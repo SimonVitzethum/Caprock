@@ -30,6 +30,13 @@ pub mod sys {
 /// Anzahl der Nachrichten-Datenwörter (Register `x2`..`x5`).
 pub const MSG_WORDS: usize = 4;
 
+/// Capability-Transfer: Ist dieses Bit im Tag (`x6`) gesetzt, überträgt ein
+/// `REPLY` zusätzlich die Capability am lokalen Slot `tag & 0xff` des Servers an
+/// den Aufrufer (in dessen [`GRANT_RECV_SLOT`]).
+pub const GRANT_FLAG: u64 = 1 << 63;
+/// Slot im Empfänger-Cspace, in dem eine per IPC übertragene Cap landet.
+pub const GRANT_RECV_SLOT: usize = 1;
+
 /// Register-Indizes im TrapFrame (`gpr[i]` == `xi`).
 pub mod reg {
     /// Eintritt: Syscall-Nummer · Austritt: Ergebniscode.

@@ -11,7 +11,7 @@
 
 use crate::system;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use sel4lake_abi::{result, sys};
+use sel4lake_abi::{result, sys, GRANT_FLAG, GRANT_RECV_SLOT};
 use sel4lake_hal::{self as hal, println, syscall::invoke};
 use sel4lake_mem::Rights;
 use sel4lake_sched::ThreadId;
@@ -61,6 +61,10 @@ static NOTIF_GOT_BADGE: AtomicU64 = AtomicU64::new(0);
 static NOTIF_COUNT: AtomicU64 = AtomicU64::new(0);
 static PRODUCER_DONE: AtomicBool = AtomicBool::new(false);
 static CONSUMER_DONE: AtomicBool = AtomicBool::new(false);
+
+// Capability-Transfer in IPC (Broker delegiert dem Client eine Service-Cap).
+static XFER_RESULT: AtomicU64 = AtomicU64::new(0);
+static XFER_DONE: AtomicBool = AtomicBool::new(false);
 static R1: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static R2: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static BATCH1_DONE: AtomicBool = AtomicBool::new(false);
@@ -132,6 +136,32 @@ pub fn spawn_demo() {
     system::bind_pd(consumer_pd, consumer);
     system::install_pd_cap(consumer_pd, 0, wait_cap);
 
+    // Capability-Transfer: Service-Endpoint + Broker, der dem Client eine
+    // svc-Send-Cap per REPLY delegiert.
+    let svc_ep = system::create_endpoint().expect("svc ep");
+    let svc_root = system::install_endpoint_cap(svc_ep as u32, Rights::RWX).expect("svc cap");
+    let svc_recv = system::cap_mint(svc_root, Rights::READ, 0).expect("svc recv");
+    let svc_send = system::cap_mint(svc_root, Rights::WRITE, 0).expect("svc send");
+    let svc_pd = system::create_pd().expect("svc pd");
+    system::install_pd_cap(svc_pd, 0, svc_recv);
+    let svc = system::spawn(svc_server as *const () as usize, 0, prio).expect("svc thread");
+    system::bind_pd(svc_pd, svc);
+
+    let brk_ep = system::create_endpoint().expect("brk ep");
+    let brk_root = system::install_endpoint_cap(brk_ep as u32, Rights::RWX).expect("brk cap");
+    let brk_recv = system::cap_mint(brk_root, Rights::READ, 0).expect("brk recv");
+    let brk_send = system::cap_mint(brk_root, Rights::WRITE, 0).expect("brk send");
+    let brk_pd = system::create_pd().expect("brk pd");
+    system::install_pd_cap(brk_pd, 0, brk_recv);
+    system::install_pd_cap(brk_pd, 2, svc_send); // Slot 2 = die zu delegierende Cap
+    let brk = system::spawn(broker_server as *const () as usize, 0, prio).expect("brk thread");
+    system::bind_pd(brk_pd, brk);
+
+    let xfer_pd = system::create_pd().expect("xfer pd");
+    system::install_pd_cap(xfer_pd, 0, brk_send); // Slot 0 = Broker; Slot 1 wird per Grant gefüllt
+    let xfer = system::spawn(xfer_client as *const () as usize, 0, prio).expect("xfer thread");
+    system::bind_pd(xfer_pd, xfer);
+
     // Freies RAM mit allen Stacks (Baseline für die Rückgewinnungs-Prüfung).
     FREE_BASELINE.store(system::total_free(), Ordering::Relaxed);
 
@@ -189,6 +219,49 @@ extern "C" fn fp_worker(arg: usize) -> ! {
         FP_RESULT[id].store(acc.to_bits(), Ordering::Relaxed);
         FP_DONE[id].store(true, Ordering::Release);
     }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Service-Server: verdreifacht (erreichbar nur über eine transferierte Cap).
+extern "C" fn svc_server(_arg: usize) -> ! {
+    loop {
+        let m = invoke(sys::RECV, 0, [0; 4], 0);
+        if m.result != result::OK {
+            break;
+        }
+        invoke(sys::REPLY, 0, [3 * m.msg[0], 0, 0, 0], 0);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Broker-Server: delegiert dem Aufrufer per REPLY-Grant seine svc-Send-Cap (Slot 2).
+extern "C" fn broker_server(_arg: usize) -> ! {
+    loop {
+        let m = invoke(sys::RECV, 0, [0; 4], 0);
+        if m.result != result::OK {
+            break;
+        }
+        // REPLY mit Grant der Cap an lokalem Slot 2.
+        invoke(sys::REPLY, 0, [0; 4], GRANT_FLAG | 2);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Transfer-Client: holt sich beim Broker eine svc-Cap und nutzt sie dann.
+extern "C" fn xfer_client(_arg: usize) -> ! {
+    // 1) Broker rufen -> erhält per Grant eine svc-Send-Cap an GRANT_RECV_SLOT.
+    let _ = invoke(sys::CALL, 0, [0; 4], 0);
+    // 2) Service über die transferierte Cap rufen (vorher kein Zugriff).
+    let r = invoke(sys::CALL, GRANT_RECV_SLOT as u64, [7, 0, 0, 0], 0);
+    XFER_RESULT.store(r.msg[0], Ordering::Relaxed);
+    XFER_DONE.store(true, Ordering::Release);
+    invoke(sys::EXIT, 0, [0; 4], 0);
     loop {
         core::hint::spin_loop();
     }
@@ -355,7 +428,8 @@ fn all_done() -> bool {
     let prio = (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire));
     let life = KILLER_DONE.load(Ordering::Acquire) && REAPED.load(Ordering::Relaxed) >= 2;
     let notif = PRODUCER_DONE.load(Ordering::Acquire) && NOTIF_COUNT.load(Ordering::Relaxed) >= NOTIF_ROUNDS;
-    workers && cores && fp && prio && life && notif
+    let xfer = XFER_DONE.load(Ordering::Acquire);
+    workers && cores && fp && prio && life && notif && xfer
 }
 
 fn report() {
@@ -420,6 +494,11 @@ fn report() {
     println!("notif   : {nc} Signale empfangen, Badge={nb:#x} (erwartet {NOTIF_BADGE_VAL:#x})");
     let notif_ok = nc >= NOTIF_ROUNDS && nb == NOTIF_BADGE_VAL;
     println!("notif   : {}", if notif_ok { "ALL PASS" } else { "FAILURES" });
+
+    // Capability-Transfer: Client nutzt eine per IPC vom Broker delegierte Cap.
+    let xr = XFER_RESULT.load(Ordering::Relaxed);
+    println!("xfer    : svc call(7) ueber transferierte Cap -> {xr} (erwartet 21)");
+    println!("xfer    : {}", if xr == 21 { "ALL PASS" } else { "FAILURES" });
 
     // Batch 1 (Server v1, verdoppelt) — cap-gesicherte IPC funktioniert.
     let mut ipc_ok = true;

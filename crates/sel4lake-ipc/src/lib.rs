@@ -135,6 +135,16 @@ impl EndpointTable {
         ep < NENDPOINTS && self.eps[ep].used
     }
 
+    /// Der aktuell auf eine Antwort wartende Aufrufer eines Endpoints (für den
+    /// Capability-Transfer bei `REPLY`).
+    pub fn caller(&self, ep: usize) -> Option<ThreadId> {
+        if self.valid(ep) {
+            self.eps[ep].caller
+        } else {
+            None
+        }
+    }
+
     /// Einen blockierten Empfänger von einem Endpoint zurückziehen (Hot-Reload).
     /// Der Thread bleibt anschließend blockiert (geparkt) und bedient den
     /// Endpoint nicht mehr. Gibt `true`, falls er Empfänger war.

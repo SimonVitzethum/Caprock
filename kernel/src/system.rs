@@ -52,10 +52,10 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
         frame as usize,
         core,
         &mut s.sched,
-        &s.cspace,
+        &mut s.cspace,
         &mut s.eps,
         &mut s.ntfns,
-        &s.pds,
+        &mut s.pds,
     ) as *mut TrapFrame
 }
 

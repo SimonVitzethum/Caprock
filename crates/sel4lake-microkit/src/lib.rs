@@ -120,10 +120,10 @@ pub fn dispatch(
     frame: usize,
     core: usize,
     sched: &mut Scheduler,
-    cspace: &CapSpace,
+    cspace: &mut CapSpace,
     eps: &mut EndpointTable,
     ntfns: &mut NotificationTable,
-    pds: &PdTable,
+    pds: &mut PdTable,
 ) -> usize {
     let nr = frame_reg(frame, reg::SYSNO_RESULT);
     if nr == sys::YIELD {
@@ -170,7 +170,15 @@ pub fn dispatch(
             match nr {
                 sys::CALL => eps.call(sched, core, ep, frame),
                 sys::RECV => eps.recv(sched, core, ep, frame),
-                _ => eps.reply(sched, core, ep, frame),
+                _ => {
+                    // Optionaler Capability-Transfer: REPLY delegiert die Cap am
+                    // lokalen Slot (tag & 0xff) an den Aufrufer (GRANT_RECV_SLOT).
+                    let tag = frame_reg(frame, reg::TAG);
+                    if tag & sel4lake_abi::GRANT_FLAG != 0 {
+                        grant_cap(cspace, pds, eps, pd, (tag & 0xff) as usize, ep);
+                    }
+                    eps.reply(sched, core, ep, frame)
+                }
             }
         }
         sys::SIGNAL | sys::WAIT => {
@@ -200,5 +208,32 @@ pub fn dispatch(
             frame
         }
         _ => deny(result::ERR_BADSYS),
+    }
+}
+
+/// Eine Capability vom Server (lokaler Slot `grant_slot` in PD `server_pd`) an
+/// den aktuell wartenden Aufrufer von `ep` delegieren: im globalen `CapSpace`
+/// ableiten (Kind im CDT) und in den Cspace des Aufrufer-PDs an
+/// [`GRANT_RECV_SLOT`](sel4lake_abi::GRANT_RECV_SLOT) eintragen.
+fn grant_cap(
+    cspace: &mut CapSpace,
+    pds: &mut PdTable,
+    eps: &EndpointTable,
+    server_pd: usize,
+    grant_slot: usize,
+    ep: usize,
+) {
+    let Some(src) = pds.cap_at(server_pd, grant_slot) else {
+        return;
+    };
+    let Some(caller) = eps.caller(ep) else {
+        return;
+    };
+    let Some(cpd) = pds.pd_of(caller) else {
+        return;
+    };
+    // Cap ableiten (erbt die Rechte) und beim Aufrufer eintragen.
+    if let Ok(new_cap) = cspace.copy(src, Rights::RWX) {
+        pds.install_cap(cpd, sel4lake_abi::GRANT_RECV_SLOT, new_cap);
     }
 }

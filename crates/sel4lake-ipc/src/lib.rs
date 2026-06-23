@@ -19,6 +19,7 @@ use sel4lake_hal::exception::{frame_reg, frame_set_reg};
 use sel4lake_sched::{Scheduler, ThreadId};
 
 const NENDPOINTS: usize = 32;
+const NNOTIFICATIONS: usize = 32;
 const QCAP: usize = 32;
 
 /// FIFO-Warteschlange blockierter Threads (an einem Endpoint).
@@ -208,5 +209,96 @@ impl EndpointTable {
         }
         frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
         frame
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Notifications: asynchrone Badge-Signale (kein Rendezvous).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct Notification {
+    used: bool,
+    /// Akkumulierte Badge-Bits noch nicht abgeholter Signale.
+    pending: u64,
+    /// Blockierter Wartender (Phase: ein Konsument je Notification).
+    waiter: Option<ThreadId>,
+}
+
+impl Notification {
+    const EMPTY: Notification = Notification {
+        used: false,
+        pending: 0,
+        waiter: None,
+    };
+}
+
+/// Tabelle aller Notification-Objekte.
+pub struct NotificationTable {
+    ntfns: [Notification; NNOTIFICATIONS],
+}
+
+impl Default for NotificationTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NotificationTable {
+    pub const fn new() -> Self {
+        Self {
+            ntfns: [Notification::EMPTY; NNOTIFICATIONS],
+        }
+    }
+
+    pub fn create(&mut self) -> Option<usize> {
+        let i = self.ntfns.iter().position(|n| !n.used)?;
+        self.ntfns[i] = Notification {
+            used: true,
+            ..Notification::EMPTY
+        };
+        Some(i)
+    }
+
+    fn valid(&self, n: usize) -> bool {
+        n < NNOTIFICATIONS && self.ntfns[n].used
+    }
+
+    /// `SIGNAL`: `badge` ins Notification-Wort ODERn und einen etwaigen Wartenden
+    /// wecken. **Nicht blockierend** — der Signalgeber läuft weiter (`frame`).
+    pub fn signal(&mut self, sched: &mut Scheduler, ntfn: usize, badge: u64, frame: usize) -> usize {
+        if !self.valid(ntfn) {
+            frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_BADCAP);
+            return frame;
+        }
+        self.ntfns[ntfn].pending |= badge;
+        if let Some(w) = self.ntfns[ntfn].waiter.take() {
+            if let Some(wframe) = sched.frame_of(w) {
+                frame_set_reg(wframe, reg::SYSNO_RESULT, result::OK);
+                frame_set_reg(wframe, reg::EP_BADGE, self.ntfns[ntfn].pending);
+                self.ntfns[ntfn].pending = 0;
+            }
+            sched.unblock(w);
+        }
+        frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
+        frame
+    }
+
+    /// `WAIT`: akkumulierten Badge abholen (sofort, falls vorhanden) oder
+    /// blockieren, bis signalisiert wird. Liefert den Badge in `x1`.
+    pub fn wait(&mut self, sched: &mut Scheduler, core: usize, ntfn: usize, frame: usize) -> usize {
+        if !self.valid(ntfn) {
+            frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_BADCAP);
+            return frame;
+        }
+        if self.ntfns[ntfn].pending != 0 {
+            frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
+            frame_set_reg(frame, reg::EP_BADGE, self.ntfns[ntfn].pending);
+            self.ntfns[ntfn].pending = 0;
+            frame
+        } else {
+            self.ntfns[ntfn].waiter = Some(sched.current_id(core));
+            sched.block_current(core, frame)
+        }
     }
 }

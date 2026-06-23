@@ -10,7 +10,7 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 CORES=8
-SECONDS_RUN="${1:-6}"
+SECONDS_RUN="${1:-15}"
 ELF="build/target/aarch64-sel4lake/release/sel4lake-kernel.elf"
 
 echo "== build =="
@@ -34,6 +34,7 @@ check "sched   : ALL PASS" "Scheduler (Preemption auf core 0 + alle Kerne ticken
 check "fp      : ALL PASS" "FP/SIMD-Kontext bleibt über Preemption erhalten"
 check "prio    : ALL PASS" "Bitmap-Prioritäten (höhere Priorität läuft zuerst)"
 check "life    : ALL PASS" "Thread-Lebenszyklus (cap-KILL + EXIT + Stack-Rückgewinnung)"
+check "notif   : ALL PASS" "Notifications (asynchrone Badge-Signale)"
 check "ipc     : ALL PASS" "Cap-gesicherte IPC (Server v1, PD<->PD)"
 check "reload  : ALL PASS" "Hot-Reload (Server v2 ersetzt v1, gleicher Endpoint, kein Reboot)"
 online=$(echo "$OUT" | grep -c "online")

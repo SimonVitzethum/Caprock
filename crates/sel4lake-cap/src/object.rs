@@ -17,6 +17,8 @@ pub enum ObjectKind {
     /// Ein Thread (Thread-Control-Block, referenziert per gepacktem ThreadId-Raw).
     /// Ermöglicht capability-kontrolliertes Beenden (`KILL`).
     Tcb(u64),
+    /// Ein Notification-Objekt (asynchrone Badge-Signale; referenziert per ID).
+    Notification(u32),
 }
 
 /// Eintrag der Objekt-Tabelle.

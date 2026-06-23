@@ -117,6 +117,11 @@ impl CapSpace {
         self.install(ObjectKind::Tcb(thread_raw), rights)
     }
 
+    /// Eine Notification-Capability einbringen.
+    pub fn install_notification(&mut self, ntfn_id: u32, rights: Rights) -> Result<CapPtr, CapError> {
+        self.install(ObjectKind::Notification(ntfn_id), rights)
+    }
+
     /// Wurzel-Objekt + -Cap anlegen (gemeinsame Logik für alle Objekttypen).
     fn install(&mut self, kind: ObjectKind, rights: Rights) -> Result<CapPtr, CapError> {
         let obj = self.alloc_object(kind)?;
@@ -130,11 +135,16 @@ impl CapSpace {
         Ok(self.ptr(slot))
     }
 
-    /// Objektart + Rechte eines Caps auflösen (für cap-gesicherte Invokation).
-    pub fn lookup(&self, ptr: CapPtr) -> Option<(ObjectKind, Rights)> {
+    /// Objektart, Rechte und Badge eines Caps auflösen (für cap-gesicherte
+    /// Invokation; der Badge identifiziert z. B. die Signalquelle bei Notifications).
+    pub fn lookup(&self, ptr: CapPtr) -> Option<(ObjectKind, Rights, u64)> {
         let slot = self.resolve(ptr).ok()?;
         let obj = self.slots[slot].object;
-        Some((self.objects[obj].kind, self.slots[slot].rights))
+        Some((
+            self.objects[obj].kind,
+            self.slots[slot].rights,
+            self.slots[slot].badge,
+        ))
     }
 
     // --- Ableitungsoperationen ---

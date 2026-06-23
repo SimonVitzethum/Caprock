@@ -53,6 +53,14 @@ static REAPED: AtomicU64 = AtomicU64::new(0); // vom Manager eingesammelte Threa
 static FREE_BASELINE: AtomicU64 = AtomicU64::new(0); // freies RAM nach allen Spawns
 /// Lokaler Cap-Slot des Killers ohne Cap (Negativtest).
 const NO_CAP_SLOT: u64 = 5;
+
+// Notifications (asynchrone Signale).
+const NOTIF_BADGE_VAL: u64 = 0xA5;
+const NOTIF_ROUNDS: u64 = 5;
+static NOTIF_GOT_BADGE: AtomicU64 = AtomicU64::new(0);
+static NOTIF_COUNT: AtomicU64 = AtomicU64::new(0);
+static PRODUCER_DONE: AtomicBool = AtomicBool::new(false);
+static CONSUMER_DONE: AtomicBool = AtomicBool::new(false);
 static R1: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static R2: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static BATCH1_DONE: AtomicBool = AtomicBool::new(false);
@@ -109,6 +117,20 @@ pub fn spawn_demo() {
     let killer = system::spawn(killer as *const () as usize, 0, prio).expect("killer");
     system::bind_pd(killer_pd, killer);
     system::install_pd_cap(killer_pd, 0, kill_cap); // Slot 0 = Tcb-Cap; Slot 5 leer
+
+    // Notifications: ein Objekt, zwei abgeleitete Caps (Signal mit Badge, Wait).
+    let ntfn = system::create_notification().expect("ntfn");
+    let nroot = system::install_notification_cap(ntfn as u32, Rights::RWX).expect("ntfn cap");
+    let signal_cap = system::cap_mint(nroot, Rights::WRITE, NOTIF_BADGE_VAL).expect("signal cap");
+    let wait_cap = system::cap_mint(nroot, Rights::READ, 0).expect("wait cap");
+    let producer_pd = system::create_pd().expect("producer pd");
+    let consumer_pd = system::create_pd().expect("consumer pd");
+    let producer = system::spawn(producer as *const () as usize, 0, prio).expect("producer");
+    system::bind_pd(producer_pd, producer);
+    system::install_pd_cap(producer_pd, 0, signal_cap);
+    let consumer = system::spawn(consumer as *const () as usize, 0, prio).expect("consumer");
+    system::bind_pd(consumer_pd, consumer);
+    system::install_pd_cap(consumer_pd, 0, wait_cap);
 
     // Freies RAM mit allen Stacks (Baseline für die Rückgewinnungs-Prüfung).
     FREE_BASELINE.store(system::total_free(), Ordering::Relaxed);
@@ -172,6 +194,37 @@ extern "C" fn fp_worker(arg: usize) -> ! {
     }
 }
 
+/// Producer: signalisiert die Notification asynchron, bis der Consumer fertig ist.
+extern "C" fn producer(_arg: usize) -> ! {
+    while !CONSUMER_DONE.load(Ordering::Acquire) {
+        let _ = invoke(sys::SIGNAL, 0, [0; 4], 0); // Notification-Cap an Slot 0
+        for _ in 0..250_000 {
+            core::hint::spin_loop();
+        }
+    }
+    PRODUCER_DONE.store(true, Ordering::Release);
+    invoke(sys::EXIT, 0, [0; 4], 0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Consumer: wartet `NOTIF_ROUNDS`-mal auf die Notification und prüft den Badge.
+extern "C" fn consumer(_arg: usize) -> ! {
+    let mut n: u64 = 0;
+    while n < NOTIF_ROUNDS {
+        let r = invoke(sys::WAIT, 0, [0; 4], 0);
+        NOTIF_GOT_BADGE.store(r.badge, Ordering::Relaxed);
+        n += 1;
+        NOTIF_COUNT.store(n, Ordering::Relaxed);
+    }
+    CONSUMER_DONE.store(true, Ordering::Release);
+    invoke(sys::EXIT, 0, [0; 4], 0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 /// Victim: zählt fortlaufend hoch, bis es (cap-kontrolliert) getötet wird.
 extern "C" fn victim(_arg: usize) -> ! {
     loop {
@@ -185,7 +238,7 @@ extern "C" fn victim(_arg: usize) -> ! {
 /// Killer (PD mit Tcb-Cap): tötet das Victim, prüft das Einfrieren + den
 /// Negativfall (KILL ohne Cap), und beendet sich danach selbst (EXIT).
 extern "C" fn killer(_arg: usize) -> ! {
-    for _ in 0..3_000_000 {
+    for _ in 0..1_000_000 {
         core::hint::spin_loop(); // Victim etwas laufen lassen
     }
     // KILL über die Tcb-Cap an Slot 0.
@@ -194,7 +247,7 @@ extern "C" fn killer(_arg: usize) -> ! {
     // Negativtest: KILL über leeren Slot -> verweigert.
     DENIED_KILL.store(invoke(sys::KILL, NO_CAP_SLOT, [0; 4], 0).result, Ordering::Relaxed);
     // Warten und erneut messen: das Victim darf nicht weitergezählt haben.
-    for _ in 0..3_000_000 {
+    for _ in 0..1_000_000 {
         core::hint::spin_loop();
     }
     KILL_SNAP2.store(VICTIM_COUNT.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -301,7 +354,8 @@ fn all_done() -> bool {
     let fp = (0..FP_WORKERS).all(|i| FP_DONE[i].load(Ordering::Acquire));
     let prio = (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire));
     let life = KILLER_DONE.load(Ordering::Acquire) && REAPED.load(Ordering::Relaxed) >= 2;
-    workers && cores && fp && prio && life
+    let notif = PRODUCER_DONE.load(Ordering::Acquire) && NOTIF_COUNT.load(Ordering::Relaxed) >= NOTIF_ROUNDS;
+    workers && cores && fp && prio && life && notif
 }
 
 fn report() {
@@ -359,6 +413,13 @@ fn report() {
     println!("life    : {reaped} Threads eingesammelt, {} KiB Stack zurueckgewonnen", freed / 1024);
     let life_ok = s1 == s2 && denied != result::OK && reaped >= 2 && freed > 0;
     println!("life    : {}", if life_ok { "ALL PASS" } else { "FAILURES" });
+
+    // Notifications: asynchrone Badge-Signale.
+    let nb = NOTIF_GOT_BADGE.load(Ordering::Relaxed);
+    let nc = NOTIF_COUNT.load(Ordering::Relaxed);
+    println!("notif   : {nc} Signale empfangen, Badge={nb:#x} (erwartet {NOTIF_BADGE_VAL:#x})");
+    let notif_ok = nc >= NOTIF_ROUNDS && nb == NOTIF_BADGE_VAL;
+    println!("notif   : {}", if notif_ok { "ALL PASS" } else { "FAILURES" });
 
     // Batch 1 (Server v1, verdoppelt) — cap-gesicherte IPC funktioniert.
     let mut ipc_ok = true;

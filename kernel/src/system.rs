@@ -9,7 +9,7 @@
 
 use sel4lake_cap::{CapError, CapInfo, CapPtr, CapSpace};
 use sel4lake_hal::{self as hal, exception::TrapFrame};
-use sel4lake_ipc::EndpointTable;
+use sel4lake_ipc::{EndpointTable, NotificationTable};
 use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
 use sel4lake_microkit::PdTable;
 use sel4lake_sched::{Scheduler, ThreadId};
@@ -24,6 +24,7 @@ struct System {
     cspace: CapSpace,
     sched: Scheduler,
     eps: EndpointTable,
+    ntfns: NotificationTable,
     pds: PdTable,
 }
 
@@ -32,6 +33,7 @@ static SYSTEM: SpinLock<System> = SpinLock::new(System {
     cspace: CapSpace::new(),
     sched: Scheduler::new(),
     eps: EndpointTable::new(),
+    ntfns: NotificationTable::new(),
     pds: PdTable::new(),
 });
 
@@ -45,9 +47,16 @@ fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
 fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
     let core = hal::cpu::core_id();
     let mut guard = SYSTEM.lock();
-    let s = &mut *guard; // disjunkte Feld-Borrows: sched/cspace/eps/pds gleichzeitig
-    sel4lake_microkit::dispatch(frame as usize, core, &mut s.sched, &s.cspace, &mut s.eps, &s.pds)
-        as *mut TrapFrame
+    let s = &mut *guard; // disjunkte Feld-Borrows
+    sel4lake_microkit::dispatch(
+        frame as usize,
+        core,
+        &mut s.sched,
+        &s.cspace,
+        &mut s.eps,
+        &mut s.ntfns,
+        &s.pds,
+    ) as *mut TrapFrame
 }
 
 /// Reschedule- + Syscall-Hook registrieren (einmalig, vor IRQs/Threads).
@@ -118,6 +127,12 @@ pub fn create_endpoint() -> Option<usize> {
 }
 pub fn install_endpoint_cap(ep: u32, rights: Rights) -> Result<CapPtr, CapError> {
     SYSTEM.lock().cspace.install_endpoint(ep, rights)
+}
+pub fn create_notification() -> Option<usize> {
+    SYSTEM.lock().ntfns.create()
+}
+pub fn install_notification_cap(ntfn: u32, rights: Rights) -> Result<CapPtr, CapError> {
+    SYSTEM.lock().cspace.install_notification(ntfn, rights)
 }
 
 // --- Threads / Protection Domains ---

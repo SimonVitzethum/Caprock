@@ -21,6 +21,10 @@ pub mod sys {
     pub const EXIT: u64 = 6;
     /// Den über eine Tcb-Cap bezeichneten Thread beenden (cap-kontrolliert).
     pub const KILL: u64 = 7;
+    /// Über eine Notification-Cap signalisieren (asynchron, nicht blockierend).
+    pub const SIGNAL: u64 = 8;
+    /// Auf eine Notification warten (blockiert; liefert den Badge in `x1`).
+    pub const WAIT: u64 = 9;
 }
 
 /// Anzahl der Nachrichten-Datenwörter (Register `x2`..`x5`).

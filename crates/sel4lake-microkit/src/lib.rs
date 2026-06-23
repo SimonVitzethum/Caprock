@@ -19,7 +19,7 @@
 use sel4lake_abi::{reg, result, sys};
 use sel4lake_cap::{CapPtr, CapSpace, ObjectKind};
 use sel4lake_hal::exception::{frame_reg, frame_set_reg};
-use sel4lake_ipc::EndpointTable;
+use sel4lake_ipc::{EndpointTable, NotificationTable};
 use sel4lake_mem::Rights;
 use sel4lake_sched::{Scheduler, ThreadId};
 
@@ -122,6 +122,7 @@ pub fn dispatch(
     sched: &mut Scheduler,
     cspace: &CapSpace,
     eps: &mut EndpointTable,
+    ntfns: &mut NotificationTable,
     pds: &PdTable,
 ) -> usize {
     let nr = frame_reg(frame, reg::SYSNO_RESULT);
@@ -152,7 +153,7 @@ pub fn dispatch(
     let Some(cap) = pds.cap_at(pd, local) else {
         return deny(result::ERR_BADCAP);
     };
-    let Some((kind, rights)) = cspace.lookup(cap) else {
+    let Some((kind, rights, badge)) = cspace.lookup(cap) else {
         return deny(result::ERR_BADCAP);
     };
 
@@ -170,6 +171,21 @@ pub fn dispatch(
                 sys::CALL => eps.call(sched, core, ep, frame),
                 sys::RECV => eps.recv(sched, core, ep, frame),
                 _ => eps.reply(sched, core, ep, frame),
+            }
+        }
+        sys::SIGNAL | sys::WAIT => {
+            let ObjectKind::Notification(id) = kind else {
+                return deny(result::ERR_BADCAP);
+            };
+            let need = if nr == sys::SIGNAL { Rights::WRITE } else { Rights::READ };
+            if !rights.contains(need) {
+                return deny(result::ERR_RIGHTS);
+            }
+            let n = id as usize;
+            if nr == sys::SIGNAL {
+                ntfns.signal(sched, n, badge, frame)
+            } else {
+                ntfns.wait(sched, core, n, frame)
             }
         }
         sys::KILL => {

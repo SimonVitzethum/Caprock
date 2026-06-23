@@ -133,12 +133,17 @@ pub fn dispatch(
         // kein Capability nötig. Kehrt nie zum Aufrufer zurück.
         return sched.block_current(core, frame);
     }
+    if nr == sys::EXIT {
+        // Selbst-Beenden: Stack/TCB werden zurückgewonnen; kein Capability nötig.
+        return sched.exit_current(core, frame);
+    }
 
     let deny = |code: u64| -> usize {
         frame_set_reg(frame, reg::SYSNO_RESULT, code);
         frame
     };
 
+    // Ab hier: cap-gesicherte Operationen. Cap aus dem PD-Cspace auflösen.
     let thread = sched.current_id(core);
     let Some(pd) = pds.pd_of(thread) else {
         return deny(result::ERR_NOPD);
@@ -147,24 +152,37 @@ pub fn dispatch(
     let Some(cap) = pds.cap_at(pd, local) else {
         return deny(result::ERR_BADCAP);
     };
-    let Some((ObjectKind::Endpoint(ep_id), rights)) = cspace.lookup(cap) else {
+    let Some((kind, rights)) = cspace.lookup(cap) else {
         return deny(result::ERR_BADCAP);
     };
-    let ep = ep_id as usize;
-
-    let need = match nr {
-        sys::CALL => Rights::WRITE,
-        sys::RECV | sys::REPLY => Rights::READ,
-        _ => return deny(result::ERR_BADSYS),
-    };
-    if !rights.contains(need) {
-        return deny(result::ERR_RIGHTS);
-    }
 
     match nr {
-        sys::CALL => eps.call(sched, core, ep, frame),
-        sys::RECV => eps.recv(sched, core, ep, frame),
-        sys::REPLY => eps.reply(sched, core, ep, frame),
-        _ => frame, // bereits oben behandelt
+        sys::CALL | sys::RECV | sys::REPLY => {
+            let ObjectKind::Endpoint(ep_id) = kind else {
+                return deny(result::ERR_BADCAP);
+            };
+            let need = if nr == sys::CALL { Rights::WRITE } else { Rights::READ };
+            if !rights.contains(need) {
+                return deny(result::ERR_RIGHTS);
+            }
+            let ep = ep_id as usize;
+            match nr {
+                sys::CALL => eps.call(sched, core, ep, frame),
+                sys::RECV => eps.recv(sched, core, ep, frame),
+                _ => eps.reply(sched, core, ep, frame),
+            }
+        }
+        sys::KILL => {
+            let ObjectKind::Tcb(raw) = kind else {
+                return deny(result::ERR_BADCAP);
+            };
+            if !rights.contains(Rights::WRITE) {
+                return deny(result::ERR_RIGHTS);
+            }
+            let ok = sched.kill(ThreadId::from_raw(raw), core);
+            frame_set_reg(frame, reg::SYSNO_RESULT, if ok { result::OK } else { result::ERR_BADCAP });
+            frame
+        }
+        _ => deny(result::ERR_BADSYS),
     }
 }

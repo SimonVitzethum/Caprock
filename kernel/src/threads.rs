@@ -42,6 +42,17 @@ static FP_DONE: [AtomicBool; FP_WORKERS] = [const { AtomicBool::new(false) }; FP
 static PRIO_SEQ: AtomicU64 = AtomicU64::new(0);
 static PRIO_FINISH: [AtomicU64; NPRIO_TEST] = [const { AtomicU64::new(0) }; NPRIO_TEST];
 static PRIO_DONE: [AtomicBool; NPRIO_TEST] = [const { AtomicBool::new(false) }; NPRIO_TEST];
+
+// Thread-Lebenszyklus (Ausbaustufe 2).
+static VICTIM_COUNT: AtomicU64 = AtomicU64::new(0);
+static KILL_SNAP1: AtomicU64 = AtomicU64::new(0); // Victim-Zähler direkt nach KILL
+static KILL_SNAP2: AtomicU64 = AtomicU64::new(0); // ... etwas später (muss gleich sein)
+static DENIED_KILL: AtomicU64 = AtomicU64::new(0); // KILL ohne Cap (muss != OK sein)
+static KILLER_DONE: AtomicBool = AtomicBool::new(false);
+static REAPED: AtomicU64 = AtomicU64::new(0); // vom Manager eingesammelte Threads
+static FREE_BASELINE: AtomicU64 = AtomicU64::new(0); // freies RAM nach allen Spawns
+/// Lokaler Cap-Slot des Killers ohne Cap (Negativtest).
+const NO_CAP_SLOT: u64 = 5;
 static R1: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static R2: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static BATCH1_DONE: AtomicBool = AtomicBool::new(false);
@@ -90,6 +101,17 @@ pub fn spawn_demo() {
     for id in 0..NPRIO_TEST {
         system::spawn(prio_thread as *const () as usize, id, 4 - id as u8);
     }
+
+    // Thread-Lebenszyklus: Victim (wird cap-kontrolliert getötet) + Killer-PD.
+    let victim = system::spawn(victim as *const () as usize, 0, prio).expect("victim");
+    let kill_cap = system::install_tcb_cap(victim, Rights::WRITE).expect("tcb cap");
+    let killer_pd = system::create_pd().expect("killer pd");
+    let killer = system::spawn(killer as *const () as usize, 0, prio).expect("killer");
+    system::bind_pd(killer_pd, killer);
+    system::install_pd_cap(killer_pd, 0, kill_cap); // Slot 0 = Tcb-Cap; Slot 5 leer
+
+    // Freies RAM mit allen Stacks (Baseline für die Rückgewinnungs-Prüfung).
+    FREE_BASELINE.store(system::total_free(), Ordering::Relaxed);
 
     *RELOAD_INFO.lock() = Some(ReloadInfo { ep, v1, v1_pd, v2_pd });
 }
@@ -145,6 +167,40 @@ extern "C" fn fp_worker(arg: usize) -> ! {
         FP_RESULT[id].store(acc.to_bits(), Ordering::Relaxed);
         FP_DONE[id].store(true, Ordering::Release);
     }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Victim: zählt fortlaufend hoch, bis es (cap-kontrolliert) getötet wird.
+extern "C" fn victim(_arg: usize) -> ! {
+    loop {
+        VICTIM_COUNT.fetch_add(1, Ordering::Relaxed);
+        for _ in 0..2_000 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Killer (PD mit Tcb-Cap): tötet das Victim, prüft das Einfrieren + den
+/// Negativfall (KILL ohne Cap), und beendet sich danach selbst (EXIT).
+extern "C" fn killer(_arg: usize) -> ! {
+    for _ in 0..3_000_000 {
+        core::hint::spin_loop(); // Victim etwas laufen lassen
+    }
+    // KILL über die Tcb-Cap an Slot 0.
+    let _ = invoke(sys::KILL, 0, [0; 4], 0);
+    KILL_SNAP1.store(VICTIM_COUNT.load(Ordering::Relaxed), Ordering::Relaxed);
+    // Negativtest: KILL über leeren Slot -> verweigert.
+    DENIED_KILL.store(invoke(sys::KILL, NO_CAP_SLOT, [0; 4], 0).result, Ordering::Relaxed);
+    // Warten und erneut messen: das Victim darf nicht weitergezählt haben.
+    for _ in 0..3_000_000 {
+        core::hint::spin_loop();
+    }
+    KILL_SNAP2.store(VICTIM_COUNT.load(Ordering::Relaxed), Ordering::Relaxed);
+    KILLER_DONE.store(true, Ordering::Release);
+    // Selbst beenden -> Stack/TCB werden zurückgewonnen.
+    invoke(sys::EXIT, 0, [0; 4], 0);
     loop {
         core::hint::spin_loop();
     }
@@ -221,12 +277,17 @@ pub fn demo_report_then_idle() -> ! {
     let mut reloaded = false;
     let mut reported = false;
     loop {
+        // Beendete Threads einsammeln (sicher: läuft auf dem Idle-Stack).
+        let n = system::reap();
+        if n > 0 {
+            REAPED.fetch_add(n as u64, Ordering::Relaxed);
+        }
         if !reloaded && BATCH1_DONE.load(Ordering::Acquire) {
             do_reload();
             RELOADED.store(true, Ordering::Release);
             reloaded = true;
         }
-        if !reported && ALL_DONE.load(Ordering::Acquire) && cores_and_workers_ok() {
+        if !reported && ALL_DONE.load(Ordering::Acquire) && all_done() {
             report();
             reported = true;
         }
@@ -234,12 +295,13 @@ pub fn demo_report_then_idle() -> ! {
     }
 }
 
-fn cores_and_workers_ok() -> bool {
+fn all_done() -> bool {
     let workers = (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD);
     let cores = (0..NUM_CORES).all(|c| hal::timer::ticks(c) > 0);
     let fp = (0..FP_WORKERS).all(|i| FP_DONE[i].load(Ordering::Acquire));
     let prio = (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire));
-    workers && cores && fp && prio
+    let life = KILLER_DONE.load(Ordering::Acquire) && REAPED.load(Ordering::Relaxed) >= 2;
+    workers && cores && fp && prio && life
 }
 
 fn report() {
@@ -285,6 +347,18 @@ fn report() {
     let f2 = PRIO_FINISH[2].load(Ordering::Relaxed);
     let prio_ok = f0 < f1 && f1 < f2;
     println!("prio    : {}", if prio_ok { "ALL PASS" } else { "FAILURES" });
+
+    // Thread-Lebenszyklus: cap-kontrolliertes KILL + Selbst-EXIT + Rückgewinnung.
+    let s1 = KILL_SNAP1.load(Ordering::Relaxed);
+    let s2 = KILL_SNAP2.load(Ordering::Relaxed);
+    let denied = DENIED_KILL.load(Ordering::Relaxed);
+    let reaped = REAPED.load(Ordering::Relaxed);
+    let freed = system::total_free().saturating_sub(FREE_BASELINE.load(Ordering::Relaxed));
+    println!("life    : victim-count nach KILL={s1}, später={s2} (eingefroren: {})", s1 == s2);
+    println!("life    : KILL ohne Cap -> result={denied} (verweigert: {})", denied != result::OK);
+    println!("life    : {reaped} Threads eingesammelt, {} KiB Stack zurueckgewonnen", freed / 1024);
+    let life_ok = s1 == s2 && denied != result::OK && reaped >= 2 && freed > 0;
+    println!("life    : {}", if life_ok { "ALL PASS" } else { "FAILURES" });
 
     // Batch 1 (Server v1, verdoppelt) — cap-gesicherte IPC funktioniert.
     let mut ipc_ok = true;

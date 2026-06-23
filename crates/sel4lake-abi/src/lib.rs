@@ -17,6 +17,10 @@ pub mod sys {
     pub const REPLY: u64 = 3;
     /// Den aufrufenden Thread dauerhaft blockieren (Selbst-Park; kein Cap nötig).
     pub const PARK: u64 = 5;
+    /// Den aufrufenden Thread beenden (Stack/TCB werden zurückgewonnen; kein Cap).
+    pub const EXIT: u64 = 6;
+    /// Den über eine Tcb-Cap bezeichneten Thread beenden (cap-kontrolliert).
+    pub const KILL: u64 = 7;
 }
 
 /// Anzahl der Nachrichten-Datenwörter (Register `x2`..`x5`).

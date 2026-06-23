@@ -14,6 +14,9 @@ pub enum ObjectKind {
     /// Ein IPC-Endpoint (referenziert per Endpoint-ID; Zustand liegt in der
     /// Endpoint-Tabelle des IPC-Subsystems).
     Endpoint(u32),
+    /// Ein Thread (Thread-Control-Block, referenziert per gepacktem ThreadId-Raw).
+    /// Ermöglicht capability-kontrolliertes Beenden (`KILL`).
+    Tcb(u64),
 }
 
 /// Eintrag der Objekt-Tabelle.

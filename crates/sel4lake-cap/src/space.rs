@@ -112,6 +112,11 @@ impl CapSpace {
         self.install(ObjectKind::Endpoint(ep_id), rights)
     }
 
+    /// Eine Thread-Capability (Tcb) für `thread_raw` (gepacktes ThreadId) einbringen.
+    pub fn install_tcb(&mut self, thread_raw: u64, rights: Rights) -> Result<CapPtr, CapError> {
+        self.install(ObjectKind::Tcb(thread_raw), rights)
+    }
+
     /// Wurzel-Objekt + -Cap anlegen (gemeinsame Logik für alle Objekttypen).
     fn install(&mut self, kind: ObjectKind, rights: Rights) -> Result<CapPtr, CapError> {
         let obj = self.alloc_object(kind)?;

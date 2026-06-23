@@ -10,7 +10,7 @@
 use sel4lake_cap::{CapError, CapInfo, CapPtr, CapSpace};
 use sel4lake_hal::{self as hal, exception::TrapFrame};
 use sel4lake_ipc::EndpointTable;
-use sel4lake_mem::{MemoryCap, PhysAllocator, Rights};
+use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
 use sel4lake_microkit::PdTable;
 use sel4lake_sched::{Scheduler, ThreadId};
 use sel4lake_sync::SpinLock;
@@ -128,11 +128,29 @@ pub fn spawn(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
     let core = hal::cpu::core_id();
     let mut guard = SYSTEM.lock();
     let s = &mut *guard;
-    let top = {
+    let (base, len) = {
         let stack = s.phys.alloc(STACK_SIZE, 16)?;
-        (stack.base() + stack.len()) as usize
+        (stack.base() as usize, stack.len() as usize)
     };
-    s.sched.spawn(core, entry, arg, top, prio)
+    s.sched.spawn(core, entry, arg, base, len, prio)
+}
+
+/// Eine Tcb-Capability für einen Thread prägen (cap-kontrolliertes `KILL`).
+pub fn install_tcb_cap(tid: ThreadId, rights: Rights) -> Result<CapPtr, CapError> {
+    SYSTEM.lock().cspace.install_tcb(tid.to_raw(), rights)
+}
+
+/// Beendete Threads einsammeln: TCB-Slots freigeben und Stacks an den Allokator
+/// zurückgeben. Aus einem sicheren Kontext (Idle-Thread) aufzurufen.
+pub fn reap() -> usize {
+    let mut guard = SYSTEM.lock();
+    let s = &mut *guard;
+    let mut n = 0;
+    while let Some((base, len)) = s.sched.reap() {
+        s.phys.free_region(PhysRegion::new(base as u64, len as u64));
+        n += 1;
+    }
+    n
 }
 
 pub fn create_pd() -> Option<usize> {

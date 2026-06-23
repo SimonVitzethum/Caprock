@@ -26,8 +26,12 @@ PASS). Zuletzt **Phase 7 (Hot-Reload)**: eine Server-Komponente wird im laufende
 System ersetzt (v1 verdoppelt → v2 verdreifacht) über *dieselbe* Endpoint-Cap,
 ohne Kernel-Neustart und transparent für den Client. Darunter: 8 Kerne mit
 MMU/W^X, capability-basierter Allokator, Capability-System mit Derivation-Tree,
-präemptiver Scheduler, cap-gesicherte IPC, Protection Domains. Test deckt MMU,
-memtest, captest, sched, ipc, **reload** und 8/8 Kerne ab. Berichte:
+präemptiver Scheduler, cap-gesicherte IPC, Protection Domains. **Ausbaustufen darüber hinaus:** FP/SIMD-Kontextsicherung,
+Bitmap-Prioritäten ([Ausbaustufe 1](docs/phase-reports/ext-1-scheduler-context.md))
+sowie Thread-Lebenszyklus (EXIT/KILL, Stack-Rückgewinnung) und TCBs als
+Capabilities ([Ausbaustufe 2](docs/phase-reports/ext-2-thread-lifecycle.md)).
+Test deckt MMU, memtest, captest, sched, **fp**, **prio**, **life**, ipc,
+**reload** und 8/8 Kerne ab. Berichte:
 [7](docs/phase-reports/phase-7.md) · [6](docs/phase-reports/phase-6.md) ·
 [5](docs/phase-reports/phase-5.md) · [4](docs/phase-reports/phase-4.md) ·
 [3](docs/phase-reports/phase-3.md) · [2](docs/phase-reports/phase-2.md) ·

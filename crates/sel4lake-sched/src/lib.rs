@@ -27,6 +27,20 @@ pub struct ThreadId {
     gen: u32,
 }
 
+impl ThreadId {
+    /// In ein einzelnes `u64` packen (für die Ablage in einer Capability).
+    pub fn to_raw(self) -> u64 {
+        (self.slot as u64) | ((self.gen as u64) << 32)
+    }
+    /// Aus dem gepackten `u64` rekonstruieren.
+    pub fn from_raw(raw: u64) -> Self {
+        Self {
+            slot: (raw & 0xffff_ffff) as usize,
+            gen: (raw >> 32) as u32,
+        }
+    }
+}
+
 /// Anzahl Prioritätsstufen (höher = wichtiger; 0 = niedrigste).
 pub const NPRIO: usize = 8;
 
@@ -42,6 +56,9 @@ struct Tcb {
     priority: u8,
     /// True, wenn der Thread blockiert ist (nicht in der Ready-Queue).
     blocked: bool,
+    /// Stack-Region des Threads (für die Rückgewinnung beim Beenden).
+    stack_base: usize,
+    stack_len: usize,
 }
 
 impl Tcb {
@@ -52,7 +69,16 @@ impl Tcb {
         core: 0,
         priority: 0,
         blocked: false,
+        stack_base: 0,
+        stack_len: 0,
     };
+}
+
+/// Aufgezeichneter Stack eines beendeten Threads, der noch freigegeben werden muss.
+#[derive(Clone, Copy)]
+struct Zombie {
+    base: usize,
+    len: usize,
 }
 
 /// FIFO-Ringpuffer von Thread-Indizes.
@@ -89,6 +115,18 @@ impl RunQueue {
         self.count -= 1;
         Some(tid)
     }
+
+    /// Einen bestimmten Eintrag entfernen (für `kill` eines bereiten Threads).
+    fn remove(&mut self, target: usize) {
+        let n = self.count;
+        for _ in 0..n {
+            if let Some(t) = self.dequeue() {
+                if t != target {
+                    self.enqueue(t);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -108,10 +146,14 @@ impl CoreSched {
     };
 }
 
+/// Maximale Anzahl noch nicht eingesammelter (reaper-)Zombies.
+const NZOMBIES: usize = 16;
+
 /// Globaler Scheduler-Zustand: eine TCB-Tabelle + Per-Kern-Run-Queues.
 pub struct Scheduler {
     tcbs: [Tcb; NTHREADS],
     cores: [CoreSched; NUM_CORES],
+    zombies: [Option<Zombie>; NZOMBIES],
 }
 
 impl Default for Scheduler {
@@ -125,6 +167,7 @@ impl Scheduler {
         Self {
             tcbs: [Tcb::EMPTY; NTHREADS],
             cores: [CoreSched::EMPTY; NUM_CORES],
+            zombies: [None; NZOMBIES],
         }
     }
 
@@ -144,13 +187,55 @@ impl Scheduler {
         core: usize,
         entry: usize,
         arg: usize,
-        stack_top: usize,
+        stack_base: usize,
+        stack_len: usize,
         priority: u8,
     ) -> Option<ThreadId> {
-        let sp = init_thread_frame(stack_top, entry, arg);
+        let sp = init_thread_frame(stack_base + stack_len, entry, arg);
         let t = self.alloc_tcb(sp, core, priority)?;
+        self.tcbs[t].stack_base = stack_base;
+        self.tcbs[t].stack_len = stack_len;
         self.enqueue_ready(t);
         Some(self.id(t))
+    }
+
+    /// Der laufende Thread beendet sich selbst: Stack als Zombie vormerken und
+    /// zum nächsten Thread wechseln. Der TCB-Slot + Stack werden später per
+    /// [`reap`](Self::reap) eingesammelt (der Thread läuft noch auf seinem Stack,
+    /// daher nicht sofort freigeben). Gibt den nächsten Frame zurück.
+    pub fn exit_current(&mut self, core: usize, _frame: usize) -> usize {
+        let cur = self.cores[core].current.expect("kein laufender Thread");
+        self.record_zombie(cur);
+        let next = self
+            .dequeue_highest(core)
+            .expect("Idle-Thread sollte immer bereit sein");
+        self.cores[core].current = Some(next);
+        self.tcbs[next].sp
+    }
+
+    /// Einen *nicht laufenden* Thread (blockiert/geparkt) beenden. Sein Stack
+    /// wird als Zombie vorgemerkt (Freigabe per [`reap`](Self::reap)). Gibt
+    /// `true`, falls der Thread gültig und nicht der laufende war.
+    pub fn kill(&mut self, tid: ThreadId, core: usize) -> bool {
+        let Some(s) = self.resolve(tid) else {
+            return false;
+        };
+        if self.cores[core].current == Some(s) {
+            return false; // laufenden Thread nicht über kill beenden (nutze exit)
+        }
+        // Aus einer etwaigen Ready-Queue entfernen, dann als Zombie vormerken.
+        self.remove_from_ready(s);
+        self.record_zombie(s);
+        true
+    }
+
+    /// Einen Zombie einsammeln: TCB-Slot freigeben und die Stack-Region
+    /// zurückgeben, damit der Aufrufer (Kernel) sie dem Allokator zurückgibt.
+    /// Wird aus einem sicheren Kontext (z. B. Idle-Thread) aufgerufen.
+    pub fn reap(&mut self) -> Option<(usize, usize)> {
+        let i = self.zombies.iter().position(|z| z.is_some())?;
+        let z = self.zombies[i].take().unwrap();
+        Some((z.base, z.len))
     }
 
     /// Handle des aktuell laufenden Threads auf `core`.
@@ -232,6 +317,31 @@ impl Scheduler {
         self.cores[core].bitmap |= 1 << p;
     }
 
+    /// Einen bereiten Thread aus seiner Prioritäts-Queue entfernen (für `kill`).
+    fn remove_from_ready(&mut self, slot: usize) {
+        let core = self.tcbs[slot].core;
+        let p = self.tcbs[slot].priority as usize;
+        self.cores[core].queues[p].remove(slot);
+        if self.cores[core].queues[p].count == 0 {
+            self.cores[core].bitmap &= !(1 << p);
+        }
+    }
+
+    /// Einen beendeten Thread aufzeichnen: TCB-Slot sofort freigeben (liegt im
+    /// Scheduler-Array), Stack-Region zum späteren Freigeben (`reap`) vormerken.
+    fn record_zombie(&mut self, slot: usize) {
+        let base = self.tcbs[slot].stack_base;
+        let len = self.tcbs[slot].stack_len;
+        let gen = self.tcbs[slot].gen.wrapping_add(1);
+        self.tcbs[slot] = Tcb::EMPTY;
+        self.tcbs[slot].gen = gen;
+        if len > 0 {
+            if let Some(z) = self.zombies.iter_mut().find(|z| z.is_none()) {
+                *z = Some(Zombie { base, len });
+            }
+        }
+    }
+
     /// Den nächsten Thread der höchsten nichtleeren Priorität entnehmen (O(1)).
     fn dequeue_highest(&mut self, core: usize) -> Option<usize> {
         let bm = self.cores[core].bitmap;
@@ -256,6 +366,8 @@ impl Scheduler {
             core,
             priority,
             blocked: false,
+            stack_base: 0,
+            stack_len: 0,
         };
         Some(i)
     }

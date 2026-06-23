@@ -13,7 +13,7 @@ use crate::system;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use sel4lake_abi::{result, sys, GRANT_FLAG, GRANT_RECV_SLOT};
 use sel4lake_hal::{self as hal, println, syscall::invoke};
-use sel4lake_mem::Rights;
+use sel4lake_mem::{peek_u64, poke_u64, Rights};
 use sel4lake_sched::ThreadId;
 use sel4lake_sync::SpinLock;
 
@@ -65,6 +65,16 @@ static CONSUMER_DONE: AtomicBool = AtomicBool::new(false);
 // Capability-Transfer in IPC (Broker delegiert dem Client eine Service-Cap).
 static XFER_RESULT: AtomicU64 = AtomicU64::new(0);
 static XFER_DONE: AtomicBool = AtomicBool::new(false);
+
+// Stateful Hot-Reload: Zähler-Service, dessen Zustand (in einer Memory-Region)
+// den Komponententausch v1(+1) -> v2(+10) überlebt.
+static CS_STATE_BASE: AtomicU64 = AtomicU64::new(0);
+static CS_R1: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3]; // v1: 1,2,3
+static CS_R2: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2]; // v2: 13,23 (Zustand erhalten)
+static CS_BATCH1_DONE: AtomicBool = AtomicBool::new(false);
+static CS_RELOADED: AtomicBool = AtomicBool::new(false);
+static CS_DONE: AtomicBool = AtomicBool::new(false);
+static CS_RELOAD_INFO: SpinLock<Option<ReloadInfo>> = SpinLock::new(None);
 static R1: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static R2: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static BATCH1_DONE: AtomicBool = AtomicBool::new(false);
@@ -162,29 +172,69 @@ pub fn spawn_demo() {
     let xfer = system::spawn(xfer_client as *const () as usize, 0, prio).expect("xfer thread");
     system::bind_pd(xfer_pd, xfer);
 
+    // Stateful Hot-Reload: Zähler-Service, dessen Zustand in einer Memory-Region
+    // liegt und den Tausch v1(+1) -> v2(+10) überlebt.
+    let cs_state = {
+        let s = system::alloc(4096, 16).expect("cs state");
+        s.base()
+    };
+    poke_u64(cs_state, 0); // Zähler initialisieren
+    CS_STATE_BASE.store(cs_state, Ordering::Relaxed);
+    let cs_ep = system::create_endpoint().expect("cs ep");
+    let cs_root = system::install_endpoint_cap(cs_ep as u32, Rights::RWX).expect("cs cap");
+    let cs_send = system::cap_mint(cs_root, Rights::WRITE, 0).expect("cs send");
+    let cs_recv1 = system::cap_mint(cs_root, Rights::READ, 0).expect("cs recv1");
+    let cs_recv2 = system::cap_mint(cs_root, Rights::READ, 0).expect("cs recv2");
+    let cs_v1_pd = system::create_pd().expect("cs v1 pd");
+    let cs_v2_pd = system::create_pd().expect("cs v2 pd");
+    let cs_client_pd = system::create_pd().expect("cs client pd");
+    system::install_pd_cap(cs_v1_pd, EP_CAP as usize, cs_recv1);
+    system::install_pd_cap(cs_v2_pd, EP_CAP as usize, cs_recv2);
+    system::install_pd_cap(cs_client_pd, EP_CAP as usize, cs_send);
+    let cs_v1 = system::spawn(counter_v1 as *const () as usize, cs_state as usize, prio).expect("cs v1");
+    system::bind_pd(cs_v1_pd, cs_v1);
+    let csc = system::spawn(cs_client as *const () as usize, 0, prio).expect("cs client");
+    system::bind_pd(cs_client_pd, csc);
+    *CS_RELOAD_INFO.lock() = Some(ReloadInfo {
+        ep: cs_ep,
+        v1: cs_v1,
+        v1_pd: cs_v1_pd,
+        v2_pd: cs_v2_pd,
+    });
+
     // Freies RAM mit allen Stacks (Baseline für die Rückgewinnungs-Prüfung).
     FREE_BASELINE.store(system::total_free(), Ordering::Relaxed);
 
     *RELOAD_INFO.lock() = Some(ReloadInfo { ep, v1, v1_pd, v2_pd });
 }
 
-/// Hot-Reload: Server v1 zurückziehen (Quiesce) und v2 starten (Swap).
-fn do_reload() {
-    let Some(info) = *RELOAD_INFO.lock() else {
-        return;
-    };
-    // Quiesce: v1 als Empfänger zurückziehen (falls blockiert -> geparkt) und
-    // ihm die Recv-Cap entziehen (falls er später erneut empfangen will -> Fehler).
+/// Generischer Hot-Reload-Swap: v1 zurückziehen (Quiesce: Empfänger entfernen +
+/// Recv-Cap entziehen), dann v2 (mit Argument) starten und an seine PD binden.
+fn reload_swap(info: ReloadInfo, v2_entry: usize, v2_arg: usize) {
     system::endpoint_retire_receiver(info.ep, info.v1);
     system::clear_pd_cap(info.v1_pd, EP_CAP as usize);
-
-    // Swap: v2 starten + an seine (bereits mit Recv-Cap bestückte) PD binden.
     // Atomar gegen Preemption, damit v2 nicht vor dem Bind läuft.
     hal::cpu::local_irq_disable();
-    if let Some(v2) = system::spawn(server_v2 as *const () as usize, 0, system::IDLE_PRIO) {
+    if let Some(v2) = system::spawn(v2_entry, v2_arg, system::IDLE_PRIO) {
         system::bind_pd(info.v2_pd, v2);
     }
     hal::cpu::local_irq_enable();
+}
+
+/// Stateless Hot-Reload (Phase 7): Server v1 (verdoppelt) -> v2 (verdreifacht).
+fn do_reload() {
+    if let Some(info) = *RELOAD_INFO.lock() {
+        reload_swap(info, server_v2 as *const () as usize, 0);
+    }
+}
+
+/// Stateful Hot-Reload: Zähler-Service v1 (+1) -> v2 (+10); der Zustand (in der
+/// Memory-Region bei CS_STATE_BASE) bleibt erhalten (zero-copy, dieselbe Region).
+fn do_cs_reload() {
+    if let Some(info) = *CS_RELOAD_INFO.lock() {
+        let state = CS_STATE_BASE.load(Ordering::Relaxed) as usize;
+        reload_swap(info, counter_v2 as *const () as usize, state);
+    }
 }
 
 // --- Demo-Threads ---
@@ -219,6 +269,50 @@ extern "C" fn fp_worker(arg: usize) -> ! {
         FP_RESULT[id].store(acc.to_bits(), Ordering::Relaxed);
         FP_DONE[id].store(true, Ordering::Release);
     }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Zähler-Service v1: liest den Zustand aus der Region, addiert 1, schreibt zurück.
+extern "C" fn counter_v1(arg: usize) -> ! {
+    counter_serve(arg as u64, 1)
+}
+
+/// Zähler-Service v2 (neu geladen): addiert 10 — setzt den Zustand von v1 fort.
+extern "C" fn counter_v2(arg: usize) -> ! {
+    counter_serve(arg as u64, 10)
+}
+
+fn counter_serve(state: u64, delta: u64) -> ! {
+    loop {
+        let m = invoke(sys::RECV, 0, [0; 4], 0);
+        if m.result != result::OK {
+            break; // Cap entzogen -> zurückgezogen
+        }
+        let c = peek_u64(state) + delta; // Zustand in der Memory-Region
+        poke_u64(state, c);
+        invoke(sys::REPLY, 0, [c, 0, 0, 0], 0);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Zähler-Client: 3 Aufrufe (von v1 bedient), Reload abwarten, 2 weitere (v2).
+extern "C" fn cs_client(_arg: usize) -> ! {
+    for r in CS_R1.iter() {
+        r.store(invoke(sys::CALL, 0, [0; 4], 0).msg[0], Ordering::Relaxed);
+    }
+    CS_BATCH1_DONE.store(true, Ordering::Release);
+    while !CS_RELOADED.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    for r in CS_R2.iter() {
+        r.store(invoke(sys::CALL, 0, [0; 4], 0).msg[0], Ordering::Relaxed);
+    }
+    CS_DONE.store(true, Ordering::Release);
+    invoke(sys::EXIT, 0, [0; 4], 0);
     loop {
         core::hint::spin_loop();
     }
@@ -401,6 +495,7 @@ extern "C" fn client(_arg: usize) -> ! {
 
 pub fn demo_report_then_idle() -> ! {
     let mut reloaded = false;
+    let mut cs_reloaded = false;
     let mut reported = false;
     loop {
         // Beendete Threads einsammeln (sicher: läuft auf dem Idle-Stack).
@@ -412,6 +507,11 @@ pub fn demo_report_then_idle() -> ! {
             do_reload();
             RELOADED.store(true, Ordering::Release);
             reloaded = true;
+        }
+        if !cs_reloaded && CS_BATCH1_DONE.load(Ordering::Acquire) {
+            do_cs_reload();
+            CS_RELOADED.store(true, Ordering::Release);
+            cs_reloaded = true;
         }
         if !reported && ALL_DONE.load(Ordering::Acquire) && all_done() {
             report();
@@ -429,7 +529,8 @@ fn all_done() -> bool {
     let life = KILLER_DONE.load(Ordering::Acquire) && REAPED.load(Ordering::Relaxed) >= 2;
     let notif = PRODUCER_DONE.load(Ordering::Acquire) && NOTIF_COUNT.load(Ordering::Relaxed) >= NOTIF_ROUNDS;
     let xfer = XFER_DONE.load(Ordering::Acquire);
-    workers && cores && fp && prio && life && notif && xfer
+    let ckpt = CS_DONE.load(Ordering::Acquire);
+    workers && cores && fp && prio && life && notif && xfer && ckpt
 }
 
 fn report() {
@@ -499,6 +600,20 @@ fn report() {
     let xr = XFER_RESULT.load(Ordering::Relaxed);
     println!("xfer    : svc call(7) ueber transferierte Cap -> {xr} (erwartet 21)");
     println!("xfer    : {}", if xr == 21 { "ALL PASS" } else { "FAILURES" });
+
+    // Stateful Hot-Reload: Zustand (Zähler) bleibt über v1->v2 erhalten.
+    let r1 = [
+        CS_R1[0].load(Ordering::Relaxed),
+        CS_R1[1].load(Ordering::Relaxed),
+        CS_R1[2].load(Ordering::Relaxed),
+    ];
+    let r2 = [CS_R2[0].load(Ordering::Relaxed), CS_R2[1].load(Ordering::Relaxed)];
+    println!("ckpt    : v1(+1)={r1:?} -> Reload -> v2(+10)={r2:?}");
+    let ckpt_ok = r1 == [1, 2, 3] && r2 == [13, 23];
+    println!(
+        "ckpt    : {} (Zustand ueber Komponententausch erhalten)",
+        if ckpt_ok { "ALL PASS" } else { "FAILURES" }
+    );
 
     // Batch 1 (Server v1, verdoppelt) — cap-gesicherte IPC funktioniert.
     let mut ipc_ok = true;

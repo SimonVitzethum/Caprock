@@ -22,3 +22,22 @@ pub use region::{PhysRegion, Rights};
 
 /// Seitengröße (Allokationsgranularität).
 pub const PAGE: u64 = 4096;
+
+/// Ein `u64` in einer besessenen physischen Region lesen.
+///
+/// Dies ist der **SAS-Direktzugriff** (ADR 0002): Wer die Memory-Capability für
+/// die Region hält, greift direkt auf den (identity-gemappten) realen RAM zu —
+/// es gibt keine MMU-Übersetzung und keine per-Prozess-Isolation. Roher
+/// Speicherzugriff ist hier unvermeidlich; der Aufrufer garantiert, dass `addr`
+/// in seine Region fällt.
+pub fn peek_u64(addr: u64) -> u64 {
+    // SAFETY: `addr` liegt in einer vom Aufrufer per MemoryCap besessenen,
+    // identity-gemappten RW-Region; volatiler Zugriff auf realen RAM.
+    unsafe { core::ptr::read_volatile(addr as *const u64) }
+}
+
+/// Ein `u64` in einer besessenen physischen Region schreiben (siehe [`peek_u64`]).
+pub fn poke_u64(addr: u64, val: u64) {
+    // SAFETY: wie `peek_u64`; volatiler Schreibzugriff auf besessenen RAM.
+    unsafe { core::ptr::write_volatile(addr as *mut u64, val) }
+}

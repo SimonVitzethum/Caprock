@@ -38,6 +38,7 @@ check "notif   : ALL PASS" "Notifications (asynchrone Badge-Signale)"
 check "xfer    : ALL PASS" "Capability-Transfer in IPC (Broker delegiert Service-Cap)"
 check "ipc     : ALL PASS" "Cap-gesicherte IPC (Server v1, PD<->PD)"
 check "reload  : ALL PASS" "Hot-Reload (Server v2 ersetzt v1, gleicher Endpoint, kein Reboot)"
+check "ckpt    : ALL PASS" "Stateful Hot-Reload (Zustand bleibt über v1->v2 erhalten)"
 online=$(echo "$OUT" | grep -c "online")
 [ "$online" -eq "$CORES" ] && echo "  PASS: alle $CORES Kerne online" || { echo "  FAIL: nur $online/$CORES Kerne online"; fail=1; }
 

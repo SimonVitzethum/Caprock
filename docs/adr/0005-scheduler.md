@@ -1,6 +1,18 @@
 # ADR 0005 — Scheduler
 
-**Status:** vorgeschlagen (Phase 4) · **Datum:** 2026-06-23
+**Status:** umgesetzt + verfeinert · **Datum:** 2026-06-23
+
+> **Umsetzungsstand:** Pro-Kern-Bitmap-Scheduler (Ansatz B) mit fester Affinität
+> ist implementiert (`sel4lake-sched`): präemptiv, O(1)-Auswahl,
+> `block`/`unblock`/`switch_to`, `exit`/`kill`/`reap`. **FP-Kontext: eager**
+> (volles q0..q31-Save/Restore im Trap-Pfad). **Lazy-FP wurde versucht und
+> verworfen** — `CPACR`-Trapping bei EL1 trappt auch den NEON-Code des Kernels
+> selbst; Lazy-FP braucht eine EL0/EL1-Trennung (echtes Userland) und ist daran
+> geknüpft (siehe `docs/phase-reports/ext-3-lazy-fp-locks.md`). **Lock-Granularität:**
+> Scheduler-Lock (`SCHED`) ist vom Ressourcen-Lock (`RES`) getrennt (feste Ordnung
+> RES→SCHED); echte per-Kern-*parallele* Scheduler-Instanzen (mit Cross-Core-IPI)
+> sind ein vorgemerkter Folge-Refactor. MCS-Scheduling-Contexts (Budget/Donation)
+> weiterhin offen.
 
 ## Motivation
 

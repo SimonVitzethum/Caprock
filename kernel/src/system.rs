@@ -1,11 +1,14 @@
-//! Vereinigter Kernzustand hinter **einem** Lock: Allokator, Capability-Space,
-//! Scheduler, Endpoints und Protection Domains — plus die Trap-Hooks.
+//! Kernzustand hinter **zwei** Locks: dem Scheduler-Lock (`SCHED`) und dem
+//! Ressourcen-Lock (`RES` = Allokator, Capability-Space, Endpoints,
+//! Notifications, Protection Domains) — plus die Trap-Hooks.
 //!
-//! Ein einziger Lock vermeidet jedes Lock-Ordering-Problem zwischen dem
-//! Timer-Reschedule- und dem Syscall-/IPC-Pfad (beide laufen in Exception-
-//! Kontext). Operationen, die mehrere Teilzustände brauchen (z. B. cap-delete:
-//! cspace + Allokator, oder IPC: sched + cspace + eps + pds), arbeiten über
-//! disjunkte Feld-Borrows desselben gesperrten Zustands.
+//! Trennung der Granularität (Per-Kern-Locks, Teil 1): Der heiße
+//! Timer-Reschedule-Pfad sperrt **nur** `SCHED` und blockiert damit keine reinen
+//! Ressourcen-Operationen (Cap-/Speicher-/PD-Verwaltung) auf anderen Kernen.
+//! Operationen, die beides brauchen (IPC, spawn, reap), sperren in **fester
+//! Reihenfolge `RES` vor `SCHED`** — kein Pfad sperrt `SCHED` vor `RES`, daher
+//! deadlockfrei. (Echte per-Kern-*parallele* Scheduler-Instanzen sind der nächste
+//! Schritt; sie brauchen per-Kern-TCB-Partitionierung + Cross-Core-IPI-Unblock.)
 
 use sel4lake_cap::{CapError, CapInfo, CapPtr, CapSpace};
 use sel4lake_hal::{self as hal, exception::TrapFrame};
@@ -19,19 +22,21 @@ const STACK_SIZE: u64 = 64 * 1024;
 /// Standardpriorität für Idle und gewöhnliche Demo-Threads (Round-Robin).
 pub const IDLE_PRIO: u8 = 1;
 
-struct System {
+/// Geteilte Ressourcen (alles außer dem Scheduler).
+struct Resources {
     phys: PhysAllocator,
     cspace: CapSpace,
-    sched: Scheduler,
     eps: EndpointTable,
     ntfns: NotificationTable,
     pds: PdTable,
 }
 
-static SYSTEM: SpinLock<System> = SpinLock::new(System {
+/// Scheduler-Lock (heißer Pfad; getrennt von den Ressourcen).
+static SCHED: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
+/// Ressourcen-Lock. **Lock-Ordnung: RES vor SCHED.**
+static RES: SpinLock<Resources> = SpinLock::new(Resources {
     phys: PhysAllocator::new(),
     cspace: CapSpace::new(),
-    sched: Scheduler::new(),
     eps: EndpointTable::new(),
     ntfns: NotificationTable::new(),
     pds: PdTable::new(),
@@ -41,21 +46,24 @@ static SYSTEM: SpinLock<System> = SpinLock::new(System {
 
 fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
     let core = hal::cpu::core_id();
-    SYSTEM.lock().sched.on_tick(core, frame as usize) as *mut TrapFrame
+    // Heißer Pfad: nur der Scheduler-Lock.
+    SCHED.lock().on_tick(core, frame as usize) as *mut TrapFrame
 }
 
 fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
     let core = hal::cpu::core_id();
-    let mut guard = SYSTEM.lock();
-    let s = &mut *guard; // disjunkte Feld-Borrows
+    // Lock-Ordnung RES vor SCHED.
+    let mut res = RES.lock();
+    let mut sched = SCHED.lock();
+    let r = &mut *res;
     sel4lake_microkit::dispatch(
         frame as usize,
         core,
-        &mut s.sched,
-        &mut s.cspace,
-        &mut s.eps,
-        &mut s.ntfns,
-        &mut s.pds,
+        &mut sched,
+        &mut r.cspace,
+        &mut r.eps,
+        &mut r.ntfns,
+        &mut r.pds,
     ) as *mut TrapFrame
 }
 
@@ -67,121 +75,119 @@ pub fn set_hooks() {
 
 /// Freies RAM `[free_base, ram_end)` beim Allokator registrieren.
 pub fn init_mem(free_base: u64, ram_end: u64) {
-    SYSTEM.lock().phys.add_region(free_base, ram_end - free_base);
+    RES.lock().phys.add_region(free_base, ram_end - free_base);
 }
 
 /// Boot-Kontext des aufrufenden Kerns als Idle-Thread registrieren (vor IRQs).
-/// Der Idle-Thread läuft auf der Standardprincriorität `IDLE_PRIO`.
 pub fn init_core() {
     let core = hal::cpu::core_id();
-    SYSTEM.lock().sched.init_core(core, IDLE_PRIO);
+    SCHED.lock().init_core(core, IDLE_PRIO);
 }
 
-// --- Allokator ---
+// --- Allokator (RES) ---
 
 pub fn alloc(size: u64, align: u64) -> Option<MemoryCap> {
-    SYSTEM.lock().phys.alloc(size, align)
+    RES.lock().phys.alloc(size, align)
 }
 pub fn free(cap: MemoryCap) {
-    SYSTEM.lock().phys.free(cap);
+    RES.lock().phys.free(cap);
 }
 pub fn total_free() -> u64 {
-    SYSTEM.lock().phys.total_free()
+    RES.lock().phys.total_free()
 }
 pub fn fragments() -> usize {
-    SYSTEM.lock().phys.fragments()
+    RES.lock().phys.fragments()
 }
 
-// --- Capability-Space ---
+// --- Capability-Space (RES) ---
 
 pub fn cap_install(cap: MemoryCap) -> Result<CapPtr, CapError> {
-    SYSTEM.lock().cspace.install_memory(cap)
+    RES.lock().cspace.install_memory(cap)
 }
 pub fn cap_copy(src: CapPtr, rights: Rights) -> Result<CapPtr, CapError> {
-    SYSTEM.lock().cspace.copy(src, rights)
+    RES.lock().cspace.copy(src, rights)
 }
 pub fn cap_mint(src: CapPtr, rights: Rights, badge: u64) -> Result<CapPtr, CapError> {
-    SYSTEM.lock().cspace.mint(src, rights, badge)
+    RES.lock().cspace.mint(src, rights, badge)
 }
 pub fn cap_move(src: CapPtr) -> Result<CapPtr, CapError> {
-    SYSTEM.lock().cspace.move_cap(src)
+    RES.lock().cspace.move_cap(src)
 }
 pub fn cap_inspect(ptr: CapPtr) -> Option<CapInfo> {
-    SYSTEM.lock().cspace.inspect(ptr)
+    RES.lock().cspace.inspect(ptr)
 }
 pub fn cap_delete(ptr: CapPtr) -> Result<(), CapError> {
-    let mut guard = SYSTEM.lock();
-    let s = &mut *guard;
-    s.cspace.delete(&mut s.phys, ptr)
+    let mut res = RES.lock();
+    let r = &mut *res;
+    r.cspace.delete(&mut r.phys, ptr)
 }
 pub fn cap_revoke(ptr: CapPtr) -> Result<(), CapError> {
-    let mut guard = SYSTEM.lock();
-    let s = &mut *guard;
-    s.cspace.revoke(&mut s.phys, ptr)
+    let mut res = RES.lock();
+    let r = &mut *res;
+    r.cspace.revoke(&mut r.phys, ptr)
 }
 
-// --- Endpoints (Zugriff cap-getragen) ---
+// --- Endpoints / Notifications (RES) ---
 
 pub fn create_endpoint() -> Option<usize> {
-    SYSTEM.lock().eps.create()
+    RES.lock().eps.create()
 }
 pub fn install_endpoint_cap(ep: u32, rights: Rights) -> Result<CapPtr, CapError> {
-    SYSTEM.lock().cspace.install_endpoint(ep, rights)
+    RES.lock().cspace.install_endpoint(ep, rights)
 }
 pub fn create_notification() -> Option<usize> {
-    SYSTEM.lock().ntfns.create()
+    RES.lock().ntfns.create()
 }
 pub fn install_notification_cap(ntfn: u32, rights: Rights) -> Result<CapPtr, CapError> {
-    SYSTEM.lock().cspace.install_notification(ntfn, rights)
+    RES.lock().cspace.install_notification(ntfn, rights)
 }
 
 // --- Threads / Protection Domains ---
 
 /// Einen Thread mit Priorität `prio` auf dem aktuellen Kern erzeugen (Stack aus
-/// dem Allokator).
+/// dem Allokator). Lock-Ordnung RES vor SCHED.
 pub fn spawn(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
     let core = hal::cpu::core_id();
-    let mut guard = SYSTEM.lock();
-    let s = &mut *guard;
+    let mut res = RES.lock();
     let (base, len) = {
-        let stack = s.phys.alloc(STACK_SIZE, 16)?;
+        let stack = res.phys.alloc(STACK_SIZE, 16)?;
         (stack.base() as usize, stack.len() as usize)
     };
-    s.sched.spawn(core, entry, arg, base, len, prio)
+    SCHED.lock().spawn(core, entry, arg, base, len, prio)
 }
 
 /// Eine Tcb-Capability für einen Thread prägen (cap-kontrolliertes `KILL`).
 pub fn install_tcb_cap(tid: ThreadId, rights: Rights) -> Result<CapPtr, CapError> {
-    SYSTEM.lock().cspace.install_tcb(tid.to_raw(), rights)
+    RES.lock().cspace.install_tcb(tid.to_raw(), rights)
 }
 
 /// Beendete Threads einsammeln: TCB-Slots freigeben und Stacks an den Allokator
-/// zurückgeben. Aus einem sicheren Kontext (Idle-Thread) aufzurufen.
+/// zurückgeben (aus dem Idle-Thread). Lock-Ordnung RES vor SCHED.
 pub fn reap() -> usize {
-    let mut guard = SYSTEM.lock();
-    let s = &mut *guard;
+    let mut res = RES.lock();
+    let mut sched = SCHED.lock();
     let mut n = 0;
-    while let Some((base, len)) = s.sched.reap() {
-        s.phys.free_region(PhysRegion::new(base as u64, len as u64));
+    while let Some((base, len)) = sched.reap() {
+        res.phys.free_region(PhysRegion::new(base as u64, len as u64));
         n += 1;
     }
     n
 }
 
 pub fn create_pd() -> Option<usize> {
-    SYSTEM.lock().pds.create()
+    RES.lock().pds.create()
 }
 pub fn bind_pd(pd: usize, tid: ThreadId) {
-    SYSTEM.lock().pds.bind_thread(pd, tid);
+    RES.lock().pds.bind_thread(pd, tid);
 }
 pub fn install_pd_cap(pd: usize, slot: usize, cap: CapPtr) {
-    SYSTEM.lock().pds.install_cap(pd, slot, cap);
+    RES.lock().pds.install_cap(pd, slot, cap);
 }
 pub fn clear_pd_cap(pd: usize, slot: usize) {
-    SYSTEM.lock().pds.clear_cap(pd, slot);
+    RES.lock().pds.clear_cap(pd, slot);
 }
 
 /// Einen blockierten Endpoint-Empfänger zurückziehen (Hot-Reload).
 pub fn endpoint_retire_receiver(ep: usize, tid: ThreadId) -> bool {
-    SYSTEM.lock().eps.retire_receiver(ep, tid)
+    RES.lock().eps.retire_receiver(ep, tid)
 }

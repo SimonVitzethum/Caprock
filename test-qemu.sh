@@ -28,6 +28,7 @@ fail=0
 check() { if echo "$OUT" | grep -q "$1"; then echo "  PASS: $2"; else echo "  FAIL: $2"; fail=1; fi; }
 
 check "M=1 C=1 I=1" "MMU + Caches aktiv"
+check "dtb     : ALL PASS" "DTB-Parsing (RAM-Größe aus dem Device Tree)"
 check "memtest : ALL PASS" "Speichermodell-Selbsttest (alloc/split/transfer/free)"
 check "captest : ALL PASS" "Capability-Selbsttest (copy/mint/move/delete/revoke)"
 check "sched   : ALL PASS" "Scheduler (Preemption auf core 0 + alle Kerne ticken)"

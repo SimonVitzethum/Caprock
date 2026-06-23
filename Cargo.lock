@@ -14,6 +14,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sel4lake-dtb"
+version = "0.0.1"
+
+[[package]]
 name = "sel4lake-hal"
 version = "0.0.1"
 dependencies = [
@@ -36,6 +40,7 @@ version = "0.0.1"
 dependencies = [
  "sel4lake-abi",
  "sel4lake-cap",
+ "sel4lake-dtb",
  "sel4lake-hal",
  "sel4lake-ipc",
  "sel4lake-mem",

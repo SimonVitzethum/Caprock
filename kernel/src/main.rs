@@ -23,9 +23,12 @@ const SEC_STACK_SIZE: u64 = 0x10000;
 /// Periodische Tick-Rate des Timers (Hz). 100 Hz = 10-ms-Zeitscheiben.
 const TICK_HZ: u64 = 100;
 
-/// RAM-Layout der Zielplattform (QEMU `virt`, 4 GiB): [0x4000_0000, +4 GiB).
+/// RAM-Layout der Zielplattform (Fallback; tatsächlich aus dem DTB gelesen).
 const RAM_BASE: u64 = 0x4000_0000;
 const RAM_END: u64 = RAM_BASE + 4 * 1024 * 1024 * 1024;
+
+/// Von QEMU erzeugter Device Tree (eingebettet — siehe `sel4lake-dtb`).
+static DTB_BYTES: &[u8] = include_bytes!("virt.dtb");
 
 extern "C" {
     /// Sekundärkern-Einstieg (Assembler, `arch::aarch64::boot`).
@@ -67,7 +70,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     println!(" phase 1: HAL bring-up");
     println!("========================================");
     println!("arch    : aarch64 (running at EL{})", hal::cpu::current_el());
-    println!("dtb     : {dtb_addr:#018x}");
+    println!("boot-x0 : {dtb_addr:#018x} (DTB-Zeiger; bei QEMU-ELF 0 -> DTB eingebettet)");
     println!("mmu     : identity-map, M={} C={} I={} (caches an)", m as u8, c as u8, i as u8);
 
     // Distributor global + Init des Primärkerns (core 0).
@@ -76,10 +79,22 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     println!("core 0  : online (vectors, gic, timer @ {} Hz)", TICK_HZ);
     println!("timer   : CNTFRQ={} Hz, PPI {}", hal::timer::freq(), hal::timer::TIMER_INTID);
 
+    // RAM-Layout aus dem Device Tree lesen (statt fest verdrahtet).
+    let (ram_base, ram_size) = sel4lake_dtb::Dtb::parse(DTB_BYTES)
+        .and_then(|d| d.memory())
+        .unwrap_or((RAM_BASE, RAM_END - RAM_BASE));
+    let ram_end = ram_base + ram_size;
+    println!(
+        "dtb     : RAM base={ram_base:#x} size={} MiB (aus Device Tree)",
+        ram_size >> 20
+    );
+    let dtb_ok = ram_base == RAM_BASE && ram_size == 4 * 1024 * 1024 * 1024;
+    println!("dtb     : {}", if dtb_ok { "ALL PASS" } else { "FAILURES" });
+
     // Phase 2/3: capability-basiertes Speichermodell + Capability-Space.
     let free_base = hal::mmu::kernel_end();
-    system::init_mem(free_base, RAM_END);
-    println!("mem     : freies RAM [{free_base:#x}, {RAM_END:#x})");
+    system::init_mem(free_base, ram_end);
+    println!("mem     : freies RAM [{free_base:#x}, {ram_end:#x})");
     selftest::run();
 
     // Phase 4–6: Scheduler + cap-gesicherte IPC + Protection Domains.

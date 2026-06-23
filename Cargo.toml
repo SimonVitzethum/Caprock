@@ -16,6 +16,7 @@ members = [
     "crates/sel4lake-sched",
     "crates/sel4lake-ipc",
     "crates/sel4lake-microkit",
+    "crates/sel4lake-dtb",
 ]
 
 [workspace.package]

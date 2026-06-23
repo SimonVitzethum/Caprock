@@ -24,3 +24,4 @@ sel4lake-sched = { path = "../crates/sel4lake-sched" }
 sel4lake-ipc = { path = "../crates/sel4lake-ipc" }
 sel4lake-abi = { path = "../crates/sel4lake-abi" }
 sel4lake-microkit = { path = "../crates/sel4lake-microkit" }
+sel4lake-dtb = { path = "../crates/sel4lake-dtb" }

@@ -1,0 +1,11 @@
+# Capability-System: CNode/Slots, Capability-Derivation-Tree (CDT),
+# copy/mint/move/delete/revoke. Reine, sichere Datenstruktur-Logik — kein unsafe.
+[package]
+name = "sel4lake-cap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+sel4lake-mem = { path = "../sel4lake-mem" }

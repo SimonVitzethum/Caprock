@@ -1,0 +1,5 @@
+# Bare-metal aarch64 needs `-Z build-std`, which requires a nightly toolchain
+# plus the `rust-src` component. Pinning here keeps the build reproducible.
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "rustfmt", "llvm-tools"]

@@ -1,0 +1,10 @@
+# Geteilte Kernel<->Thread-ABI: Syscall-Nummern, Nachrichten-Register-Layout,
+# Ergebniscodes. Reine Konstanten, kein unsafe, keine Abhängigkeiten.
+[package]
+name = "sel4lake-abi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]

@@ -1,0 +1,73 @@
+//! GICv2-Interrupt-Controller (QEMU `virt`: `arm,cortex-a15-gic`).
+//!
+//! GICD (Distributor) @ 0x0800_0000, GICC (CPU-Interface) @ 0x0801_0000.
+//! Diese Region ist als Device-Memory gemappt (MMU, ADR 0002), daher sind die
+//! volatilen MMIO-Zugriffe wohldefiniert. MMIO-Registerzugriff ist eine erlaubte
+//! `unsafe`-Domäne.
+
+use core::ptr::{read_volatile, write_volatile};
+
+const GICD_BASE: usize = 0x0800_0000;
+const GICC_BASE: usize = 0x0801_0000;
+
+const GICD_CTLR: usize = 0x000;
+const GICD_ISENABLER: usize = 0x100; // write-1-to-set, je Bit ein INTID
+
+const GICC_CTLR: usize = 0x000;
+const GICC_PMR: usize = 0x004; // Priority Mask
+const GICC_IAR: usize = 0x00c; // Interrupt Acknowledge
+const GICC_EOIR: usize = 0x010; // End Of Interrupt
+
+const INTID_MASK: u32 = 0x3ff;
+const SPURIOUS: u32 = 1023;
+
+fn gicd_write(off: usize, val: u32) {
+    // SAFETY: feste MMIO-Adresse des GIC-Distributors (Device-Memory).
+    unsafe { write_volatile((GICD_BASE + off) as *mut u32, val) }
+}
+fn gicc_write(off: usize, val: u32) {
+    // SAFETY: feste MMIO-Adresse des GIC-CPU-Interface (Device-Memory).
+    unsafe { write_volatile((GICC_BASE + off) as *mut u32, val) }
+}
+fn gicc_read(off: usize) -> u32 {
+    // SAFETY: feste MMIO-Adresse des GIC-CPU-Interface (Device-Memory).
+    unsafe { read_volatile((GICC_BASE + off) as *const u32) }
+}
+
+/// Distributor global aktivieren. Einmalig (Primärkern).
+pub fn init_dist() {
+    gicd_write(GICD_CTLR, 1);
+}
+
+/// CPU-Interface des aktuellen Kerns aktivieren (alle Prioritäten zulassen).
+pub fn init_cpu() {
+    gicc_write(GICC_PMR, 0xff);
+    gicc_write(GICC_CTLR, 1);
+}
+
+/// Eine (private) Interrupt-ID am Distributor freigeben.
+///
+/// Für PPIs (INTID 16..31) ist `GICD_ISENABLER0` pro Kern gebankt; jeder Kern
+/// ruft dies für seine eigene private Quelle (z. B. den Timer) auf.
+pub fn enable_intid(intid: u32) {
+    let reg = (intid / 32) as usize;
+    let bit = intid % 32;
+    gicd_write(GICD_ISENABLER + 4 * reg, 1 << bit);
+}
+
+/// IRQ aus dem Exception-Dispatch behandeln: acknowledgen, zuordnen, EOI.
+/// Gibt die behandelte INTID zurück (`None` bei spurious), damit der Aufrufer
+/// z. B. den Timer-Tick erkennt.
+pub fn handle_irq() -> Option<u32> {
+    let iar = gicc_read(GICC_IAR);
+    let intid = iar & INTID_MASK;
+    if intid == SPURIOUS {
+        return None;
+    }
+    if intid == crate::timer::TIMER_INTID {
+        crate::timer::on_irq();
+    }
+    // EOI mit vollständigem IAR-Wert (inkl. CPUID-Feld bei SGIs).
+    gicc_write(GICC_EOIR, iar);
+    Some(intid)
+}

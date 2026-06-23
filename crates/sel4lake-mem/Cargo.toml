@@ -1,0 +1,11 @@
+# Physisches Speichermodell: Memory-Capabilities + capability-basierter Allokator.
+#
+# Reine Arithmetik über physische Regionen — kein Speicherzugriff, kein `unsafe`.
+[package]
+name = "sel4lake-mem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]

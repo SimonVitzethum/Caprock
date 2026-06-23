@@ -1,0 +1,11 @@
+# Scheduler: Per-Kern-Run-Queues + Thread-Control-Blocks. Die eigentliche
+# Datenstrukturlogik ist sicher; der Kontextwechsel selbst liegt in sel4lake-hal.
+[package]
+name = "sel4lake-sched"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+sel4lake-hal = { path = "../sel4lake-hal" }

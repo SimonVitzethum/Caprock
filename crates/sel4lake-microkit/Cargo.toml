@@ -1,0 +1,16 @@
+# Microkit-Runtime (im Kernelimage): Protection Domains mit eigenem
+# Capability-Space + cap-gesicherter IPC-Dispatch.
+[package]
+name = "sel4lake-microkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+sel4lake-abi = { path = "../sel4lake-abi" }
+sel4lake-cap = { path = "../sel4lake-cap" }
+sel4lake-ipc = { path = "../sel4lake-ipc" }
+sel4lake-mem = { path = "../sel4lake-mem" }
+sel4lake-sched = { path = "../sel4lake-sched" }
+sel4lake-hal = { path = "../sel4lake-hal" }

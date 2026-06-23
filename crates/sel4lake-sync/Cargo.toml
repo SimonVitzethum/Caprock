@@ -1,0 +1,9 @@
+# Minimale no_std-Synchronisationsprimitive für SEL4Lake.
+[package]
+name = "sel4lake-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]

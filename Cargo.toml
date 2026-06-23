@@ -1,0 +1,35 @@
+# SEL4Lake — capability-based Rust microkernel.
+#
+# Workspace root. Phase 0 contains only the bootable `kernel` image crate.
+# Subsystem crates (capabilities, IPC, scheduler, memory) are split out in
+# their respective phases — see docs/00-overview.md for the planned layout.
+
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "crates/sel4lake-sync",
+    "crates/sel4lake-abi",
+    "crates/sel4lake-hal",
+    "crates/sel4lake-mem",
+    "crates/sel4lake-cap",
+    "crates/sel4lake-sched",
+    "crates/sel4lake-ipc",
+    "crates/sel4lake-microkit",
+]
+
+[workspace.package]
+edition = "2021"
+license = "BSD-2-Clause"
+authors = ["SEL4Lake"]
+version = "0.0.1"
+
+# Bare-metal kernel: no unwinding, abort on panic.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+# Keep symbols for debugging boot issues; strip later if image size matters.
+debug = true
+lto = "thin"

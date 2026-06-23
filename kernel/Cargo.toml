@@ -1,0 +1,26 @@
+# The SEL4Lake kernel image.
+#
+# Phase 0: bootable skeleton. By design the kernel image will only ever contain
+# the microkernel, capability system, scheduler, IPC and the Microkit runtime —
+# drivers and services live in userland (see docs/adr/0006-hot-reload-architecture.md).
+
+[package]
+name = "sel4lake-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "sel4lake-kernel"
+path = "src/main.rs"
+
+[dependencies]
+sel4lake-hal = { path = "../crates/sel4lake-hal" }
+sel4lake-sync = { path = "../crates/sel4lake-sync" }
+sel4lake-mem = { path = "../crates/sel4lake-mem" }
+sel4lake-cap = { path = "../crates/sel4lake-cap" }
+sel4lake-sched = { path = "../crates/sel4lake-sched" }
+sel4lake-ipc = { path = "../crates/sel4lake-ipc" }
+sel4lake-abi = { path = "../crates/sel4lake-abi" }
+sel4lake-microkit = { path = "../crates/sel4lake-microkit" }

@@ -1,0 +1,13 @@
+# Synchrone IPC: Endpoints (Rendezvous Sender/Empfänger), Call/Recv/Reply.
+# Orchestriert Scheduler-Block/Unblock + Nachrichtentransfer zwischen TrapFrames.
+[package]
+name = "sel4lake-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+sel4lake-abi = { path = "../sel4lake-abi" }
+sel4lake-hal = { path = "../sel4lake-hal" }
+sel4lake-sched = { path = "../sel4lake-sched" }

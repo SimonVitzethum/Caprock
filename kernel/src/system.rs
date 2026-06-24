@@ -15,12 +15,24 @@ use sel4lake_hal::{self as hal, exception::TrapFrame};
 use sel4lake_ipc::{EndpointTable, NotificationTable};
 use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
 use sel4lake_microkit::PdTable;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use sel4lake_sched::{Scheduler, ThreadId};
 use sel4lake_sync::SpinLock;
 
 const STACK_SIZE: u64 = 64 * 1024;
 /// Standardpriorität für Idle und gewöhnliche Demo-Threads (Round-Robin).
 pub const IDLE_PRIO: u8 = 1;
+
+// EL0-User-Threads: Kernel-Stacks aus einem EL1-only Pool (Linker), User-Stacks
+// aus dem EL0-zugänglichen RAM.
+extern "C" {
+    static __user_kstacks_bottom: u8;
+}
+const USER_KSTACK_SIZE: usize = 0x4000; // 16 KiB (muss zur Linker-Reservierung passen)
+const USER_KSTACK_COUNT: usize = 4;
+static USER_KSTACK_NEXT: AtomicUsize = AtomicUsize::new(0);
+/// Sticky: wurde jemals ein Syscall von EL0 (User-Thread) gesehen?
+static EL0_SYSCALL_SEEN: AtomicBool = AtomicBool::new(false);
 
 /// Geteilte Ressourcen (alles außer dem Scheduler).
 struct Resources {
@@ -52,6 +64,9 @@ fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
 
 fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
     let core = hal::cpu::core_id();
+    if hal::exception::frame_from_el0(frame as usize) {
+        EL0_SYSCALL_SEEN.store(true, Ordering::Relaxed);
+    }
     // Lock-Ordnung RES vor SCHED.
     let mut res = RES.lock();
     let mut sched = SCHED.lock();
@@ -154,6 +169,31 @@ pub fn spawn(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
         (stack.base() as usize, stack.len() as usize)
     };
     SCHED.lock().spawn(core, entry, arg, base, len, prio)
+}
+
+/// Einen **EL0-User-Thread** erzeugen: Kernel-Stack aus dem EL1-only Pool,
+/// User-Stack aus dem EL0-zugänglichen RAM. Der Thread läuft auf EL0 und kann nur
+/// per Syscall mit dem Kernel interagieren. Lock-Ordnung RES vor SCHED.
+pub fn spawn_user(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
+    let core = hal::cpu::core_id();
+    let idx = USER_KSTACK_NEXT.fetch_add(1, Ordering::Relaxed);
+    if idx >= USER_KSTACK_COUNT {
+        return None;
+    }
+    let kbase = core::ptr::addr_of!(__user_kstacks_bottom) as usize + idx * USER_KSTACK_SIZE;
+    let mut res = RES.lock();
+    let user_top = {
+        let s = res.phys.alloc(STACK_SIZE, 16)?;
+        (s.base() + s.len()) as usize
+    };
+    SCHED
+        .lock()
+        .spawn_user(core, entry, arg, kbase, USER_KSTACK_SIZE, user_top, prio)
+}
+
+/// Wurde jemals ein Syscall von EL0 (echter User-Thread) ausgeführt?
+pub fn el0_syscall_seen() -> bool {
+    EL0_SYSCALL_SEEN.load(Ordering::Relaxed)
 }
 
 /// Eine Tcb-Capability für einen Thread prägen (cap-kontrolliertes `KILL`).

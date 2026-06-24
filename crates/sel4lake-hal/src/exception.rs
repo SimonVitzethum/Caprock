@@ -23,7 +23,8 @@ pub struct TrapFrame {
     pub elr: u64,
     /// `SPSR_EL1` — gesicherter Prozessorstatus.  Offset 256
     pub spsr: u64,
-    _pad: u64, // 264 -> 272
+    /// `SP_EL0` — User-Stack-Pointer (nur relevant für EL0-Threads).  Offset 264
+    pub sp_el0: u64,
     /// q0..q31 (FP/SIMD).  Offset 272..784
     pub fpregs: [u128; 32],
     /// `FPSR`.  Offset 784
@@ -56,6 +57,8 @@ global_asm!(
     mrs     x10, SPSR_EL1
     stp     x30, x9,  [sp, #240]
     str     x10, [sp, #256]
+    mrs     x9,  sp_el0            // User-Stack-Pointer sichern (EL0-Threads)
+    str     x9,  [sp, #264]
     mov     x1,  #\id
     b       __trap_dispatch
 .endm
@@ -134,6 +137,8 @@ __trap_dispatch:
     // GP-Kontext wiederherstellen.
     ldr     x10, [sp, #256]
     msr     SPSR_EL1, x10
+    ldr     x9,  [sp, #264]        // User-Stack-Pointer wiederherstellen (EL0)
+    msr     sp_el0, x9
     ldp     x30, x9,  [sp, #240]
     msr     ELR_EL1, x9
     ldp     x28, x29, [sp, #224]
@@ -241,22 +246,42 @@ pub fn frame_set_reg(frame: usize, idx: usize, val: u64) {
     }
 }
 
-/// Einen initialen TrapFrame am oberen Ende eines frischen Thread-Stacks
-/// anlegen, sodass der Trap-Restore-Epilog per `eret` in `entry(arg)` springt.
-/// Gibt den Frame-Zeiger (initialer gespeicherter SP des Threads) zurück.
-pub fn init_thread_frame(stack_top: usize, entry: usize, arg: usize) -> usize {
+/// `SPSR` des Frames (z. B. um das Exception-Level des Aufrufers zu bestimmen:
+/// die Modus-Bits `[3:0]` sind `0b0000` für EL0t, `0b0101` für EL1h).
+pub fn frame_spsr(frame: usize) -> u64 {
+    // SAFETY: gültiger TrapFrame-Zeiger (Kontext-/Trap-Domäne).
+    unsafe { (*(frame as *const TrapFrame)).spsr }
+}
+
+/// `true`, wenn der Frame von EL0 stammt (User-Thread).
+pub fn frame_from_el0(frame: usize) -> bool {
+    frame_spsr(frame) & 0xf == 0
+}
+
+/// Einen initialen TrapFrame anlegen, sodass der Trap-Restore-Epilog per `eret`
+/// in `entry(arg)` springt. `stack_top` ist der (Kernel-)Stack, auf dem der Frame
+/// liegt; bei einem EL0-Thread (`el0 = true`) läuft der Thread auf dem separaten
+/// `user_sp` und auf EL0, sonst auf EL1 mit `stack_top`. Gibt den Frame-Zeiger
+/// (initialer gespeicherter SP des Threads) zurück.
+pub fn init_thread_frame(
+    stack_top: usize,
+    entry: usize,
+    arg: usize,
+    el0: bool,
+    user_sp: usize,
+) -> usize {
     let frame_addr = stack_top - core::mem::size_of::<TrapFrame>();
     // SAFETY: `frame_addr` liegt in einem frisch allozierten, exklusiv besessenen
-    // Thread-Stack (RW, identity-gemappt). Wir initialisieren genau einen
-    // TrapFrame, den der Restore-Epilog konsumiert. Thread-Kontext-Setup ist eine
-    // erlaubte unsafe-Domäne.
+    // Stack (RW, identity-gemappt). Wir initialisieren genau einen TrapFrame, den
+    // der Restore-Epilog konsumiert. Thread-Kontext-Setup ist erlaubte Domäne.
     unsafe {
         let f = frame_addr as *mut TrapFrame;
         (*f).gpr = [0; 31];
         (*f).gpr[0] = arg as u64; // x0 = Argument
         (*f).elr = entry as u64; // Resume-PC
-        (*f).spsr = 0x5; // EL1h, DAIF=0 -> IRQs frei (preemptierbar)
-        (*f)._pad = 0;
+        // SPSR-Modus: EL0t (0b0000) für User-Threads, sonst EL1h (0b0101). DAIF=0.
+        (*f).spsr = if el0 { 0x0 } else { 0x5 };
+        (*f).sp_el0 = user_sp as u64;
         (*f).fpregs = [0; 32]; // frischer FP/SIMD-Zustand
         (*f).fpsr = 0;
         (*f).fpcr = 0;

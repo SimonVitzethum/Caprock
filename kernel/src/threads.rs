@@ -66,6 +66,10 @@ static CONSUMER_DONE: AtomicBool = AtomicBool::new(false);
 static XFER_RESULT: AtomicU64 = AtomicU64::new(0);
 static XFER_DONE: AtomicBool = AtomicBool::new(false);
 
+// EL0-Userland: ein echter EL0-User-Thread ruft per Syscall einen EL1-Server.
+const USER_MAGIC: u64 = 0xC0DE;
+static USER_RECV: AtomicU64 = AtomicU64::new(0);
+
 // Stateful Hot-Reload: Zähler-Service, dessen Zustand (in einer Memory-Region)
 // den Komponententausch v1(+1) -> v2(+10) überlebt.
 static CS_STATE_BASE: AtomicU64 = AtomicU64::new(0);
@@ -202,6 +206,20 @@ pub fn spawn_demo() {
         v2_pd: cs_v2_pd,
     });
 
+    // EL0-Userland: ein EL1-Server + ein echter EL0-User-Thread, der per Syscall ruft.
+    let uep = system::create_endpoint().expect("user ep");
+    let uroot = system::install_endpoint_cap(uep as u32, Rights::RWX).expect("user ep cap");
+    let usend = system::cap_mint(uroot, Rights::WRITE, 0).expect("user send");
+    let urecv = system::cap_mint(uroot, Rights::READ, 0).expect("user recv");
+    let usrv_pd = system::create_pd().expect("user server pd");
+    system::install_pd_cap(usrv_pd, 0, urecv);
+    let usrv = system::spawn(user_server as *const () as usize, 0, prio).expect("user server");
+    system::bind_pd(usrv_pd, usrv);
+    let user_pd = system::create_pd().expect("user pd");
+    system::install_pd_cap(user_pd, 0, usend);
+    let ut = system::spawn_user(user_entry as *const () as usize, 0, prio).expect("user thread");
+    system::bind_pd(user_pd, ut);
+
     // Freies RAM mit allen Stacks (Baseline für die Rückgewinnungs-Prüfung).
     FREE_BASELINE.store(system::total_free(), Ordering::Relaxed);
 
@@ -315,6 +333,48 @@ extern "C" fn cs_client(_arg: usize) -> ! {
     invoke(sys::EXIT, 0, [0; 4], 0);
     loop {
         core::hint::spin_loop();
+    }
+}
+
+/// EL1-Server für den EL0-User-Thread: empfängt dessen `CALL` und merkt sich den
+/// Wert (Beleg, dass der EL0-Syscall durchkam), antwortet leer.
+extern "C" fn user_server(_arg: usize) -> ! {
+    loop {
+        let m = invoke(sys::RECV, 0, [0; 4], 0);
+        if m.result != result::OK {
+            break;
+        }
+        USER_RECV.store(m.msg[0], Ordering::Relaxed);
+        invoke(sys::REPLY, 0, [0; 4], 0);
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// **EL0-User-Programm** (eigene Sektion `.user_text`, EL0-ausführbar). Es darf
+/// NUR Syscalls ausführen (kein Kernelzugriff): ein `CALL` mit `USER_MAGIC` über
+/// den Endpoint an lokalem Cap-Slot 0, danach Selbst-Park. Reines Inline-`svc`,
+/// damit kein EL1-Kernelcode aufgerufen wird.
+#[link_section = ".user_text"]
+extern "C" fn user_entry(_arg: usize) -> ! {
+    // SAFETY: EL0-User-Code; `svc` ist die einzige erlaubte Kernel-Interaktion.
+    unsafe {
+        // CALL(slot 0, msg0 = USER_MAGIC)
+        core::arch::asm!(
+            "svc #0",
+            inout("x0") sys::CALL => _,
+            inout("x1") 0u64 => _,
+            inout("x2") USER_MAGIC => _,
+            lateout("x3") _, lateout("x4") _, lateout("x5") _, lateout("x6") _,
+            options(nostack),
+        );
+        // Danach dauerhaft parken (kein weiterer Kernelzugriff nötig).
+        core::arch::asm!(
+            "svc #0",
+            in("x0") sys::PARK,
+            options(noreturn, nostack),
+        );
     }
 }
 
@@ -530,7 +590,8 @@ fn all_done() -> bool {
     let notif = PRODUCER_DONE.load(Ordering::Acquire) && NOTIF_COUNT.load(Ordering::Relaxed) >= NOTIF_ROUNDS;
     let xfer = XFER_DONE.load(Ordering::Acquire);
     let ckpt = CS_DONE.load(Ordering::Acquire);
-    workers && cores && fp && prio && life && notif && xfer && ckpt
+    let el0 = USER_RECV.load(Ordering::Relaxed) == USER_MAGIC && system::el0_syscall_seen();
+    workers && cores && fp && prio && life && notif && xfer && ckpt && el0
 }
 
 fn report() {
@@ -600,6 +661,13 @@ fn report() {
     let xr = XFER_RESULT.load(Ordering::Relaxed);
     println!("xfer    : svc call(7) ueber transferierte Cap -> {xr} (erwartet 21)");
     println!("xfer    : {}", if xr == 21 { "ALL PASS" } else { "FAILURES" });
+
+    // EL0-Userland: echter EL0-Thread hat per Syscall einen EL1-Server gerufen.
+    let urecv = USER_RECV.load(Ordering::Relaxed);
+    let el0_seen = system::el0_syscall_seen();
+    println!("el0     : EL1-Server empfing {urecv:#x} (erwartet {USER_MAGIC:#x}); EL0-Syscall gesehen: {el0_seen}");
+    let el0_ok = urecv == USER_MAGIC && el0_seen;
+    println!("el0     : {} (User-Thread laeuft auf EL0, nur via Syscall)", if el0_ok { "ALL PASS" } else { "FAILURES" });
 
     // Stateful Hot-Reload: Zustand (Zähler) bleibt über v1->v2 erhalten.
     let r1 = [

@@ -30,6 +30,15 @@ SECTIONS {
         __text_end = .;
     } :text
 
+    /* User-Code (EL0-ausführbar). Eigene Sektion, von der MMU als EL0-RX
+     * gemappt; getrennt vom EL1-only Kernel-Code. */
+    .user_text : ALIGN(4096) {
+        __user_text_start = .;
+        *(.user_text .user_text.*)
+        . = ALIGN(4096);
+        __user_text_end = .;
+    } :text
+
     .rodata : ALIGN(4096) {
         __rodata_start = .;
         *(.rodata .rodata.*)
@@ -63,6 +72,13 @@ SECTIONS {
         __sec_stacks_bottom = .;
         . += 0x10000 * 8;
         __sec_stacks_top = .;
+
+        /* Kernel-Stacks für EL0-Threads (EL1-only, da im Kernel-Image-Bereich).
+         * Ein 16-KiB-Slot je EL0-Thread; getrennt vom EL0-zugänglichen User-Stack. */
+        . = ALIGN(16);
+        __user_kstacks_bottom = .;
+        . += 0x4000 * 4; /* 4 EL0-Threads × 16 KiB */
+        __user_kstacks_top = .;
     } :data
 
     . = ALIGN(4096);

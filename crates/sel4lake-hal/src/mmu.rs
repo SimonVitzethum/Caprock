@@ -30,6 +30,8 @@ extern "C" {
     static __text_end: u8;
     static __rodata_start: u8;
     static __rodata_end: u8;
+    static __user_text_start: u8;
+    static __user_text_end: u8;
     static __kernel_end: u8;
 }
 
@@ -55,6 +57,8 @@ const AF: u64 = 1 << 10; //      Access Flag
 const SH_INNER: u64 = 0b11 << 8; // Inner Shareable (für Normal-Memory)
 const AP_RW: u64 = 0b00 << 6; //  RW, nur EL1
 const AP_RO: u64 = 0b10 << 6; //  RO, nur EL1
+const AP_RW_EL0: u64 = 0b01 << 6; // RW, EL0 + EL1 (User-Daten/Stacks)
+const AP_RO_EL0: u64 = 0b11 << 6; // RO, EL0 + EL1 (User-Code)
 const ATTR_DEVICE: u64 = 0 << 2; // MAIR-Index 0
 const ATTR_NORMAL: u64 = 1 << 2; // MAIR-Index 1
 const PXN: u64 = 1 << 53; //      Privileged Execute Never
@@ -68,12 +72,16 @@ const RAM_BASE: u64 = 0x4000_0000;
 /// Zugriffsrecht eines Normal-Memory-Leafs.
 #[derive(Clone, Copy)]
 enum Perm {
-    /// Read + Execute (Code).
+    /// Kernel Read + Execute (Code, nur EL1).
     Rx,
-    /// Read only (Konstanten).
+    /// Kernel Read only (Konstanten, nur EL1).
     Ro,
-    /// Read + Write, niemals ausführbar (Daten, Stacks, freies RAM).
+    /// Kernel Read + Write, niemals ausführbar (Kernel-Daten/Stacks, nur EL1).
     Rw,
+    /// User Read + Write, niemals ausführbar (User-Daten/Stacks, EL0+EL1).
+    UserRw,
+    /// User Read + Execute (User-Code; EL0 ausführbar, EL1 nicht (PXN)).
+    UserRx,
 }
 
 /// Device-Block (nicht-cacheable, XN, RW). Für die MMIO-1-GiB-Region.
@@ -83,9 +91,11 @@ const DEVICE_BLOCK: u64 = BLOCK_DESC | AF | AP_RW | ATTR_DEVICE | PXN | UXN;
 fn normal_leaf(addr: u64, perm: Perm, page: bool) -> u64 {
     let kind = if page { PAGE_DESC } else { BLOCK_DESC };
     let perm_bits = match perm {
-        Perm::Rx => AP_RO, //              ausführbar: PXN=UXN=0
+        Perm::Rx => AP_RO, //                   ausführbar bei EL1 (PXN=UXN=0)
         Perm::Ro => AP_RO | PXN | UXN,
         Perm::Rw => AP_RW | PXN | UXN,
+        Perm::UserRw => AP_RW_EL0 | PXN | UXN, // EL0+EL1 RW, kein Code
+        Perm::UserRx => AP_RO_EL0 | PXN, //      EL0 ausführbar (UXN=0), EL1 nicht (PXN)
     };
     addr | AF | SH_INNER | ATTR_NORMAL | perm_bits | kind
 }
@@ -102,12 +112,14 @@ fn sym(addr_of: &u8) -> u64 {
 /// Recht für die 4-KiB-Seite, die bei `addr` beginnt (Kernel-Sektionen).
 fn perm_for_page(addr: u64) -> Perm {
     // SAFETY: nur Adressberechnung über Linker-Symbole, kein Speicherzugriff.
-    let (ts, te, rs, re, ke) = unsafe {
+    let (ts, te, rs, re, us, ue, ke) = unsafe {
         (
             sym(&__text_start),
             sym(&__text_end),
             sym(&__rodata_start),
             sym(&__rodata_end),
+            sym(&__user_text_start),
+            sym(&__user_text_end),
             sym(&__kernel_end),
         )
     };
@@ -115,9 +127,12 @@ fn perm_for_page(addr: u64) -> Perm {
         Perm::Rx
     } else if addr >= rs && addr < re {
         Perm::Ro
+    } else if addr >= us && addr < ue {
+        Perm::UserRx // EL0-ausführbarer User-Code
+    } else if addr >= ke {
+        Perm::UserRw // freies RAM oberhalb des Images (< 2 MiB): EL0-zugänglich
     } else {
-        // Unterhalb des Images, Daten/BSS/Stacks und freies RAM (< 2 MiB): RW+XN.
-        let _ = ke;
+        // Kernel-Daten/BSS/Stacks (EL1-only).
         Perm::Rw
     }
 }
@@ -140,20 +155,21 @@ fn build_tables() {
         *entry = normal_leaf(addr, perm_for_page(addr), true);
     }
 
-    // L2: [0] -> L3 ; [1..] = restliches GiB 1 als 2-MiB-RW+XN-Blöcke.
+    // L2: [0] -> L3 ; [1..] = restliches GiB 1 als 2-MiB-Blöcke, EL0-zugänglich
+    // (freies RAM für User-Stacks/-Daten).
     let l2 = table_mut(&L2_TABLE);
     l2[0] = table_desc(table_phys(&L3_TABLE));
     for (i, entry) in l2.iter_mut().enumerate().skip(1) {
         let addr = RAM_BASE + i as u64 * TWO_MIB;
-        *entry = normal_leaf(addr, Perm::Rw, false);
+        *entry = normal_leaf(addr, Perm::UserRw, false);
     }
 
-    // L1: [0] Device ; [1] -> L2 ; [2..=8] freies RAM als 1-GiB-RW+XN-Blöcke.
+    // L1: [0] Device ; [1] -> L2 ; [2..=8] freies RAM (EL0-zugänglich).
     let l1 = table_mut(&L1_TABLE);
     l1[0] = DEVICE_BLOCK; // 0..1 GiB (MMIO)
     l1[1] = table_desc(table_phys(&L2_TABLE)); // 1..2 GiB (Kernel-GiB)
     for i in 2..=8u64 {
-        l1[i as usize] = normal_leaf(i * ONE_GIB, Perm::Rw, false);
+        l1[i as usize] = normal_leaf(i * ONE_GIB, Perm::UserRw, false);
     }
 
     // Sicherheitsnetz: das Kernelimage muss in die ersten 2 MiB passen, sonst

@@ -25,6 +25,11 @@ FP-Korrektheitstest (zwei Threads → 75 000) besteht weiterhin (eager).
 
 → Lazy-FP ist damit an die spätere **EL0-Userland-Phase** geknüpft (ADR 0002).
 
+> **Nachtrag (2026-06-24):** Mit der EL0/EL1-Trennung (ext-4) ist Lazy-FP nun
+> umgesetzt — `FPEN=0b01` (nur EL0 trappt) + soft-float Microkernel. Siehe
+> [ext-5](ext-5-lazy-fp.md). Der eager-FP-Pfad ist entfernt; der `fp`-Check ist
+> jetzt ein echter EL0-Lazy-FP-Test.
+
 ## 2. Lock-Granularität — Scheduler-Lock vom Ressourcen-Lock getrennt
 
 **Umgesetzt (`kernel/src/system.rs`):** Der bisher einzelne `SYSTEM`-Lock wurde in

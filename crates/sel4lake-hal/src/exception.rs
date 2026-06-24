@@ -11,10 +11,11 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Auf dem Stack gesicherter Registerkontext einer Exception.
 ///
-/// Das Layout entspricht exakt der Speichersequenz im Vektor-Assembler.
-/// Der FP/SIMD-Zustand wird **eager** gesichert (volle q0..q31), damit Threads
-/// Fließkomma/SIMD über Preemption hinweg nutzen können. (Lazy-FP — Sichern erst
-/// bei Bedarf — wäre eine spätere Optimierung; ADR 0005.)
+/// Das Layout entspricht exakt der Speichersequenz im Vektor-Assembler. Der
+/// FP/SIMD-Zustand liegt **nicht** im Frame: er wird **lazy** verwaltet (siehe
+/// [`crate::fp`]) — der Trap-Pfad ist integer-only und kostet keine 512 Byte
+/// FP-Sicherung pro Trap. FP-Register gehören pro Kern dem aktuellen FP-Owner;
+/// erst ein FP-Trap (EC 0x07) aus EL0 löst Save/Restore aus.
 #[repr(C, align(16))]
 pub struct TrapFrame {
     /// x0..x30 (x30 = Link Register).  Offset 0..248
@@ -23,21 +24,15 @@ pub struct TrapFrame {
     pub elr: u64,
     /// `SPSR_EL1` — gesicherter Prozessorstatus.  Offset 256
     pub spsr: u64,
-    /// `SP_EL0` — User-Stack-Pointer (nur relevant für EL0-Threads).  Offset 264
+    /// `SP_EL0` — User-Stack-Pointer (nur relevant für EL0-Threads).  Offset 264 -> 272
     pub sp_el0: u64,
-    /// q0..q31 (FP/SIMD).  Offset 272..784
-    pub fpregs: [u128; 32],
-    /// `FPSR`.  Offset 784
-    pub fpsr: u64,
-    /// `FPCR`.  Offset 792 -> 800
-    pub fpcr: u64,
 }
 
 global_asm!(
     r#"
 .macro VENTRY id
 .balign 0x80
-    sub     sp, sp, #800
+    sub     sp, sp, #272
     stp     x0,  x1,  [sp, #0]
     stp     x2,  x3,  [sp, #16]
     stp     x4,  x5,  [sp, #32]
@@ -85,54 +80,10 @@ __exception_vectors:
     VENTRY 15
 
 __trap_dispatch:
-    // FP/SIMD-Kontext sichern (q0..q31 @272, FPSR/FPCR @784). x1 (vector id)
-    // und x0 bleiben unberührt; x9/x10 sind bereits im GP-Bereich gesichert.
-    stp     q0,  q1,  [sp, #272]
-    stp     q2,  q3,  [sp, #304]
-    stp     q4,  q5,  [sp, #336]
-    stp     q6,  q7,  [sp, #368]
-    stp     q8,  q9,  [sp, #400]
-    stp     q10, q11, [sp, #432]
-    stp     q12, q13, [sp, #464]
-    stp     q14, q15, [sp, #496]
-    stp     q16, q17, [sp, #528]
-    stp     q18, q19, [sp, #560]
-    stp     q20, q21, [sp, #592]
-    stp     q22, q23, [sp, #624]
-    stp     q24, q25, [sp, #656]
-    stp     q26, q27, [sp, #688]
-    stp     q28, q29, [sp, #720]
-    stp     q30, q31, [sp, #752]
-    mrs     x9,  FPSR
-    mrs     x10, FPCR
-    add     x11, sp, #784         // GP-stp-Offset reicht nur bis 504 -> Adresse bilden
-    stp     x9,  x10, [x11]
-
+    // Integer-only Trap-Pfad: KEIN FP/SIMD-Save (Lazy-FP, siehe crate::fp).
     mov     x0, sp                // x0 = &TrapFrame ; x1 = vector id
     bl      handle_exception
     mov     sp, x0                // x0 = wiederherzustellender Frame (ggf. anderer Thread)
-
-    // FP/SIMD-Kontext wiederherstellen (vor dem GP-Restore, der x9/x10/x11 setzt).
-    add     x11, sp, #784
-    ldp     x9,  x10, [x11]
-    msr     FPSR, x9
-    msr     FPCR, x10
-    ldp     q0,  q1,  [sp, #272]
-    ldp     q2,  q3,  [sp, #304]
-    ldp     q4,  q5,  [sp, #336]
-    ldp     q6,  q7,  [sp, #368]
-    ldp     q8,  q9,  [sp, #400]
-    ldp     q10, q11, [sp, #432]
-    ldp     q12, q13, [sp, #464]
-    ldp     q14, q15, [sp, #496]
-    ldp     q16, q17, [sp, #528]
-    ldp     q18, q19, [sp, #560]
-    ldp     q20, q21, [sp, #592]
-    ldp     q22, q23, [sp, #624]
-    ldp     q24, q25, [sp, #656]
-    ldp     q26, q27, [sp, #688]
-    ldp     q28, q29, [sp, #720]
-    ldp     q30, q31, [sp, #752]
 
     // GP-Kontext wiederherstellen.
     ldr     x10, [sp, #256]
@@ -156,7 +107,7 @@ __trap_dispatch:
     ldp     x4,  x5,  [sp, #32]
     ldp     x2,  x3,  [sp, #16]
     ldp     x0,  x1,  [sp, #0]
-    add     sp, sp, #800
+    add     sp, sp, #272
     eret
 "#
 );
@@ -245,6 +196,31 @@ pub fn set_fault_hook(hook: FaultHook) {
     FAULT_HOOK.store(hook as usize, Ordering::Release);
 }
 
+/// Optionaler FP-Trap-Hook (vom Lazy-FP-Subsystem registriert). Behandelt einen
+/// FP/SIMD-Zugriffstrap (EC 0x07) aus EL0: Owner-Wechsel der FP-Register. `0` =
+/// nicht gesetzt.
+static FP_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Signatur des FP-Trap-Hooks: aktueller Frame -> wiederherzustellender Frame
+/// (i. d. R. derselbe; der `eret` wiederholt die getrappte Instruktion).
+pub type FpHook = fn(*mut TrapFrame) -> *mut TrapFrame;
+
+/// FP-Trap-Hook registrieren (vor dem Aktivieren von IRQs/Threads aufzurufen).
+pub fn set_fp_hook(hook: FpHook) {
+    FP_HOOK.store(hook as usize, Ordering::Release);
+}
+
+fn fp_trap(frame: *mut TrapFrame) -> *mut TrapFrame {
+    let h = FP_HOOK.load(Ordering::Acquire);
+    if h == 0 {
+        // Kein Lazy-FP-Subsystem: FP-Trap ist hier unerwartet -> als Fault behandeln.
+        return frame;
+    }
+    // SAFETY: nur über `set_fp_hook` mit einem gültigen Zeiger dieses Typs gesetzt.
+    let hook: FpHook = unsafe { core::mem::transmute(h) };
+    hook(frame)
+}
+
 /// Register `xidx` eines (gesicherten) TrapFrames lesen. Für den
 /// Nachrichtentransfer zwischen Threads (IPC).
 pub fn frame_reg(frame: usize, idx: usize) -> u64 {
@@ -297,9 +273,6 @@ pub fn init_thread_frame(
         // SPSR-Modus: EL0t (0b0000) für User-Threads, sonst EL1h (0b0101). DAIF=0.
         (*f).spsr = if el0 { 0x0 } else { 0x5 };
         (*f).sp_el0 = user_sp as u64;
-        (*f).fpregs = [0; 32]; // frischer FP/SIMD-Zustand
-        (*f).fpsr = 0;
-        (*f).fpcr = 0;
     }
     frame_addr
 }
@@ -327,6 +300,12 @@ pub extern "C" fn handle_exception(frame: *mut TrapFrame, kind: u64) -> *mut Tra
     if ec == 0x15 {
         // SVC (AArch64) -> Syscall. ELR zeigt bereits hinter das `svc`.
         return syscall(frame);
+    }
+    if ec == 0x07 {
+        // Zugriff auf FP/SIMD aus EL0 getrappt (Lazy-FP): Owner-Wechsel. Der Hook
+        // lädt den FP-Kontext des Threads und gibt den Frame unverändert zurück;
+        // der `eret` führt die getrappte FP-Instruktion dann erneut aus.
+        return fp_trap(frame);
     }
 
     // Echter Fault: diagnostizieren.

@@ -23,7 +23,7 @@ use sel4lake_ipc::{EndpointTable, NotificationTable};
 use sel4lake_mem::Rights;
 use sel4lake_sched::{Scheduler, ThreadId};
 
-const NPDS: usize = 16;
+const NPDS: usize = 32;
 /// Cap-Slots je PD-Cspace.
 const NCAPS: usize = 16;
 

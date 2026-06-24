@@ -31,8 +31,8 @@ _start:
     b       1b
 
 2:
-    mov     x9, #(3 << 20)            // CPACR_EL1.FPEN = 0b11: FP/SIMD bei EL0/EL1
-    msr     cpacr_el1, x9             // nicht trappen (rustc/LLVM emittiert NEON)
+    mov     x9, #(1 << 20)            // CPACR_EL1.FPEN = 0b01: FP/SIMD nur an EL0
+    msr     cpacr_el1, x9             // trappen (Lazy-FP); EL1-Kernel ist soft-float
     isb
 
     adrp    x9, __boot_stack_top      // install boot stack (SP must be 16-aligned)
@@ -60,8 +60,8 @@ _start:
 .globl _start_secondary
 _start_secondary:
     msr     daifset, #0xf             // mask exceptions during bring-up
-    mov     x9, #(3 << 20)            // FP/SIMD bei EL1 freigeben (wie Primärkern)
-    msr     cpacr_el1, x9
+    mov     x9, #(1 << 20)            // CPACR_EL1.FPEN = 0b01: FP/SIMD nur an EL0 trappen
+    msr     cpacr_el1, x9             // (wie Primärkern; EL1 ist soft-float)
     isb
     mov     sp, x0                    // x0 = context-id = this core's stack top
     bl      kernel_secondary_main

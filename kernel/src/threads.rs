@@ -20,11 +20,16 @@ use sel4lake_sync::SpinLock;
 const NUM_CORES: usize = 8;
 const NWORKERS: usize = 3;
 const THRESHOLD: u64 = 3;
-/// FP-Korrektheitstest: zwei Threads summieren `FP_ITERS`-mal `1.5` und werden
-/// dabei gegenseitig preemptiert. Nur mit korrekter FP-Kontextsicherung bleibt
-/// der (in einem FP-Register gehaltene) Akkumulator über Preemption erhalten.
+/// Lazy-FP-Test: zwei **echte EL0-User-Threads** halten je ein eindeutiges Muster
+/// in FP-Registern (d0..d3) und geben per `YIELD` gegenseitig ab. Der Kernel ist
+/// soft-float und FP trappt nur an EL0 -> der Lazy-Owner-Wechsel (FP-Trap EC 0x07)
+/// muss das Muster über jede Abgabe hinweg korrekt sichern/wiederherstellen, sonst
+/// erkennt der Thread eine Korruption und meldet KEINEN Erfolg.
 const FP_WORKERS: usize = 2;
-const FP_ITERS: u64 = 50_000;
+const FP_CHECK_ITERS: u64 = 200; // Iterationen je Thread, jede mit YIELD (Owner-Wechsel)
+const FP_PRIO: u8 = 5; // eigene, höchste Demo-Priorität -> striktes A<->B-Ping-Pong
+const FP_PATTERN: [u64; FP_WORKERS] = [0xA5A5_5A5A_3C3C_C3C3, 0x1234_5678_9ABC_DEF0];
+const FP_ALL_OK: u64 = (1 << FP_WORKERS) - 1;
 /// Prioritätstest: drei Threads mit Prioritäten 4 > 3 > 2 (alle über der
 /// Standardpriorität 1) führen Arbeit aus und parken sich danach. Der höher
 /// priorisierte muss zuerst fertig werden.
@@ -37,8 +42,9 @@ const B1_IN: [u64; 2] = [5, 6]; // Server v1: verdoppelt -> [10, 12]
 const B2_IN: [u64; 2] = [5, 6]; // Server v2: verdreifacht -> [15, 18]
 
 static WORKER_COUNTS: [AtomicU64; NWORKERS] = [const { AtomicU64::new(0) }; NWORKERS];
-static FP_RESULT: [AtomicU64; FP_WORKERS] = [const { AtomicU64::new(0) }; FP_WORKERS];
-static FP_DONE: [AtomicBool; FP_WORKERS] = [const { AtomicBool::new(false) }; FP_WORKERS];
+/// Erfolgs-Maske der EL0-FP-Threads (Bit i = Thread i meldete unbeschädigtes Muster).
+static FP_OK_MASK: AtomicU64 = AtomicU64::new(0);
+static FP_COLLECTOR_DONE: AtomicBool = AtomicBool::new(false);
 static PRIO_SEQ: AtomicU64 = AtomicU64::new(0);
 static PRIO_FINISH: [AtomicU64; NPRIO_TEST] = [const { AtomicU64::new(0) }; NPRIO_TEST];
 static PRIO_DONE: [AtomicBool; NPRIO_TEST] = [const { AtomicBool::new(false) }; NPRIO_TEST];
@@ -120,8 +126,23 @@ pub fn spawn_demo() {
     for id in 0..NWORKERS {
         system::spawn(worker as *const () as usize, id, prio);
     }
+    // Lazy-FP: ein EL1-Kollektor + zwei EL0-FP-User-Threads (höchste Demo-Prio ->
+    // striktes Ping-Pong über YIELD, das jede Iteration einen Owner-Wechsel erzwingt).
+    let fp_ntfn = system::create_notification().expect("fp ntfn");
+    let fp_nroot = system::install_notification_cap(fp_ntfn as u32, Rights::RWX).expect("fp ntfn cap");
+    let fp_wait = system::cap_mint(fp_nroot, Rights::READ, 0).expect("fp wait cap");
+    let fp_coll_pd = system::create_pd().expect("fp collector pd");
+    system::install_pd_cap(fp_coll_pd, 0, fp_wait);
+    let fp_coll = system::spawn(fp_collector as *const () as usize, 0, prio).expect("fp collector");
+    system::bind_pd(fp_coll_pd, fp_coll);
+    let fp_entry = core::ptr::addr_of!(user_fp_entry) as usize;
     for id in 0..FP_WORKERS {
-        system::spawn(fp_worker as *const () as usize, id, prio);
+        let sig = system::cap_mint(fp_nroot, Rights::WRITE, 1 << id).expect("fp signal cap");
+        let pd = system::create_pd().expect("fp pd");
+        system::install_pd_cap(pd, 0, sig);
+        let t = system::spawn_user(fp_entry, FP_PATTERN[id] as usize, FP_PRIO)
+            .expect("fp user thread");
+        system::bind_pd(pd, t);
     }
     // Prioritätstest: höhere Priorität (4) zuerst, dann 3, dann 2.
     for id in 0..NPRIO_TEST {
@@ -275,26 +296,83 @@ extern "C" fn worker(arg: usize) -> ! {
     }
 }
 
-/// FP-Worker: summiert `FP_ITERS`-mal `1.5` (Akkumulator in einem FP-Register).
-/// Wird er mitten in der Berechnung preemptiert, muss der FP-Kontext erhalten
-/// bleiben — sonst stimmt das Ergebnis nicht.
-extern "C" fn fp_worker(arg: usize) -> ! {
-    let id = arg;
-    let mut acc: f64 = 0.0;
-    let mut i: u64 = 0;
-    while i < FP_ITERS {
-        acc += 1.5;
-        for _ in 0..20 {
-            core::hint::spin_loop();
-        }
-        i += 1;
-    }
-    if id < FP_WORKERS {
-        FP_RESULT[id].store(acc.to_bits(), Ordering::Relaxed);
-        FP_DONE[id].store(true, Ordering::Release);
-    }
+// Die EL0-FP-Threads kodieren die Syscall-Nummern als Immediates; hier absichern,
+// dass sie zur ABI passen.
+const _: () = assert!(sys::YIELD == 0 && sys::SIGNAL == 8 && sys::PARK == 5);
+
+// **EL0-FP-User-Programm** (`user_fp_entry`, Sektion `.user_text`, EL0-ausführbar).
+// Lädt das Muster (Argument in x0) in d0..d3 und prüft in jeder Iteration, dass es
+// erhalten ist; danach gibt es per `YIELD` ab (der andere FP-Thread stiehlt dabei
+// die FP-Register). Nur korrektes Lazy-Save/Restore lässt das Muster jede Abgabe
+// überleben. Bei Erfolg `SIGNAL` (Slot 0) an den Kollektor, sonst stilles Parken
+// (Test scheitert per Timeout).
+//
+// Eigener `global_asm!`-Block mit `.arch armv8-a`, damit die `fmov`-Instruktionen
+// trotz `-neon`-Kernel assemblieren — eigene Übersetzungseinheit, daher kein
+// soft-float/NEON-ABI-Problem (anders als `#[target_feature]`) und kein Leck der
+// `.arch`-Direktive in den Modulstrom. Register: x9=Muster, x10=Zähler, x11=Puffer;
+// der Kernel-Trap sichert x0..x30, daher überleben sie die `svc`.
+core::arch::global_asm!(
+    r#"
+.arch armv8-a
+.section .user_text,"ax"
+.globl user_fp_entry
+user_fp_entry:
+    mov   x9, x0                 // x9 = Muster (Entry-Argument)
+    fmov  d0, x9                 // Muster in d0..d3
+    fmov  d1, x9
+    fmov  d2, x9
+    fmov  d3, x9
+    mov   x10, #{iters}
+20:
+    fmov  x11, d0                // Muster prüfen (nach jeder Abgabe erhalten?)
+    cmp   x11, x9
+    b.ne  30f
+    fmov  x11, d1
+    cmp   x11, x9
+    b.ne  30f
+    fmov  x11, d2
+    cmp   x11, x9
+    b.ne  30f
+    fmov  x11, d3
+    cmp   x11, x9
+    b.ne  30f
+    mov   x0, #0                 // sys::YIELD -> FP-Owner abgeben
+    svc   #0
+    subs  x10, x10, #1
+    b.ne  20b
+    mov   x0, #8                 // sys::SIGNAL (Slot 0): Erfolg melden
+    mov   x1, #0
+    svc   #0
+10:
+    mov   x0, #5                 // sys::PARK (dauerhaft)
+    svc   #0
+    b     10b
+30:
+    mov   x0, #5                 // Korruption erkannt: ohne SIGNAL parken
+    svc   #0
+    b     30b
+"#,
+    iters = const FP_CHECK_ITERS,
+);
+
+extern "C" {
+    /// Entry-Symbol des EL0-FP-User-Programms (siehe `global_asm!` oben).
+    static user_fp_entry: u8;
+}
+
+/// FP-Kollektor (EL1): wartet auf die Erfolgs-Notifications der EL0-FP-Threads und
+/// sammelt ihre Badges (Bit i je Thread). Sobald alle gemeldet haben, ist der
+/// Lazy-FP-Test bestanden.
+extern "C" fn fp_collector(_arg: usize) -> ! {
     loop {
-        core::hint::spin_loop();
+        let r = invoke(sys::WAIT, 0, [0; 4], 0);
+        if r.result == result::OK {
+            let mask = FP_OK_MASK.fetch_or(r.badge, Ordering::Relaxed) | r.badge;
+            if mask == FP_ALL_OK {
+                FP_COLLECTOR_DONE.store(true, Ordering::Release);
+            }
+        }
     }
 }
 
@@ -621,7 +699,7 @@ pub fn demo_report_then_idle() -> ! {
 fn all_done() -> bool {
     let workers = (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD);
     let cores = (0..NUM_CORES).all(|c| hal::timer::ticks(c) > 0);
-    let fp = (0..FP_WORKERS).all(|i| FP_DONE[i].load(Ordering::Acquire));
+    let fp = FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0;
     let prio = (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire));
     let life = KILLER_DONE.load(Ordering::Acquire) && REAPED.load(Ordering::Relaxed) >= 2;
     let notif = PRODUCER_DONE.load(Ordering::Acquire) && NOTIF_COUNT.load(Ordering::Relaxed) >= NOTIF_ROUNDS;
@@ -650,17 +728,12 @@ fn report() {
     }
     println!("sched   : {}", if sched_ok { "ALL PASS" } else { "FAILURES" });
 
-    // FP/SIMD-Kontext über Preemption korrekt erhalten.
-    let mut fp_ok = true;
-    let expected = (FP_ITERS as f64) * 1.5;
-    for i in 0..FP_WORKERS {
-        let acc = f64::from_bits(FP_RESULT[i].load(Ordering::Relaxed));
-        println!("fp      : worker {i} -> {} (erwartet {})", acc as u64, expected as u64);
-        if acc != expected {
-            fp_ok = false;
-        }
-    }
-    println!("fp      : {}", if fp_ok { "ALL PASS" } else { "FAILURES" });
+    // Lazy-FP: EL0-FP-Threads behielten ihr Muster über jede FP-Owner-Abgabe.
+    let fp_mask = FP_OK_MASK.load(Ordering::Relaxed);
+    let fp_sw = system::fp_switch_count();
+    println!("fp      : EL0-FP-Threads-OK={fp_mask:#04b}/{FP_ALL_OK:#04b}, Lazy-FP-Owner-Wechsel={fp_sw}");
+    let fp_ok = fp_mask == FP_ALL_OK && fp_sw > 0;
+    println!("fp      : {} (Lazy-FP: FP-Kontext ueber Owner-Wechsel erhalten)", if fp_ok { "ALL PASS" } else { "FAILURES" });
 
     // Prioritäten: höher priorisierter Thread (id 0, prio 4) muss zuerst fertig sein.
     for i in 0..NPRIO_TEST {

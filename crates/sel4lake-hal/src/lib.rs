@@ -8,6 +8,7 @@
 pub mod console;
 pub mod cpu;
 pub mod exception;
+pub mod fp;
 pub mod gic;
 pub mod mmu;
 pub mod psci;

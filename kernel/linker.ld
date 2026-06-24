@@ -77,7 +77,7 @@ SECTIONS {
          * Ein 16-KiB-Slot je EL0-Thread; getrennt vom EL0-zugänglichen User-Stack. */
         . = ALIGN(16);
         __user_kstacks_bottom = .;
-        . += 0x4000 * 4; /* 4 EL0-Threads × 16 KiB */
+        . += 0x4000 * 8; /* 8 EL0-Threads × 16 KiB */
         __user_kstacks_top = .;
     } :data
 

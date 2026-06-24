@@ -39,7 +39,15 @@ impl ThreadId {
             gen: (raw >> 32) as u32,
         }
     }
+    /// Slot-Index (0..NTHREADS). Stabiler Index z. B. für per-Thread-Tabellen im
+    /// Kernel (etwa den Lazy-FP-Kontextpuffer).
+    pub fn slot(self) -> usize {
+        self.slot
+    }
 }
+
+/// Anzahl der Thread-Slots (Obergrenze für per-Thread-Tabellen im Kernel).
+pub const MAX_THREADS: usize = NTHREADS;
 
 /// Anzahl Prioritätsstufen (höher = wichtiger; 0 = niedrigste).
 pub const NPRIO: usize = 8;

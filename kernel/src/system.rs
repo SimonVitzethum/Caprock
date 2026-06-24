@@ -11,13 +11,16 @@
 //! Schritt; sie brauchen per-Kern-TCB-Partitionierung + Cross-Core-IPI-Unblock.)
 
 use sel4lake_cap::{CapError, CapInfo, CapPtr, CapSpace};
-use sel4lake_hal::{self as hal, exception::TrapFrame, println};
+use sel4lake_hal::{self as hal, exception::TrapFrame, fp::FpState, println};
 use sel4lake_ipc::{EndpointTable, NotificationTable};
 use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
 use sel4lake_microkit::PdTable;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use sel4lake_sched::{Scheduler, ThreadId};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use sel4lake_sched::{Scheduler, ThreadId, MAX_THREADS};
 use sel4lake_sync::SpinLock;
+
+/// Anzahl Kerne (für die per-Kern FP-Owner-Tabelle). Muss ≥ der realen Kernzahl sein.
+const NUM_CORES: usize = 8;
 
 const STACK_SIZE: u64 = 64 * 1024;
 /// Standardpriorität für Idle und gewöhnliche Demo-Threads (Round-Robin).
@@ -29,13 +32,33 @@ extern "C" {
     static __user_kstacks_bottom: u8;
 }
 const USER_KSTACK_SIZE: usize = 0x4000; // 16 KiB (muss zur Linker-Reservierung passen)
-const USER_KSTACK_COUNT: usize = 4;
+const USER_KSTACK_COUNT: usize = 8;
 static USER_KSTACK_NEXT: AtomicUsize = AtomicUsize::new(0);
 /// Sticky: wurde jemals ein Syscall von EL0 (User-Thread) gesehen?
 static EL0_SYSCALL_SEEN: AtomicBool = AtomicBool::new(false);
 /// Zähler: wie oft hat der Kernel einen EL0-Fault abgefangen und den fehlerhaften
 /// User-Thread isoliert (statt selbst anzuhalten)?
 static EL0_FAULTS: AtomicUsize = AtomicUsize::new(0);
+
+// --- Lazy-FP-Zustand ---
+//
+// Pro Kern besitzt höchstens ein Thread die FP/SIMD-Register (der „FP-Owner").
+// FP wird beim Kontextwechsel NICHT gesichert; erst ein FP-Trap (EC 0x07) eines
+// Nicht-Owners aus EL0 löst Save (alter Owner) + Restore (neuer) aus. EL1 ist
+// soft-float und berührt FP nie. Zähler `FP_SWITCHES` belegt, dass tatsächlich
+// gewechselt wurde.
+const FP_OWNER_NONE: u64 = u64::MAX;
+/// Raw-`ThreadId` des FP-Owners je Kern (nur der jeweilige Kern schreibt seinen
+/// Eintrag -> Atomics genügen, keine Sperre nötig).
+#[allow(clippy::declare_interior_mutable_const)]
+static FP_OWNER: [AtomicU64; NUM_CORES] = [const { AtomicU64::new(FP_OWNER_NONE) }; NUM_CORES];
+/// Per-Thread-Slot FP-Kontextpuffer. Zugriff ausschließlich unter dem SCHED-Lock
+/// (fp_trap hält SCHED; spawn ebenfalls) -> für gleiche Slots serialisiert,
+/// verschiedene Slots sind disjunkt. Lock-Ordnung: …->SCHED->FP_STATES (innerste).
+static FP_STATES: SpinLock<[FpState; MAX_THREADS]> =
+    SpinLock::new([const { FpState::new() }; MAX_THREADS]);
+/// Zähler abgeschlossener Lazy-FP-Owner-Wechsel (Save+Restore), für den Test.
+static FP_SWITCHES: AtomicUsize = AtomicUsize::new(0);
 
 /// Geteilte Ressourcen (alles außer dem Scheduler).
 struct Resources {
@@ -62,7 +85,10 @@ static RES: SpinLock<Resources> = SpinLock::new(Resources {
 fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
     let core = hal::cpu::core_id();
     // Heißer Pfad: nur der Scheduler-Lock.
-    SCHED.lock().on_tick(core, frame as usize) as *mut TrapFrame
+    let mut sched = SCHED.lock();
+    let next = sched.on_tick(core, frame as usize);
+    sync_fp_trap(core, &sched);
+    next as *mut TrapFrame
 }
 
 fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
@@ -74,7 +100,7 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
     let mut res = RES.lock();
     let mut sched = SCHED.lock();
     let r = &mut *res;
-    sel4lake_microkit::dispatch(
+    let next = sel4lake_microkit::dispatch(
         frame as usize,
         core,
         &mut sched,
@@ -82,7 +108,67 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
         &mut r.eps,
         &mut r.ntfns,
         &mut r.pds,
-    ) as *mut TrapFrame
+    );
+    // Der Syscall kann den laufenden Thread gewechselt haben (block/exit) -> FP-Trap
+    // passend zum neuen aktuellen Thread setzen.
+    sync_fp_trap(core, &sched);
+    next as *mut TrapFrame
+}
+
+/// `CPACR_EL1.FPEN` für den **gerade aktuellen** Thread auf `core` setzen: FP an
+/// EL0 trappen, falls dieser Thread NICHT der FP-Owner des Kerns ist (so trappt
+/// sein erster FP-Zugriff und löst den Lazy-Owner-Wechsel aus); sonst FP freigeben.
+/// Am Ende jedes Hooks aufzurufen, der den laufenden Thread gewechselt haben kann.
+fn sync_fp_trap(core: usize, sched: &Scheduler) {
+    let cur = sched.current_id(core).to_raw();
+    let owner = FP_OWNER[core].load(Ordering::Relaxed);
+    hal::fp::set_el0_trap(cur != owner);
+}
+
+/// FP-Trap-Hook (Lazy-FP): Ein EL0-Thread hat FP/SIMD benutzt, ohne Owner zu sein.
+/// Alten Owner sichern, FP-Kontext dieses Threads laden, ihn zum Owner machen und
+/// FP freigeben. Rückgabe: derselbe Frame — der `eret` wiederholt die getrappte
+/// Instruktion, jetzt mit aktivem FP. Hält SCHED (current_id) und FP_STATES.
+fn fp_trap(frame: *mut TrapFrame) -> *mut TrapFrame {
+    let core = hal::cpu::core_id();
+    let sched = SCHED.lock();
+    let cur_id = sched.current_id(core);
+    let cur = cur_id.to_raw();
+    let cur_slot = cur_id.slot();
+    let owner = FP_OWNER[core].load(Ordering::Relaxed);
+
+    let mut states = FP_STATES.lock();
+    if owner != FP_OWNER_NONE && owner != cur {
+        // Live-Register gehören dem alten Owner -> in seinen Slot sichern.
+        let prev_slot = ThreadId::from_raw(owner).slot();
+        hal::fp::save(&mut states[prev_slot]);
+        FP_SWITCHES.fetch_add(1, Ordering::Relaxed);
+    }
+    // FP-Kontext dieses Threads laden (bei Erststart genullt).
+    hal::fp::restore(&states[cur_slot]);
+    drop(states);
+
+    FP_OWNER[core].store(cur, Ordering::Relaxed);
+    hal::fp::set_el0_trap(false); // FP für diesen (jetzt Owner-)Thread freigeben
+    frame
+}
+
+/// Genullten FP-Kontext für einen frisch belegten Slot setzen und veraltete
+/// Owner-Referenzen auf diesen Slot löschen (Slot-Wiederverwendung nach Thread-Ende).
+/// Unter gehaltenem SCHED aufzurufen, BEVOR der Thread laufen kann.
+fn fp_reset_slot(slot: usize) {
+    FP_STATES.lock()[slot] = FpState::new();
+    for owner in FP_OWNER.iter() {
+        let o = owner.load(Ordering::Relaxed);
+        if o != FP_OWNER_NONE && (o & 0xffff_ffff) as usize == slot {
+            owner.store(FP_OWNER_NONE, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Anzahl abgeschlossener Lazy-FP-Owner-Wechsel (Save eines alten Owners).
+pub fn fp_switch_count() -> usize {
+    FP_SWITCHES.load(Ordering::Relaxed)
 }
 
 /// EL0-Fault-Hook: ein User-Thread hat einen synchronen Fault ausgelöst (Zugriff
@@ -100,7 +186,10 @@ fn el0_fault(frame: *mut TrapFrame, esr: u64, far: u64) -> *mut TrapFrame {
     println!(
         "el0-trap: User-Thread {tid:#x} faultete (EC={ec:#04x} FAR={far:#018x}) -> beendet, Kernel laeuft weiter"
     );
-    sched.exit_current(core, frame as usize) as *mut TrapFrame
+    let next = sched.exit_current(core, frame as usize);
+    // Auf den nächsten Thread gewechselt -> FP-Trap passend setzen.
+    sync_fp_trap(core, &sched);
+    next as *mut TrapFrame
 }
 
 /// Wie oft hat der Kernel einen EL0-Fault abgefangen und den Thread isoliert?
@@ -108,11 +197,13 @@ pub fn el0_fault_count() -> usize {
     EL0_FAULTS.load(Ordering::Relaxed)
 }
 
-/// Reschedule-, Syscall- + EL0-Fault-Hook registrieren (einmalig, vor IRQs/Threads).
+/// Reschedule-, Syscall-, EL0-Fault- + Lazy-FP-Hook registrieren (einmalig, vor
+/// IRQs/Threads).
 pub fn set_hooks() {
     hal::exception::set_reschedule_hook(reschedule);
     hal::exception::set_syscall_hook(syscall);
     hal::exception::set_fault_hook(el0_fault);
+    hal::exception::set_fp_hook(fp_trap);
 }
 
 /// Freies RAM `[free_base, ram_end)` beim Allokator registrieren.
@@ -195,7 +286,10 @@ pub fn spawn(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
         let stack = res.phys.alloc(STACK_SIZE, 16)?;
         (stack.base() as usize, stack.len() as usize)
     };
-    SCHED.lock().spawn(core, entry, arg, base, len, prio)
+    let mut sched = SCHED.lock();
+    let tid = sched.spawn(core, entry, arg, base, len, prio)?;
+    fp_reset_slot(tid.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
+    Some(tid)
 }
 
 /// Einen **EL0-User-Thread** erzeugen: Kernel-Stack aus dem EL1-only Pool,
@@ -213,9 +307,10 @@ pub fn spawn_user(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
         let s = res.phys.alloc(STACK_SIZE, 16)?;
         (s.base() as usize, s.len() as usize)
     };
-    SCHED
-        .lock()
-        .spawn_user(core, entry, arg, kbase, USER_KSTACK_SIZE, user_base, user_len, prio)
+    let mut sched = SCHED.lock();
+    let tid = sched.spawn_user(core, entry, arg, kbase, USER_KSTACK_SIZE, user_base, user_len, prio)?;
+    fp_reset_slot(tid.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
+    Some(tid)
 }
 
 /// Wurde jemals ein Syscall von EL0 (echter User-Thread) ausgeführt?

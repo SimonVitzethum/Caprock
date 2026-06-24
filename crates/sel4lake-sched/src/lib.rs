@@ -449,3 +449,25 @@ impl Scheduler {
         }
     }
 }
+
+/// Scheduler-Operationen, wie sie der IPC-/Dispatch-Pfad braucht — abstrahiert von
+/// der konkreten Instanz, damit der Kernel **kern-übergreifend** auflösen kann
+/// (z. B. einen IPC-Partner auf einem anderen Kern wecken). Bei einer Einkern-Sicht
+/// genügt eine `Scheduler`-Instanz; der Kernel stellt eine Facade über alle
+/// per-Kern-Instanzen bereit, die je Operation **genau eine** Instanz sperrt
+/// (nie zwei gleichzeitig) und beim kern-übergreifenden Wecken einen Reschedule-IPI
+/// schickt.
+///
+/// `current_id`/`block_current`/`switch_to`/`exit_current`/`on_tick`/`kill` beziehen
+/// sich auf den **aktuellen** Kern (`core`); `frame_of`/`unblock` dürfen einen
+/// Thread auf **irgendeinem** Kern betreffen (kern-übergreifender IPC-Partner).
+pub trait SchedOps {
+    fn current_id(&mut self, core: usize) -> ThreadId;
+    fn frame_of(&mut self, tid: ThreadId) -> Option<usize>;
+    fn block_current(&mut self, core: usize, frame: usize) -> usize;
+    fn switch_to(&mut self, core: usize, frame: usize, target: ThreadId) -> usize;
+    fn unblock(&mut self, tid: ThreadId);
+    fn on_tick(&mut self, core: usize, frame: usize) -> usize;
+    fn exit_current(&mut self, core: usize, frame: usize) -> usize;
+    fn kill(&mut self, tid: ThreadId, core: usize) -> bool;
+}

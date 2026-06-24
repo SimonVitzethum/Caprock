@@ -76,6 +76,16 @@ static XFER_DONE: AtomicBool = AtomicBool::new(false);
 const USER_MAGIC: u64 = 0xC0DE;
 static USER_RECV: AtomicU64 = AtomicU64::new(0);
 
+// Kern-übergreifende synchrone IPC: Client auf core 0 ruft (CALL) einen Server auf
+// core 2; Antwort (REPLY) geht zurück über die Kerngrenze. Beide Richtungen wecken
+// den Partner per Cross-Core-IPI.
+const XIPC_N: usize = 3;
+const XIPC_IN: [u64; XIPC_N] = [3, 5, 7];
+const XIPC_FACTOR: u64 = 7; // Server antwortet mit FACTOR * Eingabe
+const XIPC_SERVER_CORE: usize = 2;
+static XIPC_RESULT: [AtomicU64; XIPC_N] = [const { AtomicU64::new(0) }; XIPC_N];
+static XIPC_DONE: AtomicBool = AtomicBool::new(false);
+
 // Per-Kern-paralleler Scheduler: je ein Worker auf den Sekundärkernen 1..NUM_CORES
 // läuft PARALLEL (eigene Scheduler-Instanz je Kern, kein globaler Lock); ein
 // Parker auf core 1 wird kern-übergreifend von core 0 per IPI geweckt.
@@ -268,6 +278,22 @@ pub fn spawn_demo() {
         XCORE_PARKER_TID.store(parker.to_raw(), Ordering::Relaxed);
     }
 
+    // Kern-übergreifende synchrone IPC: Server auf core 2, Client auf core 0, ein
+    // Endpoint. CALL und REPLY queren die Kerngrenze (Cross-Core-Rendezvous + IPI).
+    let xep = system::create_endpoint().expect("xipc ep");
+    let xroot = system::install_endpoint_cap(xep as u32, Rights::RWX).expect("xipc ep cap");
+    let xsend = system::cap_mint(xroot, Rights::WRITE, 0).expect("xipc send");
+    let xrecv = system::cap_mint(xroot, Rights::READ, 0).expect("xipc recv");
+    let xsrv_pd = system::create_pd().expect("xipc server pd");
+    system::install_pd_cap(xsrv_pd, 0, xrecv);
+    let xsrv = system::spawn_on_core(XIPC_SERVER_CORE, xipc_server as *const () as usize, 0, prio)
+        .expect("xipc server");
+    system::bind_pd(xsrv_pd, xsrv);
+    let xcli_pd = system::create_pd().expect("xipc client pd");
+    system::install_pd_cap(xcli_pd, 0, xsend);
+    let xcli = system::spawn_on_core(0, xipc_client as *const () as usize, 0, prio).expect("xipc client");
+    system::bind_pd(xcli_pd, xcli);
+
     // Freies RAM mit allen Stacks (Baseline für die Rückgewinnungs-Prüfung).
     FREE_BASELINE.store(system::total_free(), Ordering::Relaxed);
 
@@ -427,6 +453,35 @@ extern "C" fn xcore_parker(_arg: usize) -> ! {
     XCORE_PARKED.store(true, Ordering::Release);
     invoke(sys::PARK, 0, [0; 4], 0); // blockiert; von core 0 via IPI geweckt
     XCORE_WOKEN.store(true, Ordering::Release);
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// Kern-übergreifender IPC-Server (EL1, auf core 2): empfängt per `RECV` (Slot 0)
+/// und antwortet mit `XIPC_FACTOR * msg[0]`. Aufrufer liegt auf core 0 -> Nachricht
+/// und Antwort queren die Kerngrenze (Cross-Core-Rendezvous + IPI-Wake).
+extern "C" fn xipc_server(_arg: usize) -> ! {
+    loop {
+        let m = invoke(sys::RECV, 0, [0; 4], 0);
+        if m.result != result::OK {
+            break;
+        }
+        invoke(sys::REPLY, 0, [XIPC_FACTOR * m.msg[0], 0, 0, 0], 0);
+    }
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// Kern-übergreifender IPC-Client (EL1, auf core 0): ruft den Server auf core 2
+/// per `CALL` (Slot 0) und prüft die Antworten.
+extern "C" fn xipc_client(_arg: usize) -> ! {
+    for (i, &v) in XIPC_IN.iter().enumerate() {
+        let r = invoke(sys::CALL, 0, [v, 0, 0, 0], 0);
+        XIPC_RESULT[i].store(r.msg[0], Ordering::Relaxed);
+    }
+    XIPC_DONE.store(true, Ordering::Release);
     loop {
         invoke(sys::PARK, 0, [0; 4], 0);
     }
@@ -776,7 +831,8 @@ fn all_done() -> bool {
     // und der Parker wurde kern-übergreifend per IPI geweckt.
     let smp = (1..NUM_CORES).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
         && XCORE_WOKEN.load(Ordering::Acquire);
-    workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp
+    let xipc = XIPC_DONE.load(Ordering::Acquire);
+    workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
 }
 
 fn report() {
@@ -912,5 +968,19 @@ fn report() {
     println!(
         "smp     : {} (per-Kern-parallele Einplanung + IPI-Cross-Core-Wake)",
         if smp_ok { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Kern-übergreifende synchrone IPC: Client (core 0) <-> Server (core 2).
+    let mut xipc_ok = true;
+    for (i, &v) in XIPC_IN.iter().enumerate() {
+        let r = XIPC_RESULT[i].load(Ordering::Relaxed);
+        println!("xipc    : core0->core{XIPC_SERVER_CORE} call({v}) -> {r} (erwartet {})", XIPC_FACTOR * v);
+        if r != XIPC_FACTOR * v {
+            xipc_ok = false;
+        }
+    }
+    println!(
+        "xipc    : {} (synchrone IPC ueber Kerngrenze, CALL+REPLY je per IPI)",
+        if xipc_ok { "ALL PASS" } else { "FAILURES" }
     );
 }

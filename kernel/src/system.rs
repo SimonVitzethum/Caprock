@@ -20,7 +20,7 @@ use sel4lake_ipc::{EndpointTable, NotificationTable};
 use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
 use sel4lake_microkit::PdTable;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use sel4lake_sched::{Scheduler, ThreadId, MAX_THREADS};
+use sel4lake_sched::{SchedOps, Scheduler, ThreadId, MAX_THREADS};
 use sel4lake_sync::SpinLock;
 
 /// Anzahl Kerne (für die per-Kern FP-Owner-Tabelle). Muss ≥ der realen Kernzahl sein.
@@ -105,15 +105,18 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
     if hal::exception::frame_from_el0(frame as usize) {
         EL0_SYSCALL_SEEN.store(true, Ordering::Relaxed);
     }
-    // Lock-Ordnung RES vor SCHEDS[core]. IPC ist kern-lokal (Endpoint-Teilnehmer
-    // liegen auf demselben Kern); daher genügt die Scheduler-Instanz dieses Kerns.
+    // Lock-Ordnung RES vor SCHEDS[*]. Der Dispatch hält `RES` (serialisiert IPC) und
+    // greift über die `KernelSched`-Facade auf die Scheduler zu — je Operation
+    // **genau eine** `SCHEDS`-Instanz (auch kern-übergreifend für IPC-Partner auf
+    // anderen Kernen), nie zwei gleichzeitig -> deadlockfrei. IRQs sind im Trap
+    // maskiert, also kann dieser Kern beim Lock-Halten nicht preemptiert werden.
     let mut res = RES.lock();
-    let mut sched = SCHEDS[core].lock();
+    let mut ops = KernelSched;
     let r = &mut *res;
     let next = sel4lake_microkit::dispatch(
         frame as usize,
         core,
-        &mut sched,
+        &mut ops,
         &mut r.cspace,
         &mut r.eps,
         &mut r.ntfns,
@@ -121,8 +124,46 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
     );
     // Der Syscall kann den laufenden Thread gewechselt haben (block/exit) -> FP-Trap
     // passend zum neuen aktuellen Thread setzen.
-    sync_fp_trap(core, &sched);
+    sync_fp_trap(core, &SCHEDS[core].lock());
     next as *mut TrapFrame
+}
+
+/// Facade über alle per-Kern-Scheduler-Instanzen für den IPC-/Dispatch-Pfad. Jede
+/// Operation sperrt **genau eine** `SCHEDS`-Instanz (die des angegebenen Kerns bzw.
+/// des Ziel-Threads) und gibt sie sofort wieder frei — nie zwei gleichzeitig. Beim
+/// kern-übergreifenden Wecken (`unblock` auf einen Thread eines anderen Kerns)
+/// schickt sie zusätzlich einen Reschedule-IPI an den Zielkern.
+struct KernelSched;
+
+impl SchedOps for KernelSched {
+    fn current_id(&mut self, core: usize) -> ThreadId {
+        SCHEDS[core].lock().current_id(core)
+    }
+    fn frame_of(&mut self, tid: ThreadId) -> Option<usize> {
+        SCHEDS[tid.core()].lock().frame_of(tid)
+    }
+    fn block_current(&mut self, core: usize, frame: usize) -> usize {
+        SCHEDS[core].lock().block_current(core, frame)
+    }
+    fn switch_to(&mut self, core: usize, frame: usize, target: ThreadId) -> usize {
+        SCHEDS[core].lock().switch_to(core, frame, target)
+    }
+    fn unblock(&mut self, tid: ThreadId) {
+        let target = tid.core();
+        SCHEDS[target].lock().unblock(tid);
+        if target != hal::cpu::core_id() {
+            hal::gic::send_sgi(target, hal::gic::IPI_RESCHED_INTID);
+        }
+    }
+    fn on_tick(&mut self, core: usize, frame: usize) -> usize {
+        SCHEDS[core].lock().on_tick(core, frame)
+    }
+    fn exit_current(&mut self, core: usize, frame: usize) -> usize {
+        SCHEDS[core].lock().exit_current(core, frame)
+    }
+    fn kill(&mut self, tid: ThreadId, core: usize) -> bool {
+        SCHEDS[core].lock().kill(tid, core)
+    }
 }
 
 /// `CPACR_EL1.FPEN` für den **gerade aktuellen** Thread auf `core` setzen: FP an

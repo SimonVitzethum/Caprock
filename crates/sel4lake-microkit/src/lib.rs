@@ -21,7 +21,7 @@ use sel4lake_cap::{CapPtr, CapSpace, ObjectKind};
 use sel4lake_hal::exception::{frame_reg, frame_set_reg};
 use sel4lake_ipc::{EndpointTable, NotificationTable};
 use sel4lake_mem::Rights;
-use sel4lake_sched::{Scheduler, ThreadId};
+use sel4lake_sched::{SchedOps, ThreadId};
 
 const NPDS: usize = 32;
 /// Cap-Slots je PD-Cspace.
@@ -119,7 +119,7 @@ impl PdTable {
 pub fn dispatch(
     frame: usize,
     core: usize,
-    sched: &mut Scheduler,
+    ops: &mut dyn SchedOps,
     cspace: &mut CapSpace,
     eps: &mut EndpointTable,
     ntfns: &mut NotificationTable,
@@ -127,16 +127,16 @@ pub fn dispatch(
 ) -> usize {
     let nr = frame_reg(frame, reg::SYSNO_RESULT);
     if nr == sys::YIELD {
-        return sched.on_tick(core, frame);
+        return ops.on_tick(core, frame);
     }
     if nr == sys::PARK {
         // Selbst-Park: Aufrufer blockieren (verlässt die Ready-Queue dauerhaft);
         // kein Capability nötig. Kehrt nie zum Aufrufer zurück.
-        return sched.block_current(core, frame);
+        return ops.block_current(core, frame);
     }
     if nr == sys::EXIT {
         // Selbst-Beenden: Stack/TCB werden zurückgewonnen; kein Capability nötig.
-        return sched.exit_current(core, frame);
+        return ops.exit_current(core, frame);
     }
 
     let deny = |code: u64| -> usize {
@@ -145,7 +145,7 @@ pub fn dispatch(
     };
 
     // Ab hier: cap-gesicherte Operationen. Cap aus dem PD-Cspace auflösen.
-    let thread = sched.current_id(core);
+    let thread = ops.current_id(core);
     let Some(pd) = pds.pd_of(thread) else {
         return deny(result::ERR_NOPD);
     };
@@ -168,8 +168,8 @@ pub fn dispatch(
             }
             let ep = ep_id as usize;
             match nr {
-                sys::CALL => eps.call(sched, core, ep, frame),
-                sys::RECV => eps.recv(sched, core, ep, frame),
+                sys::CALL => eps.call(ops, core, ep, frame),
+                sys::RECV => eps.recv(ops, core, ep, frame),
                 _ => {
                     // Optionaler Capability-Transfer: REPLY delegiert die Cap am
                     // lokalen Slot (tag & 0xff) an den Aufrufer (GRANT_RECV_SLOT).
@@ -177,7 +177,7 @@ pub fn dispatch(
                     if tag & sel4lake_abi::GRANT_FLAG != 0 {
                         grant_cap(cspace, pds, eps, pd, (tag & 0xff) as usize, ep);
                     }
-                    eps.reply(sched, core, ep, frame)
+                    eps.reply(ops, core, ep, frame)
                 }
             }
         }
@@ -191,9 +191,9 @@ pub fn dispatch(
             }
             let n = id as usize;
             if nr == sys::SIGNAL {
-                ntfns.signal(sched, n, badge, frame)
+                ntfns.signal(ops, n, badge, frame)
             } else {
-                ntfns.wait(sched, core, n, frame)
+                ntfns.wait(ops, core, n, frame)
             }
         }
         sys::KILL => {
@@ -203,7 +203,7 @@ pub fn dispatch(
             if !rights.contains(Rights::WRITE) {
                 return deny(result::ERR_RIGHTS);
             }
-            let ok = sched.kill(ThreadId::from_raw(raw), core);
+            let ok = ops.kill(ThreadId::from_raw(raw), core);
             frame_set_reg(frame, reg::SYSNO_RESULT, if ok { result::OK } else { result::ERR_BADCAP });
             frame
         }

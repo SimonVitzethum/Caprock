@@ -16,7 +16,7 @@
 
 use sel4lake_abi::{reg, result, MSG_WORDS};
 use sel4lake_hal::exception::{frame_reg, frame_set_reg};
-use sel4lake_sched::{Scheduler, ThreadId};
+use sel4lake_sched::{SchedOps, ThreadId};
 
 const NENDPOINTS: usize = 32;
 const NNOTIFICATIONS: usize = 32;
@@ -158,38 +158,49 @@ impl EndpointTable {
 
     /// `CALL`: Nachricht senden und auf Antwort warten. Gibt den fortzusetzenden
     /// Frame zurück (immer ein anderer Thread, da der Aufrufer blockiert).
-    pub fn call(&mut self, sched: &mut Scheduler, core: usize, ep: usize, frame: usize) -> usize {
+    /// **Kern-übergreifend:** Liegt der Empfänger auf einem anderen Kern, wird seine
+    /// Nachricht in seinen Frame übertragen und er per `unblock` (+IPI) geweckt;
+    /// der Aufrufer blockiert auf seinem Kern. Auf demselben Kern: Rendezvous-
+    /// Fastpath (`switch_to`).
+    pub fn call(&mut self, ops: &mut dyn SchedOps, core: usize, ep: usize, frame: usize) -> usize {
         if !self.valid(ep) {
             frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_BADCAP);
             return frame;
         }
-        let caller = sched.current_id(core);
+        let caller = ops.current_id(core);
         if let Some(server) = self.eps[ep].receivers.dequeue() {
-            // Empfänger wartet -> Rendezvous, direkt zum Server wechseln.
-            let sframe = sched.frame_of(server).expect("server frame");
+            // Empfänger wartet -> Nachricht in seinen (blockierten) Frame übertragen.
+            let sframe = ops.frame_of(server).expect("server frame");
             transfer(frame, sframe);
             frame_set_reg(sframe, reg::SYSNO_RESULT, result::OK);
             frame_set_reg(sframe, reg::EP_BADGE, 0);
             self.eps[ep].caller = Some(caller);
-            sched.switch_to(core, frame, server)
+            if server.core() == core {
+                ops.switch_to(core, frame, server) // intra-Kern: direkt zum Server
+            } else {
+                ops.unblock(server); // anderer Kern: Server dort wecken (+IPI)
+                ops.block_current(core, frame) // Aufrufer blockiert, nächster lokaler Thread
+            }
         } else {
             // Kein Empfänger -> Aufrufer reiht sich als Sender ein und blockiert.
             self.eps[ep].senders.enqueue(caller);
-            sched.block_current(core, frame)
+            ops.block_current(core, frame)
         }
     }
 
     /// `RECV`: auf einen Aufrufer warten. Gibt den fortzusetzenden Frame zurück
     /// (der eigene, falls sofort ein Sender da war; sonst ein anderer Thread).
-    pub fn recv(&mut self, sched: &mut Scheduler, core: usize, ep: usize, frame: usize) -> usize {
+    pub fn recv(&mut self, ops: &mut dyn SchedOps, core: usize, ep: usize, frame: usize) -> usize {
         if !self.valid(ep) {
             frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_BADCAP);
             return frame;
         }
-        let server = sched.current_id(core);
+        let server = ops.current_id(core);
         if let Some(sender) = self.eps[ep].senders.dequeue() {
-            // Aufrufer wartet -> dessen Nachricht in den eigenen Frame übernehmen.
-            let cframe = sched.frame_of(sender).expect("sender frame");
+            // Aufrufer (ggf. auf anderem Kern, blockiert) wartet -> dessen Nachricht
+            // in den eigenen Frame übernehmen. Der Aufrufer bleibt blockiert (wartet
+            // auf die Antwort); kein Wecken nötig.
+            let cframe = ops.frame_of(sender).expect("sender frame");
             transfer(cframe, frame);
             frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
             frame_set_reg(frame, reg::EP_BADGE, 0);
@@ -198,24 +209,24 @@ impl EndpointTable {
         } else {
             // Kein Aufrufer -> Server reiht sich als Empfänger ein und blockiert.
             self.eps[ep].receivers.enqueue(server);
-            sched.block_current(core, frame)
+            ops.block_current(core, frame)
         }
     }
 
-    /// `REPLY`: dem zuletzt empfangenen Aufrufer antworten (entblockt ihn).
-    /// Der Server läuft weiter (kein Wechsel).
-    pub fn reply(&mut self, sched: &mut Scheduler, core: usize, ep: usize, frame: usize) -> usize {
+    /// `REPLY`: dem zuletzt empfangenen Aufrufer antworten (entblockt ihn, ggf.
+    /// kern-übergreifend per `unblock`+IPI). Der Server läuft weiter (kein Wechsel).
+    pub fn reply(&mut self, ops: &mut dyn SchedOps, core: usize, ep: usize, frame: usize) -> usize {
         let _ = core;
         if !self.valid(ep) {
             frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_BADCAP);
             return frame;
         }
         if let Some(caller) = self.eps[ep].caller.take() {
-            if let Some(cframe) = sched.frame_of(caller) {
+            if let Some(cframe) = ops.frame_of(caller) {
                 transfer(frame, cframe);
                 frame_set_reg(cframe, reg::SYSNO_RESULT, result::OK);
             }
-            sched.unblock(caller);
+            ops.unblock(caller);
         }
         frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
         frame
@@ -276,19 +287,21 @@ impl NotificationTable {
 
     /// `SIGNAL`: `badge` ins Notification-Wort ODERn und einen etwaigen Wartenden
     /// wecken. **Nicht blockierend** — der Signalgeber läuft weiter (`frame`).
-    pub fn signal(&mut self, sched: &mut Scheduler, ntfn: usize, badge: u64, frame: usize) -> usize {
+    pub fn signal(&mut self, ops: &mut dyn SchedOps, ntfn: usize, badge: u64, frame: usize) -> usize {
         if !self.valid(ntfn) {
             frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_BADCAP);
             return frame;
         }
         self.ntfns[ntfn].pending |= badge;
         if let Some(w) = self.ntfns[ntfn].waiter.take() {
-            if let Some(wframe) = sched.frame_of(w) {
+            // Wartender (ggf. auf anderem Kern) -> Badge in seinen Frame, dann wecken
+            // (kern-übergreifend per unblock+IPI).
+            if let Some(wframe) = ops.frame_of(w) {
                 frame_set_reg(wframe, reg::SYSNO_RESULT, result::OK);
                 frame_set_reg(wframe, reg::EP_BADGE, self.ntfns[ntfn].pending);
                 self.ntfns[ntfn].pending = 0;
             }
-            sched.unblock(w);
+            ops.unblock(w);
         }
         frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
         frame
@@ -296,7 +309,7 @@ impl NotificationTable {
 
     /// `WAIT`: akkumulierten Badge abholen (sofort, falls vorhanden) oder
     /// blockieren, bis signalisiert wird. Liefert den Badge in `x1`.
-    pub fn wait(&mut self, sched: &mut Scheduler, core: usize, ntfn: usize, frame: usize) -> usize {
+    pub fn wait(&mut self, ops: &mut dyn SchedOps, core: usize, ntfn: usize, frame: usize) -> usize {
         if !self.valid(ntfn) {
             frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_BADCAP);
             return frame;
@@ -307,8 +320,8 @@ impl NotificationTable {
             self.ntfns[ntfn].pending = 0;
             frame
         } else {
-            self.ntfns[ntfn].waiter = Some(sched.current_id(core));
-            sched.block_current(core, frame)
+            self.ntfns[ntfn].waiter = Some(ops.current_id(core));
+            ops.block_current(core, frame)
         }
     }
 }

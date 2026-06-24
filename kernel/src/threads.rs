@@ -83,6 +83,26 @@ const CHURN_TARGET: u32 = 2000;
 static CHURN_DONE: AtomicBool = AtomicBool::new(false);
 static CHURN_OK: AtomicBool = AtomicBool::new(false);
 
+// MCS Scheduling Contexts (Härtung Ziel 3): budget-basiertes Scheduling wie seL4-MCS.
+// Auf einem eigenen Kern konkurrieren zwei gleichprioritäre Threads: einer mit knappem
+// CPU-Budget (über eine SchedContext-Cap gebunden), einer unbeschränkt (Greedy). Der
+// budgetierte Thread wird bei Budgetende deplaniert und nach der Periode aufgefüllt ->
+// er macht garantierte, aber stark begrenzte Fortschritte gegenüber dem Greedy-Thread.
+const MCS_CORE: usize = 5; // eigener Kern: keine Konkurrenz mit den Demos auf core 0
+const MCS_BUDGET: u32 = 2; // 2 Ticks CPU ...
+const MCS_PERIOD: u32 = 16; // ... je 16 Ticks (knappe Zuteilung -> klar messbar)
+const MCS_PRIO: u8 = 3; // über den Sekundärkern-Workern (IDLE_PRIO=1)
+const MCS_SETTLE_TICKS: u64 = 150; // so viele core-MCS_CORE-Ticks konkurrieren lassen
+const MCS_MIN_CYCLES: u64 = 3; // mind. so viele Erschöpfungs-/Refill-Zyklen beobachten
+static MCS_BUDGETED_COUNT: AtomicU64 = AtomicU64::new(0);
+static MCS_GREEDY_COUNT: AtomicU64 = AtomicU64::new(0);
+static MCS_START_TICK: AtomicU64 = AtomicU64::new(0);
+static MCS_STARTED: AtomicBool = AtomicBool::new(false);
+static MCS_BOUND: AtomicBool = AtomicBool::new(false); // Budget per Cap gebunden?
+static MCS_STOP: AtomicBool = AtomicBool::new(false); // Signal: beide Threads parken
+static MCS_DONE: AtomicBool = AtomicBool::new(false);
+static MCS_OK: AtomicBool = AtomicBool::new(false);
+
 const RECLAIM_TARGET: u64 = 16;
 const RECLAIM_PRIO: u8 = 6; // höchste Demo-Prio: Exiter läuft sofort + beendet sich
 static RECLAIM_SPAWNED: AtomicU64 = AtomicU64::new(0);
@@ -843,6 +863,39 @@ extern "C" fn balanced_worker(_arg: usize) -> ! {
     }
 }
 
+/// **MCS-Budget-Worker** (EL1, auf [`MCS_CORE`]): zählt in festen Arbeits-Chunks hoch,
+/// solange nicht gestoppt. Bekommt über eine SchedContext-Cap ein knappes CPU-Budget
+/// gebunden -> wird bei Budgetende deplaniert, nach der Periode aufgefüllt. Sein
+/// Zähler wächst daher viel langsamer als der des unbeschränkten Greedy-Workers.
+/// Reiner CPU-Spin (kein YIELD) -> nur der Timer-Tick preemptet ihn und belastet das
+/// Budget. Nach dem Stopp parkt er (gibt die CPU frei, hinterlässt keinen Zombie).
+extern "C" fn mcs_budgeted_worker(_arg: usize) -> ! {
+    while !MCS_STOP.load(Ordering::Relaxed) {
+        for _ in 0..5_000 {
+            core::hint::spin_loop();
+        }
+        MCS_BUDGETED_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// **MCS-Greedy-Worker** (EL1, auf [`MCS_CORE`]): identischer Arbeits-Chunk, aber
+/// **ohne** Budget (unbeschränkt). Läuft jede Tick-Zeitscheibe, in der der budgetierte
+/// Thread deplaniert ist -> dominiert die CPU. Referenz für den Drosselungs-Vergleich.
+extern "C" fn mcs_greedy_worker(_arg: usize) -> ! {
+    while !MCS_STOP.load(Ordering::Relaxed) {
+        for _ in 0..5_000 {
+            core::hint::spin_loop();
+        }
+        MCS_GREEDY_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
 /// Cross-Core-Park/Wake-Thread (EL1, auf core 1): blockiert sich per `PARK`; core 0
 /// weckt ihn kern-übergreifend per `wake_remote` (Reschedule-IPI). Setzt nach dem
 /// Aufwachen `XCORE_WOKEN` — Beleg für den IPI-getriebenen Cross-Core-Unblock.
@@ -1189,7 +1242,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -1208,6 +1261,7 @@ pub fn demo_report_then_idle() -> ! {
                 m & ISO_BADGE_NATIVE != 0,
                 m & ISO_BADGE_PAGES != 0,
                 CHURN_DONE.load(Ordering::Acquire) && CHURN_OK.load(Ordering::Acquire),
+                MCS_DONE.load(Ordering::Acquire) && MCS_OK.load(Ordering::Acquire),
             );
         }
         // Beendete Threads einsammeln (sicher: läuft auf dem Idle-Stack).
@@ -1314,6 +1368,63 @@ pub fn demo_report_then_idle() -> ! {
             CHURN_DONE.store(true, Ordering::Release);
         }
 
+        // MCS Scheduling Contexts: nach dem Churn-Test und sobald die Sekundärkern-
+        // Worker fertig sind (MCS_CORE damit frei), zwei gleichprioritäre Threads auf
+        // MCS_CORE konkurrieren lassen — einer budgetiert (Budget per SchedContext-Cap
+        // gebunden), einer unbeschränkt. Greedy zuerst spawnen, dann den budgetierten
+        // (er bekommt das Budget erst beim Bind). Autorität ausschließlich über die Cap.
+        if !MCS_STARTED.load(Ordering::Acquire)
+            && CHURN_DONE.load(Ordering::Acquire)
+            && (1..NUM_CORES).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
+        {
+            hal::cpu::local_irq_disable();
+            let greedy =
+                system::spawn_on_core(MCS_CORE, mcs_greedy_worker as *const () as usize, 0, MCS_PRIO);
+            let budg = system::spawn_on_core(
+                MCS_CORE,
+                mcs_budgeted_worker as *const () as usize,
+                0,
+                MCS_PRIO,
+            );
+            if let (Some(_g), Some(b)) = (greedy, budg) {
+                // Budget ausschließlich über eine SchedContext-Cap vergeben: Cap prägen
+                // (Budget/Periode), dann an den Thread binden. Ohne Cap kein Budget.
+                if let Ok(sc) =
+                    system::install_sched_context_cap(MCS_BUDGET, MCS_PERIOD, Rights::WRITE)
+                {
+                    MCS_BOUND.store(
+                        system::bind_sched_context(sc, MCS_CORE, b),
+                        Ordering::Release,
+                    );
+                }
+                MCS_START_TICK.store(hal::timer::ticks(MCS_CORE), Ordering::Relaxed);
+                MCS_STARTED.store(true, Ordering::Release);
+            }
+            hal::cpu::local_irq_enable();
+        }
+
+        // MCS-Auswertung: genug Ticks + mehrere Erschöpfungs-/Refill-Zyklen abwarten,
+        // dann beide Threads stoppen und prüfen, dass der budgetierte Thread Fortschritt
+        // machte (garantierte CPU), aber deutlich gedrosselt unter dem Greedy-Thread lag.
+        if MCS_STARTED.load(Ordering::Acquire) && !MCS_DONE.load(Ordering::Acquire) {
+            let (depl, refl) = system::budget_stats(MCS_CORE);
+            let elapsed =
+                hal::timer::ticks(MCS_CORE).wrapping_sub(MCS_START_TICK.load(Ordering::Relaxed));
+            if elapsed >= MCS_SETTLE_TICKS && depl >= MCS_MIN_CYCLES && refl >= MCS_MIN_CYCLES {
+                MCS_STOP.store(true, Ordering::Release); // beide Threads parken lassen
+                let bg = MCS_BUDGETED_COUNT.load(Ordering::Relaxed);
+                let gr = MCS_GREEDY_COUNT.load(Ordering::Relaxed);
+                // Budgetierter Thread: garantierter (bg > 0), aber stark begrenzter
+                // Fortschritt (mind. 3x weniger als der unbeschränkte Greedy-Thread).
+                let throttled = bg > 0 && bg.saturating_mul(3) < gr;
+                MCS_OK.store(
+                    MCS_BOUND.load(Ordering::Acquire) && throttled,
+                    Ordering::Release,
+                );
+                MCS_DONE.store(true, Ordering::Release);
+            }
+        }
+
         if !reported && ALL_DONE.load(Ordering::Acquire) && all_done() {
             report();
             reported = true;
@@ -1357,8 +1468,10 @@ fn all_done() -> bool {
     let pages4k = m & ISO_BADGE_PAGES != 0;
     // Churn/Leak: tausende spawn/destroy-Zyklen ohne Ressourcen-Leck.
     let churn = CHURN_DONE.load(Ordering::Acquire) && CHURN_OK.load(Ordering::Acquire);
+    // MCS: budget-basiertes Scheduling — budgetierter Thread gedrosselt, Budget gebunden.
+    let mcs = MCS_DONE.load(Ordering::Acquire) && MCS_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
-        && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn
+        && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
 }
 
 fn report() {
@@ -1603,5 +1716,18 @@ fn report() {
     println!(
         "churn   : {} (keine Mapping-/ASID-/TCB-/Speicher-Leaks ueber tausende Zyklen)",
         if churn { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // MCS Scheduling Contexts: budgetierter vs. unbeschränkter Thread auf MCS_CORE.
+    let (depl, refl) = system::budget_stats(MCS_CORE);
+    let bg = MCS_BUDGETED_COUNT.load(Ordering::Relaxed);
+    let gr = MCS_GREEDY_COUNT.load(Ordering::Relaxed);
+    let bound = MCS_BOUND.load(Ordering::Acquire);
+    println!("mcs     : Budget per Cap gebunden={bound} (budget={MCS_BUDGET}/Periode={MCS_PERIOD}); Erschoepfungen={depl}, Refills={refl}");
+    println!("mcs     : Fortschritt budgetiert={bg} vs. greedy={gr} (budgetiert gedrosselt + garantiert > 0)");
+    let mcs = MCS_DONE.load(Ordering::Acquire) && MCS_OK.load(Ordering::Acquire);
+    println!(
+        "mcs     : {} (MCS-Budget: Verbrauch/Tick, Erschoepfung->Block, Refill nach Periode, cap-vergeben)",
+        if mcs { "ALL PASS" } else { "FAILURES" }
     );
 }

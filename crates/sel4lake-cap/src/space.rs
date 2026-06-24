@@ -122,6 +122,12 @@ impl CapSpace {
         self.install(ObjectKind::Notification(ntfn_id), rights)
     }
 
+    /// Eine **Scheduling-Context-Capability** (MCS) einbringen: die Autorität, einem
+    /// Thread `budget` Ticks je `period` Ticks CPU-Zeit zuzuweisen.
+    pub fn install_sched_context(&mut self, budget: u32, period: u32, rights: Rights) -> Result<CapPtr, CapError> {
+        self.install(ObjectKind::SchedContext { budget, period }, rights)
+    }
+
     /// Wurzel-Objekt + -Cap anlegen (gemeinsame Logik für alle Objekttypen).
     fn install(&mut self, kind: ObjectKind, rights: Rights) -> Result<CapPtr, CapError> {
         let obj = self.alloc_object(kind)?;

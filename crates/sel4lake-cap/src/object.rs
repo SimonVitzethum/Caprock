@@ -19,6 +19,10 @@ pub enum ObjectKind {
     Tcb(u64),
     /// Ein Notification-Objekt (asynchrone Badge-Signale; referenziert per ID).
     Notification(u32),
+    /// Ein **Scheduling Context** (MCS): CPU-Budget (`budget` Ticks je `period`
+    /// Ticks). Die Cap ist die **Autorität**, einem Thread dieses Budget zuzuweisen
+    /// — CPU-Zeit wird damit kapabilitätskontrolliert vergeben.
+    SchedContext { budget: u32, period: u32 },
 }
 
 /// Eintrag der Objekt-Tabelle.

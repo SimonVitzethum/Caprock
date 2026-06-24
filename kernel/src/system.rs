@@ -14,7 +14,7 @@
 //! IPC sperrt `RES` dann `SCHEDS[core]` (kern-lokale Endpoint-Teilnehmer). Kein
 //! Pfad nimmt zwei verschiedene `SCHEDS[*]` gleichzeitig.
 
-use sel4lake_cap::{CapError, CapInfo, CapPtr};
+use sel4lake_cap::{CapError, CapInfo, CapPtr, ObjectKind};
 use sel4lake_hal::{self as hal, exception::TrapFrame, fp::FpState, println};
 use sel4lake_ipc::{Endpoint, Notification, NENDPOINTS, NNOTIFICATIONS};
 use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
@@ -164,8 +164,9 @@ static NTFNS: [SpinLock<Notification>; NNOTIFICATIONS] =
 fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
     let core = hal::cpu::core_id();
     // Heißer Pfad: nur der Scheduler-Lock DIESES Kerns (parallel zu anderen Kernen).
+    // Echter Zeitscheiben-Tick -> MCS-Budget des laufenden Threads belasten.
     let mut sched = SCHEDS[core].lock();
-    let next = sched.on_tick(core, frame as usize);
+    let next = sched.on_tick(core, frame as usize, true);
     sync_fp_trap(core, &sched);
     sync_vspace(core, &sched);
     next as *mut TrapFrame
@@ -220,7 +221,8 @@ impl SchedOps for KernelSched {
         }
     }
     fn on_tick(&mut self, core: usize, frame: usize) -> usize {
-        SCHEDS[core].lock().on_tick(core, frame)
+        // YIELD ist freiwillig -> verbraucht kein MCS-Budget (tick = false).
+        SCHEDS[core].lock().on_tick(core, frame, false)
     }
     fn exit_current(&mut self, core: usize, frame: usize) -> usize {
         // Slot des sich beendenden Threads vor dem Wechsel merken; IRQs sind im Trap
@@ -971,6 +973,49 @@ pub fn el0_syscall_seen() -> bool {
 /// Eine Tcb-Capability für einen Thread prägen (cap-kontrolliertes `KILL`).
 pub fn install_tcb_cap(tid: ThreadId, rights: Rights) -> Result<CapPtr, CapError> {
     CAPS.lock().cspace.install_tcb(tid.to_raw(), rights)
+}
+
+// --- MCS Scheduling Contexts (Budget-basiertes Scheduling) ---
+//
+// CPU-Zeit wird **kapabilitätskontrolliert** vergeben: ein Scheduling-Context-Objekt
+// (Budget/Periode) existiert nur als Cap im CapSpace. Erst die Vorlage einer gültigen
+// SchedContext-Cap mit WRITE-Recht autorisiert, einem Thread dieses Budget zuzuweisen
+// (`bind_sched_context`). Das Budget wird aus dem **Cap-Objekt** gelesen, nicht aus
+// einem freien Argument — die Cap *ist* die Autorität (vgl. seL4 `SchedContext_Bind`).
+
+/// Eine **Scheduling-Context-Capability** prägen: `budget` Ticks je `period` Ticks.
+pub fn install_sched_context_cap(
+    budget: u32,
+    period: u32,
+    rights: Rights,
+) -> Result<CapPtr, CapError> {
+    CAPS.lock()
+        .cspace
+        .install_sched_context(budget, period, rights)
+}
+
+/// Einen Scheduling Context an einen Thread **binden**: die Cap `sc` auflösen, prüfen
+/// dass sie ein `SchedContext` mit WRITE-Recht ist, und das darin gespeicherte Budget
+/// auf dem Scheduler von `core` für `tid` setzen. Ohne gültige Cap keine Budget-
+/// Autorität (gibt `false` zurück). Lock-Ordnung: CAPS vor SCHEDS[core].
+pub fn bind_sched_context(sc: CapPtr, core: usize, tid: ThreadId) -> bool {
+    let (budget, period) = {
+        let caps = CAPS.lock();
+        match caps.cspace.lookup(sc) {
+            Some((ObjectKind::SchedContext { budget, period }, rights, _))
+                if rights.contains(Rights::WRITE) =>
+            {
+                (budget, period)
+            }
+            _ => return false, // keine (gültige) SchedContext-Cap -> keine Autorität
+        }
+    }; // CAPS vor SCHEDS freigegeben
+    SCHEDS[core].lock().set_budget(tid, budget, period)
+}
+
+/// MCS-Telemetrie eines Kerns: `(Budget-Erschöpfungen, Refills)`. Für Tests.
+pub fn budget_stats(core: usize) -> (u64, u64) {
+    SCHEDS[core].lock().budget_stats()
 }
 
 /// Beendete Threads **dieses Kerns** einsammeln: TCB-Slots freigeben und Stacks an

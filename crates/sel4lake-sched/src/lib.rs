@@ -83,6 +83,18 @@ struct Tcb {
     /// Stack-Region des Threads (für die Rückgewinnung beim Beenden).
     stack_base: usize,
     stack_len: usize,
+    // --- MCS Scheduling Context (ADR 0005) ---
+    /// Budget in Ticks je Periode. `0` = unbeschränkt (klassisches Round-Robin).
+    budget: u32,
+    /// Periodenlänge in Ticks (Refill-Intervall). Nur relevant bei `budget > 0`.
+    period: u32,
+    /// Verbleibende Ticks in der aktuellen Periode.
+    remaining: u32,
+    /// Per-Kern-Tick, ab dem das Budget wieder aufgefüllt wird (bei Erschöpfung gesetzt).
+    next_refill: u64,
+    /// True, wenn das Budget erschöpft ist (Thread weder laufend noch in Ready-Queue,
+    /// wartet auf Refill).
+    depleted: bool,
 }
 
 impl Tcb {
@@ -94,6 +106,11 @@ impl Tcb {
         blocked: false,
         stack_base: 0,
         stack_len: 0,
+        budget: 0,
+        period: 0,
+        remaining: 0,
+        next_refill: 0,
+        depleted: false,
     };
 }
 
@@ -169,6 +186,11 @@ pub struct Scheduler {
     /// Bit `p` gesetzt, wenn `queues[p]` nicht leer ist (O(1)-Auswahl der höchsten).
     bitmap: u32,
     zombies: [Option<Zombie>; NZOMBIES],
+    /// Per-Kern-Tick-Zähler (für MCS-Budget-Refill-Zeitpunkte).
+    now: u64,
+    /// Telemetrie: wie oft erschöpfte ein Budget bzw. wurde aufgefüllt (für Tests).
+    depletions: u64,
+    refills: u64,
 }
 
 impl Default for Scheduler {
@@ -186,6 +208,9 @@ impl Scheduler {
             queues: [RunQueue::EMPTY; NPRIO],
             bitmap: 0,
             zombies: [None; NZOMBIES],
+            now: 0,
+            depletions: 0,
+            refills: 0,
         }
     }
 
@@ -372,11 +397,47 @@ impl Scheduler {
 
     /// Timer-Tick (oder Reschedule-IPI): aktuellen Frame sichern, rundlaufend den
     /// nächsten Thread wählen und dessen Frame zur Wiederherstellung zurückgeben.
-    pub fn on_tick(&mut self, core: usize, frame: usize) -> usize {
+    ///
+    /// `tick = true` bei einem **echten Zeitscheiben-Tick** (Timer/IPI): dann wird
+    /// das **MCS-Budget** des laufenden Threads um einen Tick reduziert und erschöpfte
+    /// Budgets werden nach Periodenablauf wieder aufgefüllt. `tick = false` bei einem
+    /// freiwilligen `YIELD` (verbraucht kein Budget, rein Round-Robin).
+    pub fn on_tick(&mut self, core: usize, frame: usize, tick: bool) -> usize {
         debug_assert_eq!(core, self.core);
+        if tick {
+            self.now += 1;
+            // Refill: erschöpfte MCS-Threads, deren Periode abgelaufen ist, auffüllen
+            // und wieder bereit machen.
+            for slot in 0..PER_CORE {
+                if self.tcbs[slot].used
+                    && self.tcbs[slot].budget > 0
+                    && self.tcbs[slot].depleted
+                    && self.now >= self.tcbs[slot].next_refill
+                {
+                    self.tcbs[slot].remaining = self.tcbs[slot].budget;
+                    self.tcbs[slot].depleted = false;
+                    self.refills += 1;
+                    self.enqueue_ready(slot);
+                }
+            }
+        }
         if let Some(cur) = self.current {
             self.tcbs[cur].sp = frame;
-            self.enqueue_ready(cur);
+            let mut requeue = true;
+            if tick && self.tcbs[cur].budget > 0 {
+                // Eine Zeitscheibe verbraucht -> Budget reduzieren.
+                self.tcbs[cur].remaining = self.tcbs[cur].remaining.saturating_sub(1);
+                if self.tcbs[cur].remaining == 0 {
+                    // Erschöpft: bis zum Refill nicht mehr einplanen (blockiert auf Budget).
+                    self.tcbs[cur].depleted = true;
+                    self.tcbs[cur].next_refill = self.now + self.tcbs[cur].period as u64;
+                    self.depletions += 1;
+                    requeue = false;
+                }
+            }
+            if requeue {
+                self.enqueue_ready(cur);
+            }
         }
         match self.dequeue_highest() {
             Some(next) => {
@@ -385,6 +446,26 @@ impl Scheduler {
             }
             None => frame, // nichts lauffähig (sollte nicht vorkommen: Idle ist immer dabei)
         }
+    }
+
+    /// Einem Thread einen **Scheduling Context** zuweisen: `budget` Ticks je `period`
+    /// Ticks (`budget = 0` -> unbeschränkt/Round-Robin). Konfiguriert die MCS-Felder.
+    pub fn set_budget(&mut self, tid: ThreadId, budget: u32, period: u32) -> bool {
+        if let Some(s) = self.resolve(tid) {
+            self.tcbs[s].budget = budget;
+            self.tcbs[s].period = period.max(1);
+            self.tcbs[s].remaining = budget;
+            self.tcbs[s].next_refill = self.now + period as u64;
+            self.tcbs[s].depleted = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// MCS-Telemetrie dieses Kerns: (Budget-Erschöpfungen, Refills). Für Tests.
+    pub fn budget_stats(&self) -> (u64, u64) {
+        (self.depletions, self.refills)
     }
 
     // --- intern ---
@@ -444,6 +525,8 @@ impl Scheduler {
             blocked: false,
             stack_base: 0,
             stack_len: 0,
+            // MCS-Felder: standardmäßig unbeschränkt (budget = 0 -> Round-Robin).
+            ..Tcb::EMPTY
         };
         Some(i)
     }

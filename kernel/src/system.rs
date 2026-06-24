@@ -111,6 +111,8 @@ static FP_STATES: SpinLock<[FpState; MAX_THREADS]> =
     SpinLock::new([const { FpState::new() }; MAX_THREADS]);
 /// Zähler abgeschlossener Lazy-FP-Owner-Wechsel (Save+Restore), für den Test.
 static FP_SWITCHES: AtomicUsize = AtomicUsize::new(0);
+/// Summe der per `reap` an den Allokator zurückgegebenen Stack-Bytes (monoton).
+static REAPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// **Per-Kern** Scheduler-Instanzen, jede hinter eigenem Lock. Der heiße
 /// Timer-/IPI-Reschedule-Pfad sperrt nur `SCHEDS[core]` des eigenen Kerns -> echte
@@ -413,6 +415,28 @@ pub fn spawn(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
     spawn_on_core(hal::cpu::core_id(), entry, arg, prio)
 }
 
+/// Den Kern mit der **geringsten Last** wählen (Anzahl belegter TCB-Slots). Sperrt
+/// jede Scheduler-Instanz einzeln/kurz (nie zwei gleichzeitig).
+pub fn least_loaded_core() -> usize {
+    let mut best = 0usize;
+    let mut best_load = usize::MAX;
+    for (c, s) in SCHEDS.iter().enumerate() {
+        let load = s.lock().load();
+        if load < best_load {
+            best_load = load;
+            best = c;
+        }
+    }
+    best
+}
+
+/// **Lastbewusst** einen Thread erzeugen: auf dem aktuell am wenigsten ausgelasteten
+/// Kern. Best-effort (die Last kann sich zwischen Auswahl und spawn ändern). Threads
+/// bleiben danach kern-gebunden — es gibt keine Laufzeit-Migration (s. ext-10).
+pub fn spawn_balanced(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
+    spawn_on_core(least_loaded_core(), entry, arg, prio)
+}
+
 /// Wie [`spawn`], aber auf einem **bestimmten** Kern `core` (z. B. vom Bootkern aus,
 /// um Arbeit über die Kerne zu verteilen). Der Zielkern muss vorab via
 /// [`bind_cores`] gebunden sein. Lock-Ordnung RES vor SCHEDS[core].
@@ -506,11 +530,21 @@ pub fn reap() -> usize {
     } // SCHEDS freigegeben
     if n > 0 {
         let mut mem = MEM.lock();
+        let mut bytes = 0u64;
         for &(base, len) in &zombies[..n] {
             mem.free_region(PhysRegion::new(base as u64, len as u64));
+            bytes += len as u64;
         }
+        REAPED_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
     n
+}
+
+/// Summe der per [`reap`] an den Allokator zurückgegebenen Stack-Bytes (monoton) —
+/// belegt, dass beendete Threads ihren Stack zurückgeben (robust gegen anderweitige
+/// Allokationen, anders als ein absoluter `total_free`-Vergleich).
+pub fn reaped_bytes() -> u64 {
+    REAPED_BYTES.load(Ordering::Relaxed)
 }
 
 pub fn create_pd() -> Option<usize> {

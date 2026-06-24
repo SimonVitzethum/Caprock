@@ -296,6 +296,12 @@ impl Scheduler {
         Some((z.base, z.len))
     }
 
+    /// Lastmaß dieses Kerns: Anzahl belegter TCB-Slots (laufend + bereit +
+    /// blockiert/geparkt). Für die lastbewusste spawn-Platzierung.
+    pub fn load(&self) -> usize {
+        self.tcbs.iter().filter(|t| t.used).count()
+    }
+
     /// Handle des aktuell laufenden Threads.
     pub fn current_id(&self, core: usize) -> ThreadId {
         debug_assert_eq!(core, self.core);

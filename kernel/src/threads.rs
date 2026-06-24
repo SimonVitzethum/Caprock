@@ -56,7 +56,6 @@ static KILL_SNAP2: AtomicU64 = AtomicU64::new(0); // ... etwas später (muss gle
 static DENIED_KILL: AtomicU64 = AtomicU64::new(0); // KILL ohne Cap (muss != OK sein)
 static KILLER_DONE: AtomicBool = AtomicBool::new(false);
 static REAPED: AtomicU64 = AtomicU64::new(0); // vom Manager eingesammelte Threads
-static FREE_BASELINE: AtomicU64 = AtomicU64::new(0); // freies RAM nach allen Spawns
 /// Lokaler Cap-Slot des Killers ohne Cap (Negativtest).
 const NO_CAP_SLOT: u64 = 5;
 
@@ -81,6 +80,12 @@ static USER_RECV: AtomicU64 = AtomicU64::new(0);
 const RECLAIM_TARGET: u64 = 16;
 const RECLAIM_PRIO: u8 = 6; // höchste Demo-Prio: Exiter läuft sofort + beendet sich
 static RECLAIM_SPAWNED: AtomicU64 = AtomicU64::new(0);
+
+// Lastausgleich: lastbewusst platzierte Worker landen auf den am wenigsten
+// belasteten Kernen (nicht alle auf dem Bootkern) -> Verteilung über die Kerne.
+const BALANCED_TARGET: u64 = 16;
+static BALANCED_SPAWNED: AtomicU64 = AtomicU64::new(0);
+static BALANCED_PLACE: [AtomicU64; NUM_CORES] = [const { AtomicU64::new(0) }; NUM_CORES];
 
 // Kern-übergreifende synchrone IPC: Client auf core 0 ruft (CALL) einen Server auf
 // core 2; Antwort (REPLY) geht zurück über die Kerngrenze. Beide Richtungen wecken
@@ -300,9 +305,6 @@ pub fn spawn_demo() {
     let xcli = system::spawn_on_core(0, xipc_client as *const () as usize, 0, prio).expect("xipc client");
     system::bind_pd(xcli_pd, xcli);
 
-    // Freies RAM mit allen Stacks (Baseline für die Rückgewinnungs-Prüfung).
-    FREE_BASELINE.store(system::total_free(), Ordering::Relaxed);
-
     *RELOAD_INFO.lock() = Some(ReloadInfo { ep, v1, v1_pd, v2_pd });
 }
 
@@ -462,6 +464,14 @@ extern "C" fn xcore_worker(arg: usize) -> ! {
             XCORE_PROGRESS[core].store(n, Ordering::Relaxed);
         }
     }
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// Lastausgleich-Worker (EL1): wird lastbewusst auf einem Kern platziert und parkt
+/// dort (belegt einen Slot dieses Kerns -> macht die Verteilung sichtbar).
+extern "C" fn balanced_worker(_arg: usize) -> ! {
     loop {
         invoke(sys::PARK, 0, [0; 4], 0);
     }
@@ -852,6 +862,26 @@ pub fn demo_report_then_idle() -> ! {
             }
             hal::cpu::local_irq_enable();
         }
+
+        // Lastausgleich: nach dem Reclaim-Test BALANCED_TARGET Worker lastbewusst
+        // platzieren. Jeder landet auf dem gerade am wenigsten belasteten Kern (die
+        // Last steigt mit jedem Spawn) -> Verteilung über die Kerne statt alle auf
+        // dem Bootkern. Wir merken uns den gewählten Kern je Worker.
+        if RECLAIM_SPAWNED.load(Ordering::Relaxed) >= RECLAIM_TARGET
+            && BALANCED_SPAWNED.load(Ordering::Relaxed) < BALANCED_TARGET
+        {
+            hal::cpu::local_irq_disable();
+            while BALANCED_SPAWNED.load(Ordering::Relaxed) < BALANCED_TARGET {
+                match system::spawn_balanced(balanced_worker as *const () as usize, 0, system::IDLE_PRIO) {
+                    Some(t) => {
+                        BALANCED_PLACE[t.core()].fetch_add(1, Ordering::Relaxed);
+                        BALANCED_SPAWNED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    None => break,
+                }
+            }
+            hal::cpu::local_irq_enable();
+        }
         if !reported && ALL_DONE.load(Ordering::Acquire) && all_done() {
             report();
             reported = true;
@@ -878,7 +908,10 @@ fn all_done() -> bool {
     let xipc = XIPC_DONE.load(Ordering::Acquire);
     // Reclaim: alle transienten EL0-Exiter wurden erzeugt (Pool-Slots wiederverwendet).
     let reclaim = RECLAIM_SPAWNED.load(Ordering::Relaxed) >= RECLAIM_TARGET;
-    workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc && reclaim
+    // Lastausgleich: alle lastbewusst platzierten Worker erzeugt.
+    let balanced = BALANCED_SPAWNED.load(Ordering::Relaxed) >= BALANCED_TARGET;
+    workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
+        && reclaim && balanced
 }
 
 fn report() {
@@ -925,7 +958,10 @@ fn report() {
     let s2 = KILL_SNAP2.load(Ordering::Relaxed);
     let denied = DENIED_KILL.load(Ordering::Relaxed);
     let reaped = REAPED.load(Ordering::Relaxed);
-    let freed = system::total_free().saturating_sub(FREE_BASELINE.load(Ordering::Relaxed));
+    // Zurückgewonnener Stack = monotone Summe der vom Reaper freigegebenen Bytes
+    // (robust gegen die Speicher-Churn von Reclaim-/Balance-Test, anders als ein
+    // absoluter total_free-Vergleich).
+    let freed = system::reaped_bytes();
     println!("life    : victim-count nach KILL={s1}, später={s2} (eingefroren: {})", s1 == s2);
     println!("life    : KILL ohne Cap -> result={denied} (verweigert: {})", denied != result::OK);
     println!("life    : {reaped} Threads eingesammelt, {} KiB Stack zurueckgewonnen", freed / 1024);
@@ -1039,5 +1075,28 @@ fn report() {
     println!(
         "reclaim : {} (EL0-Kernel-Stack-Pool-Slots werden beim Thread-Ende zurueckgegeben)",
         if reclaim_ok { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Lastausgleich: lastbewusst platzierte Worker verteilten sich über die Kerne.
+    let mut place = [0u64; NUM_CORES];
+    let mut distinct = 0usize;
+    let mut maxp = 0u64;
+    for (c, p) in place.iter_mut().enumerate() {
+        *p = BALANCED_PLACE[c].load(Ordering::Relaxed);
+        if *p > 0 {
+            distinct += 1;
+        }
+        if *p > maxp {
+            maxp = *p;
+        }
+    }
+    let bspawned = BALANCED_SPAWNED.load(Ordering::Relaxed);
+    println!("balance : {bspawned} Worker verteilt {place:?} (Kerne genutzt={distinct}, max/Kern={maxp})");
+    // Balanciert: alle platziert, über mehrere Kerne gestreut, kein Kern überladen
+    // (ohne Lastausgleich landeten alle auf dem Bootkern -> distinct=1, max=TARGET).
+    let balance_ok = bspawned >= BALANCED_TARGET && distinct >= 5 && maxp <= 4;
+    println!(
+        "balance : {} (lastbewusste Platzierung verteilt Threads ueber die Kerne)",
+        if balance_ok { "ALL PASS" } else { "FAILURES" }
     );
 }

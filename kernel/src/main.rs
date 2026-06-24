@@ -141,6 +141,10 @@ pub extern "C" fn kernel_secondary_main() -> ! {
 /// Idle-Schleife: auf Interrupts warten (Low-Power).
 fn idle() -> ! {
     loop {
+        // Jeder Kern sammelt seine EIGENEN beendeten Threads ein (per-Kern-Reaping):
+        // gibt deren Stacks an den Allokator zurück. So lecken auch Threads, die auf
+        // einem Sekundärkern enden (z. B. lastbewusst platzierte), keinen Speicher.
+        system::reap();
         hal::cpu::wfi();
     }
 }

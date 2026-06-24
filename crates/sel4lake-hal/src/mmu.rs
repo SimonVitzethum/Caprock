@@ -61,6 +61,7 @@ const AP_RW_EL0: u64 = 0b01 << 6; // RW, EL0 + EL1 (User-Daten/Stacks)
 const AP_RO_EL0: u64 = 0b11 << 6; // RO, EL0 + EL1 (User-Code)
 const ATTR_DEVICE: u64 = 0 << 2; // MAIR-Index 0
 const ATTR_NORMAL: u64 = 1 << 2; // MAIR-Index 1
+const NG: u64 = 1 << 11; //       non-global: Eintrag ist ASID-spezifisch
 const PXN: u64 = 1 << 53; //      Privileged Execute Never
 const UXN: u64 = 1 << 54; //      Unprivileged Execute Never
 
@@ -88,14 +89,20 @@ enum Perm {
 const DEVICE_BLOCK: u64 = BLOCK_DESC | AF | AP_RW | ATTR_DEVICE | PXN | UXN;
 
 /// Normal-Memory-Leaf (Block oder Page) mit gegebenem Recht erzeugen.
+///
+/// User-**Daten** (`UserRw`) sind `nG` (ASID-spezifisch): die globale SAS-Map nutzt
+/// ASID 0, isolierte VSpaces eigene ASIDs — so leckt freies User-RAM der SAS-Map
+/// nicht per global-getaggtem TLB-Eintrag in eine isolierte VSpace. User-**Code**
+/// (`UserRx`, `.user_text`) bleibt global (nG=0): er wird read-only von allen
+/// VSpaces geteilt. Kernel/Device sind ebenfalls global (in jeder VSpace gemappt).
 fn normal_leaf(addr: u64, perm: Perm, page: bool) -> u64 {
     let kind = if page { PAGE_DESC } else { BLOCK_DESC };
     let perm_bits = match perm {
         Perm::Rx => AP_RO, //                   ausführbar bei EL1 (PXN=UXN=0)
         Perm::Ro => AP_RO | PXN | UXN,
         Perm::Rw => AP_RW | PXN | UXN,
-        Perm::UserRw => AP_RW_EL0 | PXN | UXN, // EL0+EL1 RW, kein Code
-        Perm::UserRx => AP_RO_EL0 | PXN, //      EL0 ausführbar (UXN=0), EL1 nicht (PXN)
+        Perm::UserRw => AP_RW_EL0 | PXN | UXN | NG, // EL0+EL1 RW, kein Code, ASID-spezifisch
+        Perm::UserRx => AP_RO_EL0 | PXN, //      EL0 ausführbar (UXN=0), EL1 nicht (PXN), global
     };
     addr | AF | SH_INNER | ATTR_NORMAL | perm_bits | kind
 }
@@ -128,9 +135,13 @@ fn perm_for_page(addr: u64) -> Perm {
     } else if addr >= rs && addr < re {
         Perm::Ro
     } else if addr >= us && addr < ue {
-        Perm::UserRx // EL0-ausführbarer User-Code
+        Perm::UserRx // EL0-ausführbarer User-Code (global, von allen VSpaces geteilt)
     } else if addr >= ke {
-        Perm::UserRw // freies RAM oberhalb des Images (< 2 MiB): EL0-zugänglich
+        // Freies RAM in den ersten 2 MiB: **EL1-only**. Diese L3 wird von jeder
+        // isolierten VSpace geteilt (Kernelimage + .user_text); sie darf daher kein
+        // EL0-zugängliches freies RAM enthalten. User-RAM wird erst ab 2 MiB
+        // alloziert (siehe init_mem-Aufrunden).
+        Perm::Rw
     } else {
         // Kernel-Daten/BSS/Stacks (EL1-only).
         Perm::Rw
@@ -259,4 +270,93 @@ pub fn sctlr_flags() -> (bool, bool, bool) {
 pub fn kernel_end() -> u64 {
     // SAFETY: reine Adressberechnung über ein Linker-Symbol.
     unsafe { sym(&__kernel_end) }
+}
+
+/// Mindest-Basis für **User**-RAM: 2 MiB ab RAM-Anfang. Die ersten 2 MiB sind die
+/// geteilte Kernel-L3 (Kernelimage + `.user_text`, von jeder VSpace genutzt) und
+/// enthalten kein EL0-zugängliches freies RAM. Der Allokator beginnt hier.
+pub const USER_RAM_MIN: u64 = RAM_BASE + TWO_MIB;
+
+/// Ende von GiB 1 (RAM-Anfang + 1 GiB). Die private User-Region einer isolierten
+/// VSpace muss in `[USER_RAM_MIN, GIB1_END)` liegen (die per-PD-L2 deckt GiB 1 ab).
+pub const GIB1_END: u64 = RAM_BASE + ONE_GIB;
+
+/// Größe der privaten User-Region je isolierter PD (ein L2-Block).
+pub const ISO_REGION_SIZE: u64 = TWO_MIB;
+
+// ---------------------------------------------------------------------------
+// Per-Prozess-VSpaces (Weg C, Hybrid): die SAS-Map bleibt für vertrauenswürdige
+// PDs; isolierte PDs erhalten eine eigene VSpace, die nur den Kernel (EL1-only,
+// geteilt) + ihre eigene User-Region (EL0) mappt. Adressierung bleibt Identity.
+// ---------------------------------------------------------------------------
+
+/// Wurzel der globalen SAS-Map (Kernel + alles RAM EL0-zugänglich); ASID 0.
+pub fn global_root() -> u64 {
+    table_phys(&L1_TABLE)
+}
+
+/// `TTBR0_EL1` auf eine VSpace-Wurzel `root` mit `asid` setzen. Kein TLB-Flush:
+/// Kernel/Device/Code sind global (nG=0, in jeder VSpace gültig), User-Daten sind
+/// `nG` und ASID-getaggt — verschiedene ASIDs kollidieren nicht. Pro Kontextwechsel
+/// vom Kernel aufzurufen.
+pub fn set_user_vspace(root: u64, asid: u16) {
+    let ttbr0 = ((asid as u64) << 48) | root;
+    // SAFETY: Schreiben von TTBR0_EL1 (Adressraum-Wurzel) + isb. Kernel/Code sind in
+    // jeder VSpace identisch (global) gemappt, daher läuft der Kernel unterbrechungs-
+    // frei weiter. MMU-/Registerdomäne.
+    unsafe {
+        asm!("msr TTBR0_EL1, {}", "isb", in(reg) ttbr0, options(nostack, preserves_flags));
+    }
+}
+
+/// EL1-only Normal-Block (Kernel sieht das RAM, EL0 nicht), global. Für die
+/// „Rest-RAM"-Einträge einer isolierten VSpace (1-GiB- bzw. 2-MiB-Blöcke).
+fn kernel_block(addr: u64) -> u64 {
+    addr | AF | SH_INNER | ATTR_NORMAL | AP_RW | PXN | UXN | BLOCK_DESC
+}
+
+/// User-RW 2-MiB-Block, `nG` (ASID-spezifisch): die eigene Region einer isolierten PD.
+fn user_block(addr: u64) -> u64 {
+    addr | AF | SH_INNER | ATTR_NORMAL | AP_RW_EL0 | PXN | UXN | NG | BLOCK_DESC
+}
+
+/// Eine **isolierte VSpace** in zwei frische 4-KiB-Frames bauen (`l1_phys` = Wurzel,
+/// `l2_phys` = L2 für GiB 1). Gemappt wird: Device (EL1-only), das Kernelimage über
+/// die **geteilte** Kernel-L3 (inkl. `.user_text` EL0-RX), das restliche RAM
+/// **EL1-only** (Kernel sieht alles, EL0 nicht) und **genau** die User-Region
+/// `[user_base, user_base+user_len)` als EL0-RW. `user_base` muss 2-MiB-ausgerichtet
+/// und die Region ⊆ GiB 1 sein. Der Aufrufer läuft in der globalen Map (Identity),
+/// daher sind `l1_phys`/`l2_phys` direkt beschreibbar.
+pub fn build_isolated_vspace(l1_phys: u64, l2_phys: u64, user_base: u64, user_len: u64) {
+    // SAFETY: l1_phys/l2_phys sind frisch allozierte, 4-KiB-ausgerichtete RAM-Frames,
+    // in der globalen Identity-Map gültig + beschreibbar. Genau zwei Tabellen à 512
+    // Deskriptoren werden initialisiert. MMU-Tabellen-Domäne.
+    let l1 = unsafe { core::slice::from_raw_parts_mut(l1_phys as *mut u64, 512) };
+    let l2 = unsafe { core::slice::from_raw_parts_mut(l2_phys as *mut u64, 512) };
+
+    // L2 (GiB 1): [0] -> gemeinsame Kernel-L3 (Kernelimage + .user_text); die
+    // User-Region als EL0-RW (nG); alles andere EL1-only (Kernel-Sicht).
+    for (i, e) in l2.iter_mut().enumerate() {
+        let addr = RAM_BASE + i as u64 * TWO_MIB;
+        *e = if i == 0 {
+            table_desc(table_phys(&L3_TABLE))
+        } else if addr >= user_base && addr < user_base + user_len {
+            user_block(addr)
+        } else {
+            kernel_block(addr)
+        };
+    }
+
+    // L1: [0] Device, [1] -> L2 (GiB 1), [2..=8] restliches RAM EL1-only, Rest leer.
+    for e in l1.iter_mut() {
+        *e = 0;
+    }
+    l1[0] = DEVICE_BLOCK;
+    l1[1] = table_desc(l2_phys);
+    for (i, slot) in l1.iter_mut().enumerate().take(9).skip(2) {
+        *slot = kernel_block(i as u64 * ONE_GIB);
+    }
+
+    // Tabellen-Schreibzugriffe vor dem ersten Walk sichtbar machen.
+    cpu::dsb_sy();
 }

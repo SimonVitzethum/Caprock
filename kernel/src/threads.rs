@@ -87,6 +87,17 @@ const BALANCED_TARGET: u64 = 16;
 static BALANCED_SPAWNED: AtomicU64 = AtomicU64::new(0);
 static BALANCED_PLACE: [AtomicU64; NUM_CORES] = [const { AtomicU64::new(0) }; NUM_CORES];
 
+// Weg C (Hybrid): isolierte EL0-PD mit eigener VSpace vs. vertrauenswürdige SAS-PD.
+// Beide versuchen, dieselbe fremde RAM-Adresse X zu lesen: die SAS-PD darf (X ist im
+// SAS EL0-RW), die isolierte PD faultet (X ist in ihrer VSpace EL1-only -> Kernel
+// beendet sie). Belegt: nur per-Prozess-VSpace gibt echte User<->User-Trennung.
+const ISO_SECRET: u64 = 0x5E_C4E7_5E_C4E7;
+const ISO_BADGE_RAN: u64 = 1 << 0; // isolierte PD lief + IPC ging (vor dem Fault)
+const ISO_BADGE_READ: u64 = 1 << 1; // isolierte PD las X (DARF NIE kommen)
+const ISO_BADGE_TRUSTED: u64 = 1 << 2; // SAS-PD las X erfolgreich
+static ISO_MASK: AtomicU64 = AtomicU64::new(0); // gesammelte Badges
+static ISO_SECRET_ADDR: AtomicU64 = AtomicU64::new(0); // Adresse X (fremdes RAM)
+
 // Kern-übergreifende synchrone IPC: Client auf core 0 ruft (CALL) einen Server auf
 // core 2; Antwort (REPLY) geht zurück über die Kerngrenze. Beide Richtungen wecken
 // den Partner per Cross-Core-IPI.
@@ -305,6 +316,41 @@ pub fn spawn_demo() {
     let xcli = system::spawn_on_core(0, xipc_client as *const () as usize, 0, prio).expect("xipc client");
     system::bind_pd(xcli_pd, xcli);
 
+    // --- Weg C (Hybrid): isolierte PD vs. SAS-PD lesen dieselbe fremde Adresse X ---
+    // X ist eine fremde RAM-Adresse (eigene kleine Region) mit einem Geheimwert. Die
+    // MemoryCap wird verworfen -> die Region bleibt belegt (der Allokator reklamiert
+    // nur per free), niemand sonst bekommt sie. Die Proben lesen X roh (kein Cap nötig).
+    let xaddr = system::alloc(4096, 4096).expect("secret region").region().base;
+    poke_u64(xaddr, ISO_SECRET); // Kernel (EL1) schreibt das Geheimnis
+    ISO_SECRET_ADDR.store(xaddr, Ordering::Relaxed);
+
+    // Notification + Kollektor; jede Probe bekommt eine SIGNAL-Cap mit eigenem Badge.
+    let intf = system::create_notification().expect("iso ntfn");
+    let introot = system::install_notification_cap(intf as u32, Rights::RWX).expect("iso ntfn cap");
+    let iso_wait = system::cap_mint(introot, Rights::READ, 0).expect("iso wait");
+    let icoll_pd = system::create_pd().expect("iso collector pd");
+    system::install_pd_cap(icoll_pd, 0, iso_wait);
+    let icoll = system::spawn(iso_collector as *const () as usize, 0, prio).expect("iso collector");
+    system::bind_pd(icoll_pd, icoll);
+
+    // Vertrauenswürdige SAS-Probe: liest X (erlaubt) und meldet Badge TRUSTED.
+    let t_sig = system::cap_mint(introot, Rights::WRITE, ISO_BADGE_TRUSTED).expect("trusted sig");
+    let t_pd = system::create_pd().expect("trusted probe pd");
+    system::install_pd_cap(t_pd, 0, t_sig);
+    let tp = system::spawn_user(trusted_probe as *const () as usize, xaddr as usize, prio)
+        .expect("trusted probe");
+    system::bind_pd(t_pd, tp);
+
+    // Isolierte Probe (eigene VSpace): Slot 0 = Badge RAN, Slot 1 = Badge READ.
+    let i_sig0 = system::cap_mint(introot, Rights::WRITE, ISO_BADGE_RAN).expect("iso sig0");
+    let i_sig1 = system::cap_mint(introot, Rights::WRITE, ISO_BADGE_READ).expect("iso sig1");
+    let i_pd = system::create_pd().expect("iso probe pd");
+    system::install_pd_cap(i_pd, 0, i_sig0);
+    system::install_pd_cap(i_pd, 1, i_sig1);
+    if let Some((ip, _region)) = system::spawn_isolated(iso_probe as *const () as usize, xaddr as usize, prio) {
+        system::bind_pd(i_pd, ip);
+    }
+
     *RELOAD_INFO.lock() = Some(ReloadInfo { ep, v1, v1_pd, v2_pd });
 }
 
@@ -466,6 +512,65 @@ extern "C" fn xcore_worker(arg: usize) -> ! {
     }
     loop {
         invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// **Isolierte EL0-Probe** (`.user_text`, läuft in eigener VSpace). x0 = Adresse X
+/// (fremdes RAM). Meldet erst per `SIGNAL` (Slot 0, Badge RAN), dass sie auf EL0 in
+/// ihrer VSpace läuft und IPC funktioniert; **dann** liest sie X — das ist in ihrer
+/// VSpace EL1-only → Fault → der Kernel beendet sie. Der zweite `SIGNAL` (Slot 1,
+/// Badge READ) wird daher NIE erreicht (käme er, wäre die Isolation gebrochen).
+#[link_section = ".user_text"]
+extern "C" fn iso_probe(_arg: usize) -> ! {
+    // SAFETY: reiner EL0-User-Code; `svc`/`ldr` sind die einzigen Operationen.
+    unsafe {
+        core::arch::asm!(
+            "mov x9, x0",   // x9 = X (fremde Adresse)
+            "mov x0, #8",   // sys::SIGNAL
+            "mov x1, #0",   // Slot 0 (Badge RAN)
+            "svc #0",
+            "ldr x2, [x9]", // X lesen -> FAULT in isolierter VSpace (EL1-only)
+            "mov x0, #8",   // (unerreichbar bei intakter Isolation) Slot 1 (Badge READ)
+            "mov x1, #1",
+            "svc #0",
+        "1:",
+            "mov x0, #5",   // sys::PARK
+            "svc #0",
+            "b 1b",
+            options(noreturn),
+        );
+    }
+}
+
+/// **Vertrauenswürdige EL0-Probe** (`.user_text`, läuft in der globalen SAS-Map).
+/// x0 = Adresse X. Liest X (im SAS EL0-RW → erlaubt) und meldet Erfolg per `SIGNAL`
+/// (Slot 0, Badge TRUSTED). Kontrast zur isolierten Probe: **dieselbe** Adresse.
+#[link_section = ".user_text"]
+extern "C" fn trusted_probe(_arg: usize) -> ! {
+    // SAFETY: reiner EL0-User-Code (SAS); `ldr` auf X ist hier erlaubt.
+    unsafe {
+        core::arch::asm!(
+            "mov x9, x0",
+            "ldr x2, [x9]", // X lesen (im SAS erlaubt)
+            "mov x0, #8",   // sys::SIGNAL Slot 0 (Badge TRUSTED)
+            "mov x1, #0",
+            "svc #0",
+        "1:",
+            "mov x0, #5",   // sys::PARK
+            "svc #0",
+            "b 1b",
+            options(noreturn),
+        );
+    }
+}
+
+/// Kollektor (EL1) für die Weg-C-Demo: sammelt die Badges der beiden Proben.
+extern "C" fn iso_collector(_arg: usize) -> ! {
+    loop {
+        let r = invoke(sys::WAIT, 0, [0; 4], 0);
+        if r.result == result::OK {
+            ISO_MASK.fetch_or(r.badge, Ordering::Relaxed);
+        }
     }
 }
 
@@ -910,8 +1015,12 @@ fn all_done() -> bool {
     let reclaim = RECLAIM_SPAWNED.load(Ordering::Relaxed) >= RECLAIM_TARGET;
     // Lastausgleich: alle lastbewusst platzierten Worker erzeugt.
     let balanced = BALANCED_SPAWNED.load(Ordering::Relaxed) >= BALANCED_TARGET;
+    // Weg C: SAS-Probe las X (TRUSTED-Badge), isolierte Probe lief+IPC (RAN-Badge)
+    // und faultete dann beim Fremdzugriff (iso_faulted).
+    let m = ISO_MASK.load(Ordering::Relaxed);
+    let vspace = (m & ISO_BADGE_RAN != 0) && (m & ISO_BADGE_TRUSTED != 0) && system::iso_faulted();
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
-        && reclaim && balanced
+        && reclaim && balanced && vspace
 }
 
 fn report() {
@@ -1098,5 +1207,21 @@ fn report() {
     println!(
         "balance : {} (lastbewusste Platzierung verteilt Threads ueber die Kerne)",
         if balance_ok { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Weg C (Hybrid): isolierte PD vs. SAS-PD beim Zugriff auf dieselbe Adresse X.
+    let m = ISO_MASK.load(Ordering::Relaxed);
+    let x = ISO_SECRET_ADDR.load(Ordering::Relaxed);
+    let iso_faulted = system::iso_faulted();
+    let ran = m & ISO_BADGE_RAN != 0;
+    let read = m & ISO_BADGE_READ != 0;
+    let trusted = m & ISO_BADGE_TRUSTED != 0;
+    println!("vspace  : X={x:#x}; SAS-Probe las X={trusted}; isol. Probe lief+IPC={ran}, faultete={iso_faulted}, las-X={read}");
+    // Bestanden: SAS-PD darf X lesen; isolierte PD lief + meldete sich per IPC,
+    // wurde beim Fremdzugriff hardware-seitig gefaultet und las X NIE.
+    let vspace_ok = trusted && ran && iso_faulted && !read;
+    println!(
+        "vspace  : {} (per-Prozess-VSpace: echte User<->User-Trennung, nur IPC)",
+        if vspace_ok { "ALL PASS" } else { "FAILURES" }
     );
 }

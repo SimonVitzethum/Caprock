@@ -92,7 +92,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     println!("dtb     : {}", if dtb_ok { "ALL PASS" } else { "FAILURES" });
 
     // Phase 2/3: capability-basiertes Speichermodell + Capability-Space.
-    let free_base = hal::mmu::kernel_end();
+    // User-RAM erst ab 2 MiB: die ersten 2 MiB sind die geteilte Kernel-L3 (von
+    // jeder isolierten VSpace genutzt) und dürfen kein EL0-zugängliches RAM enthalten.
+    let free_base = hal::mmu::kernel_end().max(hal::mmu::USER_RAM_MIN);
     system::init_mem(free_base, ram_end);
     println!("mem     : freies RAM [{free_base:#x}, {ram_end:#x})");
     selftest::run();

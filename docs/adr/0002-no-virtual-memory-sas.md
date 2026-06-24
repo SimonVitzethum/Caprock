@@ -129,8 +129,26 @@ Abort (`EC=0x24`) und wird isoliert (`el0`/`el0iso` ALL PASS).
 Das mildert den `−`-Punkt oben für **nicht vertrauenswürdigen, aber nativen**
 User-Code: solcher Code kann zwar im SAS andere *User*-Daten erreichen (keine
 Adressraum-Isolation), aber **den Kernel hardware-seitig nicht** mehr berühren.
-Vollständige Sandbox untrusted Codes (per-Komponenten-VSpace o. Ä.) bleibt
-außerhalb des Kern-Bedrohungsmodells.
+
+## Nachtrag 2: Hybrid-Modell — optionale per-Prozess-VSpace (implementiert)
+
+Die im Nachtrag 1 verbliebene Lücke (ein kompromittierter nativer Prozess erreicht
+fremde *User*-Daten im SAS) ist nun für **isolierte** PDs geschlossen — **ohne** den
+SAS für vertrauenswürdige PDs aufzugeben (Weg C, Hybrid; siehe
+[ext-11](../phase-reports/ext-11-per-process-vspace.md)):
+
+- **Vertrauenswürdige Rust-PDs** → globale SAS-Map (ASID 0), wie gehabt: schnell,
+  deterministisch, Zero-Copy-IPC.
+- **Isolierte PDs** → eigene VSpace (eigene Tabellen + ASID), die nur den Kernel
+  (EL1-only), die geteilte `.user_text` und **eine private 2-MiB-Region** (EL0-RW,
+  `nG`) mappt; alles übrige RAM ist dort EL1-only. Ein Zugriff auf fremden
+  User-Speicher faultet → der Kernel beendet die PD. Adressierung bleibt Identity;
+  Isolation kommt aus der **Präsenz** der Mappings, nicht aus Übersetzung.
+
+Verifiziert (`vspace` ALL PASS): SAS-Probe und isolierte Probe lesen dieselbe fremde
+Adresse X — die SAS-Probe darf, die isolierte faultet (`EC=0x24`) und kommuniziert
+ausschließlich per IPC. Damit ist **echte User↔User-Trennung** für untrusted/native
+PDs hardware-erzwingbar; das Kern-Bedrohungsmodell deckt sie nun ab.
 
 ## Offene Punkte für spätere Phasen
 

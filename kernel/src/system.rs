@@ -38,7 +38,7 @@ extern "C" {
     static __user_kstacks_bottom: u8;
 }
 const USER_KSTACK_SIZE: usize = 0x4000; // 16 KiB (muss zur Linker-Reservierung passen)
-const USER_KSTACK_COUNT: usize = 8;
+const USER_KSTACK_COUNT: usize = 12;
 const KSTACK_NONE: u16 = u16::MAX;
 
 /// Free-List + Besitzer-Abbildung des EL0-Kernel-Stack-Pools. Beim Thread-Ende wird
@@ -91,6 +91,9 @@ static EL0_SYSCALL_SEEN: AtomicBool = AtomicBool::new(false);
 /// Zähler: wie oft hat der Kernel einen EL0-Fault abgefangen und den fehlerhaften
 /// User-Thread isoliert (statt selbst anzuhalten)?
 static EL0_FAULTS: AtomicUsize = AtomicUsize::new(0);
+/// Sticky: faultete jemals ein Thread, der in einer **isolierten VSpace** lief?
+/// (Beleg, dass die Hardware-Adressraumtrennung einen Fremdzugriff verhindert hat.)
+static ISO_FAULTED: AtomicBool = AtomicBool::new(false);
 
 // --- Lazy-FP-Zustand ---
 //
@@ -113,6 +116,21 @@ static FP_STATES: SpinLock<[FpState; MAX_THREADS]> =
 static FP_SWITCHES: AtomicUsize = AtomicUsize::new(0);
 /// Summe der per `reap` an den Allokator zurückgegebenen Stack-Bytes (monoton).
 static REAPED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+// --- Per-Prozess-VSpaces (Weg C, Hybrid) ---
+//
+// Vertrauenswürdige PDs laufen in der globalen SAS-Map (TTBR0 = global_root, ASID 0);
+// **isolierte** PDs in einer eigenen VSpace (eigene Wurzel + ASID), die nur den
+// Kernel (EL1-only) + ihre eigene User-Region (EL0) mappt. Der Kontextwechsel setzt
+// TTBR0 passend zum einlaufenden Thread.
+/// Gepackter `TTBR0`-Wert (asid<<48 | root) je globalem Thread-Slot; `0` = globale
+/// SAS-Map. Beim Spawn einer isolierten PD gesetzt.
+#[allow(clippy::declare_interior_mutable_const)]
+static VSPACE_OF: [AtomicU64; MAX_THREADS] = [const { AtomicU64::new(0) }; MAX_THREADS];
+/// Aktuell aktive VSpace (gepacktes TTBR0) je Kern; `0` = noch unbekannt. Vermeidet
+/// einen TTBR0-Write, wenn die VSpace gleich bleibt (der häufige All-Trusted-Fall).
+#[allow(clippy::declare_interior_mutable_const)]
+static CURRENT_VSPACE: [AtomicU64; NUM_CORES] = [const { AtomicU64::new(0) }; NUM_CORES];
 
 /// **Per-Kern** Scheduler-Instanzen, jede hinter eigenem Lock. Der heiße
 /// Timer-/IPI-Reschedule-Pfad sperrt nur `SCHEDS[core]` des eigenen Kerns -> echte
@@ -149,6 +167,7 @@ fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
     let mut sched = SCHEDS[core].lock();
     let next = sched.on_tick(core, frame as usize);
     sync_fp_trap(core, &sched);
+    sync_vspace(core, &sched);
     next as *mut TrapFrame
 }
 
@@ -164,8 +183,12 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
     let mut ops = KernelSched;
     let next = sel4lake_microkit::dispatch(frame as usize, core, &mut ops, &CAPS, &EPS, &NTFNS);
     // Der Syscall kann den laufenden Thread gewechselt haben (block/exit) -> FP-Trap
-    // passend zum neuen aktuellen Thread setzen.
-    sync_fp_trap(core, &SCHEDS[core].lock());
+    // + VSpace passend zum neuen aktuellen Thread setzen.
+    {
+        let sched = SCHEDS[core].lock();
+        sync_fp_trap(core, &sched);
+        sync_vspace(core, &sched);
+    }
     next as *mut TrapFrame
 }
 
@@ -226,6 +249,22 @@ fn sync_fp_trap(core: usize, sched: &Scheduler) {
     hal::fp::set_el0_trap(cur != owner);
 }
 
+/// `TTBR0` (Adressraum) für den **gerade aktuellen** Thread auf `core` setzen:
+/// dessen isolierte VSpace, oder die globale SAS-Map (trusted). Schreibt TTBR0 nur,
+/// wenn sich die VSpace ändert (vermeidet `isb` im häufigen All-Trusted-Fall). Am
+/// Ende jedes Hooks aufzurufen, der den laufenden Thread gewechselt haben kann.
+fn sync_vspace(core: usize, sched: &Scheduler) {
+    let slot = sched.current_id(core).slot();
+    let v = VSPACE_OF[slot].load(Ordering::Relaxed);
+    let want = if v == 0 { hal::mmu::global_root() } else { v };
+    if CURRENT_VSPACE[core].load(Ordering::Relaxed) != want {
+        let root = want & ((1u64 << 48) - 1);
+        let asid = (want >> 48) as u16;
+        hal::mmu::set_user_vspace(root, asid);
+        CURRENT_VSPACE[core].store(want, Ordering::Relaxed);
+    }
+}
+
 /// FP-Trap-Hook (Lazy-FP): Ein EL0-Thread hat FP/SIMD benutzt, ohne Owner zu sein.
 /// Alten Owner sichern, FP-Kontext dieses Threads laden, ihn zum Owner machen und
 /// FP freigeben. Rückgabe: derselbe Frame — der `eret` wiederholt die getrappte
@@ -254,9 +293,10 @@ fn fp_trap(frame: *mut TrapFrame) -> *mut TrapFrame {
     frame
 }
 
-/// Genullten FP-Kontext für einen frisch belegten Slot setzen und veraltete
-/// Owner-Referenzen auf diesen Slot löschen (Slot-Wiederverwendung nach Thread-Ende).
-/// Unter gehaltenem SCHED aufzurufen, BEVOR der Thread laufen kann.
+/// Per-Thread-Kernelzustand für einen frisch belegten Slot zurücksetzen: genullter
+/// FP-Kontext, veraltete FP-Owner-Referenzen löschen, und die VSpace auf **global**
+/// (SAS) zurücksetzen (eine vorher isolierte PD auf diesem Slot darf nicht
+/// nachwirken). Unter gehaltenem SCHED aufzurufen, BEVOR der Thread laufen kann.
 fn fp_reset_slot(slot: usize) {
     FP_STATES.lock()[slot] = FpState::new();
     for owner in FP_OWNER.iter() {
@@ -265,6 +305,7 @@ fn fp_reset_slot(slot: usize) {
             owner.store(FP_OWNER_NONE, Ordering::Relaxed);
         }
     }
+    VSPACE_OF[slot].store(0, Ordering::Relaxed); // Default: globale SAS-Map
 }
 
 /// Anzahl abgeschlossener Lazy-FP-Owner-Wechsel (Save eines alten Owners).
@@ -285,13 +326,19 @@ fn el0_fault(frame: *mut TrapFrame, esr: u64, far: u64) -> *mut TrapFrame {
     let (next, slot) = {
         let mut sched = SCHEDS[core].lock();
         let tid = sched.current_id(core);
+        if VSPACE_OF[tid.slot()].load(Ordering::Relaxed) != 0 {
+            // Der fehlerhafte Thread lief in einer isolierten VSpace -> die
+            // Adressraumtrennung hat einen Fremdzugriff hardware-seitig verhindert.
+            ISO_FAULTED.store(true, Ordering::Release);
+        }
         println!(
             "el0-trap: User-Thread {:#x} faultete (EC={ec:#04x} FAR={far:#018x}) -> beendet, Kernel laeuft weiter",
             tid.to_raw()
         );
         let next = sched.exit_current(core, frame as usize);
-        // Auf den nächsten Thread gewechselt -> FP-Trap passend setzen.
+        // Auf den nächsten Thread gewechselt -> FP-Trap + VSpace passend setzen.
         sync_fp_trap(core, &sched);
+        sync_vspace(core, &sched);
         (next, tid.slot())
     }; // SCHEDS freigegeben
     reclaim_user_kstack(slot); // EL0-Kernel-Stack-Pool-Slot zurückgeben (KSTACKS allein)
@@ -301,6 +348,12 @@ fn el0_fault(frame: *mut TrapFrame, esr: u64, far: u64) -> *mut TrapFrame {
 /// Wie oft hat der Kernel einen EL0-Fault abgefangen und den Thread isoliert?
 pub fn el0_fault_count() -> usize {
     EL0_FAULTS.load(Ordering::Relaxed)
+}
+
+/// Hat ein Thread in einer **isolierten VSpace** durch einen Fremdzugriff gefaultet?
+/// (Hardware-erzwungene Adressraumtrennung, Weg C.)
+pub fn iso_faulted() -> bool {
+    ISO_FAULTED.load(Ordering::Acquire)
 }
 
 /// Reschedule-, Syscall-, EL0-Fault- + Lazy-FP-Hook registrieren (einmalig, vor
@@ -481,6 +534,90 @@ pub fn spawn_user(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
         None => {
             release_user_kstack(kidx);
             MEM.lock().free_region(PhysRegion::new(user_base as u64, user_len as u64));
+            None
+        }
+    }
+}
+
+/// ASID-Vergabe für isolierte VSpaces (ASID 0 = globale SAS-Map, daher ab 1).
+static ISO_ASID_NEXT: AtomicU64 = AtomicU64::new(1);
+
+/// Einen **isolierten EL0-User-Thread** erzeugen (Weg C): eigene VSpace, die nur den
+/// Kernel (EL1-only) + eine **private 2-MiB-Region** (EL0-RW) mappt. Der Thread läuft
+/// auf EL0 mit Stack in dieser Region; sein Code ist die geteilte `.user_text`
+/// (EL0-RX in jeder VSpace). Greift er auf **fremdes** User-RAM zu, ist das in seiner
+/// VSpace EL1-only -> Fault -> der Kernel beendet ihn. Gibt `(ThreadId, region_base)`.
+///
+/// Vereinfachungen dieses ersten Inkrements: eine feste 2-MiB-Region je PD (in GiB 1);
+/// die VSpace-Page-Tables (L1+L2) werden beim Thread-Ende geleakt (klein, dokumentiert).
+pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u64)> {
+    let core = hal::cpu::core_id();
+    let kidx = claim_user_kstack()?;
+    let kbase = core::ptr::addr_of!(__user_kstacks_bottom) as usize + kidx * USER_KSTACK_SIZE;
+
+    // Private 2-MiB-Region (2-MiB-ausgerichtet) + zwei 4-KiB-Page-Table-Frames.
+    let region_sz = hal::mmu::ISO_REGION_SIZE;
+    let (rbase, rlen) = match MEM.lock().alloc(region_sz, region_sz) {
+        Some(r) => (r.base(), r.len()),
+        None => {
+            release_user_kstack(kidx);
+            return None;
+        }
+    };
+    // Region muss in GiB 1 liegen (die per-PD-L2 deckt nur GiB 1 ab).
+    if rbase < hal::mmu::USER_RAM_MIN || rbase + rlen > hal::mmu::GIB1_END {
+        let mut mem = MEM.lock();
+        mem.free_region(PhysRegion::new(rbase, rlen));
+        release_user_kstack(kidx);
+        return None;
+    }
+    let a = MEM.lock().alloc(4096, 4096);
+    let b = MEM.lock().alloc(4096, 4096);
+    let (l1, l2) = match (a, b) {
+        (Some(l1), Some(l2)) => (l1, l2),
+        (a, b) => {
+            let mut mem = MEM.lock();
+            if let Some(c) = a {
+                mem.free_region(PhysRegion::new(c.base(), c.len()));
+            }
+            if let Some(c) = b {
+                mem.free_region(PhysRegion::new(c.base(), c.len()));
+            }
+            mem.free_region(PhysRegion::new(rbase, rlen));
+            drop(mem);
+            release_user_kstack(kidx);
+            return None;
+        }
+    };
+
+    // VSpace aufbauen (Kernel EL1-only + diese Region EL0-RW). Wir laufen in der
+    // globalen Identity-Map -> die frischen Frames sind beschreibbar.
+    hal::mmu::build_isolated_vspace(l1.base(), l2.base(), rbase, rlen);
+    let asid = ISO_ASID_NEXT.fetch_add(1, Ordering::Relaxed) as u16;
+    let packed = ((asid as u64) << 48) | l1.base();
+
+    // Thread: Kernel-Stack aus dem Pool, User-Stack = die private Region.
+    let user_base = rbase as usize;
+    let user_len = rlen as usize;
+    let tid = {
+        let mut sched = SCHEDS[core].lock();
+        let r = sched.spawn_user(core, entry, arg, kbase, USER_KSTACK_SIZE, user_base, user_len, prio);
+        if let Some(t) = r {
+            fp_reset_slot(t.slot()); // setzt FP + VSPACE_OF[slot]=0 (global) zurück
+        }
+        r
+    };
+    match tid {
+        Some(t) => {
+            VSPACE_OF[t.slot()].store(packed, Ordering::Relaxed); // ab jetzt isoliert
+            Some((t, rbase))
+        }
+        None => {
+            release_user_kstack(kidx);
+            let mut mem = MEM.lock();
+            mem.free_region(PhysRegion::new(rbase, rlen));
+            mem.free_region(PhysRegion::new(l1.base(), l1.len()));
+            mem.free_region(PhysRegion::new(l2.base(), l2.len()));
             None
         }
     }

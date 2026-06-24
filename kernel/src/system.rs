@@ -31,13 +31,61 @@ const STACK_SIZE: u64 = 64 * 1024;
 pub const IDLE_PRIO: u8 = 1;
 
 // EL0-User-Threads: Kernel-Stacks aus einem EL1-only Pool (Linker), User-Stacks
-// aus dem EL0-zugänglichen RAM.
+// aus dem EL0-zugänglichen RAM. Der Kernel-Stack MUSS EL1-only sein (sonst könnte
+// der EL0-Thread seinen eigenen Kernel-Stack lesen/schreiben), daher der feste Pool
+// im Kernel-Image (nicht aus dem EL0-zugänglichen MEM-Allokator).
 extern "C" {
     static __user_kstacks_bottom: u8;
 }
 const USER_KSTACK_SIZE: usize = 0x4000; // 16 KiB (muss zur Linker-Reservierung passen)
 const USER_KSTACK_COUNT: usize = 8;
-static USER_KSTACK_NEXT: AtomicUsize = AtomicUsize::new(0);
+const KSTACK_NONE: u16 = u16::MAX;
+
+/// Free-List + Besitzer-Abbildung des EL0-Kernel-Stack-Pools. Beim Thread-Ende wird
+/// der Slot zurückgegeben (statt geleakt), sodass über die Laufzeit beliebig viele
+/// (nicht gleichzeitig > Pool) EL0-Threads erzeugt werden können.
+struct KstackPool {
+    /// `free[i]` = Slot `i` verfügbar.
+    free: [bool; USER_KSTACK_COUNT],
+    /// Pool-Slot je globalem Thread-Slot (`KSTACK_NONE` = keiner).
+    slot_of: [u16; MAX_THREADS],
+}
+/// Pool-Lock. Wird stets **allein** gehalten (nie verschachtelt mit anderen Locks)
+/// -> keine Sperrordnungs-Beschränkung.
+static KSTACKS: SpinLock<KstackPool> = SpinLock::new(KstackPool {
+    free: [true; USER_KSTACK_COUNT],
+    slot_of: [KSTACK_NONE; MAX_THREADS],
+});
+
+/// Einen freien Kernel-Stack-Pool-Slot reservieren (Free-List). `None` = Pool voll.
+fn claim_user_kstack() -> Option<usize> {
+    let mut p = KSTACKS.lock();
+    let idx = p.free.iter().position(|&f| f)?;
+    p.free[idx] = false;
+    Some(idx)
+}
+/// Einen (noch keinem Thread zugeordneten) Pool-Slot wieder freigeben (Fehlerpfad).
+fn release_user_kstack(idx: usize) {
+    KSTACKS.lock().free[idx] = true;
+}
+/// Den Pool-Slot `idx` dem Thread-Slot `thread_slot` zuordnen (nach erfolgreichem spawn).
+fn record_user_kstack(thread_slot: usize, idx: usize) {
+    KSTACKS.lock().slot_of[thread_slot] = idx as u16;
+}
+/// Beim Thread-Ende: den ggf. zugeordneten Kernel-Stack-Pool-Slot zurückgeben.
+/// No-Op für EL1-Threads (kein Pool-Slot). Stets allein gesperrt.
+fn reclaim_user_kstack(thread_slot: usize) {
+    let mut p = KSTACKS.lock();
+    let i = p.slot_of[thread_slot];
+    if i != KSTACK_NONE {
+        p.free[i as usize] = true;
+        p.slot_of[thread_slot] = KSTACK_NONE;
+    }
+}
+/// Anzahl aktuell freier Kernel-Stack-Pool-Slots (für den Reclaim-Test).
+pub fn user_kstack_free_count() -> usize {
+    KSTACKS.lock().free.iter().filter(|&&f| f).count()
+}
 /// Sticky: wurde jemals ein Syscall von EL0 (User-Thread) gesehen?
 static EL0_SYSCALL_SEEN: AtomicBool = AtomicBool::new(false);
 /// Zähler: wie oft hat der Kernel einen EL0-Fault abgefangen und den fehlerhaften
@@ -150,10 +198,19 @@ impl SchedOps for KernelSched {
         SCHEDS[core].lock().on_tick(core, frame)
     }
     fn exit_current(&mut self, core: usize, frame: usize) -> usize {
-        SCHEDS[core].lock().exit_current(core, frame)
+        // Slot des sich beendenden Threads vor dem Wechsel merken; IRQs sind im Trap
+        // maskiert -> der aktuelle Thread ist über die zwei kurzen Sperren stabil.
+        let slot = SCHEDS[core].lock().current_id(core).slot();
+        let next = SCHEDS[core].lock().exit_current(core, frame);
+        reclaim_user_kstack(slot); // EL0-Kernel-Stack-Pool-Slot zurückgeben (KSTACKS allein)
+        next
     }
     fn kill(&mut self, tid: ThreadId, core: usize) -> bool {
-        SCHEDS[core].lock().kill(tid, core)
+        let ok = SCHEDS[core].lock().kill(tid, core);
+        if ok {
+            reclaim_user_kstack(tid.slot()); // getöteter EL0-Thread: Pool-Slot zurück
+        }
+        ok
     }
 }
 
@@ -223,14 +280,19 @@ fn el0_fault(frame: *mut TrapFrame, esr: u64, far: u64) -> *mut TrapFrame {
     let core = hal::cpu::core_id();
     let ec = (esr >> 26) & 0x3f;
     EL0_FAULTS.fetch_add(1, Ordering::Relaxed);
-    let mut sched = SCHEDS[core].lock();
-    let tid = sched.current_id(core).to_raw();
-    println!(
-        "el0-trap: User-Thread {tid:#x} faultete (EC={ec:#04x} FAR={far:#018x}) -> beendet, Kernel laeuft weiter"
-    );
-    let next = sched.exit_current(core, frame as usize);
-    // Auf den nächsten Thread gewechselt -> FP-Trap passend setzen.
-    sync_fp_trap(core, &sched);
+    let (next, slot) = {
+        let mut sched = SCHEDS[core].lock();
+        let tid = sched.current_id(core);
+        println!(
+            "el0-trap: User-Thread {:#x} faultete (EC={ec:#04x} FAR={far:#018x}) -> beendet, Kernel laeuft weiter",
+            tid.to_raw()
+        );
+        let next = sched.exit_current(core, frame as usize);
+        // Auf den nächsten Thread gewechselt -> FP-Trap passend setzen.
+        sync_fp_trap(core, &sched);
+        (next, tid.slot())
+    }; // SCHEDS freigegeben
+    reclaim_user_kstack(slot); // EL0-Kernel-Stack-Pool-Slot zurückgeben (KSTACKS allein)
     next as *mut TrapFrame
 }
 
@@ -365,24 +427,39 @@ pub fn spawn_on_core(core: usize, entry: usize, arg: usize, prio: u8) -> Option<
     Some(tid)
 }
 
-/// Einen **EL0-User-Thread** erzeugen: Kernel-Stack aus dem EL1-only Pool,
-/// User-Stack aus dem EL0-zugänglichen RAM. Der Thread läuft auf EL0 und kann nur
-/// per Syscall mit dem Kernel interagieren. Lock-Ordnung RES vor SCHED.
+/// Einen **EL0-User-Thread** erzeugen: Kernel-Stack aus dem EL1-only Pool (per
+/// Free-List, beim Thread-Ende zurückgegeben), User-Stack aus dem EL0-zugänglichen
+/// RAM. Der Thread läuft auf EL0 und kann nur per Syscall mit dem Kernel interagieren.
 pub fn spawn_user(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
     let core = hal::cpu::core_id();
-    let idx = USER_KSTACK_NEXT.fetch_add(1, Ordering::Relaxed);
-    if idx >= USER_KSTACK_COUNT {
-        return None;
-    }
-    let kbase = core::ptr::addr_of!(__user_kstacks_bottom) as usize + idx * USER_KSTACK_SIZE;
-    let (user_base, user_len) = {
-        let s = MEM.lock().alloc(STACK_SIZE, 16)?;
-        (s.base() as usize, s.len() as usize)
+    let kidx = claim_user_kstack()?; // freien Pool-Slot reservieren
+    let kbase = core::ptr::addr_of!(__user_kstacks_bottom) as usize + kidx * USER_KSTACK_SIZE;
+    let (user_base, user_len) = match MEM.lock().alloc(STACK_SIZE, 16) {
+        Some(s) => (s.base() as usize, s.len() as usize),
+        None => {
+            release_user_kstack(kidx);
+            return None;
+        }
     }; // MEM vor SCHEDS freigegeben (Ordnung MEM < SCHEDS)
-    let mut sched = SCHEDS[core].lock();
-    let tid = sched.spawn_user(core, entry, arg, kbase, USER_KSTACK_SIZE, user_base, user_len, prio)?;
-    fp_reset_slot(tid.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
-    Some(tid)
+    let tid = {
+        let mut sched = SCHEDS[core].lock();
+        let r = sched.spawn_user(core, entry, arg, kbase, USER_KSTACK_SIZE, user_base, user_len, prio);
+        if let Some(t) = r {
+            fp_reset_slot(t.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
+        }
+        r
+    }; // SCHEDS freigegeben
+    match tid {
+        Some(t) => {
+            record_user_kstack(t.slot(), kidx); // Pool-Slot dem Thread zuordnen
+            Some(t)
+        }
+        None => {
+            release_user_kstack(kidx);
+            MEM.lock().free_region(PhysRegion::new(user_base as u64, user_len as u64));
+            None
+        }
+    }
 }
 
 /// Einen blockierten/geparkten Thread `tid` auf **seinem** (ggf. fremden) Kern

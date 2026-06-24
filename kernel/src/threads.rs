@@ -76,6 +76,12 @@ static XFER_DONE: AtomicBool = AtomicBool::new(false);
 const USER_MAGIC: u64 = 0xC0DE;
 static USER_RECV: AtomicU64 = AtomicU64::new(0);
 
+// Reclaim-Test: transiente EL0-Exiter erzeugen, mehr als der Kernel-Stack-Pool (8)
+// gleichzeitig fasst — gelingt nur, wenn beim Thread-Ende der Pool-Slot zurückkommt.
+const RECLAIM_TARGET: u64 = 16;
+const RECLAIM_PRIO: u8 = 6; // höchste Demo-Prio: Exiter läuft sofort + beendet sich
+static RECLAIM_SPAWNED: AtomicU64 = AtomicU64::new(0);
+
 // Kern-übergreifende synchrone IPC: Client auf core 0 ruft (CALL) einen Server auf
 // core 2; Antwort (REPLY) geht zurück über die Kerngrenze. Beide Richtungen wecken
 // den Partner per Cross-Core-IPI.
@@ -343,9 +349,24 @@ extern "C" fn worker(arg: usize) -> ! {
     }
 }
 
-// Die EL0-FP-Threads kodieren die Syscall-Nummern als Immediates; hier absichern,
-// dass sie zur ABI passen.
-const _: () = assert!(sys::YIELD == 0 && sys::SIGNAL == 8 && sys::PARK == 5);
+// Die EL0-User-Programme kodieren die Syscall-Nummern als Immediates; hier
+// absichern, dass sie zur ABI passen.
+const _: () = assert!(sys::YIELD == 0 && sys::EXIT == 6 && sys::SIGNAL == 8 && sys::PARK == 5);
+
+/// **EL0-Exiter** (Sektion `.user_text`, EL0-ausführbar): beendet sich sofort per
+/// `EXIT`-Syscall. Für den Reclaim-Test transient erzeugt; beim Exit gibt der Kernel
+/// seinen EL1-only Kernel-Stack-Pool-Slot zurück, sodass er wiederverwendbar ist.
+#[link_section = ".user_text"]
+extern "C" fn exiter_entry(_arg: usize) -> ! {
+    // SAFETY: reiner EL0-User-Code; `svc` ist die einzige Kernel-Interaktion.
+    unsafe {
+        core::arch::asm!(
+            "mov x0, #6", // sys::EXIT
+            "svc #0",
+            options(noreturn),
+        );
+    }
+}
 
 // **EL0-FP-User-Programm** (`user_fp_entry`, Sektion `.user_text`, EL0-ausführbar).
 // Lädt das Muster (Argument in x0) in d0..d3 und prüft in jeder Iteration, dass es
@@ -808,6 +829,29 @@ pub fn demo_report_then_idle() -> ! {
                 system::wake_remote(ThreadId::from_raw(raw));
             }
         }
+
+        // Reclaim-Test: nach dem FP-Test transiente EL0-Exiter spawnen — insgesamt
+        // mehr (RECLAIM_TARGET) als der Kernel-Stack-Pool gleichzeitig fasst. Nur ein
+        // freier Slot wird belegt; jeder Exiter beendet sich (Prio 6 -> sofort) und
+        // gibt seinen Slot zurück. Gelingen alle TARGET Spawns, funktioniert Reclaim.
+        if FP_COLLECTOR_DONE.load(Ordering::Acquire)
+            && RECLAIM_SPAWNED.load(Ordering::Relaxed) < RECLAIM_TARGET
+        {
+            // Pro Tick alle gerade freien Slots belegen (Batch); die Exiter (Prio 6)
+            // beenden sich beim nächsten wfi-Tick und geben ihre Slots zurück.
+            // Atomar gegen Preemption (Locks im Thread-Kontext), wie beim Reload.
+            hal::cpu::local_irq_disable();
+            while RECLAIM_SPAWNED.load(Ordering::Relaxed) < RECLAIM_TARGET
+                && system::user_kstack_free_count() > 0
+            {
+                if system::spawn_user(exiter_entry as *const () as usize, 0, RECLAIM_PRIO).is_some() {
+                    RECLAIM_SPAWNED.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    break;
+                }
+            }
+            hal::cpu::local_irq_enable();
+        }
         if !reported && ALL_DONE.load(Ordering::Acquire) && all_done() {
             report();
             reported = true;
@@ -832,7 +876,9 @@ fn all_done() -> bool {
     let smp = (1..NUM_CORES).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
         && XCORE_WOKEN.load(Ordering::Acquire);
     let xipc = XIPC_DONE.load(Ordering::Acquire);
-    workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
+    // Reclaim: alle transienten EL0-Exiter wurden erzeugt (Pool-Slots wiederverwendet).
+    let reclaim = RECLAIM_SPAWNED.load(Ordering::Relaxed) >= RECLAIM_TARGET;
+    workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc && reclaim
 }
 
 fn report() {
@@ -982,5 +1028,16 @@ fn report() {
     println!(
         "xipc    : {} (synchrone IPC ueber Kerngrenze, CALL+REPLY je per IPI)",
         if xipc_ok { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Reclaim: transiente EL0-Threads (mehr als der 8er-Pool) liefen dank
+    // Rückgabe der Kernel-Stack-Pool-Slots beim Thread-Ende.
+    let spawned = RECLAIM_SPAWNED.load(Ordering::Relaxed);
+    let free = system::user_kstack_free_count();
+    println!("reclaim : {spawned} transiente EL0-Threads erzeugt (Pool=8), jetzt {free} Slots frei");
+    let reclaim_ok = spawned >= RECLAIM_TARGET && free >= 4;
+    println!(
+        "reclaim : {} (EL0-Kernel-Stack-Pool-Slots werden beim Thread-Ende zurueckgegeben)",
+        if reclaim_ok { "ALL PASS" } else { "FAILURES" }
     );
 }

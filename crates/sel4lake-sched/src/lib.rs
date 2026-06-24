@@ -337,10 +337,17 @@ impl Scheduler {
 
     /// Einen blockierten Thread **dieses Kerns** wieder bereit machen. Kern-
     /// übergreifend ruft der Kernel dies auf der Zielinstanz auf (+ Reschedule-IPI).
+    ///
+    /// Idempotent: wirkt **nur**, wenn der Thread tatsächlich blockiert ist. Ein
+    /// Aufruf auf einen laufenden/bereiten Thread ist ein No-Op (verhindert
+    /// Doppel-Einreihung) — wichtig, wenn `wake_remote` einen Thread trifft, der
+    /// gerade erst dabei ist, sich zu blockieren; ein erneuter Aufruf weckt ihn dann.
     pub fn unblock(&mut self, tid: ThreadId) {
         if let Some(s) = self.resolve(tid) {
-            self.tcbs[s].blocked = false;
-            self.enqueue_ready(s);
+            if self.tcbs[s].blocked {
+                self.tcbs[s].blocked = false;
+                self.enqueue_ready(s);
+            }
         }
     }
 

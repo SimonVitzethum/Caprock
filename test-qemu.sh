@@ -10,7 +10,9 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 CORES=8
-SECONDS_RUN="${1:-22}"
+# Default großzügig: 8 Demo-Threads auf den Sekundärkernen + die core-0-Demo
+# teilen sich unter single-threaded QEMU-TCG eine Host-CPU -> alles emuliert länger.
+SECONDS_RUN="${1:-35}"
 ELF="build/target/aarch64-sel4lake/release/sel4lake-kernel.elf"
 
 echo "== build =="
@@ -42,6 +44,7 @@ check "reload  : ALL PASS" "Hot-Reload (Server v2 ersetzt v1, gleicher Endpoint,
 check "ckpt    : ALL PASS" "Stateful Hot-Reload (Zustand bleibt über v1->v2 erhalten)"
 check "el0     : ALL PASS" "EL0-Userland (echter User-Thread ruft per Syscall)"
 check "el0iso  : ALL PASS" "EL0-Isolation (Kernel-Zugriff faultet, Thread beendet, Kernel überlebt)"
+check "smp     : ALL PASS" "Per-Kern-paralleler Scheduler (Worker je Kern + Cross-Core-IPI-Wake)"
 online=$(echo "$OUT" | grep -c "online")
 [ "$online" -eq "$CORES" ] && echo "  PASS: alle $CORES Kerne online" || { echo "  FAIL: nur $online/$CORES Kerne online"; fail=1; }
 

@@ -76,6 +76,15 @@ static XFER_DONE: AtomicBool = AtomicBool::new(false);
 const USER_MAGIC: u64 = 0xC0DE;
 static USER_RECV: AtomicU64 = AtomicU64::new(0);
 
+// Per-Kern-paralleler Scheduler: je ein Worker auf den Sekundärkernen 1..NUM_CORES
+// läuft PARALLEL (eigene Scheduler-Instanz je Kern, kein globaler Lock); ein
+// Parker auf core 1 wird kern-übergreifend von core 0 per IPI geweckt.
+const SMP_WORK_TARGET: u64 = 5;
+static XCORE_PROGRESS: [AtomicU64; NUM_CORES] = [const { AtomicU64::new(0) }; NUM_CORES];
+static XCORE_PARKED: AtomicBool = AtomicBool::new(false); // Parker hat sich blockiert
+static XCORE_WOKEN: AtomicBool = AtomicBool::new(false); // Parker nach IPI-Wake fortgesetzt
+static XCORE_PARKER_TID: AtomicU64 = AtomicU64::new(u64::MAX); // raw ThreadId des Parkers
+
 // Stateful Hot-Reload: Zähler-Service, dessen Zustand (in einer Memory-Region)
 // den Komponententausch v1(+1) -> v2(+10) überlebt.
 static CS_STATE_BASE: AtomicU64 = AtomicU64::new(0);
@@ -247,6 +256,18 @@ pub fn spawn_demo() {
     let bad = system::spawn_user(bad_user as *const () as usize, 0, prio).expect("bad user thread");
     system::bind_pd(bad_pd, bad);
 
+    // Per-Kern-paralleler Scheduler: je einen Worker auf JEDEN Sekundärkern (1..N)
+    // einplanen (die Kerne booten gleich per PSCI und picken ihn auf). Sie laufen
+    // parallel zu core 0 — jeder Kern schedult über seine eigene Instanz.
+    for c in 1..NUM_CORES {
+        system::spawn_on_core(c, xcore_worker as *const () as usize, c, prio);
+    }
+    // Cross-Core-Wake: ein Parker auf core 1 (höhere Prio als Idle), den core 0
+    // später per IPI weckt.
+    if let Some(parker) = system::spawn_on_core(1, xcore_parker as *const () as usize, 0, 2) {
+        XCORE_PARKER_TID.store(parker.to_raw(), Ordering::Relaxed);
+    }
+
     // Freies RAM mit allen Stacks (Baseline für die Rückgewinnungs-Prüfung).
     FREE_BASELINE.store(system::total_free(), Ordering::Relaxed);
 
@@ -373,6 +394,41 @@ extern "C" fn fp_collector(_arg: usize) -> ! {
                 FP_COLLECTOR_DONE.store(true, Ordering::Release);
             }
         }
+    }
+}
+
+/// Per-Kern-Worker (EL1): läuft auf einem **Sekundärkern** und macht Fortschritt,
+/// während core 0 seine eigene Demo abarbeitet — Beleg für parallele Einplanung
+/// (jeder Kern schedult über seine eigene Scheduler-Instanz, kein globaler Lock).
+/// `arg` = die Kern-ID (Index in `XCORE_PROGRESS`). Danach selbst parken.
+extern "C" fn xcore_worker(arg: usize) -> ! {
+    let core = arg;
+    let mut n = 0;
+    while n < SMP_WORK_TARGET {
+        // Moderate Arbeit: unter single-threaded QEMU-TCG teilen sich alle Kerne
+        // EINE Host-CPU, daher die Sekundärkern-Last bewusst klein halten.
+        for _ in 0..20_000 {
+            core::hint::spin_loop();
+        }
+        n += 1;
+        if core < NUM_CORES {
+            XCORE_PROGRESS[core].store(n, Ordering::Relaxed);
+        }
+    }
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// Cross-Core-Park/Wake-Thread (EL1, auf core 1): blockiert sich per `PARK`; core 0
+/// weckt ihn kern-übergreifend per `wake_remote` (Reschedule-IPI). Setzt nach dem
+/// Aufwachen `XCORE_WOKEN` — Beleg für den IPI-getriebenen Cross-Core-Unblock.
+extern "C" fn xcore_parker(_arg: usize) -> ! {
+    XCORE_PARKED.store(true, Ordering::Release);
+    invoke(sys::PARK, 0, [0; 4], 0); // blockiert; von core 0 via IPI geweckt
+    XCORE_WOKEN.store(true, Ordering::Release);
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
     }
 }
 
@@ -688,6 +744,15 @@ pub fn demo_report_then_idle() -> ! {
             CS_RELOADED.store(true, Ordering::Release);
             cs_reloaded = true;
         }
+        // Cross-Core-Wake: sobald der Parker (auf core 1) blockiert ist, ihn per
+        // IPI wecken. Idempotent + Wiederholung pro Tick -> race-frei (trifft ein
+        // Wake den noch nicht blockierten Parker, weckt der nächste ihn).
+        if XCORE_PARKED.load(Ordering::Acquire) && !XCORE_WOKEN.load(Ordering::Acquire) {
+            let raw = XCORE_PARKER_TID.load(Ordering::Relaxed);
+            if raw != u64::MAX {
+                system::wake_remote(ThreadId::from_raw(raw));
+            }
+        }
         if !reported && ALL_DONE.load(Ordering::Acquire) && all_done() {
             report();
             reported = true;
@@ -707,7 +772,11 @@ fn all_done() -> bool {
     let ckpt = CS_DONE.load(Ordering::Acquire);
     let el0 = USER_RECV.load(Ordering::Relaxed) == USER_MAGIC && system::el0_syscall_seen();
     let el0iso = system::el0_fault_count() >= 1;
-    workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso
+    // SMP: alle Sekundärkerne haben ihren Worker abgearbeitet (parallele Einplanung)
+    // und der Parker wurde kern-übergreifend per IPI geweckt.
+    let smp = (1..NUM_CORES).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
+        && XCORE_WOKEN.load(Ordering::Acquire);
+    workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp
 }
 
 fn report() {
@@ -823,5 +892,25 @@ fn report() {
     println!(
         "reload  : {} (Komponente ohne Kernel-Neustart getauscht)",
         if reload_ok { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Per-Kern-paralleler Scheduler: jeder Sekundärkern hat seinen Worker parallel
+    // abgearbeitet; der Parker wurde kern-übergreifend per IPI geweckt.
+    let mut smp_ok = true;
+    for c in 1..NUM_CORES {
+        let p = XCORE_PROGRESS[c].load(Ordering::Relaxed);
+        println!("smp     : core {c} Worker-Fortschritt={p}/{SMP_WORK_TARGET}");
+        if p < SMP_WORK_TARGET {
+            smp_ok = false;
+        }
+    }
+    let woken = XCORE_WOKEN.load(Ordering::Acquire);
+    println!("smp     : Cross-Core-IPI-Wake (core 0 -> core 1 Parker) erfolgreich={woken}");
+    if !woken {
+        smp_ok = false;
+    }
+    println!(
+        "smp     : {} (per-Kern-parallele Einplanung + IPI-Cross-Core-Wake)",
+        if smp_ok { "ALL PASS" } else { "FAILURES" }
     );
 }

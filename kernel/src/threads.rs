@@ -98,11 +98,15 @@ const ISO_BADGE_TRUSTED: u64 = 1 << 2; // SAS-PD las X erfolgreich
 const ISO_BADGE_MAPPED: u64 = 1 << 3; // VMM-Probe: Frame gemappt + RW erfolgreich
 const ISO_BADGE_SHARED: u64 = 1 << 4; // Reader las den Wert des Writers via Shared Frame
 const ISO_BADGE_NATIVE: u64 = 1 << 5; // privat geladener Code lief in eigener VSpace
+const ISO_BADGE_PAGES: u64 = 1 << 6; // 4-KiB-Seiten: RW-Schreiben + RO-Lesen erfolgreich
 static ISO_MASK: AtomicU64 = AtomicU64::new(0); // gesammelte Badges
 static ISO_SECRET_ADDR: AtomicU64 = AtomicU64::new(0); // Adresse X (fremdes RAM)
 
 // Shared-Memory-IPC: zwei isolierte PDs teilen einen Frame F (in beide VSpaces
 // gemappt). Der Writer schreibt SHM_SECRET, der Reader liest es (nach Notification).
+// Der Wert ist in den shm_writer/shm_reader-Asm-Blöcken als Immediate kodiert; diese
+// Konstante dokumentiert ihn (Quelle der Wahrheit für den Kommentar).
+#[allow(dead_code)]
 const SHM_SECRET: u64 = 0x5A5A_1234_5678_9ABC;
 
 // Kern-übergreifende synchrone IPC: Client auf core 0 ruft (CALL) einen Server auf
@@ -358,9 +362,9 @@ pub fn spawn_demo() {
         system::bind_pd(i_pd, ip);
     }
 
-    // Allgemeiner VMM: eine isolierte PD mappt/entmappt einen Frame G per Syscall
-    // (cap-gated). Slot 0 = Memory-Cap fuer G (2 MiB), Slot 1 = SIGNAL-Cap.
-    let gframe = system::alloc(hal::mmu::ISO_REGION_SIZE, hal::mmu::ISO_REGION_SIZE).expect("g frame");
+    // Allgemeiner VMM: eine isolierte PD mappt/entmappt einen **4-KiB**-Frame G per
+    // Syscall (cap-gated, feingranular). Slot 0 = Memory-Cap fuer G, Slot 1 = SIGNAL.
+    let gframe = system::alloc(4096, 4096).expect("g frame");
     let gbase = gframe.region().base;
     let groot = system::cap_install(gframe).expect("g cap");
     let gmem = system::cap_mint(groot, Rights::WRITE, 0).expect("g mem cap");
@@ -413,6 +417,21 @@ pub fn spawn_demo() {
         system::spawn_isolated_native(native_template as *const () as *const u8, 64, prio)
     {
         system::bind_pd(nat_pd, nt);
+    }
+
+    // 4-KiB-Seiten: eine isolierte PD bekommt eine 12-KiB-Region feingranular gemappt
+    // -- P (RW), P+4KiB (RO, vorbefuellt), P+8KiB (Guard, ungemappt). Beweist mehrere
+    // einzelne Seiten mit gemischten Rechten + Guard-Page-Fault.
+    let preg = system::alloc(3 * 4096, 4096).expect("page region").region().base;
+    poke_u64(preg + 4096, 0x5EAD_DA7A); // RO-Seite vorbefuellen (Inhalt fuer den Reader)
+    let p_sig = system::cap_mint(introot, Rights::WRITE, ISO_BADGE_PAGES).expect("page sig");
+    let p_pd = system::create_pd().expect("page pd");
+    system::install_pd_cap(p_pd, 0, p_sig);
+    if let Some((pp, _)) = system::spawn_isolated(page_probe as *const () as usize, preg as usize, prio) {
+        system::bind_pd(p_pd, pp);
+        system::map_into_thread(pp, preg, 4096, 1); // P: RW
+        system::map_into_thread(pp, preg + 4096, 4096, 0); // P+4KiB: RO
+        // P+8KiB bleibt ungemappt (Guard).
     }
 
     *RELOAD_INFO.lock() = Some(ReloadInfo { ep, v1, v1_pd, v2_pd });
@@ -733,6 +752,34 @@ extern "C" fn shm_reader(_arg: usize) -> ! {
             "svc #0",
         "3:",
             "mov x0, #5", // sys::PARK
+            "svc #0",
+            "b 3b",
+            options(noreturn),
+        );
+    }
+}
+
+/// **4-KiB-Seiten-Probe** (`.user_text`, isolierte VSpace). x0 = Basis P einer
+/// 12-KiB-Region, vom Kernel feingranular gemappt: P=RW, P+4 KiB=RO (vorbefüllt),
+/// P+8 KiB=**Guard** (ungemappt). Die Probe schreibt P (RW), liest P+4 KiB (RO) und
+/// meldet Badge PAGES (Beleg: mehrere einzelne Seiten mit gemischten Rechten); dann
+/// schreibt sie die Guard-Seite -> **Fault** (ungemappte Seite) -> beendet. Zeigt
+/// feingranulare Rechte + Guard Pages.
+#[link_section = ".user_text"]
+extern "C" fn page_probe(_arg: usize) -> ! {
+    // SAFETY: reiner EL0-User-Code; Zugriffe nur auf die eigenen gemappten Seiten.
+    unsafe {
+        core::arch::asm!(
+            "mov x9, x0",
+            "movz x10, #0x1234",
+            "str x10, [x9]",          // P (RW) schreiben
+            "ldr x11, [x9, #4096]",   // P+4KiB (RO) lesen -> ok
+            "mov x0, #8",             // sys::SIGNAL Slot 0 (Badge PAGES)
+            "mov x1, #0",
+            "svc #0",
+            "str x10, [x9, #8192]",   // P+8KiB (Guard, ungemappt) schreiben -> FAULT
+        "3:",
+            "mov x0, #5",             // sys::PARK
             "svc #0",
             "b 3b",
             options(noreturn),
@@ -1126,7 +1173,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -1143,6 +1190,7 @@ pub fn demo_report_then_idle() -> ! {
                 (m & ISO_BADGE_MAPPED != 0) && system::iso_fault_count() >= 2,
                 m & ISO_BADGE_SHARED != 0,
                 m & ISO_BADGE_NATIVE != 0,
+                m & ISO_BADGE_PAGES != 0,
             );
         }
         // Beendete Threads einsammeln (sicher: läuft auf dem Idle-Stack).
@@ -1251,8 +1299,10 @@ fn all_done() -> bool {
     let shm = m & ISO_BADGE_SHARED != 0;
     // Natives Code-Laden: privat geladener Code lief in eigener VSpace.
     let native = m & ISO_BADGE_NATIVE != 0;
+    // 4-KiB-Seiten: RW-Schreiben + RO-Lesen einzelner Seiten erfolgreich.
+    let pages4k = m & ISO_BADGE_PAGES != 0;
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
-        && reclaim && balanced && vspace && vmm && shm && native
+        && reclaim && balanced && vspace && vmm && shm && native && pages4k
 }
 
 fn report() {
@@ -1481,5 +1531,13 @@ fn report() {
     println!(
         "native  : {} (natives Code-Laden je isolierter VSpace, EL0-RX/W^X + I-Cache-Sync)",
         if native { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // 4-KiB-Seiten: mehrere einzelne Seiten mit gemischten Rechten + Guard-Page.
+    let pages4k = m & ISO_BADGE_PAGES != 0;
+    println!("pages4k : einzelne 4-KiB-Seiten RW-Schreiben+RO-Lesen ok={pages4k} (Guard-Seite faultet danach)");
+    println!(
+        "pages4k : {} (4-KiB-Mappings: gemischte RW/RO-Rechte + Guard Pages + L3)",
+        if pages4k { "ALL PASS" } else { "FAILURES" }
     );
 }

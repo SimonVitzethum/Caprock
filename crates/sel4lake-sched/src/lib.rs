@@ -24,8 +24,9 @@ use sel4lake_hal::exception::init_thread_frame;
 
 /// Kerne (eine Scheduler-Instanz je Kern).
 pub const NUM_CORES: usize = 8;
-/// TCB-Slots je Kern (Partitionsgröße).
-const PER_CORE: usize = 32;
+/// TCB-Slots je Kern (Partitionsgröße). Großzügig, da die Demo viele (auch
+/// dauerhaft geparkte) Threads auf core 0 erzeugt.
+const PER_CORE: usize = 64;
 /// Globaler Slot-Raum.
 const NTHREADS: usize = NUM_CORES * PER_CORE;
 
@@ -477,8 +478,9 @@ pub trait SchedOps {
     fn exit_current(&mut self, core: usize, frame: usize) -> usize;
     fn kill(&mut self, tid: ThreadId, core: usize) -> bool;
     /// Einen physischen Frame `[base, base+len)` in die VSpace des Aufrufers `caller`
-    /// mappen (EL0-RW, cap-gated; nur für isolierte PDs sinnvoll). `true` bei Erfolg.
-    fn map_frame(&mut self, caller: ThreadId, base: u64, len: u64) -> bool;
+    /// mappen (cap-gated; nur für isolierte PDs sinnvoll). `perm_code`: 0=Ro, 1=Rw,
+    /// 2=Rx (aus den Cap-Rechten abgeleitet). Granularität nach `len` (2 MiB / 4 KiB).
+    fn map_frame(&mut self, caller: ThreadId, base: u64, len: u64, perm_code: u8) -> bool;
     /// Einen zuvor gemappten Frame wieder aus der VSpace des Aufrufers entfernen.
     fn unmap_frame(&mut self, caller: ThreadId, base: u64, len: u64) -> bool;
 }

@@ -69,6 +69,19 @@ const PAGE: u64 = 4096;
 const TWO_MIB: u64 = 2 * 1024 * 1024;
 const ONE_GIB: u64 = 1 << 30;
 const RAM_BASE: u64 = 0x4000_0000;
+/// Ausgabe-Adressbits eines Tabellen-/Seiten-Deskriptors (Bits 47:12).
+const ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
+
+/// Zugriffsrecht einer gemappten User-Seite (4 KiB) in einer isolierten VSpace.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UserPerm {
+    /// EL0 Read+Write, nicht ausführbar (Daten/Stack).
+    Rw,
+    /// EL0 Read+Execute, read-only (Code, W^X).
+    Rx,
+    /// EL0 Read-only (Konstanten/rodata).
+    Ro,
+}
 
 /// Zugriffsrecht eines Normal-Memory-Leafs.
 #[derive(Clone, Copy)]
@@ -404,6 +417,102 @@ pub fn vspace_unmap_block(l2_phys: u64, phys: u64) -> bool {
     l2[idx] = kernel_block(phys);
     cpu::dsb_sy();
     true
+}
+
+// --- 4-KiB-Seiten-Mapping (L3) ---
+//
+// Feingranular gegenüber den 2-MiB-Blöcken: ermöglicht gemischte RX/RO/RW-Rechte,
+// Guard Pages und kleine Frames. Wird ein 2-MiB-Block erstmals seitenweise belegt,
+// legt der Kernel eine L3-Tabelle an (alle 512 Seiten zunächst **EL1-only**, den
+// Block spiegelnd) und hängt sie in die L2 ein; einzelne Seiten werden dann auf EL0
+// gesetzt. L3-Frames werden beim Teardown über [`vspace_collect_l3s`] eingesammelt.
+
+/// EL1-only 4-KiB-Seite (Spiegel beim Aufsplitten eines Blocks: Kernel sieht das RAM).
+fn kernel_page(phys: u64) -> u64 {
+    phys | AF | SH_INNER | ATTR_NORMAL | AP_RW | PXN | UXN | PAGE_DESC
+}
+
+/// EL0-User-Seite (4 KiB) mit gegebenem Recht, `nG` (ASID-spezifisch).
+fn user_page(phys: u64, perm: UserPerm) -> u64 {
+    let bits = match perm {
+        UserPerm::Rw => AP_RW_EL0 | PXN | UXN,
+        UserPerm::Rx => AP_RO_EL0 | PXN, //        EL0 ausführbar (UXN=0), W^X
+        UserPerm::Ro => AP_RO_EL0 | PXN | UXN,
+    };
+    phys | AF | SH_INNER | ATTR_NORMAL | bits | NG | PAGE_DESC
+}
+
+/// Eine einzelne 4-KiB-Seite `phys` (identity) mit `perm` in die VSpace mit
+/// GiB-1-L2 `l2_phys` mappen. Existiert für den 2-MiB-Block noch keine L3, wird über
+/// `alloc_l3` eine neue 4-KiB-Tabelle angefordert (alle Seiten EL1-only, den Block
+/// spiegelnd) und eingehängt. `false` bei ungültiger/unausgerichteter Adresse oder
+/// fehlgeschlagener L3-Allokation. Der Aufrufer flusht anschließend die ASID.
+pub fn vspace_map_page(
+    l2_phys: u64,
+    phys: u64,
+    perm: UserPerm,
+    alloc_l3: &mut dyn FnMut() -> Option<u64>,
+) -> bool {
+    if phys < USER_RAM_MIN || phys >= GIB1_END || phys % PAGE != 0 {
+        return false;
+    }
+    let i2 = ((phys - RAM_BASE) / TWO_MIB) as usize;
+    // SAFETY: gültige, in der globalen Map beschreibbare L2-Tabelle.
+    let l2 = unsafe { core::slice::from_raw_parts_mut(l2_phys as *mut u64, 512) };
+    let l3_phys = if l2[i2] & 0b11 == TABLE_DESC {
+        l2[i2] & ADDR_MASK
+    } else {
+        let new = match alloc_l3() {
+            Some(p) => p,
+            None => return false,
+        };
+        // SAFETY: frischer, identity-gemappter 4-KiB-Frame für die neue L3.
+        let l3 = unsafe { core::slice::from_raw_parts_mut(new as *mut u64, 512) };
+        let blk = RAM_BASE + i2 as u64 * TWO_MIB;
+        for (j, e) in l3.iter_mut().enumerate() {
+            *e = kernel_page(blk + j as u64 * PAGE); // zunächst alles EL1-only
+        }
+        l2[i2] = table_desc(new);
+        new
+    };
+    // SAFETY: gültige L3-Tabelle (gerade angelegt oder bestehend).
+    let l3 = unsafe { core::slice::from_raw_parts_mut(l3_phys as *mut u64, 512) };
+    l3[((phys >> 12) & 0x1ff) as usize] = user_page(phys, perm);
+    cpu::dsb_sy();
+    true
+}
+
+/// Eine einzelne 4-KiB-Seite wieder auf **EL1-only** zurücksetzen (EL0-Zugriff
+/// faultet). `false`, wenn der Block nicht seitenweise gemappt ist. ASID flushen.
+pub fn vspace_unmap_page(l2_phys: u64, phys: u64) -> bool {
+    if phys < USER_RAM_MIN || phys >= GIB1_END || phys % PAGE != 0 {
+        return false;
+    }
+    let i2 = ((phys - RAM_BASE) / TWO_MIB) as usize;
+    // SAFETY: gültige L2-Tabelle.
+    let l2 = unsafe { core::slice::from_raw_parts_mut(l2_phys as *mut u64, 512) };
+    if l2[i2] & 0b11 != TABLE_DESC {
+        return false; // Block (nicht seitenweise) -> keine Einzelseite zu entmappen
+    }
+    let l3_phys = l2[i2] & ADDR_MASK;
+    // SAFETY: gültige L3-Tabelle.
+    let l3 = unsafe { core::slice::from_raw_parts_mut(l3_phys as *mut u64, 512) };
+    l3[((phys >> 12) & 0x1ff) as usize] = kernel_page(phys);
+    cpu::dsb_sy();
+    true
+}
+
+/// Alle **per-PD-L3-Tabellen** dieser VSpace einsammeln (für den Teardown): ruft
+/// `free_l3(l3_phys)` für jeden L2-Eintrag, der auf eine L3 zeigt — außer Index 0
+/// (die geteilte Kernel-L3). Danach gibt der Aufrufer L2 + L1 frei.
+pub fn vspace_collect_l3s(l2_phys: u64, free_l3: &mut dyn FnMut(u64)) {
+    // SAFETY: gültige L2-Tabelle (read-only Scan).
+    let l2 = unsafe { core::slice::from_raw_parts(l2_phys as *const u64, 512) };
+    for &e in l2.iter().skip(1) {
+        if e & 0b11 == TABLE_DESC {
+            free_l3(e & ADDR_MASK);
+        }
+    }
 }
 
 /// TLB-Einträge einer ASID invalidieren (nach map/unmap bzw. VSpace-Teardown).

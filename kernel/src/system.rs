@@ -237,22 +237,26 @@ impl SchedOps for KernelSched {
         }
         ok
     }
-    fn map_frame(&mut self, caller: ThreadId, base: u64, len: u64) -> bool {
-        // Nur isolierte PDs (ASID != 0) und nur ganze 2-MiB-Frames (Granularität
-        // dieses Inkrements). Der Frame wird identity EL0-RW in die eigene VSpace
-        // gemappt.
+    fn map_frame(&mut self, caller: ThreadId, base: u64, len: u64, perm_code: u8) -> bool {
+        // Nur isolierte PDs (ASID != 0). Granularität nach Frame-Größe (2-MiB-Block
+        // oder 4-KiB-Seiten), Recht nach `perm_code` (0=Ro, 1=Rw, 2=Rx).
         let asid = (VSPACE_OF[caller.slot()].load(Ordering::Relaxed) >> 48) as u16;
-        if asid == 0 || len != hal::mmu::ISO_REGION_SIZE {
+        if asid == 0 || len == 0 || len % 4096 != 0 {
             return false;
         }
-        vspace_map_region(asid, base)
+        let perm = match perm_code {
+            2 => hal::mmu::UserPerm::Rx,
+            1 => hal::mmu::UserPerm::Rw,
+            _ => hal::mmu::UserPerm::Ro,
+        };
+        vspace_map(asid, base, len, perm)
     }
-    fn unmap_frame(&mut self, caller: ThreadId, base: u64, _len: u64) -> bool {
+    fn unmap_frame(&mut self, caller: ThreadId, base: u64, len: u64) -> bool {
         let asid = (VSPACE_OF[caller.slot()].load(Ordering::Relaxed) >> 48) as u16;
-        if asid == 0 {
+        if asid == 0 || len == 0 || len % 4096 != 0 {
             return false;
         }
-        vspace_unmap_region(asid, base)
+        vspace_unmap(asid, base, len)
     }
 }
 
@@ -644,21 +648,84 @@ fn vspace_map_region(asid: u16, phys: u64) -> bool {
     }
 }
 
-/// Einen 2-MiB-Frame `phys` aus der VSpace `asid` entfernen (wieder EL1-only).
-fn vspace_unmap_region(asid: u16, phys: u64) -> bool {
+/// 4-KiB-Granularität: Region `[base, base+len)` (identity) mit `perm` in die VSpace
+/// `asid` mappen. 2-MiB-ausgerichtete 2-MiB-Regionen mit RW/RX nutzen den
+/// Block-Fastpath; sonst seitenweise (L3 wird bei Bedarf aus `MEM` angelegt).
+fn vspace_map(asid: u16, base: u64, len: u64, perm: hal::mmu::UserPerm) -> bool {
     let Some(l2) = vspace_l2(asid) else {
         return false;
     };
-    if hal::mmu::vspace_unmap_block(l2, phys) {
-        hal::mmu::flush_asid(asid);
-        true
+    let ok = if len == hal::mmu::ISO_REGION_SIZE
+        && base % hal::mmu::ISO_REGION_SIZE == 0
+        && perm != hal::mmu::UserPerm::Ro
+    {
+        match perm {
+            hal::mmu::UserPerm::Rx => hal::mmu::vspace_map_code_block(l2, base),
+            _ => hal::mmu::vspace_map_block(l2, base),
+        }
     } else {
-        false
+        let mut all = true;
+        let mut p = base;
+        while p < base + len {
+            let mapped =
+                hal::mmu::vspace_map_page(l2, p, perm, &mut || MEM.lock().alloc(4096, 4096).map(|c| c.base()));
+            if !mapped {
+                all = false;
+                break;
+            }
+            p += 4096;
+        }
+        all
+    };
+    if ok {
+        hal::mmu::flush_asid(asid);
     }
+    ok
 }
 
-/// Eine isolierte VSpace abbauen: Page-Tables (L1+L2) an `MEM` zurückgeben, Eintrag
-/// freigeben, TLB der ASID flushen. Beim Thread-Ende einer isolierten PD aufzurufen.
+/// 4-KiB-Granularität: Region `[base, base+len)` aus der VSpace `asid` entfernen.
+fn vspace_unmap(asid: u16, base: u64, len: u64) -> bool {
+    let Some(l2) = vspace_l2(asid) else {
+        return false;
+    };
+    let ok = if len == hal::mmu::ISO_REGION_SIZE && base % hal::mmu::ISO_REGION_SIZE == 0 {
+        hal::mmu::vspace_unmap_block(l2, base)
+    } else {
+        let mut all = true;
+        let mut p = base;
+        while p < base + len {
+            if !hal::mmu::vspace_unmap_page(l2, p) {
+                all = false;
+            }
+            p += 4096;
+        }
+        all
+    };
+    if ok {
+        hal::mmu::flush_asid(asid);
+    }
+    ok
+}
+
+/// Kernel-Setup: Region `[base, base+len)` mit `perm_code` (0=Ro,1=Rw,2=Rx) in die
+/// VSpace des Threads `tid` mappen (für Demos, die vorab feingranulare Seiten — z. B.
+/// RW/RO/Guard — anlegen wollen). No-Op für nicht-isolierte Threads.
+pub fn map_into_thread(tid: ThreadId, base: u64, len: u64, perm_code: u8) -> bool {
+    let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
+    if asid == 0 {
+        return false;
+    }
+    let perm = match perm_code {
+        2 => hal::mmu::UserPerm::Rx,
+        1 => hal::mmu::UserPerm::Rw,
+        _ => hal::mmu::UserPerm::Ro,
+    };
+    vspace_map(asid, base, len, perm)
+}
+
+/// Eine isolierte VSpace abbauen: alle per-PD-L3-Tabellen **und** L1+L2 an `MEM`
+/// zurückgeben, Eintrag freigeben, TLB der ASID flushen. Beim Thread-Ende einer
+/// isolierten PD aufzurufen.
 fn vspace_teardown(asid: u16) {
     if asid == 0 || asid as usize > MAX_VSPACES {
         return;
@@ -671,6 +738,10 @@ fn vspace_teardown(asid: u16) {
     };
     if ent.used {
         let mut mem = MEM.lock();
+        // Zuerst die feingranularen L3-Tabellen (aus Seiten-Mappings) einsammeln.
+        hal::mmu::vspace_collect_l3s(ent.l2, &mut |p| {
+            mem.free_region(PhysRegion::new(p, 4096));
+        });
         mem.free_region(PhysRegion::new(ent.l1, 4096));
         mem.free_region(PhysRegion::new(ent.l2, 4096));
         drop(mem);

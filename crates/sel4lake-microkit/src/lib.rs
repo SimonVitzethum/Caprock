@@ -258,16 +258,24 @@ pub fn dispatch(
             frame
         }
         sys::MAP | sys::UNMAP => {
-            // Frame über eine Memory-Cap in die eigene VSpace mappen/entfernen.
+            // Frame über eine Memory-Cap in die eigene VSpace mappen/entfernen. Das
+            // Recht der Cap bestimmt die Seitenrechte: EXEC -> RX (W^X), WRITE -> RW,
+            // sonst READ -> RO. Ohne nutzbares Recht abgelehnt.
             let ObjectKind::Memory(region) = kind else {
                 return deny(result::ERR_BADCAP);
             };
-            if !rights.contains(Rights::WRITE) {
+            let perm_code = if rights.contains(Rights::EXEC) {
+                2u8
+            } else if rights.contains(Rights::WRITE) {
+                1
+            } else if rights.contains(Rights::READ) {
+                0
+            } else {
                 return deny(result::ERR_RIGHTS);
-            }
+            };
             drop(caps_guard);
             let ok = if nr == sys::MAP {
-                ops.map_frame(thread, region.base, region.len)
+                ops.map_frame(thread, region.base, region.len, perm_code)
             } else {
                 ops.unmap_frame(thread, region.base, region.len)
             };

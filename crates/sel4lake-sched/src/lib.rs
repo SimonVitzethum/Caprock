@@ -452,11 +452,21 @@ impl Scheduler {
     /// Ticks (`budget = 0` -> unbeschränkt/Round-Robin). Konfiguriert die MCS-Felder.
     pub fn set_budget(&mut self, tid: ThreadId, budget: u32, period: u32) -> bool {
         if let Some(s) = self.resolve(tid) {
+            // War der Thread erschöpft, ist er weder laufend, noch bereit, noch
+            // blockiert — er liegt NUR auf den Refill-Scan wartend. Würden wir hier
+            // `depleted` löschen, ohne ihn wieder einzureihen, wäre er für immer
+            // verloren (nie wieder einplanbar, aber belegter TCB-Slot -> DoS + die
+            // Leak-Erkennung über `used_tcbs` würde getäuscht). Daher nach dem
+            // Reset wieder bereit machen.
+            let was_depleted = self.tcbs[s].depleted;
             self.tcbs[s].budget = budget;
             self.tcbs[s].period = period.max(1);
             self.tcbs[s].remaining = budget;
             self.tcbs[s].next_refill = self.now + period as u64;
             self.tcbs[s].depleted = false;
+            if was_depleted && self.current != Some(s) && !self.tcbs[s].blocked {
+                self.enqueue_ready(s);
+            }
             true
         } else {
             false

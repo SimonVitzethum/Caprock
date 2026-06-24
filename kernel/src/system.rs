@@ -1018,6 +1018,22 @@ pub fn budget_stats(core: usize) -> (u64, u64) {
     SCHEDS[core].lock().budget_stats()
 }
 
+/// Einen **nicht laufenden** Thread des **aktuellen** Kerns direkt beenden — dieselbe
+/// Mechanik wie der cap-kontrollierte `KILL`-Syscall (`KernelSched::kill`), nur ohne
+/// Cap-Vorlage (für kernelinterne Test-/Wartungspfade). Gibt `true` bei Erfolg. `kill`
+/// ist kern-lokal: `tid` muss auf dem aufrufenden Kern liegen und darf nicht laufen.
+pub fn kill_local(tid: ThreadId) -> bool {
+    let core = hal::cpu::core_id();
+    if tid.core() != core {
+        return false;
+    }
+    let ok = SCHEDS[core].lock().kill(tid, core);
+    if ok {
+        reclaim_user_kstack(tid.slot()); // falls EL0-Thread: Pool-Slot zurück
+    }
+    ok
+}
+
 /// Beendete Threads **dieses Kerns** einsammeln: TCB-Slots freigeben und Stacks an
 /// den Allokator zurückgeben (aus dem Idle-Thread). Erst die Zombies unter
 /// `SCHEDS[core]` einsammeln, dann den Lock **freigeben** und unter `MEM` freigeben

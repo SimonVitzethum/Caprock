@@ -10,7 +10,7 @@
 //! zurückziehen + Recv-Cap entziehen) → Swap (v2 starten + Recv-Cap delegieren).
 
 use crate::system;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use sel4lake_abi::{result, sys, GRANT_FLAG, GRANT_RECV_SLOT};
 use sel4lake_hal::{self as hal, println, syscall::invoke};
 use sel4lake_mem::{peek_u64, poke_u64, Rights};
@@ -102,6 +102,39 @@ static MCS_BOUND: AtomicBool = AtomicBool::new(false); // Budget per Cap gebunde
 static MCS_STOP: AtomicBool = AtomicBool::new(false); // Signal: beide Threads parken
 static MCS_DONE: AtomicBool = AtomicBool::new(false);
 static MCS_OK: AtomicBool = AtomicBool::new(false);
+
+// Audit-Regression A (IPC): ein in einer Endpoint-Queue blockierter Thread, der
+// zwischenzeitlich gekillt wird, darf beim nächsten RECV/CALL KEINE Kernel-Panik
+// auslösen (Fund: `.expect("sender frame")` in `recv`/`call`). Ablauf (alles auf
+// core 0, da `kill` kern-lokal ist): Opfer CALLt einen ungedienten Endpoint ->
+// blockiert in `senders`; es wird gekillt (toter Eintrag bleibt in der Queue); ein
+// Server RECVt -> MUSS den toten Eintrag überspringen statt zu paniken; ein lebender
+// Client CALLt -> wird korrekt bedient (Beweis: Endpoint überlebt + funktioniert).
+const STALE_MAGIC: u64 = 0x57A1_E000; // Eingabe des lebenden Clients (Antwort = 2x)
+static STALE_VICTIM_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static STALE_SERVER_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static STALE_CLIENT_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static STALE_VICTIM_TID: AtomicU64 = AtomicU64::new(u64::MAX);
+static STALE_SERVED: AtomicU64 = AtomicU64::new(0); // Antwortwert beim Client
+static STALE_STEP: AtomicU32 = AtomicU32::new(0);
+static STALE_DONE: AtomicBool = AtomicBool::new(false);
+static STALE_OK: AtomicBool = AtomicBool::new(false);
+
+// Audit-Regression B (Scheduler/MCS): `set_budget`/`bind_sched_context` auf einen
+// ERSCHÖPFTEN Thread darf ihn nicht stranden (Fund: `depleted` gelöscht ohne
+// `enqueue_ready` -> Thread nie wieder einplanbar, belegter Slot -> DoS + Leak-
+// Erkennung getäuscht). Ein budgetierter Worker auf STRAND_CORE erschöpft (budget=1,
+// lange Periode -> kein natürlicher Refill im Testfenster); nach erneutem Bind muss er
+// WIEDER laufen (Zähler wächst). Ohne Fix bleibt der Zähler eingefroren.
+const STRAND_CORE: usize = 4;
+static STRAND_COUNT: AtomicU64 = AtomicU64::new(0);
+static STRAND_TID: AtomicU64 = AtomicU64::new(u64::MAX);
+static STRAND_SNAP1: AtomicU64 = AtomicU64::new(0);
+static STRAND_STEP: AtomicU32 = AtomicU32::new(0);
+static STRAND_SETTLE: AtomicU32 = AtomicU32::new(0);
+static STRAND_STOP: AtomicBool = AtomicBool::new(false);
+static STRAND_DONE: AtomicBool = AtomicBool::new(false);
+static STRAND_OK: AtomicBool = AtomicBool::new(false);
 
 const RECLAIM_TARGET: u64 = 16;
 const RECLAIM_PRIO: u8 = 6; // höchste Demo-Prio: Exiter läuft sofort + beendet sich
@@ -461,6 +494,24 @@ pub fn spawn_demo() {
     }
 
     *RELOAD_INFO.lock() = Some(ReloadInfo { ep, v1, v1_pd, v2_pd });
+
+    // Audit-Regression A: Endpoint + 3 PDs (Opfer/Server/Client) für den Stale-Queue-
+    // Test. Die Threads selbst werden später vom Idle-Manager gestaffelt erzeugt (siehe
+    // demo_report_then_idle), damit das Opfer zuerst blockiert und dann gekillt wird.
+    let sep = system::create_endpoint().expect("stale ep");
+    let sroot = system::install_endpoint_cap(sep as u32, Rights::RWX).expect("stale ep cap");
+    let s_send_v = system::cap_mint(sroot, Rights::WRITE, 0).expect("stale send victim");
+    let s_recv = system::cap_mint(sroot, Rights::READ, 0).expect("stale recv");
+    let s_send_c = system::cap_mint(sroot, Rights::WRITE, 0).expect("stale send client");
+    let v_pd = system::create_pd().expect("stale victim pd");
+    system::install_pd_cap(v_pd, EP_CAP as usize, s_send_v);
+    let s_pd = system::create_pd().expect("stale server pd");
+    system::install_pd_cap(s_pd, EP_CAP as usize, s_recv);
+    let c_pd = system::create_pd().expect("stale client pd");
+    system::install_pd_cap(c_pd, EP_CAP as usize, s_send_c);
+    STALE_VICTIM_PD.store(v_pd, Ordering::Relaxed);
+    STALE_SERVER_PD.store(s_pd, Ordering::Relaxed);
+    STALE_CLIENT_PD.store(c_pd, Ordering::Relaxed);
 }
 
 /// Generischer Hot-Reload-Swap: v1 zurückziehen (Quiesce: Empfänger entfernen +
@@ -896,6 +947,58 @@ extern "C" fn mcs_greedy_worker(_arg: usize) -> ! {
     }
 }
 
+/// **Stale-Opfer** (Audit-Regression A, EL1, core 0): CALLt den ungedienten Endpoint
+/// (lokaler Slot `EP_CAP`) -> blockiert in `senders`. Wird während der Blockade gekillt;
+/// kehrt nie zurück (der `loop` ist nur formal, damit die Signatur `-> !` stimmt).
+extern "C" fn stale_victim(_arg: usize) -> ! {
+    invoke(sys::CALL, EP_CAP, [0; 4], 0); // blockiert (kein Empfänger); wird gekillt
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// **Stale-Server** (Audit-Regression A, EL1, core 0): RECV/REPLY-Schleife. Beim ersten
+/// RECV muss er den toten Opfer-Eintrag in `senders` überspringen (Fix) statt zu paniken,
+/// dann als Empfänger blockieren und schließlich den lebenden Client bedienen (2x Echo).
+extern "C" fn stale_server(_arg: usize) -> ! {
+    loop {
+        let m = invoke(sys::RECV, EP_CAP, [0; 4], 0);
+        if m.result != result::OK {
+            break;
+        }
+        invoke(sys::REPLY, EP_CAP, [m.msg[0].wrapping_mul(2), 0, 0, 0], 0);
+    }
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// **Stale-Client** (Audit-Regression A, EL1, core 0): CALLt mit `STALE_MAGIC` und hält
+/// die Antwort fest. Erfolgt die Antwort (2x `STALE_MAGIC`), hat der Server den toten
+/// Eintrag korrekt übersprungen und der Endpoint ist nach dem Kill weiter funktionsfähig.
+extern "C" fn stale_client(_arg: usize) -> ! {
+    let r = invoke(sys::CALL, EP_CAP, [STALE_MAGIC, 0, 0, 0], 0);
+    STALE_SERVED.store(r.msg[0], Ordering::Release);
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// **Strand-Worker** (Audit-Regression B, EL1, auf [`STRAND_CORE`]): zählt hoch bis
+/// gestoppt. Reiner CPU-Spin (kein YIELD), damit der Timer-Tick das gebundene Budget
+/// belastet und der Worker erschöpft. Nach erneutem Bind muss der Zähler wieder wachsen.
+extern "C" fn strand_worker(_arg: usize) -> ! {
+    while !STRAND_STOP.load(Ordering::Relaxed) {
+        STRAND_COUNT.fetch_add(1, Ordering::Relaxed);
+        for _ in 0..2_000 {
+            core::hint::spin_loop();
+        }
+    }
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
 /// Cross-Core-Park/Wake-Thread (EL1, auf core 1): blockiert sich per `PARK`; core 0
 /// weckt ihn kern-übergreifend per `wake_remote` (Reschedule-IPI). Setzt nach dem
 /// Aufwachen `XCORE_WOKEN` — Beleg für den IPI-getriebenen Cross-Core-Unblock.
@@ -1242,7 +1345,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -1262,6 +1365,8 @@ pub fn demo_report_then_idle() -> ! {
                 m & ISO_BADGE_PAGES != 0,
                 CHURN_DONE.load(Ordering::Acquire) && CHURN_OK.load(Ordering::Acquire),
                 MCS_DONE.load(Ordering::Acquire) && MCS_OK.load(Ordering::Acquire),
+                STALE_DONE.load(Ordering::Acquire) && STALE_OK.load(Ordering::Acquire),
+                STRAND_DONE.load(Ordering::Acquire) && STRAND_OK.load(Ordering::Acquire),
             );
         }
         // Beendete Threads einsammeln (sicher: läuft auf dem Idle-Stack).
@@ -1425,6 +1530,128 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // Audit-Regression A (IPC-Stale-Queue): gestaffelt, gegate auf MCS fertig + SMP
+        // fertig (core 0 frei von höher-prioren Workern -> der Idle-Manager läuft erst,
+        // wenn der gerade erzeugte prio-3-Thread blockiert hat -> deterministische
+        // Sequenz ohne Timing-Annahmen). Jeder Schritt: eine Aktion pro Manager-Runde.
+        if !STALE_DONE.load(Ordering::Acquire)
+            && MCS_DONE.load(Ordering::Acquire)
+            && (1..NUM_CORES).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
+        {
+            match STALE_STEP.load(Ordering::Acquire) {
+                0 => {
+                    // Opfer erzeugen + an seine PD binden (atomar gegen Preempt, damit es
+                    // nicht vor dem Bind läuft). Es CALLt sofort -> blockiert in `senders`.
+                    hal::cpu::local_irq_disable();
+                    if let Some(v) =
+                        system::spawn_on_core(0, stale_victim as *const () as usize, 0, 3)
+                    {
+                        system::bind_pd(STALE_VICTIM_PD.load(Ordering::Relaxed), v);
+                        STALE_VICTIM_TID.store(v.to_raw(), Ordering::Relaxed);
+                        STALE_STEP.store(1, Ordering::Release);
+                    }
+                    hal::cpu::local_irq_enable();
+                }
+                1 => {
+                    // Der Idle-Manager läuft nur, wenn alle prio-3-Threads blockiert sind
+                    // -> das Opfer ist jetzt sicher in `senders` blockiert. Töten + reapen
+                    // -> ein TOTER Eintrag verbleibt in der Endpoint-`senders`-Queue.
+                    let v = ThreadId::from_raw(STALE_VICTIM_TID.load(Ordering::Relaxed));
+                    if system::kill_local(v) {
+                        while system::reap() > 0 {}
+                        STALE_STEP.store(2, Ordering::Release);
+                    }
+                }
+                2 => {
+                    // Server erzeugen: sein erstes RECV MUSS den toten Opfer-Eintrag
+                    // überspringen (Fix) statt zu paniken, dann als Empfänger blockieren.
+                    hal::cpu::local_irq_disable();
+                    if let Some(s) =
+                        system::spawn_on_core(0, stale_server as *const () as usize, 0, 3)
+                    {
+                        system::bind_pd(STALE_SERVER_PD.load(Ordering::Relaxed), s);
+                        STALE_STEP.store(3, Ordering::Release);
+                    }
+                    hal::cpu::local_irq_enable();
+                }
+                3 => {
+                    // Lebenden Client erzeugen: sein CALL wird vom wartenden Server bedient.
+                    hal::cpu::local_irq_disable();
+                    if let Some(c) =
+                        system::spawn_on_core(0, stale_client as *const () as usize, 0, 3)
+                    {
+                        system::bind_pd(STALE_CLIENT_PD.load(Ordering::Relaxed), c);
+                        STALE_STEP.store(4, Ordering::Release);
+                    }
+                    hal::cpu::local_irq_enable();
+                }
+                _ => {
+                    // Auswertung: Kernel hat überlebt (keine Panik beim RECV trotz totem
+                    // Eintrag) UND der Endpoint ist weiter funktionsfähig (Client erhielt
+                    // 2x STALE_MAGIC). Ohne Fix wäre der Kernel beim Server-RECV panikt.
+                    let served = STALE_SERVED.load(Ordering::Acquire);
+                    if served != 0 {
+                        STALE_OK.store(served == STALE_MAGIC.wrapping_mul(2), Ordering::Release);
+                        STALE_DONE.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+
+        // Audit-Regression B (MCS-Stranding): budgetierten Worker auf STRAND_CORE
+        // erschöpfen lassen, dann erneut binden -> er muss WIEDER laufen (Fix). Gegate
+        // auf MCS fertig + SMP fertig (STRAND_CORE frei). Tick-basiert (anderer Kern).
+        if !STRAND_DONE.load(Ordering::Acquire)
+            && MCS_DONE.load(Ordering::Acquire)
+            && (1..NUM_CORES).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
+        {
+            match STRAND_STEP.load(Ordering::Acquire) {
+                0 => {
+                    // Worker auf STRAND_CORE erzeugen + knappes Budget binden (budget=1,
+                    // lange Periode -> nach Erschöpfung KEIN natürlicher Refill im Fenster).
+                    if let Some(w) =
+                        system::spawn_on_core(STRAND_CORE, strand_worker as *const () as usize, 0, 3)
+                    {
+                        STRAND_TID.store(w.to_raw(), Ordering::Relaxed);
+                        if let Ok(sc) = system::install_sched_context_cap(1, 10_000, Rights::WRITE) {
+                            system::bind_sched_context(sc, STRAND_CORE, w);
+                        }
+                        STRAND_STEP.store(1, Ordering::Release);
+                    }
+                }
+                1 => {
+                    // Warten, bis der Worker erschöpft ist (deplaniert, nicht in der Queue).
+                    let (depl, _) = system::budget_stats(STRAND_CORE);
+                    if depl >= 1 {
+                        STRAND_SNAP1.store(STRAND_COUNT.load(Ordering::Relaxed), Ordering::Relaxed);
+                        STRAND_STEP.store(2, Ordering::Release);
+                    }
+                }
+                2 => {
+                    // Erneut binden (set_budget auf den ERSCHÖPFTEN Thread). Mit Fix wird er
+                    // wieder eingereiht und läuft; ohne Fix bleibt er für immer gestrandet.
+                    let w = ThreadId::from_raw(STRAND_TID.load(Ordering::Relaxed));
+                    if let Ok(sc) = system::install_sched_context_cap(50, 100, Rights::WRITE) {
+                        system::bind_sched_context(sc, STRAND_CORE, w);
+                    }
+                    STRAND_SETTLE.store(0, Ordering::Relaxed);
+                    STRAND_STEP.store(3, Ordering::Release);
+                }
+                _ => {
+                    // Einige Ticks setzen lassen, dann prüfen, dass der Zähler seit dem
+                    // Snapshot gewachsen ist (Worker lief nach dem Re-Bind wieder).
+                    let s = STRAND_SETTLE.fetch_add(1, Ordering::Relaxed);
+                    if s >= 40 {
+                        let grew =
+                            STRAND_COUNT.load(Ordering::Relaxed) > STRAND_SNAP1.load(Ordering::Relaxed);
+                        STRAND_STOP.store(true, Ordering::Release); // Worker parken lassen
+                        STRAND_OK.store(grew, Ordering::Release);
+                        STRAND_DONE.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+
         if !reported && ALL_DONE.load(Ordering::Acquire) && all_done() {
             report();
             reported = true;
@@ -1470,8 +1697,13 @@ fn all_done() -> bool {
     let churn = CHURN_DONE.load(Ordering::Acquire) && CHURN_OK.load(Ordering::Acquire);
     // MCS: budget-basiertes Scheduling — budgetierter Thread gedrosselt, Budget gebunden.
     let mcs = MCS_DONE.load(Ordering::Acquire) && MCS_OK.load(Ordering::Acquire);
+    // Audit-Regression A: IPC paniert nicht bei totem Eintrag in der Endpoint-Queue.
+    let stale = STALE_DONE.load(Ordering::Acquire) && STALE_OK.load(Ordering::Acquire);
+    // Audit-Regression B: erneutes Budget-Bind strandet einen erschöpften Thread nicht.
+    let strand = STRAND_DONE.load(Ordering::Acquire) && STRAND_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
+        && stale && strand
 }
 
 fn report() {
@@ -1729,5 +1961,24 @@ fn report() {
     println!(
         "mcs     : {} (MCS-Budget: Verbrauch/Tick, Erschoepfung->Block, Refill nach Periode, cap-vergeben)",
         if mcs { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Audit-Regression A: IPC-Panik bei totem Thread in Endpoint-Queue (behoben).
+    let served = STALE_SERVED.load(Ordering::Acquire);
+    let stale = STALE_DONE.load(Ordering::Acquire) && STALE_OK.load(Ordering::Acquire);
+    println!("stale   : Opfer in senders gekillt; Server uebersprang toten Eintrag (keine Panik); Client-Antwort={served:#x} (erwartet {:#x})", STALE_MAGIC.wrapping_mul(2));
+    println!(
+        "stale   : {} (IPC paniert nicht bei gekilltem, in Endpoint-Queue blockiertem Thread)",
+        if stale { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Audit-Regression B: erschoepfter Thread nach erneutem Budget-Bind nicht gestrandet.
+    let snap1 = STRAND_SNAP1.load(Ordering::Relaxed);
+    let now = STRAND_COUNT.load(Ordering::Relaxed);
+    let strand = STRAND_DONE.load(Ordering::Acquire) && STRAND_OK.load(Ordering::Acquire);
+    println!("strand  : erschoepfter Worker nach Re-Bind: Zaehler {snap1} -> {now} (muss wachsen)");
+    println!(
+        "strand  : {} (set_budget/bind_sched_context strandet einen erschoepften Thread nicht)",
+        if strand { "ALL PASS" } else { "FAILURES" }
     );
 }

@@ -151,22 +151,28 @@ impl Endpoint {
             return frame;
         }
         let caller = ops.current_id(core);
-        if let Some(server) = self.receivers.dequeue() {
-            let sframe = ops.frame_of(server).expect("server frame");
+        // Einen *lebenden* wartenden Empfänger suchen. Ein zwischenzeitlich
+        // gekillter/beendeter Empfänger hat keinen Frame mehr (`frame_of` == None)
+        // und bleibt als toter Eintrag in der Queue zurück; solche Leichen werden
+        // verworfen statt zu paniken (sonst Kernel-Panik via `.expect`).
+        while let Some(server) = self.receivers.dequeue() {
+            let Some(sframe) = ops.frame_of(server) else {
+                continue; // toter Empfänger -> Eintrag verwerfen, nächsten versuchen
+            };
             transfer(frame, sframe);
             frame_set_reg(sframe, reg::SYSNO_RESULT, result::OK);
             frame_set_reg(sframe, reg::EP_BADGE, 0);
             self.caller = Some(caller);
-            if server.core() == core {
+            return if server.core() == core {
                 ops.switch_to(core, frame, server) // intra-Kern: direkt zum Server
             } else {
                 ops.unblock(server); // anderer Kern: Server dort wecken (+IPI)
                 ops.block_current(core, frame) // Aufrufer blockiert, nächster lokaler Thread
-            }
-        } else {
-            self.senders.enqueue(caller);
-            ops.block_current(core, frame)
+            };
         }
+        // Kein lebender Empfänger -> als Sender einreihen und blockieren.
+        self.senders.enqueue(caller);
+        ops.block_current(core, frame)
     }
 
     /// `RECV`: auf einen Aufrufer warten. Gibt den fortzusetzenden Frame zurück
@@ -177,19 +183,25 @@ impl Endpoint {
             return frame;
         }
         let server = ops.current_id(core);
-        if let Some(sender) = self.senders.dequeue() {
+        // Einen *lebenden* wartenden Aufrufer suchen. Ein zwischenzeitlich
+        // gekillter/beendeter Sender hat keinen Frame mehr (`frame_of` == None) und
+        // bleibt als toter Eintrag in der Queue; solche Leichen werden verworfen
+        // statt zu paniken (sonst Kernel-Panik via `.expect`).
+        while let Some(sender) = self.senders.dequeue() {
             // Aufrufer (ggf. auf anderem Kern, blockiert) -> Nachricht übernehmen.
             // Er bleibt blockiert (wartet auf die Antwort); kein Wecken nötig.
-            let cframe = ops.frame_of(sender).expect("sender frame");
+            let Some(cframe) = ops.frame_of(sender) else {
+                continue; // toter Sender -> Eintrag verwerfen, nächsten versuchen
+            };
             transfer(cframe, frame);
             frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
             frame_set_reg(frame, reg::EP_BADGE, 0);
             self.caller = Some(sender);
-            frame // Server läuft sofort weiter (kein Wechsel)
-        } else {
-            self.receivers.enqueue(server);
-            ops.block_current(core, frame)
+            return frame; // Server läuft sofort weiter (kein Wechsel)
         }
+        // Kein lebender Aufrufer -> als Empfänger einreihen und blockieren.
+        self.receivers.enqueue(server);
+        ops.block_current(core, frame)
     }
 
     /// `REPLY`: dem zuletzt empfangenen Aufrufer antworten (entblockt ihn, ggf.

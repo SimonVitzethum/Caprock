@@ -14,11 +14,11 @@
 //! IPC sperrt `RES` dann `SCHEDS[core]` (kern-lokale Endpoint-Teilnehmer). Kein
 //! Pfad nimmt zwei verschiedene `SCHEDS[*]` gleichzeitig.
 
-use sel4lake_cap::{CapError, CapInfo, CapPtr, CapSpace};
+use sel4lake_cap::{CapError, CapInfo, CapPtr};
 use sel4lake_hal::{self as hal, exception::TrapFrame, fp::FpState, println};
-use sel4lake_ipc::{EndpointTable, NotificationTable};
+use sel4lake_ipc::{Endpoint, Notification, NENDPOINTS, NNOTIFICATIONS};
 use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
-use sel4lake_microkit::PdTable;
+use sel4lake_microkit::Caps;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use sel4lake_sched::{SchedOps, Scheduler, ThreadId, MAX_THREADS};
 use sel4lake_sync::SpinLock;
@@ -64,15 +64,6 @@ static FP_STATES: SpinLock<[FpState; MAX_THREADS]> =
 /// Zähler abgeschlossener Lazy-FP-Owner-Wechsel (Save+Restore), für den Test.
 static FP_SWITCHES: AtomicUsize = AtomicUsize::new(0);
 
-/// Geteilte Ressourcen (alles außer dem Scheduler).
-struct Resources {
-    phys: PhysAllocator,
-    cspace: CapSpace,
-    eps: EndpointTable,
-    ntfns: NotificationTable,
-    pds: PdTable,
-}
-
 /// **Per-Kern** Scheduler-Instanzen, jede hinter eigenem Lock. Der heiße
 /// Timer-/IPI-Reschedule-Pfad sperrt nur `SCHEDS[core]` des eigenen Kerns -> echte
 /// parallele Einplanung ohne globalen Lock. Kern-übergreifend (z. B. `wake_remote`)
@@ -80,14 +71,25 @@ struct Resources {
 #[allow(clippy::declare_interior_mutable_const)]
 static SCHEDS: [SpinLock<Scheduler>; NUM_CORES] =
     [const { SpinLock::new(Scheduler::new()) }; NUM_CORES];
-/// Ressourcen-Lock. **Lock-Ordnung: RES vor SCHEDS[*].**
-static RES: SpinLock<Resources> = SpinLock::new(Resources {
-    phys: PhysAllocator::new(),
-    cspace: CapSpace::new(),
-    eps: EndpointTable::new(),
-    ntfns: NotificationTable::new(),
-    pds: PdTable::new(),
-});
+
+// --- Feinkörnige Ressourcen-Locks (ersetzen den einen RES-Lock) ---
+//
+// Sperrordnung (außen->innen): CAPS < {EPS[i], NTFNS[i], MEM} < SCHEDS[*] < FP_STATES.
+// Der Reschedule-Pfad nimmt nur SCHEDS[core] (+ atomares FP_OWNER), wartet also nie
+// auf einen anderen Lock. IPC auf verschiedenen Endpoints läuft parallel (je eigener
+// EPS[i]-Lock); nur die kurze Cap-Auflösung serialisiert auf CAPS.
+/// Cap-Auflösung + -Verwaltung (CapSpace + PD-Tabelle) hinter einem Lock.
+static CAPS: SpinLock<Caps> = SpinLock::new(Caps::new());
+/// Physischer Allokator (Thread-Stacks etc.) — getrennt, blockiert IPC nicht.
+static MEM: SpinLock<PhysAllocator> = SpinLock::new(PhysAllocator::new());
+/// **Per-Endpoint** Locks: IPC auf verschiedenen Endpoints ist nebenläufig.
+#[allow(clippy::declare_interior_mutable_const)]
+static EPS: [SpinLock<Endpoint>; NENDPOINTS] =
+    [const { SpinLock::new(Endpoint::EMPTY) }; NENDPOINTS];
+/// **Per-Notification** Locks.
+#[allow(clippy::declare_interior_mutable_const)]
+static NTFNS: [SpinLock<Notification>; NNOTIFICATIONS] =
+    [const { SpinLock::new(Notification::EMPTY) }; NNOTIFICATIONS];
 
 // --- Trap-Hooks ---
 
@@ -105,23 +107,12 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
     if hal::exception::frame_from_el0(frame as usize) {
         EL0_SYSCALL_SEEN.store(true, Ordering::Relaxed);
     }
-    // Lock-Ordnung RES vor SCHEDS[*]. Der Dispatch hält `RES` (serialisiert IPC) und
-    // greift über die `KernelSched`-Facade auf die Scheduler zu — je Operation
-    // **genau eine** `SCHEDS`-Instanz (auch kern-übergreifend für IPC-Partner auf
-    // anderen Kernen), nie zwei gleichzeitig -> deadlockfrei. IRQs sind im Trap
-    // maskiert, also kann dieser Kern beim Lock-Halten nicht preemptiert werden.
-    let mut res = RES.lock();
+    // Der Dispatch besorgt das Locking selbst (feinkörnig: CAPS für die kurze
+    // Cap-Auflösung, dann per-Objekt-Lock; SchedOps je Op genau eine SCHEDS-Instanz).
+    // Sperrordnung CAPS < EPS[i]/NTFNS[i] < SCHEDS -> deadlockfrei. IRQs im Trap
+    // maskiert -> kein Preempt beim Lock-Halten.
     let mut ops = KernelSched;
-    let r = &mut *res;
-    let next = sel4lake_microkit::dispatch(
-        frame as usize,
-        core,
-        &mut ops,
-        &mut r.cspace,
-        &mut r.eps,
-        &mut r.ntfns,
-        &mut r.pds,
-    );
+    let next = sel4lake_microkit::dispatch(frame as usize, core, &mut ops, &CAPS, &EPS, &NTFNS);
     // Der Syscall kann den laufenden Thread gewechselt haben (block/exit) -> FP-Trap
     // passend zum neuen aktuellen Thread setzen.
     sync_fp_trap(core, &SCHEDS[core].lock());
@@ -259,7 +250,7 @@ pub fn set_hooks() {
 
 /// Freies RAM `[free_base, ram_end)` beim Allokator registrieren.
 pub fn init_mem(free_base: u64, ram_end: u64) {
-    RES.lock().phys.add_region(free_base, ram_end - free_base);
+    MEM.lock().add_region(free_base, ram_end - free_base);
 }
 
 /// **Alle** per-Kern-Scheduler-Instanzen an ihre Kern-ID binden. Vom Bootkern
@@ -278,62 +269,78 @@ pub fn init_core() {
     SCHEDS[core].lock().init_core(core, IDLE_PRIO);
 }
 
-// --- Allokator (RES) ---
+// --- Allokator (MEM) ---
 
 pub fn alloc(size: u64, align: u64) -> Option<MemoryCap> {
-    RES.lock().phys.alloc(size, align)
+    MEM.lock().alloc(size, align)
 }
 pub fn free(cap: MemoryCap) {
-    RES.lock().phys.free(cap);
+    MEM.lock().free(cap);
 }
 pub fn total_free() -> u64 {
-    RES.lock().phys.total_free()
+    MEM.lock().total_free()
 }
 pub fn fragments() -> usize {
-    RES.lock().phys.fragments()
+    MEM.lock().fragments()
 }
 
-// --- Capability-Space (RES) ---
+// --- Capability-Space + PDs (CAPS) ---
 
 pub fn cap_install(cap: MemoryCap) -> Result<CapPtr, CapError> {
-    RES.lock().cspace.install_memory(cap)
+    CAPS.lock().cspace.install_memory(cap)
 }
 pub fn cap_copy(src: CapPtr, rights: Rights) -> Result<CapPtr, CapError> {
-    RES.lock().cspace.copy(src, rights)
+    CAPS.lock().cspace.copy(src, rights)
 }
 pub fn cap_mint(src: CapPtr, rights: Rights, badge: u64) -> Result<CapPtr, CapError> {
-    RES.lock().cspace.mint(src, rights, badge)
+    CAPS.lock().cspace.mint(src, rights, badge)
 }
 pub fn cap_move(src: CapPtr) -> Result<CapPtr, CapError> {
-    RES.lock().cspace.move_cap(src)
+    CAPS.lock().cspace.move_cap(src)
 }
 pub fn cap_inspect(ptr: CapPtr) -> Option<CapInfo> {
-    RES.lock().cspace.inspect(ptr)
+    CAPS.lock().cspace.inspect(ptr)
 }
 pub fn cap_delete(ptr: CapPtr) -> Result<(), CapError> {
-    let mut res = RES.lock();
-    let r = &mut *res;
-    r.cspace.delete(&mut r.phys, ptr)
+    // Finalisierung gibt ggf. Speicher zurück -> CAPS vor MEM (Sperrordnung).
+    let mut caps = CAPS.lock();
+    let mut mem = MEM.lock();
+    caps.cspace.delete(&mut mem, ptr)
 }
 pub fn cap_revoke(ptr: CapPtr) -> Result<(), CapError> {
-    let mut res = RES.lock();
-    let r = &mut *res;
-    r.cspace.revoke(&mut r.phys, ptr)
+    let mut caps = CAPS.lock();
+    let mut mem = MEM.lock();
+    caps.cspace.revoke(&mut mem, ptr)
 }
 
-// --- Endpoints / Notifications (RES) ---
+// --- Endpoints / Notifications (per-Objekt-Locks) ---
 
+/// Einen freien Endpoint-Slot reservieren (scannt die per-Endpoint-Locks).
 pub fn create_endpoint() -> Option<usize> {
-    RES.lock().eps.create()
+    for (i, ep) in EPS.iter().enumerate() {
+        let mut e = ep.lock();
+        if !e.is_used() {
+            e.mark_used();
+            return Some(i);
+        }
+    }
+    None
 }
 pub fn install_endpoint_cap(ep: u32, rights: Rights) -> Result<CapPtr, CapError> {
-    RES.lock().cspace.install_endpoint(ep, rights)
+    CAPS.lock().cspace.install_endpoint(ep, rights)
 }
 pub fn create_notification() -> Option<usize> {
-    RES.lock().ntfns.create()
+    for (i, n) in NTFNS.iter().enumerate() {
+        let mut nt = n.lock();
+        if !nt.is_used() {
+            nt.mark_used();
+            return Some(i);
+        }
+    }
+    None
 }
 pub fn install_notification_cap(ntfn: u32, rights: Rights) -> Result<CapPtr, CapError> {
-    RES.lock().cspace.install_notification(ntfn, rights)
+    CAPS.lock().cspace.install_notification(ntfn, rights)
 }
 
 // --- Threads / Protection Domains ---
@@ -348,11 +355,10 @@ pub fn spawn(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
 /// um Arbeit über die Kerne zu verteilen). Der Zielkern muss vorab via
 /// [`bind_cores`] gebunden sein. Lock-Ordnung RES vor SCHEDS[core].
 pub fn spawn_on_core(core: usize, entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
-    let mut res = RES.lock();
     let (base, len) = {
-        let stack = res.phys.alloc(STACK_SIZE, 16)?;
+        let stack = MEM.lock().alloc(STACK_SIZE, 16)?;
         (stack.base() as usize, stack.len() as usize)
-    };
+    }; // MEM vor SCHEDS freigegeben (Ordnung MEM < SCHEDS)
     let mut sched = SCHEDS[core].lock();
     let tid = sched.spawn(core, entry, arg, base, len, prio)?;
     fp_reset_slot(tid.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
@@ -369,11 +375,10 @@ pub fn spawn_user(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
         return None;
     }
     let kbase = core::ptr::addr_of!(__user_kstacks_bottom) as usize + idx * USER_KSTACK_SIZE;
-    let mut res = RES.lock();
     let (user_base, user_len) = {
-        let s = res.phys.alloc(STACK_SIZE, 16)?;
+        let s = MEM.lock().alloc(STACK_SIZE, 16)?;
         (s.base() as usize, s.len() as usize)
-    };
+    }; // MEM vor SCHEDS freigegeben (Ordnung MEM < SCHEDS)
     let mut sched = SCHEDS[core].lock();
     let tid = sched.spawn_user(core, entry, arg, kbase, USER_KSTACK_SIZE, user_base, user_len, prio)?;
     fp_reset_slot(tid.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
@@ -399,37 +404,56 @@ pub fn el0_syscall_seen() -> bool {
 
 /// Eine Tcb-Capability für einen Thread prägen (cap-kontrolliertes `KILL`).
 pub fn install_tcb_cap(tid: ThreadId, rights: Rights) -> Result<CapPtr, CapError> {
-    RES.lock().cspace.install_tcb(tid.to_raw(), rights)
+    CAPS.lock().cspace.install_tcb(tid.to_raw(), rights)
 }
 
 /// Beendete Threads **dieses Kerns** einsammeln: TCB-Slots freigeben und Stacks an
-/// den Allokator zurückgeben (aus dem Idle-Thread). Lock-Ordnung RES vor SCHEDS[core].
+/// den Allokator zurückgeben (aus dem Idle-Thread). Erst die Zombies unter
+/// `SCHEDS[core]` einsammeln, dann den Lock **freigeben** und unter `MEM` freigeben
+/// — nie SCHEDS und MEM gleichzeitig halten (sonst Ordnungsinversion zu `spawn`).
 pub fn reap() -> usize {
     let core = hal::cpu::core_id();
-    let mut res = RES.lock();
-    let mut sched = SCHEDS[core].lock();
+    let mut zombies: [(usize, usize); 8] = [(0, 0); 8];
     let mut n = 0;
-    while let Some((base, len)) = sched.reap() {
-        res.phys.free_region(PhysRegion::new(base as u64, len as u64));
-        n += 1;
+    {
+        let mut sched = SCHEDS[core].lock();
+        while n < zombies.len() {
+            match sched.reap() {
+                Some(z) => {
+                    zombies[n] = z;
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+    } // SCHEDS freigegeben
+    if n > 0 {
+        let mut mem = MEM.lock();
+        for &(base, len) in &zombies[..n] {
+            mem.free_region(PhysRegion::new(base as u64, len as u64));
+        }
     }
     n
 }
 
 pub fn create_pd() -> Option<usize> {
-    RES.lock().pds.create()
+    CAPS.lock().pds.create()
 }
 pub fn bind_pd(pd: usize, tid: ThreadId) {
-    RES.lock().pds.bind_thread(pd, tid);
+    CAPS.lock().pds.bind_thread(pd, tid);
 }
 pub fn install_pd_cap(pd: usize, slot: usize, cap: CapPtr) {
-    RES.lock().pds.install_cap(pd, slot, cap);
+    CAPS.lock().pds.install_cap(pd, slot, cap);
 }
 pub fn clear_pd_cap(pd: usize, slot: usize) {
-    RES.lock().pds.clear_cap(pd, slot);
+    CAPS.lock().pds.clear_cap(pd, slot);
 }
 
 /// Einen blockierten Endpoint-Empfänger zurückziehen (Hot-Reload).
 pub fn endpoint_retire_receiver(ep: usize, tid: ThreadId) -> bool {
-    RES.lock().eps.retire_receiver(ep, tid)
+    if ep < NENDPOINTS {
+        EPS[ep].lock().retire_receiver(tid)
+    } else {
+        false
+    }
 }

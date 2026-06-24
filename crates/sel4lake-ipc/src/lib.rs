@@ -1,25 +1,30 @@
 #![no_std]
-//! Synchrone IPC über Endpoints (ADR 0004).
+//! Synchrone IPC über Endpoints + asynchrone Notifications (ADR 0004).
 //!
 //! Ein **Endpoint** ist ein Rendezvous-Punkt: Sender (Aufrufer) und Empfänger
 //! (Server) treffen sich, Nachrichten-Register werden zwischen ihren TrapFrames
-//! kopiert. Trifft kein Partner ein, blockiert der Thread (verlässt die
-//! Ready-Queue des Schedulers); beim Rendezvous wird über den
-//! Scheduler-Fastpath direkt zum Partner gewechselt.
+//! kopiert. Trifft kein Partner ein, blockiert der Thread; beim Rendezvous wird
+//! über die [`SchedOps`] der Partner geweckt (kern-übergreifend per IPI) bzw. — auf
+//! demselben Kern — direkt umgeschaltet.
 //!
-//! Phase 5 implementiert das synchrone **Call/Recv/Reply**-Muster (RPC). Jede
-//! Operation gibt den als Nächstes fortzusetzenden TrapFrame zurück (passend zum
-//! Trap-Pfad in `sel4lake-hal::exception`).
+//! **Feinkörniges Locking:** Jedes [`Endpoint`]/[`Notification`] ist ein
+//! eigenständiges Objekt; der Kernel hält je Objekt einen eigenen Lock
+//! (`[SpinLock<Endpoint>; N]`). IPC auf verschiedenen Endpoints läuft daher
+//! parallel — nur die kurze Cap-Auflösung serialisiert (separater `CAPS`-Lock im
+//! Kernel). Die Methoden hier operieren jeweils auf **einem** Objekt (`&mut self`)
+//! ohne eigenes Locking; das Locking + die Sperrordnung besorgt der Kernel/Dispatch.
 //!
-//! Reine Orchestrierung über Scheduler + Frame-Accessoren — **kein eigenes
+//! Reine Orchestrierung über [`SchedOps`] + Frame-Accessoren — **kein eigenes
 //! `unsafe`** (der Frame-Zugriff ist in der HAL gekapselt).
 
 use sel4lake_abi::{reg, result, MSG_WORDS};
 use sel4lake_hal::exception::{frame_reg, frame_set_reg};
 use sel4lake_sched::{SchedOps, ThreadId};
 
-const NENDPOINTS: usize = 32;
-const NNOTIFICATIONS: usize = 32;
+/// Anzahl Endpoint-Objekte (Größe des per-Endpoint-Lock-Arrays im Kernel).
+pub const NENDPOINTS: usize = 32;
+/// Anzahl Notification-Objekte.
+pub const NNOTIFICATIONS: usize = 32;
 const QCAP: usize = 32;
 
 /// FIFO-Warteschlange blockierter Threads (an einem Endpoint).
@@ -75,8 +80,18 @@ impl TidQueue {
     }
 }
 
+/// Nachrichten-Register (Datenwörter + Tag) von `src` nach `dst` kopieren.
+fn transfer(src: usize, dst: usize) {
+    for i in 0..MSG_WORDS {
+        frame_set_reg(dst, reg::MSG0 + i, frame_reg(src, reg::MSG0 + i));
+    }
+    frame_set_reg(dst, reg::TAG, frame_reg(src, reg::TAG));
+}
+
+/// Ein Endpoint-Objekt. Der Kernel hält je Endpoint einen eigenen Lock; die
+/// Methoden operieren auf genau diesem einen Objekt.
 #[derive(Clone, Copy)]
-struct Endpoint {
+pub struct Endpoint {
     used: bool,
     /// Blockierte Aufrufer, die auf einen Empfänger warten.
     senders: TidQueue,
@@ -86,95 +101,62 @@ struct Endpoint {
     caller: Option<ThreadId>,
 }
 
+impl Default for Endpoint {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl Endpoint {
-    const EMPTY: Endpoint = Endpoint {
+    pub const EMPTY: Endpoint = Endpoint {
         used: false,
         senders: TidQueue::EMPTY,
         receivers: TidQueue::EMPTY,
         caller: None,
     };
-}
 
-/// Tabelle aller Endpoints.
-pub struct EndpointTable {
-    eps: [Endpoint; NENDPOINTS],
-}
-
-impl Default for EndpointTable {
-    fn default() -> Self {
-        Self::new()
+    /// Ist dieses Objekt belegt (von `create` reserviert)?
+    pub fn is_used(&self) -> bool {
+        self.used
     }
-}
-
-/// Nachrichten-Register (Datenwörter + Tag) von `src` nach `dst` kopieren.
-fn transfer(src: usize, dst: usize) {
-    for i in 0..MSG_WORDS {
-        frame_set_reg(dst, reg::MSG0 + i, frame_reg(src, reg::MSG0 + i));
-    }
-    frame_set_reg(dst, reg::TAG, frame_reg(src, reg::TAG));
-}
-
-impl EndpointTable {
-    pub const fn new() -> Self {
-        Self {
-            eps: [Endpoint::EMPTY; NENDPOINTS],
-        }
-    }
-
-    /// Einen neuen Endpoint anlegen; gibt seine ID zurück.
-    pub fn create(&mut self) -> Option<usize> {
-        let i = self.eps.iter().position(|e| !e.used)?;
-        self.eps[i] = Endpoint {
+    /// Als belegt markieren (von der Slot-Reservierung des Kernels).
+    pub fn mark_used(&mut self) {
+        *self = Endpoint {
             used: true,
             ..Endpoint::EMPTY
         };
-        Some(i)
     }
 
-    fn valid(&self, ep: usize) -> bool {
-        ep < NENDPOINTS && self.eps[ep].used
+    /// Der aktuell auf eine Antwort wartende Aufrufer (für den Cap-Transfer bei
+    /// `REPLY`).
+    pub fn caller(&self) -> Option<ThreadId> {
+        self.caller
     }
 
-    /// Der aktuell auf eine Antwort wartende Aufrufer eines Endpoints (für den
-    /// Capability-Transfer bei `REPLY`).
-    pub fn caller(&self, ep: usize) -> Option<ThreadId> {
-        if self.valid(ep) {
-            self.eps[ep].caller
-        } else {
-            None
-        }
-    }
-
-    /// Einen blockierten Empfänger von einem Endpoint zurückziehen (Hot-Reload).
-    /// Der Thread bleibt anschließend blockiert (geparkt) und bedient den
-    /// Endpoint nicht mehr. Gibt `true`, falls er Empfänger war.
-    pub fn retire_receiver(&mut self, ep: usize, tid: ThreadId) -> bool {
-        if self.valid(ep) {
-            self.eps[ep].receivers.remove(tid)
-        } else {
-            false
-        }
+    /// Einen blockierten Empfänger zurückziehen (Hot-Reload). Der Thread bleibt
+    /// danach blockiert (geparkt). Gibt `true`, falls er Empfänger war.
+    pub fn retire_receiver(&mut self, tid: ThreadId) -> bool {
+        self.used && self.receivers.remove(tid)
     }
 
     /// `CALL`: Nachricht senden und auf Antwort warten. Gibt den fortzusetzenden
     /// Frame zurück (immer ein anderer Thread, da der Aufrufer blockiert).
-    /// **Kern-übergreifend:** Liegt der Empfänger auf einem anderen Kern, wird seine
-    /// Nachricht in seinen Frame übertragen und er per `unblock` (+IPI) geweckt;
-    /// der Aufrufer blockiert auf seinem Kern. Auf demselben Kern: Rendezvous-
-    /// Fastpath (`switch_to`).
-    pub fn call(&mut self, ops: &mut dyn SchedOps, core: usize, ep: usize, frame: usize) -> usize {
-        if !self.valid(ep) {
+    /// **Kern-übergreifend:** Liegt der Empfänger auf einem anderen Kern, wird die
+    /// Nachricht in seinen (blockierten) Frame übertragen und er per `unblock`
+    /// (+IPI) geweckt; der Aufrufer blockiert auf seinem Kern. Auf demselben Kern:
+    /// Rendezvous-Fastpath (`switch_to`).
+    pub fn call(&mut self, ops: &mut dyn SchedOps, core: usize, frame: usize) -> usize {
+        if !self.used {
             frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_BADCAP);
             return frame;
         }
         let caller = ops.current_id(core);
-        if let Some(server) = self.eps[ep].receivers.dequeue() {
-            // Empfänger wartet -> Nachricht in seinen (blockierten) Frame übertragen.
+        if let Some(server) = self.receivers.dequeue() {
             let sframe = ops.frame_of(server).expect("server frame");
             transfer(frame, sframe);
             frame_set_reg(sframe, reg::SYSNO_RESULT, result::OK);
             frame_set_reg(sframe, reg::EP_BADGE, 0);
-            self.eps[ep].caller = Some(caller);
+            self.caller = Some(caller);
             if server.core() == core {
                 ops.switch_to(core, frame, server) // intra-Kern: direkt zum Server
             } else {
@@ -182,46 +164,45 @@ impl EndpointTable {
                 ops.block_current(core, frame) // Aufrufer blockiert, nächster lokaler Thread
             }
         } else {
-            // Kein Empfänger -> Aufrufer reiht sich als Sender ein und blockiert.
-            self.eps[ep].senders.enqueue(caller);
+            self.senders.enqueue(caller);
             ops.block_current(core, frame)
         }
     }
 
     /// `RECV`: auf einen Aufrufer warten. Gibt den fortzusetzenden Frame zurück
     /// (der eigene, falls sofort ein Sender da war; sonst ein anderer Thread).
-    pub fn recv(&mut self, ops: &mut dyn SchedOps, core: usize, ep: usize, frame: usize) -> usize {
-        if !self.valid(ep) {
+    pub fn recv(&mut self, ops: &mut dyn SchedOps, core: usize, frame: usize) -> usize {
+        if !self.used {
             frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_BADCAP);
             return frame;
         }
         let server = ops.current_id(core);
-        if let Some(sender) = self.eps[ep].senders.dequeue() {
-            // Aufrufer (ggf. auf anderem Kern, blockiert) wartet -> dessen Nachricht
-            // in den eigenen Frame übernehmen. Der Aufrufer bleibt blockiert (wartet
-            // auf die Antwort); kein Wecken nötig.
+        if let Some(sender) = self.senders.dequeue() {
+            // Aufrufer (ggf. auf anderem Kern, blockiert) -> Nachricht übernehmen.
+            // Er bleibt blockiert (wartet auf die Antwort); kein Wecken nötig.
             let cframe = ops.frame_of(sender).expect("sender frame");
             transfer(cframe, frame);
             frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
             frame_set_reg(frame, reg::EP_BADGE, 0);
-            self.eps[ep].caller = Some(sender); // diesem wird geantwortet
+            self.caller = Some(sender);
             frame // Server läuft sofort weiter (kein Wechsel)
         } else {
-            // Kein Aufrufer -> Server reiht sich als Empfänger ein und blockiert.
-            self.eps[ep].receivers.enqueue(server);
+            self.receivers.enqueue(server);
             ops.block_current(core, frame)
         }
     }
 
     /// `REPLY`: dem zuletzt empfangenen Aufrufer antworten (entblockt ihn, ggf.
-    /// kern-übergreifend per `unblock`+IPI). Der Server läuft weiter (kein Wechsel).
-    pub fn reply(&mut self, ops: &mut dyn SchedOps, core: usize, ep: usize, frame: usize) -> usize {
+    /// kern-übergreifend per `unblock`+IPI). Der Server läuft weiter. Ein etwaiger
+    /// Capability-Transfer (`grant`) wird vom Kernel **vor** diesem Aufruf erledigt,
+    /// solange noch dieser Endpoint-Lock + der CAPS-Lock gehalten werden.
+    pub fn reply(&mut self, ops: &mut dyn SchedOps, core: usize, frame: usize) -> usize {
         let _ = core;
-        if !self.valid(ep) {
+        if !self.used {
             frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_BADCAP);
             return frame;
         }
-        if let Some(caller) = self.eps[ep].caller.take() {
+        if let Some(caller) = self.caller.take() {
             if let Some(cframe) = ops.frame_of(caller) {
                 transfer(frame, cframe);
                 frame_set_reg(cframe, reg::SYSNO_RESULT, result::OK);
@@ -237,8 +218,9 @@ impl EndpointTable {
 // Notifications: asynchrone Badge-Signale (kein Rendezvous).
 // ---------------------------------------------------------------------------
 
+/// Ein Notification-Objekt (eigener Lock je Objekt im Kernel).
 #[derive(Clone, Copy)]
-struct Notification {
+pub struct Notification {
     used: bool,
     /// Akkumulierte Badge-Bits noch nicht abgeholter Signale.
     pending: u64,
@@ -246,60 +228,42 @@ struct Notification {
     waiter: Option<ThreadId>,
 }
 
+impl Default for Notification {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl Notification {
-    const EMPTY: Notification = Notification {
+    pub const EMPTY: Notification = Notification {
         used: false,
         pending: 0,
         waiter: None,
     };
-}
 
-/// Tabelle aller Notification-Objekte.
-pub struct NotificationTable {
-    ntfns: [Notification; NNOTIFICATIONS],
-}
-
-impl Default for NotificationTable {
-    fn default() -> Self {
-        Self::new()
+    pub fn is_used(&self) -> bool {
+        self.used
     }
-}
-
-impl NotificationTable {
-    pub const fn new() -> Self {
-        Self {
-            ntfns: [Notification::EMPTY; NNOTIFICATIONS],
-        }
-    }
-
-    pub fn create(&mut self) -> Option<usize> {
-        let i = self.ntfns.iter().position(|n| !n.used)?;
-        self.ntfns[i] = Notification {
+    pub fn mark_used(&mut self) {
+        *self = Notification {
             used: true,
             ..Notification::EMPTY
         };
-        Some(i)
-    }
-
-    fn valid(&self, n: usize) -> bool {
-        n < NNOTIFICATIONS && self.ntfns[n].used
     }
 
     /// `SIGNAL`: `badge` ins Notification-Wort ODERn und einen etwaigen Wartenden
-    /// wecken. **Nicht blockierend** — der Signalgeber läuft weiter (`frame`).
-    pub fn signal(&mut self, ops: &mut dyn SchedOps, ntfn: usize, badge: u64, frame: usize) -> usize {
-        if !self.valid(ntfn) {
+    /// wecken (ggf. kern-übergreifend per `unblock`+IPI). **Nicht blockierend.**
+    pub fn signal(&mut self, ops: &mut dyn SchedOps, badge: u64, frame: usize) -> usize {
+        if !self.used {
             frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_BADCAP);
             return frame;
         }
-        self.ntfns[ntfn].pending |= badge;
-        if let Some(w) = self.ntfns[ntfn].waiter.take() {
-            // Wartender (ggf. auf anderem Kern) -> Badge in seinen Frame, dann wecken
-            // (kern-übergreifend per unblock+IPI).
+        self.pending |= badge;
+        if let Some(w) = self.waiter.take() {
             if let Some(wframe) = ops.frame_of(w) {
                 frame_set_reg(wframe, reg::SYSNO_RESULT, result::OK);
-                frame_set_reg(wframe, reg::EP_BADGE, self.ntfns[ntfn].pending);
-                self.ntfns[ntfn].pending = 0;
+                frame_set_reg(wframe, reg::EP_BADGE, self.pending);
+                self.pending = 0;
             }
             ops.unblock(w);
         }
@@ -309,18 +273,18 @@ impl NotificationTable {
 
     /// `WAIT`: akkumulierten Badge abholen (sofort, falls vorhanden) oder
     /// blockieren, bis signalisiert wird. Liefert den Badge in `x1`.
-    pub fn wait(&mut self, ops: &mut dyn SchedOps, core: usize, ntfn: usize, frame: usize) -> usize {
-        if !self.valid(ntfn) {
+    pub fn wait(&mut self, ops: &mut dyn SchedOps, core: usize, frame: usize) -> usize {
+        if !self.used {
             frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_BADCAP);
             return frame;
         }
-        if self.ntfns[ntfn].pending != 0 {
+        if self.pending != 0 {
             frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
-            frame_set_reg(frame, reg::EP_BADGE, self.ntfns[ntfn].pending);
-            self.ntfns[ntfn].pending = 0;
+            frame_set_reg(frame, reg::EP_BADGE, self.pending);
+            self.pending = 0;
             frame
         } else {
-            self.ntfns[ntfn].waiter = Some(ops.current_id(core));
+            self.waiter = Some(ops.current_id(core));
             ops.block_current(core, frame)
         }
     }

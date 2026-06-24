@@ -19,13 +19,37 @@
 use sel4lake_abi::{reg, result, sys};
 use sel4lake_cap::{CapPtr, CapSpace, ObjectKind};
 use sel4lake_hal::exception::{frame_reg, frame_set_reg};
-use sel4lake_ipc::{EndpointTable, NotificationTable};
+use sel4lake_ipc::{Endpoint, Notification, NENDPOINTS, NNOTIFICATIONS};
 use sel4lake_mem::Rights;
 use sel4lake_sched::{SchedOps, ThreadId};
+use sel4lake_sync::SpinLock;
 
 const NPDS: usize = 32;
 /// Cap-Slots je PD-Cspace.
 const NCAPS: usize = 16;
+
+/// Cap-Management-Zustand hinter **einem** Lock (`CAPS` im Kernel): der globale
+/// Capability-Space + die Protection-Domain-Tabelle. Cap-Auflösung und -Verwaltung
+/// brauchen beides konsistent zusammen.
+pub struct Caps {
+    pub cspace: CapSpace,
+    pub pds: PdTable,
+}
+
+impl Default for Caps {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Caps {
+    pub const fn new() -> Self {
+        Caps {
+            cspace: CapSpace::new(),
+            pds: PdTable::new(),
+        }
+    }
+}
 
 /// Eine Protection Domain: ein Thread + ein Capability-Space.
 #[derive(Clone, Copy)]
@@ -116,14 +140,20 @@ impl PdTable {
 /// Recht wird ein Fehlercode gesetzt und (ohne Blockieren) zurückgekehrt.
 ///
 /// Rechte: `CALL` (senden) braucht `WRITE`, `RECV`/`REPLY` (empfangen) `READ`.
+/// Der Dispatch besorgt das **Locking selbst** (feinkörnig): `caps` (Cap-Auflösung
+/// + -Verwaltung) ist EIN Lock, jedes Endpoint/Notification hat seinen eigenen.
+/// Sperrordnung `CAPS < EPS[i]/NTFNS[i] < SCHEDS` (die `SchedOps` sperren intern je
+/// Operation genau eine `SCHEDS`-Instanz). Cap-Auflösung sperrt `CAPS` kurz und gibt
+/// ihn frei -> IPC auf verschiedenen Endpoints läuft danach parallel. Nur `REPLY`
+/// mit Cap-Transfer hält `CAPS` über das Sperren des Endpoints (CAPS->EPS), gibt ihn
+/// aber vor dem Rendezvous frei.
 pub fn dispatch(
     frame: usize,
     core: usize,
     ops: &mut dyn SchedOps,
-    cspace: &mut CapSpace,
-    eps: &mut EndpointTable,
-    ntfns: &mut NotificationTable,
-    pds: &mut PdTable,
+    caps: &SpinLock<Caps>,
+    eps: &[SpinLock<Endpoint>; NENDPOINTS],
+    ntfns: &[SpinLock<Notification>; NNOTIFICATIONS],
 ) -> usize {
     let nr = frame_reg(frame, reg::SYSNO_RESULT);
     if nr == sys::YIELD {
@@ -144,16 +174,18 @@ pub fn dispatch(
         frame
     };
 
-    // Ab hier: cap-gesicherte Operationen. Cap aus dem PD-Cspace auflösen.
+    // Cap-Auflösung unter `CAPS`. Der Guard bleibt nur so lange gehalten, wie nötig
+    // (bei REPLY+grant bis nach dem Transfer; sonst wird er vor dem IPC freigegeben).
+    let mut caps_guard = caps.lock();
     let thread = ops.current_id(core);
-    let Some(pd) = pds.pd_of(thread) else {
+    let Some(pd) = caps_guard.pds.pd_of(thread) else {
         return deny(result::ERR_NOPD);
     };
     let local = frame_reg(frame, reg::EP_BADGE) as usize;
-    let Some(cap) = pds.cap_at(pd, local) else {
+    let Some(cap) = caps_guard.pds.cap_at(pd, local) else {
         return deny(result::ERR_BADCAP);
     };
-    let Some((kind, rights, badge)) = cspace.lookup(cap) else {
+    let Some((kind, rights, badge)) = caps_guard.cspace.lookup(cap) else {
         return deny(result::ERR_BADCAP);
     };
 
@@ -167,17 +199,30 @@ pub fn dispatch(
                 return deny(result::ERR_RIGHTS);
             }
             let ep = ep_id as usize;
+            if ep >= NENDPOINTS {
+                return deny(result::ERR_BADCAP);
+            }
             match nr {
-                sys::CALL => eps.call(ops, core, ep, frame),
-                sys::RECV => eps.recv(ops, core, ep, frame),
+                sys::CALL => {
+                    drop(caps_guard); // CAPS vor dem Endpoint freigeben
+                    eps[ep].lock().call(ops, core, frame)
+                }
+                sys::RECV => {
+                    drop(caps_guard);
+                    eps[ep].lock().recv(ops, core, frame)
+                }
                 _ => {
-                    // Optionaler Capability-Transfer: REPLY delegiert die Cap am
-                    // lokalen Slot (tag & 0xff) an den Aufrufer (GRANT_RECV_SLOT).
+                    // REPLY: ggf. Cap-Transfer (grant) unter CAPS+EPS (Ordnung
+                    // CAPS->EPS), dann CAPS freigeben und das Rendezvous fahren.
                     let tag = frame_reg(frame, reg::TAG);
+                    let mut e = eps[ep].lock();
                     if tag & sel4lake_abi::GRANT_FLAG != 0 {
-                        grant_cap(cspace, pds, eps, pd, (tag & 0xff) as usize, ep);
+                        if let Some(caller) = e.caller() {
+                            grant_cap(&mut caps_guard, caller, pd, (tag & 0xff) as usize);
+                        }
                     }
-                    eps.reply(ops, core, ep, frame)
+                    drop(caps_guard);
+                    e.reply(ops, core, frame)
                 }
             }
         }
@@ -190,10 +235,14 @@ pub fn dispatch(
                 return deny(result::ERR_RIGHTS);
             }
             let n = id as usize;
+            if n >= NNOTIFICATIONS {
+                return deny(result::ERR_BADCAP);
+            }
+            drop(caps_guard);
             if nr == sys::SIGNAL {
-                ntfns.signal(ops, n, badge, frame)
+                ntfns[n].lock().signal(ops, badge, frame)
             } else {
-                ntfns.wait(ops, core, n, frame)
+                ntfns[n].lock().wait(ops, core, frame)
             }
         }
         sys::KILL => {
@@ -203,6 +252,7 @@ pub fn dispatch(
             if !rights.contains(Rights::WRITE) {
                 return deny(result::ERR_RIGHTS);
             }
+            drop(caps_guard);
             let ok = ops.kill(ThreadId::from_raw(raw), core);
             frame_set_reg(frame, reg::SYSNO_RESULT, if ok { result::OK } else { result::ERR_BADCAP });
             frame
@@ -211,29 +261,20 @@ pub fn dispatch(
     }
 }
 
-/// Eine Capability vom Server (lokaler Slot `grant_slot` in PD `server_pd`) an
-/// den aktuell wartenden Aufrufer von `ep` delegieren: im globalen `CapSpace`
-/// ableiten (Kind im CDT) und in den Cspace des Aufrufer-PDs an
-/// [`GRANT_RECV_SLOT`](sel4lake_abi::GRANT_RECV_SLOT) eintragen.
-fn grant_cap(
-    cspace: &mut CapSpace,
-    pds: &mut PdTable,
-    eps: &EndpointTable,
-    server_pd: usize,
-    grant_slot: usize,
-    ep: usize,
-) {
-    let Some(src) = pds.cap_at(server_pd, grant_slot) else {
+/// Eine Capability vom Server (lokaler Slot `grant_slot` in PD `server_pd`) an den
+/// `caller` delegieren: im globalen `CapSpace` ableiten (Kind im CDT) und in den
+/// Cspace des Aufrufer-PDs an [`GRANT_RECV_SLOT`](sel4lake_abi::GRANT_RECV_SLOT)
+/// eintragen. Läuft unter dem gehaltenen `CAPS`-Lock (vor dem REPLY-Rendezvous, also
+/// bevor der Aufrufer geweckt wird/laufen kann).
+fn grant_cap(caps: &mut Caps, caller: ThreadId, server_pd: usize, grant_slot: usize) {
+    let Some(src) = caps.pds.cap_at(server_pd, grant_slot) else {
         return;
     };
-    let Some(caller) = eps.caller(ep) else {
-        return;
-    };
-    let Some(cpd) = pds.pd_of(caller) else {
+    let Some(cpd) = caps.pds.pd_of(caller) else {
         return;
     };
     // Cap ableiten (erbt die Rechte) und beim Aufrufer eintragen.
-    if let Ok(new_cap) = cspace.copy(src, Rights::RWX) {
-        pds.install_cap(cpd, sel4lake_abi::GRANT_RECV_SLOT, new_cap);
+    if let Ok(new_cap) = caps.cspace.copy(src, Rights::RWX) {
+        caps.pds.install_cap(cpd, sel4lake_abi::GRANT_RECV_SLOT, new_cap);
     }
 }

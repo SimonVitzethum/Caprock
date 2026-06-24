@@ -10,9 +10,11 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 CORES=8
-# Default großzügig: 8 Demo-Threads auf den Sekundärkernen + die core-0-Demo
-# teilen sich unter single-threaded QEMU-TCG eine Host-CPU -> alles emuliert länger.
-SECONDS_RUN="${1:-35}"
+# Default großzügig: viele Demo-Threads (inkl. SMP + isolierte VSpaces) teilen sich
+# unter single-threaded QEMU-TCG eine Host-CPU -> alles emuliert länger. Unter
+# schwerer Host-Last kann ein Lauf das Fenster überschreiten (kein Kernel-Hang;
+# der Manager druckt dann nach ~25 s eine `DBG pending`-Zeile).
+SECONDS_RUN="${1:-45}"
 ELF="build/target/aarch64-sel4lake/release/sel4lake-kernel.elf"
 
 echo "== build =="
@@ -50,6 +52,7 @@ check "reclaim : ALL PASS" "EL0-Kernel-Stack-Reclaim (>Pool-viele transiente EL0
 check "balance : ALL PASS" "Lastausgleich (lastbewusste Thread-Platzierung über die Kerne)"
 check "vspace  : ALL PASS" "Per-Prozess-VSpace (isolierte PD faultet bei Fremdzugriff, SAS-PD darf)"
 check "vmm     : ALL PASS" "Allgemeiner VMM (Frame-Caps + map/unmap-Syscalls + VSpace-Teardown)"
+check "shm     : ALL PASS" "Shared-Memory-IPC (ein Frame in zwei isolierte VSpaces, cap-gewährt)"
 online=$(echo "$OUT" | grep -c "online")
 [ "$online" -eq "$CORES" ] && echo "  PASS: alle $CORES Kerne online" || { echo "  FAIL: nur $online/$CORES Kerne online"; fail=1; }
 

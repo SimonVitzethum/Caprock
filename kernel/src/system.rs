@@ -38,7 +38,7 @@ extern "C" {
     static __user_kstacks_bottom: u8;
 }
 const USER_KSTACK_SIZE: usize = 0x4000; // 16 KiB (muss zur Linker-Reservierung passen)
-const USER_KSTACK_COUNT: usize = 12;
+const USER_KSTACK_COUNT: usize = 16;
 const KSTACK_NONE: u16 = u16::MAX;
 
 /// Free-List + Besitzer-Abbildung des EL0-Kernel-Stack-Pools. Beim Thread-Ende wird

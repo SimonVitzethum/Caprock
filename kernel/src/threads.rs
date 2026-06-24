@@ -96,8 +96,13 @@ const ISO_BADGE_RAN: u64 = 1 << 0; // isolierte PD lief + IPC ging (vor dem Faul
 const ISO_BADGE_READ: u64 = 1 << 1; // isolierte PD las X (DARF NIE kommen)
 const ISO_BADGE_TRUSTED: u64 = 1 << 2; // SAS-PD las X erfolgreich
 const ISO_BADGE_MAPPED: u64 = 1 << 3; // VMM-Probe: Frame gemappt + RW erfolgreich
+const ISO_BADGE_SHARED: u64 = 1 << 4; // Reader las den Wert des Writers via Shared Frame
 static ISO_MASK: AtomicU64 = AtomicU64::new(0); // gesammelte Badges
 static ISO_SECRET_ADDR: AtomicU64 = AtomicU64::new(0); // Adresse X (fremdes RAM)
+
+// Shared-Memory-IPC: zwei isolierte PDs teilen einen Frame F (in beide VSpaces
+// gemappt). Der Writer schreibt SHM_SECRET, der Reader liest es (nach Notification).
+const SHM_SECRET: u64 = 0x5A5A_1234_5678_9ABC;
 
 // Kern-übergreifende synchrone IPC: Client auf core 0 ruft (CALL) einen Server auf
 // core 2; Antwort (REPLY) geht zurück über die Kerngrenze. Beide Richtungen wecken
@@ -366,6 +371,37 @@ pub fn spawn_demo() {
         system::bind_pd(vmm_pd, vp);
     }
 
+    // Shared-Memory-IPC: zwei isolierte PDs teilen den Frame F (in BEIDE VSpaces
+    // gemappt, identity -> gleiche Adresse). Writer schreibt SHM_SECRET + signalisiert;
+    // Reader wartet, liest F und meldet Erfolg. Zero-Copy ueber die Isolationsgrenze,
+    // nur ueber cap-gewaehrten Frame + IPC; die VSpaces teilen sonst nichts.
+    let fframe = system::alloc(hal::mmu::ISO_REGION_SIZE, hal::mmu::ISO_REGION_SIZE).expect("shared F");
+    let fbase = fframe.region().base; // Adresse des Frames (identity-VA in beiden PDs)
+    let froot = system::cap_install(fframe).expect("F cap"); // EINE Cap fuer denselben Frame
+    let shmn = system::create_notification().expect("shm ntfn");
+    let shmnroot = system::install_notification_cap(shmn as u32, Rights::RWX).expect("shm ntfn cap");
+    // Writer-PD: Slot 0 = F-Cap, Slot 1 = shm-SIGNAL (Badge != 0, sonst ginge ein
+    // Signal vor dem WAIT des Readers verloren -> pending bliebe 0).
+    let w_f = system::cap_mint(froot, Rights::WRITE, 0).expect("w F");
+    let w_sig = system::cap_mint(shmnroot, Rights::WRITE, 1).expect("w sig");
+    let w_pd = system::create_pd().expect("shm writer pd");
+    system::install_pd_cap(w_pd, 0, w_f);
+    system::install_pd_cap(w_pd, 1, w_sig);
+    if let Some((wp, _)) = system::spawn_isolated(shm_writer as *const () as usize, fbase as usize, prio) {
+        system::bind_pd(w_pd, wp);
+    }
+    // Reader-PD: Slot 0 = F-Cap (derselbe Frame!), Slot 1 = shm-WAIT, Slot 2 = SIGNAL.
+    let r_f = system::cap_mint(froot, Rights::WRITE, 0).expect("r F");
+    let r_wait = system::cap_mint(shmnroot, Rights::READ, 0).expect("r wait");
+    let r_done = system::cap_mint(introot, Rights::WRITE, ISO_BADGE_SHARED).expect("r done");
+    let r_pd = system::create_pd().expect("shm reader pd");
+    system::install_pd_cap(r_pd, 0, r_f);
+    system::install_pd_cap(r_pd, 1, r_wait);
+    system::install_pd_cap(r_pd, 2, r_done);
+    if let Some((rp, _)) = system::spawn_isolated(shm_reader as *const () as usize, fbase as usize, prio) {
+        system::bind_pd(r_pd, rp);
+    }
+
     *RELOAD_INFO.lock() = Some(ReloadInfo { ep, v1, v1_pd, v2_pd });
 }
 
@@ -418,6 +454,7 @@ const _: () = assert!(
     sys::YIELD == 0
         && sys::EXIT == 6
         && sys::SIGNAL == 8
+        && sys::WAIT == 9
         && sys::PARK == 5
         && sys::MAP == 10
         && sys::UNMAP == 11
@@ -616,6 +653,73 @@ extern "C" fn vmm_probe(_arg: usize) -> ! {
             "ldr x11, [x9]",                // nach UNMAP lesen -> FAULT -> beendet
         "3:",
             "mov x0, #5",                   // sys::PARK
+            "svc #0",
+            "b 3b",
+            options(noreturn),
+        );
+    }
+}
+
+/// **Shared-Memory-Writer** (`.user_text`, isolierte VSpace). x0 = Adresse des
+/// geteilten Frames F. Mappt F (Slot 0 = Memory-Cap), schreibt `SHM_SECRET` hinein
+/// und signalisiert (Slot 1, shm-Notification), dass der Reader lesen darf. F ist in
+/// **beide** isolierte VSpaces gemappt (identity, gleiche Adresse) -> Zero-Copy über
+/// die Isolationsgrenze, ohne dass die VSpaces sonst etwas teilen.
+#[link_section = ".user_text"]
+extern "C" fn shm_writer(_arg: usize) -> ! {
+    // SAFETY: reiner EL0-User-Code; `str` nur auf den selbst gemappten Shared-Frame.
+    unsafe {
+        core::arch::asm!(
+            "mov x9, x0",
+            "mov x0, #10", // sys::MAP Slot 0 (Memory-Cap für F)
+            "mov x1, #0",
+            "svc #0",
+            "movz x10, #0x9ABC", // x10 = SHM_SECRET
+            "movk x10, #0x5678, lsl #16",
+            "movk x10, #0x1234, lsl #32",
+            "movk x10, #0x5A5A, lsl #48",
+            "str x10, [x9]", // in den geteilten Frame schreiben
+            "mov x0, #8",  // sys::SIGNAL Slot 1 (shm-Notification -> Reader wecken)
+            "mov x1, #1",
+            "svc #0",
+        "1:",
+            "mov x0, #5", // sys::PARK
+            "svc #0",
+            "b 1b",
+            options(noreturn),
+        );
+    }
+}
+
+/// **Shared-Memory-Reader** (`.user_text`, **andere** isolierte VSpace). x0 = F.
+/// Mappt F (Slot 0), wartet auf den Writer (Slot 1, `WAIT`), liest F und meldet bei
+/// `SHM_SECRET` Erfolg (Slot 2, Badge SHARED an den Kollektor). Beweis: der Reader
+/// hat den Wert des Writers über den geteilten Frame gelesen — die VSpaces sind
+/// sonst vollständig getrennt, Kommunikation lief über IPC + cap-gewährten Frame.
+#[link_section = ".user_text"]
+extern "C" fn shm_reader(_arg: usize) -> ! {
+    // SAFETY: reiner EL0-User-Code; `ldr` nur auf den selbst gemappten Shared-Frame.
+    unsafe {
+        core::arch::asm!(
+            "mov x9, x0",
+            "mov x0, #10", // sys::MAP Slot 0 (Memory-Cap für F)
+            "mov x1, #0",
+            "svc #0",
+            "mov x0, #9",  // sys::WAIT Slot 1 (blockiert bis Writer signalisiert)
+            "mov x1, #1",
+            "svc #0",
+            "ldr x11, [x9]", // geteilten Frame lesen
+            "movz x10, #0x9ABC",
+            "movk x10, #0x5678, lsl #16",
+            "movk x10, #0x1234, lsl #32",
+            "movk x10, #0x5A5A, lsl #48",
+            "cmp x11, x10",
+            "b.ne 3f",
+            "mov x0, #8",  // sys::SIGNAL Slot 2 (Badge SHARED an Kollektor)
+            "mov x1, #2",
+            "svc #0",
+        "3:",
+            "mov x0, #5", // sys::PARK
             "svc #0",
             "b 3b",
             options(noreturn),
@@ -978,7 +1082,33 @@ pub fn demo_report_then_idle() -> ! {
     let mut reloaded = false;
     let mut cs_reloaded = false;
     let mut reported = false;
+    let mut dbg_ticks = 0u32;
+    let mut dbg_printed = false;
     loop {
+        // Diagnose: falls der Bericht ausbleibt, nach ~25 s die ausstehenden
+        // Bedingungen einmalig ausgeben (zeigt, welcher Test haengt).
+        dbg_ticks += 1;
+        if !reported && !dbg_printed && dbg_ticks > 250 {
+            dbg_printed = true;
+            let m = ISO_MASK.load(Ordering::Relaxed);
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={}",
+                (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
+                FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
+                (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
+                KILLER_DONE.load(Ordering::Acquire) && REAPED.load(Ordering::Relaxed) >= 2,
+                PRODUCER_DONE.load(Ordering::Acquire) && NOTIF_COUNT.load(Ordering::Relaxed) >= NOTIF_ROUNDS,
+                XFER_DONE.load(Ordering::Acquire),
+                CS_DONE.load(Ordering::Acquire),
+                USER_RECV.load(Ordering::Relaxed) == USER_MAGIC && system::el0_syscall_seen(),
+                (1..NUM_CORES).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET) && XCORE_WOKEN.load(Ordering::Acquire),
+                XIPC_DONE.load(Ordering::Acquire),
+                RECLAIM_SPAWNED.load(Ordering::Relaxed) >= RECLAIM_TARGET,
+                BALANCED_SPAWNED.load(Ordering::Relaxed) >= BALANCED_TARGET,
+                (m & ISO_BADGE_RAN != 0) && (m & ISO_BADGE_TRUSTED != 0) && system::iso_faulted(),
+                (m & ISO_BADGE_MAPPED != 0) && system::iso_fault_count() >= 2,
+                m & ISO_BADGE_SHARED != 0,
+            );
+        }
         // Beendete Threads einsammeln (sicher: läuft auf dem Idle-Stack).
         let n = system::reap();
         if n > 0 {
@@ -1081,8 +1211,10 @@ fn all_done() -> bool {
     // VMM: die VMM-Probe mappte+beschrieb einen Frame (MAPPED) und faultete nach dem
     // UNMAP -> beide isolierten Proben (iso + vmm) faulteten => iso_fault_count >= 2.
     let vmm = (m & ISO_BADGE_MAPPED != 0) && system::iso_fault_count() >= 2;
+    // Shared-Memory-IPC: der Reader las den Wert des Writers via geteiltem Frame.
+    let shm = m & ISO_BADGE_SHARED != 0;
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
-        && reclaim && balanced && vspace && vmm
+        && reclaim && balanced && vspace && vmm && shm
 }
 
 fn report() {
@@ -1295,5 +1427,13 @@ fn report() {
     println!(
         "vmm     : {} (Frame-Caps + map/unmap-Syscalls + VSpace-Teardown)",
         if vmm_ok { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Shared-Memory-IPC: Reader las den Wert des Writers ueber den geteilten Frame.
+    let shared = m & ISO_BADGE_SHARED != 0;
+    println!("shm     : Reader las Writer-Wert via geteiltem Frame (zwei isol. VSpaces)={shared}");
+    println!(
+        "shm     : {} (Shared-Memory-IPC: ein Frame in zwei isolierte VSpaces, cap-gewaehrt)",
+        if shared { "ALL PASS" } else { "FAILURES" }
     );
 }

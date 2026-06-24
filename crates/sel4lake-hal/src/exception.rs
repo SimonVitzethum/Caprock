@@ -284,7 +284,10 @@ pub fn init_thread_frame(
 pub extern "C" fn handle_exception(frame: *mut TrapFrame, kind: u64) -> *mut TrapFrame {
     if is_irq(kind) {
         let intid = crate::gic::handle_irq();
-        if intid == Some(crate::timer::TIMER_INTID) {
+        // Timer-Tick oder Cross-Core-Reschedule-IPI -> neu einplanen.
+        if intid == Some(crate::timer::TIMER_INTID)
+            || intid == Some(crate::gic::IPI_RESCHED_INTID)
+        {
             return reschedule(frame);
         }
         return frame;

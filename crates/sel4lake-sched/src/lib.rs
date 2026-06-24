@@ -1,26 +1,35 @@
 #![no_std]
-//! Deterministischer Per-Kern-Scheduler (ADR 0005).
+//! Deterministischer **per-Kern-paralleler** Scheduler (ADR 0005).
 //!
-//! Phase 4: präemptiver **Round-Robin** je Kern, getrieben vom Timer-Tick.
-//! Jeder Kern hat eine eigene Run-Queue; Threads haben feste Kern-Affinität
-//! (keine automatische Migration). Ein Thread-Control-Block speichert lediglich
-//! den gesicherten Stack-Pointer (der volle Registerkontext liegt als TrapFrame
-//! auf dem Thread-Stack); der Kontextwechsel selbst ist ein reiner SP-Tausch im
-//! Trap-Pfad (siehe `sel4lake-hal::exception`).
+//! Jede `Scheduler`-Instanz verwaltet **genau einen Kern**: seine eigene
+//! TCB-Partition, Run-Queues (eine je Priorität), den laufenden Thread und seine
+//! Zombies. Der Kernel hält ein Array solcher Instanzen — eine je Kern, jede hinter
+//! einem **eigenen Lock** (`SpinLock`). Damit läuft der heiße Timer-Reschedule-Pfad
+//! jedes Kerns **lock-frei gegenüber den anderen Kernen** (echte Parallelität);
+//! kein globaler Scheduler-Lock mehr.
 //!
-//! Reine, sichere Index-Logik über feste Arrays — **kein `unsafe`** (der einzige
-//! unsafe-Anteil, das Anlegen des initialen TrapFrames, steckt gekapselt in
-//! `sel4lake-hal`).
+//! **TCB-Partitionierung:** Der globale Slot-Raum ist statisch auf die Kerne
+//! aufgeteilt — Kern `c` besitzt die Slots `[c*PER_CORE, (c+1)*PER_CORE)`. Eine
+//! [`ThreadId`] trägt den **globalen** Slot; daraus ist der besitzende Kern
+//! (`tid.core()`) ableitbar, ohne eine fremde Instanz zu sperren. Eine Instanz
+//! berührt ausschließlich ihre eigenen Threads; kern-übergreifendes Aufwecken läuft
+//! über das Sperren der Zielinstanz + einen Reschedule-IPI (Kernel-Schicht).
 //!
-//! Prioritäten/Bitmap (ADR 0005) sind als nächste Verfeinerung vorgesehen;
-//! Phase 4 schedult reines Round-Robin.
+//! Threads haben feste Kern-Affinität (keine automatische Migration). Der
+//! Kontextwechsel ist ein reiner SP-Tausch im Trap-Pfad (siehe
+//! `sel4lake-hal::exception`). Reine, sichere Index-Logik über feste Arrays —
+//! **kein `unsafe`** (das Anlegen des initialen TrapFrames steckt in der HAL).
 
 use sel4lake_hal::exception::init_thread_frame;
 
-const NTHREADS: usize = 64;
-const NUM_CORES: usize = 8;
+/// Kerne (eine Scheduler-Instanz je Kern).
+pub const NUM_CORES: usize = 8;
+/// TCB-Slots je Kern (Partitionsgröße).
+const PER_CORE: usize = 32;
+/// Globaler Slot-Raum.
+const NTHREADS: usize = NUM_CORES * PER_CORE;
 
-/// Thread-Handle (Slot-Index + Generation).
+/// Thread-Handle (globaler Slot-Index + Generation).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ThreadId {
     slot: usize,
@@ -39,14 +48,22 @@ impl ThreadId {
             gen: (raw >> 32) as u32,
         }
     }
-    /// Slot-Index (0..NTHREADS). Stabiler Index z. B. für per-Thread-Tabellen im
-    /// Kernel (etwa den Lazy-FP-Kontextpuffer).
+    /// Globaler Slot-Index (0..NTHREADS). Stabiler Index z. B. für per-Thread-
+    /// Tabellen im Kernel (etwa den Lazy-FP-Kontextpuffer).
     pub fn slot(self) -> usize {
         self.slot
     }
+    /// Der besitzende Kern dieses Threads (aus der statischen Partition).
+    pub fn core(self) -> usize {
+        self.slot / PER_CORE
+    }
+    /// Lokaler Index innerhalb der Kern-Partition.
+    fn local(self) -> usize {
+        self.slot % PER_CORE
+    }
 }
 
-/// Anzahl der Thread-Slots (Obergrenze für per-Thread-Tabellen im Kernel).
+/// Anzahl der globalen Thread-Slots (Obergrenze für per-Thread-Tabellen im Kernel).
 pub const MAX_THREADS: usize = NTHREADS;
 
 /// Anzahl Prioritätsstufen (höher = wichtiger; 0 = niedrigste).
@@ -58,8 +75,6 @@ struct Tcb {
     gen: u32,
     /// Gesicherter SP (Zeiger auf den TrapFrame), gültig wenn der Thread *nicht* läuft.
     sp: usize,
-    /// Kern, dem dieser Thread fest zugeordnet ist (Affinität).
-    core: usize,
     /// Priorität (0..NPRIO-1).
     priority: u8,
     /// True, wenn der Thread blockiert ist (nicht in der Ready-Queue).
@@ -74,7 +89,6 @@ impl Tcb {
         used: false,
         gen: 0,
         sp: 0,
-        core: 0,
         priority: 0,
         blocked: false,
         stack_base: 0,
@@ -89,10 +103,10 @@ struct Zombie {
     len: usize,
 }
 
-/// FIFO-Ringpuffer von Thread-Indizes.
+/// FIFO-Ringpuffer lokaler Thread-Indizes (0..PER_CORE).
 #[derive(Clone, Copy)]
 struct RunQueue {
-    buf: [usize; NTHREADS],
+    buf: [usize; PER_CORE],
     head: usize,
     tail: usize,
     count: usize,
@@ -100,16 +114,16 @@ struct RunQueue {
 
 impl RunQueue {
     const EMPTY: RunQueue = RunQueue {
-        buf: [0; NTHREADS],
+        buf: [0; PER_CORE],
         head: 0,
         tail: 0,
         count: 0,
     };
 
     fn enqueue(&mut self, tid: usize) {
-        if self.count < NTHREADS {
+        if self.count < PER_CORE {
             self.buf[self.tail] = tid;
-            self.tail = (self.tail + 1) % NTHREADS;
+            self.tail = (self.tail + 1) % PER_CORE;
             self.count += 1;
         }
     }
@@ -119,7 +133,7 @@ impl RunQueue {
             return None;
         }
         let tid = self.buf[self.head];
-        self.head = (self.head + 1) % NTHREADS;
+        self.head = (self.head + 1) % PER_CORE;
         self.count -= 1;
         Some(tid)
     }
@@ -137,30 +151,22 @@ impl RunQueue {
     }
 }
 
-#[derive(Clone, Copy)]
-struct CoreSched {
+/// Maximale Anzahl noch nicht eingesammelter (reaper-)Zombies je Kern.
+const NZOMBIES: usize = 16;
+
+/// Scheduler **eines Kerns**: TCB-Partition + Run-Queues + laufender Thread +
+/// Zombies. Im Kernel je Kern eine Instanz hinter eigenem Lock.
+pub struct Scheduler {
+    /// Eigene Kern-ID (gesetzt durch [`bind_core`](Self::bind_core)/`init_core`);
+    /// bestimmt den globalen Slot-Offset `core*PER_CORE`.
+    core: usize,
+    tcbs: [Tcb; PER_CORE],
+    /// Laufender Thread (lokaler Index) oder `None` (vor `init_core`).
     current: Option<usize>,
     /// Eine Ready-Queue je Priorität (Round-Robin innerhalb einer Priorität).
     queues: [RunQueue; NPRIO],
     /// Bit `p` gesetzt, wenn `queues[p]` nicht leer ist (O(1)-Auswahl der höchsten).
     bitmap: u32,
-}
-
-impl CoreSched {
-    const EMPTY: CoreSched = CoreSched {
-        current: None,
-        queues: [RunQueue::EMPTY; NPRIO],
-        bitmap: 0,
-    };
-}
-
-/// Maximale Anzahl noch nicht eingesammelter (reaper-)Zombies.
-const NZOMBIES: usize = 16;
-
-/// Globaler Scheduler-Zustand: eine TCB-Tabelle + Per-Kern-Run-Queues.
-pub struct Scheduler {
-    tcbs: [Tcb; NTHREADS],
-    cores: [CoreSched; NUM_CORES],
     zombies: [Option<Zombie>; NZOMBIES],
 }
 
@@ -173,23 +179,36 @@ impl Default for Scheduler {
 impl Scheduler {
     pub const fn new() -> Self {
         Self {
-            tcbs: [Tcb::EMPTY; NTHREADS],
-            cores: [CoreSched::EMPTY; NUM_CORES],
+            core: 0,
+            tcbs: [Tcb::EMPTY; PER_CORE],
+            current: None,
+            queues: [RunQueue::EMPTY; NPRIO],
+            bitmap: 0,
             zombies: [None; NZOMBIES],
         }
     }
 
+    /// Diese Instanz an Kern `core` binden (setzt den globalen Slot-Offset). Vom
+    /// Bootkern für **alle** Instanzen aufzurufen, bevor irgendwo Threads erzeugt
+    /// werden — auch für Kerne, deren `init_core` (Idle-Anlage) erst später auf dem
+    /// jeweiligen Kern läuft.
+    pub fn bind_core(&mut self, core: usize) {
+        self.core = core;
+    }
+
     /// Kern initialisieren: der gerade laufende Boot-Kontext wird zum Idle-Thread
-    /// (sein SP wird beim ersten Tick gesichert). Vor dem Aktivieren von IRQs
-    /// aufzurufen.
+    /// (sein SP wird beim ersten Tick gesichert). Auf dem jeweiligen Kern vor dem
+    /// Aktivieren von IRQs aufzurufen.
     pub fn init_core(&mut self, core: usize, priority: u8) -> Option<ThreadId> {
-        let idle = self.alloc_tcb(0, core, priority)?;
-        self.cores[core].current = Some(idle);
+        self.core = core;
+        let idle = self.alloc_tcb(0, priority)?;
+        self.current = Some(idle);
         Some(self.id(idle))
     }
 
-    /// Einen neuen Thread auf `core` mit `priority` erzeugen: initialen Kontext am
-    /// Stack-Top anlegen und in die Ready-Queue seiner Priorität einreihen.
+    /// Einen neuen Thread auf diesem Kern mit `priority` erzeugen: initialen Kontext
+    /// am Stack-Top anlegen und in die Ready-Queue seiner Priorität einreihen.
+    /// `core` muss dem gebundenen Kern dieser Instanz entsprechen.
     pub fn spawn(
         &mut self,
         core: usize,
@@ -199,16 +218,15 @@ impl Scheduler {
         stack_len: usize,
         priority: u8,
     ) -> Option<ThreadId> {
+        debug_assert_eq!(core, self.core);
         let sp = init_thread_frame(stack_base + stack_len, entry, arg, false, 0);
-        let t = self.alloc_tcb(sp, core, priority)?;
+        let t = self.alloc_tcb(sp, priority)?;
         self.tcbs[t].stack_base = stack_base;
         self.tcbs[t].stack_len = stack_len;
         self.enqueue_ready(t);
         Some(self.id(t))
     }
 
-    /// Einen **EL0-User-Thread** erzeugen: er läuft auf EL0 mit dem User-Stack
-    /// `[user_base, user_base+user_len)`; der TrapFrame liegt auf dem separaten,
     /// Einen EL0-User-Thread erzeugen: Der initiale Frame liegt auf dem EL1-only
     /// Kernel-Stack `[kstack_base, kstack_base+kstack_len)`, der Thread läuft auf
     /// EL0 mit dem User-Stack `[user_base, user_base+user_len)`.
@@ -230,8 +248,9 @@ impl Scheduler {
         user_len: usize,
         priority: u8,
     ) -> Option<ThreadId> {
+        debug_assert_eq!(core, self.core);
         let sp = init_thread_frame(kstack_base + kstack_len, entry, arg, true, user_base + user_len);
-        let t = self.alloc_tcb(sp, core, priority)?;
+        let t = self.alloc_tcb(sp, priority)?;
         self.tcbs[t].stack_base = user_base;
         self.tcbs[t].stack_len = user_len;
         self.enqueue_ready(t);
@@ -243,78 +262,81 @@ impl Scheduler {
     /// [`reap`](Self::reap) eingesammelt (der Thread läuft noch auf seinem Stack,
     /// daher nicht sofort freigeben). Gibt den nächsten Frame zurück.
     pub fn exit_current(&mut self, core: usize, _frame: usize) -> usize {
-        let cur = self.cores[core].current.expect("kein laufender Thread");
+        debug_assert_eq!(core, self.core);
+        let cur = self.current.expect("kein laufender Thread");
         self.record_zombie(cur);
         let next = self
-            .dequeue_highest(core)
+            .dequeue_highest()
             .expect("Idle-Thread sollte immer bereit sein");
-        self.cores[core].current = Some(next);
+        self.current = Some(next);
         self.tcbs[next].sp
     }
 
-    /// Einen *nicht laufenden* Thread (blockiert/geparkt) beenden. Sein Stack
-    /// wird als Zombie vorgemerkt (Freigabe per [`reap`](Self::reap)). Gibt
-    /// `true`, falls der Thread gültig und nicht der laufende war.
+    /// Einen *nicht laufenden* Thread (blockiert/geparkt) **dieses Kerns** beenden.
+    /// Sein Stack wird als Zombie vorgemerkt. Gibt `true`, falls der Thread gültig,
+    /// auf diesem Kern und nicht der laufende war.
     pub fn kill(&mut self, tid: ThreadId, core: usize) -> bool {
+        debug_assert_eq!(core, self.core);
         let Some(s) = self.resolve(tid) else {
             return false;
         };
-        if self.cores[core].current == Some(s) {
+        if self.current == Some(s) {
             return false; // laufenden Thread nicht über kill beenden (nutze exit)
         }
-        // Aus einer etwaigen Ready-Queue entfernen, dann als Zombie vormerken.
         self.remove_from_ready(s);
         self.record_zombie(s);
         true
     }
 
-    /// Einen Zombie einsammeln: TCB-Slot freigeben und die Stack-Region
+    /// Einen Zombie dieses Kerns einsammeln: TCB-Slot freigeben und die Stack-Region
     /// zurückgeben, damit der Aufrufer (Kernel) sie dem Allokator zurückgibt.
-    /// Wird aus einem sicheren Kontext (z. B. Idle-Thread) aufgerufen.
     pub fn reap(&mut self) -> Option<(usize, usize)> {
         let i = self.zombies.iter().position(|z| z.is_some())?;
         let z = self.zombies[i].take().unwrap();
         Some((z.base, z.len))
     }
 
-    /// Handle des aktuell laufenden Threads auf `core`.
+    /// Handle des aktuell laufenden Threads.
     pub fn current_id(&self, core: usize) -> ThreadId {
-        let cur = self.cores[core].current.expect("kein laufender Thread");
+        debug_assert_eq!(core, self.core);
+        let cur = self.current.expect("kein laufender Thread");
         self.id(cur)
     }
 
-    /// Gesicherter Frame eines (blockierten) Threads — für IPC-Nachrichtentransfer.
+    /// Gesicherter Frame eines (blockierten) Threads **dieses Kerns** — für den
+    /// IPC-Nachrichtentransfer. `None`, wenn der Thread nicht zu diesem Kern gehört.
     pub fn frame_of(&self, tid: ThreadId) -> Option<usize> {
         self.resolve(tid).map(|s| self.tcbs[s].sp)
     }
 
     /// Den laufenden Thread blockieren und zum nächsten *bereiten* Thread wechseln.
-    /// Gibt dessen Frame zurück.
     pub fn block_current(&mut self, core: usize, frame: usize) -> usize {
-        let cur = self.cores[core].current.expect("kein laufender Thread");
+        debug_assert_eq!(core, self.core);
+        let cur = self.current.expect("kein laufender Thread");
         self.tcbs[cur].sp = frame;
         self.tcbs[cur].blocked = true;
         let next = self
-            .dequeue_highest(core)
+            .dequeue_highest()
             .expect("Idle-Thread sollte immer bereit sein");
-        self.cores[core].current = Some(next);
+        self.current = Some(next);
         self.tcbs[next].sp
     }
 
-    /// Den laufenden Thread blockieren und **direkt** zu `target` wechseln (das
-    /// zuvor außerhalb der Ready-Queue blockiert war, z. B. ein IPC-Partner).
-    /// Niedrige Latenz (Rendezvous-Fastpath). Gibt `target`s Frame zurück.
+    /// Den laufenden Thread blockieren und **direkt** zu `target` (zuvor blockiert,
+    /// z. B. ein IPC-Partner auf demselben Kern) wechseln. Rendezvous-Fastpath.
     pub fn switch_to(&mut self, core: usize, frame: usize, target: ThreadId) -> usize {
-        let cur = self.cores[core].current.expect("kein laufender Thread");
+        debug_assert_eq!(core, self.core);
+        let cur = self.current.expect("kein laufender Thread");
         self.tcbs[cur].sp = frame;
         self.tcbs[cur].blocked = true;
-        let t = self.resolve(target).expect("Zielthread ungültig");
+        let t = self.resolve(target).expect("Zielthread ungültig/fremder Kern");
         self.tcbs[t].blocked = false;
-        self.cores[core].current = Some(t);
+        self.current = Some(t);
         self.tcbs[t].sp
     }
 
-    /// Einen blockierten Thread wieder bereit machen (in die Run-Queue seines Kerns).
+    /// Einen blockierten Thread **dieses Kerns** wieder bereit machen. Kern-
+    /// übergreifend ruft der Kernel dies auf der Zielinstanz auf (+ Reschedule-IPI).
     pub fn unblock(&mut self, tid: ThreadId) {
         if let Some(s) = self.resolve(tid) {
             self.tcbs[s].blocked = false;
@@ -323,23 +345,28 @@ impl Scheduler {
     }
 
     fn resolve(&self, tid: ThreadId) -> Option<usize> {
-        if tid.slot < NTHREADS && self.tcbs[tid.slot].used && self.tcbs[tid.slot].gen == tid.gen {
-            Some(tid.slot)
+        if tid.core() != self.core {
+            return None;
+        }
+        let local = tid.local();
+        if self.tcbs[local].used && self.tcbs[local].gen == tid.gen {
+            Some(local)
         } else {
             None
         }
     }
 
-    /// Timer-Tick auf `core`: aktuellen Frame sichern, rundlaufend den nächsten
-    /// Thread wählen und dessen Frame zur Wiederherstellung zurückgeben.
+    /// Timer-Tick (oder Reschedule-IPI): aktuellen Frame sichern, rundlaufend den
+    /// nächsten Thread wählen und dessen Frame zur Wiederherstellung zurückgeben.
     pub fn on_tick(&mut self, core: usize, frame: usize) -> usize {
-        if let Some(cur) = self.cores[core].current {
+        debug_assert_eq!(core, self.core);
+        if let Some(cur) = self.current {
             self.tcbs[cur].sp = frame;
             self.enqueue_ready(cur);
         }
-        match self.dequeue_highest(core) {
+        match self.dequeue_highest() {
             Some(next) => {
-                self.cores[core].current = Some(next);
+                self.current = Some(next);
                 self.tcbs[next].sp
             }
             None => frame, // nichts lauffähig (sollte nicht vorkommen: Idle ist immer dabei)
@@ -348,32 +375,30 @@ impl Scheduler {
 
     // --- intern ---
 
-    /// Einen Thread in die Ready-Queue seiner Priorität einreihen + Bitmap setzen.
-    fn enqueue_ready(&mut self, tid: usize) {
-        let core = self.tcbs[tid].core;
-        let p = self.tcbs[tid].priority as usize;
-        self.cores[core].queues[p].enqueue(tid);
-        self.cores[core].bitmap |= 1 << p;
+    /// Einen Thread (lokaler Index) in die Ready-Queue seiner Priorität einreihen.
+    fn enqueue_ready(&mut self, local: usize) {
+        let p = self.tcbs[local].priority as usize;
+        self.queues[p].enqueue(local);
+        self.bitmap |= 1 << p;
     }
 
     /// Einen bereiten Thread aus seiner Prioritäts-Queue entfernen (für `kill`).
-    fn remove_from_ready(&mut self, slot: usize) {
-        let core = self.tcbs[slot].core;
-        let p = self.tcbs[slot].priority as usize;
-        self.cores[core].queues[p].remove(slot);
-        if self.cores[core].queues[p].count == 0 {
-            self.cores[core].bitmap &= !(1 << p);
+    fn remove_from_ready(&mut self, local: usize) {
+        let p = self.tcbs[local].priority as usize;
+        self.queues[p].remove(local);
+        if self.queues[p].count == 0 {
+            self.bitmap &= !(1 << p);
         }
     }
 
-    /// Einen beendeten Thread aufzeichnen: TCB-Slot sofort freigeben (liegt im
-    /// Scheduler-Array), Stack-Region zum späteren Freigeben (`reap`) vormerken.
-    fn record_zombie(&mut self, slot: usize) {
-        let base = self.tcbs[slot].stack_base;
-        let len = self.tcbs[slot].stack_len;
-        let gen = self.tcbs[slot].gen.wrapping_add(1);
-        self.tcbs[slot] = Tcb::EMPTY;
-        self.tcbs[slot].gen = gen;
+    /// Einen beendeten Thread aufzeichnen: TCB-Slot sofort freigeben (Generation
+    /// erhöhen), Stack-Region zum späteren Freigeben (`reap`) vormerken.
+    fn record_zombie(&mut self, local: usize) {
+        let base = self.tcbs[local].stack_base;
+        let len = self.tcbs[local].stack_len;
+        let gen = self.tcbs[local].gen.wrapping_add(1);
+        self.tcbs[local] = Tcb::EMPTY;
+        self.tcbs[local].gen = gen;
         if len > 0 {
             if let Some(z) = self.zombies.iter_mut().find(|z| z.is_none()) {
                 *z = Some(Zombie { base, len });
@@ -382,27 +407,25 @@ impl Scheduler {
     }
 
     /// Den nächsten Thread der höchsten nichtleeren Priorität entnehmen (O(1)).
-    fn dequeue_highest(&mut self, core: usize) -> Option<usize> {
-        let bm = self.cores[core].bitmap;
-        if bm == 0 {
+    fn dequeue_highest(&mut self) -> Option<usize> {
+        if self.bitmap == 0 {
             return None;
         }
-        let p = (31 - bm.leading_zeros()) as usize; // höchstes gesetztes Bit
-        let tid = self.cores[core].queues[p].dequeue();
-        if self.cores[core].queues[p].count == 0 {
-            self.cores[core].bitmap &= !(1 << p);
+        let p = (31 - self.bitmap.leading_zeros()) as usize; // höchstes gesetztes Bit
+        let tid = self.queues[p].dequeue();
+        if self.queues[p].count == 0 {
+            self.bitmap &= !(1 << p);
         }
         tid
     }
 
-    fn alloc_tcb(&mut self, sp: usize, core: usize, priority: u8) -> Option<usize> {
+    fn alloc_tcb(&mut self, sp: usize, priority: u8) -> Option<usize> {
         let i = self.tcbs.iter().position(|t| !t.used)?;
         let gen = self.tcbs[i].gen;
         self.tcbs[i] = Tcb {
             used: true,
             gen,
             sp,
-            core,
             priority,
             blocked: false,
             stack_base: 0,
@@ -411,10 +434,11 @@ impl Scheduler {
         Some(i)
     }
 
-    fn id(&self, slot: usize) -> ThreadId {
+    /// Globale `ThreadId` aus einem lokalen Slot-Index dieses Kerns.
+    fn id(&self, local: usize) -> ThreadId {
         ThreadId {
-            slot,
-            gen: self.tcbs[slot].gen,
+            slot: self.core * PER_CORE + local,
+            gen: self.tcbs[local].gen,
         }
     }
 }

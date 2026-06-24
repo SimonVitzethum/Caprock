@@ -99,6 +99,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     // Phase 4–6: Scheduler + cap-gesicherte IPC + Protection Domains.
     system::set_hooks(); // Reschedule- + Syscall-Hook registrieren (vor IRQs)
+    system::bind_cores(); // alle per-Kern-Scheduler an ihre Kern-ID binden (vor spawn)
     system::init_core(); // Boot-Kontext von core 0 wird Idle-Thread
     threads::spawn_demo(); // 2 PDs (Client/Server) + 3 Worker auf core 0
     println!("sched   : Round-Robin + cap-gesicherte IPC (2 PDs + 3 Worker + Idle)");

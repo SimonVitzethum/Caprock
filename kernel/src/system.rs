@@ -1,14 +1,18 @@
-//! Kernzustand hinter **zwei** Locks: dem Scheduler-Lock (`SCHED`) und dem
-//! Ressourcen-Lock (`RES` = Allokator, Capability-Space, Endpoints,
-//! Notifications, Protection Domains) — plus die Trap-Hooks.
+//! Kernzustand hinter **per-Kern-Scheduler-Locks** (`SCHEDS[core]`, je Kern eine
+//! Instanz mit eigener TCB-Partition) und dem **einen** Ressourcen-Lock (`RES` =
+//! Allokator, Capability-Space, Endpoints, Notifications, Protection Domains) —
+//! plus die Trap-Hooks.
 //!
-//! Trennung der Granularität (Per-Kern-Locks, Teil 1): Der heiße
-//! Timer-Reschedule-Pfad sperrt **nur** `SCHED` und blockiert damit keine reinen
-//! Ressourcen-Operationen (Cap-/Speicher-/PD-Verwaltung) auf anderen Kernen.
-//! Operationen, die beides brauchen (IPC, spawn, reap), sperren in **fester
-//! Reihenfolge `RES` vor `SCHED`** — kein Pfad sperrt `SCHED` vor `RES`, daher
-//! deadlockfrei. (Echte per-Kern-*parallele* Scheduler-Instanzen sind der nächste
-//! Schritt; sie brauchen per-Kern-TCB-Partitionierung + Cross-Core-IPI-Unblock.)
+//! **Echte per-Kern-parallele Einplanung:** Der heiße Timer-/IPI-Reschedule-Pfad
+//! sperrt nur `SCHEDS[core]` des eigenen Kerns — Kerne planen gleichzeitig ein,
+//! ohne sich gegenseitig zu blockieren. Kern-übergreifendes Aufwecken
+//! ([`wake_remote`]) sperrt die **Ziel**instanz und schickt einen Reschedule-IPI.
+//!
+//! **Lock-Ordnung:** `RES` vor `SCHEDS[*]`, und `SCHEDS[*]` vor `FP_STATES`. Der
+//! reine Reschedule-Pfad nimmt nur `SCHEDS[core]` (+ atomares `FP_OWNER`), wartet
+//! also nie auf einen anderen Lock und kann an keinem Deadlock-Zyklus teilnehmen.
+//! IPC sperrt `RES` dann `SCHEDS[core]` (kern-lokale Endpoint-Teilnehmer). Kein
+//! Pfad nimmt zwei verschiedene `SCHEDS[*]` gleichzeitig.
 
 use sel4lake_cap::{CapError, CapInfo, CapPtr, CapSpace};
 use sel4lake_hal::{self as hal, exception::TrapFrame, fp::FpState, println};
@@ -69,9 +73,14 @@ struct Resources {
     pds: PdTable,
 }
 
-/// Scheduler-Lock (heißer Pfad; getrennt von den Ressourcen).
-static SCHED: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
-/// Ressourcen-Lock. **Lock-Ordnung: RES vor SCHED.**
+/// **Per-Kern** Scheduler-Instanzen, jede hinter eigenem Lock. Der heiße
+/// Timer-/IPI-Reschedule-Pfad sperrt nur `SCHEDS[core]` des eigenen Kerns -> echte
+/// parallele Einplanung ohne globalen Lock. Kern-übergreifend (z. B. `wake_remote`)
+/// sperrt der Kernel die **Ziel**instanz und schickt einen Reschedule-IPI.
+#[allow(clippy::declare_interior_mutable_const)]
+static SCHEDS: [SpinLock<Scheduler>; NUM_CORES] =
+    [const { SpinLock::new(Scheduler::new()) }; NUM_CORES];
+/// Ressourcen-Lock. **Lock-Ordnung: RES vor SCHEDS[*].**
 static RES: SpinLock<Resources> = SpinLock::new(Resources {
     phys: PhysAllocator::new(),
     cspace: CapSpace::new(),
@@ -84,8 +93,8 @@ static RES: SpinLock<Resources> = SpinLock::new(Resources {
 
 fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
     let core = hal::cpu::core_id();
-    // Heißer Pfad: nur der Scheduler-Lock.
-    let mut sched = SCHED.lock();
+    // Heißer Pfad: nur der Scheduler-Lock DIESES Kerns (parallel zu anderen Kernen).
+    let mut sched = SCHEDS[core].lock();
     let next = sched.on_tick(core, frame as usize);
     sync_fp_trap(core, &sched);
     next as *mut TrapFrame
@@ -96,9 +105,10 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
     if hal::exception::frame_from_el0(frame as usize) {
         EL0_SYSCALL_SEEN.store(true, Ordering::Relaxed);
     }
-    // Lock-Ordnung RES vor SCHED.
+    // Lock-Ordnung RES vor SCHEDS[core]. IPC ist kern-lokal (Endpoint-Teilnehmer
+    // liegen auf demselben Kern); daher genügt die Scheduler-Instanz dieses Kerns.
     let mut res = RES.lock();
-    let mut sched = SCHED.lock();
+    let mut sched = SCHEDS[core].lock();
     let r = &mut *res;
     let next = sel4lake_microkit::dispatch(
         frame as usize,
@@ -131,7 +141,7 @@ fn sync_fp_trap(core: usize, sched: &Scheduler) {
 /// Instruktion, jetzt mit aktivem FP. Hält SCHED (current_id) und FP_STATES.
 fn fp_trap(frame: *mut TrapFrame) -> *mut TrapFrame {
     let core = hal::cpu::core_id();
-    let sched = SCHED.lock();
+    let sched = SCHEDS[core].lock();
     let cur_id = sched.current_id(core);
     let cur = cur_id.to_raw();
     let cur_slot = cur_id.slot();
@@ -181,7 +191,7 @@ fn el0_fault(frame: *mut TrapFrame, esr: u64, far: u64) -> *mut TrapFrame {
     let core = hal::cpu::core_id();
     let ec = (esr >> 26) & 0x3f;
     EL0_FAULTS.fetch_add(1, Ordering::Relaxed);
-    let mut sched = SCHED.lock();
+    let mut sched = SCHEDS[core].lock();
     let tid = sched.current_id(core).to_raw();
     println!(
         "el0-trap: User-Thread {tid:#x} faultete (EC={ec:#04x} FAR={far:#018x}) -> beendet, Kernel laeuft weiter"
@@ -211,10 +221,20 @@ pub fn init_mem(free_base: u64, ram_end: u64) {
     RES.lock().phys.add_region(free_base, ram_end - free_base);
 }
 
+/// **Alle** per-Kern-Scheduler-Instanzen an ihre Kern-ID binden. Vom Bootkern
+/// **einmalig vor** dem Erzeugen irgendwelcher Threads aufzurufen — damit der
+/// Bootkern Threads auf noch nicht gestartete Kerne einplanen kann
+/// ([`spawn_on_core`]), bevor deren `init_core` (Idle-Anlage) dort läuft.
+pub fn bind_cores() {
+    for (c, s) in SCHEDS.iter().enumerate() {
+        s.lock().bind_core(c);
+    }
+}
+
 /// Boot-Kontext des aufrufenden Kerns als Idle-Thread registrieren (vor IRQs).
 pub fn init_core() {
     let core = hal::cpu::core_id();
-    SCHED.lock().init_core(core, IDLE_PRIO);
+    SCHEDS[core].lock().init_core(core, IDLE_PRIO);
 }
 
 // --- Allokator (RES) ---
@@ -278,15 +298,21 @@ pub fn install_notification_cap(ntfn: u32, rights: Rights) -> Result<CapPtr, Cap
 // --- Threads / Protection Domains ---
 
 /// Einen Thread mit Priorität `prio` auf dem aktuellen Kern erzeugen (Stack aus
-/// dem Allokator). Lock-Ordnung RES vor SCHED.
+/// dem Allokator). Lock-Ordnung RES vor SCHEDS[core].
 pub fn spawn(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
-    let core = hal::cpu::core_id();
+    spawn_on_core(hal::cpu::core_id(), entry, arg, prio)
+}
+
+/// Wie [`spawn`], aber auf einem **bestimmten** Kern `core` (z. B. vom Bootkern aus,
+/// um Arbeit über die Kerne zu verteilen). Der Zielkern muss vorab via
+/// [`bind_cores`] gebunden sein. Lock-Ordnung RES vor SCHEDS[core].
+pub fn spawn_on_core(core: usize, entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
     let mut res = RES.lock();
     let (base, len) = {
         let stack = res.phys.alloc(STACK_SIZE, 16)?;
         (stack.base() as usize, stack.len() as usize)
     };
-    let mut sched = SCHED.lock();
+    let mut sched = SCHEDS[core].lock();
     let tid = sched.spawn(core, entry, arg, base, len, prio)?;
     fp_reset_slot(tid.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
     Some(tid)
@@ -307,10 +333,22 @@ pub fn spawn_user(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
         let s = res.phys.alloc(STACK_SIZE, 16)?;
         (s.base() as usize, s.len() as usize)
     };
-    let mut sched = SCHED.lock();
+    let mut sched = SCHEDS[core].lock();
     let tid = sched.spawn_user(core, entry, arg, kbase, USER_KSTACK_SIZE, user_base, user_len, prio)?;
     fp_reset_slot(tid.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
     Some(tid)
+}
+
+/// Einen blockierten/geparkten Thread `tid` auf **seinem** (ggf. fremden) Kern
+/// aufwecken: die Zielinstanz sperren, ihn bereit machen und — falls es ein
+/// anderer Kern ist — einen Reschedule-IPI schicken, damit der Zielkern ihn
+/// zeitnah einplant. Das ist der Cross-Core-Aufweck-Primitive.
+pub fn wake_remote(tid: ThreadId) {
+    let target = tid.core();
+    SCHEDS[target].lock().unblock(tid);
+    if target != hal::cpu::core_id() {
+        hal::gic::send_sgi(target, hal::gic::IPI_RESCHED_INTID);
+    }
 }
 
 /// Wurde jemals ein Syscall von EL0 (echter User-Thread) ausgeführt?
@@ -323,11 +361,12 @@ pub fn install_tcb_cap(tid: ThreadId, rights: Rights) -> Result<CapPtr, CapError
     RES.lock().cspace.install_tcb(tid.to_raw(), rights)
 }
 
-/// Beendete Threads einsammeln: TCB-Slots freigeben und Stacks an den Allokator
-/// zurückgeben (aus dem Idle-Thread). Lock-Ordnung RES vor SCHED.
+/// Beendete Threads **dieses Kerns** einsammeln: TCB-Slots freigeben und Stacks an
+/// den Allokator zurückgeben (aus dem Idle-Thread). Lock-Ordnung RES vor SCHEDS[core].
 pub fn reap() -> usize {
+    let core = hal::cpu::core_id();
     let mut res = RES.lock();
-    let mut sched = SCHED.lock();
+    let mut sched = SCHEDS[core].lock();
     let mut n = 0;
     while let Some((base, len)) = sched.reap() {
         res.phys.free_region(PhysRegion::new(base as u64, len as u64));

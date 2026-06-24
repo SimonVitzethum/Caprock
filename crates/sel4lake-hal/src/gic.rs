@@ -12,6 +12,10 @@ const GICC_BASE: usize = 0x0801_0000;
 
 const GICD_CTLR: usize = 0x000;
 const GICD_ISENABLER: usize = 0x100; // write-1-to-set, je Bit ein INTID
+const GICD_SGIR: usize = 0xf00; // Software Generated Interrupt (IPI auslösen)
+
+/// SGI-INTID für den Cross-Core-Reschedule-IPI (SGIs belegen INTID 0..15).
+pub const IPI_RESCHED_INTID: u32 = 0;
 
 const GICC_CTLR: usize = 0x000;
 const GICC_PMR: usize = 0x004; // Priority Mask
@@ -53,6 +57,14 @@ pub fn enable_intid(intid: u32) {
     let reg = (intid / 32) as usize;
     let bit = intid % 32;
     gicd_write(GICD_ISENABLER + 4 * reg, 1 << bit);
+}
+
+/// Einen Software-generierten Interrupt (SGI/IPI) `intid` (0..15) an genau einen
+/// Zielkern `target_core` (0..7) senden. GICv2 `GICD_SGIR`: TargetListFilter=0b00
+/// (Liste benutzen), CPUTargetList = `1<<target_core`, SGIINTID = `intid`.
+pub fn send_sgi(target_core: usize, intid: u32) {
+    let val = ((1u32 << (16 + (target_core & 0x7))) | (intid & 0xf)) as u32;
+    gicd_write(GICD_SGIR, val);
 }
 
 /// IRQ aus dem Exception-Dispatch behandeln: acknowledgen, zuordnen, EOI.

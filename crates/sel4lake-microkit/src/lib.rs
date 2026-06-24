@@ -257,6 +257,23 @@ pub fn dispatch(
             frame_set_reg(frame, reg::SYSNO_RESULT, if ok { result::OK } else { result::ERR_BADCAP });
             frame
         }
+        sys::MAP | sys::UNMAP => {
+            // Frame über eine Memory-Cap in die eigene VSpace mappen/entfernen.
+            let ObjectKind::Memory(region) = kind else {
+                return deny(result::ERR_BADCAP);
+            };
+            if !rights.contains(Rights::WRITE) {
+                return deny(result::ERR_RIGHTS);
+            }
+            drop(caps_guard);
+            let ok = if nr == sys::MAP {
+                ops.map_frame(thread, region.base, region.len)
+            } else {
+                ops.unmap_frame(thread, region.base, region.len)
+            };
+            frame_set_reg(frame, reg::SYSNO_RESULT, if ok { result::OK } else { result::ERR_BADCAP });
+            frame
+        }
         _ => deny(result::ERR_BADSYS),
     }
 }

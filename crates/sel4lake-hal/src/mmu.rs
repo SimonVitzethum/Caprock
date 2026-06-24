@@ -320,33 +320,26 @@ fn user_block(addr: u64) -> u64 {
     addr | AF | SH_INNER | ATTR_NORMAL | AP_RW_EL0 | PXN | UXN | NG | BLOCK_DESC
 }
 
-/// Eine **isolierte VSpace** in zwei frische 4-KiB-Frames bauen (`l1_phys` = Wurzel,
-/// `l2_phys` = L2 für GiB 1). Gemappt wird: Device (EL1-only), das Kernelimage über
-/// die **geteilte** Kernel-L3 (inkl. `.user_text` EL0-RX), das restliche RAM
-/// **EL1-only** (Kernel sieht alles, EL0 nicht) und **genau** die User-Region
-/// `[user_base, user_base+user_len)` als EL0-RW. `user_base` muss 2-MiB-ausgerichtet
-/// und die Region ⊆ GiB 1 sein. Der Aufrufer läuft in der globalen Map (Identity),
-/// daher sind `l1_phys`/`l2_phys` direkt beschreibbar.
-pub fn build_isolated_vspace(l1_phys: u64, l2_phys: u64, user_base: u64, user_len: u64) {
-    // SAFETY: l1_phys/l2_phys sind frisch allozierte, 4-KiB-ausgerichtete RAM-Frames,
-    // in der globalen Identity-Map gültig + beschreibbar. Genau zwei Tabellen à 512
-    // Deskriptoren werden initialisiert. MMU-Tabellen-Domäne.
+/// Die **Basis** einer isolierten VSpace in zwei frische 4-KiB-Frames bauen
+/// (`l1_phys` = Wurzel, `l2_phys` = L2 für GiB 1): Device (EL1-only), das Kernelimage
+/// über die **geteilte** Kernel-L3 (inkl. `.user_text` EL0-RX) und alles RAM
+/// **EL1-only** (Kernel sieht alles, EL0 nichts). User-Frames werden erst über
+/// [`vspace_map_block`] hinzugefügt. Der Aufrufer läuft in der globalen Map
+/// (Identity), daher sind `l1_phys`/`l2_phys` direkt beschreibbar.
+pub fn vspace_create_base(l1_phys: u64, l2_phys: u64) {
+    // SAFETY: frisch allozierte, 4-KiB-ausgerichtete RAM-Frames, in der globalen
+    // Identity-Map gültig + beschreibbar. Genau zwei Tabellen werden initialisiert.
     let l1 = unsafe { core::slice::from_raw_parts_mut(l1_phys as *mut u64, 512) };
     let l2 = unsafe { core::slice::from_raw_parts_mut(l2_phys as *mut u64, 512) };
 
-    // L2 (GiB 1): [0] -> gemeinsame Kernel-L3 (Kernelimage + .user_text); die
-    // User-Region als EL0-RW (nG); alles andere EL1-only (Kernel-Sicht).
+    // L2 (GiB 1): [0] -> gemeinsame Kernel-L3; alles andere EL1-only (kein EL0).
     for (i, e) in l2.iter_mut().enumerate() {
-        let addr = RAM_BASE + i as u64 * TWO_MIB;
         *e = if i == 0 {
             table_desc(table_phys(&L3_TABLE))
-        } else if addr >= user_base && addr < user_base + user_len {
-            user_block(addr)
         } else {
-            kernel_block(addr)
+            kernel_block(RAM_BASE + i as u64 * TWO_MIB)
         };
     }
-
     // L1: [0] Device, [1] -> L2 (GiB 1), [2..=8] restliches RAM EL1-only, Rest leer.
     for e in l1.iter_mut() {
         *e = 0;
@@ -356,7 +349,58 @@ pub fn build_isolated_vspace(l1_phys: u64, l2_phys: u64, user_base: u64, user_le
     for (i, slot) in l1.iter_mut().enumerate().take(9).skip(2) {
         *slot = kernel_block(i as u64 * ONE_GIB);
     }
-
-    // Tabellen-Schreibzugriffe vor dem ersten Walk sichtbar machen.
     cpu::dsb_sy();
+}
+
+/// Index eines 2-MiB-Blocks in der GiB-1-L2 für die physische Adresse `phys`.
+/// `None`, wenn `phys` nicht in `[USER_RAM_MIN, GIB1_END)` 2-MiB-ausgerichtet liegt.
+fn l2_block_index(phys: u64) -> Option<usize> {
+    if phys < USER_RAM_MIN || phys >= GIB1_END || phys % TWO_MIB != 0 {
+        return None;
+    }
+    Some(((phys - RAM_BASE) / TWO_MIB) as usize)
+}
+
+/// Einen 2-MiB-Frame `phys` als **EL0-RW** (nG) in die VSpace mit GiB-1-Tabelle
+/// `l2_phys` mappen (identity). Gibt `false` bei ungültiger/unausgerichteter Adresse.
+/// Der Aufrufer muss anschließend die ASID flushen ([`flush_asid`]).
+pub fn vspace_map_block(l2_phys: u64, phys: u64) -> bool {
+    let Some(idx) = l2_block_index(phys) else {
+        return false;
+    };
+    // SAFETY: `l2_phys` ist eine gültige, in der globalen Map beschreibbare L2-Tabelle.
+    let l2 = unsafe { core::slice::from_raw_parts_mut(l2_phys as *mut u64, 512) };
+    l2[idx] = user_block(phys);
+    cpu::dsb_sy();
+    true
+}
+
+/// Einen zuvor gemappten 2-MiB-Frame `phys` wieder auf **EL1-only** zurücksetzen
+/// (EL0 kann nicht mehr darauf zugreifen). Der Aufrufer muss die ASID flushen.
+pub fn vspace_unmap_block(l2_phys: u64, phys: u64) -> bool {
+    let Some(idx) = l2_block_index(phys) else {
+        return false;
+    };
+    // SAFETY: wie `vspace_map_block`.
+    let l2 = unsafe { core::slice::from_raw_parts_mut(l2_phys as *mut u64, 512) };
+    l2[idx] = kernel_block(phys);
+    cpu::dsb_sy();
+    true
+}
+
+/// TLB-Einträge einer ASID invalidieren (nach map/unmap bzw. VSpace-Teardown).
+/// Global getaggte Kernel-/Code-Einträge bleiben gültig.
+pub fn flush_asid(asid: u16) {
+    let arg = (asid as u64) << 48;
+    // SAFETY: TLB-Invalidate nach ASID; reine MMU-Wartung + Barrieren.
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi aside1, {a}",
+            "dsb ish",
+            "isb",
+            a = in(reg) arg,
+            options(nostack, preserves_flags),
+        );
+    }
 }

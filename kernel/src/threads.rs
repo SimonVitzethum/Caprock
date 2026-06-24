@@ -95,6 +95,7 @@ const ISO_SECRET: u64 = 0x5E_C4E7_5E_C4E7;
 const ISO_BADGE_RAN: u64 = 1 << 0; // isolierte PD lief + IPC ging (vor dem Fault)
 const ISO_BADGE_READ: u64 = 1 << 1; // isolierte PD las X (DARF NIE kommen)
 const ISO_BADGE_TRUSTED: u64 = 1 << 2; // SAS-PD las X erfolgreich
+const ISO_BADGE_MAPPED: u64 = 1 << 3; // VMM-Probe: Frame gemappt + RW erfolgreich
 static ISO_MASK: AtomicU64 = AtomicU64::new(0); // gesammelte Badges
 static ISO_SECRET_ADDR: AtomicU64 = AtomicU64::new(0); // Adresse X (fremdes RAM)
 
@@ -351,6 +352,20 @@ pub fn spawn_demo() {
         system::bind_pd(i_pd, ip);
     }
 
+    // Allgemeiner VMM: eine isolierte PD mappt/entmappt einen Frame G per Syscall
+    // (cap-gated). Slot 0 = Memory-Cap fuer G (2 MiB), Slot 1 = SIGNAL-Cap.
+    let gframe = system::alloc(hal::mmu::ISO_REGION_SIZE, hal::mmu::ISO_REGION_SIZE).expect("g frame");
+    let gbase = gframe.region().base;
+    let groot = system::cap_install(gframe).expect("g cap");
+    let gmem = system::cap_mint(groot, Rights::WRITE, 0).expect("g mem cap");
+    let vmm_sig = system::cap_mint(introot, Rights::WRITE, ISO_BADGE_MAPPED).expect("vmm sig");
+    let vmm_pd = system::create_pd().expect("vmm pd");
+    system::install_pd_cap(vmm_pd, 0, gmem); // Slot 0 = Memory-Cap (MAP/UNMAP)
+    system::install_pd_cap(vmm_pd, 1, vmm_sig); // Slot 1 = SIGNAL (Badge MAPPED)
+    if let Some((vp, _)) = system::spawn_isolated(vmm_probe as *const () as usize, gbase as usize, prio) {
+        system::bind_pd(vmm_pd, vp);
+    }
+
     *RELOAD_INFO.lock() = Some(ReloadInfo { ep, v1, v1_pd, v2_pd });
 }
 
@@ -399,7 +414,14 @@ extern "C" fn worker(arg: usize) -> ! {
 
 // Die EL0-User-Programme kodieren die Syscall-Nummern als Immediates; hier
 // absichern, dass sie zur ABI passen.
-const _: () = assert!(sys::YIELD == 0 && sys::EXIT == 6 && sys::SIGNAL == 8 && sys::PARK == 5);
+const _: () = assert!(
+    sys::YIELD == 0
+        && sys::EXIT == 6
+        && sys::SIGNAL == 8
+        && sys::PARK == 5
+        && sys::MAP == 10
+        && sys::UNMAP == 11
+);
 
 /// **EL0-Exiter** (Sektion `.user_text`, EL0-ausführbar): beendet sich sofort per
 /// `EXIT`-Syscall. Für den Reclaim-Test transient erzeugt; beim Exit gibt der Kernel
@@ -564,7 +586,44 @@ extern "C" fn trusted_probe(_arg: usize) -> ! {
     }
 }
 
-/// Kollektor (EL1) für die Weg-C-Demo: sammelt die Badges der beiden Proben.
+/// **VMM-Probe** (`.user_text`, isolierte VSpace): demonstriert `map`/`unmap` per
+/// Syscall. x0 = Frame-Adresse G (identity). Slot 0 = Memory-Cap für G, Slot 1 =
+/// SIGNAL-Cap. Ablauf: `MAP` Slot 0 → G ist EL0-RW → schreibt+liest G (Roundtrip) →
+/// `SIGNAL` Badge MAPPED → `UNMAP` Slot 0 → liest G erneut → **Fault** (unmapped) →
+/// Kernel beendet sie + baut die VSpace ab. Beweist: map macht G zugänglich, unmap
+/// entzieht es wieder — alles cap-gated in der eigenen VSpace.
+#[link_section = ".user_text"]
+extern "C" fn vmm_probe(_arg: usize) -> ! {
+    // SAFETY: reiner EL0-User-Code; `svc`/`ldr`/`str` auf den selbst gemappten Frame.
+    unsafe {
+        core::arch::asm!(
+            "mov x9, x0",                   // x9 = G (Frame-Adresse)
+            "mov x0, #10",                  // sys::MAP
+            "mov x1, #0",                   // Slot 0 (Memory-Cap für G)
+            "svc #0",
+            "movz x10, #0xBEEF",            // x10 = 0xDEADBEEF (Testmuster)
+            "movk x10, #0xDEAD, lsl #16",
+            "str x10, [x9]",                // in den gemappten Frame schreiben
+            "ldr x11, [x9]",                // zurücklesen
+            "cmp x11, x10",
+            "b.ne 3f",                      // Roundtrip fehlgeschlagen -> kein SIGNAL
+            "mov x0, #8",                   // sys::SIGNAL Slot 1 (Badge MAPPED)
+            "mov x1, #1",
+            "svc #0",
+            "mov x0, #11",                  // sys::UNMAP Slot 0
+            "mov x1, #0",
+            "svc #0",
+            "ldr x11, [x9]",                // nach UNMAP lesen -> FAULT -> beendet
+        "3:",
+            "mov x0, #5",                   // sys::PARK
+            "svc #0",
+            "b 3b",
+            options(noreturn),
+        );
+    }
+}
+
+/// Kollektor (EL1) für die Weg-C-Demo: sammelt die Badges der Proben.
 extern "C" fn iso_collector(_arg: usize) -> ! {
     loop {
         let r = invoke(sys::WAIT, 0, [0; 4], 0);
@@ -1019,8 +1078,11 @@ fn all_done() -> bool {
     // und faultete dann beim Fremdzugriff (iso_faulted).
     let m = ISO_MASK.load(Ordering::Relaxed);
     let vspace = (m & ISO_BADGE_RAN != 0) && (m & ISO_BADGE_TRUSTED != 0) && system::iso_faulted();
+    // VMM: die VMM-Probe mappte+beschrieb einen Frame (MAPPED) und faultete nach dem
+    // UNMAP -> beide isolierten Proben (iso + vmm) faulteten => iso_fault_count >= 2.
+    let vmm = (m & ISO_BADGE_MAPPED != 0) && system::iso_fault_count() >= 2;
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
-        && reclaim && balanced && vspace
+        && reclaim && balanced && vspace && vmm
 }
 
 fn report() {
@@ -1223,5 +1285,15 @@ fn report() {
     println!(
         "vspace  : {} (per-Prozess-VSpace: echte User<->User-Trennung, nur IPC)",
         if vspace_ok { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Allgemeiner VMM: map/unmap per Syscall + VSpace-Teardown.
+    let mapped = m & ISO_BADGE_MAPPED != 0;
+    let faults = system::iso_fault_count();
+    println!("vmm     : VMM-Probe mappte+beschrieb Frame={mapped}; isolierte Faults gesamt={faults} (>=2 => unmap wirkte)");
+    let vmm_ok = mapped && faults >= 2;
+    println!(
+        "vmm     : {} (Frame-Caps + map/unmap-Syscalls + VSpace-Teardown)",
+        if vmm_ok { "ALL PASS" } else { "FAILURES" }
     );
 }

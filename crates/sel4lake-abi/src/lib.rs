@@ -25,6 +25,11 @@ pub mod sys {
     pub const SIGNAL: u64 = 8;
     /// Auf eine Notification warten (blockiert; liefert den Badge in `x1`).
     pub const WAIT: u64 = 9;
+    /// Einen über eine Memory-Cap bezeichneten Frame in die **eigene VSpace** mappen
+    /// (identity, EL0-RW; cap-gated). Nur in einer isolierten VSpace sinnvoll.
+    pub const MAP: u64 = 10;
+    /// Einen zuvor gemappten Frame wieder aus der eigenen VSpace entfernen.
+    pub const UNMAP: u64 = 11;
 }
 
 /// Anzahl der Nachrichten-Datenwörter (Register `x2`..`x5`).

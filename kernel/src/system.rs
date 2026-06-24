@@ -91,9 +91,9 @@ static EL0_SYSCALL_SEEN: AtomicBool = AtomicBool::new(false);
 /// Zähler: wie oft hat der Kernel einen EL0-Fault abgefangen und den fehlerhaften
 /// User-Thread isoliert (statt selbst anzuhalten)?
 static EL0_FAULTS: AtomicUsize = AtomicUsize::new(0);
-/// Sticky: faultete jemals ein Thread, der in einer **isolierten VSpace** lief?
-/// (Beleg, dass die Hardware-Adressraumtrennung einen Fremdzugriff verhindert hat.)
-static ISO_FAULTED: AtomicBool = AtomicBool::new(false);
+/// Zähler: wie oft faultete ein Thread, der in einer **isolierten VSpace** lief?
+/// (Beleg, dass die Hardware-Adressraumtrennung Fremd-/unmapped-Zugriffe verhindert.)
+static ISO_FAULTS: AtomicUsize = AtomicUsize::new(0);
 
 // --- Lazy-FP-Zustand ---
 //
@@ -237,6 +237,23 @@ impl SchedOps for KernelSched {
         }
         ok
     }
+    fn map_frame(&mut self, caller: ThreadId, base: u64, len: u64) -> bool {
+        // Nur isolierte PDs (ASID != 0) und nur ganze 2-MiB-Frames (Granularität
+        // dieses Inkrements). Der Frame wird identity EL0-RW in die eigene VSpace
+        // gemappt.
+        let asid = (VSPACE_OF[caller.slot()].load(Ordering::Relaxed) >> 48) as u16;
+        if asid == 0 || len != hal::mmu::ISO_REGION_SIZE {
+            return false;
+        }
+        vspace_map_region(asid, base)
+    }
+    fn unmap_frame(&mut self, caller: ThreadId, base: u64, _len: u64) -> bool {
+        let asid = (VSPACE_OF[caller.slot()].load(Ordering::Relaxed) >> 48) as u16;
+        if asid == 0 {
+            return false;
+        }
+        vspace_unmap_region(asid, base)
+    }
 }
 
 /// `CPACR_EL1.FPEN` für den **gerade aktuellen** Thread auf `core` setzen: FP an
@@ -328,8 +345,8 @@ fn el0_fault(frame: *mut TrapFrame, esr: u64, far: u64) -> *mut TrapFrame {
         let tid = sched.current_id(core);
         if VSPACE_OF[tid.slot()].load(Ordering::Relaxed) != 0 {
             // Der fehlerhafte Thread lief in einer isolierten VSpace -> die
-            // Adressraumtrennung hat einen Fremdzugriff hardware-seitig verhindert.
-            ISO_FAULTED.store(true, Ordering::Release);
+            // Adressraumtrennung hat einen Fremd-/unmapped-Zugriff verhindert.
+            ISO_FAULTS.fetch_add(1, Ordering::Release);
         }
         println!(
             "el0-trap: User-Thread {:#x} faultete (EC={ec:#04x} FAR={far:#018x}) -> beendet, Kernel laeuft weiter",
@@ -342,6 +359,13 @@ fn el0_fault(frame: *mut TrapFrame, esr: u64, far: u64) -> *mut TrapFrame {
         (next, tid.slot())
     }; // SCHEDS freigegeben
     reclaim_user_kstack(slot); // EL0-Kernel-Stack-Pool-Slot zurückgeben (KSTACKS allein)
+    // War es eine isolierte PD, ihre VSpace abbauen. Sicher: `sync_vspace` oben hat
+    // TTBR0 bereits auf den nächsten Thread umgeschaltet (nicht mehr die tote VSpace).
+    let packed = VSPACE_OF[slot].load(Ordering::Relaxed);
+    if packed != 0 {
+        vspace_teardown((packed >> 48) as u16);
+        VSPACE_OF[slot].store(0, Ordering::Relaxed);
+    }
     next as *mut TrapFrame
 }
 
@@ -350,10 +374,14 @@ pub fn el0_fault_count() -> usize {
     EL0_FAULTS.load(Ordering::Relaxed)
 }
 
-/// Hat ein Thread in einer **isolierten VSpace** durch einen Fremdzugriff gefaultet?
-/// (Hardware-erzwungene Adressraumtrennung, Weg C.)
+/// Hat ein Thread in einer **isolierten VSpace** durch einen Fremd-/unmapped-Zugriff
+/// gefaultet? (Hardware-erzwungene Adressraumtrennung, Weg C.)
 pub fn iso_faulted() -> bool {
-    ISO_FAULTED.load(Ordering::Acquire)
+    ISO_FAULTS.load(Ordering::Acquire) > 0
+}
+/// Anzahl der Faults in isolierten VSpaces (Fremdzugriff bzw. unmapped Frame).
+pub fn iso_fault_count() -> usize {
+    ISO_FAULTS.load(Ordering::Acquire)
 }
 
 /// Reschedule-, Syscall-, EL0-Fault- + Lazy-FP-Hook registrieren (einmalig, vor
@@ -542,35 +570,30 @@ pub fn spawn_user(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
 /// ASID-Vergabe für isolierte VSpaces (ASID 0 = globale SAS-Map, daher ab 1).
 static ISO_ASID_NEXT: AtomicU64 = AtomicU64::new(1);
 
-/// Einen **isolierten EL0-User-Thread** erzeugen (Weg C): eigene VSpace, die nur den
-/// Kernel (EL1-only) + eine **private 2-MiB-Region** (EL0-RW) mappt. Der Thread läuft
-/// auf EL0 mit Stack in dieser Region; sein Code ist die geteilte `.user_text`
-/// (EL0-RX in jeder VSpace). Greift er auf **fremdes** User-RAM zu, ist das in seiner
-/// VSpace EL1-only -> Fault -> der Kernel beendet ihn. Gibt `(ThreadId, region_base)`.
-///
-/// Vereinfachungen dieses ersten Inkrements: eine feste 2-MiB-Region je PD (in GiB 1);
-/// die VSpace-Page-Tables (L1+L2) werden beim Thread-Ende geleakt (klein, dokumentiert).
-pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u64)> {
-    let core = hal::cpu::core_id();
-    let kidx = claim_user_kstack()?;
-    let kbase = core::ptr::addr_of!(__user_kstacks_bottom) as usize + kidx * USER_KSTACK_SIZE;
+/// Anzahl gleichzeitig verwaltbarer isolierter VSpaces (= max. ASID).
+const MAX_VSPACES: usize = 16;
 
-    // Private 2-MiB-Region (2-MiB-ausgerichtet) + zwei 4-KiB-Page-Table-Frames.
-    let region_sz = hal::mmu::ISO_REGION_SIZE;
-    let (rbase, rlen) = match MEM.lock().alloc(region_sz, region_sz) {
-        Some(r) => (r.base(), r.len()),
-        None => {
-            release_user_kstack(kidx);
-            return None;
-        }
-    };
-    // Region muss in GiB 1 liegen (die per-PD-L2 deckt nur GiB 1 ab).
-    if rbase < hal::mmu::USER_RAM_MIN || rbase + rlen > hal::mmu::GIB1_END {
-        let mut mem = MEM.lock();
-        mem.free_region(PhysRegion::new(rbase, rlen));
-        release_user_kstack(kidx);
+/// Metadaten einer isolierten VSpace (für map/unmap + Teardown). Indiziert per
+/// `asid - 1`.
+#[derive(Clone, Copy)]
+struct VSpaceEnt {
+    used: bool,
+    l1: u64,
+    l2: u64,
+}
+static VSPACES: SpinLock<[VSpaceEnt; MAX_VSPACES]> =
+    SpinLock::new([VSpaceEnt { used: false, l1: 0, l2: 0 }; MAX_VSPACES]);
+
+/// Eine **leere** isolierte VSpace anlegen (Kernel EL1-only, kein User-Frame). Gibt
+/// `(asid, l1_phys)` oder `None` (kein ASID/Speicher). Allokiert L1+L2 aus `MEM`
+/// (zuerst, freigegeben), trägt dann die Metadaten ein (`MEM` und `VSPACES` nie
+/// gleichzeitig gehalten -> keine Sperrordnungs-Inversion zu Teardown/map).
+fn create_vspace() -> Option<(u16, u64)> {
+    let asid = ISO_ASID_NEXT.fetch_add(1, Ordering::Relaxed);
+    if asid as usize > MAX_VSPACES {
         return None;
     }
+    let asid = asid as u16;
     let a = MEM.lock().alloc(4096, 4096);
     let b = MEM.lock().alloc(4096, 4096);
     let (l1, l2) = match (a, b) {
@@ -583,27 +606,119 @@ pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u
             if let Some(c) = b {
                 mem.free_region(PhysRegion::new(c.base(), c.len()));
             }
-            mem.free_region(PhysRegion::new(rbase, rlen));
-            drop(mem);
+            return None;
+        }
+    };
+    hal::mmu::vspace_create_base(l1.base(), l2.base()); // läuft in globaler Map
+    VSPACES.lock()[asid as usize - 1] = VSpaceEnt {
+        used: true,
+        l1: l1.base(),
+        l2: l2.base(),
+    };
+    Some((asid, l1.base()))
+}
+
+/// L2-Tabelle einer (gültigen) isolierten VSpace nachschlagen.
+fn vspace_l2(asid: u16) -> Option<u64> {
+    if asid == 0 || asid as usize > MAX_VSPACES {
+        return None;
+    }
+    let v = VSPACES.lock()[asid as usize - 1];
+    if v.used {
+        Some(v.l2)
+    } else {
+        None
+    }
+}
+
+/// Einen 2-MiB-Frame `phys` in die VSpace `asid` mappen (EL0-RW) + ASID flushen.
+fn vspace_map_region(asid: u16, phys: u64) -> bool {
+    let Some(l2) = vspace_l2(asid) else {
+        return false;
+    };
+    if hal::mmu::vspace_map_block(l2, phys) {
+        hal::mmu::flush_asid(asid);
+        true
+    } else {
+        false
+    }
+}
+
+/// Einen 2-MiB-Frame `phys` aus der VSpace `asid` entfernen (wieder EL1-only).
+fn vspace_unmap_region(asid: u16, phys: u64) -> bool {
+    let Some(l2) = vspace_l2(asid) else {
+        return false;
+    };
+    if hal::mmu::vspace_unmap_block(l2, phys) {
+        hal::mmu::flush_asid(asid);
+        true
+    } else {
+        false
+    }
+}
+
+/// Eine isolierte VSpace abbauen: Page-Tables (L1+L2) an `MEM` zurückgeben, Eintrag
+/// freigeben, TLB der ASID flushen. Beim Thread-Ende einer isolierten PD aufzurufen.
+fn vspace_teardown(asid: u16) {
+    if asid == 0 || asid as usize > MAX_VSPACES {
+        return;
+    }
+    let ent = {
+        let mut t = VSPACES.lock();
+        let e = t[asid as usize - 1];
+        t[asid as usize - 1] = VSpaceEnt { used: false, l1: 0, l2: 0 };
+        e
+    };
+    if ent.used {
+        let mut mem = MEM.lock();
+        mem.free_region(PhysRegion::new(ent.l1, 4096));
+        mem.free_region(PhysRegion::new(ent.l2, 4096));
+        drop(mem);
+        hal::mmu::flush_asid(asid);
+    }
+}
+
+/// Einen **isolierten EL0-User-Thread** erzeugen (Weg C): eigene VSpace, die nur den
+/// Kernel (EL1-only) + eine **private 2-MiB-Stack-Region** (EL0-RW) mappt. Sein Code
+/// ist die geteilte `.user_text` (EL0-RX in jeder VSpace). Greift er auf **fremdes**
+/// User-RAM zu, ist das in seiner VSpace EL1-only -> Fault -> Kernel beendet ihn.
+/// Zur Laufzeit kann er weitere Frames per `MAP`-Syscall (cap-gated) hinzunehmen.
+/// Gibt `(ThreadId, region_base)`. VSpace-Tabellen werden beim Thread-Ende abgebaut.
+pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u64)> {
+    let core = hal::cpu::core_id();
+    let kidx = claim_user_kstack()?;
+    let kbase = core::ptr::addr_of!(__user_kstacks_bottom) as usize + kidx * USER_KSTACK_SIZE;
+
+    // Private 2-MiB-Stack-Region (2-MiB-ausgerichtet, in GiB 1).
+    let region_sz = hal::mmu::ISO_REGION_SIZE;
+    let (rbase, rlen) = match MEM.lock().alloc(region_sz, region_sz) {
+        Some(r) => (r.base(), r.len()),
+        None => {
             release_user_kstack(kidx);
             return None;
         }
     };
+    if rbase < hal::mmu::USER_RAM_MIN || rbase + rlen > hal::mmu::GIB1_END {
+        MEM.lock().free_region(PhysRegion::new(rbase, rlen));
+        release_user_kstack(kidx);
+        return None;
+    }
+    let Some((asid, l1)) = create_vspace() else {
+        MEM.lock().free_region(PhysRegion::new(rbase, rlen));
+        release_user_kstack(kidx);
+        return None;
+    };
+    // Stack-Region in die neue VSpace mappen (EL0-RW).
+    vspace_map_region(asid, rbase);
+    let packed = ((asid as u64) << 48) | l1;
 
-    // VSpace aufbauen (Kernel EL1-only + diese Region EL0-RW). Wir laufen in der
-    // globalen Identity-Map -> die frischen Frames sind beschreibbar.
-    hal::mmu::build_isolated_vspace(l1.base(), l2.base(), rbase, rlen);
-    let asid = ISO_ASID_NEXT.fetch_add(1, Ordering::Relaxed) as u16;
-    let packed = ((asid as u64) << 48) | l1.base();
-
-    // Thread: Kernel-Stack aus dem Pool, User-Stack = die private Region.
-    let user_base = rbase as usize;
-    let user_len = rlen as usize;
+    // Thread: Kernel-Stack aus dem Pool, User-Stack = die gemappte Region.
+    let (user_base, user_len) = (rbase as usize, rlen as usize);
     let tid = {
         let mut sched = SCHEDS[core].lock();
         let r = sched.spawn_user(core, entry, arg, kbase, USER_KSTACK_SIZE, user_base, user_len, prio);
         if let Some(t) = r {
-            fp_reset_slot(t.slot()); // setzt FP + VSPACE_OF[slot]=0 (global) zurück
+            fp_reset_slot(t.slot()); // FP + VSPACE_OF[slot]=0 (global) zurücksetzen
         }
         r
     };
@@ -613,11 +728,9 @@ pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u
             Some((t, rbase))
         }
         None => {
+            vspace_teardown(asid);
+            MEM.lock().free_region(PhysRegion::new(rbase, rlen));
             release_user_kstack(kidx);
-            let mut mem = MEM.lock();
-            mem.free_region(PhysRegion::new(rbase, rlen));
-            mem.free_region(PhysRegion::new(l1.base(), l1.len()));
-            mem.free_region(PhysRegion::new(l2.base(), l2.len()));
             None
         }
     }

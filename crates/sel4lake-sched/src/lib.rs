@@ -476,4 +476,9 @@ pub trait SchedOps {
     fn on_tick(&mut self, core: usize, frame: usize) -> usize;
     fn exit_current(&mut self, core: usize, frame: usize) -> usize;
     fn kill(&mut self, tid: ThreadId, core: usize) -> bool;
+    /// Einen physischen Frame `[base, base+len)` in die VSpace des Aufrufers `caller`
+    /// mappen (EL0-RW, cap-gated; nur für isolierte PDs sinnvoll). `true` bei Erfolg.
+    fn map_frame(&mut self, caller: ThreadId, base: u64, len: u64) -> bool;
+    /// Einen zuvor gemappten Frame wieder aus der VSpace des Aufrufers entfernen.
+    fn unmap_frame(&mut self, caller: ThreadId, base: u64, len: u64) -> bool;
 }

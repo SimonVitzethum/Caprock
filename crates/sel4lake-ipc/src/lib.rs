@@ -62,6 +62,43 @@ impl TidQueue {
         t
     }
 
+    /// Iterator über die belegten Einträge (in FIFO-Reihenfolge, für Audits).
+    fn for_each(&self, mut f: impl FnMut(ThreadId)) {
+        let mut i = self.head;
+        for _ in 0..self.count {
+            if let Some(t) = self.buf[i] {
+                f(t);
+            }
+            i = (i + 1) % QCAP;
+        }
+    }
+
+    /// Audit: existiert ein **toter** Eintrag (Prädikat `live` liefert false)?
+    fn any_dead(&self, live: &mut dyn FnMut(ThreadId) -> bool) -> bool {
+        let mut dead = false;
+        self.for_each(|t| {
+            if !live(t) {
+                dead = true;
+            }
+        });
+        dead
+    }
+
+    /// Audit: kommt ein Thread mehrfach vor (Duplikat = Ready-/Queue-Korruption)?
+    fn has_dup(&self) -> bool {
+        let mut seen: [Option<ThreadId>; QCAP] = [None; QCAP];
+        let mut n = 0;
+        let mut dup = false;
+        self.for_each(|t| {
+            if seen[..n].contains(&Some(t)) {
+                dup = true;
+            }
+            seen[n] = Some(t);
+            n += 1;
+        });
+        dup
+    }
+
     /// Einen bestimmten Thread aus der Warteschlange entfernen (für Hot-Reload:
     /// einen blockierten Empfänger zurückziehen). Gibt `true`, falls gefunden.
     fn remove(&mut self, target: ThreadId) -> bool {
@@ -137,6 +174,32 @@ impl Endpoint {
     /// danach blockiert (geparkt). Gibt `true`, falls er Empfänger war.
     pub fn retire_receiver(&mut self, tid: ThreadId) -> bool {
         self.used && self.receivers.remove(tid)
+    }
+
+    /// Einen **sterbenden** Thread aus ALLEN Strukturen dieses Endpoints entfernen
+    /// (Sender-/Empfänger-Queue + `caller`). Eager-Cleanup beim Thread-Tod: verhindert,
+    /// dass tote TCBs in den festen Queues zurückbleiben (Corpse-Fill -> verdrängte
+    /// echte Sender) und dass ein REPLY in einen recycelten Frame schreibt. Gibt `true`,
+    /// falls der Thread irgendwo eingetragen war.
+    pub fn purge_thread(&mut self, tid: ThreadId) -> bool {
+        let mut found = self.senders.remove(tid);
+        found |= self.receivers.remove(tid);
+        if self.caller == Some(tid) {
+            self.caller = None;
+            found = true;
+        }
+        found
+    }
+
+    /// Read-only Audit (Fuzzer-Oracle): prüft beide Queues + `caller` mit einem
+    /// Lebendigkeits-Prädikat. Gibt `(tote_einträge, duplikat)` zurück. Muss unter dem
+    /// Endpoint-Lock aufgerufen werden (konsistenter Snapshot).
+    pub fn audit(&self, live: &mut dyn FnMut(ThreadId) -> bool) -> (bool, bool) {
+        let dead = self.senders.any_dead(live)
+            || self.receivers.any_dead(live)
+            || self.caller.map_or(false, |c| !live(c));
+        let dup = self.senders.has_dup() || self.receivers.has_dup();
+        (dead, dup)
     }
 
     /// `CALL`: Nachricht senden und auf Antwort warten. Gibt den fortzusetzenden
@@ -261,6 +324,24 @@ impl Notification {
             used: true,
             ..Notification::EMPTY
         };
+    }
+
+    /// Einen **sterbenden** Thread als Wartenden entfernen (eager Cleanup beim Tod):
+    /// verhindert einen toten Waiter, in dessen recycelten Frame ein späteres SIGNAL
+    /// schreiben würde. Gibt `true`, falls er der Wartende war.
+    pub fn purge_thread(&mut self, tid: ThreadId) -> bool {
+        if self.waiter == Some(tid) {
+            self.waiter = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Read-only Audit (Fuzzer-Oracle): toter Wartender? Unter dem Notification-Lock
+    /// aufzurufen.
+    pub fn audit(&self, live: &mut dyn FnMut(ThreadId) -> bool) -> bool {
+        self.waiter.map_or(false, |w| !live(w))
     }
 
     /// `SIGNAL`: `badge` ins Notification-Wort ODERn und einen etwaigen Wartenden

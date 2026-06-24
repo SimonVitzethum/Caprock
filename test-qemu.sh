@@ -10,11 +10,14 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 CORES=8
-# Default großzügig: viele Demo-Threads (inkl. SMP + isolierte VSpaces) teilen sich
-# unter single-threaded QEMU-TCG eine Host-CPU -> alles emuliert länger. Unter
-# schwerer Host-Last kann ein Lauf das Fenster überschreiten (kein Kernel-Hang;
-# der Manager druckt dann nach ~25 s eine `DBG pending`-Zeile).
-SECONDS_RUN="${1:-45}"
+# Der Kernel fährt nach bestandenem Selbsttest QEMU per PSCI SYSTEM_OFF herunter
+# (`== SELFTEST COMPLETE ==`), daher endet ein erfolgreicher Lauf, sobald er fertig
+# ist — auf einem ruhigen Host in wenigen Sekunden. Das Timeout ist nur eine
+# Obergrenze für den Fehlerfall (Kernel bleibt dann im Idle). Großzügig gewählt:
+# zwei Fuzzer (Ressourcen + IPC) + SMP + isolierte VSpaces teilen unter
+# single-threaded QEMU-TCG eine Host-CPU; unter schwerer Host-Last emuliert alles
+# deutlich länger (kein Kernel-Hang — der Manager druckt sonst eine `DBG pending`-Zeile).
+SECONDS_RUN="${1:-240}"
 ELF="build/target/aarch64-sel4lake/release/sel4lake-kernel.elf"
 
 echo "== build =="
@@ -60,6 +63,7 @@ check "mcs     : ALL PASS" "MCS Scheduling Contexts (Budget per Cap, Verbrauch/E
 check "stale   : ALL PASS" "Audit-Regression: IPC paniert nicht bei gekilltem, in Endpoint-Queue blockiertem Thread"
 check "strand  : ALL PASS" "Audit-Regression: erneutes Budget-Bind strandet keinen erschoepften Thread"
 check "fuzz    : ALL PASS" "Generativer Kernel-Fuzzer (zufaellige Op-Sequenzen + Baseline-Oracle + SMP-Kontention)"
+check "ipcfuzz : ALL PASS" "IPC-State-Machine-Fuzzer (nebenlaeufige Aktoren, KILL/Reload/MCS waehrend IPC, Queue-Oracle)"
 online=$(echo "$OUT" | grep -c "online")
 [ "$online" -eq "$CORES" ] && echo "  PASS: alle $CORES Kerne online" || { echo "  FAIL: nur $online/$CORES Kerne online"; fail=1; }
 

@@ -225,16 +225,18 @@ impl SchedOps for KernelSched {
         SCHEDS[core].lock().on_tick(core, frame, false)
     }
     fn exit_current(&mut self, core: usize, frame: usize) -> usize {
-        // Slot des sich beendenden Threads vor dem Wechsel merken; IRQs sind im Trap
-        // maskiert -> der aktuelle Thread ist über die zwei kurzen Sperren stabil.
-        let slot = SCHEDS[core].lock().current_id(core).slot();
+        // Tid des sich beendenden Threads vor dem Wechsel merken; IRQs sind im Trap
+        // maskiert -> der aktuelle Thread ist über die kurzen Sperren stabil.
+        let tid = SCHEDS[core].lock().current_id(core);
         let next = SCHEDS[core].lock().exit_current(core, frame);
-        reclaim_user_kstack(slot); // EL0-Kernel-Stack-Pool-Slot zurückgeben (KSTACKS allein)
+        purge_ipc_queues(tid); // eager: aus allen IPC-Queues entfernen (keine SCHEDS gehalten)
+        reclaim_user_kstack(tid.slot()); // EL0-Kernel-Stack-Pool-Slot zurückgeben (KSTACKS allein)
         next
     }
     fn kill(&mut self, tid: ThreadId, core: usize) -> bool {
         let ok = SCHEDS[core].lock().kill(tid, core);
         if ok {
+            purge_ipc_queues(tid); // eager: tote IPC-Queue-Einträge vermeiden
             reclaim_user_kstack(tid.slot()); // getöteter EL0-Thread: Pool-Slot zurück
         }
         ok
@@ -346,7 +348,7 @@ fn el0_fault(frame: *mut TrapFrame, esr: u64, far: u64) -> *mut TrapFrame {
     let core = hal::cpu::core_id();
     let ec = (esr >> 26) & 0x3f;
     EL0_FAULTS.fetch_add(1, Ordering::Relaxed);
-    let (next, slot) = {
+    let (next, tid) = {
         let mut sched = SCHEDS[core].lock();
         let tid = sched.current_id(core);
         if VSPACE_OF[tid.slot()].load(Ordering::Relaxed) != 0 {
@@ -362,15 +364,16 @@ fn el0_fault(frame: *mut TrapFrame, esr: u64, far: u64) -> *mut TrapFrame {
         // Auf den nächsten Thread gewechselt -> FP-Trap + VSpace passend setzen.
         sync_fp_trap(core, &sched);
         sync_vspace(core, &sched);
-        (next, tid.slot())
+        (next, tid)
     }; // SCHEDS freigegeben
-    reclaim_user_kstack(slot); // EL0-Kernel-Stack-Pool-Slot zurückgeben (KSTACKS allein)
+    purge_ipc_queues(tid); // eager: faultenden Thread aus allen IPC-Queues entfernen
+    reclaim_user_kstack(tid.slot()); // EL0-Kernel-Stack-Pool-Slot zurückgeben (KSTACKS allein)
     // War es eine isolierte PD, ihre VSpace abbauen. Sicher: `sync_vspace` oben hat
     // TTBR0 bereits auf den nächsten Thread umgeschaltet (nicht mehr die tote VSpace).
-    let packed = VSPACE_OF[slot].load(Ordering::Relaxed);
+    let packed = VSPACE_OF[tid.slot()].load(Ordering::Relaxed);
     if packed != 0 {
         vspace_teardown((packed >> 48) as u16);
-        VSPACE_OF[slot].store(0, Ordering::Relaxed);
+        VSPACE_OF[tid.slot()].store(0, Ordering::Relaxed);
     }
     next as *mut TrapFrame
 }
@@ -854,6 +857,7 @@ pub fn destroy_isolated(tid: ThreadId) {
     let core = hal::cpu::core_id();
     let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
     SCHEDS[core].lock().kill(tid, core); // ready -> Zombie (TCB-Slot frei, Stack vorgemerkt)
+    purge_ipc_queues(tid); // eager: tote IPC-Queue-Einträge vermeiden
     reap(); // Stack-Zombie an MEM zurueck (korrekte Lock-Ordnung: SCHEDS frei, dann MEM)
     if asid != 0 {
         vspace_teardown(asid); // L1/L2/L3 an MEM, ASID-Slot frei, TLB-Flush
@@ -1050,6 +1054,7 @@ pub fn kill_local(tid: ThreadId) -> bool {
     }
     let ok = SCHEDS[core].lock().kill(tid, core);
     if ok {
+        purge_ipc_queues(tid); // eager: tote IPC-Queue-Einträge vermeiden
         reclaim_user_kstack(tid.slot()); // falls EL0-Thread: Pool-Slot zurück
     }
     ok
@@ -1060,7 +1065,14 @@ pub fn kill_local(tid: ThreadId) -> bool {
 /// `SCHEDS[core]` einsammeln, dann den Lock **freigeben** und unter `MEM` freigeben
 /// — nie SCHEDS und MEM gleichzeitig halten (sonst Ordnungsinversion zu `spawn`).
 pub fn reap() -> usize {
-    let core = hal::cpu::core_id();
+    reap_core(hal::cpu::core_id())
+}
+
+/// Beendete Threads des Kerns `core` einsammeln — auch **kern-übergreifend** aufrufbar
+/// (z. B. der Fuzzer-Controller auf core 0 reapt Zombies belasteter Kerne, deren Idle
+/// nie läuft -> sonst lecken die Stacks). Sperrordnung: erst `SCHEDS[core]` (Zombies in
+/// einen Puffer), freigeben, dann `MEM` — nie beide gleichzeitig.
+pub fn reap_core(core: usize) -> usize {
     let mut zombies: [(usize, usize); 8] = [(0, 0); 8];
     let mut n = 0;
     {
@@ -1085,6 +1097,27 @@ pub fn reap() -> usize {
         REAPED_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
     n
+}
+
+/// Einen **nicht laufenden** Thread auf **irgendeinem** Kern beenden (für den Fuzzer-
+/// Controller, der Aktoren auf anderen Kernen zu ungünstigen Zeiten killt). Schlägt
+/// fehl (`false`), wenn der Thread gerade auf seinem Kern *läuft* (dann erneut
+/// versuchen, sobald er blockiert/verdrängt ist). Entfernt ihn eager aus allen
+/// IPC-Queues und weckt den Zielkern (IPI), damit er bald reapt.
+pub fn kill_remote(tid: ThreadId) -> bool {
+    let c = tid.core();
+    if c >= NUM_CORES {
+        return false;
+    }
+    let ok = SCHEDS[c].lock().kill(tid, c);
+    if ok {
+        purge_ipc_queues(tid);
+        reclaim_user_kstack(tid.slot());
+        if c != hal::cpu::core_id() {
+            hal::gic::send_sgi(c, hal::gic::IPI_RESCHED_INTID);
+        }
+    }
+    ok
 }
 
 /// Summe der per [`reap`] an den Allokator zurückgegebenen Stack-Bytes (monoton) —
@@ -1114,4 +1147,64 @@ pub fn endpoint_retire_receiver(ep: usize, tid: ThreadId) -> bool {
     } else {
         false
     }
+}
+
+/// **Eager-Cleanup beim Thread-Tod:** den (sterbenden) Thread `tid` aus ALLEN
+/// Endpoint-Queues (senders/receivers/caller) und Notification-Waitern entfernen.
+/// Verhindert tote TCBs in den festen Queues (Corpse-Fill -> verdrängte echte Sender)
+/// und ein REPLY/SIGNAL in einen recycelten Frame. Aus den Todespfaden (kill/exit/
+/// fault) aufzurufen — OHNE gehaltenen SCHEDS-Lock (Sperrordnung EPS/NTFNS < SCHEDS).
+pub fn purge_ipc_queues(tid: ThreadId) {
+    for ep in EPS.iter() {
+        let mut e = ep.lock();
+        if e.is_used() {
+            e.purge_thread(tid);
+        }
+    }
+    for n in NTFNS.iter() {
+        let mut nt = n.lock();
+        if nt.is_used() {
+            nt.purge_thread(tid);
+        }
+    }
+}
+
+/// Lebt `tid`? (Für IPC-Audits.) Sperrt die Zielinstanz kurz.
+pub fn thread_alive(tid: ThreadId) -> bool {
+    SCHEDS[tid.core()].lock().is_alive(tid)
+}
+
+/// **IPC-Konsistenz-Oracle** (Fuzzer): jedes belegte Endpoint/Notification + jeden
+/// Kern-Scheduler auf strukturelle Invarianten prüfen. Gibt `0` bei Konsistenz, sonst
+/// einen Anomalie-Code: 1=toter TCB in Endpoint-Queue/caller, 2=Duplikat in Endpoint-
+/// Queue, 3=toter Waiter in Notification, 10+n=Scheduler-Audit-Code n (s. `Scheduler::
+/// audit`). Sperrt je Objekt einzeln; die Liveness-Prüfung verschachtelt EPS/NTFNS ->
+/// SCHEDS (zulässige Ordnung), nie zwei Objekte gleichzeitig.
+pub fn ipc_audit() -> u32 {
+    let live = &mut |t: ThreadId| -> bool { SCHEDS[t.core()].lock().is_alive(t) };
+    for ep in EPS.iter() {
+        let e = ep.lock();
+        if e.is_used() {
+            let (dead, dup) = e.audit(live);
+            if dead {
+                return 1;
+            }
+            if dup {
+                return 2;
+            }
+        }
+    }
+    for n in NTFNS.iter() {
+        let nt = n.lock();
+        if nt.is_used() && nt.audit(live) {
+            return 3;
+        }
+    }
+    for c in 0..NUM_CORES {
+        let code = SCHEDS[c].lock().audit();
+        if code != 0 {
+            return 10 + code;
+        }
+    }
+    0
 }

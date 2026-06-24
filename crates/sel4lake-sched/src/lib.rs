@@ -478,6 +478,65 @@ impl Scheduler {
         (self.depletions, self.refills)
     }
 
+    /// Lebt `tid` auf diesem Kern (gültiges, belegtes Handle)? Für IPC-Audits, die
+    /// Queue-Einträge auf tote TCBs prüfen.
+    pub fn is_alive(&self, tid: ThreadId) -> bool {
+        self.resolve(tid).is_some()
+    }
+
+    /// Read-only **Konsistenz-Audit** dieses Kern-Schedulers (Fuzzer-Oracle). Gibt `0`
+    /// bei Konsistenz, sonst einen Anomalie-Code zurück. Unter dem `SCHEDS[core]`-Lock
+    /// aufzurufen (konsistenter Snapshot). Geprüft:
+    /// 1=toter Eintrag (Slot nicht `used`) in Ready-Queue, 2=blockierter Thread in
+    /// Ready-Queue, 3=Duplikat (Thread mehrfach eingeplant), 4=`current` auch in der
+    /// Ready-Queue, 5=Bitmap inkonsistent zu Queue-Zählern, 6=Thread in falscher
+    /// Prioritäts-Queue, 7=verlorener Thread (lauffähig, aber in keiner Queue/nicht
+    /// laufend — z. B. fälschlich gestrandet).
+    pub fn audit(&self) -> u32 {
+        let mut seen = [false; PER_CORE];
+        for p in 0..NPRIO {
+            let q = &self.queues[p];
+            if ((self.bitmap >> p) & 1 == 1) != (q.count > 0) {
+                return 5;
+            }
+            let mut i = q.head;
+            for _ in 0..q.count {
+                let local = q.buf[i];
+                i = (i + 1) % PER_CORE;
+                if local >= PER_CORE || !self.tcbs[local].used {
+                    return 1;
+                }
+                if self.tcbs[local].blocked {
+                    return 2;
+                }
+                if self.tcbs[local].priority as usize != p {
+                    return 6;
+                }
+                if seen[local] {
+                    return 3;
+                }
+                seen[local] = true;
+                if self.current == Some(local) {
+                    return 4;
+                }
+            }
+        }
+        // Verlorene Threads: jeder belegte, lauffähige (nicht blockiert, nicht MCS-
+        // erschöpft, nicht laufend) Thread MUSS in einer Ready-Queue stehen.
+        for local in 0..PER_CORE {
+            let t = &self.tcbs[local];
+            if t.used
+                && !t.blocked
+                && !t.depleted
+                && self.current != Some(local)
+                && !seen[local]
+            {
+                return 7;
+            }
+        }
+        0
+    }
+
     // --- intern ---
 
     /// Einen Thread (lokaler Index) in die Ready-Queue seiner Priorität einreihen.

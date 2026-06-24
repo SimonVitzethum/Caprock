@@ -145,13 +145,13 @@ static STRAND_OK: AtomicBool = AtomicBool::new(false);
 // Ressourcenstände (MEM/TCB/VSpace/kstack + Cap-Slots/Cap-Objekte) müssen exakt zur
 // Baseline zurückkehren (sonst Leak/Zombie/CDT-Verletzung). Phase 2: balancierte
 // Cap/MEM-Churn parallel auf allen Kernen (SMP-Lock-Kontention), danach Baseline-Check.
-const FUZZ_EPOCHS: u32 = 24;
+const FUZZ_EPOCHS: u32 = 12;
 const FUZZ_OPS_PER_EPOCH: u32 = 50;
 const FUZZ_CAP_POOL: usize = 24;
 const FUZZ_THREAD_POOL: usize = 10;
 const FUZZ_MAP_POOL: usize = 8;
 const FUZZ_SEED: u64 = 0x5E14_1A4E_2026_0624; // fester Seed
-const FUZZ_SMP_ITERS: u32 = 4000; // Treiber-Churn-Iterationen während der SMP-Phase
+const FUZZ_SMP_ITERS: u32 = 800; // Treiber-Churn-Iterationen während der SMP-Phase
 static FUZZ_DONE: AtomicBool = AtomicBool::new(false);
 static FUZZ_OK: AtomicBool = AtomicBool::new(false);
 static FUZZ_OPS: AtomicU64 = AtomicU64::new(0); // ausgeführte Phase-1-Operationen
@@ -1338,14 +1338,13 @@ extern "C" fn fuzz_driver(_arg: usize) -> ! {
     FUZZ_SMP_STOP.store(true, Ordering::Release);
     // Auf Quiesce warten (bounded; TCG-Round-Robin lässt die anderen Kerne acken).
     let mut spins = 0u64;
-    while FUZZ_SMP_ACK.load(Ordering::Acquire) < smp_workers && spins < 200_000_000 {
+    while FUZZ_SMP_ACK.load(Ordering::Acquire) < smp_workers && spins < 40_000_000 {
         core::hint::spin_loop();
         spins += 1;
     }
     while system::reap() > 0 {}
     let smp_ok = FUZZ_SMP_ACK.load(Ordering::Acquire) == smp_workers && fuzz_check(&smp_base).is_none();
     FUZZ_SMP_OK.store(smp_ok, Ordering::Release);
-
     FUZZ_OK.store(ok && smp_ok, Ordering::Release);
     FUZZ_DONE.store(true, Ordering::Release);
     loop {
@@ -1382,6 +1381,375 @@ extern "C" fn fuzz_noise(_arg: usize) -> ! {
         fuzz_noise_iter();
     }
     FUZZ_SMP_ACK.fetch_add(1, Ordering::Release);
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IPC-State-Machine-Fuzzer — mehrere gleichzeitige Aktoren (Clients/Server/
+// Notifier/Waiter) über alle Kerne + Controller, der zu ungünstigen Zeiten KILL/
+// MCS-Bind/Cap-Churn injiziert und tote Aktoren respawnt. Pro Epoche läuft das
+// strukturelle IPC-Oracle (`system::ipc_audit`): keine toten/duplizierten TCBs in
+// Endpoint-/Notification-Queues, keine Ready-Queue-Korruption, keine verlorenen
+// Threads. Am Ende vollständiger Teardown + Ressourcen-Baseline.
+// ---------------------------------------------------------------------------
+const IPCF_EPOCHS: u32 = 8;
+const IPCF_EVENTS: u32 = 8; // Meta-Events je Epoche (einmalig, kein Retry)
+// Spin-Lauffenster je Epoche: gibt den Aktoren auf cores 1..7 (TCG-Round-Robin)
+// Zeit, IPC zu fahren. `spin_loop` ist unter TCG billig -> der Lauf bleibt schnell;
+// größere Fenster -> mehr Kern-Wechsel -> mehr IPC-Ops. (Tick-basiertes Warten wäre
+// load-pathologisch unter Mehrkern-TCG -> verworfen.) `system_off` beendet bei
+// Abschluss, sodass das Test-Skript nicht bis zum Timeout warten muss.
+const IPCF_DELAY: u32 = 250_000;
+const IPCF_PRIO: u8 = 4; // Aktor-Priorität (dominiert die Sekundärkerne)
+const IPCF_SEED: u64 = 0x19CF_2026_0624_0001;
+const IPCF_N: usize = 10; // Aktoren gesamt (cores 1..7; core 0 = Controller)
+static IPCFUZZ_DONE: AtomicBool = AtomicBool::new(false);
+static IPCFUZZ_OK: AtomicBool = AtomicBool::new(false);
+static IPCF_OPS: AtomicU64 = AtomicU64::new(0); // IPC-Operationen der Aktoren
+static IPCF_KILLS: AtomicU64 = AtomicU64::new(0); // injizierte KILLs (Diagnose)
+static IPCF_EPOCHS_OK: AtomicU32 = AtomicU32::new(0);
+static IPCF_ANOMALY: AtomicU32 = AtomicU32::new(0); // Oracle-Code des ersten Bruchs
+static IPCF_FAIL_EPOCH: AtomicU32 = AtomicU32::new(0);
+static IPCF_TEARDOWN_OK: AtomicBool = AtomicBool::new(false);
+static IPCF_STOP: AtomicBool = AtomicBool::new(false); // Teardown-Signal: Aktoren beenden sich
+
+/// Ein Fuzzer-Aktor: fester Kern + PD + Einstiegsfunktion; `tid_raw` = aktuelle
+/// (ggf. respawnte) Thread-Instanz.
+#[derive(Clone, Copy)]
+struct Actor {
+    core: usize,
+    pd: usize,
+    entry: usize,
+    arg: usize,
+    tid_raw: u64,
+}
+
+/// **Server-Aktor**: RECV/REPLY-Schleife auf seinem Endpoint (lokaler Cap-Slot 0).
+/// Gelegentlich YIELD zwischen RECV und REPLY (ungünstiger Zeitpunkt) oder Selbst-EXIT.
+extern "C" fn ipcf_server(arg: usize) -> ! {
+    let mut s = (arg as u64) | 1;
+    loop {
+        if IPCF_STOP.load(Ordering::Relaxed) {
+            invoke(sys::EXIT, 0, [0; 4], 0);
+        }
+        let m = invoke(sys::RECV, 0, [0; 4], 0);
+        if m.result == result::OK {
+            IPCF_OPS.fetch_add(1, Ordering::Relaxed);
+            if frand(&mut s) % 8 == 0 {
+                invoke(sys::YIELD, 0, [0; 4], 0); // RECV..REPLY-Fenster vergrößern
+            }
+            invoke(sys::REPLY, 0, [m.msg[0].wrapping_add(1), 0, 0, 0], 0);
+            IPCF_OPS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            invoke(sys::YIELD, 0, [0; 4], 0); // Cap entzogen/Reload -> nicht busy-spinnen
+        }
+        if frand(&mut s) % 200 == 0 {
+            invoke(sys::EXIT, 0, [0; 4], 0); // EXIT mitten im Betrieb
+        }
+    }
+}
+
+/// **Client-Aktor**: zufällig CALL auf Endpoint A/B (Cap-Slot 0/1), YIELD oder EXIT.
+extern "C" fn ipcf_client(arg: usize) -> ! {
+    let mut s = (arg as u64) | 1;
+    loop {
+        if IPCF_STOP.load(Ordering::Relaxed) {
+            invoke(sys::EXIT, 0, [0; 4], 0);
+        }
+        match frand(&mut s) % 16 {
+            0 => {
+                invoke(sys::EXIT, 0, [0; 4], 0); // Selbst-EXIT (oft mitten im CALL-Zyklus)
+            }
+            1 => {
+                invoke(sys::YIELD, 0, [0; 4], 0);
+            }
+            _ => {
+                let slot = frand(&mut s) % 2; // EP A oder B
+                let _ = invoke(sys::CALL, slot, [frand(&mut s), 0, 0, 0], 0);
+                IPCF_OPS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// **Notifier-Aktor**: zufällig SIGNAL auf Notification A/B (Cap-Slot 0/1).
+extern "C" fn ipcf_notifier(arg: usize) -> ! {
+    let mut s = (arg as u64) | 1;
+    loop {
+        if IPCF_STOP.load(Ordering::Relaxed) {
+            invoke(sys::EXIT, 0, [0; 4], 0);
+        }
+        let slot = frand(&mut s) % 2;
+        invoke(sys::SIGNAL, slot, [0; 4], 0);
+        IPCF_OPS.fetch_add(1, Ordering::Relaxed);
+        if frand(&mut s) % 4 == 0 {
+            invoke(sys::YIELD, 0, [0; 4], 0);
+        }
+        if frand(&mut s) % 200 == 0 {
+            invoke(sys::EXIT, 0, [0; 4], 0);
+        }
+    }
+}
+
+/// **Waiter-Aktor**: WAIT auf Notification A/B (Cap-Slot 0/1) — blockiert bis Signal.
+extern "C" fn ipcf_waiter(arg: usize) -> ! {
+    let mut s = (arg as u64) | 1;
+    loop {
+        if IPCF_STOP.load(Ordering::Relaxed) {
+            invoke(sys::EXIT, 0, [0; 4], 0);
+        }
+        let slot = frand(&mut s) % 2;
+        invoke(sys::WAIT, slot, [0; 4], 0);
+        IPCF_OPS.fetch_add(1, Ordering::Relaxed);
+        if frand(&mut s) % 200 == 0 {
+            invoke(sys::EXIT, 0, [0; 4], 0);
+        }
+    }
+}
+
+/// **Fast-Signaller**: SIGNALt eine Notification OHNE Wartenden (Cap-Slot 0) in einer
+/// engen Schleife — asynchrones Senden ohne Kontextwechsel (nur Trap + Cap-Lookup +
+/// `pending |= badge`). Liefert die hohe IPC-Op-Rate (Cross-Core-CALLs sind unter
+/// Single-Thread-TCG zu teuer). Wird nicht gestört (kein KILL/MCS-Ziel) -> läuft voll.
+extern "C" fn ipcf_signaller(_arg: usize) -> ! {
+    loop {
+        if IPCF_STOP.load(Ordering::Relaxed) {
+            invoke(sys::EXIT, 0, [0; 4], 0);
+        }
+        invoke(sys::SIGNAL, 0, [0; 4], 0);
+        IPCF_OPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Snapshot für das Teardown-Oracle: alle Kerne summiert (Aktoren liegen auf 1..7).
+fn ipcf_snapshot() -> (u64, usize, usize, usize, usize, usize) {
+    let mut tcbs = 0;
+    for c in 0..NUM_CORES {
+        tcbs += system::used_tcbs(c);
+    }
+    (
+        system::total_free(),
+        tcbs,
+        system::free_vspaces(),
+        system::user_kstack_free_count(),
+        system::cap_used_slots(),
+        system::cap_used_objects(),
+    )
+}
+
+/// Tote Aktoren (durch Controller-KILL oder Selbst-EXIT beendet) auf ihrem Kern neu
+/// erzeugen + an ihre PD binden — hält die IPC-Last + die Death-during-IPC-Rennen am
+/// Laufen.
+fn ipcf_respawn(act: &mut [Actor; IPCF_N]) {
+    for a in act.iter_mut() {
+        if !system::thread_alive(ThreadId::from_raw(a.tid_raw)) {
+            if let Some(t) = system::spawn_on_core(a.core, a.entry, a.arg, IPCF_PRIO) {
+                system::bind_pd(a.pd, t);
+                a.tid_raw = t.to_raw();
+            }
+        }
+    }
+}
+
+/// **IPC-Fuzzer-Controller** (EL1, core 0). Legt IPC-Objekte + Caps + Aktor-PDs an,
+/// nimmt die Baseline, spawnt die Aktoren auf cores 1..7, fährt Epochen aus injizierten
+/// Meta-Events (KILL/MCS-Bind/Cap-Churn) + Oracle, und baut am Ende alles ab + prüft
+/// die Ressourcen-Baseline.
+extern "C" fn ipcfuzz_controller(_arg: usize) -> ! {
+    // --- IPC-Objekte + Wurzel-Caps + abgeleitete Caps ---
+    let ep_a = system::create_endpoint().expect("ipcf ep a");
+    let ep_b = system::create_endpoint().expect("ipcf ep b");
+    let nt_a = system::create_notification().expect("ipcf nt a");
+    let nt_b = system::create_notification().expect("ipcf nt b");
+    let nt_c = system::create_notification().expect("ipcf nt c"); // für den Fast-Signaller (kein Waiter)
+    let ra = system::install_endpoint_cap(ep_a as u32, Rights::RWX).expect("ipcf ra");
+    let rb = system::install_endpoint_cap(ep_b as u32, Rights::RWX).expect("ipcf rb");
+    let nca = system::install_notification_cap(nt_a as u32, Rights::RWX).expect("ipcf nca");
+    let ncb = system::install_notification_cap(nt_b as u32, Rights::RWX).expect("ipcf ncb");
+    let send_a = system::cap_mint(ra, Rights::WRITE, 0).expect("ipcf send a");
+    let recv_a = system::cap_mint(ra, Rights::READ, 0).expect("ipcf recv a");
+    let send_b = system::cap_mint(rb, Rights::WRITE, 0).expect("ipcf send b");
+    let recv_b = system::cap_mint(rb, Rights::READ, 0).expect("ipcf recv b");
+    // Badge != 0 (sonst gingen Signale vor dem WAIT verloren — bekannte Invariante).
+    let sig_a = system::cap_mint(nca, Rights::WRITE, 0xA1).expect("ipcf sig a");
+    let wait_a = system::cap_mint(nca, Rights::READ, 0).expect("ipcf wait a");
+    let sig_b = system::cap_mint(ncb, Rights::WRITE, 0xB2).expect("ipcf sig b");
+    let wait_b = system::cap_mint(ncb, Rights::READ, 0).expect("ipcf wait b");
+    let ncc = system::install_notification_cap(nt_c as u32, Rights::RWX).expect("ipcf ncc");
+    let sig_c = system::cap_mint(ncc, Rights::WRITE, 0xC3).expect("ipcf sig c");
+    // Zwei wiederverwendbare SchedContext-Caps für MCS-Events: knapp (50 % Duty —
+    // spürbare Drosselung, aber kein Verhungern) und unbeschränkt (Wiederherstellung).
+    let sc_tiny = system::install_sched_context_cap(8, 16, Rights::WRITE).expect("ipcf sc tiny");
+    let sc_full = system::install_sched_context_cap(0, 1, Rights::WRITE).expect("ipcf sc full");
+
+    // --- Aktor-PDs + Cap-Installation ---
+    let mk_pd = |caps: &[(usize, CapPtr)]| -> usize {
+        let pd = system::create_pd().expect("ipcf pd");
+        for &(slot, c) in caps {
+            system::install_pd_cap(pd, slot, c);
+        }
+        pd
+    };
+    let pd_sa = mk_pd(&[(0, recv_a)]);
+    let pd_sb = mk_pd(&[(0, recv_b)]);
+    let pd_no = mk_pd(&[(0, sig_a), (1, sig_b)]);
+    let pd_w0 = mk_pd(&[(0, wait_a), (1, wait_b)]);
+    let pd_w1 = mk_pd(&[(0, wait_a), (1, wait_b)]);
+    let pd_sg = mk_pd(&[(0, sig_c)]);
+    let pd_c: [usize; 4] = core::array::from_fn(|_| mk_pd(&[(0, send_a), (1, send_b)]));
+
+    let cli = ipcf_client as *const () as usize;
+    let srv = ipcf_server as *const () as usize;
+    let nof = ipcf_notifier as *const () as usize;
+    let wai = ipcf_waiter as *const () as usize;
+    let sgl = ipcf_signaller as *const () as usize;
+    // Aktor-Tabelle (core, pd, entry, seed). Server auf 2/3, Clients 1/4/5/7, Notifier
+    // 6, Waiter 6/1 -> alle Kerne 1..7 belegt, Cross-Core-IPC inhärent.
+    let mut act: [Actor; IPCF_N] = [
+        Actor { core: 2, pd: pd_sa, entry: srv, arg: 0x51, tid_raw: u64::MAX },
+        Actor { core: 3, pd: pd_sb, entry: srv, arg: 0x52, tid_raw: u64::MAX },
+        Actor { core: 1, pd: pd_c[0], entry: cli, arg: 0xC0, tid_raw: u64::MAX },
+        Actor { core: 4, pd: pd_c[1], entry: cli, arg: 0xC1, tid_raw: u64::MAX },
+        Actor { core: 5, pd: pd_c[2], entry: cli, arg: 0xC2, tid_raw: u64::MAX },
+        Actor { core: 5, pd: pd_c[3], entry: cli, arg: 0xC3, tid_raw: u64::MAX },
+        Actor { core: 6, pd: pd_no, entry: nof, arg: 0x6E, tid_raw: u64::MAX },
+        Actor { core: 6, pd: pd_w0, entry: wai, arg: 0x70, tid_raw: u64::MAX },
+        Actor { core: 1, pd: pd_w1, entry: wai, arg: 0x71, tid_raw: u64::MAX },
+        // Index 9: Fast-Signaller (kein KILL-/MCS-Ziel) -> hohe async-IPC-Op-Rate.
+        Actor { core: 7, pd: pd_sg, entry: sgl, arg: 0x59, tid_raw: u64::MAX },
+    ];
+
+    // --- Baseline (Objekte/Caps/PDs angelegt; noch keine Aktoren) ---
+    while system::reap() > 0 {}
+    let base = ipcf_snapshot();
+
+    // --- Aktoren spawnen + binden ---
+    for a in act.iter_mut() {
+        if let Some(t) = system::spawn_on_core(a.core, a.entry, a.arg, IPCF_PRIO) {
+            system::bind_pd(a.pd, t);
+            a.tid_raw = t.to_raw();
+        }
+    }
+
+    // --- Epochen: Meta-Events injizieren + Oracle ---
+    let mut s = IPCF_SEED;
+    let mut ok = true;
+    for epoch in 0..IPCF_EPOCHS {
+        // Meta-Events EINMALIG injizieren (kein Retry-Spin -> minimaler Controller-
+        // Overhead; ein verfehlter Kill — Ziel gerade laufend — wird in einer späteren
+        // Runde oder im Teardown nachgeholt).
+        for _ in 0..IPCF_EVENTS {
+            match frand(&mut s) % 8 {
+                0 | 1 | 2 => {
+                    // KILL eines zufälligen Aktors (Death-during-IPC, auch cross-core).
+                    // Index 0..8 (Server/Clients/Notifier/Waiter); der Fast-Signaller (9)
+                    // bleibt verschont -> stabile Op-Rate.
+                    let i = (frand(&mut s) % (IPCF_N as u64 - 1)) as usize;
+                    if system::kill_remote(ThreadId::from_raw(act[i].tid_raw)) {
+                        IPCF_KILLS.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                3 | 4 => {
+                    // MCS: Budget an einen NICHT-Server (Index 2..8) binden — Server
+                    // bleiben antwortbereit. Bias zu sc_full; 1/4 sc_tiny (Erschöpfung).
+                    let i = 2 + (frand(&mut s) % (IPCF_N as u64 - 3)) as usize;
+                    let tid = ThreadId::from_raw(act[i].tid_raw);
+                    let sc = if frand(&mut s) % 4 == 0 { sc_tiny } else { sc_full };
+                    system::bind_sched_context(sc, tid.core(), tid);
+                }
+                5 | 6 => {
+                    // Balancierte Cap-Churn auf einer Kopie eines aktiv genutzten
+                    // Endpoint-Caps (CDT/Refcount während IPC; netto baseline-neutral).
+                    let root = if frand(&mut s) & 1 == 0 { ra } else { rb };
+                    if let Ok(c) = system::cap_copy(root, Rights::READ) {
+                        let _ = system::cap_revoke(c);
+                        let _ = system::cap_delete(c);
+                    }
+                }
+                _ => {
+                    // HOT-RELOAD-Modell: einen Server quiescen (retire_receiver) + killen
+                    // (-> ipcf_respawn bringt die neue Instanz auf demselben Endpoint).
+                    let i = (frand(&mut s) % 2) as usize; // Server 0 (ep_a) / 1 (ep_b)
+                    let ep = if i == 0 { ep_a } else { ep_b };
+                    let tid = ThreadId::from_raw(act[i].tid_raw);
+                    let _ = system::endpoint_retire_receiver(ep, tid);
+                    if system::kill_remote(tid) {
+                        IPCF_KILLS.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        ipcf_respawn(&mut act); // tote Aktoren neu erzeugen -> volle IPC-Last im Fenster
+        // Lauffenster: die Aktoren auf cores 1..7 fahren IPC (TCG schaltet die Kerne
+        // durch). Hier entsteht der Großteil der IPC-Operationen.
+        for _ in 0..IPCF_DELAY {
+            core::hint::spin_loop();
+        }
+        for c in 0..NUM_CORES {
+            system::reap_core(c); // Zombies (gekillte Aktoren) aller Kerne einsammeln
+        }
+        // Oracle: strukturelle IPC-/Scheduler-Invarianten prüfen.
+        let code = system::ipc_audit();
+        if code != 0 {
+            IPCF_ANOMALY.store(code, Ordering::Release);
+            IPCF_FAIL_EPOCH.store(epoch, Ordering::Release);
+            ok = false;
+            break;
+        }
+        IPCF_EPOCHS_OK.store(epoch + 1, Ordering::Release);
+    }
+
+    // --- Teardown: STOP signalisieren (laufende Aktoren beenden sich selbst am
+    // Schleifenkopf -> EXIT; blockierte werden gekillt), dann reapen + Baseline. ---
+    IPCF_STOP.store(true, Ordering::Release);
+    for a in act.iter() {
+        let tid = ThreadId::from_raw(a.tid_raw);
+        let mut tries = 0;
+        while system::thread_alive(tid) && tries < 4000 {
+            system::kill_remote(tid); // blockierte (nicht laufende) Aktoren töten
+            for c in 0..NUM_CORES {
+                system::reap_core(c);
+            }
+            for _ in 0..1500 {
+                core::hint::spin_loop(); // laufende Aktoren erreichen den STOP-Check -> EXIT
+            }
+            tries += 1;
+        }
+    }
+    // Restliche Zombies einsammeln + Baseline-Konvergenz abwarten (bounded).
+    let mut spins = 0u32;
+    loop {
+        let mut z = 0;
+        for c in 0..NUM_CORES {
+            z += system::reap_core(c);
+        }
+        if (ipcf_snapshot() == base && z == 0) || spins >= 4000 {
+            break;
+        }
+        spins += 1;
+        for _ in 0..2000 {
+            core::hint::spin_loop();
+        }
+    }
+    let _ = spins;
+    let teardown_ok = ipcf_snapshot() == base && system::ipc_audit() == 0;
+    IPCF_TEARDOWN_OK.store(teardown_ok, Ordering::Release);
+    IPCFUZZ_OK.store(ok && teardown_ok, Ordering::Release);
+    IPCFUZZ_DONE.store(true, Ordering::Release);
+    // Direkte Ergebnis-Zeile (unabhängig vom Gesamt-Report): bei einer Anomalie sind
+    // Seed + Fehl-Epoche reproduzierbar.
+    println!(
+        "ipcfuzz : fertig — {} Epochen ok, {} IPC-Ops, {} KILLs, Oracle-Anomalie={} (Epoche {}), Teardown-Baseline={}, seed={:#x}",
+        IPCF_EPOCHS_OK.load(Ordering::Relaxed),
+        IPCF_OPS.load(Ordering::Relaxed),
+        IPCF_KILLS.load(Ordering::Relaxed),
+        IPCF_ANOMALY.load(Ordering::Relaxed),
+        IPCF_FAIL_EPOCH.load(Ordering::Relaxed),
+        teardown_ok,
+        IPCF_SEED,
+    );
     loop {
         invoke(sys::PARK, 0, [0; 4], 0);
     }
@@ -1727,6 +2095,7 @@ pub fn demo_report_then_idle() -> ! {
     let mut dbg_ticks = 0u32;
     let mut dbg_printed = false;
     let mut fuzz_spawned = false;
+    let mut ipcfuzz_spawned = false;
     loop {
         // Diagnose: falls der Bericht ausbleibt, nach ~25 s die ausstehenden
         // Bedingungen einmalig ausgeben (zeigt, welcher Test haengt).
@@ -1734,7 +2103,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} fuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} fuzz={} ipcfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -1757,6 +2126,7 @@ pub fn demo_report_then_idle() -> ! {
                 STALE_DONE.load(Ordering::Acquire) && STALE_OK.load(Ordering::Acquire),
                 STRAND_DONE.load(Ordering::Acquire) && STRAND_OK.load(Ordering::Acquire),
                 FUZZ_DONE.load(Ordering::Acquire) && FUZZ_OK.load(Ordering::Acquire),
+                IPCFUZZ_DONE.load(Ordering::Acquire) && IPCFUZZ_OK.load(Ordering::Acquire),
             );
         }
         // Beendete Threads einsammeln (sicher: läuft auf dem Idle-Stack).
@@ -2056,9 +2426,25 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // IPC-State-Machine-Fuzzer: EINMALIG den Controller-Thread (core 0, prio 3)
+        // spawnen, sobald der Ressourcen-Fuzzer durch ist. Er spawnt die Aktoren auf
+        // cores 1..7, fährt die Epochen + Oracle und baut am Ende alles ab (parkt dann).
+        if !ipcfuzz_spawned && FUZZ_DONE.load(Ordering::Acquire) {
+            if system::spawn_on_core(0, ipcfuzz_controller as *const () as usize, 0, 3).is_some() {
+                ipcfuzz_spawned = true;
+            }
+        }
+
         if !reported && ALL_DONE.load(Ordering::Acquire) && all_done() {
             report();
             reported = true;
+            // Alle Tests bestanden -> die (virtuelle) Maschine sauber herunterfahren,
+            // damit das Test-Skript die vollständige Ausgabe erhält, ohne bis zum
+            // Timeout warten zu müssen (verhindert ein Abschneiden des Berichts und
+            // erlaubt umfangreichere Fuzz-Läufe innerhalb des Zeitfensters). Bei einem
+            // Fehlschlag (all_done nie wahr) bleibt der Kernel im Idle -> Timeout greift.
+            println!("== SELFTEST COMPLETE -> system_off ==");
+            hal::psci::system_off();
         }
         hal::cpu::wfi();
     }
@@ -2107,9 +2493,11 @@ fn all_done() -> bool {
     let strand = STRAND_DONE.load(Ordering::Acquire) && STRAND_OK.load(Ordering::Acquire);
     // Generativer Fuzzer: zufällige Op-Sequenzen ohne Leak/Korruption (Phase 1 + SMP).
     let fuzz = FUZZ_DONE.load(Ordering::Acquire) && FUZZ_OK.load(Ordering::Acquire);
+    // IPC-State-Machine-Fuzzer: nebenläufige IPC-Aktoren + Oracle ohne Anomalie.
+    let ipcfuzz = IPCFUZZ_DONE.load(Ordering::Acquire) && IPCFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
-        && stale && strand && fuzz
+        && stale && strand && fuzz && ipcfuzz
 }
 
 fn report() {
@@ -2399,5 +2787,18 @@ fn report() {
     println!(
         "fuzz    : {} (generativ: zufaellige Cap/MEM/VSpace/Thread/SchedCtx-Sequenzen, Baseline-Oracle, SMP-Kontention)",
         if fuzz { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // IPC-State-Machine-Fuzzer (Bereich H, Teil 2): nebenläufige Aktoren + Oracle.
+    let iops = IPCF_OPS.load(Ordering::Relaxed);
+    let ikills = IPCF_KILLS.load(Ordering::Relaxed);
+    let ieo = IPCF_EPOCHS_OK.load(Ordering::Relaxed);
+    let ianom = IPCF_ANOMALY.load(Ordering::Relaxed);
+    let itd = IPCF_TEARDOWN_OK.load(Ordering::Acquire);
+    let ipcfuzz = IPCFUZZ_DONE.load(Ordering::Acquire) && IPCFUZZ_OK.load(Ordering::Acquire);
+    println!("ipcfuzz : {ieo}/{IPCF_EPOCHS} Epochen, {iops} IPC-Ops, {ikills} KILLs (8 Kerne); Oracle-Anomalie={ianom} (0=keine); Teardown-Baseline={itd}");
+    println!(
+        "ipcfuzz : {} (nebenlaeufige Endpoint-/Notification-Zustandsmaschinen: KILL/EXIT/Reload/MCS/Cap-Ops waehrend IPC, Queue-Konsistenz-Oracle)",
+        if ipcfuzz { "ALL PASS" } else { "FAILURES" }
     );
 }

@@ -8,9 +8,21 @@ use core::arch::asm;
 
 /// `CPU_ON` (SMC64-Funktions-ID gemäß QEMU-DTB).
 const PSCI_CPU_ON: u64 = 0xC400_0003;
+/// `SYSTEM_OFF` (SMC32-Funktions-ID) — fährt die (virtuelle) Maschine herunter.
+const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 
 /// PSCI-Statuscodes (Auswahl).
 pub const SUCCESS: i64 = 0;
+
+/// Die (virtuelle) Maschine **sauber herunterfahren** (QEMU beendet sich). Wird nach
+/// erfolgreichem Testdurchlauf aufgerufen, damit das Test-Skript die vollständige
+/// Ausgabe erhält und nicht bis zum Timeout warten muss (kein Abschneiden des Reports).
+pub fn system_off() -> ! {
+    // SAFETY: PSCI-Firmware-Call via HVC; kehrt nicht zurück (Maschine aus).
+    unsafe {
+        asm!("hvc #0", in("x0") PSCI_SYSTEM_OFF, options(nostack, noreturn));
+    }
+}
 
 /// Einen ausgeschalteten Kern starten.
 ///

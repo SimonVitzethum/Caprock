@@ -240,6 +240,18 @@ impl CapSpace {
 
     // --- Inspektion ---
 
+    /// Anzahl belegter Cap-Slots — für Leak-/Konsistenzprüfungen (Fuzzer-Oracle).
+    pub fn used_slots(&self) -> usize {
+        self.slots.iter().filter(|s| s.used).count()
+    }
+
+    /// Anzahl belegter Objekt-Einträge — für Leak-/Konsistenzprüfungen. Nach dem
+    /// Löschen aller abgeleiteten Caps muss dieser Wert zur Baseline zurückkehren
+    /// (sonst CDT-/Refcount-Leck: ein Objekt ohne lebende Cap).
+    pub fn used_objects(&self) -> usize {
+        self.objects.iter().filter(|o| o.used).count()
+    }
+
     /// Sicht auf einen Cap (oder `None` bei ungültigem Handle).
     pub fn inspect(&self, ptr: CapPtr) -> Option<CapInfo> {
         let slot = self.resolve(ptr).ok()?;

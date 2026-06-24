@@ -14,6 +14,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use sel4lake_abi::{result, sys, GRANT_FLAG, GRANT_RECV_SLOT};
 use sel4lake_hal::{self as hal, println, syscall::invoke};
 use sel4lake_mem::{peek_u64, poke_u64, Rights};
+use sel4lake_cap::CapPtr;
 use sel4lake_sched::ThreadId;
 use sel4lake_sync::SpinLock;
 
@@ -135,6 +136,33 @@ static STRAND_SETTLE: AtomicU32 = AtomicU32::new(0);
 static STRAND_STOP: AtomicBool = AtomicBool::new(false);
 static STRAND_DONE: AtomicBool = AtomicBool::new(false);
 static STRAND_OK: AtomicBool = AtomicBool::new(false);
+
+// --- Generativer Kernel-Fuzzer (Audit Bereich H) ---
+// DETERMINISTISCH (fester Seed -> jeder Fehlschlag reproduzierbar). Ein dedizierter
+// Treiber-Thread auf core 0 fährt zufällige Operationssequenzen über Capabilities/
+// Speicher/VSpaces/Threads/SchedContexts. Phase 1: pro Epoche N zufällige Ops, die
+// verfolgte Objekte erzeugen/mutieren, dann VOLLSTÄNDIGER Teardown + ORACLE — alle
+// Ressourcenstände (MEM/TCB/VSpace/kstack + Cap-Slots/Cap-Objekte) müssen exakt zur
+// Baseline zurückkehren (sonst Leak/Zombie/CDT-Verletzung). Phase 2: balancierte
+// Cap/MEM-Churn parallel auf allen Kernen (SMP-Lock-Kontention), danach Baseline-Check.
+const FUZZ_EPOCHS: u32 = 24;
+const FUZZ_OPS_PER_EPOCH: u32 = 50;
+const FUZZ_CAP_POOL: usize = 24;
+const FUZZ_THREAD_POOL: usize = 10;
+const FUZZ_MAP_POOL: usize = 8;
+const FUZZ_SEED: u64 = 0x5E14_1A4E_2026_0624; // fester Seed
+const FUZZ_SMP_ITERS: u32 = 4000; // Treiber-Churn-Iterationen während der SMP-Phase
+static FUZZ_DONE: AtomicBool = AtomicBool::new(false);
+static FUZZ_OK: AtomicBool = AtomicBool::new(false);
+static FUZZ_OPS: AtomicU64 = AtomicU64::new(0); // ausgeführte Phase-1-Operationen
+static FUZZ_EPOCHS_OK: AtomicU32 = AtomicU32::new(0); // bestandene Epochen
+static FUZZ_FAIL: AtomicU32 = AtomicU32::new(0); // 0=ok, sonst Invarianten-Code (1..6)
+// Phase 2 (SMP): Noise-Worker auf cores 1..NUM_CORES + Treiber-Churn auf core 0.
+static FUZZ_SMP_GO: AtomicBool = AtomicBool::new(false);
+static FUZZ_SMP_STOP: AtomicBool = AtomicBool::new(false);
+static FUZZ_SMP_ACK: AtomicU32 = AtomicU32::new(0);
+static FUZZ_SMP_OK: AtomicBool = AtomicBool::new(false);
+static FUZZ_SMP_OPS: AtomicU64 = AtomicU64::new(0); // balancierte Churn-Iterationen (alle Kerne)
 
 const RECLAIM_TARGET: u64 = 16;
 const RECLAIM_PRIO: u8 = 6; // höchste Demo-Prio: Exiter läuft sofort + beendet sich
@@ -999,6 +1027,366 @@ extern "C" fn strand_worker(_arg: usize) -> ! {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Generativer Kernel-Fuzzer (Bereich H) — Helfer, Treiber, SMP-Noise-Worker.
+// ---------------------------------------------------------------------------
+
+/// Deterministischer PRNG (xorshift64). Fester Seed -> jeder Fehlschlag reproduzierbar.
+fn frand(s: &mut u64) -> u64 {
+    let mut x = *s;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *s = x;
+    x
+}
+
+/// Zufällige Rechte für copy/mint (Kind erbt ⊆ Eltern via `intersect`).
+fn frand_rights(s: &mut u64) -> Rights {
+    match frand(s) % 4 {
+        0 => Rights::READ,
+        1 => Rights::WRITE,
+        2 => Rights::RWX,
+        _ => Rights::EXEC,
+    }
+}
+
+/// Index eines zufälligen belegten Pool-Eintrags (oder `None`, falls leer).
+fn pick_live<T: Copy>(pool: &[Option<T>], s: &mut u64) -> Option<usize> {
+    let n = pool.iter().filter(|x| x.is_some()).count();
+    if n == 0 {
+        return None;
+    }
+    let mut k = (frand(s) % n as u64) as usize;
+    for (i, x) in pool.iter().enumerate() {
+        if x.is_some() {
+            if k == 0 {
+                return Some(i);
+            }
+            k -= 1;
+        }
+    }
+    None
+}
+
+/// Index eines freien Pool-Eintrags.
+fn free_slot<T>(pool: &[Option<T>]) -> Option<usize> {
+    pool.iter().position(|x| x.is_none())
+}
+
+/// Ressourcen-Snapshot fürs Oracle: (MEM frei, TCBs core0, freie VSpaces, freie
+/// kstack-Pool-Slots, belegte Cap-Slots, belegte Cap-Objekte).
+fn fuzz_snapshot() -> (u64, usize, usize, usize, usize, usize) {
+    (
+        system::total_free(),
+        system::used_tcbs(0),
+        system::free_vspaces(),
+        system::user_kstack_free_count(),
+        system::cap_used_slots(),
+        system::cap_used_objects(),
+    )
+}
+
+/// Oracle: Baseline-Wiederherstellung prüfen. Gibt einen Invarianten-Code (1..6) des
+/// ERSTEN Bruchs zurück, sonst `None`. 1=MEM,2=TCB,3=VSpace,4=kstack,5=Slots,6=Objekte.
+fn fuzz_check(base: &(u64, usize, usize, usize, usize, usize)) -> Option<u32> {
+    let now = fuzz_snapshot();
+    if now.0 != base.0 {
+        return Some(1);
+    }
+    if now.1 != base.1 {
+        return Some(2);
+    }
+    if now.2 != base.2 {
+        return Some(3);
+    }
+    if now.3 != base.3 {
+        return Some(4);
+    }
+    if now.4 != base.4 {
+        return Some(5);
+    }
+    if now.5 != base.5 {
+        return Some(6);
+    }
+    None
+}
+
+/// Eine zufällige Operation ausführen (alle nicht-blockierend, kernelintern). Die
+/// Pools modellieren die vom Fuzzer verfolgten Objekte. Fehlschläge (volle Pools,
+/// stale Caps) werden tolerant übersprungen.
+#[allow(clippy::too_many_arguments)]
+fn fuzz_step(
+    s: &mut u64,
+    caps: &mut [Option<CapPtr>; FUZZ_CAP_POOL],
+    threads: &mut [Option<(u64, bool)>; FUZZ_THREAD_POOL],
+    maps: &mut [Option<(u64, u64)>; FUZZ_MAP_POOL],
+) {
+    match frand(s) % 12 {
+        0 => {
+            // Memory-Cap installieren (Wurzel; Frame wird beim Löschen freigegeben).
+            if let Some(i) = free_slot(caps) {
+                if let Some(c) = system::alloc(4096, 4096) {
+                    if let Ok(p) = system::cap_install(c) {
+                        caps[i] = Some(p);
+                    }
+                    // (cap_install verbraucht c; bei Err — cspace voll — geht der Frame
+                    // verloren, tritt bei beschränkten Pools nicht auf.)
+                }
+            }
+        }
+        1 | 2 => {
+            // copy / mint: Kind ableiten (Rechte ⊆ Eltern).
+            if let (Some(src), Some(dst)) = (pick_live(caps, s), free_slot(caps)) {
+                let p = caps[src].unwrap();
+                let r = frand_rights(s);
+                let res = if frand(s) & 1 == 0 {
+                    system::cap_copy(p, r)
+                } else {
+                    system::cap_mint(p, r, frand(s))
+                };
+                if let Ok(np) = res {
+                    caps[dst] = Some(np);
+                }
+            }
+        }
+        3 => {
+            // move: Cap an einen neuen Slot verschieben (altes Handle wird ungültig).
+            if let Some(i) = pick_live(caps, s) {
+                if let Ok(np) = system::cap_move(caps[i].unwrap()) {
+                    caps[i] = Some(np);
+                }
+            }
+        }
+        4 => {
+            // delete (blatt-only): bei Kindern Fehler -> übersprungen.
+            if let Some(i) = pick_live(caps, s) {
+                if system::cap_delete(caps[i].unwrap()).is_ok() {
+                    caps[i] = None;
+                }
+            }
+        }
+        5 => {
+            // revoke: löscht Nachfahren von caps[i]. Danach können ANDERE Einträge
+            // stale sein -> einsammeln.
+            if let Some(i) = pick_live(caps, s) {
+                let _ = system::cap_revoke(caps[i].unwrap());
+                for c in caps.iter_mut() {
+                    if let Some(p) = *c {
+                        if system::cap_inspect(p).is_none() {
+                            *c = None;
+                        }
+                    }
+                }
+            }
+        }
+        6 => {
+            // plain-Thread spawnen (prio 0 -> läuft nie, reiner Ressourcen-Halter).
+            if let Some(i) = free_slot(threads) {
+                if let Some(t) = system::spawn_on_core(0, balanced_worker as *const () as usize, 0, 0)
+                {
+                    threads[i] = Some((t.to_raw(), false));
+                }
+            }
+        }
+        7 => {
+            // isolierten EL0-Thread spawnen (eigene VSpace + ASID + kstack).
+            if let Some(i) = free_slot(threads) {
+                if let Some((t, _)) =
+                    system::spawn_isolated(churn_dummy as *const () as usize, 0, 0)
+                {
+                    threads[i] = Some((t.to_raw(), true));
+                }
+            }
+        }
+        8 => {
+            // Thread zerstören (vollständiger Teardown). Zugehörige Mappings verwerfen.
+            if let Some(i) = pick_live(threads, s) {
+                let (raw, iso) = threads[i].unwrap();
+                let tid = ThreadId::from_raw(raw);
+                if iso {
+                    system::destroy_isolated(tid);
+                } else {
+                    system::kill_local(tid);
+                }
+                while system::reap() > 0 {}
+                for m in maps.iter_mut() {
+                    if matches!(*m, Some((mt, _)) if mt == raw) {
+                        *m = None;
+                    }
+                }
+                threads[i] = None;
+            }
+        }
+        9 => {
+            // Frame in eine isolierte VSpace mappen (separater Frame + eigene Cap).
+            let iso = pick_live(threads, s).filter(|&i| threads[i].map_or(false, |(_, iso)| iso));
+            if let (Some(ti), Some(ci), Some(mi)) = (iso, free_slot(caps), free_slot(maps)) {
+                let (raw, _) = threads[ti].unwrap();
+                if let Some(c) = system::alloc(4096, 4096) {
+                    let base = c.base();
+                    if let Ok(p) = system::cap_install(c) {
+                        caps[ci] = Some(p);
+                        let perm = (frand(s) % 3) as u8; // 0=Ro,1=Rw,2=Rx
+                        if system::map_into_thread(ThreadId::from_raw(raw), base, 4096, perm) {
+                            maps[mi] = Some((raw, base));
+                        }
+                    }
+                }
+            }
+        }
+        10 => {
+            // Eine Mapping wieder entfernen (per-Seite-Unmap-Pfad).
+            if let Some(i) = pick_live(maps, s) {
+                let (raw, base) = maps[i].unwrap();
+                system::unmap_into_thread(ThreadId::from_raw(raw), base, 4096);
+                maps[i] = None;
+            }
+        }
+        _ => {
+            // SchedContext-Cap prägen + an einen Thread binden.
+            if let (Some(ti), Some(ci)) = (pick_live(threads, s), free_slot(caps)) {
+                let (raw, _) = threads[ti].unwrap();
+                let budget = (frand(s) % 8) as u32;
+                let period = 1 + (frand(s) % 64) as u32;
+                if let Ok(sc) = system::install_sched_context_cap(budget, period, Rights::WRITE) {
+                    caps[ci] = Some(sc);
+                    system::bind_sched_context(sc, 0, ThreadId::from_raw(raw));
+                }
+            }
+        }
+    }
+}
+
+/// Alles abbauen, was eine Epoche erzeugt hat — Reihenfolge: erst Threads (deren
+/// VSpace-Teardown entfernt Mappings), dann Caps (gibt Frames frei). So kein
+/// dangling Mapping auf einen bereits freigegebenen Frame.
+fn fuzz_teardown(
+    caps: &mut [Option<CapPtr>; FUZZ_CAP_POOL],
+    threads: &mut [Option<(u64, bool)>; FUZZ_THREAD_POOL],
+    maps: &mut [Option<(u64, u64)>; FUZZ_MAP_POOL],
+) {
+    for t in threads.iter_mut() {
+        if let Some((raw, iso)) = *t {
+            let tid = ThreadId::from_raw(raw);
+            if iso {
+                system::destroy_isolated(tid);
+            } else {
+                system::kill_local(tid);
+            }
+            *t = None;
+        }
+    }
+    while system::reap() > 0 {}
+    for m in maps.iter_mut() {
+        *m = None;
+    }
+    // Jede noch gültige Cap revoken (Nachfahren weg) + löschen (Wurzel -> Frame frei).
+    for c in caps.iter_mut() {
+        if let Some(p) = *c {
+            if system::cap_inspect(p).is_some() {
+                let _ = system::cap_revoke(p);
+                let _ = system::cap_delete(p);
+            }
+            *c = None;
+        }
+    }
+}
+
+/// **Fuzzer-Treiber** (EL1, core 0, prio 2 -> dominiert core 0 während des Fuzzings).
+/// Phase 1: Epochen aus zufälligen Ops + Teardown + Oracle. Phase 2: SMP-Churn.
+extern "C" fn fuzz_driver(_arg: usize) -> ! {
+    let mut s = FUZZ_SEED;
+    let mut caps: [Option<CapPtr>; FUZZ_CAP_POOL] = [None; FUZZ_CAP_POOL];
+    let mut threads: [Option<(u64, bool)>; FUZZ_THREAD_POOL] = [None; FUZZ_THREAD_POOL];
+    let mut maps: [Option<(u64, u64)>; FUZZ_MAP_POOL] = [None; FUZZ_MAP_POOL];
+
+    // Baseline nach dem Leeren ausstehender Zombies.
+    while system::reap() > 0 {}
+    let base = fuzz_snapshot();
+
+    let mut ok = true;
+    for epoch in 0..FUZZ_EPOCHS {
+        for _ in 0..FUZZ_OPS_PER_EPOCH {
+            fuzz_step(&mut s, &mut caps, &mut threads, &mut maps);
+            FUZZ_OPS.fetch_add(1, Ordering::Relaxed);
+        }
+        fuzz_teardown(&mut caps, &mut threads, &mut maps);
+        while system::reap() > 0 {}
+        if let Some(code) = fuzz_check(&base) {
+            FUZZ_FAIL.store(code, Ordering::Release);
+            ok = false;
+            break;
+        }
+        FUZZ_EPOCHS_OK.store(epoch + 1, Ordering::Release);
+    }
+
+    // Phase 2: SMP-Churn. Noise-Worker auf cores 1..NUM_CORES; Baseline NACH dem Spawn
+    // (Worker warten auf GO -> fester Footprint). Dann GO, Treiber-Churn auf core 0,
+    // STOP, auf Quiesce aller Worker warten, Baseline-Check (alle Churn balanciert).
+    let mut smp_workers = 0u32;
+    for c in 1..NUM_CORES {
+        if system::spawn_on_core(c, fuzz_noise as *const () as usize, 0, 5).is_some() {
+            smp_workers += 1;
+        }
+    }
+    let smp_base = fuzz_snapshot();
+    FUZZ_SMP_GO.store(true, Ordering::Release);
+    for _ in 0..FUZZ_SMP_ITERS {
+        fuzz_noise_iter(); // core 0 churnt mit
+    }
+    FUZZ_SMP_STOP.store(true, Ordering::Release);
+    // Auf Quiesce warten (bounded; TCG-Round-Robin lässt die anderen Kerne acken).
+    let mut spins = 0u64;
+    while FUZZ_SMP_ACK.load(Ordering::Acquire) < smp_workers && spins < 200_000_000 {
+        core::hint::spin_loop();
+        spins += 1;
+    }
+    while system::reap() > 0 {}
+    let smp_ok = FUZZ_SMP_ACK.load(Ordering::Acquire) == smp_workers && fuzz_check(&smp_base).is_none();
+    FUZZ_SMP_OK.store(smp_ok, Ordering::Release);
+
+    FUZZ_OK.store(ok && smp_ok, Ordering::Release);
+    FUZZ_DONE.store(true, Ordering::Release);
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// Eine vollständig balancierte Cap/MEM-Churn-Iteration (netto 0): Frame -> Cap ->
+/// Copy -> Revoke(Wurzel, löscht Copy) -> Delete(Wurzel, gibt Frame frei). Von core 0
+/// (Treiber) und den Noise-Workern genutzt -> konkurrierender Zugriff auf CAPS+MEM.
+fn fuzz_noise_iter() {
+    if let Some(c) = system::alloc(4096, 4096) {
+        match system::cap_install(c) {
+            Ok(root) => {
+                if system::cap_copy(root, Rights::READ).is_ok() {
+                    let _ = system::cap_revoke(root);
+                }
+                let _ = system::cap_delete(root);
+            }
+            Err(_) => { /* cspace voll (unter beschränkter Last unerreichbar) */ }
+        }
+    }
+    FUZZ_SMP_OPS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// **SMP-Noise-Worker** (EL1, je Sekundärkern): wartet auf GO, churnt dann balanciert
+/// (CAPS+MEM) bis STOP, quittiert (ACK) und parkt. Erzeugt echte Mehrkern-Kontention
+/// auf den globalen CAPS-/MEM-Locks + interleavte CDT-Mutationen.
+extern "C" fn fuzz_noise(_arg: usize) -> ! {
+    while !FUZZ_SMP_GO.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    while !FUZZ_SMP_STOP.load(Ordering::Acquire) {
+        fuzz_noise_iter();
+    }
+    FUZZ_SMP_ACK.fetch_add(1, Ordering::Release);
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
 /// Cross-Core-Park/Wake-Thread (EL1, auf core 1): blockiert sich per `PARK`; core 0
 /// weckt ihn kern-übergreifend per `wake_remote` (Reschedule-IPI). Setzt nach dem
 /// Aufwachen `XCORE_WOKEN` — Beleg für den IPI-getriebenen Cross-Core-Unblock.
@@ -1338,6 +1726,7 @@ pub fn demo_report_then_idle() -> ! {
     let mut reported = false;
     let mut dbg_ticks = 0u32;
     let mut dbg_printed = false;
+    let mut fuzz_spawned = false;
     loop {
         // Diagnose: falls der Bericht ausbleibt, nach ~25 s die ausstehenden
         // Bedingungen einmalig ausgeben (zeigt, welcher Test haengt).
@@ -1345,7 +1734,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} fuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -1367,6 +1756,7 @@ pub fn demo_report_then_idle() -> ! {
                 MCS_DONE.load(Ordering::Acquire) && MCS_OK.load(Ordering::Acquire),
                 STALE_DONE.load(Ordering::Acquire) && STALE_OK.load(Ordering::Acquire),
                 STRAND_DONE.load(Ordering::Acquire) && STRAND_OK.load(Ordering::Acquire),
+                FUZZ_DONE.load(Ordering::Acquire) && FUZZ_OK.load(Ordering::Acquire),
             );
         }
         // Beendete Threads einsammeln (sicher: läuft auf dem Idle-Stack).
@@ -1652,6 +2042,20 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // Generativer Fuzzer (Bereich H): EINMALIG den Treiber-Thread auf core 0
+        // (prio 2) spawnen, sobald die anderen Audit-Tests (stale/strand) + MCS durch
+        // sind. Der Treiber dominiert core 0 bis er fertig ist (parkt dann), fährt
+        // Phase 1 (Epochen + Oracle) und Phase 2 (SMP-Churn) selbstständig.
+        if !fuzz_spawned
+            && MCS_DONE.load(Ordering::Acquire)
+            && STALE_DONE.load(Ordering::Acquire)
+            && STRAND_DONE.load(Ordering::Acquire)
+        {
+            if system::spawn_on_core(0, fuzz_driver as *const () as usize, 0, 2).is_some() {
+                fuzz_spawned = true;
+            }
+        }
+
         if !reported && ALL_DONE.load(Ordering::Acquire) && all_done() {
             report();
             reported = true;
@@ -1701,9 +2105,11 @@ fn all_done() -> bool {
     let stale = STALE_DONE.load(Ordering::Acquire) && STALE_OK.load(Ordering::Acquire);
     // Audit-Regression B: erneutes Budget-Bind strandet einen erschöpften Thread nicht.
     let strand = STRAND_DONE.load(Ordering::Acquire) && STRAND_OK.load(Ordering::Acquire);
+    // Generativer Fuzzer: zufällige Op-Sequenzen ohne Leak/Korruption (Phase 1 + SMP).
+    let fuzz = FUZZ_DONE.load(Ordering::Acquire) && FUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
-        && stale && strand
+        && stale && strand && fuzz
 }
 
 fn report() {
@@ -1980,5 +2386,18 @@ fn report() {
     println!(
         "strand  : {} (set_budget/bind_sched_context strandet einen erschoepften Thread nicht)",
         if strand { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Generativer Fuzzer (Bereich H): zufaellige Op-Sequenzen, Oracle nach jeder Epoche.
+    let fops = FUZZ_OPS.load(Ordering::Relaxed);
+    let feo = FUZZ_EPOCHS_OK.load(Ordering::Relaxed);
+    let ffail = FUZZ_FAIL.load(Ordering::Relaxed);
+    let fsmp = FUZZ_SMP_OK.load(Ordering::Acquire);
+    let fsmpops = FUZZ_SMP_OPS.load(Ordering::Relaxed);
+    let fuzz = FUZZ_DONE.load(Ordering::Acquire) && FUZZ_OK.load(Ordering::Acquire);
+    println!("fuzz    : Phase1 {feo}/{FUZZ_EPOCHS} Epochen, {fops} gepruefte Ops, Oracle-Bruch-Code={ffail} (0=keiner); Phase2 {fsmpops} SMP-Churn-Iter (8 Kerne) ok={fsmp}; gesamt ~{} Ops", fops + fsmpops);
+    println!(
+        "fuzz    : {} (generativ: zufaellige Cap/MEM/VSpace/Thread/SchedCtx-Sequenzen, Baseline-Oracle, SMP-Kontention)",
+        if fuzz { "ALL PASS" } else { "FAILURES" }
     );
 }

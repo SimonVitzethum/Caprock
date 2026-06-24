@@ -437,6 +437,15 @@ pub fn fragments() -> usize {
 
 // --- Capability-Space + PDs (CAPS) ---
 
+/// Anzahl belegter Cap-Slots (Fuzzer-/Leak-Oracle).
+pub fn cap_used_slots() -> usize {
+    CAPS.lock().cspace.used_slots()
+}
+/// Anzahl belegter Cap-Objekte (Fuzzer-/Leak-Oracle: kein Objekt ohne lebende Cap).
+pub fn cap_used_objects() -> usize {
+    CAPS.lock().cspace.used_objects()
+}
+
 pub fn cap_install(cap: MemoryCap) -> Result<CapPtr, CapError> {
     CAPS.lock().cspace.install_memory(cap)
 }
@@ -736,6 +745,18 @@ pub fn map_into_thread(tid: ThreadId, base: u64, len: u64, perm_code: u8) -> boo
         _ => hal::mmu::UserPerm::Ro,
     };
     vspace_map(asid, base, len, perm)
+}
+
+/// Kernel-Setup-Gegenstück zu [`map_into_thread`]: `[base, base+len)` aus der VSpace
+/// des Threads `tid` wieder entfernen (Seiten auf EL1-only, TLB-Flush). Für den
+/// Fuzzer/Tests, um den per-Seite-Unmap-Pfad explizit zu fahren. No-Op (false) für
+/// nicht-isolierte Threads.
+pub fn unmap_into_thread(tid: ThreadId, base: u64, len: u64) -> bool {
+    let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
+    if asid == 0 {
+        return false;
+    }
+    vspace_unmap(asid, base, len)
 }
 
 /// Eine isolierte VSpace abbauen: alle per-PD-L3-Tabellen **und** L1+L2 an `MEM`

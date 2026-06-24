@@ -166,12 +166,10 @@ verbunden — daher dokumentiert statt sofort gefixt.
 1. Zero-on-Free (größenbegrenzt/gated) — Risiko 1.
 2. Reply-Caps + Mehrfach-Waiter — Risiken 2/3.
 3. Badge≠0 erzwingen — Risiko 4.
-4. **Generativer Kernel-Fuzzer** (Bereich H): zufällige Sequenzen aus Spawn/Kill/Exit/
-   Yield/Map/Unmap/Call/Reply/Signal/Wait/Cap-Ops/Reload/Bind über alle 8 Kerne, nach
-   jeder Runde Invarianten prüfen (keine Leaks/Zombies/toten Refs/Queue-Korruption). In
-   diesem Audit wurde **kein** vollständiger Fuzzer gebaut (Umfang/Stabilität); die
-   gezielten Repro-Tests + der bestehende Churn-Test (2000 Zyklen) decken die
-   höchstprioren Pfade ab. Ein Fuzzer ist der nächste sinnvolle Schritt.
+4. **Generativer Kernel-Fuzzer** (Bereich H): **umgesetzt** in [ext-19](ext-19-generative-fuzzer.md)
+   — deterministische zufällige Op-Sequenzen (Cap-CDT/Map-Unmap/Spawn-Kill-Destroy/
+   SchedContext-Bind) mit Baseline-Oracle nach jeder Epoche + SMP-Cap/MEM-Kontention
+   über alle 8 Kerne (~30k Ops je Lauf). Neuer `fuzz`-Check.
 5. 64-bit-Generation; defensives Idle-Handling — Risiken 6/7.
 
 **Ergebnis:** 2 reale, erreichbare Bugs (1× Kernel-DoS, 1× Thread-DoS) gefunden,

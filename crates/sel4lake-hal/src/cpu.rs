@@ -64,6 +64,32 @@ pub fn dsb_sy() {
     unsafe { asm!("dsb sy", options(nostack, preserves_flags)) }
 }
 
+/// Frisch geschriebenen **Code** im Bereich `[base, base+len)` kohärent zur
+/// Instruktions-Ausführung machen: D-Cache bis PoU säubern (`dc cvau`), dann
+/// I-Cache invalidieren (`ic ivau`) + Barrieren. Nötig nach dem Laden von Code in
+/// einen Frame, bevor er ausgeführt wird (sonst holt der Kern evtl. veraltete/leere
+/// I-Cache-Zeilen). Cache-Wartung ist eine erlaubte Low-Level-Domäne.
+pub fn sync_code_range(base: usize, len: usize) {
+    const LINE: usize = 64; // konservative Cache-Line-Größe (CTR_EL0 wäre exakter)
+    let start = base & !(LINE - 1);
+    let end = base + len;
+    // SAFETY: Cache-Wartungsinstruktionen auf gültigem, kernel-besessenem RAM.
+    unsafe {
+        let mut a = start;
+        while a < end {
+            asm!("dc cvau, {}", in(reg) a, options(nostack, preserves_flags));
+            a += LINE;
+        }
+        asm!("dsb ish", options(nostack, preserves_flags));
+        a = start;
+        while a < end {
+            asm!("ic ivau, {}", in(reg) a, options(nostack, preserves_flags));
+            a += LINE;
+        }
+        asm!("dsb ish", "isb", options(nostack, preserves_flags));
+    }
+}
+
 /// Auf ein Ereignis warten (Low-Power).
 pub fn wfi() {
     // SAFETY: Hint-Instruktion ohne Speichereffekt.

@@ -736,6 +736,117 @@ pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u
     }
 }
 
+/// Einen 2-MiB-Frame `phys` als **EL0-RX-Code** in die VSpace `asid` mappen + flushen.
+fn vspace_map_code_region(asid: u16, phys: u64) -> bool {
+    let Some(l2) = vspace_l2(asid) else {
+        return false;
+    };
+    if hal::mmu::vspace_map_code_block(l2, phys) {
+        hal::mmu::flush_asid(asid);
+        true
+    } else {
+        false
+    }
+}
+
+/// Eine isolierte PD mit **privat geladenem nativem Code** erzeugen: der Code
+/// `[code, code+code_len)` wird in einen frischen Frame kopiert, der **EL0-RX** in
+/// die eigene VSpace gemappt wird (W^X; nicht die geteilte `.user_text`). Dazu ein
+/// privater EL0-RW-Stack. Der Thread startet am Anfang des Code-Frames. Beweist, dass
+/// eine isolierte PD beliebigen, nicht-geteilten Code in ihrer eigenen VSpace
+/// ausführt. Gibt die `ThreadId`.
+pub fn spawn_isolated_native(code: *const u8, code_len: usize, prio: u8) -> Option<ThreadId> {
+    let core = hal::cpu::core_id();
+    let kidx = claim_user_kstack()?;
+    let kbase = core::ptr::addr_of!(__user_kstacks_bottom) as usize + kidx * USER_KSTACK_SIZE;
+    let sz = hal::mmu::ISO_REGION_SIZE;
+
+    // Code-Frame + Stack-Frame (beide 2-MiB-ausgerichtet, in GiB 1).
+    let in_gib1 = |b: u64, l: u64| b >= hal::mmu::USER_RAM_MIN && b + l <= hal::mmu::GIB1_END;
+    let ca = MEM.lock().alloc(sz, sz);
+    let sa = MEM.lock().alloc(sz, sz);
+    let (cf, sf) = match (ca, sa) {
+        (Some(cf), Some(sf)) => (cf, sf),
+        (ca, sa) => {
+            let mut mem = MEM.lock();
+            if let Some(c) = ca {
+                mem.free_region(PhysRegion::new(c.base(), c.len()));
+            }
+            if let Some(c) = sa {
+                mem.free_region(PhysRegion::new(c.base(), c.len()));
+            }
+            drop(mem);
+            release_user_kstack(kidx);
+            return None;
+        }
+    };
+    let (cbase, clen) = (cf.base(), cf.len());
+    let (sbase, slen) = (sf.base(), sf.len());
+    if !in_gib1(cbase, clen) || !in_gib1(sbase, slen) || code_len > clen as usize {
+        let mut mem = MEM.lock();
+        mem.free_region(PhysRegion::new(cbase, clen));
+        mem.free_region(PhysRegion::new(sbase, slen));
+        drop(mem);
+        release_user_kstack(kidx);
+        return None;
+    }
+
+    // Code in den Frame kopieren (globale Map: cbase ist EL0+EL1-RW -> beschreibbar),
+    // dann I-Cache kohärent machen, bevor er ausgeführt wird.
+    // SAFETY: `cbase` ist ein frisch allozierter, identity-gemappter RW-Frame; wir
+    // kopieren genau `code_len` (<= clen) Bytes aus dem gültigen Quellpuffer.
+    unsafe {
+        core::ptr::copy_nonoverlapping(code, cbase as *mut u8, code_len);
+    }
+    hal::cpu::sync_code_range(cbase as usize, code_len);
+
+    let Some((asid, l1)) = create_vspace() else {
+        let mut mem = MEM.lock();
+        mem.free_region(PhysRegion::new(cbase, clen));
+        mem.free_region(PhysRegion::new(sbase, slen));
+        drop(mem);
+        release_user_kstack(kidx);
+        return None;
+    };
+    vspace_map_code_region(asid, cbase); // Code: EL0-RX (W^X)
+    vspace_map_region(asid, sbase); //       Stack: EL0-RW
+    let packed = ((asid as u64) << 48) | l1;
+
+    let tid = {
+        let mut sched = SCHEDS[core].lock();
+        // Entry = Anfang des privaten Code-Frames; User-Stack = privater Stack-Frame.
+        let r = sched.spawn_user(
+            core,
+            cbase as usize,
+            0,
+            kbase,
+            USER_KSTACK_SIZE,
+            sbase as usize,
+            slen as usize,
+            prio,
+        );
+        if let Some(t) = r {
+            fp_reset_slot(t.slot());
+        }
+        r
+    };
+    match tid {
+        Some(t) => {
+            VSPACE_OF[t.slot()].store(packed, Ordering::Relaxed);
+            Some(t)
+        }
+        None => {
+            vspace_teardown(asid);
+            let mut mem = MEM.lock();
+            mem.free_region(PhysRegion::new(cbase, clen));
+            mem.free_region(PhysRegion::new(sbase, slen));
+            drop(mem);
+            release_user_kstack(kidx);
+            None
+        }
+    }
+}
+
 /// Einen blockierten/geparkten Thread `tid` auf **seinem** (ggf. fremden) Kern
 /// aufwecken: die Zielinstanz sperren, ihn bereit machen und — falls es ein
 /// anderer Kern ist — einen Reschedule-IPI schicken, damit der Zielkern ihn

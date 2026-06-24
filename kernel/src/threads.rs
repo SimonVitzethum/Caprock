@@ -97,6 +97,7 @@ const ISO_BADGE_READ: u64 = 1 << 1; // isolierte PD las X (DARF NIE kommen)
 const ISO_BADGE_TRUSTED: u64 = 1 << 2; // SAS-PD las X erfolgreich
 const ISO_BADGE_MAPPED: u64 = 1 << 3; // VMM-Probe: Frame gemappt + RW erfolgreich
 const ISO_BADGE_SHARED: u64 = 1 << 4; // Reader las den Wert des Writers via Shared Frame
+const ISO_BADGE_NATIVE: u64 = 1 << 5; // privat geladener Code lief in eigener VSpace
 static ISO_MASK: AtomicU64 = AtomicU64::new(0); // gesammelte Badges
 static ISO_SECRET_ADDR: AtomicU64 = AtomicU64::new(0); // Adresse X (fremdes RAM)
 
@@ -400,6 +401,18 @@ pub fn spawn_demo() {
     system::install_pd_cap(r_pd, 2, r_done);
     if let Some((rp, _)) = system::spawn_isolated(shm_reader as *const () as usize, fbase as usize, prio) {
         system::bind_pd(r_pd, rp);
+    }
+
+    // Natives Code-Laden: eine isolierte PD fuehrt PRIVAT geladenen Code (Kopie des
+    // native_template) aus einer eigenen EL0-RX-Region aus (nicht die geteilte
+    // .user_text). Slot 0 = SIGNAL-Cap (Badge NATIVE).
+    let nat_sig = system::cap_mint(introot, Rights::WRITE, ISO_BADGE_NATIVE).expect("nat sig");
+    let nat_pd = system::create_pd().expect("native pd");
+    system::install_pd_cap(nat_pd, 0, nat_sig);
+    if let Some(nt) =
+        system::spawn_isolated_native(native_template as *const () as *const u8, 64, prio)
+    {
+        system::bind_pd(nat_pd, nt);
     }
 
     *RELOAD_INFO.lock() = Some(ReloadInfo { ep, v1, v1_pd, v2_pd });
@@ -722,6 +735,28 @@ extern "C" fn shm_reader(_arg: usize) -> ! {
             "mov x0, #5", // sys::PARK
             "svc #0",
             "b 3b",
+            options(noreturn),
+        );
+    }
+}
+
+/// **Natives Programm-Template** (`.user_text`). Diese Bytes werden in einen privaten
+/// Code-Frame **kopiert** und dort (EL0-RX, eigene VSpace) ausgeführt — NICHT die
+/// geteilte `.user_text`. Es signalisiert (Slot 0, Badge NATIVE) und parkt. Reines
+/// position-unabhängiges Inline-Asm (svc + Immediates + relativer Branch), daher an
+/// einer beliebigen Adresse lauffähig.
+#[link_section = ".user_text"]
+extern "C" fn native_template(_arg: usize) -> ! {
+    // SAFETY: reiner EL0-User-Code; nur `svc`.
+    unsafe {
+        core::arch::asm!(
+            "mov x0, #8", // sys::SIGNAL
+            "mov x1, #0", // Slot 0 (Badge NATIVE)
+            "svc #0",
+        "1:",
+            "mov x0, #5", // sys::PARK
+            "svc #0",
+            "b 1b",
             options(noreturn),
         );
     }
@@ -1091,7 +1126,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -1107,6 +1142,7 @@ pub fn demo_report_then_idle() -> ! {
                 (m & ISO_BADGE_RAN != 0) && (m & ISO_BADGE_TRUSTED != 0) && system::iso_faulted(),
                 (m & ISO_BADGE_MAPPED != 0) && system::iso_fault_count() >= 2,
                 m & ISO_BADGE_SHARED != 0,
+                m & ISO_BADGE_NATIVE != 0,
             );
         }
         // Beendete Threads einsammeln (sicher: läuft auf dem Idle-Stack).
@@ -1213,8 +1249,10 @@ fn all_done() -> bool {
     let vmm = (m & ISO_BADGE_MAPPED != 0) && system::iso_fault_count() >= 2;
     // Shared-Memory-IPC: der Reader las den Wert des Writers via geteiltem Frame.
     let shm = m & ISO_BADGE_SHARED != 0;
+    // Natives Code-Laden: privat geladener Code lief in eigener VSpace.
+    let native = m & ISO_BADGE_NATIVE != 0;
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
-        && reclaim && balanced && vspace && vmm && shm
+        && reclaim && balanced && vspace && vmm && shm && native
 }
 
 fn report() {
@@ -1435,5 +1473,13 @@ fn report() {
     println!(
         "shm     : {} (Shared-Memory-IPC: ein Frame in zwei isolierte VSpaces, cap-gewaehrt)",
         if shared { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Natives Code-Laden: privat geladener Code lief in eigener EL0-RX-Region.
+    let native = m & ISO_BADGE_NATIVE != 0;
+    println!("native  : privat geladener Code lief in eigener VSpace (nicht geteilte .user_text)={native}");
+    println!(
+        "native  : {} (natives Code-Laden je isolierter VSpace, EL0-RX/W^X + I-Cache-Sync)",
+        if native { "ALL PASS" } else { "FAILURES" }
     );
 }

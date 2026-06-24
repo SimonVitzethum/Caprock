@@ -320,6 +320,12 @@ fn user_block(addr: u64) -> u64 {
     addr | AF | SH_INNER | ATTR_NORMAL | AP_RW_EL0 | PXN | UXN | NG | BLOCK_DESC
 }
 
+/// User-RX 2-MiB-Block, `nG`: privat geladener **Code** (EL0 read+execute, nicht
+/// schreibbar -> W^X; an EL1 nicht ausführbar (PXN)).
+fn user_code_block(addr: u64) -> u64 {
+    addr | AF | SH_INNER | ATTR_NORMAL | AP_RO_EL0 | PXN | NG | BLOCK_DESC
+}
+
 /// Die **Basis** einer isolierten VSpace in zwei frische 4-KiB-Frames bauen
 /// (`l1_phys` = Wurzel, `l2_phys` = L2 für GiB 1): Device (EL1-only), das Kernelimage
 /// über die **geteilte** Kernel-L3 (inkl. `.user_text` EL0-RX) und alles RAM
@@ -371,6 +377,18 @@ pub fn vspace_map_block(l2_phys: u64, phys: u64) -> bool {
     // SAFETY: `l2_phys` ist eine gültige, in der globalen Map beschreibbare L2-Tabelle.
     let l2 = unsafe { core::slice::from_raw_parts_mut(l2_phys as *mut u64, 512) };
     l2[idx] = user_block(phys);
+    cpu::dsb_sy();
+    true
+}
+
+/// Wie [`vspace_map_block`], aber als **EL0-RX** (privat geladener Code, W^X).
+pub fn vspace_map_code_block(l2_phys: u64, phys: u64) -> bool {
+    let Some(idx) = l2_block_index(phys) else {
+        return false;
+    };
+    // SAFETY: gültige, in der globalen Map beschreibbare L2-Tabelle.
+    let l2 = unsafe { core::slice::from_raw_parts_mut(l2_phys as *mut u64, 512) };
+    l2[idx] = user_code_block(phys);
     cpu::dsb_sy();
     true
 }

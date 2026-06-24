@@ -220,6 +220,12 @@ pub fn spawn_demo() {
     let ut = system::spawn_user(user_entry as *const () as usize, 0, prio).expect("user thread");
     system::bind_pd(user_pd, ut);
 
+    // EL0-Isolation: ein bösartiger EL0-Thread liest EL1-only Kernel-Speicher. Der
+    // Kernel muss ihn isolieren (Thread beenden) statt anzuhalten.
+    let bad_pd = system::create_pd().expect("bad user pd");
+    let bad = system::spawn_user(bad_user as *const () as usize, 0, prio).expect("bad user thread");
+    system::bind_pd(bad_pd, bad);
+
     // Freies RAM mit allen Stacks (Baseline für die Rückgewinnungs-Prüfung).
     FREE_BASELINE.store(system::total_free(), Ordering::Relaxed);
 
@@ -375,6 +381,37 @@ extern "C" fn user_entry(_arg: usize) -> ! {
             in("x0") sys::PARK,
             options(noreturn, nostack),
         );
+    }
+}
+
+/// **Bösartiges EL0-User-Programm** (Sektion `.user_text`, EL0-ausführbar). Es
+/// versucht, EL1-only Kernel-Speicher (die Kernel-`.text` an `0x4008_0000`) zu
+/// lesen. Da diese Seite nur EL1-Zugriff erlaubt, MUSS das aus EL0 einen Data
+/// Abort auslösen. Der Kernel fängt ihn ab, beendet **nur diesen Thread** und
+/// läuft weiter — der Nachweis, dass User-Code den Kernel nicht kompromittieren
+/// kann. Reines Inline-Asm, kein EL1-Kernelcode.
+#[link_section = ".user_text"]
+extern "C" fn bad_user(_arg: usize) -> ! {
+    // SAFETY: EL0-User-Code. Der Load auf eine EL1-only Adresse faultet
+    // garantiert und kehrt nie zurück (Kernel beendet den Thread im Fault-Hook).
+    unsafe {
+        let kernel_addr: usize = 0x4008_0000; // Kernel-.text (EL1-only gemappt)
+        let mut v: u64;
+        core::arch::asm!(
+            "ldr {v}, [{a}]",
+            a = in(reg) kernel_addr,
+            v = out(reg) v,
+            options(nostack),
+        );
+        // Wird nie erreicht. Den geladenen Wert "verbrauchen", damit der Compiler
+        // den Load nicht wegoptimiert.
+        core::arch::asm!("svc #0", in("x0") sys::PARK, in("x2") v, options(nostack));
+    }
+    loop {
+        // SAFETY: Fallback (unerreichbar) — parken statt EL1-Code zu berühren.
+        unsafe {
+            core::arch::asm!("svc #0", in("x0") sys::PARK, options(nostack));
+        }
     }
 }
 
@@ -591,7 +628,8 @@ fn all_done() -> bool {
     let xfer = XFER_DONE.load(Ordering::Acquire);
     let ckpt = CS_DONE.load(Ordering::Acquire);
     let el0 = USER_RECV.load(Ordering::Relaxed) == USER_MAGIC && system::el0_syscall_seen();
-    workers && cores && fp && prio && life && notif && xfer && ckpt && el0
+    let el0iso = system::el0_fault_count() >= 1;
+    workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso
 }
 
 fn report() {
@@ -668,6 +706,12 @@ fn report() {
     println!("el0     : EL1-Server empfing {urecv:#x} (erwartet {USER_MAGIC:#x}); EL0-Syscall gesehen: {el0_seen}");
     let el0_ok = urecv == USER_MAGIC && el0_seen;
     println!("el0     : {} (User-Thread laeuft auf EL0, nur via Syscall)", if el0_ok { "ALL PASS" } else { "FAILURES" });
+
+    // EL0-Isolation: bösartiger EL0-Thread las Kernel-Speicher -> isoliert, Kernel lebt.
+    let faults = system::el0_fault_count();
+    println!("el0iso  : EL0-Faults abgefangen={faults} (Kernel laeuft -> dieser Bericht beweist es)");
+    let iso_ok = faults >= 1;
+    println!("el0iso  : {} (EL0-Zugriff auf Kernel-Speicher faultet, Thread beendet, Kernel ueberlebt)", if iso_ok { "ALL PASS" } else { "FAILURES" });
 
     // Stateful Hot-Reload: Zustand (Zähler) bleibt über v1->v2 erhalten.
     let r1 = [

@@ -201,9 +201,15 @@ impl Scheduler {
 
     /// Einen **EL0-User-Thread** erzeugen: er läuft auf EL0 mit dem User-Stack
     /// `[user_base, user_base+user_len)`; der TrapFrame liegt auf dem separaten,
-    /// EL1-only Kernel-Stack `[kstack_base, kstack_base+kstack_len)`. Zum Reaping
-    /// wird der Kernel-Stack vermerkt (der User-Stack wird in Phase 1 nicht
-    /// zurückgewonnen).
+    /// Einen EL0-User-Thread erzeugen: Der initiale Frame liegt auf dem EL1-only
+    /// Kernel-Stack `[kstack_base, kstack_base+kstack_len)`, der Thread läuft auf
+    /// EL0 mit dem User-Stack `[user_base, user_base+user_len)`.
+    ///
+    /// Zum Reaping wird der **User-Stack** vermerkt (dynamisch alloziert,
+    /// rückgebbar an den Allokator). Der Kernel-Stack stammt aus einem festen
+    /// EL1-only Pool im Kernel-Image; er darf **nicht** an den Phys-Allokator
+    /// zurückgegeben werden (würde eine Kernel-Image-Region einschleusen) und wird
+    /// in Phase 1 geleakt (Pool ist klein und fest).
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_user(
         &mut self,
@@ -212,13 +218,14 @@ impl Scheduler {
         arg: usize,
         kstack_base: usize,
         kstack_len: usize,
-        user_top: usize,
+        user_base: usize,
+        user_len: usize,
         priority: u8,
     ) -> Option<ThreadId> {
-        let sp = init_thread_frame(kstack_base + kstack_len, entry, arg, true, user_top);
+        let sp = init_thread_frame(kstack_base + kstack_len, entry, arg, true, user_base + user_len);
         let t = self.alloc_tcb(sp, core, priority)?;
-        self.tcbs[t].stack_base = kstack_base;
-        self.tcbs[t].stack_len = kstack_len;
+        self.tcbs[t].stack_base = user_base;
+        self.tcbs[t].stack_len = user_len;
         self.enqueue_ready(t);
         Some(self.id(t))
     }

@@ -11,7 +11,7 @@
 //! Schritt; sie brauchen per-Kern-TCB-Partitionierung + Cross-Core-IPI-Unblock.)
 
 use sel4lake_cap::{CapError, CapInfo, CapPtr, CapSpace};
-use sel4lake_hal::{self as hal, exception::TrapFrame};
+use sel4lake_hal::{self as hal, exception::TrapFrame, println};
 use sel4lake_ipc::{EndpointTable, NotificationTable};
 use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
 use sel4lake_microkit::PdTable;
@@ -33,6 +33,9 @@ const USER_KSTACK_COUNT: usize = 4;
 static USER_KSTACK_NEXT: AtomicUsize = AtomicUsize::new(0);
 /// Sticky: wurde jemals ein Syscall von EL0 (User-Thread) gesehen?
 static EL0_SYSCALL_SEEN: AtomicBool = AtomicBool::new(false);
+/// Zähler: wie oft hat der Kernel einen EL0-Fault abgefangen und den fehlerhaften
+/// User-Thread isoliert (statt selbst anzuhalten)?
+static EL0_FAULTS: AtomicUsize = AtomicUsize::new(0);
 
 /// Geteilte Ressourcen (alles außer dem Scheduler).
 struct Resources {
@@ -82,10 +85,34 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
     ) as *mut TrapFrame
 }
 
-/// Reschedule- + Syscall-Hook registrieren (einmalig, vor IRQs/Threads).
+/// EL0-Fault-Hook: ein User-Thread hat einen synchronen Fault ausgelöst (Zugriff
+/// auf EL1-only Kernel-Speicher, privilegierte Instruktion o. Ä.). Statt den
+/// Kernel anzuhalten, wird der fehlerhafte Thread **beendet** und auf den nächsten
+/// lauffähigen Thread gewechselt — der Kernel läuft weiter. Das ist der konkrete
+/// Nachweis der EL0/EL1-Privileg-Trennung: User-Code kann den Kernel nicht
+/// kompromittieren. Nur der SCHED-Lock (wie der Reschedule-Pfad).
+fn el0_fault(frame: *mut TrapFrame, esr: u64, far: u64) -> *mut TrapFrame {
+    let core = hal::cpu::core_id();
+    let ec = (esr >> 26) & 0x3f;
+    EL0_FAULTS.fetch_add(1, Ordering::Relaxed);
+    let mut sched = SCHED.lock();
+    let tid = sched.current_id(core).to_raw();
+    println!(
+        "el0-trap: User-Thread {tid:#x} faultete (EC={ec:#04x} FAR={far:#018x}) -> beendet, Kernel laeuft weiter"
+    );
+    sched.exit_current(core, frame as usize) as *mut TrapFrame
+}
+
+/// Wie oft hat der Kernel einen EL0-Fault abgefangen und den Thread isoliert?
+pub fn el0_fault_count() -> usize {
+    EL0_FAULTS.load(Ordering::Relaxed)
+}
+
+/// Reschedule-, Syscall- + EL0-Fault-Hook registrieren (einmalig, vor IRQs/Threads).
 pub fn set_hooks() {
     hal::exception::set_reschedule_hook(reschedule);
     hal::exception::set_syscall_hook(syscall);
+    hal::exception::set_fault_hook(el0_fault);
 }
 
 /// Freies RAM `[free_base, ram_end)` beim Allokator registrieren.
@@ -182,13 +209,13 @@ pub fn spawn_user(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
     }
     let kbase = core::ptr::addr_of!(__user_kstacks_bottom) as usize + idx * USER_KSTACK_SIZE;
     let mut res = RES.lock();
-    let user_top = {
+    let (user_base, user_len) = {
         let s = res.phys.alloc(STACK_SIZE, 16)?;
-        (s.base() + s.len()) as usize
+        (s.base() as usize, s.len() as usize)
     };
     SCHED
         .lock()
-        .spawn_user(core, entry, arg, kbase, USER_KSTACK_SIZE, user_top, prio)
+        .spawn_user(core, entry, arg, kbase, USER_KSTACK_SIZE, user_base, user_len, prio)
 }
 
 /// Wurde jemals ein Syscall von EL0 (echter User-Thread) ausgeführt?

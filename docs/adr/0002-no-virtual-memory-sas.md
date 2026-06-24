@@ -106,9 +106,38 @@ nicht vertrauenswürdigen nativen Codes. Daher:
   Adresse ist global gültig) — sehr niedrige IPC-Latenz möglich (ADR 0004).
 - **−** Einmaliger MMU-Setup-Aufwand und etwas statischer `unsafe`-Code.
 
+## Nachtrag: EL0/EL1-Privileg-Trennung im SAS (implementiert)
+
+Der Single-Address-Space schließt **virtuellen Speicher** und per-Prozess-VSpaces
+aus — er schließt aber **nicht** die ARM-Exception-Level aus. SEL4Lake nutzt die
+*eine* Identity-Map, um eine **Privileg-Grenze** (keine Adressraum-Grenze) per
+AP-Bits zu ziehen:
+
+- Kernel-Image (`.text`/`.rodata`/`.data`/`.bss`, Kernel-Stacks) → **EL1-only**.
+- User-Code (`.user_text`) → EL0-ausführbar, read-only, `PXN` (an EL1 nicht
+  ausführbar).
+- User-RAM (Heap/User-Stacks oberhalb `__kernel_end`) → EL0+EL1 RW, `PXN`/`UXN`.
+
+User-Threads laufen auf **EL0** (`SPSR=EL0t`, eigener `SP_EL0`), interagieren mit
+dem Kernel ausschließlich über `svc` (Syscall). Greift EL0-Code auf eine
+EL1-only-Seite zu oder versucht eine privilegierte Instruktion, löst die Hardware
+einen Fault aus; der Kernel **beendet nur den fehlerhaften Thread** und läuft
+weiter (Fault-Hook → `exit_current`), statt anzuhalten. Verifiziert in QEMU:
+ein EL0-Thread, der `0x4008_0000` (Kernel-`.text`) liest, erzeugt einen Data
+Abort (`EC=0x24`) und wird isoliert (`el0`/`el0iso` ALL PASS).
+
+Das mildert den `−`-Punkt oben für **nicht vertrauenswürdigen, aber nativen**
+User-Code: solcher Code kann zwar im SAS andere *User*-Daten erreichen (keine
+Adressraum-Isolation), aber **den Kernel hardware-seitig nicht** mehr berühren.
+Vollständige Sandbox untrusted Codes (per-Komponenten-VSpace o. Ä.) bleibt
+außerhalb des Kern-Bedrohungsmodells.
+
 ## Offene Punkte für spätere Phasen
 
 - Genaues Page-Table-Layout der Identity-Map (Blockgrößen, MAIR-Attribute,
   Cacheability für Device-MMIO-Regionen vs. Normal-RAM).
+- Reclaim der EL1-only Kernel-Stacks für EL0-Threads (aktuell fester Pool von 4
+  Slots, beim Thread-Ende geleakt; der dynamische User-Stack wird zurückgewonnen).
 - Optionaler Hardware-Härtungspfad für nicht vertrauenswürdige Komponenten
-  (MTE/PAN/Sandbox-VSpace) — bewusst außerhalb des Kern-Bedrohungsmodells.
+  (MTE/PAN/per-Komponenten-Sandbox-VSpace) — bewusst außerhalb des
+  Kern-Bedrohungsmodells.

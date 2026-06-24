@@ -230,6 +230,21 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
     hook(frame)
 }
 
+/// Optionaler Fault-Hook für **synchrone Faults aus EL0** (User-Thread greift auf
+/// Kernel-Speicher zu, führt eine privilegierte Instruktion aus o. Ä.). Statt den
+/// Kernel anzuhalten, beendet der Hook den fehlerhaften User-Thread und liefert
+/// den nächsten lauffähigen Frame zurück. `0` = nicht gesetzt.
+static FAULT_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Signatur des EL0-Fault-Hooks: aktueller (fehlerhafter) Frame + `ESR`/`FAR` zur
+/// Diagnose; liefert den wiederherzustellenden Frame des nächsten Threads.
+pub type FaultHook = fn(*mut TrapFrame, u64, u64) -> *mut TrapFrame;
+
+/// EL0-Fault-Hook registrieren (vor dem Aktivieren von IRQs/Threads aufzurufen).
+pub fn set_fault_hook(hook: FaultHook) {
+    FAULT_HOOK.store(hook as usize, Ordering::Release);
+}
+
 /// Register `xidx` eines (gesicherten) TrapFrames lesen. Für den
 /// Nachrichtentransfer zwischen Threads (IPC).
 pub fn frame_reg(frame: usize, idx: usize) -> u64 {
@@ -314,12 +329,27 @@ pub extern "C" fn handle_exception(frame: *mut TrapFrame, kind: u64) -> *mut Tra
         return syscall(frame);
     }
 
-    // Echter Fault: diagnostizieren + anhalten.
+    // Echter Fault: diagnostizieren.
     let far: u64;
     // SAFETY: read-only Systemregister.
     unsafe {
         asm!("mrs {}, FAR_EL1", out(reg) far, options(nomem, nostack, preserves_flags));
     }
+
+    // Fault aus EL0 (User-Thread): isolieren statt anhalten. Der registrierte Hook
+    // beendet den fehlerhaften Thread und liefert den nächsten lauffähigen Frame.
+    // So kann ein User-Thread den Kernel nicht zum Absturz bringen.
+    if frame_from_el0(frame as usize) {
+        let h = FAULT_HOOK.load(Ordering::Acquire);
+        if h != 0 {
+            // SAFETY: nur über `set_fault_hook` mit einem gültigen Zeiger dieses
+            // Typs gesetzt (wie die übrigen Trap-Hooks).
+            let hook: FaultHook = unsafe { core::mem::transmute(h) };
+            return hook(frame, esr, far);
+        }
+    }
+
+    // EL1-Fault (Kernel-Bug) oder kein Hook: diagnostizieren + anhalten.
     // SAFETY: `frame` zeigt auf den gültigen, vom Vektor angelegten Stack-Frame.
     let frame = unsafe { &*frame };
 

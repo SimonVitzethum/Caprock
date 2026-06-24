@@ -571,9 +571,6 @@ pub fn spawn_user(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
     }
 }
 
-/// ASID-Vergabe für isolierte VSpaces (ASID 0 = globale SAS-Map, daher ab 1).
-static ISO_ASID_NEXT: AtomicU64 = AtomicU64::new(1);
-
 /// Anzahl gleichzeitig verwaltbarer isolierter VSpaces (= max. ASID).
 const MAX_VSPACES: usize = 16;
 
@@ -593,11 +590,15 @@ static VSPACES: SpinLock<[VSpaceEnt; MAX_VSPACES]> =
 /// (zuerst, freigegeben), trägt dann die Metadaten ein (`MEM` und `VSPACES` nie
 /// gleichzeitig gehalten -> keine Sperrordnungs-Inversion zu Teardown/map).
 fn create_vspace() -> Option<(u16, u64)> {
-    let asid = ISO_ASID_NEXT.fetch_add(1, Ordering::Relaxed);
-    if asid as usize > MAX_VSPACES {
-        return None;
-    }
-    let asid = asid as u16;
+    // ASID/VSpace-Slot aus der **Free-List** (VSPACES) belegen — wiederverwendbar
+    // (kein monoton wachsender Zähler -> keine ASID-Leaks). Reservierung unter EINEM
+    // Lock (Platzhalter), damit zwei Kerne nicht denselben Slot greifen.
+    let asid = {
+        let mut t = VSPACES.lock();
+        let i = t.iter().position(|v| !v.used)?;
+        t[i] = VSpaceEnt { used: true, l1: 0, l2: 0 }; // reserviert
+        (i + 1) as u16
+    };
     let a = MEM.lock().alloc(4096, 4096);
     let b = MEM.lock().alloc(4096, 4096);
     let (l1, l2) = match (a, b) {
@@ -610,6 +611,8 @@ fn create_vspace() -> Option<(u16, u64)> {
             if let Some(c) = b {
                 mem.free_region(PhysRegion::new(c.base(), c.len()));
             }
+            drop(mem);
+            VSPACES.lock()[asid as usize - 1].used = false; // Slot zurückgeben
             return None;
         }
     };
@@ -620,6 +623,16 @@ fn create_vspace() -> Option<(u16, u64)> {
         l2: l2.base(),
     };
     Some((asid, l1.base()))
+}
+
+/// Anzahl freier VSpace-/ASID-Slots (für die Leak-Prüfung des Churn-Tests).
+pub fn free_vspaces() -> usize {
+    VSPACES.lock().iter().filter(|v| !v.used).count()
+}
+
+/// Anzahl belegter TCB-Slots auf `core` (für die Leak-Prüfung).
+pub fn used_tcbs(core: usize) -> usize {
+    SCHEDS[core].lock().load()
 }
 
 /// L2-Tabelle einer (gültigen) isolierten VSpace nachschlagen.
@@ -795,6 +808,7 @@ pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u
     };
     match tid {
         Some(t) => {
+            record_user_kstack(t.slot(), kidx); // Pool-Slot dem Thread zuordnen (reclaim!)
             VSPACE_OF[t.slot()].store(packed, Ordering::Relaxed); // ab jetzt isoliert
             Some((t, rbase))
         }
@@ -805,6 +819,24 @@ pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u
             None
         }
     }
+}
+
+/// Eine isolierte PD **vollständig abbauen** (für den Churn-/Leak-Test bzw. den
+/// EXIT einer isolierten PD): den (nicht laufenden) Thread `tid` beenden + seinen
+/// Stack einsammeln (an `MEM`), die VSpace abbauen (L1/L2/L3 an `MEM`, ASID-Slot
+/// zurück), den Kernel-Stack-Pool-Slot zurückgeben und `VSPACE_OF` leeren. Gibt
+/// damit **alle** PD-Ressourcen frei. `tid` muss auf dem aktuellen Kern liegen und
+/// darf nicht der laufende Thread sein.
+pub fn destroy_isolated(tid: ThreadId) {
+    let core = hal::cpu::core_id();
+    let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
+    SCHEDS[core].lock().kill(tid, core); // ready -> Zombie (TCB-Slot frei, Stack vorgemerkt)
+    reap(); // Stack-Zombie an MEM zurueck (korrekte Lock-Ordnung: SCHEDS frei, dann MEM)
+    if asid != 0 {
+        vspace_teardown(asid); // L1/L2/L3 an MEM, ASID-Slot frei, TLB-Flush
+        VSPACE_OF[tid.slot()].store(0, Ordering::Relaxed);
+    }
+    reclaim_user_kstack(tid.slot());
 }
 
 /// Einen 2-MiB-Frame `phys` als **EL0-RX-Code** in die VSpace `asid` mappen + flushen.
@@ -903,6 +935,7 @@ pub fn spawn_isolated_native(code: *const u8, code_len: usize, prio: u8) -> Opti
     };
     match tid {
         Some(t) => {
+            record_user_kstack(t.slot(), kidx); // Pool-Slot dem Thread zuordnen (reclaim!)
             VSPACE_OF[t.slot()].store(packed, Ordering::Relaxed);
             Some(t)
         }

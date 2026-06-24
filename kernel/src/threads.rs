@@ -77,6 +77,12 @@ static USER_RECV: AtomicU64 = AtomicU64::new(0);
 
 // Reclaim-Test: transiente EL0-Exiter erzeugen, mehr als der Kernel-Stack-Pool (8)
 // gleichzeitig fasst — gelingt nur, wenn beim Thread-Ende der Pool-Slot zurückkommt.
+// Churn-/Leak-Test (Härtung Ziel 2): tausende spawn/destroy-Zyklen isolierter PDs;
+// danach müssen MEM/TCB/ASID/kstack-Stände exakt zur Baseline zurückkehren.
+const CHURN_TARGET: u32 = 2000;
+static CHURN_DONE: AtomicBool = AtomicBool::new(false);
+static CHURN_OK: AtomicBool = AtomicBool::new(false);
+
 const RECLAIM_TARGET: u64 = 16;
 const RECLAIM_PRIO: u8 = 6; // höchste Demo-Prio: Exiter läuft sofort + beendet sich
 static RECLAIM_SPAWNED: AtomicU64 = AtomicU64::new(0);
@@ -759,6 +765,16 @@ extern "C" fn shm_reader(_arg: usize) -> ! {
     }
 }
 
+/// Dummy-Entry für den Churn-Test: wird nie ausgeführt (die PD wird sofort nach dem
+/// Spawn wieder zerstört). Nur eine Adresse in `.user_text`.
+#[link_section = ".user_text"]
+extern "C" fn churn_dummy(_arg: usize) -> ! {
+    // SAFETY: reiner EL0-User-Code (unerreichbar).
+    unsafe {
+        core::arch::asm!("1:", "mov x0, #5", "svc #0", "b 1b", options(noreturn));
+    }
+}
+
 /// **4-KiB-Seiten-Probe** (`.user_text`, isolierte VSpace). x0 = Basis P einer
 /// 12-KiB-Region, vom Kernel feingranular gemappt: P=RW, P+4 KiB=RO (vorbefüllt),
 /// P+8 KiB=**Guard** (ungemappt). Die Probe schreibt P (RW), liest P+4 KiB (RO) und
@@ -1173,7 +1189,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -1191,6 +1207,7 @@ pub fn demo_report_then_idle() -> ! {
                 m & ISO_BADGE_SHARED != 0,
                 m & ISO_BADGE_NATIVE != 0,
                 m & ISO_BADGE_PAGES != 0,
+                CHURN_DONE.load(Ordering::Acquire) && CHURN_OK.load(Ordering::Acquire),
             );
         }
         // Beendete Threads einsammeln (sicher: läuft auf dem Idle-Stack).
@@ -1260,6 +1277,43 @@ pub fn demo_report_then_idle() -> ! {
             }
             hal::cpu::local_irq_enable();
         }
+        // Churn-/Leak-Test: sobald die isolierten Demos durch sind (page-Badge +
+        // die 3 faultenden isolierten PDs abgebaut), tausende spawn/destroy-Zyklen
+        // isolierter PDs fahren und pruefen, dass alle Ressourcenstaende exakt zur
+        // Baseline zurueckkehren. IRQs aus -> kein anderer Thread perturbiert die
+        // Zaehlung (Messung sauber); der Test ist kurz.
+        if !CHURN_DONE.load(Ordering::Acquire)
+            && (ISO_MASK.load(Ordering::Relaxed) & ISO_BADGE_PAGES != 0)
+            && system::iso_fault_count() >= 3
+        {
+            hal::cpu::local_irq_disable();
+            // Vor dem Snapshot alle noch ausstehenden Zombies einsammeln (z. B. von
+            // den faultenden isolierten Proben), sonst gäbe die erste reap()-Aufrufung
+            // im Churn deren Stacks frei -> Schein-Leak.
+            while system::reap() > 0 {}
+            let mem0 = system::total_free();
+            let tcb0 = system::used_tcbs(0);
+            let vs0 = system::free_vspaces();
+            let ks0 = system::user_kstack_free_count();
+            let mut ok = true;
+            for _ in 0..CHURN_TARGET {
+                match system::spawn_isolated(churn_dummy as *const () as usize, 0, system::IDLE_PRIO) {
+                    Some((tid, _)) => system::destroy_isolated(tid),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            let leak = system::total_free() != mem0
+                || system::used_tcbs(0) != tcb0
+                || system::free_vspaces() != vs0
+                || system::user_kstack_free_count() != ks0;
+            hal::cpu::local_irq_enable();
+            CHURN_OK.store(ok && !leak, Ordering::Release);
+            CHURN_DONE.store(true, Ordering::Release);
+        }
+
         if !reported && ALL_DONE.load(Ordering::Acquire) && all_done() {
             report();
             reported = true;
@@ -1301,8 +1355,10 @@ fn all_done() -> bool {
     let native = m & ISO_BADGE_NATIVE != 0;
     // 4-KiB-Seiten: RW-Schreiben + RO-Lesen einzelner Seiten erfolgreich.
     let pages4k = m & ISO_BADGE_PAGES != 0;
+    // Churn/Leak: tausende spawn/destroy-Zyklen ohne Ressourcen-Leck.
+    let churn = CHURN_DONE.load(Ordering::Acquire) && CHURN_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
-        && reclaim && balanced && vspace && vmm && shm && native && pages4k
+        && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn
 }
 
 fn report() {
@@ -1539,5 +1595,13 @@ fn report() {
     println!(
         "pages4k : {} (4-KiB-Mappings: gemischte RW/RO-Rechte + Guard Pages + L3)",
         if pages4k { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Churn/Leak: tausende spawn/destroy-Zyklen, Ressourcen kehren zur Baseline.
+    let churn = CHURN_DONE.load(Ordering::Acquire) && CHURN_OK.load(Ordering::Acquire);
+    println!("churn   : {CHURN_TARGET} spawn/destroy-Zyklen isolierter PDs; MEM/TCB/ASID/kstack zurueck=Baseline: {churn}");
+    println!(
+        "churn   : {} (keine Mapping-/ASID-/TCB-/Speicher-Leaks ueber tausende Zyklen)",
+        if churn { "ALL PASS" } else { "FAILURES" }
     );
 }

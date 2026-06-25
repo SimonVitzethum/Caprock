@@ -227,6 +227,26 @@ impl Endpoint {
         }
     }
 
+    /// **Reply-Cap-Server-Migration (Hot-Reload):** die ausstehende Antwortpflicht des
+    /// `old_owner` (das Reload-Opfer) auf die NÄCHSTE Empfänger-Instanz desselben
+    /// Endpoints übertragen, OHNE den wartenden Aufrufer abzubrechen. Der Aufrufer wird
+    /// wieder als **Sender** eingereiht (er bleibt blockiert; seine ursprüngliche
+    /// Nachricht liegt unverändert in seinem Frame). Die nächste `recv`-Instanz (v2)
+    /// übernimmt dieselbe Nachricht und wird zum neuen Reply-Owner — der Call wird so von
+    /// v2 abgeschlossen statt mit `ERR_SERVER_GONE` zu sterben (Reply-Cap überlebt den
+    /// Server-Wechsel). Gibt `true`, falls eine ausstehende Antwortpflicht des `old_owner`
+    /// migriert wurde; sonst `false` (kein passender Reply-Owner -> No-Op).
+    pub fn migrate_owner(&mut self, old_owner: ThreadId) -> bool {
+        if self.used && self.reply_owner == Some(old_owner) {
+            if let Some(caller) = self.caller.take() {
+                self.reply_owner = None;
+                self.senders.enqueue(caller); // erneut zustellbar an die v2-RECV
+                return true;
+            }
+        }
+        false
+    }
+
     /// Read-only Audit (Fuzzer-Oracle): prüft beide Queues + `caller` + `reply_owner`
     /// mit einem Lebendigkeits-Prädikat. Gibt `(tote_einträge, duplikat)` zurück. Unter
     /// dem Endpoint-Lock aufzurufen (konsistenter Snapshot).

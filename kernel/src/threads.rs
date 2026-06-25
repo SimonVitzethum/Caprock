@@ -172,6 +172,27 @@ static RCAP_STEP: AtomicU32 = AtomicU32::new(0);
 static RCAP_DONE: AtomicBool = AtomicBool::new(false);
 static RCAP_OK: AtomicBool = AtomicBool::new(false);
 
+// Reply-Cap-Server-Migration (Hot-Reload mit Call in Bearbeitung): Server v1 empfängt
+// einen Client-CALL (wird Reply-Owner) und parkt OHNE zu antworten. Der Manager
+// migriert die ausstehende Antwortpflicht (endpoint_migrate_owner) auf eine frische
+// v2-Instanz und zieht v1 capless zurück (wie beim Hot-Reload). v2 empfängt DIESELBE
+// Nachricht und antwortet -> der Client-CALL kehrt mit OK + dem von v2 berechneten Wert
+// zurück (statt ERR_SERVER_GONE). Damit überlebt eine Reply-Cap einen Server-Wechsel.
+const RMIG_INPUT: u64 = 7;
+const RMIG_V2_FACTOR: u64 = 5; // v2 verfünffacht -> beweist, dass v2 (nicht v1) bediente
+static RMIG_SERVER_PD: AtomicUsize = AtomicUsize::new(usize::MAX); // v1-PD
+static RMIG_V2_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static RMIG_CLIENT_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static RMIG_EP_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
+static RMIG_V1_TID: AtomicU64 = AtomicU64::new(u64::MAX);
+static RMIG_RECEIVED: AtomicBool = AtomicBool::new(false); // v1 hat den CALL empfangen
+static RMIG_MIGRATED: AtomicBool = AtomicBool::new(false); // Migration meldete Erfolg
+static RMIG_RESULT: AtomicU64 = AtomicU64::new(u64::MAX); // Client-CALL-Ergebniscode
+static RMIG_VALUE: AtomicU64 = AtomicU64::new(u64::MAX); // Client-CALL-Antwortwert
+static RMIG_STEP: AtomicU32 = AtomicU32::new(0);
+static RMIG_DONE: AtomicBool = AtomicBool::new(false);
+static RMIG_OK: AtomicBool = AtomicBool::new(false);
+
 // Audit-Regression B (Scheduler/MCS): `set_budget`/`bind_sched_context` auf einen
 // ERSCHÖPFTEN Thread darf ihn nicht stranden (Fund: `depleted` gelöscht ohne
 // `enqueue_ready` -> Thread nie wieder einplanbar, belegter Slot -> DoS + Leak-
@@ -631,6 +652,25 @@ pub fn spawn_demo() {
     RCAP_SERVER_PD.store(rc_s_pd, Ordering::Relaxed);
     RCAP_CLIENT_PD.store(rc_c_pd, Ordering::Relaxed);
     RCAP_EP_ID.store(rcep, Ordering::Relaxed);
+
+    // Reply-Cap-Server-Migration-Test: eigener Endpoint + v1-/v2-Server-PD + Client-PD.
+    // v1 und v2 bekommen je eine eigene Recv-Cap auf denselben Endpoint (wie beim
+    // Hot-Reload); der Client eine Send-Cap.
+    let rmep = system::create_endpoint().expect("rmig ep");
+    let rmroot = system::install_endpoint_cap(rmep as u32, Rights::RWX).expect("rmig ep cap");
+    let rm_recv1 = system::cap_mint(rmroot, Rights::READ, 0).expect("rmig recv v1");
+    let rm_recv2 = system::cap_mint(rmroot, Rights::READ, 0).expect("rmig recv v2");
+    let rm_send = system::cap_mint(rmroot, Rights::WRITE, 0).expect("rmig send");
+    let rm_s_pd = system::create_pd().expect("rmig v1 pd");
+    system::install_pd_cap(rm_s_pd, EP_CAP as usize, rm_recv1);
+    let rm_v2_pd = system::create_pd().expect("rmig v2 pd");
+    system::install_pd_cap(rm_v2_pd, EP_CAP as usize, rm_recv2);
+    let rm_c_pd = system::create_pd().expect("rmig client pd");
+    system::install_pd_cap(rm_c_pd, EP_CAP as usize, rm_send);
+    RMIG_SERVER_PD.store(rm_s_pd, Ordering::Relaxed);
+    RMIG_V2_PD.store(rm_v2_pd, Ordering::Relaxed);
+    RMIG_CLIENT_PD.store(rm_c_pd, Ordering::Relaxed);
+    RMIG_EP_ID.store(rmep, Ordering::Relaxed);
 }
 
 /// Generischer Hot-Reload-Swap: v1 zurückziehen (Quiesce: Empfänger entfernen +
@@ -1179,6 +1219,48 @@ extern "C" fn ddon_client(_arg: usize) -> ! {
 extern "C" fn rcap_client(_arg: usize) -> ! {
     let r = invoke(sys::CALL, EP_CAP, [0; 4], 0);
     RCAP_RESULT.store(r.result, Ordering::Release);
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// **Migrations-Server v1** (EL1): empfängt EINEN Aufrufer (wird Reply-Owner), meldet
+/// das per Flag und parkt dann OHNE zu antworten — simuliert einen Server, der mitten in
+/// der Bearbeitung eines Calls hot-reloaded wird. Die Antwortpflicht wird anschließend
+/// vom Manager auf v2 migriert; v1 antwortet selbst nie.
+extern "C" fn rmig_server_v1(_arg: usize) -> ! {
+    let m = invoke(sys::RECV, EP_CAP, [0; 4], 0);
+    if m.result == result::OK {
+        RMIG_RECEIVED.store(true, Ordering::Release);
+    }
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// **Migrations-Server v2** (EL1): die neue Server-Instanz nach dem Hot-Reload. Empfängt
+/// die migrierte (erneut zugestellte) Nachricht und antwortet mit `RMIG_V2_FACTOR * x` —
+/// so beweist der Antwortwert, dass v2 den Call abgeschlossen hat.
+extern "C" fn rmig_server_v2(_arg: usize) -> ! {
+    loop {
+        let m = invoke(sys::RECV, EP_CAP, [0; 4], 0);
+        if m.result != result::OK {
+            break; // Recv-Cap entzogen -> Komponente außer Dienst
+        }
+        invoke(sys::REPLY, EP_CAP, [RMIG_V2_FACTOR * m.msg[0], 0, 0, 0], 0);
+    }
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// **Migrations-Client** (EL1): CALLt einmal und hält Ergebniscode + Antwortwert fest.
+/// Wird der bedienende Server mitten im Call hot-reloaded und die Antwortpflicht auf v2
+/// migriert, MUSS dieser CALL mit OK + dem von v2 berechneten Wert zurückkehren.
+extern "C" fn rmig_client(_arg: usize) -> ! {
+    let r = invoke(sys::CALL, EP_CAP, [RMIG_INPUT, 0, 0, 0], 0);
+    RMIG_VALUE.store(r.msg[0], Ordering::Release);
+    RMIG_RESULT.store(r.result, Ordering::Release); // zuletzt: Manager pollt hierauf
     loop {
         invoke(sys::PARK, 0, [0; 4], 0);
     }
@@ -2296,7 +2378,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} fuzz={} ipcfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -2321,6 +2403,7 @@ pub fn demo_report_then_idle() -> ! {
                 RGONE_DONE.load(Ordering::Acquire) && RGONE_OK.load(Ordering::Acquire),
                 DDON_DONE.load(Ordering::Acquire) && DDON_OK.load(Ordering::Acquire),
                 RCAP_DONE.load(Ordering::Acquire) && RCAP_OK.load(Ordering::Acquire),
+                RMIG_DONE.load(Ordering::Acquire) && RMIG_OK.load(Ordering::Acquire),
                 FUZZ_DONE.load(Ordering::Acquire) && FUZZ_OK.load(Ordering::Acquire),
                 IPCFUZZ_DONE.load(Ordering::Acquire) && IPCFUZZ_OK.load(Ordering::Acquire),
             );
@@ -2750,6 +2833,71 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // Reply-Cap-Server-Migration: v1 empfängt den Call und parkt; der Manager migriert
+        // die Antwortpflicht auf v2 (endpoint_migrate_owner) und zieht v1 capless zurück.
+        // v2 schließt DENSELBEN Call ab -> Client bekommt OK + RMIG_V2_FACTOR*Eingabe.
+        // Gegate auf rcap fertig (core 0 sequenziell frei).
+        if !RMIG_DONE.load(Ordering::Acquire) && RCAP_DONE.load(Ordering::Acquire) {
+            match RMIG_STEP.load(Ordering::Acquire) {
+                0 => {
+                    // v1-Server erzeugen + binden (RECVt, blockiert als Empfänger).
+                    hal::cpu::local_irq_disable();
+                    if let Some(s) =
+                        system::spawn_on_core(0, rmig_server_v1 as *const () as usize, 0, 3)
+                    {
+                        system::bind_pd(RMIG_SERVER_PD.load(Ordering::Relaxed), s);
+                        RMIG_V1_TID.store(s.to_raw(), Ordering::Relaxed);
+                        RMIG_STEP.store(1, Ordering::Release);
+                    }
+                    hal::cpu::local_irq_enable();
+                }
+                1 => {
+                    // Client erzeugen -> CALL -> Rendezvous mit v1 (v1 wird Reply-Owner,
+                    // setzt RMIG_RECEIVED, parkt ohne REPLY; Client blockiert auf Antwort).
+                    hal::cpu::local_irq_disable();
+                    if let Some(c) =
+                        system::spawn_on_core(0, rmig_client as *const () as usize, 0, 3)
+                    {
+                        system::bind_pd(RMIG_CLIENT_PD.load(Ordering::Relaxed), c);
+                        RMIG_STEP.store(2, Ordering::Release);
+                    }
+                    hal::cpu::local_irq_enable();
+                }
+                2 => {
+                    // Sobald v1 den Call empfangen hat: Antwortpflicht auf v2 migrieren,
+                    // v1 capless zurückziehen (Hot-Reload) und v2 starten + binden.
+                    if RMIG_RECEIVED.load(Ordering::Acquire) {
+                        let ep = RMIG_EP_ID.load(Ordering::Relaxed);
+                        let v1 = ThreadId::from_raw(RMIG_V1_TID.load(Ordering::Relaxed));
+                        let migrated = system::endpoint_migrate_owner(ep, v1);
+                        RMIG_MIGRATED.store(migrated, Ordering::Release);
+                        system::endpoint_retire_receiver(ep, v1);
+                        system::clear_pd_cap(RMIG_SERVER_PD.load(Ordering::Relaxed), EP_CAP as usize);
+                        hal::cpu::local_irq_disable();
+                        if let Some(v2) =
+                            system::spawn_on_core(0, rmig_server_v2 as *const () as usize, 0, 3)
+                        {
+                            system::bind_pd(RMIG_V2_PD.load(Ordering::Relaxed), v2);
+                        }
+                        hal::cpu::local_irq_enable();
+                        RMIG_STEP.store(3, Ordering::Release);
+                    }
+                }
+                _ => {
+                    // v2 hat geantwortet -> Client kehrte zurück. Erfolg: OK + von v2
+                    // berechneter Wert + Migration meldete Erfolg (kein ERR_SERVER_GONE).
+                    let r = RMIG_RESULT.load(Ordering::Acquire);
+                    if r != u64::MAX {
+                        let ok = r == result::OK
+                            && RMIG_VALUE.load(Ordering::Acquire) == RMIG_V2_FACTOR * RMIG_INPUT
+                            && RMIG_MIGRATED.load(Ordering::Acquire);
+                        RMIG_OK.store(ok, Ordering::Release);
+                        RMIG_DONE.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+
         // Audit-Regression B (MCS-Stranding): budgetierten Worker auf STRAND_CORE
         // erschöpfen lassen, dann erneut binden -> er muss WIEDER laufen (Fix). Gegate
         // auf MCS fertig + SMP fertig (STRAND_CORE frei). Tick-basiert (anderer Kern).
@@ -2889,13 +3037,15 @@ fn all_done() -> bool {
     let ddon = DDON_DONE.load(Ordering::Acquire) && DDON_OK.load(Ordering::Acquire);
     // First-class Reply-Cap: Löschen/Revoke einer Reply-Cap bricht den Call ab.
     let rcap = RCAP_DONE.load(Ordering::Acquire) && RCAP_OK.load(Ordering::Acquire);
+    // Reply-Cap-Server-Migration: ausstehender Call überlebt einen Hot-Reload (v2 antwortet).
+    let rmig = RMIG_DONE.load(Ordering::Acquire) && RMIG_OK.load(Ordering::Acquire);
     // Generativer Fuzzer: zufällige Op-Sequenzen ohne Leak/Korruption (Phase 1 + SMP).
     let fuzz = FUZZ_DONE.load(Ordering::Acquire) && FUZZ_OK.load(Ordering::Acquire);
     // IPC-State-Machine-Fuzzer: nebenläufige IPC-Aktoren + Oracle ohne Anomalie.
     let ipcfuzz = IPCFUZZ_DONE.load(Ordering::Acquire) && IPCFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
-        && stale && strand && rgone && ddon && rcap && fuzz && ipcfuzz
+        && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz
 }
 
 fn report() {
@@ -3201,6 +3351,17 @@ fn report() {
     println!(
         "rcap    : {} (first-class ObjectKind::Reply: Revocation/Loeschen der Reply-Cap bricht den Call ab)",
         if rcap { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Reply-Cap-Server-Migration: ausstehender Call ueberlebt einen Hot-Reload des Servers.
+    let rmr = RMIG_RESULT.load(Ordering::Acquire);
+    let rmv = RMIG_VALUE.load(Ordering::Acquire);
+    let rmmig = RMIG_MIGRATED.load(Ordering::Acquire);
+    let rmig = RMIG_DONE.load(Ordering::Acquire) && RMIG_OK.load(Ordering::Acquire);
+    println!("rmig    : v1 empfaengt Call, Hot-Reload migriert die Antwortpflicht auf v2; Client-Ergebnis={rmr} (erwartet OK={}) Wert={rmv} (erwartet {}={RMIG_V2_FACTOR}*{RMIG_INPUT}) migriert={rmmig}", result::OK, RMIG_V2_FACTOR * RMIG_INPUT);
+    println!(
+        "rmig    : {} (Reply-Cap-Server-Migration: ausstehende Reply-Cap ueberlebt den Server-Wechsel, v2 schliesst den Call ab)",
+        if rmig { "ALL PASS" } else { "FAILURES" }
     );
 
     // Generativer Fuzzer (Bereich H): zufaellige Op-Sequenzen, Oracle nach jeder Epoche.

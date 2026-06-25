@@ -1263,6 +1263,19 @@ pub fn endpoint_quiesce_owner(ep: usize, tid: ThreadId) -> bool {
     }
 }
 
+/// **Reply-Cap-Server-Migration beim Hot-Reload:** überträgt eine ausstehende
+/// Antwortpflicht des Servers `tid` (das Reload-Opfer) auf die nächste RECV-Instanz
+/// desselben Endpoints. Der wartende Aufrufer wird NICHT abgebrochen, sondern wieder
+/// als Sender eingereiht; die neue Server-Instanz (v2) übernimmt dieselbe Nachricht
+/// und schließt den Call ab. Gibt `true`, falls migriert wurde. Sperrt NUR EPS[ep] —
+/// es wird niemand entblockt (kein SCHEDS-Lock, keine Sperrordnungsfrage).
+pub fn endpoint_migrate_owner(ep: usize, tid: ThreadId) -> bool {
+    if ep >= NENDPOINTS {
+        return false;
+    }
+    EPS[ep].lock().migrate_owner(tid)
+}
+
 /// **Eager-Cleanup beim Thread-Tod:** den (sterbenden) Thread `tid` aus ALLEN
 /// Endpoint-Queues (senders/receivers/caller) und Notification-Waitern entfernen.
 /// Verhindert tote TCBs in den festen Queues (Corpse-Fill -> verdrängte echte Sender)

@@ -174,8 +174,10 @@ impl Caps {
 /// Ist `kind` ein **Hardware-Cap** (MMIO/IRQ/DMA)? Generische Kategorie, damit ein künftiges
 /// `ObjectKind::Dma` ohne ABI-/Struktur-Änderung eingehängt werden kann. (P1: noch keine HW-
 /// Kinds -> stets `false`; P4/P5 erweitern den Match.)
-fn kind_is_hardware(_kind: ObjectKind) -> bool {
-    false
+fn kind_is_hardware(kind: ObjectKind) -> bool {
+    // Hardware-Caps (nur in HardwareLand erlaubt). `Dma` lässt sich später hier einhängen,
+    // ohne ABI/Strukturen zu ändern (generische Kategorie).
+    matches!(kind, ObjectKind::Mmio { .. })
 }
 
 /// Ist `kind` eine Management-Cap (`PdControl`)? Diese darf nur eine TrustedSas-PD halten.

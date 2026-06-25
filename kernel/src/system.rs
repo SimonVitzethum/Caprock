@@ -789,6 +789,7 @@ pub fn vspace_audit() -> u32 {
     // l2-Adressen unter dem Lock einsammeln, dann ohne Lock walken (die Tabellen einer
     // belegten VSpace werden nicht nebenläufig freigegeben, solange sie belegt ist).
     let mut l2s: [u64; MAX_VSPACES] = [0; MAX_VSPACES];
+    let mut l1s: [u64; MAX_VSPACES] = [0; MAX_VSPACES];
     let mut n = 0;
     {
         let t = VSPACES.lock();
@@ -798,14 +799,19 @@ pub fn vspace_audit() -> u32 {
                     return 3;
                 }
                 l2s[n] = v.l2;
+                l1s[n] = v.l1;
                 n += 1;
             }
         }
     }
-    for &l2 in &l2s[..n] {
-        let code = hal::mmu::vspace_wx_ok(l2);
+    for i in 0..n {
+        let code = hal::mmu::vspace_wx_ok(l2s[i]);
         if code != 0 {
             return code;
+        }
+        // W^X auch für GiB-0-Device-Mappings (ext-22): keine EL0-Device-Seite ausführbar.
+        if !hal::mmu::vspace_device_wx_ok(l1s[i]) {
+            return 1;
         }
     }
     0
@@ -824,6 +830,19 @@ fn vspace_l2(asid: u16) -> Option<u64> {
     let v = VSPACES.lock()[asid as usize - 1];
     if v.used {
         Some(v.l2)
+    } else {
+        None
+    }
+}
+
+/// Die L1-Wurzel der VSpace `asid` (für Device-MMIO-Mapping in GiB 0).
+fn vspace_l1(asid: u16) -> Option<u64> {
+    if asid == 0 || asid as usize > MAX_VSPACES {
+        return None;
+    }
+    let v = VSPACES.lock()[asid as usize - 1];
+    if v.used {
+        Some(v.l1)
     } else {
         None
     }
@@ -946,6 +965,10 @@ fn vspace_teardown(asid: u16) {
         let mut mem = MEM.lock();
         // Zuerst die feingranularen L3-Tabellen (aus Seiten-Mappings) einsammeln.
         hal::mmu::vspace_collect_l3s(ent.l2, &mut |p| {
+            mem.free_region(PhysRegion::new(p, 4096));
+        });
+        // GiB-0-Device-Tabellen (aus MMIO-Mappings, ext-22) einsammeln, falls vorhanden.
+        hal::mmu::vspace_collect_device_tables(ent.l1, &mut |p| {
             mem.free_region(PhysRegion::new(p, 4096));
         });
         mem.free_region(PhysRegion::new(ent.l1, 4096));
@@ -1172,6 +1195,33 @@ pub fn install_tcb_cap(tid: ThreadId, rights: Rights) -> Result<CapPtr, CapError
 /// nutzen (im Dispatch geprüft); installiert wird sie cap-policy-geprüft (nur in TrustedSas).
 pub fn install_pd_control_cap(pd: usize, rights: Rights) -> Result<CapPtr, CapError> {
     CAPS.write().cspace.install_pd_control(pd as u32, rights)
+}
+
+/// Eine **MMIO-Capability** (ext-22, HardwareLand) für die Geräte-Registerregion
+/// `[phys, phys+len)` prägen — **nur kernelseitig** (es gibt bewusst keinen User-Syscall,
+/// der beliebige MMIO-Caps erzeugt). Installiert wird sie cap-policy-geprüft nur in
+/// HardwareLand-PDs (`install_cap_checked`).
+pub fn install_mmio_cap(phys: u64, len: u64, rights: Rights) -> Result<CapPtr, CapError> {
+    CAPS.write().cspace.install_mmio(phys, len, rights)
+}
+
+/// Eine über eine MMIO-Cap autorisierte Geräteregion `[phys, phys+len)` als **EL0-Device**
+/// (Device-nGnRnE, PXN|UXN, nG) in die isolierte VSpace des Threads `tid` mappen. Generisch
+/// (keine geräte-spezifische Annahme). Nur für isolierte PDs (ASID != 0 — also Hardware/
+/// UserLand; HW-Caps sind ohnehin nur in HardwareLand installierbar). `ro` = read-only.
+/// Gibt `false` bei nicht-isolierter VSpace oder fehlgeschlagenem Mapping.
+pub fn map_mmio_into_thread(tid: ThreadId, phys: u64, len: u64, ro: bool) -> bool {
+    let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
+    let Some(l1) = vspace_l1(asid) else {
+        return false; // nicht isoliert / ungültige ASID
+    };
+    let mut alloc = || MEM.lock().alloc(4096, 4096).map(|c| c.base());
+    if hal::mmu::vspace_map_device(l1, phys, len, ro, &mut alloc) {
+        hal::mmu::flush_asid(asid);
+        true
+    } else {
+        false
+    }
 }
 
 // --- MCS Scheduling Contexts (Budget-basiertes Scheduling) ---

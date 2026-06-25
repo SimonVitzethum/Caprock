@@ -36,6 +36,12 @@ pub enum ObjectKind {
     /// TrustedSas-PD bekommt sie; sie ist die explizite Steuerungsberechtigung über genau
     /// diese eine Ziel-PD. Hält keinen Allokator-Speicher (keine Finalisierung).
     PdControl { pd: u32 },
+    /// Eine **MMIO-Capability** (ext-22, HardwareLand): die Autorität, eine konkrete
+    /// Geräte-Registerregion `[phys, phys+len)` in die eigene (isolierte) VSpace als
+    /// EL0-Device zu mappen. Wird **nur kernelseitig** geprägt (kein User-Syscall erzeugt
+    /// beliebige MMIO-Caps) und ist nur in HardwareLand-PDs installierbar. Verweist auf
+    /// einen **Geräte**-Bereich (kein RAM-Allokator-Eintrag) -> keine Finalisierung.
+    Mmio { phys: u64, len: u64 },
 }
 
 /// Eintrag der Objekt-Tabelle.

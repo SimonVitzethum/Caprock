@@ -172,6 +172,13 @@ impl CapSpace {
         self.install(ObjectKind::PdControl { pd }, rights)
     }
 
+    /// Eine **MMIO-Capability** (ext-22, HardwareLand) einbringen: die Autorität, die
+    /// Geräte-Registerregion `[phys, phys+len)` als EL0-Device zu mappen. Hält keinen
+    /// RAM-Allokator-Eintrag (Geräte-Bereich) -> keine Finalisierung. Nur kernelseitig.
+    pub fn install_mmio(&mut self, phys: u64, len: u64, rights: Rights) -> Result<CapPtr, CapError> {
+        self.install(ObjectKind::Mmio { phys, len }, rights)
+    }
+
     /// Wurzel-Objekt + -Cap anlegen (gemeinsame Logik für alle Objekttypen).
     fn install(&mut self, kind: ObjectKind, rights: Rights) -> Result<CapPtr, CapError> {
         let obj = self.alloc_object(kind)?;
@@ -532,9 +539,11 @@ impl CapSpace {
 
         self.objects[obj].refcount -= 1;
         if self.objects[obj].refcount == 0 {
-            // Memory-Objekte geben ihre Region an den Allokator zurück; Reply-Objekte
-            // melden ihren Call zum Abbruch (Kernel entblockt den Aufrufer); Endpoints/
-            // Notifications/Tcbs/SchedContexts halten keinen Allokator-Speicher.
+            // Memory-Objekte geben ihre Region an den RAM-Allokator zurück; Reply-Objekte
+            // melden ihren Call zum Abbruch (Kernel entblockt den Aufrufer). Alle anderen
+            // (Endpoint/Notification/Tcb/SchedContext/PdControl/**Mmio**) halten KEINEN
+            // RAM-Allokator-Eintrag — insbesondere `Mmio` verweist auf einen Geräte-Bereich
+            // (NICHT auf RAM): hier NIEMALS `free_region` rufen (sonst Allokator-Korruption).
             match self.objects[obj].kind {
                 ObjectKind::Memory(region) => {
                     alloc.free_region(region);

@@ -265,6 +265,24 @@ static CHAN_STEP: AtomicU32 = AtomicU32::new(0);
 static CHAN_DONE: AtomicBool = AtomicBool::new(false);
 static CHAN_OK: AtomicBool = AtomicBool::new(false);
 
+// RTC-Referenz-Backend (ext-22, P4): erstes echtes HardwareLand-Backend über die
+// GENERISCHE Device-Infrastruktur. Eine MMIO-Cap fuer das PL031-RTC wird in das
+// HardwareLand-Backend installiert; der Kernel mappt die Registerseite EL0-RO in dessen
+// isolierte VSpace (vspace_map_device). Der Trusted-Zeitdienst CALLt das Backend; das
+// Backend liest RTC_DR (echtes Geraet) und liefert den Wert ueber den paarweisen Kanal.
+const RTC_PHYS: u64 = 0x0901_0000; // PL031 RTC (QEMU virt), RTC_DR an Offset 0
+const RTC_LEN: u64 = 0x1000;
+static RTC_TS_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static RTC_BE_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static RTC_VALUE: AtomicU64 = AtomicU64::new(u64::MAX); // gelesener RTC_DR-Wert
+static RTC_RES_CODE: AtomicU64 = AtomicU64::new(u64::MAX); // Zeitdienst-CALL-Ergebniscode
+static RTC_MMIO_OK: AtomicBool = AtomicBool::new(false); // MMIO-Cap ins HardwareLand-Backend ok
+static RTC_POLICY: AtomicBool = AtomicBool::new(false); // MMIO-Cap in UserLand-PD -> denied
+static RTC_CLIENT_DONE: AtomicBool = AtomicBool::new(false);
+static RTC_STEP: AtomicU32 = AtomicU32::new(0);
+static RTC_DONE: AtomicBool = AtomicBool::new(false);
+static RTC_OK: AtomicBool = AtomicBool::new(false);
+
 // Audit-Regression B (Scheduler/MCS): `set_budget`/`bind_sched_context` auf einen
 // ERSCHÖPFTEN Thread darf ihn nicht stranden (Fund: `depleted` gelöscht ohne
 // `enqueue_ready` -> Thread nie wieder einplanbar, belegter Slot -> DoS + Leak-
@@ -1142,6 +1160,46 @@ extern "C" fn chan_client(_arg: usize) -> ! {
     let r = invoke(sys::CALL, 0, [CHAN_INPUT, 0, 0, 0], 0);
     CHAN_RESULT.store(r.msg[0], Ordering::Release);
     CHAN_CLIENT_DONE.store(true, Ordering::Release);
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// **RTC-Hardware-Backend** (ext-22, P4, `.user_text`, isolierte HardwareLand-VSpace). x0 =
+/// EL0-gemappte RTC_DR-Adresse (vom Kernel via MMIO-Cap + vspace_map_device bereitgestellt).
+/// Empfaengt eine Anfrage ueber den Kanal (Slot 0), liest das **echte** PL031-Register
+/// RTC_DR und liefert den Wert zurueck. Der kleine `unsafe`-Hardwarezugriff (ein `ldr`)
+/// ist genau der Teil, der in HardwareLand isoliert wird — die Logik bleibt im Trusted-SAS.
+#[link_section = ".user_text"]
+extern "C" fn rtc_backend(_arg: usize) -> ! {
+    // SAFETY: reiner EL0-User-Code; `ldr` nur auf die selbst (cap-autorisiert) gemappte
+    // RTC-Registerseite (Device-Memory), RECV/REPLY/PARK ueber die Kanal-Cap (Slot 0).
+    unsafe {
+        core::arch::asm!(
+            "mov x9, x0",   // x9 = RTC_DR-Adresse (identity-gemappt)
+            "mov x0, #2",   // sys::RECV Slot 0 (Anfrage des Zeitdienstes)
+            "mov x1, #0",
+            "svc #0",
+            "ldr w2, [x9]", // RTC_DR lesen (32-bit Sekundenzaehler) -> Antwort-msg0
+            "mov x0, #3",   // sys::REPLY Slot 0
+            "mov x1, #0",
+            "svc #0",
+        "1:",
+            "mov x0, #5",   // sys::PARK
+            "svc #0",
+            "b 1b",
+            options(noreturn),
+        );
+    }
+}
+
+/// **Trusted-Zeitdienst** (ext-22, P4, EL1, TrustedSas): CALLt das RTC-Backend ueber den
+/// gebundenen Kanal und haelt den vom Backend gelesenen RTC-Wert fest.
+extern "C" fn rtc_timeservice(_arg: usize) -> ! {
+    let r = invoke(sys::CALL, 0, [0, 0, 0, 0], 0);
+    RTC_VALUE.store(r.msg[0], Ordering::Release);
+    RTC_RES_CODE.store(r.result, Ordering::Release);
+    RTC_CLIENT_DONE.store(true, Ordering::Release);
     loop {
         invoke(sys::PARK, 0, [0; 4], 0);
     }
@@ -2580,7 +2638,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -2612,6 +2670,7 @@ pub fn demo_report_then_idle() -> ! {
                 DOMAIN_DONE.load(Ordering::Acquire) && DOMAIN_OK.load(Ordering::Acquire),
                 PDCTL_DONE.load(Ordering::Acquire) && PDCTL_OK.load(Ordering::Acquire),
                 CHAN_DONE.load(Ordering::Acquire) && CHAN_OK.load(Ordering::Acquire),
+                RTC_DONE.load(Ordering::Acquire) && RTC_OK.load(Ordering::Acquire),
             );
         }
         // Beendete Threads einsammeln (sicher: läuft auf dem Idle-Stack).
@@ -3355,6 +3414,85 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // RTC-Hardware-Backend (ext-22, P4): erstes echtes Geraet ueber die generische
+        // MMIO-Infrastruktur. Gegate auf chan fertig (sequenziell, vor den Fuzzern).
+        if !RTC_DONE.load(Ordering::Acquire) && CHAN_DONE.load(Ordering::Acquire) {
+            match RTC_STEP.load(Ordering::Acquire) {
+                0 => {
+                    // TrustedSas-Zeitdienst + HardwareLand-RTC-Backend + Kanal-Caps + MMIO-Cap.
+                    if let Some(ts) = system::create_pd_in_domain(Domain::TrustedSas) {
+                        RTC_TS_PD.store(ts, Ordering::Relaxed);
+                        if let Some((be, ep, _ntfn)) = system::create_hardware_backend(ts, 3) {
+                            RTC_BE_PD.store(be, Ordering::Relaxed);
+                            if let Ok(root) = system::install_endpoint_cap(ep as u32, Rights::RWX) {
+                                if let (Ok(recv), Ok(send)) = (
+                                    system::cap_mint(root, Rights::READ, 0),
+                                    system::cap_mint(root, Rights::WRITE, 0),
+                                ) {
+                                    system::install_pd_cap(be, 0, recv); // Kanal-Recv ins Backend
+                                    system::install_pd_cap(ts, 0, send); // Kanal-Send an Trusted
+                                }
+                            }
+                            // MMIO-Cap fuer das RTC: nur kernelseitig geprägt, ins HardwareLand-
+                            // Backend (Slot 1) installierbar (HardwareLand-Policy).
+                            if let Ok(mcap) = system::install_mmio_cap(RTC_PHYS, RTC_LEN, Rights::READ)
+                            {
+                                RTC_MMIO_OK.store(
+                                    system::install_pd_cap(be, 1, mcap),
+                                    Ordering::Release,
+                                );
+                            }
+                            // Policy-Negativtest: MMIO-Cap in eine UserLand-PD -> abgelehnt.
+                            if let Some(upd) = system::create_pd_in_domain(Domain::UserLand) {
+                                if let Ok(mcap2) =
+                                    system::install_mmio_cap(RTC_PHYS, RTC_LEN, Rights::READ)
+                                {
+                                    let denied = !system::install_pd_cap(upd, 0, mcap2);
+                                    RTC_POLICY.store(denied, Ordering::Release);
+                                }
+                            }
+                            RTC_STEP.store(1, Ordering::Release);
+                        }
+                    }
+                }
+                1 => {
+                    // Backend (isoliert EL0) erzeugen + binden, dann die RTC-Registerseite
+                    // EL0-RO in seine VSpace mappen (generischer Device-Mechanismus).
+                    if let Some((b, _)) =
+                        system::spawn_isolated(rtc_backend as *const () as usize, RTC_PHYS as usize, 3)
+                    {
+                        system::bind_pd(RTC_BE_PD.load(Ordering::Relaxed), b);
+                        // RTC-Registerseite EL0-RO in die Backend-VSpace mappen (generisch).
+                        // SENSITIVITAET P4 (geprueft): ohne dieses Mapping faultet das Backend
+                        // beim RTC-Read (FAR=0x09010000) -> Isolation greift.
+                        system::map_mmio_into_thread(b, RTC_PHYS, RTC_LEN, true);
+                    }
+                    RTC_STEP.store(2, Ordering::Release);
+                }
+                2 => {
+                    // Trusted-Zeitdienst (EL1) erzeugen + binden -> CALLt das RTC-Backend.
+                    if let Some(c) =
+                        system::spawn_on_core(0, rtc_timeservice as *const () as usize, 0, 3)
+                    {
+                        system::bind_pd(RTC_TS_PD.load(Ordering::Relaxed), c);
+                    }
+                    RTC_STEP.store(3, Ordering::Release);
+                }
+                _ => {
+                    if RTC_CLIENT_DONE.load(Ordering::Acquire) {
+                        let ok = RTC_RES_CODE.load(Ordering::Acquire) == result::OK
+                            && RTC_VALUE.load(Ordering::Acquire) > 0 // echtes RTC_DR gelesen
+                            && RTC_MMIO_OK.load(Ordering::Acquire)
+                            && RTC_POLICY.load(Ordering::Acquire)
+                            && system::domain_audit() == 0
+                            && system::vspace_audit() == 0;
+                        RTC_OK.store(ok, Ordering::Release);
+                        RTC_DONE.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+
         // Audit-Regression B (MCS-Stranding): budgetierten Worker auf STRAND_CORE
         // erschöpfen lassen, dann erneut binden -> er muss WIEDER laufen (Fix). Gegate
         // auf MCS fertig + SMP fertig (STRAND_CORE frei). Tick-basiert (anderer Kern).
@@ -3417,7 +3555,7 @@ pub fn demo_report_then_idle() -> ! {
             && MCS_DONE.load(Ordering::Acquire)
             && STALE_DONE.load(Ordering::Acquire)
             && STRAND_DONE.load(Ordering::Acquire)
-            && CHAN_DONE.load(Ordering::Acquire) // ext-22-Tests zuerst (frisches Frühregime)
+            && RTC_DONE.load(Ordering::Acquire) // ext-22-Tests zuerst (frisches Frühregime)
         {
             if system::spawn_on_core(0, fuzz_driver as *const () as usize, 0, 2).is_some() {
                 fuzz_spawned = true;
@@ -3509,10 +3647,12 @@ fn all_done() -> bool {
     let pdctl = PDCTL_DONE.load(Ordering::Acquire) && PDCTL_OK.load(Ordering::Acquire);
     // Paarweiser Treiber<->Backend-Kanal: CALL über die unveränderliche Bindung + 1:N + Negativ.
     let chan = CHAN_DONE.load(Ordering::Acquire) && CHAN_OK.load(Ordering::Acquire);
+    // RTC-Hardware-Backend: MMIO-Cap + Device-Mapping + echtes RTC_DR-Read über den Kanal.
+    let rtc = RTC_DONE.load(Ordering::Acquire) && RTC_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
-        && pdctl && chan
+        && pdctl && chan && rtc
 }
 
 fn report() {
@@ -3895,5 +4035,15 @@ fn report() {
     println!(
         "chan    : {} (unveraenderliche paarweise HardwareLand<->Trusted-Bindung, 1:N, Backend spricht nur mit Partner)",
         if chan { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // RTC-Hardware-Backend (ext-22, P4): generische MMIO-Infrastruktur, erstes echtes Geraet.
+    let rtcv = RTC_VALUE.load(Ordering::Acquire);
+    let rtc = RTC_DONE.load(Ordering::Acquire) && RTC_OK.load(Ordering::Acquire);
+    println!("rtc     : HardwareLand-Backend liest PL031 RTC_DR={rtcv} (>0 erwartet) ueber MMIO-Cap+Device-Mapping; MMIO-in-HW={} MMIO-in-UserLand-denied={}",
+        RTC_MMIO_OK.load(Ordering::Acquire), RTC_POLICY.load(Ordering::Acquire));
+    println!(
+        "rtc     : {} (generisches vspace_map_device + MMIO-Cap: Device-Zugriff nur in HardwareLand, kernel-autorisiert, W^X)",
+        if rtc { "ALL PASS" } else { "FAILURES" }
     );
 }

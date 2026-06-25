@@ -567,6 +567,146 @@ pub fn vspace_collect_l3s(l2_phys: u64, free_l3: &mut dyn FnMut(u64)) {
     }
 }
 
+// --- Generisches Device-MMIO-Mapping (ext-22, HardwareLand) ---
+//
+// Ein **generischer** Mechanismus, eine beliebige MMIO-Region EL0-zugänglich in eine
+// isolierte VSpace zu mappen — ohne geräte-spezifische Annahmen (PL031, UART, VirtIO,
+// NVMe, … nutzen dieselbe Primitive). Die GiB-0-Device-Region liegt im Basis-VSpace als
+// **EL1-only** 1-GiB-Block (`L1[0]`); zum Freigeben einzelner EL0-Device-Seiten wird der
+// Block bei Bedarf in eine Device-L2 und die betroffene 2-MiB-Region in eine Device-L3
+// aufgespalten — der Rest bleibt **EL1-only Device** (Kernel-MMIO wie UART/GIC bleibt
+// erreichbar). Alle Device-Mappings sind `ATTR_DEVICE` (nGnRnE) + **PXN|UXN** (nie
+// ausführbar -> W^X gilt baulich); EL0-Seiten sind `nG` (ASID-spezifisch).
+
+/// EL1-only Device-2-MiB-Block (Spiegel beim Aufsplitten der GiB-0-Device-Region).
+fn device_block(phys: u64) -> u64 {
+    phys | AF | AP_RW | ATTR_DEVICE | PXN | UXN | BLOCK_DESC
+}
+/// EL1-only Device-4-KiB-Seite (Spiegel beim Aufsplitten eines Device-Blocks).
+fn device_page_kernel(phys: u64) -> u64 {
+    phys | AF | AP_RW | ATTR_DEVICE | PXN | UXN | PAGE_DESC
+}
+/// **EL0**-Device-4-KiB-Seite (`ro` = read-only, sonst RW), `nG`, PXN|UXN.
+fn device_page_user(phys: u64, ro: bool) -> u64 {
+    let ap = if ro { AP_RO_EL0 } else { AP_RW_EL0 };
+    phys | AF | ap | ATTR_DEVICE | PXN | UXN | NG | PAGE_DESC
+}
+
+/// Eine MMIO-Region `[phys, phys+len)` (4-KiB-granular) als **EL0-Device** in die isolierte
+/// VSpace mit L1-Wurzel `l1_phys` mappen. Generisch (keine geräte-spezifischen Annahmen).
+/// Spaltet `L1[0]` bei Bedarf in eine Device-L2 und die betroffenen 2-MiB-Blöcke in
+/// Device-L3 auf (Rest bleibt EL1-only Device). `alloc` liefert frische 4-KiB-Tabellen-
+/// Frames. Gibt `false` bei ungültiger/unausgerichteter Region (nur GiB 0) oder
+/// fehlgeschlagener Allokation. Der Aufrufer flusht anschließend die ASID.
+pub fn vspace_map_device(
+    l1_phys: u64,
+    phys: u64,
+    len: u64,
+    ro: bool,
+    alloc: &mut dyn FnMut() -> Option<u64>,
+) -> bool {
+    if len == 0 || phys % PAGE != 0 || len % PAGE != 0 || phys >= ONE_GIB || phys + len > ONE_GIB {
+        return false; // nur die GiB-0-Device-Region, seitengranular
+    }
+    // SAFETY: gültige, in der globalen Map beschreibbare L1-Tabelle.
+    let l1 = unsafe { core::slice::from_raw_parts_mut(l1_phys as *mut u64, 512) };
+    // 1. L1[0] (Device-1-GiB-Block) bei Bedarf in eine Device-L2 aufspalten.
+    let dev_l2_phys = if l1[0] & 0b11 == TABLE_DESC {
+        l1[0] & ADDR_MASK
+    } else {
+        let new = match alloc() {
+            Some(p) => p,
+            None => return false,
+        };
+        // SAFETY: frischer identity-gemappter 4-KiB-Frame für die Device-L2.
+        let l2 = unsafe { core::slice::from_raw_parts_mut(new as *mut u64, 512) };
+        for (i, e) in l2.iter_mut().enumerate() {
+            *e = device_block(i as u64 * TWO_MIB); // EL1-only Device, spiegelt die Region
+        }
+        l1[0] = table_desc(new);
+        new
+    };
+    // SAFETY: gültige Device-L2 (gerade angelegt oder bestehend).
+    let dev_l2 = unsafe { core::slice::from_raw_parts_mut(dev_l2_phys as *mut u64, 512) };
+    // 2./3. Pro 4-KiB-Seite: betroffenen 2-MiB-Block bei Bedarf in eine Device-L3
+    // aufspalten und die Seite EL0-Device setzen.
+    let mut p = phys;
+    while p < phys + len {
+        let i2 = (p / TWO_MIB) as usize;
+        let l3_phys = if dev_l2[i2] & 0b11 == TABLE_DESC {
+            dev_l2[i2] & ADDR_MASK
+        } else {
+            let new = match alloc() {
+                Some(q) => q,
+                None => return false,
+            };
+            // SAFETY: frischer identity-gemappter 4-KiB-Frame für die Device-L3.
+            let l3 = unsafe { core::slice::from_raw_parts_mut(new as *mut u64, 512) };
+            let blk = i2 as u64 * TWO_MIB;
+            for (j, e) in l3.iter_mut().enumerate() {
+                *e = device_page_kernel(blk + j as u64 * PAGE); // EL1-only Device, spiegelt
+            }
+            dev_l2[i2] = table_desc(new);
+            new
+        };
+        // SAFETY: gültige Device-L3.
+        let l3 = unsafe { core::slice::from_raw_parts_mut(l3_phys as *mut u64, 512) };
+        l3[((p >> 12) & 0x1ff) as usize] = device_page_user(p, ro);
+        p += PAGE;
+    }
+    cpu::dsb_sy();
+    true
+}
+
+/// Beim Teardown die GiB-0-Device-Tabellen einer VSpace einsammeln: ist `L1[0]` eine
+/// Tabelle (durch [`vspace_map_device`] aufgespalten), `free(...)` für jede Device-L3
+/// **und** die Device-L2. (Die EL1-only Device-Blöcke/Seiten zeigen auf MMIO, nicht auf
+/// RAM — es wird nur der Tabellen-Speicher freigegeben.)
+pub fn vspace_collect_device_tables(l1_phys: u64, free: &mut dyn FnMut(u64)) {
+    // SAFETY: gültige L1-Tabelle (read-only Scan).
+    let l1 = unsafe { core::slice::from_raw_parts(l1_phys as *const u64, 512) };
+    if l1[0] & 0b11 != TABLE_DESC {
+        return; // GiB 0 ist noch ein Block -> keine Device-Tabellen
+    }
+    let dev_l2_phys = l1[0] & ADDR_MASK;
+    // SAFETY: gültige Device-L2.
+    let dev_l2 = unsafe { core::slice::from_raw_parts(dev_l2_phys as *const u64, 512) };
+    for &e in dev_l2.iter() {
+        if e & 0b11 == TABLE_DESC {
+            free(e & ADDR_MASK);
+        }
+    }
+    free(dev_l2_phys);
+}
+
+/// **W^X-/Struktur-Audit der GiB-0-Device-Mappings** einer VSpace (read-only). Prüft jede
+/// EL0-Device-Seite: sie MUSS nicht-ausführbar sein (PXN+UXN gesetzt) — eine EL0-aus-
+/// führbare Device-Seite wäre eine W^X-Verletzung. Gibt `true` bei Konsistenz. Device-
+/// Seiten sind per Konstruktion PXN|UXN; der Check fängt eine fehlerhafte Erzeugung ab.
+pub fn vspace_device_wx_ok(l1_phys: u64) -> bool {
+    // SAFETY: gültige L1-Tabelle (read-only).
+    let l1 = unsafe { core::slice::from_raw_parts(l1_phys as *const u64, 512) };
+    if l1[0] & 0b11 != TABLE_DESC {
+        return true; // kein Device-EL0-Mapping
+    }
+    let dev_l2 = unsafe { core::slice::from_raw_parts((l1[0] & ADDR_MASK) as *const u64, 512) };
+    for &e2 in dev_l2.iter() {
+        if e2 & 0b11 != TABLE_DESC {
+            continue;
+        }
+        let l3 = unsafe { core::slice::from_raw_parts((e2 & ADDR_MASK) as *const u64, 512) };
+        for &e3 in l3.iter() {
+            // Eine EL0-Device-Seite darf nie schreibbar+ausführbar sein (W^X). Device-
+            // Seiten sind per Konstruktion PXN|UXN; `is_wx_violation` fängt eine
+            // fehlerhafte (EL0+writable+executable) Erzeugung ab.
+            if is_wx_violation(e3) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// TLB-Einträge einer ASID invalidieren (nach map/unmap bzw. VSpace-Teardown).
 /// Global getaggte Kernel-/Code-Einträge bleiben gültig.
 pub fn flush_asid(asid: u16) {

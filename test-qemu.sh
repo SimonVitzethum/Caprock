@@ -17,7 +17,7 @@ CORES=8
 # zwei Fuzzer (Ressourcen + IPC) + SMP + isolierte VSpaces teilen unter
 # single-threaded QEMU-TCG eine Host-CPU; unter schwerer Host-Last emuliert alles
 # deutlich länger (kein Kernel-Hang — der Manager druckt sonst eine `DBG pending`-Zeile).
-SECONDS_RUN="${1:-240}"
+SECONDS_RUN="${1:-360}"
 ELF="build/target/aarch64-sel4lake/release/sel4lake-kernel.elf"
 
 echo "== build =="
@@ -71,6 +71,7 @@ check "ipcfuzz : ALL PASS" "IPC-State-Machine-Fuzzer (nebenlaeufige Aktoren, KIL
 check "caplk   : ALL PASS" "CAPS-Reader-Writer-Lock: parallele Cap-Lookups (zwei Kerne halten gleichzeitig den Read-Lock)"
 check "domain  : ALL PASS" "Sicherheitsdomaenen: Domaenen-Policy-Oracle (Cap-Typen je Domaene + untrusted Domaenen isoliert)"
 check "pdctl   : ALL PASS" "UserLand-Management: cap-gated SYS_PDCTL (PAUSE/RESUME/STOP, nur TrustedSas->UserLand)"
+check "chan    : ALL PASS" "Paarweiser Treiber<->Backend-Kanal: unveraenderliche Bindung bei Backend-Erzeugung, 1:N, nur Partner"
 online=$(echo "$OUT" | grep -c "online")
 [ "$online" -eq "$CORES" ] && echo "  PASS: alle $CORES Kerne online" || { echo "  FAIL: nur $online/$CORES Kerne online"; fail=1; }
 

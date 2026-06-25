@@ -80,6 +80,17 @@ impl Caps {
         if !domain_allows_kind(domain, kind) {
             return false;
         }
+        // HardwareLand-Backend: Kommunikations-Caps NUR für den eigenen Kanal (paarweise
+        // Bindung) — ein Backend darf niemals eine Endpoint-/Notification-Cap zu irgendetwas
+        // anderem als seinem Partner-Kanal erhalten.
+        if domain == Domain::HardwareLand {
+            let (cep, cntfn) = self.pds.chan_of(pd);
+            match kind {
+                ObjectKind::Endpoint(id) if id != cep => return false,
+                ObjectKind::Notification(id) if id != cntfn => return false,
+                _ => {}
+            }
+        }
         self.pds.install_cap(pd, slot, cap);
         true
     }
@@ -93,10 +104,15 @@ impl Caps {
     ///   global laufen (mehr Isolation ist nie eine Verletzung — wichtig für Rückwärts-
     ///   kompatibilität, da bestehende isolierte PDs per Default als TrustedSas getaggt sind).
     ///
+    /// - `4` = HardwareLand-Backend ohne gültige Partner-Bindung (Partner fehlt oder ist
+    ///   keine TrustedSas-PD).
+    /// - `5` = HardwareLand-Backend hält eine Endpoint-/Notification-Cap, die NICHT zu seinem
+    ///   dedizierten Partner-Kanal gehört (verbotene Kommunikationsbeziehung).
+    ///
     /// `vspace_is_global(tid)` meldet, ob der Thread im globalen SAS-Adressraum läuft
-    /// (VSPACE_OF==0). Die Kommunikationsbeziehungs-Regeln (4/5/6/7: Partner-Bindung,
-    /// UserLand↔HardwareLand-Verbot) kommen in P3 hinzu.
-    pub fn domain_audit(&self, vspace_is_global: &dyn Fn(ThreadId) -> bool) -> u32 {
+    /// (VSPACE_OF==0). Die 1:N-Kardinalität ist strukturell (ein `partner`-Feld); das
+    /// UserLand↔HardwareLand-Kommunikationsverbot folgt in P6.
+    pub fn domain_audit(&self, is_live_global: &dyn Fn(ThreadId) -> bool) -> u32 {
         for pd in 0..PdTable::capacity() {
             if !self.pds.is_used(pd) {
                 continue;
@@ -122,8 +138,31 @@ impl Caps {
             // darf global ODER isoliert sein (mehr Isolation ist keine Verletzung).
             if domain != Domain::TrustedSas {
                 if let Some(tid) = self.pds.thread_of(pd) {
-                    if vspace_is_global(tid) {
+                    // Verletzung nur, wenn der gebundene Thread LEBT und global läuft
+                    // (ein toter/gestoppter Thread zählt nicht).
+                    if is_live_global(tid) {
                         return 3;
+                    }
+                }
+            }
+            // Paarweise Bindung (HardwareLand-Backend):
+            if domain == Domain::HardwareLand {
+                // Regel 4: der Partner muss eine (existierende) TrustedSas-PD sein.
+                match self.pds.partner_of(pd) {
+                    Some(t) if self.pds.domain_of(t) == Some(Domain::TrustedSas) => {}
+                    _ => return 4,
+                }
+                // Regel 5: ein Backend hält NUR Kommunikations-Caps für seinen eigenen Kanal.
+                let (cep, cntfn) = self.pds.chan_of(pd);
+                for slot in 0..NCAPS {
+                    if let Some(cap) = self.pds.cap_at(pd, slot) {
+                        if let Some((kind, _, _)) = self.cspace.lookup(cap) {
+                            match kind {
+                                ObjectKind::Endpoint(id) if id != cep => return 5,
+                                ObjectKind::Notification(id) if id != cntfn => return 5,
+                                _ => {}
+                            }
+                        }
                     }
                 }
             }
@@ -168,8 +207,15 @@ struct Pd {
     domain: Domain,
     /// Nur für [`Domain::HardwareLand`]: der **eine** unveränderliche Trusted-SAS-Partner
     /// (PD-Index), mit dem dieses Backend ausschließlich kommunizieren darf. Bei der Erzeugung
-    /// gesetzt; `None` für Trusted/User (P3 füllt es bei `create_hardware_pd`).
+    /// gesetzt; `None` für Trusted/User.
     partner: Option<u8>,
+    /// Stabile **Backend-Id** (ext-22): identifiziert ein HardwareLand-Backend unabhängig vom
+    /// PD-Index (für später: mehrere NICs/USB-Controller, Hotplug, PCIe). `0` = keins.
+    backend_id: u16,
+    /// Endpoint-/Notification-ID des **dedizierten Kanals** zum Partner (HardwareLand-Backend).
+    /// Das Backend darf NUR über diesen Kanal kommunizieren. `u32::MAX` = keiner.
+    chan_ep: u32,
+    chan_ntfn: u32,
 }
 
 impl Pd {
@@ -179,6 +225,9 @@ impl Pd {
         cspace: [None; NCAPS],
         domain: Domain::TrustedSas, // Default: alle Altbestand-PDs sind Trusted-SAS
         partner: None,
+        backend_id: 0,
+        chan_ep: u32::MAX,
+        chan_ntfn: u32::MAX,
     };
 }
 
@@ -236,15 +285,49 @@ impl PdTable {
         }
     }
 
-    /// Den Trusted-Partner einer HardwareLand-PD **einmalig** setzen (bei der Erzeugung).
-    /// Ist bereits ein Partner gesetzt, wird der Aufruf abgelehnt (Unveränderlichkeit).
-    /// Gibt `true` bei Erfolg.
-    pub fn set_partner_once(&mut self, pd: usize, partner: usize) -> bool {
-        if pd < NPDS && self.pds[pd].used && self.pds[pd].partner.is_none() && partner < NPDS {
-            self.pds[pd].partner = Some(partner as u8);
-            true
+    /// Eine **HardwareLand-Backend-PD** mit unveränderlicher Partner-Bindung + dediziertem
+    /// Kanal anlegen (ext-22, P3). `partner` = Trusted-SAS-PD (1:N erlaubt — mehrere Backends
+    /// je Partner; N:1 ist strukturell ausgeschlossen, da `partner` ein einzelnes Feld ist).
+    /// `ep`/`ntfn` = der einzige Kanal, über den dieses Backend kommunizieren darf. Alle
+    /// Felder sind nach der Erzeugung **unveränderlich** (kein Setter).
+    pub fn create_hardware_backend(
+        &mut self,
+        partner: usize,
+        backend_id: u16,
+        ep: u32,
+        ntfn: u32,
+    ) -> Option<usize> {
+        if partner >= NPDS {
+            return None;
+        }
+        let i = self.pds.iter().position(|p| !p.used)?;
+        self.pds[i] = Pd {
+            used: true,
+            domain: Domain::HardwareLand,
+            partner: Some(partner as u8),
+            backend_id,
+            chan_ep: ep,
+            chan_ntfn: ntfn,
+            ..Pd::EMPTY
+        };
+        Some(i)
+    }
+
+    /// Die stabile Backend-Id einer PD (0 = kein Backend).
+    pub fn backend_id_of(&self, pd: usize) -> u16 {
+        if pd < NPDS {
+            self.pds[pd].backend_id
         } else {
-            false
+            0
+        }
+    }
+
+    /// Die Kanal-IDs (Endpoint, Notification) einer HardwareLand-Backend-PD.
+    pub fn chan_of(&self, pd: usize) -> (u32, u32) {
+        if pd < NPDS {
+            (self.pds[pd].chan_ep, self.pds[pd].chan_ntfn)
+        } else {
+            (u32::MAX, u32::MAX)
         }
     }
 

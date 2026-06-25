@@ -232,7 +232,15 @@ impl SchedOps for KernelSched {
         }
     }
     fn stop(&mut self, tid: ThreadId) -> bool {
-        kill_remote(tid) // cross-core kill + Teardown + Reschedule-IPI (nur wenn nicht laufend)
+        // STOP = vollständiger Teardown: cross-core kill + (falls isoliert) VSpace/ASID
+        // freigeben, damit ein gestopptes Backend/UserLand keine Ressourcen leakt.
+        let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
+        let ok = kill_remote(tid);
+        if ok && asid != 0 {
+            vspace_teardown(asid);
+            VSPACE_OF[tid.slot()].store(0, Ordering::Relaxed);
+        }
+        ok
     }
     fn on_tick(&mut self, core: usize, frame: usize) -> usize {
         // YIELD ist freiwillig -> verbraucht kein MCS-Budget (tick = false).
@@ -1304,9 +1312,22 @@ pub fn create_pd_in_domain(domain: Domain) -> Option<usize> {
 pub fn pd_domain(pd: usize) -> Option<Domain> {
     CAPS.read().pds.domain_of(pd)
 }
-/// Den unveränderlichen Trusted-Partner einer HardwareLand-PD **einmalig** setzen (P3).
-pub fn set_pd_partner(pd: usize, partner: usize) -> bool {
-    CAPS.write().pds.set_partner_once(pd, partner)
+/// Ein **HardwareLand-Backend** anlegen (ext-22, P3): erzeugt einen dedizierten Endpoint +
+/// eine Notification und eine HardwareLand-PD mit **unveränderlicher** Partner-Bindung an
+/// `trusted_pd` (TrustedSas) und genau diesem Kanal. Gibt `(backend_pd, ep, ntfn)` zurück;
+/// der Aufrufer prägt + installiert die Kanal-Caps (Backend: recv/signal — policy-geprüft auf
+/// genau diesen Kanal; Trusted-Partner: send/wait). 1:N (mehrere Backends je Trusted) erlaubt.
+pub fn create_hardware_backend(
+    trusted_pd: usize,
+    backend_id: u16,
+) -> Option<(usize, usize, usize)> {
+    let ep = create_endpoint()?;
+    let ntfn = create_notification()?;
+    let backend_pd = CAPS
+        .write()
+        .pds
+        .create_hardware_backend(trusted_pd, backend_id, ep as u32, ntfn as u32)?;
+    Some((backend_pd, ep, ntfn))
 }
 pub fn bind_pd(pd: usize, tid: ThreadId) {
     CAPS.write().pds.bind_thread(pd, tid);
@@ -1471,7 +1492,10 @@ pub fn ipc_audit() -> u32 {
 /// Die VSpace-Zugehörigkeit (global vs. isoliert) liegt in `VSPACE_OF` (nicht in `Caps`), daher
 /// wird sie hier per Closure eingespeist. Sperrt nur `CAPS.read()` (VSPACE_OF ist atomar).
 pub fn domain_audit() -> u32 {
-    let vspace_is_global =
-        |tid: ThreadId| VSPACE_OF[tid.slot()].load(Ordering::Acquire) == 0;
-    CAPS.read().domain_audit(&vspace_is_global)
+    // Regel 3 (untrusted Domäne MUSS isoliert sein) gilt nur für **lebende** gebundene
+    // Threads: ein gestoppter/getöteter Thread (dessen VSPACE_OF auf 0 zurückgesetzt wurde,
+    // dessen PD-Bindung aber noch auf den toten tid zeigt) ist KEINE Verletzung.
+    let is_live_global =
+        |tid: ThreadId| thread_alive(tid) && VSPACE_OF[tid.slot()].load(Ordering::Acquire) == 0;
+    CAPS.read().domain_audit(&is_live_global)
 }

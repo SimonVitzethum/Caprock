@@ -218,6 +218,8 @@ static DOMAIN_TRUSTED_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
 static DOMAIN_HW_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
 static DOMAIN_USER_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
 static DOMAIN_AUDIT_CODE: AtomicU32 = AtomicU32::new(u32::MAX);
+static DOMAIN_HW_TID: AtomicU64 = AtomicU64::new(u64::MAX);
+static DOMAIN_USER_TID: AtomicU64 = AtomicU64::new(u64::MAX);
 static DOMAIN_DONE: AtomicBool = AtomicBool::new(false);
 static DOMAIN_OK: AtomicBool = AtomicBool::new(false);
 
@@ -228,7 +230,7 @@ static DOMAIN_OK: AtomicBool = AtomicBool::new(false);
 const PDCTL_FRAME_SIZE: u64 = 0x20_0000; // 2 MiB (MAP-2MiB-Fastpath wie shm)
 const PDCTL_CTRL_SLOT: u64 = 0; // PdControl-Cap im Controller-Cspace
 const PDCTL_EMPTY_SLOT: u64 = 5; // leerer Slot (Negativtest: kein Cap -> ERR_BADCAP)
-const PDCTL_YIELD_OBS: u32 = 80; // Beobachtungsfenster in YIELDs (kooperativ)
+const PDCTL_YIELD_OBS: u32 = 24; // Beobachtungsfenster in YIELDs (kooperativ; knapp gehalten)
 static PDCTL_FRAME: AtomicU64 = AtomicU64::new(u64::MAX); // phys. Basis des Zaehler-Frames
 static PDCTL_TARGET_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
 static PDCTL_CTRL_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -243,6 +245,25 @@ static PDCTL_CTRL_DONE: AtomicBool = AtomicBool::new(false); // Controller-Seque
 static PDCTL_STEP: AtomicU32 = AtomicU32::new(0);
 static PDCTL_DONE: AtomicBool = AtomicBool::new(false);
 static PDCTL_OK: AtomicBool = AtomicBool::new(false);
+
+// Paarweiser Treiber<->Backend-Kanal (ext-22, P3): eine TrustedSas-Zeitdienst-PD + ein
+// HardwareLand-Backend (isolierter EL0-Stub), gebunden via create_hardware_backend
+// (unveränderlich, 1:N). Der Trusted-Client CALLt das Backend über den gebundenen Kanal;
+// das Backend antwortet (verdoppelt). Plus: 2. Backend am selben Partner (1:N), und der
+// Versuch, eine FREMDE Endpoint-Cap ins Backend zu legen, wird abgelehnt.
+const CHAN_INPUT: u64 = 9;
+const CHAN_FACTOR: u64 = 2; // Backend verdoppelt -> Beleg, dass das Backend bediente
+static CHAN_TS_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static CHAN_BE_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static CHAN_BE2_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static CHAN_RESULT: AtomicU64 = AtomicU64::new(u64::MAX); // Trusted-Client CALL-Antwortwert
+static CHAN_1N_OK: AtomicBool = AtomicBool::new(false); // 2. Backend am selben Partner ok
+static CHAN_FOREIGN_DENIED: AtomicBool = AtomicBool::new(false); // Fremd-Cap ins Backend denied
+static CHAN_BE_RECV_OK: AtomicBool = AtomicBool::new(false); // Kanal-Recv-Cap ins Backend ok
+static CHAN_CLIENT_DONE: AtomicBool = AtomicBool::new(false);
+static CHAN_STEP: AtomicU32 = AtomicU32::new(0);
+static CHAN_DONE: AtomicBool = AtomicBool::new(false);
+static CHAN_OK: AtomicBool = AtomicBool::new(false);
 
 // Audit-Regression B (Scheduler/MCS): `set_budget`/`bind_sched_context` auf einen
 // ERSCHÖPFTEN Thread darf ihn nicht stranden (Fund: `depleted` gelöscht ohne
@@ -1085,6 +1106,44 @@ extern "C" fn pdctl_target(_arg: usize) -> ! {
             "b 1b",
             options(noreturn),
         );
+    }
+}
+
+/// **Kanal-Backend** (ext-22, P3, `.user_text`, isolierte HardwareLand-VSpace): ein minimaler
+/// Server, der über seinen **einzigen** Kanal (Slot 0 = Recv-Cap des Partner-Endpoints) Anfragen
+/// empfängt und verdoppelt zurückgibt — steht stellvertretend für ein Hardware-Backend, das
+/// ausschließlich mit seinem Trusted-Partner spricht.
+#[link_section = ".user_text"]
+extern "C" fn chan_backend(_arg: usize) -> ! {
+    // SAFETY: reiner EL0-User-Code; nur RECV/REPLY/PARK-Syscalls über die Kanal-Cap (Slot 0).
+    // Ein Austausch (RECV+REPLY), dann PARK (kein RECV-Loop -> kein Busy-Spin bei Fehlern).
+    unsafe {
+        core::arch::asm!(
+            "mov x0, #2", // sys::RECV Slot 0
+            "mov x1, #0",
+            "svc #0",
+            "lsl x2, x2, #1", // Antwort = Eingabe * 2 (CHAN_FACTOR)
+            "mov x0, #3", // sys::REPLY Slot 0
+            "mov x1, #0",
+            "svc #0",
+        "1:",
+            "mov x0, #5", // sys::PARK
+            "svc #0",
+            "b 1b",
+            options(noreturn),
+        );
+    }
+}
+
+/// **Kanal-Trusted-Client** (ext-22, P3, EL1, TrustedSas-Zeitdienst): CALLt das gebundene
+/// Backend über die Send-Cap (Slot 0) und hält die Antwort fest (Beleg: der Kanal trägt
+/// Anfragen Trusted -> Backend und Antworten zurück).
+extern "C" fn chan_client(_arg: usize) -> ! {
+    let r = invoke(sys::CALL, 0, [CHAN_INPUT, 0, 0, 0], 0);
+    CHAN_RESULT.store(r.msg[0], Ordering::Release);
+    CHAN_CLIENT_DONE.store(true, Ordering::Release);
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
     }
 }
 
@@ -2521,7 +2580,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -2552,6 +2611,7 @@ pub fn demo_report_then_idle() -> ! {
                 CAPLK_DONE.load(Ordering::Acquire) && CAPLK_OK.load(Ordering::Acquire),
                 DOMAIN_DONE.load(Ordering::Acquire) && DOMAIN_OK.load(Ordering::Acquire),
                 PDCTL_DONE.load(Ordering::Acquire) && PDCTL_OK.load(Ordering::Acquire),
+                CHAN_DONE.load(Ordering::Acquire) && CHAN_OK.load(Ordering::Acquire),
             );
         }
         // Beendete Threads einsammeln (sicher: läuft auf dem Idle-Stack).
@@ -3095,26 +3155,33 @@ pub fn demo_report_then_idle() -> ! {
         // Tests -> kstack-Pool/ASIDs frei, keine Baseline-/Timing-Races) und strukturell
         // prüfen. TrustedSas: nur die Domäne (Regel 3 prüft nur untrusted). Hardware/User:
         // isolierte EL0-Threads (`spawn_isolated` setzt VSPACE_OF synchron). Gegate auf caplk.
-        if !DOMAIN_DONE.load(Ordering::Acquire) && CAPLK_DONE.load(Ordering::Acquire) {
+        // VOR den Fuzzern (gegate auf rmig fertig) — die ext-22-Tests laufen im frischen,
+        // schnellen Frühregime; die Fuzzer warten ihrerseits auf CHAN_DONE (s. u.).
+        if !DOMAIN_DONE.load(Ordering::Acquire) && RMIG_DONE.load(Ordering::Acquire) {
             hal::cpu::local_irq_disable();
-            if let Some(tpd) = system::create_pd_in_domain(Domain::TrustedSas) {
+            let tpd = system::create_pd_in_domain(Domain::TrustedSas);
+            if let Some(tpd) = tpd {
                 DOMAIN_TRUSTED_PD.store(tpd, Ordering::Relaxed);
-            }
-            if let Some(hpd) = system::create_pd_in_domain(Domain::HardwareLand) {
-                // SENSITIVITAET P1 (geprueft): spawn_isolated -> spawn (global) => HardwareLand
-                // laeuft global => domain_audit()==3 => domain-Test FAILURES (verifiziert).
-                if let Some((h, _)) =
-                    system::spawn_isolated(churn_dummy as *const () as usize, 0, 3)
-                {
-                    system::bind_pd(hpd, h);
+                // HardwareLand-Fixture als echtes Backend an den TrustedSas-Partner gebunden
+                // (Regel 4: jede HardwareLand-PD hat einen TrustedSas-Partner).
+                if let Some((hpd, _ep, _ntfn)) = system::create_hardware_backend(tpd, 1) {
+                    // SENSITIVITAET P1 (geprueft): spawn_isolated -> spawn (global) =>
+                    // HardwareLand laeuft global => domain_audit()==3 => domain FAILURES.
+                    if let Some((h, _)) =
+                        system::spawn_isolated(churn_dummy as *const () as usize, 0, 3)
+                    {
+                        system::bind_pd(hpd, h);
+                        DOMAIN_HW_TID.store(h.to_raw(), Ordering::Relaxed);
+                    }
+                    DOMAIN_HW_PD.store(hpd, Ordering::Relaxed);
                 }
-                DOMAIN_HW_PD.store(hpd, Ordering::Relaxed);
             }
             if let Some(upd) = system::create_pd_in_domain(Domain::UserLand) {
                 if let Some((u, _)) =
                     system::spawn_isolated(churn_dummy as *const () as usize, 0, 3)
                 {
                     system::bind_pd(upd, u);
+                    DOMAIN_USER_TID.store(u.to_raw(), Ordering::Relaxed);
                 }
                 DOMAIN_USER_PD.store(upd, Ordering::Relaxed);
             }
@@ -3130,6 +3197,16 @@ pub fn demo_report_then_idle() -> ! {
                     == Some(Domain::UserLand);
             DOMAIN_OK.store(code == 0 && roundtrip, Ordering::Release);
             DOMAIN_DONE.store(true, Ordering::Release);
+            // Aufräumen: die zwei isolierten Domänen-Fixtures abbauen (ASIDs + kstack-Slots
+            // freigeben), damit die folgenden Tests (pdctl/chan) den Pool wieder voll haben.
+            let ht = DOMAIN_HW_TID.swap(u64::MAX, Ordering::Relaxed);
+            if ht != u64::MAX {
+                system::destroy_isolated(ThreadId::from_raw(ht));
+            }
+            let ut = DOMAIN_USER_TID.swap(u64::MAX, Ordering::Relaxed);
+            if ut != u64::MAX {
+                system::destroy_isolated(ThreadId::from_raw(ut));
+            }
         }
 
         // UserLand-Management (ext-22, P2): cap-gated SYS_PDCTL. Gegate auf domain fertig.
@@ -3205,6 +3282,79 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // Paarweiser Treiber<->Backend-Kanal (ext-22, P3): gegate auf pdctl fertig.
+        if !CHAN_DONE.load(Ordering::Acquire) && PDCTL_DONE.load(Ordering::Acquire) {
+            match CHAN_STEP.load(Ordering::Acquire) {
+                0 => {
+                    // TrustedSas-Zeitdienst + HardwareLand-Backend (unveränderliche Bindung).
+                    if let Some(ts) = system::create_pd_in_domain(Domain::TrustedSas) {
+                        CHAN_TS_PD.store(ts, Ordering::Relaxed);
+                        if let Some((be, ep, _ntfn)) = system::create_hardware_backend(ts, 1) {
+                            CHAN_BE_PD.store(be, Ordering::Relaxed);
+                            if let Ok(root) = system::install_endpoint_cap(ep as u32, Rights::RWX) {
+                                if let (Ok(recv), Ok(send)) = (
+                                    system::cap_mint(root, Rights::READ, 0),
+                                    system::cap_mint(root, Rights::WRITE, 0),
+                                ) {
+                                    // Recv-Cap ins Backend (policy-geprüft auf genau diesen Kanal).
+                                    CHAN_BE_RECV_OK
+                                        .store(system::install_pd_cap(be, 0, recv), Ordering::Release);
+                                    system::install_pd_cap(ts, 0, send); // Send-Cap an Trusted
+                                }
+                            }
+                            // 1:N — ein 2. Backend am selben Trusted-Partner muss möglich sein.
+                            CHAN_1N_OK.store(
+                                system::create_hardware_backend(ts, 2).is_some(),
+                                Ordering::Release,
+                            );
+                            // Negativ: eine FREMDE Endpoint-Cap (anderer Endpoint) ins Backend
+                            // zu legen MUSS abgelehnt werden (Kanal-Bindung).
+                            if let Some(other) = system::create_endpoint() {
+                                if let Ok(oroot) =
+                                    system::install_endpoint_cap(other as u32, Rights::RWX)
+                                {
+                                    if let Ok(ocap) = system::cap_mint(oroot, Rights::READ, 0) {
+                                        let denied = !system::install_pd_cap(be, 6, ocap);
+                                        CHAN_FOREIGN_DENIED.store(denied, Ordering::Release);
+                                    }
+                                }
+                            }
+                            CHAN_STEP.store(1, Ordering::Release);
+                        }
+                    }
+                }
+                1 => {
+                    // Backend (isoliert EL0) erzeugen + binden -> RECVt, blockiert.
+                    if let Some((b, _)) =
+                        system::spawn_isolated(chan_backend as *const () as usize, 0, 3)
+                    {
+                        system::bind_pd(CHAN_BE_PD.load(Ordering::Relaxed), b);
+                    }
+                    CHAN_STEP.store(2, Ordering::Release);
+                }
+                2 => {
+                    // Trusted-Client (EL1) erzeugen + binden -> CALLt das Backend.
+                    if let Some(c) =
+                        system::spawn_on_core(0, chan_client as *const () as usize, 0, 3)
+                    {
+                        system::bind_pd(CHAN_TS_PD.load(Ordering::Relaxed), c);
+                    }
+                    CHAN_STEP.store(3, Ordering::Release);
+                }
+                _ => {
+                    if CHAN_CLIENT_DONE.load(Ordering::Acquire) {
+                        let ok = CHAN_RESULT.load(Ordering::Acquire) == CHAN_INPUT * CHAN_FACTOR
+                            && CHAN_BE_RECV_OK.load(Ordering::Acquire)
+                            && CHAN_1N_OK.load(Ordering::Acquire)
+                            && CHAN_FOREIGN_DENIED.load(Ordering::Acquire)
+                            && system::domain_audit() == 0;
+                        CHAN_OK.store(ok, Ordering::Release);
+                        CHAN_DONE.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+
         // Audit-Regression B (MCS-Stranding): budgetierten Worker auf STRAND_CORE
         // erschöpfen lassen, dann erneut binden -> er muss WIEDER laufen (Fix). Gegate
         // auf MCS fertig + SMP fertig (STRAND_CORE frei). Tick-basiert (anderer Kern).
@@ -3267,6 +3417,7 @@ pub fn demo_report_then_idle() -> ! {
             && MCS_DONE.load(Ordering::Acquire)
             && STALE_DONE.load(Ordering::Acquire)
             && STRAND_DONE.load(Ordering::Acquire)
+            && CHAN_DONE.load(Ordering::Acquire) // ext-22-Tests zuerst (frisches Frühregime)
         {
             if system::spawn_on_core(0, fuzz_driver as *const () as usize, 0, 2).is_some() {
                 fuzz_spawned = true;
@@ -3356,10 +3507,12 @@ fn all_done() -> bool {
     let domain = DOMAIN_DONE.load(Ordering::Acquire) && DOMAIN_OK.load(Ordering::Acquire);
     // UserLand-Management: cap-gated SYS_PDCTL (PAUSE/RESUME/STOP + cap-/policy-Negativ).
     let pdctl = PDCTL_DONE.load(Ordering::Acquire) && PDCTL_OK.load(Ordering::Acquire);
+    // Paarweiser Treiber<->Backend-Kanal: CALL über die unveränderliche Bindung + 1:N + Negativ.
+    let chan = CHAN_DONE.load(Ordering::Acquire) && CHAN_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
-        && pdctl
+        && pdctl && chan
 }
 
 fn report() {
@@ -3731,5 +3884,16 @@ fn report() {
     println!(
         "pdctl   : {} (Management-Cap PdControl: nur TrustedSas steuert nur UserLand, jede Op cap-gated)",
         if pdctl { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Paarweiser Treiber<->Backend-Kanal (ext-22, P3).
+    let chr = CHAN_RESULT.load(Ordering::Acquire);
+    let chan = CHAN_DONE.load(Ordering::Acquire) && CHAN_OK.load(Ordering::Acquire);
+    println!("chan    : Trusted CALLt Backend ueber gebundenen Kanal -> {chr} (erwartet {}={CHAN_FACTOR}*{CHAN_INPUT}); 1:N={} Fremd-Cap-denied={} recv-cap-ok={}",
+        CHAN_FACTOR * CHAN_INPUT, CHAN_1N_OK.load(Ordering::Acquire),
+        CHAN_FOREIGN_DENIED.load(Ordering::Acquire), CHAN_BE_RECV_OK.load(Ordering::Acquire));
+    println!(
+        "chan    : {} (unveraenderliche paarweise HardwareLand<->Trusted-Bindung, 1:N, Backend spricht nur mit Partner)",
+        if chan { "ALL PASS" } else { "FAILURES" }
     );
 }

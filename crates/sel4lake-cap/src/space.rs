@@ -68,6 +68,37 @@ impl CapSlot {
     };
 }
 
+/// Beim Löschen/Revoke **finalisierte Reply-Caps**: `(ep, caller)`-Paare, deren Call der
+/// Kernel abbrechen muss (den noch wartenden Aufrufer mit `ERR_SERVER_GONE` entblocken).
+/// Das Cap-System kennt das IPC-Subsystem nicht — es meldet nur, *welche* Calls
+/// finalisiert wurden; der Kernel führt das Entblocken aus (Sperrordnung CAPS < EPS<SCHEDS).
+pub struct ReplyFinal {
+    items: [(u32, u64); 8],
+    n: usize,
+}
+
+impl Default for ReplyFinal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReplyFinal {
+    pub const fn new() -> Self {
+        Self { items: [(0, 0); 8], n: 0 }
+    }
+    fn push(&mut self, ep: u32, caller: u64) {
+        if self.n < self.items.len() {
+            self.items[self.n] = (ep, caller);
+            self.n += 1;
+        }
+    }
+    /// Die finalisierten `(ep, caller)`-Paare (für den Kernel zum Abbrechen der Calls).
+    pub fn iter(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
+        self.items[..self.n].iter().copied()
+    }
+}
+
 /// Lesbare Sicht auf einen Capability (für Diagnose/Tests).
 #[derive(Clone, Copy, Debug)]
 pub struct CapInfo {
@@ -126,6 +157,13 @@ impl CapSpace {
     /// Thread `budget` Ticks je `period` Ticks CPU-Zeit zuzuweisen.
     pub fn install_sched_context(&mut self, budget: u32, period: u32, rights: Rights) -> Result<CapPtr, CapError> {
         self.install(ObjectKind::SchedContext { budget, period }, rights)
+    }
+
+    /// Eine **Reply-Capability** für den an Endpoint `ep` blockierten `caller` (gepacktes
+    /// ThreadId-Raw) einbringen. Wird sie gelöscht/revoked, finalisiert das den Call —
+    /// der Aufrufer wird mit `ERR_SERVER_GONE` entblockt (s. `delete`/`revoke`).
+    pub fn install_reply(&mut self, ep: u32, caller: u64, rights: Rights) -> Result<CapPtr, CapError> {
+        self.install(ObjectKind::Reply { ep, caller }, rights)
     }
 
     /// Wurzel-Objekt + -Cap anlegen (gemeinsame Logik für alle Objekttypen).
@@ -214,18 +252,28 @@ impl CapSpace {
     /// Einen Cap löschen. Der Cap darf keine Kinder haben (sonst `HasChildren`;
     /// vorher `revoke`). Wird damit die letzte Referenz auf das Objekt entfernt,
     /// wird das Objekt finalisiert (Speicher an `alloc` zurückgegeben).
-    pub fn delete(&mut self, alloc: &mut PhysAllocator, ptr: CapPtr) -> Result<(), CapError> {
+    pub fn delete(
+        &mut self,
+        alloc: &mut PhysAllocator,
+        ptr: CapPtr,
+        rf: &mut ReplyFinal,
+    ) -> Result<(), CapError> {
         let slot = self.resolve(ptr)?;
         if self.slots[slot].mdb.first_child.is_some() {
             return Err(CapError::HasChildren);
         }
-        self.delete_leaf(alloc, slot);
+        self.delete_leaf(alloc, slot, rf);
         Ok(())
     }
 
     /// Alle Abkömmlinge von `ptr` rekursiv löschen (der Cap selbst bleibt).
     /// Anschließend ist `ptr` kinderlos.
-    pub fn revoke(&mut self, alloc: &mut PhysAllocator, ptr: CapPtr) -> Result<(), CapError> {
+    pub fn revoke(
+        &mut self,
+        alloc: &mut PhysAllocator,
+        ptr: CapPtr,
+        rf: &mut ReplyFinal,
+    ) -> Result<(), CapError> {
         let slot = self.resolve(ptr)?;
         // Wiederholt zu einem Blatt unterhalb von `slot` absteigen und löschen.
         while let Some(child) = self.slots[slot].mdb.first_child {
@@ -233,7 +281,7 @@ impl CapSpace {
             while let Some(c) = self.slots[leaf].mdb.first_child {
                 leaf = c;
             }
-            self.delete_leaf(alloc, leaf);
+            self.delete_leaf(alloc, leaf, rf);
         }
         Ok(())
     }
@@ -471,17 +519,22 @@ impl CapSpace {
 
     /// Ein Blatt (Cap ohne Kinder) löschen: aushängen, Refcount senken,
     /// ggf. Objekt finalisieren (Speicher zurückgeben), Slot freigeben.
-    fn delete_leaf(&mut self, alloc: &mut PhysAllocator, slot: usize) {
+    fn delete_leaf(&mut self, alloc: &mut PhysAllocator, slot: usize, rf: &mut ReplyFinal) {
         let obj = self.slots[slot].object;
         self.unlink(slot);
         self.release_slot(slot);
 
         self.objects[obj].refcount -= 1;
         if self.objects[obj].refcount == 0 {
-            // Memory-Objekte geben ihre Region an den Allokator zurück;
-            // Endpoints halten keinen Allokator-Speicher (Zustand im IPC-Subsystem).
-            if let ObjectKind::Memory(region) = self.objects[obj].kind {
-                alloc.free_region(region);
+            // Memory-Objekte geben ihre Region an den Allokator zurück; Reply-Objekte
+            // melden ihren Call zum Abbruch (Kernel entblockt den Aufrufer); Endpoints/
+            // Notifications/Tcbs/SchedContexts halten keinen Allokator-Speicher.
+            match self.objects[obj].kind {
+                ObjectKind::Memory(region) => {
+                    alloc.free_region(region);
+                }
+                ObjectKind::Reply { ep, caller } => rf.push(ep, caller),
+                _ => {}
             }
             let gen = self.objects[obj].gen.wrapping_add(1);
             self.objects[obj] = Object::EMPTY;

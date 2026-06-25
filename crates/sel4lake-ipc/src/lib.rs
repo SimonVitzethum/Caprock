@@ -214,6 +214,19 @@ impl Endpoint {
         }
     }
 
+    /// **Reply-Cap-Revocation:** einen konkreten ausstehenden `caller` abbrechen (seine
+    /// Reply-Cap wurde gelöscht/revoked). Gibt den `caller` zurück (zum Entblocken mit
+    /// `ERR_SERVER_GONE`), falls er noch der wartende Aufrufer ist; sonst `None` (Call
+    /// bereits beantwortet/anders -> die Reply-Cap war veraltet, No-Op).
+    pub fn abort_call(&mut self, caller: ThreadId) -> Option<ThreadId> {
+        if self.caller == Some(caller) {
+            self.reply_owner = None;
+            self.caller.take()
+        } else {
+            None
+        }
+    }
+
     /// Read-only Audit (Fuzzer-Oracle): prüft beide Queues + `caller` + `reply_owner`
     /// mit einem Lebendigkeits-Prädikat. Gibt `(tote_einträge, duplikat)` zurück. Unter
     /// dem Endpoint-Lock aufzurufen (konsistenter Snapshot).

@@ -23,6 +23,13 @@ pub enum ObjectKind {
     /// Ticks). Die Cap ist die **Autorität**, einem Thread dieses Budget zuzuweisen
     /// — CPU-Zeit wird damit kapabilitätskontrolliert vergeben.
     SchedContext { budget: u32, period: u32 },
+    /// Eine **Reply-Capability** (seL4-artig): die einmalige Autorität, einen konkreten
+    /// per `CALL` blockierten Aufrufer (`caller`, gepacktes ThreadId-Raw) an Endpoint
+    /// `ep` zu beantworten bzw. den Call abzubrechen. Wird beim Löschen/Revoke
+    /// **finalisiert** -> der noch wartende Aufrufer wird mit `ERR_SERVER_GONE`
+    /// entblockt (Revocation eines ausstehenden Calls). Genau einer je Call,
+    /// call-spezifisch (matcht nur, solange `ep` noch diesen `caller` hält).
+    Reply { ep: u32, caller: u64 },
 }
 
 /// Eintrag der Objekt-Tabelle.

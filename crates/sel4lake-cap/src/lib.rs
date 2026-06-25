@@ -24,4 +24,4 @@ mod object;
 mod space;
 
 pub use object::ObjectKind;
-pub use space::{CapError, CapInfo, CapPtr, CapSpace};
+pub use space::{CapError, CapInfo, CapPtr, CapSpace, ReplyFinal};

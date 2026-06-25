@@ -159,6 +159,19 @@ static DDON_STEP: AtomicU32 = AtomicU32::new(0);
 static DDON_DONE: AtomicBool = AtomicBool::new(false);
 static DDON_OK: AtomicBool = AtomicBool::new(false);
 
+// First-class Reply-Cap (ObjectKind::Reply) + Revocation: ein Client-CALL etabliert
+// einen ausstehenden Call; der Manager prägt eine Reply-Cap dafür (reply_cap_for) und
+// LÖSCHT sie -> die Finalisierung bricht den Call ab, der Client kehrt mit
+// ERR_SERVER_GONE zurück (Revocation einer Reply-Cap über das Capability-System).
+static RCAP_SERVER_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static RCAP_CLIENT_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static RCAP_EP_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
+static RCAP_CLIENT_TID: AtomicU64 = AtomicU64::new(u64::MAX);
+static RCAP_RESULT: AtomicU64 = AtomicU64::new(u64::MAX);
+static RCAP_STEP: AtomicU32 = AtomicU32::new(0);
+static RCAP_DONE: AtomicBool = AtomicBool::new(false);
+static RCAP_OK: AtomicBool = AtomicBool::new(false);
+
 // Audit-Regression B (Scheduler/MCS): `set_budget`/`bind_sched_context` auf einen
 // ERSCHÖPFTEN Thread darf ihn nicht stranden (Fund: `depleted` gelöscht ohne
 // `enqueue_ready` -> Thread nie wieder einplanbar, belegter Slot -> DoS + Leak-
@@ -605,6 +618,19 @@ pub fn spawn_demo() {
     system::install_pd_cap(dd_c_pd, EP_CAP as usize, dd_send);
     DDON_SERVER_PD.store(dd_s_pd, Ordering::Relaxed);
     DDON_CLIENT_PD.store(dd_c_pd, Ordering::Relaxed);
+
+    // Reply-Cap-Revocation-Test: eigener Endpoint + Server/Client-PD.
+    let rcep = system::create_endpoint().expect("rcap ep");
+    let rcroot = system::install_endpoint_cap(rcep as u32, Rights::RWX).expect("rcap ep cap");
+    let rc_recv = system::cap_mint(rcroot, Rights::READ, 0).expect("rcap recv");
+    let rc_send = system::cap_mint(rcroot, Rights::WRITE, 0).expect("rcap send");
+    let rc_s_pd = system::create_pd().expect("rcap server pd");
+    system::install_pd_cap(rc_s_pd, EP_CAP as usize, rc_recv);
+    let rc_c_pd = system::create_pd().expect("rcap client pd");
+    system::install_pd_cap(rc_c_pd, EP_CAP as usize, rc_send);
+    RCAP_SERVER_PD.store(rc_s_pd, Ordering::Relaxed);
+    RCAP_CLIENT_PD.store(rc_c_pd, Ordering::Relaxed);
+    RCAP_EP_ID.store(rcep, Ordering::Relaxed);
 }
 
 /// Generischer Hot-Reload-Swap: v1 zurückziehen (Quiesce: Empfänger entfernen +
@@ -1142,6 +1168,17 @@ extern "C" fn ddon_client(_arg: usize) -> ! {
         let _ = invoke(sys::CALL, EP_CAP, [0; 4], 0);
     }
     DDON_CLIENT_DONE.store(true, Ordering::Release);
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// **Reply-Cap-Client** (EL1): CALLt den (nie antwortenden) Server und hält das Ergebnis
+/// fest. Wird die zugehörige Reply-Cap revoked, MUSS dieser CALL mit `ERR_SERVER_GONE`
+/// zurückkehren.
+extern "C" fn rcap_client(_arg: usize) -> ! {
+    let r = invoke(sys::CALL, EP_CAP, [0; 4], 0);
+    RCAP_RESULT.store(r.result, Ordering::Release);
     loop {
         invoke(sys::PARK, 0, [0; 4], 0);
     }
@@ -2259,7 +2296,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} fuzz={} ipcfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} fuzz={} ipcfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -2283,6 +2320,7 @@ pub fn demo_report_then_idle() -> ! {
                 STRAND_DONE.load(Ordering::Acquire) && STRAND_OK.load(Ordering::Acquire),
                 RGONE_DONE.load(Ordering::Acquire) && RGONE_OK.load(Ordering::Acquire),
                 DDON_DONE.load(Ordering::Acquire) && DDON_OK.load(Ordering::Acquire),
+                RCAP_DONE.load(Ordering::Acquire) && RCAP_OK.load(Ordering::Acquire),
                 FUZZ_DONE.load(Ordering::Acquire) && FUZZ_OK.load(Ordering::Acquire),
                 IPCFUZZ_DONE.load(Ordering::Acquire) && IPCFUZZ_OK.load(Ordering::Acquire),
             );
@@ -2664,6 +2702,54 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // First-class Reply-Cap (ObjectKind::Reply) + Revocation: ausstehenden Call per
+        // Reply-Cap-Löschung abbrechen -> Client ERR_SERVER_GONE. Gegate auf ddon fertig.
+        if !RCAP_DONE.load(Ordering::Acquire) && DDON_DONE.load(Ordering::Acquire) {
+            match RCAP_STEP.load(Ordering::Acquire) {
+                0 => {
+                    // Server erzeugen (RECVt + parkt, antwortet nie).
+                    hal::cpu::local_irq_disable();
+                    if let Some(s) =
+                        system::spawn_on_core(0, rgone_server as *const () as usize, 0, 3)
+                    {
+                        system::bind_pd(RCAP_SERVER_PD.load(Ordering::Relaxed), s);
+                        RCAP_STEP.store(1, Ordering::Release);
+                    }
+                    hal::cpu::local_irq_enable();
+                }
+                1 => {
+                    // Client erzeugen -> CALL -> Rendezvous (Server parkt, Client blockiert).
+                    hal::cpu::local_irq_disable();
+                    if let Some(c) =
+                        system::spawn_on_core(0, rcap_client as *const () as usize, 0, 3)
+                    {
+                        system::bind_pd(RCAP_CLIENT_PD.load(Ordering::Relaxed), c);
+                        RCAP_CLIENT_TID.store(c.to_raw(), Ordering::Relaxed);
+                        RCAP_STEP.store(2, Ordering::Release);
+                    }
+                    hal::cpu::local_irq_enable();
+                }
+                2 => {
+                    // Manager läuft -> Client blockiert auf die Antwort. Eine Reply-Cap
+                    // für diesen Call prägen und SOFORT löschen -> Finalisierung bricht
+                    // den Call ab (Client ERR_SERVER_GONE).
+                    let ep = RCAP_EP_ID.load(Ordering::Relaxed);
+                    let caller = ThreadId::from_raw(RCAP_CLIENT_TID.load(Ordering::Relaxed));
+                    if let Ok(rc) = system::reply_cap_for(ep, caller) {
+                        let _ = system::cap_delete(rc); // Revocation -> Call-Abbruch
+                        RCAP_STEP.store(3, Ordering::Release);
+                    }
+                }
+                _ => {
+                    let r = RCAP_RESULT.load(Ordering::Acquire);
+                    if r != u64::MAX {
+                        RCAP_OK.store(r == result::ERR_SERVER_GONE, Ordering::Release);
+                        RCAP_DONE.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+
         // Audit-Regression B (MCS-Stranding): budgetierten Worker auf STRAND_CORE
         // erschöpfen lassen, dann erneut binden -> er muss WIEDER laufen (Fix). Gegate
         // auf MCS fertig + SMP fertig (STRAND_CORE frei). Tick-basiert (anderer Kern).
@@ -2801,13 +2887,15 @@ fn all_done() -> bool {
     let rgone = RGONE_DONE.load(Ordering::Acquire) && RGONE_OK.load(Ordering::Acquire);
     // Budget-Donation: Server-Arbeit wird gegen das Client-Budget belastet (intra-core).
     let ddon = DDON_DONE.load(Ordering::Acquire) && DDON_OK.load(Ordering::Acquire);
+    // First-class Reply-Cap: Löschen/Revoke einer Reply-Cap bricht den Call ab.
+    let rcap = RCAP_DONE.load(Ordering::Acquire) && RCAP_OK.load(Ordering::Acquire);
     // Generativer Fuzzer: zufällige Op-Sequenzen ohne Leak/Korruption (Phase 1 + SMP).
     let fuzz = FUZZ_DONE.load(Ordering::Acquire) && FUZZ_OK.load(Ordering::Acquire);
     // IPC-State-Machine-Fuzzer: nebenläufige IPC-Aktoren + Oracle ohne Anomalie.
     let ipcfuzz = IPCFUZZ_DONE.load(Ordering::Acquire) && IPCFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
-        && stale && strand && rgone && ddon && fuzz && ipcfuzz
+        && stale && strand && rgone && ddon && rcap && fuzz && ipcfuzz
 }
 
 fn report() {
@@ -3104,6 +3192,15 @@ fn report() {
     println!(
         "ddon    : {} (Budget-Donation: intra-core CALL belastet die Server-Arbeit gegen das Aufrufer-Budget)",
         if ddon { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // First-class Reply-Cap (ObjectKind::Reply) + Revocation.
+    let rcr = RCAP_RESULT.load(Ordering::Acquire);
+    let rcap = RCAP_DONE.load(Ordering::Acquire) && RCAP_OK.load(Ordering::Acquire);
+    println!("rcap    : Reply-Cap fuer ausstehenden Call gepraegt + geloescht; Client-CALL-Ergebnis={rcr} (erwartet ERR_SERVER_GONE={})", result::ERR_SERVER_GONE);
+    println!(
+        "rcap    : {} (first-class ObjectKind::Reply: Revocation/Loeschen der Reply-Cap bricht den Call ab)",
+        if rcap { "ALL PASS" } else { "FAILURES" }
     );
 
     // Generativer Fuzzer (Bereich H): zufaellige Op-Sequenzen, Oracle nach jeder Epoche.

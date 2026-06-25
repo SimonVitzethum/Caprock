@@ -475,15 +475,64 @@ pub fn cap_inspect(ptr: CapPtr) -> Option<CapInfo> {
     CAPS.lock().cspace.inspect(ptr)
 }
 pub fn cap_delete(ptr: CapPtr) -> Result<(), CapError> {
-    // Finalisierung gibt ggf. Speicher zurück -> CAPS vor MEM (Sperrordnung).
-    let mut caps = CAPS.lock();
-    let mut mem = MEM.lock();
-    caps.cspace.delete(&mut mem, ptr)
+    // Finalisierung gibt ggf. Speicher zurück -> CAPS vor MEM (Sperrordnung). Beim
+    // Finalisieren einer Reply-Cap wird der zugehörige Call abgebrochen (NACH dem
+    // Freigeben von CAPS/MEM, da das Entblocken EPS<SCHEDS sperrt -> CAPS < EPS).
+    let mut rf = sel4lake_cap::ReplyFinal::new();
+    let r = {
+        let mut caps = CAPS.lock();
+        let mut mem = MEM.lock();
+        caps.cspace.delete(&mut mem, ptr, &mut rf)
+    };
+    abort_finalized_replies(&rf);
+    r
 }
 pub fn cap_revoke(ptr: CapPtr) -> Result<(), CapError> {
-    let mut caps = CAPS.lock();
-    let mut mem = MEM.lock();
-    caps.cspace.revoke(&mut mem, ptr)
+    let mut rf = sel4lake_cap::ReplyFinal::new();
+    let r = {
+        let mut caps = CAPS.lock();
+        let mut mem = MEM.lock();
+        caps.cspace.revoke(&mut mem, ptr, &mut rf)
+    };
+    abort_finalized_replies(&rf);
+    r
+}
+
+/// Für jede beim Löschen/Revoke finalisierte Reply-Cap den ausstehenden Call abbrechen:
+/// den noch wartenden Aufrufer mit `ERR_SERVER_GONE` entblocken (Revocation eines
+/// Calls). Läuft OHNE gehaltenen CAPS/MEM-Lock (Ordnung CAPS < EPS < SCHEDS).
+fn abort_finalized_replies(rf: &sel4lake_cap::ReplyFinal) {
+    for (ep, caller_raw) in rf.iter() {
+        endpoint_abort_call(ep as usize, ThreadId::from_raw(caller_raw));
+    }
+}
+
+/// Einen konkreten ausstehenden Call an Endpoint `ep` abbrechen (Reply-Cap-Revocation):
+/// ist `caller` noch der wartende Aufrufer, wird er mit `ERR_SERVER_GONE` entblockt.
+pub fn endpoint_abort_call(ep: usize, caller: ThreadId) -> bool {
+    if ep >= NENDPOINTS {
+        return false;
+    }
+    let orphan = {
+        let mut e = EPS[ep].lock();
+        e.abort_call(caller)
+    };
+    if let Some(c) = orphan {
+        unblock_with_error(c, sel4lake_abi::result::ERR_SERVER_GONE);
+        true
+    } else {
+        false
+    }
+}
+
+/// Eine **Reply-Capability** für den an Endpoint `ep` blockierten `caller` prägen
+/// (first-class `ObjectKind::Reply`): die einmalige, revozierbare Autorität, diesen Call
+/// abzubrechen. Wird die Cap gelöscht/revoked, wird der Aufrufer mit `ERR_SERVER_GONE`
+/// entblockt (s. `cap_delete`/`cap_revoke`).
+pub fn reply_cap_for(ep: usize, caller: ThreadId) -> Result<CapPtr, CapError> {
+    CAPS.lock()
+        .cspace
+        .install_reply(ep as u32, caller.to_raw(), Rights::WRITE)
 }
 
 // --- Endpoints / Notifications (per-Objekt-Locks) ---

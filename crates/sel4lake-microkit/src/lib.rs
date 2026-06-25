@@ -22,7 +22,7 @@ use sel4lake_hal::exception::{frame_reg, frame_set_reg};
 use sel4lake_ipc::{Endpoint, Notification, NENDPOINTS, NNOTIFICATIONS};
 use sel4lake_mem::Rights;
 use sel4lake_sched::{SchedOps, ThreadId};
-use sel4lake_sync::SpinLock;
+use sel4lake_sync::{RwSpinLock, SpinLock};
 
 const NPDS: usize = 64;
 /// Cap-Slots je PD-Cspace.
@@ -151,7 +151,7 @@ pub fn dispatch(
     frame: usize,
     core: usize,
     ops: &mut dyn SchedOps,
-    caps: &SpinLock<Caps>,
+    caps: &RwSpinLock<Caps>,
     eps: &[SpinLock<Endpoint>; NENDPOINTS],
     ntfns: &[SpinLock<Notification>; NNOTIFICATIONS],
 ) -> usize {
@@ -174,20 +174,25 @@ pub fn dispatch(
         frame
     };
 
-    // Cap-Auflösung unter `CAPS`. Der Guard bleibt nur so lange gehalten, wie nötig
-    // (bei REPLY+grant bis nach dem Transfer; sonst wird er vor dem IPC freigegeben).
-    let mut caps_guard = caps.lock();
+    // Cap-Auflösung unter dem **geteilten Read-Lock** auf `CAPS`: der heiße Lookup ist
+    // rein lesend und läuft so auf verschiedenen Kernen parallel (kein globaler Engpass
+    // mehr). Der Guard wird sofort wieder freigegeben; alle Pfade außer REPLY+grant
+    // arbeiten danach ohne CAPS weiter (wie zuvor). Die Werte sind `Copy`/ownend.
     let thread = ops.current_id(core);
-    let Some(pd) = caps_guard.pds.pd_of(thread) else {
-        return deny(result::ERR_NOPD);
-    };
     let local = frame_reg(frame, reg::EP_BADGE) as usize;
-    let Some(cap) = caps_guard.pds.cap_at(pd, local) else {
-        return deny(result::ERR_BADCAP);
-    };
-    let Some((kind, rights, badge)) = caps_guard.cspace.lookup(cap) else {
-        return deny(result::ERR_BADCAP);
-    };
+    let (pd, kind, rights, badge) = {
+        let g = caps.read();
+        let Some(pd) = g.pds.pd_of(thread) else {
+            return deny(result::ERR_NOPD);
+        };
+        let Some(cap) = g.pds.cap_at(pd, local) else {
+            return deny(result::ERR_BADCAP);
+        };
+        let Some((kind, rights, badge)) = g.cspace.lookup(cap) else {
+            return deny(result::ERR_BADCAP);
+        };
+        (pd, kind, rights, badge)
+    }; // CAPS-Read-Lock hier freigegeben
 
     match nr {
         sys::CALL | sys::RECV | sys::REPLY => {
@@ -203,26 +208,26 @@ pub fn dispatch(
                 return deny(result::ERR_BADCAP);
             }
             match nr {
-                sys::CALL => {
-                    drop(caps_guard); // CAPS vor dem Endpoint freigeben
-                    eps[ep].lock().call(ops, core, frame)
-                }
-                sys::RECV => {
-                    drop(caps_guard);
-                    eps[ep].lock().recv(ops, core, frame)
-                }
+                sys::CALL => eps[ep].lock().call(ops, core, frame),
+                sys::RECV => eps[ep].lock().recv(ops, core, frame),
                 _ => {
-                    // REPLY: ggf. Cap-Transfer (grant) unter CAPS+EPS (Ordnung
-                    // CAPS->EPS), dann CAPS freigeben und das Rendezvous fahren.
+                    // REPLY: ggf. Cap-Transfer (grant). Der Transfer MUTIERT den CapSpace,
+                    // braucht also den **Write-Lock**; um die Sperrordnung CAPS->EPS zu
+                    // wahren, wird CAPS-write VOR dem Endpoint-Lock genommen und nach dem
+                    // Transfer (vor dem Rendezvous) freigegeben. Ohne grant ist kein CAPS
+                    // nötig — reiner Endpoint-Lock.
                     let tag = frame_reg(frame, reg::TAG);
-                    let mut e = eps[ep].lock();
                     if tag & sel4lake_abi::GRANT_FLAG != 0 {
+                        let mut g = caps.write();
+                        let mut e = eps[ep].lock();
                         if let Some(caller) = e.caller() {
-                            grant_cap(&mut caps_guard, caller, pd, (tag & 0xff) as usize);
+                            grant_cap(&mut g, caller, pd, (tag & 0xff) as usize);
                         }
+                        drop(g); // CAPS vor dem Rendezvous freigeben (EPS bleibt gehalten)
+                        e.reply(ops, core, frame)
+                    } else {
+                        eps[ep].lock().reply(ops, core, frame)
                     }
-                    drop(caps_guard);
-                    e.reply(ops, core, frame)
                 }
             }
         }
@@ -238,7 +243,6 @@ pub fn dispatch(
             if n >= NNOTIFICATIONS {
                 return deny(result::ERR_BADCAP);
             }
-            drop(caps_guard);
             if nr == sys::SIGNAL {
                 ntfns[n].lock().signal(ops, badge, frame)
             } else {
@@ -252,7 +256,6 @@ pub fn dispatch(
             if !rights.contains(Rights::WRITE) {
                 return deny(result::ERR_RIGHTS);
             }
-            drop(caps_guard);
             let ok = ops.kill(ThreadId::from_raw(raw), core);
             frame_set_reg(frame, reg::SYSNO_RESULT, if ok { result::OK } else { result::ERR_BADCAP });
             frame
@@ -273,7 +276,6 @@ pub fn dispatch(
             } else {
                 return deny(result::ERR_RIGHTS);
             };
-            drop(caps_guard);
             let ok = if nr == sys::MAP {
                 ops.map_frame(thread, region.base, region.len, perm_code)
             } else {

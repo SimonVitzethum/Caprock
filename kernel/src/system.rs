@@ -19,9 +19,9 @@ use sel4lake_hal::{self as hal, exception::TrapFrame, fp::FpState, println};
 use sel4lake_ipc::{Endpoint, Notification, NENDPOINTS, NNOTIFICATIONS};
 use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
 use sel4lake_microkit::Caps;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use sel4lake_sched::{SchedOps, Scheduler, ThreadId, MAX_THREADS};
-use sel4lake_sync::SpinLock;
+use sel4lake_sync::{RwSpinLock, SpinLock};
 
 /// Anzahl Kerne (für die per-Kern FP-Owner-Tabelle). Muss ≥ der realen Kernzahl sein.
 const NUM_CORES: usize = 8;
@@ -145,9 +145,12 @@ static SCHEDS: [SpinLock<Scheduler>; NUM_CORES] =
 // Sperrordnung (außen->innen): CAPS < {EPS[i], NTFNS[i], MEM} < SCHEDS[*] < FP_STATES.
 // Der Reschedule-Pfad nimmt nur SCHEDS[core] (+ atomares FP_OWNER), wartet also nie
 // auf einen anderen Lock. IPC auf verschiedenen Endpoints läuft parallel (je eigener
-// EPS[i]-Lock); nur die kurze Cap-Auflösung serialisiert auf CAPS.
-/// Cap-Auflösung + -Verwaltung (CapSpace + PD-Tabelle) hinter einem Lock.
-static CAPS: SpinLock<Caps> = SpinLock::new(Caps::new());
+// EPS[i]-Lock). Die heiße Cap-Auflösung ist rein lesend und nimmt CAPS nur GETEILT
+// (Read) -> Lookups auf verschiedenen Kernen laufen parallel; nur die seltenen
+// Mutationen (install/copy/mint/move/delete/revoke/grant/PD-Ops) sperren CAPS exklusiv
+// (Write). `read()` und `write()` liegen an derselben Ordnungsposition wie zuvor `lock()`.
+/// Cap-Auflösung + -Verwaltung (CapSpace + PD-Tabelle) hinter einem Reader-Writer-Lock.
+static CAPS: RwSpinLock<Caps> = RwSpinLock::new(Caps::new());
 /// Physischer Allokator (Thread-Stacks etc.) — getrennt, blockiert IPC nicht.
 static MEM: SpinLock<PhysAllocator> = SpinLock::new(PhysAllocator::new());
 /// **Per-Endpoint** Locks: IPC auf verschiedenen Endpoints ist nebenläufig.
@@ -445,34 +448,34 @@ pub fn fragments() -> usize {
 
 /// Anzahl belegter Cap-Slots (Fuzzer-/Leak-Oracle).
 pub fn cap_used_slots() -> usize {
-    CAPS.lock().cspace.used_slots()
+    CAPS.read().cspace.used_slots()
 }
 /// Anzahl belegter Cap-Objekte (Fuzzer-/Leak-Oracle: kein Objekt ohne lebende Cap).
 pub fn cap_used_objects() -> usize {
-    CAPS.lock().cspace.used_objects()
+    CAPS.read().cspace.used_objects()
 }
 /// **CDT-/Refcount-Property-Oracle** (Fuzzer): `0` bei Konsistenz, sonst Anomalie-Code
 /// (s. `CapSpace::audit_cdt`). Sichert: keine verlorenen Objekte, keine negativen/
 /// falschen Refcounts, keine toten CDT-Knoten, keine Ableitung auf fremde Objekte,
 /// Baumform.
 pub fn cap_audit_cdt() -> u32 {
-    CAPS.lock().cspace.audit_cdt()
+    CAPS.read().cspace.audit_cdt()
 }
 
 pub fn cap_install(cap: MemoryCap) -> Result<CapPtr, CapError> {
-    CAPS.lock().cspace.install_memory(cap)
+    CAPS.write().cspace.install_memory(cap)
 }
 pub fn cap_copy(src: CapPtr, rights: Rights) -> Result<CapPtr, CapError> {
-    CAPS.lock().cspace.copy(src, rights)
+    CAPS.write().cspace.copy(src, rights)
 }
 pub fn cap_mint(src: CapPtr, rights: Rights, badge: u64) -> Result<CapPtr, CapError> {
-    CAPS.lock().cspace.mint(src, rights, badge)
+    CAPS.write().cspace.mint(src, rights, badge)
 }
 pub fn cap_move(src: CapPtr) -> Result<CapPtr, CapError> {
-    CAPS.lock().cspace.move_cap(src)
+    CAPS.write().cspace.move_cap(src)
 }
 pub fn cap_inspect(ptr: CapPtr) -> Option<CapInfo> {
-    CAPS.lock().cspace.inspect(ptr)
+    CAPS.read().cspace.inspect(ptr)
 }
 pub fn cap_delete(ptr: CapPtr) -> Result<(), CapError> {
     // Finalisierung gibt ggf. Speicher zurück -> CAPS vor MEM (Sperrordnung). Beim
@@ -480,7 +483,7 @@ pub fn cap_delete(ptr: CapPtr) -> Result<(), CapError> {
     // Freigeben von CAPS/MEM, da das Entblocken EPS<SCHEDS sperrt -> CAPS < EPS).
     let mut rf = sel4lake_cap::ReplyFinal::new();
     let r = {
-        let mut caps = CAPS.lock();
+        let mut caps = CAPS.write();
         let mut mem = MEM.lock();
         caps.cspace.delete(&mut mem, ptr, &mut rf)
     };
@@ -490,7 +493,7 @@ pub fn cap_delete(ptr: CapPtr) -> Result<(), CapError> {
 pub fn cap_revoke(ptr: CapPtr) -> Result<(), CapError> {
     let mut rf = sel4lake_cap::ReplyFinal::new();
     let r = {
-        let mut caps = CAPS.lock();
+        let mut caps = CAPS.write();
         let mut mem = MEM.lock();
         caps.cspace.revoke(&mut mem, ptr, &mut rf)
     };
@@ -530,9 +533,62 @@ pub fn endpoint_abort_call(ep: usize, caller: ThreadId) -> bool {
 /// abzubrechen. Wird die Cap gelöscht/revoked, wird der Aufrufer mit `ERR_SERVER_GONE`
 /// entblockt (s. `cap_delete`/`cap_revoke`).
 pub fn reply_cap_for(ep: usize, caller: ThreadId) -> Result<CapPtr, CapError> {
-    CAPS.lock()
+    CAPS.write()
         .cspace
         .install_reply(ep as u32, caller.to_raw(), Rights::WRITE)
+}
+
+// --- Test-Sonde: CAPS-Read-Concurrency (Verifikation des Reader-Writer-Locks) ---
+//
+// Beweist, dass der CAPS-Read-Lock mehrere Leser GLEICHZEITIG zulässt (mit dem alten
+// exklusiven SpinLock strukturell unmöglich -> Höchststand stets 1). Zwei Sonden auf
+// zwei Kernen synchronisieren sich über eine **zweiphasige Barriere innerhalb des
+// gehaltenen Read-Locks**: keiner verlässt den Abschnitt, bevor beide angekommen sind
+// (Phase 2), damit auch der Spätere den gemeinsamen Höchststand noch beobachtet.
+static CAPLK_IN: AtomicU32 = AtomicU32::new(0); // aktuell gleichzeitig im Read-Abschnitt
+static CAPLK_DEP: AtomicU32 = AtomicU32::new(0); // Abmarsch-Barriere (Phase 2)
+static CAPLK_MAX: AtomicU32 = AtomicU32::new(0); // beobachteter Höchststand gleichzeitiger Leser
+
+/// Beobachteter Höchststand gleichzeitiger CAPS-Leser (`>=2` beweist Read-Parallelität;
+/// mit einem exklusiven Lock wäre er strukturell `1`).
+pub fn caps_max_concurrent_readers() -> u32 {
+    CAPLK_MAX.load(Ordering::Acquire)
+}
+
+/// Test-Sonde: nimmt den CAPS-**Read**-Lock und wartet (begrenzt durch `spin_limit`) an
+/// einer Barriere, bis `want` Leser gleichzeitig im Read-Abschnitt sind. Gibt zurück, ob
+/// das beobachtet wurde. Mit dem Reader-Writer-Lock kommen beide Sonden gleichzeitig
+/// hinein (-> `true`); wäre der Lock exklusiv, blockierte die zweite Sonde -> die Barriere
+/// läuft in `spin_limit` und beide melden `false`. Nimmt keinen weiteren Lock -> hält nur
+/// den CAPS-Read-Lock (kein Sperrordnungsproblem). Im isolierten Test-Fenster aufzurufen.
+pub fn caps_read_concurrency_probe(want: u32, spin_limit: u32) -> bool {
+    let _g = CAPS.read();
+    CAPLK_IN.fetch_add(1, Ordering::AcqRel);
+    // Phase 1: ankommen + warten, bis beide Leser gleichzeitig drin sind.
+    let mut seen = false;
+    let mut s = 0u32;
+    loop {
+        let n = CAPLK_IN.load(Ordering::Acquire);
+        CAPLK_MAX.fetch_max(n, Ordering::AcqRel);
+        if n >= want {
+            seen = true;
+            break;
+        }
+        if s >= spin_limit {
+            break;
+        }
+        s += 1;
+        core::hint::spin_loop();
+    }
+    // Phase 2: Abmarsch-Barriere — erst gehen, wenn beide angekommen sind.
+    CAPLK_DEP.fetch_add(1, Ordering::AcqRel);
+    let mut s2 = 0u32;
+    while CAPLK_DEP.load(Ordering::Acquire) < want && s2 < spin_limit {
+        s2 += 1;
+        core::hint::spin_loop();
+    }
+    CAPLK_IN.fetch_sub(1, Ordering::AcqRel);
+    seen
 }
 
 // --- Endpoints / Notifications (per-Objekt-Locks) ---
@@ -549,7 +605,7 @@ pub fn create_endpoint() -> Option<usize> {
     None
 }
 pub fn install_endpoint_cap(ep: u32, rights: Rights) -> Result<CapPtr, CapError> {
-    CAPS.lock().cspace.install_endpoint(ep, rights)
+    CAPS.write().cspace.install_endpoint(ep, rights)
 }
 pub fn create_notification() -> Option<usize> {
     for (i, n) in NTFNS.iter().enumerate() {
@@ -562,7 +618,7 @@ pub fn create_notification() -> Option<usize> {
     None
 }
 pub fn install_notification_cap(ntfn: u32, rights: Rights) -> Result<CapPtr, CapError> {
-    CAPS.lock().cspace.install_notification(ntfn, rights)
+    CAPS.write().cspace.install_notification(ntfn, rights)
 }
 
 // --- Threads / Protection Domains ---
@@ -1089,7 +1145,7 @@ pub fn el0_syscall_seen() -> bool {
 
 /// Eine Tcb-Capability für einen Thread prägen (cap-kontrolliertes `KILL`).
 pub fn install_tcb_cap(tid: ThreadId, rights: Rights) -> Result<CapPtr, CapError> {
-    CAPS.lock().cspace.install_tcb(tid.to_raw(), rights)
+    CAPS.write().cspace.install_tcb(tid.to_raw(), rights)
 }
 
 // --- MCS Scheduling Contexts (Budget-basiertes Scheduling) ---
@@ -1106,7 +1162,7 @@ pub fn install_sched_context_cap(
     period: u32,
     rights: Rights,
 ) -> Result<CapPtr, CapError> {
-    CAPS.lock()
+    CAPS.write()
         .cspace
         .install_sched_context(budget, period, rights)
 }
@@ -1117,7 +1173,7 @@ pub fn install_sched_context_cap(
 /// Autorität (gibt `false` zurück). Lock-Ordnung: CAPS vor SCHEDS[core].
 pub fn bind_sched_context(sc: CapPtr, core: usize, tid: ThreadId) -> bool {
     let (budget, period) = {
-        let caps = CAPS.lock();
+        let caps = CAPS.read();
         match caps.cspace.lookup(sc) {
             Some((ObjectKind::SchedContext { budget, period }, rights, _))
                 if rights.contains(Rights::WRITE) =>
@@ -1220,16 +1276,16 @@ pub fn reaped_bytes() -> u64 {
 }
 
 pub fn create_pd() -> Option<usize> {
-    CAPS.lock().pds.create()
+    CAPS.write().pds.create()
 }
 pub fn bind_pd(pd: usize, tid: ThreadId) {
-    CAPS.lock().pds.bind_thread(pd, tid);
+    CAPS.write().pds.bind_thread(pd, tid);
 }
 pub fn install_pd_cap(pd: usize, slot: usize, cap: CapPtr) {
-    CAPS.lock().pds.install_cap(pd, slot, cap);
+    CAPS.write().pds.install_cap(pd, slot, cap);
 }
 pub fn clear_pd_cap(pd: usize, slot: usize) {
-    CAPS.lock().pds.clear_cap(pd, slot);
+    CAPS.write().pds.clear_cap(pd, slot);
 }
 
 /// Einen blockierten Endpoint-Empfänger zurückziehen (Hot-Reload).
@@ -1366,7 +1422,7 @@ pub fn ipc_audit() -> u32 {
         }
     }
     // CDT-/Refcount-Property (Cap-Churn-Events des IPC-Fuzzers laufen während IPC).
-    let cdt = CAPS.lock().cspace.audit_cdt();
+    let cdt = CAPS.read().cspace.audit_cdt();
     if cdt != 0 {
         return 20 + cdt;
     }

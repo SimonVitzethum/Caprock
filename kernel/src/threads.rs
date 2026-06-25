@@ -193,6 +193,22 @@ static RMIG_STEP: AtomicU32 = AtomicU32::new(0);
 static RMIG_DONE: AtomicBool = AtomicBool::new(false);
 static RMIG_OK: AtomicBool = AtomicBool::new(false);
 
+// CAPS-Read-Concurrency (Verifikation des Reader-Writer-Locks für #3): zwei Sonden auf
+// zwei Kernen halten GLEICHZEITIG den CAPS-Read-Lock (synchronisiert über eine Barriere
+// im kritischen Abschnitt). Mit dem alten exklusiven SpinLock strukturell unmöglich.
+// Beweist, dass die heißen Cap-Lookups jetzt nebenläufig (statt serialisiert) laufen.
+const CAPLK_CORE_A: usize = 1;
+const CAPLK_CORE_B: usize = 2;
+const CAPLK_WANT: u32 = 2; // zwei gleichzeitige Leser
+const CAPLK_SPIN_LIMIT: u32 = 50_000_000; // bricht im Normalfall früh ab (Barriere erfüllt)
+static CAPLK_A_OK: AtomicBool = AtomicBool::new(false);
+static CAPLK_B_OK: AtomicBool = AtomicBool::new(false);
+static CAPLK_A_DONE: AtomicBool = AtomicBool::new(false);
+static CAPLK_B_DONE: AtomicBool = AtomicBool::new(false);
+static CAPLK_STEP: AtomicU32 = AtomicU32::new(0);
+static CAPLK_DONE: AtomicBool = AtomicBool::new(false);
+static CAPLK_OK: AtomicBool = AtomicBool::new(false);
+
 // Audit-Regression B (Scheduler/MCS): `set_budget`/`bind_sched_context` auf einen
 // ERSCHÖPFTEN Thread darf ihn nicht stranden (Fund: `depleted` gelöscht ohne
 // `enqueue_ready` -> Thread nie wieder einplanbar, belegter Slot -> DoS + Leak-
@@ -1261,6 +1277,28 @@ extern "C" fn rmig_client(_arg: usize) -> ! {
     let r = invoke(sys::CALL, EP_CAP, [RMIG_INPUT, 0, 0, 0], 0);
     RMIG_VALUE.store(r.msg[0], Ordering::Release);
     RMIG_RESULT.store(r.result, Ordering::Release); // zuletzt: Manager pollt hierauf
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// **CAPS-Read-Concurrency-Sonde A** (EL1, [`CAPLK_CORE_A`]): hält den CAPS-Read-Lock und
+/// wartet an der Barriere, bis auch Sonde B drin ist. Braucht keine PD (ruft `system::`
+/// direkt + PARK). Beweist zusammen mit B die Read-Parallelität des Reader-Writer-Locks.
+extern "C" fn caplk_probe_a(_arg: usize) -> ! {
+    let ok = system::caps_read_concurrency_probe(CAPLK_WANT, CAPLK_SPIN_LIMIT);
+    CAPLK_A_OK.store(ok, Ordering::Release);
+    CAPLK_A_DONE.store(true, Ordering::Release);
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// **CAPS-Read-Concurrency-Sonde B** (EL1, [`CAPLK_CORE_B`]): Gegenstück zu A.
+extern "C" fn caplk_probe_b(_arg: usize) -> ! {
+    let ok = system::caps_read_concurrency_probe(CAPLK_WANT, CAPLK_SPIN_LIMIT);
+    CAPLK_B_OK.store(ok, Ordering::Release);
+    CAPLK_B_DONE.store(true, Ordering::Release);
     loop {
         invoke(sys::PARK, 0, [0; 4], 0);
     }
@@ -2378,7 +2416,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -2406,6 +2444,7 @@ pub fn demo_report_then_idle() -> ! {
                 RMIG_DONE.load(Ordering::Acquire) && RMIG_OK.load(Ordering::Acquire),
                 FUZZ_DONE.load(Ordering::Acquire) && FUZZ_OK.load(Ordering::Acquire),
                 IPCFUZZ_DONE.load(Ordering::Acquire) && IPCFUZZ_OK.load(Ordering::Acquire),
+                CAPLK_DONE.load(Ordering::Acquire) && CAPLK_OK.load(Ordering::Acquire),
             );
         }
         // Beendete Threads einsammeln (sicher: läuft auf dem Idle-Stack).
@@ -2898,6 +2937,53 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // CAPS-Read-Concurrency (#3, Reader-Writer-Lock): zwei Sonden auf zwei Kernen
+        // halten gleichzeitig den CAPS-Read-Lock -> beweist parallele Cap-Lookups (mit
+        // dem alten exklusiven Lock unmöglich). Gegate auf rmig + BEIDE Fuzzer fertig,
+        // damit im Sondenfenster keine konkurrierenden CAPS-Mutationen laufen.
+        if !CAPLK_DONE.load(Ordering::Acquire)
+            && RMIG_DONE.load(Ordering::Acquire)
+            && FUZZ_DONE.load(Ordering::Acquire)
+            && IPCFUZZ_DONE.load(Ordering::Acquire)
+        {
+            match CAPLK_STEP.load(Ordering::Acquire) {
+                0 => {
+                    // Beide Sonden auf verschiedenen Kernen erzeugen (keine PD nötig).
+                    // Atomar einreihen, dann beide Zielkerne per IPI wecken -> sie laufen
+                    // nebenläufig und treffen sich im CAPS-Read-Abschnitt an der Barriere.
+                    hal::cpu::local_irq_disable();
+                    let a = system::spawn_on_core(
+                        CAPLK_CORE_A,
+                        caplk_probe_a as *const () as usize,
+                        0,
+                        3,
+                    );
+                    let b = system::spawn_on_core(
+                        CAPLK_CORE_B,
+                        caplk_probe_b as *const () as usize,
+                        0,
+                        3,
+                    );
+                    hal::cpu::local_irq_enable();
+                    if let (Some(ta), Some(tb)) = (a, b) {
+                        system::wake_remote(ta);
+                        system::wake_remote(tb);
+                        CAPLK_STEP.store(1, Ordering::Release);
+                    }
+                }
+                _ => {
+                    if CAPLK_A_DONE.load(Ordering::Acquire) && CAPLK_B_DONE.load(Ordering::Acquire)
+                    {
+                        let ok = CAPLK_A_OK.load(Ordering::Acquire)
+                            && CAPLK_B_OK.load(Ordering::Acquire)
+                            && system::caps_max_concurrent_readers() >= CAPLK_WANT;
+                        CAPLK_OK.store(ok, Ordering::Release);
+                        CAPLK_DONE.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+
         // Audit-Regression B (MCS-Stranding): budgetierten Worker auf STRAND_CORE
         // erschöpfen lassen, dann erneut binden -> er muss WIEDER laufen (Fix). Gegate
         // auf MCS fertig + SMP fertig (STRAND_CORE frei). Tick-basiert (anderer Kern).
@@ -3043,9 +3129,11 @@ fn all_done() -> bool {
     let fuzz = FUZZ_DONE.load(Ordering::Acquire) && FUZZ_OK.load(Ordering::Acquire);
     // IPC-State-Machine-Fuzzer: nebenläufige IPC-Aktoren + Oracle ohne Anomalie.
     let ipcfuzz = IPCFUZZ_DONE.load(Ordering::Acquire) && IPCFUZZ_OK.load(Ordering::Acquire);
+    // CAPS-Read-Concurrency: zwei Kerne halten gleichzeitig den CAPS-Read-Lock (RwLock).
+    let caplk = CAPLK_DONE.load(Ordering::Acquire) && CAPLK_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
-        && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz
+        && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk
 }
 
 fn report() {
@@ -3388,5 +3476,14 @@ fn report() {
     println!(
         "ipcfuzz : {} (nebenlaeufige Endpoint-/Notification-Zustandsmaschinen: KILL/EXIT/Reload/MCS/Cap-Ops waehrend IPC, Queue-Konsistenz-Oracle)",
         if ipcfuzz { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // CAPS-Read-Concurrency (#3): Reader-Writer-Lock laesst parallele Cap-Lookups zu.
+    let clmax = system::caps_max_concurrent_readers();
+    let caplk = CAPLK_DONE.load(Ordering::Acquire) && CAPLK_OK.load(Ordering::Acquire);
+    println!("caplk   : 2 Sonden auf Kern {CAPLK_CORE_A}+{CAPLK_CORE_B}; gleichzeitige CAPS-Leser-Hoechststand={clmax} (erwartet >={CAPLK_WANT}; exklusiver Lock waere strukturell 1)");
+    println!(
+        "caplk   : {} (CAPS-Reader-Writer-Lock: heisse Cap-Lookups laufen nebenlaeufig statt serialisiert)",
+        if caplk { "ALL PASS" } else { "FAILURES" }
     );
 }

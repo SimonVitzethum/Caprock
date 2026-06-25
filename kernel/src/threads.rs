@@ -283,6 +283,24 @@ static RTC_STEP: AtomicU32 = AtomicU32::new(0);
 static RTC_DONE: AtomicBool = AtomicBool::new(false);
 static RTC_OK: AtomicBool = AtomicBool::new(false);
 
+// RTC-IRQ (ext-22, P5): das HardwareLand-Backend armiert den PL031-Match-Interrupt (schreibt
+// RTC_MR/RTC_IMSC ueber die RW-gemappte Device-Seite) und WAITet auf seine Kanal-Notification.
+// Der Kernel routet SPI 34 (RTC) an Kern 0, faengt ihn ab (deferred), maskiert ihn und stellt
+// ihn als Notification-Badge zu -> Backend wacht auf und meldet "IRQ erhalten" an den Partner.
+const RTC_INTID: u32 = 34; // PL031 RTC = SPI 2 -> GIC-INTID 34 (QEMU virt)
+const IRQT_BADGE: u64 = 0x10;
+static IRQT_TS_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static IRQT_BE_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static IRQT_GOT_VALUE: AtomicU64 = AtomicU64::new(u64::MAX); // Partner-CALL-Antwort (1 = IRQ erhalten)
+static IRQT_RES_CODE: AtomicU64 = AtomicU64::new(u64::MAX);
+static IRQT_MMIO_OK: AtomicBool = AtomicBool::new(false);
+static IRQT_CAP_OK: AtomicBool = AtomicBool::new(false); // IRQ-Cap ins HardwareLand-Backend ok
+static IRQT_POLICY: AtomicBool = AtomicBool::new(false); // IRQ-Cap in UserLand -> denied
+static IRQT_CLIENT_DONE: AtomicBool = AtomicBool::new(false);
+static IRQT_STEP: AtomicU32 = AtomicU32::new(0);
+static IRQT_DONE: AtomicBool = AtomicBool::new(false);
+static IRQT_OK: AtomicBool = AtomicBool::new(false);
+
 // Audit-Regression B (Scheduler/MCS): `set_budget`/`bind_sched_context` auf einen
 // ERSCHÖPFTEN Thread darf ihn nicht stranden (Fund: `depleted` gelöscht ohne
 // `enqueue_ready` -> Thread nie wieder einplanbar, belegter Slot -> DoS + Leak-
@@ -1200,6 +1218,54 @@ extern "C" fn rtc_timeservice(_arg: usize) -> ! {
     RTC_VALUE.store(r.msg[0], Ordering::Release);
     RTC_RES_CODE.store(r.result, Ordering::Release);
     RTC_CLIENT_DONE.store(true, Ordering::Release);
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// **RTC-IRQ-Backend** (ext-22, P5, `.user_text`, isolierte HardwareLand-VSpace). x0 = RW-
+/// gemappte RTC-Basis. Empfaengt die Anfrage des Partners (Slot 0), **armiert** den PL031-
+/// Match-Interrupt (RTC_MR = RTC_DR+1, RTC_IMSC=1 — kleiner `unsafe`-HW-Zugriff), WAITet auf
+/// die Kanal-Notification (Slot 2). Der Kernel stellt den RTC-IRQ als Badge zu -> der WAIT
+/// kehrt zurueck; das Backend meldet "IRQ erhalten" (msg0=1) an den Partner (REPLY Slot 0).
+#[link_section = ".user_text"]
+extern "C" fn rtc_irq_backend(_arg: usize) -> ! {
+    // SAFETY: reiner EL0-User-Code; Device-Schreib-/Lesezugriffe nur auf die selbst (cap-
+    // autorisiert) RW-gemappte RTC-Registerseite; RECV/WAIT/REPLY/PARK ueber die Kanal-Caps.
+    unsafe {
+        core::arch::asm!(
+            "mov x9, x0",   // x9 = RTC-Basis (RW)
+            "mov x0, #2",   // sys::RECV Slot 0 (Anfrage des Partners)
+            "mov x1, #0",
+            "svc #0",
+            "ldr w10, [x9]",        // w10 = RTC_DR
+            "add w10, w10, #1",     // Match = DR + 1 (naechste Sekunde)
+            "str w10, [x9, #4]",    // RTC_MR (Offset 0x04) = Match
+            "mov w11, #1",
+            "str w11, [x9, #16]",   // RTC_IMSC (Offset 0x10) = 1 (Match-Interrupt freigeben)
+            "mov x0, #9",   // sys::WAIT Slot 2 (Kanal-Notification = IRQ-Zustellung)
+            "mov x1, #2",
+            "svc #0",
+            "mov x2, #1",   // IRQ erhalten -> Antwort-msg0 = 1
+            "mov x0, #3",   // sys::REPLY Slot 0
+            "mov x1, #0",
+            "svc #0",
+        "1:",
+            "mov x0, #5",   // sys::PARK
+            "svc #0",
+            "b 1b",
+            options(noreturn),
+        );
+    }
+}
+
+/// **Trusted-Zeitdienst (IRQ-Variante)** (ext-22, P5, EL1, TrustedSas): CALLt das RTC-IRQ-
+/// Backend; der CALL kehrt erst zurueck, wenn das Backend den RTC-Interrupt empfangen hat.
+extern "C" fn irq_timeservice(_arg: usize) -> ! {
+    let r = invoke(sys::CALL, 0, [0, 0, 0, 0], 0);
+    IRQT_GOT_VALUE.store(r.msg[0], Ordering::Release);
+    IRQT_RES_CODE.store(r.result, Ordering::Release);
+    IRQT_CLIENT_DONE.store(true, Ordering::Release);
     loop {
         invoke(sys::PARK, 0, [0; 4], 0);
     }
@@ -2638,7 +2704,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -2671,6 +2737,7 @@ pub fn demo_report_then_idle() -> ! {
                 PDCTL_DONE.load(Ordering::Acquire) && PDCTL_OK.load(Ordering::Acquire),
                 CHAN_DONE.load(Ordering::Acquire) && CHAN_OK.load(Ordering::Acquire),
                 RTC_DONE.load(Ordering::Acquire) && RTC_OK.load(Ordering::Acquire),
+                IRQT_DONE.load(Ordering::Acquire) && IRQT_OK.load(Ordering::Acquire),
             );
         }
         // Beendete Threads einsammeln (sicher: läuft auf dem Idle-Stack).
@@ -3493,6 +3560,94 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // RTC-IRQ (ext-22, P5): IRQ-Cap + GIC-SPI-Routing + Deferred-IRQ-Zustellung. Gegate
+        // auf rtc fertig (sequenziell, vor den Fuzzern).
+        if !IRQT_DONE.load(Ordering::Acquire) && RTC_DONE.load(Ordering::Acquire) {
+            match IRQT_STEP.load(Ordering::Acquire) {
+                0 => {
+                    if let Some(ts) = system::create_pd_in_domain(Domain::TrustedSas) {
+                        IRQT_TS_PD.store(ts, Ordering::Relaxed);
+                        if let Some((be, ep, ntfn)) = system::create_hardware_backend(ts, 5) {
+                            IRQT_BE_PD.store(be, Ordering::Relaxed);
+                            // Kanal-Caps (Endpoint).
+                            if let Ok(eroot) = system::install_endpoint_cap(ep as u32, Rights::RWX) {
+                                if let (Ok(recv), Ok(send)) = (
+                                    system::cap_mint(eroot, Rights::READ, 0),
+                                    system::cap_mint(eroot, Rights::WRITE, 0),
+                                ) {
+                                    system::install_pd_cap(be, 0, recv);
+                                    system::install_pd_cap(ts, 0, send);
+                                }
+                            }
+                            // Kanal-Notification: WAIT-Cap (Slot 2) ins Backend = IRQ-Zustellung.
+                            if let Ok(nroot) =
+                                system::install_notification_cap(ntfn as u32, Rights::RWX)
+                            {
+                                if let Ok(waitc) = system::cap_mint(nroot, Rights::READ, 0) {
+                                    system::install_pd_cap(be, 2, waitc);
+                                }
+                            }
+                            // MMIO-Cap (RTC, RW) + IRQ-Cap (INTID 34) ins HardwareLand-Backend.
+                            if let Ok(mcap) =
+                                system::install_mmio_cap(RTC_PHYS, RTC_LEN, Rights::WRITE)
+                            {
+                                IRQT_MMIO_OK
+                                    .store(system::install_pd_cap(be, 1, mcap), Ordering::Release);
+                            }
+                            if let Ok(icap) = system::install_irq_cap(RTC_INTID, Rights::READ) {
+                                IRQT_CAP_OK
+                                    .store(system::install_pd_cap(be, 3, icap), Ordering::Release);
+                            }
+                            // Policy-Negativtest: IRQ-Cap in eine UserLand-PD -> abgelehnt.
+                            if let Some(upd) = system::create_pd_in_domain(Domain::UserLand) {
+                                if let Ok(icap2) = system::install_irq_cap(RTC_INTID, Rights::READ) {
+                                    let denied = !system::install_pd_cap(upd, 0, icap2);
+                                    IRQT_POLICY.store(denied, Ordering::Release);
+                                }
+                            }
+                            // IRQ an die Kanal-Notification binden + SPI an Kern 0 routen.
+                            system::bind_irq(RTC_INTID, ntfn, IRQT_BADGE, 0);
+                            IRQT_STEP.store(1, Ordering::Release);
+                        }
+                    }
+                }
+                1 => {
+                    // Backend (isoliert EL0) + RTC RW-Mapping; es armiert den IRQ und WAITet.
+                    if let Some((b, _)) = system::spawn_isolated(
+                        rtc_irq_backend as *const () as usize,
+                        RTC_PHYS as usize,
+                        3,
+                    ) {
+                        system::bind_pd(IRQT_BE_PD.load(Ordering::Relaxed), b);
+                        system::map_mmio_into_thread(b, RTC_PHYS, RTC_LEN, false); // RW (armieren)
+                    }
+                    IRQT_STEP.store(2, Ordering::Release);
+                }
+                2 => {
+                    // Trusted-Zeitdienst (EL1) -> CALLt das Backend (kehrt erst nach dem IRQ zurueck).
+                    if let Some(c) =
+                        system::spawn_on_core(0, irq_timeservice as *const () as usize, 0, 3)
+                    {
+                        system::bind_pd(IRQT_TS_PD.load(Ordering::Relaxed), c);
+                    }
+                    IRQT_STEP.store(3, Ordering::Release);
+                }
+                _ => {
+                    if IRQT_CLIENT_DONE.load(Ordering::Acquire) {
+                        let ok = IRQT_RES_CODE.load(Ordering::Acquire) == result::OK
+                            && IRQT_GOT_VALUE.load(Ordering::Acquire) == 1 // Backend meldete IRQ
+                            && system::irqs_delivered() >= 1
+                            && IRQT_MMIO_OK.load(Ordering::Acquire)
+                            && IRQT_CAP_OK.load(Ordering::Acquire)
+                            && IRQT_POLICY.load(Ordering::Acquire)
+                            && system::domain_audit() == 0;
+                        IRQT_OK.store(ok, Ordering::Release);
+                        IRQT_DONE.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+
         // Audit-Regression B (MCS-Stranding): budgetierten Worker auf STRAND_CORE
         // erschöpfen lassen, dann erneut binden -> er muss WIEDER laufen (Fix). Gegate
         // auf MCS fertig + SMP fertig (STRAND_CORE frei). Tick-basiert (anderer Kern).
@@ -3555,7 +3710,7 @@ pub fn demo_report_then_idle() -> ! {
             && MCS_DONE.load(Ordering::Acquire)
             && STALE_DONE.load(Ordering::Acquire)
             && STRAND_DONE.load(Ordering::Acquire)
-            && RTC_DONE.load(Ordering::Acquire) // ext-22-Tests zuerst (frisches Frühregime)
+            && IRQT_DONE.load(Ordering::Acquire) // ext-22-Tests zuerst (frisches Frühregime)
         {
             if system::spawn_on_core(0, fuzz_driver as *const () as usize, 0, 2).is_some() {
                 fuzz_spawned = true;
@@ -3649,10 +3804,12 @@ fn all_done() -> bool {
     let chan = CHAN_DONE.load(Ordering::Acquire) && CHAN_OK.load(Ordering::Acquire);
     // RTC-Hardware-Backend: MMIO-Cap + Device-Mapping + echtes RTC_DR-Read über den Kanal.
     let rtc = RTC_DONE.load(Ordering::Acquire) && RTC_OK.load(Ordering::Acquire);
+    // RTC-IRQ: IRQ-Cap + GIC-SPI-Routing + Deferred-IRQ-Zustellung an das HardwareLand-Backend.
+    let irq = IRQT_DONE.load(Ordering::Acquire) && IRQT_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
-        && pdctl && chan && rtc
+        && pdctl && chan && rtc && irq
 }
 
 fn report() {
@@ -4045,5 +4202,15 @@ fn report() {
     println!(
         "rtc     : {} (generisches vspace_map_device + MMIO-Cap: Device-Zugriff nur in HardwareLand, kernel-autorisiert, W^X)",
         if rtc { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // RTC-IRQ (ext-22, P5): IRQ-Cap + GIC-SPI-Routing + Deferred-IRQ-Zustellung.
+    let irq = IRQT_DONE.load(Ordering::Acquire) && IRQT_OK.load(Ordering::Acquire);
+    println!("irq     : HardwareLand-Backend armiert PL031-Match-IRQ (INTID {RTC_INTID}); Kernel routet+deferred-zustellt -> Backend-Antwort={} (1 erwartet), zugestellte IRQs={}; IRQ-Cap-in-HW={} in-UserLand-denied={}",
+        IRQT_GOT_VALUE.load(Ordering::Acquire), system::irqs_delivered(),
+        IRQT_CAP_OK.load(Ordering::Acquire), IRQT_POLICY.load(Ordering::Acquire));
+    println!(
+        "irq     : {} (IRQ-Cap + GICD_ITARGETSR-Routing + Deferred-Signal: Geraete-IRQ als Notification an HardwareLand, lock-/deadlock-frei)",
+        if irq { "ALL PASS" } else { "FAILURES" }
     );
 }

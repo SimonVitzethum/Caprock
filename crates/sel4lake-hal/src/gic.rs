@@ -11,7 +11,9 @@ const GICD_BASE: usize = 0x0800_0000;
 const GICC_BASE: usize = 0x0801_0000;
 
 const GICD_CTLR: usize = 0x000;
-const GICD_ISENABLER: usize = 0x100; // write-1-to-set, je Bit ein INTID
+const GICD_ISENABLER: usize = 0x100; // write-1-to-set, je Bit ein INTID (freigeben)
+const GICD_ICENABLER: usize = 0x180; // write-1-to-clear, je Bit ein INTID (maskieren)
+const GICD_ITARGETSR: usize = 0x800; // je INTID ein Byte: Ziel-CPU-Maske (nur SPIs >= 32)
 const GICD_SGIR: usize = 0xf00; // Software Generated Interrupt (IPI auslösen)
 
 /// SGI-INTID für den Cross-Core-Reschedule-IPI (SGIs belegen INTID 0..15).
@@ -57,6 +59,29 @@ pub fn enable_intid(intid: u32) {
     let reg = (intid / 32) as usize;
     let bit = intid % 32;
     gicd_write(GICD_ISENABLER + 4 * reg, 1 << bit);
+}
+
+/// Eine Interrupt-ID am Distributor **maskieren** (sperren). Verhindert ein Re-Triggern
+/// eines level-getriggerten Geräte-IRQ (z. B. RTC), bis er behandelt/wieder freigegeben ist.
+pub fn mask_intid(intid: u32) {
+    let reg = (intid / 32) as usize;
+    let bit = intid % 32;
+    gicd_write(GICD_ICENABLER + 4 * reg, 1 << bit);
+}
+
+/// Einen **SPI** (shared peripheral interrupt, INTID >= 32) an genau einen Ziel-Kern
+/// routen (`GICD_ITARGETSR`: ein Byte je INTID, Bit `target_core` = Ziel-CPU). Für PPIs/
+/// SGIs (< 32) ist das Register gebankt/read-only -> No-Op. **Ohne dieses Routing erreicht
+/// ein SPI keinen Kern** — der Standard-Reset-Wert kann 0 (kein Ziel) sein.
+pub fn route_spi(intid: u32, target_core: usize) {
+    if intid < 32 {
+        return; // PPI/SGI: gebankt, kein ITARGETSR-Routing
+    }
+    let off = GICD_ITARGETSR + intid as usize; // Byte-Offset = INTID
+    // SAFETY: feste MMIO-Adresse des GIC-Distributors (Device-Memory), Byte-Zugriff.
+    unsafe {
+        core::ptr::write_volatile((GICD_BASE + off) as *mut u8, 1u8 << (target_core & 0x7));
+    }
 }
 
 /// Einen Software-generierten Interrupt (SGI/IPI) `intid` (0..15) an genau einen

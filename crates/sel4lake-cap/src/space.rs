@@ -179,6 +179,12 @@ impl CapSpace {
         self.install(ObjectKind::Mmio { phys, len }, rights)
     }
 
+    /// Eine **IRQ-Capability** (ext-22, HardwareLand) einbringen: die Autorität, den Geräte-
+    /// Interrupt `intid` zu empfangen. Hält keinen RAM-Eintrag. Nur kernelseitig.
+    pub fn install_irq(&mut self, intid: u32, rights: Rights) -> Result<CapPtr, CapError> {
+        self.install(ObjectKind::Irq { intid }, rights)
+    }
+
     /// Wurzel-Objekt + -Cap anlegen (gemeinsame Logik für alle Objekttypen).
     fn install(&mut self, kind: ObjectKind, rights: Rights) -> Result<CapPtr, CapError> {
         let obj = self.alloc_object(kind)?;

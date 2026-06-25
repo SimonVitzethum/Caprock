@@ -146,6 +146,31 @@ pub fn set_reschedule_hook(hook: RescheduleHook) {
     RESCHED_HOOK.store(hook as usize, Ordering::Release);
 }
 
+/// Optionaler **Geräte-IRQ-Hook** (ext-22, P5): bekommt eine INTID, die weder Timer noch
+/// Reschedule-IPI ist. Der Kernel vermerkt sie (pending) + maskiert sie am Distributor und
+/// gibt `true` zurück, falls es ein **registrierter** Geräte-IRQ (mit IRQ-Cap) war — dann
+/// fährt der Dispatch einen Reschedule (der Drain stellt sie als Notification zu, außerhalb
+/// des IRQ-Kontexts). `0` = nicht gesetzt. Der Hook selbst nimmt **keinen** Lock (IRQ-Kontext).
+static IRQ_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Signatur des Geräte-IRQ-Hooks: INTID -> war es ein registrierter Geräte-IRQ?
+pub type IrqHook = fn(u32) -> bool;
+
+/// Geräte-IRQ-Hook registrieren (vor dem Aktivieren von IRQs aufzurufen).
+pub fn set_irq_hook(hook: IrqHook) {
+    IRQ_HOOK.store(hook as usize, Ordering::Release);
+}
+
+fn device_irq(intid: u32) -> bool {
+    let h = IRQ_HOOK.load(Ordering::Acquire);
+    if h == 0 {
+        return false;
+    }
+    // SAFETY: wie `reschedule` — nur über `set_irq_hook` mit gültigem Funktionszeiger gesetzt.
+    let hook: IrqHook = unsafe { core::mem::transmute(h) };
+    hook(intid)
+}
+
 fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
     let h = RESCHED_HOOK.load(Ordering::Acquire);
     if h == 0 {
@@ -289,6 +314,14 @@ pub extern "C" fn handle_exception(frame: *mut TrapFrame, kind: u64) -> *mut Tra
             || intid == Some(crate::gic::IPI_RESCHED_INTID)
         {
             return reschedule(frame);
+        }
+        // Geräte-IRQ (ext-22, P5): an den Kernel-Hook melden (pending + maskieren). War es
+        // ein registrierter Geräte-IRQ, fährt der Reschedule den Drain (Notification-Signal
+        // außerhalb des IRQ-Kontexts -> Sperrordnung gewahrt).
+        if let Some(id) = intid {
+            if device_irq(id) {
+                return reschedule(frame);
+            }
         }
         return frame;
     }

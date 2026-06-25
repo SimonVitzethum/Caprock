@@ -166,6 +166,10 @@ static NTFNS: [SpinLock<Notification>; NNOTIFICATIONS] =
 
 fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
     let core = hal::cpu::core_id();
+    // Deferred-IRQ-Zustellung (ext-22, P5): pending Geräte-IRQs als Notification signalisieren
+    // — VOR dem SCHEDS-Lock (signal nimmt NTFNS<SCHEDS; kein verschachtelter SCHEDS). Fast-
+    // Check -> Null-Overhead auf dem heißen Timer-Pfad, wenn nichts pending ist.
+    drain_pending_irqs();
     // Heißer Pfad: nur der Scheduler-Lock DIESES Kerns (parallel zu anderen Kernen).
     // Echter Zeitscheiben-Tick -> MCS-Budget des laufenden Threads belasten.
     let mut sched = SCHEDS[core].lock();
@@ -424,6 +428,7 @@ pub fn set_hooks() {
     hal::exception::set_reschedule_hook(reschedule);
     hal::exception::set_syscall_hook(syscall);
     hal::exception::set_fault_hook(el0_fault);
+    hal::exception::set_irq_hook(irq_hook); // Geräte-IRQ-Hook (ext-22, P5)
     hal::exception::set_fp_hook(fp_trap);
 }
 
@@ -1222,6 +1227,92 @@ pub fn map_mmio_into_thread(tid: ThreadId, phys: u64, len: u64, ro: bool) -> boo
     } else {
         false
     }
+}
+
+// --- IRQ-Caps + Deferred-IRQ-Zustellung (ext-22, P5) ---
+//
+// Ein Geräte-IRQ wird einem HardwareLand-Backend als Notification-Badge zugestellt. Der
+// IRQ-Pfad ist **deadlock-frei** gehalten: `irq_hook` läuft im IRQ-Kontext und ist
+// LOCK-FREI (nur Atomics + GIC-Maskierung); die eigentliche Zustellung (`drain_pending_irqs`)
+// läuft im Reschedule-Pfad (IRQs im Trap maskiert -> kein Reentrancy) und nimmt NTFNS<SCHEDS.
+const NIRQ_BIND: usize = 4;
+#[allow(clippy::declare_interior_mutable_const)]
+static IRQ_INTID: [AtomicU32; NIRQ_BIND] = [const { AtomicU32::new(u32::MAX) }; NIRQ_BIND];
+#[allow(clippy::declare_interior_mutable_const)]
+static IRQ_NTFN: [AtomicU32; NIRQ_BIND] = [const { AtomicU32::new(0) }; NIRQ_BIND];
+#[allow(clippy::declare_interior_mutable_const)]
+static IRQ_BADGE: [AtomicU64; NIRQ_BIND] = [const { AtomicU64::new(0) }; NIRQ_BIND];
+#[allow(clippy::declare_interior_mutable_const)]
+static IRQ_PENDING: [AtomicBool; NIRQ_BIND] = [const { AtomicBool::new(false) }; NIRQ_BIND];
+static IRQ_ANY_PENDING: AtomicBool = AtomicBool::new(false);
+static IRQ_DELIVERED: AtomicU64 = AtomicU64::new(0); // Telemetrie: zugestellte Geräte-IRQs
+
+/// **Geräte-IRQ-Hook** (aus `exception.rs`, IRQ-Kontext, **LOCK-FREI**): ist `intid`
+/// registriert, vermerken (pending) + am Distributor maskieren (kein Re-Trigger), `true`.
+/// Sonst `false`. Nimmt KEINEN Lock — die Zustellung erfolgt deferred im Reschedule-Pfad.
+fn irq_hook(intid: u32) -> bool {
+    for i in 0..NIRQ_BIND {
+        if IRQ_INTID[i].load(Ordering::Acquire) == intid {
+            hal::gic::mask_intid(intid); // level-getriggerten Geräte-IRQ bis zum Drain sperren
+            IRQ_PENDING[i].store(true, Ordering::Release);
+            IRQ_ANY_PENDING.store(true, Ordering::Release);
+            return true;
+        }
+    }
+    false
+}
+
+/// Pending Geräte-IRQs zustellen: je Pending-Slot die gebundene Notification per
+/// `signal_from_kernel` signalisieren (Sperrordnung NTFNS<SCHEDS, IRQs maskiert, KEIN
+/// SCHEDS-Lock gehalten). Aus dem Reschedule-Pfad VOR dem SCHEDS-Lock. Fast-Check ->
+/// Null-Overhead, wenn nichts pending ist.
+fn drain_pending_irqs() {
+    if !IRQ_ANY_PENDING.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let mut ops = KernelSched;
+    for i in 0..NIRQ_BIND {
+        if IRQ_PENDING[i].swap(false, Ordering::AcqRel) {
+            let ntfn = IRQ_NTFN[i].load(Ordering::Acquire) as usize;
+            let badge = IRQ_BADGE[i].load(Ordering::Acquire);
+            if ntfn < NNOTIFICATIONS {
+                NTFNS[ntfn].lock().signal_from_kernel(&mut ops, badge);
+                IRQ_DELIVERED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Eine **IRQ-Capability** prägen (ext-22, P5) — nur kernelseitig; installiert wird sie
+/// cap-policy-geprüft nur in HardwareLand-PDs.
+pub fn install_irq_cap(intid: u32, rights: Rights) -> Result<CapPtr, CapError> {
+    CAPS.write().cspace.install_irq(intid, rights)
+}
+
+/// Einen Geräte-IRQ `intid` an die Notification `ntfn` (mit `badge`) **binden**, an `core`
+/// routen und freigeben (ext-22, P5). Nutzt das HardwareLand-Backend (über die IRQ-Cap
+/// autorisiert). Gibt `false`, wenn kein Bindungs-Slot frei ist.
+pub fn bind_irq(intid: u32, ntfn: usize, badge: u64, core: usize) -> bool {
+    for i in 0..NIRQ_BIND {
+        if IRQ_INTID[i]
+            .compare_exchange(u32::MAX, intid, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            IRQ_NTFN[i].store(ntfn as u32, Ordering::Release);
+            IRQ_BADGE[i].store(badge, Ordering::Release);
+            // SPI an den Ziel-Kern routen (GICD_ITARGETSR — fehlte bisher; lasttragend,
+            // sensitivitaetsgeprueft: ohne dies erreicht der RTC-IRQ keinen Kern).
+            hal::gic::route_spi(intid, core);
+            hal::gic::enable_intid(intid);
+            return true;
+        }
+    }
+    false
+}
+
+/// Anzahl bisher zugestellter Geräte-IRQs (Telemetrie für den `irq`-Test).
+pub fn irqs_delivered() -> u64 {
+    IRQ_DELIVERED.load(Ordering::Acquire)
 }
 
 // --- MCS Scheduling Contexts (Budget-basiertes Scheduling) ---

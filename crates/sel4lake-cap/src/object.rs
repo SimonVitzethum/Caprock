@@ -42,6 +42,11 @@ pub enum ObjectKind {
     /// beliebige MMIO-Caps) und ist nur in HardwareLand-PDs installierbar. Verweist auf
     /// einen **Geräte**-Bereich (kein RAM-Allokator-Eintrag) -> keine Finalisierung.
     Mmio { phys: u64, len: u64 },
+    /// Eine **IRQ-Capability** (ext-22, HardwareLand): die Autorität, den Geräte-Interrupt
+    /// `intid` zu empfangen — der Kernel bindet ihn an eine Notification und stellt ihn dem
+    /// Backend als Badge-Signal zu (`bind_irq`). Nur kernelseitig geprägt, nur in
+    /// HardwareLand-PDs installierbar. Hält keinen RAM-Allokator-Eintrag -> keine Finalisierung.
+    Irq { intid: u32 },
 }
 
 /// Eintrag der Objekt-Tabelle.

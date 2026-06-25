@@ -428,6 +428,26 @@ impl Notification {
         frame
     }
 
+    /// Wie [`signal`](Self::signal), aber **aus dem Kernel** (kein signalisierender Thread/
+    /// Frame) — z. B. Deferred-IRQ-Zustellung (ext-22, P5): ein Geräte-Interrupt wird als
+    /// Badge-Signal an den wartenden HardwareLand-Backend zugestellt. Setzt den Badge,
+    /// entblockt den Waiter (ggf. kern-übergreifend per `unblock`+IPI); schreibt **keinen**
+    /// Signalisierer-Frame. Unter dem Notification-Lock aufzurufen (Sperrordnung NTFNS<SCHEDS).
+    pub fn signal_from_kernel(&mut self, ops: &mut dyn SchedOps, badge: u64) {
+        if !self.used {
+            return;
+        }
+        self.pending |= badge;
+        if let Some(w) = self.waiter.take() {
+            if let Some(wframe) = ops.frame_of(w) {
+                frame_set_reg(wframe, reg::SYSNO_RESULT, result::OK);
+                frame_set_reg(wframe, reg::EP_BADGE, self.pending);
+                self.pending = 0;
+            }
+            ops.unblock(w);
+        }
+    }
+
     /// `WAIT`: akkumulierten Badge abholen (sofort, falls vorhanden) oder
     /// blockieren, bis signalisiert wird. Liefert den Badge in `x1`.
     pub fn wait(&mut self, ops: &mut dyn SchedOps, core: usize, frame: usize) -> usize {

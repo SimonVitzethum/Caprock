@@ -177,7 +177,7 @@ impl Caps {
 fn kind_is_hardware(kind: ObjectKind) -> bool {
     // Hardware-Caps (nur in HardwareLand erlaubt). `Dma` lässt sich später hier einhängen,
     // ohne ABI/Strukturen zu ändern (generische Kategorie).
-    matches!(kind, ObjectKind::Mmio { .. })
+    matches!(kind, ObjectKind::Mmio { .. } | ObjectKind::Irq { .. })
 }
 
 /// Ist `kind` eine Management-Cap (`PdControl`)? Diese darf nur eine TrustedSas-PD halten.

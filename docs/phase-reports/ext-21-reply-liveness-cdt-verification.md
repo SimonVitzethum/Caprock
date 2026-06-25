@@ -128,18 +128,36 @@ Threads über KILL/EXIT/Reload/MCS-während-IPC.
 ## Verbleibende Restrisiken & Empfehlungen (nächste Härtungsstufe)
 
 1. **Voller first-class Reply-Cap** (eigene Objektart, per-PD-Slot, CDT-Revocation,
-   **Budget-Donation**) — der hier umgesetzte Owner-Token-Kern ist die Grundlage.
-2. **Reply nach reiner Cap-Revocation** (ohne Thread-Tod): Cap-Finalisierung sollte
-   ausstehende Caller des Endpoints mit `ERR_SERVER_GONE` entblocken.
+   **Budget-Donation**) — der umgesetzte Owner-Token-Kern ist die Grundlage. *Offen
+   (großer Umbau, hohes Migrationsrisiko).*
+2. ✅ **ERLEDIGT** (Reload-/Quiesce-Pfad): `endpoint_quiesce_owner` entblockt einen
+   ausstehenden Caller mit `ERR_SERVER_GONE`, wenn sein Reply-Owner via Hot-Reload
+   zurückgezogen wird (Server lebt). In `reload_swap` integriert; `rgone` Runde 2
+   prüft es (Server lebt=true). **Restrisiko:** reine `cap_revoke` der Recv-Cap (ohne
+   Reload-Pfad) ruft den Hook noch nicht automatisch (Cap-Finalisierung → IPC fehlt).
 3. **Globale CAPS-Sperre** serialisiert alle Cap-Lookups → IPC-Durchsatz-Engpass
-   (funktional + Skalierung); per-PD-Cap-Cache / feinere Cap-Locks.
+   (funktional + Skalierung); per-PD-Cap-Cache / feinere Cap-Locks. *Offen (Perf-Refactor).*
 4. **Echter Mehrstunden-Lauf** (Mio. Ops) auf realer HW / KVM statt TCG; + ein
-   vereinheitlichter, gleichzeitiger Mega-Fuzzer mit gemeinsamer Baseline.
-5. **VMM-Tiefenprüfung**: ein expliziter „keine verwaisten Page-Tables / keine
-   doppelten Mappings"-Walker (derzeit indirekt über die Ressourcen-Baseline).
-6. **u32-Generationen** (ABA nach 2³² Recyclings) — 64-bit, falls extreme Churn-Lauf-
-   zeiten erwartet werden.
+   vereinheitlichter, gleichzeitiger Mega-Fuzzer mit gemeinsamer Baseline. *Offen
+   (Umgebung + Baseline-Vereinheitlichung).*
+5. ✅ **ERLEDIGT** (VMM-Property-Walker): `mmu::vspace_wx_ok` / `system::vspace_audit`
+   prüfen **W^X** (keine EL0-Seite schreibbar+ausführbar) + Seitentabellen-Struktur
+   über alle isolierten VSpaces; im Ressourcen-Fuzzer mid-epoch (Code 60+).
+   Sensitivität: UXN aus `user_block` → erkannt. *Rest: „keine doppelten Mappings" —
+   im Identity-SAS-Modell inhärent (VA==PA), daher kein separater Check nötig.*
+6. **u32-Generationen** (ABA nach 2³² Recyclings) — bewusst **nicht** umgesetzt: 4 Mrd.
+   Recyclings **eines** Slots sind für realistische Lasten unerreichbar; ein 64-bit-
+   Repack birgt Regressionsrisiko ohne praktischen Nutzen (trivialer Future-Change).
 
-**Ergebnis:** `./test-qemu.sh` = **ALL PASS (32 Checks, ~5 s)**. Reply-Liveness-Lücke
-geschlossen + regressionsgetestet; CDT-/Refcount-Property-Oracle ergänzt + in alle
-Fuzzer integriert + sensitivitätsgeprüft; Property-Invarianten je Subsystem dokumentiert.
+### Folge-Härtung dieser Sitzung (aus den Empfehlungen)
+
+- **#2 Reload-/Quiesce-Reply-Liveness** (Commit `67383ee`): `endpoint_quiesce_owner`
+  + `reload_swap`-Integration; `rgone` um Runde 2 (Quiesce, Server lebt) erweitert.
+- **#5 VMM-Property-Walker** (Commit `28b2a6a`): W^X + Struktur-Walker, im Fuzzer
+  integriert + sensitivitätsgeprüft.
+
+**Ergebnis:** `./test-qemu.sh` = **ALL PASS (32 Checks, ~5 s)**. Reply-Liveness für
+Thread-Tod **und** Reload/Quiesce geschlossen + regressionsgetestet (2 Runden); CDT-/
+Refcount- **und** VMM-W^X-Property-Oracles ergänzt + in die Fuzzer integriert +
+sensitivitätsgeprüft; Property-Invarianten je Subsystem (Cap/Scheduler/IPC/VMM/
+Ressourcen) durch Oracles abgesichert.

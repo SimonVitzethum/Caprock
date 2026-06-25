@@ -30,7 +30,7 @@ echo "== boot ($SECONDS_RUN s) =="
 OUT="$(timeout --signal=KILL "$SECONDS_RUN" qemu-system-aarch64 \
     -machine virt,iommu=smmuv3 -cpu cortex-a72 -smp "$CORES" -m 4G \
     -nographic -serial mon:stdio -no-reboot \
-    -device virtio-rng-pci \
+    -net none -device virtio-rng-pci \
     -kernel "$ELF" </dev/null 2>/dev/null)"
 
 echo "$OUT"
@@ -80,6 +80,7 @@ check "rtc     : ALL PASS" "RTC-HardwareLand-Backend: generisches MMIO-Cap + vsp
 check "irq     : ALL PASS" "RTC-IRQ: IRQ-Cap + GIC-SPI-Routing + Deferred-IRQ-Zustellung als Notification an HardwareLand"
 check "dma     : ALL PASS" "DMA-Capability: DmaCap hinter DmaEnforcer-Abstraktion, kernel-ausgeschnittene Region, Normal-NC-Mapping, EL0-Round-Trip + Kohaerenz, dma_audit"
 check "pcie    : ALL PASS" "PCIe-ECAM-Enumeration: virtio-rng-pci gefunden, BAR-Zuweisung + Bus-Master-Enable, RID == SMMU-StreamID"
+check "smmu    : ALL PASS" "SMMUv3-Bring-up hinter DmaEnforcer: Command-/Event-Queue + Stream-Tabelle, Default-Abort, CR0-Enable, CMD_SYNC-Round-Trip"
 check "hwfuzz  : ALL PASS" "Domaenen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Domaenen-Policy + CDT/VSpace-Oracle + Ressourcen-Baseline"
 online=$(echo "$OUT" | grep -c "online")
 [ "$online" -eq "$CORES" ] && echo "  PASS: alle $CORES Kerne online" || { echo "  FAIL: nur $online/$CORES Kerne online"; fail=1; }

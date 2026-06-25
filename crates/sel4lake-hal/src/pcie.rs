@@ -26,6 +26,9 @@ static MMIO32_NEXT: AtomicU64 = AtomicU64::new(MMIO32_BASE);
 
 /// Red-Hat/virtio PCI-Vendor-ID.
 pub const VIRTIO_VENDOR: u16 = 0x1af4;
+/// virtio-rng PCI-Device-IDs: transitional (0x1005) bzw. modern (0x1040 + 4 = 0x1044). QEMU
+/// fügt evtl. eine Default-NIC (virtio-net, 0x1000) hinzu — daher gezielt nach RNG filtern.
+pub const VIRTIO_RNG_DEVICES: [u16; 2] = [0x1005, 0x1044];
 
 // --- PCI-Config-Space-Offsets ---
 const CFG_VENDOR: u16 = 0x00;
@@ -99,10 +102,10 @@ pub fn cfg_read8(bus: u8, dev: u8, func: u8, off: u16) -> u8 {
     (w >> ((off as u32 & 0x3) * 8)) as u8
 }
 
-/// Bus 0 nach dem ersten Gerät mit Vendor `vendor` durchsuchen. BARs werden dabei
-/// dimensioniert + im 32-bit-Fenster zugewiesen, Memory-Space + Bus-Master aktiviert.
-/// `None`, wenn kein passendes Gerät gefunden wird.
-pub fn find_by_vendor(vendor: u16) -> Option<PciDevice> {
+/// Bus 0 nach dem ersten Gerät mit Vendor `vendor` und (falls `devices` nicht leer) einer
+/// passenden Device-ID durchsuchen. BARs werden dabei dimensioniert + im 32-bit-Fenster
+/// zugewiesen, Memory-Space + Bus-Master aktiviert. `None`, wenn nichts Passendes existiert.
+pub fn find(vendor: u16, devices: &[u16]) -> Option<PciDevice> {
     for dev in 0u8..32 {
         let v = cfg_read16(0, dev, 0, CFG_VENDOR);
         if v == 0xffff || v == 0x0000 {
@@ -110,6 +113,10 @@ pub fn find_by_vendor(vendor: u16) -> Option<PciDevice> {
         }
         if v != vendor {
             continue;
+        }
+        let did = cfg_read16(0, dev, 0, CFG_DEVICE);
+        if !devices.is_empty() && !devices.contains(&did) {
+            continue; // Vendor passt, aber falscher Gerätetyp (z.B. Default-NIC)
         }
         let mut d = PciDevice {
             bus: 0,

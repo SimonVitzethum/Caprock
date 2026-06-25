@@ -13,6 +13,7 @@ pub mod gic;
 pub mod mmu;
 pub mod pcie;
 pub mod psci;
+pub mod smmu;
 pub mod syscall;
 pub mod timer;
 

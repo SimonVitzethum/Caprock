@@ -1354,27 +1354,79 @@ pub trait DmaEnforcer: Sync {
     fn is_active(&self) -> bool;
 }
 
-/// **SMMUv3-Enforcer** — die einzige `DmaEnforcer`-Implementierung in ext-23. Der Bring-up
-/// (`init`, D2) und die Bindungs-Programmierung (`enable_dma`/`disable_dma` über STE/CD/Stage-1,
-/// D3) folgen in den jeweiligen Phasen; das D0-Skelett etabliert nur die Abstraktionsgrenze.
+/// **SMMUv3-Enforcer** — die einzige `DmaEnforcer`-Implementierung in ext-23. Hält die
+/// Physadressen der Command-/Event-Queue + linearen Stream-Tabelle sowie den Command-Queue-
+/// PROD-Index. `init` (D2) bringt die SMMU hoch (Default-Abort); `enable_dma`/`disable_dma`
+/// (D3) programmieren je StreamID eine STE -> CD -> Stage-1-Tabelle. Das gesamte SMMU-Wissen
+/// liegt hier + in `hal::smmu`; der übrige Kernel kennt nur das `DmaEnforcer`-Trait.
 pub struct SmmuV3Enforcer {
-    /// Durchsetzung aktiv (nach erfolgreichem `init`).
     active: AtomicBool,
+    strtab_phys: AtomicU64,
+    cmdq_phys: AtomicU64,
+    eventq_phys: AtomicU64,
+    cmdq_prod: AtomicU32,
+    sync_ok: AtomicBool, // CMD_SYNC-Round-Trip beim Bring-up gelang (D2-Spike)
 }
 
 impl SmmuV3Enforcer {
     pub const fn new() -> Self {
         Self {
             active: AtomicBool::new(false),
+            strtab_phys: AtomicU64::new(0),
+            cmdq_phys: AtomicU64::new(0),
+            eventq_phys: AtomicU64::new(0),
+            cmdq_prod: AtomicU32::new(0),
+            sync_ok: AtomicBool::new(false),
         }
+    }
+
+    /// Einen kontiguierlichen, page-ausgerichteten, **genullten** RAM-Block der Größe `len`
+    /// ausschneiden (für Queue-/Tabellen-Speicher der SMMU). `None` bei Erschöpfung.
+    fn alloc_zeroed(len: u64) -> Option<u64> {
+        let len = (len + 4095) & !4095;
+        let base = MEM.lock().alloc(len, len.next_power_of_two().max(4096)).map(|c| c.base())?;
+        // SAFETY: frisch allozierter, identity-gemappter RAM-Block; exklusiv hier beschrieben.
+        unsafe { core::ptr::write_bytes(base as *mut u8, 0, len as usize) };
+        hal::cpu::dsb_sy();
+        Some(base)
+    }
+
+    /// CMD_SYNC-Round-Trip beim Bring-up gelungen? (D2-Spike-Telemetrie.)
+    pub fn sync_ok(&self) -> bool {
+        self.sync_ok.load(Ordering::Acquire)
     }
 }
 
 impl DmaEnforcer for SmmuV3Enforcer {
     fn init(&self) -> bool {
-        // D2: SMMU-Register mappen, Command-/Event-Queue + Stream-Tabelle anlegen, CR0 setzen,
-        // Default-Abort. Bis dahin: nicht aktiv (DMA-Tests in D0/D1 prüfen nur die Cap-Schicht).
-        false
+        if self.active.load(Ordering::Acquire) {
+            return true; // idempotent
+        }
+        if !hal::smmu::present() {
+            return false;
+        }
+        // Command-/Event-Queue + lineare Stream-Tabelle (genullt -> Default-Abort) ausschneiden.
+        let Some(strtab) = Self::alloc_zeroed(hal::smmu::strtab_bytes()) else {
+            return false;
+        };
+        let Some(cmdq) = Self::alloc_zeroed(hal::smmu::cmdq_bytes()) else {
+            return false;
+        };
+        let Some(eventq) = Self::alloc_zeroed(hal::smmu::eventq_bytes()) else {
+            return false;
+        };
+        self.strtab_phys.store(strtab, Ordering::Release);
+        self.cmdq_phys.store(cmdq, Ordering::Release);
+        self.eventq_phys.store(eventq, Ordering::Release);
+        if !hal::smmu::bringup(strtab, cmdq, eventq) {
+            return false;
+        }
+        // Spike: CMD_SYNC-Round-Trip beweist die Command-Queue-Mechanik.
+        let (prod, ok) = hal::smmu::cmd_sync(cmdq, 0);
+        self.cmdq_prod.store(prod, Ordering::Release);
+        self.sync_ok.store(ok, Ordering::Release);
+        self.active.store(true, Ordering::Release);
+        ok
     }
     fn enable_dma(&self, _binding: &DmaBinding) -> bool {
         // D3: STE/CD/Stage-1 für die StreamID, CMD_CFGI_STE + CMD_TLBI + CMD_SYNC.
@@ -1384,7 +1436,16 @@ impl DmaEnforcer for SmmuV3Enforcer {
         // D3: STE invalidieren + CMD_TLBI + CMD_SYNC.
     }
     fn audit(&self) -> u32 {
-        // D3: Event-Queue leer? STE nur für gebundene Streams? Bis dahin: konsistent.
+        if !self.active.load(Ordering::Acquire) {
+            return 0; // nicht initialisiert -> keine Durchsetzungs-Aussage (D0/D1)
+        }
+        // Aktiv: keine globalen Fehler + keine unerwarteten Translation-Faults.
+        if hal::smmu::gerror() != 0 {
+            return 1;
+        }
+        if !hal::smmu::eventq_empty() {
+            return 2;
+        }
         0
     }
     fn is_active(&self) -> bool {
@@ -1401,6 +1462,35 @@ static DMA_ENFORCER: SmmuV3Enforcer = SmmuV3Enforcer::new();
 /// enforcer-polymorph und SMMU-agnostisch).
 pub fn dma_enforcer() -> &'static dyn DmaEnforcer {
     &DMA_ENFORCER
+}
+
+/// Den DMA-Enforcer initialisieren (Bring-up; idempotent). Bei SMMUv3: Queues/Stream-Tabelle
+/// anlegen, Default-Abort, CR0 aktivieren. Gibt `true` bei Erfolg / aktiver Durchsetzung.
+pub fn dma_enforcer_init() -> bool {
+    dma_enforcer().init()
+}
+
+// --- SMMU-Diagnose-Accessors (ext-23, D2; SMMU-spezifisch, nur für den `smmu`-Test/Bericht) ---
+pub fn smmu_present() -> bool {
+    hal::smmu::present()
+}
+pub fn smmu_idr0() -> u32 {
+    hal::smmu::idr0()
+}
+pub fn smmu_sid_bits() -> u32 {
+    hal::smmu::sid_bits()
+}
+pub fn smmu_enabled() -> bool {
+    hal::smmu::enabled()
+}
+pub fn smmu_sync_ok() -> bool {
+    DMA_ENFORCER.sync_ok()
+}
+pub fn smmu_eventq_empty() -> bool {
+    hal::smmu::eventq_empty()
+}
+pub fn smmu_gerror() -> u32 {
+    hal::smmu::gerror()
 }
 
 /// Eine kontiguierliche **DMA-RAM-Region** (4-KiB-granular, in der mappbaren GiB-1-Region)
@@ -1497,7 +1587,8 @@ pub fn dma_audit() -> u32 {
 /// (inkl. RID = SMMU-StreamID) zurück. Reines kernel-/Trusted-Setup — kein User-Pfad.
 pub fn pcie_find_virtio() -> Option<hal::pcie::PciDevice> {
     hal::mmu::map_device_block_global(hal::pcie::ECAM_GIB);
-    hal::pcie::find_by_vendor(hal::pcie::VIRTIO_VENDOR)
+    // Gezielt die virtio-RNG (nicht eine evtl. vorhandene Default-NIC, ebenfalls Vendor 0x1af4).
+    hal::pcie::find(hal::pcie::VIRTIO_VENDOR, &hal::pcie::VIRTIO_RNG_DEVICES)
 }
 
 /// Wie [`dma_audit`], aber mit explizit gewähltem `floor` (für den Bounds-Sensitivitätstest:

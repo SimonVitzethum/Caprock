@@ -336,6 +336,19 @@ static PCIE_NEG: AtomicBool = AtomicBool::new(false); // Bogus-Vendor -> nicht g
 static PCIE_DONE: AtomicBool = AtomicBool::new(false);
 static PCIE_OK: AtomicBool = AtomicBool::new(false);
 
+// SMMUv3-Bring-up (ext-23, D2): den DmaEnforcer (SmmuV3Enforcer) initialisieren — Command-/
+// Event-Queue + lineare Stream-Tabelle (genullt = Default-Abort) anlegen, CR0 (CMDQEN|EVENTQEN,
+// dann SMMUEN) aktivieren, CMD_SYNC-Round-Trip als Spike. Danach: Uebersetzung aktiv (CR0ACK),
+// Event-Queue leer, keine globalen Fehler (GERROR).
+static SMMU_IDR0: AtomicU32 = AtomicU32::new(0);
+static SMMU_SID: AtomicU32 = AtomicU32::new(0);
+static SMMU_GERR: AtomicU32 = AtomicU32::new(u32::MAX);
+static SMMU_SYNC: AtomicBool = AtomicBool::new(false); // CMD_SYNC-Round-Trip gelang
+static SMMU_EN: AtomicBool = AtomicBool::new(false); // CR0ACK.SMMUEN
+static SMMU_EVTQ: AtomicBool = AtomicBool::new(false); // Event-Queue leer
+static SMMU_DONE: AtomicBool = AtomicBool::new(false);
+static SMMU_OK: AtomicBool = AtomicBool::new(false);
+
 // Domänen/HW-Fuzzer (ext-22, P6): churnt über viele Epochen Hardware-/Management-Caps gegen
 // die Domänen-Policy + CDT/VSpace-Oracles + Ressourcen-Baseline. Kernpunkte: HW-Caps (MMIO/
 // IRQ) NUR in HardwareLand, PdControl NUR in TrustedSas installierbar (Negativfälle abgelehnt);
@@ -2892,7 +2905,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} hwfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} hwfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -2928,6 +2941,7 @@ pub fn demo_report_then_idle() -> ! {
                 IRQT_DONE.load(Ordering::Acquire) && IRQT_OK.load(Ordering::Acquire),
                 DMA_DONE.load(Ordering::Acquire) && DMA_OK.load(Ordering::Acquire),
                 PCIE_DONE.load(Ordering::Acquire) && PCIE_OK.load(Ordering::Acquire),
+                SMMU_DONE.load(Ordering::Acquire) && SMMU_OK.load(Ordering::Acquire),
                 HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire),
             );
         }
@@ -3946,10 +3960,7 @@ pub fn demo_report_then_idle() -> ! {
                 PCIE_BAR.store(bar, Ordering::Relaxed);
                 PCIE_BM.store(hal::pcie::bus_master_enabled(&d), Ordering::Relaxed);
                 // Negativ: Suche nach einem Bogus-Vendor liefert nichts (kein Seiteneffekt).
-                PCIE_NEG.store(
-                    hal::pcie::find_by_vendor(0xdead).is_none(),
-                    Ordering::Relaxed,
-                );
+                PCIE_NEG.store(hal::pcie::find(0xdead, &[]).is_none(), Ordering::Relaxed);
                 let ok = d.vendor == hal::pcie::VIRTIO_VENDOR
                     && d.device != 0
                     && bar != 0
@@ -3963,9 +3974,30 @@ pub fn demo_report_then_idle() -> ! {
             PCIE_DONE.store(true, Ordering::Release);
         }
 
+        // SMMUv3-Bring-up (ext-23, D2): den DmaEnforcer initialisieren + Spike. Synchrones
+        // kernel-/Trusted-Setup, ein Schritt. Gegate auf pcie fertig (sequenziell, vor Fuzzern).
+        if !SMMU_DONE.load(Ordering::Acquire) && PCIE_DONE.load(Ordering::Acquire) {
+            let ok_init = system::dma_enforcer_init();
+            SMMU_IDR0.store(system::smmu_idr0(), Ordering::Relaxed);
+            SMMU_SID.store(system::smmu_sid_bits(), Ordering::Relaxed);
+            SMMU_SYNC.store(system::smmu_sync_ok(), Ordering::Relaxed);
+            SMMU_EN.store(system::smmu_enabled(), Ordering::Relaxed);
+            SMMU_EVTQ.store(system::smmu_eventq_empty(), Ordering::Relaxed);
+            SMMU_GERR.store(system::smmu_gerror(), Ordering::Relaxed);
+            let ok = system::smmu_present()
+                && ok_init
+                && SMMU_EN.load(Ordering::Relaxed)
+                && SMMU_SYNC.load(Ordering::Relaxed)
+                && SMMU_EVTQ.load(Ordering::Relaxed)
+                && SMMU_GERR.load(Ordering::Relaxed) == 0
+                && system::dma_audit() == 0;
+            SMMU_OK.store(ok, Ordering::Release);
+            SMMU_DONE.store(true, Ordering::Release);
+        }
+
         // Domänen/HW-Fuzzer (ext-22, P6): churnt HW-/Management-Caps gegen Policy + Oracles +
-        // Baseline. Gegate auf PCIe (ext-23) fertig; eine Epoche je Manager-Iteration.
-        if !HWFUZZ_DONE.load(Ordering::Acquire) && PCIE_DONE.load(Ordering::Acquire) {
+        // Baseline. Gegate auf SMMU (ext-23) fertig; eine Epoche je Manager-Iteration.
+        if !HWFUZZ_DONE.load(Ordering::Acquire) && SMMU_DONE.load(Ordering::Acquire) {
             match HWFUZZ_STEP.load(Ordering::Acquire) {
                 0 => {
                     // Fixtures (eine PD je Domäne, ohne Threads) + Baseline schnappen.
@@ -4171,12 +4203,14 @@ fn all_done() -> bool {
     let dma = DMA_DONE.load(Ordering::Acquire) && DMA_OK.load(Ordering::Acquire);
     // PCIe-Enumeration (ext-23): virtio-rng-pci gefunden, BAR + Bus-Master, RID = StreamID.
     let pcie = PCIE_DONE.load(Ordering::Acquire) && PCIE_OK.load(Ordering::Acquire);
+    // SMMUv3-Bring-up (ext-23): DmaEnforcer aktiv (CR0ACK), CMD_SYNC-Spike, Event-Queue leer.
+    let smmu = SMMU_DONE.load(Ordering::Acquire) && SMMU_OK.load(Ordering::Acquire);
     // Domänen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Policy + Oracles + Baseline.
     let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
-        && pdctl && chan && rtc && irq && dma && pcie && hwfuzz
+        && pdctl && chan && rtc && irq && dma && pcie && smmu && hwfuzz
 }
 
 fn report() {
@@ -4600,6 +4634,17 @@ fn report() {
     println!(
         "pcie    : {} (ECAM-Enumeration + BAR-Zuweisung + Bus-Master; RID == SMMU-StreamID, kernel-/Trusted-Setup)",
         if pcie { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // SMMUv3-Bring-up (ext-23, D2): DmaEnforcer initialisiert (Default-Abort) + CMD_SYNC-Spike.
+    let smmu = SMMU_DONE.load(Ordering::Acquire) && SMMU_OK.load(Ordering::Acquire);
+    println!("smmu    : SMMUv3 IDR0=0x{:08x} SIDSIZE={} -> Bring-up: SMMUEN={} CMD_SYNC-Round-Trip={} Event-Queue-leer={} GERROR=0x{:x}",
+        SMMU_IDR0.load(Ordering::Acquire), SMMU_SID.load(Ordering::Acquire),
+        SMMU_EN.load(Ordering::Acquire), SMMU_SYNC.load(Ordering::Acquire),
+        SMMU_EVTQ.load(Ordering::Acquire), SMMU_GERR.load(Ordering::Acquire));
+    println!(
+        "smmu    : {} (SMMUv3-Bring-up hinter DmaEnforcer: Command-/Event-Queue + lineare Stream-Tabelle, Default-Abort, CR0)",
+        if smmu { "ALL PASS" } else { "FAILURES" }
     );
 
     // Domänen/HW-Fuzzer (ext-22, P6).

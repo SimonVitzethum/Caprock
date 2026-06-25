@@ -125,11 +125,17 @@ static STALE_OK: AtomicBool = AtomicBool::new(false);
 // REPLY, muss der blockierte CALL-Aufrufer mit ERR_SERVER_GONE entblockt werden (statt
 // dauerhaft zu hängen). Server RECVt einmal + parkt (antwortet nie); Manager killt ihn;
 // Client-CALL muss mit ERR_SERVER_GONE zurückkehren. (alles core 0, kill ist kern-lokal)
+// Runde 2 (Reload/Quiesce-Pfad OHNE Thread-Tod): derselbe Aufbau, aber der Server wird
+// per endpoint_quiesce_owner (wie im Hot-Reload) zurückgezogen statt gekillt — der
+// Client muss ebenfalls ERR_SERVER_GONE sehen, und der Server bleibt am Leben.
 const RGONE_MAGIC: u64 = 0x4711;
 static RGONE_SERVER_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
 static RGONE_CLIENT_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static RGONE_EP_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
 static RGONE_SERVER_TID: AtomicU64 = AtomicU64::new(u64::MAX);
-static RGONE_RESULT: AtomicU64 = AtomicU64::new(u64::MAX); // Ergebniscode des Client-CALL
+static RGONE_RESULT: AtomicU64 = AtomicU64::new(u64::MAX); // Client-CALL-Ergebnis (kill-Runde)
+static RGONE_Q_RESULT: AtomicU64 = AtomicU64::new(u64::MAX); // Client-CALL-Ergebnis (quiesce-Runde)
+static RGONE_Q_SRV_ALIVE: AtomicBool = AtomicBool::new(false); // Server lebt nach quiesce?
 static RGONE_STEP: AtomicU32 = AtomicU32::new(0);
 static RGONE_DONE: AtomicBool = AtomicBool::new(false);
 static RGONE_OK: AtomicBool = AtomicBool::new(false);
@@ -566,11 +572,16 @@ pub fn spawn_demo() {
     system::install_pd_cap(rg_c_pd, EP_CAP as usize, rg_send);
     RGONE_SERVER_PD.store(rg_s_pd, Ordering::Relaxed);
     RGONE_CLIENT_PD.store(rg_c_pd, Ordering::Relaxed);
+    RGONE_EP_ID.store(rgep, Ordering::Relaxed);
 }
 
 /// Generischer Hot-Reload-Swap: v1 zurückziehen (Quiesce: Empfänger entfernen +
 /// Recv-Cap entziehen), dann v2 (mit Argument) starten und an seine PD binden.
 fn reload_swap(info: ReloadInfo, v2_entry: usize, v2_arg: usize) {
+    // Reply-Liveness: hatte v1 einen Aufrufer mitten in der Bearbeitung (RECV ohne REPLY),
+    // wird dieser beim Quiescen mit ERR_SERVER_GONE entblockt statt zu stranden (v1 wird
+    // gleich capless/ersetzt und antwortet nie mehr).
+    system::endpoint_quiesce_owner(info.ep, info.v1);
     system::endpoint_retire_receiver(info.ep, info.v1);
     system::clear_pd_cap(info.v1_pd, EP_CAP as usize);
     // Atomar gegen Preemption, damit v2 nicht vor dem Bind läuft.
@@ -1054,6 +1065,18 @@ extern "C" fn rgone_server(_arg: usize) -> ! {
 extern "C" fn rgone_client(_arg: usize) -> ! {
     let r = invoke(sys::CALL, EP_CAP, [RGONE_MAGIC, 0, 0, 0], 0);
     RGONE_RESULT.store(r.result, Ordering::Release);
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// **Reply-Gone-Client Runde 2** (Quiesce-/Reload-Pfad): wie [`rgone_client`], hält das
+/// Ergebnis aber in `RGONE_Q_RESULT` fest. Der Server wird hier NICHT gekillt, sondern
+/// via `endpoint_quiesce_owner` zurückgezogen (Hot-Reload) — der CALL muss trotzdem mit
+/// `ERR_SERVER_GONE` zurückkehren.
+extern "C" fn rgone_client2(_arg: usize) -> ! {
+    let r = invoke(sys::CALL, EP_CAP, [RGONE_MAGIC, 0, 0, 0], 0);
+    RGONE_Q_RESULT.store(r.result, Ordering::Release);
     loop {
         invoke(sys::PARK, 0, [0; 4], 0);
     }
@@ -2460,13 +2483,54 @@ pub fn demo_report_then_idle() -> ! {
                         RGONE_STEP.store(3, Ordering::Release);
                     }
                 }
+                3 => {
+                    // Kill-Runde ausgewertet (Client muss ERR_SERVER_GONE haben). Dann
+                    // Runde 2 (Quiesce/Reload-Pfad) starten: frischen Server erzeugen.
+                    if RGONE_RESULT.load(Ordering::Acquire) != u64::MAX {
+                        hal::cpu::local_irq_disable();
+                        if let Some(s) =
+                            system::spawn_on_core(0, rgone_server as *const () as usize, 0, 3)
+                        {
+                            system::bind_pd(RGONE_SERVER_PD.load(Ordering::Relaxed), s);
+                            RGONE_SERVER_TID.store(s.to_raw(), Ordering::Relaxed);
+                            RGONE_STEP.store(4, Ordering::Release);
+                        }
+                        hal::cpu::local_irq_enable();
+                    }
+                }
+                4 => {
+                    // Runde-2-Client erzeugen -> CALL -> Rendezvous, Server wird Reply-
+                    // Owner + parkt, Client blockiert auf die Antwort.
+                    hal::cpu::local_irq_disable();
+                    if let Some(c) =
+                        system::spawn_on_core(0, rgone_client2 as *const () as usize, 0, 3)
+                    {
+                        system::bind_pd(RGONE_CLIENT_PD.load(Ordering::Relaxed), c);
+                        RGONE_STEP.store(5, Ordering::Release);
+                    }
+                    hal::cpu::local_irq_enable();
+                }
+                5 => {
+                    // Server NICHT killen, sondern via endpoint_quiesce_owner zurückziehen
+                    // (Hot-Reload-Pfad, Server bleibt am Leben). Der Client muss ebenfalls
+                    // ERR_SERVER_GONE bekommen; danach prüfen, dass der Server noch lebt.
+                    let s = ThreadId::from_raw(RGONE_SERVER_TID.load(Ordering::Relaxed));
+                    let ep = RGONE_EP_ID.load(Ordering::Relaxed);
+                    if system::endpoint_quiesce_owner(ep, s) {
+                        RGONE_Q_SRV_ALIVE.store(system::thread_alive(s), Ordering::Release);
+                        RGONE_STEP.store(6, Ordering::Release);
+                    }
+                }
                 _ => {
-                    // Auswertung: der Client-CALL muss zurückgekehrt sein, mit
-                    // ERR_SERVER_GONE. Ohne Fix bliebe der Client ewig blockiert
-                    // (RGONE_RESULT == u64::MAX).
-                    let r = RGONE_RESULT.load(Ordering::Acquire);
-                    if r != u64::MAX {
-                        RGONE_OK.store(r == result::ERR_SERVER_GONE, Ordering::Release);
+                    // Auswertung beider Runden: Kill-Pfad UND Quiesce-Pfad liefern dem
+                    // Client ERR_SERVER_GONE; im Quiesce-Pfad lebt der Server weiter.
+                    let r1 = RGONE_RESULT.load(Ordering::Acquire);
+                    let r2 = RGONE_Q_RESULT.load(Ordering::Acquire);
+                    if r1 != u64::MAX && r2 != u64::MAX {
+                        let ok = r1 == result::ERR_SERVER_GONE
+                            && r2 == result::ERR_SERVER_GONE
+                            && RGONE_Q_SRV_ALIVE.load(Ordering::Acquire);
+                        RGONE_OK.store(ok, Ordering::Release);
                         RGONE_DONE.store(true, Ordering::Release);
                     }
                 }
@@ -2893,12 +2957,14 @@ fn report() {
         if strand { "ALL PASS" } else { "FAILURES" }
     );
 
-    // Audit-Regression C: Reply-Liveness (toter Reply-Owner -> Client ERR_SERVER_GONE).
+    // Audit-Regression C: Reply-Liveness (Reply-Owner weg -> Client ERR_SERVER_GONE).
     let rgr = RGONE_RESULT.load(Ordering::Acquire);
+    let rgq = RGONE_Q_RESULT.load(Ordering::Acquire);
+    let rgalive = RGONE_Q_SRV_ALIVE.load(Ordering::Acquire);
     let rgone = RGONE_DONE.load(Ordering::Acquire) && RGONE_OK.load(Ordering::Acquire);
-    println!("rgone   : Server nach RECV vor REPLY gekillt; Client-CALL-Ergebnis={rgr} (erwartet ERR_SERVER_GONE={})", result::ERR_SERVER_GONE);
+    println!("rgone   : kill-Runde Client={rgr}, quiesce-Runde Client={rgq} (Server lebt={rgalive}); erwartet ERR_SERVER_GONE={}", result::ERR_SERVER_GONE);
     println!(
-        "rgone   : {} (toter Reply-Owner entblockt den blockierten CALL-Aufrufer statt ihn ewig haengen zu lassen)",
+        "rgone   : {} (toter ODER zurueckgezogener Reply-Owner entblockt den CALL-Aufrufer statt ihn haengen zu lassen)",
         if rgone { "ALL PASS" } else { "FAILURES" }
     );
 

@@ -1156,6 +1156,28 @@ pub fn endpoint_retire_receiver(ep: usize, tid: ThreadId) -> bool {
     }
 }
 
+/// **Reply-Liveness beim Quiescen** (Hot-Reload/Revocation OHNE Thread-Tod): wird der
+/// Server `tid` als Reply-Owner von Endpoint `ep` zurückgezogen (z. B. seine Recv-Cap
+/// entzogen / durch v2 ersetzt), während ein `caller` noch auf die Antwort wartet, wird
+/// dieser Caller mit `ERR_SERVER_GONE` entblockt — sonst hinge er, weil der (lebende,
+/// aber capless/ersetzte) Server nie mehr antwortet. Gibt `true`, falls ein Caller
+/// entblockt wurde. Sperrordnung EPS vor SCHEDS (in `unblock_with_error`).
+pub fn endpoint_quiesce_owner(ep: usize, tid: ThreadId) -> bool {
+    if ep >= NENDPOINTS {
+        return false;
+    }
+    let orphan = {
+        let mut e = EPS[ep].lock();
+        e.owner_died(tid)
+    }; // EPS freigegeben, bevor SCHEDS gesperrt wird
+    if let Some(caller) = orphan {
+        unblock_with_error(caller, sel4lake_abi::result::ERR_SERVER_GONE);
+        true
+    } else {
+        false
+    }
+}
+
 /// **Eager-Cleanup beim Thread-Tod:** den (sterbenden) Thread `tid` aus ALLEN
 /// Endpoint-Queues (senders/receivers/caller) und Notification-Waitern entfernen.
 /// Verhindert tote TCBs in den festen Queues (Corpse-Fill -> verdrängte echte Sender)

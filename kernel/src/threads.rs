@@ -121,6 +121,19 @@ static STALE_STEP: AtomicU32 = AtomicU32::new(0);
 static STALE_DONE: AtomicBool = AtomicBool::new(false);
 static STALE_OK: AtomicBool = AtomicBool::new(false);
 
+// Audit-Regression C (Reply-Liveness): stirbt der Server (Reply-Owner) NACH RECV, VOR
+// REPLY, muss der blockierte CALL-Aufrufer mit ERR_SERVER_GONE entblockt werden (statt
+// dauerhaft zu hängen). Server RECVt einmal + parkt (antwortet nie); Manager killt ihn;
+// Client-CALL muss mit ERR_SERVER_GONE zurückkehren. (alles core 0, kill ist kern-lokal)
+const RGONE_MAGIC: u64 = 0x4711;
+static RGONE_SERVER_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static RGONE_CLIENT_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static RGONE_SERVER_TID: AtomicU64 = AtomicU64::new(u64::MAX);
+static RGONE_RESULT: AtomicU64 = AtomicU64::new(u64::MAX); // Ergebniscode des Client-CALL
+static RGONE_STEP: AtomicU32 = AtomicU32::new(0);
+static RGONE_DONE: AtomicBool = AtomicBool::new(false);
+static RGONE_OK: AtomicBool = AtomicBool::new(false);
+
 // Audit-Regression B (Scheduler/MCS): `set_budget`/`bind_sched_context` auf einen
 // ERSCHÖPFTEN Thread darf ihn nicht stranden (Fund: `depleted` gelöscht ohne
 // `enqueue_ready` -> Thread nie wieder einplanbar, belegter Slot -> DoS + Leak-
@@ -540,6 +553,19 @@ pub fn spawn_demo() {
     STALE_VICTIM_PD.store(v_pd, Ordering::Relaxed);
     STALE_SERVER_PD.store(s_pd, Ordering::Relaxed);
     STALE_CLIENT_PD.store(c_pd, Ordering::Relaxed);
+
+    // Audit-Regression C: eigener Endpoint + Server/Client-PD für den Reply-Liveness-
+    // Test (Server stirbt nach RECV vor REPLY -> Client muss ERR_SERVER_GONE sehen).
+    let rgep = system::create_endpoint().expect("rgone ep");
+    let rgroot = system::install_endpoint_cap(rgep as u32, Rights::RWX).expect("rgone ep cap");
+    let rg_recv = system::cap_mint(rgroot, Rights::READ, 0).expect("rgone recv");
+    let rg_send = system::cap_mint(rgroot, Rights::WRITE, 0).expect("rgone send");
+    let rg_s_pd = system::create_pd().expect("rgone server pd");
+    system::install_pd_cap(rg_s_pd, EP_CAP as usize, rg_recv);
+    let rg_c_pd = system::create_pd().expect("rgone client pd");
+    system::install_pd_cap(rg_c_pd, EP_CAP as usize, rg_send);
+    RGONE_SERVER_PD.store(rg_s_pd, Ordering::Relaxed);
+    RGONE_CLIENT_PD.store(rg_c_pd, Ordering::Relaxed);
 }
 
 /// Generischer Hot-Reload-Swap: v1 zurückziehen (Quiesce: Empfänger entfernen +
@@ -1007,6 +1033,27 @@ extern "C" fn stale_server(_arg: usize) -> ! {
 extern "C" fn stale_client(_arg: usize) -> ! {
     let r = invoke(sys::CALL, EP_CAP, [STALE_MAGIC, 0, 0, 0], 0);
     STALE_SERVED.store(r.msg[0], Ordering::Release);
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// **Reply-Gone-Server** (Audit-Regression C, EL1): empfängt EINEN Aufrufer (wird damit
+/// Reply-Owner) und parkt dann **ohne zu antworten** — simuliert einen Server, der nach
+/// RECV, vor REPLY verschwindet. Der Manager killt ihn anschließend.
+extern "C" fn rgone_server(_arg: usize) -> ! {
+    let _ = invoke(sys::RECV, EP_CAP, [0; 4], 0); // wird Reply-Owner, antwortet NIE
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// **Reply-Gone-Client** (Audit-Regression C, EL1): CALLt den Server und hält den
+/// Ergebniscode fest. Wird der Server vor dem REPLY gekillt, MUSS dieser CALL mit
+/// `ERR_SERVER_GONE` zurückkehren (statt dauerhaft zu blockieren).
+extern "C" fn rgone_client(_arg: usize) -> ! {
+    let r = invoke(sys::CALL, EP_CAP, [RGONE_MAGIC, 0, 0, 0], 0);
+    RGONE_RESULT.store(r.result, Ordering::Release);
     loop {
         invoke(sys::PARK, 0, [0; 4], 0);
     }
@@ -2103,7 +2150,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} fuzz={} ipcfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} fuzz={} ipcfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -2125,6 +2172,7 @@ pub fn demo_report_then_idle() -> ! {
                 MCS_DONE.load(Ordering::Acquire) && MCS_OK.load(Ordering::Acquire),
                 STALE_DONE.load(Ordering::Acquire) && STALE_OK.load(Ordering::Acquire),
                 STRAND_DONE.load(Ordering::Acquire) && STRAND_OK.load(Ordering::Acquire),
+                RGONE_DONE.load(Ordering::Acquire) && RGONE_OK.load(Ordering::Acquire),
                 FUZZ_DONE.load(Ordering::Acquire) && FUZZ_OK.load(Ordering::Acquire),
                 IPCFUZZ_DONE.load(Ordering::Acquire) && IPCFUZZ_OK.load(Ordering::Acquire),
             );
@@ -2358,6 +2406,60 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // Audit-Regression C (Reply-Liveness): Server RECVt einen Client-CALL und parkt
+        // ohne zu antworten; der Manager killt ihn; der Client-CALL MUSS mit
+        // ERR_SERVER_GONE zurückkehren (statt zu hängen). Gestaffelt, gegate auf stale
+        // fertig (core 0 frei von höher-prioren Workern -> deterministische Sequenz).
+        if !RGONE_DONE.load(Ordering::Acquire) && STALE_DONE.load(Ordering::Acquire) {
+            match RGONE_STEP.load(Ordering::Acquire) {
+                0 => {
+                    // Server erzeugen + binden. Er RECVt sofort -> blockiert (kein Caller).
+                    hal::cpu::local_irq_disable();
+                    if let Some(s) =
+                        system::spawn_on_core(0, rgone_server as *const () as usize, 0, 3)
+                    {
+                        system::bind_pd(RGONE_SERVER_PD.load(Ordering::Relaxed), s);
+                        RGONE_SERVER_TID.store(s.to_raw(), Ordering::Relaxed);
+                        RGONE_STEP.store(1, Ordering::Release);
+                    }
+                    hal::cpu::local_irq_enable();
+                }
+                1 => {
+                    // Client erzeugen + binden. Sein CALL trifft den wartenden Server ->
+                    // Rendezvous (Server wird Reply-Owner, parkt), Client blockiert auf
+                    // die Antwort.
+                    hal::cpu::local_irq_disable();
+                    if let Some(c) =
+                        system::spawn_on_core(0, rgone_client as *const () as usize, 0, 3)
+                    {
+                        system::bind_pd(RGONE_CLIENT_PD.load(Ordering::Relaxed), c);
+                        RGONE_STEP.store(2, Ordering::Release);
+                    }
+                    hal::cpu::local_irq_enable();
+                }
+                2 => {
+                    // Der Idle-Manager läuft erst, wenn Server (geparkt) UND Client (auf
+                    // Antwort blockiert) ruhen. Server killen -> purge_ipc_queues sieht
+                    // den Reply-Owner-Tod und entblockt den Client mit ERR_SERVER_GONE.
+                    let s = ThreadId::from_raw(RGONE_SERVER_TID.load(Ordering::Relaxed));
+                    if system::kill_local(s) {
+                        while system::reap() > 0 {}
+                        RGONE_STEP.store(3, Ordering::Release);
+                    }
+                }
+                _ => {
+                    // Auswertung: der Client-CALL muss zurückgekehrt sein, mit
+                    // ERR_SERVER_GONE. Ohne Fix bliebe der Client ewig blockiert
+                    // (RGONE_RESULT == u64::MAX).
+                    let r = RGONE_RESULT.load(Ordering::Acquire);
+                    if r != u64::MAX {
+                        RGONE_OK.store(r == result::ERR_SERVER_GONE, Ordering::Release);
+                        RGONE_DONE.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+
         // Audit-Regression B (MCS-Stranding): budgetierten Worker auf STRAND_CORE
         // erschöpfen lassen, dann erneut binden -> er muss WIEDER laufen (Fix). Gegate
         // auf MCS fertig + SMP fertig (STRAND_CORE frei). Tick-basiert (anderer Kern).
@@ -2491,13 +2593,15 @@ fn all_done() -> bool {
     let stale = STALE_DONE.load(Ordering::Acquire) && STALE_OK.load(Ordering::Acquire);
     // Audit-Regression B: erneutes Budget-Bind strandet einen erschöpften Thread nicht.
     let strand = STRAND_DONE.load(Ordering::Acquire) && STRAND_OK.load(Ordering::Acquire);
+    // Audit-Regression C: toter Reply-Owner entblockt den Client mit ERR_SERVER_GONE.
+    let rgone = RGONE_DONE.load(Ordering::Acquire) && RGONE_OK.load(Ordering::Acquire);
     // Generativer Fuzzer: zufällige Op-Sequenzen ohne Leak/Korruption (Phase 1 + SMP).
     let fuzz = FUZZ_DONE.load(Ordering::Acquire) && FUZZ_OK.load(Ordering::Acquire);
     // IPC-State-Machine-Fuzzer: nebenläufige IPC-Aktoren + Oracle ohne Anomalie.
     let ipcfuzz = IPCFUZZ_DONE.load(Ordering::Acquire) && IPCFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
-        && stale && strand && fuzz && ipcfuzz
+        && stale && strand && rgone && fuzz && ipcfuzz
 }
 
 fn report() {
@@ -2774,6 +2878,15 @@ fn report() {
     println!(
         "strand  : {} (set_budget/bind_sched_context strandet einen erschoepften Thread nicht)",
         if strand { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Audit-Regression C: Reply-Liveness (toter Reply-Owner -> Client ERR_SERVER_GONE).
+    let rgr = RGONE_RESULT.load(Ordering::Acquire);
+    let rgone = RGONE_DONE.load(Ordering::Acquire) && RGONE_OK.load(Ordering::Acquire);
+    println!("rgone   : Server nach RECV vor REPLY gekillt; Client-CALL-Ergebnis={rgr} (erwartet ERR_SERVER_GONE={})", result::ERR_SERVER_GONE);
+    println!(
+        "rgone   : {} (toter Reply-Owner entblockt den blockierten CALL-Aufrufer statt ihn ewig haengen zu lassen)",
+        if rgone { "ALL PASS" } else { "FAILURES" }
     );
 
     // Generativer Fuzzer (Bereich H): zufaellige Op-Sequenzen, Oracle nach jeder Epoche.

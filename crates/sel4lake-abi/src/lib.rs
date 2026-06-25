@@ -65,4 +65,9 @@ pub mod result {
     pub const ERR_RIGHTS: u64 = 3;
     /// Aufrufer gehört zu keiner Protection Domain.
     pub const ERR_NOPD: u64 = 4;
+    /// **Antwort-seitiger Liveness-Fehler:** der Server, der eine Antwort schuldete
+    /// (Reply-Owner), ist verschwunden (KILL/EXIT/Fault/Reload), bevor er antworten
+    /// konnte. Der blockierte `CALL`-Aufrufer wird damit entblockt, statt dauerhaft zu
+    /// hängen — der Client kann den Fehler behandeln (Retry/Abbruch).
+    pub const ERR_SERVER_GONE: u64 = 5;
 }

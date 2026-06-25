@@ -134,8 +134,15 @@ pub struct Endpoint {
     senders: TidQueue,
     /// Blockierte Empfänger, die auf einen Aufrufer warten.
     receivers: TidQueue,
-    /// Der zuletzt empfangene Aufrufer, der auf eine Antwort wartet.
+    /// Der zuletzt empfangene Aufrufer, der auf eine Antwort wartet (das **Reply-Token**:
+    /// genau ein gültiger Antwort-Empfänger je Rendezvous, beim REPLY automatisch
+    /// invalidiert).
     caller: Option<ThreadId>,
+    /// Der **Reply-Owner**: der Server-Thread, der `caller` empfangen hat und ihm eine
+    /// Antwort schuldet. Stirbt dieser Thread (KILL/EXIT/Fault) vor dem REPLY, wird der
+    /// `caller` mit `ERR_SERVER_GONE` entblockt (Liveness — kein dauerhaftes Hängen).
+    /// Stets gemeinsam mit `caller` gesetzt/gelöscht.
+    reply_owner: Option<ThreadId>,
 }
 
 impl Default for Endpoint {
@@ -150,6 +157,7 @@ impl Endpoint {
         senders: TidQueue::EMPTY,
         receivers: TidQueue::EMPTY,
         caller: None,
+        reply_owner: None,
     };
 
     /// Ist dieses Objekt belegt (von `create` reserviert)?
@@ -185,19 +193,35 @@ impl Endpoint {
         let mut found = self.senders.remove(tid);
         found |= self.receivers.remove(tid);
         if self.caller == Some(tid) {
+            // Der sterbende Thread war selbst der wartende Aufrufer -> Token verfällt.
             self.caller = None;
+            self.reply_owner = None;
             found = true;
         }
         found
     }
 
-    /// Read-only Audit (Fuzzer-Oracle): prüft beide Queues + `caller` mit einem
-    /// Lebendigkeits-Prädikat. Gibt `(tote_einträge, duplikat)` zurück. Muss unter dem
-    /// Endpoint-Lock aufgerufen werden (konsistenter Snapshot).
+    /// **Reply-Liveness:** stirbt der `owner` (der Server, der eine Antwort schuldet),
+    /// bevor er antwortet, verfällt das Reply-Token und der wartende `caller` muss mit
+    /// `ERR_SERVER_GONE` entblockt werden. Gibt diesen `caller` zurück (falls vorhanden)
+    /// und löscht caller+owner; sonst `None`. Aus den Todespfaden aufzurufen.
+    pub fn owner_died(&mut self, owner: ThreadId) -> Option<ThreadId> {
+        if self.reply_owner == Some(owner) {
+            self.reply_owner = None;
+            self.caller.take()
+        } else {
+            None
+        }
+    }
+
+    /// Read-only Audit (Fuzzer-Oracle): prüft beide Queues + `caller` + `reply_owner`
+    /// mit einem Lebendigkeits-Prädikat. Gibt `(tote_einträge, duplikat)` zurück. Unter
+    /// dem Endpoint-Lock aufzurufen (konsistenter Snapshot).
     pub fn audit(&self, live: &mut dyn FnMut(ThreadId) -> bool) -> (bool, bool) {
         let dead = self.senders.any_dead(live)
             || self.receivers.any_dead(live)
-            || self.caller.map_or(false, |c| !live(c));
+            || self.caller.map_or(false, |c| !live(c))
+            || self.reply_owner.map_or(false, |o| !live(o));
         let dup = self.senders.has_dup() || self.receivers.has_dup();
         (dead, dup)
     }
@@ -226,6 +250,7 @@ impl Endpoint {
             frame_set_reg(sframe, reg::SYSNO_RESULT, result::OK);
             frame_set_reg(sframe, reg::EP_BADGE, 0);
             self.caller = Some(caller);
+            self.reply_owner = Some(server); // dieser Server schuldet die Antwort
             return if server.core() == core {
                 ops.switch_to(core, frame, server) // intra-Kern: direkt zum Server
             } else {
@@ -260,6 +285,7 @@ impl Endpoint {
             frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
             frame_set_reg(frame, reg::EP_BADGE, 0);
             self.caller = Some(sender);
+            self.reply_owner = Some(server); // dieser Server schuldet die Antwort
             return frame; // Server läuft sofort weiter (kein Wechsel)
         }
         // Kein lebender Aufrufer -> als Empfänger einreihen und blockieren.
@@ -277,6 +303,9 @@ impl Endpoint {
             frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_BADCAP);
             return frame;
         }
+        // Das Reply-Token einmalig konsumieren (caller + reply_owner); ein zweites
+        // REPLY findet `None` -> No-Op (kein Doppel-Reply).
+        self.reply_owner = None;
         if let Some(caller) = self.caller.take() {
             if let Some(cframe) = ops.frame_of(caller) {
                 transfer(frame, cframe);

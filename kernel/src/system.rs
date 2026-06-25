@@ -1155,10 +1155,21 @@ pub fn endpoint_retire_receiver(ep: usize, tid: ThreadId) -> bool {
 /// und ein REPLY/SIGNAL in einen recycelten Frame. Aus den Todespfaden (kill/exit/
 /// fault) aufzurufen — OHNE gehaltenen SCHEDS-Lock (Sperrordnung EPS/NTFNS < SCHEDS).
 pub fn purge_ipc_queues(tid: ThreadId) {
+    // Verwaiste Aufrufer (deren Reply-Owner gerade stirbt) einsammeln und NACH dem
+    // Freigeben der EPS-Locks mit ERR_SERVER_GONE entblocken (kein verschachtelter
+    // EPS->SCHEDS-Lock). Ein Thread ist Reply-Owner von höchstens wenigen Endpoints.
+    let mut orphans: [Option<ThreadId>; 8] = [None; 8];
+    let mut no = 0usize;
     for ep in EPS.iter() {
         let mut e = ep.lock();
         if e.is_used() {
             e.purge_thread(tid);
+            if let Some(caller) = e.owner_died(tid) {
+                if no < orphans.len() {
+                    orphans[no] = Some(caller);
+                    no += 1;
+                }
+            }
         }
     }
     for n in NTFNS.iter() {
@@ -1166,6 +1177,27 @@ pub fn purge_ipc_queues(tid: ThreadId) {
         if nt.is_used() {
             nt.purge_thread(tid);
         }
+    }
+    for caller in orphans.iter().flatten() {
+        unblock_with_error(*caller, sel4lake_abi::result::ERR_SERVER_GONE);
+    }
+}
+
+/// Einen blockierten Thread mit einem **Fehlercode** in `x0` (statt `OK`) entblocken —
+/// für die Reply-Liveness: ein `CALL`-Aufrufer, dessen Server (Reply-Owner) verschwand,
+/// wird so entblockt und sieht den Fehler, statt dauerhaft zu hängen. Sperrt kurz die
+/// Zielinstanz; bei fremdem Kern Reschedule-IPI.
+fn unblock_with_error(caller: ThreadId, code: u64) {
+    let c = caller.core();
+    {
+        let mut sched = SCHEDS[c].lock();
+        if let Some(frame) = sched.frame_of(caller) {
+            hal::exception::frame_set_reg(frame, sel4lake_abi::reg::SYSNO_RESULT, code);
+        }
+        sched.unblock(caller);
+    } // SCHEDS freigegeben
+    if c != hal::cpu::core_id() {
+        hal::gic::send_sgi(c, hal::gic::IPI_RESCHED_INTID);
     }
 }
 

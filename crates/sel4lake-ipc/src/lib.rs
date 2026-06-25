@@ -298,11 +298,13 @@ impl Endpoint {
     /// Capability-Transfer (`grant`) wird vom Kernel **vor** diesem Aufruf erledigt,
     /// solange noch dieser Endpoint-Lock + der CAPS-Lock gehalten werden.
     pub fn reply(&mut self, ops: &mut dyn SchedOps, core: usize, frame: usize) -> usize {
-        let _ = core;
         if !self.used {
             frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_BADCAP);
             return frame;
         }
+        // Budget-Donation des Servers beenden: der antwortende Server (laufend) gibt das
+        // geliehene Konto des Aufrufers frei und läuft wieder auf seinem eigenen Budget.
+        ops.end_donation(core);
         // Das Reply-Token einmalig konsumieren (caller + reply_owner); ein zweites
         // REPLY findet `None` -> No-Op (kein Doppel-Reply).
         self.reply_owner = None;

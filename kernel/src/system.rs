@@ -241,6 +241,9 @@ impl SchedOps for KernelSched {
         }
         ok
     }
+    fn end_donation(&mut self, core: usize) {
+        SCHEDS[core].lock().end_donation(core);
+    }
     fn map_frame(&mut self, caller: ThreadId, base: u64, len: u64, perm_code: u8) -> bool {
         // Nur isolierte PDs (ASID != 0). Granularität nach Frame-Größe (2-MiB-Block
         // oder 4-KiB-Seiten), Recht nach `perm_code` (0=Ro, 1=Rw, 2=Rx).

@@ -140,6 +140,25 @@ static RGONE_STEP: AtomicU32 = AtomicU32::new(0);
 static RGONE_DONE: AtomicBool = AtomicBool::new(false);
 static RGONE_OK: AtomicBool = AtomicBool::new(false);
 
+// Budget-Donation (MCS): ein budgetierter Client (Budget DDON_CBUDGET/DDON_CPERIOD) ruft
+// intra-core einen unbeschränkten Server, der pro Call Arbeit über >=1 Tick verrichtet.
+// Mit Donation wird diese Arbeit gegen das KONTO DES CLIENTS belastet -> der Client
+// erschöpft sich je Call (Erschöpfungs-Delta >= DDON_MIN_DEPL). Ohne Donation liefe der
+// Server auf seinem eigenen (unbeschränkten) Budget -> Client-Konto kaum belastet (~0).
+const DDON_CBUDGET: u32 = 1;
+const DDON_CPERIOD: u32 = 8;
+const DDON_CALLS: u32 = 14; // so viele Calls fährt der Client, dann parkt er
+const DDON_MIN_DEPL: u64 = 6; // erwartete Erschöpfungen des Client-Kontos (mit Donation)
+static DDON_SERVER_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static DDON_CLIENT_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static DDON_CLIENT_TID: AtomicU64 = AtomicU64::new(u64::MAX);
+static DDON_DEPL0: AtomicU64 = AtomicU64::new(0); // Erschöpfungs-Baseline (core 0)
+static DDON_DELTA: AtomicU64 = AtomicU64::new(u64::MAX); // beobachtetes Delta (Diagnose)
+static DDON_CLIENT_DONE: AtomicBool = AtomicBool::new(false); // Client hat alle Calls durch
+static DDON_STEP: AtomicU32 = AtomicU32::new(0);
+static DDON_DONE: AtomicBool = AtomicBool::new(false);
+static DDON_OK: AtomicBool = AtomicBool::new(false);
+
 // Audit-Regression B (Scheduler/MCS): `set_budget`/`bind_sched_context` auf einen
 // ERSCHÖPFTEN Thread darf ihn nicht stranden (Fund: `depleted` gelöscht ohne
 // `enqueue_ready` -> Thread nie wieder einplanbar, belegter Slot -> DoS + Leak-
@@ -573,6 +592,19 @@ pub fn spawn_demo() {
     RGONE_SERVER_PD.store(rg_s_pd, Ordering::Relaxed);
     RGONE_CLIENT_PD.store(rg_c_pd, Ordering::Relaxed);
     RGONE_EP_ID.store(rgep, Ordering::Relaxed);
+
+    // Budget-Donation-Test: eigener Endpoint + Server/Client-PD (Server unbeschränkt,
+    // Client bekommt spaeter ein knappes Budget gebunden).
+    let ddep = system::create_endpoint().expect("ddon ep");
+    let ddroot = system::install_endpoint_cap(ddep as u32, Rights::RWX).expect("ddon ep cap");
+    let dd_recv = system::cap_mint(ddroot, Rights::READ, 0).expect("ddon recv");
+    let dd_send = system::cap_mint(ddroot, Rights::WRITE, 0).expect("ddon send");
+    let dd_s_pd = system::create_pd().expect("ddon server pd");
+    system::install_pd_cap(dd_s_pd, EP_CAP as usize, dd_recv);
+    let dd_c_pd = system::create_pd().expect("ddon client pd");
+    system::install_pd_cap(dd_c_pd, EP_CAP as usize, dd_send);
+    DDON_SERVER_PD.store(dd_s_pd, Ordering::Relaxed);
+    DDON_CLIENT_PD.store(dd_c_pd, Ordering::Relaxed);
 }
 
 /// Generischer Hot-Reload-Swap: v1 zurückziehen (Quiesce: Empfänger entfernen +
@@ -1077,6 +1109,39 @@ extern "C" fn rgone_client(_arg: usize) -> ! {
 extern "C" fn rgone_client2(_arg: usize) -> ! {
     let r = invoke(sys::CALL, EP_CAP, [RGONE_MAGIC, 0, 0, 0], 0);
     RGONE_Q_RESULT.store(r.result, Ordering::Release);
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// **Donations-Server** (EL1, core 0, unbeschränktes Budget): pro Call verrichtet er
+/// Arbeit, die **mindestens einen Timer-Tick überspannt** (Tick-Warten), und antwortet.
+/// Bei aktiver Donation wird diese Arbeit gegen das Budget des Aufrufers belastet.
+extern "C" fn ddon_server(_arg: usize) -> ! {
+    loop {
+        let m = invoke(sys::RECV, EP_CAP, [0; 4], 0);
+        if m.result != result::OK {
+            invoke(sys::YIELD, 0, [0; 4], 0);
+            continue;
+        }
+        // Arbeit über >=1 Tick (so wird das belastete Konto je Call mind. einmal
+        // dekrementiert). Wird der Server bei Konto-Erschöpfung deplaniert, friert das
+        // Warten ein und setzt nach dem Refill fort.
+        let t0 = hal::timer::ticks(0);
+        while hal::timer::ticks(0).wrapping_sub(t0) < 2 {
+            core::hint::spin_loop();
+        }
+        invoke(sys::REPLY, EP_CAP, [m.msg[0], 0, 0, 0], 0);
+    }
+}
+
+/// **Donations-Client** (EL1, core 0, knappes Budget): ruft den Server `DDON_CALLS`-mal
+/// und parkt dann (gibt core 0 frei, damit der Idle-Manager das Erschöpfungs-Delta misst).
+extern "C" fn ddon_client(_arg: usize) -> ! {
+    for _ in 0..DDON_CALLS {
+        let _ = invoke(sys::CALL, EP_CAP, [0; 4], 0);
+    }
+    DDON_CLIENT_DONE.store(true, Ordering::Release);
     loop {
         invoke(sys::PARK, 0, [0; 4], 0);
     }
@@ -2194,7 +2259,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} fuzz={} ipcfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} fuzz={} ipcfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -2217,6 +2282,7 @@ pub fn demo_report_then_idle() -> ! {
                 STALE_DONE.load(Ordering::Acquire) && STALE_OK.load(Ordering::Acquire),
                 STRAND_DONE.load(Ordering::Acquire) && STRAND_OK.load(Ordering::Acquire),
                 RGONE_DONE.load(Ordering::Acquire) && RGONE_OK.load(Ordering::Acquire),
+                DDON_DONE.load(Ordering::Acquire) && DDON_OK.load(Ordering::Acquire),
                 FUZZ_DONE.load(Ordering::Acquire) && FUZZ_OK.load(Ordering::Acquire),
                 IPCFUZZ_DONE.load(Ordering::Acquire) && IPCFUZZ_OK.load(Ordering::Acquire),
             );
@@ -2545,6 +2611,59 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // Budget-Donation (MCS): intra-core Client(budgetiert)->Server(unbeschränkt). Mit
+        // Donation wird die Server-Arbeit gegen das Client-Budget belastet -> Client-
+        // Konto erschöpft sich je Call. Gegate auf rgone fertig (core 0 frei sequenzierbar).
+        if !DDON_DONE.load(Ordering::Acquire) && RGONE_DONE.load(Ordering::Acquire) {
+            match DDON_STEP.load(Ordering::Acquire) {
+                0 => {
+                    // Server erzeugen + binden (RECVt, blockiert). prio 3.
+                    hal::cpu::local_irq_disable();
+                    if let Some(s) =
+                        system::spawn_on_core(0, ddon_server as *const () as usize, 0, 3)
+                    {
+                        system::bind_pd(DDON_SERVER_PD.load(Ordering::Relaxed), s);
+                        DDON_STEP.store(1, Ordering::Release);
+                    }
+                    hal::cpu::local_irq_enable();
+                }
+                1 => {
+                    // Client erzeugen, KNAPPES Budget binden (vor dem ersten Call -> Donation
+                    // sofort aktiv), Erschöpfungs-Baseline schnappen. Alles atomar, bevor der
+                    // Client läuft (kein wfi dazwischen).
+                    hal::cpu::local_irq_disable();
+                    if let Some(c) =
+                        system::spawn_on_core(0, ddon_client as *const () as usize, 0, 3)
+                    {
+                        system::bind_pd(DDON_CLIENT_PD.load(Ordering::Relaxed), c);
+                        DDON_CLIENT_TID.store(c.to_raw(), Ordering::Relaxed);
+                        if let Ok(sc) = system::install_sched_context_cap(
+                            DDON_CBUDGET,
+                            DDON_CPERIOD,
+                            Rights::WRITE,
+                        ) {
+                            system::bind_sched_context(sc, 0, c);
+                        }
+                        DDON_DEPL0.store(system::budget_stats(0).0, Ordering::Relaxed);
+                        DDON_STEP.store(2, Ordering::Release);
+                    }
+                    hal::cpu::local_irq_enable();
+                }
+                _ => {
+                    // Warten, bis der Client alle Calls durch hat (dann parkt er -> Manager
+                    // läuft). Erschöpfungs-Delta des core-0-Kontos messen: mit Donation
+                    // wurde das Client-Budget durch die Server-Arbeit je Call belastet.
+                    if DDON_CLIENT_DONE.load(Ordering::Acquire) {
+                        let delta =
+                            system::budget_stats(0).0.wrapping_sub(DDON_DEPL0.load(Ordering::Relaxed));
+                        DDON_DELTA.store(delta, Ordering::Release);
+                        DDON_OK.store(delta >= DDON_MIN_DEPL, Ordering::Release);
+                        DDON_DONE.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+
         // Audit-Regression B (MCS-Stranding): budgetierten Worker auf STRAND_CORE
         // erschöpfen lassen, dann erneut binden -> er muss WIEDER laufen (Fix). Gegate
         // auf MCS fertig + SMP fertig (STRAND_CORE frei). Tick-basiert (anderer Kern).
@@ -2680,13 +2799,15 @@ fn all_done() -> bool {
     let strand = STRAND_DONE.load(Ordering::Acquire) && STRAND_OK.load(Ordering::Acquire);
     // Audit-Regression C: toter Reply-Owner entblockt den Client mit ERR_SERVER_GONE.
     let rgone = RGONE_DONE.load(Ordering::Acquire) && RGONE_OK.load(Ordering::Acquire);
+    // Budget-Donation: Server-Arbeit wird gegen das Client-Budget belastet (intra-core).
+    let ddon = DDON_DONE.load(Ordering::Acquire) && DDON_OK.load(Ordering::Acquire);
     // Generativer Fuzzer: zufällige Op-Sequenzen ohne Leak/Korruption (Phase 1 + SMP).
     let fuzz = FUZZ_DONE.load(Ordering::Acquire) && FUZZ_OK.load(Ordering::Acquire);
     // IPC-State-Machine-Fuzzer: nebenläufige IPC-Aktoren + Oracle ohne Anomalie.
     let ipcfuzz = IPCFUZZ_DONE.load(Ordering::Acquire) && IPCFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
-        && stale && strand && rgone && fuzz && ipcfuzz
+        && stale && strand && rgone && ddon && fuzz && ipcfuzz
 }
 
 fn report() {
@@ -2974,6 +3095,15 @@ fn report() {
     println!(
         "rgone   : {} (toter ODER zurueckgezogener Reply-Owner entblockt den CALL-Aufrufer statt ihn haengen zu lassen)",
         if rgone { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Budget-Donation (MCS): Server-Arbeit gegen das Client-Budget belastet.
+    let ddelta = DDON_DELTA.load(Ordering::Acquire);
+    let ddon = DDON_DONE.load(Ordering::Acquire) && DDON_OK.load(Ordering::Acquire);
+    println!("ddon    : budgetierter Client x{DDON_CALLS} Calls -> unbeschr. Server; Client-Konto-Erschoepfungen={ddelta} (erwartet >={DDON_MIN_DEPL})");
+    println!(
+        "ddon    : {} (Budget-Donation: intra-core CALL belastet die Server-Arbeit gegen das Aufrufer-Budget)",
+        if ddon { "ALL PASS" } else { "FAILURES" }
     );
 
     // Generativer Fuzzer (Bereich H): zufaellige Op-Sequenzen, Oracle nach jeder Epoche.

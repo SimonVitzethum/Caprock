@@ -95,6 +95,15 @@ struct Tcb {
     /// True, wenn das Budget erschöpft ist (Thread weder laufend noch in Ready-Queue,
     /// wartet auf Refill).
     depleted: bool,
+    // --- Budget-Donation (MCS, intra-core IPC): bei einem CALL leiht der Aufrufer dem
+    // Server seinen Scheduling-Context; der Server wird gegen das **Konto** des Aufrufers
+    // belastet (geteilter SC), bis er antwortet. So begrenzt das Budget des Aufrufers die
+    // Server-Arbeit (ein Client mit knappem Budget kann keine unbegrenzte Server-Arbeit
+    // extrahieren). Cross-core-Calls (kein switch_to-Fastpath) spenden nicht. ---
+    /// Lokaler Slot des Kontos, gegen das dieser Thread belastet wird (`None` = eigenes).
+    sc_donor: Option<usize>,
+    /// Lokaler Slot des Threads, der gerade gegen dieses Konto läuft (`None` = keiner).
+    sc_donee: Option<usize>,
 }
 
 impl Tcb {
@@ -111,6 +120,8 @@ impl Tcb {
         remaining: 0,
         next_refill: 0,
         depleted: false,
+        sc_donor: None,
+        sc_donee: None,
     };
 }
 
@@ -363,6 +374,12 @@ impl Scheduler {
         self.tcbs[cur].blocked = true;
         let t = self.resolve(target).expect("Zielthread ungültig/fremder Kern");
         self.tcbs[t].blocked = false;
+        // Budget-Donation: der Aufrufer (`cur`) leiht dem Server (`t`) seinen
+        // Scheduling-Context. Belastet wird das **Wurzel-Konto** des Aufrufers (folgt
+        // einer evtl. eigenen Spende -> verschachtelte IPC teilt das Wurzel-Budget).
+        let account = self.tcbs[cur].sc_donor.unwrap_or(cur);
+        self.tcbs[t].sc_donor = Some(account);
+        self.tcbs[account].sc_donee = Some(t);
         self.current = Some(t);
         self.tcbs[t].sp
     }
@@ -406,8 +423,10 @@ impl Scheduler {
         debug_assert_eq!(core, self.core);
         if tick {
             self.now += 1;
-            // Refill: erschöpfte MCS-Threads, deren Periode abgelaufen ist, auffüllen
-            // und wieder bereit machen.
+            // Refill: erschöpfte MCS-Konten, deren Periode abgelaufen ist, auffüllen und
+            // den wartenden Läufer wieder bereit machen. Läuft ein **Donee** (geliehener
+            // SC) gegen dieses Konto, wird der DONEE wieder bereit gemacht (das Konto
+            // selbst ist der blockierte Aufrufer); sonst das Konto selbst.
             for slot in 0..PER_CORE {
                 if self.tcbs[slot].used
                     && self.tcbs[slot].budget > 0
@@ -417,22 +436,37 @@ impl Scheduler {
                     self.tcbs[slot].remaining = self.tcbs[slot].budget;
                     self.tcbs[slot].depleted = false;
                     self.refills += 1;
-                    self.enqueue_ready(slot);
+                    match self.tcbs[slot].sc_donee {
+                        Some(d) if d != slot => {
+                            // Der Donee war auf das Konto-Budget geblockt -> wieder bereit.
+                            self.tcbs[d].blocked = false;
+                            self.enqueue_ready(d);
+                        }
+                        _ => self.enqueue_ready(slot),
+                    }
                 }
             }
         }
         if let Some(cur) = self.current {
             self.tcbs[cur].sp = frame;
             let mut requeue = true;
-            if tick && self.tcbs[cur].budget > 0 {
-                // Eine Zeitscheibe verbraucht -> Budget reduzieren.
-                self.tcbs[cur].remaining = self.tcbs[cur].remaining.saturating_sub(1);
-                if self.tcbs[cur].remaining == 0 {
-                    // Erschöpft: bis zum Refill nicht mehr einplanen (blockiert auf Budget).
-                    self.tcbs[cur].depleted = true;
-                    self.tcbs[cur].next_refill = self.now + self.tcbs[cur].period as u64;
+            // Gegen das **Konto** belasten (eigenes oder via Donation geliehenes).
+            let acct = self.tcbs[cur].sc_donor.unwrap_or(cur);
+            if tick && self.tcbs[acct].budget > 0 {
+                // Eine Zeitscheibe verbraucht -> Budget des Kontos reduzieren.
+                self.tcbs[acct].remaining = self.tcbs[acct].remaining.saturating_sub(1);
+                if self.tcbs[acct].remaining == 0 {
+                    // Konto erschöpft: bis zum Refill nicht mehr einplanen.
+                    self.tcbs[acct].depleted = true;
+                    self.tcbs[acct].next_refill = self.now + self.tcbs[acct].period as u64;
                     self.depletions += 1;
                     requeue = false;
+                    if acct != cur {
+                        // `cur` ist ein Donee, der gegen ein fremdes (erschöpftes) Konto
+                        // lief -> auf den Refill blocken (nicht „verloren": blocked=true,
+                        // der Refill des Kontos macht ihn wieder bereit).
+                        self.tcbs[cur].blocked = true;
+                    }
                 }
             }
             if requeue {
@@ -476,6 +510,20 @@ impl Scheduler {
     /// MCS-Telemetrie dieses Kerns: (Budget-Erschöpfungen, Refills). Für Tests.
     pub fn budget_stats(&self) -> (u64, u64) {
         (self.depletions, self.refills)
+    }
+
+    /// Eine **Budget-Donation beenden**: der laufende Thread (Server beim REPLY) gibt das
+    /// geliehene Konto frei und läuft wieder auf seinem eigenen Budget. Vom IPC-`reply`
+    /// aufzurufen. Idempotent (No-Op ohne aktive Spende).
+    pub fn end_donation(&mut self, core: usize) {
+        debug_assert_eq!(core, self.core);
+        if let Some(cur) = self.current {
+            if let Some(acct) = self.tcbs[cur].sc_donor.take() {
+                if self.tcbs[acct].sc_donee == Some(cur) {
+                    self.tcbs[acct].sc_donee = None;
+                }
+            }
+        }
     }
 
     /// Lebt `tid` auf diesem Kern (gültiges, belegtes Handle)? Für IPC-Audits, die
@@ -558,6 +606,17 @@ impl Scheduler {
     /// Einen beendeten Thread aufzeichnen: TCB-Slot sofort freigeben (Generation
     /// erhöhen), Stack-Region zum späteren Freigeben (`reap`) vormerken.
     fn record_zombie(&mut self, local: usize) {
+        // Budget-Donation-Links lösen (vor dem Clear lesen): stirbt ein Konto, verliert
+        // sein Donee die Spende (charged wieder eigenes Budget); stirbt ein Donee, wird
+        // der Donee-Eintrag des Kontos gelöscht.
+        if let Some(d) = self.tcbs[local].sc_donee {
+            self.tcbs[d].sc_donor = None;
+        }
+        if let Some(a) = self.tcbs[local].sc_donor {
+            if self.tcbs[a].sc_donee == Some(local) {
+                self.tcbs[a].sc_donee = None;
+            }
+        }
         let base = self.tcbs[local].stack_base;
         let len = self.tcbs[local].stack_len;
         let gen = self.tcbs[local].gen.wrapping_add(1);
@@ -629,6 +688,9 @@ pub trait SchedOps {
     fn on_tick(&mut self, core: usize, frame: usize) -> usize;
     fn exit_current(&mut self, core: usize, frame: usize) -> usize;
     fn kill(&mut self, tid: ThreadId, core: usize) -> bool;
+    /// Eine aktive **Budget-Donation** des laufenden Threads beenden (Server beim REPLY
+    /// gibt das geliehene Konto frei). No-Op ohne aktive Spende.
+    fn end_donation(&mut self, core: usize);
     /// Einen physischen Frame `[base, base+len)` in die VSpace des Aufrufers `caller`
     /// mappen (cap-gated; nur für isolierte PDs sinnvoll). `perm_code`: 0=Ro, 1=Rw,
     /// 2=Rx (aus den Cap-Rechten abgeleitet). Granularität nach `len` (2 MiB / 4 KiB).

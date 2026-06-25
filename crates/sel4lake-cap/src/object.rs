@@ -47,6 +47,15 @@ pub enum ObjectKind {
     /// Backend als Badge-Signal zu (`bind_irq`). Nur kernelseitig geprägt, nur in
     /// HardwareLand-PDs installierbar. Hält keinen RAM-Allokator-Eintrag -> keine Finalisierung.
     Irq { intid: u32 },
+    /// Eine **DMA-Capability** (ext-23, HardwareLand): die Autorität über eine kernel-
+    /// ausgeschnittene, kontiguierliche **RAM**-Region `[phys, phys+len)`, die als DMA-Puffer
+    /// dient (Gerät liest/schreibt sie per Bus-Master). Nur kernelseitig geprägt, nur in
+    /// HardwareLand-PDs installierbar. **Anders als Mmio/Irq ist dies echtes RAM** -> die
+    /// Finalisierung gibt die Region an den Allokator zurück (`free_region`), **aber nur** weil
+    /// die System-Teardown-Reihenfolge (`enforcer.disable_dma` -> VSpace-Unmap) garantiert, dass
+    /// vorher kein Gerät mehr hineinschreiben kann (DMA-use-after-free-sicher). Die hardware-
+    /// erzwungene Isolation (SMMUv3) liegt hinter der `DmaEnforcer`-Abstraktion im Kernel.
+    Dma { phys: u64, len: u64 },
 }
 
 /// Eintrag der Objekt-Tabelle.

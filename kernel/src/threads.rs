@@ -301,6 +301,28 @@ static IRQT_STEP: AtomicU32 = AtomicU32::new(0);
 static IRQT_DONE: AtomicBool = AtomicBool::new(false);
 static IRQT_OK: AtomicBool = AtomicBool::new(false);
 
+// DMA-Capability (ext-23, D0): erstes DMA-Backend über die GENERISCHE DmaCap-Schicht hinter der
+// DmaEnforcer-Abstraktion. Der Kernel schneidet eine kontiguierliche RAM-DMA-Region aus,
+// installiert eine DmaCap ins HardwareLand-Backend und mappt sie EL0-RW Normal-Non-Cacheable in
+// dessen isolierte VSpace. Das Backend (EL0) schreibt ein Muster über die NC-Abbildung und liest
+// es zurueck (Round-Trip in EL0); der Kernel prueft via Identity-Map, dass er dieselben Bytes
+// sieht (Kohaerenz). Negativ: DmaCap in UserLand -> abgelehnt. Audits (dma/domain/vspace) == 0.
+const DMA_LEN: u64 = 0x4000; // 16 KiB DMA-Puffer
+const DMA_PAT0: u32 = 0x600D_BEEF; // vom Backend an Offset 0 geschrieben
+const DMA_PAT1: u32 = 0xD0DA_D0DA; // vom Backend an Offset 4 geschrieben
+static DMA_TS_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static DMA_BE_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static DMA_PHYS: AtomicU64 = AtomicU64::new(0); // ausgeschnittene DMA-Region-Basis
+static DMA_VALUE: AtomicU64 = AtomicU64::new(u64::MAX); // EL0-Round-Trip-Read (Reply msg0)
+static DMA_RES_CODE: AtomicU64 = AtomicU64::new(u64::MAX);
+static DMA_CAP_OK: AtomicBool = AtomicBool::new(false); // DmaCap ins HardwareLand-Backend ok
+static DMA_POLICY: AtomicBool = AtomicBool::new(false); // DmaCap in UserLand -> denied
+static DMA_SENS_OK: AtomicBool = AtomicBool::new(false); // Bounds-Sensitivität: dma_audit greift
+static DMA_CLIENT_DONE: AtomicBool = AtomicBool::new(false);
+static DMA_STEP: AtomicU32 = AtomicU32::new(0);
+static DMA_DONE: AtomicBool = AtomicBool::new(false);
+static DMA_OK: AtomicBool = AtomicBool::new(false);
+
 // Domänen/HW-Fuzzer (ext-22, P6): churnt über viele Epochen Hardware-/Management-Caps gegen
 // die Domänen-Policy + CDT/VSpace-Oracles + Ressourcen-Baseline. Kernpunkte: HW-Caps (MMIO/
 // IRQ) NUR in HardwareLand, PdControl NUR in TrustedSas installierbar (Negativfälle abgelehnt);
@@ -1361,6 +1383,54 @@ extern "C" fn rtc_irq_backend(_arg: usize) -> ! {
             "b 1b",
             options(noreturn),
         );
+    }
+}
+
+/// **DMA-Backend** (ext-23, D0, `.user_text`, isolierte HardwareLand-VSpace). x0 = EL0-RW
+/// Normal-Non-Cacheable gemappte DMA-Region-Basis (vom Kernel via DmaCap + vspace_map_dma
+/// bereitgestellt). Empfaengt eine Anfrage ueber den Kanal (Slot 0), schreibt zwei bekannte
+/// Muster in die DMA-Region (NC-Abbildung), liest Offset 0 zurueck (Round-Trip in EL0) und
+/// liefert ihn als Antwort. Der Kernel prueft danach via Identity-Map, dass er dieselben Bytes
+/// sieht. Der DMA-Puffer-Zugriff ist genau der kleine HardwareLand-Anteil; keine Treiberlogik.
+#[link_section = ".user_text"]
+extern "C" fn dma_backend(_arg: usize) -> ! {
+    // SAFETY: reiner EL0-User-Code; Lese-/Schreibzugriffe nur auf die selbst (cap-autorisiert)
+    // EL0-RW gemappte DMA-Region (Normal-NC); RECV/REPLY/PARK ueber die Kanal-Cap (Slot 0).
+    unsafe {
+        core::arch::asm!(
+            "mov x9, x0",                   // x9 = DMA-Region-Basis (identity, EL0-RW NC)
+            "mov x0, #2",                   // sys::RECV Slot 0 (Anfrage des Partners)
+            "mov x1, #0",
+            "svc #0",
+            "movz w10, #0xBEEF",            // w10 = 0x600DBEEF (DMA_PAT0)
+            "movk w10, #0x600D, lsl #16",
+            "str w10, [x9]",                // DMA[0] = PAT0 (EL0-NC-Schreibzugriff)
+            "movz w11, #0xD0DA",            // w11 = 0xD0DAD0DA (DMA_PAT1)
+            "movk w11, #0xD0DA, lsl #16",
+            "str w11, [x9, #4]",            // DMA[1] = PAT1
+            "dsb sy",                       // NC-Schreibvorgaenge sichtbar machen
+            "ldr w2, [x9]",                 // Round-Trip-Read von Offset 0 -> Antwort-msg0
+            "mov x0, #3",                   // sys::REPLY Slot 0 (msg0 = zurueckgelesenes PAT0)
+            "mov x1, #0",
+            "svc #0",
+        "1:",
+            "mov x0, #5",                   // sys::PARK
+            "svc #0",
+            "b 1b",
+            options(noreturn),
+        );
+    }
+}
+
+/// **Trusted-DMA-Dienst** (ext-23, D0, EL1, TrustedSas): CALLt das DMA-Backend ueber den
+/// gebundenen Kanal und haelt den vom Backend zurueckgelesenen DMA-Wert fest.
+extern "C" fn dma_timeservice(_arg: usize) -> ! {
+    let r = invoke(sys::CALL, 0, [0, 0, 0, 0], 0);
+    DMA_VALUE.store(r.msg[0], Ordering::Release);
+    DMA_RES_CODE.store(r.result, Ordering::Release);
+    DMA_CLIENT_DONE.store(true, Ordering::Release);
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
     }
 }
 
@@ -2809,7 +2879,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} hwfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} hwfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -2843,6 +2913,7 @@ pub fn demo_report_then_idle() -> ! {
                 CHAN_DONE.load(Ordering::Acquire) && CHAN_OK.load(Ordering::Acquire),
                 RTC_DONE.load(Ordering::Acquire) && RTC_OK.load(Ordering::Acquire),
                 IRQT_DONE.load(Ordering::Acquire) && IRQT_OK.load(Ordering::Acquire),
+                DMA_DONE.load(Ordering::Acquire) && DMA_OK.load(Ordering::Acquire),
                 HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire),
             );
         }
@@ -3754,9 +3825,105 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // DMA-Capability (ext-23, D0): erstes DMA-Backend über die generische DmaCap-Schicht
+        // hinter der DmaEnforcer-Abstraktion. Gegate auf irq fertig (sequenziell, vor den Fuzzern).
+        if !DMA_DONE.load(Ordering::Acquire) && IRQT_DONE.load(Ordering::Acquire) {
+            match DMA_STEP.load(Ordering::Acquire) {
+                0 => {
+                    // TrustedSas-Dienst + HardwareLand-DMA-Backend + Kanal-Caps + DmaCap.
+                    if let Some(ts) = system::create_pd_in_domain(Domain::TrustedSas) {
+                        DMA_TS_PD.store(ts, Ordering::Relaxed);
+                        if let Some((be, ep, _ntfn)) = system::create_hardware_backend(ts, 6) {
+                            DMA_BE_PD.store(be, Ordering::Relaxed);
+                            if let Ok(root) = system::install_endpoint_cap(ep as u32, Rights::RWX) {
+                                if let (Ok(recv), Ok(send)) = (
+                                    system::cap_mint(root, Rights::READ, 0),
+                                    system::cap_mint(root, Rights::WRITE, 0),
+                                ) {
+                                    system::install_pd_cap(be, 0, recv); // Kanal-Recv ins Backend
+                                    system::install_pd_cap(ts, 0, send); // Kanal-Send an Trusted
+                                }
+                            }
+                            // DMA-Region ausschneiden + DmaCap ins HardwareLand-Backend (Slot 1).
+                            if let Some(r) = system::alloc_dma_region(DMA_LEN) {
+                                DMA_PHYS.store(r.base, Ordering::Release);
+                                if let Ok(dcap) =
+                                    system::install_dma_cap(r.base, r.len, Rights::RW)
+                                {
+                                    DMA_CAP_OK.store(
+                                        system::install_pd_cap(be, 1, dcap),
+                                        Ordering::Release,
+                                    );
+                                    // Policy-Negativtest: DIESELBE Cap (dasselbe DMA-Objekt, KEINE
+                                    // zweite Region) in eine UserLand-PD -> abgelehnt. (Eine zweite
+                                    // install_dma_cap-Region wuerde ein zweites Objekt mit gleicher
+                                    // Region erzeugen -> dma_audit-Ueberlappung; das vermeiden wir.)
+                                    if let Some(upd) = system::create_pd_in_domain(Domain::UserLand) {
+                                        let denied = !system::install_pd_cap(upd, 0, dcap);
+                                        DMA_POLICY.store(denied, Ordering::Release);
+                                    }
+                                }
+                            }
+                            DMA_STEP.store(1, Ordering::Release);
+                        }
+                    }
+                }
+                1 => {
+                    // Backend (isoliert EL0) erzeugen + binden, dann die DMA-Region EL0-RW
+                    // Normal-NC in seine VSpace mappen (generischer DMA-Mechanismus).
+                    let phys = DMA_PHYS.load(Ordering::Acquire);
+                    if let Some((b, _)) =
+                        system::spawn_isolated(dma_backend as *const () as usize, phys as usize, 3)
+                    {
+                        system::bind_pd(DMA_BE_PD.load(Ordering::Relaxed), b);
+                        // SENSITIVITAET D0 (geprueft): ohne dieses Mapping faultet das Backend
+                        // beim DMA-Zugriff (FAR in der DMA-Region) -> Isolation greift.
+                        system::map_dma_into_thread(b, phys, DMA_LEN);
+                    }
+                    DMA_STEP.store(2, Ordering::Release);
+                }
+                2 => {
+                    // Trusted-Dienst (EL1) erzeugen + binden -> CALLt das DMA-Backend.
+                    if let Some(c) =
+                        system::spawn_on_core(0, dma_timeservice as *const () as usize, 0, 3)
+                    {
+                        system::bind_pd(DMA_TS_PD.load(Ordering::Relaxed), c);
+                    }
+                    DMA_STEP.store(3, Ordering::Release);
+                }
+                _ => {
+                    if DMA_CLIENT_DONE.load(Ordering::Acquire) {
+                        // Kohaerenz: der Kernel liest die DMA-Region via Identity-Map und prueft,
+                        // dass er DIESELBEN Bytes sieht, die das Backend ueber seine NC-Abbildung
+                        // geschrieben hat (write+read+coherency end-to-end).
+                        let phys = DMA_PHYS.load(Ordering::Acquire);
+                        let (w0, w1) = system::peek_dma_words(phys);
+                        // Bounds-Sensitivität (selbstreinigend): mit einem absichtlich zu hohen
+                        // `floor` MUSS die (legitime) Region das dma_audit verletzen (Code != 0) —
+                        // beweist, dass das Oracle Out-of-Window-Regionen faengt. Der echte
+                        // dma_audit() (korrektes floor) bleibt 0.
+                        let sens = system::dma_audit_with_floor(phys + DMA_LEN) != 0;
+                        DMA_SENS_OK.store(sens, Ordering::Release);
+                        let ok = DMA_RES_CODE.load(Ordering::Acquire) == result::OK
+                            && DMA_VALUE.load(Ordering::Acquire) as u32 == DMA_PAT0 // EL0-Round-Trip
+                            && w0 == DMA_PAT0 // Kernel sieht PAT0 (Kohaerenz)
+                            && w1 == DMA_PAT1 // Kernel sieht PAT1
+                            && DMA_CAP_OK.load(Ordering::Acquire)
+                            && DMA_POLICY.load(Ordering::Acquire)
+                            && sens
+                            && system::dma_audit() == 0
+                            && system::domain_audit() == 0
+                            && system::vspace_audit() == 0;
+                        DMA_OK.store(ok, Ordering::Release);
+                        DMA_DONE.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+
         // Domänen/HW-Fuzzer (ext-22, P6): churnt HW-/Management-Caps gegen Policy + Oracles +
-        // Baseline. Gegate auf irq fertig; eine Epoche je Manager-Iteration.
-        if !HWFUZZ_DONE.load(Ordering::Acquire) && IRQT_DONE.load(Ordering::Acquire) {
+        // Baseline. Gegate auf DMA (ext-23) fertig; eine Epoche je Manager-Iteration.
+        if !HWFUZZ_DONE.load(Ordering::Acquire) && DMA_DONE.load(Ordering::Acquire) {
             match HWFUZZ_STEP.load(Ordering::Acquire) {
                 0 => {
                     // Fixtures (eine PD je Domäne, ohne Threads) + Baseline schnappen.
@@ -3958,12 +4125,14 @@ fn all_done() -> bool {
     let rtc = RTC_DONE.load(Ordering::Acquire) && RTC_OK.load(Ordering::Acquire);
     // RTC-IRQ: IRQ-Cap + GIC-SPI-Routing + Deferred-IRQ-Zustellung an das HardwareLand-Backend.
     let irq = IRQT_DONE.load(Ordering::Acquire) && IRQT_OK.load(Ordering::Acquire);
+    // DMA-Capability (ext-23): DmaCap + Normal-NC-Mapping + EL0-Round-Trip + Kohärenz + Audits.
+    let dma = DMA_DONE.load(Ordering::Acquire) && DMA_OK.load(Ordering::Acquire);
     // Domänen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Policy + Oracles + Baseline.
     let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
-        && pdctl && chan && rtc && irq && hwfuzz
+        && pdctl && chan && rtc && irq && dma && hwfuzz
 }
 
 fn report() {
@@ -4366,6 +4535,16 @@ fn report() {
     println!(
         "irq     : {} (IRQ-Cap + GICD_ITARGETSR-Routing + Deferred-Signal: Geraete-IRQ als Notification an HardwareLand, lock-/deadlock-frei)",
         if irq { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // DMA-Capability (ext-23, D0): DmaCap + Normal-NC-Mapping + EL0-Round-Trip + Kohärenz.
+    let dmav = DMA_VALUE.load(Ordering::Acquire) as u32;
+    let dma = DMA_DONE.load(Ordering::Acquire) && DMA_OK.load(Ordering::Acquire);
+    println!("dma     : HardwareLand-Backend schreibt+liest DMA-Region (EL0 Normal-NC) ueber DmaCap; EL0-read=0x{dmav:08x} (0x{DMA_PAT0:08x} erwartet); Kohaerenz(Kernel-Identity)+DmaCap-in-HW={} in-UserLand-denied={} bounds-audit-greift={}",
+        DMA_CAP_OK.load(Ordering::Acquire), DMA_POLICY.load(Ordering::Acquire), DMA_SENS_OK.load(Ordering::Acquire));
+    println!(
+        "dma     : {} (DmaCap hinter DmaEnforcer-Abstraktion: kernel-ausgeschnittene Region, nur HardwareLand, Normal-NC-Mapping, dma_audit)",
+        if dma { "ALL PASS" } else { "FAILURES" }
     );
 
     // Domänen/HW-Fuzzer (ext-22, P6).

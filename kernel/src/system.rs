@@ -1315,6 +1315,201 @@ pub fn irqs_delivered() -> u64 {
     IRQ_DELIVERED.load(Ordering::Acquire)
 }
 
+// --- DMA-Capabilities + DmaEnforcer-Abstraktion (ext-23) ---
+//
+// DMA ist die einzige HW-Cap-Kategorie, bei der ein bus-masterndes Gerät DIREKT Physikspeicher
+// liest/schreibt (vorbei an der CPU-MMU). Der **Mechanismus** (DmaCap) ist vom **Enforcement-
+// Treiber** entkoppelt: der Kernel erzwingt Ownership/Bounds/Lifetime/Audit hardware-unabhängig;
+// ein `DmaEnforcer` setzt die Isolation ZUSÄTZLICH hardwareseitig durch. SMMUv3 ist in ext-23
+// die einzige Implementierung (`SmmuV3Enforcer`, D2/D3); ein künftiger `NullIommuEnforcer` o.a.
+// implementiert dasselbe Trait, OHNE öffentlichen Code (DmaCap, install_dma_cap, Mapping,
+// Treiber, HardwareLand) zu berühren. Die Revoke-Reihenfolge läuft über die Abstraktion:
+// `enforcer.disable_dma` -> VSpace-Unmap -> `free_region` (DMA-use-after-free-sicher).
+
+/// Eine generische **DMA-Bindung**: das Gerät mit `stream_id` darf die RAM-`region` als
+/// DMA-Puffer nutzen (besessen von `backend_pd`). Enthält bewusst KEINE enforcer-/SMMU-
+/// spezifischen Details — die Schnittstelle ist IOMMU-neutral.
+#[derive(Clone, Copy)]
+pub struct DmaBinding {
+    pub stream_id: u32,
+    pub region: PhysRegion,
+    pub backend_pd: usize,
+}
+
+/// Treiber-Abstraktion für die **hardwareseitige DMA-Durchsetzung** (IOMMU-neutral). Die
+/// einzige Stelle, die konkrete IOMMU-Register/Tabellen kennt, ist die jeweilige Impl
+/// (`SmmuV3Enforcer`). Der öffentliche DMA-Pfad spricht ausschließlich dieses Trait an.
+pub trait DmaEnforcer: Sync {
+    /// Bring-up des Enforcers (einmalig beim Boot). `true` bei Erfolg / vorhandener HW.
+    fn init(&self) -> bool;
+    /// Durchsetzung für eine Bindung aktivieren: das Gerät darf danach NUR in `binding.region`
+    /// DMAen, alles andere wird hardwareseitig abgewiesen. `false` bei Fehler.
+    fn enable_dma(&self, binding: &DmaBinding) -> bool;
+    /// Durchsetzung entziehen (VOR VSpace-Unmap + `free_region`): danach kann das Gerät nicht
+    /// mehr in die Region DMAen (DMA-use-after-free-sicher).
+    fn disable_dma(&self, binding: &DmaBinding);
+    /// Durchsetzungs-Oracle: `0` = konsistent, sonst enforcer-spezifischer Anomalie-Code.
+    fn audit(&self) -> u32;
+    /// Ist die hardwareseitige Durchsetzung aktiv (HW vorhanden + initialisiert)?
+    fn is_active(&self) -> bool;
+}
+
+/// **SMMUv3-Enforcer** — die einzige `DmaEnforcer`-Implementierung in ext-23. Der Bring-up
+/// (`init`, D2) und die Bindungs-Programmierung (`enable_dma`/`disable_dma` über STE/CD/Stage-1,
+/// D3) folgen in den jeweiligen Phasen; das D0-Skelett etabliert nur die Abstraktionsgrenze.
+pub struct SmmuV3Enforcer {
+    /// Durchsetzung aktiv (nach erfolgreichem `init`).
+    active: AtomicBool,
+}
+
+impl SmmuV3Enforcer {
+    pub const fn new() -> Self {
+        Self {
+            active: AtomicBool::new(false),
+        }
+    }
+}
+
+impl DmaEnforcer for SmmuV3Enforcer {
+    fn init(&self) -> bool {
+        // D2: SMMU-Register mappen, Command-/Event-Queue + Stream-Tabelle anlegen, CR0 setzen,
+        // Default-Abort. Bis dahin: nicht aktiv (DMA-Tests in D0/D1 prüfen nur die Cap-Schicht).
+        false
+    }
+    fn enable_dma(&self, _binding: &DmaBinding) -> bool {
+        // D3: STE/CD/Stage-1 für die StreamID, CMD_CFGI_STE + CMD_TLBI + CMD_SYNC.
+        self.active.load(Ordering::Acquire)
+    }
+    fn disable_dma(&self, _binding: &DmaBinding) {
+        // D3: STE invalidieren + CMD_TLBI + CMD_SYNC.
+    }
+    fn audit(&self) -> u32 {
+        // D3: Event-Queue leer? STE nur für gebundene Streams? Bis dahin: konsistent.
+        0
+    }
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+/// Der globale DMA-Enforcer. In ext-23 fest `SmmuV3Enforcer`; ein Wechsel (z.B. auf einen
+/// künftigen `NullIommuEnforcer`) tauscht nur diese Definition + den Accessor aus, ohne den
+/// öffentlichen DMA-Pfad zu ändern (alle Aufrufer gehen über [`dma_enforcer`]).
+static DMA_ENFORCER: SmmuV3Enforcer = SmmuV3Enforcer::new();
+
+/// Zugriff auf den aktiven DMA-Enforcer (als Trait-Objekt — der öffentliche Pfad ist
+/// enforcer-polymorph und SMMU-agnostisch).
+pub fn dma_enforcer() -> &'static dyn DmaEnforcer {
+    &DMA_ENFORCER
+}
+
+/// Eine kontiguierliche **DMA-RAM-Region** (4-KiB-granular, in der mappbaren GiB-1-Region)
+/// ausschneiden. `None` bei Erschöpfung oder wenn die Allokation nicht in GiB 1 liegt (dort
+/// arbeitet [`hal::mmu::vspace_map_dma`]). Die Region wird anschließend über eine DmaCap
+/// verwaltet; ihre Freigabe erfolgt beim Löschen der Cap (`delete_leaf` -> `free_region`),
+/// also genau einmal (balanciert mit dieser Allokation).
+pub fn alloc_dma_region(len: u64) -> Option<PhysRegion> {
+    let len = (len + 4095) & !4095;
+    let mut mem = MEM.lock();
+    let cap = mem.alloc(len, 4096)?;
+    let r = cap.region();
+    if r.base < hal::mmu::USER_RAM_MIN || r.base + r.len > hal::mmu::GIB1_END {
+        mem.free(cap); // nicht in GiB 1 -> zurückgeben (sonst nicht mappbar)
+        return None;
+    }
+    drop(cap); // nur ein Deskriptor (kein Drop-Free); Eigentum geht an die DmaCap über
+    Some(r)
+}
+
+/// Eine **DMA-Capability** (ext-23, HardwareLand) über die kernel-ausgeschnittene Region
+/// `[phys, phys+len)` prägen — **nur kernelseitig** (kein User-Syscall erzeugt DMA-Caps).
+/// Installiert wird sie cap-policy-geprüft nur in HardwareLand-PDs (`install_cap_checked`).
+pub fn install_dma_cap(phys: u64, len: u64, rights: Rights) -> Result<CapPtr, CapError> {
+    CAPS.write().cspace.install_dma(phys, len, rights)
+}
+
+/// Eine DMA-Region `[phys, phys+len)` als **EL0-RW Normal-Non-Cacheable** in die isolierte
+/// VSpace des Threads `tid` mappen (identity, VA=PA). Nur für isolierte PDs (ASID != 0).
+pub fn map_dma_into_thread(tid: ThreadId, phys: u64, len: u64) -> bool {
+    let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
+    let Some(l2) = vspace_l2(asid) else {
+        return false;
+    };
+    let mut alloc = || MEM.lock().alloc(4096, 4096).map(|c| c.base());
+    if hal::mmu::vspace_map_dma(l2, phys, len, &mut alloc) {
+        hal::mmu::flush_asid(asid);
+        true
+    } else {
+        false
+    }
+}
+
+/// Eine zuvor gemappte DMA-Region wieder aus der VSpace des Threads entmappen (zurück auf
+/// EL1-only) + ASID flushen. Teil der Revoke-Reihenfolge.
+pub fn unmap_dma_from_thread(tid: ThreadId, phys: u64, len: u64) -> bool {
+    let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
+    let Some(l2) = vspace_l2(asid) else {
+        return false;
+    };
+    let mut p = phys;
+    let mut ok = true;
+    while p < phys + len {
+        ok &= hal::mmu::vspace_unmap_page(l2, p);
+        p += 4096;
+    }
+    hal::mmu::flush_asid(asid);
+    ok
+}
+
+/// Eine DMA-Bindung **sicher abbauen** (Revoke-Reihenfolge, ext-23, DMA-use-after-free-sicher):
+/// (1) `enforcer.disable_dma` (hardwareseitige Durchsetzung entziehen — SMMU-Invalidierung),
+/// dann (2) aus der Backend-VSpace unmappen. Erst danach darf der Aufrufer die DmaCap löschen
+/// (`delete_leaf` -> `free_region`). Nach Schritt 1 kann kein Gerät mehr in die Region DMAen.
+pub fn revoke_dma(binding: &DmaBinding, tid: ThreadId) {
+    dma_enforcer().disable_dma(binding);
+    unmap_dma_from_thread(tid, binding.region.base, binding.region.len);
+}
+
+/// **DMA-Policy-Oracle** (ext-23): `0` = konsistent, sonst Anomalie-Code:
+/// - `1` = DmaCap-Bounds verletzt (nicht ausgerichtet/leer/außerhalb GiB-1-Fenster bzw.
+///   überlappt das Kernel-Image — `floor` = Kernel-Image-Ende).
+/// - `2` = zwei DmaCap-Regionen überlappen einander.
+/// - `3` = der Enforcer meldet eine Durchsetzungs-Anomalie (`dma_enforcer().audit()`).
+/// Wird in [`ipc_audit`] als Code `40 + dma_audit()` aggregiert.
+pub fn dma_audit() -> u32 {
+    let floor = hal::mmu::kernel_end().max(hal::mmu::USER_RAM_MIN);
+    let ceil = hal::mmu::GIB1_END;
+    let code = CAPS.read().dma_audit(floor, ceil);
+    if code != 0 {
+        return code;
+    }
+    if dma_enforcer().audit() != 0 {
+        return 3;
+    }
+    0
+}
+
+/// Wie [`dma_audit`], aber mit explizit gewähltem `floor` (für den Bounds-Sensitivitätstest:
+/// ein zu hoher `floor` muss eine legitime Region als Out-of-Window melden).
+pub fn dma_audit_with_floor(floor: u64) -> u32 {
+    CAPS.read().dma_audit(floor, hal::mmu::GIB1_END)
+}
+
+/// Die ersten beiden 32-bit-Worte einer (RAM-)DMA-Region über die **globale Identity-Map**
+/// lesen (der Kernel sieht alles RAM EL1-RW). Für den Kohärenz-Check: sieht der Kernel
+/// dieselben Bytes, die das Backend über seine EL0-Non-Cacheable-Abbildung geschrieben hat?
+pub fn peek_dma_words(phys: u64) -> (u32, u32) {
+    // SAFETY: `phys` ist eine kernel-ausgeschnittene RAM-DMA-Region, in der globalen SAS-Map
+    // identity-gemappt und gültig; nur lesender Zugriff auf die ersten 8 Bytes.
+    unsafe {
+        let p = phys as *const u32;
+        (
+            core::ptr::read_volatile(p),
+            core::ptr::read_volatile(p.add(1)),
+        )
+    }
+}
+
 // --- MCS Scheduling Contexts (Budget-basiertes Scheduling) ---
 //
 // CPU-Zeit wird **kapabilitätskontrolliert** vergeben: ein Scheduling-Context-Objekt
@@ -1624,6 +1819,11 @@ pub fn ipc_audit() -> u32 {
     let dom = domain_audit();
     if dom != 0 {
         return 30 + dom;
+    }
+    // DMA-Policy-Property (ext-23): DmaCap-Bounds/Disjunktheit + Enforcer-Durchsetzung.
+    let dma = dma_audit();
+    if dma != 0 {
+        return 40 + dma;
     }
     0
 }

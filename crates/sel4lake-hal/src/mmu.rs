@@ -59,8 +59,9 @@ const AP_RW: u64 = 0b00 << 6; //  RW, nur EL1
 const AP_RO: u64 = 0b10 << 6; //  RO, nur EL1
 const AP_RW_EL0: u64 = 0b01 << 6; // RW, EL0 + EL1 (User-Daten/Stacks)
 const AP_RO_EL0: u64 = 0b11 << 6; // RO, EL0 + EL1 (User-Code)
-const ATTR_DEVICE: u64 = 0 << 2; // MAIR-Index 0
-const ATTR_NORMAL: u64 = 1 << 2; // MAIR-Index 1
+const ATTR_DEVICE: u64 = 0 << 2; //    MAIR-Index 0 (Device-nGnRnE)
+const ATTR_NORMAL: u64 = 1 << 2; //    MAIR-Index 1 (Normal WB cacheable)
+const ATTR_NORMAL_NC: u64 = 2 << 2; // MAIR-Index 2 (Normal Non-Cacheable, ext-23 DMA-Puffer)
 const NG: u64 = 1 << 11; //       non-global: Eintrag ist ASID-spezifisch
 const PXN: u64 = 1 << 53; //      Privileged Execute Never
 const UXN: u64 = 1 << 54; //      Unprivileged Execute Never
@@ -205,8 +206,9 @@ fn build_tables() {
     }
 }
 
-// MAIR: attr0 = Device-nGnRnE (0x00), attr1 = Normal WB R/W-allocate (0xFF).
-const MAIR_VALUE: u64 = 0x00 | (0xFF << 8);
+// MAIR: attr0 = Device-nGnRnE (0x00), attr1 = Normal WB R/W-allocate (0xFF),
+// attr2 = Normal Non-Cacheable (0x44, inner+outer NC) für ext-23-DMA-Puffer.
+const MAIR_VALUE: u64 = 0x00 | (0xFF << 8) | (0x44 << 16);
 
 // TCR_EL1: T0SZ=25 (39-bit VA), 4-KiB-Granule, WB+inner-shareable Walks,
 // TTBR1 deaktiviert, IPS=40-bit.
@@ -550,6 +552,71 @@ pub fn vspace_unmap_page(l2_phys: u64, phys: u64) -> bool {
     // SAFETY: gültige L3-Tabelle.
     let l3 = unsafe { core::slice::from_raw_parts_mut(l3_phys as *mut u64, 512) };
     l3[((phys >> 12) & 0x1ff) as usize] = kernel_page(phys);
+    cpu::dsb_sy();
+    true
+}
+
+// --- DMA-Puffer-Mapping (ext-23, HardwareLand) ---
+//
+// Ein DMA-Puffer ist **echtes RAM** (kernel-ausgeschnitten), das ein bus-masterndes Gerät
+// liest/schreibt. Es wird als **Normal-Non-Cacheable** EL0-RW-Seite (PXN|UXN, nG) in die
+// isolierte Backend-VSpace gemappt — NC, weil CPU (Backend) und Gerät dieselbe Region ohne
+// CPU-Cache-Pflege kohärent sehen sollen (QEMU `virt` ist ohnehin `dma-coherent`; auf realer
+// HW ist NC die korrekte Wahl bzw. erspart Cache-Maintenance). Die Region liegt in **GiB 1**
+// und nutzt die **bestehende** L3-Maschinerie: die Tabellen werden von [`vspace_collect_l3s`]
+// eingesammelt und von [`vspace_wx_ok`] mit-auditiert (die DMA-Seiten sind PXN|UXN -> W^X gilt
+// baulich). Das Entmappen beim Revoke nutzt [`vspace_unmap_page`] (zurück auf EL1-only).
+
+/// EL0-RW Normal-**Non-Cacheable** 4-KiB-DMA-Seite (`nG`, PXN|UXN).
+fn dma_page(phys: u64) -> u64 {
+    phys | AF | SH_INNER | ATTR_NORMAL_NC | AP_RW_EL0 | PXN | UXN | NG | PAGE_DESC
+}
+
+/// Eine DMA-Region `[phys, phys+len)` (4-KiB-granular, in **GiB 1**) als **EL0-RW Normal-NC**
+/// in die isolierte VSpace mit GiB-1-L2 `l2_phys` mappen (identity, VA=PA). Legt L3-Tabellen
+/// bei Bedarf über `alloc_l3` an (Muster [`vspace_map_page`]); diese werden beim Teardown von
+/// [`vspace_collect_l3s`] freigegeben. Gibt `false` bei ungültiger/unausgerichteter Region
+/// (nur GiB 1) oder fehlgeschlagener Allokation. Der Aufrufer flusht anschließend die ASID.
+pub fn vspace_map_dma(
+    l2_phys: u64,
+    phys: u64,
+    len: u64,
+    alloc_l3: &mut dyn FnMut() -> Option<u64>,
+) -> bool {
+    if len == 0
+        || phys % PAGE != 0
+        || len % PAGE != 0
+        || phys < USER_RAM_MIN
+        || phys + len > GIB1_END
+    {
+        return false;
+    }
+    let mut p = phys;
+    while p < phys + len {
+        let i2 = ((p - RAM_BASE) / TWO_MIB) as usize;
+        // SAFETY: gültige, in der globalen Map beschreibbare L2-Tabelle.
+        let l2 = unsafe { core::slice::from_raw_parts_mut(l2_phys as *mut u64, 512) };
+        let l3_phys = if l2[i2] & 0b11 == TABLE_DESC {
+            l2[i2] & ADDR_MASK
+        } else {
+            let new = match alloc_l3() {
+                Some(q) => q,
+                None => return false,
+            };
+            // SAFETY: frischer, identity-gemappter 4-KiB-Frame für die neue L3.
+            let l3 = unsafe { core::slice::from_raw_parts_mut(new as *mut u64, 512) };
+            let blk = RAM_BASE + i2 as u64 * TWO_MIB;
+            for (j, e) in l3.iter_mut().enumerate() {
+                *e = kernel_page(blk + j as u64 * PAGE); // zunächst alles EL1-only
+            }
+            l2[i2] = table_desc(new);
+            new
+        };
+        // SAFETY: gültige L3-Tabelle.
+        let l3 = unsafe { core::slice::from_raw_parts_mut(l3_phys as *mut u64, 512) };
+        l3[((p >> 12) & 0x1ff) as usize] = dma_page(p);
+        p += PAGE;
+    }
     cpu::dsb_sy();
     true
 }

@@ -169,15 +169,61 @@ impl Caps {
         }
         0
     }
+
+    /// **DMA-Policy-Oracle** (ext-23, SMMU-agnostisch). Prüft die hardware-unabhängigen
+    /// DmaCap-Invarianten über alle (distinct) DMA-Objekte; `0` = konsistent, sonst:
+    /// - `1` = eine DMA-Region ist nicht 4-KiB-ausgerichtet/leer ODER liegt außerhalb des
+    ///   mappbaren RAM-Fensters `[floor, ceil)` (mit `floor` = Kernel-Image-Ende deckt das
+    ///   insbesondere „Region überlappt das Kernel-Image" ab — sie wäre nicht aus freiem RAM
+    ///   ausgeschnitten).
+    /// - `2` = zwei verschiedene DMA-Regionen überlappen einander (eine Region doppelt vergeben).
+    ///
+    /// „DmaCap nur in HardwareLand" deckt bereits [`Caps::domain_audit`] (Code 1) ab, da
+    /// `kind_is_hardware` nun `Dma` einschließt. Die hardware-erzwungene Durchsetzung (SMMU)
+    /// liegt hinter dem kernel-internen `DmaEnforcer` und wird separat auditiert.
+    pub fn dma_audit(&self, floor: u64, ceil: u64) -> u32 {
+        let mut regs: [(u64, u64); 32] = [(0, 0); 32];
+        let mut n = 0usize;
+        let mut bad = 0u32;
+        self.cspace.for_each_dma(&mut |phys, len| {
+            if len == 0
+                || phys % 4096 != 0
+                || len % 4096 != 0
+                || phys < floor
+                || phys.saturating_add(len) > ceil
+            {
+                bad = 1;
+            }
+            if n < regs.len() {
+                regs[n] = (phys, len);
+                n += 1;
+            }
+        });
+        if bad != 0 {
+            return bad;
+        }
+        // Paarweise Disjunktheit (verschiedene Objekte dürfen sich nie überlappen).
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let (a0, al) = regs[i];
+                let (b0, bl) = regs[j];
+                if a0 < b0 + bl && b0 < a0 + al {
+                    return 2;
+                }
+            }
+        }
+        0
+    }
 }
 
-/// Ist `kind` ein **Hardware-Cap** (MMIO/IRQ/DMA)? Generische Kategorie, damit ein künftiges
-/// `ObjectKind::Dma` ohne ABI-/Struktur-Änderung eingehängt werden kann. (P1: noch keine HW-
-/// Kinds -> stets `false`; P4/P5 erweitern den Match.)
+/// Ist `kind` ein **Hardware-Cap** (MMIO/IRQ/DMA)? Generische Kategorie: alle Cap-Typen, die
+/// direkten Geräte-Zugriff autorisieren und daher ausschließlich HardwareLand vorbehalten sind.
+/// (ext-22: MMIO/IRQ; ext-23: zusätzlich DMA.)
 fn kind_is_hardware(kind: ObjectKind) -> bool {
-    // Hardware-Caps (nur in HardwareLand erlaubt). `Dma` lässt sich später hier einhängen,
-    // ohne ABI/Strukturen zu ändern (generische Kategorie).
-    matches!(kind, ObjectKind::Mmio { .. } | ObjectKind::Irq { .. })
+    matches!(
+        kind,
+        ObjectKind::Mmio { .. } | ObjectKind::Irq { .. } | ObjectKind::Dma { .. }
+    )
 }
 
 /// Ist `kind` eine Management-Cap (`PdControl`)? Diese darf nur eine TrustedSas-PD halten.

@@ -24,9 +24,13 @@ echo "== build =="
 ./build.sh >/dev/null 2>&1 || { echo "BUILD FAILED"; exit 1; }
 
 echo "== boot ($SECONDS_RUN s) =="
+# ext-23: SMMUv3 (IOMMU) + virtio-rng-pci hinter der SMMU (StreamID = PCI-RID). Die SMMU auf
+# QEMU virt uebersetzt nur PCIe -> das DMA-Beweisgeraet muss virtio-rng-PCI sein. Der Kernel
+# ignoriert beide, solange die ext-23-Treiber nicht aktiv sind (Rueckwaertskompatibilitaet).
 OUT="$(timeout --signal=KILL "$SECONDS_RUN" qemu-system-aarch64 \
-    -machine virt -cpu cortex-a72 -smp "$CORES" -m 4G \
+    -machine virt,iommu=smmuv3 -cpu cortex-a72 -smp "$CORES" -m 4G \
     -nographic -serial mon:stdio -no-reboot \
+    -device virtio-rng-pci \
     -kernel "$ELF" </dev/null 2>/dev/null)"
 
 echo "$OUT"
@@ -74,6 +78,7 @@ check "pdctl   : ALL PASS" "UserLand-Management: cap-gated SYS_PDCTL (PAUSE/RESU
 check "chan    : ALL PASS" "Paarweiser Treiber<->Backend-Kanal: unveraenderliche Bindung bei Backend-Erzeugung, 1:N, nur Partner"
 check "rtc     : ALL PASS" "RTC-HardwareLand-Backend: generisches MMIO-Cap + vspace_map_device, echtes PL031 RTC_DR-Read ueber Kanal"
 check "irq     : ALL PASS" "RTC-IRQ: IRQ-Cap + GIC-SPI-Routing + Deferred-IRQ-Zustellung als Notification an HardwareLand"
+check "dma     : ALL PASS" "DMA-Capability: DmaCap hinter DmaEnforcer-Abstraktion, kernel-ausgeschnittene Region, Normal-NC-Mapping, EL0-Round-Trip + Kohaerenz, dma_audit"
 check "hwfuzz  : ALL PASS" "Domaenen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Domaenen-Policy + CDT/VSpace-Oracle + Ressourcen-Baseline"
 online=$(echo "$OUT" | grep -c "online")
 [ "$online" -eq "$CORES" ] && echo "  PASS: alle $CORES Kerne online" || { echo "  FAIL: nur $online/$CORES Kerne online"; fail=1; }

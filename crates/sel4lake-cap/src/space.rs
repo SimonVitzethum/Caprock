@@ -1,7 +1,7 @@
 //! Capability-Space: Slot-Tabelle + Capability-Derivation-Tree (CDT).
 
 use crate::object::{Object, ObjectKind};
-use sel4lake_mem::{MemoryCap, PhysAllocator, Rights};
+use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
 
 /// Anzahl Capability-Slots (CTEs) im Space.
 const NSLOTS: usize = 256;
@@ -185,6 +185,14 @@ impl CapSpace {
         self.install(ObjectKind::Irq { intid }, rights)
     }
 
+    /// Eine **DMA-Capability** (ext-23, HardwareLand) einbringen: die Autorität über die
+    /// kernel-ausgeschnittene RAM-DMA-Region `[phys, phys+len)`. Anders als Mmio/Irq ist dies
+    /// echtes RAM -> die Finalisierung gibt es frei (`free_region`), garantiert sicher durch die
+    /// Teardown-Reihenfolge (`enforcer.disable_dma` -> Unmap davor). Nur kernelseitig.
+    pub fn install_dma(&mut self, phys: u64, len: u64, rights: Rights) -> Result<CapPtr, CapError> {
+        self.install(ObjectKind::Dma { phys, len }, rights)
+    }
+
     /// Wurzel-Objekt + -Cap anlegen (gemeinsame Logik für alle Objekttypen).
     fn install(&mut self, kind: ObjectKind, rights: Rights) -> Result<CapPtr, CapError> {
         let obj = self.alloc_object(kind)?;
@@ -208,6 +216,20 @@ impl CapSpace {
             self.slots[slot].rights,
             self.slots[slot].badge,
         ))
+    }
+
+    /// Über alle **DMA-Objekte** (objektgranular, distinct) iterieren: ruft `f(phys, len)`
+    /// je belegtem `ObjectKind::Dma`. Für das DMA-Policy-Oracle (Bounds/Disjunktheit) —
+    /// objekt- statt cap-granular, damit Cap-Kopien dieselbe Region nicht mehrfach zählen
+    /// (sonst falsch-positive Selbstüberlappung).
+    pub fn for_each_dma(&self, f: &mut dyn FnMut(u64, u64)) {
+        for o in self.objects.iter() {
+            if o.used {
+                if let ObjectKind::Dma { phys, len } = o.kind {
+                    f(phys, len);
+                }
+            }
+        }
     }
 
     // --- Ableitungsoperationen ---
@@ -547,12 +569,20 @@ impl CapSpace {
         if self.objects[obj].refcount == 0 {
             // Memory-Objekte geben ihre Region an den RAM-Allokator zurück; Reply-Objekte
             // melden ihren Call zum Abbruch (Kernel entblockt den Aufrufer). Alle anderen
-            // (Endpoint/Notification/Tcb/SchedContext/PdControl/**Mmio**) halten KEINEN
-            // RAM-Allokator-Eintrag — insbesondere `Mmio` verweist auf einen Geräte-Bereich
-            // (NICHT auf RAM): hier NIEMALS `free_region` rufen (sonst Allokator-Korruption).
+            // (Endpoint/Notification/Tcb/SchedContext/PdControl/**Mmio**/**Irq**) halten KEINEN
+            // RAM-Allokator-Eintrag — insbesondere `Mmio`/`Irq` verweisen auf einen Geräte-
+            // Bereich (NICHT auf RAM): hier NIEMALS `free_region` rufen (sonst Korruption).
+            //
+            // `Dma` ist die Ausnahme (ext-23): es IST kernel-ausgeschnittenes RAM und wird wie
+            // `Memory` freigegeben. Das ist DMA-use-after-free-sicher, **weil** die System-
+            // Teardown-Reihenfolge (`enforcer.disable_dma` -> SMMU-Invalidierung -> VSpace-Unmap)
+            // garantiert, dass vor dieser Freigabe kein Gerät mehr in die Region schreiben kann.
             match self.objects[obj].kind {
                 ObjectKind::Memory(region) => {
                     alloc.free_region(region);
+                }
+                ObjectKind::Dma { phys, len } => {
+                    alloc.free_region(PhysRegion::new(phys, len));
                 }
                 ObjectKind::Reply { ep, caller } => rf.push(ep, caller),
                 _ => {}

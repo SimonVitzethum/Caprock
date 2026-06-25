@@ -361,6 +361,24 @@ static SMMUB_BALANCED: AtomicBool = AtomicBool::new(false); // total_free nach d
 static SMMUB_DONE: AtomicBool = AtomicBool::new(false);
 static SMMUB_OK: AtomicBool = AtomicBool::new(false);
 
+// virtio-rng-DMA (ext-23, D4): echter Bus-Master-DMA in die DmaCap-Region. Das Gerät DMAt
+// Zufallsbytes in die Region (zur StreamID gebundene SMMU-Stage-1, Level 2). ZWEISTUFIGER
+// KRONJUWEL: Level 1 (Software) — der Treiber validiert jede Deskriptor-Adresse gegen die
+// DmaCap; eine Out-of-Window-Adresse wird ABGEWIESEN (demonstrierbar in QEMU). Sensitivitaet:
+// ohne die Pruefung schreibt das Geraet das Ziel (Pruefung lasttragend); auf realer HW faultet
+// dann die SMMU (Level 2), unter QEMU fuer emulierte Geraete nicht beobachtbar.
+static VRNG_USED: AtomicBool = AtomicBool::new(false); // used-Ring fortgeschritten
+static VRNG_WRITTEN: AtomicU32 = AtomicU32::new(0); // gemeldete Byte-Zahl
+static VRNG_R0: AtomicU32 = AtomicU32::new(0); // erste Zufallsbytes
+static VRNG_R1: AtomicU32 = AtomicU32::new(0);
+static VRNG_EVTQ: AtomicBool = AtomicBool::new(false); // SMMU-Event-Queue nach In-Window leer
+static VRNG_CJ_SW: AtomicBool = AtomicBool::new(false); // L1: Out-of-Window software-abgewiesen
+static VRNG_CJ_SENT: AtomicBool = AtomicBool::new(false); // L1 aktiv: Ziel unveraendert
+static VRNG_CJ_UNGUARDED: AtomicBool = AtomicBool::new(false); // Sensitivitaet: Pruefung lasttragend
+static VRNG_SMMU_ENF: AtomicBool = AtomicBool::new(false); // L2: SMMU-Fault (QEMU: false)
+static VRNG_DONE: AtomicBool = AtomicBool::new(false);
+static VRNG_OK: AtomicBool = AtomicBool::new(false);
+
 // Domänen/HW-Fuzzer (ext-22, P6): churnt über viele Epochen Hardware-/Management-Caps gegen
 // die Domänen-Policy + CDT/VSpace-Oracles + Ressourcen-Baseline. Kernpunkte: HW-Caps (MMIO/
 // IRQ) NUR in HardwareLand, PdControl NUR in TrustedSas installierbar (Negativfälle abgelehnt);
@@ -2917,7 +2935,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} hwfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} hwfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -2955,6 +2973,7 @@ pub fn demo_report_then_idle() -> ! {
                 PCIE_DONE.load(Ordering::Acquire) && PCIE_OK.load(Ordering::Acquire),
                 SMMU_DONE.load(Ordering::Acquire) && SMMU_OK.load(Ordering::Acquire),
                 SMMUB_DONE.load(Ordering::Acquire) && SMMUB_OK.load(Ordering::Acquire),
+                VRNG_DONE.load(Ordering::Acquire) && VRNG_OK.load(Ordering::Acquire),
                 HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire),
             );
         }
@@ -4039,9 +4058,40 @@ pub fn demo_report_then_idle() -> ! {
             SMMUB_DONE.store(true, Ordering::Release);
         }
 
+        // virtio-rng-DMA End-to-End (ext-23, D4): echter Bus-Master-DMA hinter der SMMU +
+        // Kronjuwel-Sensitivitaet. Synchrones kernel-/Trusted-Setup, ein Schritt. Gegate auf
+        // smmubind fertig (sequenziell, vor den Fuzzern).
+        if !VRNG_DONE.load(Ordering::Acquire) && SMMUB_DONE.load(Ordering::Acquire) {
+            let res = system::virtio_rng_dma_demo();
+            VRNG_USED.store(res.used_adv, Ordering::Relaxed);
+            VRNG_WRITTEN.store(res.written, Ordering::Relaxed);
+            VRNG_R0.store(res.rand0, Ordering::Relaxed);
+            VRNG_R1.store(res.rand1, Ordering::Relaxed);
+            VRNG_EVTQ.store(res.evtq_empty_good, Ordering::Relaxed);
+            VRNG_CJ_SW.store(res.cj_sw_blocked, Ordering::Relaxed);
+            VRNG_CJ_SENT.store(res.cj_sentinel_ok, Ordering::Relaxed);
+            VRNG_CJ_UNGUARDED.store(res.cj_unguarded_wrote, Ordering::Relaxed);
+            VRNG_SMMU_ENF.store(res.cj_smmu_enforced, Ordering::Relaxed);
+            // PASS = echter DMA + Level-1-Software-Erzwingung (demonstrierbar). cj_smmu_enforced
+            // (Level 2) ist unter QEMU fuer emulierte Geraete nicht beobachtbar -> NICHT gefordert.
+            let ok = res.found
+                && res.used_adv
+                && res.written > 0
+                && (res.rand0 != 0 || res.rand1 != 0) // Gerät hat echte Bytes DMAt
+                && res.evtq_empty_good //                In-Window: keine SMMU-Faults
+                && res.cj_sw_blocked //                  L1: Out-of-Window software-abgewiesen
+                && res.cj_sentinel_ok //                 L1 aktiv: Ziel unveraendert
+                && res.cj_unguarded_wrote //             Sensitivitaet: Pruefung lasttragend
+                && res.audit_ok
+                && system::domain_audit() == 0
+                && system::vspace_audit() == 0;
+            VRNG_OK.store(ok, Ordering::Release);
+            VRNG_DONE.store(true, Ordering::Release);
+        }
+
         // Domänen/HW-Fuzzer (ext-22, P6): churnt HW-/Management-Caps gegen Policy + Oracles +
-        // Baseline. Gegate auf SMMU-Bindung (ext-23) fertig; eine Epoche je Manager-Iteration.
-        if !HWFUZZ_DONE.load(Ordering::Acquire) && SMMUB_DONE.load(Ordering::Acquire) {
+        // Baseline. Gegate auf virtio-rng-DMA (ext-23) fertig; eine Epoche je Manager-Iteration.
+        if !HWFUZZ_DONE.load(Ordering::Acquire) && VRNG_DONE.load(Ordering::Acquire) {
             match HWFUZZ_STEP.load(Ordering::Acquire) {
                 0 => {
                     // Fixtures (eine PD je Domäne, ohne Threads) + Baseline schnappen.
@@ -4251,12 +4301,14 @@ fn all_done() -> bool {
     let smmu = SMMU_DONE.load(Ordering::Acquire) && SMMU_OK.load(Ordering::Acquire);
     // SMMU-Bindung (ext-23): enable_dma/disable_dma (STE/CD/Stage-1), Event-Queue leer, balanciert.
     let smmubind = SMMUB_DONE.load(Ordering::Acquire) && SMMUB_OK.load(Ordering::Acquire);
+    // virtio-rng-DMA (ext-23): echter Bus-Master-DMA hinter der SMMU + Kronjuwel-Sensitivität.
+    let virtiorng = VRNG_DONE.load(Ordering::Acquire) && VRNG_OK.load(Ordering::Acquire);
     // Domänen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Policy + Oracles + Baseline.
     let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
-        && pdctl && chan && rtc && irq && dma && pcie && smmu && smmubind && hwfuzz
+        && pdctl && chan && rtc && irq && dma && pcie && smmu && smmubind && virtiorng && hwfuzz
 }
 
 fn report() {
@@ -4701,6 +4753,20 @@ fn report() {
     println!(
         "smmubind: {} (enable_dma/disable_dma: STE->CD->Stage-1 bildet NUR die DMA-Region ab; Revoke gibt Tabellen frei)",
         if smmubind { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // virtio-rng-DMA (ext-23, D4): echter Bus-Master-DMA + zweistufiger Kronjuwel.
+    let virtiorng = VRNG_DONE.load(Ordering::Acquire) && VRNG_OK.load(Ordering::Acquire);
+    println!("virtiorng: Geraet DMAt {} Zufallsbytes in die DmaCap-Region: used-adv={} bytes[0..8]=0x{:08x}{:08x} SMMU-Event-Queue-leer={}",
+        VRNG_WRITTEN.load(Ordering::Acquire), VRNG_USED.load(Ordering::Acquire),
+        VRNG_R1.load(Ordering::Acquire), VRNG_R0.load(Ordering::Acquire),
+        VRNG_EVTQ.load(Ordering::Acquire));
+    println!("virtiorng: KRONJUWEL out-of-window: L1-Software-abgewiesen={} Ziel-unveraendert={} (Sensitivitaet: ohne-Pruefung-Geraet-schrieb={}); L2-SMMU-Fault={} (unter QEMU fuer emulierte Geraete nicht beobachtbar; Stage-1-STE installiert, greift auf realer HW)",
+        VRNG_CJ_SW.load(Ordering::Acquire), VRNG_CJ_SENT.load(Ordering::Acquire),
+        VRNG_CJ_UNGUARDED.load(Ordering::Acquire), VRNG_SMMU_ENF.load(Ordering::Acquire));
+    println!(
+        "virtiorng: {} (echter Bus-Master-DMA in die DmaCap-Region; zweistufig: Level-1-Software-Bounds erzwingt In-Window demonstrierbar, Level-2-SMMU als HW-Backstop fuer reale HW)",
+        if virtiorng { "ALL PASS" } else { "FAILURES" }
     );
 
     // Domänen/HW-Fuzzer (ext-22, P6).

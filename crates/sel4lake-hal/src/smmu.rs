@@ -50,7 +50,7 @@ const CMD_TLBI_NSNH_ALL: u64 = 0x30;
 const CMD_SYNC: u64 = 0x46;
 
 /// Größe (log2) der linearen Stream-Tabelle / Command-/Event-Queue (Einträge).
-pub const LOG2_STRTAB: u32 = 8; // 256 StreamIDs (deckt PCI-RIDs auf Bus 0 ab)
+pub const LOG2_STRTAB: u32 = 9; // 512 StreamIDs (deckt RIDs hinter Root-Ports ab, z.B. Bus 1 = 0x100)
 pub const LOG2_CMDQ: u32 = 7; //  128 Commands
 pub const LOG2_EVENTQ: u32 = 7; // 128 Events
 pub const STE_BYTES: u64 = 64; // 8 x u64
@@ -375,6 +375,15 @@ pub fn eventq_count() -> u32 {
     let p = r32(EVENTQ_PROD) & mask;
     let c = r32(EVENTQ_CONS) & mask;
     p.wrapping_sub(c) & mask
+}
+/// Die Event-Queue leeren (CONS := PROD) — nach einem **bewusst** provozierten Fault (Kronjuwel-
+/// Sensitivität), damit nachfolgende Audits die Queue wieder leer sehen. Gibt zurück, wie viele
+/// Events verworfen wurden.
+pub fn drain_eventq() -> u32 {
+    let n = eventq_count();
+    w32(EVENTQ_CONS, r32(EVENTQ_PROD));
+    cpu::dsb_sy();
+    n
 }
 /// Byte-Größen der drei Strukturen (für die RAM-Allokation durch den Aufrufer).
 pub fn strtab_bytes() -> u64 {

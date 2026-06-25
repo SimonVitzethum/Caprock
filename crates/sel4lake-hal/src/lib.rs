@@ -16,6 +16,7 @@ pub mod psci;
 pub mod smmu;
 pub mod syscall;
 pub mod timer;
+pub mod virtio;
 
 /// Formatierte Ausgabe auf der Debug-Konsole (gesperrt, SMP-sicher).
 #[macro_export]

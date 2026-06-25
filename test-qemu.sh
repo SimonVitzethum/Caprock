@@ -24,13 +24,14 @@ echo "== build =="
 ./build.sh >/dev/null 2>&1 || { echo "BUILD FAILED"; exit 1; }
 
 echo "== boot ($SECONDS_RUN s) =="
-# ext-23: SMMUv3 (IOMMU) + virtio-rng-pci hinter der SMMU (StreamID = PCI-RID). Die SMMU auf
-# QEMU virt uebersetzt nur PCIe -> das DMA-Beweisgeraet muss virtio-rng-PCI sein. Der Kernel
-# ignoriert beide, solange die ext-23-Treiber nicht aktiv sind (Rueckwaertskompatibilitaet).
+# ext-23: SMMUv3 (IOMMU) + virtio-rng-pci HINTER einem pcie-root-port (StreamID = PCI-RID).
+# QEMUs SMMUv3 uebersetzt nur Endpunkte hinter einem Root-Port (integrierte Bus-0-Endpunkte
+# umgehen die SMMU) -> das DMA-Beweisgeraet haengt am Root-Port. Der Kernel ignoriert beide,
+# solange die ext-23-Treiber nicht aktiv sind (Rueckwaertskompatibilitaet).
 OUT="$(timeout --signal=KILL "$SECONDS_RUN" qemu-system-aarch64 \
     -machine virt,iommu=smmuv3 -cpu cortex-a72 -smp "$CORES" -m 4G \
     -nographic -serial mon:stdio -no-reboot \
-    -net none -device virtio-rng-pci \
+    -net none -device pcie-root-port,id=rp0,chassis=1 -device virtio-rng-pci,bus=rp0 \
     -kernel "$ELF" </dev/null 2>/dev/null)"
 
 echo "$OUT"
@@ -82,6 +83,7 @@ check "dma     : ALL PASS" "DMA-Capability: DmaCap hinter DmaEnforcer-Abstraktio
 check "pcie    : ALL PASS" "PCIe-ECAM-Enumeration: virtio-rng-pci gefunden, BAR-Zuweisung + Bus-Master-Enable, RID == SMMU-StreamID"
 check "smmu    : ALL PASS" "SMMUv3-Bring-up hinter DmaEnforcer: Command-/Event-Queue + Stream-Tabelle, Default-Abort, CR0-Enable, CMD_SYNC-Round-Trip"
 check "smmubind: ALL PASS" "SMMU-Bindung: enable_dma/disable_dma installiert STE->CD->Stage-1 (nur die DMA-Region), Revoke gibt Tabellen frei (balanciert)"
+check "virtiorng: ALL PASS" "virtio-rng-DMA: Geraet DMAt echte Zufallsbytes in die DmaCap-Region; zweistufig: Level-1-Software-Bounds weist Out-of-Window demonstrierbar ab, Level-2-SMMU als HW-Backstop (QEMU emuliert-Geraet-Bypass)"
 check "hwfuzz  : ALL PASS" "Domaenen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Domaenen-Policy + CDT/VSpace-Oracle + Ressourcen-Baseline"
 online=$(echo "$OUT" | grep -c "online")
 [ "$online" -eq "$CORES" ] && echo "  PASS: alle $CORES Kerne online" || { echo "  FAIL: nur $online/$CORES Kerne online"; fail=1; }

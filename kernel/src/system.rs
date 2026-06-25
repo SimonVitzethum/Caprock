@@ -1653,6 +1653,123 @@ pub fn dma_disable(stream_id: u32, base: u64, len: u64) {
     });
 }
 
+/// **Level-1-Software-Disziplin** (ext-23): prüfen, dass ein Geräte-DMA-Zugriff `[addr, addr+len)`
+/// VOLLSTÄNDIG in der DmaCap-Region `[base, base+rlen)` liegt. Der vertrauenswürdige Treiber MUSS
+/// dies vor dem Programmieren JEDER Geräte-DMA-Adresse (Deskriptor/Register) aufrufen (backend-
+/// direkt, kernel-auditiert). Hardware-unabhängig wirksam. Die SMMU (Level 2) ist der zusätzliche
+/// **Hardware-Backstop**, falls ein kompromittiertes Backend diese Prüfung umgeht.
+pub fn dma_addr_in_region(base: u64, rlen: u64, addr: u64, len: u64) -> bool {
+    len > 0 && addr >= base && addr.saturating_add(len) <= base.saturating_add(rlen)
+}
+
+/// Ergebnis der virtio-rng-DMA-Demo (ext-23, D4): echter Bus-Master-DMA in die DmaCap-Region +
+/// **zweistufiger** Kronjuwel-Test (Level-1-Software-Bounds blockt Out-of-Window demonstrierbar;
+/// Level-2-SMMU = Hardware-Backstop, unter QEMU für emulierte Geräte nicht beobachtbar).
+#[derive(Clone, Copy, Default)]
+pub struct VirtioDmaResult {
+    pub found: bool,           // Gerät + virtio-Caps gefunden
+    pub used_adv: bool,        // used-Ring fortgeschritten (Gerät hat geantwortet)
+    pub written: u32,          // vom Gerät gemeldete Byte-Zahl
+    pub rand0: u32,            // erste 4 zufällige Bytes (vom Gerät via DMA geschrieben)
+    pub rand1: u32,            // nächste 4
+    pub evtq_empty_good: bool, // SMMU-Event-Queue nach dem In-Window-DMA leer
+    pub cj_sw_blocked: bool,   // Level 1: Software-Bounds wies den Out-of-Window-Deskriptor ab
+    pub cj_sentinel_ok: bool,  // mit Level 1 aktiv: Out-of-Window-Ziel unverändert
+    pub cj_unguarded_wrote: bool, // Sensitivität: OHNE die Prüfung schrieb das Gerät -> Prüfung lasttragend
+    pub cj_smmu_enforced: bool, // Level 2: faultete die SMMU den ungeschützten Zugriff? (QEMU: false)
+    pub audit_ok: bool,        // dma_audit==0 nach dem Aufräumen
+}
+
+/// **virtio-rng-DMA End-to-End** (ext-23, D4): das Gerät DMAt Zufallsbytes in die DmaCap-Region
+/// (echter Bus-Master-DMA). Danach der **zweistufige Kronjuwel-Test**:
+/// - **Level 1 (Software, demonstrierbar):** der vertrauenswürdige Treiber validiert jede
+///   Deskriptor-Adresse via [`dma_addr_in_region`]; eine Out-of-Window-Adresse wird abgewiesen ->
+///   das Gerät wird gar nicht erst programmiert -> das Ziel bleibt unverändert.
+/// - **Sensitivität:** wird die Prüfung umgangen und der Out-of-Window-Deskriptor doch ausgegeben,
+///   schreibt das Gerät das Ziel (Prüfung ist lasttragend). Auf realer HW würde hier die SMMU
+///   (Level 2) faulten; QEMU übersetzt emulierte Geräte nicht durch die SMMU -> `cj_smmu_enforced`
+///   ist unter QEMU `false` (ehrliche Telemetrie). Die Stage-1-STE ist dennoch installiert + greift
+///   auf realer Hardware.
+pub fn virtio_rng_dma_demo() -> VirtioDmaResult {
+    let mut r = VirtioDmaResult::default();
+    let Some(dev) = virtio_device() else {
+        return r;
+    };
+    r.found = true;
+    let rid = dev.rid();
+    // DMA-Region (Virtqueue + Datenpuffer) ausschneiden + an die Geräte-StreamID binden (Level 2).
+    let Some(region) = alloc_dma_region(0x4000) else {
+        return r;
+    };
+    let base = region.base;
+    let len = region.len;
+    if !dma_enable(rid, base, len) {
+        free_raw_region(base, len);
+        return r;
+    }
+    hal::smmu::drain_eventq(); // sauberer Ausgangsstand
+    let dlen = hal::virtio::DATA_LEN_BYTES as u64;
+
+    // 1. In-Window: Treiber validiert die Zieladresse (Level 1, ok) -> Gerät DMAt Zufallsbytes.
+    let data = base + hal::virtio::DATA_OFFSET;
+    if dma_addr_in_region(base, len, data, dlen) {
+        if let Some(rng) = hal::virtio::probe(&dev) {
+            // SAFETY: kernel-/Trusted-seitiger virtio-Treiber; BAR ist global EL1-Device-gemappt,
+            // die Virtqueue + der Datenpuffer liegen in der (identity-gemappten) DMA-Region.
+            let (adv, wlen) = unsafe { rng.request(base, data) };
+            r.used_adv = adv;
+            r.written = wlen;
+            let (w0, w1) = peek_dma_words(data);
+            r.rand0 = w0;
+            r.rand1 = w1;
+        }
+    }
+    r.evtq_empty_good = hal::smmu::eventq_empty();
+
+    // 2. Kronjuwel (Sentinel-Page AUSSERHALB der DmaCap-Region). MEM-Lock VOR dem `if let`
+    // freigeben (sonst Deadlock über das `if let`-Temporary -> free_raw_region re-lockt MEM).
+    let sentinel_page = MEM.lock().alloc(4096, 4096).map(|c| c.base());
+    if let Some(sent) = sentinel_page {
+        const SENTINEL: u64 = 0xA5A5_A5A5_5A5A_5A5A;
+        // SAFETY: frische, identity-gemappte RAM-Page; exklusiv hier beschrieben/gelesen.
+        unsafe { core::ptr::write_volatile(sent as *mut u64, SENTINEL) };
+        hal::cpu::dsb_sy();
+
+        // 2a. Level 1: der Treiber validiert die Out-of-Window-Adresse -> ABGEWIESEN, kein Notify.
+        r.cj_sw_blocked = !dma_addr_in_region(base, len, sent, dlen);
+        // SAFETY: nur Lesezugriff. Da nicht programmiert, muss das Ziel unverändert sein.
+        let after_guard = unsafe { core::ptr::read_volatile(sent as *const u64) };
+        r.cj_sentinel_ok = after_guard == SENTINEL;
+
+        // 2b. Sensitivität: Prüfung umgehen + Out-of-Window doch ausgeben. Beweist, dass die
+        // Software-Prüfung lasttragend ist; testet zugleich den SMMU-Backstop (QEMU: nicht
+        // beobachtbar -> Gerät schreibt; reale HW: SMMU faultet).
+        hal::smmu::drain_eventq();
+        if let Some(rng) = hal::virtio::probe(&dev) {
+            let _ = unsafe { rng.request(base, sent) };
+        }
+        // SAFETY: s.o.
+        let after_unguarded = unsafe { core::ptr::read_volatile(sent as *const u64) };
+        r.cj_unguarded_wrote = after_unguarded != SENTINEL; // Prüfung war lasttragend
+        r.cj_smmu_enforced = !hal::smmu::eventq_empty(); //  SMMU-Fault? (QEMU: false)
+        hal::smmu::drain_eventq();
+        free_raw_region(sent, 4096);
+    }
+
+    // 3. Aufräumen: Durchsetzung entziehen (STE invalidieren) + DMA-Region freigeben.
+    dma_disable(rid, base, len);
+    free_raw_region(base, len);
+    r.audit_ok = dma_audit() == 0;
+    r
+}
+
+/// Eine roh-allozierte RAM-Region (ohne Cap) an den Allokator zurückgeben (interner Test-/
+/// Setup-Helfer für temporäre DMA-/Sentinel-Regionen). 4-KiB-granular.
+fn free_raw_region(base: u64, len: u64) {
+    let len = (len + 4095) & !4095;
+    MEM.lock().free_region(PhysRegion::new(base, len));
+}
+
 /// Eine DMA-Bindung **sicher abbauen** (Revoke-Reihenfolge, ext-23, DMA-use-after-free-sicher):
 /// (1) `enforcer.disable_dma` (hardwareseitige Durchsetzung entziehen — SMMU-Invalidierung),
 /// dann (2) aus der Backend-VSpace unmappen. Erst danach darf der Aufrufer die DmaCap löschen
@@ -1690,7 +1807,15 @@ pub fn dma_audit() -> u32 {
 pub fn pcie_find_virtio() -> Option<hal::pcie::PciDevice> {
     hal::mmu::map_device_block_global(hal::pcie::ECAM_GIB);
     // Gezielt die virtio-RNG (nicht eine evtl. vorhandene Default-NIC, ebenfalls Vendor 0x1af4).
-    hal::pcie::find(hal::pcie::VIRTIO_VENDOR, &hal::pcie::VIRTIO_RNG_DEVICES)
+    let d = hal::pcie::find(hal::pcie::VIRTIO_VENDOR, &hal::pcie::VIRTIO_RNG_DEVICES);
+    *VIRTIO_PCI.lock() = d; // für D4 (virtio-Treiber) cachen
+    d
+}
+
+/// Das in [`pcie_find_virtio`] gefundene + eingerichtete virtio-RNG-Gerät (gecacht).
+static VIRTIO_PCI: SpinLock<Option<hal::pcie::PciDevice>> = SpinLock::new(None);
+pub fn virtio_device() -> Option<hal::pcie::PciDevice> {
+    *VIRTIO_PCI.lock()
 }
 
 /// Wie [`dma_audit`], aber mit explizit gewähltem `floor` (für den Bounds-Sensitivitätstest:

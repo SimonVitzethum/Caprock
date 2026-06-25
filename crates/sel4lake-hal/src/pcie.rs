@@ -39,6 +39,15 @@ const CFG_HEADER_TYPE: u16 = 0x0e;
 const CFG_BAR0: u16 = 0x10;
 const CFG_CAP_PTR: u16 = 0x34;
 const CFG_INT_PIN: u16 = 0x3d;
+// PCI-zu-PCI-Bridge (Header-Type 1) Bus-/Fenster-Register.
+const CFG_PRIMARY_BUS: u16 = 0x18;
+const CFG_SECONDARY_BUS: u16 = 0x19;
+const CFG_SUBORDINATE_BUS: u16 = 0x1a;
+const CFG_IO_BASE: u16 = 0x1c; // I/O-Base(8)/Limit(8)
+const CFG_MEM_BASE: u16 = 0x20; // Memory-Base(16)
+const CFG_MEM_LIMIT: u16 = 0x22; // Memory-Limit(16)
+const CFG_PREF_BASE: u16 = 0x24; // Prefetchable-Base(16)
+const CFG_PREF_LIMIT: u16 = 0x26; // Prefetchable-Limit(16)
 
 // Command-Register-Bits.
 const CMD_MEM_SPACE: u16 = 1 << 1;
@@ -101,39 +110,108 @@ pub fn cfg_read8(bus: u8, dev: u8, func: u8, off: u16) -> u8 {
     let w = cfg_read32(bus, dev, func, off & !0x3);
     (w >> ((off as u32 & 0x3) * 8)) as u8
 }
+fn cfg_write8(bus: u8, dev: u8, func: u8, off: u16, val: u8) {
+    let aligned = off & !0x3;
+    let shift = (off as u32 & 0x3) * 8;
+    let mut w = cfg_read32(bus, dev, func, aligned);
+    w &= !(0xffu32 << shift);
+    w |= (val as u32) << shift;
+    cfg_write32(bus, dev, func, aligned, w);
+}
 
-/// Bus 0 nach dem ersten Gerät mit Vendor `vendor` und (falls `devices` nicht leer) einer
-/// passenden Device-ID durchsuchen. BARs werden dabei dimensioniert + im 32-bit-Fenster
-/// zugewiesen, Memory-Space + Bus-Master aktiviert. `None`, wenn nichts Passendes existiert.
-pub fn find(vendor: u16, devices: &[u16]) -> Option<PciDevice> {
+/// Maximale Bus-Nummer, die durchsucht wird (mit iommu=smmuv3 hängt QEMU Endpunkte hinter
+/// Root-Ports auf höheren Bussen ein -> nicht nur Bus 0 absuchen).
+const MAX_BUS: u8 = 16;
+
+/// **PCIe-Bridges (Root-Ports) konfigurieren**: jeder Bridge auf Bus 0 einen Sekundärbus
+/// zuweisen (Primary/Secondary/Subordinate) und ihr Memory-Window auf das 32-bit-MMIO-Fenster
+/// setzen + Memory-Forwarding einschalten — sonst sind Endpunkte dahinter weder per ECAM
+/// erreichbar noch ihre BARs zugänglich. Nötig, weil QEMUs SMMUv3 nur Endpunkte **hinter einem
+/// Root-Port** übersetzt (integrierte Bus-0-Endpunkte umgehen die SMMU). Einstufig (Root-Ports
+/// auf Bus 0, Endpunkte direkt dahinter) — für tiefere Topologien später erweiterbar.
+fn configure_bridges() {
+    let mut next_bus: u8 = 1;
     for dev in 0u8..32 {
         let v = cfg_read16(0, dev, 0, CFG_VENDOR);
         if v == 0xffff || v == 0x0000 {
-            continue; // kein Gerät in diesem Slot
-        }
-        if v != vendor {
             continue;
         }
-        let did = cfg_read16(0, dev, 0, CFG_DEVICE);
-        if !devices.is_empty() && !devices.contains(&did) {
-            continue; // Vendor passt, aber falscher Gerätetyp (z.B. Default-NIC)
+        let htype = cfg_read8(0, dev, 0, CFG_HEADER_TYPE) & 0x7f;
+        if htype != 1 {
+            continue; // kein Bridge
         }
-        let mut d = PciDevice {
-            bus: 0,
-            dev,
-            func: 0,
-            vendor: v,
-            device: cfg_read16(0, dev, 0, CFG_DEVICE),
-            class: cfg_read32(0, dev, 0, CFG_CLASS) >> 8,
-            int_pin: cfg_read8(0, dev, 0, CFG_INT_PIN),
-            bars: [0; 6],
-            bar_size: [0; 6],
-        };
-        assign_bars(&mut d);
-        enable_mem_and_bus_master(&d);
-        return Some(d);
+        let sec = next_bus;
+        next_bus += 1;
+        // Bus-Nummern: primary=0, secondary=sec, subordinate=sec (einstufig).
+        cfg_write8(0, dev, 0, CFG_PRIMARY_BUS, 0);
+        cfg_write8(0, dev, 0, CFG_SECONDARY_BUS, sec);
+        cfg_write8(0, dev, 0, CFG_SUBORDINATE_BUS, sec);
+        // Memory-Window auf das 32-bit-MMIO-Fenster (Einheiten: 1 MiB, Bits[15:4]=Addr[31:20]).
+        cfg_write16(0, dev, 0, CFG_MEM_BASE, ((MMIO32_BASE >> 16) & 0xfff0) as u16);
+        cfg_write16(0, dev, 0, CFG_MEM_LIMIT, ((MMIO32_END >> 16) & 0xfff0) as u16);
+        // Prefetchable + I/O deaktivieren (Base > Limit).
+        cfg_write16(0, dev, 0, CFG_PREF_BASE, 0xfff0);
+        cfg_write16(0, dev, 0, CFG_PREF_LIMIT, 0x0000);
+        cfg_write16(0, dev, 0, CFG_IO_BASE, 0x00f0);
+        // Memory-Space + Bus-Master am Bridge einschalten (Forwarding).
+        let cmd = cfg_read16(0, dev, 0, CFG_COMMAND);
+        cfg_write16(0, dev, 0, CFG_COMMAND, cmd | CMD_MEM_SPACE | CMD_BUS_MASTER);
+    }
+}
+
+/// Alle Busse `0..MAX_BUS` nach dem ersten Gerät mit Vendor `vendor` und (falls `devices` nicht
+/// leer) passender Device-ID durchsuchen. Konfiguriert zuvor die Bridges (Root-Ports), damit
+/// Endpunkte dahinter sichtbar werden. BARs werden dimensioniert + im 32-bit-Fenster zugewiesen,
+/// Memory-Space + Bus-Master aktiviert. `None`, wenn nichts Passendes existiert.
+pub fn find(vendor: u16, devices: &[u16]) -> Option<PciDevice> {
+    configure_bridges();
+    for bus in 0u8..MAX_BUS {
+        for dev in 0u8..32 {
+            let v = cfg_read16(bus, dev, 0, CFG_VENDOR);
+            if v == 0xffff || v == 0x0000 {
+                continue; // kein Gerät in diesem Slot
+            }
+            if v != vendor {
+                continue;
+            }
+            let did = cfg_read16(bus, dev, 0, CFG_DEVICE);
+            if !devices.is_empty() && !devices.contains(&did) {
+                continue; // Vendor passt, aber falscher Gerätetyp (z.B. Default-NIC)
+            }
+            let mut d = PciDevice {
+                bus,
+                dev,
+                func: 0,
+                vendor: v,
+                device: did,
+                class: cfg_read32(bus, dev, 0, CFG_CLASS) >> 8,
+                int_pin: cfg_read8(bus, dev, 0, CFG_INT_PIN),
+                bars: [0; 6],
+                bar_size: [0; 6],
+            };
+            assign_bars(&mut d);
+            enable_mem_and_bus_master(&d);
+            return Some(d);
+        }
     }
     None
+}
+
+/// Alle Busse `0..MAX_BUS` durchsuchen und jedes vorhandene Gerät über `f(bus, dev, vendor,
+/// device, class)` melden (Diagnose der PCIe-Topologie). Konfiguriert zuvor die Bridges.
+pub fn dump_devices(f: &mut dyn FnMut(u8, u8, u16, u16, u32)) {
+    configure_bridges();
+    for bus in 0u8..MAX_BUS {
+        for dev in 0u8..32 {
+            let v = cfg_read16(bus, dev, 0, CFG_VENDOR);
+            if v == 0xffff || v == 0x0000 {
+                continue;
+            }
+            let did = cfg_read16(bus, dev, 0, CFG_DEVICE);
+            let class = cfg_read32(bus, dev, 0, CFG_CLASS) >> 8;
+            f(bus, dev, v, did, class);
+        }
+    }
 }
 
 /// Alle BARs eines Geräts dimensionieren und Memory-BARs im 32-bit-Fenster zuweisen.
@@ -141,11 +219,11 @@ fn assign_bars(d: &mut PciDevice) {
     let mut i = 0usize;
     while i < 6 {
         let off = CFG_BAR0 + (i as u16) * 4;
-        let orig = cfg_read32(0, d.dev, 0, off);
+        let orig = cfg_read32(d.bus, d.dev, 0, off);
         // Größe sondieren: all-1s schreiben, Maske zurücklesen, Original wiederherstellen.
-        cfg_write32(0, d.dev, 0, off, 0xffff_ffff);
-        let mask = cfg_read32(0, d.dev, 0, off);
-        cfg_write32(0, d.dev, 0, off, orig);
+        cfg_write32(d.bus, d.dev, 0, off, 0xffff_ffff);
+        let mask = cfg_read32(d.bus, d.dev, 0, off);
+        cfg_write32(d.bus, d.dev, 0, off, orig);
         if mask == 0 {
             i += 1;
             continue; // BAR nicht implementiert
@@ -174,9 +252,9 @@ fn assign_bars(d: &mut PciDevice) {
             MMIO32_NEXT.store(next, Ordering::Relaxed);
             cur
         };
-        cfg_write32(0, d.dev, 0, off, (base as u32) & 0xffff_fff0 | (mask & 0xf));
+        cfg_write32(d.bus, d.dev, 0, off, (base as u32) & 0xffff_fff0 | (mask & 0xf));
         if is_64 {
-            cfg_write32(0, d.dev, 0, off + 4, (base >> 32) as u32);
+            cfg_write32(d.bus, d.dev, 0, off + 4, (base >> 32) as u32);
         }
         d.bars[i] = base;
         d.bar_size[i] = size;
@@ -186,9 +264,9 @@ fn assign_bars(d: &mut PciDevice) {
 
 /// Memory-Space + Bus-Master im Command-Register aktivieren (Bus-Master ist Pflicht für DMA).
 fn enable_mem_and_bus_master(d: &PciDevice) {
-    let cmd = cfg_read16(0, d.dev, d.func, CFG_COMMAND);
+    let cmd = cfg_read16(d.bus, d.dev, d.func, CFG_COMMAND);
     cfg_write16(
-        0,
+        d.bus,
         d.dev,
         d.func,
         CFG_COMMAND,
@@ -196,17 +274,17 @@ fn enable_mem_and_bus_master(d: &PciDevice) {
     );
 }
 
-/// Ist Bus-Master aktiv? (Verifikation nach `find_by_vendor`.)
+/// Ist Bus-Master aktiv? (Verifikation nach `find`.)
 pub fn bus_master_enabled(d: &PciDevice) -> bool {
-    cfg_read16(0, d.dev, d.func, CFG_COMMAND) & CMD_BUS_MASTER != 0
+    cfg_read16(d.bus, d.dev, d.func, CFG_COMMAND) & CMD_BUS_MASTER != 0
 }
 
 /// Header-Type des Geräts (Bit 7 = Multifunktion).
 pub fn header_type(d: &PciDevice) -> u8 {
-    cfg_read8(0, d.dev, d.func, CFG_HEADER_TYPE)
+    cfg_read8(d.bus, d.dev, d.func, CFG_HEADER_TYPE)
 }
 
 /// Capabilities-Pointer (Offset des ersten Capability-Eintrags, 0 = keine).
 pub fn cap_ptr(d: &PciDevice) -> u8 {
-    cfg_read8(0, d.dev, d.func, CFG_CAP_PTR)
+    cfg_read8(d.bus, d.dev, d.func, CFG_CAP_PTR)
 }

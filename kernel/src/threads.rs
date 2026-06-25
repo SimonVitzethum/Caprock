@@ -454,6 +454,27 @@ fn hwfuzz_epoch(tpd: usize, hpd: usize, upd: usize, base_obj: usize, base_free: 
     if !system::install_pd_cap(hpd, 8, mmio2) {
         return 12;
     }
+    // 4b. DMA-Cap (ext-23): echtes kernel-ausgeschnittenes RAM, NUR HardwareLand. Anders als
+    // MMIO/IRQ reduziert die Allokation `total_free` — die Revoke (delete_leaf -> free_region)
+    // stellt es wieder her, sodass die Epoche balanciert bleibt (Codes 70+).
+    let dlen = 0x1000u64 * (1 + hwfuzz_rand() % 4);
+    let dregion = match system::alloc_dma_region(dlen) {
+        Some(r) => r,
+        None => return 70, // GiB-1-Erschöpfung wäre eine Anomalie (Epoche allokiert+gibt frei)
+    };
+    let dma = match system::install_dma_cap(dregion.base, dregion.len, Rights::RW) {
+        Ok(c) => c,
+        Err(_) => {
+            system::free_dma_region(dregion.base, dregion.len);
+            return 71;
+        }
+    };
+    if !system::install_pd_cap(hpd, 9, dma) {
+        return 72; // HardwareLand: muss klappen
+    }
+    if system::install_pd_cap(upd, 9, dma) || system::install_pd_cap(tpd, 9, dma) {
+        return 73; // UserLand/TrustedSas: DMA-Cap (Hardware) muss abgelehnt werden
+    }
     // 5. Mid-Epoch-Oracles.
     if system::domain_audit() != 0 {
         return 30;
@@ -464,17 +485,25 @@ fn hwfuzz_epoch(tpd: usize, hpd: usize, upd: usize, base_obj: usize, base_free: 
     if system::vspace_audit() != 0 {
         return 40;
     }
+    if system::dma_audit() != 0 {
+        return 74;
+    }
     // 6. Abräumen -> Baseline. (Kind mmio2 VOR dem Elter mmio löschen.)
     system::clear_pd_cap(hpd, 5);
     system::clear_pd_cap(hpd, 6);
     system::clear_pd_cap(hpd, 8);
+    system::clear_pd_cap(hpd, 9);
     system::clear_pd_cap(tpd, 5);
     let _ = system::cap_delete(mmio2);
     let _ = system::cap_delete(mmio);
     let _ = system::cap_delete(irq);
     let _ = system::cap_delete(pdc);
-    // 7. Baseline: keine Objekt-Leaks UND — kritisch — `total_free` unveraendert (das Loeschen
-    // von MMIO/IRQ-Caps darf den RAM-Allokator NICHT anfassen; Geraet != RAM).
+    // DMA-Cap löschen -> delete_leaf gibt die RAM-Region via free_region zurück (balanciert
+    // mit der alloc_dma_region oben; total_free kehrt zur Baseline zurück).
+    let _ = system::cap_delete(dma);
+    // 7. Baseline: keine Objekt-Leaks UND `total_free` unveraendert. MMIO/IRQ-Delete fasst den
+    // RAM-Allokator NICHT an (Geraet != RAM); DMA-Delete gibt seine Region zurueck -> beides
+    // zusammen balanciert auf die Baseline (alloc_dma_region <-> free_region je Epoche).
     if system::cap_used_objects() != base_obj {
         return 50;
     }
@@ -4772,9 +4801,9 @@ fn report() {
     // Domänen/HW-Fuzzer (ext-22, P6).
     let hwf_fail = HWFUZZ_FAIL.load(Ordering::Acquire);
     let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
-    println!("hwfuzz  : {} Epochen HW-/Management-Cap-Churn gegen Domaenen-Policy + CDT/VSpace-Oracle + Baseline; Anomalie-Code={hwf_fail} (0=keine)", HWFUZZ_EPOCH.load(Ordering::Acquire));
+    println!("hwfuzz  : {} Epochen HW-/Management-Cap-Churn (MMIO/IRQ/PdControl/DMA) gegen Domaenen-Policy + CDT/VSpace/DMA-Oracle + Baseline; Anomalie-Code={hwf_fail} (0=keine)", HWFUZZ_EPOCH.load(Ordering::Acquire));
     println!(
-        "hwfuzz  : {} (HW-Caps nur HardwareLand, PdControl nur TrustedSas, MMIO/IRQ-Delete fasst RAM-Allokator nicht an, Audits stets 0)",
+        "hwfuzz  : {} (HW-Caps nur HardwareLand, PdControl nur TrustedSas, MMIO/IRQ-Delete fasst RAM-Allokator nicht an, DMA-alloc<->free balanciert, Audits stets 0)",
         if hwfuzz { "ALL PASS" } else { "FAILURES" }
     );
 }

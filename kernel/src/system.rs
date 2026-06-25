@@ -1763,6 +1763,12 @@ pub fn virtio_rng_dma_demo() -> VirtioDmaResult {
     r
 }
 
+/// Eine (noch nicht in eine DmaCap überführte) DMA-Region an den Allokator zurückgeben — für
+/// Fehler-/Cleanup-Pfade, in denen eine `alloc_dma_region` nicht in eine Cap mündet.
+pub fn free_dma_region(base: u64, len: u64) {
+    free_raw_region(base, len);
+}
+
 /// Eine roh-allozierte RAM-Region (ohne Cap) an den Allokator zurückgeben (interner Test-/
 /// Setup-Helfer für temporäre DMA-/Sentinel-Regionen). 4-KiB-granular.
 fn free_raw_region(base: u64, len: u64) {

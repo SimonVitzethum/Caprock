@@ -400,6 +400,19 @@ impl Scheduler {
         }
     }
 
+    /// Einen **bestimmten** Thread dieses Kerns externen pausieren (ext-22, `SYS_PDCTL`
+    /// PAUSE): als blockiert markieren und aus der Ready-Queue nehmen. Ist er gerade der
+    /// laufende Thread, deplaniert ihn der nächste Tick (`on_tick` reiht einen als
+    /// blockiert markierten `current` nicht wieder ein). Mit [`unblock`] (RESUME) reversibel.
+    pub fn pause(&mut self, tid: ThreadId) {
+        if let Some(s) = self.resolve(tid) {
+            if !self.tcbs[s].blocked {
+                self.tcbs[s].blocked = true;
+                self.remove_from_ready(s); // No-Op, falls er gerade `current` ist
+            }
+        }
+    }
+
     fn resolve(&self, tid: ThreadId) -> Option<usize> {
         if tid.core() != self.core {
             return None;
@@ -449,7 +462,9 @@ impl Scheduler {
         }
         if let Some(cur) = self.current {
             self.tcbs[cur].sp = frame;
-            let mut requeue = true;
+            // Ein extern als blockiert markierter `current` (z. B. via `pause`/`SYS_PDCTL`)
+            // wird NICHT wieder eingereiht -> er deplaniert sauber.
+            let mut requeue = !self.tcbs[cur].blocked;
             // Gegen das **Konto** belasten (eigenes oder via Donation geliehenes).
             let acct = self.tcbs[cur].sc_donor.unwrap_or(cur);
             if tick && self.tcbs[acct].budget > 0 {
@@ -685,6 +700,11 @@ pub trait SchedOps {
     fn block_current(&mut self, core: usize, frame: usize) -> usize;
     fn switch_to(&mut self, core: usize, frame: usize, target: ThreadId) -> usize;
     fn unblock(&mut self, tid: ThreadId);
+    /// Einen bestimmten Thread externen pausieren (blockieren; mit `unblock` reversibel).
+    fn pause(&mut self, tid: ThreadId);
+    /// Einen bestimmten (nicht laufenden) Thread auf irgendeinem Kern beenden + abbauen
+    /// (`SYS_PDCTL` STOP). Gibt `false`, falls er gerade läuft (erst pausieren).
+    fn stop(&mut self, tid: ThreadId) -> bool;
     fn on_tick(&mut self, core: usize, frame: usize) -> usize;
     fn exit_current(&mut self, core: usize, frame: usize) -> usize;
     fn kill(&mut self, tid: ThreadId, core: usize) -> bool;

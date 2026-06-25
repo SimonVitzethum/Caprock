@@ -11,7 +11,7 @@
 
 use crate::system;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use sel4lake_abi::{result, sys, GRANT_FLAG, GRANT_RECV_SLOT};
+use sel4lake_abi::{pdctl, result, sys, GRANT_FLAG, GRANT_RECV_SLOT};
 use sel4lake_hal::{self as hal, println, syscall::invoke};
 use sel4lake_mem::{peek_u64, poke_u64, Rights};
 use sel4lake_cap::CapPtr;
@@ -220,6 +220,29 @@ static DOMAIN_USER_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
 static DOMAIN_AUDIT_CODE: AtomicU32 = AtomicU32::new(u32::MAX);
 static DOMAIN_DONE: AtomicBool = AtomicBool::new(false);
 static DOMAIN_OK: AtomicBool = AtomicBool::new(false);
+
+// UserLand-Management (ext-22, P2): ein TrustedSas-Controller steuert per SYS_PDCTL (cap-
+// gated PdControl) den Lifecycle eines UserLand-Ziels. Ziel = isolierter EL0-Thread, der
+// einen geteilten Frame inkrementiert; der Controller (TrustedSas EL1) beobachtet den
+// Zaehler ueber peek_u64 und prueft PAUSE(eingefroren)/RESUME(waechst)/STOP + cap-Negativ.
+const PDCTL_FRAME_SIZE: u64 = 0x20_0000; // 2 MiB (MAP-2MiB-Fastpath wie shm)
+const PDCTL_CTRL_SLOT: u64 = 0; // PdControl-Cap im Controller-Cspace
+const PDCTL_EMPTY_SLOT: u64 = 5; // leerer Slot (Negativtest: kein Cap -> ERR_BADCAP)
+const PDCTL_YIELD_OBS: u32 = 80; // Beobachtungsfenster in YIELDs (kooperativ)
+static PDCTL_FRAME: AtomicU64 = AtomicU64::new(u64::MAX); // phys. Basis des Zaehler-Frames
+static PDCTL_TARGET_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static PDCTL_CTRL_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static PDCTL_TARGET_TID: AtomicU64 = AtomicU64::new(u64::MAX);
+static PDCTL_RAN: AtomicBool = AtomicBool::new(false); // Ziel lief (Zaehler wuchs)
+static PDCTL_FROZE: AtomicBool = AtomicBool::new(false); // PAUSE -> eingefroren + OK
+static PDCTL_RESUMED: AtomicBool = AtomicBool::new(false); // RESUME -> waechst wieder
+static PDCTL_NOCAP: AtomicBool = AtomicBool::new(false); // leerer Slot -> ERR_BADCAP
+static PDCTL_POLICY: AtomicBool = AtomicBool::new(false); // PdControl in UserLand-PD -> denied
+static PDCTL_STOPPED: AtomicBool = AtomicBool::new(false); // STOP -> OK
+static PDCTL_CTRL_DONE: AtomicBool = AtomicBool::new(false); // Controller-Sequenz fertig
+static PDCTL_STEP: AtomicU32 = AtomicU32::new(0);
+static PDCTL_DONE: AtomicBool = AtomicBool::new(false);
+static PDCTL_OK: AtomicBool = AtomicBool::new(false);
 
 // Audit-Regression B (Scheduler/MCS): `set_budget`/`bind_sched_context` auf einen
 // ERSCHÖPFTEN Thread darf ihn nicht stranden (Fund: `depleted` gelöscht ohne
@@ -1040,6 +1063,31 @@ extern "C" fn churn_dummy(_arg: usize) -> ! {
     }
 }
 
+/// **PD-Management-Ziel** (ext-22, `.user_text`, isolierte UserLand-VSpace). x0 = phys.
+/// Basis des Zähler-Frames. Mappt den Frame (Slot 0) und inkrementiert ihn in einer
+/// kooperativen Schleife (YIELD je Runde). Der TrustedSas-Controller beobachtet den
+/// Zähler und pausiert/setzt fort/stoppt dieses Ziel über `SYS_PDCTL`.
+#[link_section = ".user_text"]
+extern "C" fn pdctl_target(_arg: usize) -> ! {
+    // SAFETY: reiner EL0-User-Code; `ldr/str` nur auf den selbst gemappten Frame.
+    unsafe {
+        core::arch::asm!(
+            "mov x9, x0",  // x9 = Frame-Basis
+            "mov x0, #10", // sys::MAP Slot 0 (Memory-Cap des Zähler-Frames)
+            "mov x1, #0",
+            "svc #0",
+        "1:",
+            "ldr x10, [x9]",
+            "add x10, x10, #1",
+            "str x10, [x9]",
+            "mov x0, #0", // sys::YIELD (kooperativ -> Controller kommt dran)
+            "svc #0",
+            "b 1b",
+            options(noreturn),
+        );
+    }
+}
+
 /// **4-KiB-Seiten-Probe** (`.user_text`, isolierte VSpace). x0 = Basis P einer
 /// 12-KiB-Region, vom Kernel feingranular gemappt: P=RW, P+4 KiB=RO (vorbefüllt),
 /// P+8 KiB=**Guard** (ungemappt). Die Probe schreibt P (RW), liest P+4 KiB (RO) und
@@ -1292,6 +1340,48 @@ extern "C" fn rmig_client(_arg: usize) -> ! {
     let r = invoke(sys::CALL, EP_CAP, [RMIG_INPUT, 0, 0, 0], 0);
     RMIG_VALUE.store(r.msg[0], Ordering::Release);
     RMIG_RESULT.store(r.result, Ordering::Release); // zuletzt: Manager pollt hierauf
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
+}
+
+/// **PD-Management-Controller** (ext-22, EL1, TrustedSas-PD, hält die `PdControl`-Cap für
+/// das UserLand-Ziel in [`PDCTL_CTRL_SLOT`]). Steuert das Ziel über `SYS_PDCTL` und
+/// beobachtet dessen Zähler-Frame (peek_u64): erst läuft es, PAUSE friert es ein, RESUME
+/// lässt es weiterzählen, ein Slot ohne Cap wird abgelehnt (ERR_BADCAP), STOP beendet es.
+extern "C" fn pdctl_controller(_arg: usize) -> ! {
+    let f = PDCTL_FRAME.load(Ordering::Acquire); // u64 phys. Basis (peek_u64 nimmt u64)
+    let observe = |n: u32| {
+        for _ in 0..n {
+            invoke(sys::YIELD, 0, [0; 4], 0);
+        }
+    };
+    // 1. Ziel läuft? (Zähler wächst über das Beobachtungsfenster)
+    let a = peek_u64(f);
+    observe(PDCTL_YIELD_OBS);
+    let b = peek_u64(f);
+    PDCTL_RAN.store(b > a, Ordering::Release);
+    // 2. PAUSE -> eingefroren
+    let rp = invoke(sys::PDCTL, PDCTL_CTRL_SLOT, [pdctl::PAUSE, 0, 0, 0], 0);
+    let c = peek_u64(f);
+    observe(PDCTL_YIELD_OBS);
+    let d = peek_u64(f);
+    PDCTL_FROZE.store(rp.result == result::OK && d == c, Ordering::Release);
+    // 3. RESUME -> wächst wieder
+    let _ = invoke(sys::PDCTL, PDCTL_CTRL_SLOT, [pdctl::RESUME, 0, 0, 0], 0);
+    let e = peek_u64(f);
+    observe(PDCTL_YIELD_OBS);
+    let g = peek_u64(f);
+    PDCTL_RESUMED.store(g > e, Ordering::Release);
+    // 4. Negativ: ein Slot OHNE Cap -> ERR_BADCAP (Steuerung ist cap-gated)
+    let rn = invoke(sys::PDCTL, PDCTL_EMPTY_SLOT, [pdctl::PAUSE, 0, 0, 0], 0);
+    PDCTL_NOCAP.store(rn.result == result::ERR_BADCAP, Ordering::Release);
+    // 5. PAUSE (deplanen) dann STOP (beenden)
+    let _ = invoke(sys::PDCTL, PDCTL_CTRL_SLOT, [pdctl::PAUSE, 0, 0, 0], 0);
+    observe(PDCTL_YIELD_OBS); // sicherstellen, dass das Ziel deplaniert ist
+    let rs = invoke(sys::PDCTL, PDCTL_CTRL_SLOT, [pdctl::STOP, 0, 0, 0], 0);
+    PDCTL_STOPPED.store(rs.result == result::OK, Ordering::Release);
+    PDCTL_CTRL_DONE.store(true, Ordering::Release);
     loop {
         invoke(sys::PARK, 0, [0; 4], 0);
     }
@@ -2431,7 +2521,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -2461,6 +2551,7 @@ pub fn demo_report_then_idle() -> ! {
                 IPCFUZZ_DONE.load(Ordering::Acquire) && IPCFUZZ_OK.load(Ordering::Acquire),
                 CAPLK_DONE.load(Ordering::Acquire) && CAPLK_OK.load(Ordering::Acquire),
                 DOMAIN_DONE.load(Ordering::Acquire) && DOMAIN_OK.load(Ordering::Acquire),
+                PDCTL_DONE.load(Ordering::Acquire) && PDCTL_OK.load(Ordering::Acquire),
             );
         }
         // Beendete Threads einsammeln (sicher: läuft auf dem Idle-Stack).
@@ -3041,6 +3132,79 @@ pub fn demo_report_then_idle() -> ! {
             DOMAIN_DONE.store(true, Ordering::Release);
         }
 
+        // UserLand-Management (ext-22, P2): cap-gated SYS_PDCTL. Gegate auf domain fertig.
+        // Lazy-Setup + Controller/Ziel auf core 0 (kooperativ via YIELD).
+        if !PDCTL_DONE.load(Ordering::Acquire) && DOMAIN_DONE.load(Ordering::Acquire) {
+            match PDCTL_STEP.load(Ordering::Acquire) {
+                0 => {
+                    // Zähler-Frame + UserLand-Ziel-PD + TrustedSas-Controller-PD + Caps.
+                    if let Some(frame) = system::alloc(PDCTL_FRAME_SIZE, PDCTL_FRAME_SIZE) {
+                        let fbase = frame.region().base;
+                        poke_u64(fbase, 0);
+                        if let Ok(root) = system::cap_install(frame) {
+                            if let (Ok(wcap), Some(tpd), Some(cpd)) = (
+                                system::cap_mint(root, Rights::WRITE, 0),
+                                system::create_pd_in_domain(Domain::UserLand),
+                                system::create_pd_in_domain(Domain::TrustedSas),
+                            ) {
+                                system::install_pd_cap(tpd, 0, wcap); // Frame-Cap -> Ziel Slot 0
+                                if let Ok(ctrl) = system::install_pd_control_cap(tpd, Rights::WRITE)
+                                {
+                                    system::install_pd_cap(cpd, PDCTL_CTRL_SLOT as usize, ctrl);
+                                }
+                                // Policy-Negativtest: eine PdControl-Cap in die UserLand-Ziel-PD
+                                // zu installieren MUSS abgelehnt werden (Cap-Typ-Policy).
+                                if let Ok(ctrl2) =
+                                    system::install_pd_control_cap(tpd, Rights::WRITE)
+                                {
+                                    let denied = !system::install_pd_cap(tpd, 7, ctrl2);
+                                    PDCTL_POLICY.store(denied, Ordering::Release);
+                                }
+                                PDCTL_FRAME.store(fbase, Ordering::Release);
+                                PDCTL_TARGET_PD.store(tpd, Ordering::Relaxed);
+                                PDCTL_CTRL_PD.store(cpd, Ordering::Relaxed);
+                                PDCTL_STEP.store(1, Ordering::Release);
+                            }
+                        }
+                    }
+                }
+                1 => {
+                    // Ziel (isoliert) + Controller (EL1) ATOMAR erzeugen, damit das Ziel nicht
+                    // vor dem Controller die CPU monopolisiert; beide core 0, prio 3, kooperativ.
+                    let fbase = PDCTL_FRAME.load(Ordering::Acquire) as usize;
+                    hal::cpu::local_irq_disable();
+                    if let Some((t, _)) =
+                        system::spawn_isolated(pdctl_target as *const () as usize, fbase, 3)
+                    {
+                        system::bind_pd(PDCTL_TARGET_PD.load(Ordering::Relaxed), t);
+                        PDCTL_TARGET_TID.store(t.to_raw(), Ordering::Relaxed);
+                    }
+                    if let Some(c) = system::spawn_on_core(
+                        0,
+                        pdctl_controller as *const () as usize,
+                        0,
+                        3,
+                    ) {
+                        system::bind_pd(PDCTL_CTRL_PD.load(Ordering::Relaxed), c);
+                    }
+                    hal::cpu::local_irq_enable();
+                    PDCTL_STEP.store(2, Ordering::Release);
+                }
+                _ => {
+                    if PDCTL_CTRL_DONE.load(Ordering::Acquire) {
+                        let ok = PDCTL_RAN.load(Ordering::Acquire)
+                            && PDCTL_FROZE.load(Ordering::Acquire)
+                            && PDCTL_RESUMED.load(Ordering::Acquire)
+                            && PDCTL_NOCAP.load(Ordering::Acquire)
+                            && PDCTL_POLICY.load(Ordering::Acquire)
+                            && PDCTL_STOPPED.load(Ordering::Acquire);
+                        PDCTL_OK.store(ok, Ordering::Release);
+                        PDCTL_DONE.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+
         // Audit-Regression B (MCS-Stranding): budgetierten Worker auf STRAND_CORE
         // erschöpfen lassen, dann erneut binden -> er muss WIEDER laufen (Fix). Gegate
         // auf MCS fertig + SMP fertig (STRAND_CORE frei). Tick-basiert (anderer Kern).
@@ -3190,9 +3354,12 @@ fn all_done() -> bool {
     let caplk = CAPLK_DONE.load(Ordering::Acquire) && CAPLK_OK.load(Ordering::Acquire);
     // Sicherheitsdomänen: Domänen-Policy-Oracle konsistent + Domänen round-trippen.
     let domain = DOMAIN_DONE.load(Ordering::Acquire) && DOMAIN_OK.load(Ordering::Acquire);
+    // UserLand-Management: cap-gated SYS_PDCTL (PAUSE/RESUME/STOP + cap-/policy-Negativ).
+    let pdctl = PDCTL_DONE.load(Ordering::Acquire) && PDCTL_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
+        && pdctl
 }
 
 fn report() {
@@ -3553,5 +3720,16 @@ fn report() {
     println!(
         "domain  : {} (Domaenen-Policy: Cap-Typen je Domaene + untrusted Domaenen sind isoliert)",
         if domain { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // UserLand-Management (ext-22, P2): cap-gated SYS_PDCTL.
+    let pdctl = PDCTL_DONE.load(Ordering::Acquire) && PDCTL_OK.load(Ordering::Acquire);
+    println!("pdctl   : Controller steuert UserLand-Ziel: lief={} PAUSE-eingefroren={} RESUME-waechst={} leerer-Slot-ERR_BADCAP={} PdControl-in-UserLand-denied={} STOP={}",
+        PDCTL_RAN.load(Ordering::Acquire), PDCTL_FROZE.load(Ordering::Acquire),
+        PDCTL_RESUMED.load(Ordering::Acquire), PDCTL_NOCAP.load(Ordering::Acquire),
+        PDCTL_POLICY.load(Ordering::Acquire), PDCTL_STOPPED.load(Ordering::Acquire));
+    println!(
+        "pdctl   : {} (Management-Cap PdControl: nur TrustedSas steuert nur UserLand, jede Op cap-gated)",
+        if pdctl { "ALL PASS" } else { "FAILURES" }
     );
 }

@@ -30,6 +30,27 @@ pub mod sys {
     pub const MAP: u64 = 10;
     /// Einen zuvor gemappten Frame wieder aus der eigenen VSpace entfernen.
     pub const UNMAP: u64 = 11;
+    /// **PD-Management** (ext-22): Lifecycle einer Ziel-PD steuern, gated auf eine
+    /// `PdControl`-Cap (WRITE). Die Sub-Operation steht in `x2` (s. [`pdctl`]), Argumente
+    /// in `x3`..`x5`. Nur eine TrustedSas-PD darf eine UserLand-PD so steuern.
+    pub const PDCTL: u64 = 12;
+    // Reserviert für künftige Hardware-Cap-Syscalls (DMA o. Ä.): 13.. — bewusst Platz
+    // gelassen, damit DMA-Erweiterungen die ABI nicht verschieben (ext-22-Nachtrag).
+}
+
+/// Sub-Operationen für [`sys::PDCTL`] (Register `x2`). Jede ist auf den Besitz der
+/// `PdControl`-Cap für die Ziel-PD beschränkt.
+pub mod pdctl {
+    /// Ziel-PD starten (initial blockierten Haupt-Thread wecken).
+    pub const START: u64 = 0;
+    /// Ziel-PD stoppen (Thread beenden + isolierte Ressourcen abbauen).
+    pub const STOP: u64 = 1;
+    /// Ziel-PD pausieren (Thread blockieren, ohne ihn zu beenden).
+    pub const PAUSE: u64 = 2;
+    /// Pausierte Ziel-PD fortsetzen (Thread entblocken).
+    pub const RESUME: u64 = 3;
+    /// Der Ziel-PD ein CPU-Budget zuweisen (Arg: SchedContext-Cap-Slot in `x3`).
+    pub const ASSIGN_BUDGET: u64 = 4;
 }
 
 /// Anzahl der Nachrichten-Datenwörter (Register `x2`..`x5`).

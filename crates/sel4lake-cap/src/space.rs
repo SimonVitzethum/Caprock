@@ -166,6 +166,12 @@ impl CapSpace {
         self.install(ObjectKind::Reply { ep, caller }, rights)
     }
 
+    /// Eine **Management-Capability** (ext-22) einbringen: die Autorität, den Lifecycle der
+    /// Ziel-PD `pd` zu steuern (`SYS_PDCTL`). Hält keinen Allokator-Speicher.
+    pub fn install_pd_control(&mut self, pd: u32, rights: Rights) -> Result<CapPtr, CapError> {
+        self.install(ObjectKind::PdControl { pd }, rights)
+    }
+
     /// Wurzel-Objekt + -Cap anlegen (gemeinsame Logik für alle Objekttypen).
     fn install(&mut self, kind: ObjectKind, rights: Rights) -> Result<CapPtr, CapError> {
         let obj = self.alloc_object(kind)?;

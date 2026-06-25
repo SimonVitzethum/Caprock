@@ -16,7 +16,7 @@
 //!
 //! Reine Orchestrierung — **kein eigenes `unsafe`**.
 
-use sel4lake_abi::{reg, result, sys};
+use sel4lake_abi::{pdctl, reg, result, sys};
 use sel4lake_cap::{CapPtr, CapSpace, ObjectKind};
 use sel4lake_hal::exception::{frame_reg, frame_set_reg};
 use sel4lake_ipc::{Endpoint, Notification, NENDPOINTS, NNOTIFICATIONS};
@@ -139,9 +139,9 @@ fn kind_is_hardware(_kind: ObjectKind) -> bool {
     false
 }
 
-/// Ist `kind` eine Management-Cap (`PdControl`)? (P1: noch nicht vorhanden -> `false`; P2 erweitert.)
-fn kind_is_pd_control(_kind: ObjectKind) -> bool {
-    false
+/// Ist `kind` eine Management-Cap (`PdControl`)? Diese darf nur eine TrustedSas-PD halten.
+fn kind_is_pd_control(kind: ObjectKind) -> bool {
+    matches!(kind, ObjectKind::PdControl { .. })
 }
 
 /// Darf eine PD der Domäne `domain` eine Cap des Typs `kind` halten?
@@ -451,6 +451,49 @@ pub fn dispatch(
                 ops.map_frame(thread, region.base, region.len, perm_code)
             } else {
                 ops.unmap_frame(thread, region.base, region.len)
+            };
+            frame_set_reg(frame, reg::SYSNO_RESULT, if ok { result::OK } else { result::ERR_BADCAP });
+            frame
+        }
+        sys::PDCTL => {
+            // PD-Management (ext-22): Lifecycle einer Ziel-PD steuern. Gated auf eine
+            // PdControl-Cap (WRITE) UND: der Aufrufer muss TrustedSas sein UND das Ziel
+            // muss UserLand sein (Defense-in-Depth — nur Trusted steuert nur Untrusted).
+            let ObjectKind::PdControl { pd: target } = kind else {
+                return deny(result::ERR_BADCAP);
+            };
+            if !rights.contains(Rights::WRITE) {
+                return deny(result::ERR_RIGHTS);
+            }
+            let target = target as usize;
+            let subop = frame_reg(frame, reg::MSG0); // x2 = Sub-Operation
+            // Domänen-Policy + Ziel-Thread unter CAPS.read auflösen (dann freigeben).
+            let target_tid = {
+                let g = caps.read();
+                if g.pds.domain_of(pd) != Some(Domain::TrustedSas) {
+                    return deny(result::ERR_RIGHTS);
+                }
+                if g.pds.domain_of(target) != Some(Domain::UserLand) {
+                    return deny(result::ERR_RIGHTS);
+                }
+                g.pds.thread_of(target)
+            };
+            let ok = match (subop, target_tid) {
+                (pdctl::PAUSE, Some(t)) => {
+                    ops.pause(t);
+                    true
+                }
+                // START und RESUME: einen (initial) blockierten Ziel-Thread wecken.
+                (pdctl::RESUME, Some(t)) | (pdctl::START, Some(t)) => {
+                    ops.unblock(t);
+                    true
+                }
+                (pdctl::STOP, Some(t)) => ops.stop(t),
+                (pdctl::PAUSE, None)
+                | (pdctl::RESUME, None)
+                | (pdctl::START, None)
+                | (pdctl::STOP, None) => false, // Ziel hat keinen Thread
+                _ => return deny(result::ERR_BADSYS), // unbekannte Sub-Operation
             };
             frame_set_reg(frame, reg::SYSNO_RESULT, if ok { result::OK } else { result::ERR_BADCAP });
             frame

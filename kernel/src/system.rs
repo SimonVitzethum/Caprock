@@ -223,6 +223,17 @@ impl SchedOps for KernelSched {
             hal::gic::send_sgi(target, hal::gic::IPI_RESCHED_INTID);
         }
     }
+    fn pause(&mut self, tid: ThreadId) {
+        let target = tid.core();
+        SCHEDS[target].lock().pause(tid);
+        // Läuft das Ziel gerade auf einem anderen Kern, per Reschedule-IPI deplanen.
+        if target != hal::cpu::core_id() {
+            hal::gic::send_sgi(target, hal::gic::IPI_RESCHED_INTID);
+        }
+    }
+    fn stop(&mut self, tid: ThreadId) -> bool {
+        kill_remote(tid) // cross-core kill + Teardown + Reschedule-IPI (nur wenn nicht laufend)
+    }
     fn on_tick(&mut self, core: usize, frame: usize) -> usize {
         // YIELD ist freiwillig -> verbraucht kein MCS-Budget (tick = false).
         SCHEDS[core].lock().on_tick(core, frame, false)
@@ -1146,6 +1157,13 @@ pub fn el0_syscall_seen() -> bool {
 /// Eine Tcb-Capability für einen Thread prägen (cap-kontrolliertes `KILL`).
 pub fn install_tcb_cap(tid: ThreadId, rights: Rights) -> Result<CapPtr, CapError> {
     CAPS.write().cspace.install_tcb(tid.to_raw(), rights)
+}
+
+/// Eine **Management-Capability** (`PdControl`, ext-22) für die Ziel-PD `pd` prägen: die
+/// Autorität, deren Lifecycle via `SYS_PDCTL` zu steuern. Nur eine TrustedSas-PD darf sie
+/// nutzen (im Dispatch geprüft); installiert wird sie cap-policy-geprüft (nur in TrustedSas).
+pub fn install_pd_control_cap(pd: usize, rights: Rights) -> Result<CapPtr, CapError> {
+    CAPS.write().cspace.install_pd_control(pd as u32, rights)
 }
 
 // --- MCS Scheduling Contexts (Budget-basiertes Scheduling) ---

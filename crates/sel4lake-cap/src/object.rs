@@ -30,6 +30,12 @@ pub enum ObjectKind {
     /// entblockt (Revocation eines ausstehenden Calls). Genau einer je Call,
     /// call-spezifisch (matcht nur, solange `ep` noch diesen `caller` hält).
     Reply { ep: u32, caller: u64 },
+    /// Eine **Management-Capability** (ext-22): die Autorität einer TrustedSas-PD, den
+    /// Lifecycle einer Ziel-PD `pd` (typisch UserLand) zu steuern — starten/stoppen/
+    /// pausieren/fortsetzen/Budget zuweisen/Cap übergeben/Reload (`SYS_PDCTL`). Nicht jede
+    /// TrustedSas-PD bekommt sie; sie ist die explizite Steuerungsberechtigung über genau
+    /// diese eine Ziel-PD. Hält keinen Allokator-Speicher (keine Finalisierung).
+    PdControl { pd: u32 },
 }
 
 /// Eintrag der Objekt-Tabelle.

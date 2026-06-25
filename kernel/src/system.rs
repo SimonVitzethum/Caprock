@@ -448,6 +448,13 @@ pub fn cap_used_slots() -> usize {
 pub fn cap_used_objects() -> usize {
     CAPS.lock().cspace.used_objects()
 }
+/// **CDT-/Refcount-Property-Oracle** (Fuzzer): `0` bei Konsistenz, sonst Anomalie-Code
+/// (s. `CapSpace::audit_cdt`). Sichert: keine verlorenen Objekte, keine negativen/
+/// falschen Refcounts, keine toten CDT-Knoten, keine Ableitung auf fremde Objekte,
+/// Baumform.
+pub fn cap_audit_cdt() -> u32 {
+    CAPS.lock().cspace.audit_cdt()
+}
 
 pub fn cap_install(cap: MemoryCap) -> Result<CapPtr, CapError> {
     CAPS.lock().cspace.install_memory(cap)
@@ -1237,6 +1244,11 @@ pub fn ipc_audit() -> u32 {
         if code != 0 {
             return 10 + code;
         }
+    }
+    // CDT-/Refcount-Property (Cap-Churn-Events des IPC-Fuzzers laufen während IPC).
+    let cdt = CAPS.lock().cspace.audit_cdt();
+    if cdt != 0 {
+        return 20 + cdt;
     }
     0
 }

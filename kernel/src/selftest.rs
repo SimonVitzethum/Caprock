@@ -120,6 +120,8 @@ fn captest() {
     let ri = mm::cap_inspect(root).expect("inspect");
     check(p, ri.refcount == 4, "refcount 4 nach copy/mint/copy", &mut fail);
     check(p, ri.child_count == 2, "Wurzel hat 2 Kinder", &mut fail);
+    // CDT-/Refcount-Property bei voll abgeleitetem Baum (deterministisch).
+    check(p, mm::cap_audit_cdt() == 0, "CDT konsistent (abgeleiteter Baum)", &mut fail);
 
     let c2i = mm::cap_inspect(c2).expect("inspect c2");
     check(
@@ -173,9 +175,14 @@ fn captest() {
         &mut fail,
     );
 
+    // CDT konsistent nach revoke (nur noch die Wurzel + ihr Objekt).
+    check(p, mm::cap_audit_cdt() == 0, "CDT konsistent nach revoke", &mut fail);
+
     // delete der Wurzel -> Finalisierung -> Speicherrueckgabe.
     mm::cap_delete(root).expect("delete root");
     check(p, mm::cap_inspect(root).is_none(), "Wurzel-Handle nach delete ungueltig", &mut fail);
+    // CDT konsistent nach vollstaendigem Teardown (leer).
+    check(p, mm::cap_audit_cdt() == 0, "CDT konsistent nach Teardown", &mut fail);
     check(
         p,
         mm::total_free() == free_before,

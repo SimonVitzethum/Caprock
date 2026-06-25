@@ -252,6 +252,111 @@ impl CapSpace {
         self.objects.iter().filter(|o| o.used).count()
     }
 
+    /// **Property-Oracle des Capability-Systems** (read-only). Prüft die strukturellen
+    /// Invarianten des CDT + der Refcounts und gibt `0` bei Konsistenz zurück, sonst
+    /// einen Anomalie-Code:
+    /// 1 = ein belegter Slot verweist auf ein **nicht belegtes** Objekt (toter CDT-Knoten),
+    /// 2 = `refcount` eines Objekts stimmt **nicht** mit der Anzahl auf es zeigender Slots
+    ///     überein (negativer/zu hoher Refcount),
+    /// 3 = belegtes Objekt ohne lebende Cap **oder** unbelegtes Objekt mit lebenden Caps
+    ///     (verlorenes/inkonsistentes Objekt),
+    /// 4 = Eltern-Verkettung kaputt (Eltern-Slot unbelegt / anderes Objekt / Kind nicht in
+    ///     der Kinderliste — Rechteeskalation/Ableitung verletzt),
+    /// 5 = Geschwister-Verkettung nicht reziprok,
+    /// 6 = `first_child`-Verkettung kaputt (Kind unbelegt / falsches `parent`),
+    /// 7 = Zyklus bzw. überlange Kette (CDT nicht baumförmig).
+    /// Damit abgesichert: keine verlorenen Objekte, keine negativen Refcounts, keine toten
+    /// CDT-Knoten, keine Ableitung auf ein fremdes Objekt (Rechteeskalation), Baumform.
+    pub fn audit_cdt(&self) -> u32 {
+        // (1)+(2)+(3): Refcount == Anzahl belegter Slots, die auf das Objekt zeigen.
+        let mut refs = [0u32; NOBJECTS];
+        for s in 0..NSLOTS {
+            if !self.slots[s].used {
+                continue;
+            }
+            let obj = self.slots[s].object;
+            if obj >= NOBJECTS || !self.objects[obj].used {
+                return 1;
+            }
+            refs[obj] += 1;
+        }
+        for o in 0..NOBJECTS {
+            if self.objects[o].used {
+                if self.objects[o].refcount != refs[o] {
+                    return 2;
+                }
+                if refs[o] == 0 {
+                    return 3;
+                }
+            } else if refs[o] != 0 {
+                return 3;
+            }
+        }
+        // (4)+(5)+(6): CDT-Verkettung konsistent; Ableitung teilt das Objekt.
+        for s in 0..NSLOTS {
+            if !self.slots[s].used {
+                continue;
+            }
+            let m = self.slots[s].mdb;
+            if let Some(p) = m.parent {
+                if p >= NSLOTS || !self.slots[p].used || self.slots[p].object != self.slots[s].object
+                {
+                    return 4;
+                }
+                // s muss in der Kinderliste von p vorkommen.
+                let mut c = self.slots[p].mdb.first_child;
+                let mut found = false;
+                let mut steps = 0;
+                while let Some(ci) = c {
+                    if ci == s {
+                        found = true;
+                        break;
+                    }
+                    c = self.slots[ci].mdb.next_sibling;
+                    steps += 1;
+                    if steps > NSLOTS {
+                        return 7;
+                    }
+                }
+                if !found {
+                    return 4;
+                }
+            }
+            if let Some(c) = m.first_child {
+                if c >= NSLOTS || !self.slots[c].used || self.slots[c].mdb.parent != Some(s) {
+                    return 6;
+                }
+            }
+            if let Some(n) = m.next_sibling {
+                if n >= NSLOTS || !self.slots[n].used || self.slots[n].mdb.prev_sibling != Some(s) {
+                    return 5;
+                }
+            }
+            if let Some(pv) = m.prev_sibling {
+                if pv >= NSLOTS || !self.slots[pv].used || self.slots[pv].mdb.next_sibling != Some(s)
+                {
+                    return 5;
+                }
+            }
+        }
+        // (7): keine Zyklen in der Eltern-Kette.
+        for s in 0..NSLOTS {
+            if !self.slots[s].used {
+                continue;
+            }
+            let mut p = self.slots[s].mdb.parent;
+            let mut steps = 0;
+            while let Some(pi) = p {
+                steps += 1;
+                if steps > NSLOTS {
+                    return 7;
+                }
+                p = self.slots[pi].mdb.parent;
+            }
+        }
+        0
+    }
+
     /// Sicht auf einen Cap (oder `None` bei ungültigem Handle).
     pub fn inspect(&self, ptr: CapPtr) -> Option<CapInfo> {
         let slot = self.resolve(ptr).ok()?;

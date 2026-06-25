@@ -1156,6 +1156,11 @@ fn fuzz_check(base: &(u64, usize, usize, usize, usize, usize)) -> Option<u32> {
     if now.5 != base.5 {
         return Some(6);
     }
+    // CDT-/Refcount-Property nach dem Teardown (Code 20 + audit-Code, s. audit_cdt).
+    let cdt = system::cap_audit_cdt();
+    if cdt != 0 {
+        return Some(20 + cdt);
+    }
     None
 }
 
@@ -1357,6 +1362,14 @@ extern "C" fn fuzz_driver(_arg: usize) -> ! {
         for _ in 0..FUZZ_OPS_PER_EPOCH {
             fuzz_step(&mut s, &mut caps, &mut threads, &mut maps);
             FUZZ_OPS.fetch_add(1, Ordering::Relaxed);
+        }
+        // CDT-/Refcount-Property MITTEN in der Epoche (Caps maximal abgeleitet) prüfen —
+        // fängt Ableitungs-/Refcount-Fehler, die ein reiner Baseline-Vergleich verpasst.
+        let cdt = system::cap_audit_cdt();
+        if cdt != 0 {
+            FUZZ_FAIL.store(40 + cdt, Ordering::Release); // 40+ = mid-epoch CDT-Bruch
+            ok = false;
+            break;
         }
         fuzz_teardown(&mut caps, &mut threads, &mut maps);
         while system::reap() > 0 {}

@@ -323,6 +323,19 @@ static DMA_STEP: AtomicU32 = AtomicU32::new(0);
 static DMA_DONE: AtomicBool = AtomicBool::new(false);
 static DMA_OK: AtomicBool = AtomicBool::new(false);
 
+// PCIe-Enumeration (ext-23, D1): das DMA-Beweisgerät virtio-rng-pci ueber ECAM finden,
+// BAR zuweisen, Memory-Space + Bus-Master aktivieren, RID (= SMMU-StreamID) bestimmen. Reines
+// kernel-/Trusted-Setup (kein User-Pfad). Die SMMU uebersetzt nur PCIe -> das Geraet MUSS
+// virtio-rng-PCI sein. Negativ: Suche nach einem Bogus-Vendor liefert nichts.
+static PCIE_VENDOR: AtomicU32 = AtomicU32::new(0);
+static PCIE_DEVICE: AtomicU32 = AtomicU32::new(0);
+static PCIE_RID: AtomicU32 = AtomicU32::new(u32::MAX);
+static PCIE_BAR: AtomicU64 = AtomicU64::new(0);
+static PCIE_BM: AtomicBool = AtomicBool::new(false); // Bus-Master aktiviert
+static PCIE_NEG: AtomicBool = AtomicBool::new(false); // Bogus-Vendor -> nicht gefunden
+static PCIE_DONE: AtomicBool = AtomicBool::new(false);
+static PCIE_OK: AtomicBool = AtomicBool::new(false);
+
 // Domänen/HW-Fuzzer (ext-22, P6): churnt über viele Epochen Hardware-/Management-Caps gegen
 // die Domänen-Policy + CDT/VSpace-Oracles + Ressourcen-Baseline. Kernpunkte: HW-Caps (MMIO/
 // IRQ) NUR in HardwareLand, PdControl NUR in TrustedSas installierbar (Negativfälle abgelehnt);
@@ -2879,7 +2892,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} hwfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} hwfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -2914,6 +2927,7 @@ pub fn demo_report_then_idle() -> ! {
                 RTC_DONE.load(Ordering::Acquire) && RTC_OK.load(Ordering::Acquire),
                 IRQT_DONE.load(Ordering::Acquire) && IRQT_OK.load(Ordering::Acquire),
                 DMA_DONE.load(Ordering::Acquire) && DMA_OK.load(Ordering::Acquire),
+                PCIE_DONE.load(Ordering::Acquire) && PCIE_OK.load(Ordering::Acquire),
                 HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire),
             );
         }
@@ -3921,9 +3935,37 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // PCIe-Enumeration (ext-23, D1): synchrones kernel-/Trusted-Setup, ein Schritt.
+        // Gegate auf dma fertig (sequenziell, vor den Fuzzern).
+        if !PCIE_DONE.load(Ordering::Acquire) && DMA_DONE.load(Ordering::Acquire) {
+            if let Some(d) = system::pcie_find_virtio() {
+                PCIE_VENDOR.store(d.vendor as u32, Ordering::Relaxed);
+                PCIE_DEVICE.store(d.device as u32, Ordering::Relaxed);
+                PCIE_RID.store(d.rid(), Ordering::Relaxed);
+                let bar = d.bars.iter().copied().find(|&b| b != 0).unwrap_or(0);
+                PCIE_BAR.store(bar, Ordering::Relaxed);
+                PCIE_BM.store(hal::pcie::bus_master_enabled(&d), Ordering::Relaxed);
+                // Negativ: Suche nach einem Bogus-Vendor liefert nichts (kein Seiteneffekt).
+                PCIE_NEG.store(
+                    hal::pcie::find_by_vendor(0xdead).is_none(),
+                    Ordering::Relaxed,
+                );
+                let ok = d.vendor == hal::pcie::VIRTIO_VENDOR
+                    && d.device != 0
+                    && bar != 0
+                    && PCIE_BM.load(Ordering::Relaxed)
+                    && PCIE_NEG.load(Ordering::Relaxed)
+                    && system::dma_audit() == 0;
+                PCIE_OK.store(ok, Ordering::Release);
+            }
+            // Auch bei "nicht gefunden" abschliessen (OK bleibt false -> sichtbarer FAIL,
+            // statt die Suite haengen zu lassen).
+            PCIE_DONE.store(true, Ordering::Release);
+        }
+
         // Domänen/HW-Fuzzer (ext-22, P6): churnt HW-/Management-Caps gegen Policy + Oracles +
-        // Baseline. Gegate auf DMA (ext-23) fertig; eine Epoche je Manager-Iteration.
-        if !HWFUZZ_DONE.load(Ordering::Acquire) && DMA_DONE.load(Ordering::Acquire) {
+        // Baseline. Gegate auf PCIe (ext-23) fertig; eine Epoche je Manager-Iteration.
+        if !HWFUZZ_DONE.load(Ordering::Acquire) && PCIE_DONE.load(Ordering::Acquire) {
             match HWFUZZ_STEP.load(Ordering::Acquire) {
                 0 => {
                     // Fixtures (eine PD je Domäne, ohne Threads) + Baseline schnappen.
@@ -4127,12 +4169,14 @@ fn all_done() -> bool {
     let irq = IRQT_DONE.load(Ordering::Acquire) && IRQT_OK.load(Ordering::Acquire);
     // DMA-Capability (ext-23): DmaCap + Normal-NC-Mapping + EL0-Round-Trip + Kohärenz + Audits.
     let dma = DMA_DONE.load(Ordering::Acquire) && DMA_OK.load(Ordering::Acquire);
+    // PCIe-Enumeration (ext-23): virtio-rng-pci gefunden, BAR + Bus-Master, RID = StreamID.
+    let pcie = PCIE_DONE.load(Ordering::Acquire) && PCIE_OK.load(Ordering::Acquire);
     // Domänen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Policy + Oracles + Baseline.
     let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
-        && pdctl && chan && rtc && irq && dma && hwfuzz
+        && pdctl && chan && rtc && irq && dma && pcie && hwfuzz
 }
 
 fn report() {
@@ -4545,6 +4589,17 @@ fn report() {
     println!(
         "dma     : {} (DmaCap hinter DmaEnforcer-Abstraktion: kernel-ausgeschnittene Region, nur HardwareLand, Normal-NC-Mapping, dma_audit)",
         if dma { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // PCIe-Enumeration (ext-23, D1): virtio-rng-pci finden, BAR + Bus-Master, RID = StreamID.
+    let pcie = PCIE_DONE.load(Ordering::Acquire) && PCIE_OK.load(Ordering::Acquire);
+    println!("pcie    : virtio-rng-pci gefunden: vendor=0x{:04x} device=0x{:04x} RID/StreamID=0x{:04x} BAR=0x{:08x} bus-master={} bogus-vendor-not-found={}",
+        PCIE_VENDOR.load(Ordering::Acquire), PCIE_DEVICE.load(Ordering::Acquire),
+        PCIE_RID.load(Ordering::Acquire), PCIE_BAR.load(Ordering::Acquire),
+        PCIE_BM.load(Ordering::Acquire), PCIE_NEG.load(Ordering::Acquire));
+    println!(
+        "pcie    : {} (ECAM-Enumeration + BAR-Zuweisung + Bus-Master; RID == SMMU-StreamID, kernel-/Trusted-Setup)",
+        if pcie { "ALL PASS" } else { "FAILURES" }
     );
 
     // Domänen/HW-Fuzzer (ext-22, P6).

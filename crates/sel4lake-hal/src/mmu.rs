@@ -774,6 +774,36 @@ pub fn vspace_device_wx_ok(l1_phys: u64) -> bool {
     true
 }
 
+/// Eine 1-GiB-**Device**-Region (EL1-only, nGnRnE, PXN|UXN) bei GiB-Index `gib` in die
+/// **globale** Kernel-Map einhängen — für kernel-seitigen Gerätezugriff jenseits der statisch
+/// gemappten GiB 0..8 (ext-23: PCIe-ECAM @256 GiB). Nur vom Primärkern aufzurufen; danach
+/// TLB-Broadcast (inner-shareable), damit alle Kerne den neuen Eintrag sehen. Idempotent.
+/// `false` bei out-of-range `gib` (39-bit VA -> 512 GiB) oder bereits belegtem Nicht-Block-
+/// Eintrag (würde eine bestehende Tabelle überschreiben).
+pub fn map_device_block_global(gib: usize) -> bool {
+    if gib >= 512 {
+        return false;
+    }
+    let l1 = table_mut(&L1_TABLE);
+    // Einen bestehenden Tabellen-Deskriptor NICHT überschreiben (kein Leak/Korruption).
+    if l1[gib] & 0b11 == TABLE_DESC {
+        return false;
+    }
+    l1[gib] = device_block(gib as u64 * ONE_GIB);
+    // SAFETY: globale L1-Tabelle aktualisiert; vollständiger inner-shareable TLB-Flush +
+    // Barrieren, damit der neue (zuvor ungültige) Eintrag auf allen Kernen sichtbar wird.
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags),
+        );
+    }
+    true
+}
+
 /// TLB-Einträge einer ASID invalidieren (nach map/unmap bzw. VSpace-Teardown).
 /// Global getaggte Kernel-/Code-Einträge bleiben gültig.
 pub fn flush_asid(asid: u16) {

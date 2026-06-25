@@ -1489,6 +1489,17 @@ pub fn dma_audit() -> u32 {
     0
 }
 
+// --- PCIe-Enumeration (ext-23, D1; kernel-/Trusted-Setup) ---
+
+/// Das DMA-Beweisgerät (`virtio-rng-pci`) per ECAM finden + einrichten: ECAM **global** als
+/// EL1-Device mappen (jenseits der statischen GiB 0..8), Bus 0 nach Vendor `0x1af4` scannen,
+/// BARs dimensionieren+zuweisen, Memory-Space + **Bus-Master** aktivieren. Gibt das Gerät
+/// (inkl. RID = SMMU-StreamID) zurück. Reines kernel-/Trusted-Setup — kein User-Pfad.
+pub fn pcie_find_virtio() -> Option<hal::pcie::PciDevice> {
+    hal::mmu::map_device_block_global(hal::pcie::ECAM_GIB);
+    hal::pcie::find_by_vendor(hal::pcie::VIRTIO_VENDOR)
+}
+
 /// Wie [`dma_audit`], aber mit explizit gewähltem `floor` (für den Bounds-Sensitivitätstest:
 /// ein zu hoher `floor` muss eine legitime Region als Out-of-Window melden).
 pub fn dma_audit_with_floor(floor: u64) -> u32 {

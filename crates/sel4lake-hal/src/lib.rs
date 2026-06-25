@@ -11,6 +11,7 @@ pub mod exception;
 pub mod fp;
 pub mod gic;
 pub mod mmu;
+pub mod pcie;
 pub mod psci;
 pub mod syscall;
 pub mod timer;

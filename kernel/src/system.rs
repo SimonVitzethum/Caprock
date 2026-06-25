@@ -1428,12 +1428,79 @@ impl DmaEnforcer for SmmuV3Enforcer {
         self.active.store(true, Ordering::Release);
         ok
     }
-    fn enable_dma(&self, _binding: &DmaBinding) -> bool {
-        // D3: STE/CD/Stage-1 für die StreamID, CMD_CFGI_STE + CMD_TLBI + CMD_SYNC.
-        self.active.load(Ordering::Acquire)
+    fn enable_dma(&self, binding: &DmaBinding) -> bool {
+        if !self.active.load(Ordering::Acquire) {
+            return false;
+        }
+        let strtab = self.strtab_phys.load(Ordering::Acquire);
+        let cmdq = self.cmdq_phys.load(Ordering::Acquire);
+        // Stage-1-Identitäts-Tabelle (nur die DMA-Region) + CD bauen.
+        let mut alloc = || SmmuV3Enforcer::alloc_zeroed(4096);
+        let Some(stage1_l1) =
+            hal::smmu::build_stage1_identity(binding.region.base, binding.region.len, &mut alloc)
+        else {
+            return false;
+        };
+        let Some(cd) = SmmuV3Enforcer::alloc_zeroed(hal::smmu::CD_BYTES) else {
+            return false;
+        };
+        hal::smmu::write_cd(cd, stage1_l1);
+        let ste = hal::smmu::build_ste_stage1(cd);
+        // STE installieren (CMD_CFGI_STE + CMD_TLBI + CMD_SYNC).
+        let prod = self.cmdq_prod.load(Ordering::Acquire);
+        let (next, ok) =
+            hal::smmu::write_ste_and_sync(strtab, cmdq, prod, binding.stream_id, &ste);
+        self.cmdq_prod.store(next, Ordering::Release);
+        if !ok {
+            return false;
+        }
+        // Bindung vermerken (freien Slot belegen).
+        for i in 0..NSMMU_BIND {
+            if SMMU_B_SID[i]
+                .compare_exchange(u32::MAX, binding.stream_id, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                SMMU_B_BASE[i].store(binding.region.base, Ordering::Release);
+                SMMU_B_LEN[i].store(binding.region.len, Ordering::Release);
+                SMMU_B_S1L1[i].store(stage1_l1, Ordering::Release);
+                SMMU_B_CD[i].store(cd, Ordering::Release);
+                return true;
+            }
+        }
+        false // kein Bindungs-Slot frei
     }
-    fn disable_dma(&self, _binding: &DmaBinding) {
-        // D3: STE invalidieren + CMD_TLBI + CMD_SYNC.
+    fn disable_dma(&self, binding: &DmaBinding) {
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
+        for i in 0..NSMMU_BIND {
+            if SMMU_B_SID[i].load(Ordering::Acquire) == binding.stream_id {
+                let strtab = self.strtab_phys.load(Ordering::Acquire);
+                let cmdq = self.cmdq_phys.load(Ordering::Acquire);
+                // STE invalidieren (V=0) + CMD_TLBI + CMD_SYNC: danach kann das Gerät NICHT mehr
+                // in die Region DMAen (vor VSpace-Unmap + free_region -> use-after-free-sicher).
+                let prod = self.cmdq_prod.load(Ordering::Acquire);
+                let (next, _) =
+                    hal::smmu::clear_ste_and_sync(strtab, cmdq, prod, binding.stream_id);
+                self.cmdq_prod.store(next, Ordering::Release);
+                // Stage-1-Tabellen + CD freigeben.
+                let s1l1 = SMMU_B_S1L1[i].load(Ordering::Acquire);
+                let cd = SMMU_B_CD[i].load(Ordering::Acquire);
+                {
+                    let mut mem = MEM.lock();
+                    hal::smmu::free_stage1(s1l1, &mut |p| {
+                        mem.free_region(PhysRegion::new(p, 4096));
+                    });
+                    mem.free_region(PhysRegion::new(cd, 4096));
+                }
+                SMMU_B_BASE[i].store(0, Ordering::Release);
+                SMMU_B_LEN[i].store(0, Ordering::Release);
+                SMMU_B_S1L1[i].store(0, Ordering::Release);
+                SMMU_B_CD[i].store(0, Ordering::Release);
+                SMMU_B_SID[i].store(u32::MAX, Ordering::Release);
+                return;
+            }
+        }
     }
     fn audit(&self) -> u32 {
         if !self.active.load(Ordering::Acquire) {
@@ -1452,6 +1519,21 @@ impl DmaEnforcer for SmmuV3Enforcer {
         self.active.load(Ordering::Acquire)
     }
 }
+
+// --- SMMU-Bindungstabelle (ext-23, D3): StreamID -> {Region, Stage-1-Tabelle, CD} ---
+// Modul-Statics (Muster IRQ-Bindungstabelle). Genutzt von `SmmuV3Enforcer::enable_dma/
+// disable_dma`/`audit` — pro gebundenem Gerät genau ein Eintrag.
+const NSMMU_BIND: usize = 4;
+#[allow(clippy::declare_interior_mutable_const)]
+static SMMU_B_SID: [AtomicU32; NSMMU_BIND] = [const { AtomicU32::new(u32::MAX) }; NSMMU_BIND];
+#[allow(clippy::declare_interior_mutable_const)]
+static SMMU_B_BASE: [AtomicU64; NSMMU_BIND] = [const { AtomicU64::new(0) }; NSMMU_BIND];
+#[allow(clippy::declare_interior_mutable_const)]
+static SMMU_B_LEN: [AtomicU64; NSMMU_BIND] = [const { AtomicU64::new(0) }; NSMMU_BIND];
+#[allow(clippy::declare_interior_mutable_const)]
+static SMMU_B_S1L1: [AtomicU64; NSMMU_BIND] = [const { AtomicU64::new(0) }; NSMMU_BIND];
+#[allow(clippy::declare_interior_mutable_const)]
+static SMMU_B_CD: [AtomicU64; NSMMU_BIND] = [const { AtomicU64::new(0) }; NSMMU_BIND];
 
 /// Der globale DMA-Enforcer. In ext-23 fest `SmmuV3Enforcer`; ein Wechsel (z.B. auf einen
 /// künftigen `NullIommuEnforcer`) tauscht nur diese Definition + den Accessor aus, ohne den
@@ -1549,6 +1631,26 @@ pub fn unmap_dma_from_thread(tid: ThreadId, phys: u64, len: u64) -> bool {
     }
     hal::mmu::flush_asid(asid);
     ok
+}
+
+/// Die hardwareseitige DMA-Durchsetzung für `(stream_id, [base,len))` aktivieren (D3): über den
+/// Enforcer eine STE -> CD -> Stage-1-Tabelle installieren (SMMU). `true` bei Erfolg.
+pub fn dma_enable(stream_id: u32, base: u64, len: u64) -> bool {
+    dma_enforcer().enable_dma(&DmaBinding {
+        stream_id,
+        region: PhysRegion::new(base, len),
+        backend_pd: 0,
+    })
+}
+
+/// Die Durchsetzung für `(stream_id, [base,len))` wieder entziehen (STE invalidieren +
+/// Stage-1-Tabelle/CD freigeben).
+pub fn dma_disable(stream_id: u32, base: u64, len: u64) {
+    dma_enforcer().disable_dma(&DmaBinding {
+        stream_id,
+        region: PhysRegion::new(base, len),
+        backend_pd: 0,
+    });
 }
 
 /// Eine DMA-Bindung **sicher abbauen** (Revoke-Reihenfolge, ext-23, DMA-use-after-free-sicher):

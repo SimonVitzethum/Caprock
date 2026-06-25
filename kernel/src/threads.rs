@@ -349,6 +349,18 @@ static SMMU_EVTQ: AtomicBool = AtomicBool::new(false); // Event-Queue leer
 static SMMU_DONE: AtomicBool = AtomicBool::new(false);
 static SMMU_OK: AtomicBool = AtomicBool::new(false);
 
+// SMMU-Bindung (ext-23, D3): enable_dma/disable_dma — eine STE -> CD -> Stage-1-Tabelle fuer die
+// StreamID der virtio-RNG installieren (bildet NUR die DMA-Region ab), dann wieder entziehen.
+// Strukturell: CFGI_STE/TLBI/SYNC laufen durch, Event-Queue bleibt leer, GERROR=0; die
+// Stage-1-/CD-Frames werden balanciert wieder freigegeben (total_free zurueck zur Baseline).
+// Die funktionale Uebersetzung + Out-of-Window-Fault wird in D4 bewiesen.
+static SMMUB_RID: AtomicU32 = AtomicU32::new(u32::MAX);
+static SMMUB_ENABLE: AtomicBool = AtomicBool::new(false); // enable_dma erfolgreich
+static SMMUB_EVTQ: AtomicBool = AtomicBool::new(false); // Event-Queue nach enable leer
+static SMMUB_BALANCED: AtomicBool = AtomicBool::new(false); // total_free nach disable = Baseline
+static SMMUB_DONE: AtomicBool = AtomicBool::new(false);
+static SMMUB_OK: AtomicBool = AtomicBool::new(false);
+
 // Domänen/HW-Fuzzer (ext-22, P6): churnt über viele Epochen Hardware-/Management-Caps gegen
 // die Domänen-Policy + CDT/VSpace-Oracles + Ressourcen-Baseline. Kernpunkte: HW-Caps (MMIO/
 // IRQ) NUR in HardwareLand, PdControl NUR in TrustedSas installierbar (Negativfälle abgelehnt);
@@ -2905,7 +2917,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} hwfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} hwfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -2942,6 +2954,7 @@ pub fn demo_report_then_idle() -> ! {
                 DMA_DONE.load(Ordering::Acquire) && DMA_OK.load(Ordering::Acquire),
                 PCIE_DONE.load(Ordering::Acquire) && PCIE_OK.load(Ordering::Acquire),
                 SMMU_DONE.load(Ordering::Acquire) && SMMU_OK.load(Ordering::Acquire),
+                SMMUB_DONE.load(Ordering::Acquire) && SMMUB_OK.load(Ordering::Acquire),
                 HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire),
             );
         }
@@ -3995,9 +4008,40 @@ pub fn demo_report_then_idle() -> ! {
             SMMU_DONE.store(true, Ordering::Release);
         }
 
+        // SMMU-Bindung (ext-23, D3): enable_dma/disable_dma fuer die virtio-RNG-StreamID auf die
+        // D0-DMA-Region. Synchrones Setup, ein Schritt. Gegate auf smmu fertig.
+        if !SMMUB_DONE.load(Ordering::Acquire) && SMMU_DONE.load(Ordering::Acquire) {
+            let rid = PCIE_RID.load(Ordering::Acquire);
+            let base = DMA_PHYS.load(Ordering::Acquire);
+            SMMUB_RID.store(rid, Ordering::Relaxed);
+            // IRQs aus -> saubere total_free-Messung (enable alloziert Stage-1-/CD-Frames,
+            // disable gibt sie wieder frei -> balanciert).
+            hal::cpu::local_irq_disable();
+            let free0 = system::total_free();
+            let en = system::dma_enable(rid, base, DMA_LEN);
+            SMMUB_ENABLE.store(en, Ordering::Release);
+            SMMUB_EVTQ.store(
+                system::smmu_eventq_empty() && system::smmu_gerror() == 0,
+                Ordering::Release,
+            );
+            let mid_audit = system::dma_audit();
+            system::dma_disable(rid, base, DMA_LEN);
+            let free1 = system::total_free();
+            hal::cpu::local_irq_enable();
+            SMMUB_BALANCED.store(free1 == free0, Ordering::Release);
+            let ok = en
+                && SMMUB_EVTQ.load(Ordering::Acquire)
+                && mid_audit == 0
+                && free1 == free0
+                && system::smmu_eventq_empty()
+                && system::dma_audit() == 0;
+            SMMUB_OK.store(ok, Ordering::Release);
+            SMMUB_DONE.store(true, Ordering::Release);
+        }
+
         // Domänen/HW-Fuzzer (ext-22, P6): churnt HW-/Management-Caps gegen Policy + Oracles +
-        // Baseline. Gegate auf SMMU (ext-23) fertig; eine Epoche je Manager-Iteration.
-        if !HWFUZZ_DONE.load(Ordering::Acquire) && SMMU_DONE.load(Ordering::Acquire) {
+        // Baseline. Gegate auf SMMU-Bindung (ext-23) fertig; eine Epoche je Manager-Iteration.
+        if !HWFUZZ_DONE.load(Ordering::Acquire) && SMMUB_DONE.load(Ordering::Acquire) {
             match HWFUZZ_STEP.load(Ordering::Acquire) {
                 0 => {
                     // Fixtures (eine PD je Domäne, ohne Threads) + Baseline schnappen.
@@ -4205,12 +4249,14 @@ fn all_done() -> bool {
     let pcie = PCIE_DONE.load(Ordering::Acquire) && PCIE_OK.load(Ordering::Acquire);
     // SMMUv3-Bring-up (ext-23): DmaEnforcer aktiv (CR0ACK), CMD_SYNC-Spike, Event-Queue leer.
     let smmu = SMMU_DONE.load(Ordering::Acquire) && SMMU_OK.load(Ordering::Acquire);
+    // SMMU-Bindung (ext-23): enable_dma/disable_dma (STE/CD/Stage-1), Event-Queue leer, balanciert.
+    let smmubind = SMMUB_DONE.load(Ordering::Acquire) && SMMUB_OK.load(Ordering::Acquire);
     // Domänen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Policy + Oracles + Baseline.
     let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
-        && pdctl && chan && rtc && irq && dma && pcie && smmu && hwfuzz
+        && pdctl && chan && rtc && irq && dma && pcie && smmu && smmubind && hwfuzz
 }
 
 fn report() {
@@ -4645,6 +4691,16 @@ fn report() {
     println!(
         "smmu    : {} (SMMUv3-Bring-up hinter DmaEnforcer: Command-/Event-Queue + lineare Stream-Tabelle, Default-Abort, CR0)",
         if smmu { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // SMMU-Bindung (ext-23, D3): STE/CD/Stage-1 installieren+entziehen, balanciert.
+    let smmubind = SMMUB_DONE.load(Ordering::Acquire) && SMMUB_OK.load(Ordering::Acquire);
+    println!("smmubind: enable_dma(StreamID=0x{:04x}) STE->CD->Stage-1 installiert={} Event-Queue-leer={} Stage-1/CD-Frames balanciert nach disable={}",
+        SMMUB_RID.load(Ordering::Acquire), SMMUB_ENABLE.load(Ordering::Acquire),
+        SMMUB_EVTQ.load(Ordering::Acquire), SMMUB_BALANCED.load(Ordering::Acquire));
+    println!(
+        "smmubind: {} (enable_dma/disable_dma: STE->CD->Stage-1 bildet NUR die DMA-Region ab; Revoke gibt Tabellen frei)",
+        if smmubind { "ALL PASS" } else { "FAILURES" }
     );
 
     // Domänen/HW-Fuzzer (ext-22, P6).

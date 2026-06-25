@@ -243,6 +243,128 @@ pub fn clear_ste_and_sync(strtab_phys: u64, cmdq_phys: u64, prod: u32, sid: u32)
     write_ste_and_sync(strtab_phys, cmdq_phys, prod, sid, &[0u64; 8])
 }
 
+// --- Stage-1-Übersetzung (D3): STE -> CD -> Stage-1-Pagetable ------------------------------
+//
+// Eine STE (Config = Stage-1) verweist auf einen **Context Descriptor** (CD); der CD enthält
+// TTB0 (Basis der Stage-1-Pagetable), TCR (T0SZ/TG0/...) und MAIR. Die Stage-1-Tabelle bildet
+// IOVA->PA ab. Wir mappen die DMA-Region **identitäts** (IOVA = PA) und lassen alles andere
+// ungemappt -> Translation-Fault (Event-Queue). Format = VMSAv8-64, 4-KiB-Granule, T0SZ=25
+// (39-bit, wie die CPU-MMU).
+
+// Stage-1-Deskriptor-Bits (AArch64), lokal (entkoppelt von mmu.rs).
+const S1_TABLE: u64 = 0b11;
+const S1_PAGE: u64 = 0b11;
+const S1_AF: u64 = 1 << 10;
+const S1_SH_INNER: u64 = 0b11 << 8;
+const S1_AP_RW: u64 = 0b01 << 6; // RW für EL0+EL1 (Geräte-Zugriff erlaubt)
+const S1_ATTR_NORMAL: u64 = 1 << 2; // MAIR-Index 1 = Normal WB
+const S1_ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
+const ONE_GIB: u64 = 1 << 30;
+const TWO_MIB: u64 = 2 * 1024 * 1024;
+const PAGE: u64 = 4096;
+
+/// Eine minimale **Stage-1-Identitäts-Pagetable** bauen, die ausschließlich `[base, base+len)`
+/// (4-KiB-granular) abbildet (Normal WB, RW); alles andere bleibt ungemappt -> Fault. `alloc`
+/// liefert genullte 4-KiB-Tabellen-Frames. Gibt die L1-Wurzel-Physadresse zurück (oder `None`).
+/// Unterstützt Regionen in **GiB 0..511** (39-bit IOVA), L1->L2->L3.
+pub fn build_stage1_identity(
+    base: u64,
+    len: u64,
+    alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Option<u64> {
+    if len == 0 || base % PAGE != 0 || len % PAGE != 0 {
+        return None;
+    }
+    let l1 = alloc()?; // genullt
+    let mut p = base;
+    while p < base + len {
+        let i1 = (p / ONE_GIB) as usize;
+        let l2 = walk_or_alloc(l1, i1, alloc)?;
+        let i2 = ((p % ONE_GIB) / TWO_MIB) as usize;
+        let l3 = walk_or_alloc(l2, i2, alloc)?;
+        let i3 = ((p % TWO_MIB) / PAGE) as usize;
+        // SAFETY: `l3` ist ein gültiger, identity-gemappter Tabellen-Frame; `i3` < 512.
+        unsafe {
+            let e = (l3 + (i3 as u64) * 8) as *mut u64;
+            core::ptr::write_volatile(e, p | S1_AF | S1_SH_INNER | S1_ATTR_NORMAL | S1_AP_RW | S1_PAGE);
+        }
+        p += PAGE;
+    }
+    cpu::dsb_sy();
+    Some(l1)
+}
+
+/// Tabelleneintrag `idx` in der Tabelle `table_phys` auflösen; existiert noch keine nächste
+/// Ebene, eine neue (genullte) anlegen und einhängen. Gibt die Physadresse der nächsten Ebene.
+fn walk_or_alloc(table_phys: u64, idx: usize, alloc: &mut dyn FnMut() -> Option<u64>) -> Option<u64> {
+    // SAFETY: `table_phys` ist ein gültiger Tabellen-Frame; `idx` < 512.
+    unsafe {
+        let e = (table_phys + (idx as u64) * 8) as *mut u64;
+        let cur = core::ptr::read_volatile(e);
+        if cur & 0b11 == S1_TABLE {
+            return Some(cur & S1_ADDR_MASK);
+        }
+        let next = alloc()?;
+        core::ptr::write_volatile(e, next | S1_TABLE);
+        Some(next)
+    }
+}
+
+/// Einen **Context Descriptor** (8 x u64) in den Frame `cd_phys` schreiben: Stage-1, 4-KiB-
+/// Granule, T0SZ=25 (39-bit), IPS=40-bit, TTB0 = `stage1_l1`, MAIR wie die CPU-MMU
+/// (attr0 Device, attr1 Normal-WB, attr2 Normal-NC). `cd_phys` muss 64-Byte-ausgerichtet sein.
+pub fn write_cd(cd_phys: u64, stage1_l1: u64) {
+    // word[0]: T0SZ=25, TG0=0, IR0=OR0=WB(0b01), SH0=inner(0b11), EPD1=1, V=1.
+    let w0: u64 = 25 | (0b01 << 8) | (0b01 << 10) | (0b11 << 12) | (1 << 30) | (1 << 31);
+    // word[1]: IPS=0b010 (40-bit), AA64=1 (Bit 9).
+    let w1: u64 = 0b010 | (1 << 9);
+    let cd0 = w0 | (w1 << 32);
+    let cd1 = stage1_l1 & S1_ADDR_MASK; // TTB0
+    let mair0: u64 = 0x00 | (0xFF << 8) | (0x44 << 16);
+    let cd3 = mair0; // MAIR0 (word[6]); MAIR1 (word[7]) = 0
+    let cd = [cd0, cd1, 0u64, cd3, 0, 0, 0, 0];
+    // SAFETY: `cd_phys` ist ein genullter, identity-gemappter 64-Byte-Bereich.
+    unsafe {
+        for (i, &w) in cd.iter().enumerate() {
+            core::ptr::write_volatile((cd_phys + (i as u64) * 8) as *mut u64, w);
+        }
+    }
+    cpu::dsb_sy();
+}
+
+/// Alle Tabellen-Frames einer per [`build_stage1_identity`] gebauten Stage-1-Tabelle einsammeln
+/// (L3s -> L2s -> L1) und über `free` zurückgeben (Teardown beim `disable_dma`). Mappt nur GiB
+/// 0..511, L1->L2->L3 wie der Builder.
+pub fn free_stage1(l1: u64, free: &mut dyn FnMut(u64)) {
+    // SAFETY: `l1` ist eine gültige, identity-gemappte Stage-1-L1-Tabelle (read-only Scan).
+    unsafe {
+        for i1 in 0..512usize {
+            let e1 = core::ptr::read_volatile((l1 + (i1 as u64) * 8) as *const u64);
+            if e1 & 0b11 != S1_TABLE {
+                continue;
+            }
+            let l2 = e1 & S1_ADDR_MASK;
+            for i2 in 0..512usize {
+                let e2 = core::ptr::read_volatile((l2 + (i2 as u64) * 8) as *const u64);
+                if e2 & 0b11 == S1_TABLE {
+                    free(e2 & S1_ADDR_MASK); // L3
+                }
+            }
+            free(l2);
+        }
+    }
+    free(l1);
+}
+
+/// Eine **STE** (8 x u64) für Stage-1-Übersetzung bauen, die auf den CD bei `cd_phys` zeigt.
+pub fn build_ste_stage1(cd_phys: u64) -> [u64; 8] {
+    // STE[0]: V=1, Config=0b101 (Stage-1), S1Fmt=0 (linear, 1 CD), S1ContextPtr = cd_phys[51:6].
+    let ste0 = (cd_phys & 0x000f_ffff_ffff_ffc0) | (0b101 << 1) | 1;
+    // STE[1]: S1CIR=WB(0b01), S1COR=WB(0b01), S1CSH=inner(0b11), S1STALLD=1 (kein Stall -> abort).
+    let ste1: u64 = (0b01 << 2) | (0b01 << 4) | (0b11 << 6) | (1 << 27);
+    [ste0, ste1, 0, 0, 0, 0, 0, 0]
+}
+
 /// Ist die Event-Queue leer (PROD == CONS)? (Keine Translation-Faults aufgezeichnet.)
 pub fn eventq_empty() -> bool {
     r32(EVENTQ_PROD) == r32(EVENTQ_CONS)

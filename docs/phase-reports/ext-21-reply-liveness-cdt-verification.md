@@ -127,9 +127,16 @@ Threads über KILL/EXIT/Reload/MCS-während-IPC.
 
 ## Verbleibende Restrisiken & Empfehlungen (nächste Härtungsstufe)
 
-1. **Voller first-class Reply-Cap** (eigene Objektart, per-PD-Slot, CDT-Revocation,
-   **Budget-Donation**) — der umgesetzte Owner-Token-Kern ist die Grundlage. *Offen
-   (großer Umbau, hohes Migrationsrisiko).*
+1. ✅ **ERLEDIGT** (first-class Reply-Cap + Budget-Donation): `ObjectKind::Reply {
+   ep, caller }` ist eine eigene Capability-Art, pro CALL geprägt (`reply_cap_for`/
+   `install_reply`), in CDT/Refcount/Finalisierung integriert. `cap_delete`/`cap_revoke`
+   finalisieren die Reply-Cap → der ausstehende CALL kehrt mit `ERR_SERVER_GONE` zurück
+   (lock-order-sicher via `ReplyFinal`-Kollektor + `abort_finalized_replies` nach
+   Lock-Freigabe; CAPS < EPS < SCHEDS bleibt gewahrt). **Budget-Donation** (intra-core
+   CALL, geteilter Scheduling-Context, Konto-Belastung + Refill-Umleitung) ist umgesetzt.
+   `ddon`/`rcap` prüfen beides, beide sensitivitätsgeprüft. **Restrisiko:** per-PD-
+   Reply-Slot + Server-Migration (Reply-Cap überlebt einen Server-Wechsel) noch nicht —
+   *offen (Migrationsrisiko)*.
 2. ✅ **ERLEDIGT** (Reload-/Quiesce-Pfad): `endpoint_quiesce_owner` entblockt einen
    ausstehenden Caller mit `ERR_SERVER_GONE`, wenn sein Reply-Owner via Hot-Reload
    zurückgezogen wird (Server lebt). In `reload_swap` integriert; `rgone` Runde 2
@@ -155,9 +162,22 @@ Threads über KILL/EXIT/Reload/MCS-während-IPC.
   + `reload_swap`-Integration; `rgone` um Runde 2 (Quiesce, Server lebt) erweitert.
 - **#5 VMM-Property-Walker** (Commit `28b2a6a`): W^X + Struktur-Walker, im Fuzzer
   integriert + sensitivitätsgeprüft.
+- **#1a Budget-Donation** (Commit `aeed8e3`): intra-core CALL teilt den Scheduling-
+  Context des Aufrufers; `on_tick` belastet das Aufrufer-Konto für die Server-Arbeit,
+  Refill leitet auf den Donee um, `end_donation` löst die Spende bei `reply()`. `ddon`
+  prüft 14 Konto-Erschöpfungen (>=6 erwartet). Sensitivität: `switch_to`-Spendenlink
+  entfernt → erkannt. Inert bei unbeschränktem Budget (keine Regression der Altpfade).
+- **#1b First-class Reply-Cap** (Commit `2d50d42`): `ObjectKind::Reply { ep, caller }`
+  als eigene Capability mit `reply_cap_for`/`install_reply`; Revocation via
+  `cap_delete`/`cap_revoke` → `ReplyFinal`-Kollektor → `abort_finalized_replies`
+  bricht den ausstehenden CALL nach Lock-Freigabe mit `ERR_SERVER_GONE` ab. `rcap`
+  prüft Prägen+Löschen einer Reply-Cap für einen ausstehenden Call (Ergebnis=5).
+  Sensitivität: Finalisierungs-Push deaktiviert → Client hängt → `== FAILURES ==`.
 
-**Ergebnis:** `./test-qemu.sh` = **ALL PASS (32 Checks, ~5 s)**. Reply-Liveness für
-Thread-Tod **und** Reload/Quiesce geschlossen + regressionsgetestet (2 Runden); CDT-/
+**Ergebnis:** `./test-qemu.sh` = **ALL PASS (34 Checks, ~5 s auf ruhigem Host)**.
+Reply-Liveness für Thread-Tod **und** Reload/Quiesce geschlossen + regressionsgetestet
+(2 Runden); zusätzlich ist die Reply-Berechtigung jetzt eine **erstklassige,
+revozierbare Capability** (`ObjectKind::Reply`) mit **MCS-Budget-Donation**. CDT-/
 Refcount- **und** VMM-W^X-Property-Oracles ergänzt + in die Fuzzer integriert +
 sensitivitätsgeprüft; Property-Invarianten je Subsystem (Cap/Scheduler/IPC/VMM/
 Ressourcen) durch Oracles abgesichert.

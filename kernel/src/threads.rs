@@ -301,6 +301,111 @@ static IRQT_STEP: AtomicU32 = AtomicU32::new(0);
 static IRQT_DONE: AtomicBool = AtomicBool::new(false);
 static IRQT_OK: AtomicBool = AtomicBool::new(false);
 
+// Domänen/HW-Fuzzer (ext-22, P6): churnt über viele Epochen Hardware-/Management-Caps gegen
+// die Domänen-Policy + CDT/VSpace-Oracles + Ressourcen-Baseline. Kernpunkte: HW-Caps (MMIO/
+// IRQ) NUR in HardwareLand, PdControl NUR in TrustedSas installierbar (Negativfälle abgelehnt);
+// nach jeder Epoche domain_audit/cap_audit_cdt/vspace_audit == 0 und Baseline wiederhergestellt
+// — insbesondere ändert das Löschen von MMIO/IRQ-Caps `total_free` NICHT (Geräte != RAM).
+const HWFUZZ_EPOCHS: u32 = 32;
+static HWFUZZ_TPD: AtomicUsize = AtomicUsize::new(usize::MAX); // TrustedSas-Fixture
+static HWFUZZ_HPD: AtomicUsize = AtomicUsize::new(usize::MAX); // HardwareLand-Fixture
+static HWFUZZ_UPD: AtomicUsize = AtomicUsize::new(usize::MAX); // UserLand-Fixture
+static HWFUZZ_BASE_OBJ: AtomicUsize = AtomicUsize::new(0); // Baseline belegter Cap-Objekte
+static HWFUZZ_BASE_FREE: AtomicU64 = AtomicU64::new(0); // Baseline freier RAM (total_free)
+static HWFUZZ_LCG: AtomicU64 = AtomicU64::new(0x1234_5678_9abc_def1); // deterministischer PRNG
+static HWFUZZ_EPOCH: AtomicU32 = AtomicU32::new(0);
+static HWFUZZ_FAIL: AtomicU32 = AtomicU32::new(0); // 0=ok, sonst Anomalie-Code
+static HWFUZZ_STEP: AtomicU32 = AtomicU32::new(0);
+static HWFUZZ_DONE: AtomicBool = AtomicBool::new(false);
+static HWFUZZ_OK: AtomicBool = AtomicBool::new(false);
+
+/// Deterministischer LCG-Schritt (kein `Math::random`; reproduzierbar über den Seed).
+fn hwfuzz_rand() -> u64 {
+    let mut x = HWFUZZ_LCG.load(Ordering::Relaxed);
+    x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    HWFUZZ_LCG.store(x, Ordering::Relaxed);
+    x >> 16
+}
+
+/// Eine Fuzzer-Epoche: HW-/Management-Caps mit variierenden Parametern prägen, gegen die
+/// Domänen-Policy installieren (richtige Domäne klappt, falsche wird abgelehnt), den CDT mit
+/// einer Kopie stressen, mitten in der Epoche die Oracles prüfen, dann alles abräumen und die
+/// Ressourcen-Baseline verifizieren. Gibt `0` zurück oder einen Anomalie-Code.
+fn hwfuzz_epoch(tpd: usize, hpd: usize, upd: usize, base_obj: usize, base_free: u64) -> u32 {
+    let phys = 0x0900_0000u64 + (hwfuzz_rand() % 64) * 0x1000; // variierende MMIO-Seite (GiB 0)
+    let intid = 40 + (hwfuzz_rand() % 64) as u32; // variierende SPI-INTID
+    let len = 0x1000u64 * (1 + hwfuzz_rand() % 4);
+    // 1. MMIO-Cap: NUR HardwareLand.
+    let mmio = match system::install_mmio_cap(phys, len, Rights::READ) {
+        Ok(c) => c,
+        Err(_) => return 1,
+    };
+    if !system::install_pd_cap(hpd, 5, mmio) {
+        return 2; // HardwareLand: muss klappen
+    }
+    if system::install_pd_cap(upd, 5, mmio) || system::install_pd_cap(tpd, 5, mmio) {
+        return 3; // UserLand/TrustedSas: HW-Cap muss abgelehnt werden
+    }
+    // 2. IRQ-Cap: NUR HardwareLand.
+    let irq = match system::install_irq_cap(intid, Rights::READ) {
+        Ok(c) => c,
+        Err(_) => return 5,
+    };
+    if !system::install_pd_cap(hpd, 6, irq) {
+        return 6;
+    }
+    if system::install_pd_cap(upd, 6, irq) {
+        return 7; // UserLand: IRQ-Cap muss abgelehnt werden
+    }
+    // 3. PdControl: NUR TrustedSas.
+    let pdc = match system::install_pd_control_cap(upd, Rights::WRITE) {
+        Ok(c) => c,
+        Err(_) => return 8,
+    };
+    if !system::install_pd_cap(tpd, 5, pdc) {
+        return 9; // TrustedSas: muss klappen (Slot 5 frei, da MMIO dort abgelehnt wurde)
+    }
+    if system::install_pd_cap(hpd, 7, pdc) || system::install_pd_cap(upd, 7, pdc) {
+        return 10; // HardwareLand/UserLand: PdControl muss abgelehnt werden
+    }
+    // 4. CDT mit einer HW-Cap-Kopie stressen.
+    let mmio2 = match system::cap_copy(mmio, Rights::READ) {
+        Ok(c) => c,
+        Err(_) => return 11,
+    };
+    if !system::install_pd_cap(hpd, 8, mmio2) {
+        return 12;
+    }
+    // 5. Mid-Epoch-Oracles.
+    if system::domain_audit() != 0 {
+        return 30;
+    }
+    if system::cap_audit_cdt() != 0 {
+        return 20;
+    }
+    if system::vspace_audit() != 0 {
+        return 40;
+    }
+    // 6. Abräumen -> Baseline. (Kind mmio2 VOR dem Elter mmio löschen.)
+    system::clear_pd_cap(hpd, 5);
+    system::clear_pd_cap(hpd, 6);
+    system::clear_pd_cap(hpd, 8);
+    system::clear_pd_cap(tpd, 5);
+    let _ = system::cap_delete(mmio2);
+    let _ = system::cap_delete(mmio);
+    let _ = system::cap_delete(irq);
+    let _ = system::cap_delete(pdc);
+    // 7. Baseline: keine Objekt-Leaks UND — kritisch — `total_free` unveraendert (das Loeschen
+    // von MMIO/IRQ-Caps darf den RAM-Allokator NICHT anfassen; Geraet != RAM).
+    if system::cap_used_objects() != base_obj {
+        return 50;
+    }
+    if system::total_free() != base_free {
+        return 60;
+    }
+    0
+}
+
 // Audit-Regression B (Scheduler/MCS): `set_budget`/`bind_sched_context` auf einen
 // ERSCHÖPFTEN Thread darf ihn nicht stranden (Fund: `depleted` gelöscht ohne
 // `enqueue_ready` -> Thread nie wieder einplanbar, belegter Slot -> DoS + Leak-
@@ -2704,7 +2809,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} hwfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -2738,6 +2843,7 @@ pub fn demo_report_then_idle() -> ! {
                 CHAN_DONE.load(Ordering::Acquire) && CHAN_OK.load(Ordering::Acquire),
                 RTC_DONE.load(Ordering::Acquire) && RTC_OK.load(Ordering::Acquire),
                 IRQT_DONE.load(Ordering::Acquire) && IRQT_OK.load(Ordering::Acquire),
+                HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire),
             );
         }
         // Beendete Threads einsammeln (sicher: läuft auf dem Idle-Stack).
@@ -3648,6 +3754,52 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // Domänen/HW-Fuzzer (ext-22, P6): churnt HW-/Management-Caps gegen Policy + Oracles +
+        // Baseline. Gegate auf irq fertig; eine Epoche je Manager-Iteration.
+        if !HWFUZZ_DONE.load(Ordering::Acquire) && IRQT_DONE.load(Ordering::Acquire) {
+            match HWFUZZ_STEP.load(Ordering::Acquire) {
+                0 => {
+                    // Fixtures (eine PD je Domäne, ohne Threads) + Baseline schnappen.
+                    if let Some(tpd) = system::create_pd_in_domain(Domain::TrustedSas) {
+                        HWFUZZ_TPD.store(tpd, Ordering::Relaxed);
+                        if let Some((hpd, _, _)) = system::create_hardware_backend(tpd, 9) {
+                            HWFUZZ_HPD.store(hpd, Ordering::Relaxed);
+                        }
+                        if let Some(upd) = system::create_pd_in_domain(Domain::UserLand) {
+                            HWFUZZ_UPD.store(upd, Ordering::Relaxed);
+                        }
+                        HWFUZZ_BASE_OBJ.store(system::cap_used_objects(), Ordering::Relaxed);
+                        HWFUZZ_BASE_FREE.store(system::total_free(), Ordering::Relaxed);
+                        HWFUZZ_STEP.store(1, Ordering::Release);
+                    }
+                }
+                _ => {
+                    let e = HWFUZZ_EPOCH.load(Ordering::Acquire);
+                    if HWFUZZ_FAIL.load(Ordering::Acquire) == 0 && e < HWFUZZ_EPOCHS {
+                        let code = hwfuzz_epoch(
+                            HWFUZZ_TPD.load(Ordering::Relaxed),
+                            HWFUZZ_HPD.load(Ordering::Relaxed),
+                            HWFUZZ_UPD.load(Ordering::Relaxed),
+                            HWFUZZ_BASE_OBJ.load(Ordering::Relaxed),
+                            HWFUZZ_BASE_FREE.load(Ordering::Relaxed),
+                        );
+                        if code != 0 {
+                            HWFUZZ_FAIL.store(code, Ordering::Release);
+                        }
+                        HWFUZZ_EPOCH.store(e + 1, Ordering::Release);
+                    } else {
+                        HWFUZZ_OK.store(
+                            HWFUZZ_FAIL.load(Ordering::Acquire) == 0
+                                && e >= HWFUZZ_EPOCHS
+                                && system::domain_audit() == 0,
+                            Ordering::Release,
+                        );
+                        HWFUZZ_DONE.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+
         // Audit-Regression B (MCS-Stranding): budgetierten Worker auf STRAND_CORE
         // erschöpfen lassen, dann erneut binden -> er muss WIEDER laufen (Fix). Gegate
         // auf MCS fertig + SMP fertig (STRAND_CORE frei). Tick-basiert (anderer Kern).
@@ -3710,7 +3862,7 @@ pub fn demo_report_then_idle() -> ! {
             && MCS_DONE.load(Ordering::Acquire)
             && STALE_DONE.load(Ordering::Acquire)
             && STRAND_DONE.load(Ordering::Acquire)
-            && IRQT_DONE.load(Ordering::Acquire) // ext-22-Tests zuerst (frisches Frühregime)
+            && HWFUZZ_DONE.load(Ordering::Acquire) // ext-22-Tests zuerst (frisches Frühregime)
         {
             if system::spawn_on_core(0, fuzz_driver as *const () as usize, 0, 2).is_some() {
                 fuzz_spawned = true;
@@ -3806,10 +3958,12 @@ fn all_done() -> bool {
     let rtc = RTC_DONE.load(Ordering::Acquire) && RTC_OK.load(Ordering::Acquire);
     // RTC-IRQ: IRQ-Cap + GIC-SPI-Routing + Deferred-IRQ-Zustellung an das HardwareLand-Backend.
     let irq = IRQT_DONE.load(Ordering::Acquire) && IRQT_OK.load(Ordering::Acquire);
+    // Domänen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Policy + Oracles + Baseline.
+    let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
-        && pdctl && chan && rtc && irq
+        && pdctl && chan && rtc && irq && hwfuzz
 }
 
 fn report() {
@@ -4212,5 +4366,14 @@ fn report() {
     println!(
         "irq     : {} (IRQ-Cap + GICD_ITARGETSR-Routing + Deferred-Signal: Geraete-IRQ als Notification an HardwareLand, lock-/deadlock-frei)",
         if irq { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Domänen/HW-Fuzzer (ext-22, P6).
+    let hwf_fail = HWFUZZ_FAIL.load(Ordering::Acquire);
+    let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
+    println!("hwfuzz  : {} Epochen HW-/Management-Cap-Churn gegen Domaenen-Policy + CDT/VSpace-Oracle + Baseline; Anomalie-Code={hwf_fail} (0=keine)", HWFUZZ_EPOCH.load(Ordering::Acquire));
+    println!(
+        "hwfuzz  : {} (HW-Caps nur HardwareLand, PdControl nur TrustedSas, MMIO/IRQ-Delete fasst RAM-Allokator nicht an, Audits stets 0)",
+        if hwfuzz { "ALL PASS" } else { "FAILURES" }
     );
 }

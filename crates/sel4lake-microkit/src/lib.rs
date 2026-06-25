@@ -24,7 +24,7 @@ use sel4lake_mem::Rights;
 use sel4lake_sched::{SchedOps, ThreadId};
 use sel4lake_sync::{RwSpinLock, SpinLock};
 
-const NPDS: usize = 64;
+const NPDS: usize = 96;
 /// Cap-Slots je PD-Cspace.
 const NCAPS: usize = 16;
 

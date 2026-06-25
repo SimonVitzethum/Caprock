@@ -1394,6 +1394,14 @@ extern "C" fn fuzz_driver(_arg: usize) -> ! {
             ok = false;
             break;
         }
+        // VMM-Property MITTEN in der Epoche (isolierte VSpaces + Mappings aktiv) prüfen:
+        // W^X + Struktur der Seitentabellen (Code 60+).
+        let vmm = system::vspace_audit();
+        if vmm != 0 {
+            FUZZ_FAIL.store(60 + vmm, Ordering::Release);
+            ok = false;
+            break;
+        }
         fuzz_teardown(&mut caps, &mut threads, &mut maps);
         while system::reap() > 0 {}
         if let Some(code) = fuzz_check(&base) {

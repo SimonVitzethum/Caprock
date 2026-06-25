@@ -651,6 +651,39 @@ pub fn free_vspaces() -> usize {
     VSPACES.lock().iter().filter(|v| !v.used).count()
 }
 
+/// **VMM-Property-Oracle** (read-only, Fuzzer): prüft jede belegte isolierte VSpace auf
+/// die **W^X-Invariante** (keine EL0-Seite schreibbar+ausführbar) und strukturelle
+/// Konsistenz (L3-Zeiger valide), sowie dass `l1`/`l2` belegter Einträge gesetzt sind.
+/// Gibt `0` bei Konsistenz zurück, sonst: 1=W^X-Verletzung, 2=struktureller Defekt
+/// (L3-Zeiger), 3=belegte VSpace ohne L1/L2 (inkonsistenter Slot). (ASID-Eindeutigkeit
+/// ist durch den VSPACES-Index = ASID-1 baulich garantiert.) Sperrt `VSPACES` kurz und
+/// liest die Tabellen über die Identity-Map.
+pub fn vspace_audit() -> u32 {
+    // l2-Adressen unter dem Lock einsammeln, dann ohne Lock walken (die Tabellen einer
+    // belegten VSpace werden nicht nebenläufig freigegeben, solange sie belegt ist).
+    let mut l2s: [u64; MAX_VSPACES] = [0; MAX_VSPACES];
+    let mut n = 0;
+    {
+        let t = VSPACES.lock();
+        for v in t.iter() {
+            if v.used {
+                if v.l1 == 0 || v.l2 == 0 {
+                    return 3;
+                }
+                l2s[n] = v.l2;
+                n += 1;
+            }
+        }
+    }
+    for &l2 in &l2s[..n] {
+        let code = hal::mmu::vspace_wx_ok(l2);
+        if code != 0 {
+            return code;
+        }
+    }
+    0
+}
+
 /// Anzahl belegter TCB-Slots auf `core` (für die Leak-Prüfung).
 pub fn used_tcbs(core: usize) -> usize {
     SCHEDS[core].lock().load()

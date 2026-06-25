@@ -339,6 +339,58 @@ fn user_code_block(addr: u64) -> u64 {
     addr | AF | SH_INNER | ATTR_NORMAL | AP_RO_EL0 | PXN | NG | BLOCK_DESC
 }
 
+/// Ist `desc` ein **gültiger** Deskriptor, der eine **EL0-zugängliche, schreibbare UND
+/// ausführbare** Seite/Block beschreibt — also eine **W^X-Verletzung**?
+/// EL0-Zugriff = Bit 6 gesetzt (AP_*_EL0); schreibbar = Bit 7 klar (AP[2]=0);
+/// EL0-ausführbar = `UXN` (Bit 54) klar.
+fn is_wx_violation(desc: u64) -> bool {
+    if desc & 0b1 == 0 {
+        return false; // ungültiger Eintrag
+    }
+    let el0 = (desc >> 6) & 1 == 1;
+    let writable = (desc >> 7) & 1 == 0;
+    let el0_exec = desc & UXN == 0;
+    el0 && writable && el0_exec
+}
+
+/// **VMM-Property-Walker** (read-only, Fuzzer-Oracle): durchläuft die GiB-1-L2-Tabelle
+/// `l2_phys` einer VSpace **und** alle daran hängenden L3-Tabellen und prüft die
+/// **W^X-Invariante** (keine EL0-Seite ist gleichzeitig schreibbar und ausführbar)
+/// sowie die Struktur (Tabellen-Deskriptoren zeigen 4-KiB-ausgerichtet in den
+/// RAM-Bereich). Gibt `0` bei Konsistenz zurück, sonst `1` (W^X-Verletzung) bzw. `2`
+/// (struktureller Defekt: L3-Zeiger außerhalb des RAM / unausgerichtet).
+pub fn vspace_wx_ok(l2_phys: u64) -> u32 {
+    let ram_end = RAM_BASE + (4u64 << 30); // 4 GiB RAM (großzügige Obergrenze)
+    // SAFETY: `l2_phys` ist eine gültige, identity-gemappte L2-Tabelle (512 Einträge).
+    let l2 = unsafe { core::slice::from_raw_parts(l2_phys as *const u64, 512) };
+    for &e in l2.iter() {
+        match e & 0b11 {
+            0b01 => {
+                // 2-MiB-Block direkt.
+                if is_wx_violation(e) {
+                    return 1;
+                }
+            }
+            0b11 => {
+                // Tabellen-Deskriptor -> L3. Zeiger validieren, dann Seiten prüfen.
+                let l3_phys = e & ADDR_MASK;
+                if l3_phys < RAM_BASE || l3_phys >= ram_end || l3_phys % PAGE != 0 {
+                    return 2;
+                }
+                // SAFETY: validierter, identity-gemappter L3-Frame (512 Einträge).
+                let l3 = unsafe { core::slice::from_raw_parts(l3_phys as *const u64, 512) };
+                for &p in l3.iter() {
+                    if is_wx_violation(p) {
+                        return 1;
+                    }
+                }
+            }
+            _ => {} // 0b00 = ungültig (z. B. Guard-/ungemappte Seite) -> ok
+        }
+    }
+    0
+}
+
 /// Die **Basis** einer isolierten VSpace in zwei frische 4-KiB-Frames bauen
 /// (`l1_phys` = Wurzel, `l2_phys` = L2 für GiB 1): Device (EL1-only), das Kernelimage
 /// über die **geteilte** Kernel-L3 (inkl. `.user_text` EL0-RX) und alles RAM

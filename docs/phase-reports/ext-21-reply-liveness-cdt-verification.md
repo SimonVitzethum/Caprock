@@ -146,8 +146,15 @@ Threads über KILL/EXIT/Reload/MCS-während-IPC.
    zurückgezogen wird (Server lebt). In `reload_swap` integriert; `rgone` Runde 2
    prüft es (Server lebt=true). **Restrisiko:** reine `cap_revoke` der Recv-Cap (ohne
    Reload-Pfad) ruft den Hook noch nicht automatisch (Cap-Finalisierung → IPC fehlt).
-3. **Globale CAPS-Sperre** serialisiert alle Cap-Lookups → IPC-Durchsatz-Engpass
-   (funktional + Skalierung); per-PD-Cap-Cache / feinere Cap-Locks. *Offen (Perf-Refactor).*
+3. ✅ **ERLEDIGT** (CAPS-Reader-Writer-Lock): die globale CAPS-Sperre ist jetzt ein
+   writer-bevorzugender `RwSpinLock`. Der heiße IPC-Lookup ist rein lesend und nimmt
+   CAPS nur **geteilt** (read) → parallele Cap-Auflösung auf verschiedenen Kernen; nur
+   die seltenen Mutationen (install/copy/mint/move/delete/revoke/grant/PD-Ops) sperren
+   exklusiv (write). Sperrordnung unverändert (read/write an derselben Position; REPLY+
+   GRANT nimmt write VOR EPS → CAPS<EPS gewahrt, kein read→write-Upgrade). `caplk` belegt
+   parallele Leser (Höchststand 2), sensitivitätsgeprüft. *Hinweis: der Durchsatz-Gewinn
+   selbst ist nur auf echter Multicore-HW messbar (single-threaded TCG serialisiert die
+   Kerne) — verknüpft mit #4; die Read-Parallelität ist hier dennoch deterministisch belegt.*
 4. **Echter Mehrstunden-Lauf** (Mio. Ops) auf realer HW / KVM statt TCG; + ein
    vereinheitlichter, gleichzeitiger Mega-Fuzzer mit gemeinsamer Baseline. *Offen
    (Umgebung + Baseline-Vereinheitlichung).*
@@ -177,6 +184,13 @@ Threads über KILL/EXIT/Reload/MCS-während-IPC.
   bricht den ausstehenden CALL nach Lock-Freigabe mit `ERR_SERVER_GONE` ab. `rcap`
   prüft Prägen+Löschen einer Reply-Cap für einen ausstehenden Call (Ergebnis=5).
   Sensitivität: Finalisierungs-Push deaktiviert → Client hängt → `== FAILURES ==`.
+- **#3 CAPS-Reader-Writer-Lock** (Commit `b649b4f`): neuer writer-bevorzugender
+  `RwSpinLock<T>` in sel4lake-sync; CAPS = `RwSpinLock<Caps>`. Heiße Lookups → read
+  (parallel), Mutationen → write (exklusiv). `microkit::dispatch` löst per read auf,
+  REPLY+GRANT nimmt write vor EPS. 21 Aufrufstellen klassifiziert (6 read / 15 write).
+  `caplk` (2 Sonden, Kern 1+2, Barriere im Read-Abschnitt): Höchststand gleichzeitiger
+  Leser = 2 (exklusiv wäre strukturell 1). Sensitivität: Sonde nimmt write → Höchststand
+  1 → `== FAILURES ==`. Korrektheit zusätzlich via 8-Kern-Fuzzer + CDT-Oracle.
 - **#1c Reply-Cap-Server-Migration** (Commit `d9737c9`): `Endpoint::
   migrate_owner` reiht den wartenden Aufrufer wieder als Sender ein + löscht
   caller/reply_owner → die nächste RECV-Instanz (v2) übernimmt dieselbe Nachricht aus
@@ -186,7 +200,7 @@ Threads über KILL/EXIT/Reload/MCS-während-IPC.
   kehrt mit OK + 5·7=35 zurück (statt `ERR_SERVER_GONE`). Sensitivität: migrate durch
   `endpoint_quiesce_owner` ersetzt → Client abgebrochen → `== FAILURES ==`.
 
-**Ergebnis:** `./test-qemu.sh` = **ALL PASS (35 Checks, ~5 s auf ruhigem Host)**.
+**Ergebnis:** `./test-qemu.sh` = **ALL PASS (36 Checks, ~5 s auf ruhigem Host)**.
 Reply-Liveness für Thread-Tod **und** Reload/Quiesce geschlossen + regressionsgetestet
 (2 Runden); zusätzlich ist die Reply-Berechtigung jetzt eine **erstklassige,
 revozierbare Capability** (`ObjectKind::Reply`) mit **MCS-Budget-Donation**. CDT-/

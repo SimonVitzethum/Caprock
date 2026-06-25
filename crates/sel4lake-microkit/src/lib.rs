@@ -28,6 +28,22 @@ const NPDS: usize = 64;
 /// Cap-Slots je PD-Cspace.
 const NCAPS: usize = 16;
 
+/// **Sicherheitsdomäne** einer Protection Domain (ext-22).
+///
+/// Drei kernel-getrennte Klassen mit erzwungenen Regeln (siehe `domain_audit`):
+/// - [`Domain::TrustedSas`]: läuft im globalen Adressraum (VSPACE_OF==0), nur
+///   speichersicheres Rust ohne `unsafe`. Treiber-/Protokolllogik. Default für alle
+///   bestehenden PDs (Rückwärtskompatibilität).
+/// - [`Domain::HardwareLand`]: isolierte VSpace, darf Hardware-Caps (MMIO/IRQ) halten,
+///   kleiner `unsafe`-Hardwarekern. Genau **ein** unveränderlicher Trusted-Partner.
+/// - [`Domain::UserLand`]: isolierte VSpace, **keinerlei** Hardware-Rechte.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Domain {
+    TrustedSas,
+    HardwareLand,
+    UserLand,
+}
+
 /// Cap-Management-Zustand hinter **einem** Lock (`CAPS` im Kernel): der globale
 /// Capability-Space + die Protection-Domain-Tabelle. Cap-Auflösung und -Verwaltung
 /// brauchen beides konsistent zusammen.
@@ -49,15 +65,111 @@ impl Caps {
             pds: PdTable::new(),
         }
     }
+
+    /// Eine Cap **policy-geprüft** in den Cspace einer PD eintragen: der Cap-Typ muss in
+    /// der Domäne der PD erlaubt sein (Hardware-Caps nur in HardwareLand, `PdControl` nur
+    /// in TrustedSas). Gibt `false` zurück (ohne Eintrag), wenn die Policy es verbietet.
+    /// Zentraler Enforcement-Punkt — alle Cap-Installationen sollten hierüber laufen.
+    pub fn install_cap_checked(&mut self, pd: usize, slot: usize, cap: CapPtr) -> bool {
+        let Some(domain) = self.pds.domain_of(pd) else {
+            return false;
+        };
+        let Some((kind, _, _)) = self.cspace.lookup(cap) else {
+            return false;
+        };
+        if !domain_allows_kind(domain, kind) {
+            return false;
+        }
+        self.pds.install_cap(pd, slot, cap);
+        true
+    }
+
+    /// **Domänen-Policy-Oracle** (ext-22). `0` = konsistent, sonst Anomalie-Code:
+    /// - `1` = Hardware-Cap (MMIO/IRQ/DMA) in einer Nicht-HardwareLand-PD.
+    /// - `2` = `PdControl`-Cap in einer Nicht-TrustedSas-PD.
+    /// - `3` = Isolations-Verletzung: eine **HardwareLand/UserLand**-PD läuft im globalen
+    ///   Adressraum (VSPACE_OF==0) statt isoliert. Die sicherheitsrelevante Richtung ist
+    ///   „untrusted Domänen MÜSSEN isoliert sein"; eine TrustedSas-PD darf isoliert ODER
+    ///   global laufen (mehr Isolation ist nie eine Verletzung — wichtig für Rückwärts-
+    ///   kompatibilität, da bestehende isolierte PDs per Default als TrustedSas getaggt sind).
+    ///
+    /// `vspace_is_global(tid)` meldet, ob der Thread im globalen SAS-Adressraum läuft
+    /// (VSPACE_OF==0). Die Kommunikationsbeziehungs-Regeln (4/5/6/7: Partner-Bindung,
+    /// UserLand↔HardwareLand-Verbot) kommen in P3 hinzu.
+    pub fn domain_audit(&self, vspace_is_global: &dyn Fn(ThreadId) -> bool) -> u32 {
+        for pd in 0..PdTable::capacity() {
+            if !self.pds.is_used(pd) {
+                continue;
+            }
+            let domain = match self.pds.domain_of(pd) {
+                Some(d) => d,
+                None => continue,
+            };
+            // Cap-Typ-Policy: erlaubte Cap-Typen je Domäne.
+            for slot in 0..NCAPS {
+                if let Some(cap) = self.pds.cap_at(pd, slot) {
+                    if let Some((kind, _, _)) = self.cspace.lookup(cap) {
+                        if kind_is_hardware(kind) && domain != Domain::HardwareLand {
+                            return 1;
+                        }
+                        if kind_is_pd_control(kind) && domain != Domain::TrustedSas {
+                            return 2;
+                        }
+                    }
+                }
+            }
+            // Isolations-Mechanismus: untrusted Domänen MÜSSEN isoliert sein. TrustedSas
+            // darf global ODER isoliert sein (mehr Isolation ist keine Verletzung).
+            if domain != Domain::TrustedSas {
+                if let Some(tid) = self.pds.thread_of(pd) {
+                    if vspace_is_global(tid) {
+                        return 3;
+                    }
+                }
+            }
+        }
+        0
+    }
 }
 
-/// Eine Protection Domain: ein Thread + ein Capability-Space.
+/// Ist `kind` ein **Hardware-Cap** (MMIO/IRQ/DMA)? Generische Kategorie, damit ein künftiges
+/// `ObjectKind::Dma` ohne ABI-/Struktur-Änderung eingehängt werden kann. (P1: noch keine HW-
+/// Kinds -> stets `false`; P4/P5 erweitern den Match.)
+fn kind_is_hardware(_kind: ObjectKind) -> bool {
+    false
+}
+
+/// Ist `kind` eine Management-Cap (`PdControl`)? (P1: noch nicht vorhanden -> `false`; P2 erweitert.)
+fn kind_is_pd_control(_kind: ObjectKind) -> bool {
+    false
+}
+
+/// Darf eine PD der Domäne `domain` eine Cap des Typs `kind` halten?
+/// HW-Caps nur HardwareLand; `PdControl` nur TrustedSas; alles andere überall.
+fn domain_allows_kind(domain: Domain, kind: ObjectKind) -> bool {
+    if kind_is_hardware(kind) {
+        domain == Domain::HardwareLand
+    } else if kind_is_pd_control(kind) {
+        domain == Domain::TrustedSas
+    } else {
+        true
+    }
+}
+
+/// Eine Protection Domain: ein Thread + ein Capability-Space + eine Sicherheitsdomäne.
 #[derive(Clone, Copy)]
 struct Pd {
     used: bool,
     thread: Option<ThreadId>,
     /// Lokaler Cap-Index -> globaler CapPtr.
     cspace: [Option<CapPtr>; NCAPS],
+    /// Sicherheitsdomäne — **unveränderlich** nach der Erzeugung (Policy: bestimmt die
+    /// erlaubten Cap-Typen + Kommunikationsbeziehungen). Migration = neue PD, nicht umschalten.
+    domain: Domain,
+    /// Nur für [`Domain::HardwareLand`]: der **eine** unveränderliche Trusted-SAS-Partner
+    /// (PD-Index), mit dem dieses Backend ausschließlich kommunizieren darf. Bei der Erzeugung
+    /// gesetzt; `None` für Trusted/User (P3 füllt es bei `create_hardware_pd`).
+    partner: Option<u8>,
 }
 
 impl Pd {
@@ -65,6 +177,8 @@ impl Pd {
         used: false,
         thread: None,
         cspace: [None; NCAPS],
+        domain: Domain::TrustedSas, // Default: alle Altbestand-PDs sind Trusted-SAS
+        partner: None,
     };
 }
 
@@ -86,14 +200,71 @@ impl PdTable {
         }
     }
 
-    /// Eine neue (leere) PD anlegen; gibt ihre ID zurück.
+    /// Eine neue (leere) PD anlegen; gibt ihre ID zurück. Default-Domäne Trusted-SAS
+    /// (Rückwärtskompatibilität — alle bestehenden Aufrufer bleiben unverändert).
     pub fn create(&mut self) -> Option<usize> {
+        self.create_in_domain(Domain::TrustedSas)
+    }
+
+    /// Eine neue PD in einer bestimmten **Sicherheitsdomäne** anlegen. Die Domäne ist
+    /// danach **unveränderlich** (es gibt bewusst keinen Setter).
+    pub fn create_in_domain(&mut self, domain: Domain) -> Option<usize> {
         let i = self.pds.iter().position(|p| !p.used)?;
         self.pds[i] = Pd {
             used: true,
+            domain,
             ..Pd::EMPTY
         };
         Some(i)
+    }
+
+    /// Die (unveränderliche) Domäne einer PD.
+    pub fn domain_of(&self, pd: usize) -> Option<Domain> {
+        if pd < NPDS && self.pds[pd].used {
+            Some(self.pds[pd].domain)
+        } else {
+            None
+        }
+    }
+
+    /// Den unveränderlichen Trusted-Partner einer HardwareLand-PD (PD-Index).
+    pub fn partner_of(&self, pd: usize) -> Option<usize> {
+        if pd < NPDS {
+            self.pds[pd].partner.map(|p| p as usize)
+        } else {
+            None
+        }
+    }
+
+    /// Den Trusted-Partner einer HardwareLand-PD **einmalig** setzen (bei der Erzeugung).
+    /// Ist bereits ein Partner gesetzt, wird der Aufruf abgelehnt (Unveränderlichkeit).
+    /// Gibt `true` bei Erfolg.
+    pub fn set_partner_once(&mut self, pd: usize, partner: usize) -> bool {
+        if pd < NPDS && self.pds[pd].used && self.pds[pd].partner.is_none() && partner < NPDS {
+            self.pds[pd].partner = Some(partner as u8);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Ist `pd` belegt?
+    pub fn is_used(&self, pd: usize) -> bool {
+        pd < NPDS && self.pds[pd].used
+    }
+
+    /// Der gebundene Thread einer PD (für die Domäne↔VSpace-Isolationsprüfung).
+    pub fn thread_of(&self, pd: usize) -> Option<ThreadId> {
+        if pd < NPDS {
+            self.pds[pd].thread
+        } else {
+            None
+        }
+    }
+
+    /// Anzahl der PD-Slots (für Audit-Iteration).
+    pub const fn capacity() -> usize {
+        NPDS
     }
 
     /// Den Thread einer PD setzen (Affinität Thread<->PD).

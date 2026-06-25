@@ -15,6 +15,7 @@ use sel4lake_abi::{result, sys, GRANT_FLAG, GRANT_RECV_SLOT};
 use sel4lake_hal::{self as hal, println, syscall::invoke};
 use sel4lake_mem::{peek_u64, poke_u64, Rights};
 use sel4lake_cap::CapPtr;
+use sel4lake_microkit::Domain;
 use sel4lake_sched::ThreadId;
 use sel4lake_sync::SpinLock;
 
@@ -208,6 +209,17 @@ static CAPLK_B_DONE: AtomicBool = AtomicBool::new(false);
 static CAPLK_STEP: AtomicU32 = AtomicU32::new(0);
 static CAPLK_DONE: AtomicBool = AtomicBool::new(false);
 static CAPLK_OK: AtomicBool = AtomicBool::new(false);
+
+// Sicherheitsdomänen (ext-22, P1): je eine PD pro Domäne. TrustedSas an einen globalen
+// EL1-Thread gebunden, HardwareLand + UserLand an isolierte EL0-Threads (eigene VSpace).
+// `domain_audit()` muss 0 melden (Cap-Typ-Policy + untrusted-Domänen sind isoliert) und die
+// Domänen müssen round-trippen. Fixtures in spawn_demo (Teil der Ressourcen-Baseline).
+static DOMAIN_TRUSTED_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static DOMAIN_HW_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static DOMAIN_USER_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+static DOMAIN_AUDIT_CODE: AtomicU32 = AtomicU32::new(u32::MAX);
+static DOMAIN_DONE: AtomicBool = AtomicBool::new(false);
+static DOMAIN_OK: AtomicBool = AtomicBool::new(false);
 
 // Audit-Regression B (Scheduler/MCS): `set_budget`/`bind_sched_context` auf einen
 // ERSCHÖPFTEN Thread darf ihn nicht stranden (Fund: `depleted` gelöscht ohne
@@ -687,6 +699,9 @@ pub fn spawn_demo() {
     RMIG_V2_PD.store(rm_v2_pd, Ordering::Relaxed);
     RMIG_CLIENT_PD.store(rm_c_pd, Ordering::Relaxed);
     RMIG_EP_ID.store(rmep, Ordering::Relaxed);
+    // Sicherheitsdomänen-Fixtures (ext-22, P1) werden NICHT hier angelegt, sondern LAZY im
+    // Manager-Schritt (nach allen Fuzzer-/Reclaim-Tests), damit ihre 2 isolierten EL0-Threads
+    // den kstack-Pool/ASIDs der früheren Tests nicht beanspruchen (sonst Pool-/Timing-Races).
 }
 
 /// Generischer Hot-Reload-Swap: v1 zurückziehen (Quiesce: Empfänger entfernen +
@@ -2416,7 +2431,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -2445,6 +2460,7 @@ pub fn demo_report_then_idle() -> ! {
                 FUZZ_DONE.load(Ordering::Acquire) && FUZZ_OK.load(Ordering::Acquire),
                 IPCFUZZ_DONE.load(Ordering::Acquire) && IPCFUZZ_OK.load(Ordering::Acquire),
                 CAPLK_DONE.load(Ordering::Acquire) && CAPLK_OK.load(Ordering::Acquire),
+                DOMAIN_DONE.load(Ordering::Acquire) && DOMAIN_OK.load(Ordering::Acquire),
             );
         }
         // Beendete Threads einsammeln (sicher: läuft auf dem Idle-Stack).
@@ -2984,6 +3000,47 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // Sicherheitsdomänen (ext-22, P1): Fixtures LAZY anlegen (nach allen Fuzzer-/Reclaim-
+        // Tests -> kstack-Pool/ASIDs frei, keine Baseline-/Timing-Races) und strukturell
+        // prüfen. TrustedSas: nur die Domäne (Regel 3 prüft nur untrusted). Hardware/User:
+        // isolierte EL0-Threads (`spawn_isolated` setzt VSPACE_OF synchron). Gegate auf caplk.
+        if !DOMAIN_DONE.load(Ordering::Acquire) && CAPLK_DONE.load(Ordering::Acquire) {
+            hal::cpu::local_irq_disable();
+            if let Some(tpd) = system::create_pd_in_domain(Domain::TrustedSas) {
+                DOMAIN_TRUSTED_PD.store(tpd, Ordering::Relaxed);
+            }
+            if let Some(hpd) = system::create_pd_in_domain(Domain::HardwareLand) {
+                // SENSITIVITAET P1 (geprueft): spawn_isolated -> spawn (global) => HardwareLand
+                // laeuft global => domain_audit()==3 => domain-Test FAILURES (verifiziert).
+                if let Some((h, _)) =
+                    system::spawn_isolated(churn_dummy as *const () as usize, 0, 3)
+                {
+                    system::bind_pd(hpd, h);
+                }
+                DOMAIN_HW_PD.store(hpd, Ordering::Relaxed);
+            }
+            if let Some(upd) = system::create_pd_in_domain(Domain::UserLand) {
+                if let Some((u, _)) =
+                    system::spawn_isolated(churn_dummy as *const () as usize, 0, 3)
+                {
+                    system::bind_pd(upd, u);
+                }
+                DOMAIN_USER_PD.store(upd, Ordering::Relaxed);
+            }
+            hal::cpu::local_irq_enable();
+
+            let code = system::domain_audit();
+            DOMAIN_AUDIT_CODE.store(code, Ordering::Release);
+            let roundtrip = system::pd_domain(DOMAIN_TRUSTED_PD.load(Ordering::Relaxed))
+                == Some(Domain::TrustedSas)
+                && system::pd_domain(DOMAIN_HW_PD.load(Ordering::Relaxed))
+                    == Some(Domain::HardwareLand)
+                && system::pd_domain(DOMAIN_USER_PD.load(Ordering::Relaxed))
+                    == Some(Domain::UserLand);
+            DOMAIN_OK.store(code == 0 && roundtrip, Ordering::Release);
+            DOMAIN_DONE.store(true, Ordering::Release);
+        }
+
         // Audit-Regression B (MCS-Stranding): budgetierten Worker auf STRAND_CORE
         // erschöpfen lassen, dann erneut binden -> er muss WIEDER laufen (Fix). Gegate
         // auf MCS fertig + SMP fertig (STRAND_CORE frei). Tick-basiert (anderer Kern).
@@ -3131,9 +3188,11 @@ fn all_done() -> bool {
     let ipcfuzz = IPCFUZZ_DONE.load(Ordering::Acquire) && IPCFUZZ_OK.load(Ordering::Acquire);
     // CAPS-Read-Concurrency: zwei Kerne halten gleichzeitig den CAPS-Read-Lock (RwLock).
     let caplk = CAPLK_DONE.load(Ordering::Acquire) && CAPLK_OK.load(Ordering::Acquire);
+    // Sicherheitsdomänen: Domänen-Policy-Oracle konsistent + Domänen round-trippen.
+    let domain = DOMAIN_DONE.load(Ordering::Acquire) && DOMAIN_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
-        && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk
+        && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
 }
 
 fn report() {
@@ -3485,5 +3544,14 @@ fn report() {
     println!(
         "caplk   : {} (CAPS-Reader-Writer-Lock: heisse Cap-Lookups laufen nebenlaeufig statt serialisiert)",
         if caplk { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Sicherheitsdomänen (ext-22, P1): Domänen-Policy-Oracle + Domänen-Round-Trip.
+    let dcode = DOMAIN_AUDIT_CODE.load(Ordering::Acquire);
+    let domain = DOMAIN_DONE.load(Ordering::Acquire) && DOMAIN_OK.load(Ordering::Acquire);
+    println!("domain  : TrustedSas(global)+HardwareLand(iso)+UserLand(iso); domain_audit={dcode} (erwartet 0); Domaenen round-trippen");
+    println!(
+        "domain  : {} (Domaenen-Policy: Cap-Typen je Domaene + untrusted Domaenen sind isoliert)",
+        if domain { "ALL PASS" } else { "FAILURES" }
     );
 }

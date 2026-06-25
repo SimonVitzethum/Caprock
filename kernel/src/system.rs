@@ -18,7 +18,7 @@ use sel4lake_cap::{CapError, CapInfo, CapPtr, ObjectKind};
 use sel4lake_hal::{self as hal, exception::TrapFrame, fp::FpState, println};
 use sel4lake_ipc::{Endpoint, Notification, NENDPOINTS, NNOTIFICATIONS};
 use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
-use sel4lake_microkit::Caps;
+use sel4lake_microkit::{Caps, Domain};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use sel4lake_sched::{SchedOps, Scheduler, ThreadId, MAX_THREADS};
 use sel4lake_sync::{RwSpinLock, SpinLock};
@@ -1278,11 +1278,25 @@ pub fn reaped_bytes() -> u64 {
 pub fn create_pd() -> Option<usize> {
     CAPS.write().pds.create()
 }
+/// Eine PD in einer bestimmten **Sicherheitsdomäne** anlegen (Domäne danach unveränderlich).
+pub fn create_pd_in_domain(domain: Domain) -> Option<usize> {
+    CAPS.write().pds.create_in_domain(domain)
+}
+/// Die (unveränderliche) Domäne einer PD.
+pub fn pd_domain(pd: usize) -> Option<Domain> {
+    CAPS.read().pds.domain_of(pd)
+}
+/// Den unveränderlichen Trusted-Partner einer HardwareLand-PD **einmalig** setzen (P3).
+pub fn set_pd_partner(pd: usize, partner: usize) -> bool {
+    CAPS.write().pds.set_partner_once(pd, partner)
+}
 pub fn bind_pd(pd: usize, tid: ThreadId) {
     CAPS.write().pds.bind_thread(pd, tid);
 }
-pub fn install_pd_cap(pd: usize, slot: usize, cap: CapPtr) {
-    CAPS.write().pds.install_cap(pd, slot, cap);
+/// Cap **policy-geprüft** in eine PD eintragen (Hardware-Caps nur HardwareLand, `PdControl`
+/// nur TrustedSas). Gibt `false` zurück, wenn die Domänen-Policy es verbietet (kein Eintrag).
+pub fn install_pd_cap(pd: usize, slot: usize, cap: CapPtr) -> bool {
+    CAPS.write().install_cap_checked(pd, slot, cap)
 }
 pub fn clear_pd_cap(pd: usize, slot: usize) {
     CAPS.write().pds.clear_cap(pd, slot);
@@ -1426,5 +1440,20 @@ pub fn ipc_audit() -> u32 {
     if cdt != 0 {
         return 20 + cdt;
     }
+    // Domänen-Policy-Property (ext-22): Cap-Typen je Domäne + Domäne↔VSpace-Isolation.
+    let dom = domain_audit();
+    if dom != 0 {
+        return 30 + dom;
+    }
     0
+}
+
+/// **Domänen-Policy-Oracle** (ext-22): `0` = konsistent, sonst Anomalie-Code (1 = HW-Cap in
+/// Nicht-HardwareLand, 2 = `PdControl` in Nicht-TrustedSas, 3 = Domäne↔VSpace inkonsistent).
+/// Die VSpace-Zugehörigkeit (global vs. isoliert) liegt in `VSPACE_OF` (nicht in `Caps`), daher
+/// wird sie hier per Closure eingespeist. Sperrt nur `CAPS.read()` (VSPACE_OF ist atomar).
+pub fn domain_audit() -> u32 {
+    let vspace_is_global =
+        |tid: ThreadId| VSPACE_OF[tid.slot()].load(Ordering::Acquire) == 0;
+    CAPS.read().domain_audit(&vspace_is_global)
 }

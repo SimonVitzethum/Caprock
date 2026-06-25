@@ -134,9 +134,13 @@ Threads über KILL/EXIT/Reload/MCS-während-IPC.
    (lock-order-sicher via `ReplyFinal`-Kollektor + `abort_finalized_replies` nach
    Lock-Freigabe; CAPS < EPS < SCHEDS bleibt gewahrt). **Budget-Donation** (intra-core
    CALL, geteilter Scheduling-Context, Konto-Belastung + Refill-Umleitung) ist umgesetzt.
-   `ddon`/`rcap` prüfen beides, beide sensitivitätsgeprüft. **Restrisiko:** per-PD-
-   Reply-Slot + Server-Migration (Reply-Cap überlebt einen Server-Wechsel) noch nicht —
-   *offen (Migrationsrisiko)*.
+   `ddon`/`rcap` prüfen beides, beide sensitivitätsgeprüft. **Server-Migration jetzt
+   ebenfalls ERLEDIGT:** `Endpoint::migrate_owner` / `system::endpoint_migrate_owner`
+   überträgt eine ausstehende Antwortpflicht beim Hot-Reload auf die neue Instanz (v2),
+   statt den Client abzubrechen — die Reply-Cap überlebt den Server-Wechsel. `rmig`
+   prüft es, sensitivitätsgeprüft. *Rest: ein dedizierter benannter per-PD-Reply-Slot
+   (statt on-demand `reply_cap_for`) ist eine reine API-Ergonomie-Frage — funktional
+   nicht nötig.*
 2. ✅ **ERLEDIGT** (Reload-/Quiesce-Pfad): `endpoint_quiesce_owner` entblockt einen
    ausstehenden Caller mit `ERR_SERVER_GONE`, wenn sein Reply-Owner via Hot-Reload
    zurückgezogen wird (Server lebt). In `reload_swap` integriert; `rgone` Runde 2
@@ -173,8 +177,16 @@ Threads über KILL/EXIT/Reload/MCS-während-IPC.
   bricht den ausstehenden CALL nach Lock-Freigabe mit `ERR_SERVER_GONE` ab. `rcap`
   prüft Prägen+Löschen einer Reply-Cap für einen ausstehenden Call (Ergebnis=5).
   Sensitivität: Finalisierungs-Push deaktiviert → Client hängt → `== FAILURES ==`.
+- **#1c Reply-Cap-Server-Migration** (Commit `d9737c9`): `Endpoint::
+  migrate_owner` reiht den wartenden Aufrufer wieder als Sender ein + löscht
+  caller/reply_owner → die nächste RECV-Instanz (v2) übernimmt dieselbe Nachricht aus
+  dem weiterhin blockierten Aufrufer-Frame und wird neuer Reply-Owner → v2 schließt den
+  Call ab. Reine EPS-Operation (kein SCHEDS). `NPDS` 48→64 (3 zusätzliche Test-PDs).
+  `rmig` prüft: v1 empfängt + parkt, Manager migriert auf v2 (v1 capless), Client-CALL
+  kehrt mit OK + 5·7=35 zurück (statt `ERR_SERVER_GONE`). Sensitivität: migrate durch
+  `endpoint_quiesce_owner` ersetzt → Client abgebrochen → `== FAILURES ==`.
 
-**Ergebnis:** `./test-qemu.sh` = **ALL PASS (34 Checks, ~5 s auf ruhigem Host)**.
+**Ergebnis:** `./test-qemu.sh` = **ALL PASS (35 Checks, ~5 s auf ruhigem Host)**.
 Reply-Liveness für Thread-Tod **und** Reload/Quiesce geschlossen + regressionsgetestet
 (2 Runden); zusätzlich ist die Reply-Berechtigung jetzt eine **erstklassige,
 revozierbare Capability** (`ObjectKind::Reply`) mit **MCS-Budget-Donation**. CDT-/

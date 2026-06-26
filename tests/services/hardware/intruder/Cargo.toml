@@ -1,0 +1,16 @@
+# `intruder-h` — adversarialer HardwareLand-Testdienst (ext-27 T2, ADR 0012).
+# Speicher-Isolation aus einem HardwareLand-Backend: der Fault auf Kernel-RAM ist DOMAENEN-
+# UNABHAENGIG -- auch ein "Hardware"-Backend laeuft EL0-isoliert und kann Kernel-/Fremdspeicher
+# nicht lesen. Meldet PRE ueber den eigenen Kanal, dann fataler Zugriff.
+[package]
+name = "intruder-h"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "intruder-h"
+path = "src/main.rs"
+
+[dependencies]
+libsel4lake = { path = "../../../../programs/libsel4lake" }

@@ -481,6 +481,26 @@ static INTRU_FAULT_BASE: AtomicUsize = AtomicUsize::new(usize::MAX); // el0_faul
 /// PRE-Badge "INTR" — intruder-u signalisiert es VOR dem fatalen Kernel-RAM-Zugriff.
 const INTRU_PRE: u64 = 0x494E_5452;
 
+// ext-27 T2: HardwareLand-Dienste. AGGRH = HardwareLand-Aggressor (Cap-Confusion + Eskalation aus
+// einem Backend -> KEINE Management-Autoritaet, nichts ausserhalb des eigenen Kanals erreichbar).
+static AGGRH_STARTED: AtomicBool = AtomicBool::new(false);
+static AGGRH_DONE: AtomicBool = AtomicBool::new(false);
+static AGGRH_OK: AtomicBool = AtomicBool::new(false);
+static AGGRH_NTFN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static AGGRH_POLLS: AtomicU32 = AtomicU32::new(0);
+/// Erfolgs-Badge "AGRH" — aggressor-h meldet es ueber den eigenen Kanal bei voller Abweisung.
+const AGGRH_SUCCESS: u64 = 0x4147_5248;
+// INTRH = HardwareLand-Intruder (Speicher-Isolation domaenen-unabhaengig: ein Backend faultet
+// ebenso auf Kernel-RAM).
+static INTRH_STARTED: AtomicBool = AtomicBool::new(false);
+static INTRH_DONE: AtomicBool = AtomicBool::new(false);
+static INTRH_OK: AtomicBool = AtomicBool::new(false);
+static INTRH_NTFN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static INTRH_POLLS: AtomicU32 = AtomicU32::new(0);
+static INTRH_FAULT_BASE: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// PRE-Badge "INRH" — intruder-h signalisiert es ueber den eigenen Kanal vor dem fatalen Zugriff.
+const INTRH_PRE: u64 = 0x494E_5248;
+
 // Domänen/HW-Fuzzer (ext-22, P6): churnt über viele Epochen Hardware-/Management-Caps gegen
 // die Domänen-Policy + CDT/VSpace-Oracles + Ressourcen-Baseline. Kernpunkte: HW-Caps (MMIO/
 // IRQ) NUR in HardwareLand, PdControl NUR in TrustedSas installierbar (Negativfälle abgelehnt);
@@ -884,6 +904,31 @@ fn run_intru_start() -> usize {
         let root = system::install_notification_cap(ntfn as u32, Rights::RW).ok()?;
         let wcap = system::cap_mint(root, Rights::WRITE, INTRU_PRE).ok()?;
         loader::load_image(&svc, &[(0, wcap)]).ok()?;
+        Some(ntfn)
+    })();
+    hal::cpu::local_irq_enable();
+    res.unwrap_or(usize::MAX)
+}
+
+/// **ext-27 T2 — ein HardwareLand-Testdienst in ein Backend laden.** Eine HardwareLand-Backend-PD
+/// vor-erstellen (TrustedSAS-Partner + Kanal `ep`/`ntfn` via [`system::create_hardware_backend`]),
+/// die **eigene Kanal-Notification** (gemintet WRITE-only, Badge `badge`) in Slot 0 installieren
+/// (die HardwareLand-Cap-Policy erlaubt einem Backend NUR Caps des eigenen Kanals) und das per
+/// `name` benannte Programm (Domaene HardwareLand) **in diese PD** laden. Gibt die Kanal-
+/// Notification-ID zum Pollen (`usize::MAX` bei Setup-Fehler). IRQ-maskiert.
+fn run_hw_service_start(name: &str, badge: u64, backend_id: u16) -> usize {
+    hal::cpu::local_irq_disable();
+    let res = (|| {
+        let archive = loader::read_archive()?;
+        let svc = archive.iter().find(|p| p.name() == name)?;
+        let partner = system::create_pd_in_domain(Domain::TrustedSas)?;
+        let (hpd, _ep, ntfn) = system::create_hardware_backend(partner, backend_id)?;
+        let nroot = system::install_notification_cap(ntfn as u32, Rights::RW).ok()?;
+        let scap = system::cap_mint(nroot, Rights::WRITE, badge).ok()?;
+        if !system::install_pd_cap(hpd, 0, scap) {
+            return None; // Kanal-Cap muss ins Backend installierbar sein
+        }
+        loader::load_program_into_pd(&svc, hpd, &[]).ok()?;
         Some(ntfn)
     })();
     hal::cpu::local_irq_enable();
@@ -3486,7 +3531,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} sysload={} loadhw={} loadstop={} loaderfuzz={} aggru={} intru={} hwfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} sysload={} loadhw={} loadstop={} loaderfuzz={} aggru={} intru={} aggrh={} intrh={} hwfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -3534,6 +3579,8 @@ pub fn demo_report_then_idle() -> ! {
                 LOADERFUZZ_DONE.load(Ordering::Acquire) && LOADERFUZZ_OK.load(Ordering::Acquire),
                 AGGRU_DONE.load(Ordering::Acquire) && AGGRU_OK.load(Ordering::Acquire),
                 INTRU_DONE.load(Ordering::Acquire) && INTRU_OK.load(Ordering::Acquire),
+                AGGRH_DONE.load(Ordering::Acquire) && AGGRH_OK.load(Ordering::Acquire),
+                INTRH_DONE.load(Ordering::Acquire) && INTRH_OK.load(Ordering::Acquire),
                 HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire),
             );
         }
@@ -4795,9 +4842,53 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // ext-27 T2a: HardwareLand-Aggressor. Start gegate auf intru fertig; das SUCCESS-Badge ueber
+        // den Kanal pollen. Der Dienst beendet sich selbst (exit) nach dem Signal.
+        if !AGGRH_STARTED.load(Ordering::Acquire) && INTRU_DONE.load(Ordering::Acquire) {
+            let n = run_hw_service_start("aggressor-h", AGGRH_SUCCESS, 0x27);
+            AGGRH_NTFN.store(n, Ordering::Relaxed);
+            if n == usize::MAX {
+                AGGRH_DONE.store(true, Ordering::Release);
+            }
+            AGGRH_STARTED.store(true, Ordering::Release);
+        }
+        if AGGRH_STARTED.load(Ordering::Acquire) && !AGGRH_DONE.load(Ordering::Acquire) {
+            let n = AGGRH_NTFN.load(Ordering::Relaxed);
+            if n != usize::MAX && system::notification_pending(n) == AGGRH_SUCCESS {
+                AGGRH_OK.store(ext27_audits_ok(), Ordering::Release);
+                AGGRH_DONE.store(true, Ordering::Release);
+            } else if AGGRH_POLLS.fetch_add(1, Ordering::Relaxed) > 200_000 {
+                AGGRH_DONE.store(true, Ordering::Release); // Timeout -> FAIL
+            }
+        }
+
+        // ext-27 T2b: HardwareLand-Intruder (Speicher-Isolation domaenen-unabhaengig). Start gegate
+        // auf aggrh fertig; Fault-Baseline schnappen, dann PRE-Badge + Fault-Inkrement pollen.
+        if !INTRH_STARTED.load(Ordering::Acquire) && AGGRH_DONE.load(Ordering::Acquire) {
+            INTRH_FAULT_BASE.store(system::el0_fault_count(), Ordering::Relaxed);
+            let n = run_hw_service_start("intruder-h", INTRH_PRE, 0x28);
+            INTRH_NTFN.store(n, Ordering::Relaxed);
+            if n == usize::MAX {
+                INTRH_DONE.store(true, Ordering::Release);
+            }
+            INTRH_STARTED.store(true, Ordering::Release);
+        }
+        if INTRH_STARTED.load(Ordering::Acquire) && !INTRH_DONE.load(Ordering::Acquire) {
+            let n = INTRH_NTFN.load(Ordering::Relaxed);
+            let base = INTRH_FAULT_BASE.load(Ordering::Relaxed);
+            let pre = n != usize::MAX && system::notification_pending(n) == INTRH_PRE;
+            let faulted = base != usize::MAX && system::el0_fault_count() > base;
+            if pre && faulted {
+                INTRH_OK.store(ext27_audits_ok(), Ordering::Release);
+                INTRH_DONE.store(true, Ordering::Release);
+            } else if INTRH_POLLS.fetch_add(1, Ordering::Relaxed) > 200_000 {
+                INTRH_DONE.store(true, Ordering::Release); // Timeout -> FAIL
+            }
+        }
+
         // Domänen/HW-Fuzzer (ext-22, P6): churnt HW-/Management-Caps gegen Policy + Oracles +
         // Baseline. Gegate auf den letzten ext-27-Dienst fertig; eine Epoche je Iteration.
-        if !HWFUZZ_DONE.load(Ordering::Acquire) && INTRU_DONE.load(Ordering::Acquire) {
+        if !HWFUZZ_DONE.load(Ordering::Acquire) && INTRH_DONE.load(Ordering::Acquire) {
             match HWFUZZ_STEP.load(Ordering::Acquire) {
                 0 => {
                     // Fixtures (eine PD je Domäne, ohne Threads) + Baseline schnappen.
@@ -5027,13 +5118,18 @@ fn all_done() -> bool {
     let aggru = AGGRU_DONE.load(Ordering::Acquire) && AGGRU_OK.load(Ordering::Acquire);
     // ext-27 T1: UserLand-Intruder (extern geladen) — Kernel-RAM-Zugriff aus EL0 faultete (Isolation).
     let intru = INTRU_DONE.load(Ordering::Acquire) && INTRU_OK.load(Ordering::Acquire);
+    // ext-27 T2: HardwareLand-Aggressor — keine Management-Autoritaet, nichts ausserhalb des Kanals.
+    let aggrh = AGGRH_DONE.load(Ordering::Acquire) && AGGRH_OK.load(Ordering::Acquire);
+    // ext-27 T2: HardwareLand-Intruder — Kernel-RAM-Fault domaenen-unabhaengig (Backend isoliert).
+    let intrh = INTRH_DONE.load(Ordering::Acquire) && INTRH_OK.load(Ordering::Acquire);
     // Domänen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Policy + Oracles + Baseline.
     let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
         && pdctl && chan && rtc && irq && dma && pcie && smmu && smmubind && virtiorng && dmagen
-        && sasheap && load && sysload && loadhw && loadstop && loaderfuzz && aggru && intru && hwfuzz
+        && sasheap && load && sysload && loadhw && loadstop && loaderfuzz && aggru && intru
+        && aggrh && intrh && hwfuzz
 }
 
 fn report() {
@@ -5573,6 +5669,18 @@ fn report() {
     println!(
         "intru   : {} (extern geladener UserLand-Intruder: las Kernel-RAM aus EL0 -> Translation-Fault (Ziel nicht in der isolierten VSpace gemappt) -> Kernel terminiert den Angreifer-Thread + laeuft weiter; PRE-Badge erhalten + el0_fault_count++ + Audits==0)",
         if intru { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // ext-27 T2: HardwareLand-Dienste (ADR 0012).
+    let aggrh = AGGRH_DONE.load(Ordering::Acquire) && AGGRH_OK.load(Ordering::Acquire);
+    println!(
+        "aggrh   : {} (extern geladenes HardwareLand-Backend als Aggressor: trotz 'Hardware'-Domaene KEINE Management-Autoritaet (PDCTL/LOAD/KILL -> BADCAP) + nichts ausserhalb des eigenen Kanals erreichbar; Cap-Confusion alle BADCAP/RIGHTS/BADSYS; meldet SUCCESS ueber den Kanal nur bei voller Abweisung; Audits==0)",
+        if aggrh { "ALL PASS" } else { "FAILURES" }
+    );
+    let intrh = INTRH_DONE.load(Ordering::Acquire) && INTRH_OK.load(Ordering::Acquire);
+    println!(
+        "intrh   : {} (extern geladenes HardwareLand-Backend als Intruder: las Kernel-RAM aus EL0 -> Fault -> terminiert, Kernel laeuft weiter; Speicher-Isolation DOMAENEN-UNABHAENGIG (auch ein Hardware-Backend ist EL0-isoliert); PRE + el0_fault_count++ + Audits==0)",
+        if intrh { "ALL PASS" } else { "FAILURES" }
     );
 
     // Domänen/HW-Fuzzer (ext-22, P6).

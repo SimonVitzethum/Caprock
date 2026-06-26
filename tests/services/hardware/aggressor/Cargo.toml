@@ -1,0 +1,16 @@
+# `aggressor-h` — adversarialer HardwareLand-Testdienst (ext-27 T2, ADR 0012).
+# Ein extern geladenes HardwareLand-Backend beweist: trotz der "Hardware"-Domaene besitzt es KEINE
+# Management-Autoritaet (PDCTL/LOAD/KILL -> BADCAP) und kann NICHTS jenseits seines eigenen
+# Partner-Kanals erreichen. Cap-Confusion + Eskalation, alle abgewiesen (Self-Judging).
+[package]
+name = "aggressor-h"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aggressor-h"
+path = "src/main.rs"
+
+[dependencies]
+libsel4lake = { path = "../../../../programs/libsel4lake" }

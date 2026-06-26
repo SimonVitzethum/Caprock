@@ -444,6 +444,13 @@ static LOADHW_NTFN: AtomicUsize = AtomicUsize::new(usize::MAX);
 static LOADHW_POLLS: AtomicU32 = AtomicU32::new(0);
 static LOADTRUSTED_REJECTED: AtomicBool = AtomicBool::new(false); // EL1-Image abgelehnt (Trust-Gate)
 
+// Binary-Loader L4 (ext-26): Teardown geladener Prozesse. Ein UserLand-Programm laden, dann
+// VOLLSTAENDIG abbauen (Thread + VSpace-Tabellen + geladene Segment-Frames + Kernel-Stack + PD) und
+// die Ressourcen-Baseline pruefen (MEM/VSpace/kstack zurueck = kein Leck). Beweist sauberen
+// Lebenszyklus -- Voraussetzung fuer das Churnen geladener Prozesse (ext-27).
+static LOADSTOP_DONE: AtomicBool = AtomicBool::new(false);
+static LOADSTOP_OK: AtomicBool = AtomicBool::new(false);
+
 // Domänen/HW-Fuzzer (ext-22, P6): churnt über viele Epochen Hardware-/Management-Caps gegen
 // die Domänen-Policy + CDT/VSpace-Oracles + Ressourcen-Baseline. Kernpunkte: HW-Caps (MMIO/
 // IRQ) NUR in HardwareLand, PdControl NUR in TrustedSas installierbar (Negativfälle abgelehnt);
@@ -693,6 +700,34 @@ fn run_loadhw_start() -> usize {
     })();
     hal::cpu::local_irq_enable();
     res.unwrap_or(usize::MAX)
+}
+
+/// **Binary-Loader L4 (Teardown) testen** (ext-26): ein UserLand-Programm laden, dann VOLLSTAENDIG
+/// abbauen ([`system::destroy_loaded`]) und die Ressourcen-Baseline pruefen (freies MEM, freie
+/// VSpaces, freie Kstack-Pool-Slots zurueck = kein Leck der geladenen Segmente/VSpace/Stack).
+/// Synchron, IRQ-maskiert (saubere Baseline-Messung); das Programm wird vor dem Lauf abgebaut.
+fn run_loadstop() -> bool {
+    hal::cpu::local_irq_disable();
+    let (f0, v0, k0) = (
+        system::total_free(),
+        system::free_vspaces(),
+        system::user_kstack_free_count(),
+    );
+    let loaded = (|| {
+        let archive = loader::read_archive()?;
+        let hello = archive.iter().find(|p| p.name() == "hello")?;
+        let (tid, pd) = loader::load_image(&hello, &[]).ok()?;
+        system::destroy_loaded(tid, pd);
+        Some(())
+    })()
+    .is_some();
+    let (f1, v1, k1) = (
+        system::total_free(),
+        system::free_vspaces(),
+        system::user_kstack_free_count(),
+    );
+    hal::cpu::local_irq_enable();
+    loaded && f1 == f0 && v1 == v0 && k1 == k0
 }
 
 /// **Signatur-/Trust-Gate pruefen** (ext-26, L3): ein als TrustedSAS (Domaene 0, EL1) deklariertes
@@ -3304,7 +3339,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} sysload={} loadhw={} hwfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} sysload={} loadhw={} loadstop={} hwfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -3348,6 +3383,7 @@ pub fn demo_report_then_idle() -> ! {
                 LOAD_DONE.load(Ordering::Acquire) && LOAD_OK.load(Ordering::Acquire),
                 SYSLOAD_FIN.load(Ordering::Acquire) && SYSLOAD_OK.load(Ordering::Acquire),
                 LOADHW_FIN.load(Ordering::Acquire) && LOADHW_OK.load(Ordering::Acquire),
+                LOADSTOP_DONE.load(Ordering::Acquire) && LOADSTOP_OK.load(Ordering::Acquire),
                 HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire),
             );
         }
@@ -4547,9 +4583,16 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // Binary-Loader L4 (ext-26): Teardown geladener Prozesse (Balance). Synchron, ein Schritt.
+        // Gegate auf loadhw (L3) fertig.
+        if !LOADSTOP_DONE.load(Ordering::Acquire) && LOADHW_FIN.load(Ordering::Acquire) {
+            LOADSTOP_OK.store(run_loadstop(), Ordering::Release);
+            LOADSTOP_DONE.store(true, Ordering::Release);
+        }
+
         // Domänen/HW-Fuzzer (ext-22, P6): churnt HW-/Management-Caps gegen Policy + Oracles +
-        // Baseline. Gegate auf den Binary-Loader L3 (ext-26) fertig; eine Epoche je Iteration.
-        if !HWFUZZ_DONE.load(Ordering::Acquire) && LOADHW_FIN.load(Ordering::Acquire) {
+        // Baseline. Gegate auf den Binary-Loader L4 (ext-26) fertig; eine Epoche je Iteration.
+        if !HWFUZZ_DONE.load(Ordering::Acquire) && LOADSTOP_DONE.load(Ordering::Acquire) {
             match HWFUZZ_STEP.load(Ordering::Acquire) {
                 0 => {
                     // Fixtures (eine PD je Domäne, ohne Threads) + Baseline schnappen.
@@ -4771,13 +4814,15 @@ fn all_done() -> bool {
     let sysload = SYSLOAD_FIN.load(Ordering::Acquire) && SYSLOAD_OK.load(Ordering::Acquire);
     // Binary-Loader L3 (ext-26): HardwareLand-Laden + TrustedSAS/EL1-Trust-Gate.
     let loadhw = LOADHW_FIN.load(Ordering::Acquire) && LOADHW_OK.load(Ordering::Acquire);
+    // Binary-Loader L4 (ext-26): Teardown geladener Prozesse (Balance).
+    let loadstop = LOADSTOP_DONE.load(Ordering::Acquire) && LOADSTOP_OK.load(Ordering::Acquire);
     // Domänen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Policy + Oracles + Baseline.
     let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
         && pdctl && chan && rtc && irq && dma && pcie && smmu && smmubind && virtiorng && dmagen
-        && sasheap && load && sysload && loadhw && hwfuzz
+        && sasheap && load && sysload && loadhw && loadstop && hwfuzz
 }
 
 fn report() {
@@ -5289,6 +5334,13 @@ fn report() {
     println!(
         "loadhw  : {} (HardwareLand-Laden: Backend-PD mit Partner-Bindung+Kanal, Kanal-Cap-Policy gilt; EL1/TrustedSAS nur signiert ladbar -> ohne Signatur abgelehnt)",
         if loadhw { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Binary-Loader L4 (ext-26): Teardown geladener Prozesse.
+    let loadstop = LOADSTOP_DONE.load(Ordering::Acquire) && LOADSTOP_OK.load(Ordering::Acquire);
+    println!(
+        "loadstop: {} (geladenen Prozess vollstaendig abgebaut: Thread+VSpace-Tabellen+geladene Segment-Frames+Kstack+PD -> MEM/VSpace/kstack-Baseline wiederhergestellt, kein Leck)",
+        if loadstop { "ALL PASS" } else { "FAILURES" }
     );
 
     // Domänen/HW-Fuzzer (ext-22, P6).

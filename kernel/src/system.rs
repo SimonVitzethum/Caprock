@@ -972,6 +972,7 @@ fn vspace_teardown(asid: u16) {
     if asid == 0 || asid as usize > MAX_VSPACES {
         return;
     }
+    loaded_free(asid); // ext-26 L4: geladene Programm-Segment-Frames freigeben (sonst Leck)
     let ent = {
         let mut t = VSPACES.lock();
         let e = t[asid as usize - 1];
@@ -1067,10 +1068,24 @@ pub fn destroy_isolated(tid: ThreadId) {
     purge_ipc_queues(tid); // eager: tote IPC-Queue-Einträge vermeiden
     reap(); // Stack-Zombie an MEM zurueck (korrekte Lock-Ordnung: SCHEDS frei, dann MEM)
     if asid != 0 {
-        vspace_teardown(asid); // L1/L2/L3 an MEM, ASID-Slot frei, TLB-Flush
+        vspace_teardown(asid); // L1/L2/L3 + geladene Segmente an MEM, ASID-Slot frei, TLB-Flush
         VSPACE_OF[tid.slot()].store(0, Ordering::Relaxed);
     }
     reclaim_user_kstack(tid.slot());
+}
+
+/// Einen **geladenen Prozess vollständig abbauen** (ext-26, L4): die im Cspace seiner PD
+/// installierten Caps löschen (delegierte CDT-Kopien → Refcount runter), den Thread + die VSpace +
+/// die geladenen Segment-Frames + den Kernel-Stack abbauen ([`destroy_isolated`]) und den PD-Slot
+/// freigeben. Danach ist die Ressourcen-Baseline wiederhergestellt (kein Leck). `tid` muss auf dem
+/// aktuellen Kern liegen und darf nicht der laufende Thread sein.
+pub fn destroy_loaded(tid: ThreadId, pd: usize) {
+    let caps = CAPS.read().pds.caps_of(pd); // Snapshot; Read-Lock danach frei
+    for cap in caps.iter().flatten() {
+        let _ = cap_delete(*cap); // jeden installierten Cap löschen (CAPS.write intern)
+    }
+    destroy_isolated(tid);
+    CAPS.write().pds.free(pd); // PD-Slot freigeben
 }
 
 /// Einen 2-MiB-Frame `phys` als **EL0-RX-Code** in die VSpace `asid` mappen + flushen.
@@ -1203,6 +1218,61 @@ fn copy_segment(dst_phys: u64, src: &[u8], total: usize) {
     }
 }
 
+// --- Register geladener Programm-Segmente (ext-26, L4) ---
+//
+// Geladene PT_LOAD-Segmente + der Stack-Frame sind kernel-ausgeschnittene RAM-Frames, die NICHT
+// cap-getrackt sind (der MemoryCap-Deskriptor wird in `load_into_pd` verworfen, da das Eigentum
+// an die geladene PD/VSpace uebergeht). Damit sie beim Teardown der VSpace NICHT lecken, werden
+// sie hier je `asid` registriert und von [`vspace_teardown`] mitfreigegeben.
+const NLOADED_IMG: usize = 16; //   gleichzeitig geladene Programme
+const MAX_IMG_SEGS: usize = 8; //   Frames je Programm (Segmente + Stack)
+#[derive(Clone, Copy)]
+struct LoadedImage {
+    asid: u16, // 0 = freier Slot
+    nseg: usize,
+    segs: [(u64, u64); MAX_IMG_SEGS], // (base, len)
+}
+impl LoadedImage {
+    const EMPTY: LoadedImage = LoadedImage { asid: 0, nseg: 0, segs: [(0, 0); MAX_IMG_SEGS] };
+}
+static LOADED_IMAGES: SpinLock<[LoadedImage; NLOADED_IMG]> =
+    SpinLock::new([LoadedImage::EMPTY; NLOADED_IMG]);
+
+/// Die RAM-Frames `segs` eines geladenen Programms unter `asid` registrieren (für den Teardown).
+fn loaded_register(asid: u16, segs: &[(u64, u64)]) {
+    let mut t = LOADED_IMAGES.lock();
+    if let Some(slot) = t.iter().position(|i| i.asid == 0) {
+        let mut img = LoadedImage::EMPTY;
+        img.asid = asid;
+        for &s in segs.iter().take(MAX_IMG_SEGS) {
+            img.segs[img.nseg] = s;
+            img.nseg += 1;
+        }
+        t[slot] = img;
+    }
+}
+
+/// Die registrierten RAM-Frames der `asid` an den Allokator zurückgeben + den Slot freigeben.
+/// Snapshot ziehen, `LOADED_IMAGES` freigeben, DANN `MEM` (Rangordnung: nie beide gleichzeitig).
+fn loaded_free(asid: u16) {
+    let mut snap = [(0u64, 0u64); MAX_IMG_SEGS];
+    let mut n = 0;
+    {
+        let mut t = LOADED_IMAGES.lock();
+        if let Some(slot) = t.iter().position(|i| i.asid == asid && i.asid != 0) {
+            n = t[slot].nseg;
+            snap[..n].copy_from_slice(&t[slot].segs[..n]);
+            t[slot] = LoadedImage::EMPTY;
+        }
+    }
+    if n > 0 {
+        let mut mem = MEM.lock();
+        for &(base, len) in &snap[..n] {
+            mem.free_region(PhysRegion::new(base, len));
+        }
+    }
+}
+
 /// Ein extern geladenes, **validiertes** ELF-Image in eine **vor-erstellte** isolierte PD laden +
 /// starten (ext-26, L1c/L3, generischer Binary-Loader). Kopiert die `PT_LOAD`-Segmente an beliebige
 /// RAM-Frames und mappt sie **W^X** an ihre Link-VAs ([`hal::mmu::vspace_map_page_at`]), legt einen
@@ -1232,12 +1302,20 @@ pub fn load_into_pd(img: &ElfImage, pd: usize, endow: &[(usize, CapPtr)]) -> Opt
     };
 
     // 1. PT_LOAD-Segmente: kopieren + W^X an Link-VA mappen (nicht-identity, vaddr -> beliebige pa).
+    // Die Segment-Frames merken (für den Teardown via loaded_register; NICHT den Stack — der wird
+    // beim Thread-Ende via Reap freigegeben).
+    let mut seglist = [(0u64, 0u64); MAX_IMG_SEGS];
+    let mut nrec = 0usize;
     for seg in img.segments() {
         let total = (((seg.memsz as u64) + 4095) & !4095) as usize;
         let Some(region) = MEM.lock().alloc(total as u64, 4096) else {
             return fail(asid, kidx);
         };
         let pa = region.base(); // MemoryCap-Drop = nur Deskriptor (kein Free); RAM bleibt belegt
+        if nrec < MAX_IMG_SEGS {
+            seglist[nrec] = (pa, total as u64);
+            nrec += 1;
+        }
         copy_segment(pa, img.segment_bytes(&seg), total);
         let perm = if seg.flags & PF_X != 0 {
             hal::mmu::UserPerm::Rx
@@ -1303,6 +1381,7 @@ pub fn load_into_pd(img: &ElfImage, pd: usize, endow: &[(usize, CapPtr)]) -> Opt
     };
     record_user_kstack(tid.slot(), kidx);
     VSPACE_OF[tid.slot()].store(((asid as u64) << 48) | l1, Ordering::Relaxed); // ab jetzt isoliert
+    loaded_register(asid, &seglist[..nrec]); // Segment-Frames fuer den Teardown merken (L4)
     bind_pd(pd, tid);
     for &(slot, cap) in endow {
         install_pd_cap(pd, slot, cap); // policy-geprüft (Domänen-Policy bleibt gültig)

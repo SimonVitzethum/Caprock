@@ -319,6 +319,29 @@ impl PdTable {
         Some(i)
     }
 
+    /// Eine PD **freigeben** (ext-26, L4): den Slot leeren (used=false, Cspace/Domäne/Partner
+    /// zurückgesetzt). Der Aufrufer ist dafür verantwortlich, die im Cspace gehaltenen Caps vorher
+    /// zu löschen (sonst lecken globale Cap-Objekte) und den Thread/die VSpace abzubauen. Gibt
+    /// `false`, wenn die PD nicht belegt war.
+    pub fn free(&mut self, pd: usize) -> bool {
+        if pd < NPDS && self.pds[pd].used {
+            self.pds[pd] = Pd::EMPTY;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Die lokalen Cap-Slots einer PD (für den Teardown: jeden installierten Cap löschen). Gibt
+    /// die belegten `(slot, CapPtr)` zurück.
+    pub fn caps_of(&self, pd: usize) -> [Option<CapPtr>; NCAPS] {
+        if pd < NPDS && self.pds[pd].used {
+            self.pds[pd].cspace
+        } else {
+            [None; NCAPS]
+        }
+    }
+
     /// Die (unveränderliche) Domäne einer PD.
     pub fn domain_of(&self, pd: usize) -> Option<Domain> {
         if pd < NPDS && self.pds[pd].used {

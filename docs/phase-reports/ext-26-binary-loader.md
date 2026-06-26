@@ -1,7 +1,7 @@
-# ext-26 — Generischer Binary-Loader (Phasen L0–L3)
+# ext-26 — Generischer Binary-Loader (Phasen L0–L4)
 
-Status: **L0 + L1 + L2 + L3 fertig** (Boot-Delivery, ELF-Parser, externe Toolchain, EL0-Laden,
-`SYS_LOAD`, HardwareLand-Laden + Signatur-/Trust-Gate). Suite grün (53 Checks). Architektur/Format:
+Status: **L0–L4 fertig** (Boot-Delivery, ELF-Parser, externe Toolchain, EL0-Laden, `SYS_LOAD`,
+HardwareLand-Laden + Trust-Gate, Teardown). Suite grün (54 Checks). Architektur/Format:
 [ADR 0011](../adr/0011-binary-loader.md). Plan: [ext-26-binary-loader-plan.md](ext-26-binary-loader-plan.md).
 
 ## Ziel
@@ -49,6 +49,15 @@ Sicherheitsarchitektur (Capabilities, Domänen, Region-Runtime, Audits, W^X) ble
   Signaturprüfung implementiert ist (`prog.hash`-Hook, ADR 0011 §7), wird EL1-Laden **abgelehnt**
   (`Unverified`). Test `loadhw`: `hwhello` (= hello, Domäne HardwareLand) in eine Backend-PD geladen,
   signalisiert seinen Kanal; ein TrustedSAS-Image (`trusted-x`) wird vom Gate abgewiesen.
+- **L4 — Teardown geladener Prozesse.** Geladene `PT_LOAD`-Segment-Frames sind **nicht** cap-getrackt
+  (Eigentum geht an die VSpace über) → ohne Aufräumen lecken sie beim Teardown. Ein **Segment-
+  Register** (`LOADED_IMAGES`, je ASID) merkt die Frames; `vspace_teardown` gibt sie mit frei.
+  `destroy_loaded(tid, pd)` baut einen geladenen Prozess **vollständig** ab: PD-Caps löschen
+  (delegierte CDT-Kopien) → Thread + VSpace-Tabellen + Segment-Frames + Kernel-Stack
+  (`destroy_isolated`) → PD-Slot frei (`PdTable::free`). Test `loadstop`: laden + abbauen → MEM/
+  VSpace/Kstack-Baseline wiederhergestellt (kein Leck) — Voraussetzung fürs Churnen geladener
+  Prozesse (ext-27). (Hot-Reload geladener Prozesse: der ext-7-`reload_swap`-Mechanismus existiert;
+  auf geladene Prozesse angewandt = Folgeschritt.)
 
 ## Nutzer-Review-Verfeinerungen (eingebaut)
 

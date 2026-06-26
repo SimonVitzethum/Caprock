@@ -1678,20 +1678,27 @@ pub fn dma_enforcer_init() -> bool {
 
 /// Eine kontiguierliche **DMA-RAM-Region** (4-KiB-granular, in der mappbaren GiB-1-Region)
 /// ausschneiden. `None` bei Erschöpfung oder wenn die Allokation nicht in GiB 1 liegt (dort
-/// arbeitet [`hal::mmu::vspace_map_dma`]). Die Region wird anschließend über eine DmaCap
-/// verwaltet; ihre Freigabe erfolgt beim Löschen der Cap (`delete_leaf` -> `free_region`),
-/// also genau einmal (balanciert mit dieser Allokation).
+/// arbeitet [`hal::mmu::vspace_map_dma`]).
+///
+/// **Konsolidierung K3:** carvt über die **kanonische** [`KernelRegionSource`] (eine einzige
+/// MEM-Carve-Stelle für besitzte Regionen), als `Purpose::Dma` getaggt. Anders als ein Heap-
+/// `Region` (das seinen `MemoryCap` besitzt und über die `RegionSource` freigegeben wird) ist das
+/// **Besitzmodell** einer DMA-Region bewusst (phys,len)-basiert: die Lebensdauer hängt an der
+/// **DmaCap** — die Freigabe erfolgt beim Löschen der Cap (`delete_leaf` -> `free_region`) bzw.
+/// über [`free_dma_region`] (roher Pfad), genau einmal. Daher wird der `Region`-Wrapper hier zu
+/// einem reinen `MemoryCap`-Deskriptor aufgelöst (`into_cap`, **kein** Drop-Free) und nur die
+/// `PhysRegion` weitergereicht. Siehe `docs/invariants.md` §2/§3.
 pub fn alloc_dma_region(len: u64) -> Option<PhysRegion> {
-    let len = (len + 4095) & !4095;
-    let mut mem = MEM.lock();
-    let cap = mem.alloc(len, 4096)?;
-    let r = cap.region();
-    if r.base < hal::mmu::USER_RAM_MIN || r.base + r.len > hal::mmu::GIB1_END {
-        mem.free(cap); // nicht in GiB 1 -> zurückgeben (sonst nicht mappbar)
+    let region = KernelRegionSource.request(len as usize, Purpose::Dma)?;
+    let pr = PhysRegion::new(region.phys(), region.len() as u64);
+    if pr.base < hal::mmu::USER_RAM_MIN || pr.base + pr.len > hal::mmu::GIB1_END {
+        KernelRegionSource.release(region); // nicht in GiB 1 -> zurückgeben (sonst nicht mappbar)
         return None;
     }
-    drop(cap); // nur ein Deskriptor (kein Drop-Free); Eigentum geht an die DmaCap über
-    Some(r)
+    // Eigentum geht an die DmaCap über (Freigabe nach (phys,len), s.o.). Den linearen
+    // `MemoryCap` als reinen Deskriptor auflösen — KEIN Drop-Free.
+    let _ = region.into_cap();
+    Some(pr)
 }
 
 /// Eine **DMA-Capability** (ext-23, HardwareLand) über die kernel-ausgeschnittene Region

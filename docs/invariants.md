@@ -62,9 +62,15 @@ ziehen, Lock freigeben, dann gegen `CAPS.read().for_each_dma` prüfen — Rangor
 Jede `PhysAllocator`-Allokation hat genau einen Rückgabepfad; über einen vollständigen
 Alloc-/Free-Zyklus bleibt `MEM.total_free()` unverändert.
 
-- **DmaCap-Region:** `alloc_dma_region`/`KernelRegionSource::request` ↔ `delete_leaf`(Dma)/`release`.
-- **Region-Runtime:** jede `Region` besitzt eine `MemoryCap` (lineares Eigentum); `Heap::drop` gibt
-  **alle** Regionen über `RegionSource::release` zurück.
+- **DmaCap-Region:** carvt über `KernelRegionSource::request` (eine MEM-Carve-Stelle, K3), aber das
+  **Besitzmodell ist (phys,len)-basiert**: die Lebensdauer hängt an der **DmaCap**, nicht an einem
+  `Region`. Freigabe genau einmal über `delete_leaf`(Dma) → `free_region` (Cap-Pfad) bzw.
+  `free_dma_region` (roher Pfad). Der `Region`-Wrapper aus `request` wird sofort zum reinen
+  `MemoryCap`-Deskriptor aufgelöst (`into_cap`, kein Drop-Free) — bewusst **nicht** Region-besessen
+  (eine DMA-Region wird nie über `RegionSource::release` zurückgegeben). Das ist kein Duplikat,
+  sondern ein zweites legitimes Besitzmodell für dasselbe RAM.
+- **Region-Runtime (Heap):** jede `Region` **besitzt** ihren `MemoryCap` (lineares Eigentum);
+  `Heap::drop` gibt **alle** Regionen über `RegionSource::release` zurück.
 - **Thread-Stacks:** `spawn` ↔ `reap_core` (`REAPED_BYTES` belegt die Rückgabe monoton).
 
 **Audit/Test:** hwfuzz-Baseline (`total_free` balanciert je Epoche), `churn`, `dmagen`

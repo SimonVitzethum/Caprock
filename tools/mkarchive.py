@@ -3,13 +3,16 @@
 #
 # Baut `boot-archive.bin` aus extern gebauten Programm-Blobs + Manifesten. Das Archiv wird per
 # QEMU `-device loader,file=...,addr=MOD_BASE` in das reservierte RAM-Fenster geladen; der Kernel
-# liest es mit dem `sel4lake-loader`-Parser. Format siehe crates/sel4lake-loader/src/lib.rs.
+# liest es mit dem `sel4lake-loader`-Parser. Format: crates/sel4lake-loader/src/archive.rs.
+#
+# Das Boot-Archiv ist nur EINE Quelle (ADR 0011, Verfeinerung 3); jeder Eintrag traegt eine stabile
+# numerische program_id + version (Verfeinerung 4).
 #
 # Aufruf:
-#   mkarchive.py OUT NAME:DOMAIN:BLOB[:MANIFEST] [NAME:DOMAIN:BLOB[:MANIFEST] ...]
+#   mkarchive.py OUT ID:NAME:DOMAIN:VERSION:BLOB[:MANIFEST] [ ... ]
 #   DOMAIN: 0=TrustedSAS 1=HardwareLand 2=UserLand
 # Beispiel:
-#   mkarchive.py build/boot-archive.bin hello:2:build/hello.elf:build/hello.manifest
+#   mkarchive.py build/boot-archive.bin 1:hello:2:1:build/hello.elf:build/hello.manifest
 import struct
 import sys
 
@@ -21,31 +24,31 @@ ENTRY_LEN = 96
 
 def main(argv):
     if len(argv) < 2:
-        sys.stderr.write(__doc__ or "usage: mkarchive.py OUT [NAME:DOMAIN:BLOB[:MANIFEST] ...]\n")
+        sys.stderr.write("usage: mkarchive.py OUT ID:NAME:DOMAIN:VERSION:BLOB[:MANIFEST] ...\n")
         return 2
     out = argv[1]
     specs = argv[2:]
-    entries = []  # (name, domain, blob_bytes, manifest_bytes)
+    entries = []  # (program_id, name, version, domain, blob_bytes, manifest_bytes)
     for s in specs:
         parts = s.split(":")
-        if len(parts) < 3:
-            sys.stderr.write(f"mkarchive: ungueltige Spec '{s}'\n")
+        if len(parts) < 5:
+            sys.stderr.write(f"mkarchive: ungueltige Spec '{s}' (erwartet ID:NAME:DOMAIN:VERSION:BLOB[:MANIFEST])\n")
             return 2
-        name, domain, blobpath = parts[0], int(parts[1]), parts[2]
-        manpath = parts[3] if len(parts) > 3 else None
+        pid, name, domain, ver, blobpath = int(parts[0]), parts[1], int(parts[2]), int(parts[3]), parts[4]
+        manpath = parts[5] if len(parts) > 5 else None
         with open(blobpath, "rb") as f:
             blob = f.read()
         man = b""
         if manpath:
             with open(manpath, "rb") as f:
                 man = f.read()
-        entries.append((name, domain, blob, man))
+        entries.append((pid, name, ver, domain, blob, man))
 
     count = len(entries)
     table_end = HEADER_LEN + count * ENTRY_LEN
     payload = bytearray()
     spans = []  # (blob_off, blob_len, man_off, man_len)
-    for (_, _, blob, man) in entries:
+    for (_, _, _, _, blob, man) in entries:
         bo = table_end + len(payload)
         payload += blob
         mo = table_end + len(payload)
@@ -54,14 +57,16 @@ def main(argv):
     total = table_end + len(payload)
 
     buf = bytearray(table_end)
-    struct.pack_into("<IIII", buf, 0, MAGIC, VERSION, count, total)
-    # reserved[4] bleibt 0
-    for i, ((name, domain, _, _), (bo, bl, mo, ml)) in enumerate(zip(entries, spans)):
+    struct.pack_into("<IIII", buf, 0, MAGIC, VERSION, count, total)  # reserved[4] bleibt 0
+    for i, ((pid, name, ver, domain, _, _), (bo, bl, mo, ml)) in enumerate(zip(entries, spans)):
         base = HEADER_LEN + i * ENTRY_LEN
         nb = name.encode()[:16]
         buf[base:base + len(nb)] = nb
-        struct.pack_into("<IIIIII", buf, base + 16, bo, bl, mo, ml, domain, 0)
-        # hash[32] (base+40..72) + reserved[6] (72..96) bleiben 0
+        # program_id, version, domain, flags(0)
+        struct.pack_into("<IIII", buf, base + 16, pid, ver, domain, 0)
+        # blob_off, blob_len, manifest_off, manifest_len
+        struct.pack_into("<IIII", buf, base + 32, bo, bl, mo, ml)
+        # hash[32] (base+48..80) + reserved[4] (80..96) bleiben 0
     buf += payload
 
     with open(out, "wb") as f:

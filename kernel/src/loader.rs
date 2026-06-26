@@ -8,7 +8,7 @@
 //! **L0:** das Boot-Archiv aus dem reservierten RAM-Fenster lesen + die Module melden.
 
 use sel4lake_hal::{print, println};
-use sel4lake_loader::Archive;
+use sel4lake_loader::archive::Archive;
 
 /// Größe des reservierten RAM-Fensters für das Boot-Archiv (oben in RAM, vom `PhysAllocator`
 /// ausgenommen — siehe `init_mem`-Aufruf in `main.rs`). QEMU legt das Archiv per
@@ -36,8 +36,9 @@ pub fn probe() {
     match read_archive() {
         Some(a) => {
             print!("archive : {} Modul(e):", a.count());
-            for e in a.iter() {
-                print!(" {}", e.name());
+            for p in a.iter() {
+                // Stabile program_id (Verfeinerung 4) + Name + Version melden.
+                print!(" [{}]{}@v{}", p.program_id, p.name(), p.version);
             }
             println!(" -> ALL PASS");
         }

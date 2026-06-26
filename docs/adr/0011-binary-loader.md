@@ -80,6 +80,23 @@ ein klar markierter Hook (`verify_image(entry) -> bool`, vorerst `true` außer f
 sobald implementiert). So lässt sich Signaturprüfung + Versionsverwaltung später **ohne
 Format-/API-Bruch** nachrüsten.
 
+## Verfeinerungen (Nutzer-Review, vor L1 eingebaut)
+
+1. **Loader als eigener Kernel-Dienst, kleine öffentliche API.** Der Loader lebt im Kernel, ist aber
+   ein eigenes Modul (`kernel/src/loader.rs` + Crate `sel4lake-loader`) mit **minimaler** öffentlicher
+   API: im Kern eine einzige Operation `loader::load_image(&Program, …) -> Result<Pd, LoaderError>`.
+   So bleibt er formal analysierbar + später austauschbar.
+2. **ELF vollständig in Safe Rust parsen.** Alle Header-/Offset-/Größenprüfungen liegen im Crate
+   `sel4lake-loader` (`#![forbid(unsafe_code)]`). `unsafe` entsteht **erst** beim Kopieren bereits
+   **validierter** Segmente in den Zielspeicher (Kernel-Glue) — nie im Parser.
+3. **Quelle austauschbar — API NICHT archiv-abhängig.** Das Boot-Archiv ist nur die **erste** Quelle.
+   Die interne Loader-API spricht einen **quellen-agnostischen** `Program`-Deskriptor (Metadaten +
+   Roh-Image-Bytes), nicht das Archivformat. Künftige Quellen (Dateisystem, Flash, Netzwerk) liefern
+   denselben `Program` → `load_image` bleibt unverändert. Der Archiv-Parser ist nur **ein** Produzent.
+4. **Stabile numerische Program-ID.** Jeder Eintrag trägt eine **`program_id`** (überdauert
+   Namensänderungen) zusätzlich zu `name`, `version`, `domain`, `hash`. IDs sind stabil für
+   Hot-Reload, Logs, Debugging; Namen sind nur menschenlesbar.
+
 ## Architekturvergleich
 
 | Kriterium | **A: In-Kernel, cap-gegatet** ✅ | B: Userspace-Loader-Server | C: Hybrid |

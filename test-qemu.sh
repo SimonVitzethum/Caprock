@@ -30,7 +30,7 @@ mkdir -p build
 printf 'PROBE-A-BLOB' > build/_proba.bin
 printf 'PROBE-B-BLOB' > build/_probb.bin
 python3 tools/mkarchive.py build/boot-archive.bin \
-    probe-a:2:build/_proba.bin probe-b:1:build/_probb.bin >/dev/null 2>&1 \
+    1:probe-a:2:1:build/_proba.bin 2:probe-b:1:3:build/_probb.bin >/dev/null 2>&1 \
     || { echo "ARCHIVE BUILD FAILED"; exit 1; }
 
 echo "== boot ($SECONDS_RUN s) =="

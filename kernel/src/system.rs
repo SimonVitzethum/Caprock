@@ -2125,7 +2125,39 @@ pub fn dma_audit() -> u32 {
     if dma_enforcer().audit() != 0 {
         return 3;
     }
+    // Revoke-Ordnung-Invariante (docs/invariants.md §2, DMA-use-after-free-sicher): eine noch in
+    // einem SMMU-Kontext gemappte Region darf NIE freigegeben sein. Wäre sie freigegeben (free
+    // VOR disable_dma), läge sie in der Free-Liste und überlappte sie -> Code 4. Funktioniert für
+    // den cap-basierten (dma_attach) UND den rohen (dma_enable) Pfad. Snapshot von DMA_CTX ziehen
+    // + Lock freigeben, DANN MEM prüfen (Rangordnung R1 vor R4, nie gleichzeitig gehalten).
+    if !dma_ctx_regions_live() {
+        return 4;
+    }
     0
+}
+
+/// Hilfsprüfung für [`dma_audit`] Code 4: keine aktuell in einem `DMA_CTX` gemappte Region
+/// überlappt freies RAM (sonst wurde sie freigegeben, während die SMMU-Stage-1 noch darauf zeigte).
+/// Snapshot der Kontext-Regionen (DMA_CTX kurz sperren, kopieren, freigeben), danach gegen
+/// `MEM.overlaps_free` — die beiden Locks werden NIE gleichzeitig gehalten (R1 vor R4).
+fn dma_ctx_regions_live() -> bool {
+    let mut snap = [(0u64, 0u64); NDMA_CTX * MAX_CTX_REGS];
+    let mut n = 0;
+    {
+        let t = DMA_CTX.lock();
+        for c in t.iter() {
+            if c.used {
+                for &(b, l) in c.regs.iter() {
+                    if l != 0 {
+                        snap[n] = (b, l);
+                        n += 1;
+                    }
+                }
+            }
+        }
+    } // DMA_CTX freigegeben
+    let mem = MEM.lock();
+    !snap[..n].iter().any(|&(b, l)| mem.overlaps_free(b, l))
 }
 
 // --- PCIe-Enumeration (ext-23, D1; kernel-/Trusted-Setup) ---

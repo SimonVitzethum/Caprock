@@ -89,6 +89,24 @@ impl PhysAllocator {
         self.len
     }
 
+    /// Überlappt `[base, base+len)` ein aktuell **freies** Fragment? Trägt die DMA-Revoke-
+    /// Ordnung-Invariante (`docs/invariants.md` §2): eine noch in einem SMMU-Kontext gemappte
+    /// Region darf NIE freigegeben sein — andernfalls läge sie in der Free-Liste und überlappte
+    /// hier (DMA-use-after-free). `len == 0` → nie eine Überlappung.
+    pub fn overlaps_free(&self, base: u64, len: u64) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let end = base.saturating_add(len);
+        for i in 0..self.len {
+            let r = &self.regions[i];
+            if base < r.base + r.len && r.base < end {
+                return true;
+            }
+        }
+        false
+    }
+
     // --- intern ---
 
     /// Sortiert (nach `base`) einfügen und anschließend koaleszieren.

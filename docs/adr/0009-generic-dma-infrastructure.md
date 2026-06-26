@@ -57,7 +57,10 @@ geräteunabhängig. (Verworfen: SG-Logik je Gerät im Kernel — Geräte-Wissen 
   (intern `dc cvac`/`dc civac` + `dsb`) — Backends rufen sie geräteunabhängig um Transfers.
 - **DmaPool** — Bump-Sub-Allokator über eine angehängte Region (Deskriptor-Ringe, mbufs); jeder
   Sub-Puffer ist ein `DmaHandle` innerhalb der bereits SMMU-gemappten + Level-1-validierbaren
-  Eltern-Region.
+  Eltern-Region. **(In der Konsolidierung K2 entfernt:** redundant — ein Sub-Puffer ist nur ein
+  Teilbereich `[handle.iova+offset, +len)`, validiert über den kanonischen SG-/Containment-Pfad
+  `DmaSgEntry`+`dma_sg_validate`→`region_contains`. Ein Backend führt bei Bedarf einen trivialen
+  Offset-Cursor selbst. Siehe `docs/phase-reports/consolidation-ext22-25.md`.)**
 
 ## Schichtung (unverändert tragend)
 

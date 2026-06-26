@@ -43,12 +43,17 @@ dependencies = [
  "sel4lake-dtb",
  "sel4lake-hal",
  "sel4lake-ipc",
+ "sel4lake-loader",
  "sel4lake-mem",
  "sel4lake-microkit",
  "sel4lake-region",
  "sel4lake-sched",
  "sel4lake-sync",
 ]
+
+[[package]]
+name = "sel4lake-loader"
+version = "0.0.1"
 
 [[package]]
 name = "sel4lake-mem"

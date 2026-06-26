@@ -28,6 +28,7 @@ unsafe impl core::alloc::GlobalAlloc for NoGlobalHeap {
 static GLOBAL: NoGlobalHeap = NoGlobalHeap;
 
 mod arch;
+mod loader;
 mod panic;
 mod selftest;
 mod system;
@@ -115,8 +116,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // User-RAM erst ab 2 MiB: die ersten 2 MiB sind die geteilte Kernel-L3 (von
     // jeder isolierten VSpace genutzt) und dürfen kein EL0-zugängliches RAM enthalten.
     let free_base = hal::mmu::kernel_end().max(hal::mmu::USER_RAM_MIN);
-    system::init_mem(free_base, ram_end);
-    println!("mem     : freies RAM [{free_base:#x}, {ram_end:#x})");
+    // ext-26: das oberste RAM-Fenster [MOD_BASE, ram_end) ist für das extern geladene Boot-Archiv
+    // reserviert (QEMU `-device loader`); der Allokator bekommt es NICHT -> kein Konflikt.
+    let alloc_end = ram_end.min(loader::MOD_BASE);
+    system::init_mem(free_base, alloc_end);
+    println!("mem     : freies RAM [{free_base:#x}, {alloc_end:#x})  (Loader-Fenster [{:#x}, {ram_end:#x}) reserviert)", loader::MOD_BASE);
+    loader::probe(); // Boot-Archiv lesen + Module melden (L0; Laden folgt ab L1)
     selftest::run();
 
     // Phase 4–6: Scheduler + cap-gesicherte IPC + Protection Domains.

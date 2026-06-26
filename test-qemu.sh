@@ -23,6 +23,16 @@ ELF="build/target/aarch64-sel4lake/release/sel4lake-kernel.elf"
 echo "== build =="
 ./build.sh >/dev/null 2>&1 || { echo "BUILD FAILED"; exit 1; }
 
+# ext-26 (L0): das extern geladene Boot-Archiv assemblieren (Host-Tool tools/mkarchive.py, KEIN
+# Kernelcode). Noch keine echten Programme -> zwei Platzhalter-Module, um den Liefer-/Lese-/
+# Parse-Pfad (QEMU -device loader -> reserviertes RAM-Fenster -> Kernel-Parser) zu pruefen.
+mkdir -p build
+printf 'PROBE-A-BLOB' > build/_proba.bin
+printf 'PROBE-B-BLOB' > build/_probb.bin
+python3 tools/mkarchive.py build/boot-archive.bin \
+    probe-a:2:build/_proba.bin probe-b:1:build/_probb.bin >/dev/null 2>&1 \
+    || { echo "ARCHIVE BUILD FAILED"; exit 1; }
+
 echo "== boot ($SECONDS_RUN s) =="
 # ext-23: SMMUv3 (IOMMU) + virtio-rng-pci HINTER einem pcie-root-port (StreamID = PCI-RID).
 # QEMUs SMMUv3 uebersetzt nur Endpunkte hinter einem Root-Port (integrierte Bus-0-Endpunkte
@@ -32,6 +42,7 @@ OUT="$(timeout --signal=KILL "$SECONDS_RUN" qemu-system-aarch64 \
     -machine virt,iommu=smmuv3 -cpu cortex-a72 -smp "$CORES" -m 4G \
     -nographic -serial mon:stdio -no-reboot \
     -net none -device pcie-root-port,id=rp0,chassis=1 -device virtio-rng-pci,bus=rp0 \
+    -device loader,file=build/boot-archive.bin,addr=0x13F000000 \
     -kernel "$ELF" </dev/null 2>/dev/null)"
 
 echo "$OUT"
@@ -41,6 +52,7 @@ check() { if echo "$OUT" | grep -q "$1"; then echo "  PASS: $2"; else echo "  FA
 
 check "M=1 C=1 I=1" "MMU + Caches aktiv"
 check "dtb     : ALL PASS" "DTB-Parsing (RAM-Größe aus dem Device Tree)"
+check "archive : 2 Modul" "ext-26 L0: Boot-Archiv extern geladen + vom Kernel-Parser gelesen (reserviertes RAM-Fenster, sel4lake-loader)"
 check "memtest : ALL PASS" "Speichermodell-Selbsttest (alloc/split/transfer/free)"
 check "captest : ALL PASS" "Capability-Selbsttest (copy/mint/move/delete/revoke)"
 check "sched   : ALL PASS" "Scheduler (Preemption auf core 0 + alle Kerne ticken)"

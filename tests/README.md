@@ -25,14 +25,24 @@ Kernel einen Angriff durch, bliebe das Signal aus → der Kernel-Test (Idle-Mana
 Timeout → **FAIL**. Fatale Speicher-Batterien signalisieren zuerst ein **PRE**-Badge, dann erfolgt
 die fatale Dereferenzierung → Fault; der Kernel beobachtet PRE + `el0_fault_count`++ + Survival.
 
-## Struktur
+## Struktur (sechs Dienste, 2 je Domäne)
 
 | Verzeichnis | Dienst | Domäne | Schwerpunkt |
 |---|---|---|---|
 | `services/userland/aggressor/` | `aggressor-u` | UserLand | Cap-Confusion + Autoritäts-Eskalation (alle abgewiesen). |
+| `services/userland/intruder/`  | `intruder-u`  | UserLand | Speicher-Isolation: Kernel-RAM-Deref → Fault. |
+| `services/hardware/aggressor/` | `aggressor-h` | HardwareLand | Backend ohne Management-Autorität, nichts außerhalb des Kanals. |
+| `services/hardware/intruder/`  | `intruder-h`  | HardwareLand | Speicher-Isolation domänen-unabhängig. |
+| `services/trusted/aggressor/`  | `aggressor-t` | TrustedSAS | **Trust ≠ Privileg** (nur gehaltene Caps zählen). |
+| `services/trusted/intruder/`   | `intruder-t`  | TrustedSAS | Speicher-Isolation **auch** für die vertraute Domäne. |
 
-(Weitere Dienste je Domäne folgen in den ext-27-Phasen T1–T4: `intruder-u`, `aggressor-h`,
-`intruder-h`, `aggressor-t`, `intruder-t`.)
+Die **Cross-Service-Matrix** (`cross`, ext-27 T4) lädt drei dieser Dienste **dreier Domänen
+nebenläufig** und beweist, dass gleichzeitige cross-domain Angreifer einander nicht stören und ein
+kernel-geschütztes Canary unberührt bleibt. Vollständige Angriffsmatrix:
+[ext-27-adversarial-tests.md](../docs/phase-reports/ext-27-adversarial-tests.md).
+
+Dieselbe Angriffslogik aus **allen drei Domänen** identisch abgewiesen zu sehen IST der
+Domänen-Unabhängigkeits-Beweis (die Domäne legt der Archiv-Eintrag fest, nicht das Binary).
 
 ## Abgrenzung
 

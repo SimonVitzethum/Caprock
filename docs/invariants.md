@@ -146,3 +146,24 @@ Programmieren. Auf realer HW (z. B. STM32MP25) ist die installierte Stage-1-STE 
 
 `ipc_audit() == 0` bei jedem Quiescenz-Punkt + zwischen allen Fuzzer-Operationen = alle obigen
 Invarianten halten.
+
+## 8. Adversariale Validierung von außen (ext-27, ADR 0012)
+
+Die Isolations-Invarianten (insbesondere #1 Hardware-Adressraumtrennung, #5 Domänen-/Cap-Policy)
+werden zusätzlich durch **extern geladene Drittsoftware** geprüft: sechs adversariale EL0-Dienste
+(`tests/services/`, 2 je Domäne), vom Binary-Loader geladen, greifen den Kernel + sich gegenseitig
+ausschließlich über die Syscall-ABI an. Schlüsselaussagen, empirisch bestätigt:
+
+- **Hardware-Isolation ist domänen-unabhängig.** Ein geladener Dienst **jeder** Domäne (auch
+  HardwareLand und TrustedSAS) faultet beim Lesen von Kernel-RAM aus EL0 (`el0-trap FAR=0x40000000`),
+  wird terminiert, der Kernel überlebt. Trust befreit **nicht** von der MMU-Trennung.
+- **Trust = Cap-Autorität, nicht Privileg.** Ein TrustedSAS-Dienst ohne tatsächlich gehaltene
+  `PdControl`/`Loader`-Cap erhält auf PDCTL/LOAD/KILL `ERR_BADCAP` — die Domäne allein gewährt keine
+  Operationsmacht.
+- **Cross-Service-Nicht-Interferenz unter Nebenläufigkeit:** drei Angreifer dreier Domänen gleichzeitig
+  → keiner stört die korrekte Abweisung eines anderen, ein kernel-geschütztes Canary bleibt
+  bit-genau unberührt, alle Audits 0.
+
+Aus einem EL0-Prozess sind **nur** ABI-Operationen ausdrückbar; Cap-/CDT-Operationen (kein Syscall)
+bleiben im In-Kernel-Selbsttest (`captest`/`fuzz`/`ipcfuzz`). Vollständige Matrix:
+`docs/phase-reports/ext-27-adversarial-tests.md`.

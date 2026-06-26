@@ -26,7 +26,7 @@ gleichzeitig halten, wenn ein Kopieren-und-Freigeben es vermeidet.*
 
 **Belegte Schachtelungen (aus dem Code):**
 - `delete_leaf` (Cap-Teardown): `CAPS.write` → `MEM` (`free_region`).  R0 → R4
-- `SmmuV3Enforcer::enable_dma`/`disable_dma`: `DMA_CTX` → `MEM` (Tabellen-Alloc/Free).  R1 → R4
+- `SmmuV3Enforcer::attach`/`detach`: `DMA_CTX` → `MEM` (Tabellen-Alloc/Free).  R1 → R4
 - `Heap::allocate` (`RegionSource::request`): `Heap.inner` → `MEM`.  R3 → R4
 - `endpoint_quiesce_owner`/`purge_ipc_queues`: `EPS`/`NTFNS` **freigeben**, dann `SCHEDS`
   (`unblock_with_error`).  R1 vor R2
@@ -39,6 +39,27 @@ gleichzeitig halten, wenn ein Kopieren-und-Freigeben es vermeidet.*
 
 **Leaf-Locks** (stets allein gehalten, keine Schachtelung): `KSTACKS`, `FP_STATES`, `VIRTIO_PCI`,
 `CS_RELOAD_INFO`/`RELOAD_INFO`, `hal::console::CONSOLE`.
+
+### 1a. IRQ-Sicherheit der SpinLocks (reentranter Ticket-Lock-Deadlock — Bugfix)
+
+`SpinLock` ist ein **FIFO-Ticket-Lock**. Mehrere per-Kern-Locks werden **sowohl im IRQ-/Reschedule-
+Pfad** (Timer-Tick → `reschedule` nimmt `SCHEDS[core]`; `drain_pending_irqs` nimmt `NTFNS[]`) **als
+auch in Thread-/Idle-Kontext** genommen (`idle → reap_core → SCHEDS[core]`; Syscalls; Fuzzer-
+`kill_remote`/`reap_core`). Ohne IRQ-Maske ist das tödlich: feuert der Timer-Tick, während Thread-/
+Idle-Kontext einen solchen Lock **hält oder erwartet**, zieht der Reschedule-Hook ein **zweites
+Ticket** auf denselben Lock — der erste Halter ist aber im IRQ-Handler suspendiert und gibt sein
+Ticket nie frei → **Deadlock** (andere Kerne, die cross-core auf `SCHEDS[C]` warten, hängen mit).
+
+**Invariante (erzwungen durch `SpinLock` selbst):** `lock()` maskiert IRQs am eigenen Kern (DAIF
+sichern + I-Bit setzen) **vor** dem Ticket-Ziehen und der Guard stellt den vorherigen Zustand beim
+`Drop` wieder her (nesting-sicher: jeder Guard sichert den Stand von vor seinem Lock; der äußerste
+gibt „IRQs an" frei). Damit kann der Reschedule-/IRQ-Hook einen SpinLock-Halter **nie** unterbrechen.
+`RwSpinLock` (`CAPS`) wird **nicht** im IRQ-Pfad genommen und bleibt ohne IRQ-Maske.
+
+*Befund:* dieser Deadlock war **vorbestehend** (seit der SMP-/MCS-Phase) und trat unter QEMU-TCG mit
+~27 % je Lauf auf (im el0iso-/reclaim-/native-/Fuzzer-Abschnitt, der viel spawnt/faultet/reapt +
+cross-core killt); er wurde fälschlich als „Host-Last-Flakiness" abgetan. Nach dem Fix: 30/30 Läufe
+deadlock-frei (vorher 4/15).
 
 ## 2. DMA-Revoke-Reihenfolge (DMA-use-after-free-Sicherheit)
 

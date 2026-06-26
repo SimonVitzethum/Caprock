@@ -11,6 +11,52 @@ use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU32, Ordering};
 
+// --- IRQ-Sicherheit der SpinLocks (Bugfix: reentranter Ticket-Lock-Deadlock) ---
+//
+// Ein [`SpinLock`] ist ein FIFO-**Ticket**-Lock. Wird derselbe Lock vom IRQ-/Reschedule-Pfad UND
+// von Thread-/Idle-Kontext genommen (im Kernel: `SCHEDS[core]` und `NTFNS[]` werden im
+// Timer-Tick-Reschedule sowie aus `idle->reap_core`/Syscalls genommen), entsteht ohne IRQ-Maske
+// ein Deadlock: feuert der Timer-Tick, während Thread-/Idle-Kontext den Lock hält/erwartet, zieht
+// der Reschedule-Hook ein ZWEITES Ticket auf denselben Lock — der erste Halter ist aber im
+// IRQ-Handler suspendiert und gibt sein Ticket nie frei. Daher maskiert `lock()` IRQs am eigenen
+// Kern VOR dem Ticket-Ziehen und der Guard stellt den vorherigen Zustand beim `Drop` wieder her
+// (nesting-sicher: jeder Guard sichert den Stand von VOR seinem Lock).
+
+/// DAIF (Interrupt-Maske) sichern + IRQs am aktuellen Kern maskieren. Gibt den vorherigen
+/// DAIF-Zustand zurück (für [`irq_restore`]).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn irq_save_disable() -> u64 {
+    let daif: u64;
+    // SAFETY: reines Lesen + Setzen des DAIF-Systemregisters (I-Bit); keine Speicherwirkung.
+    unsafe {
+        core::arch::asm!("mrs {0}, DAIF", out(reg) daif, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("msr daifset, #2", options(nomem, nostack, preserves_flags));
+    }
+    daif
+}
+
+/// Den zuvor gesicherten DAIF-Zustand zurückschreiben (I-Bit). Der äußerste Guard gibt so „IRQs an"
+/// wieder frei; war IRQ schon maskiert (verschachtelt/im Trap), bleibt es maskiert.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn irq_restore(daif: u64) {
+    // SAFETY: schreibt nur das zuvor gelesene DAIF zurück; keine Speicherwirkung.
+    unsafe {
+        core::arch::asm!("msr DAIF, {0}", in(reg) daif, options(nomem, nostack, preserves_flags));
+    }
+}
+
+// Host-Builds (z. B. `cargo test` anderer Crates): kein DAIF — No-Op.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn irq_save_disable() -> u64 {
+    0
+}
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn irq_restore(_daif: u64) {}
+
 /// Fairer Ticket-Spinlock.
 ///
 /// Wer zuerst zieht, kommt zuerst dran (FIFO) — das ist deterministischer als
@@ -41,17 +87,22 @@ impl<T: ?Sized> SpinLock<T> {
     /// Sperrt und gibt einen Guard zurück, der beim Verlassen automatisch
     /// freigibt.
     pub fn lock(&self) -> SpinGuard<'_, T> {
+        // IRQ-sicher: IRQs am eigenen Kern maskieren, BEVOR ein Ticket gezogen wird (sonst kann der
+        // Timer-Tick/Reschedule denselben Lock reentrant ziehen -> Ticket-Deadlock; s. o.).
+        let daif = irq_save_disable();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
         while self.now_serving.load(Ordering::Acquire) != ticket {
             core::hint::spin_loop();
         }
-        SpinGuard { lock: self }
+        SpinGuard { lock: self, daif }
     }
 }
 
-/// RAII-Guard: hält den Lock, gibt bei `Drop` frei.
+/// RAII-Guard: hält den Lock, gibt bei `Drop` frei (und stellt den IRQ-Zustand wieder her).
 pub struct SpinGuard<'a, T: ?Sized> {
     lock: &'a SpinLock<T>,
+    /// DAIF-Zustand vor dem Locken (beim `Drop` wiederhergestellt).
+    daif: u64,
 }
 
 impl<T: ?Sized> Deref for SpinGuard<'_, T> {
@@ -73,8 +124,9 @@ impl<T: ?Sized> DerefMut for SpinGuard<'_, T> {
 impl<T: ?Sized> Drop for SpinGuard<'_, T> {
     fn drop(&mut self) {
         // Nächstes Ticket bedienen; `Release` veröffentlicht alle Schreibzugriffe
-        // unter dem Lock an den nächsten Halter.
+        // unter dem Lock an den nächsten Halter. DANACH den IRQ-Zustand wiederherstellen.
         self.lock.now_serving.fetch_add(1, Ordering::Release);
+        irq_restore(self.daif);
     }
 }
 

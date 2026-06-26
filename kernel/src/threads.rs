@@ -456,6 +456,19 @@ static LOADSTOP_OK: AtomicBool = AtomicBool::new(false);
 static LOADERFUZZ_DONE: AtomicBool = AtomicBool::new(false);
 static LOADERFUZZ_OK: AtomicBool = AtomicBool::new(false);
 
+// ext-27: adversariale EXTERNE Testdienste (geladen wie Drittsoftware, NICHT im Kernel-Image; ADR
+// 0012). Jeder Dienst greift den Kernel ueber die Syscall-ABI an und signalisiert sein SUCCESS-Badge
+// GENAU DANN, wenn ALLE Angriffe korrekt abgewiesen wurden ("der Dienst ist sein eigener Richter").
+// AGGRU = UserLand-Aggressor: Cap-Confusion (leerer Slot/falscher Typ/falsche Rechte) + Autoritaets-
+// Eskalation (PDCTL/LOAD/KILL ohne gating-Cap) -> BADCAP/RIGHTS/BADSYS.
+static AGGRU_STARTED: AtomicBool = AtomicBool::new(false);
+static AGGRU_DONE: AtomicBool = AtomicBool::new(false);
+static AGGRU_OK: AtomicBool = AtomicBool::new(false);
+static AGGRU_NTFN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static AGGRU_POLLS: AtomicU32 = AtomicU32::new(0);
+/// Erfolgs-Badge "AGRU" — aggressor-u signalisiert es nur bei vollstaendig abgewiesener Batterie.
+const AGGRU_SUCCESS: u64 = 0x4147_5255;
+
 // Domänen/HW-Fuzzer (ext-22, P6): churnt über viele Epochen Hardware-/Management-Caps gegen
 // die Domänen-Policy + CDT/VSpace-Oracles + Ressourcen-Baseline. Kernpunkte: HW-Caps (MMIO/
 // IRQ) NUR in HardwareLand, PdControl NUR in TrustedSas installierbar (Negativfälle abgelehnt);
@@ -809,6 +822,41 @@ fn check_loadtrusted_el0() -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// **ext-27 T0 — UserLand-Aggressor starten.** Den extern gebauten Dienst `aggressor-u` (Domaene
+/// UserLand) laden und mit GENAU zwei Caps endowen: Slot 0 = Report-Notification (gemintet
+/// **WRITE-only**, Badge [`AGGRU_SUCCESS`]) — der Dienst signalisiert darueber Erfolg UND probiert
+/// daran `WAIT` (braucht READ) -> `ERR_RIGHTS`; Slot 1 = dieselbe Notification **READ-only** — der
+/// Dienst probiert daran `SIGNAL` (braucht WRITE) -> `ERR_RIGHTS`. Alle uebrigen Angriffe laufen
+/// gegen einen leeren Slot bzw. den falschen Objekttyp (Notification statt Endpoint/Tcb/Memory/
+/// PdControl/Loader). Gibt die Notification-ID zum Pollen (`usize::MAX` bei Setup-Fehler).
+/// IRQ-maskiert (der Dienst darf nicht vor abgeschlossenem PD-/Cap-Aufbau laufen).
+fn run_aggru_start() -> usize {
+    hal::cpu::local_irq_disable();
+    let res = (|| {
+        let archive = loader::read_archive()?;
+        let svc = archive.iter().find(|p| p.name() == "aggressor-u")?;
+        let ntfn = system::create_notification()?;
+        let root = system::install_notification_cap(ntfn as u32, Rights::RW).ok()?;
+        let wcap = system::cap_mint(root, Rights::WRITE, AGGRU_SUCCESS).ok()?; // Slot 0: WRITE-only + Badge
+        let rcap = system::cap_mint(root, Rights::READ, 0).ok()?; // Slot 1: READ-only
+        loader::load_image(&svc, &[(0, wcap), (1, rcap)]).ok()?;
+        Some(ntfn)
+    })();
+    hal::cpu::local_irq_enable();
+    res.unwrap_or(usize::MAX)
+}
+
+/// **ext-27 T0 — Verdikt des UserLand-Aggressors.** `true`, wenn der Dienst sein SUCCESS-Badge
+/// signalisiert hat (alle Angriffe wurden korrekt abgewiesen) UND alle Sicherheits-Audits nach dem
+/// Onslaught sauber sind (kein Korruptions-/Policy-/Leak-Effekt durch die Angriffe).
+fn aggru_audits_ok() -> bool {
+    system::domain_audit() == 0
+        && system::vspace_audit() == 0
+        && system::cap_audit_cdt() == 0
+        && system::loader_audit() == 0
+        && system::ipc_audit() == 0
 }
 
 /// **Generische DMA-Infrastruktur testen** (ext-24): Richtung/Kohärenz (DmaCap-Attribute ->
@@ -3407,7 +3455,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} sysload={} loadhw={} loadstop={} loaderfuzz={} hwfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} sysload={} loadhw={} loadstop={} loaderfuzz={} aggru={} hwfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -3453,6 +3501,7 @@ pub fn demo_report_then_idle() -> ! {
                 LOADHW_FIN.load(Ordering::Acquire) && LOADHW_OK.load(Ordering::Acquire),
                 LOADSTOP_DONE.load(Ordering::Acquire) && LOADSTOP_OK.load(Ordering::Acquire),
                 LOADERFUZZ_DONE.load(Ordering::Acquire) && LOADERFUZZ_OK.load(Ordering::Acquire),
+                AGGRU_DONE.load(Ordering::Acquire) && AGGRU_OK.load(Ordering::Acquire),
                 HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire),
             );
         }
@@ -4666,9 +4715,30 @@ pub fn demo_report_then_idle() -> ! {
             LOADERFUZZ_DONE.store(true, Ordering::Release);
         }
 
+        // ext-27 T0: UserLand-Aggressor (extern geladener Dienst greift den Kernel via Syscall-ABI
+        // an). Start gegate auf den Binary-Loader L5 fertig; dann das SUCCESS-Badge pollen. Der
+        // Dienst beendet sich selbst (exit) nach dem Signal -> kein destroy_loaded noetig.
+        if !AGGRU_STARTED.load(Ordering::Acquire) && LOADERFUZZ_DONE.load(Ordering::Acquire) {
+            let n = run_aggru_start();
+            AGGRU_NTFN.store(n, Ordering::Relaxed);
+            if n == usize::MAX {
+                AGGRU_DONE.store(true, Ordering::Release); // Setup fehlgeschlagen -> FAIL
+            }
+            AGGRU_STARTED.store(true, Ordering::Release);
+        }
+        if AGGRU_STARTED.load(Ordering::Acquire) && !AGGRU_DONE.load(Ordering::Acquire) {
+            let n = AGGRU_NTFN.load(Ordering::Relaxed);
+            if n != usize::MAX && system::notification_pending(n) == AGGRU_SUCCESS {
+                AGGRU_OK.store(aggru_audits_ok(), Ordering::Release);
+                AGGRU_DONE.store(true, Ordering::Release);
+            } else if AGGRU_POLLS.fetch_add(1, Ordering::Relaxed) > 200_000 {
+                AGGRU_DONE.store(true, Ordering::Release); // Timeout -> FAIL (Angriff durchgelassen?)
+            }
+        }
+
         // Domänen/HW-Fuzzer (ext-22, P6): churnt HW-/Management-Caps gegen Policy + Oracles +
-        // Baseline. Gegate auf den Binary-Loader L5 (ext-26) fertig; eine Epoche je Iteration.
-        if !HWFUZZ_DONE.load(Ordering::Acquire) && LOADERFUZZ_DONE.load(Ordering::Acquire) {
+        // Baseline. Gegate auf den letzten ext-27-Dienst fertig; eine Epoche je Iteration.
+        if !HWFUZZ_DONE.load(Ordering::Acquire) && AGGRU_DONE.load(Ordering::Acquire) {
             match HWFUZZ_STEP.load(Ordering::Acquire) {
                 0 => {
                     // Fixtures (eine PD je Domäne, ohne Threads) + Baseline schnappen.
@@ -4894,13 +4964,15 @@ fn all_done() -> bool {
     let loadstop = LOADSTOP_DONE.load(Ordering::Acquire) && LOADSTOP_OK.load(Ordering::Acquire);
     // Binary-Loader L5 (ext-26): Loader-Fuzzer (fehlerhafte ELFs abgelehnt).
     let loaderfuzz = LOADERFUZZ_DONE.load(Ordering::Acquire) && LOADERFUZZ_OK.load(Ordering::Acquire);
+    // ext-27 T0: UserLand-Aggressor (extern geladen) — alle Syscall-Angriffe korrekt abgewiesen.
+    let aggru = AGGRU_DONE.load(Ordering::Acquire) && AGGRU_OK.load(Ordering::Acquire);
     // Domänen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Policy + Oracles + Baseline.
     let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
         && pdctl && chan && rtc && irq && dma && pcie && smmu && smmubind && virtiorng && dmagen
-        && sasheap && load && sysload && loadhw && loadstop && loaderfuzz && hwfuzz
+        && sasheap && load && sysload && loadhw && loadstop && loaderfuzz && aggru && hwfuzz
 }
 
 fn report() {
@@ -5426,6 +5498,13 @@ fn report() {
     println!(
         "loaderfuzz: {} (8 fehlerhafte ELF-Varianten durch load_image -> alle bei parse abgelehnt, kein Crash/OOB (Parser #![forbid(unsafe_code)]), Baseline unveraendert, loader_audit==0)",
         if loaderfuzz { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // ext-27 T0: UserLand-Aggressor (extern geladener Dienst, ADR 0012).
+    let aggru = AGGRU_DONE.load(Ordering::Acquire) && AGGRU_OK.load(Ordering::Acquire);
+    println!(
+        "aggru   : {} (extern geladener UserLand-Aggressor: Cap-Confusion (leerer Slot/falscher Typ/falsche Rechte) + Eskalation (PDCTL/LOAD/KILL ohne Autoritaet) -> alle als BADCAP/RIGHTS/BADSYS abgewiesen; Dienst signalisiert SUCCESS nur bei voller Abweisung; Audits==0)",
+        if aggru { "ALL PASS" } else { "FAILURES" }
     );
 
     // Domänen/HW-Fuzzer (ext-22, P6).

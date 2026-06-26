@@ -23,6 +23,31 @@ pub mod sys {
     pub const MAP: u64 = 10;
     pub const UNMAP: u64 = 11;
     pub const PDCTL: u64 = 12;
+    pub const LOAD: u64 = 13;
+}
+
+/// Ergebniscodes (Register `x0` beim Austritt; Spiegel von `sel4lake_abi::result`).
+pub mod result {
+    pub const OK: u64 = 0;
+    /// Kein gültiger Capability an der Stelle / falscher Objekttyp.
+    pub const ERR_BADCAP: u64 = 1;
+    /// Unbekannte Syscall-Nummer.
+    pub const ERR_BADSYS: u64 = 2;
+    /// Capability hat nicht die nötigen Rechte.
+    pub const ERR_RIGHTS: u64 = 3;
+    /// Aufrufer gehört zu keiner Protection Domain.
+    pub const ERR_NOPD: u64 = 4;
+    /// Antwort-seitiger Liveness-Fehler (Reply-Owner verschwunden).
+    pub const ERR_SERVER_GONE: u64 = 5;
+}
+
+/// Sub-Operationen für [`sys::PDCTL`] (Register `x2`; Spiegel von `sel4lake_abi::pdctl`).
+pub mod pdctl {
+    pub const START: u64 = 0;
+    pub const STOP: u64 = 1;
+    pub const PAUSE: u64 = 2;
+    pub const RESUME: u64 = 3;
+    pub const ASSIGN_BUDGET: u64 = 4;
 }
 
 /// Syscall-Ergebnis (Register `x0..x6` nach `eret`).
@@ -75,6 +100,27 @@ pub fn recv(cap: u64) -> Ret {
 /// Den letzten Aufrufer beantworten (Endpoint-Cap `cap`).
 pub fn reply(cap: u64, msg: [u64; 4]) {
     let _ = invoke(sys::REPLY, cap, msg, 0);
+}
+/// Frame (Memory-Cap `cap`) in die eigene VSpace mappen; gibt den Ergebniscode zurück.
+pub fn map(cap: u64) -> u64 {
+    invoke(sys::MAP, cap, [0; 4], 0).result
+}
+/// Frame (Memory-Cap `cap`) wieder entfernen; gibt den Ergebniscode zurück.
+pub fn unmap(cap: u64) -> u64 {
+    invoke(sys::UNMAP, cap, [0; 4], 0).result
+}
+/// Ziel-PD steuern (PdControl-Cap `cap`, Sub-Op `subop`); gibt den Ergebniscode zurück.
+pub fn pdctl(cap: u64, subop: u64) -> u64 {
+    invoke(sys::PDCTL, cap, [subop, 0, 0, 0], 0).result
+}
+/// Programm `index` laden (Loader-Cap `cap`, delegierter Cap-Slot `delegate`, `u64::MAX`=keiner);
+/// gibt den Ergebniscode zurück.
+pub fn load(cap: u64, index: u64, delegate: u64) -> u64 {
+    invoke(sys::LOAD, cap, [index, delegate, 0, 0], 0).result
+}
+/// Thread (Tcb-Cap `cap`) beenden; gibt den Ergebniscode zurück.
+pub fn kill(cap: u64) -> u64 {
+    invoke(sys::KILL, cap, [0; 4], 0).result
 }
 /// Freiwilliger Zeitscheibenabtritt.
 pub fn yield_now() {

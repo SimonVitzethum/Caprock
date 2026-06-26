@@ -1,0 +1,24 @@
+# Build-Konfiguration für die externen SEL4Lake-EL0-Programme (ext-26).
+#
+# Eigenständig baubar: `cd programs && cargo build --release` erzeugt statisch gelinkte
+# ET_EXEC-ELF64-Binaries (eigene Target-Spec + Linker-Skript, GETRENNT vom Kernel-Workspace).
+# Die Binaries werden vom generischen Binary-Loader des Kernels geladen.
+
+[build]
+target = "aarch64-sel4lake-user.json"
+target-dir = "build/target"
+
+[unstable]
+json-target-spec = true
+build-std = ["core", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.aarch64-sel4lake-user]
+rustflags = [
+    # Eigenes Linker-Skript (relativ zum programs/-Verzeichnis, aus dem `cargo build` läuft):
+    # festgelinkt an 0x4100_0000, getrennte W^X-PT_LOAD-Segmente.
+    "-C", "link-arg=-Tuser.ld",
+    # 4-KiB-Seiten (statt 64-KiB-Default): kompakte Datei + 4-KiB-ausgerichtete PT_LOAD-Segmente,
+    # passend zur 4-KiB-Mapping-Granularität des Loaders.
+    "-C", "link-arg=-zmax-page-size=4096",
+]

@@ -17,14 +17,20 @@ ELF="build/target/aarch64-sel4lake/release/sel4lake-kernel.elf"
 
 echo "== build =="
 ./build.sh >/dev/null 2>&1 || { echo "BUILD FAILED"; exit 1; }
-# Boot-Archiv (ext-26) wie in test-qemu.sh bereitstellen (externe Programme + hello).
+# Boot-Archiv (ext-26/ext-27) wie in test-qemu.sh bereitstellen (externe Programme + Testdienste).
 mkdir -p build
 ( cd programs && rustup run nightly cargo build --release ) >/dev/null 2>&1 \
     || { echo "PROGRAMS BUILD FAILED"; exit 1; }
+# ext-27: die adversarialen Testdienste (eigener tests/-Workspace) — sonst scheitert das Setup der
+# ext-27-Tests (Dienst nicht im Archiv) und der Selbsttest erreicht NIE SELFTEST COMPLETE (= "Hang").
+( cd tests && rustup run nightly cargo build --release ) >/dev/null 2>&1 \
+    || { echo "TESTS BUILD FAILED"; exit 1; }
 HELLO="programs/build/target/aarch64-sel4lake-user/release/hello.elf"
+TBIN="tests/build/target/aarch64-sel4lake-user/release"
 printf 'PLACEHOLDER' > build/_probe.bin
 python3 tools/mkarchive.py build/boot-archive.bin \
-    10:hello:2:1:"$HELLO" 11:hwhello:1:1:"$HELLO" 12:trusted-x:0:1:"$HELLO" 2:probe:2:1:build/_probe.bin >/dev/null 2>&1 || { echo "ARCHIVE FAILED"; exit 1; }
+    10:hello:2:1:"$HELLO" 11:hwhello:1:1:"$HELLO" 12:trusted-x:0:1:"$HELLO" 2:probe:2:1:build/_probe.bin \
+    20:aggressor-u:2:1:"$TBIN/aggressor-u.elf" >/dev/null 2>&1 || { echo "ARCHIVE FAILED"; exit 1; }
 
 echo "== stress: $N Laeufe (Timeout ${TMO}s je Lauf) =="
 ok=0; hang=0

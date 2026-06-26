@@ -3,3 +3,4 @@
 **/*.rs.bk
 *.img
 /programs/build/
+/tests/build/

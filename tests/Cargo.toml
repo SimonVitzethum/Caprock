@@ -1,0 +1,22 @@
+# SEL4Lake — adversariale externe Testdienste (ext-27).
+#
+# EIGENER Workspace, GETRENNT vom Kernel- UND vom programs/-Workspace: dieselbe Target-Spec
+# (aarch64-sel4lake-user.json) + Linker-Skript (user.ld) via tests/.cargo/config.toml. Build:
+# `cd tests && cargo build --release`. Die erzeugten ET_EXEC-ELF64-Binaries werden vom generischen
+# Binary-Loader (ext-26) wie Drittsoftware geladen und greifen den Kernel + sich gegenseitig an
+# (ADR 0012). Sie sind NICHT Teil des Kernel-Images. Einzige Abhaengigkeit: das SDK
+# programs/libsel4lake (Syscall-Stubs) — KEIN Kernel-Workspace.
+[workspace]
+resolver = "2"
+# Dienste nach Domaene gegliedert (userland/hardware/trusted), 2 je Domaene.
+members = ["services/userland/aggressor"]
+
+[workspace.package]
+edition = "2021"
+version = "0.0.1"
+license = "BSD-2-Clause"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true

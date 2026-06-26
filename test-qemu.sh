@@ -30,12 +30,19 @@ echo "== build =="
 mkdir -p build
 ( cd programs && rustup run nightly cargo build --release ) >/dev/null 2>&1 \
     || { echo "PROGRAMS BUILD FAILED"; exit 1; }
+# ext-27: die ADVERSARIALEN Testdienste (eigener tests/-Workspace) bauen — geladen wie Drittsoftware,
+# greifen den Kernel + sich gegenseitig an (ADR 0012). NICHT Teil des Kernel-Images.
+( cd tests && rustup run nightly cargo build --release ) >/dev/null 2>&1 \
+    || { echo "TESTS BUILD FAILED"; exit 1; }
 HELLO="programs/build/target/aarch64-sel4lake-user/release/hello.elf"
+TBIN="tests/build/target/aarch64-sel4lake-user/release"
 printf 'PLACEHOLDER' > build/_probe.bin
 # hello=UserLand(2), hwhello=HardwareLand(1) (gleiches ELF, L3), trusted-x=TrustedSAS(0, laedt
-# GELADEN als EL0-isolierte PD), probe=Platzhalter (Multi-Modul-Liste).
+# GELADEN als EL0-isolierte PD), probe=Platzhalter (Multi-Modul-Liste). ext-27: aggressor-u=
+# UserLand-Aggressor(2).
 python3 tools/mkarchive.py build/boot-archive.bin \
     10:hello:2:1:"$HELLO" 11:hwhello:1:1:"$HELLO" 12:trusted-x:0:1:"$HELLO" 2:probe:2:1:build/_probe.bin \
+    20:aggressor-u:2:1:"$TBIN/aggressor-u.elf" \
     >/dev/null 2>&1 || { echo "ARCHIVE BUILD FAILED"; exit 1; }
 
 echo "== boot ($SECONDS_RUN s) =="
@@ -57,7 +64,7 @@ check() { if echo "$OUT" | grep -q "$1"; then echo "  PASS: $2"; else echo "  FA
 
 check "M=1 C=1 I=1" "MMU + Caches aktiv"
 check "dtb     : ALL PASS" "DTB-Parsing (RAM-Größe aus dem Device Tree)"
-check "archive : 4 Modul" "ext-26 L0: Boot-Archiv extern geladen + vom Kernel-Parser gelesen (reserviertes RAM-Fenster, sel4lake-loader)"
+check "archive : 5 Modul" "ext-26 L0: Boot-Archiv extern geladen + vom Kernel-Parser gelesen (reserviertes RAM-Fenster, sel4lake-loader)"
 check "memtest : ALL PASS" "Speichermodell-Selbsttest (alloc/split/transfer/free)"
 check "captest : ALL PASS" "Capability-Selbsttest (copy/mint/move/delete/revoke)"
 check "sched   : ALL PASS" "Scheduler (Preemption auf core 0 + alle Kerne ticken)"
@@ -108,6 +115,7 @@ check "sysload : ALL PASS" "Binary-Loader L2 (ext-26): Laden zur LAUFZEIT via SY
 check "loadhw  : ALL PASS" "Binary-Loader L3 (ext-26): HardwareLand-Programm in vor-erstellte Backend-PD geladen, signalisiert Kanal; TrustedSAS laeuft GELADEN EL0-isoliert (alle Domaenen extern ladbar)"
 check "loadstop: ALL PASS" "Binary-Loader L4 (ext-26): geladenen Prozess vollstaendig abgebaut (Thread+VSpace+geladene Segmente+Kstack+PD) -> Ressourcen-Baseline wiederhergestellt, kein Leck"
 check "loaderfuzz: ALL PASS" "Binary-Loader L5 (ext-26): Loader-Fuzzer -- fehlerhafte ELF-Varianten durch load_image alle abgelehnt (kein Crash, Parser forbid(unsafe_code)), Baseline unveraendert, loader_audit==0"
+check "aggru   : ALL PASS" "Adversariale Testdienste (ext-27 T0): extern geladener UserLand-Aggressor -- Cap-Confusion (leerer Slot/falscher Typ/falsche Rechte) + Autoritaets-Eskalation (PDCTL/LOAD/KILL ohne Cap) alle als BADCAP/RIGHTS/BADSYS abgewiesen; Dienst signalisiert SUCCESS nur bei voller Abweisung; Audits==0"
 check "hwfuzz  : ALL PASS" "Domaenen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Domaenen-Policy + CDT/VSpace-Oracle + Ressourcen-Baseline"
 online=$(echo "$OUT" | grep -c "online")
 [ "$online" -eq "$CORES" ] && echo "  PASS: alle $CORES Kerne online" || { echo "  FAIL: nur $online/$CORES Kerne online"; fail=1; }

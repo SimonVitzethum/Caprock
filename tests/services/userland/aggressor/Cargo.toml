@@ -1,0 +1,18 @@
+# `aggressor-u` — adversarialer UserLand-Testdienst (ext-27 T0, ADR 0012).
+# Extern gebauter EL0-Prozess, der den Kernel ausschliesslich ueber die Syscall-ABI angreift:
+# Cap-Confusion (leerer Slot / falscher Objekttyp / falsche Rechte) + Autoritaets-Eskalation
+# (PDCTL/LOAD/KILL ohne gating-Cap). Signalisiert das SUCCESS-Badge GENAU DANN, wenn der Kernel
+# JEDEN Angriff korrekt abgewiesen hat ("der Dienst ist sein eigener Richter").
+[package]
+name = "aggressor-u"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aggressor-u"
+path = "src/main.rs"
+
+[dependencies]
+# Gemeinsames SDK (liegt im programs/-Workspace, hier per Pfad referenziert).
+libsel4lake = { path = "../../../../programs/libsel4lake" }

@@ -483,10 +483,12 @@ pub fn fragments() -> usize {
 // --- Capability-Space + PDs (CAPS) ---
 
 /// Anzahl belegter Cap-Slots (Fuzzer-/Leak-Oracle).
+#[cfg_attr(not(feature = "kernel-fuzz"), allow(dead_code))] // nur vom Fuzzer benutzt (ADR 0013)
 pub fn cap_used_slots() -> usize {
     CAPS.read().cspace.used_slots()
 }
 /// Anzahl belegter Cap-Objekte (Fuzzer-/Leak-Oracle: kein Objekt ohne lebende Cap).
+#[cfg_attr(not(feature = "kernel-fuzz"), allow(dead_code))] // nur vom Fuzzer benutzt (ADR 0013)
 pub fn cap_used_objects() -> usize {
     CAPS.read().cspace.used_objects()
 }
@@ -957,6 +959,7 @@ pub fn map_into_thread(tid: ThreadId, base: u64, len: u64, perm_code: u8) -> boo
 /// des Threads `tid` wieder entfernen (Seiten auf EL1-only, TLB-Flush). Für den
 /// Fuzzer/Tests, um den per-Seite-Unmap-Pfad explizit zu fahren. No-Op (false) für
 /// nicht-isolierte Threads.
+#[cfg_attr(not(feature = "kernel-fuzz"), allow(dead_code))] // nur vom Fuzzer benutzt (ADR 0013)
 pub fn unmap_into_thread(tid: ThreadId, base: u64, len: u64) -> bool {
     let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
     if asid == 0 {
@@ -2237,6 +2240,7 @@ pub fn virtio_rng_dma_demo() -> VirtioDmaResult {
 
 /// Eine (noch nicht in eine DmaCap überführte) DMA-Region an den Allokator zurückgeben — für
 /// Fehler-/Cleanup-Pfade, in denen eine `alloc_dma_region` nicht in eine Cap mündet.
+#[cfg_attr(not(feature = "kernel-fuzz"), allow(dead_code))] // nur vom Fuzzer benutzt (ADR 0013)
 pub fn free_dma_region(base: u64, len: u64) {
     free_raw_region(base, len);
 }

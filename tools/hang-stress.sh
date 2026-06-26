@@ -15,8 +15,11 @@ N="${1:-30}"
 TMO="${2:-40}"
 ELF="build/target/aarch64-sel4lake/release/sel4lake-kernel.elf"
 
-echo "== build =="
-./build.sh >/dev/null 2>&1 || { echo "BUILD FAILED"; exit 1; }
+# Default: RELEASE-Build OHNE Fuzzer (Langzeittest-/Produktivkonfiguration, ADR 0013). Mit
+# `KERNEL_FUZZ=1` wird `--features kernel-fuzz` gebaut (Deadlock-Regression inkl. Fuzzer).
+FEAT="${KERNEL_FUZZ:+--features kernel-fuzz}"
+echo "== build ${FEAT:-(release, ohne Fuzzer)} =="
+./build.sh $FEAT >/dev/null 2>&1 || { echo "BUILD FAILED"; exit 1; }
 # Boot-Archiv (ext-26/ext-27) wie in test-qemu.sh bereitstellen (externe Programme + Testdienste).
 mkdir -p build
 ( cd programs && rustup run nightly cargo build --release ) >/dev/null 2>&1 \

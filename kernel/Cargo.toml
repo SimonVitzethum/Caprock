@@ -15,6 +15,14 @@ authors.workspace = true
 name = "sel4lake-kernel"
 path = "src/main.rs"
 
+[features]
+# Optionale In-Kernel-Fuzzer (Entwicklungs-/Verifikationswerkzeuge, ADR 0013). NICHT in `default`:
+# der Release-Build enthaelt keinerlei Fuzzer-Code. Mit `--features kernel-fuzz` werden die vier
+# Fuzzer (fuzz/ipcfuzz/hwfuzz/loaderfuzz) aus `threads/fuzz.rs` einkompiliert. Die Audits bleiben
+# IMMER im Kernel (feature-unabhaengig).
+default = []
+kernel-fuzz = []
+
 [dependencies]
 sel4lake-hal = { path = "../crates/sel4lake-hal" }
 sel4lake-sync = { path = "../crates/sel4lake-sync" }

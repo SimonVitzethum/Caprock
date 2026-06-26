@@ -20,8 +20,12 @@ CORES=8
 SECONDS_RUN="${1:-360}"
 ELF="build/target/aarch64-sel4lake/release/sel4lake-kernel.elf"
 
-echo "== build =="
-./build.sh >/dev/null 2>&1 || { echo "BUILD FAILED"; exit 1; }
+# In-Kernel-Fuzzer (ADR 0013) sind ein optionales Feature. Default: RELEASE-Build OHNE Fuzzer
+# (genau die Konfiguration des Langzeittests/Produktivkernels) -> die vier Fuzzer-Checks entfallen.
+# Mit `KERNEL_FUZZ=1 ./test-qemu.sh` wird `--features kernel-fuzz` gebaut und die Fuzzer mitgeprueft.
+FEAT="${KERNEL_FUZZ:+--features kernel-fuzz}"
+echo "== build ${FEAT:-(release, ohne Fuzzer)} =="
+./build.sh $FEAT >/dev/null 2>&1 || { echo "BUILD FAILED"; exit 1; }
 
 # ext-26 (L1): die EXTERNEN Programme bauen (eigener Workspace, eigene Target/Linker) + ins
 # Boot-Archiv legen (Host-Tool tools/mkarchive.py, KEIN Kernelcode). `hello` ist ein echtes,
@@ -63,6 +67,9 @@ echo "$OUT"
 echo "== checks =="
 fail=0
 check() { if echo "$OUT" | grep -q "$1"; then echo "  PASS: $2"; else echo "  FAIL: $2"; fail=1; fi; }
+# Fuzzer-Check: nur im `KERNEL_FUZZ=1`-Lauf relevant (im Release-Build ohne Fuzzer entfaellt die
+# Zeile -> nicht als Fehler werten, sondern als bewusst uebersprungen melden).
+fcheck() { if [ -n "${KERNEL_FUZZ:-}" ]; then check "$1" "$2"; else echo "  SKIP (release ohne Fuzzer): $2"; fi; }
 
 check "M=1 C=1 I=1" "MMU + Caches aktiv"
 check "dtb     : ALL PASS" "DTB-Parsing (RAM-Größe aus dem Device Tree)"
@@ -97,8 +104,8 @@ check "rgone   : ALL PASS" "Reply-Liveness: toter Reply-Owner entblockt den CALL
 check "ddon    : ALL PASS" "Budget-Donation: intra-core CALL belastet Server-Arbeit gegen das Aufrufer-Budget"
 check "rcap    : ALL PASS" "First-class Reply-Cap (ObjectKind::Reply): Revocation bricht den ausstehenden Call ab"
 check "rmig    : ALL PASS" "Reply-Cap-Server-Migration: ausstehender Call ueberlebt einen Hot-Reload (v2 schliesst ihn ab)"
-check "fuzz    : ALL PASS" "Generativer Kernel-Fuzzer (zufaellige Op-Sequenzen + Baseline-Oracle + SMP-Kontention)"
-check "ipcfuzz : ALL PASS" "IPC-State-Machine-Fuzzer (nebenlaeufige Aktoren, KILL/Reload/MCS waehrend IPC, Queue-Oracle)"
+fcheck "fuzz    : ALL PASS" "Generativer Kernel-Fuzzer (zufaellige Op-Sequenzen + Baseline-Oracle + SMP-Kontention)"
+fcheck "ipcfuzz : ALL PASS" "IPC-State-Machine-Fuzzer (nebenlaeufige Aktoren, KILL/Reload/MCS waehrend IPC, Queue-Oracle)"
 check "caplk   : ALL PASS" "CAPS-Reader-Writer-Lock: parallele Cap-Lookups (zwei Kerne halten gleichzeitig den Read-Lock)"
 check "domain  : ALL PASS" "Sicherheitsdomaenen: Domaenen-Policy-Oracle (Cap-Typen je Domaene + untrusted Domaenen isoliert)"
 check "pdctl   : ALL PASS" "UserLand-Management: cap-gated SYS_PDCTL (PAUSE/RESUME/STOP, nur TrustedSas->UserLand)"
@@ -116,7 +123,7 @@ check "load    : ALL PASS" "Binary-Loader (ext-26): extern gebautes EL0-Programm
 check "sysload : ALL PASS" "Binary-Loader L2 (ext-26): Laden zur LAUFZEIT via SYS_LOAD-Syscall, cap-gegatet ueber Loader-Cap; Caller delegiert eigene Notification-Cap in die neue PD; ohne Loader-Cap -> ERR_BADCAP"
 check "loadhw  : ALL PASS" "Binary-Loader L3 (ext-26): HardwareLand-Programm in vor-erstellte Backend-PD geladen, signalisiert Kanal; TrustedSAS laeuft GELADEN EL0-isoliert (alle Domaenen extern ladbar)"
 check "loadstop: ALL PASS" "Binary-Loader L4 (ext-26): geladenen Prozess vollstaendig abgebaut (Thread+VSpace+geladene Segmente+Kstack+PD) -> Ressourcen-Baseline wiederhergestellt, kein Leck"
-check "loaderfuzz: ALL PASS" "Binary-Loader L5 (ext-26): Loader-Fuzzer -- fehlerhafte ELF-Varianten durch load_image alle abgelehnt (kein Crash, Parser forbid(unsafe_code)), Baseline unveraendert, loader_audit==0"
+fcheck "loaderfuzz: ALL PASS" "Binary-Loader L5 (ext-26): Loader-Fuzzer -- fehlerhafte ELF-Varianten durch load_image alle abgelehnt (kein Crash, Parser forbid(unsafe_code)), Baseline unveraendert, loader_audit==0"
 check "aggru   : ALL PASS" "Adversariale Testdienste (ext-27 T0): extern geladener UserLand-Aggressor -- Cap-Confusion (leerer Slot/falscher Typ/falsche Rechte) + Autoritaets-Eskalation (PDCTL/LOAD/KILL ohne Cap) alle als BADCAP/RIGHTS/BADSYS abgewiesen; Dienst signalisiert SUCCESS nur bei voller Abweisung; Audits==0"
 check "intru   : ALL PASS" "Adversariale Testdienste (ext-27 T1): extern geladener UserLand-Intruder -- liest Kernel-RAM aus EL0 -> Translation-Fault (nicht in der isolierten VSpace gemappt) -> Kernel terminiert den Angreifer + laeuft weiter; PRE-Badge + el0_fault_count++ + Audits==0 (Hardware-Isolation)"
 check "aggrh   : ALL PASS" "Adversariale Testdienste (ext-27 T2): extern geladenes HardwareLand-Backend als Aggressor -- KEINE Management-Autoritaet (PDCTL/LOAD/KILL -> BADCAP), nichts ausserhalb des eigenen Kanals; Cap-Confusion abgewiesen; meldet SUCCESS ueber den Kanal; Audits==0"
@@ -124,7 +131,7 @@ check "intrh   : ALL PASS" "Adversariale Testdienste (ext-27 T2): extern geladen
 check "aggrt   : ALL PASS" "Adversariale Testdienste (ext-27 T3): extern geladener TrustedSAS-Aggressor (EL0-isoliert) -- Trust != Privileg: ohne tatsaechliche PdControl/Loader-Cap PDCTL/LOAD/KILL = BADCAP; Cap-Confusion abgewiesen; SUCCESS nur bei voller Abweisung; Audits==0"
 check "intrt   : ALL PASS" "Adversariale Testdienste (ext-27 T3): extern geladener TrustedSAS-Intruder (EL0-isoliert) -- liest Kernel-RAM aus EL0 -> Fault -> terminiert; Trust befreit NICHT von der Hardware-Isolation (staerkste Aussage); PRE + el0_fault_count++ + Audits==0"
 check "cross   : ALL PASS" "Adversariale Testdienste (ext-27 T4): Cross-Service-Matrix -- 3 extern geladene Angreifer DREIER Domaenen NEBENLAEUFIG (aggressor-u + aggressor-t melden unabhaengig SUCCESS, intruder-h faultet); gleichzeitige cross-domain Angreifer stoeren einander nicht; kernel-geschuetztes Canary unberuehrt; Audits==0"
-check "hwfuzz  : ALL PASS" "Domaenen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Domaenen-Policy + CDT/VSpace-Oracle + Ressourcen-Baseline"
+fcheck "hwfuzz  : ALL PASS" "Domaenen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Domaenen-Policy + CDT/VSpace-Oracle + Ressourcen-Baseline"
 online=$(echo "$OUT" | grep -c "online")
 [ "$online" -eq "$CORES" ] && echo "  PASS: alle $CORES Kerne online" || { echo "  FAIL: nur $online/$CORES Kerne online"; fail=1; }
 

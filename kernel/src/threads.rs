@@ -807,9 +807,10 @@ static XCORE_PARKED: AtomicBool = AtomicBool::new(false); // Parker hat sich blo
 static XCORE_WOKEN: AtomicBool = AtomicBool::new(false); // Parker nach IPI-Wake fortgesetzt
 static XCORE_PARKER_TID: AtomicU64 = AtomicU64::new(u64::MAX); // raw ThreadId des Parkers
 
-// Stateful Hot-Reload: Zähler-Service, dessen Zustand (in einer Memory-Region)
-// den Komponententausch v1(+1) -> v2(+10) überlebt.
-static CS_STATE_BASE: AtomicU64 = AtomicU64::new(0);
+// Stateful Hot-Reload: Zähler-Service, dessen Zustand (in einer Region, Purpose::HotReloadState,
+// gehalten in system::CS_STATE_REGION) den Komponententausch v1(+1) -> v2(+10) überlebt. Der
+// Zugriff läuft über die sichere RegionView-API (system::hotreload_state_get/set), kein rohes
+// peek/poke mehr (Konsolidierung O-B).
 static CS_R1: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3]; // v1: 1,2,3
 static CS_R2: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2]; // v2: 13,23 (Zustand erhalten)
 static CS_BATCH1_DONE: AtomicBool = AtomicBool::new(false);
@@ -930,12 +931,8 @@ pub fn spawn_demo() {
 
     // Stateful Hot-Reload: Zähler-Service, dessen Zustand in einer Memory-Region
     // liegt und den Tausch v1(+1) -> v2(+10) überlebt.
-    let cs_state = {
-        let s = system::alloc(4096, 16).expect("cs state");
-        s.base()
-    };
-    poke_u64(cs_state, 0); // Zähler initialisieren
-    CS_STATE_BASE.store(cs_state, Ordering::Relaxed);
+    // Zustand in einer Region (Purpose::HotReloadState), Zugriff über die sichere RegionView-API.
+    let _cs_state_phys = system::hotreload_state_alloc().expect("cs state");
     let cs_ep = system::create_endpoint().expect("cs ep");
     let cs_root = system::install_endpoint_cap(cs_ep as u32, Rights::RWX).expect("cs cap");
     let cs_send = system::cap_mint(cs_root, Rights::WRITE, 0).expect("cs send");
@@ -947,7 +944,7 @@ pub fn spawn_demo() {
     system::install_pd_cap(cs_v1_pd, EP_CAP as usize, cs_recv1);
     system::install_pd_cap(cs_v2_pd, EP_CAP as usize, cs_recv2);
     system::install_pd_cap(cs_client_pd, EP_CAP as usize, cs_send);
-    let cs_v1 = system::spawn(counter_v1 as *const () as usize, cs_state as usize, prio).expect("cs v1");
+    let cs_v1 = system::spawn(counter_v1 as *const () as usize, 0, prio).expect("cs v1");
     system::bind_pd(cs_v1_pd, cs_v1);
     let csc = system::spawn(cs_client as *const () as usize, 0, prio).expect("cs client");
     system::bind_pd(cs_client_pd, csc);
@@ -1220,12 +1217,12 @@ fn do_reload() {
     }
 }
 
-/// Stateful Hot-Reload: Zähler-Service v1 (+1) -> v2 (+10); der Zustand (in der
-/// Memory-Region bei CS_STATE_BASE) bleibt erhalten (zero-copy, dieselbe Region).
+/// Stateful Hot-Reload: Zähler-Service v1 (+1) -> v2 (+10); der Zustand (in der Region
+/// `system::CS_STATE_REGION`, Purpose::HotReloadState) bleibt erhalten (zero-copy, dieselbe
+/// Region). v2 greift über dieselben system::hotreload_state_*-Helfer zu (Arg ungenutzt).
 fn do_cs_reload() {
     if let Some(info) = *CS_RELOAD_INFO.lock() {
-        let state = CS_STATE_BASE.load(Ordering::Relaxed) as usize;
-        reload_swap(info, counter_v2 as *const () as usize, state);
+        reload_swap(info, counter_v2 as *const () as usize, 0);
     }
 }
 
@@ -2858,23 +2855,26 @@ extern "C" fn xipc_client(_arg: usize) -> ! {
 }
 
 /// Zähler-Service v1: liest den Zustand aus der Region, addiert 1, schreibt zurück.
-extern "C" fn counter_v1(arg: usize) -> ! {
-    counter_serve(arg as u64, 1)
+extern "C" fn counter_v1(_arg: usize) -> ! {
+    counter_serve(1)
 }
 
 /// Zähler-Service v2 (neu geladen): addiert 10 — setzt den Zustand von v1 fort.
-extern "C" fn counter_v2(arg: usize) -> ! {
-    counter_serve(arg as u64, 10)
+extern "C" fn counter_v2(_arg: usize) -> ! {
+    counter_serve(10)
 }
 
-fn counter_serve(state: u64, delta: u64) -> ! {
+/// Zähler-Service: liest/schreibt den Zustand über die **sichere** RegionView-API
+/// (`system::hotreload_state_*`) auf der gemeinsamen Hot-Reload-Region — kein rohes peek/poke
+/// (Konsolidierung O-B). v1 und v2 teilen dieselbe Region, daher überlebt der Zähler den Tausch.
+fn counter_serve(delta: u64) -> ! {
     loop {
         let m = invoke(sys::RECV, 0, [0; 4], 0);
         if m.result != result::OK {
             break; // Cap entzogen -> zurückgezogen
         }
-        let c = peek_u64(state) + delta; // Zustand in der Memory-Region
-        poke_u64(state, c);
+        let c = system::hotreload_state_get() + delta;
+        system::hotreload_state_set(c);
         invoke(sys::REPLY, 0, [c, 0, 0, 0], 0);
     }
     loop {

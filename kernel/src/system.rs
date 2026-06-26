@@ -2023,6 +2023,42 @@ impl RegionSource for KernelRegionSource {
     }
 }
 
+// --- Hot-Reload-Zustand als Region (Konsolidierung O-B) ---
+//
+// Der zustandsbehaftete Hot-Reload-Test (Zähler-Service v1 -> v2) hielt seinen Zustand bisher in
+// einer **roh** per `peek_u64`/`poke_u64` angesprochenen RAM-Adresse (`CS_STATE_BASE`). Er lebt nun
+// in einer `Region` (`Purpose::HotReloadState`) und wird über die **sichere** RegionView-API
+// gelesen/geschrieben — dasselbe Substrat wie der Prozess-Heap (ext-25), kein rohes `unsafe` im
+// Testpfad. Beide Komponenten-Versionen (v1, v2) teilen DIESELBE Region (zero-copy; der Zustand
+// überlebt den Tausch — genau die Hot-Reload-Invariante). Siehe ADR 0010.
+static CS_STATE_REGION: SpinLock<Option<Region>> = SpinLock::new(None);
+
+/// Die Hot-Reload-Zustandsregion (genullt) anlegen + global halten. Gibt die Phys-Basis zurück
+/// (nur Telemetrie; der Zugriff läuft über [`hotreload_state_get`]/[`hotreload_state_set`]).
+pub fn hotreload_state_alloc() -> Option<u64> {
+    let region = KernelRegionSource.request(4096, Purpose::HotReloadState)?;
+    let phys = region.phys();
+    *CS_STATE_REGION.lock() = Some(region); // Lock-Guard fällt am `;` -> set() unten re-lockt sauber
+    hotreload_state_set(0); // Zähler initialisieren (carve liefert nicht garantiert genullt)
+    Some(phys)
+}
+
+/// Das erste `u64`-Wort der Hot-Reload-Zustandsregion über die **sichere** RegionView-API lesen.
+pub fn hotreload_state_get() -> u64 {
+    CS_STATE_REGION
+        .lock()
+        .as_mut()
+        .and_then(|r| r.view().get::<u64>(0))
+        .unwrap_or(0)
+}
+
+/// Das erste `u64`-Wort der Hot-Reload-Zustandsregion über die **sichere** RegionView-API schreiben.
+pub fn hotreload_state_set(val: u64) {
+    if let Some(r) = CS_STATE_REGION.lock().as_mut() {
+        r.view().set::<u64>(0, val);
+    }
+}
+
 /// Eine roh-allozierte RAM-Region (ohne Cap) an den Allokator zurückgeben (interner Test-/
 /// Setup-Helfer für temporäre DMA-/Sentinel-Regionen). 4-KiB-granular.
 fn free_raw_region(base: u64, len: u64) {

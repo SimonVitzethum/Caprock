@@ -1345,7 +1345,7 @@ pub fn irqs_delivered() -> u64 {
 // die einzige Implementierung (`SmmuV3Enforcer`, D2/D3); ein künftiger `NullIommuEnforcer` o.a.
 // implementiert dasselbe Trait, OHNE öffentlichen Code (DmaCap, install_dma_cap, Mapping,
 // Treiber, HardwareLand) zu berühren. Die Revoke-Reihenfolge läuft über die Abstraktion:
-// `enforcer.disable_dma` -> VSpace-Unmap -> `free_region` (DMA-use-after-free-sicher).
+// `enforcer.detach` -> VSpace-Unmap -> `free_region` (DMA-use-after-free-sicher).
 
 /// Eine generische **DMA-Bindung**: das Gerät mit `stream_id` darf die RAM-`region` als
 /// DMA-Puffer nutzen (besessen von `backend_pd`). Enthält bewusst KEINE enforcer-/SMMU-
@@ -1382,10 +1382,10 @@ pub trait DmaEnforcer: Sync {
     fn init(&self) -> bool;
     /// Durchsetzung für eine Bindung aktivieren: das Gerät darf danach NUR in `binding.region`
     /// DMAen, alles andere wird hardwareseitig abgewiesen. `false` bei Fehler.
-    fn enable_dma(&self, binding: &DmaBinding) -> bool;
+    fn attach(&self, binding: &DmaBinding) -> bool;
     /// Durchsetzung entziehen (VOR VSpace-Unmap + `free_region`): danach kann das Gerät nicht
     /// mehr in die Region DMAen (DMA-use-after-free-sicher).
-    fn disable_dma(&self, binding: &DmaBinding);
+    fn detach(&self, binding: &DmaBinding);
     /// Durchsetzungs-Oracle: `0` = konsistent, sonst enforcer-spezifischer Anomalie-Code.
     fn audit(&self) -> u32;
     /// Ist die hardwareseitige Durchsetzung aktiv (HW vorhanden + initialisiert)?
@@ -1400,7 +1400,7 @@ pub trait DmaEnforcer: Sync {
 
 /// **SMMUv3-Enforcer** — die einzige `DmaEnforcer`-Implementierung in ext-23. Hält die
 /// Physadressen der Command-/Event-Queue + linearen Stream-Tabelle sowie den Command-Queue-
-/// PROD-Index. `init` (D2) bringt die SMMU hoch (Default-Abort); `enable_dma`/`disable_dma`
+/// PROD-Index. `init` (D2) bringt die SMMU hoch (Default-Abort); `attach`/`detach`
 /// (D3) programmieren je StreamID eine STE -> CD -> Stage-1-Tabelle. Das gesamte SMMU-Wissen
 /// liegt hier + in `hal::smmu`; der übrige Kernel kennt nur das `DmaEnforcer`-Trait.
 pub struct SmmuV3Enforcer {
@@ -1472,7 +1472,7 @@ impl DmaEnforcer for SmmuV3Enforcer {
         self.active.store(true, Ordering::Release);
         ok
     }
-    fn enable_dma(&self, binding: &DmaBinding) -> bool {
+    fn attach(&self, binding: &DmaBinding) -> bool {
         if !self.active.load(Ordering::Acquire) {
             return false;
         }
@@ -1533,7 +1533,7 @@ impl DmaEnforcer for SmmuV3Enforcer {
         self.cmdq_prod.store(next, Ordering::Release);
         ok
     }
-    fn disable_dma(&self, binding: &DmaBinding) {
+    fn detach(&self, binding: &DmaBinding) {
         if !self.active.load(Ordering::Acquire) {
             return;
         }
@@ -1773,12 +1773,12 @@ pub fn unmap_dma_from_thread(tid: ThreadId, phys: u64, len: u64) -> bool {
 /// Die hardwareseitige DMA-Durchsetzung für `(stream_id, [base,len))` aktivieren (ext-23-API,
 /// rückwärtskompatibel: bidirektional + non-cacheable). `true` bei Erfolg.
 pub fn dma_enable(stream_id: u32, base: u64, len: u64) -> bool {
-    dma_enforcer().enable_dma(&DmaBinding::new(stream_id, PhysRegion::new(base, len)))
+    dma_enforcer().attach(&DmaBinding::new(stream_id, PhysRegion::new(base, len)))
 }
 
 /// Die Durchsetzung für `(stream_id, [base,len))` wieder entziehen.
 pub fn dma_disable(stream_id: u32, base: u64, len: u64) {
-    dma_enforcer().disable_dma(&DmaBinding::new(stream_id, PhysRegion::new(base, len)));
+    dma_enforcer().detach(&DmaBinding::new(stream_id, PhysRegion::new(base, len)));
 }
 
 /// **Opakes DMA-Handle** (ext-24): die *gerätesichtbare* Adresse (IOVA) + Länge einer
@@ -1799,7 +1799,7 @@ pub fn dma_attach(stream_id: u32, dcap: CapPtr) -> Option<DmaHandle> {
     let (phys, len, dir, coherence) = dma_cap_attrs(dcap)?;
     let ro = dir == DmaDir::DeviceRead;
     let cacheable = coherence == DmaCoherence::Coherent;
-    let ok = dma_enforcer().enable_dma(&DmaBinding {
+    let ok = dma_enforcer().attach(&DmaBinding {
         stream_id,
         region: PhysRegion::new(phys, len),
         backend_pd: 0,
@@ -1816,7 +1816,7 @@ pub fn dma_attach(stream_id: u32, dcap: CapPtr) -> Option<DmaHandle> {
 /// Eine zuvor per [`dma_attach`] angehängte Region wieder lösen (Stage-1-Eintrag entfernen +
 /// TLBI; bei letzter Region des Kontexts: Kontext abbauen). `handle.iova` == PA.
 pub fn dma_detach(stream_id: u32, handle: DmaHandle) {
-    dma_enforcer().disable_dma(&DmaBinding::new(
+    dma_enforcer().detach(&DmaBinding::new(
         stream_id,
         PhysRegion::new(handle.iova, handle.len),
     ));
@@ -2024,11 +2024,11 @@ fn free_raw_region(base: u64, len: u64) {
 }
 
 /// Eine DMA-Bindung **sicher abbauen** (Revoke-Reihenfolge, ext-23, DMA-use-after-free-sicher):
-/// (1) `enforcer.disable_dma` (hardwareseitige Durchsetzung entziehen — SMMU-Invalidierung),
+/// (1) `enforcer.detach` (hardwareseitige Durchsetzung entziehen — SMMU-Invalidierung),
 /// dann (2) aus der Backend-VSpace unmappen. Erst danach darf der Aufrufer die DmaCap löschen
 /// (`delete_leaf` -> `free_region`). Nach Schritt 1 kann kein Gerät mehr in die Region DMAen.
 pub fn revoke_dma(binding: &DmaBinding, tid: ThreadId) {
-    dma_enforcer().disable_dma(binding);
+    dma_enforcer().detach(binding);
     unmap_dma_from_thread(tid, binding.region.base, binding.region.len);
 }
 
@@ -2050,7 +2050,7 @@ pub fn dma_audit() -> u32 {
     }
     // Revoke-Ordnung-Invariante (docs/invariants.md §2, DMA-use-after-free-sicher): eine noch in
     // einem SMMU-Kontext gemappte Region darf NIE freigegeben sein. Wäre sie freigegeben (free
-    // VOR disable_dma), läge sie in der Free-Liste und überlappte sie -> Code 4. Funktioniert für
+    // VOR detach), läge sie in der Free-Liste und überlappte sie -> Code 4. Funktioniert für
     // den cap-basierten (dma_attach) UND den rohen (dma_enable) Pfad. Snapshot von DMA_CTX ziehen
     // + Lock freigeben, DANN MEM prüfen (Rangordnung R1 vor R4, nie gleichzeitig gehalten).
     if !dma_ctx_regions_live() {

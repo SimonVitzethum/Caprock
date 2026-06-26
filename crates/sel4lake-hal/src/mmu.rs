@@ -536,6 +536,49 @@ pub fn vspace_map_page(
     true
 }
 
+/// Eine einzelne 4-KiB-Seite `vaddr` → `phys` (**nicht-identity**) mit `perm` in die VSpace mit
+/// GiB-1-L2 `l2_phys` mappen (ext-26, Binary-Loader): `vaddr` indiziert die Tabellen (muss in
+/// GiB 1 liegen), `phys` ist die **Ausgabe-Adresse** (beliebiger allokierter RAM-Frame). Damit
+/// kann ein an einer festen VA gelinktes Programm an beliebige Physadressen geladen werden. Sonst
+/// wie [`vspace_map_page`] (L3 bei Bedarf aus `alloc_l3`, EL1-only-Spiegel). ASID anschließend
+/// flushen.
+pub fn vspace_map_page_at(
+    l2_phys: u64,
+    vaddr: u64,
+    phys: u64,
+    perm: UserPerm,
+    alloc_l3: &mut dyn FnMut() -> Option<u64>,
+) -> bool {
+    if vaddr < USER_RAM_MIN || vaddr >= GIB1_END || vaddr % PAGE != 0 || phys % PAGE != 0 {
+        return false;
+    }
+    let i2 = ((vaddr - RAM_BASE) / TWO_MIB) as usize;
+    // SAFETY: gültige, in der globalen Map beschreibbare L2-Tabelle.
+    let l2 = unsafe { core::slice::from_raw_parts_mut(l2_phys as *mut u64, 512) };
+    let l3_phys = if l2[i2] & 0b11 == TABLE_DESC {
+        l2[i2] & ADDR_MASK
+    } else {
+        let new = match alloc_l3() {
+            Some(p) => p,
+            None => return false,
+        };
+        // SAFETY: frischer, identity-gemappter 4-KiB-Frame für die neue L3.
+        let l3 = unsafe { core::slice::from_raw_parts_mut(new as *mut u64, 512) };
+        let blk = RAM_BASE + i2 as u64 * TWO_MIB; // VA-Block; Rest bleibt EL1-only
+        for (j, e) in l3.iter_mut().enumerate() {
+            *e = kernel_page(blk + j as u64 * PAGE);
+        }
+        l2[i2] = table_desc(new);
+        new
+    };
+    // SAFETY: gültige L3-Tabelle (gerade angelegt oder bestehend).
+    let l3 = unsafe { core::slice::from_raw_parts_mut(l3_phys as *mut u64, 512) };
+    // Indiziert per VADDR, Ausgabe-Adresse = PHYS (nicht-identity).
+    l3[((vaddr >> 12) & 0x1ff) as usize] = user_page(phys, perm);
+    cpu::dsb_sy();
+    true
+}
+
 /// Eine einzelne 4-KiB-Seite wieder auf **EL1-only** zurücksetzen (EL0-Zugriff
 /// faultet). `false`, wenn der Block nicht seitenweise gemappt ist. ASID flushen.
 pub fn vspace_unmap_page(l2_phys: u64, phys: u64) -> bool {

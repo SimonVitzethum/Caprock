@@ -7,8 +7,13 @@
 //!
 //! **L0:** das Boot-Archiv aus dem reservierten RAM-Fenster lesen + die Module melden.
 
+use sel4lake_cap::CapPtr;
 use sel4lake_hal::{print, println};
 use sel4lake_loader::archive::Archive;
+use sel4lake_loader::elf::ElfImage;
+use sel4lake_loader::{LoaderError, Program, DOMAIN_HARDWARE, DOMAIN_USERLAND};
+use sel4lake_microkit::Domain;
+use sel4lake_sched::ThreadId;
 
 /// Größe des reservierten RAM-Fensters für das Boot-Archiv (oben in RAM, vom `PhysAllocator`
 /// ausgenommen — siehe `init_mem`-Aufruf in `main.rs`). QEMU legt das Archiv per
@@ -44,4 +49,22 @@ pub fn probe() {
         }
         None => println!("archive : kein gueltiges Boot-Archiv (0 Module, FAILURES)"),
     }
+}
+
+/// **Die öffentliche Loader-API** (ADR 0011, Verfeinerung 1): ein quellen-agnostisches `Program`
+/// laden + starten. Parst das ELF (Safe Rust, [`ElfImage::parse`]), bildet die Domäne ab und
+/// delegiert den privilegierten Teil (Segmente kopieren/mappen, VSpace/PD, Spawn) an
+/// [`crate::system::load_elf`]. `endow` = initiale Caps für die neue PD (`(Slot, Cap)`), in L2 aus
+/// dem Manifest abgeleitet. Gibt `(ThreadId, pd)` der neuen, laufbereiten PD.
+///
+/// L1: nur **isolierte EL0-Domänen** (UserLand/HardwareLand). TrustedSAS (EL1) ist signatur-gegatet
+/// (L3) und wird hier abgelehnt (`UnsupportedDomain`).
+pub fn load_image(prog: &Program, endow: &[(usize, CapPtr)]) -> Result<(ThreadId, usize), LoaderError> {
+    let domain = match prog.domain {
+        DOMAIN_USERLAND => Domain::UserLand,
+        DOMAIN_HARDWARE => Domain::HardwareLand,
+        _ => return Err(LoaderError::UnsupportedDomain), // TrustedSAS/EL1: erst mit Signatur (L3)
+    };
+    let img = ElfImage::parse(prog.elf)?; // Safe-Rust-Validierung; unsafe erst im Kopier-Glue
+    crate::system::load_elf(&img, domain, endow).ok_or(LoaderError::NoResources)
 }

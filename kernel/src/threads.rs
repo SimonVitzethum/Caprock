@@ -9,6 +9,7 @@
 //! Der Reload-Manager ist der Idle-Thread des Primärkerns: Quiesce (Empfänger
 //! zurückziehen + Recv-Cap entziehen) → Swap (v2 starten + Recv-Cap delegieren).
 
+use crate::loader;
 use crate::system;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use sel4lake_abi::{pdctl, result, sys, GRANT_FLAG, GRANT_RECV_SLOT};
@@ -407,6 +408,17 @@ static SASHEAP_BALANCED: AtomicBool = AtomicBool::new(false); // total_free nach
 static SASHEAP_DONE: AtomicBool = AtomicBool::new(false);
 static SASHEAP_OK: AtomicBool = AtomicBool::new(false);
 
+// Binary-Loader (ext-26, L1): ein EXTERN gebautes Programm (`hello`) wird aus dem Boot-Archiv
+// geladen + in einer frischen isolierten UserLand-PD gestartet. Beweis der Ausfuehrung: hello
+// signalisiert die vom Loader endowte Notification mit `HELLO_BADGE`. Asynchron: laden, dann das
+// Badge in spaeteren Manager-Iterationen pollen (hello laeuft dazwischen, vom Scheduler eingeplant).
+const HELLO_BADGE: u64 = 0x4845_4C4F; // "HELO" (muss zu programs/hello uebereinstimmen)
+static LOAD_STARTED: AtomicBool = AtomicBool::new(false);
+static LOAD_DONE: AtomicBool = AtomicBool::new(false);
+static LOAD_OK: AtomicBool = AtomicBool::new(false);
+static LOAD_NTFN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static LOAD_POLLS: AtomicU32 = AtomicU32::new(0);
+
 // Domänen/HW-Fuzzer (ext-22, P6): churnt über viele Epochen Hardware-/Management-Caps gegen
 // die Domänen-Policy + CDT/VSpace-Oracles + Ressourcen-Baseline. Kernpunkte: HW-Caps (MMIO/
 // IRQ) NUR in HardwareLand, PdControl NUR in TrustedSas installierbar (Negativfälle abgelehnt);
@@ -566,6 +578,26 @@ fn hwfuzz_epoch(tpd: usize, hpd: usize, upd: usize, base_obj: usize, base_free: 
         return 60;
     }
     0
+}
+
+/// **Binary-Loader starten** (ext-26, L1): das extern gebaute `hello`-Programm aus dem Boot-Archiv
+/// in eine frische isolierte UserLand-PD laden + starten. Endowt eine Notification-Cap (Slot 0,
+/// Badge `HELLO_BADGE`) — hello signalisiert sie beim Start. Gibt die Notification-ID zurück (zum
+/// Pollen) oder `usize::MAX` bei Fehler. Setup IRQ-maskiert (Cap-Aufbau vor der Ausführung).
+fn run_load_start() -> usize {
+    hal::cpu::local_irq_disable();
+    let res = (|| {
+        let archive = loader::read_archive()?;
+        let hello = archive.iter().find(|p| p.name() == "hello")?;
+        let ntfn = system::create_notification()?;
+        let root = system::install_notification_cap(ntfn as u32, Rights::RW).ok()?;
+        // SIGNAL nutzt den CAP-Badge -> mit HELLO_BADGE minten (hellos x2 wird ignoriert).
+        let wcap = system::cap_mint(root, Rights::WRITE, HELLO_BADGE).ok()?;
+        loader::load_image(&hello, &[(0, wcap)]).ok()?;
+        Some(ntfn)
+    })();
+    hal::cpu::local_irq_enable();
+    res.unwrap_or(usize::MAX)
 }
 
 /// **Generische DMA-Infrastruktur testen** (ext-24): Richtung/Kohärenz (DmaCap-Attribute ->
@@ -3164,7 +3196,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} hwfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} hwfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -3205,6 +3237,7 @@ pub fn demo_report_then_idle() -> ! {
                 VRNG_DONE.load(Ordering::Acquire) && VRNG_OK.load(Ordering::Acquire),
                 DMAGEN_DONE.load(Ordering::Acquire) && DMAGEN_OK.load(Ordering::Acquire),
                 SASHEAP_DONE.load(Ordering::Acquire) && SASHEAP_OK.load(Ordering::Acquire),
+                LOAD_DONE.load(Ordering::Acquire) && LOAD_OK.load(Ordering::Acquire),
                 HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire),
             );
         }
@@ -4335,9 +4368,29 @@ pub fn demo_report_then_idle() -> ! {
             SASHEAP_DONE.store(true, Ordering::Release);
         }
 
+        // Binary-Loader (ext-26, L1): extern gebautes `hello` laden (gegate auf sasheap fertig),
+        // dann sein Start-Signal in spaeteren Iterationen pollen (hello laeuft dazwischen).
+        if !LOAD_STARTED.load(Ordering::Acquire) && SASHEAP_DONE.load(Ordering::Acquire) {
+            let ntfn = run_load_start();
+            LOAD_NTFN.store(ntfn, Ordering::Relaxed);
+            if ntfn == usize::MAX {
+                LOAD_DONE.store(true, Ordering::Release); // Laden fehlgeschlagen -> FAIL
+            }
+            LOAD_STARTED.store(true, Ordering::Release);
+        }
+        if LOAD_STARTED.load(Ordering::Acquire) && !LOAD_DONE.load(Ordering::Acquire) {
+            let ntfn = LOAD_NTFN.load(Ordering::Relaxed);
+            if ntfn != usize::MAX && system::notification_pending(ntfn) == HELLO_BADGE {
+                LOAD_OK.store(true, Ordering::Release);
+                LOAD_DONE.store(true, Ordering::Release);
+            } else if LOAD_POLLS.fetch_add(1, Ordering::Relaxed) > 200_000 {
+                LOAD_DONE.store(true, Ordering::Release); // Timeout -> FAIL
+            }
+        }
+
         // Domänen/HW-Fuzzer (ext-22, P6): churnt HW-/Management-Caps gegen Policy + Oracles +
-        // Baseline. Gegate auf Prozess-Heap (ext-25) fertig; eine Epoche je Iteration.
-        if !HWFUZZ_DONE.load(Ordering::Acquire) && SASHEAP_DONE.load(Ordering::Acquire) {
+        // Baseline. Gegate auf den Binary-Loader-Test (ext-26) fertig; eine Epoche je Iteration.
+        if !HWFUZZ_DONE.load(Ordering::Acquire) && LOAD_DONE.load(Ordering::Acquire) {
             match HWFUZZ_STEP.load(Ordering::Acquire) {
                 0 => {
                     // Fixtures (eine PD je Domäne, ohne Threads) + Baseline schnappen.
@@ -4553,13 +4606,15 @@ fn all_done() -> bool {
     let dmagen = DMAGEN_DONE.load(Ordering::Acquire) && DMAGEN_OK.load(Ordering::Acquire);
     // Prozess-Heap (ext-25): echter Box/Vec/BTreeMap-Heap auf realen Physadressen (safe Rust).
     let sasheap = SASHEAP_DONE.load(Ordering::Acquire) && SASHEAP_OK.load(Ordering::Acquire);
+    // Binary-Loader (ext-26): extern gebautes hello geladen + lief (signalisierte HELLO_BADGE).
+    let load = LOAD_DONE.load(Ordering::Acquire) && LOAD_OK.load(Ordering::Acquire);
     // Domänen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Policy + Oracles + Baseline.
     let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
         && pdctl && chan && rtc && irq && dma && pcie && smmu && smmubind && virtiorng && dmagen
-        && sasheap && hwfuzz
+        && sasheap && load && hwfuzz
 }
 
 fn report() {
@@ -5041,6 +5096,15 @@ fn report() {
     println!(
         "sasheap : {} (echter Box/Vec/BTreeMap-Heap auf realen Physadressen; Testcode 100% safe, unsafe nur in der Region-Runtime; prozess-lokaler Allokator ueber RegionSource grow/shrink)",
         if sasheap { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Binary-Loader (ext-26, L1): extern gebautes Programm geladen + ausgefuehrt.
+    let load = LOAD_DONE.load(Ordering::Acquire) && LOAD_OK.load(Ordering::Acquire);
+    println!("load    : extern gebautes 'hello' aus Boot-Archiv geladen (eigene isolierte UserLand-VSpace, W^X-Segmente an Link-VA, vom Allokator beliebige Phys) -> signalisierte HELLO_BADGE={}",
+        if load { "ja" } else { "NEIN" });
+    println!(
+        "load    : {} (generischer Binary-Loader: ELF64-Parse in Safe Rust, Segment-Kopie W^X, cap-gegatete PD + Endowment, EL0-Spawn -- extern gebauter Code laeuft NICHT aus dem Kernel-Image)",
+        if load { "ALL PASS" } else { "FAILURES" }
     );
 
     // Domänen/HW-Fuzzer (ext-22, P6).

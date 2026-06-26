@@ -40,6 +40,10 @@ pub enum LoaderError {
     /// Ungültiges/nicht unterstütztes ELF-Image (Magic/Klasse/Maschine/Typ falsch, `memsz<filesz`,
     /// unerwartete Program-Header-Größe).
     BadElf,
+    /// Domäne (noch) nicht ladbar (z. B. TrustedSAS/EL1 ohne Signaturprüfung, L3).
+    UnsupportedDomain,
+    /// Kernel-Ressourcen erschöpft (VSpace/ASID/RAM/TCB/PD) beim Laden.
+    NoResources,
 }
 
 /// Ein **quellen-agnostischer** ladbarer Programm-Deskriptor: stabile Metadaten + die Roh-Bytes des

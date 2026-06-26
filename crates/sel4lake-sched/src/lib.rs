@@ -294,6 +294,32 @@ impl Scheduler {
         Some(self.id(t))
     }
 
+    /// Wie [`spawn_user`](Self::spawn_user), aber mit **getrenntem** EL0-SP und Reap-Region — für
+    /// den Binary-Loader (ext-26): ein geladenes Programm hat einen **nicht-identity** gemappten
+    /// Stack (SP ist eine virtuelle Adresse `el0_sp`, die freizugebende RAM-Region liegt an einer
+    /// anderen Physadresse `reap_base`). `entry` ist die virtuelle Entry-Adresse des Programms.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_user_at(
+        &mut self,
+        core: usize,
+        entry: usize,
+        arg: usize,
+        kstack_base: usize,
+        kstack_len: usize,
+        el0_sp: usize,
+        reap_base: usize,
+        reap_len: usize,
+        priority: u8,
+    ) -> Option<ThreadId> {
+        debug_assert_eq!(core, self.core);
+        let sp = init_thread_frame(kstack_base + kstack_len, entry, arg, true, el0_sp);
+        let t = self.alloc_tcb(sp, priority)?;
+        self.tcbs[t].stack_base = reap_base;
+        self.tcbs[t].stack_len = reap_len;
+        self.enqueue_ready(t);
+        Some(self.id(t))
+    }
+
     /// Der laufende Thread beendet sich selbst: Stack als Zombie vormerken und
     /// zum nächsten Thread wechseln. Der TCB-Slot + Stack werden später per
     /// [`reap`](Self::reap) eingesammelt (der Thread läuft noch auf seinem Stack,

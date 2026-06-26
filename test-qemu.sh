@@ -23,14 +23,17 @@ ELF="build/target/aarch64-sel4lake/release/sel4lake-kernel.elf"
 echo "== build =="
 ./build.sh >/dev/null 2>&1 || { echo "BUILD FAILED"; exit 1; }
 
-# ext-26 (L0): das extern geladene Boot-Archiv assemblieren (Host-Tool tools/mkarchive.py, KEIN
-# Kernelcode). Noch keine echten Programme -> zwei Platzhalter-Module, um den Liefer-/Lese-/
-# Parse-Pfad (QEMU -device loader -> reserviertes RAM-Fenster -> Kernel-Parser) zu pruefen.
+# ext-26 (L1): die EXTERNEN Programme bauen (eigener Workspace, eigene Target/Linker) + ins
+# Boot-Archiv legen (Host-Tool tools/mkarchive.py, KEIN Kernelcode). `hello` ist ein echtes,
+# extern gebautes EL0-Programm, das der Kernel laedt + ausfuehrt; `probe` ist ein Platzhalter,
+# der den Multi-Modul-/Listen-Pfad zeigt.
 mkdir -p build
-printf 'PROBE-A-BLOB' > build/_proba.bin
-printf 'PROBE-B-BLOB' > build/_probb.bin
+( cd programs && rustup run nightly cargo build --release ) >/dev/null 2>&1 \
+    || { echo "PROGRAMS BUILD FAILED"; exit 1; }
+HELLO="programs/build/target/aarch64-sel4lake-user/release/hello.elf"
+printf 'PLACEHOLDER' > build/_probe.bin
 python3 tools/mkarchive.py build/boot-archive.bin \
-    1:probe-a:2:1:build/_proba.bin 2:probe-b:1:3:build/_probb.bin >/dev/null 2>&1 \
+    10:hello:2:1:"$HELLO" 2:probe:2:1:build/_probe.bin >/dev/null 2>&1 \
     || { echo "ARCHIVE BUILD FAILED"; exit 1; }
 
 echo "== boot ($SECONDS_RUN s) =="
@@ -98,6 +101,7 @@ check "smmubind: ALL PASS" "SMMU-Bindung: enable_dma/disable_dma installiert STE
 check "virtiorng: ALL PASS" "virtio-rng-DMA: Geraet DMAt echte Zufallsbytes in die DmaCap-Region; zweistufig: Level-1-Software-Bounds weist Out-of-Window demonstrierbar ab, Level-2-SMMU als HW-Backstop (QEMU emuliert-Geraet-Bypass)"
 check "dmagen  : ALL PASS" "Generische DMA-Infra (ext-24): Richtung/Kohaerenz als DmaCap-Attribute (richtungsminimales SMMU-AP), Multi-Region-Kontext, Stream-Gruppen, Scatter-Gather-Validierung, disjunkte Sub-Puffer (SG-Pfad)"
 check "sasheap : ALL PASS" "Prozess-Heap (ext-25): echter Box/Vec/BTreeMap-Heap auf realen Physadressen; Hybrid-Allokator (Slabs+Bump) ueber Regionsliste + grow/shrink; Testcode 100% safe, unsafe nur in der Region-Runtime"
+check "load    : ALL PASS" "Binary-Loader (ext-26): extern gebautes EL0-Programm aus dem Boot-Archiv geladen + ausgefuehrt (ELF64-Parse in Safe Rust, Segment-Kopie W^X an Link-VA, cap-gegatete isolierte PD + Endowment) -- Prozess NICHT im Kernel-Image"
 check "hwfuzz  : ALL PASS" "Domaenen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Domaenen-Policy + CDT/VSpace-Oracle + Ressourcen-Baseline"
 online=$(echo "$OUT" | grep -c "online")
 [ "$online" -eq "$CORES" ] && echo "  PASS: alle $CORES Kerne online" || { echo "  FAIL: nur $online/$CORES Kerne online"; fail=1; }

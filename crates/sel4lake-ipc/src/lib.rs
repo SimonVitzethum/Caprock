@@ -383,6 +383,11 @@ impl Notification {
     pub fn is_used(&self) -> bool {
         self.used
     }
+    /// Den aktuell akkumulierten Badge lesen, **ohne** ihn zu konsumieren (Test-/Loader-Telemetrie:
+    /// hat jemand signalisiert?). `WAIT` konsumiert ihn regulär.
+    pub fn pending_badge(&self) -> u64 {
+        self.pending
+    }
     pub fn mark_used(&mut self) {
         *self = Notification {
             used: true,

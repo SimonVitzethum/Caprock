@@ -17,12 +17,14 @@ ELF="build/target/aarch64-sel4lake/release/sel4lake-kernel.elf"
 
 echo "== build =="
 ./build.sh >/dev/null 2>&1 || { echo "BUILD FAILED"; exit 1; }
-# Boot-Archiv (ext-26) wie in test-qemu.sh bereitstellen.
+# Boot-Archiv (ext-26) wie in test-qemu.sh bereitstellen (externe Programme + hello).
 mkdir -p build
-printf 'PROBE-A-BLOB' > build/_proba.bin
-printf 'PROBE-B-BLOB' > build/_probb.bin
+( cd programs && rustup run nightly cargo build --release ) >/dev/null 2>&1 \
+    || { echo "PROGRAMS BUILD FAILED"; exit 1; }
+HELLO="programs/build/target/aarch64-sel4lake-user/release/hello.elf"
+printf 'PLACEHOLDER' > build/_probe.bin
 python3 tools/mkarchive.py build/boot-archive.bin \
-    1:probe-a:2:1:build/_proba.bin 2:probe-b:1:3:build/_probb.bin >/dev/null 2>&1 || { echo "ARCHIVE FAILED"; exit 1; }
+    10:hello:2:1:"$HELLO" 2:probe:2:1:build/_probe.bin >/dev/null 2>&1 || { echo "ARCHIVE FAILED"; exit 1; }
 
 echo "== stress: $N Laeufe (Timeout ${TMO}s je Lauf) =="
 ok=0; hang=0

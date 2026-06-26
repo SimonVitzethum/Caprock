@@ -22,6 +22,7 @@ use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
 use sel4lake_microkit::{Caps, Domain};
 use sel4lake_region::heap::RegionSource;
 use sel4lake_region::{Purpose, Region, RegionTag};
+use sel4lake_loader::elf::{ElfImage, PF_W, PF_X};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use sel4lake_sched::{SchedOps, Scheduler, ThreadId, MAX_THREADS};
 use sel4lake_sync::{RwSpinLock, SpinLock};
@@ -1173,6 +1174,141 @@ pub fn spawn_isolated_native(code: *const u8, code_len: usize, prio: u8) -> Opti
             release_user_kstack(kidx);
             None
         }
+    }
+}
+
+/// **Stack-VA-Fenster** geladener Programme (fest, in GiB 1, getrennt von der Code-Link-VA
+/// `0x4100_0000`) + Größe. Der Stack wird **nicht-identity** an diese VA gemappt.
+const LOADED_STACK_VA: u64 = 0x43F0_0000;
+const LOADED_STACK_BYTES: u64 = 0x4000; // 16 KiB
+
+/// `src` (filesz Bytes) nach `dst_phys` kopieren + `[src.len(), total)` nullen (`.bss` + Padding).
+/// Die **einzige** unsafe-Stelle des Ladepfads (ADR 0011 §2): Kopieren bereits **validierter**
+/// Segmente in den Zielspeicher.
+fn copy_segment(dst_phys: u64, src: &[u8], total: usize) {
+    // SAFETY: `dst_phys` ist ein frisch allozierter, identity-gemappter RW-Frame der Größe `total`
+    // (auf Seiten aufgerundet, >= `src.len()`); es werden genau `total` Bytes im Frame geschrieben.
+    unsafe {
+        let dst = dst_phys as *mut u8;
+        core::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+        core::ptr::write_bytes(dst.add(src.len()), 0, total - src.len());
+    }
+}
+
+/// Ein extern geladenes, **validiertes** ELF-Image in eine NEUE isolierte PD laden + starten
+/// (ext-26, L1c, generischer Binary-Loader). Kopiert die `PT_LOAD`-Segmente an beliebige RAM-Frames
+/// und mappt sie **W^X** an ihre Link-VAs ([`hal::mmu::vspace_map_page_at`]), legt einen Stack an,
+/// erzeugt eine PD in `domain`, endowt die `endow`-Caps (über `install_cap_checked` —
+/// Domänen-Policy + Audits bleiben gültig) und spawnt einen EL0-Thread am Entry. Gibt
+/// `(ThreadId, pd)`. Der Aufbau ab dem Spawn läuft **IRQ-maskiert**, damit der frisch lauffähige
+/// Thread NICHT startet, bevor PD-Bindung + Cap-Endowment stehen.
+pub fn load_elf(img: &ElfImage, domain: Domain, endow: &[(usize, CapPtr)]) -> Option<(ThreadId, usize)> {
+    let core = hal::cpu::core_id();
+    let kidx = claim_user_kstack()?;
+    let kbase = core::ptr::addr_of!(__user_kstacks_bottom) as usize + kidx * USER_KSTACK_SIZE;
+    let Some((asid, l1)) = create_vspace() else {
+        release_user_kstack(kidx);
+        return None;
+    };
+    let Some(l2) = vspace_l2(asid) else {
+        vspace_teardown(asid);
+        release_user_kstack(kidx);
+        return None;
+    };
+    let fail = |asid: u16, kidx: usize| {
+        vspace_teardown(asid);
+        release_user_kstack(kidx);
+        None
+    };
+
+    // 1. PT_LOAD-Segmente: kopieren + W^X an Link-VA mappen (nicht-identity, vaddr -> beliebige pa).
+    for seg in img.segments() {
+        let total = (((seg.memsz as u64) + 4095) & !4095) as usize;
+        let Some(region) = MEM.lock().alloc(total as u64, 4096) else {
+            return fail(asid, kidx);
+        };
+        let pa = region.base(); // MemoryCap-Drop = nur Deskriptor (kein Free); RAM bleibt belegt
+        copy_segment(pa, img.segment_bytes(&seg), total);
+        let perm = if seg.flags & PF_X != 0 {
+            hal::mmu::UserPerm::Rx
+        } else if seg.flags & PF_W != 0 {
+            hal::mmu::UserPerm::Rw
+        } else {
+            hal::mmu::UserPerm::Ro
+        };
+        let mut off = 0u64;
+        while (off as usize) < total {
+            let mut a3 = || MEM.lock().alloc(4096, 4096).map(|c| c.base());
+            if !hal::mmu::vspace_map_page_at(l2, seg.vaddr + off, pa + off, perm, &mut a3) {
+                return fail(asid, kidx);
+            }
+            off += 4096;
+        }
+        if seg.flags & PF_X != 0 {
+            hal::cpu::sync_code_range(pa as usize, total); // I-Cache kohärent vor der Ausführung
+        }
+    }
+
+    // 2. Stack (nicht-identity an festes VA-Fenster, EL0-RW).
+    let Some(stack_region) = MEM.lock().alloc(LOADED_STACK_BYTES, 4096) else {
+        return fail(asid, kidx);
+    };
+    let stack_pa = stack_region.base();
+    let mut off = 0u64;
+    while off < LOADED_STACK_BYTES {
+        let mut a3 = || MEM.lock().alloc(4096, 4096).map(|c| c.base());
+        if !hal::mmu::vspace_map_page_at(l2, LOADED_STACK_VA + off, stack_pa + off, hal::mmu::UserPerm::Rw, &mut a3) {
+            return fail(asid, kidx);
+        }
+        off += 4096;
+    }
+    hal::mmu::flush_asid(asid);
+
+    // 3. PD + Thread + Endowment IRQ-maskiert: der Thread darf nicht vor dem Setup starten.
+    hal::cpu::local_irq_disable();
+    let Some(pd) = create_pd_in_domain(domain) else {
+        hal::cpu::local_irq_enable();
+        return fail(asid, kidx);
+    };
+    let tid = {
+        let mut sched = SCHEDS[core].lock();
+        let r = sched.spawn_user_at(
+            core,
+            img.entry() as usize,
+            0,
+            kbase,
+            USER_KSTACK_SIZE,
+            (LOADED_STACK_VA + LOADED_STACK_BYTES) as usize, // EL0-SP (virtuell)
+            stack_pa as usize,                               // Reap-Region (physisch)
+            LOADED_STACK_BYTES as usize,
+            IDLE_PRIO,
+        );
+        if let Some(t) = r {
+            fp_reset_slot(t.slot());
+        }
+        r
+    };
+    let Some(tid) = tid else {
+        hal::cpu::local_irq_enable();
+        return fail(asid, kidx);
+    };
+    record_user_kstack(tid.slot(), kidx);
+    VSPACE_OF[tid.slot()].store(((asid as u64) << 48) | l1, Ordering::Relaxed); // ab jetzt isoliert
+    bind_pd(pd, tid);
+    for &(slot, cap) in endow {
+        install_pd_cap(pd, slot, cap); // policy-geprüft (Domänen-Policy bleibt gültig)
+    }
+    hal::cpu::local_irq_enable();
+    Some((tid, pd))
+}
+
+/// Den **akkumulierten Badge** einer Notification lesen, **ohne** ihn zu konsumieren (Test-/
+/// Loader-Telemetrie: hat ein geladenes Programm signalisiert?). `0`, falls leer/ungültig.
+pub fn notification_pending(ntfn: usize) -> u64 {
+    if ntfn < NNOTIFICATIONS {
+        NTFNS[ntfn].lock().pending_badge()
+    } else {
+        0
     }
 }
 

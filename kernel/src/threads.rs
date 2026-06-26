@@ -468,15 +468,26 @@ fn hwfuzz_epoch(tpd: usize, hpd: usize, upd: usize, base_obj: usize, base_free: 
     if !system::install_pd_cap(hpd, 8, mmio2) {
         return 12;
     }
-    // 4b. DMA-Cap (ext-23): echtes kernel-ausgeschnittenes RAM, NUR HardwareLand. Anders als
+    // 4b. DMA-Cap (ext-23/24): echtes kernel-ausgeschnittenes RAM, NUR HardwareLand. Anders als
     // MMIO/IRQ reduziert die Allokation `total_free` — die Revoke (delete_leaf -> free_region)
-    // stellt es wieder her, sodass die Epoche balanciert bleibt (Codes 70+).
+    // stellt es wieder her, sodass die Epoche balanciert bleibt (Codes 70+). ext-24: variierte
+    // Richtung/Kohärenz (install_dma_cap_ex).
     let dlen = 0x1000u64 * (1 + hwfuzz_rand() % 4);
     let dregion = match system::alloc_dma_region(dlen) {
         Some(r) => r,
         None => return 70, // GiB-1-Erschöpfung wäre eine Anomalie (Epoche allokiert+gibt frei)
     };
-    let dma = match system::install_dma_cap(dregion.base, dregion.len, Rights::RW) {
+    let dir = match hwfuzz_rand() % 3 {
+        0 => DmaDir::DeviceRead,
+        1 => DmaDir::DeviceWrite,
+        _ => DmaDir::Bidirectional,
+    };
+    let coh = if hwfuzz_rand() & 1 == 0 {
+        DmaCoherence::Coherent
+    } else {
+        DmaCoherence::NonCoherent
+    };
+    let dma = match system::install_dma_cap_ex(dregion.base, dregion.len, dir, coh, Rights::RW) {
         Ok(c) => c,
         Err(_) => {
             system::free_dma_region(dregion.base, dregion.len);
@@ -488,6 +499,22 @@ fn hwfuzz_epoch(tpd: usize, hpd: usize, upd: usize, base_obj: usize, base_free: 
     }
     if system::install_pd_cap(upd, 9, dma) || system::install_pd_cap(tpd, 9, dma) {
         return 73; // UserLand/TrustedSas: DMA-Cap (Hardware) muss abgelehnt werden
+    }
+    // 4c. ext-24: DmaContext-Churn — Region an eine Fuzz-StreamID anhängen, SG validieren, lösen
+    // (balanciert: attach alloziert Stage-1-Frames, detach gibt sie wieder frei).
+    let fsid = 0x60u32 + (hwfuzz_rand() % 8) as u32;
+    if let Some(h) = system::dma_attach(fsid, dma) {
+        if system::dma_ctx_region_count(fsid) != 1 {
+            return 75;
+        }
+        let sg = [system::DmaSgEntry { handle: h, offset: 0, len: dregion.len }];
+        let bad = [system::DmaSgEntry { handle: h, offset: dregion.len, len: 0x1000 }];
+        if !system::dma_sg_validate(fsid, &sg) || system::dma_sg_validate(fsid, &bad) {
+            return 76; // SG-Validierung inkonsistent
+        }
+        system::dma_detach(fsid, h);
+    } else {
+        return 77; // attach muss klappen (SMMU aktiv)
     }
     // 5. Mid-Epoch-Oracles.
     if system::domain_audit() != 0 {
@@ -4917,7 +4944,7 @@ fn report() {
     // Domänen/HW-Fuzzer (ext-22, P6).
     let hwf_fail = HWFUZZ_FAIL.load(Ordering::Acquire);
     let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
-    println!("hwfuzz  : {} Epochen HW-/Management-Cap-Churn (MMIO/IRQ/PdControl/DMA) gegen Domaenen-Policy + CDT/VSpace/DMA-Oracle + Baseline; Anomalie-Code={hwf_fail} (0=keine)", HWFUZZ_EPOCH.load(Ordering::Acquire));
+    println!("hwfuzz  : {} Epochen HW-/Management-Cap-Churn (MMIO/IRQ/PdControl/DMA + ext-24 Richtung/Kohaerenz/Kontext-Attach/SG) gegen Policy + CDT/VSpace/DMA-Oracle + Baseline; Anomalie-Code={hwf_fail} (0=keine)", HWFUZZ_EPOCH.load(Ordering::Acquire));
     println!(
         "hwfuzz  : {} (HW-Caps nur HardwareLand, PdControl nur TrustedSas, MMIO/IRQ-Delete fasst RAM-Allokator nicht an, DMA-alloc<->free balanciert, Audits stets 0)",
         if hwfuzz { "ALL PASS" } else { "FAILURES" }

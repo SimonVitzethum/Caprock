@@ -1,18 +1,19 @@
-//! Kernzustand hinter **per-Kern-Scheduler-Locks** (`SCHEDS[core]`, je Kern eine
-//! Instanz mit eigener TCB-Partition) und dem **einen** Ressourcen-Lock (`RES` =
-//! Allokator, Capability-Space, Endpoints, Notifications, Protection Domains) —
-//! plus die Trap-Hooks.
+//! Kernzustand hinter **per-Kern-Scheduler-Locks** (`SCHEDS[core]`, je Kern eine Instanz mit
+//! eigener TCB-Partition) und den **getrennten** Ressourcen-Locks (`CAPS` = Capability-Space + PDs;
+//! `MEM` = physischer Allokator; `EPS[]`/`NTFNS[]` = Endpoints/Notifications; `VSPACES`; `DMA_CTX`)
+//! — plus die Trap-Hooks.
 //!
-//! **Echte per-Kern-parallele Einplanung:** Der heiße Timer-/IPI-Reschedule-Pfad
-//! sperrt nur `SCHEDS[core]` des eigenen Kerns — Kerne planen gleichzeitig ein,
-//! ohne sich gegenseitig zu blockieren. Kern-übergreifendes Aufwecken
-//! ([`wake_remote`]) sperrt die **Ziel**instanz und schickt einen Reschedule-IPI.
+//! **Echte per-Kern-parallele Einplanung:** Der heiße Timer-/IPI-Reschedule-Pfad sperrt nur
+//! `SCHEDS[core]` des eigenen Kerns — Kerne planen gleichzeitig ein, ohne sich gegenseitig zu
+//! blockieren. Kern-übergreifendes Aufwecken ([`wake_remote`]) sperrt die **Ziel**instanz und
+//! schickt einen Reschedule-IPI.
 //!
-//! **Lock-Ordnung:** `RES` vor `SCHEDS[*]`, und `SCHEDS[*]` vor `FP_STATES`. Der
-//! reine Reschedule-Pfad nimmt nur `SCHEDS[core]` (+ atomares `FP_OWNER`), wartet
-//! also nie auf einen anderen Lock und kann an keinem Deadlock-Zyklus teilnehmen.
-//! IPC sperrt `RES` dann `SCHEDS[core]` (kern-lokale Endpoint-Teilnehmer). Kein
-//! Pfad nimmt zwei verschiedene `SCHEDS[*]` gleichzeitig.
+//! **Lock-Ordnung (Rang-Hierarchie, totale Ordnung):** `CAPS` (R0) → `EPS`/`NTFNS`/`VSPACES`/
+//! `DMA_CTX` (R1) → `SCHEDS[*]` (R2) → `Heap.inner` (R3) → `MEM` (R4, innerster). Nur aufsteigend
+//! schachteln; `MEM` hält nie einen weiteren Lock. Der reine Reschedule-Pfad nimmt nur
+//! `SCHEDS[core]` (+ atomares `FP_OWNER`) und kann an keinem Deadlock-Zyklus teilnehmen; kein Pfad
+//! nimmt zwei verschiedene `SCHEDS[*]` gleichzeitig. Vollständige Herleitung + alle belegten
+//! Schachtelungen: `docs/invariants.md` §1.
 
 use sel4lake_cap::{CapError, CapInfo, CapPtr, DmaCoherence, DmaDir, ObjectKind};
 use sel4lake_hal::{self as hal, exception::TrapFrame, fp::FpState, println};
@@ -1212,23 +1213,41 @@ pub fn install_mmio_cap(phys: u64, len: u64, rights: Rights) -> Result<CapPtr, C
     CAPS.write().cspace.install_mmio(phys, len, rights)
 }
 
-/// Eine über eine MMIO-Cap autorisierte Geräteregion `[phys, phys+len)` als **EL0-Device**
-/// (Device-nGnRnE, PXN|UXN, nG) in die isolierte VSpace des Threads `tid` mappen. Generisch
-/// (keine geräte-spezifische Annahme). Nur für isolierte PDs (ASID != 0 — also Hardware/
-/// UserLand; HW-Caps sind ohnehin nur in HardwareLand installierbar). `ro` = read-only.
-/// Gibt `false` bei nicht-isolierter VSpace oder fehlgeschlagenem Mapping.
-pub fn map_mmio_into_thread(tid: ThreadId, phys: u64, len: u64, ro: bool) -> bool {
+/// **Mapping-Art** (Konsolidierung K6) für [`map_region_into_thread`]: bestimmt Tabellen-Level,
+/// Adressfenster und Speicher-Attribute der in eine isolierte VSpace eingeblendeten Region.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MappingKind {
+    /// Geräte-MMIO: Device-nGnRnE, PXN|UXN, nG, in GiB 0 (`vspace_map_device`, L1-Wurzel).
+    /// `ro` = schreibgeschützt.
+    Device { ro: bool },
+    /// DMA-RAM: in GiB 1 (`vspace_map_dma`, L2-Wurzel). `coherent` = Normal-WB (Cache-Maintenance
+    /// nötig), sonst Normal-NC (ext-23-Default).
+    Dma { coherent: bool },
+}
+
+/// Eine autorisierte Region `[phys, phys+len)` **art-spezifisch** in die isolierte VSpace des
+/// Threads `tid` einblenden — der **eine** Eintrittspunkt (Konsolidierung K6: ersetzt
+/// `map_mmio_into_thread`/`map_dma_into_thread`/`_ex`). [`MappingKind`] wählt Tabellen-Level +
+/// Attribute. Generisch (keine geräte-spezifische Annahme); nur für isolierte PDs (ASID != 0 —
+/// also Hardware/UserLand; HW-Caps sind ohnehin nur in HardwareLand installierbar). Gibt `false`
+/// bei nicht-isolierter VSpace oder fehlgeschlagenem Mapping.
+pub fn map_region_into_thread(tid: ThreadId, phys: u64, len: u64, kind: MappingKind) -> bool {
     let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
-    let Some(l1) = vspace_l1(asid) else {
-        return false; // nicht isoliert / ungültige ASID
-    };
     let mut alloc = || MEM.lock().alloc(4096, 4096).map(|c| c.base());
-    if hal::mmu::vspace_map_device(l1, phys, len, ro, &mut alloc) {
+    let ok = match kind {
+        MappingKind::Device { ro } => match vspace_l1(asid) {
+            Some(l1) => hal::mmu::vspace_map_device(l1, phys, len, ro, &mut alloc),
+            None => return false, // nicht isoliert / ungültige ASID
+        },
+        MappingKind::Dma { coherent } => match vspace_l2(asid) {
+            Some(l2) => hal::mmu::vspace_map_dma(l2, phys, len, coherent, &mut alloc),
+            None => return false,
+        },
+    };
+    if ok {
         hal::mmu::flush_asid(asid);
-        true
-    } else {
-        false
     }
+    ok
 }
 
 // --- IRQ-Caps + Deferred-IRQ-Zustellung (ext-22, P5) ---
@@ -1634,32 +1653,8 @@ impl DmaCtx {
 
 static DMA_CTX: SpinLock<[DmaCtx; NDMA_CTX]> = SpinLock::new([DmaCtx::EMPTY; NDMA_CTX]);
 
-/// Anzahl Regionen im Kontext der StreamID (Test-/Audit-Telemetrie). `0`, wenn kein Kontext.
-pub fn dma_ctx_region_count(stream_id: u32) -> usize {
-    let t = DMA_CTX.lock();
-    t.iter()
-        .find(|c| c.used && c.sids.contains(&stream_id))
-        .map(|c| c.regs.iter().filter(|&&(_, l)| l != 0).count())
-        .unwrap_or(0)
-}
-
-/// Anzahl StreamIDs im Kontext der StreamID (Stream-Gruppen-Telemetrie).
-pub fn dma_ctx_sid_count(stream_id: u32) -> usize {
-    let t = DMA_CTX.lock();
-    t.iter()
-        .find(|c| c.used && c.sids.contains(&stream_id))
-        .map(|c| c.sids.iter().filter(|&&s| s != u32::MAX).count())
-        .unwrap_or(0)
-}
-
-/// Die Stage-1-Wurzel des Kontexts der StreamID (für den strukturellen Leaf-Test). `0` = keiner.
-pub fn dma_ctx_stage1(stream_id: u32) -> u64 {
-    let t = DMA_CTX.lock();
-    t.iter()
-        .find(|c| c.used && c.sids.contains(&stream_id))
-        .map(|c| c.l1)
-        .unwrap_or(0)
-}
+// DMA-Kontext-Telemetrie (dma_ctx_region_count/sid_count/stage1) liegt in `mod testsupport`
+// (Konsolidierung K5: Test-/Telemetrie-API von der verifizierten Kernschnittstelle getrennt).
 
 /// Der globale DMA-Enforcer. In ext-23 fest `SmmuV3Enforcer`; ein Wechsel (z.B. auf einen
 /// künftigen `NullIommuEnforcer`) tauscht nur diese Definition + den Accessor aus, ohne den
@@ -1678,28 +1673,8 @@ pub fn dma_enforcer_init() -> bool {
     dma_enforcer().init()
 }
 
-// --- SMMU-Diagnose-Accessors (ext-23, D2; SMMU-spezifisch, nur für den `smmu`-Test/Bericht) ---
-pub fn smmu_present() -> bool {
-    hal::smmu::present()
-}
-pub fn smmu_idr0() -> u32 {
-    hal::smmu::idr0()
-}
-pub fn smmu_sid_bits() -> u32 {
-    hal::smmu::sid_bits()
-}
-pub fn smmu_enabled() -> bool {
-    hal::smmu::enabled()
-}
-pub fn smmu_sync_ok() -> bool {
-    DMA_ENFORCER.sync_ok()
-}
-pub fn smmu_eventq_empty() -> bool {
-    hal::smmu::eventq_empty()
-}
-pub fn smmu_gerror() -> u32 {
-    hal::smmu::gerror()
-}
+// SMMU-Diagnose-Accessors (smmu_present/idr0/sid_bits/enabled/sync_ok/eventq_empty/gerror) liegen
+// in `mod testsupport` (Konsolidierung K5: SMMU-spezifische Test-/Bericht-Telemetrie getrennt).
 
 /// Eine kontiguierliche **DMA-RAM-Region** (4-KiB-granular, in der mappbaren GiB-1-Region)
 /// ausschneiden. `None` bei Erschöpfung oder wenn die Allokation nicht in GiB 1 liegt (dort
@@ -1750,29 +1725,6 @@ pub fn dma_cap_attrs(cap: CapPtr) -> Option<(u64, u64, DmaDir, DmaCoherence)> {
             coherence,
         } => Some((phys, len, dir, coherence)),
         _ => None,
-    }
-}
-
-/// Eine DMA-Region `[phys, phys+len)` als **EL0-RW** in die isolierte VSpace des Threads `tid`
-/// mappen (identity, VA=PA). `cacheable` = Coherent (Normal-WB, Cache-Maintenance nötig), sonst
-/// Normal-NC (Default). Nur für isolierte PDs (ASID != 0). Rückwärtskompatibel: `map_dma_into_thread`
-/// (NC) ist ein Wrapper.
-pub fn map_dma_into_thread(tid: ThreadId, phys: u64, len: u64) -> bool {
-    map_dma_into_thread_ex(tid, phys, len, false)
-}
-
-/// Wie [`map_dma_into_thread`], aber mit expliziter Cache-Kohärenz (ext-24).
-pub fn map_dma_into_thread_ex(tid: ThreadId, phys: u64, len: u64, cacheable: bool) -> bool {
-    let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
-    let Some(l2) = vspace_l2(asid) else {
-        return false;
-    };
-    let mut alloc = || MEM.lock().alloc(4096, 4096).map(|c| c.base());
-    if hal::mmu::vspace_map_dma(l2, phys, len, cacheable, &mut alloc) {
-        hal::mmu::flush_asid(asid);
-        true
-    } else {
-        false
     }
 }
 
@@ -1882,11 +1834,7 @@ fn dma_addr_in_context(stream_id: u32, addr: u64, len: u64) -> bool {
     let t = DMA_CTX.lock();
     t.iter()
         .find(|c| c.used && c.sids.contains(&stream_id))
-        .map(|c| {
-            c.regs
-                .iter()
-                .any(|&(b, l)| l != 0 && addr >= b && addr.saturating_add(len) <= b + l)
-        })
+        .map(|c| c.regs.iter().any(|&(b, l)| region_contains(b, l, addr, len)))
         .unwrap_or(false)
 }
 
@@ -1955,13 +1903,22 @@ impl DmaPool {
     }
 }
 
+/// **Kanonisches Region-Containment** (Konsolidierung K4): liegt `[addr, addr+len)` VOLLSTÄNDIG in
+/// `[base, base+rlen)`? Die **eine** Grundlage aller DMA-Bounds-Prüfungen — Level-1-Software-
+/// Disziplin ([`dma_addr_in_region`]), Multi-Region-Kontext ([`dma_addr_in_context`]) und
+/// Scatter-Gather ([`dma_sg_validate`]) bauen alle darauf auf (keine duplizierte Formel mehr).
+fn region_contains(base: u64, rlen: u64, addr: u64, len: u64) -> bool {
+    len > 0 && addr >= base && addr.saturating_add(len) <= base.saturating_add(rlen)
+}
+
 /// **Level-1-Software-Disziplin** (ext-23): prüfen, dass ein Geräte-DMA-Zugriff `[addr, addr+len)`
 /// VOLLSTÄNDIG in der DmaCap-Region `[base, base+rlen)` liegt. Der vertrauenswürdige Treiber MUSS
 /// dies vor dem Programmieren JEDER Geräte-DMA-Adresse (Deskriptor/Register) aufrufen (backend-
 /// direkt, kernel-auditiert). Hardware-unabhängig wirksam. Die SMMU (Level 2) ist der zusätzliche
-/// **Hardware-Backstop**, falls ein kompromittiertes Backend diese Prüfung umgeht.
+/// **Hardware-Backstop**, falls ein kompromittiertes Backend diese Prüfung umgeht. Dünner Wrapper
+/// um das kanonische [`region_contains`].
 pub fn dma_addr_in_region(base: u64, rlen: u64, addr: u64, len: u64) -> bool {
-    len > 0 && addr >= base && addr.saturating_add(len) <= base.saturating_add(rlen)
+    region_contains(base, rlen, addr, len)
 }
 
 /// Ergebnis der virtio-rng-DMA-Demo (ext-23, D4): echter Bus-Master-DMA in die DmaCap-Region +
@@ -2021,7 +1978,7 @@ pub fn virtio_rng_dma_demo() -> VirtioDmaResult {
             let (adv, wlen) = unsafe { rng.request(base, data) };
             r.used_adv = adv;
             r.written = wlen;
-            let (w0, w1) = peek_dma_words(data);
+            let (w0, w1) = testsupport::peek_dma_words(data);
             r.rand0 = w0;
             r.rand1 = w1;
         }
@@ -2118,7 +2075,7 @@ pub fn revoke_dma(binding: &DmaBinding, tid: ThreadId) {
 pub fn dma_audit() -> u32 {
     let floor = hal::mmu::kernel_end().max(hal::mmu::USER_RAM_MIN);
     let ceil = hal::mmu::GIB1_END;
-    let code = CAPS.read().dma_audit(floor, ceil);
+    let code = CAPS.read().dma_bounds_audit(floor, ceil);
     if code != 0 {
         return code;
     }
@@ -2160,6 +2117,85 @@ fn dma_ctx_regions_live() -> bool {
     !snap[..n].iter().any(|&(b, l)| mem.overlaps_free(b, l))
 }
 
+/// **Test-/Telemetrie-API** (Konsolidierung K5) — bewusst von der verifizierten Kernschnittstelle
+/// getrennt. Diese Funktionen werden NUR vom Selbsttest/Bericht (`threads.rs`) gelesen; sie tragen
+/// keine Sicherheitsinvariante und sind nicht Teil der zu verifizierenden DMA-Kern-API. `use
+/// super::*` bringt die (für Kindmodule sichtbaren) privaten Statics/Imports von `system` in Scope.
+pub(crate) mod testsupport {
+    use super::*;
+
+    /// Anzahl Regionen im Kontext der StreamID. `0`, wenn kein Kontext.
+    pub fn dma_ctx_region_count(stream_id: u32) -> usize {
+        let t = DMA_CTX.lock();
+        t.iter()
+            .find(|c| c.used && c.sids.contains(&stream_id))
+            .map(|c| c.regs.iter().filter(|&&(_, l)| l != 0).count())
+            .unwrap_or(0)
+    }
+
+    /// Anzahl StreamIDs im Kontext der StreamID (Stream-Gruppen-Telemetrie).
+    pub fn dma_ctx_sid_count(stream_id: u32) -> usize {
+        let t = DMA_CTX.lock();
+        t.iter()
+            .find(|c| c.used && c.sids.contains(&stream_id))
+            .map(|c| c.sids.iter().filter(|&&s| s != u32::MAX).count())
+            .unwrap_or(0)
+    }
+
+    /// Die Stage-1-Wurzel des Kontexts der StreamID (struktureller Leaf-Test). `0` = keiner.
+    pub fn dma_ctx_stage1(stream_id: u32) -> u64 {
+        let t = DMA_CTX.lock();
+        t.iter()
+            .find(|c| c.used && c.sids.contains(&stream_id))
+            .map(|c| c.l1)
+            .unwrap_or(0)
+    }
+
+    // --- SMMU-Diagnose-Accessors (ext-23, D2; SMMU-spezifisch, nur für den `smmu`-Test/Bericht) ---
+    pub fn smmu_present() -> bool {
+        hal::smmu::present()
+    }
+    pub fn smmu_idr0() -> u32 {
+        hal::smmu::idr0()
+    }
+    pub fn smmu_sid_bits() -> u32 {
+        hal::smmu::sid_bits()
+    }
+    pub fn smmu_enabled() -> bool {
+        hal::smmu::enabled()
+    }
+    pub fn smmu_sync_ok() -> bool {
+        DMA_ENFORCER.sync_ok()
+    }
+    pub fn smmu_eventq_empty() -> bool {
+        hal::smmu::eventq_empty()
+    }
+    pub fn smmu_gerror() -> u32 {
+        hal::smmu::gerror()
+    }
+
+    /// Wie [`super::dma_audit`], aber mit explizit gewähltem `floor` (Bounds-Sensitivitätstest:
+    /// ein zu hoher `floor` muss eine legitime Region als Out-of-Window melden).
+    pub fn dma_audit_with_floor(floor: u64) -> u32 {
+        CAPS.read().dma_bounds_audit(floor, hal::mmu::GIB1_END)
+    }
+
+    /// Die ersten beiden 32-bit-Worte einer (RAM-)DMA-Region über die **globale Identity-Map**
+    /// lesen (der Kernel sieht alles RAM EL1-RW). Für den Kohärenz-Check: sieht der Kernel dieselben
+    /// Bytes, die das Backend über seine EL0-Non-Cacheable-Abbildung geschrieben hat?
+    pub fn peek_dma_words(phys: u64) -> (u32, u32) {
+        // SAFETY: `phys` ist eine kernel-ausgeschnittene RAM-DMA-Region, in der globalen SAS-Map
+        // identity-gemappt und gültig; nur lesender Zugriff auf die ersten 8 Bytes.
+        unsafe {
+            let p = phys as *const u32;
+            (
+                core::ptr::read_volatile(p),
+                core::ptr::read_volatile(p.add(1)),
+            )
+        }
+    }
+}
+
 // --- PCIe-Enumeration (ext-23, D1; kernel-/Trusted-Setup) ---
 
 /// Das DMA-Beweisgerät (`virtio-rng-pci`) per ECAM finden + einrichten: ECAM **global** als
@@ -2180,26 +2216,8 @@ pub fn virtio_device() -> Option<hal::pcie::PciDevice> {
     *VIRTIO_PCI.lock()
 }
 
-/// Wie [`dma_audit`], aber mit explizit gewähltem `floor` (für den Bounds-Sensitivitätstest:
-/// ein zu hoher `floor` muss eine legitime Region als Out-of-Window melden).
-pub fn dma_audit_with_floor(floor: u64) -> u32 {
-    CAPS.read().dma_audit(floor, hal::mmu::GIB1_END)
-}
-
-/// Die ersten beiden 32-bit-Worte einer (RAM-)DMA-Region über die **globale Identity-Map**
-/// lesen (der Kernel sieht alles RAM EL1-RW). Für den Kohärenz-Check: sieht der Kernel
-/// dieselben Bytes, die das Backend über seine EL0-Non-Cacheable-Abbildung geschrieben hat?
-pub fn peek_dma_words(phys: u64) -> (u32, u32) {
-    // SAFETY: `phys` ist eine kernel-ausgeschnittene RAM-DMA-Region, in der globalen SAS-Map
-    // identity-gemappt und gültig; nur lesender Zugriff auf die ersten 8 Bytes.
-    unsafe {
-        let p = phys as *const u32;
-        (
-            core::ptr::read_volatile(p),
-            core::ptr::read_volatile(p.add(1)),
-        )
-    }
-}
+// dma_audit_with_floor + peek_dma_words liegen in `mod testsupport`
+// (Konsolidierung K5: Bounds-Sensitivitätstest + Kohärenz-Peek von der Kernschnittstelle getrennt).
 
 // --- MCS Scheduling Contexts (Budget-basiertes Scheduling) ---
 //

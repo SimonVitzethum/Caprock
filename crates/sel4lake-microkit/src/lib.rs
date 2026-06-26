@@ -170,8 +170,11 @@ impl Caps {
         0
     }
 
-    /// **DMA-Policy-Oracle** (ext-23, SMMU-agnostisch). Prüft die hardware-unabhängigen
-    /// DmaCap-Invarianten über alle (distinct) DMA-Objekte; `0` = konsistent, sonst:
+    /// **DMA-Bounds-Oracle** (ext-23, SMMU-agnostisch; Cap-Ebene). Prüft NUR die hardware-
+    /// unabhängigen DmaCap-Bounds-Invarianten über alle (distinct) DMA-Objekte — die volle
+    /// DMA-Policy (inkl. Enforcer-Durchsetzung + Revoke-Ordnung) ist `system::dma_audit`, das dies
+    /// aufruft. (Konsolidierung O-C: umbenannt von `dma_audit`, um die Namensgleichheit mit dem
+    /// aggregierenden `system::dma_audit` aufzulösen.) `0` = konsistent, sonst:
     /// - `1` = eine DMA-Region ist nicht 4-KiB-ausgerichtet/leer ODER liegt außerhalb des
     ///   mappbaren RAM-Fensters `[floor, ceil)` (mit `floor` = Kernel-Image-Ende deckt das
     ///   insbesondere „Region überlappt das Kernel-Image" ab — sie wäre nicht aus freiem RAM
@@ -181,7 +184,7 @@ impl Caps {
     /// „DmaCap nur in HardwareLand" deckt bereits [`Caps::domain_audit`] (Code 1) ab, da
     /// `kind_is_hardware` nun `Dma` einschließt. Die hardware-erzwungene Durchsetzung (SMMU)
     /// liegt hinter dem kernel-internen `DmaEnforcer` und wird separat auditiert.
-    pub fn dma_audit(&self, floor: u64, ceil: u64) -> u32 {
+    pub fn dma_bounds_audit(&self, floor: u64, ceil: u64) -> u32 {
         let mut regs: [(u64, u64); 32] = [(0, 0); 32];
         let mut n = 0usize;
         let mut bad = 0u32;

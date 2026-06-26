@@ -518,7 +518,7 @@ fn hwfuzz_epoch(tpd: usize, hpd: usize, upd: usize, base_obj: usize, base_free: 
     // (balanciert: attach alloziert Stage-1-Frames, detach gibt sie wieder frei).
     let fsid = 0x60u32 + (hwfuzz_rand() % 8) as u32;
     if let Some(h) = system::dma_attach(fsid, dma) {
-        if system::dma_ctx_region_count(fsid) != 1 {
+        if system::testsupport::dma_ctx_region_count(fsid) != 1 {
             return 75;
         }
         let sg = [system::DmaSgEntry { handle: h, offset: 0, len: dregion.len }];
@@ -602,15 +602,15 @@ fn run_dmagen() -> bool {
         hal::cpu::local_irq_enable();
         return false;
     };
-    let multiregion = system::dma_ctx_region_count(sid) == 3;
+    let multiregion = system::testsupport::dma_ctx_region_count(sid) == 3;
     // Richtungsminimales AP + Kohärenz strukturell prüfen (Stage-1-Leaves zurücklesen).
-    let l1 = system::dma_ctx_stage1(sid);
+    let l1 = system::testsupport::dma_ctx_stage1(sid);
     let leaf1 = hal::smmu::stage1_read_leaf(l1, r1.base); // DeviceRead  -> RO, NonCoherent -> NC
     let leaf2 = hal::smmu::stage1_read_leaf(l1, r2.base); // DeviceWrite -> RW, Coherent    -> WB
     let dir = hal::smmu::leaf_is_ro(leaf1) && !hal::smmu::leaf_is_ro(leaf2);
     let coh = hal::smmu::leaf_is_cacheable(leaf2) && !hal::smmu::leaf_is_cacheable(leaf1);
     // Stream-Gruppe: sid2 teilt den Kontext (2 StreamIDs -> 1 CD/Stage-1).
-    let group = system::dma_group_add(sid, sid2) && system::dma_ctx_sid_count(sid) == 2;
+    let group = system::dma_group_add(sid, sid2) && system::testsupport::dma_ctx_sid_count(sid) == 2;
     // Scatter-Gather-Validierung: valide Liste ok, Out-of-Window abgewiesen.
     let sg_good = [
         system::DmaSgEntry { handle: h1, offset: 0, len: 0x800 },
@@ -3995,7 +3995,7 @@ pub fn demo_report_then_idle() -> ! {
                         // RTC-Registerseite EL0-RO in die Backend-VSpace mappen (generisch).
                         // SENSITIVITAET P4 (geprueft): ohne dieses Mapping faultet das Backend
                         // beim RTC-Read (FAR=0x09010000) -> Isolation greift.
-                        system::map_mmio_into_thread(b, RTC_PHYS, RTC_LEN, true);
+                        system::map_region_into_thread(b, RTC_PHYS, RTC_LEN, system::MappingKind::Device { ro: true });
                     }
                     RTC_STEP.store(2, Ordering::Release);
                 }
@@ -4082,7 +4082,7 @@ pub fn demo_report_then_idle() -> ! {
                         3,
                     ) {
                         system::bind_pd(IRQT_BE_PD.load(Ordering::Relaxed), b);
-                        system::map_mmio_into_thread(b, RTC_PHYS, RTC_LEN, false); // RW (armieren)
+                        system::map_region_into_thread(b, RTC_PHYS, RTC_LEN, system::MappingKind::Device { ro: false }); // RW (armieren)
                     }
                     IRQT_STEP.store(2, Ordering::Release);
                 }
@@ -4164,7 +4164,7 @@ pub fn demo_report_then_idle() -> ! {
                         system::bind_pd(DMA_BE_PD.load(Ordering::Relaxed), b);
                         // SENSITIVITAET D0 (geprueft): ohne dieses Mapping faultet das Backend
                         // beim DMA-Zugriff (FAR in der DMA-Region) -> Isolation greift.
-                        system::map_dma_into_thread(b, phys, DMA_LEN);
+                        system::map_region_into_thread(b, phys, DMA_LEN, system::MappingKind::Dma { coherent: false });
                     }
                     DMA_STEP.store(2, Ordering::Release);
                 }
@@ -4183,12 +4183,12 @@ pub fn demo_report_then_idle() -> ! {
                         // dass er DIESELBEN Bytes sieht, die das Backend ueber seine NC-Abbildung
                         // geschrieben hat (write+read+coherency end-to-end).
                         let phys = DMA_PHYS.load(Ordering::Acquire);
-                        let (w0, w1) = system::peek_dma_words(phys);
+                        let (w0, w1) = system::testsupport::peek_dma_words(phys);
                         // Bounds-Sensitivität (selbstreinigend): mit einem absichtlich zu hohen
                         // `floor` MUSS die (legitime) Region das dma_audit verletzen (Code != 0) —
                         // beweist, dass das Oracle Out-of-Window-Regionen faengt. Der echte
                         // dma_audit() (korrektes floor) bleibt 0.
-                        let sens = system::dma_audit_with_floor(phys + DMA_LEN) != 0;
+                        let sens = system::testsupport::dma_audit_with_floor(phys + DMA_LEN) != 0;
                         DMA_SENS_OK.store(sens, Ordering::Release);
                         let ok = DMA_RES_CODE.load(Ordering::Acquire) == result::OK
                             && DMA_VALUE.load(Ordering::Acquire) as u32 == DMA_PAT0 // EL0-Round-Trip
@@ -4236,13 +4236,13 @@ pub fn demo_report_then_idle() -> ! {
         // kernel-/Trusted-Setup, ein Schritt. Gegate auf pcie fertig (sequenziell, vor Fuzzern).
         if !SMMU_DONE.load(Ordering::Acquire) && PCIE_DONE.load(Ordering::Acquire) {
             let ok_init = system::dma_enforcer_init();
-            SMMU_IDR0.store(system::smmu_idr0(), Ordering::Relaxed);
-            SMMU_SID.store(system::smmu_sid_bits(), Ordering::Relaxed);
-            SMMU_SYNC.store(system::smmu_sync_ok(), Ordering::Relaxed);
-            SMMU_EN.store(system::smmu_enabled(), Ordering::Relaxed);
-            SMMU_EVTQ.store(system::smmu_eventq_empty(), Ordering::Relaxed);
-            SMMU_GERR.store(system::smmu_gerror(), Ordering::Relaxed);
-            let ok = system::smmu_present()
+            SMMU_IDR0.store(system::testsupport::smmu_idr0(), Ordering::Relaxed);
+            SMMU_SID.store(system::testsupport::smmu_sid_bits(), Ordering::Relaxed);
+            SMMU_SYNC.store(system::testsupport::smmu_sync_ok(), Ordering::Relaxed);
+            SMMU_EN.store(system::testsupport::smmu_enabled(), Ordering::Relaxed);
+            SMMU_EVTQ.store(system::testsupport::smmu_eventq_empty(), Ordering::Relaxed);
+            SMMU_GERR.store(system::testsupport::smmu_gerror(), Ordering::Relaxed);
+            let ok = system::testsupport::smmu_present()
                 && ok_init
                 && SMMU_EN.load(Ordering::Relaxed)
                 && SMMU_SYNC.load(Ordering::Relaxed)
@@ -4266,7 +4266,7 @@ pub fn demo_report_then_idle() -> ! {
             let en = system::dma_enable(rid, base, DMA_LEN);
             SMMUB_ENABLE.store(en, Ordering::Release);
             SMMUB_EVTQ.store(
-                system::smmu_eventq_empty() && system::smmu_gerror() == 0,
+                system::testsupport::smmu_eventq_empty() && system::testsupport::smmu_gerror() == 0,
                 Ordering::Release,
             );
             let mid_audit = system::dma_audit();
@@ -4278,7 +4278,7 @@ pub fn demo_report_then_idle() -> ! {
                 && SMMUB_EVTQ.load(Ordering::Acquire)
                 && mid_audit == 0
                 && free1 == free0
-                && system::smmu_eventq_empty()
+                && system::testsupport::smmu_eventq_empty()
                 && system::dma_audit() == 0;
             SMMUB_OK.store(ok, Ordering::Release);
             SMMUB_DONE.store(true, Ordering::Release);

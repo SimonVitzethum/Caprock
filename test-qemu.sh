@@ -107,6 +107,7 @@ check "load    : ALL PASS" "Binary-Loader (ext-26): extern gebautes EL0-Programm
 check "sysload : ALL PASS" "Binary-Loader L2 (ext-26): Laden zur LAUFZEIT via SYS_LOAD-Syscall, cap-gegatet ueber Loader-Cap; Caller delegiert eigene Notification-Cap in die neue PD; ohne Loader-Cap -> ERR_BADCAP"
 check "loadhw  : ALL PASS" "Binary-Loader L3 (ext-26): HardwareLand-Programm in vor-erstellte Backend-PD (Partner-Bindung+Kanal) geladen, signalisiert seinen Kanal; Signatur-/Trust-Gate lehnt TrustedSAS/EL1-Image ab"
 check "loadstop: ALL PASS" "Binary-Loader L4 (ext-26): geladenen Prozess vollstaendig abgebaut (Thread+VSpace+geladene Segmente+Kstack+PD) -> Ressourcen-Baseline wiederhergestellt, kein Leck"
+check "loaderfuzz: ALL PASS" "Binary-Loader L5 (ext-26): Loader-Fuzzer -- fehlerhafte ELF-Varianten durch load_image alle abgelehnt (kein Crash, Parser forbid(unsafe_code)), Baseline unveraendert, loader_audit==0"
 check "hwfuzz  : ALL PASS" "Domaenen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Domaenen-Policy + CDT/VSpace-Oracle + Ressourcen-Baseline"
 online=$(echo "$OUT" | grep -c "online")
 [ "$online" -eq "$CORES" ] && echo "  PASS: alle $CORES Kerne online" || { echo "  FAIL: nur $online/$CORES Kerne online"; fail=1; }

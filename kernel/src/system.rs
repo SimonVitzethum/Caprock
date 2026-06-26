@@ -2783,6 +2783,39 @@ pub fn ipc_audit() -> u32 {
     if dma != 0 {
         return 40 + dma;
     }
+    // Loader-Property (ext-26): kein geladenes Programm-Segment überlappt freies RAM.
+    let ld = loader_audit();
+    if ld != 0 {
+        return 60 + ld;
+    }
+    0
+}
+
+/// **Loader-Property-Oracle** (ext-26, L5): `0` = konsistent, sonst Anomalie-Code:
+/// - `1` = ein aktuell in einer geladenen VSpace gemapptes Segment überlappt **freies** RAM (es
+///   wurde freigegeben, während es noch gemappt ist → Use-after-free). Spiegelt `dma_audit` Code 4.
+/// Snapshot der registrierten Segmente ziehen (`LOADED_IMAGES` kurz sperren), dann gegen
+/// `MEM.overlaps_free` (Rangordnung: nie beide Locks gleichzeitig).
+pub fn loader_audit() -> u32 {
+    let mut snap = [(0u64, 0u64); NLOADED_IMG * MAX_IMG_SEGS];
+    let mut n = 0;
+    {
+        let t = LOADED_IMAGES.lock();
+        for img in t.iter() {
+            if img.asid != 0 {
+                for &(b, l) in img.segs[..img.nseg].iter() {
+                    if l != 0 {
+                        snap[n] = (b, l);
+                        n += 1;
+                    }
+                }
+            }
+        }
+    } // LOADED_IMAGES freigegeben
+    let mem = MEM.lock();
+    if snap[..n].iter().any(|&(b, l)| mem.overlaps_free(b, l)) {
+        return 1;
+    }
     0
 }
 

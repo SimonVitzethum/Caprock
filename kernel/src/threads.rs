@@ -11,7 +11,7 @@
 
 use crate::loader;
 use crate::system;
-use sel4lake_loader::LoaderError;
+use sel4lake_loader::{LoaderError, Program, DOMAIN_USERLAND};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use sel4lake_abi::{pdctl, result, sys, GRANT_FLAG, GRANT_RECV_SLOT};
 use sel4lake_hal::{self as hal, println, syscall::invoke};
@@ -451,6 +451,11 @@ static LOADTRUSTED_REJECTED: AtomicBool = AtomicBool::new(false); // EL1-Image a
 static LOADSTOP_DONE: AtomicBool = AtomicBool::new(false);
 static LOADSTOP_OK: AtomicBool = AtomicBool::new(false);
 
+// Binary-Loader L5 (ext-26): Loader-Fuzzer -- fehlerhafte ELFs durch load_image -> alle abgelehnt,
+// kein Crash, Balance, loader_audit==0.
+static LOADERFUZZ_DONE: AtomicBool = AtomicBool::new(false);
+static LOADERFUZZ_OK: AtomicBool = AtomicBool::new(false);
+
 // Domänen/HW-Fuzzer (ext-22, P6): churnt über viele Epochen Hardware-/Management-Caps gegen
 // die Domänen-Policy + CDT/VSpace-Oracles + Ressourcen-Baseline. Kernpunkte: HW-Caps (MMIO/
 // IRQ) NUR in HardwareLand, PdControl NUR in TrustedSas installierbar (Negativfälle abgelehnt);
@@ -728,6 +733,60 @@ fn run_loadstop() -> bool {
     );
     hal::cpu::local_irq_enable();
     loaded && f1 == f0 && v1 == v0 && k1 == k0
+}
+
+/// **Loader-Fuzzer** (ext-26, L5): fehlerhafte ELF-Images durch den vollen Ladepfad
+/// (`load_image`) schicken. Jede Variante korrumpiert genau EIN vom Parser validiertes Feld eines
+/// ansonsten gueltigen Minimal-ELF -> MUSS mit `Err` abgelehnt werden (kein Crash, der Parser ist
+/// `#![forbid(unsafe_code)]`), die Ressourcen-Baseline darf sich NICHT aendern (Ablehnung bei
+/// `parse`, vor jeder Allokation), und `loader_audit() == 0`. Synchron, IRQ-maskiert.
+fn run_loaderfuzz() -> bool {
+    hal::cpu::local_irq_disable();
+    let base = system::total_free();
+    let mut buf = [0u8; 128];
+    // Ein minimales GUELTIGES ELF64 (ET_EXEC AArch64, 1 PT_LOAD, filesz=0) bauen.
+    let build = |b: &mut [u8; 128]| {
+        *b = [0u8; 128];
+        b[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+        b[4] = 2; // ELFCLASS64
+        b[5] = 1; // ELFDATA2LSB
+        b[6] = 1; // EI_VERSION
+        b[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        b[18..20].copy_from_slice(&0xB7u16.to_le_bytes()); // EM_AARCH64
+        b[24..32].copy_from_slice(&0x4100_0000u64.to_le_bytes()); // e_entry
+        b[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        b[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        b[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        b[64..68].copy_from_slice(&1u32.to_le_bytes()); // p_type=PT_LOAD
+        b[68..72].copy_from_slice(&5u32.to_le_bytes()); // p_flags=R+X
+        b[72..80].copy_from_slice(&120u64.to_le_bytes()); // p_offset
+        b[80..88].copy_from_slice(&0x4100_0000u64.to_le_bytes()); // p_vaddr
+        b[104..112].copy_from_slice(&0x1000u64.to_le_bytes()); // p_memsz (filesz=0)
+    };
+    // Jede Korruption macht den Parser ablehnen (validiertes Feld).
+    let corrupts: [fn(&mut [u8; 128]); 8] = [
+        |b| b[0] = 0,                                          // Bad-Magic
+        |b| b[4] = 1,                                          // ELFCLASS32
+        |b| b[5] = 2,                                          // Big-Endian
+        |b| b[18] = 0x3E,                                      // EM_X86_64
+        |b| b[16] = 3,                                         // ET_DYN
+        |b| b[54..56].copy_from_slice(&99u16.to_le_bytes()),   // falsche phentsize
+        |b| b[56..58].copy_from_slice(&9999u16.to_le_bytes()), // phnum out-of-bounds
+        |b| b[96..104].copy_from_slice(&0xFFFFu64.to_le_bytes()), // p_filesz > Puffer
+    ];
+    let mut all_rejected = true;
+    for c in corrupts.iter() {
+        build(&mut buf);
+        c(&mut buf);
+        let prog = Program::new(99, b"fuzz", 1, DOMAIN_USERLAND, [0u8; 32], &buf, &[]);
+        if loader::load_image(&prog, &[]).is_ok() {
+            all_rejected = false; // ein fehlerhaftes ELF wurde geladen -> FAIL
+        }
+    }
+    let after = system::total_free();
+    let audit = system::loader_audit();
+    hal::cpu::local_irq_enable();
+    all_rejected && after == base && audit == 0
 }
 
 /// **Signatur-/Trust-Gate pruefen** (ext-26, L3): ein als TrustedSAS (Domaene 0, EL1) deklariertes
@@ -3339,7 +3398,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} sysload={} loadhw={} loadstop={} hwfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} sysload={} loadhw={} loadstop={} loaderfuzz={} hwfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -3384,6 +3443,7 @@ pub fn demo_report_then_idle() -> ! {
                 SYSLOAD_FIN.load(Ordering::Acquire) && SYSLOAD_OK.load(Ordering::Acquire),
                 LOADHW_FIN.load(Ordering::Acquire) && LOADHW_OK.load(Ordering::Acquire),
                 LOADSTOP_DONE.load(Ordering::Acquire) && LOADSTOP_OK.load(Ordering::Acquire),
+                LOADERFUZZ_DONE.load(Ordering::Acquire) && LOADERFUZZ_OK.load(Ordering::Acquire),
                 HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire),
             );
         }
@@ -4590,9 +4650,16 @@ pub fn demo_report_then_idle() -> ! {
             LOADSTOP_DONE.store(true, Ordering::Release);
         }
 
+        // Binary-Loader L5 (ext-26): Loader-Fuzzer (fehlerhafte ELFs abgelehnt). Synchron, ein
+        // Schritt. Gegate auf loadstop (L4) fertig.
+        if !LOADERFUZZ_DONE.load(Ordering::Acquire) && LOADSTOP_DONE.load(Ordering::Acquire) {
+            LOADERFUZZ_OK.store(run_loaderfuzz(), Ordering::Release);
+            LOADERFUZZ_DONE.store(true, Ordering::Release);
+        }
+
         // Domänen/HW-Fuzzer (ext-22, P6): churnt HW-/Management-Caps gegen Policy + Oracles +
-        // Baseline. Gegate auf den Binary-Loader L4 (ext-26) fertig; eine Epoche je Iteration.
-        if !HWFUZZ_DONE.load(Ordering::Acquire) && LOADSTOP_DONE.load(Ordering::Acquire) {
+        // Baseline. Gegate auf den Binary-Loader L5 (ext-26) fertig; eine Epoche je Iteration.
+        if !HWFUZZ_DONE.load(Ordering::Acquire) && LOADERFUZZ_DONE.load(Ordering::Acquire) {
             match HWFUZZ_STEP.load(Ordering::Acquire) {
                 0 => {
                     // Fixtures (eine PD je Domäne, ohne Threads) + Baseline schnappen.
@@ -4816,13 +4883,15 @@ fn all_done() -> bool {
     let loadhw = LOADHW_FIN.load(Ordering::Acquire) && LOADHW_OK.load(Ordering::Acquire);
     // Binary-Loader L4 (ext-26): Teardown geladener Prozesse (Balance).
     let loadstop = LOADSTOP_DONE.load(Ordering::Acquire) && LOADSTOP_OK.load(Ordering::Acquire);
+    // Binary-Loader L5 (ext-26): Loader-Fuzzer (fehlerhafte ELFs abgelehnt).
+    let loaderfuzz = LOADERFUZZ_DONE.load(Ordering::Acquire) && LOADERFUZZ_OK.load(Ordering::Acquire);
     // Domänen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Policy + Oracles + Baseline.
     let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
         && pdctl && chan && rtc && irq && dma && pcie && smmu && smmubind && virtiorng && dmagen
-        && sasheap && load && sysload && loadhw && loadstop && hwfuzz
+        && sasheap && load && sysload && loadhw && loadstop && loaderfuzz && hwfuzz
 }
 
 fn report() {
@@ -5341,6 +5410,13 @@ fn report() {
     println!(
         "loadstop: {} (geladenen Prozess vollstaendig abgebaut: Thread+VSpace-Tabellen+geladene Segment-Frames+Kstack+PD -> MEM/VSpace/kstack-Baseline wiederhergestellt, kein Leck)",
         if loadstop { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Binary-Loader L5 (ext-26): Loader-Fuzzer + loader_audit.
+    let loaderfuzz = LOADERFUZZ_DONE.load(Ordering::Acquire) && LOADERFUZZ_OK.load(Ordering::Acquire);
+    println!(
+        "loaderfuzz: {} (8 fehlerhafte ELF-Varianten durch load_image -> alle bei parse abgelehnt, kein Crash/OOB (Parser #![forbid(unsafe_code)]), Baseline unveraendert, loader_audit==0)",
+        if loaderfuzz { "ALL PASS" } else { "FAILURES" }
     );
 
     // Domänen/HW-Fuzzer (ext-22, P6).

@@ -1,8 +1,8 @@
-# ext-26 — Generischer Binary-Loader (Phasen L0–L4)
+# ext-26 — Generischer Binary-Loader (Phasen L0–L5)
 
-Status: **L0–L4 fertig** (Boot-Delivery, ELF-Parser, externe Toolchain, EL0-Laden, `SYS_LOAD`,
-HardwareLand-Laden + Trust-Gate, Teardown). Suite grün (54 Checks). Architektur/Format:
-[ADR 0011](../adr/0011-binary-loader.md). Plan: [ext-26-binary-loader-plan.md](ext-26-binary-loader-plan.md).
+Status: **L0–L5 fertig** (Boot-Delivery, ELF-Parser, externe Toolchain, EL0-Laden, `SYS_LOAD`,
+HardwareLand-Laden + Trust-Gate, Teardown, `loader_audit` + Loader-Fuzzer). Suite grün (55 Checks).
+Architektur/Format: [ADR 0011](../adr/0011-binary-loader.md). Plan: [ext-26-binary-loader-plan.md](ext-26-binary-loader-plan.md).
 
 ## Ziel
 
@@ -58,6 +58,13 @@ Sicherheitsarchitektur (Capabilities, Domänen, Region-Runtime, Audits, W^X) ble
   VSpace/Kstack-Baseline wiederhergestellt (kein Leck) — Voraussetzung fürs Churnen geladener
   Prozesse (ext-27). (Hot-Reload geladener Prozesse: der ext-7-`reload_swap`-Mechanismus existiert;
   auf geladene Prozesse angewandt = Folgeschritt.)
+- **L5 — `loader_audit` + Loader-Fuzzer.** `loader_audit()` (in `ipc_audit`, Code 60+): kein
+  registriertes geladenes Segment überlappt **freies** RAM (freed-while-mapped → use-after-free;
+  spiegelt `dma_audit` Code 4). W^X der geladenen Seiten deckt `vspace_audit` bereits ab. Test
+  `loaderfuzz`: 8 fehlerhafte ELF-Varianten (Bad-Magic/Class/Data/Machine/Type, falsche phentsize,
+  phnum-OOB, filesz-OOB) durch den **vollen** `load_image`-Pfad → alle bei `parse` abgelehnt, **kein
+  Crash/OOB** (Parser ist `#![forbid(unsafe_code)]`), Ressourcen-Baseline unverändert,
+  `loader_audit==0`. (Der Parser ist zusätzlich per 17 Host-`cargo test` umfassend fuzz-getestet.)
 
 ## Nutzer-Review-Verfeinerungen (eingebaut)
 
@@ -78,12 +85,12 @@ deadlock-frei (vorher 4/15). Siehe `docs/invariants.md` §1a.
 
 ## Verifikation
 
-`./test-qemu.sh` → **53/53 ALL PASS** (50 Bestand + `load` + `sysload` + `loadhw`). Crate-Parser per
-Host-`cargo test` (17 Tests). Stabilität per `tools/hang-stress.sh`.
+`./test-qemu.sh` → **55/55 ALL PASS** (50 Bestand + `load`/`sysload`/`loadhw`/`loadstop`/
+`loaderfuzz`). Crate-Parser per Host-`cargo test` (17 Tests). Stabilität per `tools/hang-stress.sh`.
 
 ## Offen (Folgephasen)
 
-L2-Erweiterung: Manifest-getriebenes Mehr-Cap-Endowment (derzeit ein delegierter Cap → Slot 0).
-Signaturprüfung (derzeit EL1-Laden pauschal abgelehnt). L4 (Stop/Hot-Reload/Teardown geladener
-Segmente + VSpace), L5 (`loader_audit` + Fuzzer), L6 (Projektstruktur). Danach ext-27: aggressive
-Testdienste auf dem Loader.
+L6 (Projektstruktur `programs/{trusted,hardware,userland}` + SDK-Doku). Kleinere Erweiterungen:
+Manifest-getriebenes Mehr-Cap-Endowment (derzeit ein delegierter Cap → Slot 0), echte
+Signaturprüfung (derzeit EL1-Laden pauschal abgelehnt), Hot-Reload geladener Prozesse. Danach
+ext-27: aggressive Testdienste auf dem Loader.

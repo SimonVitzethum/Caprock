@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod archive;
+pub mod elf;
 
 /// Zieldomäne eines Programms (Manifest/Quellen-Feld). Bewusst kernel-agnostisch (u32); der
 /// Kernel-Glue bildet das auf `microkit::Domain` ab.
@@ -36,6 +37,9 @@ pub enum LoaderError {
     OutOfBounds,
     /// Unplausible Eintragszahl (Tabelle passt nicht in `total_len`).
     BadCount,
+    /// Ungültiges/nicht unterstütztes ELF-Image (Magic/Klasse/Maschine/Typ falsch, `memsz<filesz`,
+    /// unerwartete Program-Header-Größe).
+    BadElf,
 }
 
 /// Ein **quellen-agnostischer** ladbarer Programm-Deskriptor: stabile Metadaten + die Roh-Bytes des

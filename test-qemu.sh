@@ -123,6 +123,7 @@ check "aggrh   : ALL PASS" "Adversariale Testdienste (ext-27 T2): extern geladen
 check "intrh   : ALL PASS" "Adversariale Testdienste (ext-27 T2): extern geladenes HardwareLand-Backend als Intruder -- Kernel-RAM-Zugriff aus EL0 faultet ebenso (Speicher-Isolation domaenen-unabhaengig); Kernel ueberlebt; PRE + el0_fault_count++ + Audits==0"
 check "aggrt   : ALL PASS" "Adversariale Testdienste (ext-27 T3): extern geladener TrustedSAS-Aggressor (EL0-isoliert) -- Trust != Privileg: ohne tatsaechliche PdControl/Loader-Cap PDCTL/LOAD/KILL = BADCAP; Cap-Confusion abgewiesen; SUCCESS nur bei voller Abweisung; Audits==0"
 check "intrt   : ALL PASS" "Adversariale Testdienste (ext-27 T3): extern geladener TrustedSAS-Intruder (EL0-isoliert) -- liest Kernel-RAM aus EL0 -> Fault -> terminiert; Trust befreit NICHT von der Hardware-Isolation (staerkste Aussage); PRE + el0_fault_count++ + Audits==0"
+check "cross   : ALL PASS" "Adversariale Testdienste (ext-27 T4): Cross-Service-Matrix -- 3 extern geladene Angreifer DREIER Domaenen NEBENLAEUFIG (aggressor-u + aggressor-t melden unabhaengig SUCCESS, intruder-h faultet); gleichzeitige cross-domain Angreifer stoeren einander nicht; kernel-geschuetztes Canary unberuehrt; Audits==0"
 check "hwfuzz  : ALL PASS" "Domaenen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Domaenen-Policy + CDT/VSpace-Oracle + Ressourcen-Baseline"
 online=$(echo "$OUT" | grep -c "online")
 [ "$online" -eq "$CORES" ] && echo "  PASS: alle $CORES Kerne online" || { echo "  FAIL: nur $online/$CORES Kerne online"; fail=1; }

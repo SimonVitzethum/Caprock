@@ -522,6 +522,27 @@ static INTRT_FAULT_BASE: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// PRE-Badge "INRT" — intruder-t signalisiert es vor dem fatalen Kernel-RAM-Zugriff.
 const INTRT_PRE: u64 = 0x494E_5254;
 
+// ext-27 T4: Cross-Service-Matrix -- DREI Angreifer DREIER Domaenen NEBENLAEUFIG geladen: zwei
+// Aggressoren (UserLand + TrustedSAS) muessen UNABHAENGIG ihr SUCCESS melden (gleichzeitige
+// cross-domain Angreifer stoeren einander NICHT), ein Intruder (HardwareLand) faultet beim
+// Fremdspeicher-Zugriff; ein kernel-geschuetztes Canary-Frame bleibt BIT-FUER-BIT unberuehrt;
+// Audits 0 -> Cross-Service-Isolation unter Nebenlaeufigkeit ueber alle Domaenen.
+static CROSS_STARTED: AtomicBool = AtomicBool::new(false);
+static CROSS_DONE: AtomicBool = AtomicBool::new(false);
+static CROSS_OK: AtomicBool = AtomicBool::new(false);
+static CROSS_NU: AtomicUsize = AtomicUsize::new(usize::MAX); // aggressor-u Report-Notification
+static CROSS_NT: AtomicUsize = AtomicUsize::new(usize::MAX); // aggressor-t Report-Notification
+static CROSS_NH: AtomicUsize = AtomicUsize::new(usize::MAX); // intruder-h Kanal-Notification
+static CROSS_CANARY: AtomicU64 = AtomicU64::new(0); // phys. Basis des geschuetzten Canary-Frames
+static CROSS_FAULT_BASE: AtomicUsize = AtomicUsize::new(usize::MAX);
+static CROSS_POLLS: AtomicU32 = AtomicU32::new(0);
+// Report-Badges (kernel-gemintet; SIGNAL nutzt das Cap-Badge, nicht das Argument).
+const CROSS_U: u64 = 0x4352_5355; // "CRSU"
+const CROSS_T: u64 = 0x4352_5354; // "CRST"
+const CROSS_H: u64 = 0x4352_5348; // "CRSH"
+/// Canary-Muster (kernel-geschuetzter Speicher; KEIN geladener Dienst darf es erreichen).
+const CROSS_CANARY_VAL: u64 = 0xC0FF_EE5E_A1ED_0001;
+
 // Domänen/HW-Fuzzer (ext-22, P6): churnt über viele Epochen Hardware-/Management-Caps gegen
 // die Domänen-Policy + CDT/VSpace-Oracles + Ressourcen-Baseline. Kernpunkte: HW-Caps (MMIO/
 // IRQ) NUR in HardwareLand, PdControl NUR in TrustedSas installierbar (Negativfälle abgelehnt);
@@ -954,6 +975,38 @@ fn run_hw_service_start(name: &str, badge: u64, backend_id: u16) -> usize {
     })();
     hal::cpu::local_irq_enable();
     res.unwrap_or(usize::MAX)
+}
+
+/// **ext-27 T4 — Cross-Service-Matrix starten.** Ein kernel-geschuetztes Canary-Frame allozieren +
+/// Muster schreiben (Proxy fuer geschuetzten Speicher), die el0_fault_count-Baseline schnappen, dann
+/// DREI Angreifer DREIER Domaenen NEBENLAEUFIG laden: `aggressor-u` (UserLand) + `aggressor-t`
+/// (TrustedSAS) als Self-Judging-Aggressoren + `intruder-h` (HardwareLand) als Speicher-Angreifer.
+/// Sie laufen danach parallel auf den 8 Kernen. Beweisziel: gleichzeitige Angreifer VERSCHIEDENER
+/// Domaenen stoeren einander NICHT (jeder Aggressor wird unabhaengig korrekt abgewiesen), der
+/// Intruder faultet, und KEIN Dienst erreicht das geschuetzte Canary. `true` bei erfolgreichem
+/// Setup. Die Canary-/Baseline-Schnappschuesse IRQ-maskiert.
+fn run_cross_start() -> bool {
+    hal::cpu::local_irq_disable();
+    let cbase = match system::alloc(4096, 4096) {
+        Some(c) => c.region().base,
+        None => {
+            hal::cpu::local_irq_enable();
+            return false;
+        }
+    };
+    poke_u64(cbase, CROSS_CANARY_VAL); // Kernel (EL1) schreibt das geschuetzte Muster
+    CROSS_CANARY.store(cbase, Ordering::Relaxed);
+    CROSS_FAULT_BASE.store(system::el0_fault_count(), Ordering::Relaxed);
+    hal::cpu::local_irq_enable();
+    // Drei Angreifer dreier Domaenen laden (jeder Starter intern IRQ-maskiert) -> laufen danach
+    // NEBENLAEUFIG. Report-Badges kernel-gemintet (SIGNAL nutzt das Cap-Badge).
+    let nu = run_el0_aggressor("aggressor-u", CROSS_U);
+    let nt = run_el0_aggressor("aggressor-t", CROSS_T);
+    let nh = run_hw_service_start("intruder-h", CROSS_H, 0x29);
+    CROSS_NU.store(nu, Ordering::Relaxed);
+    CROSS_NT.store(nt, Ordering::Relaxed);
+    CROSS_NH.store(nh, Ordering::Relaxed);
+    nu != usize::MAX && nt != usize::MAX && nh != usize::MAX
 }
 
 /// **Generische DMA-Infrastruktur testen** (ext-24): Richtung/Kohärenz (DmaCap-Attribute ->
@@ -3552,7 +3605,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} sysload={} loadhw={} loadstop={} loaderfuzz={} aggru={} intru={} aggrh={} intrh={} aggrt={} intrt={} hwfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} sysload={} loadhw={} loadstop={} loaderfuzz={} aggru={} intru={} aggrh={} intrh={} aggrt={} intrt={} cross={} hwfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -3604,6 +3657,7 @@ pub fn demo_report_then_idle() -> ! {
                 INTRH_DONE.load(Ordering::Acquire) && INTRH_OK.load(Ordering::Acquire),
                 AGGRT_DONE.load(Ordering::Acquire) && AGGRT_OK.load(Ordering::Acquire),
                 INTRT_DONE.load(Ordering::Acquire) && INTRT_OK.load(Ordering::Acquire),
+                CROSS_DONE.load(Ordering::Acquire) && CROSS_OK.load(Ordering::Acquire),
                 HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire),
             );
         }
@@ -4952,9 +5006,36 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // ext-27 T4: Cross-Service-Matrix (3 Domaenen nebenlaeufig). Start gegate auf intrt fertig.
+        if !CROSS_STARTED.load(Ordering::Acquire) && INTRT_DONE.load(Ordering::Acquire) {
+            if !run_cross_start() {
+                CROSS_DONE.store(true, Ordering::Release); // Setup fehlgeschlagen -> FAIL
+            }
+            CROSS_STARTED.store(true, Ordering::Release);
+        }
+        if CROSS_STARTED.load(Ordering::Acquire) && !CROSS_DONE.load(Ordering::Acquire) {
+            let nu = CROSS_NU.load(Ordering::Relaxed);
+            let nt = CROSS_NT.load(Ordering::Relaxed);
+            let nh = CROSS_NH.load(Ordering::Relaxed);
+            let base = CROSS_FAULT_BASE.load(Ordering::Relaxed);
+            let su = nu != usize::MAX && system::notification_pending(nu) == CROSS_U;
+            let st = nt != usize::MAX && system::notification_pending(nt) == CROSS_T;
+            let sh = nh != usize::MAX && system::notification_pending(nh) == CROSS_H;
+            let faulted = base != usize::MAX && system::el0_fault_count() > base;
+            if su && st && sh && faulted {
+                // Beide Aggressoren (U+T) meldeten unabhaengig SUCCESS, der Intruder (H) faultete --
+                // alle drei NEBENLAEUFIG. Jetzt: Canary unberuehrt + Audits sauber.
+                let canary_ok = peek_u64(CROSS_CANARY.load(Ordering::Relaxed)) == CROSS_CANARY_VAL;
+                CROSS_OK.store(canary_ok && ext27_audits_ok(), Ordering::Release);
+                CROSS_DONE.store(true, Ordering::Release);
+            } else if CROSS_POLLS.fetch_add(1, Ordering::Relaxed) > 300_000 {
+                CROSS_DONE.store(true, Ordering::Release); // Timeout -> FAIL
+            }
+        }
+
         // Domänen/HW-Fuzzer (ext-22, P6): churnt HW-/Management-Caps gegen Policy + Oracles +
         // Baseline. Gegate auf den letzten ext-27-Dienst fertig; eine Epoche je Iteration.
-        if !HWFUZZ_DONE.load(Ordering::Acquire) && INTRT_DONE.load(Ordering::Acquire) {
+        if !HWFUZZ_DONE.load(Ordering::Acquire) && CROSS_DONE.load(Ordering::Acquire) {
             match HWFUZZ_STEP.load(Ordering::Acquire) {
                 0 => {
                     // Fixtures (eine PD je Domäne, ohne Threads) + Baseline schnappen.
@@ -5192,6 +5273,8 @@ fn all_done() -> bool {
     let aggrt = AGGRT_DONE.load(Ordering::Acquire) && AGGRT_OK.load(Ordering::Acquire);
     // ext-27 T3: TrustedSAS-Intruder — auch ein trusted EL0-Dienst faultet auf Kernel-RAM.
     let intrt = INTRT_DONE.load(Ordering::Acquire) && INTRT_OK.load(Ordering::Acquire);
+    // ext-27 T4: Cross-Service-Matrix — 3 Domaenen nebenlaeufig, kein Stoeren, Canary intakt.
+    let cross = CROSS_DONE.load(Ordering::Acquire) && CROSS_OK.load(Ordering::Acquire);
     // Domänen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Policy + Oracles + Baseline.
     let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
@@ -5199,7 +5282,7 @@ fn all_done() -> bool {
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
         && pdctl && chan && rtc && irq && dma && pcie && smmu && smmubind && virtiorng && dmagen
         && sasheap && load && sysload && loadhw && loadstop && loaderfuzz && aggru && intru
-        && aggrh && intrh && aggrt && intrt && hwfuzz
+        && aggrh && intrh && aggrt && intrt && cross && hwfuzz
 }
 
 fn report() {
@@ -5763,6 +5846,13 @@ fn report() {
     println!(
         "intrt   : {} (extern geladener TrustedSAS-Intruder (EL0-isoliert): las Kernel-RAM aus EL0 -> Fault -> terminiert, Kernel laeuft weiter; Trust befreit NICHT von der Hardware-Isolation (staerkste Aussage); PRE + el0_fault_count++ + Audits==0)",
         if intrt { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // ext-27 T4: Cross-Service-Matrix (ADR 0012).
+    let cross = CROSS_DONE.load(Ordering::Acquire) && CROSS_OK.load(Ordering::Acquire);
+    println!(
+        "cross   : {} (Cross-Service-Matrix: drei extern geladene Angreifer DREIER Domaenen NEBENLAEUFIG -- aggressor-u (UserLand) + aggressor-t (TrustedSAS) melden UNABHAENGIG SUCCESS (gleichzeitige cross-domain Angreifer stoeren einander nicht), intruder-h (HardwareLand) faultet beim Fremdspeicher-Zugriff; kernel-geschuetztes Canary BIT-FUER-BIT unberuehrt; Audits==0)",
+        if cross { "ALL PASS" } else { "FAILURES" }
     );
 
     // Domänen/HW-Fuzzer (ext-22, P6).

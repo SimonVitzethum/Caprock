@@ -10,6 +10,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "aggressor-t"
+version = "0.0.1"
+dependencies = [
+ "libsel4lake",
+]
+
+[[package]]
 name = "aggressor-u"
 version = "0.0.1"
 dependencies = [
@@ -18,6 +25,13 @@ dependencies = [
 
 [[package]]
 name = "intruder-h"
+version = "0.0.1"
+dependencies = [
+ "libsel4lake",
+]
+
+[[package]]
+name = "intruder-t"
 version = "0.0.1"
 dependencies = [
  "libsel4lake",

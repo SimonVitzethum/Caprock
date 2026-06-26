@@ -39,11 +39,12 @@ TBIN="tests/build/target/aarch64-sel4lake-user/release"
 printf 'PLACEHOLDER' > build/_probe.bin
 # hello=UserLand(2), hwhello=HardwareLand(1) (gleiches ELF, L3), trusted-x=TrustedSAS(0, laedt
 # GELADEN als EL0-isolierte PD), probe=Platzhalter (Multi-Modul-Liste). ext-27 Testdienste je
-# Domaene: aggressor-u/intruder-u=UserLand(2), aggressor-h/intruder-h=HardwareLand(1).
+# Domaene (2 je Domaene): aggressor/intruder -u=UserLand(2), -h=HardwareLand(1), -t=TrustedSAS(0).
 python3 tools/mkarchive.py build/boot-archive.bin \
     10:hello:2:1:"$HELLO" 11:hwhello:1:1:"$HELLO" 12:trusted-x:0:1:"$HELLO" 2:probe:2:1:build/_probe.bin \
     20:aggressor-u:2:1:"$TBIN/aggressor-u.elf" 21:intruder-u:2:1:"$TBIN/intruder-u.elf" \
     22:aggressor-h:1:1:"$TBIN/aggressor-h.elf" 23:intruder-h:1:1:"$TBIN/intruder-h.elf" \
+    24:aggressor-t:0:1:"$TBIN/aggressor-t.elf" 25:intruder-t:0:1:"$TBIN/intruder-t.elf" \
     >/dev/null 2>&1 || { echo "ARCHIVE BUILD FAILED"; exit 1; }
 
 echo "== boot ($SECONDS_RUN s) =="
@@ -65,7 +66,7 @@ check() { if echo "$OUT" | grep -q "$1"; then echo "  PASS: $2"; else echo "  FA
 
 check "M=1 C=1 I=1" "MMU + Caches aktiv"
 check "dtb     : ALL PASS" "DTB-Parsing (RAM-Größe aus dem Device Tree)"
-check "archive : 8 Modul" "ext-26 L0: Boot-Archiv extern geladen + vom Kernel-Parser gelesen (reserviertes RAM-Fenster, sel4lake-loader)"
+check "archive : 10 Modul" "ext-26 L0: Boot-Archiv extern geladen + vom Kernel-Parser gelesen (reserviertes RAM-Fenster, sel4lake-loader)"
 check "memtest : ALL PASS" "Speichermodell-Selbsttest (alloc/split/transfer/free)"
 check "captest : ALL PASS" "Capability-Selbsttest (copy/mint/move/delete/revoke)"
 check "sched   : ALL PASS" "Scheduler (Preemption auf core 0 + alle Kerne ticken)"
@@ -120,6 +121,8 @@ check "aggru   : ALL PASS" "Adversariale Testdienste (ext-27 T0): extern geladen
 check "intru   : ALL PASS" "Adversariale Testdienste (ext-27 T1): extern geladener UserLand-Intruder -- liest Kernel-RAM aus EL0 -> Translation-Fault (nicht in der isolierten VSpace gemappt) -> Kernel terminiert den Angreifer + laeuft weiter; PRE-Badge + el0_fault_count++ + Audits==0 (Hardware-Isolation)"
 check "aggrh   : ALL PASS" "Adversariale Testdienste (ext-27 T2): extern geladenes HardwareLand-Backend als Aggressor -- KEINE Management-Autoritaet (PDCTL/LOAD/KILL -> BADCAP), nichts ausserhalb des eigenen Kanals; Cap-Confusion abgewiesen; meldet SUCCESS ueber den Kanal; Audits==0"
 check "intrh   : ALL PASS" "Adversariale Testdienste (ext-27 T2): extern geladenes HardwareLand-Backend als Intruder -- Kernel-RAM-Zugriff aus EL0 faultet ebenso (Speicher-Isolation domaenen-unabhaengig); Kernel ueberlebt; PRE + el0_fault_count++ + Audits==0"
+check "aggrt   : ALL PASS" "Adversariale Testdienste (ext-27 T3): extern geladener TrustedSAS-Aggressor (EL0-isoliert) -- Trust != Privileg: ohne tatsaechliche PdControl/Loader-Cap PDCTL/LOAD/KILL = BADCAP; Cap-Confusion abgewiesen; SUCCESS nur bei voller Abweisung; Audits==0"
+check "intrt   : ALL PASS" "Adversariale Testdienste (ext-27 T3): extern geladener TrustedSAS-Intruder (EL0-isoliert) -- liest Kernel-RAM aus EL0 -> Fault -> terminiert; Trust befreit NICHT von der Hardware-Isolation (staerkste Aussage); PRE + el0_fault_count++ + Audits==0"
 check "hwfuzz  : ALL PASS" "Domaenen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Domaenen-Policy + CDT/VSpace-Oracle + Ressourcen-Baseline"
 online=$(echo "$OUT" | grep -c "online")
 [ "$online" -eq "$CORES" ] && echo "  PASS: alle $CORES Kerne online" || { echo "  FAIL: nur $online/$CORES Kerne online"; fail=1; }

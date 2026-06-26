@@ -501,6 +501,27 @@ static INTRH_FAULT_BASE: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// PRE-Badge "INRH" — intruder-h signalisiert es ueber den eigenen Kanal vor dem fatalen Zugriff.
 const INTRH_PRE: u64 = 0x494E_5248;
 
+// ext-27 T3: TrustedSAS-Dienste (geladen EL0-isoliert). AGGRT = TrustedSAS-Aggressor (Beweis
+// "Trust != Privileg": hoechste Cap-Autoritaet, doch ohne PdControl/Loader-Cap -> PDCTL/LOAD/KILL
+// = BADCAP).
+static AGGRT_STARTED: AtomicBool = AtomicBool::new(false);
+static AGGRT_DONE: AtomicBool = AtomicBool::new(false);
+static AGGRT_OK: AtomicBool = AtomicBool::new(false);
+static AGGRT_NTFN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static AGGRT_POLLS: AtomicU32 = AtomicU32::new(0);
+/// Erfolgs-Badge "AGRT" — aggressor-t signalisiert es nur bei vollstaendig abgewiesener Batterie.
+const AGGRT_SUCCESS: u64 = 0x4147_5254;
+// INTRT = TrustedSAS-Intruder (staerkste Aussage: auch ein trusted EL0-Dienst faultet auf Kernel-RAM
+// -> Trust befreit NICHT von der Hardware-Isolation).
+static INTRT_STARTED: AtomicBool = AtomicBool::new(false);
+static INTRT_DONE: AtomicBool = AtomicBool::new(false);
+static INTRT_OK: AtomicBool = AtomicBool::new(false);
+static INTRT_NTFN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static INTRT_POLLS: AtomicU32 = AtomicU32::new(0);
+static INTRT_FAULT_BASE: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// PRE-Badge "INRT" — intruder-t signalisiert es vor dem fatalen Kernel-RAM-Zugriff.
+const INTRT_PRE: u64 = 0x494E_5254;
+
 // Domänen/HW-Fuzzer (ext-22, P6): churnt über viele Epochen Hardware-/Management-Caps gegen
 // die Domänen-Policy + CDT/VSpace-Oracles + Ressourcen-Baseline. Kernpunkte: HW-Caps (MMIO/
 // IRQ) NUR in HardwareLand, PdControl NUR in TrustedSas installierbar (Negativfälle abgelehnt);
@@ -856,22 +877,22 @@ fn check_loadtrusted_el0() -> bool {
     }
 }
 
-/// **ext-27 T0 — UserLand-Aggressor starten.** Den extern gebauten Dienst `aggressor-u` (Domaene
-/// UserLand) laden und mit GENAU zwei Caps endowen: Slot 0 = Report-Notification (gemintet
-/// **WRITE-only**, Badge [`AGGRU_SUCCESS`]) — der Dienst signalisiert darueber Erfolg UND probiert
-/// daran `WAIT` (braucht READ) -> `ERR_RIGHTS`; Slot 1 = dieselbe Notification **READ-only** — der
-/// Dienst probiert daran `SIGNAL` (braucht WRITE) -> `ERR_RIGHTS`. Alle uebrigen Angriffe laufen
-/// gegen einen leeren Slot bzw. den falschen Objekttyp (Notification statt Endpoint/Tcb/Memory/
-/// PdControl/Loader). Gibt die Notification-ID zum Pollen (`usize::MAX` bei Setup-Fehler).
-/// IRQ-maskiert (der Dienst darf nicht vor abgeschlossenem PD-/Cap-Aufbau laufen).
-fn run_aggru_start() -> usize {
+/// **ext-27 — einen EL0-Aggressor (UserLand/TrustedSAS) laden.** Den per `name` benannten Dienst
+/// laden (Domaene aus dem Archiv-Eintrag; `load_image` erzeugt eine isolierte EL0-PD) und mit GENAU
+/// zwei Caps endowen: Slot 0 = Report-Notification (gemintet **WRITE-only**, Badge `badge`) — der
+/// Dienst signalisiert darueber Erfolg UND probiert daran `WAIT` (braucht READ) -> `ERR_RIGHTS`;
+/// Slot 1 = dieselbe Notification **READ-only** — der Dienst probiert daran `SIGNAL` (braucht WRITE)
+/// -> `ERR_RIGHTS`. Alle uebrigen Angriffe laufen gegen einen leeren Slot bzw. den falschen
+/// Objekttyp. Gibt die Notification-ID zum Pollen (`usize::MAX` bei Setup-Fehler). IRQ-maskiert
+/// (der Dienst darf nicht vor abgeschlossenem PD-/Cap-Aufbau laufen).
+fn run_el0_aggressor(name: &str, badge: u64) -> usize {
     hal::cpu::local_irq_disable();
     let res = (|| {
         let archive = loader::read_archive()?;
-        let svc = archive.iter().find(|p| p.name() == "aggressor-u")?;
+        let svc = archive.iter().find(|p| p.name() == name)?;
         let ntfn = system::create_notification()?;
         let root = system::install_notification_cap(ntfn as u32, Rights::RW).ok()?;
-        let wcap = system::cap_mint(root, Rights::WRITE, AGGRU_SUCCESS).ok()?; // Slot 0: WRITE-only + Badge
+        let wcap = system::cap_mint(root, Rights::WRITE, badge).ok()?; // Slot 0: WRITE-only + Badge
         let rcap = system::cap_mint(root, Rights::READ, 0).ok()?; // Slot 1: READ-only
         loader::load_image(&svc, &[(0, wcap), (1, rcap)]).ok()?;
         Some(ntfn)
@@ -891,18 +912,18 @@ fn ext27_audits_ok() -> bool {
         && system::ipc_audit() == 0
 }
 
-/// **ext-27 T1 — UserLand-Intruder starten.** Den extern gebauten Dienst `intruder-u` (Domaene
-/// UserLand) laden und mit Slot 0 = Report-Notification (gemintet WRITE-only, Badge [`INTRU_PRE`])
-/// endowen. Der Dienst signalisiert PRE, liest dann Kernel-RAM aus EL0 -> Translation-Fault ->
-/// terminiert. Gibt die Notification-ID zum Pollen (`usize::MAX` bei Setup-Fehler). IRQ-maskiert.
-fn run_intru_start() -> usize {
+/// **ext-27 — einen EL0-Intruder (UserLand/TrustedSAS) laden.** Den per `name` benannten Dienst
+/// laden (Domaene aus dem Archiv-Eintrag) und mit Slot 0 = Report-Notification (gemintet WRITE-only,
+/// Badge `badge`) endowen. Der Dienst signalisiert PRE, liest dann Kernel-RAM aus EL0 ->
+/// Translation-Fault -> terminiert. Gibt die Notification-ID zum Pollen (`usize::MAX` bei Fehler).
+fn run_el0_intruder(name: &str, badge: u64) -> usize {
     hal::cpu::local_irq_disable();
     let res = (|| {
         let archive = loader::read_archive()?;
-        let svc = archive.iter().find(|p| p.name() == "intruder-u")?;
+        let svc = archive.iter().find(|p| p.name() == name)?;
         let ntfn = system::create_notification()?;
         let root = system::install_notification_cap(ntfn as u32, Rights::RW).ok()?;
-        let wcap = system::cap_mint(root, Rights::WRITE, INTRU_PRE).ok()?;
+        let wcap = system::cap_mint(root, Rights::WRITE, badge).ok()?;
         loader::load_image(&svc, &[(0, wcap)]).ok()?;
         Some(ntfn)
     })();
@@ -3531,7 +3552,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} sysload={} loadhw={} loadstop={} loaderfuzz={} aggru={} intru={} aggrh={} intrh={} hwfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} sysload={} loadhw={} loadstop={} loaderfuzz={} aggru={} intru={} aggrh={} intrh={} aggrt={} intrt={} hwfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -3581,6 +3602,8 @@ pub fn demo_report_then_idle() -> ! {
                 INTRU_DONE.load(Ordering::Acquire) && INTRU_OK.load(Ordering::Acquire),
                 AGGRH_DONE.load(Ordering::Acquire) && AGGRH_OK.load(Ordering::Acquire),
                 INTRH_DONE.load(Ordering::Acquire) && INTRH_OK.load(Ordering::Acquire),
+                AGGRT_DONE.load(Ordering::Acquire) && AGGRT_OK.load(Ordering::Acquire),
+                INTRT_DONE.load(Ordering::Acquire) && INTRT_OK.load(Ordering::Acquire),
                 HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire),
             );
         }
@@ -4798,7 +4821,7 @@ pub fn demo_report_then_idle() -> ! {
         // an). Start gegate auf den Binary-Loader L5 fertig; dann das SUCCESS-Badge pollen. Der
         // Dienst beendet sich selbst (exit) nach dem Signal -> kein destroy_loaded noetig.
         if !AGGRU_STARTED.load(Ordering::Acquire) && LOADERFUZZ_DONE.load(Ordering::Acquire) {
-            let n = run_aggru_start();
+            let n = run_el0_aggressor("aggressor-u", AGGRU_SUCCESS);
             AGGRU_NTFN.store(n, Ordering::Relaxed);
             if n == usize::MAX {
                 AGGRU_DONE.store(true, Ordering::Release); // Setup fehlgeschlagen -> FAIL
@@ -4820,7 +4843,7 @@ pub fn demo_report_then_idle() -> ! {
         // pollen. Der Dienst terminiert per Fault (kein destroy_loaded; Reap gibt Kstack/VSpace frei).
         if !INTRU_STARTED.load(Ordering::Acquire) && AGGRU_DONE.load(Ordering::Acquire) {
             INTRU_FAULT_BASE.store(system::el0_fault_count(), Ordering::Relaxed);
-            let n = run_intru_start();
+            let n = run_el0_intruder("intruder-u", INTRU_PRE);
             INTRU_NTFN.store(n, Ordering::Relaxed);
             if n == usize::MAX {
                 INTRU_DONE.store(true, Ordering::Release); // Setup fehlgeschlagen -> FAIL
@@ -4886,9 +4909,52 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // ext-27 T3a: TrustedSAS-Aggressor (Trust != Privileg). Start gegate auf intrh fertig.
+        if !AGGRT_STARTED.load(Ordering::Acquire) && INTRH_DONE.load(Ordering::Acquire) {
+            let n = run_el0_aggressor("aggressor-t", AGGRT_SUCCESS);
+            AGGRT_NTFN.store(n, Ordering::Relaxed);
+            if n == usize::MAX {
+                AGGRT_DONE.store(true, Ordering::Release);
+            }
+            AGGRT_STARTED.store(true, Ordering::Release);
+        }
+        if AGGRT_STARTED.load(Ordering::Acquire) && !AGGRT_DONE.load(Ordering::Acquire) {
+            let n = AGGRT_NTFN.load(Ordering::Relaxed);
+            if n != usize::MAX && system::notification_pending(n) == AGGRT_SUCCESS {
+                AGGRT_OK.store(ext27_audits_ok(), Ordering::Release);
+                AGGRT_DONE.store(true, Ordering::Release);
+            } else if AGGRT_POLLS.fetch_add(1, Ordering::Relaxed) > 200_000 {
+                AGGRT_DONE.store(true, Ordering::Release); // Timeout -> FAIL
+            }
+        }
+
+        // ext-27 T3b: TrustedSAS-Intruder (Hardware-Isolation auch fuer die vertraute Domaene).
+        // Start gegate auf aggrt fertig; Fault-Baseline schnappen, dann PRE-Badge + Fault pollen.
+        if !INTRT_STARTED.load(Ordering::Acquire) && AGGRT_DONE.load(Ordering::Acquire) {
+            INTRT_FAULT_BASE.store(system::el0_fault_count(), Ordering::Relaxed);
+            let n = run_el0_intruder("intruder-t", INTRT_PRE);
+            INTRT_NTFN.store(n, Ordering::Relaxed);
+            if n == usize::MAX {
+                INTRT_DONE.store(true, Ordering::Release);
+            }
+            INTRT_STARTED.store(true, Ordering::Release);
+        }
+        if INTRT_STARTED.load(Ordering::Acquire) && !INTRT_DONE.load(Ordering::Acquire) {
+            let n = INTRT_NTFN.load(Ordering::Relaxed);
+            let base = INTRT_FAULT_BASE.load(Ordering::Relaxed);
+            let pre = n != usize::MAX && system::notification_pending(n) == INTRT_PRE;
+            let faulted = base != usize::MAX && system::el0_fault_count() > base;
+            if pre && faulted {
+                INTRT_OK.store(ext27_audits_ok(), Ordering::Release);
+                INTRT_DONE.store(true, Ordering::Release);
+            } else if INTRT_POLLS.fetch_add(1, Ordering::Relaxed) > 200_000 {
+                INTRT_DONE.store(true, Ordering::Release); // Timeout -> FAIL
+            }
+        }
+
         // Domänen/HW-Fuzzer (ext-22, P6): churnt HW-/Management-Caps gegen Policy + Oracles +
         // Baseline. Gegate auf den letzten ext-27-Dienst fertig; eine Epoche je Iteration.
-        if !HWFUZZ_DONE.load(Ordering::Acquire) && INTRH_DONE.load(Ordering::Acquire) {
+        if !HWFUZZ_DONE.load(Ordering::Acquire) && INTRT_DONE.load(Ordering::Acquire) {
             match HWFUZZ_STEP.load(Ordering::Acquire) {
                 0 => {
                     // Fixtures (eine PD je Domäne, ohne Threads) + Baseline schnappen.
@@ -5122,6 +5188,10 @@ fn all_done() -> bool {
     let aggrh = AGGRH_DONE.load(Ordering::Acquire) && AGGRH_OK.load(Ordering::Acquire);
     // ext-27 T2: HardwareLand-Intruder — Kernel-RAM-Fault domaenen-unabhaengig (Backend isoliert).
     let intrh = INTRH_DONE.load(Ordering::Acquire) && INTRH_OK.load(Ordering::Acquire);
+    // ext-27 T3: TrustedSAS-Aggressor — Trust != Privileg (ohne PdControl/Loader-Cap -> BADCAP).
+    let aggrt = AGGRT_DONE.load(Ordering::Acquire) && AGGRT_OK.load(Ordering::Acquire);
+    // ext-27 T3: TrustedSAS-Intruder — auch ein trusted EL0-Dienst faultet auf Kernel-RAM.
+    let intrt = INTRT_DONE.load(Ordering::Acquire) && INTRT_OK.load(Ordering::Acquire);
     // Domänen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Policy + Oracles + Baseline.
     let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
@@ -5129,7 +5199,7 @@ fn all_done() -> bool {
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
         && pdctl && chan && rtc && irq && dma && pcie && smmu && smmubind && virtiorng && dmagen
         && sasheap && load && sysload && loadhw && loadstop && loaderfuzz && aggru && intru
-        && aggrh && intrh && hwfuzz
+        && aggrh && intrh && aggrt && intrt && hwfuzz
 }
 
 fn report() {
@@ -5681,6 +5751,18 @@ fn report() {
     println!(
         "intrh   : {} (extern geladenes HardwareLand-Backend als Intruder: las Kernel-RAM aus EL0 -> Fault -> terminiert, Kernel laeuft weiter; Speicher-Isolation DOMAENEN-UNABHAENGIG (auch ein Hardware-Backend ist EL0-isoliert); PRE + el0_fault_count++ + Audits==0)",
         if intrh { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // ext-27 T3: TrustedSAS-Dienste (ADR 0012).
+    let aggrt = AGGRT_DONE.load(Ordering::Acquire) && AGGRT_OK.load(Ordering::Acquire);
+    println!(
+        "aggrt   : {} (extern geladener TrustedSAS-Aggressor (EL0-isoliert): TRUST != PRIVILEG -- hoechste Cap-Autoritaet der Domaene, doch ohne tatsaechliche PdControl/Loader-Cap scheitern PDCTL/LOAD/KILL als BADCAP; Cap-Confusion alle abgewiesen; SUCCESS nur bei voller Abweisung; Audits==0)",
+        if aggrt { "ALL PASS" } else { "FAILURES" }
+    );
+    let intrt = INTRT_DONE.load(Ordering::Acquire) && INTRT_OK.load(Ordering::Acquire);
+    println!(
+        "intrt   : {} (extern geladener TrustedSAS-Intruder (EL0-isoliert): las Kernel-RAM aus EL0 -> Fault -> terminiert, Kernel laeuft weiter; Trust befreit NICHT von der Hardware-Isolation (staerkste Aussage); PRE + el0_fault_count++ + Audits==0)",
+        if intrt { "ALL PASS" } else { "FAILURES" }
     );
 
     // Domänen/HW-Fuzzer (ext-22, P6).

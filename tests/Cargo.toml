@@ -12,6 +12,7 @@ resolver = "2"
 members = [
     "services/userland/aggressor", "services/userland/intruder",
     "services/hardware/aggressor", "services/hardware/intruder",
+    "services/trusted/aggressor", "services/trusted/intruder",
 ]
 
 [workspace.package]

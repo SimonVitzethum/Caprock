@@ -32,6 +32,7 @@ python3 tools/mkarchive.py build/boot-archive.bin \
     10:hello:2:1:"$HELLO" 11:hwhello:1:1:"$HELLO" 12:trusted-x:0:1:"$HELLO" 2:probe:2:1:build/_probe.bin \
     20:aggressor-u:2:1:"$TBIN/aggressor-u.elf" 21:intruder-u:2:1:"$TBIN/intruder-u.elf" \
     22:aggressor-h:1:1:"$TBIN/aggressor-h.elf" 23:intruder-h:1:1:"$TBIN/intruder-h.elf" \
+    24:aggressor-t:0:1:"$TBIN/aggressor-t.elf" 25:intruder-t:0:1:"$TBIN/intruder-t.elf" \
     >/dev/null 2>&1 || { echo "ARCHIVE FAILED"; exit 1; }
 
 echo "== stress: $N Laeufe (Timeout ${TMO}s je Lauf) =="

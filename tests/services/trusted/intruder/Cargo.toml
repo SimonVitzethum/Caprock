@@ -1,0 +1,16 @@
+# `intruder-t` — adversarialer TrustedSAS-Testdienst (ext-27 T3, ADR 0012).
+# Staerkste Isolations-Aussage: auch ein als TrustedSAS geladener Dienst laeuft EL0-isoliert und
+# kann Kernel-/Fremdspeicher NICHT lesen -- Trust befreit NICHT von der hardware-erzwungenen
+# Adressraumtrennung. Meldet PRE, dann fataler Kernel-RAM-Zugriff -> Fault.
+[package]
+name = "intruder-t"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "intruder-t"
+path = "src/main.rs"
+
+[dependencies]
+libsel4lake = { path = "../../../../programs/libsel4lake" }

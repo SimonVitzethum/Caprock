@@ -1,0 +1,16 @@
+# `aggressor-t` — adversarialer TrustedSAS-Testdienst (ext-27 T3, ADR 0012).
+# Beweist "Trust != Privileg": ein als TrustedSAS geladener (EL0-isolierter) Dienst hat die HOECHSTE
+# Cap-Autoritaet seiner Domaene, besitzt aber dennoch NUR die Operationsmacht der Caps, die er
+# TATSAECHLICH haelt. Ohne PdControl/Loader/Tcb-Cap -> PDCTL/LOAD/KILL = BADCAP. Self-Judging.
+[package]
+name = "aggressor-t"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aggressor-t"
+path = "src/main.rs"
+
+[dependencies]
+libsel4lake = { path = "../../../../programs/libsel4lake" }

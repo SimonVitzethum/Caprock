@@ -61,10 +61,14 @@ pub fn probe() {
 /// (L3) und wird hier abgelehnt (`UnsupportedDomain`).
 pub fn load_image(prog: &Program, endow: &[(usize, CapPtr)]) -> Result<(ThreadId, usize), LoaderError> {
     if !verify_image(prog) {
-        return Err(LoaderError::Unverified); // EL1/TrustedSAS ohne Signatur -> abgelehnt
+        return Err(LoaderError::Unverified);
     }
     let domain = match prog.domain {
         DOMAIN_USERLAND => Domain::UserLand,
+        // TrustedSAS laeuft GELADEN als EL0-ISOLIERTE PD (nicht EL1): hardware-isoliert, behaelt
+        // aber seine Trust-Stufe (darf PdControl/Loader-Caps halten). domain_audit erlaubt isolierte
+        // TrustedSAS-PDs. So sind ALLE Domaenen sicher extern ladbar (auch die Trusted-Testdienste).
+        DOMAIN_TRUSTED => Domain::TrustedSas,
         // HardwareLand braucht eine vor-erstellte Backend-PD (Partner-Bindung + Kanal) ->
         // ueber `load_program_into_pd`, NICHT hier (eine bare HardwareLand-PD bricht domain_audit).
         _ => return Err(LoaderError::UnsupportedDomain),
@@ -89,14 +93,15 @@ pub fn load_program_into_pd(
     crate::system::load_into_pd(&img, pd, endow).ok_or(LoaderError::NoResources)
 }
 
-/// **Trust-/Signatur-Gate** (ADR 0011 §7): darf dieses Image geladen werden? **EL1/TrustedSAS** ist
-/// privilegierter Code in der globalen SAS — extern geladen unterlaeuft er das SIP-Modell und ist
-/// daher **nur signiert** ladbar. Die Signaturpruefung ist noch nicht implementiert; bis dahin wird
-/// EL1-Laden **abgelehnt** (`prog.hash` ist der vorbereitete Hook). **EL0** (UserLand/HardwareLand)
-/// ist hardware-isoliert (ein fehlerhaftes/boesartiges Image faultet nur sich selbst) -> ohne
-/// Signatur ladbar.
+/// **Integritaets-/Trust-Hook** (ADR 0011 §7): darf dieses Image geladen werden? **Alle** geladenen
+/// Prozesse laufen **EL0-isoliert** (`load_into_pd` spawnt stets EL0; selbst eine TrustedSAS-PD ist
+/// geladen EL0-isoliert) — ein fehlerhaftes/boesartiges Image faultet daher nur sich selbst, ohne
+/// Privileg-Eskalation. Es gibt also **kein** Privileg-basiertes Lade-Verbot mehr. `prog.hash` ist
+/// der vorbereitete Hook fuer eine spaetere **Integritaets-/Signaturpruefung** (z.B. fuer
+/// vertrauenswuerdige Produktionsdienste); derzeit immer erlaubt.
+#[allow(unused_variables)]
 fn verify_image(prog: &Program) -> bool {
-    prog.domain != DOMAIN_TRUSTED
+    true
 }
 
 /// `SYS_LOAD`-Callback (ext-26, L2): das Programm mit Index `index` aus dem Boot-Archiv laden +

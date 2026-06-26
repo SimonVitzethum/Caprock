@@ -47,16 +47,23 @@ domain, manifest_off, manifest_len, flags, hash[32] }` + Blobs + Manifeste. Ein 
 (`tools/mkarchive`, **kein** Kernelcode) assembliert das Archiv aus den extern gebauten Binaries.
 Der Kernel liest das Archiv (Safe-Rust, bounds-geprüft) und lädt Einträge.
 
-### 4. Domänen: EL0-isoliert primär, TrustedSAS (EL1) trust-/signatur-gegatet
-- **UserLand / HardwareLand (EL0, isolierte VSpace):** vollständig generisch geladen — eigene
-  VSpace, Segmente an `p_vaddr` gemappt, W^X, EL0. Ein bösartiges/fehlerhaftes Binary ist
-  **hardware-isoliert** (Fault tötet nur den Prozess). **Primärer, sicherer Ziel-Fall.**
-- **TrustedSAS (EL1, globaler SAS):** läuft privilegiert in der Identity-Map (VA=PA), memory-safe
-  Rust (SIP). **Ehrlicher Vorbehalt:** extern geladener EL1-Code unterläuft die SIP-Annahme
-  („no unsafe + bugloser Compiler") — er ist beliebiger privilegierter Maschinencode. TrustedSAS-
-  Laden ist daher **nur** für *signierte, vertrauenswürdige* Komponenten sinnvoll und wird hinter
-  der (vorbereiteten) **Signaturprüfung** gegatet; ohne gültige Signatur wird EL1-Laden abgelehnt.
-  Fixe VA=PA über eine reservierte Programm-Slot-Konvention (da keine Relokationen).
+### 4. Domänen: ALLE geladenen Prozesse laufen EL0-isoliert (Korrektur, „TrustedSAS auch in EL0")
+- **Geladene Prozesse sind IMMER EL0-isoliert.** `load_into_pd` spawnt stets einen EL0-Thread in
+  einer eigenen VSpace (Segmente an `p_vaddr` gemappt, W^X). Ein bösartiges/fehlerhaftes Binary ist
+  daher **hardware-isoliert** (Fault tötet nur den Prozess) — **unabhängig von der Domäne**.
+- Die **Domäne** legt nur die **Cap-Autorität** fest, NICHT den Privilegienlevel:
+  - **UserLand:** keine Hardware-/Management-Rechte.
+  - **HardwareLand:** Hardware-Caps + genau ein Trusted-Partner (vor-erstellte Backend-PD mit
+    Kanal; via `load_program_into_pd`).
+  - **TrustedSAS:** darf `PdControl`/`Loader`-Caps halten (Trust-Stufe), läuft aber **geladen
+    EL0-isoliert** — NICHT EL1. `domain_audit` erlaubt isolierte TrustedSAS-PDs bereits.
+- **Konsequenz:** es gibt **kein** privileg-basiertes Lade-Verbot. Der frühere Vorbehalt („extern
+  geladener EL1-Code unterläuft SIP") entfällt, weil **kein** geladener Prozess EL1 läuft. Damit
+  sind **alle drei Domänen** sicher extern ladbar (Voraussetzung für die ext-27-Testdienste). Die
+  bestehenden **EL1-globalen** TrustedSAS-PDs (in-kernel, SAS, zero-copy) bleiben unverändert; das
+  ist eine separate, in-kernel-Konfiguration. `verify_image`/`prog.hash` bleiben als
+  **Integritäts-/Signatur-Hook** (für künftige vertrauenswürdige Produktionsdienste), gaten aber
+  nicht mehr nach Domäne.
 
 ### 5. Capability-Initialisierung über Manifest
 Jedes Programm trägt ein **Manifest** (im Archiv): `domain`, `entry_extra` (Startparameter),

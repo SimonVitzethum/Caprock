@@ -11,7 +11,7 @@
 
 use crate::loader;
 use crate::system;
-use sel4lake_loader::{LoaderError, Program, DOMAIN_USERLAND};
+use sel4lake_loader::{Program, DOMAIN_USERLAND};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use sel4lake_abi::{pdctl, result, sys, GRANT_FLAG, GRANT_RECV_SLOT};
 use sel4lake_hal::{self as hal, println, syscall::invoke};
@@ -442,7 +442,7 @@ static LOADHW_FIN: AtomicBool = AtomicBool::new(false);
 static LOADHW_OK: AtomicBool = AtomicBool::new(false);
 static LOADHW_NTFN: AtomicUsize = AtomicUsize::new(usize::MAX);
 static LOADHW_POLLS: AtomicU32 = AtomicU32::new(0);
-static LOADTRUSTED_REJECTED: AtomicBool = AtomicBool::new(false); // EL1-Image abgelehnt (Trust-Gate)
+static LOADTRUSTED_EL0: AtomicBool = AtomicBool::new(false); // TrustedSAS als EL0-isoliert geladen
 
 // Binary-Loader L4 (ext-26): Teardown geladener Prozesse. Ein UserLand-Programm laden, dann
 // VOLLSTAENDIG abbauen (Thread + VSpace-Tabellen + geladene Segment-Frames + Kernel-Stack + PD) und
@@ -789,17 +789,26 @@ fn run_loaderfuzz() -> bool {
     all_rejected && after == base && audit == 0
 }
 
-/// **Signatur-/Trust-Gate pruefen** (ext-26, L3): ein als TrustedSAS (Domaene 0, EL1) deklariertes
-/// Image MUSS vom Loader abgelehnt werden (privilegierter Code -> nur signiert; Signatur noch nicht
-/// implementiert). `true`, wenn `load_image` es mit `Unverified` zurueckweist.
-fn check_loadtrusted() -> bool {
+/// **EL0-TrustedSAS-Laden pruefen** (ext-26, L3): ein als TrustedSAS (Domaene 0) deklariertes Image
+/// wird als **EL0-ISOLIERTE** PD geladen (nicht EL1) — hardware-isoliert, behaelt aber die
+/// Trust-Stufe. `true`, wenn es laedt, die PD-Domaene TrustedSAS ist und domain_audit konsistent
+/// bleibt (isolierte TrustedSAS-PD ist policy-konform). Danach wird die PD wieder abgebaut (Balance).
+fn check_loadtrusted_el0() -> bool {
     let Some(archive) = loader::read_archive() else {
         return false;
     };
     let Some(tp) = archive.iter().find(|p| p.name() == "trusted-x") else {
         return false;
     };
-    matches!(loader::load_image(&tp, &[]), Err(LoaderError::Unverified))
+    match loader::load_image(&tp, &[]) {
+        Ok((tid, pd)) => {
+            let trusted = system::pd_domain(pd) == Some(Domain::TrustedSas);
+            let audit_ok = system::domain_audit() == 0;
+            system::destroy_loaded(tid, pd); // aufraeumen
+            trusted && audit_ok
+        }
+        Err(_) => false,
+    }
 }
 
 /// **Generische DMA-Infrastruktur testen** (ext-24): Richtung/Kohärenz (DmaCap-Attribute ->
@@ -4621,10 +4630,10 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
-        // Binary-Loader L3 (ext-26): HardwareLand-Programm laden (Backend+Partner+Kanal) +
-        // Signatur-/Trust-Gate (TrustedSAS/EL1 abgelehnt). Gegate auf sysload (L2) fertig.
+        // Binary-Loader L3 (ext-26): HardwareLand-Programm laden (Backend+Partner+Kanal) + EL0-TrustedSAS-Laden.
+        // Gegate auf sysload (L2) fertig.
         if !LOADHW_STARTED.load(Ordering::Acquire) && SYSLOAD_FIN.load(Ordering::Acquire) {
-            LOADTRUSTED_REJECTED.store(check_loadtrusted(), Ordering::Relaxed); // EL1 abgelehnt?
+            LOADTRUSTED_EL0.store(check_loadtrusted_el0(), Ordering::Relaxed); // TrustedSAS EL0-geladen?
             let n = run_loadhw_start();
             LOADHW_NTFN.store(n, Ordering::Relaxed);
             if n == usize::MAX {
@@ -4636,7 +4645,7 @@ pub fn demo_report_then_idle() -> ! {
             let n = LOADHW_NTFN.load(Ordering::Relaxed);
             if n != usize::MAX && system::notification_pending(n) == HELLO_BADGE {
                 // HardwareLand-Programm signalisierte seinen Kanal UND das Trust-Gate wies EL1 ab.
-                LOADHW_OK.store(LOADTRUSTED_REJECTED.load(Ordering::Relaxed), Ordering::Release);
+                LOADHW_OK.store(LOADTRUSTED_EL0.load(Ordering::Relaxed), Ordering::Release);
                 LOADHW_FIN.store(true, Ordering::Release);
             } else if LOADHW_POLLS.fetch_add(1, Ordering::Relaxed) > 200_000 {
                 LOADHW_FIN.store(true, Ordering::Release); // Timeout -> FAIL
@@ -5394,14 +5403,14 @@ fn report() {
         if sysload { "ALL PASS" } else { "FAILURES" }
     );
 
-    // Binary-Loader L3 (ext-26): HardwareLand laden + TrustedSAS/EL1-Trust-Gate.
+    // Binary-Loader L3 (ext-26): HardwareLand laden + EL0-TrustedSAS-Laden.
     let loadhw = LOADHW_FIN.load(Ordering::Acquire) && LOADHW_OK.load(Ordering::Acquire);
-    println!("loadhw  : HardwareLand-Programm in vor-erstellte Backend-PD geladen (Partner+Kanal) -> Kanal-Signal={} ; TrustedSAS/EL1-Image abgelehnt(Trust-Gate)={}",
+    println!("loadhw  : HardwareLand-Programm in vor-erstellte Backend-PD geladen (Partner+Kanal) -> Kanal-Signal={} ; TrustedSAS als EL0-isolierte PD geladen(domain_audit ok)={}",
         if LOADHW_NTFN.load(Ordering::Relaxed) != usize::MAX
             && system::notification_pending(LOADHW_NTFN.load(Ordering::Relaxed)) == HELLO_BADGE { "ja" } else { "NEIN" },
-        LOADTRUSTED_REJECTED.load(Ordering::Relaxed));
+        LOADTRUSTED_EL0.load(Ordering::Relaxed));
     println!(
-        "loadhw  : {} (HardwareLand-Laden: Backend-PD mit Partner-Bindung+Kanal, Kanal-Cap-Policy gilt; EL1/TrustedSAS nur signiert ladbar -> ohne Signatur abgelehnt)",
+        "loadhw  : {} (HardwareLand-Laden: Backend-PD mit Partner+Kanal, Kanal-Cap-Policy gilt; TrustedSAS laeuft GELADEN EL0-isoliert -> alle Domaenen sicher extern ladbar)",
         if loadhw { "ALL PASS" } else { "FAILURES" }
     );
 

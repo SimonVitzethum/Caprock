@@ -1,8 +1,8 @@
-# ext-26 — Generischer Binary-Loader (Phasen L0–L5)
+# ext-26 — Generischer Binary-Loader (Phasen L0–L6)
 
-Status: **L0–L5 fertig** (Boot-Delivery, ELF-Parser, externe Toolchain, EL0-Laden, `SYS_LOAD`,
-HardwareLand-Laden + Trust-Gate, Teardown, `loader_audit` + Loader-Fuzzer). Suite grün (55 Checks).
-Architektur/Format: [ADR 0011](../adr/0011-binary-loader.md). Plan: [ext-26-binary-loader-plan.md](ext-26-binary-loader-plan.md).
+Status: **L0–L6 fertig** (Boot-Delivery, ELF-Parser, externe Toolchain, EL0-Laden **aller Domänen**,
+`SYS_LOAD`, HardwareLand-Laden, Teardown, `loader_audit` + Fuzzer, Projektstruktur). Suite grün
+(55 Checks). Architektur/Format: [ADR 0011](../adr/0011-binary-loader.md). Plan: [ext-26-binary-loader-plan.md](ext-26-binary-loader-plan.md).
 
 ## Ziel
 
@@ -44,11 +44,13 @@ Sicherheitsarchitektur (Capabilities, Domänen, Region-Runtime, Audits, W^X) ble
   in eine **vor-erstellte** PD) + den `load_elf`-Wrapper (erzeugt eine UserLand-PD). HardwareLand-
   Programme brauchen eine vor-erstellte **Backend-PD** (Partner-Bindung + Kanal `ep`/`ntfn`, via
   `create_hardware_backend`); die Kanal-Cap-Policy bleibt gültig (ein Backend hält nur Caps seines
-  eigenen Kanals). **Trust-Gate** `verify_image`: **EL1/TrustedSAS** ist privilegierter Code in der
-  globalen SAS → extern geladen unterläuft er das SIP-Modell → **nur signiert** ladbar; bis die
-  Signaturprüfung implementiert ist (`prog.hash`-Hook, ADR 0011 §7), wird EL1-Laden **abgelehnt**
-  (`Unverified`). Test `loadhw`: `hwhello` (= hello, Domäne HardwareLand) in eine Backend-PD geladen,
-  signalisiert seinen Kanal; ein TrustedSAS-Image (`trusted-x`) wird vom Gate abgewiesen.
+  eigenen Kanals). **EL0-TrustedSAS** (Korrektur „TrustedSAS auch in EL0"): **alle** geladenen
+  Prozesse laufen EL0-isoliert (`load_into_pd` spawnt stets EL0) — ein geladenes TrustedSAS-Programm
+  ist daher EL0-isoliert, NICHT EL1, und behält nur die **Trust-Stufe** (darf PdControl/Loader-Caps
+  halten; `domain_audit` erlaubt isolierte TrustedSAS-PDs). Damit gibt es **kein** privileg-basiertes
+  Lade-Verbot mehr; `verify_image`/`prog.hash` bleiben als Integritäts-/Signatur-Hook. Test `loadhw`:
+  `hwhello` (Domäne HardwareLand) in eine Backend-PD geladen, signalisiert seinen Kanal; `trusted-x`
+  (Domäne TrustedSAS) lädt als **EL0-isolierte** PD (domain_audit konsistent), wird dann abgebaut.
 - **L4 — Teardown geladener Prozesse.** Geladene `PT_LOAD`-Segment-Frames sind **nicht** cap-getrackt
   (Eigentum geht an die VSpace über) → ohne Aufräumen lecken sie beim Teardown. Ein **Segment-
   Register** (`LOADED_IMAGES`, je ASID) merkt die Frames; `vspace_teardown` gibt sie mit frei.
@@ -65,6 +67,10 @@ Sicherheitsarchitektur (Capabilities, Domänen, Region-Runtime, Audits, W^X) ble
   phnum-OOB, filesz-OOB) durch den **vollen** `load_image`-Pfad → alle bei `parse` abgelehnt, **kein
   Crash/OOB** (Parser ist `#![forbid(unsafe_code)]`), Ressourcen-Baseline unverändert,
   `loader_audit==0`. (Der Parser ist zusätzlich per 17 Host-`cargo test` umfassend fuzz-getestet.)
+- **L6 — Projektstruktur + SDK-Doku.** `programs/` nach Domäne gegliedert (`userland/`, `hardware/`,
+  `trusted/`); `hello` → `userland/hello`. `programs/README.md` (Build, Struktur, Programm
+  hinzufügen) + `programs/libsel4lake/README.md` (Syscall-ABI + API). Die externen Programme bauen
+  unabhängig (`cd programs && cargo build`).
 
 ## Nutzer-Review-Verfeinerungen (eingebaut)
 
@@ -88,9 +94,8 @@ deadlock-frei (vorher 4/15). Siehe `docs/invariants.md` §1a.
 `./test-qemu.sh` → **55/55 ALL PASS** (50 Bestand + `load`/`sysload`/`loadhw`/`loadstop`/
 `loaderfuzz`). Crate-Parser per Host-`cargo test` (17 Tests). Stabilität per `tools/hang-stress.sh`.
 
-## Offen (Folgephasen)
+## Offen (kleinere Erweiterungen)
 
-L6 (Projektstruktur `programs/{trusted,hardware,userland}` + SDK-Doku). Kleinere Erweiterungen:
-Manifest-getriebenes Mehr-Cap-Endowment (derzeit ein delegierter Cap → Slot 0), echte
-Signaturprüfung (derzeit EL1-Laden pauschal abgelehnt), Hot-Reload geladener Prozesse. Danach
-ext-27: aggressive Testdienste auf dem Loader.
+Manifest-getriebenes Mehr-Cap-Endowment (derzeit ein delegierter Cap → Slot 0), echte Integritäts-/
+Signaturprüfung (`prog.hash`-Hook), Hot-Reload geladener Prozesse. **Loader L0–L6 ist abgeschlossen
+— nächste Ausbaustufe ext-27: aggressive Testdienste (6 Dienste) auf dem Loader.**

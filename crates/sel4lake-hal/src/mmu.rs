@@ -567,20 +567,22 @@ pub fn vspace_unmap_page(l2_phys: u64, phys: u64) -> bool {
 // eingesammelt und von [`vspace_wx_ok`] mit-auditiert (die DMA-Seiten sind PXN|UXN -> W^X gilt
 // baulich). Das Entmappen beim Revoke nutzt [`vspace_unmap_page`] (zurück auf EL1-only).
 
-/// EL0-RW Normal-**Non-Cacheable** 4-KiB-DMA-Seite (`nG`, PXN|UXN).
-fn dma_page(phys: u64) -> u64 {
-    phys | AF | SH_INNER | ATTR_NORMAL_NC | AP_RW_EL0 | PXN | UXN | NG | PAGE_DESC
+/// EL0-RW 4-KiB-DMA-Seite (`nG`, PXN|UXN). `cacheable` = Coherent (Normal-WB), sonst Normal-NC.
+fn dma_page(phys: u64, cacheable: bool) -> u64 {
+    let attr = if cacheable { ATTR_NORMAL } else { ATTR_NORMAL_NC };
+    phys | AF | SH_INNER | attr | AP_RW_EL0 | PXN | UXN | NG | PAGE_DESC
 }
 
-/// Eine DMA-Region `[phys, phys+len)` (4-KiB-granular, in **GiB 1**) als **EL0-RW Normal-NC**
-/// in die isolierte VSpace mit GiB-1-L2 `l2_phys` mappen (identity, VA=PA). Legt L3-Tabellen
-/// bei Bedarf über `alloc_l3` an (Muster [`vspace_map_page`]); diese werden beim Teardown von
-/// [`vspace_collect_l3s`] freigegeben. Gibt `false` bei ungültiger/unausgerichteter Region
-/// (nur GiB 1) oder fehlgeschlagener Allokation. Der Aufrufer flusht anschließend die ASID.
+/// Eine DMA-Region `[phys, phys+len)` (4-KiB-granular, in **GiB 1**) als **EL0-RW** in die
+/// isolierte VSpace mit GiB-1-L2 `l2_phys` mappen (identity, VA=PA). `cacheable` = Coherent
+/// (Normal-WB, dann Cache-Maintenance per [`dma_cache_clean`]/[`dma_cache_invalidate`] nötig),
+/// sonst Normal-NC (ext-23-Default). Legt L3-Tabellen bei Bedarf über `alloc_l3` an; diese
+/// werden beim Teardown von [`vspace_collect_l3s`] freigegeben. Der Aufrufer flusht die ASID.
 pub fn vspace_map_dma(
     l2_phys: u64,
     phys: u64,
     len: u64,
+    cacheable: bool,
     alloc_l3: &mut dyn FnMut() -> Option<u64>,
 ) -> bool {
     if len == 0
@@ -614,11 +616,43 @@ pub fn vspace_map_dma(
         };
         // SAFETY: gültige L3-Tabelle.
         let l3 = unsafe { core::slice::from_raw_parts_mut(l3_phys as *mut u64, 512) };
-        l3[((p >> 12) & 0x1ff) as usize] = dma_page(p);
+        l3[((p >> 12) & 0x1ff) as usize] = dma_page(p, cacheable);
         p += PAGE;
     }
     cpu::dsb_sy();
     true
+}
+
+/// **Cache-Maintenance für DMA** (ext-24, Coherent-Puffer). Operiert auf der identity-gemappten
+/// VA (= PA). `dma_cache_clean`: Clean-to-PoC (CPU-Schreibvorgänge sichtbar machen, **vor**
+/// einem Geräte-Read). Bei Non-Cacheable-Puffern sind diese No-Ops nötig, aber harmlos. QEMU
+/// modelliert keine Caches; die Instruktionen sind dennoch gültig (Korrektheit auf realer HW).
+const DMA_CACHE_LINE: u64 = 64; // konservative Cache-Line-Größe (CTR_EL0 typ. 64)
+pub fn dma_cache_clean(va: u64, len: u64) {
+    let mut p = va & !(DMA_CACHE_LINE - 1);
+    let end = va + len;
+    // SAFETY: reine Cache-Wartung (DC CVAC) auf einer gültigen, identity-gemappten Region.
+    unsafe {
+        while p < end {
+            asm!("dc cvac, {a}", a = in(reg) p, options(nostack, preserves_flags));
+            p += DMA_CACHE_LINE;
+        }
+        asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+/// Clean **und** Invalidate (DC CIVAC) — **nach** einem Geräte-Write, bevor die CPU liest, bzw.
+/// vor bidirektionalen Transfers. Verwirft stale CPU-Cache-Zeilen + schreibt Dirty-Zeilen zurück.
+pub fn dma_cache_invalidate(va: u64, len: u64) {
+    let mut p = va & !(DMA_CACHE_LINE - 1);
+    let end = va + len;
+    // SAFETY: reine Cache-Wartung (DC CIVAC) auf einer gültigen, identity-gemappten Region.
+    unsafe {
+        while p < end {
+            asm!("dc civac, {a}", a = in(reg) p, options(nostack, preserves_flags));
+            p += DMA_CACHE_LINE;
+        }
+        asm!("dsb sy", options(nostack, preserves_flags));
+    }
 }
 
 /// Alle **per-PD-L3-Tabellen** dieser VSpace einsammeln (für den Teardown): ruft

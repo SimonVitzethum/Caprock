@@ -1,6 +1,6 @@
 //! Capability-Space: Slot-Tabelle + Capability-Derivation-Tree (CDT).
 
-use crate::object::{Object, ObjectKind};
+use crate::object::{DmaCoherence, DmaDir, Object, ObjectKind};
 use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
 
 /// Anzahl Capability-Slots (CTEs) im Space.
@@ -190,7 +190,29 @@ impl CapSpace {
     /// echtes RAM -> die Finalisierung gibt es frei (`free_region`), garantiert sicher durch die
     /// Teardown-Reihenfolge (`enforcer.disable_dma` -> Unmap davor). Nur kernelseitig.
     pub fn install_dma(&mut self, phys: u64, len: u64, rights: Rights) -> Result<CapPtr, CapError> {
-        self.install(ObjectKind::Dma { phys, len }, rights)
+        // Rückwärtskompatibel (ext-23): Bidirectional + NonCoherent.
+        self.install_dma_ex(phys, len, DmaDir::Bidirectional, DmaCoherence::NonCoherent, rights)
+    }
+
+    /// Wie [`install_dma`], aber mit expliziter **Richtung** + **Cache-Kohärenz** (ext-24). Die
+    /// Cap kodiert damit die volle Autorität inkl. richtungsminimaler Hardware-Rechte.
+    pub fn install_dma_ex(
+        &mut self,
+        phys: u64,
+        len: u64,
+        dir: DmaDir,
+        coherence: DmaCoherence,
+        rights: Rights,
+    ) -> Result<CapPtr, CapError> {
+        self.install(
+            ObjectKind::Dma {
+                phys,
+                len,
+                dir,
+                coherence,
+            },
+            rights,
+        )
     }
 
     /// Wurzel-Objekt + -Cap anlegen (gemeinsame Logik für alle Objekttypen).
@@ -225,7 +247,7 @@ impl CapSpace {
     pub fn for_each_dma(&self, f: &mut dyn FnMut(u64, u64)) {
         for o in self.objects.iter() {
             if o.used {
-                if let ObjectKind::Dma { phys, len } = o.kind {
+                if let ObjectKind::Dma { phys, len, .. } = o.kind {
                     f(phys, len);
                 }
             }
@@ -581,7 +603,7 @@ impl CapSpace {
                 ObjectKind::Memory(region) => {
                     alloc.free_region(region);
                 }
-                ObjectKind::Dma { phys, len } => {
+                ObjectKind::Dma { phys, len, .. } => {
                     alloc.free_region(PhysRegion::new(phys, len));
                 }
                 ObjectKind::Reply { ep, caller } => rf.push(ep, caller),

@@ -14,7 +14,7 @@
 //! IPC sperrt `RES` dann `SCHEDS[core]` (kern-lokale Endpoint-Teilnehmer). Kein
 //! Pfad nimmt zwei verschiedene `SCHEDS[*]` gleichzeitig.
 
-use sel4lake_cap::{CapError, CapInfo, CapPtr, ObjectKind};
+use sel4lake_cap::{CapError, CapInfo, CapPtr, DmaCoherence, DmaDir, ObjectKind};
 use sel4lake_hal::{self as hal, exception::TrapFrame, fp::FpState, println};
 use sel4lake_ipc::{Endpoint, Notification, NENDPOINTS, NNOTIFICATIONS};
 use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
@@ -1334,6 +1334,23 @@ pub struct DmaBinding {
     pub stream_id: u32,
     pub region: PhysRegion,
     pub backend_pd: usize,
+    /// ext-24: Gerät liest nur (read-only -> schreibgeschützt). Default `false` (RW).
+    pub ro: bool,
+    /// ext-24: Coherent -> Normal-Cacheable. Default `false` (Non-Cacheable, ext-23-Verhalten).
+    pub cacheable: bool,
+}
+
+impl DmaBinding {
+    /// Rückwärtskompatible Bindung (ext-23-Semantik: bidirektional, non-cacheable).
+    pub fn new(stream_id: u32, region: PhysRegion) -> Self {
+        Self {
+            stream_id,
+            region,
+            backend_pd: 0,
+            ro: false,
+            cacheable: false,
+        }
+    }
 }
 
 /// Treiber-Abstraktion für die **hardwareseitige DMA-Durchsetzung** (IOMMU-neutral). Die
@@ -1352,6 +1369,12 @@ pub trait DmaEnforcer: Sync {
     fn audit(&self) -> u32;
     /// Ist die hardwareseitige Durchsetzung aktiv (HW vorhanden + initialisiert)?
     fn is_active(&self) -> bool;
+    /// **IOMMU-Stream-Gruppe** (ext-24): `member` soll fortan denselben Übersetzungskontext
+    /// nutzen wie `leader` (z.B. Multi-Function-Gerät / Bridge ohne RID-Translation). Default:
+    /// nicht unterstützt (`false`). `true` bei Erfolg.
+    fn share_context(&self, _leader: u32, _member: u32) -> bool {
+        false
+    }
 }
 
 /// **SMMUv3-Enforcer** — die einzige `DmaEnforcer`-Implementierung in ext-23. Hält die
@@ -1434,72 +1457,108 @@ impl DmaEnforcer for SmmuV3Enforcer {
         }
         let strtab = self.strtab_phys.load(Ordering::Acquire);
         let cmdq = self.cmdq_phys.load(Ordering::Acquire);
-        // Stage-1-Identitäts-Tabelle (nur die DMA-Region) + CD bauen.
+        let mut t = DMA_CTX.lock();
+        // Kontext finden, der `stream_id` bereits führt; sonst neu anlegen (additiv: mehrere
+        // Regionen je Kontext, mehrere StreamIDs je Gruppe).
+        let mut ci = t
+            .iter()
+            .position(|c| c.used && c.sids.contains(&binding.stream_id));
+        let is_new_ctx = ci.is_none();
+        if ci.is_none() {
+            let mut alloc = || SmmuV3Enforcer::alloc_zeroed(4096);
+            let Some(l1) = hal::smmu::stage1_create(&mut alloc) else {
+                return false;
+            };
+            let Some(cd) = SmmuV3Enforcer::alloc_zeroed(hal::smmu::CD_BYTES) else {
+                return false;
+            };
+            hal::smmu::write_cd(cd, l1);
+            let Some(slot) = t.iter().position(|c| !c.used) else {
+                return false;
+            };
+            t[slot] = DmaCtx::EMPTY;
+            t[slot].used = true;
+            t[slot].l1 = l1;
+            t[slot].cd = cd;
+            t[slot].sids[0] = binding.stream_id;
+            ci = Some(slot);
+        }
+        let slot = ci.unwrap();
+        let (l1, cd) = (t[slot].l1, t[slot].cd);
+        // Region richtungs-/kohärenz-spezifisch additiv in die Kontext-Stage-1-Tabelle einhängen.
         let mut alloc = || SmmuV3Enforcer::alloc_zeroed(4096);
-        let Some(stage1_l1) =
-            hal::smmu::build_stage1_identity(binding.region.base, binding.region.len, &mut alloc)
-        else {
+        if !hal::smmu::stage1_map_region(
+            l1,
+            binding.region.base,
+            binding.region.len,
+            binding.ro,
+            binding.cacheable,
+            &mut alloc,
+        ) {
             return false;
+        }
+        let Some(ri) = t[slot].regs.iter().position(|&(_, l)| l == 0) else {
+            return false; // kein Regions-Slot frei
         };
-        let Some(cd) = SmmuV3Enforcer::alloc_zeroed(hal::smmu::CD_BYTES) else {
-            return false;
-        };
-        hal::smmu::write_cd(cd, stage1_l1);
-        let ste = hal::smmu::build_ste_stage1(cd);
-        // STE installieren (CMD_CFGI_STE + CMD_TLBI + CMD_SYNC).
+        t[slot].regs[ri] = (binding.region.base, binding.region.len);
+        // Neuer Kontext: STE installieren. Sonst: nur TLBI+SYNC (STE zeigt schon auf den CD).
         let prod = self.cmdq_prod.load(Ordering::Acquire);
-        let (next, ok) =
-            hal::smmu::write_ste_and_sync(strtab, cmdq, prod, binding.stream_id, &ste);
+        let (next, ok) = if is_new_ctx {
+            let ste = hal::smmu::build_ste_stage1(cd);
+            hal::smmu::write_ste_and_sync(strtab, cmdq, prod, binding.stream_id, &ste)
+        } else {
+            hal::smmu::tlbi_sync(cmdq, prod)
+        };
         self.cmdq_prod.store(next, Ordering::Release);
-        if !ok {
-            return false;
-        }
-        // Bindung vermerken (freien Slot belegen).
-        for i in 0..NSMMU_BIND {
-            if SMMU_B_SID[i]
-                .compare_exchange(u32::MAX, binding.stream_id, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                SMMU_B_BASE[i].store(binding.region.base, Ordering::Release);
-                SMMU_B_LEN[i].store(binding.region.len, Ordering::Release);
-                SMMU_B_S1L1[i].store(stage1_l1, Ordering::Release);
-                SMMU_B_CD[i].store(cd, Ordering::Release);
-                return true;
-            }
-        }
-        false // kein Bindungs-Slot frei
+        ok
     }
     fn disable_dma(&self, binding: &DmaBinding) {
         if !self.active.load(Ordering::Acquire) {
             return;
         }
-        for i in 0..NSMMU_BIND {
-            if SMMU_B_SID[i].load(Ordering::Acquire) == binding.stream_id {
-                let strtab = self.strtab_phys.load(Ordering::Acquire);
-                let cmdq = self.cmdq_phys.load(Ordering::Acquire);
-                // STE invalidieren (V=0) + CMD_TLBI + CMD_SYNC: danach kann das Gerät NICHT mehr
-                // in die Region DMAen (vor VSpace-Unmap + free_region -> use-after-free-sicher).
-                let prod = self.cmdq_prod.load(Ordering::Acquire);
-                let (next, _) =
-                    hal::smmu::clear_ste_and_sync(strtab, cmdq, prod, binding.stream_id);
-                self.cmdq_prod.store(next, Ordering::Release);
-                // Stage-1-Tabellen + CD freigeben.
-                let s1l1 = SMMU_B_S1L1[i].load(Ordering::Acquire);
-                let cd = SMMU_B_CD[i].load(Ordering::Acquire);
-                {
-                    let mut mem = MEM.lock();
-                    hal::smmu::free_stage1(s1l1, &mut |p| {
-                        mem.free_region(PhysRegion::new(p, 4096));
-                    });
-                    mem.free_region(PhysRegion::new(cd, 4096));
+        let strtab = self.strtab_phys.load(Ordering::Acquire);
+        let cmdq = self.cmdq_phys.load(Ordering::Acquire);
+        let mut t = DMA_CTX.lock();
+        let Some(slot) = t
+            .iter()
+            .position(|c| c.used && c.sids.contains(&binding.stream_id))
+        else {
+            return;
+        };
+        let l1 = t[slot].l1;
+        // Region aus der Stage-1-Tabelle entfernen (danach kann das Gerät NICHT mehr dorthin
+        // DMAen) + TLBI+SYNC. DMA-use-after-free-sicher (vor VSpace-Unmap + free_region).
+        hal::smmu::stage1_unmap_region(l1, binding.region.base, binding.region.len);
+        if let Some(ri) = t[slot]
+            .regs
+            .iter()
+            .position(|&r| r == (binding.region.base, binding.region.len))
+        {
+            t[slot].regs[ri] = (0, 0);
+        }
+        let prod = self.cmdq_prod.load(Ordering::Acquire);
+        let (next, _) = hal::smmu::tlbi_sync(cmdq, prod);
+        self.cmdq_prod.store(next, Ordering::Release);
+        // Letzte Region weg -> Kontext abbauen: alle STEs der Gruppe invalidieren, Stage-1 + CD frei.
+        if t[slot].regs.iter().all(|&(_, l)| l == 0) {
+            let mut p = self.cmdq_prod.load(Ordering::Acquire);
+            for k in 0..MAX_CTX_SIDS {
+                let sid = t[slot].sids[k];
+                if sid != u32::MAX {
+                    let (n, _) = hal::smmu::clear_ste_and_sync(strtab, cmdq, p, sid);
+                    p = n;
                 }
-                SMMU_B_BASE[i].store(0, Ordering::Release);
-                SMMU_B_LEN[i].store(0, Ordering::Release);
-                SMMU_B_S1L1[i].store(0, Ordering::Release);
-                SMMU_B_CD[i].store(0, Ordering::Release);
-                SMMU_B_SID[i].store(u32::MAX, Ordering::Release);
-                return;
             }
+            self.cmdq_prod.store(p, Ordering::Release);
+            let (cl1, ccd) = (t[slot].l1, t[slot].cd);
+            {
+                let mut mem = MEM.lock();
+                hal::smmu::free_stage1(cl1, &mut |x| {
+                    mem.free_region(PhysRegion::new(x, 4096));
+                });
+                mem.free_region(PhysRegion::new(ccd, 4096));
+            }
+            t[slot] = DmaCtx::EMPTY;
         }
     }
     fn audit(&self) -> u32 {
@@ -1518,22 +1577,87 @@ impl DmaEnforcer for SmmuV3Enforcer {
     fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
     }
+    fn share_context(&self, leader: u32, member: u32) -> bool {
+        if !self.active.load(Ordering::Acquire) {
+            return false;
+        }
+        let strtab = self.strtab_phys.load(Ordering::Acquire);
+        let cmdq = self.cmdq_phys.load(Ordering::Acquire);
+        let mut t = DMA_CTX.lock();
+        let Some(slot) = t.iter().position(|c| c.used && c.sids.contains(&leader)) else {
+            return false;
+        };
+        if t[slot].sids.contains(&member) {
+            return true; // schon in der Gruppe
+        }
+        let Some(si) = t[slot].sids.iter().position(|&s| s == u32::MAX) else {
+            return false; // Gruppe voll
+        };
+        let cd = t[slot].cd;
+        let ste = hal::smmu::build_ste_stage1(cd);
+        let prod = self.cmdq_prod.load(Ordering::Acquire);
+        let (next, ok) = hal::smmu::write_ste_and_sync(strtab, cmdq, prod, member, &ste);
+        self.cmdq_prod.store(next, Ordering::Release);
+        if ok {
+            t[slot].sids[si] = member;
+        }
+        ok
+    }
 }
 
-// --- SMMU-Bindungstabelle (ext-23, D3): StreamID -> {Region, Stage-1-Tabelle, CD} ---
-// Modul-Statics (Muster IRQ-Bindungstabelle). Genutzt von `SmmuV3Enforcer::enable_dma/
-// disable_dma`/`audit` — pro gebundenem Gerät genau ein Eintrag.
-const NSMMU_BIND: usize = 4;
-#[allow(clippy::declare_interior_mutable_const)]
-static SMMU_B_SID: [AtomicU32; NSMMU_BIND] = [const { AtomicU32::new(u32::MAX) }; NSMMU_BIND];
-#[allow(clippy::declare_interior_mutable_const)]
-static SMMU_B_BASE: [AtomicU64; NSMMU_BIND] = [const { AtomicU64::new(0) }; NSMMU_BIND];
-#[allow(clippy::declare_interior_mutable_const)]
-static SMMU_B_LEN: [AtomicU64; NSMMU_BIND] = [const { AtomicU64::new(0) }; NSMMU_BIND];
-#[allow(clippy::declare_interior_mutable_const)]
-static SMMU_B_S1L1: [AtomicU64; NSMMU_BIND] = [const { AtomicU64::new(0) }; NSMMU_BIND];
-#[allow(clippy::declare_interior_mutable_const)]
-static SMMU_B_CD: [AtomicU64; NSMMU_BIND] = [const { AtomicU64::new(0) }; NSMMU_BIND];
+// --- SMMU-Übersetzungskontexte (ext-24): je Kontext eine STE-Gruppe -> ein CD -> eine
+// Stage-1-Tabelle, die MEHRERE Regionen abbildet. Ersetzt die 1:1-Bindungstabelle aus ext-23.
+const NDMA_CTX: usize = 4; //      gleichzeitige Kontexte
+const MAX_CTX_SIDS: usize = 4; //  StreamIDs je Kontext (Stream-Gruppe)
+const MAX_CTX_REGS: usize = 8; //  Regionen je Kontext (Multi-Region / Scatter-Gather)
+
+#[derive(Clone, Copy)]
+struct DmaCtx {
+    used: bool,
+    l1: u64,                          // Stage-1-Wurzel
+    cd: u64,                          // Context Descriptor
+    sids: [u32; MAX_CTX_SIDS],        // StreamIDs (u32::MAX = leer)
+    regs: [(u64, u64); MAX_CTX_REGS], // (base,len) je Region ((0,0) = leer)
+}
+
+impl DmaCtx {
+    const EMPTY: DmaCtx = DmaCtx {
+        used: false,
+        l1: 0,
+        cd: 0,
+        sids: [u32::MAX; MAX_CTX_SIDS],
+        regs: [(0, 0); MAX_CTX_REGS],
+    };
+}
+
+static DMA_CTX: SpinLock<[DmaCtx; NDMA_CTX]> = SpinLock::new([DmaCtx::EMPTY; NDMA_CTX]);
+
+/// Anzahl Regionen im Kontext der StreamID (Test-/Audit-Telemetrie). `0`, wenn kein Kontext.
+pub fn dma_ctx_region_count(stream_id: u32) -> usize {
+    let t = DMA_CTX.lock();
+    t.iter()
+        .find(|c| c.used && c.sids.contains(&stream_id))
+        .map(|c| c.regs.iter().filter(|&&(_, l)| l != 0).count())
+        .unwrap_or(0)
+}
+
+/// Anzahl StreamIDs im Kontext der StreamID (Stream-Gruppen-Telemetrie).
+pub fn dma_ctx_sid_count(stream_id: u32) -> usize {
+    let t = DMA_CTX.lock();
+    t.iter()
+        .find(|c| c.used && c.sids.contains(&stream_id))
+        .map(|c| c.sids.iter().filter(|&&s| s != u32::MAX).count())
+        .unwrap_or(0)
+}
+
+/// Die Stage-1-Wurzel des Kontexts der StreamID (für den strukturellen Leaf-Test). `0` = keiner.
+pub fn dma_ctx_stage1(stream_id: u32) -> u64 {
+    let t = DMA_CTX.lock();
+    t.iter()
+        .find(|c| c.used && c.sids.contains(&stream_id))
+        .map(|c| c.l1)
+        .unwrap_or(0)
+}
 
 /// Der globale DMA-Enforcer. In ext-23 fest `SmmuV3Enforcer`; ein Wechsel (z.B. auf einen
 /// künftigen `NullIommuEnforcer`) tauscht nur diese Definition + den Accessor aus, ohne den
@@ -1600,19 +1724,78 @@ pub fn install_dma_cap(phys: u64, len: u64, rights: Rights) -> Result<CapPtr, Ca
     CAPS.write().cspace.install_dma(phys, len, rights)
 }
 
-/// Eine DMA-Region `[phys, phys+len)` als **EL0-RW Normal-Non-Cacheable** in die isolierte
-/// VSpace des Threads `tid` mappen (identity, VA=PA). Nur für isolierte PDs (ASID != 0).
+/// Wie [`install_dma_cap`], aber mit expliziter **DMA-Richtung** + **Cache-Kohärenz** (ext-24).
+/// Die Cap kodiert damit die volle Autorität; der Enforcer mappt richtungsminimal (Read-Puffer
+/// schreibgeschützt) und kohärenz-spezifisch (cacheable vs. non-cacheable).
+pub fn install_dma_cap_ex(
+    phys: u64,
+    len: u64,
+    dir: DmaDir,
+    coherence: DmaCoherence,
+    rights: Rights,
+) -> Result<CapPtr, CapError> {
+    CAPS.write().cspace.install_dma_ex(phys, len, dir, coherence, rights)
+}
+
+/// Die DMA-Attribute (Richtung, Kohärenz) einer DMA-Cap nachschlagen (für den Enforcer/Treiber:
+/// richtungs-/kohärenz-spezifisches Mapping). `None`, wenn die Cap keine DMA-Cap ist.
+pub fn dma_cap_attrs(cap: CapPtr) -> Option<(u64, u64, DmaDir, DmaCoherence)> {
+    match CAPS.read().cspace.lookup(cap)?.0 {
+        ObjectKind::Dma {
+            phys,
+            len,
+            dir,
+            coherence,
+        } => Some((phys, len, dir, coherence)),
+        _ => None,
+    }
+}
+
+/// Eine DMA-Region `[phys, phys+len)` als **EL0-RW** in die isolierte VSpace des Threads `tid`
+/// mappen (identity, VA=PA). `cacheable` = Coherent (Normal-WB, Cache-Maintenance nötig), sonst
+/// Normal-NC (Default). Nur für isolierte PDs (ASID != 0). Rückwärtskompatibel: `map_dma_into_thread`
+/// (NC) ist ein Wrapper.
 pub fn map_dma_into_thread(tid: ThreadId, phys: u64, len: u64) -> bool {
+    map_dma_into_thread_ex(tid, phys, len, false)
+}
+
+/// Wie [`map_dma_into_thread`], aber mit expliziter Cache-Kohärenz (ext-24).
+pub fn map_dma_into_thread_ex(tid: ThreadId, phys: u64, len: u64, cacheable: bool) -> bool {
     let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
     let Some(l2) = vspace_l2(asid) else {
         return false;
     };
     let mut alloc = || MEM.lock().alloc(4096, 4096).map(|c| c.base());
-    if hal::mmu::vspace_map_dma(l2, phys, len, &mut alloc) {
+    if hal::mmu::vspace_map_dma(l2, phys, len, cacheable, &mut alloc) {
         hal::mmu::flush_asid(asid);
         true
     } else {
         false
+    }
+}
+
+/// **DMA-Transfer vorbereiten** (ext-24, Cache-Maintenance, hardware-/geräteunabhängig): vor dem
+/// Start eines Transfers in Richtung `dir` die nötige Cache-Wartung auf der (identity-gemappten)
+/// Region ausführen. Bei `DeviceRead`/`Bidirectional`: Clean (CPU-Daten sichtbar machen). Bei
+/// `DeviceWrite`: nichts (das Gerät schreibt; die CPU invalidiert in `dma_complete`). No-Op-sicher
+/// für Non-Coherent-Puffer.
+pub fn dma_prepare(handle: DmaHandle, dir: DmaDir) {
+    match dir {
+        DmaDir::DeviceRead | DmaDir::Bidirectional => {
+            hal::mmu::dma_cache_clean(handle.iova, handle.len)
+        }
+        DmaDir::DeviceWrite => {}
+    }
+}
+
+/// **DMA-Transfer abschließen** (ext-24): nach einem Geräte-Write (`DeviceWrite`/`Bidirectional`)
+/// die CPU-Cache-Zeilen invalidieren, damit die CPU die vom Gerät geschriebenen Daten frisch liest.
+pub fn dma_complete(handle: DmaHandle, dir: DmaDir) {
+    match dir {
+        DmaDir::DeviceWrite | DmaDir::Bidirectional => {
+            hal::mmu::dma_cache_invalidate(handle.iova, handle.len)
+        }
+        DmaDir::DeviceRead => {}
     }
 }
 
@@ -1633,24 +1816,141 @@ pub fn unmap_dma_from_thread(tid: ThreadId, phys: u64, len: u64) -> bool {
     ok
 }
 
-/// Die hardwareseitige DMA-Durchsetzung für `(stream_id, [base,len))` aktivieren (D3): über den
-/// Enforcer eine STE -> CD -> Stage-1-Tabelle installieren (SMMU). `true` bei Erfolg.
+/// Die hardwareseitige DMA-Durchsetzung für `(stream_id, [base,len))` aktivieren (ext-23-API,
+/// rückwärtskompatibel: bidirektional + non-cacheable). `true` bei Erfolg.
 pub fn dma_enable(stream_id: u32, base: u64, len: u64) -> bool {
-    dma_enforcer().enable_dma(&DmaBinding {
+    dma_enforcer().enable_dma(&DmaBinding::new(stream_id, PhysRegion::new(base, len)))
+}
+
+/// Die Durchsetzung für `(stream_id, [base,len))` wieder entziehen.
+pub fn dma_disable(stream_id: u32, base: u64, len: u64) {
+    dma_enforcer().disable_dma(&DmaBinding::new(stream_id, PhysRegion::new(base, len)));
+}
+
+/// **Opakes DMA-Handle** (ext-24): die *gerätesichtbare* Adresse (IOVA) + Länge einer
+/// angehängten Region. Backends programmieren das Gerät mit `iova` (heute identisch zur PA;
+/// die Abstraktion erlaubt später Remap/Bounce/SG-Kompaktierung ohne API-Bruch).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmaHandle {
+    pub iova: u64,
+    pub len: u64,
+}
+
+/// Eine **DMA-Cap** (ext-24) an den Übersetzungskontext der `stream_id` **anhängen**: liest
+/// Richtung + Kohärenz aus der Cap (cap-rein), mappt die Region richtungsminimal/kohärenz-
+/// spezifisch in die (ggf. neue) Kontext-Stage-1-Tabelle und gibt ein [`DmaHandle`] zurück.
+/// Mehrfaches `dma_attach` mit derselben `stream_id` (verschiedene Caps) hängt mehrere
+/// Regionen an **denselben** Kontext (Multi-Region). `None` bei Fehler / falscher Cap.
+pub fn dma_attach(stream_id: u32, dcap: CapPtr) -> Option<DmaHandle> {
+    let (phys, len, dir, coherence) = dma_cap_attrs(dcap)?;
+    let ro = dir == DmaDir::DeviceRead;
+    let cacheable = coherence == DmaCoherence::Coherent;
+    let ok = dma_enforcer().enable_dma(&DmaBinding {
         stream_id,
-        region: PhysRegion::new(base, len),
+        region: PhysRegion::new(phys, len),
         backend_pd: 0,
+        ro,
+        cacheable,
+    });
+    if ok {
+        Some(DmaHandle { iova: phys, len }) // IOVA = PA (identisch); Abstraktion für später
+    } else {
+        None
+    }
+}
+
+/// Eine zuvor per [`dma_attach`] angehängte Region wieder lösen (Stage-1-Eintrag entfernen +
+/// TLBI; bei letzter Region des Kontexts: Kontext abbauen). `handle.iova` == PA.
+pub fn dma_detach(stream_id: u32, handle: DmaHandle) {
+    dma_enforcer().disable_dma(&DmaBinding::new(
+        stream_id,
+        PhysRegion::new(handle.iova, handle.len),
+    ));
+}
+
+/// **IOMMU-Stream-Gruppe** (ext-24): `member` nutzt fortan denselben Übersetzungskontext wie
+/// `leader` (Multi-Function/SR-IOV/Bridge). `true` bei Erfolg.
+pub fn dma_group_add(leader: u32, member: u32) -> bool {
+    dma_enforcer().share_context(leader, member)
+}
+
+/// Prüfen, ob `[addr, addr+len)` (IOVA) **vollständig in einer angehängten Region** des Kontexts
+/// der `stream_id` liegt (Level-1-Software-Disziplin über mehrere Regionen / Scatter-Gather).
+fn dma_addr_in_context(stream_id: u32, addr: u64, len: u64) -> bool {
+    let t = DMA_CTX.lock();
+    t.iter()
+        .find(|c| c.used && c.sids.contains(&stream_id))
+        .map(|c| {
+            c.regs
+                .iter()
+                .any(|&(b, l)| l != 0 && addr >= b && addr.saturating_add(len) <= b + l)
+        })
+        .unwrap_or(false)
+}
+
+/// Ein **Scatter-Gather-Segment** (ext-24): ein Teilbereich `[offset, offset+len)` innerhalb der
+/// per `handle` referenzierten DMA-Region. Geräte-Adresse = `handle.iova + offset`. Das
+/// gerätespezifische Deskriptorformat (virtio-desc, NVMe-PRP/SGL, NIC-Ring) baut das Backend
+/// **aus** validierten Segmenten — die SG-Logik selbst bleibt geräteunabhängig.
+#[derive(Clone, Copy)]
+pub struct DmaSgEntry {
+    pub handle: DmaHandle,
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// **Scatter-Gather-Liste validieren** (ext-24, Level-1): jedes Segment muss (a) innerhalb seines
+/// Handles liegen (`offset+len <= handle.len`) und (b) dessen IOVA-Bereich in einer angehängten
+/// Region des `stream_id`-Kontexts liegen. Der vertrauenswürdige Treiber MUSS dies vor dem
+/// Programmieren einer SG-Anfrage aufrufen; die SMMU ist der Hardware-Backstop. `false`, wenn ein
+/// Segment ausserhalb liegt.
+pub fn dma_sg_validate(stream_id: u32, entries: &[DmaSgEntry]) -> bool {
+    entries.iter().all(|e| {
+        e.len > 0
+            && e.offset.saturating_add(e.len) <= e.handle.len
+            && dma_addr_in_context(stream_id, e.handle.iova + e.offset, e.len)
     })
 }
 
-/// Die Durchsetzung für `(stream_id, [base,len))` wieder entziehen (STE invalidieren +
-/// Stage-1-Tabelle/CD freigeben).
-pub fn dma_disable(stream_id: u32, base: u64, len: u64) {
-    dma_enforcer().disable_dma(&DmaBinding {
-        stream_id,
-        region: PhysRegion::new(base, len),
-        backend_pd: 0,
-    });
+/// **DMA-Pool** (ext-24): ein einfacher Bump-Sub-Allokator über eine angehängte DMA-Region. Für
+/// Backends, die viele kleine Puffer aus einer Region schneiden (Deskriptor-Ringe, mbufs). Jeder
+/// Sub-Puffer ist ein `DmaHandle` **innerhalb** der Eltern-Region — also bereits SMMU-gemappt und
+/// Level-1-validierbar. Geräteunabhängig.
+#[derive(Clone, Copy)]
+pub struct DmaPool {
+    base: u64,
+    end: u64,
+    next: u64,
+}
+
+impl DmaPool {
+    /// Einen Pool über die per `handle` referenzierte Region anlegen.
+    pub fn new(handle: DmaHandle) -> Self {
+        Self {
+            base: handle.iova,
+            end: handle.iova + handle.len,
+            next: handle.iova,
+        }
+    }
+    /// `len` Bytes (ausgerichtet auf `align`) aus dem Pool schneiden. `None` bei Erschöpfung.
+    pub fn alloc(&mut self, len: u64, align: u64) -> Option<DmaHandle> {
+        let a = align.max(1);
+        let start = (self.next + a - 1) & !(a - 1);
+        if len > 0 && start + len <= self.end {
+            self.next = start + len;
+            Some(DmaHandle { iova: start, len })
+        } else {
+            None
+        }
+    }
+    /// Den Pool zurücksetzen (alle Sub-Puffer verwerfen).
+    pub fn reset(&mut self) {
+        self.next = self.base;
+    }
+    /// Verbleibende freie Bytes.
+    pub fn remaining(&self) -> u64 {
+        self.end.saturating_sub(self.next)
+    }
 }
 
 /// **Level-1-Software-Disziplin** (ext-23): prüfen, dass ein Geräte-DMA-Zugriff `[addr, addr+len)`

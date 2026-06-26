@@ -243,6 +243,15 @@ pub fn clear_ste_and_sync(strtab_phys: u64, cmdq_phys: u64, prod: u32, sid: u32)
     write_ste_and_sync(strtab_phys, cmdq_phys, prod, sid, &[0u64; 8])
 }
 
+/// Nur **TLBI + SYNC** absetzen (ext-24): nach dem additiven Ein-/Aushängen einer Region in
+/// einen bestehenden Kontext (die STE bleibt, nur die Stage-1-Tabelle änderte sich). Gibt
+/// `(neuer_prod, ok)`.
+pub fn tlbi_sync(cmdq_phys: u64, mut prod: u32) -> (u32, bool) {
+    prod = issue(cmdq_phys, prod, CMD_TLBI_NSNH_ALL, 0);
+    prod = issue(cmdq_phys, prod, CMD_SYNC, 0);
+    (prod, wait_drained(prod))
+}
+
 // --- Stage-1-Übersetzung (D3): STE -> CD -> Stage-1-Pagetable ------------------------------
 //
 // Eine STE (Config = Stage-1) verweist auf einen **Context Descriptor** (CD); der CD enthält
@@ -256,42 +265,119 @@ const S1_TABLE: u64 = 0b11;
 const S1_PAGE: u64 = 0b11;
 const S1_AF: u64 = 1 << 10;
 const S1_SH_INNER: u64 = 0b11 << 8;
-const S1_AP_RW: u64 = 0b01 << 6; // RW für EL0+EL1 (Geräte-Zugriff erlaubt)
-const S1_ATTR_NORMAL: u64 = 1 << 2; // MAIR-Index 1 = Normal WB
+const S1_AP_RW: u64 = 0b01 << 6; //   RW für EL0+EL1 (Geräte-Zugriff erlaubt)
+const S1_AP_RO: u64 = 0b11 << 6; //   RO für EL0+EL1 (ext-24: Device-Read-Puffer schreibgeschützt)
+const S1_ATTR_NORMAL: u64 = 1 << 2; //    MAIR-Index 1 = Normal WB (Coherent)
+const S1_ATTR_NORMAL_NC: u64 = 2 << 2; // MAIR-Index 2 = Normal NC (NonCoherent)
 const S1_ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
 const ONE_GIB: u64 = 1 << 30;
 const TWO_MIB: u64 = 2 * 1024 * 1024;
 const PAGE: u64 = 4096;
 
-/// Eine minimale **Stage-1-Identitäts-Pagetable** bauen, die ausschließlich `[base, base+len)`
-/// (4-KiB-granular) abbildet (Normal WB, RW); alles andere bleibt ungemappt -> Fault. `alloc`
-/// liefert genullte 4-KiB-Tabellen-Frames. Gibt die L1-Wurzel-Physadresse zurück (oder `None`).
-/// Unterstützt Regionen in **GiB 0..511** (39-bit IOVA), L1->L2->L3.
-pub fn build_stage1_identity(
+/// Bits eines Stage-1-Leaf-Deskriptors für `ro` (read-only = Device-Read, schreibgeschützt) +
+/// `cacheable` (Coherent = Normal-WB, sonst Normal-NC).
+fn s1_leaf_bits(ro: bool, cacheable: bool) -> u64 {
+    let ap = if ro { S1_AP_RO } else { S1_AP_RW };
+    let attr = if cacheable { S1_ATTR_NORMAL } else { S1_ATTR_NORMAL_NC };
+    S1_AF | S1_SH_INNER | attr | ap | S1_PAGE
+}
+
+/// Eine **leere** Stage-1-Pagetable (nur die L1-Wurzel, alles ungemappt -> Fault) anlegen
+/// (ext-24, DmaContext). `alloc` liefert einen genullten 4-KiB-Frame. Regionen werden mit
+/// [`stage1_map_region`] additiv eingehängt (mehrere Regionen je Kontext).
+pub fn stage1_create(alloc: &mut dyn FnMut() -> Option<u64>) -> Option<u64> {
+    alloc() // genullter L1 = alle Einträge ungültig
+}
+
+/// Eine Region `[base, base+len)` (4-KiB-granular, GiB 0..511) **additiv** in die Stage-1-
+/// Tabelle `l1` einhängen (identitäts, IOVA=PA). `ro` = Device-Read (schreibgeschützt),
+/// `cacheable` = Coherent (Normal-WB) sonst NonCoherent (Normal-NC). `alloc` liefert L2/L3-
+/// Frames. `false` bei ungültiger Region oder fehlgeschlagener Allokation.
+pub fn stage1_map_region(
+    l1: u64,
     base: u64,
     len: u64,
+    ro: bool,
+    cacheable: bool,
     alloc: &mut dyn FnMut() -> Option<u64>,
-) -> Option<u64> {
+) -> bool {
     if len == 0 || base % PAGE != 0 || len % PAGE != 0 {
-        return None;
+        return false;
     }
-    let l1 = alloc()?; // genullt
+    let leaf = s1_leaf_bits(ro, cacheable);
     let mut p = base;
     while p < base + len {
         let i1 = (p / ONE_GIB) as usize;
-        let l2 = walk_or_alloc(l1, i1, alloc)?;
+        let Some(l2) = walk_or_alloc(l1, i1, alloc) else {
+            return false;
+        };
         let i2 = ((p % ONE_GIB) / TWO_MIB) as usize;
-        let l3 = walk_or_alloc(l2, i2, alloc)?;
+        let Some(l3) = walk_or_alloc(l2, i2, alloc) else {
+            return false;
+        };
         let i3 = ((p % TWO_MIB) / PAGE) as usize;
         // SAFETY: `l3` ist ein gültiger, identity-gemappter Tabellen-Frame; `i3` < 512.
         unsafe {
-            let e = (l3 + (i3 as u64) * 8) as *mut u64;
-            core::ptr::write_volatile(e, p | S1_AF | S1_SH_INNER | S1_ATTR_NORMAL | S1_AP_RW | S1_PAGE);
+            core::ptr::write_volatile((l3 + (i3 as u64) * 8) as *mut u64, p | leaf);
         }
         p += PAGE;
     }
     cpu::dsb_sy();
-    Some(l1)
+    true
+}
+
+/// Eine zuvor gemappte Region wieder aus der Stage-1-Tabelle entfernen (Leaves auf ungültig).
+/// Die Tabellen-Frames bleiben (werden erst von [`free_stage1`] beim Kontext-Abbau freigegeben).
+pub fn stage1_unmap_region(l1: u64, base: u64, len: u64) {
+    let mut p = base;
+    while p < base + len {
+        // SAFETY: read-only-Walk + ggf. ein Leaf-Write; Tabellen-Frames gültig.
+        unsafe {
+            let i1 = (p / ONE_GIB) as usize;
+            let e1 = core::ptr::read_volatile((l1 + (i1 as u64) * 8) as *const u64);
+            if e1 & 0b11 == S1_TABLE {
+                let l2 = e1 & S1_ADDR_MASK;
+                let i2 = ((p % ONE_GIB) / TWO_MIB) as usize;
+                let e2 = core::ptr::read_volatile((l2 + (i2 as u64) * 8) as *const u64);
+                if e2 & 0b11 == S1_TABLE {
+                    let l3 = e2 & S1_ADDR_MASK;
+                    let i3 = ((p % TWO_MIB) / PAGE) as usize;
+                    core::ptr::write_volatile((l3 + (i3 as u64) * 8) as *mut u64, 0);
+                }
+            }
+        }
+        p += PAGE;
+    }
+    cpu::dsb_sy();
+}
+
+/// Den Leaf-Deskriptor für IOVA `iova` aus der Stage-1-Tabelle `l1` zurücklesen (für den
+/// strukturellen Test: AP-/Attr-Bits prüfen). `0`, wenn ungemappt.
+pub fn stage1_read_leaf(l1: u64, iova: u64) -> u64 {
+    // SAFETY: read-only-Walk über gültige Tabellen-Frames.
+    unsafe {
+        let i1 = (iova / ONE_GIB) as usize;
+        let e1 = core::ptr::read_volatile((l1 + (i1 as u64) * 8) as *const u64);
+        if e1 & 0b11 != S1_TABLE {
+            return 0;
+        }
+        let i2 = ((iova % ONE_GIB) / TWO_MIB) as usize;
+        let e2 = core::ptr::read_volatile(((e1 & S1_ADDR_MASK) + (i2 as u64) * 8) as *const u64);
+        if e2 & 0b11 != S1_TABLE {
+            return 0;
+        }
+        let i3 = ((iova % TWO_MIB) / PAGE) as usize;
+        core::ptr::read_volatile(((e2 & S1_ADDR_MASK) + (i3 as u64) * 8) as *const u64)
+    }
+}
+
+/// Ist ein Stage-1-Leaf read-only (Device-Read, schreibgeschützt)? (Test-Helfer.)
+pub fn leaf_is_ro(leaf: u64) -> bool {
+    leaf & (0b11 << 6) == S1_AP_RO
+}
+/// Ist ein Stage-1-Leaf Normal-Cacheable (Coherent)? (Test-Helfer.)
+pub fn leaf_is_cacheable(leaf: u64) -> bool {
+    leaf & (0b111 << 2) == S1_ATTR_NORMAL
 }
 
 /// Tabelleneintrag `idx` in der Tabelle `table_phys` auflösen; existiert noch keine nächste

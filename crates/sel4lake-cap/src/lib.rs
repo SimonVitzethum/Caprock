@@ -23,5 +23,5 @@
 mod object;
 mod space;
 
-pub use object::ObjectKind;
+pub use object::{DmaCoherence, DmaDir, ObjectKind};
 pub use space::{CapError, CapInfo, CapPtr, CapSpace, ReplyFinal};

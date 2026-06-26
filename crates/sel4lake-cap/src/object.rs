@@ -5,6 +5,32 @@
 
 use sel4lake_mem::PhysRegion;
 
+/// **DMA-Richtung** (ext-24): die Zugriffsrichtung des **Geräts** auf den DMA-Puffer. Bestimmt
+/// die richtungsminimalen Hardware-Rechte (SMMU-Stage-1-AP) — ein reiner Lese-Puffer ist
+/// gegen ein fehlerhaftes Gerät **schreibgeschützt**.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DmaDir {
+    /// Das Gerät **liest** aus dem Puffer (CPU schreibt, Gerät liest). SMMU: read-only.
+    DeviceRead,
+    /// Das Gerät **schreibt** in den Puffer (Gerät schreibt, CPU liest). SMMU: read-write.
+    DeviceWrite,
+    /// Beide Richtungen. SMMU: read-write.
+    Bidirectional,
+}
+
+/// **Cache-Kohärenz** (ext-24) eines DMA-Puffers gegenüber der CPU. Bestimmt die Speicher-
+/// Attribute (cacheable vs. non-cacheable) und ob Cache-Maintenance (clean/invalidate) um
+/// Transfers nötig ist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DmaCoherence {
+    /// Hardware-kohärent (CCI/ACE): Normal **Cacheable**; Maintenance per `dma_prepare`/
+    /// `dma_complete` (clean vor Geräte-Read, invalidate nach Geräte-Write).
+    Coherent,
+    /// Nicht kohärent: Normal **Non-Cacheable**; keine CPU-Cache-Maintenance nötig (Default,
+    /// rückwärtskompatibel zu ext-23).
+    NonCoherent,
+}
+
 /// Art des Objekts, auf das eine Capability verweist. Notifications, TCBs usw.
 /// kommen in späteren Phasen hinzu.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,7 +81,17 @@ pub enum ObjectKind {
     /// die System-Teardown-Reihenfolge (`enforcer.disable_dma` -> VSpace-Unmap) garantiert, dass
     /// vorher kein Gerät mehr hineinschreiben kann (DMA-use-after-free-sicher). Die hardware-
     /// erzwungene Isolation (SMMUv3) liegt hinter der `DmaEnforcer`-Abstraktion im Kernel.
-    Dma { phys: u64, len: u64 },
+    ///
+    /// ext-24: die Cap kodiert zusätzlich die **Richtung** (`dir`, → richtungsminimale SMMU-
+    /// Rechte) und die **Cache-Kohärenz** (`coherence`, → Speicher-Attribute + Maintenance).
+    /// Die Felder sind additiv; `install_dma` ohne sie nutzt `Bidirectional`/`NonCoherent`
+    /// (= ext-23-Verhalten).
+    Dma {
+        phys: u64,
+        len: u64,
+        dir: DmaDir,
+        coherence: DmaCoherence,
+    },
 }
 
 /// Eintrag der Objekt-Tabelle.

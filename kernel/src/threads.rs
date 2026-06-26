@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use sel4lake_abi::{pdctl, result, sys, GRANT_FLAG, GRANT_RECV_SLOT};
 use sel4lake_hal::{self as hal, println, syscall::invoke};
 use sel4lake_mem::{peek_u64, poke_u64, Rights};
-use sel4lake_cap::CapPtr;
+use sel4lake_cap::{CapPtr, DmaCoherence, DmaDir};
 use sel4lake_microkit::Domain;
 use sel4lake_sched::ThreadId;
 use sel4lake_sync::SpinLock;
@@ -379,6 +379,20 @@ static VRNG_SMMU_ENF: AtomicBool = AtomicBool::new(false); // L2: SMMU-Fault (QE
 static VRNG_DONE: AtomicBool = AtomicBool::new(false);
 static VRNG_OK: AtomicBool = AtomicBool::new(false);
 
+// Generische DMA-Infrastruktur (ext-24): Richtung/Kohaerenz (DmaCap-Attribute -> richtungs-
+// minimale SMMU-AP + kohaerenz-spezifische Attribute, strukturell geprueft), Multi-Region-
+// Kontext (mehrere DmaCaps je StreamID in EINER Stage-1-Tabelle), Stream-Gruppen (mehrere
+// StreamIDs je Kontext), Scatter-Gather-Validierung (Level 1), DmaPool (Sub-Allokation).
+static DMAGEN_MULTIREGION: AtomicBool = AtomicBool::new(false); // 3 Regionen in 1 Kontext
+static DMAGEN_DIR: AtomicBool = AtomicBool::new(false); // DeviceRead-Leaf RO, DeviceWrite-Leaf RW
+static DMAGEN_COH: AtomicBool = AtomicBool::new(false); // Coherent-Leaf cacheable, NonCoherent NC
+static DMAGEN_GROUP: AtomicBool = AtomicBool::new(false); // 2 StreamIDs teilen den Kontext
+static DMAGEN_SG: AtomicBool = AtomicBool::new(false); // SG-Liste valide + Out-of-Window abgewiesen
+static DMAGEN_POOL: AtomicBool = AtomicBool::new(false); // DmaPool: disjunkte Sub-Puffer + Erschoepfung
+static DMAGEN_BALANCED: AtomicBool = AtomicBool::new(false); // total_free nach Teardown = Baseline
+static DMAGEN_DONE: AtomicBool = AtomicBool::new(false);
+static DMAGEN_OK: AtomicBool = AtomicBool::new(false);
+
 // Domänen/HW-Fuzzer (ext-22, P6): churnt über viele Epochen Hardware-/Management-Caps gegen
 // die Domänen-Policy + CDT/VSpace-Oracles + Ressourcen-Baseline. Kernpunkte: HW-Caps (MMIO/
 // IRQ) NUR in HardwareLand, PdControl NUR in TrustedSas installierbar (Negativfälle abgelehnt);
@@ -511,6 +525,84 @@ fn hwfuzz_epoch(tpd: usize, hpd: usize, upd: usize, base_obj: usize, base_free: 
         return 60;
     }
     0
+}
+
+/// **Generische DMA-Infrastruktur testen** (ext-24): Richtung/Kohärenz (DmaCap-Attribute ->
+/// richtungsminimales SMMU-AP + kohärenz-spezifische Attribute, strukturell zurückgelesen),
+/// Multi-Region-Kontext, Stream-Gruppen, Scatter-Gather-Validierung, DmaPool. Synchron (IRQs
+/// aus für die saubere total_free-Messung). Gibt `true` bei Erfolg + setzt die Telemetrie.
+fn run_dmagen() -> bool {
+    let (sid, sid2) = (0x40u32, 0x41u32);
+    hal::cpu::local_irq_disable();
+    // 3 RAM-Regionen + DmaCaps mit unterschiedlicher Richtung/Kohärenz.
+    let (Some(r1), Some(r2), Some(r3)) = (
+        system::alloc_dma_region(0x1000),
+        system::alloc_dma_region(0x1000),
+        system::alloc_dma_region(0x1000),
+    ) else {
+        hal::cpu::local_irq_enable();
+        return false;
+    };
+    let (Ok(cap1), Ok(cap2), Ok(cap3)) = (
+        system::install_dma_cap_ex(r1.base, r1.len, DmaDir::DeviceRead, DmaCoherence::NonCoherent, Rights::RW),
+        system::install_dma_cap_ex(r2.base, r2.len, DmaDir::DeviceWrite, DmaCoherence::Coherent, Rights::RW),
+        system::install_dma_cap_ex(r3.base, r3.len, DmaDir::Bidirectional, DmaCoherence::NonCoherent, Rights::RW),
+    ) else {
+        hal::cpu::local_irq_enable();
+        return false;
+    };
+    let free0 = system::total_free();
+    // attach: alle 3 Regionen in EINEN Kontext der StreamID (Multi-Region).
+    let (Some(h1), Some(h2), Some(h3)) = (
+        system::dma_attach(sid, cap1),
+        system::dma_attach(sid, cap2),
+        system::dma_attach(sid, cap3),
+    ) else {
+        hal::cpu::local_irq_enable();
+        return false;
+    };
+    let multiregion = system::dma_ctx_region_count(sid) == 3;
+    // Richtungsminimales AP + Kohärenz strukturell prüfen (Stage-1-Leaves zurücklesen).
+    let l1 = system::dma_ctx_stage1(sid);
+    let leaf1 = hal::smmu::stage1_read_leaf(l1, r1.base); // DeviceRead  -> RO, NonCoherent -> NC
+    let leaf2 = hal::smmu::stage1_read_leaf(l1, r2.base); // DeviceWrite -> RW, Coherent    -> WB
+    let dir = hal::smmu::leaf_is_ro(leaf1) && !hal::smmu::leaf_is_ro(leaf2);
+    let coh = hal::smmu::leaf_is_cacheable(leaf2) && !hal::smmu::leaf_is_cacheable(leaf1);
+    // Stream-Gruppe: sid2 teilt den Kontext (2 StreamIDs -> 1 CD/Stage-1).
+    let group = system::dma_group_add(sid, sid2) && system::dma_ctx_sid_count(sid) == 2;
+    // Scatter-Gather-Validierung: valide Liste ok, Out-of-Window abgewiesen.
+    let sg_good = [
+        system::DmaSgEntry { handle: h1, offset: 0, len: 0x800 },
+        system::DmaSgEntry { handle: h2, offset: 0x100, len: 0x100 },
+    ];
+    let sg_bad = [system::DmaSgEntry { handle: h1, offset: 0x800, len: 0x1000 }];
+    let sg = system::dma_sg_validate(sid, &sg_good) && !system::dma_sg_validate(sid, &sg_bad);
+    // DmaPool: disjunkte Sub-Puffer + Erschöpfung.
+    let mut pool = system::DmaPool::new(h3);
+    let pool_ok = match (pool.alloc(0x100, 0x40), pool.alloc(0x100, 0x40)) {
+        (Some(a), Some(b)) => a.iova + 0x100 <= b.iova && pool.alloc(0x10000, 1).is_none(),
+        _ => false,
+    };
+    let audit = system::dma_audit() == 0 && system::vspace_audit() == 0;
+    // Teardown: alle Regionen lösen -> Kontext abgebaut (Stage-1/CD frei). Danach Caps löschen.
+    system::dma_detach(sid, h1);
+    system::dma_detach(sid, h2);
+    system::dma_detach(sid, h3);
+    let balanced = system::total_free() == free0; // Stage-1-/CD-Frames balanciert
+    let _ = system::cap_delete(cap1);
+    let _ = system::cap_delete(cap2);
+    let _ = system::cap_delete(cap3);
+    hal::cpu::local_irq_enable();
+
+    DMAGEN_MULTIREGION.store(multiregion, Ordering::Relaxed);
+    DMAGEN_DIR.store(dir, Ordering::Relaxed);
+    DMAGEN_COH.store(coh, Ordering::Relaxed);
+    DMAGEN_GROUP.store(group, Ordering::Relaxed);
+    DMAGEN_SG.store(sg, Ordering::Relaxed);
+    DMAGEN_POOL.store(pool_ok, Ordering::Relaxed);
+    DMAGEN_BALANCED.store(balanced, Ordering::Relaxed);
+    multiregion && dir && coh && group && sg && pool_ok && audit && balanced
+        && system::domain_audit() == 0
 }
 
 // Audit-Regression B (Scheduler/MCS): `set_budget`/`bind_sched_context` auf einen
@@ -2964,7 +3056,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} hwfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} hwfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -3003,6 +3095,7 @@ pub fn demo_report_then_idle() -> ! {
                 SMMU_DONE.load(Ordering::Acquire) && SMMU_OK.load(Ordering::Acquire),
                 SMMUB_DONE.load(Ordering::Acquire) && SMMUB_OK.load(Ordering::Acquire),
                 VRNG_DONE.load(Ordering::Acquire) && VRNG_OK.load(Ordering::Acquire),
+                DMAGEN_DONE.load(Ordering::Acquire) && DMAGEN_OK.load(Ordering::Acquire),
                 HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire),
             );
         }
@@ -4118,9 +4211,17 @@ pub fn demo_report_then_idle() -> ! {
             VRNG_DONE.store(true, Ordering::Release);
         }
 
+        // Generische DMA-Infrastruktur (ext-24): Richtung/Kohärenz (strukturell), Multi-Region-
+        // Kontext, Stream-Gruppen, Scatter-Gather-Validierung, DmaPool. Synchron, ein Schritt.
+        // Gegate auf virtiorng (ext-23) fertig (SMMU initialisiert).
+        if !DMAGEN_DONE.load(Ordering::Acquire) && VRNG_DONE.load(Ordering::Acquire) {
+            DMAGEN_OK.store(run_dmagen(), Ordering::Release);
+            DMAGEN_DONE.store(true, Ordering::Release);
+        }
+
         // Domänen/HW-Fuzzer (ext-22, P6): churnt HW-/Management-Caps gegen Policy + Oracles +
-        // Baseline. Gegate auf virtio-rng-DMA (ext-23) fertig; eine Epoche je Manager-Iteration.
-        if !HWFUZZ_DONE.load(Ordering::Acquire) && VRNG_DONE.load(Ordering::Acquire) {
+        // Baseline. Gegate auf generische DMA-Infra (ext-24) fertig; eine Epoche je Iteration.
+        if !HWFUZZ_DONE.load(Ordering::Acquire) && DMAGEN_DONE.load(Ordering::Acquire) {
             match HWFUZZ_STEP.load(Ordering::Acquire) {
                 0 => {
                     // Fixtures (eine PD je Domäne, ohne Threads) + Baseline schnappen.
@@ -4332,12 +4433,15 @@ fn all_done() -> bool {
     let smmubind = SMMUB_DONE.load(Ordering::Acquire) && SMMUB_OK.load(Ordering::Acquire);
     // virtio-rng-DMA (ext-23): echter Bus-Master-DMA hinter der SMMU + Kronjuwel-Sensitivität.
     let virtiorng = VRNG_DONE.load(Ordering::Acquire) && VRNG_OK.load(Ordering::Acquire);
+    // Generische DMA-Infra (ext-24): Richtung/Kohärenz + Multi-Region + Gruppen + SG + Pool.
+    let dmagen = DMAGEN_DONE.load(Ordering::Acquire) && DMAGEN_OK.load(Ordering::Acquire);
     // Domänen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Policy + Oracles + Baseline.
     let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
-        && pdctl && chan && rtc && irq && dma && pcie && smmu && smmubind && virtiorng && hwfuzz
+        && pdctl && chan && rtc && irq && dma && pcie && smmu && smmubind && virtiorng && dmagen
+        && hwfuzz
 }
 
 fn report() {
@@ -4796,6 +4900,18 @@ fn report() {
     println!(
         "virtiorng: {} (echter Bus-Master-DMA in die DmaCap-Region; zweistufig: Level-1-Software-Bounds erzwingt In-Window demonstrierbar, Level-2-SMMU als HW-Backstop fuer reale HW)",
         if virtiorng { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Generische DMA-Infrastruktur (ext-24).
+    let dmagen = DMAGEN_DONE.load(Ordering::Acquire) && DMAGEN_OK.load(Ordering::Acquire);
+    println!("dmagen  : Multi-Region(3-in-1-Kontext)={} Richtung(Read=RO/Write=RW)={} Kohaerenz(WB/NC)={} Stream-Gruppe(2 SIDs)={} Scatter-Gather={} DmaPool={} balanciert={}",
+        DMAGEN_MULTIREGION.load(Ordering::Acquire), DMAGEN_DIR.load(Ordering::Acquire),
+        DMAGEN_COH.load(Ordering::Acquire), DMAGEN_GROUP.load(Ordering::Acquire),
+        DMAGEN_SG.load(Ordering::Acquire), DMAGEN_POOL.load(Ordering::Acquire),
+        DMAGEN_BALANCED.load(Ordering::Acquire));
+    println!(
+        "dmagen  : {} (generische DMA-Infra: Richtung/Kohaerenz als DmaCap-Attribute, Multi-Region-Kontext, Stream-Gruppen, SG-Validierung, DmaPool — baut auf DmaCap/DmaEnforcer auf)",
+        if dmagen { "ALL PASS" } else { "FAILURES" }
     );
 
     // Domänen/HW-Fuzzer (ext-22, P6).

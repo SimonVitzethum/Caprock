@@ -1,0 +1,20 @@
+# SEL4Lake — externe EL0-Programme (ext-26).
+#
+# EIGENER Workspace, GETRENNT vom Kernel-Workspace: eigene Target-Spec (aarch64-sel4lake-user.json)
+# + Linker-Skript (user.ld) via programs/.cargo/config.toml. Build: `cd programs && cargo build
+# --release`. Die erzeugten ET_EXEC-ELF64-Binaries werden vom generischen Binary-Loader geladen.
+# Jedes Programm ist unabhaengig baubar/ladbar/aktualisierbar; gemeinsame (nicht gegenseitige)
+# Abhaengigkeit ist nur das Minimal-SDK `libsel4lake` (Syscall-Stubs + Panik-Handler).
+[workspace]
+resolver = "2"
+members = ["libsel4lake", "hello"]
+
+[workspace.package]
+edition = "2021"
+version = "0.0.1"
+license = "BSD-2-Clause"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true

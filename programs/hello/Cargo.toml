@@ -1,0 +1,15 @@
+# `hello` — minimales extern geladenes SEL4Lake-UserLand-Programm (ext-26, L1).
+# Beweist End-to-End, dass extern gebauter Code geladen + ausgeführt wird: signalisiert eine
+# vom Loader endowte Notification (Cap-Slot 0) mit einem Badge, dann Selbst-Park.
+[package]
+name = "hello"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hello"
+path = "src/main.rs"
+
+[dependencies]
+libsel4lake = { path = "../libsel4lake" }

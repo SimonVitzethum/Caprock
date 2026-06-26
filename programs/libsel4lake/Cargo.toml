@@ -1,0 +1,11 @@
+# Minimal-Userland-SDK für extern geladene SEL4Lake-EL0-Programme (ext-26).
+# Syscall-Stubs (SVC-ABI) + Panik-Handler. Gemeinsame, NICHT gegenseitige Abhängigkeit der
+# Programme. Spiegelt die ABI aus crates/sel4lake-abi (bewusst dupliziert: externe Programme
+# sollen NICHT vom Kernel-Workspace abhängen).
+[package]
+name = "libsel4lake"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

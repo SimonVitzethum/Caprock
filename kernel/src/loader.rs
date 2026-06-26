@@ -68,3 +68,12 @@ pub fn load_image(prog: &Program, endow: &[(usize, CapPtr)]) -> Result<(ThreadId
     let img = ElfImage::parse(prog.elf)?; // Safe-Rust-Validierung; unsafe erst im Kopier-Glue
     crate::system::load_elf(&img, domain, endow).ok_or(LoaderError::NoResources)
 }
+
+/// `SYS_LOAD`-Callback (ext-26, L2): das Programm mit Index `index` aus dem Boot-Archiv laden +
+/// die `endow`-Caps (vom Dispatch aus dem Aufrufer-Cspace delegiert) in die neue PD endowen. Gibt
+/// die neue PD-Id. Der Dispatch hat die `Loader`-Cap-Autoritaet bereits geprueft.
+pub fn load_by_index(index: u32, endow: &[(usize, CapPtr)]) -> Option<usize> {
+    let archive = read_archive()?;
+    let prog = archive.program(index as usize)?;
+    load_image(&prog, endow).ok().map(|(_, pd)| pd)
+}

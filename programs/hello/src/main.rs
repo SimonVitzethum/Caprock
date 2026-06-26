@@ -17,6 +17,9 @@ const NTFN_SLOT: u64 = 0;
 /// `_arg` = x0 (Boot-Info-Zeiger; in L1 ungenutzt).
 #[no_mangle]
 pub extern "C" fn _start(_arg: usize) -> ! {
+    // Die endowte Notification signalisieren (Badge bleibt fuer den Kernel-Test erhalten), dann
+    // SELBST BEENDEN -> der EL0-Kernel-Stack-Pool-Slot + der User-Stack werden zurueckgegeben
+    // (vollstaendiger Programm-Lebenszyklus; kein Dauer-Park, der Pool-Slots haelt).
     libsel4lake::signal(NTFN_SLOT, HELLO_BADGE);
-    libsel4lake::park();
+    libsel4lake::exit();
 }

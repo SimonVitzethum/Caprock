@@ -172,6 +172,13 @@ impl CapSpace {
         self.install(ObjectKind::PdControl { pd }, rights)
     }
 
+    /// Eine **Loader-Capability** (ext-26) einbringen: die Autorität, über den generischen
+    /// Binary-Loader ein Programm aus `source` (0 = Boot-Archiv) zu laden (`SYS_LOAD`). Hält
+    /// keinen Allokator-Speicher -> keine Finalisierung.
+    pub fn install_loader(&mut self, source: u32, rights: Rights) -> Result<CapPtr, CapError> {
+        self.install(ObjectKind::Loader { source }, rights)
+    }
+
     /// Eine **MMIO-Capability** (ext-22, HardwareLand) einbringen: die Autorität, die
     /// Geräte-Registerregion `[phys, phys+len)` als EL0-Device zu mappen. Hält keinen
     /// RAM-Allokator-Eintrag (Geräte-Bereich) -> keine Finalisierung. Nur kernelseitig.

@@ -34,8 +34,12 @@ pub mod sys {
     /// `PdControl`-Cap (WRITE). Die Sub-Operation steht in `x2` (s. [`pdctl`]), Argumente
     /// in `x3`..`x5`. Nur eine TrustedSas-PD darf eine UserLand-PD so steuern.
     pub const PDCTL: u64 = 12;
-    // Reserviert für künftige Hardware-Cap-Syscalls (DMA o. Ä.): 13.. — bewusst Platz
-    // gelassen, damit DMA-Erweiterungen die ABI nicht verschieben (ext-22-Nachtrag).
+    /// **Binary-Loader laden** (ext-26): ein Programm aus dem Boot-Archiv zur Laufzeit laden +
+    /// starten, gated auf eine `Loader`-Cap (WRITE). `x1` = Loader-Cap-Index, `x2` = Archiv-
+    /// Programm-Index, `x3` = lokaler Cap-Index, der in **Slot 0** der neuen PD delegiert wird
+    /// (`u64::MAX` = keiner). Rückgabe: `x0` = result, `x1` = neue PD-Id (bei OK). Der geladene
+    /// Prozess erhält NUR die so explizit delegierten Caps (keine Sonderrechte über die Cap).
+    pub const LOAD: u64 = 13;
 }
 
 /// Sub-Operationen für [`sys::PDCTL`] (Register `x2`). Jede ist auf den Besitz der

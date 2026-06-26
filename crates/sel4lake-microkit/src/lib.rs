@@ -229,13 +229,14 @@ fn kind_is_hardware(kind: ObjectKind) -> bool {
     )
 }
 
-/// Ist `kind` eine Management-Cap (`PdControl`)? Diese darf nur eine TrustedSas-PD halten.
+/// Ist `kind` eine **TrustedSas-Autoritäts-Cap** (`PdControl` oder `Loader`, ext-26)? Solche dürfen
+/// nur TrustedSas-PDs halten.
 fn kind_is_pd_control(kind: ObjectKind) -> bool {
-    matches!(kind, ObjectKind::PdControl { .. })
+    matches!(kind, ObjectKind::PdControl { .. } | ObjectKind::Loader { .. })
 }
 
 /// Darf eine PD der Domäne `domain` eine Cap des Typs `kind` halten?
-/// HW-Caps nur HardwareLand; `PdControl` nur TrustedSas; alles andere überall.
+/// HW-Caps nur HardwareLand; `PdControl`/`Loader` nur TrustedSas; alles andere überall.
 fn domain_allows_kind(domain: Domain, kind: ObjectKind) -> bool {
     if kind_is_hardware(kind) {
         domain == Domain::HardwareLand
@@ -459,6 +460,11 @@ pub fn dispatch(
     caps: &RwSpinLock<Caps>,
     eps: &[SpinLock<Endpoint>; NENDPOINTS],
     ntfns: &[SpinLock<Notification>; NNOTIFICATIONS],
+    // ext-26: `SYS_LOAD`-Callback in den kernel-spezifischen Binary-Loader. `(Archiv-Index,
+    // Endowment) -> neue PD-Id`. Vom Dispatch erst NACH dem Freigeben von `caps` gerufen (der
+    // Loader re-lockt `CAPS`/`MEM`/`SCHEDS` selbst). `endow` = aus dem Aufrufer-Cspace delegierte
+    // Caps (Slot, Cap).
+    load: fn(u32, &[(usize, CapPtr)]) -> Option<usize>,
 ) -> usize {
     let nr = frame_reg(frame, reg::SYSNO_RESULT);
     if nr == sys::YIELD {
@@ -631,6 +637,51 @@ pub fn dispatch(
             };
             frame_set_reg(frame, reg::SYSNO_RESULT, if ok { result::OK } else { result::ERR_BADCAP });
             frame
+        }
+        sys::LOAD => {
+            // ext-26: cap-gegatetes Laden eines extern gebauten Programms zur Laufzeit. Die
+            // `Loader`-Cap ist die Autoritaet; der geladene Prozess erhaelt NUR den/die explizit
+            // delegierten Caller-Cap(s) -- keine Sonderrechte ueber die Loader-Cap.
+            let ObjectKind::Loader { .. } = kind else {
+                return deny(result::ERR_BADCAP);
+            };
+            if !rights.contains(Rights::WRITE) {
+                return deny(result::ERR_RIGHTS);
+            }
+            let index = frame_reg(frame, reg::MSG0) as u32; // x2: Archiv-Programm-Index
+            let delegate = frame_reg(frame, reg::MSG0 + 1); // x3: lokaler Cap-Index (u64::MAX=keiner)
+            // Den zu delegierenden Caller-Cap (x3) aufloesen + KOPIEREN (CDT-Kind, gleiche Rechte)
+            // unter CAPS.write; danach CAPS freigeben -- der Loader re-lockt CAPS/MEM/SCHEDS selbst.
+            let endowed = if delegate != u64::MAX {
+                let mut g = caps.write();
+                let Some(c) = g.pds.cap_at(pd, delegate as usize) else {
+                    return deny(result::ERR_BADCAP);
+                };
+                let Some((_, r, _)) = g.cspace.lookup(c) else {
+                    return deny(result::ERR_BADCAP);
+                };
+                match g.cspace.copy(c, r) {
+                    Ok(copy) => Some(copy),
+                    Err(_) => return deny(result::ERR_BADCAP),
+                }
+            } else {
+                None
+            }; // CAPS hier freigegeben
+            let arr;
+            let endow: &[(usize, CapPtr)] = if let Some(c) = endowed {
+                arr = [(0usize, c)]; // Konvention L2: delegierter Cap -> Slot 0 der neuen PD
+                &arr
+            } else {
+                &[]
+            };
+            match load(index, endow) {
+                Some(pd_new) => {
+                    frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
+                    frame_set_reg(frame, reg::EP_BADGE, pd_new as u64); // x1 = neue PD-Id
+                    frame
+                }
+                None => deny(result::ERR_BADCAP), // Laden fehlgeschlagen (Archiv/ELF/Ressourcen)
+            }
         }
         _ => deny(result::ERR_BADSYS),
     }

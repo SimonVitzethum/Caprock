@@ -1,8 +1,8 @@
-# ext-26 — Generischer Binary-Loader (Phasen L0–L1)
+# ext-26 — Generischer Binary-Loader (Phasen L0–L2)
 
-Status: **L0 + L1 fertig** (Boot-Delivery, ELF-Parser, externe Toolchain, EL0-Laden). Suite grün
-(51 Checks). Architektur/Format: [ADR 0011](../adr/0011-binary-loader.md). Plan:
-[ext-26-binary-loader-plan.md](ext-26-binary-loader-plan.md).
+Status: **L0 + L1 + L2 fertig** (Boot-Delivery, ELF-Parser, externe Toolchain, EL0-Laden, cap-
+gegatetes Laden zur Laufzeit via `SYS_LOAD`). Suite grün (52 Checks). Architektur/Format:
+[ADR 0011](../adr/0011-binary-loader.md). Plan: [ext-26-binary-loader-plan.md](ext-26-binary-loader-plan.md).
 
 ## Ziel
 
@@ -31,6 +31,15 @@ Sicherheitsarchitektur (Capabilities, Domänen, Region-Runtime, Audits, W^X) ble
   gültig), EL0-Spawn. Öffentliche API `loader::load_image(&Program)` (klein, quellen-agnostisch).
   Test `load`: das **extern gebaute** `hello` wird geladen + ausgeführt und signalisiert eine
   endowte Notification (`HELLO_BADGE`) — Beweis, dass Code **außerhalb** des Kernel-Images läuft.
+- **L2 — Laden zur Laufzeit via `SYS_LOAD` (cap-gegatet).** Neue Autoritäts-Cap `ObjectKind::Loader`
+  (nur TrustedSAS, wie `PdControl`) + Syscall `SYS_LOAD` (Nr. 13). Der Dispatch prüft die
+  `Loader`-Cap (WRITE), **delegiert** einen vom Aufrufer benannten eigenen Cap (CDT-Kopie) in die
+  neue PD und ruft (nach Freigabe von `CAPS`) den Kernel-Loader. Der geladene Prozess erhält **nur**
+  die so delegierten Caps — die `Loader`-Cap gewährt **keine** Sonderrechte am Ziel. `load_elf`
+  nutzt DAIF-**Save/Restore** (korrekt im Syscall-Trap *und* In-Kernel). Test `sysload`: ein
+  TrustedSAS-Caller lädt `hello` per Syscall + delegiert seine Notification-Cap (hello signalisiert
+  sie); Negativfall ohne `Loader`-Cap → `ERR_BADCAP`. `hello` **beendet sich** nach dem Signal
+  (vollständiger Lebenszyklus, gibt Pool-Slot zurück).
 
 ## Nutzer-Review-Verfeinerungen (eingebaut)
 
@@ -51,11 +60,12 @@ deadlock-frei (vorher 4/15). Siehe `docs/invariants.md` §1a.
 
 ## Verifikation
 
-`./test-qemu.sh` → **51/51 ALL PASS** (50 Bestand + neuer `load`). Crate-Parser per Host-`cargo
+`./test-qemu.sh` → **52/52 ALL PASS** (50 Bestand + `load` + `sysload`). Crate-Parser per Host-`cargo
 test` (17 Tests). Stabilität per `tools/hang-stress.sh`.
 
 ## Offen (Folgephasen)
 
-L2 (`SYS_LOAD` + `Loader`-Cap + Manifest-getriebenes Cap-Endowment), L3 (HardwareLand + TrustedSAS/
-EL1 signatur-gegatet), L4 (Stop/Hot-Reload/Teardown geladener Segmente), L5 (`loader_audit` +
-Fuzzer), L6 (Projektstruktur). Danach ext-27: aggressive Testdienste auf dem Loader.
+L2-Erweiterung: Manifest-getriebenes Mehr-Cap-Endowment (derzeit ein delegierter Cap → Slot 0).
+L3 (HardwareLand + TrustedSAS/EL1 signatur-gegatet), L4 (Stop/Hot-Reload/Teardown geladener
+Segmente + VSpace), L5 (`loader_audit` + Fuzzer), L6 (Projektstruktur). Danach ext-27: aggressive
+Testdienste auf dem Loader.

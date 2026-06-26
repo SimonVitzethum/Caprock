@@ -193,7 +193,15 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
     // Sperrordnung CAPS < EPS[i]/NTFNS[i] < SCHEDS -> deadlockfrei. IRQs im Trap
     // maskiert -> kein Preempt beim Lock-Halten.
     let mut ops = KernelSched;
-    let next = sel4lake_microkit::dispatch(frame as usize, core, &mut ops, &CAPS, &EPS, &NTFNS);
+    let next = sel4lake_microkit::dispatch(
+        frame as usize,
+        core,
+        &mut ops,
+        &CAPS,
+        &EPS,
+        &NTFNS,
+        crate::loader::load_by_index, // ext-26: SYS_LOAD-Callback (cap-gegatet im Dispatch)
+    );
     // Der Syscall kann den laufenden Thread gewechselt haben (block/exit) -> FP-Trap
     // + VSpace passend zum neuen aktuellen Thread setzen.
     {
@@ -1265,9 +1273,12 @@ pub fn load_elf(img: &ElfImage, domain: Domain, endow: &[(usize, CapPtr)]) -> Op
     hal::mmu::flush_asid(asid);
 
     // 3. PD + Thread + Endowment IRQ-maskiert: der Thread darf nicht vor dem Setup starten.
-    hal::cpu::local_irq_disable();
+    // DAIF SICHERN + maskieren (nicht unbedingt freigeben): load_elf laeuft sowohl mit IRQs an
+    // (In-Kernel-Test) ALS AUCH im Syscall-Trap (SYS_LOAD, IRQs bereits maskiert) -- der Vorzustand
+    // muss erhalten bleiben, sonst gaebe man IRQs mitten im Trap frei.
+    let daif = hal::cpu::local_irq_save();
     let Some(pd) = create_pd_in_domain(domain) else {
-        hal::cpu::local_irq_enable();
+        hal::cpu::local_irq_restore(daif);
         return fail(asid, kidx);
     };
     let tid = {
@@ -1289,7 +1300,7 @@ pub fn load_elf(img: &ElfImage, domain: Domain, endow: &[(usize, CapPtr)]) -> Op
         r
     };
     let Some(tid) = tid else {
-        hal::cpu::local_irq_enable();
+        hal::cpu::local_irq_restore(daif);
         return fail(asid, kidx);
     };
     record_user_kstack(tid.slot(), kidx);
@@ -1298,7 +1309,7 @@ pub fn load_elf(img: &ElfImage, domain: Domain, endow: &[(usize, CapPtr)]) -> Op
     for &(slot, cap) in endow {
         install_pd_cap(pd, slot, cap); // policy-geprüft (Domänen-Policy bleibt gültig)
     }
-    hal::cpu::local_irq_enable();
+    hal::cpu::local_irq_restore(daif);
     Some((tid, pd))
 }
 
@@ -1347,6 +1358,13 @@ pub fn install_pd_control_cap(pd: usize, rights: Rights) -> Result<CapPtr, CapEr
 /// HardwareLand-PDs (`install_cap_checked`).
 pub fn install_mmio_cap(phys: u64, len: u64, rights: Rights) -> Result<CapPtr, CapError> {
     CAPS.write().cspace.install_mmio(phys, len, rights)
+}
+
+/// Eine **Loader-Capability** (ext-26) prägen: die Autorität, über `SYS_LOAD` ein Programm aus
+/// `source` (0 = Boot-Archiv) zu laden. Nur kernelseitig geprägt; cap-policy-geprüft nur in
+/// TrustedSas-PDs installierbar (`install_cap_checked`).
+pub fn install_loader_cap(source: u32, rights: Rights) -> Result<CapPtr, CapError> {
+    CAPS.write().cspace.install_loader(source, rights)
 }
 
 /// **Mapping-Art** (Konsolidierung K6) für [`map_region_into_thread`]: bestimmt Tabellen-Level,

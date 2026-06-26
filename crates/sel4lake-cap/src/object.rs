@@ -62,6 +62,13 @@ pub enum ObjectKind {
     /// TrustedSas-PD bekommt sie; sie ist die explizite Steuerungsberechtigung über genau
     /// diese eine Ziel-PD. Hält keinen Allokator-Speicher (keine Finalisierung).
     PdControl { pd: u32 },
+    /// Eine **Loader-Capability** (ext-26): die Autorität einer TrustedSas-PD, über den
+    /// generischen Binary-Loader ein Programm aus `source` (0 = Boot-Archiv) zur Laufzeit zu
+    /// laden + zu starten (`SYS_LOAD`). Wie `PdControl` eine reine **Autoritäts**-Cap (kein
+    /// Allokator-Speicher, keine Finalisierung); nur in TrustedSas-PDs installierbar. Sie gewährt
+    /// **keine** Sonderrechte am geladenen Prozess — dieser erhält nur die Caps, die der Aufrufer
+    /// im `SYS_LOAD` explizit aus seinem eigenen Cspace delegiert.
+    Loader { source: u32 },
     /// Eine **MMIO-Capability** (ext-22, HardwareLand): die Autorität, eine konkrete
     /// Geräte-Registerregion `[phys, phys+len)` in die eigene (isolierte) VSpace als
     /// EL0-Device zu mappen. Wird **nur kernelseitig** geprägt (kein User-Syscall erzeugt

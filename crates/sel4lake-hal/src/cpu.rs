@@ -36,6 +36,27 @@ pub fn mpidr_affinity() -> u64 {
     mpidr & 0xff_00ff_ffff
 }
 
+/// Den IRQ-Maskenzustand (DAIF) **sichern + IRQs maskieren**; gibt den vorherigen Zustand für
+/// [`local_irq_restore`] zurück. Für Code, der in **beiden** Kontexten läuft (IRQs an *oder* im
+/// Trap maskiert) und den Vorzustand erhalten muss, statt unbedingt freizugeben.
+pub fn local_irq_save() -> u64 {
+    let daif: u64;
+    // SAFETY: reines Lesen + Setzen des DAIF-Systemregisters (I-Bit).
+    unsafe {
+        asm!("mrs {0}, DAIF", out(reg) daif, options(nomem, nostack, preserves_flags));
+        asm!("msr daifset, #2", options(nomem, nostack, preserves_flags));
+    }
+    daif
+}
+
+/// Den von [`local_irq_save`] gesicherten DAIF-Zustand wiederherstellen.
+pub fn local_irq_restore(daif: u64) {
+    // SAFETY: schreibt nur den zuvor gelesenen DAIF-Zustand zurück.
+    unsafe {
+        asm!("msr DAIF, {0}", in(reg) daif, options(nomem, nostack, preserves_flags));
+    }
+}
+
 /// IRQs am aktuellen Kern freigeben (DAIF.I löschen).
 pub fn local_irq_enable() {
     // SAFETY: erlaubt asynchrone IRQ-Auslieferung; bewusste Low-Level-Operation.

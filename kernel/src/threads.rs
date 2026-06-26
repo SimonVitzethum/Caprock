@@ -419,6 +419,20 @@ static LOAD_OK: AtomicBool = AtomicBool::new(false);
 static LOAD_NTFN: AtomicUsize = AtomicUsize::new(usize::MAX);
 static LOAD_POLLS: AtomicU32 = AtomicU32::new(0);
 
+// Binary-Loader L2 (ext-26): Laden zur LAUFZEIT via SYS_LOAD, cap-gegatet. Ein TrustedSAS-Caller-
+// Thread haelt eine Loader-Cap (Slot 0) + eine Notification-Cap (Slot 1, Badge HELLO_BADGE) und
+// ruft invoke(SYS_LOAD, loader_slot, [hello_idx, delegate_slot, ..]) -> der Kernel laedt hello +
+// delegiert die Notification-Cap in hellos Slot 0; hello signalisiert sie. Negativfall: SYS_LOAD
+// ueber einen leeren Slot (keine Loader-Cap) -> ERR_BADCAP.
+static SYSLOAD_STARTED: AtomicBool = AtomicBool::new(false);
+static SYSLOAD_FIN: AtomicBool = AtomicBool::new(false);
+static SYSLOAD_OK: AtomicBool = AtomicBool::new(false);
+static SYSLOAD_NTFN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static SYSLOAD_POLLS: AtomicU32 = AtomicU32::new(0);
+static SYSLOAD_DONE: AtomicBool = AtomicBool::new(false); // Caller-Thread hat seine Syscalls beendet
+static SYSLOAD_RESULT: AtomicU64 = AtomicU64::new(u64::MAX); // SYS_LOAD-Ergebnis (OK erwartet)
+static SYSLOAD_NEG_OK: AtomicBool = AtomicBool::new(false); // Negativfall: ERR_BADCAP erhalten
+
 // Domänen/HW-Fuzzer (ext-22, P6): churnt über viele Epochen Hardware-/Management-Caps gegen
 // die Domänen-Policy + CDT/VSpace-Oracles + Ressourcen-Baseline. Kernpunkte: HW-Caps (MMIO/
 // IRQ) NUR in HardwareLand, PdControl NUR in TrustedSas installierbar (Negativfälle abgelehnt);
@@ -598,6 +612,50 @@ fn run_load_start() -> usize {
     })();
     hal::cpu::local_irq_enable();
     res.unwrap_or(usize::MAX)
+}
+
+/// **Binary-Loader L2 (SYS_LOAD) starten** (ext-26): einen TrustedSAS-Caller-Thread aufsetzen, der
+/// eine **Loader-Cap** (Slot 0) + eine Notification-Cap (Slot 1, Badge `HELLO_BADGE`) haelt und
+/// `hello` per `SYS_LOAD` zur Laufzeit laedt (cap-gegatet) + die Notification-Cap delegiert. Gibt
+/// die Notification-ID zum Pollen zurueck (`usize::MAX` bei Setup-Fehler). IRQ-maskiert (der Caller
+/// darf nicht vor dem PD-/Cap-Aufbau laufen).
+fn run_sysload_start() -> usize {
+    hal::cpu::local_irq_disable();
+    let res = (|| {
+        let archive = loader::read_archive()?;
+        let hello_idx = (0..archive.count())
+            .find(|&i| archive.program(i).map_or(false, |p| p.name() == "hello"))?;
+        let ntfn = system::create_notification()?;
+        let nroot = system::install_notification_cap(ntfn as u32, Rights::RW).ok()?;
+        let ncap = system::cap_mint(nroot, Rights::WRITE, HELLO_BADGE).ok()?; // Cap-Badge = HELLO_BADGE
+        let lcap = system::install_loader_cap(0, Rights::RW).ok()?; // 0 = Boot-Archiv
+        let pd = system::create_pd_in_domain(Domain::TrustedSas)?;
+        if !system::install_pd_cap(pd, 0, lcap) || !system::install_pd_cap(pd, 1, ncap) {
+            return None; // Loader-/Notification-Cap muss in TrustedSAS installierbar sein
+        }
+        let tid = system::spawn(sysload_caller as *const () as usize, hello_idx, system::IDLE_PRIO)?;
+        system::bind_pd(pd, tid);
+        Some(ntfn)
+    })();
+    hal::cpu::local_irq_enable();
+    res.unwrap_or(usize::MAX)
+}
+
+/// Caller-Thread fuer den L2-`SYS_LOAD`-Test (TrustedSAS, EL1): laedt `hello` per Syscall
+/// (cap-gegatet ueber die Loader-Cap in Slot 0, delegiert die Notification-Cap aus Slot 1 in
+/// hellos Slot 0). `arg` = hello-Archiv-Index. Danach ein Negativaufruf ueber einen leeren Slot
+/// (keine Loader-Cap) -> ERR_BADCAP. Setzt die Telemetrie + parkt.
+extern "C" fn sysload_caller(arg: usize) -> ! {
+    // x1 = Loader-Cap-Slot 0; x2 = hello-Index; x3 = Delegations-Slot 1 (Notification-Cap).
+    let r = invoke(sys::LOAD, 0, [arg as u64, 1, 0, 0], 0);
+    SYSLOAD_RESULT.store(r.result, Ordering::Relaxed);
+    // Negativ: SYS_LOAD ueber Slot 5 (leer, keine Loader-Cap) -> ERR_BADCAP.
+    let r2 = invoke(sys::LOAD, 5, [arg as u64, u64::MAX, 0, 0], 0);
+    SYSLOAD_NEG_OK.store(r2.result == result::ERR_BADCAP, Ordering::Relaxed);
+    SYSLOAD_DONE.store(true, Ordering::Release);
+    loop {
+        invoke(sys::PARK, 0, [0; 4], 0);
+    }
 }
 
 /// **Generische DMA-Infrastruktur testen** (ext-24): Richtung/Kohärenz (DmaCap-Attribute ->
@@ -3196,7 +3254,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} hwfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} sysload={} hwfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -3238,6 +3296,7 @@ pub fn demo_report_then_idle() -> ! {
                 DMAGEN_DONE.load(Ordering::Acquire) && DMAGEN_OK.load(Ordering::Acquire),
                 SASHEAP_DONE.load(Ordering::Acquire) && SASHEAP_OK.load(Ordering::Acquire),
                 LOAD_DONE.load(Ordering::Acquire) && LOAD_OK.load(Ordering::Acquire),
+                SYSLOAD_FIN.load(Ordering::Acquire) && SYSLOAD_OK.load(Ordering::Acquire),
                 HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire),
             );
         }
@@ -4388,9 +4447,36 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // Binary-Loader L2 (ext-26): cap-gegatetes Laden zur Laufzeit via SYS_LOAD. Gegate auf
+        // load (L1) fertig; danach das Caller-Ergebnis + hellos Signal pollen.
+        if !SYSLOAD_STARTED.load(Ordering::Acquire) && LOAD_DONE.load(Ordering::Acquire) {
+            let n = run_sysload_start();
+            SYSLOAD_NTFN.store(n, Ordering::Relaxed);
+            if n == usize::MAX {
+                SYSLOAD_FIN.store(true, Ordering::Release); // Setup fehlgeschlagen -> FAIL
+            }
+            SYSLOAD_STARTED.store(true, Ordering::Release);
+        }
+        if SYSLOAD_STARTED.load(Ordering::Acquire) && !SYSLOAD_FIN.load(Ordering::Acquire) {
+            let n = SYSLOAD_NTFN.load(Ordering::Relaxed);
+            // Caller fertig + SYS_LOAD OK + Negativfall ERR_BADCAP + hello signalisierte ueber die
+            // delegierte Notification-Cap.
+            if SYSLOAD_DONE.load(Ordering::Acquire)
+                && n != usize::MAX
+                && system::notification_pending(n) == HELLO_BADGE
+            {
+                let ok = SYSLOAD_RESULT.load(Ordering::Relaxed) == result::OK
+                    && SYSLOAD_NEG_OK.load(Ordering::Relaxed);
+                SYSLOAD_OK.store(ok, Ordering::Release);
+                SYSLOAD_FIN.store(true, Ordering::Release);
+            } else if SYSLOAD_POLLS.fetch_add(1, Ordering::Relaxed) > 200_000 {
+                SYSLOAD_FIN.store(true, Ordering::Release); // Timeout -> FAIL
+            }
+        }
+
         // Domänen/HW-Fuzzer (ext-22, P6): churnt HW-/Management-Caps gegen Policy + Oracles +
-        // Baseline. Gegate auf den Binary-Loader-Test (ext-26) fertig; eine Epoche je Iteration.
-        if !HWFUZZ_DONE.load(Ordering::Acquire) && LOAD_DONE.load(Ordering::Acquire) {
+        // Baseline. Gegate auf den Binary-Loader L2 (ext-26) fertig; eine Epoche je Iteration.
+        if !HWFUZZ_DONE.load(Ordering::Acquire) && SYSLOAD_FIN.load(Ordering::Acquire) {
             match HWFUZZ_STEP.load(Ordering::Acquire) {
                 0 => {
                     // Fixtures (eine PD je Domäne, ohne Threads) + Baseline schnappen.
@@ -4606,15 +4692,17 @@ fn all_done() -> bool {
     let dmagen = DMAGEN_DONE.load(Ordering::Acquire) && DMAGEN_OK.load(Ordering::Acquire);
     // Prozess-Heap (ext-25): echter Box/Vec/BTreeMap-Heap auf realen Physadressen (safe Rust).
     let sasheap = SASHEAP_DONE.load(Ordering::Acquire) && SASHEAP_OK.load(Ordering::Acquire);
-    // Binary-Loader (ext-26): extern gebautes hello geladen + lief (signalisierte HELLO_BADGE).
+    // Binary-Loader L1 (ext-26): extern gebautes hello geladen + lief (signalisierte HELLO_BADGE).
     let load = LOAD_DONE.load(Ordering::Acquire) && LOAD_OK.load(Ordering::Acquire);
+    // Binary-Loader L2 (ext-26): cap-gegatetes Laden zur Laufzeit via SYS_LOAD.
+    let sysload = SYSLOAD_FIN.load(Ordering::Acquire) && SYSLOAD_OK.load(Ordering::Acquire);
     // Domänen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Policy + Oracles + Baseline.
     let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
         && pdctl && chan && rtc && irq && dma && pcie && smmu && smmubind && virtiorng && dmagen
-        && sasheap && load && hwfuzz
+        && sasheap && load && sysload && hwfuzz
 }
 
 fn report() {
@@ -5105,6 +5193,16 @@ fn report() {
     println!(
         "load    : {} (generischer Binary-Loader: ELF64-Parse in Safe Rust, Segment-Kopie W^X, cap-gegatete PD + Endowment, EL0-Spawn -- extern gebauter Code laeuft NICHT aus dem Kernel-Image)",
         if load { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Binary-Loader L2 (ext-26): SYS_LOAD zur Laufzeit, cap-gegatet.
+    let sysload = SYSLOAD_FIN.load(Ordering::Acquire) && SYSLOAD_OK.load(Ordering::Acquire);
+    println!("sysload : SYS_LOAD result={} (OK={}) Negativ(ohne Loader-Cap -> ERR_BADCAP)={} hello-Signal={}",
+        SYSLOAD_RESULT.load(Ordering::Relaxed), result::OK, SYSLOAD_NEG_OK.load(Ordering::Relaxed),
+        if sysload { "ja" } else { "NEIN" });
+    println!(
+        "sysload : {} (Laden zur LAUFZEIT via SYS_LOAD: cap-gegatet ueber Loader-Cap, Caller delegiert eigene Notification-Cap in die neue PD; ohne Loader-Cap abgewiesen)",
+        if sysload { "ALL PASS" } else { "FAILURES" }
     );
 
     // Domänen/HW-Fuzzer (ext-22, P6).

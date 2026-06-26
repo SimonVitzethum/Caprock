@@ -1203,14 +1203,16 @@ fn copy_segment(dst_phys: u64, src: &[u8], total: usize) {
     }
 }
 
-/// Ein extern geladenes, **validiertes** ELF-Image in eine NEUE isolierte PD laden + starten
-/// (ext-26, L1c, generischer Binary-Loader). Kopiert die `PT_LOAD`-Segmente an beliebige RAM-Frames
-/// und mappt sie **W^X** an ihre Link-VAs ([`hal::mmu::vspace_map_page_at`]), legt einen Stack an,
-/// erzeugt eine PD in `domain`, endowt die `endow`-Caps (über `install_cap_checked` —
-/// Domänen-Policy + Audits bleiben gültig) und spawnt einen EL0-Thread am Entry. Gibt
-/// `(ThreadId, pd)`. Der Aufbau ab dem Spawn läuft **IRQ-maskiert**, damit der frisch lauffähige
-/// Thread NICHT startet, bevor PD-Bindung + Cap-Endowment stehen.
-pub fn load_elf(img: &ElfImage, domain: Domain, endow: &[(usize, CapPtr)]) -> Option<(ThreadId, usize)> {
+/// Ein extern geladenes, **validiertes** ELF-Image in eine **vor-erstellte** isolierte PD laden +
+/// starten (ext-26, L1c/L3, generischer Binary-Loader). Kopiert die `PT_LOAD`-Segmente an beliebige
+/// RAM-Frames und mappt sie **W^X** an ihre Link-VAs ([`hal::mmu::vspace_map_page_at`]), legt einen
+/// Stack an, endowt die `endow`-Caps (über `install_cap_checked` — Domänen-Policy + Audits bleiben
+/// gültig), spawnt einen EL0-Thread am Entry und **bindet** ihn an `pd`. Die **PD-Erzeugung**
+/// (Domäne, ggf. HardwareLand-Partner/Kanal, Autoritäts-Caps) liegt beim Aufrufer — so kann der
+/// Loader UserLand (`load_elf`) wie HardwareLand-Backends (vor-erstellt) bedienen. Der Aufbau ab
+/// dem Spawn läuft **IRQ-maskiert** (der Thread startet nicht vor Bindung + Endowment). Gibt die
+/// `ThreadId`. Bei Fehler wird `pd` NICHT abgebaut (gehört dem Aufrufer).
+pub fn load_into_pd(img: &ElfImage, pd: usize, endow: &[(usize, CapPtr)]) -> Option<ThreadId> {
     let core = hal::cpu::core_id();
     let kidx = claim_user_kstack()?;
     let kbase = core::ptr::addr_of!(__user_kstacks_bottom) as usize + kidx * USER_KSTACK_SIZE;
@@ -1277,10 +1279,6 @@ pub fn load_elf(img: &ElfImage, domain: Domain, endow: &[(usize, CapPtr)]) -> Op
     // (In-Kernel-Test) ALS AUCH im Syscall-Trap (SYS_LOAD, IRQs bereits maskiert) -- der Vorzustand
     // muss erhalten bleiben, sonst gaebe man IRQs mitten im Trap frei.
     let daif = hal::cpu::local_irq_save();
-    let Some(pd) = create_pd_in_domain(domain) else {
-        hal::cpu::local_irq_restore(daif);
-        return fail(asid, kidx);
-    };
     let tid = {
         let mut sched = SCHEDS[core].lock();
         let r = sched.spawn_user_at(
@@ -1310,6 +1308,15 @@ pub fn load_elf(img: &ElfImage, domain: Domain, endow: &[(usize, CapPtr)]) -> Op
         install_pd_cap(pd, slot, cap); // policy-geprüft (Domänen-Policy bleibt gültig)
     }
     hal::cpu::local_irq_restore(daif);
+    Some(tid)
+}
+
+/// Wie [`load_into_pd`], aber **erzeugt** eine frische PD in `domain` (UserLand). Der bequeme Pfad
+/// für UserLand-Programme (`SYS_LOAD`, In-Kernel-Tests). HardwareLand-Backends werden vom Aufrufer
+/// vor-erstellt (Partner-Bindung + Kanal) und über [`load_into_pd`] geladen. Gibt `(ThreadId, pd)`.
+pub fn load_elf(img: &ElfImage, domain: Domain, endow: &[(usize, CapPtr)]) -> Option<(ThreadId, usize)> {
+    let pd = create_pd_in_domain(domain)?;
+    let tid = load_into_pd(img, pd, endow)?;
     Some((tid, pd))
 }
 

@@ -1,7 +1,7 @@
-# ext-26 — Generischer Binary-Loader (Phasen L0–L2)
+# ext-26 — Generischer Binary-Loader (Phasen L0–L3)
 
-Status: **L0 + L1 + L2 fertig** (Boot-Delivery, ELF-Parser, externe Toolchain, EL0-Laden, cap-
-gegatetes Laden zur Laufzeit via `SYS_LOAD`). Suite grün (52 Checks). Architektur/Format:
+Status: **L0 + L1 + L2 + L3 fertig** (Boot-Delivery, ELF-Parser, externe Toolchain, EL0-Laden,
+`SYS_LOAD`, HardwareLand-Laden + Signatur-/Trust-Gate). Suite grün (53 Checks). Architektur/Format:
 [ADR 0011](../adr/0011-binary-loader.md). Plan: [ext-26-binary-loader-plan.md](ext-26-binary-loader-plan.md).
 
 ## Ziel
@@ -40,6 +40,15 @@ Sicherheitsarchitektur (Capabilities, Domänen, Region-Runtime, Audits, W^X) ble
   TrustedSAS-Caller lädt `hello` per Syscall + delegiert seine Notification-Cap (hello signalisiert
   sie); Negativfall ohne `Loader`-Cap → `ERR_BADCAP`. `hello` **beendet sich** nach dem Signal
   (vollständiger Lebenszyklus, gibt Pool-Slot zurück).
+- **L3 — HardwareLand-Laden + Signatur-/Trust-Gate.** `load_elf` aufgeteilt in `load_into_pd` (lädt
+  in eine **vor-erstellte** PD) + den `load_elf`-Wrapper (erzeugt eine UserLand-PD). HardwareLand-
+  Programme brauchen eine vor-erstellte **Backend-PD** (Partner-Bindung + Kanal `ep`/`ntfn`, via
+  `create_hardware_backend`); die Kanal-Cap-Policy bleibt gültig (ein Backend hält nur Caps seines
+  eigenen Kanals). **Trust-Gate** `verify_image`: **EL1/TrustedSAS** ist privilegierter Code in der
+  globalen SAS → extern geladen unterläuft er das SIP-Modell → **nur signiert** ladbar; bis die
+  Signaturprüfung implementiert ist (`prog.hash`-Hook, ADR 0011 §7), wird EL1-Laden **abgelehnt**
+  (`Unverified`). Test `loadhw`: `hwhello` (= hello, Domäne HardwareLand) in eine Backend-PD geladen,
+  signalisiert seinen Kanal; ein TrustedSAS-Image (`trusted-x`) wird vom Gate abgewiesen.
 
 ## Nutzer-Review-Verfeinerungen (eingebaut)
 
@@ -60,12 +69,12 @@ deadlock-frei (vorher 4/15). Siehe `docs/invariants.md` §1a.
 
 ## Verifikation
 
-`./test-qemu.sh` → **52/52 ALL PASS** (50 Bestand + `load` + `sysload`). Crate-Parser per Host-`cargo
-test` (17 Tests). Stabilität per `tools/hang-stress.sh`.
+`./test-qemu.sh` → **53/53 ALL PASS** (50 Bestand + `load` + `sysload` + `loadhw`). Crate-Parser per
+Host-`cargo test` (17 Tests). Stabilität per `tools/hang-stress.sh`.
 
 ## Offen (Folgephasen)
 
 L2-Erweiterung: Manifest-getriebenes Mehr-Cap-Endowment (derzeit ein delegierter Cap → Slot 0).
-L3 (HardwareLand + TrustedSAS/EL1 signatur-gegatet), L4 (Stop/Hot-Reload/Teardown geladener
+Signaturprüfung (derzeit EL1-Laden pauschal abgelehnt). L4 (Stop/Hot-Reload/Teardown geladener
 Segmente + VSpace), L5 (`loader_audit` + Fuzzer), L6 (Projektstruktur). Danach ext-27: aggressive
 Testdienste auf dem Loader.

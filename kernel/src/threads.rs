@@ -11,6 +11,7 @@
 
 use crate::loader;
 use crate::system;
+use sel4lake_loader::LoaderError;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use sel4lake_abi::{pdctl, result, sys, GRANT_FLAG, GRANT_RECV_SLOT};
 use sel4lake_hal::{self as hal, println, syscall::invoke};
@@ -433,6 +434,16 @@ static SYSLOAD_DONE: AtomicBool = AtomicBool::new(false); // Caller-Thread hat s
 static SYSLOAD_RESULT: AtomicU64 = AtomicU64::new(u64::MAX); // SYS_LOAD-Ergebnis (OK erwartet)
 static SYSLOAD_NEG_OK: AtomicBool = AtomicBool::new(false); // Negativfall: ERR_BADCAP erhalten
 
+// Binary-Loader L3 (ext-26): HardwareLand-Programm laden (vor-erstellte Backend-PD mit Partner-
+// Bindung + Kanal) + Signatur-/Trust-Gate. hwhello (= hello, Domaene HardwareLand) signalisiert
+// ueber seine Kanal-Notification-Cap; TrustedSAS/EL1-Image wird vom verify_image-Gate abgelehnt.
+static LOADHW_STARTED: AtomicBool = AtomicBool::new(false);
+static LOADHW_FIN: AtomicBool = AtomicBool::new(false);
+static LOADHW_OK: AtomicBool = AtomicBool::new(false);
+static LOADHW_NTFN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static LOADHW_POLLS: AtomicU32 = AtomicU32::new(0);
+static LOADTRUSTED_REJECTED: AtomicBool = AtomicBool::new(false); // EL1-Image abgelehnt (Trust-Gate)
+
 // Domänen/HW-Fuzzer (ext-22, P6): churnt über viele Epochen Hardware-/Management-Caps gegen
 // die Domänen-Policy + CDT/VSpace-Oracles + Ressourcen-Baseline. Kernpunkte: HW-Caps (MMIO/
 // IRQ) NUR in HardwareLand, PdControl NUR in TrustedSas installierbar (Negativfälle abgelehnt);
@@ -656,6 +667,45 @@ extern "C" fn sysload_caller(arg: usize) -> ! {
     loop {
         invoke(sys::PARK, 0, [0; 4], 0);
     }
+}
+
+/// **Binary-Loader L3 (HardwareLand) starten** (ext-26): eine HardwareLand-Backend-PD vor-erstellen
+/// (TrustedSAS-Partner + Kanal `ep`/`ntfn`), die Kanal-Signal-Cap (Badge `HELLO_BADGE`) in Slot 0
+/// installieren und `hwhello` (= hello, Domaene HardwareLand) **in diese PD** laden
+/// (`load_program_into_pd`). hwhello signalisiert die Kanal-Notification. Gibt die Notification-ID
+/// zum Pollen (`usize::MAX` bei Fehler). IRQ-maskiert.
+fn run_loadhw_start() -> usize {
+    hal::cpu::local_irq_disable();
+    let res = (|| {
+        let archive = loader::read_archive()?;
+        let hw = archive.iter().find(|p| p.name() == "hwhello")?;
+        let partner = system::create_pd_in_domain(Domain::TrustedSas)?;
+        let (hpd, _ep, ntfn) = system::create_hardware_backend(partner, 0x26)?;
+        // Kanal-Signal-Cap (Badge HELLO_BADGE) in hpd Slot 0 -- install_cap_checked erlaubt fuer ein
+        // HardwareLand-Backend NUR Caps des EIGENEN Kanals (Policy bleibt gueltig).
+        let nroot = system::install_notification_cap(ntfn as u32, Rights::RW).ok()?;
+        let scap = system::cap_mint(nroot, Rights::WRITE, HELLO_BADGE).ok()?;
+        if !system::install_pd_cap(hpd, 0, scap) {
+            return None;
+        }
+        loader::load_program_into_pd(&hw, hpd, &[]).ok()?;
+        Some(ntfn)
+    })();
+    hal::cpu::local_irq_enable();
+    res.unwrap_or(usize::MAX)
+}
+
+/// **Signatur-/Trust-Gate pruefen** (ext-26, L3): ein als TrustedSAS (Domaene 0, EL1) deklariertes
+/// Image MUSS vom Loader abgelehnt werden (privilegierter Code -> nur signiert; Signatur noch nicht
+/// implementiert). `true`, wenn `load_image` es mit `Unverified` zurueckweist.
+fn check_loadtrusted() -> bool {
+    let Some(archive) = loader::read_archive() else {
+        return false;
+    };
+    let Some(tp) = archive.iter().find(|p| p.name() == "trusted-x") else {
+        return false;
+    };
+    matches!(loader::load_image(&tp, &[]), Err(LoaderError::Unverified))
 }
 
 /// **Generische DMA-Infrastruktur testen** (ext-24): Richtung/Kohärenz (DmaCap-Attribute ->
@@ -3254,7 +3304,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} sysload={} hwfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} sysload={} loadhw={} hwfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -3297,6 +3347,7 @@ pub fn demo_report_then_idle() -> ! {
                 SASHEAP_DONE.load(Ordering::Acquire) && SASHEAP_OK.load(Ordering::Acquire),
                 LOAD_DONE.load(Ordering::Acquire) && LOAD_OK.load(Ordering::Acquire),
                 SYSLOAD_FIN.load(Ordering::Acquire) && SYSLOAD_OK.load(Ordering::Acquire),
+                LOADHW_FIN.load(Ordering::Acquire) && LOADHW_OK.load(Ordering::Acquire),
                 HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire),
             );
         }
@@ -4474,9 +4525,31 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
+        // Binary-Loader L3 (ext-26): HardwareLand-Programm laden (Backend+Partner+Kanal) +
+        // Signatur-/Trust-Gate (TrustedSAS/EL1 abgelehnt). Gegate auf sysload (L2) fertig.
+        if !LOADHW_STARTED.load(Ordering::Acquire) && SYSLOAD_FIN.load(Ordering::Acquire) {
+            LOADTRUSTED_REJECTED.store(check_loadtrusted(), Ordering::Relaxed); // EL1 abgelehnt?
+            let n = run_loadhw_start();
+            LOADHW_NTFN.store(n, Ordering::Relaxed);
+            if n == usize::MAX {
+                LOADHW_FIN.store(true, Ordering::Release); // Setup fehlgeschlagen -> FAIL
+            }
+            LOADHW_STARTED.store(true, Ordering::Release);
+        }
+        if LOADHW_STARTED.load(Ordering::Acquire) && !LOADHW_FIN.load(Ordering::Acquire) {
+            let n = LOADHW_NTFN.load(Ordering::Relaxed);
+            if n != usize::MAX && system::notification_pending(n) == HELLO_BADGE {
+                // HardwareLand-Programm signalisierte seinen Kanal UND das Trust-Gate wies EL1 ab.
+                LOADHW_OK.store(LOADTRUSTED_REJECTED.load(Ordering::Relaxed), Ordering::Release);
+                LOADHW_FIN.store(true, Ordering::Release);
+            } else if LOADHW_POLLS.fetch_add(1, Ordering::Relaxed) > 200_000 {
+                LOADHW_FIN.store(true, Ordering::Release); // Timeout -> FAIL
+            }
+        }
+
         // Domänen/HW-Fuzzer (ext-22, P6): churnt HW-/Management-Caps gegen Policy + Oracles +
-        // Baseline. Gegate auf den Binary-Loader L2 (ext-26) fertig; eine Epoche je Iteration.
-        if !HWFUZZ_DONE.load(Ordering::Acquire) && SYSLOAD_FIN.load(Ordering::Acquire) {
+        // Baseline. Gegate auf den Binary-Loader L3 (ext-26) fertig; eine Epoche je Iteration.
+        if !HWFUZZ_DONE.load(Ordering::Acquire) && LOADHW_FIN.load(Ordering::Acquire) {
             match HWFUZZ_STEP.load(Ordering::Acquire) {
                 0 => {
                     // Fixtures (eine PD je Domäne, ohne Threads) + Baseline schnappen.
@@ -4696,13 +4769,15 @@ fn all_done() -> bool {
     let load = LOAD_DONE.load(Ordering::Acquire) && LOAD_OK.load(Ordering::Acquire);
     // Binary-Loader L2 (ext-26): cap-gegatetes Laden zur Laufzeit via SYS_LOAD.
     let sysload = SYSLOAD_FIN.load(Ordering::Acquire) && SYSLOAD_OK.load(Ordering::Acquire);
+    // Binary-Loader L3 (ext-26): HardwareLand-Laden + TrustedSAS/EL1-Trust-Gate.
+    let loadhw = LOADHW_FIN.load(Ordering::Acquire) && LOADHW_OK.load(Ordering::Acquire);
     // Domänen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Policy + Oracles + Baseline.
     let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
         && pdctl && chan && rtc && irq && dma && pcie && smmu && smmubind && virtiorng && dmagen
-        && sasheap && load && sysload && hwfuzz
+        && sasheap && load && sysload && loadhw && hwfuzz
 }
 
 fn report() {
@@ -5203,6 +5278,17 @@ fn report() {
     println!(
         "sysload : {} (Laden zur LAUFZEIT via SYS_LOAD: cap-gegatet ueber Loader-Cap, Caller delegiert eigene Notification-Cap in die neue PD; ohne Loader-Cap abgewiesen)",
         if sysload { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Binary-Loader L3 (ext-26): HardwareLand laden + TrustedSAS/EL1-Trust-Gate.
+    let loadhw = LOADHW_FIN.load(Ordering::Acquire) && LOADHW_OK.load(Ordering::Acquire);
+    println!("loadhw  : HardwareLand-Programm in vor-erstellte Backend-PD geladen (Partner+Kanal) -> Kanal-Signal={} ; TrustedSAS/EL1-Image abgelehnt(Trust-Gate)={}",
+        if LOADHW_NTFN.load(Ordering::Relaxed) != usize::MAX
+            && system::notification_pending(LOADHW_NTFN.load(Ordering::Relaxed)) == HELLO_BADGE { "ja" } else { "NEIN" },
+        LOADTRUSTED_REJECTED.load(Ordering::Relaxed));
+    println!(
+        "loadhw  : {} (HardwareLand-Laden: Backend-PD mit Partner-Bindung+Kanal, Kanal-Cap-Policy gilt; EL1/TrustedSAS nur signiert ladbar -> ohne Signatur abgelehnt)",
+        if loadhw { "ALL PASS" } else { "FAILURES" }
     );
 
     // Domänen/HW-Fuzzer (ext-22, P6).

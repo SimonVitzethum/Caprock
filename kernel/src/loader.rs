@@ -11,7 +11,7 @@ use sel4lake_cap::CapPtr;
 use sel4lake_hal::{print, println};
 use sel4lake_loader::archive::Archive;
 use sel4lake_loader::elf::ElfImage;
-use sel4lake_loader::{LoaderError, Program, DOMAIN_HARDWARE, DOMAIN_USERLAND};
+use sel4lake_loader::{LoaderError, Program, DOMAIN_TRUSTED, DOMAIN_USERLAND};
 use sel4lake_microkit::Domain;
 use sel4lake_sched::ThreadId;
 
@@ -60,13 +60,43 @@ pub fn probe() {
 /// L1: nur **isolierte EL0-Domänen** (UserLand/HardwareLand). TrustedSAS (EL1) ist signatur-gegatet
 /// (L3) und wird hier abgelehnt (`UnsupportedDomain`).
 pub fn load_image(prog: &Program, endow: &[(usize, CapPtr)]) -> Result<(ThreadId, usize), LoaderError> {
+    if !verify_image(prog) {
+        return Err(LoaderError::Unverified); // EL1/TrustedSAS ohne Signatur -> abgelehnt
+    }
     let domain = match prog.domain {
         DOMAIN_USERLAND => Domain::UserLand,
-        DOMAIN_HARDWARE => Domain::HardwareLand,
-        _ => return Err(LoaderError::UnsupportedDomain), // TrustedSAS/EL1: erst mit Signatur (L3)
+        // HardwareLand braucht eine vor-erstellte Backend-PD (Partner-Bindung + Kanal) ->
+        // ueber `load_program_into_pd`, NICHT hier (eine bare HardwareLand-PD bricht domain_audit).
+        _ => return Err(LoaderError::UnsupportedDomain),
     };
     let img = ElfImage::parse(prog.elf)?; // Safe-Rust-Validierung; unsafe erst im Kopier-Glue
     crate::system::load_elf(&img, domain, endow).ok_or(LoaderError::NoResources)
+}
+
+/// Ein Programm in eine **vor-erstellte** PD laden (ext-26, L3) — fuer HardwareLand-Backends
+/// (Partner-Bindung + Kanal vom Aufrufer aufgesetzt) und kuenftige spezialisierte PDs. Die
+/// Domaenen-Policy traegt die PD selbst (`install_cap_checked` + `domain_audit`). Trust-Gate
+/// ([`verify_image`]) gilt auch hier.
+pub fn load_program_into_pd(
+    prog: &Program,
+    pd: usize,
+    endow: &[(usize, CapPtr)],
+) -> Result<ThreadId, LoaderError> {
+    if !verify_image(prog) {
+        return Err(LoaderError::Unverified);
+    }
+    let img = ElfImage::parse(prog.elf)?;
+    crate::system::load_into_pd(&img, pd, endow).ok_or(LoaderError::NoResources)
+}
+
+/// **Trust-/Signatur-Gate** (ADR 0011 §7): darf dieses Image geladen werden? **EL1/TrustedSAS** ist
+/// privilegierter Code in der globalen SAS — extern geladen unterlaeuft er das SIP-Modell und ist
+/// daher **nur signiert** ladbar. Die Signaturpruefung ist noch nicht implementiert; bis dahin wird
+/// EL1-Laden **abgelehnt** (`prog.hash` ist der vorbereitete Hook). **EL0** (UserLand/HardwareLand)
+/// ist hardware-isoliert (ein fehlerhaftes/boesartiges Image faultet nur sich selbst) -> ohne
+/// Signatur ladbar.
+fn verify_image(prog: &Program) -> bool {
+    prog.domain != DOMAIN_TRUSTED
 }
 
 /// `SYS_LOAD`-Callback (ext-26, L2): das Programm mit Index `index` aus dem Boot-Archiv laden +

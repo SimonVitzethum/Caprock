@@ -40,8 +40,12 @@ pub enum LoaderError {
     /// Ungültiges/nicht unterstütztes ELF-Image (Magic/Klasse/Maschine/Typ falsch, `memsz<filesz`,
     /// unerwartete Program-Header-Größe).
     BadElf,
-    /// Domäne (noch) nicht ladbar (z. B. TrustedSAS/EL1 ohne Signaturprüfung, L3).
+    /// Domäne (noch) nicht über diesen Pfad ladbar (z. B. HardwareLand braucht eine vor-erstellte
+    /// Backend-PD; TrustedSAS/EL1 ist signatur-gegatet).
     UnsupportedDomain,
+    /// Image nicht verifiziert: privilegierter (EL1/TrustedSAS) Code ohne gültige Signatur
+    /// (ADR 0011 §7; Signaturprüfung noch nicht implementiert → EL1-Laden abgelehnt).
+    Unverified,
     /// Kernel-Ressourcen erschöpft (VSpace/ASID/RAM/TCB/PD) beim Laden.
     NoResources,
 }

@@ -24,7 +24,7 @@ mkdir -p build
 HELLO="programs/build/target/aarch64-sel4lake-user/release/hello.elf"
 printf 'PLACEHOLDER' > build/_probe.bin
 python3 tools/mkarchive.py build/boot-archive.bin \
-    10:hello:2:1:"$HELLO" 2:probe:2:1:build/_probe.bin >/dev/null 2>&1 || { echo "ARCHIVE FAILED"; exit 1; }
+    10:hello:2:1:"$HELLO" 11:hwhello:1:1:"$HELLO" 12:trusted-x:0:1:"$HELLO" 2:probe:2:1:build/_probe.bin >/dev/null 2>&1 || { echo "ARCHIVE FAILED"; exit 1; }
 
 echo "== stress: $N Laeufe (Timeout ${TMO}s je Lauf) =="
 ok=0; hang=0

@@ -32,9 +32,11 @@ mkdir -p build
     || { echo "PROGRAMS BUILD FAILED"; exit 1; }
 HELLO="programs/build/target/aarch64-sel4lake-user/release/hello.elf"
 printf 'PLACEHOLDER' > build/_probe.bin
+# hello=UserLand(2), hwhello=HardwareLand(1) (gleiches ELF, L3), trusted-x=TrustedSAS(0, vom
+# Signatur-/Trust-Gate abzulehnen), probe=Platzhalter (Multi-Modul-Liste).
 python3 tools/mkarchive.py build/boot-archive.bin \
-    10:hello:2:1:"$HELLO" 2:probe:2:1:build/_probe.bin >/dev/null 2>&1 \
-    || { echo "ARCHIVE BUILD FAILED"; exit 1; }
+    10:hello:2:1:"$HELLO" 11:hwhello:1:1:"$HELLO" 12:trusted-x:0:1:"$HELLO" 2:probe:2:1:build/_probe.bin \
+    >/dev/null 2>&1 || { echo "ARCHIVE BUILD FAILED"; exit 1; }
 
 echo "== boot ($SECONDS_RUN s) =="
 # ext-23: SMMUv3 (IOMMU) + virtio-rng-pci HINTER einem pcie-root-port (StreamID = PCI-RID).
@@ -55,7 +57,7 @@ check() { if echo "$OUT" | grep -q "$1"; then echo "  PASS: $2"; else echo "  FA
 
 check "M=1 C=1 I=1" "MMU + Caches aktiv"
 check "dtb     : ALL PASS" "DTB-Parsing (RAM-Größe aus dem Device Tree)"
-check "archive : 2 Modul" "ext-26 L0: Boot-Archiv extern geladen + vom Kernel-Parser gelesen (reserviertes RAM-Fenster, sel4lake-loader)"
+check "archive : 4 Modul" "ext-26 L0: Boot-Archiv extern geladen + vom Kernel-Parser gelesen (reserviertes RAM-Fenster, sel4lake-loader)"
 check "memtest : ALL PASS" "Speichermodell-Selbsttest (alloc/split/transfer/free)"
 check "captest : ALL PASS" "Capability-Selbsttest (copy/mint/move/delete/revoke)"
 check "sched   : ALL PASS" "Scheduler (Preemption auf core 0 + alle Kerne ticken)"
@@ -103,6 +105,7 @@ check "dmagen  : ALL PASS" "Generische DMA-Infra (ext-24): Richtung/Kohaerenz al
 check "sasheap : ALL PASS" "Prozess-Heap (ext-25): echter Box/Vec/BTreeMap-Heap auf realen Physadressen; Hybrid-Allokator (Slabs+Bump) ueber Regionsliste + grow/shrink; Testcode 100% safe, unsafe nur in der Region-Runtime"
 check "load    : ALL PASS" "Binary-Loader (ext-26): extern gebautes EL0-Programm aus dem Boot-Archiv geladen + ausgefuehrt (ELF64-Parse in Safe Rust, Segment-Kopie W^X an Link-VA, cap-gegatete isolierte PD + Endowment) -- Prozess NICHT im Kernel-Image"
 check "sysload : ALL PASS" "Binary-Loader L2 (ext-26): Laden zur LAUFZEIT via SYS_LOAD-Syscall, cap-gegatet ueber Loader-Cap; Caller delegiert eigene Notification-Cap in die neue PD; ohne Loader-Cap -> ERR_BADCAP"
+check "loadhw  : ALL PASS" "Binary-Loader L3 (ext-26): HardwareLand-Programm in vor-erstellte Backend-PD (Partner-Bindung+Kanal) geladen, signalisiert seinen Kanal; Signatur-/Trust-Gate lehnt TrustedSAS/EL1-Image ab"
 check "hwfuzz  : ALL PASS" "Domaenen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Domaenen-Policy + CDT/VSpace-Oracle + Ressourcen-Baseline"
 online=$(echo "$OUT" | grep -c "online")
 [ "$online" -eq "$CORES" ] && echo "  PASS: alle $CORES Kerne online" || { echo "  FAIL: nur $online/$CORES Kerne online"; fail=1; }

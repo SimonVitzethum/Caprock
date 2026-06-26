@@ -1862,46 +1862,12 @@ pub fn dma_sg_validate(stream_id: u32, entries: &[DmaSgEntry]) -> bool {
     })
 }
 
-/// **DMA-Pool** (ext-24): ein einfacher Bump-Sub-Allokator über eine angehängte DMA-Region. Für
-/// Backends, die viele kleine Puffer aus einer Region schneiden (Deskriptor-Ringe, mbufs). Jeder
-/// Sub-Puffer ist ein `DmaHandle` **innerhalb** der Eltern-Region — also bereits SMMU-gemappt und
-/// Level-1-validierbar. Geräteunabhängig.
-#[derive(Clone, Copy)]
-pub struct DmaPool {
-    base: u64,
-    end: u64,
-    next: u64,
-}
-
-impl DmaPool {
-    /// Einen Pool über die per `handle` referenzierte Region anlegen.
-    pub fn new(handle: DmaHandle) -> Self {
-        Self {
-            base: handle.iova,
-            end: handle.iova + handle.len,
-            next: handle.iova,
-        }
-    }
-    /// `len` Bytes (ausgerichtet auf `align`) aus dem Pool schneiden. `None` bei Erschöpfung.
-    pub fn alloc(&mut self, len: u64, align: u64) -> Option<DmaHandle> {
-        let a = align.max(1);
-        let start = (self.next + a - 1) & !(a - 1);
-        if len > 0 && start + len <= self.end {
-            self.next = start + len;
-            Some(DmaHandle { iova: start, len })
-        } else {
-            None
-        }
-    }
-    /// Den Pool zurücksetzen (alle Sub-Puffer verwerfen).
-    pub fn reset(&mut self) {
-        self.next = self.base;
-    }
-    /// Verbleibende freie Bytes.
-    pub fn remaining(&self) -> u64 {
-        self.end.saturating_sub(self.next)
-    }
-}
+// DmaPool (ext-24, ein Bump-Sub-Allokator über einen DmaHandle) wurde in der Konsolidierung K2
+// entfernt: ein DMA-Sub-Puffer ist nur ein Teilbereich `[handle.iova + offset, +len)` einer
+// angehängten Region; seine Disjunktheit/Bounds trägt bereits der kanonische Scatter-Gather-/
+// Containment-Pfad ([`DmaSgEntry`] + [`dma_sg_validate`] -> [`region_contains`]). Ein Backend, das
+// viele kleine Puffer schneidet, führt einen trivialen Offset-Cursor selbst — kein eigener
+// öffentlicher Allokatortyp nötig (er duplizierte die Bump-Logik der Region-Runtime/SG).
 
 /// **Kanonisches Region-Containment** (Konsolidierung K4): liegt `[addr, addr+len)` VOLLSTÄNDIG in
 /// `[base, base+rlen)`? Die **eine** Grundlage aller DMA-Bounds-Prüfungen — Level-1-Software-

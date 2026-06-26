@@ -382,13 +382,13 @@ static VRNG_OK: AtomicBool = AtomicBool::new(false);
 // Generische DMA-Infrastruktur (ext-24): Richtung/Kohaerenz (DmaCap-Attribute -> richtungs-
 // minimale SMMU-AP + kohaerenz-spezifische Attribute, strukturell geprueft), Multi-Region-
 // Kontext (mehrere DmaCaps je StreamID in EINER Stage-1-Tabelle), Stream-Gruppen (mehrere
-// StreamIDs je Kontext), Scatter-Gather-Validierung (Level 1), DmaPool (Sub-Allokation).
+// StreamIDs je Kontext), Scatter-Gather-Validierung (Level 1), disjunkte Sub-Puffer (SG-Pfad).
 static DMAGEN_MULTIREGION: AtomicBool = AtomicBool::new(false); // 3 Regionen in 1 Kontext
 static DMAGEN_DIR: AtomicBool = AtomicBool::new(false); // DeviceRead-Leaf RO, DeviceWrite-Leaf RW
 static DMAGEN_COH: AtomicBool = AtomicBool::new(false); // Coherent-Leaf cacheable, NonCoherent NC
 static DMAGEN_GROUP: AtomicBool = AtomicBool::new(false); // 2 StreamIDs teilen den Kontext
 static DMAGEN_SG: AtomicBool = AtomicBool::new(false); // SG-Liste valide + Out-of-Window abgewiesen
-static DMAGEN_POOL: AtomicBool = AtomicBool::new(false); // DmaPool: disjunkte Sub-Puffer + Erschoepfung
+static DMAGEN_POOL: AtomicBool = AtomicBool::new(false); // disjunkte DMA-Sub-Puffer (SG-Pfad) + Erschoepfung
 static DMAGEN_BALANCED: AtomicBool = AtomicBool::new(false); // total_free nach Teardown = Baseline
 static DMAGEN_DONE: AtomicBool = AtomicBool::new(false);
 static DMAGEN_OK: AtomicBool = AtomicBool::new(false);
@@ -570,7 +570,7 @@ fn hwfuzz_epoch(tpd: usize, hpd: usize, upd: usize, base_obj: usize, base_free: 
 
 /// **Generische DMA-Infrastruktur testen** (ext-24): Richtung/Kohärenz (DmaCap-Attribute ->
 /// richtungsminimales SMMU-AP + kohärenz-spezifische Attribute, strukturell zurückgelesen),
-/// Multi-Region-Kontext, Stream-Gruppen, Scatter-Gather-Validierung, DmaPool. Synchron (IRQs
+/// Multi-Region-Kontext, Stream-Gruppen, Scatter-Gather-Validierung, disjunkte Sub-Puffer. Synchron (IRQs
 /// aus für die saubere total_free-Messung). Gibt `true` bei Erfolg + setzt die Telemetrie.
 fn run_dmagen() -> bool {
     let (sid, sid2) = (0x40u32, 0x41u32);
@@ -618,12 +618,17 @@ fn run_dmagen() -> bool {
     ];
     let sg_bad = [system::DmaSgEntry { handle: h1, offset: 0x800, len: 0x1000 }];
     let sg = system::dma_sg_validate(sid, &sg_good) && !system::dma_sg_validate(sid, &sg_bad);
-    // DmaPool: disjunkte Sub-Puffer + Erschöpfung.
-    let mut pool = system::DmaPool::new(h3);
-    let pool_ok = match (pool.alloc(0x100, 0x40), pool.alloc(0x100, 0x40)) {
-        (Some(a), Some(b)) => a.iova + 0x100 <= b.iova && pool.alloc(0x10000, 1).is_none(),
-        _ => false,
-    };
+    // Disjunkte DMA-Sub-Puffer (Konsolidierung K2: ohne DmaPool): zwei Teilbereiche der
+    // angehängten Region h3 per Offset; Disjunktheit + Bounds trägt der kanonische SG-/
+    // Containment-Pfad. Erschöpfung = ein Sub-Puffer größer als die Region wird abgewiesen.
+    let sub_a = system::DmaSgEntry { handle: h3, offset: 0x0, len: 0x100 };
+    let sub_b = system::DmaSgEntry { handle: h3, offset: 0x100, len: 0x100 };
+    let pool_ok = sub_a.offset + sub_a.len <= sub_b.offset // disjunkt
+        && system::dma_sg_validate(sid, &[sub_a, sub_b]) // beide in-window
+        && !system::dma_sg_validate(
+            sid,
+            &[system::DmaSgEntry { handle: h3, offset: 0, len: 0x10000 }],
+        ); // Erschöpfung: größer als die Region -> abgewiesen
     let audit = system::dma_audit() == 0 && system::vspace_audit() == 0;
     // Teardown: alle Regionen lösen -> Kontext abgebaut (Stage-1/CD frei). Danach Caps löschen.
     system::dma_detach(sid, h1);
@@ -4316,7 +4321,7 @@ pub fn demo_report_then_idle() -> ! {
         }
 
         // Generische DMA-Infrastruktur (ext-24): Richtung/Kohärenz (strukturell), Multi-Region-
-        // Kontext, Stream-Gruppen, Scatter-Gather-Validierung, DmaPool. Synchron, ein Schritt.
+        // Kontext, Stream-Gruppen, Scatter-Gather-Validierung, disjunkte Sub-Puffer. Synchron, ein Schritt.
         // Gegate auf virtiorng (ext-23) fertig (SMMU initialisiert).
         if !DMAGEN_DONE.load(Ordering::Acquire) && VRNG_DONE.load(Ordering::Acquire) {
             DMAGEN_OK.store(run_dmagen(), Ordering::Release);
@@ -5017,13 +5022,13 @@ fn report() {
 
     // Generische DMA-Infrastruktur (ext-24).
     let dmagen = DMAGEN_DONE.load(Ordering::Acquire) && DMAGEN_OK.load(Ordering::Acquire);
-    println!("dmagen  : Multi-Region(3-in-1-Kontext)={} Richtung(Read=RO/Write=RW)={} Kohaerenz(WB/NC)={} Stream-Gruppe(2 SIDs)={} Scatter-Gather={} DmaPool={} balanciert={}",
+    println!("dmagen  : Multi-Region(3-in-1-Kontext)={} Richtung(Read=RO/Write=RW)={} Kohaerenz(WB/NC)={} Stream-Gruppe(2 SIDs)={} Scatter-Gather={} Sub-Puffer={} balanciert={}",
         DMAGEN_MULTIREGION.load(Ordering::Acquire), DMAGEN_DIR.load(Ordering::Acquire),
         DMAGEN_COH.load(Ordering::Acquire), DMAGEN_GROUP.load(Ordering::Acquire),
         DMAGEN_SG.load(Ordering::Acquire), DMAGEN_POOL.load(Ordering::Acquire),
         DMAGEN_BALANCED.load(Ordering::Acquire));
     println!(
-        "dmagen  : {} (generische DMA-Infra: Richtung/Kohaerenz als DmaCap-Attribute, Multi-Region-Kontext, Stream-Gruppen, SG-Validierung, DmaPool — baut auf DmaCap/DmaEnforcer auf)",
+        "dmagen  : {} (generische DMA-Infra: Richtung/Kohaerenz als DmaCap-Attribute, Multi-Region-Kontext, Stream-Gruppen, SG-Validierung, disjunkte Sub-Puffer ueber den SG-Pfad — baut auf DmaCap/DmaEnforcer auf)",
         if dmagen { "ALL PASS" } else { "FAILURES" }
     );
 

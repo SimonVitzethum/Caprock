@@ -9,7 +9,7 @@
 [workspace]
 resolver = "2"
 # Dienste nach Domaene gegliedert (userland/hardware/trusted), 2 je Domaene.
-members = ["services/userland/aggressor"]
+members = ["services/userland/aggressor", "services/userland/intruder"]
 
 [workspace.package]
 edition = "2021"

@@ -1,0 +1,17 @@
+# `intruder-u` — adversarialer UserLand-Testdienst (ext-27 T1, ADR 0012).
+# Speicher-Isolations-Angriff: beweist, dass ein extern geladener UserLand-EL0-Prozess KEINEN
+# Kernel-/Fremdspeicher lesen kann -- jeder Versuch faultet (hardware-erzwungene Adressraumtrennung),
+# der Kernel terminiert den Angreifer und laeuft weiter. Signalisiert ein PRE-Badge VOR dem fatalen
+# Zugriff (der Thread wird danach terminiert).
+[package]
+name = "intruder-u"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "intruder-u"
+path = "src/main.rs"
+
+[dependencies]
+libsel4lake = { path = "../../../../programs/libsel4lake" }

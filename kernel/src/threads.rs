@@ -469,6 +469,18 @@ static AGGRU_POLLS: AtomicU32 = AtomicU32::new(0);
 /// Erfolgs-Badge "AGRU" — aggressor-u signalisiert es nur bei vollstaendig abgewiesener Batterie.
 const AGGRU_SUCCESS: u64 = 0x4147_5255;
 
+// ext-27 T1: INTRU = UserLand-Intruder (Speicher-Isolation). Liest aus EL0 Kernel-RAM -> Fault ->
+// Thread terminiert, Kernel laeuft weiter. Der Dienst meldet PRE VOR dem fatalen Zugriff; der Test
+// beobachtet PRE + el0_fault_count++ (relativ zur Baseline beim Start) + Audits sauber.
+static INTRU_STARTED: AtomicBool = AtomicBool::new(false);
+static INTRU_DONE: AtomicBool = AtomicBool::new(false);
+static INTRU_OK: AtomicBool = AtomicBool::new(false);
+static INTRU_NTFN: AtomicUsize = AtomicUsize::new(usize::MAX);
+static INTRU_POLLS: AtomicU32 = AtomicU32::new(0);
+static INTRU_FAULT_BASE: AtomicUsize = AtomicUsize::new(usize::MAX); // el0_fault_count beim Start
+/// PRE-Badge "INTR" — intruder-u signalisiert es VOR dem fatalen Kernel-RAM-Zugriff.
+const INTRU_PRE: u64 = 0x494E_5452;
+
 // Domänen/HW-Fuzzer (ext-22, P6): churnt über viele Epochen Hardware-/Management-Caps gegen
 // die Domänen-Policy + CDT/VSpace-Oracles + Ressourcen-Baseline. Kernpunkte: HW-Caps (MMIO/
 // IRQ) NUR in HardwareLand, PdControl NUR in TrustedSas installierbar (Negativfälle abgelehnt);
@@ -848,15 +860,34 @@ fn run_aggru_start() -> usize {
     res.unwrap_or(usize::MAX)
 }
 
-/// **ext-27 T0 — Verdikt des UserLand-Aggressors.** `true`, wenn der Dienst sein SUCCESS-Badge
-/// signalisiert hat (alle Angriffe wurden korrekt abgewiesen) UND alle Sicherheits-Audits nach dem
-/// Onslaught sauber sind (kein Korruptions-/Policy-/Leak-Effekt durch die Angriffe).
-fn aggru_audits_ok() -> bool {
+/// **ext-27 — Sicherheits-Audits nach einem Angriffs-Onslaught.** Gemeinsam von allen ext-27-Tests
+/// genutzt: nach jeder Attacke MUSS jedes Sicherheits-Oracle sauber sein (kein Korruptions-/Policy-/
+/// Leak-Effekt durch die Angriffe eines extern geladenen Dienstes).
+fn ext27_audits_ok() -> bool {
     system::domain_audit() == 0
         && system::vspace_audit() == 0
         && system::cap_audit_cdt() == 0
         && system::loader_audit() == 0
         && system::ipc_audit() == 0
+}
+
+/// **ext-27 T1 — UserLand-Intruder starten.** Den extern gebauten Dienst `intruder-u` (Domaene
+/// UserLand) laden und mit Slot 0 = Report-Notification (gemintet WRITE-only, Badge [`INTRU_PRE`])
+/// endowen. Der Dienst signalisiert PRE, liest dann Kernel-RAM aus EL0 -> Translation-Fault ->
+/// terminiert. Gibt die Notification-ID zum Pollen (`usize::MAX` bei Setup-Fehler). IRQ-maskiert.
+fn run_intru_start() -> usize {
+    hal::cpu::local_irq_disable();
+    let res = (|| {
+        let archive = loader::read_archive()?;
+        let svc = archive.iter().find(|p| p.name() == "intruder-u")?;
+        let ntfn = system::create_notification()?;
+        let root = system::install_notification_cap(ntfn as u32, Rights::RW).ok()?;
+        let wcap = system::cap_mint(root, Rights::WRITE, INTRU_PRE).ok()?;
+        loader::load_image(&svc, &[(0, wcap)]).ok()?;
+        Some(ntfn)
+    })();
+    hal::cpu::local_irq_enable();
+    res.unwrap_or(usize::MAX)
 }
 
 /// **Generische DMA-Infrastruktur testen** (ext-24): Richtung/Kohärenz (DmaCap-Attribute ->
@@ -3455,7 +3486,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} sysload={} loadhw={} loadstop={} loaderfuzz={} aggru={} hwfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} sysload={} loadhw={} loadstop={} loaderfuzz={} aggru={} intru={} hwfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -3502,6 +3533,7 @@ pub fn demo_report_then_idle() -> ! {
                 LOADSTOP_DONE.load(Ordering::Acquire) && LOADSTOP_OK.load(Ordering::Acquire),
                 LOADERFUZZ_DONE.load(Ordering::Acquire) && LOADERFUZZ_OK.load(Ordering::Acquire),
                 AGGRU_DONE.load(Ordering::Acquire) && AGGRU_OK.load(Ordering::Acquire),
+                INTRU_DONE.load(Ordering::Acquire) && INTRU_OK.load(Ordering::Acquire),
                 HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire),
             );
         }
@@ -4729,16 +4761,43 @@ pub fn demo_report_then_idle() -> ! {
         if AGGRU_STARTED.load(Ordering::Acquire) && !AGGRU_DONE.load(Ordering::Acquire) {
             let n = AGGRU_NTFN.load(Ordering::Relaxed);
             if n != usize::MAX && system::notification_pending(n) == AGGRU_SUCCESS {
-                AGGRU_OK.store(aggru_audits_ok(), Ordering::Release);
+                AGGRU_OK.store(ext27_audits_ok(), Ordering::Release);
                 AGGRU_DONE.store(true, Ordering::Release);
             } else if AGGRU_POLLS.fetch_add(1, Ordering::Relaxed) > 200_000 {
                 AGGRU_DONE.store(true, Ordering::Release); // Timeout -> FAIL (Angriff durchgelassen?)
             }
         }
 
+        // ext-27 T1: UserLand-Intruder (Speicher-Isolation). Start gegate auf aggru fertig; die
+        // el0_fault_count-Baseline VOR dem Laden schnappen. Dann auf PRE-Badge + Fault-Inkrement
+        // pollen. Der Dienst terminiert per Fault (kein destroy_loaded; Reap gibt Kstack/VSpace frei).
+        if !INTRU_STARTED.load(Ordering::Acquire) && AGGRU_DONE.load(Ordering::Acquire) {
+            INTRU_FAULT_BASE.store(system::el0_fault_count(), Ordering::Relaxed);
+            let n = run_intru_start();
+            INTRU_NTFN.store(n, Ordering::Relaxed);
+            if n == usize::MAX {
+                INTRU_DONE.store(true, Ordering::Release); // Setup fehlgeschlagen -> FAIL
+            }
+            INTRU_STARTED.store(true, Ordering::Release);
+        }
+        if INTRU_STARTED.load(Ordering::Acquire) && !INTRU_DONE.load(Ordering::Acquire) {
+            let n = INTRU_NTFN.load(Ordering::Relaxed);
+            let base = INTRU_FAULT_BASE.load(Ordering::Relaxed);
+            let pre = n != usize::MAX && system::notification_pending(n) == INTRU_PRE;
+            let faulted = base != usize::MAX && system::el0_fault_count() > base;
+            if pre && faulted {
+                // PRE erhalten (Dienst lief) UND er faultete beim Kernel-RAM-Zugriff (Isolation
+                // hielt). Audits sauber -> der Angriff hatte keinen Korruptions-/Leak-Effekt.
+                INTRU_OK.store(ext27_audits_ok(), Ordering::Release);
+                INTRU_DONE.store(true, Ordering::Release);
+            } else if INTRU_POLLS.fetch_add(1, Ordering::Relaxed) > 200_000 {
+                INTRU_DONE.store(true, Ordering::Release); // Timeout -> FAIL
+            }
+        }
+
         // Domänen/HW-Fuzzer (ext-22, P6): churnt HW-/Management-Caps gegen Policy + Oracles +
         // Baseline. Gegate auf den letzten ext-27-Dienst fertig; eine Epoche je Iteration.
-        if !HWFUZZ_DONE.load(Ordering::Acquire) && AGGRU_DONE.load(Ordering::Acquire) {
+        if !HWFUZZ_DONE.load(Ordering::Acquire) && INTRU_DONE.load(Ordering::Acquire) {
             match HWFUZZ_STEP.load(Ordering::Acquire) {
                 0 => {
                     // Fixtures (eine PD je Domäne, ohne Threads) + Baseline schnappen.
@@ -4966,13 +5025,15 @@ fn all_done() -> bool {
     let loaderfuzz = LOADERFUZZ_DONE.load(Ordering::Acquire) && LOADERFUZZ_OK.load(Ordering::Acquire);
     // ext-27 T0: UserLand-Aggressor (extern geladen) — alle Syscall-Angriffe korrekt abgewiesen.
     let aggru = AGGRU_DONE.load(Ordering::Acquire) && AGGRU_OK.load(Ordering::Acquire);
+    // ext-27 T1: UserLand-Intruder (extern geladen) — Kernel-RAM-Zugriff aus EL0 faultete (Isolation).
+    let intru = INTRU_DONE.load(Ordering::Acquire) && INTRU_OK.load(Ordering::Acquire);
     // Domänen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Policy + Oracles + Baseline.
     let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
         && pdctl && chan && rtc && irq && dma && pcie && smmu && smmubind && virtiorng && dmagen
-        && sasheap && load && sysload && loadhw && loadstop && loaderfuzz && aggru && hwfuzz
+        && sasheap && load && sysload && loadhw && loadstop && loaderfuzz && aggru && intru && hwfuzz
 }
 
 fn report() {
@@ -5505,6 +5566,13 @@ fn report() {
     println!(
         "aggru   : {} (extern geladener UserLand-Aggressor: Cap-Confusion (leerer Slot/falscher Typ/falsche Rechte) + Eskalation (PDCTL/LOAD/KILL ohne Autoritaet) -> alle als BADCAP/RIGHTS/BADSYS abgewiesen; Dienst signalisiert SUCCESS nur bei voller Abweisung; Audits==0)",
         if aggru { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // ext-27 T1: UserLand-Intruder (Speicher-Isolation, ADR 0012).
+    let intru = INTRU_DONE.load(Ordering::Acquire) && INTRU_OK.load(Ordering::Acquire);
+    println!(
+        "intru   : {} (extern geladener UserLand-Intruder: las Kernel-RAM aus EL0 -> Translation-Fault (Ziel nicht in der isolierten VSpace gemappt) -> Kernel terminiert den Angreifer-Thread + laeuft weiter; PRE-Badge erhalten + el0_fault_count++ + Audits==0)",
+        if intru { "ALL PASS" } else { "FAILURES" }
     );
 
     // Domänen/HW-Fuzzer (ext-22, P6).

@@ -393,6 +393,20 @@ static DMAGEN_BALANCED: AtomicBool = AtomicBool::new(false); // total_free nach 
 static DMAGEN_DONE: AtomicBool = AtomicBool::new(false);
 static DMAGEN_OK: AtomicBool = AtomicBool::new(false);
 
+// Prozess-Heap (ext-25): ein Trusted-SAS-Thread (safe Rust) nutzt einen prozess-lokalen
+// Heap (sel4lake_region::heap::Heap ueber KernelRegionSource) fuer ECHTE Box/Vec/BTreeMap.
+// Der Allokator (Groessenklassen-Slabs + Bump-Arenen) fordert Regionen ueber den RegionSource
+// an (grow) und gibt sie zurueck (shrink/Drop). Alle Adressen sind reale Physadressen (SAS);
+// das einzige unsafe liegt in der Region-Runtime, der Testcode ist 100% safe.
+static SASHEAP_VEC: AtomicBool = AtomicBool::new(false); // Vec waechst ueber Klassen + Region
+static SASHEAP_BOX: AtomicBool = AtomicBool::new(false); // Box
+static SASHEAP_MAP: AtomicBool = AtomicBool::new(false); // BTreeMap (Slab-Churn)
+static SASHEAP_LARGE: AtomicBool = AtomicBool::new(false); // Large-Alloc -> dedizierte Region
+static SASHEAP_GREW: AtomicBool = AtomicBool::new(false); // >=1 Region angefordert
+static SASHEAP_BALANCED: AtomicBool = AtomicBool::new(false); // total_free nach Heap-Drop = Baseline
+static SASHEAP_DONE: AtomicBool = AtomicBool::new(false);
+static SASHEAP_OK: AtomicBool = AtomicBool::new(false);
+
 // Domänen/HW-Fuzzer (ext-22, P6): churnt über viele Epochen Hardware-/Management-Caps gegen
 // die Domänen-Policy + CDT/VSpace-Oracles + Ressourcen-Baseline. Kernpunkte: HW-Caps (MMIO/
 // IRQ) NUR in HardwareLand, PdControl NUR in TrustedSas installierbar (Negativfälle abgelehnt);
@@ -630,6 +644,68 @@ fn run_dmagen() -> bool {
     DMAGEN_BALANCED.store(balanced, Ordering::Relaxed);
     multiregion && dir && coh && group && sg && pool_ok && audit && balanced
         && system::domain_audit() == 0
+}
+
+/// **Prozess-Heap testen** (ext-25): ein Trusted-SAS-Kontext (safe Rust) baut einen prozess-
+/// lokalen `Heap` über die kernel-`RegionSource` und nutzt **echte** `Box`/`Vec`/`BTreeMap` auf
+/// realen Physadressen. Wachsen (über Größenklassen + über eine Region hinaus = grow), Large-Alloc
+/// (dedizierte Region), Drop (Slab-Free-Listen/Release) und Balance (alle Regionen zurück an `MEM`).
+/// Der Testcode ist **100% safe** — das einzige `unsafe` liegt in der Region-Runtime. IRQs aus für
+/// die saubere total_free-Messung.
+fn run_sasheap() -> bool {
+    use alloc::boxed::Box;
+    use alloc::collections::BTreeMap;
+    use alloc::vec::Vec;
+    use sel4lake_region::heap::Heap;
+
+    hal::cpu::local_irq_disable();
+    let free0 = system::total_free();
+    let (vec_ok, box_ok, map_ok, large_ok, grew) = {
+        let heap = Heap::new(system::KernelRegionSource);
+        // 1. Vec, das ueber Groessenklassen UND ueber eine Region hinaus waechst (Realloc = grow).
+        let mut v: Vec<u64, _> = Vec::new_in(&heap);
+        for i in 0..4096u64 {
+            v.push(i.wrapping_mul(2654435761));
+        }
+        let vec_ok = v.len() == 4096
+            && v[0] == 0
+            && v[4095] == 4095u64.wrapping_mul(2654435761);
+        // 2. Box (mittelgross, eine Slab-Klasse).
+        let b = Box::new_in([0xA5u8; 300], &heap);
+        let box_ok = b[0] == 0xA5 && b[299] == 0xA5;
+        // 3. BTreeMap (viele kleine Knoten -> Slab-Alloc/Free-Churn).
+        let mut m: BTreeMap<u64, u64, _> = BTreeMap::new_in(&heap);
+        for i in 0..256u64 {
+            m.insert(i, i ^ 0xDEAD);
+        }
+        let map_ok =
+            m.len() == 256 && m.get(&123) == Some(&(123u64 ^ 0xDEAD)) && m.get(&999).is_none();
+        // 4. Large-Allokation (> groesste Klasse) -> dedizierte Region (Bump/whole-region).
+        let mut big: Vec<u8, _> = Vec::with_capacity_in(16384, &heap);
+        big.resize(16384, 0x5A);
+        let large_ok = big.len() == 16384 && big[16383] == 0x5A;
+        // mind. eine Region wurde vom Heap angefordert (grow real beobachtet).
+        let grew = heap.region_count() >= 1;
+        // 5. Allokationen droppen -> Slab-Free-Listen befuellt / Large-Region freigegeben.
+        drop(v);
+        drop(b);
+        drop(m);
+        drop(big);
+        (vec_ok, box_ok, map_ok, large_ok, grew)
+        // `heap` faellt hier -> alle gehaltenen Regionen zurueck an MEM (Balance).
+    };
+    let balanced = system::total_free() == free0;
+    hal::cpu::local_irq_enable();
+
+    SASHEAP_VEC.store(vec_ok, Ordering::Relaxed);
+    SASHEAP_BOX.store(box_ok, Ordering::Relaxed);
+    SASHEAP_MAP.store(map_ok, Ordering::Relaxed);
+    SASHEAP_LARGE.store(large_ok, Ordering::Relaxed);
+    SASHEAP_GREW.store(grew, Ordering::Relaxed);
+    SASHEAP_BALANCED.store(balanced, Ordering::Relaxed);
+    vec_ok && box_ok && map_ok && large_ok && grew && balanced
+        && system::domain_audit() == 0
+        && system::vspace_audit() == 0
 }
 
 // Audit-Regression B (Scheduler/MCS): `set_budget`/`bind_sched_context` auf einen
@@ -3083,7 +3159,7 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && !dbg_printed && dbg_ticks > 250 {
             dbg_printed = true;
             let m = ISO_MASK.load(Ordering::Relaxed);
-            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} hwfuzz={}",
+            println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} hwfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
                 FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0,
                 (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire)),
@@ -3123,6 +3199,7 @@ pub fn demo_report_then_idle() -> ! {
                 SMMUB_DONE.load(Ordering::Acquire) && SMMUB_OK.load(Ordering::Acquire),
                 VRNG_DONE.load(Ordering::Acquire) && VRNG_OK.load(Ordering::Acquire),
                 DMAGEN_DONE.load(Ordering::Acquire) && DMAGEN_OK.load(Ordering::Acquire),
+                SASHEAP_DONE.load(Ordering::Acquire) && SASHEAP_OK.load(Ordering::Acquire),
                 HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire),
             );
         }
@@ -4246,9 +4323,16 @@ pub fn demo_report_then_idle() -> ! {
             DMAGEN_DONE.store(true, Ordering::Release);
         }
 
+        // Prozess-Heap (ext-25): ein Trusted-SAS-Kontext nutzt echten Box/Vec/BTreeMap-Heap.
+        // Synchron, ein Schritt. Gegate auf dmagen (ext-24) fertig.
+        if !SASHEAP_DONE.load(Ordering::Acquire) && DMAGEN_DONE.load(Ordering::Acquire) {
+            SASHEAP_OK.store(run_sasheap(), Ordering::Release);
+            SASHEAP_DONE.store(true, Ordering::Release);
+        }
+
         // Domänen/HW-Fuzzer (ext-22, P6): churnt HW-/Management-Caps gegen Policy + Oracles +
-        // Baseline. Gegate auf generische DMA-Infra (ext-24) fertig; eine Epoche je Iteration.
-        if !HWFUZZ_DONE.load(Ordering::Acquire) && DMAGEN_DONE.load(Ordering::Acquire) {
+        // Baseline. Gegate auf Prozess-Heap (ext-25) fertig; eine Epoche je Iteration.
+        if !HWFUZZ_DONE.load(Ordering::Acquire) && SASHEAP_DONE.load(Ordering::Acquire) {
             match HWFUZZ_STEP.load(Ordering::Acquire) {
                 0 => {
                     // Fixtures (eine PD je Domäne, ohne Threads) + Baseline schnappen.
@@ -4462,13 +4546,15 @@ fn all_done() -> bool {
     let virtiorng = VRNG_DONE.load(Ordering::Acquire) && VRNG_OK.load(Ordering::Acquire);
     // Generische DMA-Infra (ext-24): Richtung/Kohärenz + Multi-Region + Gruppen + SG + Pool.
     let dmagen = DMAGEN_DONE.load(Ordering::Acquire) && DMAGEN_OK.load(Ordering::Acquire);
+    // Prozess-Heap (ext-25): echter Box/Vec/BTreeMap-Heap auf realen Physadressen (safe Rust).
+    let sasheap = SASHEAP_DONE.load(Ordering::Acquire) && SASHEAP_OK.load(Ordering::Acquire);
     // Domänen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Policy + Oracles + Baseline.
     let hwfuzz = HWFUZZ_DONE.load(Ordering::Acquire) && HWFUZZ_OK.load(Ordering::Acquire);
     workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && fuzz && ipcfuzz && caplk && domain
         && pdctl && chan && rtc && irq && dma && pcie && smmu && smmubind && virtiorng && dmagen
-        && hwfuzz
+        && sasheap && hwfuzz
 }
 
 fn report() {
@@ -4939,6 +5025,17 @@ fn report() {
     println!(
         "dmagen  : {} (generische DMA-Infra: Richtung/Kohaerenz als DmaCap-Attribute, Multi-Region-Kontext, Stream-Gruppen, SG-Validierung, DmaPool — baut auf DmaCap/DmaEnforcer auf)",
         if dmagen { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Prozess-Heap (ext-25): echter Box/Vec/BTreeMap-Heap auf realen Physadressen (safe Rust).
+    let sasheap = SASHEAP_DONE.load(Ordering::Acquire) && SASHEAP_OK.load(Ordering::Acquire);
+    println!("sasheap : Trusted-SAS-Heap (Slabs+Bump ueber Regionsliste): Vec(4096,Realloc/grow)={} Box={} BTreeMap(256)={} Large-Alloc(dedizierte Region)={} Region-angefordert={} balanciert(alle Regionen zurueck)={}",
+        SASHEAP_VEC.load(Ordering::Acquire), SASHEAP_BOX.load(Ordering::Acquire),
+        SASHEAP_MAP.load(Ordering::Acquire), SASHEAP_LARGE.load(Ordering::Acquire),
+        SASHEAP_GREW.load(Ordering::Acquire), SASHEAP_BALANCED.load(Ordering::Acquire));
+    println!(
+        "sasheap : {} (echter Box/Vec/BTreeMap-Heap auf realen Physadressen; Testcode 100% safe, unsafe nur in der Region-Runtime; prozess-lokaler Allokator ueber RegionSource grow/shrink)",
+        if sasheap { "ALL PASS" } else { "FAILURES" }
     );
 
     // Domänen/HW-Fuzzer (ext-22, P6).

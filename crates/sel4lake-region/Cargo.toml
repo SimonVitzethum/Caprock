@@ -1,0 +1,14 @@
+# Runtime-Speicherabstraktion (ext-25): RegionView + Hybrid-Allokator (Slabs + Bump-Arenen).
+#
+# Die EINZIGE Crate mit `unsafe`-Speicherzugriff im Userland-Pfad — klar auditierbar.
+# Die oeffentliche API ist vollstaendig Safe Rust; alle rohen Zeiger bleiben hier gekapselt.
+[package]
+name = "sel4lake-region"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+sel4lake-mem = { path = "../sel4lake-mem" }
+sel4lake-sync = { path = "../sel4lake-sync" }

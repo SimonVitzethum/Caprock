@@ -19,6 +19,7 @@ path = "src/main.rs"
 sel4lake-hal = { path = "../crates/sel4lake-hal" }
 sel4lake-sync = { path = "../crates/sel4lake-sync" }
 sel4lake-mem = { path = "../crates/sel4lake-mem" }
+sel4lake-region = { path = "../crates/sel4lake-region" }
 sel4lake-cap = { path = "../crates/sel4lake-cap" }
 sel4lake-sched = { path = "../crates/sel4lake-sched" }
 sel4lake-ipc = { path = "../crates/sel4lake-ipc" }

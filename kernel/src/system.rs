@@ -19,6 +19,8 @@ use sel4lake_hal::{self as hal, exception::TrapFrame, fp::FpState, println};
 use sel4lake_ipc::{Endpoint, Notification, NENDPOINTS, NNOTIFICATIONS};
 use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
 use sel4lake_microkit::{Caps, Domain};
+use sel4lake_region::heap::RegionSource;
+use sel4lake_region::{Purpose, Region, RegionTag};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use sel4lake_sched::{SchedOps, Scheduler, ThreadId, MAX_THREADS};
 use sel4lake_sync::{RwSpinLock, SpinLock};
@@ -2067,6 +2069,28 @@ pub fn virtio_rng_dma_demo() -> VirtioDmaResult {
 /// Fehler-/Cleanup-Pfade, in denen eine `alloc_dma_region` nicht in eine Cap mündet.
 pub fn free_dma_region(base: u64, len: u64) {
     free_raw_region(base, len);
+}
+
+// --- Prozess-Heap-Regionsquelle (ext-25) ---
+//
+// Der kernel-/Trusted-SAS-seitige `RegionSource`: bedient grow/shrink des prozess-lokalen
+// Heaps direkt aus dem physischen Allokator (`MEM`). Ein EL0-Prozess würde dasselbe per Syscall
+// marshallen — die `RegionSource`-Schnittstelle bleibt identisch (IOMMU-/Heap-neutral). Die
+// Region trägt eine `MemoryCap` (lineares Eigentum); `release` gibt sie über `into_cap` zurück.
+static REGION_ID: AtomicU32 = AtomicU32::new(1);
+
+pub struct KernelRegionSource;
+
+impl RegionSource for KernelRegionSource {
+    fn request(&self, min_len: usize, purpose: Purpose) -> Option<Region> {
+        let len = (min_len as u64 + 4095) & !4095;
+        let cap = MEM.lock().alloc(len, 4096)?;
+        let id = REGION_ID.fetch_add(1, Ordering::Relaxed);
+        Some(Region::from_cap(cap, RegionTag::new(id, purpose)))
+    }
+    fn release(&self, region: Region) {
+        MEM.lock().free(region.into_cap());
+    }
 }
 
 /// Eine roh-allozierte RAM-Region (ohne Cap) an den Allokator zurückgeben (interner Test-/

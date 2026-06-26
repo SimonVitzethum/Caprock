@@ -1,11 +1,31 @@
 #![no_std]
 #![no_main]
+#![feature(allocator_api)]
+#![feature(btreemap_alloc)]
 //! SEL4Lake kernel — bootable image entry point.
 //!
 //! Phase 1 (HAL): Boot, Exception-Vektoren, Identity-MMU + Caches (W^X), GICv2,
 //! Timer, SMP-Bring-up. Phase 2: capability-basiertes physisches Speichermodell
 //! (`sel4lake-mem`, hier per Selbsttest exerziert). Die Hardware-Spezifik liegt
 //! in `sel4lake-hal`; diese Crate verdrahtet Boot-Trampolin und Init-Reihenfolge.
+
+// ext-25: prozess-lokale Heaps (sel4lake-region) nutzen den allocator_api — `Box`/`Vec` werden
+// stets mit EXPLIZITEM Allokator (`*_in(&heap)`) erzeugt. Es gibt bewusst KEINEN globalen Heap;
+// der Global-Allocator unten ist ein Wächter, der versehentliche `Box::new`/`Vec::new` abfängt.
+extern crate alloc;
+
+/// Wächter-Global-Allocator: das SAS-Modell verlangt **prozess-lokale** Heap-Instanzen
+/// (`Heap::new(source)` + `*_in(&heap)`). Ein impliziter globaler Heap existiert nicht.
+struct NoGlobalHeap;
+// SAFETY: niemals ein Block vergeben/freigegeben; jede Nutzung paniert (= Designfehler-Wächter).
+unsafe impl core::alloc::GlobalAlloc for NoGlobalHeap {
+    unsafe fn alloc(&self, _l: core::alloc::Layout) -> *mut u8 {
+        panic!("kein globaler Heap im SAS — prozess-lokale Heap-Instanz nutzen (*_in)")
+    }
+    unsafe fn dealloc(&self, _p: *mut u8, _l: core::alloc::Layout) {}
+}
+#[global_allocator]
+static GLOBAL: NoGlobalHeap = NoGlobalHeap;
 
 mod arch;
 mod panic;

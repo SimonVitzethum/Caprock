@@ -45,6 +45,7 @@ dependencies = [
  "sel4lake-ipc",
  "sel4lake-mem",
  "sel4lake-microkit",
+ "sel4lake-region",
  "sel4lake-sched",
  "sel4lake-sync",
 ]
@@ -63,6 +64,14 @@ dependencies = [
  "sel4lake-ipc",
  "sel4lake-mem",
  "sel4lake-sched",
+ "sel4lake-sync",
+]
+
+[[package]]
+name = "sel4lake-region"
+version = "0.0.1"
+dependencies = [
+ "sel4lake-mem",
  "sel4lake-sync",
 ]
 

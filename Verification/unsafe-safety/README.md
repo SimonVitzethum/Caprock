@@ -32,11 +32,23 @@ Beweises (je Stelle ein Zeilenverweis; bei Kernel-Änderung nachzuziehen).
 
 ## 3. Auswahlkriterium
 
-Aufgenommen wird eine Stelle, wenn sie (a) **Kategorie A** (normales RAM) und (b) in **1–3 h gut
-beweisbar** ist. **Nicht** aufgenommen (sondern als Vertrag dokumentiert): reine Trust-Primitive ohne
-in-Funktion-Bounds — `mem::peek_u64/poke_u64` (beliebige Cap-Adresse; Gültigkeit aus dem **verifizierten
-Cap-System**), MMIO-`volatile` (HAL-Gerätevertrag), fixe RAM-Fenster-Slices (`MOD_BASE..MOD_WINDOW`,
-Boot-Kontrakt). Kategorie B (Pagetables/MMIO/Assembly) bleibt die axiomatisierte HAL-TCB.
+Aufgenommen wird eine Stelle, wenn sie (a) **Kategorie A** (normales RAM, in-Funktion-Bounds) und (b)
+in **1–3 h gut beweisbar** ist.
+
+**Vollständige Abgrenzung der nicht aufgenommenen `unsafe`-Stellen** (auditierbar — jede `unsafe`-Stelle
+außerhalb region/sync ist hier kategorisiert):
+
+| Stelle(n) | Kategorie | Behandlung |
+|---|---|---|
+| `region/src/lib.rs` (RegionView), `sync/src/lib.rs` | A | **bereits** Kani-bewiesen (`docs/verification.md`) |
+| `mem::peek_u64/poke_u64`, DMA-Sentinel (`system.rs:2210/2216/2227`) | Trust-Primitiv | beliebige Cap-/DMA-Adresse, **keine** in-Funktion-Bounds — Gültigkeit aus dem **verifizierten Cap-System** bzw. DMA-Vertrag; dokumentierter `// SAFETY:`-Kontrakt, **kein** Beweisziel |
+| `loader.rs:37` (`MOD_BASE..MOD_WINDOW`-Slice) | Trust-Primitiv | festes, vom Boot/Linker bereitgestelltes RAM-Fenster (Boot-Kontrakt) |
+| `threads/mod.rs` (RTC), `system.rs` rng/smmu, HAL MMIO | B | MMIO-Geräteregister — axiomatisierte HAL-TCB (Gerätevertrag) |
+| `hal/exception.rs` Funktionszeiger-`transmute` (5×) | Funktionszeiger | `usize→fn`-Hook-Registrierung — Typ-/Registrierungsargument (kein RAM-Bounds, kein Kani-Ziel) |
+| `hal/mmu.rs` Pagetable-Writes, Kontextwechsel-`asm!` | B | Maschinenmodell (Pagetables/Assembly) — Forschungsklasse, HAL-TCB |
+
+Damit ist der **in 1–3 h gut beweisbare Kategorie-A-Teil vollständig** (region/sync vorab + die vier
+Stellen hier); der Rest ist bewusst Trust-Primitiv/HAL-TCB (vgl. `ARMTest/unsafe-memory-safety-aufwand.md`).
 
 ## 4. Bewiesene Stellen
 

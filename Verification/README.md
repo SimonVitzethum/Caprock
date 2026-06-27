@@ -28,12 +28,19 @@ Strategie/Stufenmodell + Aufwand: `ARMTest/formale-verifikation-aufwand.md`. Pip
 | **4** | **IPC** (CALL/REPLY-Rendezvous, Endpoint-Konsistenz) | [`ipc/`](ipc/) | **Kern bewiesen** (kein Verlust/Duplikat, Fortschritt); Reply-Caps/Nebenläufigkeit offen |
 | **5** | **Scheduler** (Runqueue-Konsistenz, MCS-Budget) | [`scheduler/`](scheduler/) | **Kern bewiesen** (Queue-Kopplung/MCS-Schranke/keine Aushungerung/Fortschritt); Prio-Auswahl/Donation offen |
 | **6** | **Notifications** (asynchroner Signalkanal) | [`notifications/`](notifications/) | **Kern bewiesen** (kein Signalverlust/genau-einmal-Konsum/kein Lost-Wakeup); Multi-Waiter/Binding offen |
+| **7** | **DMA-Lifetime** (Revoke-Reihenfolge) | [`dma-lifetime/`](dma-lifetime/) | **Kern bewiesen** (kein DMA-use-after-free: `detach→free`); Kontext-Aggregation offen |
 
-**Gesamtstand:** alle sechs Komponenten sind **im Kern funktional verifiziert** (Verus, **83
-verified** über 15 Dateien, CI-gated). Bewusst als nächste Ausbaustufen offen: CDT-Reachability
-(move/revoke, Phase 1), Capability-Endowment (Phase 2), RegionSource/Zero-Copy (Phase 3), Reply-Caps/
-Cap-Transfer (Phase 4), Prioritäts-Auswahlregel/Budget-Donation (Phase 5), Multi-Waiter/Binding
-(Phase 6) sowie durchgängig die **Nebenläufigkeit** (Loom/TLA+, s. Hardware-Vertrauensgrenze).
+**Gesamtstand:** sieben Komponenten sind **im Kern funktional verifiziert** (Verus, **90 verified**
+über 16 Dateien, CI-gated); zusätzlich ist die **Speichersicherheit der Kategorie-A-`unsafe`-Stellen**
+mit Kani bewiesen (s. [`unsafe-safety/`](unsafe-safety/)). Bewusst als nächste Ausbaustufen offen:
+CDT-Reachability (move/revoke, Phase 1), Capability-Endowment (Phase 2), RegionSource/Zero-Copy
+(Phase 3), Reply-Caps/Cap-Transfer (Phase 4), Prioritäts-Auswahlregel/Budget-Donation (Phase 5),
+Multi-Waiter/Binding (Phase 6), Kontext-Aggregation (Phase 7) sowie durchgängig die **Nebenläufigkeit**
+(Loom/TLA+, s. Hardware-Vertrauensgrenze).
+
+Daneben dokumentiert [`unsafe-safety/`](unsafe-safety/) (ADR 0021) die schrittweise Kani-Speicher-
+sicherheit der Software-`unsafe`-Stellen (Kategorie A); die Hardware-`unsafe` (Pagetables/MMIO/Assembly,
+Kategorie B) bleibt die kleine, dokumentierte HAL-TCB.
 
 ## Hardware-Vertrauensgrenze (bewusst außerhalb)
 

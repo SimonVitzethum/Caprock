@@ -1,8 +1,9 @@
 # Verifikation — Capability-System (Phase 1)
 
-> **Status:** in Arbeit · Schritt A (Analyse/ADR/Plan/Scaffold) abgeschlossen · Schritte B–D folgen.
-> Dieses Dokument ist **eigenständig verständlich**: es erklärt die formale Verifikation des
-> Capability-Systems vollständig, **ohne dass der Quellcode gelesen werden muss**.
+> **Status:** Kern abgeschlossen — die **vollständige `cap_inv`** (Klauseln 1–7) + **vier** der sechs
+> Operationen (`install`/`copy`/`mint`/`delete`) sind gegen sie bewiesen (10 verified, CI-gated).
+> Verbleibend: `move` (allg.)/`revoke` über die **Reachability-Ausbaustufe** (§14). Dieses Dokument
+> ist **eigenständig verständlich** — es erklärt die Verifikation vollständig **ohne Quellcode**.
 
 Bezug: [ADR 0015](../../docs/adr/0015-capability-system-formal-verification.md) (Architekturentscheidung
 der Verifikation), ADR 0001 (Capabilities), `docs/verification.md` (Gesamtpipeline),
@@ -175,8 +176,31 @@ erhalten — Refcount, Struktur **und** Azyklizität in je einem Beweis.
 
 ## 14. Nächste Ausbaustufen
 
-- **Schritt B:** vereintes `CapSpace`-Modell + volle `cap_inv`.
-- **Schritt C:** `install`/`copy`/`mint`/`move`/`delete`/`revoke` gegen die volle Invariante.
-- **Schritt D:** Doku-Vervollständigung + CI-Integration + Validierung + Abschluss-Commit.
-- **Später (Phase-übergreifend):** Code 4r-Reachability; Modell↔Code-Bindung (Richtung reale
-  Implementierung); danach Phase 2 (Loader).
+**Phase-1-Kern abgeschlossen:** die vollständige `cap_inv` (Klauseln 1–7) + die vier Operationen
+`install`/`copy`/`mint`/`delete` sind gegen sie bewiesen. Verbleibend ist die **Reachability-
+Ausbaustufe**, die `move` (allgemein) + `revoke` erst beweisbar macht:
+
+### Reachability (Code 4r) — Roadmap der finalen Ausbaustufe
+
+Die Zeiger-CDT braucht für `move`/`revoke` zusätzliche **Wohlgeformtheits-Klauseln**, die `cap_inv`
+(lokal) bewusst noch **nicht** erzwingt (sie wurden bei den Lösch-/Relokations-Versuchen als fehlend
+identifiziert):
+- **keine Selbst-Geschwister** (`next[s] != Some(s)`, `prev[s] != Some(s)`),
+- **endliche/azyklische Geschwisterlisten** (eine Sibling-Kette kehrt nicht zurück),
+- **Mitgliedschaft (4r):** jeder Knoten mit `parent==Some(p)` ist von `p.first_child` über
+  `next`-Schritte **erreichbar**.
+
+**Lösungsansatz (analog zum `rank`-Trick für die Azyklizität):** ein Ghost-Feld **`sib_pos: nat`** je
+Slot mit der Invariante `next[s]==Some(n) ⟹ sib_pos[n] == sib_pos[s]+1` und `first_child[p]==Some(c) ⟹
+sib_pos[c]==0`. Das macht Geschwisterlisten **wohlfundiert** (Position steigt strikt → endlich, kein
+Zyklus, kein Selbst-Geschwister) und trägt die Mitgliedschaft. Damit werden:
+- **`move` (allgemein)** — die Kind-`parent`-Umbiegung über die (nun endliche) Kinderliste,
+- **`revoke`** — die Teilbaum-Iteration (rekursiv über `first_child`/`next`, terminiert dank `sib_pos`)
+
+beweisbar. Aufwand: eigener mehrstufiger Block (die anspruchsvollste CDT-Verifikationsstufe, vgl.
+seL4s MDB-Beweise).
+
+### Phasenübergreifend
+
+- Modell↔Code-Bindung (Richtung reale `sel4lake-cap`-Implementierung).
+- Danach **Phase 2 (Loader)**, **Phase 3 (Region-Runtime)**, … (s. `Verification/README.md`).

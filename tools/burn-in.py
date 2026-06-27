@@ -45,6 +45,7 @@ RX_allpass_l = re.compile(r"^(\w[\w]*) *: ALL PASS", re.M)   # je Test eine ALL-
 RX_failures  = re.compile(r"FAILURES")
 RX_panic     = re.compile(r"(?i)\bpanic\b|PANIC")
 RX_complete  = re.compile(r"== SELFTEST COMPLETE -> system_off ==")
+RX_watchdog  = re.compile(r"SELFTEST FAILED \(watchdog\)")  # Harness-Watchdog: gemeldeter Test-Fehler
 RX_dbgpend   = re.compile(r"DBG pending")
 
 # Pro Lauf erwartete Loader-Aufrufe + Hot-Reloads (aus der Selbsttest-Struktur, Release-Build).
@@ -102,18 +103,22 @@ def parse(out):
     m["complete"] = bool(RX_complete.search(out))
     m["failures"] = bool(RX_failures.search(out))
     m["panic"] = bool(RX_panic.search(out))
+    m["watchdog"] = bool(RX_watchdog.search(out))
     m["dbg_pending"] = bool(RX_dbgpend.search(out))
     return m
 
 
 def verdict(m, hung):
-    if hung or not m["complete"]:
-        return "HANG"
     if m["panic"]:
         return "PANIC"
-    if m["failures"]:
+    if m["complete"]:
+        return "FAILURE" if m["failures"] else "CLEAN"
+    # Harness-Watchdog hat den Stillstand gemeldet + sauber heruntergefahren -> FAILURE (welcher Test
+    # scheiterte, steht im report() der Ausgabe), KEIN Hang. Echter Stillstand/Crash (kein COMPLETE,
+    # kein Watchdog, oder Subprozess-Timeout) bleibt HANG.
+    if m["watchdog"] or m["failures"]:
         return "FAILURE"
-    return "CLEAN"
+    return "HANG"
 
 
 def new_state(args):

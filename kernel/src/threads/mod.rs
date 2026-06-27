@@ -2789,24 +2789,53 @@ pub fn demo_report_then_idle() -> ! {
             }
             hal::cpu::local_irq_enable();
         }
-        // Churn-/Leak-Test: sobald die isolierten Demos durch sind (page-Badge +
-        // die 3 faultenden isolierten PDs abgebaut), tausende spawn/destroy-Zyklen
-        // isolierter PDs fahren und pruefen, dass alle Ressourcenstaende exakt zur
-        // Baseline zurueckkehren. IRQs aus -> kein anderer Thread perturbiert die
-        // Zaehlung (Messung sauber); der Test ist kurz.
+        // Churn-/Leak-Test: tausende spawn/destroy-Zyklen isolierter PDs (auf core 0) und pruefen,
+        // dass ALLE Ressourcenstaende exakt zur Baseline zurueckkehren. BUGFIX (nach Burn-in #1,
+        // seltener Hang ~1/1000): `local_irq_disable()` stoppt NUR core 0 — die anderen Kerne
+        // (reclaim/balance) hinterlassen kurzlebige Threads/Zombies auf IHREN Kernen, deren
+        // spaeteres Reap die GLOBALEN Zaehler (total_free/free_vspaces/kstack) waehrend der Messung
+        // perturbiert -> Schein-Leak -> CHURN_OK=false -> all_done() nie true -> Hang. Fix: gegate
+        // auf reclaim+balance vollstaendig gespawnt UND VOR der Baseline ueber ALLE Kerne
+        // quieszieren (reap_core ist kern-uebergreifend), bis die globalen Zaehler stabil sind.
         if !CHURN_DONE.load(Ordering::Acquire)
             && (ISO_MASK.load(Ordering::Relaxed) & ISO_BADGE_PAGES != 0)
             && system::iso_fault_count() >= 3
+            && RECLAIM_SPAWNED.load(Ordering::Relaxed) >= RECLAIM_TARGET
+            && BALANCED_SPAWNED.load(Ordering::Relaxed) >= BALANCED_TARGET
         {
             hal::cpu::local_irq_disable();
-            // Vor dem Snapshot alle noch ausstehenden Zombies einsammeln (z. B. von
-            // den faultenden isolierten Proben), sonst gäbe die erste reap()-Aufrufung
-            // im Churn deren Stacks frei -> Schein-Leak.
-            while system::reap() > 0 {}
-            let mem0 = system::total_free();
-            let tcb0 = system::used_tcbs(0);
-            let vs0 = system::free_vspaces();
-            let ks0 = system::user_kstack_free_count();
+            let snap = || {
+                (
+                    system::total_free(),
+                    system::used_tcbs(0),
+                    system::free_vspaces(),
+                    system::user_kstack_free_count(),
+                )
+            };
+            // Alle Kerne einsammeln (auch fremde Zombies) + settlen, bis sich die globalen Zaehler
+            // ueber eine Runde nicht mehr aendern. Bounded -> bleibt es instabil, faengt der
+            // Watchdog (kein Hang). Erst danach die Baseline schnappen.
+            let drain_all = || {
+                let mut t = 0usize;
+                for c in 0..NUM_CORES {
+                    t += system::reap_core(c);
+                }
+                t
+            };
+            while drain_all() > 0 {}
+            let mut base = snap();
+            for _ in 0..64u32 {
+                for _ in 0..20_000 {
+                    core::hint::spin_loop();
+                }
+                while drain_all() > 0 {}
+                let now = snap();
+                if now == base {
+                    break; // quiesziert: keine Perturbation durch andere Kerne mehr
+                }
+                base = now;
+            }
+            let (mem0, tcb0, vs0, ks0) = base;
             let mut ok = true;
             for _ in 0..CHURN_TARGET {
                 match system::spawn_isolated(churn_dummy as *const () as usize, 0, system::IDLE_PRIO) {
@@ -2817,6 +2846,7 @@ pub fn demo_report_then_idle() -> ! {
                     }
                 }
             }
+            while drain_all() > 0 {} // churn-eigene Zombies (alle Kerne) einsammeln
             let leak = system::total_free() != mem0
                 || system::used_tcbs(0) != tcb0
                 || system::free_vspaces() != vs0
@@ -4162,6 +4192,18 @@ pub fn demo_report_then_idle() -> ! {
             // erlaubt umfangreichere Fuzz-Läufe innerhalb des Zeitfensters). Bei einem
             // Fehlschlag (all_done nie wahr) bleibt der Kernel im Idle -> Timeout greift.
             println!("== SELFTEST COMPLETE -> system_off ==");
+            hal::psci::system_off();
+        } else if !reported && hal::timer::ticks(0) > 6000 {
+            // BUGFIX (nach Burn-in #1): Watchdog. Wird ein synchroner Test selten DONE-aber-OK=false
+            // (z. B. eine flaky Messung), wuerde all_done() NIE true -> der Kernel spinnt ewig im
+            // Idle (Hang). Deadline: 6000 Timer-Ticks @ TICK_HZ=100 = ~60 s (Normalabschluss ~6 s,
+            // Burn-in-Backstop 120 s). Dann den Zustand melden -- report() zeigt je Test ALL PASS/
+            // FAILURES, also welcher Test scheiterte -- und als FEHLER sauber herunterfahren.
+            // So wird eine Per-Test-Flakiness zu einem GEMELDETEN FAILURE statt zu einem Hang.
+            reported = true;
+            println!("== SELFTEST WATCHDOG: all_done() nicht erreicht nach ~60s -> offene Tests: ==");
+            report();
+            println!("== SELFTEST FAILED (watchdog) -> system_off ==");
             hal::psci::system_off();
         }
         hal::cpu::wfi();

@@ -202,8 +202,12 @@ impl VirtioRng {
         wr16(notify_addr, 0);
         cpu::dsb_sy();
 
-        // 10. used-Ring pollen (das Gerät DMAt die Bytes + advanced used.idx).
-        for _ in 0..2_000_000 {
+        // 10. used-Ring pollen (das Gerät DMAt die Bytes + advanced used.idx). Grosszuegige
+        // Obergrenze: der Poll bricht normal nach wenigen tausend Iterationen ab (Gerät hat
+        // geantwortet); die hohe Schranke greift nur im seltenen TCG-Timing-Jitter-Fall, in dem
+        // das emulierte Geraet spaeter fertig wird (Burn-in #1: ~1/2000 Laeufe `used_adv=false`).
+        // Worst Case dann ~hunderte ms Busy-Wait statt eines Schein-Fehlschlags.
+        for _ in 0..50_000_000u64 {
             if rd16(used + 2) != used_idx0 {
                 let len = rd32(used + 8); // used.ring[0].len
                 return (true, len);

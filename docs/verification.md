@@ -76,9 +76,10 @@ für **alle** Zustände (unbeschränkt). Methode (vom Nutzer vorgegeben): **kein
 
 Mehrere Pilotdateien spezifizieren **dokumentierte Kernel-Audits** und beweisen, dass die jeweiligen
 Operationen die Invariante **erhalten** — statisch + für **alle** Zustände, nicht nur an den
-Audit-Quiescenz-Punkten wie zur Laufzeit (`tools/verus-verify.sh`, gesamt **28 verified, 0 errors**,
-über die Audits `cap_audit_cdt`, `domain_audit`, `vspace_audit`, `dma_audit` — fünf verschiedene
-Invariantentypen: Zählen, verkettete Struktur, Klassifikation, Permission, Geometrie):
+Audit-Quiescenz-Punkten wie zur Laufzeit (`tools/verus-verify.sh`, gesamt **32 verified, 0 errors**
+über 9 Dateien, über **sechs** der dokumentierten Audits — `cap_audit_cdt`, `domain_audit`,
+`vspace_audit`, `dma_audit`, `loader_audit`, `trust_audit`; sechs verschiedene Invariantentypen:
+Zählen, verkettete Struktur, Klassifikation, Permission, Geometrie, Hash-Konsistenz):
 
 **(A) Refcount-Invariante** ([`verus/cap_cdt_refcount.rs`](../verus/cap_cdt_refcount.rs), Codes 1–3):
 1. jeder belegte Slot zeigt auf ein gültiges, belegtes Objekt;
@@ -121,8 +122,17 @@ terminiert). `derive` erhält die Rang-Monotonie; das Lemma `ancestor_rank_decre
 die Kettenlänge) liefert die **allgemeine** Aussage `not_own_ancestor`: kein Knoten ist sein eigener
 `k`-ter Vorfahre, für **beliebiges** `k`.
 
-So werden `cap_audit_cdt`, `domain_audit`, `vspace_audit` + `dma_audit` von zur Laufzeit **geprüften**
-zu **bewiesenen** Invarianten.
+**(H) Loader-Use-after-free-Schutz** ([`verus/loader_disjoint.rs`](../verus/loader_disjoint.rs),
+`loader_audit`): kein geladenes Segment überlappt eine **freie** RAM-Region. Bewiesen für **`free_ram`**
+(gibt RAM nur zurück, wenn disjunkt von allen Segmenten).
+
+**(I) TrustedSAS-Key-DB-Konsistenz** ([`verus/trust_keydb.rs`](../verus/trust_keydb.rs), `trust_audit`):
+die read-only Key-DB ist **selbst-zertifizierend** (`key_id == fingerprint(pubkey)`) + die `key_id`s
+sind **eindeutig**. Bewiesen für **`add_key`** (`key_id := fingerprint(pubkey)`, nur bei freier key_id).
+`fingerprint` ist uninterpretiert — der Beweis hängt nur von ihrer Funktionseigenschaft ab.
+
+So werden `cap_audit_cdt`, `domain_audit`, `vspace_audit`, `dma_audit`, `loader_audit` + `trust_audit`
+von zur Laufzeit **geprüften** zu **bewiesenen** Invarianten — sechs der dokumentierten Audits.
 
 Lokal ausführen: `tools/verus-verify.sh` (Verus + Z3 aus dem Release nach `~/.verus`; geforderte
 rustc-Toolchain via `rustup toolchain install`). Strategie/Stufenmodell: `ARMTest/formale-verifikation-aufwand.md`.

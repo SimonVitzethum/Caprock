@@ -1,4 +1,4 @@
-# SEL4Lake — Formale Verifikation (Tier 1: Kani)
+# SEL4Lake — Formale Verifikation (Tier 1: Kani, Tier 2: Verus-Pilot)
 
 Dieses Dokument beschreibt die **dauerhafte Verifikationspipeline** von SEL4Lake. Strategie-Analyse
 (Stufenmodell Tier 1–3, seL4-Vergleich, Tool-Landschaft): `ARMTest/formale-verifikation-aufwand.md`.
@@ -9,7 +9,8 @@ Dieses Dokument beschreibt die **dauerhafte Verifikationspipeline** von SEL4Lake
   10 Laufzeit-Audits, Fuzzer, `docs/invariants.md`.
 - **Tier 1 (HIER, aktiv):** **Kani** (bounded Model Checking, CBMC) beweist Panik-/OOB-/Overflow-
   Freiheit + Struktur-Invarianten der klar abgegrenzten, sicherheitskritischen Komponenten.
-- **Tier 2 (später):** **Verus** — funktionale Korrektheit (Audits werden zur Spec).
+- **Tier 2 (Pilot aktiv):** **Verus** — deduktive funktionale Korrektheit (Audits werden zur Spec).
+  Erster kleiner Pilot umgesetzt (s. u.).
 - **Tier 3 (Forschung):** volle Korrektheit + Isolation/Info-Flow + HW-Modell.
 
 ## Tier 1 — was bewiesen ist
@@ -65,6 +66,33 @@ für den bare-metal Kernel), der `cargo kani` sonst brechen würde.
 Schlägt ein Beweis fehl (eine spätere Änderung verletzt eine bewiesene Eigenschaft), **schlägt die CI
 fehl**. Damit können bereits bewiesene Eigenschaften nicht unbeabsichtigt verloren gehen — die
 Verifikation ist fester Bestandteil des Entwicklungsprozesses.
+
+## Tier 2 (Pilot) — Verus: dokumentierte Invariante als formale Spezifikation
+
+Der Unterschied zu Kani: Tier 1 beweist **Abwesenheit von Fehlern** (Panic/OOB/Overflow) bounded;
+Tier 2 beweist **funktionale Korrektheit** deduktiv — dass eine Operation eine **Invariante erhält**,
+für **alle** Zustände (unbeschränkt). Methode (vom Nutzer vorgegeben): **keinen** komplexen Bereich
+(Scheduler/IPC), sondern eine **bereits dokumentierte Kernel-Invariante** als erste formale Spec.
+
+**Pilot:** [`verus/cap_cdt_refcount.rs`](../verus/cap_cdt_refcount.rs) — der Refcount-Anteil von
+`cap_audit_cdt` (`crates/sel4lake-cap/src/space.rs`, Codes 1–3) als Spezifikation:
+
+1. jeder belegte Slot zeigt auf ein gültiges, belegtes Objekt;
+2. `refcount(o) == ` Anzahl belegter Slots, die auf `o` zeigen;
+3. ein Objekt ist belegt **⟺** `refcount(o) > 0`.
+
+**Bewiesen (`verus` → 7 verified, 0 errors):** die Capability-Operationen **`copy`** (Slot anhängen +
+`refcount++`) und **`delete`** (Slot löschen + `refcount--`, Objekt freigeben bei 0) **erhalten** die
+Invariante — statisch + für alle Zustände, nicht nur an den Audit-Quiescenz-Punkten wie zur Laufzeit.
+Kern sind drei per Induktion bewiesene Hilfs-Lemmas über die `refs_to`-Zählfunktion (push/update/
+member). Die Laufzeit-Funktion `cap_audit_cdt` wird so von einer **geprüften** zu einer **bewiesenen**
+Invariante.
+
+Lokal ausführen: `tools/verus-verify.sh` (Verus + Z3 aus dem Release nach `~/.verus`; geforderte
+rustc-Toolchain via `rustup toolchain install`). Strategie/Stufenmodell: `ARMTest/formale-verifikation-aufwand.md`.
+
+**Nächste Verus-Schritte (offen):** CDT-Baum-Invarianten (`audit_cdt` Codes 4–7: Eltern/Kind/Sibling-
+Konsistenz, Ableitung teilt das Objekt, Azyklizität); danach schrittweise Richtung Scheduler/IPC.
 
 ## Neue Komponenten aufnehmen
 

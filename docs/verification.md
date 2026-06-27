@@ -74,10 +74,10 @@ Tier 2 beweist **funktionale Korrektheit** deduktiv — dass eine Operation eine
 für **alle** Zustände (unbeschränkt). Methode (vom Nutzer vorgegeben): **keinen** komplexen Bereich
 (Scheduler/IPC), sondern eine **bereits dokumentierte Kernel-Invariante** als erste formale Spec.
 
-Zwei Pilotdateien spezifizieren Teile von `cap_audit_cdt` (`crates/sel4lake-cap/src/space.rs`) und
-beweisen, dass die jeweiligen Operationen sie **erhalten** — statisch + für **alle** Zustände, nicht
-nur an den Audit-Quiescenz-Punkten wie zur Laufzeit (`tools/verus-verify.sh`, gesamt **12 verified,
-0 errors**):
+Mehrere Pilotdateien spezifizieren **dokumentierte Kernel-Audits** und beweisen, dass die jeweiligen
+Operationen die Invariante **erhalten** — statisch + für **alle** Zustände, nicht nur an den
+Audit-Quiescenz-Punkten wie zur Laufzeit (`tools/verus-verify.sh`, gesamt **19 verified, 0 errors**,
+über die Audits `cap_audit_cdt`, `domain_audit`, `vspace_audit`):
 
 **(A) Refcount-Invariante** ([`verus/cap_cdt_refcount.rs`](../verus/cap_cdt_refcount.rs), Codes 1–3):
 1. jeder belegte Slot zeigt auf ein gültiges, belegtes Objekt;
@@ -99,7 +99,18 @@ Sibling-Inverse (5), `first_child` zeigt zurück + ist Listenkopf (`prev==None`,
 **`derive`** (eine Capability ableiten = neues Kind am Kopf der Kinderliste). Kernidee: der bisherige
 Kopf hat `prev==None`, wird also von keinem `next` referenziert → das Einhängen davor bricht nichts.
 
-So wird `cap_audit_cdt` von einer zur Laufzeit **geprüften** zu einer **bewiesenen** Invariante.
+**(D) Domänen-Policy** ([`verus/domain_policy.rs`](../verus/domain_policy.rs), `domain_audit` Codes
+1+2): Hardware-Caps (MMIO/IRQ/DMA) dürfen **nur** HardwareLand-PDs halten, Autoritäts-Caps
+(PdControl/Loader) **nur** TrustedSas. Bewiesen, dass das Gate **`install_cap_checked`** (installiert
+nur policy-konform) die Klassifikations-Invariante erhält — eine HW-Cap landet nie in einer
+Nicht-HardwareLand-PD.
+
+**(E) W^X** ([`verus/wx_invariant.rs`](../verus/wx_invariant.rs), `vspace_audit`): **keine** gemappte
+EL0-Seite ist zugleich schreib- **und** ausführbar (Code-Integrität). Bewiesen für **`map_page`**
+(mappt nur W^X-konform) und **`make_writable`** (W nur auf nicht-ausführbare Seiten).
+
+So werden `cap_audit_cdt`, `domain_audit` + `vspace_audit` von zur Laufzeit **geprüften** zu
+**bewiesenen** Invarianten.
 
 Lokal ausführen: `tools/verus-verify.sh` (Verus + Z3 aus dem Release nach `~/.verus`; geforderte
 rustc-Toolchain via `rustup toolchain install`). Strategie/Stufenmodell: `ARMTest/formale-verifikation-aufwand.md`.

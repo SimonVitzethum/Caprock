@@ -7,13 +7,16 @@
 //!
 //! **L0:** das Boot-Archiv aus dem reservierten RAM-Fenster lesen + die Module melden.
 
+use crate::trusted_keys::{MIN_VERSION, TRUSTED_KEYS};
 use sel4lake_cap::CapPtr;
 use sel4lake_hal::{print, println};
 use sel4lake_loader::archive::Archive;
+use sel4lake_loader::cert::{TrustedCert, SIG_ALG_ED25519, SIG_ED25519_LEN};
 use sel4lake_loader::elf::ElfImage;
 use sel4lake_loader::{LoaderError, Program, DOMAIN_TRUSTED, DOMAIN_USERLAND};
 use sel4lake_microkit::Domain;
 use sel4lake_sched::ThreadId;
+use sel4lake_trust::{fingerprint, sha256, verify_sig};
 
 /// Größe des reservierten RAM-Fensters für das Boot-Archiv (oben in RAM, vom `PhysAllocator`
 /// ausgenommen — siehe `init_mem`-Aufruf in `main.rs`). QEMU legt das Archiv per
@@ -93,15 +96,76 @@ pub fn load_program_into_pd(
     crate::system::load_into_pd(&img, pd, endow).ok_or(LoaderError::NoResources)
 }
 
-/// **Integritaets-/Trust-Hook** (ADR 0011 §7): darf dieses Image geladen werden? **Alle** geladenen
-/// Prozesse laufen **EL0-isoliert** (`load_into_pd` spawnt stets EL0; selbst eine TrustedSAS-PD ist
-/// geladen EL0-isoliert) — ein fehlerhaftes/boesartiges Image faultet daher nur sich selbst, ohne
-/// Privileg-Eskalation. Es gibt also **kein** Privileg-basiertes Lade-Verbot mehr. `prog.hash` ist
-/// der vorbereitete Hook fuer eine spaetere **Integritaets-/Signaturpruefung** (z.B. fuer
-/// vertrauenswuerdige Produktionsdienste); derzeit immer erlaubt.
-#[allow(unused_variables)]
+/// **Integritaets-/Trust-Gate** (ADR 0011 §7 + ADR 0014, ext-28): darf dieses Image geladen werden?
+///
+/// **Alle** geladenen Prozesse laufen **EL0-isoliert** (`load_into_pd` spawnt stets EL0; selbst eine
+/// TrustedSAS-PD ist geladen EL0-isoliert) — ein fehlerhaftes/boesartiges Image faultet daher nur
+/// sich selbst, ohne Privileg-Eskalation. Daher braucht **UserLand/HardwareLand kein Zertifikat**
+/// (unveraendert; ihre Isolation traegt die Hardware).
+///
+/// **TrustedSAS** dagegen darf seine Trust-Stufe behalten (PdControl-/Loader-Caps halten duerfen) —
+/// deshalb wird es **nur mit einem gueltigen, auf genau dieses Binary gebundenen Ed25519-Zertifikat**
+/// geladen ([`verify_trusted_cert`]). Ohne gueltiges Zertifikat: [`LoaderError::Unverified`].
 fn verify_image(prog: &Program) -> bool {
-    true
+    if prog.domain != DOMAIN_TRUSTED {
+        return true; // UserLand/HardwareLand: hardware-isoliert, kein Zertifikat noetig.
+    }
+    verify_trusted_cert(prog)
+}
+
+/// **TrustedSAS-Zertifikatspruefung** (ext-28, ADR 0014). Akzeptiert das Image **nur**, wenn das
+/// mitgelieferte Zertifikat in **jeder** Hinsicht gueltig ist. Rein verifizierend (kein Heap, kein
+/// RNG); die read-only Key-DB ([`TRUSTED_KEYS`]) ist in den Kernel kompiliert.
+///
+/// Geprueft (alle Felder sind durch die Signatur ueber die **gesamte** Nachricht geschuetzt):
+/// 1. Zertifikat parst (Magic/Formatversion/Laengen — [`TrustedCert::parse`]).
+/// 2. Signaturalgorithmus = Ed25519 **und** Signaturlaenge = 64.
+/// 3. `key_id` in der Key-DB vorhanden, **nicht** zurueckgezogen, und DB-selbstkonsistent
+///    (`key_id == fingerprint(pubkey)`).
+/// 4. Ed25519-Signatur ueber die **gesamte** Nachricht gueltig (`verify_strict`).
+/// 5. **Binary-Bindung:** `binary_hash == SHA-256(ELF)` und `manifest_hash == SHA-256(Manifest)`.
+/// 6. **Identitaet:** `program_id`/`version` stimmen mit dem Archiv-Eintrag ueberein.
+/// 7. **Anti-Downgrade:** `version >= MIN_VERSION[program_id]` (falls gepflegt).
+/// 8. **Unsafe-Audit:** `unsafe_status == ALL_PASS` (Programm forbid-rein, Projekt sauber,
+///    Allowlist erfuellt).
+fn verify_trusted_cert(prog: &Program) -> bool {
+    let Ok(cert) = TrustedCert::parse(prog.cert) else {
+        return false; // (1) fehlend/kaputt
+    };
+    // (2) Algorithmus + Signaturlaenge passend zum Verfahren.
+    if cert.signature_algorithm_id != SIG_ALG_ED25519 {
+        return false;
+    }
+    let Ok(sig): Result<&[u8; SIG_ED25519_LEN], _> = cert.signature().try_into() else {
+        return false;
+    };
+    // (3) Key-ID-Lookup in der read-only Key-DB; Revocation + DB-Selbstkonsistenz.
+    let Some(key) = TRUSTED_KEYS.iter().find(|k| k.key_id == cert.key_id) else {
+        return false;
+    };
+    if key.revoked || fingerprint(&key.pubkey) != key.key_id {
+        return false;
+    }
+    // (4) Signatur ueber die GESAMTE Nachricht.
+    if !verify_sig(&key.pubkey, cert.message(), sig) {
+        return false;
+    }
+    // (5) Binary-/Manifest-Bindung.
+    if cert.binary_hash != sha256(prog.elf) || cert.manifest_hash != sha256(prog.manifest) {
+        return false;
+    }
+    // (6) Identitaets-Konsistenz mit dem Archiv-Eintrag.
+    if cert.program_id != prog.program_id || cert.version != prog.version {
+        return false;
+    }
+    // (7) Anti-Downgrade (firmware-gepflegte Untergrenze je program_id).
+    if let Some(&(_, min_ver)) = MIN_VERSION.iter().find(|&&(id, _)| id == prog.program_id) {
+        if cert.version < min_ver {
+            return false;
+        }
+    }
+    // (8) Unsafe-Audit-Status: alle TrustedSAS-Regeln bestanden.
+    cert.unsafe_all_pass()
 }
 
 /// `SYS_LOAD`-Callback (ext-26, L2): das Programm mit Index `index` aus dem Boot-Archiv laden +

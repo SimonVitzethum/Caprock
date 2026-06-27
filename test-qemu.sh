@@ -39,16 +39,29 @@ mkdir -p build
 ( cd tests && rustup run nightly cargo build --release ) >/dev/null 2>&1 \
     || { echo "TESTS BUILD FAILED"; exit 1; }
 HELLO="programs/build/target/aarch64-sel4lake-user/release/hello.elf"
+SVCDEMO="programs/build/target/aarch64-sel4lake-user/release/svc-demo.elf"
 TBIN="tests/build/target/aarch64-sel4lake-user/release"
 printf 'PLACEHOLDER' > build/_probe.bin
-# hello=UserLand(2), hwhello=HardwareLand(1) (gleiches ELF, L3), trusted-x=TrustedSAS(0, laedt
-# GELADEN als EL0-isolierte PD), probe=Platzhalter (Multi-Modul-Liste). ext-27 Testdienste je
-# Domaene (2 je Domaene): aggressor/intruder -u=UserLand(2), -h=HardwareLand(1), -t=TrustedSAS(0).
+# ext-28 (ADR 0014): TrustedSAS-Binaries signieren. tools/sign_trusted.py fuehrt zuerst den
+# Unsafe-Audit (Allowlist {libsel4lake}) durch -> KEIN Zertifikat bei Verletzung, dann SHA-256-
+# Bindung an genau dies ELF + Ed25519-Signatur ueber die volle Nachricht. program_id/version MUESSEN
+# zum Archiv-Eintrag passen (Identitaets-Bindung). Schluessel: keys/trusted-test (privat, gitignored).
+mkdir -p certs
+sign() { python3 tools/sign_trusted.py --key keys/trusted-test.ed25519 "$@" >/dev/null 2>&1; }
+sign --crate programs/trusted/svc-demo --elf "$SVCDEMO" --program-id 12 --version 1 \
+     --out certs/trusted-x.cert || { echo "SIGN trusted-x FAILED"; exit 1; }
+sign --crate tests/services/trusted/aggressor --elf "$TBIN/aggressor-t.elf" --program-id 24 --version 1 \
+     --out certs/aggressor-t.cert || { echo "SIGN aggressor-t FAILED"; exit 1; }
+# hello=UserLand(2), hwhello=HardwareLand(1) (gleiches ELF, L3); trusted-x=TrustedSAS(0): das saubere,
+# zertifizierte svc-demo (laedt GELADEN als EL0-isolierte PD). probe=Platzhalter (Multi-Modul-Liste).
+# ext-27 Testdienste je Domaene (2 je Domaene): aggressor/intruder -u=UserLand(2), -h=HardwareLand(1),
+# -t=TrustedSAS(0). ext-28: TrustedSAS-Module tragen ein Zertifikat (7. Feld); aggressor-t ist
+# zertifiziert (laedt + attackiert), intruder-t bewusst OHNE Zertifikat -> verify_image weist es ab.
 python3 tools/mkarchive.py build/boot-archive.bin \
-    10:hello:2:1:"$HELLO" 11:hwhello:1:1:"$HELLO" 12:trusted-x:0:1:"$HELLO" 2:probe:2:1:build/_probe.bin \
+    10:hello:2:1:"$HELLO" 11:hwhello:1:1:"$HELLO" 12:trusted-x:0:1:"$SVCDEMO"::certs/trusted-x.cert 2:probe:2:1:build/_probe.bin \
     20:aggressor-u:2:1:"$TBIN/aggressor-u.elf" 21:intruder-u:2:1:"$TBIN/intruder-u.elf" \
     22:aggressor-h:1:1:"$TBIN/aggressor-h.elf" 23:intruder-h:1:1:"$TBIN/intruder-h.elf" \
-    24:aggressor-t:0:1:"$TBIN/aggressor-t.elf" 25:intruder-t:0:1:"$TBIN/intruder-t.elf" \
+    24:aggressor-t:0:1:"$TBIN/aggressor-t.elf"::certs/aggressor-t.cert 25:intruder-t:0:1:"$TBIN/intruder-t.elf" \
     >/dev/null 2>&1 || { echo "ARCHIVE BUILD FAILED"; exit 1; }
 
 echo "== boot ($SECONDS_RUN s) =="
@@ -129,7 +142,7 @@ check "intru   : ALL PASS" "Adversariale Testdienste (ext-27 T1): extern geladen
 check "aggrh   : ALL PASS" "Adversariale Testdienste (ext-27 T2): extern geladenes HardwareLand-Backend als Aggressor -- KEINE Management-Autoritaet (PDCTL/LOAD/KILL -> BADCAP), nichts ausserhalb des eigenen Kanals; Cap-Confusion abgewiesen; meldet SUCCESS ueber den Kanal; Audits==0"
 check "intrh   : ALL PASS" "Adversariale Testdienste (ext-27 T2): extern geladenes HardwareLand-Backend als Intruder -- Kernel-RAM-Zugriff aus EL0 faultet ebenso (Speicher-Isolation domaenen-unabhaengig); Kernel ueberlebt; PRE + el0_fault_count++ + Audits==0"
 check "aggrt   : ALL PASS" "Adversariale Testdienste (ext-27 T3): extern geladener TrustedSAS-Aggressor (EL0-isoliert) -- Trust != Privileg: ohne tatsaechliche PdControl/Loader-Cap PDCTL/LOAD/KILL = BADCAP; Cap-Confusion abgewiesen; SUCCESS nur bei voller Abweisung; Audits==0"
-check "intrt   : ALL PASS" "Adversariale Testdienste (ext-27 T3): extern geladener TrustedSAS-Intruder (EL0-isoliert) -- liest Kernel-RAM aus EL0 -> Fault -> terminiert; Trust befreit NICHT von der Hardware-Isolation (staerkste Aussage); PRE + el0_fault_count++ + Audits==0"
+check "intrt   : ALL PASS" "TrustedSAS-Zertifikats-Gate (ext-28, ADR 0014): UNZERTIFIZIERTES TrustedSAS wird abgewiesen -- intruder-t traegt absichtlich unsafe (nicht zertifizierbar) + liegt OHNE Zertifikat im Archiv -> verify_image lehnt das Laden mit Unverified ab; KEIN Thread/keine PD; Audits==0"
 check "cross   : ALL PASS" "Adversariale Testdienste (ext-27 T4): Cross-Service-Matrix -- 3 extern geladene Angreifer DREIER Domaenen NEBENLAEUFIG (aggressor-u + aggressor-t melden unabhaengig SUCCESS, intruder-h faultet); gleichzeitige cross-domain Angreifer stoeren einander nicht; kernel-geschuetztes Canary unberuehrt; Audits==0"
 fcheck "hwfuzz  : ALL PASS" "Domaenen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Domaenen-Policy + CDT/VSpace-Oracle + Ressourcen-Baseline"
 online=$(echo "$OUT" | grep -c "online")

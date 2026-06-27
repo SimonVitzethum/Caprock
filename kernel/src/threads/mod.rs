@@ -16,6 +16,7 @@ use sel4lake_abi::{pdctl, result, sys, GRANT_FLAG, GRANT_RECV_SLOT};
 use sel4lake_hal::{self as hal, println, syscall::invoke};
 use sel4lake_mem::{peek_u64, poke_u64, Rights};
 use sel4lake_cap::{DmaCoherence, DmaDir};
+use sel4lake_loader::LoaderError;
 use sel4lake_microkit::Domain;
 use sel4lake_sched::ThreadId;
 use sel4lake_sync::SpinLock;
@@ -539,16 +540,13 @@ static AGGRT_NTFN: AtomicUsize = AtomicUsize::new(usize::MAX);
 static AGGRT_POLLS: AtomicU32 = AtomicU32::new(0);
 /// Erfolgs-Badge "AGRT" — aggressor-t signalisiert es nur bei vollstaendig abgewiesener Batterie.
 const AGGRT_SUCCESS: u64 = 0x4147_5254;
-// INTRT = TrustedSAS-Intruder (staerkste Aussage: auch ein trusted EL0-Dienst faultet auf Kernel-RAM
-// -> Trust befreit NICHT von der Hardware-Isolation).
+// INTRT = TrustedSAS-Intruder, ext-28 UMGEWIDMET: Beweis, dass UNZERTIFIZIERTES TrustedSAS gar nicht
+// erst laedt. intruder-t traegt absichtlich `unsafe` (der illegale Kernel-RAM-Zugriff IST sein Test)
+// und ist daher NICHT zertifizierbar -> ohne gueltiges Zertifikat weist das verify_image-Gate (ADR
+// 0014) das Laden ab. Reine Lade-Abweisung (synchron) -> kein Notification-/Fault-Polling noetig.
 static INTRT_STARTED: AtomicBool = AtomicBool::new(false);
 static INTRT_DONE: AtomicBool = AtomicBool::new(false);
 static INTRT_OK: AtomicBool = AtomicBool::new(false);
-static INTRT_NTFN: AtomicUsize = AtomicUsize::new(usize::MAX);
-static INTRT_POLLS: AtomicU32 = AtomicU32::new(0);
-static INTRT_FAULT_BASE: AtomicUsize = AtomicUsize::new(usize::MAX);
-/// PRE-Badge "INRT" — intruder-t signalisiert es vor dem fatalen Kernel-RAM-Zugriff.
-const INTRT_PRE: u64 = 0x494E_5254;
 
 // ext-27 T4: Cross-Service-Matrix -- DREI Angreifer DREIER Domaenen NEBENLAEUFIG geladen: zwei
 // Aggressoren (UserLand + TrustedSAS) muessen UNABHAENGIG ihr SUCCESS melden (gleichzeitige
@@ -767,6 +765,25 @@ fn run_el0_intruder(name: &str, badge: u64) -> usize {
     })();
     hal::cpu::local_irq_enable();
     res.unwrap_or(usize::MAX)
+}
+
+/// **ext-28 — die Lade-Abweisung eines unzertifizierten TrustedSAS-Binaries pruefen** (ADR 0014).
+/// Versucht, das per `name` benannte TrustedSAS-Programm zu laden, und gibt `true` **genau dann**,
+/// wenn das [`loader::load_image`]-Gate ([`crate::loader`]) es mit [`LoaderError::Unverified`]
+/// abweist (fehlendes/ungueltiges Zertifikat). Es entsteht dabei **kein** Thread und **keine** PD.
+/// IRQ-maskiert (Symmetrie mit den uebrigen Lade-Helfern).
+fn trusted_load_rejected(name: &str) -> bool {
+    hal::cpu::local_irq_disable();
+    let res = (|| {
+        let archive = loader::read_archive()?;
+        let svc = archive.iter().find(|p| p.name() == name)?;
+        Some(matches!(
+            loader::load_image(&svc, &[]),
+            Err(LoaderError::Unverified)
+        ))
+    })();
+    hal::cpu::local_irq_enable();
+    res.unwrap_or(false)
 }
 
 /// **ext-27 T2 — ein HardwareLand-Testdienst in ein Backend laden.** Eine HardwareLand-Backend-PD
@@ -4070,28 +4087,17 @@ pub fn demo_report_then_idle() -> ! {
             }
         }
 
-        // ext-27 T3b: TrustedSAS-Intruder (Hardware-Isolation auch fuer die vertraute Domaene).
-        // Start gegate auf aggrt fertig; Fault-Baseline schnappen, dann PRE-Badge + Fault pollen.
+        // ext-28 (umgewidmet von ext-27 T3b): UNZERTIFIZIERTES TrustedSAS wird ABGELEHNT. intruder-t
+        // liegt OHNE Zertifikat im Archiv (es traegt absichtlich `unsafe` -> nicht zertifizierbar);
+        // das verify_image-Gate (ADR 0014) muss das Laden mit `Unverified` abweisen, OHNE dass ein
+        // Thread/eine PD entsteht und ohne Audit-Stoerung. Staerker als „laeuft + faultet": das
+        // Binary laeuft gar nicht erst an. (Die EL0-Isolation der Trusted-Domaene bleibt durch
+        // intruder-u/intruder-h domaenenunabhaengig belegt.) Synchron, gegate auf aggrt fertig.
         if !INTRT_STARTED.load(Ordering::Acquire) && AGGRT_DONE.load(Ordering::Acquire) {
-            INTRT_FAULT_BASE.store(system::el0_fault_count(), Ordering::Relaxed);
-            let n = run_el0_intruder("intruder-t", INTRT_PRE);
-            INTRT_NTFN.store(n, Ordering::Relaxed);
-            if n == usize::MAX {
-                INTRT_DONE.store(true, Ordering::Release);
-            }
+            let rejected = trusted_load_rejected("intruder-t");
+            INTRT_OK.store(rejected && ext27_audits_ok(), Ordering::Release);
+            INTRT_DONE.store(true, Ordering::Release);
             INTRT_STARTED.store(true, Ordering::Release);
-        }
-        if INTRT_STARTED.load(Ordering::Acquire) && !INTRT_DONE.load(Ordering::Acquire) {
-            let n = INTRT_NTFN.load(Ordering::Relaxed);
-            let base = INTRT_FAULT_BASE.load(Ordering::Relaxed);
-            let pre = n != usize::MAX && system::notification_pending(n) == INTRT_PRE;
-            let faulted = base != usize::MAX && system::el0_fault_count() > base;
-            if pre && faulted {
-                INTRT_OK.store(ext27_audits_ok(), Ordering::Release);
-                INTRT_DONE.store(true, Ordering::Release);
-            } else if INTRT_POLLS.fetch_add(1, Ordering::Relaxed) > 200_000 {
-                INTRT_DONE.store(true, Ordering::Release); // Timeout -> FAIL
-            }
         }
 
         // ext-27 T4: Cross-Service-Matrix (3 Domaenen nebenlaeufig). Start gegate auf intrt fertig.
@@ -4848,7 +4854,7 @@ fn report() {
     );
     let intrt = INTRT_DONE.load(Ordering::Acquire) && INTRT_OK.load(Ordering::Acquire);
     println!(
-        "intrt   : {} (extern geladener TrustedSAS-Intruder (EL0-isoliert): las Kernel-RAM aus EL0 -> Fault -> terminiert, Kernel laeuft weiter; Trust befreit NICHT von der Hardware-Isolation (staerkste Aussage); PRE + el0_fault_count++ + Audits==0)",
+        "intrt   : {} (ext-28 Zertifikats-Gate: UNZERTIFIZIERTES TrustedSAS wird abgewiesen -- intruder-t traegt absichtlich `unsafe` (nicht zertifizierbar), liegt OHNE Zertifikat im Archiv -> verify_image (ADR 0014) weist das Laden mit Unverified ab; KEIN Thread/keine PD entsteht; Audits==0)",
         if intrt { "ALL PASS" } else { "FAILURES" }
     );
 

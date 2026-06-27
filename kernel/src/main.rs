@@ -33,6 +33,9 @@ mod panic;
 mod selftest;
 mod system;
 mod threads;
+/// Read-only TrustedSAS-Root-Key-DB (ext-28, ADR 0014) — autogeneriert von `tools/gen_trusted_key.py`,
+/// in den Kernel kompiliert, nur per Firmware-/Kernel-Update änderbar (nicht per Syscall).
+mod trusted_keys;
 
 use sel4lake_hal::{self as hal, println};
 

@@ -189,6 +189,7 @@ dependencies = [
  "sel4lake-region",
  "sel4lake-sched",
  "sel4lake-sync",
+ "sel4lake-trust",
 ]
 
 [[package]]

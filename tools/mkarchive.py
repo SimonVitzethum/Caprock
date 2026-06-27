@@ -9,10 +9,13 @@
 # numerische program_id + version (Verfeinerung 4).
 #
 # Aufruf:
-#   mkarchive.py OUT ID:NAME:DOMAIN:VERSION:BLOB[:MANIFEST] [ ... ]
+#   mkarchive.py OUT ID:NAME:DOMAIN:VERSION:BLOB[:MANIFEST[:CERT]] [ ... ]
 #   DOMAIN: 0=TrustedSAS 1=HardwareLand 2=UserLand
+#   CERT (ext-28): TrustedSAS-Zertifikat (tools/sign_trusted.py). Leeres Feld = kein Zertifikat;
+#   nur TrustedSAS-Module brauchen eines (das verify_image-Gate lehnt unzertifiziertes TrustedSAS ab).
 # Beispiel:
 #   mkarchive.py build/boot-archive.bin 1:hello:2:1:build/hello.elf:build/hello.manifest
+#   mkarchive.py build/boot-archive.bin 12:svc:0:1:build/svc.elf::certs/svc.cert   # Cert, kein Manifest
 import struct
 import sys
 
@@ -28,37 +31,44 @@ def main(argv):
         return 2
     out = argv[1]
     specs = argv[2:]
-    entries = []  # (program_id, name, version, domain, blob_bytes, manifest_bytes)
+    entries = []  # (program_id, name, version, domain, blob, manifest, cert)
     for s in specs:
         parts = s.split(":")
         if len(parts) < 5:
-            sys.stderr.write(f"mkarchive: ungueltige Spec '{s}' (erwartet ID:NAME:DOMAIN:VERSION:BLOB[:MANIFEST])\n")
+            sys.stderr.write(f"mkarchive: ungueltige Spec '{s}' (erwartet ID:NAME:DOMAIN:VERSION:BLOB[:MANIFEST[:CERT]])\n")
             return 2
         pid, name, domain, ver, blobpath = int(parts[0]), parts[1], int(parts[2]), int(parts[3]), parts[4]
-        manpath = parts[5] if len(parts) > 5 else None
+        manpath = parts[5] if len(parts) > 5 and parts[5] else None
+        certpath = parts[6] if len(parts) > 6 and parts[6] else None
         with open(blobpath, "rb") as f:
             blob = f.read()
         man = b""
         if manpath:
             with open(manpath, "rb") as f:
                 man = f.read()
-        entries.append((pid, name, ver, domain, blob, man))
+        cert = b""
+        if certpath:
+            with open(certpath, "rb") as f:
+                cert = f.read()
+        entries.append((pid, name, ver, domain, blob, man, cert))
 
     count = len(entries)
     table_end = HEADER_LEN + count * ENTRY_LEN
     payload = bytearray()
-    spans = []  # (blob_off, blob_len, man_off, man_len)
-    for (_, _, _, _, blob, man) in entries:
+    spans = []  # (blob_off, blob_len, man_off, man_len, cert_off, cert_len)
+    for (_, _, _, _, blob, man, cert) in entries:
         bo = table_end + len(payload)
         payload += blob
         mo = table_end + len(payload)
         payload += man
-        spans.append((bo, len(blob), mo, len(man)))
+        co = table_end + len(payload)
+        payload += cert
+        spans.append((bo, len(blob), mo, len(man), co, len(cert)))
     total = table_end + len(payload)
 
     buf = bytearray(table_end)
     struct.pack_into("<IIII", buf, 0, MAGIC, VERSION, count, total)  # reserved[4] bleibt 0
-    for i, ((pid, name, ver, domain, _, _), (bo, bl, mo, ml)) in enumerate(zip(entries, spans)):
+    for i, ((pid, name, ver, domain, _, _, _), (bo, bl, mo, ml, co, cl)) in enumerate(zip(entries, spans)):
         base = HEADER_LEN + i * ENTRY_LEN
         nb = name.encode()[:16]
         buf[base:base + len(nb)] = nb
@@ -66,7 +76,8 @@ def main(argv):
         struct.pack_into("<IIII", buf, base + 16, pid, ver, domain, 0)
         # blob_off, blob_len, manifest_off, manifest_len
         struct.pack_into("<IIII", buf, base + 32, bo, bl, mo, ml)
-        # hash[32] (base+48..80) + reserved[4] (80..96) bleiben 0
+        # hash[32] (base+48..80) bleibt 0; cert_off/cert_len (80..88, ext-28); reserved[2] (88..96) = 0
+        struct.pack_into("<II", buf, base + 80, co, cl)
     buf += payload
 
     with open(out, "wb") as f:

@@ -13,6 +13,10 @@
 
 #![no_std]
 #![no_main]
+// ext-28: vollstaendig unsafe-frei -> als TrustedSAS **zertifizierbar** (Signatur-Gate, ADR 0014).
+// Der Entry-Point `_start` (mit dem unsafe-Attribut `#[no_mangle]`) kommt aus der auditierten
+// SDK-Schicht libsel4lake (Allowlist) via `entry!` — dieser Dienst selbst bleibt forbid-rein.
+#![forbid(unsafe_code)]
 
 use libsel4lake::{exit, invoke, result, sys};
 
@@ -30,8 +34,9 @@ fn expect(nr: u64, cap: u64, want: u64, ok: &mut bool) {
     }
 }
 
-#[no_mangle]
-pub extern "C" fn _start(_arg: usize) -> ! {
+libsel4lake::entry!(run);
+
+fn run(_arg: usize) -> ! {
     let mut ok = true;
 
     // A1: leerer Slot -> BADCAP. KERNPUNKT (Trust != Privileg): PDCTL/LOAD/KILL scheitern als

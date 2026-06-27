@@ -29,6 +29,7 @@ sel4lake-sync = { path = "../crates/sel4lake-sync" }
 sel4lake-mem = { path = "../crates/sel4lake-mem" }
 sel4lake-region = { path = "../crates/sel4lake-region" }
 sel4lake-loader = { path = "../crates/sel4lake-loader" }
+sel4lake-trust = { path = "../crates/sel4lake-trust" }
 sel4lake-cap = { path = "../crates/sel4lake-cap" }
 sel4lake-sched = { path = "../crates/sel4lake-sched" }
 sel4lake-ipc = { path = "../crates/sel4lake-ipc" }

@@ -76,7 +76,7 @@ für **alle** Zustände (unbeschränkt). Methode (vom Nutzer vorgegeben): **kein
 
 Mehrere Pilotdateien spezifizieren **dokumentierte Kernel-Audits** und beweisen, dass die jeweiligen
 Operationen die Invariante **erhalten** — statisch + für **alle** Zustände, nicht nur an den
-Audit-Quiescenz-Punkten wie zur Laufzeit (`tools/verus-verify.sh`, gesamt **21 verified, 0 errors**,
+Audit-Quiescenz-Punkten wie zur Laufzeit (`tools/verus-verify.sh`, gesamt **28 verified, 0 errors**,
 über die Audits `cap_audit_cdt`, `domain_audit`, `vspace_audit`, `dma_audit` — fünf verschiedene
 Invariantentypen: Zählen, verkettete Struktur, Klassifikation, Permission, Geometrie):
 
@@ -113,6 +113,13 @@ EL0-Seite ist zugleich schreib- **und** ausführbar (Code-Integrität). Bewiesen
 **(F) DMA-Disjunktheit** ([`verus/dma_disjoint.rs`](../verus/dma_disjoint.rs), `dma_audit` Inv. 1):
 kernel-ausgeschnittene DMA-Regionen sind **paarweise disjunkt** + disjunkt von der Kernel-Region
 (Grundlage der DMA-Isolation). Bewiesen für **`alloc_region`** (hängt nur disjunkte Regionen ein).
+
+**(G) CDT-Azyklizität** ([`verus/cap_cdt_acyclic.rs`](../verus/cap_cdt_acyclic.rs), `cap_audit_cdt`
+Code 7 — die **schwierigste**): die Eltern-Kette hat **keinen Zyklus irgendeiner Länge**. Bewiesen
+über ein **Wohlfundiertheits-Maß** (ein `rank`, der entlang `parent` strikt fällt → jede Kette
+terminiert). `derive` erhält die Rang-Monotonie; das Lemma `ancestor_rank_decreases` (Induktion über
+die Kettenlänge) liefert die **allgemeine** Aussage `not_own_ancestor`: kein Knoten ist sein eigener
+`k`-ter Vorfahre, für **beliebiges** `k`.
 
 So werden `cap_audit_cdt`, `domain_audit`, `vspace_audit` + `dma_audit` von zur Laufzeit **geprüften**
 zu **bewiesenen** Invarianten.

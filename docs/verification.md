@@ -76,8 +76,9 @@ für **alle** Zustände (unbeschränkt). Methode (vom Nutzer vorgegeben): **kein
 
 Mehrere Pilotdateien spezifizieren **dokumentierte Kernel-Audits** und beweisen, dass die jeweiligen
 Operationen die Invariante **erhalten** — statisch + für **alle** Zustände, nicht nur an den
-Audit-Quiescenz-Punkten wie zur Laufzeit (`tools/verus-verify.sh`, gesamt **19 verified, 0 errors**,
-über die Audits `cap_audit_cdt`, `domain_audit`, `vspace_audit`):
+Audit-Quiescenz-Punkten wie zur Laufzeit (`tools/verus-verify.sh`, gesamt **21 verified, 0 errors**,
+über die Audits `cap_audit_cdt`, `domain_audit`, `vspace_audit`, `dma_audit` — fünf verschiedene
+Invariantentypen: Zählen, verkettete Struktur, Klassifikation, Permission, Geometrie):
 
 **(A) Refcount-Invariante** ([`verus/cap_cdt_refcount.rs`](../verus/cap_cdt_refcount.rs), Codes 1–3):
 1. jeder belegte Slot zeigt auf ein gültiges, belegtes Objekt;
@@ -109,8 +110,12 @@ Nicht-HardwareLand-PD.
 EL0-Seite ist zugleich schreib- **und** ausführbar (Code-Integrität). Bewiesen für **`map_page`**
 (mappt nur W^X-konform) und **`make_writable`** (W nur auf nicht-ausführbare Seiten).
 
-So werden `cap_audit_cdt`, `domain_audit` + `vspace_audit` von zur Laufzeit **geprüften** zu
-**bewiesenen** Invarianten.
+**(F) DMA-Disjunktheit** ([`verus/dma_disjoint.rs`](../verus/dma_disjoint.rs), `dma_audit` Inv. 1):
+kernel-ausgeschnittene DMA-Regionen sind **paarweise disjunkt** + disjunkt von der Kernel-Region
+(Grundlage der DMA-Isolation). Bewiesen für **`alloc_region`** (hängt nur disjunkte Regionen ein).
+
+So werden `cap_audit_cdt`, `domain_audit`, `vspace_audit` + `dma_audit` von zur Laufzeit **geprüften**
+zu **bewiesenen** Invarianten.
 
 Lokal ausführen: `tools/verus-verify.sh` (Verus + Z3 aus dem Release nach `~/.verus`; geforderte
 rustc-Toolchain via `rustup toolchain install`). Strategie/Stufenmodell: `ARMTest/formale-verifikation-aufwand.md`.

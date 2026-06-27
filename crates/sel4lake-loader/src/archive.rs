@@ -233,3 +233,36 @@ mod tests {
         assert_eq!(Archive::parse(&raw).unwrap_err(), LoaderError::OutOfBounds);
     }
 }
+
+// Formale Verifikation (Tier 1, Kani — bounded Model Checking). Nur unter `cargo kani` kompiliert,
+// im Normal-Build inert. Das Boot-Archiv ist die EINZIGE externe Datenquelle des Loaders (aus dem
+// reservierten RAM-Fenster gelesen) → Crash-Freiheit auf beliebiger Eingabe ist sicherheitskritisch.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    // 260 reicht, um jeden Pfad zu erreichen: `parse` betritt die Eintragsschleife nur, wenn
+    // `count*96 + 32 <= total_len <= data.len() <= MAXLEN`, also count ≤ 2 (alle größeren count/
+    // total_len lösen vorher BadCount/OutOfBounds aus). Damit deckt unwind(3) die Schleife vollständig.
+    const MAXLEN: usize = 260;
+
+    /// **BEWEIS:** `Archive::parse` paniert/OOBt **nie** — für beliebige Bytes + Länge (≤ MAXLEN).
+    /// Ein verstümmeltes/bösartiges Boot-Archiv kann den Kernel-Loader nicht zum Absturz bringen.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn parse_never_panics() {
+        let data: [u8; MAXLEN] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MAXLEN);
+        if let Ok(a) = Archive::parse(&data[..len]) {
+            // Nach erfolgreichem parse liefert jeder Index < count ein gültiges Program (kein Panik).
+            let n = a.count();
+            kani::assume(n <= 2);
+            let mut i = 0;
+            while i < n {
+                let _ = a.program(i);
+                i += 1;
+            }
+        }
+    }
+}

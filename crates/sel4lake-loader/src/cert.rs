@@ -318,3 +318,48 @@ mod tests {
         assert_eq!(TrustedCert::parse(&c).unwrap_err(), LoaderError::BadCert);
     }
 }
+
+// Formale Verifikation (Tier 1, ADR/Analyse `ARMTest/formale-verifikation-aufwand.md`): bounded
+// Model Checking mit **Kani**. Nur unter `cargo kani` (`cfg(kani)`) kompiliert — im Normal-Build
+// vollständig inert (kein Einfluss auf Kernel/Tests). Hebt die bisher nur **gefuzzte** Aussage
+// „panik-frei, bounds-geprüft" auf einen **Beweis** für JEDE Eingabe bis `MAXLEN`.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    // Obergrenze der symbolischen Eingabe. WICHTIG: 260 reicht, um JEDEN Code-Pfad zu erreichen — ein
+    // Cert, das über den `build_info_len`-Check hinaus geparst wird, verlangt `msg_len < len`, also
+    // `build_info_len < len-152 <= 108`; größere `build_info_len` (bis u16::MAX) lösen IMMER den
+    // frühen `BadCert`-Rücksprung aus (kein Panik-Pfad braucht len > 260). Der Beweis ist damit für
+    // diesen Parser effektiv vollständig, nicht bloß „bis 260".
+    const MAXLEN: usize = 260;
+
+    /// **BEWEIS:** `TrustedCert::parse` paniert/OOBt **nie** — für beliebige Bytes + beliebige Länge
+    /// (≤ MAXLEN). Adversariale/verstümmelte Zertifikate können den Parser nicht zum Absturz bringen.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn parse_never_panics() {
+        let data: [u8; MAXLEN] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MAXLEN);
+        let _ = TrustedCert::parse(&data[..len]);
+    }
+
+    /// **BEWEIS:** Bei Erfolg partitionieren `message()` + `signature()` die Eingabe **exakt**
+    /// (`msg_len + sig_len == len`), die Signatur ist **nicht leer**, und
+    /// `message().len() == CERT_HEADER_LEN + build_info().len()` — die strukturelle Korrektheit, auf
+    /// die sich der Kernel-Verifier (`verify_image`) verlässt.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn parse_partitions_input() {
+        let data: [u8; MAXLEN] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MAXLEN);
+        if let Ok(c) = TrustedCert::parse(&data[..len]) {
+            assert!(c.message().len() + c.signature().len() == len);
+            assert!(!c.signature().is_empty());
+            assert!(c.message().len() == CERT_HEADER_LEN + c.build_info().len());
+            assert!(c.message().len() >= CERT_HEADER_LEN);
+        }
+    }
+}

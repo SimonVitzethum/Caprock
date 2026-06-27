@@ -110,6 +110,40 @@ pub proof fn lemma_refs_fresh(slots: Seq<Slot>, objects_len: nat, o: nat)
     }
 }
 
+/// Ersetzen von Slot `i` verschiebt `refs_to(o)` um die Beitragsdifferenz (Induktion). Folgerung:
+/// aendert das Update weder `used` noch `object` (gleicher Beitrag), bleibt `refs_to` unveraendert.
+pub proof fn lemma_refs_update(slots: Seq<Slot>, i: int, sl: Slot, o: nat)
+    requires 0 <= i < slots.len(),
+    ensures refs_to(slots.update(i, sl), o) + contrib(slots[i], o) == refs_to(slots, o) + contrib(sl, o),
+    decreases slots.len(),
+{
+    let upd = slots.update(i, sl);
+    if i == slots.len() - 1 {
+        assert(upd.drop_last() =~= slots.drop_last());
+        assert(upd.last() == sl);
+        assert(slots.last() == slots[i]);
+    } else {
+        assert(upd.last() == slots.last());
+        assert(upd.drop_last() =~= slots.drop_last().update(i, sl));
+        assert(slots.drop_last()[i] == slots[i]);
+        lemma_refs_update(slots.drop_last(), i, sl, o);
+    }
+}
+
+/// Zeigt ein belegter Slot auf `o`, so `refs_to(o) >= 1` (Induktion).
+pub proof fn lemma_refs_member(slots: Seq<Slot>, s: int, o: nat)
+    requires 0 <= s < slots.len(), slots[s].used, slots[s].object == o,
+    ensures refs_to(slots, o) >= 1,
+    decreases slots.len(),
+{
+    if s == slots.len() - 1 {
+        assert(slots.last() == slots[s]);
+    } else {
+        assert(slots.drop_last()[s] == slots[s]);
+        lemma_refs_member(slots.drop_last(), s, o);
+    }
+}
+
 // ============================ Operation: install ============================
 
 /// **BEWEIS:** `install` (neues Objekt mit `refcount=1` + eine Wurzel-Capability darauf: ein neuer
@@ -175,6 +209,107 @@ pub proof fn install(cs: CapSpace) -> (cs2: CapSpace)
         }
     }
     cs2
+}
+
+// ============================ Operation: copy ============================
+
+/// **BEWEIS:** `copy` (eine Capability auf Slot `src` ableiten: neues Kind am Kopf der Kinderliste,
+/// gleiches Objekt, `refcount++`, `rank = rank[src]+1`) **erhaelt die VOLLE Invariante** `cap_inv`.
+/// Vereint Refcount (Objekt +1), Struktur (4l/5/6) und Azyklizitaet (7) in EINEM Beweis.
+pub proof fn copy(cs: CapSpace, src: nat) -> (cs2: CapSpace)
+    requires
+        cap_inv(cs),
+        slot_live(cs, src),
+    ensures
+        cap_inv(cs2),
+{
+    let o = cs.slots[src as int].object;
+    let cnew: nat = cs.slots.len() as nat;
+    let srcnode = cs.slots[src as int];
+    let old_head = srcnode.first_child;
+    let new_slot = Slot {
+        used: true, object: o, parent: Some(src), first_child: None,
+        next: old_head, prev: None, rank: srcnode.rank + 1,
+    };
+    let s1 = cs.slots.update(src as int, Slot { first_child: Some(cnew), ..srcnode });
+    let s2 = if old_head is Some {
+        let h = old_head->Some_0;
+        s1.update(h as int, Slot { prev: Some(cnew), ..s1[h as int] })
+    } else { s1 };
+    let s3 = s2.push(new_slot);
+    let objs2 = cs.objects.update(o as int, Object { used: true, refcount: cs.objects[o as int].refcount + 1 });
+    let cs2 = CapSpace { objects: objs2, slots: s3 };
+
+    // --- Schluesselfakten aus cap_inv(cs) ---
+    // o gueltig + belegt; src zaehlt -> refs_to(o) >= 1 == altem refcount.
+    assert(o < cs.objects.len() && cs.objects[o as int].used);
+    lemma_refs_member(cs.slots, src as int, o);
+    assert(cs.objects[o as int].refcount == refs_to(cs.slots, o));
+    // old_head h (falls vorhanden) ist src's first_child: belegt, parent==src, prev==None.
+    if old_head is Some {
+        let h = old_head->Some_0;
+        assert(slot_live(cs, h) && cs.slots[h as int].parent == Some(src) && cs.slots[h as int].prev is None);
+        // prev[h]==None -> KEIN belegter Slot zeigt per next auf h.
+        assert forall|t: nat| slot_live(cs, t) implies cs.slots[t as int].next != Some(h) by {
+            if cs.slots[t as int].next == Some(h) {}  // -> prev[h]==Some(t) != None: Widerspruch
+        }
+    }
+
+    // --- refs_to: die src/h-Updates aendern weder used noch object -> refs_to unveraendert; push +1 fuer o.
+    assert forall|x: nat| #![trigger refs_to(s3, x)] refs_to(s3, x) == refs_to(cs.slots, x) + contrib(new_slot, x) by {
+        // s1: update(src) mit gleichem used/object -> contrib gleich.
+        lemma_refs_update(cs.slots, src as int, Slot { first_child: Some(cnew), ..srcnode }, x);
+        if old_head is Some {
+            let h = old_head->Some_0;
+            lemma_refs_update(s1, h as int, Slot { prev: Some(cnew), ..s1[h as int] }, x);
+        }
+        lemma_refs_push(s2, new_slot, x);
+    }
+
+    // --- (1) Slot-Validitaet ---
+    assert forall|s: int| 0 <= s < s3.len() && #[trigger] s3[s].used
+        implies s3[s].object < objs2.len() && objs2[s3[s].object as int].used by {
+        if s < cs.slots.len() {
+            // alte Slots: object/used unveraendert (Updates aendern nur CDT-Links).
+        }
+    }
+    // --- (2)+(3) Refcount ---
+    assert forall|x: int| 0 <= x < objs2.len()
+        implies #[trigger] objs2[x].refcount == refs_to(s3, x as nat) && (objs2[x].used <==> objs2[x].refcount > 0) by {
+        if x != o { assert(objs2[x] == cs.objects[x]); }
+    }
+    // --- (4l,5,6,7) CDT-Struktur + Azyklizitaet ---
+    assert forall|s: nat| slot_live(cs2, s) implies {
+        let nd = cs2.slots[s as int];
+        &&& (nd.parent is Some ==> slot_live(cs2, nd.parent->Some_0)
+            && cs2.slots[nd.parent->Some_0 as int].object == nd.object
+            && cs2.slots[nd.parent->Some_0 as int].rank < nd.rank)
+        &&& (nd.next is Some ==> slot_live(cs2, nd.next->Some_0) && cs2.slots[nd.next->Some_0 as int].prev == Some(s))
+        &&& (nd.prev is Some ==> slot_live(cs2, nd.prev->Some_0) && cs2.slots[nd.prev->Some_0 as int].next == Some(s))
+        &&& (nd.first_child is Some ==> slot_live(cs2, nd.first_child->Some_0)
+            && cs2.slots[nd.first_child->Some_0 as int].parent == Some(s)
+            && cs2.slots[nd.first_child->Some_0 as int].prev is None)
+    } by {
+        // Verus fuehrt die Fallunterscheidung (s == cnew / src / h / sonst) ueber die obigen Fakten.
+    }
+    cs2
+}
+
+// ============================ Operation: mint ============================
+
+/// **BEWEIS:** `mint` (eine Capability ableiten **mit reduzierten Rechten + Badge**) **erhaelt
+/// `cap_inv`**. Bzgl. der CDT-/Refcount-Invariante ist `mint` **strukturell identisch zu `copy`**:
+/// es erzeugt dasselbe Kind am selben Ort mit demselben Objekt + `refcount++`; Rechte/Badge sind
+/// **nicht** Teil des Invariant-Modells (sie beeinflussen Autorität, nicht die Buchhaltung). Der
+/// Beweis delegiert daher an [`copy`].
+pub proof fn mint(cs: CapSpace, src: nat) -> (cs2: CapSpace)
+    requires
+        cap_inv(cs),
+        slot_live(cs, src),
+    ensures
+        cap_inv(cs2),
+{
+    copy(cs, src)
 }
 
 fn main() {}

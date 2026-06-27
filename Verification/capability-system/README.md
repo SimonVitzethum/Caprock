@@ -117,7 +117,7 @@ auf `o` zeigen (rekursiv); `ancestor(cs, s, k)` = `k`-ter Vorfahre entlang `pare
 | Sibling (5) | insert_before, unlink | `verus/cap_cdt_tree.rs` | ✅ bewiesen (3 verified) |
 | Struktur (4l+5+6) | derive | `verus/cap_cdt_structure.rs` | ✅ bewiesen (2 verified) |
 | Azyklizität (7) | derive (+ allg. Korollare) | `verus/cap_cdt_acyclic.rs` | ✅ bewiesen (7 verified) |
-| **Vereint (1–7), volle `cap_inv`** | **install** ✅ · copy, mint, move, delete, revoke ⏳ | [`proofs/cap_space.rs`](proofs/cap_space.rs) | ⏳ Schritt B fertig (Modell+`cap_inv`+install, 5 verified) · C laufend |
+| **Vereint (1–7), volle `cap_inv`** | **install ✅ · copy ✅ · mint ✅** · move, delete, revoke ⏳ | [`proofs/cap_space.rs`](proofs/cap_space.rs) | ⏳ B fertig · C laufend (install/copy/mint, 9 verified) |
 
 ## 10. Noch offene Eigenschaften
 

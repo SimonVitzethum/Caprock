@@ -24,7 +24,7 @@ Strategie/Stufenmodell + Aufwand: `ARMTest/formale-verifikation-aufwand.md`. Pip
 |---|---|---|---|
 | **1** | **Capability-System** | [`capability-system/`](capability-system/) | **Kern bewiesen** (volle `cap_inv` + install/copy/mint/delete; move/revoke = Reachability-Ausbaustufe) |
 | **2** | **Loader** (Zertifikat/Hash/Integrität/Zustandsautomat) | [`loader/`](loader/) | **Kern bewiesen** (Gate-Soundness/Revocation/Atomarität); Endowment offen |
-| 3 | Region-Runtime (Ownership/Lebensdauer/Allocator/Zero-Copy/Balance) | [`region-runtime/`](region-runtime/) | geplant (Kani-Speichersicherheit als Basis) |
+| **3** | **Region-Runtime** (Konservierung/Ownership/Balance) | [`region-runtime/`](region-runtime/) | **Kern bewiesen** (kein Leak/keine Doppel-Freigabe); RegionSource/Zero-Copy offen |
 | 4 | IPC (CALL/REPLY, Endpoints, Reply-Caps, Nachrichtenzustände) | [`ipc/`](ipc/) | geplant |
 | 5 | Scheduler | [`scheduler/`](scheduler/) | bewusst zuletzt |
 

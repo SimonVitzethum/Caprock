@@ -22,8 +22,8 @@ Strategie/Stufenmodell + Aufwand: `ARMTest/formale-verifikation-aufwand.md`. Pip
 
 | Phase | Komponente | Ordner | Status |
 |---|---|---|---|
-| **1** | **Capability-System** | [`capability-system/`](capability-system/) | **in Arbeit** (erste vollständig verifizierte Komponente) |
-| 2 | Loader (Zertifikat/Hash/Integrität/Endowment/Zustandsautomat) | [`loader/`](loader/) | geplant (Kani-Parser als Basis) |
+| **1** | **Capability-System** | [`capability-system/`](capability-system/) | **Kern bewiesen** (volle `cap_inv` + install/copy/mint/delete; move/revoke = Reachability-Ausbaustufe) |
+| **2** | **Loader** (Zertifikat/Hash/Integrität/Zustandsautomat) | [`loader/`](loader/) | **Kern bewiesen** (Gate-Soundness/Revocation/Atomarität); Endowment offen |
 | 3 | Region-Runtime (Ownership/Lebensdauer/Allocator/Zero-Copy/Balance) | [`region-runtime/`](region-runtime/) | geplant (Kani-Speichersicherheit als Basis) |
 | 4 | IPC (CALL/REPLY, Endpoints, Reply-Caps, Nachrichtenzustände) | [`ipc/`](ipc/) | geplant |
 | 5 | Scheduler | [`scheduler/`](scheduler/) | bewusst zuletzt |

@@ -26,7 +26,7 @@ Strategie/Stufenmodell + Aufwand: `ARMTest/formale-verifikation-aufwand.md`. Pip
 | **2** | **Loader** (Zertifikat/Hash/Integrität/Zustandsautomat) | [`loader/`](loader/) | **Kern bewiesen** (Gate-Soundness/Revocation/Atomarität); Endowment offen |
 | **3** | **Region-Runtime** (Konservierung/Ownership/Balance) | [`region-runtime/`](region-runtime/) | **Kern bewiesen** (kein Leak/keine Doppel-Freigabe); RegionSource/Zero-Copy offen |
 | **4** | **IPC** (CALL/REPLY-Rendezvous, Endpoint-Konsistenz) | [`ipc/`](ipc/) | **Kern bewiesen** (kein Verlust/Duplikat, Fortschritt); Reply-Caps/Nebenläufigkeit offen |
-| 5 | Scheduler | [`scheduler/`](scheduler/) | bewusst zuletzt |
+| **5** | **Scheduler** (Runqueue-Konsistenz, MCS-Budget) | [`scheduler/`](scheduler/) | **Kern bewiesen** (Queue-Kopplung/MCS-Schranke/keine Aushungerung/Fortschritt); Prio-Auswahl/Donation offen |
 
 ## Hardware-Vertrauensgrenze (bewusst außerhalb)
 

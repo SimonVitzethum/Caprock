@@ -22,6 +22,10 @@ path = "src/main.rs"
 # IMMER im Kernel (feature-unabhaengig).
 default = []
 kernel-fuzz = []
+# Continuous-Soak-Treiber (Burn-in #2): nach dem Selbsttest faehrt der Idle-Manager statt
+# `system_off` eine Endlos-Epochenschleife (Dauerbetrieb EINER Instanz). NUR Harness/Testcode; der
+# Kernel-Kern bleibt byte-identisch zum Release. Mit `soak,kernel-fuzz` kombinierbar.
+soak = []
 
 [dependencies]
 sel4lake-hal = { path = "../crates/sel4lake-hal" }

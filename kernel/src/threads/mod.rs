@@ -54,6 +54,11 @@ mod fuzz {
     }
 }
 
+// Continuous-Soak-Treiber (Burn-in #2): nur mit Feature `soak`. Reiner Harness-/Testcode (Kernel-Kern
+// unveraendert); nach dem Selbsttest faehrt `soak::run()` statt `system_off` eine Endlosschleife.
+#[cfg(feature = "soak")]
+mod soak;
+
 const NUM_CORES: usize = 8;
 const NWORKERS: usize = 3;
 const THRESHOLD: u64 = 3;
@@ -4197,13 +4202,23 @@ pub fn demo_report_then_idle() -> ! {
         if !reported && ALL_DONE.load(Ordering::Acquire) && all_done() {
             report();
             reported = true;
+            // Soak (Burn-in #2): statt herunterzufahren in den Dauerbetrieb gehen (Endlosschleife,
+            // kehrt nie zurueck). Nur mit Feature `soak`; der Kernel-Kern ist dabei unveraendert.
+            #[cfg(feature = "soak")]
+            {
+                println!("== SELFTEST COMPLETE -> SOAK (Dauerbetrieb einer Instanz, kein system_off) ==");
+                soak::run();
+            }
             // Alle Tests bestanden -> die (virtuelle) Maschine sauber herunterfahren,
             // damit das Test-Skript die vollständige Ausgabe erhält, ohne bis zum
             // Timeout warten zu müssen (verhindert ein Abschneiden des Berichts und
             // erlaubt umfangreichere Fuzz-Läufe innerhalb des Zeitfensters). Bei einem
             // Fehlschlag (all_done nie wahr) bleibt der Kernel im Idle -> Timeout greift.
-            println!("== SELFTEST COMPLETE -> system_off ==");
-            hal::psci::system_off();
+            #[cfg(not(feature = "soak"))]
+            {
+                println!("== SELFTEST COMPLETE -> system_off ==");
+                hal::psci::system_off();
+            }
         } else if !reported && hal::timer::ticks(0) > 6000 {
             // BUGFIX (nach Burn-in #1): Watchdog. Wird ein synchroner Test selten DONE-aber-OK=false
             // (z. B. eine flaky Messung), wuerde all_done() NIE true -> der Kernel spinnt ewig im

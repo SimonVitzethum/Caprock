@@ -1,7 +1,11 @@
 # Burn-in #2 — Continuous-Soak-Test (Plan) + Stabilitäts-Aussagekraft-Analyse
 
-Status: **geplant** (Implementierung erst nach Abschluss von Burn-in #1, dem Reboot-/Power-Cycle-
-Test). Dieses Dokument (a) bewertet ehrlich, welche Stabilitätsaussagen Burn-in #1 erlaubt und
+Status: **IMPLEMENTIERT** (nach ext-28). Feature `soak` (`kernel/src/threads/soak.rs`, Kernel-Kern
+byte-identisch) + Host-Orchestrator `tools/soak.py`. Aufruf: `tools/soak.py --hours H`. Der laufende
+Bericht entsteht unter `build/soak/report.md`. Validierung (Heartbeat temporär 3 s): >10 000 Epochen,
+freies RAM byte-identisch konstant, `cap_obj`/`cap_slots` konstant, `loads==dmas==Epochen`, alle
+Audits 0, 0 Anomalien. Dieses Dokument (a) bewertet ehrlich, welche Stabilitätsaussagen Burn-in #1
+erlaubt und
 welche **nicht**, und (b) leitet daraus den komplementären Continuous-Soak-Test ab. Ziel: zwei
 komplementäre Stabilitätsnachweise — (1) Reboot/Power-Cycle, (2) Dauerbetrieb **einer** Instanz.
 

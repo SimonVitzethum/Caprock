@@ -59,13 +59,14 @@ für den bare-metal Kernel), der `cargo kani` sonst brechen würde.
 
 ## CI-Gate
 
-`.gitea/workflows/kani.yml` führt bei **jedem Push/PR** aus:
-1. Host-Tests der Loader-Crate + Inert-Check (cfg(kani) bricht den Normal-Build nicht),
-2. **alle Kani-Harnesses** (cert/archive/elf).
+Zwei Workflows führen bei **jedem Push/PR** aus:
+- `.gitea/workflows/kani.yml`: Host-Tests der Loader-Crate + Inert-Check + **alle Kani-Harnesses**.
+- `.gitea/workflows/verus.yml`: installiert Verus (gepinntes Release + Z3) + **alle Verus-Beweise**
+  (`tools/verus-verify.sh`).
 
 Schlägt ein Beweis fehl (eine spätere Änderung verletzt eine bewiesene Eigenschaft), **schlägt die CI
-fehl**. Damit können bereits bewiesene Eigenschaften nicht unbeabsichtigt verloren gehen — die
-Verifikation ist fester Bestandteil des Entwicklungsprozesses.
+fehl**. Damit können bereits bewiesene Eigenschaften — Kani **und** Verus — nicht unbeabsichtigt
+verloren gehen; die Verifikation ist fester Bestandteil des Entwicklungsprozesses.
 
 ## Tier 2 (Pilot) — Verus: dokumentierte Invariante als formale Spezifikation
 

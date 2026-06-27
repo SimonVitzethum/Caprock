@@ -168,6 +168,77 @@ fn verify_trusted_cert(prog: &Program) -> bool {
     cert.unsafe_all_pass()
 }
 
+/// Größe des Puffers für die manipulierte Zertifikatskopie im [`trust_audit`]-Live-Oracle.
+const TRUST_AUDIT_CERT_MAX: usize = 512;
+
+/// **Nur das Trust-Gate auswerten, NICHT laden** (ext-28). Fuehrt [`verify_image`] aus, ohne
+/// Ressourcen zu allozieren — ausschliesslich fuer den `certfuzz`-Fuzzer (ADR 0013, daher nur mit
+/// Feature `kernel-fuzz` einkompiliert; der Release-Kernel braucht diesen verify-only-Pfad nicht).
+#[cfg(feature = "kernel-fuzz")]
+pub fn verify_only(prog: &Program) -> bool {
+    verify_image(prog)
+}
+
+/// **TrustedSAS-Trust-Audit** (ext-28, ADR 0014) — bleibt **immer** im Kernel (kein Fuzzer-Feature).
+/// Strukturelle Selbstkonsistenz der read-only Key-DB + Live-Oracle des aktiven Gates. `0` = sauber,
+/// sonst ein Anomalie-Code:
+/// * 1 — Key-DB leer (kein TrustedSAS koennte je geladen werden).
+/// * 2 — ein `key_id != fingerprint(pubkey)` (DB nicht selbst-zertifizierend).
+/// * 3 — doppelte `key_id` in der DB.
+/// * 4 — Live-Oracle: ein bekannt **gueltiges** Zertifikat wird abgelehnt (Gate/DB defekt).
+/// * 5 — Live-Oracle: eine **manipulierte** Kopie wird akzeptiert (Gate setzt NICHT durch).
+///
+/// Die Invariante „jede geladene TrustedSAS-PD stammt aus einem verifizierten Zertifikat" gilt
+/// **strukturell**: [`load_image`]/[`load_program_into_pd`] rufen [`verify_image`] **vor** jeder
+/// Ressourcenvergabe — ein abgelehntes Image erzeugt weder Thread noch PD. Code 4/5 belegen, dass
+/// dieses Gate zur Audit-Zeit aktiv durchsetzt (akzeptiert gueltige, weist manipulierte ab).
+pub fn trust_audit() -> u32 {
+    if TRUSTED_KEYS.is_empty() {
+        return 1;
+    }
+    for (i, k) in TRUSTED_KEYS.iter().enumerate() {
+        if fingerprint(&k.pubkey) != k.key_id {
+            return 2;
+        }
+        for k2 in &TRUSTED_KEYS[i + 1..] {
+            if k2.key_id == k.key_id {
+                return 3;
+            }
+        }
+    }
+    // Live-Oracle gegen das erste echte TrustedSAS-Zertifikat im Archiv (falls vorhanden).
+    if let Some(archive) = read_archive() {
+        if let Some(tx) = archive
+            .iter()
+            .find(|p| p.domain == DOMAIN_TRUSTED && !p.cert.is_empty())
+        {
+            if !verify_image(&tx) {
+                return 4; // gueltig -> MUSS akzeptiert werden
+            }
+            let c = tx.cert;
+            if c.len() <= TRUST_AUDIT_CERT_MAX {
+                let mut buf = [0u8; TRUST_AUDIT_CERT_MAX];
+                buf[..c.len()].copy_from_slice(c);
+                buf[40] ^= 0x01; // ein signiertes Byte (binary_hash) kippen -> Signatur bricht
+                let tampered = Program::new(
+                    tx.program_id,
+                    b"trust-audit",
+                    tx.version,
+                    DOMAIN_TRUSTED,
+                    [0u8; 32],
+                    tx.elf,
+                    tx.manifest,
+                    &buf[..c.len()],
+                );
+                if verify_image(&tampered) {
+                    return 5; // manipuliert -> MUSS abgelehnt werden
+                }
+            }
+        }
+    }
+    0
+}
+
 /// `SYS_LOAD`-Callback (ext-26, L2): das Programm mit Index `index` aus dem Boot-Archiv laden +
 /// die `endow`-Caps (vom Dispatch aus dem Aufrufer-Cspace delegiert) in die neue PD endowen. Gibt
 /// die neue PD-Id. Der Dispatch hat die `Loader`-Cap-Autoritaet bereits geprueft.

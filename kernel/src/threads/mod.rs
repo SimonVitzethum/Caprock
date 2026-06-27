@@ -691,11 +691,16 @@ fn run_loadstop() -> bool {
 }
 
 
-/// **EL0-TrustedSAS-Laden pruefen** (ext-26, L3): ein als TrustedSAS (Domaene 0) deklariertes Image
-/// wird als **EL0-ISOLIERTE** PD geladen (nicht EL1) — hardware-isoliert, behaelt aber die
-/// Trust-Stufe. `true`, wenn es laedt, die PD-Domaene TrustedSAS ist und domain_audit konsistent
-/// bleibt (isolierte TrustedSAS-PD ist policy-konform). Danach wird die PD wieder abgebaut (Balance).
+/// **EL0-TrustedSAS-Laden pruefen** (ext-26 L3 + ext-28): ein als TrustedSAS (Domaene 0) deklariertes
+/// Image wird — **nur mit gueltigem Zertifikat** (ADR 0014) — als **EL0-ISOLIERTE** PD geladen (nicht
+/// EL1), hardware-isoliert, behaelt aber die Trust-Stufe. `true`, wenn `trusted-x` (das saubere,
+/// zertifizierte svc-demo) laedt, die PD-Domaene TrustedSAS ist, `domain_audit` konsistent bleibt
+/// **und** `trust_audit` sauber ist (Key-DB selbstkonsistent + Gate setzt zur Laufzeit aktiv durch).
+/// Danach wird die PD wieder abgebaut (Balance).
 fn check_loadtrusted_el0() -> bool {
+    if loader::trust_audit() != 0 {
+        return false; // Key-DB inkonsistent / Gate setzt nicht durch (ext-28)
+    }
     let Some(archive) = loader::read_archive() else {
         return false;
     };
@@ -4807,7 +4812,7 @@ fn report() {
             && system::notification_pending(LOADHW_NTFN.load(Ordering::Relaxed)) == HELLO_BADGE { "ja" } else { "NEIN" },
         LOADTRUSTED_EL0.load(Ordering::Relaxed));
     println!(
-        "loadhw  : {} (HardwareLand-Laden: Backend-PD mit Partner+Kanal, Kanal-Cap-Policy gilt; TrustedSAS laeuft GELADEN EL0-isoliert -> alle Domaenen sicher extern ladbar)",
+        "loadhw  : {} (HardwareLand-Laden: Backend-PD mit Partner+Kanal, Kanal-Cap-Policy gilt; TrustedSAS (zertifiziertes svc-demo) laeuft GELADEN EL0-isoliert -- nur mit gueltigem Zertifikat (ext-28) + trust_audit==0 (Key-DB selbstkonsistent, Gate setzt aktiv durch))",
         if loadhw { "ALL PASS" } else { "FAILURES" }
     );
 

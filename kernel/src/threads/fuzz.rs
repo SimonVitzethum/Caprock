@@ -19,7 +19,7 @@ use super::*;
 use sel4lake_hal::println;
 // Diese drei nutzt nur der Fuzzer-Code -> hier explizit importiert (aus threads/mod.rs gezogen).
 use sel4lake_cap::CapPtr;
-use sel4lake_loader::{Program, DOMAIN_USERLAND};
+use sel4lake_loader::{Program, DOMAIN_TRUSTED, DOMAIN_USERLAND};
 
 // Einmalige Spawn-Flags (ersetzen die frueheren Idle-Loop-Locals `fuzz_spawned`/`ipcfuzz_spawned`).
 static FUZZ_SPAWNED: AtomicBool = AtomicBool::new(false);
@@ -77,6 +77,12 @@ pub(super) fn drive() {
     if !LOADERFUZZ_DONE.load(Ordering::Acquire) && super::LOADSTOP_DONE.load(Ordering::Acquire) {
         LOADERFUZZ_OK.store(run_loaderfuzz(), Ordering::Release);
         LOADERFUZZ_DONE.store(true, Ordering::Release);
+    }
+
+    // TrustedSAS-Zertifikats-Fuzzer (ext-28): einmalig, direkt nach dem Loader-Fuzzer.
+    if !CERTFUZZ_DONE.load(Ordering::Acquire) && LOADERFUZZ_DONE.load(Ordering::Acquire) {
+        CERTFUZZ_OK.store(run_certfuzz(), Ordering::Release);
+        CERTFUZZ_DONE.store(true, Ordering::Release);
     }
 
     // Domaenen/HW-Fuzzer (ext-22): nach dem letzten ext-27-Dienst (cross); eine Epoche je Tick.
@@ -150,6 +156,8 @@ pub(super) fn drive() {
 pub(super) fn all_passed() -> bool {
     LOADERFUZZ_DONE.load(Ordering::Acquire)
         && LOADERFUZZ_OK.load(Ordering::Acquire)
+        && CERTFUZZ_DONE.load(Ordering::Acquire)
+        && CERTFUZZ_OK.load(Ordering::Acquire)
         && HWFUZZ_DONE.load(Ordering::Acquire)
         && HWFUZZ_OK.load(Ordering::Acquire)
         && FUZZ_DONE.load(Ordering::Acquire)
@@ -216,6 +224,14 @@ pub(super) fn report() {
     println!(
         "loaderfuzz: {} (8 fehlerhafte ELF-Varianten durch load_image -> alle bei parse abgelehnt, kein Crash/OOB (Parser #![forbid(unsafe_code)]), Baseline unveraendert, loader_audit==0)",
         if loaderfuzz { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // TrustedSAS-Zertifikats-Fuzzer (ext-28, ADR 0014): mutierte/zufaellige Zertifikate + Binding.
+    let certfuzz = CERTFUZZ_DONE.load(Ordering::Acquire) && CERTFUZZ_OK.load(Ordering::Acquire);
+    println!(
+        "certfuzz: {} ({} Zertifikatsvarianten durch das verify_image-Gate (Mutation/Truncation/Zufallsmuell + Identitaets-/Binary-Transplantation) -> ALLE abgelehnt, echtes Cert akzeptiert, kein Crash/OOB (no-alloc Krypto), trust_audit+loader_audit==0, Baseline unveraendert)",
+        if certfuzz { "ALL PASS" } else { "FAILURES" },
+        CERTFUZZ_CHECKED.load(Ordering::Relaxed)
     );
 
     // Domaenen/HW-Fuzzer (ext-22, P6).
@@ -450,6 +466,104 @@ fn run_loaderfuzz() -> bool {
     let audit = system::loader_audit();
     hal::cpu::local_irq_enable();
     all_rejected && after == base && audit == 0
+}
+
+// TrustedSAS-Zertifikats-Fuzzer (ext-28, ADR 0014): mutierte/zufaellige Zertifikate durch das
+// verify_image-Gate -> ALLE abgelehnt, kein Crash/OOB (Parser + Krypto #![forbid(unsafe_code)] /
+// no-alloc); das ECHTE Zertifikat als Positiv-Kontrolle akzeptiert; Identitaets-/Binary-Bindung
+// adversarial (gueltiges Cert auf falsche program_id/version/ELF -> abgelehnt); danach trust_audit /
+// loader_audit == 0 und total_free unveraendert (Verifikation alloziert nichts).
+static CERTFUZZ_DONE: AtomicBool = AtomicBool::new(false);
+static CERTFUZZ_OK: AtomicBool = AtomicBool::new(false);
+static CERTFUZZ_CHECKED: AtomicU64 = AtomicU64::new(0); // Anzahl gepruefter Zertifikatsvarianten
+
+const CERTFUZZ_ITERS: u32 = 600;
+const CERTFUZZ_BUF: usize = 512;
+const CERTFUZZ_SEED: u64 = 0x7CE2_F022_2026_0627; // fester Seed -> reproduzierbar
+
+/// Eine TrustedSAS-Program-Huelle mit dem gegebenen Zertifikat bauen (gleiche Identitaet/Binary wie
+/// das Seed-Programm `tx`, nur `cert` variiert) — fuer den verify-only-Pfad (laedt nichts).
+fn certfuzz_prog<'a>(tx: &Program<'a>, cert: &'a [u8]) -> Program<'a> {
+    Program::new(
+        tx.program_id, b"cfz", tx.version, DOMAIN_TRUSTED, [0u8; 32], tx.elf, tx.manifest, cert,
+    )
+}
+
+fn run_certfuzz() -> bool {
+    hal::cpu::local_irq_disable();
+    let base = system::total_free();
+    let ok = (|| {
+        let archive = loader::read_archive()?;
+        // Das erste echte TrustedSAS-Zertifikat als Seed (trusted-x = signiertes svc-demo).
+        let tx = archive
+            .iter()
+            .find(|p| p.domain == DOMAIN_TRUSTED && !p.cert.is_empty())?;
+        let cert = tx.cert;
+        if cert.is_empty() || cert.len() > CERTFUZZ_BUF {
+            return Some(false);
+        }
+        // Positiv-Kontrolle: das ECHTE Zertifikat MUSS akzeptiert werden (Gate ist nicht always-false).
+        if !loader::verify_only(&tx) {
+            return Some(false);
+        }
+        let mut s = CERTFUZZ_SEED;
+        let mut buf = [0u8; CERTFUZZ_BUF];
+        let mut checked = 0u64;
+        for _ in 0..CERTFUZZ_ITERS {
+            buf[..cert.len()].copy_from_slice(cert);
+            let mut len = cert.len();
+            match frand(&mut s) % 12 {
+                0 => {
+                    let i = (frand(&mut s) as usize) % len;
+                    buf[i] ^= (frand(&mut s) as u8) | 1; // ein beliebiges Byte SICHER veraendern
+                }
+                1 => len = (frand(&mut s) as usize) % len, // truncate (stets kuerzer)
+                2 => buf[0..4].fill(0),                     // Magic zerstoeren
+                3 => buf[8..10].copy_from_slice(&0xFFFFu16.to_le_bytes()), // bogus signature_algorithm_id
+                4 => buf[26..30].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes()), // program_id im Cert
+                5 => buf[30..34].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()), // version im Cert
+                6 => buf[34..66].iter_mut().for_each(|b| *b ^= 0xFF), // binary_hash
+                7 => buf[98..114].iter_mut().for_each(|b| *b ^= 0xFF), // key_id (unbekannt)
+                8 => buf[114..118].copy_from_slice(&0b011u32.to_le_bytes()), // unsafe_status != ALL_PASS
+                9 => {
+                    // Signatur (letzte 64 B) verfaelschen.
+                    let span = 64.min(len);
+                    let i = len - 1 - ((frand(&mut s) as usize) % span);
+                    buf[i] ^= (frand(&mut s) as u8) | 1;
+                }
+                10 => {
+                    // komplett zufaelliger Muell variabler Laenge.
+                    len = (frand(&mut s) as usize) % CERTFUZZ_BUF;
+                    for b in buf[..len].iter_mut() {
+                        *b = frand(&mut s) as u8;
+                    }
+                }
+                _ => len = (frand(&mut s) as usize) % 4, // 0..3 Bytes (zu kurz)
+            }
+            if loader::verify_only(&certfuzz_prog(&tx, &buf[..len])) {
+                return Some(false); // EINE Variante akzeptiert -> FAIL
+            }
+            checked += 1;
+        }
+        // Identitaets-/Binary-Bindung adversarial: das ECHTE Zertifikat auf eine FALSCHE Identitaet
+        // bzw. ein FREMDES Binary heften -> muss abgelehnt werden (Cert ist nicht transplantierbar).
+        let fake_elf: &[u8] = b"not-the-certified-binary";
+        let wrong_id = Program::new(tx.program_id ^ 0x5A5A, b"cfz", tx.version, DOMAIN_TRUSTED, [0u8; 32], tx.elf, tx.manifest, cert);
+        let wrong_ver = Program::new(tx.program_id, b"cfz", tx.version.wrapping_add(1), DOMAIN_TRUSTED, [0u8; 32], tx.elf, tx.manifest, cert);
+        let wrong_elf = Program::new(tx.program_id, b"cfz", tx.version, DOMAIN_TRUSTED, [0u8; 32], fake_elf, tx.manifest, cert);
+        if loader::verify_only(&wrong_id) || loader::verify_only(&wrong_ver) || loader::verify_only(&wrong_elf) {
+            return Some(false);
+        }
+        checked += 3;
+        CERTFUZZ_CHECKED.store(checked, Ordering::Relaxed);
+        Some(true)
+    })()
+    .unwrap_or(false);
+    let after = system::total_free();
+    let taudit = loader::trust_audit();
+    let laudit = system::loader_audit();
+    hal::cpu::local_irq_enable();
+    ok && after == base && taudit == 0 && laudit == 0
 }
 
 // --- Generativer Kernel-Fuzzer (Audit Bereich H) ---

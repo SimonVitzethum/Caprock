@@ -21,25 +21,36 @@ deterministisch. **Keine Eigenentwicklung:** Kernel-Verifikation über **`ed2551
 (`default-features=false`, no_std, no-alloc; gegen das Custom-Target gespiket — baut sauber) +
 **`sha2`** (SHA-256). Signieren passiert **host-seitig** im Build-Tool (RNG nur dort).
 
-### 2. Zertifikatsformat (fester Layout, signierter Payload + Signatur)
+### 2. Zertifikatsformat — die **gesamte** Nachricht wird signiert
+Nicht nur der Binary-Hash, sondern eine **vollständige Zertifikatsnachricht** wird mit Ed25519
+signiert; **jedes** Feld ist damit kryptographisch geschützt (kein Feld nachträglich änder-/
+austauschbar). Die Nachricht umfasst auch **Compiler-/Build-Informationen** und den **Unsafe-Prüf­
+status** (§6) — der Signierer bezeugt damit Identität **und** korrekten TrustedSAS-Buildprozess.
 ```text
-Offset Feld
-0   magic:u32         = 0x54534331 ("TSC1")
-4   format_version:u16
-6   flags:u16         (Eigenschaften)
-8   program_id:u32
-12  version:u32
-16  binary_hash:[u8;32]    (SHA-256 des ELF)
-48  manifest_hash:[u8;32]  (SHA-256 des Manifests)
-80  key_id:[u8;16]         (128-bit-Fingerprint = SHA-256(pubkey)[..16])
---- signierter Payload (96 B) ---
-96  signature:[u8;64]      (Ed25519 ueber Bytes [0..96))
-Gesamt: 160 B
+Offset Feld (Little-Endian)
+0    magic:u32              = 0x5453_4331 ("TSC1")
+4    format_version:u16      = 1
+6    flags:u16               (Eigenschaften)
+8    program_id:u32
+12   version:u32
+16   binary_hash:[u8;32]     (SHA-256 des ELF — bindet das Zertifikat FEST an genau dieses Binary)
+48   manifest_hash:[u8;32]   (SHA-256 des Manifests)
+80   key_id:[u8;16]          (128-bit-Fingerprint = SHA-256(pubkey)[..16])
+96   unsafe_status:u32       (Bitflags PROGRAM_FORBID|PROJECT_CLEAN|ALLOWLIST_OK; muss ALL_PASS sein)
+100  unsafe_audit_hash:[u8;32] (SHA-256 des vollstaendigen Unsafe-Audit-Berichts -> bindet ihn)
+132  build_info_len:u16
+134  build_info:[..]         (UTF-8: rustc/toolchain/target/profil/zeitstempel)
+--- signierte Nachricht endet (msg_len = 134 + build_info_len) ---
+msg_len  signature:[u8;64]   (Ed25519 ueber [0..msg_len))
 ```
 Der Kernel akzeptiert ein **TrustedSAS**-Binary nur, wenn **alle** gelten: magic/format_version ok;
-`key_id` in der read-only Key-DB; Ed25519-Signatur über den Payload mit diesem PubKey gültig;
-`binary_hash==SHA256(elf)` und `manifest_hash==SHA256(manifest)`; `program_id/version` konsistent
-zum Archiv-Eintrag; `version >= min_version[program_id]` (Anti-Downgrade); Key nicht `revoked`.
+`key_id` in der read-only Key-DB (Key nicht `revoked`); Ed25519-Signatur über die **gesamte**
+Nachricht mit diesem PubKey gültig; **`binary_hash == SHA256(prog.elf)`** (feste Binary-Bindung) und
+`manifest_hash == SHA256(prog.manifest)`; `program_id/version` konsistent zum Archiv-Eintrag;
+`version >= min_version[program_id]` (Anti-Downgrade); `unsafe_status == UNSAFE_ALL_PASS`. Weil die
+Bindung **kryptographisch** über `binary_hash` läuft (nicht positionell), ist die separate Ablage des
+Zertifikats im Archiv sicher: ein Zertifikat passt **ausschließlich** zu genau dem Binary, dessen
+Hash es signiert — jede Manipulation des ELF oder jedes Cert↔Binary-Mismatch wird abgelehnt.
 
 ### 3. Key-ID = 128-bit-Fingerprint des PubKey
 `key_id = SHA-256(pubkey)[..16]`. **Selbst-zertifizierend** (Kernel prüft beim DB-Laden
@@ -73,17 +84,27 @@ Ein Host-Build-Schritt für ein TrustedSAS-Programm:
    (Scope: der Rust-**Sysroot** core/alloc/compiler_builtins ist die vertraute Sprach-Laufzeit —
    wie die CPU/ISA — und außerhalb des Audits; sonst bräche jeder Build.)
 2. ELF-Hash + Manifest-Hash (SHA-256) berechnen.
-3. Zertifikat (Format §2) füllen, mit dem **privaten** Ed25519-Schlüssel signieren.
+3. Zertifikatsnachricht (Format §2) füllen — inkl. **`unsafe_status`** (Ergebnis des Audits aus 1),
+   **`unsafe_audit_hash`** (SHA-256 des vollständigen Audit-Berichts) und **`build_info`** (rustc/
+   Toolchain/Target/Profil/Zeitstempel) — und die **gesamte** Nachricht mit dem **privaten** Ed25519-
+   Schlüssel signieren. Damit sind Audit-Ergebnis + Build-Provenienz Teil der signierten Aussage.
 4. Zertifikat ins Archiv legen (erweitertes `tools/mkarchive.py`).
 Ohne den privaten Schlüssel entsteht **kein** gültiges Zertifikat; Besitz von Zertifikat/PubKey/
 Key-ID genügt **nie** (asymmetrisch). Das Zertifikat bezeugt: „dieses Programm wurde vollständig
-ohne `unsafe` entwickelt — einzige Ausnahme die explizit auditierte Syscall-ABI-Schicht".
+ohne `unsafe` (außer der auditierten Syscall-ABI) **erfolgreich nach den TrustedSAS-Regeln gebaut**,
+ist fest an genau dieses Binary gebunden und stammt von diesem Schlüssel" — die **vollständige
+Vertrauenskette** Compiler-/Buildprüfung → Unsafe-Audit → Zertifikatserstellung → Ed25519-Signatur →
+Kernel-Verifikation. Der Kernel prüft nur noch Signatur + Integrität der Nachricht; alle darin
+enthaltenen Aussagen sind dadurch automatisch kryptographisch geschützt.
 
 ## Sicherheitsanalyse (Schutz von Anfang an)
 
 | Angriff | Schutz |
 |---|---|
+| **Binary-Manipulation** | `binary_hash` (SHA-256 des ELF) liegt in der **signierten** Nachricht + Kernel prüft `==SHA256(prog.elf)` → jede ELF-Änderung bricht die Bindung → abgelehnt. |
+| **Feld-Manipulation (Version/Flags/Hashes/Status)** | die **gesamte** Nachricht ist signiert → kein Einzelfeld nachträglich änder-/austauschbar (auch `unsafe_status`/`build_info`). |
 | **Replay / Zertifikatsaustausch** | Cert bindet `binary_hash`+`manifest_hash`+`program_id`+`version`; Cert auf fremdes Binary → Hash-Mismatch → abgelehnt. |
+| **Gefälschter „bestanden"-Status** | `unsafe_status` ist signiert; das Tool signiert nur bei tatsächlich bestandenem Audit; der Kernel erzwingt `==UNSAFE_ALL_PASS`. |
 | **Downgrade** | firmware-gebackene `min_version[program_id]`; `version < min_version` → abgelehnt (zustandsloses Boot-System → statische, mit-Update-gepflegte Policy). |
 | **Schlüsselrotation** | mehrere Keys (per Key-ID); neuen per Update aufnehmen + neu signieren, alten entfernen → dessen Certs ungültig. |
 | **Kompromittierter Signierschlüssel** | **Revocation** = Key per Update entfernen / `revoked` setzen → alle Certs der Key-ID abgelehnt; mehrere Keys begrenzen den Blast-Radius. |

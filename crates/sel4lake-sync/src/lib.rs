@@ -255,3 +255,82 @@ impl<T: ?Sized> Drop for RwWriteGuard<'_, T> {
         self.lock.writers_waiting.fetch_sub(1, Ordering::Release);
     }
 }
+
+// Formale Verifikation (Tier 1, Kani — bounded Model Checking). Nur unter `cargo kani` kompiliert,
+// im Normal-Build inert. WICHTIG zur REICHWEITE: Kani ist ein **single-threaded** Modellprüfer und
+// **kein** Nebenläufigkeits-Checker — die Kern-Aussage eines Locks (gegenseitiger Ausschluss unter
+// *gleichzeitigem* Zugriff über Kerngrenzen, Interleavings) ist **außerhalb** von Kanis Reichweite
+// (dafür bräuchte es Loom/TLA+, mögliche spätere Ergänzung). Kani beweist hier die single-threaded
+// abgesicherten Eigenschaften: Memory-Safety der Guard-Derefs (kein UB), Lock/Unlock-Round-Trip +
+// Daten-Persistenz, und die **Zähler-Arithmetik** (Reader-Count/Writer-Bit panik-/overflow-/
+// underflow-frei, Zustands-Rückkehr auf „frei"). Unter dem Kani-Host-Target greifen die No-Op-
+// IRQ-Stubs (kein DAIF-Asm).
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+    use core::sync::atomic::Ordering::Relaxed;
+
+    /// **BEWEIS (SpinLock, single-thread):** `lock()` liefert exklusiven Zugriff (Guard-Deref
+    /// memory-safe), Schreiben+Lesen über den Guard ist konsistent, nach `Drop` ist der Lock wieder
+    /// frei (Ticket-Zustand `next==serving`) und **erneut sperrbar**, die Daten persistieren.
+    #[kani::proof]
+    #[kani::unwind(2)]
+    fn spinlock_roundtrip() {
+        let lock = SpinLock::new(0u32);
+        let v: u32 = kani::any();
+        {
+            let mut g = lock.lock();
+            *g = v;
+            assert!(*g == v); // Schreiben+Lesen über den Guard
+        } // Drop -> freigeben
+        // Ticket-Zustand zurück auf „frei": next_ticket == now_serving.
+        assert!(lock.next_ticket.load(Relaxed) == lock.now_serving.load(Relaxed));
+        {
+            let g = lock.lock(); // erneut sperrbar
+            assert!(*g == v); // Daten persistierten
+        }
+    }
+
+    /// **BEWEIS (RwSpinLock, single-thread):** `write()` liefert exklusiven Schreibzugriff,
+    /// anschließend sieht ein `read()` den geschriebenen Wert (Guard-Derefs memory-safe); nach allen
+    /// Drops ist der Zustand wieder `0` (frei, kein hängendes WRITER-Bit, keine Leserzahl).
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn rwlock_write_then_read() {
+        let lock = RwSpinLock::new(0u32);
+        let v: u32 = kani::any();
+        {
+            let mut g = lock.write();
+            *g = v;
+        }
+        {
+            let g = lock.read();
+            assert!(*g == v);
+        }
+        assert!(lock.state.load(Relaxed) == 0);
+        assert!(lock.writers_waiting.load(Relaxed) == 0);
+    }
+
+    /// **BEWEIS (RwSpinLock-Arithmetik, single-thread):** verschachtelte Leser zählen den Reader-Count
+    /// korrekt hoch/runter (kein Overflow/Underflow), und ein Schreiber-Zyklus löscht **nur** das
+    /// WRITER-Bit (`fetch_and`) ohne die Leserzahl zu beschädigen. Nach balancierten Acquire/Release
+    /// ist der Zustand exakt `0`. (Genau die dokumentierte „kein-Unterlauf"-Invariante des Writer-Drops.)
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn rwlock_state_arithmetic() {
+        let lock = RwSpinLock::new(0u8);
+        {
+            let _r1 = lock.read();
+            assert!(lock.state.load(Relaxed) == 1);
+            let _r2 = lock.read(); // zwei gleichzeitige Leser (im selben Thread)
+            assert!(lock.state.load(Relaxed) == 2);
+        } // beide Drop -> Reader-Count zurück auf 0 (kein Underflow)
+        assert!(lock.state.load(Relaxed) == 0);
+        {
+            let _w = lock.write();
+            assert!(lock.state.load(Relaxed) == RW_WRITER); // nur WRITER-Bit, Leserzahl 0
+        } // Drop: fetch_and(!WRITER) -> 0, writers_waiting -> 0
+        assert!(lock.state.load(Relaxed) == 0);
+        assert!(lock.writers_waiting.load(Relaxed) == 0);
+    }
+}

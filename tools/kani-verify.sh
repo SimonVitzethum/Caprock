@@ -74,7 +74,7 @@ run_target() { # $1=loader|region|sync ; weitere Args -> cargo kani
 }
 
 # Ziele mit Harnesses (wird erweitert, sobald weitere Crates aufgenommen sind).
-DEFAULT_TARGETS="loader region"
+DEFAULT_TARGETS="loader region sync"
 
 if [ "$#" -eq 0 ]; then
     for t in $DEFAULT_TARGETS; do run_target "$t"; done

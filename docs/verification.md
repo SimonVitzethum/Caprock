@@ -25,6 +25,15 @@ Dieses Dokument beschreibt die **dauerhafte Verifikationspipeline** von SEL4Lake
 | | `subview_within_parent` | `subview` liegt vollständig in der Eltern-Region (`off+sublen<=len`, kein Escape) |
 | | `get_set_never_oob` | rohe `get`/`set` greifen (über echten Puffer) nie ausserhalb der Region zu |
 | | `copy_fill_never_oob` | rohe `copy_from`/`copy_to`/`fill` bounds-respektierend (kein OOB) |
+| `sel4lake-sync/lib.rs` | `spinlock_roundtrip` | `SpinLock`: Guard-Deref memory-safe, Lock/Unlock-Round-Trip (`next==serving`), Daten-Persistenz |
+| | `rwlock_write_then_read` | `RwSpinLock`: write→read sieht den Wert; nach allen Drops Zustand `0` |
+| | `rwlock_state_arithmetic` | Reader-Count + Writer-Bit over-/underflow-frei; Writer-Drop löscht **nur** das WRITER-Bit |
+
+> **Reichweite bei `sel4lake-sync`:** Kani ist ein **single-threaded** Modellprüfer, **kein**
+> Nebenläufigkeits-Checker. Bewiesen sind Memory-Safety der Guards, Single-Thread-Round-Trips +
+> Daten-Persistenz und die Zähler-**Arithmetik**. Der **gegenseitige Ausschluss unter gleichzeitigem
+> Mehrkern-Zugriff** (Interleavings) liegt **außerhalb** Kanis Reichweite — dafür wäre ein
+> Concurrency-Modellprüfer (Loom/TLA+) nötig (mögliche spätere Ergänzung).
 
 Die Harnesses sind `#[cfg(kani)]`-Module direkt in den jeweiligen Quelldateien — **im Normal-Build
 vollständig inert** (keine Auswirkung auf Kernel/Tests). Die Eingabe-Obergrenzen (z. B. 200–260 B)
@@ -72,5 +81,6 @@ Verifikation ist fester Bestandteil des Entwicklungsprozesses.
 - [x] ELF-Parser (`elf.rs`)
 - [x] CI-Gate (Gitea Actions)
 - [x] Region-Runtime (`sel4lake-region`: RegionView — Bounds-/Slice-/Overflow-Verträge um die `unsafe`-Blöcke)
-- [ ] Synchronisationsprimitive (`sel4lake-sync`: Lock-Invarianten/Zustandsübergänge, soweit modellierbar)
+- [x] Synchronisationsprimitive (`sel4lake-sync`: Memory-Safety/Round-Trip/Arithmetik, single-thread)
+- [ ] Concurrency-Modellprüfung der Locks (Loom/TLA+ — außerhalb Kani)
 - [ ] kernweite Overflow-/Arithmetik-Checks

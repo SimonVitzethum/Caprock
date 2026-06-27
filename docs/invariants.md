@@ -1,4 +1,4 @@
-# SEL4Lake — Systeminvarianten (Konsolidierung, ext-22…ext-25)
+# SEL4Lake — Systeminvarianten (Konsolidierung, ext-22…ext-28)
 
 Dieses Dokument macht die bis ext-25 **impliziten** Invarianten explizit: die Sperrordnung, die
 DMA-Revoke-Reihenfolge, die Region-Balance, den `RegionView`/`Pod`-Sicherheitsvertrag und das
@@ -143,6 +143,7 @@ Programmieren. Auf realer HW (z. B. STM32MP25) ist die installierte Stage-1-STE 
 | Domänen-Policy | `domain_audit` | 30+n (1=HW-Cap, 2=PdControl, 3=VSpace) |
 | DMA-Policy + Enforcer + Revoke-Ordnung | `dma_audit` | 40+n (1=Bounds, 2=Überlappung, 3=Enforcer, 4=Ctx-Region ohne Cap) |
 | VSpace W^X / Tabellen | `vspace_audit` | separat |
+| TrustedSAS-Key-DB + Trust-Gate (ext-28) | `loader::trust_audit` | separat (1=DB leer, 2=key_id≠fingerprint, 3=Dublette, 4=gültig abgelehnt, 5=manipuliert akzeptiert) |
 
 `ipc_audit() == 0` bei jedem Quiescenz-Punkt + zwischen allen Fuzzer-Operationen = alle obigen
 Invarianten halten.
@@ -167,3 +168,33 @@ ausschließlich über die Syscall-ABI an. Schlüsselaussagen, empirisch bestäti
 Aus einem EL0-Prozess sind **nur** ABI-Operationen ausdrückbar; Cap-/CDT-Operationen (kein Syscall)
 bleiben im In-Kernel-Selbsttest (`captest`/`fuzz`/`ipcfuzz`). Vollständige Matrix:
 `docs/phase-reports/ext-27-adversarial-tests.md`.
+
+## 9. TrustedSAS-Zertifikate / Trust-Gate (ext-28, ADR 0014)
+
+`DOMAIN_TRUSTED` behält seine **Cap-Autorität** (darf `PdControl`/`Loader`-Caps halten) — daher gilt
+für sie eine zusätzliche Lade-Invariante. Maßgeblich: `kernel::loader::verify_image`. Belege:
+`loadhw`/`load`/`aggrt`/`intrt`/`cross` (Selbsttest) + `certfuzz`/`trust_audit` (Fuzzer/Audit).
+
+- **Trust-Gate-Invariante.** Eine TrustedSAS-PD entsteht **nur** aus einem Image mit gültigem,
+  auf genau dies Binary gebundenem Ed25519-Zertifikat. Strukturell: `load_image`/
+  `load_program_into_pd` rufen `verify_image` **vor** jeder Ressourcenvergabe; ein abgelehntes Image
+  erzeugt **weder** Thread **noch** PD (`LoaderError::Unverified`). UserLand/HardwareLand sind
+  ausgenommen (hardware-isoliert, kein Zertifikat).
+- **Bindung (alles signiert über die gesamte Nachricht).** `binary_hash == SHA-256(ELF)`,
+  `manifest_hash == SHA-256(Manifest)`, `program_id`/`version == Archiv-Eintrag`,
+  `version >= MIN_VERSION[program_id]`, `unsafe_status == ALL_PASS`, `key_id ∈ TRUSTED_KEYS` (nicht
+  `revoked`). Bricht **eine** Bedingung → Ablehnung.
+- **Schlüssel-Invariante.** Der Kernel hält **nur** öffentliche Schlüssel; die Key-DB
+  (`trusted_keys.rs`) ist kompiliert + read-only, **nur** per Firmware-/Kernel-Update änderbar — es
+  existiert **kein** Syscall dafür. `verify_strict` (nicht `verify`) → keine Signatur-Malleability.
+- **Unsafe-Invariante (host-erzwungen).** Ein zertifiziertes TrustedSAS-Programm ist
+  `#![forbid(unsafe_code)]`; `unsafe` existiert im gesamten App-Dep-Baum **nur** in der Allowlist
+  `{libsel4lake}`. `tools/sign_trusted.py` verweigert sonst das Zertifikat; der Kernel verlangt
+  `unsafe_status == ALL_PASS`.
+- **`trust_audit()` (Laufzeit-Oracle).** Key-DB-Selbstkonsistenz (`key_id == fingerprint(pubkey)`,
+  Eindeutigkeit, nicht leer) **plus** Live-Test: ein bekannt gültiges Zertifikat wird akzeptiert,
+  eine manipulierte Kopie abgelehnt → das Gate setzt zur Audit-Zeit aktiv durch.
+
+Eingefrorenes Zertifikatsformat + Sicherheitsanalyse:
+`docs/phase-reports/ext-28-trusted-certificates-report.md`. Schlüssel-Runbook:
+`docs/runbook-trusted-keys.md`.

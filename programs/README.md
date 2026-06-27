@@ -33,6 +33,19 @@ nur die **Cap-Autorität** fest (welche Cap-Typen die PD halten darf), nicht den
 
 1. `programs/<domäne>/<name>/` als Cargo-Bin anlegen (`[[bin]] name = "<name>"`).
 2. `dependencies: libsel4lake = { path = "../../libsel4lake" }`.
-3. `_start(arg)` definieren (Entry; der Kernel setzt SP, übergibt Boot-Info in `x0`).
+3. Entry definieren. Empfohlen (und für TrustedSAS **Pflicht**, s. u.): eine **sichere**
+   `fn run(arg: usize) -> !` + `libsel4lake::entry!(run);`. Das Makro erzeugt die `_start`-Glue (das
+   `#[no_mangle]`-Attribut ist in aktuellem Rust *unsafe*) in der auditierten SDK-Schicht, sodass das
+   Programm selbst `#![forbid(unsafe_code)]` bleiben kann. (Der Kernel setzt SP, übergibt Boot-Info
+   in `x0`.)
 4. In `programs/Cargo.toml` als Member eintragen.
-5. In `tools/mkarchive.py`-Aufruf (test-qemu.sh) als Archiv-Eintrag `id:name:domain:version:elf`.
+5. In `tools/mkarchive.py`-Aufruf (test-qemu.sh) als Archiv-Eintrag `id:name:domain:version:elf`
+   (TrustedSAS zusätzlich `:manifest:cert` — siehe [`trusted/README.md`](trusted/README.md)).
+
+## TrustedSAS-Programme: Zertifizierung
+
+TrustedSAS-Binaries (`trusted/`) werden vom Kernel **nur mit gültigem Ed25519-Zertifikat** geladen
+(ext-28, [ADR 0014](../docs/adr/0014-trusted-sas-certificates.md)). Sie müssen vollständig
+`#![forbid(unsafe_code)]` sein (Allowlist `{libsel4lake}`) und mit `tools/sign_trusted.py` signiert
+werden. Ablauf + Schlüsselverwaltung: [`trusted/README.md`](trusted/README.md) +
+[`docs/runbook-trusted-keys.md`](../docs/runbook-trusted-keys.md).

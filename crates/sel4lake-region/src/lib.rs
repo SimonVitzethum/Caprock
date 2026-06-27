@@ -259,3 +259,98 @@ macro_rules! impl_pod {
 impl_pod!(u8, u16, u32, u64, usize, i8, i16, i32, i64, isize);
 // SAFETY: Ein Array von Pod ist Pod (gleiches Argument elementweise, kein Padding zwischen `u8`).
 unsafe impl<const N: usize> Pod for [u8; N] {}
+
+// Formale Verifikation (Tier 1, Kani — bounded Model Checking). Nur unter `cargo kani` kompiliert,
+// im Normal-Build inert. `RegionView` kapselt das GESAMTE Speicher-`unsafe` der Runtime (rohe Reads/
+// Writes hinter Bounds-Checks). Bewiesen werden: (a) die View-Splitting-Arithmetik (split_at/subview)
+// hält jede Sicht innerhalb der Eltern-Region und ist overflow-/underflow-frei; (b) die rohen
+// Zugriffe (get/set/copy/fill) greifen — über einen echten, modellierten Puffer — nie ausserhalb der
+// Region zu (Memory-Safety der `unsafe`-Blöcke). Die Gültigkeit der Region `[base, base+len)` selbst
+// ist eine Cap-System-Vorbedingung (außerhalb dieser Crate) und wird hier angenommen.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    // Eine RegionView mit symbolischer (aber overflow-freier) Adresse/Länge — für die rein
+    // arithmetischen Invarianten (kein Speicherzugriff).
+    fn symbolic_view<'a>() -> RegionView<'a> {
+        let base: u64 = kani::any();
+        let len: usize = kani::any();
+        // Reale Cap-Regionen liegen vollständig im Adressraum: base+len läuft nicht über.
+        kani::assume((base as u128) + (len as u128) <= u64::MAX as u128);
+        RegionView { base, len, _p: core::marker::PhantomData }
+    }
+
+    /// **BEWEIS:** `split_at(mid)` partitioniert die Sicht **exakt + lückenlos + nicht-überlappend**
+    /// (`a=[base,base+mid)`, `b=[base+mid,base+len)`, `a.len+b.len==len`) — overflow-/underflow-frei.
+    #[kani::proof]
+    fn split_at_partitions() {
+        let rv = symbolic_view();
+        let (base, len) = rv.raw();
+        let mid: usize = kani::any();
+        if let Some((a, b)) = rv.split_at(mid) {
+            let (ab, al) = a.raw();
+            let (bb, bl) = b.raw();
+            assert!(ab == base && al == mid);
+            assert!(bb == base + mid as u64 && bl == len - mid);
+            assert!(al + bl == len); // exakte Partition
+            assert!(ab + al as u64 == bb); // lückenlos + nicht-überlappend
+            assert!(bb + bl as u64 == base + len as u64); // deckt die Eltern-Region exakt
+        }
+    }
+
+    /// **BEWEIS:** `subview(off, sublen)` liefert nur dann eine Sicht, wenn sie **vollständig** in der
+    /// Eltern-Region liegt (`off+sublen <= len`, `sub ⊆ parent`) — checked_add verhindert Overflow.
+    #[kani::proof]
+    fn subview_within_parent() {
+        let mut rv = symbolic_view();
+        let (base, len) = rv.raw();
+        let off: usize = kani::any();
+        let sublen: usize = kani::any();
+        if let Some(sv) = rv.subview(off, sublen) {
+            let (sb, sl) = sv.raw();
+            assert!(sb == base + off as u64 && sl == sublen);
+            assert!(off + sublen <= len); // Bounds-Check war korrekt
+            assert!(sb + sl as u64 <= base + len as u64); // kein Escape aus der Eltern-Region
+        }
+    }
+
+    // Größe des echten, von Kani modellierten Puffers für die Memory-Safety-Beweise.
+    const N: usize = 16;
+
+    /// **BEWEIS (Memory-Safety):** über einen ECHTEN N-Byte-Puffer greifen `get`/`set` bei beliebigem
+    /// Offset **nie** ausserhalb der Region zu — der Bounds-Check schützt jeden rohen Zugriff; und
+    /// `set` akzeptiert nur, wenn `off+size <= len`.
+    #[kani::proof]
+    fn get_set_never_oob() {
+        let mut buf = [0u8; N];
+        let base = buf.as_mut_ptr() as u64;
+        let mut rv = RegionView { base, len: N, _p: core::marker::PhantomData };
+        let off: usize = kani::any();
+        let _ = rv.get::<u64>(off);
+        let _ = rv.get::<u32>(off);
+        let _ = rv.get::<u8>(off);
+        if rv.set::<u32>(off, 0xDEAD_BEEF) {
+            assert!(off + 4 <= N); // akzeptiert ⟹ in-bounds
+        }
+        let _ = buf; // Puffer am Leben halten
+    }
+
+    /// **BEWEIS (Memory-Safety):** `copy_from`/`copy_to`/`fill` über einen echten Puffer greifen nie
+    /// ausserhalb der Region zu (bounds-respektierend für beliebigen Offset/Quell-/Ziel-Länge ≤ N).
+    #[kani::proof]
+    fn copy_fill_never_oob() {
+        let mut buf = [0u8; N];
+        let base = buf.as_mut_ptr() as u64;
+        let mut rv = RegionView { base, len: N, _p: core::marker::PhantomData };
+        let off: usize = kani::any();
+        let slen: usize = kani::any();
+        kani::assume(slen <= N);
+        let mut src = [0u8; N];
+        let mut dst = [0u8; N];
+        let _ = rv.copy_from(off, &src[..slen]);
+        let _ = rv.copy_to(off, &mut dst[..slen]);
+        rv.fill(0xAB);
+        let _ = (&mut src, &mut dst, &mut buf);
+    }
+}

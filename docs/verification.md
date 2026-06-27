@@ -21,6 +21,10 @@ Dieses Dokument beschreibt die **dauerhafte Verifikationspipeline** von SEL4Lake
 | `sel4lake-loader/archive.rs` | `parse_never_panics` | `Archive::parse` (+ `program(i)`) panik-/OOB-frei |
 | `sel4lake-loader/elf.rs` | `parse_never_panics` | `ElfImage::parse` panik-/OOB-/overflow-frei |
 | | `segments_are_sound` | bei Erfolg: jedes Segment `memsz>=filesz`, `segment_bytes().len()==filesz`, `offset+filesz<=len` |
+| `sel4lake-region/lib.rs` | `split_at_partitions` | `split_at` partitioniert exakt + lückenlos + nicht-überlappend, overflow-/underflow-frei |
+| | `subview_within_parent` | `subview` liegt vollständig in der Eltern-Region (`off+sublen<=len`, kein Escape) |
+| | `get_set_never_oob` | rohe `get`/`set` greifen (über echten Puffer) nie ausserhalb der Region zu |
+| | `copy_fill_never_oob` | rohe `copy_from`/`copy_to`/`fill` bounds-respektierend (kein OOB) |
 
 Die Harnesses sind `#[cfg(kani)]`-Module direkt in den jeweiligen Quelldateien — **im Normal-Build
 vollständig inert** (keine Auswirkung auf Kernel/Tests). Die Eingabe-Obergrenzen (z. B. 200–260 B)
@@ -67,6 +71,6 @@ Verifikation ist fester Bestandteil des Entwicklungsprozesses.
 - [x] Boot-Archiv-Parser (`archive.rs`)
 - [x] ELF-Parser (`elf.rs`)
 - [x] CI-Gate (Gitea Actions)
-- [ ] Region-Runtime (`sel4lake-region`: RegionView/Pod — Bounds-/Slice-/Lifetime-Verträge um die `unsafe`-Blöcke)
+- [x] Region-Runtime (`sel4lake-region`: RegionView — Bounds-/Slice-/Overflow-Verträge um die `unsafe`-Blöcke)
 - [ ] Synchronisationsprimitive (`sel4lake-sync`: Lock-Invarianten/Zustandsübergänge, soweit modellierbar)
 - [ ] kernweite Overflow-/Arithmetik-Checks

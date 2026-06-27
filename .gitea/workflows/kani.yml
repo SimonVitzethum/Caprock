@@ -1,0 +1,54 @@
+# SEL4Lake — Formale Verifikation (Tier 1, Kani) als CI-Gate.
+#
+# Ziel: jeder Push/PR führt die bewiesenen Eigenschaften automatisch erneut aus. Schlägt ein
+# Kani-Harness fehl (eine spätere Änderung bricht einen Beweis), schlägt die CI fehl -> bereits
+# bewiesene Eigenschaften können nicht unbeabsichtigt verloren gehen.
+#
+# Gitea Actions (GitHub-Actions-kompatibel). Läuft die Loader-Parser-Beweise (cert/archive/elf) über
+# tools/kani-verify.sh (eigenständige Crate-Kopie -> kein build-std-Zwang) und einen Host-Test-/
+# Inert-Check (cfg(kani) darf den Normal-Build nicht brechen).
+
+name: kani-verification
+on: [push, pull_request]
+
+jobs:
+  kani:
+    name: Kani — Tier-1-Beweise (Loader-Parser)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust-Toolchain (rustup, stable) installieren
+        run: |
+          if ! command -v cargo >/dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Kani + Toolchain cachen
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.kani
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+          key: kani-v0.67.0-${{ runner.os }}
+
+      - name: Kani installieren (idempotent)
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          command -v cargo-kani >/dev/null || cargo install --locked kani-verifier
+          cargo kani setup
+
+      - name: Host-Tests + Inert-Check (cfg(kani) bricht den Normal-Build nicht)
+        run: |
+          set -euo pipefail
+          SA="$RUNNER_TEMP/loader_host"
+          rm -rf "$SA"; mkdir -p "$SA/src"
+          cp crates/sel4lake-loader/src/*.rs "$SA/src/"
+          printf '[package]\nname="sel4lake-loader"\nversion="0.0.0"\nedition="2021"\n[workspace]\n[lib]\npath="src/lib.rs"\n' > "$SA/Cargo.toml"
+          ( cd "$SA" && cargo test )
+
+      - name: Kani-Beweise ausführen (cert + archive + elf)
+        run: bash tools/kani-verify.sh

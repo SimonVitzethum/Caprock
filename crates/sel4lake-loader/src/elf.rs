@@ -270,3 +270,48 @@ mod tests {
         assert_eq!(ElfImage::parse(&[0u8; 16]).unwrap_err(), LoaderError::TooSmall);
     }
 }
+
+// Formale Verifikation (Tier 1, Kani — bounded Model Checking). Nur unter `cargo kani` kompiliert,
+// im Normal-Build inert. Der ELF-Parser verarbeitet extern gebaute Binaries (Boot-Archiv/SYS_LOAD) →
+// Crash-/Overflow-Freiheit auf beliebiger Eingabe ist sicherheitskritisch. Kani prüft Panics,
+// Out-of-Bounds UND Integer-Überläufe (Default-Checks) gemeinsam.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    // 200 reicht für jeden Pfad: `parse` betritt die Program-Header-Schleife nur, wenn
+    // `phnum*56 + phoff <= len <= MAXLEN`; mit minimalem phoff=0 also phnum ≤ 3 (alle größeren
+    // phnum/phoff lösen vorher OutOfBounds aus). 64 B Header + bis zu 3 Program-Header + Payload
+    // passen hinein; unwind(5) deckt die ≤3 Schleifeniterationen vollständig.
+    const MAXLEN: usize = 200;
+
+    /// **BEWEIS:** `ElfImage::parse` paniert/OOBt/überläuft **nie** — für beliebige Bytes + Länge
+    /// (≤ MAXLEN). Ein verstümmeltes/bösartiges ELF kann den Loader nicht zum Absturz bringen.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn parse_never_panics() {
+        let data: [u8; MAXLEN] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MAXLEN);
+        let _ = ElfImage::parse(&data[..len]);
+    }
+
+    /// **BEWEIS:** Nach erfolgreichem `parse` ist **jedes** gelieferte Segment in sich konsistent:
+    /// `memsz >= filesz` (.bss-/W^X-Vertrag), `segment_bytes()` liefert **exakt** `filesz` Bytes und
+    /// liegt **vollständig** im Image (`offset+filesz <= len`, kein Panik/OOB/Overflow beim Iterieren).
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn segments_are_sound() {
+        let data: [u8; MAXLEN] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MAXLEN);
+        if let Ok(img) = ElfImage::parse(&data[..len]) {
+            for seg in img.segments() {
+                assert!(seg.memsz >= seg.filesz);
+                assert!(img.segment_bytes(&seg).len() == seg.filesz);
+                assert!(seg.offset + seg.filesz <= len);
+            }
+            let _ = img.entry();
+        }
+    }
+}

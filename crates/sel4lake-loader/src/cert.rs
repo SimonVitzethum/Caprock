@@ -1,39 +1,41 @@
 //! TrustedSAS-Zertifikat — **reiner**, bounds-geprüfter Parser (ext-28, [ADR 0014]).
 //!
 //! Hier liegt **keine** Krypto und **kein** `unsafe` (`#![forbid(unsafe_code)]` der Crate): nur das
-//! Nachrichtenlayout wird validiert + zerlegt. Die Ed25519-Verifikation der **gesamten** Nachricht +
-//! die Policy (Hash-Bindung, Anti-Downgrade, Unsafe-Status-Pflicht) liegen im Kernel-Glue
-//! (`loader::verify_image`) bzw. in `sel4lake-trust`; der Kernel hält die read-only Key-DB.
+//! Nachrichtenlayout wird validiert + zerlegt. Die Verifikation der **gesamten** Nachricht (Signatur
+//! gemäß `signature_algorithm_id`) + die Policy (Hash-Bindung, Anti-Downgrade, Unsafe-Status-Pflicht)
+//! liegen im Kernel-Glue (`loader::verify_image`) bzw. in `sel4lake-trust`; der Kernel hält die
+//! read-only Key-DB.
 //!
-//! ## Format (Little-Endian) — die **gesamte** Nachricht `[0..msg_len)` wird signiert
+//! ## Format (Little-Endian, **eingefroren**) — die **gesamte** Nachricht `[0..msg_len)` wird signiert
 //! ```text
 //! 0    magic:u32                = 0x5453_4331 ("TSC1")
-//! --- Build-Identitaet / Zertifizierungsverfahren (alle signiert) ---
-//! 4    cert_format_version:u16   = 1   (Zertifikatsformat-Version)
-//! 6    sig_format_version:u16    = 1   (Signaturformat: Ed25519 ueber die Nachricht)
-//! 8    build_rules_version:u16         (Compiler-/Buildregel-Version)
-//! 10   audit_protocol_version:u16      (TrustedSAS-Audit-Protokoll-Version)
-//! 12   unsafe_rules_version:u16        (Unsafe-Pruefregel-Version)
-//! 14   allowlist_rules_version:u16     (Allowlist-Regel-Version)
+//! --- Build-Identitaet / Krypto- & Policy-Identifier (alle signiert) ---
+//! 4    cert_format_version:u16   = 1   (Zertifikatsformat)
+//! 6    sig_format_version:u16    = 1   (Signaturformat-Version)
+//! 8    signature_algorithm_id:u16      (Signaturverfahren; Ed25519 = 1)
+//! 10   certificate_policy_id:u32       (Zertifizierungspolitik; z. B. interne Test-/Produktion)
+//! 14   build_rules_version:u16         (Compiler-/Buildregel)
+//! 16   audit_protocol_version:u16      (TrustedSAS-Audit-Protokoll)
+//! 18   unsafe_rules_version:u16        (Unsafe-Pruefregeln)
+//! 20   allowlist_rules_version:u16     (Allowlist-Regeln)
 //! ---
-//! 16   flags:u16                 (Eigenschaften)
-//! 18   reserved:u16              (=0, signiert, zukuenftig)
-//! 20   program_id:u32
-//! 24   version:u32
-//! 28   binary_hash:[u8;32]       (SHA-256 des ELF — bindet das Zertifikat FEST an genau dies Binary)
-//! 60   manifest_hash:[u8;32]     (SHA-256 des Manifests)
-//! 92   key_id:[u8;16]            (128-bit-Fingerprint = SHA-256(pubkey)[..16])
-//! 108  unsafe_status:u32         (Bitflags PROGRAM_FORBID|PROJECT_CLEAN|ALLOWLIST_OK; muss ALL_PASS)
-//! 112  unsafe_audit_hash:[u8;32] (SHA-256 des vollstaendigen Unsafe-Audit-Berichts -> bindet ihn)
-//! 144  build_info_len:u16
-//! 146  build_info:[..]           (UTF-8: rustc/toolchain/target/profil/zeitstempel)
-//! --- signierte Nachricht endet (msg_len = 146 + build_info_len) ---
-//! msg_len  signature:[u8;64]     (Ed25519 ueber [0..msg_len))
+//! 22   flags:u16                 (Eigenschaften)
+//! 24   reserved:u16              (=0, signiert)
+//! 26   program_id:u32
+//! 30   version:u32
+//! 34   binary_hash:[u8;32]       (SHA-256 des ELF — bindet das Zertifikat FEST an genau dies Binary)
+//! 66   manifest_hash:[u8;32]     (SHA-256 des Manifests)
+//! 98   key_id:[u8;16]            (128-bit-Fingerprint = SHA-256(pubkey)[..16])
+//! 114  unsafe_status:u32         (Bitflags PROGRAM_FORBID|PROJECT_CLEAN|ALLOWLIST_OK; muss ALL_PASS)
+//! 118  unsafe_audit_hash:[u8;32] (SHA-256 des vollstaendigen Unsafe-Audit-Berichts -> bindet ihn)
+//! 150  build_info_len:u16
+//! 152  build_info:[..]           (UTF-8: rustc/toolchain/target/profil/zeitstempel)
+//! --- signierte Nachricht endet (msg_len = 152 + build_info_len) ---
+//! msg_len  signature:[..]        (variabel; Algorithmus laut signature_algorithm_id, Ed25519 = 64 B)
 //! ```
-//! Damit ist **jedes** Feld kryptographisch geschützt — inkl. der **Verfahrens-Versionen**: ein
-//! Zertifikat sagt nicht nur „von diesem Schlüssel signiert", sondern „nach **genau diesem**
-//! TrustedSAS-Zertifizierungsverfahren erzeugt". Spätere Regeländerungen lassen sich so nicht unter
-//! demselben Format vermischen.
+//! Die **variable** Signaturlänge + `signature_algorithm_id`/`certificate_policy_id` erlauben künftige
+//! Krypto-/Policy-Wechsel **ohne Strukturänderung**. Jedes Feld ist kryptographisch geschützt — das
+//! Zertifikat bezeugt „nach **genau diesem** Verfahren + dieser Policy + diesem Algorithmus erzeugt".
 
 use crate::LoaderError;
 
@@ -41,8 +43,12 @@ use crate::LoaderError;
 pub const CERT_MAGIC: u32 = 0x5453_4331;
 /// Aktuell unterstützte **Zertifikatsformat**-Version (vom Kernel geprüft).
 pub const CERT_FORMAT_VERSION: u16 = 1;
-/// Aktuelle **Signaturformat**-Version (Ed25519 über die Nachricht). Vom Tool gestempelt.
+/// Aktuelle **Signaturformat**-Version. Vom Tool gestempelt.
 pub const SIG_FORMAT_VERSION: u16 = 1;
+/// **Signaturalgorithmus-ID**: Ed25519 (RFC 8032). Künftige Verfahren = weitere IDs.
+pub const SIG_ALG_ED25519: u16 = 1;
+/// Erwartete Signaturlänge für [`SIG_ALG_ED25519`].
+pub const SIG_ED25519_LEN: usize = 64;
 /// Aktuelle **Compiler-/Buildregel**-Version. Vom Tool gestempelt.
 pub const BUILD_RULES_VERSION: u16 = 1;
 /// Aktuelle **TrustedSAS-Audit-Protokoll**-Version. Vom Tool gestempelt.
@@ -52,12 +58,21 @@ pub const UNSAFE_RULES_VERSION: u16 = 1;
 /// Aktuelle **Allowlist-Regel**-Version. Vom Tool gestempelt.
 pub const ALLOWLIST_RULES_VERSION: u16 = 1;
 
+// Bekannte `certificate_policy_id`-Werte (der Kernel erzwingt sie zunächst nicht, sie sind aber
+// signiert + können später per Policy geprüft werden).
+/// TrustedSAS-Standardpolitik v1.
+pub const POLICY_TRUSTEDSAS_V1: u32 = 1;
+/// TrustedSAS, zusätzlich formal verifiziert.
+pub const POLICY_TRUSTEDSAS_FORMAL: u32 = 2;
+/// Interne Testzertifikate (Selbsttest).
+pub const POLICY_INTERNAL_TEST: u32 = 3;
+/// Produktionszertifikate.
+pub const POLICY_PRODUCTION: u32 = 4;
+
 /// Länge des festen Kopfteils (bis einschließlich `build_info_len`).
-pub const CERT_HEADER_LEN: usize = 146;
-/// Länge der Ed25519-Signatur.
-pub const CERT_SIG_LEN: usize = 64;
-/// Kleinste gültige Zertifikatslänge (leere `build_info`).
-pub const CERT_MIN_LEN: usize = CERT_HEADER_LEN + CERT_SIG_LEN;
+pub const CERT_HEADER_LEN: usize = 152;
+/// Kleinste gültige Zertifikatslänge (leere `build_info`, ≥1 Signaturbyte).
+pub const CERT_MIN_LEN: usize = CERT_HEADER_LEN + 1;
 
 // Unsafe-Prüfstatus-Bitflags (ADR 0014): vom Build-/Signier-Tool gesetzt, signiert, vom Kernel
 // erzwungen (TrustedSAS verlangt [`UNSAFE_ALL_PASS`]).
@@ -71,13 +86,14 @@ pub const UNSAFE_ALLOWLIST_OK: u32 = 1 << 2;
 pub const UNSAFE_ALL_PASS: u32 = UNSAFE_PROGRAM_FORBID | UNSAFE_PROJECT_CLEAN | UNSAFE_ALLOWLIST_OK;
 
 /// Ein geparstes, bounds-validiertes TrustedSAS-Zertifikat. Die Krypto-Prüfung (Signatur über
-/// [`Self::message`] mit dem über [`Self::key_id`] referenzierten PubKey) + die Policy erfolgen
-/// **außerhalb** (Kernel/`sel4lake-trust`).
+/// [`Self::message`] mit dem über [`Self::key_id`] referenzierten PubKey, Algorithmus laut
+/// [`Self::signature_algorithm_id`]) + die Policy erfolgen **außerhalb** (Kernel/`sel4lake-trust`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrustedCert<'a> {
-    // Build-Identitaet / Zertifizierungsverfahren (signiert).
     pub cert_format_version: u16,
     pub sig_format_version: u16,
+    pub signature_algorithm_id: u16,
+    pub certificate_policy_id: u32,
     pub build_rules_version: u16,
     pub audit_protocol_version: u16,
     pub unsafe_rules_version: u16,
@@ -103,10 +119,11 @@ fn rd_u32(d: &[u8], off: usize) -> u32 {
 }
 
 impl<'a> TrustedCert<'a> {
-    /// Ein Zertifikat strikt parsen: korrektes Magic + Zertifikatsformat-Version, exakte Gesamtlänge
-    /// passend zu `build_info_len`. **Nie** ein Out-of-Bounds/Panic — fehlerhafte Eingabe →
-    /// [`LoaderError::BadCert`]. Die übrigen Verfahrens-Versionen werden geparst + (über die
-    /// Signatur) geschützt, hier aber **nicht** erzwungen (kann der Kernel später tun).
+    /// Ein Zertifikat strikt parsen: korrektes Magic + Zertifikatsformat-Version, `build_info_len`
+    /// passt in die Daten, **nicht-leere** Signatur folgt. **Nie** ein Out-of-Bounds/Panic —
+    /// fehlerhafte Eingabe → [`LoaderError::BadCert`]. Algorithmus/Policy/Verfahrens-Versionen werden
+    /// geparst + (über die Signatur) geschützt; die **Auswertung** (Algorithmus-Wahl + Signaturlänge)
+    /// erfolgt im Kernel-Verifier.
     pub fn parse(data: &'a [u8]) -> Result<TrustedCert<'a>, LoaderError> {
         if data.len() < CERT_MIN_LEN {
             return Err(LoaderError::BadCert);
@@ -118,34 +135,36 @@ impl<'a> TrustedCert<'a> {
         if cert_format_version != CERT_FORMAT_VERSION {
             return Err(LoaderError::BadCert);
         }
-        let build_info_len = rd_u16(data, 144) as usize;
-        // msg_len overflow-sicher (build_info_len <= u16::MAX); exakte Gesamtlänge erzwingen.
+        let build_info_len = rd_u16(data, 150) as usize;
+        // msg_len overflow-sicher (build_info_len <= u16::MAX). Es muss mind. 1 Signaturbyte folgen.
         let msg_len = CERT_HEADER_LEN + build_info_len;
-        if data.len() != msg_len + CERT_SIG_LEN {
+        if data.len() <= msg_len {
             return Err(LoaderError::BadCert);
         }
         let mut binary_hash = [0u8; 32];
-        binary_hash.copy_from_slice(&data[28..60]);
+        binary_hash.copy_from_slice(&data[34..66]);
         let mut manifest_hash = [0u8; 32];
-        manifest_hash.copy_from_slice(&data[60..92]);
+        manifest_hash.copy_from_slice(&data[66..98]);
         let mut key_id = [0u8; 16];
-        key_id.copy_from_slice(&data[92..108]);
+        key_id.copy_from_slice(&data[98..114]);
         let mut unsafe_audit_hash = [0u8; 32];
-        unsafe_audit_hash.copy_from_slice(&data[112..144]);
+        unsafe_audit_hash.copy_from_slice(&data[118..150]);
         Ok(TrustedCert {
             cert_format_version,
             sig_format_version: rd_u16(data, 6),
-            build_rules_version: rd_u16(data, 8),
-            audit_protocol_version: rd_u16(data, 10),
-            unsafe_rules_version: rd_u16(data, 12),
-            allowlist_rules_version: rd_u16(data, 14),
-            flags: rd_u16(data, 16),
-            program_id: rd_u32(data, 20),
-            version: rd_u32(data, 24),
+            signature_algorithm_id: rd_u16(data, 8),
+            certificate_policy_id: rd_u32(data, 10),
+            build_rules_version: rd_u16(data, 14),
+            audit_protocol_version: rd_u16(data, 16),
+            unsafe_rules_version: rd_u16(data, 18),
+            allowlist_rules_version: rd_u16(data, 20),
+            flags: rd_u16(data, 22),
+            program_id: rd_u32(data, 26),
+            version: rd_u32(data, 30),
             binary_hash,
             manifest_hash,
             key_id,
-            unsafe_status: rd_u32(data, 108),
+            unsafe_status: rd_u32(data, 114),
             unsafe_audit_hash,
             build_info: &data[CERT_HEADER_LEN..msg_len],
             message: &data[..msg_len],
@@ -153,11 +172,12 @@ impl<'a> TrustedCert<'a> {
         })
     }
 
-    /// Die **gesamte** signierte Nachricht `[0..msg_len)` (Eingabe der Ed25519-Verifikation).
+    /// Die **gesamte** signierte Nachricht `[0..msg_len)` (Eingabe der Signatur-Verifikation).
     pub fn message(&self) -> &'a [u8] {
         self.message
     }
-    /// Die Ed25519-Signatur, exakt [`CERT_SIG_LEN`].
+    /// Die Signatur (variabel lang; für Ed25519 [`SIG_ED25519_LEN`] B). Der Verifier prüft Länge +
+    /// Algorithmus.
     pub fn signature(&self) -> &'a [u8] {
         self.signature
     }
@@ -175,39 +195,40 @@ impl<'a> TrustedCert<'a> {
 mod tests {
     use super::*;
 
-    /// Ein gültiges Zertifikat mit `build_info` der Länge `bil` bauen (Signatur ist Dummy — der
-    /// Parser prüft keine Krypto).
-    fn good(bil: usize) -> Vec<u8> {
+    /// Ein gültiges Zertifikat (Ed25519-Algorithmus, `bil` Bytes `build_info`, `sl` Signaturbytes)
+    /// bauen (Signatur ist Dummy — der Parser prüft keine Krypto).
+    fn good(bil: usize, sl: usize) -> Vec<u8> {
         let msg_len = CERT_HEADER_LEN + bil;
-        let mut c = vec![0u8; msg_len + CERT_SIG_LEN];
+        let mut c = vec![0u8; msg_len + sl];
         c[0..4].copy_from_slice(&CERT_MAGIC.to_le_bytes());
         c[4..6].copy_from_slice(&CERT_FORMAT_VERSION.to_le_bytes());
         c[6..8].copy_from_slice(&SIG_FORMAT_VERSION.to_le_bytes());
-        c[8..10].copy_from_slice(&BUILD_RULES_VERSION.to_le_bytes());
-        c[10..12].copy_from_slice(&AUDIT_PROTOCOL_VERSION.to_le_bytes());
-        c[12..14].copy_from_slice(&UNSAFE_RULES_VERSION.to_le_bytes());
-        c[14..16].copy_from_slice(&ALLOWLIST_RULES_VERSION.to_le_bytes());
-        c[16..18].copy_from_slice(&0u16.to_le_bytes()); // flags
-        c[20..24].copy_from_slice(&7u32.to_le_bytes()); // program_id
-        c[24..28].copy_from_slice(&3u32.to_le_bytes()); // version
-        for i in 28..60 {
+        c[8..10].copy_from_slice(&SIG_ALG_ED25519.to_le_bytes());
+        c[10..14].copy_from_slice(&POLICY_INTERNAL_TEST.to_le_bytes());
+        c[14..16].copy_from_slice(&BUILD_RULES_VERSION.to_le_bytes());
+        c[16..18].copy_from_slice(&AUDIT_PROTOCOL_VERSION.to_le_bytes());
+        c[18..20].copy_from_slice(&UNSAFE_RULES_VERSION.to_le_bytes());
+        c[20..22].copy_from_slice(&ALLOWLIST_RULES_VERSION.to_le_bytes());
+        c[26..30].copy_from_slice(&7u32.to_le_bytes()); // program_id
+        c[30..34].copy_from_slice(&3u32.to_le_bytes()); // version
+        for i in 34..66 {
             c[i] = i as u8; // binary_hash
         }
-        for i in 60..92 {
+        for i in 66..98 {
             c[i] = (i + 1) as u8; // manifest_hash
         }
-        for i in 92..108 {
+        for i in 98..114 {
             c[i] = (i + 2) as u8; // key_id
         }
-        c[108..112].copy_from_slice(&UNSAFE_ALL_PASS.to_le_bytes());
-        for i in 112..144 {
+        c[114..118].copy_from_slice(&UNSAFE_ALL_PASS.to_le_bytes());
+        for i in 118..150 {
             c[i] = (i + 3) as u8; // unsafe_audit_hash
         }
-        c[144..146].copy_from_slice(&(bil as u16).to_le_bytes());
+        c[150..152].copy_from_slice(&(bil as u16).to_le_bytes());
         for i in 0..bil {
             c[CERT_HEADER_LEN + i] = b'B';
         }
-        for i in 0..CERT_SIG_LEN {
+        for i in 0..sl {
             c[msg_len + i] = (i + 5) as u8;
         }
         c
@@ -215,9 +236,11 @@ mod tests {
 
     #[test]
     fn parse_roundtrip() {
-        let c = good(24);
+        let c = good(24, SIG_ED25519_LEN);
         let t = TrustedCert::parse(&c).unwrap();
         assert_eq!(t.cert_format_version, 1);
+        assert_eq!(t.signature_algorithm_id, SIG_ALG_ED25519);
+        assert_eq!(t.certificate_policy_id, POLICY_INTERNAL_TEST);
         assert_eq!(t.sig_format_version, SIG_FORMAT_VERSION);
         assert_eq!(t.build_rules_version, BUILD_RULES_VERSION);
         assert_eq!(t.audit_protocol_version, AUDIT_PROTOCOL_VERSION);
@@ -226,43 +249,49 @@ mod tests {
         assert_eq!(t.program_id, 7);
         assert_eq!(t.version, 3);
         assert!(t.unsafe_all_pass());
-        assert_eq!(t.binary_hash[0], 28);
+        assert_eq!(t.binary_hash[0], 34);
         assert_eq!(t.build_info(), &[b'B'; 24]);
         assert_eq!(t.message().len(), CERT_HEADER_LEN + 24);
+        assert_eq!(t.signature().len(), SIG_ED25519_LEN);
         assert_eq!(t.message(), &c[..CERT_HEADER_LEN + 24]);
         assert_eq!(t.signature(), &c[CERT_HEADER_LEN + 24..]);
     }
 
     #[test]
     fn parse_empty_build_info_ok() {
-        let c = good(0);
+        let c = good(0, SIG_ED25519_LEN);
         let t = TrustedCert::parse(&c).unwrap();
         assert_eq!(t.build_info().len(), 0);
-        assert_eq!(c.len(), CERT_MIN_LEN);
+    }
+
+    #[test]
+    fn variable_signature_length_accepted_by_parser() {
+        // Der Parser ist algorithmus-agnostisch: er akzeptiert jede nicht-leere Signaturlänge; die
+        // Längenpruefung (64 fuer Ed25519) macht der Kernel-Verifier.
+        let c1 = good(0, 1);
+        assert_eq!(TrustedCert::parse(&c1).unwrap().signature().len(), 1);
+        let c2 = good(8, 96);
+        assert_eq!(TrustedCert::parse(&c2).unwrap().signature().len(), 96);
     }
 
     #[test]
     fn unsafe_status_partial_is_not_all_pass() {
-        let mut c = good(0);
-        c[108..112].copy_from_slice(&(UNSAFE_PROGRAM_FORBID | UNSAFE_PROJECT_CLEAN).to_le_bytes());
-        let t = TrustedCert::parse(&c).unwrap();
-        assert!(!t.unsafe_all_pass()); // ALLOWLIST_OK fehlt
+        let mut c = good(0, SIG_ED25519_LEN);
+        c[114..118].copy_from_slice(&(UNSAFE_PROGRAM_FORBID | UNSAFE_PROJECT_CLEAN).to_le_bytes());
+        assert!(!TrustedCert::parse(&c).unwrap().unsafe_all_pass());
     }
 
     #[test]
-    fn wrong_total_length_rejected() {
-        let mut c = good(24);
-        c.pop();
-        assert_eq!(TrustedCert::parse(&c).unwrap_err(), LoaderError::BadCert);
-        let mut c = good(24);
-        c.push(0);
+    fn empty_signature_rejected() {
+        let c = good(0, 0); // keine Signaturbytes
         assert_eq!(TrustedCert::parse(&c).unwrap_err(), LoaderError::BadCert);
     }
 
     #[test]
-    fn build_info_len_mismatch_rejected() {
-        let mut c = good(24);
-        c[144..146].copy_from_slice(&25u16.to_le_bytes()); // behauptet 25, Daten passen zu 24
+    fn build_info_len_overruns_rejected() {
+        let mut c = good(8, SIG_ED25519_LEN);
+        // behauptet eine riesige build_info -> msg_len >= data.len() -> abgelehnt
+        c[150..152].copy_from_slice(&60000u16.to_le_bytes());
         assert_eq!(TrustedCert::parse(&c).unwrap_err(), LoaderError::BadCert);
     }
 
@@ -270,21 +299,21 @@ mod tests {
     fn too_short_rejected() {
         assert_eq!(TrustedCert::parse(&[]).unwrap_err(), LoaderError::BadCert);
         assert_eq!(
-            TrustedCert::parse(&[0u8; CERT_MIN_LEN - 1]).unwrap_err(),
+            TrustedCert::parse(&[0u8; CERT_HEADER_LEN]).unwrap_err(),
             LoaderError::BadCert
         );
     }
 
     #[test]
     fn bad_magic_rejected() {
-        let mut c = good(0);
+        let mut c = good(0, SIG_ED25519_LEN);
         c[0] ^= 0xFF;
         assert_eq!(TrustedCert::parse(&c).unwrap_err(), LoaderError::BadCert);
     }
 
     #[test]
     fn bad_cert_format_version_rejected() {
-        let mut c = good(0);
+        let mut c = good(0, SIG_ED25519_LEN);
         c[4] = 0xEE;
         assert_eq!(TrustedCert::parse(&c).unwrap_err(), LoaderError::BadCert);
     }

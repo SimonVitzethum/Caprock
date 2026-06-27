@@ -28,37 +28,43 @@ austauschbar). Die Nachricht umfasst die **Build-Identität / das Zertifizierung
 (Format-/Signatur-/Buildregel-/Audit-Protokoll-/Unsafe-Regel-/Allowlist-Regel-Version),
 **Compiler-/Build-Informationen** und den **Unsafe-Prüfstatus** (§6) — der Signierer bezeugt damit
 Identität **und** „nach genau diesem TrustedSAS-Verfahren erzeugt".
+**Eingefrorenes Format** (algorithmus-/policy-agnostisch — künftige Krypto-/Policy-Wechsel ohne
+Strukturänderung über `signature_algorithm_id`/`certificate_policy_id` + die **variable** Signaturlänge):
 ```text
 Offset Feld (Little-Endian)
 0    magic:u32                = 0x5453_4331 ("TSC1")
---- Build-Identitaet / Zertifizierungsverfahren (alle signiert) ---
+--- Build-Identitaet / Krypto- & Policy-Identifier (alle signiert) ---
 4    cert_format_version:u16   = 1   (Zertifikatsformat)
-6    sig_format_version:u16    = 1   (Signaturformat: Ed25519 ueber die Nachricht)
-8    build_rules_version:u16         (Compiler-/Buildregel)
-10   audit_protocol_version:u16      (TrustedSAS-Audit-Protokoll)
-12   unsafe_rules_version:u16        (Unsafe-Pruefregeln)
-14   allowlist_rules_version:u16     (Allowlist-Regeln)
+6    sig_format_version:u16    = 1   (Signaturformat-Version)
+8    signature_algorithm_id:u16      (Signaturverfahren; Ed25519 = 1)
+10   certificate_policy_id:u32       (Zertifizierungspolitik; z. B. interne Test- / Produktion / formal)
+14   build_rules_version:u16         (Compiler-/Buildregel)
+16   audit_protocol_version:u16      (TrustedSAS-Audit-Protokoll)
+18   unsafe_rules_version:u16        (Unsafe-Pruefregeln)
+20   allowlist_rules_version:u16     (Allowlist-Regeln)
 ---
-16   flags:u16                 (Eigenschaften)
-18   reserved:u16              (=0, signiert, zukuenftig)
-20   program_id:u32
-24   version:u32
-28   binary_hash:[u8;32]       (SHA-256 des ELF — bindet das Zertifikat FEST an genau dieses Binary)
-60   manifest_hash:[u8;32]     (SHA-256 des Manifests)
-92   key_id:[u8;16]            (128-bit-Fingerprint = SHA-256(pubkey)[..16])
-108  unsafe_status:u32         (Bitflags PROGRAM_FORBID|PROJECT_CLEAN|ALLOWLIST_OK; muss ALL_PASS sein)
-112  unsafe_audit_hash:[u8;32] (SHA-256 des vollstaendigen Unsafe-Audit-Berichts -> bindet ihn)
-144  build_info_len:u16
-146  build_info:[..]           (UTF-8: rustc/toolchain/target/profil/zeitstempel)
---- signierte Nachricht endet (msg_len = 146 + build_info_len) ---
-msg_len  signature:[u8;64]     (Ed25519 ueber [0..msg_len))
+22   flags:u16                 (Eigenschaften)
+24   reserved:u16              (=0, signiert)
+26   program_id:u32
+30   version:u32
+34   binary_hash:[u8;32]       (SHA-256 des ELF — bindet das Zertifikat FEST an genau dieses Binary)
+66   manifest_hash:[u8;32]     (SHA-256 des Manifests)
+98   key_id:[u8;16]            (128-bit-Fingerprint = SHA-256(pubkey)[..16])
+114  unsafe_status:u32         (Bitflags PROGRAM_FORBID|PROJECT_CLEAN|ALLOWLIST_OK; muss ALL_PASS sein)
+118  unsafe_audit_hash:[u8;32] (SHA-256 des vollstaendigen Unsafe-Audit-Berichts -> bindet ihn)
+150  build_info_len:u16
+152  build_info:[..]           (UTF-8: rustc/toolchain/target/profil/zeitstempel)
+--- signierte Nachricht endet (msg_len = 152 + build_info_len) ---
+msg_len  signature:[..]        (variabel; Algorithmus laut signature_algorithm_id, Ed25519 = 64 B)
 ```
 Der Kernel akzeptiert ein **TrustedSAS**-Binary nur, wenn **alle** gelten: magic/`cert_format_version`
-ok; `key_id` in der read-only Key-DB (Key nicht `revoked`); Ed25519-Signatur über die **gesamte**
-Nachricht mit diesem PubKey gültig; **`binary_hash == SHA256(prog.elf)`** (feste Binary-Bindung) und
-`manifest_hash == SHA256(prog.manifest)`; `program_id/version` konsistent zum Archiv-Eintrag;
-`version >= min_version[program_id]` (Anti-Downgrade); `unsafe_status == UNSAFE_ALL_PASS`. Die
-übrigen Verfahrens-Versionen (sig/build/audit/unsafe/allowlist) werden **vollständig signiert**
+ok; `signature_algorithm_id == Ed25519` + Signaturlänge 64; `key_id` in der read-only Key-DB (Key
+nicht `revoked`); Ed25519-Signatur über die **gesamte** Nachricht mit diesem PubKey gültig;
+**`binary_hash == SHA256(prog.elf)`** (feste Binary-Bindung) und `manifest_hash ==
+SHA256(prog.manifest)`; `program_id/version` konsistent zum Archiv-Eintrag; `version >=
+min_version[program_id]` (Anti-Downgrade); `unsafe_status == UNSAFE_ALL_PASS`. Die übrigen
+Felder — `certificate_policy_id` + die Verfahrens-Versionen (sig/build/audit/unsafe/allowlist) —
+werden **vollständig signiert**
 (also integritätsgeschützt + nachvollziehbar), aber zunächst **nicht** erzwungen — der Kernel kann sie
 in späteren Versionen prüfen (z. B. eine Mindest-Audit-Protokoll-Version verlangen), ohne dass sich
 das Format ändert. Weil die Bindung **kryptographisch** über `binary_hash` läuft (nicht positionell),

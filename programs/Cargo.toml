@@ -8,7 +8,7 @@
 [workspace]
 resolver = "2"
 # Programme nach Domaene gegliedert (userland/hardware/trusted). libsel4lake = gemeinsames SDK.
-members = ["libsel4lake", "userland/hello"]
+members = ["libsel4lake", "userland/hello", "trusted/svc-demo"]
 
 [workspace.package]
 edition = "2021"

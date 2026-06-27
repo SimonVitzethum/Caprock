@@ -10,7 +10,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 /// Ein öffentlicher TrustedSAS-Root-Schlüssel in der **read-only** Kernel-Key-DB (ADR 0014 §4).
@@ -44,12 +44,16 @@ pub fn fingerprint(pubkey: &[u8; 32]) -> [u8; 16] {
 
 /// Ed25519-Signatur über `msg` mit `pubkey` prüfen. Rein verifizierend (kein Heap, kein RNG).
 /// `false` bei ungültigem Schlüssel **oder** ungültiger Signatur.
+///
+/// Nutzt **`verify_strict`** (nicht `verify`): lehnt Small-Order-`R`-Komponenten und
+/// nicht-kanonische Kodierungen ab → keine Signatur-Malleability an der Vertrauensgrenze (zu einer
+/// gegebenen Nachricht existiert keine zweite akzeptierte Signatur).
 pub fn verify_sig(pubkey: &[u8; 32], msg: &[u8], sig: &[u8; 64]) -> bool {
     let Ok(vk) = VerifyingKey::from_bytes(pubkey) else {
         return false;
     };
     let signature = Signature::from_bytes(sig);
-    vk.verify(msg, &signature).is_ok()
+    vk.verify_strict(msg, &signature).is_ok()
 }
 
 #[cfg(test)]

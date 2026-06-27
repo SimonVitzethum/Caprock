@@ -12,3 +12,10 @@ dependencies = [
 [[package]]
 name = "libsel4lake"
 version = "0.0.1"
+
+[[package]]
+name = "svc-demo"
+version = "0.0.1"
+dependencies = [
+ "libsel4lake",
+]

@@ -4,3 +4,5 @@
 *.img
 /programs/build/
 /tests/build/
+/keys/
+/certs/

@@ -140,6 +140,22 @@ pub fn exit() -> ! {
     }
 }
 
+/// Definiert den ELF-Entry-Point `_start` eines extern geladenen Programms.
+///
+/// Die `#[no_mangle]`-Glue (in aktuellem Rust ein *unsafe* Attribut) gehoert zur auditierten
+/// SDK-Schicht (= Allowlist), damit das eigentliche Programm `#![forbid(unsafe_code)]` bleiben und
+/// damit zertifiziert werden kann. `$main` ist eine **sichere** `fn(usize) -> !` des Programms (x0 =
+/// Boot-Arg). Verwendung:  `libsel4lake::entry!(run);`  mit  `fn run(_arg: usize) -> ! { ... }`.
+#[macro_export]
+macro_rules! entry {
+    ($main:path) => {
+        #[no_mangle]
+        pub extern "C" fn _start(arg: usize) -> ! {
+            $main(arg)
+        }
+    };
+}
+
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     // Kein Heap/Konsole im EL0-Programm verfügbar -> still parken; der Kernel beobachtet, dass

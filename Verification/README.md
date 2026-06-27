@@ -28,6 +28,12 @@ Strategie/Stufenmodell + Aufwand: `ARMTest/formale-verifikation-aufwand.md`. Pip
 | **4** | **IPC** (CALL/REPLY-Rendezvous, Endpoint-Konsistenz) | [`ipc/`](ipc/) | **Kern bewiesen** (kein Verlust/Duplikat, Fortschritt); Reply-Caps/Nebenläufigkeit offen |
 | **5** | **Scheduler** (Runqueue-Konsistenz, MCS-Budget) | [`scheduler/`](scheduler/) | **Kern bewiesen** (Queue-Kopplung/MCS-Schranke/keine Aushungerung/Fortschritt); Prio-Auswahl/Donation offen |
 
+**Gesamtstand:** alle fünf Kernkomponenten sind **im Kern funktional verifiziert** (Verus, **75
+verified** über 14 Dateien, CI-gated). Bewusst als nächste Ausbaustufen offen: CDT-Reachability
+(move/revoke, Phase 1), Capability-Endowment (Phase 2), RegionSource/Zero-Copy (Phase 3), Reply-Caps/
+Cap-Transfer (Phase 4), Prioritäts-Auswahlregel/Budget-Donation (Phase 5) sowie durchgängig die
+**Nebenläufigkeit** (Loom/TLA+, s. Hardware-Vertrauensgrenze).
+
 ## Hardware-Vertrauensgrenze (bewusst außerhalb)
 
 SMP · Deferred-IRQ · Locking · MMIO · DMA · Kontextwechsel · HAL · Seitentabellen bleiben außerhalb der

@@ -73,8 +73,9 @@ Die **Gesamtinvariante** `cap_inv(cs)` ist die **Konjunktion** der Klauseln 1–
 `spec fn` über `objects`/`slots`. Hilfs-Spezifikation: `refs_to(slots, o)` = Anzahl belegter Slots, die
 auf `o` zeigen (rekursiv); `ancestor(cs, s, k)` = `k`-ter Vorfahre entlang `parent`.
 
-> **Schritt A (jetzt):** die Spezifikation ist als **getrennte** Modelle bereits umgesetzt + bewiesen
-> (s. §9). Schritt B vereint sie in **eine** `cap_inv`.
+> **Schritt B (umgesetzt):** die Spezifikation ist als **eine** vereinte `cap_inv` in
+> [`proofs/cap_space.rs`](proofs/cap_space.rs) implementiert (Konjunktion aller Klauseln 1–7);
+> `install` ist gegen die **volle** `cap_inv` bewiesen. Schritt C ergänzt copy/mint/move/delete/revoke.
 
 ## 6. Verus-Architektur
 
@@ -116,7 +117,7 @@ auf `o` zeigen (rekursiv); `ancestor(cs, s, k)` = `k`-ter Vorfahre entlang `pare
 | Sibling (5) | insert_before, unlink | `verus/cap_cdt_tree.rs` | ✅ bewiesen (3 verified) |
 | Struktur (4l+5+6) | derive | `verus/cap_cdt_structure.rs` | ✅ bewiesen (2 verified) |
 | Azyklizität (7) | derive (+ allg. Korollare) | `verus/cap_cdt_acyclic.rs` | ✅ bewiesen (7 verified) |
-| **Vereint (1–7) je Operation** | install, copy, **mint, move**, delete, **revoke** | `Verification/capability-system/proofs/` | ⏳ Schritt B/C |
+| **Vereint (1–7), volle `cap_inv`** | **install** ✅ · copy, mint, move, delete, revoke ⏳ | [`proofs/cap_space.rs`](proofs/cap_space.rs) | ⏳ Schritt B fertig (Modell+`cap_inv`+install, 5 verified) · C laufend |
 
 ## 10. Noch offene Eigenschaften
 

@@ -19,10 +19,12 @@ if [ ! -x "$VERUS" ]; then
     exit 127
 fi
 
-# Alle Verus-Pilotdateien verifizieren (jede ist eigenstaendig, --crate-type=lib).
+# Alle Verus-Dateien verifizieren (jede ist eigenstaendig, --crate-type=lib): die Pilotdateien unter
+# verus/ + die komponentenweisen Beweise unter Verification/<komponente>/proofs/.
 rc=0
-for f in "$ROOT"/verus/*.rs; do
-    echo "== Verus: $(basename "$f") =="
+for f in "$ROOT"/verus/*.rs "$ROOT"/Verification/*/proofs/*.rs; do
+    [ -e "$f" ] || continue
+    echo "== Verus: ${f#$ROOT/} =="
     "$VERUS" --crate-type=lib "$f" || rc=1
 done
 exit "$rc"

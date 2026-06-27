@@ -60,6 +60,15 @@ setup_sync() {
     echo "$SA"
 }
 
+# --- Ziel: unsafe-safety (eigenständiges Artefakt: getreue Kopien der Kernel-unsafe-Glue,
+#     Memory-Safety der Kategorie-A-`unsafe`-Stellen; abhängigkeitsfrei) ---
+setup_unsafe() {
+    local SA="$TMP/kani_unsafe"; rm -rf "$SA"; mkdir -p "$SA/src"
+    cp "$ROOT/Verification/unsafe-safety/kani/src/"*.rs "$SA/src/"
+    manifest "$SA" sel4lake-unsafe-safety "[workspace]"
+    echo "$SA"
+}
+
 run_target() { # $1=loader|region|sync ; weitere Args -> cargo kani
     local t="$1"; shift || true
     local dir pkg
@@ -67,14 +76,15 @@ run_target() { # $1=loader|region|sync ; weitere Args -> cargo kani
         loader) dir="$(setup_loader)"; pkg="sel4lake-loader" ;;
         region) dir="$(setup_region)"; pkg="sel4lake-region" ;;
         sync)   dir="$(setup_sync)";   pkg="sel4lake-sync" ;;
-        *) echo "unbekanntes Ziel '$t' (loader|region|sync)"; exit 2 ;;
+        unsafe) dir="$(setup_unsafe)"; pkg="sel4lake-unsafe-safety" ;;
+        *) echo "unbekanntes Ziel '$t' (loader|region|sync|unsafe)"; exit 2 ;;
     esac
     echo "== Kani: $pkg =="
     ( cd "$dir" && cargo kani -p "$pkg" "$@" )
 }
 
 # Ziele mit Harnesses (wird erweitert, sobald weitere Crates aufgenommen sind).
-DEFAULT_TARGETS="loader region sync"
+DEFAULT_TARGETS="loader region sync unsafe"
 
 if [ "$#" -eq 0 ]; then
     for t in $DEFAULT_TARGETS; do run_target "$t"; done

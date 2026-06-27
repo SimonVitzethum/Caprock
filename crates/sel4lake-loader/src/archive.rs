@@ -10,17 +10,18 @@
 //! Entry  (96 B):  name:[u8;16]
 //!                 program_id:u32  version:u32  domain:u32  flags:u32
 //!                 blob_off:u32  blob_len:u32  manifest_off:u32  manifest_len:u32
-//!                 hash:[u8;32]  reserved:[u32;4]
-//! ... danach die Blobs + Manifeste (innerhalb total_len) ...
+//!                 hash:[u8;32]  cert_off:u32  cert_len:u32  reserved:[u32;2]
+//! ... danach die Blobs + Manifeste + Zertifikate (innerhalb total_len) ...
 //! ```
-//! Alle Offsets sind relativ zum Archiv-Anfang; alle Zugriffe sind bounds-geprüft.
+//! Alle Offsets sind relativ zum Archiv-Anfang; alle Zugriffe sind bounds-geprüft. `cert_len==0`
+//! (ext-28) bedeutet „kein Zertifikat" (nur für TrustedSAS erforderlich).
 
 use crate::{slice_within, LoaderError, Program};
 
 /// Archiv-Magic ("SLKA" ~ SeL4Lake-Archiv), Little-Endian im Header-Wort.
 pub const MAGIC: u32 = 0x534C_4B41;
-/// Aktuelle Archiv-Format-Version.
-pub const VERSION: u32 = 1;
+/// Aktuelle Archiv-Format-Version (ext-28: `reserved[0..1]` → `cert_off`/`cert_len`).
+pub const VERSION: u32 = 2;
 
 const HEADER_LEN: usize = 32;
 const ENTRY_LEN: usize = 96;
@@ -93,9 +94,14 @@ impl<'a> Archive<'a> {
         let man_len = u32::from_le_bytes([e[44], e[45], e[46], e[47]]) as usize;
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&e[48..80]);
+        // ext-28: cert_off/cert_len in den frueher reservierten Feldern (Format v2). cert_len==0 ->
+        // leerer Slice (kein Zertifikat).
+        let cert_off = u32::from_le_bytes([e[80], e[81], e[82], e[83]]) as usize;
+        let cert_len = u32::from_le_bytes([e[84], e[85], e[86], e[87]]) as usize;
         let elf = slice_within(self.data, blob_off, blob_len)?;
         let manifest = slice_within(self.data, man_off, man_len)?;
-        Ok(Program::new(program_id, name, version, domain, hash, elf, manifest))
+        let cert = slice_within(self.data, cert_off, cert_len)?;
+        Ok(Program::new(program_id, name, version, domain, hash, elf, manifest, cert))
     }
 
     /// Programm `i` (bereits bei `parse` validiert). `None` nur bei `i >= count`.

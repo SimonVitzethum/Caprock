@@ -17,7 +17,7 @@ import struct
 import sys
 
 MAGIC = 0x534C4B41
-VERSION = 1
+VERSION = 2  # ext-28: Entry-reserved[0..1] -> cert_off/cert_len (0 = kein Zertifikat)
 HEADER_LEN = 32
 ENTRY_LEN = 96
 

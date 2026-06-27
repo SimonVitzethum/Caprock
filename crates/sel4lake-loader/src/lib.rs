@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod archive;
+pub mod cert;
 pub mod elf;
 
 /// Zieldomäne eines Programms (Manifest/Quellen-Feld). Bewusst kernel-agnostisch (u32); der
@@ -43,9 +44,12 @@ pub enum LoaderError {
     /// Domäne (noch) nicht über diesen Pfad ladbar (z. B. HardwareLand braucht eine vor-erstellte
     /// Backend-PD; TrustedSAS/EL1 ist signatur-gegatet).
     UnsupportedDomain,
-    /// Image nicht verifiziert: privilegierter (EL1/TrustedSAS) Code ohne gültige Signatur
-    /// (ADR 0011 §7; Signaturprüfung noch nicht implementiert → EL1-Laden abgelehnt).
+    /// Image nicht verifiziert: TrustedSAS-Code ohne gültiges Zertifikat (ext-28, ADR 0014):
+    /// fehlendes/abgelehntes Zertifikat, ungültige Signatur, unbekannte Key-ID, Hash-Mismatch
+    /// oder Downgrade. UserLand/HardwareLand sind hiervon **nicht** betroffen.
     Unverified,
+    /// Zertifikat-Parse-Fehler (falsche Länge/Magic/Formatversion) — siehe [`cert`].
+    BadCert,
     /// Kernel-Ressourcen erschöpft (VSpace/ASID/RAM/TCB/PD) beim Laden.
     NoResources,
 }
@@ -68,6 +72,9 @@ pub struct Program<'a> {
     pub elf: &'a [u8],
     /// Das Manifest (Cap-Endowment etc.; ab L2 interpretiert).
     pub manifest: &'a [u8],
+    /// Das TrustedSAS-Zertifikat (ext-28, ADR 0014) — leer (`&[]`), falls keines vorliegt. Nur für
+    /// `DOMAIN_TRUSTED` erforderlich + geprüft; UserLand/HardwareLand ignorieren es.
+    pub cert: &'a [u8],
 }
 
 impl<'a> Program<'a> {
@@ -81,8 +88,9 @@ impl<'a> Program<'a> {
         hash: [u8; 32],
         elf: &'a [u8],
         manifest: &'a [u8],
+        cert: &'a [u8],
     ) -> Self {
-        Self { program_id, name, version, domain, hash, elf, manifest }
+        Self { program_id, name, version, domain, hash, elf, manifest, cert }
     }
 
     /// Der Name als `&str` (bis zum ersten NUL bzw. Ende), nicht-UTF8 → `"?"`.

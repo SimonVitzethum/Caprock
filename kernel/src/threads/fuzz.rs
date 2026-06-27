@@ -441,7 +441,7 @@ fn run_loaderfuzz() -> bool {
     for c in corrupts.iter() {
         build(&mut buf);
         c(&mut buf);
-        let prog = Program::new(99, b"fuzz", 1, DOMAIN_USERLAND, [0u8; 32], &buf, &[]);
+        let prog = Program::new(99, b"fuzz", 1, DOMAIN_USERLAND, [0u8; 32], &buf, &[], &[]);
         if loader::load_image(&prog, &[]).is_ok() {
             all_rejected = false; // ein fehlerhaftes ELF wurde geladen -> FAIL
         }

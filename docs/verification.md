@@ -92,14 +92,29 @@ Geschwisterliste der Derivation-Tree ist eine **doppelt-verkettete Liste**, dere
 **gegenseitige Inverse** sind (und nur auf gültige, belegte Knoten zeigen). Bewiesen für
 **`insert_before`** (am Listenkopf einfügen) und **`unlink`** (Knoten entfernen, Nachbarn umhängen).
 
+**(C) CDT-Strukturinvariante (vereint)** ([`verus/cap_cdt_structure.rs`](../verus/cap_cdt_structure.rs),
+Codes 4-lokal + 5 + 6): ein Knotenmodell mit Objekt + allen vier Verkettungen (parent/first_child/
+next/prev). Invariante: Ableitung **teilt das Objekt** (`object[parent]==object[s]`, 4-lokal),
+Sibling-Inverse (5), `first_child` zeigt zurück + ist Listenkopf (`prev==None`, 6). Bewiesen für
+**`derive`** (eine Capability ableiten = neues Kind am Kopf der Kinderliste). Kernidee: der bisherige
+Kopf hat `prev==None`, wird also von keinem `next` referenziert → das Einhängen davor bricht nichts.
+
 So wird `cap_audit_cdt` von einer zur Laufzeit **geprüften** zu einer **bewiesenen** Invariante.
 
 Lokal ausführen: `tools/verus-verify.sh` (Verus + Z3 aus dem Release nach `~/.verus`; geforderte
 rustc-Toolchain via `rustup toolchain install`). Strategie/Stufenmodell: `ARMTest/formale-verifikation-aufwand.md`.
 
-**Nächste Verus-Schritte (offen, schwieriger):** Eltern/Kind-Verkettung (Codes 4-lokal + 6); die
-Kinderlisten-**Erreichbarkeit** aus Code 4 (Listen-Reachability); die **Azyklizität** der Eltern-Kette
-(Code 7, braucht ein Wohlfundiertheits-Maß); danach schrittweise Richtung Scheduler/IPC.
+**Nächste Verus-Schritte (offen, schwieriger):** `delete_leaf` auf der vereinten Struktur (mehr
+Fallunterscheidung als `derive`); die Kinderlisten-**Erreichbarkeit** aus Code 4 (Listen-Reachability);
+die **Azyklizität** der Eltern-Kette (Code 7, braucht ein Wohlfundiertheits-Maß); dann die übrigen
+Audits als eigene Modelle (`domain_audit`, W^X/`vspace_audit`, `dma_audit`); danach schrittweise
+Richtung Scheduler/IPC.
+
+> **Realistische Einordnung:** Dies ist eine **dauerhaft wachsende** Verifikation der dokumentierten
+> Kernel-Invarianten, kein Einmal-Ziel. Volle funktionale Korrektheit + Isolation/Info-Flow + ein
+> Hardware-Modell + die **echte SMP-Nebenläufigkeit** (von Verus single-threaded **nicht** erfasst)
+> sind Forschungsklasse (Tier 3, mehrjährig — s. `ARMTest/formale-verifikation-aufwand.md`). Jede
+> hier bewiesene Invariante ist ein abgeschlossener, CI-fähiger Baustein auf diesem Weg.
 
 ## Neue Komponenten aufnehmen
 

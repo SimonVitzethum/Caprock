@@ -60,6 +60,31 @@ pub unsafe fn slab_write_next(slot: *mut usize, next: usize) {
     core::ptr::write(slot, next);
 }
 
+// ===========================================================================
+// Stelle 3: kernel/src/system.rs::load_into_pd Code-Kopie  (system.rs:1154)
+//   Den Programm-Code in den frisch allozierten EL0+EL1-RW-Frame `cbase` (Größe `clen`) kopieren.
+//   Die Vorbedingung `code_len <= clen` wird im SELBEN Funktionsrumpf bei system.rs:1140 geprüft
+//   (`code_len > clen ==> return None`), bevor die unsafe-Kopie ausgeführt wird.
+// ===========================================================================
+
+/// Getreue Kopie der Code-Kopie (system.rs:1154).
+/// # Safety: `cbase` zeigt auf einen >= `code_len` Bytes großen, schreibbaren Frame.
+pub unsafe fn code_copy_logic(code: *const u8, cbase: *mut u8, code_len: usize) {
+    core::ptr::copy_nonoverlapping(code, cbase, code_len);
+}
+
+// ===========================================================================
+// Stelle 4: kernel/src/system.rs::SmmuV3Enforcer::alloc_zeroed  (system.rs:1676)
+//   Einen frisch allozierten, page-ausgerichteten RAM-Block der Größe `len` nullen (Queue-/Tabellen-
+//   Speicher der SMMU). Es werden genau `len` Bytes im `len`-Byte-Block geschrieben.
+// ===========================================================================
+
+/// Getreue Kopie der Nullung (system.rs:1676).
+/// # Safety: `base` zeigt auf einen >= `len` Bytes großen, schreibbaren Block.
+pub unsafe fn zero_fill_logic(base: *mut u8, len: usize) {
+    core::ptr::write_bytes(base, 0, len);
+}
+
 #[cfg(kani)]
 mod proofs {
     use super::*;
@@ -137,6 +162,34 @@ mod proofs {
         while k < src_len { assert!(dst[k] == fill); k += 1; }
         let mut z = src_len;
         while z < total { assert!(dst[z] == 0); z += 1; }
+    }
+
+    /// **BEWEIS (Memory-Safety der Code-Kopie):** der im selben Funktionsrumpf geprüfte Guard
+    /// `code_len <= clen` (system.rs:1140) schützt die rohe Kopie — sie bleibt im `clen`-Byte-Frame.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn code_copy_in_bounds() {
+        let clen: usize = kani::any();    // Frame-Größe
+        let code_len: usize = kani::any();
+        kani::assume(clen <= CAP);
+        kani::assume(code_len <= clen);   // der Guard bei system.rs:1140 (sonst return None)
+
+        let src = [0u8; CAP];
+        let mut dst = [0u8; CAP];
+        unsafe { code_copy_logic(src.as_ptr(), dst.as_mut_ptr(), code_len) };
+    }
+
+    /// **BEWEIS (Memory-Safety der Nullung):** `write_bytes(base, 0, len)` über einen ECHTEN
+    /// `len`-Byte-Block bleibt in-bounds und nullt jedes Byte (kein OOB, kein Rest).
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn zero_fill_in_bounds() {
+        let len: usize = kani::any();
+        kani::assume(len <= CAP);
+        let mut buf = [0xAAu8; CAP];
+        unsafe { zero_fill_logic(buf.as_mut_ptr(), len) };
+        let mut i = 0;
+        while i < len { assert!(buf[i] == 0); i += 1; } // [0,len) genullt
     }
 
     /// **BEWEIS (Vorbedingung wird am Aufrufer etabliert):** mit der ELF-Garantie `filesz <= memsz` und

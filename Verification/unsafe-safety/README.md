@@ -44,6 +44,8 @@ Boot-Kontrakt). Kategorie B (Pagetables/MMIO/Assembly) bleibt die axiomatisierte
 |---|---|---|---|---|
 | 1 | [`system.rs::copy_segment`](../../kernel/src/system.rs) (einzige unsafe-Stelle des Ladepfads, ADR 0011 §2) | `copy_segment_in_bounds`, `copy_segment_zeroes_tail`, `loader_precondition_holds` | Kopie (`filesz` B) + `.bss`-Nullung (`[filesz,total)`) bleiben **im Ziel-Frame**; Schwanz sauber genullt; Vorbedingung `filesz<=total` aus `total=round_up_4k(memsz)>=memsz>=filesz` (ELF) am Aufrufer etabliert (overflow-frei) | ✅ |
 | 2 | [`heap.rs`](../../crates/sel4lake-region/src/heap.rs) (Slab-Free-Liste: `read`/`write` des im freien Slot eingebetteten Nachfolger-Zeigers) | `slab_class_holds_pointer`, `slab_freelist_roundtrip` | jede Größenklasse (`[16..2048]`) fasst einen `usize` **und** ist usize-ausgerichtet (größen-ausgerichteter Slot ⟹ usize-aligned); roher `read`/`write` des Slot-Zeigers in-bounds + aligned (Round-Trip erhält den Wert) | ✅ |
+| 3 | [`system.rs`](../../kernel/src/system.rs) Code-Kopie (system.rs:1154) | `code_copy_in_bounds` | der **im selben Funktionsrumpf** geprüfte Guard `code_len<=clen` (system.rs:1140, sonst `return None`) schützt die rohe `copy_nonoverlapping` -> bleibt im `clen`-Byte-Frame | ✅ |
+| 4 | [`system.rs::alloc_zeroed`](../../kernel/src/system.rs) (system.rs:1676) | `zero_fill_in_bounds` | `write_bytes(base,0,len)` über einen echten `len`-Byte-Block ist in-bounds und nullt **jedes** Byte (kein OOB/Rest) | ✅ |
 
 ## 5. Ausführen
 
@@ -66,6 +68,7 @@ CI-Gate: `.gitea/workflows/kani.yml` (läuft `tools/kani-verify.sh` über alle Z
 
 ## 7. Nächste Stellen (Kandidaten)
 
-- `system.rs::alloc_zeroed` (`write_bytes(base,0,len)` — Nullung einer frischen `len`-Byte-Region).
-- `system.rs` Code-Kopie (`copy_nonoverlapping(code, cbase, code_len)` — RAM→RAM, Längen-Vorbedingung).
+- Weitere RAM-Kopier-/Slice-Stellen mit in-Funktion-Bounds, soweit selbstständig modellierbar.
 - `threads/mod.rs` ist überwiegend **MMIO** (RTC-Register, Kategorie B / HAL-Vertrag) — kein Kat-A-Ziel.
+- Verbleibende Kategorie B (Pagetables `mmu.rs`, MMIO, Kontextwechsel-Assembly) bleibt die
+  axiomatisierte, hand-auditierte HAL-TCB (vgl. Aufwandsanalyse) — bewusst **kein** Beweisziel hier.

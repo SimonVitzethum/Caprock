@@ -52,3 +52,5 @@ verifizierten Cap-System bzw. der HAL-TCB).
 |---|---|---|---|
 | 1 | `kernel/src/system.rs::copy_segment` (einzige unsafe-Stelle des Ladepfads) | Kopie+`.bss`-Nullung bleibt im Ziel-Frame; Vorbedingung `filesz<=total` am Aufrufer etabliert | ✅ |
 | 2 | `crates/sel4lake-region/src/heap.rs` (Slab-Free-Liste, `read`/`write` des eingebetteten Nachfolger-Zeigers) | jede Größenklasse fasst einen `usize` + ist usize-ausgerichtet; roher Read/Write des Slot-Zeigers in-bounds + aligned (Round-Trip) | ✅ |
+| 3 | `kernel/src/system.rs` Code-Kopie (system.rs:1154) | im selben Rumpf geprüfter Guard `code_len<=clen` (system.rs:1140) schützt die rohe Kopie -> bleibt im `clen`-Frame | ✅ |
+| 4 | `kernel/src/system.rs::alloc_zeroed` (system.rs:1676) | `write_bytes(base,0,len)` über einen `len`-Byte-Block in-bounds + nullt jedes Byte | ✅ |

@@ -134,9 +134,14 @@ erhalten — Refcount, Struktur **und** Azyklizität in je einem Beweis.
   Slot hat das Blatt als Elternknoten) — diese **folgt aus der Reachability-Invariante (Code 4r)**;
   als Vorbedingung trennt sie sauber „delete erhält `cap_inv` **gegeben** Reachability" vom Nachweis
   der Reachability selbst.
-- **`move`** (Index-Relokation: alle Verweise auf den Quell-Slot auf das Ziel umbiegen) — laufend.
+- **`move`** (Index-Relokation: `dst` erbt den Inhalt, alle Verweise auf `src` werden auf `dst`
+  umgebogen, `src` geleert; `refcount` unverändert). **Befund:** der **Leaf-Fall** ist wie `delete`
+  dekomponierbar (Erhaltungs-Hilfsfakt + per-Klausel-Asserts + `no_children`), aber die strukturellen
+  Klauseln brauchen für die **Relokation** (`dst` übernimmt `src`s Verkettung) zusätzliche
+  Fall-Hinweise (dst/pv/nx); **allgemeines** `move` (Cap **mit** Kindern) erfordert — wie `revoke` —
+  die unbeschränkte Kind-`parent`-Umbiegung, also die Reachability-Iteration.
 - **`revoke`** (Teilbaum löschen) — die anspruchsvollste; braucht die **Reachability-Iteration** über
-  den Teilbaum.
+  den Teilbaum (rekursive Spec + Erhaltung).
 - **Code 4r (Kinderlisten-Reachability):** `s ∈ p`s Kinderliste über Listen-Traversierung — bisher als
   **Vorbedingung** geführt (s. o.); ihr expliziter Nachweis (rekursive Spec + Erhaltung durch alle
   Operationen) ist die **letzte Ausbaustufe** der Phase und Voraussetzung für `revoke`.

@@ -74,25 +74,32 @@ Tier 2 beweist **funktionale Korrektheit** deduktiv — dass eine Operation eine
 für **alle** Zustände (unbeschränkt). Methode (vom Nutzer vorgegeben): **keinen** komplexen Bereich
 (Scheduler/IPC), sondern eine **bereits dokumentierte Kernel-Invariante** als erste formale Spec.
 
-**Pilot:** [`verus/cap_cdt_refcount.rs`](../verus/cap_cdt_refcount.rs) — der Refcount-Anteil von
-`cap_audit_cdt` (`crates/sel4lake-cap/src/space.rs`, Codes 1–3) als Spezifikation:
+Zwei Pilotdateien spezifizieren Teile von `cap_audit_cdt` (`crates/sel4lake-cap/src/space.rs`) und
+beweisen, dass die jeweiligen Operationen sie **erhalten** — statisch + für **alle** Zustände, nicht
+nur an den Audit-Quiescenz-Punkten wie zur Laufzeit (`tools/verus-verify.sh`, gesamt **12 verified,
+0 errors**):
 
+**(A) Refcount-Invariante** ([`verus/cap_cdt_refcount.rs`](../verus/cap_cdt_refcount.rs), Codes 1–3):
 1. jeder belegte Slot zeigt auf ein gültiges, belegtes Objekt;
 2. `refcount(o) == ` Anzahl belegter Slots, die auf `o` zeigen;
-3. ein Objekt ist belegt **⟺** `refcount(o) > 0`.
+3. Objekt belegt **⟺** `refcount(o) > 0`.
+Bewiesen für **`install`** (neues Objekt, `refcount=1`), **`copy`** (Slot + `refcount++`) und
+**`delete`** (Slot löschen + `refcount--`, Objekt bei 0 freigeben). Kern: vier per Induktion bewiesene
+Lemmas über die `refs_to`-Zählfunktion (push/update/member/fresh).
 
-**Bewiesen (`verus` → 7 verified, 0 errors):** die Capability-Operationen **`copy`** (Slot anhängen +
-`refcount++`) und **`delete`** (Slot löschen + `refcount--`, Objekt freigeben bei 0) **erhalten** die
-Invariante — statisch + für alle Zustände, nicht nur an den Audit-Quiescenz-Punkten wie zur Laufzeit.
-Kern sind drei per Induktion bewiesene Hilfs-Lemmas über die `refs_to`-Zählfunktion (push/update/
-member). Die Laufzeit-Funktion `cap_audit_cdt` wird so von einer **geprüften** zu einer **bewiesenen**
-Invariante.
+**(B) CDT-Sibling-Konsistenz** ([`verus/cap_cdt_tree.rs`](../verus/cap_cdt_tree.rs), Code 5): die
+Geschwisterliste der Derivation-Tree ist eine **doppelt-verkettete Liste**, deren `next`/`prev`
+**gegenseitige Inverse** sind (und nur auf gültige, belegte Knoten zeigen). Bewiesen für
+**`insert_before`** (am Listenkopf einfügen) und **`unlink`** (Knoten entfernen, Nachbarn umhängen).
+
+So wird `cap_audit_cdt` von einer zur Laufzeit **geprüften** zu einer **bewiesenen** Invariante.
 
 Lokal ausführen: `tools/verus-verify.sh` (Verus + Z3 aus dem Release nach `~/.verus`; geforderte
 rustc-Toolchain via `rustup toolchain install`). Strategie/Stufenmodell: `ARMTest/formale-verifikation-aufwand.md`.
 
-**Nächste Verus-Schritte (offen):** CDT-Baum-Invarianten (`audit_cdt` Codes 4–7: Eltern/Kind/Sibling-
-Konsistenz, Ableitung teilt das Objekt, Azyklizität); danach schrittweise Richtung Scheduler/IPC.
+**Nächste Verus-Schritte (offen, schwieriger):** Eltern/Kind-Verkettung (Codes 4-lokal + 6); die
+Kinderlisten-**Erreichbarkeit** aus Code 4 (Listen-Reachability); die **Azyklizität** der Eltern-Kette
+(Code 7, braucht ein Wohlfundiertheits-Maß); danach schrittweise Richtung Scheduler/IPC.
 
 ## Neue Komponenten aufnehmen
 

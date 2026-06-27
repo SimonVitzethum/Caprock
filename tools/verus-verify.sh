@@ -19,5 +19,10 @@ if [ ! -x "$VERUS" ]; then
     exit 127
 fi
 
-echo "== Verus: cap_audit_cdt Refcount-Invariante (Pilot) =="
-"$VERUS" --crate-type=lib "$ROOT/verus/cap_cdt_refcount.rs"
+# Alle Verus-Pilotdateien verifizieren (jede ist eigenstaendig, --crate-type=lib).
+rc=0
+for f in "$ROOT"/verus/*.rs; do
+    echo "== Verus: $(basename "$f") =="
+    "$VERUS" --crate-type=lib "$f" || rc=1
+done
+exit "$rc"

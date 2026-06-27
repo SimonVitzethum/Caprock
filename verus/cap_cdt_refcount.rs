@@ -111,6 +111,64 @@ pub proof fn lemma_refs_member(slots: Seq<Slot>, s: int, o: nat)
     }
 }
 
+/// **Lemma:** zeigt kein belegter Slot auf ein Objekt `o` jenseits aller gueltigen Indizes
+/// (`o >= objects_len`, wie ein frisch angelegtes Objekt), so ist `refs_to(o) == 0`. Per Induktion.
+pub proof fn lemma_refs_fresh(slots: Seq<Slot>, objects_len: nat, o: nat)
+    requires
+        o >= objects_len,
+        forall|s: int| 0 <= s < slots.len() && (#[trigger] slots[s].used) ==> slots[s].object
+            < objects_len,
+    ensures
+        refs_to(slots, o) == 0,
+    decreases slots.len(),
+{
+    if slots.len() != 0 {
+        assert forall|s: int| 0 <= s < slots.drop_last().len() && (#[trigger] slots.drop_last()[s].used)
+            implies slots.drop_last()[s].object < objects_len by {
+            assert(slots.drop_last()[s] == slots[s]);
+        }
+        lemma_refs_fresh(slots.drop_last(), objects_len, o);
+    }
+}
+
+/// **BEWEIS:** `install` (ein NEUES Objekt anlegen + einen darauf zeigenden Slot: `refcount = 1`)
+/// **erhaelt** die Refcount-Invariante.
+pub proof fn install(t: CapTable) -> (t2: CapTable)
+    requires
+        inv(t),
+    ensures
+        inv(t2),
+{
+    let new_o: nat = t.objects.len() as nat;
+    let new_slot = Slot { used: true, object: new_o };
+    let objects2 = t.objects.push(Obj { used: true, refcount: 1 });
+    let slots2 = t.slots.push(new_slot);
+    let t2 = CapTable { objects: objects2, slots: slots2 };
+
+    // Kein bestehender Slot zeigt auf das frische Objekt -> refs_to(t.slots, new_o) == 0.
+    lemma_refs_fresh(t.slots, t.objects.len() as nat, new_o);
+    // Effekt des angehaengten Slots auf refs_to fuer JEDES x.
+    assert forall|x: nat| #![trigger refs_to(slots2, x)]
+        refs_to(slots2, x) == refs_to(t.slots, x) + contrib(new_slot, x) by {
+        lemma_refs_push(t.slots, new_slot, x);
+    }
+    // (1) Slot-Validitaet.
+    assert forall|s: int| 0 <= s < slots2.len() && #[trigger] slots2[s].used implies slots2[s].object
+        < objects2.len() && objects2[slots2[s].object as int].used by {
+        if s < t.slots.len() {
+            assert(slots2[s] == t.slots[s]);
+        }
+    }
+    // (2)+(3).
+    assert forall|x: int| 0 <= x < objects2.len() implies #[trigger] objects2[x].refcount
+        == refs_to(slots2, x as nat) && (objects2[x].used <==> objects2[x].refcount > 0) by {
+        if x < t.objects.len() {
+            assert(objects2[x] == t.objects[x]);
+        }
+    }
+    t2
+}
+
 /// **BEWEIS:** `copy` (eine bestehende Capability auf Objekt `o` duplizieren: neuer Slot + refcount++)
 /// **erhaelt** die Refcount-Invariante.
 pub proof fn copy(t: CapTable, o: nat) -> (t2: CapTable)

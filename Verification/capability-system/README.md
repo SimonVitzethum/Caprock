@@ -117,7 +117,7 @@ auf `o` zeigen (rekursiv); `ancestor(cs, s, k)` = `k`-ter Vorfahre entlang `pare
 | Sibling (5) | insert_before, unlink | `verus/cap_cdt_tree.rs` | ✅ bewiesen (3 verified) |
 | Struktur (4l+5+6) | derive | `verus/cap_cdt_structure.rs` | ✅ bewiesen (2 verified) |
 | Azyklizität (7) | derive (+ allg. Korollare) | `verus/cap_cdt_acyclic.rs` | ✅ bewiesen (7 verified) |
-| **Vereint (1–7), volle `cap_inv`** | **install ✅ · copy ✅ · mint ✅** · delete/move/revoke ⏳ | [`proofs/cap_space.rs`](proofs/cap_space.rs) | C1 fertig (additive Ops, 9 verified) · C2 (Lösch-Ops) laufend |
+| **Vereint (1–7), volle `cap_inv`** | **install ✅ · copy ✅ · mint ✅ · delete ✅** · move/revoke ⏳ | [`proofs/cap_space.rs`](proofs/cap_space.rs) | C1 (additive) + delete fertig (10 verified) · move/revoke laufend |
 
 **`cap_inv` (Schritt B/C1):** die Konjunktion der Klauseln **1–3** (Refcount), **4-lokal** (Ableitung
 teilt Objekt), **4-sib** (Geschwister teilen Elternknoten — beim Lösch-Beweis als notwendige, wahre
@@ -128,15 +128,18 @@ erhalten — Refcount, Struktur **und** Azyklizität in je einem Beweis.
 
 ## 10. Noch offene Eigenschaften
 
-- **Lösch-Operationen** `delete` (Leaf), `move`, `revoke` (Schritt C2). **Schwierigkeitsgrad:**
-  `delete` führt **vier bedingte Slot-Updates** (Nachbarn umhängen, `first_child` nachziehen,
-  `refcount--`) durch — der strukturelle Beweis gegen die *volle* `cap_inv` sprengt die
-  Einschritt-Kapazität des SMT-Solvers (rlimit) und braucht eine **schrittweise Dekomposition**
-  (Zwischenzustände/Hilfslemmas je Update). Die Zähl-Lemmas dafür (`lemma_refs_update`/`_member`)
-  sind bereits bewiesen. `move` (Index-Relokation) + `revoke` (Teilbaum, braucht Reachability) sind
-  die anspruchsvollsten.
-- **Code 4r (Kinderlisten-Reachability):** `s ∈ p`s Kinderliste über Listen-Traversierung — Reachability;
-  `revoke` benötigt sie; letzte Ausbaustufe der Phase.
+- **`delete` (Leaf) — bewiesen ✅**, per **Dekomposition**: ein Erhaltungs-Hilfsfakt (`delete` ändert
+  nur `next`/`prev`/`first_child` + `used` von `i`) + **per-CDT-Klausel** getrennte Asserts (kleinere
+  SMT-Queries, löst die rlimit-Wand). Setzt die Vorbedingung **`no_children`** voraus (kein belegter
+  Slot hat das Blatt als Elternknoten) — diese **folgt aus der Reachability-Invariante (Code 4r)**;
+  als Vorbedingung trennt sie sauber „delete erhält `cap_inv` **gegeben** Reachability" vom Nachweis
+  der Reachability selbst.
+- **`move`** (Index-Relokation: alle Verweise auf den Quell-Slot auf das Ziel umbiegen) — laufend.
+- **`revoke`** (Teilbaum löschen) — die anspruchsvollste; braucht die **Reachability-Iteration** über
+  den Teilbaum.
+- **Code 4r (Kinderlisten-Reachability):** `s ∈ p`s Kinderliste über Listen-Traversierung — bisher als
+  **Vorbedingung** geführt (s. o.); ihr expliziter Nachweis (rekursive Spec + Erhaltung durch alle
+  Operationen) ist die **letzte Ausbaustufe** der Phase und Voraussetzung für `revoke`.
 
 ## 11. Bekannte Grenzen der aktuellen Beweise
 

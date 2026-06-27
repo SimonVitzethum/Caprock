@@ -315,6 +315,119 @@ pub proof fn mint(cs: CapSpace, src: nat) -> (cs2: CapSpace)
 }
 
 
+// ============================ Operation: delete (Leaf) ============================
+
+/// **BEWEIS:** `delete` (eine **Blatt**-Capability `i` löschen — keine Kinder: Geschwister umhängen,
+/// ggf. `first_child` des Elternknotens nachziehen, `refcount--`, Objekt bei 0 freigeben)
+/// **erhaelt die VOLLE Invariante** `cap_inv`.
+///
+/// **Dekomposition (s. README §10):** der Beweis setzt `no_children` voraus — dass **kein** belegter
+/// Slot `i` als Elternknoten hat. Diese Tatsache **folgt aus der vollen Reachability-Invariante**
+/// (Code 4r: ein Kind ist von `parent.first_child` aus erreichbar; ein Blatt mit `first_child==None`
+/// hat daher keine Kinder). Sie hier als Vorbedingung zu fuehren **trennt** „delete erhaelt cap_inv
+/// **gegeben** Reachability" sauber vom (schwierigeren) Nachweis der Reachability selbst. Die
+/// strukturelle Erhaltung ist je CDT-Klausel einzeln gefuehrt (kleinere SMT-Queries).
+#[verifier::rlimit(50)]
+pub proof fn delete(cs: CapSpace, i: nat) -> (cs2: CapSpace)
+    requires
+        cap_inv(cs),
+        slot_live(cs, i),
+        cs.slots[i as int].first_child is None,
+        // no_children: aus der Reachability-Invariante (Code 4r) + Blatt-Eigenschaft.
+        forall|s: nat| slot_live(cs, s) ==> cs.slots[s as int].parent != Some(i),
+    ensures
+        cap_inv(cs2),
+{
+    let inode = cs.slots[i as int];
+    let o = inode.object;
+    lemma_refs_member(cs.slots, i as int, o);
+    assert(cs.objects[o as int].refcount == refs_to(cs.slots, o));
+    let oldrc = cs.objects[o as int].refcount;
+    assert(oldrc >= 1);
+    let newrc: nat = (oldrc - 1) as nat;
+
+    let dead = Slot { used: false, object: 0, parent: None, first_child: None, next: None, prev: None, rank: 0 };
+    let sA = cs.slots.update(i as int, dead);
+    let sB = if inode.prev is Some {
+        let pv = inode.prev->Some_0;
+        sA.update(pv as int, Slot { next: inode.next, ..sA[pv as int] })
+    } else { sA };
+    let sC = if inode.next is Some {
+        let nx = inode.next->Some_0;
+        sB.update(nx as int, Slot { prev: inode.prev, ..sB[nx as int] })
+    } else { sB };
+    let sD = if inode.parent is Some && cs.slots[inode.parent->Some_0 as int].first_child == Some(i) {
+        let p = inode.parent->Some_0;
+        sC.update(p as int, Slot { first_child: inode.next, ..sC[p as int] })
+    } else { sC };
+    let objs2 = cs.objects.update(o as int, Object { used: newrc > 0, refcount: newrc });
+    let cs2 = CapSpace { objects: objs2, slots: sD };
+
+    // --- Erhaltungs-Hilfsfakt: delete aendert NUR next/prev/first_child (+ used von i). Fuer s != i
+    //     bleiben parent/object/rank/used unveraendert. (Kern fuer die strukturellen Klauseln.)
+    assert forall|s: int| 0 <= s < sD.len() && s != i
+        implies #[trigger] sD[s].parent == cs.slots[s].parent
+            && sD[s].object == cs.slots[s].object
+            && sD[s].rank == cs.slots[s].rank
+            && sD[s].used == cs.slots[s].used by {}
+
+    // --- refs_to: nur i->dead senkt o um 1; die Folge-Updates aendern nur CDT-Links (used/object gleich).
+    assert forall|x: nat| #![trigger refs_to(sD, x)]
+        refs_to(sD, x) == refs_to(cs.slots, x) + contrib(dead, x) - contrib(inode, x) by {
+        lemma_refs_update(cs.slots, i as int, dead, x);
+        if inode.prev is Some {
+            let pv = inode.prev->Some_0;
+            lemma_refs_update(sA, pv as int, Slot { next: inode.next, ..sA[pv as int] }, x);
+        }
+        if inode.next is Some {
+            let nx = inode.next->Some_0;
+            lemma_refs_update(sB, nx as int, Slot { prev: inode.prev, ..sB[nx as int] }, x);
+        }
+        if inode.parent is Some && cs.slots[inode.parent->Some_0 as int].first_child == Some(i) {
+            let p = inode.parent->Some_0;
+            lemma_refs_update(sC, p as int, Slot { first_child: inode.next, ..sC[p as int] }, x);
+        }
+    }
+
+    // --- Schluesselfakten ---
+    if inode.next is Some {
+        let nx = inode.next->Some_0;
+        assert(slot_live(cs, nx) && cs.slots[nx as int].prev == Some(i) && cs.slots[nx as int].parent == inode.parent);
+    }
+
+    // --- (1) Slot-Validitaet ---
+    assert forall|s: int| 0 <= s < sD.len() && #[trigger] sD[s].used
+        implies sD[s].object < objs2.len() && objs2[sD[s].object as int].used by {
+        assert(sD[s].object == cs.slots[s].object);
+        if sD[s].object == o { lemma_refs_member(sD, s, o); }
+    }
+    // --- (2)+(3) Refcount ---
+    assert forall|x: int| 0 <= x < objs2.len()
+        implies #[trigger] objs2[x].refcount == refs_to(sD, x as nat) && (objs2[x].used <==> objs2[x].refcount > 0) by {
+        if x != o { assert(objs2[x] == cs.objects[x]); }
+    }
+    // --- (4l+7) parent: unveraendert; Ziel != i (no_children) -> belegt; object/rank unveraendert ---
+    assert forall|s: nat| slot_live(cs2, s) && cs2.slots[s as int].parent is Some
+        implies slot_live(cs2, cs2.slots[s as int].parent->Some_0)
+            && cs2.slots[cs2.slots[s as int].parent->Some_0 as int].object == cs2.slots[s as int].object
+            && cs2.slots[cs2.slots[s as int].parent->Some_0 as int].rank < cs2.slots[s as int].rank by {}
+    // --- (5+4-sib) next: Sibling-Inverse + geteilter Elternknoten ---
+    assert forall|s: nat| slot_live(cs2, s) && cs2.slots[s as int].next is Some
+        implies slot_live(cs2, cs2.slots[s as int].next->Some_0)
+            && cs2.slots[cs2.slots[s as int].next->Some_0 as int].prev == Some(s)
+            && cs2.slots[cs2.slots[s as int].next->Some_0 as int].parent == cs2.slots[s as int].parent by {}
+    // --- (5) prev: Sibling-Inverse ---
+    assert forall|s: nat| slot_live(cs2, s) && cs2.slots[s as int].prev is Some
+        implies slot_live(cs2, cs2.slots[s as int].prev->Some_0)
+            && cs2.slots[cs2.slots[s as int].prev->Some_0 as int].next == Some(s) by {}
+    // --- (6) first_child: Listenkopf ---
+    assert forall|s: nat| slot_live(cs2, s) && cs2.slots[s as int].first_child is Some
+        implies slot_live(cs2, cs2.slots[s as int].first_child->Some_0)
+            && cs2.slots[cs2.slots[s as int].first_child->Some_0 as int].parent == Some(s)
+            && cs2.slots[cs2.slots[s as int].first_child->Some_0 as int].prev is None by {}
+    cs2
+}
+
 fn main() {}
 
 } // verus!

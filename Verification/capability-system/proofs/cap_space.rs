@@ -71,9 +71,10 @@ pub open spec fn cap_inv(cs: CapSpace) -> bool {
             &&& (nd.parent is Some ==> slot_live(cs, nd.parent->Some_0)
                 && cs.slots[nd.parent->Some_0 as int].object == nd.object
                 && cs.slots[nd.parent->Some_0 as int].rank < nd.rank)
-            // (5) Sibling-Inverse
+            // (5) Sibling-Inverse + (4-sib) Geschwister teilen den Elternknoten
             &&& (nd.next is Some ==> slot_live(cs, nd.next->Some_0)
-                && cs.slots[nd.next->Some_0 as int].prev == Some(s))
+                && cs.slots[nd.next->Some_0 as int].prev == Some(s)
+                && cs.slots[nd.next->Some_0 as int].parent == nd.parent)
             &&& (nd.prev is Some ==> slot_live(cs, nd.prev->Some_0)
                 && cs.slots[nd.prev->Some_0 as int].next == Some(s))
             // (6) first_child gueltig, zeigt zurueck, ist Listenkopf (prev==None)
@@ -112,6 +113,7 @@ pub proof fn lemma_refs_fresh(slots: Seq<Slot>, objects_len: nat, o: nat)
 
 /// Ersetzen von Slot `i` verschiebt `refs_to(o)` um die Beitragsdifferenz (Induktion). Folgerung:
 /// aendert das Update weder `used` noch `object` (gleicher Beitrag), bleibt `refs_to` unveraendert.
+/// (Fundament fuer die Loesch-Operationen `delete`/`revoke` — Schritt C2.)
 pub proof fn lemma_refs_update(slots: Seq<Slot>, i: int, sl: Slot, o: nat)
     requires 0 <= i < slots.len(),
     ensures refs_to(slots.update(i, sl), o) + contrib(slots[i], o) == refs_to(slots, o) + contrib(sl, o),
@@ -311,6 +313,7 @@ pub proof fn mint(cs: CapSpace, src: nat) -> (cs2: CapSpace)
 {
     copy(cs, src)
 }
+
 
 fn main() {}
 

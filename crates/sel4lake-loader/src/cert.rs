@@ -7,32 +7,53 @@
 //!
 //! ## Format (Little-Endian) — die **gesamte** Nachricht `[0..msg_len)` wird signiert
 //! ```text
-//! 0    magic:u32              = 0x5453_4331 ("TSC1")
-//! 4    format_version:u16      = 1
-//! 6    flags:u16               (Eigenschaften)
-//! 8    program_id:u32
-//! 12   version:u32
-//! 16   binary_hash:[u8;32]     (SHA-256 des ELF)
-//! 48   manifest_hash:[u8;32]   (SHA-256 des Manifests)
-//! 80   key_id:[u8;16]          (128-bit-Fingerprint = SHA-256(pubkey)[..16])
-//! 96   unsafe_status:u32       (Bitflags: PROGRAM_FORBID|PROJECT_CLEAN|ALLOWLIST_OK; ADR 0014)
-//! 100  unsafe_audit_hash:[u8;32] (SHA-256 des vollstaendigen Unsafe-Audit-Berichts -> bindet ihn)
-//! 132  build_info_len:u16
-//! 134  build_info:[build_info_len B]  (UTF-8: rustc/toolchain/target/profil/zeitstempel)
-//! --- signierte Nachricht endet (msg_len = 134 + build_info_len) ---
-//! msg_len  signature:[u8;64]   (Ed25519 ueber [0..msg_len))
+//! 0    magic:u32                = 0x5453_4331 ("TSC1")
+//! --- Build-Identitaet / Zertifizierungsverfahren (alle signiert) ---
+//! 4    cert_format_version:u16   = 1   (Zertifikatsformat-Version)
+//! 6    sig_format_version:u16    = 1   (Signaturformat: Ed25519 ueber die Nachricht)
+//! 8    build_rules_version:u16         (Compiler-/Buildregel-Version)
+//! 10   audit_protocol_version:u16      (TrustedSAS-Audit-Protokoll-Version)
+//! 12   unsafe_rules_version:u16        (Unsafe-Pruefregel-Version)
+//! 14   allowlist_rules_version:u16     (Allowlist-Regel-Version)
+//! ---
+//! 16   flags:u16                 (Eigenschaften)
+//! 18   reserved:u16              (=0, signiert, zukuenftig)
+//! 20   program_id:u32
+//! 24   version:u32
+//! 28   binary_hash:[u8;32]       (SHA-256 des ELF — bindet das Zertifikat FEST an genau dies Binary)
+//! 60   manifest_hash:[u8;32]     (SHA-256 des Manifests)
+//! 92   key_id:[u8;16]            (128-bit-Fingerprint = SHA-256(pubkey)[..16])
+//! 108  unsafe_status:u32         (Bitflags PROGRAM_FORBID|PROJECT_CLEAN|ALLOWLIST_OK; muss ALL_PASS)
+//! 112  unsafe_audit_hash:[u8;32] (SHA-256 des vollstaendigen Unsafe-Audit-Berichts -> bindet ihn)
+//! 144  build_info_len:u16
+//! 146  build_info:[..]           (UTF-8: rustc/toolchain/target/profil/zeitstempel)
+//! --- signierte Nachricht endet (msg_len = 146 + build_info_len) ---
+//! msg_len  signature:[u8;64]     (Ed25519 ueber [0..msg_len))
 //! ```
-//! Damit ist **jedes** Feld (Version, Hashes, Flags, Unsafe-Status, Build-Infos) kryptographisch
-//! geschuetzt — keines kann nachtraeglich geaendert/ausgetauscht werden.
+//! Damit ist **jedes** Feld kryptographisch geschützt — inkl. der **Verfahrens-Versionen**: ein
+//! Zertifikat sagt nicht nur „von diesem Schlüssel signiert", sondern „nach **genau diesem**
+//! TrustedSAS-Zertifizierungsverfahren erzeugt". Spätere Regeländerungen lassen sich so nicht unter
+//! demselben Format vermischen.
 
 use crate::LoaderError;
 
 /// Magic ("TSC1").
 pub const CERT_MAGIC: u32 = 0x5453_4331;
-/// Aktuell unterstützte Zertifikat-Formatversion.
+/// Aktuell unterstützte **Zertifikatsformat**-Version (vom Kernel geprüft).
 pub const CERT_FORMAT_VERSION: u16 = 1;
+/// Aktuelle **Signaturformat**-Version (Ed25519 über die Nachricht). Vom Tool gestempelt.
+pub const SIG_FORMAT_VERSION: u16 = 1;
+/// Aktuelle **Compiler-/Buildregel**-Version. Vom Tool gestempelt.
+pub const BUILD_RULES_VERSION: u16 = 1;
+/// Aktuelle **TrustedSAS-Audit-Protokoll**-Version. Vom Tool gestempelt.
+pub const AUDIT_PROTOCOL_VERSION: u16 = 1;
+/// Aktuelle **Unsafe-Prüfregel**-Version. Vom Tool gestempelt.
+pub const UNSAFE_RULES_VERSION: u16 = 1;
+/// Aktuelle **Allowlist-Regel**-Version. Vom Tool gestempelt.
+pub const ALLOWLIST_RULES_VERSION: u16 = 1;
+
 /// Länge des festen Kopfteils (bis einschließlich `build_info_len`).
-pub const CERT_HEADER_LEN: usize = 134;
+pub const CERT_HEADER_LEN: usize = 146;
 /// Länge der Ed25519-Signatur.
 pub const CERT_SIG_LEN: usize = 64;
 /// Kleinste gültige Zertifikatslänge (leere `build_info`).
@@ -54,7 +75,13 @@ pub const UNSAFE_ALL_PASS: u32 = UNSAFE_PROGRAM_FORBID | UNSAFE_PROJECT_CLEAN | 
 /// **außerhalb** (Kernel/`sel4lake-trust`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrustedCert<'a> {
-    pub format_version: u16,
+    // Build-Identitaet / Zertifizierungsverfahren (signiert).
+    pub cert_format_version: u16,
+    pub sig_format_version: u16,
+    pub build_rules_version: u16,
+    pub audit_protocol_version: u16,
+    pub unsafe_rules_version: u16,
+    pub allowlist_rules_version: u16,
     pub flags: u16,
     pub program_id: u32,
     pub version: u32,
@@ -76,8 +103,10 @@ fn rd_u32(d: &[u8], off: usize) -> u32 {
 }
 
 impl<'a> TrustedCert<'a> {
-    /// Ein Zertifikat strikt parsen: korrektes Magic + Formatversion, exakte Gesamtlänge passend zu
-    /// `build_info_len`. **Nie** ein Out-of-Bounds/Panic — fehlerhafte Eingabe → [`LoaderError::BadCert`].
+    /// Ein Zertifikat strikt parsen: korrektes Magic + Zertifikatsformat-Version, exakte Gesamtlänge
+    /// passend zu `build_info_len`. **Nie** ein Out-of-Bounds/Panic — fehlerhafte Eingabe →
+    /// [`LoaderError::BadCert`]. Die übrigen Verfahrens-Versionen werden geparst + (über die
+    /// Signatur) geschützt, hier aber **nicht** erzwungen (kann der Kernel später tun).
     pub fn parse(data: &'a [u8]) -> Result<TrustedCert<'a>, LoaderError> {
         if data.len() < CERT_MIN_LEN {
             return Err(LoaderError::BadCert);
@@ -85,33 +114,38 @@ impl<'a> TrustedCert<'a> {
         if rd_u32(data, 0) != CERT_MAGIC {
             return Err(LoaderError::BadCert);
         }
-        let format_version = rd_u16(data, 4);
-        if format_version != CERT_FORMAT_VERSION {
+        let cert_format_version = rd_u16(data, 4);
+        if cert_format_version != CERT_FORMAT_VERSION {
             return Err(LoaderError::BadCert);
         }
-        let build_info_len = rd_u16(data, 132) as usize;
+        let build_info_len = rd_u16(data, 144) as usize;
         // msg_len overflow-sicher (build_info_len <= u16::MAX); exakte Gesamtlänge erzwingen.
         let msg_len = CERT_HEADER_LEN + build_info_len;
         if data.len() != msg_len + CERT_SIG_LEN {
             return Err(LoaderError::BadCert);
         }
         let mut binary_hash = [0u8; 32];
-        binary_hash.copy_from_slice(&data[16..48]);
+        binary_hash.copy_from_slice(&data[28..60]);
         let mut manifest_hash = [0u8; 32];
-        manifest_hash.copy_from_slice(&data[48..80]);
+        manifest_hash.copy_from_slice(&data[60..92]);
         let mut key_id = [0u8; 16];
-        key_id.copy_from_slice(&data[80..96]);
+        key_id.copy_from_slice(&data[92..108]);
         let mut unsafe_audit_hash = [0u8; 32];
-        unsafe_audit_hash.copy_from_slice(&data[100..132]);
+        unsafe_audit_hash.copy_from_slice(&data[112..144]);
         Ok(TrustedCert {
-            format_version,
-            flags: rd_u16(data, 6),
-            program_id: rd_u32(data, 8),
-            version: rd_u32(data, 12),
+            cert_format_version,
+            sig_format_version: rd_u16(data, 6),
+            build_rules_version: rd_u16(data, 8),
+            audit_protocol_version: rd_u16(data, 10),
+            unsafe_rules_version: rd_u16(data, 12),
+            allowlist_rules_version: rd_u16(data, 14),
+            flags: rd_u16(data, 16),
+            program_id: rd_u32(data, 20),
+            version: rd_u32(data, 24),
             binary_hash,
             manifest_hash,
             key_id,
-            unsafe_status: rd_u32(data, 96),
+            unsafe_status: rd_u32(data, 108),
             unsafe_audit_hash,
             build_info: &data[CERT_HEADER_LEN..msg_len],
             message: &data[..msg_len],
@@ -148,23 +182,28 @@ mod tests {
         let mut c = vec![0u8; msg_len + CERT_SIG_LEN];
         c[0..4].copy_from_slice(&CERT_MAGIC.to_le_bytes());
         c[4..6].copy_from_slice(&CERT_FORMAT_VERSION.to_le_bytes());
-        c[6..8].copy_from_slice(&0u16.to_le_bytes());
-        c[8..12].copy_from_slice(&7u32.to_le_bytes());
-        c[12..16].copy_from_slice(&3u32.to_le_bytes());
-        for i in 16..48 {
-            c[i] = i as u8;
+        c[6..8].copy_from_slice(&SIG_FORMAT_VERSION.to_le_bytes());
+        c[8..10].copy_from_slice(&BUILD_RULES_VERSION.to_le_bytes());
+        c[10..12].copy_from_slice(&AUDIT_PROTOCOL_VERSION.to_le_bytes());
+        c[12..14].copy_from_slice(&UNSAFE_RULES_VERSION.to_le_bytes());
+        c[14..16].copy_from_slice(&ALLOWLIST_RULES_VERSION.to_le_bytes());
+        c[16..18].copy_from_slice(&0u16.to_le_bytes()); // flags
+        c[20..24].copy_from_slice(&7u32.to_le_bytes()); // program_id
+        c[24..28].copy_from_slice(&3u32.to_le_bytes()); // version
+        for i in 28..60 {
+            c[i] = i as u8; // binary_hash
         }
-        for i in 48..80 {
-            c[i] = (i + 1) as u8;
+        for i in 60..92 {
+            c[i] = (i + 1) as u8; // manifest_hash
         }
-        for i in 80..96 {
-            c[i] = (i + 2) as u8;
+        for i in 92..108 {
+            c[i] = (i + 2) as u8; // key_id
         }
-        c[96..100].copy_from_slice(&UNSAFE_ALL_PASS.to_le_bytes());
-        for i in 100..132 {
-            c[i] = (i + 3) as u8;
+        c[108..112].copy_from_slice(&UNSAFE_ALL_PASS.to_le_bytes());
+        for i in 112..144 {
+            c[i] = (i + 3) as u8; // unsafe_audit_hash
         }
-        c[132..134].copy_from_slice(&(bil as u16).to_le_bytes());
+        c[144..146].copy_from_slice(&(bil as u16).to_le_bytes());
         for i in 0..bil {
             c[CERT_HEADER_LEN + i] = b'B';
         }
@@ -175,19 +214,23 @@ mod tests {
     }
 
     #[test]
-    fn parse_roundtrip_with_build_info() {
-        let c = good(20);
+    fn parse_roundtrip() {
+        let c = good(24);
         let t = TrustedCert::parse(&c).unwrap();
-        assert_eq!(t.format_version, 1);
+        assert_eq!(t.cert_format_version, 1);
+        assert_eq!(t.sig_format_version, SIG_FORMAT_VERSION);
+        assert_eq!(t.build_rules_version, BUILD_RULES_VERSION);
+        assert_eq!(t.audit_protocol_version, AUDIT_PROTOCOL_VERSION);
+        assert_eq!(t.unsafe_rules_version, UNSAFE_RULES_VERSION);
+        assert_eq!(t.allowlist_rules_version, ALLOWLIST_RULES_VERSION);
         assert_eq!(t.program_id, 7);
         assert_eq!(t.version, 3);
-        assert_eq!(t.unsafe_status, UNSAFE_ALL_PASS);
         assert!(t.unsafe_all_pass());
-        assert_eq!(t.build_info(), &[b'B'; 20]);
-        assert_eq!(t.message().len(), CERT_HEADER_LEN + 20);
-        assert_eq!(t.signature().len(), CERT_SIG_LEN);
-        assert_eq!(t.message(), &c[..CERT_HEADER_LEN + 20]);
-        assert_eq!(t.signature(), &c[CERT_HEADER_LEN + 20..]);
+        assert_eq!(t.binary_hash[0], 28);
+        assert_eq!(t.build_info(), &[b'B'; 24]);
+        assert_eq!(t.message().len(), CERT_HEADER_LEN + 24);
+        assert_eq!(t.message(), &c[..CERT_HEADER_LEN + 24]);
+        assert_eq!(t.signature(), &c[CERT_HEADER_LEN + 24..]);
     }
 
     #[test]
@@ -201,25 +244,25 @@ mod tests {
     #[test]
     fn unsafe_status_partial_is_not_all_pass() {
         let mut c = good(0);
-        c[96..100].copy_from_slice(&(UNSAFE_PROGRAM_FORBID | UNSAFE_PROJECT_CLEAN).to_le_bytes());
+        c[108..112].copy_from_slice(&(UNSAFE_PROGRAM_FORBID | UNSAFE_PROJECT_CLEAN).to_le_bytes());
         let t = TrustedCert::parse(&c).unwrap();
         assert!(!t.unsafe_all_pass()); // ALLOWLIST_OK fehlt
     }
 
     #[test]
     fn wrong_total_length_rejected() {
-        let mut c = good(20);
-        c.pop(); // ein Byte zu kurz
+        let mut c = good(24);
+        c.pop();
         assert_eq!(TrustedCert::parse(&c).unwrap_err(), LoaderError::BadCert);
-        let mut c = good(20);
-        c.push(0); // ein Byte zu lang
+        let mut c = good(24);
+        c.push(0);
         assert_eq!(TrustedCert::parse(&c).unwrap_err(), LoaderError::BadCert);
     }
 
     #[test]
     fn build_info_len_mismatch_rejected() {
-        let mut c = good(20);
-        c[132..134].copy_from_slice(&21u16.to_le_bytes()); // behauptet 21, Daten passen zu 20
+        let mut c = good(24);
+        c[144..146].copy_from_slice(&25u16.to_le_bytes()); // behauptet 25, Daten passen zu 24
         assert_eq!(TrustedCert::parse(&c).unwrap_err(), LoaderError::BadCert);
     }
 
@@ -240,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn bad_format_version_rejected() {
+    fn bad_cert_format_version_rejected() {
         let mut c = good(0);
         c[4] = 0xEE;
         assert_eq!(TrustedCert::parse(&c).unwrap_err(), LoaderError::BadCert);

@@ -1189,6 +1189,11 @@ pub fn spawn_isolated_native(code: *const u8, code_len: usize, prio: u8) -> Opti
         Some(t) => {
             record_user_kstack(t.slot(), kidx); // Pool-Slot dem Thread zuordnen (reclaim!)
             VSPACE_OF[t.slot()].store(packed, Ordering::Relaxed);
+            // Der private Code-Frame ist KEINE Reap-Region (das ist der Stack) und haengt als
+            // 2-MiB-Block (kein L3) am L2 -> vspace_teardown faende ihn nicht. Unter der ASID
+            // registrieren, damit ein spaeteres destroy_isolated ihn via loaded_free freigibt
+            // (sonst leckt der Code-Frame beim Abbau). Der Stack wird separat via Reap freigegeben.
+            loaded_register(asid, &[(cbase, clen)]);
             Some(t)
         }
         None => {
@@ -2655,11 +2660,26 @@ pub fn create_hardware_backend(
     backend_id: u16,
 ) -> Option<(usize, usize, usize)> {
     let ep = create_endpoint()?;
-    let ntfn = create_notification()?;
-    let backend_pd = CAPS
-        .write()
-        .pds
-        .create_hardware_backend(trusted_pd, backend_id, ep as u32, ntfn as u32)?;
+    let Some(ntfn) = create_notification() else {
+        // `ep` ist frisch reserviert + noch unreferenziert (keine Cap, kein Waiter) -> Slot
+        // zuruecknehmen, sonst leckt der Endpoint-Slot.
+        *EPS[ep].lock() = Endpoint::EMPTY;
+        return None;
+    };
+    let backend_pd = match CAPS.write().pds.create_hardware_backend(
+        trusted_pd,
+        backend_id,
+        ep as u32,
+        ntfn as u32,
+    ) {
+        Some(pd) => pd,
+        None => {
+            // ep + ntfn sind noch unreferenziert -> beide Slots zuruecknehmen.
+            *EPS[ep].lock() = Endpoint::EMPTY;
+            *NTFNS[ntfn].lock() = Notification::EMPTY;
+            return None;
+        }
+    };
     Some((backend_pd, ep, ntfn))
 }
 pub fn bind_pd(pd: usize, tid: ThreadId) {

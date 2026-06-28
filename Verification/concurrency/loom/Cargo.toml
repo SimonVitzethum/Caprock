@@ -1,0 +1,15 @@
+# Loom-Concurrency-Verifikation der sel4lake-sync-Locks (Verification-Artefakt, ADR 0023).
+# Eigenstaendig (NICHT im Kernel-Workspace -> kein build-std/Custom-Target): via tools/loom-verify.sh
+# nach $TMPDIR kopiert + mit RUSTFLAGS="--cfg loom" getestet (loom braucht Host-std + crates.io).
+[package]
+name = "sel4lake-loom-verify"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+loom = "0.7"
+
+[workspace]

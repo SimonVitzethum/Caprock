@@ -12,8 +12,9 @@ Die Ebenen ersetzen sich **nicht**, sondern **ergänzen** + sichern sich gegense
 |---|---|---|
 | Runtime-Audits | `*_audit()` im Kernel | Invarianten an Quiescenz-Punkten geprüft (echter Code) |
 | Fuzzer | `fuzz`/`ipcfuzz`/`hwfuzz` (Feature `kernel-fuzz`) | randomisierte Op-Sequenzen + Audit je Epoche |
-| **Kani** (Tier 1) | bounded Model Checking | Speichersicherheit/Panik-/OOB-Freiheit (`docs/verification.md`) |
+| **Kani** (Tier 1) | bounded Model Checking | Speichersicherheit/Panik-/OOB-Freiheit (`docs/verification.md`); + Kat-A-`unsafe` ([`unsafe-safety/`](unsafe-safety/)) |
 | **Verus** (Tier 2, hier) | deduktiv, SMT | funktionale Korrektheit: Operationen erhalten die Invariante **für alle Zustände** |
+| **Loom** | exhaustive Interleaving-Exploration | Nebenläufigkeit der Sync-Primitive (RwSpinLock/Ticket-Lock): Ausschluss/kein Lost-Update/kein torn read ([`concurrency/`](concurrency/)) |
 
 Strategie/Stufenmodell + Aufwand: `ARMTest/formale-verifikation-aufwand.md`. Pipeline/Tooling:
 `docs/verification.md`.
@@ -53,4 +54,5 @@ definierte TCB beschrieben (Aufwandsanalyse: `ARMTest/unsafe-memory-safety-aufwa
 ```sh
 tools/verus-verify.sh      # alle Verus-Beweise (CI-Gate: .gitea/workflows/verus.yml)
 tools/kani-verify.sh       # alle Kani-Beweise   (CI-Gate: .gitea/workflows/kani.yml)
+tools/loom-verify.sh       # Loom-Concurrency-Modelle der Sync-Primitive (CI-Gate: .gitea/workflows/loom.yml)
 ```

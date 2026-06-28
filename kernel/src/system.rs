@@ -1774,10 +1774,21 @@ impl DmaEnforcer for SmmuV3Enforcer {
                 return false;
             };
             let Some(cd) = SmmuV3Enforcer::alloc_zeroed(hal::smmu::CD_BYTES) else {
+                // Stage-1 (l1) ist bereits alloziert -> freigeben, sonst Frame-Leck.
+                let mut mem = MEM.lock();
+                hal::smmu::free_stage1(l1, &mut |x| {
+                    mem.free_region(PhysRegion::new(x, 4096));
+                });
                 return false;
             };
             hal::smmu::write_cd(cd, l1);
             let Some(slot) = t.iter().position(|c| !c.used) else {
+                // l1 + cd sind bereits alloziert (kein DmaCtx-Slot frei) -> beide freigeben.
+                let mut mem = MEM.lock();
+                hal::smmu::free_stage1(l1, &mut |x| {
+                    mem.free_region(PhysRegion::new(x, 4096));
+                });
+                mem.free_region(PhysRegion::new(cd, 4096));
                 return false;
             };
             t[slot] = DmaCtx::EMPTY;
@@ -1799,10 +1810,26 @@ impl DmaEnforcer for SmmuV3Enforcer {
             binding.cacheable,
             &mut alloc,
         ) {
+            // Ein frisch angelegter Kontext ist jetzt halb aufgebaut (l1 + cd, keine Region, keine
+            // STE) -> abbauen, sonst lecken Stage-1 + CD + der DmaCtx-Slot. Bestehender Kontext:
+            // unveraendert lassen (er traegt weiter seine anderen Regionen).
+            if is_new_ctx {
+                let mut mem = MEM.lock();
+                hal::smmu::free_stage1(l1, &mut |x| {
+                    mem.free_region(PhysRegion::new(x, 4096));
+                });
+                mem.free_region(PhysRegion::new(cd, 4096));
+                drop(mem);
+                t[slot] = DmaCtx::EMPTY;
+            }
             return false;
         }
         let Some(ri) = t[slot].regs.iter().position(|&(_, l)| l == 0) else {
-            return false; // kein Regions-Slot frei
+            // Region wurde in die Stage-1-Tabelle gemappt, aber es ist kein regs-Slot frei (nur bei
+            // einem BESTEHENDEN Kontext moeglich -> dessen regs sind voll; ein neuer Kontext hat
+            // leere regs). Das Mapping zuruecknehmen, sonst bleibt es untracked in der Tabelle.
+            hal::smmu::stage1_unmap_region(l1, binding.region.base, binding.region.len);
+            return false;
         };
         t[slot].regs[ri] = (binding.region.base, binding.region.len);
         // Neuer Kontext: STE installieren. Sonst: nur TLBI+SYNC (STE zeigt schon auf den CD).

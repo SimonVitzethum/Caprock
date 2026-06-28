@@ -71,6 +71,18 @@ impl Caps {
     /// in TrustedSas). Gibt `false` zurück (ohne Eintrag), wenn die Policy es verbietet.
     /// Zentraler Enforcement-Punkt — alle Cap-Installationen sollten hierüber laufen.
     pub fn install_cap_checked(&mut self, pd: usize, slot: usize, cap: CapPtr) -> bool {
+        if !self.cap_allowed(pd, cap) {
+            return false;
+        }
+        self.pds.install_cap(pd, slot, cap);
+        true
+    }
+
+    /// Erlaubt die Domänen-Policy die Cap-Art von `cap` in PD `pd`? Reiner Test (kein Eintrag) —
+    /// damit Pfade, die VOR dem Eintragen eine Ableitung/Kopie erzeugen (Grant in IPC), die Policy
+    /// **prüfen, bevor** sie eine Kopie anlegen (kein Policy-Bypass + keine verwaiste Kopie bei
+    /// Ablehnung). Identisch zur Prüfung in [`install_cap_checked`].
+    pub fn cap_allowed(&self, pd: usize, cap: CapPtr) -> bool {
         let Some(domain) = self.pds.domain_of(pd) else {
             return false;
         };
@@ -91,7 +103,6 @@ impl Caps {
                 _ => {}
             }
         }
-        self.pds.install_cap(pd, slot, cap);
         true
     }
 
@@ -722,7 +733,15 @@ fn grant_cap(caps: &mut Caps, caller: ThreadId, server_pd: usize, grant_slot: us
     let Some(cpd) = caps.pds.pd_of(caller) else {
         return;
     };
-    // Cap ableiten (erbt die Rechte) und beim Aufrufer eintragen.
+    // **Domänen-Policy VOR der Ableitung prüfen** (konsistent zum zentralen Enforcement-Punkt
+    // install_cap_checked) — sonst könnte ein Server eine policy-fremde Cap (z. B. HW-/Loader-/
+    // PdControl-Cap) per Grant in eine fremde Domäne schleusen (Bypass; bisher nur von domain_audit
+    // nachträglich DETEKTIERT statt VERHINDERT). Die Kopie hat dieselbe Art/Id wie `src` -> die
+    // Prüfung auf `src` ist äquivalent; bei Ablehnung wird gar keine Kopie erzeugt (kein Leck).
+    if !caps.cap_allowed(cpd, src) {
+        return;
+    }
+    // Cap ableiten (erbt die Rechte) und beim Aufrufer eintragen (Policy bereits geprüft).
     if let Ok(new_cap) = caps.cspace.copy(src, Rights::RWX) {
         caps.pds.install_cap(cpd, sel4lake_abi::GRANT_RECV_SLOT, new_cap);
     }

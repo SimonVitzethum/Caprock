@@ -1419,7 +1419,13 @@ pub fn load_into_pd(img: &ElfImage, pd: usize, endow: &[(usize, CapPtr)]) -> Opt
     loaded_register(asid, &seglist[..nrec]); // Segment-Frames fuer den Teardown merken (L4)
     bind_pd(pd, tid);
     for &(slot, cap) in endow {
-        install_pd_cap(pd, slot, cap); // policy-geprüft (Domänen-Policy bleibt gültig)
+        // Policy-geprüft (Domänen-Policy bleibt gültig). Lehnt die Policy die Cap ab (false), wurde
+        // sie NICHT installiert -> die vom Dispatch erzeugte Kopie loeschen, sonst leckt sie (frisches
+        // CDT-Blatt, nicht letzte Referenz -> delete_leaf senkt nur den Refcount). Keine Locks gehalten;
+        // unter `daif` bleiben die IRQ-safe Locks maskiert.
+        if !install_pd_cap(pd, slot, cap) {
+            let _ = cap_delete(cap);
+        }
     }
     hal::cpu::local_irq_restore(daif);
     Some(tid)

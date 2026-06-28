@@ -243,7 +243,20 @@ pub fn trust_audit() -> u32 {
 /// die `endow`-Caps (vom Dispatch aus dem Aufrufer-Cspace delegiert) in die neue PD endowen. Gibt
 /// die neue PD-Id. Der Dispatch hat die `Loader`-Cap-Autoritaet bereits geprueft.
 pub fn load_by_index(index: u32, endow: &[(usize, CapPtr)]) -> Option<usize> {
-    let archive = read_archive()?;
-    let prog = archive.program(index as usize)?;
-    load_image(&prog, endow).ok().map(|(_, pd)| pd)
+    let pd = (|| {
+        let archive = read_archive()?;
+        let prog = archive.program(index as usize)?;
+        load_image(&prog, endow).ok().map(|(_, pd)| pd)
+    })();
+    if pd.is_none() {
+        // Laden fehlgeschlagen (Archiv fehlt / Index ungueltig / verify/parse/Ressourcen) -> die vom
+        // Syscall-Dispatch erzeugten Endowment-Cap-KOPIEN wurden NICHT installiert (load_into_pd endowt
+        // erst nach vollem Erfolg). Sie sind frische CDT-Blaetter + NICHT die letzte Referenz (das
+        // Original im Aufrufer-Cspace lebt) -> delete_leaf senkt nur den Refcount. Ohne dieses Cleanup
+        // lecken sie als verwaiste CDT-Kinder und blockieren sogar `delete` des Eltern-Caps (HasChildren).
+        for &(_, cap) in endow {
+            let _ = crate::system::cap_delete(cap);
+        }
+    }
+    pd
 }

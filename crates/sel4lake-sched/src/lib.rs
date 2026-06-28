@@ -180,8 +180,13 @@ impl RunQueue {
     }
 }
 
-/// Maximale Anzahl noch nicht eingesammelter (reaper-)Zombies je Kern.
-const NZOMBIES: usize = 16;
+/// Maximale Anzahl noch nicht eingesammelter (reaper-)Zombies je Kern. MUSS so groß sein wie die
+/// per-Kern-TCB-Partition (`PER_CORE`): zwischen zwei Reap-Durchläufen können bis zu `PER_CORE`
+/// Threads dieses Kerns sterben (mehr Threads kann der Kern nicht zugleich tragen), und jeder
+/// hinterlässt einen Stack-Zombie. War der Puffer kleiner (früher 16), verwarf `record_zombie` bei
+/// vollem Puffer den Stack STILL -> Stack-RAM-Leak (der `reclaim`-Test mit 16 transienten Exitern lag
+/// exakt an der alten Grenze; 17 hätten geleckt).
+const NZOMBIES: usize = PER_CORE;
 
 /// Scheduler **eines Kerns**: TCB-Partition + Run-Queues + laufender Thread +
 /// Zombies. Im Kernel je Kern eine Instanz hinter eigenem Lock.

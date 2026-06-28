@@ -446,12 +446,27 @@ impl CapSpace {
                 }
             }
             if let Some(c) = m.first_child {
-                if c >= NSLOTS || !self.slots[c].used || self.slots[c].mdb.parent != Some(s) {
+                // first_child muss belegt sein, `parent == s` haben UND der **Listenkopf** sein
+                // (`prev_sibling == None`). Ohne die prev-Prüfung passierte ein reziproker
+                // Geschwister-Zyklus (a<->b als first_child) das Audit (Verus-Invariante Klausel 6
+                // verlangt beides; das Oracle war hier schwächer als die formale Invariante).
+                if c >= NSLOTS
+                    || !self.slots[c].used
+                    || self.slots[c].mdb.parent != Some(s)
+                    || self.slots[c].mdb.prev_sibling.is_some()
+                {
                     return 6;
                 }
             }
             if let Some(n) = m.next_sibling {
-                if n >= NSLOTS || !self.slots[n].used || self.slots[n].mdb.prev_sibling != Some(s) {
+                // Geschwister müssen reziprok verkettet sein UND denselben Parent teilen (Verus-
+                // Klausel 4-sib). Ohne die parent-Prüfung könnten zwei Slots als Geschwister verkettet
+                // sein, aber in verschiedenen Kinderlisten hängen (Oracle schwächer als die Invariante).
+                if n >= NSLOTS
+                    || !self.slots[n].used
+                    || self.slots[n].mdb.prev_sibling != Some(s)
+                    || self.slots[n].mdb.parent != m.parent
+                {
                     return 5;
                 }
             }

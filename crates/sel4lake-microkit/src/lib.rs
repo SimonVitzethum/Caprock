@@ -260,7 +260,7 @@ struct Pd {
     /// Nur für [`Domain::HardwareLand`]: der **eine** unveränderliche Trusted-SAS-Partner
     /// (PD-Index), mit dem dieses Backend ausschließlich kommunizieren darf. Bei der Erzeugung
     /// gesetzt; `None` für Trusted/User.
-    partner: Option<u8>,
+    partner: Option<u16>,
     /// Stabile **Backend-Id** (ext-22): identifiziert ein HardwareLand-Backend unabhängig vom
     /// PD-Index (für später: mehrere NICs/USB-Controller, Hotplug, PCIe). `0` = keins.
     backend_id: u16,
@@ -379,7 +379,7 @@ impl PdTable {
         self.pds[i] = Pd {
             used: true,
             domain: Domain::HardwareLand,
-            partner: Some(partner as u8),
+            partner: Some(partner as u16),
             backend_id,
             chan_ep: ep,
             chan_ntfn: ntfn,

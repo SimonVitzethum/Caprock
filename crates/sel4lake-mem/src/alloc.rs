@@ -52,8 +52,20 @@ impl PhysAllocator {
         for i in 0..self.len {
             let r = self.regions[i];
             let start = align_up(r.base, align);
-            let end = start.checked_add(size)?;
+            // Overflow beim Ausrichten/Addieren -> dieses Fragment überspringen (NICHT die ganze
+            // Allokation abbrechen; ein passendes Fragment könnte weiter hinten liegen).
+            let Some(end) = start.checked_add(size) else {
+                continue;
+            };
             if start >= r.base && end <= r.end() {
+                // Ein beidseitiger Verschnitt (Präfix UND Suffix nicht leer) erhöht die Fragmentzahl
+                // um 1. Ist die Free-Liste dann voll, ginge das Suffix beim `insert` verloren (RAM-
+                // Leck). Dann dieses Fragment überspringen (ein exakter/einseitiger Treffer woanders,
+                // sonst `None`) statt still Speicher zu verlieren.
+                let two_sided = start > r.base && end < r.end();
+                if two_sided && self.len >= MAX_FRAGMENTS {
+                    continue;
+                }
                 self.remove(i);
                 self.insert(PhysRegion::new(r.base, start - r.base)); // Präfix (evtl. leer)
                 self.insert(PhysRegion::new(end, r.end() - end)); //       Suffix (evtl. leer)

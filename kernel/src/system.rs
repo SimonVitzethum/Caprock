@@ -1298,7 +1298,26 @@ pub fn load_into_pd(img: &ElfImage, pd: usize, endow: &[(usize, CapPtr)]) -> Opt
         release_user_kstack(kidx);
         return None;
     };
-    let fail = |asid: u16, kidx: usize| {
+    // `cleanup` gibt die bereits allozierten Segment-/Stack-**Daten**-Frames frei (vor dem
+    // erfolgreichen `loaded_register` trackt sie NICHTS -> sonst Leck), baut die VSpace ab (gibt die
+    // L1/L2/L3-Tabellen-Frames zurück) und gibt den kstack-Pool-Slot zurück. Der MEM-Lock wird VOR
+    // `vspace_teardown` freigegeben (das sperrt MEM selbst -> sonst Selbst-Deadlock).
+    let cleanup = |asid: u16,
+                   kidx: usize,
+                   segs: &[(u64, u64)],
+                   stack: Option<(u64, u64)>|
+     -> Option<ThreadId> {
+        {
+            let mut mem = MEM.lock();
+            for &(b, l) in segs {
+                if l > 0 {
+                    mem.free_region(PhysRegion::new(b, l));
+                }
+            }
+            if let Some((b, l)) = stack {
+                mem.free_region(PhysRegion::new(b, l));
+            }
+        }
         vspace_teardown(asid);
         release_user_kstack(kidx);
         None
@@ -1307,18 +1326,23 @@ pub fn load_into_pd(img: &ElfImage, pd: usize, endow: &[(usize, CapPtr)]) -> Opt
     // 1. PT_LOAD-Segmente: kopieren + W^X an Link-VA mappen (nicht-identity, vaddr -> beliebige pa).
     // Die Segment-Frames merken (für den Teardown via loaded_register; NICHT den Stack — der wird
     // beim Thread-Ende via Reap freigegeben).
+    // Mehr Segmente als registrierbar (MAX_IMG_SEGS) würden beim Teardown lecken (loaded_register
+    // merkt nur die ersten MAX_IMG_SEGS) -> **fail-closed**, bevor irgendetwas alloziert ist.
+    if img.segments().count() > MAX_IMG_SEGS {
+        return cleanup(asid, kidx, &[], None);
+    }
     let mut seglist = [(0u64, 0u64); MAX_IMG_SEGS];
     let mut nrec = 0usize;
     for seg in img.segments() {
         let total = (((seg.memsz as u64) + 4095) & !4095) as usize;
         let Some(region) = MEM.lock().alloc(total as u64, 4096) else {
-            return fail(asid, kidx);
+            return cleanup(asid, kidx, &seglist[..nrec], None);
         };
         let pa = region.base(); // MemoryCap-Drop = nur Deskriptor (kein Free); RAM bleibt belegt
-        if nrec < MAX_IMG_SEGS {
-            seglist[nrec] = (pa, total as u64);
-            nrec += 1;
-        }
+        // VOR dem Mappen registrieren -> ein späterer Map-Fehler gibt diesen Frame mit frei.
+        // (Die Segmentzahl ist oben auf MAX_IMG_SEGS begrenzt -> kein Überlauf von `seglist`.)
+        seglist[nrec] = (pa, total as u64);
+        nrec += 1;
         copy_segment(pa, img.segment_bytes(&seg), total);
         let perm = if seg.flags & PF_X != 0 {
             hal::mmu::UserPerm::Rx
@@ -1331,7 +1355,7 @@ pub fn load_into_pd(img: &ElfImage, pd: usize, endow: &[(usize, CapPtr)]) -> Opt
         while (off as usize) < total {
             let mut a3 = || MEM.lock().alloc(4096, 4096).map(|c| c.base());
             if !hal::mmu::vspace_map_page_at(l2, seg.vaddr + off, pa + off, perm, &mut a3) {
-                return fail(asid, kidx);
+                return cleanup(asid, kidx, &seglist[..nrec], None);
             }
             off += 4096;
         }
@@ -1342,14 +1366,15 @@ pub fn load_into_pd(img: &ElfImage, pd: usize, endow: &[(usize, CapPtr)]) -> Opt
 
     // 2. Stack (nicht-identity an festes VA-Fenster, EL0-RW).
     let Some(stack_region) = MEM.lock().alloc(LOADED_STACK_BYTES, 4096) else {
-        return fail(asid, kidx);
+        return cleanup(asid, kidx, &seglist[..nrec], None);
     };
     let stack_pa = stack_region.base();
     let mut off = 0u64;
     while off < LOADED_STACK_BYTES {
         let mut a3 = || MEM.lock().alloc(4096, 4096).map(|c| c.base());
         if !hal::mmu::vspace_map_page_at(l2, LOADED_STACK_VA + off, stack_pa + off, hal::mmu::UserPerm::Rw, &mut a3) {
-            return fail(asid, kidx);
+            // Stack ist alloziert, aber noch NICHT als Reap-Region des Threads vermerkt -> mitfreigeben.
+            return cleanup(asid, kidx, &seglist[..nrec], Some((stack_pa, LOADED_STACK_BYTES)));
         }
         off += 4096;
     }
@@ -1380,7 +1405,9 @@ pub fn load_into_pd(img: &ElfImage, pd: usize, endow: &[(usize, CapPtr)]) -> Opt
     };
     let Some(tid) = tid else {
         hal::cpu::local_irq_restore(daif);
-        return fail(asid, kidx);
+        // Spawn fehlgeschlagen -> der Stack ist noch nicht als Reap-Region eines Threads vermerkt;
+        // Segmente + Stack mitfreigeben (loaded_register lief noch nicht).
+        return cleanup(asid, kidx, &seglist[..nrec], Some((stack_pa, LOADED_STACK_BYTES)));
     };
     record_user_kstack(tid.slot(), kidx);
     VSPACE_OF[tid.slot()].store(((asid as u64) << 48) | l1, Ordering::Relaxed); // ab jetzt isoliert
@@ -1398,8 +1425,16 @@ pub fn load_into_pd(img: &ElfImage, pd: usize, endow: &[(usize, CapPtr)]) -> Opt
 /// vor-erstellt (Partner-Bindung + Kanal) und über [`load_into_pd`] geladen. Gibt `(ThreadId, pd)`.
 pub fn load_elf(img: &ElfImage, domain: Domain, endow: &[(usize, CapPtr)]) -> Option<(ThreadId, usize)> {
     let pd = create_pd_in_domain(domain)?;
-    let tid = load_into_pd(img, pd, endow)?;
-    Some((tid, pd))
+    match load_into_pd(img, pd, endow) {
+        Some(tid) => Some((tid, pd)),
+        None => {
+            // load_into_pd baut `pd` bei Fehler bewusst NICHT ab (gehört dem Aufrufer) -> hier
+            // freigeben, sonst leckt der PD-Slot. Zu diesem Zeitpunkt ist die PD weder gebunden
+            // noch mit Caps bestückt (Endowment/bind_pd laufen erst nach allen Fehlerpfaden).
+            CAPS.write().pds.free(pd);
+            None
+        }
+    }
 }
 
 /// Den **akkumulierten Badge** einer Notification lesen, **ohne** ihn zu konsumieren (Test-/

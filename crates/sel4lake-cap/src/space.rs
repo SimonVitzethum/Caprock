@@ -73,7 +73,12 @@ impl CapSlot {
 /// Das Cap-System kennt das IPC-Subsystem nicht — es meldet nur, *welche* Calls
 /// finalisiert wurden; der Kernel führt das Entblocken aus (Sperrordnung CAPS < EPS<SCHEDS).
 pub struct ReplyFinal {
-    items: [(u32, u64); 8],
+    // Ein `revoke` kann eine ganze CDT-Teilkette loeschen und dabei MEHRERE Reply-Objekte
+    // finalisieren. Die Kapazitaet MUSS die maximal in einer Operation finalisierbaren Reply-Objekte
+    // fassen (hart begrenzt durch die Objekttabelle NOBJECTS) -- sonst wuerden ueberzaehlige
+    // (ep, caller)-Paare still verworfen und ihre CALL-Aufrufer nie abgebrochen -> sie haengen
+    // dauerhaft (Liveness-Bug). NOBJECTS ist die beweisbar vollstaendige Schranke (n <= len garantiert).
+    items: [(u32, u64); NOBJECTS],
     n: usize,
 }
 
@@ -85,7 +90,7 @@ impl Default for ReplyFinal {
 
 impl ReplyFinal {
     pub const fn new() -> Self {
-        Self { items: [(0, 0); 8], n: 0 }
+        Self { items: [(0, 0); NOBJECTS], n: 0 }
     }
     fn push(&mut self, ep: u32, caller: u64) {
         if self.n < self.items.len() {

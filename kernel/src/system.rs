@@ -2773,8 +2773,10 @@ pub fn endpoint_migrate_owner(ep: usize, tid: ThreadId) -> bool {
 pub fn purge_ipc_queues(tid: ThreadId) {
     // Verwaiste Aufrufer (deren Reply-Owner gerade stirbt) einsammeln und NACH dem
     // Freigeben der EPS-Locks mit ERR_SERVER_GONE entblocken (kein verschachtelter
-    // EPS->SCHEDS-Lock). Ein Thread ist Reply-Owner von höchstens wenigen Endpoints.
-    let mut orphans: [Option<ThreadId>; 8] = [None; 8];
+    // EPS->SCHEDS-Lock). Ein Thread kann (mehrfaches recv ohne reply) Reply-Owner von bis zu
+    // NENDPOINTS Endpoints zugleich sein -> das Array MUSS so gross sein, sonst wuerden Waisen
+    // jenseits der Kapazitaet still verworfen und ihre Aufrufer haengen dauerhaft (Liveness-Bug).
+    let mut orphans: [Option<ThreadId>; NENDPOINTS] = [None; NENDPOINTS];
     let mut no = 0usize;
     for ep in EPS.iter() {
         let mut e = ep.lock();

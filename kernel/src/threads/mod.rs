@@ -295,6 +295,7 @@ const CHAN_INPUT: u64 = 9;
 const CHAN_FACTOR: u64 = 2; // Backend verdoppelt -> Beleg, dass das Backend bediente
 static CHAN_TS_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
 static CHAN_BE_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
+#[allow(dead_code)] // bewusst behalten (HW-Register/API-Vollstaendigkeit bzw. nur unter cfg(kani)/Feature genutzt)
 static CHAN_BE2_PD: AtomicUsize = AtomicUsize::new(usize::MAX);
 static CHAN_RESULT: AtomicU64 = AtomicU64::new(u64::MAX); // Trusted-Client CALL-Antwortwert
 static CHAN_1N_OK: AtomicBool = AtomicBool::new(false); // 2. Backend am selben Partner ok
@@ -2679,6 +2680,11 @@ extern "C" fn client(_arg: usize) -> ! {
 
 // --- Reload-Manager + Bericht (Idle-Thread des Primärkerns) ---
 
+// `reported = true` (defensive Re-Report-Sperre) ist nach `report()` tot, weil danach IMMER
+// `system_off()` bzw. `soak::run()` (beide `-> !`) divergieren -> die Schleife kehrt nie zurueck,
+// der Wert wird nie wieder gelesen. Die Markierung bleibt dennoch (Intent + Robustheit, falls die
+// Divergenz-Annahme je entfaellt) -> das `unused_assignments`-Warning hier bewusst erlauben.
+#[allow(unused_assignments)]
 pub fn demo_report_then_idle() -> ! {
     let mut reloaded = false;
     let mut cs_reloaded = false;

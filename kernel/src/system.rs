@@ -1643,6 +1643,7 @@ pub fn irqs_delivered() -> u64 {
 pub struct DmaBinding {
     pub stream_id: u32,
     pub region: PhysRegion,
+    #[allow(dead_code)] // bewusst behalten (HW-Register/API-Vollstaendigkeit bzw. nur unter cfg(kani)/Feature genutzt)
     pub backend_pd: usize,
     /// ext-24: Gerät liest nur (read-only -> schreibgeschützt). Default `false` (RW).
     pub ro: bool,
@@ -1678,6 +1679,7 @@ pub trait DmaEnforcer: Sync {
     /// Durchsetzungs-Oracle: `0` = konsistent, sonst enforcer-spezifischer Anomalie-Code.
     fn audit(&self) -> u32;
     /// Ist die hardwareseitige Durchsetzung aktiv (HW vorhanden + initialisiert)?
+    #[allow(dead_code)] // bewusst behalten (HW-Register/API-Vollstaendigkeit bzw. nur unter cfg(kani)/Feature genutzt)
     fn is_active(&self) -> bool;
     /// **IOMMU-Stream-Gruppe** (ext-24): `member` soll fortan denselben Übersetzungskontext
     /// nutzen wie `leader` (z.B. Multi-Function-Gerät / Bridge ohne RID-Translation). Default:
@@ -2056,6 +2058,7 @@ pub fn dma_cap_attrs(cap: CapPtr) -> Option<(u64, u64, DmaDir, DmaCoherence)> {
 /// Region ausführen. Bei `DeviceRead`/`Bidirectional`: Clean (CPU-Daten sichtbar machen). Bei
 /// `DeviceWrite`: nichts (das Gerät schreibt; die CPU invalidiert in `dma_complete`). No-Op-sicher
 /// für Non-Coherent-Puffer.
+#[allow(dead_code)] // bewusst behalten (HW-Register/API-Vollstaendigkeit bzw. nur unter cfg(kani)/Feature genutzt)
 pub fn dma_prepare(handle: DmaHandle, dir: DmaDir) {
     match dir {
         DmaDir::DeviceRead | DmaDir::Bidirectional => {
@@ -2067,6 +2070,7 @@ pub fn dma_prepare(handle: DmaHandle, dir: DmaDir) {
 
 /// **DMA-Transfer abschließen** (ext-24): nach einem Geräte-Write (`DeviceWrite`/`Bidirectional`)
 /// die CPU-Cache-Zeilen invalidieren, damit die CPU die vom Gerät geschriebenen Daten frisch liest.
+#[allow(dead_code)] // bewusst behalten (HW-Register/API-Vollstaendigkeit bzw. nur unter cfg(kani)/Feature genutzt)
 pub fn dma_complete(handle: DmaHandle, dir: DmaDir) {
     match dir {
         DmaDir::DeviceWrite | DmaDir::Bidirectional => {
@@ -2078,6 +2082,7 @@ pub fn dma_complete(handle: DmaHandle, dir: DmaDir) {
 
 /// Eine zuvor gemappte DMA-Region wieder aus der VSpace des Threads entmappen (zurück auf
 /// EL1-only) + ASID flushen. Teil der Revoke-Reihenfolge.
+#[allow(dead_code)] // bewusst behalten (HW-Register/API-Vollstaendigkeit bzw. nur unter cfg(kani)/Feature genutzt)
 pub fn unmap_dma_from_thread(tid: ThreadId, phys: u64, len: u64) -> bool {
     let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
     let Some(l2) = vspace_l2(asid) else {
@@ -2387,6 +2392,7 @@ fn free_raw_region(base: u64, len: u64) {
 /// (1) `enforcer.detach` (hardwareseitige Durchsetzung entziehen — SMMU-Invalidierung),
 /// dann (2) aus der Backend-VSpace unmappen. Erst danach darf der Aufrufer die DmaCap löschen
 /// (`delete_leaf` -> `free_region`). Nach Schritt 1 kann kein Gerät mehr in die Region DMAen.
+#[allow(dead_code)] // bewusst behalten (HW-Register/API-Vollstaendigkeit bzw. nur unter cfg(kani)/Feature genutzt)
 pub fn revoke_dma(binding: &DmaBinding, tid: ThreadId) {
     dma_enforcer().detach(binding);
     unmap_dma_from_thread(tid, binding.region.base, binding.region.len);

@@ -25,6 +25,7 @@ const CR0: u64 = 0x020;
 const CR0ACK: u64 = 0x024;
 const CR1: u64 = 0x028;
 const CR2: u64 = 0x02c;
+#[allow(dead_code)] // bewusst behalten (HW-Register/API-Vollstaendigkeit bzw. nur unter cfg(kani)/Feature genutzt)
 const GBPA: u64 = 0x044;
 const IRQ_CTRL: u64 = 0x050;
 const GERROR: u64 = 0x060;

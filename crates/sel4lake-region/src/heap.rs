@@ -30,6 +30,7 @@ pub trait RegionSource {
 /// aufgerundet; alles Größere geht den Large-Pfad.
 const CLASS_SIZES: [usize; 8] = [16, 32, 64, 128, 256, 512, 1024, 2048];
 const NUM_CLASSES: usize = CLASS_SIZES.len();
+#[allow(dead_code)] // bewusst behalten (HW-Register/API-Vollstaendigkeit bzw. nur unter cfg(kani)/Feature genutzt)
 const MAX_CLASS: usize = CLASS_SIZES[NUM_CLASSES - 1];
 
 const MAX_SLAB_REGIONS: usize = 12; // Bump-Regionen für Slabs

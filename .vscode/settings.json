@@ -1,0 +1,11 @@
+{
+  // SEL4Lake baut gegen ein bare-metal **no_std**-Custom-Target (.cargo/config.toml:
+  // aarch64-sel4lake + build-std). Die #[cfg(test)]-Module der Crates nutzen aber std/Vec/assert_eq!
+  // und laufen ausschliesslich HOST-seitig (standalone /tmp-Kopien via tools/{kani,verus,loom}-verify.sh
+  // bzw. der Host-Test in der CI). Wuerde rust-analyzer --all-targets gegen das no_std-Target pruefen,
+  // erzeugte es ~180 SPURIOUS Fehler ("can't find crate std", "cannot find macro assert_eq", ...).
+  // -> Tests von der IDE-Pruefung ausnehmen; die Lib/Bin wird weiterhin gegen das Kernel-Target geprueft.
+  "rust-analyzer.cargo.allTargets": false,
+  "rust-analyzer.check.allTargets": false,
+  "rust-analyzer.checkOnSave.allTargets": false
+}

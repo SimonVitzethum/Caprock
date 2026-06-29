@@ -30,7 +30,9 @@ const VIRTQ_DESC_F_WRITE: u16 = 2;
 
 /// common_cfg-Register-Offsets (virtio_pci_common_cfg).
 mod cc {
+    #[allow(dead_code)] // bewusst behalten (HW-Register/API-Vollstaendigkeit bzw. nur unter cfg(kani)/Feature genutzt)
     pub const DEVICE_FEATURE_SELECT: u64 = 0x00;
+    #[allow(dead_code)] // bewusst behalten (HW-Register/API-Vollstaendigkeit bzw. nur unter cfg(kani)/Feature genutzt)
     pub const DEVICE_FEATURE: u64 = 0x04;
     pub const DRIVER_FEATURE_SELECT: u64 = 0x08;
     pub const DRIVER_FEATURE: u64 = 0x0c;

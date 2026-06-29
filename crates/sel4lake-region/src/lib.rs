@@ -239,6 +239,7 @@ impl<'a> RegionView<'a> {
     }
 
     // --- Runtime-intern (crate-privat): rohe Teile für den Allokator (heap-Modul). ---
+    #[allow(dead_code)] // bewusst behalten (HW-Register/API-Vollstaendigkeit bzw. nur unter cfg(kani)/Feature genutzt)
     pub(crate) fn raw(&self) -> (u64, usize) {
         (self.base, self.len)
     }

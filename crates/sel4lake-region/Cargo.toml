@@ -12,3 +12,8 @@ authors.workspace = true
 [dependencies]
 sel4lake-mem = { path = "../sel4lake-mem" }
 sel4lake-sync = { path = "../sel4lake-sync" }
+
+# `kani` ist ein externes cfg (Tier-1-Verifikation; nur unter `cargo kani` gesetzt, im Normalbuild
+# inert). Als erwartetes cfg deklarieren -> kein `unexpected_cfgs`-Warning (Rust >= 1.80).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

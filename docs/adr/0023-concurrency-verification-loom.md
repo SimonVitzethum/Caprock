@@ -38,9 +38,12 @@ Kernel-Sensitivitätstests).
 ## Konsequenzen
 
 - **Positiv:** der RwSpinLock-Release (`fetch_and`) ist als **notwendig** maschinen-verifiziert (über
-  alle Interleavings), nicht nur per Lektüre; der Ticket-Lock-Ausschluss ebenso. Schließt die zuvor
-  ausgeklammerte Concurrency-Grenze für die **Primitive** (nicht die globale Lock-Ordnung).
-- **Grenzen/offen:** Loom verifiziert die **einzelnen Primitive**, nicht die globale **Lock-Hierarchie**
-  (CAPS < EPS/NTFNS < SCHEDS < FP — Azyklizität = Deadlock-Freiheit, separat per Audit/Doku belegt) und
-  nicht die DAIF-IRQ-Maskierung (orthogonal zur Thread-Concurrency). Cross-Core-Wake/IPI-Pfade als
-  Loom-Modell sind eine mögliche Folgestufe.
+  alle Interleavings), nicht nur per Lektüre; der Ticket-Lock-Ausschluss ebenso. **Erweitert** (zweite
+  Stufe) auf zwei weitere Modelle: die **globale Lock-Hierarchie** (`hierarchy.rs` — die belegten
+  Schachtelungen CAPS→MEM/DMA_CTX→MEM/SCHEDS→FP_STATES nebenläufig sind deadlock-frei; eine Inversion
+  deadlockt nachweislich) und die **Cross-Core-IPC**-Pfade (`crosscore.rs` — one-lock-per-op: je ein
+  SCHEDS-Lock, nie zwei → deadlock-frei; zwei gehaltene SCHEDS deadlocken nachweislich). 8 Modelle, je
+  sensitivitäts-gegengeprüft.
+- **Grenzen/offen:** die Hierarchie-/Cross-Core-Modelle nutzen **Repräsentanten** der realen Locks
+  (nicht jeden Pfad statisch); der vollständige „jeder Pfad schachtelt aufsteigend"-Nachweis bleibt beim
+  Lock-Ordering-Sweep + den Audits. DAIF-IRQ-Maskierung ist orthogonal (nicht modelliert).

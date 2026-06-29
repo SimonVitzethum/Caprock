@@ -3,6 +3,7 @@
 //! loom::cell::UnsafeCell. loom::model() exploriert ALLE Interleavings + prueft Mutual-Exclusion,
 //! kein Lost-Update, kein torn read, und dass fetch_and(!WRITER)-Release einen transienten
 //! Reader-Zaehler erhaelt.
+#![allow(dead_code)] // Test-Verifikationsartefakt: Lock-Mirrors nur von #[cfg(test)] genutzt
 use loom::cell::UnsafeCell;
 use loom::sync::atomic::{AtomicU32, Ordering};
 
@@ -116,3 +117,5 @@ mod tests {
     }
 }
 mod ticket;
+mod hierarchy;
+mod crosscore;

@@ -14,7 +14,7 @@ Die Ebenen ersetzen sich **nicht**, sondern **ergänzen** + sichern sich gegense
 | Fuzzer | `fuzz`/`ipcfuzz`/`hwfuzz` (Feature `kernel-fuzz`) | randomisierte Op-Sequenzen + Audit je Epoche |
 | **Kani** (Tier 1) | bounded Model Checking | Speichersicherheit/Panik-/OOB-Freiheit (`docs/verification.md`); + Kat-A-`unsafe` ([`unsafe-safety/`](unsafe-safety/)) |
 | **Verus** (Tier 2, hier) | deduktiv, SMT | funktionale Korrektheit: Operationen erhalten die Invariante **für alle Zustände** |
-| **Loom** | exhaustive Interleaving-Exploration | Nebenläufigkeit der Sync-Primitive (RwSpinLock/Ticket-Lock): Ausschluss/kein Lost-Update/kein torn read ([`concurrency/`](concurrency/)) |
+| **Loom** | exhaustive Interleaving-Exploration | Nebenläufigkeit: Sync-Primitive (RwSpinLock/Ticket-Lock) + globale Lock-Hierarchie (deadlock-frei) + Cross-Core-IPC (one-lock-per-op) — 8 Modelle, sensitivitäts-geprüft ([`concurrency/`](concurrency/)) |
 
 Strategie/Stufenmodell + Aufwand: `ARMTest/formale-verifikation-aufwand.md`. Pipeline/Tooling:
 `docs/verification.md`.

@@ -1,7 +1,8 @@
 # Verifikation — Nebenläufigkeit (Loom) + Krypto-Review
 
-> **Status:** Sync-Primitive concurrency-verifiziert (Loom, 4 Modelle, alle Interleavings,
-> sensitivitäts-geprüft). Krypto-/Trust-Flow review-verifiziert (kein Befund).
+> **Status:** Nebenläufigkeit Loom-verifiziert (8 Modelle, alle Interleavings, sensitivitäts-geprüft):
+> Sync-Primitive (RwSpinLock/Ticket-Lock), **globale Lock-Hierarchie** (aufsteigend = deadlock-frei)
+> und **Cross-Core-IPC** (one-lock-per-op). Krypto-/Trust-Flow review-verifiziert (kein Befund).
 
 Bezug: [ADR 0023](../../docs/adr/0023-concurrency-verification-loom.md), `crates/sel4lake-sync`,
 `crates/sel4lake-trust`, `kernel/src/loader.rs` (verify_trusted_cert), `docs/invariants.md` §1a.
@@ -13,20 +14,31 @@ exploriert **alle** Thread-Interleavings des **echten** Lock-Codes. Das Artefakt
 [`loom/`](loom/) enthält **getreue Kopien** der Lock-Logik aus `sel4lake-sync` (mit `loom`-Atomics +
 `loom::cell::UnsafeCell` statt `core`):
 
-| Modell | Lock | Eigenschaft | Status |
+| Modell | Bereich | Eigenschaft | Status |
 |---|---|---|---|
 | `one_writer_one_reader_no_torn_read` | RwSpinLock | Reader sieht nur konsistente Werte (Mutual-Exclusion W↔R) | ✅ |
 | `two_writers_no_lost_update` | RwSpinLock | zwei Writer → final **exakt +2** (kein Lost-Update) | ✅ |
 | `writer_with_transient_reader_increment` | RwSpinLock | `fetch_and(!WRITER)`-Release erhält den transienten Leser-Zähler (kein Unterlauf) | ✅ |
 | `ticket_mutual_exclusion` | Ticket-SpinLock | FIFO-Ticket-Lock: zwei Threads → final **exakt +2** | ✅ |
+| `ascending_nestings_no_deadlock` | **Lock-Hierarchie** | die belegten Kernel-Schachtelungen (CAPS→MEM, DMA_CTX→MEM, SCHEDS→FP_STATES) **nebenläufig** → kein Deadlock | ✅ |
+| `disjoint_r1_then_r2_no_deadlock` | **Lock-Hierarchie** | EPS freigeben → dann SCHEDS (R1 vor R2, disjunkt) nebenläufig zu CAPS→MEM | ✅ |
+| `concurrent_cross_core_no_deadlock` | **Cross-Core-IPC** | zwei Kerne rufen gleichzeitig cross-core (one-lock-per-op: je ein SCHEDS, nie zwei) → kein Deadlock | ✅ |
+| `concurrent_cross_core_shared_ep_no_deadlock` | **Cross-Core-IPC** | wie zuvor, aber über **denselben** Endpoint (EPS serialisiert) → kein Deadlock | ✅ |
 
 **Die subtile Stelle (RwSpinLock-Release):** der Release löscht NUR das WRITER-Bit
 (`fetch_and(!RW_WRITER)`), **nicht** `store(0)` — sonst überschriebe er einen Leser, der während des
 Write-Holds transient optimistisch `state` hochgezählt hat (→ Unterlauf bei dessen `fetch_sub`).
 
-**Sensitivitäts-Gegenprobe (Pflicht):** mit injiziertem `store(0)`-statt-`fetch_and`-Bug **fängt Loom
-den Fehler** — `one_writer_one_reader_no_torn_read` + `writer_with_transient_reader_increment` schlagen
-fehl (Loom findet das korrumpierende Interleaving). Der Harness ist also nachweislich aussagekräftig.
+**Sensitivitäts-Gegenproben (Pflicht — sonst sind die Modelle vacuous):** jeder Bereich wurde mit einem
+injizierten Bug gegengeprüft; Loom **fängt** ihn jeweils:
+- **RwSpinLock:** `store(0)` statt `fetch_and(!WRITER)` → `one_writer_one_reader_no_torn_read` +
+  `writer_with_transient_reader_increment` schlagen fehl (korrumpiertes Interleaving gefunden).
+- **Lock-Hierarchie:** eine **Inversion** (`MEM→CAPS` nebenläufig zu `CAPS→MEM`) → Loom meldet
+  „deadlock; threads = [Blocked, …]".
+- **Cross-Core:** **beide** SCHEDS-Locks zugleich halten (statt one-lock-per-op) → Loom meldet Deadlock.
+
+Damit ist belegt: aufsteigende Schachtelung **ist** deadlock-frei, eine Inversion / zwei gehaltene
+SCHEDS **deadlockt** — die Modelle prüfen genau die richtige Eigenschaft.
 
 ### Ausführen
 
@@ -39,11 +51,14 @@ sonst build-std/Custom-Target erzwingt (gleiches Muster wie `tools/kani-verify.s
 
 ### Grenzen
 
-- Verifiziert die **einzelnen Primitive**, nicht die globale **Lock-Hierarchie** (CAPS < EPS/NTFNS <
-  SCHEDS < FP — Azyklizität = Deadlock-Freiheit, separat per `docs/invariants.md` §1 + Lock-Audit).
+- Die **Lock-Hierarchie** (`hierarchy.rs`) modelliert die im Kernel belegten Schachtelungen
+  (invariants.md §1) als Repräsentanten; sie ersetzt nicht den vollständigen statischen Beweis, dass
+  **jeder** Pfad aufsteigend schachtelt (das trägt der Lock-Ordering-Sweep + die Audits) — sie zeigt,
+  dass die Hierarchie-Disziplin als solche deadlock-frei ist und eine Inversion deadlockt.
+- **Cross-Core** (`crosscore.rs`) modelliert das `call()`-`one-lock-per-op`-Muster; reale `unblock`/
+  `block_current`/IPI-Details (GIC-SGI) sind abstrahiert (IPI ist asynchrone Aufweck-Notiz, kein Lock).
 - DAIF-IRQ-Maskierung (Reentranz-Schutz innerhalb eines Kerns) ist orthogonal zur Thread-Concurrency
   und nicht modelliert (vgl. den IRQ-safe-Lock-Deadlock-Fix, `docs/invariants.md` §1a).
-- Cross-Core-Wake/IPI-Pfade (`wake_remote`, `unblock`+IPI) als Loom-Modell = mögliche Folgestufe.
 
 ## 2. Krypto-/Trust-Review (kein Befund)
 

@@ -15,8 +15,9 @@ der Azyklizität dieser totalen Ordnung.
 | Rang | Lock(s) | Typ | Rolle |
 |---|---|---|---|
 | R0 | `CAPS` | `RwSpinLock<Caps>` | Capability-Space + PDs (Autorität) |
-| R1 | `EPS[]`, `NTFNS[]`, `VSPACES`, `DMA_CTX`, `VIRTIO_PCI` | `SpinLock` | Ressourcentabellen (je Objekt/global) |
+| R1 | `EPS[]`, `NTFNS[]`, `VSPACES`, `DMA_CTX` | `SpinLock` | Ressourcentabellen (je Objekt/global) |
 | R2 | `SCHEDS[core]` | `SpinLock<Scheduler>` | Per-Kern-Runqueue |
+| R2.5 | `FP_STATES` | `SpinLock<[FpState; N]>` | Lazy-FP-Kontexte — **stets UNTER `SCHEDS` genommen** (nie davor), hält selbst nichts weiter |
 | R3 | `Heap.inner` | `SpinLock<HeapInner>` | prozess-lokaler Allokator (nur Region-Runtime) |
 | R4 | `MEM` | `SpinLock<PhysAllocator>` | physischer Allokator — **innerster** |
 
@@ -36,9 +37,12 @@ gleichzeitig halten, wenn ein Kopieren-und-Freigeben es vermeidet.*
   disjunkt statt geschachtelt — Kontention)
 - `dma_attach`/`dma_audit`: `CAPS.read` (DmaCap-Attribute/Snapshot) **freigeben**, dann `DMA_CTX`.
   R0 vor R1
+- `fp_trap` / `fp_reset_slot` (Lazy-FP): `SCHEDS[core]` → `FP_STATES`.  R2 → R2.5 (FP_STATES wird
+  **immer** unter dem gehaltenen `SCHEDS` genommen, nie davor; danach nur Atomics `FP_OWNER`/`VSPACE_OF`).
 
-**Leaf-Locks** (stets allein gehalten, keine Schachtelung): `KSTACKS`, `FP_STATES`, `VIRTIO_PCI`,
-`CS_RELOAD_INFO`/`RELOAD_INFO`, `hal::console::CONSOLE`.
+**Leaf-Locks** (halten nie einen weiteren Lock; daher deadlock-sicher unabhängig vom Aufrufkontext):
+`KSTACKS`, `VIRTIO_PCI`, `LOADED_IMAGES`, `CS_STATE_REGION`/`RELOAD_INFO`, `hal::console::CONSOLE`.
+(`FP_STATES` ist **kein** Leaf — es wird unter `SCHEDS` gehalten, s. R2.5 + Schachtelung oben.)
 
 ### 1a. IRQ-Sicherheit der SpinLocks (reentranter Ticket-Lock-Deadlock — Bugfix)
 

@@ -18,12 +18,20 @@ SECTIONS {
         *(.boot.text)         /* 32-bit-Trampolin + 64-bit long_mode */
     }
 
+    /* 4-KiB-ausgerichtete Sektionsgrenzen -> die Rust-MMU (paging.rs) kann W^X pro Seite setzen
+       (.text = R-X, .rodata = R--, .data/.bss = RW + NX). */
     .text : ALIGN(4096) {
+        __text_start = .;
         *(.text .text.*)
+        . = ALIGN(4096);
+        __text_end = .;
     }
 
     .rodata : ALIGN(4096) {
+        __rodata_start = .;
         *(.rodata .rodata.*)
+        . = ALIGN(4096);
+        __rodata_end = .;
     }
 
     .data : ALIGN(4096) {

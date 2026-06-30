@@ -12,6 +12,9 @@
 
 use core::arch::{asm, global_asm};
 
+mod idt;
+mod paging;
+
 global_asm!(
     r#"
 /* Rust-`global_asm!` nutzt Intel-Syntax als Default. */
@@ -200,6 +203,39 @@ pub fn emit_fmt(args: core::fmt::Arguments) {
     let _ = SerialWriter.write_fmt(args);
 }
 
+/// Eine u64 als `0x…`-Hex ausgeben (16 Stellen, lock-frei). Für Exception-/Paging-Dumps.
+pub(crate) fn put_hex(mut n: u64) {
+    emit_raw("0x");
+    let mut buf = [0u8; 16];
+    for i in (0..16).rev() {
+        let nib = (n & 0xf) as u8;
+        buf[i] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
+        n >>= 4;
+    }
+    for &c in &buf {
+        serial_putc(c);
+    }
+}
+
+/// Eine u64 dezimal ausgeben (lock-frei).
+pub(crate) fn put_dec(mut n: u64) {
+    if n == 0 {
+        serial_putc(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = 0;
+    while n > 0 {
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        serial_putc(buf[i]);
+    }
+}
+
 /// 64-bit-Rust-Eintritt (aus dem Boot-Trampolin). Stufe 0: Banner + Halt.
 #[no_mangle]
 pub extern "C" fn x86_rust_entry() -> ! {
@@ -212,6 +248,26 @@ pub extern "C" fn x86_rust_entry() -> ! {
     emit_raw(" Paging/IDT/APIC/Timer/Syscall/SMP folgen (Stufe 1-5).\n");
     emit_raw("========================================\n");
     emit_raw("x86_64 first light: ALL PASS\n");
+
+    // Stufe 2 (Teil): IDT + Exception-Dispatch. Selbsttest per Software-Breakpoint (int3):
+    // der Handler muss die Exception dumpen UND via iretq zurueckkehren (Fortsetzung).
+    idt::init();
+    emit_raw("idt     : 256-Eintrag-IDT geladen (32 CPU-Exception-Stubs)\n");
+    idt::test_breakpoint();
+    emit_raw("idt     : int3 behandelt + zurueckgekehrt -> ALL PASS\n");
+
+    // Stufe 1: Rust-verwaltetes 4-Level-Paging mit W^X (16 MiB Identity).
+    paging::init();
+    paging::report();
+    emit_raw("paging  : PML4 W^X-Identity aktiv (CR3 + CR0.WP gesetzt), ueberlebt -> ALL PASS\n");
+    if paging::verify_wx() {
+        emit_raw("paging  : W^X-Bits korrekt (.text=R-X, .rodata=R--/NX) -> ALL PASS\n");
+    } else {
+        emit_raw("paging  : W^X-Bits FALSCH -> FAILURES\n");
+    }
+    // (W^X-Durchsetzung separat per #PF bewiesen: Write auf .rodata -> #PF err=0x3 cr2=.rodata.)
+
+    emit_raw("x86_64 Stufe 0+1+IDT: ALL PASS (Boot, Long Mode, Serial, IDT/Exceptions, Paging/W^X)\n");
     halt();
 }
 

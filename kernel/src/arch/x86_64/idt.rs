@@ -95,6 +95,7 @@ isr_noerr 28
 isr_err   29
 isr_err   30
 isr_noerr 31
+isr_noerr 32                 /* LAPIC-Timer-IRQ (Stufe 2b) */
 
 /* Tabelle der Stub-Adressen (für das Füllen der IDT in Rust). */
 .section .rodata
@@ -108,6 +109,7 @@ isr_stub_table:
     .quad isr_stub_20, isr_stub_21, isr_stub_22, isr_stub_23
     .quad isr_stub_24, isr_stub_25, isr_stub_26, isr_stub_27
     .quad isr_stub_28, isr_stub_29, isr_stub_30, isr_stub_31
+    .quad isr_stub_32
 .text
 "#
 );
@@ -155,6 +157,12 @@ fn vec_name(v: u64) -> &'static str {
 
 #[no_mangle]
 extern "C" fn x86_isr_handler(frame: &IsrFrame) {
+    // LAPIC-Timer-IRQ (Vektor 32): Tick zählen, EOI, zurück (iretq) — kein Dump.
+    if frame.vector == super::lapic::TIMER_VECTOR as u64 {
+        super::lapic::on_tick();
+        super::lapic::eoi();
+        return;
+    }
     emit_raw("\n[x86 EXCEPTION] vector=");
     super::put_dec(frame.vector);
     emit_raw(" (");
@@ -216,18 +224,21 @@ struct Idtr {
 
 static mut IDT: [IdtEntry; 256] = [IdtEntry::missing(); 256];
 
+/// Stub-Tabelle: 32 CPU-Exceptions (0..31) + LAPIC-Timer (32).
+const NSTUBS: usize = 33;
+
 extern "C" {
-    static isr_stub_table: [u64; 32];
+    static isr_stub_table: [u64; NSTUBS];
 }
 
-/// IDT mit den 32 Exception-Stubs füllen und per `lidt` laden.
+/// IDT mit den Exception- + Timer-Stubs füllen und per `lidt` laden.
 pub fn init() {
     // SAFETY: einmaliger, alleiniger Aufbau der statischen IDT vor jeder Interrupt-Freigabe
     // (Primärkern, single-threaded). Zugriff über Rohzeiger vermeidet `static_mut_refs`.
     unsafe {
         let idt = addr_of!(IDT) as *mut IdtEntry;
         let stubs = addr_of!(isr_stub_table) as *const u64;
-        for i in 0..32 {
+        for i in 0..NSTUBS {
             (*idt.add(i)).set_handler(*stubs.add(i));
         }
         let idtr = Idtr {

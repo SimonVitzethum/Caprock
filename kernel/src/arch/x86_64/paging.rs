@@ -12,9 +12,15 @@ use core::ptr::addr_of_mut;
 
 const P: u64 = 1 << 0; //  present
 const RW: u64 = 1 << 1; // writable
+const PCD: u64 = 1 << 4; // page cache disable (für MMIO, z. B. LAPIC)
+const PS: u64 = 1 << 7; // page size (2-MiB-Block in der PD)
 const NX: u64 = 1 << 63; // no-execute (braucht EFER.NXE)
 const PAGE: u64 = 4096;
-const NPT: usize = 8; // 8 PTs × 2 MiB = 16 MiB identitätsgemappt
+const TWO_MIB: u64 = 2 * 1024 * 1024;
+const ONE_GIB: u64 = 1 << 30;
+const NPT: usize = 8; // 8 PTs × 2 MiB = 16 MiB identitätsgemappt (low)
+/// LAPIC-MMIO-Basis (über den 16 MiB low) — als 2-MiB-MMIO-Seite gemappt (Stufe 2b).
+const LAPIC_BASE: u64 = 0xFEE0_0000;
 
 #[repr(C, align(4096))]
 struct Table([u64; 512]);
@@ -23,6 +29,8 @@ static mut PML4: Table = Table([0; 512]);
 static mut PDPT: Table = Table([0; 512]);
 static mut PD: Table = Table([0; 512]);
 static mut PT: [Table; NPT] = [const { Table([0; 512]) }; NPT];
+/// PD für PDPT[3] (3..4 GiB): trägt die LAPIC/IOAPIC-MMIO-2-MiB-Seiten.
+static mut PD_HIGH: Table = Table([0; 512]);
 
 extern "C" {
     static __text_start: u8;
@@ -88,6 +96,13 @@ pub fn init() {
                 (*pti).0[j] = addr | page_flags(addr);
             }
         }
+
+        // High-MMIO (LAPIC @ 0xFEE0_0000): PDPT[3] -> PD_HIGH, dort eine 2-MiB-MMIO-Seite
+        // (RW, NX, cache-disabled). Liegt im 3..4-GiB-PDPT-Eintrag.
+        let pd_high = addr_of_mut!(PD_HIGH) as *mut Table;
+        (*pdpt).0[(LAPIC_BASE / ONE_GIB) as usize] = (pd_high as u64) | P | RW;
+        let li = ((LAPIC_BASE % ONE_GIB) / TWO_MIB) as usize;
+        (*pd_high).0[li] = (LAPIC_BASE & !(TWO_MIB - 1)) | P | RW | PS | NX | PCD;
 
         asm!("mov cr3, {}", in(reg) pml4 as u64, options(nostack, preserves_flags));
 

@@ -29,5 +29,6 @@ check "x86_64 first light: ALL PASS"   "Stufe 0: Boot + Long Mode + 16550-Serial
 check "idt     : int3 behandelt"       "Stufe 2(IDT): Exception-Dispatch (int3 gefangen + iretq)"
 check "PML4 W\^X-Identity aktiv"        "Stufe 1: 4-Level-Paging aktiv (CR3 + CR0.WP)"
 check "W\^X-Bits korrekt"              "Stufe 1: W^X-Bits (.text=R-X, .rodata=R--/NX)"
+check "lapic   : Timer-IRQs empfangen" "Stufe 2b: LAPIC + periodischer Timer-IRQ (Vektor 32)"
 if [ "$fail" = 0 ]; then echo "== ALL PASS =="; else echo "== FAILURES =="; fi
 exit "$fail"

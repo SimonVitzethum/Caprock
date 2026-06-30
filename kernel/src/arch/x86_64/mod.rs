@@ -13,6 +13,7 @@
 use core::arch::{asm, global_asm};
 
 mod idt;
+mod lapic;
 mod paging;
 
 global_asm!(
@@ -144,12 +145,13 @@ boot_stack_top:
 const COM1: u16 = 0x3F8;
 
 #[inline]
-unsafe fn outb(port: u16, val: u8) {
+pub(crate) unsafe fn outb(port: u16, val: u8) {
     // SAFETY: x86-Port-I/O auf ein festes Geräteregister; kein Speicherzugriff.
     asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
 }
 #[inline]
-unsafe fn inb(port: u16) -> u8 {
+#[allow(dead_code)]
+pub(crate) unsafe fn inb(port: u16) -> u8 {
     let v: u8;
     // SAFETY: wie `outb`.
     asm!("in al, dx", out("al") v, in("dx") port, options(nomem, nostack, preserves_flags));
@@ -267,7 +269,21 @@ pub extern "C" fn x86_rust_entry() -> ! {
     }
     // (W^X-Durchsetzung separat per #PF bewiesen: Write auf .rodata -> #PF err=0x3 cr2=.rodata.)
 
-    emit_raw("x86_64 Stufe 0+1+IDT: ALL PASS (Boot, Long Mode, Serial, IDT/Exceptions, Paging/W^X)\n");
+    // Stufe 2b: LAPIC + periodischer Timer (Vektor 32). Interrupts freigeben, auf Ticks warten.
+    lapic::init();
+    emit_raw("lapic   : 8259-PIC maskiert, LAPIC aktiviert, Timer armiert (Vektor 32, periodic)\n");
+    // SAFETY: Interrupts global freigeben (IDT + LAPIC-Timer stehen).
+    unsafe { asm!("sti", options(nomem, nostack, preserves_flags)) }
+    emit_raw("lapic   : sti -> warte auf periodische Timer-IRQs ...\n");
+    while lapic::ticks() < 5 {
+        // SAFETY: bis zum naechsten Interrupt schlafen (der Timer-IRQ weckt uns).
+        unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)) }
+    }
+    emit_raw("lapic   : Timer-IRQs empfangen (");
+    put_dec(lapic::ticks());
+    emit_raw(" Ticks) -> ALL PASS\n");
+
+    emit_raw("x86_64 Stufe 0-2: ALL PASS (Boot, Long Mode, Serial, IDT/Exceptions, Paging/W^X, LAPIC-Timer)\n");
     halt();
 }
 

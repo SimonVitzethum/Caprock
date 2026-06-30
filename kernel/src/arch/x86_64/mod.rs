@@ -12,9 +12,11 @@
 
 use core::arch::{asm, global_asm};
 
+mod gdt;
 mod idt;
 mod lapic;
 mod paging;
+mod syscall;
 
 global_asm!(
     r#"
@@ -284,7 +286,17 @@ pub extern "C" fn x86_rust_entry() -> ! {
     emit_raw(" Ticks) -> ALL PASS\n");
 
     emit_raw("x86_64 Stufe 0-2: ALL PASS (Boot, Long Mode, Serial, IDT/Exceptions, Paging/W^X, LAPIC-Timer)\n");
-    halt();
+
+    // Stufe 3a: GDT (Ring-3-Segmente) + syscall/sysret + Ring-3-Round-Trip. Der Demo läuft mit
+    // maskierten Interrupts (IF=0); eine TSS für Ring-3-Interrupts folgt in Stufe 4.
+    // SAFETY: Interrupts global maskieren vor dem Ring-3-Wechsel.
+    unsafe { asm!("cli", options(nomem, nostack, preserves_flags)) }
+    gdt::init();
+    syscall::init();
+    emit_raw("gdt     : GDT mit Ring-3-Segmenten geladen (kcode/kdata/udata/ucode)\n");
+    emit_raw("syscall : STAR/LSTAR/SFMASK gesetzt, EFER.SCE aktiv\n");
+    emit_raw("ring3   : wechsle per iretq nach Ring 3 -> user_entry ...\n");
+    syscall::enter_ring3(); // -> ! (Demo endet im SYS_EXIT-Zweig von rust_syscall)
 }
 
 /// CPU anhalten (Panic/Ende). `hlt` in Schleife.

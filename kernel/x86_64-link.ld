@@ -34,9 +34,26 @@ SECTIONS {
         __rodata_end = .;
     }
 
+    /* Ring-3-Code (EL0-äquivalent): eigene Seiten, von paging.rs als User-(U/S=1)+ausführbar
+       gemappt. Getrennt vom Kernel-.text (supervisor-only). */
+    .user_text : ALIGN(4096) {
+        __user_text_start = .;
+        *(.user_text .user_text.*)
+        . = ALIGN(4096);
+        __user_text_end = .;
+    }
+
     .data : ALIGN(4096) {
         *(.data .data.*)
         *(.got .got.plt)
+    }
+
+    /* Ring-3-Daten/-Stack: User-(U/S=1)+RW+NX. */
+    .user_data : ALIGN(4096) {
+        __user_data_start = .;
+        *(.user_data .user_data.*)
+        . = ALIGN(4096);
+        __user_data_end = .;
     }
 
     /* Genullte Kernel-BSS (NUR diese Spanne wird vom Long-Mode-Code genullt). */

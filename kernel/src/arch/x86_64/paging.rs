@@ -12,6 +12,7 @@ use core::ptr::addr_of_mut;
 
 const P: u64 = 1 << 0; //  present
 const RW: u64 = 1 << 1; // writable
+const U: u64 = 1 << 2; //  user-accessible (Ring 3)
 const PCD: u64 = 1 << 4; // page cache disable (für MMIO, z. B. LAPIC)
 const PS: u64 = 1 << 7; // page size (2-MiB-Block in der PD)
 const NX: u64 = 1 << 63; // no-execute (braucht EFER.NXE)
@@ -37,29 +38,41 @@ extern "C" {
     static __text_end: u8;
     static __rodata_start: u8;
     static __rodata_end: u8;
+    static __user_text_start: u8;
+    static __user_text_end: u8;
+    static __user_data_start: u8;
+    static __user_data_end: u8;
 }
 
 fn sym(s: &u8) -> u64 {
     s as *const u8 as u64
 }
 
-/// W^X-Flags für die identitätsgemappte 4-KiB-Seite bei `addr`.
+/// W^X-/Privileg-Flags für die identitätsgemappte 4-KiB-Seite bei `addr`.
 fn page_flags(addr: u64) -> u64 {
     // SAFETY: nur Adressberechnung über Linker-Symbole, kein Speicherzugriff.
-    let (ts, te, rs, re) = unsafe {
+    let (ts, te, rs, re, uts, ute, uds, ude) = unsafe {
         (
             sym(&__text_start),
             sym(&__text_end),
             sym(&__rodata_start),
             sym(&__rodata_end),
+            sym(&__user_text_start),
+            sym(&__user_text_end),
+            sym(&__user_data_start),
+            sym(&__user_data_end),
         )
     };
     if addr >= ts && addr < te {
-        P // .text: present, read-only, ausführbar (NX=0)
+        P // .text: Kernel R-X (NX=0, RW=0, supervisor)
     } else if addr >= rs && addr < re {
-        P | NX // .rodata: present, read-only, nicht ausführbar
+        P | NX // .rodata: Kernel R-- (NX=1)
+    } else if addr >= uts && addr < ute {
+        P | U // .user_text: Ring-3 R-X (U/S=1, NX=0, RW=0)
+    } else if addr >= uds && addr < ude {
+        P | RW | U | NX // .user_data/-stack: Ring-3 RW (U/S=1, NX=1)
     } else {
-        P | RW | NX // Rest: RW, nie ausführbar
+        P | RW | NX // Rest: Kernel RW, nie ausführbar
     }
 }
 
@@ -86,11 +99,14 @@ pub fn init() {
         let pd = addr_of_mut!(PD) as *mut Table;
         let pt0 = addr_of_mut!(PT) as *mut Table;
 
-        (*pml4).0[0] = (pdpt as u64) | P | RW;
-        (*pdpt).0[0] = (pd as u64) | P | RW;
+        // Zwischen-Tabellen mit U: die CPU ANDet U/S über alle Ebenen, daher müssen PML4/PDPT/PD das
+        // U-Bit tragen, damit die Ring-3-Seiten (.user_text/.user_data) erreichbar sind. Die
+        // eigentliche Privileg-Gatung macht weiterhin das Leaf-PTE (Kernel-Seiten: U=0 -> nur ring0).
+        (*pml4).0[0] = (pdpt as u64) | P | RW | U;
+        (*pdpt).0[0] = (pd as u64) | P | RW | U;
         for i in 0..NPT {
             let pti = pt0.add(i);
-            (*pd).0[i] = (pti as u64) | P | RW;
+            (*pd).0[i] = (pti as u64) | P | RW | U;
             for j in 0..512 {
                 let addr = (i as u64 * 512 + j as u64) * PAGE;
                 (*pti).0[j] = addr | page_flags(addr);

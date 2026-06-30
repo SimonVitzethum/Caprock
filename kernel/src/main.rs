@@ -1,7 +1,9 @@
 #![no_std]
 #![no_main]
-#![feature(allocator_api)]
-#![feature(btreemap_alloc)]
+// Die allocator_api-Features braucht der (arch-agnostische) Kernel-Kern; auf dem x86_64-Branch ist
+// in Stufe 0 nur Boot+Serial aktiv (Kern folgt) -> nur fuer aarch64 anfordern.
+#![cfg_attr(target_arch = "aarch64", feature(allocator_api))]
+#![cfg_attr(target_arch = "aarch64", feature(btreemap_alloc))]
 //! SEL4Lake kernel — bootable image entry point.
 //!
 //! Phase 1 (HAL): Boot, Exception-Vektoren, Identity-MMU + Caches (W^X), GICv2,
@@ -12,48 +14,69 @@
 // ext-25: prozess-lokale Heaps (sel4lake-region) nutzen den allocator_api — `Box`/`Vec` werden
 // stets mit EXPLIZITEM Allokator (`*_in(&heap)`) erzeugt. Es gibt bewusst KEINEN globalen Heap;
 // der Global-Allocator unten ist ein Wächter, der versehentliche `Box::new`/`Vec::new` abfängt.
+#[cfg(target_arch = "aarch64")]
 extern crate alloc;
 
 /// Wächter-Global-Allocator: das SAS-Modell verlangt **prozess-lokale** Heap-Instanzen
 /// (`Heap::new(source)` + `*_in(&heap)`). Ein impliziter globaler Heap existiert nicht.
+#[cfg(target_arch = "aarch64")]
 struct NoGlobalHeap;
 // SAFETY: niemals ein Block vergeben/freigegeben; jede Nutzung paniert (= Designfehler-Wächter).
+#[cfg(target_arch = "aarch64")]
 unsafe impl core::alloc::GlobalAlloc for NoGlobalHeap {
     unsafe fn alloc(&self, _l: core::alloc::Layout) -> *mut u8 {
         panic!("kein globaler Heap im SAS — prozess-lokale Heap-Instanz nutzen (*_in)")
     }
     unsafe fn dealloc(&self, _p: *mut u8, _l: core::alloc::Layout) {}
 }
+#[cfg(target_arch = "aarch64")]
 #[global_allocator]
 static GLOBAL: NoGlobalHeap = NoGlobalHeap;
 
 mod arch;
-mod loader;
 mod panic;
+// Der Kernel-Kern (arch-agnostisch, nutzt aber die aarch64-HAL) ist auf dem x86_64-Branch in Stufe 0
+// noch nicht aktiv — er wird Stufe fuer Stufe fuer x86_64 eingeschaltet (s. README-X86.md).
+#[cfg(target_arch = "aarch64")]
+mod loader;
+#[cfg(target_arch = "aarch64")]
 mod selftest;
+#[cfg(target_arch = "aarch64")]
 mod system;
+#[cfg(target_arch = "aarch64")]
 mod threads;
 /// Read-only TrustedSAS-Root-Key-DB (ext-28, ADR 0014) — autogeneriert von `tools/gen_trusted_key.py`,
 /// in den Kernel kompiliert, nur per Firmware-/Kernel-Update änderbar (nicht per Syscall).
+#[cfg(target_arch = "aarch64")]
 mod trusted_keys;
 
+#[cfg(target_arch = "aarch64")]
 use sel4lake_hal::{self as hal, println};
 
+// --- aarch64-Kernel-Kern (auf dem x86_64-Branch in Stufe 0 inaktiv; Boot-Entry kommt aus arch). ---
+
 /// Zielkonfiguration: ARM, 8 Kerne.
+#[cfg(target_arch = "aarch64")]
 const NUM_CORES: usize = 8;
 /// Stack-Größe je Sekundärkern (muss zur Reservierung in `linker.ld` passen).
+#[cfg(target_arch = "aarch64")]
 const SEC_STACK_SIZE: u64 = 0x10000;
 
 /// Periodische Tick-Rate des Timers (Hz). 100 Hz = 10-ms-Zeitscheiben.
+#[cfg(target_arch = "aarch64")]
 const TICK_HZ: u64 = 100;
 
 /// RAM-Layout der Zielplattform (Fallback; tatsächlich aus dem DTB gelesen).
+#[cfg(target_arch = "aarch64")]
 const RAM_BASE: u64 = 0x4000_0000;
+#[cfg(target_arch = "aarch64")]
 const RAM_END: u64 = RAM_BASE + 4 * 1024 * 1024 * 1024;
 
 /// Von QEMU erzeugter Device Tree (eingebettet — siehe `sel4lake-dtb`).
+#[cfg(target_arch = "aarch64")]
 static DTB_BYTES: &[u8] = include_bytes!("virt.dtb");
 
+#[cfg(target_arch = "aarch64")]
 extern "C" {
     /// Sekundärkern-Einstieg (Assembler, `arch::aarch64::boot`).
     fn _start_secondary();
@@ -62,12 +85,14 @@ extern "C" {
 }
 
 /// Stack-Spitze für Kern `core` (Slot `core` im reservierten Bereich).
+#[cfg(target_arch = "aarch64")]
 fn secondary_stack_top(core: usize) -> u64 {
     let base = core::ptr::addr_of!(__sec_stacks_bottom) as u64;
     base + (core as u64 + 1) * SEC_STACK_SIZE
 }
 
 /// Pro-Kern-Interrupt-Init (nach MMU). VBAR wird bereits vor der MMU gesetzt.
+#[cfg(target_arch = "aarch64")]
 fn init_core_irqs() {
     hal::gic::init_cpu(); // GIC-CPU-Interface (pro Kern)
     hal::timer::init(TICK_HZ); // Timer-PPI armieren (pro Kern)
@@ -76,6 +101,7 @@ fn init_core_irqs() {
 /// Kernel-Eintritt des Primärkerns, gerufen vom Boot-Trampolin.
 ///
 /// `dtb_addr` ist die physische Adresse des Device-Tree-Blobs (von QEMU in `x0`).
+#[cfg(target_arch = "aarch64")]
 #[no_mangle]
 pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // Vor der MMU sind Atomics/Spinlocks nicht wohldefiniert -> lock-freie Ausgabe.
@@ -151,6 +177,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 }
 
 /// Kernel-Eintritt jedes Sekundärkerns (gerufen aus `_start_secondary`).
+#[cfg(target_arch = "aarch64")]
 #[no_mangle]
 pub extern "C" fn kernel_secondary_main() -> ! {
     // Vektoren vor der MMU setzen (Fault-Diagnose), dann MMU (gemeinsame Tabelle)
@@ -169,6 +196,7 @@ pub extern "C" fn kernel_secondary_main() -> ! {
 }
 
 /// Idle-Schleife: auf Interrupts warten (Low-Power).
+#[cfg(target_arch = "aarch64")]
 fn idle() -> ! {
     loop {
         // Jeder Kern sammelt seine EIGENEN beendeten Threads ein (per-Kern-Reaping):

@@ -20,6 +20,15 @@ rustflags = [
     # Use our linker script (sets load address + sections for QEMU `virt`).
     "-C", "link-arg=-Tkernel/linker.ld",
 ]
+
+# x86_64-Port (Branch arch/x86_64): eingebauter Bare-Metal-Target x86_64-unknown-none
+# (soft-float, kein SSE, static). Eigenes Linker-Skript (Multiboot1 @ 1 MiB). Per
+# `--target x86_64-unknown-none` gewaehlt (s. build-x86.sh / test-qemu-x86.sh).
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-Tkernel/x86_64-link.ld",
+    "-C", "relocation-model=static",
+]
 # NOTE on FP/NEON: we keep them enabled (the aarch64 ABI ties `fp-armv8` to
 # `neon`; disabling them is being phased out by rustc). The kernel itself avoids
 # floating point, and FP/SIMD register state will be saved on context switch

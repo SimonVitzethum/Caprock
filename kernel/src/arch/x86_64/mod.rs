@@ -12,6 +12,7 @@
 
 use core::arch::{asm, global_asm};
 
+mod context;
 mod gdt;
 mod idt;
 mod lapic;
@@ -287,10 +288,15 @@ pub extern "C" fn x86_rust_entry() -> ! {
 
     emit_raw("x86_64 Stufe 0-2: ALL PASS (Boot, Long Mode, Serial, IDT/Exceptions, Paging/W^X, LAPIC-Timer)\n");
 
+    // Ab hier deterministisch ohne Timer-IRQ (Stufe 3b/3a-Demos).
+    // SAFETY: Interrupts global maskieren.
+    unsafe { asm!("cli", options(nomem, nostack, preserves_flags)) }
+
+    // Stufe 3b: kooperativer Context-Switch zwischen zwei Kernel-Kontexten (3x A<->B).
+    context::demo();
+
     // Stufe 3a: GDT (Ring-3-Segmente) + syscall/sysret + Ring-3-Round-Trip. Der Demo läuft mit
     // maskierten Interrupts (IF=0); eine TSS für Ring-3-Interrupts folgt in Stufe 4.
-    // SAFETY: Interrupts global maskieren vor dem Ring-3-Wechsel.
-    unsafe { asm!("cli", options(nomem, nostack, preserves_flags)) }
     gdt::init();
     syscall::init();
     emit_raw("gdt     : GDT mit Ring-3-Segmenten geladen (kcode/kdata/udata/ucode)\n");

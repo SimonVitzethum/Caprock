@@ -30,6 +30,7 @@ check "idt     : int3 behandelt"       "Stufe 2(IDT): Exception-Dispatch (int3 g
 check "PML4 W\^X-Identity aktiv"        "Stufe 1: 4-Level-Paging aktiv (CR3 + CR0.WP)"
 check "W\^X-Bits korrekt"              "Stufe 1: W^X-Bits (.text=R-X, .rodata=R--/NX)"
 check "lapic   : Timer-IRQs empfangen" "Stufe 2b: LAPIC + periodischer Timer-IRQ (Vektor 32)"
+check "3x A<->B Kontextwechsel ok"     "Stufe 3b: kooperativer Context-Switch (callee-saved + RSP + ret)"
 check "CPL=3 bestaetigt"               "Stufe 3a: Ring-3-Eintritt (iretq, CPL=3 via CS-Selektor)"
 check "ring3-Round-Trip OK"            "Stufe 3a: syscall/sysret-Round-Trip (ring3->ring0->ring3)"
 if [ "$fail" = 0 ]; then echo "== ALL PASS =="; else echo "== FAILURES =="; fi

@@ -224,9 +224,37 @@ const SCTLR_M: u64 = 1 << 0; //   MMU an
 const SCTLR_C: u64 = 1 << 2; //   Data-Cache an
 const SCTLR_I: u64 = 1 << 12; //  Instruction-Cache an
 
+/// Größte nutzbare ASID (= max. Anzahl gleichzeitiger isolierter VSpaces). Default 255 (8-Bit,
+/// TCR.AS=0); `enable()` hebt auf 65535, wenn die HW 16-Bit-ASIDs meldet (FEAT_ASID16,
+/// `ID_AA64MMFR0_EL1.ASIDBits == 0b0010`) und setzt dann TCR.AS. Der VSpace-Allokator deckelt
+/// seine Vergabe hierauf, damit ASIDs NIE über die HW-Breite hinaus vergeben werden (sonst würde
+/// eine zu große ASID auf eine andere aliasen — Isolationsbruch).
+static MAX_ASID: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(255);
+
+/// Größte HW-nutzbare ASID (255 oder 65535). Erst nach [`init_primary`] gültig.
+pub fn max_asid() -> u16 {
+    MAX_ASID.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// MMU + Caches am aktuellen Kern aktivieren (Tabellen müssen bereits stehen).
 fn enable() {
     let ttbr0 = table_phys(&L1_TABLE);
+    // 16-Bit-ASIDs (FEAT_ASID16) runtime erkennen: ID_AA64MMFR0_EL1.ASIDBits (Bits [7:4]) == 0b0010.
+    // Dann TCR.AS (Bit 36) setzen -> 65535 statt 255 ASIDs. Läuft auf jedem Kern (gleiche HW ->
+    // gleicher Wert); der primäre Kern hebt MAX_ASID. Ist FEAT_ASID16 nicht da, ist AS RES0 (bleibt
+    // 8-Bit) und MAX_ASID bleibt 255 -> sicher.
+    // SAFETY: nur ein Systemregister-Read.
+    let asid16 = unsafe {
+        let mmfr0: u64;
+        asm!("mrs {}, ID_AA64MMFR0_EL1", out(reg) mmfr0, options(nomem, nostack, preserves_flags));
+        ((mmfr0 >> 4) & 0xf) == 0b0010
+    };
+    let tcr = if asid16 {
+        MAX_ASID.store(65535, core::sync::atomic::Ordering::Relaxed);
+        TCR_VALUE | (1u64 << 36) // AS = 1 -> 16-Bit-ASIDs
+    } else {
+        TCR_VALUE
+    };
     // SAFETY: vollständige MMU-Aktivierungssequenz (Registerinit + Barrieren).
     // Der ausgeführte Code liegt in Normal-RAM (.text, R-X), daher läuft die
     // Instruktionsausführung unterbrechungsfrei weiter (VA == PA).
@@ -242,7 +270,7 @@ fn enable() {
             "dsb sy",
             "isb",
             mair = in(reg) MAIR_VALUE,
-            tcr = in(reg) TCR_VALUE,
+            tcr = in(reg) tcr,
             ttbr0 = in(reg) ttbr0,
             options(nostack, preserves_flags),
         );
@@ -327,7 +355,11 @@ pub fn set_user_vspace(root: u64, asid: u16) {
 /// EL1-only Normal-Block (Kernel sieht das RAM, EL0 nicht), global. Für die
 /// „Rest-RAM"-Einträge einer isolierten VSpace (1-GiB- bzw. 2-MiB-Blöcke).
 fn kernel_block(addr: u64) -> u64 {
-    addr | AF | SH_INNER | ATTR_NORMAL | AP_RW | PXN | UXN | BLOCK_DESC
+    // nG (ASID-spezifisch): diese EL1-only-Blöcke gehören zur jeweiligen isolierten VSpace. Wären
+    // sie global, überschattete ein in VSpace A gecachter EL1-only-Block dieselbe VA in VSpace B —
+    // inkl. einer frisch als EL0 gesplitteten Seite -> Permission-Fault Level 2 (Block) auf realer
+    // HW (QEMU-TCG maskiert das). Ein per-ASID-Flush kann globale Einträge zudem nicht evictieren.
+    addr | AF | SH_INNER | ATTR_NORMAL | AP_RW | PXN | UXN | NG | BLOCK_DESC
 }
 
 /// User-RW 2-MiB-Block, `nG` (ASID-spezifisch): die eigene Region einer isolierten PD.
@@ -483,7 +515,9 @@ pub fn vspace_unmap_block(l2_phys: u64, phys: u64) -> bool {
 
 /// EL1-only 4-KiB-Seite (Spiegel beim Aufsplitten eines Blocks: Kernel sieht das RAM).
 fn kernel_page(phys: u64) -> u64 {
-    phys | AF | SH_INNER | ATTR_NORMAL | AP_RW | PXN | UXN | PAGE_DESC
+    // nG (s. kernel_block): sonst überschattet ein global gecachter EL1-only-Spiegel dieselbe VA
+    // in einer anderen VSpace, inkl. der EL0-Seite -> Permission-Fault Level 2/3 auf realer HW.
+    phys | AF | SH_INNER | ATTR_NORMAL | AP_RW | PXN | UXN | NG | PAGE_DESC
 }
 
 /// EL0-User-Seite (4 KiB) mit gegebenem Recht, `nG` (ASID-spezifisch).
@@ -533,6 +567,7 @@ pub fn vspace_map_page(
     let l3 = unsafe { core::slice::from_raw_parts_mut(l3_phys as *mut u64, 512) };
     l3[((phys >> 12) & 0x1ff) as usize] = user_page(phys, perm);
     cpu::dsb_sy();
+    flush_va_global(phys); // identity (VA=phys): globalen Kernel-Block dieser VA evictieren
     true
 }
 
@@ -576,6 +611,7 @@ pub fn vspace_map_page_at(
     // Indiziert per VADDR, Ausgabe-Adresse = PHYS (nicht-identity).
     l3[((vaddr >> 12) & 0x1ff) as usize] = user_page(phys, perm);
     cpu::dsb_sy();
+    flush_va_global(vaddr); // globalen Kernel-Block der Link-VA evictieren (s. flush_va_global)
     true
 }
 
@@ -889,10 +925,29 @@ pub fn flush_asid(asid: u16) {
     unsafe {
         asm!(
             "dsb ishst",
-            "tlbi aside1, {a}",
+            "tlbi aside1is, {a}", // inner-shareable: alle Kerne (echtes SMP; Threads migrieren)
             "dsb ish",
             "isb",
             a = in(reg) arg,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// TLB-Invalidate **einer VA über ALLE ASIDs** (`tlbi vaae1is`, inner-shareable) — inklusive
+/// **globaler** Einträge und über alle Kerne. Nötig, weil eine identity-gemappte User-Seite (VA=PA)
+/// dieselbe VA trifft wie ein global gemappter Kernel-Block: ein per-ASID-Flush ([`flush_asid`])
+/// evictet globale Einträge nicht, und ein Nutzer-Thread kann auf einem anderen Kern laufen als dem,
+/// der gemappt hat. `va` sollte 4-KiB-ausgerichtet sein; das Argument ist VA[55:12].
+pub fn flush_va_global(va: u64) {
+    // SAFETY: TLB-Invalidate nach VA (all-ASID, inner-shareable); reine MMU-Wartung + Barrieren.
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi vaae1is, {v}",
+            "dsb ish",
+            "isb",
+            v = in(reg) (va >> 12),
             options(nostack, preserves_flags),
         );
     }

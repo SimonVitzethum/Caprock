@@ -738,8 +738,12 @@ pub fn spawn_user(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
     }
 }
 
-/// Anzahl gleichzeitig verwaltbarer isolierter VSpaces (= max. ASID).
-const MAX_VSPACES: usize = 16;
+/// Statische Reserve an isolierten-VSpace-Slots (BSS: `VSPACES` = MAX_VSPACES × ~24 B). Die
+/// **tatsächlich vergebene** Anzahl deckelt `create_vspace` auf `min(MAX_VSPACES, max_asid())`:
+/// die HW-ASID-Breite (`TCR.AS`; 255 bei 8-Bit, 65535 bei FEAT_ASID16) ist die harte Grenze —
+/// eine ASID darüber würde aliasen. Hoher Default, weil `create_vspace` ohnehin nur bis `usable`
+/// scannt (O(usable)) und die HW-Grenze schützt. 4096 = 96 KiB BSS.
+const MAX_VSPACES: usize = 4096;
 
 /// Metadaten einer isolierten VSpace (für map/unmap + Teardown). Indiziert per
 /// `asid - 1`.
@@ -761,8 +765,13 @@ fn create_vspace() -> Option<(u16, u64)> {
     // (kein monoton wachsender Zähler -> keine ASID-Leaks). Reservierung unter EINEM
     // Lock (Platzhalter), damit zwei Kerne nicht denselben Slot greifen.
     let asid = {
+        // Nur die ersten `usable` Slots vergeben: ASID = Slot+1 darf die HW-ASID-Breite
+        // (`max_asid()`, 255 oder 65535) NIE überschreiten, sonst aliast eine zu große ASID auf
+        // eine andere VSpace (Isolationsbruch). MAX_VSPACES darf also größer als die HW-Grenze sein
+        // (statische Reserve), genutzt wird aber nur bis `usable`.
+        let usable = MAX_VSPACES.min(hal::mmu::max_asid() as usize);
         let mut t = VSPACES.lock();
-        let i = t.iter().position(|v| !v.used)?;
+        let i = t.iter().take(usable).position(|v| !v.used)?;
         t[i] = VSpaceEnt { used: true, l1: 0, l2: 0 }; // reserviert
         (i + 1) as u16
     };
@@ -805,31 +814,24 @@ pub fn free_vspaces() -> usize {
 /// ist durch den VSPACES-Index = ASID-1 baulich garantiert.) Sperrt `VSPACES` kurz und
 /// liest die Tabellen über die Identity-Map.
 pub fn vspace_audit() -> u32 {
-    // l2-Adressen unter dem Lock einsammeln, dann ohne Lock walken (die Tabellen einer
-    // belegten VSpace werden nicht nebenläufig freigegeben, solange sie belegt ist).
-    let mut l2s: [u64; MAX_VSPACES] = [0; MAX_VSPACES];
-    let mut l1s: [u64; MAX_VSPACES] = [0; MAX_VSPACES];
-    let mut n = 0;
-    {
-        let t = VSPACES.lock();
-        for v in t.iter() {
-            if v.used {
-                if v.l1 == 0 || v.l2 == 0 {
-                    return 3;
-                }
-                l2s[n] = v.l2;
-                l1s[n] = v.l1;
-                n += 1;
-            }
+    // Unter dem `VSPACES`-Lock walken: `vspace_wx_ok`/`vspace_device_wx_ok` lesen nur die Tabellen
+    // (nehmen KEINE Locks) -> kein Deadlock, und race-frei (kein Teardown während des Walks). Früher
+    // wurden die L1/L2-Adressen erst in `[u64; MAX_VSPACES]` auf dem Stack kopiert; das skaliert nicht
+    // auf große MAX_VSPACES (Stack-Overflow) und war unnötig, da der Walk lock-frei ist.
+    let t = VSPACES.lock();
+    for v in t.iter() {
+        if !v.used {
+            continue;
         }
-    }
-    for i in 0..n {
-        let code = hal::mmu::vspace_wx_ok(l2s[i]);
+        if v.l1 == 0 || v.l2 == 0 {
+            return 3;
+        }
+        let code = hal::mmu::vspace_wx_ok(v.l2);
         if code != 0 {
             return code;
         }
         // W^X auch für GiB-0-Device-Mappings (ext-22): keine EL0-Device-Seite ausführbar.
-        if !hal::mmu::vspace_device_wx_ok(l1s[i]) {
+        if !hal::mmu::vspace_device_wx_ok(v.l1) {
             return 1;
         }
     }
@@ -976,15 +978,17 @@ fn vspace_teardown(asid: u16) {
         return;
     }
     loaded_free(asid); // ext-26 L4: geladene Programm-Segment-Frames freigeben (sonst Leck)
-    let ent = {
-        let mut t = VSPACES.lock();
-        let e = t[asid as usize - 1];
-        t[asid as usize - 1] = VSpaceEnt { used: false, l1: 0, l2: 0 };
-        e
-    };
+    // Eintrag NUR LESEN (Slot noch NICHT freigeben): der Kontextwechsel flusht nicht, sondern
+    // verlässt sich auf ASID-Tagging. Würde der Slot vor `flush_asid` freigegeben, könnte ein
+    // anderer Kern die ASID via `create_vspace` sofort neu vergeben + benutzen, WÄHREND die alten
+    // TLB-Einträge dieser ASID noch existieren -> das neue Programm sähe fremde Mappings. Auf realer
+    // HW mit 16-Bit-ASIDs reproduzierbar (geladene PDs liefen falsch); 8-Bit maskierte es. Reihenfolge:
+    // 1) TLB der ASID leeren, 2) Frames freigeben, 3) Slot freigeben (ab dann reusable).
+    let ent = { VSPACES.lock()[asid as usize - 1] };
     if ent.used {
+        hal::mmu::flush_asid(asid); // 1. TLB für diese ASID leeren (Tabellen noch intakt)
         let mut mem = MEM.lock();
-        // Zuerst die feingranularen L3-Tabellen (aus Seiten-Mappings) einsammeln.
+        // 2. feingranulare L3-Tabellen (aus Seiten-Mappings) einsammeln.
         hal::mmu::vspace_collect_l3s(ent.l2, &mut |p| {
             mem.free_region(PhysRegion::new(p, 4096));
         });
@@ -995,8 +999,9 @@ fn vspace_teardown(asid: u16) {
         mem.free_region(PhysRegion::new(ent.l1, 4096));
         mem.free_region(PhysRegion::new(ent.l2, 4096));
         drop(mem);
-        hal::mmu::flush_asid(asid);
     }
+    // 3. Slot erst JETZT freigeben (nach Flush) -> keine Wiederverwendung mit veralteten Einträgen.
+    VSPACES.lock()[asid as usize - 1] = VSpaceEnt { used: false, l1: 0, l2: 0 };
 }
 
 /// Einen **isolierten EL0-User-Thread** erzeugen (Weg C): eigene VSpace, die nur den

@@ -24,7 +24,7 @@ use sel4lake_mem::Rights;
 use sel4lake_sched::{SchedOps, ThreadId};
 use sel4lake_sync::{RwSpinLock, SpinLock};
 
-const NPDS: usize = 96;
+const NPDS: usize = 256; // PD-Pool großzügig (war 96): viele gleichzeitig geladene PDs (load/adversarial)
 /// Cap-Slots je PD-Cspace.
 const NCAPS: usize = 16;
 

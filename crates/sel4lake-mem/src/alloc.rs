@@ -9,9 +9,10 @@ use crate::cap::MemoryCap;
 use crate::region::{PhysRegion, Rights};
 use crate::PAGE;
 
-/// Maximale Anzahl freier Fragmente (genügt für statisches Bring-up; wächst mit
-/// einem späteren dynamischen Backing-Store).
-const MAX_FRAGMENTS: usize = 64;
+/// Maximale Anzahl freier Fragmente. 64 genügte QEMU, wird aber auf realer HW mit vielen
+/// GLEICHZEITIG lebenden isolierten PDs überschritten -> `alloc` gibt `None` trotz freiem RAM
+/// (Split-Rest passt nicht in die Liste). 1024 * 16 B = 16 KiB BSS; alloc/free scannen linear (O(n)).
+const MAX_FRAGMENTS: usize = 1024;
 
 /// Physischer Speicher-Allokator über eine feste Freiliste.
 pub struct PhysAllocator {
@@ -49,30 +50,39 @@ impl PhysAllocator {
         let align = align.max(PAGE);
         let size = align_up(size.max(1), PAGE);
 
+        // BEST-FIT: das Fragment mit dem KLEINSTEN Rest (`r.len - size`) wählen, das die Allokation
+        // (nach Alignment) fasst. So landen kleine Allocs in kleinen Löchern und GROSSE Löcher
+        // bleiben für große/ausgerichtete Allocs erhalten (z. B. 2-MiB-aligned isolierte Stacks) —
+        // vermeidet First-Fit-Fragmentierung (4-KiB-Tabellen knabbern das erste große Fragment an).
+        // Semantik sonst unverändert (Split/Coalesce/Accounting) -> memtest (1 Fragment) unberührt.
+        let mut best: Option<usize> = None;
         for i in 0..self.len {
             let r = self.regions[i];
             let start = align_up(r.base, align);
-            // Overflow beim Ausrichten/Addieren -> dieses Fragment überspringen (NICHT die ganze
-            // Allokation abbrechen; ein passendes Fragment könnte weiter hinten liegen).
+            // Overflow beim Ausrichten/Addieren -> dieses Fragment überspringen.
             let Some(end) = start.checked_add(size) else {
                 continue;
             };
             if start >= r.base && end <= r.end() {
-                // Ein beidseitiger Verschnitt (Präfix UND Suffix nicht leer) erhöht die Fragmentzahl
-                // um 1. Ist die Free-Liste dann voll, ginge das Suffix beim `insert` verloren (RAM-
-                // Leck). Dann dieses Fragment überspringen (ein exakter/einseitiger Treffer woanders,
-                // sonst `None`) statt still Speicher zu verlieren.
+                // Beidseitiger Verschnitt erhöht die Fragmentzahl um 1; ist die Liste dann voll,
+                // ginge das Suffix beim `insert` verloren (Leck) -> dieses Fragment überspringen.
                 let two_sided = start > r.base && end < r.end();
                 if two_sided && self.len >= MAX_FRAGMENTS {
                     continue;
                 }
-                self.remove(i);
-                self.insert(PhysRegion::new(r.base, start - r.base)); // Präfix (evtl. leer)
-                self.insert(PhysRegion::new(end, r.end() - end)); //       Suffix (evtl. leer)
-                return Some(MemoryCap::new(PhysRegion::new(start, size), Rights::RW));
+                if best.map_or(true, |b| r.len < self.regions[b].len) {
+                    best = Some(i);
+                }
             }
         }
-        None
+        let i = best?;
+        let r = self.regions[i];
+        let start = align_up(r.base, align);
+        let end = start + size;
+        self.remove(i);
+        self.insert(PhysRegion::new(r.base, start - r.base)); // Präfix (evtl. leer)
+        self.insert(PhysRegion::new(end, r.end() - end)); //       Suffix (evtl. leer)
+        Some(MemoryCap::new(PhysRegion::new(start, size), Rights::RW))
     }
 
     /// Eine Capability zurückgeben (konsumiert sie) und ihre Region freigeben.

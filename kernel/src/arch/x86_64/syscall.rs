@@ -31,8 +31,11 @@ user_entry:
     xor rdi, rdi
     mov di, cs                       /* rdi = CS-Selektor (User-Code|RPL3 = 0x23); low 2 Bits = CPL */
     syscall                          /* -> ring0 syscall_entry; sysret kehrt hierher zurück */
+    mov rcx, 200000000               /* Spin -> der LAPIC-Timer (IF=1) präemptiert Ring 3 via TSS.RSP0 */
+2:  dec rcx
+    jnz 2b
     mov rdi, 0x3C                    /* SYS_EXIT */
-    syscall                          /* -> Handler beendet die Demo */
+    syscall                          /* -> Handler meldet Präemption + system_off */
 1:  jmp 1b
 
 /* ---- Syscall-Entrypoint (LSTAR): syscall liefert user RIP in rcx, RFLAGS in r11 ---- */
@@ -49,7 +52,10 @@ syscall_entry:
     mov rsp, [rip + user_rsp_slot]
     sysretq                          /* -> Ring 3: RIP=rcx, RFLAGS=r11, CS/SS aus STAR */
 
-/* ---- Kernel-Syscall-Stack + User-RSP-Slot (.bss, supervisor, vom Trampolin genullt) ---- */
+/* ---- Kernel-Syscall-Stack + User-RSP-Slot (.bss, supervisor, vom Trampolin genullt) ----
+   NUR SINGLE-CORE: ein globaler Stack/Slot genügt, weil nur der Primärkern läuft und der
+   Handler mit IF=0 (SFMASK) nicht verschachtelt. SMP braucht per-CPU-Slots via
+   swapgs/KERNEL_GS_BASE (Stufe 4+), sonst korrumpieren sich Kerne gegenseitig den RSP. */
 .section .bss
 .align 16
 syscall_kstack:

@@ -160,6 +160,22 @@ pub(crate) unsafe fn inb(port: u16) -> u8 {
     asm!("in al, dx", out("al") v, in("dx") port, options(nomem, nostack, preserves_flags));
     v
 }
+#[inline]
+pub(crate) unsafe fn outw(port: u16, val: u16) {
+    // SAFETY: 16-bit-Port-I/O auf ein festes Geräteregister.
+    asm!("out dx, ax", in("dx") port, in("ax") val, options(nomem, nostack, preserves_flags));
+}
+
+/// Maschine herunterfahren (Pendant zu `hal::psci::system_off`). QEMU beendet sich über das
+/// ACPI-PM1a_CNT-Register (S5). Zwei bekannte QEMU-Ports (q35/pc + älteres piix), dann hlt-Fallback.
+pub fn system_off() -> ! {
+    // SAFETY: ACPI-Shutdown-Schreibzugriffe (QEMU); ohne Effekt auf echter HW -> Fallback halt().
+    unsafe {
+        outw(0x604, 0x2000);
+        outw(0xB004, 0x2000);
+    }
+    halt();
+}
 
 fn serial_init() {
     // SAFETY: Standard-16550-Init-Sequenz auf COM1 (Geräteregister).

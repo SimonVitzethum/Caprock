@@ -38,57 +38,63 @@ pub const IDLE_PRIO: u8 = 1;
 // aus dem EL0-zugänglichen RAM. Der Kernel-Stack MUSS EL1-only sein (sonst könnte
 // der EL0-Thread seinen eigenen Kernel-Stack lesen/schreiben), daher der feste Pool
 // im Kernel-Image (nicht aus dem EL0-zugänglichen MEM-Allokator).
-extern "C" {
-    static __user_kstacks_bottom: u8;
-}
-const USER_KSTACK_SIZE: usize = 0x4000; // 16 KiB (muss zur Linker-Reservierung passen)
-const USER_KSTACK_COUNT: usize = 16;
-const KSTACK_NONE: u16 = u16::MAX;
+const USER_KSTACK_SIZE: usize = 0x4000; // 16 KiB EL1-Kernel-Stack je EL0-Thread
 
-/// Free-List + Besitzer-Abbildung des EL0-Kernel-Stack-Pools. Beim Thread-Ende wird
-/// der Slot zurückgegeben (statt geleakt), sodass über die Laufzeit beliebig viele
-/// (nicht gleichzeitig > Pool) EL0-Threads erzeugt werden können.
+/// Besitzer-Abbildung der **dynamisch aus `MEM` allozierten** EL0-Kernel-Stacks: `base_of[slot]`
+/// = physische Basis des Kstacks des Threads `slot` (0 = keiner). Kstacks kommen NICHT mehr aus
+/// einer festen Image-Region — die lag im 2-MiB-Kernel-Image und deckelte die gleichzeitige
+/// EL0-Thread-Zahl hart. Jetzt aus dem allgemeinen RAM: Limit ist nur RAM + Thread-Zahl
+/// (MAX_THREADS), passend als Basis eines vollen OS. Beim Thread-Ende an `MEM` zurück (kein Leck).
+/// EL1-only-Zugriff: der Kstack liegt im User-RAM-Fenster; in JEDER isolierten VSpace ist dieses
+/// EL1-only (kernel_block-Spiegel) -> untrusted EL0 kommt nicht heran. Nur die globale SAS-Map
+/// (TrustedSAS) sieht es EL0-RW — konsistent mit dem SAS-Vertrauensmodell.
 struct KstackPool {
-    /// `free[i]` = Slot `i` verfügbar.
-    free: [bool; USER_KSTACK_COUNT],
-    /// Pool-Slot je globalem Thread-Slot (`KSTACK_NONE` = keiner).
-    slot_of: [u16; MAX_THREADS],
+    base_of: [u64; MAX_THREADS],
+    live: usize,
 }
-/// Pool-Lock. Wird stets **allein** gehalten (nie verschachtelt mit anderen Locks)
-/// -> keine Sperrordnungs-Beschränkung.
+/// Pool-Lock (nur `base_of`/`live`); NIE verschachtelt mit `MEM` gehalten (claim/reclaim nehmen die
+/// Locks sequenziell) -> keine Sperrordnungsverletzung; `MEM` ist ohnehin innerster Rang.
 static KSTACKS: SpinLock<KstackPool> = SpinLock::new(KstackPool {
-    free: [true; USER_KSTACK_COUNT],
-    slot_of: [KSTACK_NONE; MAX_THREADS],
+    base_of: [0; MAX_THREADS],
+    live: 0,
 });
 
-/// Einen freien Kernel-Stack-Pool-Slot reservieren (Free-List). `None` = Pool voll.
+/// Einen EL0-Kernel-Stack (16 KiB, ausgerichtet) aus `MEM` allozieren. Gibt die **physische Basis**
+/// zurück (identity-gemappt = EL1-SP-Region), oder `None` bei RAM-Erschöpfung.
 fn claim_user_kstack() -> Option<usize> {
+    let base = MEM.lock().alloc(USER_KSTACK_SIZE as u64, USER_KSTACK_SIZE as u64)?.base();
+    KSTACKS.lock().live += 1;
+    Some(base as usize)
+}
+/// Einen (noch keinem Thread zugeordneten) Kstack wieder an `MEM` freigeben (Fehlerpfad vor `record`).
+fn release_user_kstack(base: usize) {
+    MEM.lock().free_region(PhysRegion::new(base as u64, USER_KSTACK_SIZE as u64));
     let mut p = KSTACKS.lock();
-    let idx = p.free.iter().position(|&f| f)?;
-    p.free[idx] = false;
-    Some(idx)
+    p.live = p.live.saturating_sub(1);
 }
-/// Einen (noch keinem Thread zugeordneten) Pool-Slot wieder freigeben (Fehlerpfad).
-fn release_user_kstack(idx: usize) {
-    KSTACKS.lock().free[idx] = true;
+/// Den Kstack `base` dem Thread-Slot zuordnen (nach erfolgreichem spawn) -> Reclaim beim Thread-Ende.
+fn record_user_kstack(thread_slot: usize, base: usize) {
+    KSTACKS.lock().base_of[thread_slot] = base as u64;
 }
-/// Den Pool-Slot `idx` dem Thread-Slot `thread_slot` zuordnen (nach erfolgreichem spawn).
-fn record_user_kstack(thread_slot: usize, idx: usize) {
-    KSTACKS.lock().slot_of[thread_slot] = idx as u16;
-}
-/// Beim Thread-Ende: den ggf. zugeordneten Kernel-Stack-Pool-Slot zurückgeben.
-/// No-Op für EL1-Threads (kein Pool-Slot). Stets allein gesperrt.
+/// Beim Thread-Ende: den ggf. zugeordneten Kstack an `MEM` zurückgeben. No-Op für EL1-Threads.
 fn reclaim_user_kstack(thread_slot: usize) {
-    let mut p = KSTACKS.lock();
-    let i = p.slot_of[thread_slot];
-    if i != KSTACK_NONE {
-        p.free[i as usize] = true;
-        p.slot_of[thread_slot] = KSTACK_NONE;
+    let base = {
+        let mut p = KSTACKS.lock();
+        let b = p.base_of[thread_slot];
+        if b != 0 {
+            p.base_of[thread_slot] = 0;
+            p.live = p.live.saturating_sub(1);
+        }
+        b
+    };
+    if base != 0 {
+        MEM.lock().free_region(PhysRegion::new(base, USER_KSTACK_SIZE as u64));
     }
 }
-/// Anzahl aktuell freier Kernel-Stack-Pool-Slots (für den Reclaim-Test).
+/// Virtuelle „freie Kstack-Kapazität" (jetzt RAM-begrenzt): `MAX_THREADS - live`. Für den
+/// Reclaim-Test (spawnt, solange > 0) + Diagnose.
 pub fn user_kstack_free_count() -> usize {
-    KSTACKS.lock().free.iter().filter(|&&f| f).count()
+    MAX_THREADS.saturating_sub(KSTACKS.lock().live)
 }
 /// Sticky: wurde jemals ein Syscall von EL0 (User-Thread) gesehen?
 static EL0_SYSCALL_SEEN: AtomicBool = AtomicBool::new(false);

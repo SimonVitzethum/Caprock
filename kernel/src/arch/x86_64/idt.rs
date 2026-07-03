@@ -116,6 +116,10 @@ isr_stub_table:
 
 /// Von den Assembler-Stubs aufgebauter Frame (Reihenfolge = Push-Reihenfolge, niedrigste Adresse
 /// zuerst). `#[repr(C)]`, damit das Layout exakt zum Stub passt.
+///
+/// `rsp`/`ss` sind **immer** gültig: Im 64-bit-Modus pusht die CPU SS:RSP bei jedem
+/// Interrupt/Exception, auch ohne Privilegwechsel (Ring 0 -> Ring 0; Intel SDM Vol. 3, 6.14.2 —
+/// anders als im 32-bit-Modus, wo SS:ESP nur bei Ring-Wechsel gepusht wird).
 #[repr(C)]
 struct IsrFrame {
     r15: u64,

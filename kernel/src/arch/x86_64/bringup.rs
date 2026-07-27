@@ -488,6 +488,11 @@ pub fn run(multiboot_info: u64) -> ! {
     println!("iommu   : {}", if iommu_ok { "ALL PASS" } else { "SKIP/FAILURES" });
     let (nc, nthreads, per_core, tbl) = system::configure(ncpu);
     println!(
+        "apic    : {} (LAPIC-ID {}); x2APIC adressiert 32-Bit-IDs, xAPIC nur 8 -> 255 Kerne",
+        if hal::intc::x2apic_active() { "x2APIC (MSR-Pfad)" } else { "xAPIC (MMIO-Pfad)" },
+        hal::intc::lapic_id()
+    );
+    println!(
         "sched   : {nc} Kern, {nthreads} Thread-Slots ({per_core} hostbar), Tabellen {} KiB aus dem RAM",
         tbl >> 10
     );

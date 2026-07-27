@@ -10,9 +10,46 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// MSR mit LAPIC-Basisadresse + Enable-Bit.
 const MSR_APIC_BASE: u32 = 0x1B;
 const APIC_BASE_ENABLE: u64 = 1 << 11;
+/// `IA32_APIC_BASE.EXTD` — x2APIC-Modus.
+const APIC_BASE_X2APIC: u64 = 1 << 10;
 
 /// Standard-MMIO-Fenster des LAPIC (xAPIC). Wird identity-gemappt (uncacheable).
 pub const LAPIC_BASE: usize = 0xFEE0_0000;
+
+// --- x2APIC ------------------------------------------------------------------------------
+//
+// **Warum x2APIC und nicht der MMIO-Pfad**, wo doch beide funktionieren:
+//
+// * Ein IPI ist ein einziger `wrmsr` auf die ICR statt zweier uncached MMIO-Schreibzugriffe
+//   (ICR_HIGH, dann ICR_LOW) — und das Warten auf das Delivery-Status-Bit entfaellt, weil der
+//   MSR-Schreibzugriff selbst die Zustellung serialisiert.
+// * Die ICR ist ein 64-Bit-Register statt zweier Haelften; es gibt kein Fenster, in dem ein
+//   nebenlaeufiger Absender die obere Haelfte ueberschreibt.
+// * **Bindend:** xAPIC adressiert nur 8-Bit-APIC-IDs, also hoechstens 255 Kerne. Das erklaerte
+//   Ziel dieses Kernels sind 256 Kerne auf einer Dual-Epyc — mit xAPIC ist das nicht bloss
+//   langsamer, sondern strukturell ausgeschlossen.
+//
+// Der MMIO-Pfad bleibt als Rueckfall fuer Maschinen ohne x2APIC (und weil QEMU ihn ohne
+// `+x2apic` fuehrt). Welcher Pfad laeuft, entscheidet sich zur Laufzeit und steht im Log.
+
+/// x2APIC-Registerblock: MSR `0x800 + (MMIO-Offset >> 4)`.
+const X2APIC_MSR_BASE: u32 = 0x800;
+/// Ist x2APIC aktiv? (`0` = unbestimmt, `1` = xAPIC/MMIO, `2` = x2APIC/MSR.)
+static MODE: AtomicU64 = AtomicU64::new(0);
+
+fn x2apic_available() -> bool {
+    // SAFETY: `cpuid` ist nebenwirkungsfrei.
+    unsafe { core::arch::x86_64::__cpuid(1).ecx & (1 << 21) != 0 }
+}
+
+/// Läuft dieser Kern im x2APIC-Modus?
+pub fn x2apic_active() -> bool {
+    MODE.load(Ordering::Acquire) == 2
+}
+
+fn msr_of(off: usize) -> u32 {
+    X2APIC_MSR_BASE + (off >> 4) as u32
+}
 
 // LAPIC-Register (Byte-Offsets).
 const REG_ID: usize = 0x020;
@@ -34,15 +71,57 @@ fn reg_ptr(off: usize) -> *mut u32 {
     (LAPIC_BASE + off) as *mut u32
 }
 
+/// LAPIC-Registerzugriff für andere Module derselben Architektur (Timer).
+///
+/// Es gibt bewusst **einen** Zugriffspfad: der Timer schrieb bis hierher direkt ins
+/// MMIO-Fenster, was im x2APIC-Modus wirkungslos ist (dort ist es abgeschaltet). Zwei Pfade auf
+/// dasselbe Register, von denen einer die Betriebsart nicht kennt, sind genau die Sorte
+/// Doppelung, aus der stille Fehlfunktion wird.
+pub(crate) fn reg_read(off: usize) -> u32 {
+    read(off)
+}
+pub(crate) fn reg_write(off: usize, val: u32) {
+    write(off, val)
+}
+
+/// Ein LAPIC-Register lesen — im x2APIC-Modus per MSR, sonst per MMIO.
+///
+/// Der MMIO-Pfad ist im x2APIC-Modus **abgeschaltet** (Zugriffe faulten bzw. liefern Müll),
+/// deshalb ist die Fallunterscheidung keine Optimierung, sondern Voraussetzung.
 fn read(off: usize) -> u32 {
+    if x2apic_active() {
+        // SAFETY: x2APIC ist aktiv, die MSR des Registerblocks existiert.
+        return unsafe { rdmsr(msr_of(off)) } as u32;
+    }
     // SAFETY: `LAPIC_BASE+off` ist ein architektonisch festgelegtes, identity-gemapptes
     // LAPIC-Register (uncacheable); volatile MMIO aliast keinen Rust-Speicher.
     unsafe { core::ptr::read_volatile(reg_ptr(off)) }
 }
 
 fn write(off: usize, val: u32) {
+    if x2apic_active() {
+        // SAFETY: wie `read`.
+        unsafe { wrmsr(msr_of(off), val as u64) };
+        return;
+    }
     // SAFETY: wie `read`.
     unsafe { core::ptr::write_volatile(reg_ptr(off), val) }
+}
+
+/// Die **ICR** schreiben — im x2APIC-Modus ein einziger 64-Bit-Zugriff.
+///
+/// `dest` ist die volle APIC-ID (32 Bit im x2APIC-Modus, 8 Bit im xAPIC-Modus). Im xAPIC-Modus
+/// wird zusätzlich auf das Delivery-Status-Bit gewartet; im x2APIC-Modus gibt es das nicht mehr,
+/// weil der `wrmsr` selbst zustellt.
+fn write_icr(dest: u32, low: u32) {
+    if x2apic_active() {
+        // SAFETY: x2APIC aktiv; ICR ist im MSR-Block ein 64-Bit-Register.
+        unsafe { wrmsr(msr_of(REG_ICR_LOW), ((dest as u64) << 32) | low as u64) };
+        return;
+    }
+    write(REG_ICR_HIGH, dest << 24);
+    write(REG_ICR_LOW, low);
+    wait_ipi_delivered();
 }
 
 /// **Globale** Interrupt-Controller-Initialisierung (aarch64: GIC-Distributor).
@@ -73,15 +152,40 @@ pub fn init_cpu() {
     // SAFETY: `IA32_APIC_BASE` existiert auf jeder x86_64-CPU mit LAPIC (alle unterstützten).
     unsafe {
         let base = rdmsr(MSR_APIC_BASE);
-        wrmsr(MSR_APIC_BASE, base | APIC_BASE_ENABLE);
+        /*
+         * **Zwei Schritte, nicht einer.** Der Übergang „APIC aus -> x2APIC" ist architektonisch
+         * **verboten** (#GP); zulässig ist nur aus -> xAPIC -> x2APIC. `EN` und `EXTD` in einem
+         * Schreibzugriff zu setzen sieht sparsamer aus und löst auf einer CPU, die den Zustand
+         * prüft, einen General Protection Fault aus — hier im Bring-up mit der Folge Triple
+         * Fault und Reset. Unter TCG fiel das nicht auf, weil `qemu64` gar kein x2APIC meldet
+         * und der Pfad nie lief: derselbe „grün, weil das Antezedens falsch ist"-Fall wie
+         * anderswo in diesem Projekt.
+         */
+        wrmsr(MSR_APIC_BASE, (base | APIC_BASE_ENABLE) & !APIC_BASE_X2APIC);
+        if x2apic_available() {
+            let base = rdmsr(MSR_APIC_BASE);
+            wrmsr(MSR_APIC_BASE, base | APIC_BASE_X2APIC);
+            MODE.store(2, Ordering::Release);
+        } else {
+            MODE.store(1, Ordering::Release);
+        }
     }
     write(REG_SVR, SPURIOUS_VECTOR | (1 << 8));
     READY.store(1, Ordering::Release);
 }
 
 /// LAPIC-ID des aufrufenden Kerns (erst nach [`init_cpu`] gültig).
+///
+/// Im x2APIC-Modus ist das ID-Register **32 Bit breit und nicht verschoben** — die
+/// xAPIC-Verschiebung um 24 hier anzuwenden ergäbe für jeden Kern die ID 0, und der Kernel
+/// adressierte fortan den Scheduler des Bootkerns. Genau die Sorte stiller Verwechslung, die
+/// diesem Port schon einmal Stunden gekostet hat.
 pub fn lapic_id() -> u32 {
-    read(REG_ID) >> 24
+    if x2apic_active() {
+        read(REG_ID)
+    } else {
+        read(REG_ID) >> 24
+    }
 }
 
 /// **End Of Interrupt** an den LAPIC. Auf ARM steckt das im GIC-`EOIR`-Schreibzugriff des
@@ -108,26 +212,20 @@ pub fn send_sgi(target_core: usize, intid: u32) {
     if READY.load(Ordering::Acquire) == 0 {
         return;
     }
-    // Ziel-LAPIC-ID in ICR_HIGH[31:24], dann ICR_LOW schreiben (löst den IPI aus).
-    write(REG_ICR_HIGH, (target_core as u32) << 24);
     // Delivery Mode 000 (Fixed), Physical, Edge, kein Shorthand.
-    write(REG_ICR_LOW, intid & 0xFF);
+    write_icr(target_core as u32, intid & 0xFF);
 }
 
 /// **INIT-IPI** an `apic_id` (Teil der AP-Startsequenz, s. `power::cpu_on`).
 pub fn send_init_ipi(apic_id: u32) {
-    write(REG_ICR_HIGH, apic_id << 24);
     // Delivery Mode 101 (INIT), Level Assert, Edge.
-    write(REG_ICR_LOW, 0x4500);
-    wait_ipi_delivered();
+    write_icr(apic_id, 0x4500);
 }
 
 /// **STARTUP-IPI** (SIPI) an `apic_id` mit der Trampolin-Seitennummer als Vektor.
 pub fn send_startup_ipi(apic_id: u32, vector: u32) {
-    write(REG_ICR_HIGH, apic_id << 24);
     // Delivery Mode 110 (Startup), Level Assert.
-    write(REG_ICR_LOW, 0x4600 | (vector & 0xFF));
-    wait_ipi_delivered();
+    write_icr(apic_id, 0x4600 | (vector & 0xFF));
 }
 
 /// Warten, bis der LAPIC den IPI abgesetzt hat (ICR_LOW Bit 12 = Delivery Status).

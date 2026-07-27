@@ -21,13 +21,16 @@ static LAPIC_HZ: AtomicU64 = AtomicU64::new(0);
 const MAX_CORES: usize = 256;
 static TICKS: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
 
+/*
+ * Der Zugriff läuft über `intc`, nicht direkt ins MMIO-Fenster: im x2APIC-Modus ist dieses
+ * Fenster **abgeschaltet**, und ein Timer, der weiterhin dorthin schreibt, wird schlicht nie
+ * scharf — ohne Fehler, ohne Hinweis. Ein Register, ein Zugriffspfad.
+ */
 fn write(off: usize, val: u32) {
-    // SAFETY: architektonisch festes, identity-gemapptes LAPIC-Register (uncacheable).
-    unsafe { core::ptr::write_volatile((LAPIC_BASE + off) as *mut u32, val) }
+    super::intc::reg_write(off, val)
 }
 fn read(off: usize) -> u32 {
-    // SAFETY: wie `write`.
-    unsafe { core::ptr::read_volatile((LAPIC_BASE + off) as *const u32) }
+    super::intc::reg_read(off)
 }
 
 /// Frequenz der Zeitbasis (aarch64: `CNTFRQ_EL0`).

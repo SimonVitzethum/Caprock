@@ -183,20 +183,23 @@ static void __exit handover_exit(void)
 {
 	int i;
 
-	if (armed) {
-		/*
-		 * Der uebernommene Kern fuehrt unseren Code aus, nicht Linux' Park-Schleife.
-		 * Ihn per `add_cpu` zurueckzuholen hiesse, Linux' Hotplug auf einen Kern in
-		 * unbekanntem Zustand loszulassen. Ein verlorener Kern bis zum Reboot ist der
-		 * bessere Failure-Mode — und der Reboot war ausdruecklich der Ausweg.
-		 */
-		pr_warn("sel4lake: Kern %d bleibt uebernommen; Reboot stellt ihn wieder her\n",
-			cpus[0]);
-		return; /* low_page bewusst NICHT freigeben: der Kern liest sie noch. */
-	}
-	for (i = ncpus - 1; i >= 0; i--) {
+	/*
+	 * Nur der TATSAECHLICH uebernommene Kern bleibt verloren. Ihn per `add_cpu`
+	 * zurueckzuholen hiesse, Linux' Hotplug auf einen Kern in unbekanntem Zustand
+	 * loszulassen; ein verlorener Kern bis zum Reboot ist der bessere Failure-Mode.
+	 *
+	 * Die uebrigen sind lediglich offline und voellig unberuehrt — sie pauschal
+	 * mitverlieren zu lassen waere die stille Ueberdehnung einer Einschraenkung auf
+	 * Faelle, fuer die ihre Begruendung gar nicht gilt. Stufe 1a nimmt genau einen Kern.
+	 */
+	for (i = ncpus - 1; i >= (armed ? 1 : 0); i--) {
 		if (!add_cpu(cpus[i]))
 			pr_info("sel4lake: CPU %d wieder online\n", cpus[i]);
+	}
+	if (armed) {
+		pr_warn("sel4lake: CPU %d bleibt uebernommen; Reboot stellt sie wieder her\n",
+			cpus[0]);
+		return; /* low_page bewusst NICHT freigeben: der Kern liest sie noch. */
 	}
 	if (low_page)
 		__free_pages(low_page, 0);

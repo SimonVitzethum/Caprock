@@ -39,32 +39,79 @@ static int arm;
 module_param(arm, int, 0444);
 MODULE_PARM_DESC(arm, "1 = Stufe 1a: einen Kern wirklich uebernehmen (bis Reboot verloren)");
 
-/* Offset der Signatur innerhalb der Trampolin-Seite. */
-#define SIG_OFF   0x0F0
-#define SIG_VALUE 0x5345 /* 'ES' little-endian -> "SE" */
+/* Seitenlayout — identisch zu `tramp.S`, dort steht die Begruendung. */
+#define OFF_T16   0x000
+#define OFF_T64   0x080
+#define SIG_OFF   0x0F0	/* Real Mode erreicht */
+#define SIG2_OFF  0x0F2	/* Long Mode erreicht */
+#define OFF_GDT   0x100
+#define OFF_GDTR  0x120
+#define OFF_CR3   0x130
+#define SIG_VALUE  0x5345
+#define SIG2_VALUE 0x5346
 
-/*
- * 16-Bit-Real-Mode-Trampolin. Die SIPI setzt CS = Vektor<<8 und IP = 0; das Trampolin liegt
- * also am Segmentanfang und kann sich ueber CS selbst adressieren.
- *
- *   fa              cli
- *   8c c8           mov ax, cs
- *   8e d8           mov ds, ax
- *   c7 06 f0 00 45 53   mov word [0x00f0], 0x5345
- *   f4              hlt
- *   eb fd           jmp $-1
- */
-static const u8 tramp[] = {
-	0xfa,
-	0x8c, 0xc8,
-	0x8e, 0xd8,
-	0xc7, 0x06, (SIG_OFF & 0xff), (SIG_OFF >> 8), (SIG_VALUE & 0xff), (SIG_VALUE >> 8),
-	0xf4,
-	0xeb, 0xfd,
-};
+/* Das Trampolin liegt in `tramp.S` — lesbarer Assembler statt eines Opcode-Blobs. */
+extern const u8 sel4lake_t16_start[], sel4lake_t16_end[], sel4lake_t16_target[];
+extern const u8 sel4lake_t64_start[], sel4lake_t64_end[], sel4lake_t64_sig[];
 
 static struct page *low_page;
+static struct page *pt_pages[6];	/* PML4 + PDPT + 4 PDs */
 static bool armed;
+
+/*
+ * Identitaetsabbildung der ersten 4 GiB mit 2-MiB-Seiten.
+ *
+ * Bewusst nicht mit 1-GiB-Seiten: die sind eine CPU-Faehigkeit (`PDPE1GB`), und eine ungeprueft
+ * angenommene Faehigkeit ist genau die Fehlerform, die in diesem Projekt reihenweise aufgefallen
+ * ist. 2-MiB-Seiten kann jede Long-Mode-faehige CPU. Sechs Seiten Tabellen sind der Preis.
+ *
+ * Die Tabellen duerfen ueberall liegen — nur das Trampolin muss unter 1 MiB liegen, weil der
+ * SIPI-Vektor eine Seitennummer ist.
+ */
+static u64 build_identity_tables(void)
+{
+	u64 *pml4, *pdpt, *pd;
+	int i, j;
+
+	for (i = 0; i < ARRAY_SIZE(pt_pages); i++) {
+		pt_pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		if (!pt_pages[i])
+			return 0;
+	}
+	pml4 = page_address(pt_pages[0]);
+	pdpt = page_address(pt_pages[1]);
+	pml4[0] = page_to_phys(pt_pages[1]) | 0x3;	/* present + writable */
+	for (i = 0; i < 4; i++) {
+		pd = page_address(pt_pages[2 + i]);
+		pdpt[i] = page_to_phys(pt_pages[2 + i]) | 0x3;
+		for (j = 0; j < 512; j++)
+			pd[j] = (((u64)i << 30) | ((u64)j << 21)) | 0x83; /* 2 MiB, present+rw */
+	}
+	return page_to_phys(pt_pages[0]);
+}
+
+static void free_identity_tables(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(pt_pages); i++)
+		if (pt_pages[i])
+			__free_page(pt_pages[i]);
+}
+
+/* GDT mit einem 64-Bit-Codesegment (Selektor 0x10) und einem Datensegment. */
+static void build_gdt(void *page, phys_addr_t pa)
+{
+	u64 *gdt = (u64 *)((u8 *)page + OFF_GDT);
+	struct __packed { u16 limit; u32 base; } *gdtr = (void *)((u8 *)page + OFF_GDTR);
+
+	gdt[0] = 0;
+	gdt[1] = 0;
+	gdt[2] = 0x00209A0000000000ULL;	/* 64-Bit-Code: P, DPL0, S, Code, L=1 */
+	gdt[3] = 0x0000920000000000ULL;	/* Daten: P, DPL0, S, RW */
+	gdtr->limit = 4 * 8 - 1;
+	gdtr->base = (u32)(pa + OFF_GDT);	/* **lineare** Basis — Paging ist noch aus */
+}
 
 /*
  * Eine Seite **unterhalb 1 MiB** besorgen.
@@ -75,12 +122,20 @@ static bool armed;
  * anfordern und behalten, was tief genug liegt — es werden ausschliesslich Seiten benutzt, die
  * der Allokator hergegeben hat, nie geraten.
  */
-static struct page *alloc_low_page(void)
+/*
+ * Der Zwischenspeicher steht `__initdata` und nicht auf dem Stack: 512 Zeiger sind 4 KiB, und
+ * ein 4-KiB-Stapelrahmen im Kernel ist eine schlechte Idee (der Compiler warnt zu Recht).
+ * Der Bereich wird nach `init` ohnehin freigegeben.
+ */
+static struct page *low_pool[512] __initdata;
+
+static struct page *__init alloc_low_page(void)
 {
-	struct page *keep = NULL, *pool[512];
+	struct page *keep = NULL;
+	struct page **pool = low_pool;
 	int n = 0, i;
 
-	for (i = 0; i < ARRAY_SIZE(pool); i++) {
+	for (i = 0; i < ARRAY_SIZE(low_pool); i++) {
 		struct page *p = alloc_pages(GFP_KERNEL | GFP_DMA, 0);
 
 		if (!p)
@@ -153,22 +208,45 @@ static int __init handover_init(void)
 		u32 apicid = cpu_physical_id(cpus[0]);
 		u16 sig;
 
+		u16 sig2;
+		u64 cr3 = build_identity_tables();
+
+		if (!cr3) {
+			pr_err("sel4lake: Seitentabellen fehlgeschlagen\n");
+			rc = -ENOMEM;
+			goto undo;
+		}
 		memset(va, 0, PAGE_SIZE);
-		memcpy(va, tramp, sizeof(tramp));
+		memcpy((u8 *)va + OFF_T16, sel4lake_t16_start,
+		       sel4lake_t16_end - sel4lake_t16_start);
+		memcpy((u8 *)va + OFF_T64, sel4lake_t64_start,
+		       sel4lake_t64_end - sel4lake_t64_start);
+		build_gdt(va, pa);
+		*(u32 *)((u8 *)va + OFF_CR3) = (u32)cr3;
+		/* Die zwei Werte, die erst zur Laufzeit feststehen (s. `tramp.S`). */
+		*(u32 *)((u8 *)va + OFF_T16 + (sel4lake_t16_target - sel4lake_t16_start)) =
+			(u32)(pa + OFF_T64);
+		*(u64 *)((u8 *)va + OFF_T64 + (sel4lake_t64_sig - sel4lake_t64_start)) =
+			(u64)(pa + SIG2_OFF);
 		wmb();
-		pr_info("sel4lake: Trampolin @ phys %pa, SIPI-Vektor 0x%02llx, Ziel-APIC-ID %u\n",
-			&pa, (u64)(pa >> 12), apicid);
+		pr_info("sel4lake: Trampolin @ phys %pa, SIPI-Vektor 0x%02llx, CR3 0x%llx, Ziel-APIC-ID %u\n",
+			&pa, (u64)(pa >> 12), cr3, apicid);
 
 		send_init_sipi(apicid, (u8)(pa >> 12));
 		mdelay(50);
 		sig = *(volatile u16 *)((u8 *)va + SIG_OFF);
-		if (sig == SIG_VALUE) {
-			pr_info("sel4lake: STUFE 1a BESTANDEN — der Kern hat unseren Code ausgefuehrt (Signatur 0x%04x)\n",
-				sig);
-			armed = true;
-		} else {
-			pr_err("sel4lake: STUFE 1a FEHLGESCHLAGEN — Signatur 0x%04x (erwartet 0x%04x)\n",
+		sig2 = *(volatile u16 *)((u8 *)va + SIG2_OFF);
+		if (sig != SIG_VALUE) {
+			pr_err("sel4lake: STUFE 1a FEHLGESCHLAGEN — Real-Mode-Signatur 0x%04x (erwartet 0x%04x)\n",
 			       sig, SIG_VALUE);
+		} else if (sig2 != SIG2_VALUE) {
+			armed = true;	/* der Kern laeuft — nur der Uebergang misslang */
+			pr_err("sel4lake: STUFE 1b FEHLGESCHLAGEN — Real Mode erreicht, Long Mode nicht (0x%04x)\n",
+			       sig2);
+		} else {
+			pr_info("sel4lake: STUFE 1b BESTANDEN — der Kern laeuft im LONG MODE mit eigener GDT und eigenem CR3 (0x%04x/0x%04x)\n",
+				sig, sig2);
+			armed = true;
 		}
 	}
 	return 0;
@@ -203,6 +281,7 @@ static void __exit handover_exit(void)
 	}
 	if (low_page)
 		__free_pages(low_page, 0);
+	free_identity_tables();
 }
 
 module_init(handover_init);

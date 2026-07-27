@@ -209,6 +209,33 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       Ebenfalls erledigt: undeklarierte Geräte-Adressbreiten werden geführt und protokolliert
       statt stillschweigend als 64 Bit angenommen.
 
+- [ ] **Kern-Uebergabe an SEL4Lake (Variante B) — Stufe 2.** Stufe 0/1a/1b sind belegt:
+      `tools/handover/` nimmt fuenf E-Cores offline, schickt ihnen INIT-SIPI-SIPI in ein
+      Trampolin und bringt sie in den Long Mode mit eigener GDT, eigenen Seitentabellen und
+      eigenem CR3 — wiederholbar, ohne Reboot, `rmmod` gibt alles zurueck.
+      Erledigt auf der Kernel-Seite:
+      * **x2APIC** (MSR-Pfad). Entscheidung fuer maximale Leistung *und* weil xAPIC nur 255
+        Kerne adressieren kann. Zweistufiger Uebergang aus -> xAPIC -> x2APIC.
+      * **Speicher als Bereichsliste** (`init_mem_regions`), im QEMU-Lauf immer zerstueckelt
+        gefahren.
+      * **`HandoverInfo`** als gemeinsame Struktur beider Startwege, vom Multiboot-Pfad
+        mitbenutzt und mitgeprueft.
+      Offen, in dieser Reihenfolge:
+      1. **Bild-Platzierung ohne Relokation.** Der Kernel ist auf 1 MiB gelinkt, und dort liegt
+         Linux. Statt ihn positionsunabhaengig zu machen: das Modul legt das Bild in einen
+         4-MiB-Block (`alloc_pages(order=10)` — genau die Buddy-Obergrenze, das Bild ist 3,1 MB)
+         und bildet in **seinen** Seitentabellen VA 1 MiB auf diese PA ab. `mmu::init_primary`
+         muss die Abbildung dann uebernehmen statt reiner Identitaet — ein Versatz aus der
+         `HandoverInfo`, keine Relokation.
+      2. **Konsole als Ring** statt UART: die serielle Schnittstelle gehoert dem Wirt, zwei
+         Schreiber ergeben verschachtelte Zeilen. Ring in der `HandoverInfo`, vom Modul ueber
+         debugfs lesbar.
+      3. **Was auf uebergebenen Kernen ausbleiben muss:** VT-d (Linux besitzt die Einheiten fuer
+         Interrupt-Remapping — `GCMD.TE` toetet jeden Linux-DMA) und `intc::init_dist()` (legt
+         den 8259 still, der ist global).
+      4. **ELF-Laden im Modul** und der Sprung ins Bild.
+      Wenn ein uebernommener Kern echten Kernel-Code faehrt, ist `release=1` beim Entladen nicht
+      mehr selbstverstaendlich — dann `release=0` und Reboot.
 - [ ] **VT-d-Zuteilung (Punkt 6)** — Abnahmekriterium **vorab**: nicht „neue x86-Tests grün",
       sondern **`dmaalign`/`dmawin`/`dmagen`/`dmatok`/Audit 4–7/Negativtest hören auf zu
       skippen** — ohne x86-Sonderpfade in den Tests. Ein separater `vtdtest` wäre das

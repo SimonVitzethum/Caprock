@@ -164,6 +164,51 @@ extern "C" fn ring3_intruder(_arg: usize) -> ! {
     loop {}
 }
 
+// --- Isolierte Adressräume (ext-33) ---------------------------------------------------------
+//
+// Eine **isolierte** PD bekommt einen eigenen Adressraum, in dem NUR ihre eigene Region
+// user-zugänglich ist. Der Test ist derselbe wie auf aarch64 (`vspace`): zwei Ring-3-Threads
+// lesen **dieselbe** Adresse in fremdem RAM — der SAS-Thread darf (gemeinsamer Adressraum),
+// der isolierte muss faulten.
+/// Prüfadresse in fremdem User-RAM (wird vom Kernel beschrieben, s. `spawn_demo`).
+#[link_section = ".user_data"]
+static ISO_PROBE_ADDR: AtomicU64 = AtomicU64::new(0);
+/// Der SAS-Thread konnte lesen (und meldet den Wert).
+#[link_section = ".user_data"]
+static SAS_READ_OK: AtomicU64 = AtomicU64::new(0);
+/// Erwarteter Wert an der Prüfadresse.
+const PROBE_MAGIC: u64 = 0x5E14_1A4E_0BED_C0DE;
+
+/// SAS-Ring-3-Thread: liest die Prüfadresse — im gemeinsamen Adressraum ist das erlaubt.
+#[link_section = ".user_text"]
+extern "C" fn sas_probe(_arg: usize) -> ! {
+    let a = ISO_PROBE_ADDR.load(Ordering::Relaxed);
+    // SAFETY: `a` zeigt auf eine vom Kernel angelegte, im SAS-Modell user-lesbare RAM-Zelle.
+    let v = unsafe { core::ptr::read_volatile(a as *const u64) };
+    SAS_READ_OK.store(v, Ordering::Relaxed);
+    loop {
+        // SAFETY: freigegebener Syscall-Vektor (s. `ring3_worker`).
+        unsafe {
+            core::arch::asm!("int 0x80", in("rax") 0u64, in("rdi") 0u64,
+                             lateout("rax") _, lateout("rdi") _, clobber_abi("sysv64"));
+        }
+    }
+}
+
+/// Isolierter Ring-3-Thread: liest **dieselbe** Adresse. In seinem eigenen Adressraum ist sie
+/// nicht user-gemappt -> #PF -> der Kernel beendet ihn.
+#[link_section = ".user_text"]
+extern "C" fn iso_probe(_arg: usize) -> ! {
+    let a = ISO_PROBE_ADDR.load(Ordering::Relaxed);
+    // SAFETY(-Absicht): Genau dieser Zugriff SOLL fehlschlagen — er liegt außerhalb der Region
+    // dieser PD und ist in ihrem Adressraum nicht user-zugänglich.
+    unsafe {
+        let v = core::ptr::read_volatile(a as *const u64);
+        core::ptr::write_volatile(a as *mut u64, v); // nie erreicht
+    }
+    loop {}
+}
+
 /// Stackgröße je Sekundärkern (aus dem RAM belegt, wie auf aarch64 seit ext-30).
 const AP_STACK_BYTES: u64 = 64 * 1024;
 
@@ -204,6 +249,21 @@ fn spawn_demo() -> bool {
         return false;
     }
 
+    // Isolierter Adressraum vs. SAS: beide lesen dieselbe fremde Adresse.
+    let Some(probe) = system::alloc(4096, 4096) else {
+        return false;
+    };
+    // SAFETY: frisch allozierte, identity-gemappte RAM-Seite des Kernels.
+    unsafe { core::ptr::write_volatile(probe.base() as *mut u64, PROBE_MAGIC) };
+    ISO_PROBE_ADDR.store(probe.base(), Ordering::Relaxed);
+    if system::spawn_user(sas_probe as *const () as usize, 0, system::IDLE_PRIO).is_none() {
+        return false;
+    }
+    if system::spawn_isolated(iso_probe as *const () as usize, 0, system::IDLE_PRIO).is_none() {
+        println!("iso     : spawn_isolated fehlgeschlagen");
+        return false;
+    }
+
     // Cap-gesichertes IPC: ein Endpoint, zwei PDs. Der Server hält die RECV-, der Client die
     // SEND-Cap — ohne Cap ist der Endpoint für beide unsichtbar (das ist die Autoritätsregel).
     let Some(ep) = system::create_endpoint() else {
@@ -241,7 +301,8 @@ fn all_done() -> bool {
     let workers = (0..NWORKERS).all(|i| WORKER_ROUNDS[i].load(Ordering::Relaxed) >= WORK_TARGET);
     let cores = (0..system::num_cores()).all(|c| hal::timer::ticks(c) > 0);
     let ring3 = USER_SYSCALLS.load(Ordering::Relaxed) > 0 && system::el0_fault_count() > 0;
-    workers && IPC_DONE.load(Ordering::Acquire) && cores && ring3
+    let iso = SAS_READ_OK.load(Ordering::Relaxed) == PROBE_MAGIC && system::iso_fault_count() > 0;
+    workers && IPC_DONE.load(Ordering::Acquire) && cores && ring3 && iso
 }
 
 /// Bericht + Abschaltung (das Testskript wertet die Marker aus).
@@ -271,6 +332,17 @@ fn report_and_off() -> ! {
     println!(
         "ring3   : {} (Ring-3-Thread laeuft + syscallt; Zugriff auf Kernel-Speicher faultet, Thread beendet, Kernel laeuft weiter)",
         if ring3_ok { "ALL PASS" } else { "FAILURES" }
+    );
+
+    let sas = SAS_READ_OK.load(Ordering::Relaxed);
+    let isof = system::iso_fault_count();
+    println!(
+        "iso     : SAS-Thread las {sas:#x} (erwartet {PROBE_MAGIC:#x}); isolierter Thread faultete {isof}x an derselben Adresse"
+    );
+    let iso_ok = sas == PROBE_MAGIC && isof > 0;
+    println!(
+        "iso     : {} (eigener Adressraum je PD: dieselbe Adresse ist fuer SAS lesbar, fuer die isolierte PD nicht)",
+        if iso_ok { "ALL PASS" } else { "FAILURES" }
     );
 
     let sa = system::sched_audit_all();

@@ -131,8 +131,11 @@ dasselbe cap-gesicherte IPC — ohne ein einziges `cfg(target_arch)` im Kern. De
 - [x] **Ring 3**: User-Threads laufen (Syscall per `int 0x80`, Fault auf Kernel-Speicher beendet
       den Thread) — im **SAS-Modell**, wie trusted PDs auf aarch64. Nötig dafür: `US` auf allen
       vier Paging-Ebenen, `TSS.RSP0` je Thread, eigene `.user_text`/`.user_data`-Sektionen
-- [ ] **Per-Prozess-Adressräume**: PCID-Verwaltung + per-VSpace-Tabellenpool (`vspace_*` melden
-      weiterhin `false`) → **isolierte** PDs (jede mit eigenem Adressraum) fehlen auf x86 noch
+- [x] **Per-Prozess-Adressräume**: `vspace_*` vollständig implementiert (PML4→PDPT→PD, geteilte
+      Kernel-PTs, supervisor-only Grundfläche + „hineingestanzte" User-Blöcke). Isolierte PDs
+      laufen; Test `iso` zeigt: dieselbe Adresse ist für die SAS-PD lesbar, für die isolierte nicht
+- [ ] **PCID** als Optimierung: der Adressraumwechsel flusht derzeit den ganzen TLB (die ASID ist
+      eine reine Software-Kennung). Mit `CR4.PCIDE` + getaggten Einträgen entfiele das
 - [ ] **IOMMU**: VT-d/AMD-Vi statt SMMUv3 (derzeit `NullIommuEnforcer`, ohne HW-Durchsetzung)
 - [~] **PCI-ECAM**: das Fenster wird aus der ACPI-**MCFG** gelesen und gemeldet; die
       **Enumeration** darüber fehlt noch (der Kernel-PCIe-Pfad ist an das ARM-`virt`-Board gebunden)

@@ -103,6 +103,12 @@ static mut PDPT: Table = Table::EMPTY;
 static mut PD: [Table; MAPPED_GIB] = [const { Table::EMPTY }; MAPPED_GIB];
 static mut PT: [Table; FINE_BLOCKS] = [const { Table::EMPTY }; FINE_BLOCKS];
 
+/// Seitenverzeichnisse für GiB 1..3 in der **isolierten** Sicht: identisch zur globalen Map,
+/// aber **ohne** `US` — der Kernel sieht dort alles, ein Ring-3-Thread einer isolierten PD
+/// nichts. Sie sind statisch und werden von **allen** isolierten Adressräumen geteilt (sie
+/// enthalten keine PD-spezifischen Einträge), sparen also je Adressraum drei Frames.
+static mut ISO_PD_HIGH: [Table; MAPPED_GIB - 1] = [const { Table::EMPTY }; MAPPED_GIB - 1];
+
 extern "C" {
     static __text_start: u8;
     static __text_end: u8;
@@ -221,6 +227,19 @@ pub fn init_primary() {
                 pd[g].0[i] = pa | bits;
             }
         }
+        // Isolierte Sicht auf GiB 1..3: dieselben Blöcke, aber ohne `US`.
+        let iso = &mut *core::ptr::addr_of_mut!(ISO_PD_HIGH);
+        for (k, table) in iso.iter_mut().enumerate() {
+            let g = (k + 1) as u64;
+            for (i, e) in table.0.iter_mut().enumerate() {
+                let pa = g * ONE_GIB + (i as u64) * TWO_MIB;
+                let mut bits = P | RW | NX | PS; // kein US -> nur der Kernel sieht es
+                if is_device(pa) {
+                    bits |= PCD | PWT;
+                }
+                *e = pa | bits;
+            }
+        }
         activate(pml4 as *const Table as u64);
     }
 }
@@ -310,12 +329,15 @@ pub fn set_user_vspace(root: u64, _asid: u16) {
     }
 }
 
-/// Größte nutzbare Adressraum-Kennung (aarch64: ASID; x86: PCID).
+/// Größte nutzbare Adressraum-Kennung.
 ///
-/// `0` bedeutet „keine getaggten Adressräume" — der Kernel legt dann keine isolierten PDs an
-/// (die `vspace_*`-Funktionen sind auf x86 noch nicht portiert).
+/// Auf ARM ist die ASID ein **Hardware-Tag** im TLB: ein Adressraumwechsel muss nicht flushen,
+/// und eine zu große ASID würde auf eine andere aliasen (Isolationsbruch). Auf x86 gäbe es
+/// dafür PCIDs; hier ist die Kennung vorerst eine reine **Software**-Nummer des Kernels, und
+/// jeder `CR3`-Wechsel flusht den TLB ohnehin vollständig. Damit kann sie nicht aliasen — die
+/// Obergrenze ist reine Buchhaltung. (PCID nachzurüsten ist eine reine Optimierung, s. todo.md.)
 pub fn max_asid() -> u16 {
-    0
+    u16::MAX
 }
 
 /// TLB-Einträge eines Adressraums verwerfen (aarch64: `tlbi aside1is`).
@@ -352,67 +374,310 @@ pub fn dma_cache_invalidate(_va: u64, _len: u64) {
     cpu::dsb_sy();
 }
 
-// --- Per-Prozess-Adressräume (noch nicht portiert) ---------------------------------------------
+// --- Per-Prozess-Adressräume (ext-33) ---------------------------------------------------------
 //
-// Diese Funktionen melden ehrlich „nicht unterstützt", statt etwas Halbes zu tun. Der Kernel
-// wertet die Rückgabe aus und legt auf x86 keine isolierten PDs an. Der fehlende Teil ist
-// nicht die Mechanik (die Tabellen oben zeigen sie), sondern die Verwaltung: PCID-Vergabe,
-// per-VSpace-Tabellenpool und der Teardown-Pfad.
+// Ein **isolierter** Adressraum entsteht aus zwei vom Kernel gelieferten Frames plus einem, den
+// die HAL selbst anfordert. Der Aufbau spiegelt exakt das ARM-Modell: **der Kernel sieht alles,
+// der User nichts** — und in diese Grundfläche werden die Frames der PD als User-Seiten
+// „hineingestanzt".
+//
+// ```text
+//   PML4 (l1) ──[0]──> PDPT (alloc) ──[0]──> PD (l2)   GiB 0: Kernel-Image (geteilte PTs)
+//                                    │                        + RAM supervisor-only
+//                                    │                        + User-Blöcke der PD (US)
+//                                    └─[1..3]─> ISO_PD_HIGH   GiB 1..3 supervisor-only (statisch)
+//  ```
+//
+// Die ersten 16 MiB zeigen auf **dieselben** PTs wie die globale Map: dort liegen Kernel-Code
+// (supervisor) und `.user_text`/`.user_data` (US) — genau wie auf ARM die geteilte Kernel-L3.
 
-/// Nicht portiert (s. o.) — meldet „keine Verletzung" für Audits.
-pub fn vspace_wx_ok(_l2_phys: u64) -> u32 {
-    0
+/// Tabelleneintrag, der auf eine tiefere Ebene zeigt. Zwischenebenen sind **permissiv**
+/// (`US|RW`); die Entscheidung fällt am Blatt (s. `init_primary`).
+const fn table_desc(phys: u64) -> u64 {
+    phys | P | RW | US
 }
-/// Nicht portiert (s. o.).
-pub fn vspace_create_base(_l1_phys: u64, _l2_phys: u64) {}
-/// Nicht portiert (s. o.).
-pub fn vspace_map_block(_l2_phys: u64, _phys: u64) -> bool {
-    false
+
+/// 2-MiB-Block, den **nur der Kernel** sieht (ARM: `kernel_block`).
+const fn kernel_block(pa: u64) -> u64 {
+    pa | P | RW | NX | PS
 }
-/// Nicht portiert (s. o.).
-pub fn vspace_map_code_block(_l2_phys: u64, _phys: u64) -> bool {
-    false
+
+/// 2-MiB-Block als **User-RW** (ARM: `user_block`).
+const fn user_block(pa: u64) -> u64 {
+    pa | P | RW | US | NX | PS
 }
-/// Nicht portiert (s. o.).
-pub fn vspace_unmap_block(_l2_phys: u64, _phys: u64) -> bool {
-    false
+
+/// 2-MiB-Block als **User-RX** (privat geladener Code, W^X).
+const fn user_code_block(pa: u64) -> u64 {
+    pa | P | US | PS
 }
-/// Nicht portiert (s. o.).
+
+/// Eine Tabelle als Slice über ihre physische (identity-gemappte) Adresse.
+///
+/// # Safety
+/// `phys` muss auf eine gültige, 4-KiB-ausgerichtete Seitentabelle zeigen, die in der aktuell
+/// aktiven Map beschreibbar ist (der Aufrufer läuft in der globalen Identity-Map).
+unsafe fn table_mut(phys: u64) -> &'static mut [u64] {
+    unsafe { core::slice::from_raw_parts_mut(phys as *mut u64, 512) }
+}
+
+/// Index des 2-MiB-Blocks für `phys` innerhalb von GiB 0 (dort liegen die User-Regionen).
+/// `None`, wenn `phys` außerhalb von `[USER_RAM_MIN, GIB1_END)` oder unausgerichtet ist.
+fn pd_block_index(phys: u64) -> Option<usize> {
+    if phys < USER_RAM_MIN || phys >= GIB1_END || phys % TWO_MIB != 0 {
+        return None;
+    }
+    Some((phys / TWO_MIB) as usize)
+}
+
+/// **Grundgerüst eines isolierten Adressraums** anlegen (ARM: `vspace_create_base`).
+///
+/// `l1_phys` wird die PML4, `l2_phys` das Seitenverzeichnis für GiB 0; die PDPT dazwischen
+/// kommt aus `alloc` (x86 hat eine Ebene mehr als ARM). Gibt `false`, wenn `alloc` nichts
+/// liefert — dann wurde **nichts** verändert.
+pub fn vspace_create_base(
+    l1_phys: u64,
+    l2_phys: u64,
+    alloc: &mut dyn FnMut() -> Option<u64>,
+) -> bool {
+    let Some(pdpt_phys) = alloc() else {
+        return false;
+    };
+    // SAFETY: frisch allozierte, 4-KiB-ausgerichtete RAM-Frames; der Aufrufer läuft in der
+    // globalen Identity-Map, in der sie beschreibbar sind. Genau drei Tabellen werden gefüllt.
+    unsafe {
+        let pd = table_mut(l2_phys);
+        let global_pt = &*core::ptr::addr_of!(PT);
+        for (i, e) in pd.iter_mut().enumerate() {
+            *e = if i < FINE_BLOCKS {
+                // Kernel-Image + `.user_text`/`.user_data`: dieselben PTs wie global (geteilt).
+                table_desc(&global_pt[i] as *const Table as u64)
+            } else {
+                kernel_block((i as u64) * TWO_MIB) // RAM: nur der Kernel
+            };
+        }
+        let pdpt = table_mut(pdpt_phys);
+        let iso_high = &*core::ptr::addr_of!(ISO_PD_HIGH);
+        for (g, e) in pdpt.iter_mut().enumerate() {
+            *e = match g {
+                0 => table_desc(l2_phys),
+                1..=3 => table_desc(&iso_high[g - 1] as *const Table as u64),
+                _ => 0, // oberhalb der abgebildeten 4 GiB: nichts
+            };
+        }
+        let pml4 = table_mut(l1_phys);
+        for e in pml4.iter_mut() {
+            *e = 0;
+        }
+        pml4[0] = table_desc(pdpt_phys);
+    }
+    cpu::dsb_sy();
+    true
+}
+
+/// Einen 2-MiB-Frame als **User-RW** in den Adressraum mit Seitenverzeichnis `l2_phys` mappen.
+pub fn vspace_map_block(l2_phys: u64, phys: u64) -> bool {
+    let Some(idx) = pd_block_index(phys) else {
+        return false;
+    };
+    // SAFETY: gültiges, in der globalen Map beschreibbares Seitenverzeichnis.
+    unsafe { table_mut(l2_phys)[idx] = user_block(phys) };
+    cpu::dsb_sy();
+    true
+}
+
+/// Wie [`vspace_map_block`], aber als **User-RX** (privat geladener Code, W^X).
+pub fn vspace_map_code_block(l2_phys: u64, phys: u64) -> bool {
+    let Some(idx) = pd_block_index(phys) else {
+        return false;
+    };
+    // SAFETY: wie `vspace_map_block`.
+    unsafe { table_mut(l2_phys)[idx] = user_code_block(phys) };
+    cpu::dsb_sy();
+    true
+}
+
+/// Einen Block wieder auf **supervisor-only** zurücksetzen (der User kommt nicht mehr heran).
+pub fn vspace_unmap_block(l2_phys: u64, phys: u64) -> bool {
+    let Some(idx) = pd_block_index(phys) else {
+        return false;
+    };
+    // SAFETY: wie `vspace_map_block`.
+    unsafe { table_mut(l2_phys)[idx] = kernel_block(phys) };
+    cpu::dsb_sy();
+    true
+}
+
+/// Blatt-Bits für eine 4-KiB-User-Seite.
+const fn user_page(pa: u64, perm: UserPerm) -> u64 {
+    match perm {
+        UserPerm::Ro => pa | P | US | NX,
+        UserPerm::Rw => pa | P | RW | US | NX,
+        UserPerm::Rx => pa | P | US, // ausführbar, nicht schreibbar (W^X)
+    }
+}
+
+/// Die Seitentabelle für den 2-MiB-Block `idx` beschaffen: existiert dort noch ein Block,
+/// wird er in eine Tabelle **aufgeteilt** (alle Seiten zunächst supervisor-only, damit sich
+/// die Sicht des Kernels nicht ändert). `None`, wenn kein Frame verfügbar ist.
+unsafe fn pt_for(pd: &mut [u64], idx: usize, alloc: &mut dyn FnMut() -> Option<u64>) -> Option<u64> {
+    let e = pd[idx];
+    if e & PS == 0 && e & P != 0 {
+        return Some(e & 0x000f_ffff_ffff_f000); // schon eine Tabelle
+    }
+    let pt_phys = alloc()?;
+    // SAFETY: frisch alloziertes, identity-gemapptes Frame.
+    let pt = unsafe { table_mut(pt_phys) };
+    let base = (idx as u64) * TWO_MIB;
+    for (i, slot) in pt.iter_mut().enumerate() {
+        *slot = (base + (i as u64) * PAGE) | P | RW | NX; // supervisor, wie vorher der Block
+    }
+    pd[idx] = table_desc(pt_phys);
+    Some(pt_phys)
+}
+
+/// Einen 4-KiB-Frame identity als User-Seite mappen (feingranular, ARM: `vspace_map_page`).
 pub fn vspace_map_page(
-    _l2_phys: u64,
-    _phys: u64,
-    _perm: UserPerm,
-    _alloc: &mut dyn FnMut() -> Option<u64>,
+    l2_phys: u64,
+    phys: u64,
+    perm: UserPerm,
+    alloc: &mut dyn FnMut() -> Option<u64>,
 ) -> bool {
-    false
+    vspace_map_page_at(l2_phys, phys, phys, perm, alloc)
 }
-/// Nicht portiert (s. o.).
+
+/// Wie [`vspace_map_page`], aber an einer **wählbaren** virtuellen Adresse.
 pub fn vspace_map_page_at(
-    _l2_phys: u64,
-    _va: u64,
-    _phys: u64,
-    _perm: UserPerm,
-    _alloc: &mut dyn FnMut() -> Option<u64>,
+    l2_phys: u64,
+    va: u64,
+    phys: u64,
+    perm: UserPerm,
+    alloc: &mut dyn FnMut() -> Option<u64>,
 ) -> bool {
-    false
+    if va % PAGE != 0 || phys % PAGE != 0 || va >= GIB1_END {
+        return false;
+    }
+    let idx = (va / TWO_MIB) as usize;
+    if idx < FINE_BLOCKS {
+        return false; // Kernel-Image-Bereich wird nicht überschrieben
+    }
+    // SAFETY: gültiges, beschreibbares Seitenverzeichnis; `pt_for` liefert eine gültige Tabelle.
+    unsafe {
+        let pd = table_mut(l2_phys);
+        let Some(pt_phys) = pt_for(pd, idx, alloc) else {
+            return false;
+        };
+        let pt = table_mut(pt_phys);
+        pt[((va % TWO_MIB) / PAGE) as usize] = user_page(phys, perm);
+    }
+    cpu::dsb_sy();
+    true
 }
-/// Nicht portiert (s. o.).
-pub fn vspace_unmap_page(_l2_phys: u64, _phys: u64) -> bool {
-    false
+
+/// Eine zuvor gemappte User-Seite wieder auf supervisor-only zurücksetzen.
+pub fn vspace_unmap_page(l2_phys: u64, phys: u64) -> bool {
+    if phys % PAGE != 0 || phys >= GIB1_END {
+        return false;
+    }
+    let idx = (phys / TWO_MIB) as usize;
+    // SAFETY: gültiges, beschreibbares Seitenverzeichnis.
+    unsafe {
+        let pd = table_mut(l2_phys);
+        let e = pd[idx];
+        if e & P == 0 || e & PS != 0 {
+            return false; // kein feingranularer Block -> nichts zu entfernen
+        }
+        let pt = table_mut(e & 0x000f_ffff_ffff_f000);
+        let slot = ((phys % TWO_MIB) / PAGE) as usize;
+        pt[slot] = phys | P | RW | NX; // wieder supervisor-only
+    }
+    cpu::dsb_sy();
+    true
 }
-/// Nicht portiert (s. o.).
+
+/// DMA-Puffer in einen isolierten Adressraum mappen (User-RW; `coherent` steuert die
+/// Cache-Attribute — auf x86 ist DMA hardware-kohärent, nicht-kohärente Puffer werden
+/// dennoch uncacheable gemappt, damit die Semantik dieselbe bleibt wie auf ARM).
 pub fn vspace_map_dma(
-    _l2_phys: u64,
-    _phys: u64,
-    _len: u64,
-    _coherent: bool,
-    _alloc: &mut dyn FnMut() -> Option<u64>,
+    l2_phys: u64,
+    phys: u64,
+    len: u64,
+    coherent: bool,
+    alloc: &mut dyn FnMut() -> Option<u64>,
 ) -> bool {
-    false
+    if len == 0 || len % PAGE != 0 {
+        return false;
+    }
+    let mut off = 0;
+    while off < len {
+        if !vspace_map_page(l2_phys, phys + off, UserPerm::Rw, alloc) {
+            return false;
+        }
+        if !coherent {
+            // Blatt nachträglich auf uncacheable stellen.
+            let va = phys + off;
+            let idx = (va / TWO_MIB) as usize;
+            // SAFETY: die Seite wurde eben gemappt, die Tabellen sind gültig.
+            unsafe {
+                let pd = table_mut(l2_phys);
+                let pt = table_mut(pd[idx] & 0x000f_ffff_ffff_f000);
+                let slot = ((va % TWO_MIB) / PAGE) as usize;
+                pt[slot] |= PCD | PWT;
+            }
+        }
+        off += PAGE;
+    }
+    cpu::dsb_sy();
+    true
 }
-/// Nicht portiert (s. o.).
-pub fn vspace_collect_l3s(_l2_phys: u64, _free_l3: &mut dyn FnMut(u64)) {}
-/// Nicht portiert (s. o.).
+
+/// **W^X-Audit** eines isolierten Adressraums: `0` = keine Verletzung, sonst die Anzahl der
+/// Einträge, die zugleich für den User schreibbar **und** ausführbar sind.
+pub fn vspace_wx_ok(l2_phys: u64) -> u32 {
+    let mut bad = 0;
+    // SAFETY: gültiges, in der globalen Map lesbares Seitenverzeichnis.
+    unsafe {
+        let pd = table_mut(l2_phys);
+        for (i, &e) in pd.iter().enumerate() {
+            if e & P == 0 {
+                continue;
+            }
+            if e & PS != 0 {
+                if e & US != 0 && e & RW != 0 && e & NX == 0 {
+                    bad += 1;
+                }
+            } else if i >= FINE_BLOCKS {
+                // Nur selbst angelegte Tabellen prüfen (die ersten sind die geteilten Kernel-PTs).
+                let pt = table_mut(e & 0x000f_ffff_ffff_f000);
+                for &p in pt.iter() {
+                    if p & P != 0 && p & US != 0 && p & RW != 0 && p & NX == 0 {
+                        bad += 1;
+                    }
+                }
+            }
+        }
+    }
+    bad
+}
+
+/// Die **selbst angelegten** Seitentabellen eines Adressraums einsammeln (Teardown).
+/// Die geteilten Kernel-PTs der ersten 16 MiB bleiben unangetastet.
+pub fn vspace_collect_l3s(l2_phys: u64, free_l3: &mut dyn FnMut(u64)) {
+    // SAFETY: gültiges, lesbares Seitenverzeichnis.
+    unsafe {
+        let pd = table_mut(l2_phys);
+        for (i, e) in pd.iter_mut().enumerate().skip(FINE_BLOCKS) {
+            if *e & P != 0 && *e & PS == 0 {
+                free_l3(*e & 0x000f_ffff_ffff_f000);
+                *e = 0;
+            }
+        }
+    }
+}
+
+/// Geräte-MMIO in einen isolierten Adressraum mappen — auf x86 liegt MMIO oberhalb von GiB 0
+/// in **geteilten**, supervisor-only Tabellen (`ISO_PD_HIGH`). Eine PD-eigene Geräteabbildung
+/// bräuchte dort eine private Tabelle; das kommt mit dem HardwareLand-Port (s. todo.md).
 pub fn vspace_map_device(
     _l1_phys: u64,
     _phys: u64,
@@ -422,12 +687,25 @@ pub fn vspace_map_device(
 ) -> bool {
     false
 }
-/// Nicht portiert (s. o.).
-pub fn vspace_collect_device_tables(_l1_phys: u64, _free: &mut dyn FnMut(u64)) {}
-/// Nicht portiert (s. o.).
+
+/// Die PDPT eines Adressraums einsammeln (x86 hat eine Ebene mehr als ARM; der Kernel ruft
+/// dies im Teardown mit der PML4 auf, s. `vspace_collect_l3s` für die unteren Ebenen).
+pub fn vspace_collect_device_tables(l1_phys: u64, free: &mut dyn FnMut(u64)) {
+    // SAFETY: gültige, lesbare PML4 des abzubauenden Adressraums.
+    unsafe {
+        let pml4 = table_mut(l1_phys);
+        if pml4[0] & P != 0 {
+            free(pml4[0] & 0x000f_ffff_ffff_f000);
+            pml4[0] = 0;
+        }
+    }
+}
+
+/// Es gibt keine PD-eigenen Gerätetabellen (s. [`vspace_map_device`]) -> nichts zu verletzen.
 pub fn vspace_device_wx_ok(_l1_phys: u64) -> bool {
     true
 }
+
 /// Geräte-Block global abbilden — auf x86 ist der gesamte MMIO-Bereich unter 4 GiB bereits
 /// uncacheable identity-abgebildet (s. `init_primary`).
 pub fn map_device_block_global(_gib: usize) -> bool {

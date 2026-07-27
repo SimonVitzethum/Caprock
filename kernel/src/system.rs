@@ -1130,7 +1130,26 @@ fn create_vspace() -> Option<(u16, u64)> {
             return None;
         }
     };
-    hal::mmu::vspace_create_base(l1.base(), l2.base()); // läuft in globaler Map
+    // Läuft in der globalen Map. Der `alloc`-Rückkanal deckt Architekturen mit einer
+    // zusätzlichen Tabellenebene ab (x86_64: PML4 -> PDPT -> PD); schlägt er fehl, werden die
+    // beiden bereits belegten Frames wieder freigegeben.
+    let mut extra: Option<u64> = None;
+    let ok = hal::mmu::vspace_create_base(l1.base(), l2.base(), &mut || {
+        let f = mem_alloc(4096, 4096)?;
+        extra = Some(f.base());
+        Some(f.base())
+    });
+    if !ok {
+        let mut mem = MEM.lock();
+        mem.free_region(PhysRegion::new(l1.base(), 4096));
+        mem.free_region(PhysRegion::new(l2.base(), 4096));
+        if let Some(e) = extra {
+            mem.free_region(PhysRegion::new(e, 4096));
+        }
+        drop(mem);
+        VSPACES.lock()[asid as usize - 1].used = false;
+        return None;
+    }
     VSPACES.lock()[asid as usize - 1] = VSpaceEnt {
         used: true,
         l1: l1.base(),

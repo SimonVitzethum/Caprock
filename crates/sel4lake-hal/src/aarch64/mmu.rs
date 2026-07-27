@@ -431,7 +431,11 @@ pub fn vspace_wx_ok(l2_phys: u64) -> u32 {
 /// **EL1-only** (Kernel sieht alles, EL0 nichts). User-Frames werden erst über
 /// [`vspace_map_block`] hinzugefügt. Der Aufrufer läuft in der globalen Map
 /// (Identity), daher sind `l1_phys`/`l2_phys` direkt beschreibbar.
-pub fn vspace_create_base(l1_phys: u64, l2_phys: u64) {
+pub fn vspace_create_base(
+    l1_phys: u64,
+    l2_phys: u64,
+    _alloc: &mut dyn FnMut() -> Option<u64>,
+) -> bool {
     // SAFETY: frisch allozierte, 4-KiB-ausgerichtete RAM-Frames, in der globalen
     // Identity-Map gültig + beschreibbar. Genau zwei Tabellen werden initialisiert.
     let l1 = unsafe { core::slice::from_raw_parts_mut(l1_phys as *mut u64, 512) };
@@ -455,6 +459,9 @@ pub fn vspace_create_base(l1_phys: u64, l2_phys: u64) {
         *slot = kernel_block(i as u64 * ONE_GIB);
     }
     cpu::dsb_sy();
+    // ARM kommt mit den beiden gelieferten Frames aus (drei Ebenen bei 39-Bit-VA); der
+    // `alloc`-Rückkanal existiert für x86, das eine Ebene mehr hat (PML4 -> PDPT -> PD).
+    true
 }
 
 /// Index eines 2-MiB-Blocks in der GiB-1-L2 für die physische Adresse `phys`.

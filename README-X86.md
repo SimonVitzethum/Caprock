@@ -42,7 +42,8 @@ Mode die aktive Identity-Map nicht löscht; PML4/PDPT werden im 32-bit-Trampolin
 | **4** | **Kernel-Kern läuft**: HAL architekturselektiv, Selbsttests + Scheduler + cap-gesicherte IPC | ✅ QEMU-verifiziert |
 | **4b** | **SMP** (INIT-SIPI-SIPI), ACPI-MADT/MCFG, Multiboot-Speicherplan | ✅ QEMU-verifiziert (4 Kerne) |
 | **4c** | **Ring 3**: User-Threads mit Syscall + Fault-Isolation (SAS-Modell) | ✅ QEMU-verifiziert |
-| 5 | Per-Prozess-Adressräume (PCID), PCI-Enumeration, IOMMU | offen (s. `todo.md` C6) |
+| **5** | **Per-Prozess-Adressräume**: isolierte PDs mit eigenem Adressraum | ✅ QEMU-verifiziert |
+| 6 | PCI-Enumeration, IOMMU (VT-d), PCID-Optimierung | offen (s. `todo.md` C6) |
 
 ### Stufe 4 (ext-31): der eigentliche Microkernel
 
@@ -118,6 +119,28 @@ Drei Dinge waren dafür nötig:
 - **Ring-3-Code + -Daten in eigenen Sektionen** (`.user_text`/`.user_data`), weil der
   Kernel-`.text` supervisor-only bleibt. Ein Ring-3-Thread kann deshalb keine Kernel-Funktion
   aufrufen — sein Syscall ist direkt eingebettet, wie bei den EL0-Demos auf aarch64.
+
+### Stufe 5 (ext-33): Per-Prozess-Adressräume
+
+```
+iso     : SAS-Thread las 0x5e141a4e0bedc0de; isolierter Thread faultete an DERSELBEN Adresse
+```
+
+Aufbau eines isolierten Adressraums — dasselbe Modell wie auf ARM (**der Kernel sieht alles,
+der User nichts**, und in diese Grundfläche werden die Frames der PD „hineingestanzt"), nur mit
+einer Ebene mehr:
+
+```
+  PML4 (l1) ──[0]──> PDPT ──[0]──> PD (l2)   GiB 0: Kernel-Image (GETEILTE PTs, wie die
+                          │                         Kernel-L3 auf ARM) + RAM supervisor-only
+                          │                         + User-Blöcke dieser PD (US)
+                          └─[1..3]─> ISO_PD_HIGH    GiB 1..3 supervisor-only (statisch, geteilt)
+```
+
+x86 hat gegenüber ARM (39-Bit-VA, drei Ebenen) eine Tabellenebene mehr; `vspace_create_base`
+bekommt deshalb einen `alloc`-Rückkanal für die PDPT (auf ARM ungenutzt). Die statischen
+`ISO_PD_HIGH`-Tabellen für GiB 1..3 sparen drei Frames **je** Adressraum: sie enthalten nichts
+PD-Spezifisches, nur „RAM, aber nur für den Kernel".
 
 Was auf x86 **noch fehlt** (ehrlich als „nicht unterstützt" gemeldet, nicht halb umgesetzt):
 

@@ -500,6 +500,51 @@ pub fn run(multiboot_info: u64) -> ! {
     }
     system::init_core();
 
+    // --- Zyklenzaehler (Stufe 1) ---
+    //
+    // Das Primitiv, das sowohl die per-Thread-Abrechnung als auch die Messung kritischer
+    // Sektionen braucht. Geprueft wird hier nur, was ohne weitere Infrastruktur pruefbar ist:
+    // dass der Zaehler laeuft, monoton ist, plausibel kalibriert und -- getrennt davon -- ob er
+    // invariant ist. Der letzte Punkt ist keine Kosmetik: ein nicht-invarianter TSC aendert
+    // seine Rate mit dem P-State, und Zeitdifferenzen waeren dann keine Zeit, sondern eine
+    // Funktion des Taktverhaltens. Das sieht im Messlauf plausibel aus.
+    {
+        let inv = hal::timer::invariant_tsc();
+        let hz = hal::timer::cycles_per_sec();
+        let c0 = hal::timer::cycles();
+        let mut spin = 0u64;
+        while hal::timer::cycles().wrapping_sub(c0) < hz / 1000 {
+            spin += 1; // ~1 ms
+        }
+        let c1 = hal::timer::cycles();
+        let d = c1.wrapping_sub(c0);
+        // Aufloesung: die kleinste messbare Differenz zweier aufeinanderfolgender Stempel.
+        let a = hal::timer::cycles();
+        let b = hal::timer::cycles();
+        let grain = b.wrapping_sub(a);
+        println!(
+            "cycles  : invariant-TSC={inv} {} MHz; 1-ms-Fenster = {d} Zyklen ({spin} Iterationen); Aufloesung {grain} Zyklen (Tick-Uhr: {} Zyklen)",
+            hz / 1_000_000,
+            hz / TICK_HZ
+        );
+        // Invarianz ist **Telemetrie, keine Bestehensbedingung** -- dieselbe Mittelstellung wie
+        // bei den undeklarierten Geraete-Adressbreiten. TCG unterstuetzt `invtsc` nicht
+        // ("TCG doesn't support requested feature: CPUID[80000007h].EDX.invtsc"), die Emulation
+        // kann die Eigenschaft also gar nicht zusagen. Sie zur Bedingung zu machen hiesse
+        // entweder, den Test auf dieser Plattform dauerhaft rot zu lassen, oder die Pruefung
+        // wegzulassen -- und Letzteres waere die stillschweigende Annahme, die hier gerade
+        // vermieden wird. Gefuehrt und ausgewiesen: auf einer Plattform ohne Zusage sind
+        // Zyklenzahlen ein Anhaltspunkt, keine Abrechnungsgrundlage.
+        if !inv {
+            println!("cycles  : HINWEIS invariant-TSC nicht zugesagt -> Zyklenwerte sind hier indikativ, nicht abrechnungsfaehig");
+        }
+        let ok = hz > 1_000_000 && d >= hz / 2000 && d <= hz / 250 && grain > 0;
+        println!(
+            "cycles  : {} (serialisierender Zeitstempel: rdtscp+lfence, gegen den PIT kalibriert, auf EINEM Kern gemessen; Invarianz gefuehrt statt angenommen)",
+            if ok { "ALL PASS" } else { "FAILURES" }
+        );
+    }
+
     // --- Arch-neutrale DMA-Tests (ext-38) ---
     //
     // Dieselben Funktionen, die der ARM-Lauf ruft -- nicht nachgebaute. Bis hierher lagen sie in

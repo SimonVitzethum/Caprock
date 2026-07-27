@@ -5,7 +5,12 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-SECONDS_RUN="${1:-60}"
+SECONDS_RUN="${1:-90}"
+# RAM-Groesse ist ein **Testparameter**, kein Detail: alles, was aus `RAM_TOP` abgeleitet wird --
+# die IOVA-Fensterbasis voran -- prueft auf einer 512-MiB-Maschine andere Zweige als auf einer
+# grossen. Der 32-Bit-Ausschluss in `dmawin` war nur der auffaelligste Fall: dort lag das Fenster
+# unter 4 GiB, und der Test waere gruen gewesen, ohne die Eigenschaft zu pruefen.
+RAM="${2:-512M}"
 ELF="build/target/x86_64-unknown-none/release/sel4lake-kernel.mb32"
 
 echo "== build (x86_64-unknown-none) =="
@@ -15,7 +20,7 @@ echo "== build (x86_64-unknown-none) =="
 LOG="$(mktemp)"
 echo "== boot ($SECONDS_RUN s) =="
 timeout "$SECONDS_RUN" qemu-system-x86_64 \
-    -kernel "$ELF" -m 512M -smp 4 \
+    -kernel "$ELF" -m "$RAM" -smp 4 \
     -machine q35,kernel-irqchip=split -device intel-iommu,caching-mode=on \
     -device virtio-rng-pci \
     -nographic -serial file:"$LOG" -no-reboot -no-shutdown \
@@ -43,6 +48,7 @@ check "ring3   : ALL PASS"            "Stufe 4c: Ring-3-Threads (Syscall aus Rin
 check "pci     : ALL PASS"            "PCI-Enumeration ueber das ECAM-Fenster aus der ACPI-MCFG (virtio-rng gefunden, Bus-Master an)"
 check "vtdcaps : ALL PASS" "VT-d-Faehigkeiten (Schritt 1): SAGAW/MGAW/ND/CM/RWBF/ECAP.C/QI/IR/SC/ScalableMode einmal gelesen und protokolliert; jede spaetere Bit-Entscheidung leitet sich daraus ab"
 check "vtdgrp  : ALL PASS" "DMAR-Auswertung + Gruppenbildung (Schritt 2) gegen eine EINGESPEISTE Tabelle/Topologie: Catch-all zuletzt, Scope-Typ 2 als Subhierarchie, ACS-Gruppen, RID-Alias-Mengen, RMRR-Ausschluss, Firmware-Muell abgefangen, Vollstaendigkeits-Oracle"
+check "cycles  : ALL PASS" "Zyklenzaehler (Stufe 1): serialisierender Zeitstempel, invariant-TSC geprueft statt angenommen, gegen den PIT kalibriert"
 check "dmawin  : ALL PASS" "IOVA-Fenstergrenzen (ext-36b) -- DIESELBE Funktion wie im ARM-Lauf, nicht nachgebaut"
 check "dmatok  : ALL PASS" "Teardown-Token (ext-37) -- dieselbe Funktion wie im ARM-Lauf; VtdEnforcer::attach liefert jetzt Some"
 check "iommu   : ALL PASS"            "IOMMU (VT-d): Bring-up aus der ACPI-DMAR, Root-Tabelle mit Default-Block, Uebersetzung aktiv, Invalidierung quittiert"

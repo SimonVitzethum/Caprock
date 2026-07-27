@@ -67,3 +67,34 @@ pub fn on_irq() {
 pub fn ticks(core: usize) -> u64 {
     TICKS[core].load(Ordering::Relaxed)
 }
+
+
+// --- Zyklenzähler (Stufe 1) -------------------------------------------------------------------
+//
+// Gegenstück zu `x86_64::timer::cycles`. Auf ARM ist die Sache einfacher: `CNTPCT_EL0` ist
+// architektonisch definiert, läuft mit `CNTFRQ_EL0` und ist per Konstruktion invariant — es gibt
+// keinen P-State-abhängigen Zähler, dessen Rate sich unter der Messung ändert.
+
+/// Ein **serialisierender** Zeitstempel des architektonischen Zählers.
+///
+/// `isb` davor: ohne die Barriere darf der Kern das Lesen gegenüber den umgebenden Befehlen
+/// verschieben, und bei kurzen kritischen Sektionen — dem Zweck dieses Primitivs — misst man
+/// dann verschobene Grenzen statt der Sektion.
+pub fn cycles() -> u64 {
+    let v: u64;
+    // SAFETY: read-only Systemregister + Instruktionsbarriere.
+    unsafe {
+        asm!("isb", "mrs {v}, cntpct_el0", v = out(reg) v, options(nostack));
+    }
+    v
+}
+
+/// Zyklen pro Sekunde — hier schlicht `CNTFRQ_EL0`.
+pub fn cycles_per_sec() -> u64 {
+    freq()
+}
+
+/// Der architektonische Zähler ist immer invariant (kein P-State-Einfluss).
+pub fn invariant_tsc() -> bool {
+    true
+}

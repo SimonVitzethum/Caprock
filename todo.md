@@ -294,6 +294,11 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
          bestehen. Und `FSTS.PFO` (Overflow der Fault-Recording-Register) muss in denselben
          Zähler wie `config_errors()`, sonst bedeutet „keine weiteren Faults" nach einem Sturm
          nichts. (`fault_overflow()` steht bereits.)
+      3b.[ ] **Queued Invalidation ist Vorbedingung von 6.4, nicht Alternative.** Die
+         Invalidierung des Interrupt-Entry-Cache existiert nur als QI-Deskriptor, nicht als
+         Registeroperation — IR lässt sich ohne QI nicht korrekt betreiben. Der Registerpfad ist
+         damit ein **Provisorium mit bekanntem Ablaufdatum**: nichts Weiteres darauf aufbauen,
+         und beim Umstieg wirklich umstellen statt beides zu halten.
       4. [ ] Interrupt Remapping (`GCMD.IRE`) inkl. **Abschalten des Compatibility-Format-
          Interrupts** — IR aktiv bei weiter erlaubtem CFI ist eine offene Tür an der Seite.
          Eigene Zeile in `docs/invariants.md` §2, weil es dieselbe Struktur hat wie die
@@ -330,6 +335,18 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
 
 ## D. Verifikation
 
+- [ ] **Zyklenzähler weiterführen** (Stufe 1 teilweise erledigt): `hal::timer::cycles()` /
+      `cycles_per_sec()` / `invariant_tsc()` stehen auf beiden Architekturen, serialisierend und
+      gegen den PIT kalibriert. Offen: die per-TCB-Abrechnung (`consumed_cycles`, gestempelt beim
+      Ein-/Auswechseln) und darauf die Monitoring-Cap.
+      **Invarianz ist Telemetrie, keine Bestehensbedingung** — TCG sagt `invtsc` nicht zu
+      („TCG doesn't support requested feature"), die Emulation *kann* die Eigenschaft nicht
+      liefern. Sie zur Bedingung zu machen hieße, den Test dauerhaft rot zu lassen oder die
+      Prüfung wegzulassen; das Zweite wäre die stillschweigende Annahme, die hier gerade
+      vermieden wird. Auf einer Plattform ohne Zusage sind Zyklenwerte **indikativ, nicht
+      abrechnungsfähig** — das steht so im Log.
+- [ ] **RAM-Größe als Testparameter** (teilweise erledigt): `test-qemu-x86.sh` nimmt `-m` als
+      zweiten Parameter (512M/8G geprüft). Für aarch64 steht dasselbe noch aus.
 - [ ] **D1** Kani lokal nicht ausführbar (nur CI-Gate) — die ext-29-Änderung an `sel4lake-sync` ist
       dort **nicht** gegengeprüft worden.
 - [ ] **D2** Loom modelliert eine **Kopie** des Lock-Algorithmus; die IRQ-Maskierung ist prinzipiell

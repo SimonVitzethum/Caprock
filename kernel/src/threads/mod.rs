@@ -473,6 +473,14 @@ static DMAWIN_EXHAUST: AtomicBool = AtomicBool::new(false); //  Fenster voll -> 
 static DMAWIN_INTACT: AtomicBool = AtomicBool::new(false); //   Kontext danach unveraendert nutzbar
 static DMAWIN_BALANCED: AtomicBool = AtomicBool::new(false);
 static DMAWIN_UNDECL: AtomicU32 = AtomicU32::new(0); //        Geraete ohne deklarierte Adressbreite
+// Teardown-Token (ext-37): `cap_delete` allein baut die Uebersetzung ab und gibt erst danach
+// frei; ohne bestaetigte Stilllegung wird NIE freigegeben (Pending, beschraenkt, auditiert).
+static DMATOK_DONE: AtomicBool = AtomicBool::new(false);
+static DMATOK_OK: AtomicBool = AtomicBool::new(false);
+static DMATOK_DELETE_TEARS: AtomicBool = AtomicBool::new(false); // delete ohne detach baut ab
+static DMATOK_FREED: AtomicBool = AtomicBool::new(false); //        ... und gibt die Region frei
+static DMATOK_PENDING: AtomicBool = AtomicBool::new(false); //      unbestaetigt -> nicht frei
+static DMATOK_AUDIT7: AtomicBool = AtomicBool::new(false); //       Code 7 haelt im Pending-Zustand
 static DMAGEN_OK: AtomicBool = AtomicBool::new(false);
 
 // Prozess-Heap (ext-25): ein Trusted-SAS-Thread (safe Rust) nutzt einen prozess-lokalen
@@ -1036,6 +1044,85 @@ fn run_dmawin() -> bool {
     DMAWIN_BALANCED.store(balanced, Ordering::Relaxed);
     DMAWIN_UNDECL.store(system::testsupport::dma_undeclared_devices(), Ordering::Relaxed);
     narrow && exhausted && intact && balanced && system::domain_audit() == 0
+}
+
+/// **Teardown-Token testen** (ext-37).
+///
+/// Zwei Eigenschaften, die vorher nicht existierten:
+/// * `cap_delete` **allein** genuegt und ist sicher — die Cap-Crate gibt die Region nicht mehr
+///   selbst frei, sondern meldet sie; der Kernel legt still, unmappt, synchronisiert und gibt
+///   erst dann zurueck. Vorher war die Reihenfolge eine bewiesene Vorbedingung des Gesamtsystems.
+/// * Ist die Stilllegung **nicht bestaetigt**, wird die Uebersetzung trotzdem entfernt (immer
+///   zwingend), die Physadresse aber nie zurueckgegeben. Ein Leck statt eines Use-after-free —
+///   als Entscheidung, beschraenkt und auditiert.
+fn run_dmatok() -> bool {
+    hal::cpu::local_irq_disable();
+    // 1. Attach + `cap_delete` OHNE `dma_detach`.
+    let live_sid = PCIE_RID.load(Ordering::Acquire); // echtes Geraet -> Stilllegung bestaetigbar
+    // Basislinie VOR dem Ausschneiden: nach dem `cap_delete` muss exakt sie wieder dastehen —
+    // die Region selbst und alle Tabellen-Frames, die das Anhaengen alloziert hat.
+    let free0 = system::total_free();
+    let Some(r1) = system::alloc_dma_region(0x1000) else {
+        hal::cpu::local_irq_enable();
+        return false;
+    };
+    let Ok(cap1) = system::install_dma_cap_ex(
+        r1.base,
+        r1.len,
+        DmaDir::Bidirectional,
+        DmaCoherence::NonCoherent,
+        Rights::RW,
+    ) else {
+        hal::cpu::local_irq_enable();
+        return false;
+    };
+    let attached = system::dma_attach(live_sid, cap1).is_some();
+    let _ = system::cap_delete(cap1); // KEIN dma_detach
+    let tears = attached && system::testsupport::dma_ctx_region_count(live_sid) == 0;
+    let freed = system::total_free() == free0 && system::dma_audit() == 0;
+
+    // 2. Geraet, dessen Stilllegung nicht bestaetigt werden kann (StreamID ohne Geraet: das
+    //    Konfigurations-Read liefert 0xFFFF). Die Region darf NICHT zurueck in den Allokator.
+    let (pend0, unexp0) = system::testsupport::dma_pending_stats();
+    let ghost_sid = 0x60u32;
+    let free1 = system::total_free();
+    let Some(r2) = system::alloc_dma_region(0x1000) else {
+        hal::cpu::local_irq_enable();
+        return false;
+    };
+    let Ok(cap2) = system::install_dma_cap_ex(
+        r2.base,
+        r2.len,
+        DmaDir::Bidirectional,
+        DmaCoherence::NonCoherent,
+        Rights::RW,
+    ) else {
+        hal::cpu::local_irq_enable();
+        return false;
+    };
+    let attached2 = system::dma_attach(ghost_sid, cap2).is_some();
+    let pending = {
+        // Im KILL-Kontext: dort ist Pending erwartbar und darf nicht als Anomalie zaehlen.
+        let _kill = system::KillScope::enter();
+        let _ = system::cap_delete(cap2);
+        let (pend1, unexp1) = system::testsupport::dma_pending_stats();
+        attached2
+            && pend1 == pend0 + 1 //                       geparkt
+            && unexp1 == unexp0 //                         und zwar erwartbar (KILL)
+            // Alle Tabellen-Frames sind zurueck, **nur die Region nicht** — genau um ihre
+            // Groesse fehlt gegenueber der Basislinie.
+            && system::total_free() == free1 - r2.len
+            && system::testsupport::dma_ctx_region_count(ghost_sid) == 0 // Unmap trotzdem erfolgt
+    };
+    // Code 7: weder frei noch uebersetzt.
+    let audit7 = system::dma_audit() == 0 && system::vspace_audit() == 0;
+    hal::cpu::local_irq_enable();
+
+    DMATOK_DELETE_TEARS.store(tears, Ordering::Relaxed);
+    DMATOK_FREED.store(freed, Ordering::Relaxed);
+    DMATOK_PENDING.store(pending, Ordering::Relaxed);
+    DMATOK_AUDIT7.store(audit7, Ordering::Relaxed);
+    tears && freed && pending && audit7 && system::domain_audit() == 0
 }
 
 /// **Prozess-Heap testen** (ext-25): ein Trusted-SAS-Kontext (safe Rust) baut einen prozess-
@@ -4342,7 +4429,13 @@ pub fn demo_report_then_idle() -> ! {
             DMAWIN_DONE.store(true, Ordering::Release);
         }
 
-        if !SASHEAP_DONE.load(Ordering::Acquire) && DMAWIN_DONE.load(Ordering::Acquire) {
+        // Teardown-Token (ext-37). Synchron, ein Schritt.
+        if !DMATOK_DONE.load(Ordering::Acquire) && DMAWIN_DONE.load(Ordering::Acquire) {
+            DMATOK_OK.store(run_dmatok(), Ordering::Release);
+            DMATOK_DONE.store(true, Ordering::Release);
+        }
+
+        if !SASHEAP_DONE.load(Ordering::Acquire) && DMATOK_DONE.load(Ordering::Acquire) {
             SASHEAP_OK.store(run_sasheap(), Ordering::Release);
             SASHEAP_DONE.store(true, Ordering::Release);
         }
@@ -4755,6 +4848,8 @@ fn all_done() -> bool {
     let dmagen = DMAGEN_DONE.load(Ordering::Acquire) && DMAGEN_OK.load(Ordering::Acquire);
     // IOVA-Fenstergrenzen (ext-36b): Erschöpfung + Geräte-Adressbreite als geprüfte Eigenschaft.
     let dmawin = DMAWIN_DONE.load(Ordering::Acquire) && DMAWIN_OK.load(Ordering::Acquire);
+    // Teardown-Token (ext-37): Freigabe nur gegen Nachweis; Pending statt UAF.
+    let dmatok = DMATOK_DONE.load(Ordering::Acquire) && DMATOK_OK.load(Ordering::Acquire);
     // Prozess-Heap (ext-25): echter Box/Vec/BTreeMap-Heap auf realen Physadressen (safe Rust).
     let sasheap = SASHEAP_DONE.load(Ordering::Acquire) && SASHEAP_OK.load(Ordering::Acquire);
     // Binary-Loader L1 (ext-26): extern gebautes hello geladen + lief (signalisierte HELLO_BADGE).
@@ -4784,6 +4879,7 @@ fn all_done() -> bool {
         && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
         && stale && strand && rgone && ddon && rcap && rmig && caplk && domain
         && pdctl && chan && rtc && irq && dma && pcie && smmu && smmubind && virtiorng && dmagen
+        && dmawin && dmatok
         && sasheap && load && sysload && loadhw && loadstop && aggru && intru
         && aggrh && intrh && aggrt && intrt && cross && migrate && scale && fuzz::all_passed()
 }
@@ -5309,6 +5405,16 @@ fn report() {
     println!(
         "dmawin  : {} (IOVA-Fenstergrenzen: Geraete-Adressbreite + Fenster-Erschoepfung scheitern laut statt still abzuschneiden; kein halb aufgebauter Kontext)",
         if dmawin { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Teardown-Token (ext-37).
+    let dmatok = DMATOK_DONE.load(Ordering::Acquire) && DMATOK_OK.load(Ordering::Acquire);
+    println!("dmatok  : delete-ohne-detach-baut-ab={} Region-danach-frei={} unbestaetigte-Stilllegung-bleibt-pending={} Audit-Code-7-haelt={}",
+        DMATOK_DELETE_TEARS.load(Ordering::Acquire), DMATOK_FREED.load(Ordering::Acquire),
+        DMATOK_PENDING.load(Ordering::Acquire), DMATOK_AUDIT7.load(Ordering::Acquire));
+    println!(
+        "dmatok  : {} (Teardown-Token: die Cap-Crate gibt DMA-Regionen nicht mehr selbst frei, sondern meldet sie; Freigabe nur gegen Nachweis -- aus einer bewiesenen wird eine erzwungene Reihenfolge)",
+        if dmatok { "ALL PASS" } else { "FAILURES" }
     );
 
     // Prozess-Heap (ext-25): echter Box/Vec/BTreeMap-Heap auf realen Physadressen (safe Rust).

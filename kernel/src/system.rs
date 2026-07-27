@@ -755,30 +755,32 @@ pub fn cap_delete(ptr: CapPtr) -> Result<(), CapError> {
     // Finalisierung gibt ggf. Speicher zurück -> CAPS vor MEM (Sperrordnung). Beim
     // Finalisieren einer Reply-Cap wird der zugehörige Call abgebrochen (NACH dem
     // Freigeben von CAPS/MEM, da das Entblocken EPS<SCHEDS sperrt -> CAPS < EPS).
-    let mut rf = sel4lake_cap::ReplyFinal::new();
+    let mut rf = sel4lake_cap::Finalized::new();
     let r = {
         let mut caps = CAPS.write();
         let mut mem = MEM.lock();
         caps.cspace.delete(&mut mem, ptr, &mut rf)
     };
     abort_finalized_replies(&rf);
+    dma_finalize(&rf);
     r
 }
 pub fn cap_revoke(ptr: CapPtr) -> Result<(), CapError> {
-    let mut rf = sel4lake_cap::ReplyFinal::new();
+    let mut rf = sel4lake_cap::Finalized::new();
     let r = {
         let mut caps = CAPS.write();
         let mut mem = MEM.lock();
         caps.cspace.revoke(&mut mem, ptr, &mut rf)
     };
     abort_finalized_replies(&rf);
+    dma_finalize(&rf);
     r
 }
 
 /// Für jede beim Löschen/Revoke finalisierte Reply-Cap den ausstehenden Call abbrechen:
 /// den noch wartenden Aufrufer mit `ERR_SERVER_GONE` entblocken (Revocation eines
 /// Calls). Läuft OHNE gehaltenen CAPS/MEM-Lock (Ordnung CAPS < EPS < SCHEDS).
-fn abort_finalized_replies(rf: &sel4lake_cap::ReplyFinal) {
+fn abort_finalized_replies(rf: &sel4lake_cap::Finalized) {
     for (ep, caller_raw) in rf.iter() {
         endpoint_abort_call(ep as usize, ThreadId::from_raw(caller_raw));
     }
@@ -1463,6 +1465,11 @@ pub fn destroy_loaded(tid: ThreadId, pd: usize) {
 /// Cap-Container existieren (Setup-Fehlerpfade, Selbsttests); PDs **mit** Thread bauen
 /// [`destroy_loaded`] bzw. der PDCTL-STOP-Pfad ab.
 pub fn destroy_pd(pd: usize) {
+    // Der Abbau einer PD ist **der** realistische Weg in „quiesziert nie": das Gerät hängt, und
+    // niemand ist mehr da, der auf einen Fehlercode reagieren könnte. Hier darf der
+    // Pending-Zustand entstehen, ohne als Anomalie gezählt zu werden — überall sonst will man
+    // ihn sehen (`dma_pending_stats().1`).
+    let _kill = KillScope::enter();
     let caps = CAPS.read().pds.caps_of(pd); // Snapshot; Read-Lock danach frei
     for cap in caps.iter().flatten() {
         let _ = cap_delete(*cap);
@@ -2058,6 +2065,22 @@ pub trait DmaEnforcer: Sync {
     /// Durchsetzung entziehen (VOR VSpace-Unmap + `free_region`): danach kann das Gerät nicht
     /// mehr in die Region DMAen (DMA-use-after-free-sicher).
     fn detach(&self, binding: &DmaBinding);
+    /// **Gebündelte Finalisierung** (ext-37): alle genannten Regionen `(pa, len)` stilllegen,
+    /// aus den Übersetzungstabellen entfernen und **einmal** synchronisieren. `ok[i]` sagt, ob
+    /// Region `i` danach freigegeben werden darf.
+    ///
+    /// Gebündelt, weil ein `revoke` über einen CDT-Teilbaum N DMA-Caps auf einmal finalisiert:
+    /// einzeln durchgereicht wären das N Quiesce/Flush/`CMD_SYNC`-Zyklen — dieselbe Form, die
+    /// beim Multi-SID-Detach schon einmal die falsche war. Erst alle entwaffnen, alle spülen,
+    /// alle unmappen, **ein** Sync, dann freigeben.
+    ///
+    /// Default: es gab nie eine Übersetzung (kein Enforcer / `attach` liefert `None`), also darf
+    /// alles freigegeben werden. Das ist kein Freibrief, sondern die Wahrheit über x86 heute.
+    fn finalize(&self, regions: &[(u64, u64)], ok: &mut [bool]) {
+        for b in ok.iter_mut().take(regions.len()) {
+            *b = true;
+        }
+    }
     /// Durchsetzungs-Oracle: `0` = konsistent, sonst enforcer-spezifischer Anomalie-Code.
     fn audit(&self) -> u32;
     /// Ist die hardwareseitige Durchsetzung aktiv (HW vorhanden + initialisiert)?
@@ -2340,7 +2363,7 @@ mod smmu_enforcer_arm {
             else {
                 return;
             };
-            ctx_quiesce(&mut t[slot]);
+            let _ = ctx_quiesce(&mut t[slot]);
             let l1 = t[slot].l1;
             // Region aus der Stage-1-Tabelle entfernen (danach kann das Gerät NICHT mehr dorthin
             // DMAen) + TLBI+SYNC. DMA-use-after-free-sicher (vor VSpace-Unmap + free_region).
@@ -2393,6 +2416,94 @@ mod smmu_enforcer_arm {
                     mem.free_region(PhysRegion::new(ccd, 4096));
                 }
                 t[slot] = DmaCtx::EMPTY;
+            }
+        }
+        fn finalize(&self, regions: &[(u64, u64)], ok: &mut [bool]) {
+            if !self.active.load(Ordering::Acquire) {
+                for b in ok.iter_mut().take(regions.len()) {
+                    *b = true; // keine Durchsetzung aktiv -> es gab nie eine Übersetzung
+                }
+                return;
+            }
+            let strtab = self.strtab_phys.load(Ordering::Acquire);
+            let cmdq = self.cmdq_phys.load(Ordering::Acquire);
+            let mut t = DMA_CTX.lock();
+
+            // Phase 1 — **alle** betroffenen Kontexte stilllegen (je Kontext alle StreamIDs).
+            // Ein Kontext kann mehrere der Regionen tragen; die Stilllegung ist verschachtelbar,
+            // also wird sie hier einmal je *Region* genommen und in Phase 4 ebenso oft gelöst.
+            let mut ctx_of = [usize::MAX; MAX_FINALIZE];
+            let mut quiesced = [false; MAX_FINALIZE];
+            for (i, &(pa, len)) in regions.iter().enumerate().take(MAX_FINALIZE) {
+                let Some(slot) = t.iter().position(|c| {
+                    c.used
+                        && c.regs
+                            .iter()
+                            .any(|r| !r.is_empty() && r.pa == Pa::new(pa) && r.len == len)
+                }) else {
+                    // Keine lebende Übersetzung (z. B. bereits explizit detacht) -> nichts zu
+                    // entwaffnen, Freigabe zulässig.
+                    ok[i] = true;
+                    continue;
+                };
+                ctx_of[i] = slot;
+                quiesced[i] = ctx_quiesce(&mut t[slot]);
+                ok[i] = quiesced[i];
+            }
+
+            // Phase 2 — alle Regionen unmappen (IOVA-Achse). Der Unmap ist **immer** zwingend,
+            // auch wenn die Stilllegung nicht bestätigt ist: eine stehende Übersetzung auf eine
+            // Region, die gleich freigegeben würde, ist genau der geräteseitige Use-after-free.
+            // Zurückgehalten wird nur die *Freigabe*.
+            for (i, &(pa, len)) in regions.iter().enumerate().take(MAX_FINALIZE) {
+                let slot = ctx_of[i];
+                if slot == usize::MAX {
+                    continue;
+                }
+                let l1 = t[slot].l1;
+                if let Some(ri) = t[slot]
+                    .regs
+                    .iter()
+                    .position(|r| !r.is_empty() && r.pa == Pa::new(pa) && r.len == len)
+                {
+                    hal::smmu::stage1_unmap_region(l1, t[slot].regs[ri].iova.raw(), t[slot].regs[ri].len);
+                    t[slot].regs[ri] = DmaRegion::EMPTY;
+                }
+            }
+
+            // Phase 3 — **ein** TLBI+SYNC für den ganzen Stapel.
+            let prod = self.cmdq_prod.load(Ordering::Acquire);
+            let (next, _) = hal::smmu::tlbi_sync(cmdq, prod);
+            self.cmdq_prod.store(next, Ordering::Release);
+
+            // Phase 4 — Stilllegung lösen und leere Kontexte abbauen.
+            for i in 0..regions.len().min(MAX_FINALIZE) {
+                let slot = ctx_of[i];
+                if slot == usize::MAX || !t[slot].used {
+                    continue;
+                }
+                let still_in_use = !t[slot].regs.iter().all(|r| r.is_empty());
+                ctx_release(&mut t[slot], still_in_use);
+                if !still_in_use {
+                    let mut p = self.cmdq_prod.load(Ordering::Acquire);
+                    for k in 0..MAX_CTX_SIDS {
+                        let sid = t[slot].sids[k];
+                        if sid != u32::MAX {
+                            let (n, _) = hal::smmu::clear_ste_and_sync(strtab, cmdq, p, sid);
+                            p = n;
+                        }
+                    }
+                    self.cmdq_prod.store(p, Ordering::Release);
+                    let (cl1, ccd) = (t[slot].l1, t[slot].cd);
+                    {
+                        let mut mem = MEM.lock();
+                        hal::smmu::free_stage1(cl1, &mut |x| {
+                            mem.free_region(PhysRegion::new(x, 4096));
+                        });
+                        mem.free_region(PhysRegion::new(ccd, 4096));
+                    }
+                    t[slot] = DmaCtx::EMPTY;
+                }
             }
         }
         fn audit(&self) -> u32 {
@@ -2707,6 +2818,8 @@ fn note_undeclared_device(stream_id: u32) {
         if cur == u64::MAX {
             e.store(stream_id as u64, Ordering::Release);
             UNDECLARED_COUNT.fetch_add(1, Ordering::Relaxed);
+            // Die serielle Ausgabe haengt am aarch64-HAL; auf x86 bleibt es beim Zaehler.
+            #[cfg(target_arch = "aarch64")]
             crate::println!(
                 "dma: StreamID 0x{:x} ohne deklarierte Adressbreite -- angenommen 64 Bit \
                  (dma_declare_device_addr_bits)",
@@ -2746,7 +2859,12 @@ fn sid_index(c: &DmaCtx, rid: u32) -> Option<usize> {
 ///
 /// Reihenfolge: erst **alle** entwaffnen, dann **alle** spülen. So ist kein Gerät der Gruppe mehr
 /// scharf, während ein anderes noch spült.
-fn ctx_quiesce(c: &mut DmaCtx) {
+/// Gibt zurück, ob die Stilllegung **bestätigt** ist: für jede StreamID muss das Bus-Master-Bit
+/// nach dem Löschen auch wirklich gelöscht sein, und das Konfigurations-Read (der Flush) muss
+/// eine plausible Antwort liefern. Ein Gerät, das verschwunden ist (`0xFFFF`) oder sein
+/// Command-Register nicht übernimmt, hat die Spülgarantie **nicht** erbracht — dann darf seine
+/// Region nie zurück in den Allokator (ext-37, Pending-Zustand).
+fn ctx_quiesce(c: &mut DmaCtx) -> bool {
     for k in 0..MAX_CTX_SIDS {
         if c.sids[k] == u32::MAX {
             continue;
@@ -2756,11 +2874,18 @@ fn ctx_quiesce(c: &mut DmaCtx) {
         }
         c.quiesce_depth[k] += 1;
     }
+    let mut confirmed = true;
     for k in 0..MAX_CTX_SIDS {
-        if c.sids[k] != u32::MAX {
-            hal::pcie::flush_posted_writes(c.sids[k]);
+        if c.sids[k] == u32::MAX {
+            continue;
+        }
+        let vendor = hal::pcie::flush_posted_writes(c.sids[k]);
+        let cmd = hal::pcie::read_command(c.sids[k]);
+        if vendor == 0xFFFF || cmd & hal::pcie::CMD_BUS_MASTER_BIT != 0 {
+            confirmed = false;
         }
     }
+    confirmed
 }
 
 /// Stilllegung aufheben (nur beim Übergang 1→0 tatsächlich).
@@ -3037,6 +3162,129 @@ pub fn dma_enable(stream_id: u32, base: u64, len: u64) -> Option<Iova> {
 /// Die Durchsetzung für `(stream_id, [base,len))` wieder entziehen.
 pub fn dma_disable(stream_id: u32, base: u64, len: u64) {
     dma_enforcer().detach(&DmaBinding::new(stream_id, Pa::new(base), len));
+}
+
+/// Obergrenze eines Finalisierungsstapels — dieselbe Schranke wie in der Cap-Crate (`NOBJECTS`):
+/// mehr DMA-Objekte kann eine einzelne Operation nicht finalisieren.
+const MAX_FINALIZE: usize = 128;
+
+/// **Nachweis, dass eine DMA-Region abgebaut ist** (ext-37).
+///
+/// Der Token ist der einzige Weg zu [`free_dma_region`]. Er entsteht ausschließlich in
+/// [`dma_finalize`], und zwar erst, nachdem für seine Region gilt: Gerät stillgelegt (bestätigt),
+/// Übersetzung entfernt, `CMD_SYNC` durch. Vorher war diese Reihenfolge eine **bewiesene**
+/// Vorbedingung des Gesamtsystems — `CapSpace::delete_leaf` rief `free_region` direkt, und dass
+/// davor jemand aufgeräumt hatte, stand nirgends im Typ. Jetzt ist sie **erzwungen**.
+///
+/// Er trägt eine [`DmaRegion`], nicht eine `PhysRegion`: nach ext-36 gehören beide Achsen in den
+/// Nachweis. Der Unmap ist auf der IOVA-Achse, der Free auf der PA-Achse — mit einer reinen
+/// `PhysRegion` könnte der Token einen erfolgten Free bezeugen, ohne dass der Unmap darin
+/// überhaupt vorkommt.
+#[must_use = "ein Teardown-Token, der nicht eingelöst wird, ist eine geleakte Region"]
+pub struct DmaTeardownToken {
+    region: DmaRegion,
+}
+
+impl DmaTeardownToken {
+    /// Die bezeugte Region — beide Achsen, für Diagnose und Audits.
+    pub fn region(&self) -> DmaRegion {
+        self.region
+    }
+}
+
+/// Eine DMA-Region freigeben. **Nur** gegen einen [`DmaTeardownToken`].
+fn free_dma_region(token: DmaTeardownToken) {
+    free_raw_region(token.region.pa.raw(), token.region.len);
+}
+
+/// Regionen, deren Gerät die Stilllegung **nicht bestätigt** hat.
+///
+/// Ihre Übersetzung ist entfernt (das ist immer zwingend), aber ihre Physadresse geht **nie**
+/// zurück in den Allokator: ohne bestätigte Spülung ist nicht auszuschließen, dass noch ein
+/// übersetzter, unterwegs befindlicher Write ankommt. Ein Leck ist gegenüber einem
+/// Use-after-free der richtige Failure-Mode — aber als **Entscheidung**, nicht als Versehen:
+/// die Menge ist beschränkt, gezählt und auditiert (`dma_audit` Code 7).
+const MAX_PENDING_DMA: usize = 16;
+static PENDING_DMA: SpinLock<[DmaRegion; MAX_PENDING_DMA]> =
+    SpinLock::new([DmaRegion::EMPTY; MAX_PENDING_DMA]);
+/// Wie viele Regionen insgesamt in den Pending-Zustand gerieten (auch die, für die kein Platz
+/// mehr war — die sind dann erst recht geleakt, aber nicht unbemerkt).
+static PENDING_TOTAL: AtomicU32 = AtomicU32::new(0);
+/// Davon außerhalb eines `KILL` — dort ist Pending erwartbar (eine sterbende PD mit hängendem
+/// Gerät), überall sonst ist es eine Anomalie, die man sehen will.
+static PENDING_UNEXPECTED: AtomicU32 = AtomicU32::new(0);
+
+/// Läuft gerade ein `KILL`? Dort darf Pending entstehen, ohne als Anomalie zu zählen.
+static IN_KILL: AtomicU32 = AtomicU32::new(0);
+
+/// Markiert den laufenden Abbau einer PD/eines Threads (`KILL`).
+pub struct KillScope;
+impl KillScope {
+    pub fn enter() -> Self {
+        IN_KILL.fetch_add(1, Ordering::AcqRel);
+        KillScope
+    }
+}
+impl Drop for KillScope {
+    fn drop(&mut self) {
+        IN_KILL.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn park_pending(region: DmaRegion) {
+    PENDING_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if IN_KILL.load(Ordering::Acquire) == 0 {
+        PENDING_UNEXPECTED.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut p = PENDING_DMA.lock();
+    if let Some(e) = p.iter_mut().find(|r| r.is_empty()) {
+        *e = region;
+    }
+    #[cfg(target_arch = "aarch64")]
+    crate::println!(
+        "dma: Region pa=0x{:x} len=0x{:x} bleibt dauerhaft pending -- Stilllegung nicht bestaetigt",
+        region.pa.raw(),
+        region.len
+    );
+}
+
+/// **Finalisierung der beim Löschen/Revoke gemeldeten DMA-Regionen** (ext-37).
+///
+/// Läuft **ohne** gehaltenen CAPS/MEM-Lock — dieselbe Stelle und derselbe Grund wie bei
+/// [`abort_finalized_replies`]: die Nachbereitung braucht Sperren, die unter CAPS nicht genommen
+/// werden dürfen (hier `DMA_CTX` und, im Kontextabbau, `MEM`).
+///
+/// **Synchron, nicht aufgeschoben.** Der Preis ist eine geräteabhängige Laufzeit im `delete`;
+/// der Gewinn ist, dass es den Pending-Zustand für den Normalfall **gar nicht gibt**. Ein
+/// Zwischenzustand, den es meistens nicht gibt, ist schwerer richtig zu halten als einer, den es
+/// nie gibt — und die Beschränktheits-Invariante der Pending-Menge muss dann nur noch den
+/// pathologischen Fall tragen, für den sie gedacht war.
+fn dma_finalize(fin: &sel4lake_cap::Finalized) {
+    let mut regs = [(0u64, 0u64); MAX_FINALIZE];
+    let mut n = 0;
+    for (pa, len) in fin.iter_dma() {
+        if n < MAX_FINALIZE {
+            regs[n] = (pa, len);
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return;
+    }
+    let mut ok = [false; MAX_FINALIZE];
+    dma_enforcer().finalize(&regs[..n], &mut ok[..n]);
+    for i in 0..n {
+        let region = DmaRegion {
+            iova: Iova::new(0), // die IOVA ist mit dem Unmap erloschen und kommt nie zurück
+            pa: Pa::new(regs[i].0),
+            len: regs[i].1,
+        };
+        if ok[i] {
+            free_dma_region(DmaTeardownToken { region });
+        } else {
+            park_pending(region);
+        }
+    }
 }
 
 /// **Opakes DMA-Handle** (ext-24): die *gerätesichtbare* Adresse (IOVA) + Länge einer
@@ -3346,10 +3594,14 @@ pub fn virtio_rng_dma_demo() -> VirtioDmaResult {
     r
 }
 
-/// Eine (noch nicht in eine DmaCap überführte) DMA-Region an den Allokator zurückgeben — für
-/// Fehler-/Cleanup-Pfade, in denen eine `alloc_dma_region` nicht in eine Cap mündet.
+/// Eine **nie angehängte** DMA-Region an den Allokator zurückgeben — für Fehler-/Cleanup-Pfade,
+/// in denen eine `alloc_dma_region` gar nicht erst in eine Cap mündet.
+///
+/// Kein Token nötig und keiner möglich: die Region war nie in einer Übersetzungstabelle, also
+/// gibt es nichts zu bezeugen. Deshalb der eigene Name — `free_dma_region` ist der
+/// nachweispflichtige Pfad (ext-37).
 #[cfg_attr(not(feature = "kernel-fuzz"), allow(dead_code))] // nur vom Fuzzer benutzt (ADR 0013)
-pub fn free_dma_region(base: u64, len: u64) {
+pub fn free_unattached_dma_region(base: u64, len: u64) {
     free_raw_region(base, len);
 }
 
@@ -3470,7 +3722,51 @@ pub fn dma_audit() -> u32 {
     if hal::smmu::config_errors() != 0 {
         return 6;
     }
+    // Code 7: der **Pending-Zustand** ist eine eigene Invariante, kein Feld. Eine Region darin
+    // ist weder frei noch übersetzt — genau die Konjunktion, die verletzt wäre, wenn die
+    // Fädelung durch `Finalized` irgendwo abreißt: läge sie in der Freiliste, wäre sie trotz
+    // unbestätigter Stilllegung neu vergebbar; stünde sie noch in einer Übersetzungstabelle,
+    // wäre der zwingende Unmap ausgefallen.
+    if !dma_pending_is_isolated() {
+        return 7;
+    }
     0
+}
+
+/// Wächter für [`dma_audit`] Code `7`.
+fn dma_pending_is_isolated() -> bool {
+    let mut snap = [DmaRegion::EMPTY; MAX_PENDING_DMA];
+    let mut n = 0;
+    {
+        let p = PENDING_DMA.lock();
+        for r in p.iter() {
+            if !r.is_empty() {
+                snap[n] = *r;
+                n += 1;
+            }
+        }
+    }
+    if n == 0 {
+        return true;
+    }
+    // (a) nicht in irgendeiner Übersetzungstabelle geführt
+    {
+        let t = DMA_CTX.lock();
+        for r in snap[..n].iter() {
+            if t.iter().filter(|c| c.used).any(|c| {
+                c.regs
+                    .iter()
+                    .any(|q| !q.is_empty() && q.pa == r.pa && q.len == r.len)
+            }) {
+                return false;
+            }
+        }
+    }
+    // (b) nicht in der Freiliste des Allokators
+    let mem = MEM.lock();
+    !snap[..n]
+        .iter()
+        .any(|r| mem.overlaps_free(r.pa.raw(), r.len))
 }
 
 /// Wächter für [`dma_audit`] Code `5`: liegen die in den Kontexten geführten **PA**-Werte im
@@ -3554,6 +3850,14 @@ pub(crate) mod testsupport {
             }
             None => false,
         }
+    }
+
+    /// Pending-DMA-Regionen: `(insgesamt, davon ausserhalb eines KILL)`.
+    pub fn dma_pending_stats() -> (u32, u32) {
+        (
+            PENDING_TOTAL.load(Ordering::Relaxed),
+            PENDING_UNEXPECTED.load(Ordering::Relaxed),
+        )
     }
 
     /// Wie viele Geräte DMA betreiben, ohne dass ihre Adressbreite deklariert wurde.

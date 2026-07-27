@@ -276,11 +276,54 @@ statt mit der IOVA und blieb für den Compiler unsichtbar; gefunden hat ihn erst
 Auseinanderlaufen der Werte. Die Restprüfung ist deshalb ein `grep` nach `raw()` im DMA-Pfad
 (16 Stellen, jede einzeln begründet).
 
-**Was das Audit NICHT trägt:** Es findet die Verletzung, es verhindert sie nicht. Die Reihenfolge
-ist eine bewiesene Vorbedingung, keine erzwungene — `free_region` ist über `PhysRegion` aufrufbar,
-nicht nur über einen Token, den die Invalidierung zurückgibt. Die strukturelle Fassung (ein
-`Invalidated`-Token als einziger Weg zu `free_region`) ist vorgemerkt; sie berührt die
-`CapSpace`-Finalisierung und läuft über denselben Rückmeldeweg wie `ReplyFinal`. Siehe `todo.md`.
+### 2d. Teardown-Token: aus einer bewiesenen wird eine erzwungene Reihenfolge (ext-37)
+
+Bis ext-37 gab `CapSpace::delete_leaf` eine `ObjectKind::Dma`-Region direkt über
+`alloc.free_region` zurück. Dass davor stillgelegt, unmappt und synchronisiert worden war, war eine
+**bewiesene** Vorbedingung des Gesamtsystems — nirgends im Typ, und von der Cap-Crate auch nicht
+prüfbar: sie kennt weder Gerät noch Enforcer.
+
+**Invariante:** Eine DMA-Region gelangt nur über einen `DmaTeardownToken` zurück in den Allokator.
+Der Token ist ausschließlich in `dma_finalize` konstruierbar und entsteht erst, wenn für seine
+Region gilt: Gerät stillgelegt **und bestätigt**, Übersetzung entfernt, `CMD_SYNC` durch. Er trägt
+eine `DmaRegion` (beide Achsen), keine `PhysRegion` — der Unmap liegt auf der IOVA-Achse, der Free
+auf der PA-Achse; mit einer reinen `PhysRegion` könnte der Token einen erfolgten Free bezeugen,
+ohne dass der Unmap darin überhaupt vorkommt.
+
+Die Cap-Crate meldet stattdessen: `ReplyFinal` heißt jetzt `Finalized` und führt neben den
+abzubrechenden Calls die finalisierten DMA-Regionen. Derselbe Rückmeldeweg, dieselbe `NOBJECTS`-
+Schranke, dieselbe Stelle im Kernel (nach dem Freigeben von CAPS/MEM) — plus ein `overflowed()`,
+damit „kann nicht vorkommen" prüfbar ist statt behauptet.
+
+**Synchron, nicht aufgeschoben.** Der Preis ist eine geräteabhängige Laufzeit im `delete`; der
+Gewinn ist, dass es den Zwischenzustand für den Normalfall **gar nicht gibt**. Ein Zustand, den es
+meistens nicht gibt, ist schwerer richtig zu halten als einer, den es nie gibt.
+
+**Gebündelt.** Ein `revoke` über einen CDT-Teilbaum finalisiert N DMA-Objekte auf einmal. Naiv
+wären das N Quiesce/Flush/`CMD_SYNC`-Zyklen — dieselbe Form, die beim Multi-SID-Detach schon einmal
+die falsche war. `DmaEnforcer::finalize` nimmt deshalb den ganzen Stapel: erst alle entwaffnen,
+alle spülen, alle unmappen, **ein** `TLBI`+`SYNC`, dann freigeben.
+
+**Pending (`dma_audit` Code `7`).** Bestätigt ein Gerät die Stilllegung nicht — das
+Konfigurations-Read liefert `0xFFFF`, oder das Bus-Master-Bit bleibt trotz Löschen stehen —, dann
+wird die Übersetzung **trotzdem** entfernt (das ist immer zwingend; eine stehende Übersetzung auf
+eine gleich freigegebene Region *ist* der Use-after-free), die Physadresse aber **nie**
+zurückgegeben. Ein Leck ist gegenüber einem UAF der richtige Failure-Mode — aber als Entscheidung:
+die Menge ist beschränkt (`MAX_PENDING_DMA`), gezählt, protokolliert und auditiert. Code 7 prüft
+die Konjunktion, die den Zustand ausmacht: eine Pending-Region steht **weder** in der Freiliste
+**noch** in irgendeiner Übersetzungstabelle. Läge sie in der Freiliste, wäre sie trotz
+unbestätigter Stilllegung neu vergebbar; stünde sie noch in einer Tabelle, wäre der zwingende
+Unmap ausgefallen. Genau diese Konjunktion reißt, wenn die Fädelung durch `Finalized` irgendwo
+abbricht.
+
+**Wo Pending entstehen darf.** `destroy_pd` ist der realistische Weg in „quiesziert nie": das Gerät
+hängt, und niemand ist mehr da, der auf einen Fehlercode reagieren könnte. Dort läuft ein
+`KillScope`, und Pending zählt nicht als Anomalie. Überall sonst schlägt es zusätzlich auf
+`dma_pending_stats().1` durch — den Zähler, den man sehen will.
+
+**Was der Token nicht leistet:** Eine IOVA gibt er nicht zurück, weil es nichts zurückzugeben gibt
+(s. Nicht-Wiederverwendung in §2c). Der Zustandsraum ist damit um einen Zustand kleiner, als er in
+der ursprünglichen Planung war.
 
 ### 2a. Granularität eines DMA-Puffers (ext-35)
 

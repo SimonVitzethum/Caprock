@@ -1,7 +1,7 @@
 //! Capability-Space: Slot-Tabelle + Capability-Derivation-Tree (CDT).
 
 use crate::object::{DmaCoherence, DmaDir, Object, ObjectKind};
-use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
+use sel4lake_mem::{MemoryCap, PhysAllocator, Rights};
 
 /// Anzahl Capability-Slots (CTEs) im Space.
 const NSLOTS: usize = 256;
@@ -72,11 +72,19 @@ impl CapSlot {
     };
 }
 
-/// Beim Löschen/Revoke **finalisierte Reply-Caps**: `(ep, caller)`-Paare, deren Call der
-/// Kernel abbrechen muss (den noch wartenden Aufrufer mit `ERR_SERVER_GONE` entblocken).
-/// Das Cap-System kennt das IPC-Subsystem nicht — es meldet nur, *welche* Calls
-/// finalisiert wurden; der Kernel führt das Entblocken aus (Sperrordnung CAPS < EPS<SCHEDS).
-pub struct ReplyFinal {
+/// Was beim Löschen/Revoke **finalisiert** wurde und vom Kernel nachbereitet werden muss.
+///
+/// Das Cap-System kennt weder das IPC- noch das DMA-Subsystem. Es meldet nur, *was* finalisiert
+/// wurde; die Nachbereitung führt der Kernel aus, außerhalb der Sperren dieser Crate:
+///
+/// * **Reply-Caps** — `(ep, caller)`-Paare, deren Call abzubrechen ist (`ERR_SERVER_GONE`).
+/// * **DMA-Regionen** — `(phys, len)`. Diese werden hier **nicht** mehr freigegeben (ext-37).
+///   Vorher rief `delete_leaf` direkt `alloc.free_region`, und dass davor stillgelegt,
+///   unmappt und synchronisiert wurde, war eine *bewiesene* Vorbedingung des Gesamtsystems —
+///   keine erzwungene. Diese Crate kennt weder Gerät noch Enforcer und kann sie nicht prüfen;
+///   also gibt sie die Region zurück, statt sie freizugeben, und der Kernel darf sie nur über
+///   einen Nachweis (`DmaTeardownToken`) tatsächlich zurückgeben.
+pub struct Finalized {
     // Ein `revoke` kann eine ganze CDT-Teilkette loeschen und dabei MEHRERE Reply-Objekte
     // finalisieren. Die Kapazitaet MUSS die maximal in einer Operation finalisierbaren Reply-Objekte
     // fassen (hart begrenzt durch die Objekttabelle NOBJECTS) -- sonst wuerden ueberzaehlige
@@ -84,27 +92,54 @@ pub struct ReplyFinal {
     // dauerhaft (Liveness-Bug). NOBJECTS ist die beweisbar vollstaendige Schranke (n <= len garantiert).
     items: [(u32, u64); NOBJECTS],
     n: usize,
+    /// Finalisierte DMA-Regionen `(phys, len)`. Dieselbe Schranke aus demselben Grund: ein
+    /// `revoke` über einen Teilbaum kann mehrere DMA-Objekte auf einmal finalisieren, und eine
+    /// still verworfene Region wäre ein Leck **und** eine stehende Übersetzung.
+    dma: [(u64, u64); NOBJECTS],
+    dn: usize,
+    /// Wurde eine Meldung verworfen, weil die Kapazität nicht reichte? Das darf nach der
+    /// `NOBJECTS`-Schranke nicht vorkommen; steht hier, damit „kann nicht vorkommen" prüfbar
+    /// ist statt behauptet.
+    overflow: bool,
 }
 
-impl Default for ReplyFinal {
+impl Default for Finalized {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ReplyFinal {
+impl Finalized {
     pub const fn new() -> Self {
-        Self { items: [(0, 0); NOBJECTS], n: 0 }
+        Self { items: [(0, 0); NOBJECTS], n: 0, dma: [(0, 0); NOBJECTS], dn: 0, overflow: false }
     }
     fn push(&mut self, ep: u32, caller: u64) {
         if self.n < self.items.len() {
             self.items[self.n] = (ep, caller);
             self.n += 1;
+        } else {
+            self.overflow = true;
+        }
+    }
+    fn push_dma(&mut self, phys: u64, len: u64) {
+        if self.dn < self.dma.len() {
+            self.dma[self.dn] = (phys, len);
+            self.dn += 1;
+        } else {
+            self.overflow = true;
         }
     }
     /// Die finalisierten `(ep, caller)`-Paare (für den Kernel zum Abbrechen der Calls).
     pub fn iter(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
         self.items[..self.n].iter().copied()
+    }
+    /// Die finalisierten DMA-Regionen `(phys, len)` — **noch nicht freigegeben**.
+    pub fn iter_dma(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.dma[..self.dn].iter().copied()
+    }
+    /// Ging eine Meldung verloren? (Muss immer `false` sein.)
+    pub fn overflowed(&self) -> bool {
+        self.overflow
     }
 }
 
@@ -335,7 +370,7 @@ impl CapSpace {
         &mut self,
         alloc: &mut PhysAllocator,
         ptr: CapPtr,
-        rf: &mut ReplyFinal,
+        rf: &mut Finalized,
     ) -> Result<(), CapError> {
         let slot = self.resolve(ptr)?;
         if self.slots[slot].mdb.first_child.is_some() {
@@ -351,7 +386,7 @@ impl CapSpace {
         &mut self,
         alloc: &mut PhysAllocator,
         ptr: CapPtr,
-        rf: &mut ReplyFinal,
+        rf: &mut Finalized,
     ) -> Result<(), CapError> {
         let slot = self.resolve(ptr)?;
         // Wiederholt zu einem Blatt unterhalb von `slot` absteigen und löschen.
@@ -613,7 +648,7 @@ impl CapSpace {
 
     /// Ein Blatt (Cap ohne Kinder) löschen: aushängen, Refcount senken,
     /// ggf. Objekt finalisieren (Speicher zurückgeben), Slot freigeben.
-    fn delete_leaf(&mut self, alloc: &mut PhysAllocator, slot: usize, rf: &mut ReplyFinal) {
+    fn delete_leaf(&mut self, alloc: &mut PhysAllocator, slot: usize, rf: &mut Finalized) {
         let obj = self.slots[slot].object;
         self.unlink(slot);
         self.release_slot(slot);
@@ -634,9 +669,11 @@ impl CapSpace {
                 ObjectKind::Memory(region) => {
                     alloc.free_region(region);
                 }
-                ObjectKind::Dma { phys, len, .. } => {
-                    alloc.free_region(PhysRegion::new(phys, len));
-                }
+                // **Nicht** freigeben (ext-37): die Region geht als Meldung an den Kernel, der
+                // sie erst nach Stilllegung + Unmap + Sync über einen `DmaTeardownToken`
+                // zurückgeben darf. Ein `free_region` hier wäre die Freigabe *vor* dem Nachweis
+                // — genau die Reihenfolge, die den geräteseitigen Use-after-free ausmacht.
+                ObjectKind::Dma { phys, len, .. } => rf.push_dma(phys, len),
                 ObjectKind::Reply { ep, caller } => rf.push(ep, caller),
                 _ => {}
             }

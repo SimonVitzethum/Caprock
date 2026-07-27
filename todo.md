@@ -216,19 +216,21 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       Maschine mit RAM oberhalb 4 GiB liegt die aus `RAM_TOP` abgeleitete Basis ohnehin darüber,
       auf einer kleineren nicht. Gehört als Bedingung an die Fensterwahl, zusammen mit IR, ACS
       und RMRR.
-- [ ] **Teardown-Token** (`Quiesced` → `Invalidated` → `free_region`): hebt die bewiesene
-      Reihenfolge auf eine erzwungene. Nicht klein — der Free-Pfad liegt in `CapSpace::delete_leaf`
-      (arch-neutrale Cap-Crate, die weder Gerät noch Enforcer kennt). Gangbarer Weg: `ObjectKind::Dma`
-      dort **nicht** freigeben, sondern an den Kernel zurückmelden — dieselbe Mechanik wie
-      `ReplyFinal` für abgebrochene Calls. Drei Dinge müssen dabei mitspezifiziert werden:
-      * Zwischen Rückmeldung und Freigabe existiert ein **Pending-Finalization**-Zustand. Die Region
-        darf darin weder frei noch neu vergebbar sein — eigene Invariante, nicht nur ein Feld.
-      * Die Pending-Menge muss **beschränkt** sein (ein `revoke` über einen Teilbaum erzeugt sie in
-        Serie; eine PD, die Caps zyklisch anlegt und löscht, ebenso).
-      * Quiesziert ein Gerät **nie** (kaputt/hängend), gibt es keinen legitimen Weg zurück. Die
-        ehrliche Antwort: Region bleibt dauerhaft pending, wird geloggt, nie wiederverwendet. Ein
-        Leak ist gegenüber einem UAF das richtige Failure-Mode — aber als **Entscheidung**, nicht
-        als Versehen.
+- [x] **Teardown-Token** (ext-37): `CapSpace::delete_leaf` gibt `ObjectKind::Dma` **nicht** mehr
+      frei, sondern meldet die Region über `Finalized` (vormals `ReplyFinal`) zurück; der Kernel
+      legt still, unmappt, synchronisiert und gibt erst gegen einen `DmaTeardownToken` frei. Der
+      Token trägt eine `DmaRegion` (beide Achsen), nicht eine `PhysRegion`.
+      Die vier Entscheidungen: **synchron** (ein Zwischenzustand, den es meistens nicht gibt, ist
+      schwerer richtig zu halten als einer, den es nie gibt); **gebündelt** für `revoke`
+      (`DmaEnforcer::finalize` nimmt den ganzen Stapel: alle entwaffnen, alle spülen, alle
+      unmappen, ein `TLBI`+`SYNC`); **`KILL` darf Pending erzeugen** (`KillScope` in
+      `destroy_pd`), überall sonst zählt es zusätzlich als Anomalie; **Audit-Code 7** prüft, dass
+      eine Pending-Region weder in der Freiliste noch in einer Übersetzungstabelle steht.
+      Die IOVA-Rückgabe entfällt, weil Nicht-Wiederverwendung Politik ist — ein Zustand weniger.
+      Test `dmatok`: `cap_delete` ohne `dma_detach` baut ab und gibt frei (Basislinie exakt
+      wiederhergestellt); eine StreamID ohne Gerät (Konfigurations-Read `0xFFFF`) landet
+      deterministisch im Pending-Zustand, die Region fehlt genau um ihre Größe, der Unmap ist
+      trotzdem erfolgt, Code 7 hält.
 - [ ] **Descriptor-Typestate** (`Owned<Driver>`/`Owned<Device>`) treiberseitig. Ausdrücklich
       **Ergonomie, nicht TCB**: eine Compile-Zeit-Disziplin innerhalb der Treiber-PD trägt an der
       Vertrauensgrenze nichts — sie fängt Fehler des Treiberautors, nicht das Verhalten eines

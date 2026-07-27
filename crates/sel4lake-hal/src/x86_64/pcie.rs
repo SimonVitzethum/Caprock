@@ -242,9 +242,15 @@ pub fn clear_bus_master(rid: u32) -> u16 {
 /// **Getrennt** vom Entwaffnen, damit ein Aufrufer mit mehreren Geräten erst **alle**
 /// entwaffnen und dann **alle** spülen kann: so ist kein Gerät mehr scharf, während ein anderes
 /// noch spült.
-pub fn flush_posted_writes(rid: u32) {
+pub fn flush_posted_writes(rid: u32) -> u16 {
     let (bus, dev, func) = rid_parts(rid);
-    let _ = cfg_read16(bus, dev, func, CFG_VENDOR);
+    cfg_read16(bus, dev, func, CFG_VENDOR)
+}
+
+/// Das Command-Register lesen (Rücklesen nach einem Schreibzugriff).
+pub fn read_command(rid: u32) -> u16 {
+    let (bus, dev, func) = rid_parts(rid);
+    cfg_read16(bus, dev, func, CFG_COMMAND)
 }
 
 /// Ein Command-Register unverändert zurückschreiben.

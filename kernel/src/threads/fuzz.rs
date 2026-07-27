@@ -350,7 +350,7 @@ fn hwfuzz_epoch(tpd: usize, hpd: usize, upd: usize, base_obj: usize, base_free: 
     let dma = match system::install_dma_cap_ex(dregion.base, dregion.len, dir, coh, Rights::RW) {
         Ok(c) => c,
         Err(_) => {
-            system::free_dma_region(dregion.base, dregion.len);
+            system::free_unattached_dma_region(dregion.base, dregion.len);
             return 71;
         }
     };

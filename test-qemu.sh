@@ -136,6 +136,7 @@ check "pcie    : ALL PASS" "PCIe-ECAM-Enumeration: virtio-rng-pci gefunden, BAR-
 check "smmu    : ALL PASS" "SMMUv3-Bring-up hinter DmaEnforcer: Command-/Event-Queue + Stream-Tabelle, Default-Abort, CR0-Enable, CMD_SYNC-Round-Trip"
 check "smmubind: ALL PASS" "SMMU-Bindung: enable_dma/disable_dma installiert STE->CD->Stage-1 (nur die DMA-Region), Revoke gibt Tabellen frei (balanciert)"
 check "virtiorng: ALL PASS" "virtio-rng-DMA: Geraet DMAt echte Zufallsbytes in die DmaCap-Region; zweistufig: Level-1-Software-Bounds weist Out-of-Window demonstrierbar ab, Level-2-SMMU als HW-Backstop (QEMU emuliert-Geraet-Bypass)"
+check "dmatok  : ALL PASS" "Teardown-Token (ext-37): cap_delete allein legt still, unmappt und synchronisiert vor der Freigabe; unbestaetigte Stilllegung -> Region bleibt dauerhaft pending (Leck statt UAF), Audit-Code 7"
 check "dmawin  : ALL PASS" "IOVA-Fenstergrenzen (ext-36b): 32-Bit-Geraet + erschoepftes Fenster werden laut abgewiesen (kein stilles Abschneiden, kein halb aufgebauter Kontext)"
 check "dmagen  : ALL PASS" "Generische DMA-Infra (ext-24): Richtung/Kohaerenz als DmaCap-Attribute (richtungsminimales SMMU-AP), Multi-Region-Kontext, Stream-Gruppen, Scatter-Gather-Validierung, disjunkte Sub-Puffer (SG-Pfad)"
 check "sasheap : ALL PASS" "Prozess-Heap (ext-25): echter Box/Vec/BTreeMap-Heap auf realen Physadressen; Hybrid-Allokator (Slabs+Bump) ueber Regionsliste + grow/shrink; Testcode 100% safe, unsafe nur in der Region-Runtime"

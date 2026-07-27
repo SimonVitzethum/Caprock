@@ -37,7 +37,25 @@ MODULE_PARM_DESC(cpus, "Zielkerne (Vorgabe 15-19: E-Cores, kein HT-Partner, homo
 
 static int arm;
 module_param(arm, int, 0444);
-MODULE_PARM_DESC(arm, "1 = Stufe 1a: einen Kern wirklich uebernehmen (bis Reboot verloren)");
+MODULE_PARM_DESC(arm, "1 = Kerne wirklich uebernehmen (Long-Mode-Trampolin)");
+
+/*
+ * Beim Entladen die uebernommenen Kerne an Linux zurueckgeben?
+ *
+ * Ich hatte das fuer unmoeglich gehalten und "bis zum Reboot verloren" hingeschrieben. Der Lauf
+ * vom 27.07. hat das widerlegt: CPU 15 lief 24 Minuten in unserer `hlt`-Schleife, und Linux'
+ * eigenes INIT-SIPI-SIPI hat sie folgenlos wieder eingegliedert ("Booting Node 0 Processor 15").
+ * Die Annahme war unbelegt — und sie hatte einen Preis: die Seite unter 1 MiB leckte bei jedem
+ * Lauf, und davon gibt es auf dieser Maschine genau eine.
+ *
+ * Voreingestellt ist deshalb die Rueckgabe. Sie setzt voraus, dass der Kern in einem
+ * **definierten** Zustand parkt (unsere `cli; hlt`-Schleife). Fuehrt er spaeter echten
+ * SEL4Lake-Code aus, ist das nicht mehr selbstverstaendlich — dann `release=0` setzen und den
+ * Reboot nehmen. Die Entscheidung gehoert an den Aufrufer, nicht in eine Annahme.
+ */
+static int release = 1;
+module_param(release, int, 0444);
+MODULE_PARM_DESC(release, "1 = uebernommene Kerne beim Entladen an Linux zurueckgeben (Vorgabe)");
 
 /* Seitenlayout — identisch zu `tramp.S`, dort steht die Begruendung. */
 #define OFF_T16   0x000
@@ -331,19 +349,18 @@ static void __exit handover_exit(void)
 	int i;
 
 	/*
-	 * Nur der TATSAECHLICH uebernommene Kern bleibt verloren. Ihn per `add_cpu`
-	 * zurueckzuholen hiesse, Linux' Hotplug auf einen Kern in unbekanntem Zustand
-	 * loszulassen; ein verlorener Kern bis zum Reboot ist der bessere Failure-Mode.
-	 *
-	 * Die uebrigen sind lediglich offline und voellig unberuehrt — sie pauschal
-	 * mitverlieren zu lassen waere die stille Ueberdehnung einer Einschraenkung auf
-	 * Faelle, fuer die ihre Begruendung gar nicht gilt. Stufe 1a nimmt genau einen Kern.
+	 * Erst die nicht uebernommenen (die parken in Linux' eigener Schleife), dann — wenn
+	 * `release` es erlaubt — die uebernommenen. Linux schickt ihnen sein eigenes
+	 * INIT-SIPI-SIPI und holt sie damit aus unserer `hlt`-Schleife zurueck.
 	 */
-	for (i = ncpus - 1; i >= narmed; i--) {
+	for (i = ncpus - 1; i >= 0; i--) {
+		if (i < narmed && !release)
+			continue;
 		if (we_offlined[i] && !add_cpu(cpus[i]))
-			pr_info("sel4lake: CPU %d wieder online\n", cpus[i]);
+			pr_info("sel4lake: CPU %d wieder online%s\n", cpus[i],
+				i < narmed ? " (war uebernommen)" : "");
 	}
-	if (narmed) {
+	if (narmed && !release) {
 		/*
 		 * Park-Seite und Seitentabellen bleiben stehen: `CR3` des uebernommenen Kerns
 		 * zeigt auf die Tabellen, sein `RIP` in die Park-Seite. Sie freizugeben, weil
@@ -356,12 +373,20 @@ static void __exit handover_exit(void)
 			narmed);
 		return;
 	}
+	/*
+	 * Freigeben erst, nachdem die Kerne zurueck sind — sie liefen bis eben in der Park-Seite
+	 * mit `CR3` auf diesen Tabellen. Die Reihenfolge ist dieselbe wie im DMA-Teardown des
+	 * Kernels: erst die Nutzung beenden, dann die Ressource zurueckgeben, nie umgekehrt.
+	 */
 	if (low_page)
 		__free_pages(low_page, 0);
 	for (i = 0; i < ARRAY_SIZE(park_pages); i++)
 		if (park_pages[i])
 			__free_page(park_pages[i]);
 	free_identity_tables();
+	if (narmed)
+		pr_info("sel4lake: %d uebernommene Kern(e) zurueckgegeben, alle Seiten frei\n",
+			narmed);
 }
 
 module_init(handover_init);

@@ -750,7 +750,23 @@ fn local_cwg() -> u64 {
 /// [`dma_granule`] liefert das Maximum.
 ///
 pub fn record_cache_granule() {
-    CWG_MAX.fetch_max(local_cwg(), core::sync::atomic::Ordering::Relaxed);
+    let g = local_cwg();
+    // Nach dem Versiegeln darf kein Kern mehr einen GRÖSSEREN Wert melden: seither geprägte
+    // DMA-Caps wurden gegen das kleinere Maximum geprüft und wären rückwirkend zu schwach
+    // geprüft. Ein leises Anheben würde genau das verdecken — deshalb ein Abbruch mit Kontext.
+    // Erreichbar wäre das nur durch CPU-Hotplug oder einen verzögerten Sekundärkern; heute
+    // starten alle Kerne vor `seal_cache_granule()` (s. `kernel_main`).
+    if CWG_SEALED.load(core::sync::atomic::Ordering::Acquire)
+        && g > CWG_MAX.load(core::sync::atomic::Ordering::Relaxed)
+    {
+        panic!(
+            "CTR_EL0.CWG={} eines spaeten Kerns groesser als das versiegelte Maximum {} — \
+             seither gepraegte DMA-Caps waeren zu schwach geprueft",
+            g,
+            CWG_MAX.load(core::sync::atomic::Ordering::Relaxed)
+        );
+    }
+    CWG_MAX.fetch_max(g, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Architektonische Obergrenze, wenn (noch) nicht alle Kerne gemeldet haben.

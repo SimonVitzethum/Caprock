@@ -167,7 +167,21 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
 - [x] **Granularitätsprüfung an der Cap-Prägung** (`CapError::Unaligned`, Test `dmaalign`).
 - [x] **ATS-Entscheidung** mit den drei Bedingungen, unter denen sie revidiert werden dürfte.
 
-- [ ] **IOVA ≠ PA** — die user-sichtbare DMA-Adresse ist heute die physische (`DmaHandle.iova`
+- [ ] **IOVA ≠ PA** — in **zwei** Schritten, damit der negative Test etwas beweist statt zu
+      bestätigen: (a) `dma_prepare`/`dma_complete` auf die **PA**-Achse und `dma_addr_in_region`
+      auf die **IOVA**-Achse umstellen, **während IOVA = PA noch gilt** — der Umbau ist dann in
+      sich prüfbar und beide Architekturen müssen grün bleiben, weil sich am Verhalten nichts
+      ändert; (b) erst dann die Fensterbasis von 0 wegdrehen. Der negative Test (PA als
+      Deskriptoradresse → Fault) kippt genau im zweiten Schritt. Schlägt er schon im ersten an,
+      ist ein echter Achsenfehler gefunden statt eines Feldes.
+      Fünf Entscheidungen: eigener **Bump-Allokator je Kontext** ab einer Fensterbasis, die
+      **Kontext-Attribut** ist (nicht Konstante — sie muss in die per `CD.T0SZ` konfigurierte
+      Eingangsbreite passen, und ein 32-bit-Gerät braucht ein Fenster unter 4 GiB); **keine
+      arithmetische Beziehung** zu PA (kein `PA + offset`, sonst funktioniert ein
+      Passthrough-Enforcer für einen Teil der Regionen zufällig weiter und das laute Scheitern
+      fällt aus); **Guard-Seiten** vor und hinter jeder Region; **IOVA 0 dauerhaft unabgebildet**;
+      `DmaHandle` trägt beide Werte, das PA-Feld **kernelprivat**.
+      Die user-sichtbare DMA-Adresse ist heute die physische (`DmaHandle.iova`
       existiert bereits mit dem Kommentar „Abstraktion für später"; `vspace_map_page_at` und
       `stage1_map_region` liefern die Bausteine).
       **Einordnung: Defense in Depth, nicht Isolation.** Isolation liefert die IOMMU; heute schließt

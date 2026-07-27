@@ -209,8 +209,8 @@ fn write_cmd(bus: u8, dev: u8, func: u8, cmd: u16) {
     cfg_write32(bus, dev, func, CFG_COMMAND, cmd as u32);
 }
 
-/// Bus-Master **löschen** und bereits abgesetzte Writes spülen; gibt das vorherige
-/// Command-Register zurück (Save/Restore, nie „auf 1 setzen").
+/// Bus-Master **löschen**; gibt das vorherige Command-Register zurück (Save/Restore, nie
+/// „auf 1 setzen"). Das Spülen ist ein eigener Schritt: [`flush_posted_writes`].
 ///
 /// Zwei Schritte, die verschiedene Dinge tun und einander **nicht** ersetzen:
 /// 1. Bus-Master löschen — danach keine **neuen** Memory-Requests mehr.
@@ -230,12 +230,21 @@ fn write_cmd(bus: u8, dev: u8, func: u8, cmd: u16) {
 /// Kernels (`DmaCtx.quiesce_depth`, parallel zur StreamID-Liste): dort ist sie durch denselben
 /// Lock geschützt wie die RID selbst und kann nicht überlaufen, weil die Kapazität dieselbe
 /// Quelle hat wie die Kontextobergrenze.
-pub fn clear_bus_master_and_flush(rid: u32) -> u16 {
+pub fn clear_bus_master(rid: u32) -> u16 {
     let (bus, dev, func) = rid_parts(rid);
     let cmd = cfg_read16(bus, dev, func, CFG_COMMAND);
     write_cmd(bus, dev, func, cmd & !CMD_BUS_MASTER);
-    let _ = cfg_read16(bus, dev, func, CFG_VENDOR); // Flush-Read (s. o.)
     cmd
+}
+
+/// Bereits abgesetzte Writes dieses Geräts spülen (Schritt 2, s. [`clear_bus_master`]).
+///
+/// **Getrennt** vom Entwaffnen, damit ein Aufrufer mit mehreren Geräten erst **alle**
+/// entwaffnen und dann **alle** spülen kann: so ist kein Gerät mehr scharf, während ein anderes
+/// noch spült.
+pub fn flush_posted_writes(rid: u32) {
+    let (bus, dev, func) = rid_parts(rid);
+    let _ = cfg_read16(bus, dev, func, CFG_VENDOR);
 }
 
 /// Ein Command-Register unverändert zurückschreiben.

@@ -127,6 +127,12 @@ Gerät, das absichtlich aus war, darf ein Teardown nicht einschalten.
 
 Die Wiederherstellung bringt drei Bedingungen mit, die der naive Ablauf nicht hatte:
 
+0. **Über *alle* StreamIDs des Kontexts.** Die Region ist im **Kontext** gemappt, nicht an einer
+   RID — bei einer Stream-Gruppe (mehrere Geräte teilen eine Stage-1-Tabelle) können in-flight
+   Writes von **jedem** Gerät der Gruppe kommen. Entwaffnet würde nur das eine, dessen StreamID
+   der Teardown trägt, wäre der Zähler korrekt und die Flush-Garantie trotzdem unvollständig.
+   Reihenfolge: erst **alle** entwaffnen, dann **alle** spülen, dann unmappen, dann in umgekehrter
+   Ordnung freigeben — so ist kein Gerät der Gruppe mehr scharf, während ein anderes noch spült.
 1. **Serialisierung je RID — gegen Detach *und* Attach.** Zwei nebenläufige Teardowns auf
    demselben Gerät dürfen sich nicht gegenseitig entwaffnen: entwaffnet A, spült B, und stellt A
    dann wieder her, *bevor* B seine Region entfernt hat, ist B's Flush-Garantie wertlos. Dieselbe
@@ -176,7 +182,10 @@ Zwei Fallen, an denen der Wert still zu klein antworten kann, beide behandelt:
   `dma_granule` liefert das **Maximum**. Bis `seal_cache_granule()` nach dem SMP-Hochlauf gerufen
   ist, liefert es stattdessen die **architektonische Obergrenze** — eine früh geprägte Cap wird
   also gegen die strengstmögliche Granularität geprüft und kann nie zu schwach geprüft worden
-  sein. Damit ist die Annahme **erzwungen statt dokumentiert**.
+  sein. Damit ist die Annahme **erzwungen statt dokumentiert**. Meldet ein Kern **nach** dem
+  Versiegeln einen *größeren* Wert (CPU-Hotplug, verzögerter Sekundärkern), ist das ein
+  **Abbruch**, kein leises Anheben: seither geprägte Caps wären rückwirkend zu schwach geprüft,
+  und das würde ein Anheben genau verdecken. Heute starten alle Kerne vor dem Versiegeln.
 
 Zur Unterscheidung: **DminLine** ist die Schrittweite der Wartungsschleife (Minimum, damit keine
 Zeile ausgelassen wird), **CWG** die Ausrichtungs-/Padding-Granularität (Maximum, damit keine

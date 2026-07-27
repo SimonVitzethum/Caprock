@@ -2270,7 +2270,7 @@ mod smmu_enforcer_arm {
             else {
                 return;
             };
-            ctx_quiesce(&mut t[slot], binding.stream_id);
+            ctx_quiesce(&mut t[slot]);
             let l1 = t[slot].l1;
             // Region aus der Stage-1-Tabelle entfernen (danach kann das Gerät NICHT mehr dorthin
             // DMAen) + TLBI+SYNC. DMA-use-after-free-sicher (vor VSpace-Unmap + free_region).
@@ -2293,8 +2293,13 @@ mod smmu_enforcer_arm {
             // das Gerät legitim weiter in Betrieb und die eben entfernte Region ist ab dem
             // TLBI+SYNC ohnehin unerreichbar. Hat es keine Region mehr, bleibt Bus-Master **aus**
             // (fail-safe). Die Kopplung an die ATS-Entscheidung steht bei `release_quiesce`.
+            // Bedingung **beim Restore** ausgewertet, nicht beim Entwaffnen gecacht: die
+            // Pending-Intent-Mechanik kann Quiesce-Tiefe und Regionenzahl auseinanderziehen (ein
+            // `attach` bei Tiefe > 0 erhöht die Regionen, ohne die Tiefe zu ändern). Effektiv gilt
+            // damit  BME_neu = gespeichertes_BME  UND  Regionen(ctx) > 0,  beides zum Zeitpunkt
+            // 1→0 unter demselben Lock.
             let still_in_use = !t[slot].regs.iter().all(|&(_, l)| l == 0);
-            ctx_release(&mut t[slot], binding.stream_id, still_in_use);
+            ctx_release(&mut t[slot], still_in_use);
             // Letzte Region weg -> Kontext abbauen: alle STEs der Gruppe invalidieren, Stage-1 + CD frei.
             if t[slot].regs.iter().all(|&(_, l)| l == 0) {
                 let mut p = self.cmdq_prod.load(Ordering::Acquire);
@@ -2426,13 +2431,32 @@ fn sid_index(c: &DmaCtx, rid: u32) -> Option<usize> {
     c.sids.iter().position(|&s| s == rid)
 }
 
-/// Gerät stilllegen (nur beim Übergang 0→1 tatsächlich; sonst nur zählen).
-fn ctx_quiesce(c: &mut DmaCtx, rid: u32) {
-    let Some(k) = sid_index(c, rid) else { return };
-    if c.quiesce_depth[k] == 0 {
-        c.saved_cmd[k] = hal::pcie::clear_bus_master_and_flush(rid);
+/// **Alle** Geräte des Kontexts stilllegen (nur beim Übergang 0→1 je Gerät tatsächlich).
+///
+/// Über **alle** StreamIDs, nicht nur die des Teardowns: die Region ist im **Kontext** gemappt,
+/// nicht an einer RID. Bei einer Stream-Gruppe (mehrere Geräte teilen eine Stage-1-Tabelle,
+/// s. `share_context`) können in-flight Writes von **jedem** Gerät der Gruppe kommen — würde nur
+/// das eine entwaffnet, wäre der Zähler korrekt und die Flush-Garantie trotzdem unvollständig:
+/// die Region würde entfernt und freigegeben, während ein zweites Gerät desselben Kontexts noch
+/// Writes unterwegs hat.
+///
+/// Reihenfolge: erst **alle** entwaffnen, dann **alle** spülen. So ist kein Gerät der Gruppe mehr
+/// scharf, während ein anderes noch spült.
+fn ctx_quiesce(c: &mut DmaCtx) {
+    for k in 0..MAX_CTX_SIDS {
+        if c.sids[k] == u32::MAX {
+            continue;
+        }
+        if c.quiesce_depth[k] == 0 {
+            c.saved_cmd[k] = hal::pcie::clear_bus_master(c.sids[k]);
+        }
+        c.quiesce_depth[k] += 1;
     }
-    c.quiesce_depth[k] += 1;
+    for k in 0..MAX_CTX_SIDS {
+        if c.sids[k] != u32::MAX {
+            hal::pcie::flush_posted_writes(c.sids[k]);
+        }
+    }
 }
 
 /// Stilllegung aufheben (nur beim Übergang 1→0 tatsächlich).
@@ -2444,21 +2468,23 @@ fn ctx_quiesce(c: &mut DmaCtx, rid: u32) {
 /// **Kopplung an die ATS-Entscheidung** (`docs/invariants.md` §2b): Wiedereinschalten ist nur
 /// solide, *weil* nach `CMD_TLBI`+`CMD_SYNC` keine gecachte Übersetzung mehr existiert. Mit
 /// **ATS** existiert sie im ATC des Geräts — dann müsste hier eine ATC-Invalidierung davorstehen.
-fn ctx_release(c: &mut DmaCtx, rid: u32, allow_bme: bool) {
-    let Some(k) = sid_index(c, rid) else { return };
-    if c.quiesce_depth[k] == 0 {
-        return;
+fn ctx_release(c: &mut DmaCtx, allow_bme: bool) {
+    // Umgekehrte Reihenfolge zum Entwaffnen (symmetrischer Abbau).
+    for k in (0..MAX_CTX_SIDS).rev() {
+        if c.sids[k] == u32::MAX || c.quiesce_depth[k] == 0 {
+            continue;
+        }
+        c.quiesce_depth[k] -= 1;
+        if c.quiesce_depth[k] > 0 {
+            continue; // ein anderer Teardown hält dieses Gerät noch still
+        }
+        let cmd = if allow_bme {
+            c.saved_cmd[k]
+        } else {
+            c.saved_cmd[k] & !hal::pcie::CMD_BUS_MASTER_BIT
+        };
+        hal::pcie::write_command(c.sids[k], cmd);
     }
-    c.quiesce_depth[k] -= 1;
-    if c.quiesce_depth[k] > 0 {
-        return; // ein anderer Teardown hält das Gerät noch still
-    }
-    let cmd = if allow_bme {
-        c.saved_cmd[k]
-    } else {
-        c.saved_cmd[k] & !hal::pcie::CMD_BUS_MASTER_BIT
-    };
-    hal::pcie::write_command(rid, cmd);
 }
 
 /// Bus-Master nach dem Installieren einer Übersetzung erteilen.

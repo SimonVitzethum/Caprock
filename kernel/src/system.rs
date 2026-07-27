@@ -572,13 +572,55 @@ pub fn set_hooks() {
 
 /// Freies RAM `[free_base, ram_end)` beim Allokator registrieren.
 pub fn init_mem(free_base: u64, ram_end: u64) {
-    RAM_TOP.store(ram_end, Ordering::Release);
-    MEM.lock().add_region(free_base, ram_end - free_base);
+    init_mem_regions(&[(free_base, ram_end - free_base)], ram_end);
+}
+
+/// Freien Speicher als **Liste von Bereichen** registrieren.
+///
+/// Der Kernel bekam seinen Speicher bisher als genau ein `[free_base, ram_end)`. Das ist die
+/// Sicht eines Kernels, der die Maschine allein besitzt — und genau die gilt nicht mehr, sobald
+/// er neben einem anderen Betriebssystem auf uebergebenen Kernen laeuft: dort kommt der Speicher
+/// als Sammlung dessen, was der Wirt hergibt (auf Linux hoechstens 4 MiB am Stueck, weil die
+/// Buddy-Ordnung dort endet).
+///
+/// Der Allokator selbst fuehrt ohnehin eine Fragmentliste; die Einschraenkung lag allein in
+/// dieser Funktion. `ram_top` bleibt separat, weil daran die Wahl des IOVA-Fensters haengt —
+/// es muss oberhalb des **hoechsten** physischen Speichers liegen, nicht oberhalb des letzten
+/// uebergebenen Bereichs.
+pub fn init_mem_regions(regions: &[(u64, u64)], ram_top: u64) {
+    RAM_TOP.store(ram_top, Ordering::Release);
+    let mut mem = MEM.lock();
+    for &(base, len) in regions {
+        if len != 0 && !mem.add_region(base, len) {
+            // Laut scheitern statt still weniger Speicher zu haben: ein verworfener Bereich
+            // faellt sonst erst auf, wenn eine spaetere Allokation ohne erkennbaren Grund
+            // fehlschlaegt.
+            // Die serielle Ausgabe haengt am aarch64-HAL (s. `note_undeclared_device`).
+            #[cfg(target_arch = "aarch64")]
+            crate::println!(
+                "mem     : WARNUNG Bereich 0x{:x}+0x{:x} nicht aufgenommen (Fragmentliste voll)",
+                base,
+                len
+            );
+            MEM_REGIONS_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Oberste physische RAM-Adresse (aus dem Boot). Grundlage für die Wahl des IOVA-Fensters:
 /// oberhalb davon kann eine IOVA **nie** eine gültige PA sein.
 static RAM_TOP: AtomicU64 = AtomicU64::new(0);
+
+/// Wie viele beim Hochlauf angebotene Speicherbereiche **nicht** aufgenommen wurden.
+///
+/// Muss 0 sein. Ein verworfener Bereich faellt sonst erst auf, wenn eine spaetere Allokation
+/// ohne erkennbaren Grund fehlschlaegt — gezaehlt statt stillschweigend hingenommen.
+static MEM_REGIONS_DROPPED: AtomicU32 = AtomicU32::new(0);
+
+/// Anzahl beim Hochlauf verworfener Speicherbereiche (muss 0 sein).
+pub fn mem_regions_dropped() -> u32 {
+    MEM_REGIONS_DROPPED.load(Ordering::Relaxed)
+}
 
 /// **Thread-Slots je Kern**, die der Kernel im Mittel vorsieht. Die Gesamtkapazität ist
 /// `cores * THREADS_PER_CORE`; jeder Kern kann durch Migration bis zum

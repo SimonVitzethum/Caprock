@@ -401,7 +401,34 @@ pub fn run(multiboot_info: u64) -> ! {
         }
     };
     let free_base = hal::mmu::kernel_end().max(hal::mmu::USER_RAM_MIN);
-    system::init_mem(free_base, ram_end);
+    /*
+     * Den freien Speicher **absichtlich zerstueckelt** uebergeben, statt als einen Block.
+     *
+     * Fuer die Kern-Uebergabe an Linux (Variante B) kommt der Speicher als Sammlung dessen,
+     * was der Wirt hergibt -- dort hoechstens 4 MiB am Stueck. Ob der Kernel damit umgehen
+     * kann, ist keine Frage der Absicht, sondern eine Eigenschaft, die gelten muss; und ein
+     * Pfad, der im Test nie zerstueckelten Speicher sieht, belegt sie nicht. Also sieht der
+     * regulaere QEMU-Lauf ihn immer: dieselbe Menge Speicher, nur in acht Bereichen.
+     *
+     * Luecken entstehen dabei keine -- die Bereiche stossen aneinander. Der Allokator
+     * verschmilzt sie beim Freigeben ohnehin wieder; geprueft wird der *Eingang*.
+     */
+    const SPLIT: u64 = 8;
+    let total = ram_end - free_base;
+    let chunk = (total / SPLIT) & !0xfff;
+    let mut regions = [(0u64, 0u64); SPLIT as usize];
+    for (i, r) in regions.iter_mut().enumerate() {
+        let base = free_base + (i as u64) * chunk;
+        let len = if i as u64 == SPLIT - 1 { ram_end - base } else { chunk };
+        *r = (base, len);
+    }
+    system::init_mem_regions(&regions, ram_end);
+    println!(
+        "mem     : {} Bereiche a ~{} MiB uebergeben (zerstueckelt, wie es die Kern-Uebergabe liefert), verworfen={}",
+        SPLIT,
+        chunk >> 20,
+        system::mem_regions_dropped()
+    );
     println!("mem     : freies RAM [{free_base:#x}, {ram_end:#x})");
     crate::selftest::run();
 

@@ -503,9 +503,21 @@ fn wait_status(mask: u32, want_set: bool) -> bool {
 /// DMA-Anforderung eines Geräts läuft in einen nicht vorhandenen Kontext und wird abgewiesen.
 ///
 /// Gibt `true` zurück, wenn die Übersetzung danach aktiv ist (`GSTS.TES`).
-pub fn init(root_table: u64) -> bool {
+pub fn init(root_table: u64, alloc: &mut dyn FnMut() -> Option<u64>) -> bool {
     if !discover() {
         return false;
+    }
+    // **Kontext-Tabellen einmal beim Hochlauf**, eine je Bus (256 x 4 KiB = 1 MiB), statt sie
+    // beim ersten `attach` nachzuziehen. Drei Gründe, und der dritte ist der eigentliche:
+    // sie sind eine **Bus**-Struktur und dürfen beim Abbau eines einzelnen Kontexts gar nicht
+    // freigegeben werden (andere Geräte desselben Busses hängen daran); die Symmetrie zur
+    // ARM-Seite, wo die lineare Stream-Tabelle ebenfalls einmal beim Bring-up entsteht; und
+    // dass der DMA-Pfad damit **ohne Allokation** auskommt — eine lazy angelegte, nie
+    // freigegebene Tabelle sähe in jeder Ressourcenbilanz wie ein Leck aus.
+    for bus in 0..256u64 {
+        let Some(ctx) = alloc() else { return false };
+        // SAFETY: `root_table` ist ein frisch genulltes, identity-gemapptes 4-KiB-Frame.
+        unsafe { write_entry(root_table + bus * 16, (ctx & ADDR_MASK) | 1) };
     }
     ROOT_TABLE[0].store(root_table, Ordering::Release);
     // Root-Table-Pointer setzen (Bits 63:12; Translation Table Mode = Legacy).
@@ -535,4 +547,278 @@ pub fn invalidate_context_cache() -> bool {
         core::hint::spin_loop();
     }
     false
+}
+
+// --- Übersetzungstabellen (Schritt 3) ---------------------------------------------------------
+//
+// Root-Tabelle (256 Einträge à 16 Byte, indiziert mit dem Bus) -> Kontext-Tabelle je Bus
+// (256 Einträge à 16 Byte, indiziert mit `dev<<3 | func`) -> Second-Level-Pagetable.
+//
+// Zwei Eigenschaften, die aus der Fähigkeitslesung folgen und nicht aus Gewohnheit:
+//
+// * **`ECAP.C == 0`** — die Einheit ist *nicht* page-walk-kohärent und sieht die Schreibvorgänge
+//   auf Root-, Kontext- und SLPT-Einträge nicht durch den Cache. Jeder Eintrag braucht deshalb
+//   einen `clflush` **vor** der zugehörigen Invalidierung, und zwar auch auf den Zwischenebenen
+//   beim Aufbau eines neuen Zweigs, nicht nur auf dem Blatt. Damit das keine Disziplinfrage
+//   bleibt, geht **jeder** Tabellenschreibzugriff durch [`write_entry`], das nie ohne Flush
+//   zurückkehrt. Auf kohärenten Einheiten wird der Flush zum No-Op — die Stelle bleibt sichtbar.
+// * **`ECAP.SC == 0`** — keine Snoop Control. Das `SNP`-Bit im SLPTE ist dann **reserviert**, und
+//   reservierte Bits faulten; es darf also nicht gesetzt werden. Folge: No-Snoop-DMA bleibt
+//   unkohärent, und `dma_granule() == 1` auf x86 gilt unter der Bedingung, dass die zugeteilten
+//   Geräte kein No-Snoop verwenden (s. `docs/invariants.md` §2a).
+
+/// SLPTE/Kontext-Bits.
+const SL_READ: u64 = 1 << 0;
+const SL_WRITE: u64 = 1 << 1;
+/// `SNP` (Snoop) — **nur** zulässig, wenn `ECAP.SC` gesetzt ist.
+const SL_SNP: u64 = 1 << 11;
+const ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+
+/// Kontext-Eintrag: `P` (Present) und `FPD` (Fault Processing Disable).
+const CTX_PRESENT: u64 = 1 << 0;
+/// `FPD` ist **wörtlich `CD.R` noch einmal**: gesetzt, werden Faults dieses Geräts nicht
+/// aufgezeichnet — und ein Negativtest bestünde wieder an einer strukturell leeren Beobachtung.
+/// Die Konstante existiert, damit die Entscheidung *dagegen* im Code steht und nicht in einer
+/// vergessenen Null.
+#[allow(dead_code)]
+const CTX_FPD: u64 = 1 << 1;
+
+/// Einen Tabelleneintrag schreiben — **nie ohne Flush**.
+///
+/// # Safety
+/// `addr` muss eine gültige, identity-gemappte Tabellenadresse sein.
+unsafe fn write_entry(addr: u64, v: u64) {
+    unsafe { core::ptr::write_volatile(addr as *mut u64, v) };
+    flush_entry(addr);
+}
+
+/// Cache-Line der Adresse zurückschreiben, falls die Einheit nicht page-walk-kohärent ist.
+fn flush_entry(addr: u64) {
+    let coherent = VtdCaps::read().map(|c| c.coherent_walk).unwrap_or(false);
+    if coherent {
+        return; // die Einheit sieht den Schreibzugriff ohnehin
+    }
+    // SAFETY: `clflush` auf eine gemappte Adresse ist nebenwirkungsfrei; `sfence` ordnet.
+    unsafe {
+        core::arch::asm!("clflush [{a}]", "sfence", a = in(reg) addr, options(nostack, preserves_flags));
+    }
+}
+
+/// Eine Region `[iova, iova+len)` -> `[pa, ...)` in die **Second-Level-Pagetable** `slpt`
+/// einhängen. `levels` = 3 (39 Bit) oder 4 (48 Bit).
+///
+/// **Richtung fällt hier heraus statt hinzuzukommen:** Präsenz *ist* `R|W`, ein eigenes P-Bit
+/// gibt es nicht. `ToDevice` (das Gerät liest) wird damit zu „nur R", und ein solcher Puffer ist
+/// gegen das Gerät schreibgeschützt — dieselbe Eigenschaft wie über die SMMU-Rechte, ohne
+/// Zusatzarbeit.
+///
+/// # Safety
+/// `slpt` ist eine gültige, identity-gemappte SLPT-Wurzel; `alloc` liefert genullte 4-KiB-Frames.
+pub unsafe fn slpt_map(
+    slpt: u64,
+    levels: u32,
+    iova: u64,
+    pa: u64,
+    len: u64,
+    readable: bool,
+    writable: bool,
+    alloc: &mut dyn FnMut() -> Option<u64>,
+) -> bool {
+    if len == 0 || iova % 4096 != 0 || pa % 4096 != 0 || len % 4096 != 0 {
+        return false;
+    }
+    let snp = if VtdCaps::read().map(|c| c.snoop_control).unwrap_or(false) {
+        SL_SNP
+    } else {
+        0 // ohne ECAP.SC ist das Bit reserviert -> setzen würde faulten
+    };
+    let leaf_bits = snp
+        | if readable { SL_READ } else { 0 }
+        | if writable { SL_WRITE } else { 0 };
+    if leaf_bits & (SL_READ | SL_WRITE) == 0 {
+        return false; // ohne R und W wäre der Eintrag nicht präsent
+    }
+    let mut v = iova;
+    let mut p = pa;
+    while v < iova + len {
+        let mut tbl = slpt;
+        // Von der Wurzel abwärts; die unterste Ebene trägt das Blatt.
+        for lvl in (1..levels).rev() {
+            let shift = 12 + 9 * lvl;
+            let idx = ((v >> shift) & 0x1ff) as u64;
+            let e = tbl + idx * 8;
+            // SAFETY: `tbl` ist ein gültiger Tabellen-Frame, `idx` < 512.
+            let cur = unsafe { core::ptr::read_volatile(e as *const u64) };
+            tbl = if cur & (SL_READ | SL_WRITE) != 0 {
+                cur & ADDR_MASK
+            } else {
+                let Some(next) = alloc() else { return false };
+                // Zwischenebenen sind ebenfalls flush-pflichtig.
+                unsafe { write_entry(e, (next & ADDR_MASK) | SL_READ | SL_WRITE) };
+                next
+            };
+        }
+        let idx = ((v >> 12) & 0x1ff) as u64;
+        // SAFETY: `tbl` gültig, `idx` < 512.
+        unsafe { write_entry(tbl + idx * 8, (p & ADDR_MASK) | leaf_bits) };
+        v += 4096;
+        p += 4096;
+    }
+    true
+}
+
+/// Eine Region wieder aus der SLPT entfernen (Blätter auf 0). Die Tabellen-Frames bleiben.
+///
+/// # Safety
+/// wie [`slpt_map`].
+pub unsafe fn slpt_unmap(slpt: u64, levels: u32, iova: u64, len: u64) {
+    let mut v = iova;
+    while v < iova + len {
+        let mut tbl = slpt;
+        let mut ok = true;
+        for lvl in (1..levels).rev() {
+            let shift = 12 + 9 * lvl;
+            let idx = ((v >> shift) & 0x1ff) as u64;
+            // SAFETY: gültiger Tabellen-Frame.
+            let cur = unsafe { core::ptr::read_volatile((tbl + idx * 8) as *const u64) };
+            if cur & (SL_READ | SL_WRITE) == 0 {
+                ok = false;
+                break;
+            }
+            tbl = cur & ADDR_MASK;
+        }
+        if ok {
+            let idx = ((v >> 12) & 0x1ff) as u64;
+            // SAFETY: gültiger Tabellen-Frame.
+            unsafe { write_entry(tbl + idx * 8, 0) };
+        }
+        v += 4096;
+    }
+}
+
+/// Alle Frames einer SLPT einsammeln (Blätterebenen zuerst) und über `free` zurückgeben.
+///
+/// # Safety
+/// `slpt` ist eine gültige SLPT-Wurzel mit `levels` Ebenen.
+pub unsafe fn slpt_free(slpt: u64, levels: u32, free: &mut dyn FnMut(u64)) {
+    // SAFETY: read-only-Scan über gültige Tabellen-Frames.
+    unsafe fn walk(tbl: u64, lvl: u32, free: &mut dyn FnMut(u64)) {
+        if lvl > 1 {
+            for i in 0..512u64 {
+                let e = unsafe { core::ptr::read_volatile((tbl + i * 8) as *const u64) };
+                if e & (SL_READ | SL_WRITE) != 0 {
+                    unsafe { walk(e & ADDR_MASK, lvl - 1, free) };
+                }
+            }
+        }
+        free(tbl);
+    }
+    unsafe { walk(slpt, levels, free) };
+}
+
+/// Einen **Kontext-Eintrag** für `rid` schreiben: zeigt auf `slpt`, Domain `did`, Adressbreite
+/// aus `levels`. `root` ist die Root-Tabelle; `alloc` liefert bei Bedarf eine Kontext-Tabelle.
+///
+/// `FPD` bleibt **aus** — Faults dieses Geräts sollen aufgezeichnet werden.
+///
+/// # Safety
+/// `root` ist eine gültige, identity-gemappte Root-Tabelle.
+pub unsafe fn context_set(
+    root: u64,
+    rid: u32,
+    slpt: u64,
+    did: u16,
+    levels: u32,
+    alloc: &mut dyn FnMut() -> Option<u64>,
+) -> bool {
+    let bus = ((rid >> 8) & 0xff) as u64;
+    let devfn = (rid & 0xff) as u64;
+    let re = root + bus * 16;
+    // SAFETY: `root` gültig, `bus` < 256.
+    let cur = unsafe { core::ptr::read_volatile(re as *const u64) };
+    let ctx = if cur & 1 != 0 {
+        cur & ADDR_MASK
+    } else {
+        let Some(t) = alloc() else { return false };
+        unsafe { write_entry(re, (t & ADDR_MASK) | 1) };
+        t
+    };
+    // AW-Kodierung: 1 = 39 Bit (3 Level), 2 = 48 Bit (4 Level).
+    let aw = (levels as u64).saturating_sub(2);
+    let lo = (slpt & ADDR_MASK) | CTX_PRESENT; // T = 00 (nur untranslated Requests)
+    let hi = aw | ((did as u64) << 8);
+    // SAFETY: `ctx` gültig, `devfn` < 256.
+    unsafe {
+        write_entry(ctx + devfn * 16, lo);
+        write_entry(ctx + devfn * 16 + 8, hi);
+    }
+    true
+}
+
+/// Einen Kontext-Eintrag entfernen (nicht mehr präsent -> Default-Block).
+///
+/// # Safety
+/// wie [`context_set`].
+pub unsafe fn context_clear(root: u64, rid: u32) {
+    let bus = ((rid >> 8) & 0xff) as u64;
+    let devfn = (rid & 0xff) as u64;
+    // SAFETY: `root` gültig.
+    let cur = unsafe { core::ptr::read_volatile((root + bus * 16) as *const u64) };
+    if cur & 1 == 0 {
+        return;
+    }
+    let ctx = cur & ADDR_MASK;
+    // SAFETY: `ctx` gültig, `devfn` < 256.
+    unsafe {
+        write_entry(ctx + devfn * 16, 0);
+        write_entry(ctx + devfn * 16 + 8, 0);
+    }
+}
+
+/// Globale **IOTLB**-Invalidierung (Registerpfad).
+///
+/// Der Kernel fährt bewusst **nur** den Registerpfad, nicht zusätzlich Queued Invalidation:
+/// `ECAP.QI` ist zwar vorhanden, aber beide Wege parallel zu betreiben wäre zwei Mechanismen für
+/// dieselbe Aufgabe. QI bleibt als Optimierung vorgemerkt; solange `GCMD.QIE` aus ist, ist der
+/// Registerpfad der spezifikationsgemäße.
+pub fn invalidate_iotlb_global() -> bool {
+    let mut all_ok = true;
+    for u in 0..unit_count() {
+        let Some(c) = VtdCaps::read_unit(u) else { continue };
+        let iro = (((c.raw_ecap >> 8) & 0x3ff) * 16) as usize;
+        let iotlb = iro + 8;
+        const IVT: u64 = 1 << 63;
+        const IIRG_GLOBAL: u64 = 1 << 60;
+        wu64(u, iotlb, IVT | IIRG_GLOBAL);
+        let mut ok = false;
+        for _ in 0..1_000_000 {
+            if ru64(u, iotlb) & IVT == 0 {
+                ok = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        all_ok &= ok;
+    }
+    all_ok
+}
+
+/// **Nach jeder Tabellenänderung**: erst Kontext-Cache, dann IOTLB.
+///
+/// Die Reihenfolge ist nicht beliebig: umgekehrt könnte ein noch gecachter Kontexteintrag
+/// zwischen den beiden Schritten neue IOTLB-Einträge erzeugen, und die IOTLB-Invalidierung
+/// liefe ins Leere.
+///
+/// Mit `CAP.CM == 1` gilt das **auch nach dem Anlegen** einer Übersetzung, nicht nur nach dem
+/// Entfernen — dort sind nicht-präsente Einträge cachebar. Der Kernel invalidiert deshalb
+/// unbedingt und protokolliert `CM` nur: das ist die konservative Variante, die überall hält.
+pub fn sync_tables() -> bool {
+    let a = invalidate_context_cache();
+    let b = invalidate_iotlb_global();
+    a && b
+}
+
+/// Die Root-Tabelle der Einheit 0 (`0` = noch keine).
+pub fn root_table() -> u64 {
+    ROOT_TABLE[0].load(Ordering::Acquire)
 }

@@ -36,6 +36,7 @@ mod arch;
 mod panic;
 // Der Kernel-Kern (arch-agnostisch, nutzt aber die aarch64-HAL) ist auf dem x86_64-Branch in Stufe 0
 // noch nicht aktiv — er wird Stufe fuer Stufe fuer x86_64 eingeschaltet (s. README-X86.md).
+mod dmatests;
 #[cfg(target_arch = "aarch64")]
 mod loader;
 mod selftest;

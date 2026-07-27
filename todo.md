@@ -262,8 +262,33 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
          von Anfang an, nicht nachträglich — sonst hängen Tests an der zu starken Aussage.
          RMRR-behaftete Geräte werden **abgewiesen und protokolliert**, nicht mit einer Lücke
          zugeteilt: ein Teil ihres Zugriffs liegt per Konstruktion außerhalb der Kontrolle.
-      3. [ ] Root-/Context-Tabellen + SLPT für **eine** Gruppe, `attach` liefert `Some`. Ab hier
-         hören die vorhandenen Tests auf zu skippen — das ist der Meilenstein.
+      3. [x] Root-/Context-Tabellen + SLPT, `attach` liefert `Some`. **Meilenstein erreicht.**
+         Befund vorweg, der das Kriterium betraf: die DMA-Tests haben auf x86 nicht *geskippt* —
+         `threads/mod.rs` ist `#[cfg(target_arch = "aarch64")]`, es gab sie dort **gar nicht**.
+         Ein Test, den es auf einer Architektur nicht gibt, kann dort auch nicht grün werden.
+         `dmawin`/`dmatok` liegen deshalb jetzt arch-neutral in `kernel/src/dmatests.rs`, und
+         beide Bring-up-Pfade rufen **dieselbe Funktion** — nicht eine nachgebaute. Beide auf
+         x86 grün, aarch64 unverändert.
+         Umgesetzt: SLPT (3 Level, 39 Bit), Kontext-Einträge für **alle** RIDs der Gruppe (sie
+         landen in `DmaCtx::sids` und laufen damit durch dieselbe `ctx_quiesce`-Schleife wie auf
+         ARM — die Falle aus `13810e9` ist strukturell vermieden), DID ab 1 (bei `CM=1` ist 0
+         reserviert), `FPD` bleibt aus, Kontext-Cache **vor** IOTLB, unbedingt auch nach dem
+         Anlegen. Richtung fällt heraus statt hinzuzukommen: Präsenz *ist* `R|W`, `ToDevice`
+         wird zu „nur R". `SNP` wird ohne `ECAP.SC` nicht gesetzt (reserviert). Jeder
+         Tabellenschreibzugriff geht durch `write_entry`, das ohne `ECAP.C` `clflush`+`sfence`
+         ausführt und nie ohne Flush zurückkehrt — auch auf den Zwischenebenen.
+         Kontext-Tabellen entstehen **einmal beim Bring-up** (256 x 4 KiB), nicht beim ersten
+         `attach`: sie sind eine Bus-Struktur, dürfen beim Abbau eines Kontexts nicht freigegeben
+         werden, und eine lazy angelegte, nie freigegebene Tabelle sähe in jeder
+         Ressourcenbilanz wie ein Leck aus. Symmetrisch zur linearen Stream-Tabelle auf ARM, und
+         der DMA-Pfad kommt damit ohne Allokation aus.
+         Nebenbefund im Test selbst: die 32-Bit-Annahme in `dmawin` war **maschinen**-, nicht
+         architekturabhängig — auf dem x86-Aufbau mit 512 MiB RAM liegt das Fenster unter 4 GiB,
+         und der Test wäre grün gewesen, ohne die Eigenschaft zu prüfen. Jetzt 20 Bit.
+         Offen aus diesem Schritt: `dmagen` und der virtio-Negativtest hängen noch am
+         ARM-Modul (Leaf-Rücklesen bzw. virtio-Treiber); QI bleibt bewusst ungenutzt, der
+         Kernel fährt ausschließlich den Registerpfad.
+         Alt:
          Dabei: **`FPD`** (Fault Processing Disable) im Kontext-Eintrag ist wörtlich `CD.R` noch
          einmal — gesetzt, würde der Negativtest wieder an einer strukturell leeren Beobachtung
          bestehen. Und `FSTS.PFO` (Overflow der Fault-Recording-Register) muss in denselben

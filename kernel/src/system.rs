@@ -2578,6 +2578,61 @@ impl VtdEnforcer {
     pub const fn new() -> Self {
         Self
     }
+    /// Ein genulltes, ausgerichtetes Frame für Root-/Kontext-/SLPT-Tabellen.
+    fn alloc_zeroed(len: u64) -> Option<u64> {
+        let len = (len + 4095) & !4095;
+        let base = mem_alloc(len, len.next_power_of_two().max(4096)).map(|c| c.base())?;
+        // SAFETY: frisch allozierter, identity-gemappter RAM-Block; exklusiv hier beschrieben.
+        unsafe { core::ptr::write_bytes(base as *mut u8, 0, len as usize) };
+        Some(base)
+    }
+}
+
+/// Domain-IDs werden **ab 1** vergeben.
+///
+/// Bei `CAP.CM == 1` — dem Zustand dieses Aufbaus — reserviert die Spezifikation DID 0 für das
+/// Caching nicht-präsenter Einträge. Das ist damit kein theoretischer Fall, sondern eine
+/// Bedingung, unter der die Vergabe steht.
+#[cfg(not(target_arch = "aarch64"))]
+static NEXT_DID: AtomicU32 = AtomicU32::new(1);
+
+/// Die **Requester-IDs der Isolationsgruppe**, zu der `stream_id` gehört.
+///
+/// Die Gruppe ist die Isolationsgranularität, nicht das Gerät — und ihre RID-Menge enthält auch
+/// die RID einer Bridge, hinter der die eigentlichen Endpunkte sitzen. Für die muss ein
+/// Kontexteintrag existieren, obwohl dort kein zuteilbares Gerät ist: sonst kämen genau die
+/// Transaktionen ungeleitet an, die die Bridge-RID tragen.
+///
+/// Umgekehrt beim Abbau — alle Einträge räumen — und beim Stilllegen: **alle** RIDs der Gruppe
+/// entwaffnen, nicht nur die auslösende. Das ist die ARM-Falle aus `13810e9`, wörtlich; sie wird
+/// hier dadurch vermieden, dass die Gruppen-RIDs in `DmaCtx::sids` landen und damit durch
+/// dieselbe `ctx_quiesce`-Schleife laufen.
+#[cfg(not(target_arch = "aarch64"))]
+fn group_rids(stream_id: u32, out: &mut [u32]) -> usize {
+    let Some(tbl) = hal::acpi::dmar_table() else {
+        out[0] = stream_id;
+        return 1;
+    };
+    let info = hal::dmar::parse(tbl);
+    let mut topo = [hal::dmar::DevNode::EMPTY; hal::dmar::MAX_DEVS];
+    let n = hal::pcie::read_topology(&mut topo);
+    let g = hal::dmar::build_groups(&info, &topo[..n]);
+    let Some(i) = (0..n).find(|&i| topo[i].rid() == stream_id) else {
+        out[0] = stream_id;
+        return 1;
+    };
+    if g.excluded[i].is_some() {
+        return 0; // nicht zuteilbar (RMRR / keine Einheit / Gruppe über Einheiten)
+    }
+    let gi = g.group_of[i];
+    let mut k = 0;
+    for r in 0..g.n_aliases[gi] {
+        if k < out.len() {
+            out[k] = g.aliases[gi][r];
+            k += 1;
+        }
+    }
+    k
 }
 
 #[cfg(not(target_arch = "aarch64"))]
@@ -2590,24 +2645,254 @@ impl DmaEnforcer for VtdEnforcer {
         let Some(root) = mem_alloc(4096, 4096) else {
             return false;
         };
-        hal::vtd::init(root.base())
+        let mut alloc = || VtdEnforcer::alloc_zeroed(4096);
+        hal::vtd::init(root.base(), &mut alloc)
     }
-    fn attach(&self, _binding: &DmaBinding) -> Option<Iova> {
-        None // per-Gerät-Zuteilung noch nicht implementiert (s. Typ-Doku)
+
+    fn attach(&self, binding: &DmaBinding) -> Option<Iova> {
+        let caps = hal::vtd::caps_common()?;
+        if !caps.usable() || !hal::vtd::enabled() {
+            return None;
+        }
+        let root = hal::vtd::root_table();
+        if root == 0 {
+            return None;
+        }
+        // Die RID-Menge der Gruppe — leer heißt: nicht zuteilbar, und das ist ein Fehlschlag,
+        // keine Zuteilung mit Lücke.
+        let mut rids = [0u32; MAX_CTX_SIDS];
+        let n_rids = group_rids(binding.stream_id, &mut rids);
+        if n_rids == 0 {
+            return None;
+        }
+        let levels = caps.agaw_levels;
+        let mut t = DMA_CTX.lock();
+        let mut ci = t
+            .iter()
+            .position(|c| c.used && c.sids.contains(&binding.stream_id));
+        let is_new_ctx = ci.is_none();
+        if ci.is_none() {
+            let slpt = Self::alloc_zeroed(4096)?;
+            let Some(slot) = t.iter().position(|c| !c.used) else {
+                let mut mem = MEM.lock();
+                mem.free_region(PhysRegion::new(slpt, 4096));
+                return None;
+            };
+            t[slot] = DmaCtx::EMPTY;
+            t[slot].used = true;
+            t[slot].l1 = slpt; //                      x86: Wurzel der Second-Level-Pagetable
+            t[slot].cd = NEXT_DID.fetch_add(1, Ordering::Relaxed) as u64; // x86: Domain-ID
+            // **Alle** RIDs der Gruppe eintragen, nicht nur die auslösende.
+            for (k, &r) in rids[..n_rids].iter().enumerate() {
+                t[slot].sids[k] = r;
+            }
+            ctx_assign_window(&mut t[slot], slot);
+            ci = Some(slot);
+        }
+        let slot = ci.unwrap();
+        let (slpt, did) = (t[slot].l1, t[slot].cd as u16);
+        let iova = match ctx_alloc_iova(
+            &mut t[slot],
+            slot,
+            binding.len,
+            device_addr_bits(binding.stream_id),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                note_iova_reject(e);
+                if is_new_ctx {
+                    let mut mem = MEM.lock();
+                    mem.free_region(PhysRegion::new(slpt, 4096));
+                    drop(mem);
+                    t[slot] = DmaCtx::EMPTY;
+                }
+                return None;
+            }
+        };
+        // Richtung fällt heraus statt hinzuzukommen: Präsenz *ist* R|W. `ro` heißt „das Gerät
+        // liest nur" -> kein W-Bit, und der Puffer ist gegen das Gerät schreibgeschützt.
+        let mut alloc = || VtdEnforcer::alloc_zeroed(4096);
+        // SAFETY: `slpt` ist eine frisch genullte, identity-gemappte Tabellenwurzel; `alloc`
+        // liefert ebensolche Frames.
+        let mapped = unsafe {
+            hal::vtd::slpt_map(
+                slpt,
+                levels,
+                iova.raw(),
+                binding.pa.raw(),
+                binding.len,
+                true,
+                !binding.ro,
+                &mut alloc,
+            )
+        };
+        if !mapped {
+            if is_new_ctx {
+                let mut mem = MEM.lock();
+                mem.free_region(PhysRegion::new(slpt, 4096));
+                drop(mem);
+                t[slot] = DmaCtx::EMPTY;
+            }
+            return None;
+        }
+        let region = DmaRegion { iova, pa: binding.pa, len: binding.len };
+        let Some(ri) = t[slot].regs.iter().position(|r| r.is_empty()) else {
+            // SAFETY: eben gemappt, dieselbe Tabelle.
+            unsafe { hal::vtd::slpt_unmap(slpt, levels, iova.raw(), binding.len) };
+            return None;
+        };
+        t[slot].regs[ri] = region;
+        if is_new_ctx {
+            for k in 0..MAX_CTX_SIDS {
+                let r = t[slot].sids[k];
+                if r == u32::MAX {
+                    continue;
+                }
+                // SAFETY: `root` stammt aus dem Bring-up und ist identity-gemappt.
+                if !unsafe { hal::vtd::context_set(root, r, slpt, did, levels, &mut alloc) } {
+                    return None;
+                }
+            }
+        }
+        ctx_arm_bus_master(&mut t[slot], binding.stream_id);
+        // Unbedingt invalidieren — Kontext-Cache vor IOTLB. Mit `CAP.CM == 1` ist das auch nach
+        // dem **Anlegen** Pflicht; die konservative Variante hält auch dort, wo sie es nicht ist.
+        if !hal::vtd::sync_tables() {
+            return None;
+        }
+        Some(iova)
     }
-    fn detach(&self, _binding: &DmaBinding) {}
+
+    fn detach(&self, binding: &DmaBinding) {
+        let Some(caps) = hal::vtd::caps_common() else { return };
+        let root = hal::vtd::root_table();
+        let mut t = DMA_CTX.lock();
+        let Some(slot) = t
+            .iter()
+            .position(|c| c.used && c.sids.contains(&binding.stream_id))
+        else {
+            return;
+        };
+        let _ = ctx_quiesce(&mut t[slot]); // über ALLE RIDs der Gruppe
+        let slpt = t[slot].l1;
+        if let Some(ri) = t[slot]
+            .regs
+            .iter()
+            .position(|r| !r.is_empty() && r.pa == binding.pa && r.len == binding.len)
+        {
+            // SAFETY: gültige Tabellenwurzel, Region stammt aus dieser Tabelle.
+            unsafe {
+                hal::vtd::slpt_unmap(slpt, caps.agaw_levels, t[slot].regs[ri].iova.raw(), t[slot].regs[ri].len)
+            };
+            t[slot].regs[ri] = DmaRegion::EMPTY;
+        }
+        hal::vtd::sync_tables();
+        let still_in_use = !t[slot].regs.iter().all(|r| r.is_empty());
+        ctx_release(&mut t[slot], still_in_use);
+        if !still_in_use {
+            vtd_teardown_ctx(&mut t[slot], root, caps.agaw_levels);
+        }
+    }
+
+    fn finalize(&self, regions: &[(u64, u64)], ok: &mut [bool]) {
+        let Some(caps) = hal::vtd::caps_common() else {
+            for b in ok.iter_mut().take(regions.len()) {
+                *b = true; // keine Einheit -> es gab nie eine Übersetzung
+            }
+            return;
+        };
+        let root = hal::vtd::root_table();
+        let levels = caps.agaw_levels;
+        let mut t = DMA_CTX.lock();
+        let mut ctx_of = [usize::MAX; MAX_FINALIZE];
+        // Phase 1: alle betroffenen Kontexte stilllegen (je Kontext alle RIDs der Gruppe).
+        for (i, &(pa, len)) in regions.iter().enumerate().take(MAX_FINALIZE) {
+            let Some(slot) = t.iter().position(|c| {
+                c.used
+                    && c.regs
+                        .iter()
+                        .any(|r| !r.is_empty() && r.pa == Pa::new(pa) && r.len == len)
+            }) else {
+                ok[i] = true;
+                continue;
+            };
+            ctx_of[i] = slot;
+            ok[i] = ctx_quiesce(&mut t[slot]);
+        }
+        // Phase 2: alle Regionen unmappen — immer, auch ohne bestätigte Stilllegung.
+        for (i, &(pa, len)) in regions.iter().enumerate().take(MAX_FINALIZE) {
+            let slot = ctx_of[i];
+            if slot == usize::MAX {
+                continue;
+            }
+            let slpt = t[slot].l1;
+            if let Some(ri) = t[slot]
+                .regs
+                .iter()
+                .position(|r| !r.is_empty() && r.pa == Pa::new(pa) && r.len == len)
+            {
+                // SAFETY: gültige Tabellenwurzel.
+                unsafe {
+                    hal::vtd::slpt_unmap(slpt, levels, t[slot].regs[ri].iova.raw(), t[slot].regs[ri].len)
+                };
+                t[slot].regs[ri] = DmaRegion::EMPTY;
+            }
+        }
+        // Phase 3: **eine** Invalidierung für den ganzen Stapel.
+        hal::vtd::sync_tables();
+        // Phase 4: Stilllegung lösen, leere Kontexte abbauen.
+        for i in 0..regions.len().min(MAX_FINALIZE) {
+            let slot = ctx_of[i];
+            if slot == usize::MAX || !t[slot].used {
+                continue;
+            }
+            let still_in_use = !t[slot].regs.iter().all(|r| r.is_empty());
+            ctx_release(&mut t[slot], still_in_use);
+            if !still_in_use {
+                vtd_teardown_ctx(&mut t[slot], root, levels);
+            }
+        }
+    }
+
     fn audit(&self) -> u32 {
         // Ist die Einheit hochgefahren, MUSS die Übersetzung aktiv sein — sonst liefe DMA
         // ungeschützt, obwohl der Kernel meint, sie sei an.
         if hal::vtd::present() && !hal::vtd::enabled() {
-            1
-        } else {
-            0
+            return 1;
         }
+        if hal::vtd::present() && !hal::iommu::faults_empty() {
+            return 2;
+        }
+        0
     }
     fn is_active(&self) -> bool {
         hal::vtd::enabled()
     }
+}
+
+/// Einen leeren Übersetzungskontext abbauen: **alle** Kontexteinträge der Gruppe räumen,
+/// invalidieren, dann die Tabellen freigeben.
+#[cfg(not(target_arch = "aarch64"))]
+fn vtd_teardown_ctx(c: &mut DmaCtx, root: u64, levels: u32) {
+    for k in 0..MAX_CTX_SIDS {
+        let r = c.sids[k];
+        if r != u32::MAX && root != 0 {
+            // SAFETY: gültige Root-Tabelle.
+            unsafe { hal::vtd::context_clear(root, r) };
+        }
+    }
+    hal::vtd::sync_tables();
+    let slpt = c.l1;
+    {
+        let mut mem = MEM.lock();
+        // SAFETY: `slpt` ist die Wurzel dieses Kontexts, ab hier von niemandem mehr referenziert.
+        unsafe {
+            hal::vtd::slpt_free(slpt, levels, &mut |x| {
+                mem.free_region(PhysRegion::new(x, 4096));
+            })
+        };
+    }
+    *c = DmaCtx::EMPTY;
 }
 
 /// Granularität der Guard-Bänder **und** der IOVA-Ausrichtung.

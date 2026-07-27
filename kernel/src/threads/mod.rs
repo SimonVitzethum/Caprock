@@ -990,139 +990,25 @@ fn run_dmagen() -> bool {
         && system::domain_audit() == 0
 }
 
-/// **IOVA-Fenstergrenzen testen** (ext-36b Nacharbeit).
-///
-/// Zwei Grenzen, die es vorher gab, aber nicht als Eigenschaft: die Adressbreite des Geraets und
-/// das Ende des Fensters. Beide muessen zu einem sauberen Fehlschlag fuehren -- eine
-/// abgeschnittene Adresse trifft sonst irgendetwas anderes, und ein erschoepftes Fenster darf
-/// keinen halb aufgebauten Kontext hinterlassen.
+/// Die beiden DMA-Pruefungen liegen jetzt arch-neutral in `crate::dmatests` -- sie waren zuvor
+/// in diesem aarch64-only Modul und existierten auf x86 gar nicht (ext-38).
 fn run_dmawin() -> bool {
-    let (narrow_sid, wide_sid) = (0x50u32, 0x51u32);
-    hal::cpu::local_irq_disable();
-    let (Some(r1), Some(r2)) = (
-        system::alloc_dma_region(0x1000),
-        system::alloc_dma_region(0x1000),
-    ) else {
-        hal::cpu::local_irq_enable();
-        return false;
-    };
-    let free0 = system::total_free();
-    let (rej_w0, _, rej_d0) = system::testsupport::dma_iova_rejects();
-
-    // 1. Geraet mit 32-Bit-DMA: das starke Fenster liegt oberhalb des RAM (hier ~5 GiB), also
-    //    kann das Geraet die Adresse gar nicht absetzen -> `attach` muss abweisen.
-    system::dma_declare_device_addr_bits(narrow_sid, 32);
-    let narrow = system::dma_enable(narrow_sid, r1.base, r1.len).is_none()
-        && system::testsupport::dma_iova_rejects().2 == rej_d0 + 1
-        && system::testsupport::dma_ctx_region_count(narrow_sid) == 0; // kein halber Kontext
-
-    // 2. Fenster voll: erste Region geht durch, dann den Bump ans Ende schieben -> zweite
-    //    Zuteilung muss sauber scheitern, und der Kontext muss danach unveraendert nutzbar sein.
-    let first = system::dma_enable(wide_sid, r1.base, r1.len);
-    let exhausted = if first.is_some() {
-        system::testsupport::dma_ctx_exhaust_window(wide_sid);
-        let second = system::dma_enable(wide_sid, r2.base, r2.len);
-        second.is_none() && system::testsupport::dma_iova_rejects().0 == rej_w0 + 1
-    } else {
-        false
-    };
-    // Der Kontext traegt weiterhin genau seine erste Region (kein Teilabbau, kein Leck).
-    let intact = system::testsupport::dma_ctx_region_count(wide_sid) == 1
-        && system::dma_audit() == 0
-        && system::vspace_audit() == 0;
-    if first.is_some() {
-        system::dma_disable(wide_sid, r1.base, r1.len);
-    }
-    let balanced = system::total_free() == free0;
-    system::free_raw_region(r1.base, r1.len);
-    system::free_raw_region(r2.base, r2.len);
-    hal::cpu::local_irq_enable();
-
-    DMAWIN_NARROW.store(narrow, Ordering::Relaxed);
-    DMAWIN_EXHAUST.store(exhausted, Ordering::Relaxed);
-    DMAWIN_INTACT.store(intact, Ordering::Relaxed);
-    DMAWIN_BALANCED.store(balanced, Ordering::Relaxed);
-    DMAWIN_UNDECL.store(system::testsupport::dma_undeclared_devices(), Ordering::Relaxed);
-    narrow && exhausted && intact && balanced && system::domain_audit() == 0
+    let r = crate::dmatests::run_dmawin(PCIE_RID.load(Ordering::Acquire));
+    DMAWIN_NARROW.store(r.narrow, Ordering::Relaxed);
+    DMAWIN_EXHAUST.store(r.exhausted, Ordering::Relaxed);
+    DMAWIN_INTACT.store(r.intact, Ordering::Relaxed);
+    DMAWIN_BALANCED.store(r.balanced, Ordering::Relaxed);
+    DMAWIN_UNDECL.store(r.undeclared, Ordering::Relaxed);
+    r.ok
 }
 
-/// **Teardown-Token testen** (ext-37).
-///
-/// Zwei Eigenschaften, die vorher nicht existierten:
-/// * `cap_delete` **allein** genuegt und ist sicher — die Cap-Crate gibt die Region nicht mehr
-///   selbst frei, sondern meldet sie; der Kernel legt still, unmappt, synchronisiert und gibt
-///   erst dann zurueck. Vorher war die Reihenfolge eine bewiesene Vorbedingung des Gesamtsystems.
-/// * Ist die Stilllegung **nicht bestaetigt**, wird die Uebersetzung trotzdem entfernt (immer
-///   zwingend), die Physadresse aber nie zurueckgegeben. Ein Leck statt eines Use-after-free —
-///   als Entscheidung, beschraenkt und auditiert.
 fn run_dmatok() -> bool {
-    hal::cpu::local_irq_disable();
-    // 1. Attach + `cap_delete` OHNE `dma_detach`.
-    let live_sid = PCIE_RID.load(Ordering::Acquire); // echtes Geraet -> Stilllegung bestaetigbar
-    // Basislinie VOR dem Ausschneiden: nach dem `cap_delete` muss exakt sie wieder dastehen —
-    // die Region selbst und alle Tabellen-Frames, die das Anhaengen alloziert hat.
-    let free0 = system::total_free();
-    let Some(r1) = system::alloc_dma_region(0x1000) else {
-        hal::cpu::local_irq_enable();
-        return false;
-    };
-    let Ok(cap1) = system::install_dma_cap_ex(
-        r1.base,
-        r1.len,
-        DmaDir::Bidirectional,
-        DmaCoherence::NonCoherent,
-        Rights::RW,
-    ) else {
-        hal::cpu::local_irq_enable();
-        return false;
-    };
-    let attached = system::dma_attach(live_sid, cap1).is_some();
-    let _ = system::cap_delete(cap1); // KEIN dma_detach
-    let tears = attached && system::testsupport::dma_ctx_region_count(live_sid) == 0;
-    let freed = system::total_free() == free0 && system::dma_audit() == 0;
-
-    // 2. Geraet, dessen Stilllegung nicht bestaetigt werden kann (StreamID ohne Geraet: das
-    //    Konfigurations-Read liefert 0xFFFF). Die Region darf NICHT zurueck in den Allokator.
-    let (pend0, unexp0) = system::testsupport::dma_pending_stats();
-    let ghost_sid = 0x60u32;
-    let free1 = system::total_free();
-    let Some(r2) = system::alloc_dma_region(0x1000) else {
-        hal::cpu::local_irq_enable();
-        return false;
-    };
-    let Ok(cap2) = system::install_dma_cap_ex(
-        r2.base,
-        r2.len,
-        DmaDir::Bidirectional,
-        DmaCoherence::NonCoherent,
-        Rights::RW,
-    ) else {
-        hal::cpu::local_irq_enable();
-        return false;
-    };
-    let attached2 = system::dma_attach(ghost_sid, cap2).is_some();
-    let pending = {
-        // Im KILL-Kontext: dort ist Pending erwartbar und darf nicht als Anomalie zaehlen.
-        let _kill = system::KillScope::enter();
-        let _ = system::cap_delete(cap2);
-        let (pend1, unexp1) = system::testsupport::dma_pending_stats();
-        attached2
-            && pend1 == pend0 + 1 //                       geparkt
-            && unexp1 == unexp0 //                         und zwar erwartbar (KILL)
-            // Alle Tabellen-Frames sind zurueck, **nur die Region nicht** — genau um ihre
-            // Groesse fehlt gegenueber der Basislinie.
-            && system::total_free() == free1 - r2.len
-            && system::testsupport::dma_ctx_region_count(ghost_sid) == 0 // Unmap trotzdem erfolgt
-    };
-    // Code 7: weder frei noch uebersetzt.
-    let audit7 = system::dma_audit() == 0 && system::vspace_audit() == 0;
-    hal::cpu::local_irq_enable();
-
-    DMATOK_DELETE_TEARS.store(tears, Ordering::Relaxed);
-    DMATOK_FREED.store(freed, Ordering::Relaxed);
-    DMATOK_PENDING.store(pending, Ordering::Relaxed);
-    DMATOK_AUDIT7.store(audit7, Ordering::Relaxed);
-    tears && freed && pending && audit7 && system::domain_audit() == 0
+    let r = crate::dmatests::run_dmatok(PCIE_RID.load(Ordering::Acquire));
+    DMATOK_DELETE_TEARS.store(r.tears, Ordering::Relaxed);
+    DMATOK_FREED.store(r.freed, Ordering::Relaxed);
+    DMATOK_PENDING.store(r.pending, Ordering::Relaxed);
+    DMATOK_AUDIT7.store(r.audit7, Ordering::Relaxed);
+    r.ok
 }
 
 /// **Prozess-Heap testen** (ext-25): ein Trusted-SAS-Kontext (safe Rust) baut einen prozess-

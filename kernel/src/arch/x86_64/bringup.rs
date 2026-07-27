@@ -499,6 +499,25 @@ pub fn run(multiboot_info: u64) -> ! {
         hal::power::system_off();
     }
     system::init_core();
+
+    // --- Arch-neutrale DMA-Tests (ext-38) ---
+    //
+    // Dieselben Funktionen, die der ARM-Lauf ruft -- nicht nachgebaute. Bis hierher lagen sie in
+    // `threads/mod.rs`, und das Modul ist aarch64-only: auf x86 haben sie nicht geskippt, es gab
+    // sie nicht. Ein Test, den es auf einer Architektur nicht gibt, kann dort auch nicht gruen
+    // werden; das Abnahmekriterium war so nicht einloesbar.
+    let live_rid = hal::pcie::find(hal::pcie::VIRTIO_VENDOR, &hal::pcie::VIRTIO_RNG_DEVICES)
+        .map(|d| d.rid())
+        .unwrap_or(0);
+    let w = crate::dmatests::run_dmawin(live_rid);
+    println!("dmawin  : 32-Bit-Geraet-abgewiesen={} Fenster-voll-abgewiesen={} Kontext-danach-intakt={} balanciert={} Geraete-ohne-deklarierte-Adressbreite={}",
+        w.narrow, w.exhausted, w.intact, w.balanced, w.undeclared);
+    println!("dmawin  : {}", if w.ok { "ALL PASS" } else { "FAILURES" });
+    let tk = crate::dmatests::run_dmatok(live_rid);
+    println!("dmatok  : attach-installierte-Uebersetzung={} delete-ohne-detach-baut-ab={} Region-danach-frei={} unbestaetigte-Stilllegung-bleibt-pending={} Audit-Code-7-haelt={}",
+        tk.attached, tk.tears, tk.freed, tk.pending, tk.audit7);
+    println!("dmatok  : {}", if tk.ok { "ALL PASS" } else { "FAILURES" });
+
     if !spawn_demo() {
         println!("bringup : FAILURES (Demo-Aufbau fehlgeschlagen)");
         hal::power::system_off();

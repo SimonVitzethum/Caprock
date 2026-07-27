@@ -103,6 +103,8 @@ check "reload  : ALL PASS" "Hot-Reload (Server v2 ersetzt v1, gleicher Endpoint,
 check "ckpt    : ALL PASS" "Stateful Hot-Reload (Zustand bleibt über v1->v2 erhalten)"
 check "el0     : ALL PASS" "EL0-Userland (echter User-Thread ruft per Syscall)"
 check "el0iso  : ALL PASS" "EL0-Isolation (Kernel-Zugriff faultet, Thread beendet, Kernel überlebt)"
+check "scale   : ALL PASS" "Skalierung (ext-30): 1024 Threads GLEICHZEITIG (Kapazitaet zur Boot-Zeit aus dem RAM statt .bss-Konstante), alle auffindbar, danach vollstaendig abgebaut -> Slots + RAM zurueck auf Baseline"
+check "migrate : ALL PASS" "Thread-Migration (ext-30): Thread wechselt zur Laufzeit den Kern -- gleiche ThreadId/Tcb-Cap, laeuft auf dem Zielkern weiter, balance_once() verschiebt automatisch, cross-core-KILL, Scheduler-Audit 0"
 check "smp     : ALL PASS" "Per-Kern-paralleler Scheduler (Worker je Kern + Cross-Core-IPI-Wake)"
 check "xipc    : ALL PASS" "Kern-übergreifende synchrone IPC (Client core0 <-> Server core2)"
 check "reclaim : ALL PASS" "EL0-Kernel-Stack-Reclaim (>Pool-viele transiente EL0-Threads)"

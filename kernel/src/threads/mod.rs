@@ -59,7 +59,9 @@ mod fuzz {
 #[cfg(feature = "soak")]
 mod soak;
 
-const NUM_CORES: usize = 8;
+/// Compile-Zeit-Obergrenze für die Demo-Telemetrie-Arrays (die **tatsächliche** Kernzahl
+/// liefert `system::num_cores()`; die Demos laufen darüber).
+const NUM_CORES: usize = sel4lake_sched::MAX_CORES;
 const NWORKERS: usize = 3;
 const THRESHOLD: u64 = 3;
 /// Lazy-FP-Test: zwei **echte EL0-User-Threads** halten je ein eindeutiges Muster
@@ -1045,6 +1047,267 @@ static RECLAIM_SPAWNED: AtomicU64 = AtomicU64::new(0);
 // belasteten Kernen (nicht alle auf dem Bootkern) -> Verteilung über die Kerne.
 const BALANCED_TARGET: u64 = 16;
 static BALANCED_SPAWNED: AtomicU64 = AtomicU64::new(0);
+
+// --- Skalierung: viele Threads gleichzeitig (ext-30) ---------------------------------------
+//
+// Zielbild des Projekts ist eine Maschine mit sehr vielen Kernen und **vielen tausend**
+// Prozessen. Vor ext-30 war die Obergrenze eine Compile-Zeit-Konstante (8 Kerne x 64 TCBs =
+// 512 Slots, als `.bss`-Arrays im Image); jetzt kommt die Kapazität beim Boot aus dem RAM und
+// die heissen Pfade sind O(1) (Freilisten + intrusive Ready-Listen statt linearer Scans).
+// Dieser Test belegt beides: SCALE_TARGET Threads GLEICHZEITIG am Leben, danach vollstaendig
+// abgebaut (Thread-Slots + Stack-RAM zurueck auf die Baseline -> kein Leck).
+const SCALE_TARGET: usize = 1024;
+static SCALE_SPAWNED: AtomicU64 = AtomicU64::new(0);
+static SCALE_ALIVE_OK: AtomicBool = AtomicBool::new(false);
+static SCALE_SLOTS_OK: AtomicBool = AtomicBool::new(false);
+static SCALE_TEARDOWN_OK: AtomicBool = AtomicBool::new(false);
+static SCALE_AUDIT: AtomicU64 = AtomicU64::new(u64::MAX);
+static SCALE_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Skalierungs-Arbeiter: sofort parken (blockiert, verbraucht keine CPU) — es geht um die
+/// **Verwaltung** vieler gleichzeitig existierender Threads, nicht um Rechenlast.
+extern "C" fn scale_worker(_arg: usize) -> ! {
+    invoke(sys::PARK, 0, [0; 4], 0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Treiber des Skalierungstests (core 0).
+extern "C" fn scale_driver(_arg: usize) -> ! {
+    // Erst starten, wenn der Migrationstest fertig ist: beide Tests messen Lastverhaeltnisse
+    // bzw. Slot-Buchhaltung und wuerden sich sonst gegenseitig stoeren.
+    while !MIG_DONE.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    let slots0 = system::threads_available();
+    // Handles in einer Region ablegen (kein Kernel-Heap): SCALE_TARGET u64-Rohwerte.
+    let Some(store) = system::alloc(SCALE_TARGET as u64 * 8, 4096) else {
+        SCALE_DONE.store(true, Ordering::Release);
+        invoke(sys::EXIT, 0, [0; 4], 0);
+        loop {
+            core::hint::spin_loop();
+        }
+    };
+    let base = store.base();
+    let mut n = 0usize;
+    for i in 0..SCALE_TARGET {
+        // Lastbewusst ueber alle Kerne verteilen (die Platzierung nutzt den lock-freien
+        // Lastzaehler — frueher haette das je Spawn JEDEN Kern-Scheduler gesperrt).
+        match system::spawn_balanced(scale_worker as *const () as usize, i, system::IDLE_PRIO) {
+            Some(t) => {
+                poke_u64(base + (i as u64) * 8, t.to_raw());
+                n += 1;
+            }
+            None => break,
+        }
+    }
+    SCALE_SPAWNED.store(n as u64, Ordering::Release);
+    // Alle muessen GLEICHZEITIG leben und ueber ihre (migrationsstabile) ThreadId auffindbar sein.
+    let mut alive = 0usize;
+    for i in 0..n {
+        if system::thread_alive(ThreadId::from_raw(peek_u64(base + (i as u64) * 8))) {
+            alive += 1;
+        }
+    }
+    SCALE_ALIVE_OK.store(alive == n && n == SCALE_TARGET, Ordering::Release);
+    let slots_low = system::threads_available();
+    // Slot-Buchhaltung mit Toleranz: die uebrigen Demos erzeugen/beenden nebenher staendig
+    // kurzlebige Threads und geben dabei selbst Slots zurueck — eine exakte Gleichheit waere
+    // eine Wettlaufbedingung, kein Beweis. Beweiskraeftig ist die Groessenordnung (1024
+    // belegte Slots gegen eine Handvoll Stoerung) und, exakt, die Rueckgabe beim Teardown.
+    const SCALE_SLACK: usize = 64;
+    SCALE_SLOTS_OK.store(slots_low + n <= slots0 + SCALE_SLACK, Ordering::Release);
+    SCALE_AUDIT.store(system::sched_audit_all() as u64, Ordering::Release);
+    let reaped0 = system::reaped_bytes();
+    // Vollstaendig abbauen: killen (auf beliebigem Kern) + auf allen Kernen reapen.
+    for i in 0..n {
+        let t = ThreadId::from_raw(peek_u64(base + (i as u64) * 8));
+        for _ in 0..4 {
+            if system::kill_remote(t) {
+                break;
+            }
+        }
+    }
+    // Reap: die Zombies liegen auf allen Kernen; mehrfach durchlaufen (Puffer je Runde begrenzt).
+    let mut rounds = 0;
+    while rounds < 4096 {
+        let mut got = 0;
+        for c in 0..system::num_cores() {
+            got += system::reap_core(c);
+        }
+        if got == 0 {
+            break;
+        }
+        rounds += 1;
+    }
+    system::free(store);
+    // Buchhaltung **relativ** statt absolut: die uebrigen Demos laufen nebenher und veraendern
+    // `total_free`/`threads_available` staendig. Beweiskraeftig ist, dass GENAU DIESE n Threads
+    // ihre Slots und ihr Stack-RAM zurueckgegeben haben — `reaped_bytes` ist dafuer monoton.
+    let slots_back = system::threads_available() >= slots_low + n;
+    let mem_back = system::reaped_bytes() - reaped0 >= n as u64 * system::stack_bytes();
+    SCALE_TEARDOWN_OK.store(slots_back && mem_back, Ordering::Release);
+    SCALE_DONE.store(true, Ordering::Release);
+    invoke(sys::EXIT, 0, [0; 4], 0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+
+// --- Thread-Migration (ext-30) ------------------------------------------------------------
+//
+// Beweist, dass ein Thread den Kern wechseln kann, OHNE seine Identität zu verlieren:
+// dieselbe `ThreadId` (und damit jede Tcb-Cap darauf) bezeichnet ihn vorher wie nachher, er
+// läuft danach nachweislich auf dem Zielkern weiter, und seine per-Thread-Kernelzustände
+// (FP-Kontext, VSpace-Zuordnung, Kernel-Stack-Slot) folgen ihm — sie sind über den
+// migrationsstabilen globalen Slot indiziert.
+/// Kern, auf dem sich der Migrant zuletzt selbst beobachtet hat.
+static MIG_CORE_SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Fortschritt des Migranten (er zählt, solange er läuft).
+static MIG_PROGRESS: AtomicU64 = AtomicU64::new(0);
+/// Ergebnisbits des Migrationstests.
+static MIG_BEFORE_OK: AtomicBool = AtomicBool::new(false);
+static MIG_MOVED: AtomicBool = AtomicBool::new(false);
+static MIG_AFTER_OK: AtomicBool = AtomicBool::new(false);
+static MIG_CAP_OK: AtomicBool = AtomicBool::new(false);
+static MIG_AUTO_OK: AtomicBool = AtomicBool::new(false);
+static MIG_KILLED_OK: AtomicBool = AtomicBool::new(false);
+static MIG_AUDIT: AtomicU64 = AtomicU64::new(u64::MAX);
+static MIG_DONE: AtomicBool = AtomicBool::new(false);
+/// Zielkern der Migration (fest: core 3 — ein Sekundärkern, der im Test sonst nur seinen
+/// eigenen SMP-Worker trägt).
+const MIG_DST_CORE: usize = 3;
+
+/// Der Migrant: notiert bei jedem Durchlauf, auf welchem Kern er gerade läuft, und zählt
+/// seinen Fortschritt. Beides zusammen belegt „läuft nach der Migration auf dem Zielkern
+/// weiter" (Kern-ID wechselt UND der Zähler steigt weiter).
+extern "C" fn migrant_worker(_arg: usize) -> ! {
+    loop {
+        MIG_CORE_SEEN.store(hal::cpu::core_id() as u64, Ordering::Release);
+        MIG_PROGRESS.fetch_add(1, Ordering::Release);
+        for _ in 0..20_000 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Treiber des Migrationstests. Läuft **auf core 0**, weil eine Migration immer vom
+/// abgebenden Kern ausgeführt wird (Push-Modell: nur er kann den Lazy-FP-Kontext des
+/// Migranten aus seinen eigenen FP-Registern sichern).
+extern "C" fn migrate_driver(_arg: usize) -> ! {
+    let ok = (|| {
+        // 1) Migranten auf core 0 erzeugen + eine Tcb-Cap darauf prägen.
+        let tid = system::spawn_on_core(0, migrant_worker as *const () as usize, 0, system::IDLE_PRIO)?;
+        let cap = system::install_tcb_cap(tid, Rights::RW).ok()?;
+        // 2) Warten, bis er auf core 0 gelaufen ist.
+        let mut spins = 0u64;
+        while MIG_PROGRESS.load(Ordering::Acquire) < 3 {
+            spins += 1;
+            if spins > 200_000_000 {
+                return None;
+            }
+            core::hint::spin_loop();
+        }
+        MIG_BEFORE_OK.store(
+            MIG_CORE_SEEN.load(Ordering::Acquire) == 0 && system::owner_core_of(tid) == Some(0),
+            Ordering::Release,
+        );
+        // 3) Migrieren (explizit) und warten, bis er sich auf dem Zielkern meldet.
+        let moved = system::migrate_to(tid, MIG_DST_CORE);
+        MIG_MOVED.store(moved, Ordering::Release);
+        let p0 = MIG_PROGRESS.load(Ordering::Acquire);
+        spins = 0;
+        while MIG_PROGRESS.load(Ordering::Acquire) < p0 + 3
+            || MIG_CORE_SEEN.load(Ordering::Acquire) != MIG_DST_CORE as u64
+        {
+            spins += 1;
+            if spins > 200_000_000 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        MIG_AFTER_OK.store(
+            MIG_CORE_SEEN.load(Ordering::Acquire) == MIG_DST_CORE as u64
+                && MIG_PROGRESS.load(Ordering::Acquire) >= p0 + 3
+                && system::owner_core_of(tid) == Some(MIG_DST_CORE),
+            Ordering::Release,
+        );
+        // 4) **Identität**: dieselbe Tcb-Cap bezeichnet weiterhin genau diesen (nun auf einem
+        //    anderen Kern laufenden) Thread.
+        let cap_ok = match system::cap_inspect(cap).map(|i| i.kind) {
+            Some(sel4lake_cap::ObjectKind::Tcb(raw)) => {
+                ThreadId::from_raw(raw) == tid && system::thread_alive(tid)
+            }
+            _ => false,
+        };
+        MIG_CAP_OK.store(cap_ok, Ordering::Release);
+        // 5) **Automatische** Policy: `balance_once` gibt von diesem Kern einen bereiten Thread
+        //    an einen leichteren ab. Dafür ein **definiertes** Ungleichgewicht herstellen
+        //    (mehrere rechenbereite Threads auf core 0) — sonst hinge das Ergebnis an der
+        //    zufälligen Umgebungslast der übrigen Demos.
+        let mut helpers = [0u64; 8];
+        for h in helpers.iter_mut() {
+            match system::spawn_on_core(0, migrant_worker as *const () as usize, 0, system::IDLE_PRIO) {
+                Some(t) => *h = t.to_raw(),
+                None => *h = u64::MAX,
+            }
+        }
+        let before = system::migration_count();
+        let mut auto_ok = false;
+        for _ in 0..64 {
+            if system::balance_once() {
+                auto_ok = true;
+                break;
+            }
+        }
+        MIG_AUTO_OK.store(auto_ok && system::migration_count() > before, Ordering::Release);
+        // Helfer wieder abräumen (sie rechnen, also ggf. mehrfach versuchen).
+        for &h in helpers.iter() {
+            if h == u64::MAX {
+                continue;
+            }
+            let t = ThreadId::from_raw(h);
+            for _ in 0..2_000 {
+                if !system::thread_alive(t) || system::kill_remote(t) {
+                    break;
+                }
+                for _ in 0..5_000 {
+                    core::hint::spin_loop();
+                }
+            }
+        }
+        // 6) Migrierten Thread über seinen (fremden) Kern beenden -> Ressourcen zurück.
+        //    Der Migrant rechnet dauerhaft, ist auf seinem Kern also oft der LAUFENDE Thread —
+        //    `kill` verweigert genau den (er säße auf seinem eigenen Stack). Also wiederholen,
+        //    bis er verdrängt ist; das ist der normale Ablauf, kein Fehlerfall.
+        let mut killed = false;
+        for _ in 0..2_000 {
+            if system::kill_remote(tid) {
+                killed = true;
+                break;
+            }
+            for _ in 0..5_000 {
+                core::hint::spin_loop();
+            }
+        }
+        MIG_KILLED_OK.store(killed && !system::thread_alive(tid), Ordering::Release);
+        let _ = system::cap_delete(cap);
+        // 7) Beide beteiligten Kern-Scheduler müssen strukturell konsistent sein.
+        MIG_AUDIT.store(system::sched_audit_all() as u64, Ordering::Release);
+        Some(())
+    })();
+    if ok.is_none() {
+        MIG_AUDIT.store(u64::MAX, Ordering::Release); // Setup fehlgeschlagen -> FAILURES
+    }
+    MIG_DONE.store(true, Ordering::Release);
+    invoke(sys::EXIT, 0, [0; 4], 0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 static BALANCED_PLACE: [AtomicU64; NUM_CORES] = [const { AtomicU64::new(0) }; NUM_CORES];
 
 // Weg C (Hybrid): isolierte EL0-PD mit eigener VSpace vs. vertrauenswürdige SAS-PD.
@@ -1260,9 +1523,14 @@ pub fn spawn_demo() {
     // Per-Kern-paralleler Scheduler: je einen Worker auf JEDEN Sekundärkern (1..N)
     // einplanen (die Kerne booten gleich per PSCI und picken ihn auf). Sie laufen
     // parallel zu core 0 — jeder Kern schedult über seine eigene Instanz.
-    for c in 1..NUM_CORES {
+    for c in 1..system::num_cores() {
         system::spawn_on_core(c, xcore_worker as *const () as usize, c, prio);
     }
+    // Thread-Migration (ext-30): Treiber auf core 0 (nur der abgebende Kern migriert).
+    system::spawn_on_core(0, migrate_driver as *const () as usize, 0, prio);
+    // Skalierung (ext-30): viele Threads gleichzeitig verwalten + vollstaendig abbauen.
+    system::spawn_on_core(0, scale_driver as *const () as usize, 0, system::IDLE_PRIO);
+
     // Cross-Core-Wake: ein Parker auf core 1 (höhere Prio als Idle), den core 0
     // später per IPI weckt.
     if let Some(parker) = system::spawn_on_core(1, xcore_parker as *const () as usize, 0, 2) {
@@ -1639,7 +1907,7 @@ extern "C" fn xcore_worker(arg: usize) -> ! {
             core::hint::spin_loop();
         }
         n += 1;
-        if core < NUM_CORES {
+        if core < system::num_cores() {
             XCORE_PROGRESS[core].store(n, Ordering::Relaxed);
         }
     }
@@ -2748,7 +3016,7 @@ pub fn demo_report_then_idle() -> ! {
                 XFER_DONE.load(Ordering::Acquire),
                 CS_DONE.load(Ordering::Acquire),
                 USER_RECV.load(Ordering::Relaxed) == USER_MAGIC && system::el0_syscall_seen(),
-                (1..NUM_CORES).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET) && XCORE_WOKEN.load(Ordering::Acquire),
+                (1..system::num_cores()).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET) && XCORE_WOKEN.load(Ordering::Acquire),
                 XIPC_DONE.load(Ordering::Acquire),
                 RECLAIM_SPAWNED.load(Ordering::Relaxed) >= RECLAIM_TARGET,
                 BALANCED_SPAWNED.load(Ordering::Relaxed) >= BALANCED_TARGET,
@@ -2854,7 +3122,9 @@ pub fn demo_report_then_idle() -> ! {
             while BALANCED_SPAWNED.load(Ordering::Relaxed) < BALANCED_TARGET {
                 match system::spawn_balanced(balanced_worker as *const () as usize, 0, system::IDLE_PRIO) {
                     Some(t) => {
-                        BALANCED_PLACE[t.core()].fetch_add(1, Ordering::Relaxed);
+                        if let Some(c) = system::owner_core_of(t) {
+                            BALANCED_PLACE[c].fetch_add(1, Ordering::Relaxed);
+                        }
                         BALANCED_SPAWNED.fetch_add(1, Ordering::Relaxed);
                     }
                     None => break,
@@ -2875,6 +3145,10 @@ pub fn demo_report_then_idle() -> ! {
             && system::iso_fault_count() >= 3
             && RECLAIM_SPAWNED.load(Ordering::Relaxed) >= RECLAIM_TARGET
             && BALANCED_SPAWNED.load(Ordering::Relaxed) >= BALANCED_TARGET
+            // ext-30: auch der Skalierungstest muss durch sein. Er erzeugt/beendet 1024 Threads
+            // ueber ALLE Kerne — deren Reaping wuerde die globalen Zaehler waehrend der
+            // Churn-Messung perturbieren (exakt der oben beschriebene Schein-Leak).
+            && SCALE_DONE.load(Ordering::Acquire)
         {
             hal::cpu::local_irq_disable();
             let snap = || {
@@ -2890,7 +3164,7 @@ pub fn demo_report_then_idle() -> ! {
             // Watchdog (kein Hang). Erst danach die Baseline schnappen.
             let drain_all = || {
                 let mut t = 0usize;
-                for c in 0..NUM_CORES {
+                for c in 0..system::num_cores() {
                     t += system::reap_core(c);
                 }
                 t
@@ -2936,7 +3210,7 @@ pub fn demo_report_then_idle() -> ! {
         // (er bekommt das Budget erst beim Bind). Autorität ausschließlich über die Cap.
         if !MCS_STARTED.load(Ordering::Acquire)
             && CHURN_DONE.load(Ordering::Acquire)
-            && (1..NUM_CORES).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
+            && (1..system::num_cores()).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
         {
             hal::cpu::local_irq_disable();
             let greedy =
@@ -2992,7 +3266,7 @@ pub fn demo_report_then_idle() -> ! {
         // Sequenz ohne Timing-Annahmen). Jeder Schritt: eine Aktion pro Manager-Runde.
         if !STALE_DONE.load(Ordering::Acquire)
             && MCS_DONE.load(Ordering::Acquire)
-            && (1..NUM_CORES).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
+            && (1..system::num_cores()).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
         {
             match STALE_STEP.load(Ordering::Acquire) {
                 0 => {
@@ -4193,7 +4467,7 @@ pub fn demo_report_then_idle() -> ! {
         // auf MCS fertig + SMP fertig (STRAND_CORE frei). Tick-basiert (anderer Kern).
         if !STRAND_DONE.load(Ordering::Acquire)
             && MCS_DONE.load(Ordering::Acquire)
-            && (1..NUM_CORES).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
+            && (1..system::num_cores()).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
         {
             match STRAND_STEP.load(Ordering::Acquire) {
                 0 => {
@@ -4284,18 +4558,20 @@ pub fn demo_report_then_idle() -> ! {
 
 fn all_done() -> bool {
     let workers = (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD);
-    let cores = (0..NUM_CORES).all(|c| hal::timer::ticks(c) > 0);
+    let cores = (0..system::num_cores()).all(|c| hal::timer::ticks(c) > 0);
     let fp = FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0;
     let prio = (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire));
     let life = KILLER_DONE.load(Ordering::Acquire) && REAPED.load(Ordering::Relaxed) >= 2;
     let notif = PRODUCER_DONE.load(Ordering::Acquire) && NOTIF_COUNT.load(Ordering::Relaxed) >= NOTIF_ROUNDS;
     let xfer = XFER_DONE.load(Ordering::Acquire) && XFER_GRANTLK_DONE.load(Ordering::Acquire);
+    let migrate = MIG_DONE.load(Ordering::Acquire);
+    let scale = SCALE_DONE.load(Ordering::Acquire);
     let ckpt = CS_DONE.load(Ordering::Acquire);
     let el0 = USER_RECV.load(Ordering::Relaxed) == USER_MAGIC && system::el0_syscall_seen();
     let el0iso = system::el0_fault_count() >= 1;
     // SMP: alle Sekundärkerne haben ihren Worker abgearbeitet (parallele Einplanung)
     // und der Parker wurde kern-übergreifend per IPI geweckt.
-    let smp = (1..NUM_CORES).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
+    let smp = (1..system::num_cores()).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
         && XCORE_WOKEN.load(Ordering::Acquire);
     let xipc = XIPC_DONE.load(Ordering::Acquire);
     // Reclaim: alle transienten EL0-Exiter wurden erzeugt (Pool-Slots wiederverwendet).
@@ -4385,12 +4661,12 @@ fn all_done() -> bool {
         && stale && strand && rgone && ddon && rcap && rmig && caplk && domain
         && pdctl && chan && rtc && irq && dma && pcie && smmu && smmubind && virtiorng && dmagen
         && sasheap && load && sysload && loadhw && loadstop && aggru && intru
-        && aggrh && intrh && aggrt && intrt && cross && fuzz::all_passed()
+        && aggrh && intrh && aggrt && intrt && cross && migrate && scale && fuzz::all_passed()
 }
 
 fn report() {
     let mut sched_ok = true;
-    for c in 0..NUM_CORES {
+    for c in 0..system::num_cores() {
         let t = hal::timer::ticks(c);
         println!("sched   : core {c} ticks={t}");
         if t == 0 {
@@ -4453,6 +4729,49 @@ fn report() {
     let xr = XFER_RESULT.load(Ordering::Relaxed);
     println!("xfer    : svc call(7) ueber transferierte Cap -> {xr} (erwartet 21)");
     println!("xfer    : {}", if xr == 21 { "ALL PASS" } else { "FAILURES" });
+
+    // Thread-Migration (ext-30).
+    let mig_audit = MIG_AUDIT.load(Ordering::Acquire);
+    println!(
+        "migrate : Migrant lief auf core 0 (before_ok={}), migriert nach core {MIG_DST_CORE} (moved={}), laeuft dort weiter (after_ok={}, zuletzt gesehen core {}), Tcb-Cap bezeichnet ihn weiterhin (cap_ok={}), balance_once() verschob (auto_ok={}), cross-core-KILL (killed={}), sched_audit={mig_audit}",
+        MIG_BEFORE_OK.load(Ordering::Acquire),
+        MIG_MOVED.load(Ordering::Acquire),
+        MIG_AFTER_OK.load(Ordering::Acquire),
+        MIG_CORE_SEEN.load(Ordering::Acquire),
+        MIG_CAP_OK.load(Ordering::Acquire),
+        MIG_AUTO_OK.load(Ordering::Acquire),
+        MIG_KILLED_OK.load(Ordering::Acquire),
+    );
+    let migrate_ok = MIG_BEFORE_OK.load(Ordering::Acquire)
+        && MIG_MOVED.load(Ordering::Acquire)
+        && MIG_AFTER_OK.load(Ordering::Acquire)
+        && MIG_CAP_OK.load(Ordering::Acquire)
+        && MIG_AUTO_OK.load(Ordering::Acquire)
+        && MIG_KILLED_OK.load(Ordering::Acquire)
+        && mig_audit == 0;
+    println!(
+        "migrate : {} (Thread wechselt den Kern, behaelt Identitaet + Tcb-Cap, laeuft weiter)",
+        if migrate_ok { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // Skalierung (ext-30): viele gleichzeitige Threads + vollstaendiger Abbau.
+    let sc_audit = SCALE_AUDIT.load(Ordering::Acquire);
+    println!(
+        "scale   : {} von {SCALE_TARGET} Threads GLEICHZEITIG erzeugt (alle auffindbar={}, Slot-Buchhaltung={}), danach abgebaut -> Slots+RAM zurueck auf Baseline={}, sched_audit={sc_audit}",
+        SCALE_SPAWNED.load(Ordering::Acquire),
+        SCALE_ALIVE_OK.load(Ordering::Acquire),
+        SCALE_SLOTS_OK.load(Ordering::Acquire),
+        SCALE_TEARDOWN_OK.load(Ordering::Acquire),
+    );
+    let scale_ok = SCALE_SPAWNED.load(Ordering::Acquire) as usize == SCALE_TARGET
+        && SCALE_ALIVE_OK.load(Ordering::Acquire)
+        && SCALE_SLOTS_OK.load(Ordering::Acquire)
+        && SCALE_TEARDOWN_OK.load(Ordering::Acquire)
+        && sc_audit == 0;
+    println!(
+        "scale   : {} (Kapazitaet kommt zur Boot-Zeit aus dem RAM, Spawn/Teardown O(1))",
+        if scale_ok { "ALL PASS" } else { "FAILURES" }
+    );
 
     // Grant-Leak-Regression: wiederholte Grants in denselben Empfangs-Slot duerfen keine
     // unerreichbaren Caps in der geteilten Tabelle zuruecklassen (Cross-PD-DoS).
@@ -4524,7 +4843,7 @@ fn report() {
     // Per-Kern-paralleler Scheduler: jeder Sekundärkern hat seinen Worker parallel
     // abgearbeitet; der Parker wurde kern-übergreifend per IPI geweckt.
     let mut smp_ok = true;
-    for c in 1..NUM_CORES {
+    for c in 1..system::num_cores() {
         let p = XCORE_PROGRESS[c].load(Ordering::Relaxed);
         println!("smp     : core {c} Worker-Fortschritt={p}/{SMP_WORK_TARGET}");
         if p < SMP_WORK_TARGET {

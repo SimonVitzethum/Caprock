@@ -13,7 +13,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// PPI des nicht-sicheren EL1-Physical-Timers (QEMU `virt`).
 pub const TIMER_INTID: u32 = 30;
 
-const MAX_CORES: usize = 8;
+/// Compile-Zeit-Obergrenze der Kernzahl (nur diese Telemetrie-Tabelle; die tatsächliche
+/// Kernzahl ermittelt der Kernel beim Boot).
+const MAX_CORES: usize = 256;
 static TICKS: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
 /// Tick-Intervall in Timer-Zählern (für alle Kerne identisch).
 static INTERVAL: AtomicU64 = AtomicU64::new(0);

@@ -1,36 +1,168 @@
 #![no_std]
-//! Deterministischer **per-Kern-paralleler** Scheduler (ADR 0005).
+//! Deterministischer **per-Kern-paralleler** Scheduler mit **Thread-Migration** (ADR 0005).
 //!
-//! Jede `Scheduler`-Instanz verwaltet **genau einen Kern**: seine eigene
-//! TCB-Partition, Run-Queues (eine je Priorität), den laufenden Thread und seine
-//! Zombies. Der Kernel hält ein Array solcher Instanzen — eine je Kern, jede hinter
-//! einem **eigenen Lock** (`SpinLock`). Damit läuft der heiße Timer-Reschedule-Pfad
-//! jedes Kerns **lock-frei gegenüber den anderen Kernen** (echte Parallelität);
-//! kein globaler Scheduler-Lock mehr.
+//! Jede `Scheduler`-Instanz verwaltet **genau einen Kern**: seine TCB-Tabelle, Run-Queues,
+//! den laufenden Thread und seine Zombies. Der Kernel hält ein Array solcher Instanzen —
+//! eine je Kern, jede hinter einem **eigenen Lock**. Damit läuft der heiße
+//! Timer-Reschedule-Pfad jedes Kerns **lock-frei gegenüber den anderen Kernen**.
 //!
-//! **TCB-Partitionierung:** Der globale Slot-Raum ist statisch auf die Kerne
-//! aufgeteilt — Kern `c` besitzt die Slots `[c*PER_CORE, (c+1)*PER_CORE)`. Eine
-//! [`ThreadId`] trägt den **globalen** Slot; daraus ist der besitzende Kern
-//! (`tid.core()`) ableitbar, ohne eine fremde Instanz zu sperren. Eine Instanz
-//! berührt ausschließlich ihre eigenen Threads; kern-übergreifendes Aufwecken läuft
-//! über das Sperren der Zielinstanz + einen Reschedule-IPI (Kernel-Schicht).
+//! ## Identität ohne Kern-Affinität (ext-30)
 //!
-//! Threads haben feste Kern-Affinität (keine automatische Migration). Der
-//! Kontextwechsel ist ein reiner SP-Tausch im Trap-Pfad (siehe
-//! `sel4lake-hal::exception`). Reine, sichere Index-Logik über feste Arrays —
-//! **kein `unsafe`** (das Anlegen des initialen TrapFrames steckt in der HAL).
+//! Früher kodierte die [`ThreadId`] den besitzenden Kern (`slot / PER_CORE`) — die
+//! **Identität** eines Threads hing damit an seiner **Platzierung**, und Migration war
+//! strukturell unmöglich. Jetzt gibt es eine Indirektion:
+//!
+//! ```text
+//!   ThreadId{ gid, gen } ──> Thread-Directory[gid] = (used, gen, core, local)
+//!                                                          │      │
+//!                                    besitzender Kern ─────┘      └──> Index in dessen TCB-Tabelle
+//! ```
+//!
+//! Das Directory ist eine Tabelle von Atomics: **lock-frei lesbar** von jedem Kern (der
+//! Kernel muss wissen, welchen Scheduler er sperren soll, *bevor* er sperrt), und beim
+//! Migrieren unter **beiden** Kern-Locks mit einem atomaren Store umgehängt. Die `gid`
+//! bleibt lebenslang stabil — Tcb-Caps, `VSPACE_OF`, FP-Kontexte und Kernel-Stack-Slots
+//! sind darüber indiziert und überleben eine Migration unverändert.
+//!
+//! Weil ein Leser zwischen „Directory lesen" und „Kern sperren" überholt werden kann
+//! (der Thread migriert genau dann), MUSS jeder kernübergreifende Zugriff nach dem Sperren
+//! **erneut prüfen** — `resolve` schlägt dann fehl und der Aufrufer wiederholt.
+//!
+//! ## Kapazität zur Boot-Zeit (ext-30)
+//!
+//! TCB-Tabelle, Freilisten, Zombie-Ring und Directory sind [`Slab`]s: die Struktur ist
+//! `const` konstruierbar (statische Instanzen), der Speicher kommt beim Boot aus dem RAM —
+//! dimensioniert nach Kernzahl und RAM, nicht nach einer Compile-Zeit-Konstante.
+//!
+//! ## O(1) statt linearer Scans (ext-30)
+//!
+//! Bei tausenden Threads je Kern sind lineare Scans der Engpass. Daher: Ready-Queues sind
+//! **intrusive doppelt verkettete Listen** durch die TCBs (Einreihen/Entfernen O(1), kein
+//! Ringpuffer je Priorität), freie TCB-Slots kommen aus einer **Freiliste** (O(1) statt
+//! „ersten freien suchen"), `load()` ist ein Zähler, und der MCS-Refill-Scan entfällt
+//! komplett, solange kein Budget erschöpft ist.
+//!
+//! Reine, sichere Index-Logik — **kein `unsafe`** außer den Boot-`attach`-Aufrufen (die
+//! Rohspeicher-Domäne liegt in `sel4lake-slab`).
 
+use core::sync::atomic::{AtomicU64, Ordering};
 use sel4lake_hal::exception::init_thread_frame;
+use sel4lake_slab::{AtomicTable, FreeList, Slab};
+use sel4lake_sync::SpinLock;
 
-/// Kerne (eine Scheduler-Instanz je Kern).
-pub const NUM_CORES: usize = 8;
-/// TCB-Slots je Kern (Partitionsgröße). Großzügig, da die Demo viele (auch
-/// dauerhaft geparkte) Threads auf core 0 erzeugt.
-const PER_CORE: usize = 64;
-/// Globaler Slot-Raum.
-const NTHREADS: usize = NUM_CORES * PER_CORE;
+/// Compile-Zeit-Obergrenze der Kernzahl (dimensioniert nur die Arrays von *Locks*, nicht
+/// die Datentabellen). Die **tatsächliche** Kernzahl wird beim Boot ermittelt.
+pub const MAX_CORES: usize = 256;
 
-/// Thread-Handle (globaler Slot-Index + Generation).
+/// Anzahl Prioritätsstufen (höher = wichtiger; 0 = niedrigste).
+pub const NPRIO: usize = 8;
+
+/// Sentinel „kein Index" in den intrusiven Listen/Freilisten.
+const NIL: u32 = u32::MAX;
+/// Sentinel „in keiner Ready-Queue" (`queued`-Feld).
+const NOT_QUEUED: u8 = 0xff;
+
+// ---------------------------------------------------------------------------------------
+// Thread-Directory: gid -> (used, gen, core, local)
+// ---------------------------------------------------------------------------------------
+
+/// Packung eines Directory-Eintrags in ein `u64`:
+/// `used(1) | gen(31) | core(16) | local(16)`.
+const D_USED: u64 = 1 << 63;
+const D_GEN_SHIFT: u32 = 32;
+const D_GEN_MASK: u64 = 0x7fff_ffff;
+const D_CORE_SHIFT: u32 = 16;
+const D_CORE_MASK: u64 = 0xffff;
+const D_LOCAL_MASK: u64 = 0xffff;
+
+const fn pack_dir(used: bool, gen: u32, core: usize, local: usize) -> u64 {
+    (if used { D_USED } else { 0 })
+        | (((gen as u64) & D_GEN_MASK) << D_GEN_SHIFT)
+        | (((core as u64) & D_CORE_MASK) << D_CORE_SHIFT)
+        | ((local as u64) & D_LOCAL_MASK)
+}
+
+/// Das globale Thread-Directory (lock-frei lesbar).
+static DIRECTORY: AtomicTable<AtomicU64> = AtomicTable::empty();
+/// Freiliste der `gid`s. **Leaf-Lock:** wird nie gehalten, während ein anderer Lock
+/// genommen wird. Er wird unter `SCHEDS[core]` genommen (Spawn) bzw. ganz ohne weiteren
+/// Lock (Reap) — nie umgekehrt.
+static GID_FREE: SpinLock<FreeList> = SpinLock::new(FreeList::empty());
+
+/// Bytes für ein Directory mit `capacity` Thread-Slots (Einträge + Freiliste).
+pub const fn directory_bytes(capacity: usize) -> usize {
+    capacity * core::mem::size_of::<AtomicU64>() + capacity * core::mem::size_of::<u32>()
+}
+
+/// Ausrichtung, die [`attach_directory`] erwartet.
+pub const fn directory_align() -> usize {
+    core::mem::align_of::<AtomicU64>()
+}
+
+/// Das Thread-Directory beim Boot anlegen (**einmalig**, vor dem Erzeugen von Threads und
+/// vor dem Start der Sekundärkerne).
+///
+/// # Safety
+/// `mem` zeigt auf mindestens [`directory_bytes(capacity)`](directory_bytes) Bytes, ist auf
+/// [`directory_align`] ausgerichtet, exklusiv für den Kernel und lebt bis zum Reboot.
+pub unsafe fn attach_directory(mem: *mut u8, capacity: usize) {
+    debug_assert!(mem as usize % directory_align() == 0);
+    let entries = mem as *mut AtomicU64;
+    // Freiliste direkt hinter den Einträgen (u32 braucht 4er-Ausrichtung; der Offset ist
+    // ein Vielfaches von 8 -> passt).
+    // SAFETY: Vertrag des Aufrufers (Größe/Ausrichtung/Exklusivität); beide Abschnitte
+    // liegen disjunkt in derselben Zuteilung.
+    unsafe {
+        let free_next = mem.add(capacity * core::mem::size_of::<AtomicU64>()) as *mut u32;
+        DIRECTORY.attach(entries, capacity, |_| AtomicU64::new(0));
+        GID_FREE.lock().attach(free_next, capacity);
+    }
+}
+
+/// Anzahl der Thread-Slots insgesamt (Directory-Kapazität) — Obergrenze für per-Thread-
+/// Tabellen des Kernels (FP-Kontexte, `VSPACE_OF`, Kernel-Stack-Zuordnung).
+pub fn thread_capacity() -> usize {
+    DIRECTORY.len()
+}
+
+/// Anzahl noch freier Thread-Slots (Telemetrie/Tests).
+pub fn threads_available() -> usize {
+    GID_FREE.lock().available()
+}
+
+fn dir_load(gid: usize) -> Option<u64> {
+    DIRECTORY.get(gid).map(|e| e.load(Ordering::Acquire))
+}
+
+/// **Besitzender Kern** eines Threads — lock-frei.
+///
+/// Der Wert kann bereits veraltet sein, wenn der Aufrufer den Lock nimmt (der Thread kann
+/// genau dann migrieren). Der Aufrufer MUSS nach dem Sperren erneut prüfen (`resolve`
+/// schlägt dann fehl) und es mit dem neuen Besitzer wiederholen.
+pub fn owner_core(tid: ThreadId) -> Option<usize> {
+    let e = dir_load(tid.slot)?;
+    if e & D_USED == 0 || ((e >> D_GEN_SHIFT) & D_GEN_MASK) as u32 != tid.gen {
+        return None;
+    }
+    Some(((e >> D_CORE_SHIFT) & D_CORE_MASK) as usize)
+}
+
+/// Lebt dieser Thread noch (gültiger Directory-Eintrag)? Lock-frei.
+pub fn is_live(tid: ThreadId) -> bool {
+    owner_core(tid).is_some()
+}
+
+/// Eine `gid` nach dem Einsammeln des Threads wieder freigeben (aus dem Reap-Pfad,
+/// **ohne** gehaltenen Scheduler-Lock).
+pub fn release_gid(gid: u32) {
+    GID_FREE.lock().free(gid as usize);
+}
+
+// ---------------------------------------------------------------------------------------
+// ThreadId
+// ---------------------------------------------------------------------------------------
+
+/// Thread-Handle: **globaler, migrationsstabiler** Slot (`gid`) + Generation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ThreadId {
     slot: usize,
@@ -49,30 +181,23 @@ impl ThreadId {
             gen: (raw >> 32) as u32,
         }
     }
-    /// Globaler Slot-Index (0..NTHREADS). Stabiler Index z. B. für per-Thread-
-    /// Tabellen im Kernel (etwa den Lazy-FP-Kontextpuffer).
+    /// Globaler Thread-Slot (`gid`): stabiler Index für per-Thread-Tabellen des Kernels.
+    /// **Überlebt eine Migration** (anders als früher kodiert er den Kern NICHT mehr).
     pub fn slot(self) -> usize {
         self.slot
     }
-    /// Der besitzende Kern dieses Threads (aus der statischen Partition).
-    pub fn core(self) -> usize {
-        self.slot / PER_CORE
-    }
-    /// Lokaler Index innerhalb der Kern-Partition.
-    fn local(self) -> usize {
-        self.slot % PER_CORE
-    }
 }
 
-/// Anzahl der globalen Thread-Slots (Obergrenze für per-Thread-Tabellen im Kernel).
-pub const MAX_THREADS: usize = NTHREADS;
-
-/// Anzahl Prioritätsstufen (höher = wichtiger; 0 = niedrigste).
-pub const NPRIO: usize = 8;
+// ---------------------------------------------------------------------------------------
+// TCB
+// ---------------------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 struct Tcb {
     used: bool,
+    /// Globaler Thread-Slot dieses TCBs (Directory-Index).
+    gid: u32,
+    /// Generation (Kopie des Directory-Eintrags; erkennt stale Handles).
     gen: u32,
     /// Gesicherter SP (Zeiger auf den TrapFrame), gültig wenn der Thread *nicht* läuft.
     sp: usize,
@@ -83,6 +208,12 @@ struct Tcb {
     /// Stack-Region des Threads (für die Rückgewinnung beim Beenden).
     stack_base: usize,
     stack_len: usize,
+    // --- intrusive Verkettung (ext-30) ---
+    /// Priorität der Queue, in der der Thread hängt, oder [`NOT_QUEUED`].
+    queued: u8,
+    /// Nachfolger/Vorgänger in der Ready-Queue bzw. Nachfolger in der Freiliste.
+    qnext: u32,
+    qprev: u32,
     // --- MCS Scheduling Context (ADR 0005) ---
     /// Budget in Ticks je Periode. `0` = unbeschränkt (klassisches Round-Robin).
     budget: u32,
@@ -98,8 +229,10 @@ struct Tcb {
     // --- Budget-Donation (MCS, intra-core IPC): bei einem CALL leiht der Aufrufer dem
     // Server seinen Scheduling-Context; der Server wird gegen das **Konto** des Aufrufers
     // belastet (geteilter SC), bis er antwortet. So begrenzt das Budget des Aufrufers die
-    // Server-Arbeit (ein Client mit knappem Budget kann keine unbegrenzte Server-Arbeit
-    // extrahieren). Cross-core-Calls (kein switch_to-Fastpath) spenden nicht. ---
+    // Server-Arbeit. Cross-core-Calls (kein switch_to-Fastpath) spenden nicht.
+    //
+    // Die Links sind **lokale** Slots -> eine Donation ist immer intra-core. Ein Thread mit
+    // aktiver Donation wird deshalb NICHT migriert (s. `detach_for_migration`). ---
     /// Lokaler Slot des Kontos, gegen das dieser Thread belastet wird (`None` = eigenes).
     sc_donor: Option<usize>,
     /// Lokaler Slot des Threads, der gerade gegen dieses Konto läuft (`None` = keiner).
@@ -109,12 +242,16 @@ struct Tcb {
 impl Tcb {
     const EMPTY: Tcb = Tcb {
         used: false,
+        gid: NIL,
         gen: 0,
         sp: 0,
         priority: 0,
         blocked: false,
         stack_base: 0,
         stack_len: 0,
+        queued: NOT_QUEUED,
+        qnext: NIL,
+        qprev: NIL,
         budget: 0,
         period: 0,
         remaining: 0,
@@ -125,88 +262,123 @@ impl Tcb {
     };
 }
 
-/// Aufgezeichneter Stack eines beendeten Threads, der noch freigegeben werden muss.
+/// Ein zur Migration aus einem Kern **herausgelöster** Thread. Undurchsichtiges Token:
+/// nur [`Scheduler::detach_for_migration`] erzeugt es, nur
+/// [`Scheduler::attach_migrated`] nimmt es an. Zwischen beiden Aufrufen existiert der
+/// Thread in **keiner** Kern-Tabelle — deshalb müssen beide Kern-Locks über die gesamte
+/// Übergabe gehalten werden (der Kernel sperrt sie in aufsteigender Kern-Ordnung).
+pub struct Migrant {
+    tcb: Tcb,
+    /// War der Thread bereit (in einer Ready-Queue)? Dann auf dem Zielkern wieder einreihen.
+    was_ready: bool,
+}
+
+impl Migrant {
+    /// Globaler Slot des migrierenden Threads.
+    pub fn gid(&self) -> u32 {
+        self.tcb.gid
+    }
+}
+
+/// Aufgezeichneter Zombie: freizugebende Stack-Region + `gid` (die erst nach dem Reap in
+/// die Freiliste zurückgeht, damit ein stale Handle nie auf einen neuen Thread trifft).
 #[derive(Clone, Copy)]
 struct Zombie {
     base: usize,
     len: usize,
+    gid: u32,
 }
 
-/// FIFO-Ringpuffer lokaler Thread-Indizes (0..PER_CORE).
+impl Zombie {
+    const EMPTY: Zombie = Zombie {
+        base: 0,
+        len: 0,
+        gid: NIL,
+    };
+}
+
+/// Kopf einer intrusiven Ready-Queue (die Verkettung liegt in den TCBs).
 #[derive(Clone, Copy)]
-struct RunQueue {
-    buf: [usize; PER_CORE],
-    head: usize,
-    tail: usize,
-    count: usize,
+struct ListHead {
+    head: u32,
+    tail: u32,
+    count: u32,
 }
 
-impl RunQueue {
-    const EMPTY: RunQueue = RunQueue {
-        buf: [0; PER_CORE],
-        head: 0,
-        tail: 0,
+impl ListHead {
+    const EMPTY: ListHead = ListHead {
+        head: NIL,
+        tail: NIL,
         count: 0,
     };
-
-    fn enqueue(&mut self, tid: usize) {
-        if self.count < PER_CORE {
-            self.buf[self.tail] = tid;
-            self.tail = (self.tail + 1) % PER_CORE;
-            self.count += 1;
-        }
-    }
-
-    fn dequeue(&mut self) -> Option<usize> {
-        if self.count == 0 {
-            return None;
-        }
-        let tid = self.buf[self.head];
-        self.head = (self.head + 1) % PER_CORE;
-        self.count -= 1;
-        Some(tid)
-    }
-
-    /// Einen bestimmten Eintrag entfernen (für `kill` eines bereiten Threads).
-    fn remove(&mut self, target: usize) {
-        let n = self.count;
-        for _ in 0..n {
-            if let Some(t) = self.dequeue() {
-                if t != target {
-                    self.enqueue(t);
-                }
-            }
-        }
-    }
 }
 
-/// Maximale Anzahl noch nicht eingesammelter (reaper-)Zombies je Kern. MUSS so groß sein wie die
-/// per-Kern-TCB-Partition (`PER_CORE`): zwischen zwei Reap-Durchläufen können bis zu `PER_CORE`
-/// Threads dieses Kerns sterben (mehr Threads kann der Kern nicht zugleich tragen), und jeder
-/// hinterlässt einen Stack-Zombie. War der Puffer kleiner (früher 16), verwarf `record_zombie` bei
-/// vollem Puffer den Stack STILL -> Stack-RAM-Leak (der `reclaim`-Test mit 16 transienten Exitern lag
-/// exakt an der alten Grenze; 17 hätten geleckt).
-const NZOMBIES: usize = PER_CORE;
+// ---------------------------------------------------------------------------------------
+// Per-Kern-Lastzähler (lock-frei lesbar)
+// ---------------------------------------------------------------------------------------
 
-/// Scheduler **eines Kerns**: TCB-Partition + Run-Queues + laufender Thread +
-/// Zombies. Im Kernel je Kern eine Instanz hinter eigenem Lock.
+/// Belegte TCB-Slots je Kern — vom jeweiligen Scheduler gepflegt, **lock-frei** lesbar.
+/// Ohne das müsste die lastbewusste Platzierung jeden Kern-Scheduler nacheinander sperren
+/// (bei 256 Kernen 256 Lock-Zyklen je Spawn).
+static CORE_LOAD: [core::sync::atomic::AtomicUsize; MAX_CORES] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; MAX_CORES];
+
+/// Last (belegte TCB-Slots) des Kerns `core` — lock-frei.
+pub fn core_load(core: usize) -> usize {
+    CORE_LOAD
+        .get(core)
+        .map(|l| l.load(Ordering::Relaxed))
+        .unwrap_or(usize::MAX)
+}
+
+// ---------------------------------------------------------------------------------------
+// Scheduler
+// ---------------------------------------------------------------------------------------
+
+/// Scheduler **eines Kerns**: TCB-Tabelle + Ready-Listen + laufender Thread + Zombies.
 pub struct Scheduler {
-    /// Eigene Kern-ID (gesetzt durch [`bind_core`](Self::bind_core)/`init_core`);
-    /// bestimmt den globalen Slot-Offset `core*PER_CORE`.
+    /// Eigene Kern-ID (gesetzt durch [`attach_storage`](Scheduler::attach_storage)).
     core: usize,
-    tcbs: [Tcb; PER_CORE],
+    tcbs: Slab<Tcb>,
+    /// Freie lokale TCB-Indizes (O(1)).
+    free: FreeList,
     /// Laufender Thread (lokaler Index) oder `None` (vor `init_core`).
     current: Option<usize>,
-    /// Eine Ready-Queue je Priorität (Round-Robin innerhalb einer Priorität).
-    queues: [RunQueue; NPRIO],
+    /// Eine Ready-Liste je Priorität (Round-Robin innerhalb einer Priorität).
+    queues: [ListHead; NPRIO],
     /// Bit `p` gesetzt, wenn `queues[p]` nicht leer ist (O(1)-Auswahl der höchsten).
     bitmap: u32,
-    zombies: [Option<Zombie>; NZOMBIES],
+    /// Ringpuffer noch nicht eingesammelter Zombies.
+    zombies: Slab<Zombie>,
+    zhead: usize,
+    ztail: usize,
+    zcount: usize,
     /// Per-Kern-Tick-Zähler (für MCS-Budget-Refill-Zeitpunkte).
     now: u64,
     /// Telemetrie: wie oft erschöpfte ein Budget bzw. wurde aufgefüllt (für Tests).
     depletions: u64,
     refills: u64,
+    /// Belegte TCB-Slots (O(1)-`load()`); wird nach `CORE_LOAD` gespiegelt.
+    used: usize,
+    /// Anzahl aktuell **erschöpfter** MCS-Konten. Ist sie 0, entfällt der Refill-Scan
+    /// vollständig — der Normalfall (kein Budget) kostet damit nichts je Tick.
+    depleted_count: usize,
+    /// Migrations-Telemetrie (Tests): wie viele Threads dieser Kern abgegeben/aufgenommen hat.
+    migrations_out: u64,
+    migrations_in: u64,
+}
+
+/// Bytes für die Kern-Tabellen bei `capacity` gleichzeitig auf diesem Kern gehosteten
+/// Threads (TCBs + Zombie-Ring + Freiliste, ein Block).
+pub const fn core_storage_bytes(capacity: usize) -> usize {
+    capacity * core::mem::size_of::<Tcb>()
+        + capacity * core::mem::size_of::<Zombie>()
+        + capacity * core::mem::size_of::<u32>()
+}
+
+/// Ausrichtung, die [`Scheduler::attach_storage`] erwartet.
+pub const fn core_storage_align() -> usize {
+    core::mem::align_of::<Tcb>()
 }
 
 impl Default for Scheduler {
@@ -219,30 +391,54 @@ impl Scheduler {
     pub const fn new() -> Self {
         Self {
             core: 0,
-            tcbs: [Tcb::EMPTY; PER_CORE],
+            tcbs: Slab::empty(),
+            free: FreeList::empty(),
             current: None,
-            queues: [RunQueue::EMPTY; NPRIO],
+            queues: [ListHead::EMPTY; NPRIO],
             bitmap: 0,
-            zombies: [None; NZOMBIES],
+            zombies: Slab::empty(),
+            zhead: 0,
+            ztail: 0,
+            zcount: 0,
             now: 0,
             depletions: 0,
             refills: 0,
+            used: 0,
+            depleted_count: 0,
+            migrations_out: 0,
+            migrations_in: 0,
         }
     }
 
-    /// Diese Instanz an Kern `core` binden (setzt den globalen Slot-Offset). Vom
-    /// Bootkern für **alle** Instanzen aufzurufen, bevor irgendwo Threads erzeugt
-    /// werden — auch für Kerne, deren `init_core` (Idle-Anlage) erst später auf dem
-    /// jeweiligen Kern läuft.
-    pub fn bind_core(&mut self, core: usize) {
+    /// Diese Instanz an Kern `core` binden **und ihre Tabellen anlegen**. Vom Bootkern für
+    /// **alle** Instanzen aufzurufen, bevor irgendwo Threads erzeugt werden — auch für
+    /// Kerne, deren `init_core` erst später auf dem jeweiligen Kern läuft.
+    ///
+    /// # Safety
+    /// `mem` zeigt auf mindestens [`core_storage_bytes(capacity)`](core_storage_bytes)
+    /// Bytes, ist auf [`core_storage_align`] ausgerichtet, exklusiv für **diese** Instanz
+    /// und lebt bis zum Reboot.
+    pub unsafe fn attach_storage(&mut self, core: usize, mem: *mut u8, capacity: usize) {
+        debug_assert!(mem as usize % core_storage_align() == 0);
         self.core = core;
+        let tcb_bytes = capacity * core::mem::size_of::<Tcb>();
+        let zomb_bytes = capacity * core::mem::size_of::<Zombie>();
+        // SAFETY: Vertrag des Aufrufers; die drei Abschnitte liegen disjunkt in derselben
+        // Zuteilung und sind (Tcb/Zombie: 8-ausgerichtet, u32: 4) korrekt ausgerichtet.
+        unsafe {
+            self.tcbs
+                .attach(mem as *mut Tcb, capacity, |_| Tcb::EMPTY);
+            self.zombies
+                .attach(mem.add(tcb_bytes) as *mut Zombie, capacity, |_| Zombie::EMPTY);
+            self.free
+                .attach(mem.add(tcb_bytes + zomb_bytes) as *mut u32, capacity);
+        }
     }
 
-    /// Kern initialisieren: der gerade laufende Boot-Kontext wird zum Idle-Thread
-    /// (sein SP wird beim ersten Tick gesichert). Auf dem jeweiligen Kern vor dem
-    /// Aktivieren von IRQs aufzurufen.
+    /// Kern initialisieren: der gerade laufende Boot-Kontext wird zum Idle-Thread.
+    /// Auf dem jeweiligen Kern vor dem Aktivieren von IRQs aufzurufen.
     pub fn init_core(&mut self, core: usize, priority: u8) -> Option<ThreadId> {
-        self.core = core;
+        debug_assert_eq!(core, self.core);
         let idle = self.alloc_tcb(0, priority)?;
         self.current = Some(idle);
         Some(self.id(idle))
@@ -250,7 +446,6 @@ impl Scheduler {
 
     /// Einen neuen Thread auf diesem Kern mit `priority` erzeugen: initialen Kontext
     /// am Stack-Top anlegen und in die Ready-Queue seiner Priorität einreihen.
-    /// `core` muss dem gebundenen Kern dieser Instanz entsprechen.
     pub fn spawn(
         &mut self,
         core: usize,
@@ -273,11 +468,8 @@ impl Scheduler {
     /// Kernel-Stack `[kstack_base, kstack_base+kstack_len)`, der Thread läuft auf
     /// EL0 mit dem User-Stack `[user_base, user_base+user_len)`.
     ///
-    /// Zum Reaping wird der **User-Stack** vermerkt (dynamisch alloziert,
-    /// rückgebbar an den Allokator). Der Kernel-Stack stammt aus einem festen
-    /// EL1-only Pool im Kernel-Image; er darf **nicht** an den Phys-Allokator
-    /// zurückgegeben werden (würde eine Kernel-Image-Region einschleusen) und wird
-    /// in Phase 1 geleakt (Pool ist klein und fest).
+    /// Zum Reaping wird der **User-Stack** vermerkt (dynamisch alloziert, rückgebbar);
+    /// der Kernel-Stack stammt aus einem eigenen EL1-only Pool.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_user(
         &mut self,
@@ -326,9 +518,7 @@ impl Scheduler {
     }
 
     /// Der laufende Thread beendet sich selbst: Stack als Zombie vormerken und
-    /// zum nächsten Thread wechseln. Der TCB-Slot + Stack werden später per
-    /// [`reap`](Self::reap) eingesammelt (der Thread läuft noch auf seinem Stack,
-    /// daher nicht sofort freigeben). Gibt den nächsten Frame zurück.
+    /// zum nächsten Thread wechseln. Gibt den nächsten Frame zurück.
     pub fn exit_current(&mut self, core: usize, _frame: usize) -> usize {
         debug_assert_eq!(core, self.core);
         let cur = self.current.expect("kein laufender Thread");
@@ -341,8 +531,6 @@ impl Scheduler {
     }
 
     /// Einen *nicht laufenden* Thread (blockiert/geparkt) **dieses Kerns** beenden.
-    /// Sein Stack wird als Zombie vorgemerkt. Gibt `true`, falls der Thread gültig,
-    /// auf diesem Kern und nicht der laufende war.
     pub fn kill(&mut self, tid: ThreadId, core: usize) -> bool {
         debug_assert_eq!(core, self.core);
         let Some(s) = self.resolve(tid) else {
@@ -356,18 +544,32 @@ impl Scheduler {
         true
     }
 
-    /// Einen Zombie dieses Kerns einsammeln: TCB-Slot freigeben und die Stack-Region
-    /// zurückgeben, damit der Aufrufer (Kernel) sie dem Allokator zurückgibt.
-    pub fn reap(&mut self) -> Option<(usize, usize)> {
-        let i = self.zombies.iter().position(|z| z.is_some())?;
-        let z = self.zombies[i].take().unwrap();
-        Some((z.base, z.len))
+    /// Einen Zombie dieses Kerns einsammeln: Stack-Region + `gid` zurückgeben, damit der
+    /// Aufrufer (Kernel) die Region dem Allokator und die `gid` per [`release_gid`] der
+    /// Thread-Freiliste zurückgibt — **beides außerhalb** des Scheduler-Locks.
+    pub fn reap(&mut self) -> Option<(usize, usize, u32)> {
+        if self.zcount == 0 {
+            return None;
+        }
+        let z = self.zombies[self.zhead];
+        self.zhead = (self.zhead + 1) % self.zombies.len();
+        self.zcount -= 1;
+        Some((z.base, z.len, z.gid))
     }
 
-    /// Lastmaß dieses Kerns: Anzahl belegter TCB-Slots (laufend + bereit +
-    /// blockiert/geparkt). Für die lastbewusste spawn-Platzierung.
+    /// Lastmaß dieses Kerns: belegte TCB-Slots (O(1)).
     pub fn load(&self) -> usize {
-        self.tcbs.iter().filter(|t| t.used).count()
+        self.used
+    }
+
+    /// Freie TCB-Slots dieses Kerns (kann dieser Kern noch einen Thread aufnehmen?).
+    pub fn capacity_left(&self) -> usize {
+        self.free.available()
+    }
+
+    /// Migrations-Telemetrie: (abgegeben, aufgenommen).
+    pub fn migration_stats(&self) -> (u64, u64) {
+        (self.migrations_out, self.migrations_in)
     }
 
     /// Handle des aktuell laufenden Threads.
@@ -378,7 +580,7 @@ impl Scheduler {
     }
 
     /// Gesicherter Frame eines (blockierten) Threads **dieses Kerns** — für den
-    /// IPC-Nachrichtentransfer. `None`, wenn der Thread nicht zu diesem Kern gehört.
+    /// IPC-Nachrichtentransfer. `None`, wenn der Thread nicht (mehr) zu diesem Kern gehört.
     pub fn frame_of(&self, tid: ThreadId) -> Option<usize> {
         self.resolve(tid).map(|s| self.tcbs[s].sp)
     }
@@ -405,6 +607,7 @@ impl Scheduler {
         self.tcbs[cur].blocked = true;
         let t = self.resolve(target).expect("Zielthread ungültig/fremder Kern");
         self.tcbs[t].blocked = false;
+        self.remove_from_ready(t); // war er bereits bereit, jetzt läuft er -> ausklinken
         // Budget-Donation: der Aufrufer (`cur`) leiht dem Server (`t`) seinen
         // Scheduling-Context. Belastet wird das **Wurzel-Konto** des Aufrufers (folgt
         // einer evtl. eigenen Spende -> verschachtelte IPC teilt das Wurzel-Budget).
@@ -415,45 +618,158 @@ impl Scheduler {
         self.tcbs[t].sp
     }
 
-    /// Einen blockierten Thread **dieses Kerns** wieder bereit machen. Kern-
-    /// übergreifend ruft der Kernel dies auf der Zielinstanz auf (+ Reschedule-IPI).
+    /// Einen blockierten Thread **dieses Kerns** wieder bereit machen. Kern-übergreifend
+    /// ruft der Kernel dies auf der Zielinstanz auf (+ Reschedule-IPI).
     ///
-    /// Idempotent: wirkt **nur**, wenn der Thread tatsächlich blockiert ist. Ein
-    /// Aufruf auf einen laufenden/bereiten Thread ist ein No-Op (verhindert
-    /// Doppel-Einreihung) — wichtig, wenn `wake_remote` einen Thread trifft, der
-    /// gerade erst dabei ist, sich zu blockieren; ein erneuter Aufruf weckt ihn dann.
-    pub fn unblock(&mut self, tid: ThreadId) {
-        if let Some(s) = self.resolve(tid) {
-            if self.tcbs[s].blocked {
-                self.tcbs[s].blocked = false;
-                self.enqueue_ready(s);
-            }
+    /// Idempotent: wirkt **nur**, wenn der Thread tatsächlich blockiert ist.
+    ///
+    /// Rückgabe: ob der Thread auf **diesem** Kern aufgelöst werden konnte. `false` heißt
+    /// „tot **oder** inzwischen migriert" — der Aufrufer schlägt den Besitzer dann neu nach
+    /// und wiederholt (s. Modul-Doku).
+    pub fn unblock(&mut self, tid: ThreadId) -> bool {
+        let Some(s) = self.resolve(tid) else {
+            return false;
+        };
+        if self.tcbs[s].blocked {
+            self.tcbs[s].blocked = false;
+            self.enqueue_ready(s);
         }
+        true
     }
 
-    /// Einen **bestimmten** Thread dieses Kerns externen pausieren (ext-22, `SYS_PDCTL`
-    /// PAUSE): als blockiert markieren und aus der Ready-Queue nehmen. Ist er gerade der
-    /// laufende Thread, deplaniert ihn der nächste Tick (`on_tick` reiht einen als
-    /// blockiert markierten `current` nicht wieder ein). Mit [`unblock`] (RESUME) reversibel.
-    pub fn pause(&mut self, tid: ThreadId) {
-        if let Some(s) = self.resolve(tid) {
-            if !self.tcbs[s].blocked {
-                self.tcbs[s].blocked = true;
-                self.remove_from_ready(s); // No-Op, falls er gerade `current` ist
-            }
+    /// Einen **bestimmten** Thread dieses Kerns extern pausieren (`SYS_PDCTL` PAUSE).
+    /// Rückgabe wie [`unblock`](Self::unblock): konnte der Thread hier aufgelöst werden?
+    pub fn pause(&mut self, tid: ThreadId) -> bool {
+        let Some(s) = self.resolve(tid) else {
+            return false;
+        };
+        if !self.tcbs[s].blocked {
+            self.tcbs[s].blocked = true;
+            self.remove_from_ready(s); // No-Op, falls er gerade `current` ist
         }
+        true
     }
 
+    /// Auflösung `ThreadId -> lokaler TCB-Index` **dieses** Kerns.
+    ///
+    /// Schlägt fehl, wenn der Thread tot ist **oder inzwischen auf einen anderen Kern
+    /// migriert** ist. Genau das ist die Wiederholungsbedingung für kernübergreifende
+    /// Aufrufer (s. Modul-Doku).
     fn resolve(&self, tid: ThreadId) -> Option<usize> {
-        if tid.core() != self.core {
+        let e = dir_load(tid.slot)?;
+        if e & D_USED == 0 {
             return None;
         }
-        let local = tid.local();
-        if self.tcbs[local].used && self.tcbs[local].gen == tid.gen {
+        if ((e >> D_GEN_SHIFT) & D_GEN_MASK) as u32 != tid.gen {
+            return None;
+        }
+        if ((e >> D_CORE_SHIFT) & D_CORE_MASK) as usize != self.core {
+            return None; // gehört (nicht mehr) diesem Kern
+        }
+        let local = (e & D_LOCAL_MASK) as usize;
+        let t = self.tcbs.get(local)?;
+        if t.used && t.gen == tid.gen {
             Some(local)
         } else {
             None
         }
+    }
+
+    // --- Migration (ext-30) ---------------------------------------------------------
+
+    /// Einen Thread **dieses** Kerns zur Migration herauslösen.
+    ///
+    /// Nur der besitzende Kern darf das (der Aufrufer hält dessen Lock). Schlägt fehl bei:
+    /// * unbekanntem/fremdem Thread,
+    /// * dem **laufenden** Thread (sein Zustand steckt im aktiven Trap-Frame),
+    /// * aktiver **Budget-Donation** (die Links sind lokale Slots — eine Spende ist
+    ///   definitionsgemäß intra-core; erst nach dem REPLY ist der Thread migrierbar).
+    ///
+    /// Der Directory-Eintrag bleibt bis [`attach_migrated`](Self::attach_migrated)
+    /// unverändert stehen (er zeigt noch auf diesen Kern); da der Aufrufer beide Locks
+    /// hält, kann in diesem Fenster niemand den Thread erfolgreich auflösen.
+    pub fn detach_for_migration(&mut self, tid: ThreadId) -> Option<Migrant> {
+        let s = self.resolve(tid)?;
+        if self.current == Some(s) {
+            return None;
+        }
+        if self.tcbs[s].sc_donor.is_some() || self.tcbs[s].sc_donee.is_some() {
+            return None;
+        }
+        let was_ready = self.tcbs[s].queued != NOT_QUEUED;
+        self.remove_from_ready(s);
+        let mut tcb = self.tcbs[s];
+        // Lokale Verkettung/Slot-Bezüge gehören dem Quellkern -> zurücksetzen.
+        tcb.queued = NOT_QUEUED;
+        tcb.qnext = NIL;
+        tcb.qprev = NIL;
+        // Slot freigeben (die `gid` bleibt dem Thread!). `gen` NICHT erhöhen — die
+        // Identität des Threads bleibt bestehen, er wechselt nur den Kern.
+        if self.tcbs[s].depleted {
+            self.depleted_count -= 1;
+        }
+        self.tcbs[s] = Tcb::EMPTY;
+        self.free.free(s);
+        self.used -= 1;
+        CORE_LOAD[self.core].store(self.used, Ordering::Relaxed);
+        self.migrations_out += 1;
+        Some(Migrant { tcb, was_ready })
+    }
+
+    /// Einen herausgelösten Thread auf **diesem** Kern aufnehmen und den Directory-Eintrag
+    /// auf ihn umhängen. Gibt den Migranten bei fehlender Kapazität **zurück**, damit der
+    /// Aufrufer ihn wieder beim Quellkern einhängen kann (kein Thread-Verlust).
+    pub fn attach_migrated(&mut self, m: Migrant) -> Result<(), Migrant> {
+        let Some(s) = self.free.alloc() else {
+            return Err(m);
+        };
+        let mut tcb = m.tcb;
+        // MCS: `next_refill` ist relativ zur **Tick-Uhr des Quellkerns** -> auf die eigene
+        // umrechnen, sonst würde ein erschöpftes Budget hier zu früh/zu spät auffüllen.
+        if tcb.depleted {
+            tcb.next_refill = self.now + tcb.period as u64;
+            self.depleted_count += 1;
+        }
+        tcb.queued = NOT_QUEUED;
+        tcb.qnext = NIL;
+        tcb.qprev = NIL;
+        self.tcbs[s] = tcb;
+        self.used += 1;
+        CORE_LOAD[self.core].store(self.used, Ordering::Relaxed);
+        self.migrations_in += 1;
+        // Directory umhängen: ab jetzt löst der Thread auf diesem Kern auf.
+        self.publish_dir(s);
+        if m.was_ready {
+            self.enqueue_ready(s);
+        }
+        Ok(())
+    }
+
+    /// Kandidat zum Abgeben an einen anderen Kern: ein **bereiter**, nicht laufender Thread
+    /// ohne aktive Donation und ohne Idle-Rolle. `None`, wenn nichts migrierbar ist.
+    ///
+    /// Bewusst nur *bereite* Threads: blockierte hängen in IPC-Warteschlangen, deren
+    /// Einträge `ThreadId`s sind — die überleben eine Migration zwar, aber sie zu
+    /// verschieben bringt keinen Lastgewinn (sie verbrauchen keine CPU).
+    pub fn migration_candidate(&self) -> Option<ThreadId> {
+        for p in 0..NPRIO {
+            let mut i = self.queues[p].head;
+            while i != NIL {
+                let s = i as usize;
+                let t = &self.tcbs[s];
+                i = t.qnext;
+                if self.current == Some(s) || t.sc_donor.is_some() || t.sc_donee.is_some() {
+                    continue;
+                }
+                // Der Idle-Thread (Slot des `init_core`-Kontextes) hat keinen eigenen Stack
+                // und darf den Kern nie verlassen.
+                if t.stack_len == 0 {
+                    continue;
+                }
+                return Some(self.id(s));
+            }
+        }
+        None
     }
 
     /// Timer-Tick (oder Reschedule-IPI): aktuellen Frame sichern, rundlaufend den
@@ -467,28 +783,10 @@ impl Scheduler {
         debug_assert_eq!(core, self.core);
         if tick {
             self.now += 1;
-            // Refill: erschöpfte MCS-Konten, deren Periode abgelaufen ist, auffüllen und
-            // den wartenden Läufer wieder bereit machen. Läuft ein **Donee** (geliehener
-            // SC) gegen dieses Konto, wird der DONEE wieder bereit gemacht (das Konto
-            // selbst ist der blockierte Aufrufer); sonst das Konto selbst.
-            for slot in 0..PER_CORE {
-                if self.tcbs[slot].used
-                    && self.tcbs[slot].budget > 0
-                    && self.tcbs[slot].depleted
-                    && self.now >= self.tcbs[slot].next_refill
-                {
-                    self.tcbs[slot].remaining = self.tcbs[slot].budget;
-                    self.tcbs[slot].depleted = false;
-                    self.refills += 1;
-                    match self.tcbs[slot].sc_donee {
-                        Some(d) if d != slot => {
-                            // Der Donee war auf das Konto-Budget geblockt -> wieder bereit.
-                            self.tcbs[d].blocked = false;
-                            self.enqueue_ready(d);
-                        }
-                        _ => self.enqueue_ready(slot),
-                    }
-                }
+            // Refill-Scan NUR, wenn überhaupt ein Konto erschöpft ist (Normalfall: keins ->
+            // der Tick kostet nichts, unabhängig von der Tabellengröße).
+            if self.depleted_count > 0 {
+                self.refill_depleted();
             }
         }
         if let Some(cur) = self.current {
@@ -505,6 +803,7 @@ impl Scheduler {
                     // Konto erschöpft: bis zum Refill nicht mehr einplanen.
                     self.tcbs[acct].depleted = true;
                     self.tcbs[acct].next_refill = self.now + self.tcbs[acct].period as u64;
+                    self.depleted_count += 1;
                     self.depletions += 1;
                     requeue = false;
                     if acct != cur {
@@ -528,24 +827,51 @@ impl Scheduler {
         }
     }
 
+    /// Erschöpfte MCS-Konten, deren Periode abgelaufen ist, auffüllen und den wartenden
+    /// Läufer wieder bereit machen. Läuft ein **Donee** (geliehener SC) gegen dieses Konto,
+    /// wird der DONEE wieder bereit gemacht (das Konto selbst ist der blockierte Aufrufer).
+    fn refill_depleted(&mut self) {
+        for slot in 0..self.tcbs.len() {
+            if self.tcbs[slot].used
+                && self.tcbs[slot].budget > 0
+                && self.tcbs[slot].depleted
+                && self.now >= self.tcbs[slot].next_refill
+            {
+                self.tcbs[slot].remaining = self.tcbs[slot].budget;
+                self.tcbs[slot].depleted = false;
+                self.depleted_count -= 1;
+                self.refills += 1;
+                match self.tcbs[slot].sc_donee {
+                    Some(d) if d != slot => {
+                        // Der Donee war auf das Konto-Budget geblockt -> wieder bereit.
+                        self.tcbs[d].blocked = false;
+                        self.enqueue_ready(d);
+                    }
+                    _ => self.enqueue_ready(slot),
+                }
+            }
+        }
+    }
+
     /// Einem Thread einen **Scheduling Context** zuweisen: `budget` Ticks je `period`
-    /// Ticks (`budget = 0` -> unbeschränkt/Round-Robin). Konfiguriert die MCS-Felder.
+    /// Ticks (`budget = 0` -> unbeschränkt/Round-Robin).
     pub fn set_budget(&mut self, tid: ThreadId, budget: u32, period: u32) -> bool {
         if let Some(s) = self.resolve(tid) {
-            // War der Thread erschöpft, ist er weder laufend, noch bereit, noch
-            // blockiert — er liegt NUR auf den Refill-Scan wartend. Würden wir hier
-            // `depleted` löschen, ohne ihn wieder einzureihen, wäre er für immer
-            // verloren (nie wieder einplanbar, aber belegter TCB-Slot -> DoS + die
-            // Leak-Erkennung über `used_tcbs` würde getäuscht). Daher nach dem
-            // Reset wieder bereit machen.
+            // War der Thread erschöpft, ist er weder laufend, noch bereit, noch blockiert —
+            // er wartet NUR auf den Refill-Scan. Würden wir hier `depleted` löschen, ohne
+            // ihn wieder einzureihen, wäre er für immer verloren (nie wieder einplanbar,
+            // aber belegter TCB-Slot). Daher nach dem Reset wieder bereit machen.
             let was_depleted = self.tcbs[s].depleted;
             self.tcbs[s].budget = budget;
             self.tcbs[s].period = period.max(1);
             self.tcbs[s].remaining = budget;
             self.tcbs[s].next_refill = self.now + period as u64;
             self.tcbs[s].depleted = false;
-            if was_depleted && self.current != Some(s) && !self.tcbs[s].blocked {
-                self.enqueue_ready(s);
+            if was_depleted {
+                self.depleted_count -= 1;
+                if self.current != Some(s) && !self.tcbs[s].blocked {
+                    self.enqueue_ready(s);
+                }
             }
             true
         } else {
@@ -559,8 +885,7 @@ impl Scheduler {
     }
 
     /// Eine **Budget-Donation beenden**: der laufende Thread (Server beim REPLY) gibt das
-    /// geliehene Konto frei und läuft wieder auf seinem eigenen Budget. Vom IPC-`reply`
-    /// aufzurufen. Idempotent (No-Op ohne aktive Spende).
+    /// geliehene Konto frei. Idempotent (No-Op ohne aktive Spende).
     pub fn end_donation(&mut self, core: usize) {
         debug_assert_eq!(core, self.core);
         if let Some(cur) = self.current {
@@ -572,59 +897,74 @@ impl Scheduler {
         }
     }
 
-    /// Lebt `tid` auf diesem Kern (gültiges, belegtes Handle)? Für IPC-Audits, die
-    /// Queue-Einträge auf tote TCBs prüfen.
+    /// Lebt `tid` auf diesem Kern (gültiges, belegtes Handle)? Für IPC-Audits.
     pub fn is_alive(&self, tid: ThreadId) -> bool {
         self.resolve(tid).is_some()
     }
 
     /// Read-only **Konsistenz-Audit** dieses Kern-Schedulers (Fuzzer-Oracle). Gibt `0`
     /// bei Konsistenz, sonst einen Anomalie-Code zurück. Unter dem `SCHEDS[core]`-Lock
-    /// aufzurufen (konsistenter Snapshot). Geprüft:
-    /// 1=toter Eintrag (Slot nicht `used`) in Ready-Queue, 2=blockierter Thread in
-    /// Ready-Queue, 3=Duplikat (Thread mehrfach eingeplant), 4=`current` auch in der
-    /// Ready-Queue, 5=Bitmap inkonsistent zu Queue-Zählern, 6=Thread in falscher
-    /// Prioritäts-Queue, 7=verlorener Thread (lauffähig, aber in keiner Queue/nicht
-    /// laufend — z. B. fälschlich gestrandet).
+    /// aufzurufen. Geprüft: 1=toter Eintrag in einer Ready-Liste, 2=blockierter Thread in
+    /// einer Ready-Liste, 3=Verkettung nicht reziprok (Listenstruktur kaputt),
+    /// 4=`current` steht zugleich in einer Ready-Liste, 5=Bitmap/Zähler inkonsistent,
+    /// 6=Thread in der falschen Prioritäts-Liste, 7=verlorener Thread (lauffähig, aber in
+    /// keiner Liste/nicht laufend), 8=Directory-Eintrag passt nicht zum TCB.
     pub fn audit(&self) -> u32 {
-        let mut seen = [false; PER_CORE];
         for p in 0..NPRIO {
             let q = &self.queues[p];
             if ((self.bitmap >> p) & 1 == 1) != (q.count > 0) {
                 return 5;
             }
             let mut i = q.head;
-            for _ in 0..q.count {
-                let local = q.buf[i];
-                i = (i + 1) % PER_CORE;
-                if local >= PER_CORE || !self.tcbs[local].used {
+            let mut prev = NIL;
+            let mut n = 0u32;
+            while i != NIL {
+                let s = i as usize;
+                let Some(t) = self.tcbs.get(s) else {
+                    return 1;
+                };
+                if !t.used {
                     return 1;
                 }
-                if self.tcbs[local].blocked {
+                if t.blocked {
                     return 2;
                 }
-                if self.tcbs[local].priority as usize != p {
+                if t.queued as usize != p || t.priority as usize != p {
                     return 6;
                 }
-                if seen[local] {
-                    return 3;
+                if t.qprev != prev {
+                    return 3; // Rückverkettung stimmt nicht
                 }
-                seen[local] = true;
-                if self.current == Some(local) {
+                if self.current == Some(s) {
                     return 4;
                 }
+                prev = i;
+                i = t.qnext;
+                n += 1;
+                if n > q.count {
+                    return 5; // längere Liste als gezählt (Zyklus/Leck)
+                }
+            }
+            if n != q.count || q.tail != prev {
+                return 5;
             }
         }
-        // Verlorene Threads: jeder belegte, lauffähige (nicht blockiert, nicht MCS-
-        // erschöpft, nicht laufend) Thread MUSS in einer Ready-Queue stehen.
-        for local in 0..PER_CORE {
+        // Verlorene Threads + Directory-Konsistenz.
+        for local in 0..self.tcbs.len() {
             let t = &self.tcbs[local];
-            if t.used
-                && !t.blocked
-                && !t.depleted
-                && self.current != Some(local)
-                && !seen[local]
-            {
+            if !t.used {
+                continue;
+            }
+            // Der Directory-Eintrag MUSS auf genau diesen Kern + Slot zeigen.
+            match dir_load(t.gid as usize) {
+                Some(e)
+                    if e & D_USED != 0
+                        && ((e >> D_GEN_SHIFT) & D_GEN_MASK) as u32 == t.gen
+                        && ((e >> D_CORE_SHIFT) & D_CORE_MASK) as usize == self.core
+                        && (e & D_LOCAL_MASK) as usize == local => {}
+                _ => return 8,
+            }
+            if !t.blocked && !t.depleted && self.current != Some(local) && t.queued == NOT_QUEUED {
                 return 7;
             }
         }
@@ -633,28 +973,68 @@ impl Scheduler {
 
     // --- intern ---
 
-    /// Einen Thread (lokaler Index) in die Ready-Queue seiner Priorität einreihen.
+    /// Directory-Eintrag des TCBs an `local` auf diesen Kern/Slot setzen.
+    fn publish_dir(&self, local: usize) {
+        let t = &self.tcbs[local];
+        if let Some(e) = DIRECTORY.get(t.gid as usize) {
+            e.store(pack_dir(true, t.gen, self.core, local), Ordering::Release);
+        }
+    }
+
+    /// Einen Thread (lokaler Index) in die Ready-Liste seiner Priorität einreihen (O(1)).
+    /// No-Op, wenn er bereits eingereiht ist (Doppel-Einreihung wäre ein Listen-Zyklus).
     fn enqueue_ready(&mut self, local: usize) {
+        if self.tcbs[local].queued != NOT_QUEUED {
+            return;
+        }
         let p = self.tcbs[local].priority as usize;
-        self.queues[p].enqueue(local);
+        let tail = self.queues[p].tail;
+        self.tcbs[local].qprev = tail;
+        self.tcbs[local].qnext = NIL;
+        self.tcbs[local].queued = p as u8;
+        if tail == NIL {
+            self.queues[p].head = local as u32;
+        } else {
+            self.tcbs[tail as usize].qnext = local as u32;
+        }
+        self.queues[p].tail = local as u32;
+        self.queues[p].count += 1;
         self.bitmap |= 1 << p;
     }
 
-    /// Einen bereiten Thread aus seiner Prioritäts-Queue entfernen (für `kill`).
+    /// Einen bereiten Thread aus seiner Prioritäts-Liste ausklinken (O(1)).
     fn remove_from_ready(&mut self, local: usize) {
-        let p = self.tcbs[local].priority as usize;
-        self.queues[p].remove(local);
+        let p = self.tcbs[local].queued;
+        if p == NOT_QUEUED {
+            return;
+        }
+        let p = p as usize;
+        let (prev, next) = (self.tcbs[local].qprev, self.tcbs[local].qnext);
+        if prev == NIL {
+            self.queues[p].head = next;
+        } else {
+            self.tcbs[prev as usize].qnext = next;
+        }
+        if next == NIL {
+            self.queues[p].tail = prev;
+        } else {
+            self.tcbs[next as usize].qprev = prev;
+        }
+        self.tcbs[local].qnext = NIL;
+        self.tcbs[local].qprev = NIL;
+        self.tcbs[local].queued = NOT_QUEUED;
+        self.queues[p].count -= 1;
         if self.queues[p].count == 0 {
             self.bitmap &= !(1 << p);
         }
     }
 
-    /// Einen beendeten Thread aufzeichnen: TCB-Slot sofort freigeben (Generation
-    /// erhöhen), Stack-Region zum späteren Freigeben (`reap`) vormerken.
+    /// Einen beendeten Thread aufzeichnen: TCB-Slot freigeben, Directory-Eintrag
+    /// **sofort** ungültig machen (stale Handles sterben unmittelbar), Stack-Region + `gid`
+    /// zum späteren Freigeben (`reap`) vormerken.
     fn record_zombie(&mut self, local: usize) {
         // Budget-Donation-Links lösen (vor dem Clear lesen): stirbt ein Konto, verliert
-        // sein Donee die Spende (charged wieder eigenes Budget); stirbt ein Donee, wird
-        // der Donee-Eintrag des Kontos gelöscht.
+        // sein Donee die Spende; stirbt ein Donee, wird der Donee-Eintrag gelöscht.
         if let Some(d) = self.tcbs[local].sc_donee {
             self.tcbs[d].sc_donor = None;
         }
@@ -663,15 +1043,28 @@ impl Scheduler {
                 self.tcbs[a].sc_donee = None;
             }
         }
+        self.remove_from_ready(local);
         let base = self.tcbs[local].stack_base;
         let len = self.tcbs[local].stack_len;
-        let gen = self.tcbs[local].gen.wrapping_add(1);
+        let gid = self.tcbs[local].gid;
+        let gen = self.tcbs[local].gen.wrapping_add(1) & (D_GEN_MASK as u32);
+        // Directory: nicht mehr belegt, Generation hoch -> jedes alte Handle ist stale.
+        if let Some(e) = DIRECTORY.get(gid as usize) {
+            e.store(pack_dir(false, gen, 0, 0), Ordering::Release);
+        }
+        if self.tcbs[local].depleted {
+            self.depleted_count -= 1;
+        }
         self.tcbs[local] = Tcb::EMPTY;
-        self.tcbs[local].gen = gen;
-        if len > 0 {
-            if let Some(z) = self.zombies.iter_mut().find(|z| z.is_none()) {
-                *z = Some(Zombie { base, len });
-            }
+        self.free.free(local);
+        self.used -= 1;
+        CORE_LOAD[self.core].store(self.used, Ordering::Relaxed);
+        // Zombie IMMER aufzeichnen (auch ohne Stack): die `gid` muss zurück in die
+        // Thread-Freiliste, und das darf nur außerhalb des Scheduler-Locks passieren.
+        if self.zcount < self.zombies.len() {
+            self.zombies[self.ztail] = Zombie { base, len, gid };
+            self.ztail = (self.ztail + 1) % self.zombies.len();
+            self.zcount += 1;
         }
     }
 
@@ -681,34 +1074,54 @@ impl Scheduler {
             return None;
         }
         let p = (31 - self.bitmap.leading_zeros()) as usize; // höchstes gesetztes Bit
-        let tid = self.queues[p].dequeue();
-        if self.queues[p].count == 0 {
-            self.bitmap &= !(1 << p);
+        let head = self.queues[p].head;
+        if head == NIL {
+            return None;
         }
-        tid
+        let local = head as usize;
+        self.remove_from_ready(local);
+        Some(local)
     }
 
+    /// Einen freien TCB-Slot belegen (O(1) über die Freiliste) und ihm eine **globale
+    /// `gid`** aus dem Thread-Directory geben.
     fn alloc_tcb(&mut self, sp: usize, priority: u8) -> Option<usize> {
-        let i = self.tcbs.iter().position(|t| !t.used)?;
-        let gen = self.tcbs[i].gen;
+        let i = self.free.alloc()?;
+        // gid + Generation aus dem Directory (Leaf-Lock, s. `GID_FREE`).
+        let gid = match GID_FREE.lock().alloc() {
+            Some(g) => g,
+            None => {
+                self.free.free(i); // TCB-Slot zurückgeben, sonst leckt er
+                return None;
+            }
+        };
+        let gen = match dir_load(gid) {
+            Some(e) => ((e >> D_GEN_SHIFT) & D_GEN_MASK) as u32,
+            None => {
+                self.free.free(i);
+                GID_FREE.lock().free(gid);
+                return None;
+            }
+        };
         self.tcbs[i] = Tcb {
             used: true,
+            gid: gid as u32,
             gen,
             sp,
             priority,
-            blocked: false,
-            stack_base: 0,
-            stack_len: 0,
             // MCS-Felder: standardmäßig unbeschränkt (budget = 0 -> Round-Robin).
             ..Tcb::EMPTY
         };
+        self.used += 1;
+        CORE_LOAD[self.core].store(self.used, Ordering::Relaxed);
+        self.publish_dir(i);
         Some(i)
     }
 
     /// Globale `ThreadId` aus einem lokalen Slot-Index dieses Kerns.
     fn id(&self, local: usize) -> ThreadId {
         ThreadId {
-            slot: self.core * PER_CORE + local,
+            slot: self.tcbs[local].gid as usize,
             gen: self.tcbs[local].gen,
         }
     }
@@ -716,22 +1129,22 @@ impl Scheduler {
 
 /// Scheduler-Operationen, wie sie der IPC-/Dispatch-Pfad braucht — abstrahiert von
 /// der konkreten Instanz, damit der Kernel **kern-übergreifend** auflösen kann
-/// (z. B. einen IPC-Partner auf einem anderen Kern wecken). Bei einer Einkern-Sicht
-/// genügt eine `Scheduler`-Instanz; der Kernel stellt eine Facade über alle
-/// per-Kern-Instanzen bereit, die je Operation **genau eine** Instanz sperrt
+/// (z. B. einen IPC-Partner auf einem anderen Kern wecken). Der Kernel stellt eine Facade
+/// über alle per-Kern-Instanzen bereit, die je Operation **genau eine** Instanz sperrt
 /// (nie zwei gleichzeitig) und beim kern-übergreifenden Wecken einen Reschedule-IPI
 /// schickt.
 ///
 /// `current_id`/`block_current`/`switch_to`/`exit_current`/`on_tick`/`kill` beziehen
 /// sich auf den **aktuellen** Kern (`core`); `frame_of`/`unblock` dürfen einen
-/// Thread auf **irgendeinem** Kern betreffen (kern-übergreifender IPC-Partner).
+/// Thread auf **irgendeinem** Kern betreffen (kern-übergreifender IPC-Partner) — der
+/// Kernel schlägt den Besitzer im Directory nach und prüft nach dem Sperren erneut.
 pub trait SchedOps {
     fn current_id(&mut self, core: usize) -> ThreadId;
     fn frame_of(&mut self, tid: ThreadId) -> Option<usize>;
     fn block_current(&mut self, core: usize, frame: usize) -> usize;
     fn switch_to(&mut self, core: usize, frame: usize, target: ThreadId) -> usize;
     fn unblock(&mut self, tid: ThreadId);
-    /// Einen bestimmten Thread externen pausieren (blockieren; mit `unblock` reversibel).
+    /// Einen bestimmten Thread extern pausieren (blockieren; mit `unblock` reversibel).
     fn pause(&mut self, tid: ThreadId);
     /// Einen bestimmten (nicht laufenden) Thread auf irgendeinem Kern beenden + abbauen
     /// (`SYS_PDCTL` STOP). Gibt `false`, falls er gerade läuft (erst pausieren).

@@ -24,11 +24,34 @@ use sel4lake_region::heap::RegionSource;
 use sel4lake_region::{Purpose, Region, RegionTag};
 use sel4lake_loader::elf::{ElfImage, PF_W, PF_X};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use sel4lake_sched::{SchedOps, Scheduler, ThreadId, MAX_THREADS};
+use sel4lake_sched::{SchedOps, Scheduler, ThreadId, MAX_CORES};
+use sel4lake_slab::{AtomicTable, Slab};
 use sel4lake_sync::{RwSpinLock, SpinLock};
 
-/// Anzahl Kerne (für die per-Kern FP-Owner-Tabelle). Muss ≥ der realen Kernzahl sein.
-const NUM_CORES: usize = 8;
+/// **Tatsächliche** Kernzahl (beim Boot gesetzt, s. [`configure`]). Alle per-Kern-Schleifen
+/// laufen hierüber; die Compile-Zeit-Konstante [`MAX_CORES`] dimensioniert nur die Arrays
+/// von *Locks*/Atomics, nicht die Datentabellen.
+static NUM_CORES: AtomicUsize = AtomicUsize::new(1);
+
+/// Stack-Größe eines Kernel-Threads (für Ressourcen-Buchhaltung in Tests).
+pub fn stack_bytes() -> u64 {
+    STACK_SIZE
+}
+
+/// Noch freie **Thread-Slots** im globalen Thread-Directory (Kapazitäts-Telemetrie).
+pub fn threads_available() -> usize {
+    sel4lake_sched::threads_available()
+}
+
+/// Gesamtzahl der Thread-Slots (Boot-Kapazität).
+pub fn thread_capacity() -> usize {
+    sel4lake_sched::thread_capacity()
+}
+
+/// Anzahl aktiver Kerne (Laufzeitwert).
+pub fn num_cores() -> usize {
+    NUM_CORES.load(Ordering::Relaxed)
+}
 
 const STACK_SIZE: u64 = 64 * 1024;
 /// Standardpriorität für Idle und gewöhnliche Demo-Threads (Round-Robin).
@@ -51,14 +74,15 @@ const KSTACK_NONE: u16 = u16::MAX;
 struct KstackPool {
     /// `free[i]` = Slot `i` verfügbar.
     free: [bool; USER_KSTACK_COUNT],
-    /// Pool-Slot je globalem Thread-Slot (`KSTACK_NONE` = keiner).
-    slot_of: [u16; MAX_THREADS],
+    /// Pool-Slot je globalem Thread-Slot (`KSTACK_NONE` = keiner). Zur Boot-Zeit
+    /// dimensioniert (Thread-Kapazität), s. [`configure`].
+    slot_of: Slab<u16>,
 }
 /// Pool-Lock. Wird stets **allein** gehalten (nie verschachtelt mit anderen Locks)
 /// -> keine Sperrordnungs-Beschränkung.
 static KSTACKS: SpinLock<KstackPool> = SpinLock::new(KstackPool {
     free: [true; USER_KSTACK_COUNT],
-    slot_of: [KSTACK_NONE; MAX_THREADS],
+    slot_of: Slab::empty(),
 });
 
 /// Einen freien Kernel-Stack-Pool-Slot reservieren (Free-List). `None` = Pool voll.
@@ -110,12 +134,11 @@ const FP_OWNER_NONE: u64 = u64::MAX;
 /// Raw-`ThreadId` des FP-Owners je Kern (nur der jeweilige Kern schreibt seinen
 /// Eintrag -> Atomics genügen, keine Sperre nötig).
 #[allow(clippy::declare_interior_mutable_const)]
-static FP_OWNER: [AtomicU64; NUM_CORES] = [const { AtomicU64::new(FP_OWNER_NONE) }; NUM_CORES];
+static FP_OWNER: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(FP_OWNER_NONE) }; MAX_CORES];
 /// Per-Thread-Slot FP-Kontextpuffer. Zugriff ausschließlich unter dem SCHED-Lock
 /// (fp_trap hält SCHED; spawn ebenfalls) -> für gleiche Slots serialisiert,
 /// verschiedene Slots sind disjunkt. Lock-Ordnung: …->SCHED->FP_STATES (innerste).
-static FP_STATES: SpinLock<[FpState; MAX_THREADS]> =
-    SpinLock::new([const { FpState::new() }; MAX_THREADS]);
+static FP_STATES: SpinLock<Slab<FpState>> = SpinLock::new(Slab::empty());
 /// Zähler abgeschlossener Lazy-FP-Owner-Wechsel (Save+Restore), für den Test.
 static FP_SWITCHES: AtomicUsize = AtomicUsize::new(0);
 /// Summe der per `reap` an den Allokator zurückgegebenen Stack-Bytes (monoton).
@@ -130,19 +153,30 @@ static REAPED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Gepackter `TTBR0`-Wert (asid<<48 | root) je globalem Thread-Slot; `0` = globale
 /// SAS-Map. Beim Spawn einer isolierten PD gesetzt.
 #[allow(clippy::declare_interior_mutable_const)]
-static VSPACE_OF: [AtomicU64; MAX_THREADS] = [const { AtomicU64::new(0) }; MAX_THREADS];
+static VSPACE_OF: AtomicTable<AtomicU64> = AtomicTable::empty();
+
+/// Gepacktes TTBR0 eines Thread-Slots lesen (0 = globale SAS-Map).
+fn vspace_of(slot: usize) -> u64 {
+    VSPACE_OF.get(slot).map(|v| v.load(Ordering::Relaxed)).unwrap_or(0)
+}
+/// Gepacktes TTBR0 eines Thread-Slots setzen.
+fn set_vspace_of(slot: usize, packed: u64) {
+    if let Some(v) = VSPACE_OF.get(slot) {
+        v.store(packed, Ordering::Relaxed);
+    }
+}
 /// Aktuell aktive VSpace (gepacktes TTBR0) je Kern; `0` = noch unbekannt. Vermeidet
 /// einen TTBR0-Write, wenn die VSpace gleich bleibt (der häufige All-Trusted-Fall).
 #[allow(clippy::declare_interior_mutable_const)]
-static CURRENT_VSPACE: [AtomicU64; NUM_CORES] = [const { AtomicU64::new(0) }; NUM_CORES];
+static CURRENT_VSPACE: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
 
 /// **Per-Kern** Scheduler-Instanzen, jede hinter eigenem Lock. Der heiße
 /// Timer-/IPI-Reschedule-Pfad sperrt nur `SCHEDS[core]` des eigenen Kerns -> echte
 /// parallele Einplanung ohne globalen Lock. Kern-übergreifend (z. B. `wake_remote`)
 /// sperrt der Kernel die **Ziel**instanz und schickt einen Reschedule-IPI.
 #[allow(clippy::declare_interior_mutable_const)]
-static SCHEDS: [SpinLock<Scheduler>; NUM_CORES] =
-    [const { SpinLock::new(Scheduler::new()) }; NUM_CORES];
+static SCHEDS: [SpinLock<Scheduler>; MAX_CORES] =
+    [const { SpinLock::new(Scheduler::new()) }; MAX_CORES];
 
 // --- Feinkörnige Ressourcen-Locks (ersetzen den einen RES-Lock) ---
 //
@@ -176,10 +210,21 @@ fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
     drain_pending_irqs();
     // Heißer Pfad: nur der Scheduler-Lock DIESES Kerns (parallel zu anderen Kernen).
     // Echter Zeitscheiben-Tick -> MCS-Budget des laufenden Threads belasten.
-    let mut sched = SCHEDS[core].lock();
-    let next = sched.on_tick(core, frame as usize, true);
-    sync_fp_trap(core, &sched);
-    sync_vspace(core, &sched);
+    let next = {
+        let mut sched = SCHEDS[core].lock();
+        let next = sched.on_tick(core, frame as usize, true);
+        sync_fp_trap(core, &sched);
+        sync_vspace(core, &sched);
+        next
+    }; // SCHEDS freigegeben — der Lastausgleich sperrt selbst (zwei Kerne).
+    // Periodischer Lastausgleich (ext-30). Sicher an dieser Stelle: `balance_once` verschiebt
+    // nie den **laufenden** Thread, der gerade gewählte `next`-Frame bleibt also gültig.
+    if BALANCING.load(Ordering::Relaxed) {
+        let n = BALANCE_TICK[core].fetch_add(1, Ordering::Relaxed) + 1;
+        if n % BALANCE_INTERVAL_TICKS == 0 {
+            balance_once();
+        }
+    }
     next as *mut TrapFrame
 }
 
@@ -228,12 +273,66 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
 /// schickt sie zusätzlich einen Reschedule-IPI an den Zielkern.
 struct KernelSched;
 
+/// Wie oft ein kernübergreifender Zugriff wiederholt wird, wenn der Thread genau zwischen
+/// „Besitzer nachschlagen" und „Kern sperren" **migriert** ist. Migration ist selten und
+/// endlich (der Balancer verschiebt einen Thread je Tick), zwei Wiederholungen sind schon
+/// großzügig; die Schranke verhindert, dass ein pathologischer Fall hier festhängt.
+const MIGRATION_RETRIES: usize = 4;
+
+/// **Migrationssicherer Zugriff auf den besitzenden Kern eines Threads.**
+///
+/// Seit ext-30 ist der Kern eines Threads nicht mehr aus seiner `ThreadId` ableitbar,
+/// sondern steht im Thread-Directory. Zwischen dem (lock-freien) Nachschlagen und dem
+/// Sperren kann der Thread migrieren — dann gehört er dem gesperrten Kern nicht mehr und
+/// `f` schlägt fehl. Hier wird genau dieser Fall erkannt (Besitzer hat gewechselt) und mit
+/// dem **neuen** Besitzer wiederholt. Ein Fehlschlag ohne Besitzerwechsel ist ein echter
+/// Fehlschlag (Thread tot / Operation unzulässig) und wird durchgereicht.
+///
+/// Gibt `(Ergebnis, Kern)` zurück — der Kern wird für den Reschedule-IPI gebraucht, der
+/// **nach** dem Freigeben des Locks geschickt wird.
+fn with_owner<R>(
+    tid: ThreadId,
+    mut f: impl FnMut(&mut Scheduler, usize) -> Option<R>,
+) -> Option<(R, usize)> {
+    for _ in 0..MIGRATION_RETRIES {
+        let c = sel4lake_sched::owner_core(tid)?;
+        if c >= num_cores() {
+            return None;
+        }
+        let attempt = {
+            let mut sched = SCHEDS[c].lock();
+            f(&mut sched, c)
+        }; // Lock hier freigegeben
+        if let Some(r) = attempt {
+            return Some((r, c));
+        }
+        // Fehlgeschlagen: nur wiederholen, wenn der Thread inzwischen woanders lebt.
+        match sel4lake_sched::owner_core(tid) {
+            Some(c2) if c2 != c => continue,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Besitzender Kern eines Threads (lock-frei; kann beim Sperren bereits veraltet sein).
+pub fn owner_core_of(tid: ThreadId) -> Option<usize> {
+    sel4lake_sched::owner_core(tid)
+}
+
+/// Einen Reschedule-IPI an `core` schicken, falls es nicht der eigene ist.
+fn kick(core: usize) {
+    if core != hal::cpu::core_id() {
+        hal::gic::send_sgi(core, hal::gic::IPI_RESCHED_INTID);
+    }
+}
+
 impl SchedOps for KernelSched {
     fn current_id(&mut self, core: usize) -> ThreadId {
         SCHEDS[core].lock().current_id(core)
     }
     fn frame_of(&mut self, tid: ThreadId) -> Option<usize> {
-        SCHEDS[tid.core()].lock().frame_of(tid)
+        with_owner(tid, |s, _| s.frame_of(tid)).map(|(f, _)| f)
     }
     fn block_current(&mut self, core: usize, frame: usize) -> usize {
         SCHEDS[core].lock().block_current(core, frame)
@@ -242,28 +341,24 @@ impl SchedOps for KernelSched {
         SCHEDS[core].lock().switch_to(core, frame, target)
     }
     fn unblock(&mut self, tid: ThreadId) {
-        let target = tid.core();
-        SCHEDS[target].lock().unblock(tid);
-        if target != hal::cpu::core_id() {
-            hal::gic::send_sgi(target, hal::gic::IPI_RESCHED_INTID);
+        if let Some((_, c)) = with_owner(tid, |s, _| s.unblock(tid).then_some(())) {
+            kick(c);
         }
     }
     fn pause(&mut self, tid: ThreadId) {
-        let target = tid.core();
-        SCHEDS[target].lock().pause(tid);
         // Läuft das Ziel gerade auf einem anderen Kern, per Reschedule-IPI deplanen.
-        if target != hal::cpu::core_id() {
-            hal::gic::send_sgi(target, hal::gic::IPI_RESCHED_INTID);
+        if let Some((_, c)) = with_owner(tid, |s, _| s.pause(tid).then_some(())) {
+            kick(c);
         }
     }
     fn stop(&mut self, tid: ThreadId) -> bool {
         // STOP = vollständiger Teardown: cross-core kill + (falls isoliert) VSpace/ASID
         // freigeben, damit ein gestopptes Backend/UserLand keine Ressourcen leakt.
-        let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
+        let asid = (vspace_of(tid.slot()) >> 48) as u16;
         let ok = kill_remote(tid);
         if ok && asid != 0 {
             vspace_teardown(asid);
-            VSPACE_OF[tid.slot()].store(0, Ordering::Relaxed);
+            set_vspace_of(tid.slot(), 0);
         }
         ok
     }
@@ -294,7 +389,7 @@ impl SchedOps for KernelSched {
     fn map_frame(&mut self, caller: ThreadId, base: u64, len: u64, perm_code: u8) -> bool {
         // Nur isolierte PDs (ASID != 0). Granularität nach Frame-Größe (2-MiB-Block
         // oder 4-KiB-Seiten), Recht nach `perm_code` (0=Ro, 1=Rw, 2=Rx).
-        let asid = (VSPACE_OF[caller.slot()].load(Ordering::Relaxed) >> 48) as u16;
+        let asid = (vspace_of(caller.slot()) >> 48) as u16;
         if asid == 0 || len == 0 || len % 4096 != 0 {
             return false;
         }
@@ -306,7 +401,7 @@ impl SchedOps for KernelSched {
         vspace_map(asid, base, len, perm)
     }
     fn unmap_frame(&mut self, caller: ThreadId, base: u64, len: u64) -> bool {
-        let asid = (VSPACE_OF[caller.slot()].load(Ordering::Relaxed) >> 48) as u16;
+        let asid = (vspace_of(caller.slot()) >> 48) as u16;
         if asid == 0 || len == 0 || len % 4096 != 0 {
             return false;
         }
@@ -330,7 +425,7 @@ fn sync_fp_trap(core: usize, sched: &Scheduler) {
 /// Ende jedes Hooks aufzurufen, der den laufenden Thread gewechselt haben kann.
 fn sync_vspace(core: usize, sched: &Scheduler) {
     let slot = sched.current_id(core).slot();
-    let v = VSPACE_OF[slot].load(Ordering::Relaxed);
+    let v = vspace_of(slot);
     let want = if v == 0 { hal::mmu::global_root() } else { v };
     if CURRENT_VSPACE[core].load(Ordering::Relaxed) != want {
         let root = want & ((1u64 << 48) - 1);
@@ -384,7 +479,7 @@ fn fp_reset_slot(slot: usize) {
             owner.store(FP_OWNER_NONE, Ordering::Relaxed);
         }
     }
-    VSPACE_OF[slot].store(0, Ordering::Relaxed); // Default: globale SAS-Map
+    set_vspace_of(slot, 0); // Default: globale SAS-Map
 }
 
 /// Anzahl abgeschlossener Lazy-FP-Owner-Wechsel (Save eines alten Owners).
@@ -405,7 +500,7 @@ fn el0_fault(frame: *mut TrapFrame, esr: u64, far: u64) -> *mut TrapFrame {
     let (next, tid) = {
         let mut sched = SCHEDS[core].lock();
         let tid = sched.current_id(core);
-        if VSPACE_OF[tid.slot()].load(Ordering::Relaxed) != 0 {
+        if vspace_of(tid.slot()) != 0 {
             // Der fehlerhafte Thread lief in einer isolierten VSpace -> die
             // Adressraumtrennung hat einen Fremd-/unmapped-Zugriff verhindert.
             ISO_FAULTS.fetch_add(1, Ordering::Release);
@@ -424,10 +519,10 @@ fn el0_fault(frame: *mut TrapFrame, esr: u64, far: u64) -> *mut TrapFrame {
     reclaim_user_kstack(tid.slot()); // EL0-Kernel-Stack-Pool-Slot zurückgeben (KSTACKS allein)
     // War es eine isolierte PD, ihre VSpace abbauen. Sicher: `sync_vspace` oben hat
     // TTBR0 bereits auf den nächsten Thread umgeschaltet (nicht mehr die tote VSpace).
-    let packed = VSPACE_OF[tid.slot()].load(Ordering::Relaxed);
+    let packed = vspace_of(tid.slot());
     if packed != 0 {
         vspace_teardown((packed >> 48) as u16);
-        VSPACE_OF[tid.slot()].store(0, Ordering::Relaxed);
+        set_vspace_of(tid.slot(), 0);
     }
     next as *mut TrapFrame
 }
@@ -462,14 +557,91 @@ pub fn init_mem(free_base: u64, ram_end: u64) {
     MEM.lock().add_region(free_base, ram_end - free_base);
 }
 
-/// **Alle** per-Kern-Scheduler-Instanzen an ihre Kern-ID binden. Vom Bootkern
-/// **einmalig vor** dem Erzeugen irgendwelcher Threads aufzurufen — damit der
-/// Bootkern Threads auf noch nicht gestartete Kerne einplanen kann
-/// ([`spawn_on_core`]), bevor deren `init_core` (Idle-Anlage) dort läuft.
-pub fn bind_cores() {
-    for (c, s) in SCHEDS.iter().enumerate() {
-        s.lock().bind_core(c);
+/// **Thread-Slots je Kern**, die der Kernel im Mittel vorsieht. Die Gesamtkapazität ist
+/// `cores * THREADS_PER_CORE`; jeder Kern kann durch Migration bis zum
+/// [`MIGRATION_HEADROOM`]-fachen davon *hosten*.
+const THREADS_PER_CORE: usize = 256;
+/// Faktor, um den die **Hosting**-Kapazität eines Kerns über seinem Anteil liegt. Ohne
+/// Reserve könnte kein Kern einen migrierten Thread aufnehmen, sobald alle Kerne ihren
+/// Anteil ausgeschöpft haben.
+const MIGRATION_HEADROOM: usize = 2;
+
+/// **Kernel-Tabellen zur Boot-Zeit dimensionieren + anlegen** (ext-30).
+///
+/// Ersetzt die früheren `.bss`-Arrays mit Compile-Zeit-Konstanten (`[Tcb; PER_CORE]`,
+/// `[FpState; MAX_THREADS]`, …). `cores` ist die **gemessene** Kernzahl (aus dem Device
+/// Tree); daraus folgen Thread-Kapazität und Tabellengrößen. Danach sind alle
+/// per-Kern-Scheduler an ihre Kern-ID gebunden — vom Bootkern **einmalig vor** dem
+/// Erzeugen irgendwelcher Threads und **vor** dem Start der Sekundärkerne aufzurufen
+/// (der Bootkern plant Threads auf noch nicht gestartete Kerne ein).
+///
+/// Gibt `(cores, threads_total, per_core_hosting, bytes)` zurück (Boot-Report).
+pub fn configure(cores: usize) -> (usize, usize, usize, u64) {
+    let cores = cores.clamp(1, MAX_CORES);
+    NUM_CORES.store(cores, Ordering::Relaxed);
+    let total = cores * THREADS_PER_CORE;
+    let per_core = THREADS_PER_CORE * MIGRATION_HEADROOM;
+    let mut bytes = 0u64;
+
+    // Eine Tabelle belegen. Der Speicher gehört ab hier **dauerhaft** dem Kernel: die
+    // MemoryCap wird bewusst fallen gelassen (kein `Drop` -> die Region kehrt nie in den
+    // Allokator zurück). Kerneltabellen leben bis zum Reboot.
+    let mut table = |size: usize, align: usize| -> *mut u8 {
+        let cap = mem_alloc(size as u64, align as u64).expect("Kerneltabelle: RAM erschoepft");
+        bytes += cap.len();
+        cap.base() as *mut u8
+    };
+
+    // Thread-Directory (gid -> Kern/Slot) + gid-Freiliste.
+    let dir = table(
+        sel4lake_sched::directory_bytes(total),
+        sel4lake_sched::directory_align().max(4096),
+    );
+    // SAFETY: frisch allozierter, exklusiver, korrekt ausgerichteter Speicher der
+    // geforderten Größe, der bis zum Reboot lebt; einmaliger Aufruf beim Boot, bevor ein
+    // anderer Kern läuft.
+    unsafe { sel4lake_sched::attach_directory(dir, total) };
+
+    // Per-Kern-Tabellen (TCBs + Zombie-Ring + Freiliste).
+    let core_bytes = sel4lake_sched::core_storage_bytes(per_core);
+    for c in 0..cores {
+        let mem = table(core_bytes, sel4lake_sched::core_storage_align().max(4096));
+        // SAFETY: wie oben; jede Instanz bekommt ihren **eigenen** Block (exklusiv).
+        unsafe { SCHEDS[c].lock().attach_storage(c, mem, per_core) };
     }
+
+    // Per-Thread-Tabellen des Kernels (über den globalen, migrationsstabilen Slot indiziert).
+    let fp = table(
+        total * core::mem::size_of::<FpState>(),
+        core::mem::align_of::<FpState>().max(4096),
+    );
+    // SAFETY: wie oben (exklusiv, ausgerichtet, dauerhaft, einmalig).
+    unsafe {
+        FP_STATES
+            .lock()
+            .attach(fp as *mut FpState, total, |_| FpState::new())
+    };
+    let vs = table(
+        total * core::mem::size_of::<AtomicU64>(),
+        core::mem::align_of::<AtomicU64>().max(4096),
+    );
+    // SAFETY: wie oben; `VSPACE_OF` wird erst nach diesem Anhängen gelesen.
+    unsafe {
+        VSPACE_OF.attach(vs as *mut AtomicU64, total, |_| AtomicU64::new(0));
+    }
+    let ks = table(
+        total * core::mem::size_of::<u16>(),
+        core::mem::align_of::<u16>().max(4096),
+    );
+    // SAFETY: wie oben.
+    unsafe {
+        KSTACKS
+            .lock()
+            .slot_of
+            .attach(ks as *mut u16, total, |_| KSTACK_NONE)
+    };
+
+    (cores, total, per_core, bytes)
 }
 
 /// Boot-Kontext des aufrufenden Kerns als Idle-Thread registrieren (vor IRQs).
@@ -711,10 +883,13 @@ pub fn spawn(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
 /// Den Kern mit der **geringsten Last** wählen (Anzahl belegter TCB-Slots). Sperrt
 /// jede Scheduler-Instanz einzeln/kurz (nie zwei gleichzeitig).
 pub fn least_loaded_core() -> usize {
+    // **Lock-frei** (ext-30): die Last jedes Kerns steht in einem Atomic, das der jeweilige
+    // Scheduler pflegt. Vorher sperrte diese Funktion JEDEN Kern-Scheduler nacheinander —
+    // bei 256 Kernen 256 Lock-Zyklen je Spawn, und dabei stand die Einplanung aller Kerne.
     let mut best = 0usize;
     let mut best_load = usize::MAX;
-    for (c, s) in SCHEDS.iter().enumerate() {
-        let load = s.lock().load();
+    for c in 0..num_cores() {
+        let load = sel4lake_sched::core_load(c);
         if load < best_load {
             best_load = load;
             best = c;
@@ -723,9 +898,115 @@ pub fn least_loaded_core() -> usize {
     best
 }
 
+// --- Thread-Migration (ext-30) -----------------------------------------------------------
+
+/// Zähler erfolgreicher Migrationen (Telemetrie/Tests).
+static MIGRATIONS: AtomicUsize = AtomicUsize::new(0);
+/// Ist der **automatische** periodische Lastausgleich aktiv? Default **aus**: die
+/// Migrationsmechanik ist vollständig und getestet, aber die Demo-/Testthreads dieses
+/// Images setzen teils feste Kern-Affinität voraus (Cross-Core-IPC-Test, Budget-Donation,
+/// Platzierungs-Telemetrie). Der Schalter trennt „Mechanismus fertig" von „Policy
+/// standardmäßig an" — s. `todo.md` B4.
+static BALANCING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Tick-Zähler je Kern für das Ausgleichs-Intervall.
+static BALANCE_TICK: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
+/// Nur jeder n-te Tick prüft die Balance (Migration kostet Cache-Lokalität).
+const BALANCE_INTERVAL_TICKS: u64 = 16;
+
+/// Automatischen Lastausgleich ein-/ausschalten.
+pub fn set_balancing(on: bool) {
+    BALANCING.store(on, Ordering::Relaxed);
+}
+
+/// Anzahl bisher durchgeführter Thread-Migrationen.
+pub fn migration_count() -> usize {
+    MIGRATIONS.load(Ordering::Relaxed)
+}
+
+/// **Einen Thread des AKTUELLEN Kerns auf `dst` verschieben.**
+///
+/// Die Migration wird immer vom **abgebenden** Kern ausgeführt (Push, nicht Pull). Das ist
+/// keine Bequemlichkeit, sondern notwendig: der Lazy-FP-Kontext eines Threads liegt
+/// physisch in den FP-Registern **seines** Kerns. Nur dieser Kern kann ihn sichern — ein
+/// fremder Kern könnte fremde FP-Register gar nicht lesen. Deshalb: FP hier lokal
+/// ausspülen, dann übergeben.
+///
+/// Sperrordnung: beide Scheduler-Locks werden in **aufsteigender Kern-Reihenfolge**
+/// genommen (zwei gleichzeitig migrierende Kerne können sich so nicht verklemmen).
+///
+/// Gibt `false` zurück, wenn der Thread nicht migrierbar ist (läuft gerade, aktive
+/// Budget-Donation, fremder Kern) oder der Zielkern keine Kapazität hat.
+pub fn migrate_to(tid: ThreadId, dst: usize) -> bool {
+    let src = hal::cpu::core_id();
+    if dst == src || dst >= num_cores() {
+        return false;
+    }
+    if sel4lake_sched::owner_core(tid) != Some(src) {
+        return false; // nur der besitzende Kern schiebt (s. o.)
+    }
+    // Lazy-FP: gehören die FP-Register dieses Kerns dem Migranten, MÜSSEN sie jetzt in
+    // seinen (gid-indizierten, migrationsstabilen) Kontextpuffer gesichert werden —
+    // andernfalls liefe er auf dem Zielkern mit fremdem FP-Zustand weiter.
+    if FP_OWNER[src].load(Ordering::Relaxed) == tid.to_raw() {
+        hal::fp::save(&mut FP_STATES.lock()[tid.slot()]);
+        FP_OWNER[src].store(FP_OWNER_NONE, Ordering::Relaxed);
+        // Der laufende Thread ist ab jetzt nicht mehr FP-Owner -> wieder trappen lassen.
+        hal::fp::set_el0_trap(true);
+    }
+    let (lo, hi) = if src < dst { (src, dst) } else { (dst, src) };
+    let ok = {
+        let mut a = SCHEDS[lo].lock();
+        let mut b = SCHEDS[hi].lock();
+        let (source, target) = if src == lo {
+            (&mut *a, &mut *b)
+        } else {
+            (&mut *b, &mut *a)
+        };
+        match source.detach_for_migration(tid) {
+            None => false,
+            Some(m) => match target.attach_migrated(m) {
+                Ok(()) => true,
+                // Zielkern voll -> zurück zum Quellkern (kein Thread geht verloren).
+                Err(m) => {
+                    let _ = source.attach_migrated(m);
+                    false
+                }
+            },
+        }
+    }; // beide Locks freigegeben
+    if ok {
+        MIGRATIONS.fetch_add(1, Ordering::Relaxed);
+        kick(dst); // Zielkern soll den Zugang zeitnah einplanen
+    }
+    ok
+}
+
+/// **Periodischer Lastausgleich** (ext-30): der aufrufende Kern gibt einen bereiten Thread
+/// an einen deutlich weniger belasteten Kern ab.
+///
+/// Aus dem Tick-Pfad aufzurufen, aber bewusst **nicht bei jedem Tick** (der Aufrufer
+/// entscheidet über das Intervall): Migration kostet Cache-Lokalität, deshalb erst ab einer
+/// spürbaren Differenz (`IMBALANCE_THRESHOLD`) und höchstens ein Thread je Aufruf — das
+/// dämpft Oszillation (zwei Kerne, die sich Threads gegenseitig zuschieben).
+const IMBALANCE_THRESHOLD: usize = 2;
+
+pub fn balance_once() -> bool {
+    let src = hal::cpu::core_id();
+    let my_load = sel4lake_sched::core_load(src);
+    let dst = least_loaded_core();
+    if dst == src || my_load < sel4lake_sched::core_load(dst) + IMBALANCE_THRESHOLD {
+        return false;
+    }
+    let Some(cand) = SCHEDS[src].lock().migration_candidate() else {
+        return false;
+    };
+    migrate_to(cand, dst)
+}
+
 /// **Lastbewusst** einen Thread erzeugen: auf dem aktuell am wenigsten ausgelasteten
-/// Kern. Best-effort (die Last kann sich zwischen Auswahl und spawn ändern). Threads
-/// bleiben danach kern-gebunden — es gibt keine Laufzeit-Migration (s. ext-10).
+/// Kern. Best-effort (die Last kann sich zwischen Auswahl und spawn ändern). Seit ext-30
+/// ist die Platzierung nicht mehr endgültig — [`balance_once`] verschiebt Threads zur
+/// Laufzeit nach.
 pub fn spawn_balanced(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
     spawn_on_core(least_loaded_core(), entry, arg, prio)
 }
@@ -986,7 +1267,7 @@ fn vspace_unmap(asid: u16, base: u64, len: u64) -> bool {
 /// VSpace des Threads `tid` mappen (für Demos, die vorab feingranulare Seiten — z. B.
 /// RW/RO/Guard — anlegen wollen). No-Op für nicht-isolierte Threads.
 pub fn map_into_thread(tid: ThreadId, base: u64, len: u64, perm_code: u8) -> bool {
-    let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
+    let asid = (vspace_of(tid.slot()) >> 48) as u16;
     if asid == 0 {
         return false;
     }
@@ -1004,7 +1285,7 @@ pub fn map_into_thread(tid: ThreadId, base: u64, len: u64, perm_code: u8) -> boo
 /// nicht-isolierte Threads.
 #[cfg_attr(not(feature = "kernel-fuzz"), allow(dead_code))] // nur vom Fuzzer benutzt (ADR 0013)
 pub fn unmap_into_thread(tid: ThreadId, base: u64, len: u64) -> bool {
-    let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
+    let asid = (vspace_of(tid.slot()) >> 48) as u16;
     if asid == 0 {
         return false;
     }
@@ -1092,7 +1373,7 @@ pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u
     match tid {
         Some(t) => {
             record_user_kstack(t.slot(), kidx); // Pool-Slot dem Thread zuordnen (reclaim!)
-            VSPACE_OF[t.slot()].store(packed, Ordering::Relaxed); // ab jetzt isoliert
+            set_vspace_of(t.slot(), packed); // ab jetzt isoliert
             Some((t, rbase))
         }
         None => {
@@ -1112,13 +1393,13 @@ pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u
 /// darf nicht der laufende Thread sein.
 pub fn destroy_isolated(tid: ThreadId) {
     let core = hal::cpu::core_id();
-    let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
+    let asid = (vspace_of(tid.slot()) >> 48) as u16;
     SCHEDS[core].lock().kill(tid, core); // ready -> Zombie (TCB-Slot frei, Stack vorgemerkt)
     purge_ipc_queues(tid); // eager: tote IPC-Queue-Einträge vermeiden
     reap(); // Stack-Zombie an MEM zurueck (korrekte Lock-Ordnung: SCHEDS frei, dann MEM)
     if asid != 0 {
         vspace_teardown(asid); // L1/L2/L3 + geladene Segmente an MEM, ASID-Slot frei, TLB-Flush
-        VSPACE_OF[tid.slot()].store(0, Ordering::Relaxed);
+        set_vspace_of(tid.slot(), 0);
     }
     reclaim_user_kstack(tid.slot());
 }
@@ -1246,7 +1527,7 @@ pub fn spawn_isolated_native(code: *const u8, code_len: usize, prio: u8) -> Opti
     match tid {
         Some(t) => {
             record_user_kstack(t.slot(), kidx); // Pool-Slot dem Thread zuordnen (reclaim!)
-            VSPACE_OF[t.slot()].store(packed, Ordering::Relaxed);
+            set_vspace_of(t.slot(), packed);
             // Der private Code-Frame ist KEINE Reap-Region (das ist der Stack) und haengt als
             // 2-MiB-Block (kein L3) am L2 -> vspace_teardown faende ihn nicht. Unter der ASID
             // registrieren, damit ein spaeteres destroy_isolated ihn via loaded_free freigibt
@@ -1473,7 +1754,7 @@ pub fn load_into_pd(img: &ElfImage, pd: usize, endow: &[(usize, CapPtr)]) -> Opt
         return cleanup(asid, kidx, &seglist[..nrec], Some((stack_pa, LOADED_STACK_BYTES)));
     };
     record_user_kstack(tid.slot(), kidx);
-    VSPACE_OF[tid.slot()].store(((asid as u64) << 48) | l1, Ordering::Relaxed); // ab jetzt isoliert
+    set_vspace_of(tid.slot(), ((asid as u64) << 48) | l1); // ab jetzt isoliert
     loaded_register(asid, &seglist[..nrec]); // Segment-Frames fuer den Teardown merken (L4)
     bind_pd(pd, tid);
     for &(slot, cap) in endow {
@@ -1521,10 +1802,8 @@ pub fn notification_pending(ntfn: usize) -> u64 {
 /// anderer Kern ist — einen Reschedule-IPI schicken, damit der Zielkern ihn
 /// zeitnah einplant. Das ist der Cross-Core-Aufweck-Primitive.
 pub fn wake_remote(tid: ThreadId) {
-    let target = tid.core();
-    SCHEDS[target].lock().unblock(tid);
-    if target != hal::cpu::core_id() {
-        hal::gic::send_sgi(target, hal::gic::IPI_RESCHED_INTID);
+    if let Some((_, c)) = with_owner(tid, |s, _| s.unblock(tid).then_some(())) {
+        kick(c);
     }
 }
 
@@ -1579,7 +1858,7 @@ pub enum MappingKind {
 /// also Hardware/UserLand; HW-Caps sind ohnehin nur in HardwareLand installierbar). Gibt `false`
 /// bei nicht-isolierter VSpace oder fehlgeschlagenem Mapping.
 pub fn map_region_into_thread(tid: ThreadId, phys: u64, len: u64, kind: MappingKind) -> bool {
-    let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
+    let asid = (vspace_of(tid.slot()) >> 48) as u16;
     let mut alloc = || mem_alloc(4096, 4096).map(|c| c.base());
     let ok = match kind {
         MappingKind::Device { ro } => match vspace_l1(asid) {
@@ -2142,7 +2421,7 @@ pub fn dma_complete(handle: DmaHandle, dir: DmaDir) {
 /// EL1-only) + ASID flushen. Teil der Revoke-Reihenfolge.
 #[allow(dead_code)] // bewusst behalten (HW-Register/API-Vollstaendigkeit bzw. nur unter cfg(kani)/Feature genutzt)
 pub fn unmap_dma_from_thread(tid: ThreadId, phys: u64, len: u64) -> bool {
-    let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
+    let asid = (vspace_of(tid.slot()) >> 48) as u16;
     let Some(l2) = vspace_l2(asid) else {
         return false;
     };
@@ -2658,7 +2937,7 @@ pub fn budget_stats(core: usize) -> (u64, u64) {
 /// ist kern-lokal: `tid` muss auf dem aufrufenden Kern liegen und darf nicht laufen.
 pub fn kill_local(tid: ThreadId) -> bool {
     let core = hal::cpu::core_id();
-    if tid.core() != core {
+    if sel4lake_sched::owner_core(tid) != Some(core) {
         return false;
     }
     let ok = SCHEDS[core].lock().kill(tid, core);
@@ -2682,7 +2961,9 @@ pub fn reap() -> usize {
 /// nie läuft -> sonst lecken die Stacks). Sperrordnung: erst `SCHEDS[core]` (Zombies in
 /// einen Puffer), freigeben, dann `MEM` — nie beide gleichzeitig.
 pub fn reap_core(core: usize) -> usize {
-    let mut zombies: [(usize, usize); 8] = [(0, 0); 8];
+    // (base, len, gid) je Zombie: Stack-Region an MEM, `gid` an die Thread-Freiliste —
+    // beides erst NACH dem Freigeben von SCHEDS (Sperrordnung).
+    let mut zombies: [(usize, usize, u32); 8] = [(0, 0, 0); 8];
     let mut n = 0;
     {
         let mut sched = SCHEDS[core].lock();
@@ -2697,13 +2978,21 @@ pub fn reap_core(core: usize) -> usize {
         }
     } // SCHEDS freigegeben
     if n > 0 {
-        let mut mem = MEM.lock();
-        let mut bytes = 0u64;
-        for &(base, len) in &zombies[..n] {
-            mem.free_region(PhysRegion::new(base as u64, len as u64));
-            bytes += len as u64;
+        {
+            let mut mem = MEM.lock();
+            let mut bytes = 0u64;
+            for &(base, len, _) in &zombies[..n] {
+                if len > 0 {
+                    mem.free_region(PhysRegion::new(base as u64, len as u64));
+                    bytes += len as u64;
+                }
+            }
+            REAPED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        } // MEM freigegeben
+        // Thread-Slots (`gid`) zurückgeben — erst jetzt kann eine `gid` neu vergeben werden.
+        for &(_, _, gid) in &zombies[..n] {
+            sel4lake_sched::release_gid(gid);
         }
-        REAPED_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
     n
 }
@@ -2714,16 +3003,14 @@ pub fn reap_core(core: usize) -> usize {
 /// versuchen, sobald er blockiert/verdrängt ist). Entfernt ihn eager aus allen
 /// IPC-Queues und weckt den Zielkern (IPI), damit er bald reapt.
 pub fn kill_remote(tid: ThreadId) -> bool {
-    let c = tid.core();
-    if c >= NUM_CORES {
-        return false;
-    }
-    let ok = SCHEDS[c].lock().kill(tid, c);
+    let ok = with_owner(tid, |s, c| s.kill(tid, c).then_some(())).is_some();
     if ok {
         purge_ipc_queues(tid);
         reclaim_user_kstack(tid.slot());
-        if c != hal::cpu::core_id() {
-            hal::gic::send_sgi(c, hal::gic::IPI_RESCHED_INTID);
+        // Der Zielkern soll bald reapen; er kann inzwischen ein anderer sein — der IPI geht
+        // an den Kern, auf dem der Kill tatsächlich stattfand.
+        if let Some(c) = sel4lake_sched::owner_core(tid) {
+            kick(c);
         }
     }
     ok
@@ -2871,27 +3158,41 @@ pub fn purge_ipc_queues(tid: ThreadId) {
     }
 }
 
+/// **Scheduler-Audit über alle Kerne** (ext-30): `0` = alle Kern-Scheduler strukturell
+/// konsistent, sonst `100*Kern + Code` des ersten Fehlers (s. `Scheduler::audit`). Prüft
+/// insbesondere, dass jeder Directory-Eintrag auf genau den Kern + Slot zeigt, auf dem der
+/// TCB tatsächlich liegt (Code 8) — die zentrale Migrations-Invariante.
+pub fn sched_audit_all() -> u32 {
+    for c in 0..num_cores() {
+        let code = SCHEDS[c].lock().audit();
+        if code != 0 {
+            return (c as u32) * 100 + code;
+        }
+    }
+    0
+}
+
 /// Einen blockierten Thread mit einem **Fehlercode** in `x0` (statt `OK`) entblocken —
 /// für die Reply-Liveness: ein `CALL`-Aufrufer, dessen Server (Reply-Owner) verschwand,
 /// wird so entblockt und sieht den Fehler, statt dauerhaft zu hängen. Sperrt kurz die
 /// Zielinstanz; bei fremdem Kern Reschedule-IPI.
 fn unblock_with_error(caller: ThreadId, code: u64) {
-    let c = caller.core();
-    {
-        let mut sched = SCHEDS[c].lock();
-        if let Some(frame) = sched.frame_of(caller) {
-            hal::exception::frame_set_reg(frame, sel4lake_abi::reg::SYSNO_RESULT, code);
-        }
+    let done = with_owner(caller, |sched, _| {
+        let frame = sched.frame_of(caller)?; // fremder Kern/tot -> ggf. wiederholen
+        hal::exception::frame_set_reg(frame, sel4lake_abi::reg::SYSNO_RESULT, code);
         sched.unblock(caller);
-    } // SCHEDS freigegeben
-    if c != hal::cpu::core_id() {
-        hal::gic::send_sgi(c, hal::gic::IPI_RESCHED_INTID);
+        Some(())
+    });
+    if let Some((_, c)) = done {
+        kick(c);
     }
 }
 
 /// Lebt `tid`? (Für IPC-Audits.) Sperrt die Zielinstanz kurz.
 pub fn thread_alive(tid: ThreadId) -> bool {
-    SCHEDS[tid.core()].lock().is_alive(tid)
+    // Lock-frei über das Thread-Directory (ext-30): kein Sperren eines fremden Kerns nötig,
+    // und immun dagegen, dass der Thread gerade migriert.
+    sel4lake_sched::is_live(tid)
 }
 
 /// **IPC-Konsistenz-Oracle** (Fuzzer): jedes belegte Endpoint/Notification + jeden
@@ -2901,7 +3202,7 @@ pub fn thread_alive(tid: ThreadId) -> bool {
 /// audit`). Sperrt je Objekt einzeln; die Liveness-Prüfung verschachtelt EPS/NTFNS ->
 /// SCHEDS (zulässige Ordnung), nie zwei Objekte gleichzeitig.
 pub fn ipc_audit() -> u32 {
-    let live = &mut |t: ThreadId| -> bool { SCHEDS[t.core()].lock().is_alive(t) };
+    let live = &mut |t: ThreadId| -> bool { sel4lake_sched::is_live(t) };
     for ep in EPS.iter() {
         let e = ep.lock();
         if e.is_used() {
@@ -2920,7 +3221,7 @@ pub fn ipc_audit() -> u32 {
             return 3;
         }
     }
-    for c in 0..NUM_CORES {
+    for c in 0..num_cores() {
         let code = SCHEDS[c].lock().audit();
         if code != 0 {
             return 10 + code;
@@ -2986,6 +3287,6 @@ pub fn domain_audit() -> u32 {
     // Threads: ein gestoppter/getöteter Thread (dessen VSPACE_OF auf 0 zurückgesetzt wurde,
     // dessen PD-Bindung aber noch auf den toten tid zeigt) ist KEINE Verletzung.
     let is_live_global =
-        |tid: ThreadId| thread_alive(tid) && VSPACE_OF[tid.slot()].load(Ordering::Acquire) == 0;
+        |tid: ThreadId| thread_alive(tid) && vspace_of(tid.slot()) == 0;
     CAPS.read().domain_audit(&is_live_global)
 }

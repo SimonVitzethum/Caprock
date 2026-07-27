@@ -64,6 +64,52 @@ impl<'a> Dtb<'a> {
         })
     }
 
+    /// **Anzahl der CPUs** aus den `cpu@…`-Knoten unterhalb von `/cpus` (ext-30).
+    ///
+    /// Die Kernzahl wird damit von der Plattform *gelesen* statt fest verdrahtet — Grundlage
+    /// für die zur Boot-Zeit dimensionierten Scheduler-Tabellen. Gezählt werden Knoten, deren
+    /// Name mit `cpu@` beginnt **und** die direkt unter `/cpus` liegen (Tiefe 2); `cpu-map`-
+    /// Untereinträge (Cluster-Topologie) heißen anders und werden nicht mitgezählt.
+    /// `None`, wenn der Baum unlesbar ist; `Some(0)`, wenn es keine `cpu@`-Knoten gibt.
+    pub fn cpu_count(&self) -> Option<usize> {
+        let mut pos = self.off_struct;
+        let mut depth = 0usize;
+        let mut in_cpus_at = usize::MAX; // Tiefe des `/cpus`-Knotens
+        let mut n = 0usize;
+        loop {
+            let tok = be32(self.data, pos)?;
+            pos += 4;
+            match tok {
+                FDT_BEGIN_NODE => {
+                    let name = cstr(self.data, pos);
+                    pos += align4(name.len() + 1);
+                    depth += 1;
+                    if depth == 2 && name == b"cpus" {
+                        in_cpus_at = depth;
+                    } else if in_cpus_at != usize::MAX
+                        && depth == in_cpus_at + 1
+                        && name.starts_with(b"cpu@")
+                    {
+                        n += 1;
+                    }
+                }
+                FDT_END_NODE => {
+                    if depth == in_cpus_at {
+                        in_cpus_at = usize::MAX; // `/cpus` verlassen
+                    }
+                    depth = depth.saturating_sub(1);
+                }
+                FDT_PROP => {
+                    let len = be32(self.data, pos)? as usize;
+                    pos = pos + 8 + align4(len);
+                }
+                FDT_NOP => {}
+                FDT_END => return Some(n),
+                _ => return None,
+            }
+        }
+    }
+
     /// Die erste RAM-Region aus dem `/memory`-Knoten: `(base, size)`.
     /// Annahme: `#address-cells = #size-cells = 2` (Standard für QEMU `virt`).
     pub fn memory(&self) -> Option<(u64, u64)> {

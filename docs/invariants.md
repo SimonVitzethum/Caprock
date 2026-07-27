@@ -21,6 +21,13 @@ der Azyklizität dieser totalen Ordnung.
 | R3 | `Heap.inner` | `SpinLock<HeapInner>` | prozess-lokaler Allokator (nur Region-Runtime) |
 | R4 | `MEM` | `SpinLock<PhysAllocator>` | physischer Allokator — **innerster** |
 
+**Ergänzung ext-30 (Migration):** eine Migration hält **zwei** `SCHEDS`-Locks gleichzeitig —
+den des abgebenden und den des aufnehmenden Kerns. Innerhalb desselben Rangs R2 gilt dafür die
+Ordnung **aufsteigende Kern-ID**: `SCHEDS[min(src,dst)]` vor `SCHEDS[max(src,dst)]`. Zwei
+gleichzeitig migrierende Kerne können sich damit nicht verklemmen. Neu ist außerdem `GID_FREE`
+(Freiliste der globalen Thread-Slots): ein **Leaf-Lock**, der unter `SCHEDS` genommen wird
+(Spawn) bzw. ganz ohne weiteren Lock (Reap) — nie umgekehrt, und nie zusammen mit `MEM`.
+
 **Regel:** beim Schachteln nur aufsteigend (R0 → … → R4); niemals einen Lock kleineren Rangs
 nehmen, während ein größerer gehalten wird. Faustregel der bestehenden Pfade: *nie zwei grobe Locks
 gleichzeitig halten, wenn ein Kopieren-und-Freigeben es vermeidet.*
@@ -268,3 +275,53 @@ gewordene Cap darin ist ein permanenter Verlust **für alle PDs**.
   Cache-Partitionierung/Coloring (Architekturänderung, kein Patch). Ebenso Spectre-v2 auf HW **ohne**
   FEAT_CSV2: die Gegenmaßnahme wäre Predictor-Invalidierung per Firmware-Call
   (SMCCC_ARCH_WORKAROUND_1), den QEMU `virt` nicht anbietet.
+
+
+## 11. Thread-Migration + Boot-Kapazitäten (ext-30)
+
+Details + Herleitung: `docs/phase-reports/ext-30-migration-und-kapazitaet.md`.
+
+### 11.1 Identität ist von der Platzierung getrennt
+
+- **Invariante.** Die `gid` einer [`ThreadId`] ist **lebenslang stabil** und unabhängig vom
+  besitzenden Kern. Alle per-Thread-Kerneltabellen (FP-Kontext, `VSPACE_OF`, Kernel-Stack-Slot)
+  sind über sie indiziert und überleben eine Migration unverändert; eine Tcb-Cap bezeichnet
+  nach der Migration denselben Thread.
+- **Invariante (Directory-Kohärenz).** Für jeden belegten TCB gilt: der Directory-Eintrag
+  seiner `gid` ist `used`, trägt dieselbe Generation und zeigt auf **genau** den Kern und den
+  lokalen Slot, an dem der TCB liegt. Maschinell geprüft: `Scheduler::audit()` Code **8**,
+  aggregiert über alle Kerne in `system::sched_audit_all()`.
+- **Invariante (stale Handles).** Beim Thread-Ende wird der Directory-Eintrag **sofort**
+  ungültig gemacht (`used = 0`, Generation +1); die `gid` kehrt erst beim **Reap** in die
+  Freiliste zurück. Zwischen beiden Zeitpunkten ist sie nicht neu vergebbar — ein altes Handle
+  kann also nie einen *anderen* Thread treffen.
+
+### 11.2 Wettlauf „Besitzer nachschlagen ↔ Migration"
+
+- **Invariante.** Jeder kernübergreifende Zugriff prüft nach dem Sperren **erneut**
+  (`resolve` vergleicht Generation *und* Kern). Ein Fehlschlag mit gewechseltem Besitzer wird
+  mit dem neuen Besitzer wiederholt (`system::with_owner`, begrenzt auf `MIGRATION_RETRIES`);
+  ein Fehlschlag ohne Besitzerwechsel ist ein echter Fehlschlag.
+- **Konsequenz:** aus einer `ThreadId` darf **nie** ein Kern abgeleitet werden (das ging bis
+  ext-29 arithmetisch). Einzige Quelle ist das Directory.
+
+### 11.3 Was nicht migriert werden darf
+
+- Der **laufende** Thread (Zustand im aktiven Trap-Frame), ein Thread mit aktiver
+  **Budget-Donation** (die Links sind lokale Slots → Donation ist intra-core), und der
+  **Idle**-Thread. Strukturell erzwungen in `Scheduler::detach_for_migration`.
+- **Push statt Pull:** die Migration läuft immer auf dem **abgebenden** Kern, weil nur er den
+  Lazy-FP-Kontext des Migranten aus seinen eigenen FP-Registern sichern kann.
+- **Kein Thread-Verlust:** scheitert die Aufnahme (Zielkern voll), wird der Migrant beim
+  Quellkern wieder eingehängt.
+
+### 11.4 Kapazität
+
+- **Invariante.** Kerntabellen werden **einmalig beim Boot** dimensioniert
+  (`system::configure`) und leben bis zum Reboot; es gibt keinen Pfad, der sie freigibt oder
+  ein zweites Mal anhängt. Zugriffe sind bounds-geprüft (`Slab`/`AtomicTable` panieren bei
+  Überschreitung wie ein Array — kein UB).
+- **Invariante.** Die Hosting-Kapazität eines Kerns liegt über seinem Anteil
+  (`MIGRATION_HEADROOM`), sonst könnte kein Kern einen Migranten aufnehmen.
+- **Test.** `scale` — 1024 Threads gleichzeitig, danach vollständige Rückgabe (Slots +
+  Stack-RAM), Scheduler-Audit 0.

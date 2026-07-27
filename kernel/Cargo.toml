@@ -30,6 +30,7 @@ soak = []
 [dependencies]
 sel4lake-hal = { path = "../crates/sel4lake-hal" }
 sel4lake-sync = { path = "../crates/sel4lake-sync" }
+sel4lake-slab = { path = "../crates/sel4lake-slab" }
 sel4lake-mem = { path = "../crates/sel4lake-mem" }
 sel4lake-region = { path = "../crates/sel4lake-region" }
 sel4lake-loader = { path = "../crates/sel4lake-loader" }

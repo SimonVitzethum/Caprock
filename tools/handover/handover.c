@@ -53,8 +53,11 @@ MODULE_PARM_DESC(arm, "1 = Stufe 1a: einen Kern wirklich uebernehmen (bis Reboot
 /* Das Trampolin liegt in `tramp.S` — lesbarer Assembler statt eines Opcode-Blobs. */
 extern const u8 sel4lake_t16_start[], sel4lake_t16_end[], sel4lake_t16_target[];
 extern const u8 sel4lake_t64_start[], sel4lake_t64_end[], sel4lake_t64_sig[];
+extern const u8 sel4lake_t64_park[];
+extern const u8 sel4lake_park_start[], sel4lake_park_end[];
 
 static struct page *low_page;
+static struct page *park_page;
 static struct page *pt_pages[6];	/* PML4 + PDPT + 4 PDs */
 static bool armed;
 
@@ -216,6 +219,19 @@ static int __init handover_init(void)
 			rc = -ENOMEM;
 			goto undo;
 		}
+		/*
+		 * Park-Seite: gewoehnlicher Speicher, aber unterhalb 4 GiB, weil die
+		 * Identitaetsabbildung nicht weiter reicht. `GFP_DMA32` sagt genau das zu.
+		 */
+		park_page = alloc_page(GFP_KERNEL | GFP_DMA32 | __GFP_ZERO);
+		if (!park_page) {
+			pr_err("sel4lake: keine Park-Seite unter 4 GiB\n");
+			rc = -ENOMEM;
+			goto undo;
+		}
+		memcpy(page_address(park_page), sel4lake_park_start,
+		       sel4lake_park_end - sel4lake_park_start);
+
 		memset(va, 0, PAGE_SIZE);
 		memcpy((u8 *)va + OFF_T16, sel4lake_t16_start,
 		       sel4lake_t16_end - sel4lake_t16_start);
@@ -228,6 +244,8 @@ static int __init handover_init(void)
 			(u32)(pa + OFF_T64);
 		*(u64 *)((u8 *)va + OFF_T64 + (sel4lake_t64_sig - sel4lake_t64_start)) =
 			(u64)(pa + SIG2_OFF);
+		*(u64 *)((u8 *)va + OFF_T64 + (sel4lake_t64_park - sel4lake_t64_start)) =
+			(u64)page_to_phys(park_page);
 		wmb();
 		pr_info("sel4lake: Trampolin @ phys %pa, SIPI-Vektor 0x%02llx, CR3 0x%llx, Ziel-APIC-ID %u\n",
 			&pa, (u64)(pa >> 12), cr3, apicid);
@@ -247,6 +265,14 @@ static int __init handover_init(void)
 			pr_info("sel4lake: STUFE 1b BESTANDEN — der Kern laeuft im LONG MODE mit eigener GDT und eigenem CR3 (0x%04x/0x%04x)\n",
 				sig, sig2);
 			armed = true;
+			/*
+			 * Der Kern ist aus der niedrigen Seite heraus und parkt anderswo — sie
+			 * darf zurueck. Erst DAS macht die Uebergabe wiederholbar; unter 1 MiB
+			 * gibt es auf dieser Maschine praktisch eine einzige freie Seite.
+			 */
+			__free_pages(low_page, 0);
+			low_page = NULL;
+			pr_info("sel4lake: niedrige Seite freigegeben — naechste Uebergabe moeglich\n");
 		}
 	}
 	return 0;
@@ -275,12 +301,22 @@ static void __exit handover_exit(void)
 			pr_info("sel4lake: CPU %d wieder online\n", cpus[i]);
 	}
 	if (armed) {
-		pr_warn("sel4lake: CPU %d bleibt uebernommen; Reboot stellt sie wieder her\n",
+		/*
+		 * Park-Seite und Seitentabellen bleiben stehen: `CR3` des uebernommenen Kerns
+		 * zeigt auf die Tabellen, sein `RIP` in die Park-Seite. Sie freizugeben, weil
+		 * der Kern gerade nichts tut, waere exakt die Reihenfolge, die dieses Projekt
+		 * an anderer Stelle als Use-after-free bekaempft — die Begruendung "er haelt ja
+		 * an" ist eine Aussage ueber das Verhalten, nicht ueber die Zuordnung.
+		 * Ein Leck bis zum Reboot ist der richtige Failure-Mode.
+		 */
+		pr_warn("sel4lake: CPU %d bleibt uebernommen; Park-Seite + Tabellen bleiben belegt, Reboot stellt alles wieder her\n",
 			cpus[0]);
-		return; /* low_page bewusst NICHT freigeben: der Kern liest sie noch. */
+		return;
 	}
 	if (low_page)
 		__free_pages(low_page, 0);
+	if (park_page)
+		__free_page(park_page);
 	free_identity_tables();
 }
 

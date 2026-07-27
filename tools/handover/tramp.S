@@ -83,22 +83,41 @@ sel4lake_t16_end:
 	/* --------------------------------------------------------------------------------- */
 
 	.code64
-	.globl sel4lake_t64_start, sel4lake_t64_end, sel4lake_t64_sig
+	.globl sel4lake_t64_start, sel4lake_t64_end, sel4lake_t64_sig, sel4lake_t64_park
 sel4lake_t64_start:
 	/*
 	 * Absolute Adressierung statt RIP-relativer: der Stub wird verschoben ausgefuehrt, und
 	 * eine RIP-relative Referenz zeigte dann auf die Kopie im Modul statt auf die Seite.
-	 * Die lineare Adresse der Signatur traegt das Modul ein.
+	 * Die linearen Adressen traegt das Modul ein.
 	 */
 	movabs	$0, %rax
 sel4lake_t64_sig = . - 8
 	movw	$0x5346, (%rax)
 
 	/*
-	 * Angehalten mit maskierten Interrupts. Der Kern ruehrt ab hier nichts an: kein
-	 * Speicherzugriff ausser dieser Seite, keine Interrupts, kein weiterer Tabellenwechsel.
-	 * Fuer Linux bleibt er "offline".
+	 * **Weg aus der Seite unter 1 MiB.**
+	 *
+	 * Sie wird nur fuer den Moduswechsel gebraucht — Mikrosekunden. Wuerde der Kern darin
+	 * parken, bliebe eine sehr knappe Ressource dauerhaft belegt: zwischen 0x0 und 0x9efff
+	 * liegen auf dieser Maschine ~634 KiB, und praktisch war genau eine Seite frei. Der
+	 * zweite Uebergabeversuch fand deshalb keine mehr.
+	 *
+	 * Also: Signatur schreiben, dann in eine gewoehnliche Seite springen und dort anhalten.
+	 * Die niedrige Seite ist danach wieder frei — fuer den naechsten Kern.
 	 */
+	movabs	$0, %rax
+sel4lake_t64_park = . - 8
+	jmp	*%rax
+sel4lake_t64_end:
+
+	/*
+	 * Park-Schleife, liegt in einer gewoehnlichen Seite unterhalb 4 GiB (die
+	 * Identitaetsabbildung deckt nicht mehr ab). Der Kern ruehrt ab hier nichts an: kein
+	 * Speicherzugriff, keine Interrupts, kein Tabellenwechsel. Fuer Linux bleibt er "offline".
+	 */
+	.globl sel4lake_park_start, sel4lake_park_end
+sel4lake_park_start:
+	cli
 	hlt
 	jmp	.
-sel4lake_t64_end:
+sel4lake_park_end:

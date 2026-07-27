@@ -142,6 +142,16 @@ impl<T: ?Sized> Drop for SpinGuard<'_, T> {
 /// Sperrordnung: Ein `RwSpinLock` nimmt **dieselbe** Position wie ein `SpinLock` an
 /// derselben Stelle ein; `read()` und `write()` liegen an derselben Ordnungsposition
 /// (shared vs. exklusiv desselben Locks). Wie [`SpinLock`] erst nach MMU-An benutzbar.
+///
+/// **IRQ-Sicherheit (wie [`SpinLock`], Mechanismus statt Konvention):** `read()`/`write()`
+/// maskieren IRQs am eigenen Kern, BEVOR sie sich anmelden, und der Guard stellt den
+/// Vorzustand beim `Drop` wieder her. Ohne das hinge die Deadlockfreiheit daran, dass
+/// **jeder** Aufrufer im preemptierbaren EL1-Threadkontext selbst maskiert: wird ein Halter
+/// dort vom Timer-Tick verdrängt und läuft auf demselben Kern ein Syscall an (im Trap sind
+/// IRQs hardwareseitig maskiert), der denselben Lock nimmt, spinnt dieser Kern für immer —
+/// der Halter kann nie wieder eingeplant werden. Die Maskierung gehört deshalb in den Lock,
+/// nicht in die Aufrufer (die bestehenden `local_irq_disable`-Klammern an den Aufrufstellen
+/// bleiben gültig und sind durch das nesting-sichere Save/Restore unschädlich).
 pub struct RwSpinLock<T: ?Sized> {
     /// Bit 31 (`WRITER`) gesetzt = ein Schreiber hält exklusiv; Bits 0..30 = Anzahl
     /// aktiver Leser.
@@ -172,8 +182,11 @@ impl<T> RwSpinLock<T> {
 
 impl<T: ?Sized> RwSpinLock<T> {
     /// Geteilt (lesend) sperren. Blockiert nur, solange ein Schreiber hält oder
-    /// angemeldet ist.
+    /// angemeldet ist. IRQ-sicher: maskiert IRQs am eigenen Kern für die Dauer des Guards.
     pub fn read(&self) -> RwReadGuard<'_, T> {
+        // IRQs VOR der Anmeldung maskieren (s. Typ-Doku): ein Halter darf nicht verdrängt
+        // werden, sonst spinnt ein Syscall auf demselben Kern für immer.
+        let daif = irq_save_disable();
         loop {
             // Angemeldeten Schreibern den Vortritt lassen (kein Writer-Starving).
             while self.writers_waiting.load(Ordering::Acquire) != 0 {
@@ -182,15 +195,16 @@ impl<T: ?Sized> RwSpinLock<T> {
             // Optimistisch als Leser eintragen.
             let prev = self.state.fetch_add(1, Ordering::Acquire);
             if prev & RW_WRITER == 0 && self.writers_waiting.load(Ordering::Acquire) == 0 {
-                return RwReadGuard { lock: self };
+                return RwReadGuard { lock: self, daif };
             }
             // Ein Schreiber kam dazwischen -> Eintrag zurücknehmen und erneut versuchen.
             self.state.fetch_sub(1, Ordering::Release);
         }
     }
 
-    /// Exklusiv (schreibend) sperren.
+    /// Exklusiv (schreibend) sperren. IRQ-sicher wie [`read`](Self::read).
     pub fn write(&self) -> RwWriteGuard<'_, T> {
+        let daif = irq_save_disable();
         self.writers_waiting.fetch_add(1, Ordering::Acquire); // Intent -> Leser warten
         loop {
             // WRITER nur setzen, wenn weder Leser noch ein anderer Schreiber aktiv ist.
@@ -199,7 +213,7 @@ impl<T: ?Sized> RwSpinLock<T> {
                 .compare_exchange(0, RW_WRITER, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
-                return RwWriteGuard { lock: self };
+                return RwWriteGuard { lock: self, daif };
             }
             core::hint::spin_loop();
         }
@@ -209,6 +223,8 @@ impl<T: ?Sized> RwSpinLock<T> {
 /// RAII-Guard für geteilten Lesezugriff (`Deref`, kein `DerefMut`).
 pub struct RwReadGuard<'a, T: ?Sized> {
     lock: &'a RwSpinLock<T>,
+    /// DAIF-Zustand vor dem Locken (beim `Drop` wiederhergestellt).
+    daif: u64,
 }
 
 impl<T: ?Sized> Deref for RwReadGuard<'_, T> {
@@ -223,12 +239,15 @@ impl<T: ?Sized> Deref for RwReadGuard<'_, T> {
 impl<T: ?Sized> Drop for RwReadGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.state.fetch_sub(1, Ordering::Release);
+        irq_restore(self.daif); // erst freigeben, DANN den IRQ-Zustand zurück
     }
 }
 
 /// RAII-Guard für exklusiven Schreibzugriff (`Deref` + `DerefMut`).
 pub struct RwWriteGuard<'a, T: ?Sized> {
     lock: &'a RwSpinLock<T>,
+    /// DAIF-Zustand vor dem Locken (beim `Drop` wiederhergestellt).
+    daif: u64,
 }
 
 impl<T: ?Sized> Deref for RwWriteGuard<'_, T> {
@@ -253,6 +272,7 @@ impl<T: ?Sized> Drop for RwWriteGuard<'_, T> {
         // bewahrt eine solche Leserzahl -> kein Unterlauf.
         self.lock.state.fetch_and(!RW_WRITER, Ordering::Release);
         self.lock.writers_waiting.fetch_sub(1, Ordering::Release);
+        irq_restore(self.daif); // erst freigeben, DANN den IRQ-Zustand zurück
     }
 }
 

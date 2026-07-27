@@ -113,6 +113,27 @@ static CONSUMER_DONE: AtomicBool = AtomicBool::new(false);
 static XFER_RESULT: AtomicU64 = AtomicU64::new(0);
 static XFER_DONE: AtomicBool = AtomicBool::new(false);
 
+// --- Grant-Leak-Regression (ext-29) --------------------------------------------------------
+//
+// Ein REPLY-Grant legt eine ABLEITUNG der Server-Cap an und traegt sie im Empfangs-Slot des
+// Aufrufers ein. Lag dort schon eine Cap, wurde sie frueher nur ueberschrieben: die alte blieb
+// als Kind im CDT und als belegter Slot in der GETEILTEN globalen Tabelle zurueck, fuer
+// niemanden mehr erreichbar. Ein Server, der wiederholt mit Grant antwortet, konnte so die
+// Tabelle erschoepfen und ALLEN PDs jede weitere Cap-Installation verwehren (Cross-PD-DoS).
+//
+// Die Messgroesse ist bewusst der **Kindzaehler der Quell-Cap** und nicht die globale
+// Slot-Zahl: er zaehlt genau die Ableitungen DIESER Cap und ist damit immun gegen die
+// parallel laufenden uebrigen Demos (die staendig Caps anlegen/loeschen). Erwartung nach
+// `XFER_GRANT_LOOPS` zusaetzlichen Grants: **genau 1** lebende Ableitung (die aktuelle).
+const XFER_GRANT_LOOPS: usize = 64;
+/// Quell-Cap des Grants (Slot 2 des Brokers) — fuer die Kindzaehler-Messung.
+static XFER_SRC_CAP: SpinLock<Option<sel4lake_cap::CapPtr>> = SpinLock::new(None);
+/// Beobachtete Ableitungen der Quell-Cap nach den Wiederhol-Grants (Soll: 1).
+static XFER_SRC_CHILDREN: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// Ergebnis des Cap-Aufrufs NACH den Wiederhol-Grants (die Cap muss weiter funktionieren).
+static XFER_RESULT_AFTER: AtomicU64 = AtomicU64::new(0);
+static XFER_GRANTLK_DONE: AtomicBool = AtomicBool::new(false);
+
 // EL0-Userland: ein echter EL0-User-Thread ruft per Syscall einen EL1-Server.
 const USER_MAGIC: u64 = 0xC0DE;
 static USER_RECV: AtomicU64 = AtomicU64::new(0);
@@ -1181,6 +1202,7 @@ pub fn spawn_demo() {
     let brk_pd = system::create_pd().expect("brk pd");
     system::install_pd_cap(brk_pd, 0, brk_recv);
     system::install_pd_cap(brk_pd, 2, svc_send); // Slot 2 = die zu delegierende Cap
+    *XFER_SRC_CAP.lock() = Some(svc_send); // Quelle der Grant-Ableitungen (Leak-Regression)
     let brk = system::spawn(broker_server as *const () as usize, 0, prio).expect("brk thread");
     system::bind_pd(brk_pd, brk);
 
@@ -2542,6 +2564,24 @@ extern "C" fn xfer_client(_arg: usize) -> ! {
     let r = invoke(sys::CALL, GRANT_RECV_SLOT as u64, [7, 0, 0, 0], 0);
     XFER_RESULT.store(r.msg[0], Ordering::Relaxed);
     XFER_DONE.store(true, Ordering::Release);
+
+    // 3) Leak-Regression: denselben Empfangs-Slot wieder und wieder per Grant befuellen.
+    //    Jede Wiederholung verdraengt die vorige Ableitung — der Kernel MUSS sie freigeben.
+    for _ in 0..XFER_GRANT_LOOPS {
+        let _ = invoke(sys::CALL, 0, [0; 4], 0);
+    }
+    // 4) Die (neueste) transferierte Cap muss weiterhin funktionieren ...
+    let r2 = invoke(sys::CALL, GRANT_RECV_SLOT as u64, [7, 0, 0, 0], 0);
+    XFER_RESULT_AFTER.store(r2.msg[0], Ordering::Relaxed);
+    // ... und die Quell-Cap darf trotz {XFER_GRANT_LOOPS}+1 Grants nur EINE lebende
+    //     Ableitung haben (dieser Thread laeuft auf EL1 -> direkter Kernel-Zugriff).
+    let children = XFER_SRC_CAP
+        .lock()
+        .and_then(system::cap_inspect)
+        .map(|i| i.child_count)
+        .unwrap_or(usize::MAX);
+    XFER_SRC_CHILDREN.store(children, Ordering::Relaxed);
+    XFER_GRANTLK_DONE.store(true, Ordering::Release);
     invoke(sys::EXIT, 0, [0; 4], 0);
     loop {
         core::hint::spin_loop();
@@ -4249,7 +4289,7 @@ fn all_done() -> bool {
     let prio = (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire));
     let life = KILLER_DONE.load(Ordering::Acquire) && REAPED.load(Ordering::Relaxed) >= 2;
     let notif = PRODUCER_DONE.load(Ordering::Acquire) && NOTIF_COUNT.load(Ordering::Relaxed) >= NOTIF_ROUNDS;
-    let xfer = XFER_DONE.load(Ordering::Acquire);
+    let xfer = XFER_DONE.load(Ordering::Acquire) && XFER_GRANTLK_DONE.load(Ordering::Acquire);
     let ckpt = CS_DONE.load(Ordering::Acquire);
     let el0 = USER_RECV.load(Ordering::Relaxed) == USER_MAGIC && system::el0_syscall_seen();
     let el0iso = system::el0_fault_count() >= 1;
@@ -4413,6 +4453,21 @@ fn report() {
     let xr = XFER_RESULT.load(Ordering::Relaxed);
     println!("xfer    : svc call(7) ueber transferierte Cap -> {xr} (erwartet 21)");
     println!("xfer    : {}", if xr == 21 { "ALL PASS" } else { "FAILURES" });
+
+    // Grant-Leak-Regression: wiederholte Grants in denselben Empfangs-Slot duerfen keine
+    // unerreichbaren Caps in der geteilten Tabelle zuruecklassen (Cross-PD-DoS).
+    let children = XFER_SRC_CHILDREN.load(Ordering::Relaxed);
+    let xr2 = XFER_RESULT_AFTER.load(Ordering::Relaxed);
+    let cdt = system::cap_audit_cdt();
+    println!(
+        "grantlk : nach {}+1 Grants in denselben Slot: {children} lebende Ableitung(en) der Quell-Cap (erwartet 1), Cap weiter nutzbar -> {xr2} (erwartet 21), cdt_audit={cdt}",
+        XFER_GRANT_LOOPS
+    );
+    let grantlk_ok = children == 1 && xr2 == 21 && cdt == 0;
+    println!(
+        "grantlk : {} (verdraengte Grant-Cap wird freigegeben — kein Slot-Leck in der geteilten Cap-Tabelle)",
+        if grantlk_ok { "ALL PASS" } else { "FAILURES" }
+    );
 
     // EL0-Userland: echter EL0-Thread hat per Syscall einen EL1-Server gerufen.
     let urecv = USER_RECV.load(Ordering::Relaxed);

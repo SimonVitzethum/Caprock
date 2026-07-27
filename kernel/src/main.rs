@@ -103,6 +103,18 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     println!("core 0  : online (vectors, gic, timer @ {} Hz)", TICK_HZ);
     println!("timer   : CNTFRQ={} Hz, PPI {}", hal::timer::freq(), hal::timer::TIMER_INTID);
 
+    // Spekulations-Eigenschaften der HW melden (ext-29). CSV2/CSV3 sagen, ob die HW von sich
+    // aus gegen Spectre-v2 (Branch-Predictor über Kontexte) bzw. Meltdown immun ist; der Kernel
+    // härtet unabhängig davon seine EL0-Indexpfade (`array_index_nospec`) und setzt beim
+    // VSpace-Wechsel eine Spekulationsbarriere. NICHT abgedeckt bleiben Cache-/Timing-
+    // Seitenkanäle zwischen PDs (keine Cache-Partitionierung) — s. docs/invariants.md.
+    println!(
+        "spec    : CSV2={} CSV3={} FEAT_SB={} · nospec-Indizes an, Barriere beim VSpace-Wechsel",
+        hal::cpu::csv2(),
+        hal::cpu::csv3(),
+        hal::cpu::sb_supported() as u8
+    );
+
     // RAM-Layout aus dem Device Tree lesen (statt fest verdrahtet).
     let (ram_base, ram_size) = sel4lake_dtb::Dtb::parse(DTB_BYTES)
         .and_then(|d| d.memory())

@@ -183,6 +183,14 @@ fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
     next as *mut TrapFrame
 }
 
+/// Callback für den Dispatch: eine Capability löschen (Finalisierung inkl. Speicher-
+/// rückgabe und Abbruch finalisierter Reply-Calls). Wird **ohne** gehaltene Dispatch-Locks
+/// gerufen (der Dispatch gibt CAPS/EPS vorher frei); `cap_delete` sperrt selbst CAPS+MEM
+/// in der richtigen Ordnung. Ein Fehlschlag (Cap bereits weg) ist unkritisch.
+fn dispatch_delete_cap(cap: sel4lake_cap::CapPtr) {
+    let _ = cap_delete(cap);
+}
+
 fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
     let core = hal::cpu::core_id();
     if hal::exception::frame_from_el0(frame as usize) {
@@ -201,6 +209,7 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
         &EPS,
         &NTFNS,
         crate::loader::load_by_index, // ext-26: SYS_LOAD-Callback (cap-gegatet im Dispatch)
+        dispatch_delete_cap,          // beim Grant verdrängte Cap freigeben (kein Slot-Leck)
     );
     // Der Syscall kann den laufenden Thread gewechselt haben (block/exit) -> FP-Trap
     // + VSpace passend zum neuen aktuellen Thread setzen.
@@ -327,6 +336,10 @@ fn sync_vspace(core: usize, sched: &Scheduler) {
         let root = want & ((1u64 << 48) - 1);
         let asid = (want >> 48) as u16;
         hal::mmu::set_user_vspace(root, asid);
+        // Spekulations-Barriere an der Adressraum-Grenze: nach dem Wechsel darf keine noch
+        // offene Spekulation aus dem VORHERIGEN Adressraum weiterlaufen (`SB`, sonst
+        // `dsb sy; isb`). Nur im Wechselfall — der All-Trusted-Pfad bleibt unbelastet.
+        hal::cpu::speculation_barrier();
         CURRENT_VSPACE[core].store(want, Ordering::Relaxed);
     }
 }
@@ -467,8 +480,36 @@ pub fn init_core() {
 
 // --- Allokator (MEM) ---
 
+/// Physische Region `[base, base+len)` **nullen**.
+///
+/// Datenremanenz-Schutz: der Allokator vergibt Regionen wieder, die zuvor einem anderen
+/// Subjekt gehörten (Thread-Stack, isolierte PD-Region, DMA-Puffer, geladene Segmente).
+/// Ohne Nullung könnte der neue Eigentümer die Restdaten des alten lesen — eine
+/// Vertraulichkeitslücke ÜBER Vertrauensgrenzen hinweg (und Boot-RAM enthält ohnehin
+/// unbekannten Firmware-Inhalt). Deshalb wird **bei der Vergabe** genullt, nicht bei der
+/// Rückgabe: das deckt auch fabrikfrisches RAM ab und ist gegen jeden Freigabepfad robust
+/// (auch solche, die eine Region ohne `free` verlieren).
+fn zero_phys(base: u64, len: u64) {
+    // SAFETY: Der Bereich stammt direkt aus dem Allokator, gehört also exklusiv uns
+    // (noch an kein Subjekt vergeben), liegt vollständig im identity-gemappten Normal-RAM
+    // und wird nicht gleichzeitig benutzt. Rohspeicher-Initialisierung ist eine erlaubte
+    // `unsafe`-Domäne (ADR 0021).
+    unsafe { core::ptr::write_bytes(base as *mut u8, 0, len as usize) };
+}
+
+/// **Zentrale RAM-Allokation des Kernels: liefert stets genullten Speicher.**
+/// Jede Region, die an ein Subjekt gehen kann, MUSS hierüber kommen (nicht direkt über
+/// `MEM.lock().alloc`) — s. [`zero_phys`]. Genullt wird **außerhalb** des MEM-Locks: die
+/// Region ist bereits exklusiv unsere, und das Nullen großer Blöcke soll den Allokator
+/// nicht blockieren.
+fn mem_alloc(size: u64, align: u64) -> Option<MemoryCap> {
+    let cap = MEM.lock().alloc(size, align)?;
+    zero_phys(cap.base(), cap.len());
+    Some(cap)
+}
+
 pub fn alloc(size: u64, align: u64) -> Option<MemoryCap> {
-    MEM.lock().alloc(size, align)
+    mem_alloc(size, align)
 }
 pub fn free(cap: MemoryCap) {
     MEM.lock().free(cap);
@@ -694,7 +735,7 @@ pub fn spawn_balanced(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
 /// [`bind_cores`] gebunden sein. Lock-Ordnung RES vor SCHEDS[core].
 pub fn spawn_on_core(core: usize, entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
     let (base, len) = {
-        let stack = MEM.lock().alloc(STACK_SIZE, 16)?;
+        let stack = mem_alloc(STACK_SIZE, 16)?;
         (stack.base() as usize, stack.len() as usize)
     }; // MEM vor SCHEDS freigegeben (Ordnung MEM < SCHEDS)
     let mut sched = SCHEDS[core].lock();
@@ -710,7 +751,7 @@ pub fn spawn_user(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
     let core = hal::cpu::core_id();
     let kidx = claim_user_kstack()?; // freien Pool-Slot reservieren
     let kbase = core::ptr::addr_of!(__user_kstacks_bottom) as usize + kidx * USER_KSTACK_SIZE;
-    let (user_base, user_len) = match MEM.lock().alloc(STACK_SIZE, 16) {
+    let (user_base, user_len) = match mem_alloc(STACK_SIZE, 16) {
         Some(s) => (s.base() as usize, s.len() as usize),
         None => {
             release_user_kstack(kidx);
@@ -775,8 +816,8 @@ fn create_vspace() -> Option<(u16, u64)> {
         t[i] = VSpaceEnt { used: true, l1: 0, l2: 0 }; // reserviert
         (i + 1) as u16
     };
-    let a = MEM.lock().alloc(4096, 4096);
-    let b = MEM.lock().alloc(4096, 4096);
+    let a = mem_alloc(4096, 4096);
+    let b = mem_alloc(4096, 4096);
     let (l1, l2) = match (a, b) {
         (Some(l1), Some(l2)) => (l1, l2),
         (a, b) => {
@@ -902,7 +943,7 @@ fn vspace_map(asid: u16, base: u64, len: u64, perm: hal::mmu::UserPerm) -> bool 
         let mut p = base;
         while p < base + len {
             let mapped =
-                hal::mmu::vspace_map_page(l2, p, perm, &mut || MEM.lock().alloc(4096, 4096).map(|c| c.base()));
+                hal::mmu::vspace_map_page(l2, p, perm, &mut || mem_alloc(4096, 4096).map(|c| c.base()));
             if !mapped {
                 all = false;
                 break;
@@ -1017,7 +1058,7 @@ pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u
 
     // Private 2-MiB-Stack-Region (2-MiB-ausgerichtet, in GiB 1).
     let region_sz = hal::mmu::ISO_REGION_SIZE;
-    let (rbase, rlen) = match MEM.lock().alloc(region_sz, region_sz) {
+    let (rbase, rlen) = match mem_alloc(region_sz, region_sz) {
         Some(r) => (r.base(), r.len()),
         None => {
             release_user_kstack(kidx);
@@ -1096,6 +1137,18 @@ pub fn destroy_loaded(tid: ThreadId, pd: usize) {
     CAPS.write().pds.free(pd); // PD-Slot freigeben
 }
 
+/// Eine PD **ohne Thread** abbauen: alle in ihrem Cspace installierten Caps löschen
+/// (Refcount runter, ggf. Finalisierung) und den PD-Slot freigeben. Für PDs, die nur als
+/// Cap-Container existieren (Setup-Fehlerpfade, Selbsttests); PDs **mit** Thread bauen
+/// [`destroy_loaded`] bzw. der PDCTL-STOP-Pfad ab.
+pub fn destroy_pd(pd: usize) {
+    let caps = CAPS.read().pds.caps_of(pd); // Snapshot; Read-Lock danach frei
+    for cap in caps.iter().flatten() {
+        let _ = cap_delete(*cap);
+    }
+    CAPS.write().pds.free(pd);
+}
+
 /// Einen 2-MiB-Frame `phys` als **EL0-RX-Code** in die VSpace `asid` mappen + flushen.
 fn vspace_map_code_region(asid: u16, phys: u64) -> bool {
     let Some(l2) = vspace_l2(asid) else {
@@ -1123,8 +1176,8 @@ pub fn spawn_isolated_native(code: *const u8, code_len: usize, prio: u8) -> Opti
 
     // Code-Frame + Stack-Frame (beide 2-MiB-ausgerichtet, in GiB 1).
     let in_gib1 = |b: u64, l: u64| b >= hal::mmu::USER_RAM_MIN && b + l <= hal::mmu::GIB1_END;
-    let ca = MEM.lock().alloc(sz, sz);
-    let sa = MEM.lock().alloc(sz, sz);
+    let ca = mem_alloc(sz, sz);
+    let sa = mem_alloc(sz, sz);
     let (cf, sf) = match (ca, sa) {
         (Some(cf), Some(sf)) => (cf, sf),
         (ca, sa) => {
@@ -1345,7 +1398,7 @@ pub fn load_into_pd(img: &ElfImage, pd: usize, endow: &[(usize, CapPtr)]) -> Opt
     let mut nrec = 0usize;
     for seg in img.segments() {
         let total = (((seg.memsz as u64) + 4095) & !4095) as usize;
-        let Some(region) = MEM.lock().alloc(total as u64, 4096) else {
+        let Some(region) = mem_alloc(total as u64, 4096) else {
             return cleanup(asid, kidx, &seglist[..nrec], None);
         };
         let pa = region.base(); // MemoryCap-Drop = nur Deskriptor (kein Free); RAM bleibt belegt
@@ -1363,7 +1416,7 @@ pub fn load_into_pd(img: &ElfImage, pd: usize, endow: &[(usize, CapPtr)]) -> Opt
         };
         let mut off = 0u64;
         while (off as usize) < total {
-            let mut a3 = || MEM.lock().alloc(4096, 4096).map(|c| c.base());
+            let mut a3 = || mem_alloc(4096, 4096).map(|c| c.base());
             if !hal::mmu::vspace_map_page_at(l2, seg.vaddr + off, pa + off, perm, &mut a3) {
                 return cleanup(asid, kidx, &seglist[..nrec], None);
             }
@@ -1375,13 +1428,13 @@ pub fn load_into_pd(img: &ElfImage, pd: usize, endow: &[(usize, CapPtr)]) -> Opt
     }
 
     // 2. Stack (nicht-identity an festes VA-Fenster, EL0-RW).
-    let Some(stack_region) = MEM.lock().alloc(LOADED_STACK_BYTES, 4096) else {
+    let Some(stack_region) = mem_alloc(LOADED_STACK_BYTES, 4096) else {
         return cleanup(asid, kidx, &seglist[..nrec], None);
     };
     let stack_pa = stack_region.base();
     let mut off = 0u64;
     while off < LOADED_STACK_BYTES {
-        let mut a3 = || MEM.lock().alloc(4096, 4096).map(|c| c.base());
+        let mut a3 = || mem_alloc(4096, 4096).map(|c| c.base());
         if !hal::mmu::vspace_map_page_at(l2, LOADED_STACK_VA + off, stack_pa + off, hal::mmu::UserPerm::Rw, &mut a3) {
             // Stack ist alloziert, aber noch NICHT als Reap-Region des Threads vermerkt -> mitfreigeben.
             return cleanup(asid, kidx, &seglist[..nrec], Some((stack_pa, LOADED_STACK_BYTES)));
@@ -1527,7 +1580,7 @@ pub enum MappingKind {
 /// bei nicht-isolierter VSpace oder fehlgeschlagenem Mapping.
 pub fn map_region_into_thread(tid: ThreadId, phys: u64, len: u64, kind: MappingKind) -> bool {
     let asid = (VSPACE_OF[tid.slot()].load(Ordering::Relaxed) >> 48) as u16;
-    let mut alloc = || MEM.lock().alloc(4096, 4096).map(|c| c.base());
+    let mut alloc = || mem_alloc(4096, 4096).map(|c| c.base());
     let ok = match kind {
         MappingKind::Device { ro } => match vspace_l1(asid) {
             Some(l1) => hal::mmu::vspace_map_device(l1, phys, len, ro, &mut alloc),
@@ -1724,7 +1777,7 @@ impl SmmuV3Enforcer {
     /// ausschneiden (für Queue-/Tabellen-Speicher der SMMU). `None` bei Erschöpfung.
     fn alloc_zeroed(len: u64) -> Option<u64> {
         let len = (len + 4095) & !4095;
-        let base = MEM.lock().alloc(len, len.next_power_of_two().max(4096)).map(|c| c.base())?;
+        let base = mem_alloc(len, len.next_power_of_two().max(4096)).map(|c| c.base())?;
         // SAFETY: frisch allozierter, identity-gemappter RAM-Block; exklusiv hier beschrieben.
         unsafe { core::ptr::write_bytes(base as *mut u8, 0, len as usize) };
         hal::cpu::dsb_sy();
@@ -2286,7 +2339,7 @@ pub fn virtio_rng_dma_demo() -> VirtioDmaResult {
 
     // 2. Kronjuwel (Sentinel-Page AUSSERHALB der DmaCap-Region). MEM-Lock VOR dem `if let`
     // freigeben (sonst Deadlock über das `if let`-Temporary -> free_raw_region re-lockt MEM).
-    let sentinel_page = MEM.lock().alloc(4096, 4096).map(|c| c.base());
+    let sentinel_page = mem_alloc(4096, 4096).map(|c| c.base());
     if let Some(sent) = sentinel_page {
         const SENTINEL: u64 = 0xA5A5_A5A5_5A5A_5A5A;
         // SAFETY: frische, identity-gemappte RAM-Page; exklusiv hier beschrieben/gelesen.
@@ -2341,7 +2394,7 @@ pub struct KernelRegionSource;
 impl RegionSource for KernelRegionSource {
     fn request(&self, min_len: usize, purpose: Purpose) -> Option<Region> {
         let len = (min_len as u64 + 4095) & !4095;
-        let cap = MEM.lock().alloc(len, 4096)?;
+        let cap = mem_alloc(len, 4096)?;
         let id = REGION_ID.fetch_add(1, Ordering::Relaxed);
         Some(Region::from_cap(cap, RegionTag::new(id, purpose)))
     }

@@ -18,6 +18,7 @@
 
 use sel4lake_abi::{pdctl, reg, result, sys};
 use sel4lake_cap::{CapPtr, CapSpace, ObjectKind};
+use sel4lake_hal::cpu::array_index_nospec;
 use sel4lake_hal::exception::{frame_reg, frame_set_reg};
 use sel4lake_ipc::{Endpoint, Notification, NENDPOINTS, NNOTIFICATIONS};
 use sel4lake_mem::Rights;
@@ -25,8 +26,22 @@ use sel4lake_sched::{SchedOps, ThreadId};
 use sel4lake_sync::{RwSpinLock, SpinLock};
 
 const NPDS: usize = 256; // PD-Pool großzügig (war 96): viele gleichzeitig geladene PDs (load/adversarial)
-/// Cap-Slots je PD-Cspace.
+/// Cap-Slots je PD-Cspace (Adressraum der lokalen Slot-Indizes).
 const NCAPS: usize = 16;
+
+/// **Cap-Budget je PD** (Fairness-/DoS-Schranke).
+///
+/// Der globale [`CapSpace`] ist eine **systemweit geteilte** Tabelle fester Größe. `NCAPS`
+/// begrenzt nur den lokalen Index-Adressraum einer PD, nicht ihren Verbrauch an globalen
+/// Slots: ohne zusätzliche Schranke könnten wenige PDs (`NPDS * NCAPS` ≫ Slots der globalen
+/// Tabelle) die Tabelle füllen und damit **allen anderen** PDs jede weitere Cap-Installation
+/// verweigern — ein Cross-PD-Denial-of-Service über eine geteilte Ressource.
+///
+/// Das Budget deckelt, wie viele Slots des eigenen Cspace eine PD gleichzeitig belegen darf.
+/// Es ist bewusst deutlich kleiner als `NCAPS`: die vorhandenen PDs nutzen 1–4 Slots, und so
+/// bleibt selbst bei vielen gleichzeitig geladenen PDs Tabellenkapazität für alle übrig.
+/// Überschreitung wird **abgewiesen** (kein Eintrag, keine Ableitung), nie still verworfen.
+pub const CAP_BUDGET_PER_PD: usize = 8;
 
 /// **Sicherheitsdomäne** einer Protection Domain (ext-22).
 ///
@@ -66,16 +81,27 @@ impl Caps {
         }
     }
 
-    /// Eine Cap **policy-geprüft** in den Cspace einer PD eintragen: der Cap-Typ muss in
-    /// der Domäne der PD erlaubt sein (Hardware-Caps nur in HardwareLand, `PdControl` nur
-    /// in TrustedSas). Gibt `false` zurück (ohne Eintrag), wenn die Policy es verbietet.
+    /// Eine Cap **policy- und budgetgeprüft** in den Cspace einer PD eintragen: der Cap-Typ
+    /// muss in der Domäne der PD erlaubt sein (Hardware-Caps nur in HardwareLand, `PdControl`
+    /// nur in TrustedSas) UND die PD darf ihr [`CAP_BUDGET_PER_PD`] nicht überschreiten. Gibt
+    /// `false` zurück (ohne Eintrag), wenn eines von beiden verletzt ist.
     /// Zentraler Enforcement-Punkt — alle Cap-Installationen sollten hierüber laufen.
     pub fn install_cap_checked(&mut self, pd: usize, slot: usize, cap: CapPtr) -> bool {
-        if !self.cap_allowed(pd, cap) {
+        if !self.cap_allowed(pd, cap) || !self.budget_allows(pd, slot) {
             return false;
         }
         self.pds.install_cap(pd, slot, cap);
         true
+    }
+
+    /// Darf PD `pd` den Slot `slot` (neu) belegen, ohne ihr [`CAP_BUDGET_PER_PD`] zu
+    /// überschreiten? Ein **Überschreiben** eines bereits belegten Slots erhöht den
+    /// Verbrauch nicht und ist immer erlaubt.
+    pub fn budget_allows(&self, pd: usize, slot: usize) -> bool {
+        if self.pds.cap_at(pd, slot).is_some() {
+            return true; // Ersetzen, kein zusätzlicher Slot
+        }
+        self.pds.cap_count(pd) < CAP_BUDGET_PER_PD
     }
 
     /// Erlaubt die Domänen-Policy die Cap-Art von `cap` in PD `pd`? Reiner Test (kein Eintrag) —
@@ -463,9 +489,23 @@ impl PdTable {
             .position(|p| p.used && p.thread == Some(thread))
     }
 
+    /// Anzahl der aktuell belegten Cap-Slots einer PD (Verbrauch gegen [`CAP_BUDGET_PER_PD`]).
+    pub fn cap_count(&self, pd: usize) -> usize {
+        if pd < NPDS && self.pds[pd].used {
+            self.pds[pd].cspace.iter().filter(|c| c.is_some()).count()
+        } else {
+            0
+        }
+    }
+
     fn cap_at(&self, pd: usize, slot: usize) -> Option<CapPtr> {
         if slot < NCAPS {
-            self.pds[pd].cspace[slot]
+            // Spectre-v1-Härtung: `slot` stammt bei jedem Syscall aus einem EL0-Register.
+            // Die Verzweigung oben schützt nur den architektonischen Pfad — eine falsch
+            // vorhergesagte Verzweigung könnte den Zugriff spekulativ mit einem beliebigen
+            // Index ausführen und den Treffer im Cache hinterlassen. Die Maske macht den
+            // Index zusätzlich datenabhängig gültig.
+            self.pds[pd].cspace[array_index_nospec(slot, NCAPS)]
         } else {
             None
         }
@@ -499,6 +539,10 @@ pub fn dispatch(
     // Loader re-lockt `CAPS`/`MEM`/`SCHEDS` selbst). `endow` = aus dem Aufrufer-Cspace delegierte
     // Caps (Slot, Cap).
     load: fn(u32, &[(usize, CapPtr)]) -> Option<usize>,
+    // Cap löschen (Finalisierung inkl. Speicherfreigabe/Call-Abbruch) — der Kernel sperrt darin
+    // selbst `CAPS`+`MEM` und bricht finalisierte Reply-Calls ab. Nur zu rufen, wenn hier KEIN
+    // Lock mehr gehalten wird. Wird für die beim Grant verdrängte Cap gebraucht (s. `grant_cap`).
+    delete_cap: fn(CapPtr),
 ) -> usize {
     let nr = frame_reg(frame, reg::SYSNO_RESULT);
     if nr == sys::YIELD {
@@ -548,8 +592,10 @@ pub fn dispatch(
             if !rights.contains(need) {
                 return deny(result::ERR_RIGHTS);
             }
-            let ep = ep_id as usize;
-            if ep >= NENDPOINTS {
+            // `ep_id` kommt aus der (cap-geprüften) Endpoint-Cap; die Schranke wird zusätzlich
+            // spekulationssicher maskiert (s. `cap_at`), da die Cap-Auswahl EL0-gesteuert ist.
+            let ep = array_index_nospec(ep_id as usize, NENDPOINTS);
+            if ep_id as usize >= NENDPOINTS {
                 return deny(result::ERR_BADCAP);
             }
             match nr {
@@ -565,11 +611,19 @@ pub fn dispatch(
                     if tag & sel4lake_abi::GRANT_FLAG != 0 {
                         let mut g = caps.write();
                         let mut e = eps[ep].lock();
-                        if let Some(caller) = e.caller() {
-                            grant_cap(&mut g, caller, pd, (tag & 0xff) as usize);
-                        }
+                        let replaced = match e.caller() {
+                            Some(caller) => grant_cap(&mut g, caller, pd, (tag & 0xff) as usize),
+                            None => None,
+                        };
                         drop(g); // CAPS vor dem Rendezvous freigeben (EPS bleibt gehalten)
-                        e.reply(ops, core, frame)
+                        let next = e.reply(ops, core, frame);
+                        drop(e); // EPS freigeben, BEVOR das Löschen CAPS/MEM/SCHEDS nimmt
+                        // Die im Empfangs-Slot verdrängte Cap freigeben (sonst bliebe sie
+                        // unerreichbar in der geteilten Tabelle belegt -> Cross-PD-DoS).
+                        if let Some(old) = replaced {
+                            delete_cap(old);
+                        }
+                        next
                     } else {
                         eps[ep].lock().reply(ops, core, frame)
                     }
@@ -584,8 +638,8 @@ pub fn dispatch(
             if !rights.contains(need) {
                 return deny(result::ERR_RIGHTS);
             }
-            let n = id as usize;
-            if n >= NNOTIFICATIONS {
+            let n = array_index_nospec(id as usize, NNOTIFICATIONS);
+            if id as usize >= NNOTIFICATIONS {
                 return deny(result::ERR_BADCAP);
             }
             if nr == sys::SIGNAL {
@@ -726,23 +780,47 @@ pub fn dispatch(
 /// Cspace des Aufrufer-PDs an [`GRANT_RECV_SLOT`](sel4lake_abi::GRANT_RECV_SLOT)
 /// eintragen. Läuft unter dem gehaltenen `CAPS`-Lock (vor dem REPLY-Rendezvous, also
 /// bevor der Aufrufer geweckt wird/laufen kann).
-fn grant_cap(caps: &mut Caps, caller: ThreadId, server_pd: usize, grant_slot: usize) {
-    let Some(src) = caps.pds.cap_at(server_pd, grant_slot) else {
-        return;
-    };
-    let Some(cpd) = caps.pds.pd_of(caller) else {
-        return;
-    };
+///
+/// **Rückgabe:** die Cap, die im Empfangs-Slot **verdrängt** wurde (falls dort schon eine
+/// lag) — der Aufrufer MUSS sie anschließend löschen. Ohne das bliebe sie für immer im
+/// globalen `CapSpace` belegt, ohne von irgendeiner PD noch erreichbar zu sein: ein Server,
+/// der wiederholt mit `GRANT_FLAG` antwortet, könnte so die **systemweit geteilte**
+/// Slot-/Objekt-Tabelle erschöpfen und allen PDs jede weitere Cap-Installation verwehren.
+/// Das Löschen passiert bewusst NICHT hier: die Finalisierung kann Speicher freigeben
+/// (Allokator) bzw. einen Call abbrechen (EPS/SCHEDS) — beides ist unter dem hier
+/// gehaltenen `CAPS`+`EPS`-Paar sperrordnungswidrig. Der Dispatch erledigt es, nachdem
+/// beide Locks gefallen sind (s. [`dispatch`]).
+fn grant_cap(
+    caps: &mut Caps,
+    caller: ThreadId,
+    server_pd: usize,
+    grant_slot: usize,
+) -> Option<CapPtr> {
+    let src = caps.pds.cap_at(server_pd, grant_slot)?;
+    let cpd = caps.pds.pd_of(caller)?;
     // **Domänen-Policy VOR der Ableitung prüfen** (konsistent zum zentralen Enforcement-Punkt
     // install_cap_checked) — sonst könnte ein Server eine policy-fremde Cap (z. B. HW-/Loader-/
     // PdControl-Cap) per Grant in eine fremde Domäne schleusen (Bypass; bisher nur von domain_audit
     // nachträglich DETEKTIERT statt VERHINDERT). Die Kopie hat dieselbe Art/Id wie `src` -> die
     // Prüfung auf `src` ist äquivalent; bei Ablehnung wird gar keine Kopie erzeugt (kein Leck).
     if !caps.cap_allowed(cpd, src) {
-        return;
+        return None;
+    }
+    // Budget des EMPFÄNGERS prüfen, bevor eine Kopie entsteht (ein Grant darf das Cap-Budget
+    // einer PD nicht umgehen — sonst wäre der Grant-Pfad das Schlupfloch um die Schranke aus
+    // `install_cap_checked`). Ein belegter Empfangs-Slot wird ersetzt, nicht zusätzlich belegt.
+    let recv_slot = sel4lake_abi::GRANT_RECV_SLOT;
+    if !caps.budget_allows(cpd, recv_slot) {
+        return None;
     }
     // Cap ableiten (erbt die Rechte) und beim Aufrufer eintragen (Policy bereits geprüft).
-    if let Ok(new_cap) = caps.cspace.copy(src, Rights::RWX) {
-        caps.pds.install_cap(cpd, sel4lake_abi::GRANT_RECV_SLOT, new_cap);
+    // Der zuvor dort liegende Cap wird verdrängt und zum Löschen zurückgemeldet.
+    match caps.cspace.copy(src, Rights::RWX) {
+        Ok(new_cap) => {
+            let replaced = caps.pds.cap_at(cpd, recv_slot);
+            caps.pds.install_cap(cpd, recv_slot, new_cap);
+            replaced
+        }
+        Err(_) => None,
     }
 }

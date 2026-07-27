@@ -132,10 +132,55 @@ fn is_irq(kind: u64) -> bool {
     kind % 4 == 1
 }
 
-/// Optionaler Reschedule-Hook (vom Scheduler registriert). Als `usize`
-/// (Funktionszeiger) gespeichert; `0` = nicht gesetzt. Wird einmalig beim Boot
+/// **Typisierter atomarer Hook-Slot.** Die Trap-Hooks müssen aus dem IRQ-Kontext lock-frei
+/// lesbar sein, also liegen sie als `usize` in einem Atomic. Früher stand an jeder der fünf
+/// Lesestellen ein eigenes `transmute::<usize, KonkreterHookTyp>` — fünf `unsafe`-Stellen, bei
+/// denen ein Vertipper einen Hook als **falschen Funktionstyp** aufgerufen hätte (UB, vom
+/// Compiler ungeprüft). Dieser Wrapper bindet den Slot per `PhantomData` an **genau einen**
+/// Funktionszeigertyp: `store`/`load` sind typgeprüft, die Verwechslung ist strukturell
+/// unmöglich, und die Roh-Konvertierung existiert nur noch **einmal** (hier).
+struct AtomicHook<F: Copy> {
+    /// Funktionszeiger als `usize`; `0` = nicht gesetzt.
+    raw: AtomicUsize,
+    _marker: core::marker::PhantomData<fn() -> F>,
+}
+
+impl<F: Copy> AtomicHook<F> {
+    const fn new() -> Self {
+        Self {
+            raw: AtomicUsize::new(0),
+            _marker: core::marker::PhantomData,
+        }
+    }
+
+    /// Hook setzen (einmalig beim Boot, vor dem Aktivieren von IRQs).
+    fn store(&self, hook: F) {
+        const {
+            // Nur Funktionszeiger (zeigergroß, kein Fat Pointer) passen in den Slot.
+            assert!(core::mem::size_of::<F>() == core::mem::size_of::<usize>());
+        }
+        // SAFETY: `F` ist per const-Assertion zeigergroß; ein Funktionszeiger hat dieselbe
+        // Repräsentation wie `usize` (aarch64). Nur die Roh-Bits werden abgelegt.
+        let raw = unsafe { core::mem::transmute_copy::<F, usize>(&hook) };
+        self.raw.store(raw, Ordering::Release);
+    }
+
+    /// Hook lesen; `None`, solange keiner registriert ist. Lock-frei (IRQ-Kontext).
+    fn load(&self) -> Option<F> {
+        let raw = self.raw.load(Ordering::Acquire);
+        if raw == 0 {
+            return None;
+        }
+        // SAFETY: `raw` wurde ausschließlich von `store` mit einem gültigen Zeiger **genau
+        // dieses** Typs `F` geschrieben (der Slot ist über `PhantomData` an `F` gebunden, es
+        // gibt keinen anderen Schreibpfad). Größengleichheit ist const-geprüft.
+        Some(unsafe { core::mem::transmute_copy::<usize, F>(&raw) })
+    }
+}
+
+/// Optionaler Reschedule-Hook (vom Scheduler registriert). Wird einmalig beim Boot
 /// gesetzt und danach nur gelesen.
-static RESCHED_HOOK: AtomicUsize = AtomicUsize::new(0);
+static RESCHED_HOOK: AtomicHook<RescheduleHook> = AtomicHook::new();
 
 /// Signatur des Reschedule-Hooks: bekommt den aktuellen TrapFrame, liefert den
 /// wiederherzustellenden (ggf. den eines anderen Threads).
@@ -143,74 +188,61 @@ pub type RescheduleHook = fn(*mut TrapFrame) -> *mut TrapFrame;
 
 /// Reschedule-Hook registrieren (vor dem Aktivieren von IRQs aufzurufen).
 pub fn set_reschedule_hook(hook: RescheduleHook) {
-    RESCHED_HOOK.store(hook as usize, Ordering::Release);
+    RESCHED_HOOK.store(hook);
 }
 
 /// Optionaler **Geräte-IRQ-Hook** (ext-22, P5): bekommt eine INTID, die weder Timer noch
 /// Reschedule-IPI ist. Der Kernel vermerkt sie (pending) + maskiert sie am Distributor und
 /// gibt `true` zurück, falls es ein **registrierter** Geräte-IRQ (mit IRQ-Cap) war — dann
 /// fährt der Dispatch einen Reschedule (der Drain stellt sie als Notification zu, außerhalb
-/// des IRQ-Kontexts). `0` = nicht gesetzt. Der Hook selbst nimmt **keinen** Lock (IRQ-Kontext).
-static IRQ_HOOK: AtomicUsize = AtomicUsize::new(0);
+/// des IRQ-Kontexts). Der Hook selbst nimmt **keinen** Lock (IRQ-Kontext).
+static IRQ_HOOK: AtomicHook<IrqHook> = AtomicHook::new();
 
 /// Signatur des Geräte-IRQ-Hooks: INTID -> war es ein registrierter Geräte-IRQ?
 pub type IrqHook = fn(u32) -> bool;
 
 /// Geräte-IRQ-Hook registrieren (vor dem Aktivieren von IRQs aufzurufen).
 pub fn set_irq_hook(hook: IrqHook) {
-    IRQ_HOOK.store(hook as usize, Ordering::Release);
+    IRQ_HOOK.store(hook);
 }
 
 fn device_irq(intid: u32) -> bool {
-    let h = IRQ_HOOK.load(Ordering::Acquire);
-    if h == 0 {
-        return false;
+    match IRQ_HOOK.load() {
+        Some(hook) => hook(intid),
+        None => false,
     }
-    // SAFETY: wie `reschedule` — nur über `set_irq_hook` mit gültigem Funktionszeiger gesetzt.
-    let hook: IrqHook = unsafe { core::mem::transmute(h) };
-    hook(intid)
 }
 
 fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
-    let h = RESCHED_HOOK.load(Ordering::Acquire);
-    if h == 0 {
-        return frame;
+    match RESCHED_HOOK.load() {
+        Some(hook) => hook(frame),
+        None => frame,
     }
-    // SAFETY: `h` wurde ausschließlich über `set_reschedule_hook` mit einem
-    // gültigen Funktionszeiger genau dieses Typs gesetzt. Funktionszeiger und
-    // `usize` sind auf aarch64 größengleich. (Trap-Dispatch-Plumbing, erlaubte
-    // Low-Level-Domäne.)
-    let hook: RescheduleHook = unsafe { core::mem::transmute(h) };
-    hook(frame)
 }
 
-/// Optionaler Syscall-Hook (vom IPC-System registriert). Wie der Reschedule-Hook
-/// als `usize` gespeichert; `0` = nicht gesetzt.
-static SYSCALL_HOOK: AtomicUsize = AtomicUsize::new(0);
+/// Optionaler Syscall-Hook (vom IPC-System registriert).
+static SYSCALL_HOOK: AtomicHook<SyscallHook> = AtomicHook::new();
 
 /// Signatur des Syscall-Hooks (Argumente/Rückgabe im TrapFrame).
 pub type SyscallHook = fn(*mut TrapFrame) -> *mut TrapFrame;
 
 /// Syscall-Hook registrieren (vor dem Aktivieren von IRQs/Threads aufzurufen).
 pub fn set_syscall_hook(hook: SyscallHook) {
-    SYSCALL_HOOK.store(hook as usize, Ordering::Release);
+    SYSCALL_HOOK.store(hook);
 }
 
 fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
-    let h = SYSCALL_HOOK.load(Ordering::Acquire);
-    if h == 0 {
-        return frame;
+    match SYSCALL_HOOK.load() {
+        Some(hook) => hook(frame),
+        None => frame,
     }
-    // SAFETY: wie `reschedule` — nur über `set_syscall_hook` gesetzt.
-    let hook: SyscallHook = unsafe { core::mem::transmute(h) };
-    hook(frame)
 }
 
 /// Optionaler Fault-Hook für **synchrone Faults aus EL0** (User-Thread greift auf
 /// Kernel-Speicher zu, führt eine privilegierte Instruktion aus o. Ä.). Statt den
 /// Kernel anzuhalten, beendet der Hook den fehlerhaften User-Thread und liefert
-/// den nächsten lauffähigen Frame zurück. `0` = nicht gesetzt.
-static FAULT_HOOK: AtomicUsize = AtomicUsize::new(0);
+/// den nächsten lauffähigen Frame zurück.
+static FAULT_HOOK: AtomicHook<FaultHook> = AtomicHook::new();
 
 /// Signatur des EL0-Fault-Hooks: aktueller (fehlerhafter) Frame + `ESR`/`FAR` zur
 /// Diagnose; liefert den wiederherzustellenden Frame des nächsten Threads.
@@ -218,13 +250,12 @@ pub type FaultHook = fn(*mut TrapFrame, u64, u64) -> *mut TrapFrame;
 
 /// EL0-Fault-Hook registrieren (vor dem Aktivieren von IRQs/Threads aufzurufen).
 pub fn set_fault_hook(hook: FaultHook) {
-    FAULT_HOOK.store(hook as usize, Ordering::Release);
+    FAULT_HOOK.store(hook);
 }
 
 /// Optionaler FP-Trap-Hook (vom Lazy-FP-Subsystem registriert). Behandelt einen
-/// FP/SIMD-Zugriffstrap (EC 0x07) aus EL0: Owner-Wechsel der FP-Register. `0` =
-/// nicht gesetzt.
-static FP_HOOK: AtomicUsize = AtomicUsize::new(0);
+/// FP/SIMD-Zugriffstrap (EC 0x07) aus EL0: Owner-Wechsel der FP-Register.
+static FP_HOOK: AtomicHook<FpHook> = AtomicHook::new();
 
 /// Signatur des FP-Trap-Hooks: aktueller Frame -> wiederherzustellender Frame
 /// (i. d. R. derselbe; der `eret` wiederholt die getrappte Instruktion).
@@ -232,18 +263,15 @@ pub type FpHook = fn(*mut TrapFrame) -> *mut TrapFrame;
 
 /// FP-Trap-Hook registrieren (vor dem Aktivieren von IRQs/Threads aufzurufen).
 pub fn set_fp_hook(hook: FpHook) {
-    FP_HOOK.store(hook as usize, Ordering::Release);
+    FP_HOOK.store(hook);
 }
 
 fn fp_trap(frame: *mut TrapFrame) -> *mut TrapFrame {
-    let h = FP_HOOK.load(Ordering::Acquire);
-    if h == 0 {
+    match FP_HOOK.load() {
+        Some(hook) => hook(frame),
         // Kein Lazy-FP-Subsystem: FP-Trap ist hier unerwartet -> als Fault behandeln.
-        return frame;
+        None => frame,
     }
-    // SAFETY: nur über `set_fp_hook` mit einem gültigen Zeiger dieses Typs gesetzt.
-    let hook: FpHook = unsafe { core::mem::transmute(h) };
-    hook(frame)
 }
 
 /// Register `xidx` eines (gesicherten) TrapFrames lesen. Für den
@@ -355,11 +383,7 @@ pub extern "C" fn handle_exception(frame: *mut TrapFrame, kind: u64) -> *mut Tra
     // beendet den fehlerhaften Thread und liefert den nächsten lauffähigen Frame.
     // So kann ein User-Thread den Kernel nicht zum Absturz bringen.
     if frame_from_el0(frame as usize) {
-        let h = FAULT_HOOK.load(Ordering::Acquire);
-        if h != 0 {
-            // SAFETY: nur über `set_fault_hook` mit einem gültigen Zeiger dieses
-            // Typs gesetzt (wie die übrigen Trap-Hooks).
-            let hook: FaultHook = unsafe { core::mem::transmute(h) };
+        if let Some(hook) = FAULT_HOOK.load() {
             return hook(frame, esr, far);
         }
     }

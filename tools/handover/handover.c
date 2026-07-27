@@ -60,6 +60,12 @@ static struct page *low_page;
 static struct page *park_pages[8];	/* je uebernommenem Kern eine */
 static struct page *pt_pages[6];	/* PML4 + PDPT + 4 PDs */
 static int narmed;			/* wie viele Kerne uebernommen wurden */
+/*
+ * Welche Kerne **dieser Lauf** offline genommen hat. Nur die duerfen beim Entladen zurueck:
+ * einen Kern wieder online zu nehmen, den jemand anders (oder ein frueherer Lauf) geparkt hat,
+ * waere das Zurueckgeben einer Ressource, die uns nie gehoert hat.
+ */
+static bool we_offlined[8];
 
 /*
  * Identitaetsabbildung der ersten 4 GiB mit 2-MiB-Seiten.
@@ -181,16 +187,30 @@ static int __init handover_init(void)
 {
 	int i, rc;
 
-	pr_info("sel4lake: Stufe %s, Zielkerne:", arm ? "1a (arm=1)" : "0");
+	pr_info("sel4lake: Stufe %s, Zielkerne:", arm ? "1b (arm=1, Uebernahme)" : "0 (nur offline)");
 	for (i = 0; i < ncpus; i++)
 		report_cpu(cpus[i]);
 
 	for (i = 0; i < ncpus; i++) {
+		/*
+		 * Ein bereits offline stehender Kern ist **kein Fehler**, sondern der Normalfall
+		 * beim zweiten Anlauf: entweder hat ein frueherer Lauf ihn geparkt, oder jemand
+		 * hat ihn von Hand offline genommen. `remove_cpu` meldet das mit `1` — ein
+		 * positiver Wert, der weder Erfolg noch ein gueltiger `errno` ist. Ihn
+		 * durchzureichen erzeugte die Kernel-Ruege "init suspiciously returned 1".
+		 */
+		if (!cpu_online(cpus[i])) {
+			pr_info("sel4lake: CPU %d war bereits offline — uebersprungen\n",
+				cpus[i]);
+			continue;
+		}
 		rc = remove_cpu(cpus[i]);
 		if (rc) {
 			pr_err("sel4lake: CPU %d offline fehlgeschlagen (%d)\n", cpus[i], rc);
+			rc = (rc > 0) ? -EBUSY : rc;
 			goto undo;
 		}
+		we_offlined[i] = true;	/* nur diese duerfen wir zurueckgeben */
 		pr_info("sel4lake: CPU %d offline\n", cpus[i]);
 	}
 
@@ -301,7 +321,8 @@ static int __init handover_init(void)
 
 undo:
 	while (--i >= 0)
-		add_cpu(cpus[i]);
+		if (we_offlined[i])
+			add_cpu(cpus[i]);
 	return rc;
 }
 
@@ -319,7 +340,7 @@ static void __exit handover_exit(void)
 	 * Faelle, fuer die ihre Begruendung gar nicht gilt. Stufe 1a nimmt genau einen Kern.
 	 */
 	for (i = ncpus - 1; i >= narmed; i--) {
-		if (!add_cpu(cpus[i]))
+		if (we_offlined[i] && !add_cpu(cpus[i]))
 			pr_info("sel4lake: CPU %d wieder online\n", cpus[i]);
 	}
 	if (narmed) {

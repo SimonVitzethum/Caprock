@@ -259,6 +259,121 @@ pub fn write_command(rid: u32, cmd: u16) {
     write_cmd(bus, dev, func, cmd);
 }
 
+/// Die **PCI-Topologie** in `out` einlesen (Schritt 2 der VT-d-Zuteilung).
+///
+/// Liefert reine Daten (`dmar::DevNode`), damit die Gruppenbildung gegen eine eingespeiste
+/// Topologie geprüft werden kann. Erfasst wird, was für Isolation und Aliasing zählt: ist der
+/// Knoten eine Bridge (und welchen Bus überspannt sie), ist er PCIe oder konventionell, trägt er
+/// ACS mit den vier relevanten Fähigkeiten, ist er mehrfunktional — und wer sein Elternteil ist.
+pub fn read_topology(out: &mut [super::dmar::DevNode]) -> usize {
+    let mut n = 0;
+    // Erst alle Knoten sammeln, dann die Elternbeziehung über die Busbereiche der Bridges.
+    for bus in 0..=255u16 {
+        for dev in 0..32u8 {
+            for func in 0..8u8 {
+                if n >= out.len() {
+                    return n;
+                }
+                let b = bus as u8;
+                let vendor = cfg_read16(b, dev, func, CFG_VENDOR);
+                if vendor == 0xFFFF {
+                    if func == 0 {
+                        break; // Funktion 0 fehlt -> das Gerät gibt es nicht
+                    }
+                    continue;
+                }
+                let hdr = cfg_read8(b, dev, func, 0x0E);
+                let bridge = hdr & 0x7f == 1;
+                let node = super::dmar::DevNode {
+                    segment: 0, // ECAM-Segment 0 (s. `nonzero_segment` in der DMAR-Auswertung)
+                    bus: b,
+                    dev,
+                    func,
+                    bridge,
+                    sec_bus: if bridge { cfg_read8(b, dev, func, 0x19) } else { 0 },
+                    sub_bus: if bridge { cfg_read8(b, dev, func, 0x1A) } else { 0 },
+                    pcie: has_cap(b, dev, func, 0x10),
+                    acs: acs_enabled(b, dev, func),
+                    multifunction: hdr & 0x80 != 0,
+                    parent: usize::MAX,
+                };
+                out[n] = node;
+                n += 1;
+                if func == 0 && hdr & 0x80 == 0 {
+                    break; // kein Multifunktionsgerät
+                }
+            }
+        }
+    }
+    // Elternbeziehung: die Bridge, deren [sec_bus, sub_bus] den Bus des Knotens enthält und
+    // dabei den engsten Bereich hat (verschachtelte Bridges).
+    for i in 0..n {
+        let mut best = usize::MAX;
+        let mut best_span = u16::MAX;
+        for j in 0..n {
+            if i == j || !out[j].bridge {
+                continue;
+            }
+            if out[i].bus >= out[j].sec_bus && out[i].bus <= out[j].sub_bus {
+                let span = out[j].sub_bus as u16 - out[j].sec_bus as u16;
+                if span < best_span {
+                    best_span = span;
+                    best = j;
+                }
+            }
+        }
+        out[i].parent = best;
+    }
+    n
+}
+
+/// Trägt das Gerät die Capability `id` in der Standard-Capability-Liste?
+fn has_cap(bus: u8, dev: u8, func: u8, id: u8) -> bool {
+    if cfg_read16(bus, dev, func, 0x06) & (1 << 4) == 0 {
+        return false; // keine Capability-Liste
+    }
+    let mut off = cfg_read8(bus, dev, func, 0x34) & 0xfc;
+    for _ in 0..48 {
+        if off < 0x40 {
+            return false;
+        }
+        let cap = cfg_read8(bus, dev, func, off as u16);
+        if cap == id {
+            return true;
+        }
+        off = cfg_read8(bus, dev, func, off as u16 + 1) & 0xfc;
+    }
+    false
+}
+
+/// **ACS** mit den vier für die Isolationsgranularität relevanten Fähigkeiten aktiv?
+///
+/// Source Validation, Translation Blocking, P2P Request Redirect und Upstream Forwarding. Fehlt
+/// eine davon, können Geräte unterhalb dieser Bridge an der IOMMU vorbei miteinander reden — die
+/// Gruppe erstreckt sich dann über die Bridge hinaus. Geprüft wird das **Control**-Register:
+/// vorhanden, aber abgeschaltet ist dasselbe wie nicht vorhanden.
+fn acs_enabled(bus: u8, dev: u8, func: u8) -> bool {
+    const ACS_EXT_CAP_ID: u16 = 0x000D;
+    const NEEDED: u16 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4); // SV, TB, RR, UF
+    let mut off: u16 = 0x100;
+    for _ in 0..48 {
+        let hdr = cfg_read32(bus, dev, func, off);
+        if hdr == 0 || hdr == 0xFFFF_FFFF {
+            return false;
+        }
+        if (hdr & 0xffff) as u16 == ACS_EXT_CAP_ID {
+            let ctrl = cfg_read16(bus, dev, func, off + 6);
+            return ctrl & NEEDED == NEEDED;
+        }
+        let next = ((hdr >> 20) & 0xfff) as u16;
+        if next < 0x100 {
+            return false;
+        }
+        off = next;
+    }
+    false
+}
+
 /// Bus-Master aktivieren (nach dem Installieren einer Übersetzung).
 pub fn arm_bus_master(rid: u32) {
     let (bus, dev, func) = rid_parts(rid);

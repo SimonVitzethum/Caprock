@@ -463,6 +463,17 @@ pub fn run(multiboot_info: u64) -> ! {
                 if c.usable() { "ALL PASS" } else { "FAILURES" }
             );
         }
+        // Schritt 2: DMAR-Auswertung + Gruppenbildung. Der Selbsttest laeuft gegen eine
+        // EINGESPEISTE Tabelle/Topologie -- auf dem realen Aufbau (flach, keine RMRR) wuerden
+        // Ausschlusspfad und Gruppenfaelle nie ausgefuehrt.
+        let st = super::dmar_selftest::run();
+        println!(
+            "vtdgrp  : Selbsttest: parse={} Catch-all-zuletzt={} Bridge-Scope-Subhierarchie={} Gruppen={} Alias-Mengen={} RMRR-ausgeschlossen={} Firmware-Muell-abgefangen={} Oracle={}",
+            st.parse_ok, st.catch_all_last, st.bridge_scope_subtree, st.groups_ok,
+            st.alias_ok, st.rmrr_excluded, st.malformed_caught, st.audit
+        );
+        super::dmar_selftest::report_real();
+        println!("vtdgrp  : {}", if st.ok() { "ALL PASS" } else { "FAILURES" });
         let inv = hal::vtd::invalidate_context_cache();
         println!(
             "iommu   : Uebersetzung aktiv={} (GSTS.TES), Kontext-Cache-Invalidierung quittiert={inv}, dma_audit={}",

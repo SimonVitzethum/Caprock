@@ -16,6 +16,7 @@ use core::arch::{asm, global_asm};
 // (`sel4lake-hal::x86_64`) — dort stehen sie hinter derselben API wie ihre ARM-Pendants,
 // sodass der Kernel-Kern sie ohne `cfg` benutzt. Hier bleibt nur das Boot-Trampolin.
 mod bringup;
+mod dmar_selftest;
 
 global_asm!(
     r#"

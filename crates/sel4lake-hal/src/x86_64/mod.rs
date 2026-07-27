@@ -12,6 +12,7 @@ pub const MAX_CPUS: usize = 256;
 
 pub mod acpi;
 pub mod console;
+pub mod dmar;
 pub mod cpu;
 pub mod exception;
 pub mod fp;

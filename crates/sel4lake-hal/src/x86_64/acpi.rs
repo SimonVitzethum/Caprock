@@ -166,6 +166,16 @@ pub fn cpus() -> Option<Cpus> {
     Some(out)
 }
 
+/// Die vollständige **DMAR**-Tabelle (Header + Strukturen), validiert (Länge + Prüfsumme).
+///
+/// Die Auswertung liegt bewusst nicht hier, sondern in [`super::dmar`] als reine Funktion über
+/// einen Byte-Slice — damit sie gegen eine **eingespeiste** Tabelle prüfbar ist. Auf dem
+/// Standardaufbau kommen weder RMRR noch eine interessante Topologie vor; ein Test gegen die
+/// reale Tabelle wäre ein Oracle, das gilt, weil sein Antezedens falsch ist.
+pub fn dmar_table() -> Option<&'static [u8]> {
+    find_table(b"DMAR")
+}
+
 /// Registerbasis der ersten **DMA-Remapping-Einheit** aus der ACPI-**DMAR** (VT-d).
 ///
 /// Aufbau: Header(36) + HostAddressWidth(1) + Flags(1) + reserviert(10), dann Remapping-

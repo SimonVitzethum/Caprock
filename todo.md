@@ -240,7 +240,22 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
          * **`SC = false`** — keine Snoop Control, No-Snoop ist nicht überstimmbar. „x86 ist
            kohärent" gilt damit nur, solange kein Gerät No-Snoop benutzt. Gehört als Bedingung
            an `dma_granule() == 1`, nicht als Konstante.
-      2. [ ] DMAR/DRHD inkl. Device-Scope, **Gruppenbildung aus ACS**, RMRR-Ausschlüsse. Ausgabe:
+      2. [x] DMAR/DRHD inkl. Device-Scope, **Gruppenbildung aus ACS**, RMRR-Ausschlüsse.
+         Umgesetzt als **reine Funktion über eingespeiste Daten** (`hal::dmar`, `forbid(unsafe)`):
+         `parse` nimmt einen Byte-Slice, `build_groups` eine Topologiebeschreibung. Der reale Pfad
+         füllt beides aus ACPI/PCI-Enumeration, der Selbsttest aus Literalen — auf dem
+         Standardaufbau (flach, keine RMRR) liefen Ausschlusspfad und Gruppenfälle sonst **nie**.
+         Sensitivität belegt: „Catch-all in derselben Schleife" macht `catch_all_last` **und**
+         `bridge_scope_subtree` rot, „Typ 2 wie Typ 1" nur letzteres — beide Male genau die
+         Zusicherung, die die Mutation verletzt.
+         Reale Messung (QEMU q35): 7 Geräte, 1 Einheit, **5 Gruppen**, 0 Ausschlüsse, keine ATSR,
+         Segment durchweg 0, Oracle 0.
+         Offen aus diesem Schritt: mehrere DRHD-Einheiten sind **geparst**, aber `VtdCaps` ist
+         noch eine Einheit — das Minimum über alle Einheiten, die eine zuteilbare Gruppe scopen,
+         und die Aggregation von Fault-/Config-Zählern über alle Einheiten stehen aus (bis dahin
+         wäre das Oracle für alles blind, was nicht an Einheit 0 hängt). Eine Gruppe, die über
+         Einheiten streut, wird bereits **vollständig** ausgeschlossen (`GroupSpansUnits`).
+         Alt: Ausgabe:
          Liste zuteilbarer **Gruppen** (nicht Geräte — ohne ACS auf allen Upstream-Bridges ist
          die Isolationsgranularität die Gruppe: Peer-to-Peer hinter einem Switch umgeht die
          IOMMU, Multifunktionsgeräte ohne ACS teilen die RID-Sicht). Die Benennung `dma_group`

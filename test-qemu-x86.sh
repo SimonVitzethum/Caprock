@@ -16,7 +16,7 @@ LOG="$(mktemp)"
 echo "== boot ($SECONDS_RUN s) =="
 timeout "$SECONDS_RUN" qemu-system-x86_64 \
     -kernel "$ELF" -m 512M -smp 4 \
-    -machine q35,kernel-irqchip=split -device intel-iommu \
+    -machine q35,kernel-irqchip=split -device intel-iommu,caching-mode=on \
     -device virtio-rng-pci \
     -nographic -serial file:"$LOG" -no-reboot -no-shutdown \
     </dev/null >/dev/null 2>&1 || true
@@ -42,6 +42,7 @@ check "ipc     : ALL PASS"            "Stufe 4: cap-gesicherte IPC (CALL/RECV/RE
 check "ring3   : ALL PASS"            "Stufe 4c: Ring-3-Threads (Syscall aus Ring 3; Zugriff auf Kernel-Speicher faultet -> Thread beendet, Kernel laeuft weiter)"
 check "pci     : ALL PASS"            "PCI-Enumeration ueber das ECAM-Fenster aus der ACPI-MCFG (virtio-rng gefunden, Bus-Master an)"
 check "vtdcaps : ALL PASS" "VT-d-Faehigkeiten (Schritt 1): SAGAW/MGAW/ND/CM/RWBF/ECAP.C/QI/IR/SC/ScalableMode einmal gelesen und protokolliert; jede spaetere Bit-Entscheidung leitet sich daraus ab"
+check "vtdgrp  : ALL PASS" "DMAR-Auswertung + Gruppenbildung (Schritt 2) gegen eine EINGESPEISTE Tabelle/Topologie: Catch-all zuletzt, Scope-Typ 2 als Subhierarchie, ACS-Gruppen, RID-Alias-Mengen, RMRR-Ausschluss, Firmware-Muell abgefangen, Vollstaendigkeits-Oracle"
 check "iommu   : ALL PASS"            "IOMMU (VT-d): Bring-up aus der ACPI-DMAR, Root-Tabelle mit Default-Block, Uebersetzung aktiv, Invalidierung quittiert"
 check "iso     : ALL PASS"            "Stufe 5: per-Prozess-Adressraeume (isolierte PD sieht fremdes RAM NICHT, SAS-PD schon)"
 check "audit   : ALL PASS"            "Stufe 4: Scheduler- + CDT-Audit sauber"

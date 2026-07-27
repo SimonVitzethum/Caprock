@@ -276,6 +276,21 @@ statt mit der IOVA und blieb für den Compiler unsichtbar; gefunden hat ihn erst
 Auseinanderlaufen der Werte. Die Restprüfung ist deshalb ein `grep` nach `raw()` im DMA-Pfad
 (16 Stellen, jede einzeln begründet).
 
+### 2e. Warum RMRR-Geräte abgewiesen werden (x86)
+
+Eine RMRR verlangt, dass die genannte Region für das betroffene Gerät **identitätsgemappt** ist.
+Identität heißt IOVA = PA — also die Aufhebung genau der Eigenschaft, die §2c herstellt, und zwar
+**innerhalb** desselben Übersetzungskontexts, in dem sonst das Fenster oberhalb `RAM_TOP` gilt.
+Ein solcher Kontext trüge zwei Achsenregime nebeneinander, und jede Bounds-Prüfung müsste beide
+kennen.
+
+**Invariante:** Ein Gerät im Scope einer RMRR ist **nicht zuteilbar** (`Exclusion::Rmrr`), und die
+Ausschlussliste wird protokolliert. Die Begründung ist damit strukturell, nicht bloß konservativ:
+die Alternative wäre kein „Gerät mit einer kleinen Lücke", sondern ein Kontexttyp, der die
+Kernaussage des Kapitels nicht trägt. Diese Begründung hält auch dann noch, wenn jemand später
+eine Quirk-Liste hübsch findet. Die Regionsadressen liest der Kernel deshalb gar nicht — nur den
+Device-Scope, denn er filtert, er mappt nicht.
+
 ### 2d. Teardown-Token: aus einer bewiesenen wird eine erzwungene Reihenfolge (ext-37)
 
 Bis ext-37 gab `CapSpace::delete_leaf` eine `ObjectKind::Dma`-Region direkt über

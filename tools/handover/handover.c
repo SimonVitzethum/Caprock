@@ -154,20 +154,31 @@ static void build_gdt(void *page, phys_addr_t pa)
  * ein 4-KiB-Stapelrahmen im Kernel ist eine schlechte Idee (der Compiler warnt zu Recht).
  * Der Bereich wird nach `init` ohnehin freigegeben.
  */
-static struct page *low_pool[512] __initdata;
+/*
+ * ZONE_DMA umfasst 16 MiB = 4096 Seiten; davon liegen ~158 unter 1 MiB. Ein Suchlauf mit 512
+ * Versuchen greift also im Regelfall zu hoch — er muss die Zone so weit leerraeumen, dass der
+ * Allokator die tiefen Seiten herausgeben MUSS. Deshalb Platz fuer die ganze Zone. Die Seiten
+ * werden unmittelbar danach alle bis auf eine zurueckgegeben.
+ */
+static struct page *low_pool[4096] __initdata;
 
 static struct page *__init alloc_low_page(void)
 {
 	struct page *keep = NULL;
 	struct page **pool = low_pool;
+	phys_addr_t lowest = ~(phys_addr_t)0;
 	int n = 0, i;
 
 	for (i = 0; i < ARRAY_SIZE(low_pool); i++) {
-		struct page *p = alloc_pages(GFP_KERNEL | GFP_DMA, 0);
+		struct page *p = alloc_pages(GFP_KERNEL | GFP_DMA | __GFP_NOWARN, 0);
+		phys_addr_t pa;
 
 		if (!p)
-			break;
-		if (page_to_phys(p) < 0x100000 && (page_to_phys(p) & 0xfff) == 0) {
+			break;	/* Zone erschoepft — tiefer geht es nicht */
+		pa = page_to_phys(p);
+		if (pa < lowest)
+			lowest = pa;
+		if (pa < 0x100000) {
 			keep = p;
 			break;
 		}
@@ -175,6 +186,9 @@ static struct page *__init alloc_low_page(void)
 	}
 	while (n--)
 		__free_pages(pool[n], 0);
+	if (!keep)
+		pr_err("sel4lake: %d Seiten aus ZONE_DMA geprueft, tiefste war %pa — keine unter 1 MiB frei\n",
+		       i, &lowest);
 	return keep;
 }
 

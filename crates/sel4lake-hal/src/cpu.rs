@@ -111,6 +111,88 @@ pub fn sync_code_range(base: usize, len: usize) {
     }
 }
 
+// --- Spekulations-Härtung (Spectre-Klasse) ---------------------------------------------
+//
+// Der Kernel prüft an der EL0-Grenze Indizes (Cap-Slot, Endpoint-/Notification-Id) gegen
+// Tabellengrenzen. Ein `if idx < N { tab[idx] }` schützt nur den ARCHITEKTONISCHEN Pfad:
+// die Verzweigungsvorhersage kann den Rumpf spekulativ mit einem out-of-bounds `idx`
+// ausführen und so einen von EL0 wählbaren Kernel-Offset in den Cache ziehen (Spectre-v1).
+// [`array_index_nospec`] macht den Index zusätzlich DATENABHÄNGIG null, sobald er außerhalb
+// liegt — das überlebt auch eine falsch vorhergesagte Verzweigung.
+//
+// NICHT abgedeckt (bewusst, s. `docs/invariants.md`): Cache-/Timing-Seitenkanäle zwischen PDs
+// (keine Cache-Partitionierung), und Spectre-v2/BHB auf HW ohne FEAT_CSV2 (dort hilft nur
+// Predictor-Invalidierung per Firmware-Call, den QEMU `virt` nicht anbietet). [`csv2`]/[`csv3`]
+// melden, was die HW von sich aus garantiert.
+
+/// **CSDB** — Consumption of Speculative Data Barrier (`HINT #20`, auf jeder ARMv8-HW als
+/// Hint kodiert, auf älterer HW ein NOP). Verhindert, dass eine spekulativ erzeugte
+/// Bedingungsmaske vor ihrer Auflösung weiterverwendet wird.
+pub fn csdb() {
+    // SAFETY: reine Hint-/Barriere-Instruktion ohne Speichereffekt.
+    unsafe { asm!("hint #20", options(nomem, nostack, preserves_flags)) }
+}
+
+/// **Spekulationssicherer Array-Index:** liefert `index`, wenn `index < len`, sonst `0` —
+/// und zwar **datenabhängig** (arithmetische Maske + [`csdb`]), nicht per Verzweigung. Der
+/// Aufrufer muss die Grenze weiterhin architektonisch prüfen; dies härtet nur den
+/// spekulativen Pfad (Linux' `array_index_nospec`).
+#[inline(always)]
+pub fn array_index_nospec(index: usize, len: usize) -> usize {
+    // index < len  ->  (index - len) hat gesetztes Vorzeichenbit  ->  Maske = !0
+    // index >= len ->  Vorzeichenbit 0                            ->  Maske = 0
+    let mask = (((index as u64).wrapping_sub(len as u64) as i64) >> 63) as u64;
+    csdb();
+    index & (mask as usize)
+}
+
+/// **Spekulationsbarriere** an einer Vertrauensgrenze (VSpace-Wechsel): `SB` (FEAT_SB,
+/// ARMv8.5), sonst der portable Ersatz `dsb sy; isb`. Nach der Barriere hängt keine
+/// Spekulation mehr am Zustand von vor dem Wechsel.
+pub fn speculation_barrier() {
+    if sb_supported() {
+        // SAFETY: `SB` (0xd50330ff) ist eine reine Barriere; nur ausgeführt, wenn
+        // ID_AA64ISAR1_EL1.SB sie meldet. Als `.inst` kodiert, damit das Target-Feature
+        // (armv8-a) den Assembler nicht ablehnt.
+        unsafe { asm!(".inst 0xd50330ff", options(nomem, nostack, preserves_flags)) }
+    } else {
+        dsb_sy();
+        isb();
+    }
+}
+
+/// `ID_AA64ISAR1_EL1.SB` (Bits [39:36]) != 0 -> FEAT_SB (Instruktion `SB`) vorhanden.
+pub fn sb_supported() -> bool {
+    let v: u64;
+    // SAFETY: read-only ID-Register.
+    unsafe {
+        asm!("mrs {}, ID_AA64ISAR1_EL1", out(reg) v, options(nomem, nostack, preserves_flags));
+    }
+    (v >> 36) & 0xf != 0
+}
+
+/// `ID_AA64PFR0_EL1.CSV2` (Bits [59:56]): >=1 -> die HW garantiert, dass Branch-Predictor-
+/// Einträge nicht über Kontexte hinweg ausgenutzt werden können (Spectre-v2-immun).
+pub fn csv2() -> u8 {
+    let v: u64;
+    // SAFETY: read-only ID-Register.
+    unsafe {
+        asm!("mrs {}, ID_AA64PFR0_EL1", out(reg) v, options(nomem, nostack, preserves_flags));
+    }
+    ((v >> 56) & 0xf) as u8
+}
+
+/// `ID_AA64PFR0_EL1.CSV3` (Bits [63:60]): >=1 -> die HW garantiert, dass Daten aus nicht
+/// zugänglichem Speicher keinen spekulativen Seitenkanal erzeugen (Meltdown-immun).
+pub fn csv3() -> u8 {
+    let v: u64;
+    // SAFETY: read-only ID-Register.
+    unsafe {
+        asm!("mrs {}, ID_AA64PFR0_EL1", out(reg) v, options(nomem, nostack, preserves_flags));
+    }
+    ((v >> 60) & 0xf) as u8
+}
+
 /// Auf ein Ereignis warten (Low-Power).
 pub fn wfi() {
     // SAFETY: Hint-Instruktion ohne Speichereffekt.

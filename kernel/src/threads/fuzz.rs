@@ -865,7 +865,7 @@ extern "C" fn fuzz_driver(_arg: usize) -> ! {
     // (Worker warten auf GO -> fester Footprint). Dann GO, Treiber-Churn auf core 0,
     // STOP, auf Quiesce aller Worker warten, Baseline-Check (alle Churn balanciert).
     let mut smp_workers = 0u32;
-    for c in 1..NUM_CORES {
+    for c in 1..system::num_cores() {
         if system::spawn_on_core(c, fuzz_noise as *const () as usize, 0, 5).is_some() {
             smp_workers += 1;
         }
@@ -1066,7 +1066,7 @@ extern "C" fn ipcf_signaller(_arg: usize) -> ! {
 /// Snapshot für das Teardown-Oracle: alle Kerne summiert (Aktoren liegen auf 1..7).
 fn ipcf_snapshot() -> (u64, usize, usize, usize, usize, usize) {
     let mut tcbs = 0;
-    for c in 0..NUM_CORES {
+    for c in 0..system::num_cores() {
         tcbs += system::used_tcbs(c);
     }
     (
@@ -1197,7 +1197,9 @@ extern "C" fn ipcfuzz_controller(_arg: usize) -> ! {
                     let i = 2 + (frand(&mut s) % (IPCF_N as u64 - 3)) as usize;
                     let tid = ThreadId::from_raw(act[i].tid_raw);
                     let sc = if frand(&mut s) % 4 == 0 { sc_tiny } else { sc_full };
-                    system::bind_sched_context(sc, tid.core(), tid);
+                    if let Some(c) = system::owner_core_of(tid) {
+                        system::bind_sched_context(sc, c, tid);
+                    }
                 }
                 5 | 6 => {
                     // Balancierte Cap-Churn auf einer Kopie eines aktiv genutzten
@@ -1227,7 +1229,7 @@ extern "C" fn ipcfuzz_controller(_arg: usize) -> ! {
         for _ in 0..IPCF_DELAY {
             core::hint::spin_loop();
         }
-        for c in 0..NUM_CORES {
+        for c in 0..system::num_cores() {
             system::reap_core(c); // Zombies (gekillte Aktoren) aller Kerne einsammeln
         }
         // Oracle: strukturelle IPC-/Scheduler-Invarianten prüfen.
@@ -1249,7 +1251,7 @@ extern "C" fn ipcfuzz_controller(_arg: usize) -> ! {
         let mut tries = 0;
         while system::thread_alive(tid) && tries < 4000 {
             system::kill_remote(tid); // blockierte (nicht laufende) Aktoren töten
-            for c in 0..NUM_CORES {
+            for c in 0..system::num_cores() {
                 system::reap_core(c);
             }
             for _ in 0..1500 {
@@ -1262,7 +1264,7 @@ extern "C" fn ipcfuzz_controller(_arg: usize) -> ! {
     let mut spins = 0u32;
     loop {
         let mut z = 0;
-        for c in 0..NUM_CORES {
+        for c in 0..system::num_cores() {
             z += system::reap_core(c);
         }
         if (ipcf_snapshot() == base && z == 0) || spins >= 4000 {

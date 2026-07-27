@@ -284,7 +284,10 @@ impl Endpoint {
             frame_set_reg(sframe, reg::EP_BADGE, 0);
             self.caller = Some(caller);
             self.reply_owner = Some(server); // dieser Server schuldet die Antwort
-            return if server.core() == core {
+            // Fastpath nur, wenn der Server **auf diesem Kern** lebt. Seit ext-30 kann er
+            // migriert sein, deshalb den Besitzer im Thread-Directory nachschlagen (lock-frei)
+            // statt ihn aus der ThreadId abzuleiten.
+            return if sel4lake_sched::owner_core(server) == Some(core) {
                 ops.switch_to(core, frame, server) // intra-Kern: direkt zum Server
             } else {
                 ops.unblock(server); // anderer Kern: Server dort wecken (+IPI)

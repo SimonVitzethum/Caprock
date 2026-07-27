@@ -9,6 +9,7 @@ resolver = "2"
 members = [
     "kernel",
     "crates/sel4lake-sync",
+    "crates/sel4lake-slab",
     "crates/sel4lake-abi",
     "crates/sel4lake-hal",
     "crates/sel4lake-mem",

@@ -188,6 +188,7 @@ dependencies = [
  "sel4lake-microkit",
  "sel4lake-region",
  "sel4lake-sched",
+ "sel4lake-slab",
  "sel4lake-sync",
  "sel4lake-trust",
 ]
@@ -226,7 +227,13 @@ name = "sel4lake-sched"
 version = "0.0.1"
 dependencies = [
  "sel4lake-hal",
+ "sel4lake-slab",
+ "sel4lake-sync",
 ]
+
+[[package]]
+name = "sel4lake-slab"
+version = "0.0.1"
 
 [[package]]
 name = "sel4lake-sync"

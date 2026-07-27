@@ -53,12 +53,12 @@ mod trusted_keys;
 #[cfg(target_arch = "aarch64")]
 use sel4lake_hal::{self as hal, println};
 
-// --- aarch64-Kernel-Kern (auf dem x86_64-Branch in Stufe 0 inaktiv; Boot-Entry kommt aus arch). ---
+// --- aarch64-Kernel-Kern (auf dem x86_64-Branch noch inaktiv; Boot-Entry kommt aus arch). ---
 
-/// Zielkonfiguration: ARM, 8 Kerne.
+/// Rückfall-Kernzahl, wenn der Device Tree keine `cpu@`-Knoten meldet.
 #[cfg(target_arch = "aarch64")]
-const NUM_CORES: usize = 8;
-/// Stack-Größe je Sekundärkern (muss zur Reservierung in `linker.ld` passen).
+const FALLBACK_CORES: usize = 8;
+/// Stack-Größe je Sekundärkern (zur Boot-Zeit aus dem RAM belegt).
 #[cfg(target_arch = "aarch64")]
 const SEC_STACK_SIZE: u64 = 0x10000;
 
@@ -80,15 +80,18 @@ static DTB_BYTES: &[u8] = include_bytes!("virt.dtb");
 extern "C" {
     /// Sekundärkern-Einstieg (Assembler, `arch::aarch64::boot`).
     fn _start_secondary();
-    /// Basis der im Linker reservierten Sekundär-Stacks.
-    static __sec_stacks_bottom: u8;
 }
 
-/// Stack-Spitze für Kern `core` (Slot `core` im reservierten Bereich).
+/// Basis der zur Boot-Zeit belegten Sekundär-Stacks (ext-30: nicht mehr im Linker
+/// reserviert — bei bis zu 256 Kernen wären das 16 MiB tote Image-Größe, und die Kernzahl
+/// steht erst zur Laufzeit fest).
+#[cfg(target_arch = "aarch64")]
+static SEC_STACKS_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Stack-Spitze für Kern `core` (Slot `core` im belegten Block).
 #[cfg(target_arch = "aarch64")]
 fn secondary_stack_top(core: usize) -> u64 {
-    let base = core::ptr::addr_of!(__sec_stacks_bottom) as u64;
-    base + (core as u64 + 1) * SEC_STACK_SIZE
+    SEC_STACKS_BASE.load(core::sync::atomic::Ordering::Relaxed) + (core as u64) * SEC_STACK_SIZE
 }
 
 /// Pro-Kern-Interrupt-Init (nach MMU). VBAR wird bereits vor der MMU gesetzt.
@@ -129,6 +132,18 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     println!("core 0  : online (vectors, gic, timer @ {} Hz)", TICK_HZ);
     println!("timer   : CNTFRQ={} Hz, PPI {}", hal::timer::freq(), hal::timer::TIMER_INTID);
 
+    // Spekulations-Eigenschaften der HW melden (ext-29). CSV2/CSV3 sagen, ob die HW von sich
+    // aus gegen Spectre-v2 (Branch-Predictor über Kontexte) bzw. Meltdown immun ist; der Kernel
+    // härtet unabhängig davon seine EL0-Indexpfade (`array_index_nospec`) und setzt beim
+    // VSpace-Wechsel eine Spekulationsbarriere. NICHT abgedeckt bleiben Cache-/Timing-
+    // Seitenkanäle zwischen PDs (keine Cache-Partitionierung) — s. docs/invariants.md.
+    println!(
+        "spec    : CSV2={} CSV3={} FEAT_SB={} · nospec-Indizes an, Barriere beim VSpace-Wechsel",
+        hal::cpu::csv2(),
+        hal::cpu::csv3(),
+        hal::cpu::sb_supported() as u8
+    );
+
     // RAM-Layout aus dem Device Tree lesen (statt fest verdrahtet).
     let (ram_base, ram_size) = sel4lake_dtb::Dtb::parse(DTB_BYTES)
         .and_then(|d| d.memory())
@@ -138,7 +153,14 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         "dtb     : RAM base={ram_base:#x} size={} MiB (aus Device Tree)",
         ram_size >> 20
     );
-    let dtb_ok = ram_base == RAM_BASE && ram_size == 4 * 1024 * 1024 * 1024;
+    // Kernzahl ebenfalls aus dem Device Tree (ext-30) statt fest verdrahtet.
+    let cores = sel4lake_dtb::Dtb::parse(DTB_BYTES)
+        .and_then(|d| d.cpu_count())
+        .filter(|&n| n > 0)
+        .unwrap_or(FALLBACK_CORES)
+        .min(sel4lake_sched::MAX_CORES);
+    println!("dtb     : {cores} CPUs (aus Device Tree; Kernel-Obergrenze {})", sel4lake_sched::MAX_CORES);
+    let dtb_ok = ram_base == RAM_BASE && ram_size == 4 * 1024 * 1024 * 1024 && cores > 0;
     println!("dtb     : {}", if dtb_ok { "ALL PASS" } else { "FAILURES" });
 
     // Phase 2/3: capability-basiertes Speichermodell + Capability-Space.
@@ -155,15 +177,25 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     // Phase 4–6: Scheduler + cap-gesicherte IPC + Protection Domains.
     system::set_hooks(); // Reschedule- + Syscall-Hook registrieren (vor IRQs)
-    system::bind_cores(); // alle per-Kern-Scheduler an ihre Kern-ID binden (vor spawn)
+    // Kerneltabellen zur Boot-Zeit dimensionieren + alle per-Kern-Scheduler binden (vor spawn).
+    let (nc, nthreads, per_core, tbl_bytes) = system::configure(cores);
+    println!(
+        "sched   : {nc} Kerne, {nthreads} Thread-Slots ({per_core} hostbar je Kern), Tabellen {} KiB aus dem RAM",
+        tbl_bytes >> 10
+    );
     system::init_core(); // Boot-Kontext von core 0 wird Idle-Thread
     threads::spawn_demo(); // 2 PDs (Client/Server) + 3 Worker auf core 0
     println!("sched   : Round-Robin + cap-gesicherte IPC (2 PDs + 3 Worker + Idle)");
 
     // Sekundärkerne via PSCI starten.
-    println!("smp     : starte Kerne 1..{} via PSCI CPU_ON (hvc) ...", NUM_CORES - 1);
+    println!("smp     : starte Kerne 1..{} via PSCI CPU_ON (hvc) ...", cores - 1);
+    // Sekundär-Stacks aus dem RAM (ein Block, ein Slot je Kern; Slot 0 bleibt ungenutzt —
+    // der Bootkern hat seinen Stack aus dem Linker-Image).
+    let stacks = system::alloc(cores as u64 * SEC_STACK_SIZE, SEC_STACK_SIZE)
+        .expect("Sekundaer-Stacks: RAM erschoepft");
+    SEC_STACKS_BASE.store(stacks.base(), core::sync::atomic::Ordering::Relaxed);
     let entry = _start_secondary as *const () as u64;
-    for core in 1..NUM_CORES {
+    for core in 1..cores {
         let target = core as u64; // MPIDR Aff0 = Kernindex (QEMU virt, ein Cluster)
         let r = hal::psci::cpu_on(target, entry, secondary_stack_top(core));
         if r != hal::psci::SUCCESS {

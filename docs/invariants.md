@@ -21,6 +21,13 @@ der Azyklizität dieser totalen Ordnung.
 | R3 | `Heap.inner` | `SpinLock<HeapInner>` | prozess-lokaler Allokator (nur Region-Runtime) |
 | R4 | `MEM` | `SpinLock<PhysAllocator>` | physischer Allokator — **innerster** |
 
+**Ergänzung ext-30 (Migration):** eine Migration hält **zwei** `SCHEDS`-Locks gleichzeitig —
+den des abgebenden und den des aufnehmenden Kerns. Innerhalb desselben Rangs R2 gilt dafür die
+Ordnung **aufsteigende Kern-ID**: `SCHEDS[min(src,dst)]` vor `SCHEDS[max(src,dst)]`. Zwei
+gleichzeitig migrierende Kerne können sich damit nicht verklemmen. Neu ist außerdem `GID_FREE`
+(Freiliste der globalen Thread-Slots): ein **Leaf-Lock**, der unter `SCHEDS` genommen wird
+(Spawn) bzw. ganz ohne weiteren Lock (Reap) — nie umgekehrt, und nie zusammen mit `MEM`.
+
 **Regel:** beim Schachteln nur aufsteigend (R0 → … → R4); niemals einen Lock kleineren Rangs
 nehmen, während ein größerer gehalten wird. Faustregel der bestehenden Pfade: *nie zwei grobe Locks
 gleichzeitig halten, wenn ein Kopieren-und-Freigeben es vermeidet.*
@@ -58,7 +65,18 @@ Ticket nie frei → **Deadlock** (andere Kerne, die cross-core auf `SCHEDS[C]` w
 sichern + I-Bit setzen) **vor** dem Ticket-Ziehen und der Guard stellt den vorherigen Zustand beim
 `Drop` wieder her (nesting-sicher: jeder Guard sichert den Stand von vor seinem Lock; der äußerste
 gibt „IRQs an" frei). Damit kann der Reschedule-/IRQ-Hook einen SpinLock-Halter **nie** unterbrechen.
-`RwSpinLock` (`CAPS`) wird **nicht** im IRQ-Pfad genommen und bleibt ohne IRQ-Maske.
+
+**Seit ext-29 gilt dieselbe Invariante für `RwSpinLock` (`CAPS`)** — `read()`/`write()` maskieren
+ebenfalls selbst. Zuvor tat es der Lock nicht, weil er nicht im IRQ-Pfad genommen wird; das war zu
+schwach begründet. Der gefährliche Fall ist nicht der IRQ-Pfad, sondern der **preemptierbare
+EL1-Threadkontext**: Kernel-Threads (Demos, Loader-Setup, Fuzzer-Controller) nehmen `CAPS`, und ein
+Timer-Tick darf sie dabei nicht verdrängen — läuft danach auf demselben Kern ein **Syscall** an (im
+Trap sind IRQs hardwareseitig maskiert), der `CAPS` nimmt, spinnt dieser Kern für immer, weil der
+verdrängte Halter nie wieder eingeplant werden kann. Die Deadlockfreiheit hing damit an der
+**Konvention**, dass jede dieser ~35 Aufrufstellen selbst `local_irq_disable()` klammert (sie tun
+es), statt am **Mechanismus**. Jetzt trägt der Lock sie; die vorhandenen Klammern bleiben gültig
+(Save/Restore ist nesting-sicher) und dokumentieren weiterhin die gewünschte Atomarität ganzer
+Setup-Sequenzen.
 
 *Befund:* dieser Deadlock war **vorbestehend** (seit der SMP-/MCS-Phase) und trat unter QEMU-TCG mit
 ~27 % je Lauf auf (im el0iso-/reclaim-/native-/Fuzzer-Abschnitt, der viel spawnt/faultet/reapt +
@@ -202,3 +220,108 @@ für sie eine zusätzliche Lade-Invariante. Maßgeblich: `kernel::loader::verify
 Eingefrorenes Zertifikatsformat + Sicherheitsanalyse:
 `docs/phase-reports/ext-28-trusted-certificates-report.md`. Schlüssel-Runbook:
 `docs/runbook-trusted-keys.md`.
+
+
+## 10. Härtung ext-29: Cap-Budget, Datenremanenz, Spekulation
+
+Vier Invarianten aus dem Sicherheits-Review (Details + Herleitung:
+`docs/phase-reports/ext-29-hardening.md`).
+
+### 10.1 Kein Cap-Leck beim IPC-Grant (Cross-PD-DoS)
+
+Der globale `CapSpace` ist eine **systemweit geteilte** Tabelle fester Größe — jede unerreichbar
+gewordene Cap darin ist ein permanenter Verlust **für alle PDs**.
+
+- **Invariante.** Ein `REPLY`-Grant, der eine bereits im Empfangs-Slot liegende Cap verdrängt, gibt
+  die verdrängte Cap frei. Nach *n* Grants derselben Quell-Cap in denselben Slot existiert **genau
+  eine** lebende Ableitung. Strukturell: `grant_cap` **meldet** die verdrängte Cap zurück (es löscht
+  sie nicht selbst — die Finalisierung nimmt `MEM` bzw. bricht Calls ab, unter dem dort gehaltenen
+  `CAPS`+`EPS` wäre das sperrordnungswidrig), und `dispatch` löscht sie, **nachdem** beide Locks
+  gefallen sind.
+- **Test.** `grantlk` — 65 Grants in denselben Slot → `child_count(Quell-Cap) == 1`, Cap weiter
+  nutzbar, `cap_audit_cdt() == 0`. Sensitivitätsgeprüft: mit deaktiviertem Fix meldet der Test 65.
+
+### 10.2 Cap-Budget je PD
+
+`NCAPS` begrenzt nur den lokalen Index-Adressraum einer PD, nicht ihren Verbrauch an globalen Slots
+(`NPDS * NCAPS` ≫ Tabellengröße).
+
+- **Invariante.** Keine PD belegt mehr als `CAP_BUDGET_PER_PD` Slots gleichzeitig; Überschreitung
+  wird **abgewiesen** (kein Eintrag, keine Ableitung). Ein **Ersetzen** eines belegten Slots
+  verbraucht nichts und bleibt erlaubt. Erzwungen an **allen** Eintragspfaden: `install_cap_checked`
+  und `grant_cap` (sonst wäre der Grant das Schlupfloch um die Schranke).
+- **Test.** `budget` (Boot-Selbsttest).
+
+### 10.3 Keine Datenremanenz über Subjektgrenzen
+
+- **Invariante.** Jede vom Kernel vergebene RAM-Region ist bei der Vergabe **genullt**. Erzwungen
+  an genau einer Stelle: `system::mem_alloc` (alle Allokationen laufen darüber, nicht über
+  `MEM.lock().alloc`). Genullt wird bei der **Vergabe**, nicht bei der Rückgabe — das deckt auch
+  fabrikfrisches RAM mit Firmware-Resten ab und ist robust gegen Freigabepfade, die eine Region
+  ohne `free` verlieren.
+- **Test.** `zerotest` (Boot-Selbsttest): frische Allokation genullt; Muster schreiben → freigeben →
+  dieselbe Region erneut allozieren → wieder genullt.
+
+### 10.4 Spekulations-Härtung (Spectre-Klasse)
+
+- **Invariante.** Jeder Tabellenindex, den EL0 beeinflusst (Cap-Slot, Endpoint-/Notification-Id),
+  wird nicht nur architektonisch geprüft, sondern zusätzlich **datenabhängig** maskiert
+  (`cpu::array_index_nospec`, Linux-Manier: arithmetische Maske + `CSDB`) — das überlebt auch eine
+  falsch vorhergesagte Verzweigung. Beim VSpace-Wechsel steht eine Spekulationsbarriere (`SB`, sonst
+  `dsb sy; isb`).
+- **Sichtbar beim Boot.** `spec : CSV2=… CSV3=… FEAT_SB=…` meldet, was die HW von sich aus
+  garantiert (CSV2 → Spectre-v2-immun, CSV3 → Meltdown-immun).
+- **NICHT abgedeckt (bewusst, offen).** Cache-/Timing-Seitenkanäle zwischen PDs — dafür bräuchte es
+  Cache-Partitionierung/Coloring (Architekturänderung, kein Patch). Ebenso Spectre-v2 auf HW **ohne**
+  FEAT_CSV2: die Gegenmaßnahme wäre Predictor-Invalidierung per Firmware-Call
+  (SMCCC_ARCH_WORKAROUND_1), den QEMU `virt` nicht anbietet.
+
+
+## 11. Thread-Migration + Boot-Kapazitäten (ext-30)
+
+Details + Herleitung: `docs/phase-reports/ext-30-migration-und-kapazitaet.md`.
+
+### 11.1 Identität ist von der Platzierung getrennt
+
+- **Invariante.** Die `gid` einer [`ThreadId`] ist **lebenslang stabil** und unabhängig vom
+  besitzenden Kern. Alle per-Thread-Kerneltabellen (FP-Kontext, `VSPACE_OF`, Kernel-Stack-Slot)
+  sind über sie indiziert und überleben eine Migration unverändert; eine Tcb-Cap bezeichnet
+  nach der Migration denselben Thread.
+- **Invariante (Directory-Kohärenz).** Für jeden belegten TCB gilt: der Directory-Eintrag
+  seiner `gid` ist `used`, trägt dieselbe Generation und zeigt auf **genau** den Kern und den
+  lokalen Slot, an dem der TCB liegt. Maschinell geprüft: `Scheduler::audit()` Code **8**,
+  aggregiert über alle Kerne in `system::sched_audit_all()`.
+- **Invariante (stale Handles).** Beim Thread-Ende wird der Directory-Eintrag **sofort**
+  ungültig gemacht (`used = 0`, Generation +1); die `gid` kehrt erst beim **Reap** in die
+  Freiliste zurück. Zwischen beiden Zeitpunkten ist sie nicht neu vergebbar — ein altes Handle
+  kann also nie einen *anderen* Thread treffen.
+
+### 11.2 Wettlauf „Besitzer nachschlagen ↔ Migration"
+
+- **Invariante.** Jeder kernübergreifende Zugriff prüft nach dem Sperren **erneut**
+  (`resolve` vergleicht Generation *und* Kern). Ein Fehlschlag mit gewechseltem Besitzer wird
+  mit dem neuen Besitzer wiederholt (`system::with_owner`, begrenzt auf `MIGRATION_RETRIES`);
+  ein Fehlschlag ohne Besitzerwechsel ist ein echter Fehlschlag.
+- **Konsequenz:** aus einer `ThreadId` darf **nie** ein Kern abgeleitet werden (das ging bis
+  ext-29 arithmetisch). Einzige Quelle ist das Directory.
+
+### 11.3 Was nicht migriert werden darf
+
+- Der **laufende** Thread (Zustand im aktiven Trap-Frame), ein Thread mit aktiver
+  **Budget-Donation** (die Links sind lokale Slots → Donation ist intra-core), und der
+  **Idle**-Thread. Strukturell erzwungen in `Scheduler::detach_for_migration`.
+- **Push statt Pull:** die Migration läuft immer auf dem **abgebenden** Kern, weil nur er den
+  Lazy-FP-Kontext des Migranten aus seinen eigenen FP-Registern sichern kann.
+- **Kein Thread-Verlust:** scheitert die Aufnahme (Zielkern voll), wird der Migrant beim
+  Quellkern wieder eingehängt.
+
+### 11.4 Kapazität
+
+- **Invariante.** Kerntabellen werden **einmalig beim Boot** dimensioniert
+  (`system::configure`) und leben bis zum Reboot; es gibt keinen Pfad, der sie freigibt oder
+  ein zweites Mal anhängt. Zugriffe sind bounds-geprüft (`Slab`/`AtomicTable` panieren bei
+  Überschreitung wie ein Array — kein UB).
+- **Invariante.** Die Hosting-Kapazität eines Kerns liegt über seinem Anteil
+  (`MIGRATION_HEADROOM`), sonst könnte kein Kern einen Migranten aufnehmen.
+- **Test.** `scale` — 1024 Threads gleichzeitig, danach vollständige Rückgabe (Slots +
+  Stack-RAM), Scheduler-Audit 0.

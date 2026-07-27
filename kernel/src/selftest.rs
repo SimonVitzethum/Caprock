@@ -18,10 +18,123 @@ fn check(prefix: &str, cond: bool, name: &str, fail: &mut bool) {
     }
 }
 
-/// Beide Selbsttests ausführen (Primärkern, vor SMP-Start).
+/// Alle Selbsttests ausführen (Primärkern, vor SMP-Start).
 pub fn run() {
     memtest();
+    zerotest();
     captest();
+    budgettest();
+}
+
+/// **Datenremanenz-Test** (ext-29): frisch allozierter Speicher ist IMMER genullt.
+///
+/// Der Allokator vergibt Regionen wieder, die zuvor einem anderen Subjekt gehörten. Ohne
+/// Nullung könnte der neue Eigentümer die Restdaten des alten lesen — eine Vertraulichkeits-
+/// lücke über Vertrauensgrenzen hinweg. Der Test beschreibt eine Region mit einem Muster,
+/// gibt sie zurück, alloziert dieselbe Größe erneut und prüft, dass **kein einziges Byte**
+/// des Musters überlebt hat.
+fn zerotest() {
+    let p = "zerotest";
+    let mut fail = false;
+
+    let size = 4 * PAGE;
+    let a = mm::alloc(size, PAGE).expect("alloc a");
+    let base = a.base();
+
+    // Frische Allokation ist bereits genullt (auch fabrikfrisches RAM/Firmware-Reste).
+    check(p, region_is_zero(base, size), "frische Allokation ist genullt", &mut fail);
+
+    // Muster schreiben, Region zurückgeben.
+    fill_region(base, size, 0xA5A5_5A5A_DEAD_BEEF);
+    check(p, !region_is_zero(base, size), "Muster geschrieben (Kontrolle)", &mut fail);
+    mm::free(a);
+
+    // Erneut allozieren: derselbe Bereich, aber keine Restdaten mehr.
+    let b = mm::alloc(size, PAGE).expect("alloc b");
+    check(p, b.base() == base, "Allokator gibt dieselbe Region erneut aus", &mut fail);
+    check(
+        p,
+        region_is_zero(b.base(), b.len()),
+        "wiederverwendete Region ist genullt (keine Datenremanenz)",
+        &mut fail,
+    );
+    mm::free(b);
+
+    println!("zerotest: {}", if fail { "FAILURES" } else { "ALL PASS" });
+}
+
+/// Region wortweise mit `pat` beschreiben (Testmuster).
+fn fill_region(base: u64, len: u64, pat: u64) {
+    let mut off = 0;
+    while off + 8 <= len {
+        // SAFETY: `[base, base+len)` gehört uns exklusiv (eben alloziert), liegt im
+        // identity-gemappten Normal-RAM und ist 8-Byte-ausgerichtet zugreifbar.
+        unsafe { core::ptr::write_volatile((base + off) as *mut u64, pat) };
+        off += 8;
+    }
+}
+
+/// Ist die Region vollständig genullt?
+fn region_is_zero(base: u64, len: u64) -> bool {
+    let mut off = 0;
+    while off + 8 <= len {
+        // SAFETY: wie `fill_region` — exklusiv gehaltene, gemappte Region.
+        if unsafe { core::ptr::read_volatile((base + off) as *const u64) } != 0 {
+            return false;
+        }
+        off += 8;
+    }
+    true
+}
+
+/// **Cap-Budget-Test** (ext-29): eine PD kann die systemweit geteilte Cap-Tabelle nicht
+/// monopolisieren. `install_cap_checked` weist jede Installation über
+/// [`CAP_BUDGET_PER_PD`](sel4lake_microkit::CAP_BUDGET_PER_PD) hinaus ab; ein Überschreiben
+/// eines schon belegten Slots bleibt erlaubt (kein zusätzlicher Verbrauch).
+fn budgettest() {
+    let p = "budget";
+    let mut fail = false;
+    const BUDGET: usize = sel4lake_microkit::CAP_BUDGET_PER_PD;
+
+    let free_before = mm::total_free();
+    let pd = mm::create_pd().expect("budget pd");
+    let root = mm::cap_install(mm::alloc(PAGE, PAGE).expect("budget mem")).expect("budget root");
+
+    // Bis zum Budget füllen: jede Installation muss gelingen.
+    let mut all_ok = true;
+    for slot in 0..BUDGET {
+        let c = mm::cap_copy(root, Rights::RW).expect("budget copy");
+        all_ok &= mm::install_pd_cap(pd, slot, c);
+    }
+    check(p, all_ok, "Installationen bis zum Budget gelingen", &mut fail);
+
+    // Ein weiterer, bisher LEERER Slot muss abgewiesen werden.
+    let over = mm::cap_copy(root, Rights::RW).expect("budget over-copy");
+    check(
+        p,
+        !mm::install_pd_cap(pd, BUDGET, over),
+        "Installation ueber das Budget hinaus wird abgewiesen",
+        &mut fail,
+    );
+
+    // Ein bereits belegter Slot darf weiterhin ERSETZT werden (kein Mehrverbrauch).
+    let repl = mm::cap_copy(root, Rights::RW).expect("budget replace-copy");
+    check(
+        p,
+        mm::install_pd_cap(pd, 0, repl),
+        "Ersetzen eines belegten Slots bleibt erlaubt",
+        &mut fail,
+    );
+
+    // Teardown: PD abbauen, Wurzel löschen -> alles zurück auf die Baseline.
+    mm::destroy_pd(pd);
+    let _ = mm::cap_delete(over);
+    let _ = mm::cap_revoke(root);
+    let _ = mm::cap_delete(root);
+    check(p, mm::cap_audit_cdt() == 0, "CDT konsistent nach Teardown", &mut fail);
+    check(p, mm::total_free() == free_before, "Speicher zurueckgegeben", &mut fail);
+
+    println!("budget  : {}", if fail { "FAILURES" } else { "ALL PASS" });
 }
 
 /// Transfer-Demonstration: Cap per Move durchreichen (Ownership = Capability).

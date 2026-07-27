@@ -126,13 +126,16 @@ dasselbe cap-gesicherte IPC — ohne ein einziges `cfg(target_arch)` im Kern. De
 - [x] GDT/TSS, Ring 3, `syscall`/`sysret`, Context-Switch
 - [x] HAL architekturselektiv; alle 13 Crates bauen für beide Architekturen
 - [x] Kernel-Kern auf x86: Allokator, Capability-System, Scheduler (präemptiv), IPC, Audits
-- [ ] **SMP**: INIT-SIPI-SIPI + Realmode-Trampolin (`power::cpu_on` meldet derzeit `NOT_SUPPORTED`)
+- [x] **SMP**: INIT-SIPI-SIPI + 16-bit-Trampolin (16→32→64 Bit), 4 Kerne in QEMU verifiziert —
+      jeder Kern mit eigenem LAPIC-Timer und eigener Scheduler-Instanz
 - [ ] **Isolierte Adressräume**: PCID-Verwaltung + per-VSpace-Tabellenpool (`vspace_*` melden `false`)
       → ohne sie gibt es auf x86 keine Ring-3-PDs
 - [ ] **IOMMU**: VT-d/AMD-Vi statt SMMUv3 (derzeit `NullIommuEnforcer`, ohne HW-Durchsetzung)
-- [ ] **PCI-ECAM** über ACPI-MCFG (statt des `virt`-Board-Fensters)
+- [~] **PCI-ECAM**: das Fenster wird aus der ACPI-**MCFG** gelesen und gemeldet; die
+      **Enumeration** darüber fehlt noch (der Kernel-PCIe-Pfad ist an das ARM-`virt`-Board gebunden)
 - [ ] **Boot-Archiv** über Multiboot-Module (`SYS_LOAD` schlägt derzeit sauber fehl)
-- [ ] **RAM-Plan** aus der Multiboot-Info statt fester 512 MiB (Trampolin reicht `EBX` nicht durch)
+- [x] **RAM-Plan** aus dem Multiboot-Speicherplan (BSP-Trampolin reicht `EBX` durch); CPU-Liste
+      aus der ACPI-**MADT** statt fester Kernzahl
 - [ ] Die ARM-seitigen Demo-/Testdienste (`threads/mod.rs`, 5000 Zeilen) sind stark ARM-gekoppelt
       (EL0-Isolation, MMIO/RTC, DMA) — auf x86 läuft derzeit ein kompakter eigener Bring-up-Test
 

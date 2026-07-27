@@ -114,6 +114,32 @@ pub fn send_sgi(target_core: usize, intid: u32) {
     write(REG_ICR_LOW, intid & 0xFF);
 }
 
+/// **INIT-IPI** an `apic_id` (Teil der AP-Startsequenz, s. `power::cpu_on`).
+pub fn send_init_ipi(apic_id: u32) {
+    write(REG_ICR_HIGH, apic_id << 24);
+    // Delivery Mode 101 (INIT), Level Assert, Edge.
+    write(REG_ICR_LOW, 0x4500);
+    wait_ipi_delivered();
+}
+
+/// **STARTUP-IPI** (SIPI) an `apic_id` mit der Trampolin-Seitennummer als Vektor.
+pub fn send_startup_ipi(apic_id: u32, vector: u32) {
+    write(REG_ICR_HIGH, apic_id << 24);
+    // Delivery Mode 110 (Startup), Level Assert.
+    write(REG_ICR_LOW, 0x4600 | (vector & 0xFF));
+    wait_ipi_delivered();
+}
+
+/// Warten, bis der LAPIC den IPI abgesetzt hat (ICR_LOW Bit 12 = Delivery Status).
+fn wait_ipi_delivered() {
+    for _ in 0..100_000 {
+        if read(REG_ICR_LOW) & (1 << 12) == 0 {
+            return;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// Auf ARM liest der Dispatch die aktive INTID aus dem GIC. Auf x86 **ist** der Vektor die
 /// Identität (er steht im Trap-Frame) — es gibt nichts nachzuschlagen.
 pub fn handle_irq() -> Option<u32> {

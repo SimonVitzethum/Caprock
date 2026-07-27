@@ -25,12 +25,55 @@ use sel4lake_hal::{self as hal, println, syscall::invoke};
 use sel4lake_mem::Rights;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// RAM-Obergrenze für den Allokator.
+/// Rückfall-RAM-Obergrenze, falls der Bootloader keinen Speicherplan mitgibt.
+const RAM_END_FALLBACK: u64 = 128 * 1024 * 1024;
+
+/// **Speicherplan aus der Multiboot-Info** — das x86-Gegenstück zum `/memory`-Knoten des DTB.
 ///
-/// Der Multiboot-Speicherplan läge in der Info-Struktur, die der Bootloader in `EBX` übergibt;
-/// das Trampolin reicht sie derzeit nicht durch. Bis dahin die im Testlauf zugesicherte Größe
-/// (`qemu -m 512M`) — bewusst konservativ: zu klein ist harmlos, zu groß wäre es nicht.
-const RAM_END: u64 = 512 * 1024 * 1024;
+/// Gesucht wird das Ende des nutzbaren RAM: die größte als „available" (Typ 1) gemeldete
+/// Region, die oberhalb von 1 MiB beginnt (darunter liegen BIOS-/Legacy-Bereiche). Alle
+/// Zugriffe sind gegen die von der Struktur selbst gemeldeten Längen geprüft; ein fehlendes
+/// oder unplausibles `mmap` führt zum Rückfallwert, nie zu einem Fehlzugriff.
+fn ram_end_from_multiboot(info: u64) -> Option<u64> {
+    if info == 0 {
+        return None;
+    }
+    // SAFETY: Der Bootloader übergibt einen gültigen Zeiger auf seine Info-Struktur im
+    // identity-gemappten Low-Memory; wir lesen nur die Felder, deren Vorhandensein `flags`
+    // zusichert.
+    let (flags, mmap_len, mmap_addr) = unsafe {
+        (
+            core::ptr::read_volatile(info as *const u32),
+            core::ptr::read_volatile((info + 44) as *const u32) as u64,
+            core::ptr::read_volatile((info + 48) as *const u32) as u64,
+        )
+    };
+    if flags & (1 << 6) == 0 || mmap_len == 0 {
+        return None; // kein Speicherplan vorhanden
+    }
+    let mut best = 0u64;
+    let mut off = 0u64;
+    while off + 24 <= mmap_len {
+        let e = mmap_addr + off;
+        // SAFETY: `e` liegt innerhalb des von `mmap_len` aufgespannten Bereichs (s. Schleife).
+        let (size, base, len, kind) = unsafe {
+            (
+                core::ptr::read_volatile(e as *const u32) as u64,
+                core::ptr::read_volatile((e + 4) as *const u64),
+                core::ptr::read_volatile((e + 12) as *const u64),
+                core::ptr::read_volatile((e + 20) as *const u32),
+            )
+        };
+        if kind == 1 && base >= 0x10_0000 {
+            best = best.max(base + len);
+        }
+        if size == 0 {
+            break; // defekte Kette -> abbrechen statt weiterzuraten
+        }
+        off += size + 4; // `size` zählt sich selbst nicht mit
+    }
+    (best > 0x10_0000).then_some(best)
+}
 
 /// Zeitscheibe (Hz) — wie auf aarch64.
 const TICK_HZ: u64 = 100;
@@ -81,6 +124,28 @@ extern "C" fn ipc_client(_arg: usize) -> ! {
     }
 }
 
+/// Stackgröße je Sekundärkern (aus dem RAM belegt, wie auf aarch64 seit ext-30).
+const AP_STACK_BYTES: u64 = 64 * 1024;
+
+/// Einstieg eines **Sekundärkerns** (aus dem AP-Trampolin, bereits im Long Mode mit den
+/// Seitentabellen des BSP und eigenem Stack).
+///
+/// Dieselbe Reihenfolge wie beim Bootkern, nur ohne die globalen Schritte (Seitentabellen,
+/// PIC-Stilllegung, Kerneltabellen — die stehen schon).
+extern "C" fn ap_entry() -> ! {
+    hal::exception::init(); // IDT ist global, das IDTR-Register aber pro Kern
+    hal::gdt::init_ap();
+    hal::intc::init_cpu(); // eigener LAPIC
+    hal::timer::init(TICK_HZ); // eigener Timer
+    system::init_core(); // dieser Kontext wird der Idle-Thread dieses Kerns
+    hal::power::ap_report_online();
+    hal::cpu::local_irq_enable();
+    loop {
+        system::reap(); // jeder Kern sammelt seine eigenen Zombies ein
+        hal::cpu::wfi();
+    }
+}
+
 /// Alle Demo-Threads + PDs aufsetzen (vor dem Freigeben der Interrupts).
 fn spawn_demo() -> bool {
     // Drei Worker auf dem Bootkern -> sie können nur durch Präemption alle vorankommen.
@@ -121,21 +186,28 @@ fn spawn_demo() -> bool {
     true
 }
 
-/// Sind alle Demo-Aussagen belegt?
+/// Sind alle Demo-Aussagen belegt? Dazu gehört, dass **jeder** Kern tickt — ein Kern, der
+/// zwar bootet, aber keinen Timer-Interrupt bekommt, würde sonst unbemerkt bleiben.
 fn all_done() -> bool {
     let workers = (0..NWORKERS).all(|i| WORKER_ROUNDS[i].load(Ordering::Relaxed) >= WORK_TARGET);
-    workers && IPC_DONE.load(Ordering::Acquire) && hal::timer::ticks(0) > 0
+    let cores = (0..system::num_cores()).all(|c| hal::timer::ticks(c) > 0);
+    workers && IPC_DONE.load(Ordering::Acquire) && cores
 }
 
 /// Bericht + Abschaltung (das Testskript wertet die Marker aus).
 fn report_and_off() -> ! {
     let ticks = hal::timer::ticks(0);
-    println!("sched   : core 0 ticks={ticks}");
+    let mut all_tick = true;
+    for c in 0..system::num_cores() {
+        let t = hal::timer::ticks(c);
+        println!("sched   : core {c} ticks={t}");
+        all_tick &= t > 0;
+    }
     let rounds: [u64; NWORKERS] = core::array::from_fn(|i| WORKER_ROUNDS[i].load(Ordering::Relaxed));
     println!(
         "sched   : Worker-Runden {rounds:?} (jeder >= {WORK_TARGET} -> Timer verdraengt sie gegeneinander)"
     );
-    let sched_ok = ticks > 0 && rounds.iter().all(|&r| r >= WORK_TARGET);
+    let sched_ok = ticks > 0 && all_tick && rounds.iter().all(|&r| r >= WORK_TARGET);
     println!("sched   : {}", if sched_ok { "ALL PASS" } else { "FAILURES" });
 
     let ipc = IPC_RESULT.load(Ordering::Acquire);
@@ -156,7 +228,7 @@ fn report_and_off() -> ! {
 }
 
 /// Einstieg des Kernel-Kerns auf x86_64 (vom Boot-Trampolin über `x86_rust_entry` gerufen).
-pub fn run() -> ! {
+pub fn run(multiboot_info: u64) -> ! {
     // --- Hardware in der Reihenfolge hochziehen, in der sie voneinander abhängt ---
     hal::console::init();
     println!("========================================");
@@ -187,14 +259,31 @@ pub fn run() -> ! {
     );
 
     // --- Speicher + arch-neutrale Selbsttests (identisch zu aarch64) ---
+    let ram_end = match ram_end_from_multiboot(multiboot_info) {
+        Some(e) => {
+            println!("mbi     : Speicherplan gelesen -> RAM bis {:#x} ({} MiB)", e, e >> 20);
+            e
+        }
+        None => {
+            println!("mbi     : kein Speicherplan -> Rueckfall {} MiB", RAM_END_FALLBACK >> 20);
+            RAM_END_FALLBACK
+        }
+    };
     let free_base = hal::mmu::kernel_end().max(hal::mmu::USER_RAM_MIN);
-    system::init_mem(free_base, RAM_END);
-    println!("mem     : freies RAM [{free_base:#x}, {RAM_END:#x})");
+    system::init_mem(free_base, ram_end);
+    println!("mem     : freies RAM [{free_base:#x}, {ram_end:#x})");
     crate::selftest::run();
 
     // --- Kernel-Kern: Hooks, Tabellen, Scheduler ---
     system::set_hooks();
-    let (nc, nthreads, per_core, tbl) = system::configure(1); // SMP folgt (s. todo.md)
+    // Kernzahl aus der ACPI-MADT (x86-Gegenstück zu den `/cpus`-Knoten des DTB).
+    let cpus = hal::acpi::cpus();
+    let ncpu = cpus.as_ref().map(|c| c.count()).unwrap_or(1);
+    println!("acpi    : {ncpu} CPU(s) laut MADT");
+    if let Some((ecam, b0, b1)) = hal::acpi::pci_ecam() {
+        println!("acpi    : PCI-ECAM @ {ecam:#x}, Busse {b0}..{b1}");
+    }
+    let (nc, nthreads, per_core, tbl) = system::configure(ncpu);
     println!(
         "sched   : {nc} Kern, {nthreads} Thread-Slots ({per_core} hostbar), Tabellen {} KiB aus dem RAM",
         tbl >> 10
@@ -206,15 +295,36 @@ pub fn run() -> ! {
         println!("bringup : FAILURES (Bootkern hat LAPIC-ID {boot_core}, erwartet < {nc})");
         hal::power::system_off();
     }
-    let before = system::threads_available();
     system::init_core();
-    let after = system::threads_available();
-    println!("bringup : init_core: Thread-Slots {before} -> {after} (Idle belegt einen)");
     if !spawn_demo() {
         println!("bringup : FAILURES (Demo-Aufbau fehlgeschlagen)");
         hal::power::system_off();
     }
     println!("bringup : 3 Worker + 2 PDs (IPC-Server/Client) eingeplant");
+
+    // --- Sekundärkerne starten (INIT-SIPI-SIPI, s. `hal::power`) ---
+    let mut online = 1usize;
+    if let Some(list) = cpus.as_ref() {
+        let boot_id = hal::cpu::core_id() as u8;
+        for i in 0..list.count() {
+            let Some(id) = list.id(i) else { continue };
+            if id == boot_id {
+                continue;
+            }
+            let Some(stack) = system::alloc(AP_STACK_BYTES, 4096) else {
+                break;
+            };
+            let top = stack.base() + stack.len();
+            if hal::power::cpu_on(id as u64, ap_entry as *const () as u64, top)
+                == hal::power::SUCCESS
+            {
+                online += 1;
+            } else {
+                println!("smp     : CPU {id} hat sich nicht gemeldet");
+            }
+        }
+    }
+    println!("smp     : {online} von {nc} Kern(en) online");
 
     // Ab hier schedult der Timer-Interrupt präemptiv; dieser Kontext ist der Idle-Thread.
     hal::cpu::local_irq_enable();

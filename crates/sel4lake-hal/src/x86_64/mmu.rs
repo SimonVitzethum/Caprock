@@ -195,6 +195,32 @@ pub fn init_primary() {
     }
 }
 
+/// **Rechte einer einzelnen 4-KiB-Seite ändern** (nur im fein abgebildeten Bereich < 16 MiB).
+///
+/// Gebraucht für die AP-Trampolin-Seite: sie muss beim Boot **beschreibbar** sein (der BSP
+/// kopiert den Block hinein) und danach **ausführbar, nicht schreibbar** (der Sekundärkern
+/// führt dort weiter, nachdem er `CR0.PG` gesetzt hat — läge sie dann NX, gäbe es genau in
+/// diesem Moment einen #PF ohne IDT und damit einen Triple Fault). Beides gleichzeitig wäre
+/// eine W^X-Verletzung; der Wechsel ist die saubere Auflösung.
+///
+/// Gibt `false` für Adressen außerhalb des 4-KiB-granularen Bereichs oder unausgerichtete.
+pub fn protect_page(pa: u64, perm: Perm) -> bool {
+    if pa % PAGE != 0 || pa >= (FINE_BLOCKS as u64) * TWO_MIB {
+        return false;
+    }
+    let block = (pa / TWO_MIB) as usize;
+    let idx = ((pa % TWO_MIB) / PAGE) as usize;
+    // SAFETY: `PT` ist die statische Seitentabelle dieses Kernels; Block-/Index-Bereich ist eben
+    // geprüft. Der Eintrag wird atomar (ein 64-bit-Store) ersetzt und die Adresse danach aus dem
+    // TLB geworfen.
+    unsafe {
+        let pt = &mut *core::ptr::addr_of_mut!(PT);
+        pt[block].0[idx] = pa | perm_bits(perm);
+    }
+    flush_va_global(pa);
+    true
+}
+
 /// CR3 auf `root` setzen und `CR0.WP` erzwingen.
 ///
 /// **`CR0.WP` ist sicherheitskritisch:** ohne dieses Bit ignoriert Ring 0 das `RW`-Bit der

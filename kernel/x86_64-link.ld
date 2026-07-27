@@ -56,6 +56,25 @@ SECTIONS {
         __user_data_end = .;
     }
 
+    /* AP-Trampolin (ext-31): Ein Application Processor startet nach INIT-SIPI-SIPI im
+       16-bit-Real-Mode an `Vektor << 12` — also UNTERHALB von 1 MiB.
+       LAUF-Adresse (VMA) = 0x8000, damit alle Labels darin absolute Laufadressen sind
+       (Sprungziele, GDT-Zeiger, Parameterblock) — der 16-bit-Teil rechnet segmentrelativ.
+       LADE-Adresse (LMA) = hier im Image, denn ein eigenes Ladesegment bei 0x8000 wuerde die
+       Segmente nach Adresse sortieren und damit den Multiboot-Header hinter Dateioffset 8192
+       schieben — der muss aber in den ersten 8 KiB der DATEI liegen, sonst bootet QEMU
+       kommentarlos gar nicht. Der BSP kopiert den Block einmalig von LMA nach VMA. */
+    __aptramp_lma = .;
+    .aptramp 0x8000 : AT(__aptramp_lma) {
+        KEEP(*(.aptramp))
+    }
+    __aptramp_data_lma = __aptramp_lma + SIZEOF(.aptramp);
+    /* Parameter auf einer EIGENEN Seite: die Codeseite bleibt R-X, diese ist RW+NX (W^X). */
+    .aptramp_data 0x9000 : AT(__aptramp_data_lma) {
+        KEEP(*(.aptramp.data))
+    }
+    . = __aptramp_data_lma + SIZEOF(.aptramp_data);
+
     /* Genullte Kernel-BSS (NUR diese Spanne wird vom Long-Mode-Code genullt). */
     .bss (NOLOAD) : ALIGN(4096) {
         __bss_start = .;
@@ -79,4 +98,5 @@ SECTIONS {
         *(.eh_frame .eh_frame_hdr)
         *(.ARM.exidx*)
     }
+
 }

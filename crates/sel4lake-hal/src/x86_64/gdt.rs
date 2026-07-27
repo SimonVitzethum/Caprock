@@ -98,6 +98,38 @@ pub fn init() {
     }
 }
 
+/// GDT auf einem **Application Processor** laden.
+///
+/// Die Tabelle ist global (identischer Inhalt für alle Kerne), das **TSS** aber nicht: sein
+/// Deskriptor trägt ein Busy-Bit, das `ltr` setzt — ein zweiter `ltr` auf dasselbe TSS wäre ein
+/// #GP. Solange auf x86 keine Ring-3-Threads laufen (kein Stackwechsel bei Traps nötig),
+/// braucht ein AP kein eigenes TSS; sobald doch, bekommt jeder Kern seinen eigenen Deskriptor.
+pub fn init_ap() {
+    // SAFETY: dieselbe statische, vom BSP fertig aufgebaute GDT laden + Segmente neu laden.
+    unsafe {
+        let gdt = &*core::ptr::addr_of!(GDT);
+        let ptr = DescriptorTablePointer {
+            limit: (core::mem::size_of_val(gdt) - 1) as u16,
+            base: gdt.as_ptr() as u64,
+        };
+        asm!("lgdt [{}]", in(reg) &ptr, options(readonly, nostack, preserves_flags));
+        asm!(
+            "push 0x08",
+            "lea {tmp}, [rip + 2f]",
+            "push {tmp}",
+            "retfq",
+            "2:",
+            tmp = lateout(reg) _,
+            options(preserves_flags)
+        );
+        asm!(
+            "mov ax, 0x10", "mov ds, ax", "mov es, ax", "mov ss, ax",
+            "mov ax, 0", "mov fs, ax", "mov gs, ax",
+            out("ax") _, options(nostack, preserves_flags)
+        );
+    }
+}
+
 /// Kernel-Stackzeiger setzen, auf den ein Trap **aus Ring 3** umschaltet.
 ///
 /// Bei jedem Wechsel zu einem Ring-3-Thread zu setzen (dessen eigener Kernel-Stack), sonst

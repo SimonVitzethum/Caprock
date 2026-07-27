@@ -7,6 +7,10 @@
 //! Nicht vorhanden (bewusst, s. Crate-Doku): `pcie`/`smmu`/`virtio` — deren x86-Entsprechungen
 //! (PCI-ECAM über ACPI-MCFG, VT-d/AMD-Vi) sind ein eigener Portierungsschritt.
 
+/// Compile-Zeit-Obergrenze der CPUs, die aus der ACPI-MADT übernommen werden.
+pub const MAX_CPUS: usize = 256;
+
+pub mod acpi;
 pub mod console;
 pub mod cpu;
 pub mod exception;

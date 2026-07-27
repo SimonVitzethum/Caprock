@@ -35,6 +35,7 @@ global_asm!(
 _start:
     lea esp, [boot_stack_top]            /* temporärer 32-bit-Stack */
     cld
+    mov [mb_info_ptr], ebx               /* Multiboot-Info-Zeiger retten (Speicherplan!) */
 
     /* PML4 + PDPT nullen (nur Eintrag [0] wird gesetzt; Rest MUSS 0 sein). Beide sind im
        Linker zusammenhängend; PD wird vollständig gefüllt und braucht keine Nullung. */
@@ -115,6 +116,7 @@ long_mode:
     cld
     rep stosb
 
+    mov edi, [mb_info_ptr]               /* 1. Argument (SysV): Multiboot-Info-Zeiger */
     call x86_rust_entry
 2:  hlt
     jmp 2b
@@ -132,6 +134,8 @@ gdt64_ptr:
 
 /* ---- Boot-Seitentabellen + Stack (NOLOAD, vor Paging beschrieben) ---- */
 .section .boot.bss, "aw", @nobits
+.align 4096
+mb_info_ptr: .skip 8
 .align 4096
 pml4: .skip 4096
 pdpt: .skip 4096
@@ -263,8 +267,8 @@ pub(crate) fn put_dec(mut n: u64) {
 /// entfallen — ihre Aussagen (Paging/W^X, IDT, LAPIC-Timer) prüft der Bring-up implizit,
 /// weil ohne sie nichts davon liefe.
 #[no_mangle]
-pub extern "C" fn x86_rust_entry() -> ! {
-    bringup::run()
+pub extern "C" fn x86_rust_entry(multiboot_info: u64) -> ! {
+    bringup::run(multiboot_info)
 }
 
 /// CPU anhalten (Panic/Ende). `hlt` in Schleife.

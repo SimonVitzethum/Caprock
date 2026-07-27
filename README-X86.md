@@ -40,7 +40,8 @@ Mode die aktive Identity-Map nicht löscht; PML4/PDPT werden im 32-bit-Trampolin
 | **2** | IDT/Exceptions (256 Stubs) + LAPIC + periodischer Timer (gegen PIT kalibriert) | ✅ QEMU-verifiziert |
 | **3** | GDT/TSS + Ring 3 + `syscall`/`sysret` + Context-Switch | ✅ QEMU-verifiziert |
 | **4** | **Kernel-Kern läuft**: HAL architekturselektiv, Selbsttests + Scheduler + cap-gesicherte IPC | ✅ QEMU-verifiziert |
-| 5 | SMP, isolierte Adressräume (PCID), Ring-3-PDs, Loader, IOMMU | offen (s. `todo.md` C6) |
+| **4b** | **SMP** (INIT-SIPI-SIPI), ACPI-MADT/MCFG, Multiboot-Speicherplan | ✅ QEMU-verifiziert (4 Kerne) |
+| 5 | Isolierte Adressräume (PCID), Ring-3-PDs, PCI-Enumeration, IOMMU | offen (s. `todo.md` C6) |
 
 ### Stufe 4 (ext-31): der eigentliche Microkernel
 
@@ -65,9 +66,38 @@ Architekturen dasselbe **Trap-Modell** benutzen: Registersatz in einen `TrapFram
 Stack, Handler bekommt dessen Adresse, Rückgabewert ist der wiederherzustellende Frame —
 der Kontextwechsel ist auf beiden Seiten ein reiner Stackzeiger-Tausch (`eret` bzw. `iretq`).
 
+### Stufe 4b (ext-32): SMP + Plattformbeschreibung
+
+```
+acpi    : 4 CPU(s) laut MADT
+acpi    : PCI-ECAM @ 0xb0000000, Busse 0..255
+mbi     : Speicherplan gelesen -> RAM bis 0x1ffe0000 (511 MiB)
+smp     : 4 von 4 Kern(en) online
+sched   : core 0..3 ticks=24/24/23/22   -> jeder Kern hat LAPIC-Timer + Scheduler-Instanz
+```
+
+Drei Dinge, die auf ARM anders (und einfacher) sind:
+
+- **Kernstart.** PSCI startet einen Kern direkt in 64 Bit an beliebiger Adresse. Auf x86 gibt es
+  keine solche Firmware-Schnittstelle: der AP startet nach `INIT`-`SIPI`-`SIPI` im
+  **16-bit-Real-Mode unterhalb von 1 MiB**. Das Trampolin (`hal::x86_64::power`) macht
+  16 → 32 → 64 Bit und springt dann in den Rust-Einstieg.
+- **Wo das Trampolin liegt.** Laufadresse ist 0x8000 (damit alle Labels darin absolut sind),
+  **Ladeadresse** aber im Kernel-Image: ein eigenes Ladesegment unter 1 MiB sortiert die
+  ELF-Segmente nach Adresse und schiebt den Multiboot-Header aus den ersten 8 KiB der Datei —
+  dann bootet QEMU kommentarlos gar nicht. Der BSP kopiert den Block einmalig.
+- **W^X über den Moduswechsel.** Der AP führt auf 0x8000 weiter, **nachdem** er `CR0.PG`
+  gesetzt hat; wäre die Seite dann NX, gäbe es genau in diesem Moment einen #PF ohne IDT und
+  damit einen Triple Fault. Die Seite ist beim Kopieren RW und wird danach per
+  `mmu::protect_page` auf R-X gestellt; die Parameter liegen auf einer **eigenen** RW-Seite,
+  damit nie eine Seite zugleich schreibbar und ausführbar ist.
+
+**Plattformbeschreibung** kommt jetzt von der Plattform statt aus dem Code: CPU-Liste aus der
+**ACPI-MADT** (Gegenstück zu den `/cpus`-Knoten des DTB), PCI-ECAM-Fenster aus der **MCFG**,
+RAM-Größe aus dem **Multiboot-Speicherplan**.
+
 Was auf x86 **noch fehlt** (ehrlich als „nicht unterstützt" gemeldet, nicht halb umgesetzt):
 
-- **SMP**: `power::cpu_on` meldet `NOT_SUPPORTED` (INIT-SIPI-SIPI + Realmode-Trampolin fehlen).
 - **Isolierte Adressräume**: die `vspace_*`-Funktionen melden `false`; es fehlen PCID-Verwaltung
   und ein per-VSpace-Tabellenpool. Damit gibt es auf x86 (noch) keine Ring-3-PDs.
 - **IOMMU**: statt SMMUv3 greift der `NullIommuEnforcer` — er setzt **keine** Hardware-Isolation
@@ -75,7 +105,8 @@ Was auf x86 **noch fehlt** (ehrlich als „nicht unterstützt" gemeldet, nicht h
   (Ownership, Bounds, Revoke-Reihenfolge, Audits) sind davon unberührt.
 - **Boot-Archiv/Loader**: `SYS_LOAD` schlägt sauber fehl (das ARM-Fenster hat auf x86 kein
   Gegenstück; die Entsprechung wären Multiboot-Module).
-- **RAM-Größe**: fest 512 MiB statt aus der Multiboot-Info (das Trampolin reicht `EBX` nicht durch).
+- **PCI-Enumeration**: das ECAM-Fenster wird gefunden und gemeldet, aber noch nicht durchsucht
+  (der Kernel-PCIe-Pfad ist derzeit an das ARM-`virt`-Board gebunden).
 
 ## Geänderte/neue Dateien (ggü. `master`)
 

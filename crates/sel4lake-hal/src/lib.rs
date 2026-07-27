@@ -54,7 +54,7 @@ pub use imp::{gic, pcie, psci, smmu, virtio};
 
 // x86-spezifisch: Segmentierung existiert auf ARM nicht (dort gibt es keine GDT/TSS).
 #[cfg(target_arch = "x86_64")]
-pub use imp::gdt;
+pub use imp::{acpi, gdt};
 
 /// Formatierte Ausgabe auf der Debug-Konsole (gesperrt, SMP-sicher).
 #[macro_export]

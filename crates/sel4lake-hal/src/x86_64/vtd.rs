@@ -18,7 +18,8 @@
 //! kein DMA-Puffer an ein Gerät binden — statt eine Isolation vorzutäuschen, die es nicht gibt.
 //! Der Zustand ist trotzdem **sicher**: geblockt statt ungeschützt.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use crate::fault::{FaultKind, FaultRecord};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 // Registeroffsets (Intel VT-d Spezifikation, Kapitel 10).
 const REG_VER: usize = 0x000;
@@ -60,31 +61,77 @@ const GSTS_RTPS: u32 = 1 << 30;
 const CCMD_ICC: u64 = 1 << 63;
 const CCMD_CIRG_GLOBAL: u64 = 1 << 61;
 
-/// Registerbasis der Remapping-Einheit (`0` = keine gefunden).
-static UNIT_BASE: AtomicU64 = AtomicU64::new(0);
-/// Physische Adresse der Root-Tabelle (`0` = noch keine).
-static ROOT_TABLE: AtomicU64 = AtomicU64::new(0);
+/// Registerbasen **aller** Remapping-Einheiten (`0` = Steckplatz leer).
+///
+/// Vorher war das eine einzige Basis. Bei mehreren Einheiten hat jede eigene Root-Table-Pointer,
+/// eigene Invalidierungsqueue und **eigene Fault-Register** — ein Zähler, der nur Einheit 0
+/// liest, ist für alles blind, was nicht an ihr hängt. Genau die Sorte Blindheit, die auf der
+/// ARM-Seite zweimal aufgetreten ist.
+static UNIT_BASES: [AtomicU64; super::dmar::MAX_UNITS] =
+    [const { AtomicU64::new(0) }; super::dmar::MAX_UNITS];
+static N_UNITS: AtomicU32 = AtomicU32::new(0);
+/// Physische Adresse der Root-Tabelle je Einheit (`0` = noch keine).
+static ROOT_TABLE: [AtomicU64; super::dmar::MAX_UNITS] =
+    [const { AtomicU64::new(0) }; super::dmar::MAX_UNITS];
 
-fn read32(off: usize) -> u32 {
-    let b = UNIT_BASE.load(Ordering::Acquire);
+/// Anzahl gefundener Einheiten.
+pub fn unit_count() -> usize {
+    N_UNITS.load(Ordering::Acquire) as usize
+}
+
+fn base_of(unit: usize) -> u64 {
+    UNIT_BASES
+        .get(unit)
+        .map(|b| b.load(Ordering::Acquire))
+        .unwrap_or(0)
+}
+
+fn ru32(unit: usize, off: usize) -> u32 {
+    let b = base_of(unit);
+    if b == 0 {
+        return 0;
+    }
     // SAFETY: `b` stammt aus der ACPI-DMAR und liegt im identity-gemappten, uncacheable
     // MMIO-Bereich; volatile Registerzugriffe aliasen keinen Rust-Speicher.
     unsafe { core::ptr::read_volatile((b + off as u64) as *const u32) }
 }
-fn write32(off: usize, v: u32) {
-    let b = UNIT_BASE.load(Ordering::Acquire);
-    // SAFETY: wie `read32`.
+fn wu32(unit: usize, off: usize, v: u32) {
+    let b = base_of(unit);
+    if b == 0 {
+        return;
+    }
+    // SAFETY: wie `ru32`.
     unsafe { core::ptr::write_volatile((b + off as u64) as *mut u32, v) };
 }
-fn read64(off: usize) -> u64 {
-    let b = UNIT_BASE.load(Ordering::Acquire);
-    // SAFETY: wie `read32`.
+fn ru64(unit: usize, off: usize) -> u64 {
+    let b = base_of(unit);
+    if b == 0 {
+        return 0;
+    }
+    // SAFETY: wie `ru32`.
     unsafe { core::ptr::read_volatile((b + off as u64) as *const u64) }
 }
-fn write64(off: usize, v: u64) {
-    let b = UNIT_BASE.load(Ordering::Acquire);
-    // SAFETY: wie `read32`.
+fn wu64(unit: usize, off: usize, v: u64) {
+    let b = base_of(unit);
+    if b == 0 {
+        return;
+    }
+    // SAFETY: wie `ru32`.
     unsafe { core::ptr::write_volatile((b + off as u64) as *mut u64, v) };
+}
+
+// Kurzformen für Einheit 0 (Bring-up-Pfad, solange nur eine Einheit zugeteilt wird).
+fn read32(off: usize) -> u32 {
+    ru32(0, off)
+}
+fn write32(off: usize, v: u32) {
+    wu32(0, off, v)
+}
+fn read64(off: usize) -> u64 {
+    ru64(0, off)
+}
+fn write64(off: usize, v: u64) {
+    wu64(0, off, v)
 }
 
 /// Ein **Ein-Schritt-Kommando** absetzen, ohne die Zustandsbits zu verlieren.
@@ -167,25 +214,22 @@ pub struct VtdCaps {
 impl VtdCaps {
     /// Die Fähigkeiten der Einheit lesen. `None`, wenn keine Einheit gefunden wurde.
     pub fn read() -> Option<VtdCaps> {
-        if !present() {
+        VtdCaps::read_unit(0)
+    }
+
+    /// Die Fähigkeiten **einer bestimmten** Einheit lesen.
+    pub fn read_unit(unit: usize) -> Option<VtdCaps> {
+        if base_of(unit) == 0 {
             return None;
         }
-        let cap = read64(REG_CAP);
-        let ecap = read64(REG_ECAP);
+        let cap = ru64(unit, REG_CAP);
+        let ecap = ru64(unit, REG_ECAP);
         let nd = (cap & 0b111) as u32;
         let sagaw = ((cap >> 8) & 0x1f) as u32;
         // Bevorzugt 39 Bit (3 Level) — dieselbe Eingangsbreite wie die ARM-Seite, damit die
         // Fensterarithmetik nicht zweimal existiert. Bietet die Einheit sie nicht an, wird
         // aufgestiegen; sie ist NICHT garantiert, manche Implementierungen bieten nur 48.
-        let (agaw_bits, agaw_levels) = if sagaw & (1 << 1) != 0 {
-            (39, 3)
-        } else if sagaw & (1 << 2) != 0 {
-            (48, 4)
-        } else if sagaw & (1 << 3) != 0 {
-            (57, 5)
-        } else {
-            (0, 0)
-        };
+        let (agaw_bits, agaw_levels) = agaw_from_sagaw(sagaw);
         Some(VtdCaps {
             raw_cap: cap,
             raw_ecap: ecap,
@@ -224,12 +268,122 @@ impl VtdCaps {
 /// Ist die Fault-Aufzeichnung übergelaufen (`FSTS.PFO`)? Danach sind weitere Faults **verworfen**
 /// — jede Aussage der Form „keine weiteren Faults" ist dann bedeutungslos.
 pub fn fault_overflow() -> bool {
-    present() && read32(REG_FSTS) & FSTS_PFO != 0
+    (0..unit_count()).any(|u| ru32(u, REG_FSTS) & FSTS_PFO != 0)
+}
+
+/// `FSTS.PPF` — mindestens ein Fault-Recording-Register ist besetzt.
+const FSTS_PPF: u32 = 1 << 1;
+
+/// Beobachtungsunabhängiger Zähler: Konfigurationsfehler **und** Aufzeichnungs-Überläufe, über
+/// **alle** Einheiten.
+static CFG_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+pub fn config_errors() -> u32 {
+    CFG_ERRORS.load(Ordering::Relaxed)
+}
+
+/// Offset des `i`-ten Fault-Recording-Registers dieser Einheit.
+fn frr_off(unit: usize, i: u32) -> Option<usize> {
+    let c = VtdCaps::read_unit(unit)?;
+    if i >= c.num_fault_regs {
+        return None;
+    }
+    Some((c.fault_reg_offset + (i as u64) * 16) as usize)
+}
+
+/// Ein Fault-Recording-Register in die gemeinsame Form übersetzen. `None`, wenn es leer ist.
+fn read_frr(unit: usize, i: u32) -> Option<FaultRecord> {
+    let off = frr_off(unit, i)?;
+    let lo = ru64(unit, off);
+    let hi = ru64(unit, off + 8);
+    if hi >> 63 == 0 {
+        return None; // F-Bit nicht gesetzt
+    }
+    let reason = ((hi >> 32) & 0xff) as u8;
+    let kind = match reason {
+        // Nicht vorhandene Übersetzung — inklusive „gar nicht zugeteilt" (Root/Kontext fehlen),
+        // was der Default-Block-Zustand ist und kein Kernel-Fehler.
+        0x01 | 0x02 | 0x07 => FaultKind::Translation,
+        0x05 | 0x06 => FaultKind::Permission,
+        0x04 => FaultKind::AddressSize,
+        // **Die Einheit lehnt die Tabellen ab** — reservierte Bits, ungültige Tabellenadressen.
+        // Genau die Klasse, die auf ARM `C_BAD_STE`/`C_BAD_CD` heißt.
+        0x03 | 0x08 | 0x09 | 0x0a | 0x0b | 0x0c => FaultKind::Config,
+        other => FaultKind::Other(other),
+    };
+    Some(FaultRecord {
+        kind,
+        requester: (hi & 0xffff) as u32,
+        input_addr: lo & !0xfff,
+        raw: reason,
+    })
+}
+
+/// Keine aufgezeichneten Fehler in irgendeiner Einheit?
+pub fn faults_empty() -> bool {
+    !(0..unit_count()).any(|u| ru32(u, REG_FSTS) & FSTS_PPF != 0)
+}
+
+/// Den ältesten Eintrag lesen, ohne ihn zu verbrauchen.
+///
+/// `FSTS.FRI` zeigt auf das Register mit dem **ersten** aufgezeichneten Fault.
+pub fn peek_fault() -> Option<FaultRecord> {
+    for u in 0..unit_count() {
+        let fsts = ru32(u, REG_FSTS);
+        if fsts & FSTS_PPF == 0 {
+            continue;
+        }
+        let fri = (fsts >> 8) & 0xff;
+        if let Some(r) = read_frr(u, fri) {
+            return Some(r);
+        }
+        // FRI kann veraltet sein -> alle durchsehen.
+        let n = VtdCaps::read_unit(u).map(|c| c.num_fault_regs).unwrap_or(0);
+        for i in 0..n {
+            if let Some(r) = read_frr(u, i) {
+                return Some(r);
+            }
+        }
+    }
+    None
+}
+
+/// Alle Fault-Recording-Register aller Einheiten räumen.
+///
+/// **Räumen ist hier Pflicht, nicht Kosmetik.** Mit `CAP.NFR == 1` — dem Wert dieser Plattform —
+/// setzt der *zweite* Fault `FSTS.PFO`, und ab da wird verworfen, bis sowohl das `F`-Bit im
+/// Register als auch `PFO` gelöscht sind. Ein Negativtest, der zwischen Fault und
+/// Positivkontrolle nicht räumt, bekäme eine Positivkontrolle, die besteht, **weil nichts mehr
+/// aufgezeichnet wird** — wieder ein Grün ohne Bedeutung.
+pub fn drain_faults() -> u32 {
+    let mut n = 0;
+    for u in 0..unit_count() {
+        let nfr = VtdCaps::read_unit(u).map(|c| c.num_fault_regs).unwrap_or(0);
+        for i in 0..nfr {
+            let Some(off) = frr_off(u, i) else { continue };
+            if let Some(r) = read_frr(u, i) {
+                if r.kind == FaultKind::Config {
+                    CFG_ERRORS.fetch_add(1, Ordering::Relaxed);
+                }
+                n += 1;
+            }
+            // F-Bit ist RW1C: das obere Wort mit gesetztem Bit 63 zurückschreiben.
+            wu64(u, off + 8, 1u64 << 63);
+        }
+        // Überlauf zählt in denselben Zähler: danach war die Aufzeichnung blind, und jede
+        // spätere Abwesenheitsaussage wäre bedeutungslos.
+        let fsts = ru32(u, REG_FSTS);
+        if fsts & FSTS_PFO != 0 {
+            CFG_ERRORS.fetch_add(1, Ordering::Relaxed);
+            wu32(u, REG_FSTS, FSTS_PFO); // RW1C
+        }
+    }
+    n
 }
 
 /// Ist eine Remapping-Einheit vorhanden (ACPI-DMAR gefunden)?
 pub fn present() -> bool {
-    UNIT_BASE.load(Ordering::Acquire) != 0
+    base_of(0) != 0
 }
 
 /// Versionsregister (Diagnose/Test).
@@ -270,11 +424,64 @@ pub fn discover() -> bool {
     if present() {
         return true;
     }
-    let Some(base) = super::acpi::dmar_unit_base() else {
+    // **Alle** DRHD-Einheiten übernehmen, nicht nur die erste.
+    let Some(tbl) = super::acpi::dmar_table() else {
         return false;
     };
-    UNIT_BASE.store(base, Ordering::Release);
+    let info = super::dmar::parse(tbl);
+    if info.n_units == 0 {
+        return false;
+    }
+    for u in 0..info.n_units.min(super::dmar::MAX_UNITS) {
+        UNIT_BASES[u].store(info.units[u].reg_base, Ordering::Release);
+    }
+    N_UNITS.store(info.n_units as u32, Ordering::Release);
     true
+}
+
+/// Die **gemeinsame** Fähigkeitsbasis aller Einheiten.
+///
+/// Die AGAW-Wahl muss von **jeder** Einheit getragen werden, die eine zuteilbare Gruppe scopet —
+/// sonst gäbe es die Fensterarithmetik zweimal, genau das, was die Wahl von 39 Bit vermeiden
+/// sollte. Kann eine Einheit die gewählte Breite nicht, ist das ein **lauter** Fehlschlag für die
+/// dahinterliegenden Gruppen (`usable() == false`), keine stille Anpassung.
+pub fn caps_common() -> Option<VtdCaps> {
+    let n = unit_count();
+    if n == 0 {
+        return None;
+    }
+    let mut acc = VtdCaps::read_unit(0)?;
+    for u in 1..n {
+        let c = VtdCaps::read_unit(u)?;
+        // Konservativ mischen: die schwächste Zusicherung gewinnt, die strengste Pflicht auch.
+        acc.sagaw &= c.sagaw;
+        acc.num_domains = acc.num_domains.min(c.num_domains);
+        acc.mgaw_bits = acc.mgaw_bits.min(c.mgaw_bits);
+        acc.num_fault_regs = acc.num_fault_regs.min(c.num_fault_regs);
+        acc.caching_mode |= c.caching_mode; //   eine Einheit mit CM=1 zwingt den strengen Pfad
+        acc.rwbf |= c.rwbf; //                   ebenso
+        acc.coherent_walk &= c.coherent_walk; // eine inkohärente Einheit zwingt zum Flush
+        acc.queued_invalidation &= c.queued_invalidation;
+        acc.interrupt_remapping &= c.interrupt_remapping;
+        acc.snoop_control &= c.snoop_control;
+        acc.scalable_mode |= c.scalable_mode;
+    }
+    let (bits, levels) = agaw_from_sagaw(acc.sagaw);
+    acc.agaw_bits = bits;
+    acc.agaw_levels = levels;
+    Some(acc)
+}
+
+fn agaw_from_sagaw(sagaw: u32) -> (u32, u32) {
+    if sagaw & (1 << 1) != 0 {
+        (39, 3)
+    } else if sagaw & (1 << 2) != 0 {
+        (48, 4)
+    } else if sagaw & (1 << 3) != 0 {
+        (57, 5)
+    } else {
+        (0, 0)
+    }
 }
 
 /// Auf ein Statusbit warten (begrenzt — ein Hardware-Poll darf im Kernel nie unbegrenzt laufen).
@@ -300,7 +507,7 @@ pub fn init(root_table: u64) -> bool {
     if !discover() {
         return false;
     }
-    ROOT_TABLE.store(root_table, Ordering::Release);
+    ROOT_TABLE[0].store(root_table, Ordering::Release);
     // Root-Table-Pointer setzen (Bits 63:12; Translation Table Mode = Legacy).
     write64(REG_RTADDR, root_table & !0xfff);
     // **Nie** `TE` löschen, um umzukonfigurieren: `TE = 0` heißt freier DMA, nicht Blockade.

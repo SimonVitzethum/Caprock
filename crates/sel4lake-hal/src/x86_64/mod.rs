@@ -18,6 +18,7 @@ pub mod exception;
 pub mod fp;
 pub mod gdt;
 pub mod intc;
+pub mod iommu;
 pub mod mmu;
 pub mod pcie;
 pub mod power;

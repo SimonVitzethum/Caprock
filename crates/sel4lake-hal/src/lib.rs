@@ -46,15 +46,16 @@ mod imp;
 mod imp;
 
 // Gemeinsame API-Fläche beider Architekturen.
+pub mod fault;
 pub use imp::{console, cpu, exception, fp, intc, mmu, power, syscall, timer};
 
 // ARM-/QEMU-`virt`-spezifische Geräte (noch ohne x86-Entsprechung, s. Modul-Doku).
 #[cfg(target_arch = "aarch64")]
-pub use imp::{gic, pcie, psci, smmu, virtio};
+pub use imp::{gic, iommu, pcie, psci, smmu, virtio};
 
 // x86-spezifisch: Segmentierung existiert auf ARM nicht (dort gibt es keine GDT/TSS).
 #[cfg(target_arch = "x86_64")]
-pub use imp::{acpi, dmar, gdt, pcie, vtd};
+pub use imp::{acpi, dmar, gdt, iommu, pcie, vtd};
 
 /// Formatierte Ausgabe auf der Debug-Konsole (gesperrt, SMP-sicher).
 #[macro_export]

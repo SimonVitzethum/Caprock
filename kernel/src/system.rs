@@ -2514,7 +2514,7 @@ mod smmu_enforcer_arm {
             if hal::smmu::gerror() != 0 {
                 return 1;
             }
-            if !hal::smmu::eventq_empty() {
+            if !hal::iommu::faults_empty() {
                 return 2;
             }
             0
@@ -3481,7 +3481,7 @@ pub fn virtio_rng_dma_demo() -> VirtioDmaResult {
         free_raw_region(base, len);
         return r;
     };
-    hal::smmu::drain_eventq(); // sauberer Ausgangsstand
+    hal::iommu::drain_faults(); // sauberer Ausgangsstand
     let dlen = hal::virtio::DATA_LEN_BYTES as u64;
 
     // 1. In-Window: Treiber validiert die Zieladresse (Level 1, ok) -> Gerät DMAt Zufallsbytes.
@@ -3501,7 +3501,7 @@ pub fn virtio_rng_dma_demo() -> VirtioDmaResult {
             r.rand1 = w1;
         }
     }
-    r.evtq_empty_good = hal::smmu::eventq_empty();
+    r.evtq_empty_good = hal::iommu::faults_empty();
 
     // 2. Kronjuwel (Sentinel-Page AUSSERHALB der DmaCap-Region). MEM-Lock VOR dem `if let`
     // freigeben (sonst Deadlock über das `if let`-Temporary -> free_raw_region re-lockt MEM).
@@ -3529,7 +3529,7 @@ pub fn virtio_rng_dma_demo() -> VirtioDmaResult {
         // beobachtbar -> Gerät schreibt; reale HW: SMMU faultet).
         // Teil 1 des Negativtests: Event-Queue **vorher** leeren — sonst bestünde er an einem
         // Altbestand aus einem früheren Schritt.
-        hal::smmu::drain_eventq();
+        hal::iommu::drain_faults();
         if let Some(rng) = hal::virtio::probe(&dev) {
             // Die Virtqueue bleibt korrekt (CPU: PA, Gerät: IOVA) — **nur** die Zieladresse im
             // Deskriptor ist absichtlich eine **PA** statt einer IOVA. Genau das ist die
@@ -3544,10 +3544,10 @@ pub fn virtio_rng_dma_demo() -> VirtioDmaResult {
         // beliebigen anderen Fault; belegt ist die Eigenschaft erst, wenn es ein
         // Übersetzungsfehler der erwarteten StreamID auf **genau der PA** ist, die oben
         // absichtlich als Gerätesicht eingetragen wurde.
-        if let Some(ev) = hal::smmu::eventq_peek() {
+        if let Some(ev) = hal::iommu::peek_fault() {
             r.cj_smmu_enforced = true;
-            r.cj_evt_translation = ev.kind == hal::smmu::EVT_F_TRANSLATION;
-            r.cj_evt_sid_ok = ev.stream_id == rid;
+            r.cj_evt_translation = ev.kind == hal::fault::FaultKind::Translation;
+            r.cj_evt_sid_ok = ev.requester == rid;
             r.cj_evt_input_ok = ev.input_addr == sent;
             // **Queue-Liveness**: ein echter Übersetzungsfehler ist der Beleg, dass die Queue in
             // diesem Lauf überhaupt sprechen kann. Ohne ihn ruht jedes „keine Faults" auf
@@ -3567,7 +3567,7 @@ pub fn virtio_rng_dma_demo() -> VirtioDmaResult {
         // Der Aufbau ist bewusst genau der eines „Passthrough-Enforcers für den Bringup":
         // Bypass-STE, Gerät läuft unübersetzt. Er steht sichtbar benannt im Test, damit er nicht
         // versehentlich in der Durchsetzung landet.
-        hal::smmu::drain_eventq();
+        hal::iommu::drain_faults();
         unsafe { core::ptr::write_volatile(sent as *mut u64, SENTINEL) };
         hal::cpu::dsb_sy();
         if DMA_ENFORCER.override_ste(rid, &hal::smmu::build_ste_bypass()) {
@@ -3582,7 +3582,7 @@ pub fn virtio_rng_dma_demo() -> VirtioDmaResult {
             r.cj_bypass_wrote = after_bypass != SENTINEL;
             DMA_ENFORCER.restore_ste(rid);
         }
-        hal::smmu::drain_eventq();
+        hal::iommu::drain_faults();
         free_raw_region(sent, 4096);
     }
 
@@ -3590,7 +3590,7 @@ pub fn virtio_rng_dma_demo() -> VirtioDmaResult {
     dma_disable(rid, base, len);
     free_raw_region(base, len);
     r.audit_ok = dma_audit() == 0;
-    r.cfg_errors_zero = hal::smmu::config_errors() == 0;
+    r.cfg_errors_zero = hal::iommu::config_errors() == 0;
     r
 }
 
@@ -3719,7 +3719,7 @@ pub fn dma_audit() -> u32 {
     // passierte, sondern weil nichts passieren *konnte*. Genau dieser Zustand bestand hier
     // unbemerkt, solange das emulierte Gerät die SMMU ohnehin umging.
     #[cfg(target_arch = "aarch64")]
-    if hal::smmu::config_errors() != 0 {
+    if hal::iommu::config_errors() != 0 {
         return 6;
     }
     // Code 7: der **Pending-Zustand** ist eine eigene Invariante, kein Feld. Eine Region darin
@@ -3913,7 +3913,7 @@ pub(crate) mod testsupport {
     }
     #[cfg(target_arch = "aarch64")] // SMMU/virtio: ARM-spezifisch (ext-31)
     pub fn smmu_eventq_empty() -> bool {
-        hal::smmu::eventq_empty()
+        hal::iommu::faults_empty()
     }
     #[cfg(target_arch = "aarch64")] // SMMU/virtio: ARM-spezifisch (ext-31)
     pub fn smmu_gerror() -> u32 {

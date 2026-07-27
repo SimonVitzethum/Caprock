@@ -532,6 +532,14 @@ pub fn config_errors() -> u32 {
 /// [`config_errors`] und überleben das Leeren, weil sie eine Aussage über den Kernel sind und
 /// nicht über den Verkehr.
 pub fn drain_eventq() -> u32 {
+    // **Überlauf zählt wie ein Konfigurationsfehler**: das `OVFLG`-Bit in `EVENTQ_PROD` sagt,
+    // dass Einträge verworfen wurden. Danach ist jede Aussage „keine weiteren Faults"
+    // bedeutungslos — dieselbe Klasse wie `FSTS.PFO` auf x86, und derselbe Zähler.
+    if r32(EVENTQ_PROD) & (1 << 31) != r32(EVENTQ_CONS) & (1 << 31) {
+        CFG_ERRORS.fetch_add(1, Ordering::Relaxed);
+        // OVACKFLG nachziehen (Überlauf quittieren).
+        w32(EVENTQ_CONS, (r32(EVENTQ_CONS) & !(1 << 31)) | (r32(EVENTQ_PROD) & (1 << 31)));
+    }
     let n = eventq_count();
     for i in 0..n {
         if let Some(ev) = eventq_at(i) {

@@ -441,6 +441,28 @@ pub fn run(multiboot_info: u64) -> ! {
             hal::vtd::version(),
             hal::vtd::cap()
         );
+        // Schritt 1 des VT-d-Aufbaus: Fähigkeiten EINMAL lesen, protokollieren, und jede
+        // spätere Bit-Entscheidung daraus ableiten statt an der Verwendungsstelle. Die Lektion
+        // stammt von der ARM-Seite (`STE.S1STALLD` war nur unter einer Bedingung zulässig, und
+        // die Einheit übersetzte deshalb gar nicht, ohne dass es jemand sagte).
+        if let Some(c) = hal::vtd::VtdCaps::read() {
+            println!(
+                "vtdcaps : SAGAW {:#x} -> gewaehlt {} Bit ({} Level), MGAW {} Bit, Domains {}, CM={} RWBF={} ECAP.C={} QI={} IR={} SC={} ScalableMode={}",
+                c.sagaw, c.agaw_bits, c.agaw_levels, c.mgaw_bits, c.num_domains,
+                c.caching_mode, c.rwbf, c.coherent_walk, c.queued_invalidation,
+                c.interrupt_remapping, c.snoop_control, c.scalable_mode
+            );
+            println!(
+                "vtdcaps : Fault-Recording {} Register @ +{:#x}, Overflow(FSTS.PFO)={}; Eingangsgrenze {:#x}; brauchbar={}",
+                c.num_fault_regs, c.fault_reg_offset, hal::vtd::fault_overflow(),
+                c.input_limit(), c.usable()
+            );
+            // Was der Enforcer NICHT hat, gehoert genauso ins Log wie das, was er hat.
+            println!(
+                "vtdcaps : {} (Schritt 1: Faehigkeiten gelesen; Zuteilung je Gruppe, IR/CFI und RMRR-Ausschluss stehen aus -> attach liefert weiterhin None)",
+                if c.usable() { "ALL PASS" } else { "FAILURES" }
+            );
+        }
         let inv = hal::vtd::invalidate_context_cache();
         println!(
             "iommu   : Uebersetzung aktiv={} (GSTS.TES), Kontext-Cache-Invalidierung quittiert={inv}, dma_audit={}",

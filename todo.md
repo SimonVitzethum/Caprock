@@ -209,6 +209,55 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       Ebenfalls erledigt: undeklarierte Geräte-Adressbreiten werden geführt und protokolliert
       statt stillschweigend als 64 Bit angenommen.
 
+- [ ] **VT-d-Zuteilung (Punkt 6)** — Abnahmekriterium **vorab**: nicht „neue x86-Tests grün",
+      sondern **`dmaalign`/`dmawin`/`dmagen`/`dmatok`/Audit 4–7/Negativtest hören auf zu
+      skippen** — ohne x86-Sonderpfade in den Tests. Ein separater `vtdtest` wäre das
+      Warnsignal: er hieße, dass die Eigenschaften auf x86 anders formuliert sind, und dann
+      existiert doch ein zweiter Entwurf. Was danach noch skippt, ist die ehrliche Liste dessen,
+      was x86 nicht hat.
+      Zerlegung:
+      1. [x] **`VtdCaps`** einmal beim Hochlauf lesen, protokollieren, jede Bedingung daraus
+         ableiten (nicht an der Verwendungsstelle entscheiden). Dazu die Reihenfolge-Falle
+         behoben: `GCMD` ist kein RMW-Register, und `TE = 0` heißt **freier DMA**, nicht
+         Blockade — jedes Kommando geht jetzt über `gcmd_issue`, das die Zustandsbits aus `GSTS`
+         übernimmt. Ein `SRTP`-Schreibzugriff „nur mit dem Kommandobit" hätte die Übersetzung
+         für die Dauer des Wechsels abgeschaltet, und der Test hätte es als Erfolg gelesen.
+         **Messung auf der Zielplattform (QEMU q35 + intel-iommu):** SAGAW `0x6` (39 **und** 48
+         Bit) → 39 Bit / 3 Level gewählt, damit die Fensterarithmetik nicht zweimal existiert;
+         MGAW 48 → Eingangsgrenze `0x80_0000_0000`, identisch zur ARM-Seite; ND → 65536 Domains;
+         QI und IR vorhanden; Scalable Mode aus; **ein** Fault-Recording-Register.
+         Drei Werte, die Arbeit nach sich ziehen:
+         * **`CM = false`** — anders als erwartet. QEMUs `intel-iommu` hat `caching-mode` per
+           Default **aus**, das heißt: der Aufbau verzeiht hier ein fehlendes „nach dem Anlegen
+           invalidieren", und auf `CM = 1`-Hardware bräche es. Die Richtung der Divergenz ist
+           also umgekehrt zur Erwartung, die Konsequenz dieselbe: unbedingt invalidieren, `CM`
+           nur protokollieren. Für Schritt 3 zusätzlich `caching-mode=on` in den Testaufbau, um
+           genau das zu erzwingen.
+         * **`ECAP.C = false`** — die Einheit ist **nicht** page-walk-kohärent. Schreibvorgänge
+           auf Root-/Context-/Second-Level-Einträge brauchen einen Cache-Clean. Betrifft die
+           Tabellen, nicht die Puffer — ein Pfad, den `dma_granule()` gar nicht abdeckt, und den
+           QEMU nicht bestraft.
+         * **`SC = false`** — keine Snoop Control, No-Snoop ist nicht überstimmbar. „x86 ist
+           kohärent" gilt damit nur, solange kein Gerät No-Snoop benutzt. Gehört als Bedingung
+           an `dma_granule() == 1`, nicht als Konstante.
+      2. [ ] DMAR/DRHD inkl. Device-Scope, **Gruppenbildung aus ACS**, RMRR-Ausschlüsse. Ausgabe:
+         Liste zuteilbarer **Gruppen** (nicht Geräte — ohne ACS auf allen Upstream-Bridges ist
+         die Isolationsgranularität die Gruppe: Peer-to-Peer hinter einem Switch umgeht die
+         IOMMU, Multifunktionsgeräte ohne ACS teilen die RID-Sicht). Die Benennung `dma_group`
+         von Anfang an, nicht nachträglich — sonst hängen Tests an der zu starken Aussage.
+         RMRR-behaftete Geräte werden **abgewiesen und protokolliert**, nicht mit einer Lücke
+         zugeteilt: ein Teil ihres Zugriffs liegt per Konstruktion außerhalb der Kontrolle.
+      3. [ ] Root-/Context-Tabellen + SLPT für **eine** Gruppe, `attach` liefert `Some`. Ab hier
+         hören die vorhandenen Tests auf zu skippen — das ist der Meilenstein.
+         Dabei: **`FPD`** (Fault Processing Disable) im Kontext-Eintrag ist wörtlich `CD.R` noch
+         einmal — gesetzt, würde der Negativtest wieder an einer strukturell leeren Beobachtung
+         bestehen. Und `FSTS.PFO` (Overflow der Fault-Recording-Register) muss in denselben
+         Zähler wie `config_errors()`, sonst bedeutet „keine weiteren Faults" nach einem Sturm
+         nichts. (`fault_overflow()` steht bereits.)
+      4. [ ] Interrupt Remapping (`GCMD.IRE`) inkl. **Abschalten des Compatibility-Format-
+         Interrupts** — IR aktiv bei weiter erlaubtem CFI ist eine offene Tür an der Seite.
+         Eigene Zeile in `docs/invariants.md` §2, weil es dieselbe Struktur hat wie die
+         BME/STE-Arbeitsteilung: zwei Mechanismen, von denen keiner den anderen ersetzt.
 - [ ] **x86-Fensterwahl** (vor der VT-d-Zuteilung, s. C): `0xFEE0_0000–0xFEEF_FFFF` ist als
       IOVA **unbenutzbar**. VT-d behandelt DMA-Requests dorthin als Interrupt-Nachrichten und
       schickt sie durch das Interrupt-Remapping statt durch die Second-Level-Tabellen — eine IOVA

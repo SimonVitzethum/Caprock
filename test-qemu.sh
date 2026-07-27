@@ -72,7 +72,7 @@ echo "== boot ($SECONDS_RUN s) =="
 OUT="$(timeout --signal=KILL "$SECONDS_RUN" qemu-system-aarch64 \
     -machine virt,iommu=smmuv3 -cpu cortex-a72 -smp "$CORES" -m 4G \
     -nographic -serial mon:stdio -no-reboot \
-    -net none -device pcie-root-port,id=rp0,chassis=1 -device virtio-rng-pci,bus=rp0 \
+    -net none -device pcie-root-port,id=rp0,chassis=1 -device virtio-rng-pci,bus=rp0,iommu_platform=on \
     -device loader,file=build/boot-archive.bin,addr=0x13F000000 \
     -kernel "$ELF" </dev/null 2>/dev/null)"
 

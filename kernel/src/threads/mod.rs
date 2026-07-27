@@ -439,7 +439,11 @@ static VRNG_EVTQ: AtomicBool = AtomicBool::new(false); // SMMU-Event-Queue nach 
 static VRNG_CJ_SW: AtomicBool = AtomicBool::new(false); // L1: Out-of-Window software-abgewiesen
 static VRNG_CJ_SENT: AtomicBool = AtomicBool::new(false); // L1 aktiv: Ziel unveraendert
 static VRNG_CJ_UNGUARDED: AtomicBool = AtomicBool::new(false); // Sensitivitaet: Pruefung lasttragend
-static VRNG_SMMU_ENF: AtomicBool = AtomicBool::new(false); // L2: SMMU-Fault (QEMU: false)
+static VRNG_SMMU_ENF: AtomicBool = AtomicBool::new(false); // L2: SMMU-Fault
+static VRNG_EVT_XLAT: AtomicBool = AtomicBool::new(false); // ... F_TRANSLATION
+static VRNG_EVT_SID: AtomicBool = AtomicBool::new(false); //  ... erwartete StreamID
+static VRNG_EVT_IN: AtomicBool = AtomicBool::new(false); //   ... erwartete Input-Adresse
+static VRNG_AXES: AtomicBool = AtomicBool::new(false); //     ext-36b: IOVA != PA
 static VRNG_DONE: AtomicBool = AtomicBool::new(false);
 static VRNG_OK: AtomicBool = AtomicBool::new(false);
 
@@ -914,8 +918,12 @@ fn run_dmagen() -> bool {
     let multiregion = system::testsupport::dma_ctx_region_count(sid) == 3;
     // Richtungsminimales AP + Kohärenz strukturell prüfen (Stage-1-Leaves zurücklesen).
     let l1 = system::testsupport::dma_ctx_stage1(sid);
-    let leaf1 = hal::smmu::stage1_read_leaf(l1, r1.base); // DeviceRead  -> RO, NonCoherent -> NC
-    let leaf2 = hal::smmu::stage1_read_leaf(l1, r2.base); // DeviceWrite -> RW, Coherent    -> WB
+    // Die Stage-1-Tabelle wird mit der **IOVA** indiziert, nicht mit der PA (ext-36 Schritt b).
+    // Bis dahin stand hier `r1.base`/`r2.base` — richtig nur, solange beide Achsen denselben Wert
+    // trugen. Der Test lebte vollständig in `u64` und war deshalb für die Newtypes unsichtbar;
+    // gefunden hat ihn erst das Auseinanderlaufen der Werte.
+    let leaf1 = hal::smmu::stage1_read_leaf(l1, h1.iova.raw()); // DeviceRead  -> RO, NonCoherent -> NC
+    let leaf2 = hal::smmu::stage1_read_leaf(l1, h2.iova.raw()); // DeviceWrite -> RW, Coherent    -> WB
     let dir = hal::smmu::leaf_is_ro(leaf1) && !hal::smmu::leaf_is_ro(leaf2);
     let coh = hal::smmu::leaf_is_cacheable(leaf2) && !hal::smmu::leaf_is_cacheable(leaf1);
     // Stream-Gruppe: sid2 teilt den Kontext (2 StreamIDs -> 1 CD/Stage-1).
@@ -4171,7 +4179,7 @@ pub fn demo_report_then_idle() -> ! {
             // disable gibt sie wieder frei -> balanciert).
             hal::cpu::local_irq_disable();
             let free0 = system::total_free();
-            let en = system::dma_enable(rid, base, DMA_LEN);
+            let en = system::dma_enable(rid, base, DMA_LEN).is_some();
             SMMUB_ENABLE.store(en, Ordering::Release);
             SMMUB_EVTQ.store(
                 system::testsupport::smmu_eventq_empty() && system::testsupport::smmu_gerror() == 0,
@@ -4206,6 +4214,10 @@ pub fn demo_report_then_idle() -> ! {
             VRNG_CJ_SENT.store(res.cj_sentinel_ok, Ordering::Relaxed);
             VRNG_CJ_UNGUARDED.store(res.cj_unguarded_wrote, Ordering::Relaxed);
             VRNG_SMMU_ENF.store(res.cj_smmu_enforced, Ordering::Relaxed);
+            VRNG_EVT_XLAT.store(res.cj_evt_translation, Ordering::Relaxed);
+            VRNG_EVT_SID.store(res.cj_evt_sid_ok, Ordering::Relaxed);
+            VRNG_EVT_IN.store(res.cj_evt_input_ok, Ordering::Relaxed);
+            VRNG_AXES.store(res.cj_axes_differ, Ordering::Relaxed);
             // PASS = echter DMA + Level-1-Software-Erzwingung (demonstrierbar). cj_smmu_enforced
             // (Level 2) ist unter QEMU fuer emulierte Geraete nicht beobachtbar -> NICHT gefordert.
             let ok = res.found
@@ -4215,7 +4227,20 @@ pub fn demo_report_then_idle() -> ! {
                 && res.evtq_empty_good //                In-Window: keine SMMU-Faults
                 && res.cj_sw_blocked //                  L1: Out-of-Window software-abgewiesen
                 && res.cj_sentinel_ok //                 L1 aktiv: Ziel unveraendert
-                && res.cj_unguarded_wrote //             Sensitivitaet: Pruefung lasttragend
+                // Sensitivitaet: OHNE die Software-Pruefung passiert etwas Beobachtbares —
+                // entweder schreibt das Geraet (dann war L1 allein lasttragend) ODER die SMMU
+                // weist den Zugriff ab (dann traegt L2). Seit `iommu_platform=on` uebersetzt
+                // QEMU das Geraet wirklich, also greift hier der zweite Fall. Beide Faelle
+                // belegen, dass der umgangene Pfad nicht einfach folgenlos ist; keiner von
+                // beiden waere fuer sich allein eine ehrliche Forderung.
+                && (res.cj_unguarded_wrote || res.cj_smmu_enforced)
+                && res.cj_axes_differ //                 ext-36b: die Demo lief mit IOVA != PA
+                // Beobachtete die SMMU den Fault (reale HW), muss der Eintrag **passen** —
+                // sonst belegt er nichts. Unter QEMU ist `cj_smmu_enforced` false und die
+                // Implikation trivial wahr; die Forderung ist also nur dort scharf, wo sie
+                // beobachtbar ist, und dort dann vollstaendig.
+                && (!res.cj_smmu_enforced
+                    || (res.cj_evt_translation && res.cj_evt_sid_ok && res.cj_evt_input_ok))
                 && res.audit_ok
                 && system::domain_audit() == 0
                 && system::vspace_audit() == 0;
@@ -5163,9 +5188,12 @@ fn report() {
         VRNG_WRITTEN.load(Ordering::Acquire), VRNG_USED.load(Ordering::Acquire),
         VRNG_R1.load(Ordering::Acquire), VRNG_R0.load(Ordering::Acquire),
         VRNG_EVTQ.load(Ordering::Acquire));
-    println!("virtiorng: KRONJUWEL out-of-window: L1-Software-abgewiesen={} Ziel-unveraendert={} (Sensitivitaet: ohne-Pruefung-Geraet-schrieb={}); L2-SMMU-Fault={} (unter QEMU fuer emulierte Geraete nicht beobachtbar; Stage-1-STE installiert, greift auf realer HW)",
+    println!("virtiorng: KRONJUWEL out-of-window: L1-Software-abgewiesen={} Ziel-unveraendert={} (Sensitivitaet: ohne-Pruefung-Geraet-schrieb={}); L2-SMMU-Fault={} (Stage-1-STE->CD->Pagetable greift, Fault wird als Event aufgezeichnet)",
         VRNG_CJ_SW.load(Ordering::Acquire), VRNG_CJ_SENT.load(Ordering::Acquire),
         VRNG_CJ_UNGUARDED.load(Ordering::Acquire), VRNG_SMMU_ENF.load(Ordering::Acquire));
+    println!("virtiorng: ext-36b Achsen getrennt: IOVA!=PA={} ; Negativtest (Deskriptor traegt absichtlich die PA): Event-F_TRANSLATION={} StreamID-passt={} Input-Adresse-passt={} (mit iommu_platform=on uebersetzt QEMU wirklich -> beobachtbar)",
+        VRNG_AXES.load(Ordering::Acquire), VRNG_EVT_XLAT.load(Ordering::Acquire),
+        VRNG_EVT_SID.load(Ordering::Acquire), VRNG_EVT_IN.load(Ordering::Acquire));
     println!(
         "virtiorng: {} (echter Bus-Master-DMA in die DmaCap-Region; zweistufig: Level-1-Software-Bounds erzwingt In-Window demonstrierbar, Level-2-SMMU als HW-Backstop fuer reale HW)",
         if virtiorng { "ALL PASS" } else { "FAILURES" }

@@ -77,16 +77,11 @@ impl DmaRegion {
         len: 0,
     };
 
-    /// Solange das IOVA-Fenster bei 0 liegt, ist die IOVA gleich der PA (Schritt a).
-    /// **Der einzige Ort, an dem diese Gleichsetzung steht** — Schritt b ersetzt genau ihn
-    /// durch die Vergabe aus dem Fenster des Kontexts.
-    pub const fn identity(pa: Pa, len: u64) -> Self {
-        DmaRegion {
-            iova: Iova::new(pa.raw()),
-            pa,
-            len,
-        }
-    }
+    // `identity(pa, len)` gab es bis ext-36 Schritt a — es setzte IOVA = PA. Der Konstruktor ist
+    // **bewusst entfernt** und nicht nur ungenutzt: bliebe er als bequemer Einstieg stehen,
+    // griffe die nächste Architektur (x86-Zuteilung) genau danach, und die Annahme wäre wieder in
+    // den Übersetzungstabellen. Eine IOVA entsteht jetzt ausschließlich aus dem Fenster eines
+    // Übersetzungskontexts (`ctx_alloc_iova`) — der Typ bietet keinen Weg zurück zur Identität.
 
     pub const fn is_empty(&self) -> bool {
         self.len == 0

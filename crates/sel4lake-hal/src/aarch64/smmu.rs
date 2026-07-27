@@ -70,6 +70,12 @@ fn w32(off: u64, val: u32) {
     unsafe { core::ptr::write_volatile((SMMU_BASE + off) as *mut u32, val) }
 }
 #[inline]
+/// 64-bit-Register lesen (SMMU-MMIO).
+fn r64(off: u64) -> u64 {
+    // SAFETY: feste, EL1-Device-gemappte SMMU-Registerdatei; volatile MMIO.
+    unsafe { core::ptr::read_volatile((SMMU_BASE + off) as *const u64) }
+}
+
 fn w64(off: u64, val: u64) {
     // SAFETY: s.o.; 64-bit-Register (BASE-Register) als ein Zugriff.
     unsafe { core::ptr::write_volatile((SMMU_BASE + off) as *mut u64, val) }
@@ -257,8 +263,9 @@ pub fn tlbi_sync(cmdq_phys: u64, mut prod: u32) -> (u32, bool) {
 //
 // Eine STE (Config = Stage-1) verweist auf einen **Context Descriptor** (CD); der CD enthält
 // TTB0 (Basis der Stage-1-Pagetable), TCR (T0SZ/TG0/...) und MAIR. Die Stage-1-Tabelle bildet
-// IOVA->PA ab. Wir mappen die DMA-Region **identitäts** (IOVA = PA) und lassen alles andere
-// ungemappt -> Translation-Fault (Event-Queue). Format = VMSAv8-64, 4-KiB-Granule, T0SZ=25
+// IOVA->PA ab. Die IOVA wird vom Kernel aus dem Fenster des Übersetzungskontexts vergeben (seit
+// ext-36 **nicht mehr** identisch zur PA); alles andere bleibt ungemappt -> Translation-Fault
+// (Event-Queue). Format = VMSAv8-64, 4-KiB-Granule, T0SZ=25
 // (39-bit, wie die CPU-MMU).
 
 // Stage-1-Deskriptor-Bits (AArch64), lokal (entkoppelt von mmu.rs).
@@ -296,18 +303,24 @@ pub fn stage1_create(alloc: &mut dyn FnMut() -> Option<u64>) -> Option<u64> {
 /// Frames. `false` bei ungültiger Region oder fehlgeschlagener Allokation.
 pub fn stage1_map_region(
     l1: u64,
-    base: u64,
+    iova: u64,
+    pa: u64,
     len: u64,
     ro: bool,
     cacheable: bool,
     alloc: &mut dyn FnMut() -> Option<u64>,
 ) -> bool {
-    if len == 0 || base % PAGE != 0 || len % PAGE != 0 {
+    if len == 0 || iova % PAGE != 0 || pa % PAGE != 0 || len % PAGE != 0 {
+        return false;
+    }
+    // Eingangsbreite der Stage-1 (T0SZ=25 -> 39 Bit). Eine IOVA darüber wäre nicht übersetzbar.
+    if iova.checked_add(len).is_none_or(|e| e > (1u64 << 39)) {
         return false;
     }
     let leaf = s1_leaf_bits(ro, cacheable);
-    let mut p = base;
-    while p < base + len {
+    let mut p = iova;
+    let mut phys = pa;
+    while p < iova + len {
         let i1 = (p / ONE_GIB) as usize;
         let Some(l2) = walk_or_alloc(l1, i1, alloc) else {
             return false;
@@ -318,10 +331,12 @@ pub fn stage1_map_region(
         };
         let i3 = ((p % TWO_MIB) / PAGE) as usize;
         // SAFETY: `l3` ist ein gültiger, identity-gemappter Tabellen-Frame; `i3` < 512.
+        // **Der Blatt-Eintrag trägt die PA, der Index die IOVA** — das ist die Übersetzung.
         unsafe {
-            core::ptr::write_volatile((l3 + (i3 as u64) * 8) as *mut u64, p | leaf);
+            core::ptr::write_volatile((l3 + (i3 as u64) * 8) as *mut u64, phys | leaf);
         }
         p += PAGE;
+        phys += PAGE;
     }
     cpu::dsb_sy();
     true
@@ -403,8 +418,15 @@ fn walk_or_alloc(table_phys: u64, idx: usize, alloc: &mut dyn FnMut() -> Option<
 pub fn write_cd(cd_phys: u64, stage1_l1: u64) {
     // word[0]: T0SZ=25, TG0=0, IR0=OR0=WB(0b01), SH0=inner(0b11), EPD1=1, V=1.
     let w0: u64 = 25 | (0b01 << 8) | (0b01 << 10) | (0b11 << 12) | (1 << 30) | (1 << 31);
-    // word[1]: IPS=0b010 (40-bit), AA64=1 (Bit 9).
-    let w1: u64 = 0b010 | (1 << 9);
+    // word[1]: IPS=0b010 (40-bit), AA64=1 (Bit 9), R=1 (Bit 13, Faults **aufzeichnen**),
+    // A=1 (Bit 14, Terminate-Modell: ein Fault bricht die Transaktion ab, statt sie als
+    // RAZ/WI durchzulassen), ASET=1 (Bit 15).
+    //
+    // `A` ist sicherheitsrelevant und war schlicht vergessen: ohne das Bit ist das Verhalten bei
+    // einem Übersetzungsfehler nicht „abbrechen", und `R` ist der Grund, warum überhaupt ein
+    // Event in der Queue landet — ohne es prüft der Negativtest eine Queue, die per Konfiguration
+    // leer bleibt. Eine Einheit, die die Kombination validiert, antwortet mit `C_BAD_CD`.
+    let w1: u64 = 0b010 | (1 << 9) | (1 << 13) | (1 << 14) | (1 << 15);
     let cd0 = w0 | (w1 << 32);
     let cd1 = stage1_l1 & S1_ADDR_MASK; // TTB0
     let mair0: u64 = 0x00 | (0xFF << 8) | (0x44 << 16);
@@ -447,8 +469,19 @@ pub fn free_stage1(l1: u64, free: &mut dyn FnMut(u64)) {
 pub fn build_ste_stage1(cd_phys: u64) -> [u64; 8] {
     // STE[0]: V=1, Config=0b101 (Stage-1), S1Fmt=0 (linear, 1 CD), S1ContextPtr = cd_phys[51:6].
     let ste0 = (cd_phys & 0x000f_ffff_ffff_ffc0) | (0b101 << 1) | 1;
-    // STE[1]: S1CIR=WB(0b01), S1COR=WB(0b01), S1CSH=inner(0b11), S1STALLD=1 (kein Stall -> abort).
-    let ste1: u64 = (0b01 << 2) | (0b01 << 4) | (0b11 << 6) | (1 << 27);
+    // STE[1]: S1CIR=WB(0b01), S1COR=WB(0b01), S1CSH=inner(0b11).
+    //
+    // `S1STALLD` (Bit 27) heißt „Stalling für diesen Stream **verbieten**" und ist nur dann eine
+    // zulässige Wahl, wenn die Einheit beide Modelle beherrscht (`IDR0.STALL_MODEL == 0b10`).
+    // Meldet sie 0b00 („Faults terminieren immer"), ist das Bit gegenstandslos, und bei 0b01
+    // („Stall erzwungen") ist es schlicht verboten — eine Einheit, die das prüft, antwortet mit
+    // `C_BAD_STE`, und der Stream übersetzt **gar nicht**. Genau das tat QEMU, blieb aber
+    // unbemerkt, solange das Gerät die IOMMU ohnehin umging (kein `iommu_platform=on`) und
+    // IOVA == PA war: beide Fehler zusammen sahen aus wie ein funktionierender Aufbau.
+    // Ohne das Bit terminieren Faults über `CD.S == 0` — dasselbe gewünschte Verhalten.
+    let stall_model = (idr0() >> 24) & 0b11;
+    let stalld = if stall_model == 0b10 { 1u64 << 27 } else { 0 };
+    let ste1: u64 = (0b01 << 2) | (0b01 << 4) | (0b11 << 6) | stalld;
     [ste0, ste1, 0, 0, 0, 0, 0, 0]
 }
 
@@ -472,6 +505,47 @@ pub fn drain_eventq() -> u32 {
     cpu::dsb_sy();
     n
 }
+/// Ein Eintrag der Event-Queue, so weit hier gebraucht.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventRecord {
+    /// Ereignistyp (`EVT_*`), Bits [7:0] von Wort 0.
+    pub kind: u8,
+    /// StreamID der verursachenden Transaktion (Wort 0, Bits [63:32]).
+    pub stream_id: u32,
+    /// **Eingangs**adresse der fehlgeschlagenen Übersetzung — die IOVA, die das Gerät
+    /// angefordert hat (Wort 2 bei den Translation-Fault-Typen).
+    pub input_addr: u64,
+}
+
+/// `F_TRANSLATION` — die Übersetzung schlug fehl, weil kein gültiger Eintrag existiert.
+/// Genau der Typ, den eine Anforderung auf eine **nicht zugeteilte** Adresse erzeugt.
+pub const EVT_F_TRANSLATION: u8 = 0x10;
+
+/// Den **ältesten** Eintrag der Event-Queue lesen, ohne ihn zu verbrauchen.
+///
+/// Für Tests, die einen Fault nicht nur *zählen*, sondern belegen müssen, dass er der erwartete
+/// ist: ein bloßer Zähler bestünde auch bei einem Fault aus ganz anderem Grund.
+pub fn eventq_peek() -> Option<EventRecord> {
+    if eventq_empty() {
+        return None;
+    }
+    let mask = (1u64 << LOG2_EVENTQ) - 1;
+    let idx = (r32(EVENTQ_CONS) as u64) & mask;
+    let base = r64(EVENTQ_BASE) & 0x000f_ffff_ffff_ffe0;
+    let rec = base + idx * EVT_BYTES;
+    // SAFETY: `rec` liegt in der vom Kernel allozierten, identity-gemappten Event-Queue; gelesen
+    // werden genau die beiden Worte des Eintrags.
+    unsafe {
+        let w0 = core::ptr::read_volatile(rec as *const u64);
+        let w2 = core::ptr::read_volatile((rec + 16) as *const u64);
+        Some(EventRecord {
+            kind: (w0 & 0xff) as u8,
+            stream_id: (w0 >> 32) as u32,
+            input_addr: w2,
+        })
+    }
+}
+
 /// Byte-Größen der drei Strukturen (für die RAM-Allokation durch den Aufrufer).
 pub fn strtab_bytes() -> u64 {
     (1u64 << LOG2_STRTAB) * STE_BYTES

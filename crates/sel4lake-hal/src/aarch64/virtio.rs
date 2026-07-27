@@ -24,6 +24,16 @@ const STATUS_FEATURES_OK: u8 = 8;
 
 // VIRTIO_F_VERSION_1 = Bit 32 (Feature-Select 1, Bit 0).
 const VIRTIO_F_VERSION_1_HI: u32 = 1 << 0;
+/// `VIRTIO_F_ACCESS_PLATFORM` = Bit 33 (Feature-Select 1, Bit 1).
+///
+/// Das ist die Zusage des Geräts, Adressen **so zu behandeln, wie die Plattform sie meint** —
+/// also durch die IOMMU zu laufen statt physisch am Kernel vorbei. Ohne dieses Bit greift ein
+/// emuliertes virtio-Gerät in QEMU direkt auf `address_space_memory` zu und ignoriert die SMMU,
+/// auch wenn `iommu=smmuv3` gesetzt ist. Solange IOVA == PA war, fiel das nicht auf; seit ext-36
+/// Schritt b ist es der Unterschied zwischen „funktioniert" und „liest Müll oberhalb des RAM".
+/// Der Treiber verlangt es deshalb **verbindlich** und bricht sonst ab, statt still auf
+/// physische Adressen zurückzufallen — genau dieser Rückfall wäre die Achsenverwechslung.
+const VIRTIO_F_ACCESS_PLATFORM_HI: u32 = 1 << 1;
 
 // virtq-Deskriptor-Flag: Gerät schreibt in den Puffer.
 const VIRTQ_DESC_F_WRITE: u16 = 2;
@@ -150,10 +160,23 @@ impl VirtioRng {
     /// übergeben werden -> die SMMU faultet, das Gerät schreibt NICHT. Gibt
     /// `(used_advanced, written_len)`: ob der used-Ring fortschritt + die vom Gerät gemeldete
     /// Byte-Zahl. Für In-Window erwartet: used_advanced=true, written_len>0.
-    pub unsafe fn request(&self, dma_base: u64, desc_addr: u64) -> (bool, u32) {
-        let desc = dma_base + OFF_DESC;
-        let avail = dma_base + OFF_AVAIL;
-        let used = dma_base + OFF_USED;
+    /// `cpu_base` ist die **physische** Basis der Virtqueue (die CPU beschreibt die Ringe
+    /// darüber), `dev_base` die **Gerätesicht** derselben Struktur (sie wird in die
+    /// Queue-Adressregister programmiert), `desc_addr` die Gerätesicht des Zielpuffers.
+    ///
+    /// Bis ext-36 war das **ein** Parameter, weil beide Adressen denselben Wert trugen. Mit einem
+    /// IOVA-Fenster ≠ 0 fallen sie auseinander, und ein Treiber, der sie vermischt, programmiert
+    /// dem Gerät eine Adresse, die es nicht auflösen kann — oder beschreibt eine, unter der
+    /// nichts liegt. Deshalb getrennt, auch wo es umständlicher aussieht.
+    pub unsafe fn request(&self, cpu_base: u64, dev_base: u64, desc_addr: u64) -> (bool, u32) {
+        // CPU-Sicht: hier schreibt/liest der Treiber die Ringe.
+        let desc = cpu_base + OFF_DESC;
+        let avail = cpu_base + OFF_AVAIL;
+        let used = cpu_base + OFF_USED;
+        // Gerätesicht: das kommt in die Queue-Adressregister.
+        let dev_desc = dev_base + OFF_DESC;
+        let dev_avail = dev_base + OFF_AVAIL;
+        let dev_used = dev_base + OFF_USED;
 
         // 1. Reset.
         self.status(0);
@@ -166,11 +189,21 @@ impl VirtioRng {
         // 2./3. ACKNOWLEDGE + DRIVER.
         self.status(STATUS_ACK);
         self.status(STATUS_ACK | STATUS_DRIVER);
-        // 4. Feature-Negotiation: nur VIRTIO_F_VERSION_1.
+        // 4. Feature-Negotiation: VIRTIO_F_VERSION_1 + VIRTIO_F_ACCESS_PLATFORM. Letzteres muss
+        // das Gerät anbieten — bietet es das nicht an, würde es die IOMMU umgehen, und der
+        // Treiber hätte keine Möglichkeit, das zu bemerken. Also hier abbrechen.
+        wr32(self.common + cc::DEVICE_FEATURE_SELECT, 1);
+        let offered_hi = rd32(self.common + cc::DEVICE_FEATURE);
+        if offered_hi & VIRTIO_F_ACCESS_PLATFORM_HI == 0 {
+            return (false, 0);
+        }
         wr32(self.common + cc::DRIVER_FEATURE_SELECT, 0);
         wr32(self.common + cc::DRIVER_FEATURE, 0);
         wr32(self.common + cc::DRIVER_FEATURE_SELECT, 1);
-        wr32(self.common + cc::DRIVER_FEATURE, VIRTIO_F_VERSION_1_HI);
+        wr32(
+            self.common + cc::DRIVER_FEATURE,
+            VIRTIO_F_VERSION_1_HI | VIRTIO_F_ACCESS_PLATFORM_HI,
+        );
         // 5. FEATURES_OK.
         self.status(STATUS_ACK | STATUS_DRIVER | STATUS_FEATURES_OK);
         if self.get_status() & STATUS_FEATURES_OK == 0 {
@@ -181,9 +214,9 @@ impl VirtioRng {
         let qmax = rd16(self.common + cc::QUEUE_SIZE);
         let qsize = if qmax == 0 || qmax >= Q_SIZE { Q_SIZE } else { qmax };
         wr16(self.common + cc::QUEUE_SIZE, qsize);
-        wr64(self.common + cc::QUEUE_DESC, desc);
-        wr64(self.common + cc::QUEUE_DRIVER, avail);
-        wr64(self.common + cc::QUEUE_DEVICE, used);
+        wr64(self.common + cc::QUEUE_DESC, dev_desc);
+        wr64(self.common + cc::QUEUE_DRIVER, dev_avail);
+        wr64(self.common + cc::QUEUE_DEVICE, dev_used);
         let notify_off = rd16(self.common + cc::QUEUE_NOTIFY_OFF);
         wr16(self.common + cc::QUEUE_ENABLE, 1);
         // 7. DRIVER_OK.

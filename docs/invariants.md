@@ -165,8 +165,19 @@ ziehen, Lock freigeben, dann gegen `CAPS.read().for_each_dma` prüfen — Rangor
 
 Ein DMA-Puffer hat zwei Adressen: die **physische** (CPU-Sicht — Cache-Wartung, Allokator,
 Lebendigkeitsprüfung) und die **IOVA** (Gerätesicht — Stage-1-Abbildung, Deskriptorinhalt,
-Bounds-Prüfung des Treibers). Sie tragen heute denselben Zahlenwert; ab dem IOVA-Fenster
-(`todo.md` E, Schritt b) laufen sie auseinander.
+Bounds-Prüfung des Treibers). Seit Schritt b **laufen sie auseinander**: eine IOVA entsteht
+ausschließlich aus dem Fenster eines Übersetzungskontexts (`ctx_alloc_iova`), dessen Basis
+oberhalb von `RAM_TOP` liegt. Es gibt keinen Konstruktor mehr, der IOVA = PA setzt
+(`DmaRegion::identity` ist entfernt, nicht nur ungenutzt), und keine Rechenbeziehung zwischen
+beiden — `detach` findet die IOVA über die geführte Region, nicht über Arithmetik.
+
+**Fenster und Schutzbänder:** Basis = erste `IOVA_GUARD`-ausgerichtete Adresse oberhalb `RAM_TOP`,
+je Kontext 1 GiB aus einem globalen Bump. Innerhalb des Fensters wird jede Region
+`IOVA_GUARD`-ausgerichtet vergeben, mit anschließendem Schutzband, und eine IOVA wird **nie**
+wiederverwendet. `IOVA_GUARD` ist mit 2 MiB auf die größte Stage-1-Blockgranularität dimensioniert
+— ein 4-KiB-Band könnte von einem Block-Mapping überspannt werden und wäre dann keins. IOVA 0
+bleibt unabgebildet. Die Eingangsbreite ist durch `CD.T0SZ = 25` auf 39 Bit begrenzt; eine
+Fensterbasis darüber wäre nicht übersetzbar und wird abgelehnt.
 
 **Invariante:** Die beiden Achsen sind **typgetrennt** (`addr::Pa` / `addr::Iova`), nicht nur
 benannt. Eine Verwechslung ist damit ein Compilerfehler, keine stille Fehlfunktion — das ist
@@ -183,6 +194,29 @@ dort die IOVA stehen, überlappte ab Schritt b nie etwas — das Oracle bliebe g
 zu prüfen. Code 5 prüft deshalb, dass die geführten PA-Werte im RAM-Fenster des Allokators liegen;
 eine vertauschte Achse schlägt dort an. (Ein Oracle, das nach einem Achsenwechsel unverändert grün
 bleibt, ist der Normalfall des Blindwerdens — nicht der Beleg, dass alles stimmt.)
+
+**Beleg (negativ, `virtiorng`):** Ein Oracle, das nur bestätigt, ist kein Beleg. Der Test gibt dem
+Gerät im Deskriptor absichtlich die **PA** statt der IOVA — die Verwechslung, die vor Schritt b
+folgenlos war — und verlangt drei Dinge: die Event-Queue ist **vorher** geleert (sonst bestünde er
+an einem Altbestand), der Eintrag wird **geprüft statt gezählt** (`F_TRANSLATION`, erwartete
+StreamID, Input-Adresse gleich der eingetragenen PA), und im selben Lauf geht dieselbe Anfrage mit
+der korrekten IOVA durch, **ohne** Event (Positivkontrolle). `cj_axes_differ` belegt zusätzlich,
+dass der Lauf überhaupt mit IOVA != PA stattfand — ohne das prüfte der Negativtest nichts.
+
+Damit das messbar ist, muss das Gerät die IOMMU auch wirklich benutzen: der virtio-Treiber
+verlangt **verbindlich** `VIRTIO_F_ACCESS_PLATFORM` und bricht sonst ab, statt still auf physische
+Adressen zurückzufallen — dieser Rückfall *wäre* die Achsenverwechslung. Erst dadurch wurden zwei
+Konfigurationsfehler sichtbar, die vorher niemand bemerken konnte, weil das emulierte Gerät die
+SMMU umging: `STE.S1STALLD` war unbedingt gesetzt (zulässig nur bei `IDR0.STALL_MODEL == 0b10`,
+sonst `C_BAD_STE` — der Stream übersetzte **gar nicht**), und im CD fehlten `A` (Terminate-Modell:
+Fault bricht ab) und `R` (Fault wird als Event aufgezeichnet). Zwei Fehler, die sich gegenseitig
+verdeckten und zusammen wie ein funktionierender Aufbau aussahen.
+
+**Was Newtypes nicht finden:** Sie markieren Kanten. Eine Funktion, die vollständig in `u64` lebt,
+ist keine Kante, sondern ein Loch — der `dmagen`-Test las die Stage-1-Blätter mit `r1.base` (PA)
+statt mit der IOVA und blieb für den Compiler unsichtbar; gefunden hat ihn erst das
+Auseinanderlaufen der Werte. Die Restprüfung ist deshalb ein `grep` nach `raw()` im DMA-Pfad
+(16 Stellen, jede einzeln begründet).
 
 **Was das Audit NICHT trägt:** Es findet die Verletzung, es verhindert sie nicht. Die Reihenfolge
 ist eine bewiesene Vorbedingung, keine erzwungene — `free_region` ist über `PhysRegion` aufrufbar,

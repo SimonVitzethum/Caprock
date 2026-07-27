@@ -29,9 +29,10 @@ soak = []
 
 # Der Kernel-Kern + die aarch64-HAL: derzeit aarch64-spezifisch. Auf dem x86_64-Branch (Stufe 0:
 # nur Boot+Serial) werden sie NICHT kompiliert; Stufe fuer Stufe werden die arch-agnostischen Crates
-# (cap/sched/ipc/mem/...) auf eine gemeinsame [dependencies]-Sektion gehoben, sobald sie fuer x86_64
-# bauen. So bleibt aarch64 auf diesem Branch jederzeit baubar (Regressionssicherheit).
-[target.'cfg(target_arch = "aarch64")'.dependencies]
+# ext-31: Alle Subsystem-Crates bauen jetzt fuer BEIDE Architekturen (die HAL waehlt ihre
+# Implementierung per cfg(target_arch), s. sel4lake-hal). Die frueher aarch64-only Sektion
+# entfaellt damit.
+[dependencies]
 sel4lake-hal = { path = "../crates/sel4lake-hal" }
 sel4lake-sync = { path = "../crates/sel4lake-sync" }
 sel4lake-slab = { path = "../crates/sel4lake-slab" }
@@ -44,4 +45,7 @@ sel4lake-sched = { path = "../crates/sel4lake-sched" }
 sel4lake-ipc = { path = "../crates/sel4lake-ipc" }
 sel4lake-abi = { path = "../crates/sel4lake-abi" }
 sel4lake-microkit = { path = "../crates/sel4lake-microkit" }
+
+# Device-Tree gibt es nur auf der ARM-Plattform (x86 nutzt Multiboot/ACPI).
+[target.'cfg(target_arch = "aarch64")'.dependencies]
 sel4lake-dtb = { path = "../crates/sel4lake-dtb" }

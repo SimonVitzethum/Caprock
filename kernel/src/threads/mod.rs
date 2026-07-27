@@ -4550,7 +4550,7 @@ pub fn demo_report_then_idle() -> ! {
             #[cfg(not(feature = "soak"))]
             {
                 println!("== SELFTEST COMPLETE -> system_off ==");
-                hal::psci::system_off();
+                hal::power::system_off();
             }
         } else if !reported && hal::timer::ticks(0) > 6000 {
             // BUGFIX (nach Burn-in #1): Watchdog. Wird ein synchroner Test selten DONE-aber-OK=false
@@ -4563,7 +4563,7 @@ pub fn demo_report_then_idle() -> ! {
             println!("== SELFTEST WATCHDOG: all_done() nicht erreicht nach ~60s -> offene Tests: ==");
             report();
             println!("== SELFTEST FAILED (watchdog) -> system_off ==");
-            hal::psci::system_off();
+            hal::power::system_off();
         }
         hal::cpu::wfi();
     }

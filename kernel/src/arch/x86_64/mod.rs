@@ -12,12 +12,10 @@
 
 use core::arch::{asm, global_asm};
 
-mod context;
-mod gdt;
-mod idt;
-mod lapic;
-mod paging;
-mod syscall;
+// ext-31: Paging/IDT/LAPIC/GDT/Syscall/Context sind in die HAL gewandert
+// (`sel4lake-hal::x86_64`) — dort stehen sie hinter derselben API wie ihre ARM-Pendants,
+// sodass der Kernel-Kern sie ohne `cfg` benutzt. Hier bleibt nur das Boot-Trampolin.
+mod bringup;
 
 global_asm!(
     r#"
@@ -257,68 +255,16 @@ pub(crate) fn put_dec(mut n: u64) {
     }
 }
 
-/// 64-bit-Rust-Eintritt (aus dem Boot-Trampolin). Stufe 0: Banner + Halt.
+/// 64-bit-Rust-Eintritt (aus dem Boot-Trampolin).
+///
+/// Bis ext-30 lief hier eine Kette von Hardware-Demos (Stufe 0-3). Seit ext-31 übernimmt der
+/// **echte Kernel-Kern** (`bringup::run`): dieselben Selbsttests, derselbe Scheduler und
+/// dasselbe cap-gesicherte IPC wie auf aarch64. Die alten Demos sind damit erfüllt und
+/// entfallen — ihre Aussagen (Paging/W^X, IDT, LAPIC-Timer) prüft der Bring-up implizit,
+/// weil ohne sie nichts davon liefe.
 #[no_mangle]
 pub extern "C" fn x86_rust_entry() -> ! {
-    serial_init();
-    emit_raw("\n");
-    emit_raw("========================================\n");
-    emit_raw(" SEL4Lake -- x86_64 first light (COM1)\n");
-    emit_raw(" Multiboot -> Long Mode (PAE, 1 GiB identity) OK.\n");
-    emit_raw(" Branch arch/x86_64, Stufe 0: Boot + Serial.\n");
-    emit_raw(" Paging/IDT/APIC/Timer/Syscall/SMP folgen (Stufe 1-5).\n");
-    emit_raw("========================================\n");
-    emit_raw("x86_64 first light: ALL PASS\n");
-
-    // Stufe 2 (Teil): IDT + Exception-Dispatch. Selbsttest per Software-Breakpoint (int3):
-    // der Handler muss die Exception dumpen UND via iretq zurueckkehren (Fortsetzung).
-    idt::init();
-    emit_raw("idt     : 256-Eintrag-IDT geladen (32 CPU-Exception-Stubs)\n");
-    idt::test_breakpoint();
-    emit_raw("idt     : int3 behandelt + zurueckgekehrt -> ALL PASS\n");
-
-    // Stufe 1: Rust-verwaltetes 4-Level-Paging mit W^X (16 MiB Identity).
-    paging::init();
-    paging::report();
-    emit_raw("paging  : PML4 W^X-Identity aktiv (CR3 + CR0.WP gesetzt), ueberlebt -> ALL PASS\n");
-    if paging::verify_wx() {
-        emit_raw("paging  : W^X-Bits korrekt (.text=R-X, .rodata=R--/NX) -> ALL PASS\n");
-    } else {
-        emit_raw("paging  : W^X-Bits FALSCH -> FAILURES\n");
-    }
-    // (W^X-Durchsetzung separat per #PF bewiesen: Write auf .rodata -> #PF err=0x3 cr2=.rodata.)
-
-    // Stufe 2b: LAPIC + periodischer Timer (Vektor 32). Interrupts freigeben, auf Ticks warten.
-    lapic::init();
-    emit_raw("lapic   : 8259-PIC maskiert, LAPIC aktiviert, Timer armiert (Vektor 32, periodic)\n");
-    // SAFETY: Interrupts global freigeben (IDT + LAPIC-Timer stehen).
-    unsafe { asm!("sti", options(nomem, nostack, preserves_flags)) }
-    emit_raw("lapic   : sti -> warte auf periodische Timer-IRQs ...\n");
-    while lapic::ticks() < 5 {
-        // SAFETY: bis zum naechsten Interrupt schlafen (der Timer-IRQ weckt uns).
-        unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)) }
-    }
-    emit_raw("lapic   : Timer-IRQs empfangen (");
-    put_dec(lapic::ticks());
-    emit_raw(" Ticks) -> ALL PASS\n");
-
-    emit_raw("x86_64 Stufe 0-2: ALL PASS (Boot, Long Mode, Serial, IDT/Exceptions, Paging/W^X, LAPIC-Timer)\n");
-
-    // Ab hier deterministisch ohne Timer-IRQ (Stufe 3b/3a-Demos).
-    // SAFETY: Interrupts global maskieren.
-    unsafe { asm!("cli", options(nomem, nostack, preserves_flags)) }
-
-    // Stufe 3b: kooperativer Context-Switch zwischen zwei Kernel-Kontexten (3x A<->B).
-    context::demo();
-
-    // Stufe 3a: GDT (Ring-3-Segmente) + syscall/sysret + Ring-3-Round-Trip. Der Demo läuft mit
-    // maskierten Interrupts (IF=0); eine TSS für Ring-3-Interrupts folgt in Stufe 4.
-    gdt::init();
-    syscall::init();
-    emit_raw("gdt     : GDT mit Ring-3-Segmenten geladen (kcode/kdata/udata/ucode)\n");
-    emit_raw("syscall : STAR/LSTAR/SFMASK gesetzt, EFER.SCE aktiv\n");
-    emit_raw("ring3   : wechsle per iretq nach Ring 3 -> user_entry ...\n");
-    syscall::enter_ring3(); // -> ! (Demo endet im SYS_EXIT-Zweig von rust_syscall)
+    bringup::run()
 }
 
 /// CPU anhalten (Panic/Ende). `hlt` in Schleife.

@@ -35,19 +35,47 @@ Mode die aktive Identity-Map nicht löscht; PML4/PDPT werden im 32-bit-Trampolin
 
 | Stufe | Inhalt | Status |
 |---|---|---|
-| **0** | Boot (Multiboot→Long Mode) + 16550-Serial (COM1) + Banner | ✅ **QEMU-verifiziert** (`== ALL PASS ==`) |
-| 1 | 4-Level-Paging (PML4..PT) + W^X-Identity-Map (`mmu`-API) | offen |
-| 2 | IDT/Exceptions + LAPIC/IOAPIC + LAPIC-Timer (`intc`/`timer`) | offen |
-| 3 | Syscall (`syscall`/`sysret`) + ring3-User-Mode + Context-Switch (x86-Register) | offen |
-| 4 | SMP (APIC INIT-SIPI-SIPI) + `system_off` + Kern-Module für x86 aktivieren | offen |
-| 5 | volle Selbsttest-Suite unter `qemu-system-x86_64` grün | offen |
+| **0** | Boot (Multiboot→Long Mode) + 16550-Serial (COM1) | ✅ QEMU-verifiziert |
+| **1** | 4-Level-Paging (PML4..PT) + W^X-Identity-Map + `CR0.WP` | ✅ QEMU-verifiziert |
+| **2** | IDT/Exceptions (256 Stubs) + LAPIC + periodischer Timer (gegen PIT kalibriert) | ✅ QEMU-verifiziert |
+| **3** | GDT/TSS + Ring 3 + `syscall`/`sysret` + Context-Switch | ✅ QEMU-verifiziert |
+| **4** | **Kernel-Kern läuft**: HAL architekturselektiv, Selbsttests + Scheduler + cap-gesicherte IPC | ✅ QEMU-verifiziert |
+| 5 | SMP, isolierte Adressräume (PCID), Ring-3-PDs, Loader, IOMMU | offen (s. `todo.md` C6) |
 
-Der **Kernel-Kern** (Caps/Sched/IPC/Loader/Cert/Audits) ist arch-agnostisch; in Stufe 0 ist er auf
-diesem Branch noch **nicht** aktiv (die `sel4lake-*`-Crates + die aarch64-HAL sind in `kernel/Cargo.toml`
-aarch64-only). Stufe für Stufe werden die arch-agnostischen Crates auf eine gemeinsame
-`[dependencies]`-Sektion gehoben, sobald sie für x86_64 bauen, und eine x86_64-HAL (Paging, APIC,
-Timer, Syscall, Context-Switch, SMP) implementiert — bei jeder Stufe bleibt aarch64 baubar und die
-x86-QEMU-Simulation wird neu durchlaufen.
+### Stufe 4 (ext-31): der eigentliche Microkernel
+
+Bis Stufe 3 war der x86-Zweig eine Kette von **Hardware-Demos** — der Kernel-Kern selbst war
+auf diesem Branch gar nicht einkompiliert (`sel4lake-*` waren aarch64-only). Seit ext-31 ist
+`sel4lake-hal` **architekturselektiv** (`src/aarch64/` und `src/x86_64/` hinter derselben API),
+und damit läuft auf x86 derselbe Kern wie auf ARM:
+
+```
+memtest : ALL PASS      <- identische arch-neutrale Selbsttests
+zerotest: ALL PASS
+captest : ALL PASS
+budget  : ALL PASS
+sched   : 1 Kern, 256 Thread-Slots (512 hostbar), Tabellen 208 KiB aus dem RAM
+sched   : Worker-Runden [3, 3, 3]  -> ALL PASS   (LAPIC-Timer verdraengt praeemptiv)
+ipc     : CALL(21) ueber Endpoint-Cap -> 42      -> ALL PASS
+audit   : sched_audit=0 cdt_audit=0              -> ALL PASS
+```
+
+**Der Kernel-Kern enthält kein einziges `cfg(target_arch)`.** Möglich ist das, weil beide
+Architekturen dasselbe **Trap-Modell** benutzen: Registersatz in einen `TrapFrame` auf dem
+Stack, Handler bekommt dessen Adresse, Rückgabewert ist der wiederherzustellende Frame —
+der Kontextwechsel ist auf beiden Seiten ein reiner Stackzeiger-Tausch (`eret` bzw. `iretq`).
+
+Was auf x86 **noch fehlt** (ehrlich als „nicht unterstützt" gemeldet, nicht halb umgesetzt):
+
+- **SMP**: `power::cpu_on` meldet `NOT_SUPPORTED` (INIT-SIPI-SIPI + Realmode-Trampolin fehlen).
+- **Isolierte Adressräume**: die `vspace_*`-Funktionen melden `false`; es fehlen PCID-Verwaltung
+  und ein per-VSpace-Tabellenpool. Damit gibt es auf x86 (noch) keine Ring-3-PDs.
+- **IOMMU**: statt SMMUv3 greift der `NullIommuEnforcer` — er setzt **keine** Hardware-Isolation
+  durch und sagt das auch (`is_active() == false`). Die softwareseitigen DMA-Garantien
+  (Ownership, Bounds, Revoke-Reihenfolge, Audits) sind davon unberührt.
+- **Boot-Archiv/Loader**: `SYS_LOAD` schlägt sauber fehl (das ARM-Fenster hat auf x86 kein
+  Gegenstück; die Entsprechung wären Multiboot-Module).
+- **RAM-Größe**: fest 512 MiB statt aus der Multiboot-Info (das Trampolin reicht `EBX` nicht durch).
 
 ## Geänderte/neue Dateien (ggü. `master`)
 

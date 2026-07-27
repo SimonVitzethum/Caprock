@@ -20,7 +20,7 @@
 //!
 //! Sämtliches `unsafe` hier ist MMU-/Registerinitialisierung — erlaubte Domäne.
 
-use crate::cpu;
+use super::cpu;
 use core::arch::asm;
 use core::cell::UnsafeCell;
 
@@ -202,7 +202,7 @@ fn build_tables() {
     // SAFETY: reine Adressberechnung.
     let kernel_end = unsafe { sym(&__kernel_end) };
     if kernel_end > RAM_BASE + TWO_MIB {
-        crate::console::emit_raw("[mmu] WARNUNG: Kernelimage > 2 MiB, W^X-Mapping unvollständig!\n");
+        super::console::emit_raw("[mmu] WARNUNG: Kernelimage > 2 MiB, W^X-Mapping unvollständig!\n");
     }
 }
 

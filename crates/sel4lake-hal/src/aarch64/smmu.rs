@@ -13,7 +13,7 @@
 //!
 //! SMMUv3 `@0x0905_0000` (QEMU virt). Register-Offsets nach ARM IHI 0070.
 
-use crate::cpu;
+use super::cpu;
 
 pub const SMMU_BASE: u64 = 0x0905_0000;
 

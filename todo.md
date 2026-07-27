@@ -114,12 +114,27 @@ brauchen auf ARM **GICv3/GICv4** (Redistributoren je Kern, `ICC_SGI1R_EL1`, ITS 
 testbar**, unabhängig von den Kapazitäten. Die Kapazitätsseite ist seit ext-30 vorbereitet
 (`MAX_CORES = 256`, Tabellen zur Boot-Zeit dimensioniert) — es fehlt die Interrupt-Hardware.
 
-### C6. x86-64-Port (später, laut Zielbild)
+### C6. x86-64-Port — **Stufe 4 erreicht** (ext-31, Branch `arch/x86_64`)
 
-EPYC ist x86-64. Betroffen: Boot (kein PSCI → ACPI/MADT + INIT-SIPI), Exception-/Syscall-Pfad
-(IDT + `syscall`/`sysret` statt Vektortabelle + `svc`), MMU (4-/5-Level statt ARM-Deskriptoren, kein
-ASID → PCID), IRQ (APIC/x2APIC statt GIC), Timer (TSC-Deadline/HPET statt CNTP), IOMMU (VT-d/AMD-Vi
-statt SMMUv3). Der capability-/IPC-/Scheduler-Kern ist portabel; die HAL ist es nicht.
+`sel4lake-hal` ist jetzt architekturselektiv (`src/aarch64/` + `src/x86_64/` hinter derselben API).
+Der **Kernel-Kern läuft auf x86_64**: dieselben Selbsttests, derselbe präemptive Scheduler,
+dasselbe cap-gesicherte IPC — ohne ein einziges `cfg(target_arch)` im Kern. Details:
+`README-X86.md`.
+
+- [x] Boot (Multiboot→Long Mode), Serial, 4-Level-Paging + W^X + `CR0.WP`
+- [x] IDT/Exceptions (256 Stubs, einheitliches Frame-Layout), LAPIC, Timer (PIT-kalibriert)
+- [x] GDT/TSS, Ring 3, `syscall`/`sysret`, Context-Switch
+- [x] HAL architekturselektiv; alle 13 Crates bauen für beide Architekturen
+- [x] Kernel-Kern auf x86: Allokator, Capability-System, Scheduler (präemptiv), IPC, Audits
+- [ ] **SMP**: INIT-SIPI-SIPI + Realmode-Trampolin (`power::cpu_on` meldet derzeit `NOT_SUPPORTED`)
+- [ ] **Isolierte Adressräume**: PCID-Verwaltung + per-VSpace-Tabellenpool (`vspace_*` melden `false`)
+      → ohne sie gibt es auf x86 keine Ring-3-PDs
+- [ ] **IOMMU**: VT-d/AMD-Vi statt SMMUv3 (derzeit `NullIommuEnforcer`, ohne HW-Durchsetzung)
+- [ ] **PCI-ECAM** über ACPI-MCFG (statt des `virt`-Board-Fensters)
+- [ ] **Boot-Archiv** über Multiboot-Module (`SYS_LOAD` schlägt derzeit sauber fehl)
+- [ ] **RAM-Plan** aus der Multiboot-Info statt fester 512 MiB (Trampolin reicht `EBX` nicht durch)
+- [ ] Die ARM-seitigen Demo-/Testdienste (`threads/mod.rs`, 5000 Zeilen) sind stark ARM-gekoppelt
+      (EL0-Isolation, MMIO/RTC, DMA) — auf x86 läuft derzeit ein kompakter eigener Bring-up-Test
 
 ---
 

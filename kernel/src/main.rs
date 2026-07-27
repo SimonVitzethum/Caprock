@@ -19,17 +19,14 @@ extern crate alloc;
 
 /// Wächter-Global-Allocator: das SAS-Modell verlangt **prozess-lokale** Heap-Instanzen
 /// (`Heap::new(source)` + `*_in(&heap)`). Ein impliziter globaler Heap existiert nicht.
-#[cfg(target_arch = "aarch64")]
 struct NoGlobalHeap;
 // SAFETY: niemals ein Block vergeben/freigegeben; jede Nutzung paniert (= Designfehler-Wächter).
-#[cfg(target_arch = "aarch64")]
 unsafe impl core::alloc::GlobalAlloc for NoGlobalHeap {
     unsafe fn alloc(&self, _l: core::alloc::Layout) -> *mut u8 {
         panic!("kein globaler Heap im SAS — prozess-lokale Heap-Instanz nutzen (*_in)")
     }
     unsafe fn dealloc(&self, _p: *mut u8, _l: core::alloc::Layout) {}
 }
-#[cfg(target_arch = "aarch64")]
 #[global_allocator]
 static GLOBAL: NoGlobalHeap = NoGlobalHeap;
 
@@ -39,9 +36,7 @@ mod panic;
 // noch nicht aktiv — er wird Stufe fuer Stufe fuer x86_64 eingeschaltet (s. README-X86.md).
 #[cfg(target_arch = "aarch64")]
 mod loader;
-#[cfg(target_arch = "aarch64")]
 mod selftest;
-#[cfg(target_arch = "aarch64")]
 mod system;
 #[cfg(target_arch = "aarch64")]
 mod threads;
@@ -97,7 +92,7 @@ fn secondary_stack_top(core: usize) -> u64 {
 /// Pro-Kern-Interrupt-Init (nach MMU). VBAR wird bereits vor der MMU gesetzt.
 #[cfg(target_arch = "aarch64")]
 fn init_core_irqs() {
-    hal::gic::init_cpu(); // GIC-CPU-Interface (pro Kern)
+    hal::intc::init_cpu(); // GIC-CPU-Interface (pro Kern)
     hal::timer::init(TICK_HZ); // Timer-PPI armieren (pro Kern)
 }
 
@@ -127,7 +122,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     println!("mmu     : identity-map, M={} C={} I={} (caches an)", m as u8, c as u8, i as u8);
 
     // Distributor global + Init des Primärkerns (core 0).
-    hal::gic::init_dist();
+    hal::intc::init_dist();
     init_core_irqs();
     println!("core 0  : online (vectors, gic, timer @ {} Hz)", TICK_HZ);
     println!("timer   : CNTFRQ={} Hz, PPI {}", hal::timer::freq(), hal::timer::TIMER_INTID);
@@ -197,8 +192,8 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     let entry = _start_secondary as *const () as u64;
     for core in 1..cores {
         let target = core as u64; // MPIDR Aff0 = Kernindex (QEMU virt, ein Cluster)
-        let r = hal::psci::cpu_on(target, entry, secondary_stack_top(core));
-        if r != hal::psci::SUCCESS {
+        let r = hal::power::cpu_on(target, entry, secondary_stack_top(core));
+        if r != hal::power::SUCCESS {
             println!("smp     : CPU_ON für Kern {core} fehlgeschlagen (status {r})");
         }
     }

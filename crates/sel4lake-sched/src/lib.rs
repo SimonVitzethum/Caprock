@@ -575,7 +575,14 @@ impl Scheduler {
     /// Handle des aktuell laufenden Threads.
     pub fn current_id(&self, core: usize) -> ThreadId {
         debug_assert_eq!(core, self.core);
-        let cur = self.current.expect("kein laufender Thread");
+        let Some(cur) = self.current else {
+            // Diagnosefreundlich: wer fragt, auf welchem Kern, und hat der überhaupt Tabellen?
+            panic!(
+                "kein laufender Thread (gefragter Kern {core}, Instanz-Kern {}, TCB-Kapazitaet {})",
+                self.core,
+                self.tcbs.len()
+            )
+        };
         self.id(cur)
     }
 

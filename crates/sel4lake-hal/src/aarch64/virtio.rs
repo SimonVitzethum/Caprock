@@ -8,8 +8,8 @@
 //! beschränkt. Physadressen in den Deskriptoren stammen aus der DmaCap-Region (backend-direkt,
 //! SMMU-erzwungen). Die Virtqueue liegt vollständig in der DMA-Region.
 
-use crate::cpu;
-use crate::pcie::{self, PciDevice};
+use super::cpu;
+use super::pcie::{self, PciDevice};
 
 // virtio-pci Capability-Typen (cfg_type im Vendor-Cap 0x09).
 const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;

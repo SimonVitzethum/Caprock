@@ -239,6 +239,16 @@ fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
 /// rückgabe und Abbruch finalisierter Reply-Calls). Wird **ohne** gehaltene Dispatch-Locks
 /// gerufen (der Dispatch gibt CAPS/EPS vorher frei); `cap_delete` sperrt selbst CAPS+MEM
 /// in der richtigen Ordnung. Ein Fehlschlag (Cap bereits weg) ist unkritisch.
+/// SYS_LOAD-Callback in den Binary-Loader. Auf x86_64 gibt es (noch) kein Boot-Archiv —
+/// dessen Fenster ist ARM-/QEMU-`virt`-spezifisch; das x86-Gegenstück wären Multiboot-Module.
+/// Bis dahin schlägt `SYS_LOAD` dort sauber fehl, statt etwas Halbes zu laden.
+#[cfg(target_arch = "aarch64")]
+use crate::loader::load_by_index;
+#[cfg(not(target_arch = "aarch64"))]
+fn load_by_index(_index: u32, _endow: &[(usize, CapPtr)]) -> Option<usize> {
+    None
+}
+
 fn dispatch_delete_cap(cap: sel4lake_cap::CapPtr) {
     let _ = cap_delete(cap);
 }
@@ -260,7 +270,7 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
         &CAPS,
         &EPS,
         &NTFNS,
-        crate::loader::load_by_index, // ext-26: SYS_LOAD-Callback (cap-gegatet im Dispatch)
+        load_by_index, // ext-26: SYS_LOAD-Callback (cap-gegatet im Dispatch)
         dispatch_delete_cap,          // beim Grant verdrängte Cap freigeben (kein Slot-Leck)
     );
     // Der Syscall kann den laufenden Thread gewechselt haben (block/exit) -> FP-Trap
@@ -330,7 +340,7 @@ pub fn owner_core_of(tid: ThreadId) -> Option<usize> {
 /// Einen Reschedule-IPI an `core` schicken, falls es nicht der eigene ist.
 fn kick(core: usize) {
     if core != hal::cpu::core_id() {
-        hal::gic::send_sgi(core, hal::gic::IPI_RESCHED_INTID);
+        hal::intc::send_sgi(core, hal::intc::IPI_RESCHED_INTID);
     }
 }
 
@@ -1903,7 +1913,7 @@ static IRQ_DELIVERED: AtomicU64 = AtomicU64::new(0); // Telemetrie: zugestellte 
 fn irq_hook(intid: u32) -> bool {
     for i in 0..NIRQ_BIND {
         if IRQ_INTID[i].load(Ordering::Acquire) == intid {
-            hal::gic::mask_intid(intid); // level-getriggerten Geräte-IRQ bis zum Drain sperren
+            hal::intc::mask_intid(intid); // level-getriggerten Geräte-IRQ bis zum Drain sperren
             IRQ_PENDING[i].store(true, Ordering::Release);
             IRQ_ANY_PENDING.store(true, Ordering::Release);
             return true;
@@ -1952,8 +1962,8 @@ pub fn bind_irq(intid: u32, ntfn: usize, badge: u64, core: usize) -> bool {
             IRQ_BADGE[i].store(badge, Ordering::Release);
             // SPI an den Ziel-Kern routen (GICD_ITARGETSR — fehlte bisher; lasttragend,
             // sensitivitaetsgeprueft: ohne dies erreicht der RTC-IRQ keinen Kern).
-            hal::gic::route_spi(intid, core);
-            hal::gic::enable_intid(intid);
+            hal::intc::route_spi(intid, core);
+            hal::intc::enable_intid(intid);
             return true;
         }
     }
@@ -2029,258 +2039,311 @@ pub trait DmaEnforcer: Sync {
     }
 }
 
-/// **SMMUv3-Enforcer** — die einzige `DmaEnforcer`-Implementierung in ext-23. Hält die
-/// Physadressen der Command-/Event-Queue + linearen Stream-Tabelle sowie den Command-Queue-
-/// PROD-Index. `init` (D2) bringt die SMMU hoch (Default-Abort); `attach`/`detach`
-/// (D3) programmieren je StreamID eine STE -> CD -> Stage-1-Tabelle. Das gesamte SMMU-Wissen
-/// liegt hier + in `hal::smmu`; der übrige Kernel kennt nur das `DmaEnforcer`-Trait.
-pub struct SmmuV3Enforcer {
-    active: AtomicBool,
-    strtab_phys: AtomicU64,
-    cmdq_phys: AtomicU64,
-    eventq_phys: AtomicU64,
-    cmdq_prod: AtomicU32,
-    sync_ok: AtomicBool, // CMD_SYNC-Round-Trip beim Bring-up gelang (D2-Spike)
-}
+// --- SMMUv3-Enforcer (aarch64 / QEMU `virt`) -------------------------------------------------
+//
+// ext-31: Der SMMUv3 ist ARM-spezifisch. Das `DmaEnforcer`-Trait war von Anfang an
+// IOMMU-neutral entworfen ("ein künftiger `NullIommuEnforcer` implementiert dasselbe Trait,
+// OHNE öffentlichen Code zu berühren") — genau das wird hier eingelöst: der SMMU-Treiber ist
+// aarch64-only, x86_64 bekommt (bis VT-d/AMD-Vi portiert sind) den Null-Enforcer. Der
+// öffentliche DMA-Pfad (DmaCap, install_dma_cap, Mapping, Bounds, Lifetime, Audits) bleibt
+// architekturunabhängig.
+#[cfg(target_arch = "aarch64")]
+mod smmu_enforcer_arm {
+    use super::*;
+    /// **SMMUv3-Enforcer** — die einzige `DmaEnforcer`-Implementierung in ext-23. Hält die
+    /// Physadressen der Command-/Event-Queue + linearen Stream-Tabelle sowie den Command-Queue-
+    /// PROD-Index. `init` (D2) bringt die SMMU hoch (Default-Abort); `attach`/`detach`
+    /// (D3) programmieren je StreamID eine STE -> CD -> Stage-1-Tabelle. Das gesamte SMMU-Wissen
+    /// liegt hier + in `hal::smmu`; der übrige Kernel kennt nur das `DmaEnforcer`-Trait.
+    pub struct SmmuV3Enforcer {
+        active: AtomicBool,
+        strtab_phys: AtomicU64,
+        cmdq_phys: AtomicU64,
+        eventq_phys: AtomicU64,
+        cmdq_prod: AtomicU32,
+        sync_ok: AtomicBool, // CMD_SYNC-Round-Trip beim Bring-up gelang (D2-Spike)
+    }
 
-impl SmmuV3Enforcer {
-    pub const fn new() -> Self {
-        Self {
-            active: AtomicBool::new(false),
-            strtab_phys: AtomicU64::new(0),
-            cmdq_phys: AtomicU64::new(0),
-            eventq_phys: AtomicU64::new(0),
-            cmdq_prod: AtomicU32::new(0),
-            sync_ok: AtomicBool::new(false),
+    impl SmmuV3Enforcer {
+        pub const fn new() -> Self {
+            Self {
+                active: AtomicBool::new(false),
+                strtab_phys: AtomicU64::new(0),
+                cmdq_phys: AtomicU64::new(0),
+                eventq_phys: AtomicU64::new(0),
+                cmdq_prod: AtomicU32::new(0),
+                sync_ok: AtomicBool::new(false),
+            }
+        }
+
+        /// Einen kontiguierlichen, page-ausgerichteten, **genullten** RAM-Block der Größe `len`
+        /// ausschneiden (für Queue-/Tabellen-Speicher der SMMU). `None` bei Erschöpfung.
+        fn alloc_zeroed(len: u64) -> Option<u64> {
+            let len = (len + 4095) & !4095;
+            let base = mem_alloc(len, len.next_power_of_two().max(4096)).map(|c| c.base())?;
+            // SAFETY: frisch allozierter, identity-gemappter RAM-Block; exklusiv hier beschrieben.
+            unsafe { core::ptr::write_bytes(base as *mut u8, 0, len as usize) };
+            hal::cpu::dsb_sy();
+            Some(base)
+        }
+
+        /// CMD_SYNC-Round-Trip beim Bring-up gelungen? (D2-Spike-Telemetrie.)
+        pub fn sync_ok(&self) -> bool {
+            self.sync_ok.load(Ordering::Acquire)
         }
     }
 
-    /// Einen kontiguierlichen, page-ausgerichteten, **genullten** RAM-Block der Größe `len`
-    /// ausschneiden (für Queue-/Tabellen-Speicher der SMMU). `None` bei Erschöpfung.
-    fn alloc_zeroed(len: u64) -> Option<u64> {
-        let len = (len + 4095) & !4095;
-        let base = mem_alloc(len, len.next_power_of_two().max(4096)).map(|c| c.base())?;
-        // SAFETY: frisch allozierter, identity-gemappter RAM-Block; exklusiv hier beschrieben.
-        unsafe { core::ptr::write_bytes(base as *mut u8, 0, len as usize) };
-        hal::cpu::dsb_sy();
-        Some(base)
-    }
-
-    /// CMD_SYNC-Round-Trip beim Bring-up gelungen? (D2-Spike-Telemetrie.)
-    pub fn sync_ok(&self) -> bool {
-        self.sync_ok.load(Ordering::Acquire)
-    }
-}
-
-impl DmaEnforcer for SmmuV3Enforcer {
-    fn init(&self) -> bool {
-        if self.active.load(Ordering::Acquire) {
-            return true; // idempotent
+    impl DmaEnforcer for SmmuV3Enforcer {
+        fn init(&self) -> bool {
+            if self.active.load(Ordering::Acquire) {
+                return true; // idempotent
+            }
+            if !hal::smmu::present() {
+                return false;
+            }
+            // Command-/Event-Queue + lineare Stream-Tabelle (genullt -> Default-Abort) ausschneiden.
+            let Some(strtab) = Self::alloc_zeroed(hal::smmu::strtab_bytes()) else {
+                return false;
+            };
+            let Some(cmdq) = Self::alloc_zeroed(hal::smmu::cmdq_bytes()) else {
+                return false;
+            };
+            let Some(eventq) = Self::alloc_zeroed(hal::smmu::eventq_bytes()) else {
+                return false;
+            };
+            self.strtab_phys.store(strtab, Ordering::Release);
+            self.cmdq_phys.store(cmdq, Ordering::Release);
+            self.eventq_phys.store(eventq, Ordering::Release);
+            if !hal::smmu::bringup(strtab, cmdq, eventq) {
+                return false;
+            }
+            // Spike: CMD_SYNC-Round-Trip beweist die Command-Queue-Mechanik.
+            let (prod, ok) = hal::smmu::cmd_sync(cmdq, 0);
+            self.cmdq_prod.store(prod, Ordering::Release);
+            self.sync_ok.store(ok, Ordering::Release);
+            self.active.store(true, Ordering::Release);
+            ok
         }
-        if !hal::smmu::present() {
-            return false;
-        }
-        // Command-/Event-Queue + lineare Stream-Tabelle (genullt -> Default-Abort) ausschneiden.
-        let Some(strtab) = Self::alloc_zeroed(hal::smmu::strtab_bytes()) else {
-            return false;
-        };
-        let Some(cmdq) = Self::alloc_zeroed(hal::smmu::cmdq_bytes()) else {
-            return false;
-        };
-        let Some(eventq) = Self::alloc_zeroed(hal::smmu::eventq_bytes()) else {
-            return false;
-        };
-        self.strtab_phys.store(strtab, Ordering::Release);
-        self.cmdq_phys.store(cmdq, Ordering::Release);
-        self.eventq_phys.store(eventq, Ordering::Release);
-        if !hal::smmu::bringup(strtab, cmdq, eventq) {
-            return false;
-        }
-        // Spike: CMD_SYNC-Round-Trip beweist die Command-Queue-Mechanik.
-        let (prod, ok) = hal::smmu::cmd_sync(cmdq, 0);
-        self.cmdq_prod.store(prod, Ordering::Release);
-        self.sync_ok.store(ok, Ordering::Release);
-        self.active.store(true, Ordering::Release);
-        ok
-    }
-    fn attach(&self, binding: &DmaBinding) -> bool {
-        if !self.active.load(Ordering::Acquire) {
-            return false;
-        }
-        let strtab = self.strtab_phys.load(Ordering::Acquire);
-        let cmdq = self.cmdq_phys.load(Ordering::Acquire);
-        let mut t = DMA_CTX.lock();
-        // Kontext finden, der `stream_id` bereits führt; sonst neu anlegen (additiv: mehrere
-        // Regionen je Kontext, mehrere StreamIDs je Gruppe).
-        let mut ci = t
-            .iter()
-            .position(|c| c.used && c.sids.contains(&binding.stream_id));
-        let is_new_ctx = ci.is_none();
-        if ci.is_none() {
+        fn attach(&self, binding: &DmaBinding) -> bool {
+            if !self.active.load(Ordering::Acquire) {
+                return false;
+            }
+            let strtab = self.strtab_phys.load(Ordering::Acquire);
+            let cmdq = self.cmdq_phys.load(Ordering::Acquire);
+            let mut t = DMA_CTX.lock();
+            // Kontext finden, der `stream_id` bereits führt; sonst neu anlegen (additiv: mehrere
+            // Regionen je Kontext, mehrere StreamIDs je Gruppe).
+            let mut ci = t
+                .iter()
+                .position(|c| c.used && c.sids.contains(&binding.stream_id));
+            let is_new_ctx = ci.is_none();
+            if ci.is_none() {
+                let mut alloc = || SmmuV3Enforcer::alloc_zeroed(4096);
+                let Some(l1) = hal::smmu::stage1_create(&mut alloc) else {
+                    return false;
+                };
+                let Some(cd) = SmmuV3Enforcer::alloc_zeroed(hal::smmu::CD_BYTES) else {
+                    // Stage-1 (l1) ist bereits alloziert -> freigeben, sonst Frame-Leck.
+                    let mut mem = MEM.lock();
+                    hal::smmu::free_stage1(l1, &mut |x| {
+                        mem.free_region(PhysRegion::new(x, 4096));
+                    });
+                    return false;
+                };
+                hal::smmu::write_cd(cd, l1);
+                let Some(slot) = t.iter().position(|c| !c.used) else {
+                    // l1 + cd sind bereits alloziert (kein DmaCtx-Slot frei) -> beide freigeben.
+                    let mut mem = MEM.lock();
+                    hal::smmu::free_stage1(l1, &mut |x| {
+                        mem.free_region(PhysRegion::new(x, 4096));
+                    });
+                    mem.free_region(PhysRegion::new(cd, 4096));
+                    return false;
+                };
+                t[slot] = DmaCtx::EMPTY;
+                t[slot].used = true;
+                t[slot].l1 = l1;
+                t[slot].cd = cd;
+                t[slot].sids[0] = binding.stream_id;
+                ci = Some(slot);
+            }
+            let slot = ci.unwrap();
+            let (l1, cd) = (t[slot].l1, t[slot].cd);
+            // Region richtungs-/kohärenz-spezifisch additiv in die Kontext-Stage-1-Tabelle einhängen.
             let mut alloc = || SmmuV3Enforcer::alloc_zeroed(4096);
-            let Some(l1) = hal::smmu::stage1_create(&mut alloc) else {
+            if !hal::smmu::stage1_map_region(
+                l1,
+                binding.region.base,
+                binding.region.len,
+                binding.ro,
+                binding.cacheable,
+                &mut alloc,
+            ) {
+                // Ein frisch angelegter Kontext ist jetzt halb aufgebaut (l1 + cd, keine Region, keine
+                // STE) -> abbauen, sonst lecken Stage-1 + CD + der DmaCtx-Slot. Bestehender Kontext:
+                // unveraendert lassen (er traegt weiter seine anderen Regionen).
+                if is_new_ctx {
+                    let mut mem = MEM.lock();
+                    hal::smmu::free_stage1(l1, &mut |x| {
+                        mem.free_region(PhysRegion::new(x, 4096));
+                    });
+                    mem.free_region(PhysRegion::new(cd, 4096));
+                    drop(mem);
+                    t[slot] = DmaCtx::EMPTY;
+                }
+                return false;
+            }
+            let Some(ri) = t[slot].regs.iter().position(|&(_, l)| l == 0) else {
+                // Region wurde in die Stage-1-Tabelle gemappt, aber es ist kein regs-Slot frei (nur bei
+                // einem BESTEHENDEN Kontext moeglich -> dessen regs sind voll; ein neuer Kontext hat
+                // leere regs). Das Mapping zuruecknehmen, sonst bleibt es untracked in der Tabelle.
+                hal::smmu::stage1_unmap_region(l1, binding.region.base, binding.region.len);
                 return false;
             };
-            let Some(cd) = SmmuV3Enforcer::alloc_zeroed(hal::smmu::CD_BYTES) else {
-                // Stage-1 (l1) ist bereits alloziert -> freigeben, sonst Frame-Leck.
-                let mut mem = MEM.lock();
-                hal::smmu::free_stage1(l1, &mut |x| {
-                    mem.free_region(PhysRegion::new(x, 4096));
-                });
-                return false;
+            t[slot].regs[ri] = (binding.region.base, binding.region.len);
+            // Neuer Kontext: STE installieren. Sonst: nur TLBI+SYNC (STE zeigt schon auf den CD).
+            let prod = self.cmdq_prod.load(Ordering::Acquire);
+            let (next, ok) = if is_new_ctx {
+                let ste = hal::smmu::build_ste_stage1(cd);
+                hal::smmu::write_ste_and_sync(strtab, cmdq, prod, binding.stream_id, &ste)
+            } else {
+                hal::smmu::tlbi_sync(cmdq, prod)
             };
-            hal::smmu::write_cd(cd, l1);
-            let Some(slot) = t.iter().position(|c| !c.used) else {
-                // l1 + cd sind bereits alloziert (kein DmaCtx-Slot frei) -> beide freigeben.
-                let mut mem = MEM.lock();
-                hal::smmu::free_stage1(l1, &mut |x| {
-                    mem.free_region(PhysRegion::new(x, 4096));
-                });
-                mem.free_region(PhysRegion::new(cd, 4096));
-                return false;
-            };
-            t[slot] = DmaCtx::EMPTY;
-            t[slot].used = true;
-            t[slot].l1 = l1;
-            t[slot].cd = cd;
-            t[slot].sids[0] = binding.stream_id;
-            ci = Some(slot);
+            self.cmdq_prod.store(next, Ordering::Release);
+            ok
         }
-        let slot = ci.unwrap();
-        let (l1, cd) = (t[slot].l1, t[slot].cd);
-        // Region richtungs-/kohärenz-spezifisch additiv in die Kontext-Stage-1-Tabelle einhängen.
-        let mut alloc = || SmmuV3Enforcer::alloc_zeroed(4096);
-        if !hal::smmu::stage1_map_region(
-            l1,
-            binding.region.base,
-            binding.region.len,
-            binding.ro,
-            binding.cacheable,
-            &mut alloc,
-        ) {
-            // Ein frisch angelegter Kontext ist jetzt halb aufgebaut (l1 + cd, keine Region, keine
-            // STE) -> abbauen, sonst lecken Stage-1 + CD + der DmaCtx-Slot. Bestehender Kontext:
-            // unveraendert lassen (er traegt weiter seine anderen Regionen).
-            if is_new_ctx {
-                let mut mem = MEM.lock();
-                hal::smmu::free_stage1(l1, &mut |x| {
-                    mem.free_region(PhysRegion::new(x, 4096));
-                });
-                mem.free_region(PhysRegion::new(cd, 4096));
-                drop(mem);
+        fn detach(&self, binding: &DmaBinding) {
+            if !self.active.load(Ordering::Acquire) {
+                return;
+            }
+            let strtab = self.strtab_phys.load(Ordering::Acquire);
+            let cmdq = self.cmdq_phys.load(Ordering::Acquire);
+            let mut t = DMA_CTX.lock();
+            let Some(slot) = t
+                .iter()
+                .position(|c| c.used && c.sids.contains(&binding.stream_id))
+            else {
+                return;
+            };
+            let l1 = t[slot].l1;
+            // Region aus der Stage-1-Tabelle entfernen (danach kann das Gerät NICHT mehr dorthin
+            // DMAen) + TLBI+SYNC. DMA-use-after-free-sicher (vor VSpace-Unmap + free_region).
+            hal::smmu::stage1_unmap_region(l1, binding.region.base, binding.region.len);
+            if let Some(ri) = t[slot]
+                .regs
+                .iter()
+                .position(|&r| r == (binding.region.base, binding.region.len))
+            {
+                t[slot].regs[ri] = (0, 0);
+            }
+            let prod = self.cmdq_prod.load(Ordering::Acquire);
+            let (next, _) = hal::smmu::tlbi_sync(cmdq, prod);
+            self.cmdq_prod.store(next, Ordering::Release);
+            // Letzte Region weg -> Kontext abbauen: alle STEs der Gruppe invalidieren, Stage-1 + CD frei.
+            if t[slot].regs.iter().all(|&(_, l)| l == 0) {
+                let mut p = self.cmdq_prod.load(Ordering::Acquire);
+                for k in 0..MAX_CTX_SIDS {
+                    let sid = t[slot].sids[k];
+                    if sid != u32::MAX {
+                        let (n, _) = hal::smmu::clear_ste_and_sync(strtab, cmdq, p, sid);
+                        p = n;
+                    }
+                }
+                self.cmdq_prod.store(p, Ordering::Release);
+                let (cl1, ccd) = (t[slot].l1, t[slot].cd);
+                {
+                    let mut mem = MEM.lock();
+                    hal::smmu::free_stage1(cl1, &mut |x| {
+                        mem.free_region(PhysRegion::new(x, 4096));
+                    });
+                    mem.free_region(PhysRegion::new(ccd, 4096));
+                }
                 t[slot] = DmaCtx::EMPTY;
             }
-            return false;
         }
-        let Some(ri) = t[slot].regs.iter().position(|&(_, l)| l == 0) else {
-            // Region wurde in die Stage-1-Tabelle gemappt, aber es ist kein regs-Slot frei (nur bei
-            // einem BESTEHENDEN Kontext moeglich -> dessen regs sind voll; ein neuer Kontext hat
-            // leere regs). Das Mapping zuruecknehmen, sonst bleibt es untracked in der Tabelle.
-            hal::smmu::stage1_unmap_region(l1, binding.region.base, binding.region.len);
-            return false;
-        };
-        t[slot].regs[ri] = (binding.region.base, binding.region.len);
-        // Neuer Kontext: STE installieren. Sonst: nur TLBI+SYNC (STE zeigt schon auf den CD).
-        let prod = self.cmdq_prod.load(Ordering::Acquire);
-        let (next, ok) = if is_new_ctx {
+        fn audit(&self) -> u32 {
+            if !self.active.load(Ordering::Acquire) {
+                return 0; // nicht initialisiert -> keine Durchsetzungs-Aussage (D0/D1)
+            }
+            // Aktiv: keine globalen Fehler + keine unerwarteten Translation-Faults.
+            if hal::smmu::gerror() != 0 {
+                return 1;
+            }
+            if !hal::smmu::eventq_empty() {
+                return 2;
+            }
+            0
+        }
+        fn is_active(&self) -> bool {
+            self.active.load(Ordering::Acquire)
+        }
+        fn share_context(&self, leader: u32, member: u32) -> bool {
+            if !self.active.load(Ordering::Acquire) {
+                return false;
+            }
+            let strtab = self.strtab_phys.load(Ordering::Acquire);
+            let cmdq = self.cmdq_phys.load(Ordering::Acquire);
+            let mut t = DMA_CTX.lock();
+            let Some(slot) = t.iter().position(|c| c.used && c.sids.contains(&leader)) else {
+                return false;
+            };
+            if t[slot].sids.contains(&member) {
+                return true; // schon in der Gruppe
+            }
+            let Some(si) = t[slot].sids.iter().position(|&s| s == u32::MAX) else {
+                return false; // Gruppe voll
+            };
+            let cd = t[slot].cd;
             let ste = hal::smmu::build_ste_stage1(cd);
-            hal::smmu::write_ste_and_sync(strtab, cmdq, prod, binding.stream_id, &ste)
-        } else {
-            hal::smmu::tlbi_sync(cmdq, prod)
-        };
-        self.cmdq_prod.store(next, Ordering::Release);
-        ok
-    }
-    fn detach(&self, binding: &DmaBinding) {
-        if !self.active.load(Ordering::Acquire) {
-            return;
-        }
-        let strtab = self.strtab_phys.load(Ordering::Acquire);
-        let cmdq = self.cmdq_phys.load(Ordering::Acquire);
-        let mut t = DMA_CTX.lock();
-        let Some(slot) = t
-            .iter()
-            .position(|c| c.used && c.sids.contains(&binding.stream_id))
-        else {
-            return;
-        };
-        let l1 = t[slot].l1;
-        // Region aus der Stage-1-Tabelle entfernen (danach kann das Gerät NICHT mehr dorthin
-        // DMAen) + TLBI+SYNC. DMA-use-after-free-sicher (vor VSpace-Unmap + free_region).
-        hal::smmu::stage1_unmap_region(l1, binding.region.base, binding.region.len);
-        if let Some(ri) = t[slot]
-            .regs
-            .iter()
-            .position(|&r| r == (binding.region.base, binding.region.len))
-        {
-            t[slot].regs[ri] = (0, 0);
-        }
-        let prod = self.cmdq_prod.load(Ordering::Acquire);
-        let (next, _) = hal::smmu::tlbi_sync(cmdq, prod);
-        self.cmdq_prod.store(next, Ordering::Release);
-        // Letzte Region weg -> Kontext abbauen: alle STEs der Gruppe invalidieren, Stage-1 + CD frei.
-        if t[slot].regs.iter().all(|&(_, l)| l == 0) {
-            let mut p = self.cmdq_prod.load(Ordering::Acquire);
-            for k in 0..MAX_CTX_SIDS {
-                let sid = t[slot].sids[k];
-                if sid != u32::MAX {
-                    let (n, _) = hal::smmu::clear_ste_and_sync(strtab, cmdq, p, sid);
-                    p = n;
-                }
+            let prod = self.cmdq_prod.load(Ordering::Acquire);
+            let (next, ok) = hal::smmu::write_ste_and_sync(strtab, cmdq, prod, member, &ste);
+            self.cmdq_prod.store(next, Ordering::Release);
+            if ok {
+                t[slot].sids[si] = member;
             }
-            self.cmdq_prod.store(p, Ordering::Release);
-            let (cl1, ccd) = (t[slot].l1, t[slot].cd);
-            {
-                let mut mem = MEM.lock();
-                hal::smmu::free_stage1(cl1, &mut |x| {
-                    mem.free_region(PhysRegion::new(x, 4096));
-                });
-                mem.free_region(PhysRegion::new(ccd, 4096));
-            }
-            t[slot] = DmaCtx::EMPTY;
+            ok
         }
     }
+
+    
+    // DMA-Kontext-Telemetrie (dma_ctx_region_count/sid_count/stage1) liegt in `mod testsupport`
+    // (Konsolidierung K5: Test-/Telemetrie-API von der verifizierten Kernschnittstelle getrennt).
+
+}
+#[cfg(target_arch = "aarch64")]
+pub use smmu_enforcer_arm::SmmuV3Enforcer;
+
+/// **Null-Enforcer** (x86_64, bis VT-d/AMD-Vi portiert sind).
+///
+/// Er implementiert dasselbe Trait, setzt aber **keine** Hardware-Isolation durch: `init`
+/// meldet `false` (= keine HW-Durchsetzung aktiv), `attach`/`enable` schlagen fehl. Damit ist
+/// die Aussage des Systems ehrlich — DMA-Caps lassen sich auf x86 nicht an ein Gerät binden,
+/// statt eine Isolation vorzutäuschen, die es nicht gibt. Die **softwareseitigen** Garantien
+/// (Ownership, Bounds, Lifetime/Revoke-Reihenfolge, `dma_audit`) sind davon unberührt.
+#[cfg(not(target_arch = "aarch64"))]
+pub struct NullIommuEnforcer;
+
+#[cfg(not(target_arch = "aarch64"))]
+impl NullIommuEnforcer {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+impl DmaEnforcer for NullIommuEnforcer {
+    fn init(&self) -> bool {
+        false // keine IOMMU -> keine hardwareseitige Durchsetzung
+    }
+    fn attach(&self, _binding: &DmaBinding) -> bool {
+        false // ohne IOMMU wird keine Bindung eingerichtet
+    }
+    fn detach(&self, _binding: &DmaBinding) {}
     fn audit(&self) -> u32 {
-        if !self.active.load(Ordering::Acquire) {
-            return 0; // nicht initialisiert -> keine Durchsetzungs-Aussage (D0/D1)
-        }
-        // Aktiv: keine globalen Fehler + keine unerwarteten Translation-Faults.
-        if hal::smmu::gerror() != 0 {
-            return 1;
-        }
-        if !hal::smmu::eventq_empty() {
-            return 2;
-        }
-        0
+        0 // nichts programmiert -> nichts inkonsistent
     }
     fn is_active(&self) -> bool {
-        self.active.load(Ordering::Acquire)
-    }
-    fn share_context(&self, leader: u32, member: u32) -> bool {
-        if !self.active.load(Ordering::Acquire) {
-            return false;
-        }
-        let strtab = self.strtab_phys.load(Ordering::Acquire);
-        let cmdq = self.cmdq_phys.load(Ordering::Acquire);
-        let mut t = DMA_CTX.lock();
-        let Some(slot) = t.iter().position(|c| c.used && c.sids.contains(&leader)) else {
-            return false;
-        };
-        if t[slot].sids.contains(&member) {
-            return true; // schon in der Gruppe
-        }
-        let Some(si) = t[slot].sids.iter().position(|&s| s == u32::MAX) else {
-            return false; // Gruppe voll
-        };
-        let cd = t[slot].cd;
-        let ste = hal::smmu::build_ste_stage1(cd);
-        let prod = self.cmdq_prod.load(Ordering::Acquire);
-        let (next, ok) = hal::smmu::write_ste_and_sync(strtab, cmdq, prod, member, &ste);
-        self.cmdq_prod.store(next, Ordering::Release);
-        if ok {
-            t[slot].sids[si] = member;
-        }
-        ok
+        false
     }
 }
 
@@ -2311,13 +2374,13 @@ impl DmaCtx {
 
 static DMA_CTX: SpinLock<[DmaCtx; NDMA_CTX]> = SpinLock::new([DmaCtx::EMPTY; NDMA_CTX]);
 
-// DMA-Kontext-Telemetrie (dma_ctx_region_count/sid_count/stage1) liegt in `mod testsupport`
-// (Konsolidierung K5: Test-/Telemetrie-API von der verifizierten Kernschnittstelle getrennt).
-
-/// Der globale DMA-Enforcer. In ext-23 fest `SmmuV3Enforcer`; ein Wechsel (z.B. auf einen
-/// künftigen `NullIommuEnforcer`) tauscht nur diese Definition + den Accessor aus, ohne den
-/// öffentlichen DMA-Pfad zu ändern (alle Aufrufer gehen über [`dma_enforcer`]).
+/// Der globale DMA-Enforcer: auf aarch64 der SMMUv3-Treiber, sonst der Null-Enforcer. Ein
+/// Wechsel tauscht nur diese Definition + den Accessor aus, ohne den öffentlichen DMA-Pfad zu
+/// ändern (alle Aufrufer gehen über [`dma_enforcer`]).
+#[cfg(target_arch = "aarch64")]
 static DMA_ENFORCER: SmmuV3Enforcer = SmmuV3Enforcer::new();
+#[cfg(not(target_arch = "aarch64"))]
+static DMA_ENFORCER: NullIommuEnforcer = NullIommuEnforcer::new();
 
 /// Zugriff auf den aktiven DMA-Enforcer (als Trait-Objekt — der öffentliche Pfad ist
 /// enforcer-polymorph und SMMU-agnostisch).
@@ -2573,6 +2636,8 @@ pub struct VirtioDmaResult {
     pub audit_ok: bool,        // dma_audit==0 nach dem Aufräumen
 }
 
+#[cfg(target_arch = "aarch64")] // virtio-rng-PCI + SMMU: ARM-/QEMU-`virt`-spezifisch (ext-31)
+#[cfg(target_arch = "aarch64")] // SMMU/virtio: ARM-spezifisch (ext-31)
 /// **virtio-rng-DMA End-to-End** (ext-23, D4): das Gerät DMAt Zufallsbytes in die DmaCap-Region
 /// (echter Bus-Master-DMA). Danach der **zweistufige Kronjuwel-Test**:
 /// - **Level 1 (Software, demonstrierbar):** der vertrauenswürdige Treiber validiert jede
@@ -2823,25 +2888,34 @@ pub(crate) mod testsupport {
             .unwrap_or(0)
     }
 
+    #[cfg(target_arch = "aarch64")] // SMMU/virtio: ARM-spezifisch (ext-31)
     // --- SMMU-Diagnose-Accessors (ext-23, D2; SMMU-spezifisch, nur für den `smmu`-Test/Bericht) ---
+    // ext-31: Die `smmu_*`-Accessors sind aarch64-only (auf x86 wären es VT-d/AMD-Vi-Register
+    // — noch nicht portiert); die übrigen Helfer hier sind architekturunabhängig.
     pub fn smmu_present() -> bool {
         hal::smmu::present()
     }
+    #[cfg(target_arch = "aarch64")] // SMMU/virtio: ARM-spezifisch (ext-31)
     pub fn smmu_idr0() -> u32 {
         hal::smmu::idr0()
     }
+    #[cfg(target_arch = "aarch64")] // SMMU/virtio: ARM-spezifisch (ext-31)
     pub fn smmu_sid_bits() -> u32 {
         hal::smmu::sid_bits()
     }
+    #[cfg(target_arch = "aarch64")] // SMMU/virtio: ARM-spezifisch (ext-31)
     pub fn smmu_enabled() -> bool {
         hal::smmu::enabled()
     }
+    #[cfg(target_arch = "aarch64")] // SMMU-spezifischer Enforcer-Accessor (ext-31)
     pub fn smmu_sync_ok() -> bool {
         DMA_ENFORCER.sync_ok()
     }
+    #[cfg(target_arch = "aarch64")] // SMMU/virtio: ARM-spezifisch (ext-31)
     pub fn smmu_eventq_empty() -> bool {
         hal::smmu::eventq_empty()
     }
+    #[cfg(target_arch = "aarch64")] // SMMU/virtio: ARM-spezifisch (ext-31)
     pub fn smmu_gerror() -> u32 {
         hal::smmu::gerror()
     }
@@ -2868,28 +2942,36 @@ pub(crate) mod testsupport {
     }
 }
 
-// --- PCIe-Enumeration (ext-23, D1; kernel-/Trusted-Setup) ---
+#[cfg(target_arch = "aarch64")] // PCIe-ECAM des QEMU-`virt`-Boards (ext-31)
+mod pcie_arm {
+    use super::*;
+    // --- PCIe-Enumeration (ext-23, D1; kernel-/Trusted-Setup) ---
 
-/// Das DMA-Beweisgerät (`virtio-rng-pci`) per ECAM finden + einrichten: ECAM **global** als
-/// EL1-Device mappen (jenseits der statischen GiB 0..8), Bus 0 nach Vendor `0x1af4` scannen,
-/// BARs dimensionieren+zuweisen, Memory-Space + **Bus-Master** aktivieren. Gibt das Gerät
-/// (inkl. RID = SMMU-StreamID) zurück. Reines kernel-/Trusted-Setup — kein User-Pfad.
-pub fn pcie_find_virtio() -> Option<hal::pcie::PciDevice> {
-    hal::mmu::map_device_block_global(hal::pcie::ECAM_GIB);
-    // Gezielt die virtio-RNG (nicht eine evtl. vorhandene Default-NIC, ebenfalls Vendor 0x1af4).
-    let d = hal::pcie::find(hal::pcie::VIRTIO_VENDOR, &hal::pcie::VIRTIO_RNG_DEVICES);
-    *VIRTIO_PCI.lock() = d; // für D4 (virtio-Treiber) cachen
-    d
+    /// Das DMA-Beweisgerät (`virtio-rng-pci`) per ECAM finden + einrichten: ECAM **global** als
+    /// EL1-Device mappen (jenseits der statischen GiB 0..8), Bus 0 nach Vendor `0x1af4` scannen,
+    /// BARs dimensionieren+zuweisen, Memory-Space + **Bus-Master** aktivieren. Gibt das Gerät
+    /// (inkl. RID = SMMU-StreamID) zurück. Reines kernel-/Trusted-Setup — kein User-Pfad.
+    pub fn pcie_find_virtio() -> Option<hal::pcie::PciDevice> {
+        hal::mmu::map_device_block_global(hal::pcie::ECAM_GIB);
+        // Gezielt die virtio-RNG (nicht eine evtl. vorhandene Default-NIC, ebenfalls Vendor 0x1af4).
+        let d = hal::pcie::find(hal::pcie::VIRTIO_VENDOR, &hal::pcie::VIRTIO_RNG_DEVICES);
+        *VIRTIO_PCI.lock() = d; // für D4 (virtio-Treiber) cachen
+        d
+    }
+
+    /// Das in [`pcie_find_virtio`] gefundene + eingerichtete virtio-RNG-Gerät (gecacht).
+    static VIRTIO_PCI: SpinLock<Option<hal::pcie::PciDevice>> = SpinLock::new(None);
+    pub fn virtio_device() -> Option<hal::pcie::PciDevice> {
+        *VIRTIO_PCI.lock()
+    }
+
+    // dma_audit_with_floor + peek_dma_words liegen in `mod testsupport`
+    // (Konsolidierung K5: Bounds-Sensitivitätstest + Kohärenz-Peek von der Kernschnittstelle getrennt).
+
+
 }
-
-/// Das in [`pcie_find_virtio`] gefundene + eingerichtete virtio-RNG-Gerät (gecacht).
-static VIRTIO_PCI: SpinLock<Option<hal::pcie::PciDevice>> = SpinLock::new(None);
-pub fn virtio_device() -> Option<hal::pcie::PciDevice> {
-    *VIRTIO_PCI.lock()
-}
-
-// dma_audit_with_floor + peek_dma_words liegen in `mod testsupport`
-// (Konsolidierung K5: Bounds-Sensitivitätstest + Kohärenz-Peek von der Kernschnittstelle getrennt).
+#[cfg(target_arch = "aarch64")]
+pub use pcie_arm::*;
 
 // --- MCS Scheduling Contexts (Budget-basiertes Scheduling) ---
 //

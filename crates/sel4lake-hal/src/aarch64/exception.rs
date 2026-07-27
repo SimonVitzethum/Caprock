@@ -5,7 +5,7 @@
 //! [`TrapFrame`] auf dem Stack, ruft [`handle_exception`] und stellt den Kontext
 //! per `eret` wieder her. Assembler ist eine erlaubte `unsafe`-Domäne.
 
-use crate::cpu;
+use super::cpu;
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -336,10 +336,10 @@ pub fn init_thread_frame(
 #[no_mangle]
 pub extern "C" fn handle_exception(frame: *mut TrapFrame, kind: u64) -> *mut TrapFrame {
     if is_irq(kind) {
-        let intid = crate::gic::handle_irq();
+        let intid = super::gic::handle_irq();
         // Timer-Tick oder Cross-Core-Reschedule-IPI -> neu einplanen.
         if intid == Some(crate::timer::TIMER_INTID)
-            || intid == Some(crate::gic::IPI_RESCHED_INTID)
+            || intid == Some(super::gic::IPI_RESCHED_INTID)
         {
             return reschedule(frame);
         }
@@ -392,8 +392,8 @@ pub extern "C" fn handle_exception(frame: *mut TrapFrame, kind: u64) -> *mut Tra
     // SAFETY: `frame` zeigt auf den gültigen, vom Vektor angelegten Stack-Frame.
     let frame = unsafe { &*frame };
 
-    crate::console::emit_raw("\n[EXCEPTION] unerwarteter Trap\n");
-    crate::console::emit_fmt(format_args!(
+    super::console::emit_raw("\n[EXCEPTION] unerwarteter Trap\n");
+    super::console::emit_fmt(format_args!(
         "  kind={} ({})\n  ESR={:#018x} (EC={:#04x})\n  ELR={:#018x}\n  FAR={:#018x}\n  SPSR={:#018x}\n",
         kind,
         kind_name(kind),

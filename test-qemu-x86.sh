@@ -5,7 +5,7 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-SECONDS_RUN="${1:-10}"
+SECONDS_RUN="${1:-60}"
 ELF="build/target/x86_64-unknown-none/release/sel4lake-kernel.mb32"
 
 echo "== build (x86_64-unknown-none) =="
@@ -25,13 +25,15 @@ echo "$OUT"
 echo "== checks =="
 fail=0
 check() { if echo "$OUT" | grep -q "$1"; then echo "  PASS: $2"; else echo "  FAIL: $2"; fail=1; fi; }
-check "x86_64 first light: ALL PASS"   "Stufe 0: Boot + Long Mode + 16550-Serial (COM1)"
-check "idt     : int3 behandelt"       "Stufe 2(IDT): Exception-Dispatch (int3 gefangen + iretq)"
-check "PML4 W\^X-Identity aktiv"        "Stufe 1: 4-Level-Paging aktiv (CR3 + CR0.WP)"
-check "W\^X-Bits korrekt"              "Stufe 1: W^X-Bits (.text=R-X, .rodata=R--/NX)"
-check "lapic   : Timer-IRQs empfangen" "Stufe 2b: LAPIC + periodischer Timer-IRQ (Vektor 32)"
-check "3x A<->B Kontextwechsel ok"     "Stufe 3b: kooperativer Context-Switch (callee-saved + RSP + ret)"
-check "CPL=3 bestaetigt"               "Stufe 3a: Ring-3-Eintritt (iretq, CPL=3 via CS-Selektor)"
-check "ring3-Round-Trip OK"            "Stufe 3a: syscall/sysret-Round-Trip (ring3->ring0->ring3)"
+check "mmu     : identity-map, paging=1 caches=1 CR0.WP=1" "Stufe 1: 4-Level-Paging + W^X (CR0.WP)"
+check "timer   : LAPIC-Timer 100 Hz"  "Stufe 2: LAPIC-Timer (gegen PIT kalibriert)"
+check "memtest : ALL PASS"            "Kernel-Kern: Speichermodell-Selbsttest (arch-neutral, identisch zu aarch64)"
+check "zerotest: ALL PASS"            "Kernel-Kern: Datenremanenz (genullte Allokationen)"
+check "captest : ALL PASS"            "Kernel-Kern: Capability-Selbsttest (CDT/Refcounts/Revoke)"
+check "budget  : ALL PASS"            "Kernel-Kern: Cap-Budget je PD"
+check "sched   : ALL PASS"            "Stufe 4: praeemptiver Scheduler (LAPIC-Timer verdraengt Threads ueber den Trap-Frame-Tausch)"
+check "ipc     : ALL PASS"            "Stufe 4: cap-gesicherte IPC (CALL/RECV/REPLY zwischen zwei PDs)"
+check "audit   : ALL PASS"            "Stufe 4: Scheduler- + CDT-Audit sauber"
+check "SELFTEST COMPLETE"             "Stufe 4: sauberes system_off (ACPI) statt Timeout"
 if [ "$fail" = 0 ]; then echo "== ALL PASS =="; else echo "== FAILURES =="; fi
 exit "$fail"

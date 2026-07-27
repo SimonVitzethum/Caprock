@@ -6,7 +6,7 @@
 //!
 //! `unsafe` nur für Timer-Systemregisterzugriffe — erlaubte Domäne.
 
-use crate::{cpu, gic};
+use super::{cpu, gic};
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 

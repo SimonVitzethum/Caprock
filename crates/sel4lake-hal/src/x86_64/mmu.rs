@@ -108,6 +108,12 @@ extern "C" {
     static __text_end: u8;
     static __rodata_start: u8;
     static __rodata_end: u8;
+    /// Ring-3-Code: eigene Seiten, damit sie `US`+ausführbar sein können, ohne dass der
+    /// Kernel-`.text` es wird.
+    static __user_text_start: u8;
+    static __user_text_end: u8;
+    static __user_data_start: u8;
+    static __user_data_end: u8;
     static __kernel_end: u8;
 }
 
@@ -133,12 +139,25 @@ fn fine_perm(pa: u64) -> u64 {
             sym(&__rodata_end),
         )
     };
+    // SAFETY: wie oben — nur Adressen von Linker-Symbolen.
+    let (uts, ute, uds, ude) = unsafe {
+        (
+            sym(&__user_text_start),
+            sym(&__user_text_end),
+            sym(&__user_data_start),
+            sym(&__user_data_end),
+        )
+    };
     if pa >= ts && pa < te {
-        perm_bits(Perm::Rx) // Code: ausführbar, NICHT schreibbar
+        perm_bits(Perm::Rx) // Kernel-Code: ausführbar, NICHT schreibbar, Ring 0
     } else if pa >= rs && pa < re {
         perm_bits(Perm::Ro) // Konstanten: nur lesbar, NX
+    } else if pa >= uts && pa < ute {
+        perm_bits(Perm::UserRx) // Ring-3-Code: US + ausführbar, nicht schreibbar (W^X)
+    } else if pa >= uds && pa < ude {
+        perm_bits(Perm::UserRw) // Ring-3-Daten: US + RW + NX
     } else {
-        perm_bits(Perm::Rw) // alles andere: RW, NX
+        perm_bits(Perm::Rw) // alles andere: RW, NX, Ring 0
     }
 }
 
@@ -167,9 +186,14 @@ pub fn init_primary() {
         let pd = &mut *core::ptr::addr_of_mut!(PD);
         let pt = &mut *core::ptr::addr_of_mut!(PT);
 
-        pml4.0[0] = (pdpt as *const Table as u64) | P | RW;
+        // WICHTIG: Die **Zwischenebenen** tragen `US`. Auf x86 ist die effektive Berechtigung
+        // die UND-Verknüpfung über alle vier Ebenen — ohne `US` im PML4E/PDPTE/PDE verweigert die
+        // CPU jeden Ring-3-Zugriff, egal was im Blatt-Eintrag steht. Die eigentliche Entscheidung
+        // fällt damit ausschließlich am Blatt (dort ist `US` nur für User-Seiten gesetzt), genau
+        // wie `AP[1]` auf aarch64.
+        pml4.0[0] = (pdpt as *const Table as u64) | P | RW | US;
         for (g, table) in pd.iter_mut().enumerate() {
-            pdpt.0[g] = (table as *const Table as u64) | P | RW;
+            pdpt.0[g] = (table as *const Table as u64) | P | RW | US;
         }
         // Erste 16 MiB: 4-KiB-Granularität (seitengenaues W^X über das Kernel-Image).
         for (b, table) in pt.iter_mut().enumerate() {
@@ -177,7 +201,7 @@ pub fn init_primary() {
                 let pa = (b as u64) * TWO_MIB + (i as u64) * PAGE;
                 *e = pa | fine_perm(pa);
             }
-            pd[0].0[b] = (table as *const Table as u64) | P | RW;
+            pd[0].0[b] = (table as *const Table as u64) | P | RW | US;
         }
         // Rest: 2-MiB-Blöcke, RW + NX; MMIO-Bereiche uncacheable.
         for g in 0..MAPPED_GIB {
@@ -187,6 +211,12 @@ pub fn init_primary() {
                 let mut bits = P | RW | NX | PS;
                 if is_device(pa) {
                     bits |= PCD | PWT;
+                } else if pa >= USER_RAM_MIN {
+                    // SAS-Modell (ADR 0002, wie `Perm::UserRw` auf aarch64): das allgemeine
+                    // User-RAM ist für Ring 3 les-/schreibbar — Stacks und Daten der
+                    // Ring-3-Threads liegen darin. Der Kernel selbst (unter 16 MiB) bleibt
+                    // supervisor-only; ein Ring-3-Zugriff dorthin faultet.
+                    bits |= US;
                 }
                 pd[g].0[i] = pa | bits;
             }

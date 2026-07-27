@@ -41,7 +41,8 @@ Mode die aktive Identity-Map nicht löscht; PML4/PDPT werden im 32-bit-Trampolin
 | **3** | GDT/TSS + Ring 3 + `syscall`/`sysret` + Context-Switch | ✅ QEMU-verifiziert |
 | **4** | **Kernel-Kern läuft**: HAL architekturselektiv, Selbsttests + Scheduler + cap-gesicherte IPC | ✅ QEMU-verifiziert |
 | **4b** | **SMP** (INIT-SIPI-SIPI), ACPI-MADT/MCFG, Multiboot-Speicherplan | ✅ QEMU-verifiziert (4 Kerne) |
-| 5 | Isolierte Adressräume (PCID), Ring-3-PDs, PCI-Enumeration, IOMMU | offen (s. `todo.md` C6) |
+| **4c** | **Ring 3**: User-Threads mit Syscall + Fault-Isolation (SAS-Modell) | ✅ QEMU-verifiziert |
+| 5 | Per-Prozess-Adressräume (PCID), PCI-Enumeration, IOMMU | offen (s. `todo.md` C6) |
 
 ### Stufe 4 (ext-31): der eigentliche Microkernel
 
@@ -96,10 +97,34 @@ Drei Dinge, die auf ARM anders (und einfacher) sind:
 **ACPI-MADT** (Gegenstück zu den `/cpus`-Knoten des DTB), PCI-ECAM-Fenster aus der **MCFG**,
 RAM-Größe aus dem **Multiboot-Speicherplan**.
 
+### Stufe 4c (ext-32): Ring 3
+
+```
+ring3   : Ring-3-Thread machte 5 Syscalls; abgefangene Ring-3-Faults: 1
+el0-trap: User-Thread faultete (FAR=0x100000) -> beendet, Kernel laeuft weiter
+```
+
+Ein Ring-3-Thread arbeitet per `int 0x80` mit dem Kernel; ein zweiter liest **Kernel**-Speicher
+und wird dafür beendet, ohne den Kernel mitzureißen — das x86-Gegenstück zum `el0iso`-Test.
+Drei Dinge waren dafür nötig:
+
+- **`US` auf allen vier Ebenen.** Auf x86 ist die effektive Berechtigung die UND-Verknüpfung
+  über PML4E/PDPTE/PDE/PTE. Ohne `US` in den Zwischenebenen verweigert die CPU jeden
+  Ring-3-Zugriff, egal was im Blatt steht. Die Zwischenebenen sind deshalb permissiv, die
+  Entscheidung fällt am Blatt — genau wie `AP[1]` auf aarch64.
+- **`TSS.RSP0` je Thread.** Auf ARM hat jede Ausnahmestufe ihr eigenes Stackregister; auf x86
+  schaltet die CPU beim Trap aus Ring 3 auf `TSS.RSP0` um. Der wird jetzt bei jeder Rückkehr
+  nach Ring 3 auf den Kernel-Stack **genau dieses** Threads gesetzt.
+- **Ring-3-Code + -Daten in eigenen Sektionen** (`.user_text`/`.user_data`), weil der
+  Kernel-`.text` supervisor-only bleibt. Ein Ring-3-Thread kann deshalb keine Kernel-Funktion
+  aufrufen — sein Syscall ist direkt eingebettet, wie bei den EL0-Demos auf aarch64.
+
 Was auf x86 **noch fehlt** (ehrlich als „nicht unterstützt" gemeldet, nicht halb umgesetzt):
 
-- **Isolierte Adressräume**: die `vspace_*`-Funktionen melden `false`; es fehlen PCID-Verwaltung
-  und ein per-VSpace-Tabellenpool. Damit gibt es auf x86 (noch) keine Ring-3-PDs.
+- **Per-Prozess-Adressräume**: die `vspace_*`-Funktionen melden weiterhin `false` — es fehlen
+  PCID-Verwaltung und ein per-VSpace-Tabellenpool. Ring-3-Threads laufen deshalb im **SAS-Modell**
+  (gemeinsamer Adressraum, Isolation gegen den Kernel per `US`-Bit) — dasselbe, was auf aarch64
+  für *trusted* PDs gilt. Isolierte PDs (jede mit eigenem Adressraum) gibt es auf x86 noch nicht.
 - **IOMMU**: statt SMMUv3 greift der `NullIommuEnforcer` — er setzt **keine** Hardware-Isolation
   durch und sagt das auch (`is_active() == false`). Die softwareseitigen DMA-Garantien
   (Ownership, Bounds, Revoke-Reihenfolge, Audits) sind davon unberührt.

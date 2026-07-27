@@ -124,6 +124,46 @@ extern "C" fn ipc_client(_arg: usize) -> ! {
     }
 }
 
+// --- Ring-3-Threads (ext-32) ---------------------------------------------------------------
+//
+// Der Kernel-Code liegt in supervisor-only Seiten; Ring-3-Code braucht eigene, `US`-markierte
+// Seiten. Deshalb steht er — wie die EL0-Demos auf aarch64 — in `.user_text`, samt seiner
+// Syscalls: eine Ring-3-Funktion darf keine Kernel-Funktion aufrufen (die Seite ist für sie
+// nicht ausführbar), also ist der `int 0x80` hier direkt eingebettet.
+/// Der Zähler wird **aus Ring 3** hochgezählt und muss deshalb in einer `US`-schreibbaren Seite
+/// liegen — die Kernel-Statics (`.bss`/`.data`) sind supervisor-only.
+#[link_section = ".user_data"]
+static USER_SYSCALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Ring-3-Arbeiter: ruft den Kernel per Syscall (`SYS_YIELD`) und zählt die Runden.
+#[link_section = ".user_text"]
+extern "C" fn ring3_worker(_arg: usize) -> ! {
+    loop {
+        // SAFETY: `int 0x80` ist der für Ring 3 freigegebene Syscall-Vektor (IDT-Gate DPL 3);
+        // der Kernel liest/schreibt nur die ABI-Register dieses Frames.
+        unsafe {
+            core::arch::asm!("int 0x80", in("rax") 0u64, in("rdi") 0u64,
+                             lateout("rax") _, lateout("rdi") _, clobber_abi("sysv64"));
+        }
+        // Atomarer Zugriff auf eine `US`-schreibbare Seite (s. `USER_SYSCALLS`) — das ist eine
+        // Instruktion, kein Aufruf in den (für Ring 3 nicht ausführbaren) Kernel-Code.
+        USER_SYSCALLS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Ring-3-Eindringling: liest **Kernel**-Speicher. Muss faulten — der Kernel beendet ihn und
+/// läuft weiter (das x86-Gegenstück zum `el0iso`-Test auf aarch64).
+#[link_section = ".user_text"]
+extern "C" fn ring3_intruder(_arg: usize) -> ! {
+    // SAFETY(-Absicht): Genau dieser Zugriff SOLL fehlschlagen. Das Kernel-Image liegt bei
+    // 1 MiB in supervisor-only Seiten; ein Ring-3-Lesezugriff dorthin muss #PF auslösen.
+    unsafe {
+        let v = core::ptr::read_volatile(0x10_0000 as *const u64);
+        core::ptr::write_volatile(0x20_0000 as *mut u64, v); // nie erreicht
+    }
+    loop {}
+}
+
 /// Stackgröße je Sekundärkern (aus dem RAM belegt, wie auf aarch64 seit ext-30).
 const AP_STACK_BYTES: u64 = 64 * 1024;
 
@@ -153,6 +193,15 @@ fn spawn_demo() -> bool {
         if system::spawn(worker as *const () as usize, i, system::IDLE_PRIO).is_none() {
             return false;
         }
+    }
+
+    // Ring-3-Threads: einer, der ordentlich per Syscall arbeitet, und einer, der Kernel-Speicher
+    // liest und dafür beendet werden muss.
+    if system::spawn_user(ring3_worker as *const () as usize, 0, system::IDLE_PRIO).is_none() {
+        return false;
+    }
+    if system::spawn_user(ring3_intruder as *const () as usize, 0, system::IDLE_PRIO).is_none() {
+        return false;
     }
 
     // Cap-gesichertes IPC: ein Endpoint, zwei PDs. Der Server hält die RECV-, der Client die
@@ -191,7 +240,8 @@ fn spawn_demo() -> bool {
 fn all_done() -> bool {
     let workers = (0..NWORKERS).all(|i| WORKER_ROUNDS[i].load(Ordering::Relaxed) >= WORK_TARGET);
     let cores = (0..system::num_cores()).all(|c| hal::timer::ticks(c) > 0);
-    workers && IPC_DONE.load(Ordering::Acquire) && cores
+    let ring3 = USER_SYSCALLS.load(Ordering::Relaxed) > 0 && system::el0_fault_count() > 0;
+    workers && IPC_DONE.load(Ordering::Acquire) && cores && ring3
 }
 
 /// Bericht + Abschaltung (das Testskript wertet die Marker aus).
@@ -213,6 +263,15 @@ fn report_and_off() -> ! {
     let ipc = IPC_RESULT.load(Ordering::Acquire);
     println!("ipc     : CALL(21) ueber Endpoint-Cap -> {ipc} (erwartet 42)");
     println!("ipc     : {}", if ipc == 42 { "ALL PASS" } else { "FAILURES" });
+
+    let syscalls = USER_SYSCALLS.load(Ordering::Relaxed);
+    let faults = system::el0_fault_count();
+    println!("ring3   : Ring-3-Thread machte {syscalls} Syscalls; abgefangene Ring-3-Faults: {faults}");
+    let ring3_ok = syscalls > 0 && faults > 0 && system::el0_syscall_seen();
+    println!(
+        "ring3   : {} (Ring-3-Thread laeuft + syscallt; Zugriff auf Kernel-Speicher faultet, Thread beendet, Kernel laeuft weiter)",
+        if ring3_ok { "ALL PASS" } else { "FAILURES" }
+    );
 
     let sa = system::sched_audit_all();
     let cdt = system::cap_audit_cdt();

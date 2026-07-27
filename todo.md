@@ -128,8 +128,11 @@ dasselbe cap-gesicherte IPC — ohne ein einziges `cfg(target_arch)` im Kern. De
 - [x] Kernel-Kern auf x86: Allokator, Capability-System, Scheduler (präemptiv), IPC, Audits
 - [x] **SMP**: INIT-SIPI-SIPI + 16-bit-Trampolin (16→32→64 Bit), 4 Kerne in QEMU verifiziert —
       jeder Kern mit eigenem LAPIC-Timer und eigener Scheduler-Instanz
-- [ ] **Isolierte Adressräume**: PCID-Verwaltung + per-VSpace-Tabellenpool (`vspace_*` melden `false`)
-      → ohne sie gibt es auf x86 keine Ring-3-PDs
+- [x] **Ring 3**: User-Threads laufen (Syscall per `int 0x80`, Fault auf Kernel-Speicher beendet
+      den Thread) — im **SAS-Modell**, wie trusted PDs auf aarch64. Nötig dafür: `US` auf allen
+      vier Paging-Ebenen, `TSS.RSP0` je Thread, eigene `.user_text`/`.user_data`-Sektionen
+- [ ] **Per-Prozess-Adressräume**: PCID-Verwaltung + per-VSpace-Tabellenpool (`vspace_*` melden
+      weiterhin `false`) → **isolierte** PDs (jede mit eigenem Adressraum) fehlen auf x86 noch
 - [ ] **IOMMU**: VT-d/AMD-Vi statt SMMUv3 (derzeit `NullIommuEnforcer`, ohne HW-Durchsetzung)
 - [~] **PCI-ECAM**: das Fenster wird aus der ACPI-**MCFG** gelesen und gemeldet; die
       **Enumeration** darüber fehlt noch (der Kernel-PCIe-Pfad ist an das ARM-`virt`-Board gebunden)

@@ -378,6 +378,22 @@ pub const IPI_RESCHED_VECTOR: u64 = 33;
 /// Zentraler Trap-Handler (aus dem Assembler-Stub gerufen). Rückgabe: der
 /// wiederherzustellende TrapFrame (normalerweise `frame`, bei einem Scheduler-Switch der
 /// eines anderen Threads).
+/// Den Frame zurückgeben und dabei — falls wir nach **Ring 3** zurückkehren — `TSS.RSP0` auf
+/// den Kernel-Stack **genau dieses** Threads setzen.
+///
+/// Das ist der x86-Ersatz für `SP_EL1` auf ARM: dort hat jede Privilegstufe ihr eigenes
+/// Stackregister, hier schaltet die CPU beim Trap aus Ring 3 auf `TSS.RSP0` um. Zeigte der
+/// weiter auf den Stack des vorigen Threads, überschriebe der nächste Trap dessen Frame.
+/// Der Frame eines Ring-3-Threads liegt am oberen Ende seines Kernel-Stacks — die Adresse
+/// direkt darüber ist damit genau der richtige `RSP0`.
+fn resume(frame: *mut TrapFrame) -> *mut TrapFrame {
+    // SAFETY: gültiger, vom Trap-Pfad angelegter bzw. vom Scheduler gelieferter Frame.
+    if unsafe { (*frame).cs } & 3 == 3 {
+        super::gdt::set_kernel_stack(frame as u64 + core::mem::size_of::<TrapFrame>() as u64);
+    }
+    frame
+}
+
 #[no_mangle]
 pub extern "C" fn handle_exception(frame: *mut TrapFrame) -> *mut TrapFrame {
     // SAFETY: der Stub übergibt den eben angelegten, gültigen Frame.
@@ -385,10 +401,10 @@ pub extern "C" fn handle_exception(frame: *mut TrapFrame) -> *mut TrapFrame {
 
     // --- Syscall (`int 0x80`) ---
     if vector == SYSCALL_VECTOR {
-        return match SYSCALL_HOOK.load() {
+        return resume(match SYSCALL_HOOK.load() {
             Some(hook) => hook(frame),
             None => frame,
-        };
+        });
     }
 
     // --- Externe Interrupts (LAPIC) ---
@@ -398,10 +414,10 @@ pub extern "C" fn handle_exception(frame: *mut TrapFrame) -> *mut TrapFrame {
             super::timer::on_irq();
         }
         if vector == TIMER_VECTOR || vector == IPI_RESCHED_VECTOR {
-            return match RESCHED_HOOK.load() {
+            return resume(match RESCHED_HOOK.load() {
                 Some(hook) => hook(frame),
                 None => frame,
-            };
+            });
         }
         // Geräte-IRQ: dem Kernel melden (pending + maskieren); war er registriert, fährt der
         // Dispatch einen Reschedule (der Drain stellt ihn außerhalb des IRQ-Kontexts zu).
@@ -410,21 +426,21 @@ pub extern "C" fn handle_exception(frame: *mut TrapFrame) -> *mut TrapFrame {
             None => false,
         };
         if handled {
-            return match RESCHED_HOOK.load() {
+            return resume(match RESCHED_HOOK.load() {
                 Some(hook) => hook(frame),
                 None => frame,
-            };
+            });
         }
-        return frame;
+        return resume(frame);
     }
 
     // --- #NM (Device Not Available): Lazy-FP-Owner-Wechsel ---
     if vector == 7 {
-        return match FP_HOOK.load() {
+        return resume(match FP_HOOK.load() {
             Some(hook) => hook(frame),
             // Kein Lazy-FP-Subsystem: unerwartet -> wie ein Fault behandeln.
             None => fatal(frame),
-        };
+        });
     }
 
     // --- Echte Faults ---
@@ -435,7 +451,7 @@ pub extern "C" fn handle_exception(frame: *mut TrapFrame) -> *mut TrapFrame {
             // SAFETY: gültiger Frame (s. o.).
             let err = unsafe { (*frame).error };
             let esr = (vector << 32) | err;
-            return hook(frame, esr, read_cr2());
+            return resume(hook(frame, esr, read_cr2()));
         }
     }
     fatal(frame)

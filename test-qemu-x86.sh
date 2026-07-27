@@ -5,7 +5,7 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-SECONDS_RUN="${1:-90}"
+SECONDS_RUN="${1:-120}"
 # RAM-Groesse ist ein **Testparameter**, kein Detail: alles, was aus `RAM_TOP` abgeleitet wird --
 # die IOVA-Fensterbasis voran -- prueft auf einer 512-MiB-Maschine andere Zweige als auf einer
 # grossen. Der 32-Bit-Ausschluss in `dmawin` war nur der auffaelligste Fall: dort lag das Fenster
@@ -44,6 +44,15 @@ timeout "$SECONDS_RUN" qemu-system-x86_64 \
     -nographic -serial file:"$LOG" -no-reboot -no-shutdown \
     </dev/null >/dev/null 2>&1 || true
 OUT="$(grep -vE "SeaBIOS|iPXE|Press Ctrl|Booting from|C900|PMM|PnP" "$LOG" 2>/dev/null)"
+# Ein leerer Lauf sieht in der Auswertung aus wie "alle Pruefungen fehlgeschlagen" -- eine
+# Fehldiagnose, die schlimmer ist als gar keine. Also unterscheiden: kam nichts an, ist das ein
+# Problem des Aufbaus (QEMU, KVM, Zeitlimit), nicht des Kernels.
+if [ -z "$OUT" ]; then
+    echo "== KEIN OUTPUT: der Lauf hat nichts geliefert (Logdatei $(wc -c < "$LOG" 2>/dev/null || echo 0) Byte) =="
+    echo "== Das ist KEIN Testergebnis -- Aufbau pruefen (KVM verfuegbar? Zeitlimit zu knapp?) =="
+    rm -f "$LOG"
+    exit 2
+fi
 rm -f "$LOG"
 echo "$OUT"
 

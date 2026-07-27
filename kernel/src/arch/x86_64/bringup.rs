@@ -416,17 +416,29 @@ pub fn run(multiboot_info: u64) -> ! {
     const SPLIT: u64 = 8;
     let total = ram_end - free_base;
     let chunk = (total / SPLIT) & !0xfff;
-    let mut regions = [(0u64, 0u64); SPLIT as usize];
-    for (i, r) in regions.iter_mut().enumerate() {
-        let base = free_base + (i as u64) * chunk;
-        let len = if i as u64 == SPLIT - 1 { ram_end - base } else { chunk };
-        *r = (base, len);
+    let mut bi = super::bootinfo::HandoverInfo::empty();
+    bi.ram_top = ram_end;
+    for i in 0..SPLIT {
+        let base = free_base + i * chunk;
+        let len = if i == SPLIT - 1 { ram_end - base } else { chunk };
+        bi.push_region(base, len);
     }
-    system::init_mem_regions(&regions, ram_end);
+    // Dieselbe Pruefung, die der Uebergabeweg vor jeder Benutzung faehrt -- damit sie im
+    // regulaeren Lauf auch tatsaechlich einmal ausgefuehrt wird.
+    if !bi.valid() {
+        println!("mem     : FAILURES (HandoverInfo unplausibel)");
+        hal::power::system_off();
+    }
+    let mut regions = [(0u64, 0u64); super::bootinfo::MAX_REGIONS];
+    for (i, r) in bi.mem_regions().iter().enumerate() {
+        regions[i] = (r.base, r.len);
+    }
+    system::init_mem_regions(&regions[..bi.n_regions as usize], bi.ram_top);
     println!(
-        "mem     : {} Bereiche a ~{} MiB uebergeben (zerstueckelt, wie es die Kern-Uebergabe liefert), verworfen={}",
-        SPLIT,
+        "mem     : {} Bereiche a ~{} MiB ueber HandoverInfo (Quelle {}), verworfen={}",
+        bi.n_regions,
         chunk >> 20,
+        if bi.source == super::bootinfo::BootSource::Handover { "Kern-Uebergabe" } else { "Multiboot" },
         system::mem_regions_dropped()
     );
     println!("mem     : freies RAM [{free_base:#x}, {ram_end:#x})");

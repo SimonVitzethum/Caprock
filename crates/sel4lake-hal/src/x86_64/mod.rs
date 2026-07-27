@@ -18,6 +18,8 @@ pub mod fp;
 pub mod gdt;
 pub mod intc;
 pub mod mmu;
+pub mod pcie;
 pub mod power;
 pub mod syscall;
 pub mod timer;
+pub mod vtd;

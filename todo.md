@@ -136,9 +136,15 @@ dasselbe cap-gesicherte IPC — ohne ein einziges `cfg(target_arch)` im Kern. De
       laufen; Test `iso` zeigt: dieselbe Adresse ist für die SAS-PD lesbar, für die isolierte nicht
 - [ ] **PCID** als Optimierung: der Adressraumwechsel flusht derzeit den ganzen TLB (die ASID ist
       eine reine Software-Kennung). Mit `CR4.PCIDE` + getaggten Einträgen entfiele das
-- [ ] **IOMMU**: VT-d/AMD-Vi statt SMMUv3 (derzeit `NullIommuEnforcer`, ohne HW-Durchsetzung)
-- [~] **PCI-ECAM**: das Fenster wird aus der ACPI-**MCFG** gelesen und gemeldet; die
-      **Enumeration** darüber fehlt noch (der Kernel-PCIe-Pfad ist an das ARM-`virt`-Board gebunden)
+- [~] **IOMMU (VT-d)**: Bring-up mit **Default-Block** implementiert (`VtdEnforcer`): DMAR aus
+      ACPI, Root-Tabelle mit lauter „not present"-Einträgen, `SRTP`+`TE`, Invalidierungs-Round-Trip.
+      Die Hardware blockt damit **jede** nicht zugeteilte DMA — der sicherheitsrelevante Teil.
+      **Offen:** die per-Gerät-Zuteilung (Kontext-Einträge + Second-Level-Tabellen je Domäne);
+      `attach` meldet solange ehrlich `false` (sicher: geblockt statt ungeschützt). Danach erst
+      sind die `dma`/`virtiorng`-Tests von ARM auf x86 übertragbar.
+- [x] **PCI-ECAM + Enumeration**: Fenster aus der ACPI-**MCFG**, Geräte werden aufgezählt,
+      virtio-rng gefunden, Bus-Master aktiviert. (BARs vergibt auf dem PC die Firmware — anders
+      als auf `virt`, wo der Kernel das selbst tut.)
 - [ ] **Boot-Archiv** über Multiboot-Module (`SYS_LOAD` schlägt derzeit sauber fehl)
 - [x] **RAM-Plan** aus dem Multiboot-Speicherplan (BSP-Trampolin reicht `EBX` durch); CPU-Liste
       aus der ACPI-**MADT** statt fester Kernzahl

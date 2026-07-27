@@ -2332,37 +2332,55 @@ mod smmu_enforcer_arm {
 #[cfg(target_arch = "aarch64")]
 pub use smmu_enforcer_arm::SmmuV3Enforcer;
 
-/// **Null-Enforcer** (x86_64, bis VT-d/AMD-Vi portiert sind).
+/// **VT-d-Enforcer** (x86_64) — Gegenstück zum SMMUv3-Treiber auf ARM.
 ///
-/// Er implementiert dasselbe Trait, setzt aber **keine** Hardware-Isolation durch: `init`
-/// meldet `false` (= keine HW-Durchsetzung aktiv), `attach`/`enable` schlagen fehl. Damit ist
-/// die Aussage des Systems ehrlich — DMA-Caps lassen sich auf x86 nicht an ein Gerät binden,
-/// statt eine Isolation vorzutäuschen, die es nicht gibt. Die **softwareseitigen** Garantien
-/// (Ownership, Bounds, Lifetime/Revoke-Reihenfolge, `dma_audit`) sind davon unberührt.
+/// `init` bringt die Remapping-Einheit mit **Default-Block** hoch: Root-Tabelle mit lauter
+/// „not present"-Einträgen, dann `SRTP` + `TE`. Ab da ist die Übersetzung aktiv und **jede**
+/// nicht ausdrücklich zugeteilte DMA-Anforderung wird von der Hardware abgewiesen — genau die
+/// Aussage, die der `smmu`-Test auf ARM prüft.
+///
+/// `attach` meldet (noch) `false`: die per-Gerät-Zuteilung (Kontext-Einträge +
+/// Second-Level-Tabellen je Domäne) fehlt. Auf x86 lässt sich also derzeit **kein** DMA-Puffer
+/// an ein Gerät binden — der Zustand ist aber **sicher** (geblockt statt ungeschützt), und das
+/// System sagt es, statt eine Isolation vorzutäuschen. Die softwareseitigen Garantien
+/// (Ownership, Bounds, Revoke-Reihenfolge, `dma_audit`) sind davon unberührt.
 #[cfg(not(target_arch = "aarch64"))]
-pub struct NullIommuEnforcer;
+pub struct VtdEnforcer;
 
 #[cfg(not(target_arch = "aarch64"))]
-impl NullIommuEnforcer {
+impl VtdEnforcer {
     pub const fn new() -> Self {
         Self
     }
 }
 
 #[cfg(not(target_arch = "aarch64"))]
-impl DmaEnforcer for NullIommuEnforcer {
+impl DmaEnforcer for VtdEnforcer {
     fn init(&self) -> bool {
-        false // keine IOMMU -> keine hardwareseitige Durchsetzung
+        if !hal::vtd::discover() {
+            return false; // Plattform ohne IOMMU
+        }
+        // Root-Tabelle: ein genulltes Frame = alle 256 Einträge „not present" = Default-Block.
+        let Some(root) = mem_alloc(4096, 4096) else {
+            return false;
+        };
+        hal::vtd::init(root.base())
     }
     fn attach(&self, _binding: &DmaBinding) -> bool {
-        false // ohne IOMMU wird keine Bindung eingerichtet
+        false // per-Gerät-Zuteilung noch nicht implementiert (s. Typ-Doku)
     }
     fn detach(&self, _binding: &DmaBinding) {}
     fn audit(&self) -> u32 {
-        0 // nichts programmiert -> nichts inkonsistent
+        // Ist die Einheit hochgefahren, MUSS die Übersetzung aktiv sein — sonst liefe DMA
+        // ungeschützt, obwohl der Kernel meint, sie sei an.
+        if hal::vtd::present() && !hal::vtd::enabled() {
+            1
+        } else {
+            0
+        }
     }
     fn is_active(&self) -> bool {
-        false
+        hal::vtd::enabled()
     }
 }
 
@@ -2399,7 +2417,7 @@ static DMA_CTX: SpinLock<[DmaCtx; NDMA_CTX]> = SpinLock::new([DmaCtx::EMPTY; NDM
 #[cfg(target_arch = "aarch64")]
 static DMA_ENFORCER: SmmuV3Enforcer = SmmuV3Enforcer::new();
 #[cfg(not(target_arch = "aarch64"))]
-static DMA_ENFORCER: NullIommuEnforcer = NullIommuEnforcer::new();
+static DMA_ENFORCER: VtdEnforcer = VtdEnforcer::new();
 
 /// Zugriff auf den aktiven DMA-Enforcer (als Trait-Objekt — der öffentliche Pfad ist
 /// enforcer-polymorph und SMMU-agnostisch).

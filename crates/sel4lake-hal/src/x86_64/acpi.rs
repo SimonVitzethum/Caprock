@@ -166,6 +166,28 @@ pub fn cpus() -> Option<Cpus> {
     Some(out)
 }
 
+/// Registerbasis der ersten **DMA-Remapping-Einheit** aus der ACPI-**DMAR** (VT-d).
+///
+/// Aufbau: Header(36) + HostAddressWidth(1) + Flags(1) + reserviert(10), dann Remapping-
+/// Strukturen à `(Typ:u16, Länge:u16, …)`. Typ 0 = DRHD; dort liegt die Registerbasis bei
+/// Offset 8. `None`, wenn es keine DMAR gibt (dann hat die Plattform keine IOMMU).
+pub fn dmar_unit_base() -> Option<u64> {
+    let dmar = find_table(b"DMAR")?;
+    let mut off = 48;
+    while off + 4 <= dmar.len() {
+        let etype = u16::from_le_bytes([dmar[off], dmar[off + 1]]);
+        let elen = u16::from_le_bytes([dmar[off + 2], dmar[off + 3]]) as usize;
+        if elen < 4 || off + elen > dmar.len() {
+            break; // defekte Kette -> abbrechen statt weiterzuraten
+        }
+        if etype == 0 && elen >= 16 {
+            return rd_u64(dmar, off + 8);
+        }
+        off += elen;
+    }
+    None
+}
+
 /// Basis des **PCI-ECAM**-Fensters (MCFG, erste Segmentgruppe) + erste/letzte Bus-Nummer.
 pub fn pci_ecam() -> Option<(u64, u8, u8)> {
     let mcfg = find_table(b"MCFG")?;

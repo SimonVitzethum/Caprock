@@ -16,6 +16,8 @@ LOG="$(mktemp)"
 echo "== boot ($SECONDS_RUN s) =="
 timeout "$SECONDS_RUN" qemu-system-x86_64 \
     -kernel "$ELF" -m 512M -smp 4 \
+    -machine q35,kernel-irqchip=split -device intel-iommu \
+    -device virtio-rng-pci \
     -nographic -serial file:"$LOG" -no-reboot -no-shutdown \
     </dev/null >/dev/null 2>&1 || true
 OUT="$(grep -vE "SeaBIOS|iPXE|Press Ctrl|Booting from|C900|PMM|PnP" "$LOG" 2>/dev/null)"
@@ -38,6 +40,8 @@ check "budget  : ALL PASS"            "Kernel-Kern: Cap-Budget je PD"
 check "sched   : ALL PASS"            "Stufe 4: praeemptiver Scheduler (LAPIC-Timer verdraengt Threads ueber den Trap-Frame-Tausch)"
 check "ipc     : ALL PASS"            "Stufe 4: cap-gesicherte IPC (CALL/RECV/REPLY zwischen zwei PDs)"
 check "ring3   : ALL PASS"            "Stufe 4c: Ring-3-Threads (Syscall aus Ring 3; Zugriff auf Kernel-Speicher faultet -> Thread beendet, Kernel laeuft weiter)"
+check "pci     : ALL PASS"            "PCI-Enumeration ueber das ECAM-Fenster aus der ACPI-MCFG (virtio-rng gefunden, Bus-Master an)"
+check "iommu   : ALL PASS"            "IOMMU (VT-d): Bring-up aus der ACPI-DMAR, Root-Tabelle mit Default-Block, Uebersetzung aktiv, Invalidierung quittiert"
 check "iso     : ALL PASS"            "Stufe 5: per-Prozess-Adressraeume (isolierte PD sieht fremdes RAM NICHT, SAS-PD schon)"
 check "audit   : ALL PASS"            "Stufe 4: Scheduler- + CDT-Audit sauber"
 check "SELFTEST COMPLETE"             "Stufe 4: sauberes system_off (ACPI) statt Timeout"

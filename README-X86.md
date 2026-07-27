@@ -43,7 +43,8 @@ Mode die aktive Identity-Map nicht löscht; PML4/PDPT werden im 32-bit-Trampolin
 | **4b** | **SMP** (INIT-SIPI-SIPI), ACPI-MADT/MCFG, Multiboot-Speicherplan | ✅ QEMU-verifiziert (4 Kerne) |
 | **4c** | **Ring 3**: User-Threads mit Syscall + Fault-Isolation (SAS-Modell) | ✅ QEMU-verifiziert |
 | **5** | **Per-Prozess-Adressräume**: isolierte PDs mit eigenem Adressraum | ✅ QEMU-verifiziert |
-| 6 | PCI-Enumeration, IOMMU (VT-d), PCID-Optimierung | offen (s. `todo.md` C6) |
+| **6** | **PCI-Enumeration** (ECAM/MCFG) + **VT-d-Bring-up** mit Default-Block | ✅ QEMU-verifiziert |
+| 7 | VT-d per-Gerät-Zuteilung, PCID-Optimierung, Portierung der ARM-Testdienste | offen |
 
 ### Stufe 4 (ext-31): der eigentliche Microkernel
 
@@ -153,8 +154,12 @@ Was auf x86 **noch fehlt** (ehrlich als „nicht unterstützt" gemeldet, nicht h
   (Ownership, Bounds, Revoke-Reihenfolge, Audits) sind davon unberührt.
 - **Boot-Archiv/Loader**: `SYS_LOAD` schlägt sauber fehl (das ARM-Fenster hat auf x86 kein
   Gegenstück; die Entsprechung wären Multiboot-Module).
-- **PCI-Enumeration**: das ECAM-Fenster wird gefunden und gemeldet, aber noch nicht durchsucht
-  (der Kernel-PCIe-Pfad ist derzeit an das ARM-`virt`-Board gebunden).
+- **VT-d per-Gerät-Zuteilung**: der Bring-up blockt alles (Default-Block, `GSTS.TES` aktiv);
+  Kontext-Einträge + Second-Level-Tabellen je Domäne fehlen, `attach` meldet `false`. Erst
+  danach sind die `dma`/`virtiorng`-Tests von ARM übertragbar.
+- **PCID**: der Adressraumwechsel flusht den ganzen TLB (die ASID ist eine Software-Kennung).
+- **Die ARM-Testdienste** (`threads/mod.rs`, ~5000 Zeilen; Hot-Reload, Fuzzer, adversariale
+  Dienste, MCS-Tests) laufen weiter nur auf ARM; x86 hat einen eigenen, kompakten Bring-up-Test.
 
 ## Geänderte/neue Dateien (ggü. `master`)
 

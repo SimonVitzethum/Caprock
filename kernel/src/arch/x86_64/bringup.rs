@@ -414,6 +414,45 @@ pub fn run(multiboot_info: u64) -> ! {
     if let Some((ecam, b0, b1)) = hal::acpi::pci_ecam() {
         println!("acpi    : PCI-ECAM @ {ecam:#x}, Busse {b0}..{b1}");
     }
+    // --- PCI-Enumeration (die Firmware hat BARs/Bridges bereits konfiguriert) ---
+    let mut ndev = 0usize;
+    hal::pcie::dump_devices(&mut |bus, dev, ven, did, class| {
+        ndev += 1;
+        println!("pci     : {bus:02x}:{dev:02x}.0 {ven:04x}:{did:04x} class={class:#08x}");
+    });
+    let rng = hal::pcie::find(hal::pcie::VIRTIO_VENDOR, &hal::pcie::VIRTIO_RNG_DEVICES);
+    match rng {
+        Some(d) => println!(
+            "pci     : {ndev} Geraet(e); virtio-rng gefunden (RID {:#06x}, MMIO-BAR {:#x}, Bus-Master {})",
+            d.rid(),
+            d.bars.iter().copied().find(|&b| b != 0).unwrap_or(0),
+            hal::pcie::bus_master_enabled(&d)
+        ),
+        None => println!("pci     : {ndev} Geraet(e); kein virtio-rng"),
+    }
+    println!("pci     : {}", if ndev > 0 { "ALL PASS" } else { "FAILURES" });
+
+    // --- IOMMU (VT-d): Bring-up mit Default-Block ---
+    // Über denselben Weg wie auf ARM: der Kernel kennt nur das `DmaEnforcer`-Trait.
+    let up = system::dma_enforcer_init();
+    let iommu_ok = if hal::vtd::present() {
+        println!(
+            "iommu   : VT-d Version {:#x} CAP {:#x} (Root-Tabelle mit lauter 'not present' = Default-Block)",
+            hal::vtd::version(),
+            hal::vtd::cap()
+        );
+        let inv = hal::vtd::invalidate_context_cache();
+        println!(
+            "iommu   : Uebersetzung aktiv={} (GSTS.TES), Kontext-Cache-Invalidierung quittiert={inv}, dma_audit={}",
+            system::dma_enforcer().is_active(),
+            system::dma_enforcer().audit()
+        );
+        up && system::dma_enforcer().is_active() && inv && system::dma_enforcer().audit() == 0
+    } else {
+        println!("iommu   : keine ACPI-DMAR -> Plattform ohne IOMMU");
+        false
+    };
+    println!("iommu   : {}", if iommu_ok { "ALL PASS" } else { "SKIP/FAILURES" });
     let (nc, nthreads, per_core, tbl) = system::configure(ncpu);
     println!(
         "sched   : {nc} Kern, {nthreads} Thread-Slots ({per_core} hostbar), Tabellen {} KiB aus dem RAM",

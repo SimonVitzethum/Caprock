@@ -191,3 +191,32 @@ pub fn find(vendor: u16, devices: &[u16]) -> Option<PciDevice> {
 pub fn bus_master_enabled(d: &PciDevice) -> bool {
     cfg_read16(d.bus, d.dev, d.func, CFG_COMMAND) & CMD_BUS_MASTER != 0
 }
+
+/// Ein Gerät über seine **RID** stilllegen und bereits abgesetzte Writes spülen — identisch zur
+/// aarch64-Fassung (dort steht die ausführliche Begründung der beiden Schritte und ihrer Grenzen).
+///
+/// Gibt den vorherigen Inhalt des Command-Registers zurück ([`restore_command`]).
+pub fn quiesce_by_rid(rid: u32) -> u16 {
+    let (bus, dev, func) = (
+        (rid >> 8) as u8,
+        ((rid >> 3) & 0x1f) as u8,
+        (rid & 0x7) as u8,
+    );
+    // Command (16 bit) und Status (16 bit) teilen sich das Wort bei Offset 0x04. Status-Bits
+    // sind write-1-to-clear -> die obere Hälfte wird als 0 zurückgeschrieben, damit der
+    // Schreibzugriff keine Fehlerbits quittiert.
+    let cmd = cfg_read16(bus, dev, func, CFG_COMMAND);
+    cfg_write32(bus, dev, func, CFG_COMMAND, (cmd & !CMD_BUS_MASTER) as u32);
+    let _ = cfg_read16(bus, dev, func, CFG_VENDOR); // Flush-Read
+    cmd
+}
+
+/// Das Command-Register eines Geräts wiederherstellen (nach [`quiesce_by_rid`]).
+pub fn restore_command(rid: u32, cmd: u16) {
+    let (bus, dev, func) = (
+        (rid >> 8) as u8,
+        ((rid >> 3) & 0x1f) as u8,
+        (rid & 0x7) as u8,
+    );
+    cfg_write32(bus, dev, func, CFG_COMMAND, cmd as u32);
+}

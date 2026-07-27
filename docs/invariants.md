@@ -87,18 +87,92 @@ deadlock-frei (vorher 4/15).
 
 Eine DMA-Region wird **immer** in dieser Reihenfolge abgebaut (`revoke_dma` + `vspace_teardown`):
 
-1. `enforcer.disable_dma(binding)` — die Stage-1-Region wird aus dem Übersetzungskontext entfernt
-   + `CMD_TLBI`+`CMD_SYNC`. **Danach kann kein Gerät mehr in die Region DMAen.**
-2. VSpace-Unmap (`unmap_dma_from_thread`) + `flush_asid`.
-3. **Erst dann** `free_region` (über `delete_leaf` der DmaCap bzw. `free_raw_region`).
+1. **Gerät stilllegen** (`pcie::quiesce_by_rid`, ext-35): Bus-Master löschen, dann ein
+   **Config-Read vom selben Gerät**. PCIe garantiert, dass eine Completion posted Writes nicht
+   überholt — die Antwort trifft also erst ein, nachdem die zuvor vom Gerät abgesetzten Writes
+   zugestellt sind.
+2. `enforcer.disable_dma(binding)` — die Stage-1-Region wird aus dem Übersetzungskontext entfernt
+   + `CMD_TLBI`+`CMD_SYNC` (synchron: `wait_cons` wartet auf `CMDQ_CONS == PROD`).
+3. VSpace-Unmap (`unmap_dma_from_thread`) + `flush_asid`.
+4. **Erst dann** `free_region` (über `delete_leaf` der DmaCap bzw. `free_raw_region`).
 
-**Invariante:** zwischen Schritt 3 und einem späteren Re-Alloc desselben RAM zeigt **keine**
-SMMU-Stage-1 mehr auf die Region. Verletzung = DMA-use-after-free.
+### Was Schritt 1 und Schritt 2 je abdecken — und warum keiner den anderen ersetzt
+
+Bis ext-34 stand hier: *„Die Stage-1-Region wird entfernt. **Danach kann kein Gerät mehr in die
+Region DMAen.**"* Das war für **künftige** Übersetzungen richtig und für bereits übersetzte, noch
+unterwegs befindliche (posted) Writes **falsch**. Das Entfernen eines Übersetzungseintrags sagt
+nichts über Transaktionen, die die Übersetzung schon durchlaufen haben.
+
+| | deckt ab | deckt **nicht** ab |
+|---|---|---|
+| **Schritt 1** (BME-Clear + Flush-Read) | das **gutartige** Gerät: bereits abgesetzte Writes sind nach dem Flush-Read zugestellt | ein **kompromittiertes** Gerät, das `BME` ignoriert |
+| **Schritt 2** (Stage-1/STE entfernen) | jede **künftige** Anforderung — auch die eines kompromittierten Geräts | Transaktionen, die die Übersetzung bereits passiert haben |
+
+**Invariante:** zwischen Schritt 4 und einem späteren Re-Alloc desselben RAM zeigt **keine**
+SMMU-Stage-1 mehr auf die Region **und** ist keine vom Gerät abgesetzte Transaktion mehr in
+Zustellung. Verletzung = DMA-use-after-free.
+
+**Grenzen von Schritt 1** (gehören zur Aussage, nicht als Fußnote): Die Ordnungsgarantie hält
+nur, solange *Relaxed Ordering* / *ID-Based Ordering* für diese Funktion nicht aktiv sind und der
+Pfad einheitlich ist. Ein Gerät, das `BME` nicht respektiert, wird davon nicht erfasst — für das
+ist Schritt 2 die Grenze. Ein vollständiges Quiesce (FLR bzw. der dokumentierte Weg des Geräts)
+wäre stärker; BME + Flush-Read ist der Teil, der **ohne** gerätespezifisches Wissen auskommt.
+
+**BME-Wiederherstellung:** Trägt der Übersetzungskontext nach dem Detach noch andere Regionen, ist
+das Gerät legitim weiter in Betrieb und `restore_command` stellt den vorherigen Zustand her (die
+eben entfernte Region ist ab Schritt 2 ohnehin unerreichbar). Ist es die letzte Region, bleibt
+Bus-Master **aus** — ein Gerät ohne jede Zuteilung soll auch keine Requests absetzen dürfen.
 
 **Audit:** `dma_audit()` Code `4` — *jede* in einem `DMA_CTX` gemappte Region muss einer **lebenden
 DmaCap** entsprechen. Eine Kontext-Region ohne zugehörige Cap bedeutet: RAM wurde freigegeben,
-während die SMMU noch darauf zeigte (Schritt 3 vor Schritt 1) → Verletzung. (Snapshot von `DMA_CTX`
+während die SMMU noch darauf zeigte (Schritt 4 vor Schritt 2) → Verletzung. (Snapshot von `DMA_CTX`
 ziehen, Lock freigeben, dann gegen `CAPS.read().for_each_dma` prüfen — Rangordnung R0 vor R1.)
+
+**Was das Audit NICHT trägt:** Es findet die Verletzung, es verhindert sie nicht. Die Reihenfolge
+ist eine bewiesene Vorbedingung, keine erzwungene — `free_region` ist über `PhysRegion` aufrufbar,
+nicht nur über einen Token, den die Invalidierung zurückgibt. Die strukturelle Fassung (ein
+`Invalidated`-Token als einziger Weg zu `free_region`) ist vorgemerkt; sie berührt die
+`CapSpace`-Finalisierung und läuft über denselben Rückmeldeweg wie `ReplyFinal`. Siehe `todo.md`.
+
+### 2a. Granularität eines DMA-Puffers (ext-35)
+
+**Invariante:** Anfang **und** Länge einer DMA-Region liegen auf dem **Cache-Writeback-Granule**
+der Architektur (`hal::mmu::dma_granule()`; `CTR_EL0.CWG` auf ARM, `1` auf x86 — dort ist DMA
+hardware-kohärent, es gibt keine Wartung und damit keine Bedingung). Erzwungen an der
+**Cap-Prägung** (`install_dma_cap`/`install_dma_cap_ex` → `CapError::Unaligned`), nicht als
+Treiberpflicht.
+
+**Grund:** Cache-Wartung arbeitet auf ganzen Zeilen — `dc civac` (nach einem Geräte-Write bzw. bei
+bidirektionalen Puffern) **verwirft** eine komplette Zeile. Liegt in einer angebrochenen Randzeile
+fremder Speicher, verliert der seine noch nicht zurückgeschriebenen Daten. Das ist ein Schaden
+**außerhalb** des Puffers, den weder die Bounds-Prüfung noch die IOMMU sieht: beide betrachten den
+Puffer, nicht seine Nachbarschaft.
+
+Die Bedingung gilt **einheitlich**, nicht nur für die Richtungen, bei denen invalidiert wird
+(`DeviceWrite`/`Bidirectional`). Richtungsabhängig wäre näher am tatsächlich Gefährlichen, aber
+eine Cap ist langlebig und ihre Richtung ein Feld — eine später erlaubte bidirektionale Nutzung
+säße sonst auf einer Ausrichtung, die nie dafür geprüft wurde.
+
+**Test:** `dmaalign` (Boot-Selbsttest) — ausgerichtete Region wird angenommen, verschobener Anfang
+und angebrochene Länge werden abgewiesen, und aus den Fehlschlägen entsteht keine Cap.
+
+### 2b. ATS (Address Translation Services) — Entscheidung, nicht Unterlassung
+
+**ATS wird nicht aktiviert.** Ein Gerät mit ATS darf Übersetzungen **selbst cachen** (ATC) und
+Anforderungen als „bereits übersetzt" markieren — die IOMMU reicht die dann durch. Ein
+kompromittiertes oder fehlerhaftes Gerät umgeht damit praktisch die gesamte Durchsetzung
+(*Thunderclap*-Klasse). Für ein System, dessen DMA-Isolation genau auf dieser Durchsetzung
+ruht, ist ATS deshalb standardmäßig aus.
+
+Die Bedingungen, unter denen es je eingeschaltet werden dürfte — damit das eine überprüfbare
+Entscheidung bleibt und nicht beim nächsten Durchsatzproblem stillschweigend fällt:
+
+1. eine **explizite Geräteliste** (nicht „alles, was es kann"), begründet je Eintrag;
+2. **ATC-Invalidierung im Teardown-Pfad vorhanden und getestet** — ohne sie ist Schritt 2 oben
+   wirkungslos, weil das Gerät seine alte Übersetzung weiterbenutzt;
+3. die Geräteliste ist Teil des Trust-Modells (ADR 0007), nicht Treiberkonfiguration.
+
+Solange auch nur eine der drei Bedingungen fehlt, bleibt die ATS-Capability ungesetzt.
 
 ## 3. Region-Balance (kein RAM-Leck)
 

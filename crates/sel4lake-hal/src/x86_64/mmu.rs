@@ -363,6 +363,16 @@ fn flush_all() {
 
 // --- DMA-Cache-Wartung ------------------------------------------------------------------------
 
+/// **Cache Writeback Granule** — die Ausrichtung, die ein DMA-Puffer braucht, damit
+/// Cache-Wartung keine fremden Daten in einer angebrochenen Zeile trifft.
+///
+/// Auf x86 ist DMA **hardware-kohärent** (Snooping): es gibt keine Wartung, also auch keine
+/// Granularitätsbedingung. `1` heißt „jede Ausrichtung ist zulässig" — die Prüfung in
+/// `install_dma_cap` ist damit hier trivial erfüllt, statt dass sie ARM-spezifisch danebensteht.
+pub fn dma_granule() -> u64 {
+    1
+}
+
 /// Auf x86 sind DMA-Zugriffe **hardware-kohärent** zum CPU-Cache (Snooping) — anders als auf
 /// aarch64 ist hier keine Cache-Wartung nötig. Die Barriere stellt nur die Reihenfolge sicher.
 pub fn dma_cache_clean(_va: u64, _len: u64) {

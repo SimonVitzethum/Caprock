@@ -288,3 +288,43 @@ pub fn header_type(d: &PciDevice) -> u8 {
 pub fn cap_ptr(d: &PciDevice) -> u8 {
     cfg_read8(d.bus, d.dev, d.func, CFG_CAP_PTR)
 }
+
+/// Ein Gerät über seine **RID** (= StreamID) stilllegen und bereits abgesetzte Writes spülen.
+///
+/// Zwei Schritte, die verschiedene Dinge tun und einander **nicht** ersetzen:
+///
+/// 1. **Bus-Master löschen.** Danach darf das Gerät keine neuen Memory-Requests mehr absetzen.
+///    Über bereits unterwegs befindliche (posted) Writes sagt das nichts — die sind abgeschickt.
+/// 2. **Config-Read vom selben Gerät.** PCIe garantiert, dass eine Completion posted Writes
+///    nicht überholt: die Antwort auf diesen nicht-posted Read trifft erst ein, nachdem die
+///    zuvor vom Gerät abgesetzten Writes zugestellt sind. Der Rückgabewert ist belanglos —
+///    der Zweck ist die Ordnungsgarantie.
+///
+/// **Grenzen.** Das gilt nur, solange Relaxed Ordering / ID-Based Ordering für diese Funktion
+/// nicht aktiv sind und der Pfad einheitlich ist. Und es setzt voraus, dass das Gerät `BME`
+/// respektiert — ein **kompromittiertes** tut das nicht. Gegen das bösartige Gerät wirkt allein
+/// das Entfernen der Übersetzung (STE/Stage-1); gegen das gutartige mit In-flight-Writes wirkt
+/// allein dieser Schritt. Keiner ersetzt den anderen.
+///
+/// Gibt den vorherigen Inhalt des Command-Registers zurück ([`restore_command`]).
+pub fn quiesce_by_rid(rid: u32) -> u16 {
+    let (bus, dev, func) = (
+        (rid >> 8) as u8,
+        ((rid >> 3) & 0x1f) as u8,
+        (rid & 0x7) as u8,
+    );
+    let cmd = cfg_read16(bus, dev, func, CFG_COMMAND);
+    cfg_write16(bus, dev, func, CFG_COMMAND, cmd & !CMD_BUS_MASTER);
+    let _ = cfg_read16(bus, dev, func, CFG_VENDOR); // Flush-Read (s. o.)
+    cmd
+}
+
+/// Das Command-Register eines Geräts wiederherstellen (nach [`quiesce_by_rid`]).
+pub fn restore_command(rid: u32, cmd: u16) {
+    let (bus, dev, func) = (
+        (rid >> 8) as u8,
+        ((rid >> 3) & 0x1f) as u8,
+        (rid & 0x7) as u8,
+    );
+    cfg_write16(bus, dev, func, CFG_COMMAND, cmd);
+}

@@ -2235,6 +2235,22 @@ mod smmu_enforcer_arm {
             if !self.active.load(Ordering::Acquire) {
                 return;
             }
+            // --- Gerät stilllegen, BEVOR die Übersetzung verschwindet (ext-35) ---
+            //
+            // Die Reihenfolge war bisher andersherum: erst unmappen, dann (nie) stilllegen. Das
+            // hatte zwei Folgen. Erstens erzeugt ein noch aktives Gerät nach dem Unmap
+            // Translation Faults statt Korruption — ungefährlich, aber auf mancher HW ein
+            // Fault-Sturm, der echte Fehler verdeckt. Zweitens, und das ist der eigentliche
+            // Punkt: das Entfernen der Übersetzung sagt **nichts** über bereits übersetzte,
+            // unterwegs befindliche (posted) Writes. Genau die trifft `quiesce_by_rid`:
+            // Bus-Master löschen (keine NEUEN Requests) + Config-Read vom Gerät (PCIe: eine
+            // Completion überholt posted Writes nicht -> die alten sind danach zugestellt).
+            //
+            // **Arbeitsteilung, kein Ersatz:** Dieser Schritt deckt das *gutartige* Gerät mit
+            // In-flight-Writes ab; gegen ein *kompromittiertes*, das `BME` ignoriert, wirkt
+            // allein das Entfernen von Stage-1/STE weiter unten. Keiner der beiden Schritte
+            // macht den anderen entbehrlich.
+            let saved_cmd = hal::pcie::quiesce_by_rid(binding.stream_id);
             let strtab = self.strtab_phys.load(Ordering::Acquire);
             let cmdq = self.cmdq_phys.load(Ordering::Acquire);
             let mut t = DMA_CTX.lock();
@@ -2258,6 +2274,13 @@ mod smmu_enforcer_arm {
             let prod = self.cmdq_prod.load(Ordering::Acquire);
             let (next, _) = hal::smmu::tlbi_sync(cmdq, prod);
             self.cmdq_prod.store(next, Ordering::Release);
+            // Bus-Master wiederherstellen, **solange der Kontext noch Regionen trägt** — dann ist
+            // das Gerät legitim weiter in Betrieb und die eben entfernte Region ist bereits nicht
+            // mehr erreichbar. Hat es keine Region mehr, bleibt BME aus (fail-safe: ein Gerät ohne
+            // jede Zuteilung soll auch keine Requests absetzen dürfen).
+            if !t[slot].regs.iter().all(|&(_, l)| l == 0) {
+                hal::pcie::restore_command(binding.stream_id, saved_cmd);
+            }
             // Letzte Region weg -> Kontext abbauen: alle STEs der Gruppe invalidieren, Stage-1 + CD frei.
             if t[slot].regs.iter().all(|&(_, l)| l == 0) {
                 let mut p = self.cmdq_prod.load(Ordering::Acquire);
@@ -2463,7 +2486,36 @@ pub fn alloc_dma_region(len: u64) -> Option<PhysRegion> {
 /// `[phys, phys+len)` prägen — **nur kernelseitig** (kein User-Syscall erzeugt DMA-Caps).
 /// Installiert wird sie cap-policy-geprüft nur in HardwareLand-PDs (`install_cap_checked`).
 pub fn install_dma_cap(phys: u64, len: u64, rights: Rights) -> Result<CapPtr, CapError> {
+    dma_granule_ok(phys, len)?;
     CAPS.write().cspace.install_dma(phys, len, rights)
+}
+
+/// **Granularitätsbedingung eines DMA-Puffers** (ext-35).
+///
+/// Cache-Wartung arbeitet auf ganzen Zeilen: `dc civac` (nach einem Geräte-Write, bzw. bei
+/// bidirektionalen Puffern) **verwirft** eine komplette Zeile. Liegt in einer angebrochenen
+/// Randzeile fremder Speicher, verliert der seine noch nicht zurückgeschriebenen Daten — ein
+/// Datenverlust außerhalb des Puffers, den weder Bounds-Prüfung noch IOMMU sehen (beide
+/// betrachten den Puffer, nicht seine Nachbarschaft).
+///
+/// Die Bedingung wird **einheitlich** geprüft, nicht nur für die Richtungen, bei denen
+/// invalidiert wird. Richtungsabhängig wäre ehrlicher gegenüber dem tatsächlich Gefährlichen,
+/// aber eine Cap ist langlebig und ihre Richtung ein Feld: eine später erlaubte
+/// `Bidirectional`-Nutzung dürfte sonst auf einer Ausrichtung sitzen, die nie dafür geprüft
+/// wurde. Einheitlich strikt ist die Bedingung, die man in einem Jahr noch begründen kann.
+///
+/// Die Granularität liefert die Architektur ([`hal::mmu::dma_granule`]): `CTR_EL0.CWG` auf ARM,
+/// `1` auf x86 (hardware-kohärent, keine Wartung) — dort ist die Prüfung damit trivial erfüllt.
+fn dma_granule_ok(phys: u64, len: u64) -> Result<(), CapError> {
+    let g = hal::mmu::dma_granule();
+    if g <= 1 {
+        return Ok(()); // kohärente Architektur: keine Wartung, keine Bedingung
+    }
+    if phys % g == 0 && len % g == 0 {
+        Ok(())
+    } else {
+        Err(CapError::Unaligned)
+    }
 }
 
 /// Wie [`install_dma_cap`], aber mit expliziter **DMA-Richtung** + **Cache-Kohärenz** (ext-24).
@@ -2476,6 +2528,7 @@ pub fn install_dma_cap_ex(
     coherence: DmaCoherence,
     rights: Rights,
 ) -> Result<CapPtr, CapError> {
+    dma_granule_ok(phys, len)?;
     CAPS.write().cspace.install_dma_ex(phys, len, dir, coherence, rights)
 }
 

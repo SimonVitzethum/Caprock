@@ -24,6 +24,62 @@ pub fn run() {
     zerotest();
     captest();
     budgettest();
+    dmaaligntest();
+}
+
+/// **Granularitäts-Bedingung der DMA-Cap** (ext-35): ein Puffer, dessen Anfang oder Länge nicht
+/// auf dem Cache-Writeback-Granule liegt, darf gar nicht erst zu einer Cap werden.
+///
+/// Grund: `dc civac` (Invalidate nach einem Geräte-Write) verwirft **ganze** Cache-Zeilen. Liegt
+/// in einer angebrochenen Randzeile fremder Speicher, verliert der seine noch nicht
+/// zurückgeschriebenen Daten — ein Schaden **außerhalb** des Puffers, den weder die
+/// Bounds-Prüfung noch die IOMMU sieht (beide betrachten den Puffer, nicht seine Nachbarschaft).
+///
+/// Auf kohärenten Architekturen (x86: kein Cache-Maintenance, Granule 1) gibt es die Bedingung
+/// nicht — der Test meldet dort `SKIP` statt eine Eigenschaft zu behaupten, die es nicht gibt.
+fn dmaaligntest() {
+    let p = "dmaalign";
+    let g = sel4lake_hal::mmu::dma_granule();
+    if g <= 1 {
+        println!("{p}: SKIP  (kohaerente Architektur, Granule {g} -> keine Bedingung)");
+        println!("dmaalign: ALL PASS");
+        return;
+    }
+    let mut fail = false;
+    let region = mm::alloc(2 * PAGE, PAGE).expect("dmaalign region");
+    let (base, len) = (region.base(), region.len());
+
+    // Ausgerichtet -> muss angenommen werden.
+    match mm::install_dma_cap(base, len, Rights::RW) {
+        Ok(cap) => {
+            check(p, true, "ausgerichtete Region wird angenommen", &mut fail);
+            // Die Cap besitzt die Region jetzt; Loeschen gibt sie an den Allokator zurueck.
+            let _ = mm::cap_delete(cap);
+        }
+        Err(_) => check(p, false, "ausgerichtete Region wird angenommen", &mut fail),
+    }
+
+    // Verschobener Anfang -> muss abgelehnt werden (angebrochene erste Zeile).
+    let region2 = mm::alloc(2 * PAGE, PAGE).expect("dmaalign region2");
+    let (b2, l2) = (region2.base(), region2.len());
+    check(
+        p,
+        mm::install_dma_cap(b2 + 1, l2 - 1, Rights::RW) == Err(CapError::Unaligned),
+        "unausgerichteter Anfang -> Unaligned",
+        &mut fail,
+    );
+    // Angebrochene Laenge -> ebenfalls abgelehnt (angebrochene letzte Zeile).
+    check(
+        p,
+        mm::install_dma_cap(b2, l2 - 1, Rights::RW) == Err(CapError::Unaligned),
+        "angebrochene Laenge -> Unaligned",
+        &mut fail,
+    );
+    // Nichts davon darf eine Cap erzeugt haben -> Region gehoert weiter uns.
+    mm::free(region2);
+    check(p, mm::cap_audit_cdt() == 0, "CDT konsistent (keine Cap aus Fehlschlaegen)", &mut fail);
+
+    println!("dmaalign: {}", if fail { "FAILURES" } else { "ALL PASS" });
 }
 
 /// **Datenremanenz-Test** (ext-29): frisch allozierter Speicher ist IMMER genullt.

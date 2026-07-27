@@ -153,6 +153,51 @@ dasselbe cap-gesicherte IPC — ohne ein einziges `cfg(target_arch)` im Kern. De
 
 ---
 
+## E. DMA-Härtung (aus dem Design-Review, ext-35)
+
+Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
+
+- [x] **§2 sagt, was der Code leistet.** Die alte Formulierung („danach kann kein Gerät mehr in die
+      Region DMAen") galt für künftige Übersetzungen und war für bereits übersetzte, in-flight
+      Posted Writes falsch. Jetzt mit expliziter Arbeitsteilung Quiesce ↔ STE-Entfernung.
+- [x] **BME-Clear + Flush-Read vor dem Unmap** (`pcie::quiesce_by_rid`). Schließt die Lücke, die
+      die ehrliche Formulierung sichtbar macht, ohne gerätespezifisches Wissen (kein FLR).
+      Nebeneffekt: die Reihenfolge stimmt jetzt (vorher lief das Gerät während des Unmaps weiter →
+      Translation Faults statt Korruption, aber ein Fault-Sturm verdeckt echte Fehler).
+- [x] **Granularitätsprüfung an der Cap-Prägung** (`CapError::Unaligned`, Test `dmaalign`).
+- [x] **ATS-Entscheidung** mit den drei Bedingungen, unter denen sie revidiert werden dürfte.
+
+- [ ] **IOVA ≠ PA** — die user-sichtbare DMA-Adresse ist heute die physische (`DmaHandle.iova`
+      existiert bereits mit dem Kommentar „Abstraktion für später"; `vspace_map_page_at` und
+      `stage1_map_region` liefern die Bausteine).
+      **Einordnung: Defense in Depth, nicht Isolation.** Isolation liefert die IOMMU; heute schließt
+      `dma_attach` bereits fail-closed (kein Enforcer ⇒ kein Handle). Der Gewinn ist eine
+      **zweite, unabhängige** Bedingung dafür, dass DMA überhaupt funktionieren kann: der übliche
+      Weg, wie so ein Gate weich wird, ist ein Passthrough-Enforcer für den Bringup, der `true`
+      meldet — bei IOVA = PA läuft danach alles unverändert weiter, bei IOVA ≠ PA bricht es sofort
+      und laut, weil die Descriptor-Werte keine gültigen PAs sind. Dazu kommt die Eindämmung von
+      Off-by-one im eigenen Fenster.
+- [ ] **Teardown-Token** (`Quiesced` → `Invalidated` → `free_region`): hebt die bewiesene
+      Reihenfolge auf eine erzwungene. Nicht klein — der Free-Pfad liegt in `CapSpace::delete_leaf`
+      (arch-neutrale Cap-Crate, die weder Gerät noch Enforcer kennt). Gangbarer Weg: `ObjectKind::Dma`
+      dort **nicht** freigeben, sondern an den Kernel zurückmelden — dieselbe Mechanik wie
+      `ReplyFinal` für abgebrochene Calls. Drei Dinge müssen dabei mitspezifiziert werden:
+      * Zwischen Rückmeldung und Freigabe existiert ein **Pending-Finalization**-Zustand. Die Region
+        darf darin weder frei noch neu vergebbar sein — eigene Invariante, nicht nur ein Feld.
+      * Die Pending-Menge muss **beschränkt** sein (ein `revoke` über einen Teilbaum erzeugt sie in
+        Serie; eine PD, die Caps zyklisch anlegt und löscht, ebenso).
+      * Quiesziert ein Gerät **nie** (kaputt/hängend), gibt es keinen legitimen Weg zurück. Die
+        ehrliche Antwort: Region bleibt dauerhaft pending, wird geloggt, nie wiederverwendet. Ein
+        Leak ist gegenüber einem UAF das richtige Failure-Mode — aber als **Entscheidung**, nicht
+        als Versehen.
+- [ ] **Descriptor-Typestate** (`Owned<Driver>`/`Owned<Device>`) treiberseitig. Ausdrücklich
+      **Ergonomie, nicht TCB**: eine Compile-Zeit-Disziplin innerhalb der Treiber-PD trägt an der
+      Vertrauensgrenze nichts — sie fängt Fehler des Treiberautors, nicht das Verhalten eines
+      kompromittierten Treibers. Lohnt trotzdem, weil „Puffer steht armiert in der Queue, ist im
+      sicheren Code aber wieder adressierbar" real und häufig ist.
+
+---
+
 ## D. Verifikation
 
 - [ ] **D1** Kani lokal nicht ausführbar (nur CI-Gate) — die ext-29-Änderung an `sel4lake-sync` ist

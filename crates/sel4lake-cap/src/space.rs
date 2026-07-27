@@ -26,6 +26,10 @@ pub enum CapError {
     Invalid,
     /// Operation auf einem Cap mit Kindern (erst `revoke` nötig).
     HasChildren,
+    /// Die Region erfüllt eine **Ausrichtungs-/Granularitätsbedingung** nicht (ext-35: ein
+    /// DMA-Puffer muss auf dem Cache-Writeback-Granule liegen, sonst zerstört die
+    /// Cache-Wartung fremde Daten in einer angebrochenen Zeile).
+    Unaligned,
 }
 
 /// Ableitungs-Metadaten eines Slots (MDB-Knoten / CDT-Verkettung).

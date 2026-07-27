@@ -713,15 +713,42 @@ pub fn vspace_map_dma(
 /// VA (= PA). `dma_cache_clean`: Clean-to-PoC (CPU-Schreibvorgänge sichtbar machen, **vor**
 /// einem Geräte-Read). Bei Non-Cacheable-Puffern sind diese No-Ops nötig, aber harmlos. QEMU
 /// modelliert keine Caches; die Instruktionen sind dennoch gültig (Korrektheit auf realer HW).
-const DMA_CACHE_LINE: u64 = 64; // konservative Cache-Line-Größe (CTR_EL0 typ. 64)
+/// **Cache Writeback Granule** aus `CTR_EL0.CWG` (Bits [27:24], log2 der Wortzahl).
+///
+/// Das ist die Granularität, mit der Cache-Wartung tatsächlich arbeitet — und damit die
+/// Ausrichtung, die ein DMA-Puffer haben MUSS: `dc civac` invalidiert eine ganze Zeile. Liegt
+/// fremder Speicher in derselben angebrochenen Zeile, verliert er beim Invalidate seine noch
+/// nicht zurückgeschriebenen Daten. Meldet die HW `CWG = 0` (keine Angabe), gilt die
+/// architektonische Obergrenze von 2 KiB als sichere Annahme.
+pub fn dma_granule() -> u64 {
+    let ctr: u64;
+    // SAFETY: `CTR_EL0` ist read-only und ohne Seiteneffekte.
+    unsafe { asm!("mrs {}, CTR_EL0", out(reg) ctr, options(nomem, nostack, preserves_flags)) };
+    match (ctr >> 24) & 0xf {
+        0 => 2048,          // „nicht angegeben" -> architektonisches Maximum annehmen
+        cwg => 4u64 << cwg, // log2 der Anzahl 4-Byte-Worte
+    }
+}
+
+/// Cache-Line-Größe für die Wartungsschleifen (`CTR_EL0.DminLine`, Bits [19:16]).
+fn cache_line() -> u64 {
+    let ctr: u64;
+    // SAFETY: read-only Systemregister.
+    unsafe { asm!("mrs {}, CTR_EL0", out(reg) ctr, options(nomem, nostack, preserves_flags)) };
+    match (ctr >> 16) & 0xf {
+        0 => 64,
+        d => 4u64 << d,
+    }
+}
 pub fn dma_cache_clean(va: u64, len: u64) {
-    let mut p = va & !(DMA_CACHE_LINE - 1);
+    let line = cache_line();
+    let mut p = va & !(line - 1);
     let end = va + len;
     // SAFETY: reine Cache-Wartung (DC CVAC) auf einer gültigen, identity-gemappten Region.
     unsafe {
         while p < end {
             asm!("dc cvac, {a}", a = in(reg) p, options(nostack, preserves_flags));
-            p += DMA_CACHE_LINE;
+            p += line;
         }
         asm!("dsb sy", options(nostack, preserves_flags));
     }
@@ -729,13 +756,14 @@ pub fn dma_cache_clean(va: u64, len: u64) {
 /// Clean **und** Invalidate (DC CIVAC) — **nach** einem Geräte-Write, bevor die CPU liest, bzw.
 /// vor bidirektionalen Transfers. Verwirft stale CPU-Cache-Zeilen + schreibt Dirty-Zeilen zurück.
 pub fn dma_cache_invalidate(va: u64, len: u64) {
-    let mut p = va & !(DMA_CACHE_LINE - 1);
+    let line = cache_line();
+    let mut p = va & !(line - 1);
     let end = va + len;
     // SAFETY: reine Cache-Wartung (DC CIVAC) auf einer gültigen, identity-gemappten Region.
     unsafe {
         while p < end {
             asm!("dc civac, {a}", a = in(reg) p, options(nostack, preserves_flags));
-            p += DMA_CACHE_LINE;
+            p += line;
         }
         asm!("dsb sy", options(nostack, preserves_flags));
     }

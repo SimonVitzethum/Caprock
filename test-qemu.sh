@@ -90,6 +90,7 @@ check "archive : 10 Modul" "ext-26 L0: Boot-Archiv extern geladen + vom Kernel-P
 check "memtest : ALL PASS" "Speichermodell-Selbsttest (alloc/split/transfer/free)"
 check "zerotest: ALL PASS" "Datenremanenz (ext-29): frische UND wiederverwendete Allokationen sind genullt -- kein Restdatenleck zwischen Subjekten"
 check "captest : ALL PASS" "Capability-Selbsttest (copy/mint/move/delete/revoke)"
+check "dmaalign: ALL PASS" "DMA-Granularitaet (ext-35): unausgerichteter Anfang/angebrochene Laenge werden an der Cap-Praegung abgewiesen (Cache-Wartung wuerde sonst fremde Daten in der Randzeile verwerfen)"
 check "budget  : ALL PASS" "Cap-Budget je PD (ext-29): Installationen ueber CAP_BUDGET_PER_PD hinaus abgewiesen (keine Monopolisierung der geteilten Cap-Tabelle), Ersetzen bleibt erlaubt"
 check "sched   : ALL PASS" "Scheduler (Preemption auf core 0 + alle Kerne ticken)"
 check "fp      : ALL PASS" "FP/SIMD-Kontext bleibt über Preemption erhalten"

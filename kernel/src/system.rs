@@ -24,6 +24,7 @@ use sel4lake_region::heap::RegionSource;
 use sel4lake_region::{Purpose, Region, RegionTag};
 use sel4lake_loader::elf::{ElfImage, PF_W, PF_X};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use crate::addr::{DmaRegion, Iova, Pa};
 use sel4lake_sched::{SchedOps, Scheduler, ThreadId, MAX_CORES};
 use sel4lake_slab::{AtomicTable, Slab};
 use sel4lake_sync::{RwSpinLock, SpinLock};
@@ -2011,7 +2012,9 @@ pub fn irqs_delivered() -> u64 {
 #[derive(Clone, Copy)]
 pub struct DmaBinding {
     pub stream_id: u32,
-    pub region: PhysRegion,
+    /// Die Region in **beiden** Achsen: `pa` ist, was der Allokator kennt und die Cache-Wartung
+    /// braucht; `iova` ist, was die Stage-1-Tabelle abbildet und im Deskriptor steht.
+    pub region: DmaRegion,
     #[allow(dead_code)] // bewusst behalten (HW-Register/API-Vollstaendigkeit bzw. nur unter cfg(kani)/Feature genutzt)
     pub backend_pd: usize,
     /// ext-24: Gerät liest nur (read-only -> schreibgeschützt). Default `false` (RW).
@@ -2022,7 +2025,7 @@ pub struct DmaBinding {
 
 impl DmaBinding {
     /// Rückwärtskompatible Bindung (ext-23-Semantik: bidirektional, non-cacheable).
-    pub fn new(stream_id: u32, region: PhysRegion) -> Self {
+    pub fn new(stream_id: u32, region: DmaRegion) -> Self {
         Self {
             stream_id,
             region,
@@ -2192,7 +2195,7 @@ mod smmu_enforcer_arm {
             let mut alloc = || SmmuV3Enforcer::alloc_zeroed(4096);
             if !hal::smmu::stage1_map_region(
                 l1,
-                binding.region.base,
+                binding.region.iova.raw(), // Gerätesicht: was die Stage-1-Tabelle abbildet
                 binding.region.len,
                 binding.ro,
                 binding.cacheable,
@@ -2212,14 +2215,14 @@ mod smmu_enforcer_arm {
                 }
                 return false;
             }
-            let Some(ri) = t[slot].regs.iter().position(|&(_, l)| l == 0) else {
+            let Some(ri) = t[slot].regs.iter().position(|r| r.is_empty()) else {
                 // Region wurde in die Stage-1-Tabelle gemappt, aber es ist kein regs-Slot frei (nur bei
                 // einem BESTEHENDEN Kontext moeglich -> dessen regs sind voll; ein neuer Kontext hat
                 // leere regs). Das Mapping zuruecknehmen, sonst bleibt es untracked in der Tabelle.
-                hal::smmu::stage1_unmap_region(l1, binding.region.base, binding.region.len);
+                hal::smmu::stage1_unmap_region(l1, binding.region.iova.raw(), binding.region.len);
                 return false;
             };
-            t[slot].regs[ri] = (binding.region.base, binding.region.len);
+            t[slot].regs[ri] = binding.region;
             // Neuer Kontext: STE installieren. Sonst: nur TLBI+SYNC (STE zeigt schon auf den CD).
             // Bus-Master erst **nach** der Übersetzung scharf schalten (Reihenfolge: erst darf
             // es irgendwo hin, dann darf es überhaupt). Ohne das wäre ein Gerät nach einem
@@ -2274,13 +2277,9 @@ mod smmu_enforcer_arm {
             let l1 = t[slot].l1;
             // Region aus der Stage-1-Tabelle entfernen (danach kann das Gerät NICHT mehr dorthin
             // DMAen) + TLBI+SYNC. DMA-use-after-free-sicher (vor VSpace-Unmap + free_region).
-            hal::smmu::stage1_unmap_region(l1, binding.region.base, binding.region.len);
-            if let Some(ri) = t[slot]
-                .regs
-                .iter()
-                .position(|&r| r == (binding.region.base, binding.region.len))
-            {
-                t[slot].regs[ri] = (0, 0);
+            hal::smmu::stage1_unmap_region(l1, binding.region.iova.raw(), binding.region.len);
+            if let Some(ri) = t[slot].regs.iter().position(|&r| r == binding.region) {
+                t[slot].regs[ri] = DmaRegion::EMPTY;
             }
             let prod = self.cmdq_prod.load(Ordering::Acquire);
             let (next, _) = hal::smmu::tlbi_sync(cmdq, prod);
@@ -2298,10 +2297,10 @@ mod smmu_enforcer_arm {
             // `attach` bei Tiefe > 0 erhöht die Regionen, ohne die Tiefe zu ändern). Effektiv gilt
             // damit  BME_neu = gespeichertes_BME  UND  Regionen(ctx) > 0,  beides zum Zeitpunkt
             // 1→0 unter demselben Lock.
-            let still_in_use = !t[slot].regs.iter().all(|&(_, l)| l == 0);
+            let still_in_use = !t[slot].regs.iter().all(|r| r.is_empty());
             ctx_release(&mut t[slot], still_in_use);
             // Letzte Region weg -> Kontext abbauen: alle STEs der Gruppe invalidieren, Stage-1 + CD frei.
-            if t[slot].regs.iter().all(|&(_, l)| l == 0) {
+            if t[slot].regs.iter().all(|r| r.is_empty()) {
                 let mut p = self.cmdq_prod.load(Ordering::Acquire);
                 for k in 0..MAX_CTX_SIDS {
                     let sid = t[slot].sids[k];
@@ -2526,7 +2525,7 @@ struct DmaCtx {
     quiesce_depth: [u32; MAX_CTX_SIDS],
     /// Command-Register **vor** der ersten Stilllegung (Save/Restore, nie „auf 1 setzen").
     saved_cmd: [u16; MAX_CTX_SIDS],
-    regs: [(u64, u64); MAX_CTX_REGS], // (base,len) je Region ((0,0) = leer)
+    regs: [DmaRegion; MAX_CTX_REGS], // (base,len) je Region ((0,0) = leer)
 }
 
 impl DmaCtx {
@@ -2537,7 +2536,7 @@ impl DmaCtx {
         sids: [u32::MAX; MAX_CTX_SIDS],
         quiesce_depth: [0; MAX_CTX_SIDS],
         saved_cmd: [0; MAX_CTX_SIDS],
-        regs: [(0, 0); MAX_CTX_REGS],
+        regs: [DmaRegion::EMPTY; MAX_CTX_REGS],
     };
 }
 
@@ -2664,7 +2663,8 @@ pub fn dma_cap_attrs(cap: CapPtr) -> Option<(u64, u64, DmaDir, DmaCoherence)> {
 pub fn dma_prepare(handle: DmaHandle, dir: DmaDir) {
     match dir {
         DmaDir::DeviceRead | DmaDir::Bidirectional => {
-            hal::mmu::dma_cache_clean(handle.iova, handle.len)
+            // Cache-Wartung läuft über die **CPU**-Sicht: die IOVA existiert nur für das Gerät.
+            hal::mmu::dma_cache_clean(handle.pa.raw(), handle.len)
         }
         DmaDir::DeviceWrite => {}
     }
@@ -2676,7 +2676,7 @@ pub fn dma_prepare(handle: DmaHandle, dir: DmaDir) {
 pub fn dma_complete(handle: DmaHandle, dir: DmaDir) {
     match dir {
         DmaDir::DeviceWrite | DmaDir::Bidirectional => {
-            hal::mmu::dma_cache_invalidate(handle.iova, handle.len)
+            hal::mmu::dma_cache_invalidate(handle.pa.raw(), handle.len)
         }
         DmaDir::DeviceRead => {}
     }
@@ -2703,12 +2703,20 @@ pub fn unmap_dma_from_thread(tid: ThreadId, phys: u64, len: u64) -> bool {
 /// Die hardwareseitige DMA-Durchsetzung für `(stream_id, [base,len))` aktivieren (ext-23-API,
 /// rückwärtskompatibel: bidirektional + non-cacheable). `true` bei Erfolg.
 pub fn dma_enable(stream_id: u32, base: u64, len: u64) -> bool {
-    dma_enforcer().attach(&DmaBinding::new(stream_id, PhysRegion::new(base, len)))
+    // Roher Pfad (ohne Cap): der Aufrufer nennt eine **physische** Adresse. Die IOVA ergibt sich
+    // in Schritt a daraus (Identität); in Schritt b käme sie aus dem Fenster des Kontexts.
+    dma_enforcer().attach(&DmaBinding::new(
+        stream_id,
+        DmaRegion::identity(Pa::new(base), len),
+    ))
 }
 
 /// Die Durchsetzung für `(stream_id, [base,len))` wieder entziehen.
 pub fn dma_disable(stream_id: u32, base: u64, len: u64) {
-    dma_enforcer().detach(&DmaBinding::new(stream_id, PhysRegion::new(base, len)));
+    dma_enforcer().detach(&DmaBinding::new(
+        stream_id,
+        DmaRegion::identity(Pa::new(base), len),
+    ));
 }
 
 /// **Opakes DMA-Handle** (ext-24): die *gerätesichtbare* Adresse (IOVA) + Länge einer
@@ -2716,8 +2724,13 @@ pub fn dma_disable(stream_id: u32, base: u64, len: u64) {
 /// die Abstraktion erlaubt später Remap/Bounce/SG-Kompaktierung ohne API-Bruch).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DmaHandle {
-    pub iova: u64,
+    /// Gerätesicht — steht im Deskriptor, wird gegen den Kontextinhalt geprüft.
+    pub iova: Iova,
     pub len: u64,
+    /// CPU-Sicht — **kernelprivat**: Cache-Wartung und Allokator-Buchhaltung laufen darüber.
+    /// Ein Treiber hat hier nichts zu suchen; gäbe man sie heraus, wäre die Trennung der beiden
+    /// Achsen wieder eine Konvention statt einer Grenze.
+    pa: Pa,
 }
 
 /// Eine **DMA-Cap** (ext-24) an den Übersetzungskontext der `stream_id` **anhängen**: liest
@@ -2731,13 +2744,20 @@ pub fn dma_attach(stream_id: u32, dcap: CapPtr) -> Option<DmaHandle> {
     let cacheable = coherence == DmaCoherence::Coherent;
     let ok = dma_enforcer().attach(&DmaBinding {
         stream_id,
-        region: PhysRegion::new(phys, len),
+        region: DmaRegion::identity(Pa::new(phys), len),
         backend_pd: 0,
         ro,
         cacheable,
     });
     if ok {
-        Some(DmaHandle { iova: phys, len }) // IOVA = PA (identisch); Abstraktion für später
+        // Schritt a: die IOVA ist noch die PA (`DmaRegion::identity`) — Schritt b ersetzt genau
+        // diese Gleichsetzung durch die Vergabe aus dem IOVA-Fenster des Kontexts.
+        let r = DmaRegion::identity(Pa::new(phys), len);
+        Some(DmaHandle {
+            iova: r.iova,
+            len: r.len,
+            pa: r.pa,
+        })
     } else {
         None
     }
@@ -2748,7 +2768,7 @@ pub fn dma_attach(stream_id: u32, dcap: CapPtr) -> Option<DmaHandle> {
 pub fn dma_detach(stream_id: u32, handle: DmaHandle) {
     dma_enforcer().detach(&DmaBinding::new(
         stream_id,
-        PhysRegion::new(handle.iova, handle.len),
+        DmaRegion { iova: handle.iova, pa: handle.pa, len: handle.len },
     ));
 }
 
@@ -2760,11 +2780,16 @@ pub fn dma_group_add(leader: u32, member: u32) -> bool {
 
 /// Prüfen, ob `[addr, addr+len)` (IOVA) **vollständig in einer angehängten Region** des Kontexts
 /// der `stream_id` liegt (Level-1-Software-Disziplin über mehrere Regionen / Scatter-Gather).
-fn dma_addr_in_context(stream_id: u32, addr: u64, len: u64) -> bool {
+fn dma_addr_in_context(stream_id: u32, addr: Iova, len: u64) -> bool {
     let t = DMA_CTX.lock();
     t.iter()
         .find(|c| c.used && c.sids.contains(&stream_id))
-        .map(|c| c.regs.iter().any(|&(b, l)| region_contains(b, l, addr, len)))
+        // **IOVA-Achse**: geprüft wird, was im Deskriptor stehen darf — also die Gerätesicht.
+        .map(|c| {
+            c.regs
+                .iter()
+                .any(|r| region_contains(r.iova.raw(), r.len, addr.raw(), len))
+        })
         .unwrap_or(false)
 }
 
@@ -2788,7 +2813,7 @@ pub fn dma_sg_validate(stream_id: u32, entries: &[DmaSgEntry]) -> bool {
     entries.iter().all(|e| {
         e.len > 0
             && e.offset.saturating_add(e.len) <= e.handle.len
-            && dma_addr_in_context(stream_id, e.handle.iova + e.offset, e.len)
+            && dma_addr_in_context(stream_id, e.handle.iova.offset(e.offset), e.len)
     })
 }
 
@@ -2813,8 +2838,12 @@ fn region_contains(base: u64, rlen: u64, addr: u64, len: u64) -> bool {
 /// direkt, kernel-auditiert). Hardware-unabhängig wirksam. Die SMMU (Level 2) ist der zusätzliche
 /// **Hardware-Backstop**, falls ein kompromittiertes Backend diese Prüfung umgeht. Dünner Wrapper
 /// um das kanonische [`region_contains`].
-pub fn dma_addr_in_region(base: u64, rlen: u64, addr: u64, len: u64) -> bool {
-    region_contains(base, rlen, addr, len)
+pub fn dma_addr_in_region(base: Iova, rlen: u64, addr: Iova, len: u64) -> bool {
+    // **IOVA-Achse.** Geprüft wird eine Adresse, die in einen Deskriptor geschrieben werden soll
+    // — also die Gerätesicht. Diese Signatur war bis ext-36 vollständig `u64` und hätte den
+    // Achsenwechsel klaglos überlebt: sie hätte ab Schritt b gegen die falsche Achse geprüft,
+    // ohne dass irgendetwas bricht. Genau deshalb steht hier jetzt der Typ.
+    region_contains(base.raw(), rlen, addr.raw(), len)
 }
 
 /// Ergebnis der virtio-rng-DMA-Demo (ext-23, D4): echter Bus-Master-DMA in die DmaCap-Region +
@@ -2860,6 +2889,9 @@ pub fn virtio_rng_dma_demo() -> VirtioDmaResult {
     };
     let base = region.base;
     let len = region.len;
+    // Was das Gerät sieht. In Schritt a identisch zur PA; ab Schritt b käme es aus dem
+    // IOVA-Fenster des Kontexts, und genau diese Zeile ist dann die Umrechnung.
+    let dev_base = Iova::new(base);
     if !dma_enable(rid, base, len) {
         free_raw_region(base, len);
         return r;
@@ -2868,15 +2900,20 @@ pub fn virtio_rng_dma_demo() -> VirtioDmaResult {
     let dlen = hal::virtio::DATA_LEN_BYTES as u64;
 
     // 1. In-Window: Treiber validiert die Zieladresse (Level 1, ok) -> Gerät DMAt Zufallsbytes.
-    let data = base + hal::virtio::DATA_OFFSET;
-    if dma_addr_in_region(base, len, data, dlen) {
+    let data = dev_base.offset(hal::virtio::DATA_OFFSET);
+    if dma_addr_in_region(dev_base, len, data, dlen) {
         if let Some(rng) = hal::virtio::probe(&dev) {
             // SAFETY: kernel-/Trusted-seitiger virtio-Treiber; BAR ist global EL1-Device-gemappt,
             // die Virtqueue + der Datenpuffer liegen in der (identity-gemappten) DMA-Region.
-            let (adv, wlen) = unsafe { rng.request(base, data) };
+            // Der virtio-Treiber braucht **beide** Achsen und vermischt sie heute noch: die
+            // Virtqueue beschreibt er per CPU (PA), die Pufferadresse trägt er in den Deskriptor
+            // ein (Gerätesicht). Solange sie identisch sind, ist das folgenlos — in Schritt b ist
+            // `hal::virtio::request` eine der Stellen, die die Trennung nachziehen muss.
+            let (adv, wlen) = unsafe { rng.request(base, data.raw()) };
             r.used_adv = adv;
             r.written = wlen;
-            let (w0, w1) = testsupport::peek_dma_words(data);
+            // Nachlesen tut die **CPU** -> PA-Achse.
+            let (w0, w1) = testsupport::peek_dma_words(base + hal::virtio::DATA_OFFSET);
             r.rand0 = w0;
             r.rand1 = w1;
         }
@@ -2893,7 +2930,12 @@ pub fn virtio_rng_dma_demo() -> VirtioDmaResult {
         hal::cpu::dsb_sy();
 
         // 2a. Level 1: der Treiber validiert die Out-of-Window-Adresse -> ABGEWIESEN, kein Notify.
-        r.cj_sw_blocked = !dma_addr_in_region(base, len, sent, dlen);
+        // Die Sentinel-Page liegt AUSSERHALB der Region. Geprüft wird, ob der Treiber diese
+        // Adresse als Deskriptorziel abweist — also auf der Gerätesicht. Dass sie hier aus einer
+        // PA gebildet wird, ist der Punkt des Tests: eine Adresse, die dem Gerät nie zugeteilt
+        // wurde. (Ab Schritt b ist sie zusätzlich schon deshalb ungültig, weil sie gar nicht im
+        // IOVA-Fenster liegt — dann prüft dieselbe Zeile zwei Dinge auf einmal.)
+        r.cj_sw_blocked = !dma_addr_in_region(dev_base, len, Iova::new(sent), dlen);
         // SAFETY: nur Lesezugriff. Da nicht programmiert, muss das Ziel unverändert sein.
         let after_guard = unsafe { core::ptr::read_volatile(sent as *const u64) };
         r.cj_sentinel_ok = after_guard == SENTINEL;
@@ -2999,7 +3041,8 @@ fn free_raw_region(base: u64, len: u64) {
 #[allow(dead_code)] // bewusst behalten (HW-Register/API-Vollstaendigkeit bzw. nur unter cfg(kani)/Feature genutzt)
 pub fn revoke_dma(binding: &DmaBinding, tid: ThreadId) {
     dma_enforcer().detach(binding);
-    unmap_dma_from_thread(tid, binding.region.base, binding.region.len);
+    // VSpace-Unmap ist **CPU**-Sicht -> PA (die IOVA gehört der IOMMU, nicht der MMU).
+    unmap_dma_from_thread(tid, binding.region.pa.raw(), binding.region.len);
 }
 
 /// **DMA-Policy-Oracle** (ext-23): `0` = konsistent, sonst Anomalie-Code:
@@ -3026,7 +3069,31 @@ pub fn dma_audit() -> u32 {
     if !dma_ctx_regions_live() {
         return 4;
     }
+    // Achsen-Wächter (ext-36): Der Vergleich oben läuft gegen die Freiliste des **physischen**
+    // Allokators und ist nur dann aussagekräftig, wenn er physische Adressen sieht. Würde jemand
+    // dort die IOVA einsetzen, überlappte ab Schritt b nie etwas — das Oracle bliebe bei jedem
+    // Lauf grün, ohne noch irgendetwas zu prüfen. Deshalb hier explizit: jede erfasste Adresse
+    // muss im RAM-Fenster liegen, das der Allokator überhaupt vergeben kann.
+    if !dma_ctx_regions_are_physical() {
+        return 5;
+    }
     0
+}
+
+/// Wächter für [`dma_audit`] Code `5`: liegen die in den Kontexten geführten **PA**-Werte im
+/// RAM-Fenster des Allokators? Schlägt an, sobald die Achse vertauscht wurde (eine IOVA aus einem
+/// Fenster außerhalb des RAM erfüllt die Bedingung nicht) — der Fall, in dem Code 4 stillschweigend
+/// nichts mehr prüft.
+fn dma_ctx_regions_are_physical() -> bool {
+    let floor = hal::mmu::kernel_end().max(hal::mmu::USER_RAM_MIN);
+    let ceil = hal::mmu::GIB1_END;
+    let t = DMA_CTX.lock();
+    t.iter().filter(|c| c.used).all(|c| {
+        c.regs.iter().filter(|r| !r.is_empty()).all(|r| {
+            let b = r.pa.raw();
+            b >= floor && b + r.len <= ceil
+        })
+    })
 }
 
 /// Hilfsprüfung für [`dma_audit`] Code 4: keine aktuell in einem `DMA_CTX` gemappte Region
@@ -3040,9 +3107,13 @@ fn dma_ctx_regions_live() -> bool {
         let t = DMA_CTX.lock();
         for c in t.iter() {
             if c.used {
-                for &(b, l) in c.regs.iter() {
-                    if l != 0 {
-                        snap[n] = (b, l);
+                for r in c.regs.iter() {
+                    if r.len != 0 {
+                        // **PA-Achse**: verglichen wird gegen die Freiliste des physischen
+                        // Allokators. Mit der IOVA wäre der Vergleich ab Schritt b sinnlos —
+                        // sie liegt in einem Fenster, das der Allokator nie vergibt, also
+                        // überlappte NIE etwas und das Oracle wäre still blind geworden.
+                        snap[n] = (r.pa.raw(), r.len);
                         n += 1;
                     }
                 }
@@ -3065,7 +3136,7 @@ pub(crate) mod testsupport {
         let t = DMA_CTX.lock();
         t.iter()
             .find(|c| c.used && c.sids.contains(&stream_id))
-            .map(|c| c.regs.iter().filter(|&&(_, l)| l != 0).count())
+            .map(|c| c.regs.iter().filter(|r| !r.is_empty()).count())
             .unwrap_or(0)
     }
 

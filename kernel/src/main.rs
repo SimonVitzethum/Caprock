@@ -30,6 +30,8 @@ unsafe impl core::alloc::GlobalAlloc for NoGlobalHeap {
 #[global_allocator]
 static GLOBAL: NoGlobalHeap = NoGlobalHeap;
 
+/// Zwei Adressachsen (physisch / IOVA) als getrennte Typen — s. Moduldoku.
+mod addr;
 mod arch;
 mod panic;
 // Der Kernel-Kern (arch-agnostisch, nutzt aber die aarch64-HAL) ist auf dem x86_64-Branch in Stufe 0

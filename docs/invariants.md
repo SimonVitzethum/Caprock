@@ -161,6 +161,29 @@ DmaCap** entsprechen. Eine Kontext-Region ohne zugehörige Cap bedeutet: RAM wur
 während die SMMU noch darauf zeigte (Schritt 4 vor Schritt 2) → Verletzung. (Snapshot von `DMA_CTX`
 ziehen, Lock freigeben, dann gegen `CAPS.read().for_each_dma` prüfen — Rangordnung R0 vor R1.)
 
+### 2c. Zwei Adressachsen (ext-36)
+
+Ein DMA-Puffer hat zwei Adressen: die **physische** (CPU-Sicht — Cache-Wartung, Allokator,
+Lebendigkeitsprüfung) und die **IOVA** (Gerätesicht — Stage-1-Abbildung, Deskriptorinhalt,
+Bounds-Prüfung des Treibers). Sie tragen heute denselben Zahlenwert; ab dem IOVA-Fenster
+(`todo.md` E, Schritt b) laufen sie auseinander.
+
+**Invariante:** Die beiden Achsen sind **typgetrennt** (`addr::Pa` / `addr::Iova`), nicht nur
+benannt. Eine Verwechslung ist damit ein Compilerfehler, keine stille Fehlfunktion — das ist
+wesentlich, weil eine vertauschte Achse nicht abstürzt, sondern *falsch prüft*: Cache-Wartung auf
+einer Adresse, unter der nichts liegt, oder eine Bounds-Prüfung gegen den falschen Raum.
+`DmaHandle.pa` ist **kernelprivat**; ein Treiber sieht nur die IOVA.
+
+Die Umwandlung nach `u64` (`raw()`) ist bewusst eine sichtbare Handlung und markiert jede Stelle,
+an der die Trennung an die HAL-Grenze übergeben wird.
+
+**Wächter (`dma_audit` Code `5`):** Der Lebendigkeits-Vergleich (Code 4) läuft gegen die Freiliste
+des **physischen** Allokators und ist nur aussagekräftig, wenn er physische Adressen sieht. Würde
+dort die IOVA stehen, überlappte ab Schritt b nie etwas — das Oracle bliebe grün, ohne noch etwas
+zu prüfen. Code 5 prüft deshalb, dass die geführten PA-Werte im RAM-Fenster des Allokators liegen;
+eine vertauschte Achse schlägt dort an. (Ein Oracle, das nach einem Achsenwechsel unverändert grün
+bleibt, ist der Normalfall des Blindwerdens — nicht der Beleg, dass alles stimmt.)
+
 **Was das Audit NICHT trägt:** Es findet die Verletzung, es verhindert sie nicht. Die Reihenfolge
 ist eine bewiesene Vorbedingung, keine erzwungene — `free_region` ist über `PhysRegion` aufrufbar,
 nicht nur über einen Token, den die Invalidierung zurückgibt. Die strukturelle Fassung (ein

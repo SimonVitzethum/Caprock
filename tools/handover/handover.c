@@ -57,6 +57,47 @@ static int release = 1;
 module_param(release, int, 0444);
 MODULE_PARM_DESC(release, "1 = uebernommene Kerne beim Entladen an Linux zurueckgeben (Vorgabe)");
 
+/*
+ * Physische Adresse einer Seite, die ein **frueherer** Lauf dieses Moduls geleakt hat.
+ *
+ * Eine aeltere Fassung gab die Trampolin-Seite bewusst nie zurueck — unter der Annahme, der
+ * uebernommene Kern brauche sie fuer immer. Die Annahme war falsch (Linux holt den Kern
+ * zurueck), die Seite blieb trotzdem vergeben. Da es unterhalb 1 MiB auf dieser Maschine
+ * praktisch genau eine gibt, blockiert dieser eine Fehler jeden weiteren Lauf.
+ *
+ * Ein Reboot waere der grobe Weg. Der genaue: wir wissen, welche Seite es ist, wir wissen, dass
+ * sie aus einer `alloc_pages(order=0)` dieses Moduls stammt, und wir koennen es nachpruefen,
+ * bevor wir sie zurueckgeben — Referenzzaehler 1, nicht reserviert, kein Slab. Trifft eine der
+ * Bedingungen nicht zu, gehoert die Seite jemand anderem und wird nicht angefasst.
+ */
+static ulong reclaim;
+module_param(reclaim, ulong, 0444);
+MODULE_PARM_DESC(reclaim, "Physadresse einer von einem frueheren Lauf geleakten Seite zurueckgeben");
+
+static bool reclaim_page(ulong pa)
+{
+	struct page *p;
+
+	if (!pa || (pa & ~PAGE_MASK) || !pfn_valid(PHYS_PFN(pa))) {
+		pr_err("sel4lake: reclaim=0x%lx ist keine gueltige Seitenadresse\n", pa);
+		return false;
+	}
+	p = pfn_to_page(PHYS_PFN(pa));
+	/*
+	 * Die Pruefungen sind der Punkt der Uebung. Eine Seite freizugeben, die inzwischen
+	 * jemand anderem gehoert, waere Speicherkorruption im Kernel — also lieber nichts tun
+	 * als hoffen.
+	 */
+	if (PageReserved(p) || PageSlab(p) || PageLRU(p) || page_count(p) != 1) {
+		pr_err("sel4lake: reclaim 0x%lx abgelehnt (count=%d reserved=%d slab=%d lru=%d) — die Seite gehoert jemandem\n",
+		       pa, page_count(p), PageReserved(p), PageSlab(p), PageLRU(p));
+		return false;
+	}
+	__free_pages(p, 0);
+	pr_info("sel4lake: Seite 0x%lx zurueckgegeben (Leck eines frueheren Laufs behoben)\n", pa);
+	return true;
+}
+
 /* Seitenlayout — identisch zu `tramp.S`, dort steht die Begruendung. */
 #define OFF_T16   0x000
 #define OFF_T64   0x080
@@ -100,8 +141,15 @@ static u64 build_identity_tables(void)
 	u64 *pml4, *pdpt, *pd;
 	int i, j;
 
+	/*
+	 * **Unterhalb 4 GiB.** `CR3` wird im Protected Mode geladen, also mit einem 32-Bit-
+	 * Zugriff (`mov %eax, %cr3`) — eine Wurzel oberhalb 4 GiB wird dabei stillschweigend
+	 * abgeschnitten, und der Kern laeuft in Tabellen, die es nicht gibt. Genau das ist
+	 * passiert: die Wurzel lag bei 0x2052b3000 (~8,3 GiB), uebrig blieb 0x052b3000.
+	 * `GFP_DMA32` sagt die Schranke zu, statt auf sie zu hoffen.
+	 */
 	for (i = 0; i < ARRAY_SIZE(pt_pages); i++) {
-		pt_pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		pt_pages[i] = alloc_page(GFP_KERNEL | GFP_DMA32 | __GFP_ZERO);
 		if (!pt_pages[i])
 			return 0;
 	}
@@ -219,6 +267,9 @@ static int __init handover_init(void)
 {
 	int i, rc;
 
+	if (reclaim && !reclaim_page(reclaim))
+		return -EINVAL;
+
 	pr_info("sel4lake: Stufe %s, Zielkerne:", arm ? "1b (arm=1, Uebernahme)" : "0 (nur offline)");
 	for (i = 0; i < ncpus; i++)
 		report_cpu(cpus[i]);
@@ -265,6 +316,17 @@ static int __init handover_init(void)
 		if (!cr3) {
 			pr_err("sel4lake: Seitentabellen fehlgeschlagen\n");
 			rc = -ENOMEM;
+			goto undo;
+		}
+		/*
+		 * Die Zusage von `GFP_DMA32` wird nachgeprueft, nicht geglaubt: eine abgeschnittene
+		 * Wurzel faellt sonst erst als "Long Mode nicht erreicht" auf, und dort sucht man
+		 * sie zuletzt.
+		 */
+		if (cr3 >> 32) {
+			pr_err("sel4lake: Seitentabellen-Wurzel 0x%llx liegt oberhalb 4 GiB — CR3 wuerde abgeschnitten\n",
+			       cr3);
+			rc = -EIO;
 			goto undo;
 		}
 		pr_info("sel4lake: Trampolin @ phys %pa, SIPI-Vektor 0x%02llx, CR3 0x%llx\n",

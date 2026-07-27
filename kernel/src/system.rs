@@ -2097,6 +2097,31 @@ mod smmu_enforcer_arm {
     }
 
     impl SmmuV3Enforcer {
+        /// STE einer StreamID **direkt** überschreiben — ausschließlich für die
+        /// Sensitivitätskontrolle des Kronjuwel-Tests (Bypass-STE, s. `build_ste_bypass`).
+        /// Nicht Teil der Durchsetzungs-API: hier wird die Durchsetzung absichtlich aufgehoben.
+        pub fn override_ste(&self, sid: u32, ste: &[u64; 8]) -> bool {
+            if !self.active.load(Ordering::Acquire) {
+                return false;
+            }
+            let strtab = self.strtab_phys.load(Ordering::Acquire);
+            let cmdq = self.cmdq_phys.load(Ordering::Acquire);
+            let prod = self.cmdq_prod.load(Ordering::Acquire);
+            let (next, ok) = hal::smmu::write_ste_and_sync(strtab, cmdq, prod, sid, ste);
+            self.cmdq_prod.store(next, Ordering::Release);
+            ok
+        }
+        /// Die reguläre Stage-1-STE des Kontexts der StreamID wiederherstellen.
+        pub fn restore_ste(&self, sid: u32) -> bool {
+            let cd = {
+                let t = DMA_CTX.lock();
+                match t.iter().find(|c| c.used && c.sids.contains(&sid)) {
+                    Some(c) => c.cd,
+                    None => return false,
+                }
+            };
+            self.override_ste(sid, &hal::smmu::build_ste_stage1(cd))
+        }
         pub const fn new() -> Self {
             Self {
                 active: AtomicBool::new(false),
@@ -2197,7 +2222,7 @@ mod smmu_enforcer_arm {
                 t[slot].l1 = l1;
                 t[slot].cd = cd;
                 t[slot].sids[0] = binding.stream_id;
-                ctx_assign_window(&mut t[slot]); // IOVA-Fenster dieses Kontexts
+                ctx_assign_window(&mut t[slot], slot); // IOVA-Fenster dieses Kontexts
                 ci = Some(slot);
             }
             let slot = ci.unwrap();
@@ -2206,17 +2231,26 @@ mod smmu_enforcer_arm {
             // arithmetische Beziehung zur PA (kein `PA + Offset`) — sonst funktionierte ein
             // Passthrough-Enforcer, der die IOVA als PA liest, für einen Teil der Regionen
             // zufällig weiter, und das laute Scheitern fiele aus.
-            let Some(iova) = ctx_alloc_iova(&mut t[slot], binding.len) else {
-                if is_new_ctx {
-                    let mut mem = MEM.lock();
-                    hal::smmu::free_stage1(l1, &mut |x| {
-                        mem.free_region(PhysRegion::new(x, 4096));
-                    });
-                    mem.free_region(PhysRegion::new(cd, 4096));
-                    drop(mem);
-                    t[slot] = DmaCtx::EMPTY;
+            let iova = match ctx_alloc_iova(
+                &mut t[slot],
+                slot,
+                binding.len,
+                device_addr_bits(binding.stream_id),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    note_iova_reject(e);
+                    if is_new_ctx {
+                        let mut mem = MEM.lock();
+                        hal::smmu::free_stage1(l1, &mut |x| {
+                            mem.free_region(PhysRegion::new(x, 4096));
+                        });
+                        mem.free_region(PhysRegion::new(cd, 4096));
+                        drop(mem);
+                        t[slot] = DmaCtx::EMPTY;
+                    }
+                    return None;
                 }
-                return None;
             };
             let region = DmaRegion { iova, pa: binding.pa, len: binding.len };
             // Region richtungs-/kohärenz-spezifisch additiv in die Kontext-Stage-1-Tabelle einhängen.
@@ -2467,10 +2501,34 @@ impl DmaEnforcer for VtdEnforcer {
 
 /// Granularität der Guard-Bänder **und** der IOVA-Ausrichtung.
 ///
-/// Bewusst die größte Block-Granularität der Stage-1 (2 MiB) und nicht 4 KiB: läge eine Region
-/// nur seitengenau von ihrer Nachbarin getrennt, könnte ein Block-Mapping über die Lücke
+/// Bewusst die größte Block-Granularität der Stage-1 und nicht 4 KiB: läge eine Region nur
+/// seitengenau von ihrer Nachbarin getrennt, könnte ein Block-Mapping über die Lücke
 /// hinwegreichen — die Eindämmung stünde auf dem Papier und nicht in der Tabelle.
+///
+/// **Der Wert hängt an der Granule-Wahl.** 2 MiB ist der Block bei 4-KiB-Granule, und der
+/// Kernel fährt Stage 1 ausschließlich mit 4 KiB (`CD.TG0 = 0`, s. `write_cd`). Bei 64-KiB-
+/// Granule wäre der Block 512 MiB, und ein 2-MiB-Band ließe sich von einem Block-Mapping
+/// überbrücken — dann wäre dieser Wert falsch, nicht bloß knapp. Wer `TG0` ändert, muss ihn
+/// mitändern.
 const IOVA_GUARD: u64 = 2 * 1024 * 1024;
+
+/// Eingangsbreite der Stage-1 (`CD.T0SZ = 25` → 39 Bit). Jede IOVA muss darunter bleiben.
+const S1_INPUT_LIMIT: u64 = 1u64 << 39;
+
+/// Hat die SMMU-Event-Queue in diesem Lauf **nachweislich gesprochen**?
+///
+/// Ein Oracle, das über Abwesenheit entscheidet („keine Faults"), braucht als Vorbedingung den
+/// Nachweis, dass es überhaupt sprechen kann. Zweimal in Folge hat genau diese Lücke hier
+/// zugeschlagen: `dma_audit` Code 4 verglich vor der Korrektur gegen die falsche Achse und wäre
+/// nach Schritt b still grün geblieben, und die Event-Queue wäre ohne `CD.R` strukturell leer
+/// gewesen. Beide Male bedeutete Grün nichts.
+///
+/// Der Nachweis lässt sich beim Hochlauf **nicht** führen: ein Übersetzungsfehler entsteht nur
+/// durch eine echte Bus-Master-Anforderung, und die SMMUv3 bietet keinen Weg, eine zu erzeugen
+/// (`ATOS` liefert das Ergebnis ins `PAR`, nicht in die Event-Queue, und QEMU implementiert es
+/// nicht). Die erreichbare Form ist deshalb der Nachweis **im selben Lauf**: der Negativtest
+/// erzeugt einen echten `F_TRANSLATION`, und erst danach zählt „Queue leer" als Aussage.
+static EVTQ_LIVENESS: AtomicBool = AtomicBool::new(false);
 
 /// Erste Fensterbasis oberhalb des RAM, 2-MiB-ausgerichtet.
 ///
@@ -2482,7 +2540,6 @@ const IOVA_GUARD: u64 = 2 * 1024 * 1024;
 /// oberhalb des RAM kein Fenster mehr in diese Breite passt — dann bekommt der Kontext ein
 /// schwaches Fenster (s. `ctx_assign_window`).
 fn strong_window_base() -> Option<u64> {
-    const S1_INPUT_LIMIT: u64 = 1u64 << 39;
     let top = RAM_TOP.load(Ordering::Acquire);
     let base = (top + IOVA_GUARD - 1) & !(IOVA_GUARD - 1);
     // Reserve, damit auch ein paar Regionen hineinpassen.
@@ -2493,19 +2550,42 @@ fn strong_window_base() -> Option<u64> {
     }
 }
 
-/// Dem Kontext ein IOVA-Fenster zuweisen (einmalig je Kontext).
+/// Fenstergröße je Kontext-Slot: der gesamte Raum zwischen RAM-Oberkante und Eingangsgrenze,
+/// gleichmäßig auf die `NDMA_CTX` Slots verteilt.
+///
+/// Vorher war das eine feste 1-GiB-Konstante, und der Bump lief zusätzlich über einen globalen
+/// Zähler, der jedem *neu angelegten* Kontext ein frisches Fenster gab. Beides zusammen ergab
+/// zwei unnötig knappe Obergrenzen über die Lebenszeit des Kernels: ~256 Attach-Vorgänge je
+/// Kontext (jede Region kostet mit Ausrichtung und Schutzband mindestens 4 MiB) und ~500
+/// Kontext-**Erzeugungen** insgesamt. Die zweite war die schärfere und stand nirgends.
+///
+/// Jetzt hängt das Fenster am **Slot**, nicht an einer Erzeugung: `NDMA_CTX` Slots, `NDMA_CTX`
+/// Fenster, fertig. Der Bump je Slot überlebt den Abbau eines Kontexts (s. `SLOT_IOVA_NEXT`),
+/// damit eine IOVA auch über Kontextgrenzen hinweg nie wiederverwendet wird.
+fn window_size(first: u64) -> u64 {
+    ((S1_INPUT_LIMIT - first) / NDMA_CTX as u64) & !(IOVA_GUARD - 1)
+}
+
+/// Nächste freie IOVA **je Slot**, über Kontext-Lebenszeiten hinweg.
+///
+/// Der Bump wird beim Abbau eines Kontexts bewusst **nicht** zurückgesetzt. Täte er das, bekäme
+/// der nächste Kontext desselben Slots dieselben IOVAs — und ein Gerät, dessen ATC-Eintrag oder
+/// in-flight Request die alte Zuordnung trägt, träfe auf eine gültige Abbildung fremder
+/// Regionen. Nicht-Wiederverwendung ist der Preis dafür, dass die Reihenfolge beim Teardown eine
+/// bewiesene und keine erzwungene Eigenschaft ist (s. Teardown-Token in `todo.md`).
+static SLOT_IOVA_NEXT: [AtomicU64; NDMA_CTX] = [const { AtomicU64::new(0) }; NDMA_CTX];
+
+/// Dem Kontext im Slot `slot` sein IOVA-Fenster zuweisen.
 ///
 /// Die Fenster liegen hintereinander, damit zwei Kontexte nie dieselbe IOVA vergeben — sonst
 /// wäre die Bounds-Prüfung eines Treibers gegen den *eigenen* Kontext wertlos, sobald ein zweiter
 /// dieselben Zahlen benutzt.
-fn ctx_assign_window(c: &mut DmaCtx) {
-    static NEXT_WINDOW: AtomicU64 = AtomicU64::new(0);
-    /// IOVA-Raum je Kontext (großzügig; der Bump gibt nie zurück).
-    const WINDOW_SIZE: u64 = 1 << 30; // 1 GiB
+fn ctx_assign_window(c: &mut DmaCtx, slot: usize) {
     match strong_window_base() {
         Some(first) => {
-            let n = NEXT_WINDOW.fetch_add(1, Ordering::Relaxed);
-            c.iova_base = first + n * WINDOW_SIZE;
+            let size = window_size(first);
+            c.iova_base = first + slot as u64 * size;
+            c.iova_limit = c.iova_base + size;
             c.strong_window = true;
         }
         None => {
@@ -2513,23 +2593,102 @@ fn ctx_assign_window(c: &mut DmaCtx) {
             // eine IOVA *könnte* zufällig wie eine PA aussehen). Auf dieser Plattform gibt es das
             // nicht; der Zweig existiert für 32-Bit-Geräte / kleine Eingangsbreiten.
             c.iova_base = 0;
+            c.iova_limit = S1_INPUT_LIMIT;
             c.strong_window = false;
         }
     }
-    c.iova_next = c.iova_base + IOVA_GUARD; // führendes Guard-Band
+    // Bump des Slots fortsetzen, nicht neu beginnen.
+    let prev = SLOT_IOVA_NEXT[slot].load(Ordering::Relaxed);
+    c.iova_next = if prev >= c.iova_base && prev < c.iova_limit {
+        prev
+    } else {
+        c.iova_base + IOVA_GUARD // führendes Guard-Band
+    };
 }
 
-/// Eine IOVA für `len` Bytes aus dem Fenster des Kontexts vergeben — 2-MiB-ausgerichtet, mit
-/// einem Guard-Band dahinter. `None`, wenn das Fenster erschöpft ist.
-fn ctx_alloc_iova(c: &mut DmaCtx, len: u64) -> Option<Iova> {
+/// Warum eine IOVA-Vergabe scheiterte — die Unterscheidung ist der Punkt: „Fenster voll" ist ein
+/// Betriebszustand mit Obergrenze, „Gerät zu schmal" ein Konfigurationsfehler der Plattform.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IovaError {
+    /// Der Bump des Slots hat das Fensterende erreicht (keine Wiederverwendung).
+    WindowExhausted,
+    /// Die IOVA läge oberhalb der per `CD.T0SZ` konfigurierten Eingangsbreite.
+    InputWidth,
+    /// Das Gerät kann die Adresse nicht absetzen (z. B. 32-Bit-DMA, Fenster oberhalb 4 GiB).
+    DeviceAddrWidth,
+}
+
+/// Eine IOVA für `len` Bytes aus dem Fenster des Kontexts vergeben — `IOVA_GUARD`-ausgerichtet,
+/// mit einem Guard-Band dahinter, nie wiederverwendet.
+///
+/// Drei Bedingungen, alle drei mit eigener Fehlerursache, weil sie verschiedene Dinge bedeuten:
+/// das Fensterende (Betriebsgrenze), die Eingangsbreite der Stage-1 (Kernel-Konfiguration) und
+/// die Adressbreite des Geräts (Plattform). Vor allem die letzte darf nicht stillschweigend
+/// durchgehen: ein Gerät mit 32-Bit-DMA bekäme aus einem Fenster oberhalb des RAM eine Adresse,
+/// die es gar nicht absetzen kann — der Bus schneidet sie ab, und die abgeschnittene Adresse
+/// trifft irgendetwas anderes.
+fn ctx_alloc_iova(c: &mut DmaCtx, slot: usize, len: u64, dev_bits: u32) -> Result<Iova, IovaError> {
     let start = (c.iova_next + IOVA_GUARD - 1) & !(IOVA_GUARD - 1);
     let span = (len + IOVA_GUARD - 1) & !(IOVA_GUARD - 1);
-    let next = start.checked_add(span)?.checked_add(IOVA_GUARD)?; // Guard dahinter
-    if next >= c.iova_base + (1 << 30) {
-        return None; // Fenster voll
+    let next = start
+        .checked_add(span)
+        .and_then(|e| e.checked_add(IOVA_GUARD)) // Guard dahinter
+        .ok_or(IovaError::WindowExhausted)?;
+    if next > c.iova_limit {
+        return Err(IovaError::WindowExhausted);
+    }
+    if start + span > S1_INPUT_LIMIT {
+        return Err(IovaError::InputWidth);
+    }
+    if dev_bits < 64 && start + span > (1u64 << dev_bits) {
+        return Err(IovaError::DeviceAddrWidth);
     }
     c.iova_next = next;
-    Some(Iova::new(start))
+    SLOT_IOVA_NEXT[slot].store(next, Ordering::Relaxed);
+    Ok(Iova::new(start))
+}
+
+/// Wie viele Adressbits ein Gerät absetzen kann (`64` = keine Einschränkung bekannt).
+const MAX_NARROW_DEVS: usize = 4;
+static NARROW_DEVS: [AtomicU64; MAX_NARROW_DEVS] = [const { AtomicU64::new(0) }; MAX_NARROW_DEVS];
+
+/// Einem Gerät eine **schmalere** DMA-Adressbreite zuschreiben (z. B. 32 Bit).
+///
+/// Ohne diese Angabe nimmt der Kernel 64 Bit an — die einzige Annahme, die nicht still
+/// fehlschlägt: ist sie falsch, scheitert `dma_attach` laut, statt eine Adresse zu vergeben, die
+/// das Gerät abschneidet. `false`, wenn die Tabelle voll ist.
+pub fn dma_declare_device_addr_bits(stream_id: u32, bits: u32) -> bool {
+    let v = ((stream_id as u64) << 32) | (bits as u64);
+    for e in NARROW_DEVS.iter() {
+        let cur = e.load(Ordering::Acquire);
+        if cur >> 32 == stream_id as u64 || cur == 0 {
+            e.store(v, Ordering::Release);
+            return true;
+        }
+    }
+    false
+}
+
+fn device_addr_bits(stream_id: u32) -> u32 {
+    for e in NARROW_DEVS.iter() {
+        let cur = e.load(Ordering::Acquire);
+        if cur != 0 && cur >> 32 == stream_id as u64 {
+            return cur as u32;
+        }
+    }
+    64
+}
+
+/// Zähler der laut abgewiesenen Zuteilungen, je Ursache (Telemetrie/Test).
+static IOVA_REJECTS: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
+
+fn note_iova_reject(e: IovaError) {
+    let i = match e {
+        IovaError::WindowExhausted => 0,
+        IovaError::InputWidth => 1,
+        IovaError::DeviceAddrWidth => 2,
+    };
+    IOVA_REJECTS[i].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Position einer StreamID in der SID-Liste eines Kontexts.
@@ -2643,6 +2802,9 @@ struct DmaCtx {
     /// 39-Bit-Fenster unnötig und würde Fragen nach veralteten Übersetzungen aufwerfen, die es
     /// so gar nicht erst gibt.
     iova_next: u64,
+    /// Obergrenze des Fensters (exklusiv). Der Bump gibt nie zurück, also ist das zugleich die
+    /// Lebenszeit-Obergrenze der Zuteilungen dieses Slots.
+    iova_limit: u64,
     /// Liegt das Fenster oberhalb des RAM (dann ist eine vertauschte Achse **immer** ein Fault)?
     strong_window: bool,
     regs: [DmaRegion; MAX_CTX_REGS], // (base,len) je Region ((0,0) = leer)
@@ -2658,6 +2820,7 @@ impl DmaCtx {
         saved_cmd: [0; MAX_CTX_SIDS],
         iova_base: 0,
         iova_next: 0,
+        iova_limit: 0,
         strong_window: false,
         regs: [DmaRegion::EMPTY; MAX_CTX_REGS],
     };
@@ -2984,6 +3147,15 @@ pub struct VirtioDmaResult {
     pub cj_evt_sid_ok: bool,      // ... von der erwarteten StreamID
     pub cj_evt_input_ok: bool,    // ... auf genau der absichtlich eingetragenen PA
     pub cj_axes_differ: bool,     // Positivkontrolle der Trennung: IOVA != PA in diesem Lauf
+    /// Sensitivitätskontrolle: mit **Bypass-STE** (Durchsetzung aufgehoben) schreibt dasselbe
+    /// Gerät dieselbe Adresse tatsächlich. Ohne diese Kontrolle wäre das Ausbleiben des
+    /// Schreibzugriffs auch mit einem stillgelegten Gerät vereinbar.
+    pub cj_bypass_wrote: bool,
+    /// Die Event-Queue hat in **diesem Lauf** nachweislich gesprochen (ein echter
+    /// `F_TRANSLATION`). Erst damit ist „Queue leer" oben überhaupt eine Aussage.
+    pub evtq_liveness: bool,
+    /// Keine Konfigurationsfehler der Einheit (`C_BAD_STE`/`C_BAD_CD`/…) über den ganzen Lauf.
+    pub cfg_errors_zero: bool,
     pub audit_ok: bool,        // dma_audit==0 nach dem Aufräumen
 }
 
@@ -3090,6 +3262,38 @@ pub fn virtio_rng_dma_demo() -> VirtioDmaResult {
             r.cj_evt_translation = ev.kind == hal::smmu::EVT_F_TRANSLATION;
             r.cj_evt_sid_ok = ev.stream_id == rid;
             r.cj_evt_input_ok = ev.input_addr == sent;
+            // **Queue-Liveness**: ein echter Übersetzungsfehler ist der Beleg, dass die Queue in
+            // diesem Lauf überhaupt sprechen kann. Ohne ihn ruht jedes „keine Faults" auf
+            // `CD.R` — einem Bit, das genau hier einmal gefehlt hat und das jemand später aus
+            // Performancegründen wieder abschalten kann.
+            if r.cj_evt_translation {
+                EVTQ_LIVENESS.store(true, Ordering::Release);
+                r.evtq_liveness = true;
+            }
+        }
+        // Teil 3, Sensitivitätskontrolle: **ohne** Durchsetzung muss dasselbe Gerät dieselbe
+        // Adresse wirklich schreiben. Die alte Kontrolle (`cj_unguarded_wrote`) ist eingeklappt,
+        // seit die SMMU tatsächlich übersetzt: sie prüfte dann dieselbe Beobachtung wie die
+        // Hauptaussage und konnte nicht mehr fehlschlagen, während diese besteht. Diese hier
+        // kann es — sie ist rot, wenn das Gerät gar nicht mehr DMAt.
+        //
+        // Der Aufbau ist bewusst genau der eines „Passthrough-Enforcers für den Bringup":
+        // Bypass-STE, Gerät läuft unübersetzt. Er steht sichtbar benannt im Test, damit er nicht
+        // versehentlich in der Durchsetzung landet.
+        hal::smmu::drain_eventq();
+        unsafe { core::ptr::write_volatile(sent as *mut u64, SENTINEL) };
+        hal::cpu::dsb_sy();
+        if DMA_ENFORCER.override_ste(rid, &hal::smmu::build_ste_bypass()) {
+            if let Some(rng) = hal::virtio::probe(&dev) {
+                // Unter Bypass gibt es **keine** Gerätesicht mehr: die Adressen des Geräts sind
+                // physisch. Deshalb hier `base` in beiden Rollen — und genau das ist die
+                // Konfiguration, in der die Achsentrennung wirkungslos ist.
+                let _ = unsafe { rng.request(base, base, sent) };
+            }
+            // SAFETY: s.o.
+            let after_bypass = unsafe { core::ptr::read_volatile(sent as *const u64) };
+            r.cj_bypass_wrote = after_bypass != SENTINEL;
+            DMA_ENFORCER.restore_ste(rid);
         }
         hal::smmu::drain_eventq();
         free_raw_region(sent, 4096);
@@ -3099,6 +3303,7 @@ pub fn virtio_rng_dma_demo() -> VirtioDmaResult {
     dma_disable(rid, base, len);
     free_raw_region(base, len);
     r.audit_ok = dma_audit() == 0;
+    r.cfg_errors_zero = hal::smmu::config_errors() == 0;
     r
 }
 
@@ -3169,7 +3374,7 @@ pub fn hotreload_state_set(val: u64) {
 
 /// Eine roh-allozierte RAM-Region (ohne Cap) an den Allokator zurückgeben (interner Test-/
 /// Setup-Helfer für temporäre DMA-/Sentinel-Regionen). 4-KiB-granular.
-fn free_raw_region(base: u64, len: u64) {
+pub(crate) fn free_raw_region(base: u64, len: u64) {
     let len = (len + 4095) & !4095;
     MEM.lock().free_region(PhysRegion::new(base, len));
 }
@@ -3216,6 +3421,15 @@ pub fn dma_audit() -> u32 {
     // muss im RAM-Fenster liegen, das der Allokator überhaupt vergeben kann.
     if !dma_ctx_regions_are_physical() {
         return 5;
+    }
+    // Code 6: **Konfigurationsfehler der IOMMU**. `C_BAD_STE`/`C_BAD_CD` und Verwandte heißen,
+    // dass die Einheit die Tabellen ablehnt und den Stream **gar nicht** übersetzt. Jede spätere
+    // Aussage der Form „keine Faults beobachtet" wäre dann bedeutungslos — nicht weil nichts
+    // passierte, sondern weil nichts passieren *konnte*. Genau dieser Zustand bestand hier
+    // unbemerkt, solange das emulierte Gerät die SMMU ohnehin umging.
+    #[cfg(target_arch = "aarch64")]
+    if hal::smmu::config_errors() != 0 {
+        return 6;
     }
     0
 }
@@ -3287,6 +3501,34 @@ pub(crate) mod testsupport {
             .find(|c| c.used && c.sids.contains(&stream_id))
             .map(|c| c.sids.iter().filter(|&&s| s != u32::MAX).count())
             .unwrap_or(0)
+    }
+
+    /// Den Bump des Kontexts kurz vor das Fensterende schieben, damit der Erschöpfungsfall
+    /// prüfbar wird, ohne zehntausende Zuteilungen zu fahren. Gibt `false`, wenn es den Kontext
+    /// nicht gibt.
+    pub fn dma_ctx_exhaust_window(stream_id: u32) -> bool {
+        let mut t = DMA_CTX.lock();
+        match t.iter_mut().find(|c| c.used && c.sids.contains(&stream_id)) {
+            Some(c) => {
+                c.iova_next = c.iova_limit - IOVA_GUARD;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Zähler der laut abgewiesenen IOVA-Zuteilungen: (Fenster voll, Eingangsbreite, Gerät).
+    pub fn dma_iova_rejects() -> (u32, u32, u32) {
+        (
+            IOVA_REJECTS[0].load(Ordering::Relaxed),
+            IOVA_REJECTS[1].load(Ordering::Relaxed),
+            IOVA_REJECTS[2].load(Ordering::Relaxed),
+        )
+    }
+
+    /// Hat die Event-Queue in diesem Lauf nachweislich gesprochen?
+    pub fn evtq_liveness_proven() -> bool {
+        EVTQ_LIVENESS.load(Ordering::Acquire)
     }
 
     /// Die Stage-1-Wurzel des Kontexts der StreamID (struktureller Leaf-Test). `0` = keiner.

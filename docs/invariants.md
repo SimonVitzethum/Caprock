@@ -212,6 +212,48 @@ sonst `C_BAD_STE` — der Stream übersetzte **gar nicht**), und im CD fehlten `
 Fault bricht ab) und `R` (Fault wird als Event aufgezeichnet). Zwei Fehler, die sich gegenseitig
 verdeckten und zusammen wie ein funktionierender Aufbau aussahen.
 
+**Liveness als Vorbedingung jedes Abwesenheits-Oracles.** Zweimal hintereinander hat hier dieselbe
+Klasse zugeschlagen: Code 4 verglich gegen die falsche Achse und wäre nach Schritt b still grün
+geblieben, und die Event-Queue wäre ohne `CD.R` strukturell leer gewesen. Beide Male hätte Grün
+nichts bedeutet. Die Regel daraus: **jedes Oracle, das über Abwesenheit entscheidet, braucht einen
+Nachweis, dass es überhaupt sprechen kann.** Umgesetzt in zwei Formen:
+
+* **`dma_audit` Code `6`** — `hal::smmu::config_errors()` zählt die Ereignisklasse, mit der die
+  Einheit sagt „deine Tabellen ergeben keinen Sinn" (`C_BAD_STE`, `C_BAD_CD`, `C_BAD_STREAMID`,
+  `F_STE_FETCH`, `F_CD_FETCH`). Der Zähler wird beim **Leeren** der Queue fortgeschrieben, also
+  unabhängig davon, ob gerade jemand hinsieht, und überlebt das Leeren — er ist eine Aussage über
+  den Kernel, nicht über den Verkehr. Ein solcher Eintrag heißt: der Stream übersetzt *gar nicht*,
+  und jedes spätere „keine Faults" ist bedeutungslos.
+* **Queue-Liveness (`evtq_liveness`)** — „Event-Queue leer" zählt im `virtiorng`-Test nur, wenn im
+  **selben Lauf** ein echter `F_TRANSLATION` beobachtet wurde. Ein Selbsttest beim Hochlauf wäre
+  die schönere Form, ist aber nicht konstruierbar: ein Übersetzungsfehler entsteht nur durch eine
+  echte Bus-Master-Anforderung, und `ATOS` liefert sein Ergebnis ins `PAR`, nicht in die
+  Event-Queue (QEMU implementiert es ohnehin nicht). Der Nachweis im selben Lauf ist die
+  erreichbare Fassung — und er ruht auf einer Beobachtung statt auf `CD.R`, das jemand später aus
+  Performancegründen wieder abschalten kann.
+
+**Sensitivitätskontrolle (`cj_bypass_wrote`).** Die frühere Kontrolle war eingeklappt: „das Gerät
+schrieb ODER die SMMU faultete" prüft dieselbe Beobachtung wie die Hauptaussage und kann nicht
+fehlschlagen, während diese besteht. Die Kontrolle, die trägt, hebt die Durchsetzung auf: mit einer
+**Bypass-STE** muss dasselbe Gerät dieselbe Adresse wirklich schreiben. Erst damit ist das
+Ausbleiben des Schreibzugriffs eine Aussage über die SMMU und nicht über ein Gerät, das aus
+irgendeinem Grund gar nicht mehr DMAt. (Die naheliegende Mutation „Fensterbasis auf 0" leistet das
+**nicht**: die Sentinel-Seite liegt auch bei IOVA = PA außerhalb der gemappten Region und faultet
+weiterhin — sie unterscheidet die beiden Welten nicht.) Unter Bypass gibt es zudem keine
+Gerätesicht mehr; der Test programmiert dort in beiden Rollen die PA, und genau das ist die
+Konfiguration, in der die Achsentrennung wirkungslos ist.
+
+**Fenstergrenzen als geprüfte Eigenschaft (`dmawin`).** Der Bump gibt nie zurück, also gibt es eine
+Lebenszeit-Obergrenze; sie darf nur kein Betriebszustand sein. Das Fenster hängt jetzt am
+**Kontext-Slot** statt an einer Erzeugung (`NDMA_CTX` Slots, `NDMA_CTX` Fenster, Bump je Slot
+überlebt den Kontextabbau) — vorher war die schärfere, nirgends notierte Grenze nicht die ~256
+Attach-Vorgänge je Kontext, sondern ~500 Kontext-*Erzeugungen* insgesamt. Drei Bedingungen mit
+eigener Fehlerursache, alle drei laut statt still: Fensterende (`WindowExhausted`), Eingangsbreite
+der Stage-1 (`InputWidth`), **Adressbreite des Geräts** (`DeviceAddrWidth`). Die letzte ist die
+gefährlichste: ein Gerät mit 32-Bit-DMA bekäme aus einem Fenster oberhalb des RAM eine Adresse, die
+der Bus abschneidet — und die abgeschnittene Adresse trifft etwas anderes. Voreinstellung sind 64
+Bit; `dma_declare_device_addr_bits` schreibt eine schmalere zu.
+
 **Was Newtypes nicht finden:** Sie markieren Kanten. Eine Funktion, die vollständig in `u64` lebt,
 ist keine Kante, sondern ein Loch — der `dmagen`-Test las die Stage-1-Blätter mit `r1.base` (PA)
 statt mit der IOVA und blieb für den Compiler unsichtbar; gefunden hat ihn erst das

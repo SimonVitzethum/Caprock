@@ -184,7 +184,32 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       Event-Queue per Konfiguration leer und der Negativtest prüfte nichts.
       Offen geblieben: nur der aarch64-Enforcer vergibt Fenster; `VtdEnforcer::attach` meldet
       weiterhin `None` (x86 hat keine per-Gerät-Zuteilung, s. C).
+- [x] **Nacharbeit zu ext-36b — Belastbarkeit des Belegs.**
+      * **Queue-Liveness**: „Event-Queue leer" zählt nur, wenn im selben Lauf ein echter
+        `F_TRANSLATION` beobachtet wurde. Ein Selbsttest beim Hochlauf ist nicht konstruierbar
+        (ein Übersetzungsfehler braucht eine echte Bus-Master-Anforderung; `ATOS` liefert ins
+        `PAR`, nicht in die Event-Queue) — der Nachweis im selben Lauf ist die erreichbare Form.
+      * **`dma_audit` Code 6**: `C_BAD_STE`/`C_BAD_CD`/… werden beim Leeren der Queue gezählt und
+        überleben es. Ein solcher Eintrag heißt „der Stream übersetzt gar nicht" — genau der
+        Zustand, in dem jedes Abwesenheits-Oracle bedeutungslos ist.
+      * **Sensitivitätskontrolle**: Bypass-STE statt der eingeklappten „schreibt ODER faultet"-
+        Fassung. Die Mutation „Fensterbasis 0" leistet es nicht — die Sentinel-Seite faultet auch
+        bei IOVA = PA, sie unterscheidet die beiden Welten nicht.
+      * **Fenstergrenzen** (`dmawin`): Fenster am Slot statt an der Erzeugung (die schärfere,
+        nirgends notierte Grenze waren ~500 Kontext-*Erzeugungen*, nicht die ~256 Attaches je
+        Kontext), Bump je Slot überlebt den Kontextabbau, drei getrennte Fehlerursachen
+        (Fensterende / Eingangsbreite / **Geräte-Adressbreite**), alle geprüft.
+      Offen: eine Obergrenze bleibt bestehen, solange IOVAs nie wiederverwendet werden. Die
+      Wiederverwendung setzt den Teardown-Token voraus (nächster Punkt) — vorher gibt es keinen
+      erzwungenen Beleg, dass ATC/TLB die alte Zuordnung nicht mehr führen.
 
+- [ ] **x86-Fensterwahl** (vor der VT-d-Zuteilung, s. C): `0xFEE0_0000–0xFEEF_FFFF` ist als
+      IOVA **unbenutzbar**. VT-d behandelt DMA-Requests dorthin als Interrupt-Nachrichten und
+      schickt sie durch das Interrupt-Remapping statt durch die Second-Level-Tabellen — eine IOVA
+      in diesem Fenster wird also *nicht übersetzt*, egal was in der Tabelle steht. Auf einer
+      Maschine mit RAM oberhalb 4 GiB liegt die aus `RAM_TOP` abgeleitete Basis ohnehin darüber,
+      auf einer kleineren nicht. Gehört als Bedingung an die Fensterwahl, zusammen mit IR, ACS
+      und RMRR.
 - [ ] **Teardown-Token** (`Quiesced` → `Invalidated` → `free_region`): hebt die bewiesene
       Reihenfolge auf eine erzwungene. Nicht klein — der Free-Pfad liegt in `CapSpace::delete_leaf`
       (arch-neutrale Cap-Crate, die weder Gerät noch Enforcer kennt). Gangbarer Weg: `ObjectKind::Dma`

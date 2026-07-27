@@ -444,6 +444,9 @@ static VRNG_EVT_XLAT: AtomicBool = AtomicBool::new(false); // ... F_TRANSLATION
 static VRNG_EVT_SID: AtomicBool = AtomicBool::new(false); //  ... erwartete StreamID
 static VRNG_EVT_IN: AtomicBool = AtomicBool::new(false); //   ... erwartete Input-Adresse
 static VRNG_AXES: AtomicBool = AtomicBool::new(false); //     ext-36b: IOVA != PA
+static VRNG_BYPASS: AtomicBool = AtomicBool::new(false); //   Sensitivitaet: Bypass-STE -> Geraet schreibt
+static VRNG_LIVE: AtomicBool = AtomicBool::new(false); //     Event-Queue hat nachweislich gesprochen
+static VRNG_CFGERR0: AtomicBool = AtomicBool::new(false); //  keine C_BAD_STE/C_BAD_CD im Lauf
 static VRNG_DONE: AtomicBool = AtomicBool::new(false);
 static VRNG_OK: AtomicBool = AtomicBool::new(false);
 
@@ -459,6 +462,16 @@ static DMAGEN_SG: AtomicBool = AtomicBool::new(false); // SG-Liste valide + Out-
 static DMAGEN_POOL: AtomicBool = AtomicBool::new(false); // disjunkte DMA-Sub-Puffer (SG-Pfad) + Erschoepfung
 static DMAGEN_BALANCED: AtomicBool = AtomicBool::new(false); // total_free nach Teardown = Baseline
 static DMAGEN_DONE: AtomicBool = AtomicBool::new(false);
+// IOVA-Fenstergrenzen (ext-36b Nacharbeit): Erschoepfung + Geraete-Adressbreite als GEPRUEFTE
+// Eigenschaften. Der Bump gibt nie zurueck, also ist die Obergrenze real -- sie darf nur kein
+// Betriebszustand sein, und wenn sie erreicht wird, muss `attach` sauber scheitern statt eine
+// Adresse zu vergeben, die das Geraet nicht absetzen kann.
+static DMAWIN_DONE: AtomicBool = AtomicBool::new(false);
+static DMAWIN_OK: AtomicBool = AtomicBool::new(false);
+static DMAWIN_NARROW: AtomicBool = AtomicBool::new(false); //   32-Bit-Geraet -> abgewiesen
+static DMAWIN_EXHAUST: AtomicBool = AtomicBool::new(false); //  Fenster voll -> abgewiesen
+static DMAWIN_INTACT: AtomicBool = AtomicBool::new(false); //   Kontext danach unveraendert nutzbar
+static DMAWIN_BALANCED: AtomicBool = AtomicBool::new(false);
 static DMAGEN_OK: AtomicBool = AtomicBool::new(false);
 
 // Prozess-Heap (ext-25): ein Trusted-SAS-Thread (safe Rust) nutzt einen prozess-lokalen
@@ -966,6 +979,61 @@ fn run_dmagen() -> bool {
     DMAGEN_BALANCED.store(balanced, Ordering::Relaxed);
     multiregion && dir && coh && group && sg && pool_ok && audit && balanced
         && system::domain_audit() == 0
+}
+
+/// **IOVA-Fenstergrenzen testen** (ext-36b Nacharbeit).
+///
+/// Zwei Grenzen, die es vorher gab, aber nicht als Eigenschaft: die Adressbreite des Geraets und
+/// das Ende des Fensters. Beide muessen zu einem sauberen Fehlschlag fuehren -- eine
+/// abgeschnittene Adresse trifft sonst irgendetwas anderes, und ein erschoepftes Fenster darf
+/// keinen halb aufgebauten Kontext hinterlassen.
+fn run_dmawin() -> bool {
+    let (narrow_sid, wide_sid) = (0x50u32, 0x51u32);
+    hal::cpu::local_irq_disable();
+    let (Some(r1), Some(r2)) = (
+        system::alloc_dma_region(0x1000),
+        system::alloc_dma_region(0x1000),
+    ) else {
+        hal::cpu::local_irq_enable();
+        return false;
+    };
+    let free0 = system::total_free();
+    let (rej_w0, _, rej_d0) = system::testsupport::dma_iova_rejects();
+
+    // 1. Geraet mit 32-Bit-DMA: das starke Fenster liegt oberhalb des RAM (hier ~5 GiB), also
+    //    kann das Geraet die Adresse gar nicht absetzen -> `attach` muss abweisen.
+    system::dma_declare_device_addr_bits(narrow_sid, 32);
+    let narrow = system::dma_enable(narrow_sid, r1.base, r1.len).is_none()
+        && system::testsupport::dma_iova_rejects().2 == rej_d0 + 1
+        && system::testsupport::dma_ctx_region_count(narrow_sid) == 0; // kein halber Kontext
+
+    // 2. Fenster voll: erste Region geht durch, dann den Bump ans Ende schieben -> zweite
+    //    Zuteilung muss sauber scheitern, und der Kontext muss danach unveraendert nutzbar sein.
+    let first = system::dma_enable(wide_sid, r1.base, r1.len);
+    let exhausted = if first.is_some() {
+        system::testsupport::dma_ctx_exhaust_window(wide_sid);
+        let second = system::dma_enable(wide_sid, r2.base, r2.len);
+        second.is_none() && system::testsupport::dma_iova_rejects().0 == rej_w0 + 1
+    } else {
+        false
+    };
+    // Der Kontext traegt weiterhin genau seine erste Region (kein Teilabbau, kein Leck).
+    let intact = system::testsupport::dma_ctx_region_count(wide_sid) == 1
+        && system::dma_audit() == 0
+        && system::vspace_audit() == 0;
+    if first.is_some() {
+        system::dma_disable(wide_sid, r1.base, r1.len);
+    }
+    let balanced = system::total_free() == free0;
+    system::free_raw_region(r1.base, r1.len);
+    system::free_raw_region(r2.base, r2.len);
+    hal::cpu::local_irq_enable();
+
+    DMAWIN_NARROW.store(narrow, Ordering::Relaxed);
+    DMAWIN_EXHAUST.store(exhausted, Ordering::Relaxed);
+    DMAWIN_INTACT.store(intact, Ordering::Relaxed);
+    DMAWIN_BALANCED.store(balanced, Ordering::Relaxed);
+    narrow && exhausted && intact && balanced && system::domain_audit() == 0
 }
 
 /// **Prozess-Heap testen** (ext-25): ein Trusted-SAS-Kontext (safe Rust) baut einen prozess-
@@ -4218,6 +4286,9 @@ pub fn demo_report_then_idle() -> ! {
             VRNG_EVT_SID.store(res.cj_evt_sid_ok, Ordering::Relaxed);
             VRNG_EVT_IN.store(res.cj_evt_input_ok, Ordering::Relaxed);
             VRNG_AXES.store(res.cj_axes_differ, Ordering::Relaxed);
+            VRNG_BYPASS.store(res.cj_bypass_wrote, Ordering::Relaxed);
+            VRNG_LIVE.store(res.evtq_liveness, Ordering::Relaxed);
+            VRNG_CFGERR0.store(res.cfg_errors_zero, Ordering::Relaxed);
             // PASS = echter DMA + Level-1-Software-Erzwingung (demonstrierbar). cj_smmu_enforced
             // (Level 2) ist unter QEMU fuer emulierte Geraete nicht beobachtbar -> NICHT gefordert.
             let ok = res.found
@@ -4227,13 +4298,18 @@ pub fn demo_report_then_idle() -> ! {
                 && res.evtq_empty_good //                In-Window: keine SMMU-Faults
                 && res.cj_sw_blocked //                  L1: Out-of-Window software-abgewiesen
                 && res.cj_sentinel_ok //                 L1 aktiv: Ziel unveraendert
-                // Sensitivitaet: OHNE die Software-Pruefung passiert etwas Beobachtbares —
-                // entweder schreibt das Geraet (dann war L1 allein lasttragend) ODER die SMMU
-                // weist den Zugriff ab (dann traegt L2). Seit `iommu_platform=on` uebersetzt
-                // QEMU das Geraet wirklich, also greift hier der zweite Fall. Beide Faelle
-                // belegen, dass der umgangene Pfad nicht einfach folgenlos ist; keiner von
-                // beiden waere fuer sich allein eine ehrliche Forderung.
-                && (res.cj_unguarded_wrote || res.cj_smmu_enforced)
+                // Sensitivitaetskontrolle: mit Bypass-STE (Durchsetzung aufgehoben) schreibt
+                // dasselbe Geraet dieselbe Adresse wirklich. Erst damit ist das Ausbleiben des
+                // Schreibzugriffs oben eine Aussage ueber die SMMU und nicht ueber ein Geraet,
+                // das aus irgendeinem Grund gar nicht mehr DMAt. Die frueher hier stehende
+                // "schreibt ODER faultet"-Fassung war eingeklappt: sie prueft dieselbe
+                // Beobachtung wie die Hauptaussage und kann nicht fehlschlagen, waehrend diese
+                // besteht.
+                && res.cj_bypass_wrote
+                // Queue-Liveness: "Event-Queue leer" oben zaehlt nur, wenn die Queue in diesem
+                // Lauf nachweislich sprechen konnte.
+                && res.evtq_liveness
+                && res.cfg_errors_zero //                Einheit lehnt die Tabellen nicht ab
                 && res.cj_axes_differ //                 ext-36b: die Demo lief mit IOVA != PA
                 // Beobachtete die SMMU den Fault (reale HW), muss der Eintrag **passen** —
                 // sonst belegt er nichts. Unter QEMU ist `cj_smmu_enforced` false und die
@@ -4258,7 +4334,13 @@ pub fn demo_report_then_idle() -> ! {
 
         // Prozess-Heap (ext-25): ein Trusted-SAS-Kontext nutzt echten Box/Vec/BTreeMap-Heap.
         // Synchron, ein Schritt. Gegate auf dmagen (ext-24) fertig.
-        if !SASHEAP_DONE.load(Ordering::Acquire) && DMAGEN_DONE.load(Ordering::Acquire) {
+        // IOVA-Fenstergrenzen (ext-36b): laut scheitern statt still abschneiden. Synchron.
+        if !DMAWIN_DONE.load(Ordering::Acquire) && DMAGEN_DONE.load(Ordering::Acquire) {
+            DMAWIN_OK.store(run_dmawin(), Ordering::Release);
+            DMAWIN_DONE.store(true, Ordering::Release);
+        }
+
+        if !SASHEAP_DONE.load(Ordering::Acquire) && DMAWIN_DONE.load(Ordering::Acquire) {
             SASHEAP_OK.store(run_sasheap(), Ordering::Release);
             SASHEAP_DONE.store(true, Ordering::Release);
         }
@@ -4669,6 +4751,8 @@ fn all_done() -> bool {
     let virtiorng = VRNG_DONE.load(Ordering::Acquire) && VRNG_OK.load(Ordering::Acquire);
     // Generische DMA-Infra (ext-24): Richtung/Kohärenz + Multi-Region + Gruppen + SG + Pool.
     let dmagen = DMAGEN_DONE.load(Ordering::Acquire) && DMAGEN_OK.load(Ordering::Acquire);
+    // IOVA-Fenstergrenzen (ext-36b): Erschöpfung + Geräte-Adressbreite als geprüfte Eigenschaft.
+    let dmawin = DMAWIN_DONE.load(Ordering::Acquire) && DMAWIN_OK.load(Ordering::Acquire);
     // Prozess-Heap (ext-25): echter Box/Vec/BTreeMap-Heap auf realen Physadressen (safe Rust).
     let sasheap = SASHEAP_DONE.load(Ordering::Acquire) && SASHEAP_OK.load(Ordering::Acquire);
     // Binary-Loader L1 (ext-26): extern gebautes hello geladen + lief (signalisierte HELLO_BADGE).
@@ -5191,6 +5275,9 @@ fn report() {
     println!("virtiorng: KRONJUWEL out-of-window: L1-Software-abgewiesen={} Ziel-unveraendert={} (Sensitivitaet: ohne-Pruefung-Geraet-schrieb={}); L2-SMMU-Fault={} (Stage-1-STE->CD->Pagetable greift, Fault wird als Event aufgezeichnet)",
         VRNG_CJ_SW.load(Ordering::Acquire), VRNG_CJ_SENT.load(Ordering::Acquire),
         VRNG_CJ_UNGUARDED.load(Ordering::Acquire), VRNG_SMMU_ENF.load(Ordering::Acquire));
+    println!("virtiorng: Kontrollen: Bypass-STE-Geraet-schrieb={} Event-Queue-hat-gesprochen={} keine-Konfig-Fehler={}",
+        VRNG_BYPASS.load(Ordering::Acquire), VRNG_LIVE.load(Ordering::Acquire),
+        VRNG_CFGERR0.load(Ordering::Acquire));
     println!("virtiorng: ext-36b Achsen getrennt: IOVA!=PA={} ; Negativtest (Deskriptor traegt absichtlich die PA): Event-F_TRANSLATION={} StreamID-passt={} Input-Adresse-passt={} (mit iommu_platform=on uebersetzt QEMU wirklich -> beobachtbar)",
         VRNG_AXES.load(Ordering::Acquire), VRNG_EVT_XLAT.load(Ordering::Acquire),
         VRNG_EVT_SID.load(Ordering::Acquire), VRNG_EVT_IN.load(Ordering::Acquire));
@@ -5209,6 +5296,16 @@ fn report() {
     println!(
         "dmagen  : {} (generische DMA-Infra: Richtung/Kohaerenz als DmaCap-Attribute, Multi-Region-Kontext, Stream-Gruppen, SG-Validierung, disjunkte Sub-Puffer ueber den SG-Pfad — baut auf DmaCap/DmaEnforcer auf)",
         if dmagen { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // IOVA-Fenstergrenzen (ext-36b Nacharbeit).
+    let dmawin = DMAWIN_DONE.load(Ordering::Acquire) && DMAWIN_OK.load(Ordering::Acquire);
+    println!("dmawin  : 32-Bit-Geraet-abgewiesen={} Fenster-voll-abgewiesen={} Kontext-danach-intakt={} balanciert={}",
+        DMAWIN_NARROW.load(Ordering::Acquire), DMAWIN_EXHAUST.load(Ordering::Acquire),
+        DMAWIN_INTACT.load(Ordering::Acquire), DMAWIN_BALANCED.load(Ordering::Acquire));
+    println!(
+        "dmawin  : {} (IOVA-Fenstergrenzen: Geraete-Adressbreite + Fenster-Erschoepfung scheitern laut statt still abzuschneiden; kein halb aufgebauter Kontext)",
+        if dmawin { "ALL PASS" } else { "FAILURES" }
     );
 
     // Prozess-Heap (ext-25): echter Box/Vec/BTreeMap-Heap auf realen Physadressen (safe Rust).

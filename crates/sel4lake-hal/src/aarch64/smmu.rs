@@ -14,6 +14,7 @@
 //! SMMUv3 `@0x0905_0000` (QEMU virt). Register-Offsets nach ARM IHI 0070.
 
 use super::cpu;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 pub const SMMU_BASE: u64 = 0x0905_0000;
 
@@ -496,11 +497,49 @@ pub fn eventq_count() -> u32 {
     let c = r32(EVENTQ_CONS) & mask;
     p.wrapping_sub(c) & mask
 }
+/// Zähler für **Konfigurationsfehler** der Einheit (s. [`config_errors`]).
+static CFG_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+/// Ereignistypen, die **immer** ein Kernel-Fehler sind, nie das Verschulden eines Geräts:
+/// Die Einheit sagt damit „deine Tabellen ergeben keinen Sinn" — und, entscheidend, sie
+/// **übersetzt den Stream dann gar nicht**. Ein solcher Eintrag darf niemals nur mitgezählt und
+/// verworfen werden, denn danach ist jede Aussage der Form „keine Faults" bedeutungslos.
+fn is_config_error(kind: u8) -> bool {
+    matches!(
+        kind,
+        EVT_C_BAD_STREAMID | EVT_F_STE_FETCH | EVT_C_BAD_STE | EVT_F_CD_FETCH | EVT_C_BAD_CD
+    )
+}
+
+/// Wie viele **Konfigurationsfehler** (s. [`is_config_error`]) seit dem Hochlauf beobachtet
+/// wurden. Der Zähler wird beim Leeren der Queue fortgeschrieben, also unabhängig davon, ob
+/// gerade jemand hinsieht.
+///
+/// Der Grund für diesen Zähler ist ein realer Fund: `STE.S1STALLD` und die fehlenden CD-Bits
+/// `A`/`R` erzeugten je einen solchen Eintrag, und weil niemand die verworfenen Events
+/// klassifizierte, sah der Aufbau jahrelang funktionierend aus. Ein Oracle, das über
+/// **Abwesenheit** entscheidet („Event-Queue leer"), braucht als Vorbedingung, dass die
+/// Konfiguration überhaupt eine Übersetzung erzeugt.
+pub fn config_errors() -> u32 {
+    CFG_ERRORS.load(Ordering::Relaxed)
+}
+
 /// Die Event-Queue leeren (CONS := PROD) — nach einem **bewusst** provozierten Fault (Kronjuwel-
 /// Sensitivität), damit nachfolgende Audits die Queue wieder leer sehen. Gibt zurück, wie viele
 /// Events verworfen wurden.
+///
+/// Vor dem Verwerfen werden die Einträge **klassifiziert**: Konfigurationsfehler wandern in
+/// [`config_errors`] und überleben das Leeren, weil sie eine Aussage über den Kernel sind und
+/// nicht über den Verkehr.
 pub fn drain_eventq() -> u32 {
     let n = eventq_count();
+    for i in 0..n {
+        if let Some(ev) = eventq_at(i) {
+            if is_config_error(ev.kind) {
+                CFG_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
     w32(EVENTQ_CONS, r32(EVENTQ_PROD));
     cpu::dsb_sy();
     n
@@ -520,21 +559,42 @@ pub struct EventRecord {
 /// `F_TRANSLATION` — die Übersetzung schlug fehl, weil kein gültiger Eintrag existiert.
 /// Genau der Typ, den eine Anforderung auf eine **nicht zugeteilte** Adresse erzeugt.
 pub const EVT_F_TRANSLATION: u8 = 0x10;
+/// Konfigurationsfehler-Klasse (s. [`config_errors`]): die Einheit lehnt die Tabellen ab.
+pub const EVT_C_BAD_STREAMID: u8 = 0x02;
+pub const EVT_F_STE_FETCH: u8 = 0x03;
+pub const EVT_C_BAD_STE: u8 = 0x04;
+pub const EVT_F_CD_FETCH: u8 = 0x09;
+pub const EVT_C_BAD_CD: u8 = 0x0a;
 
-/// Den **ältesten** Eintrag der Event-Queue lesen, ohne ihn zu verbrauchen.
+/// Eine **Bypass**-STE (Config = 0b100): der Stream läuft **unübersetzt** durch.
 ///
-/// Für Tests, die einen Fault nicht nur *zählen*, sondern belegen müssen, dass er der erwartete
-/// ist: ein bloßer Zähler bestünde auch bei einem Fault aus ganz anderem Grund.
-pub fn eventq_peek() -> Option<EventRecord> {
-    if eventq_empty() {
+/// Ausschließlich für die Sensitivitätskontrolle des Kronjuwel-Tests gedacht, und zwar für genau
+/// die Frage, die der Test sonst nicht beantworten kann: hätte das Gerät ohne die IOMMU
+/// geschrieben? Ohne diese Kontrolle wäre ein Ausbleiben des Schreibzugriffs auch mit einem
+/// stillgelegten oder gar nicht angesprochenen Gerät vereinbar — die Hauptaussage („die SMMU hat
+/// es verhindert") ruhte dann auf einer Beobachtung, die sie nicht trägt.
+///
+/// Das ist zugleich der Aufbau, den ein „Passthrough-Enforcer für den Bringup" hätte. Er steht
+/// deshalb hier, sichtbar benannt, und nicht als Nebenwirkung eines Konfigurationsschalters.
+pub fn build_ste_bypass() -> [u64; 8] {
+    // STE[0]: V=1, Config=0b100 (Bypass). STE[1]: SHCFG=0b01 (incoming attrs beibehalten).
+    [1 | (0b100 << 1), 0b01 << 44, 0, 0, 0, 0, 0, 0]
+}
+
+/// Den `i`-ten Eintrag (ab CONS) der Event-Queue lesen, ohne ihn zu verbrauchen.
+fn eventq_at(i: u32) -> Option<EventRecord> {
+    let mask = (1u32 << LOG2_EVENTQ) - 1;
+    if i >= eventq_count() {
         return None;
     }
-    let mask = (1u64 << LOG2_EVENTQ) - 1;
-    let idx = (r32(EVENTQ_CONS) as u64) & mask;
+    let idx = (((r32(EVENTQ_CONS) & mask) + i) & mask) as u64;
     let base = r64(EVENTQ_BASE) & 0x000f_ffff_ffff_ffe0;
+    if base == 0 {
+        return None;
+    }
     let rec = base + idx * EVT_BYTES;
-    // SAFETY: `rec` liegt in der vom Kernel allozierten, identity-gemappten Event-Queue; gelesen
-    // werden genau die beiden Worte des Eintrags.
+    // SAFETY: `rec` liegt in der vom Kernel ausgeschnittenen, identity-gemappten Event-Queue;
+    // `idx` ist durch die Maske auf die Queue-Größe begrenzt.
     unsafe {
         let w0 = core::ptr::read_volatile(rec as *const u64);
         let w2 = core::ptr::read_volatile((rec + 16) as *const u64);
@@ -544,6 +604,14 @@ pub fn eventq_peek() -> Option<EventRecord> {
             input_addr: w2,
         })
     }
+}
+
+/// Den **ältesten** Eintrag der Event-Queue lesen, ohne ihn zu verbrauchen.
+///
+/// Für Tests, die einen Fault nicht nur *zählen*, sondern belegen müssen, dass er der erwartete
+/// ist: ein bloßer Zähler bestünde auch bei einem Fault aus ganz anderem Grund.
+pub fn eventq_peek() -> Option<EventRecord> {
+    eventq_at(0)
 }
 
 /// Byte-Größen der drei Strukturen (für die RAM-Allokation durch den Aufrufer).

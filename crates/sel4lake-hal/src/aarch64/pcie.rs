@@ -289,47 +289,8 @@ pub fn cap_ptr(d: &PciDevice) -> u8 {
     cfg_read8(d.bus, d.dev, d.func, CFG_CAP_PTR)
 }
 
-// --- Quiesce-Buchhaltung je RID (ext-35a) ----------------------------------------------------
-//
-// Die BME-Wiederherstellung hängt an einer Bedingung, die der naive Ablauf nicht hatte:
-// **zwei nebenläufige Teardowns auf demselben Gerät dürfen sich nicht gegenseitig entwaffnen.**
-//
-// ```text
-//   A: BME clear ──flush──┬─ unmap ── tlbi_sync ── BME restore
-//   B:      BME clear ────┴──flush──────── unmap ── free
-//                                ▲  A schaltet hier wieder scharf:
-//                                   B's Flush-Garantie ist ab hier wertlos
-// ```
-//
-// B hat gespült, aber A macht das Gerät wieder aktiv, bevor B seine Region unmappt — das Fenster,
-// das der Flush-Read schließen soll, wäre wieder offen. Deshalb ein **Tiefenzähler je RID**:
-// entwaffnet wird beim Übergang 0→1, wiederhergestellt erst beim Übergang 1→0.
-//
-// Der Zähler ist bewusst **unabhängig** von der Serialisierung des Aufrufers. Heute läuft der
-// Detach-Pfad ohnehin unter einem globalen Kontext-Lock; die Eigenschaft soll aber nicht daran
-// hängen, dass das so bleibt (jemand verfeinert das Kontext-Locking und weiß nicht, dass die
-// Quiesce-Wiederherstellung daran hing — genau der teure Fall).
-
-/// Wie viele Geräte gleichzeitig stillgelegt sein können.
-const MAX_QUIESCED: usize = 16;
-
-#[derive(Clone, Copy)]
-struct QuiesceEnt {
-    rid: u32,
-    depth: u32,
-    /// Command-Register **vor** der ersten Stilllegung (Save/Restore, nie „auf 1 setzen": ein
-    /// Gerät, das absichtlich aus war, darf ein Teardown nicht einschalten).
-    saved_cmd: u16,
-}
-
-static QUIESCED: sel4lake_sync::SpinLock<[QuiesceEnt; MAX_QUIESCED]> =
-    sel4lake_sync::SpinLock::new(
-        [QuiesceEnt {
-            rid: u32::MAX,
-            depth: 0,
-            saved_cmd: 0,
-        }; MAX_QUIESCED],
-    );
+/// Bus-Master-Bit im Command-Register (der Kernel braucht es für die Save/Restore-Semantik).
+pub const CMD_BUS_MASTER_BIT: u16 = CMD_BUS_MASTER;
 
 fn rid_parts(rid: u32) -> (u8, u8, u8) {
     (
@@ -339,81 +300,48 @@ fn rid_parts(rid: u32) -> (u8, u8, u8) {
     )
 }
 
-/// Ein Gerät über seine **RID** (= StreamID) stilllegen und bereits abgesetzte Writes spülen.
+fn write_cmd(bus: u8, dev: u8, func: u8, cmd: u16) {
+    cfg_write16(bus, dev, func, CFG_COMMAND, cmd);
+}
+
+/// Bus-Master **löschen** und bereits abgesetzte Writes spülen; gibt das vorherige
+/// Command-Register zurück (Save/Restore, nie „auf 1 setzen").
 ///
 /// Zwei Schritte, die verschiedene Dinge tun und einander **nicht** ersetzen:
+/// 1. Bus-Master löschen — danach keine **neuen** Memory-Requests mehr.
+/// 2. Ein **Read vom selben Gerät** — PCIe garantiert, dass eine Completion posted Writes nicht
+///    überholt, die zuvor abgesetzten sind danach also zugestellt.
 ///
-/// 1. **Bus-Master löschen.** Danach darf das Gerät keine neuen Memory-Requests mehr absetzen.
-///    Über bereits unterwegs befindliche (posted) Writes sagt das nichts.
-/// 2. **Read vom selben Gerät.** PCIe garantiert, dass eine Completion posted Writes nicht
-///    überholt: die Antwort trifft erst ein, nachdem die zuvor abgesetzten Writes zugestellt
-///    sind. Der Rückgabewert ist belanglos — der Zweck ist die Ordnungsgarantie.
+/// Gewählt ist ein **Config-Read**, weil zum Teardown-Zeitpunkt kein BAR garantiert gemappt ist.
+/// Der verbreitetere Idiom ist ein **MMIO-Read aus einem BAR**: die Ordnungsgarantie gilt für
+/// beide, aber Config-Space ist in manchen Endpoints über einen separaten Pfad implementiert —
+/// wo ein BAR sicher verfügbar ist, wäre der MMIO-Read die stärkere Wahl.
 ///
-///    Gewählt ist ein **Config-Read**, weil zum Teardown-Zeitpunkt kein BAR garantiert gemappt
-///    ist. Der verbreitetere Idiom ist ein **MMIO-Read aus einem BAR**: die Garantie gilt für
-///    beide, aber Config-Space ist in manchen Endpoints über einen separaten Pfad implementiert.
-///    Wo ein BAR sicher verfügbar ist, wäre der MMIO-Read die stärkere Wahl.
+/// **Grenzen.** Gilt nur, solange *Relaxed Ordering* / *ID-Based Ordering* für diese Funktion
+/// nicht aktiv sind, und setzt voraus, dass das Gerät `BME` respektiert — ein **kompromittiertes**
+/// tut das nicht. Gegen das wirkt allein das Entfernen der Übersetzung (STE/Stage-1).
 ///
-/// **Grenzen.** Die Ordnungsgarantie hält nur, solange *Relaxed Ordering* / *ID-Based Ordering*
-/// für diese Funktion nicht aktiv sind. Und sie setzt voraus, dass das Gerät `BME` respektiert —
-/// ein **kompromittiertes** tut das nicht. Gegen das wirkt allein das Entfernen der Übersetzung
-/// (STE/Stage-1); gegen das gutartige mit In-flight-Writes wirkt allein dieser Schritt.
-/// Keiner ersetzt den anderen.
-///
-/// Verschachtelbar: nur der äußerste Aufruf legt tatsächlich still (s. o.).
-pub fn quiesce_by_rid(rid: u32) {
+/// **Die Verschachtelungs-Buchhaltung liegt NICHT hier**, sondern im Übersetzungskontext des
+/// Kernels (`DmaCtx.quiesce_depth`, parallel zur StreamID-Liste): dort ist sie durch denselben
+/// Lock geschützt wie die RID selbst und kann nicht überlaufen, weil die Kapazität dieselbe
+/// Quelle hat wie die Kontextobergrenze.
+pub fn clear_bus_master_and_flush(rid: u32) -> u16 {
     let (bus, dev, func) = rid_parts(rid);
-    let mut t = QUIESCED.lock();
-    if let Some(e) = t.iter_mut().find(|e| e.rid == rid) {
-        e.depth += 1;
-        return; // bereits stillgelegt -> nur zählen
-    }
-    let Some(e) = t.iter_mut().find(|e| e.rid == u32::MAX) else {
-        return; // Tabelle voll: lieber nicht stilllegen als eine Wiederherstellung zu verlieren
-    };
     let cmd = cfg_read16(bus, dev, func, CFG_COMMAND);
-    cfg_write16(bus, dev, func, CFG_COMMAND, cmd & !CMD_BUS_MASTER);
+    write_cmd(bus, dev, func, cmd & !CMD_BUS_MASTER);
     let _ = cfg_read16(bus, dev, func, CFG_VENDOR); // Flush-Read (s. o.)
-    *e = QuiesceEnt {
-        rid,
-        depth: 1,
-        saved_cmd: cmd,
-    };
+    cmd
 }
 
-/// Die Stilllegung aufheben. Beim Übergang 1→0 wird das Command-Register zurückgeschrieben:
-/// mit `restore_bme = true` unverändert, sonst mit gelöschtem Bus-Master (die übrigen Bits —
-/// etwa Memory-Space — bleiben erhalten).
-///
-/// **Kopplung an die ATS-Entscheidung** (s. `docs/invariants.md` §2b): Bus-Master wieder
-/// einzuschalten ist nur solide, *weil* nach `CMD_TLBI`+`CMD_SYNC` keine gecachte Übersetzung
-/// mehr existiert. Mit **ATS** existiert sie sehr wohl — im ATC des Geräts. Wird ATS je für ein
-/// Gerät freigeschaltet, muss vor dieser Wiederherstellung eine **ATC-Invalidierung** stehen,
-/// sonst ist sie unsolide.
-pub fn release_quiesce(rid: u32, restore_bme: bool) {
+/// Ein Command-Register unverändert zurückschreiben.
+pub fn write_command(rid: u32, cmd: u16) {
     let (bus, dev, func) = rid_parts(rid);
-    let mut t = QUIESCED.lock();
-    let Some(e) = t.iter_mut().find(|e| e.rid == rid) else {
-        return;
-    };
-    e.depth -= 1;
-    if e.depth > 0 {
-        return; // ein anderer Teardown hält das Gerät noch still
-    }
-    let cmd = if restore_bme {
-        e.saved_cmd
-    } else {
-        e.saved_cmd & !CMD_BUS_MASTER
-    };
-    cfg_write16(bus, dev, func, CFG_COMMAND, cmd);
-    e.rid = u32::MAX;
+    write_cmd(bus, dev, func, cmd);
 }
 
-/// Bus-Master für eine RID **aktivieren** — Gegenstück zur Stilllegung, nach dem Installieren
-/// einer Übersetzung. Ohne das wäre ein Gerät nach einem vollständigen Detach/Re-Attach-Zyklus
-/// dauerhaft tot (beim letzten Detach bleibt Bus-Master bewusst aus).
+/// Bus-Master aktivieren (nach dem Installieren einer Übersetzung).
 pub fn arm_bus_master(rid: u32) {
     let (bus, dev, func) = rid_parts(rid);
     let cmd = cfg_read16(bus, dev, func, CFG_COMMAND);
-    cfg_write16(bus, dev, func, CFG_COMMAND, cmd | CMD_BUS_MASTER);
+    write_cmd(bus, dev, func, cmd | CMD_BUS_MASTER);
 }

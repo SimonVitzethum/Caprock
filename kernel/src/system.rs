@@ -2225,7 +2225,7 @@ mod smmu_enforcer_arm {
             // es irgendwo hin, dann darf es überhaupt). Ohne das wäre ein Gerät nach einem
             // vollständigen Detach/Re-Attach-Zyklus tot — beim letzten Detach bleibt Bus-Master
             // bewusst aus, und niemand sonst setzt es wieder.
-            hal::pcie::arm_bus_master(binding.stream_id);
+            ctx_arm_bus_master(&mut t[slot], binding.stream_id);
             let prod = self.cmdq_prod.load(Ordering::Acquire);
             let (next, ok) = if is_new_ctx {
                 let ste = hal::smmu::build_ste_stage1(cd);
@@ -2264,13 +2264,13 @@ mod smmu_enforcer_arm {
             let strtab = self.strtab_phys.load(Ordering::Acquire);
             let cmdq = self.cmdq_phys.load(Ordering::Acquire);
             let mut t = DMA_CTX.lock();
-            hal::pcie::quiesce_by_rid(binding.stream_id);
             let Some(slot) = t
                 .iter()
                 .position(|c| c.used && c.sids.contains(&binding.stream_id))
             else {
                 return;
             };
+            ctx_quiesce(&mut t[slot], binding.stream_id);
             let l1 = t[slot].l1;
             // Region aus der Stage-1-Tabelle entfernen (danach kann das Gerät NICHT mehr dorthin
             // DMAen) + TLBI+SYNC. DMA-use-after-free-sicher (vor VSpace-Unmap + free_region).
@@ -2294,7 +2294,7 @@ mod smmu_enforcer_arm {
             // TLBI+SYNC ohnehin unerreichbar. Hat es keine Region mehr, bleibt Bus-Master **aus**
             // (fail-safe). Die Kopplung an die ATS-Entscheidung steht bei `release_quiesce`.
             let still_in_use = !t[slot].regs.iter().all(|&(_, l)| l == 0);
-            hal::pcie::release_quiesce(binding.stream_id, still_in_use);
+            ctx_release(&mut t[slot], binding.stream_id, still_in_use);
             // Letzte Region weg -> Kontext abbauen: alle STEs der Gruppe invalidieren, Stage-1 + CD frei.
             if t[slot].regs.iter().all(|&(_, l)| l == 0) {
                 let mut p = self.cmdq_prod.load(Ordering::Acquire);
@@ -2421,6 +2421,63 @@ impl DmaEnforcer for VtdEnforcer {
     }
 }
 
+/// Position einer StreamID in der SID-Liste eines Kontexts.
+fn sid_index(c: &DmaCtx, rid: u32) -> Option<usize> {
+    c.sids.iter().position(|&s| s == rid)
+}
+
+/// Gerät stilllegen (nur beim Übergang 0→1 tatsächlich; sonst nur zählen).
+fn ctx_quiesce(c: &mut DmaCtx, rid: u32) {
+    let Some(k) = sid_index(c, rid) else { return };
+    if c.quiesce_depth[k] == 0 {
+        c.saved_cmd[k] = hal::pcie::clear_bus_master_and_flush(rid);
+    }
+    c.quiesce_depth[k] += 1;
+}
+
+/// Stilllegung aufheben (nur beim Übergang 1→0 tatsächlich).
+///
+/// `allow_bme`: darf das Gerät danach wieder Bus-Master sein? Zurückgeschrieben wird stets der
+/// **gesicherte** Wert (ggf. ohne Bus-Master-Bit) — ein Gerät, das absichtlich aus war, darf ein
+/// Teardown nicht einschalten.
+///
+/// **Kopplung an die ATS-Entscheidung** (`docs/invariants.md` §2b): Wiedereinschalten ist nur
+/// solide, *weil* nach `CMD_TLBI`+`CMD_SYNC` keine gecachte Übersetzung mehr existiert. Mit
+/// **ATS** existiert sie im ATC des Geräts — dann müsste hier eine ATC-Invalidierung davorstehen.
+fn ctx_release(c: &mut DmaCtx, rid: u32, allow_bme: bool) {
+    let Some(k) = sid_index(c, rid) else { return };
+    if c.quiesce_depth[k] == 0 {
+        return;
+    }
+    c.quiesce_depth[k] -= 1;
+    if c.quiesce_depth[k] > 0 {
+        return; // ein anderer Teardown hält das Gerät noch still
+    }
+    let cmd = if allow_bme {
+        c.saved_cmd[k]
+    } else {
+        c.saved_cmd[k] & !hal::pcie::CMD_BUS_MASTER_BIT
+    };
+    hal::pcie::write_command(rid, cmd);
+}
+
+/// Bus-Master nach dem Installieren einer Übersetzung erteilen.
+///
+/// **Kein unbedingtes Schreiben.** Läuft parallel ein Teardown desselben Geräts (Zähler > 0),
+/// würde ein direktes Scharfschalten dessen Flush-Garantie entwerten: das Gerät dürfte neue
+/// Requests in eine Region absetzen, die der andere Pfad gerade entfernt und gleich freigibt —
+/// genau das Fenster, das die Stilllegung schließt, nur über `attach` hereingekommen. Stattdessen
+/// wird die **Absicht** im gesicherten Command-Wert vermerkt; das Restore beim Übergang 1→0
+/// nimmt sie mit.
+fn ctx_arm_bus_master(c: &mut DmaCtx, rid: u32) {
+    let Some(k) = sid_index(c, rid) else { return };
+    if c.quiesce_depth[k] > 0 {
+        c.saved_cmd[k] |= hal::pcie::CMD_BUS_MASTER_BIT;
+    } else {
+        hal::pcie::arm_bus_master(rid);
+    }
+}
+
 // --- SMMU-Übersetzungskontexte (ext-24): je Kontext eine STE-Gruppe -> ein CD -> eine
 // Stage-1-Tabelle, die MEHRERE Regionen abbildet. Ersetzt die 1:1-Bindungstabelle aus ext-23.
 const NDMA_CTX: usize = 4; //      gleichzeitige Kontexte
@@ -2433,6 +2490,16 @@ struct DmaCtx {
     l1: u64,                          // Stage-1-Wurzel
     cd: u64,                          // Context Descriptor
     sids: [u32; MAX_CTX_SIDS],        // StreamIDs (u32::MAX = leer)
+    /// Verschachtelungstiefe der Stilllegung **je StreamID** (parallel zu `sids`).
+    ///
+    /// Warum hier und nicht in einer Seitentabelle der HAL: die RID gehört zu genau einem
+    /// Kontext (`attach` sucht ihn über `sids.contains`), also ist der Zähler durch **denselben**
+    /// Lock geschützt wie die RID selbst — er kann nicht aus dem Tritt geraten, wenn das
+    /// Kontext-Locking später verfeinert wird, und er kann nicht überlaufen, weil seine
+    /// Kapazität dieselbe Quelle hat wie die Kontextobergrenze (`NDMA_CTX * MAX_CTX_SIDS`).
+    quiesce_depth: [u32; MAX_CTX_SIDS],
+    /// Command-Register **vor** der ersten Stilllegung (Save/Restore, nie „auf 1 setzen").
+    saved_cmd: [u16; MAX_CTX_SIDS],
     regs: [(u64, u64); MAX_CTX_REGS], // (base,len) je Region ((0,0) = leer)
 }
 
@@ -2442,6 +2509,8 @@ impl DmaCtx {
         l1: 0,
         cd: 0,
         sids: [u32::MAX; MAX_CTX_SIDS],
+        quiesce_depth: [0; MAX_CTX_SIDS],
+        saved_cmd: [0; MAX_CTX_SIDS],
         regs: [(0, 0); MAX_CTX_REGS],
     };
 }

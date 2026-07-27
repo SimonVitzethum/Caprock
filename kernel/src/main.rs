@@ -198,6 +198,10 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         }
     }
 
+    // Alle Kerne haben ihren `CTR_EL0.CWG` gemeldet -> die DMA-Granularität steht fest. Bis
+    // hierher galt die architektonische Obergrenze (s. `mmu::seal_cache_granule`).
+    hal::mmu::seal_cache_granule();
+
     hal::cpu::local_irq_enable();
     // Ab hier läuft core 0 als Idle-Thread; der Timer-Tick schedult preemptiv.
     threads::demo_report_then_idle();

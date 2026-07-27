@@ -749,16 +749,35 @@ fn local_cwg() -> u64 {
 /// anderen Cluster zu klein sein kann. Deshalb meldet jeder Kern seinen Wert beim Hochlauf, und
 /// [`dma_granule`] liefert das Maximum.
 ///
-/// **Verbleibende Annahme:** DMA-Caps, die geprägt werden, *bevor* alle Kerne oben sind, sehen
-/// nur die bis dahin gemeldeten Werte. Auf homogenen Zielen ist das identisch; auf einem
-/// heterogenen Ziel müsste die Prägung bis nach dem SMP-Hochlauf warten.
 pub fn record_cache_granule() {
     CWG_MAX.fetch_max(local_cwg(), core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Architektonische Obergrenze, wenn (noch) nicht alle Kerne gemeldet haben.
+const CWG_ARCH_MAX: u64 = 2048;
+/// Haben alle Kerne ihren Wert gemeldet?
+static CWG_SEALED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Die Granule-Ermittlung **abschließen** — nach dem SMP-Hochlauf zu rufen, wenn jeder Kern
+/// seinen `CTR_EL0.CWG` gemeldet hat.
+///
+/// Bis dahin liefert [`dma_granule`] die architektonische Obergrenze statt des bisher gesehenen
+/// Maximums. Damit ist die frühere Fußnote („Caps vor dem SMP-Hochlauf sehen nur die bis dahin
+/// gemeldeten Werte") **erzwungen statt dokumentiert**: eine früh geprägte Cap wird gegen die
+/// strengstmögliche Granularität geprüft und kann nie zu schwach geprüft worden sein. Auf
+/// homogenen Zielen ändert das nichts; auf einem heterogenen wird aus einer stillen
+/// Fehlprägung eine abgelehnte.
+pub fn seal_cache_granule() {
+    CWG_SEALED.store(true, core::sync::atomic::Ordering::Release);
+}
+
 pub fn dma_granule() -> u64 {
+    if !CWG_SEALED.load(core::sync::atomic::Ordering::Acquire) {
+        // Noch nicht alle Kerne gemeldet -> konservativ, nie zu klein.
+        return CWG_ARCH_MAX;
+    }
     match CWG_MAX.load(core::sync::atomic::Ordering::Relaxed) {
-        0 => local_cwg(), // noch kein Kern gemeldet (sehr früher Boot)
+        0 => CWG_ARCH_MAX,
         g => g,
     }
 }

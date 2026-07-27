@@ -377,6 +377,9 @@ pub fn dma_granule() -> u64 {
 /// hardware-kohärent — es gibt keine Wartungsgranularität und damit nichts zu ermitteln.
 pub fn record_cache_granule() {}
 
+/// Gegenstück zur ARM-Fassung — hier ohne Wirkung (Granule ist konstant 1).
+pub fn seal_cache_granule() {}
+
 /// Auf x86 sind DMA-Zugriffe **hardware-kohärent** zum CPU-Cache (Snooping) — anders als auf
 /// aarch64 ist hier keine Cache-Wartung nötig. Die Barriere stellt nur die Reihenfolge sicher.
 pub fn dma_cache_clean(_va: u64, _len: u64) {

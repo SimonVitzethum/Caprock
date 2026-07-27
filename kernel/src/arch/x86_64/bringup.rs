@@ -496,6 +496,8 @@ pub fn run(multiboot_info: u64) -> ! {
     }
     println!("smp     : {online} von {nc} Kern(en) online");
 
+    hal::mmu::seal_cache_granule(); // alle Kerne haben gemeldet (auf x86 wirkungslos)
+
     // Ab hier schedult der Timer-Interrupt präemptiv; dieser Kontext ist der Idle-Thread.
     hal::cpu::local_irq_enable();
     let mut spins: u64 = 0;

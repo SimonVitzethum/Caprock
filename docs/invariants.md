@@ -127,12 +127,19 @@ Gerät, das absichtlich aus war, darf ein Teardown nicht einschalten.
 
 Die Wiederherstellung bringt drei Bedingungen mit, die der naive Ablauf nicht hatte:
 
-1. **Serialisierung je RID.** Zwei nebenläufige Teardowns auf demselben Gerät dürfen sich nicht
-   gegenseitig entwaffnen: entwaffnet A, spült B, und stellt A dann wieder her, *bevor* B seine
-   Region entfernt hat, ist B's Flush-Garantie wertlos. Deshalb ein **Tiefenzähler je RID**
-   (`quiesce_by_rid`/`release_quiesce`): entwaffnen bei 0→1, wiederherstellen bei 1→0. Der Zähler
-   ist bewusst **unabhängig** von der Serialisierung des Aufrufers — heute läuft der Detach-Pfad
-   ohnehin unter `DMA_CTX`, die Eigenschaft soll aber nicht daran hängen, dass das so bleibt.
+1. **Serialisierung je RID — gegen Detach *und* Attach.** Zwei nebenläufige Teardowns auf
+   demselben Gerät dürfen sich nicht gegenseitig entwaffnen: entwaffnet A, spült B, und stellt A
+   dann wieder her, *bevor* B seine Region entfernt hat, ist B's Flush-Garantie wertlos. Dieselbe
+   Kante kommt über `attach` herein, wenn dort Bus-Master **unbedingt** gesetzt wird. Deshalb ein
+   **Tiefenzähler je StreamID** (`ctx_quiesce`/`ctx_release`/`ctx_arm_bus_master`): entwaffnen bei
+   0→1, wiederherstellen bei 1→0 — und `attach` schreibt bei Tiefe > 0 **nicht** direkt, sondern
+   vermerkt die Absicht im gesicherten Command-Wert, den das Restore mitnimmt.
+   Der Zähler liegt **im Übersetzungskontext**, parallel zur StreamID-Liste, nicht in einer
+   Seitentabelle: eine RID gehört zu genau einem Kontext, damit ist der Zähler durch denselben
+   Lock geschützt wie die RID selbst (er kann nicht aus dem Tritt geraten, wenn das
+   Kontext-Locking später verfeinert wird) und er kann **nicht überlaufen**, weil seine Kapazität
+   dieselbe Quelle hat wie die Kontextobergrenze (`NDMA_CTX × MAX_CTX_SIDS`). Ein „Tabelle voll"-
+   Zweig — und damit die Wahl zwischen Sicherheit und Verfügbarkeit — existiert nicht.
 2. **Kopplung an die ATS-Entscheidung** (§2b). „Ab Schritt 2 ist die Region unerreichbar" gilt,
    *weil* nach `CMD_TLBI`+`CMD_SYNC` keine gecachte Übersetzung mehr existiert. Mit **ATS**
    existiert sie sehr wohl — im ATC des Geräts. Wird ATS je freigeschaltet, muss vor der
@@ -166,8 +173,10 @@ Zwei Fallen, an denen der Wert still zu klein antworten kann, beide behandelt:
   architektonische Obergrenze (2048).
 * **`CTR_EL0` ist pro Kern.** Auf heterogenen Systemen können die Werte differieren; jeder Kern
   meldet seinen beim Hochlauf (`record_cache_granule` in `init_primary`/`init_secondary`),
-  `dma_granule` liefert das **Maximum**. Verbleibende Annahme: Caps, die vor dem SMP-Hochlauf
-  geprägt werden, sehen nur die bis dahin gemeldeten Werte — auf homogenen Zielen identisch.
+  `dma_granule` liefert das **Maximum**. Bis `seal_cache_granule()` nach dem SMP-Hochlauf gerufen
+  ist, liefert es stattdessen die **architektonische Obergrenze** — eine früh geprägte Cap wird
+  also gegen die strengstmögliche Granularität geprüft und kann nie zu schwach geprüft worden
+  sein. Damit ist die Annahme **erzwungen statt dokumentiert**.
 
 Zur Unterscheidung: **DminLine** ist die Schrittweite der Wartungsschleife (Minimum, damit keine
 Zeile ausgelassen wird), **CWG** die Ausrichtungs-/Padding-Granularität (Maximum, damit keine

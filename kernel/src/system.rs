@@ -2221,6 +2221,11 @@ mod smmu_enforcer_arm {
             };
             t[slot].regs[ri] = (binding.region.base, binding.region.len);
             // Neuer Kontext: STE installieren. Sonst: nur TLBI+SYNC (STE zeigt schon auf den CD).
+            // Bus-Master erst **nach** der Übersetzung scharf schalten (Reihenfolge: erst darf
+            // es irgendwo hin, dann darf es überhaupt). Ohne das wäre ein Gerät nach einem
+            // vollständigen Detach/Re-Attach-Zyklus tot — beim letzten Detach bleibt Bus-Master
+            // bewusst aus, und niemand sonst setzt es wieder.
+            hal::pcie::arm_bus_master(binding.stream_id);
             let prod = self.cmdq_prod.load(Ordering::Acquire);
             let (next, ok) = if is_new_ctx {
                 let ste = hal::smmu::build_ste_stage1(cd);
@@ -2250,10 +2255,16 @@ mod smmu_enforcer_arm {
             // In-flight-Writes ab; gegen ein *kompromittiertes*, das `BME` ignoriert, wirkt
             // allein das Entfernen von Stage-1/STE weiter unten. Keiner der beiden Schritte
             // macht den anderen entbehrlich.
-            let saved_cmd = hal::pcie::quiesce_by_rid(binding.stream_id);
+            //
+            // **Serialisierung:** Der Zähler in `quiesce_by_rid` macht Verschachtelung sicher
+            // (entwaffnen bei 0→1, wiederherstellen bei 1→0) — unabhängig davon, dass dieser Pfad
+            // heute ohnehin unter `DMA_CTX` serialisiert ist. Ohne den Zähler könnte ein
+            // nebenläufiger Teardown desselben Geräts das Bus-Master wieder scharf schalten,
+            // bevor der andere seine Region entfernt hat; dessen Flush-Garantie wäre dann wertlos.
             let strtab = self.strtab_phys.load(Ordering::Acquire);
             let cmdq = self.cmdq_phys.load(Ordering::Acquire);
             let mut t = DMA_CTX.lock();
+            hal::pcie::quiesce_by_rid(binding.stream_id);
             let Some(slot) = t
                 .iter()
                 .position(|c| c.used && c.sids.contains(&binding.stream_id))
@@ -2278,9 +2289,12 @@ mod smmu_enforcer_arm {
             // das Gerät legitim weiter in Betrieb und die eben entfernte Region ist bereits nicht
             // mehr erreichbar. Hat es keine Region mehr, bleibt BME aus (fail-safe: ein Gerät ohne
             // jede Zuteilung soll auch keine Requests absetzen dürfen).
-            if !t[slot].regs.iter().all(|&(_, l)| l == 0) {
-                hal::pcie::restore_command(binding.stream_id, saved_cmd);
-            }
+            // Bus-Master wiederherstellen, **solange der Kontext noch Regionen trägt** — dann ist
+            // das Gerät legitim weiter in Betrieb und die eben entfernte Region ist ab dem
+            // TLBI+SYNC ohnehin unerreichbar. Hat es keine Region mehr, bleibt Bus-Master **aus**
+            // (fail-safe). Die Kopplung an die ATS-Entscheidung steht bei `release_quiesce`.
+            let still_in_use = !t[slot].regs.iter().all(|&(_, l)| l == 0);
+            hal::pcie::release_quiesce(binding.stream_id, still_in_use);
             // Letzte Region weg -> Kontext abbauen: alle STEs der Gruppe invalidieren, Stage-1 + CD frei.
             if t[slot].regs.iter().all(|&(_, l)| l == 0) {
                 let mut p = self.cmdq_prod.load(Ordering::Acquire);

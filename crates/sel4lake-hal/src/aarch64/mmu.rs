@@ -286,12 +286,14 @@ fn enable() {
 
 /// Primärkern: Tabellen bauen + MMU aktivieren.
 pub fn init_primary() {
+    record_cache_granule();
     build_tables();
     enable();
 }
 
 /// Sekundärkern: dieselbe (bereits gebaute) Tabelle aktivieren.
 pub fn init_secondary() {
+    record_cache_granule();
     enable();
 }
 
@@ -720,13 +722,44 @@ pub fn vspace_map_dma(
 /// fremder Speicher in derselben angebrochenen Zeile, verliert er beim Invalidate seine noch
 /// nicht zurückgeschriebenen Daten. Meldet die HW `CWG = 0` (keine Angabe), gilt die
 /// architektonische Obergrenze von 2 KiB als sichere Annahme.
-pub fn dma_granule() -> u64 {
+/// Größtes bisher auf **irgendeinem** Kern gesehenes CWG (`0` = noch keiner gemeldet).
+static CWG_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// CWG des **aufrufenden** Kerns aus `CTR_EL0` (Bits [27:24], log2 der Wortzahl).
+fn local_cwg() -> u64 {
     let ctr: u64;
     // SAFETY: `CTR_EL0` ist read-only und ohne Seiteneffekte.
     unsafe { asm!("mrs {}, CTR_EL0", out(reg) ctr, options(nomem, nostack, preserves_flags)) };
     match (ctr >> 24) & 0xf {
-        0 => 2048,          // „nicht angegeben" -> architektonisches Maximum annehmen
-        cwg => 4u64 << cwg, // log2 der Anzahl 4-Byte-Worte
+        // `0` heißt **„nicht angegeben"**, nicht „4 Byte". Würde man hier `4 << 0` rechnen, käme
+        // 4 heraus und die Prüfung in `install_dma_cap` wäre praktisch vakuum — sie bestünde auf
+        // Hardware, die CWG nicht meldet, ohne etwas zu prüfen. Stattdessen die architektonische
+        // Obergrenze annehmen. (Linux fährt hier historisch 128, neuer bis 256; 2048 ist die
+        // konservativere Wahl und kostet hier nichts, weil DMA-Regionen ohnehin seitengranular
+        // vergeben werden.)
+        0 => 2048,
+        cwg => 4u64 << cwg,
+    }
+}
+
+/// Den CWG des aufrufenden Kerns in das globale Maximum einrechnen.
+///
+/// `CTR_EL0` ist **pro Kern**. Auf heterogenen Systemen (big.LITTLE) können sich die Werte
+/// unterscheiden — wer nur den gerade laufenden Kern liest, bekommt eine Antwort, die auf einem
+/// anderen Cluster zu klein sein kann. Deshalb meldet jeder Kern seinen Wert beim Hochlauf, und
+/// [`dma_granule`] liefert das Maximum.
+///
+/// **Verbleibende Annahme:** DMA-Caps, die geprägt werden, *bevor* alle Kerne oben sind, sehen
+/// nur die bis dahin gemeldeten Werte. Auf homogenen Zielen ist das identisch; auf einem
+/// heterogenen Ziel müsste die Prägung bis nach dem SMP-Hochlauf warten.
+pub fn record_cache_granule() {
+    CWG_MAX.fetch_max(local_cwg(), core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn dma_granule() -> u64 {
+    match CWG_MAX.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => local_cwg(), // noch kein Kern gemeldet (sehr früher Boot)
+        g => g,
     }
 }
 

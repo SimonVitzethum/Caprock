@@ -118,10 +118,30 @@ Pfad einheitlich ist. Ein Gerät, das `BME` nicht respektiert, wird davon nicht 
 ist Schritt 2 die Grenze. Ein vollständiges Quiesce (FLR bzw. der dokumentierte Weg des Geräts)
 wäre stärker; BME + Flush-Read ist der Teil, der **ohne** gerätespezifisches Wissen auskommt.
 
-**BME-Wiederherstellung:** Trägt der Übersetzungskontext nach dem Detach noch andere Regionen, ist
-das Gerät legitim weiter in Betrieb und `restore_command` stellt den vorherigen Zustand her (die
-eben entfernte Region ist ab Schritt 2 ohnehin unerreichbar). Ist es die letzte Region, bleibt
-Bus-Master **aus** — ein Gerät ohne jede Zuteilung soll auch keine Requests absetzen dürfen.
+**BME-Wiederherstellung** (`release_quiesce`): Trägt der Übersetzungskontext nach dem Detach noch
+andere Regionen, ist das Gerät legitim weiter in Betrieb und der vorherige Zustand wird
+zurückgeschrieben (die eben entfernte Region ist ab Schritt 2 ohnehin unerreichbar). Ist es die
+letzte Region, bleibt Bus-Master **aus** — ein Gerät ohne jede Zuteilung soll auch keine Requests
+absetzen dürfen. Zurückgeschrieben wird stets der **gesicherte** Wert, nie „auf 1 gesetzt": ein
+Gerät, das absichtlich aus war, darf ein Teardown nicht einschalten.
+
+Die Wiederherstellung bringt drei Bedingungen mit, die der naive Ablauf nicht hatte:
+
+1. **Serialisierung je RID.** Zwei nebenläufige Teardowns auf demselben Gerät dürfen sich nicht
+   gegenseitig entwaffnen: entwaffnet A, spült B, und stellt A dann wieder her, *bevor* B seine
+   Region entfernt hat, ist B's Flush-Garantie wertlos. Deshalb ein **Tiefenzähler je RID**
+   (`quiesce_by_rid`/`release_quiesce`): entwaffnen bei 0→1, wiederherstellen bei 1→0. Der Zähler
+   ist bewusst **unabhängig** von der Serialisierung des Aufrufers — heute läuft der Detach-Pfad
+   ohnehin unter `DMA_CTX`, die Eigenschaft soll aber nicht daran hängen, dass das so bleibt.
+2. **Kopplung an die ATS-Entscheidung** (§2b). „Ab Schritt 2 ist die Region unerreichbar" gilt,
+   *weil* nach `CMD_TLBI`+`CMD_SYNC` keine gecachte Übersetzung mehr existiert. Mit **ATS**
+   existiert sie sehr wohl — im ATC des Geräts. Wird ATS je freigeschaltet, muss vor der
+   Wiederherstellung eine **ATC-Invalidierung** stehen, sonst ist sie unsolide. Der Vermerk steht
+   auch an `release_quiesce` selbst, damit die Kopplung nicht still bricht.
+3. **Gegenstück in `attach`.** Weil beim letzten Detach Bus-Master bewusst aus bleibt, muss das
+   Installieren einer Übersetzung es wieder scharf schalten (`arm_bus_master`) — sonst wäre ein
+   Gerät nach einem vollständigen Detach/Re-Attach-Zyklus dauerhaft tot. Reihenfolge: erst die
+   Übersetzung, dann die Erlaubnis.
 
 **Audit:** `dma_audit()` Code `4` — *jede* in einem `DMA_CTX` gemappte Region muss einer **lebenden
 DmaCap** entsprechen. Eine Kontext-Region ohne zugehörige Cap bedeutet: RAM wurde freigegeben,
@@ -138,7 +158,21 @@ nicht nur über einen Token, den die Invalidierung zurückgibt. Die strukturelle
 
 **Invariante:** Anfang **und** Länge einer DMA-Region liegen auf dem **Cache-Writeback-Granule**
 der Architektur (`hal::mmu::dma_granule()`; `CTR_EL0.CWG` auf ARM, `1` auf x86 — dort ist DMA
-hardware-kohärent, es gibt keine Wartung und damit keine Bedingung). Erzwungen an der
+hardware-kohärent, es gibt keine Wartung und damit keine Bedingung).
+
+Zwei Fallen, an denen der Wert still zu klein antworten kann, beide behandelt:
+* **`CWG == 0` heißt „nicht angegeben", nicht „4 Byte".** Würde man `4 << 0` rechnen, käme 4 heraus
+  und die Prüfung wäre auf Hardware, die CWG nicht meldet, praktisch vakuum. Stattdessen gilt die
+  architektonische Obergrenze (2048).
+* **`CTR_EL0` ist pro Kern.** Auf heterogenen Systemen können die Werte differieren; jeder Kern
+  meldet seinen beim Hochlauf (`record_cache_granule` in `init_primary`/`init_secondary`),
+  `dma_granule` liefert das **Maximum**. Verbleibende Annahme: Caps, die vor dem SMP-Hochlauf
+  geprägt werden, sehen nur die bis dahin gemeldeten Werte — auf homogenen Zielen identisch.
+
+Zur Unterscheidung: **DminLine** ist die Schrittweite der Wartungsschleife (Minimum, damit keine
+Zeile ausgelassen wird), **CWG** die Ausrichtungs-/Padding-Granularität (Maximum, damit keine
+fremden Daten in derselben Writeback-Einheit liegen). Beide werden jetzt aus `CTR_EL0` gelesen;
+vorher stand an beiden Stellen eine hartkodierte 64. Erzwungen an der
 **Cap-Prägung** (`install_dma_cap`/`install_dma_cap_ex` → `CapError::Unaligned`), nicht als
 Treiberpflicht.
 

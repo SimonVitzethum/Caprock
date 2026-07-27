@@ -536,7 +536,12 @@ pub fn run(multiboot_info: u64) -> ! {
         // vermieden wird. Gefuehrt und ausgewiesen: auf einer Plattform ohne Zusage sind
         // Zyklenzahlen ein Anhaltspunkt, keine Abrechnungsgrundlage.
         if !inv {
-            println!("cycles  : HINWEIS invariant-TSC nicht zugesagt -> Zyklenwerte sind hier indikativ, nicht abrechnungsfaehig");
+            // Wichtig: das ist eine Aussage ueber DIESE Plattform, nicht ueber den Entwurf.
+            // Unter KVM mit `-cpu host,+invtsc` meldet dieselbe Pruefung `true`, und die
+            // Zielhardware (Zen/EPYC, seit Zen durchgehend) hat Invariant TSC ohnehin. Ohne
+            // diesen Zusatz verfestigt sich sonst die Lesart "wir koennen nicht abrechnen",
+            // obwohl die Einschraenkung am Emulator haengt.
+            println!("cycles  : HINWEIS invariant-TSC nicht zugesagt (TCG kann es nicht) -> Zyklenwerte hier indikativ; unter KVM/-cpu host,+invtsc und auf Zen/EPYC ist die Zusage vorhanden");
         }
         let ok = hz > 1_000_000 && d >= hz / 2000 && d <= hz / 250 && grain > 0;
         println!(

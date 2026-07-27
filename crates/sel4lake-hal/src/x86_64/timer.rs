@@ -110,14 +110,39 @@ static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 /// steht im Deep-Sleep still. Zeitdifferenzen wären dann keine Zeit, sondern eine Funktion des
 /// Taktverhaltens — und zwar eine, die im Messlauf plausibel aussieht.
 pub fn invariant_tsc() -> bool {
-    // SAFETY: `cpuid` ist nebenwirkungsfrei; das Blatt wird zuvor auf Verfügbarkeit geprüft.
+    cpu_features() & FEAT_INVTSC != 0
+}
+
+/// Einmal ermittelte CPU-Eigenschaften (`0` = noch nicht ermittelt).
+///
+/// **Warum gecacht und nicht bei jedem Aufruf:** `cpuid` ist unter einem Hypervisor ein
+/// unbedingter VM-Exit. Ein `cycles()`, das `cpuid` ruft, misst also die Exit-Latenz und nicht
+/// die Zeit — unter KVM waren das gemessene ~3500 Zyklen je Stempel statt der erwarteten ~30.
+/// Das ist dieselbe Fehlerform wie eine Prüfung, die ihr eigenes Messobjekt verändert: die Zahl
+/// entsteht, hängt aber nicht an dem, was sie messen soll.
+static FEATURES: AtomicU64 = AtomicU64::new(0);
+const FEAT_VALID: u64 = 1 << 0;
+const FEAT_RDTSCP: u64 = 1 << 1;
+const FEAT_INVTSC: u64 = 1 << 2;
+
+fn cpu_features() -> u64 {
+    let cur = FEATURES.load(Ordering::Relaxed);
+    if cur & FEAT_VALID != 0 {
+        return cur;
+    }
+    let mut f = FEAT_VALID;
+    // SAFETY: `cpuid` ist nebenwirkungsfrei; die Blätter werden auf Verfügbarkeit geprüft.
     unsafe {
         let max = core::arch::x86_64::__cpuid(0x8000_0000).eax;
-        if max < 0x8000_0007 {
-            return false;
+        if max >= 0x8000_0001 && core::arch::x86_64::__cpuid(0x8000_0001).edx & (1 << 27) != 0 {
+            f |= FEAT_RDTSCP;
         }
-        core::arch::x86_64::__cpuid(0x8000_0007).edx & (1 << 8) != 0
+        if max >= 0x8000_0007 && core::arch::x86_64::__cpuid(0x8000_0007).edx & (1 << 8) != 0 {
+            f |= FEAT_INVTSC;
+        }
     }
+    FEATURES.store(f, Ordering::Relaxed);
+    f
 }
 
 /// Ein **serialisierender** Zyklen-Zeitstempel.
@@ -145,11 +170,7 @@ pub fn cycles() -> u64 {
 }
 
 fn has_rdtscp() -> bool {
-    // SAFETY: siehe `invariant_tsc`.
-    unsafe {
-        let max = core::arch::x86_64::__cpuid(0x8000_0000).eax;
-        max >= 0x8000_0001 && core::arch::x86_64::__cpuid(0x8000_0001).edx & (1 << 27) != 0
-    }
+    cpu_features() & FEAT_RDTSCP != 0
 }
 
 /// Zyklen pro Sekunde (gegen den PIT kalibriert, wie der LAPIC-Timer).

@@ -339,14 +339,20 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       `cycles_per_sec()` / `invariant_tsc()` stehen auf beiden Architekturen, serialisierend und
       gegen den PIT kalibriert. Offen: die per-TCB-Abrechnung (`consumed_cycles`, gestempelt beim
       Ein-/Auswechseln) und darauf die Monitoring-Cap.
-      **Invarianz ist Telemetrie, keine Bestehensbedingung** — TCG sagt `invtsc` nicht zu
-      („TCG doesn't support requested feature"), die Emulation *kann* die Eigenschaft nicht
-      liefern. Sie zur Bedingung zu machen hieße, den Test dauerhaft rot zu lassen oder die
-      Prüfung wegzulassen; das Zweite wäre die stillschweigende Annahme, die hier gerade
-      vermieden wird. Auf einer Plattform ohne Zusage sind Zyklenwerte **indikativ, nicht
-      abrechnungsfähig** — das steht so im Log.
+      **Invarianz ist Telemetrie, keine Bestehensbedingung** — aber die Einschränkung hing am
+      Emulator, nicht am Entwurf: unter KVM mit `-cpu host,+invtsc` meldet dieselbe Prüfung
+      `true` (`+invtsc` muss **explizit** angefordert werden, QEMU lässt es auch bei `-cpu host`
+      weg, weil es die Live-Migration blockiert). Zen/EPYC hat Invariant TSC durchgehend. Der
+      TCG-Fallback bleibt und sagt im Log, dass die Werte dort indikativ sind — und dass die
+      Zusage anderswo vorhanden ist.
 - [ ] **RAM-Größe als Testparameter** (teilweise erledigt): `test-qemu-x86.sh` nimmt `-m` als
       zweiten Parameter (512M/8G geprüft). Für aarch64 steht dasselbe noch aus.
+- [ ] **Zählgrenzen + Lock-Sektion als Operationszahl** (nächster Schritt, s. Diskussion):
+      Iterationen je Thread-Tod in `purge_ipc_queues`, CDT-Walk-Länge, `revoke`-Teilbaumgröße,
+      Tabellenbelegung, Stackbytes je Thread — als **Anzahl**, damit maschinenunabhängig. Die
+      Amdahl-Rechnung zerfällt dann in „Operationen unter Lock je Thread-Lebenszyklus" (jetzt
+      verfügbar) mal „Kosten je Operation" (auf Blech kalibriert). Mit KVM ist die direkte
+      Sektionsmessung zusätzlich möglich (Auflösung 51 Zyklen), also beides.
 - [ ] **D1** Kani lokal nicht ausführbar (nur CI-Gate) — die ext-29-Änderung an `sel4lake-sync` ist
       dort **nicht** gegengeprüft worden.
 - [ ] **D2** Loom modelliert eine **Kopie** des Lock-Algorithmus; die IRQ-Maskierung ist prinzipiell

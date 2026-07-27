@@ -11,6 +11,24 @@ SECONDS_RUN="${1:-90}"
 # grossen. Der 32-Bit-Ausschluss in `dmawin` war nur der auffaelligste Fall: dort lag das Fenster
 # unter 4 GiB, und der Test waere gruen gewesen, ohne die Eigenschaft zu pruefen.
 RAM="${2:-512M}"
+
+# **KVM, wenn verfuegbar.** Unter TCG kostet ein serialisierter Zeitstempel ~14 000 Zyklen --
+# damit ist alles unter ~5 us Sektionslaenge nicht aufloesbar, und `invtsc` kann TCG gar nicht
+# zusagen ("TCG doesn't support requested feature: CPUID[80000007h].EDX.invtsc"). Beides kommt
+# mit `-enable-kvm -cpu host` zurueck: Invariant TSC wird durchgereicht, die Aufloesung faellt
+# auf die Groessenordnung eines echten `rdtscp`. Der emulierte `intel-iommu` bleibt unter KVM
+# nutzbar (`kernel-irqchip=split` ist ohnehin gesetzt), `caching-mode=on` ebenso.
+# Fallback auf TCG, damit der Lauf ohne /dev/kvm nicht scheitert -- dann aber mit den obigen
+# Einschraenkungen, und die Zeile `cycles :` sagt das auch.
+if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+    # `+invtsc` MUSS explizit angefordert werden: QEMU laesst es auch bei `-cpu host` weg, weil es
+    # die Live-Migration blockiert. Unter KVM wird es dann durchgereicht, unter TCG abgelehnt.
+    ACCEL=(-enable-kvm -cpu host,+invtsc)
+    echo "== Beschleunigung: KVM (-cpu host) =="
+else
+    ACCEL=(-cpu qemu64)
+    echo "== Beschleunigung: TCG (kein /dev/kvm) -- Zyklenwerte sind dann indikativ =="
+fi
 ELF="build/target/x86_64-unknown-none/release/sel4lake-kernel.mb32"
 
 echo "== build (x86_64-unknown-none) =="
@@ -20,7 +38,7 @@ echo "== build (x86_64-unknown-none) =="
 LOG="$(mktemp)"
 echo "== boot ($SECONDS_RUN s) =="
 timeout "$SECONDS_RUN" qemu-system-x86_64 \
-    -kernel "$ELF" -m "$RAM" -smp 4 \
+    -kernel "$ELF" -m "$RAM" -smp 4 "${ACCEL[@]}" \
     -machine q35,kernel-irqchip=split -device intel-iommu,caching-mode=on \
     -device virtio-rng-pci \
     -nographic -serial file:"$LOG" -no-reboot -no-shutdown \

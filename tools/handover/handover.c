@@ -57,9 +57,9 @@ extern const u8 sel4lake_t64_park[];
 extern const u8 sel4lake_park_start[], sel4lake_park_end[];
 
 static struct page *low_page;
-static struct page *park_page;
+static struct page *park_pages[8];	/* je uebernommenem Kern eine */
 static struct page *pt_pages[6];	/* PML4 + PDPT + 4 PDs */
-static bool armed;
+static int narmed;			/* wie viele Kerne uebernommen wurden */
 
 /*
  * Identitaetsabbildung der ersten 4 GiB mit 2-MiB-Seiten.
@@ -208,10 +208,6 @@ static int __init handover_init(void)
 	{
 		phys_addr_t pa = page_to_phys(low_page);
 		void *va = page_address(low_page);
-		u32 apicid = cpu_physical_id(cpus[0]);
-		u16 sig;
-
-		u16 sig2;
 		u64 cr3 = build_identity_tables();
 
 		if (!cr3) {
@@ -219,61 +215,87 @@ static int __init handover_init(void)
 			rc = -ENOMEM;
 			goto undo;
 		}
+		pr_info("sel4lake: Trampolin @ phys %pa, SIPI-Vektor 0x%02llx, CR3 0x%llx\n",
+			&pa, (u64)(pa >> 12), cr3);
+
 		/*
-		 * Park-Seite: gewoehnlicher Speicher, aber unterhalb 4 GiB, weil die
-		 * Identitaetsabbildung nicht weiter reicht. `GFP_DMA32` sagt genau das zu.
+		 * **Alle Zielkerne nacheinander, mit EINER niedrigen Seite.**
+		 *
+		 * Der erste Anlauf gab jedem Kern eine eigene und verbrauchte sie dauerhaft --
+		 * bei genau einer freien Seite unter 1 MiB war damit nach dem ersten Kern
+		 * Schluss. Da jeder Kern die Seite nur waehrend des Moduswechsels braucht und
+		 * danach in seine eigene Park-Seite springt, reicht eine, sequenziell benutzt.
+		 * Das ist zugleich die Form, die die Uebergabe von fuenf Kernen ueberhaupt
+		 * erst moeglich macht.
 		 */
-		park_page = alloc_page(GFP_KERNEL | GFP_DMA32 | __GFP_ZERO);
-		if (!park_page) {
-			pr_err("sel4lake: keine Park-Seite unter 4 GiB\n");
-			rc = -ENOMEM;
-			goto undo;
-		}
-		memcpy(page_address(park_page), sel4lake_park_start,
-		       sel4lake_park_end - sel4lake_park_start);
+		for (i = 0; i < ncpus; i++) {
+			u32 apicid = cpu_physical_id(cpus[i]);
+			u16 sig, sig2;
 
-		memset(va, 0, PAGE_SIZE);
-		memcpy((u8 *)va + OFF_T16, sel4lake_t16_start,
-		       sel4lake_t16_end - sel4lake_t16_start);
-		memcpy((u8 *)va + OFF_T64, sel4lake_t64_start,
-		       sel4lake_t64_end - sel4lake_t64_start);
-		build_gdt(va, pa);
-		*(u32 *)((u8 *)va + OFF_CR3) = (u32)cr3;
-		/* Die zwei Werte, die erst zur Laufzeit feststehen (s. `tramp.S`). */
-		*(u32 *)((u8 *)va + OFF_T16 + (sel4lake_t16_target - sel4lake_t16_start)) =
-			(u32)(pa + OFF_T64);
-		*(u64 *)((u8 *)va + OFF_T64 + (sel4lake_t64_sig - sel4lake_t64_start)) =
-			(u64)(pa + SIG2_OFF);
-		*(u64 *)((u8 *)va + OFF_T64 + (sel4lake_t64_park - sel4lake_t64_start)) =
-			(u64)page_to_phys(park_page);
-		wmb();
-		pr_info("sel4lake: Trampolin @ phys %pa, SIPI-Vektor 0x%02llx, CR3 0x%llx, Ziel-APIC-ID %u\n",
-			&pa, (u64)(pa >> 12), cr3, apicid);
+			park_pages[i] = alloc_page(GFP_KERNEL | GFP_DMA32 | __GFP_ZERO);
+			if (!park_pages[i]) {
+				pr_err("sel4lake: keine Park-Seite unter 4 GiB fuer CPU %d\n",
+				       cpus[i]);
+				break;
+			}
+			memcpy(page_address(park_pages[i]), sel4lake_park_start,
+			       sel4lake_park_end - sel4lake_park_start);
 
-		send_init_sipi(apicid, (u8)(pa >> 12));
-		mdelay(50);
-		sig = *(volatile u16 *)((u8 *)va + SIG_OFF);
-		sig2 = *(volatile u16 *)((u8 *)va + SIG2_OFF);
-		if (sig != SIG_VALUE) {
-			pr_err("sel4lake: STUFE 1a FEHLGESCHLAGEN — Real-Mode-Signatur 0x%04x (erwartet 0x%04x)\n",
-			       sig, SIG_VALUE);
-		} else if (sig2 != SIG2_VALUE) {
-			armed = true;	/* der Kern laeuft — nur der Uebergang misslang */
-			pr_err("sel4lake: STUFE 1b FEHLGESCHLAGEN — Real Mode erreicht, Long Mode nicht (0x%04x)\n",
-			       sig2);
-		} else {
-			pr_info("sel4lake: STUFE 1b BESTANDEN — der Kern laeuft im LONG MODE mit eigener GDT und eigenem CR3 (0x%04x/0x%04x)\n",
-				sig, sig2);
-			armed = true;
-			/*
-			 * Der Kern ist aus der niedrigen Seite heraus und parkt anderswo — sie
-			 * darf zurueck. Erst DAS macht die Uebergabe wiederholbar; unter 1 MiB
-			 * gibt es auf dieser Maschine praktisch eine einzige freie Seite.
-			 */
-			__free_pages(low_page, 0);
-			low_page = NULL;
-			pr_info("sel4lake: niedrige Seite freigegeben — naechste Uebergabe moeglich\n");
+			memset(va, 0, PAGE_SIZE);
+			memcpy((u8 *)va + OFF_T16, sel4lake_t16_start,
+			       sel4lake_t16_end - sel4lake_t16_start);
+			memcpy((u8 *)va + OFF_T64, sel4lake_t64_start,
+			       sel4lake_t64_end - sel4lake_t64_start);
+			build_gdt(va, pa);
+			*(u32 *)((u8 *)va + OFF_CR3) = (u32)cr3;
+			/* Die drei Werte, die erst zur Laufzeit feststehen (s. `tramp.S`). */
+			*(u32 *)((u8 *)va + OFF_T16 +
+				 (sel4lake_t16_target - sel4lake_t16_start)) =
+				(u32)(pa + OFF_T64);
+			*(u64 *)((u8 *)va + OFF_T64 +
+				 (sel4lake_t64_sig - sel4lake_t64_start)) =
+				(u64)(pa + SIG2_OFF);
+			*(u64 *)((u8 *)va + OFF_T64 +
+				 (sel4lake_t64_park - sel4lake_t64_start)) =
+				(u64)page_to_phys(park_pages[i]);
+			wmb();
+
+			send_init_sipi(apicid, (u8)(pa >> 12));
+			mdelay(50);
+			sig = *(volatile u16 *)((u8 *)va + SIG_OFF);
+			sig2 = *(volatile u16 *)((u8 *)va + SIG2_OFF);
+
+			if (sig != SIG_VALUE) {
+				pr_err("sel4lake: CPU %d (APIC %u): FEHLGESCHLAGEN — Real Mode nicht erreicht (0x%04x)\n",
+				       cpus[i], apicid, sig);
+				__free_page(park_pages[i]);
+				park_pages[i] = NULL;
+				break;
+			}
+			narmed = i + 1;	/* ab hier laeuft der Kern unseren Code */
+			if (sig2 != SIG2_VALUE) {
+				pr_err("sel4lake: CPU %d (APIC %u): Real Mode erreicht, LONG MODE nicht (0x%04x)\n",
+				       cpus[i], apicid, sig2);
+				break;
+			}
+			pr_info("sel4lake: CPU %d (APIC %u): LONG MODE, eigene GDT + eigenes CR3, parkt @ phys 0x%llx\n",
+				cpus[i], apicid, (u64)page_to_phys(park_pages[i]));
 		}
+
+		/*
+		 * Die niedrige Seite hat ihren Zweck erfuellt — alle uebernommenen Kerne sind
+		 * heraus und parken anderswo. Zurueckgeben, damit der naechste Modullauf sie
+		 * wiederfindet; sie ist die knappste Ressource dieses Aufbaus.
+		 */
+		__free_pages(low_page, 0);
+		low_page = NULL;
+
+		if (narmed == ncpus)
+			pr_info("sel4lake: STUFE 1b BESTANDEN — %d von %d Kernen im Long Mode; niedrige Seite zurueckgegeben\n",
+				narmed, ncpus);
+		else
+			pr_err("sel4lake: STUFE 1b UNVOLLSTAENDIG — %d von %d Kernen uebernommen\n",
+			       narmed, ncpus);
 	}
 	return 0;
 
@@ -296,11 +318,11 @@ static void __exit handover_exit(void)
 	 * mitverlieren zu lassen waere die stille Ueberdehnung einer Einschraenkung auf
 	 * Faelle, fuer die ihre Begruendung gar nicht gilt. Stufe 1a nimmt genau einen Kern.
 	 */
-	for (i = ncpus - 1; i >= (armed ? 1 : 0); i--) {
+	for (i = ncpus - 1; i >= narmed; i--) {
 		if (!add_cpu(cpus[i]))
 			pr_info("sel4lake: CPU %d wieder online\n", cpus[i]);
 	}
-	if (armed) {
+	if (narmed) {
 		/*
 		 * Park-Seite und Seitentabellen bleiben stehen: `CR3` des uebernommenen Kerns
 		 * zeigt auf die Tabellen, sein `RIP` in die Park-Seite. Sie freizugeben, weil
@@ -309,14 +331,15 @@ static void __exit handover_exit(void)
 		 * an" ist eine Aussage ueber das Verhalten, nicht ueber die Zuordnung.
 		 * Ein Leck bis zum Reboot ist der richtige Failure-Mode.
 		 */
-		pr_warn("sel4lake: CPU %d bleibt uebernommen; Park-Seite + Tabellen bleiben belegt, Reboot stellt alles wieder her\n",
-			cpus[0]);
+		pr_warn("sel4lake: %d Kern(e) bleiben uebernommen; Park-Seiten + Tabellen bleiben belegt, Reboot stellt alles wieder her\n",
+			narmed);
 		return;
 	}
 	if (low_page)
 		__free_pages(low_page, 0);
-	if (park_page)
-		__free_page(park_page);
+	for (i = 0; i < ARRAY_SIZE(park_pages); i++)
+		if (park_pages[i])
+			__free_page(park_pages[i]);
 	free_identity_tables();
 }
 

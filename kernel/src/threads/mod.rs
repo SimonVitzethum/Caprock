@@ -472,6 +472,7 @@ static DMAWIN_NARROW: AtomicBool = AtomicBool::new(false); //   32-Bit-Geraet ->
 static DMAWIN_EXHAUST: AtomicBool = AtomicBool::new(false); //  Fenster voll -> abgewiesen
 static DMAWIN_INTACT: AtomicBool = AtomicBool::new(false); //   Kontext danach unveraendert nutzbar
 static DMAWIN_BALANCED: AtomicBool = AtomicBool::new(false);
+static DMAWIN_UNDECL: AtomicU32 = AtomicU32::new(0); //        Geraete ohne deklarierte Adressbreite
 static DMAGEN_OK: AtomicBool = AtomicBool::new(false);
 
 // Prozess-Heap (ext-25): ein Trusted-SAS-Thread (safe Rust) nutzt einen prozess-lokalen
@@ -1033,6 +1034,7 @@ fn run_dmawin() -> bool {
     DMAWIN_EXHAUST.store(exhausted, Ordering::Relaxed);
     DMAWIN_INTACT.store(intact, Ordering::Relaxed);
     DMAWIN_BALANCED.store(balanced, Ordering::Relaxed);
+    DMAWIN_UNDECL.store(system::testsupport::dma_undeclared_devices(), Ordering::Relaxed);
     narrow && exhausted && intact && balanced && system::domain_audit() == 0
 }
 
@@ -5300,9 +5302,10 @@ fn report() {
 
     // IOVA-Fenstergrenzen (ext-36b Nacharbeit).
     let dmawin = DMAWIN_DONE.load(Ordering::Acquire) && DMAWIN_OK.load(Ordering::Acquire);
-    println!("dmawin  : 32-Bit-Geraet-abgewiesen={} Fenster-voll-abgewiesen={} Kontext-danach-intakt={} balanciert={}",
+    println!("dmawin  : 32-Bit-Geraet-abgewiesen={} Fenster-voll-abgewiesen={} Kontext-danach-intakt={} balanciert={} Geraete-ohne-deklarierte-Adressbreite={} (gefuehrt, nicht stillschweigend 64)",
         DMAWIN_NARROW.load(Ordering::Acquire), DMAWIN_EXHAUST.load(Ordering::Acquire),
-        DMAWIN_INTACT.load(Ordering::Acquire), DMAWIN_BALANCED.load(Ordering::Acquire));
+        DMAWIN_INTACT.load(Ordering::Acquire), DMAWIN_BALANCED.load(Ordering::Acquire),
+        DMAWIN_UNDECL.load(Ordering::Acquire));
     println!(
         "dmawin  : {} (IOVA-Fenstergrenzen: Geraete-Adressbreite + Fenster-Erschoepfung scheitern laut statt still abzuschneiden; kein halb aufgebauter Kontext)",
         if dmawin { "ALL PASS" } else { "FAILURES" }

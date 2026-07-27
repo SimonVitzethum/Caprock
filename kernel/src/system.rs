@@ -2669,6 +2669,24 @@ pub fn dma_declare_device_addr_bits(stream_id: u32, bits: u32) -> bool {
     false
 }
 
+/// StreamIDs, für die **keine** Adressbreite deklariert wurde (geführt, nicht bloß angenommen).
+static UNDECLARED_DEVS: [AtomicU64; MAX_NARROW_DEVS] =
+    [const { AtomicU64::new(u64::MAX) }; MAX_NARROW_DEVS];
+static UNDECLARED_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Adressbreite eines Geräts. Undeklariert heißt **nicht** stillschweigend „64", sondern
+/// „unbekannt, angenommen 64, und das wird geführt".
+///
+/// Der Unterschied ist der Punkt: eine falsche 64-Bit-Annahme scheitert nicht laut, sondern der
+/// Bus schneidet die Adresse ab — und die abgeschnittene Adresse trifft weder ein Schutzband noch
+/// eine Prüfung. In einem Kernel, der Bus-Master fail-safe hält und `Unaligned` eine eigene
+/// Fehlervariante gibt, darf das nicht die einzige unsichtbare Annahme sein. Jedes undeklarierte
+/// Gerät wird deshalb einmal protokolliert und gezählt; `dma_undeclared_devices()` macht den
+/// Zustand prüfbar, statt ihn dem Zufall zu überlassen.
+///
+/// Ein harter Fehlschlag wäre die noch strengere Wahl, ist aber heute nicht zumutbar: die
+/// Adressbreite steht in keinem Konfigurationsregister, sie ist Treiberwissen. Die Mittelstellung
+/// ist ehrlich — sie behauptet nicht, etwas zu wissen.
 fn device_addr_bits(stream_id: u32) -> u32 {
     for e in NARROW_DEVS.iter() {
         let cur = e.load(Ordering::Acquire);
@@ -2676,7 +2694,28 @@ fn device_addr_bits(stream_id: u32) -> u32 {
             return cur as u32;
         }
     }
+    note_undeclared_device(stream_id);
     64
+}
+
+fn note_undeclared_device(stream_id: u32) {
+    for e in UNDECLARED_DEVS.iter() {
+        let cur = e.load(Ordering::Acquire);
+        if cur == stream_id as u64 {
+            return; // schon geführt
+        }
+        if cur == u64::MAX {
+            e.store(stream_id as u64, Ordering::Release);
+            UNDECLARED_COUNT.fetch_add(1, Ordering::Relaxed);
+            crate::println!(
+                "dma: StreamID 0x{:x} ohne deklarierte Adressbreite -- angenommen 64 Bit \
+                 (dma_declare_device_addr_bits)",
+                stream_id
+            );
+            return;
+        }
+    }
+    UNDECLARED_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Zähler der laut abgewiesenen Zuteilungen, je Ursache (Telemetrie/Test).
@@ -3515,6 +3554,11 @@ pub(crate) mod testsupport {
             }
             None => false,
         }
+    }
+
+    /// Wie viele Geräte DMA betreiben, ohne dass ihre Adressbreite deklariert wurde.
+    pub fn dma_undeclared_devices() -> u32 {
+        UNDECLARED_COUNT.load(Ordering::Relaxed)
     }
 
     /// Zähler der laut abgewiesenen IOVA-Zuteilungen: (Fenster voll, Eingangsbreite, Gerät).

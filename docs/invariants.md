@@ -252,7 +252,23 @@ eigener Fehlerursache, alle drei laut statt still: Fensterende (`WindowExhausted
 der Stage-1 (`InputWidth`), **Adressbreite des Geräts** (`DeviceAddrWidth`). Die letzte ist die
 gefährlichste: ein Gerät mit 32-Bit-DMA bekäme aus einem Fenster oberhalb des RAM eine Adresse, die
 der Bus abschneidet — und die abgeschnittene Adresse trifft etwas anderes. Voreinstellung sind 64
-Bit; `dma_declare_device_addr_bits` schreibt eine schmalere zu.
+Bit — aber **undeklariert heißt nicht stillschweigend 64**: jede StreamID ohne Deklaration wird
+einmal protokolliert und gezählt (`dma_undeclared_devices`). Ein harter Fehlschlag wäre strenger,
+ist aber nicht zumutbar, weil die Adressbreite in keinem Konfigurationsregister steht — sie ist
+Treiberwissen. Die geführte Annahme ist die ehrliche Mittelstellung: sie behauptet nicht, etwas zu
+wissen. `dma_declare_device_addr_bits` schreibt eine schmalere Breite zu.
+
+**Nicht-Wiederverwendung ist Politik, kein Defizit.** Eine IOVA kommt nie zurück — weder innerhalb
+eines Kontexts noch über dessen Abbau hinweg (der Bump hängt am Slot und überlebt ihn). Das ist
+keine Übergangslösung bis zu einem Recycling-Mechanismus, sondern die gewollte Eigenschaft: eine
+Adresse, die nie wiederkehrt, kann keine veraltete Übersetzung tragen, und die gesamte Klasse
+„Deskriptor mit alter IOVA trifft neue Region desselben Kontexts" existiert nicht. Die
+Schutzbänder deckten sie ohnehin nicht ab, weil eine wiederverwendete IOVA *legitim* gemappt wäre.
+Der Preis ist eine Lebenszeit-Obergrenze je Slot; sie liegt nach der Slot-Umstellung im vier- bis
+fünfstelligen Bereich an Attach-Vorgängen und ist ein geprüfter, sauberer Fehlschlag mit intaktem
+Kontext (`dmawin`), kein Betriebszustand. Wird die Grenze eines Tages doch erreicht, ist der
+richtige Ausweg **Slot-Recycling beim Kontextabbau**, nicht IOVA-Recycling innerhalb eines
+Kontexts — dort ist der Teardown ohnehin vollständig.
 
 **Was Newtypes nicht finden:** Sie markieren Kanten. Eine Funktion, die vollständig in `u64` lebt,
 ist keine Kante, sondern ein Loch — der `dmagen`-Test las die Stage-1-Blätter mit `r1.base` (PA)

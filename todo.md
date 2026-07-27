@@ -199,9 +199,15 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
         nirgends notierte Grenze waren ~500 Kontext-*Erzeugungen*, nicht die ~256 Attaches je
         Kontext), Bump je Slot überlebt den Kontextabbau, drei getrennte Fehlerursachen
         (Fensterende / Eingangsbreite / **Geräte-Adressbreite**), alle geprüft.
-      Offen: eine Obergrenze bleibt bestehen, solange IOVAs nie wiederverwendet werden. Die
-      Wiederverwendung setzt den Teardown-Token voraus (nächster Punkt) — vorher gibt es keinen
-      erzwungenen Beleg, dass ATC/TLB die alte Zuordnung nicht mehr führen.
+      **Nicht-Wiederverwendung ist als dauerhafte Politik entschieden**, nicht als offener Punkt:
+      eine IOVA, die nie zurückkommt, kann keine veraltete Übersetzung tragen. Die verbleibende
+      Lebenszeit-Obergrenze je Slot ist ein geprüfter sauberer Fehlschlag, kein Betriebszustand.
+      Falls sie je erreicht wird: Slot-Recycling beim Kontextabbau, nicht IOVA-Recycling im
+      Kontext. Damit muss der Teardown-Token nur den **PA-Free** absichern — der Unmap bleibt
+      zwingend (stehende Übersetzung auf freigegebene PA = der UAF), aber es gibt nichts
+      zurückzugeben. Ein Zustand weniger.
+      Ebenfalls erledigt: undeklarierte Geräte-Adressbreiten werden geführt und protokolliert
+      statt stillschweigend als 64 Bit angenommen.
 
 - [ ] **x86-Fensterwahl** (vor der VT-d-Zuteilung, s. C): `0xFEE0_0000–0xFEEF_FFFF` ist als
       IOVA **unbenutzbar**. VT-d behandelt DMA-Requests dorthin als Interrupt-Nachrichten und

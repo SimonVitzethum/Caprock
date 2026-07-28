@@ -13,10 +13,10 @@ use crate::loader;
 use crate::system;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use sel4lake_abi::{pdctl, result, sys, GRANT_FLAG, GRANT_RECV_SLOT};
-use sel4lake_hal::{self as hal, println, syscall::invoke};
-use sel4lake_mem::{peek_u64, poke_u64, Rights};
 use sel4lake_cap::{DmaCoherence, DmaDir};
+use sel4lake_hal::{self as hal, println, syscall::invoke};
 use sel4lake_loader::LoaderError;
+use sel4lake_mem::{peek_u64, poke_u64, Rights};
 use sel4lake_microkit::Domain;
 use sel4lake_sched::ThreadId;
 use sel4lake_sync::SpinLock;
@@ -473,8 +473,8 @@ static DMAWIN_EXHAUST: AtomicBool = AtomicBool::new(false); //  Fenster voll -> 
 static DMAWIN_INTACT: AtomicBool = AtomicBool::new(false); //   Kontext danach unveraendert nutzbar
 static DMAWIN_BALANCED: AtomicBool = AtomicBool::new(false);
 static DMAWIN_UNDECL: AtomicU32 = AtomicU32::new(0); //        Geraete ohne deklarierte Adressbreite
-// Teardown-Token (ext-37): `cap_delete` allein baut die Uebersetzung ab und gibt erst danach
-// frei; ohne bestaetigte Stilllegung wird NIE freigegeben (Pending, beschraenkt, auditiert).
+                                                     // Teardown-Token (ext-37): `cap_delete` allein baut die Uebersetzung ab und gibt erst danach
+                                                     // frei; ohne bestaetigte Stilllegung wird NIE freigegeben (Pending, beschraenkt, auditiert).
 static DMATOK_DONE: AtomicBool = AtomicBool::new(false);
 static DMATOK_OK: AtomicBool = AtomicBool::new(false);
 static DMATOK_DELETE_TEARS: AtomicBool = AtomicBool::new(false); // delete ohne detach baut ab
@@ -538,7 +538,6 @@ static LOADTRUSTED_EL0: AtomicBool = AtomicBool::new(false); // TrustedSAS als E
 // Lebenszyklus -- Voraussetzung fuer das Churnen geladener Prozesse (ext-27).
 static LOADSTOP_DONE: AtomicBool = AtomicBool::new(false);
 static LOADSTOP_OK: AtomicBool = AtomicBool::new(false);
-
 
 // ext-27: adversariale EXTERNE Testdienste (geladen wie Drittsoftware, NICHT im Kernel-Image; ADR
 // 0012). Jeder Dienst greift den Kernel ueber die Syscall-ABI an und signalisiert sein SUCCESS-Badge
@@ -624,9 +623,6 @@ const CROSS_H: u64 = 0x4352_5348; // "CRSH"
 /// Canary-Muster (kernel-geschuetzter Speicher; KEIN geladener Dienst darf es erreichen).
 const CROSS_CANARY_VAL: u64 = 0xC0FF_EE5E_A1ED_0001;
 
-
-
-
 /// **Binary-Loader starten** (ext-26, L1): das extern gebaute `hello`-Programm aus dem Boot-Archiv
 /// in eine frische isolierte UserLand-PD laden + starten. Endowt eine Notification-Cap (Slot 0,
 /// Badge `HELLO_BADGE`) — hello signalisiert sie beim Start. Gibt die Notification-ID zurück (zum
@@ -666,7 +662,11 @@ fn run_sysload_start() -> usize {
         if !system::install_pd_cap(pd, 0, lcap) || !system::install_pd_cap(pd, 1, ncap) {
             return None; // Loader-/Notification-Cap muss in TrustedSAS installierbar sein
         }
-        let tid = system::spawn(sysload_caller as *const () as usize, hello_idx, system::IDLE_PRIO)?;
+        let tid = system::spawn(
+            sysload_caller as *const () as usize,
+            hello_idx,
+            system::IDLE_PRIO,
+        )?;
         system::bind_pd(pd, tid);
         Some(ntfn)
     })();
@@ -744,7 +744,6 @@ fn run_loadstop() -> bool {
     hal::cpu::local_irq_enable();
     loaded && f1 == f0 && v1 == v0 && k1 == k0
 }
-
 
 /// **EL0-TrustedSAS-Laden pruefen** (ext-26 L3 + ext-28): ein als TrustedSAS (Domaene 0) deklariertes
 /// Image wird — **nur mit gueltigem Zertifikat** (ADR 0014) — als **EL0-ISOLIERTE** PD geladen (nicht
@@ -920,9 +919,27 @@ fn run_dmagen() -> bool {
         return false;
     };
     let (Ok(cap1), Ok(cap2), Ok(cap3)) = (
-        system::install_dma_cap_ex(r1.base, r1.len, DmaDir::DeviceRead, DmaCoherence::NonCoherent, Rights::RW),
-        system::install_dma_cap_ex(r2.base, r2.len, DmaDir::DeviceWrite, DmaCoherence::Coherent, Rights::RW),
-        system::install_dma_cap_ex(r3.base, r3.len, DmaDir::Bidirectional, DmaCoherence::NonCoherent, Rights::RW),
+        system::install_dma_cap_ex(
+            r1.base,
+            r1.len,
+            DmaDir::DeviceRead,
+            DmaCoherence::NonCoherent,
+            Rights::RW,
+        ),
+        system::install_dma_cap_ex(
+            r2.base,
+            r2.len,
+            DmaDir::DeviceWrite,
+            DmaCoherence::Coherent,
+            Rights::RW,
+        ),
+        system::install_dma_cap_ex(
+            r3.base,
+            r3.len,
+            DmaDir::Bidirectional,
+            DmaCoherence::NonCoherent,
+            Rights::RW,
+        ),
     ) else {
         hal::cpu::local_irq_enable();
         return false;
@@ -949,19 +966,40 @@ fn run_dmagen() -> bool {
     let dir = hal::smmu::leaf_is_ro(leaf1) && !hal::smmu::leaf_is_ro(leaf2);
     let coh = hal::smmu::leaf_is_cacheable(leaf2) && !hal::smmu::leaf_is_cacheable(leaf1);
     // Stream-Gruppe: sid2 teilt den Kontext (2 StreamIDs -> 1 CD/Stage-1).
-    let group = system::dma_group_add(sid, sid2) && system::testsupport::dma_ctx_sid_count(sid) == 2;
+    let group =
+        system::dma_group_add(sid, sid2) && system::testsupport::dma_ctx_sid_count(sid) == 2;
     // Scatter-Gather-Validierung: valide Liste ok, Out-of-Window abgewiesen.
     let sg_good = [
-        system::DmaSgEntry { handle: h1, offset: 0, len: 0x800 },
-        system::DmaSgEntry { handle: h2, offset: 0x100, len: 0x100 },
+        system::DmaSgEntry {
+            handle: h1,
+            offset: 0,
+            len: 0x800,
+        },
+        system::DmaSgEntry {
+            handle: h2,
+            offset: 0x100,
+            len: 0x100,
+        },
     ];
-    let sg_bad = [system::DmaSgEntry { handle: h1, offset: 0x800, len: 0x1000 }];
+    let sg_bad = [system::DmaSgEntry {
+        handle: h1,
+        offset: 0x800,
+        len: 0x1000,
+    }];
     let sg = system::dma_sg_validate(sid, &sg_good) && !system::dma_sg_validate(sid, &sg_bad);
     // Disjunkte DMA-Sub-Puffer (Konsolidierung K2: ohne DmaPool): zwei Teilbereiche der
     // angehängten Region h3 per Offset; Disjunktheit + Bounds trägt der kanonische SG-/
     // Containment-Pfad. Erschöpfung = ein Sub-Puffer größer als die Region wird abgewiesen.
-    let sub_a = system::DmaSgEntry { handle: h3, offset: 0x0, len: 0x100 };
-    let sub_b = system::DmaSgEntry { handle: h3, offset: 0x100, len: 0x100 };
+    let sub_a = system::DmaSgEntry {
+        handle: h3,
+        offset: 0x0,
+        len: 0x100,
+    };
+    let sub_b = system::DmaSgEntry {
+        handle: h3,
+        offset: 0x100,
+        len: 0x100,
+    };
     let pool_ok = sub_a.offset + sub_a.len <= sub_b.offset // disjunkt
         && system::dma_sg_validate(sid, &[sub_a, sub_b]) // beide in-window
         && !system::dma_sg_validate(
@@ -986,7 +1024,14 @@ fn run_dmagen() -> bool {
     DMAGEN_SG.store(sg, Ordering::Relaxed);
     DMAGEN_POOL.store(pool_ok, Ordering::Relaxed);
     DMAGEN_BALANCED.store(balanced, Ordering::Relaxed);
-    multiregion && dir && coh && group && sg && pool_ok && audit && balanced
+    multiregion
+        && dir
+        && coh
+        && group
+        && sg
+        && pool_ok
+        && audit
+        && balanced
         && system::domain_audit() == 0
 }
 
@@ -1032,9 +1077,7 @@ fn run_sasheap() -> bool {
         for i in 0..4096u64 {
             v.push(i.wrapping_mul(2654435761));
         }
-        let vec_ok = v.len() == 4096
-            && v[0] == 0
-            && v[4095] == 4095u64.wrapping_mul(2654435761);
+        let vec_ok = v.len() == 4096 && v[0] == 0 && v[4095] == 4095u64.wrapping_mul(2654435761);
         // 2. Box (mittelgross, eine Slab-Klasse).
         let b = Box::new_in([0xA5u8; 300], &heap);
         let box_ok = b[0] == 0xA5 && b[299] == 0xA5;
@@ -1068,7 +1111,12 @@ fn run_sasheap() -> bool {
     SASHEAP_LARGE.store(large_ok, Ordering::Relaxed);
     SASHEAP_GREW.store(grew, Ordering::Relaxed);
     SASHEAP_BALANCED.store(balanced, Ordering::Relaxed);
-    vec_ok && box_ok && map_ok && large_ok && grew && balanced
+    vec_ok
+        && box_ok
+        && map_ok
+        && large_ok
+        && grew
+        && balanced
         && system::domain_audit() == 0
         && system::vspace_audit() == 0
 }
@@ -1088,7 +1136,6 @@ static STRAND_SETTLE: AtomicU32 = AtomicU32::new(0);
 static STRAND_STOP: AtomicBool = AtomicBool::new(false);
 static STRAND_DONE: AtomicBool = AtomicBool::new(false);
 static STRAND_OK: AtomicBool = AtomicBool::new(false);
-
 
 const RECLAIM_TARGET: u64 = 16;
 const RECLAIM_PRIO: u8 = 6; // höchste Demo-Prio: Exiter läuft sofort + beendet sich
@@ -1206,7 +1253,6 @@ extern "C" fn scale_driver(_arg: usize) -> ! {
     }
 }
 
-
 // --- Thread-Migration (ext-30) ------------------------------------------------------------
 //
 // Beweist, dass ein Thread den Kern wechseln kann, OHNE seine Identität zu verlieren:
@@ -1259,7 +1305,12 @@ extern "C" fn migrant_worker(_arg: usize) -> ! {
 extern "C" fn migrate_driver(_arg: usize) -> ! {
     let ok = (|| {
         // 1) Migranten auf core 0 erzeugen + eine Tcb-Cap darauf prägen.
-        let tid = system::spawn_on_core(0, migrant_worker as *const () as usize, 0, system::IDLE_PRIO)?;
+        let tid = system::spawn_on_core(
+            0,
+            migrant_worker as *const () as usize,
+            0,
+            system::IDLE_PRIO,
+        )?;
         let cap = system::install_tcb_cap(tid, Rights::RW).ok()?;
         // 2) Warten, bis er auf core 0 gelaufen ist.
         let mut spins = 0u64;
@@ -1309,7 +1360,12 @@ extern "C" fn migrate_driver(_arg: usize) -> ! {
         //    zufälligen Umgebungslast der übrigen Demos.
         let mut helpers = [0u64; 8];
         for h in helpers.iter_mut() {
-            match system::spawn_on_core(0, migrant_worker as *const () as usize, 0, system::IDLE_PRIO) {
+            match system::spawn_on_core(
+                0,
+                migrant_worker as *const () as usize,
+                0,
+                system::IDLE_PRIO,
+            ) {
                 Some(t) => *h = t.to_raw(),
                 None => *h = u64::MAX,
             }
@@ -1322,7 +1378,10 @@ extern "C" fn migrate_driver(_arg: usize) -> ! {
                 break;
             }
         }
-        MIG_AUTO_OK.store(auto_ok && system::migration_count() > before, Ordering::Release);
+        MIG_AUTO_OK.store(
+            auto_ok && system::migration_count() > before,
+            Ordering::Release,
+        );
         // Ab hier soll niemand mehr rechnen: Migrant + Helfer parken sich selbst, sobald sie
         // das Signal sehen. Danach ist keiner von ihnen mehr der laufende Thread seines Kerns
         // und der KILL greift beim ersten Versuch.
@@ -1469,7 +1528,8 @@ pub fn spawn_demo() {
     // Lazy-FP: ein EL1-Kollektor + zwei EL0-FP-User-Threads (höchste Demo-Prio ->
     // striktes Ping-Pong über YIELD, das jede Iteration einen Owner-Wechsel erzwingt).
     let fp_ntfn = system::create_notification().expect("fp ntfn");
-    let fp_nroot = system::install_notification_cap(fp_ntfn as u32, Rights::RWX).expect("fp ntfn cap");
+    let fp_nroot =
+        system::install_notification_cap(fp_ntfn as u32, Rights::RWX).expect("fp ntfn cap");
     let fp_wait = system::cap_mint(fp_nroot, Rights::READ, 0).expect("fp wait cap");
     let fp_coll_pd = system::create_pd().expect("fp collector pd");
     system::install_pd_cap(fp_coll_pd, 0, fp_wait);
@@ -1480,8 +1540,8 @@ pub fn spawn_demo() {
         let sig = system::cap_mint(fp_nroot, Rights::WRITE, 1 << id).expect("fp signal cap");
         let pd = system::create_pd().expect("fp pd");
         system::install_pd_cap(pd, 0, sig);
-        let t = system::spawn_user(fp_entry, FP_PATTERN[id] as usize, FP_PRIO)
-            .expect("fp user thread");
+        let t =
+            system::spawn_user(fp_entry, FP_PATTERN[id] as usize, FP_PRIO).expect("fp user thread");
         system::bind_pd(pd, t);
     }
     // Prioritätstest: höhere Priorität (4) zuerst, dann 3, dann 2.
@@ -1614,14 +1674,18 @@ pub fn spawn_demo() {
     system::bind_pd(xsrv_pd, xsrv);
     let xcli_pd = system::create_pd().expect("xipc client pd");
     system::install_pd_cap(xcli_pd, 0, xsend);
-    let xcli = system::spawn_on_core(0, xipc_client as *const () as usize, 0, prio).expect("xipc client");
+    let xcli =
+        system::spawn_on_core(0, xipc_client as *const () as usize, 0, prio).expect("xipc client");
     system::bind_pd(xcli_pd, xcli);
 
     // --- Weg C (Hybrid): isolierte PD vs. SAS-PD lesen dieselbe fremde Adresse X ---
     // X ist eine fremde RAM-Adresse (eigene kleine Region) mit einem Geheimwert. Die
     // MemoryCap wird verworfen -> die Region bleibt belegt (der Allokator reklamiert
     // nur per free), niemand sonst bekommt sie. Die Proben lesen X roh (kein Cap nötig).
-    let xaddr = system::alloc(4096, 4096).expect("secret region").region().base;
+    let xaddr = system::alloc(4096, 4096)
+        .expect("secret region")
+        .region()
+        .base;
     poke_u64(xaddr, ISO_SECRET); // Kernel (EL1) schreibt das Geheimnis
     ISO_SECRET_ADDR.store(xaddr, Ordering::Relaxed);
 
@@ -1648,7 +1712,9 @@ pub fn spawn_demo() {
     let i_pd = system::create_pd().expect("iso probe pd");
     system::install_pd_cap(i_pd, 0, i_sig0);
     system::install_pd_cap(i_pd, 1, i_sig1);
-    if let Some((ip, _region)) = system::spawn_isolated(iso_probe as *const () as usize, xaddr as usize, prio) {
+    if let Some((ip, _region)) =
+        system::spawn_isolated(iso_probe as *const () as usize, xaddr as usize, prio)
+    {
         system::bind_pd(i_pd, ip);
     }
 
@@ -1662,7 +1728,9 @@ pub fn spawn_demo() {
     let vmm_pd = system::create_pd().expect("vmm pd");
     system::install_pd_cap(vmm_pd, 0, gmem); // Slot 0 = Memory-Cap (MAP/UNMAP)
     system::install_pd_cap(vmm_pd, 1, vmm_sig); // Slot 1 = SIGNAL (Badge MAPPED)
-    if let Some((vp, _)) = system::spawn_isolated(vmm_probe as *const () as usize, gbase as usize, prio) {
+    if let Some((vp, _)) =
+        system::spawn_isolated(vmm_probe as *const () as usize, gbase as usize, prio)
+    {
         system::bind_pd(vmm_pd, vp);
     }
 
@@ -1670,11 +1738,13 @@ pub fn spawn_demo() {
     // gemappt, identity -> gleiche Adresse). Writer schreibt SHM_SECRET + signalisiert;
     // Reader wartet, liest F und meldet Erfolg. Zero-Copy ueber die Isolationsgrenze,
     // nur ueber cap-gewaehrten Frame + IPC; die VSpaces teilen sonst nichts.
-    let fframe = system::alloc(hal::mmu::ISO_REGION_SIZE, hal::mmu::ISO_REGION_SIZE).expect("shared F");
+    let fframe =
+        system::alloc(hal::mmu::ISO_REGION_SIZE, hal::mmu::ISO_REGION_SIZE).expect("shared F");
     let fbase = fframe.region().base; // Adresse des Frames (identity-VA in beiden PDs)
     let froot = system::cap_install(fframe).expect("F cap"); // EINE Cap fuer denselben Frame
     let shmn = system::create_notification().expect("shm ntfn");
-    let shmnroot = system::install_notification_cap(shmn as u32, Rights::RWX).expect("shm ntfn cap");
+    let shmnroot =
+        system::install_notification_cap(shmn as u32, Rights::RWX).expect("shm ntfn cap");
     // Writer-PD: Slot 0 = F-Cap, Slot 1 = shm-SIGNAL (Badge != 0, sonst ginge ein
     // Signal vor dem WAIT des Readers verloren -> pending bliebe 0).
     let w_f = system::cap_mint(froot, Rights::WRITE, 0).expect("w F");
@@ -1682,7 +1752,9 @@ pub fn spawn_demo() {
     let w_pd = system::create_pd().expect("shm writer pd");
     system::install_pd_cap(w_pd, 0, w_f);
     system::install_pd_cap(w_pd, 1, w_sig);
-    if let Some((wp, _)) = system::spawn_isolated(shm_writer as *const () as usize, fbase as usize, prio) {
+    if let Some((wp, _)) =
+        system::spawn_isolated(shm_writer as *const () as usize, fbase as usize, prio)
+    {
         system::bind_pd(w_pd, wp);
     }
     // Reader-PD: Slot 0 = F-Cap (derselbe Frame!), Slot 1 = shm-WAIT, Slot 2 = SIGNAL.
@@ -1693,7 +1765,9 @@ pub fn spawn_demo() {
     system::install_pd_cap(r_pd, 0, r_f);
     system::install_pd_cap(r_pd, 1, r_wait);
     system::install_pd_cap(r_pd, 2, r_done);
-    if let Some((rp, _)) = system::spawn_isolated(shm_reader as *const () as usize, fbase as usize, prio) {
+    if let Some((rp, _)) =
+        system::spawn_isolated(shm_reader as *const () as usize, fbase as usize, prio)
+    {
         system::bind_pd(r_pd, rp);
     }
 
@@ -1712,19 +1786,29 @@ pub fn spawn_demo() {
     // 4-KiB-Seiten: eine isolierte PD bekommt eine 12-KiB-Region feingranular gemappt
     // -- P (RW), P+4KiB (RO, vorbefuellt), P+8KiB (Guard, ungemappt). Beweist mehrere
     // einzelne Seiten mit gemischten Rechten + Guard-Page-Fault.
-    let preg = system::alloc(3 * 4096, 4096).expect("page region").region().base;
+    let preg = system::alloc(3 * 4096, 4096)
+        .expect("page region")
+        .region()
+        .base;
     poke_u64(preg + 4096, 0x5EAD_DA7A); // RO-Seite vorbefuellen (Inhalt fuer den Reader)
     let p_sig = system::cap_mint(introot, Rights::WRITE, ISO_BADGE_PAGES).expect("page sig");
     let p_pd = system::create_pd().expect("page pd");
     system::install_pd_cap(p_pd, 0, p_sig);
-    if let Some((pp, _)) = system::spawn_isolated(page_probe as *const () as usize, preg as usize, prio) {
+    if let Some((pp, _)) =
+        system::spawn_isolated(page_probe as *const () as usize, preg as usize, prio)
+    {
         system::bind_pd(p_pd, pp);
         system::map_into_thread(pp, preg, 4096, 1); // P: RW
         system::map_into_thread(pp, preg + 4096, 4096, 0); // P+4KiB: RO
-        // P+8KiB bleibt ungemappt (Guard).
+                                                           // P+8KiB bleibt ungemappt (Guard).
     }
 
-    *RELOAD_INFO.lock() = Some(ReloadInfo { ep, v1, v1_pd, v2_pd });
+    *RELOAD_INFO.lock() = Some(ReloadInfo {
+        ep,
+        v1,
+        v1_pd,
+        v2_pd,
+    });
 
     // Audit-Regression A: Endpoint + 3 PDs (Opfer/Server/Client) für den Stale-Queue-
     // Test. Die Threads selbst werden später vom Idle-Manager gestaffelt erzeugt (siehe
@@ -1990,16 +2074,16 @@ extern "C" fn iso_probe(_arg: usize) -> ! {
     // SAFETY: reiner EL0-User-Code; `svc`/`ldr` sind die einzigen Operationen.
     unsafe {
         core::arch::asm!(
-            "mov x9, x0",   // x9 = X (fremde Adresse)
-            "mov x0, #8",   // sys::SIGNAL
-            "mov x1, #0",   // Slot 0 (Badge RAN)
+            "mov x9, x0", // x9 = X (fremde Adresse)
+            "mov x0, #8", // sys::SIGNAL
+            "mov x1, #0", // Slot 0 (Badge RAN)
             "svc #0",
             "ldr x2, [x9]", // X lesen -> FAULT in isolierter VSpace (EL1-only)
             "mov x0, #8",   // (unerreichbar bei intakter Isolation) Slot 1 (Badge READ)
             "mov x1, #1",
             "svc #0",
-        "1:",
-            "mov x0, #5",   // sys::PARK
+            "1:",
+            "mov x0, #5", // sys::PARK
             "svc #0",
             "b 1b",
             options(noreturn),
@@ -2020,8 +2104,8 @@ extern "C" fn trusted_probe(_arg: usize) -> ! {
             "mov x0, #8",   // sys::SIGNAL Slot 0 (Badge TRUSTED)
             "mov x1, #0",
             "svc #0",
-        "1:",
-            "mov x0, #5",   // sys::PARK
+            "1:",
+            "mov x0, #5", // sys::PARK
             "svc #0",
             "b 1b",
             options(noreturn),
@@ -2040,25 +2124,25 @@ extern "C" fn vmm_probe(_arg: usize) -> ! {
     // SAFETY: reiner EL0-User-Code; `svc`/`ldr`/`str` auf den selbst gemappten Frame.
     unsafe {
         core::arch::asm!(
-            "mov x9, x0",                   // x9 = G (Frame-Adresse)
-            "mov x0, #10",                  // sys::MAP
-            "mov x1, #0",                   // Slot 0 (Memory-Cap für G)
+            "mov x9, x0",  // x9 = G (Frame-Adresse)
+            "mov x0, #10", // sys::MAP
+            "mov x1, #0",  // Slot 0 (Memory-Cap für G)
             "svc #0",
-            "movz x10, #0xBEEF",            // x10 = 0xDEADBEEF (Testmuster)
+            "movz x10, #0xBEEF", // x10 = 0xDEADBEEF (Testmuster)
             "movk x10, #0xDEAD, lsl #16",
-            "str x10, [x9]",                // in den gemappten Frame schreiben
-            "ldr x11, [x9]",                // zurücklesen
+            "str x10, [x9]", // in den gemappten Frame schreiben
+            "ldr x11, [x9]", // zurücklesen
             "cmp x11, x10",
-            "b.ne 3f",                      // Roundtrip fehlgeschlagen -> kein SIGNAL
-            "mov x0, #8",                   // sys::SIGNAL Slot 1 (Badge MAPPED)
+            "b.ne 3f",    // Roundtrip fehlgeschlagen -> kein SIGNAL
+            "mov x0, #8", // sys::SIGNAL Slot 1 (Badge MAPPED)
             "mov x1, #1",
             "svc #0",
-            "mov x0, #11",                  // sys::UNMAP Slot 0
+            "mov x0, #11", // sys::UNMAP Slot 0
             "mov x1, #0",
             "svc #0",
-            "ldr x11, [x9]",                // nach UNMAP lesen -> FAULT -> beendet
-        "3:",
-            "mov x0, #5",                   // sys::PARK
+            "ldr x11, [x9]", // nach UNMAP lesen -> FAULT -> beendet
+            "3:",
+            "mov x0, #5", // sys::PARK
             "svc #0",
             "b 3b",
             options(noreturn),
@@ -2085,10 +2169,10 @@ extern "C" fn shm_writer(_arg: usize) -> ! {
             "movk x10, #0x1234, lsl #32",
             "movk x10, #0x5A5A, lsl #48",
             "str x10, [x9]", // in den geteilten Frame schreiben
-            "mov x0, #8",  // sys::SIGNAL Slot 1 (shm-Notification -> Reader wecken)
+            "mov x0, #8",    // sys::SIGNAL Slot 1 (shm-Notification -> Reader wecken)
             "mov x1, #1",
             "svc #0",
-        "1:",
+            "1:",
             "mov x0, #5", // sys::PARK
             "svc #0",
             "b 1b",
@@ -2111,7 +2195,7 @@ extern "C" fn shm_reader(_arg: usize) -> ! {
             "mov x0, #10", // sys::MAP Slot 0 (Memory-Cap für F)
             "mov x1, #0",
             "svc #0",
-            "mov x0, #9",  // sys::WAIT Slot 1 (blockiert bis Writer signalisiert)
+            "mov x0, #9", // sys::WAIT Slot 1 (blockiert bis Writer signalisiert)
             "mov x1, #1",
             "svc #0",
             "ldr x11, [x9]", // geteilten Frame lesen
@@ -2121,10 +2205,10 @@ extern "C" fn shm_reader(_arg: usize) -> ! {
             "movk x10, #0x5A5A, lsl #48",
             "cmp x11, x10",
             "b.ne 3f",
-            "mov x0, #8",  // sys::SIGNAL Slot 2 (Badge SHARED an Kollektor)
+            "mov x0, #8", // sys::SIGNAL Slot 2 (Badge SHARED an Kollektor)
             "mov x1, #2",
             "svc #0",
-        "3:",
+            "3:",
             "mov x0, #5", // sys::PARK
             "svc #0",
             "b 3b",
@@ -2156,7 +2240,7 @@ extern "C" fn pdctl_target(_arg: usize) -> ! {
             "mov x0, #10", // sys::MAP Slot 0 (Memory-Cap des Zähler-Frames)
             "mov x1, #0",
             "svc #0",
-        "1:",
+            "1:",
             "ldr x10, [x9]",
             "add x10, x10, #1",
             "str x10, [x9]",
@@ -2182,10 +2266,10 @@ extern "C" fn chan_backend(_arg: usize) -> ! {
             "mov x1, #0",
             "svc #0",
             "lsl x2, x2, #1", // Antwort = Eingabe * 2 (CHAN_FACTOR)
-            "mov x0, #3", // sys::REPLY Slot 0
+            "mov x0, #3",     // sys::REPLY Slot 0
             "mov x1, #0",
             "svc #0",
-        "1:",
+            "1:",
             "mov x0, #5", // sys::PARK
             "svc #0",
             "b 1b",
@@ -2217,16 +2301,16 @@ extern "C" fn rtc_backend(_arg: usize) -> ! {
     // RTC-Registerseite (Device-Memory), RECV/REPLY/PARK ueber die Kanal-Cap (Slot 0).
     unsafe {
         core::arch::asm!(
-            "mov x9, x0",   // x9 = RTC_DR-Adresse (identity-gemappt)
-            "mov x0, #2",   // sys::RECV Slot 0 (Anfrage des Zeitdienstes)
+            "mov x9, x0", // x9 = RTC_DR-Adresse (identity-gemappt)
+            "mov x0, #2", // sys::RECV Slot 0 (Anfrage des Zeitdienstes)
             "mov x1, #0",
             "svc #0",
             "ldr w2, [x9]", // RTC_DR lesen (32-bit Sekundenzaehler) -> Antwort-msg0
             "mov x0, #3",   // sys::REPLY Slot 0
             "mov x1, #0",
             "svc #0",
-        "1:",
-            "mov x0, #5",   // sys::PARK
+            "1:",
+            "mov x0, #5", // sys::PARK
             "svc #0",
             "b 1b",
             options(noreturn),
@@ -2257,24 +2341,24 @@ extern "C" fn rtc_irq_backend(_arg: usize) -> ! {
     // autorisiert) RW-gemappte RTC-Registerseite; RECV/WAIT/REPLY/PARK ueber die Kanal-Caps.
     unsafe {
         core::arch::asm!(
-            "mov x9, x0",   // x9 = RTC-Basis (RW)
-            "mov x0, #2",   // sys::RECV Slot 0 (Anfrage des Partners)
+            "mov x9, x0", // x9 = RTC-Basis (RW)
+            "mov x0, #2", // sys::RECV Slot 0 (Anfrage des Partners)
             "mov x1, #0",
             "svc #0",
-            "ldr w10, [x9]",        // w10 = RTC_DR
-            "add w10, w10, #1",     // Match = DR + 1 (naechste Sekunde)
-            "str w10, [x9, #4]",    // RTC_MR (Offset 0x04) = Match
+            "ldr w10, [x9]",     // w10 = RTC_DR
+            "add w10, w10, #1",  // Match = DR + 1 (naechste Sekunde)
+            "str w10, [x9, #4]", // RTC_MR (Offset 0x04) = Match
             "mov w11, #1",
-            "str w11, [x9, #16]",   // RTC_IMSC (Offset 0x10) = 1 (Match-Interrupt freigeben)
-            "mov x0, #9",   // sys::WAIT Slot 2 (Kanal-Notification = IRQ-Zustellung)
+            "str w11, [x9, #16]", // RTC_IMSC (Offset 0x10) = 1 (Match-Interrupt freigeben)
+            "mov x0, #9",         // sys::WAIT Slot 2 (Kanal-Notification = IRQ-Zustellung)
             "mov x1, #2",
             "svc #0",
-            "mov x2, #1",   // IRQ erhalten -> Antwort-msg0 = 1
-            "mov x0, #3",   // sys::REPLY Slot 0
+            "mov x2, #1", // IRQ erhalten -> Antwort-msg0 = 1
+            "mov x0, #3", // sys::REPLY Slot 0
             "mov x1, #0",
             "svc #0",
-        "1:",
-            "mov x0, #5",   // sys::PARK
+            "1:",
+            "mov x0, #5", // sys::PARK
             "svc #0",
             "b 1b",
             options(noreturn),
@@ -2294,23 +2378,23 @@ extern "C" fn dma_backend(_arg: usize) -> ! {
     // EL0-RW gemappte DMA-Region (Normal-NC); RECV/REPLY/PARK ueber die Kanal-Cap (Slot 0).
     unsafe {
         core::arch::asm!(
-            "mov x9, x0",                   // x9 = DMA-Region-Basis (identity, EL0-RW NC)
-            "mov x0, #2",                   // sys::RECV Slot 0 (Anfrage des Partners)
+            "mov x9, x0", // x9 = DMA-Region-Basis (identity, EL0-RW NC)
+            "mov x0, #2", // sys::RECV Slot 0 (Anfrage des Partners)
             "mov x1, #0",
             "svc #0",
-            "movz w10, #0xBEEF",            // w10 = 0x600DBEEF (DMA_PAT0)
+            "movz w10, #0xBEEF", // w10 = 0x600DBEEF (DMA_PAT0)
             "movk w10, #0x600D, lsl #16",
-            "str w10, [x9]",                // DMA[0] = PAT0 (EL0-NC-Schreibzugriff)
-            "movz w11, #0xD0DA",            // w11 = 0xD0DAD0DA (DMA_PAT1)
+            "str w10, [x9]",     // DMA[0] = PAT0 (EL0-NC-Schreibzugriff)
+            "movz w11, #0xD0DA", // w11 = 0xD0DAD0DA (DMA_PAT1)
             "movk w11, #0xD0DA, lsl #16",
-            "str w11, [x9, #4]",            // DMA[1] = PAT1
-            "dsb sy",                       // NC-Schreibvorgaenge sichtbar machen
-            "ldr w2, [x9]",                 // Round-Trip-Read von Offset 0 -> Antwort-msg0
-            "mov x0, #3",                   // sys::REPLY Slot 0 (msg0 = zurueckgelesenes PAT0)
+            "str w11, [x9, #4]", // DMA[1] = PAT1
+            "dsb sy",            // NC-Schreibvorgaenge sichtbar machen
+            "ldr w2, [x9]",      // Round-Trip-Read von Offset 0 -> Antwort-msg0
+            "mov x0, #3",        // sys::REPLY Slot 0 (msg0 = zurueckgelesenes PAT0)
             "mov x1, #0",
             "svc #0",
-        "1:",
-            "mov x0, #5",                   // sys::PARK
+            "1:",
+            "mov x0, #5", // sys::PARK
             "svc #0",
             "b 1b",
             options(noreturn),
@@ -2355,14 +2439,14 @@ extern "C" fn page_probe(_arg: usize) -> ! {
         core::arch::asm!(
             "mov x9, x0",
             "movz x10, #0x1234",
-            "str x10, [x9]",          // P (RW) schreiben
-            "ldr x11, [x9, #4096]",   // P+4KiB (RO) lesen -> ok
-            "mov x0, #8",             // sys::SIGNAL Slot 0 (Badge PAGES)
+            "str x10, [x9]",        // P (RW) schreiben
+            "ldr x11, [x9, #4096]", // P+4KiB (RO) lesen -> ok
+            "mov x0, #8",           // sys::SIGNAL Slot 0 (Badge PAGES)
             "mov x1, #0",
             "svc #0",
-            "str x10, [x9, #8192]",   // P+8KiB (Guard, ungemappt) schreiben -> FAULT
-        "3:",
-            "mov x0, #5",             // sys::PARK
+            "str x10, [x9, #8192]", // P+8KiB (Guard, ungemappt) schreiben -> FAULT
+            "3:",
+            "mov x0, #5", // sys::PARK
             "svc #0",
             "b 3b",
             options(noreturn),
@@ -2383,7 +2467,7 @@ extern "C" fn native_template(_arg: usize) -> ! {
             "mov x0, #8", // sys::SIGNAL
             "mov x1, #0", // Slot 0 (Badge NATIVE)
             "svc #0",
-        "1:",
+            "1:",
             "mov x0, #5", // sys::PARK
             "svc #0",
             "b 1b",
@@ -2681,23 +2765,6 @@ extern "C" fn strand_worker(_arg: usize) -> ! {
 // (Die generischen Fuzzer-Helfer frand/frand_rights/pick_live/free_slot liegen jetzt im Modul
 // `fuzz`, ADR 0013 — sie werden ausschliesslich von den Fuzzern benutzt.)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 /// Cross-Core-Park/Wake-Thread (EL1, auf core 1): blockiert sich per `PARK`; core 0
 /// weckt ihn kern-übergreifend per `wake_remote` (Reschedule-IPI). Setzt nach dem
 /// Aufwachen `XCORE_WOKEN` — Beleg für den IPI-getriebenen Cross-Core-Unblock.
@@ -2971,7 +3038,10 @@ extern "C" fn killer(_arg: usize) -> ! {
     let _ = invoke(sys::KILL, 0, [0; 4], 0);
     KILL_SNAP1.store(VICTIM_COUNT.load(Ordering::Relaxed), Ordering::Relaxed);
     // Negativtest: KILL über leeren Slot -> verweigert.
-    DENIED_KILL.store(invoke(sys::KILL, NO_CAP_SLOT, [0; 4], 0).result, Ordering::Relaxed);
+    DENIED_KILL.store(
+        invoke(sys::KILL, NO_CAP_SLOT, [0; 4], 0).result,
+        Ordering::Relaxed,
+    );
     // Warten und erneut messen: das Victim darf nicht weitergezählt haben.
     for _ in 0..1_000_000 {
         core::hint::spin_loop();
@@ -3033,7 +3103,10 @@ fn serve(factor: u64) -> ! {
 /// Batch 2 (bedient von v2) — durchgehend über dieselbe Send-Cap.
 extern "C" fn client(_arg: usize) -> ! {
     for (i, &v) in B1_IN.iter().enumerate() {
-        R1[i].store(invoke(sys::CALL, EP_CAP, [v, 0, 0, 0], 0).msg[0], Ordering::Relaxed);
+        R1[i].store(
+            invoke(sys::CALL, EP_CAP, [v, 0, 0, 0], 0).msg[0],
+            Ordering::Relaxed,
+        );
     }
     BATCH1_DONE.store(true, Ordering::Release);
 
@@ -3042,7 +3115,10 @@ extern "C" fn client(_arg: usize) -> ! {
     }
 
     for (i, &v) in B2_IN.iter().enumerate() {
-        R2[i].store(invoke(sys::CALL, EP_CAP, [v, 0, 0, 0], 0).msg[0], Ordering::Relaxed);
+        R2[i].store(
+            invoke(sys::CALL, EP_CAP, [v, 0, 0, 0], 0).msg[0],
+            Ordering::Relaxed,
+        );
     }
     ALL_DONE.store(true, Ordering::Release);
     loop {
@@ -3166,7 +3242,8 @@ pub fn demo_report_then_idle() -> ! {
             while RECLAIM_SPAWNED.load(Ordering::Relaxed) < RECLAIM_TARGET
                 && system::user_kstack_free_count() > 0
             {
-                if system::spawn_user(exiter_entry as *const () as usize, 0, RECLAIM_PRIO).is_some() {
+                if system::spawn_user(exiter_entry as *const () as usize, 0, RECLAIM_PRIO).is_some()
+                {
                     RECLAIM_SPAWNED.fetch_add(1, Ordering::Relaxed);
                 } else {
                     break;
@@ -3184,7 +3261,11 @@ pub fn demo_report_then_idle() -> ! {
         {
             hal::cpu::local_irq_disable();
             while BALANCED_SPAWNED.load(Ordering::Relaxed) < BALANCED_TARGET {
-                match system::spawn_balanced(balanced_worker as *const () as usize, 0, system::IDLE_PRIO) {
+                match system::spawn_balanced(
+                    balanced_worker as *const () as usize,
+                    0,
+                    system::IDLE_PRIO,
+                ) {
                     Some(t) => {
                         if let Some(c) = system::owner_core_of(t) {
                             BALANCED_PLACE[c].fetch_add(1, Ordering::Relaxed);
@@ -3249,7 +3330,11 @@ pub fn demo_report_then_idle() -> ! {
             let (mem0, tcb0, vs0, ks0) = base;
             let mut ok = true;
             for _ in 0..CHURN_TARGET {
-                match system::spawn_isolated(churn_dummy as *const () as usize, 0, system::IDLE_PRIO) {
+                match system::spawn_isolated(
+                    churn_dummy as *const () as usize,
+                    0,
+                    system::IDLE_PRIO,
+                ) {
                     Some((tid, _)) => system::destroy_isolated(tid),
                     None => {
                         ok = false;
@@ -3274,11 +3359,16 @@ pub fn demo_report_then_idle() -> ! {
         // (er bekommt das Budget erst beim Bind). Autorität ausschließlich über die Cap.
         if !MCS_STARTED.load(Ordering::Acquire)
             && CHURN_DONE.load(Ordering::Acquire)
-            && (1..system::num_cores()).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
+            && (1..system::num_cores())
+                .all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
         {
             hal::cpu::local_irq_disable();
-            let greedy =
-                system::spawn_on_core(MCS_CORE, mcs_greedy_worker as *const () as usize, 0, MCS_PRIO);
+            let greedy = system::spawn_on_core(
+                MCS_CORE,
+                mcs_greedy_worker as *const () as usize,
+                0,
+                MCS_PRIO,
+            );
             let budg = system::spawn_on_core(
                 MCS_CORE,
                 mcs_budgeted_worker as *const () as usize,
@@ -3330,7 +3420,8 @@ pub fn demo_report_then_idle() -> ! {
         // Sequenz ohne Timing-Annahmen). Jeder Schritt: eine Aktion pro Manager-Runde.
         if !STALE_DONE.load(Ordering::Acquire)
             && MCS_DONE.load(Ordering::Acquire)
-            && (1..system::num_cores()).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
+            && (1..system::num_cores())
+                .all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
         {
             match STALE_STEP.load(Ordering::Acquire) {
                 0 => {
@@ -3530,8 +3621,9 @@ pub fn demo_report_then_idle() -> ! {
                     // läuft). Erschöpfungs-Delta des core-0-Kontos messen: mit Donation
                     // wurde das Client-Budget durch die Server-Arbeit je Call belastet.
                     if DDON_CLIENT_DONE.load(Ordering::Acquire) {
-                        let delta =
-                            system::budget_stats(0).0.wrapping_sub(DDON_DEPL0.load(Ordering::Relaxed));
+                        let delta = system::budget_stats(0)
+                            .0
+                            .wrapping_sub(DDON_DEPL0.load(Ordering::Relaxed));
                         DDON_DELTA.store(delta, Ordering::Release);
                         DDON_OK.store(delta >= DDON_MIN_DEPL, Ordering::Release);
                         DDON_DONE.store(true, Ordering::Release);
@@ -3627,7 +3719,10 @@ pub fn demo_report_then_idle() -> ! {
                         let migrated = system::endpoint_migrate_owner(ep, v1);
                         RMIG_MIGRATED.store(migrated, Ordering::Release);
                         system::endpoint_retire_receiver(ep, v1);
-                        system::clear_pd_cap(RMIG_SERVER_PD.load(Ordering::Relaxed), EP_CAP as usize);
+                        system::clear_pd_cap(
+                            RMIG_SERVER_PD.load(Ordering::Relaxed),
+                            EP_CAP as usize,
+                        );
                         hal::cpu::local_irq_disable();
                         if let Some(v2) =
                             system::spawn_on_core(0, rmig_server_v2 as *const () as usize, 0, 3)
@@ -3804,12 +3899,9 @@ pub fn demo_report_then_idle() -> ! {
                         system::bind_pd(PDCTL_TARGET_PD.load(Ordering::Relaxed), t);
                         PDCTL_TARGET_TID.store(t.to_raw(), Ordering::Relaxed);
                     }
-                    if let Some(c) = system::spawn_on_core(
-                        0,
-                        pdctl_controller as *const () as usize,
-                        0,
-                        3,
-                    ) {
+                    if let Some(c) =
+                        system::spawn_on_core(0, pdctl_controller as *const () as usize, 0, 3)
+                    {
                         system::bind_pd(PDCTL_CTRL_PD.load(Ordering::Relaxed), c);
                     }
                     hal::cpu::local_irq_enable();
@@ -3845,8 +3937,10 @@ pub fn demo_report_then_idle() -> ! {
                                     system::cap_mint(root, Rights::WRITE, 0),
                                 ) {
                                     // Recv-Cap ins Backend (policy-geprüft auf genau diesen Kanal).
-                                    CHAN_BE_RECV_OK
-                                        .store(system::install_pd_cap(be, 0, recv), Ordering::Release);
+                                    CHAN_BE_RECV_OK.store(
+                                        system::install_pd_cap(be, 0, recv),
+                                        Ordering::Release,
+                                    );
                                     system::install_pd_cap(ts, 0, send); // Send-Cap an Trusted
                                 }
                             }
@@ -3924,12 +4018,11 @@ pub fn demo_report_then_idle() -> ! {
                             }
                             // MMIO-Cap fuer das RTC: nur kernelseitig geprägt, ins HardwareLand-
                             // Backend (Slot 1) installierbar (HardwareLand-Policy).
-                            if let Ok(mcap) = system::install_mmio_cap(RTC_PHYS, RTC_LEN, Rights::READ)
+                            if let Ok(mcap) =
+                                system::install_mmio_cap(RTC_PHYS, RTC_LEN, Rights::READ)
                             {
-                                RTC_MMIO_OK.store(
-                                    system::install_pd_cap(be, 1, mcap),
-                                    Ordering::Release,
-                                );
+                                RTC_MMIO_OK
+                                    .store(system::install_pd_cap(be, 1, mcap), Ordering::Release);
                             }
                             // Policy-Negativtest: MMIO-Cap in eine UserLand-PD -> abgelehnt.
                             if let Some(upd) = system::create_pd_in_domain(Domain::UserLand) {
@@ -3947,14 +4040,21 @@ pub fn demo_report_then_idle() -> ! {
                 1 => {
                     // Backend (isoliert EL0) erzeugen + binden, dann die RTC-Registerseite
                     // EL0-RO in seine VSpace mappen (generischer Device-Mechanismus).
-                    if let Some((b, _)) =
-                        system::spawn_isolated(rtc_backend as *const () as usize, RTC_PHYS as usize, 3)
-                    {
+                    if let Some((b, _)) = system::spawn_isolated(
+                        rtc_backend as *const () as usize,
+                        RTC_PHYS as usize,
+                        3,
+                    ) {
                         system::bind_pd(RTC_BE_PD.load(Ordering::Relaxed), b);
                         // RTC-Registerseite EL0-RO in die Backend-VSpace mappen (generisch).
                         // SENSITIVITAET P4 (geprueft): ohne dieses Mapping faultet das Backend
                         // beim RTC-Read (FAR=0x09010000) -> Isolation greift.
-                        system::map_region_into_thread(b, RTC_PHYS, RTC_LEN, system::MappingKind::Device { ro: true });
+                        system::map_region_into_thread(
+                            b,
+                            RTC_PHYS,
+                            RTC_LEN,
+                            system::MappingKind::Device { ro: true },
+                        );
                     }
                     RTC_STEP.store(2, Ordering::Release);
                 }
@@ -3992,7 +4092,8 @@ pub fn demo_report_then_idle() -> ! {
                         if let Some((be, ep, ntfn)) = system::create_hardware_backend(ts, 5) {
                             IRQT_BE_PD.store(be, Ordering::Relaxed);
                             // Kanal-Caps (Endpoint).
-                            if let Ok(eroot) = system::install_endpoint_cap(ep as u32, Rights::RWX) {
+                            if let Ok(eroot) = system::install_endpoint_cap(ep as u32, Rights::RWX)
+                            {
                                 if let (Ok(recv), Ok(send)) = (
                                     system::cap_mint(eroot, Rights::READ, 0),
                                     system::cap_mint(eroot, Rights::WRITE, 0),
@@ -4022,7 +4123,8 @@ pub fn demo_report_then_idle() -> ! {
                             }
                             // Policy-Negativtest: IRQ-Cap in eine UserLand-PD -> abgelehnt.
                             if let Some(upd) = system::create_pd_in_domain(Domain::UserLand) {
-                                if let Ok(icap2) = system::install_irq_cap(RTC_INTID, Rights::READ) {
+                                if let Ok(icap2) = system::install_irq_cap(RTC_INTID, Rights::READ)
+                                {
                                     let denied = !system::install_pd_cap(upd, 0, icap2);
                                     IRQT_POLICY.store(denied, Ordering::Release);
                                 }
@@ -4041,7 +4143,12 @@ pub fn demo_report_then_idle() -> ! {
                         3,
                     ) {
                         system::bind_pd(IRQT_BE_PD.load(Ordering::Relaxed), b);
-                        system::map_region_into_thread(b, RTC_PHYS, RTC_LEN, system::MappingKind::Device { ro: false }); // RW (armieren)
+                        system::map_region_into_thread(
+                            b,
+                            RTC_PHYS,
+                            RTC_LEN,
+                            system::MappingKind::Device { ro: false },
+                        ); // RW (armieren)
                     }
                     IRQT_STEP.store(2, Ordering::Release);
                 }
@@ -4092,8 +4199,7 @@ pub fn demo_report_then_idle() -> ! {
                             // DMA-Region ausschneiden + DmaCap ins HardwareLand-Backend (Slot 1).
                             if let Some(r) = system::alloc_dma_region(DMA_LEN) {
                                 DMA_PHYS.store(r.base, Ordering::Release);
-                                if let Ok(dcap) =
-                                    system::install_dma_cap(r.base, r.len, Rights::RW)
+                                if let Ok(dcap) = system::install_dma_cap(r.base, r.len, Rights::RW)
                                 {
                                     DMA_CAP_OK.store(
                                         system::install_pd_cap(be, 1, dcap),
@@ -4103,7 +4209,8 @@ pub fn demo_report_then_idle() -> ! {
                                     // zweite Region) in eine UserLand-PD -> abgelehnt. (Eine zweite
                                     // install_dma_cap-Region wuerde ein zweites Objekt mit gleicher
                                     // Region erzeugen -> dma_audit-Ueberlappung; das vermeiden wir.)
-                                    if let Some(upd) = system::create_pd_in_domain(Domain::UserLand) {
+                                    if let Some(upd) = system::create_pd_in_domain(Domain::UserLand)
+                                    {
                                         let denied = !system::install_pd_cap(upd, 0, dcap);
                                         DMA_POLICY.store(denied, Ordering::Release);
                                     }
@@ -4123,7 +4230,12 @@ pub fn demo_report_then_idle() -> ! {
                         system::bind_pd(DMA_BE_PD.load(Ordering::Relaxed), b);
                         // SENSITIVITAET D0 (geprueft): ohne dieses Mapping faultet das Backend
                         // beim DMA-Zugriff (FAR in der DMA-Region) -> Isolation greift.
-                        system::map_region_into_thread(b, phys, DMA_LEN, system::MappingKind::Dma { coherent: false });
+                        system::map_region_into_thread(
+                            b,
+                            phys,
+                            DMA_LEN,
+                            system::MappingKind::Dma { coherent: false },
+                        );
                     }
                     DMA_STEP.store(2, Ordering::Release);
                 }
@@ -4568,17 +4680,22 @@ pub fn demo_report_then_idle() -> ! {
         // auf MCS fertig + SMP fertig (STRAND_CORE frei). Tick-basiert (anderer Kern).
         if !STRAND_DONE.load(Ordering::Acquire)
             && MCS_DONE.load(Ordering::Acquire)
-            && (1..system::num_cores()).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
+            && (1..system::num_cores())
+                .all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
         {
             match STRAND_STEP.load(Ordering::Acquire) {
                 0 => {
                     // Worker auf STRAND_CORE erzeugen + knappes Budget binden (budget=1,
                     // lange Periode -> nach Erschöpfung KEIN natürlicher Refill im Fenster).
-                    if let Some(w) =
-                        system::spawn_on_core(STRAND_CORE, strand_worker as *const () as usize, 0, 3)
-                    {
+                    if let Some(w) = system::spawn_on_core(
+                        STRAND_CORE,
+                        strand_worker as *const () as usize,
+                        0,
+                        3,
+                    ) {
                         STRAND_TID.store(w.to_raw(), Ordering::Relaxed);
-                        if let Ok(sc) = system::install_sched_context_cap(1, 10_000, Rights::WRITE) {
+                        if let Ok(sc) = system::install_sched_context_cap(1, 10_000, Rights::WRITE)
+                        {
                             system::bind_sched_context(sc, STRAND_CORE, w);
                         }
                         STRAND_STEP.store(1, Ordering::Release);
@@ -4607,8 +4724,8 @@ pub fn demo_report_then_idle() -> ! {
                     // Snapshot gewachsen ist (Worker lief nach dem Re-Bind wieder).
                     let s = STRAND_SETTLE.fetch_add(1, Ordering::Relaxed);
                     if s >= 40 {
-                        let grew =
-                            STRAND_COUNT.load(Ordering::Relaxed) > STRAND_SNAP1.load(Ordering::Relaxed);
+                        let grew = STRAND_COUNT.load(Ordering::Relaxed)
+                            > STRAND_SNAP1.load(Ordering::Relaxed);
                         STRAND_STOP.store(true, Ordering::Release); // Worker parken lassen
                         STRAND_OK.store(grew, Ordering::Release);
                         STRAND_DONE.store(true, Ordering::Release);
@@ -4627,7 +4744,9 @@ pub fn demo_report_then_idle() -> ! {
             // kehrt nie zurueck). Nur mit Feature `soak`; der Kernel-Kern ist dabei unveraendert.
             #[cfg(feature = "soak")]
             {
-                println!("== SELFTEST COMPLETE -> SOAK (Dauerbetrieb einer Instanz, kein system_off) ==");
+                println!(
+                    "== SELFTEST COMPLETE -> SOAK (Dauerbetrieb einer Instanz, kein system_off) =="
+                );
                 soak::run();
             }
             // Alle Tests bestanden -> die (virtuelle) Maschine sauber herunterfahren,
@@ -4648,7 +4767,9 @@ pub fn demo_report_then_idle() -> ! {
             // FAILURES, also welcher Test scheiterte -- und als FEHLER sauber herunterfahren.
             // So wird eine Per-Test-Flakiness zu einem GEMELDETEN FAILURE statt zu einem Hang.
             reported = true;
-            println!("== SELFTEST WATCHDOG: all_done() nicht erreicht nach ~60s -> offene Tests: ==");
+            println!(
+                "== SELFTEST WATCHDOG: all_done() nicht erreicht nach ~60s -> offene Tests: =="
+            );
             report();
             println!("== SELFTEST FAILED (watchdog) -> system_off ==");
             hal::power::system_off();
@@ -4663,7 +4784,8 @@ fn all_done() -> bool {
     let fp = FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0;
     let prio = (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire));
     let life = KILLER_DONE.load(Ordering::Acquire) && REAPED.load(Ordering::Relaxed) >= 2;
-    let notif = PRODUCER_DONE.load(Ordering::Acquire) && NOTIF_COUNT.load(Ordering::Relaxed) >= NOTIF_ROUNDS;
+    let notif = PRODUCER_DONE.load(Ordering::Acquire)
+        && NOTIF_COUNT.load(Ordering::Relaxed) >= NOTIF_ROUNDS;
     let xfer = XFER_DONE.load(Ordering::Acquire) && XFER_GRANTLK_DONE.load(Ordering::Acquire);
     let migrate = MIG_DONE.load(Ordering::Acquire);
     let scale = SCALE_DONE.load(Ordering::Acquire);
@@ -4672,7 +4794,8 @@ fn all_done() -> bool {
     let el0iso = system::el0_fault_count() >= 1;
     // SMP: alle Sekundärkerne haben ihren Worker abgearbeitet (parallele Einplanung)
     // und der Parker wurde kern-übergreifend per IPI geweckt.
-    let smp = (1..system::num_cores()).all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
+    let smp = (1..system::num_cores())
+        .all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
         && XCORE_WOKEN.load(Ordering::Acquire);
     let xipc = XIPC_DONE.load(Ordering::Acquire);
     // Reclaim: alle transienten EL0-Exiter wurden erzeugt (Pool-Slots wiederverwendet).
@@ -4761,13 +4884,62 @@ fn all_done() -> bool {
     // ext-27 T4: Cross-Service-Matrix — 3 Domaenen nebenlaeufig, kein Stoeren, Canary intakt.
     let cross = CROSS_DONE.load(Ordering::Acquire) && CROSS_OK.load(Ordering::Acquire);
     // In-Kernel-Fuzzer (ADR 0013): bei `--features kernel-fuzz` alle vier bestanden; sonst (Stub) true.
-    workers && cores && fp && prio && life && notif && xfer && ckpt && el0 && el0iso && smp && xipc
-        && reclaim && balanced && vspace && vmm && shm && native && pages4k && churn && mcs
-        && stale && strand && rgone && ddon && rcap && rmig && caplk && domain
-        && pdctl && chan && rtc && irq && dma && pcie && smmu && smmubind && virtiorng && dmagen
-        && dmawin && dmatok
-        && sasheap && load && sysload && loadhw && loadstop && aggru && intru
-        && aggrh && intrh && aggrt && intrt && cross && migrate && scale && fuzz::all_passed()
+    workers
+        && cores
+        && fp
+        && prio
+        && life
+        && notif
+        && xfer
+        && ckpt
+        && el0
+        && el0iso
+        && smp
+        && xipc
+        && reclaim
+        && balanced
+        && vspace
+        && vmm
+        && shm
+        && native
+        && pages4k
+        && churn
+        && mcs
+        && stale
+        && strand
+        && rgone
+        && ddon
+        && rcap
+        && rmig
+        && caplk
+        && domain
+        && pdctl
+        && chan
+        && rtc
+        && irq
+        && dma
+        && pcie
+        && smmu
+        && smmubind
+        && virtiorng
+        && dmagen
+        && dmawin
+        && dmatok
+        && sasheap
+        && load
+        && sysload
+        && loadhw
+        && loadstop
+        && aggru
+        && intru
+        && aggrh
+        && intrh
+        && aggrt
+        && intrt
+        && cross
+        && migrate
+        && scale
+        && fuzz::all_passed()
 }
 
 fn report() {
@@ -4786,14 +4958,20 @@ fn report() {
             sched_ok = false;
         }
     }
-    println!("sched   : {}", if sched_ok { "ALL PASS" } else { "FAILURES" });
+    println!(
+        "sched   : {}",
+        if sched_ok { "ALL PASS" } else { "FAILURES" }
+    );
 
     // Lazy-FP: EL0-FP-Threads behielten ihr Muster über jede FP-Owner-Abgabe.
     let fp_mask = FP_OK_MASK.load(Ordering::Relaxed);
     let fp_sw = system::fp_switch_count();
     println!("fp      : EL0-FP-Threads-OK={fp_mask:#04b}/{FP_ALL_OK:#04b}, Lazy-FP-Owner-Wechsel={fp_sw}");
     let fp_ok = fp_mask == FP_ALL_OK && fp_sw > 0;
-    println!("fp      : {} (Lazy-FP: FP-Kontext ueber Owner-Wechsel erhalten)", if fp_ok { "ALL PASS" } else { "FAILURES" });
+    println!(
+        "fp      : {} (Lazy-FP: FP-Kontext ueber Owner-Wechsel erhalten)",
+        if fp_ok { "ALL PASS" } else { "FAILURES" }
+    );
 
     // Prioritäten: höher priorisierter Thread (id 0, prio 4) muss zuerst fertig sein.
     for i in 0..NPRIO_TEST {
@@ -4807,7 +4985,10 @@ fn report() {
     let f1 = PRIO_FINISH[1].load(Ordering::Relaxed);
     let f2 = PRIO_FINISH[2].load(Ordering::Relaxed);
     let prio_ok = f0 < f1 && f1 < f2;
-    println!("prio    : {}", if prio_ok { "ALL PASS" } else { "FAILURES" });
+    println!(
+        "prio    : {}",
+        if prio_ok { "ALL PASS" } else { "FAILURES" }
+    );
 
     // Thread-Lebenszyklus: cap-kontrolliertes KILL + Selbst-EXIT + Rückgewinnung.
     let s1 = KILL_SNAP1.load(Ordering::Relaxed);
@@ -4818,23 +4999,41 @@ fn report() {
     // (robust gegen die Speicher-Churn von Reclaim-/Balance-Test, anders als ein
     // absoluter total_free-Vergleich).
     let freed = system::reaped_bytes();
-    println!("life    : victim-count nach KILL={s1}, später={s2} (eingefroren: {})", s1 == s2);
-    println!("life    : KILL ohne Cap -> result={denied} (verweigert: {})", denied != result::OK);
-    println!("life    : {reaped} Threads eingesammelt, {} KiB Stack zurueckgewonnen", freed / 1024);
+    println!(
+        "life    : victim-count nach KILL={s1}, später={s2} (eingefroren: {})",
+        s1 == s2
+    );
+    println!(
+        "life    : KILL ohne Cap -> result={denied} (verweigert: {})",
+        denied != result::OK
+    );
+    println!(
+        "life    : {reaped} Threads eingesammelt, {} KiB Stack zurueckgewonnen",
+        freed / 1024
+    );
     let life_ok = s1 == s2 && denied != result::OK && reaped >= 2 && freed > 0;
-    println!("life    : {}", if life_ok { "ALL PASS" } else { "FAILURES" });
+    println!(
+        "life    : {}",
+        if life_ok { "ALL PASS" } else { "FAILURES" }
+    );
 
     // Notifications: asynchrone Badge-Signale.
     let nb = NOTIF_GOT_BADGE.load(Ordering::Relaxed);
     let nc = NOTIF_COUNT.load(Ordering::Relaxed);
     println!("notif   : {nc} Signale empfangen, Badge={nb:#x} (erwartet {NOTIF_BADGE_VAL:#x})");
     let notif_ok = nc >= NOTIF_ROUNDS && nb == NOTIF_BADGE_VAL;
-    println!("notif   : {}", if notif_ok { "ALL PASS" } else { "FAILURES" });
+    println!(
+        "notif   : {}",
+        if notif_ok { "ALL PASS" } else { "FAILURES" }
+    );
 
     // Capability-Transfer: Client nutzt eine per IPC vom Broker delegierte Cap.
     let xr = XFER_RESULT.load(Ordering::Relaxed);
     println!("xfer    : svc call(7) ueber transferierte Cap -> {xr} (erwartet 21)");
-    println!("xfer    : {}", if xr == 21 { "ALL PASS" } else { "FAILURES" });
+    println!(
+        "xfer    : {}",
+        if xr == 21 { "ALL PASS" } else { "FAILURES" }
+    );
 
     // Thread-Migration (ext-30).
     let mig_audit = MIG_AUDIT.load(Ordering::Acquire);
@@ -4899,13 +5098,21 @@ fn report() {
     let el0_seen = system::el0_syscall_seen();
     println!("el0     : EL1-Server empfing {urecv:#x} (erwartet {USER_MAGIC:#x}); EL0-Syscall gesehen: {el0_seen}");
     let el0_ok = urecv == USER_MAGIC && el0_seen;
-    println!("el0     : {} (User-Thread laeuft auf EL0, nur via Syscall)", if el0_ok { "ALL PASS" } else { "FAILURES" });
+    println!(
+        "el0     : {} (User-Thread laeuft auf EL0, nur via Syscall)",
+        if el0_ok { "ALL PASS" } else { "FAILURES" }
+    );
 
     // EL0-Isolation: bösartiger EL0-Thread las Kernel-Speicher -> isoliert, Kernel lebt.
     let faults = system::el0_fault_count();
-    println!("el0iso  : EL0-Faults abgefangen={faults} (Kernel laeuft -> dieser Bericht beweist es)");
+    println!(
+        "el0iso  : EL0-Faults abgefangen={faults} (Kernel laeuft -> dieser Bericht beweist es)"
+    );
     let iso_ok = faults >= 1;
-    println!("el0iso  : {} (EL0-Zugriff auf Kernel-Speicher faultet, Thread beendet, Kernel ueberlebt)", if iso_ok { "ALL PASS" } else { "FAILURES" });
+    println!(
+        "el0iso  : {} (EL0-Zugriff auf Kernel-Speicher faultet, Thread beendet, Kernel ueberlebt)",
+        if iso_ok { "ALL PASS" } else { "FAILURES" }
+    );
 
     // Stateful Hot-Reload: Zustand (Zähler) bleibt über v1->v2 erhalten.
     let r1 = [
@@ -4913,7 +5120,10 @@ fn report() {
         CS_R1[1].load(Ordering::Relaxed),
         CS_R1[2].load(Ordering::Relaxed),
     ];
-    let r2 = [CS_R2[0].load(Ordering::Relaxed), CS_R2[1].load(Ordering::Relaxed)];
+    let r2 = [
+        CS_R2[0].load(Ordering::Relaxed),
+        CS_R2[1].load(Ordering::Relaxed),
+    ];
     println!("ckpt    : v1(+1)={r1:?} -> Reload -> v2(+10)={r2:?}");
     let ckpt_ok = r1 == [1, 2, 3] && r2 == [13, 23];
     println!(
@@ -4970,7 +5180,10 @@ fn report() {
     let mut xipc_ok = true;
     for (i, &v) in XIPC_IN.iter().enumerate() {
         let r = XIPC_RESULT[i].load(Ordering::Relaxed);
-        println!("xipc    : core0->core{XIPC_SERVER_CORE} call({v}) -> {r} (erwartet {})", XIPC_FACTOR * v);
+        println!(
+            "xipc    : core0->core{XIPC_SERVER_CORE} call({v}) -> {r} (erwartet {})",
+            XIPC_FACTOR * v
+        );
         if r != XIPC_FACTOR * v {
             xipc_ok = false;
         }
@@ -4984,7 +5197,9 @@ fn report() {
     // Rückgabe der Kernel-Stack-Pool-Slots beim Thread-Ende.
     let spawned = RECLAIM_SPAWNED.load(Ordering::Relaxed);
     let free = system::user_kstack_free_count();
-    println!("reclaim : {spawned} transiente EL0-Threads erzeugt (Pool=8), jetzt {free} Slots frei");
+    println!(
+        "reclaim : {spawned} transiente EL0-Threads erzeugt (Pool=8), jetzt {free} Slots frei"
+    );
     let reclaim_ok = spawned >= RECLAIM_TARGET && free >= 4;
     println!(
         "reclaim : {} (EL0-Kernel-Stack-Pool-Slots werden beim Thread-Ende zurueckgegeben)",

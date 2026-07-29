@@ -14,7 +14,27 @@ const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2; // e_ident[EI_CLASS]
 const ELFDATA2LSB: u8 = 1; // e_ident[EI_DATA] (little-endian)
 const ET_EXEC: u16 = 2; // e_type
-const EM_AARCH64: u16 = 0xB7; // e_machine
+/// `e_machine` = AArch64.
+pub const EM_AARCH64: u16 = 0xB7;
+/// `e_machine` = x86-64.
+pub const EM_X86_64: u16 = 0x3E;
+
+/// Die **einzige** hier ladbare Maschine — die des laufenden Kernels.
+///
+/// Das ist kein Formalismus: ein ELF für die andere Architektur würde sonst geparst, seine
+/// Segmente kopiert und gemappt, und der Thread stürbe erst beim ersten Befehl an einer Stelle,
+/// die mit dem Loader nichts mehr zu tun hat. Die Ablehnung gehört an die Kante.
+///
+/// Bewusst über `cfg(target_arch)` und nicht als Parameter: diese Crate wird in den Kernel
+/// kompiliert, und dessen Architektur ist zur Übersetzungszeit bekannt. Ein Laufzeitparameter
+/// wäre eine Entscheidung, die jemand falsch treffen kann.
+#[cfg(target_arch = "aarch64")]
+pub const EXPECTED_MACHINE: u16 = EM_AARCH64;
+#[cfg(target_arch = "x86_64")]
+pub const EXPECTED_MACHINE: u16 = EM_X86_64;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+compile_error!("sel4lake-loader kennt nur aarch64 und x86_64 als Ziel-/Hostarchitektur");
+
 const PT_LOAD: u32 = 1; // p_type
 const EHDR_LEN: usize = 64; // ELF64-Header
 const PHDR_LEN: usize = 56; // ELF64-Program-Header
@@ -73,7 +93,7 @@ impl<'a> ElfImage<'a> {
         }
         let e_type = rd_u16(data, 16).ok_or(LoaderError::TooSmall)?;
         let e_machine = rd_u16(data, 18).ok_or(LoaderError::TooSmall)?;
-        if e_type != ET_EXEC || e_machine != EM_AARCH64 {
+        if e_type != ET_EXEC || e_machine != EXPECTED_MACHINE {
             return Err(LoaderError::BadElf);
         }
         let entry = rd_u64(data, 24).ok_or(LoaderError::TooSmall)?;
@@ -165,7 +185,7 @@ mod tests {
         v[5] = ELFDATA2LSB;
         v[6] = 1; // EI_VERSION
         v[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
-        v[18..20].copy_from_slice(&EM_AARCH64.to_le_bytes());
+        v[18..20].copy_from_slice(&EXPECTED_MACHINE.to_le_bytes());
         v[24..32].copy_from_slice(&entry.to_le_bytes()); // e_entry
         v[32..40].copy_from_slice(&(phoff as u64).to_le_bytes()); // e_phoff
         v[54..56].copy_from_slice(&(PHDR_LEN as u16).to_le_bytes()); // e_phentsize
@@ -235,8 +255,11 @@ mod tests {
 
     #[test]
     fn wrong_machine_rejected() {
+        // Die JEWEILS ANDERE Architektur. Ein ELF fuer eine fremde Maschine muss an der Kante
+        // scheitern, nicht erst beim ersten ausgefuehrten Befehl.
+        let foreign = if EXPECTED_MACHINE == EM_AARCH64 { EM_X86_64 } else { EM_AARCH64 };
         let mut raw = build_elf(0x1000, &[(0x1000, PF_R, b"a", 0)]);
-        raw[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
+        raw[18..20].copy_from_slice(&foreign.to_le_bytes());
         assert_eq!(ElfImage::parse(&raw).unwrap_err(), LoaderError::BadElf);
     }
 

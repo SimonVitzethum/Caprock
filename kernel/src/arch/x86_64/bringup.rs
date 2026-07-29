@@ -296,6 +296,48 @@ fn spawn_demo() -> bool {
     true
 }
 
+/// Badge, mit dem sich der Root-Task meldet (`programs/trusted/init`, `ROOT_BADGE`).
+#[cfg(feature = "selftest")]
+const ROOT_BADGE: u64 = 1 << 32;
+/// Badge, mit dem sich `hello` meldet (`programs/userland/hello`, `HELLO_BADGE`).
+#[cfg(feature = "selftest")]
+const HELLO_BADGE: u64 = 0x4845_4C4F;
+/// A-3.1: `SYS_CDELETE` hat die Loader-Cap geloescht **und** die Autoritaet war danach weg.
+#[cfg(feature = "selftest")]
+const CDELETE_GONE_BADGE: u64 = 1 << 33;
+/// A-3.1: ein Cap mit abgeleiteten Kopien wird abgewiesen und bleibt benutzbar.
+#[cfg(feature = "selftest")]
+const CDELETE_CHILDREN_BADGE: u64 = 1 << 34;
+
+/// Der akkumulierte Badge der Root-Notification (`0`, wenn keine endowt wurde).
+#[cfg(feature = "selftest")]
+fn root_badge() -> u64 {
+    crate::loader::root_notification()
+        .map(system::notification_pending)
+        .unwrap_or(0)
+}
+
+/// Hat der Root-Task gelaufen **und** von sich aus die uebrige Startmenge geladen?
+///
+/// Beides muss belegt sein, und zwar getrennt: dass ein geladenes Programm laeuft, sagt noch
+/// nichts darueber, ob seine Loader-Cap traegt. Erst das zweite Badge zeigt, dass ein
+/// **Userland**-Programm ein weiteres Programm gestartet hat -- das ist die Aussage, wegen der
+/// Stufe 1 des Plans existiert.
+#[cfg(feature = "selftest")]
+fn root_chain_done() -> bool {
+    let b = root_badge();
+    b & ROOT_BADGE != 0 && b & HELLO_BADGE == HELLO_BADGE
+}
+
+/// A-3.1: beide Ausgänge von `SYS_CDELETE` aus Ring 3 belegt — der erfolgreiche **und** der
+/// abgelehnte. Ein Löschpfad, von dem nur der Erfolgsfall geprüft ist, sagt nichts darüber, ob er
+/// im Zweifel zu viel löscht.
+#[cfg(feature = "selftest")]
+fn cdelete_done() -> bool {
+    let b = root_badge();
+    b & CDELETE_GONE_BADGE != 0 && b & CDELETE_CHILDREN_BADGE != 0
+}
+
 /// Sind alle Demo-Aussagen belegt? Dazu gehört, dass **jeder** Kern tickt — ein Kern, der
 /// zwar bootet, aber keinen Timer-Interrupt bekommt, würde sonst unbemerkt bleiben.
 #[cfg(feature = "selftest")]
@@ -304,7 +346,7 @@ fn all_done() -> bool {
     let cores = (0..system::num_cores()).all(|c| hal::timer::ticks(c) > 0);
     let ring3 = USER_SYSCALLS.load(Ordering::Relaxed) > 0 && system::el0_fault_count() > 0;
     let iso = SAS_READ_OK.load(Ordering::Relaxed) == PROBE_MAGIC && system::iso_fault_count() > 0;
-    workers && IPC_DONE.load(Ordering::Acquire) && cores && ring3 && iso
+    workers && IPC_DONE.load(Ordering::Acquire) && cores && ring3 && iso && root_chain_done() && cdelete_done()
 }
 
 /// Bericht + Abschaltung (das Testskript wertet die Marker aus).
@@ -346,6 +388,26 @@ fn report_and_off() -> ! {
     println!(
         "iso     : {} (eigener Adressraum je PD: dieselbe Adresse ist fuer SAS lesbar, fuer die isolierte PD nicht)",
         if iso_ok { "ALL PASS" } else { "FAILURES" }
+    );
+
+    let b = root_badge();
+    println!(
+        "root    : Notification-Badge {b:#x} (Root-Task lief: {}; er selbst hat 'hello' nachgeladen: {})",
+        b & ROOT_BADGE != 0,
+        b & HELLO_BADGE == HELLO_BADGE
+    );
+    println!(
+        "root    : {} (A-2.1: ein extern gebautes, aus dem signierten Manifest ausgewaehltes Programm laeuft -- und laedt seinerseits ueber SEINE Loader-Cap ein weiteres)",
+        if root_chain_done() { "ALL PASS" } else { "FAILURES" }
+    );
+    println!(
+        "cdelete : Loader-Cap geloescht und Autoritaet danach weg: {}; Cap mit abgeleiteten Kopien abgewiesen und weiter benutzbar: {}",
+        b & CDELETE_GONE_BADGE != 0,
+        b & CDELETE_CHILDREN_BADGE != 0
+    );
+    println!(
+        "cdelete : {} (A-3.1: SYS_CDELETE aus Ring 3 -- beide Ausgaenge belegt, nicht nur der erfolgreiche)",
+        if cdelete_done() { "ALL PASS" } else { "FAILURES" }
     );
 
     let sa = system::sched_audit_all();
@@ -501,6 +563,7 @@ pub fn run(multiboot_info: u64) -> ! {
         );
     }
     crate::loader::probe(); // was liegt im Archiv? (A-1.1: die Quelle ist jetzt auch auf x86 da)
+    crate::loader::manifest_report(); // A-1.2..A-1.4: wer bekommt welche Autoritaet?
     #[cfg(feature = "selftest")]
     crate::selftest::run();
 
@@ -686,6 +749,14 @@ pub fn run(multiboot_info: u64) -> ! {
         }
         println!("bringup : 3 Worker + 2 PDs (IPC-Server/Client) eingeplant");
     }
+
+    // --- Root-Task (A-2.1) ---
+    //
+    // Steht BEWUSST ausserhalb von `selftest`: das hier ist die Aufgabe des Kernels, nicht seine
+    // Pruefung. Ohne diesen Aufruf ist `--no-default-features` ein leerer Kernel (todo F2), und
+    // genau das war der Grund, warum `selftest` bis hierher in `default` bleiben musste.
+    let root_ok = crate::loader::start_root_task_reported();
+    let _ = root_ok;
 
     // --- Sekundärkerne starten (INIT-SIPI-SIPI, s. `hal::power`) ---
     let mut online = 1usize;

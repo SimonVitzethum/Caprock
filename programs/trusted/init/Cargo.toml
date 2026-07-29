@@ -1,0 +1,20 @@
+# `init` — der Root-Task (A-2.1).
+#
+# Das erste Programm, das der Kernel aus der Startmenge laedt. Es bekommt die Wurzel-Caps, die das
+# System-Manifest ihm zuweist, und laedt von dort aus den Rest -- ab hier ist jede weitere
+# Faehigkeit ein Userland-Programm statt eines Kernel-Patches.
+#
+# TrustedSAS: es darf eine Loader-Cap halten, und deshalb laedt der Kernel es nur mit gueltigem
+# Ed25519-Zertifikat (ADR 0014). Vollstaendig `#![forbid(unsafe_code)]`.
+[package]
+name = "init"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "init"
+path = "src/main.rs"
+
+[dependencies]
+libsel4lake = { path = "../../libsel4lake" }

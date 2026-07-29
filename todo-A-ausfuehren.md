@@ -18,35 +18,66 @@ Alles, was Strang B härtet, härtet bis dahin ein System ohne Anwendung.
 Das Boot-Image enthält genau zwei Dinge: den Kernel und **eine** Datei, die festlegt, was geladen
 wird. Alles andere liegt außerhalb.
 
-- [ ] **A-1.1 Multiboot-Module lesen.** GRUB übergibt die Startmenge als Multiboot-Module; der
+- [x] **A-1.1 Multiboot-Module lesen.** GRUB übergibt die Startmenge als Multiboot-Module; der
       Kernel muss die Modulliste aus der Multiboot-Info auswerten (Feld `mods_count`/`mods_addr`,
       Flag Bit 3). Auf ARM gibt es das Gegenstück bereits über `-device loader` + das reservierte
       RAM-Fenster; die x86-Seite fehlt vollständig. **Achtung:** die Modulbereiche müssen dem
       `PhysAllocator` als belegt gemeldet werden, bevor irgendetwas alloziert — sonst überschreibt
       die erste Allokation das Modul, das gleich geladen werden soll.
-- [ ] **A-1.2 Manifestformat.** Ein Eintrag beschreibt: Name, erwarteter SHA-256 des Moduls,
+      → `kernel/src/arch/x86_64/multiboot.rs`. Die Bereiche werden **ausgeschnitten**, nicht
+      nachträglich markiert: was nie als frei gemeldet wurde, kann nicht vergeben werden. Die
+      Grenzfälle (Rand, Überlappung, unsortierte Eingabe, Vollabdeckung) sieht der reale Lauf nie,
+      also werden sie eingespeist (`mbmod : ALL PASS`). Die Archivquelle ist nicht mehr fest
+      verdrahtet — `loader::set_archive_span`, auf ARM bleibt das statische Fenster der Rückfall.
+- [x] **A-1.2 Manifestformat.** Ein Eintrag beschreibt: Name, erwarteter SHA-256 des Moduls,
       Domäne (TrustedSAS/HardwareLand/UserLand), Schnittstellenversion, Anfangs-Caps, und die
       Politikfelder aus [A-1.4](#a-14-politikfelder-schnittstelle-zu-strang-b). Format bewusst
       **einfach und selbstbegrenzend** (feste Feldbreiten, Längenpräfixe) — es wird vor jeder
       Signaturprüfung geparst, ist also Angriffsfläche. Kein TOML, kein JSON im Kernel.
-- [ ] **A-1.3 Manifest ist ein Autoritätsdokument.** Es legt die gesamte Anfangsverteilung von
+      → `crates/sel4lake-loader/src/manifest.rs` (80-B-Kopf, 96-B-Einträge, `entry_len` im Kopf,
+      damit ein fremdes Eintragsformat **erkannt** statt verrutscht gelesen wird). Host-getestet
+      inkl. Mutations-Durchlauf; Kani-Beweise für Crash-Freiheit und exakte Partitionierung.
+- [x] **A-1.3 Manifest ist ein Autoritätsdokument.** Es legt die gesamte Anfangsverteilung von
       Autorität fest. Also: signiert, und die Signatur **an das Kernel-Image gebunden** (Hash des
       Images geht in die signierte Nachricht ein). Wer die Datei tauschen kann, besitzt sonst die
       Maschine. Baut auf ADR 0014 auf, ist aber nicht dasselbe: dort werden Binaries zertifiziert,
       hier die Zuteilung. **Prüfreihenfolge:** Signatur zuerst, Inhalt danach — nie umgekehrt.
-- [ ] **A-1.4 Politikfelder** <a id="a-14-politikfelder-schnittstelle-zu-strang-b"></a>
+      → Eigene Schlüsselmenge (`kernel/src/manifest_keys.rs`, `tools/gen_manifest_key.py`),
+      getrennt von `trusted_keys.rs`. Bindung = SHA-256 über `[__text_start, __rodata_end)`;
+      Werkzeug-Gegenstück `tools/kernel_hash.py`. **Die Prüfreihenfolge trägt der Typ:**
+      `SystemManifest::parse` liefert keinen einzigen Eintrag, Einträge gibt es nur über
+      `Verified`, und das entsteht nur aus `verify_with`.
+- [x] **A-1.4 Politikfelder** <a id="a-14-politikfelder-schnittstelle-zu-strang-b"></a>
       **(Schnittstelle zu Strang B).** Je Komponente: exklusiver Farbstreifen ja/nein,
       NUMA-Knoten, Kern-Affinität, Priorität, Budget. Strang A besitzt das **Format**, Strang B die
       **Bedeutung** (was ein Streifen ist, wie NUMA vergeben wird). Die konkrete Farbe gehört
       **nicht** ins Manifest — sie ist maschinenlokal.
-- [ ] **A-1.5 `SYS_LOAD` auf x86 zum Laufen bringen.** Scheitert heute sauber, weil es nichts zu
+      → Format steht (`policy_flags`, `numa_node`, `core_affinity`, `priority`, `budget_us`); der
+      Kernel liest und weist sie aus. **Angewandt werden sie noch nicht** — das ist der Punkt, an
+      dem B übernimmt. Für B: `POLICY_EXCLUSIVE_STRIPE`, `POLICY_PINNED` sind reserviert und
+      werden heute nur geführt.
+- [x] **A-1.5 `SYS_LOAD` auf x86 zum Laufen bringen.** Scheitert heute sauber, weil es nichts zu
       laden gibt. Der ELF-Lader existiert (`sel4lake-loader`); es fehlt die Quelle.
+      → Loader baut auf beiden Architekturen, `load_by_index` ist kein `None`-Stub mehr.
+      Nebenbefund: der ELF-Parser kannte nur `EM_AARCH64` — ein x86-Binary war für ihn schlicht
+      kein ELF. Jetzt `EXPECTED_MACHINE` per `cfg(target_arch)`, mit einem Test gegen die jeweils
+      **andere** Architektur.
 
 ## A-2. Root-Task (F2)
 
-- [ ] **A-2.1 Ein Startprogramm aus der Startmenge laden und ihm die Wurzel-Caps übergeben.** Der
+- [x] **A-2.1 Ein Startprogramm aus der Startmenge laden und ihm die Wurzel-Caps übergeben.** Der
       seL4-Weg. Ab hier ist jede weitere Fähigkeit ein Userland-Programm statt eines
       Kernel-Patches — das ist der eigentliche Hebel des ganzen Plans.
+      → `loader::start_root_task` + `programs/trusted/init`. Der Root-Task signalisiert, dass er
+      läuft, und lädt dann **über seine eigene Loader-Cap** die restliche Startmenge nach; erst das
+      zweite Badge belegt die Aussage, um die es geht. Boot-Argument ist bewusst das Minimum
+      (`(Anzahl << 32) | eigener Index`) — alles Weitere gehört hinter eine Capability, nicht in
+      ein Register.
+      **Offen und benannt:** `CAP_PD_CONTROL` ist nicht erteilbar, weil eine PdControl-Cap eine
+      Ziel-PD bezeichnet, die beim Start des Root-Tasks noch nicht existiert. Der Kernel weist ein
+      Manifest, das sie verlangt, **ab** (`UnsupportedAuthority`) statt still weniger zu geben. Der
+      ehrliche Weg wäre, dass `SYS_LOAD` die PdControl-Cap der neu erzeugten PD zurückgibt — das
+      ist eine ABI-Erweiterung und gehört zu A-3.2 (wählbarer Empfangs-Slot).
 - [ ] **A-2.2 Erst danach `default = []`** in `kernel/Cargo.toml` (Feature `selftest`). Vorher
       wäre das Gating kein schlankerer Kernel, sondern ein leerer. Der `--no-default-features`-Bau
       wird bereits von `test-qemu-x86.sh` mitgebaut und der `.text`-Schrumpf geprüft — die
@@ -54,12 +85,32 @@ wird. Alles andere liegt außerhalb.
 
 ## A-3. Caps, die man wieder loswird (A4, A3, C3)
 
-- [ ] **A-3.1 `SYS_CDELETE`** (eigener Slot, cap-gegatet auf den eigenen Cspace). Ohne das kann
+- [x] **A-3.1 `SYS_CDELETE`** (eigener Slot, cap-gegatet auf den eigenen Cspace). Ohne das kann
       ein langlebiger Dienst, der Caps per IPC empfängt, seine Slots nicht freigeben und läuft
       gegen `CAP_BUDGET_PER_PD`. Der Root-Task ist genau so ein Dienst: mit A-2 wird aus der
       ABI-Lücke ein Betriebsproblem.
-- [ ] **A-3.2 `SYS_CMOVE`/`SYS_CCOPY`** und ein **wählbarer Empfangs-Slot** für Grants statt des
+      → Syscall 14, **ohne** zusätzliche Cap: Autorität abzugeben darf nie an einer Erlaubnis
+      hängen. Reihenfolge Slot räumen → löschen → bei Misserfolg zurücklegen; ein Cap mit
+      CDT-Kindern bleibt unverändert liegen (`ERR_HASCHILDREN`) statt halb entfernt zu werden.
+      Geprüft aus **Ring 3** (im `init`), und zwar **beide** Ausgänge: der erfolgreiche (und die
+      Autorität ist danach wirklich weg — ein weiteres `SYS_LOAD` wird abgewiesen) und der
+      abgelehnte (der Cap bleibt benutzbar).
+- [x] **A-3.2 `SYS_CMOVE`/`SYS_CCOPY`** und ein **wählbarer Empfangs-Slot** für Grants statt des
       festen `GRANT_RECV_SLOT`.
+      → Syscalls 15/16/17. `CCOPY` schneidet die Rechte mit denen des Originals (eine Kopie darf nie
+      mehr können als die Vorlage) und nimmt ein **Badge**; `CMOVE` überschreibt ein belegtes Ziel
+      **nicht** (das wäre ein Cap-Verlust, den niemand angeordnet hat — wer räumen will, ruft
+      `CDELETE`); `SETRECV` legt den Empfangs-Slot **je PD** fest, und zwar beim **Empfänger**:
+      dürfte der Sender ihn wählen, könnte ein Server jeden Cap seines Clients verdrängen — eine
+      Schreiboperation in fremdes Eigentum, verkleidet als Antwort.
+      **Warum das Badge dazugehört und nicht Beiwerk ist:** `SYS_SIGNAL` verodert das Badge der
+      benutzten **Cap** in `pending`; das Nachrichtenwort spielt keine Rolle. Ohne badgbare Kopien
+      kann ein Programm dem Kernel genau **eine** Tatsache melden. Dasselbe gilt beim Weiterreichen,
+      deshalb hat `SYS_LOAD` jetzt ein Badge-Argument (`x4`). Erlaubt ist beides, weil der Aufrufer
+      das Objekt bereits besitzt — er vergibt ein Etikett auf eigener Autorität, er erwirbt keine.
+      **Nicht erledigt:** `SYS_LOAD` gibt weiterhin keine PdControl-Cap der neu erzeugten PD zurück
+      (s. A-2.1). Der wählbare Empfangs-Slot ist die Vorbedingung dafür; die Rückgabe selbst steht
+      noch aus.
 - [ ] **A-3.3 `ReplyFinal` vom Kernelstack lösen.** Hält heute ein `[(u32,u64); NOBJECTS]`-Array
       auf dem 2-KiB-Kernelstack; `NOBJECTS` hochzuziehen koppelt an die Stackgröße. Vorbedingung
       von A-3.4.

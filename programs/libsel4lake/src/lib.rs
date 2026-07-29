@@ -24,6 +24,10 @@ pub mod sys {
     pub const UNMAP: u64 = 11;
     pub const PDCTL: u64 = 12;
     pub const LOAD: u64 = 13;
+    pub const CDELETE: u64 = 14;
+    pub const CCOPY: u64 = 15;
+    pub const CMOVE: u64 = 16;
+    pub const SETRECV: u64 = 17;
 }
 
 /// Ergebniscodes (Register `x0` beim Austritt; Spiegel von `sel4lake_abi::result`).
@@ -39,6 +43,10 @@ pub mod result {
     pub const ERR_NOPD: u64 = 4;
     /// Antwort-seitiger Liveness-Fehler (Reply-Owner verschwunden).
     pub const ERR_SERVER_GONE: u64 = 5;
+    /// Am Cap hängen noch abgeleitete Kopien/Mints — er bleibt unverändert im Slot.
+    pub const ERR_HASCHILDREN: u64 = 6;
+    /// Kein Platz: Ziel-Slot belegt oder Cap-Budget der PD erschöpft.
+    pub const ERR_NOSPACE: u64 = 7;
 }
 
 /// Sub-Operationen für [`sys::PDCTL`] (Register `x2`; Spiegel von `sel4lake_abi::pdctl`).
@@ -59,7 +67,13 @@ pub struct Ret {
     pub tag: u64,
 }
 
-/// Roh-Syscall (`svc #0`). `cap` = lokaler Cap-Index der eigenen PD.
+/// Roh-Syscall. `cap` = lokaler Cap-Index der eigenen PD.
+///
+/// Die ABI ist auf beiden Architekturen **dieselbe** (`x0`=Nummer, `x1`=Cap, `x2..x5`=Nachricht,
+/// `x6`=Tag); nur die Träger unterscheiden sich: `svc #0` mit `x0..x6` auf aarch64, `int 0x80` mit
+/// `rax/rdi/rsi/rdx/r10/r8/r9` auf x86_64 (Abbildung: `sel4lake_hal::x86_64::exception::ABI_TO_GPR`).
+/// Deshalb sieht ein Programm oberhalb dieser Funktion keinen Unterschied.
+#[cfg(target_arch = "aarch64")]
 #[inline]
 pub fn invoke(nr: u64, cap: u64, msg: [u64; 4], tag: u64) -> Ret {
     let (r0, r1, r2, r3, r4, r5, r6);
@@ -81,7 +95,38 @@ pub fn invoke(nr: u64, cap: u64, msg: [u64; 4], tag: u64) -> Ret {
     Ret { result: r0, badge: r1, msg: [r2, r3, r4, r5], tag: r6 }
 }
 
-/// Notification (Cap `cap`) mit `badge` signalisieren (asynchron, nicht blockierend).
+/// Roh-Syscall (`int 0x80`) — x86_64. Siehe die aarch64-Fassung für die ABI.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn invoke(nr: u64, cap: u64, msg: [u64; 4], tag: u64) -> Ret {
+    let (r0, r1, r2, r3, r4, r5);
+    // SAFETY: `int 0x80` ist der für Ring 3 freigegebene Syscall-Vektor (IDT-Gate DPL 3). Der
+    // Kernel liest/schreibt ausschließlich die ABI-Register dieses Frames. `r9` (Tag) wird nur
+    // gelesen — der Kernel gibt den Antwort-Tag über denselben Weg zurück, aber `asm!` darf `r9`
+    // hier nicht als `inout` führen, weil `clobber_abi` es sonst doppelt beansprucht.
+    unsafe {
+        asm!(
+            "int 0x80",
+            inout("rax") nr => r0,
+            inout("rdi") cap => r1,
+            inout("rsi") msg[0] => r2,
+            inout("rdx") msg[1] => r3,
+            inout("r10") msg[2] => r4,
+            inout("r8")  msg[3] => r5,
+            in("r9") tag,
+            clobber_abi("sysv64"),
+        );
+    }
+    Ret { result: r0, badge: r1, msg: [r2, r3, r4, r5], tag: 0 }
+}
+
+/// Notification (Cap `cap`) signalisieren (asynchron, nicht blockierend).
+///
+/// **Achtung, das ist die haeufigste Fehlannahme an dieser ABI:** das Badge, das beim Empfaenger
+/// ankommt, ist eine Eigenschaft der **Capability**, nicht dieses Aufrufs. Der Kernel verodert das
+/// Badge der benutzten Cap in `pending`; `badge` hier wird **nicht** ausgewertet und bleibt nur als
+/// Dokumentation der Absicht stehen. Wer unterscheidbar signalisieren will, muss beim *Vergeben*
+/// unterschiedlich badgen (`SYS_LOAD` mit `badge != 0`, s. [`load`]).
 pub fn signal(cap: u64, badge: u64) {
     let _ = invoke(sys::SIGNAL, cap, [badge, 0, 0, 0], 0);
 }
@@ -115,8 +160,39 @@ pub fn pdctl(cap: u64, subop: u64) -> u64 {
 }
 /// Programm `index` laden (Loader-Cap `cap`, delegierter Cap-Slot `delegate`, `u64::MAX`=keiner);
 /// gibt den Ergebniscode zurück.
-pub fn load(cap: u64, index: u64, delegate: u64) -> u64 {
-    invoke(sys::LOAD, cap, [index, delegate, 0, 0], 0).result
+///
+/// `badge` versieht die **delegierte Kopie** mit einem eigenen Etikett (`0` = Badge des Originals
+/// erben). Das ist der Weg, die Signale mehrerer Kinder auseinanderzuhalten — s. [`signal`].
+pub fn load(cap: u64, index: u64, delegate: u64, badge: u64) -> u64 {
+    invoke(sys::LOAD, cap, [index, delegate, badge, 0], 0).result
+}
+/// **Einen Cap im eigenen Cspace löschen** (Slot `slot`); gibt den Ergebniscode zurück.
+///
+/// Braucht **kein** Cap: der eigene Cspace ist die Autorität. Ein langlebiger Dienst, der Caps per
+/// IPC empfängt, muss sie loswerden können — sonst läuft er gegen sein Cap-Budget, ohne dass ihm
+/// jemand etwas entzogen hätte. [`result::ERR_HASCHILDREN`] heißt: es hängen noch abgeleitete Caps
+/// daran, der Slot ist **unverändert**.
+pub fn cdelete(slot: u64) -> u64 {
+    invoke(sys::CDELETE, slot, [0; 4], 0).result
+}
+/// **Einen Cap im eigenen Cspace kopieren** (A-3.2): `src` → `dst` (muss frei sein), Rechte
+/// `rights` (1=R, 2=W, 4=X; wird mit den Rechten des Originals geschnitten), `badge` = Etikett der
+/// Kopie (`0` = Badge des Originals erben).
+///
+/// Bei Notifications/Endpoints ist das Badge der Weg, zwei **unterscheidbare** Kanäle auf dasselbe
+/// Objekt zu bekommen — s. [`signal`].
+pub fn ccopy(src: u64, dst: u64, rights: u64, badge: u64) -> u64 {
+    invoke(sys::CCOPY, src, [dst, rights, badge, 0], 0).result
+}
+/// **Einen Cap im eigenen Cspace verschieben** (A-3.2): `src` → `dst` (muss frei sein). Keine
+/// Ableitung — derselbe Cap, ein anderer Slot.
+pub fn cmove(src: u64, dst: u64) -> u64 {
+    invoke(sys::CMOVE, src, [dst, 0, 0, 0], 0).result
+}
+/// **Empfangs-Slot festlegen** (A-3.2): wo per IPC übertragene Caps landen. Der Empfänger
+/// entscheidet das, nicht der Sender.
+pub fn setrecv(slot: u64) -> u64 {
+    invoke(sys::SETRECV, slot, [0; 4], 0).result
 }
 /// Thread (Tcb-Cap `cap`) beenden; gibt den Ergebniscode zurück.
 pub fn kill(cap: u64) -> u64 {

@@ -17,6 +17,7 @@
 pub mod archive;
 pub mod cert;
 pub mod elf;
+pub mod manifest;
 
 /// Zieldomäne eines Programms (Manifest/Quellen-Feld). Bewusst kernel-agnostisch (u32); der
 /// Kernel-Glue bildet das auf `microkit::Domain` ab.
@@ -50,6 +51,10 @@ pub enum LoaderError {
     Unverified,
     /// Zertifikat-Parse-Fehler (falsche Länge/Magic/Formatversion) — siehe [`cert`].
     BadCert,
+    /// System-Manifest-Parse-Fehler (Magic/Formatversion/Eintragsbreite/-zahl, fehlende Signatur)
+    /// — siehe [`manifest`]. **Strukturell**, noch vor jeder Krypto: das Manifest ist die erste
+    /// Struktur, die der Kernel von außen anfasst.
+    BadManifest,
     /// Kernel-Ressourcen erschöpft (VSpace/ASID/RAM/TCB/PD) beim Laden.
     NoResources,
 }

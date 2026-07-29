@@ -40,6 +40,32 @@ pub mod sys {
     /// (`u64::MAX` = keiner). Rückgabe: `x0` = result, `x1` = neue PD-Id (bei OK). Der geladene
     /// Prozess erhält NUR die so explizit delegierten Caps (keine Sonderrechte über die Cap).
     pub const LOAD: u64 = 13;
+    /// **Einen Cap im eigenen Cspace löschen** (A-3.1). `x1` = lokaler Slot. Kein zusätzliches
+    /// Cap nötig — die Autorität ist der eigene Cspace: Autorität *abzugeben* darf nie an einer
+    /// Erlaubnis hängen.
+    ///
+    /// Ohne das kann ein langlebiger Dienst, der Caps per IPC empfängt, seine Slots nicht
+    /// freigeben und läuft gegen `CAP_BUDGET_PER_PD`. Mit dem Root-Task (A-2) wird aus dieser
+    /// ABI-Lücke ein Betriebsproblem: er ist genau so ein Dienst.
+    pub const CDELETE: u64 = 14;
+    /// **Einen Cap im eigenen Cspace kopieren** (A-3.2). `x1` = Quell-Slot, `x2` = Ziel-Slot
+    /// (muss frei sein), `x3` = gewünschte Rechte-Bitmaske (1=R, 2=W, 4=X), `x4` = Badge für die
+    /// Kopie (`0` = Badge des Originals erben). Die Kopie bekommt **höchstens** die Rechte des
+    /// Originals — eine Kopie darf nie mehr können als die Vorlage.
+    ///
+    /// Das Badge ist hier kein Beiwerk: bei Notifications und Endpoints steckt die Absender-
+    /// Kennung in der **Cap**, nicht in der Nachricht. Wer zwei unterscheidbare Kanäle auf
+    /// dasselbe Objekt braucht, badgt zwei Kopien — genau dafür ist die Operation da.
+    pub const CCOPY: u64 = 15;
+    /// **Einen Cap im eigenen Cspace verschieben** (A-3.2). `x1` = Quell-Slot, `x2` = Ziel-Slot
+    /// (muss frei sein). Erzeugt **keine** Ableitung: derselbe Cap, ein anderer Slot.
+    pub const CMOVE: u64 = 16;
+    /// **Den Empfangs-Slot für per IPC übertragene Caps festlegen** (A-3.2). `x1` = Slot.
+    ///
+    /// Der **Empfänger** bestimmt, wo eine gegrantete Cap landet — nicht der Sender. Ohne das
+    /// landete jeder Grant im festen [`GRANT_RECV_SLOT`], und ein Server konnte damit den Cap
+    /// verdrängen, den sein Client dort gerade hielt.
+    pub const SETRECV: u64 = 17;
 }
 
 /// Sub-Operationen für [`sys::PDCTL`] (Register `x2`). Jede ist auf den Besitz der
@@ -90,6 +116,11 @@ pub mod result {
     pub const ERR_RIGHTS: u64 = 3;
     /// Aufrufer gehört zu keiner Protection Domain.
     pub const ERR_NOPD: u64 = 4;
+    /// Operation auf einem Cap, von dem noch Kopien/Mints abgeleitet sind (CDT-Kinder). Der Cap
+    /// bleibt unverändert im Slot — ein halb entfernter Cap wäre schlimmer als gar keiner.
+    pub const ERR_HASCHILDREN: u64 = 6;
+    /// Kein Platz: der Ziel-Slot ist belegt, oder das Cap-Budget der PD ist erschöpft.
+    pub const ERR_NOSPACE: u64 = 7;
     /// **Antwort-seitiger Liveness-Fehler:** der Server, der eine Antwort schuldete
     /// (Reply-Owner), ist verschwunden (KILL/EXIT/Fault/Reload), bevor er antworten
     /// konnte. Der blockierte `CALL`-Aufrufer wird damit entblockt, statt dauerhaft zu

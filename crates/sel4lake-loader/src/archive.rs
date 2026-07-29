@@ -6,22 +6,31 @@
 //!
 //! ## Format
 //! ```text
-//! Header (32 B):  magic:u32  version:u32  count:u32  total_len:u32  reserved:[u32;4]
+//! Header (32 B):  magic:u32  version:u32  count:u32  total_len:u32
+//!                 sysman_off:u32  sysman_len:u32  reserved:[u32;2]
 //! Entry  (96 B):  name:[u8;16]
 //!                 program_id:u32  version:u32  domain:u32  flags:u32
 //!                 blob_off:u32  blob_len:u32  manifest_off:u32  manifest_len:u32
 //!                 hash:[u8;32]  cert_off:u32  cert_len:u32  reserved:[u32;2]
-//! ... danach die Blobs + Manifeste + Zertifikate (innerhalb total_len) ...
+//! ... danach die Blobs + Manifeste + Zertifikate + das System-Manifest (innerhalb total_len) ...
 //! ```
 //! Alle Offsets sind relativ zum Archiv-Anfang; alle Zugriffe sind bounds-geprüft. `cert_len==0`
 //! (ext-28) bedeutet „kein Zertifikat" (nur für TrustedSAS erforderlich).
+//!
+//! ## Das System-Manifest (A-1, Format v3)
+//!
+//! `sysman_off`/`sysman_len` zeigen auf das **eine** Autoritätsdokument des Boot-Images
+//! ([`crate::manifest`]). Es liegt bewusst *im* Archiv, nicht daneben: das Boot-Image soll aus
+//! genau zwei Dingen bestehen (Kernel + eine Datei), und eine zweite Datei wäre eine zweite
+//! Stelle, an der jemand etwas austauschen kann. `sysman_len == 0` heißt „kein Manifest" — dann
+//! lädt der Kernel nichts von sich aus (er weiß dann nicht, wer welche Autorität bekäme).
 
 use crate::{slice_within, LoaderError, Program};
 
 /// Archiv-Magic ("SLKA" ~ SeL4Lake-Archiv), Little-Endian im Header-Wort.
 pub const MAGIC: u32 = 0x534C_4B41;
-/// Aktuelle Archiv-Format-Version (ext-28: `reserved[0..1]` → `cert_off`/`cert_len`).
-pub const VERSION: u32 = 2;
+/// Aktuelle Archiv-Format-Version (v3: `reserved[0..1]` → `sysman_off`/`sysman_len`).
+pub const VERSION: u32 = 3;
 
 const HEADER_LEN: usize = 32;
 const ENTRY_LEN: usize = 96;
@@ -36,6 +45,7 @@ fn rd_u32(d: &[u8], off: usize) -> Option<u32> {
 pub struct Archive<'a> {
     data: &'a [u8],
     count: usize,
+    sysman: &'a [u8],
 }
 
 impl<'a> Archive<'a> {
@@ -63,7 +73,13 @@ impl<'a> Archive<'a> {
         if table_end > total_len {
             return Err(LoaderError::BadCount);
         }
-        let a = Archive { data: &data[..total_len], count };
+        // Das System-Manifest liegt wie jede andere Nutzlast im Archiv und wird genauso
+        // bounds-geprüft — es ist an dieser Stelle nur ein Byte-Bereich, kein Autoritätsdokument.
+        let body = &data[..total_len];
+        let sysman_off = rd_u32(data, 16).ok_or(LoaderError::TooSmall)? as usize;
+        let sysman_len = rd_u32(data, 20).ok_or(LoaderError::TooSmall)? as usize;
+        let sysman = slice_within(body, sysman_off, sysman_len)?;
+        let a = Archive { data: body, count, sysman };
         // Alle Einträge eifrig validieren, damit `program()` später garantiert gültige Slices liefert.
         for i in 0..count {
             a.parse_program(i)?;
@@ -74,6 +90,12 @@ impl<'a> Archive<'a> {
     /// Anzahl der Programme.
     pub fn count(&self) -> usize {
         self.count
+    }
+
+    /// Die Roh-Bytes des System-Manifests (leer = keines). **Ungeprüft** — Parsen und
+    /// Signaturprüfung macht [`crate::manifest`] bzw. der Kernel-Verifier.
+    pub fn system_manifest(&self) -> &'a [u8] {
+        self.sysman
     }
 
     fn parse_program(&self, i: usize) -> Result<Program<'a>, LoaderError> {
@@ -188,6 +210,28 @@ mod tests {
         assert_eq!(p1.elf, b"BLOB2");
         assert_eq!(p1.manifest, b"");
         assert_eq!(a.iter().count(), 2);
+    }
+
+    #[test]
+    fn system_manifest_absent_by_default() {
+        let raw = build(&[(1, "x", 1, DOMAIN_TRUSTED, b"z", b"")]);
+        assert!(Archive::parse(&raw).unwrap().system_manifest().is_empty());
+    }
+
+    #[test]
+    fn system_manifest_span_is_bounds_checked() {
+        let raw = build(&[(1, "x", 1, DOMAIN_TRUSTED, b"abcd", b"")]);
+        // Auf den Blob zeigen lassen: `blob_off` steht bei HEADER+32 des ersten Eintrags.
+        let bo = u32::from_le_bytes(raw[HEADER_LEN + 32..HEADER_LEN + 36].try_into().unwrap());
+        let mut ok = raw.clone();
+        ok[16..20].copy_from_slice(&bo.to_le_bytes());
+        ok[20..24].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(Archive::parse(&ok).unwrap().system_manifest(), b"abcd");
+        // Ausserhalb -> das ganze Archiv wird abgelehnt, nicht bloss das Manifest ignoriert.
+        let mut bad = raw.clone();
+        bad[16..20].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+        bad[20..24].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(Archive::parse(&bad).unwrap_err(), LoaderError::OutOfBounds);
     }
 
     #[test]

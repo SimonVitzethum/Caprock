@@ -9,10 +9,13 @@
 # numerische program_id + version (Verfeinerung 4).
 #
 # Aufruf:
-#   mkarchive.py OUT ID:NAME:DOMAIN:VERSION:BLOB[:MANIFEST[:CERT]] [ ... ]
+#   mkarchive.py OUT [--system-manifest FILE] ID:NAME:DOMAIN:VERSION:BLOB[:MANIFEST[:CERT]] [ ... ]
 #   DOMAIN: 0=TrustedSAS 1=HardwareLand 2=UserLand
 #   CERT (ext-28): TrustedSAS-Zertifikat (tools/sign_trusted.py). Leeres Feld = kein Zertifikat;
 #   nur TrustedSAS-Module brauchen eines (das verify_image-Gate lehnt unzertifiziertes TrustedSAS ab).
+#   --system-manifest (A-1): das EINE signierte Autoritaetsdokument (tools/sign_manifest.py). Es
+#   liegt IM Archiv, nicht daneben -- das Boot-Image soll aus genau zwei Dingen bestehen (Kernel +
+#   eine Datei), und eine zweite Datei waere eine zweite Stelle zum Austauschen.
 # Beispiel:
 #   mkarchive.py build/boot-archive.bin 1:hello:2:1:build/hello.elf:build/hello.manifest
 #   mkarchive.py build/boot-archive.bin 12:svc:0:1:build/svc.elf::certs/svc.cert   # Cert, kein Manifest
@@ -20,17 +23,35 @@ import struct
 import sys
 
 MAGIC = 0x534C4B41
-VERSION = 2  # ext-28: Entry-reserved[0..1] -> cert_off/cert_len (0 = kein Zertifikat)
+# v2 (ext-28): Entry-reserved[0..1] -> cert_off/cert_len.
+# v3 (A-1):    Header-reserved[0..1] -> sysman_off/sysman_len (0 = kein System-Manifest).
+VERSION = 3
 HEADER_LEN = 32
 ENTRY_LEN = 96
 
 
 def main(argv):
     if len(argv) < 2:
-        sys.stderr.write("usage: mkarchive.py OUT ID:NAME:DOMAIN:VERSION:BLOB[:MANIFEST] ...\n")
+        sys.stderr.write(
+            "usage: mkarchive.py OUT [--system-manifest FILE] ID:NAME:DOMAIN:VERSION:BLOB[:MANIFEST[:CERT]] ...\n"
+        )
         return 2
     out = argv[1]
-    specs = argv[2:]
+    rest = argv[2:]
+    sysman = b""
+    specs = []
+    i = 0
+    while i < len(rest):
+        if rest[i] == "--system-manifest":
+            if i + 1 >= len(rest):
+                sys.stderr.write("mkarchive: --system-manifest ohne Dateiname\n")
+                return 2
+            with open(rest[i + 1], "rb") as f:
+                sysman = f.read()
+            i += 2
+            continue
+        specs.append(rest[i])
+        i += 1
     entries = []  # (program_id, name, version, domain, blob, manifest, cert)
     for s in specs:
         parts = s.split(":")
@@ -64,10 +85,14 @@ def main(argv):
         co = table_end + len(payload)
         payload += cert
         spans.append((bo, len(blob), mo, len(man), co, len(cert)))
+    # Das System-Manifest zuletzt anhaengen (Lage ist beliebig; der Parser prueft nur die Grenzen).
+    sysman_off = table_end + len(payload) if sysman else 0
+    payload += sysman
     total = table_end + len(payload)
 
     buf = bytearray(table_end)
-    struct.pack_into("<IIII", buf, 0, MAGIC, VERSION, count, total)  # reserved[4] bleibt 0
+    struct.pack_into("<IIII", buf, 0, MAGIC, VERSION, count, total)
+    struct.pack_into("<II", buf, 16, sysman_off, len(sysman))  # reserved[2..3] bleibt 0
     for i, ((pid, name, ver, domain, _, _, _), (bo, bl, mo, ml, co, cl)) in enumerate(zip(entries, spans)):
         base = HEADER_LEN + i * ENTRY_LEN
         nb = name.encode()[:16]
@@ -82,7 +107,11 @@ def main(argv):
 
     with open(out, "wb") as f:
         f.write(buf)
-    sys.stderr.write(f"mkarchive: {out} ({count} Modul(e), {total} Bytes)\n")
+    sys.stderr.write(
+        f"mkarchive: {out} ({count} Modul(e), {total} Bytes, "
+        + (f"System-Manifest {len(sysman)} B @ {sysman_off}" if sysman else "OHNE System-Manifest")
+        + ")\n"
+    )
     return 0
 
 

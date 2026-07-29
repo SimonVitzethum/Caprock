@@ -259,8 +259,8 @@ fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
 /// `None`), statt etwas Halbes zu laden.
 use crate::loader::load_by_index;
 
-fn dispatch_delete_cap(cap: sel4lake_cap::CapPtr) {
-    let _ = cap_delete(cap);
+fn dispatch_delete_cap(cap: sel4lake_cap::CapPtr) -> bool {
+    cap_delete(cap).is_ok()
 }
 
 fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
@@ -973,6 +973,26 @@ pub fn create_notification() -> Option<usize> {
 }
 pub fn install_notification_cap(ntfn: u32, rights: Rights) -> Result<CapPtr, CapError> {
     CAPS.write().cspace.install_notification(ntfn, rights)
+}
+
+/// Wie [`install_notification_cap`], aber mit einem **Badge** (A-2.1).
+///
+/// Das Badge einer Notification ist eine Eigenschaft der **Cap**, nicht der Nachricht:
+/// `SYS_SIGNAL` verodert das Badge des benutzten Caps in `pending`, das `x2`-Wort des Aufrufs
+/// spielt keine Rolle. Wer also unterscheiden will, *wer* signalisiert hat, muss beim Vergeben
+/// unterschiedlich badgen — hier beim Endowment, und beim Weiterreichen in `SYS_LOAD`.
+///
+/// Zurück kommt die **geminzte** Cap; die ungebadgete bleibt als CDT-Eltern beim Kernel (sie zu
+/// löschen ginge ohnehin nicht, solange ein Kind existiert, und sie ist die Wurzel, über die eine
+/// spätere Rücknahme läuft).
+pub fn install_notification_cap_badged(
+    ntfn: u32,
+    rights: Rights,
+    badge: u64,
+) -> Result<CapPtr, CapError> {
+    let mut g = CAPS.write();
+    let root = g.cspace.install_notification(ntfn, rights)?;
+    g.cspace.mint(root, rights, badge)
 }
 
 // --- Threads / Protection Domains ---
@@ -1779,9 +1799,20 @@ pub fn spawn_isolated_native(code: *const u8, code_len: usize, prio: u8) -> Opti
     }
 }
 
-/// **Stack-VA-Fenster** geladener Programme (fest, in GiB 1, getrennt von der Code-Link-VA
-/// `0x4100_0000`) + Größe. Der Stack wird **nicht-identity** an diese VA gemappt.
+/// **Stack-VA-Fenster** geladener Programme (fest, getrennt von der Code-Link-VA) + Größe. Der
+/// Stack wird **nicht-identity** an diese VA gemappt.
+///
+/// Die Adresse ist architekturabhängig, weil das mappbare VA-Fenster einer isolierten VSpace es
+/// ist. Auf aarch64 liegt es in GiB 1 (Code bei `0x4100_0000`, Stack darüber). Auf x86 hat eine
+/// isolierte VSpace ihr eigenes Page Directory **nur für GiB 0**; GiB 1..3 teilen sich alle
+/// isolierten Adressräume statisch, und `vspace_map_page_at` weist deshalb jede VA ≥ 1 GiB ab.
+/// Der aarch64-Wert wäre dort schlicht nicht mappbar — der Ladepfad schlüge beim Stack fehl, und
+/// zwar erst nach dem Kopieren aller Segmente.
+#[cfg(target_arch = "aarch64")]
 const LOADED_STACK_VA: u64 = 0x43F0_0000;
+/// x86: knapp unter der 1-GiB-Grenze, weit über der Code-Link-VA `0x2000_0000` (`user-x86.ld`).
+#[cfg(not(target_arch = "aarch64"))]
+const LOADED_STACK_VA: u64 = 0x3FF0_0000;
 const LOADED_STACK_BYTES: u64 = 0x4000; // 16 KiB
 
 /// `src` (filesz Bytes) nach `dst_phys` kopieren + `[src.len(), total)` nullen (`.bss` + Padding).
@@ -1861,7 +1892,12 @@ fn loaded_free(asid: u16) {
 /// Loader UserLand (`load_elf`) wie HardwareLand-Backends (vor-erstellt) bedienen. Der Aufbau ab
 /// dem Spawn läuft **IRQ-maskiert** (der Thread startet nicht vor Bindung + Endowment). Gibt die
 /// `ThreadId`. Bei Fehler wird `pd` NICHT abgebaut (gehört dem Aufrufer).
-pub fn load_into_pd(img: &ElfImage, pd: usize, endow: &[(usize, CapPtr)]) -> Option<ThreadId> {
+pub fn load_into_pd(
+    img: &ElfImage,
+    pd: usize,
+    endow: &[(usize, CapPtr)],
+    boot_arg: usize,
+) -> Option<ThreadId> {
     let core = hal::cpu::core_id();
     let kbase = claim_user_kstack()?; // EL0-Kernel-Stack aus MEM (16 KiB, ausgerichtet)
     let Some((asid, l1)) = create_vspace() else {
@@ -1965,7 +2001,7 @@ pub fn load_into_pd(img: &ElfImage, pd: usize, endow: &[(usize, CapPtr)]) -> Opt
         let r = sched.spawn_user_at(
             core,
             img.entry() as usize,
-            0,
+            boot_arg,
             kbase,
             USER_KSTACK_SIZE,
             (LOADED_STACK_VA + LOADED_STACK_BYTES) as usize, // EL0-SP (virtuell)
@@ -2004,9 +2040,14 @@ pub fn load_into_pd(img: &ElfImage, pd: usize, endow: &[(usize, CapPtr)]) -> Opt
 /// Wie [`load_into_pd`], aber **erzeugt** eine frische PD in `domain` (UserLand). Der bequeme Pfad
 /// für UserLand-Programme (`SYS_LOAD`, In-Kernel-Tests). HardwareLand-Backends werden vom Aufrufer
 /// vor-erstellt (Partner-Bindung + Kanal) und über [`load_into_pd`] geladen. Gibt `(ThreadId, pd)`.
-pub fn load_elf(img: &ElfImage, domain: Domain, endow: &[(usize, CapPtr)]) -> Option<(ThreadId, usize)> {
+pub fn load_elf(
+    img: &ElfImage,
+    domain: Domain,
+    endow: &[(usize, CapPtr)],
+    boot_arg: usize,
+) -> Option<(ThreadId, usize)> {
     let pd = create_pd_in_domain(domain)?;
-    match load_into_pd(img, pd, endow) {
+    match load_into_pd(img, pd, endow, boot_arg) {
         Some(tid) => Some((tid, pd)),
         None => {
             // load_into_pd baut `pd` bei Fehler bewusst NICHT ab (gehört dem Aufrufer) -> hier

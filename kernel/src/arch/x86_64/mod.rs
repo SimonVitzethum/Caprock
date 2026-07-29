@@ -125,8 +125,23 @@ long_mode:
 2:  hlt
     jmp 2b
 
-/* ---- 64-bit-GDT: null, 64-bit-Code (L), Data ---- */
-.section .rodata
+/* ---- 64-bit-GDT: null, 64-bit-Code (L), Data ----
+   BESCHREIBBAR (`.data`), nicht `.rodata`, und das ist kein Stilfrage:
+
+   Die CPU schreibt beim Laden eines Segmentregisters das Accessed-Bit IN den Deskriptor.
+   `retf` mit CS=0x08 und die `mov ds/es/ss/fs/gs` unten machen aus 0x9A also 0x9B und aus
+   0x92 ein 0x93 -- ein Hardware-Schreibzugriff auf diese acht Bytes.
+
+   Solange das vor `mmu::init_primary` passiert (Boot-Tabellen: alles RW, CR0.WP aus), faellt
+   das nicht auf. Wuerde die GDT spaeter noch einmal geladen, traefe derselbe Schreibzugriff
+   eine Ro-Seite mit CR0.WP=1 -> #PF im Boot-Pfad, an einer Stelle, an der niemand einen
+   Schreibzugriff vermutet.
+
+   Zweitens -- und deshalb ist es hier aufgefallen -- bricht es die Zusage, auf der A-1.3
+   beruht: `[__text_start, __rodata_end)` soll zur Laufzeit unveraenderlich sein, damit der
+   Kernel seinen eigenen Code-Hash reproduzieren kann. Ein Accessed-Bit mitten in `.rodata`
+   machte den Hash lauffremd, und das Manifest liess sich an keinen Kernel binden. */
+.section .data.gdt64, "aw"
 .align 8
 gdt64:
     .quad 0x0000000000000000

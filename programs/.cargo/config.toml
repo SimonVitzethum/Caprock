@@ -22,3 +22,13 @@ rustflags = [
     # passend zur 4-KiB-Mapping-Granularität des Loaders.
     "-C", "link-arg=-zmax-page-size=4096",
 ]
+
+# x86_64 (A-1.5). Bauen: `cd programs && cargo build --release --target x86_64-sel4lake-user.json`
+# — das `[build] target` oben bleibt die Vorgabe, `--target` schlägt sie.
+[target.x86_64-sel4lake-user]
+rustflags = [
+    # Eigenes Linker-Skript: festgelinkt an 0x2000_0000 (das x86-VSpace-Fenster für isolierte PDs
+    # reicht nur bis 1 GiB — Begründung steht in `user-x86.ld`).
+    "-C", "link-arg=-Tuser-x86.ld",
+    "-C", "link-arg=-zmax-page-size=4096",
+]

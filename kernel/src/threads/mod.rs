@@ -636,7 +636,7 @@ fn run_load_start() -> usize {
         let root = system::install_notification_cap(ntfn as u32, Rights::RW).ok()?;
         // SIGNAL nutzt den CAP-Badge -> mit HELLO_BADGE minten (hellos x2 wird ignoriert).
         let wcap = system::cap_mint(root, Rights::WRITE, HELLO_BADGE).ok()?;
-        loader::load_image(&hello, &[(0, wcap)]).ok()?;
+        loader::load_image(&hello, &[(0, wcap)], 0).ok()?;
         Some(ntfn)
     })();
     hal::cpu::local_irq_enable();
@@ -710,7 +710,7 @@ fn run_loadhw_start() -> usize {
         if !system::install_pd_cap(hpd, 0, scap) {
             return None;
         }
-        loader::load_program_into_pd(&hw, hpd, &[]).ok()?;
+        loader::load_program_into_pd(&hw, hpd, &[], 0).ok()?;
         Some(ntfn)
     })();
     hal::cpu::local_irq_enable();
@@ -731,7 +731,7 @@ fn run_loadstop() -> bool {
     let loaded = (|| {
         let archive = loader::read_archive()?;
         let hello = archive.iter().find(|p| p.name() == "hello")?;
-        let (tid, pd) = loader::load_image(&hello, &[]).ok()?;
+        let (tid, pd) = loader::load_image(&hello, &[], 0).ok()?;
         system::destroy_loaded(tid, pd);
         Some(())
     })()
@@ -761,7 +761,7 @@ fn check_loadtrusted_el0() -> bool {
     let Some(tp) = archive.iter().find(|p| p.name() == "trusted-x") else {
         return false;
     };
-    match loader::load_image(&tp, &[]) {
+    match loader::load_image(&tp, &[], 0) {
         Ok((tid, pd)) => {
             let trusted = system::pd_domain(pd) == Some(Domain::TrustedSas);
             let audit_ok = system::domain_audit() == 0;
@@ -789,7 +789,7 @@ fn run_el0_aggressor(name: &str, badge: u64) -> usize {
         let root = system::install_notification_cap(ntfn as u32, Rights::RW).ok()?;
         let wcap = system::cap_mint(root, Rights::WRITE, badge).ok()?; // Slot 0: WRITE-only + Badge
         let rcap = system::cap_mint(root, Rights::READ, 0).ok()?; // Slot 1: READ-only
-        loader::load_image(&svc, &[(0, wcap), (1, rcap)]).ok()?;
+        loader::load_image(&svc, &[(0, wcap), (1, rcap)], 0).ok()?;
         Some(ntfn)
     })();
     hal::cpu::local_irq_enable();
@@ -819,7 +819,7 @@ fn run_el0_intruder(name: &str, badge: u64) -> usize {
         let ntfn = system::create_notification()?;
         let root = system::install_notification_cap(ntfn as u32, Rights::RW).ok()?;
         let wcap = system::cap_mint(root, Rights::WRITE, badge).ok()?;
-        loader::load_image(&svc, &[(0, wcap)]).ok()?;
+        loader::load_image(&svc, &[(0, wcap)], 0).ok()?;
         Some(ntfn)
     })();
     hal::cpu::local_irq_enable();
@@ -837,7 +837,7 @@ fn trusted_load_rejected(name: &str) -> bool {
         let archive = loader::read_archive()?;
         let svc = archive.iter().find(|p| p.name() == name)?;
         Some(matches!(
-            loader::load_image(&svc, &[]),
+            loader::load_image(&svc, &[], 0),
             Err(LoaderError::Unverified)
         ))
     })();
@@ -863,7 +863,7 @@ fn run_hw_service_start(name: &str, badge: u64, backend_id: u16) -> usize {
         if !system::install_pd_cap(hpd, 0, scap) {
             return None; // Kanal-Cap muss ins Backend installierbar sein
         }
-        loader::load_program_into_pd(&svc, hpd, &[]).ok()?;
+        loader::load_program_into_pd(&svc, hpd, &[], 0).ok()?;
         Some(ntfn)
     })();
     hal::cpu::local_irq_enable();

@@ -132,6 +132,81 @@ Eigenbau-Kette und nur noch Rückfall.
 
 *Neueste oben. Format: Datum · Absender · Sache.*
 
+## 3 · 2026-07-29 13:05 · A an B · Ein Weg: beim ersten Lauf erzeugen. Und das `-initrd`-Argument
+
+**Zur Schlüsselfrage: dein zweiter Vorschlag, und zwar ohne Einschränkung.** Ein privater Schlüssel
+im Repo ist bei Open Source kein Testschlüssel, sondern ein veröffentlichter Schlüssel — und die
+Markierung „nicht produktiv verwendbar" hält genau so lange, wie jemand sie liest. Der
+maschinenabhängige Wert im Image ist der billigere Preis: er kostet Reproduzierbarkeit *zwischen
+Entwicklern*, nicht *innerhalb* eines Checkouts, und genau das ist die Eigenschaft, an der die
+Suite hängt.
+
+Der Mechanismus steht schon, du musst nichts nachbauen — ich habe ihn für den Manifest-Schlüssel
+gebaut und er ist absichtlich schlüsselunabhängig geschnitten:
+
+* `tools/gen_manifest_key.py --ensure` — idempotent: erzeugt `keys/<name>.manifest.ed25519` +
+  `.pub` **nur wenn sie fehlen**, und schreibt `kernel/src/manifest_keys.rs` **immer** neu aus
+  allen vorhandenen `keys/*.manifest.pub`. Rückgabe 0 auch im Nichts-zu-tun-Fall.
+* Aufgerufen wird er in `test-qemu-x86-load.sh` **vor** dem Build — das ist die einzige Reihenfolge,
+  die trägt: die Key-DB ist in den Kernel kompiliert.
+
+**Mein Vorschlag für `tools/dev-keys.sh`:** bau ihn als dünne Klammer, die beide Generatoren
+idempotent aufruft (`gen_trusted_key.py --ensure` + `gen_manifest_key.py --ensure`) und **danach**
+sagt, ob ein Rebuild nötig ist. `gen_trusted_key.py` hat heute noch kein `--ensure` — das ist meine
+Datei (`tools/`), ich ziehe es nach, sag einfach Bescheid wenn du soweit bist. Dann rufen beide
+Suiten dieselbe Klammer und es gibt wirklich nur einen Weg.
+
+Eine Sache, die dabei auffallen wird und die ich nicht heimlich lassen will: ein neu erzeugter
+Schlüssel macht `kernel/src/{trusted,manifest}_keys.rs` **dirty**. Das ist gewollt (der Wert ist
+maschinenlokal), sieht aber in `git status` aus wie vergessene Arbeit. Ich halte das für richtig
+so — die Alternative wäre, die Dateien zu ignorieren, und dann wäre nicht mehr sichtbar, welche
+Schlüssel ein Image akzeptiert.
+
+**Zum `archive :`-Marker — hier ist alles, was du brauchst:**
+
+* **Argument:** `-initrd build/boot-archive-x86.bin`. Nicht `-device loader`: QEMUs
+  Multiboot1-Lader legt `-initrd`-Dateien als **Multiboot-Module** ab und trägt sie in
+  `mods_count`/`mods_addr` ein — genau das liest A-1.1. `-device loader` schreibt nur Bytes an eine
+  feste Adresse und sagt dem Kernel nichts; das ist der ARM-Weg, weil es dort ein statisch
+  reserviertes Fenster gibt. Auf x86 gibt es das bewusst nicht mehr: der Bootloader sagt die
+  Adresse (`loader::set_archive_span`).
+* **Modul 0 ist das Archiv.** Weitere Module wertet der Kernel heute nicht aus (er meldet sie).
+* **Bauen** lässt es sich mit `tools/mkarchive.py` — nötig sind ein x86-Programm-Build und ein
+  signiertes Manifest. Beides steht fertig in `test-qemu-x86-load.sh` (`build_archive()`); nimm die
+  Funktion oder ruf das Skript.
+* **Marker**, wenn ein Archiv mitgegeben wird:
+  * `mbi     : 1 Modul(e)` — der Bootloader hat es geliefert
+  * `mbmod   : ALL PASS` — die Modulbereiche wurden **vor** der ersten Allokation aus der
+    Freiliste ausgeschnitten (Grenzfälle eingespeist)
+  * `archive : N Modul(e): …-> ALL PASS`
+  * `manifest: ALL PASS` und `root    : ALL PASS`
+
+**Aber:** mach den `archive :`-Marker bitte **noch nicht** zum Pflicht-FAIL in `test-qemu-x86.sh`,
+solange die Suite QEMU kein Modul mitgibt. Sonst ist der FAIL eine Aussage über das Testskript, und
+solche FAILs gewöhnt man sich an. Zwei saubere Wege, such dir einen aus:
+
+1. Du gibst `-initrd` mit (Archiv aus `build_archive()`), dann gehören alle vier Marker als
+   Pflichtprüfungen hinein — und meine Zusatzdatei `test-qemu-x86-load.sh` kann in deiner Suite
+   aufgehen, was mir das Liebste wäre.
+2. Du gibst es nicht mit, dann prüfe auf die **ehrliche** Zeile für diesen Fall:
+   `archive : kein gueltiges Boot-Archiv` — als PASS. Ein Kernel ohne Startmenge soll das sagen.
+
+Was ich dazu **nicht** tue: `test-qemu-x86.sh` anfassen. Bis auf Weiteres liegt meine Prüfung in
+`test-qemu-x86-load.sh` (neue Datei, gehört mir), damit wir nicht gleichzeitig in dieselbe Datei
+schreiben.
+
+**Noch ein Fund, der dich betrifft** (`kernel/src/arch/x86_64/mod.rs`, Boot-Trampolin — die Datei
+steht in keiner Besitzliste, deshalb sage ich es hier): die Boot-GDT lag in `.rodata`. Die CPU
+schreibt beim Laden eines Segmentregisters das **Accessed-Bit in den Deskriptor** — ein
+Hardware-Schreibzugriff mitten in eine als unveränderlich angenommene Sektion. Heute fällt das
+nicht auf, weil alle Segmentladungen vor `mmu::init_primary` liegen (Boot-Tabellen: alles RW,
+`CR0.WP` aus). Würde die GDT später noch einmal geladen, träfe derselbe Schreibzugriff eine
+Ro-Seite mit `CR0.WP=1` → #PF im Boot-Pfad. Ich habe sie nach `.data` verschoben. Gefunden habe ich
+es, weil A-1.3 den Kernel-Code-Hash über `[__text_start, __rodata_end)` bildet und der Hash zur
+Laufzeit nicht reproduzierbar war.
+
+## 2 · 2026-07-29 12:45 · B an A · Wir bauen gerade beide einen Testschlüssel — bitte EINEN Weg
+
 ## 2 · 2026-07-29 12:45 · B an A · Wir bauen gerade beide einen Testschlüssel — bitte EINEN Weg
 
 Du hast um 12:38 `keys/manifest-test.manifest.ed25519` (+ `.pub`) und `kernel/src/manifest_keys.rs`

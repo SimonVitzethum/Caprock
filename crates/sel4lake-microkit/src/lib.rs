@@ -305,6 +305,14 @@ struct Pd {
     /// Das Backend darf NUR über diesen Kanal kommunizieren. `u32::MAX` = keiner.
     chan_ep: u32,
     chan_ntfn: u32,
+    /// **Empfangs-Slot für per IPC übertragene Caps** (A-3.2). Der Empfänger legt fest, wo eine
+    /// gegrantete Cap landet — nicht der Sender. Voreinstellung ist der frühere feste Slot
+    /// ([`sel4lake_abi::GRANT_RECV_SLOT`]), damit bestehende Programme unverändert laufen.
+    ///
+    /// Warum der Empfänger und nicht der Sender: der Sender kennt den Cspace des Empfängers
+    /// nicht. Dürfte er den Slot wählen, könnte ein Server jeden Cap seines Clients verdrängen —
+    /// eine Schreiboperation in fremdes Eigentum, verkleidet als Antwort.
+    recv_slot: usize,
 }
 
 impl Pd {
@@ -317,6 +325,7 @@ impl Pd {
         backend_id: 0,
         chan_ep: u32::MAX,
         chan_ntfn: u32::MAX,
+        recv_slot: sel4lake_abi::GRANT_RECV_SLOT,
     };
 }
 
@@ -477,6 +486,30 @@ impl PdTable {
     }
 
     /// Einen Cap-Slot einer PD leeren (Autorität entziehen — Hot-Reload).
+    /// Den **Empfangs-Slot** einer PD setzen (A-3.2). `false`, wenn PD oder Slot ungültig sind.
+    pub fn set_recv_slot(&mut self, pd: usize, slot: usize) -> bool {
+        if pd < NPDS && self.pds[pd].used && slot < NCAPS {
+            self.pds[pd].recv_slot = slot;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Der Empfangs-Slot einer PD (Vorgabe: [`sel4lake_abi::GRANT_RECV_SLOT`]).
+    pub fn recv_slot(&self, pd: usize) -> usize {
+        if pd < NPDS && self.pds[pd].used {
+            self.pds[pd].recv_slot
+        } else {
+            sel4lake_abi::GRANT_RECV_SLOT
+        }
+    }
+
+    /// Anzahl der Cap-Slots je PD-Cspace (Adressraum der lokalen Slot-Indizes).
+    pub const fn caps_per_pd() -> usize {
+        NCAPS
+    }
+
     pub fn clear_cap(&mut self, pd: usize, slot: usize) {
         if pd < NPDS && slot < NCAPS {
             self.pds[pd].cspace[slot] = None;
@@ -541,8 +574,11 @@ pub fn dispatch(
     load: fn(u32, &[(usize, CapPtr)]) -> Option<usize>,
     // Cap löschen (Finalisierung inkl. Speicherfreigabe/Call-Abbruch) — der Kernel sperrt darin
     // selbst `CAPS`+`MEM` und bricht finalisierte Reply-Calls ab. Nur zu rufen, wenn hier KEIN
-    // Lock mehr gehalten wird. Wird für die beim Grant verdrängte Cap gebraucht (s. `grant_cap`).
-    delete_cap: fn(CapPtr),
+    // Lock mehr gehalten wird. Wird für die beim Grant verdrängte Cap gebraucht (s. `grant_cap`)
+    // und für `SYS_CDELETE`. **Rückgabe:** ob gelöscht wurde — `false` heißt, dass noch abgeleitete
+    // Caps (CDT-Kinder) daran hängen. Für den Grant-Pfad ist das nur Telemetrie, für `CDELETE` die
+    // Bedingung, unter der der Slot überhaupt geräumt werden darf.
+    delete_cap: fn(CapPtr) -> bool,
 ) -> usize {
     let nr = frame_reg(frame, reg::SYSNO_RESULT);
     if nr == sys::YIELD {
@@ -562,6 +598,135 @@ pub fn dispatch(
         frame_set_reg(frame, reg::SYSNO_RESULT, code);
         frame
     };
+
+    // `CDELETE` **vor** der generischen Cap-Auflösung (A-3.1): die Operation braucht den rohen
+    // `CapPtr` und interessiert sich weder für Objektart noch für Rechte. Das ist kein Schlupfloch
+    // — der Slot gehört dem Aufrufer, und **Autorität abzugeben darf nie an einer Erlaubnis
+    // hängen**. Ein Dienst, der seine empfangenen Caps nicht loswird, läuft sonst gegen
+    // `CAP_BUDGET_PER_PD` und ist irgendwann handlungsunfähig, ohne dass jemand ihm etwas
+    // entzogen hätte.
+    if nr == sys::CDELETE {
+        let thread = ops.current_id(core);
+        let slot = frame_reg(frame, reg::EP_BADGE) as usize;
+        // Reihenfolge: Slot **räumen**, dann löschen, bei Misserfolg zurücklegen.
+        //
+        // Andersherum (erst löschen, dann räumen) gäbe es ein Fenster, in dem der Slot auf ein
+        // bereits finalisiertes Objekt zeigt — und die Finalisierung gibt Speicher frei und bricht
+        // Calls ab, sie darf also nicht unter gehaltenem `CAPS` laufen. Die hier gewählte Richtung
+        // hat nur ein Fenster, in dem der Slot leer ist, und in dem kann ihn niemand benutzen: der
+        // einzige Thread, der ihn benutzen könnte, führt gerade diesen Syscall aus.
+        let removed = {
+            let mut g = caps.write();
+            let Some(pd) = g.pds.pd_of(thread) else {
+                return deny(result::ERR_NOPD);
+            };
+            let Some(cap) = g.pds.cap_at(pd, slot) else {
+                return deny(result::ERR_BADCAP);
+            };
+            g.pds.clear_cap(pd, slot);
+            (pd, cap)
+        }; // CAPS freigegeben — `delete_cap` sperrt CAPS/MEM/SCHEDS selbst
+        let (pd, cap) = removed;
+        if !delete_cap(cap) {
+            // Abgeleitete Caps hängen noch daran: unverändert zurücklegen. Ein „halb gelöschter"
+            // Cap (aus dem Cspace entfernt, im CapSpace noch da) wäre für den Aufrufer unerreichbar
+            // und für den Kernel weiterhin belegt — genau das Leck, gegen das CDELETE antritt.
+            caps.write().pds.install_cap(pd, slot, cap);
+            return deny(result::ERR_HASCHILDREN);
+        }
+        frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
+        return frame;
+    }
+
+    // `CCOPY`/`CMOVE`/`SETRECV` (A-3.2) — wie `CDELETE` vor der generischen Auflösung: sie
+    // arbeiten auf **Slots** des eigenen Cspace, nicht auf einem Objekt hinter einer Cap.
+    if nr == sys::CCOPY || nr == sys::CMOVE || nr == sys::SETRECV {
+        let thread = ops.current_id(core);
+        let src_slot = frame_reg(frame, reg::EP_BADGE) as usize;
+        let dst_slot = frame_reg(frame, reg::MSG0) as usize;
+        let mask = frame_reg(frame, reg::MSG0 + 1);
+        let new_badge = frame_reg(frame, reg::MSG0 + 2);
+        // Ein bei `install_cap_checked` abgelehnter Kopie-Cap muss gelöscht werden — aber
+        // **ohne** gehaltenen Lock (die Finalisierung nimmt CAPS/MEM selbst). Deshalb wird er
+        // hier herausgereicht statt sofort behandelt.
+        let mut orphan: Option<CapPtr> = None;
+        let code = {
+            let mut g = caps.write();
+            let Some(pd) = g.pds.pd_of(thread) else {
+                return deny(result::ERR_NOPD);
+            };
+            match nr {
+                sys::SETRECV => {
+                    if g.pds.set_recv_slot(pd, src_slot) {
+                        result::OK
+                    } else {
+                        result::ERR_BADCAP
+                    }
+                }
+                sys::CMOVE => {
+                    let Some(src) = g.pds.cap_at(pd, src_slot) else {
+                        return deny(result::ERR_BADCAP);
+                    };
+                    if src_slot == dst_slot {
+                        result::OK // nichts zu tun; kein Sonderfall, der irgendwo aufschlägt
+                    } else if dst_slot >= PdTable::caps_per_pd() {
+                        result::ERR_BADCAP
+                    } else if g.pds.cap_at(pd, dst_slot).is_some() {
+                        // Ein belegtes Ziel wird NICHT stillschweigend überschrieben: das wäre ein
+                        // Cap-Verlust, den der Aufrufer nicht angeordnet hat. Wer den Slot räumen
+                        // will, ruft CDELETE — sichtbar und mit eigenem Ergebnis.
+                        result::ERR_NOSPACE
+                    } else {
+                        // Reines Umhängen: derselbe Cap, keine Ableitung, Budget unverändert
+                        // (ein Slot frei, einer belegt) -> Policy-Prüfung wäre hier ohne Inhalt.
+                        g.pds.clear_cap(pd, src_slot);
+                        g.pds.install_cap(pd, dst_slot, src);
+                        result::OK
+                    }
+                }
+                _ => {
+                    let Some(src) = g.pds.cap_at(pd, src_slot) else {
+                        return deny(result::ERR_BADCAP);
+                    };
+                    let Some((_, have, _)) = g.cspace.lookup(src) else {
+                        return deny(result::ERR_BADCAP);
+                    };
+                    if dst_slot >= PdTable::caps_per_pd() || g.pds.cap_at(pd, dst_slot).is_some() {
+                        result::ERR_NOSPACE
+                    } else if !g.budget_allows(pd, dst_slot) {
+                        result::ERR_NOSPACE
+                    } else {
+                        // **Nie mehr Rechte als das Original.** Die Maske kann nur einschränken;
+                        // ein Programm, das RWX anfordert, bekommt den Schnitt mit dem, was es
+                        // selbst hat — sonst wäre CCOPY ein Rechte-Aufwertungsdienst.
+                        let want = rights_from_bits(mask).intersect(have);
+                        // `0` = Badge erben. Ein eigenes Badge ist erlaubt, weil der Aufrufer das
+                        // Objekt bereits besitzt: er vergibt ein Etikett auf eigener Autoritaet.
+                        let derived = if new_badge != 0 {
+                            g.cspace.mint(src, want, new_badge)
+                        } else {
+                            g.cspace.copy(src, want)
+                        };
+                        match derived {
+                            Ok(new) => {
+                                if g.install_cap_checked(pd, dst_slot, new) {
+                                    result::OK
+                                } else {
+                                    orphan = Some(new);
+                                    result::ERR_RIGHTS
+                                }
+                            }
+                            Err(_) => result::ERR_NOSPACE,
+                        }
+                    }
+                }
+            }
+        }; // CAPS freigegeben
+        if let Some(c) = orphan {
+            let _ = delete_cap(c);
+        }
+        return deny(code); // `deny` setzt nur x0 und gibt den Frame zurück — auch für OK richtig
+    }
 
     // Cap-Auflösung unter dem **geteilten Read-Lock** auf `CAPS`: der heiße Lookup ist
     // rein lesend und läuft so auf verschiedenen Kernen parallel (kein globaler Engpass
@@ -621,7 +786,7 @@ pub fn dispatch(
                         // Die im Empfangs-Slot verdrängte Cap freigeben (sonst bliebe sie
                         // unerreichbar in der geteilten Tabelle belegt -> Cross-PD-DoS).
                         if let Some(old) = replaced {
-                            delete_cap(old);
+                            let _ = delete_cap(old);
                         }
                         next
                     } else {
@@ -738,8 +903,16 @@ pub fn dispatch(
             }
             let index = frame_reg(frame, reg::MSG0) as u32; // x2: Archiv-Programm-Index
             let delegate = frame_reg(frame, reg::MSG0 + 1); // x3: lokaler Cap-Index (u64::MAX=keiner)
-            // Den zu delegierenden Caller-Cap (x3) aufloesen + KOPIEREN (CDT-Kind, gleiche Rechte)
+            let badge = frame_reg(frame, reg::MSG0 + 2); // x4: Badge fuer die delegierte Cap (0=erben)
+            // Den zu delegierenden Caller-Cap (x3) aufloesen + ableiten (CDT-Kind, gleiche Rechte)
             // unter CAPS.write; danach CAPS freigeben -- der Loader re-lockt CAPS/MEM/SCHEDS selbst.
+            //
+            // **Badge (x4):** wer eine Notification/einen Endpoint weiterreicht, darf der Kopie ein
+            // eigenes Badge geben. Das ist keine Bequemlichkeit: `SYS_SIGNAL` verodert das Badge der
+            // benutzten CAP, nicht ein Nachrichtenwort — ohne unterschiedliche Badges beim Vergeben
+            // sind die Signale zweier Kinder ununterscheidbar. Erlaubt ist es, weil der Aufrufer das
+            // Objekt bereits besitzt: er vergibt ein Etikett auf seiner eigenen Autorität, er
+            // erwirbt keine neue. `0` = Badge des Originals erben (bisheriges Verhalten).
             let endowed = if delegate != u64::MAX {
                 let mut g = caps.write();
                 let Some(c) = g.pds.cap_at(pd, delegate as usize) else {
@@ -748,7 +921,12 @@ pub fn dispatch(
                 let Some((_, r, _)) = g.cspace.lookup(c) else {
                     return deny(result::ERR_BADCAP);
                 };
-                match g.cspace.copy(c, r) {
+                let derived = if badge != 0 {
+                    g.cspace.mint(c, r, badge)
+                } else {
+                    g.cspace.copy(c, r)
+                };
+                match derived {
                     Ok(copy) => Some(copy),
                     Err(_) => return deny(result::ERR_BADCAP),
                 }
@@ -773,6 +951,24 @@ pub fn dispatch(
         }
         _ => deny(result::ERR_BADSYS),
     }
+}
+
+/// Eine Rechte-Bitmaske aus der ABI (1=R, 2=W, 4=X) in [`Rights`] übersetzen. Unbekannte Bits
+/// werden **ignoriert**, nicht abgelehnt: `Rights` kennt heute genau drei, und eine Ablehnung
+/// würde ein Programm brechen, das aus Bequemlichkeit `u64::MAX` schickt — es bekommt so den
+/// Schnitt mit dem, was es hat, und das ist die sichere Richtung.
+fn rights_from_bits(mask: u64) -> Rights {
+    let mut r = Rights::NONE;
+    if mask & 1 != 0 {
+        r = r.union(Rights::READ);
+    }
+    if mask & 2 != 0 {
+        r = r.union(Rights::WRITE);
+    }
+    if mask & 4 != 0 {
+        r = r.union(Rights::EXEC);
+    }
+    r
 }
 
 /// Eine Capability vom Server (lokaler Slot `grant_slot` in PD `server_pd`) an den
@@ -809,7 +1005,10 @@ fn grant_cap(
     // Budget des EMPFÄNGERS prüfen, bevor eine Kopie entsteht (ein Grant darf das Cap-Budget
     // einer PD nicht umgehen — sonst wäre der Grant-Pfad das Schlupfloch um die Schranke aus
     // `install_cap_checked`). Ein belegter Empfangs-Slot wird ersetzt, nicht zusätzlich belegt.
-    let recv_slot = sel4lake_abi::GRANT_RECV_SLOT;
+    // A-3.2: **der Empfänger** bestimmt den Slot (`SYS_SETRECV`), nicht der Sender. Ohne das
+    // landete jede gegrantete Cap im festen Slot 1 — ein Server konnte damit den Cap verdrängen,
+    // den sein Client dort zufällig hielt. Wer den Slot wählt, schreibt in fremdes Eigentum.
+    let recv_slot = caps.pds.recv_slot(cpd);
     if !caps.budget_allows(cpd, recv_slot) {
         return None;
     }

@@ -53,6 +53,21 @@ gleichzeitig halten, wenn ein Kopieren-und-Freigeben es vermeidet.*
 
 ### 1a. IRQ-Sicherheit der SpinLocks (reentranter Ticket-Lock-Deadlock — Bugfix)
 
+> **Nachtrag 2026-07-29: derselbe Deadlock, zweite Architektur.** Die hier beschriebene Maskierung
+> war **nur für aarch64** implementiert; der No-Op-Zweig darunter war für *Host*-Builds gedacht
+> (`cargo test`), fing aber auch das x86_64-Kernel-Ziel mit. Auf x86 war damit **kein einziger
+> `SpinLock` IRQ-sicher**, und der unten beschriebene Ablauf trat real ein: sporadisches
+> Stehenbleiben mitten in einer `println!`-Ausgabe (die Konsolensperre wird am häufigsten
+> genommen), etwa jeder achte Lauf. Vorher 7 von 8 vollständige Läufe, nach dem Fix 16 von 16.
+> Die Unterscheidung muss `target_os` sein, nicht `target_arch` — `cli` ist im Userspace
+> privilegiert. Ein Wächter zur Übersetzungszeit (`IRQ_MASKING_IMPLEMENTED`) verlangt jetzt für
+> **jedes** Ziel mit `target_os = "none"` eine echte Maskierung.
+>
+> Die Lehre über den Einzelfall hinaus: **ein Fehler in der `cfg`-Auswahl ist für eine Testsuite
+> unsichtbar.** Jeder Test lief entweder auf dem Host (dort war der No-Op richtig) oder auf ARM
+> (dort war die Auswahl richtig). Verhalten zu prüfen reicht nicht, wenn der Fehler in der Auswahl
+> steckt; geprüft werden muss die Auswahl selbst.
+
 `SpinLock` ist ein **FIFO-Ticket-Lock**. Mehrere per-Kern-Locks werden **sowohl im IRQ-/Reschedule-
 Pfad** (Timer-Tick → `reschedule` nimmt `SCHEDS[core]`; `drain_pending_irqs` nimmt `NTFNS[]`) **als
 auch in Thread-/Idle-Kontext** genommen (`idle → reap_core → SCHEDS[core]`; Syscalls; Fuzzer-
@@ -624,3 +639,56 @@ Details + Herleitung: `docs/phase-reports/ext-30-migration-und-kapazitaet.md`.
   (`MIGRATION_HEADROOM`), sonst könnte kein Kern einen Migranten aufnehmen.
 - **Test.** `scale` — 1024 Threads gleichzeitig, danach vollständige Rückgabe (Slots +
   Stack-RAM), Scheduler-Audit 0.
+
+
+## 12. Cache-Partitionierung zwischen PDs (A1) — und ihre Grenzen
+
+**Invariante:** Zwei über `system::spawn_isolated_colored` erzeugte PDs mit disjunkten Farbsätzen
+teilen sich **keine Cache-Farbe des Last-Level-Cache** — weder in ihrer privaten Region noch im
+Kernel-Stack noch in ihren obersten Seitentabellen. Geprüft im Lauf (`color : ALL PASS`), die
+Arithmetik zusätzlich auf dem Host (`sel4lake-mem`, `hal::cache_decode`).
+
+**Grundlage:** Der LLC ist physisch indiziert. Die Set-Indexbits oberhalb des Seitenoffsets hängen
+damit an der Physadresse und sind seitenkonstant — das ist die *Farbe*. Die Geometrie wird
+**gemessen** (`hal::cache`: CPUID-Blatt 4 bzw. CLIDR/CCSIDR), nicht angenommen.
+
+### Was diese Zusicherung ausdrücklich NICHT umfasst
+
+Diese Liste ist der wichtigere Teil des Abschnitts. Eine Isolationszusage, deren Grenzen man nicht
+kennt, wird im Betrieb überdehnt.
+
+* **Kernlokale Strukturen.** L1, L2, TLB, Store-Buffer und Branch-Predictor werden von
+  Geschwister-Hyperthreads desselben physischen Kerns geteilt. **Dagegen hilft keine Farbe, und
+  zwar prinzipiell nicht** — die Farbe wirkt über den Set-Index des LLC, nicht über die
+  kernlokalen Strukturen. Solange SMT aktiv ist und der Scheduler Geschwister beliebig belegt, ist
+  diese Invariante auf einer SMT-Maschine **deutlich schwächer, als sie klingt**. Abhilfe wäre SMT
+  abschalten oder Gang-Scheduling der Geschwister (`todo.md` Z6); beides steht aus, und der
+  Scheduler liest die CPU-Topologie heute nicht.
+* **Der reguläre Weg.** `spawn_isolated` (2-MiB-Region, ein Blockdeskriptor) ist **ungefärbt** und
+  kann es nicht sein: 512 Seiten überstreichen bei den gemessenen 256 Farben jede Farbe zweimal.
+  Das ist Arithmetik, kein Zuteilungsproblem. Solange `spawn_isolated` der Normalfall ist, wirkt
+  A1 im Normalbetrieb **nicht** (`todo.md` Z1/B-4.1).
+* **Mehr PDs als Streifen.** `colors::mask_for` vergibt rundläufig **ohne** Belegungsprüfung. Mehr
+  gleichzeitige PDs als Partitionen heißt heute **stille** Farbüberschneidung — nicht Fehlschlag.
+  Bis das behoben ist (B-4.2), gilt die Invariante nur bis `PARTITIONS` gleichzeitigen PDs.
+* **Wirkung, nicht nur Zuteilung.** Belegt ist, dass die Farbsätze disjunkt *sind*. **Nicht**
+  belegt ist, dass daraus messbar geringere gegenseitige Verdrängung folgt — dafür bräuchte es
+  Prime+Probe auf echter Hardware. Unter TCG ist das sinnlos, weil der Emulator keinen echten
+  Cache hat.
+* **`1` ist kein Erfolgswert.** Meldet die Plattform keine Cache-Geometrie, gibt es genau eine
+  Farbe. „Die Farbsätze zweier PDs sind disjunkt" wäre dann strukturell wahr, ohne geprüft zu
+  sein. `colors::usable()` trennt das, und der Test meldet **SKIP statt PASS**.
+
+### TrustedSAS ist ausschließlich für eigenen Code
+
+**Gesetzte Regel (Simon, 2026-07-29): Kein Kundencode läuft jemals in einer TrustedSAS-PD.** Das
+folgt aus dem Modell und ist keine Vorsichtsmaßnahme: TrustedSAS-PDs teilen sich einen Adressraum,
+und ihre Isolation ruht auf *intralingualer* Sicherheit — safe Rust kann keinen Zeiger auf fremden
+Speicher erzeugen. Diese Voraussetzung lässt sich nur an **Quellcode** prüfen (das Gate aus §9 tut
+genau das: `unsafe_status == ALL_PASS`), niemals an einem fremden Binary.
+
+Folgerungen: der **isolierte** Pfad ist der Produktpfad, und seine Leistung ist das Produkt. Das
+Zertifikats-Gate ist ein **Betreiberwerkzeug, keine Kundenschnittstelle** — ein Weg, auf dem ein
+Kunde ein TrustedSAS-Zertifikat erlangen könnte, wäre ein Entwurfsfehler. Und Attestierung
+(`todo.md` Z7) betrifft die **Maschine**, nicht das Kundenbinary: der Kunde will wissen, *worauf*
+er läuft, nicht beweisen, *was* er mitbringt.

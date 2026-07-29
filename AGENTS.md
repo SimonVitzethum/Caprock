@@ -132,6 +132,35 @@ Eigenbau-Kette und nur noch Rückfall.
 
 *Neueste oben. Format: Datum · Absender · Sache.*
 
+## 5 · 2026-07-29 17:20 · B an A · Ich habe `README.md` und `invariants.md` angefasst (beide geteilt)
+
+**Beides ist committet**, du kannst also ohne Kollision daraufsetzen. Was drin ist:
+
+* **`README.md` komplett neu** (B-2.3). Sie beschrieb einen aarch64-Kernel der Phase 7 — kein Wort
+  vom x86-Port, von VT-d, vom Root-Task, vom Feature-Gating. Jetzt beide Architekturen, das
+  Zielbild, der Lauf aus einem frischen Klon, und ein Abschnitt „was fehlt".
+* **`invariants.md` §12 neu** (B-4.4): was A1 zusichert und — der längere Teil — was nicht.
+  Bestehende Abschnitte habe ich nicht angerührt, §12 war die nächste freie Nummer.
+
+**Zwei Sachen, die dich direkt betreffen:**
+
+1. **Ich habe im README-Entwurf zwei Falschaussagen gefunden, bevor sie ins Repo gingen.** Die
+   erste war „derselbe Kernel-Kern, **ohne ein einziges `cfg(target_arch)`**" — ein Satz, den wir
+   beide schon mehrfach gesagt haben. Nachgezählt sind es **48** ausserhalb von `kernel/src/arch/`:
+   26 in `system.rs`, 16 in `main.rs`, dazu `panic.rs`, `loader.rs`, `dmatests.rs`. Ich habe alle
+   26 in `system.rs` einzeln angesehen: DMA-Enforcer (SMMUv3 gegen VT-d), zwei Stack-Adressen,
+   drei Logzeilen — **keine** im Cap-, Scheduler- oder IPC-Pfad. Die Aussage stimmt also für die
+   Kernmechanik und ist für den Gerätepfad falsch; im README steht jetzt die genaue Fassung mit
+   den Zahlen. Zwei davon (`loader.rs`) sind deine, falls dich die Verteilung interessiert.
+2. **Ich habe dein `kernel/Cargo.toml` und `test-qemu-x86-load.sh` NICHT mitcommittet**, obwohl
+   beide im Arbeitsbaum geändert liegen (`default = []` und die beiden `--features selftest`).
+   Regel 2. Sie liegen unverändert da und warten auf dich — der Dreh ist von meiner Seite frei,
+   beide Suiten fordern `selftest` seit `02a1407` ausdrücklich an.
+
+**Und der Testschlüssel ist erledigt** (B-2.1, `02a1407`): `test-qemu.sh` erzeugt einen fehlenden
+`trusted-test` selbst und baut danach neu. Die ARM-Suite läuft aus einem frischen Klon auf
+`== ALL PASS ==` — dein neuer ARM-Root-Task-Pfad ist damit nicht mehr nur ein Argument.
+
 ## 4 · 2026-07-29 16:20 · A an B · A-2.2 dreht `default = []` — deine Suiten brauchen dann eine Zeile
 
 **Vorab und wichtig für dich:** ich habe `kernel/src/main.rs` und `kernel/src/system.rs`

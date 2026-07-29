@@ -43,12 +43,14 @@ Verlässliches.
 
 ## B-2. Der zweite Architekturzweig muss laufen
 
-- [ ] **B-2.1 `test-qemu.sh` aus einem frischen Clone lauffähig machen.** Sie signiert
-      TrustedSAS-Binaries mit `keys/trusted-test.ed25519`, und `/keys/` ist gitignored — aus einem
-      Clone startet die Suite also nicht, und **jede aarch64-Zeile ist ungeprüft**. Zwei gangbare
-      Wege: ein ausdrücklich als Test gekennzeichneter Schlüssel im Repo (eigener Key-Slot, im
-      Kernel als `test` markiert), oder ein Skript, das beim ersten Lauf ein Paar erzeugt und
-      `trusted_keys.rs` daraus generiert. Der Produktivschlüssel bleibt draußen.
+- [x] **B-2.1 erledigt (2026-07-29).** Gewählt wurde der zweite Weg — **erzeugen statt einchecken**:
+      fehlt `keys/trusted-test.ed25519`, legt `test-qemu.sh` es über `tools/gen_trusted_key.py` an
+      und baut den Kernel **danach** neu (die Key-DB wird hineinkompiliert, die Reihenfolge ist
+      zwingend). Ein privater Schlüssel im Repo wäre bei Open Source kein Testschlüssel, sondern
+      ein veröffentlichter. Belegt: die aarch64-Suite läuft **aus einem frischen Klon von HEAD**
+      auf `== ALL PASS ==` — damit ist der zweite Architekturzweig zum ersten Mal überhaupt
+      geprüft. Preis der Entscheidung: das Image ist maschinenlokal, also reproduzierbar
+      *innerhalb* eines Checkouts, nicht *zwischen* Entwicklern.
 - [x] **B-2.2 erledigt (2026-07-29) — bis auf einen benannten Rest.** Der aarch64-Hochlauf ruft
       jetzt `colors::report()` (neben der `spec`-Zeile: dieselbe Sorte Aussage, was die HW
       hergibt). Dafür war die Suite gar nicht nötig — die Bring-up-Meldungen kommen, bevor das
@@ -63,18 +65,28 @@ Verlässliches.
       Die Werte **unterscheiden sich zwischen den Modellen** — das ist der eigentliche Beleg, dass
       wirklich `CCSIDR_EL1` gelesen wird und keine Konstante zurückkommt. Die ARM-Modelle melden
       nur einen L2 als höchste Ebene, daher 16 statt 256 Farben wie auf x86.
-- [ ] **B-2.2b Der FEAT_CCIDX-Zweig ist WEITERHIN nie ausgeführt worden.** Keines der drei
-      Modelle meldet CCIDX (`-cpu max` liefert CSV2=2/CSV3=1/SB=1, also eine moderne CPU, aber
-      offenbar ohne CCIDX). Genau dort liegt das Risiko: bei gesetztem CCIDX stehen Assoziativität
-      und Setzahl an **anderen Bitpositionen**, und wer sie falsch liest, bekommt eine plausible,
-      aber falsche Farbanzahl. Möglicher Weg: die Feldzerlegung aus `ccsidr_for` in eine reine
-      Funktion ziehen und beide Layouts auf dem Host gegen eingespeiste Registerwerte prüfen —
-      dieselbe Technik wie bei `hal::dmar` (reine Funktion über eingespeiste Daten).
-- [ ] **B-2.3 `README.md`.** Beschreibt einen aarch64-Kernel der Phase 7 — kein Wort vom
-      x86-Port, von VT-d, von der Kern-Übergabe, vom Feature `selftest`. Bei einem
-      Open-Source-Projekt die teuerste veraltete Datei überhaupt.
-- [ ] **B-2.4 `docs/verification.md`** führt die Concurrency-Modellprüfung als offen, obwohl Loom
-      Stufe 2 seit `c2116ac` existiert (todo D5, stale).
+- [x] **B-2.2b erledigt (2026-07-29, `02a1407`).** Die Feldzerlegung liegt jetzt als **reine
+      Funktion** in `crates/sel4lake-hal/src/cache_decode.rs`, arch-neutral und ohne Hardware —
+      beide Layouts werden auf dem Host gegen eingespeiste Registerwerte geprüft (5 von 5 grün,
+      0,00 s). Damit ist der CCIDX-Zweig belegt, obwohl **keine** verfügbare QEMU-CPU ihn meldet.
+      Das war der Punkt: bei gesetztem CCIDX stehen Assoziativität und Setzahl an **anderen
+      Bitpositionen**, und wer sie falsch liest, bekommt eine plausible, aber falsche Farbanzahl.
+      Ein Fehler, den kein Lauf auf dieser Maschine je gezeigt hätte. Technik wie bei `hal::dmar`:
+      reine Funktion über eingespeiste Daten.
+- [x] **B-2.3 erledigt (2026-07-29). `README.md` neu geschrieben.** Sie beschrieb einen
+      aarch64-Kernel der Phase 7 — kein Wort vom x86-Port, von VT-d, von der Kern-Übergabe, vom
+      Feature `selftest`. Bei einem Open-Source-Projekt die teuerste veraltete Datei überhaupt.
+      Jetzt drin: beide Architekturen, das Zielbild (Basissystem statt Hypervisor), die **Regel,
+      dass TrustedSAS nie Kundencode trägt**, der Lauf aus einem frischen Klon, das Feature-Gating
+      — und ein Abschnitt „was fehlt", der nichts beschönigt. Beim Schreiben zwei Falschaussagen
+      des Entwurfs gefunden und korrigiert: „kein einziges `cfg(target_arch)` im Kern" (es sind 48
+      ausserhalb von `kernel/src/arch/`, nachgezählt) und „`virtio` ist aarch64-only" (der
+      *DMA-Nachweis* ist es, die Geräteerkennung läuft auf beiden).
+- [x] **B-2.4 erledigt (2026-07-29). `docs/verification.md`** führte die Concurrency-Modellprüfung
+      als offen, obwohl Loom Stufe 2 seit `c2116ac` existiert. Jetzt abgehakt — **mit der Grenze
+      danebengeschrieben**, und die ist der eigentliche Ertrag: Loom modelliert eine *Kopie* des
+      Algorithmus, ein Fehler in der `cfg`-**Auswahl** ist für jedes Modell unsichtbar, weil das
+      Modell den ausgewählten Code gar nicht sieht. Genau dort lag B-1.1.
 
 ## B-3. Geräte-Zuteilung, die man einem Tenant geben darf (E 3b/4)
 
@@ -106,9 +118,15 @@ Verlässliches.
       Store-Buffer zwischen Geschwister-Hyperthreads. Entweder SMT aus, oder ein physischer Kern
       gehört zu jedem Zeitpunkt genau einem Tenant. Der zweite Weg braucht die CPU-Topologie
       (`CPUID.1F`/`0B`, MPIDR) im Scheduler — die liest heute niemand.
-- [ ] **B-4.4 Die Zusicherung ehrlich aufschreiben.** `docs/invariants.md` muss sagen, dass A1 den
-      **LLC** trennt und die kernlokalen Strukturen **nicht** — und dass TrustedSAS
-      ausschließlich für eigenen Code ist, nie für Kundencode (gesetzte Regel, s. todo.md Z1).
+- [x] **B-4.4 erledigt (2026-07-29).** `docs/invariants.md` **§12** sagt jetzt, was A1 zusichert —
+      und der längere Teil des Abschnitts ist die Liste dessen, was es **nicht** umfasst: L1/L2/
+      TLB/Store-Buffer zwischen Geschwister-Hyperthreads (dagegen hilft keine Farbe, und zwar
+      prinzipiell nicht), der ungefärbte `spawn_isolated` als Normalfall, stille
+      Farbüberschneidung ab mehr PDs als Streifen (B-4.2), Zuteilung statt gemessener Wirkung, und
+      `1` als kein Erfolgswert. Dazu die gesetzte Regel: **kein Kundencode in einer TrustedSAS-PD**,
+      mit der Begründung aus dem Modell — intralinguale Sicherheit ist nur an Quellcode prüfbar,
+      nie an einem fremden Binary. Eine Isolationszusage, deren Grenzen man nicht kennt, wird im
+      Betrieb überdehnt; deshalb steht die Grenze neben der Zusage, nicht in einer Fussnote.
 - [ ] **B-4.5 Wirkung statt nur Zuteilung.** Der Test zeigt disjunkte Farbsätze, nicht messbar
       geringere Verdrängung. Ein Prime+Probe-Mikrobenchmark wäre der Beleg — unter TCG sinnlos
       (kein echter Cache), also erst auf Blech oder unter KVM.

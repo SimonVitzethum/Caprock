@@ -4,18 +4,21 @@
 Beide Agenten schreiben ihren eigenen Abschnitt und lassen den des anderen in Ruhe.
 Aktualisiert wird nach jedem abgeschlossenen Schritt, nicht nach der Uhr.*
 
-**Zuletzt geändert (B): 2026-07-29 12:40 UTC**
+**Zuletzt geändert (B): 2026-07-29 17:20 UTC**
 
 ---
 
 ## Strang B — Verlässlichkeit und Isolation (Claude B)
 
-**Gerade in Arbeit:** B-2.1 — die ARM-Suite aus einem frischen Clone lauffähig machen. `keys/` ist
-gitignored, damit startet `test-qemu.sh` aus einem Clone nicht, und **jede aarch64-Zeile ist
-ungeprüft**. Recherche zu `sign_trusted.py`/`trusted_keys.rs` läuft.
+**Gerade in Arbeit:** nichts Angefangenes. B-2 ist abgeschlossen (bis auf B-1.2b, das dauerhaft
+mitläuft).
 
-**Als Nächstes:** B-2.2 (`hal::cache` auf ARM tatsächlich ausführen — geschrieben, übersetzt, nie
-gelaufen), dann B-2.3 (README).
+**Als Nächstes:** B-4.1 — den **gefärbten** isolierten Pfad zum Normalfall machen. Das ist der
+Punkt, an dem A1 aufhört, eine Sonderfunktion zu sein: heute ist `spawn_isolated` regulär und
+ungefärbt, damit wirkt die Cache-Partitionierung im Normalbetrieb **nicht**. Hängt an der
+Entscheidung über die Regionsgröße (2-MiB-Blockdeskriptor verträgt sich nicht mit Färbung) und
+berührt A-2.1 (der Root-Task erzeugt die PDs). Danach B-4.2 (sauberer Fehlschlag statt stiller
+Farbüberschneidung).
 
 **Fertig und belegt:**
 
@@ -24,6 +27,12 @@ gelaufen), dann B-2.3 (README).
 | B-1.1/1.2 IRQ-Sicherheit der SpinLocks auf x86 | 7 von 8 → **16 von 16** vollständige Läufe | `ab76273` |
 | B-1.4 Fehlerklasse gesucht + Wächter zur Übersetzungszeit | `sel4lake-sync` war die einzige betroffene Crate; Empfindlichkeit belegt | `ab76273` |
 | B-1.3 Wiederholungsmodus der Suite | `RUNS=n`, Quote unter 100 % ist FAIL; Probelauf 5 von 5 | `b43fc14` |
+| B-2.1 ARM-Suite aus frischem Klon | Testschlüssel wird erzeugt statt eingecheckt, Kernel danach neu gebaut; **`== ALL PASS ==` aus einem frischen Klon von HEAD** | `02a1407` |
+| B-2.2 `hal::cache` auf ARM wirklich ausgeführt | `cortex-a72`/`a53` → 16 Farben, `max` → 32: **die Werte unterscheiden sich**, also wird CCSIDR gelesen und keine Konstante | `d4d27f1` |
+| B-2.2b CCIDX-Zweig geprüft | Feldzerlegung als reine Funktion (`hal::cache_decode`), beide Layouts gegen eingespeiste Registerwerte, **5 von 5** — obwohl keine QEMU-CPU CCIDX meldet | `02a1407` |
+| B-2.3 README | von „aarch64, Phase 7" auf den tatsächlichen Stand; zwei Falschaussagen des Entwurfs beim Prüfen gefunden und korrigiert | *dieser Commit* |
+| B-2.4 `docs/verification.md` | Loom Stufe 2 abgehakt — **mit der Grenze daneben**, die 2026-07-29 teuer wurde | *dieser Commit* |
+| B-4.4 Zusicherung ehrlich aufgeschrieben | `invariants.md` §12: was A1 trennt, und die längere Liste dessen, was **nicht** | *dieser Commit* |
 | A1 Stufe 1 Cache-Coloring | `color : ALL PASS`, 256 Farben gemessen | `7a87182` |
 | Feature `selftest` (todo F1) | `.text` 0x25000 → 0x11000 (54 %) | `7a87182` |
 | Zielarchitektur Z, Plan, Strang-Aufteilung | — | `6e4cf9d` |
@@ -32,9 +41,10 @@ gelaufen), dann B-2.3 (README).
 Merkmal grundsätzlich nicht (`TCG doesn't support requested feature: CPUID.01H:ECX.x2apic`), kein
 `/dev/kvm` im Container. **Kein Regress, sondern eine Grenze des Aufbaus.**
 
-**Testlage aarch64:** **nicht lauffähig.** `test-qemu.sh` signiert TrustedSAS-Binaries mit
-`keys/trusted-test.ed25519`, und `/keys/` ist gitignored. Das ist B-2.1 und der wichtigste offene
-Punkt in diesem Strang.
+**Testlage aarch64: läuft** (seit B-2.1), zuletzt `== ALL PASS ==` aus einem frischen Klon. Damit
+ist auch A's neuer ARM-Root-Task-Pfad nicht mehr auf ein Argument angewiesen.
+
+**Host-Arithmetik (17:15):** `sel4lake-mem` 13 von 13, `hal::cache_decode` 5 von 5, je 0,00 s.
 
 **Blockiert:** nichts.
 

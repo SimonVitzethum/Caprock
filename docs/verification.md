@@ -34,7 +34,12 @@ Dieses Dokument beschreibt die **dauerhafte Verifikationspipeline** von SEL4Lake
 > Nebenläufigkeits-Checker. Bewiesen sind Memory-Safety der Guards, Single-Thread-Round-Trips +
 > Daten-Persistenz und die Zähler-**Arithmetik**. Der **gegenseitige Ausschluss unter gleichzeitigem
 > Mehrkern-Zugriff** (Interleavings) liegt **außerhalb** Kanis Reichweite — dafür wäre ein
-> Concurrency-Modellprüfer (Loom/TLA+) nötig (mögliche spätere Ergänzung).
+> Concurrency-Modellprüfer nötig. Loom Stufe 2 existiert seit `c2116ac` — **deckt aber die
+> IRQ-Maskierung nicht ab**, und genau dort lag der Fehler vom 2026-07-29 (s. `invariants.md` §1a):
+> auf x86 war `irq_save_disable` ein No-Op, weil der Host-Zweig das Kernel-Ziel mitfing. Loom
+> modelliert eine **Kopie** des Algorithmus; ein Fehler in der `cfg`-**Auswahl** ist für jedes
+> Modell unsichtbar, weil das Modell den ausgewählten Code gar nicht sieht. Wirksam war stattdessen
+> eine Zusicherung über die Auswahl selbst (`IRQ_MASKING_IMPLEMENTED`, Übersetzungszeit).
 
 Die Harnesses sind `#[cfg(kani)]`-Module direkt in den jeweiligen Quelldateien — **im Normal-Build
 vollständig inert** (keine Auswirkung auf Kernel/Tests). Die Eingabe-Obergrenzen (z. B. 200–260 B)
@@ -166,5 +171,6 @@ Richtung Scheduler/IPC.
 - [x] CI-Gate (Gitea Actions)
 - [x] Region-Runtime (`sel4lake-region`: RegionView — Bounds-/Slice-/Overflow-Verträge um die `unsafe`-Blöcke)
 - [x] Synchronisationsprimitive (`sel4lake-sync`: Memory-Safety/Round-Trip/Arithmetik, single-thread)
-- [ ] Concurrency-Modellprüfung der Locks (Loom/TLA+ — außerhalb Kani)
+- [x] Concurrency-Modellprüfung der Locks (Loom, Stufe 2, seit `c2116ac`) — **mit einer Grenze,
+      die 2026-07-29 teuer wurde, s. unten**
 - [ ] kernweite Overflow-/Arithmetik-Checks

@@ -30,12 +30,16 @@ Verlässliches.
       gegen die gerade interessierende Zeile. **Merke:** die frühere Aussage „5 von 5 grün" war
       wertlos, weil sie nur auf die `color`-Zeile prüfte — ein Lauf, der danach hängenblieb,
       zählte als Erfolg.
-- [ ] **B-1.3 Wiederholungslauf in die Suite.** Ein einzelner Durchlauf kann einen
-      Nichtdeterminismus grundsätzlich nicht finden. `test-qemu-x86.sh` sollte den Bootlauf
-      N-fach fahren können (Vorgabe klein, in CI groß) und die Quote melden.
-- [ ] **B-1.4 Dieselbe Klasse Fehler suchen.** Ein `cfg`, das ein Bare-Metal-Ziel versehentlich in
-      einen Host-Zweig fallen lässt, ist selten allein. Alle `cfg(not(target_arch = ...))` und
-      `cfg(target_os = ...)` im Baum durchsehen.
+- [x] **B-1.3 erledigt (2026-07-29).** `RUNS=8 ./test-qemu-x86.sh` fährt den Bootlauf N-fach und
+      meldet die Quote; eine Quote unter 100 % ist ein **FAIL**, nicht „meistens grün". Vorgabe
+      bleibt 1, damit der übliche Aufruf schnell ist. Probelauf: 5 von 5.
+- [x] **B-1.4 erledigt (2026-07-29).** `sel4lake-sync` war die **einzige** Bibliotheks-Crate mit
+      arch-`cfg`s; die acht `cfg(not(target_arch = "aarch64"))` in `system.rs` sind ungefährlich,
+      weil die Kernel-Crate nie für ein Host-Ziel baut. Damit die Annahme nicht ungeprüft bleibt:
+      `IRQ_MASKING_IMPLEMENTED` prüft zur **Übersetzungszeit**, dass jedes Ziel mit
+      `target_os = "none"` eine echte Maskierung mitbringt. Die Konstante steht neben jeder
+      Implementierung in derselben `cfg`-Kette — eine eigene Kette wäre eine Wiederholung der
+      Bedingung, und Wiederholungen laufen auseinander. Empfindlichkeit belegt.
 
 ## B-2. Der zweite Architekturzweig muss laufen
 

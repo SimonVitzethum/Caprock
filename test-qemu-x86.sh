@@ -12,6 +12,16 @@ SECONDS_RUN="${1:-120}"
 # unter 4 GiB, und der Test waere gruen gewesen, ohne die Eigenschaft zu pruefen.
 RAM="${2:-512M}"
 
+# **Wiederholungen** (todo B-1.3). Ein einzelner Durchlauf kann einen Nichtdeterminismus
+# grundsaetzlich nicht finden -- er kann ihn nur zufaellig treffen. Genau daran ist der
+# IRQ-Deadlock von 2026-07-29 monatelang vorbeigelaufen: die Suite lief einmal, und einmal reicht
+# bei einer Ausfallquote von einem Achtel eben meistens.
+#
+# Vorgabe 1, damit der uebliche Aufruf schnell bleibt; im CI/nach Aenderungen an Locks, Scheduler
+# oder Bring-up mit `RUNS=8 ./test-qemu-x86.sh` fahren. Gemeldet wird die QUOTE, und eine Quote
+# unter 100 % ist ein FAIL -- nicht "meistens gruen".
+RUNS="${RUNS:-1}"
+
 # **KVM, wenn verfuegbar.** Unter TCG kostet ein serialisierter Zeitstempel ~14 000 Zyklen --
 # damit ist alles unter ~5 us Sektionslaenge nicht aufloesbar, und `invtsc` kann TCG gar nicht
 # zusagen ("TCG doesn't support requested feature: CPUID[80000007h].EDX.invtsc"). Beides kommt
@@ -61,14 +71,33 @@ SEL_TEXT=$(readelf -S build/target/x86_64-unknown-none/release/sel4lake-kernel 2
 
 # Zuverlaessiger Capture ueber eine Datei (Pipe + SIGKILL verliert sonst QEMUs stdout-Puffer).
 LOG="$(mktemp)"
-echo "== boot ($SECONDS_RUN s) =="
-timeout "$SECONDS_RUN" qemu-system-x86_64 \
-    -kernel "$ELF" -m "$RAM" -smp 4 "${ACCEL[@]}" \
-    -machine q35,kernel-irqchip=split -device intel-iommu,caching-mode=on \
-    -device virtio-rng-pci \
-    -nographic -serial file:"$LOG" -no-reboot -no-shutdown \
-    </dev/null >/dev/null 2>&1 || true
+boot_once() {
+    timeout "$SECONDS_RUN" qemu-system-x86_64 \
+        -kernel "$ELF" -m "$RAM" -smp 4 "${ACCEL[@]}" \
+        -machine q35,kernel-irqchip=split -device intel-iommu,caching-mode=on \
+        -device virtio-rng-pci \
+        -nographic -serial file:"$LOG" -no-reboot -no-shutdown \
+        </dev/null >/dev/null 2>&1 || true
+}
+
+echo "== boot ($SECONDS_RUN s, $RUNS Lauf/Laeufe) =="
+boot_once
 OUT="$(grep -vE "SeaBIOS|iPXE|Press Ctrl|Booting from|C900|PMM|PnP" "$LOG" 2>/dev/null)"
+
+# Wiederholungen: NUR auf Vollstaendigkeit geprueft, nicht auf jeden einzelnen Marker. Die
+# Markerpruefung unten laeuft gegen den ERSTEN Lauf; hier geht es um die Frage, ob der Lauf
+# ueberhaupt reproduzierbar durchlaeuft.
+REPEAT_OK=1
+REPEAT_DONE=0
+if [ "$RUNS" -gt 1 ]; then
+    echo "$OUT" | grep -q "SELFTEST COMPLETE" && REPEAT_DONE=1
+    for _ in $(seq 2 "$RUNS"); do
+        boot_once
+        grep -q "SELFTEST COMPLETE" "$LOG" 2>/dev/null && REPEAT_DONE=$((REPEAT_DONE + 1))
+    done
+    [ "$REPEAT_DONE" = "$RUNS" ] || REPEAT_OK=0
+    echo "== Wiederholungen: $REPEAT_DONE von $RUNS erreichten SELFTEST COMPLETE =="
+fi
 # Ein leerer Lauf sieht in der Auswertung aus wie "alle Pruefungen fehlgeschlagen" -- eine
 # Fehldiagnose, die schlimmer ist als gar keine. Also unterscheiden: kam nichts an, ist das ein
 # Problem des Aufbaus (QEMU, KVM, Zeitlimit), nicht des Kernels.
@@ -127,6 +156,16 @@ if [ -n "$SEL_TEXT" ] && [ -n "$NOSEL_TEXT" ] && [ $((0x$NOSEL_TEXT)) -lt $((0x$
     echo "  PASS: F1: .text schrumpft ohne 'selftest' von 0x$SEL_TEXT auf 0x$NOSEL_TEXT Bytes -- das Gating wirkt wirklich"
 else
     echo "  FAIL: F1: .text schrumpft nicht (0x$SEL_TEXT -> 0x$NOSEL_TEXT) -- Testcode liegt ausserhalb des Features"; fail=1
+fi
+if [ "$RUNS" -gt 1 ]; then
+    if [ "$REPEAT_OK" = 1 ]; then
+        echo "  PASS: B-1.3: $RUNS von $RUNS Laeufen vollstaendig -- der Lauf ist reproduzierbar"
+    else
+        echo "  FAIL: B-1.3: nur $REPEAT_DONE von $RUNS Laeufen vollstaendig. Eine Quote unter 100 %"
+        echo "        ist KEIN 'meistens gruen', sondern ein Nichtdeterminismus. Verdaechtig sind"
+        echo "        Sperren, IRQ-Maskierung und der SMP-Hochlauf (s. todo D0)."
+        fail=1
+    fi
 fi
 if [ "$fail" = 0 ]; then echo "== ALL PASS =="; else echo "== FAILURES =="; fi
 exit "$fail"

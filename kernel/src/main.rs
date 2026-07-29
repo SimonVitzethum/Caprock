@@ -34,18 +34,23 @@ static GLOBAL: NoGlobalHeap = NoGlobalHeap;
 mod addr;
 mod arch;
 mod panic;
+/// Seitenfarben / Cache-Partitionierung zwischen PDs (todo A1) — arch-neutral.
+mod colors;
 // Der Kernel-Kern (arch-agnostisch, nutzt aber die aarch64-HAL) ist auf dem x86_64-Branch in Stufe 0
 // noch nicht aktiv — er wird Stufe fuer Stufe fuer x86_64 eingeschaltet (s. README-X86.md).
+#[cfg(feature = "selftest")]
 mod dmatests;
-#[cfg(target_arch = "aarch64")]
+/// Kernel-Glue des generischen Binary-Loaders. **Seit A-1 auf beiden Architekturen** — die
+/// Archiv-Quelle ist nicht mehr ein fest verdrahtetes ARM-Fenster, sondern eine zur Laufzeit
+/// gemeldete Spanne (auf x86 ein Multiboot-Modul).
 mod loader;
+#[cfg(feature = "selftest")]
 mod selftest;
 mod system;
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "selftest"))]
 mod threads;
 /// Read-only TrustedSAS-Root-Key-DB (ext-28, ADR 0014) — autogeneriert von `tools/gen_trusted_key.py`,
 /// in den Kernel kompiliert, nur per Firmware-/Kernel-Update änderbar (nicht per Syscall).
-#[cfg(target_arch = "aarch64")]
 mod trusted_keys;
 
 #[cfg(target_arch = "aarch64")]

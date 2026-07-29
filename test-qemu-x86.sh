@@ -26,13 +26,38 @@ if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
     ACCEL=(-enable-kvm -cpu host,+invtsc)
     echo "== Beschleunigung: KVM (-cpu host) =="
 else
-    ACCEL=(-cpu qemu64)
+    # TCG-Rueckfall: **nicht** `qemu64`. Dieses Modell ist synthetisch und meldet weder
+    # CPUID-Blatt 4 (Cache-Geometrie -> der `color`-Test kann nur SKIPpen) noch x2APIC
+    # (-> `apic`-Pruefung faellt durch, ohne dass am Kernel etwas fehlt). Beides sind
+    # Luecken des MODELLS, keine des Kernels, und beide verschwinden mit einem echten
+    # Modell. `Skylake-Client` meldet LLC 16 MiB/16-fach/64 B -> 256 Seitenfarben und
+    # x2APIC; was TCG davon nicht kann, sagt QEMU beim Start selbst an.
+    ACCEL=(-cpu Skylake-Client)
     echo "== Beschleunigung: TCG (kein /dev/kvm) -- Zyklenwerte sind dann indikativ =="
 fi
 ELF="build/target/x86_64-unknown-none/release/sel4lake-kernel.mb32"
 
 echo "== build (x86_64-unknown-none) =="
 ./build-x86.sh >/dev/null 2>&1 || { echo "BUILD FAILED"; exit 1; }
+
+# todo F1: die Konfiguration OHNE Pruefinfrastruktur wird HIER MITGEBAUT.
+#
+# Das ist der wichtigere Teil des Gatings. Ein `--no-default-features`-Build, den niemand baut,
+# verrottet still -- und genau diese Fehlerform hat in diesem Projekt schon mehrfach zugeschlagen
+# (leere Event-Queue, nie ausgefuehrter x86-Testpfad, DMAR-Ausschlusspfad). Gebootet wird er
+# nicht: ohne `selftest` hat der Kernel derzeit keine Aufgabe (todo F2), er wuerde nur idlen.
+# Geprueft wird also genau das, was pruefbar ist -- dass er uebersetzt und linkt.
+echo "== build (--no-default-features: ohne Pruefinfrastruktur) =="
+NOSEL_OK=1
+rustup run nightly cargo build --release --no-default-features \
+    --target x86_64-unknown-none -p sel4lake-kernel >/dev/null 2>&1 || NOSEL_OK=0
+# Der Vergleich gehoert dazu: schrumpft das Image NICHT, ist das Gating wirkungslos geworden
+# (jemand hat Testcode ausserhalb des Features abgelegt), und der Build allein wuerde das nicht zeigen.
+NOSEL_TEXT=$(readelf -S build/target/x86_64-unknown-none/release/sel4lake-kernel 2>/dev/null \
+    | grep -A1 " .text " | tail -1 | tr -s ' ' | cut -d' ' -f2)
+./build-x86.sh >/dev/null 2>&1 || { echo "BUILD FAILED (Rueckbau der Default-Konfiguration)"; exit 1; }
+SEL_TEXT=$(readelf -S build/target/x86_64-unknown-none/release/sel4lake-kernel 2>/dev/null \
+    | grep -A1 " .text " | tail -1 | tr -s ' ' | cut -d' ' -f2)
 
 # Zuverlaessiger Capture ueber eine Datei (Pipe + SIGKILL verliert sonst QEMUs stdout-Puffer).
 LOG="$(mktemp)"
@@ -81,7 +106,27 @@ check "dmawin  : ALL PASS" "IOVA-Fenstergrenzen (ext-36b) -- DIESELBE Funktion w
 check "dmatok  : ALL PASS" "Teardown-Token (ext-37) -- dieselbe Funktion wie im ARM-Lauf; VtdEnforcer::attach liefert jetzt Some"
 check "iommu   : ALL PASS"            "IOMMU (VT-d): Bring-up aus der ACPI-DMAR, Root-Tabelle mit Default-Block, Uebersetzung aktiv, Invalidierung quittiert"
 check "iso     : ALL PASS"            "Stufe 5: per-Prozess-Adressraeume (isolierte PD sieht fremdes RAM NICHT, SAS-PD schon)"
+# Cache-Partitionierung (todo A1). SKIP ist hier ein EIGENES Ergebnis, kein PASS: meldet die
+# Plattform keine Cache-Geometrie, gibt es genau eine Seitenfarbe, und "die Farbsaetze zweier PDs
+# sind disjunkt" waere dann wahr, ohne geprueft zu sein. Genau diese Verwechslung -- Abwesenheit
+# als Erfuellung zu lesen -- hat dieses Projekt bei der SMMU-Event-Queue schon einmal bezahlt.
+if echo "$OUT" | grep -q "color   : SKIP"; then
+    echo "  SKIP (Plattform meldet keine Cache-Geometrie -> 1 Farbe): Cache-Partitionierung zwischen PDs"
+else
+    check "color   : ALL PASS" "A1: zwei isolierte PDs teilen sich KEINE Cache-Farbe -- Region, Kernel-Stack und Seitentabellen jeder PD stammen aus disjunkten Farbsaetzen; eine Region jenseits der Streifenbreite wird abgewiesen statt fremde Farben mitzunehmen"
+fi
 check "audit   : ALL PASS"            "Stufe 4: Scheduler- + CDT-Audit sauber"
 check "SELFTEST COMPLETE"             "Stufe 4: sauberes system_off (ACPI) statt Timeout"
+# todo F1: Gating der Pruefinfrastruktur.
+if [ "$NOSEL_OK" = 1 ]; then
+    echo "  PASS: F1: der Kernel baut auch OHNE Feature 'selftest' (die schlanke Konfiguration verrottet nicht)"
+else
+    echo "  FAIL: F1: --no-default-features baut nicht mehr"; fail=1
+fi
+if [ -n "$SEL_TEXT" ] && [ -n "$NOSEL_TEXT" ] && [ $((0x$NOSEL_TEXT)) -lt $((0x$SEL_TEXT)) ]; then
+    echo "  PASS: F1: .text schrumpft ohne 'selftest' von 0x$SEL_TEXT auf 0x$NOSEL_TEXT Bytes -- das Gating wirkt wirklich"
+else
+    echo "  FAIL: F1: .text schrumpft nicht (0x$SEL_TEXT -> 0x$NOSEL_TEXT) -- Testcode liegt ausserhalb des Features"; fail=1
+fi
 if [ "$fail" = 0 ]; then echo "== ALL PASS =="; else echo "== FAILURES =="; fi
 exit "$fail"

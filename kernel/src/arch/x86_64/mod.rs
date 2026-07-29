@@ -17,6 +17,7 @@ use core::arch::{asm, global_asm};
 // sodass der Kernel-Kern sie ohne `cfg` benutzt. Hier bleibt nur das Boot-Trampolin.
 mod bootinfo;
 mod bringup;
+#[cfg(feature = "selftest")]
 mod dmar_selftest;
 
 global_asm!(

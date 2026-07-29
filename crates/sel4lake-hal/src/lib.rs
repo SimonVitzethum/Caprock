@@ -47,7 +47,7 @@ mod imp;
 
 // Gemeinsame API-Fläche beider Architekturen.
 pub mod fault;
-pub use imp::{console, cpu, exception, fp, intc, mmu, power, syscall, timer};
+pub use imp::{cache, console, cpu, exception, fp, intc, mmu, power, syscall, timer};
 
 // ARM-/QEMU-`virt`-spezifische Geräte (noch ohne x86-Entsprechung, s. Modul-Doku).
 #[cfg(target_arch = "aarch64")]

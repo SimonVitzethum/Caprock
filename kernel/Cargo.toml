@@ -20,7 +20,22 @@ path = "src/main.rs"
 # der Release-Build enthaelt keinerlei Fuzzer-Code. Mit `--features kernel-fuzz` werden die vier
 # Fuzzer (fuzz/ipcfuzz/hwfuzz/loaderfuzz) aus `threads/fuzz.rs` einkompiliert. Die Audits bleiben
 # IMMER im Kernel (feature-unabhaengig).
-default = []
+# `selftest` — die gesamte Pruefinfrastruktur (Selbsttests, Demo-/Testthreads, DMA-/DMAR-Tests,
+# Farbtest, `system::testsupport`). Rund ein Viertel des Kernels ist Testcode, und er wurde bis
+# hierher bei JEDEM Start mitkompiliert und ausgefuehrt.
+#
+# **Vorerst in `default`.** Das ist Absicht und kein Zoegern: schaltet man heute alles ab, bleibt
+# `configure() -> idle`. Der Kernel hat derzeit keinen Nicht-Test-Zweck -- auf x86 gibt es kein
+# Boot-Archiv, und auf aarch64 ruft den Loader niemand ausser `threads/mod.rs`. Das Gating waere
+# also kein schlankerer Kernel, sondern ein leerer. Der ehrliche Ersatz ist der seL4-Weg: ein
+# Startprogramm aus dem Archiv laden und ihm die Wurzel-Caps uebergeben (todo F2).
+#
+# Bauen ohne: `cargo build --release --no-default-features --target ...`
+# **Beide Konfigurationen gehoeren in die Testskripte.** Ein `--no-default-features`-Build, den
+# niemand baut, verrottet still -- und genau diese Fehlerform hat hier schon mehrfach zugeschlagen
+# (leere Event-Queue, nie ausgefuehrter x86-Testpfad, DMAR-Ausschlusspfad).
+default = ["selftest"]
+selftest = []
 kernel-fuzz = []
 # Continuous-Soak-Treiber (Burn-in #2): nach dem Selbsttest faehrt der Idle-Manager statt
 # `system_off` eine Endlos-Epochenschleife (Dauerbetrieb EINER Instanz). NUR Harness/Testcode; der

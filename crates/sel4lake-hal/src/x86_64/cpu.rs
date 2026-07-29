@@ -77,6 +77,16 @@ pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
     (r.eax, r.ebx, r.ecx, r.edx)
 }
 
+/// `CPUID`-Blatt `leaf`, **Unterblatt** `sub` -> `(eax, ebx, ecx, edx)`.
+///
+/// Blatt 4 (Cache-Parameter) zählt über den Unterblattindex auf; ohne diese Form ist nur
+/// die erste Cache-Ebene sichtbar. Dieselbe RBX-Begründung wie bei [`cpuid`].
+pub fn cpuid_count(leaf: u32, sub: u32) -> (u32, u32, u32, u32) {
+    // SAFETY: wie [`cpuid`]; `__cpuid_count` kennt dieselbe Registerbeschränkung.
+    let r = unsafe { core::arch::x86_64::__cpuid_count(leaf, sub) };
+    (r.eax, r.ebx, r.ecx, r.edx)
+}
+
 // --- Identität / Privilegstufe -------------------------------------------------------------
 
 /// Aktuelle Privilegstufe (CPL) — das x86-Gegenstück zum aarch64-Exception-Level.

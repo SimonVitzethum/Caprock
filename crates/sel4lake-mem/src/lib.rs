@@ -12,12 +12,20 @@
 //! Coalescing) und prägt Wurzel-Caps. Alles ist reine Arithmetik über Regionen
 //! — **kein Speicherzugriff, kein `unsafe`**.
 
+// Die Crate ist `no_std` (sie läuft im Kernel). Die Farb-/Allokator-Arithmetik ist aber
+// reine Rechnung ohne Hardware und damit auf dem Host prüfbar — der Testharness braucht
+// dafür `std`. Nur unter `cfg(test)`, der Kernelbuild sieht davon nichts.
+#[cfg(test)]
+extern crate std;
+
 mod alloc;
 mod cap;
+mod color;
 mod region;
 
 pub use alloc::PhysAllocator;
 pub use cap::MemoryCap;
+pub use color::{color_of, stripe, ColorMask, MASK_BITS};
 pub use region::{PhysRegion, Rights};
 
 /// Seitengröße (Allokationsgranularität).

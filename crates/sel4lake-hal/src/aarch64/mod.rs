@@ -6,6 +6,7 @@
 //! ARM-spezifische Gerätecode (SMMU/PCIe) lesbar, während der Kernel-Kern nur die neutrale
 //! API sieht.
 
+pub mod cache;
 pub mod console;
 pub mod cpu;
 pub mod exception;

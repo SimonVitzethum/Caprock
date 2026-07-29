@@ -62,7 +62,7 @@ pub const IDLE_PRIO: u8 = 1;
 // aus dem EL0-zugänglichen RAM. Der Kernel-Stack MUSS EL1-only sein (sonst könnte
 // der EL0-Thread seinen eigenen Kernel-Stack lesen/schreiben), daher der feste Pool
 // im Kernel-Image (nicht aus dem EL0-zugänglichen MEM-Allokator).
-const USER_KSTACK_SIZE: usize = 0x4000; // 16 KiB EL1-Kernel-Stack je EL0-Thread
+pub(crate) const USER_KSTACK_SIZE: usize = 0x4000; // 16 KiB EL1-Kernel-Stack je EL0-Thread
 
 /// Besitzer-Abbildung der **dynamisch aus `MEM` allozierten** EL0-Kernel-Stacks: `base_of[slot]`
 /// = physische Basis des Kstacks des Threads `slot` (0 = keiner). Kstacks kommen NICHT mehr aus
@@ -88,7 +88,20 @@ static KSTACKS: SpinLock<KstackPool> = SpinLock::new(KstackPool {
 /// Einen EL0-Kernel-Stack (16 KiB, ausgerichtet) aus `MEM` allozieren. Gibt die **physische Basis**
 /// zurück (identity-gemappt = EL1-SP-Region), oder `None` bei RAM-Erschöpfung.
 fn claim_user_kstack() -> Option<usize> {
-    let base = MEM.lock().alloc(USER_KSTACK_SIZE as u64, USER_KSTACK_SIZE as u64)?.base();
+    claim_user_kstack_masked(None)
+}
+/// Wie [`claim_user_kstack`], aber optional aus einem Farbsatz (todo A1).
+///
+/// Der Kernel-Stack einer PD wird zwar vom Kernel benutzt, aber **im Namen dieses Subjekts** —
+/// seine Cache-Zeilen tragen also dessen Zugriffsmuster. Ihn ungefärbt zu lassen hieße, die
+/// Trennung an genau der Stelle aufzugeben, an der der Kernel für das Subjekt arbeitet.
+/// 16 KiB sind vier Seiten und passen damit in jeden Streifen (kleinster Streifen: 16 Seiten).
+fn claim_user_kstack_masked(mask: Option<sel4lake_mem::ColorMask>) -> Option<usize> {
+    let (sz, al) = (USER_KSTACK_SIZE as u64, USER_KSTACK_SIZE as u64);
+    let base = match mask {
+        Some(m) => MEM.lock().alloc_colored(sz, al, crate::colors::count(), m)?.base(),
+        None => MEM.lock().alloc(sz, al)?.base(),
+    };
     KSTACKS.lock().live += 1;
     Some(base as usize)
 }
@@ -745,14 +758,41 @@ fn mem_alloc(size: u64, align: u64) -> Option<MemoryCap> {
     Some(cap)
 }
 
+/// [`mem_alloc`] oder [`alloc_colored`], je nachdem ob ein Farbsatz vorgegeben ist. Beide
+/// nullen; der Unterschied ist ausschliesslich die Farbbedingung.
+fn mem_alloc_masked(
+    size: u64,
+    align: u64,
+    mask: Option<sel4lake_mem::ColorMask>,
+) -> Option<MemoryCap> {
+    match mask {
+        Some(m) => alloc_colored(size, align, m),
+        None => mem_alloc(size, align),
+    }
+}
+
 pub fn alloc(size: u64, align: u64) -> Option<MemoryCap> {
     mem_alloc(size, align)
+}
+/// Wie [`alloc`], aber jede Seite trägt eine Farbe aus `mask` (todo A1). Genullt wie jede
+/// Region, die an ein Subjekt gehen kann.
+pub fn alloc_colored(size: u64, align: u64, mask: sel4lake_mem::ColorMask) -> Option<MemoryCap> {
+    let colors = crate::colors::count();
+    let cap = MEM.lock().alloc_colored(size, align, colors, mask)?;
+    zero_phys(cap.base(), cap.len());
+    Some(cap)
 }
 pub fn free(cap: MemoryCap) {
     MEM.lock().free(cap);
 }
 pub fn total_free() -> u64 {
     MEM.lock().total_free()
+}
+/// Ist `[base, base+len)` vollständig frei? Präzise Leckprüfung für eine **bestimmte** Region —
+/// im Gegensatz zu [`total_free`], das global ist und von der Nebenläufigkeit anderer Kerne
+/// mitbewegt wird.
+pub fn region_fully_free(base: u64, len: u64) -> bool {
+    MEM.lock().fully_free(base, len)
 }
 pub fn fragments() -> usize {
     MEM.lock().fragments()
@@ -1149,6 +1189,15 @@ static VSPACES: SpinLock<[VSpaceEnt; MAX_VSPACES]> =
 /// (zuerst, freigegeben), trägt dann die Metadaten ein (`MEM` und `VSPACES` nie
 /// gleichzeitig gehalten -> keine Sperrordnungs-Inversion zu Teardown/map).
 fn create_vspace() -> Option<(u16, u64)> {
+    create_vspace_masked(None)
+}
+
+/// Wie [`create_vspace`], aber die Seitentabellen kommen optional aus einem Farbsatz (todo A1).
+///
+/// Tabellenzeilen werden vom **Seitenlaufwerk der MMU** geladen und liegen im selben LLC wie
+/// alles andere; ein Walk im Namen einer PD hinterlaesst also Spuren. Sie mitzufaerben kostet
+/// nichts (zwei bzw. drei 4-KiB-Seiten) und schliesst einen Kanal, den man sonst uebersieht.
+fn create_vspace_masked(mask: Option<sel4lake_mem::ColorMask>) -> Option<(u16, u64)> {
     // ASID/VSpace-Slot aus der **Free-List** (VSPACES) belegen — wiederverwendbar
     // (kein monoton wachsender Zähler -> keine ASID-Leaks). Reservierung unter EINEM
     // Lock (Platzhalter), damit zwei Kerne nicht denselben Slot greifen.
@@ -1163,8 +1212,8 @@ fn create_vspace() -> Option<(u16, u64)> {
         t[i] = VSpaceEnt { used: true, l1: 0, l2: 0 }; // reserviert
         (i + 1) as u16
     };
-    let a = mem_alloc(4096, 4096);
-    let b = mem_alloc(4096, 4096);
+    let a = mem_alloc_masked(4096, 4096, mask);
+    let b = mem_alloc_masked(4096, 4096, mask);
     let (l1, l2) = match (a, b) {
         (Some(l1), Some(l2)) => (l1, l2),
         (a, b) => {
@@ -1293,6 +1342,17 @@ fn vspace_map_region(asid: u16, phys: u64) -> bool {
 /// `asid` mappen. 2-MiB-ausgerichtete 2-MiB-Regionen mit RW/RX nutzen den
 /// Block-Fastpath; sonst seitenweise (L3 wird bei Bedarf aus `MEM` angelegt).
 fn vspace_map(asid: u16, base: u64, len: u64, perm: hal::mmu::UserPerm) -> bool {
+    vspace_map_masked(asid, base, len, perm, None)
+}
+
+/// Wie [`vspace_map`], aber die bei Bedarf angelegten L3-Tabellen kommen aus `mask` (todo A1).
+fn vspace_map_masked(
+    asid: u16,
+    base: u64,
+    len: u64,
+    perm: hal::mmu::UserPerm,
+    mask: Option<sel4lake_mem::ColorMask>,
+) -> bool {
     let Some(l2) = vspace_l2(asid) else {
         return false;
     };
@@ -1309,7 +1369,9 @@ fn vspace_map(asid: u16, base: u64, len: u64, perm: hal::mmu::UserPerm) -> bool 
         let mut p = base;
         while p < base + len {
             let mapped =
-                hal::mmu::vspace_map_page(l2, p, perm, &mut || mem_alloc(4096, 4096).map(|c| c.base()));
+                hal::mmu::vspace_map_page(l2, p, perm, &mut || {
+                    mem_alloc_masked(4096, 4096, mask).map(|c| c.base())
+                });
             if !mapped {
                 all = false;
                 break;
@@ -1458,6 +1520,92 @@ pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u
         Some(t) => {
             record_user_kstack(t.slot(), kbase); // Kstack dem Thread zuordnen (reclaim!)
             set_vspace_of(t.slot(), packed); // ab jetzt isoliert
+            Some((t, rbase))
+        }
+        None => {
+            vspace_teardown(asid);
+            MEM.lock().free_region(PhysRegion::new(rbase, rlen));
+            release_user_kstack(kbase);
+            None
+        }
+    }
+}
+
+/// **Farbige Variante von [`spawn_isolated`]** (todo A1): die private Region der PD wird aus
+/// einem Farbsatz alloziert, der zu keinem anderen Satz überlappt — zwei so erzeugte PDs können
+/// sich im Last-Level-Cache nicht gegenseitig verdrängen und damit auch nicht über Laufzeit
+/// beobachten.
+///
+/// **Warum eine eigene Funktion und nicht ein Schalter in [`spawn_isolated`]:** dort ist die
+/// Region 2 MiB groß und wird als *ein* Blockdeskriptor gemappt. 2 MiB sind 512 Seiten, also 512
+/// aufeinanderfolgende Farben — bei den auf dem Testaufbau gemessenen 256 Farben überstreicht ein
+/// einziger Block jede Farbe zweimal. Der Blockdeskriptor und die Färbung schließen einander
+/// aus; das ist keine Nachlässigkeit, sondern Arithmetik. Diese Funktion nimmt deshalb die
+/// kleinere Region ([`colors::region_bytes`]) und den **seitenweisen** Mapping-Pfad, der ohnehin
+/// existiert. Der Preis steht damit im Code und nicht in einer Fußnote: statt eines PTE nun
+/// `region_bytes / 4 KiB` Stück, plus eine L3-Tabelle.
+///
+/// **Was hier NICHT gefärbt ist:** der Kernel-Stack der PD (16 KiB aus dem Pool) und die
+/// Seitentabellen. Beide gehören dem Kernel, nicht dem Subjekt; die Zusicherung lautet
+/// ausdrücklich „die *private Region* zweier PDs teilt keine Cache-Farbe", nicht „die PDs teilen
+/// keinerlei Cache-Zeile".
+///
+/// `None`, wenn die Maske leer ist, kein passend gefärbter Speicher frei ist, oder die
+/// VSpace/Thread-Erzeugung scheitert. Gibt `(ThreadId, region_base)`.
+pub fn spawn_isolated_colored(
+    entry: usize,
+    arg: usize,
+    prio: u8,
+    mask: sel4lake_mem::ColorMask,
+) -> Option<(ThreadId, u64)> {
+    let core = hal::cpu::core_id();
+    let colors = crate::colors::count();
+    let region_sz = crate::colors::region_bytes();
+    // Region, Kernel-Stack UND Seitentabellen dieser PD kommen aus demselben Streifen.
+    let kbase = claim_user_kstack_masked(Some(mask))?;
+
+    let cap = match MEM.lock().alloc_colored(region_sz, crate::colors::PAGE, colors, mask) {
+        Some(c) => c,
+        None => {
+            release_user_kstack(kbase);
+            return None;
+        }
+    };
+    let (rbase, rlen) = (cap.base(), cap.len());
+    zero_phys(rbase, rlen); // wie `mem_alloc`: nichts geht ungenullt an ein Subjekt
+    if rbase < hal::mmu::USER_RAM_MIN || rbase + rlen > hal::mmu::GIB1_END {
+        MEM.lock().free_region(PhysRegion::new(rbase, rlen));
+        release_user_kstack(kbase);
+        return None;
+    }
+    let Some((asid, l1)) = create_vspace_masked(Some(mask)) else {
+        MEM.lock().free_region(PhysRegion::new(rbase, rlen));
+        release_user_kstack(kbase);
+        return None;
+    };
+    // Seitenweise statt Block — s. Funktionsdoku. `vspace_map` legt die L3 bei Bedarf an und
+    // `vspace_teardown` sammelt sie beim Abbau wieder ein.
+    if !vspace_map_masked(asid, rbase, rlen, hal::mmu::UserPerm::Rw, Some(mask)) {
+        vspace_teardown(asid);
+        MEM.lock().free_region(PhysRegion::new(rbase, rlen));
+        release_user_kstack(kbase);
+        return None;
+    }
+    let packed = ((asid as u64) << 48) | l1;
+
+    let (user_base, user_len) = (rbase as usize, rlen as usize);
+    let tid = {
+        let mut sched = SCHEDS[core].lock();
+        let r = sched.spawn_user(core, entry, arg, kbase, USER_KSTACK_SIZE, user_base, user_len, prio);
+        if let Some(t) = r {
+            fp_reset_slot(t.slot());
+        }
+        r
+    };
+    match tid {
+        Some(t) => {
+            record_user_kstack(t.slot(), kbase);
+            set_vspace_of(t.slot(), packed);
             Some((t, rbase))
         }
         None => {
@@ -4144,7 +4292,33 @@ fn dma_ctx_regions_live() -> bool {
 /// getrennt. Diese Funktionen werden NUR vom Selbsttest/Bericht (`threads.rs`) gelesen; sie tragen
 /// keine Sicherheitsinvariante und sind nicht Teil der zu verifizierenden DMA-Kern-API. `use
 /// super::*` bringt die (für Kindmodule sichtbaren) privaten Statics/Imports von `system` in Scope.
+#[cfg(feature = "selftest")]
 pub(crate) mod testsupport {
+    /// Kernel-Stack-Basis des Thread-Slots (0 = keiner). Fuer den Farbtest (todo A1): die
+    /// Zusicherung „auch der Kernel-Stack der PD liegt in ihrem Farbsatz" muss nachpruefbar
+    /// sein und nicht nur im Kommentar stehen.
+    pub fn kstack_of(thread_slot: usize) -> u64 {
+        super::KSTACKS.lock().base_of[thread_slot]
+    }
+
+    /// Die beiden obersten Seitentabellen der VSpace `asid` (`(l1, l2)`), oder `(0, 0)`.
+    pub fn vspace_tables_of(asid: u16) -> (u64, u64) {
+        if asid == 0 || asid as usize > super::MAX_VSPACES {
+            return (0, 0);
+        }
+        let e = super::VSPACES.lock()[asid as usize - 1];
+        if e.used {
+            (e.l1, e.l2)
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// ASID des Thread-Slots (0 = nicht isoliert).
+    pub fn asid_of(thread_slot: usize) -> u16 {
+        (super::vspace_of(thread_slot) >> 48) as u16
+    }
+
     use super::*;
 
     /// Anzahl Regionen im Kontext der StreamID. `0`, wenn kein Kontext.

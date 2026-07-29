@@ -80,15 +80,21 @@ const TICK_HZ: u64 = 100;
 
 // --- Telemetrie der Demo-Threads ------------------------------------------------------------
 
+#[cfg(feature = "selftest")]
 const NWORKERS: usize = 3;
 /// So viele Runden muss jeder Worker schaffen, damit „Präemption läuft" belegt ist.
+#[cfg(feature = "selftest")]
 const WORK_TARGET: u64 = 3;
+#[cfg(feature = "selftest")]
 static WORKER_ROUNDS: [AtomicU64; NWORKERS] = [const { AtomicU64::new(0) }; NWORKERS];
+#[cfg(feature = "selftest")]
 static IPC_RESULT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "selftest")]
 static IPC_DONE: AtomicBool = AtomicBool::new(false);
 
 /// Worker: zählt Runden. Da er **nie** freiwillig abgibt, beweist steigender Fortschritt
 /// aller Worker, dass der Timer-Interrupt sie gegeneinander verdrängt.
+#[cfg(feature = "selftest")]
 extern "C" fn worker(arg: usize) -> ! {
     loop {
         WORKER_ROUNDS[arg].fetch_add(1, Ordering::Relaxed);
@@ -100,6 +106,7 @@ extern "C" fn worker(arg: usize) -> ! {
 
 /// IPC-Server: verdoppelt die erste Nachricht und antwortet. Erreichbar **nur** über die
 /// Endpoint-Cap in Slot 0 seiner PD.
+#[cfg(feature = "selftest")]
 extern "C" fn ipc_server(_arg: usize) -> ! {
     loop {
         let m = invoke(sys::RECV, 0, [0; 4], 0);
@@ -114,6 +121,7 @@ extern "C" fn ipc_server(_arg: usize) -> ! {
 }
 
 /// IPC-Client: ruft den Server über seine Send-Cap und hält das Ergebnis fest.
+#[cfg(feature = "selftest")]
 extern "C" fn ipc_client(_arg: usize) -> ! {
     let r = invoke(sys::CALL, 0, [21, 0, 0, 0], 0);
     IPC_RESULT.store(r.msg[0], Ordering::Release);
@@ -133,10 +141,12 @@ extern "C" fn ipc_client(_arg: usize) -> ! {
 /// Der Zähler wird **aus Ring 3** hochgezählt und muss deshalb in einer `US`-schreibbaren Seite
 /// liegen — die Kernel-Statics (`.bss`/`.data`) sind supervisor-only.
 #[link_section = ".user_data"]
+#[cfg(feature = "selftest")]
 static USER_SYSCALLS: AtomicU64 = AtomicU64::new(0);
 
 /// Ring-3-Arbeiter: ruft den Kernel per Syscall (`SYS_YIELD`) und zählt die Runden.
 #[link_section = ".user_text"]
+#[cfg(feature = "selftest")]
 extern "C" fn ring3_worker(_arg: usize) -> ! {
     loop {
         // SAFETY: `int 0x80` ist der für Ring 3 freigegebene Syscall-Vektor (IDT-Gate DPL 3);
@@ -154,6 +164,7 @@ extern "C" fn ring3_worker(_arg: usize) -> ! {
 /// Ring-3-Eindringling: liest **Kernel**-Speicher. Muss faulten — der Kernel beendet ihn und
 /// läuft weiter (das x86-Gegenstück zum `el0iso`-Test auf aarch64).
 #[link_section = ".user_text"]
+#[cfg(feature = "selftest")]
 extern "C" fn ring3_intruder(_arg: usize) -> ! {
     // SAFETY(-Absicht): Genau dieser Zugriff SOLL fehlschlagen. Das Kernel-Image liegt bei
     // 1 MiB in supervisor-only Seiten; ein Ring-3-Lesezugriff dorthin muss #PF auslösen.
@@ -172,15 +183,19 @@ extern "C" fn ring3_intruder(_arg: usize) -> ! {
 // der isolierte muss faulten.
 /// Prüfadresse in fremdem User-RAM (wird vom Kernel beschrieben, s. `spawn_demo`).
 #[link_section = ".user_data"]
+#[cfg(feature = "selftest")]
 static ISO_PROBE_ADDR: AtomicU64 = AtomicU64::new(0);
 /// Der SAS-Thread konnte lesen (und meldet den Wert).
 #[link_section = ".user_data"]
+#[cfg(feature = "selftest")]
 static SAS_READ_OK: AtomicU64 = AtomicU64::new(0);
 /// Erwarteter Wert an der Prüfadresse.
+#[cfg(feature = "selftest")]
 const PROBE_MAGIC: u64 = 0x5E14_1A4E_0BED_C0DE;
 
 /// SAS-Ring-3-Thread: liest die Prüfadresse — im gemeinsamen Adressraum ist das erlaubt.
 #[link_section = ".user_text"]
+#[cfg(feature = "selftest")]
 extern "C" fn sas_probe(_arg: usize) -> ! {
     let a = ISO_PROBE_ADDR.load(Ordering::Relaxed);
     // SAFETY: `a` zeigt auf eine vom Kernel angelegte, im SAS-Modell user-lesbare RAM-Zelle.
@@ -198,6 +213,7 @@ extern "C" fn sas_probe(_arg: usize) -> ! {
 /// Isolierter Ring-3-Thread: liest **dieselbe** Adresse. In seinem eigenen Adressraum ist sie
 /// nicht user-gemappt -> #PF -> der Kernel beendet ihn.
 #[link_section = ".user_text"]
+#[cfg(feature = "selftest")]
 extern "C" fn iso_probe(_arg: usize) -> ! {
     let a = ISO_PROBE_ADDR.load(Ordering::Relaxed);
     // SAFETY(-Absicht): Genau dieser Zugriff SOLL fehlschlagen — er liegt außerhalb der Region
@@ -232,6 +248,7 @@ extern "C" fn ap_entry() -> ! {
 }
 
 /// Alle Demo-Threads + PDs aufsetzen (vor dem Freigeben der Interrupts).
+#[cfg(feature = "selftest")]
 fn spawn_demo() -> bool {
     // Drei Worker auf dem Bootkern -> sie können nur durch Präemption alle vorankommen.
     for i in 0..NWORKERS {
@@ -262,6 +279,37 @@ fn spawn_demo() -> bool {
     if system::spawn_isolated(iso_probe as *const () as usize, 0, system::IDLE_PRIO).is_none() {
         println!("iso     : spawn_isolated fehlgeschlagen");
         return false;
+    }
+
+    #[cfg(feature = "selftest")]
+    {
+        // Cache-Partitionierung (todo A1): zwei PDs mit disjunkten Farbsaetzen. Der Test baut sie
+        // sofort wieder ab -- geprueft wird die Zuteilung, nicht ihr Programm.
+        let c = crate::colors::run_color(iso_probe as *const () as usize, system::IDLE_PRIO);
+        if !c.usable {
+            println!(
+                "color   : SKIP -- {} Farbe(n) gemessen, unter 2 gibt es nichts zu trennen (QEMU meldet \
+                 ohne echtes CPU-Modell keine Cache-Geometrie; mit -cpu Skylake-Client sind es 256)",
+                c.colors
+            );
+        } else {
+            println!(
+                "color   : {} Farben, {} Partitionen, Region {} KiB · in_mask={} kernelseite={} disjunkt={} \
+                 uebergross_abgewiesen={} bilanz={}",
+                c.colors,
+                crate::colors::PARTITIONS,
+                crate::colors::region_bytes() / 1024,
+                c.in_mask as u8,
+                c.kernel_side_in_mask as u8,
+                c.disjoint as u8,
+                c.oversize_refused as u8,
+                c.balanced as u8
+            );
+            println!(
+                "color   : {} (zwei isolierte PDs teilen sich keine Cache-Farbe)",
+                if c.ok { "ALL PASS" } else { "FAIL" }
+            );
+        }
     }
 
     // Cap-gesichertes IPC: ein Endpoint, zwei PDs. Der Server hält die RECV-, der Client die
@@ -297,6 +345,7 @@ fn spawn_demo() -> bool {
 
 /// Sind alle Demo-Aussagen belegt? Dazu gehört, dass **jeder** Kern tickt — ein Kern, der
 /// zwar bootet, aber keinen Timer-Interrupt bekommt, würde sonst unbemerkt bleiben.
+#[cfg(feature = "selftest")]
 fn all_done() -> bool {
     let workers = (0..NWORKERS).all(|i| WORKER_ROUNDS[i].load(Ordering::Relaxed) >= WORK_TARGET);
     let cores = (0..system::num_cores()).all(|c| hal::timer::ticks(c) > 0);
@@ -306,6 +355,7 @@ fn all_done() -> bool {
 }
 
 /// Bericht + Abschaltung (das Testskript wertet die Marker aus).
+#[cfg(feature = "selftest")]
 fn report_and_off() -> ! {
     let ticks = hal::timer::ticks(0);
     let mut all_tick = true;
@@ -388,6 +438,7 @@ pub fn run(multiboot_info: u64) -> ! {
         hal::cpu::csv3(),
         hal::cpu::sb_supported() as u8
     );
+    crate::colors::report();
 
     // --- Speicher + arch-neutrale Selbsttests (identisch zu aarch64) ---
     let ram_end = match ram_end_from_multiboot(multiboot_info) {
@@ -442,6 +493,7 @@ pub fn run(multiboot_info: u64) -> ! {
         system::mem_regions_dropped()
     );
     println!("mem     : freies RAM [{free_base:#x}, {ram_end:#x})");
+    #[cfg(feature = "selftest")]
     crate::selftest::run();
 
     // --- Kernel-Kern: Hooks, Tabellen, Scheduler ---
@@ -505,14 +557,17 @@ pub fn run(multiboot_info: u64) -> ! {
         // Schritt 2: DMAR-Auswertung + Gruppenbildung. Der Selbsttest laeuft gegen eine
         // EINGESPEISTE Tabelle/Topologie -- auf dem realen Aufbau (flach, keine RMRR) wuerden
         // Ausschlusspfad und Gruppenfaelle nie ausgefuehrt.
-        let st = super::dmar_selftest::run();
-        println!(
-            "vtdgrp  : Selbsttest: parse={} Catch-all-zuletzt={} Bridge-Scope-Subhierarchie={} Gruppen={} Alias-Mengen={} RMRR-ausgeschlossen={} Firmware-Muell-abgefangen={} Oracle={}",
-            st.parse_ok, st.catch_all_last, st.bridge_scope_subtree, st.groups_ok,
-            st.alias_ok, st.rmrr_excluded, st.malformed_caught, st.audit
-        );
-        super::dmar_selftest::report_real();
-        println!("vtdgrp  : {}", if st.ok() { "ALL PASS" } else { "FAILURES" });
+        #[cfg(feature = "selftest")]
+        {
+            let st = super::dmar_selftest::run();
+            println!(
+                "vtdgrp  : Selbsttest: parse={} Catch-all-zuletzt={} Bridge-Scope-Subhierarchie={} Gruppen={} Alias-Mengen={} RMRR-ausgeschlossen={} Firmware-Muell-abgefangen={} Oracle={}",
+                st.parse_ok, st.catch_all_last, st.bridge_scope_subtree, st.groups_ok,
+                st.alias_ok, st.rmrr_excluded, st.malformed_caught, st.audit
+            );
+            super::dmar_selftest::report_real();
+            println!("vtdgrp  : {}", if st.ok() { "ALL PASS" } else { "FAILURES" });
+        }
         let inv = hal::vtd::invalidate_context_cache();
         println!(
             "iommu   : Uebersetzung aktiv={} (GSTS.TES), Kontext-Cache-Invalidierung quittiert={inv}, dma_audit={}",
@@ -600,23 +655,29 @@ pub fn run(multiboot_info: u64) -> ! {
     // `threads/mod.rs`, und das Modul ist aarch64-only: auf x86 haben sie nicht geskippt, es gab
     // sie nicht. Ein Test, den es auf einer Architektur nicht gibt, kann dort auch nicht gruen
     // werden; das Abnahmekriterium war so nicht einloesbar.
-    let live_rid = hal::pcie::find(hal::pcie::VIRTIO_VENDOR, &hal::pcie::VIRTIO_RNG_DEVICES)
-        .map(|d| d.rid())
-        .unwrap_or(0);
-    let w = crate::dmatests::run_dmawin(live_rid);
-    println!("dmawin  : 32-Bit-Geraet-abgewiesen={} Fenster-voll-abgewiesen={} Kontext-danach-intakt={} balanciert={} Geraete-ohne-deklarierte-Adressbreite={}",
-        w.narrow, w.exhausted, w.intact, w.balanced, w.undeclared);
-    println!("dmawin  : {}", if w.ok { "ALL PASS" } else { "FAILURES" });
-    let tk = crate::dmatests::run_dmatok(live_rid);
-    println!("dmatok  : attach-installierte-Uebersetzung={} delete-ohne-detach-baut-ab={} Region-danach-frei={} unbestaetigte-Stilllegung-bleibt-pending={} Audit-Code-7-haelt={}",
-        tk.attached, tk.tears, tk.freed, tk.pending, tk.audit7);
-    println!("dmatok  : {}", if tk.ok { "ALL PASS" } else { "FAILURES" });
-
-    if !spawn_demo() {
-        println!("bringup : FAILURES (Demo-Aufbau fehlgeschlagen)");
-        hal::power::system_off();
+    #[cfg(feature = "selftest")]
+    {
+        let live_rid = hal::pcie::find(hal::pcie::VIRTIO_VENDOR, &hal::pcie::VIRTIO_RNG_DEVICES)
+            .map(|d| d.rid())
+            .unwrap_or(0);
+        let w = crate::dmatests::run_dmawin(live_rid);
+        println!("dmawin  : 32-Bit-Geraet-abgewiesen={} Fenster-voll-abgewiesen={} Kontext-danach-intakt={} balanciert={} Geraete-ohne-deklarierte-Adressbreite={}",
+            w.narrow, w.exhausted, w.intact, w.balanced, w.undeclared);
+        println!("dmawin  : {}", if w.ok { "ALL PASS" } else { "FAILURES" });
+        let tk = crate::dmatests::run_dmatok(live_rid);
+        println!("dmatok  : attach-installierte-Uebersetzung={} delete-ohne-detach-baut-ab={} Region-danach-frei={} unbestaetigte-Stilllegung-bleibt-pending={} Audit-Code-7-haelt={}",
+            tk.attached, tk.tears, tk.freed, tk.pending, tk.audit7);
+        println!("dmatok  : {}", if tk.ok { "ALL PASS" } else { "FAILURES" });
     }
-    println!("bringup : 3 Worker + 2 PDs (IPC-Server/Client) eingeplant");
+
+    #[cfg(feature = "selftest")]
+    {
+        if !spawn_demo() {
+            println!("bringup : FAILURES (Demo-Aufbau fehlgeschlagen)");
+            hal::power::system_off();
+        }
+        println!("bringup : 3 Worker + 2 PDs (IPC-Server/Client) eingeplant");
+    }
 
     // --- Sekundärkerne starten (INIT-SIPI-SIPI, s. `hal::power`) ---
     let mut online = 1usize;
@@ -646,18 +707,34 @@ pub fn run(multiboot_info: u64) -> ! {
 
     // Ab hier schedult der Timer-Interrupt präemptiv; dieser Kontext ist der Idle-Thread.
     hal::cpu::local_irq_enable();
-    let mut spins: u64 = 0;
-    loop {
-        system::reap();
-        if all_done() {
-            report_and_off();
+    #[cfg(feature = "selftest")]
+    {
+        let mut spins: u64 = 0;
+        loop {
+            system::reap();
+            if all_done() {
+                report_and_off();
+            }
+            // Notbremse, damit ein hängender Test nicht ewig läuft (der Bericht zeigt dann, was fehlt).
+            spins += 1;
+            if spins > 50_000_000 {
+                println!("bringup : WATCHDOG — nicht alle Aussagen belegt");
+                report_and_off();
+            }
+            core::hint::spin_loop();
         }
-        // Notbremse, damit ein hängender Test nicht ewig läuft (der Bericht zeigt dann, was fehlt).
-        spins += 1;
-        if spins > 50_000_000 {
-            println!("bringup : WATCHDOG — nicht alle Aussagen belegt");
-            report_and_off();
+    }
+    // OHNE `selftest` bleibt genau das hier uebrig, und das ist die ehrliche Aussage von todo F2:
+    // der Kernel hat derzeit **keinen Nicht-Test-Zweck**. Es gibt kein Boot-Archiv auf x86 und
+    // keinen Root-Task, dem die Wurzel-Caps uebergeben wuerden. Das Gating liefert also keinen
+    // schlankeren Kernel, sondern einen leeren -- deshalb steht `selftest` weiterhin in `default`.
+    // Diese Konfiguration wird trotzdem GEBAUT (test-qemu-x86.sh), damit sie nicht verrottet.
+    #[cfg(not(feature = "selftest"))]
+    {
+        println!("bringup : Kernel-Kern steht; ohne Feature `selftest` gibt es keine Aufgabe (todo F2)");
+        loop {
+            system::reap();
+            core::hint::spin_loop();
         }
-        core::hint::spin_loop();
     }
 }

@@ -77,6 +77,13 @@ Alles andere ist unabhängig. Nur hier müsst ihr euch abstimmen:
 4. **Dynamische Cap-Tabellen** (A-3.4 ↔ B-4.2): mehr PDs als Farbstreifen muss **sauber
    scheitern**, nicht still überlappen.
 
+## Statusdatei
+
+[STATUS.md](STATUS.md) ist der Blick von aussen: was läuft, was ist fertig, was blockiert. Jeder
+schreibt **seinen eigenen Abschnitt** und lässt den des anderen in Ruhe. Aktualisiert wird nach
+jedem abgeschlossenen Schritt — nicht nach der Uhr und nicht erst am Ende. Simon liest dort mit,
+ohne nachfragen zu müssen.
+
 ## Vor jeder Übergabe
 
 ```sh

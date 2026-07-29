@@ -19,6 +19,7 @@ mod bootinfo;
 mod bringup;
 #[cfg(feature = "selftest")]
 mod dmar_selftest;
+mod multiboot;
 
 global_asm!(
     r#"

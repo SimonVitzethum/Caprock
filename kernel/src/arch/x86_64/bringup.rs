@@ -21,59 +21,12 @@
 
 use crate::system;
 use sel4lake_abi::{result, sys};
-use sel4lake_hal::{self as hal, println, syscall::invoke};
+use sel4lake_hal::{self as hal, print, println, syscall::invoke};
 use sel4lake_mem::Rights;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Rückfall-RAM-Obergrenze, falls der Bootloader keinen Speicherplan mitgibt.
 const RAM_END_FALLBACK: u64 = 128 * 1024 * 1024;
-
-/// **Speicherplan aus der Multiboot-Info** — das x86-Gegenstück zum `/memory`-Knoten des DTB.
-///
-/// Gesucht wird das Ende des nutzbaren RAM: die größte als „available" (Typ 1) gemeldete
-/// Region, die oberhalb von 1 MiB beginnt (darunter liegen BIOS-/Legacy-Bereiche). Alle
-/// Zugriffe sind gegen die von der Struktur selbst gemeldeten Längen geprüft; ein fehlendes
-/// oder unplausibles `mmap` führt zum Rückfallwert, nie zu einem Fehlzugriff.
-fn ram_end_from_multiboot(info: u64) -> Option<u64> {
-    if info == 0 {
-        return None;
-    }
-    // SAFETY: Der Bootloader übergibt einen gültigen Zeiger auf seine Info-Struktur im
-    // identity-gemappten Low-Memory; wir lesen nur die Felder, deren Vorhandensein `flags`
-    // zusichert.
-    let (flags, mmap_len, mmap_addr) = unsafe {
-        (
-            core::ptr::read_volatile(info as *const u32),
-            core::ptr::read_volatile((info + 44) as *const u32) as u64,
-            core::ptr::read_volatile((info + 48) as *const u32) as u64,
-        )
-    };
-    if flags & (1 << 6) == 0 || mmap_len == 0 {
-        return None; // kein Speicherplan vorhanden
-    }
-    let mut best = 0u64;
-    let mut off = 0u64;
-    while off + 24 <= mmap_len {
-        let e = mmap_addr + off;
-        // SAFETY: `e` liegt innerhalb des von `mmap_len` aufgespannten Bereichs (s. Schleife).
-        let (size, base, len, kind) = unsafe {
-            (
-                core::ptr::read_volatile(e as *const u32) as u64,
-                core::ptr::read_volatile((e + 4) as *const u64),
-                core::ptr::read_volatile((e + 12) as *const u64),
-                core::ptr::read_volatile((e + 20) as *const u32),
-            )
-        };
-        if kind == 1 && base >= 0x10_0000 {
-            best = best.max(base + len);
-        }
-        if size == 0 {
-            break; // defekte Kette -> abbrechen statt weiterzuraten
-        }
-        off += size + 4; // `size` zählt sich selbst nicht mit
-    }
-    (best > 0x10_0000).then_some(best)
-}
 
 /// Zeitscheibe (Hz) — wie auf aarch64.
 const TICK_HZ: u64 = 100;
@@ -441,7 +394,8 @@ pub fn run(multiboot_info: u64) -> ! {
     crate::colors::report();
 
     // --- Speicher + arch-neutrale Selbsttests (identisch zu aarch64) ---
-    let ram_end = match ram_end_from_multiboot(multiboot_info) {
+    let mbi = super::multiboot::MultibootInfo::new(multiboot_info);
+    let ram_end = match mbi.and_then(|m| m.ram_end()) {
         Some(e) => {
             println!("mbi     : Speicherplan gelesen -> RAM bis {:#x} ({} MiB)", e, e >> 20);
             e
@@ -451,6 +405,37 @@ pub fn run(multiboot_info: u64) -> ! {
             RAM_END_FALLBACK
         }
     };
+    // --- Multiboot-Module (A-1.1) ---
+    //
+    // Die Startmenge kommt auf x86 als Multiboot-Module. Zwei Dinge muessen VOR der ersten
+    // Allokation stehen, nicht danach:
+    //
+    // 1. Die Modulbereiche duerfen dem `PhysAllocator` nie als frei gemeldet werden. Sonst
+    //    ueberschreibt die erste Allokation genau das Archiv, das der Kernel gleich lesen will --
+    //    und zwar lautlos, weil ein ueberschriebenes Archiv einfach "kein gueltiges Archiv" ergibt.
+    // 2. Der Loader muss wissen, WO das Archiv liegt. Auf ARM ist das eine Verabredung mit dem
+    //    Testaufbau; hier sagt es der Bootloader erst zur Laufzeit.
+    let mut mods = [super::multiboot::Module { start: 0, end: 0 }; super::multiboot::MAX_MODULES];
+    let nmods = mbi.map(|m| m.modules(&mut mods)).unwrap_or(0);
+    let claimed = mbi.map(|m| m.mods_claimed()).unwrap_or(0);
+    if nmods > 0 {
+        print!("mbi     : {nmods} Modul(e):");
+        for m in &mods[..nmods] {
+            print!(" [{:#x}..{:#x}) {} KiB", m.start, m.end, m.len() >> 10);
+        }
+        println!();
+    }
+    if claimed > nmods {
+        // Eine stille Kuerzung sieht in jeder spaeteren Auswertung aus wie Vollstaendigkeit.
+        println!(
+            "mbi     : HINWEIS Bootloader meldet {claimed} Module, ausgewertet werden {nmods} (Grenze {} bzw. leere Eintraege verworfen)",
+            super::multiboot::MAX_MODULES
+        );
+    }
+    // Modul 0 ist das Boot-Archiv (Verabredung mit `test-qemu-x86.sh`: `-initrd boot-archive.bin`).
+    if nmods > 0 {
+        crate::loader::set_archive_span(mods[0].start, mods[0].len());
+    }
     let free_base = hal::mmu::kernel_end().max(hal::mmu::USER_RAM_MIN);
     /*
      * Den freien Speicher **absichtlich zerstueckelt** uebergeben, statt als einen Block.
@@ -469,11 +454,20 @@ pub fn run(multiboot_info: u64) -> ! {
     let chunk = (total / SPLIT) & !0xfff;
     let mut bi = super::bootinfo::HandoverInfo::empty();
     bi.ram_top = ram_end;
+    let mut gross = 0u64; // Summe vor dem Ausschnitt
     for i in 0..SPLIT {
         let base = free_base + i * chunk;
         let len = if i == SPLIT - 1 { ram_end - base } else { chunk };
-        bi.push_region(base, len);
+        gross += len;
+        // Die Modulbereiche werden hier **ausgeschnitten**, nicht spaeter markiert: was nie als
+        // frei gemeldet wurde, kann auch nicht vergeben werden (A-1.1).
+        super::multiboot::subtract_holes(base, len, &mods[..nmods], &mut |b, l| {
+            bi.push_region(b, l);
+        });
     }
+    // Wieviel durch den Ausschnitt wegfiel -- als Zahl, nicht als Gefuehl.
+    let net = bi.mem_regions().iter().map(|r| r.len).sum::<u64>();
+    let carved = gross - net;
     // Dieselbe Pruefung, die der Uebergabeweg vor jeder Benutzung faehrt -- damit sie im
     // regulaeren Lauf auch tatsaechlich einmal ausgefuehrt wird.
     if !bi.valid() {
@@ -493,6 +487,20 @@ pub fn run(multiboot_info: u64) -> ! {
         system::mem_regions_dropped()
     );
     println!("mem     : freies RAM [{free_base:#x}, {ram_end:#x})");
+    if carved > 0 {
+        println!("mem     : {carved} Byte fuer Multiboot-Module ausgeschnitten (vor der ersten Allokation)");
+    }
+    #[cfg(feature = "selftest")]
+    {
+        // Das Ausschneiden traegt eine Sicherheitsaussage; der reale Lauf sieht davon nur EINEN
+        // Fall. Die Grenzfaelle werden eingespeist (s. `multiboot::selftest`).
+        let ok = super::multiboot::selftest();
+        println!(
+            "mbmod   : {} (Modulbereiche werden aus der Freiliste ausgeschnitten: Rand, Ueberlappung, unsortiert, Vollabdeckung)",
+            if ok { "ALL PASS" } else { "FAILURES" }
+        );
+    }
+    crate::loader::probe(); // was liegt im Archiv? (A-1.1: die Quelle ist jetzt auch auf x86 da)
     #[cfg(feature = "selftest")]
     crate::selftest::run();
 

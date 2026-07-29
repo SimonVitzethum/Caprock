@@ -253,15 +253,11 @@ fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
 /// rückgabe und Abbruch finalisierter Reply-Calls). Wird **ohne** gehaltene Dispatch-Locks
 /// gerufen (der Dispatch gibt CAPS/EPS vorher frei); `cap_delete` sperrt selbst CAPS+MEM
 /// in der richtigen Ordnung. Ein Fehlschlag (Cap bereits weg) ist unkritisch.
-/// SYS_LOAD-Callback in den Binary-Loader. Auf x86_64 gibt es (noch) kein Boot-Archiv —
-/// dessen Fenster ist ARM-/QEMU-`virt`-spezifisch; das x86-Gegenstück wären Multiboot-Module.
-/// Bis dahin schlägt `SYS_LOAD` dort sauber fehl, statt etwas Halbes zu laden.
-#[cfg(target_arch = "aarch64")]
+/// SYS_LOAD-Callback in den Binary-Loader (A-1.5). Seit A-1.1 gibt es das Boot-Archiv auf
+/// **beiden** Architekturen: auf ARM in einem reservierten RAM-Fenster, auf x86 als
+/// Multiboot-Modul. Wo keines vorliegt, schlägt der Aufruf sauber fehl (der Loader liefert
+/// `None`), statt etwas Halbes zu laden.
 use crate::loader::load_by_index;
-#[cfg(not(target_arch = "aarch64"))]
-fn load_by_index(_index: u32, _endow: &[(usize, CapPtr)]) -> Option<usize> {
-    None
-}
 
 fn dispatch_delete_cap(cap: sel4lake_cap::CapPtr) {
     let _ = cap_delete(cap);

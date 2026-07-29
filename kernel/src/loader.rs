@@ -8,6 +8,7 @@
 //! **L0:** das Boot-Archiv aus dem reservierten RAM-Fenster lesen + die Module melden.
 
 use crate::trusted_keys::{MIN_VERSION, TRUSTED_KEYS};
+use core::sync::atomic::{AtomicU64, Ordering};
 use sel4lake_cap::CapPtr;
 use sel4lake_hal::{print, println};
 use sel4lake_loader::archive::Archive;
@@ -28,13 +29,55 @@ pub const MOD_WINDOW: u64 = 0x0100_0000; // 16 MiB
 /// Normal-WB-Region (GiB 2..9), also EL1-lesbar.
 pub const MOD_BASE: u64 = 0x0001_4000_0000 - MOD_WINDOW; // 0x1_3F00_0000
 
+/// **Wo das Boot-Archiv liegt** — zur Laufzeit gesetzt, nicht fest verdrahtet (A-1.1).
+///
+/// Auf ARM ist die Lage eine Verabredung mit dem Testaufbau (`-device loader,addr=MOD_BASE` in ein
+/// reserviertes Fenster); auf x86 legt der Bootloader das Archiv als Multiboot-Modul dorthin, wo
+/// er will, und sagt die Adresse erst beim Start. Also entscheidet der Hochlauf, nicht der
+/// Übersetzer. Fehlt die Angabe, bleibt es beim ARM-Fenster (unverändertes Verhalten dort) bzw.
+/// bei „kein Archiv".
+static ARCHIVE_BASE: AtomicU64 = AtomicU64::new(0);
+static ARCHIVE_LEN: AtomicU64 = AtomicU64::new(0);
+
+/// Die Lage des Boot-Archivs melden. Muss **vor** der ersten Archiv-Benutzung laufen und
+/// beschreibt einen Bereich, den der `PhysAllocator` nicht vergeben darf.
+pub fn set_archive_span(base: u64, len: u64) {
+    ARCHIVE_BASE.store(base, Ordering::Relaxed);
+    ARCHIVE_LEN.store(len, Ordering::Relaxed);
+}
+
+/// Die aktuell geltende Lage des Archivs (`(0, 0)` = keine).
+pub fn archive_span() -> (u64, u64) {
+    let base = ARCHIVE_BASE.load(Ordering::Relaxed);
+    if base != 0 {
+        return (base, ARCHIVE_LEN.load(Ordering::Relaxed));
+    }
+    // Rückfall: das statisch reservierte ARM-Fenster. Auf x86 gibt es kein solches Fenster —
+    // dort heißt „nicht gemeldet" genau das, und `read_archive` liefert None statt an einer
+    // erratenen Adresse zu lesen.
+    #[cfg(target_arch = "aarch64")]
+    {
+        (MOD_BASE, MOD_WINDOW)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        (0, 0)
+    }
+}
+
 /// Das Boot-Archiv aus dem reservierten Fenster lesen + **vollständig validieren**. `None`, wenn
 /// kein gültiges Archiv vorliegt (fehlend/beschädigt) — der Kernel läuft dann ohne externe Module.
 pub fn read_archive() -> Option<Archive<'static>> {
-    // SAFETY: `[MOD_BASE, MOD_BASE+MOD_WINDOW)` ist reserviertes, statisch identity-gemapptes
-    // Normal-RAM (vom PhysAllocator ausgenommen, s. `system::init_mem`-Aufruf). Nur **lesender**
-    // Zugriff; der Parser (`sel4lake-loader`) ist vollständig bounds-geprüft und panik-frei.
-    let bytes = unsafe { core::slice::from_raw_parts(MOD_BASE as *const u8, MOD_WINDOW as usize) };
+    let (base, len) = archive_span();
+    if base == 0 || len == 0 {
+        return None;
+    }
+    // SAFETY: `[base, base+len)` ist reservierter, identity-gemappter Normal-RAM — auf ARM das
+    // statische Fenster (vom PhysAllocator ausgenommen, s. `system::init_mem`-Aufruf), auf x86 der
+    // vom Bootloader gemeldete Modulbereich, der vor der ersten Allokation aus der Freiliste
+    // ausgeschnitten wurde (`arch::x86_64::bringup`). Nur **lesender** Zugriff; der Parser
+    // (`sel4lake-loader`) ist vollständig bounds-geprüft und panik-frei.
+    let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, len as usize) };
     Archive::parse(bytes).ok()
 }
 

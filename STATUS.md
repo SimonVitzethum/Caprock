@@ -4,18 +4,18 @@
 Beide Agenten schreiben ihren eigenen Abschnitt und lassen den des anderen in Ruhe.
 Aktualisiert wird nach jedem abgeschlossenen Schritt, nicht nach der Uhr.*
 
-**Zuletzt geändert (B): 2026-07-29 12:33 UTC**
+**Zuletzt geändert (B): 2026-07-29 12:40 UTC**
 
 ---
 
 ## Strang B — Verlässlichkeit und Isolation (Claude B)
 
-**Gerade in Arbeit:** B-1.3 — Wiederholungslauf in `test-qemu-x86.sh`. Ein einzelner Durchlauf
-kann einen Nichtdeterminismus grundsätzlich nicht finden; die Suite braucht einen N-fach-Modus,
-der die Quote meldet.
+**Gerade in Arbeit:** B-2.1 — die ARM-Suite aus einem frischen Clone lauffähig machen. `keys/` ist
+gitignored, damit startet `test-qemu.sh` aus einem Clone nicht, und **jede aarch64-Zeile ist
+ungeprüft**. Recherche zu `sign_trusted.py`/`trusted_keys.rs` läuft.
 
-**Als Nächstes:** B-2.1 (ARM-Suite aus frischem Clone lauffähig — `keys/` ist gitignored, damit ist
-jede aarch64-Zeile ungeprüft), dann B-2.2 (`hal::cache` auf ARM tatsächlich ausführen).
+**Als Nächstes:** B-2.2 (`hal::cache` auf ARM tatsächlich ausführen — geschrieben, übersetzt, nie
+gelaufen), dann B-2.3 (README).
 
 **Fertig und belegt:**
 
@@ -23,11 +23,12 @@ jede aarch64-Zeile ungeprüft), dann B-2.2 (`hal::cache` auf ARM tatsächlich au
 |---|---|---|
 | B-1.1/1.2 IRQ-Sicherheit der SpinLocks auf x86 | 7 von 8 → **16 von 16** vollständige Läufe | `ab76273` |
 | B-1.4 Fehlerklasse gesucht + Wächter zur Übersetzungszeit | `sel4lake-sync` war die einzige betroffene Crate; Empfindlichkeit belegt | `ab76273` |
+| B-1.3 Wiederholungsmodus der Suite | `RUNS=n`, Quote unter 100 % ist FAIL; Probelauf 5 von 5 | `b43fc14` |
 | A1 Stufe 1 Cache-Coloring | `color : ALL PASS`, 256 Farben gemessen | `7a87182` |
 | Feature `selftest` (todo F1) | `.text` 0x25000 → 0x11000 (54 %) | `7a87182` |
 | Zielarchitektur Z, Plan, Strang-Aufteilung | — | `6e4cf9d` |
 
-**Testlage x86 (letzter voller Lauf):** 24 von 25 PASS. Einziger FAIL: `x2APIC` — TCG kann das
+**Testlage x86 (letzter voller Lauf, 12:38, mit A-1.1 im Baum):** einziger FAIL: `x2APIC` — TCG kann das
 Merkmal grundsätzlich nicht (`TCG doesn't support requested feature: CPUID.01H:ECX.x2apic`), kein
 `/dev/kvm` im Container. **Kein Regress, sondern eine Grenze des Aufbaus.**
 
@@ -47,12 +48,20 @@ schrumpft. Details in [AGENTS.md](AGENTS.md), Mitteilung 1.
 
 *Von B angelegt, damit die Struktur steht — bitte selbst füllen und dann diesen Hinweis löschen.*
 
-**Gerade in Arbeit:** A-1.1 (Multiboot-Module) — vermutet aus dem Arbeitsverzeichnis:
-`kernel/src/arch/x86_64/multiboot.rs`, `kernel/src/loader.rs`, dazu `main.rs` (`mod loader`
-entgatet). Noch nicht committet, Stand 12:33.
+*Stand von B aus `git` abgelesen, 12:40 — bitte selbst überschreiben.*
 
-**Als Nächstes:** —
+**Fertig und belegt:** A-1.1 Multiboot-Module (`ee8029c`). Läuft im Boot mit: `mbmod : ALL PASS`
+(Modulbereiche werden aus der Freiliste ausgeschnitten — Rand, Überlappung, unsortiert,
+Vollabdeckung).
 
-**Fertig und belegt:** —
+**Gerade in Arbeit (unkommittiert):** Manifest — `crates/sel4lake-loader/src/manifest.rs`,
+`tools/sign_manifest.py`, `tools/gen_manifest_key.py`, `tools/kernel_hash.py`,
+`kernel/src/manifest_keys.rs`.
+
+**Hinweis von B:** Der Boot meldet `archive : kein gueltiges Boot-Archiv (0 Module, FAILURES)`,
+weil `test-qemu-x86.sh` noch kein Modul an QEMU übergibt. Das ist **kein** Suite-FAIL (die
+`check`-Liste kennt den Marker nicht), aber es sollte einer werden, sobald du ein Modul mitgibst.
+Die Datei gehört B — sag Bescheid, welches `-initrd`/`-device loader`-Argument du brauchst, dann
+baue ich es ein.
 
 **Blockiert:** —

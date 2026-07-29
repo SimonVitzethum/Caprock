@@ -47,8 +47,13 @@ else
 fi
 ELF="build/target/x86_64-unknown-none/release/sel4lake-kernel.mb32"
 
-echo "== build (x86_64-unknown-none) =="
-./build-x86.sh >/dev/null 2>&1 || { echo "BUILD FAILED"; exit 1; }
+# **Der gebootete Bau verlangt `selftest` AUSDRUECKLICH** -- nicht, weil es heute noetig waere
+# (das Feature steht in `default`), sondern weil es das nach A-2.2 nicht mehr tut. Ohne diese
+# Angabe boetete die Suite nach dem Dreh einen Kernel ohne Selbsttests und wartete auf ein
+# `SELFTEST COMPLETE`, das nie kommt: kein FAIL, sondern Stille -- und Stille ist die schlechteste
+# Art zu scheitern, weil sie wie Erfolg aussieht, bis jemand das Zeitlimit bemerkt.
+echo "== build (x86_64-unknown-none, --features selftest) =="
+./build-x86.sh --features selftest >/dev/null 2>&1 || { echo "BUILD FAILED"; exit 1; }
 
 # todo F1: die Konfiguration OHNE Pruefinfrastruktur wird HIER MITGEBAUT.
 #
@@ -65,7 +70,8 @@ rustup run nightly cargo build --release --no-default-features \
 # (jemand hat Testcode ausserhalb des Features abgelegt), und der Build allein wuerde das nicht zeigen.
 NOSEL_TEXT=$(readelf -S build/target/x86_64-unknown-none/release/sel4lake-kernel 2>/dev/null \
     | grep -A1 " .text " | tail -1 | tr -s ' ' | cut -d' ' -f2)
-./build-x86.sh >/dev/null 2>&1 || { echo "BUILD FAILED (Rueckbau der Default-Konfiguration)"; exit 1; }
+# Rueckbau MIT Feature -- das ist das Image, das gleich gebootet wird.
+./build-x86.sh --features selftest >/dev/null 2>&1 || { echo "BUILD FAILED (Rueckbau)"; exit 1; }
 SEL_TEXT=$(readelf -S build/target/x86_64-unknown-none/release/sel4lake-kernel 2>/dev/null \
     | grep -A1 " .text " | tail -1 | tr -s ' ' | cut -d' ' -f2)
 
@@ -152,10 +158,14 @@ if [ "$NOSEL_OK" = 1 ]; then
 else
     echo "  FAIL: F1: --no-default-features baut nicht mehr"; fail=1
 fi
+# Der Vergleich ist bewusst zwischen den ZWEI BENANNTEN Bauten formuliert (mit Feature gegen
+# ohne), nicht zwischen "Default" und "Nicht-Default". So bleibt er richtig, egal ob `selftest`
+# in `default` steht oder nicht -- A-2.2 dreht genau das um, und eine Pruefung, die sich beim
+# Drehen einer Vorgabe mitdrehen muss, ist eine Pruefung, die man dabei vergisst.
 if [ -n "$SEL_TEXT" ] && [ -n "$NOSEL_TEXT" ] && [ $((0x$NOSEL_TEXT)) -lt $((0x$SEL_TEXT)) ]; then
-    echo "  PASS: F1: .text schrumpft ohne 'selftest' von 0x$SEL_TEXT auf 0x$NOSEL_TEXT Bytes -- das Gating wirkt wirklich"
+    echo "  PASS: F1: .text ohne 'selftest' (0x$NOSEL_TEXT) < mit 'selftest' (0x$SEL_TEXT) -- das Gating wirkt wirklich"
 else
-    echo "  FAIL: F1: .text schrumpft nicht (0x$SEL_TEXT -> 0x$NOSEL_TEXT) -- Testcode liegt ausserhalb des Features"; fail=1
+    echo "  FAIL: F1: .text schrumpft nicht (mit: 0x$SEL_TEXT, ohne: 0x$NOSEL_TEXT) -- Testcode liegt ausserhalb des Features"; fail=1
 fi
 if [ "$RUNS" -gt 1 ]; then
     if [ "$REPEAT_OK" = 1 ]; then

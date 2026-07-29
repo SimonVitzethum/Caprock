@@ -23,7 +23,10 @@ ELF="build/target/aarch64-sel4lake/release/sel4lake-kernel.elf"
 # In-Kernel-Fuzzer (ADR 0013) sind ein optionales Feature. Default: RELEASE-Build OHNE Fuzzer
 # (genau die Konfiguration des Langzeittests/Produktivkernels) -> die vier Fuzzer-Checks entfallen.
 # Mit `KERNEL_FUZZ=1 ./test-qemu.sh` wird `--features kernel-fuzz` gebaut und die Fuzzer mitgeprueft.
-FEAT="${KERNEL_FUZZ:+--features kernel-fuzz}"
+# `selftest` wird AUSDRUECKLICH angefordert, nicht ueber `default` mitgenommen: nach A-2.2 steht
+# es dort nicht mehr, und diese Suite bootet einen Kernel, dessen Selbsttestbericht sie auswertet.
+# Ohne die Angabe waere der Lauf danach still statt rot (s. AGENTS.md Mitteilung 4).
+FEAT="--features selftest${KERNEL_FUZZ:+,kernel-fuzz}"
 echo "== build ${FEAT:-(release, ohne Fuzzer)} =="
 ./build.sh $FEAT >/dev/null 2>&1 || { echo "BUILD FAILED"; exit 1; }
 
@@ -47,6 +50,35 @@ printf 'PLACEHOLDER' > build/_probe.bin
 # Bindung an genau dies ELF + Ed25519-Signatur ueber die volle Nachricht. program_id/version MUESSEN
 # zum Archiv-Eintrag passen (Identitaets-Bindung). Schluessel: keys/trusted-test (privat, gitignored).
 mkdir -p certs
+
+# **B-2.1: aus einem frischen Clone lauffaehig.** `keys/` ist gitignored -- bis hierher scheiterte
+# diese Suite bei jedem, der das Repo neu ausgecheckt hat, an einem fehlenden Schluessel. Damit war
+# der GESAMTE aarch64-Zweig ungeprueft, und genau diese Fehlerform hat das Projekt schon mehrfach
+# bezahlt (leere Event-Queue, nie ausgefuehrter x86-Testpfad, DMAR-Ausschlusspfad).
+#
+# Der Weg ist derselbe wie auf der x86-Seite (Strang A, `test-qemu-x86-load.sh`): **erzeugen statt
+# einchecken**. Ein privater Schluessel im Repo waere bei einem Open-Source-Projekt kein
+# Testschluessel, sondern ein veroeffentlichter -- und der Vermerk "nur fuer Tests" haelt genau so
+# lange, wie jemand ihn liest. Der Preis ist ein maschinenlokaler Wert im Image: er kostet
+# Reproduzierbarkeit ZWISCHEN Entwicklern, nicht INNERHALB eines Checkouts, und nur Letzteres
+# braucht die Suite.
+#
+# Reihenfolge ist zwingend: die Key-DB (`kernel/src/trusted_keys.rs`) wird in den Kernel
+# **kompiliert**. Ein neu erzeugter Schluessel nach dem Build waere ein Schluessel, den das laufende
+# Image nicht kennt. Deshalb hier, VOR `./build.sh`.
+python3 -c "import cryptography" 2>/dev/null || {
+    echo "== FEHLT: das Python-Paket 'cryptography' (signieren geht ohne nicht) =="
+    echo "   pip3 install --user cryptography   # oder --break-system-packages auf Debian"
+    exit 2
+}
+if [ ! -f keys/trusted-test.ed25519 ]; then
+    echo "== TrustedSAS-Testschluessel fehlt -> erzeugen (frischer Clone) =="
+    python3 tools/gen_trusted_key.py --name trusted-test >/dev/null 2>&1 || {
+        echo "SCHLUESSEL-ERZEUGUNG FEHLGESCHLAGEN"; exit 2; }
+    echo "   erzeugt; kernel/src/trusted_keys.rs regeneriert -> Kernel wird neu gebaut"
+    ./build.sh $FEAT >/dev/null 2>&1 || { echo "BUILD FAILED (nach Key-Regen)"; exit 1; }
+fi
+
 sign() { python3 tools/sign_trusted.py --key keys/trusted-test.ed25519 "$@" >/dev/null 2>&1; }
 sign --crate programs/trusted/svc-demo --elf "$SVCDEMO" --program-id 12 --version 1 \
      --out certs/trusted-x.cert || { echo "SIGN trusted-x FAILED"; exit 1; }

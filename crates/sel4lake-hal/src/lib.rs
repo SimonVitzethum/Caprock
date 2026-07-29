@@ -46,6 +46,7 @@ mod imp;
 mod imp;
 
 // Gemeinsame API-Fläche beider Architekturen.
+pub mod cache_decode;
 pub mod fault;
 pub use imp::{cache, console, cpu, exception, fp, intc, mmu, power, syscall, timer};
 

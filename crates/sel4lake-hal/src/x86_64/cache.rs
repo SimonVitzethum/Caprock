@@ -89,13 +89,7 @@ pub fn page_colors() -> u32 {
 /// Farbanzahl aus Sets und Zeilenlänge — als eigene Funktion, damit die Arithmetik ohne
 /// Hardware prüfbar ist (s. Tests im `cache`-Modul der Crate).
 pub(crate) fn colors_from(sets: u64, line: u64) -> u32 {
-    let span = sets.saturating_mul(line);
-    if span <= PAGE {
-        return 1;
-    }
-    // Auf die nächstkleinere Zweierpotenz abrunden: nur echte Indexbits sind Farbbits.
-    // Ein nicht-2er-potenter Set-Zähler (manche LLC-Slices) darf keine Farben vortäuschen.
-    let n = span / PAGE;
-    let bits = 63 - n.leading_zeros() as u64;
-    (1u64 << bits) as u32
+    // Dieselbe geprüfte Funktion wie auf ARM (`crate::cache_decode`) — die Farbarithmetik ist
+    // nicht architekturabhängig, und zwei Fassungen davon würden auseinanderlaufen.
+    crate::cache_decode::colors_from(sets, line, PAGE)
 }

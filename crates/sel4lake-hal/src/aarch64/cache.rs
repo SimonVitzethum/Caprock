@@ -85,14 +85,19 @@ pub fn llc() -> Option<LlcGeometry> {
         }
         // SAFETY: `ctype != 0` heißt, die Ebene existiert laut CLIDR_EL1.
         let c = unsafe { ccsidr_for(level) };
-        let line = 1u32 << ((c & 0x7) + 4); // log2(Zeilenlänge) - 4
-        let (ways, sets) = if ccidx {
-            ((((c >> 3) & 0x1F_FFFF) + 1) as u32, (((c >> 32) & 0xFF_FFFF) + 1) as u32)
-        } else {
-            ((((c >> 3) & 0x3FF) + 1) as u32, (((c >> 13) & 0x7FFF) + 1) as u32)
+        // Die Zerlegung liegt in `crate::cache_decode` — arch-neutral und **auf dem Host
+        // geprueft**, inklusive des CCIDX-Zweigs, den keine QEMU-CPU anbietet. Hier steht
+        // deshalb nur noch das Lesen des Registers; die Arithmetik ist dieselbe, die die Tests
+        // pruefen. Eine zweite Fassung an dieser Stelle waere genau der Fehler, den die
+        // Auslagerung verhindern soll.
+        let d = crate::cache_decode::decode_ccsidr(c, ccidx);
+        let g = LlcGeometry {
+            level,
+            size_bytes: d.size_bytes(),
+            ways: d.ways,
+            line_bytes: d.line_bytes,
+            sets: d.sets,
         };
-        let size = line as u64 * ways as u64 * sets as u64;
-        let g = LlcGeometry { level, size_bytes: size, ways, line_bytes: line, sets };
         if best.map_or(true, |b| g.level > b.level) {
             best = Some(g);
         }
@@ -111,14 +116,8 @@ pub fn page_colors() -> u32 {
     colors_from(g.sets as u64, g.line_bytes as u64)
 }
 
-/// Farbanzahl aus Sets und Zeilenlänge — eigene Funktion, damit die Arithmetik ohne
-/// Hardware prüfbar ist.
+/// Farbanzahl aus Sets und Zeilenlänge — dieselbe geprüfte Funktion wie in
+/// [`crate::cache_decode`], nicht eine zweite Fassung.
 pub(crate) fn colors_from(sets: u64, line: u64) -> u32 {
-    let span = sets.saturating_mul(line);
-    if span <= PAGE {
-        return 1;
-    }
-    let n = span / PAGE;
-    let bits = 63 - n.leading_zeros() as u64;
-    (1u64 << bits) as u32
+    crate::cache_decode::colors_from(sets, line, PAGE)
 }

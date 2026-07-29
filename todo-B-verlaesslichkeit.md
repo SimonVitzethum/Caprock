@@ -41,6 +41,17 @@ Verlässliches.
       Implementierung in derselben `cfg`-Kette — eine eigene Kette wäre eine Wiederholung der
       Bedingung, und Wiederholungen laufen auseinander. Empfindlichkeit belegt.
 
+- [ ] **B-1.5 Erwartete Meldungen aussprechen, nicht verstecken.** In einem grünen Lauf von
+      `test-qemu-x86.sh` stehen `root : FAILURES` und `cdelete : FAILURES` — richtig, weil die
+      Suite **kein** Boot-Archiv baut (keine `programs`, kein `mkarchive`, kein Manifest, anders
+      als die Lade-Suite) und der Kernel die fehlende Startmenge meldet, statt still zu idlen.
+      Geprüft wird beides hier nicht (null Vorkommen im Skript); der Harness-Bericht läuft nur
+      ungefiltert durch. Das ist „Stille sieht wie Erfolg aus" mit umgekehrtem Vorzeichen: wer das
+      Log liest, kann erwartete von echter Meldung nicht trennen. **Der Weg ist ein Check, der die
+      Abwesenheit ausdrücklich abnimmt** — dann schlägt die Suite an, wenn die Zeilen eines Tages
+      *nicht* mehr kommen. Ein Filter, der sie versteckt, wäre das Gegenteil davon.
+      Gefunden 2026-07-29 im Übernahmelauf (`build/diag/b-uebernahme-suite.log`).
+
 ## B-2. Der zweite Architekturzweig muss laufen
 
 - [x] **B-2.1 erledigt (2026-07-29).** Gewählt wurde der zweite Weg — **erzeugen statt einchecken**:

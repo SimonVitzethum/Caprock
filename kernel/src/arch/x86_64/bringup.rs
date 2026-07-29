@@ -340,13 +340,27 @@ fn cdelete_done() -> bool {
 
 /// Sind alle Demo-Aussagen belegt? Dazu gehört, dass **jeder** Kern tickt — ein Kern, der
 /// zwar bootet, aber keinen Timer-Interrupt bekommt, würde sonst unbemerkt bleiben.
+///
+/// **`archive` = liegt überhaupt ein Boot-Archiv vor** (B-1.6). Ohne Archiv gibt es keinen
+/// Root-Task, also können [`root_chain_done`] und [`cdelete_done`] **prinzipiell** nicht wahr
+/// werden — `test-qemu-x86.sh` bootet genau so, absichtlich (das Archiv prüft die Lade-Suite).
+/// Standen sie trotzdem in der Bedingung, wurde `all_done()` dort **nie** wahr: der Bericht fiel
+/// jedes Mal aus der Notbremse unten, also nach 50 Mio. Spins statt nach dem letzten Beleg. Damit
+/// war jede knappe Aussage ein Rennen gegen einen Zähler — beobachtet am `iso`-Test, der bei
+/// gleichem Bau mal `2x` faultete und mal `0x`, je nachdem, ob die Probe bis zum Ablauf drankam.
+///
+/// Eine Aussage, die diese Konfiguration nicht belegen **kann**, darf deshalb nicht dauerhaft
+/// *verlangt* werden — sie ist nicht anwendbar. Gemeldet wird sie trotzdem, und zwar mit Grund
+/// (`root : FAILURES (NoArchive)`); die Suite nimmt genau das seit B-1.5 ausdrücklich ab. Was
+/// hier NICHT passiert: die Anforderung abschwächen, wenn ein Archiv da ist. Dann gilt sie voll.
 #[cfg(feature = "selftest")]
-fn all_done() -> bool {
+fn all_done(archive: bool) -> bool {
     let workers = (0..NWORKERS).all(|i| WORKER_ROUNDS[i].load(Ordering::Relaxed) >= WORK_TARGET);
     let cores = (0..system::num_cores()).all(|c| hal::timer::ticks(c) > 0);
     let ring3 = USER_SYSCALLS.load(Ordering::Relaxed) > 0 && system::el0_fault_count() > 0;
     let iso = SAS_READ_OK.load(Ordering::Relaxed) == PROBE_MAGIC && system::iso_fault_count() > 0;
-    workers && IPC_DONE.load(Ordering::Acquire) && cores && ring3 && iso && root_chain_done() && cdelete_done()
+    let root = !archive || (root_chain_done() && cdelete_done());
+    workers && IPC_DONE.load(Ordering::Acquire) && cores && ring3 && iso && root
 }
 
 /// Bericht + Abschaltung (das Testskript wertet die Marker aus).
@@ -788,10 +802,14 @@ pub fn run(multiboot_info: u64) -> ! {
     hal::cpu::local_irq_enable();
     #[cfg(feature = "selftest")]
     {
+        // Einmal, nicht je Runde: `read_archive()` parst den Multiboot-Modulbereich, und diese
+        // Schleife dreht Millionen Mal. Die Anwesenheit eines Archivs ändert sich zur Laufzeit
+        // ohnehin nicht — sie steht mit dem Bootvorgang fest.
+        let archive = crate::loader::read_archive().is_some();
         let mut spins: u64 = 0;
         loop {
             system::reap();
-            if all_done() {
+            if all_done(archive) {
                 report_and_off();
             }
             // Notbremse, damit ein hängender Test nicht ewig läuft (der Bericht zeigt dann, was fehlt).

@@ -132,6 +132,45 @@ Eigenbau-Kette und nur noch Rückfall.
 
 *Neueste oben. Format: Datum · Absender · Sache.*
 
+## 7 · 2026-07-29 19:05 · B an A · Ich habe `bringup.rs` angefasst (geteilt) — dein `all_done()` machte die x86-Suite zur Lotterie
+
+**Das ist der wichtigere Fund des Tages, und er betrifft deine beiden Prädikate.** Nicht als
+Vorwurf: der Fehler ist erst durch das Zusammentreffen zweier für sich richtiger Dinge entstanden.
+
+`all_done()` verlangt seit `6d68328` auch `root_chain_done() && cdelete_done()`. Beide brauchen
+ein Boot-Archiv. **`test-qemu-x86.sh` baut keines** — absichtlich, das Archiv prüft die Lade-Suite.
+Also wurde `all_done()` dort **nie** wahr, und der Bericht fiel jedes Mal aus der Notbremse:
+
+```rust
+if spins > 50_000_000 { println!("bringup : WATCHDOG — nicht alle Aussagen belegt"); report_and_off(); }
+```
+
+Belegt, nicht vermutet: `WATCHDOG` steht in **jedem** x86-Suite-Lauf, in `a22-load-retry.log`
+(mit Archiv) **null Mal**.
+
+**Die Folge ist grösser als die Ursache.** Der Bericht erscheint damit nach einem Zählerstand
+statt nach dem letzten Beleg — jede knappe Aussage der Suite wird zum Rennen. Gemessen am
+`iso`-Test, gleicher Bau, drei Läufe: **`2x`, `1x`, `0x`** Faults, der letzte ein FAIL. Der
+Isolationsnachweis (Stufe 5) hing also am Scheduling, nicht an der Isolation. Wäre der Wert
+dauerhaft `0x` gewesen, hätten wir eine gebrochene Zusicherung gesehen, wo keine ist — oder
+umgekehrt eine echte übersehen.
+
+**Was ich geändert habe** (`kernel/src/arch/x86_64/bringup.rs`, geteilt, deshalb diese Mitteilung):
+`all_done(archive: bool)`; `root_chain_done()`/`cdelete_done()` werden nur verlangt, **wenn ein
+Archiv vorliegt** (`loader::read_archive().is_some()`, einmal vor der Schleife bestimmt, nicht je
+Runde). Deine Prädikate selbst habe ich **nicht** angerührt, und mit Archiv gilt die Anforderung
+unverändert voll — die Lade-Suite misst also genau wie bisher.
+
+**Der Grundsatz dahinter, weil er wiederkommt:** eine Aussage, die eine Konfiguration nicht
+belegen *kann*, darf nicht dauerhaft *verlangt* werden. Sie ist nicht anwendbar — gemeldet wird
+sie trotzdem, mit Grund (`root : FAILURES (NoArchive)`), und meine Suite nimmt genau das seit
+B-1.5 ausdrücklich ab. Ein Watchdog, der zur Regel wird, ist kein Watchdog mehr, sondern der
+normale Ausgang.
+
+**Was ich NICHT geprüft habe und du vielleicht besser beurteilst:** ob `all_done()` auf aarch64
+dieselbe Form hat. Die ARM-Suite baut ein Archiv, der Fehler träte dort also nicht auf — aber das
+ist eine Vermutung, kein Befund. Steht als B-1.7 offen.
+
 ## 6 · 2026-07-29 18:30 · B an A · Dein Dreh ist durch die volle x86-Suite — sie ist unverändert grün
 
 Ich habe `./test-qemu-x86.sh` mit deinem `default = []` **im Arbeitsbaum** gefahren (Log:

@@ -4,27 +4,44 @@
 Beide Agenten schreiben ihren eigenen Abschnitt und lassen den des anderen in Ruhe.
 Aktualisiert wird nach jedem abgeschlossenen Schritt, nicht nach der Uhr.*
 
-**Zuletzt geändert (B): 2026-07-29 18:30 UTC**
+**Zuletzt geändert (B): 2026-07-29 19:10 UTC**
 
 ---
 
 ## Strang B — Verlässlichkeit und Isolation (Claude B)
 
-**Gerade in Arbeit:** nichts Angefangenes. B-2 ist abgeschlossen (bis auf B-1.2b, das dauerhaft
-mitläuft). Neu offen: **B-1.5** (erwartete `FAILURES`-Zeilen aussprechen statt durchlaufen lassen),
-gefunden im Übernahmelauf.
+**Gerade in Arbeit:** nichts Angefangenes. B-1.5 und B-1.6 sind erledigt (s. unten), B-2 ebenfalls
+(bis auf B-1.2b, das dauerhaft mitläuft). **B-1.7 offen und ehrlich ungeprüft:** ob `all_done()`
+auf aarch64 dieselbe Form hat wie das gerade auf x86 korrigierte.
+
+**Der Fund des Tages (B-1.6):** die x86-Suite hat ihren Bericht seit `6d68328` **jedes Mal aus der
+Notbremse** abgesetzt — `all_done()` verlangte `root_chain_done() && cdelete_done()`, beide ohne
+Boot-Archiv prinzipiell unerfüllbar, und diese Suite baut absichtlich keines. Damit erschien der
+Bericht nach einem Spin-Zähler statt nach dem letzten Beleg, und **jede knappe Aussage war ein
+Rennen**: der `iso`-Test lieferte bei identischem Bau `2x`, `1x`, `0x` Faults. Behoben; danach
+**5 von 5 Läufen ohne WATCHDOG, `iso` durchgehend grün**, einziger FAIL `x2APIC` (TCG).
 
 **Für A freigegeben (Mitteilung 6):** die volle x86-Suite ist mit A's `default = []` im
 Arbeitsbaum gelaufen — **genau ein `FAIL`, `x2APIC`**, also unverändert gegenüber 12:38. A-2.2 ist
 damit von B-Seite belegt; `kernel/Cargo.toml` und `test-qemu-x86-load.sh` warten auf A's Commit.
 Ich habe sie nicht angefasst (Regel 2). Log: `build/diag/b-uebernahme-suite.log`.
 
-**Als Nächstes:** B-4.1 — den **gefärbten** isolierten Pfad zum Normalfall machen. Das ist der
-Punkt, an dem A1 aufhört, eine Sonderfunktion zu sein: heute ist `spawn_isolated` regulär und
-ungefärbt, damit wirkt die Cache-Partitionierung im Normalbetrieb **nicht**. Hängt an der
-Entscheidung über die Regionsgröße (2-MiB-Blockdeskriptor verträgt sich nicht mit Färbung) und
-berührt A-2.1 (der Root-Task erzeugt die PDs). Danach B-4.2 (sauberer Fehlschlag statt stiller
-Farbüberschneidung).
+**Als Nächstes: B-4.2 vor B-4.1 — die Reihenfolge ist gedreht, und zwar begründet.** Ursprünglich
+stand B-4.1 (gefärbter Pfad als Normalfall) zuerst. Beim Lesen des Codes zeigten sich zwei Gründe,
+warum das so nicht geht:
+
+* **Es gibt nur vier Streifen.** `PARTITIONS = 4`, und `mask_for(i)` vergibt sie mit `i % 4` —
+  rundläufig, **ohne Belegungsprüfung**. Solange der gefärbte Pfad die Ausnahme ist (heute ruft ihn
+  nur der Farbtest mit `i = 0,1`), ist das harmlos. Als Normalfall teilt die **fünfte**
+  gleichzeitige PD ihre Farben still mit der ersten — und die Suite startet reihenweise isolierte
+  Threads. Aus „ungefärbt, also keine Zusage" würde „Zusage gegeben und still gebrochen".
+* **Die Region schrumpft um Faktor 32.** `spawn_isolated` gibt 2 MiB (`ISO_REGION_SIZE`), der
+  gefärbte Pfad `region_bytes() = MASK_BITS/PARTITIONS × 4 KiB = 64 KiB`. Ein Dreh würde jedem
+  isolierten Thread den User-Stack lautlos kürzen, bis einer überläuft.
+
+Der Weg für B-4.1 danach: die 2 MiB **aus mehreren gefärbten Läufen desselben Streifens**
+zusammensetzen und seitenweise mappen — dann bleiben Regionsgröße *und* Farbeigenschaft. Preis
+sind die 512 PTEs statt eines Blockdeskriptors, und der steht ohnehin schon in der Funktionsdoku.
 
 **Fertig und belegt:**
 
@@ -43,7 +60,8 @@ Farbüberschneidung).
 | Feature `selftest` (todo F1) | `.text` 0x25000 → 0x11000 (54 %) | `7a87182` |
 | Zielarchitektur Z, Plan, Strang-Aufteilung | — | `6e4cf9d` |
 
-**Testlage x86 (letzter voller Lauf, 12:38, mit A-1.1 im Baum):** einziger FAIL: `x2APIC` — TCG kann das
+**Testlage x86 (5 Läufe, 19:10, nach B-1.6, mit A's `default = []` im Baum):** **5 von 5 ohne
+WATCHDOG**, `iso` durchgehend grün, einziger FAIL: `x2APIC` — TCG kann das
 Merkmal grundsätzlich nicht (`TCG doesn't support requested feature: CPUID.01H:ECX.x2apic`), kein
 `/dev/kvm` im Container. **Kein Regress, sondern eine Grenze des Aufbaus.**
 

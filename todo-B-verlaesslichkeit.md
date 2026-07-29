@@ -52,6 +52,23 @@ Verlässliches.
       *nicht* mehr kommen. Ein Filter, der sie versteckt, wäre das Gegenteil davon.
       Gefunden 2026-07-29 im Übernahmelauf (`build/diag/b-uebernahme-suite.log`).
 
+- [ ] **B-1.6 Der Bericht darf nicht aus der Notbremse kommen.** `all_done()` in
+      `arch/x86_64/bringup.rs` verlangte seit `6d68328` auch `root_chain_done() && cdelete_done()`
+      — beide brauchen ein Boot-Archiv, das `test-qemu-x86.sh` absichtlich **nicht** baut. Damit
+      wurde `all_done()` dort **nie** wahr und der Bericht fiel jedes Mal aus dem Watchdog nach
+      50 Mio. Spins. Belegt: `WATCHDOG` steht in jedem x86-Suite-Lauf, in der Lade-Suite (mit
+      Archiv) **null Mal**. Folge: der Bericht erscheint nach einem Zählerstand, nicht nach dem
+      letzten Beleg — **jede knappe Aussage der Suite ist seither ein Rennen**. Gemessen am
+      `iso`-Test bei identischem Bau: `2x`, `1x`, `0x` Faults in drei Läufen, der letzte ein FAIL.
+      Behoben, indem eine Aussage, die diese Konfiguration nicht belegen *kann*, als **nicht
+      anwendbar** behandelt wird statt als dauerhaft unerfüllt (`archive`-Parameter, einmal vor
+      der Schleife bestimmt). Liegt ein Archiv vor, gilt die Anforderung unverändert voll.
+      **Die allgemeine Lehre:** ein Watchdog, der zur Regel wird, ist kein Watchdog mehr, sondern
+      der normale Ausgang — und dann misst niemand mehr, was er zu messen glaubt.
+- [ ] **B-1.7 (offen) Dasselbe für aarch64 prüfen.** Ob `all_done()`/Notbremse dort dieselbe Form
+      hat, ist **nicht** nachgesehen. Die ARM-Suite baut ein Archiv, der Fehler träte also nicht
+      auf — aber „tritt hier nicht auf" ist kein Befund, sondern eine Vermutung.
+
 ## B-2. Der zweite Architekturzweig muss laufen
 
 - [x] **B-2.1 erledigt (2026-07-29).** Gewählt wurde der zweite Weg — **erzeugen statt einchecken**:

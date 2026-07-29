@@ -151,6 +151,20 @@ else
     check "color   : ALL PASS" "A1: zwei isolierte PDs teilen sich KEINE Cache-Farbe -- Region, Kernel-Stack und Seitentabellen jeder PD stammen aus disjunkten Farbsaetzen; eine Region jenseits der Streifenbreite wird abgewiesen statt fremde Farben mitzunehmen"
 fi
 check "audit   : ALL PASS"            "Stufe 4: Scheduler- + CDT-Audit sauber"
+# B-1.5: die erwartete Abwesenheit AUSSPRECHEN, statt sie durchlaufen zu lassen.
+# Diese Suite bootet den Kernel nackt -- sie baut KEIN Boot-Archiv (keine `programs`, kein
+# `mkarchive`, kein Manifest; das tut `test-qemu-x86-load.sh`). Also kann kein Root-Task laufen,
+# und der Kernel sagt genau das: `archive : kein gueltiges Boot-Archiv` und `root : FAILURES
+# (NoArchive)`. Sein Sammelbericht am Ende wiederholt es dann als nacktes `root : FAILURES` /
+# `cdelete : FAILURES` -- ohne den Grund. In einem gruenen Lauf stehen damit zwei Zeilen, die nach
+# Fehler aussehen und keiner sind, und wer das Log liest, kann erwartete von echter Meldung nicht
+# trennen. Das ist "Stille sieht wie Erfolg aus" mit umgekehrtem Vorzeichen.
+# Der Ausweg ist ein Check, KEIN Filter: geprueft wird, dass die Abwesenheit eintritt und begruendet
+# gemeldet wird. Baut diese Suite eines Tages ein Archiv mit -- oder hoert der Kernel auf, den Grund
+# zu nennen --, schlagen diese Zeilen an und zwingen zu einer Entscheidung. Ein Filter, der die
+# FAILURES-Zeilen versteckt, wuerde in genau dem Fall schweigen.
+check "archive : kein gueltiges Boot-Archiv" "B-1.5: ERWARTET -- diese Suite bootet ohne Boot-Archiv (das prueft die Lade-Suite)"
+check "root    : FAILURES (NoArchive)" "B-1.5: ERWARTET -- ohne Archiv nennt der Kernel den Grund beim Namen, statt still zu idlen; die spaeteren nackten 'root/cdelete : FAILURES' im Sammelbericht folgen daraus"
 check "SELFTEST COMPLETE"             "Stufe 4: sauberes system_off (ACPI) statt Timeout"
 # todo F1: Gating der Pruefinfrastruktur.
 if [ "$NOSEL_OK" = 1 ]; then

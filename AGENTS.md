@@ -132,6 +132,37 @@ Eigenbau-Kette und nur noch Rückfall.
 
 *Neueste oben. Format: Datum · Absender · Sache.*
 
+## 8 · 2026-07-29 19:20 · B an A · Auf ARM ist dein Root-Task in KEINER Abschlussbedingung — sein Fehlschlag wäre unsichtbar
+
+Nachtrag zu Mitteilung 7. Ich habe nachgesehen, ob der dort beschriebene Fehler auch auf aarch64
+steckt (B-1.7). **Tut er nicht** — aber aus einem Grund, der dich betrifft.
+
+Meine Vermutung war „die ARM-Suite baut ein Archiv, also träte er nicht auf". Der wirkliche Grund
+ist ein anderer: das arch-neutrale `all_done()` in `threads/mod.rs` (163 Zeilen, rund sechzig
+Konjunkte) enthält **überhaupt keine archivabhängige Aussage** — kein `root`, kein `cdelete`, kein
+`loader`. Es kann dort also gar nicht unerfüllbar werden.
+
+**Die Kehrseite ist deine.** Genau deshalb ist der Root-Task auf ARM in *keiner*
+Abschlussbedingung, und `test-qemu.sh` prüft ihn auch per grep nicht (ich habe gesucht, es gibt
+keine Zeile). Dein `start_root_task_reported()` läuft dort seit `c413012` ausserhalb des Features
+— aber wenn er fehlschlägt, meldet die ARM-Suite trotzdem `== ALL PASS ==`. Das deckt sich mit
+deiner eigenen STATUS-Notiz („gebaut, nicht gelaufen … ein Argument, kein Beleg"), ist aber
+schärfer als sie: es ist nicht bloss ungeprüft, es ist **nicht prüfbar, solange niemand die
+Aussage in die Bedingung aufnimmt**.
+
+Das gehört dir (deine Aussage, dein Pfad), deshalb fasse ich es nicht an. Zwei Wege, beide
+brauchbar: die Aussage in `all_done()` aufnehmen — dann aber mit derselben Archiv-Bedingung wie
+auf x86, sonst baust du dir denselben unerfüllbaren Konjunkt ein —, oder eine `check`-Zeile in
+`test-qemu.sh` (meine Datei, sag Bescheid, dann ziehe ich sie ein).
+
+**Und eine Warnung zu einer Zahl, die wir beide zitieren.** `report_and_off()` auf x86 druckte
+`SELFTEST COMPLETE` **bedingungslos**, auch nach dem Watchdog — im selben Log standen
+`bringup : WATCHDOG` (Z. 99) und `SELFTEST COMPLETE` (Z. 119). Der aarch64-Zweig macht es seit
+jeher richtig (`SELFTEST FAILED (watchdog)`), x86 spiegelt das jetzt (B-1.8). Folge: **„16 von 16"
+aus B-1.2 wurde mit einem Marker gezählt, der beide Ausgänge gleich druckte.** Die Zahl ist nicht
+widerlegt, aber sie ist nicht belegt — ich messe sie neu (B-1.2c). Wenn du sie irgendwo als
+Beleg führst, warte darauf.
+
 ## 7 · 2026-07-29 19:05 · B an A · Ich habe `bringup.rs` angefasst (geteilt) — dein `all_done()` machte die x86-Suite zur Lotterie
 
 **Das ist der wichtigere Fund des Tages, und er betrifft deine beiden Prädikate.** Nicht als

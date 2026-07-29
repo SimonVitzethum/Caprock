@@ -165,6 +165,16 @@ check "audit   : ALL PASS"            "Stufe 4: Scheduler- + CDT-Audit sauber"
 # FAILURES-Zeilen versteckt, wuerde in genau dem Fall schweigen.
 check "archive : kein gueltiges Boot-Archiv" "B-1.5: ERWARTET -- diese Suite bootet ohne Boot-Archiv (das prueft die Lade-Suite)"
 check "root    : FAILURES (NoArchive)" "B-1.5: ERWARTET -- ohne Archiv nennt der Kernel den Grund beim Namen, statt still zu idlen; die spaeteren nackten 'root/cdelete : FAILURES' im Sammelbericht folgen daraus"
+# B-1.8: kam der Bericht aus `all_done()` oder aus der Notbremse? Bis 2026-07-29 war das am Log
+# NICHT unterscheidbar -- `report_and_off()` druckte `SELFTEST COMPLETE` auch nach dem Watchdog,
+# beide Zeilen standen im selben Lauf untereinander. Ausgerechnet dieser Marker traegt aber die
+# Wiederholungsmessung (B-1.2/B-1.3 zaehlen ihn). Jetzt trennt der Kernel die Ausgaenge; hier wird
+# die Trennung abgenommen. Ein Watchdog-Lauf ist ein FAIL, kein "meistens grün".
+if echo "$OUT" | grep -q "bringup : WATCHDOG"; then
+    echo "  FAIL: B-1.8: der Bericht kam aus der NOTBREMSE, nicht aus all_done() -- die Aussagen darunter sind zu einem Zeitpunkt abgelesen, nicht nach ihrem Beleg"; fail=1
+else
+    echo "  PASS: B-1.8: der Bericht kam aus all_done() (kein Watchdog) -- die Aussagen sind belegt, nicht abgelesen"
+fi
 check "SELFTEST COMPLETE"             "Stufe 4: sauberes system_off (ACPI) statt Timeout"
 # todo F1: Gating der Pruefinfrastruktur.
 if [ "$NOSEL_OK" = 1 ]; then

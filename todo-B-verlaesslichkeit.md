@@ -65,9 +65,28 @@ Verlässliches.
       der Schleife bestimmt). Liegt ein Archiv vor, gilt die Anforderung unverändert voll.
       **Die allgemeine Lehre:** ein Watchdog, der zur Regel wird, ist kein Watchdog mehr, sondern
       der normale Ausgang — und dann misst niemand mehr, was er zu messen glaubt.
-- [ ] **B-1.7 (offen) Dasselbe für aarch64 prüfen.** Ob `all_done()`/Notbremse dort dieselbe Form
-      hat, ist **nicht** nachgesehen. Die ARM-Suite baut ein Archiv, der Fehler träte also nicht
-      auf — aber „tritt hier nicht auf" ist kein Befund, sondern eine Vermutung.
+- [x] **B-1.7 erledigt (2026-07-29). Der Fehler existiert auf aarch64 nicht — aus einem stärkeren
+      Grund als vermutet.** Ich hatte angenommen: „die ARM-Suite baut ein Archiv, also träte er
+      nicht auf." Tatsächlich enthält das arch-neutrale `all_done()` in `threads/mod.rs` (163
+      Zeilen, ~60 Konjunkte) **überhaupt keine archivabhängige Aussage** — kein `root`, kein
+      `cdelete`, kein `loader`. Die Bedingung kann dort nicht unerfüllbar werden, unabhängig vom
+      Archiv. Die Vermutung wäre also zufällig richtig gewesen, mit falscher Begründung.
+      **Kehrseite, dabei gefunden:** genau deshalb ist der Root-Task auf ARM in **keiner**
+      Abschlussbedingung — und `test-qemu.sh` prüft ihn auch per grep nicht. A's neuer ARM-Pfad
+      ist damit nicht nur ungeprüft, sein Fehlschlag wäre unsichtbar. Gehört A, ist ihm gemeldet.
+- [x] **B-1.8 erledigt (2026-07-29). Der Erfolgsmarker log auf x86.** `report_and_off()` druckte
+      `== SELFTEST COMPLETE ==` **bedingungslos** — auch nach dem Watchdog. Belegt: im selben Lauf
+      standen `bringup : WATCHDOG` (Z. 99) und `SELFTEST COMPLETE` (Z. 119). Damit konnte
+      ausgerechnet der Marker, auf dem die Wiederholungsmessung steht, einen vollständigen Lauf
+      nicht von einem abgelaufenen unterscheiden: **B-1.3s `RUNS=n` zählt genau ihn**, und B-1.2s
+      „16 von 16" beruht darauf. Der aarch64-Zweig macht es seit jeher richtig
+      (`SELFTEST FAILED (watchdog)`); x86 spiegelt das jetzt, und die Suite nimmt die Trennung ab
+      (ein Watchdog-Lauf ist ein FAIL, kein „meistens grün").
+      **Folge für eine ältere Aussage:** „16 von 16" (B-1.2) wurde mit einem Marker gezählt, der
+      beide Ausgänge gleich druckte. Die Zahl ist damit nicht widerlegt, aber sie ist **nicht
+      belegt** — sie gehört nach dieser Korrektur neu gemessen. Steht als B-1.2c.
+- [ ] **B-1.2c `16 von 16` neu messen.** Mit dem getrennten Marker aus B-1.8, sonst zählt die
+      Messung wieder beide Ausgänge als Erfolg.
 
 ## B-2. Der zweite Architekturzweig muss laufen
 

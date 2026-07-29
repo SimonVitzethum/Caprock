@@ -364,8 +364,16 @@ fn all_done(archive: bool) -> bool {
 }
 
 /// Bericht + Abschaltung (das Testskript wertet die Marker aus).
+///
+/// **`watchdog` = wir kamen über die Notbremse hierher, nicht über [`all_done`]** (B-1.8). Der
+/// Unterschied MUSS im Marker stehen: vorher druckte diese Funktion `SELFTEST COMPLETE`
+/// bedingungslos, also auch nach einem Abbruch. Damit konnte ausgerechnet der Marker, auf dem die
+/// ganze Wiederholungsmessung steht (B-1.2/B-1.3 zählen ihn), einen vollständigen Lauf nicht von
+/// einem abgelaufenen unterscheiden — im selben Log standen `WATCHDOG` und `SELFTEST COMPLETE`
+/// untereinander. Der aarch64-Zweig macht es seit jeher richtig (`SELFTEST FAILED (watchdog)`);
+/// das hier ist die Spiegelung, nicht eine neue Erfindung.
 #[cfg(feature = "selftest")]
-fn report_and_off() -> ! {
+fn report_and_off(watchdog: bool) -> ! {
     let ticks = hal::timer::ticks(0);
     let mut all_tick = true;
     for c in 0..system::num_cores() {
@@ -433,7 +441,13 @@ fn report_and_off() -> ! {
     );
 
     println!("x86_64 Stufe 4: Kernel-Kern laeuft (Selbsttests + Scheduler + cap-gesicherte IPC)");
-    println!("== SELFTEST COMPLETE -> system_off ==");
+    // Der Marker trennt die beiden Ausgänge -- s. Funktionsdoku. Ein Lauf, der aus der Notbremse
+    // kommt, darf nicht denselben Satz drucken wie einer, der alles belegt hat.
+    if watchdog {
+        println!("== SELFTEST FAILED (watchdog) -> system_off ==");
+    } else {
+        println!("== SELFTEST COMPLETE -> system_off ==");
+    }
     hal::power::system_off()
 }
 
@@ -810,13 +824,13 @@ pub fn run(multiboot_info: u64) -> ! {
         loop {
             system::reap();
             if all_done(archive) {
-                report_and_off();
+                report_and_off(false);
             }
             // Notbremse, damit ein hängender Test nicht ewig läuft (der Bericht zeigt dann, was fehlt).
             spins += 1;
             if spins > 50_000_000 {
                 println!("bringup : WATCHDOG — nicht alle Aussagen belegt");
-                report_and_off();
+                report_and_off(true);
             }
             core::hint::spin_loop();
         }

@@ -4,15 +4,27 @@
 Beide Agenten schreiben ihren eigenen Abschnitt und lassen den des anderen in Ruhe.
 Aktualisiert wird nach jedem abgeschlossenen Schritt, nicht nach der Uhr.*
 
-**Zuletzt geändert (B): 2026-07-29 19:10 UTC**
+**Zuletzt geändert (B): 2026-07-29 19:38 UTC**
 
 ---
 
 ## Strang B — Verlässlichkeit und Isolation (Claude B)
 
-**Gerade in Arbeit:** nichts Angefangenes. B-1.5 und B-1.6 sind erledigt (s. unten), B-2 ebenfalls
-(bis auf B-1.2b, das dauerhaft mitläuft). **B-1.7 offen und ehrlich ungeprüft:** ob `all_done()`
-auf aarch64 dieselbe Form hat wie das gerade auf x86 korrigierte.
+**Gerade in Arbeit:** B-1.2c (Wiederholungsmessung neu, mit dem getrennten Marker). B-1.5 bis
+B-1.8 sind erledigt (s. unten), B-2 ebenfalls.
+
+**B-1.7 beantwortet:** der x86-Fehler existiert auf aarch64 **nicht** — aber aus einem stärkeren
+Grund als vermutet. Nicht „die ARM-Suite baut ein Archiv", sondern: das arch-neutrale `all_done()`
+in `threads/mod.rs` enthält **überhaupt keine** archivabhängige Aussage. Kehrseite, dabei
+gefunden und A gemeldet (Mitteilung 8): genau deshalb ist der Root-Task auf ARM in **keiner**
+Abschlussbedingung und wird auch per grep nicht geprüft — sein Fehlschlag wäre unsichtbar.
+
+**B-1.8 — der unangenehmste Fund:** `report_and_off()` druckte auf x86 `SELFTEST COMPLETE`
+**bedingungslos**, auch nach dem Watchdog (im selben Log Z. 99 `WATCHDOG`, Z. 119 `COMPLETE`).
+Damit konnte ausgerechnet der Marker, auf dem die Wiederholungsmessung steht, einen vollständigen
+Lauf nicht von einem abgebrochenen unterscheiden. Nach aarch64-Vorbild getrennt, die Suite nimmt
+die Trennung ab. **Folge: B-1.2s „16 von 16" ist nicht widerlegt, aber nicht belegt** — mit diesem
+Marker gezählt. Neu zu messen als B-1.2c.
 
 **Der Fund des Tages (B-1.6):** die x86-Suite hat ihren Bericht seit `6d68328` **jedes Mal aus der
 Notbremse** abgesetzt — `all_done()` verlangte `root_chain_done() && cdelete_done()`, beide ohne
@@ -53,14 +65,18 @@ sind die 512 PTEs statt eines Blockdeskriptors, und der steht ohnehin schon in d
 | B-2.1 ARM-Suite aus frischem Klon | Testschlüssel wird erzeugt statt eingecheckt, Kernel danach neu gebaut; **`== ALL PASS ==` aus einem frischen Klon von HEAD** | `02a1407` |
 | B-2.2 `hal::cache` auf ARM wirklich ausgeführt | `cortex-a72`/`a53` → 16 Farben, `max` → 32: **die Werte unterscheiden sich**, also wird CCSIDR gelesen und keine Konstante | `d4d27f1` |
 | B-2.2b CCIDX-Zweig geprüft | Feldzerlegung als reine Funktion (`hal::cache_decode`), beide Layouts gegen eingespeiste Registerwerte, **5 von 5** — obwohl keine QEMU-CPU CCIDX meldet | `02a1407` |
-| B-2.3 README | von „aarch64, Phase 7" auf den tatsächlichen Stand; zwei Falschaussagen des Entwurfs beim Prüfen gefunden und korrigiert | *dieser Commit* |
-| B-2.4 `docs/verification.md` | Loom Stufe 2 abgehakt — **mit der Grenze daneben**, die 2026-07-29 teuer wurde | *dieser Commit* |
-| B-4.4 Zusicherung ehrlich aufgeschrieben | `invariants.md` §12: was A1 trennt, und die längere Liste dessen, was **nicht** | *dieser Commit* |
+| B-2.3 README | von „aarch64, Phase 7" auf den tatsächlichen Stand; zwei Falschaussagen des Entwurfs beim Prüfen gefunden und korrigiert | `529bc35` |
+| B-2.4 `docs/verification.md` | Loom Stufe 2 abgehakt — **mit der Grenze daneben**, die 2026-07-29 teuer wurde | `529bc35` |
+| B-4.4 Zusicherung ehrlich aufgeschrieben | `invariants.md` §12: was A1 trennt, und die längere Liste dessen, was **nicht** | `529bc35` |
+| B-1.5 Erwartete Abwesenheit ausgesprochen | zwei Checks nehmen ab, dass ohne Boot-Archiv kein Root-Task laeuft **und der Kernel den Grund nennt** — kein Filter, der die Zeilen versteckt | `8f5b2a7` |
+| B-1.6 Bericht kam aus der Notbremse | `all_done()` war ohne Archiv unerfuellbar -> WATCHDOG in JEDEM Lauf; danach **9 von 9 ohne Watchdog**, `iso` durchgehend gruen (vorher 2 von 4) | `8f5b2a7` |
+| B-1.7 aarch64 gegengeprueft | Fehler existiert dort **nicht** — arch-neutrales `all_done()` hat gar keine archivabhaengige Aussage. Kehrseite an A: sein Root-Task ist auf ARM in KEINER Abschlussbedingung | *dieser Commit* |
+| B-1.8 Erfolgsmarker log | `SELFTEST COMPLETE` wurde auch nach dem Watchdog gedruckt (Z. 99 + Z. 119 im selben Log); nach aarch64-Vorbild getrennt, Suite nimmt die Trennung ab | *dieser Commit* |
 | A1 Stufe 1 Cache-Coloring | `color : ALL PASS`, 256 Farben gemessen | `7a87182` |
 | Feature `selftest` (todo F1) | `.text` 0x25000 → 0x11000 (54 %) | `7a87182` |
 | Zielarchitektur Z, Plan, Strang-Aufteilung | — | `6e4cf9d` |
 
-**Testlage x86 (5 Läufe, 19:10, nach B-1.6, mit A's `default = []` im Baum):** **5 von 5 ohne
+**Testlage x86 (9 Läufe, 19:36, nach B-1.6/B-1.8, mit A's `default = []` im Baum):** **9 von 9 ohne
 WATCHDOG**, `iso` durchgehend grün, einziger FAIL: `x2APIC` — TCG kann das
 Merkmal grundsätzlich nicht (`TCG doesn't support requested feature: CPUID.01H:ECX.x2apic`), kein
 `/dev/kvm` im Container. **Kein Regress, sondern eine Grenze des Aufbaus.**

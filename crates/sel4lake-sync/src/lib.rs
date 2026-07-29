@@ -22,6 +22,13 @@ use core::sync::atomic::{AtomicU32, Ordering};
 // Kern VOR dem Ticket-Ziehen und der Guard stellt den vorherigen Zustand beim `Drop` wieder her
 // (nesting-sicher: jeder Guard sichert den Stand von VOR seinem Lock).
 
+/// Belegt, dass DIESE Auswahl eine echte Maskierung mitbringt. Steht bewusst **neben** der
+/// Implementierung und nicht in einer eigenen `cfg`-Kette: eine zweite Kette waere eine
+/// Wiederholung der Bedingung, und Wiederholungen laufen auseinander. So kann der Waechter
+/// weiter unten nur wahr sein, wenn die Funktionen wirklich gebaut werden.
+#[cfg(target_arch = "aarch64")]
+const IRQ_MASKING_IMPLEMENTED: bool = true;
+
 /// DAIF (Interrupt-Maske) sichern + IRQs am aktuellen Kern maskieren. Gibt den vorherigen
 /// DAIF-Zustand zurück (für [`irq_restore`]).
 #[cfg(target_arch = "aarch64")]
@@ -47,15 +54,89 @@ fn irq_restore(daif: u64) {
     }
 }
 
-// Host-Builds (z. B. `cargo test` anderer Crates): kein DAIF — No-Op.
-#[cfg(not(target_arch = "aarch64"))]
+/// RFLAGS sichern + IRQs am aktuellen Kern maskieren (x86_64-Gegenstück zu DAIF).
+///
+/// **Diese Fassung hat gefehlt, und das war ein echter Fehler**, kein Schönheitsmangel: bis
+/// 2026-07-29 galt für x86_64 der No-Op-Zweig unten, der für *Host*-Builds gedacht war. Damit war
+/// auf x86 **kein einziger `SpinLock` IRQ-sicher** — also genau der reentrante Ticket-Deadlock,
+/// vor dem der Kommentar am Modulanfang warnt: der Timer-Tick trifft einen Kontext, der ein
+/// Ticket hält, der Handler zieht ein neues, und das alte wird nie bedient.
+///
+/// Beobachtbar war das als **sporadisches Stehenbleiben mitten in einer `println!`-Ausgabe**
+/// (die Konsolensperre wird am häufigsten genommen), mit wechselnden Abbruchstellen und einer
+/// Rate von etwa einem Achtel der Läufe. Betroffen waren alle Locks, nicht nur die Konsole.
+///
+/// Die Unterscheidung ist `target_os`, nicht `target_arch`: der Kernel baut gegen
+/// `x86_64-unknown-none` (`target_os = "none"`), die Host-Tests gegen
+/// `x86_64-unknown-linux-gnu`. Nur Ersteres darf `cli` ausführen — im Userspace ist die
+/// Instruktion privilegiert und würde eine SIGSEGV auslösen.
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+const IRQ_MASKING_IMPLEMENTED: bool = true;
+
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+#[inline(always)]
+fn irq_save_disable() -> u64 {
+    let flags: u64;
+    // SAFETY: `pushfq`/`pop` liest nur das Flags-Register (Stack wird ausgeglichen), `cli`
+    // maskiert Interrupts am eigenen Kern. Beides sind die vorgesehenen Low-Level-Operationen.
+    unsafe {
+        core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags));
+        core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+    }
+    flags
+}
+
+/// Den zuvor gesicherten RFLAGS.IF-Zustand wiederherstellen.
+///
+/// Bewusst **nicht** `popfq`: das würde alle Flags zurückschreiben, auch die
+/// Vergleichsergebnisse des unterbrochenen Codes. Wiederhergestellt wird nur das, was
+/// [`irq_save_disable`] verändert hat — und war IRQ vorher schon maskiert (verschachtelter Guard
+/// oder Trap-Kontext), bleibt es maskiert.
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+#[inline(always)]
+fn irq_restore(flags: u64) {
+    if flags & (1 << 9) != 0 {
+        // SAFETY: gibt die Interrupt-Zustellung am eigenen Kern wieder frei — genau der
+        // Zustand, der vor `irq_save_disable` galt.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack, preserves_flags)) };
+    }
+}
+
+// Host-Builds (z. B. `cargo test` anderer Crates): keine Interrupt-Maske — No-Op.
+// Die Bedingung muss **beide** Bare-Metal-Ziele ausschließen; stünde hier nur
+// `not(target_arch = "aarch64")`, fiele der x86-Kernel wieder in diesen Zweig.
+#[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_os = "none"))))]
+const IRQ_MASKING_IMPLEMENTED: bool = false;
+
+#[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_os = "none"))))]
 #[inline(always)]
 fn irq_save_disable() -> u64 {
     0
 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_os = "none"))))]
 #[inline(always)]
 fn irq_restore(_daif: u64) {}
+
+// --- Wächter: baut das Bare-Metal-Ziel wirklich den maskierenden Zweig? -----------------------
+//
+// Der x86-Fehler von 2026-07-29 bestand nicht aus falschem Code, sondern aus einer falschen
+// `cfg`-Auswahl: der No-Op-Zweig für Host-Builds fing das Kernel-Ziel mit. Kein Test hat das
+// gemerkt, weil jeder Test entweder auf dem Host lief (dort ist der No-Op richtig) oder auf ARM
+// (dort war die Auswahl richtig). Ein Fehler in der Auswahl ist für eine Testsuite unsichtbar,
+// solange sie nur Verhalten prüft.
+//
+// Deshalb hier eine Prüfung der Auswahl selbst, zur Übersetzungszeit: auf JEDEM Ziel ohne
+// Betriebssystem (`target_os = "none"` — also jedes Kernel-Ziel, heutige wie künftige) MUSS eine
+// echte Maskierung vorhanden sein. Wer eine neue Architektur hinzufügt und die Maskierung
+// vergisst, bekommt einen Übersetzungsfehler statt eines sporadischen Deadlocks.
+
+#[cfg(target_os = "none")]
+const _: () = assert!(
+    IRQ_MASKING_IMPLEMENTED,
+    "Bare-Metal-Ziel ohne Interrupt-Maskierung in SpinLock::lock. Der Ticket-Lock ist dann \
+     reentrant aus dem IRQ-Pfad erreichbar und verklemmt sporadisch (s. Modulanfang). \
+     `irq_save_disable`/`irq_restore` fuer diese Architektur implementieren."
+);
 
 /// Fairer Ticket-Spinlock.
 ///

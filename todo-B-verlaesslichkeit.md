@@ -49,9 +49,27 @@ Verlässliches.
       Wege: ein ausdrücklich als Test gekennzeichneter Schlüssel im Repo (eigener Key-Slot, im
       Kernel als `test` markiert), oder ein Skript, das beim ersten Lauf ein Paar erzeugt und
       `trusted_keys.rs` daraus generiert. Der Produktivschlüssel bleibt draußen.
-- [ ] **B-2.2 `hal::cache` auf aarch64 tatsächlich ausführen.** Die ARM-Fassung (CLIDR/CCSIDR
-      inkl. FEAT_CCIDX) ist geschrieben, übersetzt und **nie gelaufen**. Genau die Fehlerform, die
-      dieses Projekt schon dreimal bezahlt hat.
+- [x] **B-2.2 erledigt (2026-07-29) — bis auf einen benannten Rest.** Der aarch64-Hochlauf ruft
+      jetzt `colors::report()` (neben der `spec`-Zeile: dieselbe Sorte Aussage, was die HW
+      hergibt). Dafür war die Suite gar nicht nötig — die Bring-up-Meldungen kommen, bevor das
+      Boot-Archiv angefasst wird, ein nackter `qemu-system-aarch64 -kernel` genügt. Gemessen:
+
+      | CPU | LLC | Farben |
+      |---|---|---|
+      | `cortex-a72` | L2 1024 KiB, 16-fach, 64 B/Zeile, 1024 Sets | 16 |
+      | `cortex-a53` | L2 1024 KiB, 16-fach, 64 B/Zeile, 1024 Sets | 16 |
+      | `max` | L2 2048 KiB, 16-fach, 64 B/Zeile, 2048 Sets | 32 |
+
+      Die Werte **unterscheiden sich zwischen den Modellen** — das ist der eigentliche Beleg, dass
+      wirklich `CCSIDR_EL1` gelesen wird und keine Konstante zurückkommt. Die ARM-Modelle melden
+      nur einen L2 als höchste Ebene, daher 16 statt 256 Farben wie auf x86.
+- [ ] **B-2.2b Der FEAT_CCIDX-Zweig ist WEITERHIN nie ausgeführt worden.** Keines der drei
+      Modelle meldet CCIDX (`-cpu max` liefert CSV2=2/CSV3=1/SB=1, also eine moderne CPU, aber
+      offenbar ohne CCIDX). Genau dort liegt das Risiko: bei gesetztem CCIDX stehen Assoziativität
+      und Setzahl an **anderen Bitpositionen**, und wer sie falsch liest, bekommt eine plausible,
+      aber falsche Farbanzahl. Möglicher Weg: die Feldzerlegung aus `ccsidr_for` in eine reine
+      Funktion ziehen und beide Layouts auf dem Host gegen eingespeiste Registerwerte prüfen —
+      dieselbe Technik wie bei `hal::dmar` (reine Funktion über eingespeiste Daten).
 - [ ] **B-2.3 `README.md`.** Beschreibt einen aarch64-Kernel der Phase 7 — kein Wort vom
       x86-Port, von VT-d, von der Kern-Übergabe, vom Feature `selftest`. Bei einem
       Open-Source-Projekt die teuerste veraltete Datei überhaupt.

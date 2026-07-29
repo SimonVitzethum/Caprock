@@ -44,6 +44,10 @@ mod dmatests;
 /// Archiv-Quelle ist nicht mehr ein fest verdrahtetes ARM-Fenster, sondern eine zur Laufzeit
 /// gemeldete Spanne (auf x86 ein Multiboot-Modul).
 mod loader;
+/// Read-only Root-Schlüssel des **System-Manifests** (A-1.3) — autogeneriert von
+/// `tools/gen_manifest_key.py`. Getrennt von [`trusted_keys`]: ein Zertifikat bezeugt die Herkunft
+/// eines Binaries, ein Manifest die Zuteilung der ganzen Maschine.
+mod manifest_keys;
 #[cfg(feature = "selftest")]
 mod selftest;
 mod system;
@@ -146,6 +150,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         hal::cpu::csv3(),
         hal::cpu::sb_supported() as u8
     );
+    // Cache-Geometrie melden (todo A1/B-2.2). Steht bewusst NEBEN der `spec`-Zeile: beides sagt,
+    // was die Hardware von sich aus hergibt, und beides ist eine Bring-up-Meldung, kein
+    // Testbericht (todo F3). Bis hierher lief die aarch64-Fassung von `hal::cache` nie -- sie war
+    // geschrieben und uebersetzt, aber nur der x86-Hochlauf rief sie.
+    crate::colors::report();
 
     // RAM-Layout aus dem Device Tree lesen (statt fest verdrahtet).
     let (ram_base, ram_size) = sel4lake_dtb::Dtb::parse(DTB_BYTES)

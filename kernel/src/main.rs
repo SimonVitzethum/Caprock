@@ -185,6 +185,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     system::init_mem(free_base, alloc_end);
     println!("mem     : freies RAM [{free_base:#x}, {alloc_end:#x})  (Loader-Fenster [{:#x}, {ram_end:#x}) reserviert)", loader::MOD_BASE);
     loader::probe(); // Boot-Archiv lesen + Module melden (L0; Laden folgt ab L1)
+    #[cfg(feature = "selftest")]
     selftest::run();
 
     // Phase 4–6: Scheduler + cap-gesicherte IPC + Protection Domains.
@@ -196,8 +197,20 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         tbl_bytes >> 10
     );
     system::init_core(); // Boot-Kontext von core 0 wird Idle-Thread
-    threads::spawn_demo(); // 2 PDs (Client/Server) + 3 Worker auf core 0
-    println!("sched   : Round-Robin + cap-gesicherte IPC (2 PDs + 3 Worker + Idle)");
+    #[cfg(feature = "selftest")]
+    {
+        threads::spawn_demo(); // 2 PDs (Client/Server) + 3 Worker auf core 0
+        println!("sched   : Round-Robin + cap-gesicherte IPC (2 PDs + 3 Worker + Idle)");
+    }
+
+    // --- Root-Task (A-2.1/A-2.2) ---
+    //
+    // Dieselbe Stelle wie auf x86 (`arch::x86_64::bringup`) und aus demselben Grund **ausserhalb**
+    // von `selftest`: das ist die Aufgabe des Kernels, nicht seine Pruefung. Bis A-2.2 rief den
+    // Loader auf ARM ausschliesslich `threads/mod.rs` — also nur der Testcode. Ohne diesen Aufruf
+    // ist der `--no-default-features`-Kernel auf ARM tatsaechlich leer, und das Gating waere kein
+    // schlankerer Kernel, sondern ein Kernel ohne Zweck.
+    let _root_ok = loader::start_root_task_reported();
 
     // Sekundärkerne via PSCI starten.
     println!("smp     : starte Kerne 1..{} via PSCI CPU_ON (hvc) ...", cores - 1);
@@ -221,7 +234,16 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     hal::cpu::local_irq_enable();
     // Ab hier läuft core 0 als Idle-Thread; der Timer-Tick schedult preemptiv.
+    #[cfg(feature = "selftest")]
     threads::demo_report_then_idle();
+    // Ohne `selftest` gibt es keinen Bericht, auf den zu warten waere: core 0 wird Idle-Thread,
+    // und was laeuft, laeuft im Root-Task. `idle()` reapt weiter (Stacks beendeter Threads) und
+    // wartet per WFI — dieselbe Schleife wie auf jedem Sekundaerkern.
+    #[cfg(not(feature = "selftest"))]
+    {
+        println!("bringup : Kernel-Kern steht; Aufgaben kommen ab hier aus dem Root-Task (A-2.2)");
+        idle();
+    }
 }
 
 /// Kernel-Eintritt jedes Sekundärkerns (gerufen aus `_start_secondary`).

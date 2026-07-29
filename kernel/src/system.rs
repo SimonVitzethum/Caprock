@@ -3959,7 +3959,10 @@ pub struct VirtioDmaResult {
 }
 
 #[cfg(target_arch = "aarch64")] // virtio-rng-PCI + SMMU: ARM-/QEMU-`virt`-spezifisch (ext-31)
-#[cfg(target_arch = "aarch64")] // SMMU/virtio: ARM-spezifisch (ext-31)
+// A-2.2: benutzt `testsupport` (liegt hinter `selftest`), und der einzige Aufrufer ist
+// `threads::mod.rs` — das Modul gibt es ohne das Feature nicht. Ohne dieses Gate uebersetzt der
+// `--no-default-features`-Bau auf aarch64 gar nicht.
+#[cfg(feature = "selftest")]
 /// **virtio-rng-DMA End-to-End** (ext-23, D4): das Gerät DMAt Zufallsbytes in die DmaCap-Region
 /// (echter Bus-Master-DMA). Danach der **zweistufige Kronjuwel-Test**:
 /// - **Level 1 (Software, demonstrierbar):** der vertrauenswürdige Treiber validiert jede

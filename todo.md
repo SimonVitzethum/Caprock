@@ -5,16 +5,277 @@ Reihenfolge innerhalb eines Abschnitts = Priorität. `[~]` = teilweise erledigt,
 
 ---
 
+## Z. Zielarchitektur (Stand 2026-07-29) — woran alles andere zu messen ist
+
+> **Reihenfolge und Begründung:** [docs/plan-betriebsbereit.md](docs/plan-betriebsbereit.md).
+> Hier steht *was* offen ist, dort *in welcher Reihenfolge* und *warum*.
+>
+> **Zur parallelen Bearbeitung geteilt in zwei unabhängige Stränge:**
+> [todo-A-ausfuehren.md](todo-A-ausfuehren.md) — der Kernel führt fremden Code aus und tauscht ihn
+> aus (Manifest, Root-Task, Caps, Hot-Reload, Treiber). **Kritischer Pfad.**
+> [todo-B-verlaesslichkeit.md](todo-B-verlaesslichkeit.md) — die Zusicherungen tragen und sind
+> messbar (Determinismus, ARM-Zweig, IOMMU, Färbung/SMT, Zeit/NUMA, Attestierung).
+> Dateibesitz und die vier echten Kopplungen stehen am Ende von Strang A.
+
+Der Mikrokern ist **das Basissystem eines Cloud-Servers**, nicht ein Hypervisor darunter und
+keine VM darin. Es gibt keine Gastschicht: Isolation, Zeit- und Ressourcenverwaltung macht der
+Kern selbst. Daraus folgen drei Anforderungen, die keine reine Fleißarbeit sind, sondern den
+Entwurf mitbestimmen — und an denen die Abschnitte A–G im Folgenden hängen.
+
+**Z1. Kein VM-Overhead, Isolation vollständig durch den Kern.** Der isolierte Pfad (eigene VSpace
+je PD, gefärbt) muss der **Normalfall** werden, nicht die Ausnahme. Heute ist `spawn_isolated` der
+reguläre Weg und ungefärbt; `spawn_isolated_colored` ist der Sonderweg (s. [A1](#a1-cache--timing-seitenkanäle-zwischen-pds)).
+
+**Gesetzte Regel (Simon, 2026-07-29): TrustedSAS ist ausschließlich für eigenen Code. Kein
+Kundencode läuft jemals in einer TrustedSAS-PD.** Das ist keine Vorsichtsmaßnahme, sondern folgt
+aus dem Modell: TrustedSAS-PDs teilen sich einen Adressraum, und ihre Isolation ruht auf
+*intralingualer* Sicherheit — safe Rust kann keinen Zeiger auf fremden Speicher erzeugen. Diese
+Voraussetzung lässt sich nur an eigenem Quellcode prüfen (das Zertifikats-Gate ADR 0014 tut genau
+das: `unsafe_status == ALL_PASS`), niemals an einem fremden Binary.
+
+Drei Folgerungen, die den Entwurf binden:
+
+* **Der isolierte Pfad ist der Produktpfad.** Seine Leistung und seine Skalierbarkeit *sind* das
+  Produkt — nicht die des SAS-Pfads. Optimierungsarbeit gehört dorthin.
+* **Das Zertifikats-Gate ist ein Betreiberwerkzeug, keine Kundenschnittstelle.** Kunden brauchen
+  kein Zertifikat und bekommen keins; ein Weg, auf dem ein Kunde ein TrustedSAS-Zertifikat
+  erlangen könnte, wäre ein Entwurfsfehler. Umgekehrt heißt das: [Z7](#z7-attestierung-und-messbarer-boot)
+  betrifft die **Maschine**, nicht das Kundenbinary — der Kunde will wissen, *worauf* er läuft,
+  nicht beweisen, *was* er mitbringt.
+* **Zwei Klassen, zwei Zusicherungen.** Eigene Dienste (Treiber, Netzstack, Kontrollebene) dürfen
+  TrustedSAS sein und zahlen dafür keinen Adressraumwechsel. Alles Fremde ist isoliert, gefärbt
+  und wird so abgerechnet. Das gehört in `docs/invariants.md`, damit die Grenze nicht später aus
+  Bequemlichkeit verwischt.
+
+**Z2. Abrechnung feiner als der Zeittakt — „nur zahlen, was man braucht".** 100 Hz heißt 10 ms
+Granularität; das ist zugleich die Untergrenze der Abrechnung *und* eine Jitterquelle, die HPC
+gerade abschaltet. Ziel ist eine Abrechnung, die **nicht** an der Tick-Rate hängt: Verbrauch wird
+per TSC/CNTVCT beim Ein- und Auswechseln gestempelt (Zyklen, nicht Ticks), und der Tick selbst
+wird für Rechenkerne abgeschaltet statt beschleunigt. Ein schnellerer Tick wäre die falsche
+Antwort — er erhöht die Auflösung *und* den Overhead; ein Zyklenstempel erhöht nur die Auflösung.
+Siehe [Z5](#z5-tickless-für-rechenkerne) und [D](#d-verifikation) (per-TCB-`consumed_cycles`).
+
+**Z3. Threads einfrieren, versetzen, weiterlaufen lassen (Server-übergreifend).** Das ist die
+Eigenschaft, die VMs heute liefern (Live-Migration) und die ein VM-freier Entwurf ersetzen muss.
+Sie ist die **anspruchsvollste** Anforderung im ganzen Dokument, weil sie quer zu fast allem liegt:
+ein Thread ist nicht nur sein Registersatz, sondern sein Speicher, seine Caps, seine
+IPC-Beziehungen und seine Position in den Kerneltabellen. Zerlegung in [Z4](#z4-checkpointrestore-eines-threads).
+
+### Z11. Boot-Image = Kernel + **eine** Manifestdatei; alles andere außerhalb und austauschbar
+**Klasse:** Aufbau/Betrieb · **Aufwand:** groß, betrifft Loader, Cap-System und IPC
+
+**Gesetzte Regel (Simon, 2026-07-29):** Im Boot-Image liegen genau zwei Dinge — der Kernel und
+eine Datei, die festlegt, *was* geladen wird. Alles Übrige (Treiber, Netzstack, Dienste,
+Kontrollebene) liegt außerhalb des Images und ist **zur Laufzeit austauschbar, ohne dass IPC-
+Beziehungen verlorengehen**.
+
+Das ist die schärfere Fassung der bestehenden Projektgrenze („nur Mikrokern, Caps, Scheduler, IPC
+und Microkit-Runtime im Image") und zieht Konsequenzen nach sich, die über sie hinausgehen.
+
+- [ ] **Z11a. Das Henne-Ei-Problem benennen und lösen.** Einen Plattentreiber kann man nicht von
+      der Platte laden. Der einzige ehrliche Ausweg: **der Bootloader liefert die Startmodule**
+      (Multiboot-Module bei GRUB) — die liegen damit außerhalb des Kernel-Images, kommen aber
+      trotzdem zum Boot an. Das Manifest nennt sie; der Kernel prüft, dass genau das ankam, was
+      dort steht. Nachladen über Netz/Platte gibt es erst, wenn die zugehörigen Treiber laufen.
+      Ohne diese Trennung („Startmenge vom Bootloader" vs. „Nachladen zur Laufzeit") wird das
+      Manifest ein Wunschzettel, den niemand einlösen kann.
+- [ ] **Z11b. Das Manifest ist ein Autoritätsdokument, kein Konfigurationsfile.** Es legt fest,
+      wer geladen wird *und welche Caps er bekommt* — also die gesamte Anfangsverteilung von
+      Autorität. Damit **muss** es signiert und gegen das Kernel-Image gebunden sein. Wer die
+      Datei tauschen kann, besitzt die Maschine; ein Manifest ohne Signatur wäre eine
+      Hintertür mit Dateiendung. Verwandt mit ADR 0014, aber nicht dasselbe: dort werden
+      *Binaries* zertifiziert, hier die *Zuteilung*.
+- [ ] **Z11c. Das Manifest ist der natürliche Ort für die Politik.** Farbstreifen ([A1](#a1-cache--timing-seitenkanäle-zwischen-pds)),
+      NUMA-Knoten ([Z8](#z8-numa)), Kern-Affinität, Budget, Priorität — alles Dinge, die heute im
+      Code stehen oder gar nicht existieren. Wenn sie ins Manifest wandern, sind sie
+      *überprüfbar* und *änderbar ohne Neubau*. Wichtig dabei: die Farbe selbst gehört **nicht**
+      hinein (sie ist maschinenlokal, s. [Z4c](#z4-checkpointrestore-eines-threads)) — wohl aber
+      „diese Komponente bekommt einen exklusiven Streifen".
+- [ ] **Z11d. Hot-Reload ohne IPC-Verlust — was dafür wirklich nötig ist.** Auf ARM existiert der
+      Fall bereits (Phase 7: eine Server-PD wird über *dieselbe* Endpoint-Cap ersetzt). Für einen
+      Betriebsanspruch reicht das aber nicht; drei Dinge fehlen:
+      1. **Endpoint-Identität unabhängig vom Thread.** Clients halten Caps auf den *Endpoint*,
+         nicht auf den Server-Thread — das trägt heute schon. Der Austausch ist dann ein
+         Umbinden, wer auf dem Endpoint empfängt. Das muss **atomar** sein: zwischen „alter
+         Server weg" und „neuer Server empfangsbereit" darf kein Zustand liegen, in dem ein
+         `CALL` mit `NoEndpoint` scheitert.
+      2. **Schwebende Transaktionen.** Ein Client, der in `CALL` blockiert, hält eine Reply-Cap
+         auf den alten Server. Entweder der neue Server erbt die offenen Replys, oder der
+         Austausch findet nur an einem *ruhenden* Punkt statt (keine offene Transaktion). Die
+         zweite Variante ist ehrlich und für Stufe 1 wahrscheinlich richtig — sie braucht aber
+         einen Begriff von „ruhend", den es heute nicht gibt. Verwandt mit [Z4a](#z4-checkpointrestore-eines-threads):
+         derselbe Haltepunkt-Begriff trägt beides.
+      3. **Zustandsübergabe.** Die neue Fassung braucht den Zustand der alten. Entweder eine
+         Speicherregion, die den Austausch überlebt (dann ist ihr Format eine ABI und muss
+         versioniert werden), oder ein ausdrückliches Übergabeprotokoll. Ohne Festlegung wird
+         Hot-Reload ein Neustart mit Datenverlust und heißt nur anders.
+- [ ] **Z11e. Protokollversionen prüfen, nicht hoffen.** Das Manifest nennt die Schnittstellen-
+      version je Komponente; ein Austausch, der die Version ändert, wird **abgewiesen** statt
+      durchgelassen. Sonst redet ein neuer Server mit alten Clients in einer Sprache, die beide
+      für dieselbe halten.
+- [ ] **Z11f. Was NICHT hot-reloadbar sein kann, muss benannt sein.** Der Kernel selbst, und
+      alles, was eine Cap auf maschinenlokale Hardware hält, während sie in Benutzung ist
+      (IOMMU-Kontexte, aktive DMA-Regionen). Eine Liste dessen, was der Austausch *nicht* umfasst,
+      gehört in `docs/invariants.md` — sonst wird aus „alles ist austauschbar" im Betrieb eine
+      Überraschung.
+
+### Z4. Checkpoint/Restore eines Threads
+**Klasse:** neues Subsystem · **Aufwand:** groß, mehrstufig
+
+Reihenfolge ist hier keine Geschmacksfrage — jede Stufe ist Vorbedingung der nächsten.
+
+- [ ] **Z4a. Anhalten mit definiertem Zustand.** Ein Thread muss an einer *benennbaren* Grenze
+      stehenbleiben können, nicht irgendwo. Mitten in einem Syscall ist sein Zustand halb im
+      Kernel; mitten in einer IPC-Transaktion hängt ein Partner. Nötig: ein Haltepunkt-Begriff
+      (nur an Syscall-Grenzen, nie im Kernel), und ein `SYS_FREEZE`, das *wartet*, bis der Thread
+      dort ist, statt ihn zu unterbrechen. Ohne das ist alles Weitere Zufall.
+- [ ] **Z4b. Serialisierbarer Zustand.** Registersatz + FP/SIMD ist der leichte Teil (der
+      Trap-Frame steht bereits). Der schwere Teil sind die **Caps**: eine Cap ist heute ein Index
+      in eine globale Tabelle plus CDT-Kante. Über Maschinengrenzen bedeutet ein Index nichts.
+      Nötig ist eine externe, maschinenunabhängige Darstellung (Objekttyp, Rechte, Badge,
+      Herkunft) — und eine Regel, was mit Caps auf **maschinenlokale** Dinge passiert (MMIO,
+      DMA-Regionen, Endpoints zu nicht mitwandernden PDs). Meine Erwartung: die müssen den
+      Transfer **verweigern**, sonst wandert ein Thread mit Autorität, die auf der Zielmaschine
+      etwas anderes bezeichnet. Das ist die gefährlichste Stelle des ganzen Vorhabens.
+- [ ] **Z4c. Speicher mitnehmen.** Die private Region der PD ist der Zustand. Bei 64 KiB
+      ([A1](#a1-cache--timing-seitenkanäle-zwischen-pds)) ist das billig, bei 2 MiB weniger.
+      Offen: Dirty-Tracking, damit nicht alles kopiert werden muss, und die Frage, ob die
+      **Farbe** auf der Zielmaschine erhalten bleiben muss (nein — Farbe ist maschinenlokal; die
+      Zielmaschine färbt neu; das ist ein Argument dafür, Farbe nie in die ABI zu heben).
+- [ ] **Z4d. IPC-Beziehungen.** Ein wandernder Thread mit offenem `CALL` hat einen wartenden
+      Server zurückgelassen. Entweder Migration nur ohne offene Transaktionen (einfach, ehrlich,
+      wahrscheinlich richtig für Stufe 1), oder Endpoint-Proxys über das Netz (ein eigenes
+      Projekt).
+- [ ] **Z4e. Transport + Vertrauen.** Ein Checkpoint ist der vollständige Zustand eines Tenants.
+      Er geht verschlüsselt und authentifiziert über das Netz, oder gar nicht. Hängt an
+      [Z7](#z7-attestierung-und-messbarer-boot): die Zielmaschine muss nachweisen können, dass sie
+      dieselbe Kernelversion mit denselben Zusicherungen fährt — sonst wandert der Zustand in eine
+      schwächere Umgebung, und der Tenant merkt es nicht.
+- [ ] **Z4f. Identische Server als Vorbedingung benennen.** „gleicher Server" muss geprüft
+      werden, nicht angenommen: gleiche Architektur, gleiche Kernelversion, gleiche
+      Cache-/NUMA-Klasse. Ein Vergleich, der nur die Architektur prüft, lässt einen Thread von
+      einer Maschine mit `invtsc` auf eine ohne wandern — und die Abrechnung aus [Z2](#z-zielarchitektur-stand-2026-07-29--woran-alles-andere-zu-messen-ist)
+      wird still falsch.
+
+### Z5. Tickless für Rechenkerne
+**Klasse:** Scheduler/Timer · **Aufwand:** mittel
+
+- [ ] Der 100-Hz-Tick läuft auf **jedem** Kern. Für einen Kern, auf dem genau ein rechenbereiter
+      Thread liegt, ist jeder Tick reiner Verlust — und in HPC die klassische „OS-Noise"-Quelle,
+      die Kollektivoperationen über tausende Ränge hinweg verschleppt. Nötig: Timer nur armieren,
+      wenn es etwas zu verdrängen gibt (>1 lauffähiger Thread oder ein ablaufendes Budget), sonst
+      abschalten. Zusammen mit [Z2](#z-zielarchitektur-stand-2026-07-29--woran-alles-andere-zu-messen-ist)
+      ergibt das: Abrechnung per Zyklenstempel, Verdrängung per Bedarf — die beiden werden
+      entkoppelt, und genau das ist der Punkt.
+- [ ] Kern-Isolierung als Politik: Rechenkerne bekommen keine IPIs, keine Balancierung
+      (`balance_once` ist per Default aus — hier ist das zufällig schon richtig), keine
+      Interrupt-Zustellung außer ihren eigenen.
+
+### Z6. SMT — die Lücke, die Cache-Coloring NICHT schließt
+**Klasse:** Seitenkanal · **Aufwand:** Scheduler-Politik, klein bis mittel
+
+- [ ] [A1](#a1-cache--timing-seitenkanäle-zwischen-pds) partitioniert den **LLC**. Zwei
+      Hyperthreads auf demselben physischen Kern teilen sich aber L1, L2, TLB, Store-Buffer und
+      Branch-Predictor — dagegen hilft keine Farbe, und zwar prinzipiell nicht. Solange SMT an ist
+      und der Scheduler Geschwister-Threads beliebig belegt, ist die A1-Zusicherung auf einer
+      SMT-Maschine deutlich schwächer, als sie klingt. Zwei gangbare Wege: SMT abschalten (kostet
+      Durchsatz, ist ehrlich) oder **Gang-Scheduling der Geschwister** — ein physischer Kern
+      gehört zu jedem Zeitpunkt genau einem Tenant. Der zweite Weg braucht die
+      Topologie (`CPUID.1F`/`0B` bzw. MPIDR) im Scheduler; die liest heute niemand.
+- [ ] Solange das offen ist, gehört es in die Zusicherung: `docs/invariants.md` muss sagen, dass
+      A1 den LLC trennt **und die kernlokalen Strukturen nicht**.
+
+### Z7. Attestierung und messbarer Boot
+**Klasse:** Vertrauen · **Aufwand:** mittel-groß
+
+- [ ] Das Zertifikats-Gate (ADR 0014) sichert, welche **Binaries** starten dürfen. Ein Tenant
+      will aber aus der Ferne nachweisen können, **was auf der Maschine läuft**, bevor er seinen
+      Zustand dorthin gibt — Measured Boot, Messkette bis in den Kernel, Signatur über die
+      Messung. Vorbedingung von [Z4e](#z4-checkpointrestore-eines-threads); ohne das ist
+      Thread-Migration ein Vertrauensvorschuss an eine unbekannte Maschine.
+
+### Z8. NUMA
+**Klasse:** Speicher/Skalierung · **Aufwand:** mittel, greift in den Allokator
+
+- [ ] Der `PhysAllocator` hat **eine flache Freiliste ohne Knotenbegriff**. Beim Zielbild
+      Dual-EPYC ist das kein Detail: Speicher am falschen Knoten kostet grob Faktor zwei an
+      Latenz, und bei CXL wird es schlimmer. Nötig: Knoten aus ACPI SRAT/SLIT lesen, Freilisten je
+      Knoten, PD-Zuteilung knotenlokal, und der Scheduler darf einen Thread nicht auf einen Kern
+      legen, dessen Knoten seinen Speicher nicht hält.
+- [ ] **Verzahnt mit A1**: Farbe *und* Knoten müssen **gemeinsam** vergeben werden. Zwei
+      unabhängig entwickelte Politiken kämpfen sonst gegeneinander — der Farbstreifen erzwingt
+      eine Physadresse, der Knoten eine andere, und wer zuerst zuteilt, gewinnt. Das gehört in
+      **eine** Entscheidung, nicht in zwei Schichten.
+
+### Z9. Fehlerdomäne
+**Klasse:** Betrieb · **Aufwand:** Entwurfsentscheidung
+
+- [ ] Ein Kernel-Panic reißt heute den ganzen Knoten mit; eine VM tut das nicht. Für „VMs
+      ersetzen" braucht es eine ausdrückliche Antwort — entweder „der Knoten ist die
+      Fehlerdomäne, plant entsprechend" (legitim, muss aber dokumentiert und den Tenants gesagt
+      sein), oder Kernel-Fehler werden auf die verursachende PD eingegrenzt. Das Zweite ist
+      Forschungsklasse; das Erste ist eine Zeile in der Dokumentation, die heute fehlt.
+
+### Z10. I/O überhaupt
+**Klasse:** Grundlage · **Aufwand:** groß
+
+- [ ] Kein Netzstack, kein Blockgerät, und `virtio` ist bis heute **aarch64-only**. Eine Cloud
+      ohne Netz und Speicher ist keine. Hängt an [F2](#f-debug-testcode-aus-dem-release-build-nehmen)
+      (Root-Task) und an [C6](#c6-x86-64-port--rest) (Boot-Archiv): ohne einen Weg, Userland zu
+      starten, gibt es auch keinen Treiber, der laufen könnte.
+- [ ] Für durchgereichte Geräte ist **Interrupt Remapping** ([E](#e-dma-härtung--rest), Schritt 4)
+      keine Kür: ohne IR kann ein Gerät beliebige Interrupt-Nachrichten erzeugen. Das ist der
+      Standardausbruch aus einer Geräte-Zuteilung und muss vor dem ersten Tenant-Gerät stehen.
+
+---
+
 ## A. Offen aus dem Sicherheits-Review (ext-29)
 
 ### A1. Cache-/Timing-Seitenkanäle zwischen PDs
 **Klasse:** Seitenkanal · **Aufwand:** Architekturänderung, kein Patch
 
-Nicht adressiert. Zwei PDs teilen sich alle Cache-Ebenen; eine kann das Zugriffsmuster der anderen
-über Laufzeitmessung beobachten. Gegenmaßnahme wäre **Cache-Coloring/Partitionierung**: der
-physische Allokator müsste Frames nach Cache-Set-Farbe vergeben und das VSpace-Layout die Farben je
-PD disjunkt halten. Betrifft `PhysAllocator` (Farb-bewusste Freilisten) + `vspace_map_*`. Bei
-„hochsicher" als Projektziel die größte verbleibende Lücke.
+`[~]` **Stufe 1 steht und ist auf x86 gemessen** (s. [done.md](done.md)): Cache-Geometrie wird aus
+der HW gelesen, der Allokator vergibt farbrein, und zwei so erzeugte PDs teilen sich nachweislich
+keine Cache-Farbe — Region, Kernel-Stack und Seitentabellen. Offen bleibt das Folgende.
+
+- [ ] **Der reguläre Weg ist weiterhin ungefärbt.** `spawn_isolated` (2-MiB-Region) kann es
+      strukturell nicht sein: 2 MiB sind 512 Seiten, also 512 aufeinanderfolgende Farben — bei den
+      gemessenen 256 Farben überstreicht ein einziger Blockdeskriptor jede Farbe zweimal. Färbung
+      gibt es nur über `spawn_isolated_colored`, und die kostet die kleinere Region
+      (`colors::region_bytes()`, bei 4 Partitionen 64 KiB) plus seitenweises Mapping statt eines
+      Block-PTE. **Die Entscheidung, welcher Weg der reguläre sein soll, steht aus** — solange
+      `spawn_isolated` der Normalfall ist, ist A1 im Normalbetrieb *nicht* wirksam.
+
+- [ ] **Die Farbanzahl begrenzt die Anzahl gleichzeitig getrennter PDs.** `ColorMask` ist 64 Bit,
+      `PARTITIONS` teilt das in disjunkte Streifen. Mehr gleichzeitige PDs als Partitionen heißt:
+      zwei teilen sich einen Streifen. Heute vergibt `mask_for` rundläufig, **ohne** zu prüfen, ob
+      der Streifen schon belegt ist — der Aufrufer bekommt also stillschweigend eine Farbüberschneidung.
+      Nötig: eine Streifen-Freiliste, und ein sauberer Fehlschlag statt einer stillen Aufweichung,
+      wenn keine disjunkte Partition mehr frei ist.
+
+- [ ] **Nur auf x86 gemessen.** `hal::cache` hat eine aarch64-Fassung (CLIDR/CCSIDR inkl. FEAT_CCIDX),
+      die **nie gelaufen ist** — die ARM-Suite braucht `keys/trusted-test.ed25519`, und das ist
+      gitignored. Ungeprüfter Code auf dem zweiten Zweig ist genau die Fehlerform, die dieses Projekt
+      schon dreimal getroffen hat (leere Event-Queue, nie ausgeführter x86-Testpfad,
+      DMAR-Ausschlusspfad). Bis dahin gilt A1 als **x86-only**.
+
+- [ ] **Way-Partitionierung (Intel CAT / ARM MPAM) nicht betrachtet.** Sie träfe dieselbe
+      Eigenschaft über die Hardware statt über den Allokator, käme ohne kleinere Regionen und ohne
+      seitenweises Mapping aus — und ließe sich mit der Färbung kombinieren. QEMU emuliert CAT
+      nicht, also wäre sie hier **nicht prüfbar**; das ist ein Grund, sie zurückzustellen, kein
+      Grund, sie zu vergessen.
+
+- [ ] **A1 trennt den LLC und sonst nichts.** Kernlokale Strukturen (L1, L2, TLB, Store-Buffer,
+      Branch-Predictor) bleiben geteilt, sobald zwei Tenants auf Geschwister-Hyperthreads liegen —
+      s. [Z6](#z6-smt--die-lücke-die-cache-coloring-nicht-schliesst). Und die Farbvergabe muss mit
+      der NUMA-Zuteilung **gemeinsam** entschieden werden, nicht nacheinander, s.
+      [Z8](#z8-numa).
+
+- [ ] **Kein Nachweis der *Wirkung*, nur der Zuteilung.** Der Test zeigt, dass die Farbsätze
+      disjunkt sind. Er zeigt **nicht**, dass daraus eine messbar geringere gegenseitige Verdrängung
+      folgt. Ein Prime+Probe-Mikrobenchmark (eine PD misst ihre eigene Zugriffszeit, während die
+      andere den Cache durchläuft, gefärbt vs. ungefärbt) wäre der eigentliche Beleg. Unter TCG ist
+      er sinnlos — der Emulator hat keinen echten Cache; also erst auf Blech oder unter KVM.
 
 ### A2. Spectre-v2 auf HW ohne FEAT_CSV2
 **Klasse:** Seitenkanal · **Aufwand:** klein, aber HW-abhängig
@@ -265,6 +526,45 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       Vertrauensgrenze nichts — sie fängt Fehler des Treiberautors, nicht das Verhalten eines
       kompromittierten Treibers. Lohnt trotzdem, weil „Puffer steht armiert in der Queue, ist im
       sicheren Code aber wieder adressierbar" real und häufig ist.
+
+---
+
+## D0. Instabilität des x86-Laufs (2026-07-29, offen)
+**Klasse:** Fehler · **Aufwand:** unbekannt, zuerst einzugrenzen
+
+- [ ] **Der x86-Lauf ist nicht mehr deterministisch.** Gemessen: von 8 Läufen desselben Images
+      erreichten nur 4–6 `SELFTEST COMPLETE`; die übrigen bleiben stehen, und zwar an
+      **verschiedenen** Stellen (einmal nach `color : ALL PASS` beim `bringup :`-Schritt, einmal
+      bei `dmatok : FAILURES`). Verschiedene Abbruchstellen sprechen gegen einen einzelnen
+      kaputten Testpfad und für etwas Gemeinsames: Zeitverhalten oder Speicherlage.
+
+      **Beide naheliegenden Verdächtigen sind gemessen und ausgeschieden** (2026-07-29, je 8 Läufe
+      desselben Images, `SELFTEST COMPLETE` als Kriterium):
+
+      | Aufbau | vollständig |
+      |---|---|
+      | `HEAD` (498e149, **ohne** A1), `-cpu Skylake-Client` | 7 von 8 |
+      | mit A1, `-cpu Skylake-Client` | 7 von 8 |
+      | mit A1, `-cpu qemu64` | 5 von 8 |
+
+      Also: **die Instabilität ist älter als die A1-Arbeit** und wurde nicht von ihr eingeschleppt.
+      Der CPU-Modellwechsel ist ebenfalls nicht die Ursache — `Skylake-Client` ist sogar stabiler
+      als `qemu64`. Damit bleibt ein **vorbestehender Fehler im x86-Lauf**, der bisher nur deshalb
+      nicht auffiel, weil die Suite üblicherweise einmal statt achtmal läuft.
+
+      Nächste Eingrenzung: mehrere hängende Läufe mit Vollprotokoll vergleichen. Bisher beobachtet
+      wurden **verschiedene** Abbruchstellen (nach `color : ALL PASS`, bei `dmatok`), was gegen
+      einen einzelnen kaputten Pfad und für ein Rennen spricht — Kandidaten: der SMP-Hochlauf
+      (`cpu_on`/`ap_entry`), die Konsolensperre, oder die Idle-Schleife mit `all_done()`.
+
+      Merke für die Diagnose: die Aussage „5 von 5 grün" aus der ersten Runde war **wertlos**,
+      weil sie nur auf die `color`-Zeile grepte und nicht auf `SELFTEST COMPLETE`. Ein Lauf, der
+      nach der geprüften Zeile hängenbleibt, zählte dort als Erfolg. Wer hier weitermisst: immer
+      gegen das **Ende** des Laufs prüfen, nicht gegen die interessierende Zeile.
+
+- [ ] **Sobald die Ursache feststeht:** der Lauf muss wieder wiederholbar sein, bevor A1 als
+      abgenommen gilt. Ein Testaufbau, der in einem Drittel der Fälle stehenbleibt, kann keine
+      Aussage über irgendeine Eigenschaft tragen — auch nicht über die, die er gerade grün meldet.
 
 ---
 

@@ -9,6 +9,59 @@ schon einmal nicht getragen hat.
 
 ---
 
+## A1. Cache-Partitionierung zwischen PDs — **Stufe 1 erledigt** (x86)
+
+Rest in [todo.md](todo.md#a1-cache--timing-seitenkanäle-zwischen-pds); hier steht, was trägt und
+welche Annahmen dabei umgefallen sind.
+
+**Gemessen, nicht angenommen.** `hal::cache` liest die LLC-Geometrie aus der Hardware — x86 über
+`CPUID`-Blatt 4 (Unterblätter durchzählen, höchste Ebene mit Daten-/Unified-Cache), aarch64 über
+`CLIDR_EL1`/`CCSIDR_EL1` inklusive der FEAT_CCIDX-Feldverschiebung. Farbe einer Seite =
+`sets * line / PAGE`, immer auf die nächstkleinere Zweierpotenz abgerundet: nur echte Indexbits
+sind Farbbits. Auf dem Testaufbau (QEMU q35, `-cpu Skylake-Client`): LLC L3 16 MiB, 16-fach,
+64 B/Zeile, 16384 Sets → **256 Seitenfarben**.
+
+**`1` ist kein Erfolgswert.** Meldet die Plattform keine Geometrie, gibt es eine Farbe — und
+„die Farbsätze zweier PDs sind disjunkt" wäre dann strukturell wahr, ohne geprüft zu sein.
+`colors::usable()` trennt das, der Test meldet **SKIP statt PASS**, und die Suite hat dafür einen
+eigenen Zweig. Dieselbe Falle wie bei der SMMU-Event-Queue ohne `CD.R`, nur eine Ebene höher.
+`qemu64` ist genau dieser Fall: das synthetische Modell meldet weder Blatt 4 noch x2APIC. Der
+TCG-Rückfall der Suite steht deshalb jetzt auf `Skylake-Client` — die Lücken waren die des
+**Modells**, nicht die des Kernels.
+
+**Die Annahme, die umfiel: Färbung und der 2-MiB-Blockdeskriptor schließen einander aus.**
+Aufeinanderfolgende Seiten tragen aufeinanderfolgende Farben, also überstreicht eine
+zusammenhängende Region über `n` Seiten `n` aufeinanderfolgende Farben. Die 2-MiB-Region von
+`spawn_isolated` sind 512 Seiten — bei 256 Farben also jede Farbe zweimal. Kein Zuteilungstrick
+ändert das; es ist Arithmetik. Färbung gibt es deshalb nur mit einer Region, die **höchstens so
+breit ist wie der Farbstreifen** (`MASK_BITS / PARTITIONS` Seiten, bei 4 Partitionen 64 KiB), und
+mit seitenweisem Mapping statt eines Block-PTE. Der Preis steht im Code, nicht in einer Fußnote:
+16 PTEs plus eine L3-Tabelle statt eines Deskriptors. `alloc_colored` weist eine zu große
+Anforderung **ab**, statt still fremde Farben mitzunehmen.
+
+**Auch die Kernel-Seite gehört dazu.** Kernel-Stack (16 KiB) und die obersten Seitentabellen einer
+PD werden vom Kernel benutzt, aber *im Namen dieses Subjekts*; ihre Cache-Zeilen tragen dessen
+Zugriffsmuster, und ein MMU-Walk hinterlässt dieselben Spuren. Beide kommen jetzt aus demselben
+Streifen, und der Test weist das getrennt nach (`kernel_side_in_mask`) — sonst wäre es eine
+Behauptung im Kommentar.
+
+**Die zweite Annahme, die umfiel: `total_free()` ist als Leck-Orakel unbrauchbar, sobald andere
+Kerne laufen.** Der erste Bilanz-Test verglich die globale Summe vor und nach dem Abbau und war
+nichtdeterministisch — gleicher Kernel, mal grün, mal rot. Ursache: nebenher sammelt ein anderer
+Kern den Stack des planmäßig gefaulteten `iso_probe`-Threads ein; fiel dieser Rückgang ins
+Messfenster, sah eine bilanzneutrale Operation aus wie ein Gewinn. Ersetzt durch
+`PhysAllocator::fully_free(base, len)`: die Frage lautet jetzt „ist **genau diese** Region wieder
+frei", unabhängig von fremder Nebenläufigkeit. Ein Test, der aus fremdem Grund fehlschlägt, ist so
+wenig wert wie einer, der nicht fehlschlagen kann.
+
+**Wo die Arithmetik geprüft wird.** Farb- und Allokatorlogik liegen in `sel4lake-mem` und sind
+reine Rechnung ohne Hardware — 13 Host-Unit-Tests (`rustc --test crates/sel4lake-mem/src/lib.rs`,
+Laufzeit 0,00 s; der Umweg über `cargo` würde wegen `build-std` die halbe Standardbibliothek
+übersetzen). Darunter ein **Sensitivitätstest**: ohne Maske muss die Eigenschaft umfallen. Ohne
+ihn könnte der Disjunktheitstest grün sein, weil die Anordnung es zufällig hergibt, statt weil die
+Maske wirkt. Der Kernel-Test rechnet die Farbe mit **derselben** `color_of` wie der Allokator —
+eine zweite Fassung im Testmodul hätte am Ende nur die eigene Arithmetik bestätigt.
+
 ## B. Thread-Migration — **erledigt** (ext-30)
 
 - [x] **B1** Kern-Zuordnung aus der ThreadId gelöst — globales **Thread-Directory**

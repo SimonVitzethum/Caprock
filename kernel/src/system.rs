@@ -829,36 +829,110 @@ pub fn cap_move(src: CapPtr) -> Result<CapPtr, CapError> {
 pub fn cap_inspect(ptr: CapPtr) -> Option<CapInfo> {
     CAPS.read().cspace.inspect(ptr)
 }
+/// **Der Rückmeldepuffer der Cap-Finalisierung** (A-3.3) — einmal statisch, nicht je Aufruf auf
+/// dem Kernelstack.
+///
+/// Bis hierher legte jeder `cap_delete`/`cap_revoke` ein `Finalized` als **lokale Variable** an:
+/// zwei `[_; 128]`-Arrays, rund 4 KiB, plus die 2,2 KiB, die `dma_finalize` daneben nochmals
+/// aufmachte. Damit hing die Objekttabelle an der Stackgröße — `NOBJECTS` zu vergrößern (A-3.4,
+/// todo C3) hätte den Stack **jedes** Threads mitvergrößert. Genau das nennt todo A3 als
+/// Nebenbedingung, und deshalb steht A-3.3 vor A-3.4.
+///
+/// Die Kapazität kommt aus der Cap-Crate ([`sel4lake_cap::MAX_FINALIZED`]) statt aus einer
+/// zweiten Konstante hier; wächst die Tabelle, wächst der Puffer mit, ohne dass jemand daran
+/// denken muss.
+struct FinalizeBuf {
+    /// `(ep, caller)`-Paare abzubrechender Calls.
+    items: [(u32, u64); sel4lake_cap::MAX_FINALIZED],
+    /// Finalisierte DMA-Regionen `(phys, len)`.
+    dma: [(u64, u64); sel4lake_cap::MAX_FINALIZED],
+    /// Ergebnis je Region aus `dma_enforcer().finalize` — abgebaut ja/nein.
+    ok: [bool; sel4lake_cap::MAX_FINALIZED],
+    /// Kratzfläche der Enforcer: je Region der Index des betroffenen Übersetzungskontexts.
+    /// Lag bis A-3.3 in **jeder** `finalize`-Implementierung nochmals auf dem Stack.
+    ctx_of: [usize; sel4lake_cap::MAX_FINALIZED],
+}
+
+/// **Sperrordnung: `FINALIZE` ist die äußerste.** Sie wird vor `CAPS` genommen und erst nach
+/// `abort_finalized_replies` (EPS < SCHEDS) und `dma_finalize` wieder freigegeben — die Meldungen
+/// liegen ja darin.
+///
+/// Das führt **keine neue Verklemmungsklasse** ein: `FINALIZE` nimmt ausschliesslich
+/// `cap_delete`/`cap_revoke`, und beide nehmen unmittelbar danach ohnehin `CAPS.write()`. Ein
+/// Pfad, der sich hier verklemmen könnte, verklemmte sich vorher schon an `CAPS`. Was sich
+/// tatsächlich ändert: die beiden Operationen serialisieren jetzt auch gegeneinander — was sie
+/// über `CAPS.write()` bereits taten.
+static FINALIZE: SpinLock<FinalizeBuf> = SpinLock::new(FinalizeBuf {
+    items: [(0, 0); sel4lake_cap::MAX_FINALIZED],
+    dma: [(0, 0); sel4lake_cap::MAX_FINALIZED],
+    ok: [false; sel4lake_cap::MAX_FINALIZED],
+    ctx_of: [usize::MAX; sel4lake_cap::MAX_FINALIZED],
+});
+
+/// Wie oft eine Finalisierungsmeldung mangels Kapazität verworfen wurde. **Muss 0 bleiben.**
+static FINALIZE_OVERFLOW: AtomicU32 = AtomicU32::new(0);
+
+/// Zähler der verworfenen Finalisierungsmeldungen (Audit-Code 70 in [`ipc_audit`]).
+pub fn finalize_overflow_count() -> u32 {
+    FINALIZE_OVERFLOW.load(Ordering::Relaxed)
+}
+
+/// Den Überlauf auswerten — **die Prüfung, die es bis A-3.3 nicht gab.**
+///
+/// `Finalized::overflowed()` existierte mit dem Kommentar „damit «kann nicht vorkommen» prüfbar
+/// ist statt behauptet", und gerufen hat sie **niemand**. Solange die Arrays im Typ lagen, war das
+/// verschmerzbar; seit der Puffer vom Aufrufer kommt, ist die Kapazität eine Entscheidung und
+/// keine Typeigenschaft mehr. Ein Überlauf heisst konkret: ein in `CALL` blockierter Aufrufer wird
+/// **nie** entblockt (Liveness-Bug) oder eine DMA-Region bleibt gemappt und belegt.
+///
+/// Deshalb laut und sofort, nicht nur als Zähler: ein Fehler dieser Klasse ist im Nachhinein an
+/// nichts mehr zu erkennen — man sieht nur einen Thread, der steht.
+fn note_finalize_overflow(rf: &sel4lake_cap::Finalized<'_>) {
+    if rf.overflowed() {
+        FINALIZE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+        println!(
+            "cap     : FAILURES Finalisierungspuffer uebergelaufen (Kapazitaet {}) -- Meldungen verworfen: blockierte CALL-Aufrufer bleiben stehen",
+            sel4lake_cap::MAX_FINALIZED
+        );
+    }
+}
+
 pub fn cap_delete(ptr: CapPtr) -> Result<(), CapError> {
     // Finalisierung gibt ggf. Speicher zurück -> CAPS vor MEM (Sperrordnung). Beim
     // Finalisieren einer Reply-Cap wird der zugehörige Call abgebrochen (NACH dem
     // Freigeben von CAPS/MEM, da das Entblocken EPS<SCHEDS sperrt -> CAPS < EPS).
-    let mut rf = sel4lake_cap::Finalized::new();
+    let mut buf = FINALIZE.lock();
+    let b = &mut *buf;
+    let mut rf = sel4lake_cap::Finalized::new(&mut b.items, &mut b.dma);
     let r = {
         let mut caps = CAPS.write();
         let mut mem = MEM.lock();
         caps.cspace.delete(&mut mem, ptr, &mut rf)
     };
     abort_finalized_replies(&rf);
-    dma_finalize(&rf);
+    dma_finalize(&rf, &mut b.ok, &mut b.ctx_of);
+    note_finalize_overflow(&rf);
     r
 }
 pub fn cap_revoke(ptr: CapPtr) -> Result<(), CapError> {
-    let mut rf = sel4lake_cap::Finalized::new();
+    let mut buf = FINALIZE.lock();
+    let b = &mut *buf;
+    let mut rf = sel4lake_cap::Finalized::new(&mut b.items, &mut b.dma);
     let r = {
         let mut caps = CAPS.write();
         let mut mem = MEM.lock();
         caps.cspace.revoke(&mut mem, ptr, &mut rf)
     };
     abort_finalized_replies(&rf);
-    dma_finalize(&rf);
+    dma_finalize(&rf, &mut b.ok, &mut b.ctx_of);
+    note_finalize_overflow(&rf);
     r
 }
 
 /// Für jede beim Löschen/Revoke finalisierte Reply-Cap den ausstehenden Call abbrechen:
 /// den noch wartenden Aufrufer mit `ERR_SERVER_GONE` entblocken (Revocation eines
 /// Calls). Läuft OHNE gehaltenen CAPS/MEM-Lock (Ordnung CAPS < EPS < SCHEDS).
-fn abort_finalized_replies(rf: &sel4lake_cap::Finalized) {
+fn abort_finalized_replies(rf: &sel4lake_cap::Finalized<'_>) {
     for (ep, caller_raw) in rf.iter() {
         endpoint_abort_call(ep as usize, ThreadId::from_raw(caller_raw));
     }
@@ -2303,7 +2377,12 @@ pub trait DmaEnforcer: Sync {
     ///
     /// Default: es gab nie eine Übersetzung (kein Enforcer / `attach` liefert `None`), also darf
     /// alles freigegeben werden. Das ist kein Freibrief, sondern die Wahrheit über x86 heute.
-    fn finalize(&self, regions: &[(u64, u64)], ok: &mut [bool]) {
+    ///
+    /// `ctx_of` ist **geliehene Kratzfläche** (A-3.3): je Region der Index des betroffenen
+    /// Übersetzungskontexts, gebraucht zwischen Phase 1 und Phase 4. Sie lag bis hierher als
+    /// `[usize; MAX_FINALIZE]` auf dem Kernelstack — dieselbe Kopplung an `NOBJECTS`, die A-3.3
+    /// beseitigt, nur eine Ebene tiefer. Wer sie nicht braucht (dieser Default), ignoriert sie.
+    fn finalize(&self, regions: &[(u64, u64)], ok: &mut [bool], _ctx_of: &mut [usize]) {
         for b in ok.iter_mut().take(regions.len()) {
             *b = true;
         }
@@ -2645,7 +2724,7 @@ mod smmu_enforcer_arm {
                 t[slot] = DmaCtx::EMPTY;
             }
         }
-        fn finalize(&self, regions: &[(u64, u64)], ok: &mut [bool]) {
+        fn finalize(&self, regions: &[(u64, u64)], ok: &mut [bool], ctx_of: &mut [usize]) {
             if !self.active.load(Ordering::Acquire) {
                 for b in ok.iter_mut().take(regions.len()) {
                     *b = true; // keine Durchsetzung aktiv -> es gab nie eine Übersetzung
@@ -2659,9 +2738,14 @@ mod smmu_enforcer_arm {
             // Phase 1 — **alle** betroffenen Kontexte stilllegen (je Kontext alle StreamIDs).
             // Ein Kontext kann mehrere der Regionen tragen; die Stilllegung ist verschachtelbar,
             // also wird sie hier einmal je *Region* genommen und in Phase 4 ebenso oft gelöst.
-            let mut ctx_of = [usize::MAX; MAX_FINALIZE];
-            let mut quiesced = [false; MAX_FINALIZE];
-            for (i, &(pa, len)) in regions.iter().enumerate().take(MAX_FINALIZE) {
+            // `ctx_of` kommt vom Aufrufer (A-3.3). `quiesced` gab es hier als zweites Array
+            // derselben Groesse -- gelesen wurde es nie ausser in der Zeile darunter; eine lokale
+            // Variable tut dasselbe.
+            let nfin = regions.len().min(ok.len()).min(ctx_of.len());
+            for e in ctx_of[..nfin].iter_mut() {
+                *e = usize::MAX;
+            }
+            for (i, &(pa, len)) in regions.iter().enumerate().take(nfin) {
                 let Some(slot) = t.iter().position(|c| {
                     c.used
                         && c.regs
@@ -2674,15 +2758,14 @@ mod smmu_enforcer_arm {
                     continue;
                 };
                 ctx_of[i] = slot;
-                quiesced[i] = ctx_quiesce(&mut t[slot]);
-                ok[i] = quiesced[i];
+                ok[i] = ctx_quiesce(&mut t[slot]);
             }
 
             // Phase 2 — alle Regionen unmappen (IOVA-Achse). Der Unmap ist **immer** zwingend,
             // auch wenn die Stilllegung nicht bestätigt ist: eine stehende Übersetzung auf eine
             // Region, die gleich freigegeben würde, ist genau der geräteseitige Use-after-free.
             // Zurückgehalten wird nur die *Freigabe*.
-            for (i, &(pa, len)) in regions.iter().enumerate().take(MAX_FINALIZE) {
+            for (i, &(pa, len)) in regions.iter().enumerate().take(nfin) {
                 let slot = ctx_of[i];
                 if slot == usize::MAX {
                     continue;
@@ -2704,7 +2787,7 @@ mod smmu_enforcer_arm {
             self.cmdq_prod.store(next, Ordering::Release);
 
             // Phase 4 — Stilllegung lösen und leere Kontexte abbauen.
-            for i in 0..regions.len().min(MAX_FINALIZE) {
+            for i in 0..nfin {
                 let slot = ctx_of[i];
                 if slot == usize::MAX || !t[slot].used {
                     continue;
@@ -3021,7 +3104,7 @@ impl DmaEnforcer for VtdEnforcer {
         }
     }
 
-    fn finalize(&self, regions: &[(u64, u64)], ok: &mut [bool]) {
+    fn finalize(&self, regions: &[(u64, u64)], ok: &mut [bool], ctx_of: &mut [usize]) {
         let Some(caps) = hal::vtd::caps_common() else {
             for b in ok.iter_mut().take(regions.len()) {
                 *b = true; // keine Einheit -> es gab nie eine Übersetzung
@@ -3031,9 +3114,13 @@ impl DmaEnforcer for VtdEnforcer {
         let root = hal::vtd::root_table();
         let levels = caps.agaw_levels;
         let mut t = DMA_CTX.lock();
-        let mut ctx_of = [usize::MAX; MAX_FINALIZE];
+        // Kratzflaeche vom Aufrufer (A-3.3) statt `[usize; MAX_FINALIZE]` auf dem Kernelstack.
+        let nfin = regions.len().min(ok.len()).min(ctx_of.len());
+        for e in ctx_of[..nfin].iter_mut() {
+            *e = usize::MAX;
+        }
         // Phase 1: alle betroffenen Kontexte stilllegen (je Kontext alle RIDs der Gruppe).
-        for (i, &(pa, len)) in regions.iter().enumerate().take(MAX_FINALIZE) {
+        for (i, &(pa, len)) in regions.iter().enumerate().take(nfin) {
             let Some(slot) = t.iter().position(|c| {
                 c.used
                     && c.regs
@@ -3047,7 +3134,7 @@ impl DmaEnforcer for VtdEnforcer {
             ok[i] = ctx_quiesce(&mut t[slot]);
         }
         // Phase 2: alle Regionen unmappen — immer, auch ohne bestätigte Stilllegung.
-        for (i, &(pa, len)) in regions.iter().enumerate().take(MAX_FINALIZE) {
+        for (i, &(pa, len)) in regions.iter().enumerate().take(nfin) {
             let slot = ctx_of[i];
             if slot == usize::MAX {
                 continue;
@@ -3068,7 +3155,7 @@ impl DmaEnforcer for VtdEnforcer {
         // Phase 3: **eine** Invalidierung für den ganzen Stapel.
         hal::vtd::sync_tables();
         // Phase 4: Stilllegung lösen, leere Kontexte abbauen.
-        for i in 0..regions.len().min(MAX_FINALIZE) {
+        for i in 0..nfin {
             let slot = ctx_of[i];
             if slot == usize::MAX || !t[slot].used {
                 continue;
@@ -3676,10 +3763,6 @@ pub fn dma_disable(stream_id: u32, base: u64, len: u64) {
     dma_enforcer().detach(&DmaBinding::new(stream_id, Pa::new(base), len));
 }
 
-/// Obergrenze eines Finalisierungsstapels — dieselbe Schranke wie in der Cap-Crate (`NOBJECTS`):
-/// mehr DMA-Objekte kann eine einzelne Operation nicht finalisieren.
-const MAX_FINALIZE: usize = 128;
-
 /// **Nachweis, dass eine DMA-Region abgebaut ist** (ext-37).
 ///
 /// Der Token ist der einzige Weg zu [`free_dma_region`]. Er entsteht ausschließlich in
@@ -3771,20 +3854,17 @@ fn park_pending(region: DmaRegion) {
 /// Zwischenzustand, den es meistens nicht gibt, ist schwerer richtig zu halten als einer, den es
 /// nie gibt — und die Beschränktheits-Invariante der Pending-Menge muss dann nur noch den
 /// pathologischen Fall tragen, für den sie gedacht war.
-fn dma_finalize(fin: &sel4lake_cap::Finalized) {
-    let mut regs = [(0u64, 0u64); MAX_FINALIZE];
-    let mut n = 0;
-    for (pa, len) in fin.iter_dma() {
-        if n < MAX_FINALIZE {
-            regs[n] = (pa, len);
-            n += 1;
-        }
-    }
+/// `ok` ist der Ergebnispuffer des Enforcers und kommt vom Aufrufer (A-3.3, s. [`FinalizeBuf`]).
+/// Vorher lagen hier **zwei** weitere Arrays auf dem Kernelstack: eine Kopie der Regionen (nur um
+/// aus dem Kollektor einen zusammenhängenden Slice zu machen — den liefert er jetzt selbst) und
+/// das Ergebnisfeld.
+fn dma_finalize(fin: &sel4lake_cap::Finalized<'_>, ok: &mut [bool], ctx_of: &mut [usize]) {
+    let regs = fin.dma_regions();
+    let n = regs.len().min(ok.len());
     if n == 0 {
         return;
     }
-    let mut ok = [false; MAX_FINALIZE];
-    dma_enforcer().finalize(&regs[..n], &mut ok[..n]);
+    dma_enforcer().finalize(&regs[..n], &mut ok[..n], ctx_of);
     for i in 0..n {
         let region = DmaRegion {
             iova: Iova::new(0), // die IOVA ist mit dem Unmap erloschen und kommt nie zurück

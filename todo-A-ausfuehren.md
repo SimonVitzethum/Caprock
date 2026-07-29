@@ -111,9 +111,22 @@ wird. Alles andere liegt außerhalb.
       **Nicht erledigt:** `SYS_LOAD` gibt weiterhin keine PdControl-Cap der neu erzeugten PD zurück
       (s. A-2.1). Der wählbare Empfangs-Slot ist die Vorbedingung dafür; die Rückgabe selbst steht
       noch aus.
-- [ ] **A-3.3 `ReplyFinal` vom Kernelstack lösen.** Hält heute ein `[(u32,u64); NOBJECTS]`-Array
+- [x] **A-3.3 `ReplyFinal` vom Kernelstack lösen.** Hält heute ein `[(u32,u64); NOBJECTS]`-Array
       auf dem 2-KiB-Kernelstack; `NOBJECTS` hochzuziehen koppelt an die Stackgröße. Vorbedingung
       von A-3.4.
+      → `Finalized` (der heutige Name) leiht seinen Speicher jetzt vom Aufrufer statt ihn zu
+      besitzen; der Kernel hält **einen** statischen Puffer (`FinalizeBuf`, äusserste Sperre).
+      Kommen die Tabellen in A-3.4 aus dem RAM, kommt der Puffer aus derselben Quelle — **ohne
+      Änderung an der Cap-Crate**. Es war mehr als das eine Array: `dma_finalize` hielt eine
+      **Kopie** derselben Regionen (nur um daraus einen zusammenhängenden Slice zu machen), und
+      **jede** `finalize`-Implementierung der Enforcer nochmals ein `[usize; 128]`.
+      **Zwei Funde:** `Finalized::overflowed()` — daneben der Kommentar, sie stehe da, „damit «kann
+      nicht vorkommen» prüfbar ist statt behauptet" — wurde von **niemandem** gerufen. Solange die
+      Arrays im Typ lagen, war die Kapazität eine Typeigenschaft; jetzt ist sie eine Entscheidung
+      des Aufrufers, also wird sie geprüft (Audit-Code 70, plus sofortige Meldung: ein Überlauf
+      heisst, ein in `CALL` blockierter Aufrufer wird nie entblockt, und das sieht man hinterher
+      an nichts mehr). Und die Schranke stand doppelt (`MAX_FINALIZE` im Kernel „dieselbe Schranke
+      wie in der Cap-Crate") — eine Kopie, die beim Wachsen still auseinanderläuft.
 - [ ] **A-3.4 Cap-/PD-/Endpoint-/Notification-Tabellen dynamisch.** Solange die Cap-Tabelle global
       und fest ist, bestimmt ein Tenant die Dichte aller anderen. **(Berührt Strang B:** die
       Streifenbuchhaltung aus A1 zählt PDs; wächst die PD-Zahl dynamisch, muss die

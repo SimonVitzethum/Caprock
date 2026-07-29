@@ -24,4 +24,4 @@ mod object;
 mod space;
 
 pub use object::{DmaCoherence, DmaDir, ObjectKind};
-pub use space::{CapError, CapInfo, CapPtr, CapSpace, Finalized};
+pub use space::{CapError, CapInfo, CapPtr, CapSpace, Finalized, MAX_FINALIZED};

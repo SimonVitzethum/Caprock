@@ -291,9 +291,17 @@ HW (STM32MP257F-DK) umsetzbar/testbar. Boot-Report `spec :` zeigt bereits, was d
 `CAP_BUDGET_PER_PD` begrenzt jetzt den **Schaden**, ersetzt aber nicht das seL4-Modell (jede PD
 bekommt ihren CNode aus dem **eigenen** Untyped-Budget). Solange die Tabelle geteilt ist, bleibt
 Kapazität eine globale Größe.
-**Nebenbedingung beim Vergrößern:** `ReplyFinal` hält ein `[(u32,u64); NOBJECTS]`-Array **auf dem
-Kernelstack** (aktuell 2 KiB) — `NOBJECTS` hochzuziehen koppelt an die Kernel-Stackgröße. Vorher auf
-eine wachstumsfähige Meldestruktur umstellen. Siehe auch [C3](#c3-cap--pd--ipc-tabellen-dynamisch).
+**Nebenbedingung beim Vergrößern: erledigt** (A-3.3). `ReplyFinal`/`Finalized` hielt sein
+`[(u32,u64); NOBJECTS]`-Array **auf dem Kernelstack**, und nicht als einziges: `dma_finalize` hielt
+eine Kopie derselben Regionen, jede `finalize`-Implementierung der Enforcer nochmals ein
+`[usize; NOBJECTS]`. Gemessen am x86-Release war der Rahmen von `cap_delete`/`cap_revoke` deshalb
+**6168 Byte** — gross genug, dass der Compiler eine Stack-Probe einbaute. Jetzt leiht die Struktur
+ihren Speicher vom Aufrufer (ein statischer Puffer im Kernel), Rahmen 72 bzw. 88 Byte. `NOBJECTS`
+hochzuziehen koppelt damit nicht mehr an die Stackgrösse. Siehe auch
+[C3](#c3-cap--pd--ipc-tabellen-dynamisch).
+
+*(Die frühere Angabe „aktuell 2 KiB" war veraltet: Kernel-Threads haben 64 KiB, EL0-Threads einen
+16-KiB-EL1-Stack. Der Punkt stand trotzdem — 6,2 KiB waren 38 % des kleineren der beiden.)*
 
 ### A4. Kein Syscall zum Löschen eigener Caps
 **Klasse:** ABI-Lücke · **Aufwand:** klein-mittel
@@ -335,8 +343,8 @@ O(1); belegt durch den `scale`-Test mit 1024 gleichzeitigen Threads). Offen blei
 Tabellen, die GIC-Skalierung und der x86-Port.
 
 - [ ] **C3** <a id="c3-cap--pd--ipc-tabellen-dynamisch"></a>Cap-/PD-/Endpoint-/Notification-Tabellen
-      dynamisch (hängt an [A3](#a3-globale-cap-tabelle-bleibt-geteilte-ressource-fester-größe):
-      `ReplyFinal` zuerst vom Stack lösen).
+      dynamisch (hing an [A3](#a3-globale-cap-tabelle-bleibt-geteilte-ressource-fester-größe):
+      `ReplyFinal` zuerst vom Stack lösen — **das ist seit A-3.3 erledigt**, der Weg ist frei).
 
 ### C4. Effizienz bei tausenden Threads (lineare Scans beseitigen)
 

@@ -72,6 +72,14 @@ impl CapSlot {
     };
 }
 
+/// **Die Kapazität, die ein [`Finalized`] mitbringen muss**, damit keine Meldung verlorengeht:
+/// mehr Objekte als die Objekttabelle fasst kann eine einzelne Operation nicht finalisieren.
+///
+/// Sie steht hier und nicht beim Aufrufer, damit es **eine** Quelle gibt. Vorher hielt der Kernel
+/// eine eigene `MAX_FINALIZE`-Konstante mit dem Kommentar „dieselbe Schranke wie in der Cap-Crate"
+/// — eine Kopie, die beim Wachsen der Tabelle (A-3.4) still auseinanderläuft.
+pub const MAX_FINALIZED: usize = NOBJECTS;
+
 /// Was beim Löschen/Revoke **finalisiert** wurde und vom Kernel nachbereitet werden muss.
 ///
 /// Das Cap-System kennt weder das IPC- noch das DMA-Subsystem. Es meldet nur, *was* finalisiert
@@ -84,34 +92,47 @@ impl CapSlot {
 ///   keine erzwungene. Diese Crate kennt weder Gerät noch Enforcer und kann sie nicht prüfen;
 ///   also gibt sie die Region zurück, statt sie freizugeben, und der Kernel darf sie nur über
 ///   einen Nachweis (`DmaTeardownToken`) tatsächlich zurückgeben.
-pub struct Finalized {
+///
+/// **Der Rückmeldepuffer gehört dem Aufrufer** (A-3.3). Bis hierher trug diese Struktur zwei
+/// `[_; NOBJECTS]`-Arrays **in sich** und wurde im Kernel als lokale Variable angelegt — also rund
+/// 4 KiB auf dem Kernelstack, je Aufruf von `delete`/`revoke`. Damit hing `NOBJECTS` an der
+/// Stackgröße: die Objekttabelle zu vergrößern (A-3.4, todo C3) hätte den Stack mitvergrößert,
+/// und zwar den **jedes** Threads.
+///
+/// Jetzt sind es geliehene Slices. Der Kernel legt den Puffer einmal statisch an; sobald die
+/// Tabellen dynamisch aus dem RAM kommen, kommt der Puffer aus derselben Quelle — **ohne dass
+/// diese Crate sich ändert**. Sie bleibt allokationsfrei und ohne `unsafe`.
+pub struct Finalized<'a> {
     // Ein `revoke` kann eine ganze CDT-Teilkette loeschen und dabei MEHRERE Reply-Objekte
     // finalisieren. Die Kapazitaet MUSS die maximal in einer Operation finalisierbaren Reply-Objekte
     // fassen (hart begrenzt durch die Objekttabelle NOBJECTS) -- sonst wuerden ueberzaehlige
     // (ep, caller)-Paare still verworfen und ihre CALL-Aufrufer nie abgebrochen -> sie haengen
     // dauerhaft (Liveness-Bug). NOBJECTS ist die beweisbar vollstaendige Schranke (n <= len garantiert).
-    items: [(u32, u64); NOBJECTS],
+    items: &'a mut [(u32, u64)],
     n: usize,
     /// Finalisierte DMA-Regionen `(phys, len)`. Dieselbe Schranke aus demselben Grund: ein
     /// `revoke` über einen Teilbaum kann mehrere DMA-Objekte auf einmal finalisieren, und eine
     /// still verworfene Region wäre ein Leck **und** eine stehende Übersetzung.
-    dma: [(u64, u64); NOBJECTS],
+    dma: &'a mut [(u64, u64)],
     dn: usize,
     /// Wurde eine Meldung verworfen, weil die Kapazität nicht reichte? Das darf nach der
     /// `NOBJECTS`-Schranke nicht vorkommen; steht hier, damit „kann nicht vorkommen" prüfbar
     /// ist statt behauptet.
+    ///
+    /// **Seit A-3.3 ist das keine Formalie mehr.** Solange die Arrays in dieser Struktur lagen,
+    /// war die Kapazität durch den Typ garantiert; jetzt bringt der Aufrufer sie mit und kann sie
+    /// zu klein wählen. Deshalb **muss** [`Finalized::overflowed`] ausgewertet werden — der Kernel
+    /// tut das (`system::cap_delete`/`cap_revoke`, Audit-Code 70). Bis A-3.3 rief diese Methode
+    /// **niemand**: die Prüfbarkeit war vorhanden, die Prüfung nicht.
     overflow: bool,
 }
 
-impl Default for Finalized {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Finalized {
-    pub const fn new() -> Self {
-        Self { items: [(0, 0); NOBJECTS], n: 0, dma: [(0, 0); NOBJECTS], dn: 0, overflow: false }
+impl<'a> Finalized<'a> {
+    /// Einen Kollektor über geliehenem Speicher anlegen. Beide Slices sollten mindestens
+    /// [`MAX_FINALIZED`] Einträge fassen; sind sie kürzer, geht keine Meldung *unbemerkt*
+    /// verloren — [`Finalized::overflowed`] wird gesetzt.
+    pub fn new(items: &'a mut [(u32, u64)], dma: &'a mut [(u64, u64)]) -> Self {
+        Self { items, n: 0, dma, dn: 0, overflow: false }
     }
     fn push(&mut self, ep: u32, caller: u64) {
         if self.n < self.items.len() {
@@ -136,6 +157,12 @@ impl Finalized {
     /// Die finalisierten DMA-Regionen `(phys, len)` — **noch nicht freigegeben**.
     pub fn iter_dma(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         self.dma[..self.dn].iter().copied()
+    }
+    /// Dieselben Regionen als **zusammenhängender Slice**. Der Kernel reicht sie so direkt an den
+    /// DMA-Enforcer weiter; vorher kopierte er sie erst in ein zweites Stack-Array derselben
+    /// Größe um, das genau diese Form herstellte.
+    pub fn dma_regions(&self) -> &[(u64, u64)] {
+        &self.dma[..self.dn]
     }
     /// Ging eine Meldung verloren? (Muss immer `false` sein.)
     pub fn overflowed(&self) -> bool {
@@ -370,7 +397,7 @@ impl CapSpace {
         &mut self,
         alloc: &mut PhysAllocator,
         ptr: CapPtr,
-        rf: &mut Finalized,
+        rf: &mut Finalized<'_>,
     ) -> Result<(), CapError> {
         let slot = self.resolve(ptr)?;
         if self.slots[slot].mdb.first_child.is_some() {
@@ -386,7 +413,7 @@ impl CapSpace {
         &mut self,
         alloc: &mut PhysAllocator,
         ptr: CapPtr,
-        rf: &mut Finalized,
+        rf: &mut Finalized<'_>,
     ) -> Result<(), CapError> {
         let slot = self.resolve(ptr)?;
         // Wiederholt zu einem Blatt unterhalb von `slot` absteigen und löschen.
@@ -648,7 +675,7 @@ impl CapSpace {
 
     /// Ein Blatt (Cap ohne Kinder) löschen: aushängen, Refcount senken,
     /// ggf. Objekt finalisieren (Speicher zurückgeben), Slot freigeben.
-    fn delete_leaf(&mut self, alloc: &mut PhysAllocator, slot: usize, rf: &mut Finalized) {
+    fn delete_leaf(&mut self, alloc: &mut PhysAllocator, slot: usize, rf: &mut Finalized<'_>) {
         let obj = self.slots[slot].object;
         self.unlink(slot);
         self.release_slot(slot);

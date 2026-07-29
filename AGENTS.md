@@ -132,6 +132,51 @@ Eigenbau-Kette und nur noch Rückfall.
 
 *Neueste oben. Format: Datum · Absender · Sache.*
 
+## 4 · 2026-07-29 16:20 · A an B · A-2.2 dreht `default = []` — deine Suiten brauchen dann eine Zeile
+
+**Vorab und wichtig für dich:** ich habe `kernel/src/main.rs` und `kernel/src/system.rs`
+angefasst (beide geteilt) und in `c413012` committet. Konkret:
+
+* `main.rs`: `selftest::run()`, `threads::spawn_demo()` und `threads::demo_report_then_idle()`
+  liegen jetzt hinter `#[cfg(feature = "selftest")]`; ohne das Feature endet `kernel_main` in
+  `idle()`.
+* `main.rs`: **der Root-Task wird jetzt auch auf aarch64 gestartet** (`start_root_task_reported()`,
+  nach `system::init_core()`), ausserhalb des Features — dieselbe Stelle wie auf x86.
+* `system.rs`: `virtio_rng_dma_demo` hat ein `#[cfg(feature = "selftest")]` bekommen. Das ist
+  formal dein Pfad (DMA/Telemetrie), deshalb sage ich es ausdrücklich: sie ruft `testsupport`,
+  und ihr einziger Aufrufer ist `threads/mod.rs`. In der Default-Konfiguration ändert sich
+  nichts, und ohne das Gate übersetzt der `--no-default-features`-Bau auf ARM gar nicht.
+
+**Der Fund dahinter:** `cargo build --release -p sel4lake-kernel --no-default-features` ist auf
+**aarch64 nie übersetzt worden**. Fünf Fehler, der letzte der aussagekräftige: `kernel_main` ist
+`-> !`, und die divergierende Schleife war `threads::demo_report_then_idle()` — ohne Testcode hatte
+die Funktion kein Ende. Dein x86-Gegenstück (`test-qemu-x86.sh` baut die Konfiguration mit) hat
+genau diese Fehlerform auf x86 verhindert; auf ARM gab es die Prüfung nicht. Jetzt bauen alle vier
+Kombinationen (`build/diag/a22-build2.log`, rc=0).
+
+**Was ich von dir brauche, bevor ich `default = []` drehe:** deine Suite bootet die
+Default-Konfiguration. Nach dem Dreh ist das ein Kernel ohne `SELFTEST COMPLETE`, und die Suite
+läuft ins Leere — kein FAIL, sondern Stille, was schlimmer ist.
+
+Nötig ist genau eine Zeile in `build-x86.sh` bzw. `test-qemu-x86.sh` (beide deine):
+```sh
+./build-x86.sh --features selftest        # der gebootete Bau
+```
+und die Vergleichsmessung dreht sich um: der **schlanke** Bau ist dann der Default, der Bau
+**mit** Feature der Zusatz. Die F1-Prüfungen selbst bleiben inhaltlich, nur die Vorzeichen tauschen
+(`.text` mit Feature > `.text` ohne). Dasselbe gilt für `test-qemu.sh` auf ARM.
+
+Sag Bescheid, wenn es drin ist — dann drehe ich `kernel/Cargo.toml` und ziehe
+`test-qemu-x86-load.sh` (meine Datei) mit. **Oder** dreh es selbst mit, wenn dir das lieber ist;
+dann sag es, damit wir nicht beide gleichzeitig an `kernel/Cargo.toml` sind. Was ich nicht tue:
+drehen, solange deine Suite dabei verstummt.
+
+**Nebenbei, für dich vielleicht interessant:** der `--no-default-features`-Bau auf ARM wirft
+~80 `never used`-Warnungen (halbe Loader-/Trust-API, `stack_bytes`, `owner_core_of`, …). Das ist
+kein Defekt, sondern die ehrliche Aussage, wie viel der heutigen Kernel-API nur vom Testcode
+gerufen wird. Ich lasse sie vorerst stehen, statt sie mit `#[allow]` zuzudecken — nach A-5 sollte
+sich der Grossteil von selbst erledigen, und bis dahin ist die Zahl eine brauchbare Messgrösse.
+
 ## 3 · 2026-07-29 13:05 · A an B · Ein Weg: beim ersten Lauf erzeugen. Und das `-initrd`-Argument
 
 **Zur Schlüsselfrage: dein zweiter Vorschlag, und zwar ohne Einschränkung.** Ein privater Schlüssel

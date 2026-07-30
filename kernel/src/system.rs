@@ -824,6 +824,22 @@ pub fn configure_caps() -> u64 {
     // SAFETY: wie oben.
     unsafe { CAP_AUDIT.lock().attach(refs as *mut u32, n, |_| 0u32) };
 
+    // A-3.4 Teil 3: die PD-Tabelle. Sie war der Grund, warum 10000 Threads keine 10000 Tenants
+    // waren -- `[Pd; 256]` im `.bss`. Ab hier gilt dasselbe wie fuer die Cap-Tabellen: die Zahl
+    // kostet RAM, keine Struktur, und was sie kostet, steht im Boot-Report.
+    let pds_mem = table(
+        sel4lake_microkit::NPDS * core::mem::size_of::<sel4lake_microkit::Pd>(),
+        core::mem::align_of::<sel4lake_microkit::Pd>().max(4096),
+    );
+    // SAFETY: frisch allozierter, exklusiver, ausgerichteter Speicher der geforderten Groesse,
+    // der bis zum Reboot lebt; einmaliger Aufruf beim Boot VOR der ersten PD.
+    unsafe {
+        CAPS.write().pds.attach(
+            pds_mem as *mut sel4lake_microkit::Pd,
+            sel4lake_microkit::NPDS,
+        )
+    };
+
     bytes
 }
 
@@ -1456,7 +1472,13 @@ fn create_vspace_masked(mask: Option<sel4lake_mem::ColorMask>) -> Option<(u16, u
     // beiden bereits belegten Frames wieder freigegeben.
     let mut extra: Option<u64> = None;
     let ok = hal::mmu::vspace_create_base(l1.base(), l2.base(), &mut || {
-        let f = mem_alloc(4096, 4096)?;
+        // **Auch diese Ebene traegt die Maske.** Sie ging bisher ueber das ungefaerbte
+        // `mem_alloc` — auf x86_64 (PML4 -> PDPT -> PD) lag damit eine der drei Tabellen einer
+        // gefaerbten PD ausserhalb ihres Farbsatzes, und der Farbtest sah es nicht, weil er nur
+        // `l1`/`l2` zurueckliest. Ein Seitenlauf der MMU im Namen der PD hinterlaesst dort
+        // dieselben Spuren wie in den beiden anderen. Schlaegt die gefaerbte Zuteilung fehl,
+        // scheitert das Anlegen der VSpace — kein stiller Rueckfall auf fremde Farben.
+        let f = mem_alloc_masked(4096, 4096, mask)?;
         extra = Some(f.base());
         Some(f.base())
     });
@@ -1491,6 +1513,11 @@ fn create_vspace_masked(mask: Option<sel4lake_mem::ColorMask>) -> Option<(u16, u
 /// Kapazität `(Slots, Objekte)` des globalen Capability-Space (Boot-Report/Tests).
 pub fn cap_capacity() -> (usize, usize) {
     CAPS.read().cspace.capacity()
+}
+
+/// Tatsaechliche PD-Kapazitaet (A-3.4 Teil 3) -- die angehaengte, nicht die Konstante.
+pub fn pd_capacity() -> usize {
+    CAPS.read().pds.capacity()
 }
 
 pub fn cap_peaks() -> (usize, usize, usize, usize) {

@@ -247,13 +247,22 @@ fn spawn_demo() -> bool {
             );
         } else {
             println!(
-                "color   : {} Farben, {} Partitionen, Region {} KiB · in_mask={} kernelseite={} disjunkt={} \
+                "color   : {} Farben, {} Partitionen, Region {} KiB · in_mask={} \
+                 kernelseite={} (kstack={} l1={} l2={}) rueckgelesen={} (kstack={} l1={} l2={}) \
+                 disjunkt={} \
                  uebergross_abgewiesen={} bilanz={}",
                 c.colors,
                 crate::colors::PARTITIONS,
                 crate::colors::region_bytes() / 1024,
                 c.in_mask as u8,
                 c.kernel_side_in_mask as u8,
+                c.ks_in_mask as u8,
+                c.l1_in_mask as u8,
+                c.l2_in_mask as u8,
+                c.kernel_side_readable as u8,
+                c.ks_read as u8,
+                c.l1_read as u8,
+                c.l2_read as u8,
                 c.disjoint as u8,
                 c.oversize_refused as u8,
                 c.balanced as u8
@@ -622,7 +631,8 @@ pub fn run(multiboot_info: u64) -> ! {
     let cap_bytes = system::configure_caps();
     let (cap_slots, cap_objs) = system::cap_capacity();
     println!(
-        "cap     : {cap_slots} Slots / {cap_objs} Objekte, Tabellen {} KiB aus dem RAM (Summe aller PD-Budgets: {})",
+        "cap     : {cap_slots} Slots / {cap_objs} Objekte / {} PDs, Tabellen {} KiB aus dem RAM (Summe aller PD-Budgets: {})",
+        system::pd_capacity(),
         cap_bytes >> 10,
         sel4lake_microkit::CAP_SLOTS_FOR_ALL_PDS
     );

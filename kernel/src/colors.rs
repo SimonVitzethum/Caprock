@@ -221,6 +221,22 @@ pub struct ColorTest {
     /// Getrennt gefuehrt, weil es eine eigene Zusicherung ist: der Kernel arbeitet dort **im
     /// Namen** des Subjekts, und ein Seitenlauf der MMU hinterlaesst dieselben Spuren.
     pub kernel_side_in_mask: bool,
+    /// Aufschlüsselung von [`Self::kernel_side_in_mask`]: Kernel-Stack, oberste und zweitoberste
+    /// Tabelle — jeweils über **beide** PDs. Ein einzelnes `false` sagt, *welche* der drei
+    /// Zusicherungen gebrochen ist; ohne das ist der Sammelwert nur ein Alarm ohne Adresse.
+    pub ks_in_mask: bool,
+    pub l1_in_mask: bool,
+    pub l2_in_mask: bool,
+    /// **Konnte die Kernel-Seite überhaupt zurückgelesen werden?** Getrennt von
+    /// [`Self::kernel_side_in_mask`], weil beides ganz verschiedene Befunde sind: eine gebrochene
+    /// Färbung ist ein Isolationsfehler, eine `0` aus dem Rückkanal ein Fehler des Tests. Vorher
+    /// fielen beide in dasselbe Bit (`l1 != 0 && in_mask(l1)`) — ein `kernelseite=0` liess sich
+    /// dann nicht deuten, ohne zu raten. Dieselbe Trennung wie bei `audit_cdt` (Code 8:
+    /// „konnte nicht laufen" statt still „konsistent").
+    pub kernel_side_readable: bool,
+    pub ks_read: bool,
+    pub l1_read: bool,
+    pub l2_read: bool,
     /// **Die A1-Eigenschaft**: die Farbmengen beider PDs sind disjunkt.
     pub disjoint: bool,
     /// Eine Region jenseits der Streifenbreite wird abgewiesen statt fremde Farben mitzunehmen.
@@ -294,18 +310,30 @@ pub fn run_color(entry: usize, prio: u8) -> ColorTest {
         r.in_mask = region_in_mask(ba, sz, r.colors, m0) && region_in_mask(bb, sz, r.colors, m1);
         r.disjoint = !regions_share_color((ba, sz), (bb, sz), r.colors);
         // Kernel-Seite: Stack (16 KiB) und die beiden obersten Tabellen (je 4 KiB) jeder PD.
-        r.kernel_side_in_mask = [(ta, m0), (tb, m1)].iter().all(|&(t, m)| {
+        r.ks_in_mask = true;
+        r.l1_in_mask = true;
+        r.l2_in_mask = true;
+        r.ks_read = true;
+        r.l1_read = true;
+        r.l2_read = true;
+        for &(t, m) in [(ta, m0), (tb, m1)].iter() {
             let ks = crate::system::testsupport::kstack_of(t.slot());
             let (l1, l2) = crate::system::testsupport::vspace_tables_of(
                 crate::system::testsupport::asid_of(t.slot()),
             );
-            ks != 0
-                && l1 != 0
-                && l2 != 0
-                && region_in_mask(ks, crate::system::USER_KSTACK_SIZE as u64, r.colors, m)
-                && region_in_mask(l1, PAGE, r.colors, m)
-                && region_in_mask(l2, PAGE, r.colors, m)
-        });
+            // Lesbarkeit und Färbung getrennt: eine `0` heisst „nicht zurueckgelesen", nicht
+            // „falsch gefaerbt". Beides faellt weiterhin durch (`ok` fordert beide Sammelwerte),
+            // aber die Meldung sagt jetzt, welcher der beiden Faelle vorliegt.
+            r.ks_read &= ks != 0;
+            r.l1_read &= l1 != 0;
+            r.l2_read &= l2 != 0;
+            r.ks_in_mask &=
+                ks == 0 || region_in_mask(ks, crate::system::USER_KSTACK_SIZE as u64, r.colors, m);
+            r.l1_in_mask &= l1 == 0 || region_in_mask(l1, PAGE, r.colors, m);
+            r.l2_in_mask &= l2 == 0 || region_in_mask(l2, PAGE, r.colors, m);
+        }
+        r.kernel_side_readable = r.ks_read && r.l1_read && r.l2_read;
+        r.kernel_side_in_mask = r.ks_in_mask && r.l1_in_mask && r.l2_in_mask;
         crate::system::destroy_isolated(ta);
         crate::system::destroy_isolated(tb);
         // Leckprüfung an GENAU den beiden Regionen, nicht an der globalen Summe. Der
@@ -320,6 +348,7 @@ pub fn run_color(entry: usize, prio: u8) -> ColorTest {
     r.ok = r.usable
         && r.spawned
         && r.in_mask
+        && r.kernel_side_readable
         && r.kernel_side_in_mask
         && r.disjoint
         && r.oversize_refused

@@ -13,5 +13,6 @@ sel4lake-cap = { path = "../sel4lake-cap" }
 sel4lake-ipc = { path = "../sel4lake-ipc" }
 sel4lake-mem = { path = "../sel4lake-mem" }
 sel4lake-sched = { path = "../sel4lake-sched" }
+sel4lake-slab = { path = "../sel4lake-slab" }
 sel4lake-hal = { path = "../sel4lake-hal" }
 sel4lake-sync = { path = "../sel4lake-sync" }

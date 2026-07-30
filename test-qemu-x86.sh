@@ -184,6 +184,13 @@ if [ -n "${NTHREADS:-}" ] && [ "$NTHREADS" -ge 10000 ]; then
 else
     echo "  FAIL: A-3.4: nur ${NTHREADS:-?} Thread-Slots, Ziel 10000"; fail=1
 fi
+# A-3.4 Teil 3: die PD-Kapazitaet ist eine Zusage, keine .bss-Konstante.
+NPD=$(echo "$OUT" | grep -m1 -oE '^cap     : [0-9]+ Slots / [0-9]+ Objekte / [0-9]+ PDs' | grep -oE '[0-9]+ PDs' | grep -oE '^[0-9]+')
+if [ -n "${NPD:-}" ] && [ "$NPD" -ge 10000 ]; then
+    echo "  PASS: A-3.4: $NPD PD-Slots -- 10000 Threads koennen jetzt 10000 EIGENE Adressraeume haben, nicht nur geteilte"
+else
+    echo "  FAIL: A-3.4: nur ${NPD:-?} PD-Slots, Ziel 10000"; fail=1
+fi
 check "capsz   : ALL PASS" "A-3.4: der globale Cap-Space wurde nicht erschoepft -- gemessen am HOECHSTSTAND gleichzeitig belegter Slots, nicht am Endstand (ein Lauf, der zwischendurch an die Grenze stiess und danach aufraeumte, sieht am Ende harmlos aus)"
 check "iface   : ALL PASS" "A-4.4: die Versionssperre des Laders weist eine GEAENDERTE Schnittstellenversion ab und laesst die gleiche durch -- beide Ausgaenge belegt; eine andere program_id bleibt unberuehrt"
 check "stripe  : ALL PASS" "B-4.2: erschoepfte Farbpartitionierung scheitert SAUBER -- der 5. Streifenversuch wird abgewiesen, statt den Satz der ersten PD still ein zweites Mal auszugeben; nach Freigabe wieder vergebbar (kein Leck)"

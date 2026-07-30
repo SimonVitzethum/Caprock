@@ -23,12 +23,22 @@ use sel4lake_hal::exception::{frame_reg, frame_set_reg};
 use sel4lake_ipc::{Endpoint, Notification, NENDPOINTS, NNOTIFICATIONS};
 use sel4lake_mem::Rights;
 use sel4lake_sched::{SchedOps, ThreadId};
+use sel4lake_slab::Slab;
 use sel4lake_sync::{RwSpinLock, SpinLock};
 
 /// Größe des PD-Pools. **Öffentlich seit A-3.4**: wie viele Cap-Slots das System vorhalten muss,
 /// folgt aus `NPDS * CAP_BUDGET_PER_PD` — diese Rechnung gehört an *eine* Stelle
 /// ([`CAP_SLOTS_FOR_ALL_PDS`]) und nicht als abgeschriebene Zahl in den Boot-Code.
-pub const NPDS: usize = 256; // PD-Pool großzügig (war 96): viele gleichzeitig geladene PDs (load/adversarial)
+/// **Ziel-Zahl gleichzeitiger Protection Domains** (A-3.4, Teil 3).
+///
+/// War 256 und lag als `[Pd; NPDS]` im `.bss`. Damit waren 10000 Threads (`TARGET_THREADS`) zwar
+/// darstellbar, aber nur solange sie sich Adressräume **teilen** — als 10000 isolierte Tenants
+/// nicht, und genau das ist der Punkt des Systems. Die Tabelle wird jetzt beim Boot alloziert
+/// (`PdTable::attach`), die Zahl kostet also RAM, keine Struktur.
+///
+/// Auf `TARGET_THREADS` abgestimmt: im Grenzfall bekommt jeder Thread seine eigene PD. Was das
+/// kostet, meldet der Boot-Report — die Entscheidung hängt an einer gemessenen Größe.
+pub const NPDS: usize = 10_000;
 /// Cap-Slots je PD-Cspace (Adressraum der lokalen Slot-Indizes).
 const NCAPS: usize = 16;
 
@@ -166,7 +176,7 @@ impl Caps {
     /// (VSPACE_OF==0). Die 1:N-Kardinalität ist strukturell (ein `partner`-Feld); das
     /// UserLand↔HardwareLand-Kommunikationsverbot folgt in P6.
     pub fn domain_audit(&self, is_live_global: &dyn Fn(ThreadId) -> bool) -> u32 {
-        for pd in 0..PdTable::capacity() {
+        for pd in 0..self.pds.capacity() {
             if !self.pds.is_used(pd) {
                 continue;
             }
@@ -302,7 +312,7 @@ fn domain_allows_kind(domain: Domain, kind: ObjectKind) -> bool {
 
 /// Eine Protection Domain: ein Thread + ein Capability-Space + eine Sicherheitsdomäne.
 #[derive(Clone, Copy)]
-struct Pd {
+pub struct Pd {
     used: bool,
     thread: Option<ThreadId>,
     /// Lokaler Cap-Index -> globaler CapPtr.
@@ -347,7 +357,7 @@ impl Pd {
 
 /// Tabelle aller Protection Domains.
 pub struct PdTable {
-    pds: [Pd; NPDS],
+    pds: Slab<Pd>,
 }
 
 impl Default for PdTable {
@@ -359,7 +369,7 @@ impl Default for PdTable {
 impl PdTable {
     pub const fn new() -> Self {
         Self {
-            pds: [Pd::EMPTY; NPDS],
+            pds: Slab::empty(),
         }
     }
 
@@ -386,7 +396,7 @@ impl PdTable {
     /// zu löschen (sonst lecken globale Cap-Objekte) und den Thread/die VSpace abzubauen. Gibt
     /// `false`, wenn die PD nicht belegt war.
     pub fn free(&mut self, pd: usize) -> bool {
-        if pd < NPDS && self.pds[pd].used {
+        if pd < self.pds.len() && self.pds[pd].used {
             self.pds[pd] = Pd::EMPTY;
             true
         } else {
@@ -397,7 +407,7 @@ impl PdTable {
     /// Die lokalen Cap-Slots einer PD (für den Teardown: jeden installierten Cap löschen). Gibt
     /// die belegten `(slot, CapPtr)` zurück.
     pub fn caps_of(&self, pd: usize) -> [Option<CapPtr>; NCAPS] {
-        if pd < NPDS && self.pds[pd].used {
+        if pd < self.pds.len() && self.pds[pd].used {
             self.pds[pd].cspace
         } else {
             [None; NCAPS]
@@ -406,7 +416,7 @@ impl PdTable {
 
     /// Die (unveränderliche) Domäne einer PD.
     pub fn domain_of(&self, pd: usize) -> Option<Domain> {
-        if pd < NPDS && self.pds[pd].used {
+        if pd < self.pds.len() && self.pds[pd].used {
             Some(self.pds[pd].domain)
         } else {
             None
@@ -415,7 +425,7 @@ impl PdTable {
 
     /// Den unveränderlichen Trusted-Partner einer HardwareLand-PD (PD-Index).
     pub fn partner_of(&self, pd: usize) -> Option<usize> {
-        if pd < NPDS {
+        if pd < self.pds.len() {
             self.pds[pd].partner.map(|p| p as usize)
         } else {
             None
@@ -434,7 +444,7 @@ impl PdTable {
         ep: u32,
         ntfn: u32,
     ) -> Option<usize> {
-        if partner >= NPDS {
+        if partner >= self.pds.len() {
             return None;
         }
         let i = self.pds.iter().position(|p| !p.used)?;
@@ -452,7 +462,7 @@ impl PdTable {
 
     /// Die stabile Backend-Id einer PD (0 = kein Backend).
     pub fn backend_id_of(&self, pd: usize) -> u16 {
-        if pd < NPDS {
+        if pd < self.pds.len() {
             self.pds[pd].backend_id
         } else {
             0
@@ -461,7 +471,7 @@ impl PdTable {
 
     /// Die Kanal-IDs (Endpoint, Notification) einer HardwareLand-Backend-PD.
     pub fn chan_of(&self, pd: usize) -> (u32, u32) {
-        if pd < NPDS {
+        if pd < self.pds.len() {
             (self.pds[pd].chan_ep, self.pds[pd].chan_ntfn)
         } else {
             (u32::MAX, u32::MAX)
@@ -470,33 +480,47 @@ impl PdTable {
 
     /// Ist `pd` belegt?
     pub fn is_used(&self, pd: usize) -> bool {
-        pd < NPDS && self.pds[pd].used
+        pd < self.pds.len() && self.pds[pd].used
     }
 
     /// Der gebundene Thread einer PD (für die Domäne↔VSpace-Isolationsprüfung).
     pub fn thread_of(&self, pd: usize) -> Option<ThreadId> {
-        if pd < NPDS {
+        if pd < self.pds.len() {
             self.pds[pd].thread
         } else {
             None
         }
     }
 
-    /// Anzahl der PD-Slots (für Audit-Iteration).
-    pub const fn capacity() -> usize {
-        NPDS
+    /// Anzahl der PD-Slots (für Audit-Iteration) — die **tatsächliche**, beim Boot zugewiesene.
+    ///
+    /// War eine Konstante (`NPDS`). Seit A-3.4 Teil 3 ist sie die Länge der angehängten Tabelle:
+    /// eine Audit-Schleife, die über die Konstante läuft statt über die reale Kapazität, würde
+    /// vor dem `attach` ins Leere greifen und danach womöglich an der Tabelle vorbei.
+    pub fn capacity(&self) -> usize {
+        self.pds.len()
+    }
+
+    /// Der Tabelle ihren Speicher geben (einmalig, beim Boot — vor der ersten PD).
+    ///
+    /// # Safety
+    /// Vertrag von [`Slab::attach`]: exklusiver, ausgerichteter, dauerhafter Speicher für
+    /// mindestens `len` Elemente, genau einmal.
+    pub unsafe fn attach(&mut self, ptr: *mut Pd, len: usize) {
+        // SAFETY: an den Aufrufer durchgereicht (s. Funktionsdoku).
+        unsafe { self.pds.attach(ptr, len, |_| Pd::EMPTY) };
     }
 
     /// Den Thread einer PD setzen (Affinität Thread<->PD).
     pub fn bind_thread(&mut self, pd: usize, thread: ThreadId) {
-        if pd < NPDS {
+        if pd < self.pds.len() {
             self.pds[pd].thread = Some(thread);
         }
     }
 
     /// Eine globale Capability in den Cspace einer PD an `slot` eintragen.
     pub fn install_cap(&mut self, pd: usize, slot: usize, cap: CapPtr) {
-        if pd < NPDS && slot < NCAPS {
+        if pd < self.pds.len() && slot < NCAPS {
             self.pds[pd].cspace[slot] = Some(cap);
         }
     }
@@ -504,7 +528,7 @@ impl PdTable {
     /// Einen Cap-Slot einer PD leeren (Autorität entziehen — Hot-Reload).
     /// Den **Empfangs-Slot** einer PD setzen (A-3.2). `false`, wenn PD oder Slot ungültig sind.
     pub fn set_recv_slot(&mut self, pd: usize, slot: usize) -> bool {
-        if pd < NPDS && self.pds[pd].used && slot < NCAPS {
+        if pd < self.pds.len() && self.pds[pd].used && slot < NCAPS {
             self.pds[pd].recv_slot = slot;
             true
         } else {
@@ -514,7 +538,7 @@ impl PdTable {
 
     /// Der Empfangs-Slot einer PD (Vorgabe: [`sel4lake_abi::GRANT_RECV_SLOT`]).
     pub fn recv_slot(&self, pd: usize) -> usize {
-        if pd < NPDS && self.pds[pd].used {
+        if pd < self.pds.len() && self.pds[pd].used {
             self.pds[pd].recv_slot
         } else {
             sel4lake_abi::GRANT_RECV_SLOT
@@ -527,7 +551,7 @@ impl PdTable {
     }
 
     pub fn clear_cap(&mut self, pd: usize, slot: usize) {
-        if pd < NPDS && slot < NCAPS {
+        if pd < self.pds.len() && slot < NCAPS {
             self.pds[pd].cspace[slot] = None;
         }
     }
@@ -540,7 +564,7 @@ impl PdTable {
 
     /// Anzahl der aktuell belegten Cap-Slots einer PD (Verbrauch gegen [`CAP_BUDGET_PER_PD`]).
     pub fn cap_count(&self, pd: usize) -> usize {
-        if pd < NPDS && self.pds[pd].used {
+        if pd < self.pds.len() && self.pds[pd].used {
             self.pds[pd].cspace.iter().filter(|c| c.is_some()).count()
         } else {
             0

@@ -212,6 +212,7 @@ dependencies = [
  "sel4lake-ipc",
  "sel4lake-mem",
  "sel4lake-sched",
+ "sel4lake-slab",
  "sel4lake-sync",
 ]
 

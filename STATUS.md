@@ -96,10 +96,10 @@ schrumpft. Details in [AGENTS.md](AGENTS.md), Mitteilung 1.
 
 ## Strang A — Ausführen und Austauschen (Claude A)
 
-**Zuletzt geändert (A): 2026-07-30 20:50 UTC**
+**Zuletzt geändert (A): 2026-07-30 21:50 UTC**
 
-**Gerade in Arbeit: nichts Angefangenes — A-3.4 Teil 1 (`ec26cfb`), Teil 2 (`1e2bd51`) und Teil 3
-(`f6e5186`) sind committet, der Baum ist sauber.** Erledigt ist die Thread-Kapazität als
+**Gerade in Arbeit: nichts Angefangenes — A-3.4 Teil 1 (`ec26cfb`), Teil 2 (`1e2bd51`), Teil 3
+(`f6e5186`) und Teil 4 (`25d388a`) sind committet, der Baum ist sauber.** Erledigt ist die Thread-Kapazität als
 **Zusage** (`TARGET_THREADS = 10_000`, gemessen:
 `4 Kern, 10000 Thread-Slots (5000 hostbar), Tabellen 7872 KiB aus dem RAM`), die
 Cap-Space-Telemetrie (Höchststand statt Endstand — ein Lauf, der zwischendurch an die Grenze
@@ -142,21 +142,29 @@ eine `0` aus dem Rückkanal (Fehler des Tests) in dasselbe Bit — ein `kernelse
 nicht deuten, ohne zu raten. Beides fällt weiterhin durch (`ok` fordert beide). Dieselbe Trennung
 wie bei `audit_cdt` (Code 8) seit Teil 2.
 
-**Ausdrücklich NICHT erreicht:** Endpoints und Notifications (`NENDPOINTS`/`NNOTIFICATIONS = 32`
-in `sel4lake-ipc`) sind weiter **statisch**. Und die **Summe** der Cap-Budgets prüft weiter
+**Teil 4 (`25d388a`) schliesst die letzte feste Tabelle der Kette:** `NENDPOINTS`/`NNOTIFICATIONS
+= 32` in `sel4lake-ipc` hiessen, dass mit `NPDS = 10000` zwar jede PD einen eigenen Adressraum
+haben konnte, aber ab der 33. keine mehr Server sein. Beide sind jetzt `Slab<_>`, beim Boot
+dimensioniert nach „eine PD, ein Endpoint" (`NPDS` + Reserve = 10064) und in **beiden**
+Boot-Pfaden (`main.rs`, `bringup.rs`) vor dem Selbsttest angehängt — dieselbe `attach`-Mechanik
+wie CapSpace (Teil 2) und PD-Tabelle (Teil 3). Gemessen: `ipc : 10064 Endpoints / 10064
+Notifications, Tabellen 16908 KiB aus dem RAM (eine PD, ein Endpoint: 10000 PDs)`, dazu
+`PASS: A-3.4: 10064 Endpoints / 10064 Notifications`.
+
+**Ausdrücklich NICHT erreicht:** die **Summe** der Cap-Budgets prüft weiter
 niemand (`budget_allows` kennt nur `cap_count(pd)`); sie passt in die Tabelle, statt geprüft zu
 werden: `NPDS * CAP_BUDGET_PER_PD` = 10000 × 8 = 80000, dazu 256 Reserve — genau die 80256 aus
 dem Bootreport. Die Dimensionierung trägt die Zusicherung, nicht eine Prüfung.
 
-**Nächster Schritt (A-3.4 4/n):** dieselbe Mechanik für `NENDPOINTS`/`NNOTIFICATIONS` in
-`sel4lake-ipc`.
+**Nächster Schritt:** A-3.4 ist damit erledigt — die dynamischen Tabellen stehen (Threads, Caps,
+Objekte, PDs, Endpoints, Notifications). Offen bleibt als eigener Punkt die **Summenprüfung** der
+Cap-Budgets (s. oben); danach A-4 (Hot-Reload, 4.1–4.3) und A-5.
 
-**Belegt durch Lauf 20:25** (`build/diag/a34-teil3c.log`): `rc_load=0` mit `== ALL PASS ==`,
+**Belegt durch Lauf 21:31** (`build/diag/a34-teil4.log`): `rc_load=0` mit `== ALL PASS ==`,
 `rc_main=1` mit genau einem FAIL — `x2APIC`, der bekannte TCG-Vorbehalt ohne KVM.
 
 **Neu erledigt (2026-07-30):** A-2.2 (`default = []`), A-4.4 (Versionssperre im Lader, beide
-Ausgänge belegt), A-4.5 (Negativliste `invariants.md` §13), A-3.4 Teil 1, Teil 2 und Teil 3
-(s. oben).
+Ausgänge belegt), A-4.5 (Negativliste `invariants.md` §13), A-3.4 Teil 1 bis Teil 4 (s. oben).
 
 **Eine Grenze, die zu A-4.4 gehört und nicht verschwiegen wird:** über das Manifest ist der
 Abweisungszweig heute **nicht erreichbar** — pro Boot gibt es genau ein Manifest. Er wird es erst

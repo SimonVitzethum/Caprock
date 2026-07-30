@@ -24,17 +24,24 @@ path = "src/main.rs"
 # Farbtest, `system::testsupport`). Rund ein Viertel des Kernels ist Testcode, und er wurde bis
 # hierher bei JEDEM Start mitkompiliert und ausgefuehrt.
 #
-# **Vorerst in `default`.** Das ist Absicht und kein Zoegern: schaltet man heute alles ab, bleibt
-# `configure() -> idle`. Der Kernel hat derzeit keinen Nicht-Test-Zweck -- auf x86 gibt es kein
-# Boot-Archiv, und auf aarch64 ruft den Loader niemand ausser `threads/mod.rs`. Das Gating waere
-# also kein schlankerer Kernel, sondern ein leerer. Der ehrliche Ersatz ist der seL4-Weg: ein
-# Startprogramm aus dem Archiv laden und ihm die Wurzel-Caps uebergeben (todo F2).
+# **NICHT in `default`** (A-2.2, gedreht 2026-07-29). Bis A-2.1 stand, waere das Gating kein
+# schlankerer Kernel gewesen, sondern ein leerer: ohne Testcode blieb `configure() -> idle`, der
+# Kernel hatte keinen Nicht-Test-Zweck. Jetzt hat er einen. `loader::start_root_task_reported()`
+# liegt in `kernel_main` AUSSERHALB jedes Features: der Vorgabebau laedt das Startprogramm aus dem
+# signierten Manifest und uebergibt ihm die Wurzel-Caps -- der seL4-Weg (todo F2). Ab hier ist jede
+# weitere Faehigkeit ein Userland-Programm statt eines Kernel-Patches.
 #
-# Bauen ohne: `cargo build --release --no-default-features --target ...`
-# **Beide Konfigurationen gehoeren in die Testskripte.** Ein `--no-default-features`-Build, den
-# niemand baut, verrottet still -- und genau diese Fehlerform hat hier schon mehrfach zugeschlagen
-# (leere Event-Queue, nie ausgefuehrter x86-Testpfad, DMAR-Ausschlusspfad).
-default = ["selftest"]
+# Was der Vorgabebau NICHT mehr tut: Selbsttests, Demo-/Testthreads, DMA-/DMAR-Tests, Farbtest,
+# `system::testsupport`. Rund ein Viertel des Kernels war Testcode und wurde bis hierher bei JEDEM
+# Start mitkompiliert und ausgefuehrt.
+#
+# Bauen MIT Pruefinfrastruktur: `--features selftest`. Beide Suiten fordern das jetzt ausdruecklich
+# fuer den gebooteten Bau (nicht ueber `default`) -- sonst waeren sie beim Dreh still geworden statt
+# rot, und Stille sieht wie Erfolg aus.
+# **Beide Konfigurationen gehoeren in die Testskripte.** Eine Konfiguration, die niemand baut,
+# verrottet still -- diese Fehlerform hat hier schon viermal zugeschlagen (leere Event-Queue, nie
+# ausgefuehrter x86-Testpfad, DMAR-Ausschlusspfad, und `--no-default-features` auf aarch64).
+default = []
 selftest = []
 kernel-fuzz = []
 # Continuous-Soak-Treiber (Burn-in #2): nach dem Selbsttest faehrt der Idle-Manager statt

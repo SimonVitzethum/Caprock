@@ -45,8 +45,14 @@ python3 -c "import cryptography" 2>/dev/null || {
 echo "== Manifest-Schluessel =="
 python3 tools/gen_manifest_key.py --ensure || exit 2
 
-echo "== build (Kernel) =="
-./build-x86.sh >/dev/null 2>&1 || { echo "BUILD FAILED (Kernel)"; exit 1; }
+echo "== build (Kernel, --features selftest) =="
+# `--features selftest` ausdruecklich (nicht ueber `default`): seit A-2.2 ist `selftest` NICHT mehr
+# in `default`. Diese Suite prueft den Root-Task-Pfad aus Ring 3 (zweites Badge, SYS_CDELETE) und
+# das saubere `system_off` -- alles Aussagen, die der Testharness (`system::testsupport`) meldet.
+# Ohne das Feature laedt der Kernel den Root-Task und geht dann in `idle()`: kein Bericht, kein
+# `system_off`, Timeout. Das gebootete Image einer Test-Suite braucht den Harness -- dieselbe Zeile,
+# die B fuer test-qemu-x86.sh eingezogen hat.
+./build-x86.sh --features selftest >/dev/null 2>&1 || { echo "BUILD FAILED (Kernel)"; exit 1; }
 
 echo "== build (Programme, x86_64-sel4lake-user) =="
 ( cd programs && rustup run nightly cargo build --release --target x86_64-sel4lake-user.json ) \
@@ -62,7 +68,7 @@ if [ ! -f "$TRUSTKEY" ]; then
     python3 tools/gen_trusted_key.py --name trusted-test >/dev/null 2>&1 || {
         echo "  FEHLER: TrustedSAS-Schluessel liess sich nicht erzeugen"; exit 2; }
     echo "  (Schluessel neu erzeugt -> kernel/src/trusted_keys.rs regeneriert, Kernel wird neu gebaut)"
-    ./build-x86.sh >/dev/null 2>&1 || { echo "BUILD FAILED (nach Key-Regen)"; exit 1; }
+    ./build-x86.sh --features selftest >/dev/null 2>&1 || { echo "BUILD FAILED (nach Key-Regen)"; exit 1; }
 fi
 python3 tools/sign_trusted.py --crate programs/trusted/init --elf "$PROG/init.elf" \
     --program-id 1 --version 1 --policy internal-test --key "$TRUSTKEY" \

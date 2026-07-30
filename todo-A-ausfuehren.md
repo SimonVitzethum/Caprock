@@ -78,10 +78,15 @@ wird. Alles andere liegt außerhalb.
       Manifest, das sie verlangt, **ab** (`UnsupportedAuthority`) statt still weniger zu geben. Der
       ehrliche Weg wäre, dass `SYS_LOAD` die PdControl-Cap der neu erzeugten PD zurückgibt — das
       ist eine ABI-Erweiterung und gehört zu A-3.2 (wählbarer Empfangs-Slot).
-- [ ] **A-2.2 Erst danach `default = []`** in `kernel/Cargo.toml` (Feature `selftest`). Vorher
-      wäre das Gating kein schlankerer Kernel, sondern ein leerer. Der `--no-default-features`-Bau
-      wird bereits von `test-qemu-x86.sh` mitgebaut und der `.text`-Schrumpf geprüft — die
-      Prüfungen bleiben, nur die Vorgabe dreht sich.
+- [x] **A-2.2 erledigt (2026-07-30). `default = []`.** Vorher wäre das Gating kein schlankerer
+      Kernel gewesen, sondern ein leerer; seit A-2.1 hat der Vorgabebau einen Zweck
+      (`start_root_task_reported()` liegt ausserhalb jedes Features). Beide Suiten fordern
+      `--features selftest` für den gebooteten Bau **ausdrücklich** an, nicht über `default` —
+      sonst wären sie beim Dreh still geworden statt rot, und Stille sieht wie Erfolg aus.
+      Belegt von B: volle x86-Suite mit dem Dreh im Baum, **einziger FAIL `x2APIC`** (unverändert
+      gegenüber dem Lauf davor), beide F1-Prüfungen mit gedrehten Vorzeichen (`.text` ohne Feature
+      `0x24000`, mit `0x38000`), und die Lade-Suite `== ALL PASS ==` inklusive aller drei
+      Negativfälle. Details in AGENTS.md, Mitteilung 6.
 
 ## A-3. Caps, die man wieder loswird (A4, A3, C3)
 

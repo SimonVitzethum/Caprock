@@ -121,10 +121,14 @@ Vorbedingung von A-3.4 (dynamische Tabellen).
   statt still weniger zu geben. Der ehrliche Weg wäre eine ABI-Erweiterung (`SYS_LOAD` gibt die
   PdControl-Cap der neuen PD zurück); gehört zu A-3.2, steht noch aus.
 
-**Blockiert:** **A-2.2 (`default = []`) wartet auf Strang B.** Die Suite bootet die
-Default-Konfiguration und erwartet `SELFTEST COMPLETE`; nach dem Dreh liefe sie ins Leere. Nötig
-ist eine Zeile in `build-x86.sh`/`test-qemu-x86.sh` (`--features selftest` für den gebooteten Bau),
-Details in [AGENTS.md](AGENTS.md) Mitteilung 4. Alles Übrige für A-2.2 ist erledigt.
+**Blockiert:** nichts. **A-2.2 ist erledigt** (2026-07-30) — B hat den Beleg geliefert
+(Mitteilung 6), der Dreh `default = []` ist committet. Die Suiten fordern `--features selftest`
+für den gebooteten Bau ausdrücklich an.
+
+**Nächste Kopplung, bevor A-3.4 anfängt:** B-4.2 führt jetzt Buch über die Farbstreifen, und es
+gibt genau vier. Eine dynamische PD-Zahl gegen eine statische Streifenzahl geht nicht auf; der
+Vorschlag steht in [AGENTS.md](AGENTS.md) Mitteilung 9 (Weg 2: `POLICY_EXCLUSIVE_STRIPE` aus
+A-1.4 — nur wer einen Streifen anfordert, bekommt einen).
 
 **Testlage:** x86-Suite unverändert wie von B berichtet. aarch64 kann ich nicht laufen lassen
 (B-2.1, `keys/` gitignored) — die vier Bau-Konfigurationen sind dort **gebaut, nicht gelaufen**,

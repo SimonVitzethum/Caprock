@@ -53,9 +53,19 @@ wird. Alles andere liegt außerhalb.
       **Bedeutung** (was ein Streifen ist, wie NUMA vergeben wird). Die konkrete Farbe gehört
       **nicht** ins Manifest — sie ist maschinenlokal.
       → Format steht (`policy_flags`, `numa_node`, `core_affinity`, `priority`, `budget_us`); der
-      Kernel liest und weist sie aus. **Angewandt werden sie noch nicht** — das ist der Punkt, an
-      dem B übernimmt. Für B: `POLICY_EXCLUSIVE_STRIPE`, `POLICY_PINNED` sind reserviert und
-      werden heute nur geführt.
+      Kernel liest und weist sie aus.
+      **Nachtrag 2026-07-30: „noch nicht angewandt" ist kein neutraler Zustand.** Wer
+      `POLICY_EXCLUSIVE_STRIPE` in ein signiertes Dokument schreibt, glaubt danach an eine
+      Cache-Trennung, die niemand herstellt — das ist schlimmer als gar kein Feld. Der Kernel
+      **weist ein solches Manifest jetzt ab** (`UnsupportedPolicy`), genau wie A-2.1 es bei
+      `CAP_PD_CONTROL` tut: lieber ablehnen als weniger geben, ohne es zu sagen.
+      Warum es heute nicht einhaltbar ist: `alloc_colored` weist mehr als `MASK_BITS` Seiten ab,
+      ein Streifen trägt `MASK_BITS/PARTITIONS` Seiten (64 KiB), und Segmente/Stack eines
+      geladenen Programms kommen physisch **zusammenhängend** aus `mem_alloc`. Nötig wäre
+      stückweise Allokation aus demselben Streifen mit seitenweisem Mapping, plus eine
+      Freigabe-Buchhaltung, die mitwächst (`seglist`, `MAX_IMG_SEGS`). **Teilweise gefärbt ist
+      nicht gefärbt** — deshalb ablehnen statt halb liefern.
+      `POLICY_NO_HOTRELOAD` **wird durchgesetzt** (s. A-4.5).
 - [x] **A-1.5 `SYS_LOAD` auf x86 zum Laufen bringen.** Scheitert heute sauber, weil es nichts zu
       laden gibt. Der ELF-Lader existiert (`sel4lake-loader`); es fehlt die Quelle.
       → Loader baut auf beiden Architekturen, `load_by_index` ist kein `None`-Stub mehr.

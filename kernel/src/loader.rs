@@ -546,20 +546,91 @@ static IFACE_SEEN: SpinLock<([(u32, u32); MAX_IFACE_TRACKED], usize)> =
 /// nichts zu vergleichen -- und **nichts zu behaupten**: der Gate laesst durch, statt eine Zusage
 /// zu erfinden, die er nicht pruefen kann.
 fn manifest_iface_version(program_id: u32) -> Option<u32> {
+    manifest_entry_of(program_id).map(|(iface, _)| iface)
+}
+
+/// `(iface_version, policy_flags)` dieser `program_id` aus dem **angenommenen** Manifest.
+fn manifest_entry_of(program_id: u32) -> Option<(u32, u32)> {
     let m = read_manifest()?;
     (0..m.count())
         .filter_map(|i| m.entry(i))
         .find(|e| e.program_id == program_id)
-        .map(|e| e.iface_version)
+        .map(|e| (e.iface_version, e.policy_flags))
+}
+
+// --- A-1.4: Politikfelder, die der Kernel nicht einhalten kann, werden ABGEWIESEN -------------
+//
+// A-1.4 sagt: das Format steht, angewandt werden die Felder noch nicht. "Noch nicht angewandt"
+// ist fuer ein Dokument, das Autoritaet verteilt, aber kein neutraler Zustand -- wer
+// `POLICY_EXCLUSIVE_STRIPE` ins Manifest schreibt, glaubt danach an eine Cache-Trennung, die
+// niemand herstellt. Das ist schlimmer als gar kein Feld.
+//
+// Deshalb dasselbe Muster wie bei `CAP_PD_CONTROL` in A-2.1: der Kernel weist ein Manifest ab,
+// dessen Politik er nicht einhalten kann, statt still weniger zu geben.
+//
+// **Warum `EXCLUSIVE_STRIPE` heute nicht einhaltbar ist** (und was fehlt): die Streifenvergabe
+// steht seit B-4.2, aber ein GELADENES Programm bekommt seine Segmente und seinen Stack ueber
+// `mem_alloc` als physisch ZUSAMMENHAENGENDE Region. Ein gefaerbter Lauf endet nach
+// `MASK_BITS / PARTITIONS` Seiten (heute 64 KiB) -- `alloc_colored` weist groesseres ausdruecklich
+// ab. Eine gefaerbte geladene PD braucht also stueckweise Allokation aus DEMSELBEN Streifen mit
+// seitenweisem Mapping, und die Freigabe-Buchhaltung (`seglist`, `MAX_IMG_SEGS`) muss mitwachsen.
+// Bis dahin waere jede "gefaerbte" geladene PD nur teilweise gefaerbt -- also gar nicht.
+fn policy_gate(program_id: u32) -> Result<(), LoaderError> {
+    let Some((_, flags)) = manifest_entry_of(program_id) else {
+        return Ok(());
+    };
+    if flags & sel4lake_loader::manifest::POLICY_EXCLUSIVE_STRIPE != 0 {
+        println!(
+            "loader  : POLICY ABGEWIESEN -- program_id {program_id} verlangt EXCLUSIVE_STRIPE. \
+             Die Streifenvergabe steht (B-4.2), aber Segmente/Stack eines geladenen Programms \
+             kommen zusammenhaengend aus mem_alloc; ein Farbstreifen traegt nur \
+             MASK_BITS/PARTITIONS Seiten. Teilweise gefaerbt ist NICHT gefaerbt."
+        );
+        return Err(LoaderError::UnsupportedPolicy);
+    }
+    Ok(())
+}
+
+/// **A-4.5 mit Zaehnen:** ein als nicht austauschbar markiertes Programm wird kein zweites Mal
+/// geladen.
+///
+/// Die Negativliste in `docs/invariants.md` §13 sagt, was nicht austauschbar ist; hier wird es
+/// durchgesetzt. Ein zweiter Ladevorgang derselben `program_id` in derselben Laufzeit **ist** der
+/// Austausch -- ein anderer Weg, eine PD zu ersetzen, existiert nicht.
+fn hotreload_gate(program_id: u32, schon_geladen: bool) -> Result<(), LoaderError> {
+    if !schon_geladen {
+        return Ok(());
+    }
+    let Some((_, flags)) = manifest_entry_of(program_id) else {
+        return Ok(());
+    };
+    if flags & sel4lake_loader::manifest::POLICY_NO_HOTRELOAD != 0 {
+        println!(
+            "loader  : A-4.5 ABGEWIESEN -- program_id {program_id} ist als NO_HOTRELOAD markiert \
+             und wurde bereits geladen."
+        );
+        return Err(LoaderError::HotReloadForbidden);
+    }
+    Ok(())
 }
 
 /// A-4.4-Gate. Beim ersten Laden einer `program_id` wird ihre Schnittstellenversion festgehalten,
 /// bei jedem weiteren gegen sie geprueft.
 fn iface_gate(program_id: u32) -> Result<(), LoaderError> {
+    policy_gate(program_id)?; // zuerst: eine unerfuellbare Politik macht alles Weitere sinnlos
+    let schon = iface_bekannt(program_id);
+    hotreload_gate(program_id, schon)?;
     let Some(jetzt) = manifest_iface_version(program_id) else {
         return Ok(()); // kein Manifest-Eintrag -> keine Aussage moeglich, also auch keine gemacht
     };
     iface_record_or_check(program_id, jetzt)
+}
+
+/// Wurde diese `program_id` in dieser Laufzeit schon geladen?
+fn iface_bekannt(program_id: u32) -> bool {
+    let g = IFACE_SEEN.lock();
+    let (tab, used) = &*g;
+    tab[..*used].iter().any(|&(id, _)| id == program_id)
 }
 
 /// Der pruefbare Kern von [`iface_gate`]: Buchhaltung und Vergleich, ohne Manifest.
@@ -615,10 +686,16 @@ pub fn run_iface_gate() -> bool {
     // Und die Sperre darf nicht ueber die ID hinaus greifen: eine ANDERE ID mit derselben
     // Nummer 8 muss durchgehen, sonst wuerde der Gate fremde Programme mitsperren.
     let fremd = iface_record_or_check(ID + 1, 8).is_ok();
-    let ok = erst && gleich && anders && fremd;
+    // A-4.5: die Hot-Reload-Sperre, beide Ausgaenge. Ohne Manifest-Eintrag darf sie NICHT greifen
+    // (sonst spraeche sie eine Zusage aus, die im Dokument gar nicht steht) -- und die
+    // Testkennungen kommen in keinem Archiv vor.
+    let ohne_eintrag_durch = hotreload_gate(ID, true).is_ok();
+    let unbekannt_durch = hotreload_gate(ID + 2, false).is_ok();
+    let ok = erst && gleich && anders && fremd && ohne_eintrag_durch && unbekannt_durch;
     println!(
         "iface   : erstes Laden {erst}; gleiche Version {gleich}; GEAENDERTE Version abgewiesen \
-         {anders}; andere program_id unberuehrt {fremd}"
+         {anders}; andere program_id unberuehrt {fremd}; ohne Manifest-Eintrag keine \
+         Hot-Reload-Sperre {ohne_eintrag_durch}; Erstladung nie gesperrt {unbekannt_durch}"
     );
     println!(
         "iface   : {} (A-4.4: ein Austausch, der die Schnittstellenversion aendert, wird abgewiesen -- \

@@ -59,6 +59,16 @@ pub enum LoaderError {
     /// halten. Abgewiesen, weil eine Prüfung, die still aussetzt, schlechter ist als keine: sie
     /// sieht von aussen aus wie eine bestandene.
     IfaceTableFull,
+    /// **A-1.4/B-4.2:** Das Manifest verlangt eine Politik, die der Kernel heute nicht *einhalten*
+    /// kann — derzeit `POLICY_EXCLUSIVE_STRIPE`. Abgewiesen statt still ungefärbt geladen: eine
+    /// angeforderte Trennung, die niemand herstellt, ist die gefährlichste Sorte Zusage, weil sie
+    /// im Manifest steht und geglaubt wird. Dasselbe Muster wie `UnsupportedAuthority` bei
+    /// `CAP_PD_CONTROL` (A-2.1): lieber ablehnen als weniger geben, ohne es zu sagen.
+    UnsupportedPolicy,
+    /// **A-4.5:** Das Programm ist im Manifest als nicht austauschbar markiert
+    /// (`POLICY_NO_HOTRELOAD`) und wurde bereits geladen. Ein zweiter Ladevorgang derselben
+    /// `program_id` in derselben Laufzeit *ist* der Austausch.
+    HotReloadForbidden,
     /// Zertifikat-Parse-Fehler (falsche Länge/Magic/Formatversion) — siehe [`cert`].
     BadCert,
     /// System-Manifest-Parse-Fehler (Magic/Formatversion/Eintragsbreite/-zahl, fehlende Signatur)

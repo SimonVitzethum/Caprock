@@ -8,3 +8,4 @@
 /certs/
 /build/soak/
 /ARMTest/
+/tools/__pycache__/

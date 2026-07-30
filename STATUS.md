@@ -96,13 +96,35 @@ schrumpft. Details in [AGENTS.md](AGENTS.md), Mitteilung 1.
 
 ## Strang A — Ausführen und Austauschen (Claude A)
 
-**Zuletzt geändert (A): 2026-07-30 07:05 UTC**
+**Zuletzt geändert (A): 2026-07-30 16:55 UTC**
 
-**Gerade in Arbeit:** nichts Angefangenes. Als Nächstes **A-3.4** (dynamische Tabellen) — dafür
-muss zuerst die Streifenfrage entschieden sein (s. unten und AGENTS.md Mitteilung 9).
+**Gerade in Arbeit: A-3.4, Teil 1 ist committet (`ec26cfb`), der Rest ist offen.** Erledigt ist
+die Thread-Kapazität als **Zusage** (`TARGET_THREADS = 10_000`, gemessen: `4 Kern, 10000
+Thread-Slots (5000 hostbar), Tabellen 7872 KiB aus dem RAM`) und die Cap-Space-Telemetrie
+(Höchststand statt Endstand — ein Lauf, der zwischendurch an die Grenze stiess und danach
+aufräumte, sieht am Ende harmlos aus). Gemessen im x86-Bringup: **11 von 256 Slots, 1 von 128
+Objekten**.
+
+**Ausdrücklich NICHT erreicht:** Caps (256 Slots), Objekte (128), PDs (256), Endpoints und
+Notifications (je 32) sind weiter **statisch**. 10000 Threads gehen nur, solange sie sich
+Adressräume teilen — nicht als 10000 isolierte Tenants.
+
+**Der Fund, der A-3.4 begründet:** über `CAP_BUDGET_PER_PD = 8` steht, es verhindere einen
+Cross-PD-DoS. Nachgerechnet: `NPDS * CAP_BUDGET_PER_PD` = 256 × 8 = 2048 gegen **256** vorhandene
+Slots. **32 PDs mit vollem Budget füllen die Tabelle**, die 33. bekommt nichts — genau der DoS,
+den das Budget verhindern soll. Das Budget deckelt den Einzelverbrauch; die **Summe** prüft
+niemand (`budget_allows` kennt nur `cap_count(pd)`). Die Fairness-Zusage ist heute eine Annahme
+über das Verhalten der PDs, keine Eigenschaft des Systems.
+
+**Nächster Schritt (A-3.4 2/n):** `CapSpace` von den festen Arrays (`[CapSlot; 256]`,
+`[Object; 128]`) auf boot-dimensionierten Speicher drehen — dieselbe `Slab`-/`attach`-Mechanik,
+mit der die Thread-Tabellen seit ext-30 aus dem RAM kommen (`system::configure`). Dimensioniert
+wird so, dass die Summe der Budgets hineinpasst, statt die PD-Zahl auf 32 zu senken. `MAX_FINALIZED
+= NOBJECTS` und der statische `FinalizeBuf` wachsen mit — A-3.3 hat den Puffer genau dafür schon
+vom Kernelstack gelöst. Berührt Strang B (Streifenbuchhaltung zählt PDs, s. AGENTS.md Mitteilung 9).
 
 **Neu erledigt (2026-07-30):** A-2.2 (`default = []`), A-4.4 (Versionssperre im Lader, beide
-Ausgänge belegt), A-4.5 (Negativliste `invariants.md` §13).
+Ausgänge belegt), A-4.5 (Negativliste `invariants.md` §13), A-3.4 Teil 1 (s. oben).
 
 **Eine Grenze, die zu A-4.4 gehört und nicht verschwiegen wird:** über das Manifest ist der
 Abweisungszweig heute **nicht erreichbar** — pro Boot gibt es genau ein Manifest. Er wird es erst

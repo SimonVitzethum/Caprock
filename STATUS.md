@@ -96,35 +96,42 @@ schrumpft. Details in [AGENTS.md](AGENTS.md), Mitteilung 1.
 
 ## Strang A — Ausführen und Austauschen (Claude A)
 
-**Zuletzt geändert (A): 2026-07-30 16:55 UTC**
+**Zuletzt geändert (A): 2026-07-30 18:50 UTC**
 
-**Gerade in Arbeit: A-3.4, Teil 1 ist committet (`ec26cfb`), der Rest ist offen.** Erledigt ist
-die Thread-Kapazität als **Zusage** (`TARGET_THREADS = 10_000`, gemessen: `4 Kern, 10000
-Thread-Slots (5000 hostbar), Tabellen 7872 KiB aus dem RAM`) und die Cap-Space-Telemetrie
-(Höchststand statt Endstand — ein Lauf, der zwischendurch an die Grenze stiess und danach
-aufräumte, sieht am Ende harmlos aus). Gemessen im x86-Bringup: **11 von 256 Slots, 1 von 128
-Objekten**.
+**Gerade in Arbeit: A-3.4, Teil 1 (`ec26cfb`) und Teil 2 (`1e2bd51`) sind committet, Teil 3 ist
+offen.** Erledigt ist die Thread-Kapazität als **Zusage** (`TARGET_THREADS = 10_000`, gemessen:
+`4 Kern, 10000 Thread-Slots (5000 hostbar), Tabellen 7872 KiB aus dem RAM`), die
+Cap-Space-Telemetrie (Höchststand statt Endstand — ein Lauf, der zwischendurch an die Grenze
+stiess und danach aufräumte, sieht am Ende harmlos aus) und seit Teil 2 der **Cap-Space aus dem
+Boot-RAM**.
 
-**Ausdrücklich NICHT erreicht:** Caps (256 Slots), Objekte (128), PDs (256), Endpoints und
-Notifications (je 32) sind weiter **statisch**. 10000 Threads gehen nur, solange sie sich
-Adressräume teilen — nicht als 10000 isolierte Tenants.
+**Der Fund, der A-3.4 begründet — geschlossen:** über `CAP_BUDGET_PER_PD = 8` stand, es
+verhindere einen Cross-PD-DoS. Nachgerechnet waren das `NPDS * CAP_BUDGET_PER_PD` = 256 × 8 =
+2048 gegen **256** vorhandene Slots: 32 PDs mit vollem Budget füllten die Tabelle, die 33. bekam
+nichts — genau der DoS, den das Budget verhindern soll. Teil 2 dreht `slots`/`objects` von
+`[CapSlot; 256]`/`[Object; 128]` auf `Slab<_>` und lässt `configure_caps()` sie beim Boot
+allozieren, dimensioniert nach `CAP_SLOTS_FOR_ALL_PDS` (2048) + 256 Reserve. Gemessen im
+x86-Bringup: `cap : 2304 Slots / 2304 Objekte, Tabellen 400 KiB aus dem RAM (Summe aller
+PD-Budgets: 2048)` und `capsz : Hoechststand 11/2304 … bei vollem Budget passen 288 PDs in die
+globale Tabelle`. **288 > 256** — die Summe passt jetzt hinein, ohne die PD-Zahl zu senken.
 
-**Der Fund, der A-3.4 begründet:** über `CAP_BUDGET_PER_PD = 8` steht, es verhindere einen
-Cross-PD-DoS. Nachgerechnet: `NPDS * CAP_BUDGET_PER_PD` = 256 × 8 = 2048 gegen **256** vorhandene
-Slots. **32 PDs mit vollem Budget füllen die Tabelle**, die 33. bekommt nichts — genau der DoS,
-den das Budget verhindern soll. Das Budget deckelt den Einzelverbrauch; die **Summe** prüft
-niemand (`budget_allows` kennt nur `cap_count(pd)`). Die Fairness-Zusage ist heute eine Annahme
-über das Verhalten der PDs, keine Eigenschaft des Systems.
+Zwei Nebenwirkungen von Teil 2, die eigenständig zählen: `audit_cdt` nimmt die Zählfläche als
+Puffer vom Aufrufer und meldet mit Code 8 „konnte nicht laufen" statt still „konsistent";
+`ipc_audit()` in `system.rs` ging als **einzige** Stelle am Wrapper `cap_audit_cdt()` vorbei und
+damit an der Sperrordnung (CAP_AUDIT vor CAPS) — behoben. `MAX_FINALIZED` ist raus,
+`#![forbid(unsafe_code)]` erzwingt in der Cap-Crate jetzt, was vorher nur behauptet war.
 
-**Nächster Schritt (A-3.4 2/n):** `CapSpace` von den festen Arrays (`[CapSlot; 256]`,
-`[Object; 128]`) auf boot-dimensionierten Speicher drehen — dieselbe `Slab`-/`attach`-Mechanik,
-mit der die Thread-Tabellen seit ext-30 aus dem RAM kommen (`system::configure`). Dimensioniert
-wird so, dass die Summe der Budgets hineinpasst, statt die PD-Zahl auf 32 zu senken. `MAX_FINALIZED
-= NOBJECTS` und der statische `FinalizeBuf` wachsen mit — A-3.3 hat den Puffer genau dafür schon
-vom Kernelstack gelöst. Berührt Strang B (Streifenbuchhaltung zählt PDs, s. AGENTS.md Mitteilung 9).
+**Ausdrücklich NICHT erreicht:** PDs (`NPDS = 256`), Endpoints und Notifications (je 32) sind
+weiter **statisch**. 10000 Threads gehen nur, solange sie sich Adressräume teilen — nicht als
+10000 isolierte Tenants. Und die **Summe** der Budgets prüft weiter niemand (`budget_allows`
+kennt nur `cap_count(pd)`); sie passt jetzt bloss in die Tabelle, statt geprüft zu werden.
+
+**Nächster Schritt (A-3.4 3/n):** dieselbe Mechanik für die PD-Tabelle (`NPDS`) sowie Endpoints
+und Notifications (`NENDPOINTS`/`NNOTIFICATIONS = 32` in `sel4lake-ipc`). Berührt Strang B
+(Streifenbuchhaltung zählt PDs, s. AGENTS.md Mitteilung 9) — vorher abstimmen.
 
 **Neu erledigt (2026-07-30):** A-2.2 (`default = []`), A-4.4 (Versionssperre im Lader, beide
-Ausgänge belegt), A-4.5 (Negativliste `invariants.md` §13), A-3.4 Teil 1 (s. oben).
+Ausgänge belegt), A-4.5 (Negativliste `invariants.md` §13), A-3.4 Teil 1 und Teil 2 (s. oben).
 
 **Eine Grenze, die zu A-4.4 gehört und nicht verschwiegen wird:** über das Manifest ist der
 Abweisungszweig heute **nicht erreichbar** — pro Boot gibt es genau ein Manifest. Er wird es erst

@@ -419,6 +419,25 @@ fn report_and_off(watchdog: bool) -> ! {
         if ring3_ok { "ALL PASS" } else { "FAILURES" }
     );
 
+    // A-3.4: wie nah kam der globale Cap-Space seiner Grenze? Der Hoechststand, nicht der
+    // Endstand -- s. `system::cap_peaks`. Gemeldet wird auch, wie viele PDs mit VOLLEM Budget
+    // ueberhaupt hineinpassen: `CAP_BUDGET_PER_PD` deckelt den Verbrauch EINER PD, aber niemand
+    // prueft die Summe, und `NPDS * CAP_BUDGET_PER_PD` uebersteigt die Kapazitaet um ein
+    // Vielfaches. Die Fairness-Zusage ist damit eine Annahme ueber das Verhalten der PDs.
+    let (pslots, cslots, pobjs, cobjs) = system::cap_peaks();
+    let pd_voll = cslots / sel4lake_microkit::CAP_BUDGET_PER_PD;
+    println!(
+        "capsz   : Cap-Slots Hoechststand {pslots}/{cslots}, Objekte {pobjs}/{cobjs}; bei vollem \
+         Budget ({} Slots/PD) passen {pd_voll} PDs in die globale Tabelle",
+        sel4lake_microkit::CAP_BUDGET_PER_PD
+    );
+    let capsz_ok = pslots < cslots && pobjs < cobjs;
+    println!(
+        "capsz   : {} (A-3.4: der globale Cap-Space wurde NICHT erschoepft -- gemessen am \
+         Hoechststand, nicht am Endstand)",
+        if capsz_ok { "ALL PASS" } else { "FAILURES" }
+    );
+
     let sas = SAS_READ_OK.load(Ordering::Relaxed);
     let isof = system::iso_fault_count();
     println!(

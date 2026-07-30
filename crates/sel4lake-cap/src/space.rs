@@ -184,6 +184,16 @@ pub struct CapInfo {
 pub struct CapSpace {
     slots: [CapSlot; NSLOTS],
     objects: [Object; NOBJECTS],
+    /// **Höchststand belegter Slots** seit dem Start (A-3.4).
+    ///
+    /// `used_slots()` sagt, wie voll die Tabelle *jetzt* ist — und das ist genau der Wert, der
+    /// nichts über Erschöpfung aussagt: ein Lauf, der zwischendurch an die Grenze stieß und
+    /// danach aufräumte, sieht am Ende harmlos aus. Die Fairness-Zusage des Cap-Budgets
+    /// (`CAP_BUDGET_PER_PD`) hängt aber am **gleichzeitigen** Verbrauch, nicht am Endstand.
+    /// Deshalb wird der Höchststand mitgeführt statt hinterher gemessen.
+    peak_slots: usize,
+    /// Höchststand belegter Objekt-Einträge, aus demselben Grund.
+    peak_objects: usize,
 }
 
 impl Default for CapSpace {
@@ -197,6 +207,8 @@ impl CapSpace {
         Self {
             slots: [CapSlot::EMPTY; NSLOTS],
             objects: [Object::EMPTY; NOBJECTS],
+            peak_slots: 0,
+            peak_objects: 0,
         }
     }
 
@@ -441,6 +453,22 @@ impl CapSpace {
         self.objects.iter().filter(|o| o.used).count()
     }
 
+    /// Höchststand gleichzeitig belegter Slots seit dem Start (A-3.4) und die Kapazität dazu.
+    ///
+    /// **Wozu:** `CAP_BUDGET_PER_PD` deckelt den Verbrauch **einer** PD, prüft aber nirgends die
+    /// **Summe**. Bei `NPDS` PDs mit vollem Budget wäre der Bedarf ein Vielfaches von [`NSLOTS`] —
+    /// die Fairness-Zusage des Budgets ist damit eine Annahme über das Verhalten der PDs, keine
+    /// Eigenschaft des Systems. Der Höchststand macht den Abstand zur Grenze **messbar**, statt
+    /// ihn zu behaupten.
+    pub fn peak_slots(&self) -> (usize, usize) {
+        (self.peak_slots, NSLOTS)
+    }
+
+    /// Höchststand belegter Objekt-Einträge und die Kapazität dazu.
+    pub fn peak_objects(&self) -> (usize, usize) {
+        (self.peak_objects, NOBJECTS)
+    }
+
     /// **Property-Oracle des Capability-Systems** (read-only). Prüft die strukturellen
     /// Invarianten des CDT + der Refcounts und gibt `0` bei Konsistenz zurück, sonst
     /// einen Anomalie-Code:
@@ -609,6 +637,12 @@ impl CapSpace {
             badge,
             mdb: Mdb::EMPTY,
         };
+        // Höchststand hier, im einzigen Belegungspfad: eine Stichprobe von aussen wuerde genau
+        // die Spitzen verfehlen, um die es geht (A-3.4).
+        let now = self.used_slots();
+        if now > self.peak_slots {
+            self.peak_slots = now;
+        }
         Ok(i)
     }
 
@@ -619,6 +653,17 @@ impl CapSpace {
     }
 
     fn alloc_object(&mut self, kind: ObjectKind) -> Result<usize, CapError> {
+        let r = self.alloc_object_inner(kind);
+        if r.is_ok() {
+            let now = self.used_objects();
+            if now > self.peak_objects {
+                self.peak_objects = now;
+            }
+        }
+        r
+    }
+
+    fn alloc_object_inner(&mut self, kind: ObjectKind) -> Result<usize, CapError> {
         let i = self
             .objects
             .iter()

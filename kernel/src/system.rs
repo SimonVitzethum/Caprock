@@ -635,6 +635,22 @@ pub fn mem_regions_dropped() -> u32 {
 /// `cores * THREADS_PER_CORE`; jeder Kern kann durch Migration bis zum
 /// [`MIGRATION_HEADROOM`]-fachen davon *hosten*.
 const THREADS_PER_CORE: usize = 256;
+
+/// **Ziel-Thread-Kapazitaet des Systems** (A-3.4).
+///
+/// Bis hierher ergab sich die Kapazitaet als `cores * THREADS_PER_CORE` -- auf einer
+/// 4-Kern-Maschine also 1024, und auf einer 2-Kern-Maschine die Haelfte. Das ist eine Eigenschaft
+/// des **Testaufbaus**, keine Zusage des Systems: dieselbe Software haette je nach Maschine eine
+/// andere Obergrenze, ohne dass es irgendwo steht.
+///
+/// Jetzt ist die Kapazitaet eine **Zusage**, und die Kernzahl teilt sie nur auf. Die Tabellen
+/// dahinter sind seit ext-30 ohnehin boot-dimensioniert (`attach_*`), nicht `.bss` -- die Zahl
+/// kostet also RAM, keine Struktur. Was sie kostet, meldet der Boot-Report (`bytes`), damit die
+/// Entscheidung an einer gemessenen Groesse haengt und nicht an einem Gefuehl.
+///
+/// **Untergrenze bleibt `THREADS_PER_CORE` je Kern**: eine Maschine mit vielen Kernen soll nicht
+/// weniger Threads je Kern haben als vorher.
+pub const TARGET_THREADS: usize = 10_000;
 /// Faktor, um den die **Hosting**-Kapazität eines Kerns über seinem Anteil liegt. Ohne
 /// Reserve könnte kein Kern einen migrierten Thread aufnehmen, sobald alle Kerne ihren
 /// Anteil ausgeschöpft haben.
@@ -653,8 +669,11 @@ const MIGRATION_HEADROOM: usize = 2;
 pub fn configure(cores: usize) -> (usize, usize, usize, u64) {
     let cores = cores.clamp(1, MAX_CORES);
     NUM_CORES.store(cores, Ordering::Relaxed);
-    let total = cores * THREADS_PER_CORE;
-    let per_core = THREADS_PER_CORE * MIGRATION_HEADROOM;
+    // Die Ziel-Kapazitaet wird auf die Kerne aufgeteilt, mindestens aber THREADS_PER_CORE je Kern
+    // (aufgerundet, damit die Summe das Ziel nie unterschreitet).
+    let je_kern = ((TARGET_THREADS + cores - 1) / cores).max(THREADS_PER_CORE);
+    let total = cores * je_kern;
+    let per_core = je_kern * MIGRATION_HEADROOM;
     let mut bytes = 0u64;
 
     // Eine Tabelle belegen. Der Speicher gehört ab hier **dauerhaft** dem Kernel: die
@@ -1355,6 +1374,19 @@ fn create_vspace_masked(mask: Option<sel4lake_mem::ColorMask>) -> Option<(u16, u
         stripe: None,
     };
     Some((asid, l1.base()))
+}
+
+/// **A-3.4-Telemetrie:** `(Slot-Hoechststand, Slot-Kapazitaet, Objekt-Hoechststand,
+/// Objekt-Kapazitaet)` des globalen Cap-Space.
+///
+/// Der Endstand (`used_slots`) sagt ueber Erschoepfung nichts: ein Lauf, der zwischendurch an die
+/// Grenze stiess und danach aufraeumte, sieht hinterher harmlos aus. Die Fairness-Zusage des
+/// Cap-Budgets haengt aber am GLEICHZEITIGEN Verbrauch.
+pub fn cap_peaks() -> (usize, usize, usize, usize) {
+    let g = CAPS.read();
+    let (ps, cs) = g.cspace.peak_slots();
+    let (po, co) = g.cspace.peak_objects();
+    (ps, cs, po, co)
 }
 
 /// Anzahl freier VSpace-/ASID-Slots (für die Leak-Prüfung des Churn-Tests).

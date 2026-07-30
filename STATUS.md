@@ -96,10 +96,11 @@ schrumpft. Details in [AGENTS.md](AGENTS.md), Mitteilung 1.
 
 ## Strang A — Ausführen und Austauschen (Claude A)
 
-**Zuletzt geändert (A): 2026-07-30 18:50 UTC**
+**Zuletzt geändert (A): 2026-07-30 20:50 UTC**
 
-**Gerade in Arbeit: A-3.4, Teil 1 (`ec26cfb`) und Teil 2 (`1e2bd51`) sind committet, Teil 3 ist
-offen.** Erledigt ist die Thread-Kapazität als **Zusage** (`TARGET_THREADS = 10_000`, gemessen:
+**Gerade in Arbeit: nichts Angefangenes — A-3.4 Teil 1 (`ec26cfb`), Teil 2 (`1e2bd51`) und Teil 3
+(`f6e5186`) sind committet, der Baum ist sauber.** Erledigt ist die Thread-Kapazität als
+**Zusage** (`TARGET_THREADS = 10_000`, gemessen:
 `4 Kern, 10000 Thread-Slots (5000 hostbar), Tabellen 7872 KiB aus dem RAM`), die
 Cap-Space-Telemetrie (Höchststand statt Endstand — ein Lauf, der zwischendurch an die Grenze
 stiess und danach aufräumte, sieht am Ende harmlos aus) und seit Teil 2 der **Cap-Space aus dem
@@ -121,17 +122,41 @@ Puffer vom Aufrufer und meldet mit Code 8 „konnte nicht laufen" statt still �
 damit an der Sperrordnung (CAP_AUDIT vor CAPS) — behoben. `MAX_FINALIZED` ist raus,
 `#![forbid(unsafe_code)]` erzwingt in der Cap-Crate jetzt, was vorher nur behauptet war.
 
-**Ausdrücklich NICHT erreicht:** PDs (`NPDS = 256`), Endpoints und Notifications (je 32) sind
-weiter **statisch**. 10000 Threads gehen nur, solange sie sich Adressräume teilen — nicht als
-10000 isolierte Tenants. Und die **Summe** der Budgets prüft weiter niemand (`budget_allows`
-kennt nur `cap_count(pd)`); sie passt jetzt bloss in die Tabelle, statt geprüft zu werden.
+**Teil 3 (`f6e5186`) schliesst die PD-Tabelle an:** `[Pd; NPDS]` im `.bss` war der Grund, warum
+10000 Threads keine 10000 Tenants waren — 256 Adressräume, danach nur noch geteilte. `pds` ist
+jetzt ein `Slab`, `configure_caps()` hängt ihn beim Boot an, `NPDS` steht auf **10000**. Gemessen:
+`cap : 80256 Slots / 80256 Objekte / 10000 PDs, Tabellen 17792 KiB aus dem RAM`, dazu
+`PASS: A-3.4: 10000 PD-Slots`. Die Zahl kostet RAM, keine Struktur.
 
-**Nächster Schritt (A-3.4 3/n):** dieselbe Mechanik für die PD-Tabelle (`NPDS`) sowie Endpoints
-und Notifications (`NENDPOINTS`/`NNOTIFICATIONS = 32` in `sel4lake-ipc`). Berührt Strang B
-(Streifenbuchhaltung zählt PDs, s. AGENTS.md Mitteilung 9) — vorher abstimmen.
+**Der Fund in Teil 3 — kein Testartefakt:** `create_vspace_masked` allozierte die **dritte**
+Tabellenebene über den ungefärbten `mem_alloc`. Auf x86_64 (PML4 → PDPT → PD) lag damit **eine der
+drei** Tabellen jeder gefärbten PD ausserhalb ihres Farbsatzes — und der Farbtest sah es nicht,
+weil er nur `l1`/`l2` zurückliest. Ein Seitenlauf der MMU im Namen dieser PD hinterlässt dort
+dieselben Spuren wie in den beiden anderen. Auf `mem_alloc_masked` gezogen; schlägt die gefärbte
+Zuteilung fehl, scheitert das Anlegen der VSpace, statt fremde Farben mitzunehmen. **Berührt
+Strang B** (Streifenbuchhaltung) — deshalb hier benannt.
+
+Dazu in `colors.rs` getrennt, was zwei Befunde sind: `kernelseite=` heisst jetzt nur noch „Farbe
+hält", daneben steht `rueckgelesen=`. Vorher fielen eine gebrochene Färbung (Isolationsfehler) und
+eine `0` aus dem Rückkanal (Fehler des Tests) in dasselbe Bit — ein `kernelseite=0` liess sich
+nicht deuten, ohne zu raten. Beides fällt weiterhin durch (`ok` fordert beide). Dieselbe Trennung
+wie bei `audit_cdt` (Code 8) seit Teil 2.
+
+**Ausdrücklich NICHT erreicht:** Endpoints und Notifications (`NENDPOINTS`/`NNOTIFICATIONS = 32`
+in `sel4lake-ipc`) sind weiter **statisch**. Und die **Summe** der Cap-Budgets prüft weiter
+niemand (`budget_allows` kennt nur `cap_count(pd)`); sie passt in die Tabelle, statt geprüft zu
+werden: `NPDS * CAP_BUDGET_PER_PD` = 10000 × 8 = 80000, dazu 256 Reserve — genau die 80256 aus
+dem Bootreport. Die Dimensionierung trägt die Zusicherung, nicht eine Prüfung.
+
+**Nächster Schritt (A-3.4 4/n):** dieselbe Mechanik für `NENDPOINTS`/`NNOTIFICATIONS` in
+`sel4lake-ipc`.
+
+**Belegt durch Lauf 20:25** (`build/diag/a34-teil3c.log`): `rc_load=0` mit `== ALL PASS ==`,
+`rc_main=1` mit genau einem FAIL — `x2APIC`, der bekannte TCG-Vorbehalt ohne KVM.
 
 **Neu erledigt (2026-07-30):** A-2.2 (`default = []`), A-4.4 (Versionssperre im Lader, beide
-Ausgänge belegt), A-4.5 (Negativliste `invariants.md` §13), A-3.4 Teil 1 und Teil 2 (s. oben).
+Ausgänge belegt), A-4.5 (Negativliste `invariants.md` §13), A-3.4 Teil 1, Teil 2 und Teil 3
+(s. oben).
 
 **Eine Grenze, die zu A-4.4 gehört und nicht verschwiegen wird:** über das Manifest ist der
 Abweisungszweig heute **nicht erreichbar** — pro Boot gibt es genau ein Manifest. Er wird es erst

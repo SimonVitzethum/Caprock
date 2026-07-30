@@ -12,6 +12,7 @@ use crate::trusted_keys::{MIN_VERSION, TRUSTED_KEYS};
 use core::sync::atomic::{AtomicU64, Ordering};
 use sel4lake_cap::CapPtr;
 use sel4lake_hal::{print, println};
+use sel4lake_sync::SpinLock;
 use sel4lake_loader::archive::Archive;
 use sel4lake_loader::cert::{TrustedCert, SIG_ALG_ED25519, SIG_ED25519_LEN};
 use sel4lake_loader::elf::ElfImage;
@@ -514,6 +515,119 @@ pub fn probe() {
 ///
 /// L1: nur **isolierte EL0-Domänen** (UserLand/HardwareLand). TrustedSAS (EL1) ist signatur-gegatet
 /// (L3) und wird hier abgelehnt (`UnsupportedDomain`).
+
+// --- A-4.4: Schnittstellenversion beim Austausch pruefen, nicht hoffen -----------------------
+//
+// Hot-Reload ersetzt eine Server-PD ueber DIESELBE Endpoint-Cap. Die Clients merken davon nichts
+// -- das ist der Zweck. Genau deshalb ist eine geaenderte Schnittstellenversion hier gefaehrlich:
+// niemand wird benachrichtigt, und der Fehler zeigt sich erst beim ersten missverstandenen `CALL`,
+// weit weg von seiner Ursache. Ein Austausch, der `iface_version` aendert, wird deshalb ABGEWIESEN.
+//
+// Wo die Grenze liegt: geprueft wird gegen die Version, mit der diese `program_id` **zuerst**
+// geladen wurde -- nicht gegen die vorige. Sonst liesse sich die Schnittstelle in kleinen Schritten
+// beliebig weit wegdriften (1 -> 2 -> 3), obwohl kein einzelner Schritt „erlaubt" war.
+//
+// Die Version kommt aus dem **signierten** Manifest, nicht aus dem Image: sie ist eine Aussage
+// ueber die Zuteilung, und Aussagen ueber Zuteilung gehoeren in das Dokument, das signiert ist.
+
+/// Wie viele verschiedene `program_id` die Versionsbuchhaltung fassen kann.
+///
+/// Laeuft sie voll, wird **abgewiesen** ([`LoaderError::IfaceTableFull`]) statt still nicht mehr
+/// zu pruefen. Eine Pruefung, die unbemerkt aussetzt, sieht von aussen aus wie eine bestandene --
+/// dieselbe Fehlerform, die dieses Projekt schon an der leeren SMMU-Event-Queue bezahlt hat.
+const MAX_IFACE_TRACKED: usize = 64;
+
+static IFACE_SEEN: SpinLock<([(u32, u32); MAX_IFACE_TRACKED], usize)> =
+    SpinLock::new(([(0, 0); MAX_IFACE_TRACKED], 0));
+
+/// Die im Manifest ausgewiesene Schnittstellenversion dieser `program_id`.
+///
+/// `None`, wenn es kein angenommenes Manifest gibt oder die ID darin nicht vorkommt. Dann gibt es
+/// nichts zu vergleichen -- und **nichts zu behaupten**: der Gate laesst durch, statt eine Zusage
+/// zu erfinden, die er nicht pruefen kann.
+fn manifest_iface_version(program_id: u32) -> Option<u32> {
+    let m = read_manifest()?;
+    (0..m.count())
+        .filter_map(|i| m.entry(i))
+        .find(|e| e.program_id == program_id)
+        .map(|e| e.iface_version)
+}
+
+/// A-4.4-Gate. Beim ersten Laden einer `program_id` wird ihre Schnittstellenversion festgehalten,
+/// bei jedem weiteren gegen sie geprueft.
+fn iface_gate(program_id: u32) -> Result<(), LoaderError> {
+    let Some(jetzt) = manifest_iface_version(program_id) else {
+        return Ok(()); // kein Manifest-Eintrag -> keine Aussage moeglich, also auch keine gemacht
+    };
+    iface_record_or_check(program_id, jetzt)
+}
+
+/// Der pruefbare Kern von [`iface_gate`]: Buchhaltung und Vergleich, ohne Manifest.
+///
+/// **Getrennt, weil der Gate sonst unpruefbar waere.** Pro Boot gibt es genau EIN Manifest; jeder
+/// Ladevorgang derselben `program_id` liest also zwangslaeufig dieselbe `iface_version`, und der
+/// Abweisungszweig kann ueber [`iface_gate`] gar nicht erreicht werden. Er wird es erst, wenn ein
+/// Austausch zur Laufzeit ein ANDERES Image mitbringt (A-4.1/A-4.3) -- diesen Weg gibt es heute
+/// nicht. Bis dahin waere der Zweig ungeprueft, und ungeprueft heisst hier: vermutlich kaputt,
+/// wenn er zum ersten Mal gebraucht wird. Der Selbsttest fuettert deshalb diese Funktion direkt.
+fn iface_record_or_check(program_id: u32, jetzt: u32) -> Result<(), LoaderError> {
+    let mut g = IFACE_SEEN.lock();
+    let (tab, used) = &mut *g;
+    if let Some(&(_, zuerst)) = tab[..*used].iter().find(|&&(id, _)| id == program_id) {
+        if zuerst != jetzt {
+            println!(
+                "loader  : A-4.4 ABGEWIESEN -- program_id {program_id} wurde mit iface_version \
+                 {zuerst} geladen, das Archiv bietet {jetzt}. Ein Austausch ueber dieselbe \
+                 Endpoint-Cap darf die Schnittstelle nicht aendern."
+            );
+            return Err(LoaderError::IfaceVersionChanged);
+        }
+        return Ok(());
+    }
+    if *used >= MAX_IFACE_TRACKED {
+        println!(
+            "loader  : A-4.4 ABGEWIESEN -- Versionsbuchhaltung voll ({MAX_IFACE_TRACKED} IDs). \
+             Lieber abweisen als ungeprueft laden."
+        );
+        return Err(LoaderError::IfaceTableFull);
+    }
+    tab[*used] = (program_id, jetzt);
+    *used += 1;
+    Ok(())
+}
+
+
+/// **A-4.4-Selbsttest:** beide Ausgaenge der Versionssperre belegen -- den durchgelassenen und den
+/// abgewiesenen.
+///
+/// Faehrt gegen [`iface_record_or_check`] statt gegen [`iface_gate`], aus dem dort genannten Grund:
+/// ueber das Manifest ist der Abweisungszweig heute nicht erreichbar. Benutzt `program_id`-Werte,
+/// die kein Archiv vergibt, damit die echte Buchhaltung unberuehrt bleibt.
+#[cfg(feature = "selftest")]
+pub fn run_iface_gate() -> bool {
+    const ID: u32 = 0xA44_0001; // kein Archiv vergibt IDs in dieser Gegend
+    let erst = iface_record_or_check(ID, 7).is_ok();
+    let gleich = iface_record_or_check(ID, 7).is_ok();
+    let anders = matches!(
+        iface_record_or_check(ID, 8),
+        Err(LoaderError::IfaceVersionChanged)
+    );
+    // Und die Sperre darf nicht ueber die ID hinaus greifen: eine ANDERE ID mit derselben
+    // Nummer 8 muss durchgehen, sonst wuerde der Gate fremde Programme mitsperren.
+    let fremd = iface_record_or_check(ID + 1, 8).is_ok();
+    let ok = erst && gleich && anders && fremd;
+    println!(
+        "iface   : erstes Laden {erst}; gleiche Version {gleich}; GEAENDERTE Version abgewiesen \
+         {anders}; andere program_id unberuehrt {fremd}"
+    );
+    println!(
+        "iface   : {} (A-4.4: ein Austausch, der die Schnittstellenversion aendert, wird abgewiesen -- \
+         beide Ausgaenge belegt, nicht nur der erlaubte)",
+        if ok { "ALL PASS" } else { "FAILURES" }
+    );
+    ok
+}
+
 pub fn load_image(
     prog: &Program,
     endow: &[(usize, CapPtr)],
@@ -522,6 +636,7 @@ pub fn load_image(
     if !verify_image(prog) {
         return Err(LoaderError::Unverified);
     }
+    iface_gate(prog.program_id)?; // A-4.4, nach dem Trust-Gate: erst echt, dann kompatibel
     let domain = match prog.domain {
         DOMAIN_USERLAND => Domain::UserLand,
         // TrustedSAS laeuft GELADEN als EL0-ISOLIERTE PD (nicht EL1): hardware-isoliert, behaelt
@@ -549,6 +664,7 @@ pub fn load_program_into_pd(
     if !verify_image(prog) {
         return Err(LoaderError::Unverified);
     }
+    iface_gate(prog.program_id)?; // A-4.4 -- gilt auf BEIDEN Ladepfaden, sonst ist er umgehbar
     let img = ElfImage::parse(prog.elf)?;
     crate::system::load_into_pd(&img, pd, endow, boot_arg).ok_or(LoaderError::NoResources)
 }

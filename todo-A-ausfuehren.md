@@ -157,12 +157,36 @@ Für einen Betriebsanspruch fehlen drei Dinge.
       Region, die den Austausch überlebt (dann ist ihr Format eine ABI und muss versioniert
       werden), oder ein ausdrückliches Übergabeprotokoll. Ohne Festlegung ist Hot-Reload ein
       Neustart mit Datenverlust, der anders heißt.
-- [ ] **A-4.4 Schnittstellenversion prüfen, nicht hoffen.** Ein Austausch, der die Version ändert,
-      wird **abgewiesen**. Sonst redet ein neuer Server mit alten Clients in einer Sprache, die
-      beide für dieselbe halten.
-- [ ] **A-4.5 Negativliste.** Was **nicht** austauschbar ist, muss benannt sein: der Kernel
-      selbst, und alles, was eine Cap auf maschinenlokale Hardware hält, während sie in Benutzung
-      ist (IOMMU-Kontexte, aktive DMA-Regionen). Gehört in `docs/invariants.md`.
+- [x] **A-4.4 erledigt (2026-07-30), mit einer benannten Grenze.** Versionssperre im Lader:
+      `iface_gate` hält beim ersten Laden einer `program_id` ihre `iface_version` fest und weist
+      jeden weiteren Ladevorgang mit abweichender Version ab (`IfaceVersionChanged`). Verglichen
+      wird gegen die **erste**, nicht gegen die vorige — sonst driftete die Schnittstelle in
+      kleinen Schritten beliebig weit weg, obwohl kein einzelner Schritt erlaubt war. Die Version
+      kommt aus dem **signierten** Manifest, nicht aus dem Image: sie ist eine Aussage über
+      Zuteilung. Der Gate hängt in **beiden** Ladepfaden (`load_image`, `load_program_into_pd`),
+      sonst wäre er umgehbar. Läuft die Buchhaltung voll, wird abgewiesen (`IfaceTableFull`) statt
+      still nicht mehr zu prüfen — eine Prüfung, die unbemerkt aussetzt, sieht von aussen aus wie
+      eine bestandene.
+      **Die Grenze, und sie ist wichtig:** über das Manifest ist der Abweisungszweig heute
+      **nicht erreichbar**. Pro Boot gibt es genau ein Manifest, jeder Ladevorgang derselben ID
+      liest also dieselbe Version. Erreichbar wird er erst, wenn ein Austausch zur Laufzeit ein
+      *anderes* Image mitbringt — das ist A-4.1/A-4.3 und existiert nicht. Damit der Zweig nicht
+      bis dahin ungeprüft bleibt (ungeprüft heisst: vermutlich kaputt, wenn er zum ersten Mal
+      gebraucht wird), ist die Buchhaltung als `iface_record_or_check` herausgezogen und wird vom
+      Selbsttest direkt gefüttert: `iface : ALL PASS` belegt **beide** Ausgänge plus, dass eine
+      andere `program_id` unberührt bleibt.
+- [x] **A-4.5 erledigt (2026-07-30).** `docs/invariants.md` **§13**, normativ formuliert: der
+      Kernel selbst (das Manifest ist an sein Image gebunden — ein getauschter Kernel entwertet
+      jede Signatur, die auf ihn lautet), IOMMU-Kontexte und aktive DMA-Regionen (werden von der
+      *Hardware* gelesen, nicht vom Kernel; „die PD ist weg" ist für ein Busmaster-Gerät keine
+      Aussage), gebundene IRQ-Zustellung. Das Teardown-Token (ext-37) ist die richtige Grundlage:
+      austauschbar ist eine PD erst, wenn sie ihre Geräte abgegeben hat.
+      **Beim Schreiben dazugekommen:** eine gefärbte PD ist nur hot-reloadbar, wenn ein Streifen
+      **frei** ist. A-4.1 verlangt atomares Umbinden, also existieren alte und neue Instanz
+      kurzzeitig gleichzeitig und brauchen je einen disjunkten Satz. Bei vier Streifen und vier
+      gefärbten PDs schlägt jeder Austausch fehl — sauber (B-4.2), aber er schlägt fehl. Die neue
+      Instanz den Streifen der alten erben zu lassen ist **kein** Ausweg: solange beide leben,
+      teilten sie sich die Farben.
 
 ## A-5. Etwas, das sich lohnt zu laden (Z10)
 

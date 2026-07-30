@@ -96,10 +96,18 @@ schrumpft. Details in [AGENTS.md](AGENTS.md), Mitteilung 1.
 
 ## Strang A — Ausführen und Austauschen (Claude A)
 
-**Zuletzt geändert (A): 2026-07-29 16:25 UTC**
+**Zuletzt geändert (A): 2026-07-30 07:05 UTC**
 
-**Gerade in Arbeit:** A-3.3 — `Finalized` (vormals `ReplyFinal`) vom 2-KiB-Kernelstack lösen.
-Vorbedingung von A-3.4 (dynamische Tabellen).
+**Gerade in Arbeit:** nichts Angefangenes. Als Nächstes **A-3.4** (dynamische Tabellen) — dafür
+muss zuerst die Streifenfrage entschieden sein (s. unten und AGENTS.md Mitteilung 9).
+
+**Neu erledigt (2026-07-30):** A-2.2 (`default = []`), A-4.4 (Versionssperre im Lader, beide
+Ausgänge belegt), A-4.5 (Negativliste `invariants.md` §13).
+
+**Eine Grenze, die zu A-4.4 gehört und nicht verschwiegen wird:** über das Manifest ist der
+Abweisungszweig heute **nicht erreichbar** — pro Boot gibt es genau ein Manifest. Er wird es erst
+mit einem Austausch, der zur Laufzeit ein anderes Image mitbringt (A-4.1/A-4.3). Damit er bis
+dahin nicht ungeprüft bleibt, füttert der Selbsttest die Buchhaltung direkt (`iface : ALL PASS`).
 
 **Fertig und belegt:**
 

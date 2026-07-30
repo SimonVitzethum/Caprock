@@ -267,6 +267,8 @@ fn spawn_demo() -> bool {
         // stille Wiederholung. Laeuft NACH `run_color` (das baut seine PDs sofort wieder ab) und
         // vor allem, was selbst Streifen belegt, also im Ruhezustand.
         STRIPE_ALLOC_OK.store(crate::colors::run_stripe_alloc(), Ordering::Release);
+        // A-4.4: Versionssperre des Laders, beide Ausgaenge.
+        IFACE_GATE_OK.store(crate::loader::run_iface_gate(), Ordering::Release);
     }
 
     // Cap-gesichertes IPC: ein Endpoint, zwei PDs. Der Server hält die RECV-, der Client die
@@ -312,6 +314,10 @@ const CDELETE_GONE_BADGE: u64 = 1 << 33;
 /// A-3.1: ein Cap mit abgeleiteten Kopien wird abgewiesen und bleibt benutzbar.
 #[cfg(feature = "selftest")]
 const CDELETE_CHILDREN_BADGE: u64 = 1 << 34;
+
+/// A-4.4: hat die Versionssperre die geaenderte Schnittstellenversion abgewiesen?
+#[cfg(feature = "selftest")]
+static IFACE_GATE_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// B-4.2: hat die Streifenvergabe den Erschoepfungsfall sauber abgewiesen?
 #[cfg(feature = "selftest")]
@@ -371,7 +377,8 @@ fn all_done(archive: bool) -> bool {
     // B-4.2 gehoert in die Abschlussbedingung, nicht bloss in den Bericht: sonst waere ein
     // Fehlschlag genau die Sorte Zeile, die niemand liest.
     let stripes = STRIPE_ALLOC_OK.load(Ordering::Acquire);
-    workers && IPC_DONE.load(Ordering::Acquire) && cores && ring3 && iso && root && stripes
+    let iface = IFACE_GATE_OK.load(Ordering::Acquire);
+    workers && IPC_DONE.load(Ordering::Acquire) && cores && ring3 && iso && root && stripes && iface
 }
 
 /// Bericht + Abschaltung (das Testskript wertet die Marker aus).

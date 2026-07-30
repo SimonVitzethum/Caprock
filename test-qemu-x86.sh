@@ -176,6 +176,7 @@ if echo "$OUT" | grep -q "color   : SKIP"; then
 else
     check "color   : ALL PASS" "A1: zwei isolierte PDs teilen sich KEINE Cache-Farbe -- Region, Kernel-Stack und Seitentabellen jeder PD stammen aus disjunkten Farbsaetzen; eine Region jenseits der Streifenbreite wird abgewiesen statt fremde Farben mitzunehmen"
 fi
+check "iface   : ALL PASS" "A-4.4: die Versionssperre des Laders weist eine GEAENDERTE Schnittstellenversion ab und laesst die gleiche durch -- beide Ausgaenge belegt; eine andere program_id bleibt unberuehrt"
 check "stripe  : ALL PASS" "B-4.2: erschoepfte Farbpartitionierung scheitert SAUBER -- der 5. Streifenversuch wird abgewiesen, statt den Satz der ersten PD still ein zweites Mal auszugeben; nach Freigabe wieder vergebbar (kein Leck)"
 check "audit   : ALL PASS"            "Stufe 4: Scheduler- + CDT-Audit sauber"
 # B-1.5: die erwartete Abwesenheit AUSSPRECHEN, statt sie durchlaufen zu lassen.

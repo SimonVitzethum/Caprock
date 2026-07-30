@@ -49,6 +49,16 @@ pub enum LoaderError {
     /// fehlendes/abgelehntes Zertifikat, ungültige Signatur, unbekannte Key-ID, Hash-Mismatch
     /// oder Downgrade. UserLand/HardwareLand sind hiervon **nicht** betroffen.
     Unverified,
+    /// **A-4.4:** Der Austausch würde die Schnittstellenversion ändern. Ein neuer Server, der
+    /// eine andere `iface_version` mitbringt als die Instanz, die er ersetzt, redet mit den
+    /// bestehenden Clients in einer Sprache, die beide für dieselbe halten. Deshalb abgewiesen
+    /// statt „wird schon passen" — der Fehler beim Zulassen ist still und tritt erst beim ersten
+    /// missverstandenen `CALL` auf, weit weg von seiner Ursache.
+    IfaceVersionChanged,
+    /// **A-4.4:** Die Versionsbuchhaltung ist voll — der Gate könnte seine Zusage nicht mehr
+    /// halten. Abgewiesen, weil eine Prüfung, die still aussetzt, schlechter ist als keine: sie
+    /// sieht von aussen aus wie eine bestandene.
+    IfaceTableFull,
     /// Zertifikat-Parse-Fehler (falsche Länge/Magic/Formatversion) — siehe [`cert`].
     BadCert,
     /// System-Manifest-Parse-Fehler (Magic/Formatversion/Eintragsbreite/-zahl, fehlende Signatur)

@@ -692,3 +692,51 @@ Zertifikats-Gate ist ein **Betreiberwerkzeug, keine Kundenschnittstelle** — ei
 Kunde ein TrustedSAS-Zertifikat erlangen könnte, wäre ein Entwurfsfehler. Und Attestierung
 (`todo.md` Z7) betrifft die **Maschine**, nicht das Kundenbinary: der Kunde will wissen, *worauf*
 er läuft, nicht beweisen, *was* er mitbringt.
+
+---
+
+## 13. Was **nicht** austauschbar ist (A-4.5)
+
+Hot-Reload ist im Projekt als Fähigkeit beschrieben (Phase 7: eine Server-PD wird über *dieselbe*
+Endpoint-Cap ersetzt). Eine Fähigkeit ohne benannte Grenze wird im Betrieb überdehnt, deshalb steht
+hier die Gegenliste. Sie ist **normativ**: was hier steht, wird abgewiesen, nicht „nach Möglichkeit
+vermieden".
+
+**Der Kernel selbst.** Er ist kein austauschbares Objekt. Das ist keine Bequemlichkeit, sondern
+folgt aus §9 und A-1.3: das System-Manifest ist **an das Kernel-Image gebunden** (SHA-256 über
+`[__text_start, __rodata_end)`). Ein getauschter Kernel entwertet jede Signatur, die auf ihn
+lautet — die gesamte Anfangsverteilung von Autorität wäre danach unbelegt. Kernelwechsel heißt
+Neustart mit neuem Manifest, und dafür gibt es einen Namen, der nicht „Hot-Reload" ist.
+
+**Alles, was eine Cap auf maschinenlokale Hardware hält, solange sie in Benutzung ist.** Konkret:
+
+* **IOMMU-Kontexte** — VT-d-Root-/Kontexttabellen, SMMU-STE/CD. Diese Strukturen werden von der
+  *Hardware* gelesen, nicht vom Kernel. Ein Austausch der besitzenden PD, während ein Gerät
+  überträgt, tauscht Tabellen unter einem laufenden DMA-Zugriff — der Kernel sieht davon nichts,
+  weil der Zugriff nicht durch ihn läuft.
+* **Aktive DMA-Regionen.** Dasselbe Argument eine Ebene tiefer: die Region ist einem Gerät
+  zugesagt. „Die PD ist weg" ist für ein Busmaster-Gerät keine Aussage.
+* **IRQ-Zustellung an ein HardwareLand-Backend**, solange die IRQ-Cap gebunden ist. Ein Interrupt,
+  der zwischen alter und neuer Instanz eintrifft, gehört keiner von beiden.
+
+Das Teardown-Token (ext-37) ist der bestehende Mechanismus für genau diese Fälle und die richtige
+Grundlage: austauschbar ist eine PD erst, wenn sie ihre Geräte abgegeben hat.
+
+### Und eine Grenze, die neu ist: gefärbte PDs brauchen einen freien Streifen
+
+Seit B-4.2 wird die Vergabe der Farbstreifen **geführt**, und es gibt `PARTITIONS` davon (heute 4).
+Ein Hot-Reload erzeugt die neue Instanz, **bevor** die alte verschwindet — das verlangt A-4.1
+(atomares Umbinden: zwischen „alter Server weg" und „neuer Server empfangsbereit" darf kein
+Zustand liegen, in dem ein `CALL` mit `NoEndpoint` scheitert). Beide existieren also kurzzeitig
+gleichzeitig, und beide brauchen einen eigenen, disjunkten Streifen.
+
+**Folge, unbequem und deshalb hier notiert:** sind alle Streifen vergeben, ist eine gefärbte PD
+**nicht** hot-reloadbar. Bei vier Streifen und vier gefärbten PDs schlägt jeder Austausch fehl —
+sauber (die neue PD entsteht gar nicht erst, s. B-4.2), aber er schlägt fehl. Wer Hot-Reload für
+gefärbte PDs zusagt, muss entweder einen Streifen freihalten oder die Färbung anfordernd machen
+statt pauschal (`POLICY_EXCLUSIVE_STRIPE`, A-1.4).
+
+Der naheliegende Ausweg — die neue Instanz übernimmt den Streifen der alten — ist **keiner**:
+solange beide leben, teilten sie sich dann die Farben, und genau diese Überschneidung soll B-4.2
+verhindern. Ein Sonderfall „nur ganz kurz" wäre die stille Aufweichung, gegen die der ganze
+Abschnitt geschrieben ist.

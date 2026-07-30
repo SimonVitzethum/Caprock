@@ -17,7 +17,7 @@
 
 use sel4lake_cap::{CapError, CapInfo, CapPtr, DmaCoherence, DmaDir, ObjectKind};
 use sel4lake_hal::{self as hal, exception::TrapFrame, fp::FpState, println};
-use sel4lake_ipc::{Endpoint, Notification, NENDPOINTS, NNOTIFICATIONS};
+use sel4lake_ipc::{Endpoint, Notification};
 use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
 use sel4lake_microkit::{Caps, Domain};
 use sel4lake_region::heap::RegionSource;
@@ -212,14 +212,80 @@ static SCHEDS: [SpinLock<Scheduler>; MAX_CORES] =
 static CAPS: RwSpinLock<Caps> = RwSpinLock::new(Caps::new());
 /// Physischer Allokator (Thread-Stacks etc.) — getrennt, blockiert IPC nicht.
 static MEM: SpinLock<PhysAllocator> = SpinLock::new(PhysAllocator::new());
+/// **Eine beim Boot einmalig befüllte Tabelle** (A-3.4 Teil 4).
+///
+/// Für die IPC-Tabellen taugt das sonst übliche `SpinLock<Slab<T>>` (so halten es `FP_STATES`
+/// und `CAP_AUDIT`) **nicht**: ein Lock um die Tabelle würde jede IPC serialisieren und damit
+/// genau die Eigenschaft aufheben, für die es die per-Endpoint-Locks gibt (ADR 0004:
+/// „IPC auf verschiedenen Endpoints läuft parallel"). Auch ein `RwSpinLock` löst es nicht —
+/// sein Read-Guard maskiert IRQs für seine ganze Lebensdauer, hier also über die gesamte IPC.
+///
+/// Die Tabelle braucht aber gar keinen Lock: sie wird **einmal** beim Boot befüllt und danach
+/// nie wieder verändert. Verändert werden nur die *Elemente*, und die tragen ihren eigenen
+/// Lock. Das ist dieselbe Bauform, die die HAL für ihre Seitentabellen benutzt
+/// (`TableStore(UnsafeCell<PageTable>)`), nur typisiert.
+///
+/// **Der Vertrag, auf dem das steht** (die einzige `unsafe`-Stelle hier):
+/// `attach` läuft genau einmal, auf dem Boot-Kern, **bevor** weitere Kerne starten und bevor
+/// die erste IPC möglich ist. Danach gibt es nur noch `&Slab<T>` — geteilt, unveränderlich.
+/// Wird der Aufruf vergessen, hat die Tabelle Länge 0: jeder Zugriff läuft in die
+/// Schrankenprüfung und wird als `ERR_BADCAP` abgewiesen. Ein vergessener Aufruf fällt damit
+/// als sauberer Fehler auf, nicht als Fehlzugriff.
+struct BootSlab<T: 'static>(core::cell::UnsafeCell<Slab<T>>);
+
+// SAFETY: Nach dem einmaligen `attach` (single-threaded, vor dem Start weiterer Kerne) gibt
+// dieser Typ ausschließlich `&Slab<T>` heraus. Er verhält sich damit wie ein `&[T]`, den sich
+// alle Kerne teilen -> `Sync` verlangt nur `T: Sync`, exakt wie bei `[T]`.
+unsafe impl<T: Sync> Sync for BootSlab<T> {}
+
+impl<T> BootSlab<T> {
+    const fn new() -> Self {
+        Self(core::cell::UnsafeCell::new(Slab::empty()))
+    }
+
+    /// Der Tabelle ihren Speicher geben.
+    ///
+    /// # Safety
+    /// * Vertrag von [`Slab::attach`] (exklusiver, ausgerichteter, dauerhafter Speicher).
+    /// * **Genau einmal**, auf dem Boot-Kern, bevor ein anderer Kern oder eine IPC laufen
+    ///   kann — sonst existiert währenddessen ein `&mut` neben geteilten `&`.
+    unsafe fn attach(&self, ptr: *mut T, len: usize, init: impl FnMut(usize) -> T) {
+        // SAFETY: an den Aufrufer durchgereicht (s. Funktionsdoku): zu diesem Zeitpunkt gibt es
+        // keinen zweiten Verweis auf die Tabelle, der `&mut` ist also exklusiv.
+        unsafe { (*self.0.get()).attach(ptr, len, init) };
+    }
+
+    /// Die Tabelle geteilt lesen — nach dem Boot der einzige Zugang.
+    fn get(&self) -> &Slab<T> {
+        // SAFETY: nach dem Boot wird die Tabelle nicht mehr verändert (s. Typ-Doku); es kann
+        // also kein `&mut` daneben existieren. Vor dem `attach` ist sie leer, aber gültig.
+        unsafe { &*self.0.get() }
+    }
+}
+
 /// **Per-Endpoint** Locks: IPC auf verschiedenen Endpoints ist nebenläufig.
-#[allow(clippy::declare_interior_mutable_const)]
-static EPS: [SpinLock<Endpoint>; NENDPOINTS] =
-    [const { SpinLock::new(Endpoint::EMPTY) }; NENDPOINTS];
-/// **Per-Notification** Locks.
-#[allow(clippy::declare_interior_mutable_const)]
-static NTFNS: [SpinLock<Notification>; NNOTIFICATIONS] =
-    [const { SpinLock::new(Notification::EMPTY) }; NNOTIFICATIONS];
+///
+/// Seit A-3.4 Teil 4 beim Boot dimensioniert (vorher `[SpinLock<Endpoint>; 32]` im `.bss`).
+static EPS: BootSlab<SpinLock<Endpoint>> = BootSlab::new();
+/// **Per-Notification** Locks. Wie [`EPS`] beim Boot dimensioniert.
+static NTFNS: BootSlab<SpinLock<Notification>> = BootSlab::new();
+
+/// Zugriff auf die Endpoint-Tabelle als Slice (Schranke = **reale** Kapazität).
+fn eps() -> &'static [SpinLock<Endpoint>] {
+    EPS.get().as_slice()
+}
+
+/// Zugriff auf die Notification-Tabelle als Slice.
+fn ntfns() -> &'static [SpinLock<Notification>] {
+    NTFNS.get().as_slice()
+}
+
+/// **Sammelflaeche fuer verwaiste Aufrufer** beim Thread-Tod (`purge_ipc_queues`, A-3.4 Teil 4).
+///
+/// Ein Eintrag je Endpoint — mehr Waisen kann ein einzelner sterbender Thread nicht erzeugen.
+/// Frueher eine lokale Variable; bei 10 000 Endpoints waeren das 240 KiB Kernelstack im
+/// Todespfad gewesen (s. `purge_ipc_queues`).
+static IPC_ORPHANS: SpinLock<Slab<Option<ThreadId>>> = SpinLock::new(Slab::empty());
 
 // --- Trap-Hooks ---
 
@@ -278,8 +344,8 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
         core,
         &mut ops,
         &CAPS,
-        &EPS,
-        &NTFNS,
+        eps(),
+        ntfns(),
         load_by_index, // ext-26: SYS_LOAD-Callback (cap-gegatet im Dispatch)
         dispatch_delete_cap,          // beim Grant verdrängte Cap freigeben (kein Slot-Leck)
     );
@@ -843,6 +909,80 @@ pub fn configure_caps() -> u64 {
     bytes
 }
 
+/// **Endpoint-Kapazität** (A-3.4 Teil 4): einer je PD, dazu eine Reserve für die Kanäle, die
+/// der Kernel selbst aufmacht (Bringup-Kanäle, HardwareLand-Backends, Testkanäle).
+///
+/// Die Reserve steht **neben** der Summe, nicht in ihr — aus demselben Grund wie bei `CAP_SLOTS`:
+/// eine PD, die ihren Endpoint nimmt, soll dem Kernel keinen wegnehmen können.
+const NEPS: usize = sel4lake_microkit::ENDPOINTS_FOR_ALL_PDS + 64;
+/// **Notification-Kapazität** — wie [`NEPS`], eine je PD plus Reserve.
+const NNTFNS: usize = sel4lake_microkit::NOTIFICATIONS_FOR_ALL_PDS + 64;
+
+/// **IPC-Tabellen zur Boot-Zeit anlegen** (A-3.4 Teil 4) — Endpoints, Notifications und die
+/// Sammelfläche für verwaiste Aufrufer.
+///
+/// **Muss vor der ersten IPC laufen** und vor allem, was einen Endpoint reserviert
+/// (`create_endpoint`/`create_notification`, also vor `selftest::run()` und vor den
+/// Bringup-Kanälen). Vorher haben die Tabellen Länge 0: `create_endpoint` findet keinen freien
+/// Slot (`None`), der Dispatch weist jede Endpoint-Cap mit `ERR_BADCAP` ab. Ein vergessener
+/// Aufruf fällt damit als sauberer Fehler auf, nicht als Fehlzugriff.
+///
+/// Gibt die belegten Bytes zurück (Boot-Report).
+pub fn configure_ipc() -> u64 {
+    let mut bytes = 0u64;
+    let mut table = |size: usize, align: usize| -> *mut u8 {
+        let cap = mem_alloc(size as u64, align as u64).expect("IPC-Tabelle: RAM erschoepft");
+        bytes += cap.len();
+        cap.base() as *mut u8
+    };
+
+    let eps_mem = table(
+        NEPS * core::mem::size_of::<SpinLock<Endpoint>>(),
+        core::mem::align_of::<SpinLock<Endpoint>>().max(4096),
+    );
+    let ntfns_mem = table(
+        NNTFNS * core::mem::size_of::<SpinLock<Notification>>(),
+        core::mem::align_of::<SpinLock<Notification>>().max(4096),
+    );
+    let orphans_mem = table(
+        NEPS * core::mem::size_of::<Option<ThreadId>>(),
+        core::mem::align_of::<Option<ThreadId>>().max(4096),
+    );
+
+    // SAFETY: frisch allozierter, exklusiver, korrekt ausgerichteter Speicher der geforderten
+    // Größe, der bis zum Reboot lebt. Einmaliger Aufruf beim Boot auf dem Boot-Kern, bevor ein
+    // weiterer Kern startet und bevor die erste IPC möglich ist — der Vertrag von
+    // `BootSlab::attach`.
+    unsafe {
+        EPS.attach(eps_mem as *mut SpinLock<Endpoint>, NEPS, |_| {
+            SpinLock::new(Endpoint::EMPTY)
+        });
+        NTFNS.attach(ntfns_mem as *mut SpinLock<Notification>, NNTFNS, |_| {
+            SpinLock::new(Notification::EMPTY)
+        });
+        IPC_ORPHANS
+            .lock()
+            .attach(orphans_mem as *mut Option<ThreadId>, NEPS, |_| None);
+    }
+
+    // Gemeldet wird die **angehaengte** Kapazitaet, nicht `NEPS`/`NNTFNS`: eine Zahl, die neben
+    // der Tabelle her existiert, kann von ihr abweichen — und genau daran haengt die Pruefung
+    // der Testsuite.
+    let (n_eps, n_ntfns) = ipc_capacity();
+    println!(
+        "ipc     : {n_eps} Endpoints / {n_ntfns} Notifications, Tabellen {} KiB aus dem RAM (eine PD, ein Endpoint: {} PDs)",
+        bytes >> 10,
+        sel4lake_microkit::ENDPOINTS_FOR_ALL_PDS,
+    );
+    bytes
+}
+
+/// Kapazität der IPC-Tabellen (Selbsttest/Telemetrie): `(Endpoints, Notifications)` — die
+/// **tatsächlich** zugewiesene, nicht die Konstante.
+pub fn ipc_capacity() -> (usize, usize) {
+    (eps().len(), ntfns().len())
+}
+
 /// Boot-Kontext des aufrufenden Kerns als Idle-Thread registrieren (vor IRQs).
 pub fn init_core() {
     let core = hal::cpu::core_id();
@@ -1082,11 +1222,11 @@ fn abort_finalized_replies(rf: &sel4lake_cap::Finalized<'_>) {
 /// Einen konkreten ausstehenden Call an Endpoint `ep` abbrechen (Reply-Cap-Revocation):
 /// ist `caller` noch der wartende Aufrufer, wird er mit `ERR_SERVER_GONE` entblockt.
 pub fn endpoint_abort_call(ep: usize, caller: ThreadId) -> bool {
-    if ep >= NENDPOINTS {
+    if ep >= eps().len() {
         return false;
     }
     let orphan = {
-        let mut e = EPS[ep].lock();
+        let mut e = eps()[ep].lock();
         e.abort_call(caller)
     };
     if let Some(c) = orphan {
@@ -1164,7 +1304,7 @@ pub fn caps_read_concurrency_probe(want: u32, spin_limit: u32) -> bool {
 
 /// Einen freien Endpoint-Slot reservieren (scannt die per-Endpoint-Locks).
 pub fn create_endpoint() -> Option<usize> {
-    for (i, ep) in EPS.iter().enumerate() {
+    for (i, ep) in eps().iter().enumerate() {
         let mut e = ep.lock();
         if !e.is_used() {
             e.mark_used();
@@ -1177,7 +1317,7 @@ pub fn install_endpoint_cap(ep: u32, rights: Rights) -> Result<CapPtr, CapError>
     CAPS.write().cspace.install_endpoint(ep, rights)
 }
 pub fn create_notification() -> Option<usize> {
-    for (i, n) in NTFNS.iter().enumerate() {
+    for (i, n) in ntfns().iter().enumerate() {
         let mut nt = n.lock();
         if !nt.is_used() {
             nt.mark_used();
@@ -2374,8 +2514,8 @@ pub fn load_elf(
 /// Den **akkumulierten Badge** einer Notification lesen, **ohne** ihn zu konsumieren (Test-/
 /// Loader-Telemetrie: hat ein geladenes Programm signalisiert?). `0`, falls leer/ungültig.
 pub fn notification_pending(ntfn: usize) -> u64 {
-    if ntfn < NNOTIFICATIONS {
-        NTFNS[ntfn].lock().pending_badge()
+    if ntfn < ntfns().len() {
+        ntfns()[ntfn].lock().pending_badge()
     } else {
         0
     }
@@ -2506,8 +2646,8 @@ fn drain_pending_irqs() {
         if IRQ_PENDING[i].swap(false, Ordering::AcqRel) {
             let ntfn = IRQ_NTFN[i].load(Ordering::Acquire) as usize;
             let badge = IRQ_BADGE[i].load(Ordering::Acquire);
-            if ntfn < NNOTIFICATIONS {
-                NTFNS[ntfn].lock().signal_from_kernel(&mut ops, badge);
+            if ntfn < ntfns().len() {
+                ntfns()[ntfn].lock().signal_from_kernel(&mut ops, badge);
                 IRQ_DELIVERED.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -4991,7 +5131,7 @@ pub fn create_hardware_backend(
     let Some(ntfn) = create_notification() else {
         // `ep` ist frisch reserviert + noch unreferenziert (keine Cap, kein Waiter) -> Slot
         // zuruecknehmen, sonst leckt der Endpoint-Slot.
-        *EPS[ep].lock() = Endpoint::EMPTY;
+        *eps()[ep].lock() = Endpoint::EMPTY;
         return None;
     };
     let backend_pd = match CAPS.write().pds.create_hardware_backend(
@@ -5003,8 +5143,8 @@ pub fn create_hardware_backend(
         Some(pd) => pd,
         None => {
             // ep + ntfn sind noch unreferenziert -> beide Slots zuruecknehmen.
-            *EPS[ep].lock() = Endpoint::EMPTY;
-            *NTFNS[ntfn].lock() = Notification::EMPTY;
+            *eps()[ep].lock() = Endpoint::EMPTY;
+            *ntfns()[ntfn].lock() = Notification::EMPTY;
             return None;
         }
     };
@@ -5024,8 +5164,8 @@ pub fn clear_pd_cap(pd: usize, slot: usize) {
 
 /// Einen blockierten Endpoint-Empfänger zurückziehen (Hot-Reload).
 pub fn endpoint_retire_receiver(ep: usize, tid: ThreadId) -> bool {
-    if ep < NENDPOINTS {
-        EPS[ep].lock().retire_receiver(tid)
+    if ep < eps().len() {
+        eps()[ep].lock().retire_receiver(tid)
     } else {
         false
     }
@@ -5038,11 +5178,11 @@ pub fn endpoint_retire_receiver(ep: usize, tid: ThreadId) -> bool {
 /// aber capless/ersetzte) Server nie mehr antwortet. Gibt `true`, falls ein Caller
 /// entblockt wurde. Sperrordnung EPS vor SCHEDS (in `unblock_with_error`).
 pub fn endpoint_quiesce_owner(ep: usize, tid: ThreadId) -> bool {
-    if ep >= NENDPOINTS {
+    if ep >= eps().len() {
         return false;
     }
     let orphan = {
-        let mut e = EPS[ep].lock();
+        let mut e = eps()[ep].lock();
         e.owner_died(tid)
     }; // EPS freigegeben, bevor SCHEDS gesperrt wird
     if let Some(caller) = orphan {
@@ -5060,10 +5200,10 @@ pub fn endpoint_quiesce_owner(ep: usize, tid: ThreadId) -> bool {
 /// und schließt den Call ab. Gibt `true`, falls migriert wurde. Sperrt NUR EPS[ep] —
 /// es wird niemand entblockt (kein SCHEDS-Lock, keine Sperrordnungsfrage).
 pub fn endpoint_migrate_owner(ep: usize, tid: ThreadId) -> bool {
-    if ep >= NENDPOINTS {
+    if ep >= eps().len() {
         return false;
     }
-    EPS[ep].lock().migrate_owner(tid)
+    eps()[ep].lock().migrate_owner(tid)
 }
 
 /// **Eager-Cleanup beim Thread-Tod:** den (sterbenden) Thread `tid` aus ALLEN
@@ -5075,11 +5215,30 @@ pub fn purge_ipc_queues(tid: ThreadId) {
     // Verwaiste Aufrufer (deren Reply-Owner gerade stirbt) einsammeln und NACH dem
     // Freigeben der EPS-Locks mit ERR_SERVER_GONE entblocken (kein verschachtelter
     // EPS->SCHEDS-Lock). Ein Thread kann (mehrfaches recv ohne reply) Reply-Owner von bis zu
-    // NENDPOINTS Endpoints zugleich sein -> das Array MUSS so gross sein, sonst wuerden Waisen
-    // jenseits der Kapazitaet still verworfen und ihre Aufrufer haengen dauerhaft (Liveness-Bug).
-    let mut orphans: [Option<ThreadId>; NENDPOINTS] = [None; NENDPOINTS];
+    // `eps().len()` Endpoints zugleich sein -> die Flaeche MUSS so gross sein, sonst wuerden
+    // Waisen jenseits der Kapazitaet still verworfen und ihre Aufrufer haengen dauerhaft
+    // (Liveness-Bug).
+    //
+    // **A-3.4 Teil 4 — warum das hier keine lokale Variable mehr ist:** bis Teil 3 stand hier
+    // `[Option<ThreadId>; NENDPOINTS]`, also 32 Eintraege = 768 Byte auf dem Kernelstack. Mit
+    // 10 000 Endpoints waeren daraus 240 KiB geworden -- auf einem Stack, der ein Vielfaches
+    // kleiner ist, und das im **Todespfad** eines Threads. Die Zusage der Zeile darueber
+    // (`so gross wie die Endpoint-Zahl`) haette den Stack ueberrannt, statt Waisen zu verlieren:
+    // ein Stack-Overflow statt eines Liveness-Bugs. Dieselbe Falle, die A-3.3 fuer den
+    // Finalisierungspuffer aufgeloest hat -- die Flaeche kommt jetzt aus dem Boot-RAM.
+    //
+    // **Der Lock wird ueber die ganze Funktion gehalten**, und das ist Absicht: die Flaeche ist
+    // jetzt geteilt statt lokal. Wer sie zum Einsammeln sperrt, sie zum Entblocken freigibt und
+    // danach wieder liest, liest moeglicherweise die Waisen eines anderen Kerns -- ein zweiter
+    // sterbender Thread wuerde die Eintraege dazwischen ueberschreiben. Der Preis ist, dass
+    // Thread-Tode kernuebergreifend serialisieren; das ist ein seltener, kalter Pfad.
+    //
+    // Sperrordnung: IPC_ORPHANS ist damit **aeusserer** Lock ->
+    // IPC_ORPHANS < EPS[i]/NTFNS[i] < SCHEDS. Kein anderer Pfad nimmt ihn, insbesondere keiner
+    // mit gehaltenem EPS oder SCHEDS -> kein Zyklus.
+    let mut orphans = IPC_ORPHANS.lock();
     let mut no = 0usize;
-    for ep in EPS.iter() {
+    for ep in eps().iter() {
         let mut e = ep.lock();
         if e.is_used() {
             e.purge_thread(tid);
@@ -5090,15 +5249,17 @@ pub fn purge_ipc_queues(tid: ThreadId) {
                 }
             }
         }
-    }
-    for n in NTFNS.iter() {
+    } // EPS-Locks sind hier alle wieder frei
+    for n in ntfns().iter() {
         let mut nt = n.lock();
         if nt.is_used() {
             nt.purge_thread(tid);
         }
     }
-    for caller in orphans.iter().flatten() {
-        unblock_with_error(*caller, sel4lake_abi::result::ERR_SERVER_GONE);
+    for i in 0..no {
+        if let Some(caller) = orphans[i].take() {
+            unblock_with_error(caller, sel4lake_abi::result::ERR_SERVER_GONE);
+        }
     }
 }
 
@@ -5147,7 +5308,7 @@ pub fn thread_alive(tid: ThreadId) -> bool {
 /// SCHEDS (zulässige Ordnung), nie zwei Objekte gleichzeitig.
 pub fn ipc_audit() -> u32 {
     let live = &mut |t: ThreadId| -> bool { sel4lake_sched::is_live(t) };
-    for ep in EPS.iter() {
+    for ep in eps().iter() {
         let e = ep.lock();
         if e.is_used() {
             let (dead, dup) = e.audit(live);
@@ -5159,7 +5320,7 @@ pub fn ipc_audit() -> u32 {
             }
         }
     }
-    for n in NTFNS.iter() {
+    for n in ntfns().iter() {
         let nt = n.lock();
         if nt.is_used() && nt.audit(live) {
             return 3;

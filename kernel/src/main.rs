@@ -192,6 +192,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         cap_bytes >> 10,
         sel4lake_microkit::CAP_SLOTS_FOR_ALL_PDS
     );
+    // A-3.4 Teil 4: IPC-Tabellen VOR dem ersten Endpoint — der Selbsttest und die Bringup-Kanäle
+    // reservieren gleich welche. Meldet sich selbst (`ipc :`).
+    system::configure_ipc();
     loader::probe(); // Boot-Archiv lesen + Module melden (L0; Laden folgt ab L1)
     #[cfg(feature = "selftest")]
     selftest::run();

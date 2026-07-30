@@ -636,6 +636,8 @@ pub fn run(multiboot_info: u64) -> ! {
         cap_bytes >> 10,
         sel4lake_microkit::CAP_SLOTS_FOR_ALL_PDS
     );
+    // A-3.4 Teil 4: IPC-Tabellen VOR dem ersten Endpoint. Meldet sich selbst (`ipc :`).
+    system::configure_ipc();
     #[cfg(feature = "selftest")]
     {
         // Das Ausschneiden traegt eine Sicherheitsaussage; der reale Lauf sieht davon nur EINEN

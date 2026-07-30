@@ -20,7 +20,7 @@ use sel4lake_abi::{pdctl, reg, result, sys};
 use sel4lake_cap::{CapPtr, CapSpace, ObjectKind};
 use sel4lake_hal::cpu::array_index_nospec;
 use sel4lake_hal::exception::{frame_reg, frame_set_reg};
-use sel4lake_ipc::{Endpoint, Notification, NENDPOINTS, NNOTIFICATIONS};
+use sel4lake_ipc::{Endpoint, Notification};
 use sel4lake_mem::Rights;
 use sel4lake_sched::{SchedOps, ThreadId};
 use sel4lake_slab::Slab;
@@ -68,6 +68,26 @@ pub const CAP_BUDGET_PER_PD: usize = 8;
 /// bekommt ihr Budget" eine Eigenschaft des Aufbaus. Der Weg dahin war ausdrücklich *nicht*, die
 /// PD-Zahl auf 32 zu senken: das hätte dieselbe Zusage gerettet, indem es das System kleiner macht.
 pub const CAP_SLOTS_FOR_ALL_PDS: usize = NPDS * CAP_BUDGET_PER_PD;
+
+/// **Wie viele Endpoint-Objekte alle PDs zusammen brauchen** (A-3.4 Teil 4).
+///
+/// Dieselbe Rechnung eine Ebene weiter, und derselbe Fund: `NENDPOINTS = 32` in `sel4lake-ipc`
+/// stand gegen [`NPDS`] = 10 000. Eine PD, die als Server auftreten will, braucht **mindestens
+/// einen** Endpoint; ab der 33. war keiner mehr zu haben. Die Zusage „10 000 Tenants" endete
+/// damit an einer Zahl, die nie mitgewachsen ist — Threads (Teil 1), Caps (Teil 2) und
+/// Adressräume (Teil 3) waren gedreht, die Kommunikation nicht. Ein Tenant ohne Endpoint ist
+/// aber kein Tenant, sondern ein Prozess, mit dem niemand reden kann.
+///
+/// Ein Endpoint je PD ist die **untere** Schranke, nicht die bequeme: mehr Endpoints je PD
+/// (eine PD mit mehreren Diensten) sind damit nicht gedeckt und müssten die Zahl erhöhen.
+pub const ENDPOINTS_FOR_ALL_PDS: usize = NPDS;
+
+/// **Wie viele Notification-Objekte alle PDs zusammen brauchen** (A-3.4 Teil 4).
+///
+/// Wie [`ENDPOINTS_FOR_ALL_PDS`]: eine asynchrone Signalquelle je PD als untere Schranke.
+/// Notifications sind mit Abstand die billigsten Objekte (drei Felder, keine Warteschlange) —
+/// hier zu sparen bringt nichts und kostet dieselbe Zusage.
+pub const NOTIFICATIONS_FOR_ALL_PDS: usize = NPDS;
 
 /// **Sicherheitsdomäne** einer Protection Domain (ext-22).
 ///
@@ -605,8 +625,11 @@ pub fn dispatch(
     core: usize,
     ops: &mut dyn SchedOps,
     caps: &RwSpinLock<Caps>,
-    eps: &[SpinLock<Endpoint>; NENDPOINTS],
-    ntfns: &[SpinLock<Notification>; NNOTIFICATIONS],
+    // A-3.4 Teil 4: **Slices** statt `&[_; NENDPOINTS]`. Die Schranke ist damit die
+    // tatsächlich beim Boot zugewiesene Kapazität (`eps.len()`), nicht eine Konstante, die
+    // neben der Tabelle her existiert und bei einer Änderung stillschweigend auseinanderläuft.
+    eps: &[SpinLock<Endpoint>],
+    ntfns: &[SpinLock<Notification>],
     // ext-26: `SYS_LOAD`-Callback in den kernel-spezifischen Binary-Loader. `(Archiv-Index,
     // Endowment) -> neue PD-Id`. Vom Dispatch erst NACH dem Freigeben von `caps` gerufen (der
     // Loader re-lockt `CAPS`/`MEM`/`SCHEDS` selbst). `endow` = aus dem Aufrufer-Cspace delegierte
@@ -799,8 +822,8 @@ pub fn dispatch(
             }
             // `ep_id` kommt aus der (cap-geprüften) Endpoint-Cap; die Schranke wird zusätzlich
             // spekulationssicher maskiert (s. `cap_at`), da die Cap-Auswahl EL0-gesteuert ist.
-            let ep = array_index_nospec(ep_id as usize, NENDPOINTS);
-            if ep_id as usize >= NENDPOINTS {
+            let ep = array_index_nospec(ep_id as usize, eps.len());
+            if ep_id as usize >= eps.len() {
                 return deny(result::ERR_BADCAP);
             }
             match nr {
@@ -843,8 +866,8 @@ pub fn dispatch(
             if !rights.contains(need) {
                 return deny(result::ERR_RIGHTS);
             }
-            let n = array_index_nospec(id as usize, NNOTIFICATIONS);
-            if id as usize >= NNOTIFICATIONS {
+            let n = array_index_nospec(id as usize, ntfns.len());
+            if id as usize >= ntfns.len() {
                 return deny(result::ERR_BADCAP);
             }
             if nr == sys::SIGNAL {

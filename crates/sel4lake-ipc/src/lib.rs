@@ -9,7 +9,8 @@
 //!
 //! **Feinkörniges Locking:** Jedes [`Endpoint`]/[`Notification`] ist ein
 //! eigenständiges Objekt; der Kernel hält je Objekt einen eigenen Lock
-//! (`[SpinLock<Endpoint>; N]`). IPC auf verschiedenen Endpoints läuft daher
+//! (`Slab<SpinLock<Endpoint>>`, seit A-3.4 Teil 4 beim Boot dimensioniert statt
+//! `[SpinLock<Endpoint>; 32]` im `.bss`). IPC auf verschiedenen Endpoints läuft daher
 //! parallel — nur die kurze Cap-Auflösung serialisiert (separater `CAPS`-Lock im
 //! Kernel). Die Methoden hier operieren jeweils auf **einem** Objekt (`&mut self`)
 //! ohne eigenes Locking; das Locking + die Sperrordnung besorgt der Kernel/Dispatch.
@@ -21,11 +22,15 @@ use sel4lake_abi::{reg, result, MSG_WORDS};
 use sel4lake_hal::exception::{frame_reg, frame_set_reg};
 use sel4lake_sched::{SchedOps, ThreadId};
 
-/// Anzahl Endpoint-Objekte (Größe des per-Endpoint-Lock-Arrays im Kernel).
-pub const NENDPOINTS: usize = 32;
-/// Anzahl Notification-Objekte.
-pub const NNOTIFICATIONS: usize = 32;
-const QCAP: usize = 32;
+/// **Warteschlangen-Tiefe je Endpoint** — so viele Sender bzw. Empfänger können an
+/// *einem* Endpoint zugleich blockieren.
+///
+/// Diese Zahl ist von A-3.4 **nicht** angefasst worden und bleibt eine Compile-Zeit-Grenze:
+/// Sie steckt in jedem `Endpoint` (zwei `TidQueue`), wächst also mit der Endpoint-Zahl
+/// multiplikativ. Der 33. gleichzeitige Sender an demselben Endpoint wird von `enqueue`
+/// **still verworfen** (s. dort) — eine eigene Baustelle, hier nur benannt, nicht behoben.
+pub const QUEUE_CAP: usize = 32;
+const QCAP: usize = QUEUE_CAP;
 
 /// FIFO-Warteschlange blockierter Threads (an einem Endpoint).
 #[derive(Clone, Copy)]

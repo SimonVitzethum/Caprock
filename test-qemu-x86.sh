@@ -191,6 +191,17 @@ if [ -n "${NPD:-}" ] && [ "$NPD" -ge 10000 ]; then
 else
     echo "  FAIL: A-3.4: nur ${NPD:-?} PD-Slots, Ziel 10000"; fail=1
 fi
+# A-3.4 Teil 4: dieselbe Zusage fuer die Kommunikation. Threads, Caps und Adressraeume waren
+# gedreht -- eine PD ohne Endpoint ist aber kein Tenant, sondern ein Prozess, mit dem niemand
+# reden kann. Geprueft wird, dass jede PD mindestens einen Endpoint UND eine Notification haben
+# kann, nicht bloss, dass eine Zahl gemeldet wird.
+NEP=$(echo "$OUT" | grep -m1 -oE '^ipc     : [0-9]+ Endpoints / [0-9]+ Notifications' | grep -oE '^ipc     : [0-9]+' | grep -oE '[0-9]+$')
+NNT=$(echo "$OUT" | grep -m1 -oE '^ipc     : [0-9]+ Endpoints / [0-9]+ Notifications' | grep -oE '/ [0-9]+ Notifications' | grep -oE '[0-9]+')
+if [ -n "${NEP:-}" ] && [ "$NEP" -ge 10000 ] && [ -n "${NNT:-}" ] && [ "$NNT" -ge 10000 ]; then
+    echo "  PASS: A-3.4: $NEP Endpoints / $NNT Notifications -- jede der 10000 PDs kann Server sein; vorher waren es 32, ab der 33. PD gab es keinen Endpoint mehr"
+else
+    echo "  FAIL: A-3.4: nur ${NEP:-?} Endpoints / ${NNT:-?} Notifications, Ziel je 10000"; fail=1
+fi
 check "capsz   : ALL PASS" "A-3.4: der globale Cap-Space wurde nicht erschoepft -- gemessen am HOECHSTSTAND gleichzeitig belegter Slots, nicht am Endstand (ein Lauf, der zwischendurch an die Grenze stiess und danach aufraeumte, sieht am Ende harmlos aus)"
 check "iface   : ALL PASS" "A-4.4: die Versionssperre des Laders weist eine GEAENDERTE Schnittstellenversion ab und laesst die gleiche durch -- beide Ausgaenge belegt; eine andere program_id bleibt unberuehrt"
 check "stripe  : ALL PASS" "B-4.2: erschoepfte Farbpartitionierung scheitert SAUBER -- der 5. Streifenversuch wird abgewiesen, statt den Satz der ersten PD still ein zweites Mal auszugeben; nach Freigabe wieder vergebbar (kein Leck)"

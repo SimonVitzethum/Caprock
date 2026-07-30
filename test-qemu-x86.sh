@@ -90,19 +90,45 @@ echo "== boot ($SECONDS_RUN s, $RUNS Lauf/Laeufe) =="
 boot_once
 OUT="$(grep -vE "SeaBIOS|iPXE|Press Ctrl|Booting from|C900|PMM|PnP" "$LOG" 2>/dev/null)"
 
-# Wiederholungen: NUR auf Vollstaendigkeit geprueft, nicht auf jeden einzelnen Marker. Die
-# Markerpruefung unten laeuft gegen den ERSTEN Lauf; hier geht es um die Frage, ob der Lauf
-# ueberhaupt reproduzierbar durchlaeuft.
+# Wiederholungen (B-1.3, verschaerft durch B-1.2c).
+#
+# **Frueher wurde hier NUR `SELFTEST COMPLETE` gezaehlt.** Das war zweimal zu wenig:
+#  1. Bis B-1.8 druckte der Kernel diesen Marker auch nach einem Watchdog-Abbruch -- ein
+#     abgebrochener Lauf zaehlte also als Erfolg. Das ist behoben, aber es bleibt:
+#  2. Ein Lauf kann den Marker erreichen und trotzdem eine Pruefung reissen. Genau das ist am
+#     2026-07-29 passiert (`iso` mal 2x, mal 1x, mal 0x Faults; `color` einmal FAILURES) -- und
+#     die Wiederholungsmessung haette geschwiegen, weil der Marker jedes Mal stand.
+#
+# Verglichen wird deshalb die **Ergebnissignatur**: alle Ergebniszeilen des Kernels
+# (`xxx : ALL PASS|FAILURES|SKIP`) plus der Abschlussmarker, sortiert. Die Prueffunktionen unten
+# sind reine greps auf genau diese Zeilen -- gleiche Signatur heisst also gleiches Testergebnis.
+# **Ein Lauf, dessen Signatur abweicht, ist ein FAIL**, auch wenn er "auch gruen" aussieht: bei
+# einer sporadischen Messung weiss man nicht, welcher der beiden Laeufe die Wahrheit sagt.
+run_signature() {
+    printf '%s\n' "$1" \
+        | grep -oE '^[a-z0-9_]+ +: (ALL PASS|FAILURES|SKIP)|^== SELFTEST [A-Z]+( \(watchdog\))?' \
+        | sort
+}
 REPEAT_OK=1
 REPEAT_DONE=0
 if [ "$RUNS" -gt 1 ]; then
-    echo "$OUT" | grep -q "SELFTEST COMPLETE" && REPEAT_DONE=1
-    for _ in $(seq 2 "$RUNS"); do
+    SIG0="$(mktemp)"; SIGN="$(mktemp)"
+    run_signature "$OUT" > "$SIG0"
+    REPEAT_DONE=1
+    for n in $(seq 2 "$RUNS"); do
         boot_once
-        grep -q "SELFTEST COMPLETE" "$LOG" 2>/dev/null && REPEAT_DONE=$((REPEAT_DONE + 1))
+        OUTN="$(grep -vE "SeaBIOS|iPXE|Press Ctrl|Booting from|C900|PMM|PnP" "$LOG" 2>/dev/null)"
+        run_signature "$OUTN" > "$SIGN"
+        if cmp -s "$SIG0" "$SIGN"; then
+            REPEAT_DONE=$((REPEAT_DONE + 1))
+        else
+            echo "== Lauf $n weicht vom ersten ab (< Lauf 1, > Lauf $n): =="
+            diff "$SIG0" "$SIGN" | grep -E '^[<>]' | sed 's/^/     /'
+        fi
     done
+    rm -f "$SIG0" "$SIGN"
     [ "$REPEAT_DONE" = "$RUNS" ] || REPEAT_OK=0
-    echo "== Wiederholungen: $REPEAT_DONE von $RUNS erreichten SELFTEST COMPLETE =="
+    echo "== Wiederholungen: $REPEAT_DONE von $RUNS mit IDENTISCHER Ergebnissignatur =="
 fi
 # Ein leerer Lauf sieht in der Auswertung aus wie "alle Pruefungen fehlgeschlagen" -- eine
 # Fehldiagnose, die schlimmer ist als gar keine. Also unterscheiden: kam nichts an, ist das ein
@@ -150,6 +176,7 @@ if echo "$OUT" | grep -q "color   : SKIP"; then
 else
     check "color   : ALL PASS" "A1: zwei isolierte PDs teilen sich KEINE Cache-Farbe -- Region, Kernel-Stack und Seitentabellen jeder PD stammen aus disjunkten Farbsaetzen; eine Region jenseits der Streifenbreite wird abgewiesen statt fremde Farben mitzunehmen"
 fi
+check "stripe  : ALL PASS" "B-4.2: erschoepfte Farbpartitionierung scheitert SAUBER -- der 5. Streifenversuch wird abgewiesen, statt den Satz der ersten PD still ein zweites Mal auszugeben; nach Freigabe wieder vergebbar (kein Leck)"
 check "audit   : ALL PASS"            "Stufe 4: Scheduler- + CDT-Audit sauber"
 # B-1.5: die erwartete Abwesenheit AUSSPRECHEN, statt sie durchlaufen zu lassen.
 # Diese Suite bootet den Kernel nackt -- sie baut KEIN Boot-Archiv (keine `programs`, kein
@@ -193,11 +220,14 @@ else
 fi
 if [ "$RUNS" -gt 1 ]; then
     if [ "$REPEAT_OK" = 1 ]; then
-        echo "  PASS: B-1.3: $RUNS von $RUNS Laeufen vollstaendig -- der Lauf ist reproduzierbar"
+        echo "  PASS: B-1.3/B-1.2c: $RUNS von $RUNS Laeufen mit IDENTISCHER Ergebnissignatur -- reproduzierbar,"
+        echo "        und zwar im Ergebnis, nicht bloss im Durchlaufen"
     else
-        echo "  FAIL: B-1.3: nur $REPEAT_DONE von $RUNS Laeufen vollstaendig. Eine Quote unter 100 %"
-        echo "        ist KEIN 'meistens gruen', sondern ein Nichtdeterminismus. Verdaechtig sind"
-        echo "        Sperren, IRQ-Maskierung und der SMP-Hochlauf (s. todo D0)."
+        echo "  FAIL: B-1.3/B-1.2c: nur $REPEAT_DONE von $RUNS Laeufen mit identischer Ergebnissignatur."
+        echo "        Eine Quote unter 100 % ist KEIN 'meistens gruen', sondern ein Nichtdeterminismus --"
+        echo "        und bei abweichenden Signaturen weiss niemand, welcher Lauf die Wahrheit sagt."
+        echo "        Die abweichenden Zeilen stehen oben. Verdaechtig sind Sperren, IRQ-Maskierung,"
+        echo "        der SMP-Hochlauf (s. todo D0) und zeitkritische Messungen im Bericht."
         fail=1
     fi
 fi

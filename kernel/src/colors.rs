@@ -51,13 +51,145 @@ pub fn usable() -> bool {
 /// breit ist, auch eine kleinere größtmögliche zusammenhängende Region (s. [`region_bytes`]).
 pub const PARTITIONS: u32 = 4;
 
-/// Farbsatz der PD mit laufender Nummer `i` (rundläufig über [`PARTITIONS`]).
+/// Farbsatz des Streifens mit der Nummer `i` (rundläufig über [`PARTITIONS`]).
 ///
 /// `None`, wenn die Aufteilung nicht aufgeht — dann gibt es keinen disjunkten Satz, und der
 /// Aufrufer darf **nicht** ersatzweise „alle Farben" nehmen: das wäre die Zusicherung ohne
 /// die Eigenschaft.
+///
+/// **Diese Funktion führt KEINE Belegung** — `i % PARTITIONS` heißt: die fünfte Nummer bekommt
+/// wieder den Satz der ersten. Für einen Selbsttest, der zwei feste Nummern vergleicht, ist das
+/// richtig; für die Zuteilung an PDs ist es die stille Farbüberschneidung aus B-4.2. Wer eine PD
+/// bedient, nimmt [`claim_stripe`].
 pub fn mask_for(i: u32) -> Option<ColorMask> {
     sel4lake_mem::stripe(i % PARTITIONS, PARTITIONS)
+}
+
+// --- Streifenvergabe mit Belegung (B-4.2) ---------------------------------------------------
+//
+// Bis hierher wurden Farbsätze rundläufig vergeben. Solange der gefärbte Pfad die Ausnahme war
+// (nur der Selbsttest mit zwei festen Nummern), fiel das nicht auf. Als Normalfall — und dorthin
+// soll er, B-4.1 — bedeutet es: ab der fünften gleichzeitigen PD teilen sich zwei PDs ihre
+// Farben, **ohne dass es jemand merkt**. Das wäre schlimmer als der heutige Zustand: heute ist
+// der reguläre Pfad ungefärbt und verspricht nichts; dann wäre er gefärbt und bräche das
+// Versprechen still.
+//
+// Deshalb eine geführte Belegung, und der Fehlschlag ist **sauber**: ist kein Streifen frei,
+// gibt es `None` und die PD entsteht gar nicht erst. Kein Ersatzsatz, keine Aufweichung, keine
+// „alle Farben"-Rückfallebene — eine Zusicherung, die unter Last leise schwächer wird, ist
+// keine.
+
+/// Bit `i` gesetzt = Streifen `i` ist vergeben. Höchstens [`PARTITIONS`] Bits in Gebrauch.
+static STRIPES_TAKEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+// Die Auswahl selbst (`sel4lake_mem::pick_free`) liegt bei `stripe`, nicht hier — aus demselben
+// Grund wie `color_of` oben: eine zweite Fassung derselben Arithmetik im Kernel würde am Ende nur
+// sich selbst bestätigen. Dort ist sie ohne Hardware host-getestet (Technik wie `cache_decode`).
+
+/// Einen freien Farbstreifen belegen. Gibt `(Streifennummer, Farbsatz)`.
+///
+/// `None` heißt **kein freier Streifen** (oder die Aufteilung geht nicht auf) — und dann darf der
+/// Aufrufer die PD nicht ungefärbt anlegen und so tun, als sei sie getrennt. Freigabe über
+/// [`release_stripe`], gebunden an die Lebensdauer der VSpace (`vspace_teardown`).
+pub fn claim_stripe() -> Option<(u32, ColorMask)> {
+    use core::sync::atomic::Ordering;
+    loop {
+        let cur = STRIPES_TAKEN.load(Ordering::Acquire);
+        let i = sel4lake_mem::pick_free(cur, PARTITIONS)?;
+        // Der Farbsatz muss VOR dem Belegen feststehen: geht die Aufteilung nicht auf, wäre ein
+        // belegter Streifen ohne Maske ein Leck, das niemand je freigibt.
+        let mask = sel4lake_mem::stripe(i, PARTITIONS)?;
+        if STRIPES_TAKEN
+            .compare_exchange_weak(cur, cur | (1u32 << i), Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Some((i, mask));
+        }
+        // Verloren: ein anderer Kern war schneller. Neu lesen, nicht blind weiterzählen.
+    }
+}
+
+/// Einen Streifen wieder freigeben. Doppelte Freigabe ist wirkungslos, nicht schädlich.
+pub fn release_stripe(i: u32) {
+    if i < PARTITIONS {
+        STRIPES_TAKEN.fetch_and(!(1u32 << i), core::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Wie viele Streifen sind gerade vergeben? (Telemetrie/Selbsttest.)
+pub fn stripes_in_use() -> u32 {
+    STRIPES_TAKEN
+        .load(core::sync::atomic::Ordering::Acquire)
+        .count_ones()
+}
+
+/// **B-4.2 auf der laufenden Maschine belegen:** die Streifen erschöpfen und prüfen, dass der
+/// Versuch danach *scheitert*, statt einen Satz ein zweites Mal auszugeben.
+///
+/// Die Arithmetik dahinter ist host-getestet (`sel4lake_mem::pick_free`); hier geht es um die
+/// Zustandsführung im Kernel — dass die Belegung wirklich atomar geführt und die Freigabe wirklich
+/// wirksam ist. Der Test stellt den Ausgangszustand danach wieder her; er läuft vor dem Anlegen
+/// gefärbter PDs, belegt also nichts, was jemandem gehört.
+#[cfg(feature = "selftest")]
+pub fn run_stripe_alloc() -> bool {
+    let vorher = stripes_in_use();
+    if vorher != 0 {
+        // Nicht „durchgefallen", sondern nicht durchführbar: es hält schon jemand Streifen.
+        println!("stripe  : SKIP ({vorher} Streifen bereits vergeben -- Test braucht den Ruhezustand)");
+        return true;
+    }
+    let mut held: [Option<u32>; PARTITIONS as usize] = [None; PARTITIONS as usize];
+    let mut n = 0usize;
+    while n < PARTITIONS as usize {
+        match claim_stripe() {
+            Some((i, m)) => {
+                // Jeder Satz muss nichtleer sein und darf keinen früheren überlappen.
+                for prev in held.iter().take(n).flatten() {
+                    if let Some(pm) = sel4lake_mem::stripe(*prev, PARTITIONS) {
+                        if pm.0 & m.0 != 0 {
+                            println!("stripe  : FAILURES (Streifen {i} ueberlappt {prev})");
+                            return false;
+                        }
+                    }
+                }
+                held[n] = Some(i);
+                n += 1;
+            }
+            None => {
+                println!("stripe  : FAILURES (nur {n} von {PARTITIONS} Streifen vergebbar)");
+                for h in held.iter().flatten() {
+                    release_stripe(*h);
+                }
+                return false;
+            }
+        }
+    }
+    // **Der eigentliche Punkt:** jetzt ist alles vergeben, und der nächste Versuch muss scheitern.
+    let erschoepft = claim_stripe().is_none();
+    if !erschoepft {
+        println!("stripe  : FAILURES (der {}. Versuch bekam einen Satz -- stille Ueberschneidung)", PARTITIONS + 1);
+    }
+    for h in held.iter().flatten() {
+        release_stripe(*h);
+    }
+    // Und nach der Freigabe muss wieder etwas gehen, sonst leckt die Belegung.
+    let wieder_frei = stripes_in_use() == 0 && claim_stripe().is_some();
+    if wieder_frei {
+        release_stripe(0);
+    }
+    let ok = erschoepft && wieder_frei && stripes_in_use() == 0;
+    println!(
+        "stripe  : {} Streifen vergeben, {}. Versuch abgewiesen: {}; nach Freigabe wieder vergebbar: {}",
+        PARTITIONS,
+        PARTITIONS + 1,
+        erschoepft,
+        wieder_frei
+    );
+    println!(
+        "stripe  : {} (B-4.2: erschoepfte Farbpartitionierung scheitert SAUBER, statt einen Satz still ein zweites Mal auszugeben)",
+        if ok { "ALL PASS" } else { "FAILURES" }
+    );
+    ok
 }
 
 /// Größte **zusammenhängende** Region, die vollständig in einen Streifen passt.

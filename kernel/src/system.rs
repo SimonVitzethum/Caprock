@@ -1270,9 +1270,16 @@ struct VSpaceEnt {
     used: bool,
     l1: u64,
     l2: u64,
+    /// Belegter Farbstreifen dieser PD (B-4.2), `None` bei ungefärbten VSpaces.
+    ///
+    /// **Warum hier und nicht am Thread:** ein Streifen gehört dem *Adressraum*, nicht dem
+    /// Ausführungsfaden — Region, Kernel-Stack und Seitentabellen der PD stammen daraus. Am
+    /// Thread aufgehängt würde er bei mehreren Threads je PD mehrfach freigegeben oder gar nicht;
+    /// an der VSpace hat er genau einen Anfang und genau ein Ende (`vspace_teardown`).
+    stripe: Option<u32>,
 }
 static VSPACES: SpinLock<[VSpaceEnt; MAX_VSPACES]> =
-    SpinLock::new([VSpaceEnt { used: false, l1: 0, l2: 0 }; MAX_VSPACES]);
+    SpinLock::new([VSpaceEnt { used: false, l1: 0, l2: 0, stripe: None }; MAX_VSPACES]);
 
 /// Eine **leere** isolierte VSpace anlegen (Kernel EL1-only, kein User-Frame). Gibt
 /// `(asid, l1_phys)` oder `None` (kein ASID/Speicher). Allokiert L1+L2 aus `MEM`
@@ -1299,7 +1306,7 @@ fn create_vspace_masked(mask: Option<sel4lake_mem::ColorMask>) -> Option<(u16, u
         let usable = MAX_VSPACES.min(hal::mmu::max_asid() as usize);
         let mut t = VSPACES.lock();
         let i = t.iter().take(usable).position(|v| !v.used)?;
-        t[i] = VSpaceEnt { used: true, l1: 0, l2: 0 }; // reserviert
+        t[i] = VSpaceEnt { used: true, l1: 0, l2: 0, stripe: None }; // reserviert
         (i + 1) as u16
     };
     let a = mem_alloc_masked(4096, 4096, mask);
@@ -1343,6 +1350,9 @@ fn create_vspace_masked(mask: Option<sel4lake_mem::ColorMask>) -> Option<(u16, u
         used: true,
         l1: l1.base(),
         l2: l2.base(),
+        // Der Streifen wird nach dem Anlegen gesetzt (`vspace_bind_stripe`): hier ist noch nicht
+        // entschieden, ob diese VSpace eine gefärbte PD trägt.
+        stripe: None,
     };
     Some((asid, l1.base()))
 }
@@ -1560,7 +1570,27 @@ fn vspace_teardown(asid: u16) {
         drop(mem);
     }
     // 3. Slot erst JETZT freigeben (nach Flush) -> keine Wiederverwendung mit veralteten Einträgen.
-    VSPACES.lock()[asid as usize - 1] = VSpaceEnt { used: false, l1: 0, l2: 0 };
+    VSPACES.lock()[asid as usize - 1] = VSpaceEnt { used: false, l1: 0, l2: 0, stripe: None };
+    // 4. Farbstreifen zuletzt (B-4.2). **Nach** dem Slot, nicht davor: gäbe man den Streifen frei,
+    // solange diese VSpace noch steht, könnte eine neue PD ihn belegen und läge kurzzeitig auf
+    // denselben Farben wie eine noch existierende — genau die Überschneidung, die B-4.2 verhindern
+    // soll, nur in einem schmalen Fenster statt dauerhaft.
+    if let Some(i) = ent.stripe {
+        crate::colors::release_stripe(i);
+    }
+}
+
+/// Den belegten Farbstreifen an die Lebensdauer einer VSpace binden (B-4.2).
+///
+/// Getrennt von `create_vspace_masked`, weil dort nur die *Maske* bekannt ist, nicht die
+/// Streifennummer — und die Freigabe braucht die Nummer. Wird der Aufruf vergessen, ist der
+/// Streifen für immer belegt: nach vier vergessenen PDs entsteht keine gefärbte mehr. Deshalb
+/// steht er unmittelbar neben dem `claim_stripe()` seines einzigen Aufrufers.
+fn vspace_bind_stripe(asid: u16, stripe: u32) {
+    if asid == 0 || asid as usize > MAX_VSPACES {
+        return;
+    }
+    VSPACES.lock()[asid as usize - 1].stripe = Some(stripe);
 }
 
 /// Einen **isolierten EL0-User-Thread** erzeugen (Weg C): eigene VSpace, die nur den
@@ -1648,6 +1678,39 @@ pub fn spawn_isolated_colored(
     prio: u8,
     mask: sel4lake_mem::ColorMask,
 ) -> Option<(ThreadId, u64)> {
+    // Ohne Streifennummer: der Aufrufer hat die Maske selbst gewaehlt (Selbsttest) und fuehrt
+    // keine Belegung. Fuer PDs ist `spawn_isolated_colored_auto` der richtige Weg.
+    spawn_isolated_colored_inner(entry, arg, prio, mask, None)
+}
+
+/// **Gefaerbte PD mit gefuehrter Streifenvergabe** (B-4.2) — der Weg, den B-4.1 zum Normalfall
+/// macht.
+///
+/// Belegt einen freien Farbstreifen, bindet ihn an die Lebensdauer der VSpace und gibt ihn bei
+/// jedem Fehlschlag wieder frei. **`None` heisst: kein Streifen frei** — und dann entsteht die PD
+/// gar nicht erst. Es gibt bewusst keine ungefaerbte Rueckfallebene: eine Trennung, die unter
+/// Last leise verschwindet, waere schlimmer als gar keine, weil niemand mehr weiss, welche PD
+/// getrennt ist und welche nicht.
+pub fn spawn_isolated_colored_auto(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u64)> {
+    let (i, mask) = crate::colors::claim_stripe()?;
+    match spawn_isolated_colored_inner(entry, arg, prio, mask, Some(i)) {
+        Some(r) => Some(r),
+        None => {
+            // Scheitert das Anlegen NACH dem Belegen, muss der Streifen zurueck -- sonst ist er
+            // fuer immer weg, und nach vier Fehlschlaegen gibt es keine gefaerbte PD mehr.
+            crate::colors::release_stripe(i);
+            None
+        }
+    }
+}
+
+fn spawn_isolated_colored_inner(
+    entry: usize,
+    arg: usize,
+    prio: u8,
+    mask: sel4lake_mem::ColorMask,
+    stripe: Option<u32>,
+) -> Option<(ThreadId, u64)> {
     let core = hal::cpu::core_id();
     let colors = crate::colors::count();
     let region_sz = crate::colors::region_bytes();
@@ -1673,6 +1736,11 @@ pub fn spawn_isolated_colored(
         release_user_kstack(kbase);
         return None;
     };
+    // Ab hier gibt `vspace_teardown(asid)` den Streifen selbst zurueck -- deshalb sofort binden
+    // und nicht erst am Ende: jeder Fehlerausgang unten ruft teardown.
+    if let Some(i) = stripe {
+        vspace_bind_stripe(asid, i);
+    }
     // Seitenweise statt Block — s. Funktionsdoku. `vspace_map` legt die L3 bei Bedarf an und
     // `vspace_teardown` sammelt sie beim Abbau wieder ein.
     if !vspace_map_masked(asid, rbase, rlen, hal::mmu::UserPerm::Rw, Some(mask)) {

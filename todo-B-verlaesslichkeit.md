@@ -41,7 +41,7 @@ Verlässliches.
       Implementierung in derselben `cfg`-Kette — eine eigene Kette wäre eine Wiederholung der
       Bedingung, und Wiederholungen laufen auseinander. Empfindlichkeit belegt.
 
-- [ ] **B-1.5 Erwartete Meldungen aussprechen, nicht verstecken.** In einem grünen Lauf von
+- [x] **B-1.5 erledigt (2026-07-29). Erwartete Meldungen aussprechen, nicht verstecken.** In einem grünen Lauf von
       `test-qemu-x86.sh` stehen `root : FAILURES` und `cdelete : FAILURES` — richtig, weil die
       Suite **kein** Boot-Archiv baut (keine `programs`, kein `mkarchive`, kein Manifest, anders
       als die Lade-Suite) und der Kernel die fehlende Startmenge meldet, statt still zu idlen.
@@ -52,7 +52,7 @@ Verlässliches.
       *nicht* mehr kommen. Ein Filter, der sie versteckt, wäre das Gegenteil davon.
       Gefunden 2026-07-29 im Übernahmelauf (`build/diag/b-uebernahme-suite.log`).
 
-- [ ] **B-1.6 Der Bericht darf nicht aus der Notbremse kommen.** `all_done()` in
+- [x] **B-1.6 erledigt (2026-07-29). Der Bericht kam aus der Notbremse.** `all_done()` in
       `arch/x86_64/bringup.rs` verlangte seit `6d68328` auch `root_chain_done() && cdelete_done()`
       — beide brauchen ein Boot-Archiv, das `test-qemu-x86.sh` absichtlich **nicht** baut. Damit
       wurde `all_done()` dort **nie** wahr und der Bericht fiel jedes Mal aus dem Watchdog nach
@@ -85,8 +85,18 @@ Verlässliches.
       **Folge für eine ältere Aussage:** „16 von 16" (B-1.2) wurde mit einem Marker gezählt, der
       beide Ausgänge gleich druckte. Die Zahl ist damit nicht widerlegt, aber sie ist **nicht
       belegt** — sie gehört nach dieser Korrektur neu gemessen. Steht als B-1.2c.
-- [ ] **B-1.2c `16 von 16` neu messen.** Mit dem getrennten Marker aus B-1.8, sonst zählt die
-      Messung wieder beide Ausgänge als Erfolg.
+- [x] **B-1.2c erledigt (2026-07-30). `8 von 8 Läufen mit IDENTISCHER Ergebnissignatur.`** Nicht
+      nur „achtmal durchgelaufen" — achtmal *dasselbe Ergebnis*. Dafür wurde das Kriterium
+      verschärft: `RUNS=n` zählt nicht mehr den Marker, sondern vergleicht die **Ergebnissignatur**
+      (alle `xxx : ALL PASS|FAILURES|SKIP`-Zeilen plus den Abschlussmarker, sortiert). Die
+      Prüffunktionen der Suite sind reine greps auf genau diese Zeilen, gleiche Signatur heisst
+      also gleiches Testergebnis. Weicht ein Lauf ab, druckt die Suite die Differenz und wertet
+      ihn als FAIL — denn bei zwei verschiedenen Ergebnissen weiss niemand, welcher Lauf die
+      Wahrheit sagt. Damit hätte auch der `iso`-Flake angeschlagen, den B-1.3 in seiner alten Form
+      übersehen hätte. Einziger FAIL bleibt `x2APIC` (TCG-Grenze).
+      **Damit ist B-1.2b miterledigt** — „gegen `SELFTEST COMPLETE` prüfen, nicht gegen die gerade
+      interessierende Zeile" war die halbe Lehre; die ganze ist, gegen das *gesamte* Ergebnis zu
+      prüfen.
 
 ## B-2. Der zweite Architekturzweig muss laufen
 
@@ -157,10 +167,24 @@ Verlässliches.
       über die Regionsgröße: Färbung verträgt sich nicht mit dem 2-MiB-Blockdeskriptor (512 Seiten
       überstreichen alle 256 gemessenen Farben) — also kleinere Regionen mit seitenweisem Mapping
       oder mehrere gefärbte Läufe je PD. **(Strang A ruft das auf: A-2.1.)**
-- [ ] **B-4.2 Streifen-Freiliste.** `mask_for` vergibt heute rundläufig **ohne** Belegungsprüfung:
-      mehr gleichzeitige PDs als Partitionen heißt stille Farbüberschneidung. Nötig ist ein
-      sauberer Fehlschlag statt einer stillen Aufweichung. **(Berührt A-3.4: dynamische Tabellen
-      heben die PD-Zahl.)**
+- [x] **B-4.2 erledigt (2026-07-30).** Geführte Streifenbelegung statt `i % PARTITIONS`.
+      `sel4lake_mem::pick_free` (rein, host-getestet: 18 von 18, davon fünf neue — darunter
+      „erschöpft ergibt `None` und ausdrücklich nicht wieder Streifen 0") liegt neben `stripe`,
+      nicht im Kernel: eine zweite Fassung derselben Arithmetik bestätigt am Ende nur sich selbst.
+      Im Kernel führen `claim_stripe`/`release_stripe` die Belegung über eine CAS-Schleife.
+      **Der Streifen hängt an der VSpace, nicht am Thread** — er gehört dem Adressraum (Region,
+      Kernel-Stack und Seitentabellen stammen daraus); am Thread aufgehängt würde er bei mehreren
+      Threads je PD mehrfach oder gar nicht freigegeben. `vspace_teardown` gibt ihn zurück, und
+      zwar **nach** der Slot-Freigabe: umgekehrt könnte eine neue PD ihn belegen, während die alte
+      noch steht — dieselbe Überschneidung, nur in einem schmalen Fenster.
+      `spawn_isolated_colored_auto` ist der Einstieg, den B-4.1 zum Normalfall macht; kein Streifen
+      frei heißt, die PD entsteht **nicht**. Bewusst **keine** ungefärbte Rückfallebene: eine
+      Trennung, die unter Last leise verschwindet, ist schlimmer als keine, weil dann niemand mehr
+      weiß, welche PD getrennt ist.
+      Belegt auf der Maschine (`stripe : ALL PASS`): vier Streifen vergeben, **der fünfte Versuch
+      abgewiesen**, nach Freigabe wieder vergebbar. Steht in `all_done()`, nicht bloß im Bericht.
+      **(Berührt A-3.4: dynamische Tabellen heben die PD-Zahl — vier Streifen bei beliebig vielen
+      PDs heißt, die Färbung ist sofort erschöpft. Gehört gemeinsam entschieden.)**
 - [ ] **B-4.3 SMT** (Z6). Cache-Coloring trennt den LLC und **prinzipiell nicht** L1/L2/TLB/
       Store-Buffer zwischen Geschwister-Hyperthreads. Entweder SMT aus, oder ein physischer Kern
       gehört zu jedem Zeitpunkt genau einem Tenant. Der zweite Weg braucht die CPU-Topologie

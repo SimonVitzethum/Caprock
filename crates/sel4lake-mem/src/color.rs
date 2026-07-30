@@ -92,9 +92,94 @@ pub fn stripe(i: u32, n: u32) -> Option<ColorMask> {
     Some(ColorMask(bits))
 }
 
+/// **Niedrigster freier Streifen** unter `n`, oder `None`, wenn alle vergeben sind (B-4.2).
+///
+/// `taken` ist eine Bitmenge: Bit `i` gesetzt heißt Streifen `i` ist vergeben. Die Funktion ist
+/// bewusst rein und liegt hier statt im Kernel — dieselbe Technik wie bei `cache_decode`: die
+/// Arithmetik gegen eingespeiste Werte prüfen, nicht gegen den Zustand einer laufenden Maschine.
+///
+/// **Der Rückgabewert `None` ist der eigentliche Zweck.** Vorher vergab der Kernel Farbsätze mit
+/// `i % n` — die (n+1)-te PD bekam wieder den Satz der ersten, und niemand merkte es. Eine
+/// erschöpfte Partitionierung muss ein *Fehlschlag* sein, keine stille Überschneidung.
+pub const fn pick_free(taken: u32, n: u32) -> Option<u32> {
+    if n == 0 || n > 32 {
+        return None;
+    }
+    let mut i = 0;
+    while i < n {
+        if taken & (1u32 << i) == 0 {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Leere Belegung -> Streifen 0; danach der jeweils niedrigste freie.
+    #[test]
+    fn pick_free_nimmt_den_niedrigsten_freien() {
+        assert_eq!(pick_free(0b0000, 4), Some(0));
+        assert_eq!(pick_free(0b0001, 4), Some(1));
+        assert_eq!(pick_free(0b0011, 4), Some(2));
+        assert_eq!(pick_free(0b0111, 4), Some(3));
+        // Luecke in der Mitte: freigegebene Streifen werden wiederverwendet, nicht uebersprungen.
+        assert_eq!(pick_free(0b1101, 4), Some(1));
+    }
+
+    /// **Der Punkt der Uebung:** ist alles vergeben, gibt es KEINEN Ersatz.
+    #[test]
+    fn pick_free_erschoepft_ist_ein_fehlschlag_keine_wiederholung() {
+        assert_eq!(pick_free(0b1111, 4), None);
+        // Und nicht etwa Streifen 0 erneut -- genau das war der Fehler von `i % n`.
+        assert_ne!(pick_free(0b1111, 4), Some(0));
+    }
+
+    /// Bits oberhalb von `n` gehen die Auswahl nichts an.
+    #[test]
+    fn pick_free_ignoriert_bits_jenseits_von_n() {
+        assert_eq!(pick_free(0b1111_0000, 4), Some(0));
+        assert_eq!(pick_free(0b1111_0001, 4), Some(1));
+    }
+
+    /// Unsinnige Streifenzahlen ergeben keinen Streifen (statt Panik oder Ueberlauf).
+    #[test]
+    fn pick_free_weist_unsinnige_streifenzahl_ab() {
+        assert_eq!(pick_free(0, 0), None);
+        assert_eq!(pick_free(0, 33), None);
+        // Genau 32 ist die Grenze und muss noch gehen.
+        assert_eq!(pick_free(0, 32), Some(0));
+        assert_eq!(pick_free(u32::MAX, 32), None);
+    }
+
+    /// Zusammenspiel mit `stripe`: jeder von `pick_free` gelieferte Index ergibt einen gueltigen
+    /// Satz, zwei verschiedene ueberlappen nicht, und nach `n` Vergaben ist Schluss.
+    ///
+    /// Das ist die Aussage, auf der B-4.2 steht -- „sauberer Fehlschlag statt stiller
+    /// Ueberschneidung" ist genau die Konjunktion dieser beiden Haelften.
+    #[test]
+    fn gelieferte_indizes_ergeben_disjunkte_saetze() {
+        let mut taken = 0u32;
+        let mut masks = [0u64; 4];
+        let mut used = 0usize;
+        while let Some(i) = pick_free(taken, 4) {
+            let bits = stripe(i, 4).expect("Aufteilung geht auf").0;
+            assert_ne!(bits, 0, "ein leerer Satz waere keine Trennung");
+            for m in masks.iter().take(used) {
+                assert_eq!(bits & m, 0, "Streifen {i} ueberlappt einen frueheren");
+            }
+            masks[used] = bits;
+            used += 1;
+            taken |= 1 << i;
+        }
+        assert_eq!(used, 4, "genau vier disjunkte Saetze, dann Schluss");
+        assert_eq!(pick_free(taken, 4), None, "erschoepft heisst erschoepft");
+        // Gegenprobe: die vier Saetze zusammen decken den ganzen Farbraum ab, keiner faellt weg.
+        assert_eq!(masks.iter().fold(0u64, |a, m| a | m), u64::MAX);
+    }
 
     /// Farbe ist seitenkonstant und läuft mit der Seitennummer um.
     #[test]

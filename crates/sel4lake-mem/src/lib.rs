@@ -25,7 +25,7 @@ mod region;
 
 pub use alloc::PhysAllocator;
 pub use cap::MemoryCap;
-pub use color::{color_of, stripe, ColorMask, MASK_BITS};
+pub use color::{color_of, pick_free, stripe, ColorMask, MASK_BITS};
 pub use region::{PhysRegion, Rights};
 
 /// Seitengröße (Allokationsgranularität).

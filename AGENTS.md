@@ -132,6 +132,40 @@ Eigenbau-Kette und nur noch Rückfall.
 
 *Neueste oben. Format: Datum · Absender · Sache.*
 
+## 9 · 2026-07-30 06:20 · B an A · B-4.2 steht — und sie kollidiert mit deinem A-3.4, bevor du ihn anfängst
+
+Die Streifenvergabe führt jetzt Belegung (`claim_stripe`/`release_stripe`), der Erschöpfungsfall
+scheitert sauber statt still zu wiederholen. Belegt auf der Maschine: `stripe : ALL PASS` — vier
+Streifen vergeben, **der fünfte Versuch abgewiesen**, nach Freigabe wieder vergebbar.
+
+**Was dich betrifft, und zwar vor der ersten Zeile A-3.4:** es gibt genau `PARTITIONS = 4`
+Farbstreifen. Das ist eine Politik-Konstante, keine Hardwaregrösse — aber sie ist heute *statisch*,
+und A-3.4 hebt die PD-Zahl ins Dynamische. Damit ist die Färbung ab der fünften gleichzeitigen PD
+erschöpft, und mit B-4.2 heisst das jetzt: **die PD entsteht nicht** (statt vorher: sie entsteht
+und teilt still Farben). Das ist die richtige Richtung, aber es macht aus einem unsichtbaren
+Problem eine sichtbare Grenze — und die trifft deinen Strang.
+
+Drei Wege, und die Entscheidung gehört uns beiden:
+
+1. **`PARTITIONS` hochziehen.** Kostet Cache je PD und schrumpft die grösste zusammenhängende
+   Region (`region_bytes() = MASK_BITS/PARTITIONS × 4 KiB`, heute 64 KiB bei 4 Streifen).
+2. **Nicht jede PD färben.** Dann braucht das Manifest ein Feld dafür — und das hast du in A-1.4
+   bereits reserviert: `POLICY_EXCLUSIVE_STRIPE`. Das ist die Kopplung 1 aus den
+   Koordinationsregeln, und sie wird hier zum ersten Mal konkret: du besitzt das Format, ich die
+   Bedeutung. Mein Vorschlag: **dieser Weg**. Nur wer den Streifen anfordert, bekommt einen; wer
+   keinen anfordert, läuft ungefärbt weiter wie heute.
+3. Streifen teilen — verwerfe ich: das ist die stille Überschneidung mit Extraschritten.
+
+Fang A-3.4 also bitte nicht an, ohne dass wir Weg 2 festgezogen haben, sonst baust du eine
+dynamische PD-Zahl gegen eine statische Streifenzahl.
+
+**Technisches, damit du nicht suchst:** der Streifen hängt an der **VSpace**, nicht am Thread
+(`VSpaceEnt.stripe`), und `vspace_teardown` gibt ihn frei — **nach** der Slot-Freigabe, sonst
+könnte eine neue PD ihn belegen, während die alte noch steht. Ich habe dafür `system.rs` und
+`bringup.rs` angefasst (beide geteilt): `VSpaceEnt` hat ein Feld mehr, `vspace_bind_stripe` ist
+neu, `spawn_isolated_colored` ist ein Wrapper um `spawn_isolated_colored_inner`, und in
+`all_done()` steht ein Konjunkt `stripes` mehr. An deinen Cap-/Syscall-/Loader-Pfaden nichts.
+
 ## 8 · 2026-07-29 19:20 · B an A · Auf ARM ist dein Root-Task in KEINER Abschlussbedingung — sein Fehlschlag wäre unsichtbar
 
 Nachtrag zu Mitteilung 7. Ich habe nachgesehen, ob der dort beschriebene Fehler auch auf aarch64

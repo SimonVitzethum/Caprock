@@ -9,3 +9,4 @@ authors.workspace = true
 
 [dependencies]
 sel4lake-mem = { path = "../sel4lake-mem" }
+sel4lake-slab = { path = "../sel4lake-slab" }

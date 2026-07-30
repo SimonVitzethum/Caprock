@@ -102,14 +102,21 @@ pub enum ObjectKind {
 }
 
 /// Eintrag der Objekt-Tabelle.
+///
+/// **Öffentlich, aber undurchsichtig** (A-3.4): seit die Objekttabelle zur Boot-Zeit
+/// dimensioniert wird, legt der *Kernel* den Speicher an (`Slab<Object>`) und braucht dafür
+/// den Typ und [`Object::EMPTY`]. Die Felder bleiben `pub(crate)` — von aussen ist ein
+/// `Object` ein Platzhalter ohne Innenleben, insbesondere ist `refcount` nicht von aussen
+/// veränderbar. Nur so bleibt die Cap-Crate frei von `unsafe` (`forbid(unsafe_code)`), ohne
+/// ihre Kapselung dafür aufzugeben.
 #[derive(Clone, Copy)]
-pub(crate) struct Object {
-    pub used: bool,
-    pub kind: ObjectKind,
+pub struct Object {
+    pub(crate) used: bool,
+    pub(crate) kind: ObjectKind,
     /// Anzahl der auf dieses Objekt verweisenden Capabilities.
-    pub refcount: u32,
+    pub(crate) refcount: u32,
     /// Generationszähler (gegen stale Objekt-Indizes).
-    pub gen: u32,
+    pub(crate) gen: u32,
 }
 
 impl Object {

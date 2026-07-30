@@ -1,4 +1,5 @@
 #![no_std]
+#![forbid(unsafe_code)]
 //! Capability-System-Kern von SEL4Lake (ADR 0003).
 //!
 //! Capabilities sind die einzige Autoritätsquelle: ein Subjekt darf genau das,
@@ -18,10 +19,16 @@
 //! [`CapSpace::delete`], [`CapSpace::revoke`]. Rechte können bei der Ableitung
 //! nur *eingeschränkt* werden (kein Privilege-Escalation).
 //!
-//! Alles ist sichere Rust-Datenstrukturlogik über feste Arrays — **kein `unsafe`**.
+//! Alles ist sichere Rust-Datenstrukturlogik — **kein `unsafe`**, seit A-3.4 nicht mehr nur
+//! behauptet, sondern per `forbid(unsafe_code)` erzwungen.
+//!
+//! Die Tabellen sind seither **zur Boot-Zeit dimensioniert** ([`CapSpace::attach`]) statt fest im
+//! `.bss`. Den Rohspeicher besorgt der Kernel und trägt dessen `unsafe`-Vertrag; hier kommen nur
+//! die fertigen [`Slab`](sel4lake_slab::Slab)-Handles an. [`CapSlot`] und [`Object`] sind deshalb
+//! öffentlich — als undurchsichtige Platzhalter mit `EMPTY`, ohne zugängliche Felder.
 
 mod object;
 mod space;
 
-pub use object::{DmaCoherence, DmaDir, ObjectKind};
-pub use space::{CapError, CapInfo, CapPtr, CapSpace, Finalized, MAX_FINALIZED};
+pub use object::{DmaCoherence, DmaDir, Object, ObjectKind};
+pub use space::{CapError, CapInfo, CapPtr, CapSlot, CapSpace, Finalized};

@@ -617,6 +617,15 @@ pub fn run(multiboot_info: u64) -> ! {
     if carved > 0 {
         println!("mem     : {carved} Byte fuer Multiboot-Module ausgeschnitten (vor der ersten Allokation)");
     }
+    // Cap-Tabellen VOR dem ersten Cap (A-3.4): der Selbsttest weiter unten installiert bereits
+    // welche, und ein nicht angehaengter Space haette Kapazitaet 0.
+    let cap_bytes = system::configure_caps();
+    let (cap_slots, cap_objs) = system::cap_capacity();
+    println!(
+        "cap     : {cap_slots} Slots / {cap_objs} Objekte, Tabellen {} KiB aus dem RAM (Summe aller PD-Budgets: {})",
+        cap_bytes >> 10,
+        sel4lake_microkit::CAP_SLOTS_FOR_ALL_PDS
+    );
     #[cfg(feature = "selftest")]
     {
         // Das Ausschneiden traegt eine Sicherheitsaussage; der reale Lauf sieht davon nur EINEN

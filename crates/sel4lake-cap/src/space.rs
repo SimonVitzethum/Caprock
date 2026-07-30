@@ -2,11 +2,7 @@
 
 use crate::object::{DmaCoherence, DmaDir, Object, ObjectKind};
 use sel4lake_mem::{MemoryCap, PhysAllocator, Rights};
-
-/// Anzahl Capability-Slots (CTEs) im Space.
-const NSLOTS: usize = 256;
-/// Anzahl verwaltbarer Objekte.
-const NOBJECTS: usize = 128;
+use sel4lake_slab::Slab;
 
 /// Sicheres Capability-Handle: Slot-Index + Generation (erkennt stale Pointer).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -34,7 +30,7 @@ pub enum CapError {
 
 /// Ableitungs-Metadaten eines Slots (MDB-Knoten / CDT-Verkettung).
 #[derive(Clone, Copy)]
-struct Mdb {
+pub(crate) struct Mdb {
     parent: Option<usize>,
     first_child: Option<usize>,
     next_sibling: Option<usize>,
@@ -51,18 +47,22 @@ impl Mdb {
 }
 
 /// Ein Capability-Slot (CTE: Capability + MDB-Knoten).
+///
+/// **Öffentlich, aber undurchsichtig** — aus demselben Grund wie [`Object`]: der Kernel legt
+/// die Slot-Tabelle zur Boot-Zeit an (`Slab<CapSlot>`) und braucht dafür Typ und
+/// [`CapSlot::EMPTY`]. Rechte, Badge und CDT-Verkettung bleiben `pub(crate)`.
 #[derive(Clone, Copy)]
-struct CapSlot {
-    used: bool,
-    gen: u32,
-    object: usize, // Index in die Objekt-Tabelle
-    rights: Rights,
-    badge: u64,
-    mdb: Mdb,
+pub struct CapSlot {
+    pub(crate) used: bool,
+    pub(crate) gen: u32,
+    pub(crate) object: usize, // Index in die Objekt-Tabelle
+    pub(crate) rights: Rights,
+    pub(crate) badge: u64,
+    pub(crate) mdb: Mdb,
 }
 
 impl CapSlot {
-    const EMPTY: CapSlot = CapSlot {
+    pub const EMPTY: CapSlot = CapSlot {
         used: false,
         gen: 0,
         object: 0,
@@ -72,13 +72,11 @@ impl CapSlot {
     };
 }
 
-/// **Die Kapazität, die ein [`Finalized`] mitbringen muss**, damit keine Meldung verlorengeht:
-/// mehr Objekte als die Objekttabelle fasst kann eine einzelne Operation nicht finalisieren.
-///
-/// Sie steht hier und nicht beim Aufrufer, damit es **eine** Quelle gibt. Vorher hielt der Kernel
-/// eine eigene `MAX_FINALIZE`-Konstante mit dem Kommentar „dieselbe Schranke wie in der Cap-Crate"
-/// — eine Kopie, die beim Wachsen der Tabelle (A-3.4) still auseinanderläuft.
-pub const MAX_FINALIZED: usize = NOBJECTS;
+// Die Kapazität, die ein `Finalized` mitbringen muss, damit keine Meldung verlorengeht, ist die
+// Größe der Objekttabelle: mehr Objekte als sie fasst kann eine einzelne Operation nicht
+// finalisieren. Bis A-3.4 stand das hier als Konstante `MAX_FINALIZED = NOBJECTS`; seit die
+// Tabelle boot-dimensioniert ist, ist es keine Compile-Zeit-Zahl mehr, sondern
+// `CapSpace::finalize_capacity()` — dieselbe *eine* Quelle, nur zur Laufzeit gelesen.
 
 /// Was beim Löschen/Revoke **finalisiert** wurde und vom Kernel nachbereitet werden muss.
 ///
@@ -129,8 +127,8 @@ pub struct Finalized<'a> {
 
 impl<'a> Finalized<'a> {
     /// Einen Kollektor über geliehenem Speicher anlegen. Beide Slices sollten mindestens
-    /// [`MAX_FINALIZED`] Einträge fassen; sind sie kürzer, geht keine Meldung *unbemerkt*
-    /// verloren — [`Finalized::overflowed`] wird gesetzt.
+    /// [`CapSpace::finalize_capacity`] Einträge fassen; sind sie kürzer, geht keine Meldung
+    /// *unbemerkt* verloren — [`Finalized::overflowed`] wird gesetzt.
     pub fn new(items: &'a mut [(u32, u64)], dma: &'a mut [(u64, u64)]) -> Self {
         Self { items, n: 0, dma, dn: 0, overflow: false }
     }
@@ -181,9 +179,20 @@ pub struct CapInfo {
 }
 
 /// Ein Capability-Space: Slot-Tabelle + Objekt-Tabelle.
+///
+/// **Beide Tabellen sind zur Boot-Zeit dimensioniert** (A-3.4, Teil 2), nicht mehr
+/// `[_; NSLOTS]`/`[_; NOBJECTS]` im `.bss`. Der Grund steht in [`CapSpace::peak_slots`]: das
+/// Cap-Budget deckelt den Verbrauch **einer** PD, die **Summe** über alle PDs prüfte niemand —
+/// `NPDS * CAP_BUDGET_PER_PD` = 2048 stand gegen 256 vorhandene Slots. 32 PDs mit vollem Budget
+/// füllten die Tabelle, die 33. bekam nichts. Das war kein Fehler *im* Budget, sondern eine
+/// Zusage, die die Tabelle nicht einlösen konnte.
+///
+/// Ein frisch konstruierter `CapSpace` hat **Kapazität 0** — jede Installation scheitert mit
+/// [`CapError::NoSlot`], bis [`CapSpace::attach`] gelaufen ist. Das ist Absicht: ein vergessenes
+/// `attach` fällt als sauberer Fehler auf, nicht als stiller Fehlzugriff.
 pub struct CapSpace {
-    slots: [CapSlot; NSLOTS],
-    objects: [Object; NOBJECTS],
+    slots: Slab<CapSlot>,
+    objects: Slab<Object>,
     /// **Höchststand belegter Slots** seit dem Start (A-3.4).
     ///
     /// `used_slots()` sagt, wie voll die Tabelle *jetzt* ist — und das ist genau der Wert, der
@@ -203,13 +212,49 @@ impl Default for CapSpace {
 }
 
 impl CapSpace {
+    /// Ein **leerer** Space (Kapazität 0). `const`, damit `static`-Instanzen möglich bleiben;
+    /// den Speicher gibt es erst per [`attach`](Self::attach).
     pub const fn new() -> Self {
         Self {
-            slots: [CapSlot::EMPTY; NSLOTS],
-            objects: [Object::EMPTY; NOBJECTS],
+            slots: Slab::empty(),
+            objects: Slab::empty(),
             peak_slots: 0,
             peak_objects: 0,
         }
+    }
+
+    /// Dem Space seine **Tabellen** geben — einmalig, beim Boot, bevor die erste Cap installiert
+    /// wird.
+    ///
+    /// Die Slabs kommen **fertig angehängt** vom Aufrufer (der Kernel besorgt den Rohspeicher und
+    /// trägt dessen `unsafe`-Vertrag). Diese Crate bleibt dadurch `forbid(unsafe_code)`: sie sieht
+    /// nur zwei besitzende Handles, keine Zeiger.
+    ///
+    /// Ein zweiter Aufruf ist ein Programmierfehler und **panikt**, statt die alten Tabellen still
+    /// zu vergessen — mit ihnen wären alle ausgegebenen [`CapPtr`] auf einen Schlag Verweise auf
+    /// fremden Speicher, und zwar ohne dass irgendetwas es meldet.
+    pub fn attach(&mut self, slots: Slab<CapSlot>, objects: Slab<Object>) {
+        assert!(
+            self.slots.is_empty() && self.objects.is_empty(),
+            "CapSpace::attach zweimal gerufen"
+        );
+        self.slots = slots;
+        self.objects = objects;
+    }
+
+    /// Kapazität `(Slots, Objekte)` — 0/0, solange nicht [`attach`](Self::attach)ed.
+    pub fn capacity(&self) -> (usize, usize) {
+        (self.slots.len(), self.objects.len())
+    }
+
+    /// **Die Kapazität, die ein [`Finalized`] mitbringen muss**, damit keine Meldung verlorengeht:
+    /// mehr Objekte als die Objekttabelle fasst kann eine einzelne Operation nicht finalisieren.
+    ///
+    /// Sie steht hier und nicht beim Aufrufer, damit es **eine** Quelle gibt. Vorher hielt der
+    /// Kernel eine eigene `MAX_FINALIZE`-Konstante mit dem Kommentar „dieselbe Schranke wie in der
+    /// Cap-Crate" — eine Kopie, die beim Wachsen der Tabelle still auseinanderläuft.
+    pub fn finalize_capacity(&self) -> usize {
+        self.objects.len()
     }
 
     // --- Installation eines Wurzel-Caps ---
@@ -456,17 +501,17 @@ impl CapSpace {
     /// Höchststand gleichzeitig belegter Slots seit dem Start (A-3.4) und die Kapazität dazu.
     ///
     /// **Wozu:** `CAP_BUDGET_PER_PD` deckelt den Verbrauch **einer** PD, prüft aber nirgends die
-    /// **Summe**. Bei `NPDS` PDs mit vollem Budget wäre der Bedarf ein Vielfaches von [`NSLOTS`] —
+    /// **Summe**. Bei `NPDS` PDs mit vollem Budget wäre der Bedarf ein Vielfaches von der Slot-Kapazität —
     /// die Fairness-Zusage des Budgets ist damit eine Annahme über das Verhalten der PDs, keine
     /// Eigenschaft des Systems. Der Höchststand macht den Abstand zur Grenze **messbar**, statt
     /// ihn zu behaupten.
     pub fn peak_slots(&self) -> (usize, usize) {
-        (self.peak_slots, NSLOTS)
+        (self.peak_slots, self.slots.len())
     }
 
     /// Höchststand belegter Objekt-Einträge und die Kapazität dazu.
     pub fn peak_objects(&self) -> (usize, usize) {
-        (self.peak_objects, NOBJECTS)
+        (self.peak_objects, self.objects.len())
     }
 
     /// **Property-Oracle des Capability-Systems** (read-only). Prüft die strukturellen
@@ -481,23 +526,39 @@ impl CapSpace {
     ///     der Kinderliste — Rechteeskalation/Ableitung verletzt),
     /// 5 = Geschwister-Verkettung nicht reziprok,
     /// 6 = `first_child`-Verkettung kaputt (Kind unbelegt / falsches `parent`),
-    /// 7 = Zyklus bzw. überlange Kette (CDT nicht baumförmig).
+    /// 7 = Zyklus bzw. überlange Kette (CDT nicht baumförmig),
+    /// 8 = `refs` kürzer als die Objekttabelle — das Audit **konnte nicht laufen** (A-3.4).
+    ///
+    /// `refs` ist die Zählfläche für die Refcount-Prüfung und muss mindestens
+    /// [`finalize_capacity`](Self::finalize_capacity) Einträge fassen; ihr Inhalt beim Eintritt
+    /// ist gleichgültig (wird genullt).
     /// Damit abgesichert: keine verlorenen Objekte, keine negativen Refcounts, keine toten
     /// CDT-Knoten, keine Ableitung auf ein fremdes Objekt (Rechteeskalation), Baumform.
-    pub fn audit_cdt(&self) -> u32 {
+    pub fn audit_cdt(&self, refs: &mut [u32]) -> u32 {
+        let nslots = self.slots.len();
+        let nobjects = self.objects.len();
+        // Der Zählpuffer kommt seit A-3.4 vom Aufrufer (dieselbe Entscheidung wie bei
+        // `Finalized`): ein `[0u32; NOBJECTS]` war ein Stack-Array mit Compile-Zeit-Größe und
+        // hätte die Objekttabelle wieder an die Stackgröße gebunden. Zu klein ist ein eigener
+        // Befund und **kein** stilles „konsistent": ein Audit, das nicht laufen kann, sieht sonst
+        // aus wie ein bestandenes.
+        if refs.len() < nobjects {
+            return 8;
+        }
+        let refs = &mut refs[..nobjects];
+        refs.fill(0);
         // (1)+(2)+(3): Refcount == Anzahl belegter Slots, die auf das Objekt zeigen.
-        let mut refs = [0u32; NOBJECTS];
-        for s in 0..NSLOTS {
+        for s in 0..nslots {
             if !self.slots[s].used {
                 continue;
             }
             let obj = self.slots[s].object;
-            if obj >= NOBJECTS || !self.objects[obj].used {
+            if obj >= nobjects || !self.objects[obj].used {
                 return 1;
             }
             refs[obj] += 1;
         }
-        for o in 0..NOBJECTS {
+        for o in 0..nobjects {
             if self.objects[o].used {
                 if self.objects[o].refcount != refs[o] {
                     return 2;
@@ -510,13 +571,13 @@ impl CapSpace {
             }
         }
         // (4)+(5)+(6): CDT-Verkettung konsistent; Ableitung teilt das Objekt.
-        for s in 0..NSLOTS {
+        for s in 0..nslots {
             if !self.slots[s].used {
                 continue;
             }
             let m = self.slots[s].mdb;
             if let Some(p) = m.parent {
-                if p >= NSLOTS || !self.slots[p].used || self.slots[p].object != self.slots[s].object
+                if p >= nslots || !self.slots[p].used || self.slots[p].object != self.slots[s].object
                 {
                     return 4;
                 }
@@ -531,7 +592,7 @@ impl CapSpace {
                     }
                     c = self.slots[ci].mdb.next_sibling;
                     steps += 1;
-                    if steps > NSLOTS {
+                    if steps > nslots {
                         return 7;
                     }
                 }
@@ -544,7 +605,7 @@ impl CapSpace {
                 // (`prev_sibling == None`). Ohne die prev-Prüfung passierte ein reziproker
                 // Geschwister-Zyklus (a<->b als first_child) das Audit (Verus-Invariante Klausel 6
                 // verlangt beides; das Oracle war hier schwächer als die formale Invariante).
-                if c >= NSLOTS
+                if c >= nslots
                     || !self.slots[c].used
                     || self.slots[c].mdb.parent != Some(s)
                     || self.slots[c].mdb.prev_sibling.is_some()
@@ -556,7 +617,7 @@ impl CapSpace {
                 // Geschwister müssen reziprok verkettet sein UND denselben Parent teilen (Verus-
                 // Klausel 4-sib). Ohne die parent-Prüfung könnten zwei Slots als Geschwister verkettet
                 // sein, aber in verschiedenen Kinderlisten hängen (Oracle schwächer als die Invariante).
-                if n >= NSLOTS
+                if n >= nslots
                     || !self.slots[n].used
                     || self.slots[n].mdb.prev_sibling != Some(s)
                     || self.slots[n].mdb.parent != m.parent
@@ -565,14 +626,14 @@ impl CapSpace {
                 }
             }
             if let Some(pv) = m.prev_sibling {
-                if pv >= NSLOTS || !self.slots[pv].used || self.slots[pv].mdb.next_sibling != Some(s)
+                if pv >= nslots || !self.slots[pv].used || self.slots[pv].mdb.next_sibling != Some(s)
                 {
                     return 5;
                 }
             }
         }
         // (7): keine Zyklen in der Eltern-Kette.
-        for s in 0..NSLOTS {
+        for s in 0..nslots {
             if !self.slots[s].used {
                 continue;
             }
@@ -580,7 +641,7 @@ impl CapSpace {
             let mut steps = 0;
             while let Some(pi) = p {
                 steps += 1;
-                if steps > NSLOTS {
+                if steps > nslots {
                     return 7;
                 }
                 p = self.slots[pi].mdb.parent;
@@ -612,7 +673,10 @@ impl CapSpace {
     }
 
     fn resolve(&self, ptr: CapPtr) -> Result<usize, CapError> {
-        if ptr.slot < NSLOTS && self.slots[ptr.slot].used && self.slots[ptr.slot].gen == ptr.gen {
+        if ptr.slot < self.slots.len()
+            && self.slots[ptr.slot].used
+            && self.slots[ptr.slot].gen == ptr.gen
+        {
             Ok(ptr.slot)
         } else {
             Err(CapError::Invalid)

@@ -183,7 +183,15 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // reserviert (QEMU `-device loader`); der Allokator bekommt es NICHT -> kein Konflikt.
     let alloc_end = ram_end.min(loader::MOD_BASE);
     system::init_mem(free_base, alloc_end);
+    // Cap-Tabellen VOR dem ersten Cap: der Selbsttest gleich darunter installiert bereits welche.
+    let cap_bytes = system::configure_caps();
     println!("mem     : freies RAM [{free_base:#x}, {alloc_end:#x})  (Loader-Fenster [{:#x}, {ram_end:#x}) reserviert)", loader::MOD_BASE);
+    let (cap_slots, cap_objs) = system::cap_capacity();
+    println!(
+        "cap     : {cap_slots} Slots / {cap_objs} Objekte, Tabellen {} KiB aus dem RAM (Summe aller PD-Budgets: {})",
+        cap_bytes >> 10,
+        sel4lake_microkit::CAP_SLOTS_FOR_ALL_PDS
+    );
     loader::probe(); // Boot-Archiv lesen + Module melden (L0; Laden folgt ab L1)
     #[cfg(feature = "selftest")]
     selftest::run();

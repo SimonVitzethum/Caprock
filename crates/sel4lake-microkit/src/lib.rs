@@ -25,7 +25,10 @@ use sel4lake_mem::Rights;
 use sel4lake_sched::{SchedOps, ThreadId};
 use sel4lake_sync::{RwSpinLock, SpinLock};
 
-const NPDS: usize = 256; // PD-Pool großzügig (war 96): viele gleichzeitig geladene PDs (load/adversarial)
+/// Größe des PD-Pools. **Öffentlich seit A-3.4**: wie viele Cap-Slots das System vorhalten muss,
+/// folgt aus `NPDS * CAP_BUDGET_PER_PD` — diese Rechnung gehört an *eine* Stelle
+/// ([`CAP_SLOTS_FOR_ALL_PDS`]) und nicht als abgeschriebene Zahl in den Boot-Code.
+pub const NPDS: usize = 256; // PD-Pool großzügig (war 96): viele gleichzeitig geladene PDs (load/adversarial)
 /// Cap-Slots je PD-Cspace (Adressraum der lokalen Slot-Indizes).
 const NCAPS: usize = 16;
 
@@ -42,6 +45,19 @@ const NCAPS: usize = 16;
 /// bleibt selbst bei vielen gleichzeitig geladenen PDs Tabellenkapazität für alle übrig.
 /// Überschreitung wird **abgewiesen** (kein Eintrag, keine Ableitung), nie still verworfen.
 pub const CAP_BUDGET_PER_PD: usize = 8;
+
+/// **Wie viele globale Cap-Slots die Summe aller PD-Budgets braucht** (A-3.4).
+///
+/// Der Kommentar an [`CAP_BUDGET_PER_PD`] sagt, das Budget verhindere einen Cross-PD-DoS über die
+/// geteilte Tabelle. Nachgerechnet stimmte das nicht: 256 × 8 = 2048 Slots Bedarf standen gegen
+/// **256** vorhandene. Das Budget deckelte den Verbrauch **einer** PD, die Summe prüfte niemand —
+/// 32 PDs mit vollem Budget füllten die Tabelle, die 33. bekam nichts. Die Zusage war also eine
+/// Annahme über das Verhalten der PDs, keine Eigenschaft des Systems.
+///
+/// Seit A-3.4 dimensioniert der Kernel die Tabelle **hiernach**. Damit ist die Aussage „jede PD
+/// bekommt ihr Budget" eine Eigenschaft des Aufbaus. Der Weg dahin war ausdrücklich *nicht*, die
+/// PD-Zahl auf 32 zu senken: das hätte dieselbe Zusage gerettet, indem es das System kleiner macht.
+pub const CAP_SLOTS_FOR_ALL_PDS: usize = NPDS * CAP_BUDGET_PER_PD;
 
 /// **Sicherheitsdomäne** einer Protection Domain (ext-22).
 ///

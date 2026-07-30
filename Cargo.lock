@@ -151,6 +151,7 @@ name = "sel4lake-cap"
 version = "0.0.1"
 dependencies = [
  "sel4lake-mem",
+ "sel4lake-slab",
 ]
 
 [[package]]

@@ -737,6 +737,96 @@ pub fn configure(cores: usize) -> (usize, usize, usize, u64) {
     (cores, total, per_core, bytes)
 }
 
+/// **Slot-Kapazität des globalen Capability-Space** (A-3.4).
+///
+/// Die Summe aller PD-Budgets plus eine Reserve für die Caps, die der **Kernel selbst** hält
+/// (Wurzel-Caps auf Speicherregionen, Endpoints/Notifications der Bringup-Kanäle, Loader-Cap des
+/// Root-Task, DMA-/MMIO-/IRQ-Caps der Treiber). Die Reserve steht neben der Summe und nicht in ihr:
+/// eine PD, die ihr Budget ausschöpft, soll dem Kernel keinen Slot wegnehmen können.
+const CAP_SLOTS: usize = sel4lake_microkit::CAP_SLOTS_FOR_ALL_PDS + 256;
+
+/// **Objekt-Kapazität** — genauso viele wie Slots.
+///
+/// Bis A-3.4 stand das Verhältnis auf 2:1 (256 Slots / 128 Objekte), aus der Beobachtung heraus,
+/// dass viele Caps Ableitungen auf dasselbe Objekt sind. Als Zusage taugt das nicht: `install`
+/// erzeugt Slot **und** Objekt, ein System aus lauter Wurzel-Caps braucht also so viele Objekte wie
+/// Slots. Mit 2:1 wäre „jede PD bekommt ihr Budget" an der Objekttabelle gescheitert statt an der
+/// Slot-Tabelle — dieselbe Lücke, eine Ebene tiefer.
+const CAP_OBJECTS: usize = CAP_SLOTS;
+
+/// **Capability-Tabellen zur Boot-Zeit anlegen** (A-3.4, Teil 2) — Slot- und Objekttabelle des
+/// globalen `CapSpace`, dazu der Finalisierungspuffer und die Zählfläche des CDT-Audits.
+///
+/// **Muss vor der ersten Cap-Installation laufen**, also vor `selftest::run()` und vor allem, was
+/// Speicher als Cap ausgibt. Vorher hat der Space Kapazität 0 und jede Installation scheitert mit
+/// `NoSlot` — ein vergessener Aufruf fällt damit als sauberer Fehler auf, nicht als Fehlzugriff.
+///
+/// Der Finalisierungspuffer kommt hier aus **derselben Quelle** wie die Tabellen — genau das hatte
+/// A-3.3 vorbereitet, als es die Arrays aus `Finalized` in geliehene Slices verwandelte: die
+/// Objekttabelle wachsen zu lassen, ohne den Kernelstack jedes Threads mitwachsen zu lassen.
+///
+/// Gibt die belegten Bytes zurück (Boot-Report).
+pub fn configure_caps() -> u64 {
+    let mut bytes = 0u64;
+    // Wie in `configure`: der Speicher gehört ab hier dauerhaft dem Kernel (die MemoryCap wird
+    // bewusst fallen gelassen — Kerneltabellen leben bis zum Reboot).
+    let mut table = |size: usize, align: usize| -> *mut u8 {
+        let cap = mem_alloc(size as u64, align as u64).expect("Cap-Tabelle: RAM erschoepft");
+        bytes += cap.len();
+        cap.base() as *mut u8
+    };
+
+    let slots_mem = table(
+        CAP_SLOTS * core::mem::size_of::<sel4lake_cap::CapSlot>(),
+        core::mem::align_of::<sel4lake_cap::CapSlot>().max(4096),
+    );
+    let objs_mem = table(
+        CAP_OBJECTS * core::mem::size_of::<sel4lake_cap::Object>(),
+        core::mem::align_of::<sel4lake_cap::Object>().max(4096),
+    );
+    let mut slots: Slab<sel4lake_cap::CapSlot> = Slab::empty();
+    let mut objects: Slab<sel4lake_cap::Object> = Slab::empty();
+    // SAFETY: frisch allozierter, exklusiver, korrekt ausgerichteter Speicher der geforderten
+    // Größe, der bis zum Reboot lebt; einmaliger Aufruf beim Boot vor jeder Cap-Operation.
+    unsafe {
+        slots.attach(
+            slots_mem as *mut sel4lake_cap::CapSlot,
+            CAP_SLOTS,
+            |_| sel4lake_cap::CapSlot::EMPTY,
+        );
+        objects.attach(
+            objs_mem as *mut sel4lake_cap::Object,
+            CAP_OBJECTS,
+            |_| sel4lake_cap::Object::EMPTY,
+        );
+    }
+    CAPS.write().cspace.attach(slots, objects);
+
+    // Finalisierungspuffer + Enforcer-Kratzflächen: je ein Eintrag pro Objekt, denn mehr Objekte
+    // als die Tabelle fasst kann eine einzelne `delete`/`revoke`-Operation nicht finalisieren.
+    let n = CAP_OBJECTS;
+    let items = table(n * core::mem::size_of::<(u32, u64)>(), 4096);
+    let dma = table(n * core::mem::size_of::<(u64, u64)>(), 4096);
+    let ok = table(n, 4096);
+    let ctx = table(n * core::mem::size_of::<usize>(), 4096);
+    {
+        let mut b = FINALIZE.lock();
+        // SAFETY: wie oben; jede Tabelle bekommt ihren **eigenen** Block (exklusiv).
+        unsafe {
+            b.items.attach(items as *mut (u32, u64), n, |_| (0, 0));
+            b.dma.attach(dma as *mut (u64, u64), n, |_| (0, 0));
+            b.ok.attach(ok as *mut bool, n, |_| false);
+            b.ctx_of.attach(ctx as *mut usize, n, |_| usize::MAX);
+        }
+    }
+
+    let refs = table(n * core::mem::size_of::<u32>(), 4096);
+    // SAFETY: wie oben.
+    unsafe { CAP_AUDIT.lock().attach(refs as *mut u32, n, |_| 0u32) };
+
+    bytes
+}
+
 /// Boot-Kontext des aufrufenden Kerns als Idle-Thread registrieren (vor IRQs).
 pub fn init_core() {
     let core = hal::cpu::core_id();
@@ -830,7 +920,11 @@ pub fn cap_used_objects() -> usize {
 /// falschen Refcounts, keine toten CDT-Knoten, keine Ableitung auf fremde Objekte,
 /// Baumform.
 pub fn cap_audit_cdt() -> u32 {
-    CAPS.read().cspace.audit_cdt()
+    // Sperrordnung: CAP_AUDIT vor CAPS (s. dort). Code 8 = die Zählfläche war kürzer als die
+    // Objekttabelle; dann konnte das Audit nicht laufen und meldet das, statt „konsistent" zu
+    // sagen.
+    let mut scratch = CAP_AUDIT.lock();
+    CAPS.read().cspace.audit_cdt(scratch.as_mut_slice())
 }
 
 pub fn cap_install(cap: MemoryCap) -> Result<CapPtr, CapError> {
@@ -862,14 +956,14 @@ pub fn cap_inspect(ptr: CapPtr) -> Option<CapInfo> {
 /// denken muss.
 struct FinalizeBuf {
     /// `(ep, caller)`-Paare abzubrechender Calls.
-    items: [(u32, u64); sel4lake_cap::MAX_FINALIZED],
+    items: Slab<(u32, u64)>,
     /// Finalisierte DMA-Regionen `(phys, len)`.
-    dma: [(u64, u64); sel4lake_cap::MAX_FINALIZED],
+    dma: Slab<(u64, u64)>,
     /// Ergebnis je Region aus `dma_enforcer().finalize` — abgebaut ja/nein.
-    ok: [bool; sel4lake_cap::MAX_FINALIZED],
+    ok: Slab<bool>,
     /// Kratzfläche der Enforcer: je Region der Index des betroffenen Übersetzungskontexts.
     /// Lag bis A-3.3 in **jeder** `finalize`-Implementierung nochmals auf dem Stack.
-    ctx_of: [usize; sel4lake_cap::MAX_FINALIZED],
+    ctx_of: Slab<usize>,
 }
 
 /// **Sperrordnung: `FINALIZE` ist die äußerste.** Sie wird vor `CAPS` genommen und erst nach
@@ -882,11 +976,23 @@ struct FinalizeBuf {
 /// tatsächlich ändert: die beiden Operationen serialisieren jetzt auch gegeneinander — was sie
 /// über `CAPS.write()` bereits taten.
 static FINALIZE: SpinLock<FinalizeBuf> = SpinLock::new(FinalizeBuf {
-    items: [(0, 0); sel4lake_cap::MAX_FINALIZED],
-    dma: [(0, 0); sel4lake_cap::MAX_FINALIZED],
-    ok: [false; sel4lake_cap::MAX_FINALIZED],
-    ctx_of: [usize::MAX; sel4lake_cap::MAX_FINALIZED],
+    items: Slab::empty(),
+    dma: Slab::empty(),
+    ok: Slab::empty(),
+    ctx_of: Slab::empty(),
 });
+
+/// **Zählfläche des CDT-Audits** (A-3.4) — ein `u32` je Objekt-Eintrag.
+///
+/// Lag bis hierher als `[0u32; NOBJECTS]` auf dem Stack von `audit_cdt`. Mit einer
+/// boot-dimensionierten Objekttabelle geht das nicht mehr: die Größe steht erst zur Laufzeit fest,
+/// und ein mitwachsendes Stack-Array wäre genau die Kopplung, die A-3.3 für den
+/// Finalisierungspuffer aufgelöst hat.
+///
+/// **Sperrordnung wie bei [`FINALIZE`]:** wird *vor* `CAPS` genommen. Das führt keine neue
+/// Verklemmungsklasse ein — `CAP_AUDIT` nimmt ausschliesslich [`cap_audit_cdt`], und die nimmt
+/// unmittelbar danach `CAPS.read()`.
+static CAP_AUDIT: SpinLock<Slab<u32>> = SpinLock::new(Slab::empty());
 
 /// Wie oft eine Finalisierungsmeldung mangels Kapazität verworfen wurde. **Muss 0 bleiben.**
 static FINALIZE_OVERFLOW: AtomicU32 = AtomicU32::new(0);
@@ -911,7 +1017,7 @@ fn note_finalize_overflow(rf: &sel4lake_cap::Finalized<'_>) {
         FINALIZE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
         println!(
             "cap     : FAILURES Finalisierungspuffer uebergelaufen (Kapazitaet {}) -- Meldungen verworfen: blockierte CALL-Aufrufer bleiben stehen",
-            sel4lake_cap::MAX_FINALIZED
+            CAPS.read().cspace.finalize_capacity()
         );
     }
 }
@@ -922,28 +1028,28 @@ pub fn cap_delete(ptr: CapPtr) -> Result<(), CapError> {
     // Freigeben von CAPS/MEM, da das Entblocken EPS<SCHEDS sperrt -> CAPS < EPS).
     let mut buf = FINALIZE.lock();
     let b = &mut *buf;
-    let mut rf = sel4lake_cap::Finalized::new(&mut b.items, &mut b.dma);
+    let mut rf = sel4lake_cap::Finalized::new(b.items.as_mut_slice(), b.dma.as_mut_slice());
     let r = {
         let mut caps = CAPS.write();
         let mut mem = MEM.lock();
         caps.cspace.delete(&mut mem, ptr, &mut rf)
     };
     abort_finalized_replies(&rf);
-    dma_finalize(&rf, &mut b.ok, &mut b.ctx_of);
+    dma_finalize(&rf, b.ok.as_mut_slice(), b.ctx_of.as_mut_slice());
     note_finalize_overflow(&rf);
     r
 }
 pub fn cap_revoke(ptr: CapPtr) -> Result<(), CapError> {
     let mut buf = FINALIZE.lock();
     let b = &mut *buf;
-    let mut rf = sel4lake_cap::Finalized::new(&mut b.items, &mut b.dma);
+    let mut rf = sel4lake_cap::Finalized::new(b.items.as_mut_slice(), b.dma.as_mut_slice());
     let r = {
         let mut caps = CAPS.write();
         let mut mem = MEM.lock();
         caps.cspace.revoke(&mut mem, ptr, &mut rf)
     };
     abort_finalized_replies(&rf);
-    dma_finalize(&rf, &mut b.ok, &mut b.ctx_of);
+    dma_finalize(&rf, b.ok.as_mut_slice(), b.ctx_of.as_mut_slice());
     note_finalize_overflow(&rf);
     r
 }
@@ -1382,6 +1488,11 @@ fn create_vspace_masked(mask: Option<sel4lake_mem::ColorMask>) -> Option<(u16, u
 /// Der Endstand (`used_slots`) sagt ueber Erschoepfung nichts: ein Lauf, der zwischendurch an die
 /// Grenze stiess und danach aufraeumte, sieht hinterher harmlos aus. Die Fairness-Zusage des
 /// Cap-Budgets haengt aber am GLEICHZEITIGEN Verbrauch.
+/// Kapazität `(Slots, Objekte)` des globalen Capability-Space (Boot-Report/Tests).
+pub fn cap_capacity() -> (usize, usize) {
+    CAPS.read().cspace.capacity()
+}
+
 pub fn cap_peaks() -> (usize, usize, usize, usize) {
     let g = CAPS.read();
     let (ps, cs) = g.cspace.peak_slots();
@@ -5034,7 +5145,7 @@ pub fn ipc_audit() -> u32 {
         }
     }
     // CDT-/Refcount-Property (Cap-Churn-Events des IPC-Fuzzers laufen während IPC).
-    let cdt = CAPS.read().cspace.audit_cdt();
+    let cdt = cap_audit_cdt();
     if cdt != 0 {
         return 20 + cdt;
     }

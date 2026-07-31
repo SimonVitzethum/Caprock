@@ -142,7 +142,14 @@ wird. Alles andere liegt außerhalb.
       heisst, ein in `CALL` blockierter Aufrufer wird nie entblockt, und das sieht man hinterher
       an nichts mehr). Und die Schranke stand doppelt (`MAX_FINALIZE` im Kernel „dieselbe Schranke
       wie in der Cap-Crate") — eine Kopie, die beim Wachsen still auseinanderläuft.
-- [ ] **A-3.4 Cap-/PD-/Endpoint-/Notification-Tabellen dynamisch.** Solange die Cap-Tabelle global
+- [x] **A-3.4 erledigt (2026-07-30/31), in vier Teilen + Abschluss.** Threads als Zusage
+      (`TARGET_THREADS = 10_000`, vorher `cores * 256` — eine Eigenschaft des Testaufbaus);
+      `CapSpace`, `PdTable`, Endpoints und Notifications aus dem Boot-RAM statt `.bss`
+      (`Slab`-Muster aus ext-30). Gemessen: 80256 Slots/Objekte, 10000 PDs, 10064 Endpoints,
+      10000 Thread-Slots, zusammen rund 42 MiB. **Der Fund, der A-3.4 begruendete, ist
+      geschlossen:** `CAP_BUDGET_PER_PD` deckelte den Einzelverbrauch, die **Summe** prüfte
+      niemand — 256 Slots gegen 2048 zugesagte, 32 PDs füllten die Tabelle. Jetzt wird die Summe
+      geprüft (`d1f5ed8`). *(Alter Text:)* **A-3.4 Cap-/PD-/Endpoint-/Notification-Tabellen dynamisch.** Solange die Cap-Tabelle global
       und fest ist, bestimmt ein Tenant die Dichte aller anderen. **(Berührt Strang B:** die
       Streifenbuchhaltung aus A1 zählt PDs; wächst die PD-Zahl dynamisch, muss die
       Streifen-Freiliste das mitmachen.)
@@ -169,10 +176,26 @@ Für einen Betriebsanspruch fehlen drei Dinge.
       **Derselbe Begriff trägt später [Z4a](todo.md#z4-checkpointrestore-eines-threads)
       (Thread einfrieren).** Einmal bauen, zweimal benutzen — und deshalb hier gleich allgemein
       genug entwerfen.
-- [ ] **A-4.3 Zustandsübergabe.** Die neue Fassung braucht den Zustand der alten. Entweder eine
-      Region, die den Austausch überlebt (dann ist ihr Format eine ABI und muss versioniert
-      werden), oder ein ausdrückliches Übergabeprotokoll. Ohne Festlegung ist Hot-Reload ein
-      Neustart mit Datenverlust, der anders heißt.
+- [x] **A-4.3 erledigt (2026-07-31).** Gewählt ist die **Region, die den Austausch überlebt** —
+      und damit ist ihr Format eine ABI, also mit **versioniertem Kopf** (`state.rs` in
+      `sel4lake-region`). Der Kopf trägt `state_version`, `program_id` und einen
+      Übernahmezähler. **Der Punkt, an dem die Sache hängt:** eine abweichende Version wird
+      ABGEWIESEN, statt die Bytes der alten Fassung im eigenen Sinn zu lesen. Das ist der
+      Unterschied zwischen Datenverlust (merkt man) und fehlinterpretiertem Zustand (merkt man
+      nicht). Ebenso weist eine fremde `program_id` ab; eine frische Region meldet `NoState`
+      statt „Version 0", weil „noch keiner" und „der nullte" verschiedene Lagen sind. Der
+      Übernahmezähler zählt nur bei tatsächlicher Übernahme, nicht bei Abweisungen — sonst
+      belegte er das Gegenteil dessen, was er behauptet.
+      **Belegt in zwei Stufen:** die Torlogik auf x86 (`state : ALL PASS`), der Ernstfall auf
+      aarch64 (`ckpt : ALL PASS`): v1 rechnet `+1` und hinterlässt `[1, 2, 3]`, nach dem Reload
+      rechnet v2 mit `+10` weiter und kommt auf `[13, 23]` — also auf den ÜBERNOMMENEN Werten,
+      nicht auf frisch initialisierten, Übernahmegeneration 1. Der Ernstfall läuft nicht auf
+      x86, weil er an der arch-neutralen Thread-Demo hängt, die dort nicht startet; im x86-Skript
+      steht das als Anmerkung, damit ein grünes `state` nicht mehr verspricht, als es prüft.
+      *(Alter Text:)* **A-4.3 Zustandsübergabe.** Die neue Fassung braucht den Zustand der alten.
+      Entweder eine Region, die den Austausch überlebt (dann ist ihr Format eine ABI und muss
+      versioniert werden), oder ein ausdrückliches Übergabeprotokoll. Ohne Festlegung ist
+      Hot-Reload ein Neustart mit Datenverlust, der anders heißt.
 - [x] **A-4.4 erledigt (2026-07-30), mit einer benannten Grenze.** Versionssperre im Lader:
       `iface_gate` hält beim ersten Laden einer `program_id` ihre `iface_version` fest und weist
       jeden weiteren Ladevorgang mit abweichender Version ab (`IfaceVersionChanged`). Verglichen

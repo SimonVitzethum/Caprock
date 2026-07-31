@@ -283,6 +283,9 @@ fn spawn_demo() -> bool {
         QUIESCE_OK.store(system::run_quiesce(), Ordering::Release);
         // A-4.1: atomares Umbinden -- alle Ausgaenge, ebenfalls auf einem lokalen Objekt.
         REBIND_OK.store(system::run_rebind(), Ordering::Release);
+        // A-4.3: die Zustandsuebergabe, alle Ausgaenge. Auf einer EIGENEN Scratch-Region -- der
+        // Test darf den Zustand, dessen Ueberleben `ckpt` belegt, nicht selbst anfassen.
+        STATE_OK.store(system::run_state(), Ordering::Release);
     }
 
     // Cap-gesichertes IPC: ein Endpoint, zwei PDs. Der Server hält die RECV-, der Client die
@@ -345,6 +348,10 @@ static QUIESCE_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 #[cfg(feature = "selftest")]
 static REBIND_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+/// A-4.3: weist die Zustandsuebergabe ein fremdes Layout ab, statt es fehlzuinterpretieren?
+#[cfg(feature = "selftest")]
+static STATE_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Der akkumulierte Badge der Root-Notification (`0`, wenn keine endowt wurde).
 #[cfg(feature = "selftest")]
 fn root_badge() -> u64 {
@@ -406,6 +413,9 @@ fn all_done(archive: bool) -> bool {
     // A-4.1 aus demselben Grund: eine Zusicherung, die nur im Bericht steht, faellt beim
     // Brechen niemandem auf.
     let rebind = REBIND_OK.load(Ordering::Acquire);
+    // A-4.3 aus demselben Grund: eine Zusicherung, die nur im Bericht steht, faellt beim Brechen
+    // niemandem auf.
+    let state = STATE_OK.load(Ordering::Acquire);
     workers
         && IPC_DONE.load(Ordering::Acquire)
         && cores
@@ -416,6 +426,7 @@ fn all_done(archive: bool) -> bool {
         && iface
         && quiesce
         && rebind
+        && state
 }
 
 /// Bericht + Abschaltung (das Testskript wertet die Marker aus).

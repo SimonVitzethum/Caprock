@@ -214,6 +214,10 @@ fi
 check "iface   : ALL PASS" "A-4.4: die Versionssperre des Laders weist eine GEAENDERTE Schnittstellenversion ab und laesst die gleiche durch -- beide Ausgaenge belegt; eine andere program_id bleibt unberuehrt"
 check "quiesce : ALL PASS" "A-4.2: der ruhende Punkt -- ein stillgelegter Endpoint weist NEUE Transaktionen ab (ERR_QUIESCING, nicht ERR_BADCAP: 'kommt gleich wieder' ist fuer den Client eine andere Lage als 'gibt es nicht'), laufende duerfen abschliessen; ein ZWEITER Austausch am selben Endpoint wird abgewiesen"
 check "rebind  : ALL PASS" "A-4.1: atomares Umbinden -- Pruefung und Tausch unter EINEM Lock; OHNE Stilllegung wird abgewiesen (der Befund waere sonst eine Momentaufnahme), ein fremder Empfaenger blockiert, und im ueberlappenden Fall hat der Endpoint zu KEINEM Zeitpunkt null Empfaenger"
+check "state   : ALL PASS" "A-4.3: Zustandsuebergabe ueber eine Region mit VERSIONIERTEM Kopf -- ein abweichendes state_version-Layout und eine fremde program_id werden ABGEWIESEN, statt die Bytes der alten Fassung im eigenen Sinn zu lesen (das waere kein Datenverlust, sondern ein fehlinterpretierter Zustand); eine frische Region meldet NoState statt 'Version 0'; der Uebernahmezaehler zaehlt weiter und wird von Abweisungen nicht erhoeht"
+# Anmerkung: der ERNSTFALL (v2 uebernimmt den Zaehler von v1, Marker `ckpt`) laeuft NICHT auf x86 --
+# der zustandsbehaftete Hot-Reload haengt an der arch-neutralen Thread-Demo, die hier nicht startet.
+# Er wird von test-qemu.sh (aarch64) geprueft. Auf x86 belegt `state` die Torlogik, nicht den Lauf.
 check "stripe  : ALL PASS" "B-4.2: erschoepfte Farbpartitionierung scheitert SAUBER -- der 5. Streifenversuch wird abgewiesen, statt den Satz der ersten PD still ein zweites Mal auszugeben; nach Freigabe wieder vergebbar (kein Leck)"
 check "audit   : ALL PASS"            "Stufe 4: Scheduler- + CDT-Audit sauber"
 # B-1.5: die erwartete Abwesenheit AUSSPRECHEN, statt sie durchlaufen zu lassen.

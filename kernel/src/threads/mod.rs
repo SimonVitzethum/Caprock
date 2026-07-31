@@ -1486,6 +1486,11 @@ static CS_R2: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2]; // v2: 13,23 (Z
 static CS_BATCH1_DONE: AtomicBool = AtomicBool::new(false);
 static CS_RELOADED: AtomicBool = AtomicBool::new(false);
 static CS_DONE: AtomicBool = AtomicBool::new(false);
+// A-4.3: wievielte Uebernahme des Zustands die neue Fassung war. 0 heisst: v2 hat den Zustand
+// nie uebernommen -- entweder weil es die Uebernahme nicht versucht hat oder weil sie abgewiesen
+// wurde. Ohne diesen Zaehler waere "der Zustand hat den Tausch ueberlebt" von "v2 hat zufaellig
+// dieselben Zahlen erzeugt" nicht zu unterscheiden.
+static CS_GENERATION: AtomicU64 = AtomicU64::new(0);
 static CS_RELOAD_INFO: SpinLock<Option<ReloadInfo>> = SpinLock::new(None);
 static R1: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static R2: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -2815,8 +2820,25 @@ extern "C" fn counter_v1(_arg: usize) -> ! {
 }
 
 /// Zähler-Service v2 (neu geladen): addiert 10 — setzt den Zustand von v1 fort.
+///
+/// **A-4.3:** v2 *übernimmt* den Zustand, statt ihn vorauszusetzen. Die Übernahme prüft den
+/// versionierten Kopf der Region; passt das Layout nicht, bedient v2 **nicht** — die Alternative
+/// wäre, die Bytes der alten Fassung im eigenen Sinn zu lesen, und das ist kein Datenverlust,
+/// sondern ein fehlinterpretierter Zustand. Der schweigt.
 extern "C" fn counter_v2(_arg: usize) -> ! {
-    counter_serve(10)
+    match system::hotreload_state_attach(system::CS_PROGRAM_ID, system::CS_STATE_VERSION) {
+        Ok(h) => {
+            CS_GENERATION.store(h.generation as u64, Ordering::Release);
+            counter_serve(10)
+        }
+        Err(_) => {
+            // Nicht bedienen. Der Client laeuft dann in die leere Antwort und `ckpt` faellt
+            // durch -- lauter, als still mit falschem Zustand weiterzuzaehlen.
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+    }
 }
 
 /// Zähler-Service: liest/schreibt den Zustand über die **sichere** RegionView-API
@@ -5158,10 +5180,15 @@ fn report() {
         CS_R2[0].load(Ordering::Relaxed),
         CS_R2[1].load(Ordering::Relaxed),
     ];
-    println!("ckpt    : v1(+1)={r1:?} -> Reload -> v2(+10)={r2:?}");
-    let ckpt_ok = r1 == [1, 2, 3] && r2 == [13, 23];
+    // A-4.3: die Uebernahme selbst. `gen == 1` heisst: v2 hat den Zustand ueber den versionierten
+    // Kopf UEBERNOMMEN. Ohne diese Zahl belegen [13, 23] nur, dass v2 dieselben Werte erzeugt hat
+    // -- nicht, dass es sie geerbt hat.
+    let gen = CS_GENERATION.load(Ordering::Acquire);
+    println!("ckpt    : v1(+1)={r1:?} -> Reload -> v2(+10)={r2:?} (Uebernahme Generation {gen})");
+    let ckpt_ok = r1 == [1, 2, 3] && r2 == [13, 23] && gen == 1;
     println!(
-        "ckpt    : {} (Zustand ueber Komponententausch erhalten)",
+        "ckpt    : {} (Zustand ueber Komponententausch erhalten -- und nachweislich UEBERNOMMEN, \
+         nicht neu erzeugt)",
         if ckpt_ok { "ALL PASS" } else { "FAILURES" }
     );
 

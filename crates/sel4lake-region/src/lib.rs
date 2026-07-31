@@ -22,6 +22,7 @@
 extern crate alloc;
 
 pub mod heap;
+pub mod state;
 
 use core::marker::PhantomData;
 use sel4lake_mem::MemoryCap;

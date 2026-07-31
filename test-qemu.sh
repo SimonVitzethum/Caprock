@@ -133,7 +133,7 @@ check "xfer    : ALL PASS" "Capability-Transfer in IPC (Broker delegiert Service
 check "grantlk : ALL PASS" "Grant-Leak-Regression (ext-29): 65 Grants in denselben Empfangs-Slot -> verdraengte Cap wird freigegeben, genau 1 lebende Ableitung, kein Leck in der geteilten Cap-Tabelle (Cross-PD-DoS)"
 check "ipc     : ALL PASS" "Cap-gesicherte IPC (Server v1, PD<->PD)"
 check "reload  : ALL PASS" "Hot-Reload (Server v2 ersetzt v1, gleicher Endpoint, kein Reboot)"
-check "ckpt    : ALL PASS" "Stateful Hot-Reload (Zustand bleibt über v1->v2 erhalten)"
+check "ckpt    : ALL PASS" "A-4.3 im Ernstfall: Stateful Hot-Reload -- v2 hat den Zaehler von v1 nachweislich UEBERNOMMEN (Uebernahmezaehler auf 1, gegen den versionierten Kopf der Zustandsregion geprueft), nicht bloss dieselben Werte erzeugt"
 check "el0     : ALL PASS" "EL0-Userland (echter User-Thread ruft per Syscall)"
 check "el0iso  : ALL PASS" "EL0-Isolation (Kernel-Zugriff faultet, Thread beendet, Kernel überlebt)"
 check "scale   : ALL PASS" "Skalierung (ext-30): 1024 Threads GLEICHZEITIG (Kapazitaet zur Boot-Zeit aus dem RAM statt .bss-Konstante), alle auffindbar, danach vollstaendig abgebaut -> Slots + RAM zurueck auf Baseline"

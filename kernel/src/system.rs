@@ -21,7 +21,7 @@ use sel4lake_ipc::{Endpoint, Notification, Quiescence, Rebind};
 use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
 use sel4lake_microkit::{Caps, Domain};
 use sel4lake_region::heap::RegionSource;
-use sel4lake_region::{Purpose, Region, RegionTag};
+use sel4lake_region::{state, Purpose, Region, RegionTag};
 use sel4lake_loader::elf::{ElfImage, PF_W, PF_X};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::addr::{DmaRegion, Iova, Pa};
@@ -4660,29 +4660,78 @@ impl RegionSource for KernelRegionSource {
 // überlebt den Tausch — genau die Hot-Reload-Invariante). Siehe ADR 0010.
 static CS_STATE_REGION: SpinLock<Option<Region>> = SpinLock::new(None);
 
-/// Die Hot-Reload-Zustandsregion (genullt) anlegen + global halten. Gibt die Phys-Basis zurück
-/// (nur Telemetrie; der Zugriff läuft über [`hotreload_state_get`]/[`hotreload_state_set`]).
+/// `program_id` des Zähler-Service (Hot-Reload-Testkomponente). Der Zustand gehört einem
+/// **Programm**, nicht einer Instanz — genau deshalb überlebt er den Instanztausch.
+pub const CS_PROGRAM_ID: u32 = 0xA43_0001;
+/// Layout-Version der Zähler-Nutzlast: ein `u64` an Nutzlast-Offset 0.
+///
+/// Bewusst **getrennt** von der `iface_version` aus A-4.4: die eine beschreibt, was über den
+/// Endpoint geht, die andere, was im Speicher liegt. v1 (+1) und v2 (+10) unterscheiden sich im
+/// Verhalten, nicht im Zustandslayout — sie tragen dieselbe `STATE_VERSION`, und genau deshalb
+/// darf v2 den Zähler von v1 fortsetzen.
+pub const CS_STATE_VERSION: u32 = 1;
+/// Nutzlastlänge des Zähler-Zustands (ein `u64`).
+const CS_PAYLOAD_LEN: u32 = 8;
+
+/// Die Hot-Reload-Zustandsregion anlegen: Kopf schreiben (A-4.3), Nutzlast nullen. Gibt die
+/// Phys-Basis zurück (nur Telemetrie; der Zugriff läuft über [`hotreload_state_get`]/
+/// [`hotreload_state_set`], die Übernahme über [`hotreload_state_attach`]).
 pub fn hotreload_state_alloc() -> Option<u64> {
-    let region = KernelRegionSource.request(4096, Purpose::HotReloadState)?;
+    let mut region = KernelRegionSource.request(4096, Purpose::HotReloadState)?;
     let phys = region.phys();
-    *CS_STATE_REGION.lock() = Some(region); // Lock-Guard fällt am `;` -> set() unten re-lockt sauber
-    hotreload_state_set(0); // Zähler initialisieren (carve liefert nicht garantiert genullt)
+    // `init` nullt die Nutzlast selbst — `carve` liefert nicht garantiert genullten Speicher, und
+    // ein Zustand aus Resten einer fremden Allokation ist von einem echten nicht zu unterscheiden.
+    state::init(
+        &mut region.view(),
+        CS_PROGRAM_ID,
+        CS_STATE_VERSION,
+        CS_PAYLOAD_LEN,
+    )
+    .ok()?;
+    *CS_STATE_REGION.lock() = Some(region);
     Some(phys)
 }
 
-/// Das erste `u64`-Wort der Hot-Reload-Zustandsregion über die **sichere** RegionView-API lesen.
+/// Den Zustand **übernehmen** (A-4.3): der Kopf muss zu `program_id`/`state_version` passen, sonst
+/// gibt es kein `Ok` — und damit keinen stillschweigend fehlinterpretierten Zustand. Erhöht bei
+/// Erfolg den Übernahmezähler, macht die Übernahme also im Speicher sichtbar.
+///
+/// `NoState` heisst **Kaltstart**, nicht Fehler: der Aufrufer legt dann an, statt abzubrechen.
+pub fn hotreload_state_attach(
+    program_id: u32,
+    state_version: u32,
+) -> Result<state::Handover, state::StateError> {
+    let mut guard = CS_STATE_REGION.lock();
+    let Some(r) = guard.as_mut() else {
+        return Err(state::StateError::NoState);
+    };
+    state::attach(&mut r.view(), program_id, state_version)
+}
+
+/// Die Übernahmezahl lesen, ohne zu übernehmen (Telemetrie/Selbsttest). `None`, wenn dort kein
+/// gültiger Kopf steht.
+pub fn hotreload_state_generation() -> Option<u32> {
+    let mut guard = CS_STATE_REGION.lock();
+    let r = guard.as_mut()?;
+    state::generation(&r.view())
+}
+
+/// Das Zähler-Wort aus der **Nutzlast** der Hot-Reload-Region lesen (sichere RegionView-API).
+/// Liegt hinter dem Kopf — ein Schreibfehler hier kann die Versionsangabe nicht überschreiben.
 pub fn hotreload_state_get() -> u64 {
     CS_STATE_REGION
         .lock()
         .as_mut()
-        .and_then(|r| r.view().get::<u64>(0))
+        .and_then(|r| state::payload(&mut r.view()).and_then(|p| p.get::<u64>(0)))
         .unwrap_or(0)
 }
 
-/// Das erste `u64`-Wort der Hot-Reload-Zustandsregion über die **sichere** RegionView-API schreiben.
+/// Das Zähler-Wort in die **Nutzlast** der Hot-Reload-Region schreiben (sichere RegionView-API).
 pub fn hotreload_state_set(val: u64) {
     if let Some(r) = CS_STATE_REGION.lock().as_mut() {
-        r.view().set::<u64>(0, val);
+        if let Some(mut p) = state::payload(&mut r.view()) {
+            p.set::<u64>(0, val);
+        }
     }
 }
 
@@ -5445,6 +5494,128 @@ pub fn run_rebind() -> bool {
     println!(
         "rebind  : {} (A-4.1: Pruefung und Tausch unter EINEM Lock -- zwischen 'alter Server weg' \
          und 'neuer empfangsbereit' liegt kein Zustand ohne Empfaenger)",
+        if ok { "ALL PASS" } else { "FAILURES" }
+    );
+    ok
+}
+
+/// **A-4.3-Selbsttest: die Zustandsübergabe, alle Ausgänge.**
+///
+/// Läuft auf einer **eigenen** Scratch-Region, nicht auf der echten Zustandsregion des
+/// Zähler-Service: der Test darf den Zustand, dessen Überleben er belegen soll, nicht selbst
+/// anfassen. Er gibt die Region am Ende zurück.
+///
+/// Geprüft wird dieselbe Torlogik ([`state::attach`]), die der Reload-Pfad ausführt. Über den
+/// regulären Pfad sind die Abweisungszweige heute **nicht** erreichbar — pro Boot gibt es genau
+/// eine Fassung des Zustandslayouts, jede Übernahme liest also dieselbe Version. Erreichbar
+/// werden sie erst, wenn ein Austausch zur Laufzeit ein anderes Layout mitbringt. Damit sie bis
+/// dahin nicht ungeprüft bleiben (ungeprüft heisst: vermutlich kaputt, wenn sie zum ersten Mal
+/// gebraucht werden), füttert der Selbsttest sie direkt — dieselbe Begründung wie bei
+/// `iface_record_or_check` (A-4.4).
+pub fn run_state() -> bool {
+    const PROG: u32 = 0xA43_00FF;
+    const VER: u32 = 7;
+    const LEN: u32 = 16;
+
+    let Some(mut region) = KernelRegionSource.request(4096, Purpose::HotReloadState) else {
+        println!("state   : FAILURES (keine Scratch-Region)");
+        return false;
+    };
+
+    // Vor `init` liegt dort kein Kopf: eine frische Region ist ein Kaltstart, kein Zustand der
+    // Version 0. Der Allokator liefert nicht garantiert genullten Speicher -- deshalb erst nullen
+    // und dann pruefen, sonst prueft dieser Fall den Zufall.
+    region.view().fill(0);
+    let vorher_kein_zustand =
+        state::attach(&mut region.view(), PROG, VER) == Err(state::StateError::NoState);
+
+    let angelegt = state::init(&mut region.view(), PROG, VER, LEN).is_ok();
+    // Direkt nach dem Anlegen: null Uebernahmen. Ohne diesen Zaehler saehe ein still neu
+    // angelegter Zustand genauso aus wie ein geerbter, der zufaellig dieselben Werte traegt.
+    let gen0 = state::generation(&region.view()) == Some(0);
+
+    // Die alte Fassung hinterlaesst etwas.
+    let geschrieben = state::payload(&mut region.view())
+        .map(|mut p| p.set::<u64>(0, 0xA43_BEEF))
+        .unwrap_or(false);
+
+    // **Der Erfolgsfall:** passende program_id UND state_version -> Uebernahme, Zaehler auf 1.
+    let uebernommen = state::attach(&mut region.view(), PROG, VER)
+        == Ok(state::Handover {
+            generation: 1,
+            payload_len: LEN,
+        });
+    // Und der Zustand ist wirklich da -- das ist die Aussage von A-4.3.
+    let zustand_ueberlebt = state::payload(&mut region.view())
+        .and_then(|p| p.get::<u64>(0))
+        == Some(0xA43_BEEF);
+    // Eine zweite Uebernahme zaehlt weiter, statt zurueckzusetzen: sonst waere die dritte
+    // Fassung von der ersten nicht zu unterscheiden.
+    let zaehlt_weiter = state::attach(&mut region.view(), PROG, VER)
+        .map(|h| h.generation)
+        == Ok(2);
+
+    // **Die Kernabweisung:** anderes Layout -> KEIN Ok. Ohne sie laese die neue Fassung die Bytes
+    // der alten in ihrem eigenen Sinn -- kein Datenverlust, sondern ein fehlinterpretierter
+    // Zustand, und der faellt niemandem auf.
+    let falsche_version = state::attach(&mut region.view(), PROG, VER + 1)
+        == Err(state::StateError::VersionMismatch { found: VER });
+    // Fremdes Programm: hier liegt der Zustand von jemand anderem, nicht "vermutlich passend".
+    let fremdes_programm = state::attach(&mut region.view(), PROG + 1, VER)
+        == Err(state::StateError::WrongProgram { found: PROG });
+    // Und die Abweisungen haben den Zaehler NICHT erhoeht -- eine gescheiterte Uebernahme ist
+    // keine.
+    let abweisung_zaehlt_nicht = state::generation(&region.view()) == Some(2);
+
+    // Der Kopf ist eine Behauptung ueber die Region, keine Tatsache: behauptet er mehr Nutzlast,
+    // als die Region traegt, ist das ein eigener Befund und kein stillschweigend gekuerzter
+    // Zugriff.
+    let zu_gross = LEN as usize + 4096;
+    region.view().set::<u32>(16, zu_gross as u32); // OFF_PAYLOAD_LEN
+    let kopf_luegt = matches!(
+        state::attach(&mut region.view(), PROG, VER),
+        Err(state::StateError::Corrupt { .. })
+    );
+
+    // Eine Region, die kleiner ist als Kopf + gewuenschte Nutzlast, wird gar nicht erst angelegt.
+    let zu_klein = state::init(&mut region.view(), PROG, VER, u32::MAX) == Err(state::StateError::TooSmall);
+
+    KernelRegionSource.release(region);
+
+    // Dass auch die ECHTE Zustandsregion einen gueltigen Kopf traegt, belegt dieser Test NICHT --
+    // und zwar bewusst nicht mehr: die Region entsteht in der arch-neutralen Zaehler-Demo
+    // (`threads::…`, Aufruf von `hotreload_state_alloc`), die auf x86 gar nicht laeuft. Hier
+    // abgefragt war die Zusicherung nicht scharf, sondern nur an der falschen Stelle: sie fiel
+    // durch, weil es die Region nicht gibt, nicht weil ihr Kopf fehlt. Belegt wird sie im
+    // aarch64-Lauf durch `ckpt`: die Uebernahme-Generation 1 kann nur aus `state::attach` kommen,
+    // und das gibt es ohne gueltigen Kopf nicht.
+    let echte_region_hat_kopf = hotreload_state_generation();
+
+    let ok = vorher_kein_zustand
+        && angelegt
+        && gen0
+        && geschrieben
+        && uebernommen
+        && zustand_ueberlebt
+        && zaehlt_weiter
+        && falsche_version
+        && fremdes_programm
+        && abweisung_zaehlt_nicht
+        && kopf_luegt
+        && zu_klein;
+    println!(
+        "state   : frisch -> NoState {vorher_kein_zustand}; angelegt {angelegt} (Generation 0 \
+         {gen0}, Nutzlast schreibbar {geschrieben}); UEBERNOMMEN {uebernommen} (Zustand ueberlebt \
+         {zustand_ueberlebt}, zweite Uebernahme zaehlt weiter {zaehlt_weiter}); falsche \
+         state_version abgewiesen {falsche_version}; fremde program_id abgewiesen \
+         {fremdes_programm}; Abweisung zaehlt nicht {abweisung_zaehlt_nicht}; luegender Kopf \
+         erkannt {kopf_luegt}; zu kleine Region abgewiesen {zu_klein}; echte Zustandsregion \
+         {echte_region_hat_kopf:?} (auf x86 keine -- die Demo laeuft dort nicht; Beleg im \
+         aarch64-Lauf via ckpt)"
+    );
+    println!(
+        "state   : {} (A-4.3: der Zustand liegt in einer Region mit VERSIONIERTEM Kopf -- passt \
+         das Layout nicht, wird abgewiesen statt fehlinterpretiert)",
         if ok { "ALL PASS" } else { "FAILURES" }
     );
     ok

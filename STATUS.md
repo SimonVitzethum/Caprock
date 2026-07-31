@@ -96,10 +96,11 @@ schrumpft. Details in [AGENTS.md](AGENTS.md), Mitteilung 1.
 
 ## Strang A — Ausführen und Austauschen (Claude A)
 
-**Zuletzt geändert (A): 2026-07-30 21:50 UTC**
+**Zuletzt geändert (A): 2026-07-31 09:50 UTC**
 
 **Gerade in Arbeit: nichts Angefangenes — A-3.4 Teil 1 (`ec26cfb`), Teil 2 (`1e2bd51`), Teil 3
-(`f6e5186`) und Teil 4 (`25d388a`) sind committet, der Baum ist sauber.** Erledigt ist die Thread-Kapazität als
+(`f6e5186`), Teil 4 (`25d388a`) und der Abschluss (Summenprüfung, `d1f5ed8`) sind committet, der
+Baum ist sauber.** Erledigt ist die Thread-Kapazität als
 **Zusage** (`TARGET_THREADS = 10_000`, gemessen:
 `4 Kern, 10000 Thread-Slots (5000 hostbar), Tabellen 7872 KiB aus dem RAM`), die
 Cap-Space-Telemetrie (Höchststand statt Endstand — ein Lauf, der zwischendurch an die Grenze
@@ -151,17 +152,32 @@ wie CapSpace (Teil 2) und PD-Tabelle (Teil 3). Gemessen: `ipc : 10064 Endpoints 
 Notifications, Tabellen 16908 KiB aus dem RAM (eine PD, ein Endpoint: 10000 PDs)`, dazu
 `PASS: A-3.4: 10064 Endpoints / 10064 Notifications`.
 
-**Ausdrücklich NICHT erreicht:** die **Summe** der Cap-Budgets prüft weiter
-niemand (`budget_allows` kennt nur `cap_count(pd)`); sie passt in die Tabelle, statt geprüft zu
-werden: `NPDS * CAP_BUDGET_PER_PD` = 10000 × 8 = 80000, dazu 256 Reserve — genau die 80256 aus
-dem Bootreport. Die Dimensionierung trägt die Zusicherung, nicht eine Prüfung.
+**Der Abschluss (`d1f5ed8`) — die Summe wird jetzt geprüft, nicht nur unterstellt:**
+`budget_allows` deckelt den Verbrauch **einer** PD; dass die Summe aller Budgets in die Tabelle
+passt, trug bis hierher allein die Dimensionierung (10000 × 8 = 80000 + 256 Reserve = genau die
+80256 Slots). Ungeprüft blieb die andere Seite derselben Rechnung: **der Kernel selbst** installiert
+Wurzel-Caps, und nichts hinderte ihn daran, mehr als seine 256 Reserve zu belegen. Dann ist jede
+einzelne PD innerhalb ihres Budgets und bekommt trotzdem `NoSlot` — an einer Stelle, die nichts
+falsch gemacht hat. `Caps::nonbudget_slots` zählt die Slots, die auf kein PD-Budget gehen,
+ausdrücklich **nicht** über `used_slots − Σ cap_count(pd)`: halten zwei PDs denselben `CapPtr`,
+überzählt die Summe, und der Fehlbetrag zeigt in die unsichere Richtung — die Prüfung ginge durch,
+obwohl sie es nicht sollte. Stattdessen wird jeder gehaltene Slot markiert und ausgezählt, was
+belegt und unmarkiert blieb; eine zu kleine Zählfläche ist ein eigener Befund (`None`), kein
+stilles „in Ordnung" (dieselbe Trennung wie Code 8 im CDT-Audit). Dazu
+`CAP_SLOTS_TOTAL`/`CAP_SLOTS_KERNEL_RESERVE` in `sel4lake-microkit` — der Kernel hatte
+`CAP_SLOTS_FOR_ALL_PDS + 256` abgeschrieben, eine zweite Stelle, die beim nächsten Drehen an `NPDS`
+still auseinanderläuft — und eine Prüfung nach `attach`, dass die Tabelle wirklich so gross ist wie
+gerechnet. Gemessen: `capsum : 1/256 Slots ausserhalb aller PD-Budgets (Kernel-Wurzelcaps);
+Kapazitaet 80256 = 80000 PD-Budgets + 256 Reserve`.
 
-**Nächster Schritt:** A-3.4 ist damit erledigt — die dynamischen Tabellen stehen (Threads, Caps,
-Objekte, PDs, Endpoints, Notifications). Offen bleibt als eigener Punkt die **Summenprüfung** der
-Cap-Budgets (s. oben); danach A-4 (Hot-Reload, 4.1–4.3) und A-5.
+**Nächster Schritt:** A-3.4 ist damit **komplett** — die dynamischen Tabellen stehen (Threads,
+Caps, Objekte, PDs, Endpoints, Notifications), und die Summe ist geprüft statt unterstellt. Als
+Nächstes A-4 (Hot-Reload, 4.1–4.3), danach A-5.
 
-**Belegt durch Lauf 21:31** (`build/diag/a34-teil4.log`): `rc_load=0` mit `== ALL PASS ==`,
-`rc_main=1` mit genau einem FAIL — `x2APIC`, der bekannte TCG-Vorbehalt ohne KVM.
+**Belegt durch Lauf 09:22** (`build/diag/a34-summe.log`): `rc_arm=0` (aarch64-Bau als
+Regressionsschutz für die arch-neutralen Crates), `rc_load=0` mit `== ALL PASS ==`, `rc_main=1` mit
+genau einem FAIL — `x2APIC`, der bekannte TCG-Vorbehalt ohne KVM. Teil 4 zuvor belegt durch Lauf
+21:31 (`build/diag/a34-teil4.log`), gleiche Bilanz.
 
 **Neu erledigt (2026-07-30):** A-2.2 (`default = []`), A-4.4 (Versionssperre im Lader, beide
 Ausgänge belegt), A-4.5 (Negativliste `invariants.md` §13), A-3.4 Teil 1 bis Teil 4 (s. oben).

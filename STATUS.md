@@ -96,11 +96,37 @@ schrumpft. Details in [AGENTS.md](AGENTS.md), Mitteilung 1.
 
 ## Strang A — Ausführen und Austauschen (Claude A)
 
-**Zuletzt geändert (A): 2026-07-31 09:50 UTC**
+**Zuletzt geändert (A): 2026-07-31 12:20 UTC**
 
-**Gerade in Arbeit: nichts Angefangenes — A-3.4 Teil 1 (`ec26cfb`), Teil 2 (`1e2bd51`), Teil 3
-(`f6e5186`), Teil 4 (`25d388a`) und der Abschluss (Summenprüfung, `d1f5ed8`) sind committet, der
-Baum ist sauber.** Erledigt ist die Thread-Kapazität als
+**Gerade in Arbeit: nichts Angefangenes — A-3.4 ist komplett (Teil 1 `ec26cfb`, Teil 2 `1e2bd51`,
+Teil 3 `f6e5186`, Teil 4 `25d388a`, Summenprüfung `d1f5ed8`), und A-4.2 ist committet
+(`4fca286`).** Im Arbeitsbaum liegt nur **fremde** Arbeit: der QEMU-Auswahlblock in
+`test-qemu-x86.sh` (nicht von A, nicht mitcommittet).
+
+**A-4.2 — der ruhende Punkt (`4fca286`).** Vor A-4.1 gebaut, mit Absicht: 4.1s ehrliche Variante
+(„Austausch nur ohne offene Transaktion") setzt den Begriff *ruhend* voraus, den es nicht gab, und
+derselbe Begriff trägt später Z4a (Thread einfrieren). Stilllegen weist **neue** Transaktionen mit
+`ERR_QUIESCING` ab, nicht mit `ERR_BADCAP` — „kommt gleich wieder" ist für den Client eine andere
+Lage als „gibt es nicht"; wer beides vermengt, zwingt ihn zum Aufgeben, wo Warten richtig wäre.
+Laufende Transaktionen dürfen abschließen, ein zweiter Austausch am selben Endpoint wird
+abgewiesen, Freigabe öffnet das Tor wieder, doppelte Freigabe wird gemeldet. Belegt:
+`quiesce : ALL PASS`, Lauf 11:30/11:51 mit `rc_arm=0 rc_load=0 rc_main=0`.
+
+**Der `x2APIC`-Vorbehalt ist weg — und er lag nie am Kernel.** Seit `/opt/tools/qemu`
+(QEMU 11.0.3, von außen installiert) meldet der Kernel `apic: x2APIC (MSR-Pfad)` statt des
+MMIO-Rückfalls; Debians 7.2 kann das Merkmal unter TCG schlicht nicht
+(`TCG doesn't support requested feature: CPUID.01H:ECX.x2apic`). Die Hauptsuite ist damit erstmals
+`== ALL PASS ==` ohne Ausnahme. **Offene Unwucht:** `test-qemu-x86-load.sh:103` ruft weiter das
+nackte `qemu-system-x86_64` (7.2) — beide Suiten laufen auf **verschiedenen** Maschinenmodellen,
+ein grünes Ergebnis heißt in beiden nicht dasselbe. Nachzuziehen, sobald der fremde QEMU-Block
+committet ist.
+
+**Umgebungsfalle, die 11:47 einen Lauf gekostet hat:** der Container wurde neu gebaut, `~/.local`
+war weg, damit auch das per `pip3 install --user` nachgerüstete `cryptography` — ohne das kann
+kein Manifest signiert werden und die Lade-Suite bricht vor dem ersten Bau ab (`rc_load=2`).
+Wiederhergestellt; **überlebt den nächsten Neubau wieder nicht**, gehört ins Dockerfile.
+
+Erledigt ist die Thread-Kapazität als
 **Zusage** (`TARGET_THREADS = 10_000`, gemessen:
 `4 Kern, 10000 Thread-Slots (5000 hostbar), Tabellen 7872 KiB aus dem RAM`), die
 Cap-Space-Telemetrie (Höchststand statt Endstand — ein Lauf, der zwischendurch an die Grenze

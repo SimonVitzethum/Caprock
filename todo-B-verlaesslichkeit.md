@@ -147,10 +147,21 @@ Verlässliches.
 
 ## B-3. Geräte-Zuteilung, die man einem Tenant geben darf (E 3b/4)
 
-- [ ] **B-3.1 Queued Invalidation.** Vorbedingung, nicht Alternative: die Invalidierung des
+- [x] **B-3.1 erledigt (2026-07-30).** Warteschlange (256 x 16 B), Wait-Deskriptor mit
+      Statusschreibung an jedem Auftrag — `IQT` allein hiesse nur „eingereiht", nicht
+      „durchgefuehrt". Kontext-Cache und IOTLB **umgestellt, nicht zusaetzlich**: sobald
+      `GSTS.QIES` steht, verbietet die Architektur den Registerpfad (VT-d 6.5.2). Belegt:
+      `qi : ALL PASS` — aktiv, Kontext-Cache quittiert, **Interrupt-Entry-Cache invalidiert**.
+      Offen als Teil von B-3.3: QI laeuft nur auf Einheit 0. *(Alter Text:)* **B-3.1 Queued Invalidation.** Vorbedingung, nicht Alternative: die Invalidierung des
       Interrupt-Entry-Cache existiert **nur** als QI-Deskriptor. Der Registerpfad ist ein
       Provisorium mit bekanntem Ablaufdatum — beim Umstieg wirklich umstellen, nicht beides halten.
-- [ ] **B-3.2 Interrupt Remapping + Compatibility-Format-Interrupts abschalten.** Ohne IR kann ein
+- [x] **B-3.2 erledigt (2026-07-31).** IRT mit lauter „not present" (Default-Block wie die
+      Root-Tabelle): ein Geraet ohne IRTE kann keinen Interrupt ausloesen. Reihenfolge festgelegt:
+      `IRTA` → `SIRTP` → **IEC invalidieren** → `IRE`; der mittlere Schritt geht nur ueber QI,
+      deshalb scheitert `ir_enable` ohne QI, statt IR ohne Durchsetzungsmittel anzuschalten.
+      **CFI ist Teil des Anschaltens**, keine Verschaerfung danach — `GSTS.CFIS == 0` wird als
+      Gegenprobe abgenommen, nicht angenommen. Belegt: `ir : ALL PASS`, Lade-Suite `ALL PASS`
+      rc=0 mit aktivem IR. *(Alter Text:)* **B-3.2 Interrupt Remapping + Compatibility-Format-Interrupts abschalten.** Ohne IR kann ein
       durchgereichtes Gerät beliebige Interrupt-Nachrichten erzeugen; IR mit weiter erlaubtem CFI
       ist eine offene Tür an der Seite. **Muss vor dem ersten Tenant-Gerät stehen** (Strang A-5.3
       hängt daran).

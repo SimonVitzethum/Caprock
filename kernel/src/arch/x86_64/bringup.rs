@@ -707,7 +707,7 @@ pub fn run(multiboot_info: u64) -> ! {
             );
             // Was der Enforcer NICHT hat, gehoert genauso ins Log wie das, was er hat.
             println!(
-                "vtdcaps : {} (Schritt 1: Faehigkeiten gelesen; Zuteilung je Gruppe, IR/CFI und RMRR-Ausschluss stehen aus -> attach liefert weiterhin None)",
+                "vtdcaps : {} (Schritt 1: Faehigkeiten gelesen. IR/CFI stehen seit B-3.2; offen bleiben die Mehr-Einheiten-Aggregation (B-3.3) und die IOVA-Fensterwahl gegen 0xFEE0_0000 (B-3.4) -> attach liefert weiterhin None)",
                 if c.usable() { "ALL PASS" } else { "FAILURES" }
             );
         }
@@ -747,7 +747,23 @@ pub fn run(multiboot_info: u64) -> ! {
              Interrupt-Entry-Cache ist erreichbar)",
             if qi && iec { "ALL PASS" } else { "FAILURES" }
         );
-        up && system::dma_enforcer().is_active() && inv && qi && iec
+        // B-3.2: Interrupt Remapping aktiv UND Compatibility-Format zu. Beides zusammen, denn
+        // IR mit erlaubtem CFI ist eine offene Tuer an der Seite: das Compatibility-Format ist
+        // der alte, nicht-remappte Nachrichtenpfad und umgeht die Tabelle vollstaendig.
+        let ir = hal::vtd::ir_active();
+        let cfi = hal::vtd::cfi_blocked();
+        println!(
+            "ir      : Interrupt Remapping aktiv={ir} (GSTS.IRES), Compatibility-Format \
+             abgeschaltet={cfi} (GSTS.CFIS==0); Tabelle mit lauter 'not present' = Default-Block, \
+             ein Geraet ohne IRTE kann keinen Interrupt ausloesen"
+        );
+        println!(
+            "ir      : {} (B-3.2: ohne IR koennte ein durchgereichtes Geraet beliebige \
+             Interrupt-Nachrichten erzeugen -- MSI ist eine DMA-Schreibung, die die Uebersetzung \
+             gar nicht ansieht)",
+            if ir && cfi { "ALL PASS" } else { "FAILURES" }
+        );
+        up && system::dma_enforcer().is_active() && inv && qi && iec && ir && cfi
             && system::dma_enforcer().audit() == 0
     } else {
         println!("iommu   : keine ACPI-DMAR -> Plattform ohne IOMMU");

@@ -80,7 +80,7 @@ LOG="$(mktemp)"
 boot_once() {
     timeout "$SECONDS_RUN" qemu-system-x86_64 \
         -kernel "$ELF" -m "$RAM" -smp 4 "${ACCEL[@]}" \
-        -machine q35,kernel-irqchip=split -device intel-iommu,caching-mode=on \
+        -machine q35,kernel-irqchip=split -device intel-iommu,caching-mode=on,intremap=on \
         -device virtio-rng-pci \
         -nographic -serial file:"$LOG" -no-reboot -no-shutdown \
         </dev/null >/dev/null 2>&1 || true
@@ -165,6 +165,7 @@ check "apic    : x2APIC" "x2APIC aktiv (MSR-Pfad statt MMIO): schnellere IPIs, 6
 check "cycles  : ALL PASS" "Zyklenzaehler (Stufe 1): serialisierender Zeitstempel, invariant-TSC geprueft statt angenommen, gegen den PIT kalibriert"
 check "dmawin  : ALL PASS" "IOVA-Fenstergrenzen (ext-36b) -- DIESELBE Funktion wie im ARM-Lauf, nicht nachgebaut"
 check "dmatok  : ALL PASS" "Teardown-Token (ext-37) -- dieselbe Funktion wie im ARM-Lauf; VtdEnforcer::attach liefert jetzt Some"
+check "ir      : ALL PASS" "B-3.2: Interrupt Remapping aktiv UND Compatibility-Format-Interrupts abgeschaltet -- ohne IR kann ein durchgereichtes Geraet beliebige Interrupt-Nachrichten erzeugen (MSI ist eine DMA-Schreibung, die die Uebersetzung nicht ansieht); mit IR, aber erlaubtem CFI bleibt die Tabelle umgehbar"
 check "qi      : ALL PASS" "B-3.1: Queued Invalidation aktiv und der Interrupt-Entry-Cache invalidierbar -- fuer den gibt es KEINEN Registerpfad, er ist damit die Vorbedingung fuer Interrupt Remapping (B-3.2)"
 check "iommu   : ALL PASS"            "IOMMU (VT-d): Bring-up aus der ACPI-DMAR, Root-Tabelle mit Default-Block, Uebersetzung aktiv, Invalidierung quittiert"
 check "iso     : ALL PASS"            "Stufe 5: per-Prozess-Adressraeume (isolierte PD sieht fremdes RAM NICHT, SAS-PD schon)"

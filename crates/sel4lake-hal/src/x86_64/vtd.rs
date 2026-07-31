@@ -104,6 +104,47 @@ pub fn qi_active() -> bool {
     QI_QUEUE[0].load(Ordering::Acquire) != 0
 }
 
+// --- Interrupt Remapping (B-3.2) --------------------------------------------------------------
+//
+// Ohne IR kann ein durchgereichtes Geraet **beliebige** Interrupt-Nachrichten erzeugen: eine
+// MSI-Schreibung an die APIC-Adresse ist eine gewoehnliche DMA-Schreibung, und die
+// Adressuebersetzung sieht sie sich nicht an -- der Bereich 0xFEEx_xxxx ist fuer die Einheit
+// ausdruecklich KEIN uebersetzbarer Adressraum, sondern eine Interrupt-Nachricht (deshalb ist er
+// auch als IOVA unbrauchbar, s. B-3.4). Ein Tenant-Geraet koennte damit einen beliebigen Vektor
+// auf einem beliebigen Kern ausloesen, ganz ohne Zutun der Uebersetzungstabellen.
+//
+// **Und IR mit weiter erlaubtem CFI ist eine offene Tuer an der Seite.** Das
+// Compatibility-Format ist der alte, nicht-remappte Nachrichtenpfad; laesst man ihn zu, kann ein
+// Geraet die gesamte Remapping-Tabelle einfach umgehen. `GCMD.CFI = 0` ist deshalb Teil des
+// Anschaltens, nicht eine Verschaerfung danach.
+const REG_IRTA: usize = 0x0B8;
+
+const GCMD_SIRTP: u32 = 1 << 24;
+const GSTS_IRTPS: u32 = 1 << 24;
+const GCMD_IRE: u32 = 1 << 25;
+const GSTS_IRES: u32 = 1 << 25;
+/// `GCMD.CFI` / `GSTS.CFIS` -- Compatibility Format Interrupts. **Wird nie gesetzt.**
+const GSTS_CFIS: u32 = 1 << 23;
+
+/// Eintraege der Interrupt-Remapping-Tabelle. 256 x 16 B = eine 4-KiB-Seite; das Groessenfeld in
+/// `IRTA` ist `log2(n) - 1`.
+const IRT_ENTRIES: u64 = 256;
+const IRTA_SIZE_FIELD: u64 = 7; // 2^(7+1) = 256
+
+/// Basisadresse der Interrupt-Remapping-Tabelle (0 = IR nicht aktiv).
+static IRT: [AtomicU64; super::dmar::MAX_UNITS] =
+    [const { AtomicU64::new(0) }; super::dmar::MAX_UNITS];
+
+/// Laeuft Interrupt Remapping auf Einheit 0?
+pub fn ir_active() -> bool {
+    IRT[0].load(Ordering::Acquire) != 0 && read32(REG_GSTS) & GSTS_IRES != 0
+}
+
+/// Sind Compatibility-Format-Interrupts abgeschaltet? (Muss bei aktivem IR **immer** `true` sein.)
+pub fn cfi_blocked() -> bool {
+    read32(REG_GSTS) & GSTS_CFIS == 0
+}
+
 const CCMD_ICC: u64 = 1 << 63;
 const CCMD_CIRG_GLOBAL: u64 = 1 << 61;
 
@@ -579,11 +620,59 @@ pub fn init(root_table: u64, alloc: &mut dyn FnMut() -> Option<u64>) -> bool {
     // `false`, und niemand behauptet etwas anderes. Interrupt Remapping (B-3.2) ist in diesem
     // Fall NICHT zulaessig, weil der Interrupt-Entry-Cache dann nicht invalidierbar waere.
     qi_enable(alloc);
+    // IR erst nach QI (Vorbedingung) und vor dem Aktivieren der Uebersetzung: ab hier ist ein
+    // Geraet ohne IRTE auch interrupt-seitig stumm, nicht nur DMA-seitig.
+    ir_enable(alloc);
     invalidate_context_cache();
     // Übersetzung aktivieren.
     gcmd_set_state(GCMD_TE, true)
 }
 
+
+
+/// **Interrupt Remapping aufsetzen** (B-3.2). `alloc` liefert ein genulltes 4-KiB-Frame.
+///
+/// Die Tabelle wird mit lauter **nicht vorhandenen** Eintraegen aufgesetzt -- dieselbe
+/// Default-Block-Politik wie bei der Root-Tabelle: eine Interrupt-Nachricht, fuer die kein
+/// Eintrag existiert, wird abgewiesen statt durchgelassen. Erst wer eine IRTE bekommt, darf
+/// ueberhaupt einen Interrupt ausloesen.
+///
+/// Reihenfolge, und sie ist nicht beliebig:
+/// 1. `IRTA` setzen (Adresse + Groessenfeld), dann `SIRTP` -- die Einheit uebernimmt den Zeiger.
+/// 2. **Interrupt-Entry-Cache invalidieren.** Ohne das koennte die Einheit Eintraege einer
+///    frueheren Tabelle weiterverwenden. Das geht nur ueber QI (B-3.1) -- deshalb schlaegt diese
+///    Funktion fehl, wenn QI nicht laeuft, statt IR ohne Invalidierungsmoeglichkeit anzuschalten.
+/// 3. `IRE` setzen. `CFI` bleibt dabei **aus**: `gcmd_set_state` schreibt nur die Bits aus
+///    [`GCMD_STATE_MASK`], und Bit 23 steht bewusst nicht darin.
+///
+/// `false`, wenn kein Speicher da ist, QI fehlt, oder die Einheit einen der Schritte nicht
+/// bestaetigt. Der Aufrufer darf dann **nicht** so tun, als sei IR aktiv.
+fn ir_enable(alloc: &mut dyn FnMut() -> Option<u64>) -> bool {
+    // Ohne QI ist der Interrupt-Entry-Cache nicht invalidierbar -- IR waere dann eine Zusage
+    // ohne Durchsetzungsmittel (B-3.1 ist Vorbedingung, nicht Alternative).
+    if !qi_active() {
+        return false;
+    }
+    let Some(table) = alloc() else { return false };
+    // Groessenfeld in den unteren Bits, Adresse in 63:12. EIME (Bit 11) bleibt aus: es gilt nur
+    // im x2APIC-Modus, und den meldet diese Plattform nicht zwingend -- ein gesetztes EIME ohne
+    // x2APIC waere ein reserviertes Bit.
+    write64(REG_IRTA, (table & !0xfff) | IRTA_SIZE_FIELD);
+    if !gcmd_issue(GCMD_SIRTP, GSTS_IRTPS, true) {
+        return false;
+    }
+    IRT[0].store(table, Ordering::Release);
+    if !invalidate_iec_global() {
+        IRT[0].store(0, Ordering::Release);
+        return false;
+    }
+    if !gcmd_set_state(GCMD_IRE, true) {
+        IRT[0].store(0, Ordering::Release);
+        return false;
+    }
+    // Gegenprobe statt Annahme: CFI MUSS aus sein, sonst ist die Tabelle umgehbar.
+    cfi_blocked()
+}
 
 /// **Queued Invalidation aufsetzen** (B-3.1). `alloc` liefert genullte, identity-gemappte 4-KiB-Frames.
 ///

@@ -96,12 +96,24 @@ schrumpft. Details in [AGENTS.md](AGENTS.md), Mitteilung 1.
 
 ## Strang A — Ausführen und Austauschen (Claude A)
 
-**Zuletzt geändert (A): 2026-07-31 12:20 UTC**
+**Zuletzt geändert (A): 2026-07-31 13:20 UTC**
 
 **Gerade in Arbeit: nichts Angefangenes — A-3.4 ist komplett (Teil 1 `ec26cfb`, Teil 2 `1e2bd51`,
-Teil 3 `f6e5186`, Teil 4 `25d388a`, Summenprüfung `d1f5ed8`), und A-4.2 ist committet
-(`4fca286`).** Im Arbeitsbaum liegt nur **fremde** Arbeit: der QEMU-Auswahlblock in
-`test-qemu-x86.sh` (nicht von A, nicht mitcommittet).
+Teil 3 `f6e5186`, Teil 4 `25d388a`, Summenprüfung `d1f5ed8`), A-4.2 (`4fca286`) und A-4.1
+(`a25fa23`) sind committet.** Von A-4 fehlt damit nur noch **A-4.3 (Zustandsübergabe)**; ohne
+Festlegung dort ist Hot-Reload ein Neustart mit Datenverlust, der anders heißt. Im Arbeitsbaum
+liegt nur **fremde** Arbeit: der QEMU-Auswahlblock in `test-qemu-x86.sh` (nicht von A, nicht
+mitcommittet).
+
+**A-4.1 — atomares Umbinden (`a25fa23`).** Der Austausch prüfte bisher und tauschte danach.
+Zwischen beidem liegt ein Fenster: der Befund „keine offene Transaktion" ist eine Momentaufnahme,
+die im nächsten Takt nicht mehr gilt; und zwischen „alter Server gelöst" und „neuer gebunden"
+hätte der Endpoint kurz **keinen** Empfänger — ein Client, der genau dann sendet, sieht einen
+Server, den es nie gab. Jetzt laufen Prüfung und Tausch unter *einem* Lock. Ohne vorherige
+Stilllegung wird abgewiesen, ein fremder Empfänger blockiert den Tausch statt still verdrängt zu
+werden, und im überlappenden Fall ist durchgehend genau ein Empfänger gebunden. Belegt:
+`rebind : ALL PASS`, Lauf 13:04 mit `rc_arm=0 rc_load=0 rc_main=0` — beide Suiten ohne eine
+einzige FAIL-Zeile.
 
 **A-4.2 — der ruhende Punkt (`4fca286`).** Vor A-4.1 gebaut, mit Absicht: 4.1s ehrliche Variante
 („Austausch nur ohne offene Transaktion") setzt den Begriff *ruhend* voraus, den es nicht gab, und

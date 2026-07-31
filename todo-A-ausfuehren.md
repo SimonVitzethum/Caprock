@@ -152,11 +152,17 @@ wird. Alles andere liegt außerhalb.
 Auf ARM existiert der Fall (Phase 7: eine Server-PD wird über *dieselbe* Endpoint-Cap ersetzt).
 Für einen Betriebsanspruch fehlen drei Dinge.
 
-- [ ] **A-4.1 Atomares Umbinden.** Zwischen „alter Server weg" und „neuer Server empfangsbereit"
-      darf kein Zustand liegen, in dem ein `CALL` mit `NoEndpoint` scheitert. Der Endpoint ist
-      bereits ein eigenes Objekt mit eigener Cap — das trägt; der Austausch muss unter *einem*
-      Lock geschehen.
-- [ ] **A-4.2 Ruhender Punkt.** Ein Client, der in `CALL` blockiert, hält eine Reply-Cap auf den
+- [x] **A-4.1 erledigt (2026-07-31, `a25fa23`).** Prüfung und Tausch laufen unter *einem* Lock.
+      Ohne vorherige Stilllegung (A-4.2) wird abgewiesen — der Befund „keine offene Transaktion"
+      wäre sonst eine Momentaufnahme, die im nächsten Takt nicht mehr gilt. Ein fremder Empfänger
+      blockiert den Tausch, statt still verdrängt zu werden; im überlappenden Fall ist durchgehend
+      genau ein Empfänger gebunden. Belegt: `rebind : ALL PASS`.
+- [x] **A-4.2 erledigt (2026-07-31, `4fca286`).** Vor A-4.1 gebaut, weil dessen ehrliche Variante
+      den Begriff *ruhend* voraussetzt. Stilllegen weist **neue** Transaktionen mit
+      `ERR_QUIESCING` ab (nicht `ERR_BADCAP`: „kommt gleich wieder" ist für den Client eine andere
+      Lage als „gibt es nicht"), laufende dürfen abschließen; ein zweiter Austausch am selben
+      Endpoint wird abgewiesen, doppelte Freigabe wird gemeldet. Belegt: `quiesce : ALL PASS`.
+      Ursprüngliche Fassung: Ein Client, der in `CALL` blockiert, hält eine Reply-Cap auf den
       alten Server. Entweder der neue erbt die offenen Replys, oder der Austausch findet nur ohne
       offene Transaktion statt. Die zweite Variante ist ehrlich und für den Anfang wahrscheinlich
       richtig — sie braucht aber einen Begriff von „ruhend", den es heute nicht gibt.

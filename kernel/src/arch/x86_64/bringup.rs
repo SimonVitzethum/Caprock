@@ -281,6 +281,8 @@ fn spawn_demo() -> bool {
         // A-4.2: der ruhende Punkt -- die Torlogik, alle Ausgaenge. Laeuft auf einem lokalen
         // Endpoint-Objekt, legt also keinen benutzten Endpoint still.
         QUIESCE_OK.store(system::run_quiesce(), Ordering::Release);
+        // A-4.1: atomares Umbinden -- alle Ausgaenge, ebenfalls auf einem lokalen Objekt.
+        REBIND_OK.store(system::run_rebind(), Ordering::Release);
     }
 
     // Cap-gesichertes IPC: ein Endpoint, zwei PDs. Der Server hält die RECV-, der Client die
@@ -338,6 +340,10 @@ static STRIPE_ALLOC_OK: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 /// A-4.2: haelt der ruhende Punkt -- weist ein stillgelegter Endpoint neue Transaktionen ab?
 #[cfg(feature = "selftest")]
 static QUIESCE_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// A-4.1: bindet der Austausch atomar um -- ohne Zustand ohne Empfaenger dazwischen?
+#[cfg(feature = "selftest")]
+static REBIND_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Der akkumulierte Badge der Root-Notification (`0`, wenn keine endowt wurde).
 #[cfg(feature = "selftest")]
@@ -397,6 +403,9 @@ fn all_done(archive: bool) -> bool {
     // A-4.2 aus demselben Grund wie B-4.2 in der Abschlussbedingung: eine Zusicherung, die nur
     // im Bericht steht, faellt beim Brechen niemandem auf.
     let quiesce = QUIESCE_OK.load(Ordering::Acquire);
+    // A-4.1 aus demselben Grund: eine Zusicherung, die nur im Bericht steht, faellt beim
+    // Brechen niemandem auf.
+    let rebind = REBIND_OK.load(Ordering::Acquire);
     workers
         && IPC_DONE.load(Ordering::Acquire)
         && cores
@@ -406,6 +415,7 @@ fn all_done(archive: bool) -> bool {
         && stripes
         && iface
         && quiesce
+        && rebind
 }
 
 /// Bericht + Abschaltung (das Testskript wertet die Marker aus).

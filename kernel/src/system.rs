@@ -17,7 +17,7 @@
 
 use sel4lake_cap::{CapError, CapInfo, CapPtr, DmaCoherence, DmaDir, ObjectKind};
 use sel4lake_hal::{self as hal, exception::TrapFrame, fp::FpState, println};
-use sel4lake_ipc::{Endpoint, Notification, Quiescence};
+use sel4lake_ipc::{Endpoint, Notification, Quiescence, Rebind};
 use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
 use sel4lake_microkit::{Caps, Domain};
 use sel4lake_region::heap::RegionSource;
@@ -5330,6 +5330,124 @@ pub fn thread_quiescence(tid: ThreadId) -> Quiescence {
         q = q.merge(ntfns()[i].lock().quiescence_of(tid));
     }
     q
+}
+
+// -- A-4.1: atomares Umbinden ----------------------------------------------------------
+
+/// **Die Server-Instanz eines Endpoints austauschen — Prüfung und Tausch unter EINEM Lock**
+/// (A-4.1). Siehe [`Endpoint::rebind_server`] für die Begründung; hier zählt nur, dass es
+/// **ein** `lock()` ist. Aus `endpoint_retire_receiver` + einem späteren `RECV` der neuen
+/// Instanz zusammengesetzt, läge zwischen beiden ein Zustand ohne Empfänger — und ein `CALL`
+/// darin wartet auf einen Server, dessen Existenz vom Gelingen des restlichen Austauschs
+/// abhängt.
+pub fn endpoint_rebind_server(ep: usize, old: ThreadId, new: ThreadId) -> Rebind {
+    if ep >= eps().len() {
+        return Rebind::NoEndpoint;
+    }
+    eps()[ep].lock().rebind_server(old, new)
+}
+
+/// **Eine Empfänger-Instanz binden, ohne dass sie selbst `RECV` ruft** (A-4.1). Vorbedingung:
+/// `tid` ist blockiert geparkt — siehe [`Endpoint::bind_receiver`]. Der überlappende Weg
+/// (`new` ruft sein `RECV` **vor** der Stilllegung) braucht diese Vorbedingung nicht.
+pub fn endpoint_bind_receiver(ep: usize, tid: ThreadId) -> bool {
+    ep < eps().len() && eps()[ep].lock().bind_receiver(tid)
+}
+
+/// **A-4.1-Selbsttest: die Torlogik des atomaren Umbindens, alle Ausgänge.**
+///
+/// Aus demselben Grund am lokalen Objekt wie [`run_quiesce`]: der Test darf keinen benutzten
+/// Endpoint stilllegen. Die Empfängerqueue lässt sich hier — anders als Reply-Token und
+/// Sender — über [`Endpoint::bind_receiver`] füllen, also sind **alle** Ausgänge erreichbar,
+/// auch der überlappende Erfolgsfall. Nicht erreichbar bleiben `senders_waiting` und
+/// `reply_open`: beide entstehen nur in `call`/`recv` und werden am echten offenen Call im
+/// `rmig`-Szenario abgenommen.
+#[cfg(feature = "selftest")]
+pub fn run_rebind() -> bool {
+    use sel4lake_ipc::RebindBlocked;
+    let v1 = ThreadId::from_raw(0xA41_0001);
+    let v2 = ThreadId::from_raw(0xA41_0002);
+    let fremd = ThreadId::from_raw(0xA41_0003);
+    let mut e = Endpoint::EMPTY;
+
+    // Unbelegt: nichts umzubinden -- und der Grund wird benannt, nicht als "geht nicht"
+    // verschwiegen.
+    let leer_no_ep = e.rebind_server(v1, v2) == Rebind::NoEndpoint;
+    let leer_nicht_bindbar = !e.bind_receiver(v1);
+
+    e.mark_used();
+    // **Die Kernabweisung:** ohne Stilllegung wird NICHT umgebunden, auch nicht an einem
+    // ruhenden Endpoint. Der Befund waere sonst nur eine Momentaufnahme -- ein CALL auf einem
+    // anderen Kern macht ihn falsch, bevor der Tausch geschieht.
+    let ohne_ruhe_abgewiesen = e.rebind_server(v1, v2) == Rebind::NotQuiescing;
+
+    e.begin_quiesce();
+    // Stillgelegt, aber v1 ist gar nicht gebunden -> es gibt nichts abzuloesen.
+    let ungebunden_gemeldet = e.rebind_server(v1, v2) == Rebind::NotReceiver;
+    // Ein Austausch mit sich selbst meldet Erfolg, ohne einer zu sein -> eigener Ausgang.
+    let selbsttausch_gemeldet = e.rebind_server(v1, v1) == Rebind::SameThread;
+
+    // v1 binden; ein zweites Binden desselben Threads waere ein Duplikat in der Queue.
+    let v1_gebunden = e.bind_receiver(v1);
+    let doppelbindung_abgewiesen = !e.bind_receiver(v1);
+    let v1_ist_empfaenger = e.quiescence_of(v1).as_receiver;
+
+    // Ein FREMDER Empfaenger blockiert den Austausch: wer hier wartet, gehoert nicht zu den
+    // beiden Instanzen und wuerde vom Tausch stillschweigend uebergangen.
+    e.bind_receiver(fremd);
+    let fremder_blockiert = e.rebind_server(v1, v2)
+        == Rebind::Blocked(RebindBlocked {
+            other_receiver: true,
+            ..RebindBlocked::default()
+        });
+    e.retire_receiver(fremd);
+
+    // **Der Erfolgsfall ohne Ueberlappung:** v2 wird hier eingereiht. Zulaessig, aber die
+    // schwaechere Zusicherung -- der Aufrufer steht dafuer ein, dass v2 geparkt ist.
+    let einfach = e.rebind_server(v1, v2) == Rebind::Done { overlapped: false };
+    let v1_geloest = e.quiescence_of(v1).is_quiescent();
+    let v2_gebunden = e.quiescence_of(v2).as_receiver;
+
+    // **Der Erfolgsfall MIT Ueberlappung -- die starke Zusicherung.** Beide Instanzen sind
+    // gebunden, das Loesen der alten hinterlaesst keine Luecke: zu keinem Zeitpunkt, auch
+    // nicht innerhalb der Operation, hat der Endpoint null Empfaenger.
+    e.bind_receiver(v1); // "v1" spielt hier die neue Instanz, v2 die alte
+    let ueberlappend = e.rebind_server(v2, v1) == Rebind::Done { overlapped: true };
+    let nur_noch_v1 = e.quiescence_of(v1).as_receiver && e.quiescence_of(v2).is_quiescent();
+    // Und der Endpoint ist danach NICHT leer -- genau das ist die Aussage von A-4.1.
+    let empfaenger_durchgehend = !e.is_idle();
+
+    let ok = leer_no_ep
+        && leer_nicht_bindbar
+        && ohne_ruhe_abgewiesen
+        && ungebunden_gemeldet
+        && selbsttausch_gemeldet
+        && v1_gebunden
+        && doppelbindung_abgewiesen
+        && v1_ist_empfaenger
+        && fremder_blockiert
+        && einfach
+        && v1_geloest
+        && v2_gebunden
+        && ueberlappend
+        && nur_noch_v1
+        && empfaenger_durchgehend;
+    println!(
+        "rebind  : unbelegt -> NoEndpoint {leer_no_ep}/nicht bindbar {leer_nicht_bindbar}; OHNE \
+         Stilllegung abgewiesen {ohne_ruhe_abgewiesen}; ungebunden gemeldet \
+         {ungebunden_gemeldet}; Selbsttausch gemeldet {selbsttausch_gemeldet}; binden greift \
+         {v1_gebunden}/Doppelbindung abgewiesen {doppelbindung_abgewiesen}/ist Empfaenger \
+         {v1_ist_empfaenger}; FREMDER Empfaenger blockiert {fremder_blockiert}; Tausch ohne \
+         Ueberlappung {einfach} (alt geloest {v1_geloest}, neu gebunden {v2_gebunden}); Tausch MIT \
+         Ueberlappung {ueberlappend} (nur noch die neue {nur_noch_v1}, durchgehend ein Empfaenger \
+         {empfaenger_durchgehend})"
+    );
+    println!(
+        "rebind  : {} (A-4.1: Pruefung und Tausch unter EINEM Lock -- zwischen 'alter Server weg' \
+         und 'neuer empfangsbereit' liegt kein Zustand ohne Empfaenger)",
+        if ok { "ALL PASS" } else { "FAILURES" }
+    );
+    ok
 }
 
 /// **A-4.2-Selbsttest: die Torlogik des ruhenden Punktes, alle Ausgänge.**

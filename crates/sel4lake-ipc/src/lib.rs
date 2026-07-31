@@ -188,6 +188,65 @@ impl Quiescence {
     }
 }
 
+/// **Warum ein Umbinden nicht stattfinden konnte** (A-4.1) — aufgeschlüsselt, nicht zu
+/// einem Bit vermengt. [`Endpoint::is_idle`] beantwortet „ruht der Endpoint?" mit ja/nein;
+/// für einen abgewiesenen Austausch ist das zu wenig, weil die drei Fälle **verschieden**
+/// zu behandeln sind: wartende Sender lösen sich von selbst auf, sobald die neue Instanz
+/// empfängt (warten genügt), ein offenes Reply-Token nicht — dort schuldet die alte Instanz
+/// eine Antwort, und wer sie mitten im Austausch verliert, lässt einen Client hängen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct RebindBlocked {
+    /// Blockierte Aufrufer stehen an: ihre Nachricht ist abgesetzt, ein Server fehlt.
+    pub senders_waiting: bool,
+    /// Ein **anderer** Empfänger als die abzulösende Instanz wartet hier.
+    pub other_receiver: bool,
+    /// Ein Reply-Token ist offen — jemand wartet auf eine Antwort der alten Instanz.
+    pub reply_open: bool,
+}
+
+/// Ergebnis von [`Endpoint::rebind_server`]. Jeder Ausgang ist benannt: ein `false` liesse
+/// den Aufrufer raten, ob er warten (Sender stehen an), abbrechen (nicht stillgelegt) oder
+/// einen anderen Weg nehmen soll (die alte Instanz ist gar nicht gebunden).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Rebind {
+    /// Getauscht: `old` ist nicht mehr Empfänger, `new` ist es.
+    ///
+    /// `overlapped` unterscheidet die zwei Wege dorthin, und der Unterschied ist der Kern
+    /// von A-4.1: bei `true` war `new` **schon vor** dem Aufruf gebunden (beide Instanzen
+    /// standen kurz gleichzeitig bereit), der Endpoint hatte also zu **keinem** Zeitpunkt
+    /// null Empfänger — auch nicht innerhalb dieser Operation. Bei `false` wurde `new` hier
+    /// eingereiht; dann steht der Aufrufer dafür ein, dass `new` blockiert geparkt ist
+    /// (siehe [`bind_receiver`](Self::bind_receiver)). Beides ist zulässig, aber nur das
+    /// erste ist die starke Zusicherung — deshalb wird es gemeldet und nicht verschwiegen.
+    Done { overlapped: bool },
+    /// Der Endpoint ist nicht belegt — es gibt nichts umzubinden.
+    NoEndpoint,
+    /// **Nicht stillgelegt.** Ohne [`Endpoint::begin_quiesce`] wäre jede Vorbedingung nur
+    /// eine Momentaufnahme: ein `CALL` auf einem anderen Kern macht sie falsch, bevor der
+    /// Tausch geschieht. Deshalb ist das eine Abweisung und keine Warnung.
+    NotQuiescing,
+    /// Es ist noch etwas offen; welches der drei Dinge, steht im Befund.
+    Blocked(RebindBlocked),
+    /// Die alte Instanz ist hier nicht als Empfänger geparkt — sie läuft noch, ist tot, oder
+    /// war nie gebunden. Umbinden würde dann etwas ablösen, das nicht da ist.
+    NotReceiver,
+    /// `old` und `new` sind derselbe Thread. Kein Fehler im Zustand, aber ein Fehler im
+    /// Aufruf: die Operation hätte nichts zu tun und meldete trotzdem Erfolg — ein
+    /// Austausch, der keiner war, sähe von aussen aus wie ein gelungener.
+    SameThread,
+}
+
+impl Rebind {
+    /// Ist der Austausch geschehen?
+    pub fn is_done(&self) -> bool {
+        matches!(self, Rebind::Done { .. })
+    }
+    /// Ist er **ohne** ein Fenster ohne Empfänger geschehen (die starke Zusicherung)?
+    pub fn is_overlapped(&self) -> bool {
+        matches!(self, Rebind::Done { overlapped: true })
+    }
+}
+
 /// Ein Endpoint-Objekt. Der Kernel hält je Endpoint einen eigenen Lock; die
 /// Methoden operieren auf genau diesem einen Objekt.
 #[derive(Clone, Copy)]
@@ -334,6 +393,88 @@ impl Endpoint {
                 && self.receivers.is_empty()
                 && self.caller.is_none()
                 && self.reply_owner.is_none())
+    }
+
+    // -- A-4.1: atomares Umbinden ---------------------------------------------------
+
+    /// **Die Server-Instanz austauschen — Prüfung und Tausch in EINEM Zug** (A-4.1).
+    ///
+    /// Das ist der ganze Punkt der Operation. Dieselbe Wirkung liesse sich aus
+    /// [`retire_receiver`](Self::retire_receiver) und einem `RECV` der neuen Instanz
+    /// zusammensetzen — aber dazwischen fällt der Lock, und in genau diesem Fenster hat der
+    /// Endpoint **keinen** Empfänger. Ein `CALL` trifft dann keinen leeren Endpoint (das
+    /// Objekt lebt weiter, der Aufrufer reiht sich als Sender ein), aber er trifft auch
+    /// keinen Server; ob ihn je einer übernimmt, hängt davon ab, ob der Austausch danach
+    /// noch gelingt. Hier gibt es dieses Fenster nicht: entweder die alte Instanz ist
+    /// gebunden, oder die neue — nie keine von beiden.
+    ///
+    /// Vorbedingung ist die Stilllegung (A-4.2). Sie ist nicht Ordnungsliebe: ohne sie wäre
+    /// der Ruhebefund veraltet, bevor er gelesen ist, und der Tausch geschähe mitten in einer
+    /// Transaktion, deren Existenz die Prüfung gerade verneint hat.
+    ///
+    /// Der wartende **Sender** blockiert den Austausch, obwohl seine Transaktion noch nicht
+    /// begonnen hat und die neue Instanz ihn übernehmen könnte. Das ist bewusst streng: die
+    /// Zusicherung dieses Schrittes lautet „der Austausch trifft niemanden", nicht „der
+    /// Austausch geht meistens gut". Wer Sender übernehmen will, braucht die
+    /// Zustandsübergabe aus A-4.3 — sonst bedient v2 eine Nachricht, die für v1 gedacht war.
+    pub fn rebind_server(&mut self, old: ThreadId, new: ThreadId) -> Rebind {
+        if !self.used {
+            return Rebind::NoEndpoint;
+        }
+        if !self.quiescing {
+            return Rebind::NotQuiescing;
+        }
+        if old == new {
+            return Rebind::SameThread;
+        }
+        // Steht die neue Instanz schon bereit? Dann ist dies der **überlappende** Fall: beide
+        // Instanzen sind gebunden, und das Lösen der alten hinterlässt keine Lücke. Das ist
+        // der Weg, den der Kernel gehen soll — v2 ruft sein RECV, bevor stillgelegt wird.
+        let overlapped = self.receivers.contains(new);
+        // Was ist sonst offen? Weder `old` noch (im überlappenden Fall) `new` zählen als
+        // fremder Empfänger — sie abzulösen bzw. einzusetzen ist der Zweck des Aufrufs.
+        let eigene = usize::from(self.receivers.contains(old)) + usize::from(overlapped);
+        let blocked = RebindBlocked {
+            senders_waiting: !self.senders.is_empty(),
+            other_receiver: self.receivers.count > eigene,
+            reply_open: self.caller.is_some() || self.reply_owner.is_some(),
+        };
+        if blocked != RebindBlocked::default() {
+            return Rebind::Blocked(blocked);
+        }
+        if !self.receivers.remove(old) {
+            return Rebind::NotReceiver;
+        }
+        if !overlapped {
+            self.receivers.enqueue(new);
+        }
+        Rebind::Done { overlapped }
+    }
+
+    /// **Eine Empfänger-Instanz binden, ohne dass sie selbst `RECV` ruft.**
+    ///
+    /// Nötig, weil ein stillgelegter Endpoint genau das verhindert: `RECV` der neuen Instanz
+    /// liefe ins geschlossene Tor (`ERR_QUIESCING`). Die Alternative wäre, das Tor vor dem
+    /// Start von v2 zu öffnen — dann steht der Endpoint ohne Empfänger da, und jeder `CALL`
+    /// in dieser Lücke wartet auf einen Server, dessen Existenz vom Gelingen des restlichen
+    /// Austauschs abhängt. Genau diese Lücke soll A-4.1 schliessen.
+    ///
+    /// **Vorbedingung, für die der Aufrufer einsteht:** `tid` ist blockiert und hat einen
+    /// gültigen Frame, in den ein `CALL` seine Nachricht legen darf. Einen *laufenden* Thread
+    /// einzureihen, zerstört seinen Zustand — der Rendezvous-Pfad schreibt ihm Register und
+    /// weckt ihn, während er anderswo mitten in der Arbeit ist. Der überlappende Weg
+    /// ([`rebind_server`](Self::rebind_server) mit bereits gebundenem `new`) braucht diese
+    /// Vorbedingung nicht und ist deshalb vorzuziehen.
+    ///
+    /// Gibt `false`, wenn der Endpoint unbelegt ist oder `tid` bereits als Empfänger steht —
+    /// ein zweiter Eintrag wäre ein Duplikat in der Queue, also genau das, was `audit` als
+    /// Korruption meldet.
+    pub fn bind_receiver(&mut self, tid: ThreadId) -> bool {
+        if !self.used || self.receivers.contains(tid) {
+            return false;
+        }
+        self.receivers.enqueue(tid);
+        true
     }
 
     /// Einen **sterbenden** Thread aus ALLEN Strukturen dieses Endpoints entfernen

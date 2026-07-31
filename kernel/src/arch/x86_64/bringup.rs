@@ -731,7 +731,24 @@ pub fn run(multiboot_info: u64) -> ! {
             system::dma_enforcer().is_active(),
             system::dma_enforcer().audit()
         );
-        up && system::dma_enforcer().is_active() && inv && system::dma_enforcer().audit() == 0
+        // B-3.1: laeuft die Queued Invalidation, und traegt sie den Interrupt-Entry-Cache?
+        // Der IEC ist der Punkt: fuer ihn gibt es KEINEN Registerpfad. Ohne ihn waere eine
+        // geaenderte IRTE nie wirksam zu invalidieren -- und damit Interrupt Remapping (B-3.2)
+        // nicht zulaessig, sondern nur scheinbar aktiv.
+        let qi = hal::vtd::qi_active();
+        let iec = hal::vtd::invalidate_iec_global();
+        println!(
+            "qi      : Queued Invalidation aktiv={qi}; Kontext-Cache ueber die Warteschlange \
+             quittiert={inv}; Interrupt-Entry-Cache invalidiert={iec} (fuer den gibt es KEINEN \
+             Registerpfad -- deshalb ist B-3.1 Vorbedingung von B-3.2, nicht Geschmackssache)"
+        );
+        println!(
+            "qi      : {} (B-3.1: Invalidierung laeuft ueber die Warteschlange, und der \
+             Interrupt-Entry-Cache ist erreichbar)",
+            if qi && iec { "ALL PASS" } else { "FAILURES" }
+        );
+        up && system::dma_enforcer().is_active() && inv && qi && iec
+            && system::dma_enforcer().audit() == 0
     } else {
         println!("iommu   : keine ACPI-DMAR -> Plattform ohne IOMMU");
         false

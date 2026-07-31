@@ -58,6 +58,52 @@ const GSTS_TES: u32 = 1 << 31;
 const GCMD_SRTP: u32 = 1 << 30;
 const GSTS_RTPS: u32 = 1 << 30;
 /// Context-Cache: globale Invalidierung anfordern / Fertigmeldung.
+// --- Queued Invalidation (B-3.1) -------------------------------------------------------------
+//
+// **Vorbedingung, keine Alternative.** Der Registerpfad (`CCMD`/`IOTLB`) kann Kontext-Cache und
+// IOTLB invalidieren -- den **Interrupt-Entry-Cache** nicht: fuer den existiert ueberhaupt nur ein
+// QI-Deskriptor (Typ 0x4). Ohne QI ist Interrupt Remapping (B-3.2) also nicht bloss unbequem,
+// sondern nicht sicher abschaltbar/aenderbar, weil eine geaenderte IRTE nie wirksam invalidiert
+// werden koennte.
+//
+// **Und der Umstieg ist vollstaendig, nicht additiv.** Die Architektur verbietet den
+// Registerpfad, sobald `GSTS.QIES` steht (VT-d 6.5.2): beides parallel zu halten waere kein
+// Rueckfallnetz, sondern ein Fehler. Deshalb schalten die Invalidierungen unten hart um, statt
+// eine Wahl anzubieten.
+const REG_IQH: usize = 0x080; // Queue Head  (nur lesend)
+const REG_IQT: usize = 0x088; // Queue Tail
+const REG_IQA: usize = 0x090; // Queue Address + Groesse
+const REG_ICS: usize = 0x09C; // Invalidation Completion Status
+
+const GCMD_QIE: u32 = 1 << 26;
+const GSTS_QIES: u32 = 1 << 26;
+
+/// Deskriptoren sind 16 B; eine 4-KiB-Seite fasst 256 davon (IQA-Groessenfeld 0).
+const QI_DESCS: u64 = 256;
+const QI_DESC_BYTES: u64 = 16;
+
+/// Deskriptortypen (unteres Nibble von Wort 0).
+const QI_CC_INV: u64 = 0x1; // Context Cache
+const QI_IOTLB_INV: u64 = 0x2; // IOTLB
+const QI_IEC_INV: u64 = 0x4; // Interrupt Entry Cache -- gibt es NUR hier
+const QI_WAIT: u64 = 0x5; // Invalidation Wait
+
+/// Basisadresse der Warteschlange je Einheit (0 = QI nicht aktiv).
+static QI_QUEUE: [AtomicU64; super::dmar::MAX_UNITS] =
+    [const { AtomicU64::new(0) }; super::dmar::MAX_UNITS];
+/// Statuswort, in das der Wait-Deskriptor schreibt. Eigene Zeile, damit die Einheit nicht in
+/// fremde Daten schreibt; identity-gemappt wie alles andere hier.
+static QI_STATUS: [AtomicU64; super::dmar::MAX_UNITS] =
+    [const { AtomicU64::new(0) }; super::dmar::MAX_UNITS];
+/// Naechster freier Deskriptorplatz (in Deskriptoren, nicht Bytes).
+static QI_TAIL: [AtomicU64; super::dmar::MAX_UNITS] =
+    [const { AtomicU64::new(0) }; super::dmar::MAX_UNITS];
+
+/// Laeuft die Queued Invalidation auf Einheit 0?
+pub fn qi_active() -> bool {
+    QI_QUEUE[0].load(Ordering::Acquire) != 0
+}
+
 const CCMD_ICC: u64 = 1 << 63;
 const CCMD_CIRG_GLOBAL: u64 = 1 << 61;
 
@@ -528,9 +574,92 @@ pub fn init(root_table: u64, alloc: &mut dyn FnMut() -> Option<u64>) -> bool {
     if !gcmd_issue(GCMD_SRTP, GSTS_RTPS, true) {
         return false;
     }
+    // QI VOR der ersten Invalidierung aufsetzen (B-3.1): danach laeuft sie ueber die
+    // Warteschlange. Scheitert es, bleibt der Registerpfad gueltig -- `qi_active()` sagt dann
+    // `false`, und niemand behauptet etwas anderes. Interrupt Remapping (B-3.2) ist in diesem
+    // Fall NICHT zulaessig, weil der Interrupt-Entry-Cache dann nicht invalidierbar waere.
+    qi_enable(alloc);
     invalidate_context_cache();
     // Übersetzung aktivieren.
     gcmd_set_state(GCMD_TE, true)
+}
+
+
+/// **Queued Invalidation aufsetzen** (B-3.1). `alloc` liefert genullte, identity-gemappte 4-KiB-Frames.
+///
+/// Zwei Seiten: die Deskriptor-Warteschlange (256 x 16 B) und eine Seite fuer das Statuswort, in
+/// das der Wait-Deskriptor schreibt. Das Statuswort bekommt eine **eigene** Seite, weil die
+/// Einheit dorthin per DMA schreibt -- in einer geteilten Zeile wuerde sie fremde Daten
+/// ueberschreiben, und der Fehler traete weit entfernt von hier auf.
+///
+/// `false`, wenn kein Speicher da ist oder die Einheit `QIES` nicht bestaetigt. Der Aufrufer darf
+/// dann **nicht** so tun, als liefe QI: der Registerpfad bleibt gueltig, solange QIES aus ist.
+fn qi_enable(alloc: &mut dyn FnMut() -> Option<u64>) -> bool {
+    let Some(queue) = alloc() else { return false };
+    let Some(status) = alloc() else { return false };
+    // IQA: Bits 63:12 Adresse, Bits 2:0 Groesse (0 = 256 Deskriptoren), Bit 11 DW (128-Bit) = 0.
+    write64(REG_IQA, queue & !0xfff);
+    write64(REG_IQT, 0);
+    QI_QUEUE[0].store(queue, Ordering::Release);
+    QI_STATUS[0].store(status, Ordering::Release);
+    QI_TAIL[0].store(0, Ordering::Release);
+    if !gcmd_set_state(GCMD_QIE, true) {
+        // Nicht bestaetigt -> Zustand zuruecknehmen, sonst hielte `qi_active()` eine Unwahrheit.
+        QI_QUEUE[0].store(0, Ordering::Release);
+        return false;
+    }
+    true
+}
+
+/// Einen Deskriptor abschicken und auf seine Abarbeitung warten.
+///
+/// Angehaengt wird immer ein **Wait-Deskriptor** mit Statusschreibung: erst wenn die Einheit ihn
+/// abgearbeitet hat, sind alle davor liegenden Deskriptoren wirksam. Ohne ihn waere `IQT` nur die
+/// Aussage "eingereiht", nicht "durchgefuehrt" -- und eine Invalidierung, deren Wirksamkeit man
+/// nicht abwartet, ist genau die Sorte Zusage, die dieses Projekt nicht ausspricht.
+fn qi_submit(w0: u64, w1: u64) -> bool {
+    let queue = QI_QUEUE[0].load(Ordering::Acquire);
+    let status = QI_STATUS[0].load(Ordering::Acquire);
+    if queue == 0 {
+        return false;
+    }
+    // Statuswort auf 0, Zielwert 1 -- die Einheit schreibt ihn beim Abarbeiten des Wait-Deskriptors.
+    // SAFETY: `status` ist ein frisch alloziertes, identity-gemapptes, genulltes 4-KiB-Frame.
+    unsafe { write_entry(status, 0) };
+
+    let mut tail = QI_TAIL[0].load(Ordering::Acquire);
+    let mut put = |a: u64, b: u64, tail: &mut u64| {
+        let off = queue + (*tail % QI_DESCS) * QI_DESC_BYTES;
+        // SAFETY: `off` liegt in der allozierten Warteschlangenseite (Modulo ueber QI_DESCS).
+        unsafe {
+            write_entry(off, a);
+            write_entry(off + 8, b);
+        }
+        *tail += 1;
+    };
+    put(w0, w1, &mut tail);
+    // Wait: SW (Bit 5) = Statuswort schreiben, FN (Bit 6) = erst nach allen vorherigen.
+    put(QI_WAIT | (1 << 5) | (1 << 6) | (1u64 << 32), status, &mut tail);
+    QI_TAIL[0].store(tail, Ordering::Release);
+    write64(REG_IQT, (tail % QI_DESCS) * QI_DESC_BYTES);
+
+    for _ in 0..1_000_000 {
+        // SAFETY: identity-gemapptes Frame, von der Einheit per DMA beschrieben.
+        if unsafe { core::ptr::read_volatile(status as *const u64) } == 1 {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+/// **Interrupt-Entry-Cache invalidieren** (global). Gibt es **nur** als QI-Deskriptor -- das ist
+/// der Grund, warum B-3.1 Vorbedingung von B-3.2 ist und nicht Geschmackssache.
+pub fn invalidate_iec_global() -> bool {
+    if !qi_active() {
+        return false;
+    }
+    qi_submit(QI_IEC_INV, 0)
 }
 
 /// Globale Invalidierung des Kontext-Caches (Gegenstück zum `CMD_SYNC`-Round-Trip auf ARM):
@@ -538,6 +667,12 @@ pub fn init(root_table: u64, alloc: &mut dyn FnMut() -> Option<u64>) -> bool {
 pub fn invalidate_context_cache() -> bool {
     if !present() {
         return false;
+    }
+    // Sobald QI laeuft, ist der Registerpfad architektonisch VERBOTEN (VT-d 6.5.2) -- nicht bloss
+    // unnoetig. Deshalb umschalten statt beides halten (B-3.1).
+    if qi_active() {
+        // Granularitaet global: Bits 5:4 = 01.
+        return qi_submit(QI_CC_INV | (1 << 4), 0);
     }
     write64(REG_CCMD, CCMD_ICC | CCMD_CIRG_GLOBAL);
     for _ in 0..1_000_000 {
@@ -784,6 +919,18 @@ pub unsafe fn context_clear(root: u64, rid: u32) {
 pub fn invalidate_iotlb_global() -> bool {
     let mut all_ok = true;
     for u in 0..unit_count() {
+        // Einheit 0 laeuft ueber die Warteschlange, sobald QI steht -- der Registerpfad ist dann
+        // architektonisch verboten (B-3.1). **Die uebrigen Einheiten nicht:** QI wird heute nur
+        // auf Einheit 0 aufgesetzt, weil `VtdCaps` noch eine Einheit ist. Das ist keine
+        // Nachlaessigkeit, sondern der ausdrueckliche Rest von B-3.3 -- und es steht hier, damit
+        // es beim Umstieg auf mehrere DRHDs nicht uebersehen wird.
+        if u == 0 && qi_active() {
+            // Granularitaet global: Bits 5:4 = 01.
+            if !qi_submit(QI_IOTLB_INV | (1 << 4), 0) {
+                all_ok = false;
+            }
+            continue;
+        }
         let Some(c) = VtdCaps::read_unit(u) else { continue };
         let iro = (((c.raw_ecap >> 8) & 0x3ff) * 16) as usize;
         let iotlb = iro + 8;

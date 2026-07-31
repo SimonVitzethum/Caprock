@@ -251,6 +251,9 @@ static RMIG_EP_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
 static RMIG_V1_TID: AtomicU64 = AtomicU64::new(u64::MAX);
 static RMIG_RECEIVED: AtomicBool = AtomicBool::new(false); // v1 hat den CALL empfangen
 static RMIG_MIGRATED: AtomicBool = AtomicBool::new(false); // Migration meldete Erfolg
+static RMIG_QUIESCED: AtomicBool = AtomicBool::new(false); // A-4.2: Endpoint neu stillgelegt
+static RMIG_ROLE_OK: AtomicBool = AtomicBool::new(false); // A-4.2: Rollenbefund am offenen Call
+static RMIG_RESUMED: AtomicBool = AtomicBool::new(false); // A-4.2: wieder freigegeben
 static RMIG_RESULT: AtomicU64 = AtomicU64::new(u64::MAX); // Client-CALL-Ergebniscode
 static RMIG_VALUE: AtomicU64 = AtomicU64::new(u64::MAX); // Client-CALL-Antwortwert
 static RMIG_STEP: AtomicU32 = AtomicU32::new(0);
@@ -3716,6 +3719,25 @@ pub fn demo_report_then_idle() -> ! {
                     if RMIG_RECEIVED.load(Ordering::Acquire) {
                         let ep = RMIG_EP_ID.load(Ordering::Relaxed);
                         let v1 = ThreadId::from_raw(RMIG_V1_TID.load(Ordering::Relaxed));
+                        // A-4.2: den Ruhepunkt VOR dem Eingriff herstellen. Ohne die
+                        // Stilllegung waere jede Auskunft ueber offene Transaktionen in dem
+                        // Moment veraltet, in dem sie zurueckkommt -- ein CALL auf einem
+                        // anderen Kern genuegt. Erst danach ist der Befund unten eine
+                        // Aussage und keine Momentaufnahme.
+                        RMIG_QUIESCED.store(system::endpoint_begin_quiesce(ep), Ordering::Release);
+                        // Der Befund am ECHTEN offenen Call: v1 schuldet eine Antwort, also
+                        // ruht der Endpoint NICHT -- und zwar aus genau diesem Grund. Das ist
+                        // die Rollenaufschluesselung, die der Zustandstest (`run_quiesce`)
+                        // nicht fuellen kann.
+                        let q = system::endpoint_quiescence_of(ep, v1);
+                        RMIG_ROLE_OK.store(
+                            q.as_reply_owner
+                                && !q.as_sender
+                                && !q.as_caller
+                                && !q.is_quiescent()
+                                && !system::endpoint_is_idle(ep),
+                            Ordering::Release,
+                        );
                         let migrated = system::endpoint_migrate_owner(ep, v1);
                         RMIG_MIGRATED.store(migrated, Ordering::Release);
                         system::endpoint_retire_receiver(ep, v1);
@@ -3723,6 +3745,13 @@ pub fn demo_report_then_idle() -> ! {
                             RMIG_SERVER_PD.load(Ordering::Relaxed),
                             EP_CAP as usize,
                         );
+                        // A-4.2: freigeben, BEVOR v2 existiert -- nicht danach. Sonst liefe
+                        // v2s erstes RECV moeglicherweise in das noch geschlossene Tor und
+                        // bekaeme ERR_QUIESCING; ob das passiert, haengt daran, wann der
+                        // Scheduler ihn erstmals laufen laesst. Ein Rennen, das der Test
+                        // gelegentlich bestuende, ist schlimmer als keiner. Der Ruhepunkt hat
+                        // hier seinen Zweck (Migration + Rueckzug von v1) bereits erfuellt.
+                        RMIG_RESUMED.store(system::endpoint_end_quiesce(ep), Ordering::Release);
                         hal::cpu::local_irq_disable();
                         if let Some(v2) =
                             system::spawn_on_core(0, rmig_server_v2 as *const () as usize, 0, 3)
@@ -3740,7 +3769,12 @@ pub fn demo_report_then_idle() -> ! {
                     if r != u64::MAX {
                         let ok = r == result::OK
                             && RMIG_VALUE.load(Ordering::Acquire) == RMIG_V2_FACTOR * RMIG_INPUT
-                            && RMIG_MIGRATED.load(Ordering::Acquire);
+                            && RMIG_MIGRATED.load(Ordering::Acquire)
+                            // A-4.2: der Austausch lief ueber einen echten Ruhepunkt --
+                            // stillgelegt, Rollenbefund korrekt, wieder freigegeben.
+                            && RMIG_QUIESCED.load(Ordering::Acquire)
+                            && RMIG_ROLE_OK.load(Ordering::Acquire)
+                            && RMIG_RESUMED.load(Ordering::Acquire);
                         RMIG_OK.store(ok, Ordering::Release);
                         RMIG_DONE.store(true, Ordering::Release);
                     }

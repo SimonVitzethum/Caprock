@@ -278,6 +278,9 @@ fn spawn_demo() -> bool {
         STRIPE_ALLOC_OK.store(crate::colors::run_stripe_alloc(), Ordering::Release);
         // A-4.4: Versionssperre des Laders, beide Ausgaenge.
         IFACE_GATE_OK.store(crate::loader::run_iface_gate(), Ordering::Release);
+        // A-4.2: der ruhende Punkt -- die Torlogik, alle Ausgaenge. Laeuft auf einem lokalen
+        // Endpoint-Objekt, legt also keinen benutzten Endpoint still.
+        QUIESCE_OK.store(system::run_quiesce(), Ordering::Release);
     }
 
     // Cap-gesichertes IPC: ein Endpoint, zwei PDs. Der Server hält die RECV-, der Client die
@@ -331,6 +334,10 @@ static IFACE_GATE_OK: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 /// B-4.2: hat die Streifenvergabe den Erschoepfungsfall sauber abgewiesen?
 #[cfg(feature = "selftest")]
 static STRIPE_ALLOC_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// A-4.2: haelt der ruhende Punkt -- weist ein stillgelegter Endpoint neue Transaktionen ab?
+#[cfg(feature = "selftest")]
+static QUIESCE_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Der akkumulierte Badge der Root-Notification (`0`, wenn keine endowt wurde).
 #[cfg(feature = "selftest")]
@@ -387,7 +394,18 @@ fn all_done(archive: bool) -> bool {
     // Fehlschlag genau die Sorte Zeile, die niemand liest.
     let stripes = STRIPE_ALLOC_OK.load(Ordering::Acquire);
     let iface = IFACE_GATE_OK.load(Ordering::Acquire);
-    workers && IPC_DONE.load(Ordering::Acquire) && cores && ring3 && iso && root && stripes && iface
+    // A-4.2 aus demselben Grund wie B-4.2 in der Abschlussbedingung: eine Zusicherung, die nur
+    // im Bericht steht, faellt beim Brechen niemandem auf.
+    let quiesce = QUIESCE_OK.load(Ordering::Acquire);
+    workers
+        && IPC_DONE.load(Ordering::Acquire)
+        && cores
+        && ring3
+        && iso
+        && root
+        && stripes
+        && iface
+        && quiesce
 }
 
 /// Bericht + Abschaltung (das Testskript wertet die Marker aus).

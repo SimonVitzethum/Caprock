@@ -17,7 +17,7 @@
 
 use sel4lake_cap::{CapError, CapInfo, CapPtr, DmaCoherence, DmaDir, ObjectKind};
 use sel4lake_hal::{self as hal, exception::TrapFrame, fp::FpState, println};
-use sel4lake_ipc::{Endpoint, Notification};
+use sel4lake_ipc::{Endpoint, Notification, Quiescence};
 use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
 use sel4lake_microkit::{Caps, Domain};
 use sel4lake_region::heap::RegionSource;
@@ -5254,6 +5254,158 @@ pub fn endpoint_migrate_owner(ep: usize, tid: ThreadId) -> bool {
         return false;
     }
     eps()[ep].lock().migrate_owner(tid)
+}
+
+// -- A-4.2: der ruhende Punkt ----------------------------------------------------------
+//
+// Ein Austausch der Server-Instanz braucht einen Zeitpunkt, an dem feststeht, was offen ist.
+// Ohne Stilllegung gibt es den nicht: zwischen der Frage „ist etwas offen?" und der Antwort
+// kann auf einem anderen Kern ein CALL eintreffen, und die Antwort ist falsch, bevor sie
+// gelesen wird. `endpoint_begin_quiesce` schliesst neue Transaktionen aus; erst danach ist
+// `endpoint_quiescence_of`/`endpoint_is_idle` eine Aussage über mehr als den Moment.
+//
+// Der Begriff ist bewusst weiter gefasst als der Hot-Reload-Fall: `thread_quiescence`
+// beantwortet dieselbe Frage systemweit und trägt damit später Z4a (Thread einfrieren).
+
+/// **Endpoint stilllegen** (A-4.2): ab jetzt scheitern `CALL`/`RECV` mit `ERR_QUIESCING`,
+/// `REPLY` bleibt erlaubt — die Menge der offenen Transaktionen kann nur noch schrumpfen.
+/// Gibt `true`, falls der Endpoint dadurch **neu** stillgelegt wurde; `false`, wenn bereits
+/// ein anderer Austausch läuft (dann darf der Aufrufer ihn nicht für seinen halten) oder der
+/// Endpoint nicht belegt ist. Sperrt nur EPS[ep].
+pub fn endpoint_begin_quiesce(ep: usize) -> bool {
+    if ep >= eps().len() {
+        return false;
+    }
+    eps()[ep].lock().begin_quiesce()
+}
+
+/// **Stilllegung beenden** (Austausch fertig oder abgebrochen). Gibt `true`, falls der
+/// Endpoint stillgelegt war. Auf **jedem** Ausgang des Austauschs aufzurufen, auch dem
+/// fehlgeschlagenen: ein Endpoint, der stillgelegt zurückbleibt, weist von da an jeden
+/// `CALL` ab — ein Totalausfall, der aussieht wie ein laufender Austausch.
+pub fn endpoint_end_quiesce(ep: usize) -> bool {
+    if ep >= eps().len() {
+        return false;
+    }
+    eps()[ep].lock().end_quiesce()
+}
+
+/// Ist dieser Endpoint gerade stillgelegt?
+pub fn endpoint_is_quiescing(ep: usize) -> bool {
+    ep < eps().len() && eps()[ep].lock().is_quiescing()
+}
+
+/// **Ruht der Endpoint als Ganzes?** Keine wartenden Sender/Empfänger, kein offenes
+/// Reply-Token — die Bedingung, unter der ein Austausch niemanden trifft.
+pub fn endpoint_is_idle(ep: usize) -> bool {
+    ep >= eps().len() || eps()[ep].lock().is_idle()
+}
+
+/// **Ruhepunkt-Befund für einen Thread an einem Endpoint** — aufgeschlüsselt nach den vier
+/// Rollen (siehe [`Quiescence`]).
+pub fn endpoint_quiescence_of(ep: usize, tid: ThreadId) -> Quiescence {
+    if ep >= eps().len() {
+        return Quiescence::default();
+    }
+    eps()[ep].lock().quiescence_of(tid)
+}
+
+/// **Systemweiter Ruhepunkt-Befund für einen Thread** (A-4.2, und derselbe Begriff für Z4a):
+/// steht `tid` in **irgendeiner** IPC-Struktur — Endpoint-Queues, Reply-Token, Reply-Pflicht
+/// oder als Notification-Waiter? Die Rollen werden über alle Objekte verschmolzen, die
+/// Aufschlüsselung bleibt erhalten.
+///
+/// **Grenze, und sie ist wichtig:** diese Auskunft ist eine Momentaufnahme, solange nicht
+/// jeder betroffene Endpoint stillgelegt ist. Die Objekte werden nacheinander gesperrt (ein
+/// Lock über alle wäre eine Sperrordnungs-Verletzung und bei 10064 Objekten ohnehin
+/// untragbar), also kann sich ein früh gelesenes Objekt ändern, während ein spätes gelesen
+/// wird. Für „ruht der Thread wirklich?" ist das nur mit vorheriger Stilllegung eine Antwort;
+/// ohne sie ist es Telemetrie. Wer das verwechselt, friert einen laufenden Thread ein.
+pub fn thread_quiescence(tid: ThreadId) -> Quiescence {
+    let mut q = Quiescence::default();
+    for i in 0..eps().len() {
+        q = q.merge(eps()[i].lock().quiescence_of(tid));
+    }
+    for i in 0..ntfns().len() {
+        q = q.merge(ntfns()[i].lock().quiescence_of(tid));
+    }
+    q
+}
+
+/// **A-4.2-Selbsttest: die Torlogik des ruhenden Punktes, alle Ausgänge.**
+///
+/// Fährt gegen [`Endpoint::gate_new_transaction`] statt gegen `call`/`recv`, aus dem dort
+/// genannten Grund: über den regulären Pfad ist der Abweisungszweig nur während eines
+/// laufenden Austauschs erreichbar und bliebe sonst bis zum ersten echten Hot-Reload
+/// ungeprüft. Geprüft wird **dieselbe** Funktion, die `call`/`recv` ausführen.
+///
+/// Auf einem **lokalen** Endpoint-Objekt, nicht auf einem der echten: der Test darf keinen
+/// Endpoint stilllegen, den gerade jemand benutzt. Der Rollenbefund
+/// ([`Endpoint::quiescence_of`]) lässt sich hier nicht füllen — Queues und Reply-Token sind
+/// privat und werden nur von `call`/`recv` gesetzt. Er wird deshalb am **echten** offenen
+/// Call im Hot-Reload-Szenario (`rmig`) abgenommen, nicht an einer Attrappe.
+#[cfg(feature = "selftest")]
+pub fn run_quiesce() -> bool {
+    use sel4lake_abi::result;
+    let fremd = ThreadId::from_raw(0xA42_0001);
+    let mut e = Endpoint::EMPTY;
+
+    // Unbelegter Endpoint: nicht stilllegbar, und das Tor weist mit ERR_BADCAP ab -- NICHT mit
+    // ERR_QUIESCING. Die beiden Gründe duerfen nicht verschwimmen: "gibt es nicht" ist fuer
+    // einen Client eine andere Lage als "kommt gleich wieder".
+    let leer_nicht_stilllegbar = !e.begin_quiesce();
+    let leer_badcap = e.gate_new_transaction() == Some(result::ERR_BADCAP);
+    // Ein unbelegter (recycelter) Endpoint darf keine Rollen melden, sonst schleppte er den
+    // Befund seines Vorbesitzers weiter.
+    let leer_ohne_rollen = e.quiescence_of(fremd).is_quiescent();
+
+    e.mark_used();
+    let frisch_offen = e.gate_new_transaction().is_none();
+    let frisch_ruhig = e.is_idle();
+
+    // Stilllegen greift; ein ZWEITER Aufruf meldet false. Das ist kein Schoenheitsfehler:
+    // zwei gleichzeitige Austausche am selben Endpoint wuerden sich gegenseitig die Freigabe
+    // ziehen -- der erste `end_quiesce` oeffnete das Tor mitten im zweiten Austausch.
+    let erste_stilllegung = e.begin_quiesce();
+    let zweite_abgewiesen = !e.begin_quiesce();
+    let tor_zu = e.gate_new_transaction() == Some(result::ERR_QUIESCING);
+    let meldet_still = e.is_quiescing();
+    // Stillgelegt heisst NICHT beschaeftigt: ein Endpoint ohne offene Transaktion ruht auch
+    // waehrend der Stilllegung -- genau das ist die Bedingung, unter der ausgetauscht werden
+    // darf.
+    let still_und_ruhig = e.is_idle();
+
+    let freigabe = e.end_quiesce();
+    let tor_wieder_offen = e.gate_new_transaction().is_none();
+    let doppelte_freigabe_gemeldet = !e.end_quiesce();
+
+    let ok = leer_nicht_stilllegbar
+        && leer_badcap
+        && leer_ohne_rollen
+        && frisch_offen
+        && frisch_ruhig
+        && erste_stilllegung
+        && zweite_abgewiesen
+        && tor_zu
+        && meldet_still
+        && still_und_ruhig
+        && freigabe
+        && tor_wieder_offen
+        && doppelte_freigabe_gemeldet;
+    println!(
+        "quiesce : unbelegt nicht stilllegbar {leer_nicht_stilllegbar}; unbelegt -> BADCAP (nicht \
+         QUIESCING) {leer_badcap}; unbelegt ohne Rollen {leer_ohne_rollen}; frisch offen \
+         {frisch_offen}/ruhig {frisch_ruhig}; stilllegen greift {erste_stilllegung}; ZWEITER \
+         Austausch abgewiesen {zweite_abgewiesen}; Tor zu {tor_zu}; meldet still {meldet_still}; \
+         still+ohne offene Transaktion = ruhig {still_und_ruhig}; freigeben greift {freigabe}; Tor \
+         wieder offen {tor_wieder_offen}; doppelte Freigabe gemeldet {doppelte_freigabe_gemeldet}"
+    );
+    println!(
+        "quiesce : {} (A-4.2: der ruhende Punkt -- waehrend eines Austauschs wird KEINE neue \
+         Transaktion eroeffnet, laufende duerfen abschliessen)",
+        if ok { "ALL PASS" } else { "FAILURES" }
+    );
+    ok
 }
 
 /// **Eager-Cleanup beim Thread-Tod:** den (sterbenden) Thread `tid` aus ALLEN

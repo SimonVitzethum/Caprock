@@ -104,6 +104,22 @@ impl TidQueue {
         dup
     }
 
+    /// Steht dieser Thread in der Warteschlange? (Ruhepunkt-Abfrage, A-4.2.)
+    fn contains(&self, target: ThreadId) -> bool {
+        let mut found = false;
+        self.for_each(|t| {
+            if t == target {
+                found = true;
+            }
+        });
+        found
+    }
+
+    /// Ist die Warteschlange leer? (Ruhepunkt-Abfrage für den Endpoint als Ganzes.)
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
     /// Einen bestimmten Thread aus der Warteschlange entfernen (für Hot-Reload:
     /// einen blockierten Empfänger zurückziehen). Gibt `true`, falls gefunden.
     fn remove(&mut self, target: ThreadId) -> bool {
@@ -130,11 +146,59 @@ fn transfer(src: usize, dst: usize) {
     frame_set_reg(dst, reg::TAG, frame_reg(src, reg::TAG));
 }
 
+/// **Ruhepunkt-Befund (A-4.2).** Wieso ein Thread an einem Endpoint *nicht* ruht —
+/// aufgeschlüsselt nach den vier Rollen, die er dort haben kann, statt zu einem Bit
+/// vermengt.
+///
+/// Die Aufschlüsselung ist nicht Bequemlichkeit: die vier Rollen verlangen
+/// **verschiedene** Antworten. `as_reply_owner` heisst „schuldet eine Antwort" — darauf
+/// wartet man, oder man migriert sie ([`Endpoint::migrate_owner`]). `as_receiver` heisst
+/// „wartet auf Arbeit" — den zieht man einfach zurück ([`Endpoint::retire_receiver`]).
+/// `as_sender`/`as_caller` heisst, der Thread ist *Client* an diesem Endpoint, nicht
+/// Server; ihn stillzulegen ist eine andere Entscheidung als einen Server auszutauschen.
+/// Ein Sammelbit „nicht ruhig" liesse den Aufrufer raten, welcher der vier Fälle vorliegt —
+/// derselbe Fehler wie das alte `kernelseite=0` im Farbtest.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Quiescence {
+    /// Blockierter Sender: hat `CALL` abgesetzt, noch kein Server hat ihn übernommen.
+    pub as_sender: bool,
+    /// Blockierter Empfänger: wartet in `RECV` auf einen Aufrufer.
+    pub as_receiver: bool,
+    /// Wartet als Aufrufer auf eine Antwort (Reply-Token zeigt auf ihn).
+    pub as_caller: bool,
+    /// Schuldet als Server eine Antwort (Reply-Owner).
+    pub as_reply_owner: bool,
+}
+
+impl Quiescence {
+    /// Ruht dieser Thread an diesem Endpoint — steht er in **keiner** der vier Rollen?
+    pub fn is_quiescent(&self) -> bool {
+        !(self.as_sender || self.as_receiver || self.as_caller || self.as_reply_owner)
+    }
+
+    /// Zwei Befunde (verschiedene Endpoints) zu einem verschmelzen — für die
+    /// systemweite Frage „ruht dieser Thread überall?" (Z4a: Thread einfrieren).
+    pub fn merge(self, other: Quiescence) -> Quiescence {
+        Quiescence {
+            as_sender: self.as_sender || other.as_sender,
+            as_receiver: self.as_receiver || other.as_receiver,
+            as_caller: self.as_caller || other.as_caller,
+            as_reply_owner: self.as_reply_owner || other.as_reply_owner,
+        }
+    }
+}
+
 /// Ein Endpoint-Objekt. Der Kernel hält je Endpoint einen eigenen Lock; die
 /// Methoden operieren auf genau diesem einen Objekt.
 #[derive(Clone, Copy)]
 pub struct Endpoint {
     used: bool,
+    /// **Stillgelegt (A-4.2):** solange gesetzt, wird keine *neue* Transaktion eröffnet —
+    /// `CALL` und `RECV` scheitern mit `ERR_QUIESCING`, `REPLY` bleibt erlaubt. Damit
+    /// existiert ein Zustand, in dem die Menge der offenen Transaktionen nur noch
+    /// schrumpfen kann; ohne ihn wäre jede Ruhe-Auskunft in dem Moment veraltet, in dem
+    /// sie zurückkommt (ein `CALL` auf einem anderen Kern genügt).
+    quiescing: bool,
     /// Blockierte Aufrufer, die auf einen Empfänger warten.
     senders: TidQueue,
     /// Blockierte Empfänger, die auf einen Aufrufer warten.
@@ -159,6 +223,7 @@ impl Default for Endpoint {
 impl Endpoint {
     pub const EMPTY: Endpoint = Endpoint {
         used: false,
+        quiescing: false,
         senders: TidQueue::EMPTY,
         receivers: TidQueue::EMPTY,
         caller: None,
@@ -187,6 +252,88 @@ impl Endpoint {
     /// danach blockiert (geparkt). Gibt `true`, falls er Empfänger war.
     pub fn retire_receiver(&mut self, tid: ThreadId) -> bool {
         self.used && self.receivers.remove(tid)
+    }
+
+    // -- A-4.2: der ruhende Punkt --------------------------------------------------
+
+    /// **Stilllegen beginnen.** Ab jetzt wird keine neue Transaktion mehr eröffnet
+    /// (`CALL`/`RECV` -> `ERR_QUIESCING`); laufende dürfen abschliessen. Gibt `true`, falls
+    /// der Endpoint dadurch neu stillgelegt wurde, `false`, wenn er es schon war (dann läuft
+    /// bereits ein Austausch — der zweite Aufrufer darf ihn nicht für seinen halten) oder der
+    /// Endpoint gar nicht belegt ist.
+    pub fn begin_quiesce(&mut self) -> bool {
+        if !self.used || self.quiescing {
+            return false;
+        }
+        self.quiescing = true;
+        true
+    }
+
+    /// **Stilllegen beenden** (Austausch fertig oder abgebrochen). Der Endpoint nimmt wieder
+    /// neue Transaktionen an. Gibt `true`, falls er stillgelegt war.
+    pub fn end_quiesce(&mut self) -> bool {
+        let war = self.quiescing;
+        self.quiescing = false;
+        war
+    }
+
+    /// Ist dieser Endpoint gerade stillgelegt?
+    pub fn is_quiescing(&self) -> bool {
+        self.quiescing
+    }
+
+    /// **Ruhepunkt-Befund für einen Thread** an diesem Endpoint: in welchen der vier Rollen
+    /// steht er noch? Siehe [`Quiescence`].
+    ///
+    /// Die Antwort ist nur dann mehr als eine Momentaufnahme, wenn der Endpoint
+    /// [stillgelegt](Self::begin_quiesce) ist: dann kann die Menge der offenen Transaktionen
+    /// nur schrumpfen, ein `is_quiescent()` bleibt also wahr. Ohne Stilllegung darf der
+    /// Aufrufer daraus nichts folgern, was über den Moment hinausreicht.
+    pub fn quiescence_of(&self, tid: ThreadId) -> Quiescence {
+        if !self.used {
+            return Quiescence::default();
+        }
+        Quiescence {
+            as_sender: self.senders.contains(tid),
+            as_receiver: self.receivers.contains(tid),
+            as_caller: self.caller == Some(tid),
+            as_reply_owner: self.reply_owner == Some(tid),
+        }
+    }
+
+    /// **Die Torentscheidung für eine NEUE Transaktion** (`CALL`/`RECV`), als reine Funktion:
+    /// `None` = zulassen, `Some(code)` = mit diesem Ergebniscode abweisen.
+    ///
+    /// Herausgezogen aus demselben Grund wie `iface_record_or_check` bei A-4.4: der
+    /// Abweisungszweig ist über den regulären Pfad nur zu erreichen, wenn gerade ein
+    /// Austausch läuft — er bliebe also bis zum ersten echten Hot-Reload ungeprüft, und
+    /// ungeprüft heisst: vermutlich kaputt, wenn er zum ersten Mal gebraucht wird. So kann
+    /// der Selbsttest ihn direkt füttern, und zwar **dieselbe** Logik, die `call`/`recv`
+    /// ausführen — keine Nachbildung, die auseinanderlaufen kann.
+    pub fn gate_new_transaction(&self) -> Option<u64> {
+        if !self.used {
+            Some(result::ERR_BADCAP)
+        } else if self.quiescing {
+            Some(result::ERR_QUIESCING)
+        } else {
+            None
+        }
+    }
+
+    /// **Ruht der Endpoint als Ganzes?** Keine wartenden Sender, keine wartenden Empfänger,
+    /// kein offenes Reply-Token. Das ist die Bedingung, unter der ein Austausch der
+    /// Server-Instanz *niemanden* trifft — die ehrliche Variante aus A-4.2 („der Austausch
+    /// findet nur ohne offene Transaktion statt").
+    ///
+    /// Wartende **Sender** zählen mit, obwohl ihre Transaktion noch nicht begonnen hat: sie
+    /// haben ihre Nachricht bereits abgesetzt und blockieren. Ein Austausch, der sie
+    /// übergeht, liesse sie auf einen Server warten, den es nicht mehr gibt.
+    pub fn is_idle(&self) -> bool {
+        !self.used
+            || (self.senders.is_empty()
+                && self.receivers.is_empty()
+                && self.caller.is_none()
+                && self.reply_owner.is_none())
     }
 
     /// Einen **sterbenden** Thread aus ALLEN Strukturen dieses Endpoints entfernen
@@ -271,8 +418,12 @@ impl Endpoint {
     /// (+IPI) geweckt; der Aufrufer blockiert auf seinem Kern. Auf demselben Kern:
     /// Rendezvous-Fastpath (`switch_to`).
     pub fn call(&mut self, ops: &mut dyn SchedOps, core: usize, frame: usize) -> usize {
-        if !self.used {
-            frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_BADCAP);
+        // A-4.2: stillgelegt -> keine NEUE Transaktion. Der Aufrufer bekommt sofort einen
+        // benennbaren Fehler, statt als Sender einzureihen und auf einen Server zu warten,
+        // der gerade ausgetauscht wird. Auch ein wartender Empfänger wird dann bewusst NICHT
+        // bedient: sonst begänne genau die Transaktion, die der Ruhepunkt ausschliessen soll.
+        if let Some(code) = self.gate_new_transaction() {
+            frame_set_reg(frame, reg::SYSNO_RESULT, code);
             return frame;
         }
         let caller = ops.current_id(core);
@@ -307,8 +458,12 @@ impl Endpoint {
     /// `RECV`: auf einen Aufrufer warten. Gibt den fortzusetzenden Frame zurück
     /// (der eigene, falls sofort ein Sender da war; sonst ein anderer Thread).
     pub fn recv(&mut self, ops: &mut dyn SchedOps, core: usize, frame: usize) -> usize {
-        if !self.used {
-            frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_BADCAP);
+        // A-4.2: stillgelegt -> keine NEUE Transaktion. Das trifft die **alte** Instanz, die
+        // sonst noch einmal einen wartenden Sender übernähme und damit eine Antwortpflicht
+        // aufbaute, die der Austausch gleich wieder wegnehmen müsste. Die neue Instanz ruft
+        // ihr erstes RECV nach `end_quiesce` ab — das ist der Sinn der Reihenfolge.
+        if let Some(code) = self.gate_new_transaction() {
+            frame_set_reg(frame, reg::SYSNO_RESULT, code);
             return frame;
         }
         let server = ops.current_id(core);
@@ -419,6 +574,19 @@ impl Notification {
     /// aufzurufen.
     pub fn audit(&self, live: &mut dyn FnMut(ThreadId) -> bool) -> bool {
         self.waiter.map_or(false, |w| !live(w))
+    }
+
+    /// **Ruhepunkt-Befund (A-4.2/Z4a):** wartet dieser Thread hier in `WAIT`? Ein Wartender
+    /// zählt als **Empfänger** — er hält keine Antwortpflicht (Notifications haben keine),
+    /// blockiert aber auf ein Ereignis. Für „ist dieser Thread systemweit ruhig?" gehört er
+    /// dazu: ihn einzufrieren, während er auf ein Signal wartet, verliert das Signal nicht
+    /// (es akkumuliert in `pending`), aber ihn zu *übersehen* hiesse, ihn für lauffähig zu
+    /// halten, obwohl er blockiert.
+    pub fn quiescence_of(&self, tid: ThreadId) -> Quiescence {
+        Quiescence {
+            as_receiver: self.used && self.waiter == Some(tid),
+            ..Quiescence::default()
+        }
     }
 
     /// `SIGNAL`: `badge` ins Notification-Wort ODERn und einen etwaigen Wartenden

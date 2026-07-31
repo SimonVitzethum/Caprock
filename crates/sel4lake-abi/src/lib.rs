@@ -126,4 +126,15 @@ pub mod result {
     /// konnte. Der blockierte `CALL`-Aufrufer wird damit entblockt, statt dauerhaft zu
     /// hängen — der Client kann den Fehler behandeln (Retry/Abbruch).
     pub const ERR_SERVER_GONE: u64 = 5;
+    /// **Der Endpoint wird gerade stillgelegt** (A-4.2, ruhender Punkt): ein Austausch der
+    /// Server-Instanz läuft, deshalb wird keine *neue* Transaktion mehr eröffnet. Laufende
+    /// Transaktionen dürfen abschliessen (`REPLY` bleibt erlaubt) — abgewiesen werden nur
+    /// `CALL` und `RECV`.
+    ///
+    /// Der Unterschied zu [`ERR_SERVER_GONE`] ist der, auf den es ankommt: dort ist eine
+    /// **begonnene** Transaktion verloren, hier ist eine **nicht begonnene** abgewiesen. Ein
+    /// Client darf hierauf gefahrlos wiederholen, sobald der Austausch durch ist; dort muss er
+    /// wissen, ob der Server die Wirkung schon hatte. Denselben Code für beides zu nehmen
+    /// hiesse, dem Client diesen Unterschied zu verschweigen.
+    pub const ERR_QUIESCING: u64 = 8;
 }

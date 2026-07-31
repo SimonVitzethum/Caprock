@@ -212,6 +212,7 @@ if echo "$OUT" | grep -q "capsum  : Summenpruefung KONNTE NICHT LAUFEN"; then
     echo "  FAIL: A-3.4: die Summenpruefung konnte nicht laufen (Zaehlflaeche zu klein) -- das ist kein Bestehen"; fail=1
 fi
 check "iface   : ALL PASS" "A-4.4: die Versionssperre des Laders weist eine GEAENDERTE Schnittstellenversion ab und laesst die gleiche durch -- beide Ausgaenge belegt; eine andere program_id bleibt unberuehrt"
+check "quiesce : ALL PASS" "A-4.2: der ruhende Punkt -- ein stillgelegter Endpoint weist NEUE Transaktionen ab (ERR_QUIESCING, nicht ERR_BADCAP: 'kommt gleich wieder' ist fuer den Client eine andere Lage als 'gibt es nicht'), laufende duerfen abschliessen; ein ZWEITER Austausch am selben Endpoint wird abgewiesen"
 check "stripe  : ALL PASS" "B-4.2: erschoepfte Farbpartitionierung scheitert SAUBER -- der 5. Streifenversuch wird abgewiesen, statt den Satz der ersten PD still ein zweites Mal auszugeben; nach Freigabe wieder vergebbar (kein Leck)"
 check "audit   : ALL PASS"            "Stufe 4: Scheduler- + CDT-Audit sauber"
 # B-1.5: die erwartete Abwesenheit AUSSPRECHEN, statt sie durchlaufen zu lassen.

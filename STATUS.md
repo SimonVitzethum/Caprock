@@ -96,14 +96,37 @@ schrumpft. Details in [AGENTS.md](AGENTS.md), Mitteilung 1.
 
 ## Strang A — Ausführen und Austauschen (Claude A)
 
-**Zuletzt geändert (A): 2026-07-31 13:20 UTC**
+**Zuletzt geändert (A): 2026-07-31 16:55 UTC**
 
-**Gerade in Arbeit: nichts Angefangenes — A-3.4 ist komplett (Teil 1 `ec26cfb`, Teil 2 `1e2bd51`,
-Teil 3 `f6e5186`, Teil 4 `25d388a`, Summenprüfung `d1f5ed8`), A-4.2 (`4fca286`) und A-4.1
-(`a25fa23`) sind committet.** Von A-4 fehlt damit nur noch **A-4.3 (Zustandsübergabe)**; ohne
-Festlegung dort ist Hot-Reload ein Neustart mit Datenverlust, der anders heißt. Im Arbeitsbaum
-liegt nur **fremde** Arbeit: der QEMU-Auswahlblock in `test-qemu-x86.sh` (nicht von A, nicht
-mitcommittet).
+**Gerade in Arbeit: nichts Angefangenes — A-4 ist VOLLSTÄNDIG.** A-4.3 ist committet (`78f0d52`),
+damit stehen A-4.1 (`a25fa23`), A-4.2 (`4fca286`), A-4.3 (`78f0d52`), A-4.4 und A-4.5; A-3.4 ist
+komplett (Teil 1 `ec26cfb`, Teil 2 `1e2bd51`, Teil 3 `f6e5186`, Teil 4 `25d388a`, Summenprüfung
+`d1f5ed8`). Im Arbeitsbaum liegt nur **fremde** Arbeit: der QEMU-Auswahlblock in
+`test-qemu-x86.sh` und `todo-B-verlaesslichkeit.md` (beides B, nicht mitcommittet).
+**Nächster Schritt ist zu wählen** — A-4 gibt keinen mehr vor.
+
+**A-4.3 — Zustandsübergabe (`78f0d52`).** Gewählt ist die Region, die den Austausch überlebt —
+und damit ist ihr Format eine **ABI**. Der Punkt, an dem die Sache hängt, ist nicht das
+Überleben der Bytes, sondern die Frage, ob die neue Fassung weiß, *welche* Bytes sie liest: eine
+Region ohne Kopf verlagert das Problem bloß, weil v2 die Daten von v1 dann im eigenen Sinn deutet.
+Das ist kein Datenverlust, sondern ein fehlinterpretierter Zustand — der eine fällt auf, der
+andere nicht. Also versionierter Kopf (`state.rs` in `sel4lake-region`): `state_version`,
+`program_id`, Übernahmezähler; abweichendes Layout und fremde `program_id` werden **abgewiesen**
+statt gedeutet, eine frische Region meldet `NoState` statt „Version 0", und der Übernahmezähler
+steigt nur bei tatsächlicher Übernahme — erhöhte ihn eine Abweisung, belegte er das Gegenteil
+dessen, was er behauptet. Belegt in zwei Stufen: Torlogik auf x86 (`state : ALL PASS`),
+Ernstfall auf aarch64 (`ckpt : ALL PASS` — v1 rechnet `+1` und hinterlässt `[1, 2, 3]`, v2 rechnet
+mit `+10` weiter auf `[13, 23]`, also auf den übernommenen Werten, Generation 1). Der Ernstfall
+läuft **nicht** auf x86, weil er an der arch-neutralen Thread-Demo hängt, die dort nicht startet;
+das steht als Anmerkung im x86-Skript, damit ein grünes `state` nicht mehr verspricht, als es
+prüft. Suitenlauf 16:21/16:23: `rc_load=0 rc_arm=0`, beide Logs `== ALL PASS ==`, keine FAIL-Zeile.
+
+**Falle nach Container-Neubau (heute zweimal aufgeschlagen):** das Python-Paket `cryptography`
+fehlte (Load-Suite bricht mit `rc_load=2` ab, Manifest-Signieren geht nicht) und die
+**git-Identität war weg** (`Author identity unknown`). Ersteres per
+`pip3 install --user --break-system-packages cryptography`, letzteres bewusst **nicht** in die
+Repo-Config geschrieben, sondern pro Commit über `GIT_AUTHOR_*`/`GIT_COMMITTER_*` gesetzt — eine
+repo-weite Identität ließe Strang B unter A's Namen committen.
 
 **A-4.1 — atomares Umbinden (`a25fa23`).** Der Austausch prüfte bisher und tauschte danach.
 Zwischen beidem liegt ein Fenster: der Befund „keine offene Transaktion" ist eine Momentaufnahme,

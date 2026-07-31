@@ -205,6 +205,12 @@ else
     echo "  FAIL: A-3.4: nur ${NEP:-?} Endpoints / ${NNT:-?} Notifications, Ziel je 10000"; fail=1
 fi
 check "capsz   : ALL PASS" "A-3.4: der globale Cap-Space wurde nicht erschoepft -- gemessen am HOECHSTSTAND gleichzeitig belegter Slots, nicht am Endstand (ein Lauf, der zwischendurch an die Grenze stiess und danach aufraeumte, sieht am Ende harmlos aus)"
+check "capsum  : ALL PASS" "A-3.4 Abschluss: die SUMME wird geprueft, nicht nur das Budget je PD -- die Slots ausserhalb aller PD-Budgets (Wurzelcaps des Kernels) bleiben in der Reserve; sonst bekaeme eine PD INNERHALB ihres Budgets kein Slot mehr"
+# Die Summenpruefung darf nicht still ausfallen: eine zu kleine Zaehlflaeche ist ein eigener
+# Befund, kein bestandener Test (dieselbe Trennung wie Code 8 im CDT-Audit).
+if echo "$OUT" | grep -q "capsum  : Summenpruefung KONNTE NICHT LAUFEN"; then
+    echo "  FAIL: A-3.4: die Summenpruefung konnte nicht laufen (Zaehlflaeche zu klein) -- das ist kein Bestehen"; fail=1
+fi
 check "iface   : ALL PASS" "A-4.4: die Versionssperre des Laders weist eine GEAENDERTE Schnittstellenversion ab und laesst die gleiche durch -- beide Ausgaenge belegt; eine andere program_id bleibt unberuehrt"
 check "stripe  : ALL PASS" "B-4.2: erschoepfte Farbpartitionierung scheitert SAUBER -- der 5. Streifenversuch wird abgewiesen, statt den Satz der ersten PD still ein zweites Mal auszugeben; nach Freigabe wieder vergebbar (kein Leck)"
 check "audit   : ALL PASS"            "Stufe 4: Scheduler- + CDT-Audit sauber"

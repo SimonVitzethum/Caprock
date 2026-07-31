@@ -430,9 +430,9 @@ fn report_and_off(watchdog: bool) -> ! {
 
     // A-3.4: wie nah kam der globale Cap-Space seiner Grenze? Der Hoechststand, nicht der
     // Endstand -- s. `system::cap_peaks`. Gemeldet wird auch, wie viele PDs mit VOLLEM Budget
-    // ueberhaupt hineinpassen: `CAP_BUDGET_PER_PD` deckelt den Verbrauch EINER PD, aber niemand
-    // prueft die Summe, und `NPDS * CAP_BUDGET_PER_PD` uebersteigt die Kapazitaet um ein
-    // Vielfaches. Die Fairness-Zusage ist damit eine Annahme ueber das Verhalten der PDs.
+    // ueberhaupt hineinpassen: `CAP_BUDGET_PER_PD` deckelt den Verbrauch EINER PD, die Summe
+    // traegt seit A-3.4 die Dimensionierung (`CAP_SLOTS_TOTAL`). Nachgezaehlt wird sie von
+    // `capsum` weiter unten.
     let (pslots, cslots, pobjs, cobjs) = system::cap_peaks();
     let pd_voll = cslots / sel4lake_microkit::CAP_BUDGET_PER_PD;
     println!(
@@ -445,6 +445,27 @@ fn report_and_off(watchdog: bool) -> ! {
         "capsz   : {} (A-3.4: der globale Cap-Space wurde NICHT erschoepft -- gemessen am \
          Hoechststand, nicht am Endstand)",
         if capsz_ok { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // A-3.4 Abschluss: die SUMME. Das Budget deckelt eine PD; dass daneben noch die Wurzel-Caps
+    // des Kernels in die Tabelle passen, war eine Zahl (256) mit einem Kommentar daneben. Hier
+    // wird sie nachgezaehlt -- nicht durch Abziehen (zwei PDs koennen denselben CapPtr halten,
+    // dann zaehlt die Summe zu hoch und die Pruefung ginge faelschlich durch), sondern durch
+    // Markieren jedes von einer PD gehaltenen Slots.
+    let (nonbudget, reserve, sum_ok) = system::cap_nonbudget_slots();
+    if nonbudget == usize::MAX {
+        println!("capsum  : Summenpruefung KONNTE NICHT LAUFEN (Zaehlflaeche zu klein)");
+    } else {
+        println!(
+            "capsum  : {nonbudget}/{reserve} Slots ausserhalb aller PD-Budgets (Kernel-Wurzelcaps); \
+             Kapazitaet {cslots} = {} PD-Budgets + {reserve} Reserve",
+            sel4lake_microkit::CAP_SLOTS_FOR_ALL_PDS
+        );
+    }
+    println!(
+        "capsum  : {} (A-3.4: der Kernel bleibt in seiner Reserve -- sonst bekommt eine PD \
+         INNERHALB ihres Budgets keinen Slot mehr)",
+        if sum_ok { "ALL PASS" } else { "FAILURES" }
     );
 
     let sas = SAS_READ_OK.load(Ordering::Relaxed);

@@ -514,6 +514,50 @@ impl CapSpace {
         (self.peak_objects, self.objects.len())
     }
 
+    /// Den von `cap` bezeichneten Slot in `seen` **markieren** — Baustein der Summenprüfung
+    /// (A-3.4, Abschluss).
+    ///
+    /// Warum das hier steht und nicht beim Aufrufer: der Slot-Index in [`CapPtr`] ist
+    /// `pub(crate)` und soll es bleiben. Ein öffentlicher Index wäre eine zweite, ungeprüfte
+    /// Adressierung des Cap-Systems neben dem Handle; das Markieren braucht ihn, sonst niemand.
+    ///
+    /// Gibt `false` zurück, wenn `cap` **nicht auflösbar** ist (Slot außerhalb der Tabelle, frei,
+    /// oder Generation abgelaufen) oder `seen` zu kurz ist. Ein abgelaufenes Handle in einem
+    /// PD-Cspace ist kein Verbrauch, darf also auch nichts markieren.
+    pub fn mark_slot(&self, cap: CapPtr, seen: &mut [bool]) -> bool {
+        let Some(slot) = self.slots.get(cap.slot) else {
+            return false;
+        };
+        if !slot.used || slot.gen != cap.gen || cap.slot >= seen.len() {
+            return false;
+        }
+        seen[cap.slot] = true;
+        true
+    }
+
+    /// Belegte Slots, die in `seen` **nicht** markiert sind — die Gegenrechnung zu
+    /// [`mark_slot`](Self::mark_slot).
+    ///
+    /// Markiert der Aufrufer vorher jede Cap jeder PD, ist das Ergebnis der Verbrauch, der auf
+    /// **kein** PD-Budget geht: die Wurzel-Caps des Kernels. Genau diese Größe stand bisher gegen
+    /// eine Reserve, die niemand nachgezählt hat.
+    ///
+    /// `None` heißt „konnte nicht laufen" (`seen` kürzer als die Slot-Tabelle) — dieselbe
+    /// Unterscheidung wie Code 8 in [`audit_cdt`](Self::audit_cdt) und aus demselben Grund: eine
+    /// Prüfung, die nicht laufen kann, sieht sonst aus wie eine bestandene.
+    pub fn unmarked_used_slots(&self, seen: &[bool]) -> Option<usize> {
+        if seen.len() < self.slots.len() {
+            return None;
+        }
+        Some(
+            self.slots
+                .iter()
+                .enumerate()
+                .filter(|(i, s)| s.used && !seen[*i])
+                .count(),
+        )
+    }
+
     /// **Property-Oracle des Capability-Systems** (read-only). Prüft die strukturellen
     /// Invarianten des CDT + der Refcounts und gibt `0` bei Konsistenz zurück, sonst
     /// einen Anomalie-Code:

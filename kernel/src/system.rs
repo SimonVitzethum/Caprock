@@ -805,11 +805,12 @@ pub fn configure(cores: usize) -> (usize, usize, usize, u64) {
 
 /// **Slot-Kapazität des globalen Capability-Space** (A-3.4).
 ///
-/// Die Summe aller PD-Budgets plus eine Reserve für die Caps, die der **Kernel selbst** hält
-/// (Wurzel-Caps auf Speicherregionen, Endpoints/Notifications der Bringup-Kanäle, Loader-Cap des
-/// Root-Task, DMA-/MMIO-/IRQ-Caps der Treiber). Die Reserve steht neben der Summe und nicht in ihr:
-/// eine PD, die ihr Budget ausschöpft, soll dem Kernel keinen Slot wegnehmen können.
-const CAP_SLOTS: usize = sel4lake_microkit::CAP_SLOTS_FOR_ALL_PDS + 256;
+/// Summe aller PD-Budgets plus Kernel-Reserve. Die Rechnung stand hier als
+/// `CAP_SLOTS_FOR_ALL_PDS + 256` und damit an einer zweiten Stelle neben der Definition der
+/// Budgets; sie ist nach `sel4lake_microkit::CAP_SLOTS_TOTAL` gezogen. Was die Reserve deckt und
+/// warum sie neben der Summe steht, ist dort dokumentiert — **nachgezählt** wird sie von
+/// `cap_nonbudget_slots`.
+const CAP_SLOTS: usize = sel4lake_microkit::CAP_SLOTS_TOTAL;
 
 /// **Objekt-Kapazität** — genauso viele wie Slots.
 ///
@@ -867,6 +868,18 @@ pub fn configure_caps() -> u64 {
         );
     }
     CAPS.write().cspace.attach(slots, objects);
+    // Die Zusage "jede PD bekommt ihr Budget" haengt daran, dass die Tabelle wirklich so gross
+    // ist wie gerechnet. `attach` nimmt entgegen, was der Aufrufer gibt -- eine zu kleine Tabelle
+    // faellt sonst erst auf, wenn eine PD innerhalb ihres Budgets `NoSlot` bekommt, also
+    // fruehestens unter Last und ohne Hinweis auf die Ursache.
+    {
+        let g = CAPS.read();
+        let (have_slots, have_objs) = g.cspace.capacity();
+        assert!(
+            have_slots >= sel4lake_microkit::CAP_SLOTS_TOTAL && have_objs >= CAP_OBJECTS,
+            "Cap-Tabellen kleiner als gerechnet: {have_slots}/{have_objs} Slots/Objekte"
+        );
+    }
 
     // Finalisierungspuffer + Enforcer-Kratzflächen: je ein Eintrag pro Objekt, denn mehr Objekte
     // als die Tabelle fasst kann eine einzelne `delete`/`revoke`-Operation nicht finalisieren.
@@ -889,6 +902,12 @@ pub fn configure_caps() -> u64 {
     let refs = table(n * core::mem::size_of::<u32>(), 4096);
     // SAFETY: wie oben.
     unsafe { CAP_AUDIT.lock().attach(refs as *mut u32, n, |_| 0u32) };
+
+    // Zaehlflaeche der Summenpruefung: ein Markierbit je SLOT (nicht je Objekt), s.
+    // `cap_nonbudget_slots`.
+    let seen = table(CAP_SLOTS, 4096);
+    // SAFETY: wie oben.
+    unsafe { CAP_SEEN.lock().attach(seen as *mut bool, CAP_SLOTS, |_| false) };
 
     // A-3.4 Teil 3: die PD-Tabelle. Sie war der Grund, warum 10000 Threads keine 10000 Tenants
     // waren -- `[Pd; 256]` im `.bss`. Ab hier gilt dasselbe wie fuer die Cap-Tabellen: die Zahl
@@ -1083,6 +1102,26 @@ pub fn cap_audit_cdt() -> u32 {
     CAPS.read().cspace.audit_cdt(scratch.as_mut_slice())
 }
 
+/// **Summenprüfung des Cap-Budgets** (A-3.4, Abschluss): wie viele belegte Slots gehen auf **kein**
+/// PD-Budget, und passen sie in die Kernel-Reserve?
+///
+/// Liefert `(nicht_budgetiert, reserve, ok)`. `ok == false` heisst: der Kernel selbst hat mehr
+/// Slots belegt als die Reserve deckt — dann kann eine PD *innerhalb* ihres Budgets abgewiesen
+/// werden, obwohl `budget_allows` nichts zu beanstanden hat. Genau diese Richtung prüfte bisher
+/// niemand; die Dimensionierung trug die Zusage allein.
+///
+/// `nicht_budgetiert == usize::MAX` markiert „die Prüfung konnte nicht laufen" (zu kleine
+/// Zählfläche); `ok` ist dann `false`, nicht stillschweigend `true`.
+pub fn cap_nonbudget_slots() -> (usize, usize, bool) {
+    // Sperrordnung: CAP_SEEN vor CAPS (s. dort).
+    let mut scratch = CAP_SEEN.lock();
+    let g = CAPS.read();
+    match g.nonbudget_slots(scratch.as_mut_slice()) {
+        Some(n) => (n, sel4lake_microkit::CAP_SLOTS_KERNEL_RESERVE, n <= sel4lake_microkit::CAP_SLOTS_KERNEL_RESERVE),
+        None => (usize::MAX, sel4lake_microkit::CAP_SLOTS_KERNEL_RESERVE, false),
+    }
+}
+
 pub fn cap_install(cap: MemoryCap) -> Result<CapPtr, CapError> {
     CAPS.write().cspace.install_memory(cap)
 }
@@ -1149,6 +1188,17 @@ static FINALIZE: SpinLock<FinalizeBuf> = SpinLock::new(FinalizeBuf {
 /// Verklemmungsklasse ein — `CAP_AUDIT` nimmt ausschliesslich [`cap_audit_cdt`], und die nimmt
 /// unmittelbar danach `CAPS.read()`.
 static CAP_AUDIT: SpinLock<Slab<u32>> = SpinLock::new(Slab::empty());
+
+/// **Zählfläche der Summenprüfung** (A-3.4, Abschluss) — ein Markierbit je Cap-**Slot**.
+///
+/// Eigene Fläche statt Mitbenutzung von [`CAP_AUDIT`]: die dortige ist je *Objekt* dimensioniert
+/// (heute gleich gross, aber aus einem anderen Grund) und wird von `audit_cdt` genullt. Zwei
+/// Prüfungen, die sich einen Puffer teilen, laufen irgendwann ineinander — und dann meldet die
+/// eine ein Ergebnis, das die andere überschrieben hat.
+///
+/// **Sperrordnung wie bei [`CAP_AUDIT`]:** vor `CAPS`, genommen ausschliesslich von
+/// [`cap_nonbudget_slots`].
+static CAP_SEEN: SpinLock<Slab<bool>> = SpinLock::new(Slab::empty());
 
 /// Wie oft eine Finalisierungsmeldung mangels Kapazität verworfen wurde. **Muss 0 bleiben.**
 static FINALIZE_OVERFLOW: AtomicU32 = AtomicU32::new(0);

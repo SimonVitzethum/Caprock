@@ -69,6 +69,24 @@ pub const CAP_BUDGET_PER_PD: usize = 8;
 /// PD-Zahl auf 32 zu senken: das hätte dieselbe Zusage gerettet, indem es das System kleiner macht.
 pub const CAP_SLOTS_FOR_ALL_PDS: usize = NPDS * CAP_BUDGET_PER_PD;
 
+/// **Slots für die Caps, die der Kernel selbst hält** (Wurzel-Caps auf Speicherregionen,
+/// Endpoints/Notifications der Bringup-Kanäle, Loader-Cap des Root-Task, DMA-/MMIO-/IRQ-Caps der
+/// Treiber).
+///
+/// Die Reserve steht **neben** der Summe aller PD-Budgets, nicht in ihr: eine PD, die ihr Budget
+/// ausschöpft, soll dem Kernel keinen Slot wegnehmen können — und umgekehrt. Bis hierher war das
+/// eine Zahl im Boot-Code mit einem Kommentar daneben; nachgezählt hat sie niemand. Womit sie
+/// nachgezählt wird, steht an [`Caps::nonbudget_slots`].
+pub const CAP_SLOTS_KERNEL_RESERVE: usize = 256;
+
+/// **Gesamte Slot-Kapazität des globalen Cap-Space** — Summe aller PD-Budgets plus Kernel-Reserve.
+///
+/// Stand als `CAP_SLOTS_FOR_ALL_PDS + 256` im Boot-Code des Kernels. Dieselbe Begründung wie bei
+/// [`CAP_SLOTS_FOR_ALL_PDS`]: die Rechnung gehört an *eine* Stelle, sonst läuft die abgeschriebene
+/// Zahl beim nächsten Drehen an [`NPDS`] oder [`CAP_BUDGET_PER_PD`] still auseinander — und still
+/// auseinandergelaufen heißt hier: eine PD innerhalb ihres Budgets bekommt `NoSlot`.
+pub const CAP_SLOTS_TOTAL: usize = CAP_SLOTS_FOR_ALL_PDS + CAP_SLOTS_KERNEL_RESERVE;
+
 /// **Wie viele Endpoint-Objekte alle PDs zusammen brauchen** (A-3.4 Teil 4).
 ///
 /// Dieselbe Rechnung eine Ebene weiter, und derselbe Fund: `NENDPOINTS = 32` in `sel4lake-ipc`
@@ -148,6 +166,50 @@ impl Caps {
             return true; // Ersetzen, kein zusätzlicher Slot
         }
         self.pds.cap_count(pd) < CAP_BUDGET_PER_PD
+    }
+
+    /// **Die Summenprüfung** (A-3.4, Abschluss): wie viele globale Slots gehen auf **kein**
+    /// PD-Budget?
+    ///
+    /// [`budget_allows`](Self::budget_allows) deckelt den Verbrauch **einer** PD; dass die Summe
+    /// aller Budgets in die Tabelle passt, trägt seit A-3.4 die Dimensionierung
+    /// ([`CAP_SLOTS_TOTAL`]). Ungeprüft blieb die andere Seite derselben Rechnung: der Kernel
+    /// selbst installiert Wurzel-Caps, und nichts hindert ihn daran, mehr als
+    /// [`CAP_SLOTS_KERNEL_RESERVE`] zu belegen. Dann ist jede einzelne PD innerhalb ihres Budgets
+    /// und die Zusage „jede PD bekommt ihr Budget" trotzdem gebrochen — mit `NoSlot` an einer
+    /// Stelle, die nichts falsch gemacht hat.
+    ///
+    /// Gezählt wird **nicht** über `used_slots() − Σ cap_count(pd)`: halten zwei PDs denselben
+    /// [`CapPtr`], überzählt die Summe, und der Fehlbetrag zeigt in die unsichere Richtung (die
+    /// Prüfung ginge durch, obwohl sie es nicht sollte). Stattdessen wird jeder von einer PD
+    /// gehaltene Slot in `seen` markiert und danach ausgezählt, was belegt und unmarkiert blieb.
+    ///
+    /// `seen` muss mindestens so viele Einträge haben wie die Slot-Tabelle; sein Inhalt beim
+    /// Eintritt ist gleichgültig (wird genullt). `None` heißt „konnte nicht laufen", nicht „in
+    /// Ordnung" — siehe [`CapSpace::unmarked_used_slots`].
+    pub fn nonbudget_slots(&self, seen: &mut [bool]) -> Option<usize> {
+        let (nslots, _) = self.cspace.capacity();
+        if seen.len() < nslots {
+            return None;
+        }
+        seen[..nslots].fill(false);
+        for pd in 0..self.pds.capacity() {
+            if !self.pds.is_used(pd) {
+                continue;
+            }
+            for cap in self.pds.caps_of(pd).into_iter().flatten() {
+                // Ein nicht auflösbares Handle markiert nichts — es ist kein Verbrauch.
+                let _ = self.cspace.mark_slot(cap, seen);
+            }
+        }
+        self.cspace.unmarked_used_slots(seen)
+    }
+
+    /// Hält der Kernel sich an seine Reserve? `Some(true)`/`Some(false)`, `None` = die Prüfung
+    /// konnte nicht laufen (zu kleine Zählfläche) — die drei Fälle bleiben getrennt.
+    pub fn kernel_reserve_ok(&self, seen: &mut [bool]) -> Option<bool> {
+        self.nonbudget_slots(seen)
+            .map(|n| n <= CAP_SLOTS_KERNEL_RESERVE)
     }
 
     /// Erlaubt die Domänen-Policy die Cap-Art von `cap` in PD `pd`? Reiner Test (kein Eintrag) —

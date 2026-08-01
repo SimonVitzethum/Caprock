@@ -72,7 +72,15 @@ Beziehungen verlorengehen**.
 Das ist die schärfere Fassung der bestehenden Projektgrenze („nur Mikrokern, Caps, Scheduler, IPC
 und Microkit-Runtime im Image") und zieht Konsequenzen nach sich, die über sie hinausgehen.
 
-- [ ] **Z11a. Das Henne-Ei-Problem benennen und lösen.** Einen Plattentreiber kann man nicht von
+- [ ] **Z11a. Das Henne-Ei-Problem benennen und lösen.** *(Bootloader-Weg belegt 2026-08-01:
+      `tools/mkgrubiso.sh` baut ein GRUB-ISO aus Kernel + Boot-Archiv; ein echter Bootloader
+      liefert nachweislich dasselbe wie QEMUs `-kernel`/`-initrd` — Speicherplan, ein Modul,
+      `mbmod : ALL PASS`, `archive : 2 Modul(e) -> ALL PASS`, Root-Task läuft,
+      `SELFTEST COMPLETE`. Einziger Unterschied: die Ladeadresse des Moduls, wie erwartet.
+      Die Sorge wegen `Flags = 0` im Multiboot-Header war unbegründet — GRUB liefert
+      Speicherplan und Module auch ungefragt. **Offen bleibt die zweite Hälfte:** das
+      Nachladen zur Laufzeit, und dafür fehlt jeder Treiber — `crates/` enthält keinen
+      einzigen. Erst mit A-5.2 (virtio auf x86) gibt es etwas, von dem man nachladen kann.)* Einen Plattentreiber kann man nicht von
       der Platte laden. Der einzige ehrliche Ausweg: **der Bootloader liefert die Startmodule**
       (Multiboot-Module bei GRUB) — die liegen damit außerhalb des Kernel-Images, kommen aber
       trotzdem zum Boot an. Das Manifest nennt sie; der Kernel prüft, dass genau das ankam, was

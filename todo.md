@@ -22,6 +22,20 @@ keine VM darin. Es gibt keine Gastschicht: Isolation, Zeit- und Ressourcenverwal
 Kern selbst. Daraus folgen drei Anforderungen, die keine reine Fleißarbeit sind, sondern den
 Entwurf mitbestimmen — und an denen die Abschnitte A–G im Folgenden hängen.
 
+**Die Lastform (Simon, 2026-08-01): Vercel-artige Dienste.** Kurzlebige Funktionsaufrufe, hohe
+Fluktuation, **viele Mandanten je Maschine**, fremder Code. Das ist keine Randnotiz, sondern legt
+drei Größen fest, die sonst frei wählbar aussähen:
+
+* **Spawn/Teardown ist der heiße Pfad**, nicht der Startpfad. Genau dort saßen die D0-Rennen.
+* **Die Zahl gleichzeitig getrennter Mandanten ist heute 4.** `PARTITIONS = 4`, und `claim_stripe`
+  scheitert ab dem fünften sauber (B-4.2) — richtig so, aber vier cache-getrennte Mandanten je
+  Maschine sind für diese Lastform um Größenordnungen zu wenig. Und Erhöhen ist nicht gratis:
+  `region_bytes()` ist `min(Farben, 64) / PARTITIONS` Seiten, bei `PARTITIONS = 64` also **eine
+  Seite** je zusammenhängender Region. Diese Spannung ist der eigentliche Inhalt von B-4.1.
+* **Die Maschine muss Blech sein.** Neu belegt am 2026-08-01 (B-4.5): läuft SEL4Lake selbst als
+  Gast, schreibt der Wirt die Farbbits um, und die Cache-Trennung ist wirkungslos — gemessen, nicht
+  vermutet. Wer „Isolation ohne VMs" verkauft und dafür gemietete VMs benutzt, verkauft nichts.
+
 **Z1. Kein VM-Overhead, Isolation vollständig durch den Kern.** Der isolierte Pfad (eigene VSpace
 je PD, gefärbt) muss der **Normalfall** werden, nicht die Ausnahme. Heute ist `spawn_isolated` der
 reguläre Weg und ungefärbt; `spawn_isolated_colored` ist der Sonderweg (s. [A1](#a1-cache--timing-seitenkanäle-zwischen-pds)).

@@ -614,9 +614,6 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
 - [ ] **D4** Verus laut `docs/verification.md` offen: `delete_leaf` auf der vereinten Struktur,
       Kinderlisten-Erreichbarkeit, danach Scheduler/IPC.
 
-- [ ] **D5** `docs/verification.md`: Tier-1-Roadmap führt „Concurrency-Modellprüfung der Locks" noch
-      als offen, obwohl Loom Stufe 2 seit `c2116ac` existiert (stale).
-
 ---
 
 ## F. Debug-/Testcode aus dem Release-Build nehmen

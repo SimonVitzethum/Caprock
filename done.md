@@ -201,3 +201,15 @@ eine zweite Fassung im Testmodul hätte am Ende nur die eigene Arithmetik bestä
       wiederhergestellt); eine StreamID ohne Gerät (Konfigurations-Read `0xFFFF`) landet
       deterministisch im Pending-Zustand, die Region fehlt genau um ihre Größe, der Unmap ist
       trotzdem erfolgt, Code 7 hält.
+
+## D. Verifikation
+
+- [x] **D5** Tier-1-Roadmap in `docs/verification.md` war stale — sie führte die
+      Concurrency-Modellprüfung der Locks noch als offen, obwohl Loom Stufe 2 seit `c2116ac`
+      steht. Abgehakt in `529bc35` (B-2.4), **mit der Grenze daneben**: Loom modelliert eine
+      *Kopie* des Algorithmus, ein Fehler in der `cfg`-Auswahl bleibt für Loom wie für Kani
+      unsichtbar. Genau dort lag B-1.1, der x86-IRQ-Deadlock.
+      Der Punkt stand danach noch in `todo.md` — der Eintrag beschrieb also einen Zustand, den
+      es seit `529bc35` nicht mehr gab. Eine Liste, die Erledigtes als offen führt, ist
+      derselbe Fehler wie ein grüner Testlauf ohne Testergebnis: sie sagt etwas aus, wofür sie
+      keinen Beleg hat.

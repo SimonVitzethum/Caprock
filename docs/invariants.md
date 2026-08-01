@@ -652,6 +652,12 @@ Arithmetik zusätzlich auf dem Host (`sel4lake-mem`, `hal::cache_decode`).
 damit an der Physadresse und sind seitenkonstant — das ist die *Farbe*. Die Geometrie wird
 **gemessen** (`hal::cache`: CPUID-Blatt 4 bzw. CLIDR/CCSIDR), nicht angenommen.
 
+**Auf beiden Zweigen geprüft (seit 2026-08-01).** Der Test lag bis dahin im x86-Hochlauf und lief
+auf aarch64 nicht — die CLIDR/CCSIDR-Fassung war übersetzt, aber nie an einer echten Zuteilung
+geprüft. Er liegt jetzt arch-neutral in `kernel/src/colors.rs` und wird von beiden Wegen gefahren
+(wie `kernel/src/dmatests.rs`), gemeldet aus **einer** Druckstelle. Erste ARM-Messung unter QEMU
+`virt`: L2, 1024 KiB, 16-fach, 64 B/Zeile, 1024 Sets → 16 Seitenfarben.
+
 ### Was diese Zusicherung ausdrücklich NICHT umfasst
 
 Diese Liste ist der wichtigere Teil des Abschnitts. Eine Isolationszusage, deren Grenzen man nicht
@@ -668,13 +674,17 @@ kennt, wird im Betrieb überdehnt.
   kann es nicht sein: 512 Seiten überstreichen bei den gemessenen 256 Farben jede Farbe zweimal.
   Das ist Arithmetik, kein Zuteilungsproblem. Solange `spawn_isolated` der Normalfall ist, wirkt
   A1 im Normalbetrieb **nicht** (`todo.md` Z1/B-4.1).
-* **Mehr PDs als Streifen.** `colors::mask_for` vergibt rundläufig **ohne** Belegungsprüfung. Mehr
-  gleichzeitige PDs als Partitionen heißt heute **stille** Farbüberschneidung — nicht Fehlschlag.
-  Bis das behoben ist (B-4.2), gilt die Invariante nur bis `PARTITIONS` gleichzeitigen PDs.
+* **Mehr PDs als Streifen — behoben (B-4.2), aber die Grenze bleibt.** `claim_stripe` führt
+  Belegung; ist kein Streifen frei, gibt es `None`, und die PD entsteht **gar nicht erst**. Es gibt
+  keine ungefärbte Rückfallebene. Die Zusicherung wird also nicht mehr still schwächer — sie hört
+  auf, vergeben zu werden. Der Preis ist derselbe in anderer Form: **mehr als `PARTITIONS`
+  gleichzeitig getrennte PDs gibt es nicht**, und der Aufrufer muss den Fehlschlag behandeln.
+  (`colors::mask_for`, rundläufig und ungeprüft, steht nur noch im Selbsttest.)
 * **Wirkung, nicht nur Zuteilung.** Belegt ist, dass die Farbsätze disjunkt *sind*. **Nicht**
   belegt ist, dass daraus messbar geringere gegenseitige Verdrängung folgt — dafür bräuchte es
-  Prime+Probe auf echter Hardware. Unter TCG ist das sinnlos, weil der Emulator keinen echten
-  Cache hat.
+  Prime+Probe. Unter TCG ist das sinnlos, weil der Emulator keinen echten Cache hat; **unter KVM
+  wäre es messbar** (die Suite läuft dort seit 2026-08-01 mit `-cpu host,+invtsc`), und das ist
+  damit kein Hardware-, sondern ein Arbeitspunkt (`todo.md` A1).
 * **`1` ist kein Erfolgswert.** Meldet die Plattform keine Cache-Geometrie, gibt es genau eine
   Farbe. „Die Farbsätze zweier PDs sind disjunkt" wäre dann strukturell wahr, ohne geprüft zu
   sein. `colors::usable()` trennt das, und der Test meldet **SKIP statt PASS**.

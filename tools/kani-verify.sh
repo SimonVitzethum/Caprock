@@ -14,6 +14,22 @@
 #   tools/kani-verify.sh                         # ALLE Ziele (loader, region, sync) — so nutzt es die CI
 #   tools/kani-verify.sh loader                  # nur ein Ziel
 #   tools/kani-verify.sh loader --harness cert::kani_proofs::parse_never_panics
+
+# --- Riegel gegen die falsche Shell -------------------------------------------------------
+# Dieses Skript ist bash-spezifisch (`local`, `$'...'`, `set -o pipefail`). Am 2026-07-31 wurde
+# es versehentlich als `sh tools/kani-verify.sh` gefahren: dabei lief GENAU EIN Ziel von vier
+# -- und der Rueckgabewert war trotzdem 0. Ein Lauf, der drei Viertel auslaesst und Erfolg
+# meldet, ist die gefaehrlichste Sorte gruen, weil niemand ihn nachprueft.
+#
+# Die Anleitung sagte das bereits (docs/kani-lauf.md). Eine Anleitung ist aber keine Sperre:
+# sie wirkt nur auf den, der sie liest, und der Fehler passiert dem, der es eilig hat. Deshalb
+# steht der Riegel VOR `set -euo pipefail` -- unter dash scheitert diese Zeile selbst.
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "FEHLER: dieses Skript braucht bash, nicht sh/dash." >&2
+    echo "        Aufruf:  bash tools/kani-verify.sh [ziel ...]" >&2
+    exit 2
+fi
+
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -81,13 +97,29 @@ run_target() { # $1=loader|region|sync ; weitere Args -> cargo kani
     esac
     echo "== Kani: $pkg =="
     ( cd "$dir" && cargo kani -p "$pkg" "$@" )
+    GELAUFEN=$((GELAUFEN + 1))
 }
 
 # Ziele mit Harnesses (wird erweitert, sobald weitere Crates aufgenommen sind).
 DEFAULT_TARGETS="loader region sync unsafe"
 
+# Mitzaehlen, wie viele Ziele tatsaechlich durchliefen. Der Riegel oben faengt die falsche
+# Shell; diese Zaehlung faengt alles andere, was einen Durchlauf still verkuerzen koennte --
+# ein veraendertes DEFAULT_TARGETS, ein `break` in einer kuenftigen Fassung, eine Schleife, die
+# aus einem Grund abbricht, den heute niemand vorhersieht.
+GELAUFEN=0
+
 if [ "$#" -eq 0 ]; then
+    ERWARTET=0
+    for t in $DEFAULT_TARGETS; do ERWARTET=$((ERWARTET + 1)); done
     for t in $DEFAULT_TARGETS; do run_target "$t"; done
 else
+    ERWARTET=1
     run_target "$@"
 fi
+
+if [ "$GELAUFEN" -ne "$ERWARTET" ]; then
+    echo "FEHLER: $GELAUFEN von $ERWARTET Zielen gelaufen -- das ist KEIN Beweisergebnis." >&2
+    exit 1
+fi
+echo "== Kani: $GELAUFEN von $ERWARTET Zielen durchlaufen =="

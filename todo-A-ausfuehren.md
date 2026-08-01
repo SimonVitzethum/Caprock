@@ -229,8 +229,31 @@ Für einen Betriebsanspruch fehlen drei Dinge.
 
 ## A-5. Etwas, das sich lohnt zu laden (Z10)
 
-- [ ] **A-5.1 Treiberrahmen als Userland-PD.** MMIO-Cap, IRQ-Cap, DMA-Cap — die Stücke existieren
-      einzeln; es fehlt die Zusammenfassung zu „so schreibt man hier einen Treiber".
+- [ ] **A-5.1 Treiberrahmen als Userland-PD** — **jetzt gesetzte Regel, nicht mehr nur Plan.**
+
+      Simon, 2026-08-01: *„in den Mikrokernel sollen nur Sachen die reingehören, keine Treiber
+      direkt im Mikrokernel."* Das ist die Voraussetzung für Hot-Reload, Fehlereindämmung und
+      Mandantentrennung — ein Treiber im Kern kann keins davon.
+
+      **Gemessener Stand (2026-08-01):** es läuft **kein einziger** Treiber als geladenes
+      Userland-Programm. Die Bausteine sind vollständig da — `libsel4lake` hat `map`/`unmap`
+      (MMIO-Frame-Cap), `wait` (IRQ als Notification), `call`/`recv`/`reply` (Kanal), und der
+      RTC-Test belegt den Weg. Benutzt werden sie nur von Testdiensten. Was fehlt, ist der
+      **Rahmen**: ein Treiber-PD-Gerüst, das diese Caps entgegennimmt, und die Umkehrung der
+      Richtung — der Kernel ruft heute den Treiber, künftig meldet sich der Treiber beim Kernel.
+
+      **Die Grenze ist seit heute geprüft, nicht nur beschrieben:** `tools/kernel-grenze.sh` führt
+      eine Erlaubnisliste der HAL-Module, jeder Eintrag mit Begründung, *warum der Kern das Gerät
+      selbst braucht*. Die Trennlinie ist nicht „Hardware ja/nein" — die HAL fasst per Definition
+      Hardware an — sondern: MMU, Interrupt-Controller, Timer und IOMMU sind die Mechanik von
+      Isolation und Einplanung selbst; ein RNG, eine Netzkarte, eine Platte sind Dienste *für*
+      Mandanten. Der Wächter weist beim Selbsttest nach, dass er ein untergeschobenes Modul
+      erkennt. **Eine Ausnahme steht drin, benannt und nicht genehmigt: `virtio`** — heute im Kern,
+      weil es das DMA-Beweisgerät ist, Ausgang ist genau dieser Punkt.
+
+      Beim ersten Lauf hat der Wächter sofort ein Modul gemeldet, das niemand auf dem Schirm hatte
+      (`hook.rs`, legitim: Trap-Mechanik). Genau dafür ist er da.
+
 - [~] **A-5.2 virtio auf x86** — der **Transport** steht und ist auf x86 belegt (2026-08-01).
       Offen bleiben **Netz und Blockgerät**.
 

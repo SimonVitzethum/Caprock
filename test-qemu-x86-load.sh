@@ -104,7 +104,7 @@ boot() {
         -kernel "$KELF.mb32" -m "$RAM" -smp 4 "${ACCEL[@]}" \
         -machine q35,kernel-irqchip=split -device intel-iommu,caching-mode=on \
         -device virtio-rng-pci "${extra[@]}" \
-        -nographic -serial file:"$2" -no-reboot -no-shutdown \
+        -nographic -serial file:"$2" -no-reboot \
         </dev/null >/dev/null 2>&1 || true
 }
 

@@ -77,13 +77,35 @@ SEL_TEXT=$(readelf -S build/target/x86_64-unknown-none/release/sel4lake-kernel 2
 
 # Zuverlaessiger Capture ueber eine Datei (Pipe + SIGKILL verliert sonst QEMUs stdout-Puffer).
 LOG="$(mktemp)"
+# Zaehlt Laeufe, die das Zeitlimit rissen -- s. die Begruendung in boot_once().
+BOOT_TIMEOUTS=0
+
 boot_once() {
+    # KEIN `-no-shutdown`. Der Schalter haelt QEMU nach dem ACPI-Poweroff des Gastes am Leben;
+    # der Lauf kostete dadurch IMMER das volle Zeitlimit, egal wie schnell der Kernel fertig
+    # war. Gemessen am 2026-08-01 mit identischem Kernel und identischer Ausgabe (139 Zeilen,
+    # `SELFTEST COMPLETE` in beiden):
+    #
+    #     mit  -no-shutdown : 130038 ms, rc=124 (vom Zeitlimit erschlagen)
+    #     ohne -no-shutdown :    857 ms, rc=0   (sauber beendet)
+    #
+    # Faktor 152 -- aber der Zeitgewinn ist nicht der wichtigste Teil. Mit `-no-shutdown` lief
+    # JEDER Lauf ins Zeitlimit, `rc` war also immer 124 und trug keine Information. Deshalb
+    # musste ein Haenger bisher aus dem Logtext erschlossen werden (`bringup : WATCHDOG`).
+    # Ohne den Schalter bedeutet rc=124 genau das, was es soll: der Gast hat sich nicht
+    # heruntergefahren. Ein zweiter, unabhaengiger Melder fuer dieselbe Sache -- und einer,
+    # den kein Kernelfehler stillstellen kann, weil er ausserhalb liegt.
+    #
+    # aarch64 macht es seit jeher so (test-qemu.sh: nur `-no-reboot`, PSCI SYSTEM_OFF).
     timeout "$SECONDS_RUN" qemu-system-x86_64 \
         -kernel "$ELF" -m "$RAM" -smp 4 "${ACCEL[@]}" \
         -machine q35,kernel-irqchip=split -device intel-iommu,caching-mode=on,intremap=on \
         -device virtio-rng-pci \
-        -nographic -serial file:"$LOG" -no-reboot -no-shutdown \
-        </dev/null >/dev/null 2>&1 || true
+        -nographic -serial file:"$LOG" -no-reboot \
+        </dev/null >/dev/null 2>&1
+    local rc=$?
+    [ "$rc" -eq 124 ] && BOOT_TIMEOUTS=$((BOOT_TIMEOUTS + 1))
+    return 0
 }
 
 echo "== boot ($SECONDS_RUN s, $RUNS Lauf/Laeufe) =="
@@ -243,6 +265,20 @@ if echo "$OUT" | grep -q "bringup : WATCHDOG"; then
     echo "  FAIL: B-1.8: der Bericht kam aus der NOTBREMSE, nicht aus all_done() -- die Aussagen darunter sind zu einem Zeitpunkt abgelesen, nicht nach ihrem Beleg"; fail=1
 else
     echo "  PASS: B-1.8: der Bericht kam aus all_done() (kein Watchdog) -- die Aussagen sind belegt, nicht abgelesen"
+fi
+# Der Rueckgabewert von QEMU als zweiter, unabhaengiger Melder (s. boot_once()).
+#
+# Seit `-no-shutdown` weg ist, heisst rc=124: der Gast hat sich NICHT heruntergefahren. Das ist
+# eine Aussage von aussen -- sie haengt an keiner Zeile, die der Kernel selbst drucken muss.
+# Genau darin liegt ihr Wert: die Watchdog-Erkennung (B-1.8) liest das Log, und ein Kernel, der
+# in der falschen Lage schweigt, koennte sie taeuschen. Ein Zeitlimit kann er nicht taeuschen.
+if [ "$BOOT_TIMEOUTS" -gt 0 ]; then
+    echo "  FAIL: $BOOT_TIMEOUTS Lauf/Laeufe rissen das Zeitlimit von ${SECONDS_RUN}s -- der Gast"
+    echo "        hat sich nicht heruntergefahren. Das ist ein Haenger, unabhaengig davon, was im"
+    echo "        Log steht (s. todo D0)."
+    fail=1
+else
+    echo "  PASS: kein Lauf riss das Zeitlimit -- jeder Gast fuhr selbst herunter (rc=0)"
 fi
 # B-1.2c-Waechter: ein Ergebniswort, das die Signatur NICHT kennt, ist unsichtbar.
 #

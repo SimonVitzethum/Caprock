@@ -307,6 +307,31 @@ pub fn run_color(entry: usize, prio: u8) -> ColorTest {
     let b = crate::system::spawn_isolated_colored(entry, 1, prio, m1);
     if let (Some((ta, ba)), Some((tb, bb))) = (a, b) {
         r.spawned = true;
+
+        // Die Kernelseite SOFORT nach dem Erzeugen ablesen, vor jeder anderen Messung.
+        //
+        // Grund: Der Einsprungpunkt dieser PDs faultet ABSICHTLICH (Isolationstest). Ein
+        // anderer Kern sammelt den gefaulteten Thread ein, und dabei werden Kernel-Stack und
+        // ASID frei. `kstack_of()` und `vspace_tables_of()` liefern dann 0 -- und zwar alle
+        // drei zugleich, weil sie an derselben Belegung haengen.
+        //
+        // Genau das war am 2026-08-01 in 4 von 400 Laeufen zu sehen: `rueckgelesen=0
+        // (kstack=0 l1=0 l2=0)` bei sonst fehlerfreier Zuteilung (`in_mask`, `kernelseite`,
+        // `disjunkt`, `bilanz` alle 1). Kein Farbfehler, sondern ein Wettlauf mit dem
+        // Einsammler -- dieselbe Ursache, die weiter unten schon fuer `balanced` beschrieben
+        // ist ("nebenher sammelt ein anderer Kern den Stack ... ein").
+        //
+        // Das Ablesen ist ein Atomzugriff auf eine Tabelle, keine teure Operation; es vor die
+        // uebrigen Messungen zu ziehen kostet nichts und schliesst das Fenster.
+        let kernelseite: [(u64, u64, u64); 2] = core::array::from_fn(|i| {
+            let t = if i == 0 { ta } else { tb };
+            let ks = crate::system::testsupport::kstack_of(t.slot());
+            let (l1, l2) = crate::system::testsupport::vspace_tables_of(
+                crate::system::testsupport::asid_of(t.slot()),
+            );
+            (ks, l1, l2)
+        });
+
         r.in_mask = region_in_mask(ba, sz, r.colors, m0) && region_in_mask(bb, sz, r.colors, m1);
         r.disjoint = !regions_share_color((ba, sz), (bb, sz), r.colors);
         // Kernel-Seite: Stack (16 KiB) und die beiden obersten Tabellen (je 4 KiB) jeder PD.
@@ -316,11 +341,8 @@ pub fn run_color(entry: usize, prio: u8) -> ColorTest {
         r.ks_read = true;
         r.l1_read = true;
         r.l2_read = true;
-        for &(t, m) in [(ta, m0), (tb, m1)].iter() {
-            let ks = crate::system::testsupport::kstack_of(t.slot());
-            let (l1, l2) = crate::system::testsupport::vspace_tables_of(
-                crate::system::testsupport::asid_of(t.slot()),
-            );
+        for (i, &(_t, m)) in [(ta, m0), (tb, m1)].iter().enumerate() {
+            let (ks, l1, l2) = kernelseite[i];
             // Lesbarkeit und Färbung getrennt: eine `0` heisst „nicht zurueckgelesen", nicht
             // „falsch gefaerbt". Beides faellt weiterhin durch (`ok` fordert beide Sammelwerte),
             // aber die Meldung sagt jetzt, welcher der beiden Faelle vorliegt.

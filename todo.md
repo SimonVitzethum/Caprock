@@ -597,8 +597,9 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       Beide waren strukturell unsichtbar. Vollprotokolle liegen unter
       `build/diag/abweichung-lauf-N.log`.
 
-- [ ] **`color`-Fehlschlag: die Kernelseite wird zurückgelesen, nachdem der Thread eingesammelt
-      wurde** (starker Verdacht, noch nicht behoben). Alle vier Fehlschläge sind zeichengleich:
+- [ ] **`color`-Fehlschlag: die Buchführung wird geschrieben, NACHDEM der Thread lauffähig ist**
+      (Ursache am 2026-08-01 im Kernel lokalisiert, noch nicht behoben — ein erster Versuch im
+      Test hat nicht gewirkt, weil das Fenster nicht dort liegt). Alle vier Fehlschläge sind zeichengleich:
 
           gut:    rueckgelesen=1 (kstack=1 l1=1 l2=1)
           kaputt: rueckgelesen=0 (kstack=0 l1=0 l2=0)
@@ -617,13 +618,38 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       **absichtlich** (Isolationstest). Wird er eingesammelt, bevor die Kernelseite gelesen
       wird, sind Stack und ASID weg.
 
-      Zu tun: die Werte **vor** dem Fault erfassen, oder den Teardown gegen das Messfenster
-      abgrenzen — dieselbe Behandlung, die `balanced` schon bekommen hat.
+      **Die Stelle** (`spawn_isolated_colored_inner` in `kernel/src/system.rs`):
 
-- [ ] **Hänger ab `sched`** (2/400): Lauf 115 und 235 fehlen ausschließlich die Zeilen ab dem
-      Scheduler-Test; alles davor ist vollständig, `rc=124`. Zu klären am Vollprotokoll: vor
-      oder nach `smp : 4 von 4 Kern(en) online`? Das trennt den SMP-Hochlauf von der
-      Konsolensperre.
+          let tid = { let mut sched = SCHEDS[core].lock();
+                      sched.spawn_user(core, entry, arg, kbase, …) };   // lauffähig ab hier
+          match tid { Some(t) => { record_user_kstack(t.slot(), kbase); // Buchführung DANACH
+                                   set_vspace_of(t.slot(), packed);
+
+      Der Thread läuft, sobald `SCHEDS[core]` frei ist; Stack- und VSpace-Buchführung folgen
+      erst danach. Auf vier Kernen kann er dazwischen anlaufen, faulten und eingesammelt
+      werden.
+
+      **Folge jenseits des Tests:** Trifft der Einsammler das Fenster, sieht er
+      `base_of[slot] == 0` und gibt den Kernel-Stack **nie frei** — ein Leck, das kein Test
+      heute sucht. `set_vspace_of` schreibt danach in einen Slot, der bereits neu vergeben sein
+      kann.
+
+      Zu tun: die Buchführung **innerhalb** von `SCHEDS[core].lock()` erledigen, bevor der
+      Thread lauffähig wird — nicht danach. Der Test bekäme die Werte dann verlässlich; das
+      Leck verschwände als Nebenwirkung. Ein Versuch, allein im Test früher zu lesen, wurde
+      gemessen und half nicht (3 von 500 statt 4 von 400 — Rauschen).
+
+- [x] **Hänger ab `sched`** — Ursache gefunden und die Notbremse repariert (2026-08-01).
+      Läufe 115 und 235 blieben **nach** `smp : 4 von 4 Kern(en) online` stehen, ohne
+      `WATCHDOG`-Zeile. Der SMP-Hochlauf war also erfolgreich. Die Notbremse stand hinter
+      `system::reap()`, und das nimmt `SCHEDS[core].lock()` und `MEM.lock()` — blockiert der
+      Einsammler, dreht sich die Schleife nie weiter: **die Notbremse wurde von dem
+      ausgehungert, was sie überwachen soll**. Sie steht jetzt davor und zählt Ticks statt
+      Umdrehungen (50 Mio Umdrehungen sind unter KVM Millisekunden und unter TCG Minuten —
+      dieselbe Zahl meinte je nach Aufbau etwas anderes).
+      Gegenprobe: **500 Läufe, kein einziger riss das Zeitlimit** (vorher 2 von 400).
+      **Offen bleibt:** blockiert `reap()` selbst, hilft auch das nicht — dafür bräuchte es
+      eine Notbremse im Timer-Interrupt, außerhalb dieses Fadens. Steht so im Code.
 
 - [ ] **Sobald die Ursache feststeht:** der Lauf muss wieder wiederholbar sein, bevor A1 als
       abgenommen gilt. Ein Testaufbau, der stehenbleibt, kann keine Aussage über irgendeine

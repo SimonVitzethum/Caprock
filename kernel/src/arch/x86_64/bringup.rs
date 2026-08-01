@@ -980,15 +980,40 @@ pub fn run(multiboot_info: u64) -> ! {
         let archive = crate::loader::read_archive().is_some();
         let mut spins: u64 = 0;
         loop {
+            // Die Notbremse steht VOR `reap()`, und sie zaehlt Ticks statt Umdrehungen.
+            //
+            // Beides aus einem Grund, den zwei Haenger am 2026-08-01 gezeigt haben (Laeufe 115
+            // und 235 von 400): sie blieben nach `smp : 4 von 4 Kern(en) online` stehen, und
+            // im Log stand KEINE WATCHDOG-Zeile. Unter KVM braucht diese Schleife fuer 50 Mio
+            // Umdrehungen den Bruchteil einer Sekunde -- haette sie sich gedreht, waere die
+            // Notbremse in 120 s laengst gefallen. Sie hat sich also nicht gedreht.
+            //
+            // `reap()` nimmt `SCHEDS[core].lock()` und `MEM.lock()`. Blockiert es dort, kam
+            // der Zaehler frueher nie wieder an die Reihe: die Notbremse wurde von genau dem
+            // ausgehungert, was sie ueberwachen soll. Steht sie davor, faengt sie jeden
+            // Stillstand ausserhalb von `reap()` selbst -- insbesondere einen in `all_done()`.
+            //
+            // Ticks statt Umdrehungen, weil eine Umdrehungszahl von der Taktrate abhaengt:
+            // 50 Mio sind unter KVM Millisekunden und unter TCG Minuten, dieselbe Zahl meint
+            // also je nach Aufbau etwas anderes. Ticks kommen vom Timer-Interrupt und messen
+            // Zeit. Der Zaehler bleibt als zweites Kriterium fuer den Fall, dass gar kein
+            // Timer laeuft -- dann gaebe es keine Ticks, und eine reine Tick-Grenze wuerde nie
+            // greifen.
+            //
+            // OFFEN (todo D0): blockiert `reap()` SELBST, hilft auch das nicht -- dieser Faden
+            // kommt dann nirgends mehr an. Dafuer braeuchte es eine Notbremse im
+            // Timer-Interrupt, also ausserhalb dieses Fadens.
+            spins += 1;
+            let sekunden = hal::timer::ticks(0) / 100; // 100 Hz
+            if sekunden > 60 || spins > 5_000_000_000 {
+                println!(
+                    "bringup : WATCHDOG — nicht alle Aussagen belegt (nach {sekunden}s, {spins} Umdrehungen)"
+                );
+                report_and_off(true);
+            }
             system::reap();
             if all_done(archive) {
                 report_and_off(false);
-            }
-            // Notbremse, damit ein hängender Test nicht ewig läuft (der Bericht zeigt dann, was fehlt).
-            spins += 1;
-            if spins > 50_000_000 {
-                println!("bringup : WATCHDOG — nicht alle Aussagen belegt");
-                report_and_off(true);
             }
             core::hint::spin_loop();
         }

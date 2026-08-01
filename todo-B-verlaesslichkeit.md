@@ -26,7 +26,7 @@ Verlässliches.
       muss `target_os` sein, denn `cli` ist im Userspace privilegiert.
 - [x] **B-1.2 Nachgewiesen (2026-07-29).** Vorher 7 von 8 bzw. 11 von 12 Läufen vollständig; nach
       dem Fix **16 von 16**. Gemessen gegen `SELFTEST COMPLETE`, `-cpu Skylake-Client`, 4 Kerne.
-- [ ] **B-1.2b Weiter beobachten.** Wiederholungsläufe gegen `SELFTEST COMPLETE`, nicht
+- [x] **B-1.2b miterledigt mit B-1.2c** (Kaestchen stand offen, der Text darunter erklaerte es bereits fuer erledigt). Urspruenglich: Wiederholungsläufe gegen `SELFTEST COMPLETE`, nicht
       gegen die gerade interessierende Zeile. **Merke:** die frühere Aussage „5 von 5 grün" war
       wertlos, weil sie nur auf die `color`-Zeile prüfte — ein Lauf, der danach hängenblieb,
       zählte als Erfolg.

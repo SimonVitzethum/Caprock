@@ -273,8 +273,11 @@ keine Cache-Farbe — Region, Kernel-Stack und Seitentabellen. Offen bleibt das 
       `colors::report_color`; die vorherige Verdopplung war die Ursache des `FAIL`-statt-`FAILURES`-
       Fehlers. `color`/`stripe` stehen jetzt in der ARM-Abschlussbedingung und in `test-qemu.sh`.
 
-      Erste ARM-Messung der Geometrie: `cache : LLC L2 1024 KiB, 16-fach, 64 B/Zeile, 1024 Sets
-      -> 16 Seitenfarbe(n)` — 1024 × 64 / 4096 = 16, die aarch64-Dekodierung rechnet richtig.
+      **Nicht** neu ist die Geometriemessung — die steht seit B-2.2 (2026-07-29) und wurde dort
+      gegen drei CPU-Modelle geprüft, die *verschiedene* Werte liefern (`cortex-a72`/`a53` → 16,
+      `max` → 32). Genau das belegt, dass `CCSIDR_EL1` gelesen und nicht eine Konstante
+      zurückgegeben wird. Neu ist, dass die **Zuteilung** dort geprüft wird: bis heute lief auf
+      aarch64 die Meldung, nicht der Test.
 
 - [ ] **Way-Partitionierung (Intel CAT / ARM MPAM) nicht betrachtet.** Sie träfe dieselbe
       Eigenschaft über die Hardware statt über den Allokator, käme ohne kleinere Regionen und ohne

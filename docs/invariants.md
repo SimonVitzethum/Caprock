@@ -655,8 +655,10 @@ damit an der Physadresse und sind seitenkonstant — das ist die *Farbe*. Die Ge
 **Auf beiden Zweigen geprüft (seit 2026-08-01).** Der Test lag bis dahin im x86-Hochlauf und lief
 auf aarch64 nicht — die CLIDR/CCSIDR-Fassung war übersetzt, aber nie an einer echten Zuteilung
 geprüft. Er liegt jetzt arch-neutral in `kernel/src/colors.rs` und wird von beiden Wegen gefahren
-(wie `kernel/src/dmatests.rs`), gemeldet aus **einer** Druckstelle. Erste ARM-Messung unter QEMU
-`virt`: L2, 1024 KiB, 16-fach, 64 B/Zeile, 1024 Sets → 16 Seitenfarben.
+(wie `kernel/src/dmatests.rs`), gemeldet aus **einer** Druckstelle. Die *Geometrie* wurde auf
+aarch64 schon vorher gelesen (siehe `todo-B` B-2.2, gegen drei CPU-Modelle mit verschiedenen
+Werten); ungeprüft war die **Zuteilung**. Unter QEMU `virt`: L2, 1024 KiB, 16-fach, 64 B/Zeile,
+1024 Sets → 16 Seitenfarben.
 
 ### Was diese Zusicherung ausdrücklich NICHT umfasst
 

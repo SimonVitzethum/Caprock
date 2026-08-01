@@ -577,11 +577,45 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       Ausgabe). Erst dadurch sind 200 Läufe bezahlbar — vorher hätte dieselbe Aussage sieben
       Stunden gekostet, und deshalb gab es sie nicht.
 
-- [ ] **Nächster Schritt: das Vollprotokoll eines Hängers lesen.** Die Suite sichert es seit
-      2026-08-01 nach `build/diag/abweichung-lauf-N.log` (vorher überschrieb sie es bei jedem
-      Durchgang — bei einer Rate von 1 zu 200 war der Lauf, den man braucht, weg, bevor jemand
-      hinsah). Zu klären: bleibt er vor oder nach `smp : 4 von 4 Kern(en) online` stehen? Das
-      trennt den SMP-Hochlauf von der Konsolensperre.
+- [ ] **Zwei getrennte Fehlerbilder** (400 Läufe am 2026-08-01, davon 6 Abweichungen; die
+      Serie lief parallel zur Load-Suite, die Quote gilt also *unter Last* — im Leerlauf waren
+      es 1 von 200):
+
+      | Bild | Läufe | Rate | vor dem 2026-08-01 sichtbar? |
+      |---|---|---|---|
+      | `color : FAILURES`, `rueckgelesen=0` | 138, 141, 228, 377 | 4/400 | **nein** — `FAIL` fiel aus der Signatur |
+      | Hänger ab `sched` | 115, 235 | 2/400 | **nein** — `rc` war immer 124 |
+
+      Beide waren strukturell unsichtbar. Vollprotokolle liegen unter
+      `build/diag/abweichung-lauf-N.log`.
+
+- [ ] **`color`-Fehlschlag: die Kernelseite wird zurückgelesen, nachdem der Thread eingesammelt
+      wurde** (starker Verdacht, noch nicht behoben). Alle vier Fehlschläge sind zeichengleich:
+
+          gut:    rueckgelesen=1 (kstack=1 l1=1 l2=1)
+          kaputt: rueckgelesen=0 (kstack=0 l1=0 l2=0)
+
+      Alles andere stimmt in allen Läufen — `in_mask`, `kernelseite`, `disjunkt`,
+      `uebergross_abgewiesen`, `bilanz`. Es ist **kein Farbfehler**, die Zuteilung ist richtig.
+
+      Die drei Felder kommen aus `kstack_of(t.slot())` und `vspace_tables_of(asid_of(...))`;
+      beide liefern `0`, sobald Slot bzw. ASID nicht mehr belegt sind. Dass sie **immer
+      gemeinsam** kippen und nie einzeln, spricht für eine Ursache statt drei.
+
+      `run_color` in `kernel/src/colors.rs` beschreibt dasselbe Rennen bereits — für
+      `balanced`: „nebenher sammelt ein anderer Kern den Stack des gerade gefaulteten
+      `iso_probe`-Threads ein, und je nachdem, ob dieser Rückgang ins Messfenster fällt, wurde
+      derselbe Kernel mal grün und mal rot gemeldet". Der `iso_probe`-Thread faultet
+      **absichtlich** (Isolationstest). Wird er eingesammelt, bevor die Kernelseite gelesen
+      wird, sind Stack und ASID weg.
+
+      Zu tun: die Werte **vor** dem Fault erfassen, oder den Teardown gegen das Messfenster
+      abgrenzen — dieselbe Behandlung, die `balanced` schon bekommen hat.
+
+- [ ] **Hänger ab `sched`** (2/400): Lauf 115 und 235 fehlen ausschließlich die Zeilen ab dem
+      Scheduler-Test; alles davor ist vollständig, `rc=124`. Zu klären am Vollprotokoll: vor
+      oder nach `smp : 4 von 4 Kern(en) online`? Das trennt den SMP-Hochlauf von der
+      Konsolensperre.
 
 - [ ] **Sobald die Ursache feststeht:** der Lauf muss wieder wiederholbar sein, bevor A1 als
       abgenommen gilt. Ein Testaufbau, der stehenbleibt, kann keine Aussage über irgendeine

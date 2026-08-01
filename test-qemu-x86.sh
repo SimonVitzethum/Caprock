@@ -146,6 +146,16 @@ if [ "$RUNS" -gt 1 ]; then
         else
             echo "== Lauf $n weicht vom ersten ab (< Lauf 1, > Lauf $n): =="
             diff "$SIG0" "$SIGN" | grep -E '^[<>]' | sed 's/^/     /'
+            # Das VOLLE Log des abweichenden Laufs aufheben. Ohne das ist die Abweichung eine
+            # Liste fehlender Zeilen und sonst nichts -- man sieht, DASS er stehenblieb, aber
+            # nicht wo. Genau daran hing D0 monatelang ("Naechste Eingrenzung: mehrere
+            # haengende Laeufe mit Vollprotokoll vergleichen"), waehrend die Suite das
+            # Protokoll bei jedem Lauf ueberschrieb.
+            # Bei einer Rate von 1 zu 200 ist der Lauf, den man braucht, sonst weg, bevor
+            # jemand hinsieht.
+            mkdir -p build/diag
+            cp -f "$LOG" "build/diag/abweichung-lauf-$n.log" 2>/dev/null \
+                && echo "     (volles Log: build/diag/abweichung-lauf-$n.log)"
         fi
     done
     rm -f "$SIG0" "$SIGN"

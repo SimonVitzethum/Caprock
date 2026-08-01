@@ -537,45 +537,59 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
 
 ---
 
-## D0. Instabilität des x86-Laufs (2026-07-29, offen)
-**Klasse:** Fehler · **Aufwand:** unbekannt, zuerst einzugrenzen
+## D0. Instabilität des x86-Laufs (2026-07-29, **neu gemessen 2026-08-01**)
+**Klasse:** Fehler · **Aufwand:** eingegrenzt, Vollprotokoll eines Hängers steht aus
 
-- [ ] **Der x86-Lauf ist nicht mehr deterministisch.** Gemessen: von 8 Läufen desselben Images
-      erreichten nur 4–6 `SELFTEST COMPLETE`; die übrigen bleiben stehen, und zwar an
-      **verschiedenen** Stellen (einmal nach `color : ALL PASS` beim `bringup :`-Schritt, einmal
-      bei `dmatok : FAILURES`). Verschiedene Abbruchstellen sprechen gegen einen einzelnen
-      kaputten Testpfad und für etwas Gemeinsames: Zeitverhalten oder Speicherlage.
+- [ ] **Der x86-Lauf ist noch nicht deterministisch — aber zwei Größenordnungen seltener als
+      gedacht.** Neu gemessen am 2026-08-01 (200 Läufe, KVM, `-cpu host,+invtsc`, lastfreier
+      Rechner mit 20 Kernen):
 
-      **Beide naheliegenden Verdächtigen sind gemessen und ausgeschieden** (2026-07-29, je 8 Läufe
-      desselben Images, `SELFTEST COMPLETE` als Kriterium):
-
-      | Aufbau | vollständig |
+      | Messung | Quote |
       |---|---|
-      | `HEAD` (498e149, **ohne** A1), `-cpu Skylake-Client` | 7 von 8 |
-      | mit A1, `-cpu Skylake-Client` | 7 von 8 |
-      | mit A1, `-cpu qemu64` | 5 von 8 |
+      | 2026-07-29, 8 Läufe, TCG | 4–6 von 8 vollständig |
+      | 2026-08-01, 200 Läufe, KVM | **199 von 200 mit identischer Ergebnissignatur** |
 
-      Also: **die Instabilität ist älter als die A1-Arbeit** und wurde nicht von ihr eingeschleppt.
-      Der CPU-Modellwechsel ist ebenfalls nicht die Ursache — `Skylake-Client` ist sogar stabiler
-      als `qemu64`. Damit bleibt ein **vorbestehender Fehler im x86-Lauf**, der bisher nur deshalb
-      nicht auffiel, weil die Suite üblicherweise einmal statt achtmal läuft.
+      Der eine abweichende Lauf (Nr. 174) **riss das Zeitlimit** — er wurde von außen erkannt
+      (`rc=124`), nicht aus dem Logtext. Ihm fehlen ausschließlich die Zeilen ab dem
+      Scheduler-Test (`sched`, `ipc`, `ring3`, `capsz`, `capsum`, `iso`, `root`, `cdelete`,
+      `audit`, `SELFTEST COMPLETE`); alles davor ist vollständig. Er blieb also nach
+      `bringup : 3 Worker + 2 PDs eingeplant` stehen. Das trifft genau die drei Kandidaten,
+      die hier schon standen: **SMP-Hochlauf** (`cpu_on`/`ap_entry`), **Konsolensperre**,
+      **Idle-Schleife mit `all_done()`**.
 
-      Nächste Eingrenzung: mehrere hängende Läufe mit Vollprotokoll vergleichen. Bisher beobachtet
-      wurden **verschiedene** Abbruchstellen (nach `color : ALL PASS`, bei `dmatok`), was gegen
-      einen einzelnen kaputten Pfad und für ein Rennen spricht — Kandidaten: der SMP-Hochlauf
-      (`cpu_on`/`ap_entry`), die Konsolensperre, oder die Idle-Schleife mit `all_done()`.
+      **Warum die alte Zahl nicht belastbar war.** Drei Schichten verdeckten einander, jede
+      musste einzeln weg, bevor eine Messung überhaupt etwas aussagen konnte:
 
-      Merke für die Diagnose: die Aussage „5 von 5 grün" aus der ersten Runde war **wertlos**,
-      weil sie nur auf die `color`-Zeile grepte und nicht auf `SELFTEST COMPLETE`. Ein Lauf, der
-      nach der geprüften Zeile hängenbleibt, zählte dort als Erfolg. Wer hier weitermisst: immer
-      gegen das **Ende** des Laufs prüfen, nicht gegen die interessierende Zeile.
+      1. `report_and_off()` druckte `SELFTEST COMPLETE` **bedingungslos**, auch nach dem
+         Watchdog (behoben in B-1.8) — ein abgebrochener Lauf zählte als vollständig.
+      2. `color` druckte als einzige Stelle im Kernel `FAIL` statt `FAILURES` (behoben
+         2026-08-01) — ein durchgefallener Test fiel damit aus der Ergebnissignatur **heraus**
+         statt als Abweichung aufzufallen.
+      3. `-no-shutdown` ließ **jeden** Lauf ins Zeitlimit laufen (behoben 2026-08-01) —
+         `rc=124` war immer wahr und trug keine Information. Ein Hänger musste deshalb aus
+         einer Zeile erschlossen werden, die der Kernel selbst drucken muss.
+
+      Seit (3) ist der Rückgabewert ein **zweiter, unabhängiger Melder**: er liegt außerhalb
+      des Kernels und lässt sich von keinem Kernelfehler stillstellen. Genau er hat Lauf 174
+      gefangen.
+
+      Nebenbefund von (3): ein Lauf dauert jetzt 0,86 s statt 130 s (Faktor 152, zeichengleiche
+      Ausgabe). Erst dadurch sind 200 Läufe bezahlbar — vorher hätte dieselbe Aussage sieben
+      Stunden gekostet, und deshalb gab es sie nicht.
+
+- [ ] **Nächster Schritt: das Vollprotokoll eines Hängers lesen.** Die Suite sichert es seit
+      2026-08-01 nach `build/diag/abweichung-lauf-N.log` (vorher überschrieb sie es bei jedem
+      Durchgang — bei einer Rate von 1 zu 200 war der Lauf, den man braucht, weg, bevor jemand
+      hinsah). Zu klären: bleibt er vor oder nach `smp : 4 von 4 Kern(en) online` stehen? Das
+      trennt den SMP-Hochlauf von der Konsolensperre.
 
 - [ ] **Sobald die Ursache feststeht:** der Lauf muss wieder wiederholbar sein, bevor A1 als
-      abgenommen gilt. Ein Testaufbau, der in einem Drittel der Fälle stehenbleibt, kann keine
-      Aussage über irgendeine Eigenschaft tragen — auch nicht über die, die er gerade grün meldet.
+      abgenommen gilt. Ein Testaufbau, der stehenbleibt, kann keine Aussage über irgendeine
+      Eigenschaft tragen — auch nicht über die, die er gerade grün meldet. Bei 0,5 % ist die
+      Frage allerdings eine andere als bei 25 %: es geht nicht mehr um Brauchbarkeit der Suite,
+      sondern um einen echten, seltenen Fehler im Kernel.
 
 ---
-
 ## D. Verifikation
 
 - [ ] **Zyklenzähler weiterführen** (Stufe 1 teilweise erledigt): `hal::timer::cycles()` /

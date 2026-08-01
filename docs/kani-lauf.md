@@ -127,6 +127,89 @@ ausschliesst. Ein Beweis mit unbenannter Schranke ist eine Zusage, deren Reichwe
 
 ---
 
+## Befund vom 2026-08-01: `sync` ist grün — und sagt über ext-29 nichts
+
+D1 stand als „Kani lokal nicht ausführbar (nur CI-Gate) — die ext-29-Änderung an
+`sel4lake-sync` ist dort **nicht** gegengeprüft worden". Die erste Hälfte ist erledigt: Kani
+0.67.0 läuft lokal, `bash tools/kani-verify.sh sync` liefert
+
+```
+Complete - 3 successfully verified harnesses, 0 failures, 3 total.
+```
+
+in zusammen 0,3 Sekunden. Die zweite Hälfte ist damit aber **nicht** erledigt, sondern zum
+ersten Mal belegt — und der Beleg steht im Lauf selbst.
+
+### Was der grüne Lauf ausschließt
+
+Kani baut für das **Host**-Ziel; im Log steht 287-mal `x86_64-unknown-linux-gnu`. Damit greift
+in `sel4lake-sync` der dritte `cfg`-Zweig:
+
+```rust
+#[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_os = "none"))))]
+const IRQ_MASKING_IMPLEMENTED: bool = false;      // und irq_save_disable() = No-Op
+```
+
+Der Lauf prüft also eine Fassung, in der die Interrupt-Maskierung **nichts tut** — genau die
+Eigenschaft, die ext-29 geändert hat und deren Fehlen als B-1.1 den x86-IRQ-Deadlock
+verursachte.
+
+Der Wächter, der so etwas fangen soll, kann hier nicht greifen:
+
+```rust
+#[cfg(target_os = "none")]
+const _: () = assert!(IRQ_MASKING_IMPLEMENTED, "Bare-Metal-Ziel ohne Interrupt-Maskierung …");
+```
+
+Er ist selbst an `target_os = "none"` gebunden — richtig so, denn ein Host-Bau hat legitim keine
+Maskierung. Die Folge ist trotzdem, dass im Kani-Bau **niemand** die Zusage prüft.
+
+**Das Werkzeug hat es sogar gesagt**, und niemand hat es als Reichweitenaussage gelesen:
+
+```
+warning: constant `IRQ_MASKING_IMPLEMENTED` is never used
+   --> src/lib.rs:109:7
+```
+
+Eine unbenutzte Konstante ist hier keine Unordnung, sondern der Nachweis, dass der Wächter im
+geprüften Bau nicht existiert.
+
+### Was tatsächlich bewiesen ist
+
+Die drei Harnesses tragen ihre Grenze im Namen — sie sind ausdrücklich als **single-thread**
+dokumentiert:
+
+| Harness | Aussage |
+|---|---|
+| `spinlock_roundtrip` | Guard-Deref speichersicher, Ticket-Zustand nach `Drop` wieder frei, Daten persistieren |
+| `rwlock_write_then_read` | Schreiben dann Lesen konsistent, Zustand danach exakt `0` |
+| `rwlock_state_arithmetic` | Leserzahl ohne Über-/Unterlauf, `fetch_and` löscht nur das WRITER-Bit |
+
+Das ist Speichersicherheit und Arithmetik der Datenstruktur. Es ist **keine** Aussage über
+Wettläufe (Kani modelliert keine Nebenläufigkeit) und **keine** über IRQ-Sicherheit (im
+geprüften Bau nicht vorhanden).
+
+### Warum das die bekannte Lücke schärft
+
+`verification.md` sagt bereits: Loom modelliert eine *Kopie* des Algorithmus, ein Fehler in der
+`cfg`-**Auswahl** ist für Loom wie für Kani unsichtbar. Der Lauf vom 2026-08-01 macht daraus
+eine Messung: es ist nicht nur so, dass Kani den Fehler nicht *fände* — die geprüfte Fassung
+**enthält die Eigenschaft gar nicht**. Ein Prüfer, der über die Abwesenheit eines Fehlers
+entscheidet, muss belegen können, dass er sprechfähig ist. Hier ist er es nachweislich nicht.
+
+### Was daraus folgt (offen, s. `todo.md` D1)
+
+Ein Kani-Lauf gegen `sel4lake-sync` wird die ext-29-Eigenschaft **nie** abdecken, solange er
+auf dem Host-Ziel baut. Zwei Wege, beide noch nicht beschritten:
+
+* Einen Harness bauen, der `irq_save_disable`/`irq_restore` als *Modell* mitführt statt sie
+  wegzu-`cfg`-en, und die Reentranz aus dem IRQ-Pfad als Eigenschaft formuliert.
+* Oder: ausdrücklich festhalten, dass diese Eigenschaft **nicht** von Kani getragen wird,
+  sondern allein vom Wächter zur Übersetzungszeit plus dem Lauftest (B-1.2/B-1.4) — und im
+  CI-Gate danebenschreiben, damit ein grünes Kani nicht mehr verspricht, als es prüft.
+
+---
+
 ## Prüfliste nach jedem Lauf
 
 * Stehen **vier** `== Kani: … ==`-Zeilen im Log? (Sonst wurden Ziele übersprungen.)

@@ -42,12 +42,15 @@ declare -A ERLAUBT=(
   [dmar]="IOMMU-Entdeckung aus ACPI"
   [acpi]="Plattformentdeckung (Kerne, ECAM) beim Hochlauf"
   [pcie]="Bus-ENUMERATION + RID-Ermittlung fuer die IOMMU -- nicht Geraetetreiber"
+  [virtio]="nur noch das AUFFINDEN der virtio-Strukturen im Konfigurationsraum (Enumeration, wie pcie). Die Treiberlogik liegt seit 2026-08-01 in crates/sel4lake-virtio -- ohne jede Abhaengigkeit, damit sie in eine Userland-PD kann (A-5.1)"
 )
 
 # Bekannte Ausnahmen: liegen im Kern, gehoeren dort NICHT hin, mit benanntem Ausgang.
-declare -A AUSNAHME=(
-  [virtio]="DMA-Beweisgeraet (ext-23, A-5.2). Gehoert als Userland-Treiber-PD nach A-5.1."
-)
+# Leer -- und das ist der Punkt. Am 2026-08-01 stand hier `virtio`, weil das Protokoll im Kern
+# lag. Es liegt jetzt in `crates/sel4lake-virtio` (keine Abhaengigkeiten); in der HAL blieb nur das
+# Auffinden der Strukturen, also Enumeration. Eine Ausnahme weniger, nicht eine Ausnahme
+# umgeschrieben.
+declare -A AUSNAHME=()
 
 NUR_PRUEFEN=0
 [ "${1:-}" = "--nur-pruefen" ] && NUR_PRUEFEN=1

@@ -164,6 +164,7 @@ version = "0.0.1"
 dependencies = [
  "sel4lake-abi",
  "sel4lake-sync",
+ "sel4lake-virtio",
 ]
 
 [[package]]
@@ -248,6 +249,10 @@ dependencies = [
  "ed25519-dalek",
  "sha2",
 ]
+
+[[package]]
+name = "sel4lake-virtio"
+version = "0.1.0"
 
 [[package]]
 name = "semver"

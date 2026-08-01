@@ -1,0 +1,9 @@
+[package]
+name = "sel4lake-virtio"
+version = "0.1.0"
+edition = "2021"
+
+# **Keine Abhaengigkeiten.** Das ist der Zweck dieser Crate, nicht ein Zufall: sie soll von einer
+# Userland-Treiber-PD gelinkt werden koennen (todo A-5.1), und alles, was sie an den Kernel
+# bindet, waere genau die Bindung, die dort weg soll.
+[dependencies]

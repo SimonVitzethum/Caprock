@@ -10,5 +10,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+# Treiberlogik liegt bewusst AUSSERHALB der HAL (todo A-5.1) -- diese Crate haengt an nichts.
+sel4lake-virtio = { path = "../sel4lake-virtio" }
 sel4lake-sync = { path = "../sel4lake-sync" }
 sel4lake-abi = { path = "../sel4lake-abi" }

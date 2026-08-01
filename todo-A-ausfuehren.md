@@ -254,6 +254,30 @@ Für einen Betriebsanspruch fehlen drei Dinge.
       Beim ersten Lauf hat der Wächter sofort ein Modul gemeldet, das niemand auf dem Schirm hatte
       (`hook.rs`, legitim: Trap-Mechanik). Genau dafür ist er da.
 
+      **Erster Schritt getan (2026-08-01): die Treiberlogik ist kernfrei.** `crates/sel4lake-virtio`
+      hat **keine einzige Abhängigkeit** — kein `sel4lake-hal`, kein Kernel, keine Architektur —
+      und enthält das Protokoll: Handshake, Feature-Aushandlung, Virtqueue, Notify, used-Ring.
+
+      Der Schnitt liegt dort, wo die **Autorität** aufhört, nicht dort, wo es beim Aufteilen bequem
+      war. In der HAL blieb nur das *Auffinden* der Strukturen, also ein Lauf durch den
+      PCI-Konfigurationsraum. Der ist geräteweit: wer ihn lesen darf, sieht jedes Gerät der
+      Maschine. Eine Treiber-PD bekommt deshalb das **Ergebnis** — die Adressen ihres eigenen
+      Geräts — und nicht das Werkzeug, sie zu suchen.
+
+      Ein Detail, das beinahe schiefging: die Speicherbarriere wird **hereingereicht**
+      (`VirtioRng::new(..., fence: fn())`), nicht in der Crate gewählt. Der naheliegende Weg wäre
+      `core::sync::atomic::fence(SeqCst)` gewesen — arch-neutral und ohne Parameter. Er wäre falsch:
+      auf aarch64 übersetzt das zu `dmb ish`, und Device-Memory liegt nicht in der
+      inner-shareable-Domäne. Der ARM-Zweig hätte es vielleicht überlebt — bis er es nicht mehr tut.
+
+      Gegenprobe: x86 `virtio : ALL PASS` unverändert, aarch64 `virtio-rng-DMA: PASS`, keine
+      FAIL-Zeile. `tools/kernel-grenze.sh` führt **keine Ausnahme** mehr.
+
+      **Was noch fehlt** (das eigentliche A-5.1): die PD selbst. Ein Programm unter
+      `programs/hardware/` (das Verzeichnis ist heute leer), das MMIO-Cap + DMA-Region entgegennimmt,
+      `sel4lake-virtio` linkt und sein Ergebnis über den Kanal meldet — plus die Umkehrung der
+      Richtung: heute ruft der Kernel den Treiber, künftig meldet sich der Treiber beim Kernel.
+
 - [~] **A-5.2 virtio auf x86** — der **Transport** steht und ist auf x86 belegt (2026-08-01).
       Offen bleiben **Netz und Blockgerät**.
 

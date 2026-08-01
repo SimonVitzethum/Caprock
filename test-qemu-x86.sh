@@ -244,6 +244,28 @@ if echo "$OUT" | grep -q "bringup : WATCHDOG"; then
 else
     echo "  PASS: B-1.8: der Bericht kam aus all_done() (kein Watchdog) -- die Aussagen sind belegt, nicht abgelesen"
 fi
+# B-1.2c-Waechter: ein Ergebniswort, das die Signatur NICHT kennt, ist unsichtbar.
+#
+# Am 2026-08-01 gemessen: `color` druckte als einzige Stelle im Kernel `FAIL` statt `FAILURES`
+# (68 andere Tests schreiben `FAILURES`). Damit fiel ein durchgefallener color-Test aus der
+# Ergebnissignatur HERAUS, statt als Abweichung aufzutauchen -- Lauf 4 von 8 zeigte als einzigen
+# Unterschied eine FEHLENDE Zeile. Wer den Diff las, sah "eine Zeile weniger" und nicht "ein
+# Test ist durchgefallen". Der Kommentar weiter oben in dieser Datei belegt, wie lange das
+# unbemerkt blieb: dort steht "`color` einmal FAILURES" -- das Wort stand dort nie.
+#
+# Geprueft wird deshalb die KLASSE, nicht der Einzelfall: jede Zusammenfassungszeile muss eines
+# der drei bekannten Woerter tragen. Zusammenfassungen haben Leerzeichen vor dem Doppelpunkt
+# (`color   : ...`), Einzelzusagen nicht (`memtest: PASS  alloc 1 Seite`) -- deshalb das ` +`
+# im Muster, sonst schluege der Waechter bei jeder Einzelzeile an.
+UNBEKANNT="$(printf '%s\n' "$OUT" | grep -oE '^[a-z0-9_]+ +: (FAIL|PASS|OK|NOK|ERROR|ERRORS|FAILED|SUCCESS)\b' || true)"
+if [ -n "$UNBEKANNT" ]; then
+    echo "  FAIL: B-1.2c: Ergebniszeile(n) mit einem Wort, das die Signatur nicht kennt --"
+    echo "        sie sind fuer die Wiederholungsmessung UNSICHTBAR (erlaubt: ALL PASS, FAILURES, SKIP):"
+    printf '%s\n' "$UNBEKANNT" | sed 's/^/          /'
+    fail=1
+else
+    echo "  PASS: B-1.2c: jede Zusammenfassungszeile nutzt ALL PASS|FAILURES|SKIP -- keine faellt aus der Signatur"
+fi
 check "SELFTEST COMPLETE"             "Stufe 4: sauberes system_off (ACPI) statt Timeout"
 # todo F1: Gating der Pruefinfrastruktur.
 if [ "$NOSEL_OK" = 1 ]; then

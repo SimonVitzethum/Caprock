@@ -268,8 +268,15 @@ fn spawn_demo() -> bool {
                 c.balanced as u8
             );
             println!(
+                // `FAILURES`, nicht `FAIL`. Der Unterschied ist kein Stil: die
+                // Ergebnissignatur der Suite (B-1.2c) erkennt nur `ALL PASS|FAILURES|SKIP`.
+                // Mit `FAIL` fiel ein durchgefallener color-Test aus der Signatur HERAUS,
+                // statt als Abweichung aufzutauchen -- am 2026-08-01 gemessen: Lauf 4 von 8
+                // zeigte als einzigen Unterschied eine FEHLENDE Zeile, nicht einen Fehlschlag.
+                // Es war die einzige Stelle im Kernel mit diesem Wort; 68 andere Tests
+                // schreiben `FAILURES`.
                 "color   : {} (zwei isolierte PDs teilen sich keine Cache-Farbe)",
-                if c.ok { "ALL PASS" } else { "FAIL" }
+                if c.ok { "ALL PASS" } else { "FAILURES" }
             );
         }
         // B-4.2: die Streifenvergabe fuehrt Belegung -- erschoepft heisst FEHLSCHLAG, nicht

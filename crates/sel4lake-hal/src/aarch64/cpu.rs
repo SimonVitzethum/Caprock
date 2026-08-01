@@ -206,3 +206,14 @@ pub fn halt() -> ! {
         unsafe { asm!("wfe", options(nomem, nostack, preserves_flags)) }
     }
 }
+
+/// **Läuft dieser Kernel unter einem Hypervisor?** — auf aarch64 aus EL1 **nicht** feststellbar.
+///
+/// Anders als x86 (`CPUID.1:ECX[31]`) kennt die Architektur kein Bit, das ein Gast lesen dürfte;
+/// EL2 ist von EL1 aus per Entwurf unsichtbar. Gemeldet wird deshalb `false` — die
+/// **konservative** Antwort: ein davon abhängiger Test urteilt dann so, als liefe er auf echter
+/// Hardware, und ein Fehlschlag bleibt ein Fehlschlag statt weggeklärt zu werden. Siehe die
+/// x86-Fassung für den Grund, warum das überhaupt jemanden interessiert (B-4.5).
+pub fn hypervisor_present() -> bool {
+    false
+}

@@ -455,43 +455,61 @@ pub fn report() {
 // aber: *weil* sie disjunkt sind, verdrängen sich die PDs im LLC nicht gegenseitig. Diese Zeile
 // stand bis 2026-08-01 ungeprüft in `docs/invariants.md` §12.
 //
-// ## Warum das eine Positivkontrolle braucht
-//
-// Ein Prime+Probe misst, wie lange ein erneuter Durchlauf über den eigenen Datensatz dauert,
-// nachdem jemand anderes den Cache benutzt hat. Bleibt die Zeit niedrig, war nichts verdrängt.
-// Genau hier lauert der Fehler, gegen den dieses Projekt seine Regel hat: **auf einer Maschine
-// ohne echten Cache bleibt die Zeit IMMER niedrig.** Unter TCG hätte der Test also „keine
-// Verdrängung" gemeldet — und damit A1 scheinbar bewiesen, ohne je etwas gemessen zu haben.
-//
-// Deshalb misst er drei Werte statt einem:
+// ## Drei Messpunkte, nicht einer — und warum
 //
 //   base     — Opfer erneut lesen, ohne dass jemand dazwischen war
 //   shared   — nachdem ein Angreifer mit dem GLEICHEN Farbsatz gelaufen ist
 //   disjoint — nachdem ein Angreifer mit einem DISJUNKTEN Farbsatz gelaufen ist
 //
-// `shared` ist die Positivkontrolle: liegt sie nicht deutlich über `base`, kann diese Maschine
-// Verdrängung nicht zeigen, und dann ist über `disjoint` **nichts** auszusagen -> SKIP, nicht
-// PASS. Das erledigt den TCG-Fall nebenbei und ohne den Hypervisor zu erkennen: ein Emulator
-// ohne Cache fällt durch die Positivkontrolle, weil er es nicht anders kann.
+// `shared` ist die **Positivkontrolle**. Bleibt sie nahe `base`, kann diese Maschine Verdrängung
+// nicht zeigen, und dann ist über `disjoint` *nichts* auszusagen -> SKIP, nicht PASS. Ohne diese
+// Kontrolle hätte der Test auf einer Maschine ohne echten Cache (TCG) „keine Verdrängung"
+// gemeldet und damit A1 scheinbar bewiesen, ohne je etwas gemessen zu haben. Der TCG-Fall fällt
+// damit nebenbei heraus, ohne den Hypervisor zu erkennen — er scheitert an der Kontrolle, weil er
+// es nicht anders kann.
 //
-// ## Warum der Angreifer aus vielen Regionen besteht
+// ## Zwei Fallen, die dieser Test beim ersten Anlauf selbst gestellt hat
 //
-// Eine gefärbte Region ist auf [`region_bytes`] begrenzt (64 KiB bei 4 Partitionen) — das ist
-// die harte Grenze des Verfahrens, nicht eine Einstellung. Eine einzelne solche Region kann eine
-// andere gar nicht aus dem LLC verdrängen: sie ist um Größenordnungen kleiner als der Anteil des
-// LLC, der auf ihren Streifen entfällt. Der Angreifer besteht daher aus so vielen Regionen
-// desselben Streifens, dass er diesen Anteil zweimal überschreibt — dimensioniert an der
-// **gemessenen** LLC-Größe, nicht an einer Konstanten.
+// **1. Ein linearer Durchlauf misst den Vorauslader, nicht den Cache.** Erste Fassung: Opfer
+// 64 KiB, Angreifer 6 MiB, sequenzielles Lesen je Cache-Zeile. Ergebnis 1904 / 4301 / 4528
+// Zyklen — also 4,2 Zyklen je Zeile selbst im „verdrängten" Fall. Für einen DRAM-Zugriff ist das
+// zwei Größenordnungen zu schnell: die Hardware hatte den nächsten Zugriff längst geholt, weil er
+// vorhersagbar war. Gemessen wurde der Prefetcher. Deshalb jetzt eine **Zeigerkette** in
+// bit-umgekehrter Reihenfolge: jeder Zugriff hängt am Ergebnis des vorigen (der Vorauslader kann
+// die Adresse nicht kennen), und die Reihenfolge ist weder aufsteigend noch konstant-schrittig.
+//
+// **2. Ein Opfer, das in den L2 passt, sagt nichts über den L3.** Färbung partitioniert **nur**
+// den Last-Level-Cache. Auf der Messmaschine hat der L2 rund 1,5 MiB je Kern — ein 64-KiB-Opfer
+// lag komplett darin, und der Angreifer räumte es dort heraus, unabhängig von jeder Farbe. Das
+// Opfer ist deshalb jetzt so groß, dass es den L2 überschreitet.
+//
+// Beides ist derselbe Fehlertyp, gegen den dieses Projekt seine Regel hat: eine Messung, die
+// nicht messen KANN, was sie zu messen behauptet.
 
-/// Obergrenze für die Angreifer-Regionen je Seite (Speicher: 2 × MAX × [`region_bytes`]).
+/// Regionen des Opfers. `VICTIM_REGIONS * region_bytes()` muss über dem L2 liegen (s. o.) und
+/// eine Zweierpotenz an Cache-Zeilen ergeben (die Kette permutiert per Bitumkehr).
 #[cfg(feature = "selftest")]
-const MAX_ATTACKER: usize = 96;
+const VICTIM_REGIONS: usize = 32;
 
-/// Wiederholungen je Messpunkt; gewertet wird das **Minimum**. Ein Minimum ist gegen Störungen
-/// robust, wie sie ein Timer-Tick oder ein anderer Kern erzeugt: Störungen können eine Messung
-/// nur verlängern, nie verkürzen.
+/// Obergrenze für die Regionen **eines** Angreifers.
 #[cfg(feature = "selftest")]
-const ROUNDS: usize = 8;
+const MAX_ATTACKER: usize = 384;
+
+/// Alle Regionen des Tests (Opfer + beide Angreifer).
+#[cfg(feature = "selftest")]
+const MAX_REGIONS: usize = VICTIM_REGIONS + 2 * MAX_ATTACKER;
+
+/// Wiederholungen je Messpunkt; gewertet wird das **Minimum**. Störungen (Timer-Tick, anderer
+/// Kern) können eine Messung nur verlängern, nie verkürzen — das Minimum ist gegen sie robust.
+#[cfg(feature = "selftest")]
+const ROUNDS: usize = 4;
+
+/// **Der Speicher für die Caps liegt statisch, nicht auf dem Kernel-Stack** (A-3.3): ein Array
+/// aus `MAX_REGIONS` Caps wären mehrere KiB Rahmen, und der EL0-Kernel-Stack hat 16 KiB. Genau
+/// diese Falle hat `ReplyFinal` schon einmal gestellt (Rahmen 6168 Byte).
+#[cfg(feature = "selftest")]
+static PP_CAPS: sel4lake_sync::SpinLock<[Option<sel4lake_mem::MemoryCap>; MAX_REGIONS]> =
+    sel4lake_sync::SpinLock::new([const { None }; MAX_REGIONS]);
 
 /// Ergebnis des Prime+Probe (B-4.5).
 #[cfg(feature = "selftest")]
@@ -501,55 +519,108 @@ pub struct PrimeProbe {
     pub ok: bool,
     /// Konnte der Aufbau überhaupt hergestellt werden (Farben, Geometrie, Speicher)?
     pub ran: bool,
-    /// **Positivkontrolle**: hat der gleichfarbige Angreifer messbar verdrängt? Ohne das ist
-    /// über den disjunkten nichts auszusagen.
+    /// **Positivkontrolle**: hat der gleichfarbige Angreifer messbar verdrängt?
     pub sensitive: bool,
-    /// Zyklen für einen Durchlauf über das Opfer — ungestört.
+    /// War der Effekt da (disjunkt näher am ungestörten Fall als am verdrängten)?
+    pub effect: bool,
+    /// Läuft der Kernel unter einem Hypervisor? Dann ist [`Self::effect`] **nicht entscheidbar**.
+    pub guest: bool,
+    /// Zyklen je Kettenglied — ungestört.
     pub base: u64,
-    /// … nachdem ein Angreifer mit dem **gleichen** Farbsatz lief.
+    /// … nach einem Angreifer mit **gleichem** Farbsatz.
     pub shared: u64,
-    /// … nachdem ein Angreifer mit einem **disjunkten** Farbsatz lief.
+    /// … nach einem Angreifer mit **disjunktem** Farbsatz.
     pub disjoint: u64,
-    /// Größe **eines** Angreifer-Datensatzes in KiB (beide sind gleich groß).
+    /// Opfergröße in KiB.
+    pub victim_kib: u64,
+    /// Größe **eines** Angreifers in KiB.
     pub attacker_kib: u64,
     /// Aller Speicher zurückgegeben?
     pub balanced: bool,
 }
 
-/// Einen Datensatz einmal vollständig durchlaufen, eine Leseoperation je Cache-Zeile.
+/// Adresse der `k`-ten Cache-Zeile über eine Liste von Regionen gleicher Länge.
+#[cfg(feature = "selftest")]
+fn line_addr(regions: &[(u64, u64)], line: u64, k: u64) -> u64 {
+    let je_region = regions[0].1 / line;
+    let (r, i) = ((k / je_region) as usize, k % je_region);
+    regions[r].0 + i * line
+}
+
+/// Eine **Zeigerkette** durch alle Cache-Zeilen legen, in bit-umgekehrter Reihenfolge.
 ///
-/// `read_volatile` ist hier nicht Vorsicht, sondern Bedingung: ein gewöhnliches Lesen, dessen
-/// Ergebnis niemand benutzt, darf der Compiler entfernen — und dann misst der Test eine leere
-/// Schleife.
+/// Bitumkehr ist eine Permutation (also besucht die Kette jede Zeile genau einmal) und erzeugt
+/// eine Folge, die weder aufsteigend noch konstant-schrittig ist — beides würde ein
+/// Stride-Prefetcher erkennen. Gibt den Einstiegspunkt zurück.
+#[cfg(feature = "selftest")]
+fn build_chain(regions: &[(u64, u64)], line: u64, bits: u32) -> u64 {
+    let n = 1u64 << bits;
+    let perm = |k: u64| k.reverse_bits() >> (64 - bits);
+    for k in 0..n {
+        let von = line_addr(regions, line, perm(k));
+        let nach = line_addr(regions, line, perm((k + 1) % n));
+        // SAFETY: die Region stammt aus `alloc_colored`, gehört exklusiv dem Test und liegt im
+        // identity-gemappten Normal-RAM. Geschrieben wird der Anfang jeder Cache-Zeile.
+        unsafe { core::ptr::write_volatile(von as *mut u64, nach) };
+    }
+    line_addr(regions, line, perm(0))
+}
+
+/// Die Kette `n` Glieder weit verfolgen und die Zyklen je Glied melden.
+///
+/// Jeder Zugriff hängt am Ergebnis des vorigen — der Vorauslader kann die nächste Adresse nicht
+/// erraten, und genau das trennt einen Cache-Treffer von einem DRAM-Zugriff.
+#[cfg(feature = "selftest")]
+fn chase(start: u64, n: u64) -> u64 {
+    let mut p = start;
+    let t0 = hal::timer::cycles();
+    for _ in 0..n {
+        // SAFETY: `p` läuft ausschließlich über die von `build_chain` beschriebenen Zeilen.
+        p = unsafe { core::ptr::read_volatile(p as *const u64) };
+    }
+    let dt = hal::timer::cycles().wrapping_sub(t0);
+    core::hint::black_box(p);
+    dt / n.max(1)
+}
+
+/// Einen Datensatz einmal überschreiben — der Angreifer. Hier genügt ein linearer Lauf: er soll
+/// den Cache **füllen**, nicht ihn messen.
 #[cfg(feature = "selftest")]
 fn walk(regions: &[(u64, u64)], line: u64) {
     for &(base, len) in regions {
         let mut off = 0;
         while off < len {
-            // SAFETY: `base..base+len` stammt aus `alloc_colored`, gehört exklusiv dem Test,
-            // liegt im identity-gemappten Normal-RAM und wird nirgends gleichzeitig benutzt.
-            unsafe { core::ptr::read_volatile((base + off) as *const u8) };
+            // SAFETY: wie `build_chain`.
+            unsafe { core::ptr::write_volatile((base + off) as *mut u64, off) };
             off += line;
         }
     }
 }
 
-/// Einen Durchlauf über das Opfer messen (Zyklen).
-#[cfg(feature = "selftest")]
-fn probe(victim: &[(u64, u64)], line: u64) -> u64 {
-    let t0 = hal::timer::cycles();
-    walk(victim, line);
-    hal::timer::cycles().wrapping_sub(t0)
-}
-
 /// **Prime+Probe: verdrängen disjunkte Farbsätze einander messbar weniger?** (B-4.5)
 ///
-/// Gibt `ran == false`, wenn der Aufbau nicht herstellbar war (eine Farbe, keine Geometrie, zu
-/// wenig Speicher), und `sensitive == false`, wenn die Maschine Verdrängung nicht zeigen kann.
-/// Beides ist **kein Fehlschlag**, sondern die Feststellung, dass hier nichts zu messen ist.
+/// `ran == false`: Aufbau nicht herstellbar (eine Farbe, keine Geometrie, zu wenig Speicher).
+/// `sensitive == false`: die Maschine kann Verdrängung nicht zeigen. Beides ist **kein
+/// Fehlschlag**, sondern die Feststellung, dass hier nichts zu messen ist.
 #[cfg(feature = "selftest")]
 pub fn run_prime_probe() -> PrimeProbe {
     let mut r = PrimeProbe::default();
+    // **Unter einem Hypervisor gar nicht erst messen.** Nicht aus Bequemlichkeit: ein Gast faerbt
+    // GASTphysische Adressen, und die zweite Uebersetzungsstufe bildet jede 4-KiB-Seite auf eine
+    // beliebige Wirtsseite ab -- die Farbbits liegen oberhalb des Seitenoffsets und ueberleben das
+    // nicht. Was hier herauskaeme, waere eine Aussage ueber die Seitenzuteilung des WIRTS, nicht
+    // ueber die eigene Faerbung.
+    //
+    // Der Aufbau selbst (rund 50 MiB in 800 gefaerbten Einzelregionen, weil eine gefaerbte Region
+    // auf `region_bytes` begrenzt ist) traegt zudem an die Fragmentgrenze des Allokators und war
+    // dort NICHT reproduzierbar -- gemessen 54 bis 179 Zyklen je Glied bei identischem Aufbau,
+    // `balanciert` kippte. Ein nicht reproduzierbarer Test haette B-1.3 (500 von 500 mit
+    // identischer Ergebnissignatur) unmittelbar zerstoert.
+    r.guest = hal::cpu::hypervisor_present();
+    if r.guest {
+        r.ok = true; // nicht entscheidbar ist kein Fehlschlag
+        return r;
+    }
     if !usable() {
         return r;
     }
@@ -563,86 +634,104 @@ pub fn run_prime_probe() -> PrimeProbe {
     let sz = region_bytes();
     let free0 = crate::system::total_free();
 
-    // So viele Regionen, dass der auf EINEN Streifen entfallende LLC-Anteil zweimal
-    // überschrieben wird. Aus der gemessenen Geometrie, nicht geraten.
-    let je_streifen = u64::from(g.size_bytes) / u64::from(PARTITIONS);
-    let n = ((2 * je_streifen).div_ceil(sz) as usize).clamp(8, MAX_ATTACKER);
+    // **Der Angreifer wird gegen den GANZEN LLC dimensioniert, nicht gegen seinen Streifenanteil.**
+    //
+    // Das war im ersten Anlauf falsch herum gedacht. Der Streifenanteil (LLC/PARTITIONS) genügt
+    // nur, WENN die Färbung die Platzierung im LLC tatsächlich steuert — und genau das soll hier
+    // erst gezeigt werden. Tut sie es nicht, verteilen sich die Zugriffe des Angreifers über den
+    // ganzen Cache, und ein Datensatz von einem Viertel der LLC-Größe verdrängt dann NICHTS,
+    // auch nicht im gleichfarbigen Fall. Die Positivkontrolle wäre gescheitert, ohne dass daraus
+    // etwas folgte — der Test hätte seine eigene Annahme geprüft statt der Hardware.
+    //
+    // Gegen den ganzen LLC dimensioniert, kann sie in jedem Fall greifen: der gleichfarbige
+    // Angreifer verdrängt, sofern diese Maschine überhaupt verdrängbar ist. Erst dann trägt der
+    // Vergleich mit dem disjunkten.
+    let n_ang = ((3 * u64::from(g.size_bytes) / 2).div_ceil(sz) as usize).clamp(8, MAX_ATTACKER);
 
-    // Belegen. Bei jedem Fehlschlag alles bisher Belegte zurueckgeben -- ein Test, der unter
-    // Speichermangel leckt, macht den naechsten Test unbrauchbar.
-    let mut caps: [Option<sel4lake_mem::MemoryCap>; 1 + 2 * MAX_ATTACKER] =
-        core::array::from_fn(|_| None);
-    let mut nutz = 0usize;
-    let mut belegen = |maske: ColorMask,
-                       caps: &mut [Option<sel4lake_mem::MemoryCap>],
-                       nutz: &mut usize|
-     -> Option<(u64, u64)> {
-        let c = crate::system::alloc_colored(sz, PAGE, maske)?;
-        let (b, l) = (c.base(), c.len());
-        caps[*nutz] = Some(c);
-        *nutz += 1;
-        Some((b, l))
-    };
-
-    let mut victim = [(0u64, 0u64); 1];
+    let mut victim = [(0u64, 0u64); VICTIM_REGIONS];
     let mut ang_gleich = [(0u64, 0u64); MAX_ATTACKER];
     let mut ang_disjunkt = [(0u64, 0u64); MAX_ATTACKER];
 
-    let mut aufbau = || -> Option<()> {
-        victim[0] = belegen(m0, &mut caps, &mut nutz)?;
-        for e in ang_disjunkt.iter_mut().take(n) {
-            *e = belegen(m1, &mut caps, &mut nutz)?;
+    let mut caps = PP_CAPS.lock();
+    let mut nutz = 0usize;
+    let mut aufgebaut = true;
+    'aufbau: {
+        for (ziel, maske) in [
+            (&mut victim[..], m0),
+            (&mut ang_disjunkt[..n_ang], m1),
+            (&mut ang_gleich[..n_ang], m0),
+        ] {
+            for e in ziel.iter_mut() {
+                let Some(c) = crate::system::alloc_colored(sz, PAGE, maske) else {
+                    aufgebaut = false;
+                    break 'aufbau;
+                };
+                *e = (c.base(), c.len());
+                caps[nutz] = Some(c);
+                nutz += 1;
+            }
         }
-        for e in ang_gleich.iter_mut().take(n) {
-            *e = belegen(m0, &mut caps, &mut nutz)?;
-        }
-        Some(())
-    };
-    let aufgebaut = aufbau().is_some();
+    }
 
     if aufgebaut {
         r.ran = true;
-        r.attacker_kib = n as u64 * sz / 1024;
-        let (gleich, disjunkt) = (&ang_gleich[..n], &ang_disjunkt[..n]);
+        r.victim_kib = VICTIM_REGIONS as u64 * sz / 1024;
+        r.attacker_kib = n_ang as u64 * sz / 1024;
+        let (gleich, disjunkt) = (&ang_gleich[..n_ang], &ang_disjunkt[..n_ang]);
 
-        // IRQs aus: ein Timer-Tick mitten in einer Messung verlaengert sie und verschiebt
-        // ausgerechnet das Minimum, auf das gewertet wird.
+        // Zeilen des Opfers: Zweierpotenz (Bitumkehr). `VICTIM_REGIONS` und `region_bytes` sind
+        // beides Zweierpotenzen, das Produkt also auch.
+        let n_lines = VICTIM_REGIONS as u64 * sz / line;
+        let bits = n_lines.trailing_zeros();
+        let start = build_chain(&victim, line, bits);
+
+        // IRQs aus: ein Timer-Tick mitten in einer Messung verschöbe ausgerechnet das Minimum.
         let daif = hal::cpu::local_irq_save();
         let (mut b, mut s, mut d) = (u64::MAX, u64::MAX, u64::MAX);
         for _ in 0..ROUNDS {
-            // Ungestoert. Zweimal laufen, damit die erste (kalte) Runde nicht gewertet wird.
-            walk(&victim, line);
-            b = b.min(probe(&victim, line));
+            chase(start, n_lines); // aufwärmen, nicht gewertet
+            b = b.min(chase(start, n_lines));
 
-            // Disjunkter Angreifer.
-            walk(&victim, line);
+            chase(start, n_lines);
             walk(disjunkt, line);
-            d = d.min(probe(&victim, line));
+            d = d.min(chase(start, n_lines));
 
-            // Gleichfarbiger Angreifer -- die Positivkontrolle.
-            walk(&victim, line);
+            chase(start, n_lines);
             walk(gleich, line);
-            s = s.min(probe(&victim, line));
+            s = s.min(chase(start, n_lines));
         }
         hal::cpu::local_irq_restore(daif);
         r.base = b;
         r.shared = s;
         r.disjoint = d;
 
-        // Positivkontrolle: der gleichfarbige Angreifer muss den Durchlauf um mindestens die
-        // Haelfte verlaengert haben. Darunter ist die Messung zu stumpf, um ueber den
-        // disjunkten Fall zu urteilen -- und dann sagt der Test das, statt PASS zu melden.
+        // Positivkontrolle: der gleichfarbige Angreifer muss den Zugriff mindestens um die
+        // Hälfte verlängert haben. Darunter ist die Messung zu stumpf, um über den disjunkten
+        // Fall zu urteilen — und dann sagt der Test das, statt PASS zu melden.
         r.sensitive = s >= b.saturating_add(b / 2);
-        // Die eigentliche Behauptung: mit disjunkten Farben liegt die Zeit naeher am
-        // ungestoerten Fall als am verdraengten.
-        r.ok = r.sensitive && d.saturating_mul(2) <= b.saturating_add(s);
+        // Die eigentliche Behauptung: mit disjunkten Farben liegt die Zeit näher am ungestörten
+        // Fall als am verdrängten.
+        r.effect = r.sensitive && d.saturating_mul(2) <= b.saturating_add(s);
+        // **Unter einem Hypervisor ist die Frage nicht entscheidbar** — nicht schwer zu messen,
+        // sondern prinzipiell nicht messbar: der Gast färbt GASTphysische Adressen, und die
+        // zweite Übersetzungsstufe bildet jede 4-KiB-Seite auf eine beliebige Wirtsseite ab. Die
+        // Farbbits liegen oberhalb des Seitenoffsets und überleben das nicht. Ein „kein Effekt"
+        // sagt hier also nichts über die Färbung — es sagt etwas über die Sichtbarkeitsgrenze
+        // eines Gastes. Die Zahlen werden trotzdem gemeldet, damit die Grenze sichtbar bleibt.
+        r.guest = hal::cpu::hypervisor_present();
+        r.ok = r.effect || r.guest;
     }
 
-    for c in caps.iter_mut().take(nutz) {
+    // **Rueckwaerts freigeben.** Vorwaerts entstehen 800 Einzelfragmente, und die Freiliste des
+    // Allokators ist endlich (`MAX_FRAGMENTS`) -- was nicht mehr hineinpasst, ist verloren, und
+    // `balanciert` faellt. Rueckwaerts trifft jede Freigabe auf den bereits freien Nachbarn und
+    // verschmilzt mit ihm, statt einen neuen Eintrag zu brauchen.
+    for c in caps.iter_mut().take(nutz).rev() {
         if let Some(cap) = c.take() {
             crate::system::free(cap);
         }
     }
+    drop(caps);
     r.balanced = crate::system::total_free() == free0;
     r.ok = r.ok && r.balanced;
     r
@@ -651,6 +740,17 @@ pub fn run_prime_probe() -> PrimeProbe {
 /// Das Ergebnis von [`run_prime_probe`] melden — wie [`report_color`] die **einzige** Druckstelle.
 #[cfg(feature = "selftest")]
 pub fn report_prime_probe(p: &PrimeProbe) {
+    if p.guest {
+        println!(
+            "pprobe  : SKIP -- unter einem Hypervisor NICHT ENTSCHEIDBAR (CPUID.1:ECX[31]). Ein \
+             Gast faerbt GASTphysische Adressen; die zweite Uebersetzungsstufe bildet jede \
+             4-KiB-Seite auf eine beliebige Wirtsseite ab, und die Farbbits liegen oberhalb des \
+             Seitenoffsets. Gemessen wuerde die Seitenzuteilung des Wirts, nicht die eigene \
+             Faerbung -- belegbar ist die WIRKUNG von A1 nur auf Blech (oder mit wirtsseitig \
+             farberhaltender Hinterlegung, z. B. 1-GiB-Seiten)"
+        );
+        return;
+    }
     if !p.ran {
         println!(
             "pprobe  : SKIP -- kein Aufbau moeglich ({} Farbe(n), LLC-Geometrie/Speicher)",
@@ -659,22 +759,30 @@ pub fn report_prime_probe(p: &PrimeProbe) {
         return;
     }
     println!(
-        "pprobe  : Opfer {} KiB, Angreifer {} KiB je Farbsatz · ungestoert={} Zyklen \
-         disjunkt={} gleichfarbig={} · balanciert={}",
-        region_bytes() / 1024,
-        p.attacker_kib,
-        p.base,
-        p.disjoint,
-        p.shared,
-        p.balanced as u8
+        "pprobe  : Opfer {} KiB, Angreifer {} KiB je Farbsatz, Zeigerkette · Zyklen je Glied: \
+         ungestoert={} disjunkt={} gleichfarbig={} · balanciert={}",
+        p.victim_kib, p.attacker_kib, p.base, p.disjoint, p.shared, p.balanced as u8
     );
     if !p.sensitive {
         println!(
             "pprobe  : SKIP -- die Positivkontrolle traegt nicht: der GLEICHFARBIGE Angreifer hat \
              nicht messbar verdraengt (gleichfarbig={} vs ungestoert={}). Auf einer Maschine, die \
-             Verdraengung nicht zeigen kann (z. B. TCG: kein echter Cache), ist ueber den disjunkten \
-             Fall nichts auszusagen -- 'kein Unterschied' waere hier kein Beleg, sondern ein Artefakt",
+             Verdraengung nicht zeigen kann (TCG hat keinen echten Cache), ist ueber den disjunkten \
+             Fall nichts auszusagen -- 'kein Unterschied' waere kein Beleg, sondern ein Artefakt",
             p.shared, p.base
+        );
+        return;
+    }
+    if p.guest && !p.effect {
+        println!(
+            "pprobe  : SKIP -- unter einem Hypervisor NICHT ENTSCHEIDBAR. Die Positivkontrolle \
+             traegt (gleichfarbig={} vs ungestoert={}), und der disjunkte Farbsatz schuetzt \
+             NICHT (disjunkt={}). Das widerlegt A1 nicht, sondern zeigt die Sichtbarkeitsgrenze \
+             eines Gastes: gefaerbt werden GASTphysische Adressen, und die zweite \
+             Uebersetzungsstufe bildet jede 4-KiB-Seite auf eine beliebige Wirtsseite ab -- die \
+             Farbbits liegen oberhalb des Seitenoffsets und ueberleben das nicht. Belegbar ist \
+             die WIRKUNG nur auf Blech (oder mit wirtsseitig farberhaltender Hinterlegung)",
+            p.shared, p.base, p.disjoint
         );
         return;
     }

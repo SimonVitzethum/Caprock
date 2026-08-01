@@ -682,11 +682,22 @@ kennt, wird im Betrieb überdehnt.
   auf, vergeben zu werden. Der Preis ist derselbe in anderer Form: **mehr als `PARTITIONS`
   gleichzeitig getrennte PDs gibt es nicht**, und der Aufrufer muss den Fehlschlag behandeln.
   (`colors::mask_for`, rundläufig und ungeprüft, steht nur noch im Selbsttest.)
-* **Wirkung, nicht nur Zuteilung.** Belegt ist, dass die Farbsätze disjunkt *sind*. **Nicht**
-  belegt ist, dass daraus messbar geringere gegenseitige Verdrängung folgt — dafür bräuchte es
-  Prime+Probe. Unter TCG ist das sinnlos, weil der Emulator keinen echten Cache hat; **unter KVM
-  wäre es messbar** (die Suite läuft dort seit 2026-08-01 mit `-cpu host,+invtsc`), und das ist
-  damit kein Hardware-, sondern ein Arbeitspunkt (`todo.md` A1).
+* **Wirkung, nicht nur Zuteilung — und diese Zusicherung gilt nur auf Blech.** Belegt ist, dass
+  die Farbsätze disjunkt *sind*. **Nicht** belegt ist, dass daraus messbar geringere gegenseitige
+  Verdrängung folgt. Der Prime+Probe dafür existiert (`colors::run_prime_probe`, B-4.5), aber:
+
+  **In einer virtuellen Maschine ist die Aussage prinzipiell nicht entscheidbar.** Der Gast färbt
+  *gastphysische* Adressen; die zweite Übersetzungsstufe (EPT/Stage-2) bildet jede 4-KiB-Seite auf
+  eine beliebige Wirtsseite ab, und die Farbbits liegen **oberhalb** des Seitenoffsets. Sie
+  überleben die Abbildung nicht. Gemessen am 2026-08-01 unter KVM, Zyklen je Kettenglied:
+
+      ungestoert=41   disjunkt=234   gleichfarbig=210
+
+  Der disjunkte Farbsatz schützt dort **nicht**. Das widerlegt A1 nicht — es zeigt, dass A1 eine
+  Aussage über die *physische* Adresse ist und ein Gast diese nicht besitzt. Wer SEL4Lake als Gast
+  betreibt, darf sich auf §12 **nicht** verlassen, solange der Wirt nicht farberhaltend hinterlegt
+  (z. B. 1-GiB-Seiten). Der Test erkennt den Gastfall (`CPUID.1:ECX[31]`) und meldet SKIP mit
+  Begründung, statt eine Zahl zu liefern, die etwas anderes bedeutet, als sie zu bedeuten scheint.
 * **`1` ist kein Erfolgswert.** Meldet die Plattform keine Cache-Geometrie, gibt es genau eine
   Farbe. „Die Farbsätze zweier PDs sind disjunkt" wäre dann strukturell wahr, ohne geprüft zu
   sein. `colors::usable()` trennt das, und der Test meldet **SKIP statt PASS**.

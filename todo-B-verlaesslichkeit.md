@@ -209,9 +209,39 @@ Verlässliches.
       mit der Begründung aus dem Modell — intralinguale Sicherheit ist nur an Quellcode prüfbar,
       nie an einem fremden Binary. Eine Isolationszusage, deren Grenzen man nicht kennt, wird im
       Betrieb überdehnt; deshalb steht die Grenze neben der Zusage, nicht in einer Fussnote.
-- [ ] **B-4.5 Wirkung statt nur Zuteilung.** Der Test zeigt disjunkte Farbsätze, nicht messbar
-      geringere Verdrängung. Ein Prime+Probe-Mikrobenchmark wäre der Beleg — unter TCG sinnlos
-      (kein echter Cache), also erst auf Blech oder unter KVM.
+- [~] **B-4.5 Wirkung statt nur Zuteilung** — der Prime+Probe steht (`colors::run_prime_probe`,
+      arch-neutral, beide Hochlaufwege, Meldung `pprobe`). Was fehlt, ist **Blech**.
+
+      **Die Annahme im alten Eintrag war falsch:** „erst auf Blech ODER unter KVM". Unter KVM ist
+      die Frage nicht schwer zu messen, sondern **prinzipiell nicht entscheidbar**. Ein Gast färbt
+      *gastphysische* Adressen; die zweite Übersetzungsstufe bildet jede 4-KiB-Seite auf eine
+      beliebige Wirtsseite ab, und die Farbbits liegen oberhalb des Seitenoffsets. Gemessen würde
+      die Seitenzuteilung des Wirts, nicht die eigene Färbung. Der Test erkennt das
+      (`CPUID.1:ECX[31]`) und meldet SKIP mit Begründung, statt eine Zahl zu liefern, die etwas
+      anderes bedeutet, als sie zu bedeuten scheint.
+
+      **Gemessen wurde trotzdem** — und das Ergebnis ist der Beleg dafür, dass die Sichtbarkeits-
+      grenze real ist, nicht bloß theoretisch (Zyklen je Kettenglied, Opfer 2 MiB, Angreifer
+      24 MiB je Farbsatz):
+
+          ungestoert=41   disjunkt=234   gleichfarbig=210
+
+      Die Positivkontrolle trägt deutlich; der **disjunkte** Farbsatz verdrängt genauso stark wie
+      der gleichfarbige. Auf Blech wäre das ein Fehlschlag von A1 — im Gast ist es die erwartete
+      Folge davon, dass der Wirt die Farbe längst umgeschrieben hat.
+
+      Zwei Fallen, die der Test beim Bauen selbst gestellt hat und die im Code dokumentiert sind:
+      * **Ein linearer Durchlauf misst den Vorauslader, nicht den Cache** (erste Fassung: 4,2
+        Zyklen je Zeile selbst im „verdrängten" Fall — zwei Größenordnungen zu schnell für DRAM).
+        Jetzt Zeigerkette in bit-umgekehrter Reihenfolge: jeder Zugriff hängt am vorigen.
+      * **Ein Opfer, das in den L2 passt, sagt nichts über den L3.** Färbung partitioniert nur den
+        LLC; die Messmaschine hat ~1,5 MiB L2 je Kern. Opfer jetzt 2 MiB.
+
+      **Offen (das eigentliche B-4.5):** ein Lauf auf echter Hardware. Nebenbedingung, im Code
+      notiert: der Aufbau braucht ~50 MiB in 800 gefärbten Einzelregionen (eine gefärbte Region ist
+      auf `region_bytes` begrenzt) und trug damit an die Fragmentgrenze des Allokators — dort war
+      er **nicht reproduzierbar** (54 bis 179 Zyklen bei identischem Aufbau, `balanciert` kippte).
+      Vor dem Blech-Lauf gehört das entschärft, sonst zerstört der Test B-1.3.
 
 ## B-5. Zeit, Abrechnung, Speicherorte (Z2, Z5, Z8)
 

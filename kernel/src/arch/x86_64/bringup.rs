@@ -245,6 +245,15 @@ fn spawn_demo() -> bool {
         // stille Wiederholung. Laeuft NACH `run_color` (das baut seine PDs sofort wieder ab) und
         // vor allem, was selbst Streifen belegt, also im Ruhezustand.
         STRIPE_ALLOC_OK.store(crate::colors::run_stripe_alloc(), Ordering::Release);
+        // B-4.5: die WIRKUNG der Faerbung, nicht nur die Zuteilung. Traegt die Positivkontrolle
+        // nicht (Maschine kann Verdraengung nicht zeigen, z. B. TCG), ist das ein SKIP und darf
+        // die Abschlussbedingung nicht blockieren -- aber die Bilanz muss immer stimmen.
+        let pp = crate::colors::run_prime_probe();
+        crate::colors::report_prime_probe(&pp);
+        PPROBE_OK.store(
+            (!pp.ran || pp.balanced) && (!pp.sensitive || pp.ok),
+            Ordering::Release,
+        );
         // A-4.4: Versionssperre des Laders, beide Ausgaenge.
         IFACE_GATE_OK.store(crate::loader::run_iface_gate(), Ordering::Release);
         // A-4.2: der ruhende Punkt -- die Torlogik, alle Ausgaenge. Laeuft auf einem lokalen
@@ -308,6 +317,9 @@ static IFACE_GATE_OK: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 /// B-4.2: hat die Streifenvergabe den Erschoepfungsfall sauber abgewiesen?
 #[cfg(feature = "selftest")]
 static STRIPE_ALLOC_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// B-4.5: Prime+Probe. `true` heisst auch "nicht messbar" (SKIP) -- ein Fehlschlag ist nur ein
+/// Lauf, in dem die Positivkontrolle TRAEGT und die Faerbung trotzdem nichts bewirkt.
+static PPROBE_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// A-4.2: haelt der ruhende Punkt -- weist ein stillgelegter Endpoint neue Transaktionen ab?
 #[cfg(feature = "selftest")]
@@ -375,6 +387,8 @@ fn all_done(archive: bool) -> bool {
     // B-4.2 gehoert in die Abschlussbedingung, nicht bloss in den Bericht: sonst waere ein
     // Fehlschlag genau die Sorte Zeile, die niemand liest.
     let stripes = STRIPE_ALLOC_OK.load(Ordering::Acquire);
+    // B-4.5 in der Abschlussbedingung, aus demselben Grund wie B-4.2 daneben.
+    let pprobe = PPROBE_OK.load(Ordering::Acquire);
     let iface = IFACE_GATE_OK.load(Ordering::Acquire);
     // A-4.2 aus demselben Grund wie B-4.2 in der Abschlussbedingung: eine Zusicherung, die nur
     // im Bericht steht, faellt beim Brechen niemandem auf.
@@ -392,6 +406,7 @@ fn all_done(archive: bool) -> bool {
         && iso
         && root
         && stripes
+        && pprobe
         && iface
         && quiesce
         && rebind

@@ -260,3 +260,29 @@ pub fn halt() -> ! {
         wfi();
     }
 }
+
+/// **Läuft dieser Kernel unter einem Hypervisor?** (`CPUID.1:ECX[31]`)
+///
+/// Architektonisch reserviert und von jedem verbreiteten Hypervisor gesetzt; auf echter Hardware
+/// ist das Bit 0. Der Wert wird gecacht — `cpuid` ist unter KVM ein bedingungsloser VM-Exit und
+/// hat in einem heißen Pfad schon einmal 3556 statt 51 Zyklen gekostet.
+///
+/// **Wofür das gebraucht wird — und wofür nicht.** Nicht, um Verhalten umzuschalten. Sondern für
+/// eine Aussage, die ein Gast *prinzipiell nicht treffen kann*: Seitenfärbung wirkt über die
+/// **physische** Adresse. Unter einem Hypervisor färbt der Gast gastphysische Adressen, und die
+/// zweite Übersetzungsstufe bildet jede 4-KiB-Seite auf eine beliebige Wirtsseite ab — genau die
+/// Bits oberhalb des Seitenoffsets, aus denen die Farbe besteht, überleben das nicht. Ein
+/// Prime+Probe im Gast misst deshalb nicht die eigene Färbung (s. `kernel/src/colors.rs`, B-4.5).
+pub fn hypervisor_present() -> bool {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    static CACHED: AtomicU8 = AtomicU8::new(0); // 0 = unbekannt, 1 = nein, 2 = ja
+    match CACHED.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let v = cpuid(1).2 & (1 << 31) != 0;
+            CACHED.store(if v { 2 } else { 1 }, Ordering::Relaxed);
+            v
+        }
+    }
+}

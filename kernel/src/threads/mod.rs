@@ -479,6 +479,8 @@ static DMAWIN_OK: AtomicBool = AtomicBool::new(false);
 static COLOR_DONE: AtomicBool = AtomicBool::new(false);
 static COLOR_OK: AtomicBool = AtomicBool::new(false);
 static STRIPE_ALLOC_OK: AtomicBool = AtomicBool::new(false);
+/// B-4.5: Prime+Probe. `true` heisst auch "nicht messbar" (SKIP).
+static PPROBE_OK: AtomicBool = AtomicBool::new(false);
 static DMAWIN_NARROW: AtomicBool = AtomicBool::new(false); //   32-Bit-Geraet -> abgewiesen
 static DMAWIN_EXHAUST: AtomicBool = AtomicBool::new(false); //  Fenster voll -> abgewiesen
 static DMAWIN_INTACT: AtomicBool = AtomicBool::new(false); //   Kontext danach unveraendert nutzbar
@@ -1532,6 +1534,13 @@ pub fn spawn_demo() {
         // Farben gibt es nichts zu trennen) -- dann darf es die Abschlussbedingung nicht blockieren.
         COLOR_OK.store(c.ok || !c.usable, Ordering::Release);
         STRIPE_ALLOC_OK.store(crate::colors::run_stripe_alloc(), Ordering::Release);
+        // B-4.5: die WIRKUNG der Faerbung. Traegt die Positivkontrolle nicht, ist das ein SKIP.
+        let pp = crate::colors::run_prime_probe();
+        crate::colors::report_prime_probe(&pp);
+        PPROBE_OK.store(
+            (!pp.ran || pp.balanced) && (!pp.sensitive || pp.ok),
+            Ordering::Release,
+        );
         COLOR_DONE.store(true, Ordering::Release);
     }
 
@@ -4945,7 +4954,8 @@ fn all_done() -> bool {
     // Zusicherung, die nur gedruckt wird, faellt beim Brechen niemandem auf.
     let color = COLOR_DONE.load(Ordering::Acquire)
         && COLOR_OK.load(Ordering::Acquire)
-        && STRIPE_ALLOC_OK.load(Ordering::Acquire);
+        && STRIPE_ALLOC_OK.load(Ordering::Acquire)
+        && PPROBE_OK.load(Ordering::Acquire);
     // Prozess-Heap (ext-25): echter Box/Vec/BTreeMap-Heap auf realen Physadressen (safe Rust).
     let sasheap = SASHEAP_DONE.load(Ordering::Acquire) && SASHEAP_OK.load(Ordering::Acquire);
     // Binary-Loader L1 (ext-26): extern gebautes hello geladen + lief (signalisierte HELLO_BADGE).

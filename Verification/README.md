@@ -55,4 +55,5 @@ definierte TCB beschrieben (Aufwandsanalyse: `ARMTest/unsafe-memory-safety-aufwa
 tools/verus-verify.sh      # alle Verus-Beweise (CI-Gate: .gitea/workflows/verus.yml)
 tools/kani-verify.sh       # alle Kani-Beweise   (CI-Gate: .gitea/workflows/kani.yml)
 tools/loom-verify.sh       # Loom-Concurrency-Modelle der Sync-Primitive (CI-Gate: .gitea/workflows/loom.yml)
+tools/guard-verify.sh      # IRQ-Waechter in sel4lake-sync: loest er aus? (im Kani-Gate)
 ```

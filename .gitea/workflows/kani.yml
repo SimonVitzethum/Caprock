@@ -52,3 +52,26 @@ jobs:
 
       - name: Kani-Beweise ausführen (cert + archive + elf)
         run: bash tools/kani-verify.sh
+
+      # --- Was Kani NICHT abdeckt, und warum hier trotzdem ein Schritt dafür steht ---------
+      #
+      # Kani baut für das Host-Ziel. In `sel4lake-sync` greift dort der dritte `cfg`-Zweig mit
+      # `IRQ_MASKING_IMPLEMENTED = false` und `irq_save_disable()` als No-Op — die geprüfte
+      # Fassung enthält die IRQ-Eigenschaft also gar nicht (belegt 2026-08-01, s.
+      # docs/kani-lauf.md). Ein grünes Kani sagt über die ext-29-Änderung nichts.
+      #
+      # Getragen wird die Eigenschaft allein vom Wächter zur Übersetzungszeit. Ein Wächter,
+      # den niemand hat auslösen sehen, ist aber eine Behauptung — deshalb prüft der folgende
+      # Schritt beide Richtungen: unverändert muss übersetzen, mit zerstörtem `cfg` muss der
+      # Bau am Wächter abbrechen. Ohne diesen Schritt wäre das Kani-Gate grün und die Lücke
+      # unbemerkt.
+      - name: Nightly + rust-src (für den Bare-Metal-Bau des Wächtertests)
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup toolchain install nightly --profile minimal --component rust-src
+
+      - name: IRQ-Wächter prüfen (beide Bare-Metal-Ziele)
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          bash tools/guard-verify.sh x86_64-unknown-none
+          bash tools/guard-verify.sh aarch64-unknown-none-softfloat

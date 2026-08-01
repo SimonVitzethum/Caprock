@@ -197,16 +197,40 @@ eine Messung: es ist nicht nur so, dass Kani den Fehler nicht *fände* — die g
 **enthält die Eigenschaft gar nicht**. Ein Prüfer, der über die Abwesenheit eines Fehlers
 entscheidet, muss belegen können, dass er sprechfähig ist. Hier ist er es nachweislich nicht.
 
-### Was daraus folgt (offen, s. `todo.md` D1)
+### Was daraus folgt — und was am 2026-08-01 daraufhin gebaut wurde
 
 Ein Kani-Lauf gegen `sel4lake-sync` wird die ext-29-Eigenschaft **nie** abdecken, solange er
-auf dem Host-Ziel baut. Zwei Wege, beide noch nicht beschritten:
+auf dem Host-Ziel baut. Getragen wird sie allein vom Wächter zur Übersetzungszeit. Damit stand
+die Frage: löst dieser Wächter überhaupt aus?
 
-* Einen Harness bauen, der `irq_save_disable`/`irq_restore` als *Modell* mitführt statt sie
-  wegzu-`cfg`-en, und die Reentranz aus dem IRQ-Pfad als Eigenschaft formuliert.
-* Oder: ausdrücklich festhalten, dass diese Eigenschaft **nicht** von Kani getragen wird,
-  sondern allein vom Wächter zur Übersetzungszeit plus dem Lauftest (B-1.2/B-1.4) — und im
-  CI-Gate danebenschreiben, damit ein grünes Kani nicht mehr verspricht, als es prüft.
+Gemessen — und die Antwort ist ja. [`tools/guard-verify.sh`](../tools/guard-verify.sh) prüft
+**beide Richtungen** und ist seither Teil des Kani-Gates:
+
+```
+== 1/2  unveraendert fuer x86_64-unknown-none -- muss uebersetzen ==
+   OK -- uebersetzt (Waechter zufrieden: Maskierung ist vorhanden)
+== 2/2  cfg zerstoert -- muss scheitern ==
+   OK -- Bau bricht am Waechter ab:
+      error[E0080]: evaluation panicked: Bare-Metal-Ziel ohne Interrupt-Maskierung ...
+```
+
+Nachgestellt wird dabei genau die Regression aus B-1.1: die Bare-Metal-`cfg`-Zweige fallen
+weg, der Kernel rutscht in den Host-Zweig und bekäme einen SpinLock ohne Maskierung.
+
+**Eine Falle beim Bauen dieses Tests, die er selbst fast gestellt hätte:** der erste Entwurf
+entschärfte nur den x86-Zweig. Für ein aarch64-Ziel blieb Zweig 1 gültig, der Bau lief korrekt
+durch — und das Skript meldete daraufhin „der Wächter ist leer". Ein Prüfer, der aus dem
+falschen Grund rot wird, ist so schlecht wie einer, der aus dem falschen Grund grün wird.
+Jetzt fallen beide Zweige, und der Test läuft für beide Ziele.
+
+**Die Arbeitsteilung steht damit fest:**
+
+| Eigenschaft | getragen von | *nicht* von |
+|---|---|---|
+| Speichersicherheit, Arithmetik der Locks | Kani (`sync`, 3 Harnesses) | — |
+| IRQ-Maskierung im kritischen Abschnitt | Wächter zur Übersetzungszeit, geprüft durch `guard-verify.sh` | Kani (Eigenschaft im geprüften Bau nicht vorhanden), Loom (kein DAIF) |
+| Wettlauffreiheit der Locks | Loom, Stufe 2 | Kani (modelliert keine Nebenläufigkeit) |
+| Richtige `cfg`-**Auswahl** | dem Wächter, sonst niemandem | Kani und Loom gleichermaßen |
 
 ---
 

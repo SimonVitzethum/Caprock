@@ -599,20 +599,21 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       verfügbar) mal „Kosten je Operation" (auf Blech kalibriert). Mit KVM ist die direkte
       Sektionsmessung zusätzlich möglich (Auflösung 51 Zyklen), also beides.
 
-- [ ] **D1** Kani deckt die ext-29-Eigenschaft von `sel4lake-sync` **strukturell nicht** ab.
-      Der erste Teil ist erledigt: Kani 0.67.0 läuft lokal, `bash tools/kani-verify.sh sync`
-      meldet 3 von 3 Harnesses erfolgreich (2026-08-01, `build/diag/kani-sync-lokal.log`).
-      Der zweite Teil ist damit nicht erledigt, sondern **belegt**: Kani baut für das Host-Ziel
-      (`x86_64-unknown-linux-gnu`), dort greift der dritte `cfg`-Zweig mit
-      `IRQ_MASKING_IMPLEMENTED = false` und `irq_save_disable()` als No-Op. Der Wächter zur
-      Übersetzungszeit hängt selbst an `target_os = "none"` und kann im Host-Bau nicht auslösen;
-      der Lauf sagt es sogar (`warning: constant IRQ_MASKING_IMPLEMENTED is never used`).
-      Ein grünes `sync` beweist Speichersicherheit und Arithmetik der Datenstruktur — nicht
-      IRQ-Sicherheit und nicht Wettlauffreiheit. Ausführlich: `docs/kani-lauf.md`.
-      Offen ist die Entscheidung: entweder einen Harness bauen, der IRQ-Maskierung als *Modell*
-      mitführt statt sie wegzu-`cfg`-en, oder die Nichtabdeckung im CI-Gate danebenschreiben,
-      damit ein grünes Kani nicht mehr verspricht, als es prüft.
-
+- [ ] **D1** *(Kernfrage beantwortet, Rest ist eine Entwurfsentscheidung)* Kani deckt die
+      ext-29-Eigenschaft von `sel4lake-sync` **strukturell nicht** ab — belegt 2026-08-01: Kani
+      baut für das Host-Ziel, dort greift der dritte `cfg`-Zweig mit
+      `IRQ_MASKING_IMPLEMENTED = false` und `irq_save_disable()` als No-Op; der Lauf sagt es
+      selbst (`warning: constant IRQ_MASKING_IMPLEMENTED is never used`). Ein grünes `sync`
+      beweist Speichersicherheit und Arithmetik, nicht IRQ-Sicherheit.
+      **Kompensiert:** die Eigenschaft trägt der Wächter zur Übersetzungszeit, und dass der
+      auslösen *kann*, ist jetzt geprüft statt behauptet — `tools/guard-verify.sh` baut
+      unverändert (muss übersetzen) und mit zerstörten `cfg`-Zweigen (muss am Wächter
+      abbrechen), für beide Bare-Metal-Ziele; im Kani-Gate verdrahtet. Details:
+      `docs/kani-lauf.md`.
+      **Bleibt offen:** ob zusätzlich ein Kani-Harness gebaut wird, der die Maskierung als
+      *Modell* mitführt (statt sie wegzu-`cfg`-en) und Reentranz aus dem IRQ-Pfad als
+      Eigenschaft formuliert. Das wäre ein echter Beweis statt eines Wächters — aber er fände
+      einen `cfg`-Auswahlfehler weiterhin nicht, denn er liefe auf demselben Host-Ziel.
 - [ ] **D2** Loom modelliert eine **Kopie** des Lock-Algorithmus; die IRQ-Maskierung ist prinzipiell
       nicht modellierbar (kein DAIF in Loom). Deadlockfreiheit gegenüber Preemption bleibt Argument,
       nicht Beweis.

@@ -686,8 +686,23 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       Leck verschwände als Nebenwirkung. Ein Versuch, allein im Test früher zu lesen, wurde
       gemessen und half nicht (3 von 500 statt 4 von 400 — Rauschen).
 
-- [~] **Hänger ab `sched`** — die Notbremse ist repariert und **greift nachweislich**; der Hänger
-      selbst ist NICHT weg (2026-08-01).
+- [ ] **Hänger ab `sched` — NICHT behoben, und seit dem 2026-08-01 abends deutlich häufiger.**
+      Die Notbremse ist repariert und greift nachweislich; der Hänger selbst ist offen.
+
+      **Gemessene Rate, gleicher Tag, gleiche Maschine:**
+
+          Stand 15bc289 (vor virtio/pprobe):   1 von 500   (0,2 %)
+          Stand 9503212 (danach):              4 von 100   (4 %)
+
+      Kein neuer Fehler: 3 der 4 tragen die `WATCHDOG`-Zeile, alle brechen bei ~144 statt 190
+      Ausgabezeilen ab, die abweichende Signaturzeile ist immer `ipc : FAILURES`. Es ist derselbe
+      Hänger. Aber der virtio-Test macht zwei vollständige Geräte-Handshakes mit langen
+      Poll-Schleifen, und das hat das Timing so verschoben, dass ein latenter Fehler um den Faktor
+      20 sichtbarer wurde.
+
+      **Das ist ein Geschenk, kein Rückschritt:** ein Fehler mit 0,2 % ist praktisch nicht
+      debuggierbar, einer mit 4 % schon. Wer ihn sucht, sollte den aktuellen Stand nehmen, nicht
+      den ruhigeren von vorher.
       Läufe 115 und 235 blieben **nach** `smp : 4 von 4 Kern(en) online` stehen, ohne
       `WATCHDOG`-Zeile. Der SMP-Hochlauf war also erfolgreich. Die Notbremse stand hinter
       `system::reap()`, und das nimmt `SCHEDS[core].lock()` und `MEM.lock()` — blockiert der

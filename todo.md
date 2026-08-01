@@ -279,6 +279,27 @@ keine Cache-Farbe — Region, Kernel-Stack und Seitentabellen. Offen bleibt das 
       zurückgegeben wird. Neu ist, dass die **Zuteilung** dort geprüft wird: bis heute lief auf
       aarch64 die Meldung, nicht der Test.
 
+
+      **Der Umzug hat sofort zwei echte Fehler gefunden — beide nur auf aarch64 sichtbar, beide
+      NOCH OFFEN:**
+
+      1. `region_bytes()` rechnete mit `sel4lake_mem::MASK_BITS` (64) statt mit der tatsächlichen
+         Farbanzahl. Auf x86 (256 Farben) zufällig richtig; auf aarch64 (16 Farben) umfasst ein
+         Streifen nur 4 Farben, eine 64-KiB-Region aber 16 aufeinanderfolgende Seiten — also jede
+         Farbe, mehrfach. **Behoben** (Laufzeitrechnung `min(count(), MASK_BITS) / PARTITIONS`).
+      2. **`sel4lake_mem::stripe(i, PARTITIONS)` teilt ebenfalls `MASK_BITS` auf, nicht `count()`.**
+         Bei 16 Farben umfasst Streifen 0 damit *alle* Farben und die Streifen 1–3 keine — es gibt
+         gar keine Partitionierung, und `uebergross_abgewiesen` schlägt folgerichtig fehl. Auf x86
+         fällt es nicht auf, weil 256 ≥ 64 ist. **Offen** — die Änderung gehört in `sel4lake-mem`
+         mit Host-Tests, nicht schnell in den Kernel.
+
+      **Drittens, und deshalb ist der Test auf aarch64 derzeit AUSGEHÄNGT:** an seinem Platz ganz
+      am Anfang von `threads::spawn_demo` belegt und gibt er Speicher frei, *bevor* die
+      baseline-empfindlichen Tests ihre Ausgangswerte nehmen. Danach fiel mal `captest`, mal
+      `sched` durch — nicht reproduzierbar und nicht ihre Schuld. Ein Test, der andere Tests kippen
+      lässt, macht das **gesamte** Ergebnis unbrauchbar; er bleibt draußen, bis (2) behoben ist und
+      ein Platz gefunden ist, der keine Baseline stört. Der arch-neutrale Code und der x86-Weg
+      bleiben unverändert.
 - [ ] **Way-Partitionierung (Intel CAT / ARM MPAM) nicht betrachtet.** Sie träfe dieselbe
       Eigenschaft über die Hardware statt über den Allokator, käme ohne kleinere Regionen und ohne
       seitenweises Mapping aus — und ließe sich mit der Färbung kombinieren. QEMU emuliert CAT

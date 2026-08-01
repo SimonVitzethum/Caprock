@@ -48,11 +48,14 @@ mod imp;
 // Gemeinsame API-Fläche beider Architekturen.
 pub mod cache_decode;
 pub mod fault;
+// virtio-pci ist ein PCI-Standard und liegt deshalb arch-neutral (A-5.2); es braucht nur `cpu`
+// und `pcie`, die es auf beiden Zweigen gibt.
+pub mod virtio;
 pub use imp::{cache, console, cpu, exception, fp, intc, mmu, power, syscall, timer};
 
 // ARM-/QEMU-`virt`-spezifische Geräte (noch ohne x86-Entsprechung, s. Modul-Doku).
 #[cfg(target_arch = "aarch64")]
-pub use imp::{gic, iommu, pcie, psci, smmu, virtio};
+pub use imp::{gic, iommu, pcie, psci, smmu};
 
 // x86-spezifisch: Segmentierung existiert auf ARM nicht (dort gibt es keine GDT/TSS).
 #[cfg(target_arch = "x86_64")]

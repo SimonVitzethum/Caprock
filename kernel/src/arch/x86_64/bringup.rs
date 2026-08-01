@@ -320,6 +320,35 @@ static STRIPE_ALLOC_OK: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 /// B-4.5: Prime+Probe. `true` heisst auch "nicht messbar" (SKIP) -- ein Fehlschlag ist nur ein
 /// Lauf, in dem die Positivkontrolle TRAEGT und die Faerbung trotzdem nichts bewirkt.
 static PPROBE_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// A-5.2: virtio-pci-Transport auf x86.
+static VIRTIO_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// A-5.2, Teil 1: lief der Transport, solange die IOMMU noch nicht sperrte?
+static VIRTIO_XPORT_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Eine vollstaendige virtio-rng-Anfrage auf einer frisch belegten Virtqueue-Region.
+///
+/// Gibt `(caps_gefunden, used_ring_fortgeschritten, gemeldete_bytes)`. Die Region wird hier
+/// belegt und wieder freigegeben -- der Aufrufer soll sich um nichts kuemmern muessen ausser um
+/// die Frage, die er stellt.
+#[cfg(feature = "selftest")]
+fn virtio_versuch(dev: Option<&hal::pcie::PciDevice>, max_poll: u64) -> (bool, bool, u32) {
+    let Some(d) = dev else { return (false, false, 0) };
+    let Some(cap) = system::alloc(4096, 4096) else { return (false, false, 0) };
+    let base = cap.base();
+    let r = match hal::virtio::probe(d) {
+        // SAFETY: das BAR-Fenster unter 4 GiB ist identity-gemappt (`map_device_block_global`),
+        // und die Virtqueue-Region stammt aus dem Allokator, gehoert also exklusiv uns.
+        Some(rng) => {
+            let (adv, w) = unsafe {
+                rng.request_polled(base, base, base + hal::virtio::DATA_OFFSET, max_poll)
+            };
+            (true, adv, w)
+        }
+        None => (false, false, 0),
+    };
+    system::free(cap);
+    r
+}
 
 /// A-4.2: haelt der ruhende Punkt -- weist ein stillgelegter Endpoint neue Transaktionen ab?
 #[cfg(feature = "selftest")]
@@ -389,6 +418,7 @@ fn all_done(archive: bool) -> bool {
     let stripes = STRIPE_ALLOC_OK.load(Ordering::Acquire);
     // B-4.5 in der Abschlussbedingung, aus demselben Grund wie B-4.2 daneben.
     let pprobe = PPROBE_OK.load(Ordering::Acquire);
+    let virtio = VIRTIO_OK.load(Ordering::Acquire);
     let iface = IFACE_GATE_OK.load(Ordering::Acquire);
     // A-4.2 aus demselben Grund wie B-4.2 in der Abschlussbedingung: eine Zusicherung, die nur
     // im Bericht steht, faellt beim Brechen niemandem auf.
@@ -407,6 +437,7 @@ fn all_done(archive: bool) -> bool {
         && root
         && stripes
         && pprobe
+        && virtio
         && iface
         && quiesce
         && rebind
@@ -724,6 +755,30 @@ pub fn run(multiboot_info: u64) -> ! {
     }
     println!("pci     : {}", if ndev > 0 { "ALL PASS" } else { "FAILURES" });
 
+    // --- virtio-pci auf x86, Teil 1 von 2 (A-5.2) -------------------------------------------
+    //
+    // Bis 2026-08-01 lag der virtio-Treiber unter `hal/aarch64/`, obwohl nichts daran ARM-
+    // spezifisch ist: virtio-pci ist ein PCI-Standard. Er liegt jetzt arch-neutral
+    // (`hal::virtio`) und laeuft hier zum ersten Mal auf x86.
+    //
+    // **Diese Stelle ist bewusst gewaehlt: VOR dem VT-d-Aufbau.** Hier steht die Root-Tabelle
+    // noch nicht auf Default-Block, das Geraet darf also DMAen. Belegt wird damit der TRANSPORT
+    // in voller Laenge -- Capability-Liste, Handshake, Feature-Aushandlung einschliesslich
+    // VIRTIO_F_ACCESS_PLATFORM, Virtqueue, und dass das Geraet wirklich Bytes liefert.
+    //
+    // Teil 2 steht nach dem IOMMU-Aufbau und prueft die Gegenrichtung. Zwei Teile, weil ein Test,
+    // der nur den Erfolgsfall zeigt, nicht sagen kann, ob die Sperre danach wirkt -- und einer,
+    // der nur die Sperre zeigt, nicht, ob ueberhaupt etwas funktioniert haette.
+    #[cfg(feature = "selftest")]
+    {
+        let (ok, adv, w) = virtio_versuch(rng.as_ref(), 50_000_000);
+        println!(
+            "virtio  : Transport (vor VT-d): Caps={} Geraet-DMA={} ({} Byte)",
+            ok as u8, adv as u8, w
+        );
+        VIRTIO_XPORT_OK.store(rng.is_none() || (ok && adv && w > 0), Ordering::Release);
+    }
+
     // --- IOMMU (VT-d): Bring-up mit Default-Block ---
     // Über denselben Weg wie auf ARM: der Kernel kennt nur das `DmaEnforcer`-Trait.
     let up = system::dma_enforcer_init();
@@ -832,6 +887,36 @@ pub fn run(multiboot_info: u64) -> ! {
         hal::power::system_off();
     }
     system::init_core();
+
+    // --- virtio-pci auf x86, Teil 2 von 2 (A-5.2 / E) ---------------------------------------
+    //
+    // Dieselbe Anfrage, jetzt mit aufgebauter VT-d-Einheit und Root-Tabelle auf Default-Block.
+    // Das Geraet hat KEINE Zuteilung (`attach` liefert auf x86 noch None -- B-3.3/B-3.4), sein
+    // Bus-Master-Zugriff muss also ins Leere laufen. Kaeme er durch, waere das ein
+    // Isolationsbruch, und dieser Test wuerde ihn sehen.
+    //
+    // Kurze Poll-Schranke: hier wird ein AUSBLEIBEN erwartet: auf eine Antwort zu warten, die per
+    // Entwurf nie kommt, kostet sonst je Lauf hunderte Millisekunden.
+    #[cfg(feature = "selftest")]
+    {
+        let vorher = hal::iommu::drain_faults();
+        let (ok, adv, w) = virtio_versuch(rng.as_ref(), 2_000_000);
+        let faults = hal::iommu::drain_faults();
+        println!(
+            "virtio  : Sperre (nach VT-d, Geraet nicht zugeteilt): Caps={} Geraet-DMA={} ({} Byte) \
+             VT-d-Faults davor={} danach={}",
+            ok as u8, adv as u8, w, vorher, faults
+        );
+        let blockiert = rng.is_none() || !adv;
+        println!(
+            "virtio  : {} (A-5.2: der virtio-pci-Transport laeuft auf x86 -- arch-neutraler Treiber, \
+             Caps, Handshake, Feature-Aushandlung inkl. VIRTIO_F_ACCESS_PLATFORM, Virtqueue, echte \
+             Geraete-DMA. Und nach dem VT-d-Aufbau kommt dasselbe Geraet OHNE Zuteilung nicht mehr \
+             durch -- beide Richtungen belegt, nicht nur die bequeme)",
+            if VIRTIO_XPORT_OK.load(Ordering::Acquire) && blockiert { "ALL PASS" } else { "FAILURES" }
+        );
+        VIRTIO_OK.store(VIRTIO_XPORT_OK.load(Ordering::Acquire) && blockiert, Ordering::Release);
+    }
 
     // --- Zyklenzaehler (Stufe 1) ---
     //

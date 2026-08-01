@@ -380,3 +380,17 @@ pub fn arm_bus_master(rid: u32) {
     let cmd = cfg_read16(bus, dev, func, CFG_COMMAND);
     write_cmd(bus, dev, func, cmd | CMD_BUS_MASTER);
 }
+
+/// **Zeiger auf die erste PCI-Capability** (Konfigurationsoffset `0x34`), oder `0`.
+///
+/// Gebraucht von [`crate::virtio`], das seine Strukturen ausschliesslich ueber die
+/// Capability-Liste findet. Fehlte auf x86, solange der virtio-Treiber unter `aarch64/` lag
+/// (A-5.2) — die ARM-Fassung hat die Funktion seit jeher.
+pub fn cap_ptr(d: &PciDevice) -> u8 {
+    // Nur gueltig, wenn das Status-Register die Capability-Liste ueberhaupt meldet (Bit 4);
+    // sonst steht an 0x34 Muell, und die Liste liefe in eine erfundene Kette.
+    if cfg_read16(d.bus, d.dev, d.func, 0x06) & (1 << 4) == 0 {
+        return 0;
+    }
+    cfg_read8(d.bus, d.dev, d.func, 0x34) & 0xfc
+}

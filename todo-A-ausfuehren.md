@@ -231,8 +231,34 @@ Für einen Betriebsanspruch fehlen drei Dinge.
 
 - [ ] **A-5.1 Treiberrahmen als Userland-PD.** MMIO-Cap, IRQ-Cap, DMA-Cap — die Stücke existieren
       einzeln; es fehlt die Zusammenfassung zu „so schreibt man hier einen Treiber".
-- [ ] **A-5.2 virtio auf x86.** `virtio` ist bis heute aarch64-only. Netz und Blockgerät sind die
-      Mindestmenge für „Cloud".
+- [~] **A-5.2 virtio auf x86** — der **Transport** steht und ist auf x86 belegt (2026-08-01).
+      Offen bleiben **Netz und Blockgerät**.
+
+      Der Treiber lag unter `hal/aarch64/`, obwohl nichts daran ARM-spezifisch war: virtio-pci ist
+      ein PCI-Standard, und die beiden Berührungspunkte — `cpu::dsb_sy()` (auf x86 `mfence`, war
+      da) und `pcie::cap_ptr` (fehlte, drei Zeilen) — gibt es auf beiden Zweigen. Er liegt jetzt
+      arch-neutral in `crates/sel4lake-hal/src/virtio.rs`.
+
+      **Gemessen, beide Richtungen** (`virtio`-Zeile, x86-Suite):
+
+          Transport (vor VT-d):  Caps=1  Geraet-DMA=1 (64 Byte)
+          Sperre  (nach VT-d):   Caps=1  Geraet-DMA=0 (0 Byte)  VT-d-Faults 0 -> 1
+
+      Der erste Teil steht **vor** dem VT-d-Aufbau und belegt den Transport in voller Länge:
+      Capability-Liste, Handshake, Feature-Aushandlung einschließlich
+      `VIRTIO_F_ACCESS_PLATFORM`, Virtqueue — und dass das Gerät wirklich Bytes per Bus-Master-DMA
+      liefert. Der zweite läuft nach dem Aufbau: dasselbe Gerät, keine Zuteilung, kommt am
+      Default-Block nicht mehr durch, und die Einheit protokolliert den Fault. Ein Test, der nur
+      den Erfolgsfall zeigt, könnte nicht sagen, ob die Sperre wirkt; einer, der nur die Sperre
+      zeigt, nicht, ob überhaupt etwas funktioniert hätte.
+
+      QEMU-Detail, das eine Runde gekostet hat: `virtio-rng-pci` ist auf x86 per Vorgabe
+      *transitional*, und dort gibt es `iommu_platform` nicht (`VIRTIO_F_IOMMU_PLATFORM was
+      supported by neither legacy nor transitional device`). Es braucht `disable-legacy=on`.
+
+      **Zu tun für das eigentliche A-5.2:** virtio-net und virtio-blk. Beides braucht mehr als den
+      Transport (mehrere Queues, Anfrageformate) — und für nutzbaren DMA die VT-d-Zuteilung aus
+      B-3.3/B-3.4, die heute noch `None` liefert.
 - [ ] **A-5.3** Die Geräte-Zuteilung darf erst scharf werden, wenn **Interrupt Remapping** steht —
       das liegt in Strang B (B-3). Bis dahin nur Geräte ohne DMA-Fähigkeit oder ohne
       Tenant-Zugriff.

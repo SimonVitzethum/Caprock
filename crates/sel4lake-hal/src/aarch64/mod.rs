@@ -19,7 +19,6 @@ pub mod psci;
 pub mod smmu;
 pub mod syscall;
 pub mod timer;
-pub mod virtio;
 
 /// Arch-neutraler Name des Interrupt-Controllers (hier: GICv2).
 pub use gic as intc;

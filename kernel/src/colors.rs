@@ -198,8 +198,19 @@ pub fn run_stripe_alloc() -> bool {
 /// nach `MASK_BITS / PARTITIONS` Seiten. **Das ist die harte Grenze des Verfahrens** und der
 /// Grund, warum die 2-MiB-Region von [`crate::system::spawn_isolated`] nicht gefärbt werden
 /// kann: 512 Seiten überstreichen jeden Streifen mehrfach, also alle Farben.
-pub const fn region_bytes() -> u64 {
-    (sel4lake_mem::MASK_BITS / PARTITIONS) as u64 * PAGE
+pub fn region_bytes() -> u64 {
+    // **Die kleinere der beiden Schranken.** `MASK_BITS` begrenzt, wie viele Farben eine Maske
+    // ueberhaupt fassen kann; `count()` sagt, wie viele es auf DIESER Maschine gibt. Frueher stand
+    // hier nur `MASK_BITS`, und das war auf x86 zufaellig richtig (256 Farben > 64 Maskenbits).
+    //
+    // Auf aarch64 mit 16 Farben war es falsch: ein Streifen umfasst dort 16/4 = 4 Farben, eine
+    // 64-KiB-Region aber 16 aufeinanderfolgende Seiten -- also jede Farbe, viermal. `alloc_colored`
+    // fand folglich nie einen passenden Lauf, und der gesamte Farbtest fiel durch.
+    //
+    // Aufgefallen ist das erst, als der Test arch-neutral wurde (A1): auf einem Zweig gemessen,
+    // auf dem anderen nie ausgefuehrt -- genau die Fehlerform, gegen die der Umzug gemacht wurde.
+    let farben = count().min(sel4lake_mem::MASK_BITS);
+    (farben / PARTITIONS).max(1) as u64 * PAGE
 }
 
 /// Ergebnis des Farb-Selbsttests.

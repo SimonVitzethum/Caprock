@@ -100,7 +100,7 @@ boot_once() {
     timeout "$SECONDS_RUN" qemu-system-x86_64 \
         -kernel "$ELF" -m "$RAM" -smp 4 "${ACCEL[@]}" \
         -machine q35,kernel-irqchip=split -device intel-iommu,caching-mode=on,intremap=on \
-        -device virtio-rng-pci \
+        -device virtio-rng-pci,disable-legacy=on,iommu_platform=on \
         -nographic -serial file:"$LOG" -no-reboot \
         </dev/null >/dev/null 2>&1
     local rc=$?
@@ -191,6 +191,7 @@ check "sched   : ALL PASS"            "Stufe 4: praeemptiver Scheduler (LAPIC-Ti
 check "ipc     : ALL PASS"            "Stufe 4: cap-gesicherte IPC (CALL/RECV/REPLY zwischen zwei PDs)"
 check "ring3   : ALL PASS"            "Stufe 4c: Ring-3-Threads (Syscall aus Ring 3; Zugriff auf Kernel-Speicher faultet -> Thread beendet, Kernel laeuft weiter)"
 check "pci     : ALL PASS"            "PCI-Enumeration ueber das ECAM-Fenster aus der ACPI-MCFG (virtio-rng gefunden, Bus-Master an)"
+check "virtio  : ALL PASS" "A-5.2: virtio-pci auf x86 -- arch-neutraler Treiber; VOR dem VT-d-Aufbau liefert das Geraet echte Bytes per Bus-Master-DMA, NACH dem Aufbau kommt dasselbe Geraet ohne Zuteilung nicht mehr durch (VT-d-Fault). Beide Richtungen, nicht nur die bequeme"
 check "vtdcaps : ALL PASS" "VT-d-Faehigkeiten (Schritt 1): SAGAW/MGAW/ND/CM/RWBF/ECAP.C/QI/IR/SC/ScalableMode einmal gelesen und protokolliert; jede spaetere Bit-Entscheidung leitet sich daraus ab"
 check "vtdgrp  : ALL PASS" "DMAR-Auswertung + Gruppenbildung (Schritt 2) gegen eine EINGESPEISTE Tabelle/Topologie: Catch-all zuletzt, Scope-Typ 2 als Subhierarchie, ACS-Gruppen, RID-Alias-Mengen, RMRR-Ausschluss, Firmware-Muell abgefangen, Vollstaendigkeits-Oracle"
 check "apic    : x2APIC" "x2APIC aktiv (MSR-Pfad statt MMIO): schnellere IPIs, 64-Bit-ICR in einem Zugriff, und 32-Bit-APIC-IDs -- xAPIC kann nur 255 Kerne adressieren"

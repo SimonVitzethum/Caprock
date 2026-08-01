@@ -1,5 +1,12 @@
 //! Minimaler **virtio-pci (modern)** RNG-Treiber (ext-23, D4) — das DMA-Beweisgerät.
 //!
+//! **Arch-neutral seit 2026-08-01 (todo A-5.2).** Das Modul lag bis dahin unter `aarch64/`, obwohl
+//! nichts daran ARM-spezifisch war: virtio-pci ist ein PCI-Standard, und die beiden einzigen
+//! Berührungspunkte mit der Architektur — `cpu::dsb_sy()` (auf x86 `mfence`) und der
+//! PCI-Konfigurationszugriff — gibt es auf beiden Zweigen. Es lag dort, weil es dort entstanden
+//! ist. Dieselbe Fehlerform wie beim Farbtest: Code auf einem Zweig, der auf dem anderen fehlt,
+//! ohne dass ihn jemand dorthin gelegt hätte.
+//!
 //! Treiber-/Protokoll-Logik (Trusted-/kernel-seitig): findet die virtio-Strukturen über die
 //! PCI-Capability-Liste, handshaket (Reset -> ACK -> DRIVER -> VERSION_1 -> FEATURES_OK ->
 //! Virtqueue 0 -> DRIVER_OK), legt einen WRITE-Deskriptor in die DMA-Region und pollt den
@@ -8,8 +15,8 @@
 //! beschränkt. Physadressen in den Deskriptoren stammen aus der DmaCap-Region (backend-direkt,
 //! SMMU-erzwungen). Die Virtqueue liegt vollständig in der DMA-Region.
 
-use super::cpu;
-use super::pcie::{self, PciDevice};
+use crate::cpu;
+use crate::pcie::{self, PciDevice};
 
 // virtio-pci Capability-Typen (cfg_type im Vendor-Cap 0x09).
 const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
@@ -169,6 +176,23 @@ impl VirtioRng {
     /// dem Gerät eine Adresse, die es nicht auflösen kann — oder beschreibt eine, unter der
     /// nichts liegt. Deshalb getrennt, auch wo es umständlicher aussieht.
     pub unsafe fn request(&self, cpu_base: u64, dev_base: u64, desc_addr: u64) -> (bool, u32) {
+        self.request_polled(cpu_base, dev_base, desc_addr, 50_000_000)
+    }
+
+    /// Wie [`Self::request`], aber mit waehlbarer Poll-Obergrenze.
+    ///
+    /// Gebraucht fuer den **erwarteten Fehlschlag**: soll geprueft werden, dass die IOMMU einen
+    /// nicht zugeteilten Strom blockt, wartet man auf eine Antwort, die per Entwurf nie kommt.
+    /// 50 Mio Umdrehungen sind dann keine Grosszuegigkeit, sondern hunderte Millisekunden
+    /// Leerlauf je Lauf. Der Aufrufer, der einen Fehlschlag ERWARTET, sagt das mit einer kurzen
+    /// Schranke — und traegt selbst die Verantwortung, dass sie nicht zu kurz ist.
+    pub unsafe fn request_polled(
+        &self,
+        cpu_base: u64,
+        dev_base: u64,
+        desc_addr: u64,
+        max_poll: u64,
+    ) -> (bool, u32) {
         // CPU-Sicht: hier schreibt/liest der Treiber die Ringe.
         let desc = cpu_base + OFF_DESC;
         let avail = cpu_base + OFF_AVAIL;
@@ -242,7 +266,7 @@ impl VirtioRng {
         // geantwortet); die hohe Schranke greift nur im seltenen TCG-Timing-Jitter-Fall, in dem
         // das emulierte Geraet spaeter fertig wird (Burn-in #1: ~1/2000 Laeufe `used_adv=false`).
         // Worst Case dann ~hunderte ms Busy-Wait statt eines Schein-Fehlschlags.
-        for _ in 0..50_000_000u64 {
+        for _ in 0..max_poll {
             if rd16(used + 2) != used_idx0 {
                 let len = rd32(used + 8); // used.ring[0].len
                 return (true, len);

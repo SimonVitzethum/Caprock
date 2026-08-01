@@ -387,6 +387,9 @@ pub fn run_color(entry: usize, prio: u8) -> ColorTest {
 /// gemessen"), und die Textfassung driftete — `color` schrieb als **einzige** von 69 Stellen `FAIL`
 /// statt `FAILURES`, womit ein durchgefallener Test aus der Ergebnissignatur der Suite (B-1.2c)
 /// HERAUSfiel, statt aufzufallen. Zwei Fassungen desselben Urteils driften; eine kann es nicht.
+///
+/// Hinter demselben Gate wie [`ColorTest`] — ohne das baut die schlanke Konfiguration nicht (F1).
+#[cfg(feature = "selftest")]
 pub fn report_color(c: &ColorTest) {
     if !c.usable {
         println!(
@@ -443,4 +446,241 @@ pub fn report() {
             "cache   : keine Cache-Geometrie gemeldet -> 1 Seitenfarbe (keine Partitionierung moeglich)"
         ),
     }
+}
+
+// --- B-4.5: Wirkung statt nur Zuteilung (Prime+Probe) --------------------------------------
+//
+// Bis hierher belegt `run_color`, dass die Farbsätze zweier PDs **disjunkt sind**. Das ist eine
+// Aussage über die Zuteilung, nicht über ihre Wirkung. Die eigentliche Behauptung von A1 lautet
+// aber: *weil* sie disjunkt sind, verdrängen sich die PDs im LLC nicht gegenseitig. Diese Zeile
+// stand bis 2026-08-01 ungeprüft in `docs/invariants.md` §12.
+//
+// ## Warum das eine Positivkontrolle braucht
+//
+// Ein Prime+Probe misst, wie lange ein erneuter Durchlauf über den eigenen Datensatz dauert,
+// nachdem jemand anderes den Cache benutzt hat. Bleibt die Zeit niedrig, war nichts verdrängt.
+// Genau hier lauert der Fehler, gegen den dieses Projekt seine Regel hat: **auf einer Maschine
+// ohne echten Cache bleibt die Zeit IMMER niedrig.** Unter TCG hätte der Test also „keine
+// Verdrängung" gemeldet — und damit A1 scheinbar bewiesen, ohne je etwas gemessen zu haben.
+//
+// Deshalb misst er drei Werte statt einem:
+//
+//   base     — Opfer erneut lesen, ohne dass jemand dazwischen war
+//   shared   — nachdem ein Angreifer mit dem GLEICHEN Farbsatz gelaufen ist
+//   disjoint — nachdem ein Angreifer mit einem DISJUNKTEN Farbsatz gelaufen ist
+//
+// `shared` ist die Positivkontrolle: liegt sie nicht deutlich über `base`, kann diese Maschine
+// Verdrängung nicht zeigen, und dann ist über `disjoint` **nichts** auszusagen -> SKIP, nicht
+// PASS. Das erledigt den TCG-Fall nebenbei und ohne den Hypervisor zu erkennen: ein Emulator
+// ohne Cache fällt durch die Positivkontrolle, weil er es nicht anders kann.
+//
+// ## Warum der Angreifer aus vielen Regionen besteht
+//
+// Eine gefärbte Region ist auf [`region_bytes`] begrenzt (64 KiB bei 4 Partitionen) — das ist
+// die harte Grenze des Verfahrens, nicht eine Einstellung. Eine einzelne solche Region kann eine
+// andere gar nicht aus dem LLC verdrängen: sie ist um Größenordnungen kleiner als der Anteil des
+// LLC, der auf ihren Streifen entfällt. Der Angreifer besteht daher aus so vielen Regionen
+// desselben Streifens, dass er diesen Anteil zweimal überschreibt — dimensioniert an der
+// **gemessenen** LLC-Größe, nicht an einer Konstanten.
+
+/// Obergrenze für die Angreifer-Regionen je Seite (Speicher: 2 × MAX × [`region_bytes`]).
+#[cfg(feature = "selftest")]
+const MAX_ATTACKER: usize = 96;
+
+/// Wiederholungen je Messpunkt; gewertet wird das **Minimum**. Ein Minimum ist gegen Störungen
+/// robust, wie sie ein Timer-Tick oder ein anderer Kern erzeugt: Störungen können eine Messung
+/// nur verlängern, nie verkürzen.
+#[cfg(feature = "selftest")]
+const ROUNDS: usize = 8;
+
+/// Ergebnis des Prime+Probe (B-4.5).
+#[cfg(feature = "selftest")]
+#[derive(Default)]
+pub struct PrimeProbe {
+    /// Urteil. Nur aussagekräftig, wenn [`Self::sensitive`] gilt.
+    pub ok: bool,
+    /// Konnte der Aufbau überhaupt hergestellt werden (Farben, Geometrie, Speicher)?
+    pub ran: bool,
+    /// **Positivkontrolle**: hat der gleichfarbige Angreifer messbar verdrängt? Ohne das ist
+    /// über den disjunkten nichts auszusagen.
+    pub sensitive: bool,
+    /// Zyklen für einen Durchlauf über das Opfer — ungestört.
+    pub base: u64,
+    /// … nachdem ein Angreifer mit dem **gleichen** Farbsatz lief.
+    pub shared: u64,
+    /// … nachdem ein Angreifer mit einem **disjunkten** Farbsatz lief.
+    pub disjoint: u64,
+    /// Größe **eines** Angreifer-Datensatzes in KiB (beide sind gleich groß).
+    pub attacker_kib: u64,
+    /// Aller Speicher zurückgegeben?
+    pub balanced: bool,
+}
+
+/// Einen Datensatz einmal vollständig durchlaufen, eine Leseoperation je Cache-Zeile.
+///
+/// `read_volatile` ist hier nicht Vorsicht, sondern Bedingung: ein gewöhnliches Lesen, dessen
+/// Ergebnis niemand benutzt, darf der Compiler entfernen — und dann misst der Test eine leere
+/// Schleife.
+#[cfg(feature = "selftest")]
+fn walk(regions: &[(u64, u64)], line: u64) {
+    for &(base, len) in regions {
+        let mut off = 0;
+        while off < len {
+            // SAFETY: `base..base+len` stammt aus `alloc_colored`, gehört exklusiv dem Test,
+            // liegt im identity-gemappten Normal-RAM und wird nirgends gleichzeitig benutzt.
+            unsafe { core::ptr::read_volatile((base + off) as *const u8) };
+            off += line;
+        }
+    }
+}
+
+/// Einen Durchlauf über das Opfer messen (Zyklen).
+#[cfg(feature = "selftest")]
+fn probe(victim: &[(u64, u64)], line: u64) -> u64 {
+    let t0 = hal::timer::cycles();
+    walk(victim, line);
+    hal::timer::cycles().wrapping_sub(t0)
+}
+
+/// **Prime+Probe: verdrängen disjunkte Farbsätze einander messbar weniger?** (B-4.5)
+///
+/// Gibt `ran == false`, wenn der Aufbau nicht herstellbar war (eine Farbe, keine Geometrie, zu
+/// wenig Speicher), und `sensitive == false`, wenn die Maschine Verdrängung nicht zeigen kann.
+/// Beides ist **kein Fehlschlag**, sondern die Feststellung, dass hier nichts zu messen ist.
+#[cfg(feature = "selftest")]
+pub fn run_prime_probe() -> PrimeProbe {
+    let mut r = PrimeProbe::default();
+    if !usable() {
+        return r;
+    }
+    let Some(g) = hal::cache::llc() else {
+        return r;
+    };
+    let (Some(m0), Some(m1)) = (mask_for(0), mask_for(1)) else {
+        return r;
+    };
+    let line = u64::from(g.line_bytes).max(16);
+    let sz = region_bytes();
+    let free0 = crate::system::total_free();
+
+    // So viele Regionen, dass der auf EINEN Streifen entfallende LLC-Anteil zweimal
+    // überschrieben wird. Aus der gemessenen Geometrie, nicht geraten.
+    let je_streifen = u64::from(g.size_bytes) / u64::from(PARTITIONS);
+    let n = ((2 * je_streifen).div_ceil(sz) as usize).clamp(8, MAX_ATTACKER);
+
+    // Belegen. Bei jedem Fehlschlag alles bisher Belegte zurueckgeben -- ein Test, der unter
+    // Speichermangel leckt, macht den naechsten Test unbrauchbar.
+    let mut caps: [Option<sel4lake_mem::MemoryCap>; 1 + 2 * MAX_ATTACKER] =
+        core::array::from_fn(|_| None);
+    let mut nutz = 0usize;
+    let mut belegen = |maske: ColorMask,
+                       caps: &mut [Option<sel4lake_mem::MemoryCap>],
+                       nutz: &mut usize|
+     -> Option<(u64, u64)> {
+        let c = crate::system::alloc_colored(sz, PAGE, maske)?;
+        let (b, l) = (c.base(), c.len());
+        caps[*nutz] = Some(c);
+        *nutz += 1;
+        Some((b, l))
+    };
+
+    let mut victim = [(0u64, 0u64); 1];
+    let mut ang_gleich = [(0u64, 0u64); MAX_ATTACKER];
+    let mut ang_disjunkt = [(0u64, 0u64); MAX_ATTACKER];
+
+    let mut aufbau = || -> Option<()> {
+        victim[0] = belegen(m0, &mut caps, &mut nutz)?;
+        for e in ang_disjunkt.iter_mut().take(n) {
+            *e = belegen(m1, &mut caps, &mut nutz)?;
+        }
+        for e in ang_gleich.iter_mut().take(n) {
+            *e = belegen(m0, &mut caps, &mut nutz)?;
+        }
+        Some(())
+    };
+    let aufgebaut = aufbau().is_some();
+
+    if aufgebaut {
+        r.ran = true;
+        r.attacker_kib = n as u64 * sz / 1024;
+        let (gleich, disjunkt) = (&ang_gleich[..n], &ang_disjunkt[..n]);
+
+        // IRQs aus: ein Timer-Tick mitten in einer Messung verlaengert sie und verschiebt
+        // ausgerechnet das Minimum, auf das gewertet wird.
+        let daif = hal::cpu::local_irq_save();
+        let (mut b, mut s, mut d) = (u64::MAX, u64::MAX, u64::MAX);
+        for _ in 0..ROUNDS {
+            // Ungestoert. Zweimal laufen, damit die erste (kalte) Runde nicht gewertet wird.
+            walk(&victim, line);
+            b = b.min(probe(&victim, line));
+
+            // Disjunkter Angreifer.
+            walk(&victim, line);
+            walk(disjunkt, line);
+            d = d.min(probe(&victim, line));
+
+            // Gleichfarbiger Angreifer -- die Positivkontrolle.
+            walk(&victim, line);
+            walk(gleich, line);
+            s = s.min(probe(&victim, line));
+        }
+        hal::cpu::local_irq_restore(daif);
+        r.base = b;
+        r.shared = s;
+        r.disjoint = d;
+
+        // Positivkontrolle: der gleichfarbige Angreifer muss den Durchlauf um mindestens die
+        // Haelfte verlaengert haben. Darunter ist die Messung zu stumpf, um ueber den
+        // disjunkten Fall zu urteilen -- und dann sagt der Test das, statt PASS zu melden.
+        r.sensitive = s >= b.saturating_add(b / 2);
+        // Die eigentliche Behauptung: mit disjunkten Farben liegt die Zeit naeher am
+        // ungestoerten Fall als am verdraengten.
+        r.ok = r.sensitive && d.saturating_mul(2) <= b.saturating_add(s);
+    }
+
+    for c in caps.iter_mut().take(nutz) {
+        if let Some(cap) = c.take() {
+            crate::system::free(cap);
+        }
+    }
+    r.balanced = crate::system::total_free() == free0;
+    r.ok = r.ok && r.balanced;
+    r
+}
+
+/// Das Ergebnis von [`run_prime_probe`] melden — wie [`report_color`] die **einzige** Druckstelle.
+#[cfg(feature = "selftest")]
+pub fn report_prime_probe(p: &PrimeProbe) {
+    if !p.ran {
+        println!(
+            "pprobe  : SKIP -- kein Aufbau moeglich ({} Farbe(n), LLC-Geometrie/Speicher)",
+            count()
+        );
+        return;
+    }
+    println!(
+        "pprobe  : Opfer {} KiB, Angreifer {} KiB je Farbsatz · ungestoert={} Zyklen \
+         disjunkt={} gleichfarbig={} · balanciert={}",
+        region_bytes() / 1024,
+        p.attacker_kib,
+        p.base,
+        p.disjoint,
+        p.shared,
+        p.balanced as u8
+    );
+    if !p.sensitive {
+        println!(
+            "pprobe  : SKIP -- die Positivkontrolle traegt nicht: der GLEICHFARBIGE Angreifer hat \
+             nicht messbar verdraengt (gleichfarbig={} vs ungestoert={}). Auf einer Maschine, die \
+             Verdraengung nicht zeigen kann (z. B. TCG: kein echter Cache), ist ueber den disjunkten \
+             Fall nichts auszusagen -- 'kein Unterschied' waere hier kein Beleg, sondern ein Artefakt",
+            p.shared, p.base
+        );
+        return;
+    }
+    println!(
+        "pprobe  : {} (B-4.5: disjunkte Farbsaetze verdraengen einander messbar weniger -- die \
+         WIRKUNG von A1, nicht nur die Zuteilung; Positivkontrolle traegt)",
+        if p.ok { "ALL PASS" } else { "FAILURES" }
+    );
 }

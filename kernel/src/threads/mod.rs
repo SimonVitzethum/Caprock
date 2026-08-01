@@ -471,6 +471,14 @@ static DMAGEN_DONE: AtomicBool = AtomicBool::new(false);
 // Adresse zu vergeben, die das Geraet nicht absetzen kann.
 static DMAWIN_DONE: AtomicBool = AtomicBool::new(false);
 static DMAWIN_OK: AtomicBool = AtomicBool::new(false);
+/// Cache-Partitionierung (todo A1) und Streifenvergabe (B-4.2) — bis 2026-08-01 liefen beide
+/// **nur** auf x86, weil ihr einziger Aufrufer in `arch/x86_64/bringup.rs` stand. `hal::cache` hat
+/// eine aarch64-Fassung, die damit nie an einer echten Zuteilung geprueft wurde; genau diese
+/// Fehlerform (Code auf dem zweiten Zweig, uebersetzt aber nie ausgefuehrt) hat das Projekt schon
+/// dreimal bezahlt. Der Test selbst liegt arch-neutral in `crate::colors` — wie `crate::dmatests`.
+static COLOR_DONE: AtomicBool = AtomicBool::new(false);
+static COLOR_OK: AtomicBool = AtomicBool::new(false);
+static STRIPE_ALLOC_OK: AtomicBool = AtomicBool::new(false);
 static DMAWIN_NARROW: AtomicBool = AtomicBool::new(false); //   32-Bit-Geraet -> abgewiesen
 static DMAWIN_EXHAUST: AtomicBool = AtomicBool::new(false); //  Fenster voll -> abgewiesen
 static DMAWIN_INTACT: AtomicBool = AtomicBool::new(false); //   Kontext danach unveraendert nutzbar
@@ -1510,6 +1518,23 @@ static RELOAD_INFO: SpinLock<Option<ReloadInfo>> = SpinLock::new(None);
 
 /// PDs + Endpoint + Caps anlegen und Demo-Threads (v1, Client, Worker) starten.
 pub fn spawn_demo() {
+    // Cache-Partitionierung (todo A1) + Streifenvergabe (B-4.2). Steht GANZ am Anfang, aus einem
+    // inhaltlichen Grund: `run_stripe_alloc` prueft, dass ein erschoepfter Farbraum SAUBER
+    // scheitert, und braucht dafuer den Ruhezustand -- haelt schon jemand Streifen, meldet der
+    // Test SKIP statt zu pruefen. Genau hier hat noch nichts gespawnt.
+    //
+    // Gemeldet wird ueber `colors::report_color` (EINE Druckstelle fuer beide Hochlaufwege);
+    // `run_stripe_alloc` meldet selbst.
+    {
+        let c = crate::colors::run_color(iso_probe as *const () as usize, system::IDLE_PRIO);
+        crate::colors::report_color(&c);
+        // `usable == false` heisst NICHT durchgefallen, sondern nicht durchfuehrbar (unter zwei
+        // Farben gibt es nichts zu trennen) -- dann darf es die Abschlussbedingung nicht blockieren.
+        COLOR_OK.store(c.ok || !c.usable, Ordering::Release);
+        STRIPE_ALLOC_OK.store(crate::colors::run_stripe_alloc(), Ordering::Release);
+        COLOR_DONE.store(true, Ordering::Release);
+    }
+
     let ep = system::create_endpoint().expect("endpoint");
     let root = system::install_endpoint_cap(ep as u32, Rights::RWX).expect("ep cap");
     let send_cap = system::cap_mint(root, Rights::WRITE, 0).expect("send cap");
@@ -4915,6 +4940,12 @@ fn all_done() -> bool {
     let dmawin = DMAWIN_DONE.load(Ordering::Acquire) && DMAWIN_OK.load(Ordering::Acquire);
     // Teardown-Token (ext-37): Freigabe nur gegen Nachweis; Pending statt UAF.
     let dmatok = DMATOK_DONE.load(Ordering::Acquire) && DMATOK_OK.load(Ordering::Acquire);
+    // Cache-Partitionierung (todo A1) + Streifenvergabe (B-4.2). In der ABSCHLUSSBEDINGUNG, nicht
+    // bloss im Bericht -- aus demselben Grund, der auf x86 schon fuer B-4.2 notiert ist: eine
+    // Zusicherung, die nur gedruckt wird, faellt beim Brechen niemandem auf.
+    let color = COLOR_DONE.load(Ordering::Acquire)
+        && COLOR_OK.load(Ordering::Acquire)
+        && STRIPE_ALLOC_OK.load(Ordering::Acquire);
     // Prozess-Heap (ext-25): echter Box/Vec/BTreeMap-Heap auf realen Physadressen (safe Rust).
     let sasheap = SASHEAP_DONE.load(Ordering::Acquire) && SASHEAP_OK.load(Ordering::Acquire);
     // Binary-Loader L1 (ext-26): extern gebautes hello geladen + lief (signalisierte HELLO_BADGE).
@@ -4981,6 +5012,7 @@ fn all_done() -> bool {
         && dmagen
         && dmawin
         && dmatok
+        && color
         && sasheap
         && load
         && sysload

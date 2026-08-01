@@ -254,18 +254,27 @@ keine Cache-Farbe — Region, Kernel-Stack und Seitentabellen. Offen bleibt das 
       Block-PTE. **Die Entscheidung, welcher Weg der reguläre sein soll, steht aus** — solange
       `spawn_isolated` der Normalfall ist, ist A1 im Normalbetrieb *nicht* wirksam.
 
-- [ ] **Die Farbanzahl begrenzt die Anzahl gleichzeitig getrennter PDs.** `ColorMask` ist 64 Bit,
-      `PARTITIONS` teilt das in disjunkte Streifen. Mehr gleichzeitige PDs als Partitionen heißt:
-      zwei teilen sich einen Streifen. Heute vergibt `mask_for` rundläufig, **ohne** zu prüfen, ob
-      der Streifen schon belegt ist — der Aufrufer bekommt also stillschweigend eine Farbüberschneidung.
-      Nötig: eine Streifen-Freiliste, und ein sauberer Fehlschlag statt einer stillen Aufweichung,
-      wenn keine disjunkte Partition mehr frei ist.
+- [x] **Die Farbanzahl begrenzt die Anzahl gleichzeitig getrennter PDs** — erledigt mit B-4.2,
+      hier bis 2026-08-01 nur nicht nachgetragen. `claim_stripe`/`release_stripe`
+      (`kernel/src/colors.rs`) führen Belegung über `STRIPES_TAKEN`; ist kein Streifen frei, gibt es
+      `None`, und die PD entsteht **gar nicht erst** — kein Ersatzsatz, keine „alle Farben"-Rückfallebene.
+      `mask_for` (rundläufig, ungeprüft) steht nur noch im Test selbst; der Spawn-Pfad
+      (`system.rs:2069`) nimmt `claim_stripe`. Der Test `stripe` deckt beide Ausgänge ab.
 
-- [ ] **Nur auf x86 gemessen.** `hal::cache` hat eine aarch64-Fassung (CLIDR/CCSIDR inkl. FEAT_CCIDX),
-      die **nie gelaufen ist** — die ARM-Suite braucht `keys/trusted-test.ed25519`, und das ist
-      gitignored. Ungeprüfter Code auf dem zweiten Zweig ist genau die Fehlerform, die dieses Projekt
-      schon dreimal getroffen hat (leere Event-Queue, nie ausgeführter x86-Testpfad,
-      DMAR-Ausschlusspfad). Bis dahin gilt A1 als **x86-only**.
+- [x] **Nur auf x86 gemessen** — behoben am 2026-08-01. Der fehlende Schlüssel war nur die
+      *äußere* Hürde; B-2.1 erzeugt ihn inzwischen selbst. Die *innere* saß tiefer: `run_color` und
+      `run_stripe_alloc` hatten ihren **einzigen Aufrufer in `arch/x86_64/bringup.rs`**. Die ARM-Suite
+      hätte also auch mit Schlüssel nichts gemessen — sie rief nur `colors::report()` (Geometrie),
+      nie den Test. Genau die Fehlerform, die dieses Projekt dreimal bezahlt hat, ein viertes Mal.
+
+      Behandlung wie bei `dmatests.rs`: der Test liegt arch-neutral in `kernel/src/colors.rs` und
+      wird von **beiden** Hochlaufwegen gefahren (aarch64 aus `threads::spawn_demo`, ganz am Anfang —
+      `run_stripe_alloc` braucht den Ruhezustand). Die Druckstelle liegt **einmal** in
+      `colors::report_color`; die vorherige Verdopplung war die Ursache des `FAIL`-statt-`FAILURES`-
+      Fehlers. `color`/`stripe` stehen jetzt in der ARM-Abschlussbedingung und in `test-qemu.sh`.
+
+      Erste ARM-Messung der Geometrie: `cache : LLC L2 1024 KiB, 16-fach, 64 B/Zeile, 1024 Sets
+      -> 16 Seitenfarbe(n)` — 1024 × 64 / 4096 = 16, die aarch64-Dekodierung rechnet richtig.
 
 - [ ] **Way-Partitionierung (Intel CAT / ARM MPAM) nicht betrachtet.** Sie träfe dieselbe
       Eigenschaft über die Hardware statt über den Allokator, käme ohne kleinere Regionen und ohne
@@ -639,7 +648,8 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       Leck verschwände als Nebenwirkung. Ein Versuch, allein im Test früher zu lesen, wurde
       gemessen und half nicht (3 von 500 statt 4 von 400 — Rauschen).
 
-- [x] **Hänger ab `sched`** — Ursache gefunden und die Notbremse repariert (2026-08-01).
+- [~] **Hänger ab `sched`** — die Notbremse ist repariert und **greift nachweislich**; der Hänger
+      selbst ist NICHT weg (2026-08-01).
       Läufe 115 und 235 blieben **nach** `smp : 4 von 4 Kern(en) online` stehen, ohne
       `WATCHDOG`-Zeile. Der SMP-Hochlauf war also erfolgreich. Die Notbremse stand hinter
       `system::reap()`, und das nimmt `SCHEDS[core].lock()` und `MEM.lock()` — blockiert der
@@ -647,7 +657,15 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       ausgehungert, was sie überwachen soll**. Sie steht jetzt davor und zählt Ticks statt
       Umdrehungen (50 Mio Umdrehungen sind unter KVM Millisekunden und unter TCG Minuten —
       dieselbe Zahl meinte je nach Aufbau etwas anderes).
-      Gegenprobe: **500 Läufe, kein einziger riss das Zeitlimit** (vorher 2 von 400).
+      Gegenprobe, zwei Serien zu je 500 Läufen: **kein einziger riss das Zeitlimit** (vorher 2 von
+      400). Das heißt aber **nicht „keine Hänger mehr"** — in der zweiten Serie steht in Lauf 328
+
+          bringup : WATCHDOG — nicht alle Aussagen belegt (nach 61s, 14898083 Umdrehungen)
+
+      und derselbe Lauf zeigt `ipc : FAILURES`. Der Hänger trat also weiterhin auf (~1 von 500); die
+      Notbremse hat ihn in eine saubere, sichtbare Abweichung verwandelt statt in ein Zeitlimit.
+      Das ist der gewünschte Ausgang — und zugleich der erste Beleg, dass dieser Wächter überhaupt
+      auslösen kann. Vorher war „0 Zeitlimits" zweideutig: er konnte funktionieren oder stumm sein.
       **Offen bleibt:** blockiert `reap()` selbst, hilft auch das nicht — dafür bräuchte es
       eine Notbremse im Timer-Interrupt, außerhalb dieses Fadens. Steht so im Code.
 
@@ -704,6 +722,27 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       ext-30-Invarianten (Directory-Kohärenz, Migrations-Sperrordnung) haben Laufzeittests, aber
       keine Verus-/Kani-Beweise. Für die Migration wäre die Sperrordnung „aufsteigende Kern-ID"
       ein lohnendes Loom-Modell (zwei Kerne migrieren gegeneinander).
+
+- [ ] **D5 (neu, 2026-08-01): die aarch64-Suite ist dauerhaft rot — aus genau einem Grund.**
+      Gemessen: 66 von 66 gelisteten Tests PASS, Gesamturteil trotzdem `== FAILURES ==`. Die einzige
+      abweichende Zeile ist
+
+          root    : FAILURES (NoManifest) -- kein Root-Task, der Kernel hat nichts auszufuehren
+
+      A-2.1 (signiertes System-Manifest, Root-Task-Auswahl) wurde nur in `test-qemu-x86-load.sh`
+      eingebaut; `test-qemu.sh` ruft `mkarchive.py` **ohne** `--system-manifest`. Das Archiv selbst
+      ist in Ordnung (10 Module, `archive : ALL PASS`) — es fehlt das Autoritätsdokument.
+
+      **Warum das zählt:** ein dauerhaft rotes Urteil sagt genauso wenig wie ein dauerhaft grünes.
+      Solange `== FAILURES ==` konstant anliegt, fällt der 67. Test, der wirklich bricht, niemandem
+      mehr auf. Das ist derselbe Fehler wie `-no-shutdown` (rc war immer 124), nur mit umgekehrtem
+      Vorzeichen.
+
+      Zu tun: `test-qemu.sh` ein Manifest bauen lassen wie die x86-Load-Suite (`sign_manifest.py`
+      mit genau einem `root`-Eintrag; `init.elf` ist für aarch64 gebaut und vorhanden, es bräuchte
+      ein Zertifikat wie `certs/init-x86.cert`). **Achtung:** ein laufender Root-Task ist ein
+      zusätzlicher Thread — die 66 bestehenden Tests müssen danach nachgemessen werden, nicht
+      angenommen.
 
 - [ ] **D4** Verus laut `docs/verification.md` offen: `delete_leaf` auf der vereinten Struktur,
       Kinderlisten-Erreichbarkeit, danach Scheduler/IPC.

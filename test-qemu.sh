@@ -124,6 +124,13 @@ check "zerotest: ALL PASS" "Datenremanenz (ext-29): frische UND wiederverwendete
 check "captest : ALL PASS" "Capability-Selbsttest (copy/mint/move/delete/revoke)"
 check "dmaalign: ALL PASS" "DMA-Granularitaet (ext-35): unausgerichteter Anfang/angebrochene Laenge werden an der Cap-Praegung abgewiesen (Cache-Wartung wuerde sonst fremde Daten in der Randzeile verwerfen)"
 check "budget  : ALL PASS" "Cap-Budget je PD (ext-29): Installationen ueber CAP_BUDGET_PER_PD hinaus abgewiesen (keine Monopolisierung der geteilten Cap-Tabelle), Ersetzen bleibt erlaubt"
+# todo A1 / B-4.2. Bis 2026-08-01 fehlten diese beiden Zeilen hier nicht deshalb, weil der Test
+# uebersprungen wurde -- er LIEF auf aarch64 gar nicht: sein einziger Aufrufer stand in
+# `arch/x86_64/bringup.rs`. `hal::cache` hatte damit eine aarch64-Fassung, die uebersetzt, aber nie
+# an einer echten Zuteilung geprueft wurde. Der Test liegt jetzt arch-neutral in `kernel/src/colors.rs`
+# und wird von BEIDEN Hochlaufwegen gefahren -- dieselbe Behandlung wie `kernel/src/dmatests.rs`.
+check "color   : ALL PASS" "Cache-Partitionierung (todo A1): zwei isolierte PDs teilen sich keine Cache-Farbe -- Region, Kernel-Stack UND Seitentabellen; auf aarch64 aus CLIDR/CCSIDR statt CPUID"
+check "stripe  : ALL PASS" "Farbstreifen-Vergabe (B-4.2): erschoepfte Partitionierung scheitert SAUBER, statt einen Farbsatz still ein zweites Mal auszugeben"
 check "sched   : ALL PASS" "Scheduler (Preemption auf core 0 + alle Kerne ticken)"
 check "fp      : ALL PASS" "FP/SIMD-Kontext bleibt über Preemption erhalten"
 check "prio    : ALL PASS" "Bitmap-Prioritäten (höhere Priorität läuft zuerst)"

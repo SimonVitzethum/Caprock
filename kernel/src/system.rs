@@ -112,6 +112,22 @@ fn release_user_kstack(base: usize) {
     p.live = p.live.saturating_sub(1);
 }
 /// Den Kstack `base` dem Thread-Slot zuordnen (nach erfolgreichem spawn) -> Reclaim beim Thread-Ende.
+///
+/// **MUSS unter `SCHEDS[core]` aufgerufen werden, im selben kritischen Abschnitt wie
+/// `sched.spawn_user()`** — zusammen mit [`set_vspace_of`], und *nach* `fp_reset_slot` (das setzt
+/// `VSPACE_OF[slot] = 0`).
+///
+/// Grund: `spawn_user` macht den Thread lauffaehig. Steht die Buchfuehrung erst *hinter* dem
+/// kritischen Abschnitt, laeuft er zwischen Freigabe und Eintrag bereits — ein Timer-Tick genuegt,
+/// SMP braucht es dafuer nicht. Faultet er in diesem Fenster (der Isolationstest faultet
+/// ABSICHTLICH) und wird eingesammelt, sieht `reclaim_user_kstack` `base_of[slot] == 0` und gibt
+/// den Kernel-Stack **nie** frei; `set_vspace_of` schreibt danach in einen Slot, der bereits neu
+/// vergeben sein kann. Sichtbar wurde das als `color : FAILURES` mit `rueckgelesen=0` in 4 von 400
+/// Laeufen — das Leck selbst sucht bis heute kein Test.
+///
+/// Sperrordnung: `KSTACKS` ist ein Blatt (wie `FP_STATES`) und wird nirgends *ausserhalb* von
+/// `SCHEDS` gehalten, waehrend `SCHEDS` genommen wird — jeder Reclaim-Pfad gibt `SCHEDS` vorher
+/// frei (s. die Kommentare „KSTACKS allein"). Die Kante `SCHEDS -> KSTACKS` ist damit zyklusfrei.
 fn record_user_kstack(thread_slot: usize, base: usize) {
     KSTACKS.lock().base_of[thread_slot] = base as u64;
 }
@@ -1571,14 +1587,13 @@ pub fn spawn_user(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
         let r = sched.spawn_user(core, entry, arg, kbase, USER_KSTACK_SIZE, user_base, user_len, prio);
         if let Some(t) = r {
             fp_reset_slot(t.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
+            // Buchfuehrung NOCH UNTER SCHEDS -- s. Kommentar an `record_user_kstack`.
+            record_user_kstack(t.slot(), kbase); // Kstack dem Thread zuordnen
         }
         r
     }; // SCHEDS freigegeben
     match tid {
-        Some(t) => {
-            record_user_kstack(t.slot(), kbase); // Kstack dem Thread zuordnen
-            Some(t)
-        }
+        Some(t) => Some(t),
         None => {
             release_user_kstack(kbase);
             MEM.lock().free_region(PhysRegion::new(user_base as u64, user_len as u64));
@@ -1993,15 +2008,14 @@ pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u
         let r = sched.spawn_user(core, entry, arg, kbase, USER_KSTACK_SIZE, user_base, user_len, prio);
         if let Some(t) = r {
             fp_reset_slot(t.slot()); // FP + VSPACE_OF[slot]=0 (global) zurücksetzen
+            // Buchfuehrung NOCH UNTER SCHEDS -- s. Kommentar an `record_user_kstack`.
+            record_user_kstack(t.slot(), kbase); // Kstack dem Thread zuordnen (reclaim!)
+            set_vspace_of(t.slot(), packed); // ab jetzt isoliert (nach fp_reset_slot!)
         }
         r
     };
     match tid {
-        Some(t) => {
-            record_user_kstack(t.slot(), kbase); // Kstack dem Thread zuordnen (reclaim!)
-            set_vspace_of(t.slot(), packed); // ab jetzt isoliert
-            Some((t, rbase))
-        }
+        Some(t) => Some((t, rbase)),
         None => {
             vspace_teardown(asid);
             MEM.lock().free_region(PhysRegion::new(rbase, rlen));
@@ -2032,12 +2046,25 @@ pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u
 ///
 /// `None`, wenn die Maske leer ist, kein passend gefärbter Speicher frei ist, oder die
 /// VSpace/Thread-Erzeugung scheitert. Gibt `(ThreadId, region_base)`.
+/// Gibt zusaetzlich die **Kernelseite** `(kstack_base, l1, l2)` zurueck — und zwar so, wie sie beim
+/// Anlegen war, nicht wie sie beim Nachsehen noch ist.
+///
+/// Das ist kein Komfort, sondern der Kern einer Fehlerbehebung. Der Selbsttest las diese drei Werte
+/// bis 2026-08-01 ueber `testsupport::kstack_of`/`vspace_tables_of` **zurueck** — aus Tabellen, die
+/// an der Lebendigkeit des Threads haengen. Der Einsprungpunkt der Sonde faultet ABSICHTLICH; wird
+/// sie eingesammelt, bevor der Test liest, liefern alle drei 0. Gemessen: 5 von 500 Laeufen mit
+/// `rueckgelesen=0 (kstack=0 l1=0 l2=0)` bei sonst fehlerfreier Zuteilung, und im Protokoll steht
+/// die Ursache woertlich davor — `el0-trap: User-Thread 0x8 faultete ... -> beendet`.
+///
+/// Frueher zu lesen half nicht (gemessen: 4/400 -> 3/500 -> 5/500, alles Rauschen): das Fenster
+/// beginnt, sobald `spawn` zurueckkehrt. Deshalb werden die Werte **hier drin** genommen, direkt
+/// nach `create_vspace_masked` und **bevor es einen Thread gibt**, der sterben koennte.
 pub fn spawn_isolated_colored(
     entry: usize,
     arg: usize,
     prio: u8,
     mask: sel4lake_mem::ColorMask,
-) -> Option<(ThreadId, u64)> {
+) -> Option<(ThreadId, u64, (u64, u64, u64))> {
     // Ohne Streifennummer: der Aufrufer hat die Maske selbst gewaehlt (Selbsttest) und fuehrt
     // keine Belegung. Fuer PDs ist `spawn_isolated_colored_auto` der richtige Weg.
     spawn_isolated_colored_inner(entry, arg, prio, mask, None)
@@ -2054,7 +2081,8 @@ pub fn spawn_isolated_colored(
 pub fn spawn_isolated_colored_auto(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u64)> {
     let (i, mask) = crate::colors::claim_stripe()?;
     match spawn_isolated_colored_inner(entry, arg, prio, mask, Some(i)) {
-        Some(r) => Some(r),
+        // Die Kernelseite interessiert nur den Selbsttest (s. `spawn_isolated_colored`).
+        Some((t, rbase, _kernelseite)) => Some((t, rbase)),
         None => {
             // Scheitert das Anlegen NACH dem Belegen, muss der Streifen zurueck -- sonst ist er
             // fuer immer weg, und nach vier Fehlschlaegen gibt es keine gefaerbte PD mehr.
@@ -2070,7 +2098,7 @@ fn spawn_isolated_colored_inner(
     prio: u8,
     mask: sel4lake_mem::ColorMask,
     stripe: Option<u32>,
-) -> Option<(ThreadId, u64)> {
+) -> Option<(ThreadId, u64, (u64, u64, u64))> {
     let core = hal::cpu::core_id();
     let colors = crate::colors::count();
     let region_sz = crate::colors::region_bytes();
@@ -2096,6 +2124,15 @@ fn spawn_isolated_colored_inner(
         release_user_kstack(kbase);
         return None;
     };
+    // **Die Kernelseite JETZT festhalten** -- hier gibt es noch keinen Thread, der faulten und
+    // eingesammelt werden koennte, also ist der Wert stabil. Zurueckgelesen waere er es nicht:
+    // `kstack_of`/`vspace_tables_of` haengen an der Lebendigkeit des Threads. Siehe die Doku an
+    // `spawn_isolated_colored`. `l2` steht in `VSPACES`, gesetzt von `create_vspace_masked`;
+    // der Zugriff nimmt keinen SCHEDS-Lock -- Sperrordnung VSPACES < SCHEDS bleibt gewahrt.
+    let kernelseite = {
+        let e = VSPACES.lock()[asid as usize - 1];
+        (kbase as u64, l1, e.l2)
+    };
     // Ab hier gibt `vspace_teardown(asid)` den Streifen selbst zurueck -- deshalb sofort binden
     // und nicht erst am Ende: jeder Fehlerausgang unten ruft teardown.
     if let Some(i) = stripe {
@@ -2117,15 +2154,14 @@ fn spawn_isolated_colored_inner(
         let r = sched.spawn_user(core, entry, arg, kbase, USER_KSTACK_SIZE, user_base, user_len, prio);
         if let Some(t) = r {
             fp_reset_slot(t.slot());
+            // Buchfuehrung NOCH UNTER SCHEDS -- s. Kommentar an `record_user_kstack`.
+            record_user_kstack(t.slot(), kbase);
+            set_vspace_of(t.slot(), packed); // nach fp_reset_slot!
         }
         r
     };
     match tid {
-        Some(t) => {
-            record_user_kstack(t.slot(), kbase);
-            set_vspace_of(t.slot(), packed);
-            Some((t, rbase))
-        }
+        Some(t) => Some((t, rbase, kernelseite)),
         None => {
             vspace_teardown(asid);
             MEM.lock().free_region(PhysRegion::new(rbase, rlen));
@@ -2275,13 +2311,14 @@ pub fn spawn_isolated_native(code: *const u8, code_len: usize, prio: u8) -> Opti
         );
         if let Some(t) = r {
             fp_reset_slot(t.slot());
+            // Buchfuehrung NOCH UNTER SCHEDS -- s. Kommentar an `record_user_kstack`.
+            record_user_kstack(t.slot(), kbase); // Kstack dem Thread zuordnen (reclaim!)
+            set_vspace_of(t.slot(), packed); // nach fp_reset_slot!
         }
         r
     };
     match tid {
         Some(t) => {
-            record_user_kstack(t.slot(), kbase); // Kstack dem Thread zuordnen (reclaim!)
-            set_vspace_of(t.slot(), packed);
             // Der private Code-Frame ist KEINE Reap-Region (das ist der Stack) und haengt als
             // 2-MiB-Block (kein L3) am L2 -> vspace_teardown faende ihn nicht. Unter der ASID
             // registrieren, damit ein spaeteres destroy_isolated ihn via loaded_free freigibt
@@ -2513,6 +2550,11 @@ pub fn load_into_pd(
         );
         if let Some(t) = r {
             fp_reset_slot(t.slot());
+            // Buchfuehrung NOCH UNTER SCHEDS -- s. Kommentar an `record_user_kstack`. Hier waere
+            // sie auch danach sicher (`local_irq_save` oben), aber die Form bleibt ueberall gleich:
+            // eine Ausnahme, die nur unter einer Zusatzbedingung stimmt, ist eine kuenftige Falle.
+            record_user_kstack(t.slot(), kbase);
+            set_vspace_of(t.slot(), ((asid as u64) << 48) | l1); // isoliert (nach fp_reset_slot!)
         }
         r
     };
@@ -2522,8 +2564,6 @@ pub fn load_into_pd(
         // Segmente + Stack mitfreigeben (loaded_register lief noch nicht).
         return cleanup(asid, kbase, &seglist[..nrec], Some((stack_pa, LOADED_STACK_BYTES)));
     };
-    record_user_kstack(tid.slot(), kbase);
-    set_vspace_of(tid.slot(), ((asid as u64) << 48) | l1); // ab jetzt isoliert
     loaded_register(asid, &seglist[..nrec]); // Segment-Frames fuer den Teardown merken (L4)
     bind_pd(pd, tid);
     for &(slot, cap) in endow {

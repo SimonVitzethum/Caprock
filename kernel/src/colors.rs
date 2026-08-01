@@ -305,32 +305,29 @@ pub fn run_color(entry: usize, prio: u8) -> ColorTest {
 
     let a = crate::system::spawn_isolated_colored(entry, 0, prio, m0);
     let b = crate::system::spawn_isolated_colored(entry, 1, prio, m1);
-    if let (Some((ta, ba)), Some((tb, bb))) = (a, b) {
+    if let (Some((ta, ba, ksa)), Some((tb, bb, ksb))) = (a, b) {
         r.spawned = true;
 
-        // Die Kernelseite SOFORT nach dem Erzeugen ablesen, vor jeder anderen Messung.
+        // Die Kernelseite wird **nicht mehr zurueckgelesen**, sondern vom Spawn geliefert.
         //
-        // Grund: Der Einsprungpunkt dieser PDs faultet ABSICHTLICH (Isolationstest). Ein
-        // anderer Kern sammelt den gefaulteten Thread ein, und dabei werden Kernel-Stack und
-        // ASID frei. `kstack_of()` und `vspace_tables_of()` liefern dann 0 -- und zwar alle
-        // drei zugleich, weil sie an derselben Belegung haengen.
+        // Warum das noetig war: Der Einsprungpunkt dieser PDs faultet ABSICHTLICH. Wird der
+        // Thread eingesammelt, geben `kstack_of()`/`vspace_tables_of()` 0 zurueck -- alle drei
+        // zugleich, weil sie an derselben Belegung haengen. Genau das zeigten am 2026-08-01
+        // mehrere Laeufe: `rueckgelesen=0 (kstack=0 l1=0 l2=0)` bei sonst fehlerfreier Zuteilung,
+        // und im Protokoll steht die Ursache woertlich in der Zeile davor:
+        // `el0-trap: User-Thread 0x8 faultete ... -> beendet, Kernel laeuft weiter`.
         //
-        // Genau das war am 2026-08-01 in 4 von 400 Laeufen zu sehen: `rueckgelesen=0
-        // (kstack=0 l1=0 l2=0)` bei sonst fehlerfreier Zuteilung (`in_mask`, `kernelseite`,
-        // `disjunkt`, `bilanz` alle 1). Kein Farbfehler, sondern ein Wettlauf mit dem
-        // Einsammler -- dieselbe Ursache, die weiter unten schon fuer `balanced` beschrieben
-        // ist ("nebenher sammelt ein anderer Kern den Stack ... ein").
+        // Zwei Anlaeufe halfen NICHT, und beide sind lehrreich:
+        //  * frueher lesen (4/400 -> 3/500): das Fenster beginnt, sobald `spawn` zurueckkehrt --
+        //    frueher als "sofort danach" geht nicht.
+        //  * die Buchfuehrung im Kernel unter den SCHEDS-Lock ziehen (-> 5/500): das war ein
+        //    ECHTER Fehler (ein Kernel-Stack-Leck, s. `system::record_user_kstack`) und ist
+        //    behoben -- aber es war nicht DIESER.
         //
-        // Das Ablesen ist ein Atomzugriff auf eine Tabelle, keine teure Operation; es vor die
-        // uebrigen Messungen zu ziehen kostet nichts und schliesst das Fenster.
-        let kernelseite: [(u64, u64, u64); 2] = core::array::from_fn(|i| {
-            let t = if i == 0 { ta } else { tb };
-            let ks = crate::system::testsupport::kstack_of(t.slot());
-            let (l1, l2) = crate::system::testsupport::vspace_tables_of(
-                crate::system::testsupport::asid_of(t.slot()),
-            );
-            (ks, l1, l2)
-        });
+        // Ein Wert, der von der Lebendigkeit eines Threads abhaengt, der sterben darf, ist als
+        // Messgroesse untauglich, egal wie schnell man liest. Deshalb kommt er jetzt von dort,
+        // wo er stabil ist: aus dem Spawn selbst, vor der Existenz des Threads.
+        let kernelseite: [(u64, u64, u64); 2] = [ksa, ksb];
 
         r.in_mask = region_in_mask(ba, sz, r.colors, m0) && region_in_mask(bb, sz, r.colors, m1);
         r.disjoint = !regions_share_color((ba, sz), (bb, sz), r.colors);
@@ -382,6 +379,51 @@ pub fn run_color(entry: usize, prio: u8) -> ColorTest {
 ///
 /// Kein Testbericht, sondern eine Bring-up-Meldung (todo F3): sie sagt, was die *Hardware*
 /// hergibt, unabhängig davon, ob ein Test läuft.
+/// Das Ergebnis von [`run_color`] melden — **die einzige Druckstelle, von beiden Hochlaufwegen
+/// gerufen.**
+///
+/// Sie stand bis 2026-08-01 in `arch/x86_64/bringup.rs`, also auf genau einem Zweig. Das hatte zwei
+/// Folgen, und beide sind eingetreten: der Test lief auf aarch64 gar nicht (todo A1 „nur auf x86
+/// gemessen"), und die Textfassung driftete — `color` schrieb als **einzige** von 69 Stellen `FAIL`
+/// statt `FAILURES`, womit ein durchgefallener Test aus der Ergebnissignatur der Suite (B-1.2c)
+/// HERAUSfiel, statt aufzufallen. Zwei Fassungen desselben Urteils driften; eine kann es nicht.
+pub fn report_color(c: &ColorTest) {
+    if !c.usable {
+        println!(
+            "color   : SKIP -- {} Farbe(n) gemessen, unter 2 gibt es nichts zu trennen (QEMU meldet \
+             ohne echtes CPU-Modell keine Cache-Geometrie; mit -cpu Skylake-Client sind es 256)",
+            c.colors
+        );
+        return;
+    }
+    println!(
+        "color   : {} Farben, {} Partitionen, Region {} KiB · in_mask={} \
+         kernelseite={} (kstack={} l1={} l2={}) rueckgelesen={} (kstack={} l1={} l2={}) \
+         disjunkt={} \
+         uebergross_abgewiesen={} bilanz={}",
+        c.colors,
+        PARTITIONS,
+        region_bytes() / 1024,
+        c.in_mask as u8,
+        c.kernel_side_in_mask as u8,
+        c.ks_in_mask as u8,
+        c.l1_in_mask as u8,
+        c.l2_in_mask as u8,
+        c.kernel_side_readable as u8,
+        c.ks_read as u8,
+        c.l1_read as u8,
+        c.l2_read as u8,
+        c.disjoint as u8,
+        c.oversize_refused as u8,
+        c.balanced as u8
+    );
+    println!(
+        // `FAILURES`, nicht `FAIL` — s. den Kommentar am Kopf dieser Funktion.
+        "color   : {} (zwei isolierte PDs teilen sich keine Cache-Farbe)",
+        if c.ok { "ALL PASS" } else { "FAILURES" }
+    );
+}
+
 pub fn report() {
     match hal::cache::llc() {
         Some(g) => {

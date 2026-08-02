@@ -93,8 +93,11 @@ und Microkit-Runtime im Image") und zieht Konsequenzen nach sich, die über sie 
       `SELFTEST COMPLETE`. Einziger Unterschied: die Ladeadresse des Moduls, wie erwartet.
       Die Sorge wegen `Flags = 0` im Multiboot-Header war unbegründet — GRUB liefert
       Speicherplan und Module auch ungefragt. **Offen bleibt die zweite Hälfte:** das
-      Nachladen zur Laufzeit, und dafür fehlt jeder Treiber — `crates/` enthält keinen
-      einzigen. Erst mit A-5.2 (virtio auf x86) gibt es etwas, von dem man nachladen kann.)* Einen Plattentreiber kann man nicht von
+      Nachladen zur Laufzeit. Der Plattentreiber dafür ist da und läuft seit A-5.1 (2026-08-01)
+      als **geladenes Userland-Programm** — es bedient Leseanfragen über seinen Kanal, inhaltlich
+      geprüft. Was noch fehlt, ist alles darüber: eine Partitionstabelle und ein Dateisystem.
+      Ein Sektor ist noch kein Archiv.)*
+      Einen Plattentreiber kann man nicht von
       der Platte laden. Der einzige ehrliche Ausweg: **der Bootloader liefert die Startmodule**
       (Multiboot-Module bei GRUB) — die liegen damit außerhalb des Kernel-Images, kommen aber
       trotzdem zum Boot an. Das Manifest nennt sie; der Kernel prüft, dass genau das ankam, was
@@ -146,24 +149,67 @@ und Microkit-Runtime im Image") und zieht Konsequenzen nach sich, die über sie 
 
 Reihenfolge ist hier keine Geschmacksfrage — jede Stufe ist Vorbedingung der nächsten.
 
-- [ ] **Z4a. Anhalten mit definiertem Zustand.** Ein Thread muss an einer *benennbaren* Grenze
-      stehenbleiben können, nicht irgendwo. Mitten in einem Syscall ist sein Zustand halb im
-      Kernel; mitten in einer IPC-Transaktion hängt ein Partner. Nötig: ein Haltepunkt-Begriff
-      (nur an Syscall-Grenzen, nie im Kernel), und ein `SYS_FREEZE`, das *wartet*, bis der Thread
-      dort ist, statt ihn zu unterbrechen. Ohne das ist alles Weitere Zufall.
-- [ ] **Z4b. Serialisierbarer Zustand.** Registersatz + FP/SIMD ist der leichte Teil (der
-      Trap-Frame steht bereits). Der schwere Teil sind die **Caps**: eine Cap ist heute ein Index
-      in eine globale Tabelle plus CDT-Kante. Über Maschinengrenzen bedeutet ein Index nichts.
-      Nötig ist eine externe, maschinenunabhängige Darstellung (Objekttyp, Rechte, Badge,
-      Herkunft) — und eine Regel, was mit Caps auf **maschinenlokale** Dinge passiert (MMIO,
-      DMA-Regionen, Endpoints zu nicht mitwandernden PDs). Meine Erwartung: die müssen den
-      Transfer **verweigern**, sonst wandert ein Thread mit Autorität, die auf der Zielmaschine
-      etwas anderes bezeichnet. Das ist die gefährlichste Stelle des ganzen Vorhabens.
+- [~] **Z4a: der Haltepunkt steht** (2026-08-02, `system::freeze_thread`, Prüfzeile `freeze`).
+      Details in [done.md](done.md#z4a--z4b-der-haltepunkt-und-was-auf-keinen-fall-mitwandert).
+      „Benennbar" heisst zwei prüfbare Dinge: **nicht auf einem Kern** (über `current_id` je Kern
+      gefragt, nicht geglaubt) und **keine offene IPC-Beziehung**. Die drei Ausgänge sind
+      unterscheidbar, und der Unterschied trägt: `StillRunning` ist vorübergehend, `Busy` ist eine
+      **Absage** — wer darauf wartet, wartet ewig. Geprüft wird die **Wirkung**: der Rundenzähler
+      muss sich vorher bewegen, dann stehen, dann wieder laufen; zwei Mutationen machen die Suite
+      rot.
+
+      **Offen bleibt der Syscall.** `freeze_thread` ist eine Kernel-Funktion, kein `SYS_FREEZE`,
+      und sie **wartet nicht** — sie nimmt die Scheduler-Sperre jedes Kerns, und darin auf einen
+      anderen Kern zu warten ist die Bauanleitung für einen Deadlock. Der Aufruf ist idempotent;
+      das Warten gehört dem Aufrufer. Ein blockierender Syscall darüber ist eine ABI-Frage und
+      eine eigene Stufe.
+- [~] **Z4b: die Verweigerungsregel steht, der Serialisierer nicht** (2026-08-02,
+      `crates/sel4lake-cap/src/checkpoint.rs`, 7 Host-Tests). Der Registersatz war ohnehin der
+      leichte Teil; gebaut ist der schwere: **was auf der Zielmaschine nicht dasselbe bezeichnen
+      kann, wandert nicht mit — es wird verweigert, nicht ersetzt.** Verweigert werden `Mmio`,
+      `Irq`, `Dma`, `Reply`, `Loader` und jede Beziehungs-Cap, deren Partner nicht im Umfang ist;
+      die Gründe sind **einzeln** und kein Sammel-`false`, weil nur manche durch einen grösseren
+      Umfang behebbar sind. Fail-closed: ein neuer Objekttyp wandert nicht mit, statt
+      durchzurutschen.
+
+      Drei Entscheidungen stecken in den Tests: Speicher wandert als **Inhalt** (zwei Regionen
+      gleicher Länge an verschiedenen Physadressen sind extern gleich), Beziehungen über den
+      **Platz im Checkpoint** statt über eine ID, und ein Budget trägt eine **Vorbedingung**
+      (`SameTickSemantics`, Z4f) statt sie zu verschweigen.
+
+      ~~**Offen:** ein Serialisierer und ein Wiederhersteller.~~ Beide stehen seit 2026-08-03,
+      s. Stufe 2 direkt darunter.
+- [~] **Z4 Stufe 2: ein Thread über die BOOTGRENZE** (2026-08-03, Prüfzeile `bootckpt`).
+      Details in [done.md](done.md#z4-stufe-2-ein-thread-ueber-die-bootgrenze). Derselbe Kernel
+      speichert und stellt wieder her und **entscheidet selbst welches** — er liest den Sektor
+      (`CKPT_SECTOR = 32710`, ausserhalb beider Partitionen). Transport ist der vorhandene
+      Blockdienst; der Kern ist Client, `programs/hardware/virtio-blk` blieb unverändert. Das
+      Format liegt in `crates/sel4lake-cap/src/checkpoint.rs` (feste Breiten, LE, CRC-32,
+      host-getestet), und `Image::build` ruft `classify_all`: **eine nicht übertragbare Cap
+      verhindert den Checkpoint vor dem Schreiben.**
+
+      **Der Befund, der den Entwurf umgebaut hat, gehört in die Merkliste:** der Fortschrittszähler
+      ist unter KVM **reproduzierbar** (gemessen 133…155 an derselben Stelle des Hochlaufs). Eine
+      Mutation, die den gefundenen Wert liest und meldet, ohne ihn zu setzen, traf den gespeicherten
+      Wert exakt — und die Suite blieb grün. Erst eine **wachsende Kette** (jeder Lauf arbeitet
+      +100 Runden weiter und speichert mit Epoche + 1) trennt „geerbt" von „selbst gezählt"; die
+      Positivkontrolle dazu (`Zaehler-vorher != Fortschritt`) steht in der Suite.
+
+      **Offen bleibt hier:** kein Trap-Frame und keine Register — das wäre ohne
+      [Z4c](#z4-checkpointrestore-eines-threads) wertlos oder schlimmer, weil `RSP` in einen Stack
+      zeigt, dessen Inhalt nach dem Neustart frischer Speicher ist. Und der Checkpoint ist
+      **nicht authentifiziert** (Z4e): die Prüfsumme sagt „strukturell heil", nicht „von wem".
 - [ ] **Z4c. Speicher mitnehmen.** Die private Region der PD ist der Zustand. Bei 64 KiB
       ([A1](#a1-cache--timing-seitenkanäle-zwischen-pds)) ist das billig, bei 2 MiB weniger.
       Offen: Dirty-Tracking, damit nicht alles kopiert werden muss, und die Frage, ob die
       **Farbe** auf der Zielmaschine erhalten bleiben muss (nein — Farbe ist maschinenlokal; die
       Zielmaschine färbt neu; das ist ein Argument dafür, Farbe nie in die ABI zu heben).
+
+      **Seit Stufe 2 ist das die BLOCKIERENDE Stufe, nicht eine nebenläufige.** Der Checkpoint
+      trägt eine Speicher-Cap als `Region { len }` — als **Länge**, nicht als Inhalt; drüben ist
+      sie null. Und ein Trap-Frame lässt sich erst dann sinnvoll mitnehmen, wenn der Stack
+      mitkommt: `RSP` ohne Stackinhalt ist ein Zeiger ins Leere, und der Fehler tritt später und
+      woanders auf.
 - [ ] **Z4d. IPC-Beziehungen.** Ein wandernder Thread mit offenem `CALL` hat einen wartenden
       Server zurückgelassen. Entweder Migration nur ohne offene Transaktionen (einfach, ehrlich,
       wahrscheinlich richtig für Stufe 1), oder Endpoint-Proxys über das Netz (ein eigenes
@@ -173,11 +219,21 @@ Reihenfolge ist hier keine Geschmacksfrage — jede Stufe ist Vorbedingung der n
       [Z7](#z7-attestierung-und-messbarer-boot): die Zielmaschine muss nachweisen können, dass sie
       dieselbe Kernelversion mit denselben Zusicherungen fährt — sonst wandert der Zustand in eine
       schwächere Umgebung, und der Tenant merkt es nicht.
-- [ ] **Z4f. Identische Server als Vorbedingung benennen.** „gleicher Server" muss geprüft
+- [~] **Z4f. Identische Server als Vorbedingung benennen.** „gleicher Server" muss geprüft
       werden, nicht angenommen: gleiche Architektur, gleiche Kernelversion, gleiche
       Cache-/NUMA-Klasse. Ein Vergleich, der nur die Architektur prüft, lässt einen Thread von
       einer Maschine mit `invtsc` auf eine ohne wandern — und die Abrechnung aus [Z2](#z-zielarchitektur-stand-2026-07-29--woran-alles-andere-zu-messen-ist)
       wird still falsch.
+
+      **Ein Stück davon steht (2026-08-03):** der Checkpoint trägt `kernel_code_hash` und wird
+      abgewiesen, wenn er zu einem anderen Kernel-Image gehört (Lesecode 7, Negativfall in
+      `test-qemu-x86-load.sh`). Das ist die **Kernelversion**, und nur sie.
+
+      **Nicht geprüft — und das ist genau die Lücke, die dieser Punkt meint:** die MASCHINE. Zwei
+      Rechner mit demselben Image, aber verschiedener Cache-/NUMA-Klasse oder einer ohne `invtsc`,
+      sind heute nicht unterscheidbar. Die Vorbedingung `SameTickSemantics` steht **im** Checkpoint
+      (`precondition_bits`), aber niemand wertet sie aus — sie zu tragen und nicht zu prüfen ist
+      der halbe Weg, und der halbe Weg sieht von aussen aus wie der ganze.
 
 ### Z5. Tickless für Rechenkerne
 **Klasse:** Scheduler/Timer · **Aufwand:** mittel
@@ -232,19 +288,42 @@ Reihenfolge ist hier keine Geschmacksfrage — jede Stufe ist Vorbedingung der n
 ### Z9. Fehlerdomäne
 **Klasse:** Betrieb · **Aufwand:** Entwurfsentscheidung
 
-- [ ] Ein Kernel-Panic reißt heute den ganzen Knoten mit; eine VM tut das nicht. Für „VMs
-      ersetzen" braucht es eine ausdrückliche Antwort — entweder „der Knoten ist die
-      Fehlerdomäne, plant entsprechend" (legitim, muss aber dokumentiert und den Tenants gesagt
-      sein), oder Kernel-Fehler werden auf die verursachende PD eingegrenzt. Das Zweite ist
-      Forschungsklasse; das Erste ist eine Zeile in der Dokumentation, die heute fehlt.
+- [~] **Die Festlegung steht (B-6.2, 2026-08-02) — und die Prämisse dieses Eintrags war falsch.**
+      „Ein Kernel-Panic reißt den Knoten mit" stimmt **nicht**, und das ist die schlechtere
+      Nachricht: der Panic-Pfad hält den Kern **ohne IRQ-Maskierung**, der nächste Timer-Tick
+      holt ihn zurück in den Scheduler. Gemessen lief der Knoten **61 s weiter** und meldete
+      `ipc`, `ring3`, `iommu`, `dmatok` als ALL PASS — mit einer nachweislich verletzten
+      Invariante. Vier verschiedene Ausgänge je nachdem **wo** der Panic auftritt, darunter ein
+      stiller Totalausfall (unter der MEM-Sperre) und ein Zustand, der von außen nicht von einem
+      Deadlock zu unterscheiden ist.
+
+      Festlegung in `docs/fehlerdomaene.md` (betreiberseitig, mit Messtabelle und VM-Vergleich),
+      normativ als `docs/invariants.md` §14.
+
+      **Offen ist die Entscheidung, nicht die Beschreibung:** die Festlegung ist heute
+      *behauptet*, nicht *hergestellt*. Drei Maßnahmen von zusammen etwa einem halben Tag machen
+      sie wahr — IRQs im Panic-Pfad maskieren, ein Rekursionswächter im Panic-Handler,
+      `panic → system_off` (beide Abschaltwege existieren und werden aus `panic.rs` **nie**
+      gerufen). Das ist ein Abwägen zwischen Verfügbarkeit und Ehrlichkeit und gehört Simon.
 
 ### Z10. I/O überhaupt
 **Klasse:** Grundlage · **Aufwand:** groß
 
-- [ ] Kein Netzstack, kein Blockgerät, und `virtio` ist bis heute **aarch64-only**. Eine Cloud
-      ohne Netz und Speicher ist keine. Hängt an [F2](#f-debug-testcode-aus-dem-release-build-nehmen)
-      (Root-Task) und an [C6](#c6-x86-64-port--rest) (Boot-Archiv): ohne einen Weg, Userland zu
-      starten, gibt es auch keinen Treiber, der laufen könnte.
+- [ ] Kein Netzstack, kein Dateisystem. Eine Cloud ohne Netz und Speicher ist keine.
+      *(Zwei Schritte erledigt, 2026-08-01: **A-5.2** brachte Treiberlogik für Blockgerät und
+      Netzkarte, kernfrei in `crates/sel4lake-virtio`; **A-5.1** brachte die erste Treiber-PD —
+      `programs/hardware/virtio-blk` liest einen Sektor als geladenes Userland-Programm, mit
+      eigener Gerätezuteilung aus dem Manifest.)*
+      Seit 2026-08-02 ist der Treiber ein **Dienst**: er bedient Anfragen über seinen Kanal und
+      ist im Betrieb austauschbar (A-5.1 abgeschlossen).
+      Seit 2026-08-02 steht darüber ein **Speicherstapel, vollständig außerhalb des Kerns**:
+      Blockdienst (A-6.1), GPT (A-6.2) und ein lesendes **FAT16-Dateisystem als eigene PD**
+      (A-6.3). Eine Datei wird über GPT → FAT16 → Blockdienst → Treiber gelesen.
+      Seit A-6.4 **schreibt** sie auch (zweiter Cluster, beide FAT-Kopien, Flush, jedes Byte
+      zurückgelesen; unabhängig am Abbild nachgeprüft).
+      **Was weiterhin fehlt:** Dateien anlegen/löschen, Unterverzeichnisse, lange Namen — und ein
+      **Netzstack**. Jeder Treiber **pollt**: eine IRQ-Cap ist nicht erteilbar, solange es keine
+      IRTE-Vergabe gibt (B-3).
 - [ ] Für durchgereichte Geräte ist **Interrupt Remapping** ([E](#e-dma-härtung--rest), Schritt 4)
       keine Kür: ohne IR kann ein Gerät beliebige Interrupt-Nachrichten erzeugen. Das ist der
       Standardausbruch aus einer Geräte-Zuteilung und muss vor dem ersten Tenant-Gerät stehen.
@@ -256,9 +335,12 @@ Reihenfolge ist hier keine Geschmacksfrage — jede Stufe ist Vorbedingung der n
 ### A1. Cache-/Timing-Seitenkanäle zwischen PDs
 **Klasse:** Seitenkanal · **Aufwand:** Architekturänderung, kein Patch
 
-`[~]` **Stufe 1 steht und ist auf x86 gemessen** (s. [done.md](done.md)): Cache-Geometrie wird aus
-der HW gelesen, der Allokator vergibt farbrein, und zwei so erzeugte PDs teilen sich nachweislich
-keine Cache-Farbe — Region, Kernel-Stack und Seitentabellen. Offen bleibt das Folgende.
+`[~]` **Stufe 1 steht und ist auf BEIDEN Architekturen gemessen** (s. [done.md](done.md)):
+Cache-Geometrie wird aus der HW gelesen, der Allokator vergibt farbrein, und zwei so erzeugte PDs
+teilen sich nachweislich keine Cache-Farbe — Region, Kernel-Stack und Seitentabellen. x86 seit
+2026-08-01 (seit 2026-08-02 mit der ECHTEN Geometrie der Maschine, 512 Farben — vorher meldete
+QEMU 256 erfundene), aarch64 seit 2026-08-02 (16 Farben — die Aufteilung, an der die
+`MASK_BITS`-Verwechslung hing). Offen bleibt das Folgende.
 
 - [ ] **Der reguläre Weg ist weiterhin ungefärbt.** `spawn_isolated` (2-MiB-Region) kann es
       strukturell nicht sein: 2 MiB sind 512 Seiten, also 512 aufeinanderfolgende Farben — bei den
@@ -295,42 +377,62 @@ keine Cache-Farbe — Region, Kernel-Stack und Seitentabellen. Offen bleibt das 
 
 
       **Der Umzug hat sofort zwei echte Fehler gefunden — beide nur auf aarch64 sichtbar, beide
-      NOCH OFFEN:**
+      inzwischen BEHOBEN:**
 
       1. `region_bytes()` rechnete mit `sel4lake_mem::MASK_BITS` (64) statt mit der tatsächlichen
          Farbanzahl. Auf x86 (256 Farben) zufällig richtig; auf aarch64 (16 Farben) umfasst ein
          Streifen nur 4 Farben, eine 64-KiB-Region aber 16 aufeinanderfolgende Seiten — also jede
          Farbe, mehrfach. **Behoben** (Laufzeitrechnung `min(count(), MASK_BITS) / PARTITIONS`).
-      2. **`sel4lake_mem::stripe(i, PARTITIONS)` teilt ebenfalls `MASK_BITS` auf, nicht `count()`.**
-         Bei 16 Farben umfasst Streifen 0 damit *alle* Farben und die Streifen 1–3 keine — es gibt
-         gar keine Partitionierung, und `uebergross_abgewiesen` schlägt folgerichtig fehl. Auf x86
-         fällt es nicht auf, weil 256 ≥ 64 ist. **Offen** — die Änderung gehört in `sel4lake-mem`
-         mit Host-Tests, nicht schnell in den Kernel.
+      2. `sel4lake_mem::stripe` teilte ebenfalls `MASK_BITS` auf statt `count()`. Bei 16 Farben
+         umfasste Streifen 0 damit *alle* Farben und die Streifen 1–3 keine — und weil leere Mengen
+         sich nicht schneiden, meldete der Selbsttest trotzdem „disjunkt". **Behoben am
+         2026-08-02**: `stripe(i, n, colors)` nimmt die Farbanzahl als Parameter, mit Host-Tests
+         gegen 16 **und** 256 Farben (ein Test nur gegen 256 wäre grün gewesen und hätte nichts
+         belegt).
 
-      **Drittens, und deshalb ist der Test auf aarch64 derzeit AUSGEHÄNGT:** an seinem Platz ganz
-      am Anfang von `threads::spawn_demo` belegt und gibt er Speicher frei, *bevor* die
-      baseline-empfindlichen Tests ihre Ausgangswerte nehmen. Danach fiel mal `captest`, mal
-      `sched` durch — nicht reproduzierbar und nicht ihre Schuld. Ein Test, der andere Tests kippen
-      lässt, macht das **gesamte** Ergebnis unbrauchbar; er bleibt draußen, bis (2) behoben ist und
-      ein Platz gefunden ist, der keine Baseline stört. Der arch-neutrale Code und der x86-Weg
-      bleiben unverändert.
+      **Drittens — der Test war auf aarch64 AUSGEHÄNGT, und das ist seit 2026-08-02 behoben.**
+      An seinem alten Platz ganz am Anfang von `threads::spawn_demo` belegte und gab er Speicher
+      frei, *bevor* die baseline-empfindlichen Tests ihre Ausgangswerte nehmen; danach fiel mal
+      `captest`, mal `sched` durch. Der Ausweg war damals, ihn auszuhängen — und dabei
+      `COLOR_OK`/`STRIPE_ALLOC_OK`/`PPROBE_OK` **hart auf `true`** zu setzen. Das war die
+      schlechtere Hälfte: drei dauerhaft wahre Konjunkte in `all_done()`, keine Berichtszeile,
+      kein Check in `test-qemu.sh` — die Abwesenheit war damit nicht bloß unbelegt, sie war
+      **unsichtbar**.
+
+      Die Lösung ist der **Platz**, nicht das Weglassen: die drei Tests hängen jetzt als letztes
+      Glied der Testkette in `demo_report_then_idle` (`run_color_suite`), hinter `cross`, `strand`
+      und `loadstop`. Danach nimmt keine Prüfung mehr eine Baseline. Gemessen (8 Läufe,
+      `test-qemu.sh`): `color : ALL PASS`, `stripe : ALL PASS`, `pprobe : SKIP` (unter TCG kann die
+      Positivkontrolle nicht tragen — kein echter Cache), `captest` und `sched` in allen acht
+      Läufen unverändert grün, identische Ergebnissignatur. Damit ist A1 **zum ersten Mal auf
+      aarch64 belegt** — und zwar auf der 16-Farben-Aufteilung, also genau dem Fall, den (2) falsch
+      machte. Details in [done.md](done.md).
 - [ ] **Way-Partitionierung (Intel CAT / ARM MPAM) nicht betrachtet.** Sie träfe dieselbe
       Eigenschaft über die Hardware statt über den Allokator, käme ohne kleinere Regionen und ohne
       seitenweises Mapping aus — und ließe sich mit der Färbung kombinieren. QEMU emuliert CAT
       nicht, also wäre sie hier **nicht prüfbar**; das ist ein Grund, sie zurückzustellen, kein
       Grund, sie zu vergessen.
-
 - [ ] **A1 trennt den LLC und sonst nichts.** Kernlokale Strukturen (L1, L2, TLB, Store-Buffer,
       Branch-Predictor) bleiben geteilt, sobald zwei Tenants auf Geschwister-Hyperthreads liegen —
       s. [Z6](#z6-smt--die-lücke-die-cache-coloring-nicht-schliesst). Und die Farbvergabe muss mit
       der NUMA-Zuteilung **gemeinsam** entschieden werden, nicht nacheinander, s.
       [Z8](#z8-numa).
 
-- [ ] **Kein Nachweis der *Wirkung*, nur der Zuteilung.** Der Test zeigt, dass die Farbsätze
-      disjunkt sind. Er zeigt **nicht**, dass daraus eine messbar geringere gegenseitige Verdrängung
-      folgt. Ein Prime+Probe-Mikrobenchmark (eine PD misst ihre eigene Zugriffszeit, während die
-      andere den Cache durchläuft, gefärbt vs. ungefärbt) wäre der eigentliche Beleg. Unter TCG ist
-      er sinnlos — der Emulator hat keinen echten Cache; also erst auf Blech oder unter KVM.
+- [~] **Der Wirkungsnachweis ist gebaut, aber nicht erbracht** (B-4.5, s.
+      [todo-B-verlaesslichkeit.md](todo-B-verlaesslichkeit.md)). Der Prime+Probe läuft
+      arch-neutral bei **jedem** Start und wird von beiden Suiten gelesen; Aufbau,
+      Positivkontrolle, Farbwahl und Bilanz sind auch dort geprüft, wo kein Urteil möglich ist —
+      ein Prüfpfad, der zum ersten Mal am Zieltag läuft, ist am Zieltag kaputt.
+
+      **Die alte Annahme „erst auf Blech ODER unter KVM" war falsch:** unter einem Hypervisor ist
+      die Frage nicht schwer zu messen, sondern **prinzipiell nicht entscheidbar** — ein Gast färbt
+      gastphysische Adressen, und die zweite Übersetzungsstufe schreibt die Farbbits um. Gemessen
+      (Gast): `ungestoert=41 disjunkt=234 gleichfarbig=210` — die Positivkontrolle trägt, der
+      disjunkte Farbsatz schützt **nicht**.
+
+      **Offen:** ein Lauf auf echter Hardware — und die Maschine muss eine Bedingung erfüllen:
+      `Größe der nicht partitionierten Cache-Ebene < LLC / PARTITIONS`. Sonst gibt es **keine
+      gültige Opfergröße**, und das ist eine Eigenschaft der Maschine, nicht des Tests.
 
 ### A2. Spectre-v2 auf HW ohne FEAT_CSV2
 **Klasse:** Seitenkanal · **Aufwand:** klein, aber HW-abhängig
@@ -767,35 +869,74 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       *Modell* mitführt (statt sie wegzu-`cfg`-en) und Reentranz aus dem IRQ-Pfad als
       Eigenschaft formuliert. Das wäre ein echter Beweis statt eines Wächters — aber er fände
       einen `cfg`-Auswahlfehler weiterhin nicht, denn er liefe auf demselben Host-Ziel.
-- [ ] **D2** Loom modelliert eine **Kopie** des Lock-Algorithmus; die IRQ-Maskierung ist prinzipiell
-      nicht modellierbar (kein DAIF in Loom). Deadlockfreiheit gegenüber Preemption bleibt Argument,
-      nicht Beweis.
+- [~] **D2 halb erledigt (2026-08-02, B-7.2).** Die **Kopie** ist weg: Loom prüft den echten
+      `sel4lake-sync`-Quelltext (das Skript kopiert ihn unverändert, die Beweise stehen in
+      derselben Datei), die alten Nachbauten sind gelöscht. Der Fund dabei: mit
+      `core::cell::UnsafeCell` prüft Loom nur das **Atomic-Protokoll** — eine abgeschwächte
+      Ordnung im Ticket-Release lief durch ALLE Beweise; erst mit `loom::cell::UnsafeCell` fallen
+      2 von 10.
+
+      **Offen bleibt die IRQ-Maskierung**, und sie ist prinzipiell nicht modellierbar (kein DAIF
+      in Loom). Deadlockfreiheit gegenüber Preemption bleibt damit Argument, nicht Beweis.
 
 - [ ] **D3** Die ext-29-Invarianten (Grant-Nicht-Leck, Zeroing, Cap-Budget) und die
       ext-30-Invarianten (Directory-Kohärenz, Migrations-Sperrordnung) haben Laufzeittests, aber
       keine Verus-/Kani-Beweise. Für die Migration wäre die Sperrordnung „aufsteigende Kern-ID"
       ein lohnendes Loom-Modell (zwei Kerne migrieren gegeneinander).
 
-- [ ] **D5 (neu, 2026-08-01): die aarch64-Suite ist dauerhaft rot — aus genau einem Grund.**
-      Gemessen: 66 von 66 gelisteten Tests PASS, Gesamturteil trotzdem `== FAILURES ==`. Die einzige
-      abweichende Zeile ist
+- [x] **D5 erledigt (2026-08-02): der aarch64-Kernel hat einen Root-Task — und der Weg dorthin fand
+      zwei Fehler, die nichts mit dem Manifest zu tun hatten.**
+      Details in [done.md](done.md#d5-eine-rote-zeile-die-niemand-ansah).
 
-          root    : FAILURES (NoManifest) -- kein Root-Task, der Kernel hat nichts auszufuehren
+      Der Anlass war die Zeile `root : FAILURES (NoManifest)`, die die Suite **gar nicht prüfte**.
+      Behoben: `test-qemu.sh` baut ein signiertes Manifest mit genau einem `root`-Eintrag, `init`
+      bekommt ein aarch64-Zertifikat (`certs/init-arm.cert`), `manifest_report()` wird auf ARM
+      gerufen wie auf x86, und die Suite prüft `root`, `manifest` und die Modulzahl.
 
-      A-2.1 (signiertes System-Manifest, Root-Task-Auswahl) wurde nur in `test-qemu-x86-load.sh`
-      eingebaut; `test-qemu.sh` ruft `mkarchive.py` **ohne** `--system-manifest`. Das Archiv selbst
-      ist in Ordnung (10 Module, `archive : ALL PASS`) — es fehlt das Autoritätsdokument.
+      **Was dabei herauskam, war wertvoller als der Anlass:**
 
-      **Warum das zählt:** ein dauerhaft rotes Urteil sagt genauso wenig wie ein dauerhaft grünes.
-      Solange `== FAILURES ==` konstant anliegt, fällt der 67. Test, der wirklich bricht, niemandem
-      mehr auf. Das ist derselbe Fehler wie `-no-shutdown` (rc war immer 124), nur mit umgekehrtem
-      Vorzeichen.
+      1. **Die Startmenge stand im falschen Dokument.** `boot_arg` gab dem Root-Task
+         `archive.count()` — die Größe des *Behälters*, nicht der *Startmenge*. Auf x86 stimmte
+         beides überein, weil dasselbe Skript Archiv und Manifest erzeugte. Auf aarch64 liegen zehn
+         Testdienste im Archiv, die nicht zur Startmenge gehören; `init` hätte sie als Startmenge
+         geladen — darunter `probe`, das gar kein ELF ist. Jetzt kommt die Zahl aus dem Manifest,
+         und die dadurch nötige Zusage (Manifest-Einträge `0..n` liegen auf Archivpositionen
+         `0..n`) ist eine **geprüfte Regel**: `RootTaskError::StartSetNotPrefix`, fail-closed.
+         Negativkontrolle gefahren.
+      2. **`loadstop` maß eine globale Baseline mit einer lokalen Sperre.** `local_irq_disable()`
+         stellt einen Kern still; sieben andere und der Einsammler laufen weiter. Gemessen wurde
+         `free 4204597248 -> 4204613632` — **16 KiB mehr** hinterher, ein fremder `free`, kein Leck.
+         Die Prüfung stellt jetzt erst Ruhe fest und misst dann; ein Lauf, der nie ruhig wird,
+         fällt **durch** („nicht messbar" ist kein bestandener Test).
 
-      Zu tun: `test-qemu.sh` ein Manifest bauen lassen wie die x86-Load-Suite (`sign_manifest.py`
-      mit genau einem `root`-Eintrag; `init.elf` ist für aarch64 gebaut und vorhanden, es bräuchte
-      ein Zertifikat wie `certs/init-x86.cert`). **Achtung:** ein laufender Root-Task ist ein
-      zusätzlicher Thread — die 66 bestehenden Tests müssen danach nachgemessen werden, nicht
-      angenommen.
+      Nachgemessen wie gefordert: `RUNS=6` → 6/6 mit identischer Signatur, `== ALL PASS ==`.
+
+- [~] **D6 (2026-08-02): die aarch64-Suite hatte keine Wiederholungsmessung — jetzt hat sie eine.**
+
+      **Was der Befund war:** über rund 13 Läufe fielen **vier verschiedene** Prüfungen aus
+      (`xfer`, `dtb`, `prio`, `loadstop`), scheinbar zufällig. Das sah nach Kernel-Nichtdeterminismus
+      aus und war zur Hauptsache **die Testmechanik**:
+
+      1. Die Ausgabe hing an einer **Pipe**, beendet wurde mit `--signal=KILL`. Ein per SIGKILL
+         erschlagenes QEMU flusht seinen stdout-Puffer nicht.
+      2. Nach dem Umbau auf eine Datei teilten sich alle Läufe **eine** Datei. Gelegentlich fehlten
+         dann **frühe** Bootzeilen in der ausgewerteten Ausgabe, während alle Ergebniszeilen da
+         waren — die Signatur blieb identisch, und trotzdem fiel je nach Lauf eine andere Prüfung
+         durch. Jeder Lauf bekommt jetzt seine eigene Datei.
+
+      **Gemessen nach dem Umbau:** `RUNS=16` → 16 von 16 mit identischer Signatur, `ALL PASS`.
+
+      **Was NICHT erledigt ist:** in einer Messung davor (gemeinsame Datei) standen 14 von 16, und
+      die beiden Abweichungen waren echte Watchdog-Läufe — die Zeile kommt vom Kernel, nicht von
+      der Mechanik. 16 saubere Läufe schließen eine Rate von 12,5 % nicht aus (P ≈ 12 %). Der
+      Hänger ist damit **offen**, aber erstmals messbar: die Suite hält jetzt bei Abweichung das
+      volle Log (`build/diag/arm-abweichung-lauf-N.log`), und `RUNS` ist der Weg, die Rate zu
+      bestimmen.
+
+      **Nächster Schritt:** die aarch64-Notbremse soll sagen, **worauf** sie gewartet hat — auf
+      x86 tut sie das seit heute (`bringup : offen waren: …`), und dort war der Befund damit in
+      einer Zeile sichtbar. Im ARM-Hänger sind alle Ergebniszeilen grün und der Bericht kommt
+      trotzdem aus der Notbremse; ohne diese Zeile ist nicht zu sagen, welche Bedingung fehlte.
 
 - [ ] **D4** Verus laut `docs/verification.md` offen: `delete_leaf` auf der vereinten Struktur,
       Kinderlisten-Erreichbarkeit, danach Scheduler/IPC.
@@ -825,18 +966,12 @@ Crate ruft in die Testmodule. Es gibt genau **acht** Aufrufstellen (`main.rs`, `
 `testsupport` wird außerhalb der Testmodule nur an **einer** Stelle benutzt (`peek_dma_words` in
 der virtio-Demo).
 
-- [ ] **F1** `feature = "selftest"` (zunächst **in** `default`): `mod threads`/`selftest`/
-      `dmatests`/`dmar_selftest` und `testsupport` dahinter. Aufwand ~½ Tag, davon der größere
-      Teil **nicht** das Gating selbst, sondern beide Konfigurationen in die Testskripte zu
-      nehmen — ein `--no-default-features`-Build, den niemand baut, verrottet still, und genau
-      diese Fehlerform hat in diesem Projekt schon mehrfach zugeschlagen (leere Event-Queue,
-      nie ausgeführter x86-Testpfad, DMAR-Ausschlusspfad).
-- [ ] **F2** Erst wenn ein **Root-Task** existiert: `default = []` umstellen.
-      **Warum nicht sofort:** schaltet man heute alles ab, bleibt `configure() → idle`. Der
-      Kernel hat derzeit keinen Nicht-Test-Zweck — auf x86 gibt es kein Boot-Archiv, und auf
-      aarch64 ruft den Loader niemand außer `threads/mod.rs`. Das Gating wäre also kein
-      schlankerer Kernel, sondern ein leerer. Der ehrliche Ersatz ist der seL4-Weg: ein
-      Startprogramm aus dem Archiv laden und ihm die Wurzel-Caps übergeben.
+- [x] **F1/F2 erledigt (2026-07-30, A-2.2).** `feature = "selftest"` steht, `default = []` ist
+      gedreht, und **beide** Konfigurationen werden gebaut: `test-qemu-x86.sh` baut den
+      `--no-default-features`-Bau mit und vergleicht die `.text`-Größe — ein Gating, das nichts
+      schrumpfen lässt, ist wirkungslos geworden, und der Build allein zeigte das nicht.
+      Vorbedingung war der Root-Task (A-2.1): vorher wäre das Gating kein schlankerer Kernel
+      gewesen, sondern ein leerer.
 - [ ] **F3** Boot-Meldungen (`mmu:`, `apic:`, `mem:`) **nicht** mitgaten — sie sind kein
       Debug-Code, sondern das einzige Lebenszeichen eines Kernels ohne Konsole. Dass die HAL mit
       8 401 Zeilen nur **sieben** `println!` enthält, zeigt, dass die Trennung dort schon

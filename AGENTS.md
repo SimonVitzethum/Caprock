@@ -126,6 +126,32 @@ export RUSTUP_HOME=/opt/tools/rustup CARGO_HOME=/opt/tools/cargo PATH=/opt/tools
 QEMU, clang 22, gcc und Java liegen im Image. `~/.openclaw/toolchain` ist eine ältere
 Eigenbau-Kette und nur noch Rückfall.
 
+### Ein Worktree **innerhalb** des Repos ist nicht baubar (gemessen 2026-08-02)
+
+Cargo sucht `.cargo/config.toml` den Verzeichnisbaum **hinauf**. Ein Worktree unter
+`.claude/worktrees/` liegt *innerhalb* des Repos — die Konfiguration des Hauptcheckouts greift also
+zusätzlich, und das Linker-Skript wird **zweimal** übergeben. Die Folgen sind ungleich schlimm:
+
+* **aarch64** scheitert laut am Link (acht Overlap-Fehler). Ärgerlich, aber ehrlich.
+* **x86_64 scheitert lautlos.** `objcopy: section .aptramp_data can't be allocated in segment 5`
+  liest sich wie eine Warnung; das Image ist unbootbar, und QEMU sagt dann nur
+  `Error loading uncompressed kernel without PVH ELF Note`. Wer das für einen Kernelfehler hält,
+  sucht an der falschen Stelle.
+
+`CARGO_TARGET_<TRIPLE>_RUSTFLAGS` hilft **nicht** — es wird *addiert*, nicht ersetzt. Nur
+`RUSTFLAGS` ersetzt, und das bricht `programs/`/`tests/` (die haben eigene Linker-Skripte).
+
+**Für Agenten:** einen Worktree **außerhalb** des Repos anlegen, oder im Hauptcheckout arbeiten und
+den Dateibesitz oben einhalten.
+
+### QEMU meldet unter `-cpu host` eine SYNTHETISCHE Cache-Geometrie
+
+Ohne `host-cache-info=on` liefert QEMU seine Legacy-Deskriptoren (L3 16 MiB/16-fach, L2 4 MiB)
+statt der echten der Maschine. Alles, was aus der Geometrie folgt — Farbanzahl, Streifenbreite,
+die Frage nach einer gültigen Opfergröße im Prime+Probe —, wird damit gegen eine **Fiktion**
+gemessen. Wer eine Aussage über Cache-Färbung prüft, muss wissen, welche der beiden Geometrien
+gerade unter ihm liegt.
+
 ---
 
 # Mitteilungen

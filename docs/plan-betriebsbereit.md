@@ -70,10 +70,17 @@ zurück. Ab hier ist jede weitere Fähigkeit ein Userland-Programm und kein Kern
    QI-Deskriptor. Und ohne IR kann ein durchgereichtes Gerät beliebige Interrupt-Nachrichten
    erzeugen — das ist der Standardausbruch aus einer Geräte-Zuteilung und muss **vor** dem ersten
    Tenant-Gerät stehen, nicht danach.
-9. **[Z9] Fehlerdomäne festlegen und aufschreiben.** Ein Kernel-Panic reißt heute den Knoten mit;
-   eine VM tut das nicht. Die billige Variante ist eine Zeile Dokumentation („der Knoten ist die
-   Fehlerdomäne"), die teure ist Eingrenzung auf die verursachende PD. Die billige Variante
-   *jetzt* ist besser als die teure irgendwann — aber sie muss getroffen und gesagt werden.
+9. ~~**[Z9] Fehlerdomäne festlegen und aufschreiben.**~~ **Erledigt 2026-08-02 (B-6.2):**
+   [fehlerdomaene.md](fehlerdomaene.md), Invariante §14 in [invariants.md](invariants.md).
+   Festgelegt ist die billige Variante — *der Knoten ist die Fehlerdomäne, Redundanz über Knoten*,
+   und alle TrustedSAS-PDs eines Knotens bilden untereinander **eine** Domäne.
+   **Die Prämisse dieses Punktes war falsch:** ein Kernel-Panic reißt den Knoten heute *nicht*
+   zuverlässig mit — er wird in den häufigsten Fällen verschluckt, weil das `halt()` im Panic-Pfad
+   die Interrupts nicht maskiert und der Timer-Tick den Kern zurückholt. Gemessen, mit vier
+   verschiedenen Ausgängen für dieselbe Ursache. Für ein Sicherheitsprodukt ist das der schlechtere
+   Ausgang: der Kernel arbeitet nach einer nachweislich verletzten Invariante weiter. Die drei
+   billigen Gegenmaßnahmen sind benannt und **nicht** gebaut — sie sind eine Entscheidung
+   (Verfügbarkeit gegen Ehrlichkeit), keine Reparatur.
 
 ## Stufe 3 — mehr als ein Tenant, verantwortbar
 

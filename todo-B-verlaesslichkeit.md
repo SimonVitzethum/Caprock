@@ -165,11 +165,34 @@ Verlässliches.
       durchgereichtes Gerät beliebige Interrupt-Nachrichten erzeugen; IR mit weiter erlaubtem CFI
       ist eine offene Tür an der Seite. **Muss vor dem ersten Tenant-Gerät stehen** (Strang A-5.3
       hängt daran).
-- [ ] **B-3.3 Mehr-Einheiten-Aggregation.** `VtdCaps` ist noch eine Einheit; nötig ist das Minimum
-      über alle DRHDs, die eine zuteilbare Gruppe scopen, und Fault-/Config-Zähler über alle
-      Einheiten. Bis dahin ist das Oracle für alles blind, was nicht an Einheit 0 hängt.
-- [ ] **B-3.4 x86-Fensterwahl:** `0xFEE0_0000–0xFEEF_FFFF` ist als IOVA unbenutzbar (VT-d
-      behandelt DMA dorthin als Interrupt-Nachricht). Gehört als Bedingung an die Fensterwahl.
+- [x] **B-3.3 erledigt (2026-08-02).** Die Notiz war zur Hälfte veraltet — und die andere Hälfte
+      war schlimmer als beschrieben. Details in
+      [done.md](done.md#b-33-mehr-einheiten-aggregation--die-haelfte-die-schlimmer-war).
+
+      Schon aggregiert waren `caps_common()`, die Fault-Zähler und `discover`. **Nicht**
+      aggregiert waren drei Stellen mit Zähnen: `init()` stellte **nur Einheit 0** scharf (die
+      übrigen blieben mit `TE = 0` — das heißt nicht „blockiert", sondern **keine Übersetzung**),
+      `invalidate_context_cache()` lief nur auf Einheit 0, und `flush_entry`/`slpt_map` trafen
+      **Politik** (`clflush`, `SNP`) anhand der Fähigkeiten von Einheit 0.
+
+      Dazu neu: eine **Sprechprobe** je Einheit. Eine deklarierte, stumme Einheit trug vorher
+      genauso zu „keine Faults" bei wie eine fehlerfreie.
+
+      **Offen geblieben (B-3.2-Rest, nicht B-3.3):** QI und IR laufen weiterhin nur auf Einheit 0.
+      Für die Übersetzung folgenlos (die übrigen fahren den Registerpfad), **für Interrupt
+      Remapping nicht**: hinter Einheit 1..n bleibt der nicht-remappte Nachrichtenpfad offen.
+- [x] **B-3.4 erledigt (2026-08-02).** `0xFEE0_0000–0xFEEF_FFFF` ist als IOVA unbenutzbar (VT-d
+      behandelt DMA dorthin als Interrupt-Nachricht und befragt die Übersetzung **gar nicht**).
+      Die Fensterbasis liegt jetzt oberhalb dieses Bereichs — **strukturell**, nicht als Prüfung
+      bei jeder Vergabe: eine Bedingung, die nicht gelten *kann*, ist besser als eine, die an
+      jeder Vergabestelle richtig geprüft werden muss. Der Preis sind ein paar GiB ungenutzter
+      IOVA-Raum von 39 Bit; das ist kein Preis.
+      Der Bereich kommt aus der HAL (`iommu::interrupt_message_window`), nicht aus einer
+      `cfg`-Verzweigung beim Aufrufer; auf aarch64 liefert sie `None`, und das ist eine **Zusage**
+      („jede IOVA wird übersetzt"), keine Unkenntnis.
+      Belegt: `dmawin : ... kein Kontext-Fenster im Interrupt-Nachrichtenbereich=1`, und in der
+      Gegenprobe ohne das Überspringen `=0` mit `dmawin : FAILURES` — das Fenster lag vorher
+      **wirklich** darin, es war kein theoretisches Loch.
 
 ## B-4. Isolation, die für fremde Tenants trägt (A1-Rest, Z1, Z6)
 
@@ -210,44 +233,87 @@ Verlässliches.
       nie an einem fremden Binary. Eine Isolationszusage, deren Grenzen man nicht kennt, wird im
       Betrieb überdehnt; deshalb steht die Grenze neben der Zusage, nicht in einer Fussnote.
 - [~] **B-4.5 Wirkung statt nur Zuteilung** — der Prime+Probe steht (`colors::run_prime_probe`,
-      arch-neutral, beide Hochlaufwege, Meldung `pprobe`). Was fehlt, ist **Blech**.
+      arch-neutral, Meldung `pprobe`, seit 2026-08-02 von `test-qemu-x86.sh` auch **geprüft**).
+      Was fehlt, ist **Blech** — und der Eintrag sagt jetzt, was für eine Maschine das sein muss.
+      **Die Reproduzierbarkeits-Nebenbedingung ist erledigt (2026-08-02).** Details in
+      [done.md](done.md#b-45-teil-2-der-primeprobe-war-nicht-reproduzierbar--und-die-ursache-war-nicht-der-allokator).
+      Kurz, weil die alte Notiz die Ursache falsch benannte:
+      * **Der Allokator war es nicht.** Der Aufbau war byte-identisch reproduzierbar (gleiche
+        Physadressen, gleiche Fragmentzahl davor/danach), der Fragment-Höchststand lag bei **419
+        von 1024**, und alle 800 Regionen waren nach dem Abbau nachweislich frei. Ein identischer
+        Aufbau kann keine Streuung erzeugen — sie lag in der **Messung**.
+      * **Der Angreifer lief linear.** Falle 1 („linear misst den Vorauslader") war nur fürs Opfer
+        behoben; ein sequenzieller Strom wird von verdrängungsresistenter Cache-Einlagerung als
+        „kein Wiedergebrauch" behandelt und verdrängt nichts. Positivkontrolle: linear **3 von
+        10**, bit-umgekehrt **10 von 10**.
+      * **Das Minimum ist für `shared`/`disjoint` der falsche Schätzer** — jede Störung, die die
+        Verdrängung schwächt, macht die Messung *kürzer*, das Minimum greift also einseitig in die
+        Richtung, die die Positivkontrolle zerstört. Minimum **4 von 10**, Median **10 von 10**.
+        Gewertet wird der Median; gemeldet werden Minimum/Median/Maximum plus ein
+        **Auflösungs-Gate** (überlappen die Verteilungen, gibt es kein Urteil, sondern SKIP).
+      * **„Opfer > L2" war eine feste Zahl.** 2 MiB, begründet mit „die Messmaschine hat ~1,5 MiB
+        L2" — auf der heutigen Maschine sind es 4 MiB, das Opfer lag also wieder privat. Die Größe
+        kommt jetzt aus `hal::cache::below_llc()` (neu) und muss in ein Fenster passen.
+      * Der Aufbau kommt aus **wenigen großen ungefärbten Blöcken**, in denen die farbreinen Läufe
+        gesucht werden — 14 Allokationen statt 800, und die Farbe jeder benutzten Seite wird an der
+        Verwendungsstelle nachgerechnet statt `alloc_colored` geglaubt. Nebenbei fällt damit weg,
+        dass `MAX_ATTACKER` die Angreifergröße auf großen Maschinen still deckelte (auf der
+        Messmaschine war der Deckel **exakt erreicht**).
+      Nachher: 10 Boots mit identischer Ergebnissignatur, `disjunkt`-Median 174–271 statt 45–189;
+      acht Aufbauten in einem Boot: Median 189–215 (±7 %). `RUNS=5 ./test-qemu-x86.sh` grün.
+      **Offen (das eigentliche B-4.5): ein Lauf auf echter Hardware — und die Maschine muss eine
+      Bedingung erfüllen:**
+          Größe der nicht partitionierten Cache-Ebene   <   LLC / PARTITIONS
+      Sonst gibt es **keine gültige Opfergröße**: unterhalb der privaten Ebene misst der Test
+      diese Ebene (jeder Angreifer verdrängt dort, Farbe hin oder her), oberhalb des Farbanteils
+      kann das Opfer auch bei perfekt wirkender Färbung nicht resident bleiben. Auf der heutigen
+      Messmaschine ist das Fenster **nicht** leer, sobald QEMU die echte Geometrie meldet: mit
+      `host-cache-info=on` (seit 2026-08-02 in beiden x86-Suiten) sind es 2 MiB private Ebene
+      gegen 24 MiB / 4 = 6 MiB Farbanteil. Ohne den Schalter meldet QEMU seine Legacy-Deskriptoren
+      (L3 16 MiB, L2 4 MiB), und das Fenster war **leer** -- der SKIP-Grund war dann ein
+      Aufbau-Artefakt statt der Sache. Jetzt nennt der Test den strukturellen Grund (Gast). Ein Xeon mit 1–2 MiB L2 und
+      32+ MiB LLC erfüllt die Bedingung; ein hybrider Notebook-Kern mit 4 MiB E-Core-L2 nicht.
 
-      **Die Annahme im alten Eintrag war falsch:** „erst auf Blech ODER unter KVM". Unter KVM ist
-      die Frage nicht schwer zu messen, sondern **prinzipiell nicht entscheidbar**. Ein Gast färbt
-      *gastphysische* Adressen; die zweite Übersetzungsstufe bildet jede 4-KiB-Seite auf eine
-      beliebige Wirtsseite ab, und die Farbbits liegen oberhalb des Seitenoffsets. Gemessen würde
-      die Seitenzuteilung des Wirts, nicht die eigene Färbung. Der Test erkennt das
-      (`CPUID.1:ECX[31]`) und meldet SKIP mit Begründung, statt eine Zahl zu liefern, die etwas
-      anderes bedeutet, als sie zu bedeuten scheint.
+      Das ist zugleich ein Befund **über A1 selbst** und gehört neben `docs/invariants.md` §12:
+      wo eine nicht partitionierte Cache-Ebene so groß ist wie ein ganzer Farbanteil des LLC, kann
+      Färbung mit dieser Streifenzahl nichts schützen, was nicht ohnehin privat zwischengespeichert
+      ist. Das ist keine Eigenschaft des Tests, sondern eine der Maschine.
 
-      **Gemessen wurde trotzdem** — und das Ergebnis ist der Beleg dafür, dass die Sichtbarkeits-
-      grenze real ist, nicht bloß theoretisch (Zyklen je Kettenglied, Opfer 2 MiB, Angreifer
-      24 MiB je Farbsatz):
-
-          ungestoert=41   disjunkt=234   gleichfarbig=210
-
-      Die Positivkontrolle trägt deutlich; der **disjunkte** Farbsatz verdrängt genauso stark wie
-      der gleichfarbige. Auf Blech wäre das ein Fehlschlag von A1 — im Gast ist es die erwartete
-      Folge davon, dass der Wirt die Farbe längst umgeschrieben hat.
-
-      Zwei Fallen, die der Test beim Bauen selbst gestellt hat und die im Code dokumentiert sind:
-      * **Ein linearer Durchlauf misst den Vorauslader, nicht den Cache** (erste Fassung: 4,2
-        Zyklen je Zeile selbst im „verdrängten" Fall — zwei Größenordnungen zu schnell für DRAM).
-        Jetzt Zeigerkette in bit-umgekehrter Reihenfolge: jeder Zugriff hängt am vorigen.
-      * **Ein Opfer, das in den L2 passt, sagt nichts über den L3.** Färbung partitioniert nur den
-        LLC; die Messmaschine hat ~1,5 MiB L2 je Kern. Opfer jetzt 2 MiB.
-
-      **Offen (das eigentliche B-4.5):** ein Lauf auf echter Hardware. Nebenbedingung, im Code
-      notiert: der Aufbau braucht ~50 MiB in 800 gefärbten Einzelregionen (eine gefärbte Region ist
-      auf `region_bytes` begrenzt) und trug damit an die Fragmentgrenze des Allokators — dort war
-      er **nicht reproduzierbar** (54 bis 179 Zyklen bei identischem Aufbau, `balanciert` kippte).
-      Vor dem Blech-Lauf gehört das entschärft, sonst zerstört der Test B-1.3.
+      **Unter einem Hypervisor bleibt die Frage nicht entscheidbar** (ein Gast färbt gastphysische
+      Adressen; die zweite Übersetzungsstufe bildet jede 4-KiB-Seite auf eine beliebige Wirtsseite
+      ab, und die Farbbits liegen oberhalb des Seitenoffsets). **Gemessen wird trotzdem** — Aufbau,
+      Positivkontrolle, Farbwahl und Bilanz sind dort genauso prüfbar wie auf Blech, und ein
+      Prüfpfad, der zum ersten Mal am Zieltag läuft, ist am Zieltag kaputt. Das Urteil über A1
+      unterbleibt, die Zahlen stehen im Log.
 
 ## B-5. Zeit, Abrechnung, Speicherorte (Z2, Z5, Z8)
 
-- [ ] **B-5.1 Verbrauch per Zyklenstempel** statt per Tick: `consumed_cycles` je TCB, gestempelt
-      beim Ein- und Auswechseln, darauf eine Monitoring-Cap. **Ein schnellerer Tick wäre die
-      falsche Antwort** — er erhöht Auflösung *und* Overhead; ein Zyklenstempel nur die Auflösung.
+- [x] **B-5.1 erledigt (2026-08-02).** Der Verbrauch wird bei **jeder Umplanung** gestempelt, nicht
+      mehr beim Tick. Details in [done.md](done.md#b-51-die-abrechnung-hing-am-tick).
+
+      Der Zustand vorher war schlimmer als die Notiz vermutete: `on_tick` belastete nur bei
+      `tick == true`, `block_current`/`switch_to`/`YIELD` **gar nicht**. Die Verzerrung war damit
+      nicht „bis zu 10 ms", sondern **vollständig** — wer kurz vor dem Tick blockiert, zahlte
+      **null**, und wer das systematisch tut, rechnet dauerhaft umsonst.
+
+      Die Arithmetik liegt abhängigkeitsfrei in `crates/sel4lake-sched/src/cycles.rs` und wird auf
+      dem Host geprüft (`tools/host-tests.sh cycles`, 9 Tests); die **Uhr** bleibt beim Kernel.
+      Drei Fallen sind benannt und einzeln getestet: Rückwärtssprung wird **verworfen statt
+      gewrappt** (`wrapping_sub` hätte aus 20 ns Messfehler ein für immer erschöpftes Konto
+      gemacht), unplausible Differenzen fliegen raus, und ein Kernwechsel wird **vor** der Zahl
+      geprüft — ein Zyklenzähler ist nur innerhalb eines Kerns eine Zeitachse. Vorgabe ist
+      `Source::Untrusted`: ohne zugesicherte Invarianz wird **nichts** abgerechnet.
+
+      Im Kernel klammert `charged()` jede Umplanung — mit **einem** Zählerstand, nicht zwei: zwei
+      Lesungen ließen die Zyklen der Umplanung selbst zwischen den Stempeln liegen, und die Summe
+      aller Konten wäre systematisch kleiner als die verstrichene Zeit.
+
+      Geprüft wird es als `cycacct` (63 Proben gegen 39 Ticks). **Welcher Zweig gilt, sagt die
+      Maschine** (`invariant_tsc()`), nicht der Kernel — der erste Entwurf las nur den
+      Ablehnungszähler und hätte ein vergessenes `set_cycle_source` bestanden.
+
+      **Offen bleibt** die Monitoring-Cap: `consumed_cycles(tid)` liefert die Zahl, aber es gibt
+      noch keine Cap, über die ein Mandant sie abfragen kann. Das gehört zu B-6.1.
 - [ ] **B-5.2 Tickless für Rechenkerne** (Z5): Timer nur armieren, wenn es etwas zu verdrängen
       gibt. Zusammen mit B-5.1 werden Abrechnung und Verdrängung entkoppelt — das ist der Punkt.
 - [ ] **B-5.3 Kern-Isolierung als Politik:** keine IPIs, keine Balancierung, keine fremde
@@ -255,31 +321,134 @@ Verlässliches.
 - [ ] **B-5.4 NUMA** (Z8): Knoten aus ACPI SRAT/SLIT, Freilisten je Knoten, PD-Zuteilung
       knotenlokal. **Gemeinsam mit der Farbvergabe entscheiden**, nicht in zwei Schichten — sonst
       kämpfen beide Politiken um dieselbe Physadresse und wer zuerst zuteilt, gewinnt.
-- [ ] **B-5.5 Zählgrenzen als Operationszahl** (todo D): Iterationen je Thread-Tod, CDT-Walk-Länge,
-      `revoke`-Teilbaumgröße, Stackbytes je Thread — als **Anzahl**, damit maschinenunabhängig.
+- [x] **B-5.5 erledigt (2026-08-02).** Die CDT-Läufe sind begrenzt — und der Befund dabei war,
+      dass es **ausgerechnet umgekehrt** stand. Details in
+      [done.md](done.md#b-55-der-prüfer-war-begrenzt-revoke-nicht).
 
-## B-6. Vertrauen in die Maschine (Z7, Z9)
+      `audit_cdt` war gegen einen zyklischen CDT geschützt (`steps > nslots`), `revoke`,
+      `move_cap` und `child_count` **nicht**. Der Prüfer läuft auf Anforderung, `revoke` auf
+      **Mandantenwunsch** — und unter der CAPS-Sperre. Aus einer Datenstrukturanomalie wäre damit
+      kein Latenzproblem geworden, sondern ein stehender Knoten.
+
+      Die Schranke ist **hergeleitet**, nicht gegriffen: ein azyklischer Lauf besucht keinen Slot
+      zweimal, also `slots.len()` — dieselbe Zahl, die `audit_cdt` schon nahm, jetzt aus **einer**
+      Quelle. Ein Überlauf bricht ab und wird **gezählt**; der Kernel prüft ihn über den neuen
+      `cdt_audit`-Code **9**, und die Höchststände stehen als **Operationszahl** im Bericht
+      (`cdtlen : Abstieg 1/80256, Revoke 4/80256`). Zeit wäre das falsche Maß — sie hängt an
+      Taktrate und Emulation, nicht an der Struktur.
+
+      Sensitivität: Schranke gelockert → 1 Test fällt; Schranke **entfernt** → der Test „terminiert
+      auf einem Zyklus" **hängt** und musste nach 60 s abgebrochen werden. Dass er zurückkehrt,
+      ist das Ergebnis.
+
+      **Nebenertrag:** `sel4lake-cap` hatte **keinen** Host-Test-Pfad — seine Tests liefen
+      nirgends. `tools/host-tests.sh` sammelt jetzt alle reinen Crates (mem, part, fat, cap):
+      **62 Tests**, `ALL PASS`.
 
 - [ ] **B-6.1 Messbarer Boot + Attestierung.** Der Kunde will wissen, **worauf** er läuft — nicht
       beweisen, was er mitbringt (TrustedSAS ist nur für eigenen Code, s. Z1). Messkette bis in
       den Kernel, Signatur über die Messung. Vorbedingung für alles, was Tenant-Zustand über das
       Netz bewegt.
-- [ ] **B-6.2 Fehlerdomäne festlegen und aufschreiben** (Z9). Ein Panic reißt heute den Knoten
-      mit, eine VM tut das nicht. Die billige Variante ist eine Zeile Dokumentation („der Knoten
-      ist die Fehlerdomäne"), die teure ist Eingrenzung auf die verursachende PD und
-      Forschungsklasse. Die billige **jetzt** schlägt die teure irgendwann — aber getroffen und
-      gesagt werden muss sie.
+- [x] **B-6.2 erledigt (2026-08-02) — und die Prämisse des Eintrags war falsch.** Die Festlegung
+      steht in [docs/fehlerdomaene.md](docs/fehlerdomaene.md) (betreiberseitig, mit Messvorschrift
+      und Nicht-Zusicherungen), als Invariante §14 in [docs/invariants.md](docs/invariants.md).
+      Details in [done.md](done.md#b-62-die-fehlerdomaene--und-ein-panic-der-nicht-den-knoten-reisst-sondern-verschluckt-wird).
+
+      **Zugesichert:** der Knoten ist die Fehlerdomäne; Redundanz über Knoten. Zusätzlich: alle PDs
+      im **globalen SAS-Adressraum** (`VSPACE_OF == 0`) bilden untereinander **eine** Domäne —
+      Trennung intralingual statt hardwareseitig, und das ist der Grund für „kein Kundencode in
+      TrustedSAS", nicht seine nachträgliche Begründung. **Nicht** am Domänen-Etikett festmachen:
+      `Domain::TrustedSas` darf global *oder* isoliert laufen, extern geladene bekommen heute immer
+      eine eigene VSpace. Eingegrenzt ist und bleibt der Fault einer **isolierten** PD.
+
+      **Der Eintrag sagte „ein Panic reißt heute den Knoten mit". Gemessen stimmt das nicht — und
+      das ist die schlechtere Nachricht.** `panic.rs` ruft ein `halt()`, das die Interrupts nicht
+      maskiert (`arch/x86_64/mod.rs:294` `loop { hlt }` ohne `cli`; aarch64 `loop { wfe }`, DAIF
+      unverändert), also holt der nächste Timer-Tick den Kern zurück in den Scheduler. Vier
+      verschiedene Ausgänge für dieselbe Ursache — welcher eintritt, hängt davon ab, **wo** der
+      Panic auftrat, nicht wie schlimm er war:
+      * Panic in einem Kernelfaden → der Knoten läuft **61 s weiter**, alle 4 Kerne ticken, nur der
+        gepanickte Faden steht (`Worker-Runden [4908, 4910, 2]`). Auf aarch64 dasselbe.
+      * Panic auf einem Sekundärkern → Prüfsignatur **identisch** zum sauberen Lauf, `rc=0`.
+        Ohne die Konsolenzeile wäre der Panic durch nichts nachweisbar.
+      * Panic unter gehaltener `MEM`-Sperre → **stiller Totalausfall**, kein Watchdog, `rc=124`
+        (der Ticket-Lock in `sel4lake-sync` dreht unbegrenzt).
+      * Panic im Steuerfaden des Bootkerns → Knoten läuft, meldet aber nie wieder etwas — von außen
+        **nicht** von einem Deadlock zu unterscheiden. Das betrifft die Diagnose von D0.
+
+      **Nicht gebaut, absichtlich** (Aufwände und Begründung in `docs/fehlerdomaene.md` §6): IRQs im
+      Panic-Pfad maskieren (Minuten), Rekursionswächter im Panic-Handler (Minuten, heute gibt es
+      **keinen** — gemessen 362 Ebenen ohne `#DF`, ohne Schutzseite), `panic` → `system_off`
+      (~1 h). Die drei zusammen machen die Festlegung wahr, statt sie zu behaupten — aber das ist
+      eine **Entscheidung** (Verfügbarkeit gegen Ehrlichkeit), keine Reparatur, und gehört Simon.
 
 ## B-7. Verifikation (D1–D5)
 
-- [ ] **B-7.1** Kani läuft nur im CI-Gate; die ext-29-Änderung an `sel4lake-sync` ist dort nicht
+- [x] **B-7.1 erledigt (2026-08-02) — die Notiz war überholt, die Lücke lag woanders.**
+      Details in [done.md](done.md#b-71-die-notiz-war-überholt--die-lücke-lag-woanders).
+
+      `tools/kani-verify.sh` hatte `sync` längst als Ziel, und die CI ruft es **ohne Argumente**,
+      also mit allen vier Zielen. Woher die Notiz kam, ist trotzdem sichtbar: der CI-Job hiess
+      *„Kani — Tier-1-Beweise (Loader-Parser)"*. Wer die CI liest statt das Skript, musste
+      schliessen, `sync` sei ungegatet. **Beschriftung korrigiert** — dieselbe Fehlerform wie
+      B-7.2, nur eine Ebene höher: eine Beschreibung, die neben der Sache herläuft.
+
+      **Die echte Lücke:** die drei vorhandenen Beweise liefen mit **konkreten** Werten (ein Leser,
+      zwei Leser, ein Schreiber) — also in derselben Grössenordnung, die Loom seit B-7.2 über
+      Interleavings abdeckt. Über den Zustandsraum, in dem die Zusicherungen leben (31 Bit
+      Leserzahl neben dem Schreiberbit, überlaufende u32-Ticketzähler), sagte **keines** der beiden
+      Werkzeuge etwas. Fünf neue Harnesses nehmen den Zustand jetzt **symbolisch** und rufen dabei
+      den echten Code. `sync` steht damit bei 8 statt 3 Beweisen.
+
+      Sensitivität am echten Lock gemessen (vier Mutationen, je andere Zahl fallender Beweise);
+      selbst nachgemessen: `store(0)` statt `fetch_and(!RW_WRITER)` → **7 verified, 1 failure**.
+
+      **Der Inert-Check der CI deckte nur `sel4lake-loader` ab** — jetzt auch `sel4lake-sync`, die
+      Crate mit **zwei** externen cfgs (`kani` *und* `loom`). Der Kernel-Build fing das mit ab, aber
+      nicht als benannte Zusicherung, und ein Schutz, den niemand ausspricht, fällt beim nächsten
+      Umbau unbemerkt weg.
+
+      *(Alter Text:)* **B-7.1** Kani läuft nur im CI-Gate; die ext-29-Änderung an `sel4lake-sync` ist dort nicht
       gegengeprüft — **und genau diese Crate hatte gerade den x86-IRQ-Fehler.**
-- [ ] **B-7.2** Loom modelliert eine *Kopie* des Lock-Algorithmus; die IRQ-Maskierung ist dort
+- [x] **B-7.2 erledigt (2026-08-02).** Die Kopie ist weg: `tools/loom-verify.sh` übernimmt
+      `crates/sel4lake-sync/src/lib.rs` **unverändert**, die Beweise stehen in derselben Datei.
+      `Verification/concurrency/loom/src/{lib,ticket}.rs` sind **gelöscht** — eine tote Kopie, die
+      autoritativ aussieht, ist schlimmer als keine. Details in
+      [done.md](done.md#b-72-loom-prüfte-eine-kopie--und-die-kopie-war-nicht-das-problem).
+
+      **Der Fund, der zählt:** eine abgeschwächte Speicherordnung im Ticket-Release
+      (`Release` → `Relaxed`) lief durch **alle** Beweise. Ursache war nicht die Kopie, sondern
+      `core::cell::UnsafeCell` — damit prüfte Loom nur das Atomic-Protokoll, nicht die
+      Veröffentlichung der Nutzlast. Erst mit `loom::cell::UnsafeCell` fallen 2 von 10. Selbst
+      nachgemessen am echten Lock: `8 passed; 2 failed`, danach wieder `10 passed`.
+
+      **Die IRQ-Maskierung bleibt außerhalb** — und steht jetzt als benannte Grenze im Modulkopf,
+      im Skriptkopf und neben `IRQ_MASKING_IMPLEMENTED`. Der Punkt aus dem alten Text gilt
+      unverändert (s. u.): der Fehler von B-1.1 lag genau dort, wo das Modell nicht hinsieht. Was
+      ihn heute hält, ist die Übersetzungszeit-Zusicherung `target_os = "none"`, nicht Loom.
+
+      *(Alter Text:)* **B-7.2** Loom modelliert eine *Kopie* des Lock-Algorithmus; die IRQ-Maskierung ist dort
       prinzipiell nicht modellierbar. **Nach B-1.1 ist das keine Randnotiz mehr:** der Fehler lag
       exakt in dem Teil, den das Modell nicht abbildet. Ein Test, der die reale `cfg`-Auswahl
       prüft (baut das Kernel-Ziel wirklich den maskierenden Zweig?), wäre wirksamer als ein
       feineres Modell.
-- [ ] **B-7.3** Verus: `delete_leaf` auf der vereinten Struktur, Kinderlisten-Erreichbarkeit,
-      danach Scheduler/IPC.
+- [ ] **B-7.3** *(Rest)* Verus **Scheduler/IPC vertiefen**. `delete_leaf` + Kinderlisten-
+      Erreichbarkeit sind **zu** (2026-08-03, s. `done.md`): `cap_space.rs` steht auf
+      `18 verified, 0 errors` (3,0 s), der Erreichbarkeitssatz `unreachable_after_delete` hat
+      **beide** Hälften (keine Kante zeigt mehr auf den gelöschten Slot **und** kein fremder Elter
+      hat sich bewegt), 8 von 9 Mutationen fallen — die neunte ist eine **bewiesene** Redundanz,
+      keine Lücke. Neu dabei: `tools/verus-modelltreue.sh` (Wächter mit Selbsttest, hält das
+      Modell an `crates/sel4lake-cap/src/space.rs`).
+
+      **Was für Scheduler/IPC noch offen ist:** `Verification/scheduler/proofs/runqueue.rs`
+      (13 verified) und `Verification/ipc/proofs/endpoint.rs` (6 verified) sind grün, aber ihr
+      Bezug zum echten Quelltext ist **nicht** geprüft — der Modell-Treue-Wächter deckt heute nur
+      `unlink`/`delete_leaf` ab. Vor jeder Vertiefung dort zuerst die Entsprechung festziehen,
+      sonst wächst dieselbe stille Drift an zwei weiteren Stellen.
+
+      **Und der Grund, warum B-7.3 überhaupt so lange offen aussah, war keiner:** der `delete`-
+      Beweis galt seit `3384abb` (2026-06-27) als erbracht — Commit-Titel, README-Status und
+      CI-Gate sagten das. Gemessen war er `9 verified, 1 ERRORS`, und zwar **auch gegen die damals
+      gepinnte Verus-Fassung**. 37 Tage rotes Gate, das niemand gelesen hat.
 - [ ] **B-7.4** Die ext-29-/ext-30-Invarianten haben Laufzeittests, aber keine Beweise. Für die
       Migration wäre die Sperrordnung „aufsteigende Kern-ID" ein lohnendes Loom-Modell.

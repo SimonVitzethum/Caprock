@@ -229,86 +229,182 @@ Für einen Betriebsanspruch fehlen drei Dinge.
 
 ## A-5. Etwas, das sich lohnt zu laden (Z10)
 
-- [ ] **A-5.1 Treiberrahmen als Userland-PD** — **jetzt gesetzte Regel, nicht mehr nur Plan.**
+- [x] **A-5.1 erledigt (2026-08-02).** Ein Treiber laeuft als **Dienst** ausserhalb des Kerns,
+      und der Kernel kann ihn **austauschen**, ohne zu wissen, was er treibt. Details, Messwerte
+      und die Fehler, die dabei sichtbar wurden, in
+      [done.md](done.md#a-51-der-treiber-als-dienst-und-sein-austausch).
 
-      Simon, 2026-08-01: *„in den Mikrokernel sollen nur Sachen die reingehören, keine Treiber
-      direkt im Mikrokernel."* Das ist die Voraussetzung für Hot-Reload, Fehlereindämmung und
-      Mandantentrennung — ein Treiber im Kern kann keins davon.
+      **Gemessen (Lade-Suite):**
 
-      **Gemessener Stand (2026-08-01):** es läuft **kein einziger** Treiber als geladenes
-      Userland-Programm. Die Bausteine sind vollständig da — `libsel4lake` hat `map`/`unmap`
-      (MMIO-Frame-Cap), `wait` (IRQ als Notification), `call`/`recv`/`reply` (Kanal), und der
-      RTC-Test belegt den Weg. Benutzt werden sie nur von Testdiensten. Was fehlt, ist der
-      **Rahmen**: ein Treiber-PD-Gerüst, das diese Caps entgegennimmt, und die Umkehrung der
-      Richtung — der Kernel ruft heute den Treiber, künftig meldet sich der Treiber beim Kernel.
+          drv : Anfrage 1 an v1: Status=0 Bytes=0x454b414c344c4553 Kapazitaet=2048 bedient=1
+          drv : Austausch: Ergebnis=0 (umgebunden OHNE Empfaengerluecke); v1 bereit=1 v2 bereit=1
+          drv : Anfrage 2 an v2: Status=0 Bytes=0x454b414c344c4553 Kapazitaet=2048 bedient=2
 
-      **Die Grenze ist seit heute geprüft, nicht nur beschrieben:** `tools/kernel-grenze.sh` führt
-      eine Erlaubnisliste der HAL-Module, jeder Eintrag mit Begründung, *warum der Kern das Gerät
-      selbst braucht*. Die Trennlinie ist nicht „Hardware ja/nein" — die HAL fasst per Definition
-      Hardware an — sondern: MMU, Interrupt-Controller, Timer und IOMMU sind die Mechanik von
-      Isolation und Einplanung selbst; ein RNG, eine Netzkarte, eine Platte sind Dienste *für*
-      Mandanten. Der Wächter weist beim Selbsttest nach, dass er ein untergeschobenes Modul
-      erkennt. **Eine Ausnahme steht drin, benannt und nicht genehmigt: `virtio`** — heute im Kern,
-      weil es das DMA-Beweisgerät ist, Ausgang ist genau dieser Punkt.
+      `programs/hardware/virtio-blk` mappt seine Fenster, loest sein Geraet auf **seiner eigenen
+      Konfigurationsraum-Seite** auf und wartet dann in `recv`. Der Kernel ist **Client**, nicht
+      Treiber. Zwischen den beiden Anfragen tauscht er den Empfaenger am laufenden Endpoint aus
+      (A-4.1, `overlapped` — der Endpoint hatte zu keinem Zeitpunkt null Empfaenger). Der
+      Bedienungszaehler 1 → 2 liegt in der DMA-Region und belegt, dass die neue Fassung **dieselbe
+      Region geerbt** hat: ein Austausch, kein Neustart.
 
-      Beim ersten Lauf hat der Wächter sofort ein Modul gemeldet, das niemand auf dem Schirm hatte
-      (`hook.rs`, legitim: Trap-Mechanik). Genau dafür ist er da.
+      In `loader::reload_driver` kommt das Wort „virtio" nicht vor. Das ist die Abnahmebedingung,
+      nicht ein Zufall: solange der Kernel wuesste, was der Treiber treibt, waere „austauschbar"
+      eine Eigenschaft dieses einen Treibers und nicht des Mechanismus.
 
-      **Erster Schritt getan (2026-08-01): die Treiberlogik ist kernfrei.** `crates/sel4lake-virtio`
-      hat **keine einzige Abhängigkeit** — kein `sel4lake-hal`, kein Kernel, keine Architektur —
-      und enthält das Protokoll: Handshake, Feature-Aushandlung, Virtqueue, Notify, used-Ring.
+      **Was ausdruecklich NICHT dazugehoert — und warum es nicht hierher gehoert:** `CAP_IRQ`.
+      Der Treiber **pollt** seinen used-Ring. Ein Geraete-Interrupt kaeme auf x86 per MSI-X, und
+      seit B-3.2 steht die Interrupt-Remapping-Tabelle auf lauter „not present": ein Geraet ohne
+      IRTE kann keinen Interrupt ausloesen — mit Absicht. Eine **IRTE-Vergabe gibt es nicht**
+      (geprueft, `crates/sel4lake-hal/src/x86_64/vtd.rs`). Der Weg dorthin ist damit B-3-Arbeit
+      (Vergabe + Invalidierung ueber QI), nicht A-5.1. `endow_from_manifest` weist `CAP_IRQ`
+      deshalb **ab**, statt eine Autoritaet zu erteilen, die niemand einloest — dieselbe Regel wie
+      bei `CAP_PD_CONTROL` in A-2.1.
 
-      Der Schnitt liegt dort, wo die **Autorität** aufhört, nicht dort, wo es beim Aufteilen bequem
-      war. In der HAL blieb nur das *Auffinden* der Strukturen, also ein Lauf durch den
-      PCI-Konfigurationsraum. Der ist geräteweit: wer ihn lesen darf, sieht jedes Gerät der
-      Maschine. Eine Treiber-PD bekommt deshalb das **Ergebnis** — die Adressen ihres eigenen
-      Geräts — und nicht das Werkzeug, sie zu suchen.
+      *(Die urspruengliche Begruendung, weil sie weiter gilt:)* Simon, 2026-08-01: *„in den
+      Mikrokernel sollen nur Sachen die reingehoeren, keine Treiber direkt im Mikrokernel."* Das
+      ist die Voraussetzung fuer Hot-Reload, Fehlereindaemmung und Mandantentrennung — ein Treiber
+      im Kern kann keins davon. Die Grenze ist seit 2026-08-01 **geprueft**, nicht nur
+      beschrieben: `tools/kernel-grenze.sh` fuehrt eine Erlaubnisliste der HAL-Module, jeder
+      Eintrag mit Begruendung, und weist im Selbsttest nach, dass er ein untergeschobenes Modul
+      erkennt.
 
-      Ein Detail, das beinahe schiefging: die Speicherbarriere wird **hereingereicht**
-      (`VirtioRng::new(..., fence: fn())`), nicht in der Crate gewählt. Der naheliegende Weg wäre
-      `core::sync::atomic::fence(SeqCst)` gewesen — arch-neutral und ohne Parameter. Er wäre falsch:
-      auf aarch64 übersetzt das zu `dmb ish`, und Device-Memory liegt nicht in der
-      inner-shareable-Domäne. Der ARM-Zweig hätte es vielleicht überlebt — bis er es nicht mehr tut.
+- [x] **A-5.2 erledigt (2026-08-01).** virtio auf x86: Transport, **Blockgerät und Netzkarte**.
+      Details, Messwerte und die Annahme, die dabei umfiel, in
+      [done.md](done.md#a-52-virtio-auf-x86--transport-blockgerät-netzkarte).
 
-      Gegenprobe: x86 `virtio : ALL PASS` unverändert, aarch64 `virtio-rng-DMA: PASS`, keine
-      FAIL-Zeile. `tools/kernel-grenze.sh` führt **keine Ausnahme** mehr.
+      Kurzfassung: `rng` belegte den Transport, aber nur **eine** Richtung — das Gerät schreibt in
+      unseren Speicher, es liest nie etwas von uns. `blk` schließt die Lücke mit einer
+      dreigliedrigen Deskriptorkette (Anfragekopf, den das Gerät **liest**), `net` fügt die zweite
+      Queue mit eigenem `queue_notify_off` hinzu. Beide Treiber liegen kernfrei in
+      `crates/sel4lake-virtio`; in der HAL blieb das Auffinden der Strukturen.
 
-      **Was noch fehlt** (das eigentliche A-5.1): die PD selbst. Ein Programm unter
-      `programs/hardware/` (das Verzeichnis ist heute leer), das MMIO-Cap + DMA-Region entgegennimmt,
-      `sel4lake-virtio` linkt und sein Ergebnis über den Kanal meldet — plus die Umkehrung der
-      Richtung: heute ruft der Kernel den Treiber, künftig meldet sich der Treiber beim Kernel.
+      **Korrektur zu einer Zeile, die hier erst falsch stand:** „`attach` liefert auf x86 weiter
+      `None`" stimmt nicht. `VtdEnforcer::attach` ist implementiert und teilt zu — der `dmatok`-Test
+      belegt es seit Längerem (`attach-installierte-Uebersetzung=true`), und A-5.1 benutzt es: die
+      Treiber-PD bekommt eine echte IOVA (`0x20e00000` gegen PA `0x3b51000`). Die Zeile war aus dem
+      alten Text übernommen, ohne sie gegen den Code zu halten; derselbe Satz stand auch im
+      `vtdcaps`-Bericht des Kernels und ist dort ebenfalls korrigiert.
+      Offen bleiben B-3.3 (Mehr-Einheiten-Aggregation) und B-3.4 (Fensterwahl gegen `0xFEE0_0000`)
+      — beides Vollständigkeitslücken, keine Funktionssperre. Die A-5.2-Tests laufen trotzdem
+      **vor** dem VT-d-Aufbau, weil sie den Fall „Gerät ohne Zuteilung" prüfen sollen.
+## A-6. Ueber dem Sektor: Blockdienst, Partition, Dateisystem
 
-- [~] **A-5.2 virtio auf x86** — der **Transport** steht und ist auf x86 belegt (2026-08-01).
-      Offen bleiben **Netz und Blockgerät**.
+Alles hier laeuft **ausserhalb des Kerns** (Simon, 2026-08-02: *„moeglichst als Treiber, nicht im
+Kernel"*). Der Kern bekommt davon nichts: die Parser sind abhaengigkeitsfreie Crates wie
+`sel4lake-virtio`, gelinkt von Userland-PDs.
 
-      Der Treiber lag unter `hal/aarch64/`, obwohl nichts daran ARM-spezifisch war: virtio-pci ist
-      ein PCI-Standard, und die beiden Berührungspunkte — `cpu::dsb_sy()` (auf x86 `mfence`, war
-      da) und `pcie::cap_ptr` (fehlte, drei Zeilen) — gibt es auf beiden Zweigen. Er liegt jetzt
-      arch-neutral in `crates/sel4lake-hal/src/virtio.rs`.
+- [x] **A-6.1 erledigt (2026-08-02): das Dienstprotokoll ueber dem Treiber.**
+      `OP_INFO` (Kapazitaet, Hoechstzahl je Anfrage, Sektorgroesse), `OP_READ`, `OP_WRITE`,
+      `OP_FLUSH`, und ein eigener Status **Bereich** fuer Sektoren jenseits der Platte.
+      Details in [done.md](done.md#a-61-das-dienstprotokoll-ueber-dem-treiber).
 
-      **Gemessen, beide Richtungen** (`virtio`-Zeile, x86-Suite):
+      **Gemessen:** `INFO Kapazitaet=2048 Sektorgroesse=512; READ(0)=0 WRITE(100)=0 FLUSH=0;
+      Rueckgelesen=0x454b414c344c4553; READ(jenseits der Platte)=3`.
 
-          Transport (vor VT-d):  Caps=1  Geraet-DMA=1 (64 Byte)
-          Sperre  (nach VT-d):   Caps=1  Geraet-DMA=0 (0 Byte)  VT-d-Faults 0 -> 1
+      Der Puffer des Treibers ist die **Ablage**: `READ` fuellt ihn, `WRITE` schreibt ihn zurueck.
+      Der Client nennt Sektoren, keine Adressen. Eine geteilte Uebertragungsflaeche kommt erst mit
+      A-6.2 dazu, wo es einen Abnehmer dafuer gibt — eine Schnittstelle vor ihrem ersten Benutzer
+      belegt nur eine Vermutung.
 
-      Der erste Teil steht **vor** dem VT-d-Aufbau und belegt den Transport in voller Länge:
-      Capability-Liste, Handshake, Feature-Aushandlung einschließlich
-      `VIRTIO_F_ACCESS_PLATFORM`, Virtqueue — und dass das Gerät wirklich Bytes per Bus-Master-DMA
-      liefert. Der zweite läuft nach dem Aufbau: dasselbe Gerät, keine Zuteilung, kommt am
-      Default-Block nicht mehr durch, und die Einheit protokolliert den Fault. Ein Test, der nur
-      den Erfolgsfall zeigt, könnte nicht sagen, ob die Sperre wirkt; einer, der nur die Sperre
-      zeigt, nicht, ob überhaupt etwas funktioniert hätte.
+- [x] **A-6.2 erledigt (2026-08-02): die Partitionstabelle.** `crates/sel4lake-part` —
+      GPT-Parser, `#![no_std]`, `forbid(unsafe_code)`, **keine Abhaengigkeiten**, **14 von 14**
+      Host-Tests. Gelesen wird sie im **Blockdienst**, nicht im Kern.
+      Details in [done.md](done.md#a-62-die-partitionstabelle--im-dienst-gelesen-nicht-im-kern).
 
-      QEMU-Detail, das eine Runde gekostet hat: `virtio-rng-pci` ist auf x86 per Vorgabe
-      *transitional*, und dort gibt es `iommu_platform` nicht (`VIRTIO_F_IOMMU_PLATFORM was
-      supported by neither legacy nor transitional device`). Es braucht `disable-legacy=on`.
+      **Gemessen:** `GPT-Scan Status=0 belegte Eintraege=2; erste Partition LBA 34 ueber 967
+      Sektoren`. Gegenprobe mit drei kaputten Tabellen: Signatur, Kopf-CRC, Eintrags-CRC — alle
+      drei abgewiesen, mit **unterscheidbaren** Gruenden (2, 5, 8).
 
-      **Zu tun für das eigentliche A-5.2:** virtio-net und virtio-blk. Beides braucht mehr als den
-      Transport (mehrere Queues, Anfrageformate) — und für nutzbaren DMA die VT-d-Zuteilung aus
-      B-3.3/B-3.4, die heute noch `None` liefert.
-- [ ] **A-5.3** Die Geräte-Zuteilung darf erst scharf werden, wenn **Interrupt Remapping** steht —
-      das liegt in Strang B (B-3). Bis dahin nur Geräte ohne DMA-Fähigkeit oder ohne
-      Tenant-Zugriff.
+      Die Testabbilder baut `tools/mkgpt.py` (beide Suiten, dasselbe Werkzeug) — selbst gebaut
+      statt `sgdisk` aufgerufen, weil eine Suite, die an einem Fremdwerkzeug haengt, auf einem
+      Rechner ohne dieses Werkzeug als „Test rot" ausfaellt statt als „Aufbau unvollstaendig".
+      Und nur ein eigenes Werkzeug kann den Negativfall herstellen (`--break`).
+
+      **Was NICHT gebaut wurde, und warum:** die geteilte Uebertragungsflaeche. Sie wird erst
+      gebraucht, wenn ein Client die Sektoren SELBST sehen soll — der Scan lief im Dienst, der die
+      Bytes ohnehin hat. Eine Schnittstelle vor ihrem ersten Benutzer belegt nur eine Vermutung.
+      Fuer A-6.3 kommt sie, und dann mit der offenen Frage: die DMA-Region des Treibers ist
+      non-coherent gemappt, eine gecachte Zweitabbildung derselben Seiten waere auf x86 ein
+      Attribut-Alias. Der saubere Weg ist eine **getrennte** Region und ein Kopierschritt im
+      Treiber — ein echter Treiber tut das ohnehin, wenn der Client-Puffer nicht DMA-faehig ist.
+
+- [x] **A-6.3 erledigt (2026-08-02): ein lesendes Dateisystem als eigene PD.**
+      `crates/sel4lake-fat` (FAT16, **16 von 16** Host-Tests) + `programs/trusted/fs`.
+      Details in [done.md](done.md#a-63-ein-lesendes-dateisystem-als-eigene-pd).
+
+      **Gemessen:** `fs : Status=0; Groesse=20 erste acht Byte=0x454b414c344c4553 Cluster=1` —
+      die Datei wurde nicht bloss gefunden, sondern **gelesen**, ueber GPT → FAT16 → Blockdienst →
+      Treiber, und kein Schritt davon liegt im Kern.
+
+      Die PD faehrt **kein Geraet**. Sie ruft den Blockdienst ueber dessen Kanal und liest die
+      Bytes aus der **geteilten Uebertragungsflaeche** — einer eigenen Region aus normalem RAM,
+      nicht der DMA-Region des Treibers: die ist non-coherent gemappt, und eine gecachte
+      Zweitabbildung derselben Seiten waere auf x86 ein Attribut-Alias. Der Treiber kopiert.
+
+      **Offen und benannt: die Domaene.** Die PD ist TrustedSAS, weil ein HardwareLand-Backend nur
+      Caps seines eigenen Kanals halten darf und sein Partner TrustedSas sein muss (ext-22). Ein
+      Dateisystem, das FREMDE Bytes liest, in einer vertrauenswuerdigen Domaene zu fuehren ist ein
+      Geruch. Der richtige Weg ist ein UserLand↔TrustedSas-Kanal darueber (ext-22 P6) — dann ist
+      diese PD der Server, und der Mandant sitzt untrusted darueber.
+
+- [x] **A-6.4 erledigt (2026-08-02): Schreiben.** Die Dateisystem-PD verlaengert eine Datei ueber
+      einen zweiten Cluster hinaus, schreibt die Kette in **alle** FAT-Kopien, flusht und liest
+      **jedes Byte** zurueck. Details in [done.md](done.md#a-64-schreiben--und-der-zweite-melder).
+
+      **Gemessen:** `Schreiben Status=0; Rueckgelesen Status=0 Groesse=700 geprueft=700 Byte`, und
+      unabhaengig davon am Abbild: `OK: HELLO.TXT, 700 Byte, 2 Cluster, 2 FAT-Kopien gleich`.
+
+      Der zweite Melder (`tools/checkfat.py`) hat sich sofort bezahlt gemacht: in der Gegenprobe,
+      in der die PD absichtlich nur EINE FAT-Kopie fortschreibt, meldet der Kernel weiterhin
+      `fs : ALL PASS` — die PD liest ueber Kopie 0 korrekt zurueck —, und **nur** der unabhaengige
+      Leser sieht, dass die Kopien auseinanderlaufen. Ein Schreiber, der sein eigenes Ergebnis
+      bestaetigt, bestaetigt nichts.
+
+      **Nicht dabei:** Anlegen und Loeschen von Dateien, Unterverzeichnisse, lange Namen, und die
+      Suche nach einem freien Cluster geht nur ueber den ERSTEN FAT-Sektor. Alles benannt, nichts
+      davon stillschweigend weggelassen.
+
+- [x] **A-5.3 erledigt (2026-08-02): das Manifest sagt, WELCHES Gerät — nicht die Fundreihenfolge.**
+      Details in [done.md](done.md#a-53-die-zuteilung-stand-im-enumerator-nicht-im-manifest).
+
+      Die Vorbedingung war erfüllt: Interrupt Remapping steht seit B-3.2 (aktiv, CFI abgeschaltet).
+
+      Der Manifest-Eintrag trägt jetzt einen **Geräte-Selektor** (`vendor`/`device`/`class`,
+      je einzeln „beliebig") in 8 der 12 reservierten Bytes — `ENTRY_LEN` bleibt 96, bestehende
+      signierte Manifeste bleiben gültig, und Nullen dort heißen ausdrücklich **„beliebig"** und
+      nicht „passt auf nichts". Der Selektor benennt eine **Art** von Gerät, nie eine Instanz: ein
+      Manifest mit `00:04.0` wäre auf der nächsten Maschine stillschweigend falsch.
+
+      **Fail-closed:** passt kein Gerät, gibt es keines. Der bequeme Rückfall („nichts passt → nimm
+      irgendeins") wäre genau die versteckte Politik, gegen die der Selektor antritt.
+
+      **Offen geblieben (klein, aber benannt):** der Kernel findet die *Kandidaten* weiterhin über
+      `hal::pcie::find(VIRTIO_VENDOR, …)`, weil die BAR-Bestimmung durch den virtio-Fähigkeitslauf
+      geht (`probe_transport`). Die **Auswahl** ist damit sauber im Manifest, das **Angebot** noch
+      nicht: ein Nicht-virtio-Gerät ließe sich heute gar nicht anbieten. Wer eine zweite
+      Gerätefamilie will, muss zuerst die BAR-Bestimmung von virtio lösen.
+
+- [x] **A-5.4 erledigt (2026-08-02): zwei Treiber-PDs, und das Gerät der einen erreicht die
+      DMA-Region der anderen nicht.** Details in
+      [done.md](done.md#a-54-teil-2-das-geraet-des-einen-treibers-erreicht-die-region-des-anderen-nicht).
+
+      **Teil 1** — `programs/hardware/virtio-net` ist der zweite Treiber, beide bekommen ihr im
+      Manifest **benanntes** Gerät (`devsel : ALL PASS`, je Eintrag geprüft), der Client benennt
+      seinen Dienst (`service_id`). Der Umbau legte **vier versteckte Politiken** frei — „die erste
+      benutzte Zuteilung", „der zuletzt geladene Dienst", eine geteilte Notification-Ablage und
+      eine geteilte Übertragungsfläche; alle vier laufen jetzt über die `program_id`, und wo eine
+      Wahl mehrdeutig wäre, wird **abgewiesen statt geraten**.
+
+      **Teil 2** — `dmaiso : ALL PASS`. Vier Zahlen, keine reicht allein: Positivkontrolle über
+      denselben Treiber und dieselbe Deskriptorkette (nur **eine** Adresse wandert), keine Daten
+      beim Fremdversuch, das Opfer **vom Kernel** nachgeprüft unberührt, und ein VT-d-Fault als
+      *aktiver* Beleg, dass geblockt wurde. Zwei Mutationen belegen die Zeile: der Angreifer auf
+      die eigene Region → FAILURES; kein Gegenüber → SKIP mit Begründung.
+
+      Zwei Fehler im eigenen Entwurf gefunden und behoben: `arp_probe` nullte nur **acht Byte** des
+      Empfangspuffers, also las die zweite Probe die Antwort der ersten; und `rx_used` (used-Ring)
+      gehörte nicht ins Kriterium — es sagt, dass das Gerät *gehandelt* hat, nicht dass Daten
+      ankamen.
 
 ---
 

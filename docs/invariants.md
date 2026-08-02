@@ -763,3 +763,35 @@ Der naheliegende Ausweg — die neue Instanz übernimmt den Streifen der alten �
 solange beide leben, teilten sie sich dann die Farben, und genau diese Überschneidung soll B-4.2
 verhindern. Ein Sonderfall „nur ganz kurz" wäre die stille Aufweichung, gegen die der ganze
 Abschnitt geschrieben ist.
+
+---
+
+## 14. Fehlerdomäne (B-6.2 / Z9)
+
+**Der Knoten ist die Fehlerdomäne.** Ein Fehler *im Kernel* kann jede PD auf diesem Knoten treffen;
+Ausfallsicherheit wird **über Knoten hinweg** gebaut. **Alle PDs im globalen SAS-Adressraum
+(`VSPACE_OF == 0`) bilden zusätzlich untereinander EINE Fehlerdomäne** — ihre Trennung ruht auf §12
+(intralinguale Sicherheit, Zertifikats-Gate §9), nicht auf der Hardware. Nur TrustedSAS-PDs dürfen
+dort laufen (`domain_audit` Code 3), und das ist der Grund für die gesetzte Regel „kein Kundencode
+in TrustedSAS" — nicht ihre Begründung im Nachhinein. **Die Zusicherung hängt am Adressraum, nicht
+am Domänen-Etikett:** `Domain::TrustedSas` darf global *oder* isoliert laufen, und extern geladene
+TrustedSAS-PDs bekommen heute eine eigene VSpace (`kernel/src/loader.rs:719–722`) — für die gilt
+die Hardwaretrennung wie für jede isolierte PD.
+
+**Eingegrenzt ist und bleibt der Fault einer isolierten PD** (EL0/Ring 3): er beendet genau ihren
+Thread, gibt IPC-Queues, Kernel-Stack, VSpace und Farbstreifen frei, und der Kernel läuft weiter
+(`kernel/src/system.rs:605–637`; geprüft als `ring3`/`el0iso`/`iso`/`vspace`).
+
+**Gemessen am 2026-08-02, und die bisherige Notiz stand verkehrt:** ein Kernel-Panic reißt den
+Knoten **nicht zuverlässig** mit — er wird in den häufigsten Fällen *verschluckt*. `panic.rs` ruft
+ein `halt()`, das die Interrupts **nicht maskiert** (`kernel/src/arch/x86_64/mod.rs:294`
+`loop { hlt }` ohne `cli`; aarch64 `loop { wfe }` mit unverändertem DAIF), und der nächste
+Timer-Tick holt den Kern in den Scheduler zurück. Vier verschiedene Ausgänge für dieselbe Ursache,
+je nachdem *wo* der Panic auftrat — Belege, Zahlen und die Liste der ungeprüften Fälle in
+[docs/fehlerdomaene.md](fehlerdomaene.md).
+
+**Für diesen Abschnitt heißt das:** die Sperrordnung aus §1 sichert Verklemmungsfreiheit im
+**fehlerfreien** Betrieb. Sie sagt nichts über einen Kern, der *mitten in* einem kritischen
+Abschnitt stehenbleibt. Der Ticket-Lock (`crates/sel4lake-sync`) hat keine Schranke; ein Panic
+unter `MEM` oder `CAPS` friert damit alle Kerne ein, ohne eine weitere Zeile auszugeben — gemessen.
+Wer §1 erweitert, erweitert damit **nicht** die Fehlerdomäne.

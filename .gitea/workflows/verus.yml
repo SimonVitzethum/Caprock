@@ -11,9 +11,14 @@
 name: verus-verification
 on: [push, pull_request]
 
+# **Der Pin nennt den Beweiser, aus dem die Zahlen stammen.** Bis 2026-08-03 stand hier
+# 0.2026.06.20.911e4e7, waehrend lokal 0.2026.07.27.31579f0 lief — zwei verschiedene Beweiser fuer
+# dieselbe Aussage, und keine Stelle, an der das aufgefallen waere. Beide Fassungen sind mit dem
+# heutigen Stand nachgemessen (je 18 verified, 0 errors fuer cap_space.rs); der Pin steht auf der,
+# gegen die entwickelt wird.
 env:
-  VERUS_RELEASE: "0.2026.06.20.911e4e7"
-  VERUS_TOOLCHAIN: "1.96.0"
+  VERUS_RELEASE: "0.2026.07.27.31579f0"
+  VERUS_TOOLCHAIN: "1.97.1"
 
 jobs:
   verus:
@@ -49,5 +54,12 @@ jobs:
           fi
           "$HOME/.verus/verus" --version
 
-      - name: Verus-Beweise ausführen (alle verus/*.rs)
+      # **Erst nachweisen, dass dieses Gate fehlschlagen KANN.** Der Selbsttest schiebt eine
+      # nachweislich falsche Beweisdatei unter — an einer Stelle, die die frueheren zwei Globs
+      # nicht getroffen haetten — und verlangt, dass der Lauf daran scheitert. Ohne diesen Schritt
+      # ist ein gruenes Gate nicht von einem leeren zu unterscheiden.
+      - name: Gate-Selbsttest (kann es ueberhaupt fehlschlagen?)
+        run: VERUS="$HOME/.verus/verus" bash tools/verus-verify.sh --selftest
+
+      - name: Verus-Beweise ausführen (alle Dateien mit verus!-Block) + Modell-Treue
         run: VERUS="$HOME/.verus/verus" bash tools/verus-verify.sh

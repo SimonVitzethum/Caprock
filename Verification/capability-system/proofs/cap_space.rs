@@ -316,22 +316,468 @@ pub proof fn mint(cs: CapSpace, src: nat) -> (cs2: CapSpace)
 
 
 // ============================ Operation: delete (Leaf) ============================
+//
+// **Modell-Treue (Schritt C2b).** Die vier Schreibzugriffe unten spiegeln `CapSpace::unlink` +
+// `CapSpace::release_slot` in `crates/sel4lake-cap/src/space.rs` Schritt fuer Schritt: gleiche
+// Verzweigung, gleiche Reihenfolge, gleiche Feldzuweisung.
+//
+//     let mdb = self.slots[slot].mdb;                                   // `inode` unten
+//     match mdb.prev_sibling {
+//         Some(p) => self.slots[p].mdb.next_sibling = mdb.next_sibling,      // unlink1, Zweig 1
+//         None => {
+//             if let Some(par) = mdb.parent {
+//                 self.slots[par].mdb.first_child = mdb.next_sibling;        // unlink1, Zweig 2
+//             }
+//         }
+//     }
+//     if let Some(n) = mdb.next_sibling {
+//         self.slots[n].mdb.prev_sibling = mdb.prev_sibling;                 // unlink2
+//     }
+//     self.slots[slot].mdb = Mdb::EMPTY;                                     // unlink_slots
+//     // ... release_slot(slot): self.slots[slot] = CapSlot::EMPTY (used=false)
+//
+// `tools/verus-modelltreue.sh` haelt diese Entsprechung fest und schlaegt an, wenn eine der
+// beiden Seiten sich ohne die andere aendert.
+//
+// **Eine Stelle, an der der Code mehr tut als die Invariante verlangt** (Befund, kein Fehler):
+// Zweig 2 schreibt `first_child[par] = next` sobald `prev is None && parent is Some` -- OHNE zu
+// pruefen, ob `first_child[par]` ueberhaupt `Some(i)` war. Unter `cap_inv` ALLEIN folgt das nicht
+// (Klausel 6 sagt nur die Gegenrichtung); erst die Reachability-Klausel 4r macht beides gleich.
+// `cap_inv` bleibt trotzdem erhalten -- der Beweis unten fuehrt genau diesen Fall mit.
 
-/// **BEWEIS:** `delete` (eine **Blatt**-Capability `i` löschen — keine Kinder: Geschwister umhängen,
-/// ggf. `first_child` des Elternknotens nachziehen, `refcount--`, Objekt bei 0 freigeben)
+/// Der geloeschte Slot: `CapSlot::EMPTY` + `Mdb::EMPTY` (`rank` ist Ghost, also 0).
+pub open spec fn dead_slot() -> Slot {
+    Slot { used: false, object: 0, parent: None, first_child: None, next: None, prev: None, rank: 0 }
+}
+
+/// `unlink`, Schritt 1: `match prev { Some(p) => next[p] = next[i], None => first_child[par] = next[i] }`.
+pub open spec fn unlink1(slots: Seq<Slot>, i: nat) -> Seq<Slot> {
+    let nd = slots[i as int];
+    if nd.prev is Some {
+        let pv = nd.prev->Some_0;
+        slots.update(pv as int, Slot { next: nd.next, ..slots[pv as int] })
+    } else if nd.parent is Some {
+        let par = nd.parent->Some_0;
+        slots.update(par as int, Slot { first_child: nd.next, ..slots[par as int] })
+    } else {
+        slots
+    }
+}
+
+/// `unlink`, Schritt 2: `if let Some(n) = next { prev[n] = prev[i] }` — auf dem Stand NACH Schritt 1.
+pub open spec fn unlink2(slots: Seq<Slot>, i: nat) -> Seq<Slot> {
+    let nd = slots[i as int];
+    let s1 = unlink1(slots, i);
+    if nd.next is Some {
+        let nx = nd.next->Some_0;
+        s1.update(nx as int, Slot { prev: nd.prev, ..s1[nx as int] })
+    } else {
+        s1
+    }
+}
+
+/// `unlink`, Schritt 3 (+ `release_slot`): der Slot selbst wird geleert — **zuletzt**, wie im Code.
+pub open spec fn unlink_slots(slots: Seq<Slot>, i: nat) -> Seq<Slot> {
+    unlink2(slots, i).update(i as int, dead_slot())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rahmen-Lemma: WAS die drei Schreibzugriffe NICHT anfassen.
+// ---------------------------------------------------------------------------------------------
+
+/// **BEWEIS:** `unlink` aendert ausschliesslich `next`/`prev`/`first_child` — und den Slot `i`
+/// selbst. Fuer jeden anderen Slot bleiben `used`, `object`, `parent` und `rank` **unveraendert**.
+/// Das ist die zweite Haelfte der Erreichbarkeitsaussage (s. [`unreachable_after_delete`]): ein
+/// Eingriff, der sauber aushaengt und dabei ein fremdes Kind umhaengt, faellt hier durch.
+pub proof fn lemma_unlink_frame(cs: CapSpace, i: nat)
+    requires
+        cap_inv(cs),
+        slot_live(cs, i),
+    ensures
+        unlink_slots(cs.slots, i).len() == cs.slots.len(),
+        unlink1(cs.slots, i).len() == cs.slots.len(),
+        unlink2(cs.slots, i).len() == cs.slots.len(),
+        unlink_slots(cs.slots, i)[i as int] == dead_slot(),
+        forall|s: int| #![trigger unlink_slots(cs.slots, i)[s]]
+            0 <= s < cs.slots.len() && s != (i as int) ==> {
+                &&& unlink_slots(cs.slots, i)[s].used == cs.slots[s].used
+                &&& unlink_slots(cs.slots, i)[s].object == cs.slots[s].object
+                &&& unlink_slots(cs.slots, i)[s].parent == cs.slots[s].parent
+                &&& unlink_slots(cs.slots, i)[s].rank == cs.slots[s].rank
+            },
+{
+    let nd = cs.slots[i as int];
+    // Die drei Schreibziele liegen in der Tabelle — aus cap_inv, nicht angenommen.
+    assert(nd.prev is Some ==> slot_live(cs, nd.prev->Some_0));
+    assert(nd.next is Some ==> slot_live(cs, nd.next->Some_0));
+    assert(nd.parent is Some ==> slot_live(cs, nd.parent->Some_0));
+}
+
+/// **BEWEIS:** die Blatt-Eigenschaft ist **keine zusaetzliche Annahme** — sie folgt aus
+/// `no_children` + Klausel 6. (Deshalb faellt der Beweis nicht, wenn man die Vorbedingung
+/// `first_child is None` streicht; s. Bericht zur Mutationsmessung.)
+pub proof fn lemma_leaf_from_no_children(cs: CapSpace, i: nat)
+    requires
+        cap_inv(cs),
+        slot_live(cs, i),
+        forall|s: nat| slot_live(cs, s) ==> cs.slots[s as int].parent != Some(i),
+    ensures
+        cs.slots[i as int].first_child is None,
+{
+    if cs.slots[i as int].first_child is Some {
+        let c = cs.slots[i as int].first_child->Some_0;
+        assert(slot_live(cs, c) && cs.slots[c as int].parent == Some(i));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Refcount: nur der geleerte Slot faellt weg.
+// ---------------------------------------------------------------------------------------------
+
+/// **BEWEIS:** die drei Verkettungs-Schreibzugriffe lassen `refs_to` unberuehrt (sie aendern weder
+/// `used` noch `object`); allein `i -> dead_slot()` senkt den Zaehler um `contrib(slots[i], x)`.
+pub proof fn lemma_unlink_refs(cs: CapSpace, i: nat, x: nat)
+    requires
+        cap_inv(cs),
+        slot_live(cs, i),
+    ensures
+        refs_to(unlink_slots(cs.slots, i), x) + contrib(cs.slots[i as int], x) == refs_to(cs.slots, x),
+{
+    let nd = cs.slots[i as int];
+    let s1 = unlink1(cs.slots, i);
+    let s2 = unlink2(cs.slots, i);
+    lemma_unlink_frame(cs, i);
+
+    if nd.prev is Some {
+        let pv = nd.prev->Some_0;
+        assert(slot_live(cs, pv));
+        lemma_refs_update(cs.slots, pv as int, Slot { next: nd.next, ..cs.slots[pv as int] }, x);
+    } else if nd.parent is Some {
+        let par = nd.parent->Some_0;
+        assert(slot_live(cs, par));
+        lemma_refs_update(cs.slots, par as int, Slot { first_child: nd.next, ..cs.slots[par as int] }, x);
+    }
+    assert(refs_to(s1, x) == refs_to(cs.slots, x));
+    assert(s1[i as int].used == nd.used && s1[i as int].object == nd.object);
+
+    if nd.next is Some {
+        let nx = nd.next->Some_0;
+        assert(slot_live(cs, nx));
+        lemma_refs_update(s1, nx as int, Slot { prev: nd.prev, ..s1[nx as int] }, x);
+    }
+    assert(refs_to(s2, x) == refs_to(cs.slots, x));
+    assert(s2[i as int].used == nd.used && s2[i as int].object == nd.object);
+
+    lemma_refs_update(s2, i as int, dead_slot(), x);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Die CDT-Klauseln, je eine eigene SMT-Query.
+// ---------------------------------------------------------------------------------------------
+
+/// **BEWEIS (4l + 7):** `parent` bleibt fuer jeden ueberlebenden Slot unveraendert, das Ziel ist
+/// **nicht** der geloeschte Slot (`no_children`), und Objekt/Rang der Elternbeziehung stehen still.
+pub proof fn lemma_del_parent(cs: CapSpace, cs2: CapSpace, i: nat)
+    requires
+        cap_inv(cs),
+        slot_live(cs, i),
+        forall|s: nat| slot_live(cs, s) ==> cs.slots[s as int].parent != Some(i),
+        cs2.slots == unlink_slots(cs.slots, i),
+    ensures
+        forall|s: nat| #![trigger cs2.slots[s as int]]
+            slot_live(cs2, s) && cs2.slots[s as int].parent is Some ==> {
+                &&& slot_live(cs2, cs2.slots[s as int].parent->Some_0)
+                &&& cs2.slots[cs2.slots[s as int].parent->Some_0 as int].object == cs2.slots[s as int].object
+                &&& cs2.slots[cs2.slots[s as int].parent->Some_0 as int].rank < cs2.slots[s as int].rank
+            },
+{
+    lemma_unlink_frame(cs, i);
+    assert forall|s: nat| slot_live(cs2, s) && cs2.slots[s as int].parent is Some implies {
+        &&& slot_live(cs2, cs2.slots[s as int].parent->Some_0)
+        &&& cs2.slots[cs2.slots[s as int].parent->Some_0 as int].object == cs2.slots[s as int].object
+        &&& cs2.slots[cs2.slots[s as int].parent->Some_0 as int].rank < cs2.slots[s as int].rank
+    } by {
+        // Der geloeschte Slot ist tot -> s ist ein anderer, und er lebte schon vorher.
+        assert(cs2.slots[i as int] == dead_slot());
+        assert((s as int) != (i as int));
+        assert(slot_live(cs, s));
+        assert(cs2.slots[s as int].parent == cs.slots[s as int].parent);
+        let p = cs.slots[s as int].parent->Some_0;
+        assert(slot_live(cs, p));                            // Klausel 4l an s
+        assert(cs.slots[s as int].parent != Some(i));        // no_children
+        assert((p as int) != (i as int));
+        assert(cs2.slots[p as int].used == cs.slots[p as int].used);
+    }
+}
+
+/// **BEWEIS (5 + 4-sib):** `next` zeigt weiter auf einen lebenden Slot, dessen `prev` zurueckzeigt
+/// und dessen `parent` derselbe ist. Zwei Faelle: `s` ist der Vorgaenger des geloeschten Slots
+/// (dann erbt `s` dessen `next`), oder `s` ist unbeteiligt.
+pub proof fn lemma_del_next(cs: CapSpace, cs2: CapSpace, i: nat)
+    requires
+        cap_inv(cs),
+        slot_live(cs, i),
+        cs2.slots == unlink_slots(cs.slots, i),
+    ensures
+        forall|s: nat| #![trigger cs2.slots[s as int]]
+            slot_live(cs2, s) && cs2.slots[s as int].next is Some ==> {
+                &&& slot_live(cs2, cs2.slots[s as int].next->Some_0)
+                &&& cs2.slots[cs2.slots[s as int].next->Some_0 as int].prev == Some(s)
+                &&& cs2.slots[cs2.slots[s as int].next->Some_0 as int].parent == cs2.slots[s as int].parent
+            },
+{
+    let nd = cs.slots[i as int];
+    let s1 = unlink1(cs.slots, i);
+    let s2 = unlink2(cs.slots, i);
+    lemma_unlink_frame(cs, i);
+
+    assert forall|s: nat| slot_live(cs2, s) && cs2.slots[s as int].next is Some implies {
+        &&& slot_live(cs2, cs2.slots[s as int].next->Some_0)
+        &&& cs2.slots[cs2.slots[s as int].next->Some_0 as int].prev == Some(s)
+        &&& cs2.slots[cs2.slots[s as int].next->Some_0 as int].parent == cs2.slots[s as int].parent
+    } by {
+        assert(cs2.slots[i as int] == dead_slot());
+        assert((s as int) != (i as int));
+        assert(slot_live(cs, s));
+        // Schritt 2 schreibt nur `prev`, Schritt 3 nur den Slot i -> `next` stammt aus Schritt 1.
+        assert(cs2.slots[s as int].next == s1[s as int].next);
+        let n = cs2.slots[s as int].next->Some_0;
+        if nd.prev == Some(s) {
+            // s ist der Vorgaenger von i und erbt dessen next.
+            assert(s1[s as int].next == nd.next);
+            assert(slot_live(cs, n) && cs.slots[n as int].prev == Some(i)
+                && cs.slots[n as int].parent == nd.parent);      // Klausel 5/4-sib an i
+            // n == i waere ein Selbst-Geschwister: dann prev[i]==Some(i), also s==i.
+            assert((n as int) != (i as int));
+            // n ist genau das nx aus Schritt 2 -> prev[n] wurde auf prev[i] == Some(s) gesetzt.
+            assert(s2[n as int].prev == nd.prev);
+            // parent: cs.slots[s].next == Some(i) -> Klausel 4-sib an s -> parent[i] == parent[s].
+            assert(cs.slots[s as int].next == Some(i));
+            assert(cs.slots[i as int].parent == cs.slots[s as int].parent);
+        } else {
+            // s ist unbeteiligt: sein next steht noch da, wo es stand.
+            assert(s1[s as int].next == cs.slots[s as int].next);
+            assert(slot_live(cs, n) && cs.slots[n as int].prev == Some(s)
+                && cs.slots[n as int].parent == cs.slots[s as int].parent);   // Klausel 5/4-sib an s
+            // n == i haette prev[i] == Some(s) verlangt — das ist gerade der andere Fall.
+            assert((n as int) != (i as int));
+            // nd.next == Some(n) haette prev[n] == Some(i) verlangt, aber prev[n] == Some(s), s != i.
+            assert(nd.next != Some(n));
+            assert(s2[n as int].prev == s1[n as int].prev);
+            assert(s1[n as int].prev == cs.slots[n as int].prev);
+        }
+    }
+}
+
+/// **BEWEIS (5):** `prev` zeigt weiter auf einen lebenden Slot, dessen `next` zurueckzeigt.
+pub proof fn lemma_del_prev(cs: CapSpace, cs2: CapSpace, i: nat)
+    requires
+        cap_inv(cs),
+        slot_live(cs, i),
+        cs2.slots == unlink_slots(cs.slots, i),
+    ensures
+        forall|s: nat| #![trigger cs2.slots[s as int]]
+            slot_live(cs2, s) && cs2.slots[s as int].prev is Some ==> {
+                &&& slot_live(cs2, cs2.slots[s as int].prev->Some_0)
+                &&& cs2.slots[cs2.slots[s as int].prev->Some_0 as int].next == Some(s)
+            },
+{
+    let nd = cs.slots[i as int];
+    let s1 = unlink1(cs.slots, i);
+    let s2 = unlink2(cs.slots, i);
+    lemma_unlink_frame(cs, i);
+
+    assert forall|s: nat| slot_live(cs2, s) && cs2.slots[s as int].prev is Some implies {
+        &&& slot_live(cs2, cs2.slots[s as int].prev->Some_0)
+        &&& cs2.slots[cs2.slots[s as int].prev->Some_0 as int].next == Some(s)
+    } by {
+        assert(cs2.slots[i as int] == dead_slot());
+        assert((s as int) != (i as int));
+        assert(slot_live(cs, s));
+        assert(cs2.slots[s as int].prev == s2[s as int].prev);
+        let pp = cs2.slots[s as int].prev->Some_0;
+        if nd.next == Some(s) {
+            // s ist der Nachfolger von i und erbt dessen prev.
+            assert(s2[s as int].prev == nd.prev);
+            assert(slot_live(cs, pp) && cs.slots[pp as int].next == Some(i));   // Klausel 5 an i
+            assert((pp as int) != (i as int));
+            // pp ist genau das pv aus Schritt 1 -> next[pp] wurde auf next[i] == Some(s) gesetzt.
+            assert(s1[pp as int].next == nd.next);
+            assert(s2[pp as int].next == s1[pp as int].next);
+        } else {
+            assert(s2[s as int].prev == s1[s as int].prev);
+            assert(s1[s as int].prev == cs.slots[s as int].prev);
+            assert(slot_live(cs, pp) && cs.slots[pp as int].next == Some(s));   // Klausel 5 an s
+            assert((pp as int) != (i as int));
+            // nd.prev == Some(pp) haette next[pp] == Some(i) verlangt, aber next[pp] == Some(s).
+            assert(nd.prev != Some(pp));
+            assert(s1[pp as int].next == cs.slots[pp as int].next);
+            assert(s2[pp as int].next == s1[pp as int].next);
+        }
+    }
+}
+
+/// **BEWEIS (6):** `first_child` bleibt Listenkopf — auch beim Elternknoten, dessen Kopf gerade
+/// nachgezogen wurde.
+pub proof fn lemma_del_first_child(cs: CapSpace, cs2: CapSpace, i: nat)
+    requires
+        cap_inv(cs),
+        slot_live(cs, i),
+        cs2.slots == unlink_slots(cs.slots, i),
+    ensures
+        forall|s: nat| #![trigger cs2.slots[s as int]]
+            slot_live(cs2, s) && cs2.slots[s as int].first_child is Some ==> {
+                &&& slot_live(cs2, cs2.slots[s as int].first_child->Some_0)
+                &&& cs2.slots[cs2.slots[s as int].first_child->Some_0 as int].parent == Some(s)
+                &&& cs2.slots[cs2.slots[s as int].first_child->Some_0 as int].prev is None
+            },
+{
+    let nd = cs.slots[i as int];
+    let s1 = unlink1(cs.slots, i);
+    let s2 = unlink2(cs.slots, i);
+    lemma_unlink_frame(cs, i);
+
+    assert forall|s: nat| slot_live(cs2, s) && cs2.slots[s as int].first_child is Some implies {
+        &&& slot_live(cs2, cs2.slots[s as int].first_child->Some_0)
+        &&& cs2.slots[cs2.slots[s as int].first_child->Some_0 as int].parent == Some(s)
+        &&& cs2.slots[cs2.slots[s as int].first_child->Some_0 as int].prev is None
+    } by {
+        assert(cs2.slots[i as int] == dead_slot());
+        assert((s as int) != (i as int));
+        assert(slot_live(cs, s));
+        assert(cs2.slots[s as int].first_child == s1[s as int].first_child);
+        let c = cs2.slots[s as int].first_child->Some_0;
+        if nd.prev is None && nd.parent == Some(s) {
+            // s ist der Elternknoten, dessen Kopf nachgezogen wurde: neuer Kopf ist next[i].
+            assert(s1[s as int].first_child == nd.next);
+            assert(slot_live(cs, c) && cs.slots[c as int].prev == Some(i)
+                && cs.slots[c as int].parent == nd.parent);      // Klausel 5/4-sib an i
+            assert((c as int) != (i as int));
+            // c ist genau das nx aus Schritt 2 -> prev[c] wurde auf prev[i] == None gesetzt.
+            assert(s2[c as int].prev == nd.prev);
+        } else {
+            assert(s1[s as int].first_child == cs.slots[s as int].first_child);
+            assert(slot_live(cs, c) && cs.slots[c as int].parent == Some(s)
+                && cs.slots[c as int].prev is None);             // Klausel 6 an s
+            // c == i haette prev[i] is None und parent[i] == Some(s) verlangt — der andere Fall.
+            assert((c as int) != (i as int));
+            // nd.next == Some(c) haette prev[c] == Some(i) verlangt, aber prev[c] is None.
+            assert(nd.next != Some(c));
+            assert(s2[c as int].prev == s1[c as int].prev);
+            assert(s1[c as int].prev == cs.slots[c as int].prev);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Kinderlisten-Erreichbarkeit: der geloeschte Slot ist von nirgends mehr zu erreichen —
+// und KEIN fremdes Kind ist dabei umgehaengt worden.
+// ---------------------------------------------------------------------------------------------
+
+/// **SATZ (Erreichbarkeit nach dem Loeschen).** Nach `delete(i)` gilt beides zugleich:
+///
+/// 1. **kein lebender Slot zeigt noch auf `i`** — ueber **keine** der vier Kanten
+///    (`parent`, `next`, `prev`, `first_child`), und `i` selbst ist tot;
+/// 2. **der Elternknoten jedes anderen Slots ist unveraendert.**
+///
+/// Ohne (2) waere (1) wertlos: ein Eingriff, der sauber aushaengt und nebenbei ein fremdes Kind
+/// umhaengt, erfuellte (1) und waere trotzdem falsch. Deshalb steht (2) hier und nicht daneben.
+pub proof fn unreachable_after_delete(cs: CapSpace, cs2: CapSpace, i: nat)
+    requires
+        cap_inv(cs),
+        slot_live(cs, i),
+        forall|s: nat| slot_live(cs, s) ==> cs.slots[s as int].parent != Some(i),
+        cs2.slots == unlink_slots(cs.slots, i),
+    ensures
+        // (1a) der geloeschte Slot ist tot.
+        !cs2.slots[i as int].used,
+        // (1b) keine Kante eines lebenden Slots trifft ihn noch.
+        forall|s: nat| #![trigger cs2.slots[s as int]]
+            slot_live(cs2, s) ==> {
+                &&& cs2.slots[s as int].parent != Some(i)
+                &&& cs2.slots[s as int].next != Some(i)
+                &&& cs2.slots[s as int].prev != Some(i)
+                &&& cs2.slots[s as int].first_child != Some(i)
+            },
+        // (2) und der Elter aller uebrigen Slots steht still.
+        forall|s: int| #![trigger cs2.slots[s]]
+            0 <= s < cs.slots.len() && s != (i as int) ==> cs2.slots[s].parent == cs.slots[s].parent,
+{
+    let nd = cs.slots[i as int];
+    let s1 = unlink1(cs.slots, i);
+    let s2 = unlink2(cs.slots, i);
+    lemma_unlink_frame(cs, i);
+
+    assert forall|s: nat| slot_live(cs2, s) implies {
+        &&& cs2.slots[s as int].parent != Some(i)
+        &&& cs2.slots[s as int].next != Some(i)
+        &&& cs2.slots[s as int].prev != Some(i)
+        &&& cs2.slots[s as int].first_child != Some(i)
+    } by {
+        assert(cs2.slots[i as int] == dead_slot());
+        assert((s as int) != (i as int));
+        assert(slot_live(cs, s));
+        // parent: unveraendert (Rahmen) + no_children.
+        assert(cs2.slots[s as int].parent == cs.slots[s as int].parent);
+        // next: stammt aus Schritt 1.
+        assert(cs2.slots[s as int].next == s1[s as int].next);
+        if nd.prev == Some(s) {
+            // s erbt next[i]; waere das Some(i), so prev[i] == Some(i) (Klausel 5 an i) und s == i.
+            assert(s1[s as int].next == nd.next);
+            assert(nd.next == Some(i) ==> cs.slots[i as int].prev == Some(i));
+        } else {
+            // next[s] unveraendert; waere es Some(i), so prev[i] == Some(s) (Klausel 5 an s).
+            assert(s1[s as int].next == cs.slots[s as int].next);
+            assert(cs.slots[s as int].next == Some(i) ==> cs.slots[i as int].prev == Some(s));
+        }
+        // prev: stammt aus Schritt 2.
+        assert(cs2.slots[s as int].prev == s2[s as int].prev);
+        if nd.next == Some(s) {
+            assert(s2[s as int].prev == nd.prev);
+            assert(nd.prev == Some(i) ==> cs.slots[i as int].next == Some(i));
+        } else {
+            assert(s2[s as int].prev == s1[s as int].prev);
+            assert(s1[s as int].prev == cs.slots[s as int].prev);
+            assert(cs.slots[s as int].prev == Some(i) ==> cs.slots[i as int].next == Some(s));
+        }
+        // first_child: stammt aus Schritt 1.
+        assert(cs2.slots[s as int].first_child == s1[s as int].first_child);
+        if nd.prev is None && nd.parent == Some(s) {
+            assert(s1[s as int].first_child == nd.next);
+            assert(nd.next == Some(i) ==> cs.slots[i as int].prev == Some(i));
+        } else {
+            assert(s1[s as int].first_child == cs.slots[s as int].first_child);
+            // waere first_child[s] == Some(i), so parent[i] == Some(s) und prev[i] is None
+            // (Klausel 6 an s) — das ist gerade der andere Fall.
+            assert(cs.slots[s as int].first_child == Some(i)
+                ==> cs.slots[i as int].parent == Some(s) && cs.slots[i as int].prev is None);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Die Operation selbst.
+// ---------------------------------------------------------------------------------------------
+
+/// **BEWEIS:** `delete` (eine **Blatt**-Capability `i` löschen — Geschwister umhängen, ggf.
+/// `first_child` des Elternknotens nachziehen, Slot leeren, `refcount--`, Objekt bei 0 freigeben)
 /// **erhaelt die VOLLE Invariante** `cap_inv`.
 ///
 /// **Dekomposition (s. README §10):** der Beweis setzt `no_children` voraus — dass **kein** belegter
 /// Slot `i` als Elternknoten hat. Diese Tatsache **folgt aus der vollen Reachability-Invariante**
-/// (Code 4r: ein Kind ist von `parent.first_child` aus erreichbar; ein Blatt mit `first_child==None`
-/// hat daher keine Kinder). Sie hier als Vorbedingung zu fuehren **trennt** „delete erhaelt cap_inv
-/// **gegeben** Reachability" sauber vom (schwierigeren) Nachweis der Reachability selbst. Die
-/// strukturelle Erhaltung ist je CDT-Klausel einzeln gefuehrt (kleinere SMT-Queries).
-#[verifier::rlimit(50)]
+/// (Code 4r). Sie hier als Vorbedingung zu fuehren **trennt** „delete erhaelt cap_inv **gegeben**
+/// Reachability" sauber vom (schwierigeren) Nachweis der Reachability selbst.
+///
+/// Die strukturelle Erhaltung liegt in **eigenen Lemmas** (`lemma_del_parent`/`_next`/`_prev`/
+/// `_first_child`) statt in diesem Rumpf: eine Klausel je SMT-Query. In EINER Query gerechnet
+/// lief dieser Beweis in die rlimit-Wand — nicht weil eine Klausel schwer waere, sondern weil
+/// alle vier zusammen mit der Refcount-Rechnung in einem Kontext standen.
 pub proof fn delete(cs: CapSpace, i: nat) -> (cs2: CapSpace)
     requires
         cap_inv(cs),
         slot_live(cs, i),
+        // Blatt-Eigenschaft. Redundant (s. `lemma_leaf_from_no_children`), aber sie ist das,
+        // was der Code an dieser Stelle geprueft hat — deshalb steht sie hier.
         cs.slots[i as int].first_child is None,
         // no_children: aus der Reachability-Invariante (Code 4r) + Blatt-Eigenschaft.
         forall|s: nat| slot_live(cs, s) ==> cs.slots[s as int].parent != Some(i),
@@ -346,58 +792,23 @@ pub proof fn delete(cs: CapSpace, i: nat) -> (cs2: CapSpace)
     assert(oldrc >= 1);
     let newrc: nat = (oldrc - 1) as nat;
 
-    let dead = Slot { used: false, object: 0, parent: None, first_child: None, next: None, prev: None, rank: 0 };
-    let sA = cs.slots.update(i as int, dead);
-    let sB = if inode.prev is Some {
-        let pv = inode.prev->Some_0;
-        sA.update(pv as int, Slot { next: inode.next, ..sA[pv as int] })
-    } else { sA };
-    let sC = if inode.next is Some {
-        let nx = inode.next->Some_0;
-        sB.update(nx as int, Slot { prev: inode.prev, ..sB[nx as int] })
-    } else { sB };
-    let sD = if inode.parent is Some && cs.slots[inode.parent->Some_0 as int].first_child == Some(i) {
-        let p = inode.parent->Some_0;
-        sC.update(p as int, Slot { first_child: inode.next, ..sC[p as int] })
-    } else { sC };
+    let sD = unlink_slots(cs.slots, i);
     let objs2 = cs.objects.update(o as int, Object { used: newrc > 0, refcount: newrc });
     let cs2 = CapSpace { objects: objs2, slots: sD };
 
-    // --- Erhaltungs-Hilfsfakt: delete aendert NUR next/prev/first_child (+ used von i). Fuer s != i
-    //     bleiben parent/object/rank/used unveraendert. (Kern fuer die strukturellen Klauseln.)
-    assert forall|s: int| 0 <= s < sD.len() && s != i
-        implies #[trigger] sD[s].parent == cs.slots[s].parent
-            && sD[s].object == cs.slots[s].object
-            && sD[s].rank == cs.slots[s].rank
-            && sD[s].used == cs.slots[s].used by {}
+    lemma_unlink_frame(cs, i);
+    assert(sD[i as int] == dead_slot());
 
-    // --- refs_to: nur i->dead senkt o um 1; die Folge-Updates aendern nur CDT-Links (used/object gleich).
+    // --- refs_to: nur der geleerte Slot faellt weg.
     assert forall|x: nat| #![trigger refs_to(sD, x)]
-        refs_to(sD, x) == refs_to(cs.slots, x) + contrib(dead, x) - contrib(inode, x) by {
-        lemma_refs_update(cs.slots, i as int, dead, x);
-        if inode.prev is Some {
-            let pv = inode.prev->Some_0;
-            lemma_refs_update(sA, pv as int, Slot { next: inode.next, ..sA[pv as int] }, x);
-        }
-        if inode.next is Some {
-            let nx = inode.next->Some_0;
-            lemma_refs_update(sB, nx as int, Slot { prev: inode.prev, ..sB[nx as int] }, x);
-        }
-        if inode.parent is Some && cs.slots[inode.parent->Some_0 as int].first_child == Some(i) {
-            let p = inode.parent->Some_0;
-            lemma_refs_update(sC, p as int, Slot { first_child: inode.next, ..sC[p as int] }, x);
-        }
-    }
-
-    // --- Schluesselfakten ---
-    if inode.next is Some {
-        let nx = inode.next->Some_0;
-        assert(slot_live(cs, nx) && cs.slots[nx as int].prev == Some(i) && cs.slots[nx as int].parent == inode.parent);
+        refs_to(sD, x) + contrib(inode, x) == refs_to(cs.slots, x) by {
+        lemma_unlink_refs(cs, i, x);
     }
 
     // --- (1) Slot-Validitaet ---
     assert forall|s: int| 0 <= s < sD.len() && #[trigger] sD[s].used
         implies sD[s].object < objs2.len() && objs2[sD[s].object as int].used by {
+        assert(s != (i as int));
         assert(sD[s].object == cs.slots[s].object);
         if sD[s].object == o { lemma_refs_member(sD, s, o); }
     }
@@ -406,25 +817,13 @@ pub proof fn delete(cs: CapSpace, i: nat) -> (cs2: CapSpace)
         implies #[trigger] objs2[x].refcount == refs_to(sD, x as nat) && (objs2[x].used <==> objs2[x].refcount > 0) by {
         if x != o { assert(objs2[x] == cs.objects[x]); }
     }
-    // --- (4l+7) parent: unveraendert; Ziel != i (no_children) -> belegt; object/rank unveraendert ---
-    assert forall|s: nat| slot_live(cs2, s) && cs2.slots[s as int].parent is Some
-        implies slot_live(cs2, cs2.slots[s as int].parent->Some_0)
-            && cs2.slots[cs2.slots[s as int].parent->Some_0 as int].object == cs2.slots[s as int].object
-            && cs2.slots[cs2.slots[s as int].parent->Some_0 as int].rank < cs2.slots[s as int].rank by {}
-    // --- (5+4-sib) next: Sibling-Inverse + geteilter Elternknoten ---
-    assert forall|s: nat| slot_live(cs2, s) && cs2.slots[s as int].next is Some
-        implies slot_live(cs2, cs2.slots[s as int].next->Some_0)
-            && cs2.slots[cs2.slots[s as int].next->Some_0 as int].prev == Some(s)
-            && cs2.slots[cs2.slots[s as int].next->Some_0 as int].parent == cs2.slots[s as int].parent by {}
-    // --- (5) prev: Sibling-Inverse ---
-    assert forall|s: nat| slot_live(cs2, s) && cs2.slots[s as int].prev is Some
-        implies slot_live(cs2, cs2.slots[s as int].prev->Some_0)
-            && cs2.slots[cs2.slots[s as int].prev->Some_0 as int].next == Some(s) by {}
-    // --- (6) first_child: Listenkopf ---
-    assert forall|s: nat| slot_live(cs2, s) && cs2.slots[s as int].first_child is Some
-        implies slot_live(cs2, cs2.slots[s as int].first_child->Some_0)
-            && cs2.slots[cs2.slots[s as int].first_child->Some_0 as int].parent == Some(s)
-            && cs2.slots[cs2.slots[s as int].first_child->Some_0 as int].prev is None by {}
+    // --- (4l,5,6,7) je Klausel eine eigene Query ---
+    lemma_del_parent(cs, cs2, i);
+    lemma_del_next(cs, cs2, i);
+    lemma_del_prev(cs, cs2, i);
+    lemma_del_first_child(cs, cs2, i);
+    // --- und der Erreichbarkeitssatz, damit er im selben Lauf mitgeprueft wird ---
+    unreachable_after_delete(cs, cs2, i);
     cs2
 }
 

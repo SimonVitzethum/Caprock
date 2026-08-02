@@ -1,9 +1,19 @@
 # Verifikation — Capability-System (Phase 1)
 
-> **Status:** Kern abgeschlossen — die **vollständige `cap_inv`** (Klauseln 1–7) + **vier** der sechs
-> Operationen (`install`/`copy`/`mint`/`delete`) sind gegen sie bewiesen (10 verified, CI-gated).
-> Verbleibend: `move` (allg.)/`revoke` über die **Reachability-Ausbaustufe** (§14). Dieses Dokument
-> ist **eigenständig verständlich** — es erklärt die Verifikation vollständig **ohne Quellcode**.
+> **Status (2026-08-03, gemessen):** die **vollständige `cap_inv`** (Klauseln 1–7) + **vier** der
+> sechs Operationen (`install`/`copy`/`mint`/`delete`) sind gegen sie bewiesen —
+> `18 verified, 0 errors` in 3,0 s (Verus 0.2026.07.27.31579f0). Dazu der Erreichbarkeitssatz
+> `unreachable_after_delete` (§10a). Verbleibend: `move` (allg.)/`revoke` über die
+> **Reachability-Ausbaustufe** (§14). Dieses Dokument ist **eigenständig verständlich** — es
+> erklärt die Verifikation vollständig **ohne Quellcode**.
+>
+> **Korrektur, die hier stehen bleibt.** Vom 2026-06-27 (`3384abb`, Commit-Titel „delete (Leaf)
+> gegen die VOLLE cap_inv bewiesen") bis zum 2026-08-03 stand an dieser Stelle „10 verified" —
+> und der Beweis war in Wahrheit **rot**: `9 verified, 1 ERRORS`, ein leerer `by {}`-Rumpf für die
+> Eltern-Klausel plus `rlimit exceeded` für den Funktionsrumpf. Nachgemessen **auch gegen die
+> damals in der CI gepinnte Verus-Fassung 0.2026.06.20.911e4e7** — identisch rot. Es war also
+> kein Beweiser-Versionsartefakt: der Beweis war nie grün, 37 Tage lang, mit einem CI-Gate
+> darüber. Was fehlte, war nicht der Beweis, sondern **jemand, der das Ergebnis liest**.
 
 Bezug: [ADR 0015](../../docs/adr/0015-capability-system-formal-verification.md) (Architekturentscheidung
 der Verifikation), ADR 0001 (Capabilities), `docs/verification.md` (Gesamtpipeline),
@@ -118,7 +128,7 @@ auf `o` zeigen (rekursiv); `ancestor(cs, s, k)` = `k`-ter Vorfahre entlang `pare
 | Sibling (5) | insert_before, unlink | `verus/cap_cdt_tree.rs` | ✅ bewiesen (3 verified) |
 | Struktur (4l+5+6) | derive | `verus/cap_cdt_structure.rs` | ✅ bewiesen (2 verified) |
 | Azyklizität (7) | derive (+ allg. Korollare) | `verus/cap_cdt_acyclic.rs` | ✅ bewiesen (7 verified) |
-| **Vereint (1–7), volle `cap_inv`** | **install ✅ · copy ✅ · mint ✅ · delete ✅** · move/revoke ⏳ | [`proofs/cap_space.rs`](proofs/cap_space.rs) | C1 (additive) + delete fertig (10 verified) · move/revoke laufend |
+| **Vereint (1–7), volle `cap_inv`** | **install ✅ · copy ✅ · mint ✅ · delete ✅** · move/revoke ⏳ | [`proofs/cap_space.rs`](proofs/cap_space.rs) | C1 (additive) + C2b delete + Erreichbarkeit (**18 verified, 0 errors**, 3,0 s) · move/revoke laufend |
 
 **`cap_inv` (Schritt B/C1):** die Konjunktion der Klauseln **1–3** (Refcount), **4-lokal** (Ableitung
 teilt Objekt), **4-sib** (Geschwister teilen Elternknoten — beim Lösch-Beweis als notwendige, wahre
@@ -127,14 +137,42 @@ Klausel ergänzt), **5** (Sibling-Inverse), **6** (first_child = Listenkopf), **
 (= copy mit Rechten/Badge, ausserhalb des Invariant-Modells) die **gesamte** `cap_inv` zugleich
 erhalten — Refcount, Struktur **und** Azyklizität in je einem Beweis.
 
-## 10. Noch offene Eigenschaften
+## 10. `delete` (Leaf) — was der Beweis wirklich brauchte
 
-- **`delete` (Leaf) — bewiesen ✅**, per **Dekomposition**: ein Erhaltungs-Hilfsfakt (`delete` ändert
-  nur `next`/`prev`/`first_child` + `used` von `i`) + **per-CDT-Klausel** getrennte Asserts (kleinere
-  SMT-Queries, löst die rlimit-Wand). Setzt die Vorbedingung **`no_children`** voraus (kein belegter
-  Slot hat das Blatt als Elternknoten) — diese **folgt aus der Reachability-Invariante (Code 4r)**;
-  als Vorbedingung trennt sie sauber „delete erhält `cap_inv` **gegeben** Reachability" vom Nachweis
-  der Reachability selbst.
+**Bewiesen ✅ (C2b, 2026-08-03).** Die frühere Fassung hatte die richtige *Idee* (Dekomposition in
+per-Klausel-Asserts), aber die Dekomposition fand im **selben Funktionsrumpf** statt — also in
+**einer** SMT-Query. Das ist keine Dekomposition, sondern eine Gliederung: die rlimit-Wand steht
+nicht vor einer schwierigen Klausel, sondern vor der *Summe* aus vier Struktur-Klauseln und der
+Refcount-Rechnung in einem Kontext. Die Klauseln liegen jetzt in **eigenen `proof fn`** —
+`lemma_del_parent`/`_next`/`_prev`/`_first_child` —, jede mit ihrer eigenen Query und ihrem eigenen
+Budget. Ergebnis: von *rlimit exceeded* auf **3,0 s** für die ganze Datei, ohne `#[verifier::rlimit]`.
+
+**Der leere `by {}` war kein Beweisproblem, sondern eine fehlende Kette.** Die Eltern-Klausel gilt,
+aber ihr Nachweis braucht fünf Schritte, die Z3 nicht selbst findet: (i) der gelöschte Slot ist tot,
+also ist jeder lebende Slot `s` ein anderer; (ii) `s` lebte deshalb auch vorher; (iii) sein `parent`
+ist unverändert (Rahmen-Lemma); (iv) das Ziel `p` ist **nicht** der gelöschte Slot — das ist der
+einzige Punkt, an dem `no_children` gebraucht wird; (v) `object`/`rank` von `p` stehen still. Ohne
+(iv) ist die Klausel schlicht falsch.
+
+**Der Eingriff steht jetzt als Spezifikation da, nicht als Zuweisungsfolge im Rumpf:**
+`unlink1`/`unlink2`/`unlink_slots` bilden `CapSpace::unlink` Schritt für Schritt ab — gleiche
+Verzweigung, gleiche Reihenfolge, gleiche Feldzuweisung (früher wich das Modell an zwei Stellen ab,
+s. §12).
+
+### 10a. Kinderlisten-Erreichbarkeit — `unreachable_after_delete`
+
+Ein eigener Satz, mit **zwei** Hälften, weil die erste ohne die zweite wertlos ist:
+
+1. **kein lebender Slot zeigt noch auf den gelöschten** — über **keine** der vier Kanten
+   (`parent`, `next`, `prev`, `first_child`); und der Slot selbst ist tot.
+2. **der Elternknoten jedes anderen Slots ist unverändert.**
+
+Ohne (2) bestünde ein Eingriff, der sauber aushängt und nebenbei ein fremdes Kind umhängt, die
+Prüfung (1) mühelos. Gemessen: eine Mutation, die genau das tut (`unlink` löscht nebenbei den
+`parent` des Nachfolgers), lässt den Beweis fallen.
+
+## 10b. Noch offene Eigenschaften
+
 - **`move`** (Index-Relokation: `dst` erbt den Inhalt, alle Verweise auf `src` werden auf `dst`
   umgebogen, `src` geleert; `refcount` unverändert). **Befund:** der **Leaf-Fall** ist wie `delete`
   dekomponierbar (Erhaltungs-Hilfsfakt + per-Klausel-Asserts + `no_children`), aber die strukturellen
@@ -147,10 +185,37 @@ erhalten — Refcount, Struktur **und** Azyklizität in je einem Beweis.
   **Vorbedingung** geführt (s. o.); ihr expliziter Nachweis (rekursive Spec + Erhaltung durch alle
   Operationen) ist die **letzte Ausbaustufe** der Phase und Voraussetzung für `revoke`.
 
+## 10c. Empfindlichkeit — gemessen, nicht behauptet
+
+Ein Beweis, durch den eine Mutation durchgeht, hat dort eine Lücke. Neun Mutationen, **acht
+gefallen**:
+
+| # | Mutation | Ausgang |
+|---|---|---|
+| M1 | `next[pv]` wird nicht fortgeschrieben | **gefallen** |
+| M2 | `first_child[par]` wird nicht nachgezogen | **gefallen** |
+| M3 | `prev[nx]` wird nicht fortgeschrieben | **gefallen** |
+| M4 | Blatt-Vorbedingung `first_child is None` entfernt | *durchgegangen* — s. u. |
+| M5 | `no_children` entfernt (Blatt-Vorbedingung bleibt) | **gefallen** (Nachbedingung + Assert) |
+| M6 | `cap_inv` (6) ohne `prev[first_child] is None` | **gefallen** |
+| M7 | `cap_inv` (4-sib) ohne geteilten Elternknoten | **gefallen** |
+| M8 | `unlink` hängt den Nachfolger nebenbei um (`parent := None`) | **gefallen** |
+| M9 | Slot wird zuerst geleert statt zuletzt | **gefallen** |
+
+**M4 ist keine Lücke, sondern eine Redundanz — und sie ist bewiesen.** `first_child is None` folgt
+aus `no_children` + Klausel 6: hätte das Blatt ein `first_child`, so hätte dieses Kind `parent ==
+Some(i)`, was `no_children` verbietet. Der Beweis dafür steht als `lemma_leaf_from_no_children` in
+derselben Datei. Die Vorbedingung bleibt trotzdem stehen, weil sie das ist, was der reale Code an
+dieser Stelle prüft. Das Paar M4/M5 zeigt die Ordnung der beiden Vorbedingungen: `no_children`
+allein trägt, die Blatt-Eigenschaft allein trägt **nicht**.
+
 ## 11. Bekannte Grenzen der aktuellen Beweise
 
-- **Abstraktes Modell, nicht der reale Code:** die Beweise gelten am Modell; die Treue zum echten
-  `sel4lake-cap` ist eine dokumentierte Annahme (s. §12), abgesichert durch Audit+Fuzzer.
+- **Abstraktes Modell, nicht der reale Code:** die Beweise gelten am Modell. Die Treue zum echten
+  `sel4lake-cap` war bis 2026-08-03 eine **dokumentierte Annahme**; seither hält sie
+  `tools/verus-modelltreue.sh` (s. §12) — ein normalisierter Strukturvergleich mit Selbsttest.
+  Was er **nicht** leistet: er vergleicht Verzweigung und Feldzuweisung, nicht die Bedeutung.
+  Ein Umbau, der beide Seiten gleichartig verfälscht, käme durch.
 - **Sequenziell:** Verus modelliert **keine** Nebenläufigkeit; gleichzeitige Mehrkern-Operationen sind
   außerhalb (durch den `CAPS`-RwLock serialisiert — dessen Korrektheit ist HAL/Concurrency-TCB).
 - **Beschränkte Datentypen:** `refcount`/Indizes als `nat` (kein Überlauf im Modell); der reale Code
@@ -159,8 +224,28 @@ erhalten — Refcount, Struktur **und** Azyklizität in je einem Beweis.
 ## 12. Vertrauensannahmen (Trusted Computing Base)
 
 1. **Modell-Treue:** das Verus-Modell bildet die reale `CapSpace`-Struktur + Operationen korrekt ab.
-   *Absicherung:* dieselbe Invariante wird vom Laufzeit-`cap_audit_cdt` + den Fuzzern auf dem **echten**
-   Code geprüft (mehrschichtig).
+   *Absicherung, seit 2026-08-03 nicht mehr nur Prosa:* **`tools/verus-modelltreue.sh`** reduziert
+   `crates/sel4lake-cap/src/space.rs::unlink`/`delete_leaf` **und** `unlink1`/`unlink2`/
+   `unlink_slots` auf dieselbe normalisierte Ereignisfolge (Verzweigung + Feldzuweisung) und
+   verlangt Gleichheit — heute 12 Ereignisse, deckungsgleich. Ein `match Option {Some/None}` und
+   ein `if … is Some { } else { }` fallen dabei auf dieselbe Form; der Dialektunterschied
+   verschwindet, die Struktur bleibt stehen. Der Wächter hat einen **Selbsttest** (8 Fälle): sieben
+   Mutationen — vier am echten Code, drei am Modell — müssen ihn auslösen, und eine **kosmetische
+   Änderung auf beiden Seiten** (Binder umbenannt, Kommentare, Leerzeilen) darf ihn **nicht**
+   auslösen. Ein Wächter, der immer schreit, wird abgeschaltet; einer, der nie schreit, ist eine
+   Kopie mit Zertifikat.
+   *Zusätzlich:* dieselbe Invariante wird vom Laufzeit-`cap_audit_cdt` + den Fuzzern auf dem
+   **echten** Code geprüft (mehrschichtig).
+
+   **Zwei Abweichungen, die der Wächter beim ersten Lauf gefunden hat** (beide jetzt behoben, indem
+   das *Modell* dem Code angeglichen wurde):
+   - Das Modell zog `first_child[par]` nach, wenn `first_child[par] == Some(i)` galt. Der Code prüft
+     das **nicht**: er schreibt, sobald `prev is None && parent is Some`. Unter `cap_inv` **allein**
+     ist das nicht dasselbe — Klausel 6 sagt nur die Gegenrichtung; erst die Reachability-Klausel
+     4r macht beides gleich. `cap_inv` bleibt in beiden Fassungen erhalten; der Beweis führt den
+     Fall jetzt mit.
+   - Das Modell leerte den Slot **zuerst**, der Code **zuletzt**. Bei einem Selbst-Geschwister
+     (`next[i] == Some(i)`, von `cap_inv` nicht ausgeschlossen) sind das verschiedene Endzustände.
 2. **HAL/Speicher:** die physische Integrität der Tabellen (kein fremder Schreibzugriff) trägt die
    HAL-TCB + die Kani-Beweise (`region`/`sync` speichersicher).
 3. **Serialisierung:** Operationen laufen unter dem `CAPS`-RwLock (keine Daten-Races) — Concurrency-TCB.
@@ -173,6 +258,11 @@ erhalten — Refcount, Struktur **und** Azyklizität in je einem Beweis.
 - **Kani** — Speichersicherheit der Tabellen-tragenden `unsafe`-Schicht (`region`/`sync`).
 - **Verus (hier)** — beweist, dass die Operationen die Invariante **immer** erhalten (nicht nur an
   Audit-Punkten). Verus ersetzt **nichts** — es ergänzt die obersten drei Ebenen um einen Beweis.
+
+**Und eine Ebene, die vorher fehlte:** ein grüner Beweis kann per Konstruktion **nicht** bemerken,
+dass sich der Code unter ihm bewegt hat — das Modell ändert sich ja nicht mit. Genau deshalb ist
+`tools/verus-modelltreue.sh` kein Beiwerk, sondern die Ebene, auf der die anderen ruhen. Sie läuft
+am Ende von `tools/verus-verify.sh` und damit im CI-Gate mit.
 
 ## 14. Nächste Ausbaustufen
 

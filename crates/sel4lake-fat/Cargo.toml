@@ -1,0 +1,12 @@
+# `sel4lake-fat` — FAT16 lesen (A-6.3).
+#
+# **Keine Abhaengigkeiten**, `forbid(unsafe_code)`, reine Byte-Arithmetik. Sie liest **fremde
+# Bytes** von einer Platte; das gehoert nicht in den Kern. Auf dem HOST pruefbar, in Sekunden:
+#   rustc --test --edition 2021 -O crates/sel4lake-fat/src/lib.rs -o /tmp/t && /tmp/t
+[package]
+name = "sel4lake-fat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

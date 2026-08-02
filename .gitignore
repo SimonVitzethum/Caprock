@@ -9,3 +9,6 @@
 /build/soak/
 /ARMTest/
 /tools/__pycache__/
+
+# Agenten-Worktrees und Sitzungsdaten (mehrere GB, nie versionieren)
+.claude/

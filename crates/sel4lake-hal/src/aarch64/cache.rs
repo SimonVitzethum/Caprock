@@ -73,9 +73,35 @@ unsafe fn ccsidr_for(level: u8) -> u64 {
 /// Genommen wird die **höchste** Ebene mit einem Daten- oder Unified-Cache; reine
 /// Instruktions-Caches sind für die Datenseitenkanäle irrelevant.
 pub fn llc() -> Option<LlcGeometry> {
+    let mut best: Option<LlcGeometry> = None;
+    for_each_level(|g| {
+        if best.map_or(true, |b: LlcGeometry| g.level > b.level) {
+            best = Some(g);
+        }
+    });
+    best
+}
+
+/// **Die grösste Daten-Cache-Ebene UNTERHALB des LLC** — Spiegelbild zur x86-Fassung, dort steht
+/// die ausführliche Begründung. Kurz: Färbung partitioniert nur den LLC, also muss ein
+/// Prime+Probe-Opfer grösser sein als die darunterliegende, *nicht* partitionierte Ebene —
+/// sonst misst der Test diese Ebene statt der Partitionierung (B-4.5).
+pub fn below_llc() -> Option<LlcGeometry> {
+    let top = llc()?;
+    let mut best: Option<LlcGeometry> = None;
+    for_each_level(|g| {
+        if g.level < top.level && best.map_or(true, |b: LlcGeometry| g.level > b.level) {
+            best = Some(g);
+        }
+    });
+    best
+}
+
+/// Jede von `CLIDR_EL1` gemeldete Daten-/Unified-Ebene einmal an `f` geben — eine Stelle, an der
+/// `CCSIDR_EL1` zerlegt wird.
+fn for_each_level(mut f: impl FnMut(LlcGeometry)) {
     let clidr = clidr();
     let ccidx = ccidx();
-    let mut best: Option<LlcGeometry> = None;
     for level in 1..=7u8 {
         let ctype = ((clidr >> (3 * (level as u32 - 1))) & 0x7) as u32;
         // 0 = kein Cache, 1 = nur Instruktion. 2 = nur Daten, 3 = getrennt (Datenteil),
@@ -91,18 +117,14 @@ pub fn llc() -> Option<LlcGeometry> {
         // pruefen. Eine zweite Fassung an dieser Stelle waere genau der Fehler, den die
         // Auslagerung verhindern soll.
         let d = crate::cache_decode::decode_ccsidr(c, ccidx);
-        let g = LlcGeometry {
+        f(LlcGeometry {
             level,
             size_bytes: d.size_bytes(),
             ways: d.ways,
             line_bytes: d.line_bytes,
             sets: d.sets,
-        };
-        if best.map_or(true, |b| g.level > b.level) {
-            best = Some(g);
-        }
+        });
     }
-    best
 }
 
 /// Anzahl unterscheidbarer **Seitenfarben** im LLC.

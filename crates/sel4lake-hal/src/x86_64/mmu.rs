@@ -696,13 +696,133 @@ pub fn vspace_collect_l3s(l2_phys: u64, free_l3: &mut dyn FnMut(u64)) {
 /// in **geteilten**, supervisor-only Tabellen (`ISO_PD_HIGH`). Eine PD-eigene Geräteabbildung
 /// bräuchte dort eine private Tabelle; das kommt mit dem HardwareLand-Port (s. todo.md).
 pub fn vspace_map_device(
-    _l1_phys: u64,
-    _phys: u64,
-    _len: u64,
-    _ro: bool,
-    _alloc: &mut dyn FnMut() -> Option<u64>,
+    l1_phys: u64,
+    phys: u64,
+    len: u64,
+    ro: bool,
+    alloc: &mut dyn FnMut() -> Option<u64>,
 ) -> bool {
-    false
+    if len == 0 || len % PAGE != 0 || phys % PAGE != 0 {
+        return false;
+    }
+    // Oberhalb der abgebildeten 4 GiB gibt es keine Blattstruktur, an die sich etwas haengen
+    // liesse. Das ist eine Grenze der Plattformabbildung, kein Rechtefehler -- deshalb hier
+    // ablehnen und nicht irgendwo eine Tabelle erfinden.
+    if phys.saturating_add(len) > (MAPPED_GIB as u64) * ONE_GIB {
+        return false;
+    }
+    let mut off = 0;
+    while off < len {
+        if !map_device_page(l1_phys, phys + off, ro, alloc) {
+            return false;
+        }
+        off += PAGE;
+    }
+    cpu::dsb_sy();
+    true
+}
+
+/// Das Seitenverzeichnis fuer GiB `g` dieses Adressraums **privat** machen, falls es noch das
+/// geteilte ist.
+///
+/// **Der wichtigste Schritt der ganzen Funktion.** `vspace_create_base` haengt GiB 1..3 jeder
+/// isolierten PD an dieselben statischen Tabellen ([`ISO_PD_HIGH`]) -- das spart drei Frames je
+/// Adressraum und ist richtig, solange dort nichts PD-Spezifisches steht. Ein Geraetefenster ist
+/// aber genau das. Wer es in die geteilte Tabelle schriebe, gaebe es **jeder** isolierten PD:
+/// aus einer Zuteilung an einen Treiber wuerde ein Zugriff fuer alle, und zwar lautlos -- die
+/// Cap-Pruefung liefe korrekt durch, die Isolation waere trotzdem weg.
+///
+/// Also: beim ersten Geraetefenster in diesem GiB eine **Kopie** anlegen und einhaengen. Danach
+/// gehoert sie diesem Adressraum, und `vspace_collect_device_tables` gibt sie beim Abbau zurueck.
+///
+/// # Safety
+/// `pdpt` muss die PDPT dieses Adressraums sein.
+unsafe fn private_pd(
+    pdpt: &mut [u64],
+    g: usize,
+    alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Option<u64> {
+    let e = pdpt[g];
+    let cur = e & 0x000f_ffff_ffff_f000;
+    if e & P != 0 && !is_shared_high_pd(g, cur) {
+        return Some(cur); // schon privat
+    }
+    let new = alloc()?;
+    // SAFETY: frisch alloziertes, identity-gemapptes Frame; Quelle ist die bisherige Tabelle.
+    unsafe {
+        let dst = table_mut(new);
+        if e & P != 0 {
+            let src = table_mut(cur);
+            dst.copy_from_slice(src);
+        } else {
+            for s in dst.iter_mut() {
+                *s = 0;
+            }
+        }
+    }
+    pdpt[g] = table_desc(new);
+    Some(new)
+}
+
+/// Zeigt `pd_phys` auf das **geteilte** Seitenverzeichnis fuer GiB `g`?
+fn is_shared_high_pd(g: usize, pd_phys: u64) -> bool {
+    if g == 0 || g >= MAPPED_GIB {
+        return false; // GiB 0 hat ohnehin eine eigene Tabelle je Adressraum
+    }
+    // SAFETY: nur die **Adresse** eines statischen Objekts wird gelesen.
+    let shared = unsafe { &(*core::ptr::addr_of!(ISO_PD_HIGH))[g - 1] as *const Table as u64 };
+    pd_phys == shared
+}
+
+/// Eine einzelne Geraeteseite user-zugreifbar in diesen Adressraum haengen (uncacheable, NX).
+fn map_device_page(
+    l1_phys: u64,
+    pa: u64,
+    ro: bool,
+    alloc: &mut dyn FnMut() -> Option<u64>,
+) -> bool {
+    let g = (pa / ONE_GIB) as usize;
+    // SAFETY: gueltige, identity-gemappte PML4 dieses Adressraums; alle weiteren Tabellen werden
+    // aus ihr aufgeloest bzw. frisch alloziert.
+    unsafe {
+        let pml4 = table_mut(l1_phys);
+        if pml4[0] & P == 0 {
+            return false;
+        }
+        let pdpt = table_mut(pml4[0] & 0x000f_ffff_ffff_f000);
+        let Some(pd_phys) = private_pd(pdpt, g, alloc) else {
+            return false;
+        };
+        let pd = table_mut(pd_phys);
+        let idx = ((pa % ONE_GIB) / TWO_MIB) as usize;
+        let e = pd[idx];
+        let pt_phys = if e & P != 0 && e & PS == 0 {
+            e & 0x000f_ffff_ffff_f000
+        } else {
+            let Some(p) = alloc() else {
+                return false;
+            };
+            // Den 2-MiB-Block **attributgetreu** in Seiten aufloesen: dieselben Flags, nur ohne
+            // `PS`. Feste Bits einzusetzen waere hier ein Fehler mit Reichweite -- der Kernel
+            // laeuft beim Syscall in DIESEM Adressraum, und ein RAM-Block, den die Aufteilung
+            // nebenbei uncacheable machte, wuerde ihn ausbremsen, ohne dass es jemand mit dieser
+            // Zeile in Verbindung braechte.
+            let base = (g as u64) * ONE_GIB + (idx as u64) * TWO_MIB;
+            let flags = if e & P != 0 { e & !0x000f_ffff_ffff_f000 & !PS } else { 0 };
+            let pt = table_mut(p);
+            for (i, slot) in pt.iter_mut().enumerate() {
+                *slot = if flags == 0 { 0 } else { (base + (i as u64) * PAGE) | flags };
+            }
+            pd[idx] = table_desc(p);
+            p
+        };
+        let pt = table_mut(pt_phys);
+        let slot = ((pa % TWO_MIB) / PAGE) as usize;
+        // Geraeteregister: uncacheable + write-through, nie ausfuehrbar. `US` ist die eigentliche
+        // Zuteilung -- ohne dieses Bit sieht der Treiber in Ring 3 nichts.
+        pt[slot] = pa | P | US | NX | PCD | PWT | if ro { 0 } else { RW };
+    }
+    true
 }
 
 /// Die PDPT eines Adressraums einsammeln (x86 hat eine Ebene mehr als ARM; der Kernel ruft
@@ -711,15 +831,83 @@ pub fn vspace_collect_device_tables(l1_phys: u64, free: &mut dyn FnMut(u64)) {
     // SAFETY: gültige, lesbare PML4 des abzubauenden Adressraums.
     unsafe {
         let pml4 = table_mut(l1_phys);
-        if pml4[0] & P != 0 {
-            free(pml4[0] & 0x000f_ffff_ffff_f000);
-            pml4[0] = 0;
+        if pml4[0] & P == 0 {
+            return;
         }
+        let pdpt_phys = pml4[0] & 0x000f_ffff_ffff_f000;
+        let pdpt = table_mut(pdpt_phys);
+        // GiB 1..3: **privat gewordene** Seitenverzeichnisse samt ihrer Seitentabellen zurückgeben.
+        // Die geteilten (`ISO_PD_HIGH`) gehören keinem Adressraum und dürfen nicht freigegeben
+        // werden -- das wäre kein Leck, sondern das Gegenteil: der Allokator bekäme statischen
+        // Kernel-Speicher als freies RAM zurück. Deshalb wird jede Tabelle vor dem Freigeben
+        // **daraufhin geprüft**, ob sie überhaupt aus dem Allokator stammt.
+        //
+        // GiB 0 bleibt außen vor: dessen Tabellen räumt `vspace_collect_l3s` ab. Beides zu tun
+        // wäre eine doppelte Freigabe.
+        for g in 1..MAPPED_GIB {
+            let e = pdpt[g];
+            if e & P == 0 {
+                continue;
+            }
+            let pd_phys = e & 0x000f_ffff_ffff_f000;
+            if is_shared_high_pd(g, pd_phys) {
+                continue;
+            }
+            let pd = table_mut(pd_phys);
+            for &pe in pd.iter() {
+                if pe & P != 0 && pe & PS == 0 {
+                    free(pe & 0x000f_ffff_ffff_f000);
+                }
+            }
+            free(pd_phys);
+            pdpt[g] = 0;
+        }
+        free(pdpt_phys);
+        pml4[0] = 0;
     }
 }
 
-/// Es gibt keine PD-eigenen Gerätetabellen (s. [`vspace_map_device`]) -> nichts zu verletzen.
-pub fn vspace_device_wx_ok(_l1_phys: u64) -> bool {
+/// **W^X-Audit der Geräte-Tabellen**: `false`, wenn eine für den User schreibbare Seite zugleich
+/// ausführbar ist.
+///
+/// Bis A-5.1 gab es keine PD-eigenen Gerätetabellen, und die Antwort war fest `true`. Das war
+/// richtig, solange nichts zu prüfen war — und wäre ab jetzt genau die Sorte Prüfer, die über
+/// Abwesenheit entscheidet, ohne sprechfähig zu sein.
+pub fn vspace_device_wx_ok(l1_phys: u64) -> bool {
+    // SAFETY: gültige, lesbare PML4 des Adressraums.
+    unsafe {
+        let pml4 = table_mut(l1_phys);
+        if pml4[0] & P == 0 {
+            return true;
+        }
+        let pdpt = table_mut(pml4[0] & 0x000f_ffff_ffff_f000);
+        for g in 1..MAPPED_GIB {
+            let e = pdpt[g];
+            if e & P == 0 {
+                continue;
+            }
+            let pd_phys = e & 0x000f_ffff_ffff_f000;
+            if is_shared_high_pd(g, pd_phys) {
+                continue;
+            }
+            for &pe in table_mut(pd_phys).iter() {
+                if pe & P == 0 {
+                    continue;
+                }
+                if pe & PS != 0 {
+                    if pe & US != 0 && pe & RW != 0 && pe & NX == 0 {
+                        return false;
+                    }
+                    continue;
+                }
+                for &leaf in table_mut(pe & 0x000f_ffff_ffff_f000).iter() {
+                    if leaf & P != 0 && leaf & US != 0 && leaf & RW != 0 && leaf & NX == 0 {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
     true
 }
 

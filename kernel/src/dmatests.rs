@@ -23,6 +23,13 @@ pub struct DmaWin {
     pub intact: bool,
     pub balanced: bool,
     pub undeclared: u32,
+    /// B-3.4: liegt **jedes** Kontext-Fenster ausserhalb des Interrupt-Nachrichtenbereichs?
+    ///
+    /// Eigenes Feld und keine stille Konjunktion: die anderen Grenzen fuehren zu einem sauberen
+    /// Fehlschlag, dieser Bereich zu **gar keinem** — VT-d liest eine DMA-Schreibung dorthin als
+    /// Interrupt-Nachricht und befragt die Uebersetzung nicht. Kein Fault, keine Fehlerzeile, nur
+    /// Daten, die nirgends ankommen. Genau deshalb muss die Aussage einzeln dastehen.
+    pub msi_clear: bool,
 }
 
 #[derive(Default)]
@@ -45,6 +52,9 @@ pub struct DmaTok {
 /// keinen halb aufgebauten Kontext hinterlassen.
 pub fn run_dmawin(live_sid: u32) -> DmaWin {
     let mut r = DmaWin::default();
+    // B-3.4 zuerst, weil es keine Ressourcen braucht und auch dann gilt, wenn der Rest des Tests
+    // mangels Speicher gar nicht laeuft.
+    r.msi_clear = (0..system::ndma_ctx()).all(system::iova_window_clear_of_msi);
     let _ = live_sid;
     let (narrow_sid, wide_sid) = (0x50u32, 0x51u32);
     hal::cpu::local_irq_disable();
@@ -97,7 +107,8 @@ pub fn run_dmawin(live_sid: u32) -> DmaWin {
     r.intact = intact;
     r.balanced = balanced;
     r.undeclared = system::testsupport::dma_undeclared_devices();
-    r.ok = narrow && exhausted && intact && balanced && system::domain_audit() == 0;
+    r.ok = narrow && exhausted && intact && balanced && r.msi_clear
+        && system::domain_audit() == 0;
     r
 }
 

@@ -734,28 +734,160 @@ fn run_loadhw_start() -> usize {
 /// abbauen ([`system::destroy_loaded`]) und die Ressourcen-Baseline pruefen (freies MEM, freie
 /// VSpaces, freie Kstack-Pool-Slots zurueck = kein Leck der geladenen Segmente/VSpace/Stack).
 /// Synchron, IRQ-maskiert (saubere Baseline-Messung); das Programm wird vor dem Lauf abgebaut.
+/// Die drei Zahlen, gegen die L4 seine Balance-Aussage haelt.
+fn loadstop_snapshot() -> (u64, usize, usize) {
+    (
+        system::total_free(),
+        system::free_vspaces(),
+        system::user_kstack_free_count(),
+    )
+}
+
+/// Wie oft die Messung wiederholt wird, wenn das System waehrend des Fensters nicht ruhig war.
+const LOADSTOP_TRIES: usize = 16;
+
+/// **Warten, bis sich die globalen Zaehler nicht mehr bewegen** (D5).
+///
+/// `Some(...)` = zwei aufeinanderfolgende Proben waren gleich, das System ist ruhig.
+/// `None` = in `LOADSTOP_TRIES` Anlaeufen nie -- dann ist die Baseline **nicht messbar**, und das
+/// ist etwas anderes als „nicht bestanden".
+fn loadstop_quiet() -> Option<(u64, usize, usize)> {
+    let mut prev = loadstop_snapshot();
+    for _ in 0..LOADSTOP_TRIES {
+        for _ in 0..200_000 {
+            core::hint::spin_loop();
+        }
+        let now = loadstop_snapshot();
+        if now == prev {
+            return Some(now);
+        }
+        prev = now;
+    }
+    None
+}
+
+/// **Binary-Loader L4** (ext-26): laden + vollstaendig abbauen, und danach steht die Baseline wieder.
+///
+/// ## Warum hier eine Ruhephase steht (D5)
+///
+/// Die Messung vergleicht **globale** Zaehler (freier Speicher, freie VSpaces, Kernel-Stacks) vor
+/// und nach der Operation -- abgesichert mit `local_irq_disable()`, das aber nur **diesen einen
+/// Kern** stillstellt. Sieben andere Kerne und der Einsammler laufen weiter.
+///
+/// Solange in dem Fenster sonst nichts passierte, ging das gut. Mit dem Root-Task (D5) passiert
+/// dort etwas: `init` beendet sich, und seine Freigabe faellt gelegentlich mitten in die Messung.
+/// Gemessen wurde dann `free 4204597248 -> 4204613632` -- **16 KiB mehr** hinterher. Das ist kein
+/// Leck, das ist ein fremder `free`; die Zeile meldete trotzdem FAILURES.
+///
+/// Der Punkt ist allgemeiner als der Root-Task: eine Gleichheitsaussage ueber eine geteilte
+/// Groesse braucht ein Fenster, in dem niemand sonst daran schreibt. Die lokale IRQ-Sperre war nie
+/// dieses Fenster -- sie sah nur so aus. Deshalb wird jetzt **erst Ruhe festgestellt** und dann
+/// gemessen, und ein Lauf, der nie ruhig wird, faellt DURCH statt still als bestanden zu gelten
+/// („nicht messbar" ist kein Ergebnis).
+///
+/// Ein echtes Leck faellt weiterhin durch: es steht in **jeder** Wiederholung in den Zahlen.
 fn run_loadstop() -> bool {
-    hal::cpu::local_irq_disable();
-    let (f0, v0, k0) = (
-        system::total_free(),
-        system::free_vspaces(),
-        system::user_kstack_free_count(),
+    let mut last = None;
+    for _ in 0..LOADSTOP_TRIES {
+        let Some(_) = loadstop_quiet() else { continue };
+        hal::cpu::local_irq_disable();
+        let vorher = loadstop_snapshot();
+        let loaded = (|| {
+            let archive = loader::read_archive()?;
+            let hello = archive.iter().find(|p| p.name() == "hello")?;
+            let (tid, pd) = loader::load_image(&hello, &[], 0).ok()?;
+            system::destroy_loaded(tid, pd);
+            Some(())
+        })()
+        .is_some();
+        let nachher = loadstop_snapshot();
+        hal::cpu::local_irq_enable();
+        if loaded && vorher == nachher {
+            return true;
+        }
+        last = Some((loaded, vorher, nachher));
+    }
+    // Durchgefallen -- und zwar mit Zahlen. Ein blosses „FAILURES" liesse offen, ob etwas leckte
+    // oder ob nie ein ruhiges Fenster zustande kam; das sind zwei verschiedene Befunde.
+    match last {
+        Some((loaded, (f0, v0, k0), (f1, v1, k1))) => println!(
+            "loadstop: geladen={loaded} frei {f0}->{f1} vspaces {v0}->{v1} kstacks {k0}->{k1} \
+             (nach {LOADSTOP_TRIES} Anlaeufen)"
+        ),
+        None => println!(
+            "loadstop: in {LOADSTOP_TRIES} Anlaeufen kein ruhiges Fenster -- die Baseline war \
+             NICHT MESSBAR (das ist kein bestandener Test)"
+        ),
+    }
+    false
+}
+
+/// **Die drei Farbtests auf aarch64 fahren** — A1 (`color`), B-4.2 (`stripe`), B-4.5 (`pprobe`).
+///
+/// ## Warum das hier steht und nicht in `spawn_demo`
+///
+/// Bis 2026-08-02 liefen sie auf aarch64 **gar nicht**: `spawn_demo` setzte die drei Flaggen hart
+/// auf `true`. Der Grund dafuer war echt — an jener Stelle belegen und geben die Tests Speicher
+/// frei, BEVOR die baseline-empfindlichen Pruefungen ihre Ausgangswerte nehmen, und danach fiel
+/// mal `captest`, mal `sched` durch. Nur war die Antwort falsch: ein hart gesetztes `true` ohne
+/// jede Berichtszeile ist nicht „Test fehlt", sondern „Test besteht immer", und das ist die
+/// schlechtere Haelfte.
+///
+/// Die richtige Antwort ist der **Platz**. Diese Funktion haengt am ENDE der Testkette, hinter
+/// `cross` (dem letzten adversarialen Dienst), `strand` (der letzten Scheduler-Messung) und
+/// `loadstop` (der Ressourcen-Bilanz). Danach nimmt keine Pruefung mehr eine Baseline; was der
+/// Farbtest an der Freiliste anrichtet, kann niemanden mehr kippen.
+///
+/// **Der Gate-Ausdruck ist eine Zusicherung, keine Bequemlichkeit.** Wer eine baseline-empfindliche
+/// Pruefung NACH `cross`/`strand`/`loadstop` einhaengt, muss sie hier ergaenzen — sonst laeuft der
+/// Farbtest wieder davor.
+///
+/// ## Die Ruhephase ist hier eine DIAGNOSE, kein Tor — und das ist mit Absicht so
+///
+/// `run_loadstop` (D5) braucht die Ruhephase, weil es eine Gleichheitsaussage ueber **globale**
+/// Zaehler trifft: dort entscheidet ein fremder `free` im Messfenster ueber PASS oder FAIL. Die
+/// Farbtests treffen diese Aussage **nicht** — sie pruefen ihre Bilanz regionsgenau
+/// (`region_fully_free` je geholter Region) statt ueber den Summenzaehler. Genau diese Umstellung
+/// hat A1 schon einmal bezahlt, und sie macht die Ruhephase als *Tor* ueberfluessig.
+///
+/// Gemessen wird sie trotzdem, und gemeldet auch: findet sich nach der gesamten Testkette **kein**
+/// ruhiges Fenster, dann werkelt dort noch etwas, obwohl alles fertig gemeldet hat. Das ist ein
+/// Befund fuer sich — und ein Grund, den Zahlen darunter weniger zu glauben. Ein Tor daraus zu
+/// machen waere die falsche Konsequenz: der Test wuerde dann ausgerechnet dort schweigen, wo etwas
+/// nicht stimmt. Dieselbe Mechanik wie in [`run_loadstop`]: zwei gleiche Proben in Folge. Wird es nie
+/// ruhig, laufen die Tests trotzdem — sie haengen nicht an der globalen Summe — aber der Bericht
+/// sagt es.
+fn run_color_suite() {
+    let ruhig = loadstop_quiet().is_some();
+    if !ruhig {
+        println!(
+            "color: HINWEIS  kein ruhiges Fenster in {LOADSTOP_TRIES} Anlaeufen; die drei \
+             Farbtests laufen trotzdem (sie pruefen ihre Bilanz regionsgenau, nicht ueber den \
+             globalen Summenzaehler)"
+        );
+    }
+
+    // A1: zwei isolierte PDs mit disjunkten Farbsaetzen. Der Test baut sie sofort wieder ab.
+    let c = crate::colors::run_color(iso_probe as *const () as usize, system::IDLE_PRIO);
+    crate::colors::report_color(&c);
+    // `usable == false` heisst NICHT durchgefallen, sondern nicht durchfuehrbar (unter zwei Farben
+    // gibt es nichts zu trennen). `report_color` druckt dafuer SKIP; die Abschlussbedingung darf
+    // daran nicht haengenbleiben.
+    COLOR_OK.store(c.ok || !c.usable, Ordering::Release);
+
+    // B-4.2: die Streifenvergabe fuehrt Belegung -- erschoepft heisst FEHLSCHLAG, nicht stille
+    // Wiederholung. Laeuft NACH `run_color` (das gibt seine Streifen sofort wieder frei).
+    STRIPE_ALLOC_OK.store(crate::colors::run_stripe_alloc(), Ordering::Release);
+
+    // B-4.5: die WIRKUNG der Faerbung. Traegt die Positivkontrolle nicht (TCG hat keinen echten
+    // Cache), ist das ein SKIP und darf die Abschlussbedingung nicht blockieren -- aber die
+    // Bilanz muss immer stimmen. Gleiche Verrechnung wie auf x86 (`arch/x86_64/bringup.rs`).
+    let pp = crate::colors::run_prime_probe();
+    crate::colors::report_prime_probe(&pp);
+    PPROBE_OK.store(
+        (!pp.ran || pp.balanced) && (!pp.sensitive || pp.ok),
+        Ordering::Release,
     );
-    let loaded = (|| {
-        let archive = loader::read_archive()?;
-        let hello = archive.iter().find(|p| p.name() == "hello")?;
-        let (tid, pd) = loader::load_image(&hello, &[], 0).ok()?;
-        system::destroy_loaded(tid, pd);
-        Some(())
-    })()
-    .is_some();
-    let (f1, v1, k1) = (
-        system::total_free(),
-        system::free_vspaces(),
-        system::user_kstack_free_count(),
-    );
-    hal::cpu::local_irq_enable();
-    loaded && f1 == f0 && v1 == v0 && k1 == k0
 }
 
 /// **EL0-TrustedSAS-Laden pruefen** (ext-26 L3 + ext-28): ein als TrustedSAS (Domaene 0) deklariertes
@@ -1520,21 +1652,20 @@ static RELOAD_INFO: SpinLock<Option<ReloadInfo>> = SpinLock::new(None);
 
 /// PDs + Endpoint + Caps anlegen und Demo-Threads (v1, Client, Worker) starten.
 pub fn spawn_demo() {
-    // Cache-Partitionierung (todo A1) + Prime+Probe (B-4.5) laufen hier **noch nicht**.
+    // Die drei Farbtests (A1, B-4.2, B-4.5) laufen hier **nicht mehr** -- und auch nicht mehr
+    // gar nicht. Sie stehen jetzt als letztes Glied der Testkette in `demo_report_then_idle`
+    // (s. `run_color_suite`).
     //
-    // Der Test ist arch-neutral (`crate::colors`) und lief am 2026-08-01 zum ersten Mal auf
-    // aarch64. Er hat dabei sofort zwei echte Fehler gefunden (s. todo A1) -- und einen dritten,
-    // der ihn selbst betrifft: an dieser Stelle, ganz am Anfang von `spawn_demo`, belegt und
-    // gibt er Speicher frei, BEVOR die baseline-empfindlichen Tests ihre Ausgangswerte nehmen.
-    // Danach fiel mal `captest`, mal `sched` durch -- nicht reproduzierbar und nicht ihre Schuld.
+    // Was hier stand, war schlimmer als ein fehlender Test: `COLOR_OK`, `STRIPE_ALLOC_OK` und
+    // `PPROBE_OK` wurden hart auf `true` gesetzt, ohne dass irgendetwas lief. Drei dauerhaft
+    // wahre Konjunkte in `all_done()`, keine Berichtszeile, kein Check in `test-qemu.sh` --
+    // die Abwesenheit war damit nicht bloss unbelegt, sie war **unsichtbar**. Genau die
+    // Fehlerform, gegen die dieses Projekt seinen Leitsatz hat.
     //
-    // Bis die beiden Farbfehler behoben sind und ein Platz gefunden ist, der keine Baseline
-    // stoert, bleibt der Aufruf hier draussen. Ein Test, der andere Tests kippen laesst, ist
-    // schlimmer als einer, der fehlt: er macht das GESAMTE Ergebnis unbrauchbar.
-    COLOR_OK.store(true, Ordering::Release);
-    STRIPE_ALLOC_OK.store(true, Ordering::Release);
-    PPROBE_OK.store(true, Ordering::Release);
-    COLOR_DONE.store(true, Ordering::Release);
+    // Der Grund, aus dem sie hier ausgehaengt waren, galt: an dieser Stelle belegen und geben
+    // sie Speicher frei, BEVOR die baseline-empfindlichen Tests ihre Ausgangswerte nehmen --
+    // danach fiel mal `captest`, mal `sched` durch. Die Antwort darauf ist nicht, den Test
+    // wegzulassen, sondern ihn dorthin zu stellen, wo keine Baseline mehr genommen wird.
 
     let ep = system::create_endpoint().expect("endpoint");
     let root = system::install_endpoint_cap(ep as u32, Rights::RWX).expect("ep cap");
@@ -3190,13 +3321,31 @@ pub fn demo_report_then_idle() -> ! {
     let mut reported = false;
     let mut dbg_ticks = 0u32;
     let mut dbg_printed = false;
+    // **Ein zweiter Schnappschuss, kurz VOR der Notbremse** (D6, 2026-08-02).
+    //
+    // Die Zeile darunter lief bisher genau einmal, nach ~25 s. Im beobachteten Haenger ist das zu
+    // frueh: dort sind am Ende **alle** Ergebniszeilen gruen, der Bericht kommt trotzdem aus der
+    // Notbremse, und der 25-s-Schnappschuss zeigt lauter Tests, die danach noch fertig wurden.
+    // Damit ist nicht zu sagen, welche Bedingung bei Ablauf offen war -- und ohne das ist jede
+    // Ursachensuche ein Raten. Auf x86 nennt die Notbremse die offenen Punkte seit heute; das
+    // hier ist das ARM-Gegenstueck mit den Mitteln, die es dort schon gibt.
+    let mut dbg_printed_wd = false;
     // (Die Fuzzer-Spawn-Flags liegen jetzt als Statics im Modul `fuzz`, ADR 0013.)
     loop {
         // Diagnose: falls der Bericht ausbleibt, nach ~25 s die ausstehenden
         // Bedingungen einmalig ausgeben (zeigt, welcher Test haengt).
         dbg_ticks += 1;
-        if !reported && !dbg_printed && dbg_ticks > 250 {
-            dbg_printed = true;
+        // Kurz vor der Deadline (6000 Ticks) noch einmal -- der Schnappschuss soll den Stand ZUM
+        // ZEITPUNKT DER BREMSE zeigen, nicht den von vor 35 Sekunden.
+        let kurz_vor_der_bremse = hal::timer::ticks(0) > 5990;
+        if !reported
+            && ((!dbg_printed && dbg_ticks > 250) || (!dbg_printed_wd && kurz_vor_der_bremse))
+        {
+            if kurz_vor_der_bremse {
+                dbg_printed_wd = true;
+            } else {
+                dbg_printed = true;
+            }
             let m = ISO_MASK.load(Ordering::Relaxed);
             println!("DBG pending: workers={} fp={} prio={} life={} notif={} xfer={} ckpt={} el0={} smp={} xipc={} reclaim={} balance={} vspace={} vmm={} shm={} native={} pages4k={} churn={} mcs={} stale={} strand={} rgone={} ddon={} rcap={} rmig={} fuzz={} ipcfuzz={} caplk={} domain={} pdctl={} chan={} rtc={} irq={} dma={} pcie={} smmu={} smmubind={} virtiorng={} dmagen={} sasheap={} load={} sysload={} loadhw={} loadstop={} loaderfuzz={} aggru={} intru={} aggrh={} intrh={} aggrt={} intrt={} cross={} hwfuzz={}",
                 (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD),
@@ -4814,6 +4963,22 @@ pub fn demo_report_then_idle() -> ! {
                     }
                 }
             }
+        }
+
+        // Gegate auf `cross` (letzter adversarialer Dienst), `strand` (letzte Scheduler-Messung)
+        // und `loadstop` (Ressourcen-Bilanz). Danach nimmt keine Pruefung mehr eine Baseline, und
+        // genau deshalb steht der Farbtest hier: an seinem alten Platz (Anfang von `spawn_demo`)
+        // hat er `captest` und `sched` gekippt. Ein Test, der andere Tests kippt, macht das
+        // GESAMTE Ergebnis unbrauchbar -- das wiegt schwerer als drei zusaetzliche gruene Zeilen.
+        //
+        // Wer eine baseline-empfindliche Pruefung dahinter einhaengt, muss dieses Gate ergaenzen.
+        if !COLOR_DONE.load(Ordering::Acquire)
+            && CROSS_DONE.load(Ordering::Acquire)
+            && STRAND_DONE.load(Ordering::Acquire)
+            && LOADSTOP_DONE.load(Ordering::Acquire)
+        {
+            run_color_suite();
+            COLOR_DONE.store(true, Ordering::Release);
         }
 
         // (Generativer Fuzzer + IPC-State-Machine-Fuzzer werden jetzt in `fuzz::drive()` gespawnt,

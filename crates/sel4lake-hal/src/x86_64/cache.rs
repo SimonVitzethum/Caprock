@@ -40,13 +40,52 @@ const TYPE_UNIFIED: u32 = 3;
 /// Instruktions-Caches sind für die Datenseitenkanäle irrelevant. `None`, wenn die CPU
 /// Blatt 4 nicht anbietet oder keine passende Ebene meldet.
 pub fn llc() -> Option<LlcGeometry> {
+    let mut best: Option<LlcGeometry> = None;
+    for_each_level(|g| {
+        if best.map_or(true, |b: LlcGeometry| g.level > b.level) {
+            best = Some(g);
+        }
+    });
+    best
+}
+
+/// **Die grösste Daten-Cache-Ebene UNTERHALB des LLC** — auf x86 üblicherweise der L2.
+///
+/// Warum das jemanden interessiert: Seitenfärbung partitioniert **nur** den LLC. Ein
+/// Arbeitssatz, der vollständig in die darunterliegende (nicht partitionierte) Ebene passt, wird
+/// von *jedem* Angreifer verdrängt, gleich welcher Farbe — ein Prime+Probe über einen solchen
+/// Arbeitssatz misst dann die private Ebene und nicht die Partitionierung.
+///
+/// `kernel/src/colors.rs` (B-4.5) leitet daraus seine Opfergrösse ab. Bis 2026-08-02 stand dort
+/// stattdessen eine feste Zahl (2 MiB) mit dem Kommentar „die Messmaschine hat ~1,5 MiB L2 je
+/// Kern" — auf einer Maschine mit **genau 2 MiB L2** war die Bedingung damit gerade nicht mehr
+/// erfüllt, und die Positivkontrolle trug nur noch sporadisch. Eine Bedingung, die als Zahl
+/// festgeschrieben statt aus der Geometrie abgeleitet wird, gilt genau auf einer Maschine.
+///
+/// `None`, wenn es keine solche Ebene gibt oder die CPU Blatt 4 nicht anbietet.
+pub fn below_llc() -> Option<LlcGeometry> {
+    let top = llc()?;
+    let mut best: Option<LlcGeometry> = None;
+    for_each_level(|g| {
+        if g.level < top.level && best.map_or(true, |b: LlcGeometry| g.level > b.level) {
+            best = Some(g);
+        }
+    });
+    best
+}
+
+/// Jede gemeldete Daten-/Unified-Ebene einmal an `f` geben.
+///
+/// Eine Stelle, an der `CPUID.4` zerlegt wird — [`llc`] und [`below_llc`] unterscheiden sich nur
+/// in der Auswahl. Zwei Fassungen derselben Zerlegung wären genau die Doppelung, an der dieses
+/// Projekt schon einmal auseinandergelaufene Farbarithmetik hatte.
+fn for_each_level(mut f: impl FnMut(LlcGeometry)) {
     // Blatt 4 existiert nur, wenn das höchste Basisblatt >= 4 ist. Ohne diese Prüfung
     // liefert `cpuid` das höchste unterstützte Blatt zurück — also plausibel aussehenden
     // Müll, aus dem eine Farbanzahl fiele, die nichts mit der HW zu tun hat.
     if cpuid(0).0 < 4 {
-        return None;
+        return;
     }
-    let mut best: Option<LlcGeometry> = None;
     // 16 Unterblätter sind mehr als jede real gemeldete Cache-Hierarchie; der Abbruch bei
     // TYPE_NULL ist der eigentliche Terminator, die Schranke nur das Netz darunter.
     for sub in 0..16u32 {
@@ -64,12 +103,8 @@ pub fn llc() -> Option<LlcGeometry> {
         let ways = ((ebx >> 22) & 0x3FF) + 1;
         let sets = ecx + 1;
         let size = line as u64 * partitions as u64 * ways as u64 * sets as u64;
-        let g = LlcGeometry { level, size_bytes: size, ways, line_bytes: line, sets };
-        if best.map_or(true, |b| g.level > b.level) {
-            best = Some(g);
-        }
+        f(LlcGeometry { level, size_bytes: size, ways, line_bytes: line, sets });
     }
-    best
 }
 
 /// Anzahl unterscheidbarer **Seitenfarben** im LLC.

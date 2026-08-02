@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn farbige_allokation_liefert_nur_erlaubte_farben() {
         let mut a = with_ram(0x4000_0000, 64 * 1024 * 1024);
-        let m = stripe(1, 4).unwrap();
+        let m = stripe(1, 4, COLORS).unwrap();
         let cap = a.alloc_colored(4 * PAGE, PAGE, COLORS, m).expect("Platz vorhanden");
         assert!(all_pages_in(&cap, m), "Seite mit unerlaubter Farbe vergeben");
     }
@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn disjunkte_streifen_teilen_keine_farbe() {
         let mut a = with_ram(0x4000_0000, 64 * 1024 * 1024);
-        let (m0, m1) = (stripe(0, 2).unwrap(), stripe(1, 2).unwrap());
+        let (m0, m1) = (stripe(0, 2, COLORS).unwrap(), stripe(1, 2, COLORS).unwrap());
         let c0 = a.alloc_colored(8 * PAGE, PAGE, COLORS, m0).expect("PD 0");
         let c1 = a.alloc_colored(8 * PAGE, PAGE, COLORS, m1).expect("PD 1");
         assert!(all_pages_in(&c0, m0));
@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn ohne_maske_faellt_die_eigenschaft_um() {
         let mut a = with_ram(0x4000_0000, 64 * 1024 * 1024);
-        let m = stripe(1, 4).unwrap(); // Farben 16..31 (mod 64)
+        let m = stripe(1, 4, COLORS).unwrap(); // Farben 16..31 (mod 64)
         let cap = a.alloc(4 * PAGE, PAGE).expect("Platz vorhanden");
         assert!(
             !all_pages_in(&cap, m),
@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn zu_grosse_region_wird_abgewiesen() {
         let mut a = with_ram(0x4000_0000, 64 * 1024 * 1024);
-        let m = stripe(0, 4).unwrap(); // 16 von 64 Bits
+        let m = stripe(0, 4, COLORS).unwrap(); // 16 von 64 Bits
         assert!(a.alloc_colored(16 * PAGE, PAGE, COLORS, m).is_some(), "16 Seiten passen");
         assert!(
             a.alloc_colored(17 * PAGE, PAGE, COLORS, m).is_none(),
@@ -415,7 +415,9 @@ mod tests {
     #[test]
     fn ohne_farben_wie_alloc() {
         let mut a = with_ram(0x4000_0000, 16 * 1024 * 1024);
-        let cap = a.alloc_colored(4 * PAGE, PAGE, 1, stripe(0, 4).unwrap());
+        // Die Maske ist eine echte Vierteilung; die MASCHINE hat nur eine Farbe. Genau diese
+        // Kombination meint `colors <= 1` -- deshalb wird die Maske fuer COLORS gebaut.
+        let cap = a.alloc_colored(4 * PAGE, PAGE, 1, stripe(0, 4, COLORS).unwrap());
         assert!(cap.is_some());
     }
 
@@ -425,7 +427,7 @@ mod tests {
         let mut a = with_ram(0x4000_0000, 64 * 1024 * 1024);
         let free0 = a.total_free();
         let caps: std::vec::Vec<_> = (0..4)
-            .map(|i| a.alloc_colored(4 * PAGE, PAGE, COLORS, stripe(i, 4).unwrap()).unwrap())
+            .map(|i| a.alloc_colored(4 * PAGE, PAGE, COLORS, stripe(i, 4, COLORS).unwrap()).unwrap())
             .collect();
         assert!(a.total_free() < free0);
         for c in caps {

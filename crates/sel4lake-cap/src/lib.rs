@@ -27,6 +27,7 @@
 //! die fertigen [`Slab`](sel4lake_slab::Slab)-Handles an. [`CapSlot`] und [`Object`] sind deshalb
 //! öffentlich — als undurchsichtige Platzhalter mit `EMPTY`, ohne zugängliche Felder.
 
+pub mod checkpoint;
 mod object;
 mod space;
 

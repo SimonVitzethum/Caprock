@@ -45,6 +45,9 @@
 //! Reine, sichere Index-Logik — **kein `unsafe`** außer den Boot-`attach`-Aufrufen (die
 //! Rohspeicher-Domäne liegt in `sel4lake-slab`).
 
+mod cycles;
+pub use cycles::{CycleStats, Reject, Sample, Source, Stamp, MAX_PLAUSIBLE_SLICE};
+
 use core::sync::atomic::{AtomicU64, Ordering};
 use sel4lake_hal::exception::init_thread_frame;
 use sel4lake_slab::{AtomicTable, FreeList, Slab};
@@ -237,6 +240,13 @@ struct Tcb {
     sc_donor: Option<usize>,
     /// Lokaler Slot des Threads, der gerade gegen dieses Konto läuft (`None` = keiner).
     sc_donee: Option<usize>,
+    // --- Zyklenabrechnung (B-5.1) ---
+    /// Verbrauchte Zyklen + die Gründe, warum die Summe unvollständig sein könnte.
+    /// Wandert bei einer Migration **mit** (der `Migrant` trägt den ganzen `Tcb`) — es ist der
+    /// Lebensverbrauch des Threads, keine Eigenschaft des Kerns.
+    cyc: CycleStats,
+    /// Offener Stempel, solange der Thread **läuft**. `None` heisst „läuft gerade nicht".
+    stamp: Option<Stamp>,
 }
 
 impl Tcb {
@@ -259,6 +269,8 @@ impl Tcb {
         depleted: false,
         sc_donor: None,
         sc_donee: None,
+        cyc: CycleStats::EMPTY,
+        stamp: None,
     };
 }
 
@@ -358,6 +370,14 @@ pub struct Scheduler {
     /// Telemetrie: wie oft erschöpfte ein Budget bzw. wurde aufgefüllt (für Tests).
     depletions: u64,
     refills: u64,
+    /// Taugt die Zyklenquelle als Zeitachse? **Vorgabe `Untrusted`** (B-5.1): solange der
+    /// Kernel die Invarianz nicht ausdrücklich zugesichert hat, wird nichts abgerechnet.
+    /// Die sichere Vorgabe ist „ich weiss es nicht", nicht „wird schon stimmen" — auf einer
+    /// gemieteten Maschine ist Letzteres eine erfundene Rechnung.
+    cycle_source: Source,
+    /// Kernweite Summe derselben Proben (Telemetrie; die Ablehnungsgründe interessieren hier
+    /// besonders, weil sie an der **Maschine** hängen und nicht am Thread).
+    cyc_core: CycleStats,
     /// Belegte TCB-Slots (O(1)-`load()`); wird nach `CORE_LOAD` gespiegelt.
     used: usize,
     /// Anzahl aktuell **erschöpfter** MCS-Konten. Ist sie 0, entfällt der Refill-Scan
@@ -403,6 +423,8 @@ impl Scheduler {
             now: 0,
             depletions: 0,
             refills: 0,
+            cycle_source: Source::Untrusted,
+            cyc_core: CycleStats::EMPTY,
             used: 0,
             depleted_count: 0,
             migrations_out: 0,
@@ -706,6 +728,11 @@ impl Scheduler {
         let was_ready = self.tcbs[s].queued != NOT_QUEUED;
         self.remove_from_ready(s);
         let mut tcb = self.tcbs[s];
+        // Der offene Zyklenstempel wird **absichtlich nicht** geloescht (B-5.1). Ein migrierender
+        // Thread laeuft nicht (s. oben), sein Stempel ist also normalerweise schon geschlossen.
+        // Ist er es nicht, hat der Kernel `charge_current` vergessen -- und dann soll die naechste
+        // Messung auf dem Zielkern als `Reject::CoreChanged` **auffallen** statt still zu
+        // verschwinden. Loeschen hiesse, den einzigen Hinweis auf den vergessenen Aufruf zu tilgen.
         // Lokale Verkettung/Slot-Bezüge gehören dem Quellkern -> zurücksetzen.
         tcb.queued = NOT_QUEUED;
         tcb.qnext = NIL;
@@ -886,9 +913,88 @@ impl Scheduler {
         }
     }
 
+    /// Wie viele **Ticks** dieser Kern gesehen hat.
+    ///
+    /// Die Vergleichszahl zur Zyklenabrechnung (B-5.1): die Tick-Rechnung kann höchstens einmal
+    /// je Tick belasten. Liegt die Zahl der Zyklenproben deutlich darüber, sind genau so viele
+    /// Abrechnungsereignisse **zwischen** den Ticks passiert — und die fielen vorher weg.
+    pub fn ticks(&self) -> u64 {
+        self.now
+    }
+
     /// MCS-Telemetrie dieses Kerns: (Budget-Erschöpfungen, Refills). Für Tests.
     pub fn budget_stats(&self) -> (u64, u64) {
         (self.depletions, self.refills)
+    }
+
+    // --- Zyklenabrechnung (B-5.1) -------------------------------------------------------------
+    //
+    // **Bewusst additiv.** `on_tick`/`switch_to`/`block_current` behalten ihre Signatur; die
+    // Abrechnung klammert sie ein. Der Grund ist nicht Bequemlichkeit: die Uhr gehoert dem
+    // Kernel (nur er kennt `hal::timer::cycles()` und die Invarianz-Zusage), die Rechnung
+    // gehoert hierher. Wuerde diese Crate die Uhr selbst lesen, waere die Arithmetik an ein
+    // Ziel gebunden und damit genau das nicht mehr, was sie sein muss: host-pruefbar.
+    //
+    // Die Tick-Rechnung (`remaining`) bleibt **unangetastet**. B-5.1 liefert die Messung; die
+    // Verdraengung von der Messung zu entkoppeln ist B-5.2. Beides in einem Schritt zu aendern
+    // hiesse, MCS umzubauen, waehrend man die Messung erst einfuehrt.
+
+    /// Die Zyklenquelle als **invariant** zusichern — oder die Zusicherung zurueckziehen.
+    ///
+    /// Nur der Kernel kann das beantworten (x86: `CPUID.80000007H:EDX.InvariantTSC`, unter TCG
+    /// nicht zugesichert). Ohne diesen Aufruf bleibt es bei [`Source::Untrusted`], und dann wird
+    /// **nichts** abgerechnet — sichtbar an den Ablehnungszaehlern, nicht als stille Null.
+    pub fn set_cycle_source(&mut self, source: Source) {
+        self.cycle_source = source;
+    }
+
+    /// Den laufenden Thread bis `now` belasten und seinen Stempel schliessen.
+    ///
+    /// **Vor** jeder Umplanung zu rufen (`on_tick`, `switch_to`, `block_current`,
+    /// `exit_current`, `yield`). Ohne offenen Stempel ein No-Op — ein doppelter Aufruf rechnet
+    /// also nicht doppelt ab.
+    pub fn charge_current(&mut self, core: usize, now: u64) {
+        debug_assert_eq!(core, self.core);
+        let Some(cur) = self.current else { return };
+        let Some(prev) = self.tcbs[cur].stamp.take() else {
+            return;
+        };
+        let s = cycles::measure(
+            prev,
+            Stamp { cycles: now, core: core as u16 },
+            self.cycle_source,
+            MAX_PLAUSIBLE_SLICE,
+        );
+        // Gegen dasselbe **Konto** wie die Tick-Rechnung: laeuft der Thread auf einem
+        // geliehenen Scheduling-Context (Donation), zahlt der Spender. Sonst haetten
+        // Zyklen- und Tick-Rechnung zwei verschiedene Schuldner, und die Monitoring-Cap
+        // zeigte etwas anderes als das Budget durchsetzt.
+        let acct = self.tcbs[cur].sc_donor.unwrap_or(cur);
+        self.tcbs[acct].cyc.apply(s);
+        self.cyc_core.apply(s);
+    }
+
+    /// Fuer den (nach der Umplanung) laufenden Thread einen neuen Stempel setzen.
+    /// **Nach** jeder Umplanung zu rufen.
+    pub fn stamp_current(&mut self, core: usize, now: u64) {
+        debug_assert_eq!(core, self.core);
+        if let Some(cur) = self.current {
+            self.tcbs[cur].stamp = Some(Stamp { cycles: now, core: core as u16 });
+        }
+    }
+
+    /// Das Zyklenkonto eines Threads (Grundlage der Monitoring-Cap).
+    ///
+    /// `None` bei ungueltigem Handle. Beachte [`CycleStats::measurable`]: ist es `false`, ist
+    /// `consumed` keine gemessene Null, sondern eine Leerstelle.
+    pub fn consumed_cycles(&self, tid: ThreadId) -> Option<CycleStats> {
+        self.resolve(tid).map(|s| self.tcbs[s].cyc)
+    }
+
+    /// Kernweite Zyklentelemetrie — vor allem die Ablehnungsgruende: sie haengen an der
+    /// **Maschine** (Quelle nicht invariant, Zaehler springt) und nicht am einzelnen Thread.
+    pub fn cycle_stats(&self) -> CycleStats {
+        self.cyc_core
     }
 
     /// Eine **Budget-Donation beenden**: der laufende Thread (Server beim REPLY) gibt das
@@ -1168,4 +1274,26 @@ pub trait SchedOps {
     fn map_frame(&mut self, caller: ThreadId, base: u64, len: u64, perm_code: u8) -> bool;
     /// Einen zuvor gemappten Frame wieder aus der VSpace des Aufrufers entfernen.
     fn unmap_frame(&mut self, caller: ThreadId, base: u64, len: u64) -> bool;
+    /// Ein **Geräte-Fenster** (MMIO-Register oder DMA-RAM) in die VSpace des Aufrufers mappen —
+    /// A-5.1, der Weg, auf dem ein Treiber im Userland an seine Hardware kommt.
+    ///
+    /// Getrennt von [`Self::map_frame`], weil die **Speicherattribute** verschieden sind und nicht
+    /// aus den Cap-Rechten folgen: Geräteregister dürfen nicht gecacht und nicht spekulativ
+    /// gelesen werden, DMA-RAM schon (bzw. nicht, je nach Kohärenz). Beides über einen Parameter
+    /// zu fahren, der „Rechte" heißt, hätte die Attribute an die Rechte gekoppelt — zwei Dinge,
+    /// die nichts miteinander zu tun haben.
+    ///
+    /// `dma`: `None` = MMIO-Register, `Some(coherent)` = DMA-RAM.
+    /// Rückgabe: `None` bei Fehlschlag, sonst die **Gerätesicht** der Region (IOVA) — `0`, wenn es
+    /// keine gibt (MMIO). Ein Treiber braucht beide Achsen und bekommt sie hier getrennt.
+    fn map_window(
+        &mut self,
+        caller: ThreadId,
+        base: u64,
+        len: u64,
+        ro: bool,
+        dma: Option<bool>,
+    ) -> Option<u64>;
+    /// Ein zuvor per [`Self::map_window`] gemapptes Geräte-Fenster wieder entfernen.
+    fn unmap_window(&mut self, caller: ThreadId, base: u64, len: u64) -> bool;
 }

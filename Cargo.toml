@@ -13,6 +13,8 @@ members = [
     "crates/sel4lake-abi",
     "crates/sel4lake-hal",
     "crates/sel4lake-virtio",
+    "crates/sel4lake-part",
+    "crates/sel4lake-fat",
     "crates/sel4lake-mem",
     "crates/sel4lake-region",
     "crates/sel4lake-loader",

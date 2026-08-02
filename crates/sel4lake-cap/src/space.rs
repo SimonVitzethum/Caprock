@@ -168,6 +168,72 @@ impl<'a> Finalized<'a> {
     }
 }
 
+// --- Zählgrenzen der CDT-Läufe (B-5.5) --------------------------------------------------------
+//
+// Jede Schleife über den CDT läuft über eine Struktur, die **Mandanten mitgestalten**: jedes
+// `copy`/`mint` hängt einen Knoten hinein. Solange niemand sagt, wie lang ein Lauf höchstens wird,
+// ist „der Kernel ist reaktiv" eine Hoffnung — und hier ist es mehr als eine Latenzfrage: ein
+// zyklisch verketteter CDT liesse `revoke` **endlos** laufen, und zwar unter der CAPS-Sperre, die
+// dann niemand mehr freigibt. Aus einer Datenstrukturanomalie würde ein stehender Knoten.
+//
+// Die Grenze ist bewusst eine **Operationszahl**, keine Zeit: Zyklen hängen an Taktrate und
+// Emulation, Schritte hängen an der Struktur. Und sie ist nicht gegriffen, sondern hergeleitet:
+// ein azyklischer Lauf besucht keinen Slot zweimal, kann also nie mehr Schritte tun, als es Slots
+// gibt. Genau diese Schranke benutzt [`CapSpace::audit_cdt`] seit jeher für ihren Code 7 — bisher
+// als zwei eingestreute `steps > nslots`, jetzt als eine benannte Stelle.
+//
+// **Die Grenze schneidet nichts Legitimes ab.** Sie ist erst erreichbar, wenn die Baumform bereits
+// verletzt ist. Ihr Erreichen ist deshalb ein *gezählter Befund*
+// ([`CapSpace::cdt_walk_overruns`]) und kein Normalbetrieb — dieselbe Form wie
+// [`Finalized::overflowed`]: „kann nicht vorkommen" muss prüfbar sein statt behauptet.
+
+/// Von `start` aus zum ersten Blatt absteigen (immer `first_child`).
+///
+/// `Ok((blatt, schritte))`, oder `Err(())`, wenn die Schrittgrenze überschritten wurde oder ein
+/// Kindindex ausserhalb der Tabelle liegt — beides heisst: der CDT ist **nicht baumförmig**.
+///
+/// Freie Funktion über einem Slice statt Methode, damit sie ohne `CapSpace` (und damit ohne
+/// [`Slab`](sel4lake_slab::Slab), dessen Konstruktion `unsafe` ist) geprüft werden kann. Diese
+/// Crate ist `forbid(unsafe_code)`; ein Test, der die Grenze belegen soll, muss also ohne
+/// Tabellen-Handle auskommen.
+fn descend_to_leaf(slots: &[CapSlot], start: usize, limit: usize) -> Result<(usize, usize), ()> {
+    let mut leaf = start;
+    let mut steps = 0usize;
+    loop {
+        let Some(s) = slots.get(leaf) else {
+            return Err(()); // Index ausserhalb der Tabelle -> Verkettung kaputt
+        };
+        let Some(c) = s.mdb.first_child else {
+            return Ok((leaf, steps));
+        };
+        steps += 1;
+        if steps > limit {
+            return Err(());
+        }
+        leaf = c;
+    }
+}
+
+/// Länge der Kinderliste von `parent`, mit derselben Schranke und aus demselben Grund.
+fn count_children(slots: &[CapSlot], parent: usize, limit: usize) -> Result<usize, ()> {
+    let mut n = 0usize;
+    let mut cur = match slots.get(parent) {
+        Some(s) => s.mdb.first_child,
+        None => return Err(()),
+    };
+    while let Some(i) = cur {
+        n += 1;
+        if n > limit {
+            return Err(());
+        }
+        let Some(s) = slots.get(i) else {
+            return Err(());
+        };
+        cur = s.mdb.next_sibling;
+    }
+    Ok(n)
+}
+
 /// Lesbare Sicht auf einen Capability (für Diagnose/Tests).
 #[derive(Clone, Copy, Debug)]
 pub struct CapInfo {
@@ -203,6 +269,17 @@ pub struct CapSpace {
     peak_slots: usize,
     /// Höchststand belegter Objekt-Einträge, aus demselben Grund.
     peak_objects: usize,
+    /// **Längster CDT-Lauf** in Schritten seit dem Start (B-5.5) — die Zahl, die „reaktiv"
+    /// überhaupt erst zu einer Aussage macht. Aus demselben Grund mitgeführt wie `peak_slots`:
+    /// hinterher gemessen sieht ein Lauf harmlos aus, der zwischendurch an der Grenze war.
+    peak_cdt_walk: usize,
+    /// Grösster **Teilbaum**, den ein einzelnes `revoke` gelöscht hat (Anzahl `delete_leaf`).
+    /// Das ist die zweite Hälfte der Zusage: ein Lauf kann kurz sein und trotzdem sehr oft
+    /// stattfinden.
+    peak_revoke_ops: usize,
+    /// Wie oft hat ein Lauf die strukturelle Schranke erreicht? **Muss 0 sein.** Ist er es nicht,
+    /// war der CDT nicht baumförmig — und die betroffene Operation ist unvollständig geblieben.
+    cdt_walk_overruns: u32,
 }
 
 impl Default for CapSpace {
@@ -220,6 +297,9 @@ impl CapSpace {
             objects: Slab::empty(),
             peak_slots: 0,
             peak_objects: 0,
+            peak_cdt_walk: 0,
+            peak_revoke_ops: 0,
+            cdt_walk_overruns: 0,
         }
     }
 
@@ -436,11 +516,21 @@ impl CapSpace {
         if let Some(n) = mdb.next_sibling {
             self.slots[n].mdb.prev_sibling = Some(dst);
         }
+        // Ebenfalls begrenzt: die Kinderliste ist mandantengestaltet (jedes `copy` hängt vorne
+        // ein), und eine zyklische Geschwisterkette liefe hier endlos.
+        let limit = self.cdt_step_limit();
         let mut child = mdb.first_child;
+        let mut steps = 0usize;
         while let Some(c) = child {
+            steps += 1;
+            if steps > limit {
+                self.note_overrun();
+                break;
+            }
             self.slots[c].mdb.parent = Some(dst);
             child = self.slots[c].mdb.next_sibling;
         }
+        self.note_walk(steps);
 
         // Quellslot freigeben (Generation erhöhen -> altes Handle ungültig).
         self.release_slot(s);
@@ -473,13 +563,37 @@ impl CapSpace {
         rf: &mut Finalized<'_>,
     ) -> Result<(), CapError> {
         let slot = self.resolve(ptr)?;
+        let limit = self.cdt_step_limit();
         // Wiederholt zu einem Blatt unterhalb von `slot` absteigen und löschen.
+        //
+        // **Beide** Schleifen sind begrenzt (B-5.5), und zwar aus verschiedenen Gründen: der
+        // Abstieg endet bei einer zyklischen `first_child`-Kette nie, und die äussere Schleife
+        // endet nie, wenn `delete_leaf` den Baum nicht kleiner macht. Ohne die Grenzen hinge der
+        // Kern hier unter der CAPS-Sperre — bei einer Struktur, die Mandanten mitgestalten.
+        let mut ops = 0usize;
         while let Some(child) = self.slots[slot].mdb.first_child {
-            let mut leaf = child;
-            while let Some(c) = self.slots[leaf].mdb.first_child {
-                leaf = c;
-            }
+            let (leaf, steps) = match descend_to_leaf(self.slots.as_slice(), child, limit) {
+                Ok(v) => v,
+                Err(()) => {
+                    // Der Teilbaum ist nicht baumförmig. Abbrechen ist die einzig richtige
+                    // Antwort — aber **gezählt**: dieses `revoke` ist unvollständig, es leben
+                    // noch Abkömmlinge, die weg sein sollten.
+                    self.note_overrun();
+                    break;
+                }
+            };
+            self.note_walk(steps);
             self.delete_leaf(alloc, leaf, rf);
+            ops += 1;
+            if ops > limit {
+                // Mehr Löschungen als Slots: jede Löschung gibt genau einen Slot frei, das kann
+                // nicht sein. Auch das ist ein Befund, kein Normalfall.
+                self.note_overrun();
+                break;
+            }
+        }
+        if ops > self.peak_revoke_ops {
+            self.peak_revoke_ops = ops;
         }
         Ok(())
     }
@@ -512,6 +626,34 @@ impl CapSpace {
     /// Höchststand belegter Objekt-Einträge und die Kapazität dazu.
     pub fn peak_objects(&self) -> (usize, usize) {
         (self.peak_objects, self.objects.len())
+    }
+
+    /// **Längster CDT-Lauf in Schritten** und die strukturelle Schranke dazu (B-5.5).
+    ///
+    /// Eine Operationszahl, keine Zeit — damit sie zwischen Blech, KVM und TCG dieselbe Aussage
+    /// trifft. Der Abstand zur Schranke ist der Spielraum, den die Zusage „begrenzte kritische
+    /// Sektion" tatsächlich hat; ohne ihn ist sie eine Hoffnung.
+    pub fn peak_cdt_walk(&self) -> (usize, usize) {
+        (self.peak_cdt_walk, self.cdt_step_limit())
+    }
+
+    /// Grösster von einem einzelnen `revoke` gelöschter Teilbaum (Anzahl Löschoperationen) und
+    /// die Schranke dazu. Die zweite Hälfte von [`peak_cdt_walk`](Self::peak_cdt_walk): ein
+    /// einzelner Lauf kann kurz sein, das `revoke` darüber trotzdem lang.
+    pub fn peak_revoke_ops(&self) -> (usize, usize) {
+        (self.peak_revoke_ops, self.cdt_step_limit())
+    }
+
+    /// Wie oft ein CDT-Lauf die Schranke erreicht hat. **Muss 0 sein.**
+    ///
+    /// Ist er es nicht, war der CDT nicht baumförmig (dasselbe, was
+    /// [`audit_cdt`](Self::audit_cdt) mit Code 7 meldet) — und die betroffene Operation ist
+    /// **unvollständig** abgebrochen. Bei `revoke` heisst unvollständig: es leben noch
+    /// Abkömmlinge, die weg sein sollten. Genau deshalb steht das hier als Zähler und nicht als
+    /// stilles Abschneiden; der Aufrufer **muss** ihn auswerten, wie er
+    /// [`Finalized::overflowed`] auswertet.
+    pub fn cdt_walk_overruns(&self) -> u32 {
+        self.cdt_walk_overruns
     }
 
     /// Den von `cap` bezeichneten Slot in `seen` **markieren** — Baustein der Summenprüfung
@@ -581,6 +723,11 @@ impl CapSpace {
     pub fn audit_cdt(&self, refs: &mut [u32]) -> u32 {
         let nslots = self.slots.len();
         let nobjects = self.objects.len();
+        // **Dieselbe** Schranke, die auch die Operationen begrenzen (B-5.5). Sie stand hier schon
+        // immer -- als zwei eingestreute `steps > nslots`. Dass ausgerechnet der *Prüfer* gegen
+        // einen zyklischen CDT geschützt war und `revoke` nicht, war die eigentliche Schieflage:
+        // der Prüfer läuft auf Anforderung, `revoke` auf Mandantenwunsch.
+        let limit = self.cdt_step_limit();
         // Der Zählpuffer kommt seit A-3.4 vom Aufrufer (dieselbe Entscheidung wie bei
         // `Finalized`): ein `[0u32; NOBJECTS]` war ein Stack-Array mit Compile-Zeit-Größe und
         // hätte die Objekttabelle wieder an die Stackgröße gebunden. Zu klein ist ein eigener
@@ -636,7 +783,7 @@ impl CapSpace {
                     }
                     c = self.slots[ci].mdb.next_sibling;
                     steps += 1;
-                    if steps > nslots {
+                    if steps > limit {
                         return 7;
                     }
                 }
@@ -685,7 +832,7 @@ impl CapSpace {
             let mut steps = 0;
             while let Some(pi) = p {
                 steps += 1;
-                if steps > nslots {
+                if steps > limit {
                     return 7;
                 }
                 p = self.slots[pi].mdb.parent;
@@ -695,19 +842,46 @@ impl CapSpace {
     }
 
     /// Sicht auf einen Cap (oder `None` bei ungültigem Handle).
+    ///
+    /// **Seit B-5.5 auch `None`, wenn die Kinderliste die Schrittgrenze reisst** — dann ist der
+    /// CDT nicht baumförmig und jede Kinderzahl wäre erfunden. Der Fall wird hier **nicht**
+    /// mitgezählt: `inspect` nimmt `&self` und kann den Zähler nicht führen. Er ist trotzdem
+    /// nicht unsichtbar — dieselbe Struktur meldet [`audit_cdt`](Self::audit_cdt) mit Code 7,
+    /// und jede *verändernde* Operation über denselben Pfad erhöht
+    /// [`cdt_walk_overruns`](Self::cdt_walk_overruns).
     pub fn inspect(&self, ptr: CapPtr) -> Option<CapInfo> {
         let slot = self.resolve(ptr).ok()?;
         let obj = self.slots[slot].object;
+        // Reisst die Kinderliste die Schranke, ist die Zahl bedeutungslos -> `None` statt einer
+        // erfundenen 0. Eine Sicht, die bei kaputter Verkettung „keine Kinder" meldet, wäre
+        // genau die stille Falschaussage, gegen die die Schranke gebaut ist.
+        let child_count = self.child_count(slot).ok()?;
         Some(CapInfo {
             kind: self.objects[obj].kind,
             rights: self.slots[slot].rights,
             badge: self.slots[slot].badge,
             refcount: self.objects[obj].refcount,
-            child_count: self.child_count(slot),
+            child_count,
         })
     }
 
     // --- intern ---
+
+    /// Die strukturelle Schranke jedes CDT-Laufs: so viele Slots gibt es, mehr kann ein
+    /// azyklischer Lauf nicht besuchen. **Eine** Quelle für alle Läufe und für `audit_cdt`.
+    fn cdt_step_limit(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn note_walk(&mut self, steps: usize) {
+        if steps > self.peak_cdt_walk {
+            self.peak_cdt_walk = steps;
+        }
+    }
+
+    fn note_overrun(&mut self) {
+        self.cdt_walk_overruns = self.cdt_walk_overruns.saturating_add(1);
+    }
 
     fn ptr(&self, slot: usize) -> CapPtr {
         CapPtr {
@@ -787,14 +961,11 @@ impl CapSpace {
         Ok(i)
     }
 
-    fn child_count(&self, slot: usize) -> usize {
-        let mut n = 0;
-        let mut c = self.slots[slot].mdb.first_child;
-        while let Some(i) = c {
-            n += 1;
-            c = self.slots[i].mdb.next_sibling;
-        }
-        n
+    /// Länge der Kinderliste. `0` auch dann, wenn die Verkettung die Schranke reisst — der
+    /// Zähler [`cdt_walk_overruns`](Self::cdt_walk_overruns) sagt, dass das passiert ist.
+    /// `&self`, deshalb hier ohne Buchung; der Befund wird in [`inspect`](Self::inspect) gebucht.
+    fn child_count(&self, slot: usize) -> Result<usize, ()> {
+        count_children(self.slots.as_slice(), slot, self.cdt_step_limit())
     }
 
     /// `child` vorne in die Kinderliste von `parent` einhängen.
@@ -861,5 +1032,97 @@ impl CapSpace {
             self.objects[obj] = Object::EMPTY;
             self.objects[obj].gen = gen;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Kette `0 -> 1 -> ... -> n-1` ueber `first_child` (Tiefe n-1).
+    fn kette<const N: usize>() -> [CapSlot; N] {
+        let mut v = [CapSlot::EMPTY; N];
+        for (i, s) in v.iter_mut().enumerate() {
+            s.used = true;
+            s.mdb.first_child = if i + 1 < N { Some(i + 1) } else { None };
+        }
+        v
+    }
+
+    /// Der Normalfall: der Abstieg findet das Blatt und meldet die **Anzahl Schritte**.
+    /// Genau diese Zahl ist die Zusage -- eine Operationszahl, keine Zeit.
+    #[test]
+    fn abstieg_findet_das_blatt_und_zaehlt_die_schritte() {
+        let slots = kette::<4>();
+        assert_eq!(descend_to_leaf(&slots, 0, 8), Ok((3, 3)));
+        // Von der Mitte aus entsprechend kuerzer.
+        assert_eq!(descend_to_leaf(&slots, 2, 8), Ok((3, 1)));
+        // Ein Blatt ist nach null Schritten erreicht.
+        assert_eq!(descend_to_leaf(&slots, 3, 8), Ok((3, 0)));
+    }
+
+    /// **Die Grenze greift.** Eine Kette, die laenger ist als erlaubt, wird abgewiesen statt
+    /// zu Ende gelaufen. Ohne diese Pruefung gaebe es keine Aussage darueber, wie lang die
+    /// kritische Sektion hoechstens wird.
+    #[test]
+    fn abstieg_bricht_an_der_schranke_ab() {
+        let slots = kette::<6>();
+        assert_eq!(descend_to_leaf(&slots, 0, 5), Ok((5, 5)), "genau an der Grenze noch gueltig");
+        assert_eq!(descend_to_leaf(&slots, 0, 4), Err(()), "ueber der Grenze -> Befund");
+    }
+
+    /// **Der Fall, um den es wirklich geht:** eine zyklische `first_child`-Kette. Ohne Schranke
+    /// laeuft der Abstieg hier endlos -- im Kernel unter der CAPS-Sperre, die dann niemand mehr
+    /// freigibt. Dass dieser Test ueberhaupt *terminiert*, ist das Ergebnis.
+    #[test]
+    fn abstieg_terminiert_auf_einem_zyklus() {
+        let mut slots = [CapSlot::EMPTY; 3];
+        for s in slots.iter_mut() {
+            s.used = true;
+        }
+        slots[0].mdb.first_child = Some(1);
+        slots[1].mdb.first_child = Some(2);
+        slots[2].mdb.first_child = Some(1); // zurueck -> Zyklus
+        assert_eq!(descend_to_leaf(&slots, 0, 3), Err(()));
+    }
+
+    /// Ein Kindindex ausserhalb der Tabelle ist ebenfalls „nicht baumfoermig" -- und darf kein
+    /// Panic sein. Ein `slots[i]` mit rohem Index waere hier ein Kernel-Panic aus Mandantendaten.
+    #[test]
+    fn abstieg_weist_index_ausserhalb_der_tabelle_ab() {
+        let mut slots = [CapSlot::EMPTY; 2];
+        slots[0].used = true;
+        slots[0].mdb.first_child = Some(99);
+        assert_eq!(descend_to_leaf(&slots, 0, 8), Err(()));
+        assert_eq!(descend_to_leaf(&slots, 99, 8), Err(()), "Startindex ebenso");
+    }
+
+    /// Die Kinderliste zaehlt richtig -- und bricht bei einer zyklischen Geschwisterkette ab
+    /// statt zu haengen. `move_cap` laeuft ueber genau diese Verkettung.
+    #[test]
+    fn kinderliste_zaehlt_und_bricht_ab() {
+        // parent 0 mit den Kindern 1,2,3.
+        let mut slots = [CapSlot::EMPTY; 4];
+        for s in slots.iter_mut() {
+            s.used = true;
+            s.mdb = Mdb::EMPTY;
+        }
+        slots[0].mdb.first_child = Some(1);
+        slots[1].mdb.next_sibling = Some(2);
+        slots[2].mdb.next_sibling = Some(3);
+        assert_eq!(count_children(&slots, 0, 8), Ok(3));
+        assert_eq!(count_children(&slots, 3, 8), Ok(0), "ein Blatt hat keine Kinder");
+        // Und jetzt der Zyklus: 3 zeigt zurueck auf 1.
+        slots[3].mdb.next_sibling = Some(1);
+        assert_eq!(count_children(&slots, 0, 8), Err(()));
+    }
+
+    /// Auch die Kinderliste weist einen Index ausserhalb der Tabelle ab.
+    #[test]
+    fn kinderliste_weist_index_ausserhalb_der_tabelle_ab() {
+        let mut slots = [CapSlot::EMPTY; 2];
+        slots[0].used = true;
+        slots[0].mdb.first_child = Some(42);
+        assert_eq!(count_children(&slots, 0, 8), Err(()));
     }
 }

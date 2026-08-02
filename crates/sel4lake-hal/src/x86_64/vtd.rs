@@ -207,12 +207,13 @@ fn wu64(unit: usize, off: usize, v: u64) {
     unsafe { core::ptr::write_volatile((b + off as u64) as *mut u64, v) };
 }
 
-// Kurzformen für Einheit 0 (Bring-up-Pfad, solange nur eine Einheit zugeteilt wird).
+// Kurzformen für **Einheit 0**. Sie sind nach B-3.3 kein Standardweg mehr, sondern nur noch für
+// die Pfade da, die tatsächlich einheitsgebunden sind: QI und IR werden heute ausschliesslich auf
+// Einheit 0 aufgesetzt (s. `init`), und die Diagnosefunktionen `version`/`cap`/`ecap` melden
+// bewusst eine einzelne Einheit. Alles, was eine Aussage über *die IOMMU* trifft, geht über
+// `ru32`/`wu32` mit ausdrücklicher Einheit.
 fn read32(off: usize) -> u32 {
     ru32(0, off)
-}
-fn write32(off: usize, v: u32) {
-    wu32(0, off, v)
 }
 fn read64(off: usize) -> u64 {
     ru64(0, off)
@@ -221,26 +222,83 @@ fn write64(off: usize, v: u64) {
     wu64(0, off, v)
 }
 
-/// Ein **Ein-Schritt-Kommando** absetzen, ohne die Zustandsbits zu verlieren.
+/// Ein **Ein-Schritt-Kommando** an `unit` absetzen, ohne die Zustandsbits zu verlieren.
 ///
 /// `one_shot` ist das Kommandobit (`SRTP`, `SIRTP`, …); alle Zustandsbits werden aus `GSTS`
 /// übernommen. `want_mask`/`want_set` beschreiben, worauf gewartet wird.
-fn gcmd_issue(one_shot: u32, want_mask: u32, want_set: bool) -> bool {
-    let state = read32(REG_GSTS) & GCMD_STATE_MASK;
-    write32(REG_GCMD, state | one_shot);
-    wait_status(want_mask, want_set)
+fn gcmd_issue_on(unit: usize, one_shot: u32, want_mask: u32, want_set: bool) -> bool {
+    let state = ru32(unit, REG_GSTS) & GCMD_STATE_MASK;
+    wu32(unit, REG_GCMD, state | one_shot);
+    wait_status_on(unit, want_mask, want_set)
 }
 
-/// Ein **Zustandsbit** setzen oder löschen (ebenfalls unter Erhalt der übrigen).
-fn gcmd_set_state(bit: u32, on: bool) -> bool {
-    let mut state = read32(REG_GSTS) & GCMD_STATE_MASK;
+fn gcmd_issue(one_shot: u32, want_mask: u32, want_set: bool) -> bool {
+    gcmd_issue_on(0, one_shot, want_mask, want_set)
+}
+
+/// Ein **Zustandsbit** an `unit` setzen oder löschen (ebenfalls unter Erhalt der übrigen).
+fn gcmd_set_state_on(unit: usize, bit: u32, on: bool) -> bool {
+    let mut state = ru32(unit, REG_GSTS) & GCMD_STATE_MASK;
     if on {
         state |= bit;
     } else {
         state &= !bit;
     }
-    write32(REG_GCMD, state);
-    wait_status(bit, on)
+    wu32(unit, REG_GCMD, state);
+    wait_status_on(unit, bit, on)
+}
+
+fn gcmd_set_state(bit: u32, on: bool) -> bool {
+    gcmd_set_state_on(0, bit, on)
+}
+
+// --- Sprechfähigkeit einzelner Einheiten (B-3.3) ----------------------------------------------
+//
+// **Das Kernproblem der Aggregation.** Sobald über mehrere Einheiten geschleift wird, bedeutet ein
+// `false` aus `ru32(u, …)` zweierlei: „die Einheit meldet nichts" oder „die Einheit antwortet gar
+// nicht". `ru32` liefert bei fehlender Basis `0` — eine stumme Einheit trägt damit exakt so viel
+// zu `faults_empty()` bei wie eine fehlerfreie. Genau die Form, gegen die dieses Projekt schon
+// zweimal angetreten ist (leere SMMU-Event-Queue ohne `CD.R`, `virtio-rng` ohne Leserichtung):
+// eine Aussage sieht wahr aus, weil der Fall, der sie widerlegen könnte, gar nicht auftreten kann.
+//
+// Deshalb gibt es hier eine ausdrückliche Sprechprobe, und die Abwesenheitsaussagen unten hängen
+// an ihr statt an einer Null.
+
+/// Antwortet die deklarierte Einheit `unit` überhaupt?
+///
+/// Drei Stufen, und alle drei sind nötig: Die Basis muss gesetzt sein (eine DRHD ohne
+/// Registerbasis ist Firmware-Unsinn); `CAP` darf nicht `0` sein (ein nicht abgebildeter Bereich
+/// liest sich unter TCG als Null); und `CAP` darf nicht `!0` sein (ein nicht dekodierter
+/// MMIO-Bereich liest sich auf Blech als lauter Einsen). Nur wer alle drei besteht, darf mit
+/// seinem Schweigen als Beleg für Fehlerfreiheit gelten.
+pub fn unit_speaking(unit: usize) -> bool {
+    if base_of(unit) == 0 {
+        return false;
+    }
+    let cap = ru64(unit, REG_CAP);
+    cap != 0 && cap != u64::MAX
+}
+
+/// Anzahl der Einheiten, die antworten (≤ [`unit_count`]).
+pub fn units_speaking() -> usize {
+    (0..unit_count()).filter(|&u| unit_speaking(u)).count()
+}
+
+/// Antworten **alle** deklarierten Einheiten? Nur dann trägt eine Abwesenheitsaussage.
+pub fn all_units_speaking() -> bool {
+    unit_count() > 0 && units_speaking() == unit_count()
+}
+
+/// Die DMAR deklarierte **mehr** Einheiten, als [`super::dmar::MAX_UNITS`] fasst.
+///
+/// Das ist kein Kapazitätsdetail, sondern ein Loch im Oracle: von den überzähligen Einheiten
+/// kennen wir nicht einmal die Registerbasis, können also weder ihre Fähigkeiten mitteln noch
+/// ihre Faults lesen. Ein Gerät hinter einer solchen Einheit wäre unbemerkt unübersetzt.
+static UNITS_TRUNCATED: AtomicU32 = AtomicU32::new(0);
+
+/// Wurden bei der DMAR-Auswertung Einheiten abgeschnitten?
+pub fn units_truncated() -> bool {
+    UNITS_TRUNCATED.load(Ordering::Acquire) != 0
 }
 
 /// **Fähigkeiten der Einheit**, einmal beim Hochlauf gelesen (Schritt 1 des VT-d-Aufbaus).
@@ -365,6 +423,11 @@ const FSTS_PPF: u32 = 1 << 1;
 /// **alle** Einheiten.
 static CFG_ERRORS: AtomicU32 = AtomicU32::new(0);
 
+/// Welche stummen Einheiten wurden bereits in [`CFG_ERRORS`] gezählt (Bitmaske)?
+/// Stummheit ist ein Dauerzustand — ohne diese Latch wäre der Zähler eine Funktion der
+/// Aufrufhäufigkeit von [`drain_faults`] statt der Anzahl Befunde.
+static MUTE_REPORTED: AtomicU32 = AtomicU32::new(0);
+
 pub fn config_errors() -> u32 {
     CFG_ERRORS.load(Ordering::Relaxed)
 }
@@ -407,8 +470,23 @@ fn read_frr(unit: usize, i: u32) -> Option<FaultRecord> {
 }
 
 /// Keine aufgezeichneten Fehler in irgendeiner Einheit?
+///
+/// **Das ist eine Abwesenheitsaussage, und sie hängt an der Sprechfähigkeit.** Eine deklarierte,
+/// aber stumme Einheit liefert aus `ru32` eine `0` — sie trüge sonst genauso zum „leer" bei wie
+/// eine fehlerfreie. Genau deshalb ist eine unvollständige Sprechprobe hier ein **`false`**: wir
+/// wissen es nicht, und „wir wissen es nicht" darf nicht als „nichts passiert" durchgehen.
+/// Dasselbe gilt für abgeschnittene Einheiten — von denen kennen wir nicht einmal die Basis.
+///
+/// **Nicht** betroffen ist der Fall „gar keine Einheit deklariert" (`unit_count() == 0`): dort gibt
+/// es keine IOMMU und damit auch keine IOMMU-Faults; die Aussage ist leer, aber nicht falsch, und
+/// der Aufrufer gattert ohnehin über [`present`]. Der gefährliche Fall ist der andere — eine
+/// Einheit ist **deklariert** und antwortet trotzdem nicht.
 pub fn faults_empty() -> bool {
-    !(0..unit_count()).any(|u| ru32(u, REG_FSTS) & FSTS_PPF != 0)
+    let n = unit_count();
+    if n > 0 && (units_speaking() != n || units_truncated()) {
+        return false;
+    }
+    !(0..n).any(|u| ru32(u, REG_FSTS) & FSTS_PPF != 0)
 }
 
 /// Den ältesten Eintrag lesen, ohne ihn zu verbrauchen.
@@ -444,7 +522,30 @@ pub fn peek_fault() -> Option<FaultRecord> {
 /// aufgezeichnet wird** — wieder ein Grün ohne Bedeutung.
 pub fn drain_faults() -> u32 {
     let mut n = 0;
+    // **Stumme und abgeschnittene Einheiten zählen als Konfigurationsfehler** (B-3.3). Sie sind
+    // der Fall, in dem das Räumen selbst nicht stattfinden kann: die Register sind nicht lesbar,
+    // also ist auch jede spätere Aussage „keine Faults" über sie bedeutungslos. Der Zähler ist
+    // beobachtungsunabhängig und wird vom Kernel ohnehin geprüft (Audit-Code 6) — die Blindheit
+    // wird damit sichtbar, ohne dass ein neuer Meldeweg nötig wäre.
+    //
+    // Die Abschneidung ist ein **Zustand**, kein Ereignis: sie würde sonst bei jedem Aufruf erneut
+    // zählen und den Zähler zu einer Funktion der Aufrufhäufigkeit machen. Deshalb genau einmal
+    // (1 = festgestellt, 2 = gezählt); `units_truncated()` bleibt in beiden Fällen wahr.
+    if UNITS_TRUNCATED
+        .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        CFG_ERRORS.fetch_add(1, Ordering::Relaxed);
+    }
     for u in 0..unit_count() {
+        if !unit_speaking(u) {
+            // Ebenfalls ein Zustand, nicht ein Ereignis -> je Einheit genau einmal zählen.
+            let bit = 1u32 << (u % 32);
+            if MUTE_REPORTED.fetch_or(bit, Ordering::AcqRel) & bit == 0 {
+                CFG_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+            continue;
+        }
         let nfr = VtdCaps::read_unit(u).map(|c| c.num_fault_regs).unwrap_or(0);
         for i in 0..nfr {
             let Some(off) = frr_off(u, i) else { continue };
@@ -500,10 +601,16 @@ pub fn ecap() -> u64 {
     }
 }
 
-/// Ist die Übersetzung aktiv (`GSTS.TES`)? Genau dann blockt die Einheit alles, was nicht
-/// ausdrücklich zugeteilt ist.
+/// Ist die Übersetzung aktiv (`GSTS.TES`) — auf **jeder** deklarierten Einheit?
+///
+/// Genau dann blockt die IOMMU alles, was nicht ausdrücklich zugeteilt ist. Über alle Einheiten,
+/// nicht nur Einheit 0: eine einzige Einheit mit `TE = 0` genügt, damit jedes Gerät hinter ihr
+/// **unübersetzt** auf den ganzen Speicher zugreift. Eine stumme Einheit zählt als nicht aktiv —
+/// wir können ihren Zustand nicht feststellen und dürfen ihn deshalb nicht behaupten.
 pub fn enabled() -> bool {
-    present() && read32(REG_GSTS) & GSTS_TES != 0
+    present()
+        && unit_count() > 0
+        && (0..unit_count()).all(|u| unit_speaking(u) && ru32(u, REG_GSTS) & GSTS_TES != 0)
 }
 
 /// Registerbasis aus der **ACPI-DMAR** übernehmen (idempotent).
@@ -519,11 +626,77 @@ pub fn discover() -> bool {
     if info.n_units == 0 {
         return false;
     }
-    for u in 0..info.n_units.min(super::dmar::MAX_UNITS) {
+    let n = info.n_units.min(super::dmar::MAX_UNITS);
+    for u in 0..n {
         UNIT_BASES[u].store(info.units[u].reg_base, Ordering::Release);
     }
-    N_UNITS.store(info.n_units as u32, Ordering::Release);
+    N_UNITS.store(n as u32, Ordering::Release);
+    // Abschnittene Einheiten sind ein Loch im Oracle, kein Kapazitätsdetail (s. `units_truncated`).
+    if info.truncated || info.n_units > super::dmar::MAX_UNITS {
+        UNITS_TRUNCATED.store(1, Ordering::Release);
+    }
+    // Den Fähigkeits-Cache **verwerfen**, nicht hier neu füllen: `discover` hat bisher keine
+    // Register gelesen, und diese Reihenfolgeannahme (MMIO schon abgebildet) soll sie auch nicht
+    // bekommen. Die Neuberechnung passiert beim ersten echten Bedarf — und das ist frühestens im
+    // Tabellenaufbau von `init`, wo die Register nachweislich erreichbar sind.
+    AGG_COHERENT.store(0, Ordering::Release);
+    AGG_SNOOP.store(0, Ordering::Release);
     true
+}
+
+// --- Gemittelte Fähigkeiten im heissen Pfad (B-3.3) --------------------------------------------
+//
+// `flush_entry` und `slpt_map` treffen **Politik**: ob geflusht wird und ob `SNP` gesetzt werden
+// darf. Beides hing bisher an `VtdCaps::read()`, also an **Einheit 0** — und beides ist genau in
+// der Richtung falsch, die nicht auffällt:
+//
+// * `ECAP.C` (kohärenter Page-Walk) von Einheit 0 übernommen: ist Einheit 1 inkohärent, entfällt
+//   der `clflush`, und sie sieht den Tabelleneintrag **nie**. Die Übersetzung, die dort entstehen
+//   sollte, entsteht nicht — und der Test sieht einen erfolgreichen `slpt_map`.
+// * `ECAP.SC` (Snoop Control) von Einheit 0 übernommen: fehlt sie Einheit 1, ist `SNP` dort ein
+//   **reserviertes** Bit. Reservierte Bits faulten — wörtlich derselbe Mechanismus wie
+//   `STE.S1STALLD` ohne `IDR0.STALL_MODEL`, an dem dieses Projekt schon einmal hing.
+//
+// Das Minimum ist bei beiden die sichere Richtung: lieber einmal zu viel flushen, lieber `SNP`
+// weglassen. Zwischengespeichert wird, weil der Pfad je Tabelleneintrag läuft — `caps_common()`
+// dort aufzurufen hiesse, je 4-KiB-Seite `n_units` MMIO-Lesungen zu machen.
+//
+// Tri-State, damit ein kalter Cache nicht als „nichts nötig" durchgeht: 0 = unbekannt,
+// 1 = ja, 2 = nein. Bei `unbekannt` gilt die **konservative** Annahme (flushen, kein `SNP`).
+static AGG_COHERENT: AtomicU32 = AtomicU32::new(0);
+static AGG_SNOOP: AtomicU32 = AtomicU32::new(0);
+
+fn refresh_aggregate() {
+    let (coh, snp) = match caps_common() {
+        Some(c) => (c.coherent_walk, c.snoop_control),
+        None => (false, false), // konservativ: flushen, kein SNP
+    };
+    AGG_COHERENT.store(if coh { 1 } else { 2 }, Ordering::Release);
+    AGG_SNOOP.store(if snp { 1 } else { 2 }, Ordering::Release);
+}
+
+/// Ist der Page-Walk **aller** Einheiten kohärent? Unbekannt -> `false` (also flushen).
+fn agg_coherent_walk() -> bool {
+    match AGG_COHERENT.load(Ordering::Acquire) {
+        1 => true,
+        2 => false,
+        _ => {
+            refresh_aggregate();
+            AGG_COHERENT.load(Ordering::Acquire) == 1
+        }
+    }
+}
+
+/// Beherrschen **alle** Einheiten Snoop Control? Unbekannt -> `false` (also kein `SNP`).
+fn agg_snoop_control() -> bool {
+    match AGG_SNOOP.load(Ordering::Acquire) {
+        1 => true,
+        2 => false,
+        _ => {
+            refresh_aggregate();
+            AGG_SNOOP.load(Ordering::Acquire) == 1
+        }
+    }
 }
 
 /// Die **gemeinsame** Fähigkeitsbasis aller Einheiten.
@@ -532,13 +705,42 @@ pub fn discover() -> bool {
 /// sonst gäbe es die Fensterarithmetik zweimal, genau das, was die Wahl von 39 Bit vermeiden
 /// sollte. Kann eine Einheit die gewählte Breite nicht, ist das ein **lauter** Fehlschlag für die
 /// dahinterliegenden Gruppen (`usable() == false`), keine stille Anpassung.
+/// **`raw_cap`/`raw_ecap` sind die Rohwerte von Einheit 0** und dürfen nicht als gemittelt gelesen
+/// werden. Wer ein Bit braucht, das hier nicht als benanntes Feld auftaucht, muss es über alle
+/// Einheiten selbst mitteln (Vorbild: `invalidate_iotlb_global`, das `IRO` je Einheit liest).
 pub fn caps_common() -> Option<VtdCaps> {
+    caps_for_units(u32::MAX)
+}
+
+/// Wie [`caps_common`], aber nur über die Einheiten, deren Bit in `mask` gesetzt ist.
+///
+/// Gedacht für `dmar::units_scoping_allocatable`: das Minimum über **genau die** Einheiten, die
+/// eine zuteilbare Gruppe scopen. Eine Einheit, hinter der nur ausgeschlossene Geräte hängen,
+/// beschneidet damit nicht mehr die Zusicherung für alle anderen.
+///
+/// `None`, wenn keine Einheit übrig bleibt oder eine ausgewählte Einheit **stumm** ist — deren
+/// Fähigkeiten sind unbekannt, und ein Minimum über unbekannte Werte wäre eine erfundene Zusage.
+pub fn caps_for_units(mask: u32) -> Option<VtdCaps> {
     let n = unit_count();
     if n == 0 {
         return None;
     }
-    let mut acc = VtdCaps::read_unit(0)?;
-    for u in 1..n {
+    let sel = |u: usize| u < 32 && mask & (1u32 << u) != 0;
+    let first = (0..n).find(|&u| sel(u))?;
+    // Eine stumme Einheit liefert `CAP == 0` bzw. `!0`; daraus abgeleitete „Fähigkeiten" wären
+    // frei erfunden (SAGAW 0, MGAW 1 -- oder umgekehrt alles). Deshalb hier ein hartes `None`
+    // statt eines Minimums ueber Werte, die niemand gelesen hat.
+    if !unit_speaking(first) {
+        return None;
+    }
+    let mut acc = VtdCaps::read_unit(first)?;
+    for u in (first + 1)..n {
+        if !sel(u) {
+            continue;
+        }
+        if !unit_speaking(u) {
+            return None;
+        }
         let c = VtdCaps::read_unit(u)?;
         // Konservativ mischen: die schwächste Zusicherung gewinnt, die strengste Pflicht auch.
         acc.sagaw &= c.sagaw;
@@ -572,9 +774,9 @@ fn agaw_from_sagaw(sagaw: u32) -> (u32, u32) {
 }
 
 /// Auf ein Statusbit warten (begrenzt — ein Hardware-Poll darf im Kernel nie unbegrenzt laufen).
-fn wait_status(mask: u32, want_set: bool) -> bool {
+fn wait_status_on(unit: usize, mask: u32, want_set: bool) -> bool {
     for _ in 0..1_000_000 {
-        let set = read32(REG_GSTS) & mask != 0;
+        let set = ru32(unit, REG_GSTS) & mask != 0;
         if set == want_set {
             return true;
         }
@@ -606,26 +808,62 @@ pub fn init(root_table: u64, alloc: &mut dyn FnMut() -> Option<u64>) -> bool {
         // SAFETY: `root_table` ist ein frisch genulltes, identity-gemapptes 4-KiB-Frame.
         unsafe { write_entry(root_table + bus * 16, (ctx & ADDR_MASK) | 1) };
     }
-    ROOT_TABLE[0].store(root_table, Ordering::Release);
-    // Root-Table-Pointer setzen (Bits 63:12; Translation Table Mode = Legacy).
-    write64(REG_RTADDR, root_table & !0xfff);
-    // **Nie** `TE` löschen, um umzukonfigurieren: `TE = 0` heißt freier DMA, nicht Blockade.
-    // `gcmd_issue` übernimmt die Zustandsbits aus `GSTS`, der Wechsel läuft also auch dann
-    // ohne Lücke, wenn die Übersetzung bereits aktiv ist.
-    if !gcmd_issue(GCMD_SRTP, GSTS_RTPS, true) {
+    // **Die Root-Tabelle wird von allen Einheiten GETEILT** (B-3.3).
+    //
+    // Vorher bekam nur Einheit 0 einen Root-Table-Pointer und nur sie `TE` — die übrigen blieben
+    // mit `TE = 0` stehen, und das heisst nicht „blockiert", sondern **keine Übersetzung**, also
+    // freier DMA für jedes Gerät hinter ihnen. Ein Aggregations-Todo hätte das nicht abgedeckt;
+    // es ist der Unterschied zwischen „das Oracle ist blind" und „es gibt dort keinen Schutz".
+    //
+    // Geteilt statt je Einheit eigen, weil die Root-Tabelle nur Bus -> Kontext-Tabelle abbildet
+    // und die Kontexteinträge ohnehin nach Requester-ID getrennt sind: eine zweite Tabelle wäre
+    // dieselbe Abbildung ein zweites Mal, plus 1 MiB Kontext-Tabellen je Einheit. Die Einheiten
+    // scopen disjunkte Gerätemengen, sie können sich also nicht gegenseitig etwas freischalten.
+    for u in 0..unit_count() {
+        ROOT_TABLE[u].store(root_table, Ordering::Release);
+    }
+    let mut all_ok = true;
+    for u in 0..unit_count() {
+        if !unit_speaking(u) {
+            // Eine deklarierte, aber stumme Einheit lässt sich nicht scharfstellen. Das ist ein
+            // Fehlschlag: Geräte hinter ihr wären unübersetzt, und das darf nicht wie Erfolg
+            // aussehen.
+            all_ok = false;
+            continue;
+        }
+        // Root-Table-Pointer setzen (Bits 63:12; Translation Table Mode = Legacy).
+        wu64(u, REG_RTADDR, root_table & !0xfff);
+        // **Nie** `TE` löschen, um umzukonfigurieren: `TE = 0` heißt freier DMA, nicht Blockade.
+        // `gcmd_issue_on` übernimmt die Zustandsbits aus `GSTS`, der Wechsel läuft also auch dann
+        // ohne Lücke, wenn die Übersetzung bereits aktiv ist.
+        if !gcmd_issue_on(u, GCMD_SRTP, GSTS_RTPS, true) {
+            all_ok = false;
+        }
+    }
+    if !all_ok {
         return false;
     }
     // QI VOR der ersten Invalidierung aufsetzen (B-3.1): danach laeuft sie ueber die
     // Warteschlange. Scheitert es, bleibt der Registerpfad gueltig -- `qi_active()` sagt dann
     // `false`, und niemand behauptet etwas anderes. Interrupt Remapping (B-3.2) ist in diesem
     // Fall NICHT zulaessig, weil der Interrupt-Entry-Cache dann nicht invalidierbar waere.
+    //
+    // **Beides heute nur auf Einheit 0** — beide brauchen je Einheit eigene Frames (2 Seiten QI,
+    // 1 Seite IRT), und die Warteschlangen-Statics sind je Einheit angelegt, aber nur an Index 0
+    // befüllt. Für die Uebersetzung ist das folgenlos (die uebrigen Einheiten fahren den
+    // Registerpfad, s. `invalidate_context_cache`), fuer Interrupt Remapping NICHT: hinter
+    // Einheit 1..n bleibt der nicht-remappte Nachrichtenpfad offen. Das steht als Rest von B-3.2
+    // offen und ist hier vermerkt, damit es nicht in der Aggregation verschwindet.
     qi_enable(alloc);
-    // IR erst nach QI (Vorbedingung) und vor dem Aktivieren der Uebersetzung: ab hier ist ein
-    // Geraet ohne IRTE auch interrupt-seitig stumm, nicht nur DMA-seitig.
     ir_enable(alloc);
     invalidate_context_cache();
-    // Übersetzung aktivieren.
-    gcmd_set_state(GCMD_TE, true)
+    // Übersetzung auf **allen** Einheiten aktivieren.
+    for u in 0..unit_count() {
+        if !gcmd_set_state_on(u, GCMD_TE, true) {
+            all_ok = false;
+        }
+    }
+    all_ok
 }
 
 
@@ -753,24 +991,47 @@ pub fn invalidate_iec_global() -> bool {
 
 /// Globale Invalidierung des Kontext-Caches (Gegenstück zum `CMD_SYNC`-Round-Trip auf ARM):
 /// die Einheit muss die Anforderung quittieren, indem sie `ICC` wieder löscht.
+///
+/// **Über alle Einheiten** (B-3.3). Vorher lief das über die Kurzformen `write64`/`read64`, also
+/// ausschliesslich auf Einheit 0 — die übrigen behielten ihre Kontext-Cache-Einträge. Nach einem
+/// `context_clear` hiesse das: das Gerät ist in der Tabelle entwaffnet, die Einheit übersetzt es
+/// aber weiter aus dem Cache. Ein Teardown, der genau die Eigenschaft nicht herstellt, für die er
+/// da ist.
 pub fn invalidate_context_cache() -> bool {
     if !present() {
         return false;
     }
-    // Sobald QI laeuft, ist der Registerpfad architektonisch VERBOTEN (VT-d 6.5.2) -- nicht bloss
-    // unnoetig. Deshalb umschalten statt beides halten (B-3.1).
-    if qi_active() {
-        // Granularitaet global: Bits 5:4 = 01.
-        return qi_submit(QI_CC_INV | (1 << 4), 0);
-    }
-    write64(REG_CCMD, CCMD_ICC | CCMD_CIRG_GLOBAL);
-    for _ in 0..1_000_000 {
-        if read64(REG_CCMD) & CCMD_ICC == 0 {
-            return true; // quittiert
+    let mut all_ok = true;
+    for u in 0..unit_count() {
+        if !unit_speaking(u) {
+            // Eine stumme Einheit kann nicht quittieren — das ist ein Fehlschlag, keine
+            // erledigte Invalidierung. Sonst hinge ein `true` an einer Einheit, die schweigt.
+            all_ok = false;
+            continue;
         }
-        core::hint::spin_loop();
+        // Sobald QI laeuft, ist der Registerpfad architektonisch VERBOTEN (VT-d 6.5.2) -- nicht
+        // bloss unnoetig. Deshalb umschalten statt beides halten (B-3.1). QI wird heute nur auf
+        // Einheit 0 aufgesetzt (s. `qi_enable`); die uebrigen fahren den Registerpfad, der fuer
+        // sie der spezifikationsgemaesse ist, solange ihr `GSTS.QIES` aus ist.
+        if u == 0 && qi_active() {
+            // Granularitaet global: Bits 5:4 = 01.
+            if !qi_submit(QI_CC_INV | (1 << 4), 0) {
+                all_ok = false;
+            }
+            continue;
+        }
+        wu64(u, REG_CCMD, CCMD_ICC | CCMD_CIRG_GLOBAL);
+        let mut ok = false;
+        for _ in 0..1_000_000 {
+            if ru64(u, REG_CCMD) & CCMD_ICC == 0 {
+                ok = true; // quittiert
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        all_ok &= ok;
     }
-    false
+    all_ok
 }
 
 // --- Übersetzungstabellen (Schritt 3) ---------------------------------------------------------
@@ -816,11 +1077,14 @@ unsafe fn write_entry(addr: u64, v: u64) {
     flush_entry(addr);
 }
 
-/// Cache-Line der Adresse zurückschreiben, falls die Einheit nicht page-walk-kohärent ist.
+/// Cache-Line der Adresse zurückschreiben, falls **irgendeine** Einheit nicht page-walk-kohärent
+/// ist.
+///
+/// Gemittelt über alle Einheiten, nicht von Einheit 0 übernommen: es genügt eine inkohärente
+/// Einheit, damit der Eintrag geflusht werden muss (s. `AGG_COHERENT`).
 fn flush_entry(addr: u64) {
-    let coherent = VtdCaps::read().map(|c| c.coherent_walk).unwrap_or(false);
-    if coherent {
-        return; // die Einheit sieht den Schreibzugriff ohnehin
+    if agg_coherent_walk() {
+        return; // jede Einheit sieht den Schreibzugriff ohnehin
     }
     // SAFETY: `clflush` auf eine gemappte Adresse ist nebenwirkungsfrei; `sfence` ordnet.
     unsafe {
@@ -851,7 +1115,9 @@ pub unsafe fn slpt_map(
     if len == 0 || iova % 4096 != 0 || pa % 4096 != 0 || len % 4096 != 0 {
         return false;
     }
-    let snp = if VtdCaps::read().map(|c| c.snoop_control).unwrap_or(false) {
+    // Gemittelt über alle Einheiten: fehlt EINER die Snoop Control, ist `SNP` für sie ein
+    // reserviertes Bit und würde faulten. Das Minimum ist hier die einzige sichere Richtung.
+    let snp = if agg_snoop_control() {
         SL_SNP
     } else {
         0 // ohne ECAP.SC ist das Bit reserviert -> setzen würde faulten
@@ -1010,9 +1276,8 @@ pub fn invalidate_iotlb_global() -> bool {
     for u in 0..unit_count() {
         // Einheit 0 laeuft ueber die Warteschlange, sobald QI steht -- der Registerpfad ist dann
         // architektonisch verboten (B-3.1). **Die uebrigen Einheiten nicht:** QI wird heute nur
-        // auf Einheit 0 aufgesetzt, weil `VtdCaps` noch eine Einheit ist. Das ist keine
-        // Nachlaessigkeit, sondern der ausdrueckliche Rest von B-3.3 -- und es steht hier, damit
-        // es beim Umstieg auf mehrere DRHDs nicht uebersehen wird.
+        // auf Einheit 0 aufgesetzt (je Einheit eigene Frames noetig, s. `init`); fuer sie ist der
+        // Registerpfad der spezifikationsgemaesse, solange ihr `GSTS.QIES` aus ist.
         if u == 0 && qi_active() {
             // Granularitaet global: Bits 5:4 = 01.
             if !qi_submit(QI_IOTLB_INV | (1 << 4), 0) {
@@ -1020,7 +1285,13 @@ pub fn invalidate_iotlb_global() -> bool {
             }
             continue;
         }
-        let Some(c) = VtdCaps::read_unit(u) else { continue };
+        // Eine stumme Einheit wurde hier frueher per `else { continue }` uebersprungen -- und der
+        // Rueckgabewert blieb `true`. Eine nicht durchgefuehrte Invalidierung, die als erfolgreich
+        // gemeldet wird, ist genau die Zusage ohne Deckung, gegen die B-3.3 antritt.
+        let Some(c) = VtdCaps::read_unit(u).filter(|_| unit_speaking(u)) else {
+            all_ok = false;
+            continue;
+        };
         let iro = (((c.raw_ecap >> 8) & 0x3ff) * 16) as usize;
         let iotlb = iro + 8;
         const IVT: u64 = 1 << 63;

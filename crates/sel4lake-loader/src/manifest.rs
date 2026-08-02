@@ -55,7 +55,10 @@
 //!  72  core_affinity:u32      (0xFFFF_FFFF = beliebig)
 //!  76  priority:u32
 //!  80  budget_us:u32          (0 = kein Budget)
-//!  84  reserved:[u8;12]       = 0
+//!  84  dev_vendor:u16         (A-5.3 Geraete-Selektor; 0xFFFF = beliebig, 0 = Feld ungesetzt)
+//!  86  dev_device:u16         (dito)
+//!  88  dev_class:u32          (class<<16|subclass<<8|prog_if; 0xFFFF_FFFF = beliebig)
+//!  92  service_id:u32         (A-5.4: WELCHEN Dienst dieser Client meint; 0 = nicht benannt)
 //!
 //! msg_len = 80 + entry_count * 96
 //! msg_len  signature:[..]     (nicht leer; Laenge/Algorithmus prueft der Kernel-Verifier)
@@ -162,6 +165,79 @@ pub struct Entry<'a> {
     pub priority: u32,
     /// CPU-Budget in Mikrosekunden (0 = keines).
     pub budget_us: u32,
+    /// **Welches** Gerät diese Komponente bekommen soll (A-5.3). Siehe [`DeviceSelector`].
+    pub device: DeviceSelector,
+    /// **Welchen Dienst dieser Client meint** (A-5.4) — die `program_id` des Anbieters.
+    ///
+    /// `0` = nicht benannt. Das war bis A-5.4 der einzige Zustand, und es ging gut, solange es
+    /// genau **einen** Dienst gab: „gib mir einen Endpoint" konnte dann nur dessen Kanal meinen.
+    /// Bei zweien ist dieselbe Zeile eine **im Kernel versteckte Politik** — der Client bekäme
+    /// irgendeinen, und welchen, entschiede die Ladereihenfolge.
+    ///
+    /// Deshalb: `0` bleibt zulässig und heißt „es gibt ohnehin nur einen"; gibt es mehrere, wird
+    /// **abgewiesen** statt geraten.
+    pub service_id: u32,
+}
+
+/// **Der Geräte-Selektor eines Manifest-Eintrags** (A-5.3).
+///
+/// Bis A-5.1 sagte das Manifest über Geräte-Autorität nur `mmio,dma` — „diese Komponente darf ein
+/// Registerfenster und eine DMA-Region halten". *Welches* Gerät das ist, entschied der Kernel, und
+/// zwar nach Fundreihenfolge. Bei genau einem zuteilbaren Gerät fiel das nicht auf; bei zweien wäre
+/// es eine **im Kernel versteckte Politik** gewesen — die gefährlichste Sorte, weil sie nirgends
+/// steht und sich mit der Enumerationsreihenfolge ändert.
+///
+/// ## Was hier NICHT steht, und warum
+///
+/// **Keine Instanz.** Kein Bus, kein Gerät, keine Funktion, keine physische Adresse. Ein Manifest,
+/// das `00:04.0` nennt, ist an die Topologie *einer* Maschine gebunden und auf der nächsten
+/// stillschweigend falsch — es zeigte dann auf ein anderes Gerät, nicht auf keines. Der Selektor
+/// benennt eine **Art** von Gerät; welche Instanz das ist, sieht nur der Kernel, weil nur er
+/// enumeriert.
+///
+/// ## Die Felder
+///
+/// `vendor`/`device` sind die PCI-IDs, `class` ist `class<<16 | subclass<<8 | prog_if`. Jedes Feld
+/// einzeln auf „beliebig" stellbar ([`ANY16`]/[`ANY32`]); ein Eintrag ohne Geräte-Caps lässt alle
+/// drei auf „beliebig" und ändert damit nichts.
+///
+/// **Fail-closed:** passt kein Gerät auf den Selektor, bekommt die Komponente **keines**. Der
+/// bequeme Rückfall („nichts passt → nimm irgendeins") wäre genau die versteckte Politik, gegen die
+/// dieses Feld antritt, nur eine Ebene tiefer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct DeviceSelector {
+    pub vendor: u16,
+    pub device: u16,
+    pub class: u32,
+}
+
+/// „Beliebig" für die 16-Bit-Felder eines [`DeviceSelector`].
+pub const ANY16: u16 = 0xFFFF;
+/// „Beliebig" für die 32-Bit-Felder eines [`DeviceSelector`].
+pub const ANY32: u32 = 0xFFFF_FFFF;
+
+impl DeviceSelector {
+    /// Der Selektor, der auf **jedes** Gerät passt — der Zustand vor A-5.3.
+    pub const ANY: Self = Self {
+        vendor: ANY16,
+        device: ANY16,
+        class: ANY32,
+    };
+
+    /// Schränkt dieser Selektor überhaupt etwas ein?
+    ///
+    /// Wichtig für den Bericht: „keine Einschränkung" und „Einschränkung, auf die nichts passt"
+    /// sind zwei völlig verschiedene Lagen, und nur die zweite ist ein Aufbaufehler.
+    pub fn is_any(&self) -> bool {
+        *self == Self::ANY
+    }
+
+    /// Passt ein gefundenes Gerät auf diesen Selektor?
+    pub fn matches(&self, vendor: u16, device: u16, class: u32) -> bool {
+        (self.vendor == ANY16 || self.vendor == vendor)
+            && (self.device == ANY16 || self.device == device)
+            && (self.class == ANY32 || self.class == class)
+    }
 }
 
 impl<'a> Entry<'a> {
@@ -311,6 +387,23 @@ impl<'a> Verified<'a> {
             core_affinity: rd_u32(e, 72),
             priority: rd_u32(e, 76),
             budget_us: rd_u32(e, 80),
+            // A-5.3 nimmt 8 der 12 reservierten Bytes. Das Format bleibt eingefroren: `ENTRY_LEN`
+            // aendert sich nicht, und ein aelteres Manifest (Nullen im reservierten Bereich) ergibt
+            // `vendor=0 device=0 class=0` -- was auf **kein** Geraet passt. Deshalb wird `0` hier
+            // ausdruecklich als "nicht gesetzt" gelesen und auf `ANY` abgebildet: sonst haette die
+            // Formaterweiterung stillschweigend jedem alten Manifest die Geraete-Zuteilung
+            // weggenommen, und zwar mit derselben Fehlermeldung wie ein echter Fehlgriff.
+            device: {
+                let v = rd_u16(e, 84);
+                let d = rd_u16(e, 86);
+                let c = rd_u32(e, 88);
+                if v == 0 && d == 0 && c == 0 {
+                    DeviceSelector::ANY
+                } else {
+                    DeviceSelector { vendor: v, device: d, class: c }
+                }
+            },
+            service_id: rd_u32(e, 92),
         })
     }
 
@@ -385,10 +478,23 @@ mod tests {
         domain: u32,
         initial_caps: u32,
         policy_flags: u32,
+        /// A-5.3: `None` = die reservierten Bytes bleiben **null**, also genau das, was ein vor
+        /// A-5.3 erzeugtes Manifest liefert.
+        device: Option<DeviceSelector>,
+        /// A-5.4: die `program_id` des gemeinten Dienstes (`0` = nicht benannt).
+        service_id: u32,
     }
 
     fn e(name: &'static str, program_id: u32) -> E {
-        E { name, program_id, domain: DOMAIN_USERLAND, initial_caps: 0, policy_flags: 0 }
+        E {
+            name,
+            program_id,
+            domain: DOMAIN_USERLAND,
+            initial_caps: 0,
+            policy_flags: 0,
+            device: None,
+            service_id: 0,
+        }
     }
 
     /// Ein strukturell gültiges Manifest bauen (Signatur ist Dummy — der Parser prüft keine Krypto).
@@ -423,6 +529,12 @@ mod tests {
             v[b + 72..b + 76].copy_from_slice(&ANY_CORE.to_le_bytes());
             v[b + 76..b + 80].copy_from_slice(&5u32.to_le_bytes()); // priority
             v[b + 80..b + 84].copy_from_slice(&1000u32.to_le_bytes()); // budget_us
+            if let Some(d) = en.device {
+                v[b + 84..b + 86].copy_from_slice(&d.vendor.to_le_bytes());
+                v[b + 86..b + 88].copy_from_slice(&d.device.to_le_bytes());
+                v[b + 88..b + 92].copy_from_slice(&d.class.to_le_bytes());
+            }
+            v[b + 92..b + 96].copy_from_slice(&en.service_id.to_le_bytes());
         }
         for i in 0..siglen {
             v[msg_len + i] = (i + 9) as u8;
@@ -437,7 +549,89 @@ mod tests {
             domain: DOMAIN_TRUSTED,
             initial_caps: CAP_LOADER | CAP_PD_CONTROL,
             policy_flags: POLICY_ROOT_TASK,
+            device: None,
+            service_id: 0,
         }
+    }
+
+    // --- A-5.3: der Geraete-Selektor -------------------------------------------------------------
+
+    /// **Die Rueckwaertsfalle.** Ein vor A-5.3 erzeugtes Manifest hat dort Nullen stehen. Wuerden
+    /// die als `vendor=0 device=0 class=0` gelesen, passte der Selektor auf **kein** Geraet -- die
+    /// Formaterweiterung haette jedem alten Manifest still die Geraete-Zuteilung weggenommen, und
+    /// zwar mit derselben Meldung wie ein echter Fehlgriff.
+    #[test]
+    fn nullbytes_heissen_beliebig_nicht_nichts() {
+        let raw = build(&[e("alt", 1)], 64);
+        let v = accept(SystemManifest::parse(&raw).unwrap());
+        let en = v.entry(0).unwrap();
+        assert_eq!(en.device, DeviceSelector::ANY);
+        assert!(en.device.is_any());
+        assert!(en.device.matches(0x1af4, 0x1042, 0x01_0000));
+    }
+
+    /// Ein gesetzter Selektor kommt unveraendert heraus und passt nur auf das benannte Geraet.
+    #[test]
+    fn selektor_trennt_zwei_geraete() {
+        let blk = DeviceSelector { vendor: 0x1af4, device: 0x1042, class: ANY32 };
+        let mut en = e("blk", 3);
+        en.device = Some(blk);
+        let raw = build(&[en], 64);
+        let v = accept(SystemManifest::parse(&raw).unwrap());
+        let got = v.entry(0).unwrap().device;
+        assert_eq!(got, blk);
+        assert!(!got.is_any(), "ein gesetzter Selektor ist nicht 'beliebig'");
+        assert!(got.matches(0x1af4, 0x1042, 0x01_0000), "das benannte Geraet passt");
+        // virtio-net: gleicher Hersteller, andere Geraete-ID -> passt NICHT. Genau diese
+        // Unterscheidung ist der Zweck des Feldes; ohne sie entschiede die Fundreihenfolge.
+        assert!(!got.matches(0x1af4, 0x1041, 0x02_0000), "virtio-net darf nicht passen");
+        assert!(!got.matches(0x8086, 0x1042, 0x01_0000), "anderer Hersteller darf nicht passen");
+    }
+
+    /// Ein Selektor nur ueber die **Klasse** -- die maschinenunabhaengige Aussage („ein
+    /// Massenspeicher"), ohne sich auf Hersteller-IDs festzulegen.
+    #[test]
+    fn selektor_nur_ueber_die_klasse() {
+        let sel = DeviceSelector { vendor: ANY16, device: ANY16, class: 0x01_0000 };
+        let mut en = e("irgendein-blk", 4);
+        en.device = Some(sel);
+        let raw = build(&[en], 64);
+        let v = accept(SystemManifest::parse(&raw).unwrap());
+        let got = v.entry(0).unwrap().device;
+        assert!(got.matches(0x1af4, 0x1042, 0x01_0000));
+        assert!(got.matches(0x8086, 0x0953, 0x01_0000), "anderer Hersteller, gleiche Klasse");
+        assert!(!got.matches(0x1af4, 0x1041, 0x02_0000), "Netzwerkklasse passt nicht");
+    }
+
+    /// **Der Client benennt seinen Dienst** (A-5.4). Ohne dieses Feld hiess "gib mir einen
+    /// Endpoint" bei zwei Diensten: "gib mir irgendeinen" -- eine Politik, die niemand
+    /// aufgeschrieben hat und die sich mit der Ladereihenfolge aendert.
+    #[test]
+    fn dienst_benennung_kommt_durch() {
+        let mut client = e("fs", 4);
+        client.service_id = 3;
+        let raw = build(&[client], 64);
+        let v = accept(SystemManifest::parse(&raw).unwrap());
+        assert_eq!(v.entry(0).unwrap().service_id, 3);
+        // Und ein Eintrag ohne Benennung bleibt 0 -- der Zustand vor A-5.4, der zulaessig bleibt,
+        // solange es ohnehin nur einen Dienst gibt.
+        let raw2 = build(&[e("alt", 9)], 64);
+        let v2 = accept(SystemManifest::parse(&raw2).unwrap());
+        assert_eq!(v2.entry(0).unwrap().service_id, 0);
+    }
+
+    /// Der Selektor liegt in den **reservierten** Bytes und aendert die Eintragslaenge nicht --
+    /// sonst waere jedes bestehende signierte Manifest ungueltig geworden.
+    #[test]
+    fn selektor_aendert_die_eintragslaenge_nicht() {
+        assert_eq!(ENTRY_LEN, 96);
+        let mut en = e("x", 1);
+        en.device = Some(DeviceSelector { vendor: 1, device: 2, class: 3 });
+        let raw = build(&[en], 64);
+        assert_eq!(raw.len(), HEADER_LEN + ENTRY_LEN + 64);
+        // Die letzten vier Bytes tragen seit A-5.4 die Dienst-Benennung; ungesetzt sind sie null.
+        let b = HEADER_LEN;
+        assert_eq!(&raw[b + 92..b + 96], &[0u8; 4]);
     }
 
     fn accept<'a>(m: SystemManifest<'a>) -> Verified<'a> {

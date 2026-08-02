@@ -621,6 +621,27 @@ fn is_below(topo: &[DevNode], i: usize, bridge: usize) -> bool {
     false
 }
 
+/// **Bitmaske der Einheiten, die mindestens eine zuteilbare Gruppe scopen** (B-3.3).
+///
+/// Der Sinn: die Fähigkeitsmittelung (`vtd::caps_for_units`) soll das Minimum über *genau diese*
+/// Einheiten nehmen — nicht über alle. Eine Einheit, hinter der ausschliesslich ausgeschlossene
+/// Geräte hängen (RMRR, gruppenübergreifend, ohne Einheit), kann die Zusicherung für niemanden
+/// tragen; ihre schwächeren Fähigkeiten würden die Zuteilung anderer Gruppen grundlos
+/// beschneiden. Umgekehrt darf keine Einheit fehlen, an der ein zuteilbares Gerät hängt.
+///
+/// Bit `u` gesetzt heisst: Einheit `u` trägt mindestens ein **nicht ausgeschlossenes** Gerät.
+/// `0` heisst: es gibt nichts zuzuteilen — und das ist ein anderer Zustand als „alle Einheiten",
+/// weshalb der Aufrufer ihn unterscheiden muss statt auf „alle" zurückzufallen.
+pub fn units_scoping_allocatable(g: &Groups) -> u32 {
+    let mut mask = 0u32;
+    for i in 0..g.n_devs {
+        if g.excluded[i].is_none() && g.unit_of[i] != usize::MAX && g.unit_of[i] < 32 {
+            mask |= 1u32 << g.unit_of[i];
+        }
+    }
+    mask
+}
+
 // --- Oracle -----------------------------------------------------------------------------------
 
 /// Vollständigkeits-Oracle für Schritt 2. `0` = konsistent.
@@ -651,4 +672,98 @@ pub fn audit(g: &Groups) -> u32 {
         }
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Zwei Einheiten, zwei Endpunkte -- Geraet 0 an Einheit 0, Geraet 1 an Einheit 1.
+    fn zwei_einheiten() -> (DmarInfo, [DevNode; 2]) {
+        let mut info = DmarInfo::EMPTY;
+        info.n_units = 2;
+        for (u, dev) in [(0usize, 2u8), (1usize, 3u8)] {
+            info.units[u].reg_base = 0xfed9_0000 + (u as u64) * 0x1000;
+            info.units[u].n_scope = 1;
+            info.units[u].scope[0] = Scope {
+                kind: SCOPE_ENDPOINT,
+                segment: 0,
+                start_bus: 0,
+                path: [(dev, 0), (0, 0), (0, 0), (0, 0)],
+                path_len: 1,
+            };
+        }
+        let mk = |dev: u8| DevNode { bus: 0, dev, func: 0, ..DevNode::EMPTY };
+        (info, [mk(2), mk(3)])
+    }
+
+    /// Beide Geraete zuteilbar -> beide Einheiten stehen in der Maske.
+    #[test]
+    fn maske_enthaelt_jede_einheit_mit_zuteilbarem_geraet() {
+        let (info, topo) = zwei_einheiten();
+        let g = build_groups(&info, &topo);
+        assert_eq!(g.unit_of[0], 0);
+        assert_eq!(g.unit_of[1], 1);
+        assert_eq!(units_scoping_allocatable(&g), 0b11);
+    }
+
+    /// **Der eigentliche Zweck**: eine Einheit, hinter der nur AUSGESCHLOSSENE Geraete haengen,
+    /// darf die Faehigkeitsmittelung nicht beschneiden -- ihr Bit faellt aus der Maske.
+    ///
+    /// Ohne diesen Unterschied waere `caps_for_units` nur ein umstaendliches `caps_common`.
+    #[test]
+    fn ausgeschlossene_einheit_faellt_aus_der_maske() {
+        let (mut info, topo) = zwei_einheiten();
+        // Geraet 1 (Bus 0, Dev 3) mit einer RMRR belegen -> ausgeschlossen.
+        info.n_rmrr = 1;
+        info.rmrr[0] = Scope {
+            kind: SCOPE_ENDPOINT,
+            segment: 0,
+            start_bus: 0,
+            path: [(3, 0), (0, 0), (0, 0), (0, 0)],
+            path_len: 1,
+        };
+        let g = build_groups(&info, &topo);
+        assert_eq!(g.excluded[1], Some(Exclusion::Rmrr));
+        assert_eq!(
+            units_scoping_allocatable(&g),
+            0b01,
+            "Einheit 1 traegt nur ein ausgeschlossenes Geraet und gehoert nicht in die Mittelung"
+        );
+    }
+
+    /// Nichts zuteilbar heisst **leere Maske** -- und das ist ein anderer Zustand als „alle".
+    /// Ein Aufrufer, der hier auf `u32::MAX` zurueckfiele, mittelte ueber Einheiten, die
+    /// niemanden tragen, und bekaeme eine Zusage ohne Subjekt.
+    #[test]
+    fn ohne_zuteilbares_geraet_ist_die_maske_leer() {
+        let (mut info, topo) = zwei_einheiten();
+        info.n_rmrr = 2;
+        for (k, dev) in [(0usize, 2u8), (1usize, 3u8)] {
+            info.rmrr[k] = Scope {
+                kind: SCOPE_ENDPOINT,
+                segment: 0,
+                start_bus: 0,
+                path: [(dev, 0), (0, 0), (0, 0), (0, 0)],
+                path_len: 1,
+            };
+        }
+        info.n_rmrr = 2;
+        let g = build_groups(&info, &topo);
+        assert_eq!(units_scoping_allocatable(&g), 0);
+    }
+
+    /// Ein Geraet ohne zustaendige Einheit ist ausgeschlossen (`NoUnit`) und darf kein Bit
+    /// setzen -- `usize::MAX` als Index waere sonst ein Schiebefehler.
+    #[test]
+    fn geraet_ohne_einheit_setzt_kein_bit() {
+        let mut info = DmarInfo::EMPTY;
+        info.n_units = 1;
+        info.units[0].reg_base = 0xfed9_0000;
+        // Kein Scope, kein INCLUDE_PCI_ALL -> niemand ist zustaendig.
+        let topo = [DevNode { bus: 0, dev: 2, func: 0, ..DevNode::EMPTY }];
+        let g = build_groups(&info, &topo);
+        assert_eq!(g.excluded[0], Some(Exclusion::NoUnit));
+        assert_eq!(units_scoping_allocatable(&g), 0);
+    }
 }

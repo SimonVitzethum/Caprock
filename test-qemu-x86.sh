@@ -33,7 +33,23 @@ RUNS="${RUNS:-1}"
 if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
     # `+invtsc` MUSS explizit angefordert werden: QEMU laesst es auch bei `-cpu host` weg, weil es
     # die Live-Migration blockiert. Unter KVM wird es dann durchgereicht, unter TCG abgelehnt.
-    ACCEL=(-enable-kvm -cpu host,+invtsc)
+    #
+    # **`host-cache-info=on` ebenso, und aus einem verwandten Grund** (gemessen 2026-08-02): ohne
+    # den Schalter meldet QEMU auch bei `-cpu host` seine LEGACY-Deskriptoren -- L3 16 MiB/16-fach,
+    # L2 4 MiB -- statt der Geometrie der Maschine. Alles, was daraus folgt, wurde damit gegen eine
+    # **Fiktion** geprueft:
+    #
+    #   ohne : LLC 16384 KiB, 16-fach -> 256 Farben; Prime+Probe fand kein gueltiges Opferfenster
+    #          (Opfer 4096 KiB gegen eine "private" Ebene von 4096 KiB) und uebersprang mit einer
+    #          Begruendung, die ein AUFBAU-Artefakt war.
+    #   mit  : LLC 24576 KiB, 12-fach -> 512 Farben; das Opferfenster existiert (privat 2048), der
+    #          Test misst und nennt den STRUKTURELLEN Grund fuers Aussetzen (Gast, s. B-4.5).
+    #
+    # Der Zugewinn ist nicht bloss Genauigkeit. 512 ist keine 256, und genau daran hing der
+    # A1-Rest-Fehler: `stripe` rechnete mit `MASK_BITS` statt mit der Farbanzahl und war deshalb
+    # bei 256 zufaellig richtig. Eine Suite, die nur 256 Farben je sieht, kann diese Klasse von
+    # Fehlern grundsaetzlich nicht finden.
+    ACCEL=(-enable-kvm -cpu host,+invtsc,host-cache-info=on)
     echo "== Beschleunigung: KVM (-cpu host) =="
 else
     # TCG-Rueckfall: **nicht** `qemu64`. Dieses Modell ist synthetisch und meldet weder
@@ -77,6 +93,31 @@ SEL_TEXT=$(readelf -S build/target/x86_64-unknown-none/release/sel4lake-kernel 2
 
 # Zuverlaessiger Capture ueber eine Datei (Pipe + SIGKILL verliert sonst QEMUs stdout-Puffer).
 LOG="$(mktemp)"
+
+# --- Plattenabbild fuer virtio-blk (A-5.2) ------------------------------------------------------
+#
+# Der Inhalt ist der Test. Ein frisch angelegtes Abbild besteht aus Nullen, und ein Puffer voller
+# Nullen ist von einem NIE BESCHRIEBENEN Puffer nicht zu unterscheiden -- eine Leseanfrage gegen
+# ein leeres Abbild waere also auch dann gruen, wenn das Geraet gar keine Daten uebertraegt.
+# Deshalb steht eine Magie ("SEL4LAKE") auf der Platte, gegen die der Kernel rechnet -- seit
+# A-6.2 auf LBA 34, dem ersten Sektor der ersten Partition (s. u.).
+#
+# Die Groesse ist die zweite, unabhaengige Aussage: 1 MiB sind genau 2048 Sektoren zu 512 Byte,
+# und der Kernel liest die Kapazitaet aus dem geraetespezifischen Konfigurationsraum. Passt sie
+# nicht, ist entweder der Konfigurationsraum falsch lokalisiert oder gar nicht gefunden.
+BLK_IMG="$(mktemp)"
+BLK_SECTORS=32768
+# Seit A-6.2/A-6.3 eine **echte GPT mit zwei Partitionen** (`tools/mkgpt.py`) -- und zwar dieselbe
+# wie in der Lade-Suite. Zwei Suiten, die dieselbe Platte verschieden aufsetzen, waeren derselbe
+# Riss wie zwei, die dasselbe Geraet verschieden aufsetzen.
+#   Partition 1 (34..20000): ein lesbares FAT16 mit HELLO.TXT
+#   Partition 2 (20001..):   roh, traegt die Magie
+# Getrennt, weil die Magie sonst auf dem FAT-Bootsektor laege -- zwei Tests, die sich dieselbe
+# Flaeche teilen, sind ein Riss, durch den beide fallen koennen.
+python3 tools/mkgpt.py "$BLK_IMG" --sectors "$BLK_SECTORS" \
+    --part 34:20000 --part 20001:32700 --magic-at 20001 \
+    --fat16 34:20000 --file "HELLO.TXT=SEL4LAKE-DATEIINHALT" \
+    || { echo "  FEHLER: GPT-Abbild liess sich nicht bauen"; exit 2; }
 # Zaehlt Laeufe, die das Zeitlimit rissen -- s. die Begruendung in boot_once().
 BOOT_TIMEOUTS=0
 
@@ -101,6 +142,10 @@ boot_once() {
         -kernel "$ELF" -m "$RAM" -smp 4 "${ACCEL[@]}" \
         -machine q35,kernel-irqchip=split -device intel-iommu,caching-mode=on,intremap=on \
         -device virtio-rng-pci,disable-legacy=on,iommu_platform=on \
+        -drive if=none,id=blk0,format=raw,file="$BLK_IMG" \
+        -device virtio-blk-pci,drive=blk0,disable-legacy=on,iommu_platform=on \
+        -netdev user,id=net0 \
+        -device virtio-net-pci,netdev=net0,disable-legacy=on,iommu_platform=on \
         -nographic -serial file:"$LOG" -no-reboot \
         </dev/null >/dev/null 2>&1
     local rc=$?
@@ -168,10 +213,10 @@ fi
 if [ -z "$OUT" ]; then
     echo "== KEIN OUTPUT: der Lauf hat nichts geliefert (Logdatei $(wc -c < "$LOG" 2>/dev/null || echo 0) Byte) =="
     echo "== Das ist KEIN Testergebnis -- Aufbau pruefen (KVM verfuegbar? Zeitlimit zu knapp?) =="
-    rm -f "$LOG"
+    rm -f "$LOG" "$BLK_IMG"
     exit 2
 fi
-rm -f "$LOG"
+rm -f "$LOG" "$BLK_IMG"
 echo "$OUT"
 
 echo "== checks =="
@@ -192,10 +237,26 @@ check "ipc     : ALL PASS"            "Stufe 4: cap-gesicherte IPC (CALL/RECV/RE
 check "ring3   : ALL PASS"            "Stufe 4c: Ring-3-Threads (Syscall aus Ring 3; Zugriff auf Kernel-Speicher faultet -> Thread beendet, Kernel laeuft weiter)"
 check "pci     : ALL PASS"            "PCI-Enumeration ueber das ECAM-Fenster aus der ACPI-MCFG (virtio-rng gefunden, Bus-Master an)"
 check "virtio  : ALL PASS" "A-5.2: virtio-pci auf x86 -- arch-neutraler Treiber; VOR dem VT-d-Aufbau liefert das Geraet echte Bytes per Bus-Master-DMA, NACH dem Aufbau kommt dasselbe Geraet ohne Zuteilung nicht mehr durch (VT-d-Fault). Beide Richtungen, nicht nur die bequeme"
+check "vblk    : ALL PASS" "A-5.2: virtio-blk -- dreigliedrige Deskriptorkette (Anfragekopf, den das GERAET LIEST; Datenpuffer; Statusbyte). Der gelieferte Sektor traegt die Magie, die diese Suite ins Abbild schreibt; nach dem VT-d-Aufbau erreicht das Geraet den Anfragekopf nicht mehr -- damit ist die LESERICHTUNG gesperrt belegt, die der RNG-Test strukturell nicht zeigen kann"
+check "vnet    : ALL PASS" "A-5.2: virtio-net -- ZWEI Queues mit getrenntem queue_notify_off (bei einem Einqueue-Geraet kann der Vertauschungsfehler gar nicht auftreten); die ARP-ANTWORT auf die eigene Anfrage belegt Senden und Empfangen inhaltlich, ein bloss gefuellter Puffer koennte Restspeicher sein"
+# Die vom Geraet gemeldete Kapazitaet ist die zweite, unabhaengige Aussage ueber denselben Pfad:
+# sie kommt aus dem geraetespezifischen Konfigurationsraum (VIRTIO_PCI_CAP_DEVICE_CFG), den der
+# RNG nicht hat und der deshalb bis A-5.2 nirgends aufgeloest wurde. Steht dort Muell, ist die
+# Capability falsch lokalisiert -- ein Fehler, den die Magie im Sektor allein nicht faende, weil
+# der Datenpfad davon unberuehrt ist. Die erwartete Zahl steht HIER, wo das Abbild entsteht, und
+# nicht im Kernel: seine Aufgabe ist, die Kapazitaet zu MELDEN, nicht sie zu kennen.
+if echo "$OUT" | grep -q "vblk    : Lesen (vor VT-d).*Kapazitaet=$BLK_SECTORS Sektor"; then
+    echo "  PASS: A-5.2: das Blockgeraet meldet $BLK_SECTORS Sektoren -- genau die Groesse des Abbilds, das diese Suite anlegt (geraetespezifischer Konfigurationsraum korrekt lokalisiert)"
+else
+    echo "  FAIL: A-5.2: gemeldete Kapazitaet passt nicht zum Abbild ($BLK_SECTORS Sektoren erwartet):"
+    echo "$OUT" | grep -m1 "vblk    : Lesen" | sed 's/^/          /'
+    fail=1
+fi
 check "vtdcaps : ALL PASS" "VT-d-Faehigkeiten (Schritt 1): SAGAW/MGAW/ND/CM/RWBF/ECAP.C/QI/IR/SC/ScalableMode einmal gelesen und protokolliert; jede spaetere Bit-Entscheidung leitet sich daraus ab"
 check "vtdgrp  : ALL PASS" "DMAR-Auswertung + Gruppenbildung (Schritt 2) gegen eine EINGESPEISTE Tabelle/Topologie: Catch-all zuletzt, Scope-Typ 2 als Subhierarchie, ACS-Gruppen, RID-Alias-Mengen, RMRR-Ausschluss, Firmware-Muell abgefangen, Vollstaendigkeits-Oracle"
 check "apic    : x2APIC" "x2APIC aktiv (MSR-Pfad statt MMIO): schnellere IPIs, 64-Bit-ICR in einem Zugriff, und 32-Bit-APIC-IDs -- xAPIC kann nur 255 Kerne adressieren"
 check "cycles  : ALL PASS" "Zyklenzaehler (Stufe 1): serialisierender Zeitstempel, invariant-TSC geprueft statt angenommen, gegen den PIT kalibriert"
+check "cycacct : ALL PASS" "B-5.1: CPU-Verbrauch wird bei JEDER Umplanung gestempelt, nicht nur beim Tick. Die Zahl, die das belegt, ist Proben > Ticks -- die Tick-Rechnung kann hoechstens einmal je Tick belasten, jede weitere Probe ist Rechenzeit, die vorher niemand zahlte (wer kurz vor dem Tick blockiert, rechnete umsonst). Ohne zugesicherte Zeitquelle wird bewusst NICHTS gerechnet -- dann muss der Ablehnungszaehler sprechen, sonst waere ein Kernel ohne die Klammerung von einem korrekt schweigenden nicht zu unterscheiden"
 check "dmawin  : ALL PASS" "IOVA-Fenstergrenzen (ext-36b) -- DIESELBE Funktion wie im ARM-Lauf, nicht nachgebaut"
 check "dmatok  : ALL PASS" "Teardown-Token (ext-37) -- dieselbe Funktion wie im ARM-Lauf; VtdEnforcer::attach liefert jetzt Some"
 check "ir      : ALL PASS" "B-3.2: Interrupt Remapping aktiv UND Compatibility-Format-Interrupts abgeschaltet -- ohne IR kann ein durchgereichtes Geraet beliebige Interrupt-Nachrichten erzeugen (MSI ist eine DMA-Schreibung, die die Uebersetzung nicht ansieht); mit IR, aber erlaubtem CFI bleibt die Tabelle umgehbar"
@@ -252,6 +313,43 @@ check "state   : ALL PASS" "A-4.3: Zustandsuebergabe ueber eine Region mit VERSI
 # der zustandsbehaftete Hot-Reload haengt an der arch-neutralen Thread-Demo, die hier nicht startet.
 # Er wird von test-qemu.sh (aarch64) geprueft. Auf x86 belegt `state` die Torlogik, nicht den Lauf.
 check "stripe  : ALL PASS" "B-4.2: erschoepfte Farbpartitionierung scheitert SAUBER -- der 5. Streifenversuch wird abgewiesen, statt den Satz der ersten PD still ein zweites Mal auszugeben; nach Freigabe wieder vergebbar (kein Leck)"
+# B-4.5 (Prime+Probe): die WIRKUNG der Faerbung, nicht nur die Zuteilung.
+#
+# Diese Zeile wurde bis 2026-08-02 von KEINER Suite geprueft -- der Kernel druckte sie, und
+# niemand las sie. Genau das ist die Fehlerform, gegen die B-1.5 gebaut wurde.
+#
+# Drei Ausgaenge, und alle drei sind hier ausgesprochen:
+#  * ALL PASS -- die Wirkung ist belegt (nur auf Blech erreichbar, s. u.).
+#  * SKIP     -- die Frage ist auf DIESER Maschine nicht entscheidbar. Unter QEMU ist das der
+#                Normalfall und KEIN Fehler: ein Gast faerbt gastphysische Adressen, und wo eine
+#                nicht partitionierte Cache-Ebene so gross ist wie ein LLC-Farbanteil, gibt es
+#                keine gueltige Opfergroesse. Der Grund steht in derselben Zeile.
+#  * FAILURES -- entweder ist die Wirkung widerlegt, oder der Aufbau ist kaputt (Bilanz,
+#                Farbwahl). Beides ist ein FAIL, und zwar hier und nicht erst am Blech-Tag.
+# Die FEHLENDE Zeile ist ebenfalls ein FAIL: sie wird auf x86 bedingungslos gedruckt, ihr
+# Ausbleiben heisst also, dass der Hochlauf vorher stehengeblieben ist.
+if echo "$OUT" | grep -q "^pprobe  : FAILURES"; then
+    echo "  FAIL: B-4.5: $(echo "$OUT" | grep -m1 '^pprobe  : FAILURES')"
+    fail=1
+elif echo "$OUT" | grep -q "^pprobe  : ALL PASS"; then
+    echo "  PASS: B-4.5: disjunkte Farbsaetze verdraengen einander messbar weniger -- die WIRKUNG von A1"
+elif echo "$OUT" | grep -q "^pprobe  : SKIP"; then
+    echo "  SKIP: B-4.5 (nicht entscheidbar, Grund in der Zeile): $(echo "$OUT" | grep -m1 -oE '^pprobe  : SKIP -- [^.]*')"
+    # Auch im SKIP-Fall pruefbar und geprueft: der Aufbau hat seinen Speicher zurueckgegeben und
+    # die Farbwahl war korrekt. Ohne diese beiden waere ein SKIP eine Aussage ueber gar nichts.
+    if echo "$OUT" | grep -q "^pprobe  : Opfer"; then
+        if echo "$OUT" | grep -q "^pprobe  : Opfer.*farbtreu=1 bilanz=1"; then
+            echo "  PASS: B-4.5: der Aufbau ist trotzdem geprueft -- Farbwahl korrekt und JEDER Rueckspeicherblock wieder frei (region_fully_free je Block, nicht Summenvergleich)"
+        else
+            echo "  FAIL: B-4.5: SKIP, aber Aufbau nicht sauber: $(echo "$OUT" | grep -m1 -oE 'farbtreu=[01] bilanz=[01]')"
+            fail=1
+        fi
+    fi
+else
+    echo "  FAIL: B-4.5: keine pprobe-Zeile im Protokoll -- der Hochlauf ist vor dem Prime+Probe stehengeblieben"
+    fail=1
+fi
+check "freeze  : ALL PASS" "Z4a: ein Thread haelt an einer BENENNBAREN Grenze an -- deplant, auf keinem Kern, in keiner IPC-Rolle. Geprueft wird die WIRKUNG statt des Rueckgabewerts: der Rundenzaehler muss sich VORHER bewegen (sonst belegt 'er steht' nichts), waehrend des Einfrierens stehen, und nach dem Auftauen wieder laufen (sonst waere ein freeze, das den Thread kaputtmacht, davon nicht zu unterscheiden). Ein Thread in RECV wird ABGEWIESEN -- 'blockiert' und 'ruhend' sehen von aussen gleich aus"
 check "audit   : ALL PASS"            "Stufe 4: Scheduler- + CDT-Audit sauber"
 # B-1.5: die erwartete Abwesenheit AUSSPRECHEN, statt sie durchlaufen zu lassen.
 # Diese Suite bootet den Kernel nackt -- sie baut KEIN Boot-Archiv (keine `programs`, kein

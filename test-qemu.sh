@@ -27,6 +27,19 @@ ELF="build/target/aarch64-sel4lake/release/sel4lake-kernel.elf"
 # es dort nicht mehr, und diese Suite bootet einen Kernel, dessen Selbsttestbericht sie auswertet.
 # Ohne die Angabe waere der Lauf danach still statt rot (s. AGENTS.md Mitteilung 4).
 FEAT="--features selftest${KERNEL_FUZZ:+,kernel-fuzz}"
+
+# **D5: der Manifest-Schluessel, und zwar VOR dem Build.** Die oeffentliche Haelfte wird in
+# `kernel/src/manifest_keys.rs` **einkompiliert** -- ein danach erzeugtes Paar waere ein Schluessel,
+# den das laufende Image nicht kennt. Dieselbe Reihenfolge wie beim TrustedSAS-Schluessel weiter
+# unten, und aus demselben Grund.
+python3 -c "import cryptography" 2>/dev/null || {
+    echo "== FEHLT: das Python-Paket 'cryptography' (signieren geht ohne nicht) =="
+    echo "   pip3 install --user cryptography   # oder --break-system-packages auf Debian"
+    exit 2
+}
+MANKEY=keys/manifest-test.manifest.ed25519
+python3 tools/gen_manifest_key.py --ensure >/dev/null || exit 2
+
 echo "== build ${FEAT:-(release, ohne Fuzzer)} =="
 ./build.sh $FEAT >/dev/null 2>&1 || { echo "BUILD FAILED"; exit 1; }
 
@@ -43,6 +56,7 @@ mkdir -p build
     || { echo "TESTS BUILD FAILED"; exit 1; }
 HELLO="programs/build/target/aarch64-sel4lake-user/release/hello.elf"
 SVCDEMO="programs/build/target/aarch64-sel4lake-user/release/svc-demo.elf"
+INIT="programs/build/target/aarch64-sel4lake-user/release/init.elf"
 TBIN="tests/build/target/aarch64-sel4lake-user/release"
 printf 'PLACEHOLDER' > build/_probe.bin
 # ext-28 (ADR 0014): TrustedSAS-Binaries signieren. tools/sign_trusted.py fuehrt zuerst den
@@ -66,11 +80,6 @@ mkdir -p certs
 # Reihenfolge ist zwingend: die Key-DB (`kernel/src/trusted_keys.rs`) wird in den Kernel
 # **kompiliert**. Ein neu erzeugter Schluessel nach dem Build waere ein Schluessel, den das laufende
 # Image nicht kennt. Deshalb hier, VOR `./build.sh`.
-python3 -c "import cryptography" 2>/dev/null || {
-    echo "== FEHLT: das Python-Paket 'cryptography' (signieren geht ohne nicht) =="
-    echo "   pip3 install --user cryptography   # oder --break-system-packages auf Debian"
-    exit 2
-}
 if [ ! -f keys/trusted-test.ed25519 ]; then
     echo "== TrustedSAS-Testschluessel fehlt -> erzeugen (frischer Clone) =="
     python3 tools/gen_trusted_key.py --name trusted-test >/dev/null 2>&1 || {
@@ -84,12 +93,37 @@ sign --crate programs/trusted/svc-demo --elf "$SVCDEMO" --program-id 12 --versio
      --out certs/trusted-x.cert || { echo "SIGN trusted-x FAILED"; exit 1; }
 sign --crate tests/services/trusted/aggressor --elf "$TBIN/aggressor-t.elf" --program-id 24 --version 1 \
      --out certs/aggressor-t.cert || { echo "SIGN aggressor-t FAILED"; exit 1; }
+# D5: `init` ist TrustedSAS -> das Zertifikats-Gate (ADR 0014) gilt auch fuer den Root-Task. Das
+# Zertifikat bindet an DIESES aarch64-ELF; `certs/init-x86.cert` traegt hier nicht (anderer Hash).
+sign --crate programs/trusted/init --elf "$INIT" --program-id 1 --version 1 \
+     --out certs/init-arm.cert || { echo "SIGN init FAILED"; exit 1; }
 # hello=UserLand(2), hwhello=HardwareLand(1) (gleiches ELF, L3); trusted-x=TrustedSAS(0): das saubere,
 # zertifizierte svc-demo (laedt GELADEN als EL0-isolierte PD). probe=Platzhalter (Multi-Modul-Liste).
 # ext-27 Testdienste je Domaene (2 je Domaene): aggressor/intruder -u=UserLand(2), -h=HardwareLand(1),
 # -t=TrustedSAS(0). ext-28: TrustedSAS-Module tragen ein Zertifikat (7. Feld); aggressor-t ist
 # zertifiziert (laedt + attackiert), intruder-t bewusst OHNE Zertifikat -> verify_image weist es ab.
-python3 tools/mkarchive.py build/boot-archive.bin \
+
+# --- D5: das System-Manifest ---------------------------------------------------------------------
+#
+# **Was hier fehlte und warum es zaehlte.** Der aarch64-Kernel meldete `root : FAILURES
+# (NoManifest)` -- eine rote Zeile, die diese Suite gar nicht prueft. Ein Urteil, das niemand
+# ansieht, ist kein Urteil; der 67. Test, der wirklich bricht, waere darin verschwunden. Das ist
+# dieselbe Form wie `-no-shutdown` (rc war immer 124), nur mit umgekehrtem Vorzeichen.
+#
+# **Die Startmenge ist GENAU EIN Eintrag.** Das Archiv enthaelt zehn weitere Module -- die
+# adversarialen Testdienste, `probe` (ein Platzhalter, kein ELF) und die Loader-Testfaelle. Die
+# gehoeren nicht zur Startmenge: sie werden von den Kerntests gezielt geladen. Genau daran haengt
+# die Pruefung, die D5 im Kernel noetig gemacht hat (`StartSetNotPrefix`): der Root-Task bekommt
+# die GROESSE der Startmenge aus dem Manifest und spricht ihre Mitglieder ueber einen ARCHIVINDEX
+# an. Damit beide dasselbe meinen, muss `init` auf Archivposition 0 liegen -- deshalb steht es
+# unten als ERSTES Argument, und deshalb prueft der Kernel es nach, statt es zu glauben.
+python3 tools/sign_manifest.py --kernel "$ELF" --key "$MANKEY" --manifest-version 1 \
+    --out build/system.manifest \
+    --entry "1:init:0:1:$INIT:loader,ntfn:root:3::any:0" >/dev/null 2>&1 \
+    || { echo "MANIFEST BUILD FAILED"; exit 1; }
+
+python3 tools/mkarchive.py build/boot-archive.bin --system-manifest build/system.manifest \
+    1:init:0:1:"$INIT"::certs/init-arm.cert \
     10:hello:2:1:"$HELLO" 11:hwhello:1:1:"$HELLO" 12:trusted-x:0:1:"$SVCDEMO"::certs/trusted-x.cert 2:probe:2:1:build/_probe.bin \
     20:aggressor-u:2:1:"$TBIN/aggressor-u.elf" 21:intruder-u:2:1:"$TBIN/intruder-u.elf" \
     22:aggressor-h:1:1:"$TBIN/aggressor-h.elf" 23:intruder-h:1:1:"$TBIN/intruder-h.elf" \
@@ -101,12 +135,95 @@ echo "== boot ($SECONDS_RUN s) =="
 # QEMUs SMMUv3 uebersetzt nur Endpunkte hinter einem Root-Port (integrierte Bus-0-Endpunkte
 # umgehen die SMMU) -> das DMA-Beweisgeraet haengt am Root-Port. Der Kernel ignoriert beide,
 # solange die ext-23-Treiber nicht aktiv sind (Rueckwaertskompatibilitaet).
-OUT="$(timeout --signal=KILL "$SECONDS_RUN" qemu-system-aarch64 \
-    -machine virt,iommu=smmuv3 -cpu cortex-a72 -smp "$CORES" -m 4G \
-    -nographic -serial mon:stdio -no-reboot \
-    -net none -device pcie-root-port,id=rp0,chassis=1 -device virtio-rng-pci,bus=rp0,iommu_platform=on \
-    -device loader,file=build/boot-archive.bin,addr=0x13F000000 \
-    -kernel "$ELF" </dev/null 2>/dev/null)"
+# --- Wiederholungen + zuverlaessiger Capture (D6) -----------------------------------------------
+#
+# **Zwei Aenderungen, und die erste ist wichtiger als sie aussieht.**
+#
+# 1. Die Ausgabe geht in eine **Datei**, nicht durch eine Pipe. Vorher hing sie an einer
+#    Kommandosubstitution, und beendet wurde mit `--signal=KILL`. Ein per SIGKILL erschlagenes
+#    QEMU flusht seinen stdout-Puffer nicht -- der Lauf verlor dann Ausgabe, und zwar
+#    unvorhersehbar viel. Im Ergebnis fiel "mal dieser, mal jener Test" durch, ohne dass am Kernel
+#    etwas anders war. Genau diese Falle hat die x86-Suite am 2026-08-01 schon einmal bezahlt.
+# 2. **Wiederholungen** (B-1.3, hier nachgezogen): verglichen wird die Ergebnis-SIGNATUR ueber
+#    `RUNS` Laeufe. Ein einzelner Lauf kann einen Nichtdeterminismus grundsaetzlich nicht finden --
+#    er kann ihn nur zufaellig treffen. Die ARM-Suite lief bis heute genau einmal, und ein roter
+#    Lauf war dort von einem echten Befund nicht zu unterscheiden.
+#
+# Die Mechanik ist bewusst **dieselbe** wie in `test-qemu-x86.sh` und keine zweite Fassung davon:
+# zwei Fassungen derselben Messung laufen auseinander, und dann weiss niemand, welche gilt.
+RUNS="${RUNS:-1}"
+BOOT_TIMEOUTS=0
+
+# **Jeder Lauf bekommt seine EIGENE Datei** ($1). Eine gemeinsame Datei ueber mehrere Laeufe war
+# eine Fehlerquelle mit genau der Form, die man am schwersten sieht: gelegentlich fehlten in der
+# ausgewerteten Ausgabe **fruehe** Bootzeilen, waehrend alle Ergebniszeilen da waren. Die Signatur
+# blieb deshalb identisch, und trotzdem fiel mal `M=1 C=1 I=1`, mal `archive : 10 Modul` durch --
+# also je nach Lauf eine ANDERE Pruefung, ohne dass am Kernel etwas anders war.
+boot_once() {
+    local LOG="$1"
+    timeout --signal=KILL "$SECONDS_RUN" qemu-system-aarch64 \
+        -machine virt,iommu=smmuv3 -cpu cortex-a72 -smp "$CORES" -m 4G \
+        -nographic -serial "file:$LOG" -no-reboot \
+        -net none -device pcie-root-port,id=rp0,chassis=1 -device virtio-rng-pci,bus=rp0,iommu_platform=on \
+        -device loader,file=build/boot-archive.bin,addr=0x13F000000 \
+        -kernel "$ELF" </dev/null >/dev/null 2>/dev/null
+    local rc=$?
+    # rc 137 = SIGKILL durchs Zeitlimit. Ein zweiter, unabhaengiger Melder: er haengt an keiner
+    # Zeile, die der Kernel drucken muss -- ein Kernel, der in der falschen Lage schweigt, koennte
+    # die Logauswertung taeuschen, ein Zeitlimit nicht.
+    { [ "$rc" -eq 137 ] || [ "$rc" -eq 124 ]; } && BOOT_TIMEOUTS=$((BOOT_TIMEOUTS + 1))
+    return 0
+}
+
+# Die Ergebnissignatur: alle Ergebniszeilen plus der Abschlussmarker, sortiert. Gleiche Signatur
+# heisst gleiches Testergebnis -- die Pruefungen unten sind reine greps auf genau diese Zeilen.
+run_signature() {
+    printf '%s\n' "$1" \
+        | grep -oE '^[a-z0-9_]+ +: (ALL PASS|FAILURES|SKIP)|^== SELFTEST [A-Z]+( \(watchdog\))?' \
+        | sort
+}
+
+echo "== boot ($SECONDS_RUN s, $RUNS Lauf/Laeufe) =="
+LOG1="$(mktemp)"
+boot_once "$LOG1"
+OUT="$(cat "$LOG1" 2>/dev/null)"
+
+REPEAT_OK=1
+REPEAT_DONE=0
+if [ "$RUNS" -gt 1 ]; then
+    SIG0="$(mktemp)"; SIGN="$(mktemp)"
+    run_signature "$OUT" > "$SIG0"
+    REPEAT_DONE=1
+    for n in $(seq 2 "$RUNS"); do
+        LOGN="$(mktemp)"
+        boot_once "$LOGN"
+        OUTN="$(cat "$LOGN" 2>/dev/null)"
+        run_signature "$OUTN" > "$SIGN"
+        if cmp -s "$SIG0" "$SIGN"; then
+            REPEAT_DONE=$((REPEAT_DONE + 1))
+        else
+            echo "== Lauf $n weicht vom ersten ab (< Lauf 1, > Lauf $n): =="
+            diff "$SIG0" "$SIGN" | grep -E '^[<>]' | sed 's/^/     /'
+            # Das VOLLE Log aufheben. Ohne das sieht man, DASS er abwich, aber nicht wo.
+            mkdir -p build/diag
+            cp -f "$LOGN" "build/diag/arm-abweichung-lauf-$n.log" 2>/dev/null \
+                && echo "     (volles Log: build/diag/arm-abweichung-lauf-$n.log)"
+        fi
+        rm -f "$LOGN"
+    done
+    rm -f "$SIG0" "$SIGN"
+    [ "$REPEAT_DONE" = "$RUNS" ] || REPEAT_OK=0
+    echo "== Wiederholungen: $REPEAT_DONE von $RUNS mit IDENTISCHER Ergebnissignatur =="
+fi
+
+# Ein leerer Lauf sieht in der Auswertung aus wie "alle Pruefungen fehlgeschlagen" -- eine
+# Fehldiagnose, die schlimmer ist als gar keine.
+if [ -z "$OUT" ]; then
+    echo "== KEIN OUTPUT: der Lauf hat nichts geliefert (Logdatei $(wc -c < "$LOG1" 2>/dev/null || echo 0) Byte) =="
+    echo "== Das ist KEIN Testergebnis -- Aufbau pruefen (QEMU? Zeitlimit zu knapp?) =="
+    rm -f "$LOG1"; exit 2
+fi
+rm -f "$LOG1"
 
 echo "$OUT"
 echo "== checks =="
@@ -118,7 +235,9 @@ fcheck() { if [ -n "${KERNEL_FUZZ:-}" ]; then check "$1" "$2"; else echo "  SKIP
 
 check "M=1 C=1 I=1" "MMU + Caches aktiv"
 check "dtb     : ALL PASS" "DTB-Parsing (RAM-Größe aus dem Device Tree)"
-check "archive : 10 Modul" "ext-26 L0: Boot-Archiv extern geladen + vom Kernel-Parser gelesen (reserviertes RAM-Fenster, sel4lake-loader)"
+check "archive : 11 Modul" "ext-26 L0: Boot-Archiv extern geladen + vom Kernel-Parser gelesen (reserviertes RAM-Fenster, sel4lake-loader)"
+check "manifest: ALL PASS" "A-1.2/A-1.4 (D5): das System-Manifest wird auch auf aarch64 geprueft -- Signatur ueber die GESAMTE Nachricht, an DIESES Kernel-Image gebunden, Anti-Downgrade"
+check "root    : ALL PASS" "A-2.1 (D5): der aarch64-Kernel hat einen Root-Task. Bis hierher meldete er 'root : FAILURES (NoManifest)', und diese Suite sah sich die Zeile ueberhaupt nicht an -- ein dauerhaft rotes Teilurteil lag unbeachtet im Bericht. Ein Urteil, das niemand ansieht, unterscheidet nicht mehr zwischen 'wie immer' und 'gerade gebrochen'"
 check "memtest : ALL PASS" "Speichermodell-Selbsttest (alloc/split/transfer/free)"
 check "zerotest: ALL PASS" "Datenremanenz (ext-29): frische UND wiederverwendete Allokationen sind genullt -- kein Restdatenleck zwischen Subjekten"
 check "captest : ALL PASS" "Capability-Selbsttest (copy/mint/move/delete/revoke)"
@@ -191,8 +310,78 @@ check "aggrt   : ALL PASS" "Adversariale Testdienste (ext-27 T3): extern geladen
 check "intrt   : ALL PASS" "TrustedSAS-Zertifikats-Gate (ext-28, ADR 0014): UNZERTIFIZIERTES TrustedSAS wird abgewiesen -- intruder-t traegt absichtlich unsafe (nicht zertifizierbar) + liegt OHNE Zertifikat im Archiv -> verify_image lehnt das Laden mit Unverified ab; KEIN Thread/keine PD; Audits==0"
 check "cross   : ALL PASS" "Adversariale Testdienste (ext-27 T4): Cross-Service-Matrix -- 3 extern geladene Angreifer DREIER Domaenen NEBENLAEUFIG (aggressor-u + aggressor-t melden unabhaengig SUCCESS, intruder-h faultet); gleichzeitige cross-domain Angreifer stoeren einander nicht; kernel-geschuetztes Canary unberuehrt; Audits==0"
 fcheck "hwfuzz  : ALL PASS" "Domaenen/HW-Fuzzer: HW-/Management-Cap-Churn gegen Domaenen-Policy + CDT/VSpace-Oracle + Ressourcen-Baseline"
+# --- Farbe / Cache-Partitionierung (A1, B-4.2, B-4.5) ------------------------------------------
+#
+# Diese drei Zeilen gab es auf aarch64 bis 2026-08-02 NICHT. `spawn_demo` setzte `COLOR_OK`,
+# `STRIPE_ALLOC_OK` und `PPROBE_OK` hart auf `true` -- drei dauerhaft wahre Konjunkte in
+# `all_done()`, keine Berichtszeile, kein Check hier. Die Abwesenheit war damit nicht bloss
+# unbelegt, sie war unsichtbar; ein Ausfall der Faerbung auf ARM haette `== ALL PASS ==` gemeldet.
+#
+# Jetzt laufen die Tests (am ENDE der Kette, hinter cross/strand/loadstop) und melden. Geprueft
+# wird hier deshalb auch die ANWESENHEIT der Zeile: fehlt sie, ist die Kette vorher
+# stehengeblieben, und genau das soll nicht wieder in der Stille verschwinden.
+if echo "$OUT" | grep -q "^color   : SKIP"; then
+    echo "  SKIP (Plattform meldet weniger als 2 Seitenfarben): A1 Cache-Partitionierung"
+elif echo "$OUT" | grep -q "^color   : ALL PASS"; then
+    echo "  PASS: A1: zwei isolierte PDs teilen sich KEINE Cache-Farbe -- Region, Kernel-Stack und Seitentabellen jeder PD aus disjunkten Farbsaetzen; eine Region jenseits der Streifenbreite wird abgewiesen. Auf aarch64 (16 Farben) laeuft das seit 2026-08-02 zum ersten Mal -- die 16-Farben-Aufteilung ist genau der Fall, den die MASK_BITS-Verwechslung falsch machte"
+else
+    echo "  FAIL: A1: keine verwertbare 'color'-Zeile -- der Farbtest lief nicht oder fiel durch"
+    fail=1
+fi
+if echo "$OUT" | grep -q "^stripe  : SKIP"; then
+    echo "  SKIP (weniger als 2 Seitenfarben): B-4.2 Streifenvergabe"
+elif echo "$OUT" | grep -q "^stripe  : ALL PASS"; then
+    echo "  PASS: B-4.2: erschoepfte Farbpartitionierung scheitert SAUBER -- der 5. Streifenversuch wird abgewiesen statt den Satz der ersten PD still ein zweites Mal auszugeben; nach Freigabe wieder vergebbar (kein Leck)"
+else
+    echo "  FAIL: B-4.2: keine verwertbare 'stripe'-Zeile"
+    fail=1
+fi
+# B-4.5: drei Ausgaenge, alle ausgesprochen. Unter TCG ist SKIP der erwartete Fall (kein echter
+# Cache -> die Positivkontrolle kann nicht tragen), aber Aufbau, Farbwahl und Bilanz sind auch
+# dort pruefbar -- und werden geprueft. Ein SKIP, der ueber den Aufbau nichts sagt, waere eine
+# Aussage ueber gar nichts.
+if echo "$OUT" | grep -q "^pprobe  : FAILURES"; then
+    echo "  FAIL: B-4.5: $(echo "$OUT" | grep -m1 '^pprobe  : FAILURES')"
+    fail=1
+elif echo "$OUT" | grep -q "^pprobe  : ALL PASS"; then
+    echo "  PASS: B-4.5: disjunkte Farbsaetze verdraengen einander messbar weniger -- die WIRKUNG von A1"
+elif echo "$OUT" | grep -q "^pprobe  : SKIP"; then
+    echo "  SKIP: B-4.5 (nicht entscheidbar, Grund in der Zeile): $(echo "$OUT" | grep -m1 -oE '^pprobe  : SKIP -- [^.]*')"
+    if echo "$OUT" | grep -q "^pprobe  : Opfer"; then
+        if echo "$OUT" | grep -q "^pprobe  : Opfer.*farbtreu=1 bilanz=1"; then
+            echo "  PASS: B-4.5: der Aufbau ist trotzdem geprueft -- Farbwahl korrekt und JEDER Rueckspeicherblock wieder frei (region_fully_free je Block, nicht Summenvergleich)"
+        else
+            echo "  FAIL: B-4.5: SKIP, aber Aufbau nicht sauber: $(echo "$OUT" | grep -m1 -oE 'farbtreu=[01] bilanz=[01]')"
+            fail=1
+        fi
+    fi
+else
+    echo "  FAIL: B-4.5: keine pprobe-Zeile im Protokoll -- die Testkette ist vor dem Prime+Probe stehengeblieben"
+    fail=1
+fi
 online=$(echo "$OUT" | grep -c "online")
 [ "$online" -eq "$CORES" ] && echo "  PASS: alle $CORES Kerne online" || { echo "  FAIL: nur $online/$CORES Kerne online"; fail=1; }
+
+# Das Zeitlimit als zweiter, unabhaengiger Melder (s. boot_once).
+if [ "$BOOT_TIMEOUTS" -gt 0 ]; then
+    echo "  FAIL: $BOOT_TIMEOUTS Lauf/Laeufe rissen das Zeitlimit von ${SECONDS_RUN}s -- der Gast"
+    echo "        hat sich nicht heruntergefahren. Das ist ein Haenger, unabhaengig davon, was im"
+    echo "        Log steht (s. todo D6)."
+    fail=1
+else
+    echo "  PASS: kein Lauf riss das Zeitlimit -- jeder Gast fuhr selbst herunter"
+fi
+if [ "$RUNS" -gt 1 ]; then
+    if [ "$REPEAT_OK" = 1 ]; then
+        echo "  PASS: D6/B-1.3: $RUNS von $RUNS Laeufen mit IDENTISCHER Ergebnissignatur -- reproduzierbar,"
+        echo "        und zwar im Ergebnis, nicht bloss im Durchlaufen"
+    else
+        echo "  FAIL: D6/B-1.3: nur $REPEAT_DONE von $RUNS Laeufen mit identischer Ergebnissignatur."
+        echo "        Eine Quote unter 100 % ist KEIN 'meistens gruen', sondern ein Nichtdeterminismus --"
+        echo "        und bei abweichenden Signaturen weiss niemand, welcher Lauf die Wahrheit sagt."
+        fail=1
+    fi
+fi
 
 echo "== $([ $fail -eq 0 ] && echo 'ALL PASS' || echo 'FAILURES') =="
 exit $fail

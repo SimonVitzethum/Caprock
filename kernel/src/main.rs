@@ -221,6 +221,11 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // Loader auf ARM ausschliesslich `threads/mod.rs` — also nur der Testcode. Ohne diesen Aufruf
     // ist der `--no-default-features`-Kernel auf ARM tatsaechlich leer, und das Gating waere kein
     // schlankerer Kernel, sondern ein Kernel ohne Zweck.
+    // D5: erst das Autoritaetsdokument melden, dann den Root-Task starten. Genau diese Zeile fehlte
+    // auf ARM -- die x86-Seite druckt sie seit A-1.4 (`bringup`), hier lief der Manifest-Pfad
+    // ungeprueft mit. Ohne sie waere „root : ALL PASS" die einzige Aussage ueber ein Dokument, an
+    // dem die gesamte Anfangsverteilung von Autoritaet haengt.
+    loader::manifest_report();
     let _root_ok = loader::start_root_task_reported();
 
     // Sekundärkerne via PSCI starten.

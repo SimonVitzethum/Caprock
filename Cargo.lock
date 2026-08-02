@@ -159,6 +159,10 @@ name = "sel4lake-dtb"
 version = "0.0.1"
 
 [[package]]
+name = "sel4lake-fat"
+version = "0.0.1"
+
+[[package]]
 name = "sel4lake-hal"
 version = "0.0.1"
 dependencies = [
@@ -216,6 +220,10 @@ dependencies = [
  "sel4lake-slab",
  "sel4lake-sync",
 ]
+
+[[package]]
+name = "sel4lake-part"
+version = "0.0.1"
 
 [[package]]
 name = "sel4lake-region"

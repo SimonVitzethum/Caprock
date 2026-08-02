@@ -48,3 +48,15 @@ pub fn drain_faults() -> u32 {
 pub fn config_errors() -> u32 {
     smmu::config_errors()
 }
+
+/// Gegenstueck zu `x86_64::iommu::interrupt_message_window` (B-3.4).
+///
+/// Auf aarch64 laeuft MSI ueber die **ITS-Doorbell**, und die ist eine ganz gewoehnliche Adresse,
+/// die durch die SMMU uebersetzt wird — es gibt kein Fenster, das die Uebersetzung umgeht. Deshalb
+/// `None`, und das ist eine **Zusage**, keine Unkenntnis: jede IOVA wird hier uebersetzt.
+///
+/// (Sollte je eine Plattform dazukommen, auf der die Doorbell ausserhalb der Uebersetzung liegt,
+/// gehoert sie hierher — nicht in eine Sonderbehandlung beim Aufrufer.)
+pub fn interrupt_message_window() -> Option<(u64, u64)> {
+    None
+}

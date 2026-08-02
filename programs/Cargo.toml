@@ -8,7 +8,7 @@
 [workspace]
 resolver = "2"
 # Programme nach Domaene gegliedert (userland/hardware/trusted). libsel4lake = gemeinsames SDK.
-members = ["libsel4lake", "userland/hello", "trusted/init", "trusted/svc-demo"]
+members = ["libsel4lake", "userland/hello", "hardware/virtio-blk", "hardware/virtio-net", "trusted/init", "trusted/svc-demo", "trusted/fs"]
 
 [workspace.package]
 edition = "2021"

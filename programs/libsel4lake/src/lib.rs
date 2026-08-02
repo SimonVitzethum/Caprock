@@ -150,6 +150,136 @@ pub fn reply(cap: u64, msg: [u64; 4]) {
 pub fn map(cap: u64) -> u64 {
     invoke(sys::MAP, cap, [0; 4], 0).result
 }
+
+/// Ein **Fenster** (Memory-, MMIO- oder DMA-Cap) mappen und erfahren, **was** gemappt wurde:
+/// `(Basis, Länge, Gerätesicht)`. `None` bei Fehlschlag.
+///
+/// Die Gerätesicht (IOVA) ist bei DMA-Caps die Adresse, unter der **das Gerät** die Region sieht;
+/// bei MMIO ist sie `0`. Sie ist **nicht** die Basis: die IOVA stammt aus dem Fenster, das der
+/// Kernel beim Zuteilen gewählt hat, und liegt oberhalb des RAM. Ein Treiber, der die beiden
+/// vermischt, programmiert dem Gerät eine Adresse, die es nicht auflösen kann — oder beschreibt
+/// eine, unter der nichts liegt. Deshalb kommen sie hier **getrennt** zurück, auch wenn das
+/// umständlicher aussieht als ein Wert.
+///
+/// **Warum es das gibt** (A-5.1): ein Treiber im Userland hält Caps auf seine Fenster, aber die
+/// Adressen kennt er nicht — `map` legt sie an ihre physische Lage, und die steht nirgends im
+/// Programm. Der bequeme Weg wäre ein Boot-Info-Block gewesen; der wäre eine Autoritätsquelle
+/// neben dem Manifest, die jedes Programm ungefragt lesen kann. Hier beschreibt der Kernel
+/// stattdessen genau die Cap, die der Aufrufer ohnehin schon hält — neue Autorität entsteht
+/// dabei keine.
+pub fn map_window(cap: u64) -> Option<Window> {
+    let r = invoke(sys::MAP, cap, [0; 4], 0);
+    if r.result != result::OK {
+        return None;
+    }
+    Some(Window { base: r.msg[0], len: r.msg[1], iova: r.msg[2] })
+}
+
+/// Ein **gemapptes Fenster** — und die Grenze, innerhalb derer darauf zugegriffen werden darf.
+///
+/// ## Warum es diesen Typ gibt (A-6.3)
+///
+/// Ein Programm, das `map_window` bekommt, hält eine Adresse und eine Länge. Um sie zu benutzen,
+/// braucht es rohe Zeigerzugriffe — also `unsafe`. Für eine **TrustedSAS**-PD ist das ein
+/// Ausschlusskriterium: das Zertifikats-Gate (ADR 0014) verlangt `forbid(unsafe_code)`, und zwar
+/// zu Recht — eine Komponente, die ihre Vertrauensstufe behält, muss auditierbar sein.
+///
+/// Der Ausweg ist **nicht**, die Regel aufzuweichen, sondern das `unsafe` dorthin zu legen, wo es
+/// hingehört: in das auditierte SDK, das ohnehin auf der Allowlist steht. Dieser Typ ist die
+/// Kapsel dafür. Er entsteht **nur** aus [`map_window`] — also aus Basis und Länge, die der
+/// Kernel gerade selbst gemappt hat — und **jeder** Zugriff wird gegen die Länge geprüft. Ein
+/// Programm kann ihn nicht fälschen: die Felder sind privat und es gibt keinen Konstruktor.
+///
+/// Das ist derselbe Gedanke wie bei `Verified` im Manifest-Parser: die Bedingung trägt der Typ,
+/// nicht die Disziplin des Aufrufers.
+#[derive(Clone, Copy)]
+pub struct Window {
+    base: u64,
+    len: u64,
+    iova: u64,
+}
+
+impl Window {
+    /// Die Adresse, unter der **dieses Programm** das Fenster sieht.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+    /// Die Länge in Bytes.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    /// Die **Gerätesicht** (IOVA) — `0`, wenn es keine gibt. Sie ist **nicht** die Basis; s.
+    /// [`map_window`].
+    pub fn iova(&self) -> u64 {
+        self.iova
+    }
+
+    /// Ob `[off, off+n)` noch im Fenster liegt. Mit geprüfter Addition — eine Bereichsprüfung
+    /// hinter einem übergelaufenen Produkt ist eine Attrappe.
+    fn passt(&self, off: u64, n: u64) -> bool {
+        off.checked_add(n).is_some_and(|e| e <= self.len)
+    }
+
+    /// `n` Bytes ab `off` lesen. `None`, wenn das nicht mehr ins Fenster passt — **kein**
+    /// gekürzter Slice: ein halber Sektor sieht aus wie ein ganzer und wird als solcher gelesen.
+    pub fn bytes(&self, off: u64, n: u64) -> Option<&[u8]> {
+        if !self.passt(off, n) {
+            return None;
+        }
+        // SAFETY: `base` und `len` stammen aus `SYS_MAP` — der Kernel hat genau diesen Bereich
+        // eben in diese VSpace gemappt. `off + n <= len` ist geprüft. Nur lesend.
+        Some(unsafe { core::slice::from_raw_parts((self.base + off) as *const u8, n as usize) })
+    }
+
+    /// Ein 64-Bit-Wort ab `off` lesen (little-endian, ungeprüfte Ausrichtung nicht nötig:
+    /// `read_unaligned`).
+    pub fn read_u64(&self, off: u64) -> Option<u64> {
+        if !self.passt(off, 8) {
+            return None;
+        }
+        // SAFETY: wie `bytes`.
+        Some(unsafe { core::ptr::read_volatile((self.base + off) as *const u64) })
+    }
+
+    /// Ein einzelnes Byte ab `off` schreiben.
+    pub fn write_u8(&self, off: u64, v: u8) -> Option<()> {
+        if !self.passt(off, 1) {
+            return None;
+        }
+        // SAFETY: wie `bytes`; `off < len` ist geprueft.
+        unsafe { core::ptr::write_volatile((self.base + off) as *mut u8, v) };
+        Some(())
+    }
+
+    /// Ein 16-Bit-Wort ab `off` schreiben (little-endian, byteweise — der Aufrufer darf nicht
+    /// annehmen, dass `off` ausgerichtet ist).
+    pub fn write_u16(&self, off: u64, v: u16) -> Option<()> {
+        self.write_u8(off, v as u8)?;
+        self.write_u8(off + 1, (v >> 8) as u8)
+    }
+
+    /// Ein 32-Bit-Wort ab `off` schreiben (little-endian, byteweise).
+    pub fn write_u32(&self, off: u64, v: u32) -> Option<()> {
+        for i in 0..4 {
+            self.write_u8(off + i, (v >> (8 * i)) as u8)?;
+        }
+        Some(())
+    }
+
+    /// Ein 64-Bit-Wort ab `off` schreiben. `None`, wenn es nicht mehr ins Fenster passt.
+    pub fn write_u64(&self, off: u64, v: u64) -> Option<()> {
+        if !self.passt(off, 8) {
+            return None;
+        }
+        // SAFETY: wie `bytes`; das Fenster wurde mit Schreibrecht gemappt, sonst haette
+        // `SYS_MAP` es nicht herausgegeben.
+        unsafe { core::ptr::write_volatile((self.base + off) as *mut u64, v) };
+        Some(())
+    }
+}
 /// Frame (Memory-Cap `cap`) wieder entfernen; gibt den Ergebniscode zurück.
 pub fn unmap(cap: u64) -> u64 {
     invoke(sys::UNMAP, cap, [0; 4], 0).result

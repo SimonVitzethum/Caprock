@@ -1,0 +1,26 @@
+# `fs` — ein **lesendes Dateisystem als eigene PD** (A-6.3).
+#
+# Es faehrt kein Geraet. Es ruft den Blockdienst (`programs/hardware/virtio-blk`) ueber dessen
+# Kanal und liest die Bytes aus der geteilten Uebertragungsflaeche. Das ist der Punkt der Schicht:
+# ein Dateisystem hat mit Registern und DMA nichts zu tun, und ein Treiber hat mit
+# Verzeichniseintraegen nichts zu tun.
+#
+# **TrustedSAS, und das ist ein Kompromiss**, kein Entwurfsziel: ein HardwareLand-Backend darf nur
+# Caps seines eigenen Kanals halten, und sein Partner muss TrustedSas sein (ext-22). Ein
+# Dateisystem, das FREMDE Bytes liest, in einer vertrauenswuerdigen Domaene zu fuehren ist ein
+# Geruch. Der richtige Weg ist ein UserLand<->TrustedSas-Kanal darueber (ext-22 P6) -- nicht ein
+# Umweg um die Domaenenregel.
+[package]
+name = "fs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fs"
+path = "src/main.rs"
+
+[dependencies]
+libsel4lake = { path = "../../libsel4lake" }
+sel4lake-part = { path = "../../../crates/sel4lake-part" }
+sel4lake-fat = { path = "../../../crates/sel4lake-fat" }

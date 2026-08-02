@@ -1,0 +1,26 @@
+# `virtio-blk` — der erste Treiber als geladenes Userland-Programm (A-5.1).
+#
+# Zwei Abhaengigkeiten, und beide sind der Punkt:
+#
+#   * `libsel4lake`  — das Minimal-SDK (Syscalls, Panik-Handler), wie jedes andere Programm.
+#   * `sel4lake-virtio` — die Treiberlogik. Sie liegt im KERNEL-Workspace unter `crates/`, haengt
+#     aber an **nichts** (kein sel4lake-hal, kein Kernel, keine Architektur). Genau dafuer wurde
+#     sie am 2026-08-01 dorthin entkoppelt: damit ein Userland-Programm sie linken kann, ohne den
+#     Kernel mitzuziehen. Dass dieser Pfad hier funktioniert, ist die Probe aufs Exempel -- waere
+#     auch nur eine Kernel-Abhaengigkeit uebriggeblieben, liesse sich dieses Programm nicht bauen.
+[package]
+name = "virtio-blk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "virtio-blk"
+path = "src/main.rs"
+
+[dependencies]
+libsel4lake = { path = "../../libsel4lake" }
+sel4lake-virtio = { path = "../../../crates/sel4lake-virtio" }
+# A-6.2: der GPT-Parser. Ebenfalls abhaengigkeitsfrei und `forbid(unsafe_code)` -- er liest fremde
+# Bytes von der Platte, und die gehoeren nicht in den Kern.
+sel4lake-part = { path = "../../../crates/sel4lake-part" }

@@ -21,6 +21,13 @@ use crate::PAGE;
 /// Farbe `c` gehört zur Maske, wenn Bit `c % 64` gesetzt ist. Bei 256 Farben und 64 Bits fasst
 /// ein Maskenbit also 4 Farben zusammen — die Partitionierung wird gröber, bleibt aber
 /// **disjunkt**, und das ist die Eigenschaft, auf die es ankommt.
+///
+/// **Die andere Richtung ist die gefährliche.** Hat die Maschine *weniger* als 64 Farben
+/// (aarch64: 16), dann fragt `contains` nie ein Bit oberhalb von `colors` ab — die Bits
+/// `colors..64` sind **tot**. Eine Maske, die nur dort Bits setzt, ist damit leer, *sieht* aber
+/// nicht leer aus: `is_empty()` sagt `false`, `intersects` sagt „disjunkt". Deshalb darf keine
+/// Rechnung, die Masken *aufteilt*, mit [`MASK_BITS`] arbeiten — sie braucht die tatsächliche
+/// Farbanzahl (s. [`stripe`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ColorMask(pub u64);
 
@@ -79,16 +86,60 @@ pub fn color_of(pa: u64, colors: u32) -> u32 {
 /// aus der Mitte zu stanzen (Fragmentierung). Bei verschränkter Vergabe wäre jede zweite Seite
 /// ein eigenes Fragment.
 ///
-/// `None`, wenn `n` keine Zweierpotenz ist, `n > MASK_BITS`, oder `i >= n` — die Aufteilung
-/// muss aufgehen, sonst wären die Sätze nicht disjunkt und die Zusicherung eine Behauptung.
-pub fn stripe(i: u32, n: u32) -> Option<ColorMask> {
-    if n == 0 || i >= n || n > MASK_BITS || !n.is_power_of_two() {
+/// `colors` ist die Farbanzahl **dieser Maschine** (Zweierpotenz, `hal::cache::page_colors()`).
+///
+/// **Warum das ein Parameter sein muss.** Früher rechnete diese Funktion mit [`MASK_BITS`] statt
+/// mit der Farbanzahl — derselbe Fehler, den `colors::region_bytes` im Kernel schon bezahlt hat.
+/// `contains` befragt Bit `c % MASK_BITS`; bei `colors < MASK_BITS` sind die Bits ab `colors`
+/// deshalb **tot**, sie stehen für keine Farbe. Auf x86 (256 Farben) fiel das nicht auf, weil dort
+/// alle 64 Bits lebendig sind und die Rechnung zufällig stimmte. Auf aarch64 (16 Farben) bekam
+/// Streifen 0 alle 16 Farben — also den ganzen Farbraum statt eines Viertels — und die Streifen
+/// 1..3 **keine einzige**. Gemessen, nicht vermutet: 16/0/0/0 statt 4/4/4/4.
+///
+/// Das ist die schlimmere Hälfte des Fehlers: `intersects` meldete die Sätze als disjunkt, weil
+/// leere Mengen sich nicht schneiden. Der Selbsttest wäre grün gewesen, ohne dass irgendetwas
+/// getrennt war — genau die leere Beobachtung, gegen die dieses Projekt an anderer Stelle den
+/// `CD.R`-Fall gestellt hat.
+///
+/// **Warum es sich nicht ohne Parameter beheben lässt.** Ein festes 64-Bit-Muster kann nicht für
+/// 16 *und* 256 Farben zugleich zusammenhängend und richtig sein: bei 16 Farben müsste Streifen `i`
+/// die Farben `4i..4i+3` halten, bei 256 einen Block von 16 Bits — die beiden Forderungen legen
+/// unvereinbare Muster fest. Wer den Parameter weglässt, muss die Zusammenhangs-Eigenschaft
+/// aufgeben, und damit `region_bytes` im Kernel falsch machen.
+///
+/// `None`, wenn `n` keine Zweierpotenz ist, `i >= n`, `colors` keine Zweierpotenz ist, oder
+/// **`n` grösser ist als der lebendige Farbraum** `min(colors, MASK_BITS)` — aus `colors` Farben
+/// lassen sich keine `n > colors` nichtleeren disjunkten Sätze schneiden. Die Aufteilung muss
+/// aufgehen, sonst wären die Sätze nicht disjunkt und die Zusicherung eine Behauptung.
+pub fn stripe(i: u32, n: u32, colors: u32) -> Option<ColorMask> {
+    if n == 0 || i >= n || !n.is_power_of_two() {
         return None;
     }
-    let per = MASK_BITS / n;
+    if colors == 0 || !colors.is_power_of_two() {
+        return None;
+    }
+    // Der **lebendige** Teil der Maske: so viele Bits, wie `contains` überhaupt je befragt.
+    // Bei `colors >= MASK_BITS` faltet `c % MASK_BITS` den Farbraum auf alle 64 Bits (ein Bit
+    // trägt dann `colors / MASK_BITS` Farben); bei `colors < MASK_BITS` bleiben nur `colors` Bits.
+    let live = if colors < MASK_BITS { colors } else { MASK_BITS };
+    if n > live {
+        return None;
+    }
+    let per = live / n;
     let lo = i * per;
-    // `per == MASK_BITS` (n == 1) würde bei `1<<64` überlaufen -> Sonderfall über ALL.
-    let bits = if per == MASK_BITS { u64::MAX } else { ((1u64 << per) - 1) << lo };
+    // `per == MASK_BITS` (live == 64 und n == 1) würde bei `1<<64` überlaufen -> Sonderfall.
+    let block = if per == MASK_BITS { u64::MAX } else { ((1u64 << per) - 1) << lo };
+    // Das Muster mit der Periode `live` über alle 64 Bits wiederholen. Für `contains` ist das
+    // gleichwertig zu „nur die unteren `live` Bits setzen" (es fragt `c % MASK_BITS`, und für
+    // `c < colors = live` sind das genau die unteren Bits) — aber es hält die zwei Eigenschaften
+    // aufrecht, an denen Aufrufer hängen: `stripe(0, 1, colors) == ColorMask::ALL` (`alloc_colored`
+    // hat dafür einen schnellen Pfad) und „die Vereinigung aller `n` Streifen ist lückenlos".
+    let mut bits = 0u64;
+    let mut off = 0u32;
+    while off < MASK_BITS {
+        bits |= block << off;
+        off += live;
+    }
     Some(ColorMask(bits))
 }
 
@@ -166,7 +217,7 @@ mod tests {
         let mut masks = [0u64; 4];
         let mut used = 0usize;
         while let Some(i) = pick_free(taken, 4) {
-            let bits = stripe(i, 4).expect("Aufteilung geht auf").0;
+            let bits = stripe(i, 4, 64).expect("Aufteilung geht auf").0;
             assert_ne!(bits, 0, "ein leerer Satz waere keine Trennung");
             for m in masks.iter().take(used) {
                 assert_eq!(bits & m, 0, "Streifen {i} ueberlappt einen frueheren");
@@ -197,14 +248,18 @@ mod tests {
     fn eine_farbe_heisst_keine_farbe() {
         assert_eq!(color_of(PAGE * 7, 1), 0);
         assert_eq!(color_of(PAGE * 8, 1), 0);
-        assert_eq!(stripe(0, 1).unwrap(), ColorMask::ALL);
+        // Ein einziger Streifen ist der ganze Farbraum — und zwar bei JEDER Farbanzahl, damit
+        // der schnelle Pfad `mask == ColorMask::ALL` in `alloc_colored` nicht arch-abhaengig wird.
+        for colors in [1u32, 16, 64, 256] {
+            assert_eq!(stripe(0, 1, colors).unwrap(), ColorMask::ALL, "colors={colors}");
+        }
     }
 
     /// **Die A1-Eigenschaft**: n Streifen sind paarweise disjunkt und decken zusammen alles ab.
     #[test]
     fn streifen_sind_paarweise_disjunkt_und_vollstaendig() {
         for n in [1u32, 2, 4, 8, 16, 32, 64] {
-            let masks: alloc_vec::Vec = (0..n).map(|i| stripe(i, n).unwrap()).collect();
+            let masks: alloc_vec::Vec = (0..n).map(|i| stripe(i, n, 64).unwrap()).collect();
             let mut union = 0u64;
             for (a, ma) in masks.iter().enumerate() {
                 assert!(!ma.is_empty(), "n={n}: Streifen {a} ist leer");
@@ -219,21 +274,121 @@ mod tests {
         }
     }
 
+    /// **Die eigentliche A1-Eigenschaft, gegen ECHTE Farben statt gegen Maskenbits.**
+    ///
+    /// Jede der `colors` Farben liegt in genau einem Streifen, und jeder Streifen hält gleich
+    /// viele. Die alte Rechnung mit `MASK_BITS` lieferte bei 16 Farben 16/0/0/0 statt 4/4/4/4 —
+    /// also den ganzen Farbraum für Streifen 0 und leere Sätze für den Rest.
+    ///
+    /// **16 UND 256 stehen hier beide mit Absicht.** Bei 256 war die alte Rechnung zufällig
+    /// richtig; ein Test, der nur 256 prüft, ist grün und belegt nichts. Erst das Paar trennt
+    /// „stimmt" von „stimmte hier gerade".
+    #[test]
+    fn jede_farbe_in_genau_einem_streifen_bei_jeder_farbanzahl() {
+        for colors in [2u32, 4, 8, 16, 32, 64, 128, 256, 1024] {
+            for n in [1u32, 2, 4, 8, 16] {
+                if n > colors {
+                    continue;
+                }
+                let masks: std::vec::Vec<ColorMask> =
+                    (0..n).map(|i| stripe(i, n, colors).expect("Aufteilung geht auf")).collect();
+                for c in 0..colors {
+                    let treffer = masks.iter().filter(|m| m.contains(c)).count();
+                    assert_eq!(treffer, 1, "colors={colors}, n={n}: Farbe {c} in {treffer} Streifen");
+                }
+                for (i, m) in masks.iter().enumerate() {
+                    let anteil = (0..colors).filter(|&c| m.contains(c)).count() as u32;
+                    assert_eq!(
+                        anteil,
+                        colors / n,
+                        "colors={colors}, n={n}: Streifen {i} haelt {anteil} statt {} Farben",
+                        colors / n
+                    );
+                }
+            }
+        }
+    }
+
+    /// **Ein Streifen ohne Farbe ist kein Streifen.** Getrennt geführt, weil `is_empty()` und
+    /// `intersects` diesen Fall NICHT sehen: leere Mengen sind bitweise ungleich null und
+    /// schneiden sich nicht — sie sehen aus wie eine perfekte Trennung.
+    #[test]
+    fn kein_streifen_ist_ueber_den_echten_farben_leer() {
+        for colors in [2u32, 16, 256] {
+            for n in [2u32, 4] {
+                if n > colors {
+                    continue; // aus 2 Farben gibt es keine 4 Streifen -- das prueft ein eigener Test
+                }
+                for i in 0..n {
+                    let m = stripe(i, n, colors).unwrap();
+                    assert!(
+                        (0..colors).any(|c| m.contains(c)),
+                        "colors={colors}, n={n}: Streifen {i} traegt keine einzige Farbe"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **Zusammenhang** — die Eigenschaft, auf der `colors::region_bytes` im Kernel steht:
+    /// ein Lauf aufeinanderfolgender Seiten bleibt `min(colors, MASK_BITS) / n` Seiten lang
+    /// im selben Streifen. Ohne sie schnitte der Allokator Einzelseiten statt Blöcke.
+    ///
+    /// Bei 16 Farben und 4 Streifen sind das 4 Seiten; die alte Rechnung gab Streifen 1..3
+    /// einen Lauf der Länge **0**.
+    #[test]
+    fn streifen_bleibt_ueber_zusammenhaengende_seiten_erhalten() {
+        for colors in [16u32, 64, 256] {
+            let n = 4u32;
+            let erwartet = colors.min(MASK_BITS) / n;
+            for i in 0..n {
+                let m = stripe(i, n, colors).unwrap();
+                // Längster Lauf aufeinanderfolgender Farben, die alle im Streifen liegen.
+                let (mut lauf, mut best) = (0u32, 0u32);
+                for c in 0..colors {
+                    lauf = if m.contains(c) { lauf + 1 } else { 0 };
+                    best = best.max(lauf);
+                }
+                assert!(
+                    best >= erwartet,
+                    "colors={colors}: Streifen {i} haelt nur {best} zusammenhaengende Seiten, \
+                     region_bytes() verspricht {erwartet}"
+                );
+            }
+        }
+    }
+
+    /// Aus 16 Farben lassen sich keine 32 nichtleeren disjunkten Sätze schneiden — das muss
+    /// ein **Fehlschlag** sein. Die alte Rechnung gab hier 32-mal `Some` zurück, davon 30
+    /// Sätze ohne eine einzige Farbe.
+    #[test]
+    fn mehr_streifen_als_farben_wird_abgewiesen() {
+        assert!(stripe(0, 32, 16).is_none(), "32 Streifen aus 16 Farben");
+        assert!(stripe(0, 2, 1).is_none(), "2 Streifen aus 1 Farbe");
+        // Genau so viele Streifen wie Farben ist die Grenze und muss noch gehen.
+        assert!(stripe(15, 16, 16).is_some(), "16 Streifen aus 16 Farben");
+        assert!(stripe(0, 64, 256).is_some(), "64 Streifen passen in die Maske");
+        assert!(stripe(0, 128, 256).is_none(), "mehr Streifen als Maskenbits");
+    }
+
     /// Eine Aufteilung, die nicht aufgeht, wird abgewiesen statt stillschweigend gerundet.
     #[test]
     fn ungueltige_aufteilung_wird_abgewiesen() {
-        assert!(stripe(0, 0).is_none(), "n=0");
-        assert!(stripe(2, 2).is_none(), "i >= n");
-        assert!(stripe(0, 3).is_none(), "keine Zweierpotenz");
-        assert!(stripe(0, 128).is_none(), "mehr Streifen als Maskenbits");
+        assert!(stripe(0, 0, 64).is_none(), "n=0");
+        assert!(stripe(2, 2, 64).is_none(), "i >= n");
+        assert!(stripe(0, 3, 64).is_none(), "keine Zweierpotenz");
+        assert!(stripe(0, 128, 64).is_none(), "mehr Streifen als Maskenbits");
+        // Eine Farbanzahl, die keine Zweierpotenz ist, passt nicht zu `color_of` (`& (colors-1)`).
+        assert!(stripe(0, 2, 24).is_none(), "colors keine Zweierpotenz");
+        assert!(stripe(0, 1, 0).is_none(), "colors=0");
     }
 
     /// Die Maske wiederholt sich über den Farbraum — bei 256 Farben trägt ein Bit 4 Farben,
     /// und zwei disjunkte Streifen bleiben auch dann disjunkt.
     #[test]
     fn maske_wiederholt_sich_ueber_den_farbraum() {
-        let (a, b) = (stripe(0, 2).unwrap(), stripe(1, 2).unwrap());
         let colors = 256;
+        let (a, b) = (stripe(0, 2, colors).unwrap(), stripe(1, 2, colors).unwrap());
         for page in 0..(colors as u64 * 2) {
             let c = color_of(page * PAGE, colors);
             assert!(a.contains(c) ^ b.contains(c), "Farbe {c} in beiden oder keinem Streifen");

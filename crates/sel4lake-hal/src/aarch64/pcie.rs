@@ -29,6 +29,15 @@ pub const VIRTIO_VENDOR: u16 = 0x1af4;
 /// virtio-rng PCI-Device-IDs: transitional (0x1005) bzw. modern (0x1040 + 4 = 0x1044). QEMU
 /// fügt evtl. eine Default-NIC (virtio-net, 0x1000) hinzu — daher gezielt nach RNG filtern.
 pub const VIRTIO_RNG_DEVICES: [u16; 2] = [0x1005, 0x1044];
+/// Device-IDs des virtio-Blockgeraets (legacy + modern) — A-5.2.
+pub const VIRTIO_BLK_DEVICES: [u16; 2] = [0x1001, 0x1042];
+/// Device-IDs der virtio-Netzkarte (legacy + modern) — A-5.2.
+///
+/// Die Legacy-ID steht hier, damit die **Suche** ein transitional konfiguriertes Geraet findet.
+/// Bedienen kann der Treiber es nicht: er verlangt `VIRTIO_F_VERSION_1` und bricht sonst ab. Das
+/// ist die richtige Reihenfolge — ein Geraet, das da ist und nicht modern spricht, soll als
+/// Fehlschlag sichtbar werden und nicht als "kein Geraet gefunden".
+pub const VIRTIO_NET_DEVICES: [u16; 2] = [0x1000, 0x1041];
 
 // --- PCI-Config-Space-Offsets ---
 const CFG_VENDOR: u16 = 0x00;
@@ -78,6 +87,12 @@ impl PciDevice {
 }
 
 #[inline]
+/// Die **Konfigurationsraum-Seite genau dieser Funktion** (A-5.1) — s. die x86-Fassung fuer die
+/// Begruendung, warum eine einzelne Funktion mappbar ist und das ECAM-Fenster als Ganzes nicht.
+pub fn cfg_page(d: &PciDevice) -> u64 {
+    cfg_addr(d.bus, d.dev, d.func, 0) & !0xfff
+}
+
 fn cfg_addr(bus: u8, dev: u8, func: u8, off: u16) -> u64 {
     ECAM_BASE
         + ((bus as u64) << 20)

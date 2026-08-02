@@ -19,7 +19,7 @@ use sel4lake_loader::elf::ElfImage;
 use sel4lake_loader::manifest::{
     Entry as ManifestEntry, SystemManifest, Verified, SIG_ALG_ED25519 as MAN_SIG_ALG_ED25519,
 };
-use sel4lake_loader::{LoaderError, Program, DOMAIN_TRUSTED, DOMAIN_USERLAND};
+use sel4lake_loader::{LoaderError, Program, DOMAIN_HARDWARE, DOMAIN_TRUSTED, DOMAIN_USERLAND};
 use sel4lake_mem::Rights;
 use sel4lake_microkit::Domain;
 use sel4lake_sched::ThreadId;
@@ -314,12 +314,28 @@ pub enum RootTaskError {
     HashMismatch,
     /// Manifest und Archiv widersprechen sich in der Domäne des Eintrags.
     DomainMismatch,
+    /// **Die Startmenge liegt nicht vorn im Archiv** (D5). Der Root-Task bekommt seine Startmenge
+    /// als `(Anzahl, eigener Index)` und spricht die anderen über `SYS_LOAD` mit einem
+    /// **Archivindex** an. Damit das aufgeht, müssen die Manifest-Einträge `0..count` genau auf
+    /// den Archivpositionen `0..count` liegen.
+    ///
+    /// Bis D5 stand diese Zusage nirgends — sie galt, weil die x86-Suite ihr Archiv passend
+    /// baute. Ein Archiv mit Zusatzmodulen (die aarch64-Suite hat zehn Testdienste darin) hätte
+    /// den Root-Task dazu gebracht, Fremdmodule als Startmenge zu laden: `probe` ist gar kein
+    /// ELF, und die adversarialen Dienste wären ein zweites Mal gelaufen. Fail-closed statt
+    /// stillschweigend das Falsche zu starten.
+    StartSetNotPrefix,
     /// Das Manifest verlangt Autorität, die dieser Kernel nicht **erteilen** kann. Fail-closed:
     /// lieber gar nicht starten als mit stillschweigend weniger Rechten (ein halb bevollmächtigter
     /// Dienst scheitert später an einer Stelle, die niemand mit dem Manifest in Verbindung bringt).
     UnsupportedAuthority,
     /// Anfangs-Caps ließen sich nicht erzeugen (Kernel-Ressourcen erschöpft).
     NoResources,
+    /// **Kein zuteilbares Gerät** (A-5.1). Das Manifest verlangt Geräte-Autorität, und es gibt
+    /// keine — kein Gerät gefunden, oder es ist schon an einen anderen Treiber vergeben.
+    /// Ausdrücklich **nicht** `NoResources`: ein erschöpfter Allokator ist ein Lastproblem, ein
+    /// fehlendes Gerät ein Aufbauproblem, und die beiden führen zu verschiedenen Handgriffen.
+    NoDevice,
     /// **Der Loader hat das Image abgelehnt** — mit dem genauen Grund.
     ///
     /// Dass dieser Grund mitgeführt wird, ist keine Bequemlichkeit. Beim ersten Lauf meldete
@@ -332,15 +348,27 @@ pub enum RootTaskError {
 /// Die Anfangs-Caps eines Manifest-Eintrags erzeugen und als `(Slot, Cap)`-Liste ablegen.
 ///
 /// **Slot-Konvention** (Teil der Loader-ABI, `docs/invariants.md`):
-/// `0` = Loader-Cap, `1` = Notification, `2` = Endpoint. Ein nicht angeforderter Cap lässt seinen
+/// `0` = Loader-Cap, `1` = Notification, `2` = Endpoint, `3` = Konfigurationsraum-Seite,
+/// `4` = Registerfenster (BAR), `5` = DMA-Region. Ein nicht angeforderter Cap lässt seinen
 /// Slot leer — die Nummern verschieben sich also nicht, je nachdem was angefragt wurde. (Genau das
 /// wäre die Art Detail, an der ein Programm später still das falsche Objekt anspricht.)
-fn endow_from_manifest(e: &ManifestEntry) -> Result<[Option<(usize, CapPtr)>; 3], RootTaskError> {
+///
+/// Slots 3–5 kamen mit A-5.1 dazu: sie sind die Autorität, aus der ein **Treiber im Userland**
+/// besteht. `CAP_MMIO` erzeugt dabei **zwei** Caps, und das ist kein Schönheitsfehler — die
+/// Manifest-Bitmaske nennt die *Art* der Autorität ("darf ein MMIO-Fenster halten"), nicht die
+/// Anzahl der Fenster. Ein Treiber braucht zwei: seinen Konfigurationsraum (um sein Gerät
+/// aufzulösen) und sein Registerfenster (um es zu bedienen).
+fn endow_from_manifest(
+    e: &ManifestEntry,
+    channel: Option<(usize, usize)>,
+) -> Result<[Option<(usize, CapPtr)>; 7], RootTaskError> {
+    let channel_ep = channel.map(|(ep, _)| ep);
+    let channel_ntfn = channel.map(|(_, ntfn)| ntfn);
     use sel4lake_loader::manifest as man;
-    let mut out: [Option<(usize, CapPtr)>; 3] = [None; 3];
+    let mut out: [Option<(usize, CapPtr)>; 7] = [None; 7];
     // Bis hierher erzeugte Caps wieder abräumen, wenn ein späterer Schritt scheitert — sie sind
     // dann nirgends installiert und würden sonst in der geteilten Tabelle belegt bleiben.
-    fn undo(out: &[Option<(usize, CapPtr)>; 3]) {
+    fn undo(out: &[Option<(usize, CapPtr)>; 7]) {
         for &(_, cap) in out.iter().flatten() {
             let _ = crate::system::cap_delete(cap);
         }
@@ -352,8 +380,21 @@ fn endow_from_manifest(e: &ManifestEntry) -> Result<[Option<(usize, CapPtr)>; 3]
     // entstünde erst mit dem, was er selbst lädt. Der ehrliche Weg wäre, dass `SYS_LOAD` die
     // PdControl-Cap der neu erzeugten PD zurückgibt; das ist eine ABI-Erweiterung und steht in
     // todo-A (A-3.2, wählbarer Empfangs-Slot). Bis dahin: nicht erteilbar, also nicht behaupten.
-    const GRANTABLE: u32 = man::CAP_LOADER | man::CAP_NOTIFICATION | man::CAP_ENDPOINT;
+    //
+    // `CAP_IRQ` ebenso, und der Grund liegt tiefer als „noch nicht gebaut": ein Geräte-Interrupt
+    // käme auf x86 per MSI-X, und seit B-3.2 steht die Interrupt-Remapping-Tabelle auf lauter
+    // „not present" — ein Gerät ohne IRTE kann keinen Interrupt auslösen, mit Absicht. Eine
+    // IRTE-**Vergabe** gibt es nicht; sie gehört zu B-3 (Vergabe + Invalidierung über QI). Eine
+    // IRQ-Cap zu erteilen, ohne sie binden zu können, wäre eine Autorität ohne Wirkung — und ein
+    // Treiber, der auf einen Interrupt wartet, der strukturell nie kommt, hängt. Also abweisen.
+    const GRANTABLE: u32 =
+        man::CAP_LOADER | man::CAP_NOTIFICATION | man::CAP_ENDPOINT | man::CAP_MMIO | man::CAP_DMA;
     if e.initial_caps & !GRANTABLE != 0 {
+        return Err(RootTaskError::UnsupportedAuthority);
+    }
+    // MMIO und DMA hängen an **einer** Zuteilung: es ist dasselbe Gerät. Sie einzeln anzufordern
+    // wäre ein halber Treiber — Register ohne Puffer oder Puffer ohne Gerät.
+    if (e.initial_caps & man::CAP_MMIO != 0) != (e.initial_caps & man::CAP_DMA != 0) {
         return Err(RootTaskError::UnsupportedAuthority);
     }
     if e.initial_caps & man::CAP_LOADER != 0 {
@@ -364,14 +405,43 @@ fn endow_from_manifest(e: &ManifestEntry) -> Result<[Option<(usize, CapPtr)>; 3]
         }
     }
     if e.initial_caps & man::CAP_NOTIFICATION != 0 {
-        let r = crate::system::create_notification().and_then(|ntfn| {
+        // **Wer sich meldet, muss unterscheidbar sein.** Der Root-Task und eine Treiber-PD melden
+        // sich beide über eine endowte Notification; bekämen beide dasselbe Badge, wäre am
+        // akkumulierten `pending` nicht mehr zu erkennen, wer gelaufen ist -- und ein Lauf, in dem
+        // nur einer von beiden startete, sähe aus wie ein vollständiger.
+        // **Drei Rollen, drei Badges, drei Ablagen.** Root-Task, Treiber (HardwareLand-Backend am
+        // eigenen Kanal) und Client eines Dienstes melden sich alle ueber eine endowte
+        // Notification. Waeren sie ununterscheidbar, saehe ein Lauf, in dem nur einer startete,
+        // aus wie ein vollstaendiger -- und schlimmer: die zuletzt geladene PD ueberschriebe die
+        // Ablage der frueheren, und der Kernel wartete auf ein Signal am falschen Objekt. Genau
+        // das ist beim Bau von A-6.3 passiert.
+        let is_root = e.policy_flags & man::POLICY_ROOT_TASK != 0;
+        let is_driver = channel.is_some();
+        let badge = if is_root {
+            ROOT_NTFN_BADGE
+        } else if is_driver {
+            DRIVER_NTFN_BADGE
+        } else {
+            CLIENT_NTFN_BADGE
+        };
+        // Ein HardwareLand-Backend bekommt die Notification **seines Kanals**, keine frische:
+        // seine Cap-Policy erlaubt nur Caps des eigenen Kanals, und eine fremde waere abgewiesen
+        // worden -- der Treiber haette dann Geraete-Autoritaet, aber keinen Weg, etwas zu sagen.
+        let r = channel_ntfn.or_else(crate::system::create_notification).and_then(|ntfn| {
             // **Gebadgt**, nicht nackt: `SYS_SIGNAL` verodert das Badge der benutzten CAP in
             // `pending` -- das Nachrichtenwort spielt keine Rolle. Ohne Badge waere jedes Signal
             // ein ODER mit 0, und der Kernel saehe nicht, dass ueberhaupt jemand gerufen hat.
             let cap =
-                crate::system::install_notification_cap_badged(ntfn as u32, Rights::RWX, ROOT_NTFN_BADGE)
+                crate::system::install_notification_cap_badged(ntfn as u32, Rights::RWX, badge)
                     .ok()?;
-            ROOT_NTFN.store(ntfn as u64 + 1, Ordering::Relaxed); // +1, damit 0 = "keine" bleibt
+            // +1, damit 0 = "keine" bleibt
+            if is_root {
+                ROOT_NTFN.store(ntfn as u64 + 1, Ordering::Relaxed);
+            } else if is_driver {
+                DRIVER_NTFN.store(ntfn as u64 + 1, Ordering::Relaxed);
+            } else {
+                CLIENT_NTFN.store(ntfn as u64 + 1, Ordering::Relaxed);
+            }
             Some(cap)
         });
         match r {
@@ -383,7 +453,27 @@ fn endow_from_manifest(e: &ManifestEntry) -> Result<[Option<(usize, CapPtr)>; 3]
         }
     }
     if e.initial_caps & man::CAP_ENDPOINT != 0 {
-        let r = crate::system::create_endpoint().and_then(|ep| {
+        // Wie bei der Notification: ein HardwareLand-Backend bekommt den Endpoint **seines
+        // Kanals**. Ein frischer waere eine fremde Cap, die seine Policy abweist -- und der
+        // Treiber haette eine Dienstschnittstelle, die niemand erreichen kann.
+        // Reihenfolge: der eigene Kanal (HardwareLand-Backend), sonst der **benannte** Dienst,
+        // sonst -- nur wenn es genau einen gibt -- eben dieser, sonst ein frischer Endpoint.
+        //
+        // **`service_id` ist der Punkt von A-5.4** (Z11b/Z11c). Vorher stand hier
+        // `driver_service()` mit der Bedeutung „der zuletzt geladene". Bei einem Dienst konnte
+        // „gib mir einen Endpoint" nur dessen Kanal meinen; bei zweien waere es „gib mir
+        // irgendeinen" gewesen, und welchen, haette die Ladereihenfolge entschieden. Jetzt steht
+        // die Antwort im Autoritaetsdokument -- und wo sie fehlt und mehrdeutig waere, liefert
+        // `driver_service()` bewusst `None` statt zu raten.
+        let ziel = channel_ep
+            .or_else(|| {
+                (e.service_id != 0)
+                    .then(|| driver_service_of(e.service_id))
+                    .flatten()
+                    .map(|s| s.ep)
+            })
+            .or_else(|| (e.service_id == 0).then(driver_service).flatten().map(|s| s.ep));
+        let r = ziel.or_else(crate::system::create_endpoint).and_then(|ep| {
             crate::system::install_endpoint_cap(ep as u32, Rights::RWX).ok()
         });
         match r {
@@ -392,6 +482,41 @@ fn endow_from_manifest(e: &ManifestEntry) -> Result<[Option<(usize, CapPtr)>; 3]
                 undo(&out);
                 return Err(RootTaskError::NoResources);
             }
+        }
+    }
+    // A-5.1: die Geräte-Autorität. Eine Zuteilung, drei Caps — und **fail-closed**: gibt es kein
+    // zuteilbares Gerät (oder ist es schon vergeben), startet der Treiber gar nicht. Ihn ohne
+    // Gerät laufen zu lassen hieße, einen Dienst zu starten, der seine Aufgabe nicht erfüllen
+    // kann und das erst an einer Stelle merkt, die niemand mit dem Manifest in Verbindung bringt.
+    // A-5.3: **welches** Gerät, sagt jetzt der Eintrag. `DeviceSelector::ANY` (auch: ein vor A-5.3
+    // erzeugtes Manifest) verhält sich wie bisher.
+    if e.initial_caps & man::CAP_MMIO != 0 {
+        match crate::system::assign_driver_device(e.device, e.program_id) {
+            Some(g) => {
+                out[3] = Some((3, g.cfg));
+                out[4] = Some((4, g.bar));
+                out[5] = Some((5, g.dma));
+                out[6] = Some((6, g.shared));
+            }
+            None => {
+                undo(&out);
+                return Err(RootTaskError::NoDevice);
+            }
+        }
+    } else if channel.is_none() && e.initial_caps & man::CAP_ENDPOINT != 0 {
+        // **Ein Client des Blockdienstes** (A-6.3).
+        //
+        // Die Regel, und sie ist dieselbe wie bei MMIO/DMA: das Manifest nennt die **Art** der
+        // Autoritaet ("bekommt einen Endpoint"), die **Instanz** teilt der Kernel-Glue zu. Heute
+        // gibt es genau einen Dienst, also kann "gib mir einen Endpoint" nur dessen Kanal meinen.
+        // Dazu die geteilte Uebertragungsflaeche -- ohne sie haette der Client eine
+        // Dienstschnittstelle und keinen Weg, Daten zu sehen.
+        //
+        // **Das ist ausdruecklich eine Uebergangsregel.** Sobald es zwei Dienste gibt, muss das
+        // Manifest sie benennen koennen (Z11b/Z11c); bis dahin waere jede andere Auswahl eine im
+        // Kernel versteckte Politik, und eine versteckte ist schlimmer als eine einfache.
+        if let Some(shared) = crate::system::driver_shared_cap(e.service_id) {
+            out[6] = Some((6, shared));
         }
     }
     Ok(out)
@@ -405,6 +530,242 @@ pub const ROOT_NTFN_BADGE: u64 = 1 << 32;
 /// Die Notification, die dem Root-Task endowt wurde (`0` = keine). Der Selbsttest liest daran ab,
 /// ob er wirklich gelaufen ist — der Kernel hat sonst kein Fenster in einen isolierten Prozess.
 static ROOT_NTFN: AtomicU64 = AtomicU64::new(0);
+
+/// **Badge einer Treiber-PD** (A-5.1). Wieder ein hohes Bit und ein anderes als
+/// [`ROOT_NTFN_BADGE`]: ein akkumuliertes Badge soll "der Root-Task lief" und "der Treiber lief"
+/// getrennt lesbar lassen. Zwei Melder mit demselben Etikett sind ein Melder.
+pub const DRIVER_NTFN_BADGE: u64 = 1 << 40;
+
+/// Die Notification einer Treiber-PD (`0` = keine endowt).
+static DRIVER_NTFN: AtomicU64 = AtomicU64::new(0);
+
+/// **Was über einen geladenen Treiber-Dienst bekannt ist** (A-5.1).
+///
+/// Genau das, was man braucht, um ihn **auszutauschen** — und nichts darüber hinaus: an welchem
+/// Endpoint er hängt, in welcher PD er läuft, welcher Thread gerade Empfänger ist, und welches
+/// Archivmodul ihn stellt. Was er *treibt*, steht hier nicht. Das ist die Aussage von A-5.1: der
+/// Kernel ersetzt einen Empfänger an einem Endpoint; dass dahinter virtio steckt, weiß er nicht.
+#[derive(Clone, Copy)]
+pub struct DriverService {
+    /// Der Kanal-Endpoint — die Dienstschnittstelle. Er überlebt den Austausch.
+    pub ep: usize,
+    /// Die Kanal-Notification (Melde-/Bereit-Kanal).
+    pub ntfn: usize,
+    /// Die PD der **laufenden** Fassung.
+    pub pd: usize,
+    /// Der Thread der laufenden Fassung — der Empfänger, der ersetzt wird.
+    pub tid: ThreadId,
+    /// Archiv-Index des Moduls, aus dem die nächste Fassung geladen wird.
+    pub index: u32,
+    /// **Wer** dieser Dienst ist — die `program_id` aus dem Manifest (A-5.4).
+    pub program_id: u32,
+}
+
+/// Höchstzahl gleichzeitig laufender Treiber-Dienste.
+const MAX_SERVICES: usize = 4;
+
+/// **Die laufenden Treiber-Dienste.**
+///
+/// Bis A-5.3 war das ein einzelner Platz mit der Bedeutung „der zuletzt geladene". Das ging gut,
+/// solange es einen gab. Bei zweien ist es eine **stille Fehlwahl**: der zweite überschriebe den
+/// ersten, ein Client bekäme den Endpoint des falschen Dienstes, und ein Hot-Reload träfe den
+/// falschen Empfänger — alles mit gültigen Caps und ohne eine einzige Fehlermeldung.
+static DRIVER_SERVICES: SpinLock<[Option<DriverService>; MAX_SERVICES]> =
+    SpinLock::new([None; MAX_SERVICES]);
+
+/// Der **eindeutige** Treiber-Dienst — `None`, wenn es keinen oder **mehrere** gibt.
+///
+/// „Mehrere" liefert bewusst `None` und nicht „den ersten": eine Auswahl, die niemand
+/// aufgeschrieben hat, ist schlimmer als eine Verweigerung. Wer einen bestimmten meint, nimmt
+/// [`driver_service_of`].
+pub fn driver_service() -> Option<DriverService> {
+    let g = DRIVER_SERVICES.lock();
+    let mut it = g.iter().flatten();
+    let first = *it.next()?;
+    it.next().is_none().then_some(first)
+}
+
+/// Genau **diesen** Dienst (nach `program_id`).
+pub fn driver_service_of(program_id: u32) -> Option<DriverService> {
+    DRIVER_SERVICES
+        .lock()
+        .iter()
+        .flatten()
+        .find(|s| s.program_id == program_id)
+        .copied()
+}
+
+/// Wie viele Dienste laufen (Bericht).
+pub fn driver_service_count() -> usize {
+    DRIVER_SERVICES.lock().iter().flatten().count()
+}
+
+/// Die laufende Fassung eines Treiber-Dienstes vermerken (Erstladen und nach einem Austausch).
+///
+/// Ein bereits vorhandener Eintrag **derselben** `program_id` wird ersetzt — das ist der
+/// Austauschfall; ein neuer belegt den nächsten freien Platz.
+pub fn set_driver_service(s: DriverService) {
+    let mut g = DRIVER_SERVICES.lock();
+    if let Some(slot) = g
+        .iter_mut()
+        .find(|x| x.map(|v| v.program_id) == Some(s.program_id))
+    {
+        *slot = Some(s);
+        return;
+    }
+    if let Some(slot) = g.iter_mut().find(|x| x.is_none()) {
+        *slot = Some(s);
+    }
+}
+
+/// Wie ein Austausch ausging (A-5.1). Bewusst **unterscheidbar**: „hat nicht geklappt" ist als
+/// Diagnose wertlos, und der Unterschied zwischen „keine neue Fassung geladen" und „umgebunden,
+/// aber mit Lücke" ist der Unterschied zwischen einem Aufbaufehler und einem Isolationsbefund.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReloadOutcome {
+    /// Umgebunden, und der Endpoint hatte zu **keinem** Zeitpunkt null Empfänger (die neue
+    /// Fassung stand schon bereit, als umgebunden wurde). Die starke Zusicherung aus A-4.1.
+    DoneOverlapped,
+    /// Umgebunden, aber die neue Fassung wurde beim Tausch eingereiht statt vorher bereitzustehen.
+    /// Zulässig, aber die schwächere Aussage.
+    Done,
+    /// Kein Treiber-Dienst bekannt.
+    NoService,
+    /// Die neue Fassung liess sich nicht aufsetzen (PD, Zuteilung oder Laden).
+    NotLoaded,
+    /// Die neue Fassung stand nicht rechtzeitig am Endpoint bereit.
+    NotReady,
+    /// Das Umbinden selbst wurde abgewiesen (Grund s. `Rebind`).
+    Rejected,
+}
+
+/// **Den Treiber-Dienst durch eine neue Fassung ersetzen** (A-5.1, Richtungsumkehr).
+///
+/// Hier steht das eigentliche Ergebnis dieses Punktes: der Kernel tauscht einen **Empfänger an
+/// einem Endpoint** aus. Er lädt dasselbe Archivmodul in eine zweite Backend-PD **am selben
+/// Kanal**, gibt ihr dieselbe Gerätezuteilung, wartet, bis sie bereit ist, und bindet dann um.
+///
+/// **In dieser Funktion kommt das Wort „virtio" nicht vor**, und das ist kein Zufall, sondern die
+/// Abnahmebedingung: solange der Kernel wüsste, was der Treiber treibt, wäre „austauschbar" eine
+/// Eigenschaft dieses einen Treibers und nicht des Mechanismus.
+///
+/// Reihenfolge, und sie ist nicht verhandelbar:
+/// 1. neue Fassung laden — sie ruft ihr `recv` und steht als **zweiter** Empfänger bereit;
+/// 2. **erst dann** stilllegen (A-4.2): ohne Stilllegung wäre jede Vorbedingung des Tauschs eine
+///    Momentaufnahme, die ein `CALL` auf einem anderen Kern falsch macht, bevor getauscht wird;
+/// 3. umbinden (A-4.1) — weil (1) vor (2) lag, ist der Ausgang `overlapped`, der Endpoint hatte
+///    also durchgehend einen Empfänger;
+/// 4. Stilllegung aufheben, alte Fassung entkoppeln.
+pub fn reload_driver(program_id: u32) -> ReloadOutcome {
+    use sel4lake_ipc::Rebind;
+    // **Genau dieser Dienst** (A-5.4). `driver_service()` liefert bei zwei Diensten bewusst
+    // `None` -- „der zuletzt geladene" waere hier keine Abkuerzung, sondern ein Austausch am
+    // falschen Empfaenger, und zwar lautlos.
+    let Some(old) = driver_service_of(program_id) else {
+        return ReloadOutcome::NoService;
+    };
+    let Some(archive) = read_archive() else {
+        return ReloadOutcome::NotLoaded;
+    };
+    let Some(prog) = archive.program(old.index as usize) else {
+        return ReloadOutcome::NotLoaded;
+    };
+    // Zweite Backend-PD am SELBEN Kanal. Der Endpoint ist das, was den Austausch ueberlebt.
+    let partner = crate::system::pd_partner(old.pd).unwrap_or(0);
+    let Some(v2_pd) =
+        crate::system::create_hardware_backend_on(partner, old.index as u16, old.ep, old.ntfn)
+    else {
+        return ReloadOutcome::NotLoaded;
+    };
+    // Dieselbe Zuteilung, neue Caps. Das Geraet wird NICHT losgelassen -- s. `reassign_driver_device`.
+    //
+    // **Die Zuteilung wird ueber die `program_id` gefunden** (A-5.4), nicht ueber „die erste
+    // benutzte". `prog.program_id` kommt aus dem Archiv-Eintrag derselben Komponente, die gerade
+    // ersetzt wird -- bei zwei Treibern haette die alte Fassung sonst der Nachfolgerin ein FREMDES
+    // Geraet gegeben, und zwar lautlos, weil alle Caps gueltig gewesen waeren.
+    let Some(g) = crate::system::reassign_driver_device(prog.program_id) else {
+        return ReloadOutcome::NotLoaded;
+    };
+    let ntfn_cap = crate::system::install_notification_cap_badged(
+        old.ntfn as u32,
+        Rights::RWX,
+        DRIVER_V2_BADGE,
+    );
+    let ep_cap = crate::system::install_endpoint_cap(old.ep as u32, Rights::RWX);
+    let (Ok(ntfn_cap), Ok(ep_cap)) = (ntfn_cap, ep_cap) else {
+        return ReloadOutcome::NotLoaded;
+    };
+    // **Slot 6 gehoert dazu.** Beim ersten Anlauf fehlte er hier, und die neue Fassung endete
+    // sofort: der Treiber verlangt seine Uebertragungsflaeche und bricht ohne sie ab -- richtig
+    // so. Der Austausch meldete dann `NotReady`, was nach einem Zeitproblem aussieht und ein
+    // fehlendes Endowment war. Wer eine Fassung ersetzt, muss ihr ALLES geben, was die alte hatte.
+    let endow = [
+        (1usize, ntfn_cap),
+        (2, ep_cap),
+        (3, g.cfg),
+        (4, g.bar),
+        (5, g.dma),
+        (6, g.shared),
+    ];
+    let Ok(v2) = load_program_into_pd(&prog, v2_pd, &endow, boot_arg(old.index as usize, archive.count()))
+    else {
+        return ReloadOutcome::NotLoaded;
+    };
+
+    // (1) Warten, bis die neue Fassung wirklich am Endpoint steht. **Nicht** blind umbinden: ein
+    // Tausch auf eine Fassung, die noch nicht empfaengt, waere genau die Luecke, die A-4.1
+    // ausschliessen soll.
+    let mut ready = false;
+    for _ in 0..200_000_000u64 {
+        if crate::system::endpoint_quiescence_of(old.ep, v2).as_receiver {
+            ready = true;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    if !ready {
+        return ReloadOutcome::NotReady;
+    }
+    // (2) Stilllegen, (3) umbinden, (4) freigeben.
+    crate::system::endpoint_begin_quiesce(old.ep);
+    let r = crate::system::endpoint_rebind_server(old.ep, old.tid, v2);
+    crate::system::endpoint_end_quiesce(old.ep);
+    let out = match r {
+        Rebind::Done { overlapped: true } => ReloadOutcome::DoneOverlapped,
+        Rebind::Done { overlapped: false } => ReloadOutcome::Done,
+        _ => return ReloadOutcome::Rejected,
+    };
+    // Die alte Fassung entkoppeln: ohne Endpoint-Cap laeuft ihr `recv` ins Leere, und sie endet
+    // von selbst. Sie zu killen waere haerter als noetig -- ein Dienst, der geordnet enden kann,
+    // soll das auch duerfen.
+    crate::system::endpoint_retire_receiver(old.ep, old.tid);
+    crate::system::clear_pd_cap(old.pd, 2);
+    set_driver_service(DriverService { pd: v2_pd, tid: v2, ..old });
+    out
+}
+
+/// **Badge der zweiten Fassung** (A-5.1). Ein anderes als [`DRIVER_NTFN_BADGE`], damit am
+/// akkumulierten Badge ablesbar ist, dass wirklich eine ZWEITE Fassung lief — und nicht bloss die
+/// erste ein zweites Mal gemeldet hat.
+pub const DRIVER_V2_BADGE: u64 = 1 << 41;
+
+/// **Badge einer Client-PD** eines Dienstes (A-6.3) — wieder ein eigenes Bit.
+pub const CLIENT_NTFN_BADGE: u64 = 1 << 44;
+
+/// Die Notification einer Client-PD (`0` = keine endowt).
+static CLIENT_NTFN: AtomicU64 = AtomicU64::new(0);
+
+/// Die Notification-Id der Client-PD (`None` = keine endowt).
+pub fn client_notification() -> Option<usize> {
+    let v = CLIENT_NTFN.load(Ordering::Relaxed);
+    (v != 0).then(|| (v - 1) as usize)
+}
+
+/// Die Notification-Id der Treiber-PD (`None` = keine endowt).
+pub fn driver_notification() -> Option<usize> {
+    let v = DRIVER_NTFN.load(Ordering::Relaxed);
+    (v != 0).then(|| (v - 1) as usize)
+}
 
 /// Die Notification-Id des Root-Tasks (`None` = keine endowt).
 pub fn root_notification() -> Option<usize> {
@@ -443,15 +804,37 @@ pub fn start_root_task() -> Result<(ThreadId, usize), RootTaskError> {
     if prog.domain != entry.domain {
         return Err(RootTaskError::DomainMismatch);
     }
-    let caps = endow_from_manifest(&entry)?;
-    let arg = boot_arg(index, archive.count());
+    // **Die Startmenge ist das Manifest, nicht das Archiv** (D5).
+    //
+    // Vorher stand hier `archive.count()`. Das war nicht bloss ungenau, es war die falsche Quelle:
+    // das Archiv ist ein Behaelter, das Manifest ist das Autoritaetsdokument. Auf x86 fiel das nie
+    // auf, weil die Suite ihr Archiv genau aus den Manifest-Modulen baute -- zwei Zahlen, die
+    // uebereinstimmten, weil dasselbe Skript beide erzeugte. Die aarch64-Suite hat zehn
+    // Testdienste im Archiv, die nicht zur Startmenge gehoeren; dort haette der Root-Task
+    // `count = 11` bekommen und Fremdmodule geladen (darunter `probe`, das gar kein ELF ist).
+    //
+    // Die Zusage, die dadurch noetig wird, steht jetzt als **Pruefung** da und nicht als
+    // Gewohnheit: der Root-Task spricht die uebrige Startmenge ueber einen ARCHIVINDEX an
+    // (`SYS_LOAD`), bekommt aber die Groesse der Startmenge aus dem Manifest. Beide Zahlen
+    // bedeuten nur dann dasselbe, wenn die Manifest-Eintraege `0..count` auf den Archivpositionen
+    // `0..count` liegen. Genau das wird hier geprueft -- fail-closed.
+    let n = man.count();
+    for i in 0..n {
+        let e = man.entry(i).ok_or(RootTaskError::StartSetNotPrefix)?;
+        let p = archive.program(i).ok_or(RootTaskError::StartSetNotPrefix)?;
+        if p.program_id != e.program_id {
+            return Err(RootTaskError::StartSetNotPrefix);
+        }
+    }
+    let caps = endow_from_manifest(&entry, None)?;
+    let arg = boot_arg(index, n);
     // Die belegten Einträge zu einem dichten Slice verdichten. `CapPtr` hat bewusst keinen
     // öffentlichen Konstruktor (ein fabrizierbarer Cap-Handle wäre eine Einladung), also dient
     // der erste erzeugte Cap als Füllwert — ohne Cap gibt es nichts zu verdichten.
     let Some(first) = caps.iter().flatten().next().copied() else {
         return load_image(&prog, &[], arg).map_err(RootTaskError::Rejected);
     };
-    let mut endow = [first; 3];
+    let mut endow = [first; 7];
     let mut n = 0usize;
     for &c in caps.iter().flatten() {
         endow[n] = c;
@@ -892,14 +1275,99 @@ pub fn trust_audit() -> u32 {
 /// `SYS_LOAD`-Callback (ext-26, L2): das Programm mit Index `index` aus dem Boot-Archiv laden +
 /// die `endow`-Caps (vom Dispatch aus dem Aufrufer-Cspace delegiert) in die neue PD endowen. Gibt
 /// die neue PD-Id. Der Dispatch hat die `Loader`-Cap-Autoritaet bereits geprueft.
-pub fn load_by_index(index: u32, endow: &[(usize, CapPtr)]) -> Option<usize> {
-    let pd = (|| {
+pub fn load_by_index(index: u32, caller_pd: usize, endow: &[(usize, CapPtr)]) -> Option<usize> {
+    // **Das Manifest gilt auch hier** (A-5.1 / Z11b). Bis dahin bekamen nur der Root-Task seine
+    // Anfangs-Caps aus dem Manifest; alles Weitere lebte von dem, was der Lader delegierte. Damit
+    // war das Manifest für alle außer einem Programm ein Wunschzettel: es stand darin, was eine
+    // Komponente bekommen soll, und niemand setzte es um.
+    //
+    // Die Aufteilung ist sauber und bleibt es: die **Loader-Cap** sagt, WER laden darf, das
+    // **Manifest** sagt, WAS das Geladene bekommt. Der Lader kann dadurch nichts vergeben, was
+    // nicht aufgeschrieben ist — und ein Treiber-PD kann Geräte-Autorität haben, ohne dass der
+    // Root-Task sie je besessen hätte (er könnte sie sonst gar nicht weiterreichen).
+    //
+    // **HardwareLand zuerst.** Ein Treiber ist per Entwurf ein Backend an einem Kanal (ext-22,
+    // unveraenderlich an seinen Partner gebunden) -- eine "bare" HardwareLand-PD bricht
+    // `domain_audit`. Der Kanal muss deshalb **vor** den Anfangs-Caps stehen: seine Notification
+    // IST die Cap, die das Manifest mit `ntfn` meint. Eine frisch erzeugte waere eine fremde, und
+    // die HardwareLand-Cap-Policy weist sie -- zu Recht -- ab.
+    let hardware_backend = (|| {
         let archive = read_archive()?;
         let prog = archive.program(index as usize)?;
-        load_image(&prog, endow, boot_arg(index as usize, archive.count()))
-            .ok()
-            .map(|(_, pd)| pd)
+        if prog.domain != DOMAIN_HARDWARE {
+            return None;
+        }
+        crate::system::create_hardware_backend(caller_pd, (prog.program_id & 0xffff) as u16)
     })();
+    let manifest_caps = (|| {
+        let archive = read_archive()?;
+        let prog = archive.program(index as usize)?;
+        let man = read_manifest()?;
+        let e = (0..man.count())
+            .filter_map(|i| man.entry(i))
+            .find(|e| e.program_id == prog.program_id)?;
+        if e.initial_caps == 0 {
+            return None;
+        }
+        endow_from_manifest(&e, hardware_backend.map(|(_, ep, ntfn)| (ep, ntfn))).ok()
+    })();
+    // `CapPtr` hat bewusst keinen öffentlichen Konstruktor (ein fabrizierbarer Cap-Handle wäre eine
+    // Einladung), also erst als `Option` sammeln und dann mit dem ersten echten Cap als Füllwert
+    // verdichten — derselbe Weg wie in `start_root_task`.
+    let mut slots: [Option<(usize, CapPtr)>; 8] = [None; 8];
+    let mut n = 0usize;
+    let mut collision = false;
+    for &c in endow {
+        slots[n] = Some(c);
+        n += 1;
+    }
+    if let Some(caps) = manifest_caps.as_ref() {
+        for &(slot, cap) in caps.iter().flatten() {
+            // Ein belegter Slot ist **fail-closed**: der Lader hat etwas dorthin delegiert, wo das
+            // Manifest etwas anderes hinlegen will. Welches von beiden das Programm dann meint,
+            // kann niemand mehr sagen -- also gar nicht erst starten.
+            if slots[..n].iter().flatten().any(|&(s, _)| s == slot) || n == slots.len() {
+                collision = true;
+                break;
+            }
+            slots[n] = Some((slot, cap));
+            n += 1;
+        }
+    }
+    let do_load = |endow: &[(usize, CapPtr)]| -> Option<usize> {
+        let archive = read_archive()?;
+        let prog = archive.program(index as usize)?;
+        // Dieselbe Quelle wie beim Root-Task (D5): die Groesse der **Startmenge**, nicht die des
+        // Behaelters. Zwei Bedeutungen fuer dieselbe Zahl waeren schlimmer als eine ungenaue.
+        // Ohne Manifest bleibt es beim Archiv -- dann gibt es kein Autoritaetsdokument, das etwas
+        // anderes behaupten koennte.
+        let arg = boot_arg(
+            index as usize,
+            read_manifest().map(|m| m.count()).unwrap_or_else(|| archive.count()),
+        );
+        if let Some((hpd, ep, ntfn)) = hardware_backend {
+            let tid = load_program_into_pd(&prog, hpd, endow, arg).ok()?;
+            // Festhalten, WAS da laeuft -- nicht, was es tut. Ohne diese vier Zahlen liesse sich
+            // ein Dienst nicht austauschen, ohne ihn zu kennen.
+            set_driver_service(DriverService { ep, ntfn, pd: hpd, tid, index, program_id: prog.program_id });
+            return Some(hpd);
+        }
+        load_image(&prog, endow, arg).ok().map(|(_, pd)| pd)
+    };
+    // Verdichten — mit dem ersten echten Cap als Füllwert, weil `CapPtr` bewusst keinen
+    // öffentlichen Konstruktor hat (ein fabrizierbarer Cap-Handle wäre eine Einladung). Ohne einen
+    // einzigen Cap gibt es nichts zu verdichten und nichts aufzuräumen.
+    let Some(first) = slots.iter().flatten().next().copied() else {
+        return do_load(&[]);
+    };
+    let mut dense = [first; 8];
+    let mut dense_len = 0usize;
+    for &c in slots[..n].iter().flatten() {
+        dense[dense_len] = c;
+        dense_len += 1;
+    }
+    let endow: &[(usize, CapPtr)] = &dense[..dense_len];
+    let pd = if collision { None } else { do_load(endow) };
     if pd.is_none() {
         // Laden fehlgeschlagen (Archiv fehlt / Index ungueltig / verify/parse/Ressourcen) -> die vom
         // Syscall-Dispatch erzeugten Endowment-Cap-KOPIEN wurden NICHT installiert (load_into_pd endowt

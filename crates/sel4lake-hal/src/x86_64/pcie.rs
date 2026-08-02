@@ -22,6 +22,15 @@ static MAX_BUS: AtomicU64 = AtomicU64::new(0);
 pub const VIRTIO_VENDOR: u16 = 0x1af4;
 /// Device-IDs des virtio-RNG (legacy + modern).
 pub const VIRTIO_RNG_DEVICES: [u16; 2] = [0x1005, 0x1044];
+/// Device-IDs des virtio-Blockgeraets (legacy + modern) — A-5.2.
+pub const VIRTIO_BLK_DEVICES: [u16; 2] = [0x1001, 0x1042];
+/// Device-IDs der virtio-Netzkarte (legacy + modern) — A-5.2.
+///
+/// Die Legacy-ID steht hier, damit die **Suche** ein transitional konfiguriertes Geraet findet.
+/// Bedienen kann der Treiber es nicht: er verlangt `VIRTIO_F_VERSION_1` und bricht sonst ab. Das
+/// ist die richtige Reihenfolge — ein Geraet, das da ist und nicht modern spricht, soll als
+/// Fehlschlag sichtbar werden und nicht als "kein Geraet gefunden".
+pub const VIRTIO_NET_DEVICES: [u16; 2] = [0x1000, 0x1041];
 
 // Konfigurationsraum-Offsets.
 const CFG_VENDOR: u16 = 0x00;
@@ -190,6 +199,60 @@ pub fn find(vendor: u16, devices: &[u16]) -> Option<PciDevice> {
 /// Ist Bus-Master für dieses Gerät aktiv?
 pub fn bus_master_enabled(d: &PciDevice) -> bool {
     cfg_read16(d.bus, d.dev, d.func, CFG_COMMAND) & CMD_BUS_MASTER != 0
+}
+
+/// Die **Konfigurationsraum-Seite genau dieser Funktion** (A-5.1). `0`, solange kein ECAM bekannt.
+///
+/// Das ist der Punkt, an dem ein alter Einwand wegfällt. Bis A-5.1 hieß es: der Konfigurationsraum
+/// darf nicht an einen Treiber, denn er ist **geräteweit** — wer ihn liest, sieht jedes Gerät der
+/// Maschine. Das gilt für den alten Portpfad (`0xCF8`/`0xCFC`, ein globales Adressregister) und
+/// für „das ECAM-Fenster" als Ganzes. Es gilt **nicht** für eine einzelne Funktion: ECAM bildet
+/// `(bus, dev, func)` auf je 4 KiB ab, und 4 KiB sind genau eine Seite. Eine Funktion ist damit
+/// mappbar, ohne die Nachbarn mitzugeben.
+///
+/// Deshalb kann der Kern die **Enumeration** behalten (er sucht das Gerät) und der Treiber-PD
+/// trotzdem seinen eigenen Capability-Lauf machen (er liest seine eigene Seite). Ohne das müsste
+/// der Kern die virtio-Strukturen auflösen und dem Treiber reichen — also virtio kennen, und
+/// genau das soll er nicht (A-5.1, Richtungsumkehr).
+pub fn cfg_page(d: &PciDevice) -> u64 {
+    cfg_addr(d.bus, d.dev, d.func, 0).unwrap_or(0) & !0xfff
+}
+
+/// **Größe des BAR `i`** in Bytes (`0` = unbenutzt/kein Speicher-BAR).
+///
+/// Ermittelt über den üblichen Weg: alle Bits schreiben, zurücklesen, die niedrigsten gesetzten
+/// Bits geben die Größe — und **den Originalwert wiederherstellen**. Das Wiederherstellen ist
+/// nicht Kosmetik: zwischen dem Schreiben und dem Zurückschreiben zeigt das BAR ins Leere, und
+/// jeder Zugriff darauf ginge daneben. Deshalb passiert das **einmal beim Zuteilen** und nicht
+/// im laufenden Betrieb.
+pub fn bar_size(d: &PciDevice, i: usize) -> u64 {
+    if i >= 6 {
+        return 0;
+    }
+    let off = CFG_BAR0 + (i as u16) * 4;
+    let lo = cfg_read32(d.bus, d.dev, d.func, off);
+    if lo & 1 != 0 {
+        return 0; // I/O-BAR
+    }
+    let is64 = (lo >> 1) & 0b11 == 0b10;
+    let hi_off = off + 4;
+    let hi = if is64 { cfg_read32(d.bus, d.dev, d.func, hi_off) } else { 0 };
+    cfg_write32(d.bus, d.dev, d.func, off, 0xffff_ffff);
+    let mask_lo = cfg_read32(d.bus, d.dev, d.func, off) & !0xf;
+    let mask_hi = if is64 {
+        cfg_write32(d.bus, d.dev, d.func, hi_off, 0xffff_ffff);
+        let m = cfg_read32(d.bus, d.dev, d.func, hi_off);
+        cfg_write32(d.bus, d.dev, d.func, hi_off, hi);
+        m
+    } else {
+        0xffff_ffff
+    };
+    cfg_write32(d.bus, d.dev, d.func, off, lo);
+    let mask = (mask_lo as u64) | ((mask_hi as u64) << 32);
+    if mask == 0 {
+        return 0;
+    }
+    (!mask).wrapping_add(1)
 }
 
 /// Bus-Master-Bit im Command-Register (der Kernel braucht es für die Save/Restore-Semantik).

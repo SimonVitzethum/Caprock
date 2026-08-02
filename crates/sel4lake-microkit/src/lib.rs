@@ -17,7 +17,7 @@
 //! Reine Orchestrierung — **kein eigenes `unsafe`**.
 
 use sel4lake_abi::{pdctl, reg, result, sys};
-use sel4lake_cap::{CapPtr, CapSpace, ObjectKind};
+use sel4lake_cap::{CapPtr, CapSpace, DmaCoherence, DmaDir, ObjectKind};
 use sel4lake_hal::cpu::array_index_nospec;
 use sel4lake_hal::exception::{frame_reg, frame_set_reg};
 use sel4lake_ipc::{Endpoint, Notification};
@@ -693,10 +693,15 @@ pub fn dispatch(
     eps: &[SpinLock<Endpoint>],
     ntfns: &[SpinLock<Notification>],
     // ext-26: `SYS_LOAD`-Callback in den kernel-spezifischen Binary-Loader. `(Archiv-Index,
-    // Endowment) -> neue PD-Id`. Vom Dispatch erst NACH dem Freigeben von `caps` gerufen (der
-    // Loader re-lockt `CAPS`/`MEM`/`SCHEDS` selbst). `endow` = aus dem Aufrufer-Cspace delegierte
-    // Caps (Slot, Cap).
-    load: fn(u32, &[(usize, CapPtr)]) -> Option<usize>,
+    // AUFRUFER-PD, Endowment) -> neue PD-Id`. Vom Dispatch erst NACH dem Freigeben von `caps`
+    // gerufen (der Loader re-lockt `CAPS`/`MEM`/`SCHEDS` selbst). `endow` = aus dem
+    // Aufrufer-Cspace delegierte Caps (Slot, Cap).
+    //
+    // **Die Aufrufer-PD kam mit A-5.1 dazu**, und nicht aus Bequemlichkeit: ein
+    // HardwareLand-Backend ist per Entwurf an einen **Partner** gebunden (ext-22, unveraenderlich,
+    // 1:N). Wer es laedt, ist dieser Partner -- eine andere Antwort gibt es nicht, und sie muss
+    // vom Dispatch kommen, weil nur er weiss, wer gerade syscallt.
+    load: fn(u32, usize, &[(usize, CapPtr)]) -> Option<usize>,
     // Cap löschen (Finalisierung inkl. Speicherfreigabe/Call-Abbruch) — der Kernel sperrt darin
     // selbst `CAPS`+`MEM` und bricht finalisierte Reply-Calls ab. Nur zu rufen, wenn hier KEIN
     // Lock mehr gehalten wird. Wird für die beim Grant verdrängte Cap gebraucht (s. `grant_cap`)
@@ -953,8 +958,33 @@ pub fn dispatch(
             // Frame über eine Memory-Cap in die eigene VSpace mappen/entfernen. Das
             // Recht der Cap bestimmt die Seitenrechte: EXEC -> RX (W^X), WRITE -> RW,
             // sonst READ -> RO. Ohne nutzbares Recht abgelehnt.
-            let ObjectKind::Memory(region) = kind else {
-                return deny(result::ERR_BADCAP);
+            //
+            // **A-5.1: MMIO- und DMA-Caps gehen hier ebenfalls durch.** Bis dahin mappte der
+            // Kernel die Fenster eines HardwareLand-Backends beim Erzeugen selbst; ein Treiber,
+            // der sein Gerät erst *bekommt* und dann bedient, muss es aber selbst aufziehen und
+            // wieder loslassen können — sonst ist „Hot-Reload" eine Eigenschaft, die der Kernel
+            // für ihn ausübt.
+            //
+            // Was zurückkommt, ist die **Beschreibung des Fensters**, nicht neue Autorität: Basis,
+            // Länge und (bei DMA) die Gerätesicht der Region, die der Aufrufer bereits hält. Ohne
+            // sie bräuchte ein Treiber einen Boot-Info-Block, den jedes Programm ungefragt lesen
+            // kann — und der wäre eine Autoritätsquelle neben dem Manifest (s. `loader::boot_arg`).
+            // `ro_kind` = "das OBJEKT verlangt schreibgeschuetzt", unabhaengig von den Rechten.
+            // Nur eine DMA-Cap in Richtung `DeviceRead` sagt das: dort liest das Geraet, und der
+            // Puffer ist gegen es schreibgeschuetzt. Ein MMIO-Fenster sagt es NICHT -- Register
+            // schreibt man, sonst steuert man nichts. (Genau hier lag beim ersten Anlauf ein
+            // Fehler: MMIO pauschal `ro` gemappt, und der Treiber faultete beim allerersten
+            // Schreiben auf `device_status`. Ob ein Fenster schreibbar ist, sagt die **Cap**.)
+            let (base, len, dma, ro_kind) = match kind {
+                ObjectKind::Memory(r) => (r.base, r.len, None, false),
+                ObjectKind::Mmio { phys, len } => (phys, len, None, false),
+                ObjectKind::Dma { phys, len, dir, coherence } => (
+                    phys,
+                    len,
+                    Some(coherence == DmaCoherence::Coherent),
+                    dir == DmaDir::DeviceRead,
+                ),
+                _ => return deny(result::ERR_BADCAP),
             };
             let perm_code = if rights.contains(Rights::EXEC) {
                 2u8
@@ -965,11 +995,43 @@ pub fn dispatch(
             } else {
                 return deny(result::ERR_RIGHTS);
             };
+            // Geräte-Fenster (MMIO/DMA) laufen über `map_window`: ihre Speicherattribute folgen
+            // dem Objekt, nicht den Rechten (s. Trait-Doku). Plain-RAM bleibt auf `map_frame`.
+            let is_device = !matches!(kind, ObjectKind::Memory(_));
+            if is_device {
+                // Ein Register-Fenster nur-lesbar zu mappen wäre ein Treiber, der nichts
+                // steuern kann; das Schreibrecht muss aus der Cap kommen.
+                let ro = ro_kind || !rights.contains(Rights::WRITE);
+                if nr == sys::MAP {
+                    match ops.map_window(thread, base, len, ro, dma) {
+                        Some(iova) => {
+                            frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
+                            frame_set_reg(frame, reg::MSG0, base);
+                            frame_set_reg(frame, reg::MSG1, len);
+                            frame_set_reg(frame, reg::MSG2, iova);
+                        }
+                        None => frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_BADCAP),
+                    }
+                } else {
+                    let ok = ops.unmap_window(thread, base, len);
+                    frame_set_reg(
+                        frame,
+                        reg::SYSNO_RESULT,
+                        if ok { result::OK } else { result::ERR_BADCAP },
+                    );
+                }
+                return frame;
+            }
             let ok = if nr == sys::MAP {
-                ops.map_frame(thread, region.base, region.len, perm_code)
+                ops.map_frame(thread, base, len, perm_code)
             } else {
-                ops.unmap_frame(thread, region.base, region.len)
+                ops.unmap_frame(thread, base, len)
             };
+            if ok && nr == sys::MAP {
+                frame_set_reg(frame, reg::MSG0, base);
+                frame_set_reg(frame, reg::MSG1, len);
+                frame_set_reg(frame, reg::MSG2, 0);
+            }
             frame_set_reg(frame, reg::SYSNO_RESULT, if ok { result::OK } else { result::ERR_BADCAP });
             frame
         }
@@ -1065,7 +1127,7 @@ pub fn dispatch(
             } else {
                 &[]
             };
-            match load(index, endow) {
+            match load(index, pd, endow) {
                 Some(pd_new) => {
                     frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
                     frame_set_reg(frame, reg::EP_BADGE, pd_new as u64); // x1 = neue PD-Id

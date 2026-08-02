@@ -23,6 +23,7 @@ use sel4lake_microkit::{Caps, Domain};
 use sel4lake_region::heap::RegionSource;
 use sel4lake_region::{state, Purpose, Region, RegionTag};
 use sel4lake_loader::elf::{ElfImage, PF_W, PF_X};
+use sel4lake_loader::manifest as man;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::addr::{DmaRegion, Iova, Pa};
 use sel4lake_sched::{SchedOps, Scheduler, ThreadId, MAX_CORES};
@@ -305,6 +306,27 @@ static IPC_ORPHANS: SpinLock<Slab<Option<ThreadId>>> = SpinLock::new(Slab::empty
 
 // --- Trap-Hooks ---
 
+/// Eine Umplanung **eingeklammert abrechnen** (B-5.1): den abgehenden Thread belasten, den
+/// ankommenden neu stempeln — beides unter derselben Sperre wie die Umplanung selbst.
+///
+/// **Ein** Zählerstand, nicht zwei. Zwei Lesungen wären die naheliegende Fassung und hinterliessen
+/// ein Loch: die Zyklen der Umplanung selbst lägen zwischen den Stempeln und gehörten niemandem.
+/// Die Summe aller Konten wäre dann systematisch kleiner als die verstrichene Zeit — also genau
+/// der Fehler, gegen den B-5.1 antritt, nur kleiner. Mit einem Stempel ist die Zeitachse
+/// **lückenlos** aufgeteilt, und das ist nachprüfbar: die Summe muss zur Uhr passen.
+///
+/// Der Preis ist benannt: die Kosten der Umplanung trägt der **ankommende** Thread. Das ist eine
+/// Zuordnungsentscheidung, keine Messungenauigkeit — und die einzige, die eine lückenlose Achse
+/// zulässt.
+#[inline]
+fn charged<R>(core: usize, sched: &mut Scheduler, f: impl FnOnce(&mut Scheduler) -> R) -> R {
+    let now = hal::timer::cycles();
+    sched.charge_current(core, now);
+    let r = f(sched);
+    sched.stamp_current(core, now);
+    r
+}
+
 fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
     let core = hal::cpu::core_id();
     // Deferred-IRQ-Zustellung (ext-22, P5): pending Geräte-IRQs als Notification signalisieren
@@ -315,7 +337,7 @@ fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
     // Echter Zeitscheiben-Tick -> MCS-Budget des laufenden Threads belasten.
     let next = {
         let mut sched = SCHEDS[core].lock();
-        let next = sched.on_tick(core, frame as usize, true);
+        let next = charged(core, &mut sched, |s| s.on_tick(core, frame as usize, true));
         sync_fp_trap(core, &sched);
         sync_vspace(core, &sched);
         next
@@ -362,7 +384,7 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
         &CAPS,
         eps(),
         ntfns(),
-        load_by_index, // ext-26: SYS_LOAD-Callback (cap-gegatet im Dispatch)
+        load_by_index, // ext-26: SYS_LOAD-Callback (cap-gegatet im Dispatch); A-5.1: mit Aufrufer-PD
         dispatch_delete_cap,          // beim Grant verdrängte Cap freigeben (kein Slot-Leck)
     );
     // Der Syscall kann den laufenden Thread gewechselt haben (block/exit) -> FP-Trap
@@ -444,10 +466,12 @@ impl SchedOps for KernelSched {
         with_owner(tid, |s, _| s.frame_of(tid)).map(|(f, _)| f)
     }
     fn block_current(&mut self, core: usize, frame: usize) -> usize {
-        SCHEDS[core].lock().block_current(core, frame)
+        // Genau der Pfad, den die Tick-Rechnung **nicht** sieht: wer kurz vor dem Tick blockiert,
+        // hat gerechnet und zahlte bisher nichts (B-5.1).
+        charged(core, &mut SCHEDS[core].lock(), |s| s.block_current(core, frame))
     }
     fn switch_to(&mut self, core: usize, frame: usize, target: ThreadId) -> usize {
-        SCHEDS[core].lock().switch_to(core, frame, target)
+        charged(core, &mut SCHEDS[core].lock(), |s| s.switch_to(core, frame, target))
     }
     fn unblock(&mut self, tid: ThreadId) {
         if let Some((_, c)) = with_owner(tid, |s, _| s.unblock(tid).then_some(())) {
@@ -472,14 +496,19 @@ impl SchedOps for KernelSched {
         ok
     }
     fn on_tick(&mut self, core: usize, frame: usize) -> usize {
-        // YIELD ist freiwillig -> verbraucht kein MCS-Budget (tick = false).
-        SCHEDS[core].lock().on_tick(core, frame, false)
+        // YIELD ist freiwillig -> verbraucht kein MCS-**Budget** (tick = false). Gerechnet hat der
+        // Thread trotzdem, und B-5.1 misst den Verbrauch, nicht das Budget: die beiden Zahlen
+        // dürfen auseinanderlaufen, sonst misst man wieder nur die Durchsetzung.
+        charged(core, &mut SCHEDS[core].lock(), |s| s.on_tick(core, frame, false))
     }
     fn exit_current(&mut self, core: usize, frame: usize) -> usize {
         // Tid des sich beendenden Threads vor dem Wechsel merken; IRQs sind im Trap
         // maskiert -> der aktuelle Thread ist über die kurzen Sperren stabil.
         let tid = SCHEDS[core].lock().current_id(core);
-        let next = SCHEDS[core].lock().exit_current(core, frame);
+        // Auch der sterbende Thread wird belastet. Sein Konto liest niemand mehr — aber die
+        // kernweite Summe bliebe sonst hinter der Uhr zurück, und genau diese Summe ist die
+        // einzige Probe darauf, ob die Achse lückenlos ist.
+        let next = charged(core, &mut SCHEDS[core].lock(), |s| s.exit_current(core, frame));
         purge_ipc_queues(tid); // eager: aus allen IPC-Queues entfernen (keine SCHEDS gehalten)
         reclaim_user_kstack(tid.slot()); // EL0-Kernel-Stack-Pool-Slot zurückgeben (KSTACKS allein)
         next
@@ -510,6 +539,43 @@ impl SchedOps for KernelSched {
         vspace_map(asid, base, len, perm)
     }
     fn unmap_frame(&mut self, caller: ThreadId, base: u64, len: u64) -> bool {
+        let asid = (vspace_of(caller.slot()) >> 48) as u16;
+        if asid == 0 || len == 0 || len % 4096 != 0 {
+            return false;
+        }
+        vspace_unmap(asid, base, len)
+    }
+    /// A-5.1: ein Geräte-Fenster in die VSpace des Aufrufers, mit den Attributen des **Objekts**
+    /// (Device vs. DMA-RAM), nicht denen der Rechte. Gibt die Gerätesicht (IOVA) zurück, `0` für
+    /// MMIO.
+    fn map_window(
+        &mut self,
+        caller: ThreadId,
+        base: u64,
+        len: u64,
+        ro: bool,
+        dma: Option<bool>,
+    ) -> Option<u64> {
+        if len == 0 || len % 4096 != 0 {
+            return None;
+        }
+        let kind = match dma {
+            None => MappingKind::Device { ro },
+            Some(coherent) => MappingKind::Dma { coherent },
+        };
+        if !map_region_into_thread(caller, base, len, kind) {
+            return None;
+        }
+        // Die IOVA ist **nicht** die PA und wird auch nicht daraus gerechnet: sie stammt aus dem
+        // Fenster des Übersetzungskontexts, das der Kernel bei der Zuteilung gewählt hat. Wer sie
+        // hier aus `base` ableitete, hätte die beiden Achsen wieder zusammengelegt — genau der
+        // Fehler, gegen den `Pa`/`Iova` getrennte Typen sind.
+        Some(match dma {
+            Some(_) => assigned_iova(base).unwrap_or(0),
+            None => 0,
+        })
+    }
+    fn unmap_window(&mut self, caller: ThreadId, base: u64, len: u64) -> bool {
         let asid = (vspace_of(caller.slot()) >> 48) as u16;
         if asid == 0 || len == 0 || len % 4096 != 0 {
             return false;
@@ -618,7 +684,7 @@ fn el0_fault(frame: *mut TrapFrame, esr: u64, far: u64) -> *mut TrapFrame {
             "el0-trap: User-Thread {:#x} faultete (EC={ec:#04x} FAR={far:#018x}) -> beendet, Kernel laeuft weiter",
             tid.to_raw()
         );
-        let next = sched.exit_current(core, frame as usize);
+        let next = charged(core, &mut sched, |s| s.exit_current(core, frame as usize));
         // Auf den nächsten Thread gewechselt -> FP-Trap + VSpace passend setzen.
         sync_fp_trap(core, &sched);
         sync_vspace(core, &sched);
@@ -783,6 +849,17 @@ pub fn configure(cores: usize) -> (usize, usize, usize, u64) {
         let mem = table(core_bytes, sel4lake_sched::core_storage_align().max(4096));
         // SAFETY: wie oben; jede Instanz bekommt ihren **eigenen** Block (exklusiv).
         unsafe { SCHEDS[c].lock().attach_storage(c, mem, per_core) };
+        // B-5.1: die Zyklenquelle **zusichern oder nicht**. `invariant_tsc()` fragt die Hardware
+        // (x86: `CPUID.80000007H:EDX[8]`; auf aarch64 ist der architektonische Zähler per
+        // Konstruktion invariant). Sagt sie nein, bleibt es bei `Untrusted` — dann wird nichts
+        // abgerechnet, und das steht als `rejected_source` im Bericht statt als stille Null.
+        // Genau darum wird hier **gefragt** und nicht angenommen: unter TCG lautet die Antwort
+        // je nach CPU-Modell verschieden, und eine erfundene Rechnung wäre schlimmer als keine.
+        SCHEDS[c].lock().set_cycle_source(if hal::timer::invariant_tsc() {
+            sel4lake_sched::Source::Invariant
+        } else {
+            sel4lake_sched::Source::Untrusted
+        });
     }
 
     // Per-Thread-Tabellen des Kernels (über den globalen, migrationsstabilen Slot indiziert).
@@ -1115,7 +1192,54 @@ pub fn cap_audit_cdt() -> u32 {
     // Objekttabelle; dann konnte das Audit nicht laufen und meldet das, statt „konsistent" zu
     // sagen.
     let mut scratch = CAP_AUDIT.lock();
-    CAPS.read().cspace.audit_cdt(scratch.as_mut_slice())
+    let g = CAPS.read();
+    // **Code 9: ein CDT-Lauf hat seine Schranke gerissen** (B-5.5).
+    //
+    // Die Schranke ist `slots.len()` -- ein azyklischer Lauf besucht keinen Slot zweimal. Wird sie
+    // erreicht, ist der Baum nicht mehr azyklisch, und `revoke` hat **abgebrochen**: Abkoemmlinge
+    // bleiben am Leben, die weg sein sollten. Das ist kein Latenzbefund, sondern ein
+    // Autoritaetsbefund.
+    //
+    // Die Pruefung steht hier und nicht bloss der Zaehler in der Crate -- genau diese Trennung
+    // ("die Pruefbarkeit war vorhanden, die Pruefung nicht") hat diese Datei bei A-3.3 schon
+    // einmal gekostet.
+    if g.cspace.cdt_walk_overruns() != 0 {
+        return 9;
+    }
+    g.cspace.audit_cdt(scratch.as_mut_slice())
+}
+
+/// **Hoechststaende der CDT-Laeufe** (B-5.5): `(Abstiegsschritte, Revoke-Loeschungen, Schranke)`.
+///
+/// Als **Operationszahl**, nicht als Zeit: eine kritische Sektion, deren Laenge man nur in
+/// Zyklen ausdruecken kann, sagt auf Blech, unter KVM und unter TCG jeweils etwas anderes. Erst
+/// der **Abstand zur Schranke** macht "begrenzte kritische Sektion" zu einer Aussage.
+pub fn cap_cdt_peaks() -> (usize, usize, usize) {
+    let g = CAPS.read();
+    let (walk, limit) = g.cspace.peak_cdt_walk();
+    let (ops, _) = g.cspace.peak_revoke_ops();
+    (walk, ops, limit)
+}
+
+/// **Zyklenabrechnung dieses Kerns** (B-5.1): `(Proben, Zyklen, Ticks, rückwärts, unplausibel,
+/// Kernwechsel, Quelle-untrusted)`.
+///
+/// Die Ablehnungszähler gehören zwingend dazu. Eine 0 bei `Zyklen` hat zwei völlig verschiedene
+/// Bedeutungen — „hat nicht gerechnet" und „konnte nicht messen" — und nur die Zähler trennen sie.
+/// Ohne sie wäre ein Kernel, in dem die Klammerung **gar nicht** gerufen wird, von einem völlig
+/// unbeschäftigten Kernel nicht zu unterscheiden.
+pub fn cycle_accounting(core: usize) -> (u64, u64, u64, u32, u32, u32, u32) {
+    let g = SCHEDS[core].lock();
+    let c = g.cycle_stats();
+    (
+        c.samples,
+        c.consumed,
+        g.ticks(),
+        c.rejected_backward,
+        c.rejected_implausible,
+        c.rejected_core,
+        c.rejected_source,
+    )
 }
 
 /// **Summenprüfung des Cap-Budgets** (A-3.4, Abschluss): wie viele belegte Slots gehen auf **kein**
@@ -3542,7 +3666,19 @@ impl DmaEnforcer for VtdEnforcer {
     }
 
     fn detach(&self, binding: &DmaBinding) {
-        let Some(caps) = hal::vtd::caps_common() else { return };
+        // **Ein Teardown, der nicht laufen kann, darf nicht still zurueckkehren.**
+        //
+        // Bis B-3.3 war `caps_common()` praktisch immer `Some`. Seit die Faehigkeiten das Minimum
+        // ueber ALLE Einheiten sind und eine stumme Einheit erkannt wird, kann es `None` werden --
+        // und dann bliebe hier eine Uebersetzung stehen, waehrend die Region freigegeben wird.
+        // Genau die Lage, gegen die das Teardown-Token existiert, nur ohne jede Meldung.
+        //
+        // Also zaehlen und ueber `dma_audit` Code 8 sichtbar machen. Ein stilles `return` waere
+        // die schlimmere Variante desselben Fehlers: kein Schutz UND kein Hinweis darauf.
+        let Some(caps) = hal::vtd::caps_common() else {
+            DETACH_WITHOUT_CAPS.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
         let root = hal::vtd::root_table();
         let mut t = DMA_CTX.lock();
         let Some(slot) = t
@@ -3719,13 +3855,54 @@ static EVTQ_LIVENESS: AtomicBool = AtomicBool::new(false);
 /// schwaches Fenster (s. `ctx_assign_window`).
 fn strong_window_base() -> Option<u64> {
     let top = RAM_TOP.load(Ordering::Acquire);
-    let base = (top + IOVA_GUARD - 1) & !(IOVA_GUARD - 1);
+    let mut base = (top + IOVA_GUARD - 1) & !(IOVA_GUARD - 1);
+    // **B-3.4: den Interrupt-Nachrichtenbereich ueberspringen.**
+    //
+    // Auf x86 behandelt VT-d eine DMA-Schreibung nach `0xFEE0_0000..0xFEF0_0000` als
+    // Interrupt-Nachricht und befragt die Uebersetzung gar nicht. Eine IOVA dort ist damit
+    // unbenutzbar — und zwar auf die unangenehmste Art: die Seitentabellen saehen richtig aus,
+    // das Geraet erzeugte trotzdem Interrupts statt Speicherzugriffe. Kein Fault, kein Eintrag in
+    // der Fehlerwarteschlange, nur Daten, die nirgends ankommen.
+    //
+    // Gewaehlt ist die **strukturelle** Loesung: das Fenster faengt oberhalb an, statt bei jeder
+    // Vergabe zu pruefen. Eine Bedingung, die nicht gelten KANN, ist besser als eine, die an jeder
+    // Vergabestelle richtig geprueft werden muss — die naechste Vergabestelle vergisst sie.
+    // Der Preis sind ein paar GiB ungenutzter IOVA-Raum von 39 Bit. Das ist kein Preis.
+    if let Some((msi, len)) = hal::iommu::interrupt_message_window() {
+        let ende = msi + len;
+        if base < ende {
+            base = (ende + IOVA_GUARD - 1) & !(IOVA_GUARD - 1);
+        }
+    }
     // Reserve, damit auch ein paar Regionen hineinpassen.
     if base + 16 * IOVA_GUARD < S1_INPUT_LIMIT {
         Some(base)
     } else {
         None
     }
+}
+
+/// Wie viele DMA-Kontext-Slots es gibt (fuer Tests, die ueber alle laufen wollen).
+pub fn ndma_ctx() -> usize {
+    NDMA_CTX
+}
+
+/// **B-3.4-Nachweis:** liegt das Fenster eines Slots vollstaendig ausserhalb des
+/// Interrupt-Nachrichtenbereichs?
+///
+/// Als eigene Funktion, damit die Aussage pruefbar ist und nicht bloss aus der Konstruktion folgt.
+/// „Folgt aus der Konstruktion" ist genau die Sorte Begruendung, die nach der naechsten Aenderung
+/// nicht mehr stimmt und die niemand nachrechnet.
+pub fn iova_window_clear_of_msi(slot: usize) -> bool {
+    let Some((msi, len)) = hal::iommu::interrupt_message_window() else {
+        return true; // diese Architektur hat keinen solchen Bereich (Zusage, s. HAL)
+    };
+    let Some(first) = strong_window_base() else {
+        return true; // kein starkes Fenster -> es gibt nichts zu ueberlappen
+    };
+    let size = window_size(first);
+    let base = first + slot as u64 * size;
+    base >= msi + len || base + size <= msi
 }
 
 /// Fenstergröße je Kontext-Slot: der gesamte Raum zwischen RAM-Oberkante und Eingangsgrenze,
@@ -4407,6 +4584,487 @@ pub fn dma_group_add(leader: u32, member: u32) -> bool {
     dma_enforcer().share_context(leader, member)
 }
 
+// ================================================================================================
+// A-5.1: ein Gerät an eine Treiber-PD zuteilen
+// ================================================================================================
+
+/// Ein Gerät, das der Hochlauf gefunden hat und das an eine Treiber-PD gehen **darf**.
+///
+/// Bewusst nur die **aufgelösten Tatsachen** und kein `PciDevice`: was der Kern hier weitergibt,
+/// ist „diese Konfigurationsraum-Seite, dieses Registerfenster, diese Requester-ID". Was er
+/// **nicht** weitergibt, ist der Weg, sie zu finden — ein Lauf über alle Busse sieht jedes Gerät
+/// der Maschine, und genau das ist die Autorität, die im Kern bleibt.
+///
+/// Der Kern weiß hier auch **nicht**, was für ein Gerät das ist. Kein virtio, kein Blockgerät,
+/// keine Vendor-ID in der Entscheidung. Das ist die halbe Richtungsumkehr aus A-5.1: der Kern
+/// teilt Autorität zu, der Treiber weiß, was er damit anfängt.
+#[derive(Clone, Copy)]
+pub struct DriverDevice {
+    /// Requester-ID (x86) bzw. StreamID (aarch64) — die Identität, unter der das Gerät DMA anfordert.
+    pub rid: u32,
+    /// Die Konfigurationsraum-**Seite** genau dieser Funktion (4 KiB).
+    pub cfg_page: u64,
+    /// Registerfenster (BAR) — Basis und Länge.
+    pub bar: u64,
+    pub bar_len: u64,
+    /// PCI-Hersteller-ID — **nur zur Auswahl**, nicht zum Bedienen (A-5.3).
+    pub vendor: u16,
+    /// PCI-Geräte-ID — dito.
+    pub device: u16,
+    /// `class<<16 | subclass<<8 | prog_if` — dito.
+    pub class: u32,
+}
+
+/// Höchstzahl gleichzeitig **angebotener** Geräte.
+pub const MAX_OFFERED_DEVICES: usize = 8;
+
+/// Die zuteilbaren Geräte. `None` in einem Platz = frei; ein vergebenes Gerät wird
+/// **herausgenommen**, damit es kein zweites Mal vergeben werden kann.
+///
+/// **Vorher stand hier genau eines** — mit der Begründung, dass jede Auswahl unter mehreren eine im
+/// Kernel versteckte Politik wäre, solange das Manifest nicht sagen kann, *welches*. Die Begründung
+/// war richtig, und A-5.3 nimmt ihr die Grundlage: der Manifest-Eintrag trägt jetzt einen
+/// [`man::DeviceSelector`], also steht die Politik im Autoritätsdokument und nicht in der
+/// Fundreihenfolge des Enumerators.
+///
+/// Die Reihenfolge in dieser Liste ist damit **keine Zusage**. Wer sich auf sie verlässt, hat einen
+/// Fehler, der bei der nächsten Maschine auffällt.
+static DRIVER_DEVICES: SpinLock<[Option<DriverDevice>; MAX_OFFERED_DEVICES]> =
+    SpinLock::new([None; MAX_OFFERED_DEVICES]);
+
+/// Wie viel DMA-Speicher eine Treiber-PD bekommt. Reicht für Ringe + Puffer eines einfachen
+/// Geräts; die Größe gehört perspektivisch ins Manifest (Z11c), nicht hierher.
+const DRIVER_DMA_BYTES: u64 = 16 * 1024;
+
+/// Höchstzahl gleichzeitiger Gerätezuteilungen (heute: eine, s. [`DRIVER_DEVICE`]).
+const MAX_DRIVER_ASSIGN: usize = 4;
+
+/// Was einer Treiber-PD tatsächlich zugeteilt wurde — gebraucht, um die **Gerätesicht** ihrer
+/// DMA-Region wiederzufinden, wenn sie diese mappt.
+#[derive(Clone, Copy)]
+struct DriverAssign {
+    used: bool,
+    /// **WEM** diese Zuteilung gehört (A-5.4) — die `program_id` aus dem Manifest-Eintrag.
+    ///
+    /// Bis A-5.3 gab es genau einen Treiber, und vier Stellen im Kernel nahmen deshalb „die
+    /// **erste** benutzte Zuteilung" (`find(|a| a.used)`). Das ist bei zwei Treibern keine
+    /// Abkürzung mehr, sondern eine **stille Fehlwahl**: der Client des Blockdienstes bekäme die
+    /// Übertragungsfläche irgendeines Treibers, und ein Hot-Reload träfe irgendeinen.
+    ///
+    /// Der Schlüssel ist die `program_id` und nicht die PD-Nummer: die PD entsteht erst *nach*
+    /// der Zuteilung (`endow_from_manifest` läuft vor `load_image`), und die `program_id` steht
+    /// im **Autoritätsdokument** — dieselbe Zahl, mit der das Manifest den Eintrag benennt.
+    program_id: u32,
+    /// **Welches** Gerät hier hängt (A-5.3). Ohne diese Zahl wäre „der Treiber hat ein Gerät" die
+    /// einzige Aussage, die der Bericht treffen könnte — und genau die ist bei zwei Geräten
+    /// wertlos, weil sie auch dann wahr ist, wenn die Zuteilung vertauscht wurde.
+    rid: u32,
+    vendor: u16,
+    device: u16,
+    dma_phys: u64,
+    dma_len: u64,
+    iova: u64,
+    /// Die Fenster, damit eine **Nachfolgefassung** dieselbe Zuteilung bekommen kann, ohne dass
+    /// das Gerät dafür losgelassen und neu gesucht würde (A-5.1, Hot-Reload).
+    cfg_page: u64,
+    bar: u64,
+    bar_len: u64,
+    /// Wurzel-Cap der geteilten Uebertragungsflaeche (A-6.3). Jeder Halter bekommt eine **Kopie**;
+    /// das Original bleibt beim Kernel, damit ein sterbender Treiber die Flaeche nicht mitnimmt.
+    shared_root: Option<CapPtr>,
+    shared_phys: u64,
+}
+
+impl DriverAssign {
+    const EMPTY: Self = Self {
+        used: false,
+        program_id: 0,
+        rid: 0,
+        vendor: 0,
+        device: 0,
+        dma_phys: 0,
+        dma_len: 0,
+        iova: 0,
+        cfg_page: 0,
+        bar: 0,
+        bar_len: 0,
+        shared_root: None,
+        shared_phys: 0,
+    };
+}
+
+static DRIVER_ASSIGN: SpinLock<[DriverAssign; MAX_DRIVER_ASSIGN]> =
+    SpinLock::new([DriverAssign::EMPTY; MAX_DRIVER_ASSIGN]);
+
+/// Ein gefundenes Gerät als zuteilbar anmelden (Hochlauf). `false` = Liste voll.
+pub fn offer_driver_device(d: DriverDevice) -> bool {
+    let mut g = DRIVER_DEVICES.lock();
+    for s in g.iter_mut() {
+        if s.is_none() {
+            *s = Some(d);
+            return true;
+        }
+    }
+    false
+}
+
+/// Wie viele Geräte noch zuteilbar sind (Bericht).
+pub fn offered_device_count() -> usize {
+    DRIVER_DEVICES.lock().iter().filter(|s| s.is_some()).count()
+}
+
+/// Die angebotenen Geräte für den Bericht auslesen (RID, Hersteller, Gerät, Klasse).
+pub fn offered_devices(out: &mut [(u32, u16, u16, u32)]) -> usize {
+    let g = DRIVER_DEVICES.lock();
+    let mut n = 0;
+    for d in g.iter().flatten() {
+        if n == out.len() {
+            break;
+        }
+        out[n] = (d.rid, d.vendor, d.device, d.class);
+        n += 1;
+    }
+    n
+}
+
+/// Die **Gerätesicht** (IOVA) einer zugeteilten DMA-Region nachschlagen.
+///
+/// Sie wird **nicht** aus der PA gerechnet. Die IOVA stammt aus dem Fenster des
+/// Übersetzungskontexts, das der Enforcer beim Anhängen gewählt hat; oberhalb von `RAM_TOP` kann
+/// sie nie zufällig eine gültige PA sein, und genau darauf beruht die Trennung der beiden Achsen.
+fn assigned_iova(dma_phys: u64) -> Option<u64> {
+    DRIVER_ASSIGN
+        .lock()
+        .iter()
+        .find(|a| a.used && a.dma_phys == dma_phys)
+        .map(|a| a.iova)
+}
+
+/// Groesse der **geteilten Uebertragungsflaeche** (A-6.3).
+///
+/// Sie ist **nicht** die DMA-Region des Treibers, und das ist der Punkt: die ist non-coherent
+/// gemappt (Normal-NC), damit das Geraet hineinschreiben kann, ohne dass jemand Cache-Wartung
+/// fahren muss. Eine zweite, **gecachte** Abbildung derselben Seiten in einer Client-PD waere auf
+/// x86 ein Attribut-Alias -- laut SDM undefiniert, in der Praxis „geht meistens". Also eine
+/// eigene Region aus normalem RAM, in beiden PDs mit denselben Attributen, und der Treiber
+/// kopiert. Ein echter Treiber tut das ohnehin, sobald der Client-Puffer nicht DMA-faehig ist.
+const SHARED_BYTES: u64 = 8 * 1024;
+
+/// Die Caps, die eine Treiber-PD beim Start bekommt (A-5.1).
+pub struct DriverGrant {
+    /// Slot 3: die eigene Konfigurationsraum-Seite (der Treiber löst sein Gerät selbst auf).
+    pub cfg: CapPtr,
+    /// Slot 4: das Registerfenster.
+    pub bar: CapPtr,
+    /// Slot 5: die DMA-Region, bereits an die RID des Geräts angehängt.
+    pub dma: CapPtr,
+    /// Slot 6: die geteilte Übertragungsfläche (A-6.3) — dieselbe Region, die ein Client des
+    /// Blockdienstes bekommt. Der Treiber kopiert gelesene Sektoren dorthin.
+    pub shared: CapPtr,
+}
+
+/// Ein Gerät herausnehmen, das auf `sel` passt (A-5.3). Es ist danach **vergeben**.
+///
+/// **Fail-closed:** passt keines, gibt es `None` — es wird ausdrücklich **nicht** auf „dann eben
+/// irgendeins" zurückgefallen. Der Rückfall wäre die bequeme Zeile und genau die versteckte
+/// Politik, gegen die der Selektor antritt: ein Manifest, das ein Blockgerät verlangt, bekäme
+/// stillschweigend eine Netzkarte, und der Treiber fände sein Gerät „irgendwie nicht".
+fn take_matching_device(sel: man::DeviceSelector) -> Option<DriverDevice> {
+    let mut g = DRIVER_DEVICES.lock();
+    for s in g.iter_mut() {
+        if let Some(d) = *s {
+            if sel.matches(d.vendor, d.device, d.class) {
+                *s = None;
+                return Some(d);
+            }
+        }
+    }
+    None
+}
+
+/// Ein zurückgegebenes Gerät wieder anbieten (Rücknahme bei halbem Fehlschlag).
+fn put_back_device(d: DriverDevice) {
+    let mut g = DRIVER_DEVICES.lock();
+    for s in g.iter_mut() {
+        if s.is_none() {
+            *s = Some(d);
+            return;
+        }
+    }
+}
+
+/// **Ein zuteilbares Gerät an eine Treiber-PD vergeben** (A-5.1, seit A-5.3 mit Selektor).
+///
+/// Erzeugt vier Caps und hängt die DMA-Region an den Übersetzungskontext der Geräte-RID. Danach
+/// ist das Gerät **vergeben** — ein zweiter Aufruf mit demselben Selektor liefert `None`, statt
+/// dasselbe Gerät ein zweites Mal auszugeben. Zwei Treiber auf einem Gerät wären kein Grenzfall,
+/// sondern zwei Instanzen, die sich gegenseitig die Virtqueue umschreiben.
+///
+/// `sel` kommt aus dem Manifest-Eintrag. [`man::DeviceSelector::ANY`] ist das Verhalten vor A-5.3.
+///
+/// Schlägt ein Schritt fehl, werden die vorher erzeugten Caps wieder abgeräumt und das Gerät
+/// bleibt vergebbar: eine halbe Zuteilung ist schlimmer als keine, weil der Treiber dann an einer
+/// Stelle scheitert, die niemand mit der Zuteilung in Verbindung bringt.
+pub fn assign_driver_device(sel: man::DeviceSelector, program_id: u32) -> Option<DriverGrant> {
+    let dev = take_matching_device(sel)?;
+    let give_back = || put_back_device(dev);
+
+    let Some(region) = alloc_dma_region(DRIVER_DMA_BYTES) else {
+        give_back();
+        return None;
+    };
+    // Non-coherent (Normal-NC): der Treiber liest den used-Ring, den das Gerät geschrieben hat.
+    // Cacheable wäre auf x86 richtig und auf aarch64 falsch, solange der Treiber keine
+    // Cache-Wartung fährt -- und eine Zuteilung, die nur auf einer Architektur trägt, ist eine
+    // Falle mit Verfallsdatum.
+    let dma = match install_dma_cap_ex(
+        region.base,
+        region.len,
+        DmaDir::Bidirectional,
+        DmaCoherence::NonCoherent,
+        Rights::RW,
+    ) {
+        Ok(c) => c,
+        Err(_) => {
+            MEM.lock().free_region(region);
+            give_back();
+            return None;
+        }
+    };
+    // **Anhängen, bevor der Treiber existiert.** Danach ist die Region für genau diese RID
+    // übersetzbar und für jede andere nicht -- das ist die Aussage, die eine Treiber-PD von
+    // "der Kernel macht DMA für mich" unterscheidet.
+    let Some(handle) = dma_attach(dev.rid, dma) else {
+        let _ = cap_delete(dma);
+        give_back();
+        return None;
+    };
+    let cfg = match install_mmio_cap(dev.cfg_page, 4096, Rights::RW) {
+        Ok(c) => c,
+        Err(_) => {
+            dma_detach(dev.rid, handle);
+            let _ = cap_delete(dma);
+            give_back();
+            return None;
+        }
+    };
+    let bar = match install_mmio_cap(dev.bar, dev.bar_len, Rights::RW) {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = cap_delete(cfg);
+            dma_detach(dev.rid, handle);
+            let _ = cap_delete(dma);
+            give_back();
+            return None;
+        }
+    };
+    // Die geteilte Uebertragungsflaeche (A-6.3): normales RAM, keine Geraetesicht. Das
+    // **Original** bleibt beim Kernel, jeder Halter bekommt eine Kopie -- so nimmt ein sterbender
+    // Treiber die Flaeche nicht mit, und die Nachfolgefassung findet dieselbe vor.
+    let Some(shared_region) = alloc(SHARED_BYTES, 4096) else {
+        let _ = cap_delete(bar);
+        let _ = cap_delete(cfg);
+        dma_detach(dev.rid, handle);
+        let _ = cap_delete(dma);
+        give_back();
+        return None;
+    };
+    let shared_phys = shared_region.base();
+    let Ok(shared_root) = cap_install(shared_region) else {
+        let _ = cap_delete(bar);
+        let _ = cap_delete(cfg);
+        dma_detach(dev.rid, handle);
+        let _ = cap_delete(dma);
+        give_back();
+        return None;
+    };
+    let Ok(shared) = cap_copy(shared_root, Rights::RW) else {
+        let _ = cap_delete(bar);
+        let _ = cap_delete(cfg);
+        dma_detach(dev.rid, handle);
+        let _ = cap_delete(dma);
+        give_back();
+        return None;
+    };
+    {
+        let mut t = DRIVER_ASSIGN.lock();
+        let Some(slot) = t.iter().position(|a| !a.used) else {
+            drop(t);
+            let _ = cap_delete(shared);
+            let _ = cap_delete(bar);
+            let _ = cap_delete(cfg);
+            dma_detach(dev.rid, handle);
+            let _ = cap_delete(dma);
+            give_back();
+            return None;
+        };
+        t[slot] = DriverAssign {
+            used: true,
+            program_id,
+            rid: dev.rid,
+            vendor: dev.vendor,
+            device: dev.device,
+            dma_phys: region.base,
+            dma_len: region.len,
+            iova: handle.iova.raw(),
+            cfg_page: dev.cfg_page,
+            bar: dev.bar,
+            bar_len: dev.bar_len,
+            shared_root: Some(shared_root),
+            shared_phys,
+        };
+    }
+    Some(DriverGrant { cfg, bar, dma, shared })
+}
+
+/// Eine **Kopie** der geteilten Uebertragungsflaeche fuer einen Client des Blockdienstes (A-6.3).
+///
+/// **Es gibt hier keinen ersten Treiber mehr** (A-5.4). Gesucht wird die Zuteilung, die ueberhaupt
+/// eine Uebertragungsflaeche hat -- und wenn es davon mehr als eine gibt, wird **keine** gewaehlt:
+/// „irgendeine" waere eine Politik, die niemand aufgeschrieben hat, und der Client bekaeme die
+/// Flaeche eines Dienstes, den er nicht gemeint hat. Sobald zwei Dienste eine anbieten, muss das
+/// Manifest sie benennen (Z11b/Z11c); bis dahin ist Verweigern die einzige ehrliche Antwort.
+pub fn driver_shared_cap(service_id: u32) -> Option<CapPtr> {
+    let g = DRIVER_ASSIGN.lock();
+    let root = if service_id != 0 {
+        // Der Client hat seinen Dienst **benannt** (A-5.4) -- dann gibt es nichts zu entscheiden.
+        g.iter()
+            .find(|a| a.used && a.program_id == service_id)?
+            .shared_root?
+    } else {
+        // Nicht benannt: nur zulaessig, solange es genau eine Flaeche gibt. „Irgendeine" waere
+        // eine Politik, die niemand aufgeschrieben hat, und der Client saehe die Daten eines
+        // Dienstes, den er nicht gemeint hat.
+        let mut it = g.iter().filter(|a| a.used && a.shared_root.is_some());
+        let a = it.next()?;
+        if it.next().is_some() {
+            return None;
+        }
+        a.shared_root?
+    };
+    drop(g);
+    cap_copy(root, Rights::RW).ok()
+}
+
+/// **Was tatsächlich zugeteilt wurde** (A-5.3, Bericht): `(RID, Hersteller, Geräte-ID)` je Platz.
+///
+/// Der Bericht braucht die **Instanz**, nicht die Anzahl. „Eine Zuteilung ist erfolgt" ist auch
+/// dann wahr, wenn der Treiber das falsche Gerät bekommen hat — genau der Fehler, den ein
+/// Selektor verhindern soll, wäre damit unsichtbar.
+pub fn driver_assignments(out: &mut [(u32, u32, u16, u16)]) -> usize {
+    let g = DRIVER_ASSIGN.lock();
+    let mut n = 0;
+    for a in g.iter().filter(|a| a.used) {
+        if n == out.len() {
+            break;
+        }
+        out[n] = (a.program_id, a.rid, a.vendor, a.device);
+        n += 1;
+    }
+    n
+}
+
+/// Lage der geteilten Uebertragungsflaeche — fuer den Bericht des Hochlaufs.
+pub fn driver_shared_region(service_id: u32) -> Option<(u64, u64)> {
+    let g = DRIVER_ASSIGN.lock();
+    let a = *g
+        .iter()
+        .find(|a| a.used && a.shared_phys != 0 && a.program_id == service_id)?;
+    Some((a.shared_phys, SHARED_BYTES))
+}
+
+/// **Dieselbe Zuteilung an eine Nachfolgefassung ausgeben** (A-5.1, Hot-Reload).
+///
+/// Es entstehen neue **Caps** auf dieselben Fenster und dieselbe DMA-Region — das Gerät wird
+/// **nicht** losgelassen und nicht neu angehängt. Das ist der Unterschied zwischen einem
+/// Austausch und einem Neustart: die Übersetzung im IOMMU-Kontext bleibt stehen, die IOVA bleibt
+/// dieselbe, und in der Region steht noch, was die alte Fassung hinterlassen hat.
+///
+/// **Zur Überlappung:** zwischen dem Ausgeben und dem Abbau der alten Fassung halten kurzzeitig
+/// **beide** Caps auf dasselbe Gerät. Das ist zulässig und nicht dasselbe wie „zwei Treiber":
+/// die Stilllegung des Endpoints (A-4.2) sorgt dafür, dass in diesem Fenster **keiner** von
+/// beiden eine Anfrage bekommt. Autorität zu halten und sie zu benutzen sind verschiedene Dinge —
+/// und nur das zweite wäre hier ein Fehler.
+pub fn reassign_driver_device(program_id: u32) -> Option<DriverGrant> {
+    // **Genau diese Komponente**, nicht „die erste benutzte" (A-5.4). Ein Hot-Reload, der bei zwei
+    // Treibern die falsche Zuteilung ausgibt, gaebe der Nachfolgefassung ein FREMDES Geraet -- und
+    // zwar lautlos, denn alle Caps waeren gueltig.
+    let a = *DRIVER_ASSIGN.lock().iter().find(|a| a.used && a.program_id == program_id)?;
+    let dma = install_dma_cap_ex(
+        a.dma_phys,
+        a.dma_len,
+        DmaDir::Bidirectional,
+        DmaCoherence::NonCoherent,
+        Rights::RW,
+    )
+    .ok()?;
+    let cfg = match install_mmio_cap(a.cfg_page, 4096, Rights::RW) {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = cap_delete(dma);
+            return None;
+        }
+    };
+    let bar = match install_mmio_cap(a.bar, a.bar_len, Rights::RW) {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = cap_delete(cfg);
+            let _ = cap_delete(dma);
+            return None;
+        }
+    };
+    let Some(shared) = a.shared_root.and_then(|r| cap_copy(r, Rights::RW).ok()) else {
+        let _ = cap_delete(bar);
+        let _ = cap_delete(cfg);
+        let _ = cap_delete(dma);
+        return None;
+    };
+    Some(DriverGrant { cfg, bar, dma, shared })
+}
+
+/// Eine **weitere** HardwareLand-Backend-PD an einem **bestehenden** Kanal anlegen (A-5.1).
+///
+/// Der Kanal ist das, was den Austausch überlebt: Clients halten Caps auf **diesen** Endpoint.
+/// Bekäme die neue Fassung einen eigenen, müsste jeder Client umgehängt werden — genau die
+/// gerissene IPC-Beziehung, gegen die A-4.1 gebaut ist.
+pub fn create_hardware_backend_on(
+    partner: usize,
+    backend_id: u16,
+    ep: usize,
+    ntfn: usize,
+) -> Option<usize> {
+    CAPS.write()
+        .pds
+        .create_hardware_backend(partner, backend_id, ep as u32, ntfn as u32)
+}
+
+/// Wurde das Gerät vergeben, und mit welcher Gerätesicht? Für den Bericht des Hochlaufs.
+pub fn driver_assignment(program_id: u32) -> Option<(u64, u64)> {
+    DRIVER_ASSIGN
+        .lock()
+        .iter()
+        .find(|a| a.used && a.program_id == program_id)
+        .map(|a| (a.dma_phys, a.iova))
+}
+
+/// **Die IOVA-Fenster aller Zuteilungen** (A-5.4): `(program_id, RID, IOVA, Laenge)` je Platz.
+///
+/// Grundlage der Isolationsaussage zwischen zwei Treibern. Zwei Geraete sind nur dann getrennt,
+/// wenn ihre Gerätesichten sich nicht ueberschneiden -- und das ist eine Aussage ueber die
+/// **IOVA**-Achse, nicht ueber die Physadressen.
+pub fn driver_windows(out: &mut [(u32, u32, u64, u64)]) -> usize {
+    let g = DRIVER_ASSIGN.lock();
+    let mut n = 0;
+    for a in g.iter().filter(|a| a.used) {
+        if n == out.len() {
+            break;
+        }
+        out[n] = (a.program_id, a.rid, a.iova, a.dma_len);
+        n += 1;
+    }
+    n
+}
+
 /// Prüfen, ob `[addr, addr+len)` (IOVA) **vollständig in einer angehängten Region** des Kontexts
 /// der `stream_id` liegt (Level-1-Software-Disziplin über mehrere Regionen / Scatter-Gather).
 fn dma_addr_in_context(stream_id: u32, addr: Iova, len: u64) -> bool {
@@ -4842,8 +5500,18 @@ pub fn dma_audit() -> u32 {
     if !dma_pending_is_isolated() {
         return 7;
     }
+    // Code 8: ein Teardown konnte die Faehigkeiten der Einheit nicht lesen und ist deshalb
+    // **ausgefallen** (s. `VtdEnforcer::detach`). Eine Uebersetzung, die stehen bleibt, waehrend
+    // ihre Region freigegeben wird, ist ein DMA-use-after-free -- und zwar einer, den ohne diesen
+    // Zaehler niemand bemerkt haette.
+    if DETACH_WITHOUT_CAPS.load(Ordering::Relaxed) != 0 {
+        return 8;
+    }
     0
 }
+
+/// Zaehler fuer Teardowns, die mangels lesbarer IOMMU-Faehigkeiten ausfielen (`dma_audit` Code 8).
+static DETACH_WITHOUT_CAPS: AtomicU32 = AtomicU32::new(0);
 
 /// Wächter für [`dma_audit`] Code `7`.
 fn dma_pending_is_isolated() -> bool {
@@ -5289,6 +5957,10 @@ pub fn create_hardware_backend(
     };
     Some((backend_pd, ep, ntfn))
 }
+/// Der **Partner** einer HardwareLand-Backend-PD (die TrustedSas-PD, an die sie gebunden ist).
+pub fn pd_partner(pd: usize) -> Option<usize> {
+    CAPS.read().pds.partner_of(pd)
+}
 pub fn bind_pd(pd: usize, tid: ThreadId) {
     CAPS.write().pds.bind_thread(pd, tid);
 }
@@ -5299,6 +5971,26 @@ pub fn install_pd_cap(pd: usize, slot: usize, cap: CapPtr) -> bool {
 }
 pub fn clear_pd_cap(pd: usize, slot: usize) {
     CAPS.write().pds.clear_cap(pd, slot);
+}
+
+/// **Die Objektarten, die im Cspace einer PD stehen** — die Eingabe für
+/// [`sel4lake_cap::checkpoint::classify_all`] (Z4b/Z4 Stufe 2).
+///
+/// Gibt die Zahl der betrachteten Slots zurück; `out[i]` ist `None`, wo der Slot leer ist. Der
+/// **Platz** bleibt erhalten und wird nicht weggelassen: der Grund einer Verweigerung nennt den
+/// Slot, und ein verdichteter Vektor verschöbe ihn.
+///
+/// Warum die Rechte hier nicht mitkommen: die Klassifikation entscheidet über die **Art** der
+/// Autorität, nicht über ihren Umfang. Eine MMIO-Cap mit Leserecht ist auf der Zielmaschine
+/// genauso wenig dieselbe wie eine mit Schreibrecht.
+pub fn pd_object_kinds(pd: usize, out: &mut [Option<ObjectKind>]) -> usize {
+    let g = CAPS.read();
+    let caps = g.pds.caps_of(pd);
+    let n = caps.len().min(out.len());
+    for (i, slot) in caps.iter().take(n).enumerate() {
+        out[i] = slot.and_then(|c| g.cspace.lookup(c)).map(|(k, _, _)| k);
+    }
+    n
 }
 
 /// Einen blockierten Endpoint-Empfänger zurückziehen (Hot-Reload).
@@ -5419,6 +6111,83 @@ pub fn thread_quiescence(tid: ThreadId) -> Quiescence {
         q = q.merge(ntfns()[i].lock().quiescence_of(tid));
     }
     q
+}
+
+
+// --- Z4a: der Haltepunkt ------------------------------------------------------------------------
+
+/// Wie ein Einfrierversuch ausging (Z4a). Bewusst **unterscheidbar**: „geht nicht" ist als
+/// Diagnose wertlos, und die drei Fälle verlangen drei verschiedene Reaktionen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Freeze {
+    /// Der Thread steht an einer **benennbaren** Grenze: deplant, auf keinem Kern, und in keiner
+    /// IPC-Rolle. Sein Trap-Frame ist vollständig — das ist die Voraussetzung für alles Weitere.
+    Frozen,
+    /// Er ist deplant, läuft aber **noch** auf einem Kern (der Reschedule-IPI ist unterwegs).
+    /// Der Aufrufer wiederholt; der Zustand ist vorübergehend.
+    StillRunning,
+    /// Er hat **offene IPC-Beziehungen** — er hängt in `CALL`, wartet in `RECV`, ist Ziel eines
+    /// Reply-Tokens oder schuldet selbst eine Antwort. Das ist **kein** vorübergehender Zustand,
+    /// sondern eine Absage: Z4d Stufe 1 lässt einen Thread nur ohne offene Transaktionen wandern.
+    /// Ihn hier trotzdem einzufrieren hiesse, einen Partner auf der Gegenseite hängen zu lassen.
+    Busy(Quiescence),
+    /// Kein solcher Thread.
+    NoThread,
+}
+
+/// **Einen Thread an einer benennbaren Grenze anhalten** (Z4a).
+///
+/// ## Was „benennbar" hier heisst
+///
+/// Genau zweierlei, und beides ist prüfbar:
+///
+/// 1. **Nicht im Kernel.** Ein Thread, der gerade auf einem Kern läuft, kann mitten in einem
+///    Syscall stehen — sein Zustand liegt dann halb im Trap-Frame und halb in Kernel-Variablen.
+///    Ein Thread, der auf **keinem** Kern läuft, ist per Konstruktion an einer Trap-Grenze
+///    stehengeblieben: der Kernel betritt und verlässt sich in einem Zug, und was dazwischen
+///    liegt, ist nie deplant. Deshalb wird die Bedingung über `current_id` je Kern geprüft und
+///    nicht geglaubt.
+/// 2. **Keine offene IPC-Beziehung** ([`thread_quiescence`]). Mitten in einer Transaktion hängt
+///    ein Partner, und der bliebe hier zurück.
+///
+/// ## Warum das hier NICHT wartet
+///
+/// Z4a verlangt ein `SYS_FREEZE`, das *wartet*. Das Warten gehört aber **nicht** hierher: diese
+/// Funktion nimmt die Scheduler-Sperre jedes Kerns, und in einer Schleife darauf zu warten, dass
+/// ein anderer Kern voranschreitet, während man seine Sperre hält, ist die Bauanleitung für einen
+/// Deadlock. Der Aufruf ist deshalb **idempotent und ergebnislos wiederholbar**; wer warten will,
+/// wiederholt ihn. Ein blockierender Syscall darüber ist eine ABI-Frage und eine eigene Stufe.
+///
+/// **`Busy` ist kein Zwischenzustand.** Wer darauf wartet, wartet ewig — die Absage ist die
+/// Antwort, nicht ein Zeitproblem.
+pub fn freeze_thread(tid: ThreadId) -> Freeze {
+    if with_owner(tid, |s, _| s.frame_of(tid)).is_none() {
+        return Freeze::NoThread;
+    }
+    // Zuerst deplanen. `pause` schickt bei Bedarf einen Reschedule-IPI -- der wirkt nicht sofort,
+    // und genau deshalb gibt es `StillRunning`.
+    KernelSched.pause(tid);
+    let q = thread_quiescence(tid);
+    if !q.is_quiescent() {
+        return Freeze::Busy(q);
+    }
+    // **Gefragt, nicht geglaubt:** laeuft er noch irgendwo?
+    //
+    // `num_cores()` und **nicht** `MAX_CORES`: die Schranke ist die Zahl der KONFIGURIERTEN
+    // Kerne. Die erste Fassung lief bis `MAX_CORES` (8) und paniced auf einer Maschine mit vier
+    // -- `current_id` auf einer Scheduler-Instanz ohne Tabellen ist kein Grenzfall, sondern ein
+    // Programmfehler, und sie sagt das auch so ("TCB-Kapazitaet 0"). Gemessen, nicht ueberlegt.
+    for c in 0..num_cores() {
+        if SCHEDS[c].lock().current_id(c) == tid {
+            return Freeze::StillRunning;
+        }
+    }
+    Freeze::Frozen
+}
+
+/// Einen eingefrorenen Thread wieder laufen lassen.
+pub fn thaw_thread(tid: ThreadId) -> bool {
+    with_owner(tid, |s, _| s.unblock(tid).then_some(())).is_some()
 }
 
 // -- A-4.1: atomares Umbinden ----------------------------------------------------------

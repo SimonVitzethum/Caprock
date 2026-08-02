@@ -1,0 +1,23 @@
+# `virtio-net` — der **zweite** Treiber, und darum geht es (A-5.4).
+#
+# Sein Zweck ist nicht die Netzkarte. Bis A-5.3 lief immer nur EINE Treiber-PD, und damit war die
+# eigentliche Mandantenaussage — zwei zugeteilte Geraete sind **voneinander** getrennt — gar nicht
+# pruefbar: der Fall, der sie widerlegen koennte, kam nicht vor. Dieselbe Form wie `virtio-rng`
+# vor A-5.2, wo nur die Schreibrichtung belegt war.
+#
+# Dieses Programm ist deshalb bewusst klein. Es holt sein Geraet, faehrt EINE echte Transaktion
+# (ARP) und meldet, was es dabei gesehen hat. Die Transaktion ist die **Positivkontrolle**: ohne
+# sie hiesse "der Fremdzugriff kam nicht an" nur, dass ueberhaupt nichts lief.
+[package]
+name = "virtio-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "virtio-net"
+path = "src/main.rs"
+
+[dependencies]
+libsel4lake = { path = "../../libsel4lake" }
+sel4lake-virtio = { path = "../../../crates/sel4lake-virtio" }

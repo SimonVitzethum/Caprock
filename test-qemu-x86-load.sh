@@ -20,7 +20,11 @@ SECONDS_RUN="${1:-120}"
 RAM="${2:-512M}"
 
 if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-    ACCEL=(-enable-kvm -cpu host,+invtsc)
+    # `host-cache-info=on` wie in `test-qemu-x86.sh`, und aus demselben Grund dort ausfuehrlich
+    # begruendet: ohne den Schalter meldet QEMU eine synthetische Cache-Geometrie. Zwei Suiten, die
+    # dieselbe Maschine verschieden beschreiben, sind derselbe Riss wie zwei, die dasselbe Geraet
+    # verschieden aufsetzen -- das hat dieses Projekt schon einmal einen halben Tag gekostet.
+    ACCEL=(-enable-kvm -cpu host,+invtsc,host-cache-info=on)
     echo "== Beschleunigung: KVM (-cpu host) =="
 else
     ACCEL=(-cpu Skylake-Client)
@@ -110,19 +114,71 @@ fi
 python3 tools/sign_trusted.py --crate programs/trusted/init --elf "$PROG/init.elf" \
     --program-id 1 --version 1 --policy internal-test --key "$TRUSTKEY" \
     --out certs/init-x86.cert >/dev/null 2>&1 || { echo "  FEHLER: init liess sich nicht zertifizieren"; exit 2; }
+# A-6.3: die Dateisystem-PD ist TrustedSAS (s. programs/trusted/fs/Cargo.toml, warum das ein
+# Kompromiss ist) -> sie braucht ebenfalls ein Zertifikat, sonst weist das Gate sie ab.
+python3 tools/sign_trusted.py --crate programs/trusted/fs --elf "$PROG/fs.elf" \
+    --program-id 4 --version 1 --policy internal-test --key "$TRUSTKEY" \
+    --out certs/fs-x86.cert >/dev/null 2>&1 || { echo "  FEHLER: fs liess sich nicht zertifizieren"; exit 2; }
+
+# --- Plattenabbild fuer die Treiber-PD (A-5.1) ---------------------------------------------------
+#
+# Derselbe Inhalt wie in `test-qemu-x86.sh`, und aus demselben Grund: ein Puffer voller Nullen ist
+# von einem NIE BESCHRIEBENEN Puffer nicht zu unterscheiden. Der Unterschied hier ist, WER liest --
+# nicht der Kernel, sondern ein geladenes Userland-Programm. Geprueft wird die Magie trotzdem vom
+# Kernel: er hat die DMA-Region ausgegeben und kennt den erwarteten Inhalt. Der Treiber meldet nur,
+# dass seine Transaktion durchlief. Zwei Quellen, keine davon allein ausreichend.
+BLK_IMG="$(mktemp)"
+BLK_SECTORS=32768
+# Seit A-6.2/A-6.3 eine **echte GPT mit zwei Partitionen**, gebaut von `tools/mkgpt.py`:
+#   Partition 1 (34..20000): ein lesbares FAT16 mit HELLO.TXT (A-6.3)
+#   Partition 2 (20001..):   roh, traegt die Magie (`MAGIC_LBA`)
+# Getrennt, weil die Magie sonst auf dem FAT-Bootsektor laege.
+#
+# **Selbst gebaut statt `sgdisk`/`parted` aufgerufen**, und das ist kein Eigensinn: eine Suite, die
+# an einem Fremdwerkzeug haengt, faellt auf einem Rechner ohne dieses Werkzeug als "Test rot" aus
+# statt als "Aufbau unvollstaendig" -- eine Verwechslung, die dieses Projekt schon mehrfach
+# bezahlt hat. Und nur mit einem eigenen Werkzeug laesst sich der Negativfall herstellen
+# (`--break`), gegen den der Parser abgenommen wird.
+BLK_PART1_LBA=34
+BLK_PART1_SECTORS=19967
+python3 tools/mkgpt.py "$BLK_IMG" --sectors "$BLK_SECTORS" \
+    --part "$BLK_PART1_LBA:20000" --part 20001:32700 --magic-at 20001 \
+    --fat16 "$BLK_PART1_LBA:20000" --file "HELLO.TXT=SEL4LAKE-DATEIINHALT" \
+    || { echo "  FEHLER: GPT-Abbild liess sich nicht bauen"; exit 2; }
 
 # --- Das Boot-Image: Kernel + EINE Datei ---------------------------------------------------------
 #
-# Eintrag 1 = init (TrustedSAS, Root-Task, Loader- + Notification-Cap)
-# Eintrag 2 = hello (UserLand) -- das, was init von sich aus nachlaedt.
-build_archive() {   # $1 = Ausgabedatei, $2 = Kernel-ELF fuer die Bindung, $3 = manifest-version
+# Eintrag 1 = init       (TrustedSAS, Root-Task, Loader- + Notification-Cap)
+# Eintrag 2 = hello      (UserLand) -- das, was init von sich aus nachlaedt.
+# Eintrag 3 = virtio-blk (HardwareLand, A-5.1) -- der erste TREIBER als geladenes Programm.
+#
+# Sein Manifest-Eintrag ist die eigentliche Aussage: `mmio,dma` heisst "diese Komponente darf ein
+# Registerfenster und eine DMA-Region halten". WELCHES Geraet das ist, steht nicht da -- die
+# Instanz teilt der Kernel-Glue zu (das Manifest legt die Art der Autoritaet fest, nicht die
+# Instanz). `ntfn` ist sein Meldekanal; ohne den koennte er nichts berichten, und ein Treiber, von
+# dem man nichts hoert, ist von einem nicht gestarteten nicht zu unterscheiden.
+#
+# HardwareLand braucht KEIN Zertifikat: das Gate (ADR 0014) gilt fuer TrustedSAS, weil dort
+# Vertrauen die Autoritaet traegt. Hier traegt sie die Cap.
+build_archive() {   # $1 = Ausgabedatei, $2 = Kernel-ELF, $3 = manifest-version, $4 = Geraete-Selektor
+    # $4 ist der A-5.3-Selektor der Treiber-PD. Vorgabe: das Blockgeraet. Die Negativfaelle unten
+    # setzen ihn auf etwas Unerfuellbares bzw. auf die Netzkarte -- und brauchen dafuer das VOLLE
+    # Archiv, sonst erreicht der Lauf den Bericht gar nicht und die Aussage waere ein Timeout.
+    local sel="${4:-vendor=1af4,device=1042}"
     python3 tools/sign_manifest.py --kernel "$2" --key "$MANKEY" --manifest-version "$3" \
         --out build/system.manifest \
         --entry "1:init:0:1:$PROG/init.elf:loader,ntfn:root:3::any:0" \
-        --entry "2:hello:2:1:$PROG/hello.elf:ntfn::1::any:0" >/dev/null 2>&1 || return 1
+        --entry "2:hello:2:1:$PROG/hello.elf:ntfn::1::any:0" \
+        --entry "3:virtio-blk:1:1:$PROG/virtio-blk.elf:mmio,dma,ntfn,ep::2::any:0:$sel" \
+        --entry "4:fs:0:1:$PROG/fs.elf:ntfn,ep::2::any:0::3" \
+        --entry "5:virtio-net:1:1:$PROG/virtio-net.elf:mmio,dma,ntfn,ep::2::any:0:vendor=1af4,device=1041" \
+        >/dev/null 2>&1 || return 1
     python3 tools/mkarchive.py "$1" --system-manifest build/system.manifest \
         "1:init:0:1:$PROG/init.elf::certs/init-x86.cert" \
-        "2:hello:2:1:$PROG/hello.elf" >/dev/null 2>&1
+        "2:hello:2:1:$PROG/hello.elf" \
+        "3:virtio-blk:1:1:$PROG/virtio-blk.elf" \
+        "4:fs:0:1:$PROG/fs.elf::certs/fs-x86.cert" \
+        "5:virtio-net:1:1:$PROG/virtio-net.elf" >/dev/null 2>&1
 }
 
 echo "== Boot-Archiv bauen =="
@@ -134,13 +190,30 @@ build_archive build/boot-archive-x86.bin "$KELF" 1 || { echo "  FEHLER: Archiv/M
 # nie (es gibt keinen Root-Task), er laeuft in den Watchdog. Die Zeilen, um die es geht, stehen
 # aber im ersten Boot-Abschnitt. Das volle Limit abzuwarten hiesse, dreimal auf einen Watchdog zu
 # warten, dessen Ausgang schon feststeht.
+# `disable-legacy=on,iommu_platform=on` am RNG ist kein Detail, sondern die Bedingung dafuer, dass
+# diese Suite ueberhaupt fertig werden kann.
+#
+# Ohne die Schalter ist `virtio-rng-pci` auf x86 *transitional* und bietet
+# `VIRTIO_F_ACCESS_PLATFORM` nicht an. Der Treiber bricht dann ab -- richtig so, denn ein Geraet
+# ohne dieses Bit greift an der IOMMU vorbei, und ein Rueckfall auf physische Adressen waere
+# genau die Achsenverwechslung, gegen die `Pa`/`Iova` getrennt sind. Nur: `virtio` steht in
+# `all_done()`, also wurde der Lauf nie fertig, lief in den Watchdog und `SELFTEST COMPLETE` blieb
+# aus. Das sah wie ein Haenger aus und war eine Geraetekonfiguration.
+#
+# Die Zeile stammt aus der Zeit vor der `virtio`-Pruefung (2026-08-01); `test-qemu-x86.sh` bekam
+# die Schalter damals, diese Suite nicht. Zwei Suiten, die dasselbe Geraet verschieden aufsetzen,
+# sind ein Riss, durch den genau so etwas faellt.
 boot() {
     local extra=()
     [ -n "$1" ] && extra=(-initrd "$1")
     timeout "${3:-$SECONDS_RUN}" qemu-system-x86_64 \
         -kernel "$KELF.mb32" -m "$RAM" -smp 4 "${ACCEL[@]}" \
         -machine q35,kernel-irqchip=split -device intel-iommu,caching-mode=on \
-        -device virtio-rng-pci "${extra[@]}" \
+        -device virtio-rng-pci,disable-legacy=on,iommu_platform=on \
+        -drive if=none,id=blk0,format=raw,file="$BLK_IMG" \
+        -device virtio-blk-pci,drive=blk0,disable-legacy=on,iommu_platform=on \
+        -device virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on \
+        -netdev user,id=n0,restrict=on "${extra[@]}" \
         -nographic -serial file:"$2" -no-reboot \
         </dev/null >/dev/null 2>&1 || true
 }
@@ -151,9 +224,9 @@ boot build/boot-archive-x86.bin "$LOG"
 OUT="$(grep -vE "SeaBIOS|iPXE|Press Ctrl|Booting from|C900|PMM|PnP" "$LOG" 2>/dev/null)"
 if [ -z "$OUT" ]; then
     echo "== KEIN OUTPUT -- das ist KEIN Testergebnis, sondern ein Aufbauproblem (QEMU? Zeitlimit?) =="
-    rm -f "$LOG"; exit 2
+    rm -f "$LOG" "$BLK_IMG"; exit 2
 fi
-echo "$OUT" | grep -E "^(mbi|mbmod|archive|manifest|root) " || true
+echo "$OUT" | grep -E "^(mbi|mbmod|archive|manifest|root|devassign|devsel|dmaiso|drv|blkdev|part|fs|bootckpt) *:" || true
 
 echo "== checks =="
 fail=0
@@ -162,8 +235,11 @@ check "mbi     : 1 Modul(e)" \
     "A-1.1: der Bootloader liefert die Startmenge als Multiboot-Modul (Flag Bit 3 ausgewertet)"
 check "mbmod   : ALL PASS" \
     "A-1.1: Modulbereiche werden VOR der ersten Allokation aus der Freiliste ausgeschnitten (Rand/Ueberlappung/unsortiert/Vollabdeckung eingespeist)"
-check "archive : 2 Modul(e)" \
-    "A-1.1/A-1.5: das Archiv liegt an der vom Bootloader gemeldeten Adresse und parst"
+# Die ZAHL steht hier, nicht bloss "das Archiv parst": ein Archiv, aus dem beim Bauen still ein
+# Modul herausfiel, parst genauso gut -- und der Treiber-Test darunter saehe dann aus wie ein
+# Treiberfehler statt wie ein fehlendes Modul.
+check "archive : 5 Modul(e)" \
+    "A-1.1/A-1.5: das Archiv liegt an der vom Bootloader gemeldeten Adresse und parst (init + hello + virtio-blk + fs)"
 check "manifest: ALL PASS" \
     "A-1.2..A-1.4: System-Manifest -- signiert ueber die GESAMTE Nachricht, an DIESES Kernel-Image gebunden, Anti-Downgrade, manipulierte Kopie wird abgewiesen"
 check "manifest:   \[1\]init .* ROOT" \
@@ -178,7 +254,278 @@ check "root    : ALL PASS (Startprogramm" \
     "A-2.1: Root-Task aus dem Manifest geladen (Hash geprueft, Wurzel-Caps endowt)"
 check "cdelete : ALL PASS" \
     "A-3.1: SYS_CDELETE aus Ring 3 -- beide Ausgaenge belegt (geloescht + Autoritaet weg; mit Ableitungen abgewiesen und weiter benutzbar)"
+# A-5.1: der erste Treiber, der nicht im Kern laeuft.
+check "drv     : ALL PASS" \
+    "A-5.1: ein Treiber als DIENST ausserhalb des Kerns -- eigene Konfigurationsraum-Seite aufgeloest, virtio-Handshake, Sektoren per Bus-Master-DMA auf Anfrage. Der Kernel hat enumeriert, zugeteilt und den Empfaenger ausgetauscht, ohne einen virtio-Schritt auszufuehren"
+check "dmaiso  : ALL PASS" \
+    "A-5.4: das Geraet der EINEN Treiber-PD erreicht die DMA-Region der ANDEREN nicht. Die Aussage haengt an VIER Zahlen, und keine reicht allein: die Positivkontrolle laeuft ueber denselben Treiber, dasselbe Geraet und dieselbe Deskriptorkette (nur EINE Adresse wandert); der Fremdversuch liefert keine Daten; das Opfer ist unberuehrt, und zwar vom KERNEL nachgeprueft statt vom Angreifer gemeldet; und ein VT-d-Fault belegt AKTIV, dass geblockt wurde -- ohne ihn waere 'keine Antwort' auch mit einem stummen Gegenueber vereinbar"
+check "devsel  : ALL PASS" \
+    "A-5.3: das MANIFEST sagt, welches Geraet die Treiber-PD bekommt -- nicht die Fundreihenfolge des Enumerators. Der Lauf bietet ZWEI Geraete an (virtio-blk und virtio-net); ohne die zweite waere die Zeile eine Aussage ueber nichts, denn bei einem einzigen trifft jeder Selektor dieselbe Wahl. Geprueft wird deshalb auch, dass die nicht gewaehlte Alternative LIEGEN BLIEB"
+# Die Einzelaussagen werden HIER noch einmal gelesen, nicht nur das Sammelurteil. Sie sind
+# verschieden, und ein Sammel-PASS verdeckte, welche davon traegt:
+#
+#   1. der Dienst BEDIENT (Anfrage 1 an v1 mit Status 0),
+#   2. der Empfaenger wurde OHNE LUECKE ausgetauscht (A-4.1 am echten Dienst, nicht am lokalen
+#      Objekt -- dort war der ueberlappende Fall bisher nur konstruiert erreichbar),
+#   3. die neue Fassung erbt die REGION (Bedienungszaehler 1 -> 2, nicht 1 -> 1).
+if echo "$OUT" | grep -q "drv     : Anfrage 1 an v1: Status=0 "; then
+    echo "  PASS: A-5.1: der Treiber-DIENST beantwortet eine Anfrage -- der Kernel ist Client, nicht Treiber (Richtungsumkehr)"
+else
+    echo "  FAIL: A-5.1: die erste Anfrage an den Dienst kam nicht durch:"
+    echo "$OUT" | grep -m1 "drv     : Anfrage 1" | sed 's/^/          /'
+    fail=1
+fi
+if echo "$OUT" | grep -q "drv     : Austausch: Ergebnis=0 .*v1 meldete bereit=1 v2 meldete bereit=1"; then
+    echo "  PASS: A-5.1/A-4.1: der Dienst wurde am LAUFENDEN Endpoint ausgetauscht, und der Endpoint hatte zu keinem Zeitpunkt null Empfaenger; beide Fassungen haben sich gemeldet"
+else
+    echo "  FAIL: A-5.1/A-4.1: der Austausch lief nicht sauber:"
+    echo "$OUT" | grep -m1 "drv     : Austausch" | sed 's/^/          /'
+    fail=1
+fi
+if echo "$OUT" | grep -q "drv     : Anfrage 2 an v2: Status=0 "; then
+    echo "  PASS: A-5.1: die NEUE Fassung bedient weiter und hat die DMA-Region geerbt (Zaehler 1 -> 2) -- ein Austausch, kein Neustart"
+else
+    echo "  FAIL: A-5.1: die neue Fassung bediente nicht oder bekam eine frische Region:"
+    echo "$OUT" | grep -m1 "drv     : Anfrage 2" | sed 's/^/          /'
+    fail=1
+fi
+# A-6.1: das Dienstprotokoll ueber dem Treiber.
+check "blkdev  : ALL PASS" \
+    "A-6.1: der Blockdienst traegt -- Auskunft (Kapazitaet/Sektorgroesse), Lesen, SCHREIBEN, Flush, und ein Sektor jenseits der Platte wird ABGEWIESEN statt ans Geraet durchgereicht"
+# Der Rueckleseschritt einzeln, weil er die eigentliche Aussage traegt: eine quittierte
+# Schreibanfrage ist eine Quittung, keine Daten. Faellt nur er aus, ist das ein Befund am
+# Schreibpfad -- und kein Sammel-FAIL, dem man nicht ansieht, welcher Schritt riss.
+if echo "$OUT" | grep -q "blkdev  : .*Rueckgelesen=0x454b414c344c4553 (erwartet 0x454b414c344c4553)"; then
+    echo "  PASS: A-6.1: geschrieben und ZURUECKGELESEN -- die Daten stehen wirklich auf der Platte, nicht bloss in einer Quittung"
+else
+    echo "  FAIL: A-6.1: das Zurueckgelesene passt nicht zum Geschriebenen:"
+    echo "$OUT" | grep -m1 "blkdev  : INFO" | sed 's/^/          /'
+    fail=1
+fi
+# A-6.2: die Partitionstabelle -- gelesen im Blockdienst, nicht im Kern.
+check "part    : ALL PASS" \
+    "A-6.2: GPT im BLOCKDIENST gelesen (sel4lake-part: abhaengigkeitsfrei, forbid(unsafe_code), host-getestet). Beide Pruefsummen geprueft; die Eintragsliste passt nicht in eine Anfrage und wird stueckweise gelesen, die Pruefsumme aber ueber das GANZE gebildet"
+if echo "$OUT" | grep -q "part    : .*erste Partition LBA $BLK_PART1_LBA ueber $BLK_PART1_SECTORS Sektoren"; then
+    echo "  PASS: A-6.2: die gemeldete erste Partition passt zu der, die diese Suite ins Abbild geschrieben hat (LBA $BLK_PART1_LBA, $BLK_PART1_SECTORS Sektoren)"
+else
+    echo "  FAIL: A-6.2: die gemeldete Partition passt nicht zum Abbild:"
+    echo "$OUT" | grep -m1 "part    : GPT-Scan" | sed 's/^/          /'
+    fail=1
+fi
+# A-6.3: das Dateisystem -- eine EIGENE PD, die kein Geraet faehrt.
+check "fs      : ALL PASS" \
+    "A-6.3: ein lesendes Dateisystem als eigene PD -- sie ruft den Blockdienst ueber dessen Kanal und liest die Bytes aus der geteilten Uebertragungsflaeche. GPT (sel4lake-part) und FAT16 (sel4lake-fat) sind kernfrei und forbid(unsafe_code); der Kern kennt weder Partitionen noch Dateien"
+# Der Inhalt einzeln, weil er die eigentliche Aussage traegt: eine gefundene Datei ist noch keine
+# gelesene. Groesse UND erste Bytes muessen zu dem passen, was `tools/mkgpt.py --file` hineinlegt.
+if echo "$OUT" | grep -q "fs      : Status=0 .*Groesse=20 erste acht Byte=0x454b414c344c4553"; then
+    echo "  PASS: A-6.3: die Datei wurde nicht bloss GEFUNDEN, sondern GELESEN -- Groesse und Inhalt passen zu dem, was diese Suite ins Dateisystem geschrieben hat"
+else
+    echo "  FAIL: A-6.3: Groesse oder Inhalt der gelesenen Datei passen nicht:"
+    echo "$OUT" | grep -m1 "fs      : Status" | sed 's/^/          /'
+    fail=1
+fi
+# A-6.4: **die zweite, unabhaengige Quelle.** Der Kernel meldet, dass die PD geschrieben und
+# zurueckgelesen hat -- eine Aussage des Codes ueber sich selbst. Hier liest ein Werkzeug in einer
+# ANDEREN Sprache dasselbe Abbild und sagt, ob wirklich auf der Platte steht, was behauptet wird.
+# Es prueft zusaetzlich, was die PD gar nicht sehen kann: dass BEIDE FAT-Kopien dieselbe Kette
+# tragen. Nur die erste fortzuschreiben ist der haeufigste Schreibfehler ueberhaupt.
+if python3 tools/checkfat.py "$BLK_IMG" --part-lba "$BLK_PART1_LBA" --file HELLO.TXT \
+        --expect-size 700 > "$LOG.fat" 2>&1; then
+    echo "  PASS: A-6.4: $(cat "$LOG.fat") -- unabhaengig vom Kernel am Abbild nachgelesen"
+else
+    echo "  FAIL: A-6.4: das Abbild traegt nicht, was der Kernel meldet:"
+    sed 's/^/          /' "$LOG.fat"
+    fail=1
+fi
+rm -f "$LOG.fat"
 check "SELFTEST COMPLETE" "sauberes system_off statt Timeout"
+
+# --- Z4 Stufe 2: ein Thread ueber die BOOTGRENZE -------------------------------------------------
+#
+# **Die Maschinengrenze ist hier die Zeit.** Diese Suite bootet mehrfach mit DEMSELBEN `$BLK_IMG`;
+# was ein Lauf auf die Platte schreibt, findet der naechste dort vor. Alles im RAM ist dazwischen
+# weg -- genau das macht die Aussage zu einer ueber einen Checkpoint und nicht ueber eine Variable.
+#
+# Die eine Aussage: **der Zaehler im naechsten Lauf startet bei dem Wert aus dem vorigen, nicht
+# bei 0.** Alles andere hier ist das, was noetig ist, damit diese Aussage etwas belegt.
+#
+# ## Warum DREI Laeufe und nicht zwei
+#
+# Gemessen (2026-08-02, KVM): derselbe Kernel erreicht an derselben Stelle des Hochlaufs 133, 148
+# und 151 Worker-Runden -- eine Streuung von rund 18. In einem Mutationslauf, in dem der Kernel den
+# gefundenen Wert LAS und MELDETE, ihn aber nicht in den Thread schrieb, traf sein eigener Zaehler
+# den gespeicherten Wert **exakt** (151 gegen 151) -- und die Suite blieb gruen. Der Zaehler ist
+# also gerade NICHT „bei jedem Lauf woanders"; unter KVM ist der Hochlauf reproduzierbar.
+#
+# Deshalb waechst der Zustand ueber die Kette: jeder Lauf laesst den wiederhergestellten Thread
+# noch mindestens 100 Runden arbeiten (`CKPT_MIN_DELTA`) und speichert erst dann. Ab dem ZWEITEN
+# Glied liegt der gespeicherte Wert damit strukturell ausserhalb dessen, was ein Lauf ohne
+# Wiederherstellung erreicht -- und erst im DRITTEN Lauf ist „geerbt oder selbst gezaehlt?"
+# entscheidbar. Lauf 2 allein waere genau die Zeile, die im Mutationslauf gruen blieb.
+CKPT_SECTOR=32710   # muss zu `CKPT_SECTOR` in kernel/src/arch/x86_64/bringup.rs passen
+
+# Ein Feld aus einer `bootckpt:`-Zeile ziehen: $1 = Ausgabe, $2 = Zeilenart, $3 = Feldname.
+ck() { echo "$1" | sed -n "s/^bootckpt: $2 .*[ (]$3=\([0-9a-fx]\{1,\}\).*/\1/p" | head -1; }
+
+# 1. Die Verweigerungsregel (Z4b) laeuft in JEDEM Lauf mit -- sie haengt nicht daran, ob gerade
+#    gespeichert oder wiederhergestellt wird. Geprueft wird der GRUND, nicht bloss, dass es einen
+#    gab: Grund 5 (Partner nicht im Umfang) waere durch einen groesseren Umfang behebbar und
+#    belegte die Regel deshalb nicht. Der Kanal der Treiber-PD liegt darum ausdruecklich IM
+#    Umfang; was uebrigbleibt, ist Geraete-Autoritaet (1=MMIO-Fenster, 2=IRQ, 3=DMA-Region).
+if echo "$OUT" | grep -qE "^bootckpt: Verweigerung: .* Grund (1|2|3) "; then
+    echo "  PASS: Z4b: eine nicht uebertragbare Cap im Umfang verhindert das SPEICHERN -- die Treiber-PD haelt Geraete-Autoritaet, und die kann auf der Zielmaschine nichts bezeichnen. Der Grund ist EINZELN (Geraetefenster/IRQ/DMA), nicht ein Sammel-Nein, und er ist durch keinen groesseren Umfang behebbar"
+else
+    echo "  FAIL: Z4b: die Treiber-PD wurde nicht mit einem GERAETE-Grund abgewiesen:"
+    echo "$OUT" | grep -m1 "^bootckpt: Verweigerung" | sed 's/^/          /'
+    fail=1
+fi
+
+# 2. Lauf 1 ist der KALTSTART: kein Checkpoint auf der Platte -> speichern, Epoche 1. Bis zum
+#    Flush, denn ohne Flush ist „geschrieben" eine Aussage ueber einen Puffer -- und ueber eine
+#    Bootgrenze ist genau das der Unterschied.
+check "^bootckpt: ALL PASS" \
+    "Z4 Stufe 2: Lauf 1 (Kaltstart) hat einen Thread eingefroren und seinen Zustand geschrieben"
+P1="$(ck "$OUT" gespeichert Fortschritt)"
+N1="$(ck "$OUT" gespeichert Nonce)"
+E1="$(ck "$OUT" gespeichert Epoche)"
+if [ -n "$P1" ] && [ "$P1" != 0 ] && [ -n "$N1" ] && [ "$N1" != "0x0000000000000000" ] && [ "$E1" = 1 ]; then
+    echo "  PASS: Z4a am echten Gegenstand: Lauf 1 speicherte Fortschritt=$P1 Nonce=$N1 als Epoche 1 (am EINGEFRORENEN Thread gelesen -- ein Wert, der waehrend des Lesens weiterlaeuft, gehoert zu keinem Zeitpunkt)"
+else
+    echo "  FAIL: Z4 Stufe 2: Lauf 1 hat nichts Brauchbares gespeichert (Fortschritt=$P1 Nonce=$N1 Epoche=$E1):"
+    echo "$OUT" | grep -m1 "^bootckpt: gespeichert" | sed 's/^/          /'
+    fail=1
+fi
+
+echo "== Z4 Stufe 2: zweiter Boot auf DERSELBEN Platte =="
+LOG2="$(mktemp)"
+boot build/boot-archive-x86.bin "$LOG2"
+OUT2="$(grep -vE "SeaBIOS|iPXE|Press Ctrl|Booting from|C900|PMM|PnP" "$LOG2" 2>/dev/null)"
+echo "$OUT2" | grep -E "^bootckpt" || true
+[ -z "$OUT2" ] && { echo "  FAIL: der zweite Boot lieferte keine Ausgabe -- Aufbauproblem, kein Testergebnis"; fail=1; }
+R2P="$(ck "$OUT2" wiederhergestellt Fortschritt)"
+R2N="$(ck "$OUT2" wiederhergestellt Nonce)"
+R2E="$(ck "$OUT2" wiederhergestellt Epoche)"
+R2NACH="$(ck "$OUT2" wiederhergestellt Zaehler-danach)"
+S2P="$(ck "$OUT2" gespeichert Fortschritt)"
+S2N="$(ck "$OUT2" gespeichert Nonce)"
+S2E="$(ck "$OUT2" gespeichert Epoche)"
+# **`Zaehler-danach` gehoert ausdruecklich dazu.** Ohne dieses Feld belegte der Vergleich nur, dass
+# der Checkpoint richtig GELESEN wurde -- ein Kernel, der ihn liest, ausgibt und den Thread dann
+# bei seinem eigenen Wert weiterlaufen laesst, kaeme damit durch. Genau das ist gemessen worden.
+if [ "$R2P" = "$P1" ] && [ "$R2N" = "$N1" ] && [ "$R2E" = 1 ] && [ "$R2NACH" = "$P1" ]; then
+    echo "  PASS: Z4 Stufe 2: Lauf 2 fand den Checkpoint aus Lauf 1 (Fortschritt=$P1, Nonce=$N1, Epoche 1) und schrieb ihn in den Thread (Zaehler-danach=$R2NACH). Die Nonce traegt die Beweislast fuer die HERKUNFT: sie ist der Zyklenzaehler von Lauf 1 und kann kein Rest im Puffer sein"
+else
+    echo "  FAIL: Z4 Stufe 2: Lauf 2 fand den Zustand aus Lauf 1 nicht (erwartet Fortschritt=$P1 Nonce=$N1 Epoche=1 Zaehler-danach=$P1; bekam $R2P / $R2N / $R2E / $R2NACH)"
+    fail=1
+fi
+# Die Kette WAECHST -- das ist der Unterschied zwischen „wiederhergestellt" und „neu angelegt".
+if [ "$S2E" = 2 ] && [ -n "$S2P" ] && [ -n "$P1" ] && [ "$S2P" -gt "$P1" ] 2>/dev/null; then
+    echo "  PASS: Z4 Stufe 2: Lauf 2 schrieb selbst wieder einen Checkpoint -- Epoche 2, Fortschritt $S2P > $P1. Der Zustand WAECHST ueber die Bootgrenze hinweg, statt in jedem Lauf neu zu entstehen"
+else
+    echo "  FAIL: Z4 Stufe 2: die Kette waechst nicht (Epoche=$S2E Fortschritt=$S2P gegen $P1)"; fail=1
+fi
+if echo "$OUT2" | grep -q "^bootckpt: ALL PASS"; then
+    echo "  PASS: Z4 Stufe 2: der wiederhergestellte Thread lief danach weiter und kam um mindestens 100 Runden voran -- ein Wiederherstellen, das den Thread kaputtmacht, waere sonst von einem korrekten nicht zu unterscheiden"
+else
+    echo "  FAIL: Z4 Stufe 2: der zweite Lauf meldet keinen sauberen Checkpoint-Ausgang:"
+    echo "$OUT2" | grep -m3 "^bootckpt" | sed 's/^/          /'; fail=1
+fi
+grep -q "SELFTEST COMPLETE" "$LOG2" \
+    && echo "  PASS: der zweite Boot laeuft sauber durch (system_off, kein Watchdog)" \
+    || { echo "  FAIL: der zweite Boot wurde nicht fertig"; fail=1; }
+
+echo "== Z4 Stufe 2: dritter Boot -- hier wird die Aussage ENTSCHEIDBAR =="
+LOG4="$(mktemp)"
+boot build/boot-archive-x86.bin "$LOG4"
+OUT4="$(grep -vE "SeaBIOS|iPXE|Press Ctrl|Booting from|C900|PMM|PnP" "$LOG4" 2>/dev/null)"
+echo "$OUT4" | grep -E "^bootckpt" || true
+R3P="$(ck "$OUT4" wiederhergestellt Fortschritt)"
+R3N="$(ck "$OUT4" wiederhergestellt Nonce)"
+R3E="$(ck "$OUT4" wiederhergestellt Epoche)"
+R3VOR="$(ck "$OUT4" wiederhergestellt Zaehler-vorher)"
+R3NACH="$(ck "$OUT4" wiederhergestellt Zaehler-danach)"
+S3E="$(ck "$OUT4" gespeichert Epoche)"
+# **Die Positivkontrolle:** war ueberhaupt etwas zu messen? `Zaehler-vorher` ist der Stand, den
+# DIESER Lauf ohne jede Wiederherstellung erreicht haette. Ist er gleich dem gefundenen Wert, ist
+# „gesetzt" von „nicht gesetzt" nicht zu unterscheiden -- dann hat der Test nichts gemessen, und
+# das ist kein bestandener Test. Erst der Zuwachs aus Lauf 2 trennt die beiden Zahlen.
+if [ -n "$R3VOR" ] && [ -n "$R3P" ] && [ "$R3VOR" != "$R3P" ]; then
+    echo "  PASS: Z4 Stufe 2 (Positivkontrolle): der eigene Stand dieses Laufs waere $R3VOR gewesen, der geerbte ist $R3P -- die beiden Zahlen sind TRENNBAR, also ist die naechste Aussage ueberhaupt eine Messung"
+else
+    echo "  FAIL: Z4 Stufe 2: NICHT MESSBAR -- eigener Stand ($R3VOR) und geerbter Wert ($R3P) sind gleich. Das ist kein bestandener Test, sondern ein Aufbau, in dem sich 'wiederhergestellt' und 'selbst gezaehlt' nicht unterscheiden lassen"
+    fail=1
+fi
+if [ "$R3P" = "$S2P" ] && [ "$R3N" = "$S2N" ] && [ "$R3E" = 2 ] && [ "$R3NACH" = "$S2P" ] && [ "$S3E" = 3 ]; then
+    echo "  PASS: Z4 Stufe 2 -- DIE AUSSAGE: der Thread in Lauf 3 startet bei $S2P, dem Wert aus Lauf 2, und nicht bei seinen eigenen $R3VOR. Drei Boots, drei Glieder (Epoche 1 -> 2 -> 3), jedes Glied traegt die Nonce seines Erzeugers"
+else
+    echo "  FAIL: Z4 Stufe 2: Lauf 3 uebernahm den Zustand aus Lauf 2 nicht (erwartet Fortschritt=$S2P Nonce=$S2N Epoche=2 Zaehler-danach=$S2P Folge-Epoche=3; bekam $R3P / $R3N / $R3E / $R3NACH / $S3E)"
+    fail=1
+fi
+echo "$OUT4" | grep -q "^bootckpt: ALL PASS" \
+    && echo "  PASS: Z4 Stufe 2: auch das dritte Glied ist sauber (eingefroren, gesetzt, weitergelaufen, neu geschrieben)" \
+    || { echo "  FAIL: Z4 Stufe 2: der dritte Lauf meldet keinen sauberen Ausgang"; fail=1; }
+
+# --- Negativfall Z4f: ein Checkpoint eines FREMDEN Kernel-Images ---------------------------------
+#
+# **Der wichtigste Fall des ganzen Strangs.** Ein Checkpoint gehoert an genau das Kernel-Image,
+# unter dem er entstand. Wandert er in eine Umgebung mit anderen Zusicherungen, merkt es sonst
+# niemand -- und das ist die teuerste Form von „es lief ja".
+#
+# Hergestellt wird er so, wie ein echter aussaehe: der Sektor bleibt STRUKTURELL HEIL, nur das
+# Hashfeld traegt einen anderen Wert, und die Pruefsumme wird neu gerechnet. Ein einfaches
+# Bytekippen waere der schwaechere Fall -- der faellt schon an der Pruefsumme durch, und dann
+# haette der Test „kaputte Bytes" gemessen statt „falsches Image".
+#
+# Die Pruefsumme rechnet hier `zlib.crc32` und im Kernel `checkpoint::crc32`. Zwei
+# Implementierungen in zwei Sprachen, dieselbe Zahl -- dieselbe Form wie `tools/checkfat.py`:
+# ein Schreiber, der sein eigenes Ergebnis bestaetigt, bestaetigt nichts.
+echo "== Negativfall Z4f: Checkpoint eines FREMDEN Kernel-Images =="
+if python3 - "$BLK_IMG" "$CKPT_SECTOR" <<'EOF'
+import struct, sys, zlib
+img, lba = sys.argv[1], int(sys.argv[2])
+with open(img, "r+b") as f:
+    f.seek(lba * 512)
+    s = bytearray(f.read(512))
+    if bytes(s[0:8]) != b"SL4KCKPT":
+        sys.exit("kein Checkpoint auf dem Sektor -- der Negativfall haette nichts zu veraendern")
+    body_len = struct.unpack_from("<I", s, 12)[0]
+    s[16] ^= 0xFF                      # ein Byte im KERNEL-HASH, sonst alles unveraendert
+    struct.pack_into("<I", s, 16 + body_len, zlib.crc32(bytes(s[:16 + body_len])) & 0xFFFFFFFF)
+    f.seek(lba * 512)
+    f.write(bytes(s))
+EOF
+then
+    LOG3="$(mktemp)"
+    boot build/boot-archive-x86.bin "$LOG3"
+    OUT3="$(grep -vE "SeaBIOS|iPXE|Press Ctrl|Booting from|C900|PMM|PnP" "$LOG3" 2>/dev/null)"
+    echo "$OUT3" | grep -E "^bootckpt" || true
+    if echo "$OUT3" | grep -q "^bootckpt: ABGEWIESEN .*Lesecode=7" \
+        && ! echo "$OUT3" | grep -q "^bootckpt: wiederhergestellt"; then
+        echo "  PASS: Z4f in klein -- ein STRUKTURELL HEILER Checkpoint eines anderen Kernel-Images wird ABGEWIESEN (Lesecode 7), nicht geladen. Die Pruefsumme stimmt, die Laengen stimmen, die Kennung stimmt: was allein nicht stimmt, ist die Bindung ans Image"
+    else
+        echo "  FAIL: Z4f -- ein fremd gebundener Checkpoint wurde nicht mit Lesecode 7 abgewiesen:"
+        echo "$OUT3" | grep -m3 "^bootckpt" | sed 's/^/          /'
+        fail=1
+    fi
+    # Und er darf den fremden Checkpoint weder ueberschrieben noch geladen haben: aus einer
+    # Abweisung wuerde sonst beim naechsten Lauf stillschweigend ein eigener Zustand.
+    if echo "$OUT3" | grep -q "^bootckpt: gespeichert"; then
+        echo "  FAIL: Z4f -- nach der Abweisung wurde trotzdem gespeichert; damit waere der fremde Zustand lautlos durch einen eigenen ersetzt"
+        fail=1
+    elif python3 -c "
+import sys
+d = open(sys.argv[1],'rb').read()[int(sys.argv[2])*512:][:512]
+sys.exit(0 if d[0:8] == b'SL4KCKPT' and d[16] != 0x00 else 1)" "$BLK_IMG" "$CKPT_SECTOR"; then
+        echo "  PASS: der abgewiesene Checkpoint blieb auf der Platte UNVERAENDERT -- ein Kernel, der ihn ueberschriebe, machte aus einem fremden Zustand lautlos einen eigenen"
+    else
+        echo "  FAIL: der abgewiesene Checkpoint wurde ueberschrieben"; fail=1
+    fi
+    rm -f "$LOG3"
+else
+    echo "  FAIL: der Negativfall liess sich nicht herstellen (kein Checkpoint auf Sektor $CKPT_SECTOR)"
+    fail=1
+fi
+rm -f "$LOG2" "$LOG4"
 
 # --- Negativfaelle ------------------------------------------------------------------------------
 #
@@ -229,6 +576,53 @@ else
     echo "  FAIL: A-1.2 -- abweichender Modul-Hash wurde nicht bemerkt"; fail=1
 fi
 
+echo "== Negativfall 4 (A-5.3): der Selektor passt auf KEIN vorhandenes Geraet =="
+# **Der wichtigste der vier.** Die bequeme Zeile im Kernel waere "nichts passt -> nimm irgendeins",
+# und sie waere unsichtbar: der Treiber liefe, der Bericht saehe gruen aus, und die Zuteilung
+# folgte wieder der Fundreihenfolge statt dem Manifest. Genau diese Zeile gibt es nicht -- und der
+# Beleg dafuer ist, dass ein unerfuellbarer Selektor gar keine Zuteilung ergibt.
+#
+# Der Lauf braucht das VOLLE Archiv und das volle Zeitlimit: die Zuteilung passiert erst, wenn
+# `init` laeuft, und die Meldung steht im Abschlussbericht. Ein kurzer Lauf haette hier ein
+# Timeout gemessen und es fuer ein Ergebnis gehalten.
+if build_archive build/boot-archive-nodev.bin "$KELF" 1 "vendor=dead,device=beef"; then
+    boot build/boot-archive-nodev.bin "$LOG"
+    # Entscheidend ist, dass Eintrag 3 GAR NICHT auftaucht: `devsel` druckt je Zuteilung eine
+    # Zeile, und ohne Zuteilung gibt es keine. Der zweite Treiber (Eintrag 5) bekommt sein Geraet
+    # weiterhin -- das ist die Gegenprobe im selben Lauf: der unerfuellbare Selektor trifft GENAU
+    # den Eintrag, der ihn traegt, und nicht die Zuteilung als Ganzes.
+    if ! grep -q "devsel  : Eintrag 3 verlangt" "$LOG" \
+        && grep -q "devsel  : Eintrag 5 verlangt" "$LOG" \
+        && grep -q "1 vergeben" "$LOG"; then
+        echo "  PASS: A-5.3 -- ein unerfuellbarer Selektor fuehrt fuer GENAU DIESEN Eintrag zu keiner Zuteilung; kein stiller Rueckfall auf 'irgendeins', und der zweite Treiber ist unbeeintraechtigt"
+    else
+        echo "  FAIL: A-5.3 -- auf einen unerfuellbaren Selektor hin wurde trotzdem ein Geraet vergeben (oder der zweite Treiber ging mit unter)"
+        grep -m2 "devsel  :" "$LOG" | sed 's/^/          /'
+        fail=1
+    fi
+else
+    echo "  FAIL: Negativfall 4 liess sich nicht bauen"; fail=1
+fi
+
+echo "== Negativfall 5 (A-5.3): der Selektor nennt das ANDERE Geraet =="
+# Belegt die Richtung, die Negativfall 4 nicht zeigen kann: der Selektor waehlt nicht nur AUS,
+# er waehlt das BENANNTE. Hier zeigt er auf die Netzkarte (1af4:1041) -- und der Treiber bekommt
+# sie, obwohl das Blockgeraet in der Angebotsliste VOR ihr steht. Ohne diesen Fall waere „es
+# passte" von „es war ohnehin das erste" nicht zu unterscheiden.
+if build_archive build/boot-archive-otherdev.bin "$KELF" 1 "vendor=1af4,device=1041"; then
+    boot build/boot-archive-otherdev.bin "$LOG"
+    if grep -q "devsel  : Eintrag 3 verlangt 1af4:1041, bekam RID 0x0020 1af4:1041" "$LOG"; then
+        echo "  PASS: A-5.3 -- der Selektor der BLOCK-Treiber-PD zeigt auf die Netzkarte, und sie bekommt die Netzkarte; das Blockgeraet steht in der Angebotsliste DAVOR und bleibt liegen. Ohne diesen Fall waere 'es passte' von 'es war ohnehin das erste' nicht zu unterscheiden"
+    else
+        echo "  FAIL: A-5.3 -- der Selektor benannte 1af4:1041, vergeben wurde etwas anderes (die Fundreihenfolge entscheidet weiterhin)"
+        grep -m2 "devsel  :" "$LOG" | sed 's/^/          /'
+        fail=1
+    fi
+else
+    echo "  FAIL: Negativfall 5 liess sich nicht bauen"; fail=1
+fi
+
 rm -f "$LOG"
+rm -f "$BLK_IMG"
 if [ "$fail" = 0 ]; then echo "== ALL PASS =="; else echo "== FAILURES =="; fi
 exit "$fail"

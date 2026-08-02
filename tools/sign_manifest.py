@@ -12,13 +12,20 @@ Signiert wird die **gesamte** Nachricht `[0..msg_len)`, also Kopf UND alle Eintr
 Aufruf:
   tools/sign_manifest.py --kernel <kernel.elf> --key keys/manifest-test.manifest.ed25519 \\
       --manifest-version 1 --out build/system.manifest \\
-      --entry ID:NAME:DOMAIN:IFACE:BLOB[:CAPS[:POLICY[:PRIO[:NUMA[:AFFINITY[:BUDGET_US]]]]]] ...
+      --entry ID:NAME:DOMAIN:IFACE:BLOB[:CAPS[:POLICY[:PRIO[:NUMA[:AFFINITY[:BUDGET_US[:DEVICE]]]]]]]
 
   DOMAIN   0=TrustedSAS 1=HardwareLand 2=UserLand
   BLOB     Pfad zum Modul -- daraus wird der erwartete SHA-256 berechnet
   CAPS     Komma-Liste aus: loader,pdctl,ntfn,ep,mmio,irq,dma   (leer = keine)
   POLICY   Komma-Liste aus: stripe,root,pinned,nohotreload      (leer = keine)
   AFFINITY Kern-Nummer oder 'any'
+  SERVICE  program_id des Dienstes, den dieser Client meint (A-5.4; 0 = nicht benannt).
+           Ohne diese Angabe bekaeme ein Client bei ZWEI Diensten "irgendeinen" -- eine Politik,
+           die niemand aufgeschrieben hat. Der Kernel weist dann ab, statt zu raten.
+  DEVICE   Geraete-Selektor (A-5.3), Komma-Liste aus vendor=HEX / device=HEX / class=HEX,
+           je optional, 'any' erlaubt. Leer = beliebiges Geraet. Benennt eine ART von Geraet,
+           NIE eine Instanz -- ein Manifest mit Bus/Geraet/Funktion waere auf der naechsten
+           Maschine stillschweigend falsch statt offensichtlich leer.
 """
 import argparse
 import hashlib
@@ -78,12 +85,64 @@ def bits(spec: str, table: dict, what: str) -> int:
     return v
 
 
+ANY16 = 0xFFFF
+ANY32 = 0xFFFF_FFFF
+
+
+def parse_device(spec: str):
+    """Den Geraete-Selektor eines Eintrags lesen (A-5.3).
+
+    Form: `vendor=1af4,device=1042,class=010000` -- Hex, jedes Feld einzeln weglassbar (dann
+    „beliebig"), `any` ausdruecklich erlaubt. Leer = gar keine Einschraenkung; dann bleiben die
+    reservierten Bytes **null**, und der Kernel liest das als „beliebig". Genau so verhaelt sich
+    auch jedes vor A-5.3 erzeugte Manifest -- die Erweiterung nimmt keinem alten Dokument etwas weg.
+
+    **Kein Bus/Geraet/Funktion.** Ein Manifest, das `00:04.0` naennte, waere an die Topologie EINER
+    Maschine gebunden und auf der naechsten stillschweigend falsch -- es zeigte dann auf ein
+    anderes Geraet, nicht auf keines.
+    """
+    if not spec:
+        return None
+    v, d, c = ANY16, ANY16, ANY32
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise SystemExit(
+                f"sign_manifest: ungueltiger Geraete-Selektor '{part}' "
+                "(erwartet vendor=HEX / device=HEX / class=HEX, je optional, 'any' erlaubt)"
+            )
+        k, _, val = part.partition("=")
+        k = k.strip()
+        val = val.strip()
+        if k == "vendor":
+            v = ANY16 if val == "any" else int(val, 16)
+        elif k == "device":
+            d = ANY16 if val == "any" else int(val, 16)
+        elif k == "class":
+            c = ANY32 if val == "any" else int(val, 16)
+        else:
+            raise SystemExit(
+                f"sign_manifest: unbekanntes Selektor-Feld '{k}' (bekannt: vendor, device, class)"
+            )
+    if not (0 <= v <= 0xFFFF and 0 <= d <= 0xFFFF and 0 <= c <= 0xFFFF_FFFF):
+        raise SystemExit(f"sign_manifest: Geraete-Selektor '{spec}' ausserhalb des Wertebereichs")
+    # Ein Selektor, der auf nichts einschraenkt, wird als „nicht gesetzt" abgelegt -- sonst
+    # stuenden im Manifest drei Sentinels, die dasselbe bedeuten wie Nullen, und ein Leser muesste
+    # beide Schreibweisen kennen.
+    if (v, d, c) == (ANY16, ANY16, ANY32):
+        return None
+    return (v, d, c)
+
+
 def parse_entry(spec: str):
     f = spec.split(":")
     if len(f) < 5:
         raise SystemExit(
             f"sign_manifest: ungueltiger --entry '{spec}' "
-            "(erwartet ID:NAME:DOMAIN:IFACE:BLOB[:CAPS[:POLICY[:PRIO[:NUMA[:AFFINITY[:BUDGET_US]]]]]])"
+            "(erwartet ID:NAME:DOMAIN:IFACE:BLOB[:CAPS[:POLICY[:PRIO[:NUMA[:AFFINITY"
+            "[:BUDGET_US[:DEVICE[:SERVICE]]]]]]]])"
         )
 
     def opt(i, default):
@@ -92,7 +151,21 @@ def parse_entry(spec: str):
     with open(f[4], "rb") as fh:
         blob = fh.read()
     affinity = opt(9, "any")
+    dev = parse_device(opt(11, ""))
+    if dev is not None and not bits(opt(5, ""), CAPS, "Cap") & (CAPS["mmio"] | CAPS["dma"]):
+        # Frueh und laut: ein Selektor an einem Eintrag ohne Geraete-Caps wird nie ausgewertet.
+        # Er saehe im Manifest aus wie eine Zuteilung und waere keine -- genau die Sorte
+        # stillschweigender Wirkungslosigkeit, die dieses Projekt schon mehrfach bezahlt hat.
+        raise SystemExit(
+            f"sign_manifest: Eintrag '{f[1]}' hat einen Geraete-Selektor, aber weder 'mmio' noch "
+            "'dma' in CAPS -- der Selektor wuerde nie ausgewertet"
+        )
+    # A-5.4: WELCHEN Dienst dieser Client meint (program_id des Anbieters). 0 = nicht benannt --
+    # zulaessig, solange es ohnehin nur einen gibt; bei mehreren weist der Kernel dann ab, statt
+    # zu raten.
     return {
+        "service": int(opt(12, "0")),
+        "device": dev,
         "program_id": int(f[0]),
         "name": f[1].encode()[:16],
         "domain": int(f[2]),
@@ -130,6 +203,12 @@ def build_message(kernel_hash: bytes, key_id: bytes, manifest_version: int, entr
         buf[b + 32:b + 64] = e["sha256"]
         struct.pack_into("<IIIII", buf, b + 64, e["policy"], e["numa"], e["affinity"],
                          e["prio"], e["budget"])
+        # A-5.3: 8 der 12 reservierten Bytes. `ENTRY_LEN` bleibt 96 -- das Format ist eingefroren,
+        # und ein bestehendes signiertes Manifest bleibt gueltig.
+        if e["device"] is not None:
+            v, d, c = e["device"]
+            struct.pack_into("<HHI", buf, b + 84, v, d, c)
+        struct.pack_into("<I", buf, b + 92, e["service"])
     return bytes(buf)
 
 

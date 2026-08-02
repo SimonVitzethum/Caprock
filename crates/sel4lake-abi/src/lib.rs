@@ -101,6 +101,12 @@ pub mod reg {
     pub const EP_BADGE: usize = 1;
     /// Erstes Nachrichten-Datenwort (`x2`); weitere folgen aufsteigend.
     pub const MSG0: usize = 2;
+    /// Zweites Nachrichten-Datenwort (`x3`).
+    pub const MSG1: usize = 3;
+    /// Drittes Nachrichten-Datenwort (`x4`).
+    pub const MSG2: usize = 4;
+    /// Viertes Nachrichten-Datenwort (`x5`).
+    pub const MSG3: usize = 5;
     /// Nachrichten-Tag/Label (`x6`).
     pub const TAG: usize = 6;
 }

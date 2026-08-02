@@ -4,8 +4,9 @@
 # Kani-Harness fehl (eine spätere Änderung bricht einen Beweis), schlägt die CI fehl -> bereits
 # bewiesene Eigenschaften können nicht unbeabsichtigt verloren gehen.
 #
-# Gitea Actions (GitHub-Actions-kompatibel). Läuft die Loader-Parser-Beweise (cert/archive/elf) über
-# tools/kani-verify.sh (eigenständige Crate-Kopie -> kein build-std-Zwang) und einen Host-Test-/
+# Gitea Actions (GitHub-Actions-kompatibel). Läuft **alle** Kani-Ziele über tools/kani-verify.sh
+# (loader, region, sync, unsafe-safety; eigenständige Crate-Kopie -> kein build-std-Zwang) und einen
+# Host-Test-/
 # Inert-Check (cfg(kani) darf den Normal-Build nicht brechen).
 
 name: kani-verification
@@ -13,7 +14,7 @@ on: [push, pull_request]
 
 jobs:
   kani:
-    name: Kani — Tier-1-Beweise (Loader-Parser)
+    name: Kani — Tier-1-Beweise (loader, region, sync, unsafe-safety)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,8 +50,17 @@ jobs:
           cp crates/sel4lake-loader/src/*.rs "$SA/src/"
           printf '[package]\nname="sel4lake-loader"\nversion="0.0.0"\nedition="2021"\n[workspace]\n[lib]\npath="src/lib.rs"\n' > "$SA/Cargo.toml"
           ( cd "$SA" && cargo test )
+          # `sel4lake-sync` traegt seit B-7.1/B-7.2 ZWEI externe cfgs (`kani` UND `loom`). Dass
+          # keines davon den Normalbau bricht, faengt der Kernel-Build zwar mit ab -- aber nicht
+          # als benannte Zusicherung, und ein Schutz, den niemand ausspricht, faellt beim naechsten
+          # Umbau unbemerkt weg.
+          SB="$RUNNER_TEMP/sync_host"
+          rm -rf "$SB"; mkdir -p "$SB/src"
+          cp crates/sel4lake-sync/src/*.rs "$SB/src/"
+          printf '[package]\nname="sel4lake-sync"\nversion="0.0.0"\nedition="2021"\n[workspace]\n[lib]\npath="src/lib.rs"\n[lints.rust]\nunexpected_cfgs = { level = "warn", check-cfg = [\'cfg(kani)\', \'cfg(loom)\'] }\n' > "$SB/Cargo.toml"
+          ( cd "$SB" && cargo build )
 
-      - name: Kani-Beweise ausführen (cert + archive + elf)
+      - name: Kani-Beweise ausführen (alle Ziele: loader, region, sync, unsafe-safety)
         run: bash tools/kani-verify.sh
 
       # --- Was Kani NICHT abdeckt, und warum hier trotzdem ein Schritt dafür steht ---------

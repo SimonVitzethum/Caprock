@@ -8,7 +8,14 @@ authors.workspace = true
 
 [dependencies]
 
-# `kani` ist ein externes cfg (Tier-1-Verifikation; nur unter `cargo kani` gesetzt, im Normalbuild
-# inert). Als erwartetes cfg deklarieren -> kein `unexpected_cfgs`-Warning (Rust >= 1.80).
+# `kani` und `loom` sind externe cfgs (Tier-1- bzw. Tier-2-Verifikation; nur unter `cargo kani`
+# bzw. `RUSTFLAGS="--cfg loom"` gesetzt, im Normalbuild inert). Als erwartete cfgs deklarieren
+# -> kein `unexpected_cfgs`-Warning (Rust >= 1.80).
+#
+# `loom` schaltet in `src/lib.rs` die Atomics auf `loom::sync::atomic` um, damit die
+# Nebenlaeufigkeits-Beweise am ECHTEN Lock-Code laufen statt an einer Kopie (B-7.2). Die
+# `loom`-Abhaengigkeit steht bewusst NICHT hier: der Beweis laeuft in einem eigenstaendigen
+# Crate in $TMPDIR (s. `tools/loom-verify.sh`), weil der Workspace auf ein Bare-Metal-Target
+# mit `build-std` festgelegt ist. Ein Host-only-Dependency hier waere im Kernel-Build im Weg.
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)'] }

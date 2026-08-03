@@ -1208,7 +1208,29 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       `ERR_BADCAP` getrennt — „kommt gleich wieder" ist etwas anderes als „gibt es nicht", und
       „gerade kein Platz" ist ein drittes.
 
-- [ ] **E-Rest 1: `iova_window_clear_of_msi` gibt im schwachen Zweig „in Ordnung" zurück, ohne
+- [ ] **E-Rest 1b: im SCHWACHEN Zweig teilen sich alle vier Kontexte EIN Fenster.** (2026-08-04,
+      beim Beheben von E-Rest 1 bemerkt, **nicht** behoben.) `slot_window` gibt dort jedem Slot
+      `[0, 512 GiB)`. Damit gilt die Zusicherung „zwei Kontexte vergeben nie dieselbe IOVA" nicht
+      — und genau darauf beruht die Bounds-Prüfung eines Treibers gegen den **eigenen** Kontext.
+      Der schwache Zweig ist ab ~512 GiB RAM erreichbar. Seit E-Rest 1 wird er wenigstens
+      **gemeldet** (`dmawin : FAILURES` statt stillem `msi_clear=1`), aber die Slot-Trennung
+      fehlt dort weiterhin.
+
+- [ ] **E-Rest 3b: der Allokator ist Best-Fit und weiß nichts von GiB 0.** (2026-08-04, beim
+      Beheben von E-Rest 3 gemessen, **nicht** gelöst — die Stelle liegt in `system.rs`.)
+      `alloc_dma_region` und isolierte PD-Regionen müssen unter 4 GiB liegen und versuchen es
+      **kein zweites Mal**. Bei `-m 3G` (unten 2032 MiB, oben 1024 MiB) wählt Best-Fit den oberen
+      Bereich → gemessen `dmawin`/`dmatok : FAILURES`, `iso : spawn_isolated fehlgeschlagen`,
+      während 4G und 6G **zufällig** grün waren. Genau die Sorte Zufall, die eine Messung
+      wertlos macht.
+      Behelf steht fail-closed: hohes RAM geht nur in die Freiliste, wenn es **größer** ist als
+      der kleinste untere Bereich; sonst bleibt es abgebildet und unvergeben, und die `mem`-Zeile
+      sagt das. **Folge:** der nutzbare Speicher für DMA-Regionen und isolierte PDs ist weiterhin
+      auf **1 GiB** gedeckelt — für das Zielbild (Cloud-Knoten, viele tausend Prozesse) der
+      härtere Deckel als die alte 4-GiB-Karte. Richtig wäre eine Freiliste, die den Zonenwunsch
+      kennt, statt einer, die ihn errät.
+
+- [x] **E-Rest 1 BEHOBEN am 2026-08-04: `iova_window_clear_of_msi` gibt im schwachen Zweig „in Ordnung" zurück, ohne
       urteilen zu können.** (2026-08-03, gemessen) `kernel/src/system.rs:3900`:
 
           let Some(first) = strong_window_base() else {
@@ -1230,7 +1252,7 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       „starkes Fenster ja/nein" ist erfasst und wird nicht verwendet — kein Bericht, kein
       Audit-Code.
 
-- [ ] **E-Rest 2: RMRR färbt das Gerät, nicht die Gruppe.** (2026-08-03, gemessen)
+- [x] **E-Rest 2 BEHOBEN am 2026-08-04: RMRR färbt die Gruppe.** (2026-08-03, gemessen)
       `GroupSpansUnits` färbt die ganze ACS-Gruppe, `Rmrr` nur die einzelne Funktion. Gemessen
       mit einem Sonderharness gegen den unveränderten `dmar.rs`: zwei Funktionen ohne ACS in
       einer Gruppe, RMRR auf 05.1 → `excluded[0] = None`, Aliasmenge `[0x28, 0x29]`,
@@ -1238,7 +1260,7 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       in dessen Domäne. **Auf q35 unsichtbar (0 RMRRs), auf echter Hardware der Normalfall** —
       also genau die Sorte Lücke, die eine Emulation nie zeigt.
 
-- [ ] **E-Rest 3: der Zweig „RAM oberhalb 4 GiB" ist heute nicht ausführbar.** (2026-08-03)
+- [x] **E-Rest 3 BEHOBEN am 2026-08-04: der Kernel bootet mit RAM über 4 GiB (3G/4G/6G gemessen), und der Zweig der Fensterwahl trägt.** (2026-08-03)
       Ab `-m 3G` stirbt der Boot mit `#PF`, `cr2 = 0x0000_0070_0000_0014`, `rip` →
       `Transport::status` (`0x14` = `DEVICE_STATUS`). Sobald QEMU Speicher oberhalb 4 GiB
       anlegt, legt SeaBIOS die virtio-BARs bei `0x70_0000_0000` ab — und `mmu.rs:99` hat

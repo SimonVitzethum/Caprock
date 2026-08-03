@@ -26,6 +26,7 @@ Zweig `arch/x86_64` (2026-08-03).
 | | |
 |---|---|
 | x86_64 | **2300 von 2300** mit identischer Signatur, `== ALL PASS ==` (2026-08-03: 200 im Leerlauf + 600 + 1500 unter Last in je 5 parallelen Stroemen, 20 vCPU auf 20 Kernen; alle Stroeme auch **untereinander** deckungsgleich, `e419003d625f`, ueber beide Aufrufe hinweg) |
+| x86_64 RAM-Reihe | `== ALL PASS ==` bei **512M · 2560M · 3G · 6G**, Haupt- **und** Lade-Suite (2026-08-04). Vor E-Rest 3 starb ab 3G der Boot mit `#PF cr2=0x70_0000_0014` — der Zweig „RAM oberhalb 4 GiB" war nie gelaufen |
 | x86_64 Lade-Suite | `== ALL PASS ==` (2026-08-03: 39 Pruefungen — 5 Module, **zwei** Treiber-PDs, Austausch, A-5.3/A-5.4, dazu **drei** verkettete Boots fuer Z4 Stufe 2, inkl. sieben Negativfaellen) |
 | aarch64 | `RUNS=6` → **6 von 6** mit identischer Signatur, `== ALL PASS ==` (2026-08-02, **mit Root-Task**; davor 16/16 ohne, s. D6/D5) |
 | Host-Tests | `mem · part · fat · cycles · loader · cap · virtio · typestate · ipctreue` → `== HOST-TESTS: ALL PASS ==` (`tools/host-tests.sh`, 2026-08-03) |
@@ -337,6 +338,19 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   CI-Job hiess „Kani — Tier-1-Beweise (Loader-Parser)" und fuhr in Wahrheit alle vier Ziele. Daraus
   wurde ein Todo-Eintrag ueber eine Luecke, die es nicht gab — waehrend die echte Luecke (Beweise
   mit konkreten statt symbolischen Werten) unbenannt blieb.
+* **Ein Pruefer, der die gepruefte Groesse NACHRECHNET statt sie zu lesen, prueft eine zweite
+  Wirklichkeit.** `iova_window_clear_of_msi` rechnete die Fensterlage selbst aus und bildete
+  dabei nur den starken Zweig ab; im schwachen gab er `true` zurueck, obwohl das Fenster dort
+  `[0, 512 GiB)` ist und den Sperrbereich ENTHAELT. Zuteiler und Pruefer brauchen EINE Quelle.
+* **Was auf q35 nicht vorkommt, ist damit nicht abwesend, sondern ungeprueft.** RMRR faerbte das
+  Geraet statt der ACS-Gruppe. q35 hat 0 RMRRs, also konnte die QEMU-Suite das nie zeigen -- auf
+  echter Hardware (Legacy-USB, BMC, Grafik) ist es der Normalfall. Wo die Emulation eine
+  Eigenschaft gar nicht hat, gehoert ein Host-Test mit synthetischer Topologie hin.
+* **Eine flaechige Identitaetskarte ist bequem und macht jeden verirrten Zeiger gueltig.** Beim
+  Hochziehen ueber 4 GiB waeren 512 GiB mit 1-GiB-Blaettern 512 Eintraege gewesen -- billiger als
+  der gewaehlte Weg. Dann ist aber auch alles praesent, wo nichts ist: ein Zeiger nach 200 GiB
+  traefe eine gueltige, beschreibbare Seite statt eines Faults. Abgebildet wird, was der
+  Speicherplan deckt; darueber wird abgewiesen, nicht geraten.
 * **Ein `if cap { .. }` ohne `else` verwirft still — und der Aufrufer merkt es nicht.**
   `TidQueue::enqueue` nahm 32 Sender; der 33. wurde TROTZDEM blockiert, bekam keinen
   Ergebniscode, stand in keiner Struktur des Endpoints, wurde nie geweckt — und

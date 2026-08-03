@@ -694,8 +694,44 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
 
 ---
 
-## D0. Instabilität des x86-Laufs (2026-07-29, **neu gemessen 2026-08-01**)
+## D0. Instabilität des x86-Laufs (2026-07-29, **neu gemessen 2026-08-01 und 2026-08-03**)
 **Klasse:** Fehler · **Aufwand:** eingegrenzt, Vollprotokoll eines Hängers steht aus
+
+- [ ] **800 Läufe am 2026-08-03, keine einzige Abweichung — und das reicht noch nicht.**
+      Gemessen nach dem Tagesstand (Z4 Stufe 2, A-5.4, B-7.3):
+
+      | Reihe | Läufe | Bedingung | Ergebnis |
+      |---|---|---|---|
+      | vormittags | 200 | Leerlauf, KVM | 200 von 200, identische Signatur |
+      | nachmittags | 600 | 5 parallele Ströme à 120, 20 vCPU auf 20 Kernen | 600 von 600, identische Signatur |
+
+      **Warum das D0 nicht schließt.** Die relevante Grundlinie ist nicht die alte Gesamtquote
+      von 1,5 % (6/400) — davon waren **4 das Farbrennen**, und das ist seit dem 2026-08-01
+      behoben (500/500). Für das hier noch offene Bild, den **Hänger ab `sched`**, lautet sie
+      2/400 unter Last und 1/200 im Leerlauf, also rund **0,5 %**. Dagegen ist eine saubere
+      800er-Reihe `0,995⁸⁰⁰ ≈ 2 %`: auffällig, aber kein Ausschluss. Obere 95-%-Schranke nach
+      der Dreierregel: `3/800 ≈ 0,4 %`. Für einen echten Ausschluss braucht es rund **1500
+      Läufe** — bei 0,86 s je Lauf und fünf Strömen ist das eine Viertelstunde, es scheitert
+      also nicht am Preis.
+
+      **Zwei Vorbehalte, die zur Zahl gehören.** (a) Die alte Serie lief parallel zur
+      **Lade-Suite**, die neue gegen fünf Kopien ihrer selbst. Beides ist Last, aber ein
+      Fehlerbild, das am Zusammenspiel mit dem Blockgerät hängt, träfe die neue Anordnung
+      schwächer. (b) `pprobe` meldet unter KVM grundsätzlich `SKIP` (`CPUID.1:ECX[31]`) und
+      urteilt in dieser Reihe nicht mit — der Eintrag steht in der Signatur, fällt also auf,
+      ist aber kein bestandener Test.
+
+      **Nebenertrag: die Signaturprüfung hatte ein Loch.** `test-qemu-x86.sh` vergleicht jeden
+      Lauf gegen den **ersten Lauf desselben Aufrufs**. Fünf parallele Ströme mit je einer in
+      sich stimmigen, untereinander aber verschiedenen Signatur hätten damit fünfmal grün
+      gemeldet. Der Quervergleich über die Ströme ist deshalb Teil der Messung (alle fünf
+      `e419003d625f`).
+
+      Dabei fast eine falsche Aussage produziert: ein erster Quervergleich über die *rohen*
+      Zusammenfassungszeilen ergab fünf verschiedene Hashes — das war die **Kalibrierung**
+      (LAPIC 999937800 gegen 1000032500 Hz, TSC 2804 gegen 2803 MHz), nicht der Kernel. Der
+      Vergleich muss durch dieselbe `run_signature`-Extraktion laufen, die auch der Test
+      benutzt; alles andere misst Rauschen.
 
 - [ ] **Der x86-Lauf ist noch nicht deterministisch — aber zwei Größenordnungen seltener als
       gedacht.** Neu gemessen am 2026-08-01 (200 Läufe, KVM, `-cpu host,+invtsc`, lastfreier

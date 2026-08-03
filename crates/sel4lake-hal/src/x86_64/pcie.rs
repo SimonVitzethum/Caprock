@@ -196,6 +196,81 @@ pub fn find(vendor: u16, devices: &[u16]) -> Option<PciDevice> {
     None
 }
 
+/// **Jedes Speicher-BAR jeder vorhandenen Funktion melden** — `f(basis, laenge)`.
+///
+/// Gebraucht für E-Rest 3: die Karte oberhalb von 4 GiB wächst nur dort, wo etwas ist, und
+/// „wo etwas ist" steht in den BARs, die die Firmware vergeben hat. Das ist der Pfad von der
+/// BAR-Ermittlung zur Seitentabelle — bewusst **hier** und nicht im Kernel, weil er sonst
+/// nochmal enumerieren müsste.
+///
+/// Zwei Feinheiten, die beide Schaden anrichten, wenn man sie übergeht:
+/// * **Header-Typ.** Eine Bridge (Typ 1) hat nur zwei BARs; ab `0x18` stehen dort Bus-Nummern.
+///   `bar_size` schreibt zum Dimensionieren alle Bits und stellt danach wieder her — auf ein
+///   Bus-Nummern-Register angewandt wäre das keine Messung, sondern eine Umkonfiguration der
+///   Topologie mitten im Hochlauf.
+/// * **Alle acht Funktionen**, nicht nur Funktion 0: ein Multifunktionsgerät legt seine
+///   Registerfenster über die Funktionen, und ein nicht abgebildetes Fenster fällt erst beim
+///   ersten Zugriff auf — also weit weg von hier.
+pub fn for_each_bar(f: &mut dyn FnMut(u64, u64)) {
+    if !init() {
+        return;
+    }
+    let max = MAX_BUS.load(Ordering::Acquire) as u16;
+    for bus in 0..=max.min(255) {
+        for dev in 0u8..32 {
+            for func in 0u8..8 {
+                let b = bus as u8;
+                if cfg_read16(b, dev, func, CFG_VENDOR) == 0xffff {
+                    if func == 0 {
+                        break; // Funktion 0 fehlt -> das Geraet gibt es nicht
+                    }
+                    continue;
+                }
+                let hdr = cfg_read8(b, dev, func, 0x0E);
+                let nbars = match hdr & 0x7f {
+                    0 => 6, // Endpoint
+                    1 => 2, // Bridge -- ab 0x18 stehen Bus-Nummern, keine BARs
+                    _ => 0, // Cardbus o. ae.: hier nichts zu holen
+                };
+                let d = PciDevice {
+                    bus: b,
+                    dev,
+                    func,
+                    vendor: 0,
+                    device: 0,
+                    class: 0,
+                    int_pin: 0,
+                    bars: [0; 6],
+                };
+                let mut i = 0usize;
+                while i < nbars {
+                    let lo = cfg_read32(b, dev, func, CFG_BAR0 + (i as u16) * 4);
+                    if lo & 1 != 0 {
+                        i += 1; // I/O-BAR
+                        continue;
+                    }
+                    let is64 = (lo >> 1) & 0b11 == 0b10;
+                    let mut addr = (lo & !0xf) as u64;
+                    if is64 && i + 1 < nbars {
+                        addr |= (cfg_read32(b, dev, func, CFG_BAR0 + ((i + 1) as u16) * 4) as u64)
+                            << 32;
+                    }
+                    if addr != 0 {
+                        let len = bar_size(&d, i);
+                        if len != 0 {
+                            f(addr, len);
+                        }
+                    }
+                    i += if is64 { 2 } else { 1 };
+                }
+                if func == 0 && hdr & 0x80 == 0 {
+                    break; // kein Multifunktionsgeraet
+                }
+            }
+        }
+    }
+}
+
 /// Ist Bus-Master für dieses Gerät aktiv?
 pub fn bus_master_enabled(d: &PciDevice) -> bool {
     cfg_read16(d.bus, d.dev, d.func, CFG_COMMAND) & CMD_BUS_MASTER != 0

@@ -259,6 +259,20 @@ check "drv     : ALL PASS" \
     "A-5.1: ein Treiber als DIENST ausserhalb des Kerns -- eigene Konfigurationsraum-Seite aufgeloest, virtio-Handshake, Sektoren per Bus-Master-DMA auf Anfrage. Der Kernel hat enumeriert, zugeteilt und den Empfaenger ausgetauscht, ohne einen virtio-Schritt auszufuehren"
 check "dmaiso  : ALL PASS" \
     "A-5.4: das Geraet der EINEN Treiber-PD erreicht die DMA-Region der ANDEREN nicht. Die Aussage haengt an VIER Zahlen, und keine reicht allein: die Positivkontrolle laeuft ueber denselben Treiber, dasselbe Geraet und dieselbe Deskriptorkette (nur EINE Adresse wandert); der Fremdversuch liefert keine Daten; das Opfer ist unberuehrt, und zwar vom KERNEL nachgeprueft statt vom Angreifer gemeldet; und ein VT-d-Fault belegt AKTIV, dass geblockt wurde -- ohne ihn waere 'keine Antwort' auch mit einem stummen Gegenueber vereinbar"
+# E-Rest 3: das Geraetefenster einer Treiber-PD oberhalb 4 GiB liegt in einer PRIVATEN Kopie.
+# Ab `-m 3G` legt SeaBIOS die virtio-BARs bei 448 GiB ab; dort steht die Karte in einer GETEILTEN
+# statischen Tabelle, und wer ein PD-Fenster dorthin schriebe, gaebe es JEDER isolierten PD --
+# lautlos, denn die Cap-Pruefung liefe korrekt durch. SKIP heisst hier "die BARs lagen unter
+# 4 GiB" (der Fall bei der Vorgabe 512M) und ist ausdruecklich KEIN Bestehen.
+if echo "$OUT" | grep -q "^hiiso   : FAILURES"; then
+    echo "  FAIL: E-Rest 3: $(echo "$OUT" | grep -m1 '^hiiso   :')"; fail=1
+elif echo "$OUT" | grep -q "^hiiso   : ALL PASS"; then
+    echo "  PASS: E-Rest 3: die Treiber-PD bekam ihr Fenster oberhalb 4 GiB in einer PRIVATEN Kopie des Seitenverzeichnisses -- die geteilte Tabelle traegt keinen PD-spezifischen Eintrag"
+elif echo "$OUT" | grep -q "^hiiso   : SKIP"; then
+    echo "  SKIP (keine BARs oberhalb 4 GiB -- mit '$RAM' legt die Firmware sie darunter; mit '6G' wird die Aussage scharf): private Geraete-Tabelle oberhalb 4 GiB"
+else
+    echo "  FAIL: E-Rest 3: keine hiiso-Zeile im Protokoll"; fail=1
+fi
 check "devsel  : ALL PASS" \
     "A-5.3: das MANIFEST sagt, welches Geraet die Treiber-PD bekommt -- nicht die Fundreihenfolge des Enumerators. Der Lauf bietet ZWEI Geraete an (virtio-blk und virtio-net); ohne die zweite waere die Zeile eine Aussage ueber nichts, denn bei einem einzigen trifft jeder Selektor dieselbe Wahl. Geprueft wird deshalb auch, dass die nicht gewaehlte Alternative LIEGEN BLIEB"
 # Die Einzelaussagen werden HIER noch einmal gelesen, nicht nur das Sammelurteil. Sie sind

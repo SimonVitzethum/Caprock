@@ -486,6 +486,14 @@ static DMAWIN_EXHAUST: AtomicBool = AtomicBool::new(false); //  Fenster voll -> 
 static DMAWIN_INTACT: AtomicBool = AtomicBool::new(false); //   Kontext danach unveraendert nutzbar
 static DMAWIN_BALANCED: AtomicBool = AtomicBool::new(false);
 static DMAWIN_UNDECL: AtomicU32 = AtomicU32::new(0); //        Geraete ohne deklarierte Adressbreite
+// B-3.4 (E-Rest 1). Vorgabe 1 = FAILURES bzw. 2 = "nicht entscheidbar": ein Wert, den niemand
+// gesetzt hat, darf nicht als bestanden bzw. als "frei" durchgehen.
+static DMAWIN_VERDICT: AtomicU32 = AtomicU32::new(1);
+static DMAWIN_MSI_POLICY: AtomicU32 = AtomicU32::new(2);
+static DMAWIN_MSI_LIVE: AtomicU32 = AtomicU32::new(0);
+static DMAWIN_MSI_WEAK: AtomicU32 = AtomicU32::new(0);
+static DMAWIN_MSI_DRIFT: AtomicU32 = AtomicU32::new(0);
+static DMAWIN_MSI_OVL: AtomicU32 = AtomicU32::new(0);
                                                      // Teardown-Token (ext-37): `cap_delete` allein baut die Uebersetzung ab und gibt erst danach
                                                      // frei; ohne bestaetigte Stilllegung wird NIE freigegeben (Pending, beschraenkt, auditiert).
 static DMATOK_DONE: AtomicBool = AtomicBool::new(false);
@@ -1189,6 +1197,17 @@ fn run_dmawin() -> bool {
     DMAWIN_INTACT.store(r.intact, Ordering::Relaxed);
     DMAWIN_BALANCED.store(r.balanced, Ordering::Relaxed);
     DMAWIN_UNDECL.store(r.undeclared, Ordering::Relaxed);
+    // B-3.4 (E-Rest 1): das Urteil ueber das Interrupt-Nachrichtenfenster hat **drei** Zustaende
+    // und wurde auf aarch64 bis hierher ueberhaupt nicht berichtet -- es steckte still in `r.ok`.
+    // Auf dieser Architektur sagt die HAL `None` zu ("die ITS-Doorbell wird uebersetzt"), das
+    // Urteil ist also `Clear` aus einer ZUSAGE. Genau das gehoert in den Bericht: sonst ist von
+    // aussen nicht zu sehen, ob geprueft oder zugesagt wurde.
+    DMAWIN_VERDICT.store(r.verdict().code(), Ordering::Relaxed);
+    DMAWIN_MSI_POLICY.store(crate::dmatests::msi_code(r.msi.policy), Ordering::Relaxed);
+    DMAWIN_MSI_LIVE.store(r.msi.live, Ordering::Relaxed);
+    DMAWIN_MSI_WEAK.store(r.msi.weak, Ordering::Relaxed);
+    DMAWIN_MSI_DRIFT.store(r.msi.drift, Ordering::Relaxed);
+    DMAWIN_MSI_OVL.store(r.msi.live_overlaps, Ordering::Relaxed);
     r.ok
 }
 
@@ -5758,14 +5777,34 @@ fn report() {
     );
 
     // IOVA-Fenstergrenzen (ext-36b Nacharbeit).
-    let dmawin = DMAWIN_DONE.load(Ordering::Acquire) && DMAWIN_OK.load(Ordering::Acquire);
+    let dmawin_fertig = DMAWIN_DONE.load(Ordering::Acquire);
     println!("dmawin  : 32-Bit-Geraet-abgewiesen={} Fenster-voll-abgewiesen={} Kontext-danach-intakt={} balanciert={} Geraete-ohne-deklarierte-Adressbreite={} (gefuehrt, nicht stillschweigend 64)",
         DMAWIN_NARROW.load(Ordering::Acquire), DMAWIN_EXHAUST.load(Ordering::Acquire),
         DMAWIN_INTACT.load(Ordering::Acquire), DMAWIN_BALANCED.load(Ordering::Acquire),
         DMAWIN_UNDECL.load(Ordering::Acquire));
+    // B-3.4 (E-Rest 1): auf aarch64 stand diese Aussage bis hierher in KEINER Zeile -- sie steckte
+    // still in `r.ok`. Eine Zusicherung, die nirgends gedruckt wird, ist von einer fehlenden nicht
+    // zu unterscheiden.
+    println!(
+        "dmawin  : B-3.4 Fenster gegen den Interrupt-Nachrichtenbereich: {} -- belegte-DMA-Kontexte={} davon-schwaches-Fenster={} Fenster-weicht-von-der-Politik-ab={} eingetragenes-Fenster-im-Sperrbereich={}",
+        crate::dmatests::msi_klartext(crate::dmatests::msi_from_code(
+            DMAWIN_MSI_POLICY.load(Ordering::Acquire)
+        )),
+        DMAWIN_MSI_LIVE.load(Ordering::Acquire),
+        DMAWIN_MSI_WEAK.load(Ordering::Acquire),
+        DMAWIN_MSI_DRIFT.load(Ordering::Acquire),
+        DMAWIN_MSI_OVL.load(Ordering::Acquire)
+    );
+    let dmawin_urteil = if dmawin_fertig {
+        crate::dmatests::Verdict::from_code(DMAWIN_VERDICT.load(Ordering::Acquire))
+    } else {
+        // Nicht gelaufen ist nicht bestanden -- und auch kein SKIP: ein Test, der nicht
+        // durchkam, hat kein Ergebnis, sondern einen Ausfall.
+        crate::dmatests::Verdict::Fail
+    };
     println!(
         "dmawin  : {} (IOVA-Fenstergrenzen: Geraete-Adressbreite + Fenster-Erschoepfung scheitern laut statt still abzuschneiden; kein halb aufgebauter Kontext)",
-        if dmawin { "ALL PASS" } else { "FAILURES" }
+        dmawin_urteil.wort()
     );
 
     // Teardown-Token (ext-37).

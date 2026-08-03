@@ -17,6 +17,40 @@
 //! seitengenau in `.text` (R-X), `.rodata` (R--/NX) und Daten (RW/NX) zerfällt; darüber
 //! genügen 2-MiB-Blöcke. Das oberste GiB unter 4 GiB ist **uncacheable** (LAPIC/IOAPIC/PCI).
 //!
+//! ## Oberhalb von 4 GiB (E-Rest 3)
+//!
+//! Bis 2026-08-03 endete die Karte bei 4 GiB. Das genügt, solange die Firmware alles unter
+//! 4 GiB legt — und genau das tut sie **nicht** mehr, sobald QEMU Speicher oberhalb 4 GiB
+//! anlegt: SeaBIOS schiebt die 64-Bit-BARs dann in ein Loch bei 448 GiB, und der erste
+//! Registerzugriff des Treibers starb mit `#PF, cr2 = 0x70_0000_0014`. Der Zweig „RAM oberhalb
+//! 4 GiB" war damit nicht bloß ungeprüft, sondern **nicht ausführbar** — und an `RAM_TOP`
+//! hängt die Wahl des IOVA-Fensters.
+//!
+//! Oberhalb von `LOW_GIB` ist die Karte deshalb **nicht flächig**, sondern wächst nur dort, wo
+//! der Hochlauf belegen kann, dass etwas da ist. Zwei Quellen, zwei Mechanismen:
+//!
+//! | Was | Woher | Wie abgebildet |
+//! |---|---|---|
+//! | Geräte-Registerfenster | die BAR-Ermittlung der PCI-Enumeration | 2-MiB-Blöcke aus einem kleinen statischen Vorrat ([`HIGH_DEV_SLOTS`]), **nur** wo ein BAR liegt |
+//! | RAM | der Speicherplan des Bootloaders | 1-GiB-Blätter, und nur für GiB, die der Plan **vollständig** deckt |
+//!
+//! Die Alternative wäre gewesen, den ganzen `PML4[0]` (512 GiB) mit 1-GiB-Seiten flächig
+//! abzubilden — 512 Einträge, kein einziger zusätzlicher Tabellenrahmen. Dagegen spricht genau
+//! ein Satz: dann ist auch alles präsent, wo **nichts** ist. Ein verirrter Kernel-Zeiger nach
+//! 200 GiB träfe eine gültige, beschreibbare Seite, der Schreibvorgang verschwände im Nichts
+//! und niemand erführe davon. Ein #PF ist die bessere Antwort auf eine Adresse, die es nicht
+//! gibt. Der Preis der sparsamen Variante sind 16 KiB statische Tabellen und ein Aufruf an der
+//! Stelle, an der die BARs ohnehin schon gelesen werden.
+//!
+//! **Für die Isolation ändert sich dadurch nichts zum Schlechteren, sondern etwas zum
+//! Besseren.** `vspace_create_base` spiegelt die hohen PDPT-Einträge in den isolierten
+//! Adressraum — aber **ohne `US`**. Der Kernel läuft beim Syscall im Adressraum der PD und
+//! muss dort hohes RAM und hohe Register erreichen; ein Ring-3-Thread der PD darf es nicht.
+//! Ein Gerätefenster für eine einzelne PD entsteht wie unter 4 GiB über eine **private Kopie**
+//! des Seitenverzeichnisses ([`private_pd`]); der statische Vorrat wird dabei nie beschrieben.
+//! Dass er nie beschrieben und nie freigegeben wird, hängt jetzt an **einer** strukturellen
+//! Frage ([`is_static_table`]) statt an einem Vergleich mit einer einzelnen Tabelle.
+//!
 //! ## Noch nicht portiert
 //!
 //! Die `vspace_*`-Funktionen (per-Prozess-Adressräume isolierter PDs, ext-11ff) melden hier
@@ -25,6 +59,7 @@
 //! per-VSpace-Tabellenlayout — ein eigener Portierungsschritt (s. `todo.md`).
 
 use super::cpu;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 // --- Deskriptor-Bits ------------------------------------------------------------------------
 
@@ -33,12 +68,18 @@ const RW: u64 = 1 << 1; // schreibbar
 const US: u64 = 1 << 2; // im User-Modus (Ring 3) zugreifbar
 const PWT: u64 = 1 << 3; // write-through
 const PCD: u64 = 1 << 4; // cache disable (MMIO)
+const A: u64 = 1 << 5; // accessed  -- von der HARDWARE gesetzt, nie von uns
+const D: u64 = 1 << 6; // dirty     -- dito
 const PS: u64 = 1 << 7; // page size: 2-MiB-Block statt Tabellenverweis
 const NX: u64 = 1 << 63; // not executable (braucht EFER.NXE)
 
 const PAGE: u64 = 4096;
 const TWO_MIB: u64 = 2 * 1024 * 1024;
 const ONE_GIB: u64 = 1 << 30;
+
+/// **Ende des fest abgebildeten Bereichs** (4 GiB). Darunter steht die Karte seit
+/// [`init_primary`]; darüber wächst sie nur dort, wo der Hochlauf etwas belegen kann.
+pub const LOW_MAPPED_END: u64 = (LOW_GIB as u64) * ONE_GIB;
 
 /// Untergrenze des für User-RAM nutzbaren Bereichs.
 ///
@@ -95,19 +136,58 @@ impl Table {
 
 /// Anzahl der mit **4-KiB-Seiten** abgebildeten 2-MiB-Blöcke (= die ersten 16 MiB).
 const FINE_BLOCKS: usize = 8;
-/// Wie viele GiB identity-abgebildet werden (deckt RAM + MMIO-Fenster unter 4 GiB ab).
-const MAPPED_GIB: usize = 4;
+/// Wie viele GiB mit **eigenen Seitenverzeichnissen** (2-MiB-Granularität) fest abgebildet
+/// werden — RAM und MMIO-Fenster **unter 4 GiB**. Auf einer kleinen Maschine ist das alles,
+/// was es gibt; die Karte oberhalb davon entsteht erst im Hochlauf (s. Modul-Doku).
+const LOW_GIB: usize = 4;
+
+/// **Obergrenze der Identity-Map**: ein PML4-Eintrag spannt 512 GiB, und diese Karte benutzt
+/// genau einen (`PML4[0]`, s. `vspace_create_base`). Eine physische Adresse darüber ist hier
+/// nicht abbildbar — eine **benannte** Grenze: [`map_device_window_global`] und
+/// [`vspace_map_device`] weisen sie ab, statt irgendwo eine Tabelle zu erfinden.
+const MAPPED_GIB: usize = 512;
+
+/// Wie viele GiB **oberhalb** von [`LOW_GIB`] ein Geräte-Registerfenster tragen können.
+///
+/// Vier, weil eine Plattform ihre 64-Bit-BARs praktisch immer in **ein** zusammenhängendes Loch
+/// legt (QEMU/q35: alles bei 448 GiB). Reicht es nicht, gibt [`map_device_window_global`]
+/// `false` zurück und der Aufrufer sagt es — eine still verkürzte Karte wäre ein #PF, der
+/// später und woanders auftritt.
+const HIGH_DEV_SLOTS: usize = 4;
 
 static mut PML4: Table = Table::EMPTY;
 static mut PDPT: Table = Table::EMPTY;
-static mut PD: [Table; MAPPED_GIB] = [const { Table::EMPTY }; MAPPED_GIB];
+static mut PD: [Table; LOW_GIB] = [const { Table::EMPTY }; LOW_GIB];
 static mut PT: [Table; FINE_BLOCKS] = [const { Table::EMPTY }; FINE_BLOCKS];
 
 /// Seitenverzeichnisse für GiB 1..3 in der **isolierten** Sicht: identisch zur globalen Map,
 /// aber **ohne** `US` — der Kernel sieht dort alles, ein Ring-3-Thread einer isolierten PD
 /// nichts. Sie sind statisch und werden von **allen** isolierten Adressräumen geteilt (sie
 /// enthalten keine PD-spezifischen Einträge), sparen also je Adressraum drei Frames.
-static mut ISO_PD_HIGH: [Table; MAPPED_GIB - 1] = [const { Table::EMPTY }; MAPPED_GIB - 1];
+static mut ISO_PD_HIGH: [Table; LOW_GIB - 1] = [const { Table::EMPTY }; LOW_GIB - 1];
+
+/// Seitenverzeichnisse für Geräte-GiB **oberhalb** von [`LOW_GIB`] (globale Karte).
+///
+/// Ebenfalls statisch und geteilt — und deshalb gilt für sie **wörtlich** dasselbe wie für
+/// [`ISO_PD_HIGH`]: wer hier einen PD-spezifischen Eintrag hineinschriebe, gäbe ihn jedem
+/// isolierten Adressraum. Verhindert wird das nicht durch Sorgfalt an jeder Schreibstelle,
+/// sondern durch [`is_static_table`] an der einen Stelle, die entscheidet.
+static mut HIGH_DEV_PD: [Table; HIGH_DEV_SLOTS] = [const { Table::EMPTY }; HIGH_DEV_SLOTS];
+
+/// Welches GiB der Platz `k` in [`HIGH_DEV_PD`] trägt (`usize::MAX` = frei).
+static HIGH_DEV_GIB: [AtomicUsize; HIGH_DEV_SLOTS] =
+    [const { AtomicUsize::new(usize::MAX) }; HIGH_DEV_SLOTS];
+
+/// Wie viele 1-GiB-Blätter oberhalb von [`LOW_GIB`] als RAM übernommen wurden (Bericht).
+static HIGH_RAM_GIB: AtomicUsize = AtomicUsize::new(0);
+
+/// Wie oft für ein GiB **oberhalb** von [`LOW_GIB`] eine **private** Kopie eines
+/// Seitenverzeichnisses angelegt wurde ([`private_pd`]).
+///
+/// Der Zähler ist die Sprechprobe zu [`high_shared_audit`]: „keine unzulässigen Einträge in der
+/// geteilten Tabelle" ist eine Aussage über gar nichts, solange nie eine PD ein Fenster dort
+/// bekommen hat. Erst zusammen wird daraus ein Testergebnis.
+static HIGH_DEV_PRIVATE: AtomicUsize = AtomicUsize::new(0);
 
 extern "C" {
     static __text_start: u8;
@@ -210,7 +290,7 @@ pub fn init_primary() {
             pd[0].0[b] = (table as *const Table as u64) | P | RW | US;
         }
         // Rest: 2-MiB-Blöcke, RW + NX; MMIO-Bereiche uncacheable.
-        for g in 0..MAPPED_GIB {
+        for g in 0..LOW_GIB {
             let first = if g == 0 { FINE_BLOCKS } else { 0 };
             for i in first..512 {
                 let pa = (g as u64) * ONE_GIB + (i as u64) * TWO_MIB;
@@ -242,6 +322,254 @@ pub fn init_primary() {
         }
         activate(pml4 as *const Table as u64);
     }
+}
+
+// --- Die Karte oberhalb von 4 GiB (E-Rest 3) --------------------------------------------------
+//
+// Beide Funktionen laufen **im Hochlauf, einkernig**: die Sekundärkerne werden erst nach der
+// PCI-Enumeration gestartet (s. `bringup::run`). Deshalb genügt ein lokales `flush_all()` und es
+// braucht keinen TLB-Shootdown. Zusätzlich gilt: die Einträge waren vorher *nicht präsent*, und
+// nicht präsente Einträge legt x86 nicht in den Paging-Structure-Caches ab — ein hinzugefügter
+// Eintrag muss also gar nichts verdrängen.
+
+/// Kann diese CPU **1-GiB-Seiten**? (`CPUID.8000_0001h:EDX[26]`, `PDPE1GB`)
+///
+/// Die Frage wird gestellt und nicht angenommen: unter TCG meldet nicht jedes CPU-Modell das
+/// Bit, und ein 1-GiB-Blatt auf einer CPU ohne die Fähigkeit ist ein reservierter Bit-Fehler,
+/// also ein #PF beim ersten Zugriff — genau der Fehler, den dieser Abschnitt beseitigen soll.
+pub fn gib_pages() -> bool {
+    let (max_ext, _, _, _) = cpu::cpuid(0x8000_0000);
+    if max_ext < 0x8000_0001 {
+        return false;
+    }
+    let (_, _, _, edx) = cpu::cpuid(0x8000_0001);
+    edx & (1 << 26) != 0
+}
+
+/// Was oberhalb von [`LOW_GIB`] tatsächlich abgebildet wurde: `(Geräte-GiB, RAM-GiB,
+/// 1-GiB-Seiten verfügbar)`. Für den Bootbericht — eine Karte, über die niemand etwas sagen
+/// kann, ist von einer falschen nicht zu unterscheiden.
+pub fn high_map_report() -> (usize, usize, bool) {
+    let dev = HIGH_DEV_GIB
+        .iter()
+        .filter(|s| s.load(Ordering::Acquire) != usize::MAX)
+        .count();
+    (dev, HIGH_RAM_GIB.load(Ordering::Acquire), gib_pages())
+}
+
+/// Das Seitenverzeichnis für das GiB `g` oberhalb von [`LOW_GIB`] — vorhandenes oder neues.
+/// `None`, wenn der Vorrat erschöpft ist.
+fn high_dev_pd(g: usize) -> Option<u64> {
+    for (k, slot) in HIGH_DEV_GIB.iter().enumerate() {
+        if slot.load(Ordering::Acquire) == g {
+            // SAFETY: nur die Adresse eines statischen Objekts.
+            return Some(unsafe { &(*core::ptr::addr_of!(HIGH_DEV_PD))[k] as *const Table as u64 });
+        }
+    }
+    for (k, slot) in HIGH_DEV_GIB.iter().enumerate() {
+        if slot.load(Ordering::Acquire) != usize::MAX {
+            continue;
+        }
+        // SAFETY: statische, 4-KiB-ausgerichtete Tabelle; einkerniger Hochlauf (s. o.).
+        let phys = unsafe {
+            let t = &mut (*core::ptr::addr_of_mut!(HIGH_DEV_PD))[k];
+            for e in t.0.iter_mut() {
+                *e = 0;
+            }
+            t as *const Table as u64
+        };
+        // SAFETY: die globale PDPT dieses Kernels; `g < MAPPED_GIB == 512` ist geprüft.
+        unsafe { (*core::ptr::addr_of_mut!(PDPT)).0[g] = table_desc(phys) };
+        slot.store(g, Ordering::Release);
+        return Some(phys);
+    }
+    None
+}
+
+/// **Ein Geräte-Registerfenster in die globale Karte aufnehmen** — der Pfad von der
+/// BAR-Ermittlung zur Seitentabelle.
+///
+/// Abgebildet werden die 2-MiB-Blöcke, die `[pa, pa+len)` überdecken: uncacheable,
+/// nicht ausführbar, **supervisor-only**. Unter [`LOW_GIB`] ist das ein No-op — dort steht der
+/// Block seit [`init_primary`].
+///
+/// `false` heißt „nicht abbildbar" (oberhalb von [`MAPPED_GIB`] oder Vorrat erschöpft) und ist
+/// als Rückgabewert wichtiger als es aussieht: der Aufrufer würde sonst gleich darauf Register
+/// lesen und bekäme einen #PF mitten im Hochlauf — also die Fehlerform, wegen der es diese
+/// Funktion überhaupt gibt.
+pub fn map_device_window_global(pa: u64, len: u64) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let Some(end) = pa.checked_add(len) else {
+        return false;
+    };
+    if end > (MAPPED_GIB as u64) * ONE_GIB {
+        return false;
+    }
+    let mut blk = pa & !(TWO_MIB - 1);
+    while blk < end {
+        let g = (blk / ONE_GIB) as usize;
+        if g >= LOW_GIB {
+            let Some(pd_phys) = high_dev_pd(g) else {
+                return false;
+            };
+            let idx = ((blk % ONE_GIB) / TWO_MIB) as usize;
+            // SAFETY: `pd_phys` ist eine statische, identity-gemappte Tabelle dieses Moduls;
+            // `idx < 512`.
+            unsafe { table_mut(pd_phys)[idx] = blk | P | RW | NX | PS | PCD | PWT };
+        }
+        blk += TWO_MIB;
+    }
+    flush_all();
+    true
+}
+
+/// **RAM oberhalb von 4 GiB in die globale Karte aufnehmen** — 1-GiB-Blätter, cacheable, `US`
+/// (SAS-Modell wie unter 4 GiB oberhalb von [`USER_RAM_MIN`]).
+///
+/// Übernommen wird nur, was ein 1-GiB-Blatt **vollständig** trägt. Ein Blatt, das zur Hälfte
+/// über Adressen läge, die der Speicherplan nicht als RAM meldet, wäre eine Zusage über
+/// Speicher, den niemand zugesagt hat — und auf echter Hardware liegt dort gerne MMIO.
+///
+/// Zurück kommt der übernommene Bereich, und der Aufrufer gibt dem Allokator **genau den**.
+/// Damit ist „was der Allokator ausgeben darf" dieselbe Zahl wie „was die Karte als RAM
+/// ausweist", und nicht zwei Zahlen, die zueinander passen müssen.
+///
+/// `None`, wenn nichts übernommen werden konnte — insbesondere ohne [`gib_pages`].
+pub fn adopt_high_ram(base: u64, len: u64) -> Option<(u64, u64)> {
+    if !gib_pages() {
+        return None;
+    }
+    let end = base.checked_add(len)?;
+    let first = base.div_ceil(ONE_GIB).max(LOW_GIB as u64);
+    let last = (end / ONE_GIB).min(MAPPED_GIB as u64);
+    if last <= first {
+        return None;
+    }
+    let mut taken = first;
+    for g in first..last {
+        // SAFETY: die globale PDPT; `g < 512`.
+        let occupied = unsafe { (*core::ptr::addr_of!(PDPT)).0[g as usize] & P != 0 };
+        if occupied {
+            break; // schon vergeben (Gerätefenster) -- nicht überschreiben, sondern hier enden
+        }
+        // SAFETY: wie oben; ein 1-GiB-Blatt ist erlaubt, weil `gib_pages()` geprüft ist.
+        unsafe {
+            (*core::ptr::addr_of_mut!(PDPT)).0[g as usize] =
+                (g * ONE_GIB) | P | RW | NX | PS | US;
+        }
+        taken = g + 1;
+    }
+    if taken == first {
+        return None;
+    }
+    HIGH_RAM_GIB.fetch_add((taken - first) as usize, Ordering::Release);
+    flush_all();
+    Some((first * ONE_GIB, (taken - first) * ONE_GIB))
+}
+
+/// **Audit der geteilten Geräte-Seitenverzeichnisse oberhalb 4 GiB** —
+/// `(benutzte Tabellen, private Kopien, unzulässige Einträge)`.
+///
+/// In [`HIGH_DEV_PD`] darf **ausschließlich** stehen, was [`map_device_window_global`]
+/// hineinschreibt: ein 2-MiB-Geräteblock (`P|RW|NX|PS|PCD|PWT`) oder nichts. Jeder andere
+/// Eintrag — insbesondere einer mit `US` oder ein Tabellenverweis — heißt, dass ein
+/// PD-spezifisches Fenster in eine **geteilte** Tabelle geschrieben wurde. Die Folge steht in
+/// CLAUDE.md: aus einer Zuteilung an einen Treiber würde ein Zugriff für **jede** isolierte PD,
+/// und zwar lautlos, weil die Cap-Prüfung dabei korrekt durchläuft.
+///
+/// Das ist wörtlich die Widerlegung der bequemen Abkürzung: wer sich in [`private_pd`] die
+/// Kopie spart, fällt hier durch. Die **private Kopien** stehen mit im Ergebnis, weil die
+/// Aussage sonst über nichts urteilt: keine Kopie heißt, dass nie eine PD ein Fenster dort
+/// bekommen hat, und dann ist „0 unzulässige Einträge" kein Testergebnis.
+///
+/// **`A`/`D` bleiben ausserhalb des Vergleichs**, und das war der erste Befund dieser Funktion an
+/// sich selbst: sie meldete `unzulaessige Eintraege=1` auf einem tadellosen Aufbau. Der Eintrag
+/// war `0x8000_0070_0000_00fb` — `US` **nicht** gesetzt, dafuer Accessed und Dirty, gesetzt von
+/// der HARDWARE, weil der Kernel die Register gelesen hatte. Ein Pruefer, der Bits vergleicht,
+/// die ihm nicht gehoeren, misst die Benutzung statt der Zuteilung.
+pub fn high_shared_audit() -> (usize, usize, usize) {
+    const ERLAUBT: u64 = P | RW | NX | PS | PCD | PWT;
+    let mut tabellen = 0usize;
+    let mut bad = 0usize;
+    for (k, slot) in HIGH_DEV_GIB.iter().enumerate() {
+        if slot.load(Ordering::Acquire) == usize::MAX {
+            continue;
+        }
+        tabellen += 1;
+        // SAFETY: statische Tabelle dieses Moduls, nur gelesen.
+        let t = unsafe { &(*core::ptr::addr_of!(HIGH_DEV_PD))[k] };
+        for &e in t.0.iter() {
+            if e == 0 {
+                continue;
+            }
+            if e & !0x000f_ffff_ffff_f000 & !(A | D) != ERLAUBT {
+                bad += 1;
+            }
+        }
+    }
+    (tabellen, HIGH_DEV_PRIVATE.load(Ordering::Acquire), bad)
+}
+
+/// **Eine Adresse durch die globale Karte auflösen** — der Beleg, dass eine Abbildung steht.
+///
+/// Gibt die physische Adresse, auf die `va` in der globalen Identity-Map zeigt, oder `None`,
+/// wenn dort nichts abgebildet ist. Alle vier Ebenen werden gelaufen, 1-GiB- und 2-MiB-Blätter
+/// eingeschlossen.
+///
+/// Warum das eine eigene Funktion ist und nicht „folgt aus der Konstruktion": nach einem
+/// `map_device_window_global` ist die Aussage „das Fenster ist jetzt da" sonst nur eine
+/// Behauptung des Aufbaus. Mit dieser Funktion ist sie prüfbar — **und** widerlegbar: dieselbe
+/// Frage an ein GiB, das niemand abgebildet hat, muss `None` liefern. Eine flächige Karte
+/// (der bequeme Entwurf) würde daran scheitern.
+pub fn resolve_global(va: u64) -> Option<u64> {
+    const MASK: u64 = 0x000f_ffff_ffff_f000;
+    // SAFETY: nur Lesezugriffe auf die eigenen, identity-gemappten Seitentabellen.
+    unsafe {
+        let e4 = (*core::ptr::addr_of!(PML4)).0[((va >> 39) & 0x1ff) as usize];
+        if e4 & P == 0 {
+            return None;
+        }
+        let e3 = table_mut(e4 & MASK)[((va >> 30) & 0x1ff) as usize];
+        if e3 & P == 0 {
+            return None;
+        }
+        if e3 & PS != 0 {
+            return Some((e3 & MASK & !(ONE_GIB - 1)) | (va & (ONE_GIB - 1)));
+        }
+        let e2 = table_mut(e3 & MASK)[((va >> 21) & 0x1ff) as usize];
+        if e2 & P == 0 {
+            return None;
+        }
+        if e2 & PS != 0 {
+            return Some((e2 & MASK & !(TWO_MIB - 1)) | (va & (TWO_MIB - 1)));
+        }
+        let e1 = table_mut(e2 & MASK)[((va >> 12) & 0x1ff) as usize];
+        if e1 & P == 0 {
+            return None;
+        }
+        Some((e1 & MASK) | (va & (PAGE - 1)))
+    }
+}
+
+/// Gehört dieser Rahmen zu den **statischen** Tabellen dieses Moduls?
+///
+/// Der Test ist absichtlich strukturell und nicht „ist es genau die eine geteilte Tabelle":
+/// eine statische Tabelle darf **nie** PD-spezifisch beschrieben werden (sie ist geteilt) und
+/// **nie** freigegeben werden (sie ist Kernel-Speicher, kein Allokat — eine Freigabe gäbe dem
+/// Allokator das Kernel-Image als freies RAM zurück). Beide Zusagen hängen an derselben Frage,
+/// also steht sie an **einer** Stelle. Ein Vergleich gegen eine einzelne Tabelle wäre nach der
+/// nächsten hinzugefügten Tabelle wieder unvollständig — und zwar lautlos.
+fn is_static_table(phys: u64) -> bool {
+    let in_range = |start: u64, n: usize| phys >= start && phys < start + (n as u64) * PAGE;
+    // Nur die **Adressen** statischer Objekte -- `addr_of!` liest nichts.
+    in_range(core::ptr::addr_of!(PML4) as u64, 1)
+        || in_range(core::ptr::addr_of!(PDPT) as u64, 1)
+        || in_range(core::ptr::addr_of!(PD) as u64, LOW_GIB)
+        || in_range(core::ptr::addr_of!(PT) as u64, FINE_BLOCKS)
+        || in_range(core::ptr::addr_of!(ISO_PD_HIGH) as u64, LOW_GIB - 1)
+        || in_range(core::ptr::addr_of!(HIGH_DEV_PD) as u64, HIGH_DEV_SLOTS)
 }
 
 /// **Rechte einer einzelnen 4-KiB-Seite ändern** (nur im fein abgebildeten Bereich < 16 MiB).
@@ -475,11 +803,27 @@ pub fn vspace_create_base(
         }
         let pdpt = table_mut(pdpt_phys);
         let iso_high = &*core::ptr::addr_of!(ISO_PD_HIGH);
+        let global = &*core::ptr::addr_of!(PDPT);
         for (g, e) in pdpt.iter_mut().enumerate() {
-            *e = match g {
-                0 => table_desc(l2_phys),
-                1..=3 => table_desc(&iso_high[g - 1] as *const Table as u64),
-                _ => 0, // oberhalb der abgebildeten 4 GiB: nichts
+            *e = if g == 0 {
+                table_desc(l2_phys)
+            } else if g < LOW_GIB {
+                table_desc(&iso_high[g - 1] as *const Table as u64)
+            } else {
+                // **Oberhalb von 4 GiB spiegelt der isolierte Adressraum die globale Karte —
+                // ohne `US`.** Beide Hälften des Satzes tragen:
+                //
+                // *Spiegeln*, weil der Kernel beim Syscall in **diesem** Adressraum läuft. Läge
+                // hier `0`, faultete er, sobald er hohes RAM oder ein hohes Registerfenster
+                // anfasst — an einer Stelle, die mit dieser PD nichts zu tun hat.
+                //
+                // *Ohne `US`*, weil das die Zuteilung ist. Ein Ring-3-Thread dieser PD sieht
+                // oberhalb von 4 GiB nichts, solange ihm nicht ausdrücklich eine Seite gegeben
+                // wurde — und die entsteht in einer **privaten** Kopie (`private_pd`), nie in
+                // der geteilten Tabelle. `US` an der Zwischenebene stellt `private_pd` mit
+                // `table_desc` wieder her; die Entscheidung fällt also am Blatt, wie überall
+                // sonst in dieser Datei.
+                global.0[g] & !US
             };
         }
         let pml4 = table_mut(l1_phys);
@@ -705,9 +1049,9 @@ pub fn vspace_map_device(
     if len == 0 || len % PAGE != 0 || phys % PAGE != 0 {
         return false;
     }
-    // Oberhalb der abgebildeten 4 GiB gibt es keine Blattstruktur, an die sich etwas haengen
-    // liesse. Das ist eine Grenze der Plattformabbildung, kein Rechtefehler -- deshalb hier
-    // ablehnen und nicht irgendwo eine Tabelle erfinden.
+    // Oberhalb des einen benutzten PML4-Eintrags (512 GiB) gibt es keine Blattstruktur, an die
+    // sich etwas haengen liesse. Das ist eine Grenze der Plattformabbildung, kein Rechtefehler
+    // -- deshalb hier ablehnen und nicht irgendwo eine Tabelle erfinden.
     if phys.saturating_add(len) > (MAPPED_GIB as u64) * ONE_GIB {
         return false;
     }
@@ -744,14 +1088,26 @@ unsafe fn private_pd(
 ) -> Option<u64> {
     let e = pdpt[g];
     let cur = e & 0x000f_ffff_ffff_f000;
-    if e & P != 0 && !is_shared_high_pd(g, cur) {
+    let leaf = e & P != 0 && e & PS != 0; // 1-GiB-Blatt: KEINE Tabelle
+    if e & P != 0 && !leaf && !is_shared_high_pd(g, cur) {
         return Some(cur); // schon privat
     }
     let new = alloc()?;
     // SAFETY: frisch alloziertes, identity-gemapptes Frame; Quelle ist die bisherige Tabelle.
     unsafe {
         let dst = table_mut(new);
-        if e & P != 0 {
+        if leaf {
+            // **Ein 1-GiB-Blatt ist keine Tabelle.** `cur` zeigt hier auf RAM, nicht auf
+            // Einträge; es als Tabelle zu lesen wäre der teuerste Fehler dieser Datei — 512
+            // Speicherworte würden als Seitentabelleneinträge gedeutet. Also **attributgetreu**
+            // in 2-MiB-Blöcke auflösen: dieselben Flags (inkl. `PS`, das auf dieser Ebene 2 MiB
+            // heißt), dieselbe Sicht wie vorher.
+            let flags = e & !0x000f_ffff_ffff_f000;
+            let base = (g as u64) * ONE_GIB;
+            for (i, s) in dst.iter_mut().enumerate() {
+                *s = (base + (i as u64) * TWO_MIB) | flags;
+            }
+        } else if e & P != 0 {
             let src = table_mut(cur);
             dst.copy_from_slice(src);
         } else {
@@ -761,17 +1117,25 @@ unsafe fn private_pd(
         }
     }
     pdpt[g] = table_desc(new);
+    if g >= LOW_GIB {
+        HIGH_DEV_PRIVATE.fetch_add(1, Ordering::Release);
+    }
     Some(new)
 }
 
-/// Zeigt `pd_phys` auf das **geteilte** Seitenverzeichnis fuer GiB `g`?
+/// Zeigt `pd_phys` auf ein **geteiltes** Seitenverzeichnis (also eines, das keinem einzelnen
+/// Adressraum gehört)?
+///
+/// Vorher stand hier ein Vergleich gegen **eine** Tabelle ([`ISO_PD_HIGH`]`[g-1]`). Das war
+/// richtig, solange es nur diese gab; mit dem Vorrat für hohe Geräte-GiB ([`HIGH_DEV_PD`]) wäre
+/// es lautlos unvollständig geworden — und die Folge stünde in CLAUDE.md: ein Gerätefenster in
+/// einer geteilten Tabelle gehört **jeder** isolierten PD, bei korrekt durchlaufender
+/// Cap-Prüfung. Die Frage ist deshalb jetzt strukturell: gehört der Rahmen dem Kernel-Image?
 fn is_shared_high_pd(g: usize, pd_phys: u64) -> bool {
-    if g == 0 || g >= MAPPED_GIB {
+    if g == 0 {
         return false; // GiB 0 hat ohnehin eine eigene Tabelle je Adressraum
     }
-    // SAFETY: nur die **Adresse** eines statischen Objekts wird gelesen.
-    let shared = unsafe { &(*core::ptr::addr_of!(ISO_PD_HIGH))[g - 1] as *const Table as u64 };
-    pd_phys == shared
+    is_static_table(pd_phys)
 }
 
 /// Eine einzelne Geraeteseite user-zugreifbar in diesen Adressraum haengen (uncacheable, NX).
@@ -846,7 +1210,10 @@ pub fn vspace_collect_device_tables(l1_phys: u64, free: &mut dyn FnMut(u64)) {
         // wäre eine doppelte Freigabe.
         for g in 1..MAPPED_GIB {
             let e = pdpt[g];
-            if e & P == 0 {
+            // Ein 1-GiB-Blatt (`PS`) ist keine Tabelle -- es zu „befreien" gäbe dem Allokator
+            // RAM zurück, das ihm nie gehörte, und die Schleife darunter läse Speicher als
+            // Einträge. Nicht präsent: nichts zu tun.
+            if e & P == 0 || e & PS != 0 {
                 continue;
             }
             let pd_phys = e & 0x000f_ffff_ffff_f000;
@@ -886,6 +1253,14 @@ pub fn vspace_device_wx_ok(l1_phys: u64) -> bool {
             if e & P == 0 {
                 continue;
             }
+            if e & PS != 0 {
+                // 1-GiB-Blatt: selbst prüfbar, aber keine Tabelle. Die Verletzung wäre
+                // „für den User schreibbar UND ausführbar" -- dieselbe Frage, eine Ebene höher.
+                if e & US != 0 && e & RW != 0 && e & NX == 0 {
+                    return false;
+                }
+                continue;
+            }
             let pd_phys = e & 0x000f_ffff_ffff_f000;
             if is_shared_high_pd(g, pd_phys) {
                 continue;
@@ -911,8 +1286,14 @@ pub fn vspace_device_wx_ok(l1_phys: u64) -> bool {
     true
 }
 
-/// Geräte-Block global abbilden — auf x86 ist der gesamte MMIO-Bereich unter 4 GiB bereits
-/// uncacheable identity-abgebildet (s. `init_primary`).
-pub fn map_device_block_global(_gib: usize) -> bool {
-    true
+/// Ein ganzes GiB als Geräte-Block global abbilden (ARM-API-Gegenstück).
+///
+/// Unter 4 GiB ein No-op: dort steht der MMIO-Bereich seit [`init_primary`] uncacheable
+/// identity-abgebildet. Darüber geht es durch denselben Pfad wie ein einzelnes Registerfenster
+/// ([`map_device_window_global`]) — und meldet ehrlich `false`, wenn der Vorrat nicht reicht.
+pub fn map_device_block_global(gib: usize) -> bool {
+    if gib < LOW_GIB {
+        return true;
+    }
+    map_device_window_global((gib as u64) * ONE_GIB, ONE_GIB)
 }

@@ -113,6 +113,50 @@ impl MultibootInfo {
         (best > 0x10_0000).then_some(best)
     }
 
+    /// Die als **verfügbar** gemeldeten RAM-Bereiche (Typ 1, oberhalb 1 MiB) in `out` ablegen;
+    /// gibt die Anzahl zurück. `0`, wenn kein Speicherplan vorliegt.
+    ///
+    /// **Warum das nicht dasselbe ist wie [`ram_end`].** Bis 2026-08-03 leitete der Bring-up
+    /// seinen freien Speicher als **ein** `[free_base, ram_end)` ab. Auf einer Maschine, deren
+    /// RAM ganz unter 4 GiB liegt, ist das richtig; sobald QEMU Speicher oberhalb 4 GiB anlegt,
+    /// ist es falsch — und zwar teuer: zwischen dem RAM unter 4 GiB und dem ab 4 GiB klafft das
+    /// PCI-Loch (bei `-m 3G` gemessen: `0x8000_0000..0x1_0000_0000`, zwei ganze GiB), und der
+    /// Kernel meldete es dem Allokator als freies RAM. Eine Allokation dort trifft
+    /// Geräteregister oder gar nichts.
+    ///
+    /// Der Unterschied ist eine Klasse von Fehler, die dieses Projekt kennt: **zwei Zahlen aus
+    /// derselben Hand sind keine zwei Quellen.** `ram_end` beantwortet „wo hört der Speicher
+    /// auf" (daran hängt die Wahl des IOVA-Fensters), diese Funktion „wo ist welcher"; die
+    /// zweite Frage aus der ersten zu erraten geht genau so lange gut, wie es keine Löcher gibt.
+    pub fn ram_regions(&self, out: &mut [(u64, u64)]) -> usize {
+        if self.flags & FLAG_MMAP == 0 {
+            return 0;
+        }
+        let mmap_len = rd32(self.addr + 44) as u64;
+        let mmap_addr = rd32(self.addr + 48) as u64;
+        if mmap_len == 0 || mmap_addr == 0 {
+            return 0;
+        }
+        let mut n = 0usize;
+        let mut off = 0u64;
+        while off + 24 <= mmap_len && n < out.len() {
+            let e = mmap_addr + off;
+            let size = rd32(e) as u64;
+            let base = rd64(e + 4);
+            let len = rd64(e + 12);
+            let kind = rd32(e + 20);
+            if kind == 1 && base >= 0x10_0000 && len != 0 && base.checked_add(len).is_some() {
+                out[n] = (base, len);
+                n += 1;
+            }
+            if size == 0 {
+                break; // defekte Kette -> abbrechen statt weiterzuraten
+            }
+            off += size + 4;
+        }
+        n
+    }
+
     /// Die vom Bootloader gemeldeten Module, **bounds- und plausibilitätsgeprüft**, in `out`
     /// ablegen. Gibt die Zahl der übernommenen Module. Verworfen wird jeder Eintrag mit
     /// `end <= start` (leer/verdreht) — er beschriebe keinen Bereich, den man reservieren

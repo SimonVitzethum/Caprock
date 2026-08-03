@@ -2229,6 +2229,37 @@ fn report_and_off(watchdog: bool) -> ! {
         }
     }
 
+    // --- E-Rest 3: bleibt die GETEILTE Geraete-Tabelle oberhalb 4 GiB sauber? ------------------
+    //
+    // Die Falle steht in CLAUDE.md und gilt fuer die neuen hohen Tabellen woertlich wie fuer
+    // `ISO_PD_HIGH`: wer ein Geraetefenster in eine GETEILTE Tabelle schreibt, gibt es JEDER
+    // isolierten PD -- lautlos, denn die Cap-Pruefung laeuft dabei korrekt durch. Eine Loesung,
+    // die das Fenster allen PDs gibt, ist keine.
+    //
+    // Geprueft wird deshalb nicht die Absicht, sondern der Inhalt: in der geteilten Tabelle darf
+    // ausschliesslich stehen, was der Hochlauf hineinschreibt (2-MiB-Geraeteblock, kein `US`).
+    // Und weil "0 unzulaessige Eintraege" ueber nichts urteilt, solange nie eine PD ein Fenster
+    // dort bekommen hat, steht die Zahl der PRIVATEN Kopien danebst: erst sie macht die Aussage
+    // zu einem Testergebnis. Ohne Treiber-PD (nackte Suite) ist das ein SKIP mit Grund.
+    {
+        let (geteilt, privat, verstoesse) = hal::mmu::high_shared_audit();
+        println!(
+            "hiiso   : geteilte Geraete-Tabellen oberhalb 4 GiB={geteilt}, private Kopien fuer \
+             isolierte PDs={privat}, unzulaessige Eintraege in den geteilten={verstoesse}"
+        );
+        println!(
+            "hiiso   : {}",
+            if verstoesse > 0 {
+                "FAILURES"
+            } else if privat == 0 {
+                // Kein Urteil moeglich -- und das ist ein eigenes Ergebnis, kein Bestehen.
+                "SKIP"
+            } else {
+                "ALL PASS"
+            }
+        );
+    }
+
     // Z4 Stufe 2 **vor** `freeze_bericht`: jene Pruefung friert denselben Worker noch einmal ein
     // und taut ihn auf. Liefe sie zuerst, waere „der Zaehler lief nach dem Wiederherstellen
     // weiter" eine Aussage ueber ihr Auftauen statt ueber den Checkpoint.
@@ -2399,20 +2430,123 @@ pub fn run(multiboot_info: u64) -> ! {
      * verschmilzt sie beim Freigeben ohnehin wieder; geprueft wird der *Eingang*.
      */
     const SPLIT: u64 = 8;
-    let total = ram_end - free_base;
-    let chunk = (total / SPLIT) & !0xfff;
+    /// Wie viele `mmap`-Eintraege hoechstens ausgewertet werden. Klein und sichtbar -- die
+    /// Struktur kommt vom Bootloader, und eine unbegrenzte Schleife ueber fremde Daten ist
+    /// keine Auswertung, sondern ein Vertrauensvorschuss.
+    const MAX_MMAP: usize = 16;
     let mut bi = super::bootinfo::HandoverInfo::empty();
     bi.ram_top = ram_end;
+    /*
+     * **E-Rest 3: der Speicherplan wird jetzt gelesen statt interpoliert.**
+     *
+     * Bisher stand hier `[free_base, ram_end)` als EIN Block. Das ist genau so lange richtig,
+     * wie der Speicher zusammenhaengt -- und sobald QEMU RAM oberhalb 4 GiB anlegt, tut er das
+     * nicht mehr: bei `-m 3G` liegen 2 GiB unter 4 GiB, 1 GiB ab 4 GiB, und dazwischen klafft
+     * das PCI-Loch `0x8000_0000..0x1_0000_0000`. Der Kernel meldete es dem Allokator als freies
+     * RAM -- gemessen `mem : freies RAM [0x1000000, 0x140000000)`, also 5070 MiB "frei" auf
+     * einer 3-GiB-Maschine. Eine Allokation dort trifft Geraeteregister oder gar nichts, und
+     * zwar erst dann, wenn genug Speicher verbraucht ist: also spaet, weit weg und ohne
+     * erkennbaren Zusammenhang.
+     *
+     * `ram_top` bleibt der **hoechste** Wert (daran haengt die Wahl des IOVA-Fensters); die
+     * Freiliste kommt aus den als verfuegbar gemeldeten Bereichen. Zwei Fragen, zwei Quellen.
+     */
+    let mut avail = [(0u64, 0u64); MAX_MMAP];
+    let mut navail = mbi.map(|m| m.ram_regions(&mut avail)).unwrap_or(0);
+    if navail == 0 {
+        // Kein auswertbarer Plan -> die alte Annahme, aber ausgesprochen statt unterstellt.
+        avail[0] = (free_base, ram_end.saturating_sub(free_base));
+        navail = 1;
+        println!("mem     : HINWEIS kein Bereichsplan -> Rueckfall auf einen Block");
+    }
     let mut gross = 0u64; // Summe vor dem Ausschnitt
-    for i in 0..SPLIT {
-        let base = free_base + i * chunk;
-        let len = if i == SPLIT - 1 { ram_end - base } else { chunk };
-        gross += len;
-        // Die Modulbereiche werden hier **ausgeschnitten**, nicht spaeter markiert: was nie als
-        // frei gemeldet wurde, kann auch nicht vergeben werden (A-1.1).
-        super::multiboot::subtract_holes(base, len, &mods[..nmods], &mut |b, l| {
-            bi.push_region(b, l);
-        });
+    // Einen Bereich in `SPLIT` Stuecke zerlegt in die Freiliste geben. Die Zerstueckelung ist
+    // eine Aussage ueber den **Eingang** (s. o.); der Allokator verschmilzt angrenzende Stuecke
+    // beim Einfuegen ohnehin sofort wieder.
+    let mut einspeisen = |a: u64, b: u64, gross: &mut u64, bi: &mut super::bootinfo::HandoverInfo| {
+        let chunk = ((b - a) / SPLIT) & !0xfff;
+        for k in 0..SPLIT {
+            let base = a + k * chunk;
+            let len = if k == SPLIT - 1 { b - base } else { chunk };
+            if len == 0 {
+                continue;
+            }
+            *gross += len;
+            // Die Modulbereiche werden hier **ausgeschnitten**, nicht spaeter markiert: was nie
+            // als frei gemeldet wurde, kann auch nicht vergeben werden (A-1.1).
+            super::multiboot::subtract_holes(base, len, &mods[..nmods], &mut |b, l| {
+                bi.push_region(b, l);
+            });
+        }
+    };
+    let grenze = hal::mmu::LOW_MAPPED_END;
+    // **Erst alles unter 4 GiB** -- das ist der Speicher, den es auf jeder Maschine gibt, und
+    // die Groesse seines kleinsten Bereichs entscheidet gleich ueber den Rest.
+    let mut unten_kleinster = u64::MAX;
+    for &(rb, rl) in &avail[..navail] {
+        // Was unterhalb von `free_base` liegt, gehoert dem Kernel-Image und den Boot-Tabellen.
+        let a = rb.max(free_base);
+        let b = rb.saturating_add(rl).min(grenze);
+        if b <= a {
+            continue;
+        }
+        unten_kleinster = unten_kleinster.min(b - a);
+        einspeisen(a, b, &mut gross, &mut bi);
+    }
+    if unten_kleinster == u64::MAX {
+        unten_kleinster = 0;
+    }
+    /*
+     * **Und jetzt der Teil oberhalb von 4 GiB -- mit einer Bedingung, die gemessen ist.**
+     *
+     * Der `PhysAllocator` waehlt BEST-FIT: das kleinste Fragment, in das die Anforderung passt.
+     * Solange der Speicher zusammenhaengt, gibt es genau ein Fragment, und die Belegung laeuft
+     * von unten nach oben. Auf diese unausgesprochene Eigenschaft verlassen sich zwei Stellen:
+     * `alloc_dma_region` und die Region einer isolierten PD MUESSEN in GiB 0 liegen (`system.rs`
+     * prueft `< GIB1_END`, weil `vspace_map_block` nur dort abbilden kann) -- und beide
+     * versuchen es **kein zweites Mal**. Was der Allokator liefert, gilt.
+     *
+     * Ein zweiter Bereich oberhalb 4 GiB bricht das, sobald er KLEINER ist als der untere:
+     * dann waehlt Best-Fit ihn fuer jede kleine Allokation, und die beiden Aufrufer bekommen
+     * eine Adresse, die sie nicht gebrauchen koennen. Gemessen bei `-m 3G` (unten 2032 MiB,
+     * oben 1024 MiB): `dmawin : FAILURES`, `dmatok : FAILURES`, `iso : spawn_isolated
+     * fehlgeschlagen` -- waehrend `-m 4G` und `-m 6G` gruen waren, weil dort der obere Bereich
+     * zufaellig groesser ist. Ein Fehler, der an einer Groessenrelation haengt und nicht an der
+     * Struktur, ist der unangenehmste: er verschwindet beim naechsten Messwert.
+     *
+     * Also fail-closed: der hohe Bereich geht nur dann in die Freiliste, wenn er **groesser**
+     * ist als der kleinste untere. Dann ruehrt Best-Fit ihn erst an, wenn unten nichts mehr
+     * passt -- also genau als Reserve, und die Belegungsordnung bleibt, wie sie war. Sonst
+     * bleibt er abgebildet, aber unvergeben, und die Zeile darunter SAGT das.
+     *
+     * Die eigentliche Luecke liegt nicht hier: dass GiB 0 eine knappe, besonders verlangte
+     * Ressource ist, weiss weder der Allokator noch `alloc_dma_region`. Solange der Aufrufer
+     * nimmt, was kommt, statt gezielt unterhalb 1 GiB anzufordern, haengt die Sache an der
+     * Belegungsordnung. Das gehoert nach `system.rs`/`sel4lake-mem`, nicht in den Speicherplan.
+     */
+    let mut hoch_abgebildet = 0u64;
+    let mut hoch_frei = 0u64;
+    let mut hoch_unabgebildet = 0u64;
+    for &(rb, rl) in &avail[..navail] {
+        let a = rb.max(free_base).max(grenze);
+        let b = rb.saturating_add(rl);
+        if b <= a {
+            continue;
+        }
+        // **Erst abbilden, dann verteilen.** In die Freiliste kann nur kommen, was
+        // `adopt_high_ram` als RAM in die Karte gelegt hat -- nicht ein Byte mehr. Ohne diese
+        // Kopplung waeren "was der Allokator ausgeben darf" und "was abgebildet ist" zwei
+        // Zahlen, die zueinander passen muessen; so ist es eine.
+        let Some((hb, hl)) = hal::mmu::adopt_high_ram(a, b - a) else {
+            hoch_unabgebildet += b - a;
+            continue;
+        };
+        hoch_abgebildet += hl;
+        hoch_unabgebildet += (b - a) - hl;
+        if hl > unten_kleinster {
+            hoch_frei += hl;
+            einspeisen(hb, hb + hl, &mut gross, &mut bi);
+        }
     }
     // Wieviel durch den Ausschnitt wegfiel -- als Zahl, nicht als Gefuehl.
     let net = bi.mem_regions().iter().map(|r| r.len).sum::<u64>();
@@ -2429,13 +2563,30 @@ pub fn run(multiboot_info: u64) -> ! {
     }
     system::init_mem_regions(&regions[..bi.n_regions as usize], bi.ram_top);
     println!(
-        "mem     : {} Bereiche a ~{} MiB ueber HandoverInfo (Quelle {}), verworfen={}",
+        "mem     : {} Bereiche / {} MiB ueber HandoverInfo (Quelle {}), verworfen={}",
         bi.n_regions,
-        chunk >> 20,
+        net >> 20,
         if bi.source == super::bootinfo::BootSource::Handover { "Kern-Uebergabe" } else { "Multiboot" },
         system::mem_regions_dropped()
     );
-    println!("mem     : freies RAM [{free_base:#x}, {ram_end:#x})");
+    print!(
+        "mem     : freies RAM ab {free_base:#x} aus {navail} gemeldeten Bereich(en), \
+         RAM-Oberkante {ram_end:#x}"
+    );
+    if hoch_abgebildet > 0 || hoch_unabgebildet > 0 {
+        // Drei Zahlen, weil es drei verschiedene Lagen sind, und ein stillschweigend kleinerer
+        // Speicher eine Fehldiagnose in Wartestellung ist: **abgebildet** (der Kernel kommt
+        // heran), **davon vergeben** (der Allokator darf es ausgeben -- nur wenn der Bereich
+        // groesser ist als der unterste, s. o.), **nicht abgebildet** (kein vollstaendig
+        // gedecktes 1-GiB-Blatt oder keine 1-GiB-Seiten auf dieser CPU).
+        print!(
+            " -- oberhalb 4 GiB: {} MiB abgebildet, davon {} MiB vergeben; {} MiB nicht abgebildet",
+            hoch_abgebildet >> 20,
+            hoch_frei >> 20,
+            hoch_unabgebildet >> 20
+        );
+    }
+    println!();
     if carved > 0 {
         println!("mem     : {carved} Byte fuer Multiboot-Module ausgeschnitten (vor der ersten Allokation)");
     }
@@ -2492,6 +2643,61 @@ pub fn run(multiboot_info: u64) -> ! {
         None => println!("pci     : {ndev} Geraet(e); kein virtio-rng"),
     }
     println!("pci     : {}", if ndev > 0 { "ALL PASS" } else { "FAILURES" });
+
+    // --- E-Rest 3: Registerfenster oberhalb von 4 GiB in die Karte holen ----------------------
+    //
+    // **Der Pfad von der BAR-Ermittlung zur Seitentabelle.** Sobald die Maschine Speicher
+    // oberhalb 4 GiB hat, legt SeaBIOS die 64-Bit-BARs in ein Loch bei 448 GiB -- gemessen:
+    // `cr2 = 0x70_0000_0014`, also `DEVICE_STATUS` des virtio-Transports, drei Zeilen nach
+    // dieser hier. Die Karte endete bei 4 GiB, die Seite war schlicht nicht da.
+    //
+    // Abgebildet wird **gezielt**, nicht flaechig: nur die 2-MiB-Bloecke, in denen wirklich ein
+    // BAR liegt. Eine flaechige 512-GiB-Karte waere billiger zu schreiben (512 PDPT-Eintraege,
+    // kein zusaetzlicher Rahmen) -- und haette zur Folge, dass jede erfundene Adresse in 448 GiB
+    // Nichts auf eine gueltige, beschreibbare Seite trifft.
+    //
+    // Die Zeile ist **sprechfaehig**: sie nennt beide Richtungen. Positivkontrolle -- jedes
+    // abgebildete Fenster wird durch die Seitentabellen aufgeloest und muss auf sich selbst
+    // zeigen. Negativkontrolle -- dieselbe Frage an ein GiB, das niemand abgebildet hat, muss
+    // `None` liefern. Ohne die zweite waere ein `ALL PASS` auch dann zu haben, wenn die Karte
+    // flaechig alles abbildet; ohne die erste hiesse "0 Fenster oberhalb 4 GiB" dasselbe wie
+    // "alles in Ordnung", und das sind zwei verschiedene Aussagen.
+    {
+        let mut ueber4 = 0usize;
+        let mut abgebildet = 0usize;
+        let mut aufloesbar = 0usize;
+        let mut erste = 0u64;
+        hal::pcie::for_each_bar(&mut |base, len| {
+            if base.saturating_add(len) <= hal::mmu::LOW_MAPPED_END {
+                return; // unter 4 GiB: steht seit `mmu::init_primary`
+            }
+            ueber4 += 1;
+            if erste == 0 {
+                erste = base;
+            }
+            if hal::mmu::map_device_window_global(base, len) {
+                abgebildet += 1;
+                if hal::mmu::resolve_global(base) == Some(base) {
+                    aufloesbar += 1;
+                }
+            }
+        });
+        // Das oberste GiB des einen benutzten PML4-Eintrags: dort bildet dieser Kernel
+        // grundsaetzlich nichts ab. Faende der Aufloeser hier etwas, waere die Karte flaechig
+        // geworden -- und die Positivkontrolle darueber wertlos.
+        let leer = hal::mmu::resolve_global(511 * (1 << 30)).is_none();
+        let (dev_gib, ram_gib, gib_seiten) = hal::mmu::high_map_report();
+        println!(
+            "himap   : BAR-Fenster oberhalb 4 GiB: {ueber4} gefunden, {abgebildet} abgebildet, \
+             {aufloesbar} durch die Seitentabellen aufloesbar (erstes {erste:#x}); \
+             hohe GiB: {dev_gib} Geraet + {ram_gib} RAM, 1-GiB-Seiten={gib_seiten}, \
+             unabgebildetes GiB bleibt unabgebildet={leer}"
+        );
+        println!(
+            "himap   : {}",
+            if abgebildet == ueber4 && aufloesbar == ueber4 && leer { "ALL PASS" } else { "FAILURES" }
+        );
+    }
 
     // --- virtio-pci auf x86, Teil 1 von 2 (A-5.2) -------------------------------------------
     //
@@ -2906,16 +3112,28 @@ pub fn run(multiboot_info: u64) -> ! {
             .map(|d| d.rid())
             .unwrap_or(0);
         let w = crate::dmatests::run_dmawin(live_rid);
+        // **Drei unterscheidbare Faelle, nicht zwei.** Die Vorgaengerzeile druckte `=1` und
+        // bedeutete damit wahlweise „geprueft und frei" oder „gar nicht geprueft" -- im schwachen
+        // Zweig gab der Pruefer `true` zurueck, obwohl das Fenster `[0, 512 GiB)` den Sperrbereich
+        // ENTHAELT. Wer aus einer solchen Zeile liest, kann den Unterschied nicht sehen; deshalb
+        // steht das Urteil jetzt im Klartext und die Begruendung dahinter.
         println!(
-            "dmawin  : B-3.4 kein Kontext-Fenster im Interrupt-Nachrichtenbereich \
-             (0xFEE0_0000..0xFEF0_0000)={} -- dorthin geschriebene DMA waere fuer VT-d eine \
+            "dmawin  : B-3.4 Fenster gegen den Interrupt-Nachrichtenbereich \
+             (0xFEE0_0000..0xFEF0_0000): {} -- dorthin geschriebene DMA waere fuer VT-d eine \
              Interrupt-Nachricht und wuerde gar nicht uebersetzt: kein Fault, keine Fehlerzeile, \
              nur Daten, die nirgends ankommen",
-            w.msi_clear as u8
+            crate::dmatests::msi_klartext(w.msi.policy)
+        );
+        println!(
+            "dmawin  : B-3.4 belegte-DMA-Kontexte={} davon-schwaches-Fenster={} \
+             Fenster-weicht-von-der-Politik-ab={} eingetragenes-Fenster-im-Sperrbereich={} \
+             (das schwache Fenster ist [0, 512 GiB) und enthaelt den Sperrbereich -- die Zahl \
+             erklaert ein VERLETZT, statt es zu ersetzen)",
+            w.msi.live, w.msi.weak, w.msi.drift, w.msi.live_overlaps
         );
         println!("dmawin  : 32-Bit-Geraet-abgewiesen={} Fenster-voll-abgewiesen={} Kontext-danach-intakt={} balanciert={} Geraete-ohne-deklarierte-Adressbreite={}",
             w.narrow, w.exhausted, w.intact, w.balanced, w.undeclared);
-        println!("dmawin  : {}", if w.ok { "ALL PASS" } else { "FAILURES" });
+        println!("dmawin  : {}", w.verdict().wort());
         let tk = crate::dmatests::run_dmatok(live_rid);
         println!("dmatok  : attach-installierte-Uebersetzung={} delete-ohne-detach-baut-ab={} Region-danach-frei={} unbestaetigte-Stilllegung-bleibt-pending={} Audit-Code-7-haelt={}",
             tk.attached, tk.tears, tk.freed, tk.pending, tk.audit7);

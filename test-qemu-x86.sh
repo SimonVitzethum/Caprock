@@ -236,6 +236,33 @@ check "sched   : ALL PASS"            "Stufe 4: praeemptiver Scheduler (LAPIC-Ti
 check "ipc     : ALL PASS"            "Stufe 4: cap-gesicherte IPC (CALL/RECV/REPLY zwischen zwei PDs)"
 check "ring3   : ALL PASS"            "Stufe 4c: Ring-3-Threads (Syscall aus Ring 3; Zugriff auf Kernel-Speicher faultet -> Thread beendet, Kernel laeuft weiter)"
 check "pci     : ALL PASS"            "PCI-Enumeration ueber das ECAM-Fenster aus der ACPI-MCFG (virtio-rng gefunden, Bus-Master an)"
+# E-Rest 3: die Karte oberhalb von 4 GiB. Auf einer kleinen Maschine gibt es dort nichts, und
+# genau deshalb steht hier eine Pruefung und kein Filter: die Zeile nennt BEIDE Richtungen --
+# jedes gefundene Fenster ist abgebildet UND durch die Seitentabellen aufloesbar (Positivkontrolle),
+# und ein GiB, das niemand abgebildet hat, ist weiterhin nicht aufloesbar (Negativkontrolle).
+# Ohne die zweite waere ein ALL PASS auch mit einer flaechig abgebildeten 512-GiB-Karte zu haben,
+# und dann traefe jeder verirrte Zeiger in 448 GiB Nichts eine gueltige, beschreibbare Seite.
+# Die Aussage wird erst ab `-m 3G` scharf; ab dort legt SeaBIOS die virtio-BARs bei 448 GiB ab,
+# und bis 2026-08-03 starb der Boot genau daran (`#PF`, `cr2 = 0x0000_0070_0000_0014`).
+check "himap   : ALL PASS" "E-Rest 3: jedes BAR-Fenster oberhalb 4 GiB ist abgebildet und aufloesbar, und ein nicht abgebildetes GiB bleibt es -- die Identity-Map waechst gezielt statt flaechig (RAM-Groesse als Testparameter: mit 512M ist die Zahl 0, ab 3G ist sie 3)"
+# E-Rest 3, zweite Haelfte: bleibt die GETEILTE Geraete-Tabelle oberhalb 4 GiB sauber?
+# Drei Ausgaenge, und alle drei sind hier ausgesprochen -- SKIP ist KEIN Bestehen:
+#   ALL PASS -- es gab mindestens eine private Kopie fuer eine isolierte PD, und die geteilte
+#               Tabelle traegt trotzdem keinen PD-spezifischen Eintrag.
+#   SKIP     -- keine Treiber-PD hat ein Fenster oberhalb 4 GiB bekommen; diese Suite laedt kein
+#               Boot-Archiv, also ist das hier der Normalfall (die Lade-Suite urteilt).
+#   FAILURES -- in der geteilten Tabelle steht etwas, das dort nicht stehen darf: dann haette das
+#               Fenster einer PD JEDE isolierte PD erreicht, bei korrekt durchlaufender Cap-Pruefung.
+# Die FEHLENDE Zeile ist ebenfalls ein FAIL: sie wird bedingungslos gedruckt.
+if echo "$OUT" | grep -q "^hiiso   : FAILURES"; then
+    echo "  FAIL: E-Rest 3: $(echo "$OUT" | grep -m1 '^hiiso   :')"; fail=1
+elif echo "$OUT" | grep -q "^hiiso   : ALL PASS"; then
+    echo "  PASS: E-Rest 3: eine isolierte PD bekam ihr Geraetefenster oberhalb 4 GiB in einer PRIVATEN Kopie -- die geteilte Tabelle blieb unberuehrt"
+elif echo "$OUT" | grep -q "^hiiso   : SKIP"; then
+    echo "  SKIP (keine Treiber-PD mit Fenster oberhalb 4 GiB -- diese Suite laedt kein Archiv; die Lade-Suite urteilt): geteilte Geraete-Tabelle oberhalb 4 GiB"
+else
+    echo "  FAIL: E-Rest 3: keine hiiso-Zeile im Protokoll -- der Hochlauf ist vorher stehengeblieben"; fail=1
+fi
 check "virtio  : ALL PASS" "A-5.2: virtio-pci auf x86 -- arch-neutraler Treiber; VOR dem VT-d-Aufbau liefert das Geraet echte Bytes per Bus-Master-DMA, NACH dem Aufbau kommt dasselbe Geraet ohne Zuteilung nicht mehr durch (VT-d-Fault). Beide Richtungen, nicht nur die bequeme"
 check "vblk    : ALL PASS" "A-5.2: virtio-blk -- dreigliedrige Deskriptorkette (Anfragekopf, den das GERAET LIEST; Datenpuffer; Statusbyte). Der gelieferte Sektor traegt die Magie, die diese Suite ins Abbild schreibt; nach dem VT-d-Aufbau erreicht das Geraet den Anfragekopf nicht mehr -- damit ist die LESERICHTUNG gesperrt belegt, die der RNG-Test strukturell nicht zeigen kann"
 check "vnet    : ALL PASS" "A-5.2: virtio-net -- ZWEI Queues mit getrenntem queue_notify_off (bei einem Einqueue-Geraet kann der Vertauschungsfehler gar nicht auftreten); die ARP-ANTWORT auf die eigene Anfrage belegt Senden und Empfangen inhaltlich, ein bloss gefuellter Puffer koennte Restspeicher sein"

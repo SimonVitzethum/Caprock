@@ -11,9 +11,92 @@
 //! Interface mit einer Implementierung ist keine Abstraktion, sondern eine Umbenennung.
 
 use crate::system;
+use crate::system::{MsiClearance, MsiWindows};
 use sel4lake_cap::{DmaCoherence, DmaDir};
 use sel4lake_mem::Rights;
 use sel4lake_hal as hal;
+
+/// Wie eine Zusammenfassungszeile ausgeht. Drei Werte, weil `bool` den dritten nicht tragen kann
+/// (B-1.2c: jede Zusammenfassungszeile ist `ALL PASS`, `FAILURES` oder `SKIP` — sonst faellt sie
+/// aus der Ergebnissignatur, und was aus der Signatur faellt, wird von der Wiederholungsmessung
+/// nicht mehr verglichen).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Verdict {
+    Pass,
+    Fail,
+    /// Nicht entscheidbar. Zaehlt **nicht** als bestanden.
+    Skip,
+}
+
+impl Verdict {
+    pub fn wort(self) -> &'static str {
+        match self {
+            Verdict::Pass => "ALL PASS",
+            Verdict::Fail => "FAILURES",
+            Verdict::Skip => "SKIP",
+        }
+    }
+    /// Fuer den aarch64-Weg, der das Ergebnis in einem `AtomicU32` bis zum Bericht traegt.
+    /// (Auf x86 entsteht der Bericht an Ort und Stelle, deshalb dort ohne Aufrufer.)
+    #[allow(dead_code)]
+    pub fn code(self) -> u32 {
+        match self {
+            Verdict::Pass => 0,
+            Verdict::Fail => 1,
+            Verdict::Skip => 2,
+        }
+    }
+    /// Gegenstueck zu [`Verdict::code`]. **Unbekannt ist `Fail`, nicht `Pass`** — ein Wert, den
+    /// niemand gesetzt hat, darf nicht als bestanden zurueckkommen.
+    #[allow(dead_code)]
+    pub fn from_code(c: u32) -> Verdict {
+        match c {
+            0 => Verdict::Pass,
+            2 => Verdict::Skip,
+            _ => Verdict::Fail,
+        }
+    }
+}
+
+/// [`MsiClearance`] als `u32` — derselbe Grund wie bei [`Verdict::code`].
+#[allow(dead_code)]
+pub fn msi_code(c: MsiClearance) -> u32 {
+    match c {
+        MsiClearance::Clear => 0,
+        MsiClearance::Overlaps => 1,
+        MsiClearance::Undecidable => 2,
+    }
+}
+
+/// Gegenstueck zu [`msi_code`]. Unbekannt ist `Undecidable`, nicht `Clear`.
+#[allow(dead_code)]
+pub fn msi_from_code(c: u32) -> MsiClearance {
+    match c {
+        0 => MsiClearance::Clear,
+        1 => MsiClearance::Overlaps,
+        _ => MsiClearance::Undecidable,
+    }
+}
+
+/// Das B-3.4-Urteil im Klartext — mit **Grund**, nicht als Zahl.
+///
+/// Ein `=1` in einer Berichtszeile kann „geprueft und frei" und „konnte gar nicht urteilen" nicht
+/// auseinanderhalten. Genau diese Verwechslung stand hier: der Pruefer meldete `1`, waehrend das
+/// Fenster den Sperrbereich enthielt.
+pub fn msi_klartext(c: MsiClearance) -> &'static str {
+    match c {
+        MsiClearance::Clear => "GEPRUEFT, frei (jedes der NDMA_CTX Slot-Fenster liegt vollstaendig ausserhalb)",
+        MsiClearance::Overlaps => {
+            "GEPRUEFT, VERLETZT -- mindestens ein Slot-Fenster schneidet den Bereich (der schwache \
+             Zweig vergibt [0, 512 GiB) und enthaelt ihn damit vollstaendig)"
+        }
+        MsiClearance::Undecidable => {
+            "NICHT ENTSCHEIDBAR -- die RAM-Oberkante ist noch nicht bekannt oder das Fenster ist \
+             entartet; jede Fensterlage waere hier gerechnete Fiktion. Das ist ein SKIP und zaehlt \
+             NICHT als bestanden"
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct DmaWin {
@@ -23,13 +106,44 @@ pub struct DmaWin {
     pub intact: bool,
     pub balanced: bool,
     pub undeclared: u32,
-    /// B-3.4: liegt **jedes** Kontext-Fenster ausserhalb des Interrupt-Nachrichtenbereichs?
+    /// B-3.4: wie steht **jedes** Kontext-Fenster zum Interrupt-Nachrichtenbereich?
     ///
     /// Eigenes Feld und keine stille Konjunktion: die anderen Grenzen fuehren zu einem sauberen
     /// Fehlschlag, dieser Bereich zu **gar keinem** — VT-d liest eine DMA-Schreibung dorthin als
     /// Interrupt-Nachricht und befragt die Uebersetzung nicht. Kein Fault, keine Fehlerzeile, nur
     /// Daten, die nirgends ankommen. Genau deshalb muss die Aussage einzeln dastehen.
-    pub msi_clear: bool,
+    ///
+    /// **Drei Zustaende, nicht zwei.** Vorher stand hier ein `bool`, und der konnte
+    /// „geprueft-und-frei" von „gar nicht geprueft" nicht unterscheiden — der Pruefer gab im
+    /// schwachen Zweig `true` zurueck, obwohl das Fenster den Bereich enthielt.
+    pub msi: MsiWindows,
+}
+
+impl DmaWin {
+    /// Das Urteil ueber die `dmawin`-Zeile.
+    ///
+    /// **Reihenfolge mit Absicht:** was KAPUTT ist, wird zuerst gemeldet. Ein SKIP, der einen
+    /// echten Fehlschlag verdeckt, waere genau die Stille, die hier gerade beseitigt wird.
+    pub fn verdict(&self) -> Verdict {
+        let hart = self.narrow
+            && self.exhausted
+            && self.intact
+            && self.balanced
+            // **Sprechfaehigkeit der Live-Erhebung.** `weak`/`drift`/`live_overlaps` sind ohne
+            // einen belegten Kontext strukturell 0 -- sie koennten dann gar nicht anschlagen, und
+            // ihre Nullen waeren keine Aussage. Die Erhebung laeuft, waehrend `wide_sid` seinen
+            // Kontext haelt; sieht sie keinen, hat sie nichts geprueft.
+            && self.msi.live > 0
+            && self.msi.drift == 0
+            && self.msi.live_overlaps == 0
+            && system::domain_audit() == 0;
+        match self.msi.policy {
+            MsiClearance::Overlaps => Verdict::Fail,
+            _ if !hart => Verdict::Fail,
+            MsiClearance::Undecidable => Verdict::Skip,
+            MsiClearance::Clear => Verdict::Pass,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -54,7 +168,7 @@ pub fn run_dmawin(live_sid: u32) -> DmaWin {
     let mut r = DmaWin::default();
     // B-3.4 zuerst, weil es keine Ressourcen braucht und auch dann gilt, wenn der Rest des Tests
     // mangels Speicher gar nicht laeuft.
-    r.msi_clear = (0..system::ndma_ctx()).all(system::iova_window_clear_of_msi);
+    r.msi = system::dma_msi_windows();
     let _ = live_sid;
     let (narrow_sid, wide_sid) = (0x50u32, 0x51u32);
     hal::cpu::local_irq_disable();
@@ -94,6 +208,25 @@ pub fn run_dmawin(live_sid: u32) -> DmaWin {
     let intact = system::testsupport::dma_ctx_region_count(wide_sid) == 1
         && system::dma_audit() == 0
         && system::vspace_audit() == 0;
+
+    // **Zweite B-3.4-Erhebung -- jetzt mit einem LEBENDEN Kontext.**
+    //
+    // Die erste (ganz oben) urteilt ueber die Fenster-POLITIK und braucht dafuer keinen Kontext;
+    // genau deshalb steht sie vorn und gilt auch dann, wenn dieser Test mangels Speicher gar nicht
+    // laeuft. Sie sieht `DmaCtx::strong_window` aber NIE: zu diesem Zeitpunkt ist kein Slot belegt
+    // (gemessen: `belegte-DMA-Kontexte=0`), und dann sind `weak`, `drift` und `live_overlaps`
+    // strukturell 0 -- drei Zahlen, die gar nicht anschlagen KOENNEN. Das waere dieselbe Sorte
+    // stiller Zustimmung, die dieser Eintrag gerade beseitigt.
+    //
+    // Hier gibt es einen Kontext: `wide_sid` haelt seinen bis zum `dma_disable` unten. Damit wird
+    // `strong_window` wirklich gelesen und gegen die Politik gegengeprueft (`drift`).
+    let live = system::dma_msi_windows();
+    r.msi.policy = r.msi.policy.worse(live.policy);
+    r.msi.live = live.live;
+    r.msi.weak = live.weak;
+    r.msi.drift = live.drift;
+    r.msi.live_overlaps = live.live_overlaps;
+
     if first.is_some() {
         system::dma_disable(wide_sid, r1.base, r1.len);
     }
@@ -107,8 +240,9 @@ pub fn run_dmawin(live_sid: u32) -> DmaWin {
     r.intact = intact;
     r.balanced = balanced;
     r.undeclared = system::testsupport::dma_undeclared_devices();
-    r.ok = narrow && exhausted && intact && balanced && r.msi_clear
-        && system::domain_audit() == 0;
+    // `ok` heisst **bestanden**, nicht „nicht durchgefallen": ein SKIP zaehlt nicht mit. „Nicht
+    // messbar ist kein bestandener Test" — dieselbe Festlegung wie bei `loadstop`.
+    r.ok = r.verdict() == Verdict::Pass;
     r
 }
 

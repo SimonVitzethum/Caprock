@@ -3882,27 +3882,148 @@ fn strong_window_base() -> Option<u64> {
     }
 }
 
-/// Wie viele DMA-Kontext-Slots es gibt (fuer Tests, die ueber alle laufen wollen).
-pub fn ndma_ctx() -> usize {
-    NDMA_CTX
+// `ndma_ctx()` ist entfallen: der einzige Aufrufer war `(0..ndma_ctx()).all(iova_window_clear_of_msi)`
+// in `dmatests`, und der Lauf ueber alle Slots gehoert jetzt nach `dma_msi_windows` — dort, wo die
+// Slotzahl auch die Kontexttabelle indiziert. Ein Accessor ohne Leser ist eine Behauptung ueber
+// eine Unterscheidung, die nirgends wirkt.
+
+/// Wie steht das IOVA-Fenster eines Slots zum Interrupt-Nachrichtenbereich? (B-3.4)
+///
+/// **Warum das kein `bool` mehr ist.** Ein `bool` kann nur „frei" und „nicht frei" sagen — und
+/// genau daran ist die Vorgaengerfassung gescheitert. Sie gab im schwachen Zweig `true` zurueck,
+/// mit der Begruendung „kein starkes Fenster -> es gibt nichts zu ueberlappen". Das stimmt nur,
+/// wenn es GAR KEIN Fenster gibt. Tatsaechlich ist das schwache Fenster `[0, S1_INPUT_LIMIT)`
+/// und **enthaelt** den Sperrbereich; der Pruefer gab also Schweigen als Erfolg aus. Dieselbe
+/// Form wie die leere Event-Queue ohne `CD.R` und wie `virtio-rng` als angeblicher Beleg fuer
+/// die Leserichtung: eine Aussage sieht wahr aus, weil der Fall, der sie widerlegen koennte,
+/// im Pruefer gar nicht vorkommt.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MsiClearance {
+    /// **Geprueft und frei**: das Fenster liegt vollstaendig ausserhalb des Sperrbereichs.
+    Clear,
+    /// **Geprueft und verletzt**: das Fenster schneidet den Sperrbereich. Eine IOVA daraus liest
+    /// VT-d als Interrupt-Nachricht und uebersetzt sie gar nicht — kein Fault, keine Fehlerzeile,
+    /// nur Daten, die nirgends ankommen.
+    Overlaps,
+    /// **Nicht entscheidbar**: dem Pruefer fehlt die Grundlage. Wird als SKIP berichtet und
+    /// zaehlt **nicht** als bestanden — „nicht messbar" ist kein bestandener Test.
+    Undecidable,
 }
 
-/// **B-3.4-Nachweis:** liegt das Fenster eines Slots vollstaendig ausserhalb des
-/// Interrupt-Nachrichtenbereichs?
+impl Default for MsiClearance {
+    /// Fail-closed: ein nie gesetztes Ergebnis darf nicht als „bestanden" durchgehen. `Clear` als
+    /// Vorgabe waere genau der Fehler, der hier gerade behoben wird, nur eine Ebene hoeher.
+    fn default() -> Self {
+        MsiClearance::Undecidable
+    }
+}
+
+impl MsiClearance {
+    /// Das schlechtere von zwei Urteilen. **Reihenfolge mit Absicht:** kaputt schlaegt
+    /// unentscheidbar schlaegt frei — dieselbe Ordnung wie in `pprobe`, wo ein SKIP nie einen
+    /// Bilanzfehler verdecken darf.
+    pub fn worse(self, other: MsiClearance) -> MsiClearance {
+        use MsiClearance::*;
+        match (self, other) {
+            (Overlaps, _) | (_, Overlaps) => Overlaps,
+            (Undecidable, _) | (_, Undecidable) => Undecidable,
+            _ => Clear,
+        }
+    }
+}
+
+/// **B-3.4-Nachweis:** wie steht das Fenster des Slots `slot` zum Interrupt-Nachrichtenbereich?
 ///
 /// Als eigene Funktion, damit die Aussage pruefbar ist und nicht bloss aus der Konstruktion folgt.
 /// „Folgt aus der Konstruktion" ist genau die Sorte Begruendung, die nach der naechsten Aenderung
 /// nicht mehr stimmt und die niemand nachrechnet.
-pub fn iova_window_clear_of_msi(slot: usize) -> bool {
+///
+/// Geprueft wird das Fenster, das [`slot_window`] dem Slot gibt — **dieselbe** Funktion, die auch
+/// `ctx_assign_window` benutzt. Vorher rechnete der Pruefer die Fensterlage selbst nach und
+/// bildete dabei nur den *starken* Zweig ab; die beiden konnten also auseinanderlaufen, und sie
+/// sind es. Ein Pruefer, der die gepruefte Groesse nachbaut statt sie zu lesen, prueft seine
+/// eigene Kopie.
+pub fn iova_window_clear_of_msi(slot: usize) -> MsiClearance {
     let Some((msi, len)) = hal::iommu::interrupt_message_window() else {
-        return true; // diese Architektur hat keinen solchen Bereich (Zusage, s. HAL)
+        // Das ist eine **Zusage** der HAL und keine Unkenntnis: „diese Architektur hat keinen
+        // Bereich, der die Uebersetzung umgeht" (s. `aarch64::iommu`, ITS-Doorbell). Damit ist
+        // die Frage beantwortet, nicht uebersprungen.
+        return MsiClearance::Clear;
     };
-    let Some(first) = strong_window_base() else {
-        return true; // kein starkes Fenster -> es gibt nichts zu ueberlappen
+    // **Sprechfaehigkeit vor Urteil.** Ohne bekannte RAM-Oberkante ist jedes hier gerechnete
+    // Fenster eine Fiktion: `strong_window_base()` liefert dann eine Basis, die mit dem spaeter
+    // wirklich vergebenen Fenster nichts zu tun hat, und ein „frei" darueber waere eine Aussage
+    // ueber eine Zahl, die es noch nicht gibt.
+    if RAM_TOP.load(Ordering::Acquire) == 0 {
+        return MsiClearance::Undecidable;
+    }
+    let (base, limit, _strong) = slot_window(slot);
+    if limit <= base {
+        // Entartetes Fenster (Groesse 0): der Slot kann keine IOVA vergeben, die Aussage „das
+        // Fenster meidet den Bereich" hat keinen Inhalt. Kein Erfolg, sondern kein Befund.
+        return MsiClearance::Undecidable;
+    }
+    if base >= msi + len || limit <= msi {
+        MsiClearance::Clear
+    } else {
+        MsiClearance::Overlaps
+    }
+}
+
+/// Die B-3.4-Lage ueber **alle** Kontext-Slots, plus die Zahlen, die den Befund erklaeren.
+#[derive(Clone, Copy, Default)]
+pub struct MsiWindows {
+    /// Urteil ueber die Fenster-**Politik**: was [`slot_window`] jedem der `NDMA_CTX` Slots gibt,
+    /// unabhaengig davon, ob dort gerade ein Kontext sitzt. Das ist die tragende Aussage — ein
+    /// Pruefer, der nur belegte Slots ansaehe, haette in einem Lauf ohne DMA-Kontext gar nichts
+    /// geprueft und trotzdem gruen gemeldet.
+    pub policy: MsiClearance,
+    /// Belegte Kontexte zum Messzeitpunkt.
+    pub live: u32,
+    /// Davon auf einem **schwachen** Fenster (`DmaCtx::strong_window == false`).
+    pub weak: u32,
+    /// Belegte Kontexte, deren eingetragenes Fenster von dem abweicht, das die Politik fuer
+    /// ihren Slot vorsieht (Basis, Grenze **oder** `strong_window`). Muss 0 sein.
+    pub drift: u32,
+    /// Belegte Kontexte, deren **eingetragenes** Fenster den Sperrbereich schneidet.
+    pub live_overlaps: u32,
+}
+
+/// Die B-3.4-Lage erheben — Politik **und** eingetragener Zustand.
+///
+/// Zwei Quellen mit Absicht: `policy` rechnet nach, was der Zuteiler vergeben wuerde, `drift`
+/// vergleicht das mit dem, was die belegten Kontexte wirklich tragen. Eine Zahl allein waere
+/// hier wieder nur eine Hand — genau der Fehler, den `boot_arg` mit der Archivgroesse gemacht hat.
+pub fn dma_msi_windows() -> MsiWindows {
+    let mut r = MsiWindows {
+        policy: MsiClearance::Clear,
+        ..Default::default()
     };
-    let size = window_size(first);
-    let base = first + slot as u64 * size;
-    base >= msi + len || base + size <= msi
+    // Politik zuerst, und zwar OHNE den Kontext-Lock: sie braucht keinen Kontext.
+    for slot in 0..NDMA_CTX {
+        r.policy = r.policy.worse(iova_window_clear_of_msi(slot));
+    }
+    let window = hal::iommu::interrupt_message_window();
+    let t = DMA_CTX.lock();
+    for (slot, c) in t.iter().enumerate() {
+        if !c.used {
+            continue;
+        }
+        r.live += 1;
+        if !c.strong_window {
+            r.weak += 1;
+        }
+        let (base, limit, strong) = slot_window(slot);
+        if c.iova_base != base || c.iova_limit != limit || c.strong_window != strong {
+            r.drift += 1;
+        }
+        if let Some((msi, len)) = window {
+            if c.iova_base < msi + len && c.iova_limit > msi {
+                r.live_overlaps += 1;
+            }
+        }
+    }
+    r
 }
 
 /// Fenstergröße je Kontext-Slot: der gesamte Raum zwischen RAM-Oberkante und Eingangsgrenze,
@@ -3930,28 +4051,43 @@ fn window_size(first: u64) -> u64 {
 /// bewiesene und keine erzwungene Eigenschaft ist (s. Teardown-Token in `todo.md`).
 static SLOT_IOVA_NEXT: [AtomicU64; NDMA_CTX] = [const { AtomicU64::new(0) }; NDMA_CTX];
 
-/// Dem Kontext im Slot `slot` sein IOVA-Fenster zuweisen.
+/// Das Fenster des Slots `slot`: `(base, limit, strong)`.
 ///
 /// Die Fenster liegen hintereinander, damit zwei Kontexte nie dieselbe IOVA vergeben — sonst
 /// wäre die Bounds-Prüfung eines Treibers gegen den *eigenen* Kontext wertlos, sobald ein zweiter
 /// dieselben Zahlen benutzt.
-fn ctx_assign_window(c: &mut DmaCtx, slot: usize) {
+///
+/// **Eine Quelle fuer Zuteiler und Pruefer.** Vorher rechnete `iova_window_clear_of_msi` die Lage
+/// selbst nach und bildete dabei nur den starken Zweig ab — der Pruefer prueft dann seine eigene
+/// Kopie, nicht die vergebene Groesse. Wer hier etwas aendert, aendert beides zugleich; das ist
+/// der Punkt.
+fn slot_window(slot: usize) -> (u64, u64, bool) {
     match strong_window_base() {
         Some(first) => {
             let size = window_size(first);
-            c.iova_base = first + slot as u64 * size;
-            c.iova_limit = c.iova_base + size;
-            c.strong_window = true;
+            let base = first + slot as u64 * size;
+            (base, base + size, true)
         }
         None => {
             // Kein Platz oberhalb des RAM: schwaches Fenster (die Trennung gilt weiterhin, aber
             // eine IOVA *könnte* zufällig wie eine PA aussehen). Auf dieser Plattform gibt es das
             // nicht; der Zweig existiert für 32-Bit-Geräte / kleine Eingangsbreiten.
-            c.iova_base = 0;
-            c.iova_limit = S1_INPUT_LIMIT;
-            c.strong_window = false;
+            //
+            // **Auf x86 ist dieses Fenster nicht bloss schwach, sondern verletzt B-3.4:** es
+            // enthaelt `0xFEE0_0000..0xFEF0_0000`. Genau deshalb urteilt
+            // `iova_window_clear_of_msi` hier `Overlaps` und nicht mehr `true`.
+            (0, S1_INPUT_LIMIT, false)
         }
     }
+}
+
+/// Dem Kontext im Slot `slot` sein IOVA-Fenster zuweisen — die Lage kommt aus [`slot_window`],
+/// damit der Pruefer dieselbe Quelle liest.
+fn ctx_assign_window(c: &mut DmaCtx, slot: usize) {
+    let (base, limit, strong) = slot_window(slot);
+    c.iova_base = base;
+    c.iova_limit = limit;
+    c.strong_window = strong;
     // Bump des Slots fortsetzen, nicht neu beginnen.
     let prev = SLOT_IOVA_NEXT[slot].load(Ordering::Relaxed);
     c.iova_next = if prev >= c.iova_base && prev < c.iova_limit {

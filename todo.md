@@ -697,22 +697,46 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
 ## D0. Instabilität des x86-Laufs (2026-07-29, **neu gemessen 2026-08-01 und 2026-08-03**)
 **Klasse:** Fehler · **Aufwand:** eingegrenzt, Vollprotokoll eines Hängers steht aus
 
-- [ ] **800 Läufe am 2026-08-03, keine einzige Abweichung — und das reicht noch nicht.**
-      Gemessen nach dem Tagesstand (Z4 Stufe 2, A-5.4, B-7.3):
+- [ ] **2300 Läufe am 2026-08-03, keine einzige Abweichung. Die alte Quote ist damit
+      ausgeschlossen — die URSACHE ist es nicht.** Gemessen nach dem Tagesstand (Z4 Stufe 2,
+      A-5.4, B-7.3):
 
       | Reihe | Läufe | Bedingung | Ergebnis |
       |---|---|---|---|
       | vormittags | 200 | Leerlauf, KVM | 200 von 200, identische Signatur |
-      | nachmittags | 600 | 5 parallele Ströme à 120, 20 vCPU auf 20 Kernen | 600 von 600, identische Signatur |
+      | mittags | 600 | 5 parallele Ströme à 120, 20 vCPU auf 20 Kernen | 600 von 600 |
+      | nachmittags | 1500 | 5 parallele Ströme à 300, 8 min Wandzeit | 1500 von 1500 |
 
-      **Warum das D0 nicht schließt.** Die relevante Grundlinie ist nicht die alte Gesamtquote
-      von 1,5 % (6/400) — davon waren **4 das Farbrennen**, und das ist seit dem 2026-08-01
-      behoben (500/500). Für das hier noch offene Bild, den **Hänger ab `sched`**, lautet sie
-      2/400 unter Last und 1/200 im Leerlauf, also rund **0,5 %**. Dagegen ist eine saubere
-      800er-Reihe `0,995⁸⁰⁰ ≈ 2 %`: auffällig, aber kein Ausschluss. Obere 95-%-Schranke nach
-      der Dreierregel: `3/800 ≈ 0,4 %`. Für einen echten Ausschluss braucht es rund **1500
-      Läufe** — bei 0,86 s je Lauf und fünf Strömen ist das eine Viertelstunde, es scheitert
-      also nicht am Preis.
+      Alle fünf Ströme beider Lastreihen tragen dieselbe Signatur `e419003d625f` — auch über
+      die beiden getrennten Aufrufe hinweg.
+
+      **Die Grundlinie, gegen die zu rechnen ist.** Nicht die alte Gesamtquote von 1,5 %
+      (6/400): davon waren **4 das Farbrennen**, und das ist seit dem 2026-08-01 behoben
+      (500/500). Für das hier noch offene Bild, den **Hänger ab `sched`**, lautet sie 2/400
+      unter Last und 1/200 im Leerlauf, also rund **0,5 %**.
+
+      | Frage | Antwort |
+      |---|---|
+      | Ist eine Rate von 0,5 % noch haltbar? | **Nein.** `0,995²³⁰⁰ ≈ 1·10⁻⁵` |
+      | Ist eine Rate von 0,1 % ausgeschlossen? | **Nein.** `0,999²³⁰⁰ ≈ 10 %` |
+      | Obere 95-%-Schranke (Dreierregel) | `3/2300 ≈ 0,13 %` |
+
+      **Was hier NICHT behauptet wird, und das ist der eigentliche Punkt.** Niemand hat diesen
+      Hänger behoben. Die letzte D0-Arbeit hat das *Farbrennen* beseitigt, nicht ihn. Er ist
+      also nicht *repariert*, sondern **unter die Messschwelle gefallen** — und dafür gibt es
+      drei Erklärungen, die diese Messung nicht auseinanderhält: (a) eine der vielen Änderungen
+      seither (A-5.x, B-5.1, Root-Task auf x86, Z4) hat ihn nebenbei mitgenommen, (b) die
+      Lastform ist eine andere — die alte Serie lief parallel zur **Lade-Suite**, die neue gegen
+      fünf Kopien ihrer selbst, (c) die alte Quote 2/400 war eine Schwankung und die wahre Rate
+      lag immer bei ~0,1 %, wo sie auch jetzt noch liegen dürfte.
+
+      Ein Fehler, der ohne bekannte Ursache verschwindet, ist nicht zu. Er ist nur nicht mehr
+      **greifbar** — und damit auch nicht mehr debuggbar, was die Lage schlechter macht, nicht
+      besser. Der Eintrag bleibt offen und wandert nicht nach `done.md`.
+
+      **Was ihn wirklich schließen würde:** ein Lauf gegen die *ursprüngliche* Lastform (parallel
+      zur Lade-Suite, nicht gegen Kopien der eigenen Suite) in derselben Größenordnung. Fällt er
+      auch dort sauber aus, ist (b) erledigt und nur noch (a)/(c) offen.
 
       **Zwei Vorbehalte, die zur Zahl gehören.** (a) Die alte Serie lief parallel zur
       **Lade-Suite**, die neue gegen fünf Kopien ihrer selbst. Beides ist Last, aber ein

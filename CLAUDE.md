@@ -25,17 +25,21 @@ Zweig `arch/x86_64` (2026-08-03).
 
 | | |
 |---|---|
-| x86_64 | **800 von 800** mit identischer Signatur, `== ALL PASS ==` (2026-08-03: 200 im Leerlauf + 600 unter Last in 5 parallelen Stroemen a 120, 20 vCPU auf 20 Kernen; die Stroeme sind auch **untereinander** deckungsgleich) |
+| x86_64 | **2300 von 2300** mit identischer Signatur, `== ALL PASS ==` (2026-08-03: 200 im Leerlauf + 600 + 1500 unter Last in je 5 parallelen Stroemen, 20 vCPU auf 20 Kernen; alle Stroeme auch **untereinander** deckungsgleich, `e419003d625f`, ueber beide Aufrufe hinweg) |
 | x86_64 Lade-Suite | `== ALL PASS ==` (2026-08-03: 39 Pruefungen — 5 Module, **zwei** Treiber-PDs, Austausch, A-5.3/A-5.4, dazu **drei** verkettete Boots fuer Z4 Stufe 2, inkl. sieben Negativfaellen) |
 | aarch64 | `RUNS=6` → **6 von 6** mit identischer Signatur, `== ALL PASS ==` (2026-08-02, **mit Root-Task**; davor 16/16 ohne, s. D6/D5) |
 | Host-Tests | `mem 22 · part 14 · fat 20 · cycles 9 · loader 50 · cap 22` → `== HOST-TESTS: ALL PASS ==` (`tools/host-tests.sh`, 2026-08-03) |
 
-**Was diese 800 Läufe heißen — und was nicht.** D0 ist damit **nicht** zu. Die noch offene Hälfte
-(Hänger ab `sched`) hatte eine gemessene Grundlinie von rund **0,5 %** (2/400 unter Last, 1/200 im
-Leerlauf). Gegen 0,5 % ist ein sauberer 800er-Lauf `0,995⁸⁰⁰ ≈ 2 %` — auffällig, aber kein Beweis.
-Nach der Dreierregel liegt die obere 95-%-Schranke jetzt bei `3/800 ≈ 0,4 %`. Ehrlich gesagt: die
-Rate ist gefallen oder das Bild ist lastabhängig anders als gedacht; **ausgeschlossen ist sie
-nicht**. Wer sie ausschließen will, braucht rund 1500 Läufe.
+**Was diese 2300 Läufe heißen — und was nicht.** Die noch offene Hälfte von D0 (Hänger ab `sched`)
+hatte eine Grundlinie von rund **0,5 %** (2/400 unter Last, 1/200 im Leerlauf). Die ist jetzt
+ausgeschlossen: `0,995²³⁰⁰ ≈ 1·10⁻⁵`. Eine Rate von **0,1 % ist es nicht** (`0,999²³⁰⁰ ≈ 10 %`);
+die obere 95-%-Schranke liegt bei `3/2300 ≈ 0,13 %`.
+
+**D0 bleibt trotzdem offen, und das ist der Punkt.** Niemand hat diesen Hänger behoben — die letzte
+D0-Arbeit beseitigte das *Farbrennen*, nicht ihn. Er ist unter die Messschwelle gefallen, nicht
+repariert. Ein Fehler ohne bekannte Ursache, der aufhört sich zu zeigen, ist damit auch nicht mehr
+**debuggbar**; das macht die Lage schlechter, nicht besser. Was ihn wirklich schlösse, steht in
+`todo.md` D0.
 
 Zwei Vorbehalte, die zur Zahl gehören: die alte Serie lief parallel zur **Lade-Suite**, die neue
 gegen fünf Kopien ihrer selbst — beides ist Last, aber nicht dieselbe. Und `pprobe` meldet unter
@@ -64,12 +68,18 @@ falsch.
   host-getestet), und `Image::build` ruft `classify_all`: **eine nicht uebertragbare Cap verhindert
   den Checkpoint vor dem Schreiben.** Belegt ueber drei verkettete Boots (244 → 345 → 446, Epochen
   1 → 2 → 3) und zwei Negativfaelle. Details in `done.md`.
-* **D0 nachgemessen: 800 Läufe, keine Abweichung — und trotzdem nicht zu.** Die Zahl allein sagt
-  weniger, als sie aussieht: gegen die Grundlinie des noch offenen Fehlerbildes (~0,5 %) ist eine
-  saubere 800er-Reihe rund 2 % wahrscheinlich. Details und die nötige Läufezahl in `todo.md` D0.
+* **D0 nachgemessen: 2300 Läufe, keine Abweichung — und trotzdem nicht zu.** Die alte Quote von
+  0,5 % ist ausgeschlossen, 0,1 % nicht. Wichtiger als die Zahl: **niemand hat diesen Hänger
+  behoben.** Er ist unter die Messschwelle gefallen, nicht repariert — und damit auch nicht mehr
+  debuggbar. Details in `todo.md` D0.
   Dabei fiel ein Loch im Prüfer auf: **jeder Lauf verglich nur gegen den ersten Lauf seines
   eigenen Stroms** — fünf parallele Ströme mit je eigener, in sich stimmiger Signatur hätten
   fünfmal grün gemeldet. Der Quervergleich ist jetzt Teil der Messung.
+* **Alle drei CI-Gates (Kani, Loom, Verus) sind seit ihrer Anlage NIE gelaufen.** Sie lagen in
+  `.gitea/workflows/`; der Server ist GitLab. Gemessen über die Pipelines-API: zwei Pipelines
+  insgesamt, beide vom 2026-05-23, beide mit GitLabs Auto-DevOps-Vorgabejobs. Seit 2026-08-03
+  liegt `.gitlab-ci.yml` dort, wo der Server liest — die Jobs entstehen, warten aber auf einen
+  Runner. Siehe Fallenliste unten.
 * **Der Befund, der dabei den ganzen Entwurf umgebaut hat — und der allgemein gilt:** der
   Fortschrittszaehler ist unter KVM **reproduzierbar** (gemessen 133…155 an derselben Stelle des
   Hochlaufs). Der erste Aufbau verglich einfach „gespeicherter Wert == gefundener Wert"; eine
@@ -315,6 +325,17 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   CI-Job hiess „Kani — Tier-1-Beweise (Loader-Parser)" und fuhr in Wahrheit alle vier Ziele. Daraus
   wurde ein Todo-Eintrag ueber eine Luecke, die es nicht gab — waehrend die echte Luecke (Beweise
   mit konkreten statt symbolischen Werten) unbenannt blieb.
+* **Ein Gate im Format des falschen Servers ist kein schwaeches Gate, sondern keins.** Kani, Loom
+  und Verus lagen in `.gitea/workflows/`; der Server ist GitLab und liest das nicht. Zwei
+  Pipelines in der ganzen Projektgeschichte, beide vom 2026-05-23, beide mit der
+  Auto-DevOps-Vorlage. Der rote Verus-Beweis fiel deshalb 37 Tage niemandem auf — nicht weil
+  niemand hinsah, sondern weil es nichts zu sehen gab. **Ein CI-Gate ist erst dann eines, wenn man
+  eine Pipeline-ID vorzeigen kann.** Und danach zaehlen drei unterscheidbare Faelle: keine Pipeline
+  (Konfiguration nicht gefunden), Pipeline mit `pending`-Jobs (kein Runner), gruen.
+* **Eine lokale Datei in `.git/info/exclude` sieht versioniert aus.** `CLAUDE.md` stand dort. Ein
+  Commit mit dem Titel „CLAUDE.md auf den Stand von heute" enthielt ausschliesslich `todo.md`, und
+  jede Aenderung an ihr lag auf genau einer Platte. `.gitignore` faellt beim Lesen auf,
+  `.git/info/exclude` nicht — es wird nicht mitversioniert und steht in keinem Diff.
 * **Ein Nebenlaeufigkeitsbeweis ohne verfolgte Zellen prueft nur die Atomics.** Loom sah eine
   abgeschwaechte Speicherordnung im Ticket-Release nicht, solange `data` in einem
   `core::cell::UnsafeCell` lag — die Veroeffentlichung der Nutzlast war gar nicht im Modell.

@@ -388,6 +388,27 @@ pub struct Scheduler {
     /// Anzahl aktuell **erschöpfter** MCS-Konten. Ist sie 0, entfällt der Refill-Scan
     /// vollständig — der Normalfall (kein Budget) kostet damit nichts je Tick.
     depleted_count: usize,
+    /// Anzahl Threads mit gesetztem [`Tcb::budget_blocked`] (D10). Ist sie 0, entfällt der
+    /// **Weckelauf** in [`refill_depleted`](Self::refill_depleted) und
+    /// [`set_budget`](Self::set_budget) — beide kosteten seit H-b einen vollen
+    /// Tabellendurchlauf **je aufgefülltem Konto** (gemessen: 10 000 Iterationen bei 10 000
+    /// Slots, und 1 000 000 in **einem** Timer-Interrupt, sobald 100 Konten im selben Tick
+    /// auffüllen — `tools/sched-erschoepfung-messen.sh`, L1/L3).
+    ///
+    /// **Bewegt wird er an genau zwei Zeilen**, beide in
+    /// [`set_budget_blocked`](Self::set_budget_blocked), und beide sind an einen echten
+    /// Zustandswechsel des Feldes gebunden. Das ist kein Stil, sondern die Lehre aus
+    /// `depleted_count` (D8/M5): der wurde mehrfach erhöht und nur einmal gesenkt, kehrte nie
+    /// auf 0 zurück, und der Scan lief dadurch in **jedem** Tick — bei einem Zähler, der
+    /// über „läuft der teure Pfad?" entscheidet, ist ein Lügen dasselbe wie kein Zähler.
+    /// Wer ihn nachzählt: [`audit`](Self::audit) (Code **10**) und die L9-Reihe des
+    /// Messwerkzeugs — zwei voneinander unabhängige Nachzählungen.
+    ///
+    /// Drei Stellen überschreiben einen `Tcb` **als Ganzes** und laufen deshalb nicht über
+    /// den Helfer; sie führen den Zähler von Hand nach: [`record_zombie`](Self::record_zombie)
+    /// (der Sterbende selbst), [`detach_for_migration`](Self::detach_for_migration) (der
+    /// Abwandernde) und [`attach_migrated`](Self::attach_migrated) (der Ankommende).
+    budget_blocked_count: usize,
     /// Migrations-Telemetrie (Tests): wie viele Threads dieser Kern abgegeben/aufgenommen hat.
     migrations_out: u64,
     migrations_in: u64,
@@ -432,6 +453,7 @@ impl Scheduler {
             cyc_core: CycleStats::EMPTY,
             used: 0,
             depleted_count: 0,
+            budget_blocked_count: 0,
             migrations_out: 0,
             migrations_in: 0,
         }
@@ -675,7 +697,8 @@ impl Scheduler {
             if acct != s && self.tcbs[acct].depleted {
                 // Zurueck in den Lauf ja -- aber nicht auf ein leeres Konto. Die Blockade
                 // wechselt den GRUND, und der neue Grund hat einen Wecker.
-                self.tcbs[s].budget_blocked = true;
+                // D10: **Erhöhung 2 von 2** von `budget_blocked_count`.
+                self.set_budget_blocked(s, true);
                 return true;
             }
             self.tcbs[s].blocked = false;
@@ -709,7 +732,8 @@ impl Scheduler {
         // H-b: PAUSE UEBERNIMMT die Blockade. Ohne diese Zeile ist sie ein No-Op an einem
         // Thread, der schon auf sein Konto-Budget geblockt ist (er ist ja `blocked`) -- und der
         // Refill hebt sie dann mit auf, obwohl PAUSE Erfolg gemeldet hat.
-        self.tcbs[s].budget_blocked = false;
+        // D10: **Senkung 1 von 4** von `budget_blocked_count`.
+        self.set_budget_blocked(s, false);
         if !self.tcbs[s].blocked {
             self.tcbs[s].blocked = true;
             self.remove_from_ready(s); // No-Op, falls er gerade `current` ist
@@ -780,6 +804,14 @@ impl Scheduler {
         if self.tcbs[s].depleted {
             self.depleted_count -= 1;
         }
+        // D10: dritte Stelle, die einen `Tcb` als Ganzes ueberschreibt. Heute **strukturell
+        // unerreichbar** -- `budget_blocked` wird nur an Threads mit `sc_donor` gesetzt, und
+        // der Aufruf ist oben schon an `sc_donor.is_some()` gescheitert. Die Zeile steht
+        // trotzdem hier: die Richtigkeit des Zaehlers soll nicht davon abhaengen, dass diese
+        // Herleitung jede kuenftige Aenderung ueberlebt.
+        if self.tcbs[s].budget_blocked {
+            self.budget_blocked_count -= 1;
+        }
         self.tcbs[s] = Tcb::EMPTY;
         self.free.free(s);
         self.used -= 1;
@@ -801,6 +833,12 @@ impl Scheduler {
         if tcb.depleted {
             tcb.next_refill = self.now + tcb.period as u64;
             self.depleted_count += 1;
+        }
+        // D10: Gegenstueck zu `detach_for_migration` -- ein ankommender `Tcb` bringt sein
+        // `budget_blocked` mit, ohne den Helfer zu durchlaufen. Heute ebenso unerreichbar
+        // (was nicht abwandern kann, kommt auch nicht an), und aus demselben Grund hier.
+        if tcb.budget_blocked {
+            self.budget_blocked_count += 1;
         }
         tcb.queued = NOT_QUEUED;
         tcb.qnext = NIL;
@@ -856,7 +894,19 @@ impl Scheduler {
         if tick {
             self.now += 1;
             // Refill-Scan NUR, wenn überhaupt ein Konto erschöpft ist (Normalfall: keins ->
-            // der Tick kostet nichts, unabhängig von der Tabellengröße).
+            // der Tick kostet nichts, unabhängig von der Tabellengröße). **Gemessen**
+            // (`tools/sched-erschoepfung-messen.sh`, L0): 0 Iterationen über 200 Ticks, bei
+            // 32 wie bei 10 000 Slots.
+            //
+            // Was der Satz NICHT sagt, und ab hier steht es dabei (D10):
+            //  * Ist **irgendein** Konto erschöpft, kostet jeder Tick einen vollen
+            //    Tabellendurchlauf — 10 000 Iterationen bei 10 000 Slots, und zwar für
+            //    jeden Tick bis zum Refill (L1: `aussen_je_wartetakt`). Das ist die äußere
+            //    Schleife und war schon vor der Budget-Donation so.
+            //  * Der **Weckelauf** in `refill_depleted` kostet noch einmal so viel je
+            //    aufgefülltem Konto. Seit D10 läuft er nur bei `budget_blocked_count > 0`;
+            //    ohne diesen Wächter kostete ein Tick, in dem 100 Konten zugleich auffüllen,
+            //    1 000 000 Iterationen (L3, und dieser Fall ist erreichbar).
             if self.depleted_count > 0 {
                 self.refill_depleted();
             }
@@ -881,8 +931,9 @@ impl Scheduler {
                     if acct != cur && !self.tcbs[cur].blocked {
                         // H-b: nur wer nicht schon aus einem ANDEREN Grund blockiert ist, wird
                         // hier blockiert -- und der Grund wird mitgeschrieben.
+                        // D10: **Erhöhung 1 von 2** von `budget_blocked_count`.
                         self.tcbs[cur].blocked = true;
-                        self.tcbs[cur].budget_blocked = true;
+                        self.set_budget_blocked(cur, true);
                     }
                 }
             }
@@ -916,15 +967,28 @@ impl Scheduler {
                 // H-b: die Spende ist ein STAPEL. `sc_donee` ist nur ihre Spitze, wird vom
                 // zweiten CALL ueberschrieben und vom inneren REPLY geloescht -- geweckt wird
                 // deshalb, wer WEGEN DIESES KONTOS blockiert ist, und nur der.
-                for d in 0..self.tcbs.len() {
-                    if d != slot
-                        && self.tcbs[d].used
-                        && self.tcbs[d].budget_blocked
-                        && self.tcbs[d].sc_donor == Some(slot)
-                    {
-                        self.tcbs[d].budget_blocked = false;
-                        self.tcbs[d].blocked = false;
-                        self.enqueue_ready(d);
+                //
+                // **D10: der Weckelauf nur, wenn ueberhaupt jemand budget-blockiert ist.** Er
+                // kostet einen VOLLEN Tabellendurchlauf, und zwar je aufgefuelltem Konto --
+                // gemessen 10 000 Iterationen bei 10 000 Slots, und 1 000 000 in EINEM
+                // Timer-Interrupt, sobald 100 Konten im selben Tick auffuellen (erreichbar,
+                // s. `tools/sched-erschoepfung-messen.sh` L3). Der Normalfall ist: niemand.
+                //
+                // **Was hier NICHT stehen darf:** `if self.tcbs[slot].sc_donee.is_some()`.
+                // Genau dann ist `sc_donee` `None`, waehrend Donees warten (D5, die
+                // verschachtelte Spende) -- die Abkuerzung risse D5 wieder auf.
+                if self.budget_blocked_count > 0 {
+                    for d in 0..self.tcbs.len() {
+                        if d != slot
+                            && self.tcbs[d].used
+                            && self.tcbs[d].budget_blocked
+                            && self.tcbs[d].sc_donor == Some(slot)
+                        {
+                            // D10: **Senkung 2 von 4**.
+                            self.set_budget_blocked(d, false);
+                            self.tcbs[d].blocked = false;
+                            self.enqueue_ready(d);
+                        }
                     }
                 }
                 match self.tcbs[slot].sc_donee {
@@ -967,15 +1031,21 @@ impl Scheduler {
                 self.depleted_count -= 1;
                 // H-b: mit `depleted` verschwindet der Anlass, aus dem der Donee je wieder
                 // geweckt wuerde -- also hier wecken.
-                for d in 0..self.tcbs.len() {
-                    if d != s
-                        && self.tcbs[d].used
-                        && self.tcbs[d].budget_blocked
-                        && self.tcbs[d].sc_donor == Some(s)
-                    {
-                        self.tcbs[d].budget_blocked = false;
-                        self.tcbs[d].blocked = false;
-                        self.enqueue_ready(d);
+                // D10: derselbe Waechter wie im Refill -- der Lauf ist O(n), der Normalfall
+                // ist „niemand ist budget-blockiert" (gemessen: 10 000 Iterationen je
+                // `set_budget` auf ein erschoepftes Konto bei 10 000 Slots).
+                if self.budget_blocked_count > 0 {
+                    for d in 0..self.tcbs.len() {
+                        if d != s
+                            && self.tcbs[d].used
+                            && self.tcbs[d].budget_blocked
+                            && self.tcbs[d].sc_donor == Some(s)
+                        {
+                            // D10: **Senkung 3 von 4**.
+                            self.set_budget_blocked(d, false);
+                            self.tcbs[d].blocked = false;
+                            self.enqueue_ready(d);
+                        }
                     }
                 }
                 if self.current != Some(s) && !self.tcbs[s].blocked {
@@ -1098,7 +1168,16 @@ impl Scheduler {
     /// 6=Thread in der falschen Prioritäts-Liste, 7=verlorener Thread (lauffähig, aber in
     /// keiner Liste/nicht laufend), 8=Directory-Eintrag passt nicht zum TCB,
     /// 9=**erschöpfter** Thread steht in einer Ready-Liste (D8, seit 2026-08-03 — die
-    /// Gegenrichtung zu 7; ohne sie war der Zustand unbeobachtbar, der `mcs_bound` widerlegt).
+    /// Gegenrichtung zu 7; ohne sie war der Zustand unbeobachtbar, der `mcs_bound` widerlegt),
+    /// 10=`budget_blocked_count` weicht von der **Nachzählung** der Tabelle ab (D10).
+    ///
+    /// Zu 10: der Zähler entscheidet, ob der teure Weckelauf überhaupt läuft. Lügt er nach
+    /// oben, läuft der Lauf für immer (die `depleted_count`-Form aus D8/M5); lügt er nach
+    /// unten, bleibt ein Donee liegen, den niemand mehr weckt (die D5-Form). Beide Richtungen
+    /// sind ohne diese Zeile unbeobachtbar — genau der Zustand, den D8/M5 hatte.
+    /// **Zur Nummer:** `kernel/src/system.rs` meldet Scheduler-Codes als `10 + code`, die
+    /// nächste Kategorie beginnt bei `20 + cdt` mit `cdt >= 1`. Damit ist `10` die letzte
+    /// Zahl, die dort nicht mit einer anderen Kategorie zusammenfällt.
     pub fn audit(&self) -> u32 {
         for p in 0..NPRIO {
             let q = &self.queues[p];
@@ -1148,11 +1227,16 @@ impl Scheduler {
                 return 5;
             }
         }
-        // Verlorene Threads + Directory-Konsistenz.
+        // Verlorene Threads + Directory-Konsistenz. Die D10-Nachzählung läuft in DIESER
+        // Schleife mit — sie kostet damit nichts über das hinaus, was `audit` ohnehin tut.
+        let mut bb = 0usize;
         for local in 0..self.tcbs.len() {
             let t = &self.tcbs[local];
             if !t.used {
                 continue;
+            }
+            if t.budget_blocked {
+                bb += 1;
             }
             // Der Directory-Eintrag MUSS auf genau diesen Kern + Slot zeigen.
             match dir_load(t.gid as usize) {
@@ -1167,10 +1251,36 @@ impl Scheduler {
                 return 7;
             }
         }
+        // D10: die **unabhängige** Nachzählung gegen den Zähler. Ein `budget_blocked` an einem
+        // freien Slot zählt hier nicht mit — `Tcb::EMPTY` hat das Feld auf `false`, und die
+        // drei Bulk-Stellen führen den Zähler beim Freigeben nach.
+        if bb != self.budget_blocked_count {
+            return 10;
+        }
         0
     }
 
     // --- intern ---
+
+    /// [`Tcb::budget_blocked`] setzen/löschen — **die einzige Stelle**, die das Feld ändert,
+    /// und damit die einzige, die [`Scheduler::budget_blocked_count`] bewegt (D10).
+    ///
+    /// Der Zähler wird hier an einen **echten Zustandswechsel** gebunden (`== an` -> raus).
+    /// Genau das fehlte `depleted_count`: dort standen Erhöhung und Senkung an verschiedenen
+    /// Stellen, die Erhöhung lief mehrfach, und der Zähler kam nie auf 0 zurück (D8/M5).
+    /// Ein Zähler, der über „läuft der teure Pfad?" entscheidet, ist dann kein Zähler mehr,
+    /// sondern eine dauerhaft wahre Bedingung.
+    fn set_budget_blocked(&mut self, local: usize, an: bool) {
+        if self.tcbs[local].budget_blocked == an {
+            return;
+        }
+        self.tcbs[local].budget_blocked = an;
+        if an {
+            self.budget_blocked_count += 1;
+        } else {
+            self.budget_blocked_count -= 1;
+        }
+    }
 
     /// Directory-Eintrag des TCBs an `local` auf diesen Kern/Slot setzen.
     fn publish_dir(&self, local: usize) {
@@ -1236,11 +1346,21 @@ impl Scheduler {
         // sein Donee die Spende; stirbt ein Donee, wird der Donee-Eintrag gelöscht.
         // H-b: ALLE Empfaenger dieser Spende loesen, nicht nur die Spitze -- und wer auf
         // dieses Konto geblockt war, verliert mit ihm seinen Wecker und muss hier frei.
+        //
+        // **D10: dieser Lauf bekommt bewusst KEINEN `budget_blocked_count`-Waechter.** Er tut
+        // zwei Dinge, und nur eines davon haengt an `budget_blocked`: das Loesen von
+        // `sc_donor` muss **immer** laufen, sonst zeigt ein Donee auf einen freigegebenen und
+        // sogleich wiederverwendeten Slot und wird gegen ein fremdes Konto belastet. Gemessen
+        // kostet der Lauf einen vollen Tabellendurchlauf **je Thread-Tod** (10 000 Iterationen
+        // bei 10 000 Slots, `sched-erschoepfung-messen.sh` L4) -- nicht im Tick-Pfad. Wer ihn
+        // bezahlt bekommen will, braucht eine **Liste** der Donees je Konto; ein Zaehler kann
+        // die Frage „wer zeigt auf mich?" nicht beantworten.
         for d in 0..self.tcbs.len() {
             if d != local && self.tcbs[d].used && self.tcbs[d].sc_donor == Some(local) {
                 self.tcbs[d].sc_donor = None;
                 if self.tcbs[d].budget_blocked {
-                    self.tcbs[d].budget_blocked = false;
+                    // D10: **Senkung 4 von 4**.
+                    self.set_budget_blocked(d, false);
                     self.tcbs[d].blocked = false;
                     self.enqueue_ready(d);
                 }
@@ -1262,6 +1382,12 @@ impl Scheduler {
         }
         if self.tcbs[local].depleted {
             self.depleted_count -= 1;
+        }
+        // D10: der Sterbende SELBST kann budget-blockiert sein (ein Donee, dessen Konto leer
+        // ist, wird gekillt). Die Zuweisung darunter loescht das Feld, ohne den Helfer zu
+        // durchlaufen -- eine der drei Stellen, die den Zaehler von Hand nachfuehren.
+        if self.tcbs[local].budget_blocked {
+            self.budget_blocked_count -= 1;
         }
         self.tcbs[local] = Tcb::EMPTY;
         self.free.free(local);

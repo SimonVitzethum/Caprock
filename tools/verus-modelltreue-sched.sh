@@ -130,6 +130,30 @@
 # Wer das aendern will, braucht ein Modell MIT Donation (`sc_donor` als Feld, `switch_to` und
 # `end_donation` als Uebergaenge) -- das ist eine eigene Arbeit, keine Zeile hier.
 #
+# ------------------------------------------------------------------------------------------------
+# D10 (2026-08-03) -- WAS DER ZAEHLER `budget_blocked_count` DIESEM WAECHTER KOSTET
+# ------------------------------------------------------------------------------------------------
+# Der Weckelauf aus H-b kostete einen VOLLEN Tabellendurchlauf je aufgefuelltem Konto (gemessen:
+# 10000 Iterationen bei 10000 Slots, 1000000 in EINEM Timer-Interrupt bei 100 gleichzeitigen
+# Refills). Seit D10 laeuft er nur bei `budget_blocked_count > 0`. Drei Stellen aendern sich hier:
+#
+#   1. `refill` und `set_budget` tragen je eine zusaetzliche Zeile in der Uebertragungsluecke
+#      (`WENN #budget_blocked_count > 0`). Sie ist eine KOSTENZEILE, keine Politik, und sie hat
+#      je Paar ihre eigene Begruendung -- samt dem Argument, warum sie die Abbildung nicht
+#      beruehrt (ist der Zaehler 0, ist auch das Konjunkt `ziel.#budget_blocked` fuer jedes
+#      `ziel` falsch; der uebersprungene Lauf haette nichts getan).
+#   2. `budget_blocked` wird nicht mehr direkt geschrieben, sondern ueber `set_budget_blocked`.
+#      Der Normalisierer FOLGT diesem Einzeiler (`bbset` in `CODE_PAT`) -- sonst waeren die
+#      eingetragenen Schreibzugriffe `ziel.#budget_blocked := true/false` einfach verschwunden,
+#      und das Register haette weiter gestimmt, ohne noch etwas zu beschreiben.
+#   3. `audit` bekommt Code **10**: die Nachzaehlung des Zaehlers gegen die Tabelle. Sie ist der
+#      Preis fuer Punkt 1 -- ohne sie waere „der Zaehler sagt die Wahrheit" eine unbelegte
+#      Voraussetzung, und genau diese Form (`depleted_count`, D8/M5) hat hier schon einmal
+#      gelogen. **Ueber das Modell sagt Code 10 nichts**; er sichert eine Eigenschaft des Codes.
+#
+# Zwei neue Selbsttestfaelle halten das fest: der Waechter darf den Zaehler nicht mehr lesen
+# (Fall a) und die Nachzaehlung darf nicht verschwinden (Fall b).
+#
 # Aufruf:
 #   tools/verus-modelltreue-sched.sh              # pruefen + Selbsttest
 #   tools/verus-modelltreue-sched.sh --nur-pruefen
@@ -376,6 +400,7 @@ PAARE = [
             '-WENN #now >= ziel.#next_refill && ziel.budget > 0 && ziel.depleted && ziel.used',
             ' SETZE ziel.remaining := ziel.budget',
             ' SETZE ziel.depleted := false',
+            '-WENN #budget_blocked_count > 0',
             '-WENN ziel != ziel && ziel.#budget_blocked && ziel.#sc_donor == Some(ziel) && ziel.used',
             '-SETZE ziel.blocked := false',
             ' ENQ ziel',
@@ -418,7 +443,22 @@ PAARE = [
               'Das Modell traegt von alldem NICHTS: sein `refill` weckt genau einen Thread, den '
               'erschoepften selbst. Der ganze Lauf liegt in der Donation und damit ausserhalb '
               '(ADR 0019) -- was er behebt, belegt `tools/sched-erschoepfung-messen.sh` (D5 auf '
-              '6 Ticks, D4 auf 299, D7 auf 9), nicht Verus.',
+              '6 Ticks, D4 auf 299, D7 auf 9), nicht Verus. '
+              '(e) NEU seit D10 (2026-08-03): `WENN #budget_blocked_count > 0` VOR dem Lauf. '
+              'Das ist keine Politik, sondern eine KOSTENZEILE, und sie hat ihr eigenes Argument. '
+              'Gemessen (`sched-erschoepfung-messen.sh`, L-Reihe): der Lauf kostet einen vollen '
+              'Tabellendurchlauf je aufgefuelltem Konto -- 10000 Iterationen bei 10000 Slots, und '
+              '1000000 in EINEM Timer-Interrupt, sobald 100 Konten im selben Tick auffuellen '
+              '(erreichbar: die Periode legt `next_refill` fest, und `attach_migrated` rechnet sie '
+              'auf die eigene Uhr um -- L3a..L3d). Warum die Zeile die ABBILDUNG nicht beruehrt: '
+              'sie ist genau dann falsch, wenn KEIN Thread `budget_blocked` traegt, und dann ist '
+              'auch das Konjunkt `ziel.#budget_blocked` der Zeile darunter fuer jedes `ziel` '
+              'falsch -- der uebersprungene Lauf haette nichts getan. Das gilt aber NUR, solange '
+              'der Zaehler die Wahrheit sagt; deshalb zaehlt `audit` ihn nach (Code 10, s. [4]). '
+              'Ohne diese Nachzaehlung waere die Zeile eine unbelegte Voraussetzung -- und genau '
+              'diese Form (`depleted_count`, D8/M5) hat in diesem Projekt schon einmal gelogen. '
+              'Gegengeprueft mit der Fassung `ohne-Zaehler`: alle 208 Verhaltensmesswerte '
+              'unveraendert, nur die Kosten fallen (L3a/L3d 1000000 -> 0, L3b -> 10000).',
     ),
     dict(
         name='set_budget',
@@ -430,6 +470,7 @@ PAARE = [
             ' SETZE ziel.budget := PARAM',
             ' SETZE ziel.depleted := false',
             '-WENN MERKER1',
+            '-WENN #budget_blocked_count > 0',
             '-WENN ziel != ziel && ziel.#budget_blocked && ziel.#sc_donor == Some(ziel) && ziel.used',
             '-SETZE ziel.blocked := false',
             '-ENQ ziel',
@@ -458,7 +499,14 @@ PAARE = [
               'haette. Gemessen: 0 Ticks in 3 Perioden, `audit() == 0`; mit dem Lauf 9 Ticks. '
               'Dieselbe Form wie `record_zombie` (dort stirbt das Konto ganz, D4). '
               'Das Modell traegt auch das nicht: sein `set_budget` fasst genau `i` an. Der Lauf '
-              'liegt in der Donation, ADR 0019: ausserhalb.',
+              'liegt in der Donation, ADR 0019: ausserhalb. '
+              'NEU seit D10 (2026-08-03): `WENN #budget_blocked_count > 0` VOR dem Lauf -- '
+              'dasselbe Argument wie in `refill`, aber mit einer eigenen Zahl: `set_budget` auf '
+              'ein erschoepftes Konto kostete 10000 Iterationen bei 10000 Slots (L5), jetzt 0. '
+              'Diese Stelle liegt NICHT im Tick-Pfad; sie ist trotzdem mitgezogen, weil sonst '
+              'zwei Laeufe mit derselben Frage verschieden begruendet waeren -- und ein Waechter, '
+              'der zwei gleiche Faelle verschieden fuehrt, ist der Anfang einer Beschriftung, die '
+              'neben der Sache herlaeuft.',
     ),
 ]
 
@@ -478,6 +526,15 @@ AUDIT_QUEUE = [
 AUDIT_REST = [
     (8, '#dir_load passt nicht'),
     (7, '!t.blocked && !t.depleted && self.current != Some(local) && t.queued == NOT_QUEUED'),
+    # Seit 2026-08-03 (D10). Code 10 ist die NACHZAEHLUNG von `budget_blocked_count` gegen die
+    # Tabelle -- und sie ist der Preis dafuer, dass `refill_depleted`/`set_budget` den teuren
+    # Weckelauf jetzt an einem Zaehler aufhaengen. Ohne sie waere der Waechter im Code eine
+    # unbelegte Voraussetzung: luegt der Zaehler nach oben, laeuft der Scan wieder in jedem Tick
+    # (die `depleted_count`-Form aus D8/M5); luegt er nach unten, bleibt ein Donee liegen, den
+    # niemand mehr weckt (die D5-Form). Beide Richtungen waren vorher unbeobachtbar.
+    # **Ueber das Modell sagt Code 10 nichts** -- `budget_blocked` ist als ausserhalb eingetragen
+    # (ADR 0019, Donation). Er sichert eine Eigenschaft des CODE, nicht der Abbildung.
+    (10, 'bb != self.budget_blocked_count'),
 ]
 # Die Praedikate, ueber die INVARIANTE unten redet -- eingefroren. Ohne das waere die Tabelle
 # darunter eine Behauptung ueber einen Text, der sich unbemerkt aendern kann: wer `runnable` das
@@ -674,6 +731,7 @@ CODE_PAT = re.compile(r'''
   | (?P<cur_set>self\.current\s*=(?!=)\s*(?P<cv>Some\(\s*\w+\s*\)|None))
   | (?P<tcb_ganz>self\.tcbs\[\s*(?P<tw>\w+)\s*\]\s*=(?!=)\s*(?P<twv>[^;]+))
   | (?P<setf>self\.tcbs\[\s*(?P<sft>\w+)\s*\]\.(?P<sff>\w+)\s*=(?!=)\s*(?P<sfv>[^;]+))
+  | (?P<bbset>self\.set_budget_blocked\s*\(\s*(?P<bbt>\w+)\s*,\s*(?P<bbv>true|false)\s*\))
   | (?P<selfop>self\.(?P<so>\w+)\s*(?:\+=|-=|=(?!=))\s*[^;]+)
   | (?P<els>\}\s*else\s*\{)
   | (?P<iff>if\s+(?P<ic>[^{]+?)\s*\{)
@@ -727,6 +785,15 @@ def code_ereignisse(text, rollen, param):
             wert = normausdruck(m.group('sfv'), k)
             (ev if f in FELDPAAR.values() else ausserhalb).append(
                 ('SETZE %s := %s' if f in FELDPAAR.values() else '%s := %s') % (ziel, wert))
+        elif m.group('bbset'):
+            # D10 (2026-08-03): `budget_blocked` wird nicht mehr direkt geschrieben, sondern
+            # ueber `set_budget_blocked`, weil dort der Zaehler `budget_blocked_count`
+            # mitlaeuft. Der Waechter FOLGT diesem Einzeiler, statt die Schreibstelle aus dem
+            # Register verschwinden zu lassen -- sonst haette das Verlegen hinter einen Helfer
+            # eine eingetragene Wirkung stillschweigend getilgt, und das Register haette
+            # weiterhin gestimmt, ohne dass es noch etwas beschreibt.
+            ausserhalb.append('%s.#budget_blocked := %s'
+                              % (k.rolle(m.group('bbt')), m.group('bbv')))
         elif m.group('selfop'):
             ausserhalb.append('#%s' % m.group('so'))
         elif m.group('els'):
@@ -1155,7 +1222,7 @@ PY
     # Uebertragungsluecke bzw. die Liste der wegabstrahierten Zugriffe. Genau deshalb ist die
     # AUSSERHALB-Liste je Paar gepflegt und nicht bloss ein Sammelbecken: sie ist hier die einzige
     # Stelle, an der ein weggelassener Schreibzugriff noch bemerkt wird.
-    mutieren code 's = s.replace("                        self.tcbs[cur].budget_blocked = true;\n", "", 1)'
+    mutieren code 's = s.replace("                        self.set_budget_blocked(cur, true);\n", "", 1)'
     erwarte kracht "Code: on_tick schreibt den GRUND der Blockade nicht mehr mit (H-b/D9)"
 
     # Die Gegenrichtung im selben `on_tick`: ohne den `!blocked`-Konjunkt schreibt der Tick eine
@@ -1167,33 +1234,20 @@ PY
     # Der Kern von D9: der Refill-Lauf ueber ALLE `sc_donor == slot` faellt auf den einzelnen
     # `sc_donee` zurueck -- also auf die Spitze eines Stapels. Gemessen war das: niemand weckt den
     # Richtigen (D5: 0 Ticks in 3 Perioden, `audit() == 0`).
-    mutieren code 's = s.replace("""                for d in 0..self.tcbs.len() {
-                    if d != slot
-                        && self.tcbs[d].used
-                        && self.tcbs[d].budget_blocked
-                        && self.tcbs[d].sc_donor == Some(slot)
-                    {
-                        self.tcbs[d].budget_blocked = false;
-                        self.tcbs[d].blocked = false;
-                        self.enqueue_ready(d);
-                    }
-                }
-                match self.tcbs[slot].sc_donee {
-                    Some(d) if d != slot => {
-                        let _ = d; // erledigt der Lauf darueber
-                    }""",
-"""                match self.tcbs[slot].sc_donee {
-                    Some(d) if d != slot => {
-                        self.tcbs[d].budget_blocked = false;
-                        self.tcbs[d].blocked = false;
-                        self.enqueue_ready(d);
-                    }""", 1)'
+    # **Neu angesetzt am 2026-08-03 (D10).** Der Anker war der ganze Rumpf; seit der Waechter
+    # `budget_blocked_count > 0` davorsteht und die Zuweisung hinter `set_budget_blocked` liegt,
+    # passte er nicht mehr. Er ist jetzt die SACHE selbst und nicht ihre Formatierung: geweckt
+    # wird nur noch, wer zugleich die SPITZE des Stapels ist -- also genau der Rueckfall auf
+    # `sc_donee`, den D5 widerlegt hat.
+    mutieren code 's = s.replace("""                            && self.tcbs[d].sc_donor == Some(slot)""",
+"""                            && self.tcbs[d].sc_donor == Some(slot)
+                            && self.tcbs[slot].sc_donee == Some(d)""", 1)'
     erwarte kracht "Code: der Refill-Lauf faellt auf den einzelnen sc_donee zurueck (H-b/D9)"
 
     # PAUSE uebernimmt die Blockade nicht mehr: die Zeile steht VOR `if !blocked` und ist deshalb
     # kein Zweig, sondern ein wegabstrahierter Schreibzugriff -- ohne sie hoebe der Refill eine
     # PAUSE auf, die Erfolg gemeldet hat.
-    mutieren code 's = s.replace("        self.tcbs[s].budget_blocked = false;\n", "", 1)'
+    mutieren code 's = s.replace("        self.set_budget_blocked(s, false);\n", "", 1)'
     erwarte kracht "Code: pause uebernimmt die Budget-Blockade nicht mehr (H-b/D9)"
 
     # Und der Waechter in `unblock`, der eine Budget-Blockade stehen laesst. Faellt er weg, ist D6
@@ -1227,6 +1281,30 @@ s = s.replace("""    pub fn load(&self) -> usize {""",
 
     mutieren code 's = s.replace("            self.tcbs[s].next_refill = self.now + period as u64;\n", "", 1)'
     erwarte kracht "Code: ein wegabstrahierter Schreibzugriff verschwindet (AUSSERHALB-Liste)"
+
+    # -- D10 (2026-08-03): zwei Faelle, die es vor D10 nicht geben KONNTE ------------------------
+    # Der Weckelauf haengt seit D10 an einem ZAEHLER, und ein Zaehler ist genau die Konstruktion,
+    # die in diesem Projekt schon einmal gelogen hat (`depleted_count`, D8/M5). Beide Faelle
+    # nehmen einer Haelfte dieser Konstruktion den Halt.
+    #
+    # (a) Der Waechter liest den Zaehler nicht mehr -- die Kostenzeile faellt weg. Fuer die
+    #     ABBILDUNG ist das folgenlos (der Lauf tut dann hoechstens mehr, nie weniger), aber die
+    #     Ereignisfolge des Codes ist eine andere als die eingetragene, und genau das soll der
+    #     Waechter merken: eine Zeile, die im Register mit einer eigenen Begruendung steht, darf
+    #     nicht stillschweigend verschwinden.
+    mutieren code 's = s.replace("                if self.budget_blocked_count > 0 {", "                if true {", 1)'
+    erwarte kracht "Code: der D10-Waechter im Refill liest den Zaehler nicht mehr"
+
+    # (b) Die NACHZAEHLUNG faellt weg. Das ist der schwerere der beiden: ohne sie ist der Zaehler
+    #     eine unbelegte Voraussetzung des Waechters aus (a) -- luegt er nach oben, laeuft der
+    #     Scan wieder in jedem Tick; luegt er nach unten, bleibt ein Donee liegen. Beides war vor
+    #     Audit-Code 10 unbeobachtbar, und beides ist am echten Quelltext gemessen
+    #     (`sched-erschoepfung-messen.sh`, Fassungen `Luegner-hoch` / `Luegner-runter`).
+    mutieren code 's = s.replace("""        if bb != self.budget_blocked_count {
+            return 10;
+        }
+""", "", 1)'
+    erwarte kracht "Code: die Nachzaehlung von budget_blocked_count faellt weg (Audit-Code 10)"
 
     # -- Mutationen am MODELL --------------------------------------------------------------------
     mutieren modell 's = s.replace("Thread { blocked: false, in_ready: !t.depleted, ..t }",

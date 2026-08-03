@@ -138,6 +138,45 @@ mod messung {
     const BUDGET: u32 = 3;
     const PERIOD: u32 = 100;
 
+    // --- D10: die beiden Tabellengroessen der Leistungsmessung -------------------------------
+    //
+    // `Slab::len()` ist die TABELLENGROESSE, nicht die Belegung. Im Kernel ist sie
+    // `je_kern * MIGRATION_HEADROOM` mit `je_kern = max(ceil(TARGET_THREADS/cores), 256)`
+    // (kernel/src/system.rs:801/822) -- also **1000 bei 20 Kernen bis 20000 auf einer
+    // Einkernmaschine**. `L_GROSS` nimmt die Zahl aus dem Todo-Eintrag (10000); sie liegt
+    // mitten in diesem Band. `L_KLEIN` ist die Groesse, mit der die uebrige Messung faehrt.
+    const L_KLEIN: usize = 32;
+    const L_GROSS: usize = 10_000;
+
+    // --- D10: die Instrumentierung ------------------------------------------------------------
+    //
+    // **Warum Iterationen und nicht Zeit.** Zeit auf einer Mehrkernmaschine unter Last misst
+    // den Wirt mit; dieselbe Schleife kostet je nach Nachbarprozess das Doppelte. Eine
+    // Iterationszahl ist eine Eigenschaft des Programms und ueber Laeufe hinweg identisch --
+    // und genau darum kann sie ueberhaupt in eine Gegenprobentabelle.
+    //
+    // Die `fetch_add`-Zeilen stehen NICHT im Quelltext von `sel4lake-sched`. Sie werden vom
+    // Werkzeug in eine KOPIE eingesetzt (s. `INSTR_*` unten) -- deshalb tragen die
+    // Verhaltensmessungen (P/M/D) und die Kostenmessungen (L) getrennte Binaries: die
+    // Verhaltensaussage soll am unveraenderten Quelltext haengen.
+    pub static SCAN_AUSSEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub static SCAN_INNEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub static SCAN_SETBUDGET: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    pub static SCAN_ZOMBIE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn z_null() {
+        use std::sync::atomic::Ordering as O;
+        SCAN_AUSSEN.store(0, O::Relaxed);
+        SCAN_INNEN.store(0, O::Relaxed);
+        SCAN_SETBUDGET.store(0, O::Relaxed);
+        SCAN_ZOMBIE.store(0, O::Relaxed);
+    }
+
+    fn z(a: &std::sync::atomic::AtomicU64) -> i64 {
+        a.load(std::sync::atomic::Ordering::Relaxed) as i64
+    }
+
     // --- Aufbau -------------------------------------------------------------------------------
 
     fn roh(bytes: usize, align: usize) -> *mut u8 {
@@ -148,16 +187,23 @@ mod messung {
         p
     }
 
-    /// Ein frischer Kern mit frischem Directory. Jedes Szenario steht fuer sich.
-    fn aufbau() -> (Scheduler, ThreadId) {
+    /// Ein frischer Kern mit frischem Directory **beliebiger Tabellengroesse**. Jedes Szenario
+    /// steht fuer sich. Die Groesse ist ein Parameter, weil die D10-Aussage genau von ihr
+    /// handelt: eine Messung, die nur bei 32 Slots laeuft, kann ueber 10000 nichts sagen.
+    fn aufbau_mit(cap: usize) -> (Scheduler, ThreadId) {
         // SAFETY: frischer, exklusiver Speicher; das Directory wird je Szenario neu angehaengt
         // (der alte Block bleibt liegen -- ein Messbinary lebt Millisekunden).
-        unsafe { attach_directory(roh(directory_bytes(CAP), directory_align()), CAP) };
+        unsafe { attach_directory(roh(directory_bytes(cap), directory_align()), cap) };
         let mut s = Scheduler::new();
         // SAFETY: wie oben.
-        unsafe { s.attach_storage(0, roh(core_storage_bytes(CAP), core_storage_align()), CAP) };
+        unsafe { s.attach_storage(0, roh(core_storage_bytes(cap), core_storage_align()), cap) };
         let idle = s.init_core(0, PRIO_IDLE).expect("init_core");
         (s, idle)
+    }
+
+    /// Ein frischer Kern mit frischem Directory. Jedes Szenario steht fuer sich.
+    fn aufbau() -> (Scheduler, ThreadId) {
+        aufbau_mit(CAP)
     }
 
     fn faden(s: &mut Scheduler, prio: u8, nr: usize) -> ThreadId {
@@ -186,7 +232,9 @@ mod messung {
                 }
                 i = s.tcbs[i as usize].qnext;
                 n += 1;
-                assert!(n <= CAP + 1, "Listenzyklus in Prioritaet {p}");
+                // Schranke aus der TABELLE, nicht aus `CAP`: seit D10 laeuft dieselbe Messung
+                // auch mit 10000 Slots, und eine feste 32 waere dort eine falsche Zyklusmeldung.
+                assert!(n <= s.tcbs.len() + 1, "Listenzyklus in Prioritaet {p}");
             }
         }
         None
@@ -216,6 +264,22 @@ mod messung {
         (0..s.tcbs.len())
             .filter(|&i| s.tcbs[i].used && s.tcbs[i].depleted)
             .count() as i64
+    }
+
+    /// Wie viele Threads sind WIRKLICH budget-blockiert (Tabelle gezaehlt)? Die zweite,
+    /// unabhaengig hergeleitete Zahl neben einem etwaigen Zaehler im Scheduler. Genau diese
+    /// Nachzaehlung fehlte bei `depleted_count` -- er log (D8/M5), und niemand konnte es sehen.
+    fn echte_budget_blocked(s: &Scheduler) -> i64 {
+        (0..s.tcbs.len())
+            .filter(|&i| s.tcbs[i].used && s.tcbs[i].budget_blocked)
+            .count() as i64
+    }
+
+    /// Was BEHAUPTET der Scheduler ueber dieselbe Zahl? `-1` heisst „es gibt den Zaehler
+    /// (noch) nicht" -- das ist der Stand VOR der D10-Behebung und ist ausdruecklich ein
+    /// gueltiges Messergebnis, kein Fehler.
+    fn zaehler_budget_blocked(s: &Scheduler) -> i64 {
+        s.budget_blocked_count as i64
     }
 
     /// Vollstaendiger Blick auf einen Thread, ohne Adjektive.
@@ -725,7 +789,12 @@ in_liste={} flag={} current={}",
     /// laeuft. Danach ist der Donee auf das Konto-Budget geblockt -- der Zustand, den der
     /// Donee-Zweig aufloest. Rueckgabe: (Scheduler, idle, konto, donee) als lokale Slots.
     fn donee_aufbau(budget: u32) -> (Scheduler, usize, usize, usize) {
-        let (mut s, idle) = aufbau();
+        donee_aufbau_mit(CAP, budget)
+    }
+
+    /// Wie [`donee_aufbau`], aber mit waehlbarer Tabellengroesse (D10).
+    fn donee_aufbau_mit(cap: usize, budget: u32) -> (Scheduler, usize, usize, usize) {
+        let (mut s, idle) = aufbau_mit(cap);
         let a = faden(&mut s, PRIO_T, 1);
         let srv = faden(&mut s, PRIO_T, 2);
         let (la, ls, li) = (lok(&s, a), lok(&s, srv), lok(&s, idle));
@@ -1100,6 +1169,386 @@ in_liste={} flag={} current={}",
     }
 
     // ==============================================================================================
+    // L-REIHE (D10, 2026-08-03) -- die KOSTEN des Refill-Scans, gemessen in ITERATIONEN.
+    //
+    // Der Befund war GELESEN: die Donee-Schleife aus H-b (`for d in 0..self.tcbs.len()`) liegt
+    // INNERHALB der Schleife ueber die Thread-Tabelle. Gemessen wird hier, was das kostet -- und
+    // zwar getrennt nach den drei Schleifen, die es gibt:
+    //
+    //   SCAN_AUSSEN     `refill_depleted`, die aeussere Schleife  -- **bestand schon vorher**,
+    //                   O(n) je Tick, solange irgendein Konto erschoepft ist
+    //   SCAN_INNEN      `refill_depleted`, die Donee-Schleife      -- NEU seit H-b, O(n) je
+    //                   AUFGEFUELLTEM Konto  ==> der D10-Befund
+    //   SCAN_SETBUDGET  `set_budget`, `was_depleted`-Zweig         -- NEU seit H-b
+    //   SCAN_ZOMBIE     `record_zombie`                            -- NEU seit H-b
+    //
+    // **Die Sprechprobe steht in L1:** dieselbe Messgroesse bei 32 und bei 10000 Slots. Bleibt
+    // sie gleich, misst sie nicht die Tabellengroesse, und dann sagt keine Zahl darunter etwas.
+    // ==============================================================================================
+
+    /// L0 -- die ZUSICHERUNG aus `on_tick`: „Normalfall: kein Konto erschoepft -> der Tick
+    ///       kostet nichts, UNABHAENGIG VON DER TABELLENGROESSE."
+    fn l0(b: &mut Bericht, cap: usize, tag: &str) {
+        let (mut s, _idle) = aufbau_mit(cap);
+        let _t = faden(&mut s, PRIO_T, 1); // Thread OHNE Budget -> nichts erschoepft je
+        s.on_tick(0, F, false);
+        z_null();
+        for _ in 0..200 {
+            s.on_tick(0, F, true);
+        }
+        b.k(&format!("L0.{tag}.tabelle"), s.tcbs.len() as i64);
+        b.k(&format!("L0.{tag}.ruhe_aussen"), z(&SCAN_AUSSEN));
+        b.k(&format!("L0.{tag}.ruhe_innen"), z(&SCAN_INNEN));
+        b.k(&format!("L0.{tag}.depleted_count"), s.depleted_count as i64);
+    }
+
+    /// L1 -- EIN Konto, EIN Donee (genau der Aufbau der Positivkontrolle P2). Getrennt gemessen:
+    ///       was kostet ein WARTETAKT (Konto erschoepft, Refill noch nicht faellig) und was
+    ///       kostet der REFILL-TAKT selbst.
+    fn l1(b: &mut Bericht, cap: usize, tag: &str) {
+        let (mut s, _li, la, ls) = donee_aufbau_mit(cap, BUDGET);
+        for _ in 0..BUDGET {
+            s.on_tick(0, F, true);
+        }
+        assert!(s.tcbs[la].depleted, "das Konto muss erschoepft sein");
+        assert!(s.tcbs[ls].blocked, "der Donee muss geblockt sein");
+        let (_, vor) = s.budget_stats();
+        let (mut warte_a, mut warte_i, mut wartetakte) = (0i64, 0i64, 0i64);
+        let (mut refill_a, mut refill_i) = (-1i64, -1i64);
+        for _ in 0..(PERIOD as i64 + 10) {
+            z_null();
+            s.on_tick(0, F, true);
+            let (a, i) = (z(&SCAN_AUSSEN), z(&SCAN_INNEN));
+            if s.budget_stats().1 > vor {
+                refill_a = a;
+                refill_i = i;
+                break;
+            }
+            warte_a += a;
+            warte_i += i;
+            wartetakte += 1;
+        }
+        b.k(&format!("L1.{tag}.tabelle"), s.tcbs.len() as i64);
+        b.k(&format!("L1.{tag}.wartetakte"), wartetakte);
+        b.k(
+            &format!("L1.{tag}.aussen_je_wartetakt"),
+            if wartetakte > 0 { warte_a / wartetakte } else { -1 },
+        );
+        b.k(
+            &format!("L1.{tag}.innen_je_wartetakt"),
+            if wartetakte > 0 { warte_i / wartetakte } else { -1 },
+        );
+        b.k(&format!("L1.{tag}.refilltakt_aussen"), refill_a);
+        // ==> DIE MESSUNG: die Donee-Schleife im Refill-Takt.
+        b.k(&format!("L1.{tag}.refilltakt_innen"), refill_i);
+        b.k(
+            &format!("L1.{tag}.depleted_count_nach"),
+            s.depleted_count as i64,
+        );
+        b.k(
+            &format!("L1.{tag}.donee_geweckt"),
+            ja(!s.tcbs[ls].blocked),
+        );
+    }
+
+    /// L3 -- der O(n^2)-VERSUCH. Der Todo-Eintrag laesst offen, ob „viele Konten refillen im
+    ///       SELBEN Tick" ueberhaupt erreichbar ist; dagegen spricht, dass je Kern und Tick
+    ///       hoechstens EIN Konto erschoepft. Das stimmt -- und reicht nicht:
+    ///       `next_refill = now + period`, und die PERIODE waehlt der Mandant. Erschoepft
+    ///       Konto i im Tick `m+i` und traegt es die Periode `Z - m - i`, faellt sein Refill
+    ///       auf denselben Tick `Z` wie alle anderen. Kein Privileg, nur `set_budget`.
+    ///
+    ///       Drei Varianten, weil sie sich unterscheiden MUESSEN, wenn der Zaehler wirkt:
+    ///         a) kein Donee            -- niemand ist budget-blockiert
+    ///         b) EIN Donee             -- einer ist es
+    ///         c) je Konto EIN Donee    -- der echte schlechteste Fall
+    fn l3(b: &mut Bericht, tag: &str, k: usize, donees: usize) {
+        let cap = L_GROSS;
+        let (mut s, _idle) = aufbau_mit(cap);
+        let mut ida = Vec::new();
+        let mut ids = Vec::new();
+        let mut la = Vec::new();
+        for i in 0..k {
+            let a = faden(&mut s, PRIO_T, 1 + 2 * i);
+            let srv = faden(&mut s, PRIO_T, 2 + 2 * i);
+            la.push(lok(&s, a));
+            ida.push(a);
+            ids.push(srv);
+            // Alle parken: dann bestimmt allein `unblock`, wer als naechstes laeuft -- die
+            // Reihenfolge ist damit gesetzt und nicht dem Rundlauf ueberlassen.
+            s.pause(a);
+            s.pause(srv);
+        }
+        let ziel = s.ticks() + 3 * k as u64 + 50;
+        for i in 0..k {
+            assert!(s.unblock(ida[i]), "unblock A{i}");
+            s.on_tick(0, F, false); // YIELD: A_i wird current, kostet kein Budget
+            assert_eq!(s.current, Some(la[i]), "A{i} muss laufen");
+            if i < donees {
+                s.switch_to(0, F, ids[i]); // S_i laeuft gegen das Konto von A_i
+            }
+            let m = s.ticks();
+            assert!(ziel > m + 1, "Zieltick zu knapp gewaehlt");
+            assert!(
+                s.set_budget(ida[i], 1, (ziel - m - 1) as u32),
+                "set_budget A{i}"
+            );
+            s.on_tick(0, F, true); // now = m+1 -> A_i erschoepft, next_refill = ziel
+            assert!(s.tcbs[la[i]].depleted, "A{i} muss erschoepft sein");
+        }
+        b.k(&format!("L3{tag}.konten"), k as i64);
+        b.k(&format!("L3{tag}.depleted_count"), s.depleted_count as i64);
+        b.k(
+            &format!("L3{tag}.budget_blocked_echt"),
+            echte_budget_blocked(&s),
+        );
+        // Bis zum Zieltick laufen und JEDEN Tick einzeln messen.
+        let (mut max_a, mut max_i, mut max_r) = (0i64, 0i64, 0i64);
+        let mut takte = 0i64;
+        while s.ticks() < ziel {
+            let (_, r0) = s.budget_stats();
+            z_null();
+            s.on_tick(0, F, true);
+            takte += 1;
+            let (a, i) = (z(&SCAN_AUSSEN), z(&SCAN_INNEN));
+            let dr = (s.budget_stats().1 - r0) as i64;
+            if dr > max_r {
+                max_r = dr;
+            }
+            if a > max_a {
+                max_a = a;
+            }
+            if i > max_i {
+                max_i = i;
+            }
+        }
+        b.k(&format!("L3{tag}.takte"), takte);
+        // ==> DIE MESSUNG: refillen wirklich alle im SELBEN Tick, und was kostet dieser Tick?
+        b.k(&format!("L3{tag}.refills_max_tick"), max_r);
+        b.k(&format!("L3{tag}.aussen_max_tick"), max_a);
+        b.k(&format!("L3{tag}.innen_max_tick"), max_i);
+        b.k(
+            &format!("L3{tag}.innen_max_je_konto"),
+            if k > 0 { max_i / (k as i64) } else { -1 },
+        );
+    }
+
+    /// L3d -- **dieselbe Wirkung, ohne dass irgendwer eine Periode waehlt.**
+    ///        `attach_migrated` rechnet `next_refill` auf die eigene Tick-Uhr um:
+    ///        `tcb.next_refill = self.now + tcb.period`. Kommen mehrere erschoepfte Threads
+    ///        **im selben Tick** auf einem Kern an, ist das fuer alle dieselbe Zahl -- und die
+    ///        Periode muss dafuer nicht gewaehlt, sondern nur GETEILT werden (dieselbe
+    ///        SchedContext-Cap). Ausgeloest wird es vom Lastausgleich, nicht vom Mandanten.
+    fn l3d(b: &mut Bericht, k: usize) {
+        let cap = L_GROSS;
+        const P: u32 = 500;
+        // Zwei Kerne an EINEM Directory -- genau die Lage, in der der Kernel migriert.
+        // SAFETY: frischer, exklusiver Speicher (s. `aufbau_mit`).
+        unsafe { attach_directory(roh(directory_bytes(cap), directory_align()), cap) };
+        let mut a = Scheduler::new();
+        // SAFETY: wie oben.
+        unsafe { a.attach_storage(0, roh(core_storage_bytes(cap), core_storage_align()), cap) };
+        a.init_core(0, PRIO_IDLE).expect("init_core 0");
+        let mut zk = Scheduler::new();
+        // SAFETY: wie oben.
+        unsafe { zk.attach_storage(1, roh(core_storage_bytes(cap), core_storage_align()), cap) };
+        zk.init_core(1, PRIO_IDLE).expect("init_core 1");
+
+        let mut ids = Vec::new();
+        for i in 0..k {
+            let t = a
+                .spawn(0, 0x1000 + i, 0, 0x10_0000 + i * 0x1000, 0x1000, PRIO_T)
+                .expect("spawn");
+            // **Dieselbe** Periode fuer alle -- nicht gewaehlt, sondern geteilt.
+            assert!(a.set_budget(t, 1, P), "set_budget {i}");
+            ids.push(t);
+        }
+        a.on_tick(0, F, false); // der erste wird current
+        for _ in 0..k {
+            a.on_tick(0, F, true); // je Tick erschoepft genau EINES -- unterschiedliche next_refill
+        }
+        b.k("L3d.erschoepft_auf_quelle", a.depleted_count as i64);
+        // Und jetzt wandern sie -- alle im selben Tick des Zielkerns.
+        let mut gewandert = 0i64;
+        for t in ids.iter() {
+            if let Some(m) = a.detach_for_migration(*t) {
+                assert!(zk.attach_migrated(m).is_ok(), "attach_migrated");
+                gewandert += 1;
+            }
+        }
+        b.k("L3d.gewandert", gewandert);
+        b.k("L3d.erschoepft_auf_ziel", zk.depleted_count as i64);
+        let (mut max_i, mut max_r) = (0i64, 0i64);
+        for _ in 0..(P as i64 + 5) {
+            let (_, r0) = zk.budget_stats();
+            z_null();
+            zk.on_tick(1, F, true);
+            let dr = (zk.budget_stats().1 - r0) as i64;
+            if dr > max_r {
+                max_r = dr;
+                max_i = z(&SCAN_INNEN);
+            }
+        }
+        // ==> DIE MESSUNG: wie viele Refills fallen auf EINEN Tick, ohne jede Periodenwahl?
+        b.k("L3d.refills_max_tick", max_r);
+        b.k("L3d.innen_max_tick", max_i);
+    }
+
+    /// L4 -- `record_zombie` (je Thread-Tod) und L5 -- `set_budget` im `was_depleted`-Zweig.
+    ///       Beide waren vor H-b O(1). Nicht im Tick-Pfad, deshalb getrennt ausgewiesen.
+    fn l45(b: &mut Bericht, cap: usize, tag: &str) {
+        let (mut s, _idle) = aufbau_mit(cap);
+        let t = faden(&mut s, PRIO_T, 1);
+        z_null();
+        assert!(s.kill(t, 0), "kill");
+        b.k(&format!("L4.{tag}.zombie_scan"), z(&SCAN_ZOMBIE));
+
+        let (mut s, _idle) = aufbau_mit(cap);
+        let t = faden(&mut s, PRIO_T, 1);
+        assert!(s.set_budget(t, BUDGET, PERIOD), "set_budget");
+        s.on_tick(0, F, false);
+        for _ in 0..BUDGET {
+            s.on_tick(0, F, true);
+        }
+        assert!(s.tcbs[lok(&s, t)].depleted, "muss erschoepft sein");
+        z_null();
+        assert!(s.set_budget(t, BUDGET, PERIOD), "set_budget erneut");
+        b.k(&format!("L5.{tag}.setbudget_scan"), z(&SCAN_SETBUDGET));
+    }
+
+    /// L9 -- **die Nachzaehlung.** Ein Zaehler nach dem Muster von `depleted_count` ist genau
+    ///       die Konstruktion, die an diesem Projekt am selben Tag schon einmal gelogen hat
+    ///       (D8/M5: mehrfach erhoeht, einmal gesenkt, nie wieder 0 -- und der Scan lief ab da
+    ///       in jedem Tick). Deshalb wird er hier gegen eine **unabhaengig hergeleitete** Zahl
+    ///       gehalten: die Tabelle wird gezaehlt. Zwei Stellen pruefen dasselbe:
+    ///       `audit()` (im Kernel-Quelltext, Code 10) und diese Zeile (im Messwerkzeug).
+    fn l9(b: &mut Bericht) {
+        println!("  L9  Nachzaehlung: Zaehler gegen die gezaehlte Tabelle");
+        let (mut s, _li, la, ls) = donee_aufbau_mit(L_KLEIN, BUDGET);
+        b.k("L9.start.echt", echte_budget_blocked(&s));
+        b.k("L9.start.zaehler", zaehler_budget_blocked(&s));
+        b.k("L9.start.audit", s.audit() as i64);
+        for _ in 0..BUDGET {
+            s.on_tick(0, F, true);
+        }
+        // Jetzt ist genau EINER budget-blockiert: der Donee.
+        b.k("L9.blockiert.echt", echte_budget_blocked(&s));
+        b.k("L9.blockiert.zaehler", zaehler_budget_blocked(&s));
+        b.k("L9.blockiert.ist_der_donee", ja(s.tcbs[ls].blocked));
+        b.k("L9.blockiert.audit", s.audit() as i64);
+        let (_, passiert) = bis_refill(&mut s, PERIOD as i64 + 10);
+        b.k("L9.refill_passiert", ja(passiert));
+        // ... und nach dem Refill KEINER mehr. Kehrt der Zaehler nicht auf 0 zurueck, ist der
+        // Waechter dauerhaft wahr und die Behebung wirkungslos -- die M5-Form.
+        b.k("L9.nach_refill.echt", echte_budget_blocked(&s));
+        b.k("L9.nach_refill.zaehler", zaehler_budget_blocked(&s));
+        b.k(
+            "L9.nach_refill.zaehler_luegt_um",
+            zaehler_budget_blocked(&s) - echte_budget_blocked(&s),
+        );
+        // ==> DIE MESSUNG: schlaegt `audit()` an, wenn der Zaehler luegt?
+        b.k("L9.nach_refill.audit", s.audit() as i64);
+        let _ = la;
+
+        // Und dieselbe Frage nach den drei uebrigen Aufloesungswegen (PAUSE, Kontotod,
+        // set_budget) -- jeder von ihnen senkt den Zaehler, und jeder einzeln ist eine Stelle,
+        // an der er stehenbleiben koennte.
+        for (nr, was) in ["pause", "kill", "setbudget"].iter().enumerate() {
+            let (mut s, _li, la, ls) = donee_aufbau_mit(L_KLEIN, BUDGET);
+            for _ in 0..BUDGET {
+                s.on_tick(0, F, true);
+            }
+            match nr {
+                0 => {
+                    s.pause(tid(&s, ls));
+                }
+                1 => {
+                    assert!(s.kill(tid(&s, la), 0), "kill Konto");
+                }
+                _ => {
+                    assert!(s.set_budget(tid(&s, la), BUDGET, PERIOD), "set_budget");
+                }
+            }
+            b.k(&format!("L9.{was}.echt"), echte_budget_blocked(&s));
+            b.k(&format!("L9.{was}.zaehler"), zaehler_budget_blocked(&s));
+            b.k(
+                &format!("L9.{was}.zaehler_luegt_um"),
+                zaehler_budget_blocked(&s) - echte_budget_blocked(&s),
+            );
+            b.k(&format!("L9.{was}.audit"), s.audit() as i64);
+        }
+    }
+
+    // ==============================================================================================
+
+    pub fn leistung(fassung: &str) -> i32 {
+        println!("== D10-Kostenmessung (instrumentierte Fassung: {fassung}) ==");
+        let mut b = Bericht { zeilen: Vec::new() };
+        println!("  L0  Ruhe: kein Konto erschoepft -- die Zusicherung aus `on_tick`");
+        l0(&mut b, L_KLEIN, "klein");
+        l0(&mut b, L_GROSS, "gross");
+        println!("  L1  ein Konto, ein Donee -- Wartetakt gegen Refill-Takt (SPRECHPROBE)");
+        l1(&mut b, L_KLEIN, "klein");
+        l1(&mut b, L_GROSS, "gross");
+        println!("  L3  der O(n^2)-Versuch: viele Konten refillen im SELBEN Tick");
+        l3(&mut b, "a", 100, 0);
+        l3(&mut b, "b", 100, 1);
+        l3(&mut b, "c", 100, 100);
+        l3d(&mut b, 100);
+        println!("  L4/L5  record_zombie und set_budget (nicht im Tick-Pfad)");
+        l45(&mut b, L_KLEIN, "klein");
+        l45(&mut b, L_GROSS, "gross");
+        l9(&mut b);
+
+        let hol = |n: &str| -> i64 {
+            b.zeilen
+                .iter()
+                .find(|(k, _)| k == n)
+                .map(|(_, v)| *v)
+                .unwrap_or(-999)
+        };
+        // **Die Sprechprobe des Messgeraets.** Ohne diesen Kontrast misst die L-Reihe nichts:
+        // eine Zahl, die bei 32 und bei 10000 Slots gleich ist, sagt ueber die Tabellengroesse
+        // gar nichts -- und genau darum geht D10.
+        let gross_teurer = hol("L1.gross.refilltakt_aussen") > hol("L1.klein.refilltakt_aussen");
+        let lk = hol("L0.klein.ruhe_aussen") == 0
+            && hol("L0.gross.ruhe_aussen") == 0
+            && hol("L0.gross.ruhe_innen") == 0
+            && hol("L1.klein.tabelle") == L_KLEIN as i64
+            && hol("L1.gross.tabelle") == L_GROSS as i64
+            && hol("L1.klein.donee_geweckt") == 1
+            && hol("L1.gross.donee_geweckt") == 1
+            && gross_teurer
+            && hol("L3c.refills_max_tick") > 1 // der O(n^2)-Aufbau ist wirklich entstanden
+            // ... und der Zaehler luegt an keiner der vier Aufloesungsstellen. Ohne diese
+            // Zeilen waere er genau der von D8/M5: eine Zahl, die niemand nachhaelt.
+            && hol("L9.nach_refill.zaehler_luegt_um") == 0
+            && hol("L9.nach_refill.audit") == 0
+            && hol("L9.pause.zaehler_luegt_um") == 0
+            && hol("L9.pause.audit") == 0
+            && hol("L9.kill.zaehler_luegt_um") == 0
+            && hol("L9.kill.audit") == 0
+            && hol("L9.setbudget.zaehler_luegt_um") == 0
+            && hol("L9.setbudget.audit") == 0
+            && hol("L9.blockiert.zaehler") == hol("L9.blockiert.echt");
+
+        println!();
+        println!("  -- Werte ({}) --", fassung);
+        for (k, v) in &b.zeilen {
+            println!("  {k}={v}");
+        }
+        println!();
+        println!(
+            "  SPRECHPROBE (klein != gross, Ruhe == 0, Zaehler luegt nicht): {}",
+            if lk { "BESTANDEN" } else { "DURCHGEFALLEN" }
+        );
+        println!("-- {} Messwerte, Fassung {} --", b.zeilen.len(), fassung);
+        if lk {
+            0
+        } else {
+            1
+        }
+    }
 
     pub fn run(fassung: &str) -> i32 {
         println!("== Messung am echten sel4lake-sched (Fassung: {fassung}) ==");
@@ -1181,7 +1630,12 @@ in_liste={} flag={} current={}",
 
 fn main() {
     let f = std::env::args().nth(1).unwrap_or_else(|| "echt".to_string());
-    std::process::exit(messung::run(&f));
+    let modus = std::env::args().nth(2).unwrap_or_default();
+    std::process::exit(if modus == "leistung" {
+        messung::leistung(&f)
+    } else {
+        messung::run(&f)
+    });
 }
 RSEOF
 }
@@ -1226,7 +1680,7 @@ PY
 }
 
 harness_bauen() {   # harness_bauen <lib.rs> <arbeitsverzeichnis>
-    local code="$1" W="$2" ausgabe
+    local code="$1" W="$2" ausgabe f
 
     for f in "$code" "$CYCLES_STD" "$SLAB_STD" "$SYNC_STD"; do
         [ -f "$f" ] || { echo "  FEHLER: $f fehlt." >&2; return 2; }
@@ -1259,16 +1713,27 @@ harness_bauen() {   # harness_bauen <lib.rs> <arbeitsverzeichnis>
     return 0
 }
 
-fahren() {   # fahren <arbeitsverzeichnis> <fassung> [--leise]
-    local W="$1" fassung="$2" leise="${3:-}" ausgabe rc n
-    ausgabe="$("$W/mess.bin" "$fassung" 2>&1)"; rc=$?
+# Rueckgabe: 0 = Positiv-/Sprechprobe bestanden, 1 = durchgefallen, 2 = Werkzeugfehler,
+#            3 = der Lauf ist ABGEBROCHEN (nur bei ausdruecklich dafuer erklaerten Fassungen).
+#
+# Zu 3: eine Fassung, die den Zaehler nach UNTEN luegen laesst, laeuft in die naechste
+# Subtraktion und bricht dort ab. Das ist eine Erkennung und kein Werkzeugfehler -- aber nur
+# fuer die Fassungen, bei denen es erwartet wird; ueberall sonst bleibt „kein Messwert" ein
+# Fehler ("ein leerer Lauf ist kein Testergebnis").
+fahren() {   # fahren <arbeitsverzeichnis> <fassung> [--leise] [modus] [--darf-abbrechen]
+    local W="$1" fassung="$2" leise="${3:-}" modus="${4:-}" abbruch_ok="${5:-}" ausgabe rc n
+    ausgabe="$("$W/mess.bin" "$fassung" $modus 2>&1)"; rc=$?
+    printf '%s\n' "$ausgabe" > "$W/ausgabe.txt"
     n="$(printf '%s\n' "$ausgabe" | sed -n 's/^-- \([0-9]*\) Messwerte.*/\1/p')"
     if [ -z "$n" ] || [ "$n" -lt 1 ]; then
+        if [ -n "$abbruch_ok" ]; then
+            printf '%s\n' "$ausgabe" | grep -m1 "panicked at" | sed 's/^/    Abbruch: /'
+            return 3
+        fi
         echo "  FEHLER: kein Messwert entstanden -- ein leerer Lauf ist kein Ergebnis." >&2
         printf '%s\n' "$ausgabe" | sed 's/^/    /' >&2
         return 2
     fi
-    printf '%s\n' "$ausgabe" > "$W/ausgabe.txt"
     [ -n "$leise" ] || printf '%s\n' "$ausgabe" | sed 's/^/  /'
     return "$rc"
 }
@@ -1342,128 +1807,70 @@ V0_AUDIT='s = s.replace("""                if t.depleted {
                 }
 """, "", 1)'
 
-# H-a -- der Waechter des `_`-Zweigs WOERTLICH in den Donee-Zweig uebertragen. Sieht symmetrisch
-#        aus und ist es nicht: der Donee ist an dieser Stelle IMMER blockiert (`on_tick` hat ihn
-#        gerade blockiert), der Zweig wird also nie wirksam.
-H_A='s = s.replace("""                    Some(d) if d != slot => {
-                        // Der Donee war auf das Konto-Budget geblockt -> wieder bereit.
-                        self.tcbs[d].blocked = false;
-                        self.enqueue_ready(d);
-                    }""", """                    Some(d) if d != slot => {
-                        // H-a: der woertlich uebertragene Waechter aus dem `_`-Zweig.
-                        if !self.tcbs[d].blocked && self.current != Some(d) {
-                            self.enqueue_ready(d);
-                        }
-                    }""", 1)'
+# H-a -- der Waechter des `_`-Zweigs WOERTLICH in den Donee-Weckelauf uebertragen. Sieht
+#        symmetrisch aus und ist es nicht: der Donee ist an dieser Stelle IMMER blockiert
+#        (`on_tick` hat ihn gerade blockiert), der Lauf weckt also niemanden mehr.
+#
+#        **Neu angesetzt am 2026-08-03 (D10).** Bis dahin zeigte der Anker auf den `sc_donee`-Zweig
+#        VOR H-b; seit dessen Behebung passte er nicht mehr, und das Werkzeug brach an dieser
+#        Stelle mit rc=2 ab -- nach der Behebung von D9, also seit es H-b im Quelltext gibt.
+#        Genau die Form aus der eigenen Kopfzeile: die Anker sind der GEGENSTAND, nicht seine
+#        Geschichte.
+H_A='s = s.replace("""                            && self.tcbs[d].used
+                            && self.tcbs[d].budget_blocked
+                            && self.tcbs[d].sc_donor == Some(slot)""", """                            && self.tcbs[d].used
+                            // H-a: der woertlich uebertragene Waechter aus dem `_`-Zweig.
+                            && !self.tcbs[d].blocked
+                            && self.current != Some(d)
+                            && self.tcbs[d].sc_donor == Some(slot)""", 1)'
 
-# H-b -- der Vorschlag: der GRUND der Blockade wird mitgeschrieben (`budget_blocked`), und der
-#        Refill weckt genau die Threads, die WEGEN DIESES KONTOS blockiert sind -- statt des
-#        einen Slots in `sc_donee`, den der zweite CALL ueberschreibt und der innere REPLY loescht.
-H_B1='s = s.replace("""    /// True, wenn das Budget erschöpft ist (Thread weder laufend noch in Ready-Queue,
-    /// wartet auf Refill).
-    depleted: bool,""", """    /// True, wenn das Budget erschöpft ist (Thread weder laufend noch in Ready-Queue,
-    /// wartet auf Refill).
-    depleted: bool,
-    /// H-b: blockiert, WEIL das belastete Konto leer ist -- im Unterschied zu einer Blockade
-    /// aus IPC oder PAUSE. `blocked` allein kann das nicht sagen, und genau daran haengt der
-    /// Donee-Zweig: er hebt eine Blockade auf, deren Grund er nicht kennt.
-    budget_blocked: bool,""", 1)'
-H_B2='s = s.replace("""        depleted: false,
-""", """        depleted: false,
-        budget_blocked: false,
-""", 1)'
-H_B3='s = s.replace("""                    if acct != cur {
-                        // `cur` ist ein Donee, der gegen ein fremdes (erschöpftes) Konto
-                        // lief -> auf den Refill blocken (nicht „verloren": blocked=true,
-                        // der Refill des Kontos macht ihn wieder bereit).
-                        self.tcbs[cur].blocked = true;
-                    }""", """                    if acct != cur && !self.tcbs[cur].blocked {
-                        // H-b: nur wer nicht schon aus einem ANDEREN Grund blockiert ist, wird
-                        // hier blockiert -- und der Grund wird mitgeschrieben.
-                        self.tcbs[cur].blocked = true;
-                        self.tcbs[cur].budget_blocked = true;
-                    }""", 1)'
-H_B4='s = s.replace("""                match self.tcbs[slot].sc_donee {
-                    Some(d) if d != slot => {
-                        // Der Donee war auf das Konto-Budget geblockt -> wieder bereit.
-                        self.tcbs[d].blocked = false;
-                        self.enqueue_ready(d);
-                    }""", """                // H-b: die Spende ist ein STAPEL. `sc_donee` ist nur ihre Spitze, wird vom
-                // zweiten CALL ueberschrieben und vom inneren REPLY geloescht -- geweckt wird
-                // deshalb, wer WEGEN DIESES KONTOS blockiert ist, und nur der.
-                for d in 0..self.tcbs.len() {
-                    if d != slot
-                        && self.tcbs[d].used
-                        && self.tcbs[d].budget_blocked
-                        && self.tcbs[d].sc_donor == Some(slot)
-                    {
-                        self.tcbs[d].budget_blocked = false;
-                        self.tcbs[d].blocked = false;
-                        self.enqueue_ready(d);
-                    }
-                }
-                match self.tcbs[slot].sc_donee {
-                    Some(d) if d != slot => {
-                        let _ = d; // erledigt der Lauf darueber
-                    }""", 1)'
-H_B5='s = s.replace("""        if self.tcbs[s].blocked {
-""", """        if self.tcbs[s].blocked {
-            // H-b: WARUM ist er blockiert? Eine Blockade auf ein leeres Konto hebt nur der
-            // Refill auf. Der Waechter ist hier -- anders als G-a -- gefahrlos, weil der Wecker
-            // BENANNT ist: `refill_depleted` weckt genau `budget_blocked`.
-            if self.tcbs[s].budget_blocked {
-                return true;
-            }
-            let acct = self.tcbs[s].sc_donor.unwrap_or(s);
-            if acct != s && self.tcbs[acct].depleted {
-                // Zurueck in den Lauf ja -- aber nicht auf ein leeres Konto. Die Blockade
-                // wechselt den GRUND, und der neue Grund hat einen Wecker.
-                self.tcbs[s].budget_blocked = true;
-                return true;
-            }
-""", 1)'
-H_B6='s = s.replace("""        if let Some(d) = self.tcbs[local].sc_donee {
-            self.tcbs[d].sc_donor = None;
-        }""", """        // H-b: ALLE Empfaenger dieser Spende loesen, nicht nur die Spitze -- und wer auf
-        // dieses Konto geblockt war, verliert mit ihm seinen Wecker und muss hier frei.
-        for d in 0..self.tcbs.len() {
-            if d != local && self.tcbs[d].used && self.tcbs[d].sc_donor == Some(local) {
-                self.tcbs[d].sc_donor = None;
-                if self.tcbs[d].budget_blocked {
-                    self.tcbs[d].budget_blocked = false;
-                    self.tcbs[d].blocked = false;
-                    self.enqueue_ready(d);
-                }
-            }
+# **H-b ist keine Mutation mehr, sondern der Quelltext.** Bis zum 2026-08-03 stand hier der
+# Vorschlag aus D9 (`budget_blocked`, der Refill weckt den ganzen Spenden-STAPEL). Er ist seit
+# Commit 068db2a in `crates/sel4lake-sched/src/lib.rs` -- und damit ist die Fassung `echt` die
+# Fassung H-b. Ihn hier stehen zu lassen hiesse, das Feld ein zweites Mal einzufuegen; das
+# Werkzeug wuerde mit einem Uebersetzungsfehler abbrechen. Was H-b war, steht in `todo.md` (D9)
+# und im Commit; was H-b TUT, misst jede Zeile der D-Reihe an der Fassung `echt`.
+
+# --- D10 (2026-08-03) -------------------------------------------------------------------------
+# ohne-Zaehler -- der Stand VOR D10: der Waechter faellt weg, der Weckelauf laeuft wieder
+#                 bedingungslos. Er dient ZWEI Aussagen zugleich: die Kosten muessen sichtbar
+#                 hoeher sein (L-Reihe), und das VERHALTEN muss in JEDER Zeile gleich bleiben
+#                 (Verhaltenstabelle). Eine Behebung, die nur Kosten senken soll und dabei eine
+#                 Zahl verschiebt, ist keine.
+OHNE_ZAEHLER='s = s.replace("""                if self.budget_blocked_count > 0 {
+                    for d in 0..self.tcbs.len() {
+                        if d != slot""", """                if true {
+                    for d in 0..self.tcbs.len() {
+                        if d != slot""", 1)
+s = s.replace("""                if self.budget_blocked_count > 0 {
+                    for d in 0..self.tcbs.len() {
+                        if d != s""", """                if true {
+                    for d in 0..self.tcbs.len() {
+                        if d != s""", 1)'
+
+# Luegner-hoch -- **die Form, die dieses Projekt am 2026-08-03 schon einmal hatte** (D8/M5):
+#                 der Zaehler wird erhoeht und nie gesenkt, kehrt nie auf 0 zurueck, der teure
+#                 Lauf ist ab da dauerhaft scharf. Die Nachzaehlung in `audit()` muss anschlagen
+#                 (Code 10) -- sonst ist der neue Zaehler genau der alte.
+LUEGNER_HOCH='s = s.replace("""        if an {
+            self.budget_blocked_count += 1;
+        } else {
+            self.budget_blocked_count -= 1;
+        }""", """        if an {
+            self.budget_blocked_count += 1;
         }""", 1)'
-H_B7='s = s.replace("""            if was_depleted {
-                self.depleted_count -= 1;
-                if self.current != Some(s) && !self.tcbs[s].blocked {""", """            if was_depleted {
-                self.depleted_count -= 1;
-                // H-b: mit `depleted` verschwindet der Anlass, aus dem der Donee je wieder
-                // geweckt wuerde -- also hier wecken.
-                for d in 0..self.tcbs.len() {
-                    if d != s
-                        && self.tcbs[d].used
-                        && self.tcbs[d].budget_blocked
-                        && self.tcbs[d].sc_donor == Some(s)
-                    {
-                        self.tcbs[d].budget_blocked = false;
-                        self.tcbs[d].blocked = false;
-                        self.enqueue_ready(d);
-                    }
-                }
-                if self.current != Some(s) && !self.tcbs[s].blocked {""", 1)'
-H_B8='s = s.replace("""        if !self.tcbs[s].blocked {
-            self.tcbs[s].blocked = true;""", """        // H-b: PAUSE UEBERNIMMT die Blockade. Ohne diese Zeile ist sie ein No-Op an einem
-        // Thread, der schon auf sein Konto-Budget geblockt ist (er ist ja `blocked`) -- und der
-        // Refill hebt sie dann mit auf, obwohl PAUSE Erfolg gemeldet hat.
-        self.tcbs[s].budget_blocked = false;
-        if !self.tcbs[s].blocked {
-            self.tcbs[s].blocked = true;""", 1)'
+
+# Luegner-runter -- die andere Richtung: der Zaehler bleibt 0, der Waechter ueberspringt den
+#                 Lauf, und der Donee wird NIE geweckt (die D5-Form). Auch das muss die
+#                 Nachzaehlung sehen -- ein Waechter, der nur eine Richtung prueft, prueft halb.
+LUEGNER_RUNTER='s = s.replace("""        if an {
+            self.budget_blocked_count += 1;
+        } else {""", """        if an {
+        } else {""", 1)'
 
 echo "== Gegenproben (Mutationen ausschliesslich auf KOPIEN) =="
-for fassung in V0 H-a H-b; do
+GEGENPROBEN="V0 H-a ohne-Zaehler Luegner-hoch Luegner-runter"
+for fassung in $GEGENPROBEN; do
     Wg="$WURZEL/$fassung"; mkdir -p "$Wg"
     cp "$CODE_STD" "$Wg/lib.rs" || exit 2
     case "$fassung" in
@@ -1471,14 +1878,19 @@ for fassung in V0 H-a H-b; do
              mutieren "$Wg/lib.rs" "$V0_REFILL"  || exit 2
              mutieren "$Wg/lib.rs" "$V0_AUDIT"   || exit 2 ;;
         H-a) mutieren "$Wg/lib.rs" "$H_A" || exit 2 ;;
-        H-b) for teil in "$H_B1" "$H_B2" "$H_B3" "$H_B4" "$H_B5" "$H_B6" "$H_B7" "$H_B8"; do
-                 mutieren "$Wg/lib.rs" "$teil" || exit 2
-             done ;;
+        ohne-Zaehler)   mutieren "$Wg/lib.rs" "$OHNE_ZAEHLER" || exit 2 ;;
+        Luegner-hoch)   mutieren "$Wg/lib.rs" "$LUEGNER_HOCH" || exit 2 ;;
+        Luegner-runter) mutieren "$Wg/lib.rs" "$LUEGNER_RUNTER" || exit 2 ;;
     esac
     harness_bauen "$Wg/lib.rs" "$Wg" || exit 2
-    fahren "$Wg" "$fassung" --leise; rc=$?
+    abbruch_ok=""; [ "$fassung" = "Luegner-runter" ] && abbruch_ok="--darf-abbrechen"
+    fahren "$Wg" "$fassung" --leise "" "$abbruch_ok"; rc=$?
     if [ "$rc" = 2 ]; then exit 2; fi
-    pk="BESTANDEN"; [ "$rc" != 0 ] && pk="DURCHGEFALLEN"
+    case "$rc" in
+        0) pk="BESTANDEN" ;;
+        3) pk="ABGEBROCHEN (die Subtraktion selbst erkennt es)" ;;
+        *) pk="DURCHGEFALLEN" ;;
+    esac
     echo "  $fassung gebaut und gefahren -- Positivkontrolle: $pk"
 done
 echo
@@ -1497,6 +1909,8 @@ M7.ende.blocked
 P2.nach_refill.donee_blocked
 P2.nach_refill.donee_current
 P2.tick_auf_gefuelltem_konto
+P2.erschoepft.audit
+P2.nach_refill.audit
 D1.nach_pause.donee_blocked
 D1.nach_refill.donee_blocked
 D1.pausierter_ist_current
@@ -1530,25 +1944,189 @@ D7.ticks_donee_lief
 D7.ende.donee_blocked
 "
 
-printf '  %-36s %6s %6s %6s %6s\n' "Groesse" "echt" "V0" "H-a" "H-b"
-printf '  %-36s %6s %6s %6s %6s\n' "------------------------------------" \
-       "------" "------" "------" "------"
+# Die Spalten entstehen aus $GEGENPROBEN -- wer eine Fassung dazunimmt, bekommt sie hier
+# automatisch, statt eine Kopfzeile und eine `wert`-Zeile getrennt nachzupflegen (genau so
+# entstehen Beschriftungen, die neben der Sache herlaufen).
+printf '  %-36s %14s' "Groesse (Verhalten)" "echt"
+for f in $GEGENPROBEN; do printf ' %14s' "$f"; done
+printf '\n'
 for k in $SCHLUESSEL; do
     ve="$(wert "$W_ECHT/ausgabe.txt" "$k")"
-    v0="$(wert "$WURZEL/V0/ausgabe.txt" "$k")"
-    va="$(wert "$WURZEL/H-a/ausgabe.txt" "$k")"
-    vb="$(wert "$WURZEL/H-b/ausgabe.txt" "$k")"
-    printf '  %-36s %6s %6s %6s %6s\n' "$k" "${ve:--}" "${v0:--}" "${va:--}" "${vb:--}"
+    printf '  %-36s %14s' "$k" "${ve:--}"
+    for f in $GEGENPROBEN; do
+        v="$(wert "$WURZEL/$f/ausgabe.txt" "$k")"
+        printf ' %14s' "${v:--}"
+    done
+    printf '\n'
 done
+echo
+
+# --- D10: das VERHALTEN darf sich nicht bewegt haben ------------------------------------------
+#
+# Die Tabelle oben zeigt 45 ausgewaehlte Groessen. Das reicht fuer eine Aussage ueber die
+# BEHEBUNG nicht: sie soll KOSTEN senken und sonst nichts, und „sonst nichts" ist eine Aussage
+# ueber ALLE Messwerte, nicht ueber die, die jemand in eine Liste geschrieben hat. Deshalb wird
+# hier stumpf alles verglichen -- eine ausgewaehlte Liste haette genau die Zeile nicht enthalten,
+# die sich bewegt.
+werte_alle() { sed -n 's/^  \([A-Za-z][A-Za-z0-9_.]*\)=\(-\?[0-9]*\)$/\1=\2/p' "$1"; }
+D10_OK=1
+n_echt="$(werte_alle "$W_ECHT/ausgabe.txt" | wc -l)"
+if [ "$n_echt" -lt 1 ]; then
+    echo "  D10: FEHLER -- keine Verhaltensmesswerte zum Vergleichen." >&2; D10_OK=0
+elif diff -q <(werte_alle "$W_ECHT/ausgabe.txt") \
+              <(werte_alle "$WURZEL/ohne-Zaehler/ausgabe.txt") >/dev/null; then
+    echo "  D10: alle $n_echt Verhaltensmesswerte von 'ohne-Zaehler' sind mit 'echt' IDENTISCH."
+    echo "       Die Behebung senkt Kosten und verschiebt keine einzige Zahl."
+else
+    echo "  D10: ACHTUNG -- 'echt' und 'ohne-Zaehler' unterscheiden sich im VERHALTEN:" >&2
+    diff <(werte_alle "$W_ECHT/ausgabe.txt") \
+         <(werte_alle "$WURZEL/ohne-Zaehler/ausgabe.txt") | sed 's/^/       /' >&2
+    D10_OK=0
+fi
 echo
 echo "  Lesart:"
 echo "   * V0 ist der Stand VOR D8 -- die Sprechprobe der Gegenprobenmechanik. Tauchen dort die"
 echo "     alten Befunde (M1/M4/M5) nicht wieder auf, misst der ganze Vergleich nichts."
 echo "   * H-a ist der woertlich uebertragene Waechter. Er faellt in der POSITIVKONTROLLE durch:"
 echo "     der Donee ist an dieser Stelle IMMER blockiert, also weckt ihn niemand mehr."
-echo "   * H-b traegt den GRUND der Blockade mit. D1/D4/D5/D6/D7 muessen verschwinden UND"
-echo "     D1.nach_resume.ticks_mit_budget > 0 bleiben -- sonst ist es dieselbe halbe Behebung"
-echo "     wie G-a bei D8."
+echo "   * H-b steht nicht mehr als Spalte: H-b IST seit 2026-08-03 der Quelltext, also die"
+echo "     Spalte 'echt'. D1/D4/D5/D6/D7 tragen dort die behobenen Werte."
+echo "   * ohne-Zaehler ist der Stand VOR D10 (der Waechter im Refill faellt weg). Sein"
+echo "     VERHALTEN muss in JEDER Zeile mit 'echt' uebereinstimmen -- eine Behebung, die nur"
+echo "     Kosten senken soll und dabei eine Zahl verschiebt, ist keine."
+echo "   * Luegner-hoch / Luegner-runter lassen den neuen Zaehler luegen (Senken bzw. Erhoehen"
+echo "     faellt weg). Sie muessen in der Positivkontrolle bzw. an Audit-Code 10 auffallen."
 echo "   * D3a/D3b sind das Ergebnis 'nicht ausloesbar': ein veralteter sc_donee entsteht nicht,"
 echo "     weil Tod ihn loescht und Migration verweigert wird (Sprechprobe: ohne Spende geht sie)."
+echo
+
+# ================================================================================================
+# 4. D10 -- die KOSTEN. Eigene, INSTRUMENTIERTE Binaries.
+# ================================================================================================
+#
+# Warum getrennte Binaries: die Verhaltensaussage oben soll am **unveraenderten** Quelltext
+# haengen. Die Zaehlzeilen sind zwar wirkungsfrei (ein `fetch_add` auf einem lokalen Static),
+# aber „wirkungsfrei" ist eine Behauptung, und die Verhaltensmessung soll sie nicht brauchen.
+#
+# Gemessen werden ITERATIONEN, nicht Zeit: eine Iterationszahl ist eine Eigenschaft des
+# Programms und ueber Laeufe hinweg identisch -- Zeit misst auf einer Mehrkernmaschine den
+# Wirt mit.
+INSTR_AUSSEN='s = s.replace("""    fn refill_depleted(&mut self) {
+        for slot in 0..self.tcbs.len() {""", """    fn refill_depleted(&mut self) {
+        for slot in 0..self.tcbs.len() {
+            crate::messung::SCAN_AUSSEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);""", 1)'
+INSTR_INNEN='s = s.replace("""                    for d in 0..self.tcbs.len() {
+                        if d != slot""", """                    for d in 0..self.tcbs.len() {
+                        crate::messung::SCAN_INNEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        if d != slot""", 1)'
+INSTR_SETBUDGET='s = s.replace("""                    for d in 0..self.tcbs.len() {
+                        if d != s""", """                    for d in 0..self.tcbs.len() {
+                        crate::messung::SCAN_SETBUDGET.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        if d != s""", 1)'
+INSTR_ZOMBIE='s = s.replace("""        for d in 0..self.tcbs.len() {
+            if d != local""", """        for d in 0..self.tcbs.len() {
+            crate::messung::SCAN_ZOMBIE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if d != local""", 1)'
+
+leistung_fassung() {   # leistung_fassung <name> [zusatzmutation ...]
+    local name="$1"; shift
+    local Wl="$WURZEL/L-$name" m
+    mkdir -p "$Wl"
+    cp "$CODE_STD" "$Wl/lib.rs" || return 2
+    for m in "$@"; do mutieren "$Wl/lib.rs" "$m" || return 2; done
+    for m in "$INSTR_AUSSEN" "$INSTR_INNEN" "$INSTR_SETBUDGET" "$INSTR_ZOMBIE"; do
+        mutieren "$Wl/lib.rs" "$m" || return 2
+    done
+    harness_bauen "$Wl/lib.rs" "$Wl" || return 2
+    local abbruch_ok=""
+    [ "$name" = "Luegner-runter" ] && abbruch_ok="--darf-abbrechen"
+    fahren "$Wl" "L-$name" --leise leistung "$abbruch_ok"
+    return $?
+}
+
+echo "== D10: die Kosten des Refill-Scans (Iterationen, instrumentierte Kopien) =="
+L_FASSUNGEN="echt ohne-Zaehler Luegner-hoch Luegner-runter"
+# `lf` und nicht `f`: `harness_bauen` benutzt `f` als Laufvariable OHNE `local` -- der Name
+# waere nach dem ersten Bauen ueberschrieben, und die Zeile darunter meldete eine Fassung,
+# die es nicht gibt. (Eine Beschriftung, die neben der Sache herlaeuft.)
+for lf in $L_FASSUNGEN; do
+    case "$lf" in
+        echt)           leistung_fassung "$lf" ;;
+        ohne-Zaehler)   leistung_fassung "$lf" "$OHNE_ZAEHLER" ;;
+        Luegner-hoch)   leistung_fassung "$lf" "$LUEGNER_HOCH" ;;
+        Luegner-runter) leistung_fassung "$lf" "$LUEGNER_RUNTER" ;;
+    esac
+    rc=$?
+    [ "$rc" = 2 ] && exit 2
+    case "$rc" in
+        0) sp="BESTANDEN" ;;
+        3) sp="ABGEBROCHEN (die Subtraktion selbst erkennt es)" ;;
+        *) sp="DURCHGEFALLEN" ;;
+    esac
+    echo "  L-$lf gebaut und gefahren -- Sprechprobe: $sp"
+done
+echo
+L_SCHLUESSEL="
+L0.klein.ruhe_aussen
+L0.gross.ruhe_aussen
+L0.gross.ruhe_innen
+L1.klein.aussen_je_wartetakt
+L1.gross.aussen_je_wartetakt
+L1.klein.refilltakt_aussen
+L1.gross.refilltakt_aussen
+L1.klein.refilltakt_innen
+L1.gross.refilltakt_innen
+L1.gross.donee_geweckt
+L3a.refills_max_tick
+L3a.aussen_max_tick
+L3a.innen_max_tick
+L3b.refills_max_tick
+L3b.innen_max_tick
+L3c.refills_max_tick
+L3c.innen_max_tick
+L3c.innen_max_je_konto
+L3d.gewandert
+L3d.refills_max_tick
+L3d.innen_max_tick
+L4.klein.zombie_scan
+L4.gross.zombie_scan
+L5.klein.setbudget_scan
+L5.gross.setbudget_scan
+L9.blockiert.echt
+L9.blockiert.zaehler
+L9.nach_refill.echt
+L9.nach_refill.zaehler
+L9.nach_refill.zaehler_luegt_um
+L9.nach_refill.audit
+L9.pause.zaehler_luegt_um
+L9.pause.audit
+L9.kill.zaehler_luegt_um
+L9.kill.audit
+L9.setbudget.zaehler_luegt_um
+L9.setbudget.audit
+"
+printf '  %-38s' "Groesse (Kosten, Iterationen)"
+for f in $L_FASSUNGEN; do printf ' %14s' "$f"; done
+printf '\n'
+for k in $L_SCHLUESSEL; do
+    printf '  %-38s' "$k"
+    for f in $L_FASSUNGEN; do
+        v="$(wert "$WURZEL/L-$f/ausgabe.txt" "$k")"
+        printf ' %14s' "${v:--}"
+    done
+    printf '\n'
+done
+echo
+echo "  Lesart der L-Reihe:"
+echo "   * L0 ist die ZUSICHERUNG aus \`on_tick\`: kein Konto erschoepft -> 0 Iterationen, und"
+echo "     zwar bei 32 wie bei 10000 Slots. Steht dort etwas anderes als 0, faellt der Satz."
+echo "   * L1 ist die SPRECHPROBE: dieselbe Groesse bei kleiner und bei grosser Tabelle. Sind"
+echo "     die Zahlen gleich, misst die ganze Reihe nicht die Tabellengroesse."
+echo "   * L3 beantwortet die offene Frage aus dem Todo-Eintrag: refillen mehrere Konten im"
+echo "     SELBEN Tick? \`refills_max_tick\` ist die Antwort, \`innen_max_tick\` ihr Preis."
+echo "     a = kein Donee, b = EIN Donee, c = je Konto einer (der schlechteste Fall)."
+echo "   * L4/L5 sind die zwei kleineren Stellen. Sie liegen NICHT im Tick-Pfad."
+echo "   * L9 haelt den Zaehler gegen die gezaehlte Tabelle. \`zaehler_luegt_um\` != 0 ist der"
+echo "     Befund, den \`depleted_count\` am 2026-08-03 hatte und den niemand sehen konnte."
+[ "$D10_OK" = 1 ] || exit 1
 exit 0

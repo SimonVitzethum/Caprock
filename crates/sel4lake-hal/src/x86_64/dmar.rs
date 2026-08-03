@@ -13,6 +13,32 @@
 //! von Anfang an auf `Group` — nicht, weil das heute schon jeder Pfad ausnutzt, sondern weil
 //! Tests, die erst an `dma_device` hängen, später an einer **zu starken** Aussage hängen.
 //!
+//! ## RMRR gilt der **Gruppe**, nicht der Funktion
+//!
+//! Eine RMRR ist ein Speicherbereich, den die **Firmware** für sich beansprucht (Legacy-USB,
+//! BMC, integrierte Grafik). Das betroffene Gerät ist deshalb nicht zuteilbar — ein Teil seines
+//! Zugriffs liegt per Konstruktion außerhalb unserer Kontrolle.
+//!
+//! Der Ausschluss muss aber **dieselbe Reichweite** haben wie die Gruppenbildung, und zwar aus
+//! genau demselben Argument: fehlt der Bridge oberhalb ACS (oder handelt es sich um ein
+//! Multifunktionsgerät ohne ACS), können die Geräte der Gruppe **an der IOMMU vorbei**
+//! untereinander DMA umleiten. Wer eine Funktion der Gruppe bekommt, bekommt damit faktisch den
+//! Weg des RMRR-Geräts — und zusätzlich schreibt die Zuteilung Kontexteinträge für **alle** RIDs
+//! der Gruppe (`Groups::aliases`), also auch für die RID des RMRR-Geräts, in **seine** Domäne.
+//!
+//! Bis 2026-08-03 färbte `Rmrr` nur die einzelne Funktion, während `GroupSpansUnits` die ganze
+//! Gruppe färbte. Gemessen: zwei Funktionen ohne ACS in einer Gruppe, RMRR auf 05.1 →
+//! `excluded[05.0] = None`, Aliasmenge `[0x28, 0x29]`, `audit() = 0`. **Auf QEMU q35 ist das
+//! unsichtbar (0 RMRRs), auf echter Hardware der Normalfall** — also genau die Sorte Lücke, die
+//! eine Emulation nie zeigt und die deshalb aus Literalen geprüft werden muss
+//! (`tools/host-tests.sh dmar`, Mutationen in `tools/dmar-rmrr-negativ.sh`).
+//!
+//! **Wirkung gleich, Grund verschieden.** Die Nachbarfunktion trägt keine RMRR; sie ist
+//! ausgeschlossen, *weil sie in einer Gruppe mit einer steht*. Deshalb ein eigener Grund
+//! (`GroupHasRmrr`) statt `Rmrr` über alle zu streichen: eine Meldung `AUSGESCHLOSSEN 00:05.0 --
+//! Rmrr` schickte den Leser in die DMAR, wo für 05.0 nichts steht. Eine Beschriftung, die neben
+//! der Sache herläuft, erzeugt Arbeit, die es nicht braucht.
+//!
 //! ## Isolation und Aliasing sind zwei Dinge
 //!
 //! * **Isolation** beantwortet: welche Geräte müssen zusammen zugeteilt werden?
@@ -418,7 +444,11 @@ pub fn unit_of(info: &DmarInfo, topo: &[DevNode], i: usize) -> Option<usize> {
     None
 }
 
-/// Ist das Gerät `i` von einer RMRR betroffen?
+/// Trägt das Gerät `i` **selbst** eine RMRR?
+///
+/// Bewusst geräteweise: die Ausweitung auf die Isolationsgruppe passiert in `build_groups`, weil
+/// sie die Gruppen braucht. Wer diese Funktion als Zuteilungsschranke benutzt, prüft die
+/// **falsche** Reichweite — die Schranke ist `Groups::excluded`.
 pub fn has_rmrr(info: &DmarInfo, topo: &[DevNode], i: usize) -> bool {
     (0..info.n_rmrr).any(|r| scope_covers(&info.rmrr[r], topo, i))
 }
@@ -432,8 +462,18 @@ pub enum Exclusion {
     /// es später trotzdem ein `attach`, hinge eine Übersetzung an einer Einheit, die es nicht
     /// sieht.
     NoUnit,
-    /// RMRR-behaftet (s. `DmarInfo::rmrr`).
+    /// **Dieses Gerät** ist RMRR-behaftet (s. `DmarInfo::rmrr`).
     Rmrr,
+    /// Ein **anderes Gerät derselben Isolationsgruppe** ist RMRR-behaftet.
+    ///
+    /// Die Wirkung ist dieselbe wie bei `Rmrr` — nicht zuteilbar —, die Tatsache ist eine andere:
+    /// über dieses Gerät steht in der DMAR nichts. Wer beides `Rmrr` nennte, schickte jeden
+    /// Leser der Ausschlussliste in eine Tabelle, in der er den Grund nicht findet.
+    ///
+    /// Warum überhaupt ausgeschlossen: ohne ACS reden die Geräte einer Gruppe an der IOMMU vorbei
+    /// miteinander, und die Zuteilung schreibt Kontexteinträge für **alle** RIDs der Gruppe —
+    /// also auch für die des RMRR-Geräts, in die Domäne des Zuteilungsempfängers.
+    GroupHasRmrr,
     /// Die Gruppe streut über mehrere Einheiten — ein Firmware-Zustand, der abgewiesen und nicht
     /// behandelt wird.
     GroupSpansUnits,
@@ -453,6 +493,14 @@ pub struct Groups {
     pub n_aliases: [usize; MAX_DEVS],
     pub n_devs: usize,
     pub n_groups: usize,
+    /// **RMRR-Scopes, die auf kein Gerät der Topologie zeigen.**
+    ///
+    /// Ein solcher Scope kann niemanden ausschließen — und das heißt nicht „kein Ausschluss
+    /// nötig", sondern „die Ausschlussliste ist nachweislich unvollständig". Genau die Sorte
+    /// Schweigen, die sonst als Erfolg durchgeht: `0 Ausschlüsse` sähe identisch aus, ob die
+    /// Firmware nichts beansprucht oder ob wir das beanspruchte Gerät nur nicht gefunden haben.
+    /// `audit()` unterscheidet die beiden Fälle (Code 5).
+    pub rmrr_unresolved: usize,
 }
 
 impl Groups {
@@ -464,6 +512,7 @@ impl Groups {
         n_aliases: [0; MAX_DEVS],
         n_devs: 0,
         n_groups: 0,
+        rmrr_unresolved: 0,
     };
 }
 
@@ -562,7 +611,7 @@ pub fn build_groups(info: &DmarInfo, topo: &[DevNode]) -> Groups {
         g.group_of[i] = map[r];
     }
 
-    // Einheiten + Ausschlüsse.
+    // Einheiten + geräteeigene Ausschlüsse.
     for i in 0..n {
         match unit_of(info, topo, i) {
             Some(u) => g.unit_of[i] = u,
@@ -570,6 +619,35 @@ pub fn build_groups(info: &DmarInfo, topo: &[DevNode]) -> Groups {
         }
         if has_rmrr(info, topo, i) {
             g.excluded[i] = Some(Exclusion::Rmrr);
+        }
+    }
+    // **Eine RMRR schließt die GRUPPE aus, nicht die Funktion** (s. Modulkopf).
+    //
+    // Dasselbe Argument wie bei `GroupSpansUnits`: die Gruppe ist die Isolationsgranularität. Wer
+    // eine Funktion einer Gruppe bekommt, in der ein RMRR-Gerät sitzt, bekommt ohne ACS dessen
+    // Weg — und die Zuteilung schreibt ohnehin Kontexteinträge für **alle** RIDs der Gruppe, also
+    // auch für die RID des RMRR-Geräts, in die Domäne des Empfängers.
+    //
+    // Der Grund bleibt unterscheidbar (`GroupHasRmrr`), und ein bereits vorhandener,
+    // **geräteeigener** Grund wird nicht überschrieben: `NoUnit` sagt mehr über dieses Gerät als
+    // „steht neben einem RMRR-Gerät".
+    for gi in 0..g.n_groups {
+        let hat_rmrr = (0..n).any(|i| g.group_of[i] == gi && g.excluded[i] == Some(Exclusion::Rmrr));
+        if hat_rmrr {
+            for i in 0..n {
+                if g.group_of[i] == gi && g.excluded[i].is_none() {
+                    g.excluded[i] = Some(Exclusion::GroupHasRmrr);
+                }
+            }
+        }
+    }
+    // Ein RMRR-Scope, den die Topologie nicht auflöst, schließt **niemanden** aus. Das ist kein
+    // „nichts zu tun", sondern eine Lücke im Wissen — sie wird gezählt statt verschluckt, damit
+    // `audit()` sie melden kann (Code 5). Fail-closed heißt hier: der Zustand ist benannt, nicht
+    // stillschweigend als „keine RMRR" gelesen.
+    for r in 0..info.n_rmrr {
+        if resolve_scope(&info.rmrr[r], &topo[..n]).is_none() {
+            g.rmrr_unresolved += 1;
         }
     }
     // Eine Gruppe, die über Einheiten streut, wird **vollständig** ausgeschlossen — teilweise
@@ -653,6 +731,17 @@ pub fn units_scoping_allocatable(g: &Groups) -> u32 {
 ///   später ein `attach`, hinge eine Übersetzung an einer Einheit, die es nicht sieht).
 /// * `3` — die Alias-Mengen zweier Gruppen überlappen. Dann sind zwei „Gruppen" in Wahrheit eine
 ///   — genau der Fehler, den die Gruppenbildung verhindern soll.
+/// * `4` — eine Gruppe enthält ein RMRR-behaftetes **und** ein zuteilbares Gerät. Dann ist die
+///   Gruppe als Isolationseinheit aufgegeben: der Zuteilungsempfänger erbt ohne ACS den Weg des
+///   RMRR-Geräts, und seine Kontexteinträge decken dessen RID mit ab. **Genau der Zustand, den
+///   dieser Code bis 2026-08-03 nicht melden konnte** — er war weder ein Ausschluss noch eine
+///   Alias-Überlappung, also für die Codes 1–3 unsichtbar, und `audit()` gab `0` zurück.
+/// * `5` — ein RMRR-Scope zeigt auf kein Gerät der Topologie (`Groups::rmrr_unresolved`). Dann
+///   ist die Ausschlussliste nachweislich unvollständig, und „0 Ausschlüsse" bedeutet nichts.
+///
+/// Die Prüfungen 4 und 5 sind **unabhängige Nachzählungen** über das fertige Ergebnis: sie rufen
+/// nichts aus der Gruppenbildung auf, sondern lesen nur, was dort herauskam. Ein Prüfer, der die
+/// Schleife des Geprüften wiederverwendet, bestätigt dessen Fehler mit.
 pub fn audit(g: &Groups) -> u32 {
     for i in 0..g.n_devs {
         if g.group_of[i] == usize::MAX {
@@ -670,6 +759,27 @@ pub fn audit(g: &Groups) -> u32 {
                 }
             }
         }
+    }
+    for gi in 0..g.n_groups {
+        let mut mit_rmrr = false;
+        let mut zuteilbar = false;
+        for i in 0..g.n_devs {
+            if g.group_of[i] != gi {
+                continue;
+            }
+            if g.excluded[i] == Some(Exclusion::Rmrr) {
+                mit_rmrr = true;
+            }
+            if g.excluded[i].is_none() {
+                zuteilbar = true;
+            }
+        }
+        if mit_rmrr && zuteilbar {
+            return 4;
+        }
+    }
+    if g.rmrr_unresolved > 0 {
+        return 5;
     }
     0
 }
@@ -751,6 +861,171 @@ mod tests {
         info.n_rmrr = 2;
         let g = build_groups(&info, &topo);
         assert_eq!(units_scoping_allocatable(&g), 0);
+    }
+
+    // --- RMRR faerbt die GRUPPE, nicht die Funktion (E-Rest 2, 2026-08-03) ----------------------
+    //
+    // Diese Faelle laufen auf QEMU q35 NIE: die Plattform hat 0 RMRRs. Auf echter Hardware ist
+    // eine RMRR der Normalfall (Legacy-USB, BMC, Grafik). Deshalb aus Literalen -- eine Messung
+    // gegen die reale Topologie waere gruen, weil ihr Antezedens falsch ist.
+
+    /// Ein RMRR-Scope auf `00:05.<func>`.
+    fn rmrr_auf(func: u8) -> Scope {
+        Scope {
+            kind: SCOPE_ENDPOINT,
+            segment: 0,
+            start_bus: 0,
+            path: [(5, func), (0, 0), (0, 0), (0, 0)],
+            path_len: 1,
+        }
+    }
+
+    /// Zwei Funktionen eines Multifunktionsgeraets (00:05.0 / 00:05.1), RMRR auf **05.1**, dazu
+    /// ein unbeteiligtes Geraet 00:06.0. `acs` steuert den einzigen Unterschied zwischen dem
+    /// gesunden und dem gefaehrlichen Fall.
+    fn rmrr_szenario(acs: bool) -> (DmarInfo, [DevNode; 3]) {
+        let mut info = DmarInfo::EMPTY;
+        info.n_units = 1;
+        info.units[0].reg_base = 0xfed9_0000;
+        info.units[0].include_all = true;
+        info.n_rmrr = 1;
+        info.rmrr[0] = rmrr_auf(1);
+        let f = |func: u8| DevNode {
+            bus: 0,
+            dev: 5,
+            func,
+            acs,
+            multifunction: true,
+            ..DevNode::EMPTY
+        };
+        let fremd = DevNode { bus: 0, dev: 6, func: 0, ..DevNode::EMPTY };
+        (info, [f(0), f(1), fremd])
+    }
+
+    /// **Positivkontrolle.** Mit ACS trennt die Hardware die Funktionen -- dann darf der
+    /// Ausschluss NICHT ueber das RMRR-Geraet hinausgehen. Ohne diesen Fall waere „alles
+    /// ausschliessen" eine bestandene Loesung, und die Maschine haette am Ende gar keine
+    /// zuteilbaren Geraete mehr.
+    #[test]
+    fn rmrr_mit_acs_faerbt_nur_das_geraet() {
+        let (info, topo) = rmrr_szenario(true);
+        let g = build_groups(&info, &topo);
+        assert_eq!(g.n_groups, 3, "mit ACS sind es drei getrennte Gruppen");
+        assert_eq!(g.excluded[1], Some(Exclusion::Rmrr), "05.1 traegt die RMRR");
+        assert_eq!(g.excluded[0], None, "05.0 ist durch ACS getrennt und bleibt zuteilbar");
+        assert_eq!(g.excluded[2], None, "06.0 war nie beteiligt");
+        assert_eq!(&g.aliases[g.group_of[0]][..g.n_aliases[g.group_of[0]]], &[0x28]);
+        assert_eq!(audit(&g), 0);
+    }
+
+    /// **Der Fehlerfall.** Ohne ACS bilden 05.0 und 05.1 EINE Gruppe -- sie koennen DMA
+    /// untereinander umleiten, ohne dass die IOMMU es sieht, und eine Zuteilung von 05.0 schriebe
+    /// Kontexteintraege fuer die Aliasmenge `[0x28, 0x29]`, also auch fuer die RID des
+    /// RMRR-Geraets. Vor dem 2026-08-03 war `excluded[0] == None`.
+    #[test]
+    fn rmrr_ohne_acs_faerbt_die_ganze_gruppe() {
+        let (info, topo) = rmrr_szenario(false);
+        let g = build_groups(&info, &topo);
+        assert_eq!(g.group_of[0], g.group_of[1], "ohne ACS eine Gruppe");
+        assert_eq!(g.excluded[1], Some(Exclusion::Rmrr));
+        assert_eq!(
+            g.excluded[0],
+            Some(Exclusion::GroupHasRmrr),
+            "05.0 steht in der Gruppe eines RMRR-Geraets und ist damit nicht zuteilbar"
+        );
+        assert_eq!(g.excluded[2], None, "der Ausschluss endet an der Gruppengrenze");
+        // Die Aliasmenge bleibt unveraendert -- Aliasing und Isolation sind zwei Achsen. Der
+        // Unterschied ist, dass diese Menge jetzt niemandem mehr zugeteilt wird.
+        let gi = g.group_of[0];
+        assert_eq!(&g.aliases[gi][..g.n_aliases[gi]], &[0x28, 0x29]);
+        assert_eq!(audit(&g), 0);
+        // Einheit 0 traegt weiterhin 06.0 -- ein Gruppenausschluss darf die Faehigkeits-
+        // mittelung nicht leerraeumen.
+        assert_eq!(units_scoping_allocatable(&g), 0b1);
+    }
+
+    /// Dasselbe eine Ebene hoeher: hinter einer **konventionellen** Bridge tragen alle Geraete
+    /// die RID der Bridge. Eine RMRR auf einem von ihnen faerbt die Bridge und das
+    /// Nachbargeraet mit -- sie sind fuer die Einheit ununterscheidbar.
+    #[test]
+    fn rmrr_hinter_konventioneller_bruecke_faerbt_alles_darunter() {
+        let mut info = DmarInfo::EMPTY;
+        info.n_units = 1;
+        info.units[0].include_all = true;
+        info.n_rmrr = 1;
+        info.rmrr[0] = Scope {
+            kind: SCOPE_ENDPOINT,
+            segment: 0,
+            start_bus: 3,
+            path: [(1, 0), (0, 0), (0, 0), (0, 0)],
+            path_len: 1,
+        };
+        // `acs: false` ist hier keine Zutat, sondern die Wirklichkeit: ACS ist eine
+        // **PCI-Express**-Extended-Capability, eine konventionelle Bridge kann sie nicht tragen.
+        // `pcie::acs_enabled` liefert fuer sie folglich `false`. (`DevNode::EMPTY` steht auf
+        // `acs: true` -- der optimistische Default fuer handgebaute PCIe-Endpunkte.)
+        let topo = [
+            DevNode { bus: 0, dev: 3, func: 0, bridge: true, sec_bus: 3, sub_bus: 3, pcie: false, acs: false, ..DevNode::EMPTY },
+            DevNode { bus: 3, dev: 1, func: 0, parent: 0, ..DevNode::EMPTY }, // RMRR
+            DevNode { bus: 3, dev: 2, func: 0, parent: 0, ..DevNode::EMPTY },
+        ];
+        let g = build_groups(&info, &topo);
+        assert_eq!(g.excluded[1], Some(Exclusion::Rmrr));
+        assert_eq!(g.excluded[2], Some(Exclusion::GroupHasRmrr), "gleiche Alias-RID");
+        assert_eq!(g.excluded[0], Some(Exclusion::GroupHasRmrr), "die Bruecke setzt selbst DMA ab");
+        assert_eq!(audit(&g), 0);
+        assert_eq!(units_scoping_allocatable(&g), 0, "hier ist wirklich nichts zuteilbar");
+    }
+
+    /// Ein **geraeteeigener** Grund wird nicht von dem abgeleiteten ueberschrieben: `NoUnit` sagt
+    /// mehr ueber dieses Geraet als „steht neben einem RMRR-Geraet".
+    #[test]
+    fn geraeteeigener_grund_schlaegt_den_abgeleiteten() {
+        let (mut info, topo) = rmrr_szenario(false);
+        info.units[0].include_all = false; // niemand ist mehr zustaendig
+        let g = build_groups(&info, &topo);
+        assert_eq!(g.excluded[0], Some(Exclusion::NoUnit));
+        assert_eq!(g.excluded[1], Some(Exclusion::Rmrr), "die eigene RMRR bleibt der Grund");
+    }
+
+    /// **Kann `audit()` diesen Zustand ueberhaupt melden?** Der alte Zustand wird nachgebaut,
+    /// indem genau die neue Faerbung wieder entfernt wird -- mehr aendert sich nicht. Vorher
+    /// meldete `audit()` dazu `0`; ohne Code 4 waere der Fehler auch nach dem Einbau eines
+    /// Pruefers unsichtbar geblieben.
+    #[test]
+    fn audit_meldet_die_ungefaerbte_gruppe() {
+        let (info, topo) = rmrr_szenario(false);
+        let g = build_groups(&info, &topo);
+        assert_eq!(audit(&g), 0, "der behobene Zustand ist konsistent");
+
+        let mut alt = build_groups(&info, &topo);
+        alt.excluded[0] = None; // <- der Stand vor dem 2026-08-03
+        assert_eq!(
+            audit(&alt),
+            4,
+            "eine Gruppe mit RMRR-Geraet UND zuteilbarem Geraet ist keine Isolationseinheit"
+        );
+    }
+
+    /// Ein RMRR-Scope, der auf kein Geraet der Topologie zeigt, schliesst niemanden aus. „0
+    /// Ausschluesse" darf dann nicht wie „keine RMRR" aussehen -- Code 5.
+    #[test]
+    fn unaufloesbare_rmrr_wird_gemeldet_statt_verschluckt() {
+        let (mut info, topo) = rmrr_szenario(true);
+        info.rmrr[0] = rmrr_auf(7); // 00:05.7 gibt es in dieser Topologie nicht
+        let g = build_groups(&info, &topo);
+        assert_eq!(g.rmrr_unresolved, 1);
+        assert!(
+            (0..g.n_devs).all(|i| g.excluded[i].is_none()),
+            "der Scope kann niemanden treffen -- genau deshalb braucht es die Meldung"
+        );
+        assert_eq!(audit(&g), 5);
+
+        // Gegenprobe: derselbe Aufbau mit aufloesbarem Scope schweigt nicht aus Zufall.
+        let (info2, topo2) = rmrr_szenario(true);
+        let g2 = build_groups(&info2, &topo2);
+        assert_eq!(g2.rmrr_unresolved, 0);
+        assert_eq!(audit(&g2), 0);
     }
 
     /// Ein Geraet ohne zustaendige Einheit ist ausgeschlossen (`NoUnit`) und darf kein Bit

@@ -77,7 +77,7 @@ mit_deps() { # $1 = Name, $2 = Crate-Verzeichnis, $3.. = Abhaengigkeiten (Verzei
     rm -rf "$SA"
 }
 
-ZIELE="${*:-mem part fat cycles loader cap virtio typestate ipctreue}"
+ZIELE="${*:-mem part fat cycles loader cap virtio dmar dmarneg typestate ipctreue}"
 for z in $ZIELE; do
     case "$z" in
         mem)  einzeln mem  "$ROOT/crates/sel4lake-mem/src/lib.rs" ;;
@@ -101,6 +101,24 @@ for z in $ZIELE; do
         # Zugriff und ohne Geraet. Alles andere in der Crate fasst MMIO an und gehoert in die
         # QEMU-Suiten.
         virtio) einzeln virtio "$ROOT/crates/sel4lake-virtio/src/lib.rs" ;;
+        # `sel4lake-hal` als Ganzes ist arch-Asm und baut auf dem Host nie. `dmar.rs` ist die
+        # Ausnahme: **reine Funktion ueber eingespeiste Daten** (`forbid(unsafe_code)`, keine
+        # `use`-Zeile ausser `super::*` im Testmodul), also als DATEI pruefbar -- derselbe Weg wie
+        # `cycles`. Bis zum 2026-08-03 lief das Testmodul deshalb NIRGENDS: vier Tests, kein
+        # Aufrufer. Neu dazu die RMRR-Gruppenfaelle (E-Rest 2), die q35 mit seinen 0 RMRRs
+        # strukturell nicht zeigen kann -- die QEMU-Suiten sind hier blind, nicht nachlaessig.
+        dmar) einzeln dmar "$ROOT/crates/sel4lake-hal/src/x86_64/dmar.rs" ;;
+        # ... und die Gegenprobe dazu: die Tests oben sehen nur den BEHOBENEN Zustand. Vier
+        # Mutationen bauen den Fehler einzeln wieder ein, jede mit dem NAMEN des Tests, der fallen
+        # muss (sonst waere „irgendetwas ist rot" schon ein Beleg).
+        dmarneg)
+            if [ ! -f "$ROOT/tools/dmar-rmrr-negativ.sh" ]; then
+                echo "== Host-Tests: dmarneg =="
+                echo "  FEHLT: tools/dmar-rmrr-negativ.sh ist nicht vorhanden -- Ziel nicht gelaufen"
+                fail=1
+            else
+                bash "$ROOT/tools/dmar-rmrr-negativ.sh" || fail=1
+            fi ;;
         # **Der Uebersetzer als Pruefer.** Der Descriptor-Typestate behauptet etwas ueber Code, der
         # NICHT uebersetzt -- und ein solcher Code steht per Definition in keinem Testbinary. Der
         # Nachweis muss deshalb `rustc` selbst befragen, mit Positivkontrolle und mit ERWARTETEN
@@ -126,7 +144,7 @@ for z in $ZIELE; do
             else
                 bash "$ROOT/tools/verus-modelltreue-ipc.sh" || fail=1
             fi ;;
-        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio typestate ipctreue)"; fail=1 ;;
+        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio dmar dmarneg typestate ipctreue)"; fail=1 ;;
     esac
 done
 

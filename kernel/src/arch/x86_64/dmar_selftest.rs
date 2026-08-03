@@ -11,6 +11,9 @@
 //!   absichtlich **zuerst** — mit „erster Treffer gewinnt" landete das Gerät in der falschen
 //!   Einheit, und mit nur einer Einheit fiele das nie auf).
 //! * Scope-Typ 2 ist eine **Subhierarchie**, kein Gerät.
+//! * Eine **RMRR** schließt die ganze ACS-Gruppe aus, nicht die einzelne Funktion (E-Rest 2). Auf
+//!   q35 gibt es 0 RMRRs — dieser Fall existiert ausschließlich hier und in
+//!   `tools/host-tests.sh dmar`.
 //! * Firmware-Eingabe: Prüfsumme, Länge 0, unbekannte Typen.
 
 use sel4lake_hal::dmar::{self, DevNode, DmarInfo, Exclusion, Scope};
@@ -84,7 +87,7 @@ fn build_table(buf: &mut [u8], with_unknown: bool, zero_len_elem: bool) -> usize
 }
 
 /// Die synthetische Topologie.
-fn build_topo(t: &mut [DevNode; 11]) {
+fn build_topo(t: &mut [DevNode; 12]) {
     let ep = |bus: u8, dev: u8, func: u8, parent: usize, acs: bool| DevNode {
         bus,
         dev,
@@ -120,7 +123,19 @@ fn build_topo(t: &mut [DevNode; 11]) {
         multifunction: true,
         ..ep(0, 4, 1, usize::MAX, false)
     }; // 00:04.1 /
-    t[10] = ep(0, 5, 0, usize::MAX, true); // 00:05.0 RMRR-behaftet
+    // 00:05.0/05.1: Multifunktion OHNE ACS, die RMRR steht auf 05.0. Die zweite Funktion traegt
+    // selbst keine RMRR — sie ist trotzdem nicht zuteilbar, weil sie in derselben Gruppe steht
+    // (E-Rest 2). Ohne ACS koennen beide DMA untereinander umleiten, und eine Zuteilung von 05.1
+    // schriebe Kontexteintraege fuer die ganze Aliasmenge [0x28, 0x29] — also auch fuer die RID
+    // des RMRR-Geraets, in die Domaene des Empfaengers.
+    t[10] = DevNode {
+        multifunction: true,
+        ..ep(0, 5, 0, usize::MAX, false)
+    }; // 00:05.0 RMRR-behaftet
+    t[11] = DevNode {
+        multifunction: true,
+        ..ep(0, 5, 1, usize::MAX, false)
+    }; // 00:05.1 nur Nachbar — und genau darum geht es
 }
 
 /// Ergebnis des Selbsttests (für den Bericht).
@@ -159,7 +174,7 @@ pub fn run() -> SelfTest {
         && info.units[0].include_all
         && !info.units[1].include_all;
 
-    let mut topo = [DevNode::EMPTY; 11];
+    let mut topo = [DevNode::EMPTY; 12];
     build_topo(&mut topo);
     let g = dmar::build_groups(&info, &topo);
 
@@ -174,6 +189,7 @@ pub fn run() -> SelfTest {
         && same(2, 3) //                   ... inklusive der Bridge selbst
         && same(5, 6) && same(6, 7) //     konventionelle Bridge + Geraete darunter
         && same(8, 9) //                   Multifunktion ohne ACS
+        && same(10, 11) //                 dito -- das RMRR-Geraet und sein Nachbar
         && !same(1, 3) //                  Root Port MIT ACS trennt
         && !same(10, 8); //                unabhaengige Geraete bleiben getrennt
 
@@ -185,7 +201,14 @@ pub fn run() -> SelfTest {
         && g.n_aliases[gi] >= 3
         && g.n_aliases[g.group_of[1]] == 1;
 
-    let rmrr_excluded = g.excluded[10] == Some(Exclusion::Rmrr) && g.excluded[1].is_none();
+    // **RMRR faerbt die GRUPPE, nicht die Funktion** (E-Rest 2). Drei Aussagen, und die mittlere
+    // ist die, die bis zum 2026-08-03 falsch war: 05.1 traegt selbst keine RMRR und war deshalb
+    // `None` — zuteilbar, obwohl ohne ACS in derselben Gruppe wie 05.0. Der Grund bleibt
+    // unterscheidbar (`GroupHasRmrr`), sonst schickte die Ausschlussliste jeden Leser in die
+    // DMAR, wo ueber 05.1 nichts steht.
+    let rmrr_excluded = g.excluded[10] == Some(Exclusion::Rmrr)
+        && g.excluded[11] == Some(Exclusion::GroupHasRmrr)
+        && g.excluded[1].is_none();
 
     // Firmware-Eingabe: kaputte Pruefsumme, Laenge 0, zu kurze Tabelle.
     let mut bad = buf;

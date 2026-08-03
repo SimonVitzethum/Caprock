@@ -1208,6 +1208,27 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       `ERR_BADCAP` getrennt — „kommt gleich wieder" ist etwas anderes als „gibt es nicht", und
       „gerade kein Platz" ist ein drittes.
 
+- [ ] **E-Rest 3c: `hiiso` hat noch nie ein Urteil gefällt.** (2026-08-04, gemessen direkt nach
+      der E-Rest-3-Behebung.) Die Zeile meldet in **allen vier** RAM-Größen `SKIP` — auch bei 3G
+      und 6G, wo die geteilte hohe Gerätetabelle existiert (`=1`). In der **Lade-Suite** kommt
+      sie gar nicht vor.
+
+      | Hälfte der Prüfung | Stand |
+      |---|---|
+      | unzulässige Einträge in den geteilten Tabellen | wird ausgewertet (`=0`), und eine `US`-Mutation lässt sie fehlschlagen — **sprechfähig** |
+      | **private Kopie für eine isolierte PD** | `private Kopien = 0` überall — **läuft nirgends** |
+
+      Damit ist die Eigenschaft, vor der CLAUDE.md ausdrücklich warnt („ein Gerätefenster dort
+      einzutragen gäbe es JEDER isolierten PD, lautlos, denn die Cap-Prüfung liefe korrekt
+      durch"), für den Bereich **oberhalb 4 GiB** behauptet und nicht vorgeführt. Der
+      Aggregatwert ist ehrlicherweise `SKIP` und zählt nicht als bestanden — die Lücke steht
+      trotzdem.
+
+      **Zu tun:** einen Fall bauen, in dem eine **isolierte PD** ein Gerätefenster oberhalb
+      4 GiB bekommt, und zeigen, dass (a) sie es hat, (b) eine zweite isolierte PD es **nicht**
+      hat. Ohne (b) ist es kein Isolationsnachweis. Der natürliche Ort ist die Lade-Suite bei
+      6G — dort gibt es Treiber-PDs, und die BARs liegen bei `0x70_0000_0000`.
+
 - [ ] **E-Rest 1b: im SCHWACHEN Zweig teilen sich alle vier Kontexte EIN Fenster.** (2026-08-04,
       beim Beheben von E-Rest 1 bemerkt, **nicht** behoben.) `slot_window` gibt dort jedem Slot
       `[0, 512 GiB)`. Damit gilt die Zusicherung „zwei Kontexte vergeben nie dieselbe IOVA" nicht

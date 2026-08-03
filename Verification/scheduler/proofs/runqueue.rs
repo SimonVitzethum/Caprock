@@ -12,6 +12,62 @@
 // Budget-Donation (intra-core IPC) bleiben ausserhalb (s. ADR 0019).
 //
 // Lauf:  tools/verus-verify.sh
+//
+// ------------------------------------------------------------------------------------------------
+// **WIE WEIT DIESES MODELL TRAEGT** — festgehalten von `tools/verus-modelltreue-sched.sh`.
+// ------------------------------------------------------------------------------------------------
+//
+// Dieses Modell hat 7 Thread-Felder und 7 Uebergaenge. `crates/sel4lake-sched/src/lib.rs::Tcb` hat
+// 20 Felder, und 20 Funktionen schreiben Scheduler-Zustand. Ein 1:1-Strukturvergleich wie bei
+// `unlink` (s. `Verification/capability-system/proofs/cap_space.rs`) waere hier unehrlich — er
+// muesste so weit aufgeweicht werden, dass er nicht mehr anschlagen KANN. Der Waechter prueft
+// deshalb: Feld- und Uebergangs-ABDECKUNG (echte Kreuzpruefung: kein TCB-Feld und keine
+// zustandsschreibende Funktion darf unbenannt bleiben) und haelt je Paar die begruendete
+// **Uebertragungsluecke** fest. Was er nicht prueft, steht in seinem Kopf.
+//
+// Fuenf Befunde aus seinem ersten Lauf (2026-08-03). `lib.rs` blieb unangetastet.
+//
+// **BEFUND B1 — `unblock` weicht wirklich ab.** Der Code reiht BEDINGUNGSLOS wieder ein:
+//
+//     if self.tcbs[s].blocked { self.tcbs[s].blocked = false; self.enqueue_ready(s); }
+//
+// `unblock` unten setzt `in_ready: !t.depleted`. Ein Thread, der blockiert UND MCS-erschoepft ist,
+// landet im Code also in der Ready-Liste — `ridx` waere verletzt, `unblock_preserves` gilt fuer
+// diesen Zustandsuebergang nicht. Erreichbar: Konto erschoepft (`on_tick`), dann `pause`, dann
+// `unblock`. Das Modell nimmt hier NICHT den Code auf, sondern die Invariante — der Beweis sagt,
+// was der Code tun muesste, nicht was er tut.
+//
+// Zwei Folgen, aus dem Quelltext GELESEN, nicht gemessen (wer sie belegen will, braucht einen
+// hwfuzz-Fall `budget setzen -> erschoepfen -> PAUSE -> RESUME`):
+//   * der Thread ist wieder einplanbar, obwohl `remaining == 0` — bis zum Refill laeuft er auf
+//     einem erschoepften Budget. Das ist genau die Laufzeit, die `mcs_bound` ausschliessen soll.
+//   * `on_tick` hat im Zweig `remaining == 0` keinen Waechter „war schon erschoepft": laeuft der
+//     Thread erneut, wird `depleted_count` ein zweites Mal erhoeht (der Refill senkt es nur
+//     einmal -> der Zaehler driftet nach oben, und der Refill-Scan laeuft danach in JEDEM Tick)
+//     und `next_refill` wird auf `now + period` zurueckgeschoben — der Refill verschiebt sich,
+//     solange der Thread laeuft.
+//
+// **BEFUND B2 — die Richtung „in der Queue ⟹ nicht erschoepft" hat keinen Audit-Code.**
+// `Scheduler::audit` prueft im Queue-Lauf `used` (1), `blocked` (2) und `current` (4), aber nie
+// `depleted`. B1 kann zur Laufzeit deshalb nicht auffallen: derselbe Fall, der die Aussage
+// widerlegen wuerde, wird nie beobachtet. (Vgl. die leere Event-Queue ohne `CD.R`, CLAUDE.md.)
+//
+// **BEFUND B3 — `budget_inv` hat ueberhaupt keine Laufzeitentsprechung.** `audit` liest weder
+// `budget` noch `remaining`. `mcs_bound`/`roundrobin_no_starve` sind statisch bewiesen und zur
+// Laufzeit ungeprueft; der hwfuzz kann sie also nicht als Oracle benutzen.
+//
+// **BEFUND B4 — `pause` deplaniert den laufenden Thread nicht.** Der Code setzt nur
+// `blocked = true` (`remove_from_ready` ist ein No-Op fuer `current`); `pause` unten setzt
+// zusaetzlich `current: None`. Der Doc-Kommentar dort nennt das eine Abstraktion („der naechste
+// Tick deplaniert ihn") — sie hat ein beobachtbares Fenster: bis zum naechsten Tick ist
+// `current_valid` im Code falsch, und es gibt keinen Audit-Code dafuer.
+//
+// **BEFUND B5 — fuenf Uebergangsklassen des Codes haben hier gar keine Entsprechung.**
+// `switch_to` (IPC-Fastpath: blockiert den Aufrufer UND macht den Server laufend, dazu
+// Budget-Donation), `exit_current`/`kill`/`record_zombie` (Zombie/Reap), `spawn*`/`init_core`/
+// `alloc_tcb` (Erzeugung) und `detach_for_migration`/`attach_migrated` (Migration). Das ist in
+// README §10/§11 als offen benannt; der Waechter zaehlt es jetzt mit, damit eine NEUE solche
+// Funktion nicht stillschweigend dazukommt.
 use vstd::prelude::*;
 
 verus! {
@@ -100,6 +156,10 @@ pub open spec fn pick(s: Sched, n: int) -> Sched {
 
 /// **unblock:** einen blockierten Thread `i` wieder bereit machen (idempotent im Code; hier auf den
 /// blockierten Fall spezifiziert). Wird genau dann wieder eingereiht, wenn nicht erschoepft.
+///
+/// **ACHTUNG (BEFUND B1, s. Dateikopf):** `Scheduler::unblock` prueft `depleted` NICHT und reiht
+/// bedingungslos ein. Dieses `!t.depleted` ist die Forderung der Invariante, nicht der Zustand des
+/// Codes. `tools/verus-modelltreue-sched.sh` haelt die Abweichung fest.
 pub open spec fn unblock(s: Sched, i: int) -> Sched {
     let t = s.threads[i];
     Sched {
@@ -110,6 +170,10 @@ pub open spec fn unblock(s: Sched, i: int) -> Sched {
 
 /// **pause:** einen Thread `i` externen blockieren (SYS_PDCTL PAUSE); ist er der laufende, wird er
 /// zugleich deplaniert (Abstraktion von „der naechste Tick deplaniert ihn").
+///
+/// **ACHTUNG (BEFUND B4, s. Dateikopf):** diese Deplanierung ist im Code NICHT sofort. Bis zum
+/// naechsten Tick bleibt ein pausierter `current` laufend und blockiert zugleich — in diesem
+/// Fenster ist `current_valid` am echten Scheduler falsch, und `audit` hat keinen Code dafuer.
 pub open spec fn pause(s: Sched, i: int) -> Sched {
     let t = s.threads[i];
     Sched {

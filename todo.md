@@ -1045,6 +1045,41 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
 - [ ] **D4** Verus laut `docs/verification.md` offen: `delete_leaf` auf der vereinten Struktur,
       Kinderlisten-Erreichbarkeit, danach Scheduler/IPC.
 
+- [ ] **D7 Das IPC-Modell trägt für den echten Endpoint nur einen Ausschnitt — gemessen, nicht
+      geschätzt** (2026-08-03, `tools/verus-modelltreue-ipc.sh`, 32 Fälle · 12 Selbsttestfälle).
+
+      Der Wächter fährt den **echten** `sel4lake-ipc`-Quelltext gegen ein aus der Beweisdatei
+      **übersetztes** Modell (nicht abgeschrieben) und misst die Entsprechung unter einer
+      hingeschriebenen Abbildung. Ergebnis: `call`/`recv` entsprechen `send`/`recv` in beiden
+      Zweigen, über beide Kern-Pfade, FIFO-treu, über Ketten hinweg. Und drei Löcher, jedes
+      einzeln nachgemessen:
+
+      **(a) `ep_inv` gilt am echten Endpoint NICHT.** Über die *öffentliche* Schnittstelle sind
+      Zustände mit wartenden Sendern UND geparkten Empfängern erreichbar: `bind_receiver` sieht
+      die Sender-Queue nicht an, und `migrate_owner` reiht den Aufrufer wieder als Sender ein,
+      während ein Empfänger geparkt sein darf. Beides ist gewollt (A-4.1/A-4.3) — aber es heißt,
+      die Rendezvous-Invariante hält der **Typ** nicht, sondern die Aufrufdisziplin des Kernels,
+      und über die sagt der Beweis nichts. Dass `threads::mod` heute erst migriert und dann v2
+      erzeugt, ist eine Reihenfolge, keine Zusicherung.
+
+      **(b) `send_no_loss` gilt am echten Endpoint NICHT.** `Seq::push` ist unbeschränkt,
+      `TidQueue::enqueue` verwirft ab `QUEUE_CAP` **still**. Gemessen am 33. Sender an *einem*
+      Endpoint: `msgs_total` bleibt auf 32. Im Quelltext benannt, nirgends gemessen — bis jetzt.
+      (Das ist zugleich die alte Baustelle „der 33. Sender wird still verworfen".)
+
+      **(c)** `!used` (`ERR_BADCAP`), `quiescing` (`ERR_QUIESCING`) und der Leichen-Zweig
+      (`frame_of == None`) haben im Modell **kein** Gegenstück.
+
+      Offen ist nicht der Wächter, sondern das Modell. Damit es weiter trägt, bräuchte es
+      mindestens: `used`/`quiescing` als Bits mit Abweisung; eine **Schranke** auf beiden
+      Warteschlangen (dann wäre `send_no_loss` nur unter `len < QUEUE_CAP` beweisbar — was der
+      Wahrheit entspricht); `caller`/`reply_owner` samt `reply` als dritter Operation; und
+      `bind_receiver`/`migrate_owner` als Operationen, unter denen `ep_inv` dann nachweislich
+      *nicht* erhalten bleibt — die Invariante müsste zu „kein Rendezvous ist fällig, außer
+      während eines laufenden Austauschs" abgeschwächt werden. Kernel-Quelltext ist deshalb
+      **nicht** geändert worden; die Befunde stehen im Kopf von
+      `Verification/ipc/proofs/endpoint.rs`.
+
 ---
 
 ## F. Debug-/Testcode aus dem Release-Build nehmen

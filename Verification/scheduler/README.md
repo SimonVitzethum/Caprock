@@ -89,20 +89,37 @@ wird so neu berechnet, dass die Kopplung lokal gilt. Die Erhaltung für alle and
 
 - **Sequentiell / Einkern:** **Nebenlaeufigkeit** (acht Instanzen, Reschedule-IPIs, Kontextwechsel,
   fehlende Migration) liegt **ausserhalb** — dafür wäre ein Concurrency-Modellprüfer (Loom/TLA+) nötig.
-- **Mitgliedschafts-Abstraktion:** die konkrete Ringpuffer-`RunQueue` (head/tail/count) wird nicht
-  bitgenau nachgebaut; ihre Konsistenz sichern `Scheduler::audit` + der hwfuzz auf dem **echten** Code.
+- **Mitgliedschafts-Abstraktion:** die konkrete intrusive Ready-Liste (head/tail/count/bitmap) wird
+  nicht bitgenau nachgebaut; ihre Konsistenz sichern `Scheduler::audit` + der hwfuzz auf dem
+  **echten** Code.
+- **Grössenordnung:** 7 Modellfelder gegen 20 `Tcb`-Felder, 7 Übergänge gegen 20
+  zustandsschreibende Funktionen. `tools/verus-modelltreue-sched.sh` zählt beides mit, damit die
+  Lücke nicht stillschweigend wächst.
 
 ## 12. Trusted Computing Base
 
 1. Lock-Serialisierung je Kern (`SCHEDS[core]`) + Kontextwechsel (HAL) — Concurrency-/HAL-TCB.
-2. Modell↔Code-Treue (Mitgliedschaft statt Ringpuffer) — durch `Scheduler::audit` + hwfuzz abgesichert.
+2. Modell↔Code-Treue (Mitgliedschaft statt Liste). **Seit 2026-08-03 nicht mehr nur behauptet:**
+   `tools/verus-modelltreue-sched.sh` prüft Feld- und Übergangs-Abdeckung als echte Kreuzprüfung
+   und hält je Übergang die begründete Übertragungslücke fest (mit Selbsttest, 20 Fälle inkl.
+   Negativkontrolle). Er beweist nichts — er sorgt dafür, dass eine Änderung an einer Seite nicht
+   stillschweigend an der anderen vorbeigeht. Was er nicht prüft, steht in seinem Kopf.
+3. **Fünf gemessene Befunde** stehen im Kopf von [`proofs/runqueue.rs`](proofs/runqueue.rs) (B1–B5).
+   Der wichtigste: `Scheduler::unblock` reiht **ohne** `depleted`-Prüfung wieder ein, das Modell
+   fordert `in_ready: !t.depleted` — für diesen Übergang gilt `unblock_preserves` am echten Code
+   **nicht**. `lib.rs` blieb unangetastet.
 
 ## 13. Verbindung zu Runtime-Audits / Kani
 
-- **Laufzeit:** `Scheduler::audit` (Codes 1–7, in `ipc_audit` als Code 10+ aggregiert), hwfuzz
+- **Laufzeit:** `Scheduler::audit` (Codes 1–8, in `ipc_audit` als Code 10+ aggregiert), hwfuzz
   (randomisierte spawn/block/unblock/kill/tick/Budget-Sequenzen + Audit je Epoche).
 - **Verus (hier):** beweist, dass die Kopplung + MCS-Buchhaltung **für alle Zustände** stimmt. Die
-  Ebenen ergänzen sich (Verus die Logik, hwfuzz die Ringpuffer-/Nebenlaeufigkeitsrealitaet empirisch).
+  Ebenen ergänzen sich (Verus die Logik, hwfuzz die Listen-/Nebenlaeufigkeitsrealitaet empirisch).
+- **Wie weit sie sich decken — gemessen, nicht angenommen:** von den neun Teilaussagen der
+  Invariante trägt `audit` **vier** (Codes 1/2/4/7). Ohne Laufzeitentsprechung sind:
+  „in der Queue ⟹ nicht erschöpft" (B2), die drei Konjunkte von `budget_inv` (B3 — `audit` liest
+  weder `budget` noch `remaining`) und `current_valid` (B4). Der hwfuzz kann diese fünf also nicht
+  als Oracle benutzen; sie sind statisch bewiesen und dynamisch unbeobachtet.
 
 ## 14. Verifikationsfortschritt / Nächste Ausbaustufen
 

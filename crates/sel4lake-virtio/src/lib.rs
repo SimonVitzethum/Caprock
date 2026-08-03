@@ -41,8 +41,18 @@
 
 #![no_std]
 
+// Die Crate ist `no_std` (sie laeuft in einer Treiber-PD ohne Betriebssystem). Die
+// Typestate-Buchhaltung in `owned` ist aber reine Arithmetik ueber Adressen — ohne Zugriff, ohne
+// Geraet — und damit auf dem Host pruefbar; der Testharness braucht dafuer `std`. Nur unter
+// `cfg(test)`, der PD-Build sieht davon nichts. (`tools/host-tests.sh virtio`.)
+#[cfg(test)]
+extern crate std;
+
 pub mod blk;
 pub mod net;
+pub mod owned;
+
+pub use owned::{Completion, Device, Driver, Owned, Region};
 
 // device_status-Bits.
 const STATUS_ACK: u8 = 1;
@@ -255,14 +265,66 @@ impl Queue {
 
     /// Einen Deskriptor setzen. `addr` ist die **Geraetesicht** des Puffers.
     ///
+    /// **Privat, und das ist der Punkt** (todo E, Descriptor-Typestate): der einzige Weg zu einem
+    /// Deskriptor fuehrt ueber [`Self::arm`], und `arm` **verbraucht** den Puffer. Waere diese
+    /// Funktion oeffentlich, koennte jeder Treiber eine Adresse eintragen und den Puffer daneben
+    /// weiter beschreiben — genau der Fehler, den der Typestate fangen soll.
+    ///
     /// # Safety
     /// `self.cpu` muss auf beschreibbaren, dem Aufrufer allein gehoerenden Speicher zeigen.
-    pub unsafe fn set_desc(&self, i: u16, addr: u64, len: u32, flags: u16, next: u16) {
+    unsafe fn set_desc(&self, i: u16, addr: u64, len: u32, flags: u16, next: u16) {
         let d = self.desc() + (i as u64) * 16;
         wr64(d, addr);
         wr32(d + 8, len);
         wr16(d + 12, flags);
         wr16(d + 14, next);
+    }
+
+    /// **Einen Puffer armieren**: er geht in Deskriptor `i` und damit an das Geraet.
+    ///
+    /// Der Puffer wird `by value` genommen. Nach diesem Aufruf gibt es seinen Namen nicht mehr,
+    /// und das Zurueckgegebene (`Owned<Device>`) hat keinen Zugriffsweg. Die Laenge kommt aus dem
+    /// Puffer, nicht aus einem Parameter — eine Deskriptorlaenge, die groesser ist als der Puffer,
+    /// ist damit nicht mehr formulierbar.
+    ///
+    /// Siehe [`crate::owned`] fuer die Einordnung: das ist **Ergonomie, nicht TCB**.
+    ///
+    /// # Safety
+    /// `self.cpu` muss auf beschreibbaren, dem Aufrufer allein gehoerenden Speicher zeigen, und
+    /// `i` muss innerhalb der Queue liegen.
+    pub unsafe fn arm(
+        &self,
+        i: u16,
+        buf: Owned<Driver>,
+        flags: u16,
+        next: u16,
+    ) -> Owned<Device> {
+        self.set_desc(i, buf.dev_addr(), buf.len(), flags, next);
+        buf.transition()
+    }
+
+    /// **Den Puffer zurueckholen** — gegen den Abschlussbeleg des Geraets.
+    ///
+    /// Der Beleg ist kein Zierrat: er stammt aus dem used-Ring, also von dem Ereignis, das
+    /// „das Geraet ist fertig" ueberhaupt bedeutet. Ohne ihn geht es nur ueber
+    /// [`Self::reclaim_unproven`], und der Name steht dann an der Aufrufstelle.
+    pub fn reclaim(&self, buf: Owned<Device>, _done: &Completion) -> Owned<Driver> {
+        buf.transition()
+    }
+
+    /// Den Puffer **ohne** Abschlussbeleg zurueckholen.
+    ///
+    /// Es gibt genau einen Grund, das zu tun, und `blk` hat ihn: nach einem Poll-Timeout wird das
+    /// Statusbyte trotzdem gelesen. Steht dort noch `0xff`, ist belegt, dass das Geraet nichts
+    /// geschrieben hat — und nicht bloss, dass wir zu frueh aufgehoert haben zu warten. Diese
+    /// Unterscheidung wollen wir behalten.
+    ///
+    /// # Safety
+    /// Der Aufrufer sagt zu, dass ein gleichzeitiger Geraetezugriff auf den Puffer entweder
+    /// ausgeschlossen ist oder **die Aussage ist, die er messen will**. Wer das nicht begruenden
+    /// kann, braucht [`Self::reclaim`].
+    pub unsafe fn reclaim_unproven(&self, buf: Owned<Device>) -> Owned<Driver> {
+        buf.transition()
     }
 
     /// Den Kettenkopf `head` in den avail-Ring haengen und sichtbar machen.
@@ -285,20 +347,20 @@ impl Queue {
         rd16(self.used() + 2)
     }
 
-    /// `(id, len)` des used-Eintrags an Ringposition `slot % size`.
+    /// Der used-Eintrag an Ringposition `slot % size` als [`Completion`].
     ///
     /// # Safety
-    /// wie [`Self::set_desc`].
-    pub unsafe fn used_entry(&self, slot: u16) -> (u32, u32) {
+    /// wie [`Self::arm`].
+    pub unsafe fn used_entry(&self, slot: u16) -> Completion {
         let e = self.used() + 4 + (slot % self.size) as u64 * 8;
-        (rd32(e), rd32(e + 4))
+        Completion::new(rd32(e), rd32(e + 4))
     }
 
     /// Warten, bis der used-Ring ueber `from` hinausgeht. `None` = das Geraet hat nicht geantwortet.
     ///
     /// # Safety
-    /// wie [`Self::set_desc`].
-    pub unsafe fn poll_used(&self, from: u16, max_poll: u64) -> Option<(u32, u32)> {
+    /// wie [`Self::arm`].
+    pub unsafe fn poll_used(&self, from: u16, max_poll: u64) -> Option<Completion> {
         for _ in 0..max_poll {
             if self.used_idx() != from {
                 return Some(self.used_entry(from));
@@ -587,9 +649,24 @@ impl VirtioRng {
         // 7. DRIVER_OK.
         self.t.driver_ok();
 
-        // 8. used-Ring-Ausgangsstand merken, Deskriptor + avail-Ring bauen.
+        // 8. used-Ring-Ausgangsstand merken, Puffer ARMIEREN, avail-Ring bauen.
+        //
+        // Der Puffer wird hier aus der Region geschnitten und an `arm` uebergeben — danach gibt es
+        // ihn unter diesem Namen nicht mehr (todo E, s. `crate::owned`). Der RNG ist der Fall, in
+        // dem das am wenigsten kostet und am deutlichsten zu sehen ist: zwischen `arm` und
+        // `poll_used` liegt kein einziger Zugriff, und das ist jetzt nicht mehr eine Zusage des
+        // Autors, sondern der Zustand des Namens.
         let used_idx0 = q.used_idx();
-        q.set_desc(0, desc_addr, DATA_LEN, VIRTQ_DESC_F_WRITE, 0);
+        let mut region = Region::from_raw(cpu_base, dev_base, OFF_DATA + DATA_LEN as u64);
+        let mut buf = match region.carve(OFF_DATA, DATA_LEN) {
+            Some(b) => b,
+            None => return (false, 0),
+        };
+        // `desc_addr` ist die Geraetesicht, die der Aufrufer NENNEN will — beim
+        // Sensitivitaetstest bewusst eine Adresse ausserhalb des Fensters. Nur diese eine Achse
+        // wandert; die Treibersicht bleibt die eigene Region.
+        buf.retarget_device_view(desc_addr);
+        let armed = q.arm(0, buf, VIRTQ_DESC_F_WRITE, 0);
         q.publish(0, self.t.fence);
         // 9. Notify: queue_notify_off * multiplier.
         self.t.kick(notify_off, 0);
@@ -600,8 +677,20 @@ impl VirtioRng {
         // das emulierte Geraet spaeter fertig wird (Burn-in #1: ~1/2000 Laeufe `used_adv=false`).
         // Worst Case dann ~hunderte ms Busy-Wait statt eines Schein-Fehlschlags.
         match q.poll_used(used_idx0, max_poll) {
-            Some((_id, len)) => (true, len),
-            None => (false, 0),
+            Some(done) => {
+                // Erst der Beleg, dann der Puffer zurueck. Der Aufrufer liest die Bytes ausserhalb
+                // dieser Crate (er hat `cpu_base`) — die Zusage endet an der Crate-Grenze, s.
+                // `crate::owned`.
+                let _buf = q.reclaim(armed, &done);
+                (true, done.len())
+            }
+            None => {
+                // Kein Beleg: das Geraet koennte den Puffer noch in der Hand haben. Der RNG liest
+                // ihn hier nicht, gibt ihn aber trotzdem benannt zurueck, statt ihn stumm
+                // liegenzulassen.
+                let _buf = q.reclaim_unproven(armed);
+                (false, 0)
+            }
         }
     }
 }

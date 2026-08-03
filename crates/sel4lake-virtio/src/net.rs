@@ -179,6 +179,16 @@ impl VirtioNet {
         };
         self.t.driver_ok();
 
+        // **Die beiden Puffer werden EINMAL herausgeschnitten** (todo E, Descriptor-Typestate).
+        // Monoton: Empfangspuffer (0x800, 2048 Byte) direkt gefolgt vom Sendepuffer (0x1000).
+        let mut region = crate::Region::from_raw(cpu_base, dev_base, REGION_BYTES);
+        let (Some(mut rxbuf), Some(mut txbuf)) = (
+            region.carve(OFF_RXBUF, RXBUF_LEN),
+            region.carve(OFF_TXBUF, HDR_LEN as u32 + FRAME_LEN),
+        ) else {
+            return r;
+        };
+
         // Empfangspuffer **zuerst** einhaengen, dann senden. Umgekehrt haette das Geraet die
         // Antwort schon in der Hand, bevor irgendwo Platz dafuer ist — und wuerfe sie weg. Der
         // Fehler saehe aus wie "das Gegenueber antwortet nicht".
@@ -195,70 +205,96 @@ impl VirtioNet {
         // Dieselbe Fehlerform, die dieses Projekt schon zweimal bezahlt hat: ein Puffer mit den
         // richtigen Bytes darin ist von einem beschriebenen Puffer nicht zu unterscheiden,
         // solange niemand vorher aufraeumt.
-        for i in 0..(HDR_LEN + FRAME_LEN as u64) {
-            crate::wr8(cpu_base + OFF_RXBUF + i, 0);
-        }
-        rxq.set_desc(0, rx_buf_dev, RXBUF_LEN, VIRTQ_DESC_F_WRITE, 0);
+        rxbuf.zero(0, HDR_LEN + FRAME_LEN as u64);
+        // Nur die **Geraetesicht** wandert (A-5.4): der Treiber liest weiter seinen eigenen
+        // Puffer, dem Geraet wird eine fremde IOVA genannt. Genau eine Achse, und sie ist im Typ
+        // als solche benannt — nicht ein zweites `u64` neben dem ersten.
+        rxbuf.retarget_device_view(rx_buf_dev);
+        let armed_rx = rxq.arm(0, rxbuf, VIRTQ_DESC_F_WRITE, 0);
         rxq.publish(0, self.t.fence);
         self.t.kick(rx_notify, 0);
 
         // Sendepuffer: virtio-Kopf (12 Byte Null: kein Offload, kein GSO) + ARP-Anfrage.
-        for i in 0..HDR_LEN {
-            crate::wr8(cpu_base + OFF_TXBUF + i, 0);
-        }
-        self.build_arp_request(cpu_base + OFF_TXBUF + HDR_LEN, &r.mac, src_ip, target_ip);
+        txbuf.zero(0, HDR_LEN);
+        self.build_arp_request(&mut txbuf, HDR_LEN, &r.mac, src_ip, target_ip);
         self.t.fence();
 
         let tx_used0 = txq.used_idx();
-        txq.set_desc(0, dev_base + OFF_TXBUF, HDR_LEN as u32 + FRAME_LEN, 0, 0);
+        let armed_tx = txq.arm(0, txbuf, 0, 0);
         txq.publish(0, self.t.fence);
         self.t.kick(tx_notify, 1);
 
-        if txq.poll_used(tx_used0, max_poll).is_some() {
-            r.tx_used = true;
-        }
-        if let Some((_id, len)) = rxq.poll_used(rx_used0, max_poll) {
-            r.rx_used = true;
-            r.rx_len = len;
-            self.t.fence();
-            let f = cpu_base + OFF_RXBUF + HDR_LEN;
-            let ethertype = u16::from_be_bytes([crate::rd8(f + 12), crate::rd8(f + 13)]);
-            let oper = u16::from_be_bytes([crate::rd8(f + 20), crate::rd8(f + 21)]);
-            for i in 0..4 {
-                r.sender_ip[i] = crate::rd8(f + 28 + i as u64);
+        match txq.poll_used(tx_used0, max_poll) {
+            Some(done) => {
+                r.tx_used = true;
+                let _ = txq.reclaim(armed_tx, &done);
             }
-            r.arp_reply = len as u64 >= HDR_LEN + 42
-                && ethertype == ETHERTYPE_ARP
-                && oper == ARP_REPLY
-                && r.sender_ip == target_ip;
+            // Kein Beleg: das Geraet koennte den Sendepuffer noch lesen. Er wird hier auch nicht
+            // gelesen — aber er wird benannt zurueckgeholt statt stumm liegengelassen.
+            None => {
+                let _ = txq.reclaim_unproven(armed_tx);
+            }
+        }
+        match rxq.poll_used(rx_used0, max_poll) {
+            Some(done) => {
+                r.rx_used = true;
+                r.rx_len = done.len();
+                // **Erst der Beleg, dann der Zugriff.** Vorher stand hier ein Lesen des
+                // Empfangspuffers, waehrend er formal noch in der Queue hing; dass es gutging, lag
+                // an der Reihenfolge im Kopf des Autors, nicht an einer Regel.
+                let rxbuf = rxq.reclaim(armed_rx, &done);
+                self.t.fence();
+                let f = HDR_LEN;
+                let ethertype = u16::from_be_bytes([rxbuf.rd8(f + 12), rxbuf.rd8(f + 13)]);
+                let oper = u16::from_be_bytes([rxbuf.rd8(f + 20), rxbuf.rd8(f + 21)]);
+                for i in 0..4 {
+                    r.sender_ip[i] = rxbuf.rd8(f + 28 + i as u64);
+                }
+                r.arp_reply = done.len() as u64 >= HDR_LEN + 42
+                    && ethertype == ETHERTYPE_ARP
+                    && oper == ARP_REPLY
+                    && r.sender_ip == target_ip;
+            }
+            None => {
+                let _ = rxq.reclaim_unproven(armed_rx);
+            }
         }
         r
     }
 
-    /// Eine ARP-Anfrage nach `target_ip` an `dst` schreiben (42 Byte, Rest bis 60 genullt).
+    /// Eine ARP-Anfrage nach `target_ip` ab `at` in `buf` schreiben (42 Byte, Rest bis 60 genullt).
+    ///
+    /// Nimmt den Puffer als `&mut Owned<Driver>` statt als rohe Adresse: damit ist an der Signatur
+    /// abzulesen, dass diese Funktion nur auf einem Puffer laufen darf, der **nicht** armiert ist.
+    /// Vorher war das eine Zusage im Kopf des Aufrufers.
     ///
     /// # Safety
-    /// `[dst, dst + FRAME_LEN)` muss beschreibbar sein.
-    unsafe fn build_arp_request(&self, dst: u64, mac: &[u8; 6], src_ip: [u8; 4], target_ip: [u8; 4]) {
-        for i in 0..FRAME_LEN as u64 {
-            crate::wr8(dst + i, 0);
-        }
+    /// `[at, at + FRAME_LEN)` muss innerhalb von `buf` liegen und beschreibbar sein.
+    unsafe fn build_arp_request(
+        &self,
+        buf: &mut crate::Owned<crate::Driver>,
+        at: u64,
+        mac: &[u8; 6],
+        src_ip: [u8; 4],
+        target_ip: [u8; 4],
+    ) {
+        buf.zero(at, FRAME_LEN as u64);
         for i in 0..6u64 {
-            crate::wr8(dst + i, 0xff); // Ethernet-Ziel: Broadcast
-            crate::wr8(dst + 6 + i, mac[i as usize]); // Ethernet-Quelle
-            crate::wr8(dst + 22 + i, mac[i as usize]); // ARP sender hardware address
+            buf.wr8(at + i, 0xff); // Ethernet-Ziel: Broadcast
+            buf.wr8(at + 6 + i, mac[i as usize]); // Ethernet-Quelle
+            buf.wr8(at + 22 + i, mac[i as usize]); // ARP sender hardware address
         }
         // Ethertype, htype (Ethernet), ptype (IPv4), hlen, plen, oper — alles Big-Endian.
-        crate::wr8(dst + 12, (ETHERTYPE_ARP >> 8) as u8);
-        crate::wr8(dst + 13, ETHERTYPE_ARP as u8);
-        crate::wr8(dst + 15, 1); // htype = 1
-        crate::wr8(dst + 16, 0x08); // ptype = 0x0800
-        crate::wr8(dst + 18, 6); // hlen
-        crate::wr8(dst + 19, 4); // plen
-        crate::wr8(dst + 21, ARP_REQUEST as u8);
+        buf.wr8(at + 12, (ETHERTYPE_ARP >> 8) as u8);
+        buf.wr8(at + 13, ETHERTYPE_ARP as u8);
+        buf.wr8(at + 15, 1); // htype = 1
+        buf.wr8(at + 16, 0x08); // ptype = 0x0800
+        buf.wr8(at + 18, 6); // hlen
+        buf.wr8(at + 19, 4); // plen
+        buf.wr8(at + 21, ARP_REQUEST as u8);
         for i in 0..4u64 {
-            crate::wr8(dst + 28 + i, src_ip[i as usize]); // sender protocol address
-            crate::wr8(dst + 38 + i, target_ip[i as usize]); // target protocol address
+            buf.wr8(at + 28 + i, src_ip[i as usize]); // sender protocol address
+            buf.wr8(at + 38 + i, target_ip[i as usize]); // target protocol address
         }
         // target hardware address (Offset 32..38) bleibt null — das ist die Frage.
     }

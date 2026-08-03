@@ -77,7 +77,7 @@ mit_deps() { # $1 = Name, $2 = Crate-Verzeichnis, $3.. = Abhaengigkeiten (Verzei
     rm -rf "$SA"
 }
 
-ZIELE="${*:-mem part fat cycles loader cap ipctreue}"
+ZIELE="${*:-mem part fat cycles loader cap virtio typestate ipctreue}"
 for z in $ZIELE; do
     case "$z" in
         mem)  einzeln mem  "$ROOT/crates/sel4lake-mem/src/lib.rs" ;;
@@ -96,6 +96,23 @@ for z in $ZIELE; do
         # `sel4lake-cap` haengt an `sel4lake-mem` und `sel4lake-slab`. Bis B-5.5 liefen seine Tests
         # deshalb nirgends -- die Huerde war das Manifest, nicht der Code.
         cap)  mit_deps cap sel4lake-cap sel4lake-mem sel4lake-slab ;;
+        # `sel4lake-virtio` ist abhaengigkeitsfrei (A-5.1). Host-pruefbar ist daran die
+        # Typestate-Buchhaltung (`owned.rs`, todo E): Schnittarithmetik ueber Adressen, ohne
+        # Zugriff und ohne Geraet. Alles andere in der Crate fasst MMIO an und gehoert in die
+        # QEMU-Suiten.
+        virtio) einzeln virtio "$ROOT/crates/sel4lake-virtio/src/lib.rs" ;;
+        # **Der Uebersetzer als Pruefer.** Der Descriptor-Typestate behauptet etwas ueber Code, der
+        # NICHT uebersetzt -- und ein solcher Code steht per Definition in keinem Testbinary. Der
+        # Nachweis muss deshalb `rustc` selbst befragen, mit Positivkontrolle und mit ERWARTETEN
+        # Fehlercodes (sonst waere jeder Tippfehler ein Beleg).
+        typestate)
+            if [ ! -f "$ROOT/tools/typestate-negativ.sh" ]; then
+                echo "== Host-Tests: typestate =="
+                echo "  FEHLT: tools/typestate-negativ.sh ist nicht vorhanden -- Ziel nicht gelaufen"
+                fail=1
+            else
+                bash "$ROOT/tools/typestate-negativ.sh" || fail=1
+            fi ;;
         # `sel4lake-ipc` haengt an `sel4lake-hal` (arch-Asm) und wird auf dem Host nie bauen -- wie
         # `sel4lake-sched`. Anders als bei `cycles` liegt die Logik aber NICHT abhaengigkeitsfrei in
         # einem eigenen Modul, sondern mitten im Endpoint. Der Ausweg sind Stellvertreter fuer
@@ -109,7 +126,7 @@ for z in $ZIELE; do
             else
                 bash "$ROOT/tools/verus-modelltreue-ipc.sh" || fail=1
             fi ;;
-        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap ipctreue)"; fail=1 ;;
+        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio typestate ipctreue)"; fail=1 ;;
     esac
 done
 

@@ -198,16 +198,37 @@ impl VirtioBlk {
         };
         self.t.driver_ok();
 
+        // **Die drei Puffer werden EINMAL herausgeschnitten** (todo E, Descriptor-Typestate).
+        //
+        // `carve` schneidet monoton — Kopf (0x800), Statusbyte (0x810), Daten (0x1000) —, also
+        // koennen sie sich nicht ueberlappen. Danach ist jeder von ihnen ein `Owned<Driver>`, und
+        // das Armieren VERBRAUCHT ihn: „Puffer steht in der Queue und wird nebenher noch
+        // beschrieben" ist ab hier kein Fehler mehr, den man machen kann, sondern einer, den der
+        // Uebersetzer nennt.
+        let bytes = n * SECTOR;
+        let mut region = crate::Region::from_raw(cpu_base, dev_base, REGION_BYTES);
+        let (Some(mut hdr), Some(mut status)) =
+            (region.carve(OFF_HDR, 16), region.carve(OFF_STATUS, 1))
+        else {
+            return r;
+        };
+        // Bei Flush gibt es kein Datenglied — der Puffer wird trotzdem geschnitten, weil
+        // `first_word` auch dann berichtet wird. Er wird dann nur nie armiert und bleibt die ganze
+        // Zeit unserer.
+        let Some(mut data) = region.carve(OFF_DATA, if n > 0 { bytes } else { 8 }) else {
+            return r;
+        };
+
         // Anfragekopf: struct virtio_blk_req { le32 type; le32 reserved; le64 sector; }
-        crate::wr32(cpu_base + OFF_HDR, op.type_code());
-        crate::wr32(cpu_base + OFF_HDR + 4, 0);
-        crate::wr64(cpu_base + OFF_HDR + 8, sector);
+        hdr.wr32(0, op.type_code());
+        hdr.wr32(4, 0);
+        hdr.wr64(8, sector);
         // Das Statusbyte vorbelegen: **nicht** mit Null. Ein Statusbyte, das schon 0 (= S_OK) ist,
         // bevor das Geraet es beschreibt, macht die Statuspruefung wertlos — sie waere auch dann
         // gruen, wenn das Geraet nie geantwortet hat.
-        crate::wr8(cpu_base + OFF_STATUS, 0xff);
+        status.wr8(0, 0xff);
         if op == Op::Read {
-            crate::wr64(cpu_base + OFF_DATA, 0);
+            data.wr64(0, 0);
         }
         self.t.fence();
 
@@ -215,32 +236,55 @@ impl VirtioBlk {
         // zeigen kann. Beim SCHREIBEN traegt auch das Datenglied keins: dort liest das Geraet
         // **beide** Glieder, und ein faelschlich gesetztes Write-Flag hiesse, dem Geraet
         // Schreibrecht auf unseren Puffer zu geben, das es fuer diese Anfrage nicht braucht.
-        let bytes = n * SECTOR;
         let last = if n == 0 { 1u16 } else { 2 };
-        q.set_desc(0, dev_base + OFF_HDR, 16, VIRTQ_DESC_F_NEXT, 1);
-        if n > 0 {
+        let armed_hdr = q.arm(0, hdr, VIRTQ_DESC_F_NEXT, 1);
+        let mut ruhender_datenpuffer = Some(data);
+        let armed_data = if n > 0 {
             let data_flags = match op {
                 Op::Read => VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
                 _ => VIRTQ_DESC_F_NEXT,
             };
-            q.set_desc(1, dev_base + OFF_DATA, bytes, data_flags, 2);
-        }
-        q.set_desc(last, dev_base + OFF_STATUS, 1, VIRTQ_DESC_F_WRITE, 0);
+            ruhender_datenpuffer.take().map(|d| q.arm(1, d, data_flags, 2))
+        } else {
+            None
+        };
+        let armed_status = q.arm(last, status, VIRTQ_DESC_F_WRITE, 0);
 
         let used0 = q.used_idx();
         q.publish(0, self.t.fence); // die hereingereichte Barriere, nicht irgendeine
         self.t.kick(notify_off, 0);
 
-        if let Some((_id, len)) = q.poll_used(used0, max_poll) {
+        let done = q.poll_used(used0, max_poll);
+        if let Some(c) = done.as_ref() {
             r.used_advanced = true;
-            r.written = len;
+            r.written = c.len();
         }
         // Status und Daten werden IMMER gelesen, auch ohne used-Fortschritt: bliebe das
         // Statusbyte bei 0xff, ist damit belegt, dass das Geraet nichts geschrieben hat — und
         // nicht bloss, dass wir zu frueh aufgehoert haben zu warten.
+        //
+        // **Genau dafuer gibt es `reclaim_unproven`.** Der Weg ohne Abschlussbeleg ist hier kein
+        // Versehen, sondern die Messung selbst — und er steht deshalb mit seinem Namen da, statt
+        // als roher Zugriff an der Typisierung vorbei.
         self.t.fence();
-        r.status = crate::rd8(cpu_base + OFF_STATUS);
-        r.first_word = crate::rd64(cpu_base + OFF_DATA);
+        let (hdr, status, data) = match done.as_ref() {
+            Some(c) => (
+                q.reclaim(armed_hdr, c),
+                q.reclaim(armed_status, c),
+                armed_data.map(|d| q.reclaim(d, c)),
+            ),
+            None => (
+                q.reclaim_unproven(armed_hdr),
+                q.reclaim_unproven(armed_status),
+                armed_data.map(|d| q.reclaim_unproven(d)),
+            ),
+        };
+        let _ = hdr; // der Kopf wird nicht zurueckgelesen -- aber auch nicht stumm liegengelassen
+        r.status = status.rd8(0);
+        r.first_word = match data.or(ruhender_datenpuffer) {
+            Some(d) => d.rd64(0),
+            None => 0,
+        };
         r.sectors = n;
         r.expected_written = if op == Op::Read { n * SECTOR + 1 } else { 1 };
         r

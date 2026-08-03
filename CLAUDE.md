@@ -1,0 +1,404 @@
+# SEL4Lake
+
+Faehigkeitsbasierter Mikrokern in Rust, von Grund auf geschrieben — kein seL4-Fork.
+Stand dieser Notiz: 2026-08-03. Nur Geprueftes.
+
+## Wo die Wahrheit steht
+
+Diese Datei ist eine Einstiegshilfe, keine Quelle. Fuer alles Inhaltliche gilt:
+
+| Datei | Inhalt |
+|---|---|
+| `todo.md` | **ausschliesslich Offenes** — die Quelle fuer "was ist noch zu tun" |
+| `done.md` | Erledigtes |
+| `docs/invariants.md` | die tragenden Zusicherungen, u. a. §2a–2e zu DMA |
+| `docs/00-overview.md` | Aufbau |
+| `README-X86.md` | x86-Besonderheiten |
+
+Offene Punkte **nicht aus dem Gedaechtnis beantworten**. `todo.md` lesen.
+
+## Aktueller Stand
+
+Zweig `arch/x86_64` (2026-08-03).
+
+**Gemessen, nicht erinnert:**
+
+| | |
+|---|---|
+| x86_64 | **800 von 800** mit identischer Signatur, `== ALL PASS ==` (2026-08-03: 200 im Leerlauf + 600 unter Last in 5 parallelen Stroemen a 120, 20 vCPU auf 20 Kernen; die Stroeme sind auch **untereinander** deckungsgleich) |
+| x86_64 Lade-Suite | `== ALL PASS ==` (2026-08-03: 39 Pruefungen — 5 Module, **zwei** Treiber-PDs, Austausch, A-5.3/A-5.4, dazu **drei** verkettete Boots fuer Z4 Stufe 2, inkl. sieben Negativfaellen) |
+| aarch64 | `RUNS=6` → **6 von 6** mit identischer Signatur, `== ALL PASS ==` (2026-08-02, **mit Root-Task**; davor 16/16 ohne, s. D6/D5) |
+| Host-Tests | `mem 22 · part 14 · fat 20 · cycles 9 · loader 50 · cap 22` → `== HOST-TESTS: ALL PASS ==` (`tools/host-tests.sh`, 2026-08-03) |
+
+**Was diese 800 Läufe heißen — und was nicht.** D0 ist damit **nicht** zu. Die noch offene Hälfte
+(Hänger ab `sched`) hatte eine gemessene Grundlinie von rund **0,5 %** (2/400 unter Last, 1/200 im
+Leerlauf). Gegen 0,5 % ist ein sauberer 800er-Lauf `0,995⁸⁰⁰ ≈ 2 %` — auffällig, aber kein Beweis.
+Nach der Dreierregel liegt die obere 95-%-Schranke jetzt bei `3/800 ≈ 0,4 %`. Ehrlich gesagt: die
+Rate ist gefallen oder das Bild ist lastabhängig anders als gedacht; **ausgeschlossen ist sie
+nicht**. Wer sie ausschließen will, braucht rund 1500 Läufe.
+
+Zwei Vorbehalte, die zur Zahl gehören: die alte Serie lief parallel zur **Lade-Suite**, die neue
+gegen fünf Kopien ihrer selbst — beides ist Last, aber nicht dieselbe. Und `pprobe` meldet unter
+KVM grundsätzlich `SKIP` (`CPUID.1:ECX[31]`), urteilt in dieser Reihe also nicht mit.
+
+Neu an der Messung ist der **Quervergleich**: bis dahin verglich jeder Lauf nur gegen den *ersten
+Lauf seines eigenen Stroms*. Fünf Ströme mit je einer in sich stimmigen, untereinander aber
+verschiedenen Signatur hätten so grün gemeldet.
+
+Früher stand hier `RUNS=100` → 96 von 100. Diese Zahl war aus einem anderen Grund wertlos, als sie
+aussah: drei Schichten verdeckten einander (bedingungsloses `SELFTEST COMPLETE`, `color` druckte
+`FAIL` statt `FAILURES`, `-no-shutdown` machte `rc=124` immer wahr). Erst nachdem alle drei weg
+waren, konnte eine Messung überhaupt etwas aussagen — s. todo D0.
+
+Ein früher hier stehendes „aarch64 66/66, x86_64 24/24" war eine Momentaufnahme ohne Datum. Zahlen
+in dieser Datei brauchen einen Stand **und eine Stichprobengröße**, sonst werden sie stillschweigend
+falsch.
+
+## Was am 2026-08-03 dazukam
+
+* **Z4 Stufe 2 steht: ein Thread ueberlebt eine BOOTGRENZE.** Derselbe Kernel speichert und
+  stellt wieder her und **entscheidet selbst welches** — er liest einen Sektor (32710, ausserhalb
+  beider Partitionen), prueft Magie, Formatversion und `kernel_code_hash` und handelt danach. Der
+  Transport ist der vorhandene Blockdienst; der Kern ist Client, `virtio-blk` blieb unveraendert.
+  Format in `crates/sel4lake-cap/src/checkpoint.rs` (feste Breiten, LE, CRC-32, abhaengigkeitsfrei,
+  host-getestet), und `Image::build` ruft `classify_all`: **eine nicht uebertragbare Cap verhindert
+  den Checkpoint vor dem Schreiben.** Belegt ueber drei verkettete Boots (244 → 345 → 446, Epochen
+  1 → 2 → 3) und zwei Negativfaelle. Details in `done.md`.
+* **D0 nachgemessen: 800 Läufe, keine Abweichung — und trotzdem nicht zu.** Die Zahl allein sagt
+  weniger, als sie aussieht: gegen die Grundlinie des noch offenen Fehlerbildes (~0,5 %) ist eine
+  saubere 800er-Reihe rund 2 % wahrscheinlich. Details und die nötige Läufezahl in `todo.md` D0.
+  Dabei fiel ein Loch im Prüfer auf: **jeder Lauf verglich nur gegen den ersten Lauf seines
+  eigenen Stroms** — fünf parallele Ströme mit je eigener, in sich stimmiger Signatur hätten
+  fünfmal grün gemeldet. Der Quervergleich ist jetzt Teil der Messung.
+* **Der Befund, der dabei den ganzen Entwurf umgebaut hat — und der allgemein gilt:** der
+  Fortschrittszaehler ist unter KVM **reproduzierbar** (gemessen 133…155 an derselben Stelle des
+  Hochlaufs). Der erste Aufbau verglich einfach „gespeicherter Wert == gefundener Wert"; eine
+  Mutation, die den Wert LAS und MELDETE, ohne ihn zu setzen, traf ihn **exakt**, und die Suite
+  blieb gruen. Siehe unten in der Fallenliste.
+
+## Was am 2026-08-02 dazukam
+
+* **B-6.2: ein Kernel-Panic reisst den Knoten NICHT mit — und das ist die schlechtere Nachricht.**
+  Gemessen: der Panic-Pfad haltet den Kern **ohne IRQ-Maskierung**, der naechste Timer-Tick holt
+  ihn zurueck in den Scheduler. Der Knoten lief 61 s weiter und meldete `ipc`, `ring3`, `iommu`,
+  `dmatok` als ALL PASS — mit einer nachweislich verletzten Invariante. Vier verschiedene Ausgaenge
+  je nachdem **wo** der Panic auftritt, darunter ein stiller Totalausfall (Panic unter der
+  MEM-Sperre) und ein Zustand, der von aussen nicht von einem Deadlock zu unterscheiden ist.
+  Festlegung in `docs/fehlerdomaene.md`, normativ als `docs/invariants.md` §14.
+* **Z4 angefangen — die zwei Stufen, die heute prüfbar sind.** **Z4a**: `freeze_thread` hält an
+  einer *benennbaren* Grenze (nicht auf einem Kern **und** keine offene IPC-Beziehung), geprüft
+  über die **Wirkung** — Zähler bewegt sich, steht, läuft wieder. **Z4b**: die Verweigerungsregel
+  (`crates/sel4lake-cap/src/checkpoint.rs`, host-getestet) — was drüben nicht dasselbe bezeichnen
+  kann, wandert nicht mit, und die Entscheidung braucht den **Umfang** des Checkpoints, nicht nur
+  die Cap. Drei Fehler im eigenen Entwurf gemessen, darunter ein Beobachtungsfenster kürzer als
+  ein Tick und ein `all_done()`-Konjunkt, das erst im Bericht entsteht.
+* **A-5.4 ist zu: das Geraet der einen Treiber-PD erreicht die DMA-Region der anderen nicht**
+  (`dmaiso : ALL PASS`). Vier Zahlen, keine reicht allein — Positivkontrolle ueber denselben
+  Treiber und dieselbe Deskriptorkette (nur **eine** Adresse wandert), keine Daten beim
+  Fremdversuch, das Opfer **vom Kernel** nachgeprueft, und ein VT-d-Fault als aktiver Beleg. Zwei
+  Fehler im eigenen Entwurf gefunden: `arp_probe` nullte nur acht Byte, also las die zweite Probe
+  die Antwort der ersten; und `rx_used` sagt, dass das Geraet *gehandelt* hat, nicht dass Daten
+  ankamen.
+* **Dabei: zwei Treiber-PDs laufen gleichzeitig**, jede bekommt ihr im Manifest **benanntes**
+  Geraet. Der Weg dorthin legte vier versteckte Politiken frei — „die erste benutzte Zuteilung",
+  „der zuletzt geladene Dienst", eine geteilte Notification-Ablage und eine geteilte
+  Uebertragungsflaeche. Alle vier sind jetzt ueber die `program_id` aus dem Manifest verschluesselt;
+  wo eine Wahl mehrdeutig waere, wird **abgewiesen statt geraten**. Der Client benennt seinen Dienst
+  im Manifest (`service_id`, die letzten 4 reservierten Bytes).
+* **`pprobe` urteilte unter Emulation.** Auf aarch64 unter Last "trug" die Positivkontrolle und die
+  Verteilungen waren "trennbar" — bei **0,6 Zyklen je Kettenglied**. Eine abhaengige Ladeoperation
+  kostet auf echter Hardware mindestens die L1-Trefferlatenz; darunter misst der Test die
+  Befehlszahl der Emulation, nicht den Cache. Jetzt eine Untergrenze, die von der Messung
+  unabhaengig ist.
+* **A1 gilt jetzt auch auf aarch64 — und war dort vorher NICHT ausgehängt, sondern auf `true`
+  verdrahtet.** `spawn_demo` setzte `COLOR_OK`/`STRIPE_ALLOC_OK`/`PPROBE_OK` hart auf `true`: drei
+  dauerhaft wahre Konjunkte in `all_done()`, keine Berichtszeile, kein Check — die Abwesenheit war
+  nicht bloß unbelegt, sie war **unsichtbar**. Die Lösung war der **Platz** (ans Ende der Kette,
+  hinter `cross`/`strand`/`loadstop`), nicht das Weglassen. Damit läuft A1 zum ersten Mal auf der
+  **16-Farben**-Aufteilung — genau dem Fall, den die `MASK_BITS`-Verwechslung falsch machte.
+* **B-4.5 reproduzierbar — und die Ursache war NICHT der Allokator.** Der Aufbau war
+  byte-identisch (gleiche Physadressen, Fragment-Höchststand 419/1024); die Streuung lag in der
+  **Messung**: der Angreifer lief linear (Positivkontrolle 3/10 → bit-umgekehrt 10/10), das
+  Minimum war der falsche Schätzer (4/10 → Median 10/10), und „Opfer > L2" war eine feste Zahl.
+  Dazu: **QEMU meldete eine erfundene Cache-Geometrie.** Mit `host-cache-info=on` sieht der Kernel
+  512 echte Farben statt 256 gedachter — und 512 ist keine 256, genau daran hing der
+  A1-Rest-Fehler.
+* **A-5.3: die Geräte-Zuteilung stand im Enumerator, jetzt im Manifest.** Der Eintrag trägt einen
+  Selektor (`vendor`/`device`/`class`) in den reservierten Bytes — Format bleibt eingefroren, und
+  Nullen heißen „beliebig", nicht „passt auf nichts". Fail-closed: passt keines, gibt es keines.
+  Belegt durch zwei Negativfälle; der stärkere zeigt auf die **Netzkarte** und bekommt sie, obwohl
+  das Blockgerät in der Angebotsliste davor steht.
+* **B-5.1: die Abrechnung hing am Tick — und zwar ganz.** Nicht „bis zu 10 ms Verzerrung":
+  `block_current`, `switch_to` und YIELD belasteten **gar nichts**. Wer kurz vor dem Tick
+  blockiert, zahlte null. Jetzt wird jede Umplanung gestempelt (`crates/sel4lake-sched/src/cycles.rs`,
+  abhängigkeitsfrei, host-geprüft), geprüft als `cycacct`: **Proben > Ticks** ist die Aussage.
+* **D5: der aarch64-Kernel hat einen Root-Task** — und der Weg dorthin fand zwei Fehler, die mit
+  dem Manifest nichts zu tun hatten: `boot_arg` gab die **Archiv**-Größe statt der Startmenge
+  (jetzt `StartSetNotPrefix`, fail-closed), und `loadstop` maß eine **globale** Baseline mit einer
+  **lokalen** IRQ-Sperre.
+* **B-5.5: begrenzt war der Prüfer, nicht `revoke`.** `cdt_audit`-Code 9, Höchststände als
+  Operationszahl im Bericht.
+* **`tools/host-tests.sh`** existiert — `sel4lake-cap` hatte gar keinen Host-Test-Pfad, seine
+  sechs Tests wären nirgends gelaufen.
+
+## Was am 2026-08-01 dazukam
+
+* **D0 zur Hälfte zu.** Das Farbrennen ist weg (500/500): die Kernelseite wird nicht mehr
+  *zurückgelesen*, sondern vom Spawn geliefert — ein Wert, der an der Lebendigkeit eines Threads
+  hängt, der sterben darf, taugt nicht als Messgröße. Der Hänger bleibt offen (s. o.).
+* **Ein echtes Leck nebenbei behoben:** `record_user_kstack` lief *hinter* dem kritischen
+  Abschnitt; traf der Einsammler das Fenster, wurde der Kernel-Stack nie freigegeben.
+* **A-5.2 ist zu:** virtio-**Transport**, **Blockgerät** und **Netzkarte** auf x86, alle drei
+  kernfrei in `crates/sel4lake-virtio`. Wichtiger als die Geräte ist, was sie belegen: der RNG
+  zeigte nur, dass ein Gerät in unseren Speicher **schreibt** — `blk` schickt eine Deskriptorkette,
+  deren erstes Glied das Gerät **lesen** muss, und belegt damit die andere Richtung. Auch im
+  Negativtest: nach dem VT-d-Aufbau bleibt das Statusbyte auf `0xff`, das Gerät hat den Anfragekopf
+  nicht einmal gesehen. Details in `done.md`.
+* **B-4.5 (Prime+Probe) steht** — mit einem negativen Ergebnis, s. unten.
+* **Die Kerngrenze ist prüfbar:** `tools/kernel-grenze.sh`.
+* **A-5.1 ist zu (2026-08-02): ein Treiber laeuft als DIENST ausserhalb des Kerns — und wird
+  ausgetauscht, ohne dass der Kernel weiss, was er treibt.** `programs/hardware/virtio-blk` loest
+  sein Geraet auf seiner **eigenen Konfigurationsraum-Seite** auf und wartet dann in `recv`; der
+  Kernel ist **Client**. Zwischen zwei Anfragen tauscht er den Empfaenger am laufenden Endpoint aus
+  (A-4.1, ohne Empfaengerluecke); der Bedienungszaehler 1 → 2 in der DMA-Region belegt, dass die
+  neue Fassung dieselbe Region **geerbt** hat. In `loader::reload_driver` kommt „virtio" nicht vor
+  — das ist die Abnahmebedingung, nicht ein Zufall.
+  Der Einwand, der unterwegs wegfiel: der Konfigurationsraum ist geraeteweit — stimmt fuer das
+  ECAM-Fenster als Ganzes, nicht fuer **eine Funktion** (ECAM bildet jede auf 4 KiB ab, also auf
+  eine Seite). **Nicht dabei:** `CAP_IRQ` — der Treiber pollt, s. unten. Details in `done.md`.
+* **B-3.3 ist zu — und die Todo-Notiz war nur die halbe Wahrheit.** Aggregiert war schon einiges;
+  **nicht** aggregiert waren drei Stellen mit Zaehnen: `init()` stellte nur Einheit 0 scharf (die
+  uebrigen blieben mit `TE=0` — das heisst *keine Uebersetzung*, nicht *blockiert*),
+  `invalidate_context_cache()` ebenso, und `flush_entry`/`slpt_map` trafen **Politik** (`clflush`,
+  `SNP`) nach den Faehigkeiten von Einheit 0. Dazu neu: eine Sprechprobe je Einheit.
+  Nebenbefund behoben: `detach` kehrte bei nicht lesbaren Faehigkeiten **still** zurueck — ein
+  ausgefallener Teardown laesst eine Uebersetzung stehen. Jetzt `dma_audit` Code 8.
+* **B-5.5 ist zu — und stand genau verkehrt herum.** Begrenzt war ausgerechnet der **Pruefer**
+  (`audit_cdt`); `revoke`, `move_cap` und `child_count` liefen unbegrenzt — auf Mandantenwunsch und
+  unter der CAPS-Sperre. Schranke jetzt hergeleitet (`slots.len()`), Ueberlauf gezaehlt und als
+  `cdt_audit`-Code 9 geprueft, Hoechststaende als **Operationszahl** im Bericht.
+  Nebenertrag: `sel4lake-cap` hatte gar keinen Host-Test-Pfad — `tools/host-tests.sh` sammelt jetzt
+  **62 Tests** (mem, part, fat, cap) an einem Ort.
+* **B-7.1 ist zu — und die Notiz war ueberholt.** Kani deckte `sync` laengst ab; die CI beschrieb
+  sich nur falsch (`Job: „…(Loader-Parser)"`, tatsaechlich alle vier Ziele) — und genau daraus war
+  der „Befund" entstanden. Die **echte** Luecke: die Beweise liefen mit KONKRETEN Werten, also in
+  derselben Groessenordnung wie Loom. Fuenf neue Harnesses nehmen den Zustand **symbolisch**
+  (2^31 Leserzahlen, u32-Ticketueberlauf); `sync` steht bei 8 statt 3 Beweisen.
+* **B-7.2 ist zu — und die Kopie war nicht der Grund.** Loom prueft jetzt den **echten**
+  `sel4lake-sync`-Quelltext (das Skript kopiert ihn unveraendert, Beweise in derselben Datei), und
+  die alten Kopien sind geloescht. Der Fund dabei: mit `core::cell::UnsafeCell` prueft Loom nur das
+  **Atomic-Protokoll** — eine abgeschwaechte Ordnung im Ticket-Release lief durch ALLE Beweise
+  durch. Erst mit `loom::cell::UnsafeCell` fallen 2 von 10. Selbst nachgemessen.
+* **D6: die aarch64-Suite hat jetzt eine Wiederholungsmessung** (`RUNS`, Signaturvergleich, Logs
+  bei Abweichung). Die scheinbare Sporadik von ~30 % war zur Hauptsache die **Mechanik** — Pipe
+  statt Datei, danach eine gemeinsame Datei fuer alle Laeufe. Ein echter Haenger bleibt offen und
+  ist jetzt erstmals messbar.
+* **B-3.4 ist zu:** `0xFEE0_0000..0xFEF0_0000` ist als IOVA unbenutzbar (VT-d liest DMA dorthin als
+  Interrupt-Nachricht und uebersetzt gar nicht — kein Fault, keine Fehlerzeile, nur Daten, die
+  nirgends ankommen). Die Fensterbasis liegt jetzt **strukturell** darueber. Die Gegenprobe zeigt:
+  das Fenster lag vorher wirklich darin.
+* **A-6 ist zu: ueber dem Sektor liegt ein Speicherstapel — vollstaendig ausserhalb des Kerns.**
+  **A-6.1** Blockdienst (Auskunft, Lesen, **Schreiben**, Flush, Bereichsfehler mit eigenem Status);
+  **A-6.2** `crates/sel4lake-part` liest GPT (14/14 Host-Tests, drei kaputte Tabellen mit
+  unterscheidbaren Gruenden abgewiesen); **A-6.3** `crates/sel4lake-fat` + `programs/trusted/fs`
+  lesen eine Datei ueber GPT → FAT16 → Blockdienst → Treiber (16/16 Host-Tests). Beide Parser sind
+  abhaengigkeitsfrei und `forbid(unsafe_code)` — fremde Plattenbytes werden nirgends mit
+  Kernprivileg interpretiert. **A-6.4** die PD SCHREIBT auch (zweiter Cluster, beide FAT-Kopien,
+  Flush, jedes Byte zurueckgelesen), und `tools/checkfat.py` liest das Abbild **unabhaengig** nach.
+  Details in `done.md`.
+* **Die Lade-Suite war rot und ist es nicht mehr** — und die Ursache ist lehrreich:
+  `test-qemu-x86-load.sh` startete `virtio-rng-pci` ohne `iommu_platform=on`, das Gerät war damit
+  transitional, der Treiber brach korrekt ab, `virtio` fiel durch, `all_done()` wurde nie wahr,
+  Watchdog. Sah aus wie ein Hänger, war eine Gerätekonfiguration. **Zwei Suiten, die dasselbe
+  Gerät verschieden aufsetzen, sind ein Riss, durch den genau so etwas fällt.**
+
+## Das Entwurfsprinzip, das alles zusammenhaelt
+
+**Ein Pruefer, der ueber Abwesenheit entscheidet, muss belegen koennen, dass er ueberhaupt
+sprechfaehig ist. Ein leerer Lauf ist kein Testergebnis.**
+
+Das ist keine Stilfrage, sondern im Code verankert: `config_errors()` prueft
+beobachtungsunabhaengig, `evtq_liveness` weist nach, dass die Ereigniswarteschlange antworten
+koennte, und die Audit-Codes 6 (IOMMU-Konfigurationsfehler) und 7 (haengende Isolierung)
+existieren, damit ein Schweigen nicht als Erfolg durchgeht.
+
+Wer hier etwas aendert, weicht das leicht versehentlich auf. Vor jeder Aenderung an einem
+Pruefpfad: Kann dieser Test noch fehlschlagen, wenn die gepruefte Sache kaputt ist?
+
+Dasselbe gilt fuer Abnahmekriterien. Ein frueher Kriterium lautete "die vorhandenen Tests
+hoeren auf zu skippen" — und setzte damit voraus, dass es sie gibt. Auf x86 gab es sie nicht;
+sie skippten nicht, sie fehlten. Daher liegen die DMA-Tests jetzt architekturneutral in
+`kernel/src/dmatests.rs` und werden von **beiden** Hochlaufwegen gefahren.
+
+## Zwei Achsen, die nie vermischt werden duerfen
+
+`addr::Pa` und `addr::Iova` sind getrennte Typen. `DmaRegion::identity` wurde **absichtlich
+entfernt** — es gibt keinen bequemen Weg mehr, eine PA als IOVA auszugeben.
+
+IOVA-Fenster liegen oberhalb von `RAM_TOP`, mit 2-MiB-Schutzbaendern, und werden nicht
+wiederverwendet. Oberhalb von `RAM_TOP` kann eine IOVA nie zufaellig eine gueltige PA sein —
+darauf beruht die Trennung.
+
+**Die Falle dabei:** Eine Funktion, die vollstaendig in `u64` rechnet, ist keine Kante, sondern
+ein Loch. Genau so las `dmagen` einmal Stage-1-Blaetter mit der PA statt der IOVA — die
+Newtypes konnten das nicht sehen, weil sie nirgends vorkamen. Wo Adressarithmetik passiert,
+gehoeren die Typen mit hinein.
+
+## Fallen, die dieses Projekt bereits bezahlt hat
+
+Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
+
+* **SMMUv3 `STE.S1STALLD`** darf nur gesetzt werden, wenn `IDR0.STALL_MODEL == 0b10`. Sonst
+  `C_BAD_STE`, und der Strom wird nie uebersetzt.
+* **SMMUv3 CD** braucht die Bits `A` (terminate) und `R` (record). Ohne `R` ist die
+  Ereigniswarteschlange **strukturell** leer — und ein leerer Puffer sieht aus wie "keine
+  Fehler".
+* **QEMU-virtio umgeht die SMMU**, solange `VIRTIO_F_ACCESS_PLATFORM` fehlt. Der Treiber
+  verlangt es jetzt; der Lauf braucht `iommu_platform=on`.
+* **x86 `GCMD` ist kein Read-Modify-Write.** Ein zurueckgeschriebenes `TE=0` gibt DMA frei.
+* **x2APIC**: `EN` und `EXTD` in einem Schreibvorgang ist ein verbotener Zustandsuebergang —
+  #GP, Triple Fault, zurueck ins BIOS. Zwei Schritte, oder gar nicht. Unter TCG faellt das
+  nicht auf, weil `qemu64` kein x2APIC hat.
+* **`cpuid` in einem heissen Pfad** ist unter KVM ein bedingungsloser VM-Exit. In `cycles()`
+  kostete das 3556 statt 51 Zyklen. Merkmale werden einmal ermittelt und zwischengespeichert.
+* **Faerbung wirkt nur auf Blech.** Gemessen: als Gast schreibt der Wirt die Farbbits um (sie
+  liegen oberhalb des Seitenoffsets, die zweite Uebersetzungsstufe zerstoert sie). `disjunkt=234`
+  gegen `gleichfarbig=210` — kein Schutz. Wer „Isolation ohne VMs" auf gemieteten VMs betreibt,
+  hat sie nicht.
+* **Eine „arch-neutrale" Barriere ist keine.** `core::sync::atomic::fence(SeqCst)` wird auf aarch64
+  zu `dmb ish` — Device-Memory liegt nicht in dieser Domaene, dort braucht es `dsb sy`. Beim
+  Entkoppeln von `sel4lake-virtio` waere das der bequeme Weg gewesen und haette die Semantik still
+  abgeschwaecht.
+* **Ein Test, der Speicher belegt, kippt baseline-empfindliche Tests.** Der Farbtest am Anfang von
+  `threads::spawn_demo` liess auf aarch64 mal `captest`, mal `sched` durchfallen. Er ist dort
+  deshalb ausgehaengt (x86 laeuft ihn). Ein Test, der andere Tests kippt, macht das GESAMTE
+  Ergebnis unbrauchbar.
+* **`MASK_BITS` ist nicht die Farbanzahl.** `region_bytes()` rechnete mit 64 statt mit `count()` —
+  auf x86 (256 Farben) zufaellig richtig, auf aarch64 (16) falsch. `sel4lake_mem::stripe` hatte
+  denselben Fehler; **behoben am 2026-08-02**, und er war schlimmer als gedacht: bei 16 Farben
+  bekam Streifen 0 ALLE Farben und die Streifen 1..3 KEINE — und weil leere Mengen sich nicht
+  schneiden, meldete der Selbsttest „disjunkt". Gruen, ohne dass etwas getrennt war.
+  `stripe` nimmt jetzt die Farbanzahl als Parameter; bei 256 Farben bit-identisch zu vorher.
+* **Kern-Uebergabe**: `CR3` per 32-Bit-Schreibzugriff ist ein abgeschnittener Zeiger, sobald
+  die Tabellen ueber 4 GiB liegen. Seitentabellen mit `GFP_DMA32` anfordern und pruefen.
+* **Geteilte Seitenverzeichnisse vertragen keine PD-spezifischen Eintraege.** `vspace_create_base`
+  haengt GiB 1..3 **jeder** isolierten x86-PD an dieselben statischen Tabellen (`ISO_PD_HIGH`).
+  Ein Geraetefenster dort einzutragen gaebe es JEDER isolierten PD -- lautlos, denn die
+  Cap-Pruefung liefe korrekt durch. Seit A-5.1 entsteht beim ersten Geraetefenster eine private
+  Kopie; beim Abbau werden nur die privaten freigegeben (die geteilten sind Kernel-Speicher).
+* **Ein Geraet, das nur schreibt, belegt nur das Schreiben.** `virtio-rng` galt als Beleg fuer "der
+  DMA-Pfad traegt" — er liest nie etwas von uns, die Leserichtung kam in seinem Testfall gar nicht
+  vor. Das trug bis in den Negativtest: dass der VT-d-Default-Block auch Lesezugriffe sperrt, war
+  eine ANNAHME. `virtio-blk` prueft sie (A-5.2). Dieselbe Form wie die leere Event-Queue ohne
+  `CD.R` — eine Aussage sieht wahr aus, weil der Fall, der sie widerlegen koennte, nie laeuft.
+* **Ein Schreiber, der sein eigenes Ergebnis bestaetigt, bestaetigt nichts.** Die
+  Dateisystem-PD las nach dem Schreiben zurueck und meldete Erfolg — mit derselben Sicht, mit der
+  sie geschrieben hatte. Dass sie nur EINE der zwei FAT-Kopien fortgeschrieben hatte, sah nur ein
+  **unabhaengiger** Leser (`tools/checkfat.py`, andere Sprache, Muster dort noch einmal
+  hingeschrieben statt importiert).
+* **Wer eine Fassung ersetzt, muss ihr ALLES geben, was die alte hatte.** Beim Hot-Reload fehlte
+  der neuen Fassung ein Endowment-Slot; sie brach korrekt ab, und der Austausch meldete
+  `NotReady` — was nach einem Zeitproblem aussieht und ein fehlendes Cap war. Eine
+  Endowment-Liste, die beim Ersetzen von der beim Erstladen abweicht, ist ein Riss.
+* **Rollen, die sich melden, brauchen getrennte Ablagen.** Root-Task, Treiber und Client teilten
+  sich eine Notification-Ablage; die zuletzt geladene PD ueberschrieb sie, und der Kernel wartete
+  auf ein Signal am falschen Objekt.
+* **Ein Urteil, das in `all_done()` steht, darf nicht erst im Bericht entstehen.** Sonst kann es
+  den Bericht nicht ausloesen: der Lauf laeuft in den Watchdog und druckt das Ergebnis trotzdem.
+  Im Log sieht das aus wie „gruen, aber gehangen". Zweimal an einem Tag passiert (A-6.1).
+* **Ein Test, der nirgends laeuft, ist kein Test.** `sel4lake-cap` hatte `#[cfg(test)]`-Module und
+  keinen Weg, sie auszufuehren (`cargo test -p` scheitert am erzwungenen Custom-Target). Seit
+  2026-08-02: `tools/host-tests.sh`.
+* **Wer eine Schleife begrenzt, pruefe zuerst, WELCHE begrenzt ist.** Hier war es der Pruefer und
+  nicht der Pfad, den ein Mandant ausloest.
+* **Eine Beschriftung, die neben der Sache herlaeuft, erzeugt Arbeit, die es nicht braucht.** Der
+  CI-Job hiess „Kani — Tier-1-Beweise (Loader-Parser)" und fuhr in Wahrheit alle vier Ziele. Daraus
+  wurde ein Todo-Eintrag ueber eine Luecke, die es nicht gab — waehrend die echte Luecke (Beweise
+  mit konkreten statt symbolischen Werten) unbenannt blieb.
+* **Ein Nebenlaeufigkeitsbeweis ohne verfolgte Zellen prueft nur die Atomics.** Loom sah eine
+  abgeschwaechte Speicherordnung im Ticket-Release nicht, solange `data` in einem
+  `core::cell::UnsafeCell` lag — die Veroeffentlichung der Nutzlast war gar nicht im Modell.
+  Gemessen: 0 von 6 gegen 2 von 6.
+* **Eine Suite, die einmal laeuft, misst nicht.** Die ARM-Seite hatte bis 2026-08-02 keine
+  Wiederholungsmessung, und ihre Ausgabe hing an einer **Pipe**, die beim SIGKILL verlorenging.
+  Das sah wie Kernel-Nichtdeterminismus aus (~30 %, jedes Mal eine andere Pruefung) und war die
+  Mechanik. **Zweite Schicht desselben Fehlers:** danach teilten sich alle Laeufe EINE Logdatei —
+  dann fehlten gelegentlich fruehe Bootzeilen, waehrend die Ergebniszeilen (und damit die
+  Signatur) vollstaendig blieben.
+* **Nur den Treiberteil einer Virtqueue zu nullen, reicht nicht.** `used` gehoert dem Geraet — aber
+  bei einer **wiederverwendeten** Region (Treiber-Austausch, A-5.1) steht dort noch der Endstand der
+  vorigen Fassung. Das Geraet faengt nach dem Reset wieder bei 0 an, die neue Fassung wartet auf
+  einen Fortschritt, der schon eingetreten ist, und laeuft in ihre Poll-Schranke. Sieht aus wie ein
+  stummes Geraet. Der Treiber initialisiert die **ganze** Queue, bevor er sie freigibt.
+* **Zwei Suiten, die dasselbe Geraet verschieden aufsetzen**, sind ein Riss: `test-qemu-x86.sh`
+  bekam `iommu_platform=on`, `test-qemu-x86-load.sh` nicht — die Lade-Suite lief in den Watchdog,
+  und es sah aus wie ein Haenger.
+* **Eine lokale IRQ-Sperre ist kein Fenster über eine geteilte Größe.** `loadstop` verglich
+  globale Zähler mit `local_irq_disable()` — ein Kern still, sieben laufen. Das ging gut, solange
+  nichts sonst passierte; mit dem Root-Task fiel ein fremder `free` (16 KiB) mitten hinein und
+  meldete FAILURES. Erst Ruhe feststellen, dann messen — und „nicht messbar" ist kein bestandener
+  Test.
+* **Zwei Zahlen, die aus derselben Hand kommen, sind keine zwei Quellen.** `boot_arg` gab dem
+  Root-Task die Archivgröße statt der Startmenge; auf x86 stimmten beide überein, weil dasselbe
+  Skript Archiv und Manifest erzeugte. Auf aarch64 (zehn Fremdmodule im Archiv) wäre die
+  Startmenge falsch gewesen.
+* **Ein reproduzierbarer Wert kann nicht belegen, dass er geerbt wurde.** Z4 Stufe 2 verglich
+  zuerst nur „gespeicherter Fortschritt == gefundener Fortschritt". Unter KVM ist der Hochlauf
+  deterministisch: derselbe Kernel erreicht an derselben Stelle 133…155 Runden, Streuung rund 20.
+  Eine Mutation, die den Wert **las und meldete, ohne ihn zu setzen**, traf ihn exakt (151 gegen
+  151) — gruene Suite, nichts wiederhergestellt. Die Nonce half nicht: sie belegt die **Herkunft
+  der Bytes**, nicht die **Wirkung** des Wiederherstellens. Zwei verschiedene Fragen, dieselbe
+  Unterscheidung wie `rx_used` gegen „Daten angekommen". Die Loesung war eine **wachsende Kette**
+  (jeder Lauf arbeitet +100 Runden weiter, Epoche + 1), damit der geerbte Wert strukturell
+  ausserhalb dessen liegt, was ein Lauf allein erreicht.
+* **Der Puffer eines Treibers gehoert dem LETZTEN Client, nicht der Aussage.** `drv : ALL PASS`
+  las den Datenpuffer der Treiber-PD **im Bericht** und verglich ihn mit der Plattenmagie. Das ging
+  gut, solange es genau einen Client gab; mit einem zweiten stand dort dessen Sektor, und die Zeile
+  meldete `FAILURES` fuer einen Treiber, der alles richtig gemacht hatte. Ein Wert wird dort
+  **erfasst, wo die Aussage gilt** — nicht dort, wo sie gedruckt wird.
+* **`wrapping_sub` auf einer Zeitdifferenz ist die teuerste bequeme Zeile.** Ein Zähler, der um
+  100 Zyklen zurückspringt, ergäbe rund `2^64` — ein Konto, das so belastet wird, ist sofort und
+  dauerhaft erschöpft. Rückwärts heisst **verworfen**, nicht „fast einmal herum".
+
+## Aufbau, grob
+
+| Ort | Inhalt |
+|---|---|
+| `kernel/src/system.rs` | Kern der Faehigkeitsverwaltung, IOVA-Fenster, Teardown-Token, Audit |
+| `kernel/src/addr.rs` | `Pa`, `Iova`, `DmaRegion` |
+| `kernel/src/dmatests.rs` | architekturneutrale DMA-Tests, von beiden Hochlaufwegen gefahren |
+| `kernel/src/arch/x86_64/bootinfo.rs` | `HandoverInfo` — eine Struktur, zwei Herkuenfte |
+| `kernel/src/arch/x86_64/dmar_selftest.rs` | synthetisches DMAR fuer den Selbsttest |
+| `crates/sel4lake-hal/` | `vtd`, `dmar`, `intc`, `timer`, `fault`, `iommu`-Fassade |
+| `crates/sel4lake-cap/src/space.rs` | `Finalized`, CDT, `delete_leaf` |
+| `crates/sel4lake-cap/src/checkpoint.rs` | Z4: die Verweigerungsregel (`classify`) **und** das Checkpoint-Format (`Image`, CRC-32). Abhaengigkeitsfrei, ohne `unsafe`, host-getestet — ein Checkpoint ist Eingabe, kein Zustand |
+| `crates/sel4lake-virtio/` | virtio: `Transport` + `Queue`, darauf `rng`/`blk`/`net`, plus `probe_ecam`. **Ohne jede Abhaengigkeit** — wird von der Treiber-PD gelinkt (A-5.1) |
+| `programs/hardware/virtio-blk/` | **der erste Treiber ausserhalb des Kerns** (A-5.1): loest sein Geraet selbst auf, bedient Anfragen ueber seinen Kanal, austauschbar im Betrieb; seit A-6 auch Blockdienst + GPT-Scan |
+| `crates/sel4lake-part/` | GPT-Parser (A-6.2). Abhaengigkeitsfrei, `forbid(unsafe_code)`, host-getestet — fremde Plattenbytes gehoeren nicht in den Kern |
+| `crates/sel4lake-fat/` | FAT16-Parser (A-6.3), ebenso |
+| `programs/trusted/fs/` | **Dateisystem-PD** (A-6.3): faehrt kein Geraet, ruft den Blockdienst |
+| `tools/mkgpt.py` | baut die GPT-Testabbilder, auch **kaputte** (`--break`) — beide Suiten benutzen dasselbe Werkzeug |
+| `kernel/src/colors.rs` | Farbzuteilung, `run_color`, Prime+Probe (B-4.5) — arch-neutral |
+| `crates/sel4lake-sched/src/cycles.rs` | Zyklenabrechnung (B-5.1) — **ohne jede Abhaengigkeit**, damit die Fallen mit Literalen statt mit einer Maschine ausloesbar sind |
+| `tools/kernel-grenze.sh` | prueft, dass keine Treiber in die HAL wandern; mit Selbsttest |
+| `tools/host-tests.sh` | die Host-Tests der reinen Crates an **einem** Ort (`sel4lake-cap` lief vorher nirgends) |
+| `tools/handover/` | Linux-Kernelmodul fuer die Kern-Uebergabe (Variante B) |
+
+## Wenn du hier auf dem Server arbeitest
+
+Diese Kopie enthaelt **kein `target/`** und keine grossen Testdaten — siehe `../MEMORY.md`.
+Ein fehlendes Bauverzeichnis ist Absicht, kein Defekt. Der erste Build dauert entsprechend.
+
+## Der naechste Schritt
+
+**Strang A-5 ist zu.** Zwei Treiber-PDs, jede mit ihrem im Manifest benannten Geraet, und die
+Trennung zwischen ihnen ist gemessen statt behauptet (A-5.4).
+
+Alles Weitere in `todo.md` — lesen, nicht raten. Zwei Dinge, die unmittelbar anschliessen:
+
+* **`CAP_IRQ` fuer Treiber** braucht eine **IRTE-Vergabe** — die Interrupt-Remapping-Tabelle steht
+  seit B-3.2 auf lauter „not present", und das ist Absicht. Bis dahin pollt jeder Treiber. Das ist
+  B-3-Arbeit, nicht A-5.
+* **Das Geraete-ANGEBOT ist noch virtio-gebunden**: der Kernel findet Kandidaten ueber
+  `hal::pcie::find(VIRTIO_VENDOR, …)`, weil die BAR-Bestimmung durch `probe_transport` geht. Die
+  Auswahl steht seit A-5.3 sauber im Manifest, das Angebot nicht.

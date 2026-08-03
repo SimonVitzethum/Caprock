@@ -1045,6 +1045,92 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
 - [ ] **D4** Verus laut `docs/verification.md` offen: `delete_leaf` auf der vereinten Struktur,
       Kinderlisten-Erreichbarkeit, danach Scheduler/IPC.
 
+- [ ] **D8 FEHLER, GEMESSEN: ein erschöpfter Thread kommt über `unblock` zurück in die
+      Ready-Liste und läuft auf leerem Konto — ohne jede Cap.** (2026-08-03)
+      **Klasse:** Fehler · **Aufwand:** Behebung liegt vor und ist gemessen, aber sie hat drei
+      Teile und eine falsche Fassung ist schlimmer als der Fehler.
+
+      Werkzeug: `tools/sched-erschoepfung-messen.sh` (~3 s, 96 Messwerte, `--nur-echt` für den
+      Einzellauf). Der **echte** `crates/sel4lake-sched/src/lib.rs` wird gelinkt — genau eine
+      Zeile unterscheidet den Harness vom Original (`#![no_std]`), Stellvertreter ist nur
+      `init_thread_frame`. Keine Zweitfassung des Schedulers.
+
+      **Die Kette, und sie braucht kein Privileg.** Der PDCTL-Weg (PAUSE → RESUME) verlangt eine
+      `PdControl`-Cap. Der zweite nicht:
+      `switch_to` setzt beim IPC-CALL `blocked = true` am **Aufrufer** und spendet dem Server
+      dessen Konto (`sc_donor`) → `on_tick` belastet über `acct = sc_donor.unwrap_or(cur)` und
+      setzt `depleted = true` **am blockierten Aufrufer** → `reply` ruft `ops.unblock(caller)`
+      (`sel4lake-ipc:653`) → `unblock` (`sched:658`) prüft `depleted` nicht →
+      `enqueue_ready` (`sched:1099`) auch nicht.
+
+      | Gemessen (M1 / M2) | Wert |
+      |---|---|
+      | in der Ready-Liste, **Liste gelaufen** statt `queued` gelesen | 1 |
+      | dabei `depleted` / `remaining` | 1 / 0 |
+      | `audit()` | **0** |
+      | Alternative im Augenblick der Wahl bereit | 1 |
+      | wird `current`, verbraucht eine volle Zeitscheibe | 1 |
+
+      **Warum die Aussage das Paar braucht.** „Läuft auf leerem Budget" allein kann denselben
+      Wert aus einem anderen Grund annehmen: ist **kein anderer Thread lauffähig** (M6), lässt
+      `dequeue_highest` `current` stehen, und `depleted_count` wächst auch ohne jedes `unblock`.
+      Deshalb trägt erst **„wird `current`" ∧ „eine Alternative stand im selben Augenblick
+      bereit"**. Dieselbe Unterscheidung wie bei Z4 („der Wert stimmt" gegen „der Wert wurde
+      geerbt").
+
+      **Korrektur an der ersten Herleitung.** „`depleted_count` wächst bei jedem Tick" stimmt
+      **nicht**: nach dem erneuten Erschöpfen setzt `on_tick` `requeue = false`, der Thread ist
+      wieder off-queue und läuft nicht von selbst weiter. Der Zuwachs ist **+1 je
+      PAUSE/RESUME-Paar** (M3a: 6 Runden → `depleted_count` 7 bei **einem** echt erschöpften
+      Konto), `next_refill` verschiebt sich um genau die eine dabei verbrauchte Tick.
+      Kontrolle M3b (dieselben Ticks ohne PAUSE/RESUME): Zähler bleibt 1, keine Drift.
+
+      **Die Folge, die bleibt (M5).** Nach vollständigem Refill steht `depleted_count = 3` bei
+      **0** wirklich erschöpften Konten. Der Zähler kehrt nie auf 0 zurück ⇒
+      `if self.depleted_count > 0 { self.refill_depleted(); }` ist **dauerhaft wahr**, der
+      O(n)-Scan läuft ab da in jedem Tick. Die Zusicherung im Kommentar darüber — „der Tick
+      kostet nichts, unabhängig von der Tabellengröße" — fällt damit.
+
+      **Gegenprobe.** Mit dem Wächter verschwindet **jede** M1/M2/M3a/M5-Wirkung; die
+      M4/M4b/M6-Werte bleiben. Der Test misst also genau diese Ursache und trennt sie sauber von
+      der anderen.
+
+      **Zweiter, unabhängiger Fehler (M4): PAUSE hält nicht.** `refill_depleted` reiht **ohne
+      `!blocked`-Prüfung** wieder ein. Gemessen: erschöpfen → PAUSE → 100 Ticks → der
+      **pausierte** Thread (`blocked = 1`) wird `current` und verbraucht eine Zeitscheibe,
+      `audit()` = 0. Dafür braucht es kein `unblock`. Steht ein höher priorisierter Läufer
+      daneben (M4b), bleibt er mit `blocked = 1` in der Ready-Liste und `audit()` = **2** — das
+      belegt zugleich, dass `audit()` sprechfähig ist und in M1 **geschwiegen** hat.
+
+      **Behebung — drei Teile, und die naheliegende Fassung ist die falsche.**
+      1. `if blocked && !depleted { … }` ist **schädlich** (gemessen als G-a): der Rumpf wird
+         übersprungen, `blocked` bleibt `true`, das RESUME wird verschluckt. Zusammen mit der
+         Behebung von M4 (G-d) misst man `ticks_mit_budget = 0`, `ende.blocked = 1` —
+         **vollständiges Verhungern.** Die halbe Behebung, die schlimmer ist als der Befund.
+      2. Richtig und modellgleich (G-b):
+         ```rust
+         if self.tcbs[s].blocked {
+             self.tcbs[s].blocked = false;
+             if !self.tcbs[s].depleted { self.enqueue_ready(s); }
+         }
+         ```
+         Wer ihn danach einreiht, ist gemessen: `refill_depleted` (M7: 2 Refills, 6 Ticks mit
+         echtem Budget, am Ende nicht blockiert). Kein Verhungern.
+      3. Dazu G-c in `refill_depleted`, sonst bleibt M4 stehen:
+         `_ => { if !self.tcbs[slot].blocked && self.current != Some(slot) { self.enqueue_ready(slot); } }`
+      4. Und **B2 schließen**: `audit()` braucht im Queue-Lauf ein `if t.depleted { return <neuer
+         Code> }`. Ohne das bleibt genau der Zustand unbeobachtbar, der die Aussage widerlegt —
+         dieselbe Form wie die leere Event-Queue ohne `CD.R`.
+
+      **Offen und ungeprüft:** der Donee-Zweig in `refill_depleted`
+      (`self.tcbs[d].blocked = false; enqueue_ready(d)`) setzt `blocked` bedingungslos zurück —
+      dieselbe Frage, nicht gemessen.
+
+      **Auch das noch nicht gemessen:** dass die Kette in einem *laufenden* Kernel eintritt.
+      Gemessen ist die Zustandsmaschine am echten `Scheduler`; die Erreichbarkeit aus dem
+      Syscall ist aus dem Quelltext argumentiert (`system.rs:6588`, `system.rs:2743`,
+      `sel4lake-ipc:653`), nicht end-to-end ausgelöst.
+
 - [ ] **D7 Das IPC-Modell trägt für den echten Endpoint nur einen Ausschnitt — gemessen, nicht
       geschätzt** (2026-08-03, `tools/verus-modelltreue-ipc.sh`, 32 Fälle · 12 Selbsttestfälle).
 

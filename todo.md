@@ -893,6 +893,50 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
 ---
 ## D. Verifikation
 
+- [ ] **KEIN CI-RUNNER — alle Gates warten (2026-08-03). Das ist der Rest eines Befunds, dessen
+      erste zwei Schichten heute zu sind.** Der Reihe nach, weil jede Schicht die nächste verdeckt
+      hat:
+
+      | # | Befund | Stand |
+      |---|---|---|
+      | 1 | Gates lagen in `.gitea/workflows/`, der Server ist **GitLab** — er liest das nicht | **behoben**: `.gitlab-ci.yml` |
+      | 2 | `.gitea/workflows/kani.yml` war seit Anlage **ungültiges YAML** (`: ` im Jobnamen, Z. 63 Sp. 49) | **behoben** + `tools/ci-yaml.sh` mit Selbsttest |
+      | 3 | **kein Runner registriert** | **offen — hier** |
+
+      Gemessen, nicht vermutet: Pipeline 5 stand **284 s** in der Warteschlange, alle sechs Jobs
+      `pending`, `runner=None`, `tag_list` leer. Ein registrierter Runner greift binnen Sekunden
+      zu. Die Runner-API (`/projects/2/runners`) braucht ein Token, das hier nicht vorliegt —
+      **welcher** Runner fehlt (kein Runner / falsche Tags / `paused`), ist damit noch nicht
+      auseinandergehalten.
+
+      Vor dem Push existierten **zwei** Pipelines in der ganzen Projektgeschichte, beide vom
+      2026-05-23, beide auf `main`, beide mit GitLabs Auto-DevOps-Vorlage
+      (`semgrep-sast`, `container_scanning`, `code_quality`, `build`, `test`) — nie mit unseren
+      Gates.
+
+      **Warum das mehr ist als eine Konfigurationsaufgabe.** Der Verus-Beweis in `cap_space.rs`
+      war 37 Tage rot, während der zugehörige Commit „delete (Leaf) gegen die VOLLE cap_inv
+      bewiesen" hieß und der README „10 verified" behauptete. Die naheliegende Erklärung war
+      „gelaufen, aber niemand hat hingesehen". Sie ist falsch: **es gab nichts zu sehen.**
+      Ein Gate, das auf keinem Server steht, ist keine schwächere Zusicherung, sondern keine —
+      und es ist von einem grünen Gate äußerlich nicht zu unterscheiden. Das ist dieselbe Form
+      wie die leere Ereigniswarteschlange ohne `CD.R`.
+
+      **Abnahmebedingung — und sie ist absichtlich nicht „die CI ist grün":** eine Pipeline-ID
+      vorzeigen können, deren `verus`-Job **gelaufen** ist. Dazu drei Fälle, die
+      auseinandergehalten gehören, weil sie von außen gleich aussehen:
+      (a) keine Pipeline → Konfiguration nicht gefunden;
+      (b) Pipeline mit `pending`-Jobs → kein Runner (der Fall heute);
+      (c) Jobs mit Ergebnis → erst hier sagt grün etwas.
+
+      Nebenpunkt, sobald ein Runner läuft: der `verus`-Job fährt `--selftest` **vor** dem
+      eigentlichen Lauf. Wenn der Selbsttest grün ist, aber der Hauptlauf auch — dann erst ist
+      belegt, dass das Gate fehlschlagen *kann* und trotzdem nicht fehlschlägt.
+
+      Eigene Falle dabei, für den nächsten, der misst: **jeder Push bricht die vorige Pipeline
+      desselben Zweigs ab.** Pipeline 4 und 5 gingen so auf `canceled` — das sah nach „Runner
+      hat abgelehnt" aus und war mein eigener nächster Commit.
+
 - [ ] **Zyklenzähler weiterführen** (Stufe 1 teilweise erledigt): `hal::timer::cycles()` /
       `cycles_per_sec()` / `invariant_tsc()` stehen auf beiden Architekturen, serialisierend und
       gegen den PIT kalibriert. Offen: die per-TCB-Abrechnung (`consumed_cycles`, gestempelt beim

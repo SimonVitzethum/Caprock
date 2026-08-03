@@ -325,6 +325,17 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   CI-Job hiess „Kani — Tier-1-Beweise (Loader-Parser)" und fuhr in Wahrheit alle vier Ziele. Daraus
   wurde ein Todo-Eintrag ueber eine Luecke, die es nicht gab — waehrend die echte Luecke (Beweise
   mit konkreten statt symbolischen Werten) unbenannt blieb.
+* **Ein Bit, das zwei Gruende traegt, macht den Wecker unbestimmbar.** Im Scheduler hiess
+  `blocked` gleichzeitig „pausiert", „wartet in IPC" und „wartet auf Konto-Refill". Wer die
+  Blockade aufhebt, hebt damit auch eine auf, deren Grund er nicht kennt — und wer sie stehen
+  laesst, laesst einen Thread liegen, dessen Wecker weggefallen ist. Vier der fuenf D9-Befunde
+  hingen daran (gemessen: 0 Ticks in 3 Perioden, `audit() == 0`). Die Behebung war nicht ein
+  weiterer Waechter, sondern ein eigenes Bit fuer den GRUND.
+* **Ein Zeiger auf „den" Empfaenger einer Spende ist falsch, sobald Spenden schachteln.**
+  `sc_donee` hielt genau einen Slot. Der zweite CALL ueberschrieb ihn, der innere REPLY loeschte
+  ihn — danach wartete der mittlere Server auf einen Wecker, den es nicht mehr gab. Genau die
+  Kette `fs -> Blockdienst -> Treiber`, die dieses Projekt selbst faehrt, und ohne jedes
+  Privileg: zwei CALLs und ein REPLY. Eine Spende ist ein STAPEL; `sc_donee` war nur die Spitze.
 * **Die naheliegende Fassung eines Waechters kann schlimmer sein als der Fehler.** D8: `unblock`
   reihte einen ERSCHOEPFTEN Thread bedingungslos ein. Die offensichtliche Behebung
   `if blocked && !depleted { .. }` ueberspringt aber auch `blocked = false` — das RESUME wird

@@ -1140,8 +1140,76 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       Syscall ist aus dem Quelltext argumentiert (`system.rs:6588`, `system.rs:2743`,
       `sel4lake-ipc:653`), nicht end-to-end ausgelöst.
 
-- [ ] **D9 Der DONEE-Zweig in `refill_depleted` — gemessen am 2026-08-03, fünf Befunde, keiner
-      behoben.** Werkzeug: `tools/sched-erschoepfung-messen.sh` (jetzt **208 Messwerte**, die
+- [ ] **D10 Der Refill kostet seit H-b einen VOLLEN Tabellendurchlauf je aufgefülltem Konto —
+      gelesen, nicht gemessen.** (2026-08-03) **Klasse:** Leistung/Zusicherung · **Aufwand:**
+      Messfall mit großer Tabelle, dann ein Zähler nach dem Muster von `depleted_count`.
+
+      Die neue Schleife (`refill_depleted`, `for d in 0..self.tcbs.len()`) liegt **innerhalb** der
+      bestehenden Schleife über die Thread-Tabelle. `Slab::len()` ist die **Tabellengröße**, nicht
+      die Belegung — laut A-3.4 sind das **10 000** Slots.
+
+      | | |
+      |---|---|
+      | **sicher** (steht im Code) | ein Refill kostet ab jetzt 10 000 Iterationen statt einer konstanten Zahl |
+      | **nicht belegt** | ob „viele Konten refillen im selben Tick" (→ O(n²), 10⁸ Iterationen in einem Timer-Interrupt) erreichbar ist |
+
+      Dagegen spricht, dass pro Kern und Tick höchstens **ein** Konto erschöpft und `next_refill`
+      an die Erschöpfungszeit gekoppelt ist — die Refills verteilen sich von selbst. Gemessen ist
+      das nicht.
+
+      **Beschädigt ist eine ausgesprochene Zusicherung.** Der Kommentar in `on_tick` sagt:
+      „Refill-Scan NUR, wenn überhaupt ein Konto erschöpft ist (Normalfall: keins → der Tick
+      kostet nichts, **unabhängig von der Tabellengröße**)." Das gilt so nicht mehr.
+
+      **Die naheliegende Abkürzung funktioniert nicht:** „nur laufen, wenn `sc_donee.is_some()`"
+      reißt D5 sofort wieder auf — dort ist `sc_donee` gerade `None`, während Donees warten. Das
+      ist der ganze Punkt von H-b. Es braucht einen eigenen Zähler `budget_blocked_count`.
+
+      **Bewusst NICHT sofort gebaut.** Zähler haben am selben Tag schon einmal gelogen
+      (`depleted_count`, D8/M5), und ungemessenen Code nachzuschieben wäre genau der Fehler, den
+      D8 und D9 vermieden haben. Reihenfolge: erst ein Messfall mit großer Tabelle, der die Kosten
+      **zeigt**, dann der Zähler, dann die Gegenprobe.
+
+      Zwei kleinere Stellen derselben Änderung, ebenfalls neu O(n) statt O(1), aber nicht im
+      Tick-Pfad: `record_zombie` (je Thread-Tod) und `set_budget` (nur im `was_depleted`-Zweig).
+
+- [x] **D9 BEHOBEN am 2026-08-03 (H-b): der DONEE-Zweig — fünf Befunde, alle gemessen und alle
+      behoben.** Der Kern der Behebung ist ein neues TCB-Bit `budget_blocked`, das den **Grund**
+      einer Blockade trägt: bis dahin teilten sich „pausiert", „wartet in IPC" und „wartet auf
+      Konto-Refill" ein einziges `blocked`, und daran hingen D1, D4, D5 und D7. Dazu wird die
+      Spende als **Stapel** behandelt — `refill_depleted` weckt alle mit
+      `sc_donor == slot && budget_blocked` statt des einen `sc_donee`, den der zweite CALL
+      überschreibt und der innere REPLY löscht (das ist D5).
+
+      | Messgröße | vorher | nachher |
+      |---|---|---|
+      | `D1.pausierter_ist_current` (PAUSE hält) | 1 | **0** |
+      | `D4.ticks_donee_lief` (Konto stirbt) | 0 | **299** |
+      | `D5.ticks_mid_lief` (verschachtelte Spende) | 0 | **6** |
+      | `D6.wird_current` / `zaehler_luegt_um` | 1 / 1 | **0 / 0** |
+      | `D7.ticks_donee_lief` | 0 | **9** |
+      | `M1`/`M4`/`M5` (D8 — keine Regression) | 0 | **0** |
+      | `M7.ticks_mit_budget` (kein Verhungern) | 6 | **6** |
+      | Positivkontrolle P2 | bestanden | **bestanden** |
+
+      x86-Suite, Lade-Suite, Host-Tests, Verus + drei Wächter: alle grün. **500 Läufe** (5 × 100)
+      mit derselben Signatur `e419003d625f` wie vor D8 und vor H-b.
+
+      **Was H-b NICHT ist: ein Verus-Beweis.** `budget_blocked` ist als **außerhalb** eingetragen,
+      weil es vollständig zum Spenden-Mechanismus gehört und Donation laut ADR 0019 außerhalb des
+      Modells liegt. Die Kehrseite gehört benannt: `roundrobin_no_starve` und `no_lost_thread`
+      gelten damit für eine Welt **ohne** Spende — und genau in der Spende lagen D4, D5 und D7.
+      Ein gestrandeter Donee ist `depleted == false`, in keiner Liste, `audit() == 0`; er fällt
+      durch **jede** dieser Zusicherungen hindurch, weil sie über ihn gar nicht sprechen. Der
+      Beleg für H-b ist `sched-erschoepfung-messen.sh`, nicht Verus. Wer das ändern will, braucht
+      ein Modell **mit** Donation.
+
+      Neuer Aufwand daraus: **D10** (der Refill kostet jetzt einen vollen Tabellendurchlauf).
+
+      Die Herleitung und alle Zahlen der fünf Befunde stehen unverändert darunter.
+
+- [ ] **D9 (Herleitung) Der DONEE-Zweig in `refill_depleted` — gemessen am 2026-08-03, fünf
+      Befunde.** Werkzeug: `tools/sched-erschoepfung-messen.sh` (jetzt **208 Messwerte**, die
       D-Reihe kam dazu). Der echte `crates/sel4lake-sched/src/lib.rs` wird gelinkt; Mutationen
       nur auf Kopien.
 

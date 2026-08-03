@@ -52,12 +52,19 @@
 #   [4] AUDIT.        `Scheduler::audit` ist die Laufzeitseite derselben Kopplung. Jeder
 #                     Rueckgabecode mit seiner Bedingung ist eingetragen; ausserdem, WELCHE
 #                     Teilaussage von `ridx`/`bidx`/`current_valid` von welchem Code getragen wird
-#                     -- und welche von KEINEM. Genau dort sitzen die Befunde B2/B3/B4.
+#                     -- und welche von KEINEM. Dort sassen die Befunde B2 (behoben, Code 9),
+#                     B3 und B4.
 #                     Damit diese Zuordnung nicht ueber einem Text redet, der sich unbemerkt
 #                     verschiebt, sind die sieben Praedikate des Modells (`runnable`, `ridx`,
 #                     `bidx`, `current_valid`, `coupled`, `budget_inv`, `sched_inv`) hier
 #                     eingefroren. Wer `runnable` das `!t.depleted` nimmt, schwaecht die bewiesene
 #                     Aussage -- ohne dieses Register faellt das nirgends auf.
+#                     Und die Gegenrichtung, seit 2026-08-03 fuer B2/B3/B4 vollstaendig: zu jedem
+#                     „das hat KEINEN Audit-Code" gehoert eine Meldung, die anschlaegt, sobald es
+#                     doch einen gibt. Sie haengt am REGISTER, nicht an der Beobachtung -- sonst
+#                     schriee sie ab dem Tag der Behebung fuer immer, wuerde abgeschaltet und
+#                     schwiege dann auch beim naechsten echten Fall (CLAUDE.md, Fallenliste).
+#                     Zwei Selbsttestfaelle (`erwarte_meldung`) belegen, dass sie sprechen kann.
 #
 # ------------------------------------------------------------------------------------------------
 # WAS DIESER WAECHTER NICHT PRUEFT -- ausdruecklich
@@ -75,21 +82,53 @@
 #     laesst sich nicht mechanisch verhindern -- deshalb steht es hier.
 #
 # ------------------------------------------------------------------------------------------------
-# BEFUNDE beim ersten Lauf (2026-08-03) -- gemeldet, NICHT behoben, `lib.rs` unangetastet
+# BEFUNDE beim ersten Lauf (2026-08-03) -- Stand des Registers am 2026-08-03 nach D8 und H-b/D9
 # ------------------------------------------------------------------------------------------------
-#   B1  `unblock` reiht **ohne** `depleted`-Pruefung wieder ein; das Modell setzt
-#       `in_ready: !t.depleted`. Ein Thread, der blockiert UND erschoepft ist, landet im Code in der
-#       Ready-Liste -- `ridx` waere verletzt. Und `audit` sieht es nicht (s. B2).
-#   B2  Die Richtung „in der Queue ==> nicht erschoepft" hat **keinen** Audit-Code. `audit` prueft
-#       im Queue-Lauf `used` (1), `blocked` (2) und `current` (4), aber nie `depleted`.
-#   B3  `bidx` (Restbudget <= Budget, erschoepft ==> Rest 0, budget==0 ==> nicht erschoepft) hat
-#       ueberhaupt keine Laufzeitentsprechung: `audit` liest weder `budget` noch `remaining`.
-#   B4  `pause` deplaniert den laufenden Thread NICHT (nur `blocked = true`); das Modell setzt
-#       `current: None`. Der Kommentar am Modell nennt das eine Abstraktion („der naechste Tick
-#       deplaniert ihn") -- bis dahin ist `current_valid` im Code verletzt.
-#   B5  `switch_to` (IPC-Fastpath) schreibt `blocked` an ZWEI Threads und wechselt `current`, hat
-#       aber keinen Uebergang im Modell. Ebenso `exit_current`, `kill`, `spawn*`, `init_core`,
-#       Migration und `record_zombie`.
+#   B1  BEHOBEN (D8, 2026-08-03). Stand hier als: „`unblock` reiht **ohne** `depleted`-Pruefung
+#       wieder ein, das Modell setzt `in_ready: !t.depleted`". Der Waechter fuehrt den Befund
+#       weiter, weil die BEDINGUNG dahinter weiter gilt -- der Eintrag steht jetzt am Paar
+#       `unblock` unten, samt der Fassung, die es NICHT geworden ist (`if blocked && !depleted`).
+#   B2  BEHOBEN (D8, 2026-08-03) als **Audit-Code 9**. Stand hier als: „die Richtung „in der Queue
+#       ==> nicht erschoepft" hat keinen Audit-Code". Die Veraltungsmeldung dazu weiter unten ist
+#       an das Register gekoppelt, nicht an die Beobachtung -- s. dort, warum das der Unterschied
+#       zwischen einem Waechter und einem abgeschalteten Waechter ist.
+#   B3  OFFEN. `bidx` (Restbudget <= Budget, erschoepft ==> Rest 0, budget==0 ==> nicht erschoepft)
+#       hat ueberhaupt keine Laufzeitentsprechung: `audit` liest weder `budget` noch `remaining`.
+#   B4  OFFEN, und H-b hat daran NICHTS geaendert (nachgesehen 2026-08-03): `pause` deplaniert den
+#       laufenden Thread weiterhin NICHT (nur `blocked = true`, seit H-b davor noch
+#       `budget_blocked = false`); das Modell setzt `current: None`. Der Kommentar am Modell nennt
+#       das eine Abstraktion („der naechste Tick deplaniert ihn") -- bis dahin ist `current_valid`
+#       im Code verletzt. Auch dieser Eintrag hat jetzt eine an das Register gekoppelte
+#       Veraltungsmeldung: faengt `pause` an zu deplanieren, sagt der Waechter, dass B4 weg kann.
+#   B5  OFFEN. `switch_to` (IPC-Fastpath) schreibt `blocked` an ZWEI Threads und wechselt
+#       `current`, hat aber keinen Uebergang im Modell. Ebenso `exit_current`, `kill`, `spawn*`,
+#       `init_core`, Migration und `record_zombie` -- letzteres seit H-b mit deutlich mehr
+#       Wirkung (es loest ALLE Empfaenger einer Spende und weckt sie).
+#
+# ------------------------------------------------------------------------------------------------
+# H-b / D9 (2026-08-03) -- WAS DAS NEUE FELD `budget_blocked` DIESEM MODELL KOSTET
+# ------------------------------------------------------------------------------------------------
+# H-b traegt den GRUND einer Blockade mit: `Tcb.budget_blocked` heisst „blockiert, WEIL das
+# belastete Konto leer ist" -- im Unterschied zu einer Blockade aus IPC oder PAUSE. Das Feld ist
+# hier als **ausserhalb des Modells** eingetragen (TCB_AUSSERHALB), NICHT als achtes Modellfeld.
+#
+# Der Grund ist kein Bequemlichkeitsgrund: `budget_blocked` wird ausschliesslich an Stellen
+# gesetzt und gelesen, an denen ein Thread gegen ein **fremdes** Konto laeuft (`sc_donor`). Es
+# gehoert damit vollstaendig zur Budget-Donation, und die ist laut ADR 0019 bereits ausserhalb --
+# aus genau diesem Grund steht der Donation-Zweig in `refill` seit dem ersten Lauf so eingetragen.
+# Ein Feld ins Modell zu heben, dessen einziger Zweck ein Mechanismus ist, den das Modell nicht
+# kennt, hiesse: sieben neue Zeilen Spezifikation, die ueber nichts reden, was das Modell
+# entscheiden kann.
+#
+# **Die Kehrseite, und sie gehoert benannt statt verdeckt.** Damit gilt die Liveness-Aussage des
+# Modells -- `roundrobin_no_starve` („budget == 0 ==> nie erschoepft ==> bleibt einplanbar") und
+# `no_lost_thread` -- fuer eine Welt OHNE Spende. In genau der Spende lagen aber D4/D5/D7: ein
+# Donee, den niemand mehr weckt, ist gemessen nicht erschoepft (`depleted == false`), nicht in
+# einer Liste und `audit() == 0` -- er faellt durch jede dieser Zusicherungen hindurch, weil sie
+# ueber ihn gar nicht sprechen. Was H-b behebt, behebt es also UNTERHALB dieses Modells; der
+# Beleg dafuer ist `tools/sched-erschoepfung-messen.sh`, nicht Verus.
+# Wer das aendern will, braucht ein Modell MIT Donation (`sc_donor` als Feld, `switch_to` und
+# `end_donation` als Uebergaenge) -- das ist eine eigene Arbeit, keine Zeile hier.
 #
 # Aufruf:
 #   tools/verus-modelltreue-sched.sh              # pruefen + Selbsttest
@@ -144,6 +183,13 @@ TCB_AUSSERHALB = {
     'next_refill': 'Refill-Zeitpunkt -- dito',
     'sc_donor':    'Budget-Donation (ADR 0019: ausserhalb)',
     'sc_donee':    'dito',
+    # H-b/D9, 2026-08-03. Die Entscheidung ist im Dateikopf begruendet -- kurz: das Feld wird
+    # ausschliesslich dort gesetzt und gelesen, wo ein Thread gegen ein FREMDES Konto laeuft, es
+    # gehoert also ganz zur Donation, und die ist bereits ausserhalb. Der Preis dafuer steht
+    # ebenfalls im Kopf: die Liveness-Aussage des Modells gilt damit fuer eine Welt ohne Spende.
+    'budget_blocked':
+                   'H-b: der GRUND einer Blockade („wartet auf den Refill eines FREMDEN Kontos") '
+                   '-- Teil der Budget-Donation, ADR 0019: ausserhalb',
     'cyc':         'Zyklenabrechnung (B-5.1) -- Messung, nicht Einplanung',
     'stamp':       'dito',
 }
@@ -203,14 +249,16 @@ PAARE = [
         luecke=[
             '-WENN #aufloesbar',
             '-WENN ziel.blocked',
+            '-WENN ziel.#budget_blocked',
+            '-WENN konto != ziel && konto.depleted',
             ' SETZE ziel.blocked := false',
         ],
-        ausserhalb=[],
-        grund='NUR NOCH EIN DING, und das ist die gute Nachricht. `WENN #aufloesbar` + '
-              '`WENN ziel.blocked` sind die Aufloesung des Handles und die Idempotenz; das Modell '
-              'sagt in seinem Kommentar ausdruecklich, es spezifiziere nur den blockierten Fall. '
-              'Das ist eine Abstraktion, keine Abweichung. '
-              'BEFUND B1 IST BEHOBEN (2026-08-03): hier stand '
+        ausserhalb=['ziel.#budget_blocked := true'],
+        grund='Vier Zeilen, und sie zerfallen in zwei Paare mit sehr verschiedenem Gewicht. '
+              '(a) `WENN #aufloesbar` + `WENN ziel.blocked` sind die Aufloesung des Handles und '
+              'die Idempotenz; das Modell sagt in seinem Kommentar ausdruecklich, es spezifiziere '
+              'nur den blockierten Fall. Das ist eine Abstraktion, keine Abweichung. '
+              'BEFUND B1 IST BEHOBEN (2026-08-03, D8): hier stand '
               '`+WENN !ziel.depleted` als echte Abweichung -- der Code reihte BEDINGUNGSLOS ein, '
               'das Modell nur, wenn nicht erschoepft. Gemessen mit '
               '`tools/sched-erschoepfung-messen.sh` (D8): ein erschoepfter Thread lief danach eine '
@@ -218,7 +266,22 @@ PAARE = [
               'erreichbar OHNE Cap ueber die IPC-Donation. `unblock` traegt den Waechter jetzt '
               'INNERHALB des Rumpfes -- die Fassung `if blocked && !depleted` waere schaedlich '
               'gewesen (RESUME verschluckt, zusammen mit dem refill-Waechter: vollstaendiges '
-              'Verhungern, gemessen). Code und Modell decken sich an dieser Stelle jetzt.',
+              'Verhungern, gemessen). Das Einreihen selbst deckt sich seitdem. '
+              '(b) NEU seit H-b (2026-08-03, D9): `WENN ziel.#budget_blocked`, '
+              '`WENN konto != ziel && konto.depleted` und der wegabstrahierte '
+              '`ziel.#budget_blocked := true`. Alle drei reden ueber das KONTO, gegen das der '
+              'Thread belastet wird (`sc_donor.unwrap_or(s)`) -- also ueber Donation, ADR 0019: '
+              'ausserhalb. Das Modell hat fuer diesen Fall keinen Begriff; es kennt nur '
+              '`t.depleted` AM THREAD SELBST, und genau das war D6: der D8-Waechter fragte den '
+              'Thread, belastet wurde das fremde Konto. '
+              'Warum das `ridx` nicht bricht: in beiden neuen Zweigen kehrt `unblock` zurueck, '
+              'OHNE `blocked` zu loeschen und OHNE einzureihen -- beide Seiten der Kopplung '
+              'bleiben unveraendert, der Thread ist weiter blockiert und weiter nicht in der '
+              'Liste. Fuer das Modell sieht das aus wie ein `unblock`, das nichts tut. '
+              'Was es aber sehr wohl beruehrt, ist LIVENESS, und die traegt dieses Modell hier '
+              'nicht: dass den Thread jemand wieder weckt, haengt daran, dass '
+              '`refill_depleted`/`set_budget`/`record_zombie` genau `budget_blocked` aufloesen. '
+              'Bewiesen ist das nirgends, gemessen ist es (D5 6 Ticks, D7 9, D4 299).',
     ),
     dict(
         name='pause',
@@ -232,12 +295,25 @@ PAARE = [
             '+WENN LAEUFT == ziel',
             '+LAEUFT := keiner',
         ],
-        ausserhalb=[],
+        ausserhalb=['ziel.#budget_blocked := false'],
         grund='Handle-Aufloesung + Idempotenz auf der Codeseite; auf der Modellseite die '
               'Deplanierung des laufenden Threads (BEFUND B4). Der Code laesst einen pausierten '
               '`current` stehen, bis der naechste Tick ihn nicht wieder einreiht -- in diesem '
               'Fenster ist `current_valid` im Code falsch. Das Modell nennt das eine Abstraktion; '
-              'es ist eine, aber eine mit einem beobachtbaren Fenster.',
+              'es ist eine, aber eine mit einem beobachtbaren Fenster. '
+              'NEU seit H-b (2026-08-03, D9): der wegabstrahierte `ziel.#budget_blocked := false` '
+              '-- **PAUSE UEBERNIMMT die Blockade**. Er steht VOR `if !ziel.blocked` und ist '
+              'deshalb kein Teil der Verzweigung: ohne ihn waere `pause` an einem Thread, der '
+              'schon auf ein leeres fremdes Konto geblockt ist, ein reines No-Op (er ist ja '
+              'bereits `blocked`), und der naechste Refill des Kontos hoebe die PAUSE mit auf --'
+              ' obwohl `pause` Erfolg gemeldet hat. Das ist D9/D1, gemessen: nach dem Refill '
+              '`blocked = 0`, wird `current`, verbraucht Budget, `audit() == 0`. '
+              'Im Modell ist das unsichtbar, weil `budget_blocked` dort nicht existiert (Donation, '
+              'ADR 0019) -- die Ereignisfolge des Modells bleibt Zeile fuer Zeile dieselbe. '
+              'BEFUND B4 ist davon NICHT beruehrt und bleibt offen: die Zeile schreibt kein '
+              '`current`. Sie macht die Abstraktion des Modells auch nicht schlimmer, aber sie '
+              'macht das beobachtbare Fenster laenger begruendungsbeduerftig, denn ein pausierter '
+              '`current` haelt jetzt zusaetzlich seine Nicht-Weckbarkeit fest.',
     ),
     dict(
         name='tick_charge',
@@ -253,7 +329,7 @@ PAARE = [
             '-WENN konto.remaining == 0',
             '-SETZE konto.depleted := true',
             '-MERKER MERKER1 := false',
-            '-WENN konto != laeufer',
+            '-WENN !laeufer.blocked && konto != laeufer',
             '-SETZE laeufer.blocked := true',
             '-WENN MERKER1',
             '-ENQ laeufer',
@@ -268,7 +344,8 @@ PAARE = [
             '+SETZE laeufer.remaining := laeufer.remaining - 1',
         ],
         ausserhalb=['#now', 'laeufer.#sp := frame',
-                    'konto.#next_refill := #now + konto.#period', '#depleted_count', '#depletions'],
+                    'konto.#next_refill := #now + konto.#period', '#depleted_count', '#depletions',
+                    'laeufer.#budget_blocked := true'],
         grund='HIER DECKT SICH NICHTS -- und das ist die ehrliche Auskunft. `on_tick` verschmilzt '
               'vier Dinge: den Refill-Anstoss, die Budgetbelastung, das Wiedereinreihen des '
               'laufenden Threads und `pick`. Das Modell beschreibt nur das zweite, und auch das in '
@@ -277,7 +354,19 @@ PAARE = [
               'belastet der Code das **Konto** (`sc_donor.unwrap_or(cur)`), das Modell immer den '
               'laufenden Thread; Donation ist laut ADR 0019 ausserhalb. Fuer dieses Paar leistet '
               'Schicht [3] nur noch, was ein eingefrorener Text leisten kann: JEDE Aenderung an '
-              'einer der beiden Seiten faellt auf und verlangt eine neue Herleitung.',
+              'einer der beiden Seiten faellt auf und verlangt eine neue Herleitung. '
+              'ZWEI ZEILEN sind seit H-b neu (2026-08-03, D9), beide im Donee-Zweig '
+              '(`konto != laeufer`), also im bereits ausserhalb liegenden Teil: '
+              '(a) `WENN !laeufer.blocked && konto != laeufer` statt `WENN konto != laeufer`. '
+              'Ohne den Konjunkt schriebe `on_tick` eine Blockade aus IPC oder PAUSE still in eine '
+              'Budget-Blockade um -- und der naechste Refill des Kontos hoebe sie mit auf. Der '
+              'Zusatz sagt: nur wer nicht schon aus einem ANDEREN Grund blockiert ist, wird hier '
+              'blockiert. (b) der wegabstrahierte `laeufer.#budget_blocked := true`: der Grund '
+              'wird mitgeschrieben, damit der Wecker spaeter BENANNT ist. Vor H-b stand hier ein '
+              'blankes `blocked = true` -- und `refill_depleted` hob es an einem Thread wieder auf, '
+              'dessen Blockade es nicht gesetzt hatte (D9/D1) bzw. gar nicht mehr auf (D5/D4/D7). '
+              'Fuer das Modell aendert sich dadurch nichts: es kennt weder `konto != laeufer` noch '
+              '`budget_blocked`; seine Ereignisfolge ist Zeile fuer Zeile dieselbe geblieben.',
     ),
     dict(
         name='refill',
@@ -287,28 +376,49 @@ PAARE = [
             '-WENN #now >= ziel.#next_refill && ziel.budget > 0 && ziel.depleted && ziel.used',
             ' SETZE ziel.remaining := ziel.budget',
             ' SETZE ziel.depleted := false',
+            '-WENN ziel != ziel && ziel.#budget_blocked && ziel.#sc_donor == Some(ziel) && ziel.used',
+            '-SETZE ziel.blocked := false',
+            ' ENQ ziel',
             '-WENN donee != ziel',
-            '-SETZE donee.blocked := false',
-            '-ENQ donee',
+            '-MERKER MERKER1 := donee',
             '-SONST',
             '-WENN !ziel.blocked && LAEUFT != ziel',
-            ' ENQ ziel',
+            '-ENQ ziel',
         ],
-        ausserhalb=['#depleted_count', '#refills'],
+        ausserhalb=['#depleted_count', '#refills', 'ziel.#budget_blocked := false'],
         grund='Der Kern deckt sich Zeile fuer Zeile (`remaining := budget`, `depleted := false`, '
               'einreihen). Die Luecke ist (a) die Ausloesebedingung -- das Modell kennt keine Zeit '
               'und nimmt `refill` als bereits ausgeloest an (seine Vorbedingungen `used`, '
               '`depleted`, `budget > 0` stehen im `requires`, nicht im Rumpf) -- und (b) der '
               'Donation-Zweig: laeuft ein Donee gegen das Konto, wird DER wieder bereit. Beides '
               'ausserhalb (ADR 0019). '
-              'NEU seit 2026-08-03 (c): `WENN !ziel.blocked && LAEUFT != ziel`. Das Modell kennt '
+              '(c) seit D8: `WENN !ziel.blocked && LAEUFT != ziel`. Das Modell kennt '
               'kein `pause` im Refill-Pfad, der Code muss es kennen -- BEFUND D8/M4, gemessen: '
               'ohne diesen Waechter reihte der Refill einen PAUSIERTEN Thread wieder ein, er wurde '
               '`current` und verbrauchte eine Zeitscheibe, `audit()==0`. PAUSE hielt also nicht, '
               'und dafuer brauchte es nicht einmal ein `unblock`. Der `LAEUFT`-Teil verhindert '
               'zusaetzlich Audit-Code 4 (`current` steht zugleich in einer Ready-Liste). '
-              'OFFEN und ausdruecklich NICHT geprueft: der Donee-Zweig setzt `donee.blocked` '
-              'weiterhin BEDINGUNGSLOS zurueck -- dieselbe Frage, nicht gemessen.',
+              '(d) NEU seit H-b (2026-08-03, D9) -- und hier stand bis heute „OFFEN und '
+              'ausdruecklich NICHT geprueft: der Donee-Zweig setzt `donee.blocked` weiterhin '
+              'BEDINGUNGSLOS zurueck". Das ist gemessen und behoben. Der `match sc_donee`-Zweig '
+              'weckt jetzt NIEMANDEN mehr (`let _ = d;` -- daher `MERKER MERKER1 := donee` in der '
+              'Luecke, eine Zuweisung ohne Wirkung); davor steht ein LAUF ueber alle TCBs, der '
+              'genau die weckt, die `budget_blocked` sind UND `sc_donor == slot` fuehren. '
+              'Der Grund ist D5: die Spende ist ein **Stapel** (fs -> Blockdienst -> Treiber), '
+              '`sc_donee` nur seine Spitze -- der zweite CALL ueberschreibt sie, das innere REPLY '
+              'loescht sie, und der Zweig weckte danach den Falschen bzw. gar keinen (0 Ticks in '
+              '3 Perioden, `blocked = 1`, `audit() == 0`, ohne jedes Privileg herstellbar). '
+              'Die Zeile `WENN ziel != ziel && ...` ist KEIN Tippfehler und keine tote Bedingung: '
+              'der Normalisierer bindet sowohl die aeussere Schleife (`for slot`) als auch die '
+              'innere (`for d`) an die Rolle `ziel`, weil beide dieselbe Herkunft haben '
+              '(`for _ in 0..self.tcbs.len()`). Im Quelltext steht `d != slot`. Wer das '
+              'auseinanderziehen will, braucht eine zweite Rolle im Normalisierer -- solange sie '
+              'fehlt, steht der Hinweis hier, damit die Zeile nicht als Befund missverstanden '
+              'wird. '
+              'Das Modell traegt von alldem NICHTS: sein `refill` weckt genau einen Thread, den '
+              'erschoepften selbst. Der ganze Lauf liegt in der Donation und damit ausserhalb '
+              '(ADR 0019) -- was er behebt, belegt `tools/sched-erschoepfung-messen.sh` (D5 auf '
+              '6 Ticks, D4 auf 299, D7 auf 9), nicht Verus.',
     ),
     dict(
         name='set_budget',
@@ -320,12 +430,15 @@ PAARE = [
             ' SETZE ziel.budget := PARAM',
             ' SETZE ziel.depleted := false',
             '-WENN MERKER1',
+            '-WENN ziel != ziel && ziel.#budget_blocked && ziel.#sc_donor == Some(ziel) && ziel.used',
+            '-SETZE ziel.blocked := false',
+            '-ENQ ziel',
             ' WENN !ziel.blocked && LAEUFT != ziel',
             ' ENQ ziel',
             '-SONST',
         ],
         ausserhalb=['ziel.#period := period.max(1)', 'ziel.#next_refill := #now + period',
-                    '#depleted_count'],
+                    '#depleted_count', 'ziel.#budget_blocked := false'],
         grund='Die drei Zuweisungen und die Einreihbedingung decken sich. Die Luecke ist die '
               'Handle-Aufloesung und der zusaetzliche Waechter `WENN war_erschoepft`: der Code '
               'reiht NUR dann wieder ein, wenn der Thread vorher erschoepft war. Das ist nur '
@@ -333,7 +446,19 @@ PAARE = [
               'nicht laufender Thread steht bereits in einer Liste, `enqueue_ready` waere ein '
               'No-Op. Die Aequivalenz haengt also an der Invariante, die hier gerade bewiesen '
               'wird. Genau diese Art Kreisschluss ist der Grund, warum die Luecke aufgeschrieben '
-              'gehoert statt wegnormalisiert.',
+              'gehoert statt wegnormalisiert. '
+              'NEU seit H-b (2026-08-03, D9): derselbe Lauf ueber alle TCBs wie in `refill`, in '
+              'demselben `war_erschoepft`-Zweig, plus der wegabstrahierte '
+              '`ziel.#budget_blocked := false`. Zur Doppelrolle `ziel != ziel` s. das Paar '
+              '`refill` -- es ist dieselbe Normalisierung, nicht ein zweiter Befund. '
+              'Der Grund ist D7 und er ist praeziser als „auch hier wecken": `set_budget` loescht '
+              '`depleted` am Konto und senkt `depleted_count`. Damit verschwindet der ANLASS, aus '
+              'dem `refill_depleted` diesen Slot je wieder anfassen wuerde -- wer auf dieses Konto '
+              'geblockt war, verliert seinen Wecker genau hier, ohne dass ihn jemand aufgeweckt '
+              'haette. Gemessen: 0 Ticks in 3 Perioden, `audit() == 0`; mit dem Lauf 9 Ticks. '
+              'Dieselbe Form wie `record_zombie` (dort stirbt das Konto ganz, D4). '
+              'Das Modell traegt auch das nicht: sein `set_budget` fasst genau `i` an. Der Lauf '
+              'liegt in der Donation, ADR 0019: ausserhalb.',
     ),
 ]
 
@@ -780,6 +905,9 @@ zeilen.append("  [2] Uebergaenge .... %d Modell-Uebergaenge, %d Partnerfunktione
               % (len(uebergaenge), len(CODE_PARTNER), n_schreib, len(gesehen)))
 
 # ---- [3] Struktur ------------------------------------------------------------------------------
+# Die Ereignisfolgen werden aufgehoben: Schicht [4] fragt sie fuer die Veraltungsmeldung zu
+# BEFUND B4 noch einmal ab (fuer eine Aussage ueber `pause` braucht man `pause`, nicht `audit`).
+PAAR_EREIGNISSE = {}
 for p in PAARE:
     cev, caus = [], []
     for muster, rollen, param in p['code']:
@@ -791,6 +919,7 @@ for p in PAARE:
         mev += modell_ereignisse(rumpf(mt, muster, MODELL), rollen, param)
     if not cev or not mev:
         fehler("FEHLER: leere Ereignisfolge fuer %s -- ein leerer Lauf ist kein Ergebnis." % p['name'])
+    PAAR_EREIGNISSE[p['name']] = (cev, caus)
     ist = [z for z in difflib.unified_diff(cev, mev, n=1, lineterm='')
            if not z.startswith(('---', '+++', '@@'))]
     if ist != p['luecke']:
@@ -857,9 +986,25 @@ _b2_noch_offen = any(n == 'ridx: in_ready ==> !depleted' and c is None for n, c,
 if _b2_noch_offen and any('depleted' in b for _, b in ist_q):
     mangel(4, "Der Queue-Lauf von `audit` prueft jetzt `depleted` -- das Register oben (BEFUND B2)",
               "ist damit veraltet. Gute Nachricht, aber sie gehoert eingetragen.")
-if any(re.search(r'\b(budget|remaining)\b', b) for _, b in alle):
+# B3 -- 2026-08-03 an das Register GEKOPPELT. Vorher hing diese Meldung allein an der Beobachtung
+# („`audit` liest budget/remaining"), also an genau der Bedingung, die nach der Behebung des
+# Befundes DAUERHAFT wahr waere. Sie haette ab dem Tag der Behebung fuer immer geschrien -- und ein
+# Waechter, der das tut, wird abgeschaltet und schweigt dann auch beim naechsten echten Fall.
+# Dieselbe Falle wie bei B2, dieselbe Form der Behebung. (`budget_blocked` faellt hier nicht
+# hinein: `\bbudget\b` greift daran nicht, weil `_` ein Wortzeichen ist -- nachgesehen, nicht
+# angenommen.)
+_b3_noch_offen = any(n.startswith('bidx:') and c is None for n, c, _ in INVARIANTE)
+if _b3_noch_offen and any(re.search(r'\b(budget|remaining)\b', b) for _, b in alle):
     mangel(4, "`audit` liest jetzt `budget`/`remaining` -- BEFUND B3 ist veraltet und gehoert",
               "nachgetragen (dann traegt `bidx` erstmals auch zur Laufzeit).")
+# B4 -- ebenso gekoppelt, und die Beobachtung kommt nicht aus `audit`, sondern aus `pause` selbst:
+# der Befund lautet „`pause` deplaniert den laufenden Thread nicht". Faengt `pause` an, `current`
+# zu loeschen, ist er weg und das Register veraltet. Nachgesehen am 2026-08-03: H-b aendert daran
+# nichts (die neue Zeile schreibt `budget_blocked`, nicht `current`) -- der Eintrag bleibt offen.
+_b4_noch_offen = any(n == 'current_valid' and c is None for n, c, _ in INVARIANTE)
+if _b4_noch_offen and 'LAEUFT := keiner' in PAAR_EREIGNISSE.get('pause', ([], []))[0]:
+    mangel(4, "`pause` deplaniert jetzt den laufenden Thread -- BEFUND B4 ist damit veraltet und",
+              "gehoert nachgetragen (`current_valid` gilt dann auch im Code ohne Fenster).")
 zeilen.append("  [4] Audit .......... %d Praedikate eingefroren, %d Rueckgabestellen, "
               "%d Teilaussagen ohne Laufzeitpruefung"
               % (len(PRAEDIKATE), len(alle), sum(1 for _, c, _ in INVARIANTE if c is None)))
@@ -868,7 +1013,10 @@ zeilen.append("  [4] Audit .......... %d Praedikate eingefroren, %d Rueckgabeste
 if '--leise' not in sys.argv:
     for z in zeilen:
         print(z)
-    print("  -- Befunde (deklariert, `lib.rs` unangetastet) --")
+    # Die Ueberschrift hiess bis 2026-08-03 „(deklariert, `lib.rs` unangetastet)". Das stimmte beim
+    # ersten Lauf und danach nicht mehr: D8 und H-b/D9 haben `lib.rs` sehr wohl angefasst. Eine
+    # Beschriftung, die neben der Sache herlaeuft, erzeugt Arbeit, die es nicht braucht.
+    print("  -- Befunde (deklariert, OHNE Laufzeitpruefung -- Stand des Registers im Dateikopf) --")
     for b in befunde:
         print("     %s" % b)
     for p in PAARE:
@@ -942,6 +1090,26 @@ PY
             else echo "  still   : $2"; fi
         fi
     }
+    # Dritte Form neben `kracht`/`still`. Bei einer VERALTUNGSMELDUNG ist nicht das Anschlagen die
+    # Leistung, sondern der Text: „der Befund im Register ist weg, trag ihn aus". Ein Fall, der nur
+    # `kracht` prueft, waere schon bestanden, sobald irgendeine andere Schicht meckert -- und
+    # genau das tut sie hier immer mit. Die Meldung koennte dann spurlos verschwinden, ohne dass
+    # etwas auffaellt. Deshalb wird sie namentlich verlangt.
+    erwarte_meldung() {   # erwarte_meldung <regex> <name>
+        n=$((n+1))
+        if [ "$mut_rc" -ne 0 ]; then
+            echo "  FEHLER: '$2' -- die Mutation selbst ist fehlgeschlagen (Muster veraltet)." >&2
+            fehler=1; mut_rc=0; return
+        fi
+        local aus
+        aus="$(pruefen "$W/lib.rs" "$W/runqueue.rs" 2>&1)"
+        if printf '%s' "$aus" | grep -qE -- "$1"; then
+            echo "  gemeldet: $2"
+        else
+            echo "  FEHLER: '$2' -- die erwartete Meldung fehlt (/$1/)." >&2
+            fehler=1
+        fi
+    }
 
     # -- Mutationen am ECHTEN Code ---------------------------------------------------------------
     mutieren code 's = s.replace("if self.tcbs[acct].remaining == 0 {",
@@ -979,6 +1147,62 @@ PY
                 self.enqueue_ready(s);
             }""", "            self.enqueue_ready(s);", 1)'
     erwarte kracht "Code: der D8-Waechter in unblock faellt weg (Rueckfall auf bedingungsloses Einreihen)"
+
+    # -- H-b / D9 (2026-08-03): fuenf Faelle, die es vor H-b nicht geben KONNTE ------------------
+    # Sie halten die Behebung fest, ohne die der Waechter sie nur beschreibt. Jeder einzelne dreht
+    # genau ein Stueck von H-b zurueck -- und weil das Feld `budget_blocked` als „ausserhalb"
+    # eingetragen ist, faellt das nicht ueber Schicht [1] auf, sondern nur ueber die
+    # Uebertragungsluecke bzw. die Liste der wegabstrahierten Zugriffe. Genau deshalb ist die
+    # AUSSERHALB-Liste je Paar gepflegt und nicht bloss ein Sammelbecken: sie ist hier die einzige
+    # Stelle, an der ein weggelassener Schreibzugriff noch bemerkt wird.
+    mutieren code 's = s.replace("                        self.tcbs[cur].budget_blocked = true;\n", "", 1)'
+    erwarte kracht "Code: on_tick schreibt den GRUND der Blockade nicht mehr mit (H-b/D9)"
+
+    # Die Gegenrichtung im selben `on_tick`: ohne den `!blocked`-Konjunkt schreibt der Tick eine
+    # Blockade aus IPC oder PAUSE still zu einer Budget-Blockade um -- und der naechste Refill hebt
+    # sie mit auf. Das ist D9/D1, und es steht als Zeile in der Uebertragungsluecke.
+    mutieren code 's = s.replace("if acct != cur && !self.tcbs[cur].blocked {", "if acct != cur {", 1)'
+    erwarte kracht "Code: on_tick ueberschreibt wieder eine fremde Blockade (!blocked-Konjunkt weg)"
+
+    # Der Kern von D9: der Refill-Lauf ueber ALLE `sc_donor == slot` faellt auf den einzelnen
+    # `sc_donee` zurueck -- also auf die Spitze eines Stapels. Gemessen war das: niemand weckt den
+    # Richtigen (D5: 0 Ticks in 3 Perioden, `audit() == 0`).
+    mutieren code 's = s.replace("""                for d in 0..self.tcbs.len() {
+                    if d != slot
+                        && self.tcbs[d].used
+                        && self.tcbs[d].budget_blocked
+                        && self.tcbs[d].sc_donor == Some(slot)
+                    {
+                        self.tcbs[d].budget_blocked = false;
+                        self.tcbs[d].blocked = false;
+                        self.enqueue_ready(d);
+                    }
+                }
+                match self.tcbs[slot].sc_donee {
+                    Some(d) if d != slot => {
+                        let _ = d; // erledigt der Lauf darueber
+                    }""",
+"""                match self.tcbs[slot].sc_donee {
+                    Some(d) if d != slot => {
+                        self.tcbs[d].budget_blocked = false;
+                        self.tcbs[d].blocked = false;
+                        self.enqueue_ready(d);
+                    }""", 1)'
+    erwarte kracht "Code: der Refill-Lauf faellt auf den einzelnen sc_donee zurueck (H-b/D9)"
+
+    # PAUSE uebernimmt die Blockade nicht mehr: die Zeile steht VOR `if !blocked` und ist deshalb
+    # kein Zweig, sondern ein wegabstrahierter Schreibzugriff -- ohne sie hoebe der Refill eine
+    # PAUSE auf, die Erfolg gemeldet hat.
+    mutieren code 's = s.replace("        self.tcbs[s].budget_blocked = false;\n", "", 1)'
+    erwarte kracht "Code: pause uebernimmt die Budget-Blockade nicht mehr (H-b/D9)"
+
+    # Und der Waechter in `unblock`, der eine Budget-Blockade stehen laesst. Faellt er weg, ist D6
+    # wieder da: RESUME am Donee -> in die Liste, wird `current`, ein voller Tick auf leerem Konto.
+    mutieren code 's = s.replace("""            if self.tcbs[s].budget_blocked {
+                return true;
+            }
+""", "", 1)'
+    erwarte kracht "Code: unblock hebt eine Budget-Blockade wieder auf (H-b/D9)"
 
     mutieren code 's = s.replace("    pub fn set_budget(&mut self", "    pub fn set_budget_v2(&mut self", 1)'
     erwarte kracht "Code: Funktion umbenannt (Waechter liest NICHT ins Leere)"
@@ -1044,6 +1268,21 @@ s = s.replace("""    pub fn load(&self) -> usize {""",
     mutieren modell 's = s.replace("(s.threads[i].budget == 0 ==> !s.threads[i].depleted)",
                                    "(s.threads[i].budget == 1 ==> !s.threads[i].depleted)", 1)'
     erwarte kracht "Modell: bidx-Konjunkt aufgeweicht (keine Aushungerung nur noch bei budget==1)"
+
+    # -- Sprechprobe der beiden VERALTUNGSMELDUNGEN im Register (B3/B4) --------------------------
+    # Beide sind an das Register gekoppelt und feuern im Normalbetrieb deshalb NIE. Ein Melder,
+    # von dem niemand je etwas gehoert hat, ist keiner -- genau die Form, die dieses Projekt bei
+    # der leeren Ereigniswarteschlange ohne `CD.R` schon einmal bezahlt hat. Die zwei Faelle
+    # zeigen, dass er sprechen KANN, und sie halten zugleich fest, WAS er sagt.
+    mutieren code 's = s.replace("            self.remove_from_ready(s); // No-Op, falls er gerade `current` ist",
+      "            self.remove_from_ready(s);\n            if self.current == Some(s) {\n                self.current = None;\n            }", 1)'
+    erwarte_meldung "BEFUND B4 ist damit veraltet" "Sprechprobe: pause deplaniert -> Register B4 meldet sich veraltet"
+
+    mutieren code 's = s.replace("""                if t.depleted {
+                    return 9;""",
+    """                if t.depleted || t.remaining > t.budget {
+                    return 9;""", 1)'
+    erwarte_meldung "BEFUND B3 ist veraltet" "Sprechprobe: audit liest remaining -> Register B3 meldet sich veraltet"
 
     # -- Und die Gegenprobe: Kosmetik auf BEIDEN Seiten darf NICHT ausloesen ----------------------
     # Umbenannte lokale Variablen (Code + Modell), ein Kommentar, eine Leerzeile.

@@ -229,6 +229,10 @@ struct Tcb {
     /// True, wenn das Budget erschöpft ist (Thread weder laufend noch in Ready-Queue,
     /// wartet auf Refill).
     depleted: bool,
+    /// H-b: blockiert, WEIL das belastete Konto leer ist -- im Unterschied zu einer Blockade
+    /// aus IPC oder PAUSE. `blocked` allein kann das nicht sagen, und genau daran haengt der
+    /// Donee-Zweig: er hebt eine Blockade auf, deren Grund er nicht kennt.
+    budget_blocked: bool,
     // --- Budget-Donation (MCS, intra-core IPC): bei einem CALL leiht der Aufrufer dem
     // Server seinen Scheduling-Context; der Server wird gegen das **Konto** des Aufrufers
     // belastet (geteilter SC), bis er antwortet. So begrenzt das Budget des Aufrufers die
@@ -267,6 +271,7 @@ impl Tcb {
         remaining: 0,
         next_refill: 0,
         depleted: false,
+        budget_blocked: false,
         sc_donor: None,
         sc_donee: None,
         cyc: CycleStats::EMPTY,
@@ -660,6 +665,19 @@ impl Scheduler {
             return false;
         };
         if self.tcbs[s].blocked {
+            // H-b: WARUM ist er blockiert? Eine Blockade auf ein leeres Konto hebt nur der
+            // Refill auf. Der Waechter ist hier -- anders als G-a -- gefahrlos, weil der Wecker
+            // BENANNT ist: `refill_depleted` weckt genau `budget_blocked`.
+            if self.tcbs[s].budget_blocked {
+                return true;
+            }
+            let acct = self.tcbs[s].sc_donor.unwrap_or(s);
+            if acct != s && self.tcbs[acct].depleted {
+                // Zurueck in den Lauf ja -- aber nicht auf ein leeres Konto. Die Blockade
+                // wechselt den GRUND, und der neue Grund hat einen Wecker.
+                self.tcbs[s].budget_blocked = true;
+                return true;
+            }
             self.tcbs[s].blocked = false;
             // **Erschöpft heisst: nicht einplanen** (D8, gemessen 2026-08-03). Bis hierher
             // reihte `unblock` bedingungslos ein, und ein erschöpfter Thread lief danach eine
@@ -688,6 +706,10 @@ impl Scheduler {
         let Some(s) = self.resolve(tid) else {
             return false;
         };
+        // H-b: PAUSE UEBERNIMMT die Blockade. Ohne diese Zeile ist sie ein No-Op an einem
+        // Thread, der schon auf sein Konto-Budget geblockt ist (er ist ja `blocked`) -- und der
+        // Refill hebt sie dann mit auf, obwohl PAUSE Erfolg gemeldet hat.
+        self.tcbs[s].budget_blocked = false;
         if !self.tcbs[s].blocked {
             self.tcbs[s].blocked = true;
             self.remove_from_ready(s); // No-Op, falls er gerade `current` ist
@@ -856,11 +878,11 @@ impl Scheduler {
                     self.depleted_count += 1;
                     self.depletions += 1;
                     requeue = false;
-                    if acct != cur {
-                        // `cur` ist ein Donee, der gegen ein fremdes (erschöpftes) Konto
-                        // lief -> auf den Refill blocken (nicht „verloren": blocked=true,
-                        // der Refill des Kontos macht ihn wieder bereit).
+                    if acct != cur && !self.tcbs[cur].blocked {
+                        // H-b: nur wer nicht schon aus einem ANDEREN Grund blockiert ist, wird
+                        // hier blockiert -- und der Grund wird mitgeschrieben.
                         self.tcbs[cur].blocked = true;
+                        self.tcbs[cur].budget_blocked = true;
                     }
                 }
             }
@@ -891,11 +913,23 @@ impl Scheduler {
                 self.tcbs[slot].depleted = false;
                 self.depleted_count -= 1;
                 self.refills += 1;
-                match self.tcbs[slot].sc_donee {
-                    Some(d) if d != slot => {
-                        // Der Donee war auf das Konto-Budget geblockt -> wieder bereit.
+                // H-b: die Spende ist ein STAPEL. `sc_donee` ist nur ihre Spitze, wird vom
+                // zweiten CALL ueberschrieben und vom inneren REPLY geloescht -- geweckt wird
+                // deshalb, wer WEGEN DIESES KONTOS blockiert ist, und nur der.
+                for d in 0..self.tcbs.len() {
+                    if d != slot
+                        && self.tcbs[d].used
+                        && self.tcbs[d].budget_blocked
+                        && self.tcbs[d].sc_donor == Some(slot)
+                    {
+                        self.tcbs[d].budget_blocked = false;
                         self.tcbs[d].blocked = false;
                         self.enqueue_ready(d);
+                    }
+                }
+                match self.tcbs[slot].sc_donee {
+                    Some(d) if d != slot => {
+                        let _ = d; // erledigt der Lauf darueber
                     }
                     // **Einen PAUSIERTEN Thread weckt der Refill nicht** (D8/M4, gemessen
                     // 2026-08-03). Bis hierher reihte der Refill bedingungslos ein: erschöpfen,
@@ -931,6 +965,19 @@ impl Scheduler {
             self.tcbs[s].depleted = false;
             if was_depleted {
                 self.depleted_count -= 1;
+                // H-b: mit `depleted` verschwindet der Anlass, aus dem der Donee je wieder
+                // geweckt wuerde -- also hier wecken.
+                for d in 0..self.tcbs.len() {
+                    if d != s
+                        && self.tcbs[d].used
+                        && self.tcbs[d].budget_blocked
+                        && self.tcbs[d].sc_donor == Some(s)
+                    {
+                        self.tcbs[d].budget_blocked = false;
+                        self.tcbs[d].blocked = false;
+                        self.enqueue_ready(d);
+                    }
+                }
                 if self.current != Some(s) && !self.tcbs[s].blocked {
                     self.enqueue_ready(s);
                 }
@@ -1187,8 +1234,17 @@ impl Scheduler {
     fn record_zombie(&mut self, local: usize) {
         // Budget-Donation-Links lösen (vor dem Clear lesen): stirbt ein Konto, verliert
         // sein Donee die Spende; stirbt ein Donee, wird der Donee-Eintrag gelöscht.
-        if let Some(d) = self.tcbs[local].sc_donee {
-            self.tcbs[d].sc_donor = None;
+        // H-b: ALLE Empfaenger dieser Spende loesen, nicht nur die Spitze -- und wer auf
+        // dieses Konto geblockt war, verliert mit ihm seinen Wecker und muss hier frei.
+        for d in 0..self.tcbs.len() {
+            if d != local && self.tcbs[d].used && self.tcbs[d].sc_donor == Some(local) {
+                self.tcbs[d].sc_donor = None;
+                if self.tcbs[d].budget_blocked {
+                    self.tcbs[d].budget_blocked = false;
+                    self.tcbs[d].blocked = false;
+                    self.enqueue_ready(d);
+                }
+            }
         }
         if let Some(a) = self.tcbs[local].sc_donor {
             if self.tcbs[a].sc_donee == Some(local) {

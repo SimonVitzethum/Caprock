@@ -27,30 +27,28 @@
 //
 // Fuenf Befunde aus seinem ersten Lauf (2026-08-03). `lib.rs` blieb unangetastet.
 //
-// **BEFUND B1 — `unblock` weicht wirklich ab.** Der Code reiht BEDINGUNGSLOS wieder ein:
+// **BEFUND B1 — BEHOBEN am 2026-08-03 (todo.md D8).** Er lautete: der Code reiht BEDINGUNGSLOS
+// wieder ein, waehrend `unblock` unten `in_ready: !t.depleted` setzt. Ein blockierter UND
+// MCS-erschoepfter Thread landete damit in der Ready-Liste — `ridx` verletzt,
+// `unblock_preserves` galt fuer diesen Uebergang nicht.
 //
-//     if self.tcbs[s].blocked { self.tcbs[s].blocked = false; self.enqueue_ready(s); }
+// Aus dem gelesenen Befund wurde eine Messung (`tools/sched-erschoepfung-messen.sh`, 208
+// Messwerte, Positivkontrolle zuerst): der Thread wurde `current` mit `remaining == 0`, WAEHREND
+// eine Alternative bereitstand, und `audit()` schwieg. Erreichbar OHNE Cap ueber die
+// IPC-Donation, nicht nur ueber PAUSE/RESUME. `unblock` traegt den Waechter jetzt INNERHALB des
+// Rumpfes; die naheliegende Fassung `if blocked && !depleted` war gemessen SCHAEDLICH (das RESUME
+// wurde verschluckt, zusammen mit dem Refill-Waechter: vollstaendiges Verhungern).
 //
-// `unblock` unten setzt `in_ready: !t.depleted`. Ein Thread, der blockiert UND MCS-erschoepft ist,
-// landet im Code also in der Ready-Liste — `ridx` waere verletzt, `unblock_preserves` gilt fuer
-// diesen Zustandsuebergang nicht. Erreichbar: Konto erschoepft (`on_tick`), dann `pause`, dann
-// `unblock`. Das Modell nimmt hier NICHT den Code auf, sondern die Invariante — der Beweis sagt,
-// was der Code tun muesste, nicht was er tut.
+// Die zweite gelesene Folge — `depleted_count` waechst — hat die Messung KORRIGIERT: der Zuwachs
+// ist +1 je PAUSE/RESUME-Paar, nicht je Tick (`on_tick` setzt `requeue = false`, der Thread ist
+// wieder off-queue). Was blieb: der Zaehler kehrte nie auf 0 zurueck, also lief der Refill-Scan
+// ab da in jedem Tick.
 //
-// Zwei Folgen, aus dem Quelltext GELESEN, nicht gemessen (wer sie belegen will, braucht einen
-// hwfuzz-Fall `budget setzen -> erschoepfen -> PAUSE -> RESUME`):
-//   * der Thread ist wieder einplanbar, obwohl `remaining == 0` — bis zum Refill laeuft er auf
-//     einem erschoepften Budget. Das ist genau die Laufzeit, die `mcs_bound` ausschliessen soll.
-//   * `on_tick` hat im Zweig `remaining == 0` keinen Waechter „war schon erschoepft": laeuft der
-//     Thread erneut, wird `depleted_count` ein zweites Mal erhoeht (der Refill senkt es nur
-//     einmal -> der Zaehler driftet nach oben, und der Refill-Scan laeuft danach in JEDEM Tick)
-//     und `next_refill` wird auf `now + period` zurueckgeschoben — der Refill verschiebt sich,
-//     solange der Thread laeuft.
-//
-// **BEFUND B2 — die Richtung „in der Queue ⟹ nicht erschoepft" hat keinen Audit-Code.**
-// `Scheduler::audit` prueft im Queue-Lauf `used` (1), `blocked` (2) und `current` (4), aber nie
-// `depleted`. B1 kann zur Laufzeit deshalb nicht auffallen: derselbe Fall, der die Aussage
-// widerlegen wuerde, wird nie beobachtet. (Vgl. die leere Event-Queue ohne `CD.R`, CLAUDE.md.)
+// **BEFUND B2 — BEHOBEN am 2026-08-03: Audit-Code 9.** Er lautete: die Richtung „in der Queue ⟹
+// nicht erschoepft" hat keinen Audit-Code; `Scheduler::audit` prueft im Queue-Lauf `used` (1),
+// `blocked` (2) und `current` (4), aber nie `depleted`. B1 konnte zur Laufzeit deshalb nicht
+// auffallen — derselbe Fall, der die Aussage widerlegt haette, wurde nie beobachtet. (Vgl. die
+// leere Event-Queue ohne `CD.R`, CLAUDE.md.) Der Queue-Lauf prueft `depleted` jetzt und gibt 9.
 //
 // **BEFUND B3 — `budget_inv` hat ueberhaupt keine Laufzeitentsprechung.** `audit` liest weder
 // `budget` noch `remaining`. `mcs_bound`/`roundrobin_no_starve` sind statisch bewiesen und zur
@@ -157,9 +155,12 @@ pub open spec fn pick(s: Sched, n: int) -> Sched {
 /// **unblock:** einen blockierten Thread `i` wieder bereit machen (idempotent im Code; hier auf den
 /// blockierten Fall spezifiziert). Wird genau dann wieder eingereiht, wenn nicht erschoepft.
 ///
-/// **ACHTUNG (BEFUND B1, s. Dateikopf):** `Scheduler::unblock` prueft `depleted` NICHT und reiht
-/// bedingungslos ein. Dieses `!t.depleted` ist die Forderung der Invariante, nicht der Zustand des
-/// Codes. `tools/verus-modelltreue-sched.sh` haelt die Abweichung fest.
+/// **Seit 2026-08-03 deckt sich der Code hier** (BEFUND B1 behoben, s. Dateikopf und todo.md D8):
+/// `Scheduler::unblock` traegt den `!depleted`-Waechter INNERHALB seines Rumpfes. Bis dahin war
+/// dieses `!t.depleted` die Forderung der Invariante und nicht der Zustand des Codes.
+/// `tools/verus-modelltreue-sched.sh` haelt die verbliebene Uebertragungsluecke fest — sie redet
+/// nur noch ueber die Handle-Aufloesung und die Idempotenz, plus die zwei Zeilen aus D9/H-b, die
+/// ueber das gespendete KONTO reden (das Modell kennt keine Spende, ADR 0019).
 pub open spec fn unblock(s: Sched, i: int) -> Sched {
     let t = s.threads[i];
     Sched {

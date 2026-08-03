@@ -77,7 +77,7 @@ mit_deps() { # $1 = Name, $2 = Crate-Verzeichnis, $3.. = Abhaengigkeiten (Verzei
     rm -rf "$SA"
 }
 
-ZIELE="${*:-mem part fat cycles loader cap}"
+ZIELE="${*:-mem part fat cycles loader cap ipctreue}"
 for z in $ZIELE; do
     case "$z" in
         mem)  einzeln mem  "$ROOT/crates/sel4lake-mem/src/lib.rs" ;;
@@ -96,7 +96,20 @@ for z in $ZIELE; do
         # `sel4lake-cap` haengt an `sel4lake-mem` und `sel4lake-slab`. Bis B-5.5 liefen seine Tests
         # deshalb nirgends -- die Huerde war das Manifest, nicht der Code.
         cap)  mit_deps cap sel4lake-cap sel4lake-mem sel4lake-slab ;;
-        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap)"; fail=1 ;;
+        # `sel4lake-ipc` haengt an `sel4lake-hal` (arch-Asm) und wird auf dem Host nie bauen -- wie
+        # `sel4lake-sched`. Anders als bei `cycles` liegt die Logik aber NICHT abhaengigkeitsfrei in
+        # einem eigenen Modul, sondern mitten im Endpoint. Der Ausweg sind Stellvertreter fuer
+        # HAL/Scheduler/ABI; weil derselbe Aufbau zugleich das Verus-Modell gegen den echten Code
+        # faehrt, liegt er in `tools/verus-modelltreue-ipc.sh` und wird hier nur gerufen.
+        ipctreue)
+            echo "== Host-Tests: ipctreue (Endpoint gegen das Verus-Modell) =="
+            if [ ! -x "$ROOT/tools/verus-modelltreue-ipc.sh" ] && [ ! -f "$ROOT/tools/verus-modelltreue-ipc.sh" ]; then
+                echo "  FEHLT: tools/verus-modelltreue-ipc.sh ist nicht vorhanden -- Ziel nicht gelaufen"
+                fail=1
+            else
+                bash "$ROOT/tools/verus-modelltreue-ipc.sh" || fail=1
+            fi ;;
+        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap ipctreue)"; fail=1 ;;
     esac
 done
 

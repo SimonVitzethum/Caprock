@@ -108,4 +108,23 @@ echo
 echo "== Modell-Treue (Verus-Modell gegen den echten Quelltext) =="
 bash "$ROOT/tools/verus-modelltreue.sh" || rc=1
 
+# Der IPC-Waechter hat eine ANDERE Bauform als der ueber `unlink`, und zwar aus einem Grund:
+# dort sind Modell und Code fast deckungsgleich, ein struktureller 1:1-Vergleich war ehrlich.
+# Hier klafft eine Abstraktionsluecke (3 Felder gegen 6, 2 Operationen gegen ~15) -- ein
+# Strukturvergleich muesste so weit aufgeweicht werden, dass er nicht mehr anschlagen KANN.
+# Deshalb wird die Abbildung dort ausgefuehrt statt verglichen. Siehe Kopf des Skripts.
+echo
+echo "== Modell-Treue IPC (ausgefuehrte Abbildung statt Strukturvergleich) =="
+bash "$ROOT/tools/verus-modelltreue-ipc.sh" || rc=1
+
+# Der Scheduler-Waechter hat noch einmal eine andere Bauform, aus demselben Grund wie beim IPC --
+# 7 Modellfelder gegen 20 TCB-Felder, 7 Uebergaenge gegen 20 zustandsschreibende Funktionen.
+# Ausfuehren wie beim IPC geht hier nicht (`Scheduler` haengt an `sel4lake-hal`/`-slab`/`-sync` und
+# baut nicht auf dem Host). Deshalb: Feld- und Uebergangs-Abdeckung als echte Kreuzpruefung, dazu
+# ein Strukturvergleich, der nicht Gleichheit verlangt, sondern die eingetragene, begruendete
+# UEBERTRAGUNGSLUECKE. Siehe Kopf des Skripts -- dort steht auch, was er NICHT prueft.
+echo
+echo "== Modell-Treue Scheduler (Abdeckung + eingetragene Uebertragungsluecke) =="
+bash "$ROOT/tools/verus-modelltreue-sched.sh" || rc=1
+
 exit "$rc"

@@ -10,6 +10,57 @@
 // Concurrency-TCB) — hier das sequentielle Protokoll-Modell.
 //
 // Lauf:  tools/verus-verify.sh
+//
+// ------------------------------------------------------------------------------------------------
+// **WIE WEIT DIESES MODELL TRAEGT** — gemessen von `tools/verus-modelltreue-ipc.sh`, nicht behauptet.
+// ------------------------------------------------------------------------------------------------
+//
+// Dieses Modell hat DREI Felder und ZWEI Operationen. `crates/sel4lake-ipc/src/lib.rs::Endpoint`
+// hat SECHS Felder (`used`, `quiescing`, `senders`, `receivers`, `caller`, `reply_owner`) und rund
+// fuenfzehn Operationen. Der Waechter faehrt den ECHTEN Quelltext gegen eine aus DIESER Datei
+// uebersetzte Fassung von `ep_inv`/`msgs_total`/`send`/`recv` und misst die Entsprechung unter der
+// Abbildung
+//     senders   := die Nachricht, die jeder blockierte Sender abgesetzt hat (aus seinem Frame)
+//     receivers := die Thread-IDs der geparkten Empfaenger, in FIFO-Reihenfolge
+//     delivered := effektbasiert: erstmaliges Auftauchen des Nachrichtenworts im Frame eines
+//                  ANDEREN Fadens ("das Geraet hat gehandelt" ist nicht "Daten sind angekommen")
+//
+// **Was traegt:** `call`/`recv` entsprechen `send`/`recv` in beiden Zweigen, ueber beide Kern-Pfade
+// (`switch_to` und `unblock`+IPI), in FIFO-Reihenfolge beider Warteschlangen, ueber Ketten von
+// Schritten hinweg — samt `ep_inv` und der Buchhaltung `msgs_total`.
+//
+// **BEFUND 1 — `ep_inv` gilt am echten Endpoint NICHT.** Ueber die OEFFENTLICHE Schnittstelle sind
+// Zustaende mit wartenden Sendern UND geparkten Empfaengern erreichbar; ein Rendezvous ist dann
+// faellig, aber nicht geschehen. Zwei gemessene Wege:
+//   (a) `Endpoint::bind_receiver` reiht einen Empfaenger ein, OHNE die Sender-Warteschlange
+//       anzusehen (der Weg aus A-4.1, wenn ein stillgelegter Endpoint kein `RECV` zulaesst);
+//   (b) `Endpoint::migrate_owner` reiht den wartenden Aufrufer wieder als Sender ein — der
+//       Hot-Reload-Weg (A-4.1/A-4.3), auf dem v2 bereits gebunden sein darf.
+// Beides ist gewollt, aber es heisst: die Rendezvous-Invariante wird nicht vom TYP gehalten,
+// sondern von der Aufrufdisziplin des Kernels. Ueber diese Disziplin sagt dieser Beweis nichts.
+// Der Weg der aktuellen `threads::mod`-Reihenfolge (erst migrieren, dann v2 erzeugen) bleibt
+// zufaellig auf der guten Seite — er bindet v2 erst NACH der Migration.
+//
+// **BEFUND 2 — `send_no_loss` gilt am echten Endpoint NICHT.** `Seq::push` ist unbeschraenkt,
+// `TidQueue::enqueue` nicht: ab `QUEUE_CAP` (32) wird STILL verworfen. Gemessen am 33. Sender an
+// EINEM Endpoint: `msgs_total` bleibt bei 32 statt auf 33 zu steigen. Im Quelltext ist das benannt
+// (Kommentar an `QUEUE_CAP`), war aber nirgends gemessen.
+//
+// **BEFUND 3 — die Abweisungs- und Leichen-Zweige fehlen im Modell.** `!used` (`ERR_BADCAP`),
+// `quiescing` (`ERR_QUIESCING`, A-4.2) und ein toter Partner (`frame_of == None` -> Eintrag
+// verwerfen) haben hier kein Gegenstueck; der Waechter misst fuer jeden dieser drei Faelle, dass
+// die Entsprechung ohne die zugehoerige Nebenbedingung zerbricht.
+//
+// **Was das Modell mindestens abbilden muesste, um darueber hinaus zu tragen:** ein `used`- und ein
+// `quiescing`-Bit mit `send`/`recv` als Abweisung darauf; eine SCHRANKE auf `senders`/`receivers`
+// (dann waere `send_no_loss` nur noch unter `len < QUEUE_CAP` beweisbar — was der Wahrheit
+// entspricht); ein `caller`/`reply_owner`-Paar mit `reply` als dritter Operation (sonst bleibt der
+// ganze Antwortpfad aussen vor); und `bind_receiver`/`migrate_owner` als Operationen, unter denen
+// `ep_inv` dann nachweislich NICHT erhalten bleibt — die Invariante muesste zu „kein Rendezvous
+// ist faellig, ausser waehrend eines laufenden Austauschs" abgeschwaecht werden.
+//
+// KEIN Kernel-Quelltext wurde wegen dieser Befunde geaendert (wie beim `unlink`-Waechter).
+// ------------------------------------------------------------------------------------------------
 use vstd::prelude::*;
 
 verus! {

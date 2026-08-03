@@ -1,3 +1,7 @@
+# !!! DIESE DATEI LAEUFT NIRGENDS (Stand 2026-08-03). !!!
+# Der Server ist GitLab und liest .gitea/workflows/ nicht; der laufende Stand steht in
+# `.gitlab-ci.yml`. Begruendung und Messung im Kopf von .gitea/workflows/verus.yml.
+#
 # SEL4Lake — Concurrency-Verifikation (Loom) als CI-Gate.
 #
 # Ziel: jeder Push/PR exploriert die Sync-Primitive (RwSpinLock + Ticket-SpinLock) erneut ueber ALLE

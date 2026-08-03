@@ -1,3 +1,7 @@
+# !!! DIESE DATEI LAEUFT NIRGENDS (Stand 2026-08-03). !!!
+# Der Server ist GitLab und liest .gitea/workflows/ nicht; der laufende Stand steht in
+# `.gitlab-ci.yml`. Begruendung und Messung im Kopf von .gitea/workflows/verus.yml.
+#
 # SEL4Lake — Formale Verifikation (Tier 1, Kani) als CI-Gate.
 #
 # Ziel: jeder Push/PR führt die bewiesenen Eigenschaften automatisch erneut aus. Schlägt ein
@@ -60,7 +64,10 @@ jobs:
           printf '[package]\nname="sel4lake-sync"\nversion="0.0.0"\nedition="2021"\n[workspace]\n[lib]\npath="src/lib.rs"\n[lints.rust]\nunexpected_cfgs = { level = "warn", check-cfg = [\'cfg(kani)\', \'cfg(loom)\'] }\n' > "$SB/Cargo.toml"
           ( cd "$SB" && cargo build )
 
-      - name: Kani-Beweise ausführen (alle Ziele: loader, region, sync, unsafe-safety)
+      # Anfuehrungszeichen sind hier PFLICHT und nicht Kosmetik: das `: ` in „alle Ziele: loader"
+      # macht aus dem Skalar eine verschachtelte Abbildung, und die Datei war damit seit ihrer
+      # Anlage ungueltiges YAML -- sie haette auch auf einem Gitea-Server nie geladen.
+      - name: "Kani-Beweise ausführen (alle Ziele: loader, region, sync, unsafe-safety)"
         run: bash tools/kani-verify.sh
 
       # --- Was Kani NICHT abdeckt, und warum hier trotzdem ein Schritt dafür steht ---------

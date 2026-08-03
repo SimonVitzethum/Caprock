@@ -1,3 +1,14 @@
+# !!! DIESE DATEI LAEUFT NIRGENDS (Stand 2026-08-03). !!!
+# Der Server unter git.simonsmp.jocraft.cc:8443 ist GitLab und liest .gitea/workflows/ nicht.
+# Gemessen ueber die Pipelines-API: zwei Pipelines in der ganzen Projektgeschichte, beide vom
+# 2026-05-23, beide mit GitLabs Auto-DevOps-Vorlage. Das Gate hier ist seit seiner Anlage am
+# 2026-06-27 KEIN EINZIGES MAL gelaufen -- und genau deshalb fiel nicht auf, dass cap_space.rs
+# 37 Tage lang rot war (9 verified, 1 errors).
+# Der laufende Stand steht in `.gitlab-ci.yml`. Diese Datei bleibt nur, falls das Projekt spaeter
+# auf Gitea umzieht; sie ist eine VORLAGE, keine Zusicherung. Zwei CI-Definitionen, von denen eine
+# nicht laeuft, sind derselbe Riss wie zwei Suiten, die dasselbe Geraet verschieden aufsetzen --
+# wer hier etwas aendert, aendert es auch drueben, oder loescht diese Datei.
+#
 # SEL4Lake — Formale Verifikation (Tier 2, Verus) als CI-Gate.
 #
 # Ziel wie beim Kani-Gate: jeder Push/PR fuehrt die Verus-Beweise (dokumentierte Kernel-Invarianten:

@@ -138,6 +138,16 @@ host-tests:
   script:
     - bash tools/host-tests.sh
 
+# Der billigste Gate von allen — und der, den es ohne einen konkreten Schaden nicht gaebe:
+# `.gitea/workflows/kani.yml` war seit seiner Anlage ungueltiges YAML (unquotiertes `: ` in einem
+# Jobnamen). Eine CI-Datei gibt nur Rueckmeldung, wenn sie gefahren wird — also faellt so etwas
+# nur an einer Stelle auf, die nichts davon braucht.
+ci-yaml:
+  stage: gate
+  script:
+    - apt-get update -qq && apt-get install -y -qq python3-yaml >/dev/null
+    - bash tools/ci-yaml.sh
+
 kerngrenze:
   stage: gate
   script:

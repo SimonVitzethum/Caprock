@@ -661,7 +661,23 @@ impl Scheduler {
         };
         if self.tcbs[s].blocked {
             self.tcbs[s].blocked = false;
-            self.enqueue_ready(s);
+            // **Erschöpft heisst: nicht einplanen** (D8, gemessen 2026-08-03). Bis hierher
+            // reihte `unblock` bedingungslos ein, und ein erschöpfter Thread lief danach eine
+            // volle Zeitscheibe auf leerem Konto -- mit einer bereitstehenden Alternative
+            // daneben und `audit() == 0`. Erreichbar OHNE Cap: `switch_to` spendet beim
+            // IPC-CALL das Konto des Aufrufers, `on_tick` belastet es und setzt `depleted` am
+            // **blockierten** Aufrufer, `reply` ruft `unblock(caller)`.
+            //
+            // Der Wächter gehört INNERHALB des Rumpfes. Die naheliegende Fassung
+            // `if blocked && !depleted { .. }` ist gemessen SCHÄDLICH: sie überspringt auch
+            // `blocked = false`, das RESUME wird verschluckt, und zusammen mit dem Wächter in
+            // `refill_depleted` verhungert der Thread vollständig (0 Ticks mit Budget).
+            //
+            // Wer ihn danach einreiht, ist `refill_depleted` -- gemessen (2 Refills, 6 Ticks
+            // mit echtem Budget, am Ende nicht blockiert).
+            if !self.tcbs[s].depleted {
+                self.enqueue_ready(s);
+            }
         }
         true
     }
@@ -881,7 +897,19 @@ impl Scheduler {
                         self.tcbs[d].blocked = false;
                         self.enqueue_ready(d);
                     }
-                    _ => self.enqueue_ready(slot),
+                    // **Einen PAUSIERTEN Thread weckt der Refill nicht** (D8/M4, gemessen
+                    // 2026-08-03). Bis hierher reihte der Refill bedingungslos ein: erschöpfen,
+                    // PAUSE, 100 Ticks warten -- und der pausierte Thread (`blocked = 1`) wurde
+                    // `current` und verbrauchte eine Zeitscheibe, `audit() == 0`. Dafür brauchte
+                    // es nicht einmal ein `unblock`; PAUSE hielt schlicht nicht.
+                    // Der `current`-Teil verhindert zusätzlich Audit-Code 4 (`current` steht
+                    // zugleich in einer Ready-Liste), wenn der Refill einen gerade laufenden
+                    // erschöpften Thread trifft.
+                    _ => {
+                        if !self.tcbs[slot].blocked && self.current != Some(slot) {
+                            self.enqueue_ready(slot);
+                        }
+                    }
                 }
             }
         }
@@ -1021,7 +1049,9 @@ impl Scheduler {
     /// einer Ready-Liste, 3=Verkettung nicht reziprok (Listenstruktur kaputt),
     /// 4=`current` steht zugleich in einer Ready-Liste, 5=Bitmap/Zähler inkonsistent,
     /// 6=Thread in der falschen Prioritäts-Liste, 7=verlorener Thread (lauffähig, aber in
-    /// keiner Liste/nicht laufend), 8=Directory-Eintrag passt nicht zum TCB.
+    /// keiner Liste/nicht laufend), 8=Directory-Eintrag passt nicht zum TCB,
+    /// 9=**erschöpfter** Thread steht in einer Ready-Liste (D8, seit 2026-08-03 — die
+    /// Gegenrichtung zu 7; ohne sie war der Zustand unbeobachtbar, der `mcs_bound` widerlegt).
     pub fn audit(&self) -> u32 {
         for p in 0..NPRIO {
             let q = &self.queues[p];
@@ -1041,6 +1071,15 @@ impl Scheduler {
                 }
                 if t.blocked {
                     return 2;
+                }
+                // **Die Gegenrichtung zu Code 7** (D8/B2, 2026-08-03). Code 7 meldet
+                // „lauffähig, aber in keiner Liste"; dass ein ERSCHÖPFTER Thread in einer Liste
+                // steht, prüfte bis hierher niemand -- genau der Zustand, der `mcs_bound`
+                // widerlegt, war damit unbeobachtbar. Dieselbe Form wie die leere
+                // Ereigniswarteschlange ohne `CD.R`: die Aussage sah wahr aus, weil der Fall,
+                // der sie widerlegt, nirgends abgefragt wurde.
+                if t.depleted {
+                    return 9;
                 }
                 if t.queued as usize != p || t.priority as usize != p {
                     return 6;

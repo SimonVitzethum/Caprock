@@ -1045,10 +1045,19 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
 - [ ] **D4** Verus laut `docs/verification.md` offen: `delete_leaf` auf der vereinten Struktur,
       Kinderlisten-Erreichbarkeit, danach Scheduler/IPC.
 
-- [ ] **D8 FEHLER, GEMESSEN: ein erschöpfter Thread kommt über `unblock` zurück in die
-      Ready-Liste und läuft auf leerem Konto — ohne jede Cap.** (2026-08-03)
-      **Klasse:** Fehler · **Aufwand:** Behebung liegt vor und ist gemessen, aber sie hat drei
-      Teile und eine falsche Fassung ist schlimmer als der Fehler.
+- [x] **D8 BEHOBEN am 2026-08-03 (gemessen davor und danach): ein erschöpfter Thread kam über
+      `unblock` zurück in die Ready-Liste und lief auf leerem Konto — ohne jede Cap.**
+      Behebung in drei Teilen: Wächter **innerhalb** des `unblock`-Rumpfes, `!blocked`-Wächter in
+      `refill_depleted`, neuer Audit-Code **9**. Nachgemessen: **jede** Wirkung (M1/M2/M3a/M5)
+      auf 0, Positivkontrolle weiter bestanden, `M7.ticks_mit_budget = 6` — **kein Verhungern**.
+      x86-Suite, Lade-Suite, Host-Tests, Verus + drei Wächter: alle grün. **500 Läufe** (5 Ströme
+      à 100) mit **derselben Signatur wie vor der Behebung** (`e419003d625f`) — keine Regression,
+      und zugleich der Beleg, dass die Suite diesen Fehler nie ausgelöst hat. Passt zu
+      `audit() == 0`: niemand konnte ihn sehen.
+
+      Der Rest des Eintrags bleibt als Herleitung stehen. **Zwei Punkte sind weiter offen** und
+      stehen am Ende: der Donee-Zweig in `refill_depleted` und die Erreichbarkeit im laufenden
+      Kernel.
 
       Werkzeug: `tools/sched-erschoepfung-messen.sh` (~3 s, 96 Messwerte, `--nur-echt` für den
       Einzellauf). Der **echte** `crates/sel4lake-sched/src/lib.rs` wird gelinkt — genau eine

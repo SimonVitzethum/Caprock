@@ -204,17 +204,21 @@ PAARE = [
             '-WENN #aufloesbar',
             '-WENN ziel.blocked',
             ' SETZE ziel.blocked := false',
-            '+WENN !ziel.depleted',
-            ' ENQ ziel',
         ],
         ausserhalb=[],
-        grund='ZWEI VERSCHIEDENE DINGE. (a) `WENN #aufloesbar` + `WENN ziel.blocked` sind die '
-              'Aufloesung des Handles und die Idempotenz; das Modell sagt in seinem Kommentar '
-              'ausdruecklich, es spezifiziere nur den blockierten Fall. (b) `WENN !ziel.depleted` '
-              'ist **eine echte Abweichung** (BEFUND B1): der Code reiht bedingungslos ein, das '
-              'Modell nur, wenn nicht erschoepft. Ein blockierter UND erschoepfter Thread landet '
-              'im Code in der Ready-Liste -- `ridx` verletzt, und `audit` sieht es nicht (B2). '
-              'Der Befund steht hier, `lib.rs` bleibt unangetastet.',
+        grund='NUR NOCH EIN DING, und das ist die gute Nachricht. `WENN #aufloesbar` + '
+              '`WENN ziel.blocked` sind die Aufloesung des Handles und die Idempotenz; das Modell '
+              'sagt in seinem Kommentar ausdruecklich, es spezifiziere nur den blockierten Fall. '
+              'Das ist eine Abstraktion, keine Abweichung. '
+              'BEFUND B1 IST BEHOBEN (2026-08-03): hier stand '
+              '`+WENN !ziel.depleted` als echte Abweichung -- der Code reihte BEDINGUNGSLOS ein, '
+              'das Modell nur, wenn nicht erschoepft. Gemessen mit '
+              '`tools/sched-erschoepfung-messen.sh` (D8): ein erschoepfter Thread lief danach eine '
+              'volle Zeitscheibe auf leerem Konto, mit bereitstehender Alternative und `audit()==0`; '
+              'erreichbar OHNE Cap ueber die IPC-Donation. `unblock` traegt den Waechter jetzt '
+              'INNERHALB des Rumpfes -- die Fassung `if blocked && !depleted` waere schaedlich '
+              'gewesen (RESUME verschluckt, zusammen mit dem refill-Waechter: vollstaendiges '
+              'Verhungern, gemessen). Code und Modell decken sich an dieser Stelle jetzt.',
     ),
     dict(
         name='pause',
@@ -287,6 +291,7 @@ PAARE = [
             '-SETZE donee.blocked := false',
             '-ENQ donee',
             '-SONST',
+            '-WENN !ziel.blocked && LAEUFT != ziel',
             ' ENQ ziel',
         ],
         ausserhalb=['#depleted_count', '#refills'],
@@ -295,7 +300,15 @@ PAARE = [
               'und nimmt `refill` als bereits ausgeloest an (seine Vorbedingungen `used`, '
               '`depleted`, `budget > 0` stehen im `requires`, nicht im Rumpf) -- und (b) der '
               'Donation-Zweig: laeuft ein Donee gegen das Konto, wird DER wieder bereit. Beides '
-              'ausserhalb (ADR 0019).',
+              'ausserhalb (ADR 0019). '
+              'NEU seit 2026-08-03 (c): `WENN !ziel.blocked && LAEUFT != ziel`. Das Modell kennt '
+              'kein `pause` im Refill-Pfad, der Code muss es kennen -- BEFUND D8/M4, gemessen: '
+              'ohne diesen Waechter reihte der Refill einen PAUSIERTEN Thread wieder ein, er wurde '
+              '`current` und verbrauchte eine Zeitscheibe, `audit()==0`. PAUSE hielt also nicht, '
+              'und dafuer brauchte es nicht einmal ein `unblock`. Der `LAEUFT`-Teil verhindert '
+              'zusaetzlich Audit-Code 4 (`current` steht zugleich in einer Ready-Liste). '
+              'OFFEN und ausdruecklich NICHT geprueft: der Donee-Zweig setzt `donee.blocked` '
+              'weiterhin BEDINGUNGSLOS zurueck -- dieselbe Frage, nicht gemessen.',
     ),
     dict(
         name='set_budget',
@@ -330,6 +343,7 @@ AUDIT_QUEUE = [
     (1, '#tcbs.get schlaegt fehl'),
     (1, '!t.used'),
     (2, 't.blocked'),
+    (9, 't.depleted'),  # seit 2026-08-03 (D8/B2): die Gegenrichtung zu Code 7
     (6, 't.queued as usize != p || t.priority as usize != p'),
     (3, 't.qprev != prev'),
     (4, 'self.current == Some(s)'),
@@ -372,7 +386,7 @@ INVARIANTE = [
     ('ridx: in_ready ==> used',            1,    None),
     ('ridx: in_ready ==> !blocked',        2,    None),
     ('ridx: in_ready ==> nicht laufend',   4,    None),
-    ('ridx: in_ready ==> !depleted',       None, 'BEFUND B2: der Queue-Lauf prueft `depleted` nicht'),
+    ('ridx: in_ready ==> !depleted',       9,    None),  # B2 behoben 2026-08-03 (D8): Code 9
     ('ridx: lauffaehig ==> in_ready',      7,    None),
     ('bidx: remaining <= budget',          None, 'BEFUND B3: `audit` liest `budget`/`remaining` nie'),
     ('bidx: depleted ==> remaining == 0',  None, 'BEFUND B3'),
@@ -834,7 +848,13 @@ for name, code, notiz in INVARIANTE:
                   % (name, code))
     if code is None:
         befunde.append("%-36s -> KEIN Audit-Code (%s)" % (name, notiz))
-if any('depleted' in b for _, b in ist_q):
+# Diese Meldung darf NUR anschlagen, solange das Register die Teilaussage noch als
+# „kein Audit-Code" fuehrt. Sonst feuert sie ab dem Tag, an dem der Befund behoben ist, fuer
+# immer -- ein Waechter, der nach seiner eigenen Behebung weiterschreit, wird abgeschaltet, und
+# dann schweigt er auch beim naechsten echten Fall. (B2 ist seit 2026-08-03 als Code 9
+# eingetragen; die Meldung bleibt fuer den Fall, dass jemand den Code wieder herausnimmt.)
+_b2_noch_offen = any(n == 'ridx: in_ready ==> !depleted' and c is None for n, c, _ in INVARIANTE)
+if _b2_noch_offen and any('depleted' in b for _, b in ist_q):
     mangel(4, "Der Queue-Lauf von `audit` prueft jetzt `depleted` -- das Register oben (BEFUND B2)",
               "ist damit veraltet. Gute Nachricht, aber sie gehoert eingetragen.")
 if any(re.search(r'\b(budget|remaining)\b', b) for _, b in alle):
@@ -943,9 +963,22 @@ PY
                                  "        if self.tcbs[s].blocked {\n            self.tcbs[s].blocked = true;", 1)'
     erwarte kracht "Code: Verzweigung invertiert (pause: !blocked -> blocked)"
 
-    mutieren code 's = s.replace("""            self.tcbs[s].blocked = false;
-            self.enqueue_ready(s);""", "            self.tcbs[s].blocked = false;", 1)'
+    # Muster nachgezogen am 2026-08-03: seit der D8-Behebung steht das Einreihen in `unblock`
+    # hinter `if !self.tcbs[s].depleted`. Das ALTE Muster traf danach nichts mehr -- und der
+    # Waechter hat das als harten Fehler gemeldet statt als "schweigt". Genau dafuer ist die
+    # Regel da.
+    mutieren code 's = s.replace("""            if !self.tcbs[s].depleted {
+                self.enqueue_ready(s);
+            }""", "", 1)'
     erwarte kracht "Code: unblock reiht nicht mehr ein"
+
+    # Und die Gegenrichtung, neu seit der Behebung: faellt der Waechter WEG (also wieder
+    # bedingungsloses Einreihen wie vor D8), muss es ebenfalls anschlagen. Ohne diesen Fall
+    # koennte die Behebung still zurueckgedreht werden, ohne dass etwas meldet.
+    mutieren code 's = s.replace("""            if !self.tcbs[s].depleted {
+                self.enqueue_ready(s);
+            }""", "            self.enqueue_ready(s);", 1)'
+    erwarte kracht "Code: der D8-Waechter in unblock faellt weg (Rueckfall auf bedingungsloses Einreihen)"
 
     mutieren code 's = s.replace("    pub fn set_budget(&mut self", "    pub fn set_budget_v2(&mut self", 1)'
     erwarte kracht "Code: Funktion umbenannt (Waechter liest NICHT ins Leere)"

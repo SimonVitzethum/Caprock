@@ -325,6 +325,18 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   CI-Job hiess „Kani — Tier-1-Beweise (Loader-Parser)" und fuhr in Wahrheit alle vier Ziele. Daraus
   wurde ein Todo-Eintrag ueber eine Luecke, die es nicht gab — waehrend die echte Luecke (Beweise
   mit konkreten statt symbolischen Werten) unbenannt blieb.
+* **Die naheliegende Fassung eines Waechters kann schlimmer sein als der Fehler.** D8: `unblock`
+  reihte einen ERSCHOEPFTEN Thread bedingungslos ein. Die offensichtliche Behebung
+  `if blocked && !depleted { .. }` ueberspringt aber auch `blocked = false` — das RESUME wird
+  verschluckt, und zusammen mit dem noetigen zweiten Waechter im Refill verhungert der Thread
+  **vollstaendig** (gemessen: 0 Ticks mit Budget statt 6). Richtig ist der Waechter INNERHALB des
+  Rumpfes. Wer eine Behebung nicht mit derselben Schaerfe misst wie den Fehler, tauscht ihn nur
+  gegen einen schlechteren.
+* **Ein Waechter, der nach seiner eigenen Behebung weiterschreit, wird abgeschaltet.** Die
+  B2-Veraltungsmeldung im Scheduler-Waechter feuerte, sobald `audit` ueberhaupt `depleted` prueft
+  — also ab dem Tag, an dem der Befund behoben war, fuer immer. Danach schweigt sie auch beim
+  naechsten echten Fall. Solche Meldungen gehoeren an das Register gekoppelt, nicht an die
+  Beobachtung.
 * **Ein Gate im Format des falschen Servers ist kein schwaeches Gate, sondern keins.** Kani, Loom
   und Verus lagen in `.gitea/workflows/`; der Server ist GitLab und liest das nicht. Zwei
   Pipelines in der ganzen Projektgeschichte, beide vom 2026-05-23, beide mit der

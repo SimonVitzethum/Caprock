@@ -1131,14 +1131,72 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
          Code> }`. Ohne das bleibt genau der Zustand unbeobachtbar, der die Aussage widerlegt —
          dieselbe Form wie die leere Event-Queue ohne `CD.R`.
 
-      **Offen und ungeprüft:** der Donee-Zweig in `refill_depleted`
-      (`self.tcbs[d].blocked = false; enqueue_ready(d)`) setzt `blocked` bedingungslos zurück —
-      dieselbe Frage, nicht gemessen.
+      **Der Donee-Zweig ist am 2026-08-03 nachgemessen worden** — er trägt nicht, aber anders
+      als vermutet: nicht „er weckt zu viel", sondern **er weckt den Falschen und lässt den
+      Richtigen liegen**. Eigener Eintrag: **D9**.
 
       **Auch das noch nicht gemessen:** dass die Kette in einem *laufenden* Kernel eintritt.
       Gemessen ist die Zustandsmaschine am echten `Scheduler`; die Erreichbarkeit aus dem
       Syscall ist aus dem Quelltext argumentiert (`system.rs:6588`, `system.rs:2743`,
       `sel4lake-ipc:653`), nicht end-to-end ausgelöst.
+
+- [ ] **D9 Der DONEE-Zweig in `refill_depleted` — gemessen am 2026-08-03, fünf Befunde, keiner
+      behoben.** Werkzeug: `tools/sched-erschoepfung-messen.sh` (jetzt **208 Messwerte**, die
+      D-Reihe kam dazu). Der echte `crates/sel4lake-sched/src/lib.rs` wird gelinkt; Mutationen
+      nur auf Kopien.
+
+      **Positivkontrolle zuerst (P2):** der gesunde Fall trägt — Konto erschöpft, während der
+      Donee läuft; der Donee ist *nachweislich* auf das Konto-Budget geblockt (`blocked = 1`,
+      **nicht** in der Liste, `audit() = 0`); nach 100 Ticks Refill wird er `current`, während
+      eine Alternative bereitsteht, und der nächste Tick belastet ein Konto **mit** Budget.
+      Ohne diese Zeile wäre keine Zahl darunter etwas wert.
+
+      | Befund | gemessen |
+      |---|---|
+      | **D1 (F1) PAUSE hält nicht** — gesetzt, während das Konto noch Budget hat (`konto_depleted = 0`, `depleted_count = 0`), also nachweislich die PAUSE und nicht das Budget | nach dem Refill `blocked = 0`, **wird `current`**, Alternative stand bereit, verbraucht Budget, `audit() = 0` |
+      | **D5 verschachtelte Spende** (fs → Blockdienst → Treiber ist genau diese Form) — der zweite CALL überschreibt `sc_donee`, der innere REPLY (`end_donation`) löscht es; der äußere Server behält seinen `sc_donor` | beim Erschöpfen ist `sc_donee = None` → `_`-Zweig → **niemand weckt ihn**: 0 Ticks in 3 Perioden, `blocked = 1`, `audit() = 0`. Client **und** Server dauerhaft fest. **Kein Privileg nötig: zwei CALLs und ein REPLY.** |
+      | **D4 das Konto stirbt**, während der Donee auf sein Budget geblockt ist | `record_zombie` löst `sc_donor`, lässt `blocked = 1` — mit dem Konto verschwindet der einzige Wecker: 0 Ticks in 3 Perioden, `audit() = 0` |
+      | **D7 `set_budget`/`bind_sched_context` auf das Konto** räumt `depleted` weg — und damit den Anlass des Refills | 0 Ticks in 3 Perioden. Die vorhandene Prüfzeile `strand` deckt genau diese Strandung ab — aber nur für **einen einzelnen** budgetierten Thread, nicht für seinen Donee |
+      | **D6 `unblock` prüft das falsche Konto** — der D8-Wächter fragt `self.tcbs[s].depleted`, belastet wird aber `sc_donor.unwrap_or(s)` | RESUME am Donee → in der Liste, wird `current` mit bereitstehender Alternative, **ein voller Tick auf leerem Konto**, `depletions +1`, `depleted_count` driftet +1 (M5-Form) |
+
+      **F2 (D2): an der Scheduler-Schnittstelle auslösbar, im Kernel nicht.** Ein Donee mit
+      **eigenem** erschöpftem Konto wird vom Zweig eingereiht — und **Audit-Code 9 meldet es**
+      (`audit() = 9`), der Zustand ist also nicht unbeobachtbar. Über `sel4lake-ipc` ist er
+      derzeit nicht herstellbar: Donee wird man nur über `switch_to` aus `call`, und das Ziel
+      kommt aus der Empfängerliste — dort landet nur, wer `recv` ausgeführt hat, also gelaufen
+      ist, also nicht erschöpft war. **Offene Entwurfsfrage:** ob Code 9 einen Thread ausnehmen
+      muss, der auf einem **fremden** Konto läuft.
+
+      **F3: nicht auslösbar, und der Grund ist benannt.** Ein veralteter `sc_donee` entsteht
+      nicht — Tod löscht ihn (`record_zombie`), Migration wird für Donee *und* Konto verweigert
+      (`detach_for_migration`). Sprechprobe dazu: ein Thread **ohne** Spende lässt sich sehr wohl
+      herauslösen. Die Gegenrichtung ist der Befund: `sc_donee` wird **zu früh** gelöscht (D5).
+
+      **Behebungsvorschlag, gemessen (H-b im Werkzeug): der GRUND der Blockade gehört
+      mitgeschrieben.** Ein Bit `budget_blocked` im TCB; `on_tick` setzt es nur, wenn der Donee
+      nicht schon aus einem anderen Grund blockiert war; `refill_depleted` weckt **alle**
+      Threads mit `sc_donor == slot && budget_blocked` (die Spende ist ein **Stapel**, `sc_donee`
+      nur seine Spitze); `pause` übernimmt die Blockade; `unblock` lässt eine Budget-Blockade
+      stehen (gefahrlos, weil der Wecker **benannt** ist) und schiebt eine Blockade auf ein
+      leeres fremdes Konto in denselben Zustand; `record_zombie`/`set_budget` lassen ihre Donees
+      frei. Gemessen: D1/D4/D5/D6/D7 auf 0 bzw. „läuft wieder" (D4 299 Ticks, D5 6, D7 9),
+      Positivkontrolle bestanden, **M1…M7 unverändert** (keine D8-Regression).
+
+      **Und die Frage aus D8 noch einmal gestellt:** der naheliegende Wächter ist wieder der
+      falsche. `if !blocked && current != Some(d)` — wörtlich aus dem `_`-Zweig übertragen —
+      **fällt in der Positivkontrolle durch**: der Donee ist an dieser Stelle *immer* blockiert
+      (`on_tick` hat ihn gerade blockiert), also weckt ihn niemand mehr. Verhungerungsprobe zu
+      H-b: nach RESUME 4 Ticks **mit** Budget (echt: 3).
+
+      **Nebenbefund am Werkzeug selbst:** die Gegenproben von D8 waren nach ihrer eigenen
+      Behebung stumm abgebrochen („der Anker passt nicht mehr") — der Lauf am echten Quelltext
+      blieb grün und meldete das nicht als Fehler. Die Fassungen heißen jetzt `V0` (Stand vor
+      D8, als Sprechprobe der Mechanik: die alten Befunde tauchen dort wieder auf), `H-a`, `H-b`.
+
+      **Nicht gemessen:** dass D1/D5 in einem *laufenden* Kernel eintreten. Die Aufruffolgen
+      sind die von `sel4lake-ipc` (`call` → `switch_to`, `reply` → `end_donation` + `unblock`,
+      `recv` → `block_current`) und `system::freeze_thread` (das **vor** der Quiescence-Prüfung
+      `pause` absetzt und die PAUSE bei `Busy` stehen lässt), aber nicht end-to-end ausgelöst.
 
 - [ ] **D7 Das IPC-Modell trägt für den echten Endpoint nur einen Ausschnitt — gemessen, nicht
       geschätzt** (2026-08-03, `tools/verus-modelltreue-ipc.sh`, 32 Fälle · 12 Selbsttestfälle).

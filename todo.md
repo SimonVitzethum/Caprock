@@ -678,7 +678,23 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
          Eigene Zeile in `docs/invariants.md` §2, weil es dieselbe Struktur hat wie die
          BME/STE-Arbeitsteilung: zwei Mechanismen, von denen keiner den anderen ersetzt.
 
-- [ ] **x86-Fensterwahl** (vor der VT-d-Zuteilung, s. C): `0xFEE0_0000–0xFEEF_FFFF` ist als
+- [x] **x86-Fensterwahl — im Kern ERLEDIGT und RAM-UNABHAENGIG (gemessen 2026-08-03).** Die
+      Befuerchtung im Eintrag („auf einer kleineren Maschine nicht") trifft **nicht** zu, und
+      zwar aus einem Grund, den der Eintrag nicht nannte: das Fenster kommt als **feste Zusage**
+      aus der HAL (`crates/sel4lake-hal/src/x86_64/iommu.rs:32`), nicht aus `RAM_TOP`. Es gibt
+      nur zwei Faelle, beide enden oberhalb des Sperrbereichs — bis ~4 GiB springt die Basis auf
+      `0xFF00_0000`, darueber liegt sie ohnehin hoeher.
+      Gemessen ueber **fuenf RAM-Groessen** (256M / 512M / 1G / 2G / 2560M), alle `msi_clear=1`,
+      `dmawin : ALL PASS`, rc=0. Von den drei Nebenbedingungen: **IR** beruecksichtigt
+      (`GSTS.IRES=1`, `CFIS=0`), **ACS** beruecksichtigt (echtes `acs_enabled` je Funktion, die
+      Gruppen-Aliasmenge geht vollstaendig in `DmaCtx::sids`; q35: 8 Geraete, 6 Gruppen),
+      **RMRR nur teilweise**.
+      Was bleibt, steht als **E-Rest 1/2/3** im Abschnitt D — der luegende Pruefer im schwachen
+      Zweig, die RMRR-Faerbung, und der nicht ausfuehrbare 4-GiB-Zweig.
+      Nebenbefund: **Punkt 6.4 unten fuehrt IR noch als offen**, waehrend `bringup.rs:2621`
+      sagt „steht seit B-3.2". Eine Beschriftung, die neben der Sache herlaeuft — nachpruefen.
+
+- [x] **x86-Fensterwahl (Herleitung)**: `0xFEE0_0000–0xFEEF_FFFF` ist als
       IOVA **unbenutzbar**. VT-d behandelt DMA-Requests dorthin als Interrupt-Nachrichten und
       schickt sie durch das Interrupt-Remapping statt durch die Second-Level-Tabellen — eine IOVA
       in diesem Fenster wird also *nicht übersetzt*, egal was in der Tabelle steht. Auf einer
@@ -686,7 +702,21 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       auf einer kleineren nicht. Gehört als Bedingung an die Fensterwahl, zusammen mit IR, ACS
       und RMRR.
 
-- [ ] **Descriptor-Typestate** (`Owned<Driver>`/`Owned<Device>`) treiberseitig. Ausdrücklich
+- [x] **Descriptor-Typestate ERLEDIGT (2026-08-03).** `crates/sel4lake-virtio/src/owned.rs`:
+      `Owned<Driver>`/`Owned<Device>` mit unbewohnten Markern, `Region::carve` (monoton → keine
+      ueberlappenden Puffer), `Completion` als Abschlussbeleg. `Queue::set_desc` ist **privat**;
+      der einzige Weg ist `Queue::arm`, das den Puffer **by value** nimmt. Zurueck nur ueber
+      `reclaim(buf, &Completion)` oder das benannte `reclaim_unproven` (das `blk` braucht, um
+      nach einem Timeout die `0xff` im Statusbyte lesen zu duerfen). Alle drei Treiber migriert.
+      Die Crate bleibt **abhaengigkeitsfrei** — nachgeprueft.
+      **Belegt statt behauptet:** `tools/typestate-negativ.sh` — Positivkontrolle plus drei
+      Negativfaelle, jeder mit **erwartetem Fehlercode** (E0382/E0599/E0624), damit ein
+      Tippfehler kein Beleg ist; drei Mutationen kippen je genau ihren Fall.
+      **Nebenbefund, im Code vermerkt:** `#[derive(Clone, Copy)]` auf `Owned` ist ein **No-op**
+      (das Derive erzeugt die Schranke `S: Copy`, und die Marker sind unbewohnt). Die erste
+      Mutation war dadurch wirkungslos und meldete faelschlich gruen.
+
+- [x] **Descriptor-Typestate (Herleitung)** (`Owned<Driver>`/`Owned<Device>`) treiberseitig. Ausdrücklich
       **Ergonomie, nicht TCB**: eine Compile-Zeit-Disziplin innerhalb der Treiber-PD trägt an der
       Vertrauensgrenze nichts — sie fängt Fehler des Treiberautors, nicht das Verhalten eines
       kompromittierten Treibers. Lohnt trotzdem, weil „Puffer steht armiert in der Queue, ist im
@@ -1140,9 +1170,120 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       Syscall ist aus dem Quelltext argumentiert (`system.rs:6588`, `system.rs:2743`,
       `sel4lake-ipc:653`), nicht end-to-end ausgelöst.
 
-- [ ] **D10 Der Refill kostet seit H-b einen VOLLEN Tabellendurchlauf je aufgefülltem Konto —
-      gelesen, nicht gemessen.** (2026-08-03) **Klasse:** Leistung/Zusicherung · **Aufwand:**
-      Messfall mit großer Tabelle, dann ein Zähler nach dem Muster von `depleted_count`.
+- [ ] **D11 FEHLER, GEMESSEN: der 33. Sender an einem Endpoint hängt für immer — und kein
+      Prüfer kann ihn sehen.** (2026-08-03) **Klasse:** Fehler · **Aufwand:** Behebung
+      vorgeschlagen, nicht angewandt · **Fundort:** beim Erweitern des IPC-Modells (D7).
+
+      `TidQueue::enqueue` ist `if self.count < QCAP { … }` **ohne `else`**. Bei `QUEUE_CAP = 32`
+      landen von 33 CALLs 32 in der Queue. Der 33.:
+
+      | | |
+      |---|---|
+      | wird **trotzdem blockiert** | `block_current` läuft |
+      | bekommt **keinen** Ergebniscode | der Sentinel `0xDEADBEEF` steht unberührt im Frame |
+      | steht in **keiner** Struktur des Endpoints | weder Sender- noch Empfängerliste |
+      | `quiescence_of(…).is_quiescent()` | meldet ihn als **ruhig** |
+      | 33 nachfolgende RECVs | bedienen 32 — er wird **nie** geweckt |
+      | `audit` | `(false, false)` |
+      | `purge_thread` | `false` |
+
+      Er hängt dauerhaft, und **jeder** Prüfer meldet Ordnung. Das ist dieselbe Form wie die
+      leere Ereigniswarteschlange ohne `CD.R` — nur schlimmer, weil hier ein Thread verloren
+      geht und die Ruhemeldung einen Hot-Reload (A-4.2) fälschlich freigäbe.
+
+      **Dieselbe Zeile trifft drei weitere Stellen, alle gemessen:** der 33. RECV ebenso;
+      `bind_receiver` meldet `true`, obwohl verworfen; `migrate_owner` meldet `true`, löscht die
+      Antwortpflicht und verliert den Aufrufer.
+
+      **Zwei weitere Befunde aus demselben Lauf:** das Reply-Token wird beim zweiten RECV
+      **überschrieben** — der übergangene Aufrufer hängt, und `is_idle()` meldet den Endpoint
+      danach als *ruhig*, ein A-4.1-Austausch träfe also scheinbar niemanden. Und nach
+      `migrate_owner` bei geparktem Empfänger ist ein Rendezvous fällig, während **beide Seiten**
+      blockiert sind — ein Dritter überholt den migrierten Aufrufer.
+
+      **Vorschlag (nicht angewandt, `crates/` unberührt):** `enqueue -> bool`; ein voller
+      Endpoint gibt einen eigenen `ERR_EP_FULL` zurück **statt** zu blockieren; `bind_receiver`
+      und `migrate_owner` geben `false`. Vorher zu klären: ist „voll" für den Client dieselbe
+      Lage wie „stillgelegt"? A-4.2 hat für genau diese Unterscheidung `ERR_QUIESCING` von
+      `ERR_BADCAP` getrennt — „kommt gleich wieder" ist etwas anderes als „gibt es nicht", und
+      „gerade kein Platz" ist ein drittes.
+
+- [ ] **E-Rest 1: `iova_window_clear_of_msi` gibt im schwachen Zweig „in Ordnung" zurück, ohne
+      urteilen zu können.** (2026-08-03, gemessen) `kernel/src/system.rs:3900`:
+
+          let Some(first) = strong_window_base() else {
+              return true; // kein starkes Fenster -> es gibt nichts zu ueberlappen
+          };
+
+      Der Kommentar stimmt nur, wenn es gar kein Fenster gibt. Tatsächlich ist es dann
+      `[0, 512 GiB)` und **enthält** den Sperrbereich `0xFEE0_0000–0xFEEF_FFFF`. Sichtbar
+      gemacht über eine HAL-Mutation: Suite `== ALL PASS ==`, `msi_clear = 1`, bei nachweislich
+      weggefallener Trennung. Erreichbar ab ~512 GiB RAM.
+
+      Genau das, was `docs/invariants.md` und CLAUDE.md als Entwurfsprinzip ausschließen: **ein
+      Prüfer, der über Abwesenheit entscheidet, muss belegen können, dass er sprechfähig ist.**
+      Hier gibt er Schweigen als Erfolg aus. Richtig wäre: im schwachen Zweig prüfen, ob das
+      Fenster den Bereich enthält, und sonst „nicht entscheidbar" melden — nicht `true`.
+
+      Dazu: **`DmaCtx::strong_window` wird geschrieben und nirgends gelesen** (`system.rs:3944`
+      und `:3952` setzen es, `:4217` deklariert es, kein Lesezugriff). Die Unterscheidung
+      „starkes Fenster ja/nein" ist erfasst und wird nicht verwendet — kein Bericht, kein
+      Audit-Code.
+
+- [ ] **E-Rest 2: RMRR färbt das Gerät, nicht die Gruppe.** (2026-08-03, gemessen)
+      `GroupSpansUnits` färbt die ganze ACS-Gruppe, `Rmrr` nur die einzelne Funktion. Gemessen
+      mit einem Sonderharness gegen den unveränderten `dmar.rs`: zwei Funktionen ohne ACS in
+      einer Gruppe, RMRR auf 05.1 → `excluded[0] = None`, Aliasmenge `[0x28, 0x29]`,
+      `audit() = 0`. Wird 05.0 zugeteilt, bekommt die RID des RMRR-Geräts einen Kontexteintrag
+      in dessen Domäne. **Auf q35 unsichtbar (0 RMRRs), auf echter Hardware der Normalfall** —
+      also genau die Sorte Lücke, die eine Emulation nie zeigt.
+
+- [ ] **E-Rest 3: der Zweig „RAM oberhalb 4 GiB" ist heute nicht ausführbar.** (2026-08-03)
+      Ab `-m 3G` stirbt der Boot mit `#PF`, `cr2 = 0x0000_0070_0000_0014`, `rip` →
+      `Transport::status` (`0x14` = `DEVICE_STATUS`). Sobald QEMU Speicher oberhalb 4 GiB
+      anlegt, legt SeaBIOS die virtio-BARs bei `0x70_0000_0000` ab — und `mmu.rs:99` hat
+      `MAPPED_GIB = 4`. Solange das steht, kann die Fensterwahl in diesem Bereich nicht
+      gemessen werden.
+
+- [x] **D10 BEHOBEN am 2026-08-03: der Refill-Weckelauf läuft nur noch, wenn jemand darauf
+      wartet.** Gemessen in **Iterationen** (nicht Zeit — eine Iterationszahl ist eine
+      Eigenschaft des Programms), Sprechprobe Tabellengröße 32 gegen 10 000.
+
+      | | vorher | nachher |
+      |---|---|---|
+      | Ruhe (nichts erschöpft) | 0 | 0 |
+      | 100 Refills in **einem** Tick, kein Donee | 1 000 000 | **0** |
+      | dito, ein Donee | 1 000 000 | **10 000** |
+      | dito über **Migration** | 1 000 000 | **0** |
+      | `set_budget` | 10 000 | **0** |
+      | je Konto ein eigener Donee | 1 000 000 | **1 000 000** |
+
+      **Zwei Korrekturen an meiner eigenen Notiz.** Die `on_tick`-Zusicherung war nur **halb**
+      kaputt: der Normalfall kostet wirklich 0. Kaputt war der Fall „irgendein Konto erschöpft",
+      und die 10 000 kommen aus der **äußeren** Schleife, die schon vor der Donation da war.
+      Und der Einzelfall wird durch den Zähler nicht billiger.
+
+      **O(n²) ist erreichbar** — mein Einwand („pro Tick erschöpft nur eins") stimmt und reicht
+      nicht, weil die **Periode** die zweite Hälfte der Summe ist. Weg 1: Konto *i* erschöpft im
+      Tick `m+i`, Periode `Z−m−i` → alle Refills fallen auf Tick `Z`; gemessen 100 Refills in
+      *einem* Timer-Interrupt. Weg 2 braucht gar keine Periodenwahl: `attach_migrated` setzt
+      `next_refill = now + period`, mehrere erschöpfte Threads, die im selben Tick ankommen,
+      refillen gemeinsam — die Periode muss nur **geteilt** sein. Ausgelöst vom **Lastausgleich**,
+      nicht vom Mandanten. Weg 1 ist cap-vergittert, Weg 2 nicht.
+
+      **Der Zähler hat, was `depleted_count` heute Morgen fehlte:** eine **unabhängige
+      Nachzählung** in `audit()` → **Audit-Code 10**, wenn er von der Tabelle abweicht. Genau
+      diese Nachzählung fehlte damals, und deshalb log er. Bewegt wird er ausschließlich über
+      `set_budget_blocked(local, an)` (2 Erhöhungen, 4 Senkungen, 3 Bulk-Nachführungen, alle im
+      Kommentar aufgezählt). Die Lügen-Mutation „Senken weg" — die D8/M5-Form — schlägt an
+      allen vier Auflösungswegen an, die Positivkontrolle fällt durch.
+
+      **Was bleibt:** trägt jedes Konto einen eigenen blockierten Donee, ist k·n unverändert.
+      Ein Zähler kann „wer zeigt auf mich?" nicht beantworten; dafür bräuchte es eine
+      Donee-**Liste** je Konto.
+
+- [x] **D10 (Herleitung) Der Refill kostet seit H-b einen VOLLEN Tabellendurchlauf je
+      aufgefülltem Konto — gelesen, nicht gemessen.** (2026-08-03)
 
       Die neue Schleife (`refill_depleted`, `for d in 0..self.tcbs.len()`) liegt **innerhalb** der
       bestehenden Schleife über die Thread-Tabelle. `Slab::len()` ist die **Tabellengröße**, nicht
@@ -1208,8 +1349,8 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
 
       Die Herleitung und alle Zahlen der fünf Befunde stehen unverändert darunter.
 
-- [ ] **D9 (Herleitung) Der DONEE-Zweig in `refill_depleted` — gemessen am 2026-08-03, fünf
-      Befunde.** Werkzeug: `tools/sched-erschoepfung-messen.sh` (jetzt **208 Messwerte**, die
+- [x] **D9 (Herleitung — kein offener Punkt, sondern das Protokoll zur Behebung darüber.)
+      Der DONEE-Zweig in `refill_depleted`, gemessen am 2026-08-03, fünf Befunde.** Werkzeug: `tools/sched-erschoepfung-messen.sh` (jetzt **208 Messwerte**, die
       D-Reihe kam dazu). Der echte `crates/sel4lake-sched/src/lib.rs` wird gelinkt; Mutationen
       nur auf Kopien.
 
@@ -1266,7 +1407,32 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       `recv` → `block_current`) und `system::freeze_thread` (das **vor** der Quiescence-Prüfung
       `pause` absetzt und die PAUSE bei `Busy` stehen lässt), aber nicht end-to-end ausgelöst.
 
-- [ ] **D7 Das IPC-Modell trägt für den echten Endpoint nur einen Ausschnitt — gemessen, nicht
+- [x] **D7 ERLEDIGT am 2026-08-03: das IPC-Modell sagt jetzt, was gilt.** Nicht „mehr Beweise",
+      sondern ehrlicher: 3 Felder → **9**, 4 Operationen → **13**, 5 Beweise → **24**
+      (**25 verified, 0 errors**).
+      * `send_no_loss` traegt die Kapazitaetsschranke als **Vorbedingung**, und der Verlust
+        darueber ist **bewiesen** statt weggelassen.
+      * `ep_inv` ist auf das abgeschwaecht, was haelt (`quiescing || ep_inv_strong`); die
+        Aufrufdisziplin steht als Vorbedingung **im Modell** statt in einem Kommentar, und der
+        Bruch der starken Fassung ist bewiesen.
+      * neu: `reply` (Token-Konsum, kein Doppel-Reply, `token_inv`), das Tor
+        (`gate_distinguishes`, `gate_rejects_are_noops`, `reply_not_gated_by_quiescing`),
+        `queue_cap()`.
+      **Bewusst NICHT bewiesen, weil falsch:** `ep_inv_strong` als erhalten, unbedingte
+      Verlustfreiheit, Token-Erhalt — ihr **Gegenteil** ist bewiesen. Liveness ebenfalls nicht:
+      das ist eine Scheduler-Eigenschaft und wird gemessen, nicht bewiesen.
+      Waechter: **93 Prueffaelle** (32), **28 Selbsttestfaelle** (12), darunter 14 Sprechproben
+      **am Modell allein** — ohne die bliebe ein auf `true` aufgeweichtes `ep_inv`/`token_inv`
+      unbemerkt. Ein veralteter Anker ist jetzt ein **harter Fehler**; im Baseline-Lauf ging
+      „die kosmetische Mutation hat nichts geaendert" vorher direkt in „still" ueber — die
+      Negativkontrolle bestand, **weil** nichts geaendert wurde.
+      **Was der Beweis jetzt traegt:** das Protokoll eines Endpoints unter der Aufrufdisziplin
+      des Kernels — 8 von ~15 Operationen, alle 6 Zustandsfelder. **Nicht** getragen: Tod,
+      `rebind_server` (ausgerechnet *die* A-4.1-Operation), Nebenlaeufigkeit, Liveness. Die drei
+      dabei gefundenen Fehler (**D11**) liegen alle genau dort, wo Modell und Wirklichkeit sich
+      nur am Rand beruehren.
+
+- [x] **D7 (Herleitung) Das IPC-Modell trägt für den echten Endpoint nur einen Ausschnitt — gemessen, nicht
       geschätzt** (2026-08-03, `tools/verus-modelltreue-ipc.sh`, 32 Fälle · 12 Selbsttestfälle).
 
       Der Wächter fährt den **echten** `sel4lake-ipc`-Quelltext gegen ein aus der Beweisdatei

@@ -28,7 +28,9 @@ Zweig `arch/x86_64` (2026-08-03).
 | x86_64 | **2300 von 2300** mit identischer Signatur, `== ALL PASS ==` (2026-08-03: 200 im Leerlauf + 600 + 1500 unter Last in je 5 parallelen Stroemen, 20 vCPU auf 20 Kernen; alle Stroeme auch **untereinander** deckungsgleich, `e419003d625f`, ueber beide Aufrufe hinweg) |
 | x86_64 Lade-Suite | `== ALL PASS ==` (2026-08-03: 39 Pruefungen — 5 Module, **zwei** Treiber-PDs, Austausch, A-5.3/A-5.4, dazu **drei** verkettete Boots fuer Z4 Stufe 2, inkl. sieben Negativfaellen) |
 | aarch64 | `RUNS=6` → **6 von 6** mit identischer Signatur, `== ALL PASS ==` (2026-08-02, **mit Root-Task**; davor 16/16 ohne, s. D6/D5) |
-| Host-Tests | `mem 22 · part 14 · fat 20 · cycles 9 · loader 50 · cap 22` → `== HOST-TESTS: ALL PASS ==` (`tools/host-tests.sh`, 2026-08-03) |
+| Host-Tests | `mem · part · fat · cycles · loader · cap · virtio · typestate · ipctreue` → `== HOST-TESTS: ALL PASS ==` (`tools/host-tests.sh`, 2026-08-03) |
+| Verus | **16 Beweisdateien, 0 errors** — dazu **drei** Modell-Treue-Waechter (cap_space, IPC, Scheduler) mit 28 · 28 · 30 Selbsttestfaellen (2026-08-03) |
+| Scheduler-Messung | `tools/sched-erschoepfung-messen.sh`: 208 Messwerte, Positivkontrolle bestanden, vier Fassungen (echt/V0/H-a/H-b) — belegt D8, D9 und D10 |
 
 **Was diese 2300 Läufe heißen — und was nicht.** Die noch offene Hälfte von D0 (Hänger ab `sched`)
 hatte eine Grundlinie von rund **0,5 %** (2/400 unter Last, 1/200 im Leerlauf). Die ist jetzt
@@ -68,6 +70,16 @@ falsch.
   host-getestet), und `Image::build` ruft `classify_all`: **eine nicht uebertragbare Cap verhindert
   den Checkpoint vor dem Schreiben.** Belegt ueber drei verkettete Boots (244 → 345 → 446, Epochen
   1 → 2 → 3) und zwei Negativfaelle. Details in `done.md`.
+* **Vier Fehler im Kern gefunden, drei davon behoben — alle vier von Prüfern, die es gestern
+  noch nicht gab.** D8 (ein erschöpfter Thread lief über `unblock` auf leerem Konto, ohne jede
+  Cap), D9 (fünf Befunde im Donee-Zweig, darunter: die verschachtelte Spende `fs → Blockdienst →
+  Treiber` ließ Client **und** Server dauerhaft hängen), D10 (O(n²) im Timer-Interrupt,
+  erreichbar über den Lastausgleich) — behoben und gemessen. **D11 offen:** der 33. Sender an
+  einem Endpoint hängt für immer, `is_quiescent()` meldet ihn als ruhig, `audit` und
+  `purge_thread` sehen ihn nicht. Details in `todo.md`.
+  Das Muster dahinter ist wichtiger als die Fehler: **keiner war über die Testsuite auffindbar.**
+  Die Signatur der x86-Suite ist über alle drei Behebungen hinweg **byte-identisch geblieben**
+  (`e419003d625f`, 500 Läufe je Stand) — die Suite hat nie einen davon ausgelöst.
 * **D0 nachgemessen: 2300 Läufe, keine Abweichung — und trotzdem nicht zu.** Die alte Quote von
   0,5 % ist ausgeschlossen, 0,1 % nicht. Wichtiger als die Zahl: **niemand hat diesen Hänger
   behoben.** Er ist unter die Messschwelle gefallen, nicht repariert — und damit auch nicht mehr
@@ -325,6 +337,23 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   CI-Job hiess „Kani — Tier-1-Beweise (Loader-Parser)" und fuhr in Wahrheit alle vier Ziele. Daraus
   wurde ein Todo-Eintrag ueber eine Luecke, die es nicht gab — waehrend die echte Luecke (Beweise
   mit konkreten statt symbolischen Werten) unbenannt blieb.
+* **Ein `if cap { .. }` ohne `else` verwirft still — und der Aufrufer merkt es nicht.**
+  `TidQueue::enqueue` nahm 32 Sender; der 33. wurde TROTZDEM blockiert, bekam keinen
+  Ergebniscode, stand in keiner Struktur des Endpoints, wurde nie geweckt — und
+  `is_quiescent()` meldete ihn als RUHIG. `audit` sagte `(false,false)`, `purge_thread` `false`.
+  Ein Faden haengt dauerhaft, und JEDER Pruefer meldet Ordnung. Schlimmer als die leere
+  Event-Queue ohne `CD.R`, weil die Ruhemeldung zusaetzlich einen Hot-Reload freigaebe.
+  Wer eine Kapazitaet einfuehrt, muss den Ueberlauf **benennen** (Rueckgabewert, eigener
+  Fehlercode) — sonst ist die Schranke kein Schutz, sondern ein Loch.
+* **Ein Beweis, der die Wunschform beweist, ist schlechter als keiner.** `send_no_loss` galt am
+  echten Endpoint NICHT (die Kapazitaetsschranke kam im Modell nicht vor), `ep_inv` hielt nicht
+  der Typ, sondern die Aufrufdisziplin. Beides sah gruen aus. Die Behebung war nicht, mehr zu
+  beweisen, sondern das Modell auf das abzuschwaechen, was HAELT — und den Bruch der starken
+  Fassung ausdruecklich mitzubeweisen.
+* **Eine Iterationszahl ist eine Eigenschaft des Programms, eine Zeitmessung nicht.** Bei D10
+  war „wie teuer ist der Refill" auf einer 20-Kern-Maschine unter Last mit einer Stoppuhr nicht
+  zu beantworten. Gezaehlte Iterationen ergaben eine Tabelle, die sich vorher/nachher und ueber
+  vier Fassungen vergleichen laesst — und eine Sprechprobe (Tabelle 32 gegen 10 000).
 * **Ein Bit, das zwei Gruende traegt, macht den Wecker unbestimmbar.** Im Scheduler hiess
   `blocked` gleichzeitig „pausiert", „wartet in IPC" und „wartet auf Konto-Refill". Wer die
   Blockade aufhebt, hebt damit auch eine auf, deren Grund er nicht kennt — und wer sie stehen

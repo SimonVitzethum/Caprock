@@ -903,9 +903,9 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       | 2 | `.gitea/workflows/kani.yml` war seit Anlage **ungültiges YAML** (`: ` im Jobnamen, Z. 63 Sp. 49) | **behoben** + `tools/ci-yaml.sh` mit Selbsttest |
       | 3 | **kein Runner registriert** | **offen — hier** |
 
-      Gemessen, nicht vermutet: Pipeline 5 stand **284 s** in der Warteschlange, alle sechs Jobs
-      `pending`, `runner=None`, `tag_list` leer. Ein registrierter Runner greift binnen Sekunden
-      zu. Die Runner-API (`/projects/2/runners`) braucht ein Token, das hier nicht vorliegt —
+      Gemessen, nicht vermutet: Pipeline 5 stand **284 s** in der Warteschlange, Pipeline 6
+      **939 s (16 min)** — beide mit allen Jobs `pending`, `runner=None`, `tag_list` leer. Ein
+      registrierter Runner greift binnen Sekunden zu; 16 Minuten sind keine Langsamkeit mehr. Die Runner-API (`/projects/2/runners`) braucht ein Token, das hier nicht vorliegt —
       **welcher** Runner fehlt (kein Runner / falsche Tags / `paused`), ist damit noch nicht
       auseinandergehalten.
 

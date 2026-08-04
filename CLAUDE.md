@@ -61,6 +61,35 @@ Ein früher hier stehendes „aarch64 66/66, x86_64 24/24" war eine Momentaufnah
 in dieser Datei brauchen einen Stand **und eine Stichprobengröße**, sonst werden sie stillschweigend
 falsch.
 
+## Was am 2026-08-04 dazukam
+
+* **D11 behoben: der Ueberlauf einer Endpoint-Warteschlange ist BENANNT.** Neuer ABI-Code
+  `ERR_EP_FULL = 9`; `TidQueue::enqueue` gibt `bool` und ist `#[must_use]`. `call`/`recv` weisen
+  ab **ohne zu blockieren**, `bind_receiver` und `migrate_owner` melden Misserfolg statt Erfolg,
+  und `migrate_owner` prueft **vor** dem `take()` — die Antwortpflicht bleibt beim alten Besitzer,
+  statt geloescht zu werden und den Aufrufer zu verlieren.
+  **Eine fuenfte Fundstelle, die der Befund nicht nannte:** `Notification::wait` hatte dieselbe
+  Form bei Kapazitaet 1 — ein zweiter `WAIT` ueberschrieb den Wartenden.
+  Das Verus-Modell ist **dem Code gefolgt** (`dropped_*` -> `rejected_*`, `send_gate`/`recv_gate`
+  mit Code 3, **25 -> 30 Beweise**), der Modelltreue-Waechter faehrt 99 Faelle / 35
+  Selbsttestfaelle und fuehrt ein **Hauptbuch der Gestrandeten**; die Positivkontrolle sind fuenf
+  Mutationen, die D11 einzeln wiederherstellen. Im Kernel: Pruefzeile `epfull`.
+  Bemerkenswert: der alte Beweis `send_drops_above_cap` **bewies den Verlust**. Er war richtig —
+  der Code war falsch. Ein Beweis, der dem Code treu ist, kann das Falsche beweisen.
+* **E-Rest 3b behoben: die Freiliste kennt den Zonenwunsch.** `alloc_below`/`alloc_colored_below`
+  nehmen eine Obergrenze (Farbe und Zone in EINER Entscheidung); die drei Stellen mit benannter
+  GiB-0-Bedingung suchen jetzt, statt einmal zu fragen und aufzugeben. Der Behelf im Speicherplan
+  ist weg — hoher Speicher geht **vollstaendig** in die Freiliste (bei `-m 3G` vorher 0 von
+  1024 MiB).
+  **Der Befund war groesser als der Eintrag:** „unten zuerst" war ueberhaupt ein **Zufall der
+  Groessenrelation**. Best-Fit nimmt das kleinste passende Fragment; solange der obere Bereich
+  zufaellig groesser war (4G, 6G), landete alles Unbenannte unten. Bei 3G kehrt sich das um, und
+  der ganze Ladepfad faellt aus. „Unten zuerst" ist jetzt eine ausgesprochene Politik.
+  Zwei eigene Fehler dabei, beide in der Fallenliste unten.
+* **Gemessen:** RAM-Reihe 512M · 2560M · 3G · 4G · 6G (Hauptsuite) und 512M · 3G · 6G
+  (Lade-Suite), alle `== ALL PASS ==`; x86 `RUNS=8` mit identischer Signatur; Host-Tests, Verus,
+  drei Modelltreue-Waechter, Kerngrenze, Typestate gruen.
+
 ## Was am 2026-08-03 dazukam
 
 * **Z4 Stufe 2 steht: ein Thread ueberlebt eine BOOTGRENZE.** Derselbe Kernel speichert und
@@ -443,6 +472,22 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   gut, solange es genau einen Client gab; mit einem zweiten stand dort dessen Sektor, und die Zeile
   meldete `FAILURES` fuer einen Treiber, der alles richtig gemacht hatte. Ein Wert wird dort
   **erfasst, wo die Aussage gilt** — nicht dort, wo sie gedruckt wird.
+* **`match lock() { .. None => lock() }` ist ein Selbst-Deadlock im seltenen Zweig.** Der
+  Guard des Scrutinees lebt bis zum Ende des `match`; ein zweites `lock()` im `None`-Arm
+  blockiert auf einem Spinlock, den derselbe Faden haelt. Gebaut beim Ausweichpfad der
+  Zonenpolitik (E-Rest 3b), gemessen als stehende Lade-Suite. Ein Fehler im seltenen Zweig sieht
+  aus wie ein Haenger und nicht wie ein Fehler.
+* **Ein Zaehler, der VERSUCHE zaehlt, beantwortet die Frage nach der WIRKUNG nicht.** Der
+  Ausweichzaehler von E-Rest 3b meldete `1x` auf einer 512-MiB-Maschine, auf der es oberhalb
+  4 GiB gar keinen Speicher gibt — gezaehlt hatte er eine absichtlich uebergrosse Anforderung,
+  die NIRGENDS passte. „Unten war kein Platz" und „es wurde oben genommen" sind zwei Aussagen;
+  dieselbe Verwechslung wie `rx_used` gegen „Daten sind angekommen".
+* **„Unten zuerst" war jahrelang ein Zufall der Groessenrelation, kein Entwurf.** Best-Fit nimmt
+  das kleinste passende Fragment. Solange der Speicherbereich oberhalb 4 GiB zufaellig groesser
+  war als der untere, landete alles Unbenannte unten — und Dutzende Stellen kamen ohne
+  Zonenwunsch aus. Bei `-m 3G` (1024 gegen 2032 MiB) kehrt sich die Relation um, und der ganze
+  Ladepfad faellt aus. Wo eine Eigenschaft aus einer Groessenrelation folgt statt aus der
+  Struktur, verschwindet sie beim naechsten Messwert.
 * **`wrapping_sub` auf einer Zeitdifferenz ist die teuerste bequeme Zeile.** Ein Zähler, der um
   100 Zyklen zurückspringt, ergäbe rund `2^64` — ein Konto, das so belastet wird, ist sofort und
   dauerhaft erschöpft. Rückwärts heisst **verworfen**, nicht „fast einmal herum".

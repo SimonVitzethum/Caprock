@@ -8,8 +8,8 @@
 # `Verification/ipc/proofs/endpoint.rs` beweist etwas ueber ein Modell mit NEUN Feldern und ACHT
 # Operationen. `crates/sel4lake-ipc/src/lib.rs::Endpoint` hat SECHS Felder (`used`, `quiescing`,
 # `senders`, `receivers`, `caller`, `reply_owner`) und rund fuenfzehn Operationen. Alle sechs haben
-# im Modell inzwischen ein Gegenstueck; die drei weiteren (`delivered`, `dropped_senders`,
-# `dropped_receivers`) sind Buchhaltung, die im Code nirgends steht und deshalb **gemessen** wird.
+# im Modell inzwischen ein Gegenstueck; die drei weiteren (`delivered`, `rejected_senders`,
+# `rejected_receivers`) sind Buchhaltung, die im Code nirgends steht und deshalb **gemessen** wird.
 #
 # Ein struktureller 1:1-Vergleich waere hier trotzdem eine LUEGE (anders als bei `unlink`,
 # tools/verus-modelltreue.sh): er schlaege entweder immer an oder muesste so weit aufgeweicht
@@ -87,19 +87,25 @@
 #            Sender-Warteschlange nicht an, `migrate_owner` nicht die Empfaengerseite. Beides ist
 #            gewollt (A-4.1/A-4.3) -- die Invariante haelt deshalb nicht der TYP, sondern die
 #            Aufrufdisziplin, und die steht jetzt als Vorbedingung im Modell (`ep_inv`).
-#   B2       Der 33. Sender an EINEM Endpoint wird von `TidQueue::enqueue` still verworfen. Der
-#            Faden wird trotzdem blockiert, bekommt KEINEN Ergebniscode, steht in keiner Struktur
-#            des Endpoints, wird von 33 nachfolgenden `RECV` nie geweckt, und `quiescence_of`
-#            meldet ihn als RUHIG. `purge_thread` findet ihn nicht, `audit` meldet nichts.
-#   B2b/c/d  Dieselbe Schranke auf der Empfaengerseite, in `bind_receiver` (meldet ERFOLG, obwohl
-#            verworfen) und in `migrate_owner` (loescht die Antwortpflicht und verliert den
-#            Aufrufer).
 #   B3       Ein zweites `RECV` desselben Servers vor dem `REPLY` UEBERSCHREIBT das Reply-Token.
 #            Der uebergangene Aufrufer wird nie geweckt -- und `is_idle()` meldet den Endpoint
 #            danach als RUHIG, ein Austausch nach A-4.1 traefe also scheinbar niemanden.
 #   B4       Nach `migrate_owner` bei geparktem Empfaenger ist ein Rendezvous FAELLIG, aber beide
 #            Seiten sind blockiert; ein dritter Aufrufer ueberholt den migrierten.
-#   KEIN Kernel-Quelltext wird deshalb geaendert -- so wie beim `unlink`-Waechter.
+#   Fuer B3/B4 wird KEIN Kernel-Quelltext geaendert -- so wie beim `unlink`-Waechter.
+#
+# **B2/B2b/B2c/B2d sind am 2026-08-04 BEHOBEN und deshalb hier heraus** (D11, s. `done.md`). Sie
+# lauteten: der 33. Sender wird still verworfen, blockiert trotzdem, bekommt keinen Code, steht in
+# keiner Struktur und wird nie geweckt -- dieselbe Zeile traf Empfaengerseite, `bind_receiver`
+# (meldete ERFOLG, obwohl verworfen) und `migrate_owner` (loeschte die Antwortpflicht und verlor
+# den Aufrufer). An ihrer Stelle stehen jetzt **Proben**, die die Behebung nachweisen, und das
+# **Hauptbuch der Gestrandeten** (`Welt::gestrandete`): nach einem Lauf ueber alle vier
+# Ueberlaufwege darf kein Faden blockiert und zugleich unauffindbar sein. Die Positivkontrolle
+# dazu sind fuenf Mutationen im Selbsttest, die D11 einzeln wieder herstellen -- eine leere Liste
+# ist nur dann eine Aussage, wenn sie sich fuellen kann.
+#
+# Das ist genau der Weg, den die `befund`-Mechanik erzwingt: als die Behebung stand, schlug der
+# Waechter an ("der Befund trifft nicht mehr zu") und verlangte den Eintrag hier heraus.
 #
 # Aufruf:
 #   tools/verus-modelltreue-ipc.sh              # pruefen + Selbsttest
@@ -154,7 +160,8 @@ text = re.sub(r'//.*$', '', roh[m.end():i-1], flags=re.M)
 
 # -- Die Oberflaeche, die dieser Waechter kennt. Weicht sie ab, liest er ins Leere oder deckt
 #    weniger ab, als sein Kopf behauptet -- beides ist ein Fehler, kein stiller Erfolg.
-SPEC_ERWARTET  = {'queue_cap', 'gate', 'ep_inv_strong', 'ep_inv', 'token_inv', 'msgs_total',
+SPEC_ERWARTET  = {'queue_cap', 'gate', 'send_gate', 'recv_gate', 'core_eq',
+                  'ep_inv_strong', 'ep_inv', 'token_inv', 'msgs_total',
                   'send', 'recv', 'reply', 'bind_receiver', 'migrate_owner',
                   'begin_quiesce', 'end_quiesce'}
 PROOF_ERWARTET = {
@@ -162,9 +169,11 @@ PROOF_ERWARTET = {
     'bind_receiver_keeps_inv_under_discipline', 'bind_receiver_breaks_strong_inv',
     'migrate_owner_keeps_inv_under_discipline', 'migrate_owner_breaks_strong_inv',
     'end_quiesce_breaks_inv',
-    'send_accounts_every_message', 'send_no_loss', 'send_drops_above_cap',
-    'recv_drops_above_cap', 'recv_delivers_once', 'rendezvous_progress',
-    'gate_rejects_are_noops', 'gate_distinguishes',
+    'send_accounts_every_message', 'send_no_loss', 'send_rejects_above_cap',
+    'recv_rejects_above_cap', 'send_never_strands', 'recv_never_strands',
+    'bind_receiver_full_is_noop', 'migrate_owner_full_keeps_token',
+    'recv_delivers_once', 'rendezvous_progress',
+    'gate_rejects_are_noops', 'gate_distinguishes', 'gate_three_reasons_distinct',
     'send_preserves_token_inv', 'recv_preserves_token_inv', 'reply_preserves_token_inv',
     'migrate_owner_preserves_token_inv', 'reply_consumes_token', 'no_double_reply',
     'reply_not_gated_by_quiescing', 'recv_overwrites_token'}
@@ -633,6 +642,8 @@ mod treue {
             1
         } else if echt == result::ERR_QUIESCING {
             2
+        } else if echt == result::ERR_EP_FULL {
+            3
         } else {
             99
         }
@@ -662,8 +673,14 @@ mod treue {
         blockiert: Vec<u64>,
         /// Faeden, fuer die `unblock` gerufen wurde.
         geweckt: Vec<u64>,
-        verworfene_sender: u64,
-        verworfene_empfaenger: u64,
+        abgewiesene_sender: u64,
+        abgewiesene_empfaenger: u64,
+        /// **Das D11-Hauptbuch.** Jeder Faden, der nach einer Operation blockiert ist und
+        /// trotzdem in KEINER Struktur des Endpoints steht -- also niemanden mehr hat, der ihn
+        /// wecken koennte. Diese Liste muss ueber den GESAMTEN Lauf leer bleiben; sie ist die
+        /// Messgroesse, nicht ein Zaehler nebenbei. Vor der Behebung fuellte sie sich beim
+        /// 33. Sender, beim 33. Empfaenger, bei `bind_receiver` und bei `migrate_owner`.
+        gestrandete: Vec<u64>,
         naechste_id: u64,
         naechste_msg: u64,
     }
@@ -703,8 +720,9 @@ mod treue {
                 zugestellt: 0,
                 blockiert: Vec::new(),
                 geweckt: Vec::new(),
-                verworfene_sender: 0,
-                verworfene_empfaenger: 0,
+                abgewiesene_sender: 0,
+                abgewiesene_empfaenger: 0,
+                gestrandete: Vec::new(),
                 naechste_id: 1,
                 naechste_msg: 0x1000,
             }
@@ -753,8 +771,8 @@ mod treue {
                 caller: ep.caller.map(|t| t.to_raw()),
                 reply_owner: ep.reply_owner.map(|t| t.to_raw()),
                 delivered: self.zugestellt,
-                dropped_senders: self.verworfene_sender,
-                dropped_receivers: self.verworfene_empfaenger,
+                rejected_senders: self.abgewiesene_sender,
+                rejected_receivers: self.abgewiesene_empfaenger,
             }
         }
 
@@ -784,6 +802,20 @@ mod treue {
                 && ep.reply_owner != Some(t)
         }
 
+        /// **Die D11-Buchung.** Ist `t` durch diese Operation blockiert worden und strandet er,
+        /// wird er hier vermerkt -- unabhaengig davon, was die Operation gemeldet hat. Der Lauf
+        /// prueft am Ende, dass die Liste leer ist.
+        fn buche_strandung(&mut self, ep: &Endpoint, t: ThreadId, war_blockiert: bool) {
+            if war_blockiert && self.strandet(ep, t) {
+                self.gestrandete.push(t.to_raw());
+            }
+        }
+
+        /// Alle bisher gestrandeten Faeden. Leer heisst: jeder blockierte Faden ist auffindbar.
+        pub fn gestrandete(&self) -> &[u64] {
+            &self.gestrandete
+        }
+
         /// Ein echter `call` -- mit dem Modellschritt, den er unter `alpha` bewirken muss.
         pub fn tue_call(&mut self, ep: &mut Endpoint, c: ThreadId, kern: usize) -> Schritt {
             let msg = self.naechste_msg;
@@ -797,12 +829,17 @@ mod treue {
             self.laufend.insert(kern, c);
             let b0 = self.blockiert.len();
             ep.call(&mut *self, kern, f);
-            if self.blockiert[b0..].contains(&c.to_raw()) && self.strandet(ep, c) {
-                self.verworfene_sender += 1;
+            let blockiert = self.blockiert[b0..].contains(&c.to_raw());
+            let code = modellcode(frame_reg(f, reg::SYSNO_RESULT));
+            // **Abgewiesen heisst: Code 3 UND nicht blockiert.** Beide Haelften gehoeren dazu --
+            // ein Code, nach dem der Faden trotzdem blockiert ist, waere D11 mit Beipackzettel.
+            if code == 3 && !blockiert {
+                self.abgewiesene_sender += 1;
             }
+            self.buche_strandung(ep, c, blockiert);
             self.nachzaehlen();
             let nachher = self.alpha(ep);
-            Schritt { vorher, erwartet, nachher, code: modellcode(frame_reg(f, reg::SYSNO_RESULT)) }
+            Schritt { vorher, erwartet, nachher, code }
         }
 
         /// Ein echter `recv` -- mit seinem Modellschritt.
@@ -814,12 +851,15 @@ mod treue {
             self.laufend.insert(kern, s);
             let b0 = self.blockiert.len();
             ep.recv(&mut *self, kern, f);
-            if self.blockiert[b0..].contains(&s.to_raw()) && self.strandet(ep, s) {
-                self.verworfene_empfaenger += 1;
+            let blockiert = self.blockiert[b0..].contains(&s.to_raw());
+            let code = modellcode(frame_reg(f, reg::SYSNO_RESULT));
+            if code == 3 && !blockiert {
+                self.abgewiesene_empfaenger += 1;
             }
+            self.buche_strandung(ep, s, blockiert);
             self.nachzaehlen();
             let nachher = self.alpha(ep);
-            Schritt { vorher, erwartet, nachher, code: modellcode(frame_reg(f, reg::SYSNO_RESULT)) }
+            Schritt { vorher, erwartet, nachher, code }
         }
 
         /// Ein echter `reply`. `antwort` wird vorher in den Frame des Servers gelegt, damit die
@@ -839,15 +879,15 @@ mod treue {
         }
 
         /// `bind_receiver` (A-4.1). Meldet die Operation Erfolg, ohne dass der Faden danach
-        /// irgendwo steht, ist er gestrandet -- dieselbe Wirkung wie eine volle Warteschlange.
+        /// irgendwo steht, ist die Erfolgsmeldung eine Luege -- vor D11 genau der Fall bei
+        /// voller Warteschlange. Das wird als Strandung gebucht, nicht als Abweisung: hier gibt
+        /// es keinen Frame und keinen Code, sondern nur einen Rueckgabewert.
         pub fn tue_bind(&mut self, ep: &mut Endpoint, t: ThreadId)
             -> (modell::Endpoint, modell::Endpoint, bool) {
             let vorher = self.alpha(ep);
             let erwartet = modell::bind_receiver(&vorher, t.to_raw());
             let ok = ep.bind_receiver(t);
-            if ok && self.strandet(ep, t) {
-                self.verworfene_empfaenger += 1;
-            }
+            self.buche_strandung(ep, t, ok);
             (erwartet, self.alpha(ep), ok)
         }
 
@@ -859,12 +899,12 @@ mod treue {
             let erwartet = modell::migrate_owner(&vorher, alt.to_raw());
             let vorher_caller = ep.caller();
             let ok = ep.migrate_owner(alt);
-            if ok {
-                if let Some(c) = vorher_caller {
-                    if self.strandet(ep, c) {
-                        self.verworfene_sender += 1;
-                    }
-                }
+            if let Some(c) = vorher_caller {
+                // Der Aufrufer war vorher als `caller` auffindbar. Meldet die Operation Erfolg
+                // und steht er danach nirgends, hat sie ihn verloren -- und ihm zugleich die
+                // Antwortpflicht weggenommen, auf die er wartet. Das ist der gefaehrlichste der
+                // vier D11-Faelle.
+                self.buche_strandung(ep, c, ok);
             }
             (erwartet, self.alpha(ep), ok)
         }
@@ -914,8 +954,8 @@ mod treue {
             caller,
             reply_owner: owner,
             delivered: 0,
-            dropped_senders: 0,
-            dropped_receivers: 0,
+            rejected_senders: 0,
+            rejected_receivers: 0,
         }
     }
 
@@ -930,12 +970,23 @@ mod treue {
         /// der Ergebniscode ist der, den das Tor des Modells vorhersagt.
         ///
         /// `sendend` traegt die bewiesene Buchhaltung mit: ein zugelassenes `send` erhoeht
-        /// `msgs_total` um genau 1 (zugestellt ODER eingereiht ODER als verworfen gezaehlt --
-        /// `send_accounts_every_message`), ein abgewiesenes gar nicht, `recv` nie.
+        /// `msgs_total` um genau 1 (zugestellt ODER eingereiht ODER als abgewiesen gezaehlt --
+        /// `send_accounts_every_message`), ein am Endpoint-Tor abgewiesenes gar nicht, `recv` nie.
+        ///
+        /// **Der erwartete Code kommt seit D11 aus `send_gate`/`recv_gate`, nicht aus `gate`.**
+        /// Der Unterschied ist genau der dritte Grund: eine volle Warteschlange laesst `gate`
+        /// zu (der Endpoint ist in Ordnung) und wird trotzdem abgewiesen. Stuende hier weiter
+        /// `gate`, erwartete der Waechter beim 33. Sender den Code 0 -- und die Behebung waere
+        /// eine Abweichung.
         fn deckt(&mut self, name: &str, s: &Schritt, sendend: bool) {
             let erwartete_summe = modell::msgs_total(&s.vorher)
                 + u64::from(sendend && modell::gate(&s.vorher) == 0);
-            self.urteil(name, s, erwartete_summe, modell::gate(&s.vorher));
+            let code_soll = if sendend {
+                modell::send_gate(&s.vorher)
+            } else {
+                modell::recv_gate(&s.vorher)
+            };
+            self.urteil(name, s, erwartete_summe, code_soll);
         }
 
         /// Entsprechung fuer `reply`: **nicht** vom Stilllegungstor betroffen (A-4.2), nur von
@@ -975,7 +1026,7 @@ mod treue {
                 }
                 if !tor {
                     println!("              Ergebniscode {} statt {} (Modellcodes: 0 zulassen, \
-                              1 BADCAP, 2 QUIESCING, 99 unbekannt)", s.code, code_soll);
+                              1 BADCAP, 2 QUIESCING, 3 EP_FULL, 99 unbekannt)", s.code, code_soll);
                 }
             }
         }
@@ -1120,7 +1171,7 @@ mod treue {
         {
             let mut m = synth(true, false, 3, 0, None, None);
             m.delivered = 5;
-            m.dropped_senders = 2;
+            m.rejected_senders = 2;
             b.probe("msgs_total zaehlt den VERLUST mit (5 + 3 + 2 == 10)",
                     modell::msgs_total(&m) == 10);
         }
@@ -1305,19 +1356,25 @@ mod treue {
             let letzter = w.faden(0);
             alle.push(letzter);
             let sch = w.tue_call(&mut ep, letzter, 0);
-            b.deckt(&format!("CALL {} -- der Sender wird STILL verworfen (das Modell sagt es \
-                              voraus, statt es zu uebergehen)", QUEUE_CAP + 1), &sch, true);
-            b.befund(&format!("B2 der {}. Sender: block_current gerufen, in KEINER Warteschlange, \
-                               kein Token, KEIN Ergebniscode -- und quiescence_of meldet ihn als \
-                               ruhig", QUEUE_CAP + 1),
-                     w.blockiert_worden(letzter)
-                         && !ep.senders.contains(letzter)
-                         && ep.caller() != Some(letzter)
-                         && sch.code == 0
-                         && ep.quiescence_of(letzter).is_quiescent());
-            b.probe(&format!("die Buchhaltung sieht den Verlust: dropped_senders == 1 bei \
+            b.deckt(&format!("CALL {} -- der Sender wird ABGEWIESEN (Code 3), nicht verworfen",
+                             QUEUE_CAP + 1), &sch, true);
+            // **D11, die Aussage.** Die drei Teile gehoeren zusammen: er hat einen Code bekommen
+            // (er weiss, was los ist), er ist NICHT blockiert worden (er laeuft weiter), und der
+            // Endpoint ist unveraendert (die 32 vor ihm sind unberuehrt). Fehlte der mittlere,
+            // waere es D11 mit Beipackzettel.
+            b.probe(&format!("D11: der {}. Sender bekommt ERR_EP_FULL (Modellcode 3) statt \
+                              Schweigen", QUEUE_CAP + 1),
+                    sch.code == 3);
+            b.probe(&format!("D11: der {}. Sender wird NICHT blockiert -- er laeuft weiter und \
+                              kann wiederholen", QUEUE_CAP + 1),
+                    !w.blockiert_worden(letzter));
+            b.probe("D11: die Abweisung ist wirkungslos -- die Warteschlange steht unveraendert \
+                     auf QUEUE_CAP, kein Eintrag der 32 wurde verdraengt",
+                    w.alpha(&ep).senders.len() as usize == QUEUE_CAP
+                        && !ep.senders.contains(letzter));
+            b.probe(&format!("die Buchhaltung sieht die Abweisung: rejected_senders == 1 bei \
                               {} Aufrufern", QUEUE_CAP + 1),
-                    w.alpha(&ep).dropped_senders == 1);
+                    w.alpha(&ep).rejected_senders == 1);
 
             // Alle abarbeiten: wie viele werden je geweckt?
             let mut kette = true;
@@ -1330,13 +1387,21 @@ mod treue {
             }
             b.probe(&format!("{} RECV+REPLY danach decken ebenfalls", QUEUE_CAP + 1), kette);
             let geweckt = alle.iter().filter(|c| w.weck_zahl(**c) > 0).count();
-            b.befund(&format!("B2 Folge: von {} Aufrufern werden {} geweckt -- der letzte NIE. \
-                               Er bleibt blockiert, ohne dass ihn jemand wecken koennte",
-                              QUEUE_CAP + 1, geweckt),
-                     geweckt == QUEUE_CAP && w.weck_zahl(letzter) == 0);
-            b.befund("B2 Folge: auch purge_thread findet ihn nicht -- er steht in keiner Struktur \
-                      des Endpoints, und audit meldet weder Leiche noch Duplikat",
-                     !ep.purge_thread(letzter) && ep.audit(&mut |_t: ThreadId| true) == (false, false));
+            // Der Abgewiesene wird NICHT geweckt -- er war nie blockiert. Das ist der
+            // Unterschied zu vorher, wo dieselbe Zahl herauskam und einen haengenden Faden
+            // bedeutete. Deshalb steht die zweite Haelfte dabei.
+            b.probe(&format!("jeder EINGEREIHTE Aufrufer wird geweckt: {} von {} -- der \
+                              abgewiesene nicht, weil er nie blockiert war",
+                             geweckt, QUEUE_CAP + 1),
+                    geweckt == QUEUE_CAP && w.weck_zahl(letzter) == 0
+                        && !w.blockiert_worden(letzter));
+            // Die 33 RECVs bedienen 32 Sender; der letzte findet keinen und parkt. Danach ist
+            // die SENDER-Seite leer -- niemand ist liegengeblieben -- und audit meldet weder
+            // Leiche noch Duplikat.
+            b.probe("nach dem Abarbeiten ist kein Sender liegengeblieben, und audit meldet weder \
+                     Leiche noch Duplikat",
+                    w.alpha(&ep).senders.is_empty()
+                        && ep.audit(&mut |_t: ThreadId| true) == (false, false));
         }
         {
             // Dieselbe Schranke auf der EMPFAENGER-Seite.
@@ -1353,22 +1418,20 @@ mod treue {
                              QUEUE_CAP), kette);
             let letzter = w.faden(0);
             let sch = w.tue_recv(&mut ep, letzter, 0);
-            b.deckt(&format!("RECV {} -- der Empfaenger wird STILL verworfen", QUEUE_CAP + 1),
-                    &sch, false);
-            b.befund(&format!("B2b dieselbe Schranke, andere Seite: der {}. RECV blockiert, steht \
-                               in keiner Warteschlange und gilt als ruhig", QUEUE_CAP + 1),
-                     w.blockiert_worden(letzter)
-                         && !ep.receivers.contains(letzter)
-                         && ep.quiescence_of(letzter).is_quiescent());
+            b.deckt(&format!("RECV {} -- der Empfaenger wird ABGEWIESEN, nicht verworfen",
+                             QUEUE_CAP + 1), &sch, false);
+            b.probe(&format!("D11: dieselbe Schranke, andere Seite -- der {}. RECV bekommt Code 3 \
+                              und blockiert NICHT", QUEUE_CAP + 1),
+                    sch.code == 3 && !w.blockiert_worden(letzter)
+                        && !ep.receivers.contains(letzter));
 
             // Und `bind_receiver` an derselben vollen Warteschlange.
             let v = w.faden(0);
             let (e, n, ok) = w.tue_bind(&mut ep, v);
             b.deckt_zustand("bind_receiver bei VOLLER Empfaenger-Warteschlange", &e, &n);
-            b.befund("B2c bind_receiver meldet ERFOLG, obwohl der Empfaenger verworfen wurde -- \
-                      ein Aufrufer, der darauf baut, haelt einen Endpoint fuer gebunden, der es \
-                      nicht ist",
-                     ok && !ep.receivers.contains(v));
+            b.probe("D11: bind_receiver meldet MISSERFOLG, wenn die Warteschlange voll ist -- \
+                     vorher meldete es Erfolg, waehrend der Eintrag verschwand",
+                    !ok && !ep.receivers.contains(v));
         }
 
         // -- A-4.1/A-4.3: bind_receiver und migrate_owner --------------------------------------
@@ -1438,10 +1501,14 @@ mod treue {
             let erster = ep.caller();
             let (e, n, ok) = w.tue_migrate(&mut ep, srv);
             b.deckt_zustand("migrate_owner bei VOLLER Sender-Warteschlange", &e, &n);
-            b.befund("B2d migrate_owner meldet ERFOLG, obwohl der Aufrufer beim Wiedereinreihen \
-                      verworfen wurde -- die Antwortpflicht ist geloescht und der Client ist weg",
-                     ok && erster.is_some() && !ep.senders.contains(erster.unwrap())
-                         && ep.caller().is_none());
+            // **Der gefaehrlichste der vier D11-Faelle.** Vorher: Erfolg gemeldet, Antwortpflicht
+            // geloescht, Aufrufer nirgends -- er wartete auf eine Antwort, die niemand mehr
+            // schuldete. Jetzt: gar nichts passiert, und die Antwortpflicht steht noch da, wo sie
+            // hingehoert. Der Aufrufer laeuft dann ueber `owner_died` -> ERR_SERVER_GONE auf.
+            b.probe("D11: migrate_owner bei voller Sender-Warteschlange ist ein NO-OP und meldet \
+                     Misserfolg -- die Antwortpflicht bleibt beim alten Besitzer stehen",
+                    !ok && erster.is_some() && ep.caller() == erster
+                        && ep.reply_owner == Some(srv));
         }
 
         // -- Das Reply-Token: die schwierige Stelle --------------------------------------------
@@ -1527,6 +1594,66 @@ mod treue {
                          kennt keinen Serverausfall", &vorher, &nachher);
             b.probe("G4 Positivkontrolle: owner_died gibt genau den wartenden Aufrufer zurueck",
                     gerettet == Some(c));
+        }
+
+        // -- D11: das Hauptbuch der gestrandeten Faeden ----------------------------------------
+        //
+        // Die Einzelfaelle oben pruefen je einen Ausgang. Dieser Block fragt die Eigenschaft im
+        // GANZEN: nach einem Lauf, der alle vier Ueberlaufwege beruehrt, darf **kein** Faden
+        // blockiert und zugleich unauffindbar sein.
+        //
+        // Die Positivkontrolle dazu ist keine Zeile hier, sondern die Mutation weiter unten
+        // ("Code: der Ueberlauf blockiert wieder still" u. a.): sie stellt D11 wieder her, und
+        // dann MUSS genau diese Probe fehlschlagen. Eine leere Liste ist nur dann eine Aussage,
+        // wenn sie sich fuellen kann.
+        {
+            let mut w = Welt::neu();
+            let mut ep_s = Endpoint::EMPTY;
+            let mut ep_r = Endpoint::EMPTY;
+            ep_s.mark_used();
+            ep_r.mark_used();
+
+            // (1) Sender-Ueberlauf, dreimal -- der Endpoint bleibt dabei unveraendert.
+            for _ in 0..QUEUE_CAP {
+                let c = w.faden(0);
+                let _ = w.tue_call(&mut ep_s, c, 0);
+            }
+            let mut codes_s = Vec::new();
+            for _ in 0..3 {
+                let c = w.faden(0);
+                codes_s.push(w.tue_call(&mut ep_s, c, 0).code);
+            }
+            // (2) Empfaenger-Ueberlauf am zweiten Endpoint.
+            for _ in 0..QUEUE_CAP {
+                let s = w.faden(0);
+                let _ = w.tue_recv(&mut ep_r, s, 0);
+            }
+            let mut codes_r = Vec::new();
+            for _ in 0..2 {
+                let s = w.faden(0);
+                codes_r.push(w.tue_recv(&mut ep_r, s, 0).code);
+            }
+            // (3) bind_receiver an der vollen Empfaengerseite.
+            let v = w.faden(0);
+            let (_, _, bind_ok) = w.tue_bind(&mut ep_r, v);
+            // (4) migrate_owner an der vollen Senderseite: erst eine Antwortpflicht herstellen.
+            let srv = w.faden(0);
+            let _ = w.tue_recv(&mut ep_s, srv, 0); // nimmt einen Sender -> Platz wird frei
+            let nach = w.faden(0);
+            let _ = w.tue_call(&mut ep_s, nach, 0); // Platz wieder voll
+            let caller_vorher = ep_s.caller();
+            let (_, _, mig_ok) = w.tue_migrate(&mut ep_s, srv);
+
+            b.probe("D11 im Ganzen: nach 4 Ueberlaufwegen ist KEIN Faden blockiert und zugleich \
+                     unauffindbar -- das Hauptbuch der Gestrandeten ist leer",
+                    w.gestrandete().is_empty());
+            b.probe("D11: alle 5 Ueberlaeufe an call/recv tragen denselben, benannten Code 3",
+                    codes_s.iter().all(|c| *c == 3) && codes_r.iter().all(|c| *c == 3));
+            b.probe("D11: die beiden Wege ohne Frame melden Misserfolg statt Erfolg",
+                    !bind_ok && !mig_ok);
+            b.probe("D11: und die Antwortpflicht, die migrate_owner nicht verschieben konnte, \
+                     steht unveraendert -- der Aufrufer ist nicht verlorengegangen",
+                    caller_vorher.is_some() && ep_s.caller() == caller_vorher);
         }
 
         println!("-- {} Faelle geprueft, {} Abweichung(en) --", b.n, b.fehler);
@@ -1712,18 +1839,51 @@ PY
     }
 
     # -- Mutationen am ECHTEN Code: Rendezvous und Abbildung --------------------------------------
-    mutieren code 's = s.replace("""        self.senders.enqueue(caller);
-        ops.block_current(core, frame)""", """        ops.block_current(core, frame)""", 1)'
+    # Anker bewusst EINZEILIG und ohne Umlaute: ein mehrzeiliger Anker durch einen Kommentarblock
+    # hindurch bricht bei jeder Umformulierung, und ein gebrochener Anker meldet sich als HARTER
+    # FEHLER -- richtig so, aber vermeidbar.
+    mutieren code 's = s.replace("        if !self.senders.enqueue(caller) {",
+                                 "        if false {", 1)'
     erwarte kracht "Code: CALL reiht den Sender nicht mehr ein"
 
     mutieren code 's = s.replace("            transfer(frame, sframe);\n", "", 1)'
     erwarte kracht "Code: CALL uebertraegt die Nachricht nicht (Rendezvous ohne Zustellung)"
 
-    mutieren code 's = s.replace("""        self.receivers.enqueue(server);
-        ops.block_current(core, frame)""", """        self.receivers.enqueue(server);
-        self.receivers.enqueue(server);
-        ops.block_current(core, frame)""", 1)'
+    mutieren code 's = s.replace("""        if !self.receivers.enqueue(server) {""",
+                                 """        let _ = self.receivers.enqueue(server);
+        if !self.receivers.enqueue(server) {""", 1)'
     erwarte kracht "Code: RECV reiht den Empfaenger doppelt ein"
+
+    # -- Mutationen am ECHTEN Code: D11 wieder herstellen ------------------------------------------
+    #
+    # Das sind die Positivkontrollen zum Hauptbuch der Gestrandeten. Jede stellt genau einen der
+    # vier Ueberlaufwege auf den Stand vor dem 2026-08-04 zurueck; schweigt der Waechter dabei,
+    # misst er die Eigenschaft nicht, um die es geht.
+    # `let _ = enqueue(..); if false { .. }` ist WOERTLICH der Stand vor dem 2026-08-04: das
+    # Ergebnis wird verworfen, der Abweisungszweig ist tot, `block_current` laeuft unbedingt.
+    mutieren code 's = s.replace("        if !self.senders.enqueue(caller) {",
+                                 "        let _ = self.senders.enqueue(caller);\n        if false {", 1)'
+    erwarte kracht "Code: D11 zurueck -- der 33. Sender blockiert wieder still (kein Code, kein Eintrag)"
+
+    mutieren code 's = s.replace("        if !self.receivers.enqueue(server) {",
+                                 "        let _ = self.receivers.enqueue(server);\n        if false {", 1)'
+    erwarte kracht "Code: D11 zurueck -- der 33. RECV blockiert wieder still"
+
+    mutieren code 's = s.replace("        self.receivers.enqueue(tid)\n    }",
+                                 "        let _ = self.receivers.enqueue(tid);\n        true\n    }", 1)'
+    erwarte kracht "Code: D11 zurueck -- bind_receiver meldet wieder Erfolg, ohne einen zu haben"
+
+    mutieren code 's = s.replace("if self.used && self.reply_owner == Some(old_owner) && !self.senders.is_full() {",
+                                 "if self.used && self.reply_owner == Some(old_owner) {", 1)'
+    erwarte kracht "Code: D11 zurueck -- migrate_owner loescht die Antwortpflicht und verliert den Aufrufer"
+
+    mutieren code 's = s.replace("""        if self.count >= QCAP {
+            return false;
+        }""", """        if self.count >= QCAP {
+            return true;
+        }""", 1)'
+    erwarte kracht "Code: enqueue LUEGT beim Ueberlauf (meldet Erfolg, ohne einzureihen) -- die \
+Wurzel aller vier Faelle"
 
     mutieren code 's = s.replace("    pub fn call(&mut self, ops: &mut dyn SchedOps",
                                  "    pub fn call_umbenannt(&mut self, ops: &mut dyn SchedOps", 1)'
@@ -1792,7 +1952,7 @@ PY
     mutieren modell 's = s.replace("pub open spec fn msgs_total", "pub open spec fn msgs_gesamt", 1)'
     erwarte kracht "Modell: msgs_total umbenannt"
 
-    mutieren modell 's = s.replace("    ep.delivered + ep.senders.len() + ep.dropped_senders",
+    mutieren modell 's = s.replace("    ep.delivered + ep.senders.len() + ep.rejected_senders",
                                    "    ep.delivered + ep.senders.len()", 1)'
     erwarte kracht "Modell: msgs_total zaehlt den Verlust nicht mehr mit (der Verlust wird unsichtbar)"
 
@@ -1811,8 +1971,27 @@ PY
                                    "pub open spec fn queue_cap() -> nat { 64 }", 1)'
     erwarte kracht "Modell: die Schranke ist nicht mehr die des Codes"
 
-    mutieren modell 's = s.replace("    } else if ep.senders.len() < queue_cap() {", "    } else if true {", 1)'
-    erwarte kracht "Modell: die Kapazitaetsschranke im send-Zweig ist weg (der 33. Sender geht durch)"
+    mutieren modell 's = s.replace("""    } else if ep.receivers.len() == 0 && ep.senders.len() >= queue_cap() {
+        3  // <-> ERR_EP_FULL""", """    } else if false {
+        3  // <-> ERR_EP_FULL""", 1)'
+    erwarte kracht "Modell: die Kapazitaetsschranke in send_gate ist weg (der 33. Sender geht durch)"
+
+    mutieren modell 's = s.replace("""    } else if ep.senders.len() == 0 && ep.receivers.len() >= queue_cap() {
+        3
+    } else {
+        0
+    }
+}""", """    } else if false {
+        3
+    } else {
+        0
+    }
+}""", 1)'
+    erwarte kracht "Modell: die Kapazitaetsschranke in recv_gate ist weg"
+
+    mutieren modell 's = s.replace("""        3  // <-> ERR_EP_FULL: \"gerade kein Platz\" (D11)""",
+                                   """        2  // <-> ERR_EP_FULL: \"gerade kein Platz\" (D11)""", 1)'
+    erwarte kracht "Modell: voll und stillgelegt tragen denselben Code (der dritte Grund verschwiegen)"
 
     mutieren modell 's = s.replace("""    } else if ep.quiescing {
         2""", """    } else if ep.quiescing {
@@ -1822,11 +2001,11 @@ PY
     mutieren modell 's = s.replace("""            senders: ep.senders, receivers: ep.receivers,
             caller: None, reply_owner: None,
             delivered: ep.delivered,
-            dropped_senders: ep.dropped_senders, dropped_receivers: ep.dropped_receivers,""",
+            rejected_senders: ep.rejected_senders, rejected_receivers: ep.rejected_receivers,""",
                                    """            senders: ep.senders, receivers: ep.receivers,
             caller: ep.caller, reply_owner: ep.reply_owner,
             delivered: ep.delivered,
-            dropped_senders: ep.dropped_senders, dropped_receivers: ep.dropped_receivers,""", 1)'
+            rejected_senders: ep.rejected_senders, rejected_receivers: ep.rejected_receivers,""", 1)'
     erwarte kracht "Modell: reply konsumiert das Token nicht mehr"
 
     mutieren modell 's = s.replace("            caller: Some(ep.senders.first()), reply_owner: Some(tid),",
@@ -1845,10 +2024,8 @@ vor = s
 s = s.replace("        let caller = ops.current_id(core);",
               "        // Kommentar des Selbsttests.\n\n        let aufrufer = ops.current_id(core);", 1)
 s = s.replace("            self.caller = Some(caller);", "            self.caller = Some(aufrufer);", 1)
-s = s.replace("""        self.senders.enqueue(caller);
-        ops.block_current(core, frame)""",
-              """        self.senders.enqueue(aufrufer);
-        ops.block_current(core, frame)""", 1)
+s = s.replace("        if !self.senders.enqueue(caller) {",
+              "        if !self.senders.enqueue(aufrufer) {", 1)
 if s == vor:
     sys.exit("FEHLER: die kosmetische Mutation am Code hat nichts geaendert.")
 io.open(c, 'w', encoding='utf-8').write(s)

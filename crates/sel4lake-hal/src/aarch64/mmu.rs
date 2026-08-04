@@ -326,6 +326,19 @@ pub const USER_RAM_MIN: u64 = RAM_BASE + TWO_MIB;
 /// VSpace muss in `[USER_RAM_MIN, GIB1_END)` liegen (die per-PD-L2 deckt GiB 1 ab).
 pub const GIB1_END: u64 = RAM_BASE + ONE_GIB;
 
+/// **Obergrenze der bevorzugten Allokationszone** (E-Rest 3b).
+///
+/// Auf x86 ist das die Grenze des fest abgebildeten Bereichs (4 GiB): darüber wächst die Karte
+/// nur gezielt, und mehrere Pfade brauchen Speicher, den sie identisch abbilden können. Der
+/// aarch64-Zweig hat diese Zweiteilung **nicht** — es gibt keinen Bereich oberhalb einer
+/// Kartengrenze, in den der Allokator ausweichen könnte.
+///
+/// Deshalb steht hier `u64::MAX` und nicht etwa [`GIB1_END`]: eine Vorgabe, die es auf dieser
+/// Architektur gar nicht gibt, als Zahl zu erfinden hiesse, dem Allokator eine Einschränkung
+/// unterzuschieben, die keine Ursache hat. Die *echte* GiB-0-Bedingung für PD-private Regionen
+/// steht weiterhin bei ihren Aufrufern (`system::gib0_zone`), auf beiden Architekturen gleich.
+pub const LOW_MAPPED_END: u64 = u64::MAX;
+
 /// Größe der privaten User-Region je isolierter PD (ein L2-Block).
 pub const ISO_REGION_SIZE: u64 = TWO_MIB;
 

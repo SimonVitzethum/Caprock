@@ -272,6 +272,9 @@ fn spawn_demo() -> bool {
         QUIESCE_OK.store(system::run_quiesce(), Ordering::Release);
         // A-4.1: atomares Umbinden -- alle Ausgaenge, ebenfalls auf einem lokalen Objekt.
         REBIND_OK.store(system::run_rebind(), Ordering::Release);
+        // D11: der Ueberlauf einer Endpoint-Warteschlange ist benannt, nicht still. Ebenfalls
+        // auf einem lokalen Objekt -- ein benutzter Endpoint wuerde hier 32 Leichen behalten.
+        EPFULL_OK.store(system::run_epfull(), Ordering::Release);
         // A-4.3: die Zustandsuebergabe, alle Ausgaenge. Auf einer EIGENEN Scratch-Region -- der
         // Test darf den Zustand, dessen Ueberleben `ckpt` belegt, nicht selbst anfassen.
         STATE_OK.store(system::run_state(), Ordering::Release);
@@ -1722,6 +1725,8 @@ static QUIESCE_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// A-4.1: bindet der Austausch atomar um -- ohne Zustand ohne Empfaenger dazwischen?
 #[cfg(feature = "selftest")]
 static REBIND_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "selftest")]
+static EPFULL_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// A-4.3: weist die Zustandsuebergabe ein fremdes Layout ab, statt es fehlzuinterpretieren?
 #[cfg(feature = "selftest")]
@@ -1810,6 +1815,9 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
     // A-4.1 aus demselben Grund: eine Zusicherung, die nur im Bericht steht, faellt beim
     // Brechen niemandem auf.
     let rebind = REBIND_OK.load(Ordering::Acquire);
+    // D11 aus demselben Grund: eine Zusicherung, die nur im Bericht steht, faellt beim Brechen
+    // niemandem auf.
+    let epfull = EPFULL_OK.load(Ordering::Acquire);
     // A-4.3 aus demselben Grund: eine Zusicherung, die nur im Bericht steht, faellt beim Brechen
     // niemandem auf.
     let state = STATE_OK.load(Ordering::Acquire);
@@ -1843,6 +1851,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             ("iface", iface),
             ("quiesce", quiesce),
             ("rebind", rebind),
+            ("epfull", epfull),
             ("state", state),
         ];
     }
@@ -1865,12 +1874,13 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
         && iface
         && quiesce
         && rebind
+        && epfull
         && state
 }
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 20;
+const DONE_FLAGS: usize = 21;
 
 /// Bericht + Abschaltung (das Testskript wertet die Marker aus).
 ///
@@ -1883,6 +1893,17 @@ const DONE_FLAGS: usize = 20;
 /// das hier ist die Spiegelung, nicht eine neue Erfindung.
 #[cfg(feature = "selftest")]
 fn report_and_off(watchdog: bool) -> ! {
+    // **E-Rest 3b, und die Zahl gehoert an den SCHLUSS, nicht an den Hochlauf.** Sie sagt, wie oft
+    // die Vorgabe „unten zuerst" nicht erfuellt werden konnte und oberhalb 4 GiB ausgewichen
+    // wurde. `0` heisst „kam nicht vor" -- **nicht** „geht nicht": auf diesen Aufbauten reicht
+    // der untere Bereich, der Ueberlaufpfad ist damit in QEMU ungefahren. Ohne diese Zeile saehe
+    // ein ungefahrener Pfad genauso aus wie ein tragender. Gefahren wird er in den Host-Tests
+    // (`zone_ohne_platz_liefert_none`).
+    println!(
+        "mem     : Zonenvorgabe 'unten zuerst' -- Ausweichen oberhalb 4 GiB: {}x (0 = kam nicht \
+         vor, nicht 'geht nicht')",
+        system::high_fallbacks()
+    );
     let ticks = hal::timer::ticks(0);
     let mut all_tick = true;
     for c in 0..system::num_cores() {
@@ -2480,9 +2501,9 @@ pub fn run(multiboot_info: u64) -> ! {
         }
     };
     let grenze = hal::mmu::LOW_MAPPED_END;
-    // **Erst alles unter 4 GiB** -- das ist der Speicher, den es auf jeder Maschine gibt, und
-    // die Groesse seines kleinsten Bereichs entscheidet gleich ueber den Rest.
-    let mut unten_kleinster = u64::MAX;
+    // **Erst alles unter 4 GiB** -- der Speicher, den es auf jeder Maschine gibt. Die Reihenfolge
+    // ist seit E-Rest 3b nur noch Ordnung im Bericht, keine Zusicherung mehr: welcher Bereich
+    // eine Anforderung bedient, entscheidet der Zonenwunsch, nicht die Einspeisereihenfolge.
     for &(rb, rl) in &avail[..navail] {
         // Was unterhalb von `free_base` liegt, gehoert dem Kernel-Image und den Boot-Tabellen.
         let a = rb.max(free_base);
@@ -2490,39 +2511,27 @@ pub fn run(multiboot_info: u64) -> ! {
         if b <= a {
             continue;
         }
-        unten_kleinster = unten_kleinster.min(b - a);
         einspeisen(a, b, &mut gross, &mut bi);
     }
-    if unten_kleinster == u64::MAX {
-        unten_kleinster = 0;
-    }
     /*
-     * **Und jetzt der Teil oberhalb von 4 GiB -- mit einer Bedingung, die gemessen ist.**
+     * **Und jetzt der Teil oberhalb von 4 GiB -- seit E-Rest 3b ohne Bedingung.**
      *
-     * Der `PhysAllocator` waehlt BEST-FIT: das kleinste Fragment, in das die Anforderung passt.
-     * Solange der Speicher zusammenhaengt, gibt es genau ein Fragment, und die Belegung laeuft
-     * von unten nach oben. Auf diese unausgesprochene Eigenschaft verlassen sich zwei Stellen:
-     * `alloc_dma_region` und die Region einer isolierten PD MUESSEN in GiB 0 liegen (`system.rs`
-     * prueft `< GIB1_END`, weil `vspace_map_block` nur dort abbilden kann) -- und beide
-     * versuchen es **kein zweites Mal**. Was der Allokator liefert, gilt.
+     * Bis zum 2026-08-04 stand hier ein Behelf: der hohe Bereich kam nur in die Freiliste, wenn
+     * er GROESSER war als der kleinste untere. Der Grund war eine unausgesprochene Eigenschaft,
+     * auf die sich `alloc_dma_region` und die Region einer isolierten PD verliessen -- beide
+     * MUESSEN in GiB 0 liegen (`vspace_map_block` bildet nur dort ab), fragten aber nach
+     * "irgendeiner" Region und gaben bei Verfehlung auf, ohne ein zweites Mal zu fragen. Solange
+     * der Speicher zusammenhing, belegte Best-Fit von unten und es ging gut; ein zweiter,
+     * KLEINERER Bereich oben brach es (gemessen bei `-m 3G`: `dmawin`/`dmatok : FAILURES`,
+     * `iso : spawn_isolated fehlgeschlagen`, waehrend 4G und 6G zufaellig gruen waren).
      *
-     * Ein zweiter Bereich oberhalb 4 GiB bricht das, sobald er KLEINER ist als der untere:
-     * dann waehlt Best-Fit ihn fuer jede kleine Allokation, und die beiden Aufrufer bekommen
-     * eine Adresse, die sie nicht gebrauchen koennen. Gemessen bei `-m 3G` (unten 2032 MiB,
-     * oben 1024 MiB): `dmawin : FAILURES`, `dmatok : FAILURES`, `iso : spawn_isolated
-     * fehlgeschlagen` -- waehrend `-m 4G` und `-m 6G` gruen waren, weil dort der obere Bereich
-     * zufaellig groesser ist. Ein Fehler, der an einer Groessenrelation haengt und nicht an der
-     * Struktur, ist der unangenehmste: er verschwindet beim naechsten Messwert.
+     * Der Behelf war fail-closed und hat den nutzbaren Speicher fuer DMA-Regionen und isolierte
+     * PDs bei 1 GiB gedeckelt -- fuer das Zielbild der haertere Deckel als die alte 4-GiB-Karte.
      *
-     * Also fail-closed: der hohe Bereich geht nur dann in die Freiliste, wenn er **groesser**
-     * ist als der kleinste untere. Dann ruehrt Best-Fit ihn erst an, wenn unten nichts mehr
-     * passt -- also genau als Reserve, und die Belegungsordnung bleibt, wie sie war. Sonst
-     * bleibt er abgebildet, aber unvergeben, und die Zeile darunter SAGT das.
-     *
-     * Die eigentliche Luecke liegt nicht hier: dass GiB 0 eine knappe, besonders verlangte
-     * Ressource ist, weiss weder der Allokator noch `alloc_dma_region`. Solange der Aufrufer
-     * nimmt, was kommt, statt gezielt unterhalb 1 GiB anzufordern, haengt die Sache an der
-     * Belegungsordnung. Das gehoert nach `system.rs`/`sel4lake-mem`, nicht in den Speicherplan.
+     * Behoben ist es jetzt dort, wo die Ursache lag: `sel4lake_mem::alloc_below` kennt den
+     * Zonenwunsch, und die drei Aufrufer nennen ihn (`system::gib0_zone`). Damit haengt nichts
+     * mehr an der Belegungsordnung, und hoher Speicher geht vollstaendig in die Freiliste --
+     * fuer alles, was keine PD-eigene Abbildung braucht (Kernel-Stacks, Heap, Slabs, Archiv).
      */
     let mut hoch_abgebildet = 0u64;
     let mut hoch_frei = 0u64;
@@ -2543,10 +2552,8 @@ pub fn run(multiboot_info: u64) -> ! {
         };
         hoch_abgebildet += hl;
         hoch_unabgebildet += (b - a) - hl;
-        if hl > unten_kleinster {
-            hoch_frei += hl;
-            einspeisen(hb, hb + hl, &mut gross, &mut bi);
-        }
+        hoch_frei += hl;
+        einspeisen(hb, hb + hl, &mut gross, &mut bi);
     }
     // Wieviel durch den Ausschnitt wegfiel -- als Zahl, nicht als Gefuehl.
     let net = bi.mem_regions().iter().map(|r| r.len).sum::<u64>();
@@ -2576,9 +2583,10 @@ pub fn run(multiboot_info: u64) -> ! {
     if hoch_abgebildet > 0 || hoch_unabgebildet > 0 {
         // Drei Zahlen, weil es drei verschiedene Lagen sind, und ein stillschweigend kleinerer
         // Speicher eine Fehldiagnose in Wartestellung ist: **abgebildet** (der Kernel kommt
-        // heran), **davon vergeben** (der Allokator darf es ausgeben -- nur wenn der Bereich
-        // groesser ist als der unterste, s. o.), **nicht abgebildet** (kein vollstaendig
-        // gedecktes 1-GiB-Blatt oder keine 1-GiB-Seiten auf dieser CPU).
+        // heran), **davon vergeben** (der Allokator darf es ausgeben -- seit E-Rest 3b immer
+        // alles Abgebildete; die beiden Zahlen sind gleich, und wenn sie es einmal nicht sind,
+        // steht es hier), **nicht abgebildet** (kein vollstaendig gedecktes 1-GiB-Blatt oder
+        // keine 1-GiB-Seiten auf dieser CPU).
         print!(
             " -- oberhalb 4 GiB: {} MiB abgebildet, davon {} MiB vergeben; {} MiB nicht abgebildet",
             hoch_abgebildet >> 20,

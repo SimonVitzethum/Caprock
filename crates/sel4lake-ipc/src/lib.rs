@@ -27,8 +27,12 @@ use sel4lake_sched::{SchedOps, ThreadId};
 ///
 /// Diese Zahl ist von A-3.4 **nicht** angefasst worden und bleibt eine Compile-Zeit-Grenze:
 /// Sie steckt in jedem `Endpoint` (zwei `TidQueue`), wächst also mit der Endpoint-Zahl
-/// multiplikativ. Der 33. gleichzeitige Sender an demselben Endpoint wird von `enqueue`
-/// **still verworfen** (s. dort) — eine eigene Baustelle, hier nur benannt, nicht behoben.
+/// multiplikativ.
+///
+/// **Der Überlauf ist seit D11 benannt statt still** ([`result::ERR_EP_FULL`]): der 33.
+/// gleichzeitige Sender wird abgewiesen und läuft weiter, statt blockiert und vergessen zu
+/// werden. Eine Kapazität ohne benannten Überlauf ist kein Schutz, sondern ein Loch — wer die
+/// Schranke einführt, muss sagen, was jenseits von ihr passiert.
 pub const QUEUE_CAP: usize = 32;
 const QCAP: usize = QUEUE_CAP;
 
@@ -49,12 +53,33 @@ impl TidQueue {
         count: 0,
     };
 
-    fn enqueue(&mut self, t: ThreadId) {
-        if self.count < QCAP {
-            self.buf[self.tail] = Some(t);
-            self.tail = (self.tail + 1) % QCAP;
-            self.count += 1;
+    /// Einreihen. Gibt `false`, wenn die Warteschlange **voll** ist — und dieser Rückgabewert
+    /// ist der ganze Punkt von D11.
+    ///
+    /// Vorher war das ein `if cap { … }` ohne `else`: der Aufrufer erfuhr nichts, blockierte
+    /// den Thread trotzdem, und der stand danach in keiner Struktur dieses Endpoints. Weder
+    /// `audit` noch `purge_thread` noch `quiescence_of` konnten ihn sehen — ein dauerhaft
+    /// hängender Faden, über den jeder Prüfer „in Ordnung" meldete.
+    ///
+    /// **Jede** Aufrufstelle muss den Wert auswerten. Die beiden, an denen er strukturell nicht
+    /// `false` werden kann ([`remove`](Self::remove), [`Endpoint::rebind_server`]), sagen dort,
+    /// warum — nicht „das wird schon".
+    #[must_use = "ein verworfenes Einreihen laesst einen Thread haengen -- genau D11"]
+    fn enqueue(&mut self, t: ThreadId) -> bool {
+        if self.count >= QCAP {
+            return false;
         }
+        self.buf[self.tail] = Some(t);
+        self.tail = (self.tail + 1) % QCAP;
+        self.count += 1;
+        true
+    }
+
+    /// Ist kein Platz mehr? Vorabfrage für die Aufrufer, die **vor** dem Blockieren entscheiden
+    /// müssen (`call`/`recv`) oder vor einem Zustandswechsel, den sie sonst nicht zurücknehmen
+    /// könnten ([`Endpoint::migrate_owner`]).
+    fn is_full(&self) -> bool {
+        self.count >= QCAP
     }
 
     fn dequeue(&mut self) -> Option<ThreadId> {
@@ -130,7 +155,11 @@ impl TidQueue {
                 if t == target {
                     found = true;
                 } else {
-                    self.enqueue(t);
+                    // Kann strukturell nicht scheitern und ist nicht bloss unwahrscheinlich:
+                    // die Schleife nimmt `n` Einträge heraus und legt höchstens `n` zurück,
+                    // jedes `enqueue` steht hinter genau einem `dequeue`. Der Füllstand ist
+                    // hier also nie grösser als beim Eintritt, und der war <= QCAP.
+                    let _ = self.enqueue(t);
                 }
             }
         }
@@ -446,7 +475,11 @@ impl Endpoint {
             return Rebind::NotReceiver;
         }
         if !overlapped {
-            self.receivers.enqueue(new);
+            // Kann strukturell nicht scheitern: `remove(old)` hat gerade einen Eintrag
+            // herausgenommen (sonst wären wir oben ausgestiegen), es ist also mindestens ein
+            // Platz frei. Der Wert wird trotzdem gelesen — ein `let _` ohne diesen Satz wäre
+            // wieder die D11-Form.
+            let _ = self.receivers.enqueue(new);
         }
         Rebind::Done { overlapped }
     }
@@ -466,15 +499,18 @@ impl Endpoint {
     /// ([`rebind_server`](Self::rebind_server) mit bereits gebundenem `new`) braucht diese
     /// Vorbedingung nicht und ist deshalb vorzuziehen.
     ///
-    /// Gibt `false`, wenn der Endpoint unbelegt ist oder `tid` bereits als Empfänger steht —
+    /// Gibt `false`, wenn der Endpoint unbelegt ist, `tid` bereits als Empfänger steht —
     /// ein zweiter Eintrag wäre ein Duplikat in der Queue, also genau das, was `audit` als
-    /// Korruption meldet.
+    /// Korruption meldet — **oder die Empfänger-Warteschlange voll ist** (D11).
+    ///
+    /// Der letzte Fall war vorher der schlimmste der drei: die Funktion meldete `true`,
+    /// während der Eintrag verworfen wurde. Der Aufrufer (Hot-Reload, A-4.1) hielt die neue
+    /// Instanz danach für gebunden, obwohl der Endpoint sie nie gesehen hatte.
     pub fn bind_receiver(&mut self, tid: ThreadId) -> bool {
         if !self.used || self.receivers.contains(tid) {
             return false;
         }
-        self.receivers.enqueue(tid);
-        true
+        self.receivers.enqueue(tid)
     }
 
     /// Einen **sterbenden** Thread aus ALLEN Strukturen dieses Endpoints entfernen
@@ -528,12 +564,26 @@ impl Endpoint {
     /// übernimmt dieselbe Nachricht und wird zum neuen Reply-Owner — der Call wird so von
     /// v2 abgeschlossen statt mit `ERR_SERVER_GONE` zu sterben (Reply-Cap überlebt den
     /// Server-Wechsel). Gibt `true`, falls eine ausstehende Antwortpflicht des `old_owner`
-    /// migriert wurde; sonst `false` (kein passender Reply-Owner -> No-Op).
+    /// migriert wurde; sonst `false` (kein passender Reply-Owner, oder die Sender-Queue ist
+    /// voll -> No-Op).
+    ///
+    /// **Die Prüfung auf „voll" steht VOR dem `take()`, und das ist der Unterschied zwischen
+    /// einem No-Op und einem verlorenen Thread** (D11). Vorher wurde erst `caller`
+    /// herausgenommen und `reply_owner` gelöscht, dann eingereiht — schlug das Einreihen fehl,
+    /// war die Antwortpflicht weg *und* der Aufrufer in keiner Struktur mehr: er wartet auf
+    /// eine Antwort, die niemand mehr schuldet. Die Funktion meldete dabei `true`.
+    ///
+    /// Fail-closed heisst hier: die Antwortpflicht bleibt beim alten Besitzer. Der Aufrufer
+    /// hängt dann nicht, sondern läuft über den vorhandenen Weg
+    /// ([`owner_died`](Self::owner_died) -> `ERR_SERVER_GONE`) auf — eine begonnene
+    /// Transaktion, die ehrlich scheitert, statt einer, die lautlos verschwindet.
     pub fn migrate_owner(&mut self, old_owner: ThreadId) -> bool {
-        if self.used && self.reply_owner == Some(old_owner) {
+        if self.used && self.reply_owner == Some(old_owner) && !self.senders.is_full() {
             if let Some(caller) = self.caller.take() {
                 self.reply_owner = None;
-                self.senders.enqueue(caller); // erneut zustellbar an die v2-RECV
+                // Kann nach der `is_full`-Vorabfrage nicht scheitern (kein Zwischenschritt
+                // füllt die Queue — `&mut self` schliesst einen fremden Zugriff aus).
+                let _ = self.senders.enqueue(caller); // erneut zustellbar an die v2-RECV
                 return true;
             }
         }
@@ -592,7 +642,17 @@ impl Endpoint {
             };
         }
         // Kein lebender Empfänger -> als Sender einreihen und blockieren.
-        self.senders.enqueue(caller);
+        //
+        // **D11: erst einreihen, dann blockieren — und nur, wenn das Einreihen gelingt.** Die
+        // Reihenfolge ist die ganze Behebung. Vorher lief `block_current` bedingungslos: der
+        // 33. Aufrufer wurde blockiert, stand in keiner Warteschlange, hielt kein Token und
+        // wurde damit von keinem RECV je erreicht. Wer ihn suchte, fand ihn nicht — `audit`
+        // meldete `(false, false)`, `quiescence_of(..).is_quiescent()` meldete ihn als ruhig,
+        // und diese Ruhemeldung hätte einen Hot-Reload (A-4.2) freigegeben.
+        if !self.senders.enqueue(caller) {
+            frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_EP_FULL);
+            return frame; // NICHT blockieren: der Aufrufer läuft weiter und kann wiederholen
+        }
         ops.block_current(core, frame)
     }
 
@@ -626,7 +686,13 @@ impl Endpoint {
             return frame; // Server läuft sofort weiter (kein Wechsel)
         }
         // Kein lebender Aufrufer -> als Empfänger einreihen und blockieren.
-        self.receivers.enqueue(server);
+        // Dieselbe Zeile, dieselbe Behebung wie im `call`-Zweig (D11): der 33. RECV an
+        // demselben Endpoint verschwand ebenso spurlos. Ein Server, dem das zustösst, ist
+        // schlimmer als ein Client — er wartet auf Arbeit, die ihm niemand mehr geben kann.
+        if !self.receivers.enqueue(server) {
+            frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_EP_FULL);
+            return frame;
+        }
         ops.block_current(core, frame)
     }
 
@@ -783,6 +849,17 @@ impl Notification {
             self.pending = 0;
             frame
         } else {
+            // **D11, zweite Fundstelle — dieselbe Form, anderes Objekt.** `waiter` ist ein
+            // einzelner Slot ("ein Konsument je Notification"), also eine Kapazität von 1 —
+            // und ihr Überlauf war ebenso unbenannt: ein zweiter `WAIT` ÜBERSCHRIEB den
+            // Wartenden. Der Überschriebene blieb blockiert, stand danach in keiner Struktur
+            // dieser Notification, und `purge_thread`/`audit`/`quiescence_of` sahen ihn nicht
+            // mehr — Faden weg, alle Prüfer still. Dass die Kapazität hier 1 statt 32 ist,
+            // ändert nichts an der Struktur des Fehlers.
+            if self.waiter.is_some() {
+                frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_EP_FULL);
+                return frame;
+            }
             self.waiter = Some(ops.current_id(core));
             ops.block_current(core, frame)
         }

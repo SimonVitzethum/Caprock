@@ -9,6 +9,133 @@ schon einmal nicht getragen hat.
 
 ---
 
+## D11 — der Ueberlauf einer Endpoint-Warteschlange ist benannt (2026-08-04)
+
+**Der Fehler.** `TidQueue::enqueue` war ein `if self.count < QCAP { .. }` **ohne `else`**. Bei
+`QUEUE_CAP = 32` landeten von 33 CALLs 32 in der Queue. Der 33.: `block_current` lief trotzdem,
+der Sentinel `0xDEADBEEF` blieb unberuehrt im Frame (kein Ergebniscode), er stand in **keiner**
+Struktur des Endpoints, 33 nachfolgende RECVs bedienten 32 — und `quiescence_of(..).is_quiescent()`
+meldete ihn als **ruhig**, `audit` `(false,false)`, `purge_thread` `false`. Ein Faden haengt
+dauerhaft, und JEDER Pruefer meldet Ordnung. Schlimmer als die leere Ereigniswarteschlange ohne
+`CD.R`, weil die Ruhemeldung zusaetzlich einen Hot-Reload (A-4.2) freigegeben haette.
+
+Dieselbe Zeile traf vier Wege: den 33. RECV ebenso; `bind_receiver` meldete `true`, obwohl
+verworfen; `migrate_owner` meldete `true`, **loeschte die Antwortpflicht** und verlor den Aufrufer
+— ein Client, der auf eine Antwort wartet, die niemand mehr schuldet.
+
+**Eine fuenfte Fundstelle, die der Befund nicht nannte.** `Notification::wait` hat dieselbe Form
+bei Kapazitaet 1: ein zweiter `WAIT` **ueberschrieb** `waiter`. Der Ueberschriebene blieb
+blockiert und war danach fuer `purge_thread`/`audit`/`quiescence_of` unsichtbar. Dass die
+Kapazitaet hier 1 statt 32 ist, aendert an der Struktur des Fehlers nichts.
+
+**Die Behebung.** `enqueue -> bool`, `#[must_use]`, und **jede** Aufrufstelle wertet aus. Die
+beiden, an denen `false` strukturell unmoeglich ist (`TidQueue::remove`, `rebind_server`), sagen
+dort **warum** — nicht „das wird schon". `call`/`recv` weisen mit `ERR_EP_FULL` ab und blockieren
+**nicht**; `bind_receiver` meldet Misserfolg; `migrate_owner` prueft `is_full()` **vor** dem
+`take()` und ist im vollen Fall ein reines No-Op — fail-closed heisst hier: die Antwortpflicht
+bleibt beim alten Besitzer, und der Aufrufer laeuft ueber den vorhandenen Weg (`owner_died` ->
+`ERR_SERVER_GONE`) auf. Eine begonnene Transaktion, die ehrlich scheitert, statt einer, die
+lautlos verschwindet.
+
+**Warum ein DRITTER Code (`ERR_EP_FULL = 9`) und nicht `ERR_QUIESCING`.** Das war die Frage, die
+der Befund offenliess. Die drei Lagen verlangen vom Client verschiedene Antworten: `ERR_BADCAP`
+heisst „gibt es nicht" (nie wieder versuchen), `ERR_QUIESCING` „kommt gleich wieder" (die
+Wartezeit ist durch den Austausch begrenzt und haengt nicht an fremdem Verhalten), `ERR_EP_FULL`
+„gerade kein Platz" — eine **Lastaussage**: sie haengt an den anderen 32 Wartenden, kann sofort
+wieder gelten, und wer stumpf wiederholt, verschaerft sie. Die beiden zusammenzuwerfen naehme dem
+Client genau die Unterscheidung, die A-4.2 gerade eingefuehrt hat.
+
+**Das Modell ist dem Code gefolgt, nicht umgekehrt.** `Verification/ipc/proofs/endpoint.rs`:
+`dropped_*` -> `rejected_*` (ein Verlust ist unbeobachtbar, eine Abweisung ist eine Antwort),
+neue `send_gate`/`recv_gate` mit Code 3, `core_eq` fuer „die Operation hat den Endpoint nicht
+angefasst". **25 -> 30 Beweise, 0 errors.** Der Beweis, um den es geht, ist
+`send_never_strands`/`recv_never_strands`: unter offenem Tor gibt es nur zwei Ausgaenge —
+zugestellt/eingereiht oder abgewiesen-mit-Code. Einen dritten gibt es nicht mehr; genau der war
+D11. Dazu `gate_three_reasons_distinct`, `bind_receiver_full_is_noop` und
+`migrate_owner_full_keeps_token`.
+
+Bemerkenswert am alten Stand: `send_drops_above_cap` **bewies den Verlust** — der Beweis war
+richtig, der Code war falsch. Ein Beweis, der dem Code treu ist, kann das Falsche beweisen.
+
+**Belegt statt behauptet.** `tools/verus-modelltreue-ipc.sh` faehrt den echten Quelltext gegen das
+uebersetzte Modell: **93 -> 99 Faelle**, **28 -> 35 Selbsttestfaelle**. Neu ist das **Hauptbuch
+der Gestrandeten** (`Welt::gestrandete`): jeder Faden, der nach einer Operation blockiert ist und
+in KEINER Struktur steht, wird vermerkt; nach einem Lauf ueber alle vier Ueberlaufwege muss die
+Liste leer sein. Die Positivkontrolle dazu ist keine Zeile im Lauf, sondern **fuenf Mutationen**,
+die D11 einzeln wiederherstellen (auch die Wurzel: „`enqueue` meldet beim Ueberlauf Erfolg") —
+jede wird erkannt. Eine leere Liste ist nur dann eine Aussage, wenn sie sich fuellen kann.
+
+Die `befund`-Mechanik des Waechters hat dabei genau das getan, wofuer sie gebaut wurde: als die
+Behebung stand, schlug sie an („der Befund trifft nicht mehr zu") und verlangte, dass B2/B2b/B2c/B2d
+aus ihrem Kopf heraus und hierher wandern.
+
+**Im Kernel sichtbar:** Pruefzeile `epfull` (`system::run_epfull`, lokales Objekt wie `run_quiesce`
+und `run_rebind`). Sie prueft den Weg, der ohne Scheduler auskommt — `bind_receiver` —, und die
+Positivkontrolle steckt in der Anlage: die ersten 32 muessen gelingen **und auffindbar sein**,
+sonst waere die Zeile von „bind_receiver geht nie" nicht zu unterscheiden. Gegenprobe gefahren:
+die alte Fassung wieder eingesetzt -> `epfull : FAILURES` und `bringup : offen waren: epfull`.
+
+Die drei blockierenden Wege (`call`/`recv`/`migrate_owner`) misst der Host-Waechter gegen
+denselben Quelltext. Das steht so in der Pruefzeile, damit die Suite nicht mehr behauptet, als sie
+prueft.
+
+---
+
+## E-Rest 3b — die Freiliste kennt den Zonenwunsch (2026-08-04)
+
+**Der Befund war groesser als der Eintrag.** Notiert war: `alloc_dma_region` und isolierte
+PD-Regionen muessen in GiB 0 liegen, fragen aber nach „irgendeiner" Region und geben bei
+Verfehlung auf, ohne ein zweites Mal zu fragen. Richtig — aber die eigentliche Abhaengigkeit lag
+eine Ebene tiefer: **„unten zuerst" war ueberhaupt ein Zufall der Groessenrelation.** Best-Fit
+nimmt das kleinste passende Fragment; solange der Bereich oberhalb 4 GiB zufaellig groesser war
+(`-m 4G`: 2048 gegen 2032 MiB; `-m 6G`: 4096 gegen 2032), landete alles Unbenannte unten. Bei
+`-m 3G` (1024 gegen 2032) kehrt sich das um.
+
+Gemessen, nachdem der alte Behelf entfernt war: nicht nur `dmawin`/`dmatok`/`iso` fielen aus,
+sondern der ganze Ladepfad — `drv`, `blkdev`, `fs`, `part` reihenweise rot, die Treiber-PD kam gar
+nicht hoch.
+
+**Die Behebung, zweiteilig.** (1) `sel4lake_mem::alloc_below`/`alloc_colored_below` nehmen eine
+Obergrenze; gesucht wird nur unter Fragmenten, die sie erfuellen koennen, und ein Fragment ueber
+die Grenze hinweg wird an ihr **beschnitten** statt verworfen. Best-Fit vergleicht dabei den
+**nutzbaren** Teil, nicht die Fragmentlaenge — sonst gewaenne ein riesiges Fragment, von dem nur
+ein Zipfel unter der Grenze liegt, gegen ein kleines, das ganz hineinpasst. Farbe und Zone werden
+in EINER Entscheidung getroffen (dasselbe Argument wie Z8 fuer NUMA: zwei nacheinander laufende
+Politiken kaempfen gegeneinander). (2) „Unten zuerst" ist jetzt eine **ausgesprochene Politik** in
+`mem_alloc`/`alloc_colored`, mit hohem Speicher als Ueberlauf. `claim_user_kstack` griff als
+einzige Stelle am Wrapper vorbei und geht jetzt darueber — eine Vorgabe, an der eine einzige
+Stelle vorbeigreift, ist keine Vorgabe.
+
+Der Behelf im Speicherplan ist damit weg: hoher Speicher geht **vollstaendig** in die Freiliste
+(bei `-m 3G` vorher 0 von 1024 MiB vergeben, jetzt 1024 von 1024).
+
+**Zwei eigene Fehler unterwegs, beide gemessen und beide lehrreich.**
+
+* `match MEM.lock() { .. None => MEM.lock() }` haelt den Guard bis zum Ende des `match`. Der
+  Ausweichpfad war damit ein **Selbst-Deadlock** auf einem Spinlock — und zwar genau der Pfad,
+  der selten laeuft. Die Lade-Suite blieb stehen, sobald der untere Bereich einmal nicht reichte.
+  Ein Fehler im seltenen Zweig sieht aus wie ein Haenger und nicht wie ein Fehler.
+* Der Zaehler fuer den Ausweich zaehlte zuerst **Versuche** statt **Wirkung** und meldete `1x` auf
+  einer 512-MiB-Maschine, auf der es oberhalb 4 GiB gar keinen Speicher gibt. Gezaehlt hatte er
+  eine absichtlich uebergrosse Anforderung aus dem Farbtest, die NIRGENDS passte. „Unten war kein
+  Platz" und „es wurde oben genommen" sind zwei verschiedene Aussagen — dieselbe Verwechslung wie
+  `rx_used` gegen „Daten sind angekommen".
+
+**Gemessen.** RAM-Reihe 512M · 2560M · 3G · 4G · 6G auf der Hauptsuite, 512M · 3G · 6G auf der
+Lade-Suite, alle `== ALL PASS ==`. Host-Tests mit **Positivkontrolle**:
+`ohne_zone_waehlt_best_fit_den_oberen_bereich` belegt, dass Best-Fit ohne Zonenwunsch wirklich
+oben landet — ohne diese Zeile sagte der Test darunter nichts, er koennte auch gruen sein, wenn
+die Zone gar nichts bewirkt.
+
+**Was NICHT behoben ist**, steht als E-Rest 3d in `todo.md`: welche Stellen GiB 0 wirklich
+brauchen, ist nicht aufgezaehlt — „unten zuerst" ist eine Vorsichtsmassnahme, keine Zusicherung.
+Und der 1-GiB-Deckel fuer Regionen mit PD-eigener Abbildung bleibt: `vspace_map_block` bildet
+**identisch** ab (VA == PA), das ist eine Eigenschaft des VSpace-Layouts und mit Allokatorarbeit
+nicht zu heben. Der Ausweichzaehler in der `mem`-Zeile meldet ehrlich `0x` — der Ueberlaufpfad ist
+in QEMU **ungefahren**, seine Wirkung nur host-getestet.
+
+---
+
 ## A1. Cache-Partitionierung zwischen PDs — **Stufe 1 erledigt** (x86)
 
 Rest in [todo.md](todo.md#a1-cache--timing-seitenkanäle-zwischen-pds); hier steht, was trägt und

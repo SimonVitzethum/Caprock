@@ -1170,7 +1170,36 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       Syscall ist aus dem Quelltext argumentiert (`system.rs:6588`, `system.rs:2743`,
       `sel4lake-ipc:653`), nicht end-to-end ausgelöst.
 
-- [ ] **D11 FEHLER, GEMESSEN: der 33. Sender an einem Endpoint hängt für immer — und kein
+- [x] **D11 BEHOBEN am 2026-08-04: der Überlauf einer Endpoint-Warteschlange ist BENANNT.**
+      Neuer ABI-Code `ERR_EP_FULL = 9`; `TidQueue::enqueue` gibt `bool` und ist `#[must_use]`;
+      alle sechs Aufrufstellen werten ihn aus. `call`/`recv` weisen ab **ohne zu blockieren**,
+      `bind_receiver` und `migrate_owner` melden Misserfolg statt Erfolg — und `migrate_owner`
+      prüft **vor** dem `take()`, sodass die Antwortpflicht beim alten Besitzer stehenbleibt
+      statt gelöscht zu werden.
+
+      **Warum ein dritter Code und nicht `ERR_QUIESCING`** (die Frage, die dieser Eintrag
+      offenließ): „gibt es nicht" (nie wieder), „kommt gleich wieder" (nach dem Austausch) und
+      „gerade kein Platz" verlangen verschiedene Reaktionen. Der dritte ist eine **Lastaussage**
+      — er hängt an den anderen 32 Wartenden, kann sofort wieder gelten, und wer stumpf
+      wiederholt, verschärft ihn.
+
+      **Eine zweite Fundstelle, die dieser Eintrag nicht nannte:** `Notification::wait` hatte
+      dieselbe Form bei Kapazität 1 — ein zweiter `WAIT` **überschrieb** den Wartenden, und der
+      Überschriebene war danach in keiner Struktur mehr. Ebenfalls `ERR_EP_FULL`.
+
+      **Belegt, nicht behauptet.** Das Verus-Modell ist mitgezogen (`dropped_*` → `rejected_*`,
+      `send_gate`/`recv_gate` mit Code 3, **25 → 30 Beweise**), darunter `send_never_strands`:
+      unter offenem Tor gibt es nur noch zwei Ausgänge, zugestellt/eingereiht **oder**
+      abgewiesen-mit-Code. Der Modelltreue-Wächter fährt den echten Quelltext (93 → **99
+      Fälle**, 28 → **35 Selbsttestfälle**) und führt ein **Hauptbuch der Gestrandeten**: nach
+      einem Lauf über alle vier Überlaufwege muss es leer sein. Die Positivkontrolle sind fünf
+      Mutationen, die D11 einzeln wiederherstellen — jede wird erkannt. Dazu die Prüfzeile
+      `epfull` in der x86-Suite; eine Mutation macht sie rot und die Notbremse nennt sie
+      (`bringup : offen waren: epfull`).
+
+      Der Rest des Eintrags bleibt als Herleitung stehen.
+
+- [ ] **D11 (Herleitung) der 33. Sender an einem Endpoint hängt für immer — und kein
       Prüfer kann ihn sehen.** (2026-08-03) **Klasse:** Fehler · **Aufwand:** Behebung
       vorgeschlagen, nicht angewandt · **Fundort:** beim Erweitern des IPC-Modells (D7).
 
@@ -1237,19 +1266,55 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       **gemeldet** (`dmawin : FAILURES` statt stillem `msi_clear=1`), aber die Slot-Trennung
       fehlt dort weiterhin.
 
-- [ ] **E-Rest 3b: der Allokator ist Best-Fit und weiß nichts von GiB 0.** (2026-08-04, beim
-      Beheben von E-Rest 3 gemessen, **nicht** gelöst — die Stelle liegt in `system.rs`.)
-      `alloc_dma_region` und isolierte PD-Regionen müssen unter 4 GiB liegen und versuchen es
-      **kein zweites Mal**. Bei `-m 3G` (unten 2032 MiB, oben 1024 MiB) wählt Best-Fit den oberen
-      Bereich → gemessen `dmawin`/`dmatok : FAILURES`, `iso : spawn_isolated fehlgeschlagen`,
-      während 4G und 6G **zufällig** grün waren. Genau die Sorte Zufall, die eine Messung
-      wertlos macht.
-      Behelf steht fail-closed: hohes RAM geht nur in die Freiliste, wenn es **größer** ist als
-      der kleinste untere Bereich; sonst bleibt es abgebildet und unvergeben, und die `mem`-Zeile
-      sagt das. **Folge:** der nutzbare Speicher für DMA-Regionen und isolierte PDs ist weiterhin
-      auf **1 GiB** gedeckelt — für das Zielbild (Cloud-Knoten, viele tausend Prozesse) der
-      härtere Deckel als die alte 4-GiB-Karte. Richtig wäre eine Freiliste, die den Zonenwunsch
-      kennt, statt einer, die ihn errät.
+- [x] **E-Rest 3b BEHOBEN am 2026-08-04: die Freiliste kennt den Zonenwunsch, statt ihn zu
+      erraten.** `sel4lake_mem::alloc_below`/`alloc_colored_below` nehmen eine Obergrenze; Farbe
+      **und** Zone werden dabei in EINER Entscheidung getroffen (dasselbe Argument wie Z8 für
+      NUMA). Die drei Stellen mit einer *benannten* GiB-0-Bedingung (`alloc_dma_region`,
+      `spawn_isolated`, `spawn_isolated_colored`) nennen sie jetzt und **suchen** statt einmal zu
+      fragen und aufzugeben. Der Behelf im Speicherplan ist weg: hoher Speicher geht
+      **vollständig** in die Freiliste (bei `-m 3G` vorher 0 von 1024 MiB, jetzt 1024 von 1024).
+
+      **Der eigentliche Befund war ein anderer, als der Eintrag annahm.** Nicht nur die drei
+      benannten Stellen hingen an der Belegungsordnung — „unten zuerst" war überhaupt ein
+      **Zufall der Größenrelation**: Best-Fit nimmt das kleinste passende Fragment, und solange
+      der obere Bereich zufällig größer war (4G, 6G), landete alles Unbenannte unten. Sobald das
+      nicht mehr gilt, fällt der Ladepfad aus (gemessen: `drv`/`blkdev`/`fs`/`part` reihenweise
+      rot bei 3G). Deshalb ist „unten zuerst" jetzt eine **ausgesprochene Politik** in
+      `mem_alloc`/`alloc_colored` mit hohem Speicher als Überlauf — sie reproduziert das
+      gemessene Verhalten, statt eine unbelegte Freiheit zu behaupten. `claim_user_kstack` griff
+      als einzige Stelle am Wrapper vorbei und geht jetzt ebenfalls darüber.
+
+      **Zwei eigene Fehler dabei, beide gemessen.** (1) `match MEM.lock() { … None => MEM.lock() }`
+      hält den Guard bis zum Ende des `match` — der Ausweichpfad war ein **Selbst-Deadlock** auf
+      einem Spinlock, und zwar genau der Pfad, der selten läuft (Lade-Suite blieb stehen).
+      (2) Der Zähler für den Ausweich zählte zuerst *Versuche* statt *Wirkung* und meldete `1x`
+      auf einer 512-MiB-Maschine, auf der es oberhalb 4 GiB gar keinen Speicher gibt — gezählt
+      war in Wahrheit eine absichtlich übergroße Anforderung aus dem Farbtest. Dieselbe
+      Verwechslung wie `rx_used` gegen „Daten angekommen".
+
+      **Gemessen:** RAM-Reihe 512M · 2560M · 3G · 4G · 6G, Haupt- **und** Lade-Suite, alle
+      `== ALL PASS ==`; Host-Tests mit **Positivkontrolle** (`ohne_zone_waehlt_best_fit_den_oberen_bereich`
+      belegt, dass Best-Fit ohne Zone wirklich oben landet — sonst sagte der Test darunter nichts).
+
+      **Was NICHT behoben ist und jetzt benannt gehört:** der 1-GiB-Deckel für Regionen mit
+      **PD-eigener** Abbildung bleibt, und er liegt nicht im Allokator. `vspace_map_block` bildet
+      **identisch** ab (VA == PA) und GiB 1..3 jeder isolierten PD hängen an geteilten statischen
+      Tabellen — eine DMA-Region oder eine isolierte PD *kann* deshalb nur in GiB 0 liegen. Das
+      ist eine Eigenschaft des VSpace-Layouts; es zu heben ist eigene Arbeit (s. E-Rest 3d).
+
+- [ ] **E-Rest 3d: die Menge der Stellen, die GiB 0 brauchen, ist nicht aufgezählt.**
+      (2026-08-04, beim Beheben von 3b bemerkt.) `mem_alloc` gibt „unten zuerst" vor, **weil**
+      unbekannt ist, wer alles darauf baut — das ist eine Vorsichtsmaßnahme, keine Zusicherung.
+      Gemessen ist nur, dass es ohne sie bricht (Ladepfad bei 3G). Zu tun: die Bedingung je
+      Aufrufer benennen (wer wird PD-privat abgebildet? wer geht an ein Gerät? wer ist reiner
+      Kernel-Speicher?) und den Rest ausdrücklich **freigeben** — sonst bleibt der obere
+      Speicher praktisch Reserve. Der Ausweichzähler in der `mem`-Zeile sagt heute ehrlich `0x`:
+      der Überlaufpfad ist in QEMU **ungefahren**, seine Wirkung nur host-getestet.
+
+      Der zweite Teil ist das VSpace-Layout selbst: solange `vspace_map_block` identisch abbildet,
+      sind DMA-Regionen und isolierte PDs strukturell auf GiB 0 begrenzt — 1 GiB für alle
+      Mandanten zusammen. Für das Zielbild (viele tausend Prozesse) ist das der bindende Deckel,
+      und er ist mit Allokatorarbeit **nicht** zu heben.
 
 - [x] **E-Rest 1 BEHOBEN am 2026-08-04: `iova_window_clear_of_msi` gibt im schwachen Zweig „in Ordnung" zurück, ohne
       urteilen zu können.** (2026-08-03, gemessen) `kernel/src/system.rs:3900`:

@@ -100,8 +100,10 @@ fn claim_user_kstack() -> Option<usize> {
 fn claim_user_kstack_masked(mask: Option<sel4lake_mem::ColorMask>) -> Option<usize> {
     let (sz, al) = (USER_KSTACK_SIZE as u64, USER_KSTACK_SIZE as u64);
     let base = match mask {
-        Some(m) => MEM.lock().alloc_colored(sz, al, crate::colors::count(), m)?.base(),
-        None => MEM.lock().alloc(sz, al)?.base(),
+        // Ueber die Politik aus `mem_alloc`/`alloc_colored` (unten zuerst), nicht daran vorbei:
+        // eine Vorgabe, an der eine einzige Stelle vorbeigreift, ist keine Vorgabe (E-Rest 3b).
+        Some(m) => alloc_colored(sz, al, m)?.base(),
+        None => mem_alloc(sz, al)?.base(),
     };
     KSTACKS.lock().live += 1;
     Some(base as usize)
@@ -1126,7 +1128,84 @@ fn zero_phys(base: u64, len: u64) {
 /// Region ist bereits exklusiv unsere, und das Nullen großer Blöcke soll den Allokator
 /// nicht blockieren.
 fn mem_alloc(size: u64, align: u64) -> Option<MemoryCap> {
-    let cap = MEM.lock().alloc(size, align)?;
+    // **„Unten zuerst" war bis zum 2026-08-04 ein ZUFALL, jetzt ist es eine Politik** (E-Rest 3b).
+    //
+    // Best-Fit nimmt das kleinste passende Fragment. Solange der Bereich oberhalb 4 GiB zufaellig
+    // groesser war als der untere (`-m 4G`, `-m 6G`), landete damit alles Unbenannte unten -- und
+    // die Stellen, die das brauchen, kamen ohne Zonenwunsch aus. Bei `-m 3G` (unten 2032 MiB, oben
+    // 1024 MiB) kehrt sich die Relation um, und dieselbe Zeile liefert oben.
+    //
+    // Wieviele Stellen darauf bauen, ist NICHT vollstaendig bekannt -- und das ist der Grund fuer
+    // diese Reihenfolge statt eines mutigeren Umbaus: `vspace_map_block` bildet **identisch** ab
+    // (VA == PA), also ist jede so gemappte Region strukturell an GiB 0 gebunden; der Ladepfad
+    // haengt daran ebenso. Gemessen wurde ausserdem ein dritter Fall (Z4-Kette, dritter Boot), der
+    // ohne diese Politik ausfaellt. Solange diese Menge nicht aufgezaehlt ist, ist „unten zuerst"
+    // die ehrliche Vorgabe: sie reproduziert das gemessene Verhalten, statt eine unbelegte
+    // Freiheit zu behaupten.
+    //
+    // Der Unterschied zum alten Behelf ist trotzdem wesentlich: hoher Speicher liegt jetzt
+    // **vollstaendig** in der Freiliste und wird als Ueberlauf benutzt, statt gar nicht vergeben
+    // zu werden (bei `-m 3G` vorher 0 von 1024 MiB).
+    // **EIN Lock, nicht zwei.** `match MEM.lock() { .. }` haelt den Guard bis zum Ende des
+    // `match` -- ein zweites `MEM.lock()` im `None`-Zweig ist ein Selbst-Deadlock auf einem
+    // Spinlock, und zwar genau im Ausweichpfad, der selten laeuft. Selbst gebaut und gemessen:
+    // die Lade-Suite blieb stehen, sobald der untere Bereich einmal nicht reichte.
+    let cap = {
+        let mut mem = MEM.lock();
+        match mem.alloc_below(size, align, hal::mmu::LOW_MAPPED_END) {
+            Some(c) => Some(c),
+            // Ueberlauf: oben ist besser als gar nicht -- und er wird GEZAEHLT. Ein Pfad, der in
+            // keinem Lauf vorkommt, ist ungeprueft; ohne diese Zahl saehe „nie gebraucht"
+            // genauso aus wie „funktioniert".
+            //
+            // **Gezaehlt wird die WIRKUNG, nicht der Versuch.** Die erste Fassung zaehlte hier
+            // bedingungslos und meldete deshalb `1x` auf einer 512-MiB-Maschine, auf der es
+            // ueberhaupt keinen Speicher oberhalb 4 GiB gibt -- gezaehlt hatte sie in Wahrheit
+            // eine Anforderung, die NIRGENDS passte (eine absichtlich uebergrosse aus dem
+            // Farbtest). „Unten war kein Platz" und „es wurde oben genommen" sind zwei
+            // verschiedene Aussagen; dieselbe Verwechslung wie `rx_used` gegen „Daten angekommen".
+            None => match mem.alloc(size, align) {
+                Some(c) => {
+                    if c.base() >= hal::mmu::LOW_MAPPED_END {
+                        HIGH_FALLBACK.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(c)
+                }
+                None => None,
+            },
+        }
+    }?;
+    zero_phys(cap.base(), cap.len());
+    Some(cap)
+}
+
+/// Wie oft die Zonenvorgabe „unten zuerst" nicht erfuellt werden konnte und oberhalb 4 GiB
+/// ausgewichen wurde (E-Rest 3b). `0` heisst **nicht** „geht nicht", sondern „kam nicht vor".
+static HIGH_FALLBACK: AtomicU32 = AtomicU32::new(0);
+
+/// Zaehlerstand fuer den Bericht.
+pub fn high_fallbacks() -> u32 {
+    HIGH_FALLBACK.load(Ordering::Relaxed)
+}
+
+/// **Die Zone, aus der alles kommen muss, was eine PD-eigene Abbildung braucht** (E-Rest 3b).
+///
+/// `vspace_map_region`/`vspace_map_block` bilden nur in GiB 1 des PD-eigenen Adressraums ab;
+/// GiB 1..3 hängen an geteilten statischen Tabellen (`ISO_PD_HIGH`, s. CLAUDE.md). Eine private
+/// Region **muss** deshalb in `[USER_RAM_MIN, GIB1_END)` liegen. Das ist keine Vorliebe, die man
+/// nachträglich prüfen kann, sondern eine Bedingung, die in die Anforderung gehört.
+fn gib0_zone() -> (u64, u64) {
+    (hal::mmu::USER_RAM_MIN, hal::mmu::GIB1_END)
+}
+
+/// [`mem_alloc`] mit Zonenwunsch: die Region liegt vollständig unterhalb von `limit`.
+///
+/// Der Unterschied zum alten Weg („anfordern, Grenze prüfen, bei Verfehlung aufgeben") ist,
+/// dass hier **gesucht** statt geraten wird. Wer nur einmal fragt und die Antwort verwirft,
+/// verlässt sich stillschweigend auf die Belegungsordnung des Allokators — und die ist keine
+/// Zusicherung, sondern eine Nebenwirkung von Best-Fit über einen zufälligen Speicherplan.
+fn mem_alloc_below(size: u64, align: u64, limit: u64) -> Option<MemoryCap> {
+    let cap = MEM.lock().alloc_below(size, align, limit)?;
     zero_phys(cap.base(), cap.len());
     Some(cap)
 }
@@ -1151,7 +1230,23 @@ pub fn alloc(size: u64, align: u64) -> Option<MemoryCap> {
 /// Region, die an ein Subjekt gehen kann.
 pub fn alloc_colored(size: u64, align: u64, mask: sel4lake_mem::ColorMask) -> Option<MemoryCap> {
     let colors = crate::colors::count();
-    let cap = MEM.lock().alloc_colored(size, align, colors, mask)?;
+    // Dieselbe Politik wie in [`mem_alloc`] -- und aus demselben Grund unter EINEM Lock.
+    let cap = {
+        let mut mem = MEM.lock();
+        match mem.alloc_colored_below(size, align, colors, mask, hal::mmu::LOW_MAPPED_END) {
+            Some(c) => Some(c),
+            // Wie in [`mem_alloc`]: gezaehlt wird nur, was oben auch WIRKLICH genommen wurde.
+            None => match mem.alloc_colored(size, align, colors, mask) {
+                Some(c) => {
+                    if c.base() >= hal::mmu::LOW_MAPPED_END {
+                        HIGH_FALLBACK.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(c)
+                }
+                None => None,
+            },
+        }
+    }?;
     zero_phys(cap.base(), cap.len());
     Some(cap)
 }
@@ -2102,16 +2197,22 @@ pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u
     let core = hal::cpu::core_id();
     let kbase = claim_user_kstack()?; // EL0-Kernel-Stack aus MEM (16 KiB, ausgerichtet)
 
-    // Private 2-MiB-Stack-Region (2-MiB-ausgerichtet, in GiB 1).
+    // Private 2-MiB-Stack-Region (2-MiB-ausgerichtet, in GiB 1). Der Zonenwunsch geht in die
+    // Anforderung (E-Rest 3b) -- vorher wurde irgendeine Region genommen, die Grenze danach
+    // geprueft und bei Verfehlung aufgegeben, ohne ein zweites Mal zu fragen.
     let region_sz = hal::mmu::ISO_REGION_SIZE;
-    let (rbase, rlen) = match mem_alloc(region_sz, region_sz) {
+    let (floor, ceil) = gib0_zone();
+    let (rbase, rlen) = match mem_alloc_below(region_sz, region_sz, ceil) {
         Some(r) => (r.base(), r.len()),
         None => {
             release_user_kstack(kbase);
             return None;
         }
     };
-    if rbase < hal::mmu::USER_RAM_MIN || rbase + rlen > hal::mmu::GIB1_END {
+    // Die Untergrenze bleibt eine Pruefung: `alloc_below` kennt nur eine Obergrenze, und
+    // unterhalb von `USER_RAM_MIN` liegt ohnehin nichts in der Freiliste (der Bereich gehoert
+    // dem Kernel-Image). Faellt diese Zusage, soll es auffallen statt durchzurutschen.
+    if rbase < floor || rbase + rlen > ceil {
         MEM.lock().free_region(PhysRegion::new(rbase, rlen));
         release_user_kstack(kbase);
         return None;
@@ -2229,7 +2330,14 @@ fn spawn_isolated_colored_inner(
     // Region, Kernel-Stack UND Seitentabellen dieser PD kommen aus demselben Streifen.
     let kbase = claim_user_kstack_masked(Some(mask))?;
 
-    let cap = match MEM.lock().alloc_colored(region_sz, crate::colors::PAGE, colors, mask) {
+    // Farbe UND Zone in EINER Entscheidung (E-Rest 3b): zwei nacheinander laufende Politiken
+    // kaempfen gegeneinander -- der Farbstreifen erzwingt eine Physadresse, die Zone eine andere,
+    // und wer zuerst zuteilt, gewinnt. Dasselbe Argument steht in todo.md Z8 fuer NUMA.
+    let (floor, ceil) = gib0_zone();
+    let cap = match MEM
+        .lock()
+        .alloc_colored_below(region_sz, crate::colors::PAGE, colors, mask, ceil)
+    {
         Some(c) => c,
         None => {
             release_user_kstack(kbase);
@@ -2238,7 +2346,7 @@ fn spawn_isolated_colored_inner(
     };
     let (rbase, rlen) = (cap.base(), cap.len());
     zero_phys(rbase, rlen); // wie `mem_alloc`: nichts geht ungenullt an ein Subjekt
-    if rbase < hal::mmu::USER_RAM_MIN || rbase + rlen > hal::mmu::GIB1_END {
+    if rbase < floor || rbase + rlen > ceil {
         MEM.lock().free_region(PhysRegion::new(rbase, rlen));
         release_user_kstack(kbase);
         return None;
@@ -4408,9 +4516,14 @@ pub fn dma_enforcer_init() -> bool {
 /// einem reinen `MemoryCap`-Deskriptor aufgelöst (`into_cap`, **kein** Drop-Free) und nur die
 /// `PhysRegion` weitergereicht. Siehe `docs/invariants.md` §2/§3.
 pub fn alloc_dma_region(len: u64) -> Option<PhysRegion> {
-    let region = KernelRegionSource.request(len as usize, Purpose::Dma)?;
+    // E-Rest 3b: der Zonenwunsch steht in der Anforderung. Vorher fragte diese Stelle nach
+    // "irgendeiner" Region, prüfte die Grenze danach und gab bei Verfehlung auf -- bei `-m 3G`
+    // wählte Best-Fit dann den kleineren oberen Bereich und `dmawin`/`dmatok` fielen durch,
+    // obwohl unten reichlich Platz war.
+    let (floor, ceil) = gib0_zone();
+    let region = KernelRegionSource.request_below(len as usize, Purpose::Dma, ceil)?;
     let pr = PhysRegion::new(region.phys(), region.len() as u64);
-    if pr.base < hal::mmu::USER_RAM_MIN || pr.base + pr.len > hal::mmu::GIB1_END {
+    if pr.base < floor || pr.base + pr.len > ceil {
         KernelRegionSource.release(region); // nicht in GiB 1 -> zurückgeben (sonst nicht mappbar)
         return None;
     }
@@ -5472,12 +5585,23 @@ static REGION_ID: AtomicU32 = AtomicU32::new(1);
 
 pub struct KernelRegionSource;
 
-impl RegionSource for KernelRegionSource {
-    fn request(&self, min_len: usize, purpose: Purpose) -> Option<Region> {
+impl KernelRegionSource {
+    /// Wie [`RegionSource::request`], aber mit Zonenwunsch (E-Rest 3b).
+    ///
+    /// Bewusst **nicht** in der `RegionSource`-Schnittstelle: die ist die Sicht des Heaps, und
+    /// dem ist die Physadresse gleichgültig. Nur der Kernel weiss, dass eine DMA-Region in GiB 0
+    /// liegen muss; die Bedingung gehört dorthin, wo sie begründbar ist.
+    fn request_below(&self, min_len: usize, purpose: Purpose, limit: u64) -> Option<Region> {
         let len = (min_len as u64 + 4095) & !4095;
-        let cap = mem_alloc(len, 4096)?;
+        let cap = mem_alloc_below(len, 4096, limit)?;
         let id = REGION_ID.fetch_add(1, Ordering::Relaxed);
         Some(Region::from_cap(cap, RegionTag::new(id, purpose)))
+    }
+}
+
+impl RegionSource for KernelRegionSource {
+    fn request(&self, min_len: usize, purpose: Purpose) -> Option<Region> {
+        self.request_below(min_len, purpose, u64::MAX)
     }
     fn release(&self, region: Region) {
         MEM.lock().free(region.into_cap());
@@ -6439,6 +6563,83 @@ pub fn run_rebind() -> bool {
     println!(
         "rebind  : {} (A-4.1: Pruefung und Tausch unter EINEM Lock -- zwischen 'alter Server weg' \
          und 'neuer empfangsbereit' liegt kein Zustand ohne Empfaenger)",
+        if ok { "ALL PASS" } else { "FAILURES" }
+    );
+    ok
+}
+
+/// **D11-Selbsttest: der Überlauf einer Endpoint-Warteschlange ist BENANNT.**
+///
+/// Bis zum 2026-08-04 war `TidQueue::enqueue` ein `if cap { … }` **ohne `else`**: ab dem 33.
+/// Eintrag verschwand der Faden lautlos. Der schlimmste Ausgang davon war nicht der Verlust,
+/// sondern die Meldung darüber — `bind_receiver` gab `true` zurück, während der Eintrag
+/// weggeworfen wurde. Wer darauf baute, hielt eine Server-Instanz für gebunden, die der Endpoint
+/// nie gesehen hatte.
+///
+/// **Was dieser Test kann und was nicht.** Er läuft — wie [`run_quiesce`] und [`run_rebind`] — auf
+/// einem *lokalen* Objekt und braucht deshalb keinen Scheduler. Damit ist genau der Weg prüfbar,
+/// der ohne `SchedOps` auskommt: `bind_receiver`. Die anderen drei Wege (`call`, `recv`,
+/// `migrate_owner`) brauchen blockierende Operationen und werden gegen **denselben** Quelltext in
+/// `tools/verus-modelltreue-ipc.sh` gefahren — dort mit Stellvertretern für Frames und Scheduler,
+/// samt fünf Mutationen, die D11 einzeln wieder herstellen. Diese Zeile ersetzt das nicht, sie
+/// belegt, dass die Schranke **in diesem Kernel-Abbild** so gebaut ist.
+///
+/// Die Positivkontrolle steckt in der Anlage: der 32. Eintrag muss gelingen. Ein Test, in dem nur
+/// der 33. scheitert, wäre auch von „bind_receiver geht nie" nicht zu unterscheiden.
+#[cfg(feature = "selftest")]
+pub fn run_epfull() -> bool {
+    let mut e = Endpoint::EMPTY;
+    e.mark_used();
+
+    // 1..QUEUE_CAP fuellen. Jeder einzelne muss gelingen -- sonst misst der Rest nichts.
+    let mut alle_gebunden = true;
+    for i in 0..sel4lake_ipc::QUEUE_CAP {
+        let t = ThreadId::from_raw(0xD11_0000 + i as u64);
+        alle_gebunden &= e.bind_receiver(t);
+    }
+    // Und sie stehen wirklich alle drin -- nicht nur "hat true gesagt". Genau diese Lücke war
+    // der Befund: die Meldung stimmte, der Eintrag fehlte.
+    let mut alle_auffindbar = true;
+    for i in 0..sel4lake_ipc::QUEUE_CAP {
+        let t = ThreadId::from_raw(0xD11_0000 + i as u64);
+        alle_auffindbar &= e.quiescence_of(t).as_receiver;
+    }
+
+    // Der eine ueber der Schranke: MISSERFOLG, und er steht nirgends.
+    let ueberzaehlig = ThreadId::from_raw(0xD11_FFFF);
+    let abgewiesen = !e.bind_receiver(ueberzaehlig);
+    let nicht_eingetragen = e.quiescence_of(ueberzaehlig).is_quiescent();
+    // Er hat auch keinen der 32 verdraengt -- eine Abweisung, die den Ringpuffer weiterdreht,
+    // waere schlimmer als der Fehler.
+    let erster_noch_da = e
+        .quiescence_of(ThreadId::from_raw(0xD11_0000))
+        .as_receiver;
+    let audit_sauber = e.audit(&mut |_t: ThreadId| true) == (false, false);
+
+    // Kein Leck: wird ein Platz frei, ist er wieder vergebbar. Ohne diese Haelfte waere
+    // "abgewiesen" von "kaputt" nicht zu unterscheiden.
+    e.retire_receiver(ThreadId::from_raw(0xD11_0000));
+    let nach_freigabe = e.bind_receiver(ueberzaehlig);
+
+    let ok = alle_gebunden
+        && alle_auffindbar
+        && abgewiesen
+        && nicht_eingetragen
+        && erster_noch_da
+        && audit_sauber
+        && nach_freigabe;
+    println!(
+        "epfull  : {} gebunden (alle auffindbar {alle_auffindbar}); der {}. abgewiesen \
+         {abgewiesen}/nicht eingetragen {nicht_eingetragen}/keinen verdraengt {erster_noch_da}/\
+         audit sauber {audit_sauber}; nach Freigabe wieder vergebbar {nach_freigabe}",
+        sel4lake_ipc::QUEUE_CAP,
+        sel4lake_ipc::QUEUE_CAP + 1
+    );
+    println!(
+        "epfull  : {} (D11: der Ueberlauf einer Endpoint-Warteschlange wird BENANNT statt still \
+         verworfen. Vorher meldete bind_receiver Erfolg, waehrend der Eintrag verschwand -- und \
+         call/recv blockierten den Faden, ohne ihn irgendwo einzutragen: er hing dauerhaft, und \
+         is_quiescent/audit/purge_thread meldeten Ordnung)",
         if ok { "ALL PASS" } else { "FAILURES" }
     );
     ok

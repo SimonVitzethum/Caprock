@@ -143,4 +143,22 @@ pub mod result {
     /// wissen, ob der Server die Wirkung schon hatte. Denselben Code für beides zu nehmen
     /// hiesse, dem Client diesen Unterschied zu verschweigen.
     pub const ERR_QUIESCING: u64 = 8;
+    /// **Die Warteschlange dieses Endpoints ist voll** (D11): mehr als `QUEUE_CAP` Threads
+    /// können an *einem* Endpoint nicht zugleich blockieren.
+    ///
+    /// Vor diesem Code gab es die Lage nicht als Antwort, sondern als Loch: der 33. Sender
+    /// wurde **trotzdem** blockiert, landete in keiner Struktur des Endpoints, bekam keinen
+    /// Ergebniscode und wurde nie geweckt — und `is_quiescent()` meldete ihn als *ruhig*.
+    /// Ein Thread ging verloren, und jeder Prüfer meldete Ordnung.
+    ///
+    /// **Warum ein dritter Code und nicht [`ERR_QUIESCING`]** (die Frage, die D11 offenließ):
+    /// die drei Lagen verlangen vom Client verschiedene Antworten. [`ERR_BADCAP`] heisst „gibt
+    /// es nicht" — nie wieder versuchen. `ERR_QUIESCING` heisst „kommt gleich wieder" — warten,
+    /// bis der Austausch durch ist; die Wartezeit ist durch den Austausch begrenzt und hängt
+    /// nicht am Verhalten anderer Clients. `ERR_EP_FULL` heisst „gerade kein Platz" — das ist
+    /// eine **Lastaussage**: sie hängt an den anderen 32 Wartenden, kann sofort wieder gelten,
+    /// und ein Client, der stumpf wiederholt, verschärft sie. Wer die beiden zusammenwürfe,
+    /// nähme dem Client genau die Unterscheidung, die A-4.2 zwischen `ERR_QUIESCING` und
+    /// `ERR_BADCAP` gerade eingeführt hat.
+    pub const ERR_EP_FULL: u64 = 9;
 }

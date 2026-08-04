@@ -62,6 +62,31 @@ impl PhysAllocator {
     /// `size` Bytes mit Ausrichtung `align` (mind. [`PAGE`]) allozieren.
     /// Liefert eine RW-Wurzel-Cap oder `None`, wenn kein Platz passt.
     pub fn alloc(&mut self, size: u64, align: u64) -> Option<MemoryCap> {
+        self.alloc_below(size, align, u64::MAX)
+    }
+
+    /// Wie [`alloc`](Self::alloc), aber die Region muss **vollständig unterhalb von `limit`**
+    /// liegen — der Zonenwunsch des Aufrufers, im Allokator statt daneben.
+    ///
+    /// **Warum es diese Funktion gibt** (E-Rest 3b, 2026-08-04). Manche Regionen sind nicht
+    /// austauschbar: eine DMA-Region und die private Region einer isolierten PD *müssen* in
+    /// GiB 0 liegen, weil nur dort eine PD-eigene Abbildung entstehen kann. Bis hierher fragten
+    /// diese Aufrufer nach „irgendeiner" Region, prüften die Grenze danach und gaben bei
+    /// Verfehlung auf — **ohne ein zweites Mal zu fragen**. Das ging gut, solange der Speicher
+    /// zusammenhing und Best-Fit von unten belegte; sobald ein zweiter, *kleinerer* Bereich
+    /// oberhalb 4 GiB dazukam, wählte Best-Fit ihn für jede kleine Anforderung und der Aufrufer
+    /// bekam eine Adresse, die er nicht gebrauchen konnte. Gemessen bei `-m 3G`:
+    /// `dmawin`/`dmatok : FAILURES`, `iso : spawn_isolated fehlgeschlagen` — während 4G und 6G
+    /// grün waren, weil dort der obere Bereich zufällig größer ist.
+    ///
+    /// Ein Fehler, der an einer **Größenrelation** hängt statt an der Struktur, verschwindet
+    /// beim nächsten Messwert. Deshalb kennt die Freiliste den Wunsch jetzt, statt ihn zu
+    /// erraten: gesucht wird nur unter Fragmenten, die ihn erfüllen können, und ein Fragment,
+    /// das die Grenze überschreitet, wird an ihr **beschnitten** statt verworfen — sonst wäre
+    /// ein einzelner Bereich über die Grenze hinweg für die Zone unbenutzbar.
+    ///
+    /// `limit == u64::MAX` heisst „egal" und ist bit-identisch zum bisherigen Verhalten.
+    pub fn alloc_below(&mut self, size: u64, align: u64, limit: u64) -> Option<MemoryCap> {
         let align = align.max(PAGE);
         let size = align_up(size.max(1), PAGE);
 
@@ -70,7 +95,11 @@ impl PhysAllocator {
         // bleiben für große/ausgerichtete Allocs erhalten (z. B. 2-MiB-aligned isolierte Stacks) —
         // vermeidet First-Fit-Fragmentierung (4-KiB-Tabellen knabbern das erste große Fragment an).
         // Semantik sonst unverändert (Split/Coalesce/Accounting) -> memtest (1 Fragment) unberührt.
-        let mut best: Option<usize> = None;
+        // BEST-FIT **innerhalb der Zone**: verglichen wird die Länge des *nutzbaren* Teils, nicht
+        // die des Fragments. Sonst gewänne ein riesiges Fragment, von dem nur ein Zipfel unter
+        // der Grenze liegt, gegen ein kleines, das ganz hineinpasst — und Best-Fit hiesse etwas
+        // anderes, sobald jemand eine Grenze nennt.
+        let mut best: Option<(usize, u64)> = None;
         for i in 0..self.len {
             let r = self.regions[i];
             let start = align_up(r.base, align);
@@ -78,19 +107,25 @@ impl PhysAllocator {
             let Some(end) = start.checked_add(size) else {
                 continue;
             };
-            if start >= r.base && end <= r.end() {
+            // Der in der Zone nutzbare Teil dieses Fragments.
+            let zone_end = r.end().min(limit);
+            if zone_end <= r.base {
+                continue; // liegt vollständig jenseits der Grenze
+            }
+            let nutzbar = zone_end - r.base;
+            if start >= r.base && end <= zone_end {
                 // Beidseitiger Verschnitt erhöht die Fragmentzahl um 1; ist die Liste dann voll,
                 // ginge das Suffix beim `insert` verloren (Leck) -> dieses Fragment überspringen.
                 let two_sided = start > r.base && end < r.end();
                 if two_sided && self.len >= MAX_FRAGMENTS {
                     continue;
                 }
-                if best.map_or(true, |b| r.len < self.regions[b].len) {
-                    best = Some(i);
+                if best.map_or(true, |(_, n)| nutzbar < n) {
+                    best = Some((i, nutzbar));
                 }
             }
         }
-        let i = best?;
+        let (i, _) = best?;
         let r = self.regions[i];
         let start = align_up(r.base, align);
         let end = start + size;
@@ -121,11 +156,26 @@ impl PhysAllocator {
         colors: u32,
         mask: ColorMask,
     ) -> Option<MemoryCap> {
+        self.alloc_colored_below(size, align, colors, mask, u64::MAX)
+    }
+
+    /// Wie [`alloc_colored`](Self::alloc_colored), aber zusätzlich mit dem Zonenwunsch aus
+    /// [`alloc_below`](Self::alloc_below). Farbe **und** Zone werden hier gemeinsam entschieden;
+    /// zwei nacheinander laufende Politiken würden gegeneinander arbeiten (dasselbe Argument
+    /// steht in `todo.md` Z8 für Farbe und NUMA-Knoten).
+    pub fn alloc_colored_below(
+        &mut self,
+        size: u64,
+        align: u64,
+        colors: u32,
+        mask: ColorMask,
+        limit: u64,
+    ) -> Option<MemoryCap> {
         if mask.is_empty() {
             return None;
         }
         if colors <= 1 || mask == ColorMask::ALL {
-            return self.alloc(size, align);
+            return self.alloc_below(size, align, limit);
         }
         let align = align.max(PAGE);
         let size = align_up(size.max(1), PAGE);
@@ -138,9 +188,15 @@ impl PhysAllocator {
         let step = align;
 
         let mut best: Option<(usize, u64)> = None;
+        let mut best_nutzbar = u64::MAX;
         for i in 0..self.len {
             let r = self.regions[i];
             let mut start = align_up(r.base, align);
+            let zone_end = r.end().min(limit);
+            if zone_end <= r.base {
+                continue; // liegt vollständig jenseits der Grenze
+            }
+            let nutzbar = zone_end - r.base;
             // Das Farbmuster wiederholt sich spätestens nach `colors` Schritten; mehr zu
             // probieren kann nichts Neues finden.
             let mut tries = 0u32;
@@ -148,15 +204,16 @@ impl PhysAllocator {
                 let Some(end) = start.checked_add(size) else {
                     break;
                 };
-                if end > r.end() {
+                if end > zone_end {
                     break;
                 }
                 if run_is_colored(start, npages, colors, mask) {
                     let two_sided = start > r.base && end < r.end();
                     if !(two_sided && self.len >= MAX_FRAGMENTS) {
-                        // Best-Fit wie in `alloc`: kleinstes taugliches Fragment zuerst.
-                        if best.map_or(true, |(b, _)| r.len < self.regions[b].len) {
+                        // Best-Fit wie in `alloc_below`: kleinster **nutzbarer** Teil zuerst.
+                        if nutzbar < best_nutzbar {
                             best = Some((i, start));
+                            best_nutzbar = nutzbar;
                         }
                     }
                     break;
@@ -435,5 +492,106 @@ mod tests {
         }
         assert_eq!(a.total_free(), free0, "Speicher nach Rueckgabe nicht vollstaendig zurueck");
         assert_eq!(a.fragments(), 1, "Freiliste nicht wieder koalesziert");
+    }
+
+    // -- E-Rest 3b: der Zonenwunsch ------------------------------------------------------------
+    //
+    // Der Speicherplan, an dem der Befund gemessen wurde: `-m 3G` auf q35 ergibt UNTEN einen
+    // grossen Bereich und OBEN einen KLEINEREN. Genau diese Groessenrelation liess Best-Fit den
+    // oberen waehlen. Die Zahlen sind deshalb nicht frei gewaehlt -- sie bilden den Fall ab, der
+    // `dmawin`/`dmatok : FAILURES` und `iso : spawn_isolated fehlgeschlagen` erzeugt hat.
+    const GIB: u64 = 1 << 30;
+    /// Wie `-m 3G`: unten 2032 MiB ab 16 MiB, oben 1024 MiB ab 4 GiB.
+    fn wie_3g() -> PhysAllocator {
+        let mut a = PhysAllocator::new();
+        assert!(a.add_region(16 * 1024 * 1024, 2032 * 1024 * 1024));
+        assert!(a.add_region(4 * GIB, GIB));
+        a
+    }
+
+    /// **Die Positivkontrolle -- und sie ist der eigentliche Test.** Ohne Zonenwunsch waehlt
+    /// Best-Fit den kleineren OBEREN Bereich. Steht diese Zeile nicht, sagt der Test darunter
+    /// nichts: er koennte auch dann gruen sein, wenn die Zone gar nichts bewirkt.
+    #[test]
+    fn ohne_zone_waehlt_best_fit_den_oberen_bereich() {
+        let mut a = wie_3g();
+        let cap = a.alloc(2 * 1024 * 1024, 2 * 1024 * 1024).expect("Platz vorhanden");
+        assert!(
+            cap.base() >= 4 * GIB,
+            "Voraussetzung des Befunds entfaellt: Best-Fit nahm {:#x}, nicht den oberen Bereich",
+            cap.base()
+        );
+    }
+
+    /// **Die Aussage:** mit Zonenwunsch kommt dieselbe Anforderung aus GiB 0.
+    #[test]
+    fn mit_zone_kommt_die_region_aus_gib0() {
+        let mut a = wie_3g();
+        let cap = a
+            .alloc_below(2 * 1024 * 1024, 2 * 1024 * 1024, GIB)
+            .expect("unten ist reichlich Platz");
+        assert!(cap.base() + cap.len() <= GIB, "Region {:#x} liegt nicht in GiB 0", cap.base());
+    }
+
+    /// Die Zone ist eine **Schranke**, keine Vorliebe: passt nichts hinein, gibt es `None` --
+    /// und nicht ersatzweise etwas darueber.
+    #[test]
+    fn zone_ohne_platz_liefert_none() {
+        let mut a = PhysAllocator::new();
+        assert!(a.add_region(4 * GIB, GIB)); // NUR hoher Speicher
+        assert!(a.alloc_below(PAGE, PAGE, GIB).is_none(), "Zone wurde ueberschritten");
+        assert!(a.alloc(PAGE, PAGE).is_some(), "ohne Zone muss dieselbe Anforderung gelingen");
+    }
+
+    /// Ein Bereich, der die Grenze **ueberquert**, wird an ihr beschnitten statt verworfen --
+    /// sonst waere ein einzelner durchgehender Speicher fuer die Zone unbenutzbar.
+    #[test]
+    fn bereich_ueber_die_grenze_wird_beschnitten() {
+        let mut a = PhysAllocator::new();
+        assert!(a.add_region(GIB / 2, GIB)); // 512 MiB .. 1,5 GiB -- ueberquert GIB
+        let cap = a.alloc_below(64 * 1024 * 1024, PAGE, GIB).expect("die untere Haelfte reicht");
+        assert!(cap.base() + cap.len() <= GIB, "Grenze verletzt: {:#x}", cap.base());
+        // Und was jenseits liegt, bleibt vergebbar -- die Zone verbraucht es nicht.
+        assert!(a.alloc(256 * 1024 * 1024, PAGE).is_some(), "Speicher jenseits der Grenze verloren");
+    }
+
+    /// `u64::MAX` heisst „egal" und muss **bit-identisch** zum alten Weg sein. Ohne diese Zeile
+    /// koennte die Zonenlogik das Verhalten aller uebrigen Aufrufer still verschieben.
+    #[test]
+    fn ohne_grenze_identisch_zu_alloc() {
+        let mut a = wie_3g();
+        let mut b = wie_3g();
+        for _ in 0..8 {
+            let x = a.alloc(PAGE * 3, PAGE).unwrap();
+            let y = b.alloc_below(PAGE * 3, PAGE, u64::MAX).unwrap();
+            assert_eq!(x.base(), y.base(), "alloc und alloc_below(u64::MAX) laufen auseinander");
+        }
+    }
+
+    /// Farbe UND Zone gemeinsam: die Region traegt nur erlaubte Farben **und** liegt in GiB 0.
+    /// Nacheinander entschieden wuerde eine der beiden Bedingungen die andere ueberstimmen.
+    #[test]
+    fn farbe_und_zone_gelten_gemeinsam() {
+        let mut a = wie_3g();
+        let m = stripe(2, 4, COLORS).unwrap();
+        let cap = a
+            .alloc_colored_below(4 * PAGE, PAGE, COLORS, m, GIB)
+            .expect("unten ist Platz in jeder Farbe");
+        assert!(all_pages_in(&cap, m), "Seite mit unerlaubter Farbe vergeben");
+        assert!(cap.base() + cap.len() <= GIB, "Farbe erfuellt, Zone verletzt: {:#x}", cap.base());
+    }
+
+    /// Der Zonenwunsch leckt nicht: nach der Rueckgabe steht die Bilanz wieder.
+    #[test]
+    fn zonen_allokation_ist_bilanzneutral() {
+        let mut a = wie_3g();
+        let free0 = a.total_free();
+        let caps: std::vec::Vec<_> =
+            (0..4).map(|_| a.alloc_below(PAGE * 5, PAGE, GIB).unwrap()).collect();
+        assert!(a.total_free() < free0);
+        for c in caps {
+            assert!(a.free(c));
+        }
+        assert_eq!(a.total_free(), free0, "Speicher nach Rueckgabe nicht vollstaendig zurueck");
     }
 }

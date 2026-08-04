@@ -1392,18 +1392,79 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       **Was er NICHT kann, und das steht in seinem Kopf:** er sieht Aufrufe, keine Absichten. Ob
       eine erlaubte Stelle ihre Identität weiterhin zu Recht annimmt, prüft er nicht.
 
-- [ ] **E-Rest 3e: DMA-Regionen hängen weiterhin an GiB 0.** (2026-08-04, beim Heben des
-      PD-Deckels stehengeblieben.) `alloc_dma_region` trägt die harte Bedingung `gib0_zone`
-      unverändert, und zwar aus zwei Gründen, die auseinandergehalten gehören:
-      **(a)** sie wird über `map_dma_into_thread`/`map_region_into_thread` **identisch** in die
-      Treiber-PD abgebildet — dieselbe Bindung, die der PD-Deckel gerade verloren hat, und mit
-      demselben Fenster-Mechanismus zu lösen;
-      **(b)** sie ist **gerätesichtbar**, und ob ein Gerät oberhalb 4 GiB adressieren kann, ist
-      eine Eigenschaft des Geräts. Gemessen ist nur, dass `virtio-blk` unter QEMU es kann
-      (E-Rest 3d); die Angebotsliste führt die Adressbreite nicht
-      (`dmawin : Geraete-ohne-deklarierte-Adressbreite=1`). (a) ist Arbeit, (b) ist eine
-      Enumerationsfrage — und ohne (b) wäre das Heben von (a) ein Vertrauensvorschuss an
-      unbekannte Hardware.
+- [ ] **D12: aarch64 fällt unter Host-Überbuchung gelegentlich aus — und meine Entlastung des
+      eigenen Umbaus war NICHT gedeckt.** (2026-08-04, gemessen.)
+
+      Ich hatte geschrieben, der Fehlschlag „trat auch vor diesen Änderungen auf". Das war
+      **behauptet, nicht gemessen**. Nachgeholt als Bisect über die **Last** statt über den Code:
+      derselbe Aufbau (drei parallele QEMU-Suiten: x86 3G, x86 6G, Lade-Suite 6G), einmal auf dem
+      Stand **vor** dem VA-Fenster (`986bb40`, eigener Worktree), einmal danach.
+
+      | Stand | Läufe unter dreifacher Parallellast | grün |
+      |---|---|---|
+      | vor dem Umbau (`986bb40`) | 6 | **6** |
+      | nach dem Umbau (HEAD) | 6 + 12 | **17** |
+
+      **Was das heißt und was nicht.** 0 von 6 schließt eine Rate von ~6 % nicht aus
+      (`0,94⁶ ≈ 0,69`) — die Vorher-Stichprobe ist zu klein, um den Nachher-Wert von rund 1/18 zu
+      widerlegen. Ein Regressionsnachweis ist das **nicht**. Aber meine Entlastung ist damit
+      ebenfalls weg: ich habe keine Messung, die den Umbau entlastet, und hatte behauptet, es
+      gäbe eine.
+
+      **Was fehlt, und das ist der eigentliche Mangel:** ich habe **kein Protokoll** eines
+      Fehlschlags. `tools/`-Nachbau steht (`armfang.sh` im Scratchpad hält das volle Log bei
+      Abweichung), hat aber in 12 Läufen nicht ausgelöst. Ohne die fehlschlagende Zeile ist jede
+      Ursachenvermutung Prosa.
+
+      **Nicht als „Umgebung" ablegen.** Ein Fehler, der nur bei Überbuchung des Wirts auftritt,
+      ist ein Kandidat für ein verpasstes `WFE`-Wakeup oder ein Timer/IPI-Rennen — zeitabhängige
+      Kernelfehler leben genau dort, und die Emulation verschiebt nur die Wahrscheinlichkeit,
+      nicht die Ursache. Verwandt mit D0 (x86) und D6 (aarch64), aber mit einem eigenen,
+      **reproduzierbaren Auslöser**: Last.
+
+      **Dasselbe Bild auf x86, und derselbe Mangel.** Die **Lade-Suite bei 512M** fiel am
+      2026-08-04 zweimal aus — beide Male innerhalb eines längeren Sammellaufs, isoliert
+      danach 6 von 6 grün (und davor schon 3 von 3). Auch dafür habe ich **kein Protokoll**.
+
+      **Der gemeinsame Nenner ist mein Messaufbau, nicht der Kernel.** Beide Sammelläufe hielten
+      nur `tail -1` fest und warfen die Ausgabe weg. Die Suiten selbst legen bei Abweichung ein
+      volles Log ab (`build/diag/`); meine Schleife darüber tat es nicht. Ein Fehlschlag ohne
+      Protokoll ist ein verlorener Fehlschlag — und bei einer Rate um 1/20 kostet jeder verlorene
+      Stunden.
+
+      **Zu tun:** (1) die Sammelläufe halten das volle Log bei Abweichung fest — das ist die
+      Voraussetzung für alles Weitere und kostet zehn Zeilen; (2) das Fangnetz nach `tools/`
+      heben und länger laufen lassen, bis ein Protokoll da ist; (3) beide Stände mit gleicher,
+      größerer Stichprobe messen (je 30+), sonst bleibt die Tabelle oben ein Hinweis und kein
+      Urteil.
+
+- [ ] **E-Rest 3e: DMA-Regionen hängen an GiB 0 — und das sind ZWEI Fragen, keine.**
+      (2026-08-04, beim VA==PA-Durchgang neu zerlegt; die erste Fassung dieses Eintrags faltete
+      beide zusammen und machte den Punkt dadurch größer, als er ist.)
+
+      **(a) Abbildung — dieselbe Arbeit wie E-Rest 3d.** Die Region wird über
+      `map_region_into_thread`/`MappingKind::Dma` **identisch** in die Treiber-PD abgebildet
+      (`IdentityReason::DeviceDmaWindow`). Das ist die CPU-Seite, und für sie gilt wörtlich, was
+      für die private PD-Region galt: das Fenster löst es. Kein neuer Entwurf nötig.
+
+      **(b) Allokation — eine ganz andere Frage, und die eigentliche Lücke.** Ein 32-Bit-fähiges
+      Gerät kann nur in die unteren 4 GiB schreiben. Das ist **keine Eigenschaft der Abbildung**,
+      sondern eine Einschränkung der **Zuteilung** — und unter VT-d/SMMU löst sie sich sogar auf:
+      die **IOVA** kann niedrig sein, während die PA irgendwo liegt. GiB-0-Pinning ist damit eine
+      **Politik des Allokators**, die beim IOMMU-Detect gewählt gehört, und keine Eigenschaft der
+      Region.
+
+      **Was wirklich fehlt, ist die Ausdrückbarkeit:** eine `dma_mask` gehört in die Cap bzw. in
+      den Angebotseintrag, damit die Einschränkung überhaupt formulierbar ist, statt in eine
+      Basisadresse eingebacken zu sein. Heute meldet die Suite sie als Abwesenheit
+      (`dmawin : Geraete-ohne-deklarierte-Adressbreite=1`) — das ist ehrlich, aber es ist ein
+      **Zähler für eine fehlende Angabe** und keine Angabe. Solange sie fehlt, ist jede Wahl der
+      Basisadresse ein Rateschritt: unten liegen heisst „für alle Geräte sicher", und das ist
+      dieselbe Sorte Vorsichtsmaßnahme wie „unten zuerst" aus E-Rest 3b — sie kostet die knappe
+      Zone und belegt nichts.
+
+      Reihenfolge: **(b) vor (a)**. (a) ohne (b) wäre ein Vertrauensvorschuss an unbekannte
+      Hardware — die Region läge dann oben, weil es geht, nicht weil das Gerät es kann.
 
 - [x] **E-Rest 1 BEHOBEN am 2026-08-04: `iova_window_clear_of_msi` gibt im schwachen Zweig „in Ordnung" zurück, ohne
       urteilen zu können.** (2026-08-03, gemessen) `kernel/src/system.rs:3900`:

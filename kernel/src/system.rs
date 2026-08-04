@@ -538,14 +538,25 @@ impl SchedOps for KernelSched {
             1 => hal::mmu::UserPerm::Rw,
             _ => hal::mmu::UserPerm::Ro,
         };
-        vspace_map(asid, base, len, perm)
+        vspace_map(
+            asid,
+            crate::addr::IdentityReason::SyscallMapByCap,
+            crate::addr::Pa::new(base),
+            len,
+            perm,
+        )
     }
     fn unmap_frame(&mut self, caller: ThreadId, base: u64, len: u64) -> bool {
         let asid = (vspace_of(caller.slot()) >> 48) as u16;
         if asid == 0 || len == 0 || len % 4096 != 0 {
             return false;
         }
-        vspace_unmap(asid, base, len)
+        vspace_unmap(
+            asid,
+            crate::addr::IdentityReason::SyscallMapByCap,
+            crate::addr::Pa::new(base),
+            len,
+        )
     }
     /// A-5.1: ein Geräte-Fenster in die VSpace des Aufrufers, mit den Attributen des **Objekts**
     /// (Device vs. DMA-RAM), nicht denen der Rechte. Gibt die Gerätesicht (IOVA) zurück, `0` für
@@ -582,7 +593,18 @@ impl SchedOps for KernelSched {
         if asid == 0 || len == 0 || len % 4096 != 0 {
             return false;
         }
-        vspace_unmap(asid, base, len)
+        // **Der Grund haengt an der ART des Fensters, nicht am Aufrufer.** MMIO und DMA in
+        // einen Eintrag zu falten war der Fehler der ersten Fassung: bei MMIO ist die Identitaet
+        // die Zusicherung (der Treiber rechnet mit BAR-Adressen aus der Enumeration), bei DMA ist
+        // sie nur die CPU-seitige Haelfte -- das Geraet sieht eine IOVA, und die ist eine andere
+        // Achse. `unmap_window` weiss hier nicht mehr, welche Art es war; die Abbildung ist in
+        // beiden Faellen dieselbe, der Grund also der schwaechere der beiden.
+        vspace_unmap(
+            asid,
+            crate::addr::IdentityReason::DeviceMmioWindow,
+            crate::addr::Pa::new(base),
+            len,
+        )
     }
 }
 
@@ -2155,18 +2177,30 @@ fn vspace_l1(asid: u16) -> Option<u64> {
 /// 4-KiB-Granularität: Region `[base, base+len)` (identity) mit `perm` in die VSpace
 /// `asid` mappen. 2-MiB-ausgerichtete 2-MiB-Regionen mit RW/RX nutzen den
 /// Block-Fastpath; sonst seitenweise (L3 wird bei Bedarf aus `MEM` angelegt).
-fn vspace_map(asid: u16, base: u64, len: u64, perm: hal::mmu::UserPerm) -> bool {
-    vspace_map_masked(asid, base, len, perm, None)
+fn vspace_map(
+    asid: u16,
+    reason: crate::addr::IdentityReason,
+    pa: crate::addr::Pa,
+    len: u64,
+    perm: hal::mmu::UserPerm,
+) -> bool {
+    vspace_map_masked(asid, reason, pa, len, perm, None)
 }
 
 /// Wie [`vspace_map`], aber die bei Bedarf angelegten L3-Tabellen kommen aus `mask` (todo A1).
 fn vspace_map_masked(
     asid: u16,
-    base: u64,
+    reason: crate::addr::IdentityReason,
+    pa: crate::addr::Pa,
     len: u64,
     perm: hal::mmu::UserPerm,
     mask: Option<sel4lake_mem::ColorMask>,
 ) -> bool {
+    // **Hier und nur hier** wird aus einer PA eine VA — mit Grund. Der Rest der Funktion rechnet
+    // danach mit `base`, weil die HAL an dieser Stelle EINEN Wert nimmt; das ist der Sinn der
+    // identischen Abbildung. Der Unterschied zu vorher ist, dass die Gleichsetzung eine
+    // benannte Handlung ist und keine Zeile, die man beim Lesen ueberspringt.
+    let base = crate::addr::Va::identity(reason, pa).raw();
     let Some(l2) = vspace_l2(asid) else {
         return false;
     };
@@ -2228,7 +2262,15 @@ fn vspace_map_user_region(
 }
 
 /// 4-KiB-Granularität: Region `[base, base+len)` aus der VSpace `asid` entfernen.
-fn vspace_unmap(asid: u16, base: u64, len: u64) -> bool {
+fn vspace_unmap(
+    asid: u16,
+    reason: crate::addr::IdentityReason,
+    pa: crate::addr::Pa,
+    len: u64,
+) -> bool {
+    // Muss dieselbe Achse benutzen wie das Mappen, sonst raeumt es an der falschen Stelle ab --
+    // deshalb dieselbe benannte Umwandlung und nicht etwa ein roher Wert.
+    let base = crate::addr::Va::identity(reason, pa).raw();
     let Some(l2) = vspace_l2(asid) else {
         return false;
     };
@@ -2264,7 +2306,13 @@ pub fn map_into_thread(tid: ThreadId, base: u64, len: u64, perm_code: u8) -> boo
         1 => hal::mmu::UserPerm::Rw,
         _ => hal::mmu::UserPerm::Ro,
     };
-    vspace_map(asid, base, len, perm)
+    vspace_map(
+        asid,
+        crate::addr::IdentityReason::KernelSetupMapping,
+        crate::addr::Pa::new(base),
+        len,
+        perm,
+    )
 }
 
 /// Kernel-Setup-Gegenstück zu [`map_into_thread`]: `[base, base+len)` aus der VSpace
@@ -2277,7 +2325,12 @@ pub fn unmap_into_thread(tid: ThreadId, base: u64, len: u64) -> bool {
     if asid == 0 {
         return false;
     }
-    vspace_unmap(asid, base, len)
+    vspace_unmap(
+        asid,
+        crate::addr::IdentityReason::KernelSetupMapping,
+        crate::addr::Pa::new(base),
+        len,
+    )
 }
 
 /// Eine isolierte VSpace abbauen: alle per-PD-L3-Tabellen **und** L1+L2 an `MEM`
@@ -3080,13 +3133,30 @@ pub fn map_region_into_thread(tid: ThreadId, phys: u64, len: u64, kind: MappingK
     // Reine Seitentabellen (E-Rest 3d): der Kernel schreibt sie ueber seine Identitaetskarte,
     // die PD sieht sie nie -- sie ist der Baum, nicht das Blatt.
     let mut alloc = || mem_alloc_anywhere(4096, 4096).map(|c| c.base());
+    // **Zwei Arten, zwei Gruende -- und das ist keine Formsache.** Bei MMIO IST die Identitaet
+    // die Zusicherung: ein Treiber rechnet mit BAR-Adressen aus der PCI-Enumeration, und die sind
+    // physisch. Bei DMA ist sie nur die **CPU-seitige** Haelfte; was das Geraet sieht, ist eine
+    // `Iova` aus dem Fenster des Uebersetzungskontexts. Beides in einen Eintrag zu falten waere
+    // dieselbe Vermengung eine Achse weiter.
     let ok = match kind {
         MappingKind::Device { ro } => match vspace_l1(asid) {
-            Some(l1) => hal::mmu::vspace_map_device(l1, phys, len, ro, &mut alloc),
+            Some(l1) => {
+                let va = crate::addr::Va::identity(
+                    crate::addr::IdentityReason::DeviceMmioWindow,
+                    crate::addr::Pa::new(phys),
+                );
+                hal::mmu::vspace_map_device(l1, va.raw(), len, ro, &mut alloc)
+            }
             None => return false, // nicht isoliert / ungültige ASID
         },
         MappingKind::Dma { coherent } => match vspace_l2(asid) {
-            Some(l2) => hal::mmu::vspace_map_dma(l2, phys, len, coherent, &mut alloc),
+            Some(l2) => {
+                let va = crate::addr::Va::identity(
+                    crate::addr::IdentityReason::DeviceDmaWindow,
+                    crate::addr::Pa::new(phys),
+                );
+                hal::mmu::vspace_map_dma(l2, va.raw(), len, coherent, &mut alloc)
+            }
             None => return false,
         },
     };
@@ -4807,9 +4877,19 @@ pub fn unmap_dma_from_thread(tid: ThreadId, phys: u64, len: u64) -> bool {
     let Some(l2) = vspace_l2(asid) else {
         return false;
     };
-    let mut p = phys;
+    // Gegenstueck zum DMA-Zweig von `map_region_into_thread` -- **derselbe Grund, damit es
+    // dieselbe Achse ist**. Der Waechter hat diese Stelle gefunden: sie stand ausserhalb jeder
+    // Engstelle und bildete identisch ab, ohne dass irgendwo stand warum. Raeumte sie auf einer
+    // anderen Achse ab als das Mappen, bliebe eine Abbildung stehen -- und ein DMA-Fenster, das
+    // beim Abbau stehenbleibt, ist genau das, was `dma_audit` Code 8 meldet.
+    let base = crate::addr::Va::identity(
+        crate::addr::IdentityReason::DeviceDmaWindow,
+        crate::addr::Pa::new(phys),
+    )
+    .raw();
+    let mut p = base;
     let mut ok = true;
-    while p < phys + len {
+    while p < base + len {
         ok &= hal::mmu::vspace_unmap_page(l2, p);
         p += 4096;
     }
@@ -6192,6 +6272,13 @@ mod pcie_arm {
     /// BARs dimensionieren+zuweisen, Memory-Space + **Bus-Master** aktivieren. Gibt das Gerät
     /// (inkl. RID = SMMU-StreamID) zurück. Reines kernel-/Trusted-Setup — kein User-Pfad.
     pub fn pcie_find_virtio() -> Option<hal::pcie::PciDevice> {
+        // Kein Subjekt beteiligt: der Kernel bildet sich selbst das ECAM-Fenster ein, um zu
+        // enumerieren. Der Grund steht trotzdem hin -- er unterscheidet diese Stelle von einer,
+        // an der eine PD etwas zu sehen bekaeme.
+        let _ = crate::addr::Va::identity(
+            crate::addr::IdentityReason::KernelGlobalDeviceWindow,
+            crate::addr::Pa::new((hal::pcie::ECAM_GIB as u64) << 30),
+        );
         hal::mmu::map_device_block_global(hal::pcie::ECAM_GIB);
         // Gezielt die virtio-RNG (nicht eine evtl. vorhandene Default-NIC, ebenfalls Vendor 0x1af4).
         let d = hal::pcie::find(hal::pcie::VIRTIO_VENDOR, &hal::pcie::VIRTIO_RNG_DEVICES);

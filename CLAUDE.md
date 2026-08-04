@@ -105,7 +105,16 @@ falsch.
   Frage dort nicht entscheidbar ist. Gegenprobe gefahren.
   Zwei eigene Annahmen widerlegt: der 2-MiB-Block-Fastpath geht **nicht** verloren (er hing an
   der Ausrichtung der VA, nicht an der Identitaet), und A1/B-4.1 ist gar nicht betroffen.
-* **VA == PA ist jetzt eine LISTE, keine Gewohnheit.** Bestandsaufnahme nach dem Fenster-Umbau:
+* **VA == PA steht jetzt im TYP.** `addr::Va` hat **keinen** Konstruktor aus `u64` oder `Pa` --
+  der einzige Weg ist `Va::identity(reason, pa)` mit einer Variante des geschlossenen Enums
+  `IdentityReason`. Die Liste IST damit der Quelltext. Die erste Fassung war ein Skript mit einer
+  Liste im Kopf und hat sich am selben Tag selbst widerlegt: `vspace_map_dma` stand gar nicht
+  darin, und der Grundtext zu `SYS_MAP` war **falsch** (`sys::MAP` traegt kein Adressargument --
+  der Aufrufer nennt eine Cap, die Basis kommt aus der Cap-Aufloesung im Kernel; die Identitaet
+  ist also behebbar, ohne die ABI anzufassen). **Ein Waechter prueft die Existenz eines Grundes,
+  nie seine Wahrheit** -- deshalb tragen die Gruende jetzt, wo moeglich, einen **Falsifikator**.
+  Der neue Waechter fand sofort eine Stelle, die der alte nicht sah (`unmap_dma_from_thread`).
+* **VA == PA, erste Fassung: eine LISTE, keine Gewohnheit** (ueberholt, s. o.) Bestandsaufnahme nach dem Fenster-Umbau:
   neun Aufrufstellen in acht identisch abbildenden HAL-Funktionen, in drei Klassen.
   **Entfernt:** `spawn_isolated_native` bildete Code und Stack identisch ab und nahm die
   Physadresse des Code-Frames als **Einsprungadresse** -- beides geht jetzt ins Fenster,
@@ -515,6 +524,21 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   4 GiB gar keinen Speicher gibt — gezaehlt hatte er eine absichtlich uebergrosse Anforderung,
   die NIRGENDS passte. „Unten war kein Platz" und „es wurde oben genommen" sind zwei Aussagen;
   dieselbe Verwechslung wie `rx_used` gegen „Daten sind angekommen".
+* **Ein Waechter prueft die EXISTENZ eines Grundes, nie seine WAHRHEIT -- ein falscher Grund ist
+  damit unsterblich.** Der Eintrag zu `SYS_MAP` sagte „das ist die ABI"; tatsaechlich traegt
+  `sys::MAP` kein Adressargument, und die Identitaet entsteht erst in der Cap-Aufloesung des
+  Kernels. Der falsche Grund liess den Punkt als unbehebbar erscheinen. Abhilfe: wo ein Grund
+  widerlegbar ist, gehoert ein **Falsifikator** dazu -- und der muss selbst pruefen, dass sein
+  Anker existiert, sonst liest er ins Leere.
+* **Eine Liste im Pruefskript ist eine Textflaeche; eine Liste im Typ ist eine Bedingung.** Die
+  erste Fassung des Identitaets-Waechters fuehrte ihre Funktionsliste von Hand -- `vspace_map_dma`
+  fehlte, und damit sah sie den DMA-Pfad einer Treiber-PD nie. Die zweite liest die Funktionen aus
+  der HAL und stuetzt sich im Uebrigen auf einen Typ ohne zweiten Konstruktor.
+* **Ein Fehlschlag ohne Protokoll ist ein verlorener Fehlschlag.** Zwei Ausfaelle am 2026-08-04
+  (aarch64 unter Last, x86-Lade-Suite bei 512M) liessen sich nicht untersuchen, weil die
+  Sammelschleife nur `tail -1` festhielt. Die Suiten legen bei Abweichung selbst ein volles Log
+  ab; wer darueber schleift, muss es auch tun. Bei einer Rate um 1/20 kostet jeder verlorene
+  Fehlschlag Stunden.
 * **Ein Parameter, der zwei Bedeutungen traegt, ist so lange harmlos, wie die beiden zufaellig
   gleich sind.** `Scheduler::spawn_user` nahm EINEN Wert fuer den EL0-Stackzeiger UND die
   Reap-Region, die beim Thread-Tod an den Allokator zurueckgeht. Solange die private Region

@@ -81,7 +81,70 @@ prueft.
 
 ---
 
-## VA == PA: die Annahme ist jetzt eine Liste, keine Gewohnheit (2026-08-04)
+## VA == PA: die Annahme steht jetzt im TYP, nicht in einer Liste daneben (2026-08-04)
+
+**Die erste Fassung war disziplinarisch und hat sich binnen Stunden selbst widerlegt.** Ein
+Skript hielt die Aufrufstellen gegen eine Liste im Skriptkopf. Zwei Loecher, beide von aussen
+angestossen:
+
+* `hal::mmu::vspace_map_dma` stand in seiner Funktionsliste **gar nicht**. Der DMA-Pfad einer
+  Treiber-PD bildet identisch ab, und der Waechter sah ihn nie -- eine Textflaeche ueber einem
+  Loch.
+* der Grundtext zu `SYS_MAP` war **falsch**. Er sagte „das ist die ABI". `sel4lake_abi::sys::MAP`
+  traegt aber **kein Adressargument**: der Aufrufer nennt eine Cap, und die Basis kommt aus
+  `ObjectKind::Memory(r).base` -- aus der Cap-Aufloesung IM KERNEL. Die Identitaet liegt damit in
+  einer Entscheidung des Kernels und ist behebbar, **ohne die ABI anzufassen** (der Rueckgabewert
+  nennt dem Aufrufer die Adresse ohnehin, `reg::MSG0`). Der Punkt war also nie strukturell
+  unbehebbar, wie der Grund glauben machte.
+
+Der zweite ist der lehrreichere: **ein Waechter prueft die Existenz eines Grundes, nie seine
+Wahrheit.** Ein falscher Grund ist damit unsterblich.
+
+**Die strukturelle Fassung.** `kernel/src/addr.rs` bekommt die **dritte Achse**: `Va` -- was ein
+Subjekt sieht. Sie hat **keinen** Konstruktor aus `u64` und **keinen** aus `Pa`. Der einzige Weg
+ist `Va::identity(reason, pa)`, und `reason` ist eine Variante des geschlossenen Enums
+`IdentityReason`. Dazu zwei Wege, die gar nicht aus einer PA kommen: `Va::window` (das private
+Fenster) und `Va::link` (ELF-Link-Adressen). **Die Liste IST damit der Quelltext**; eine neue
+identische Abbildung braucht eine neue Variante, und die schreibt man nicht versehentlich.
+
+Dieselbe Ueberlegung wie bei `DmaRegion::identity`, das ext-36 **bewusst entfernt** hat: bliebe
+der bequeme Einstieg stehen, griffe der naechste danach.
+
+**Was der Waechter jetzt noch tut** -- nur das, was ein Typ nicht kann: (1) es gibt keinen
+zweiten Konstruktor, (2) jede Enum-Variante traegt einen Grund, (3) die identisch abbildenden
+HAL-Funktionen werden nur aus den benannten Engstellen gerufen -- **die Funktionsliste liest er
+aus der HAL selbst**, damit das erste Loch nicht wiederkommt, (4) **Falsifikatoren**.
+
+**Der Falsifikator zu `SyscallMapByCap`** ist der erste seiner Art: der Grund behauptet, die ABI
+trage kein Adressargument. Das Skript versucht ihn zu widerlegen -- es prueft, dass im
+`SYS_MAP`-Zweig die Basis aus der aufgeloesten Cap stammt und **nicht** aus einem Frame-Register.
+Und es prueft, dass der Anker ueberhaupt da ist: ein Falsifikator, der ins Leere liest, ist
+keiner. Nicht jeder Grund laesst das zu -- aber die, die es zulassen, sollten nicht Prosa
+bleiben.
+
+**Der neue Waechter hat sofort geliefert.** `unmap_dma_from_thread` rief `vspace_unmap_page`
+direkt mit einer Physadresse -- ausserhalb jeder Engstelle, ohne dass irgendwo stand warum. Die
+alte Fassung hatte die Stelle nicht gesehen. Sie traegt jetzt denselben Grund wie der Mapping-Weg
+(`DeviceDmaWindow`), und das ist keine Formsache: raeumte der Abbau auf einer anderen Achse ab
+als das Mappen, bliebe eine Abbildung stehen -- genau das, was `dma_audit` Code 8 meldet.
+
+**MMIO und DMA sind zwei Gruende, nicht einer.** Die erste Liste hatte sie in einem Eintrag. Bei
+MMIO **ist** die Identitaet die Zusicherung (ein Treiber rechnet mit BAR-Adressen aus der
+PCI-Enumeration, und die sind physisch -- CPU-Sicht, `Pa`). Bei DMA ist sie nur die **CPU-seitige
+Haelfte**; was das Geraet sieht, ist eine `Iova` aus dem Fenster des Uebersetzungskontexts. Beides
+zusammenzufalten waere dieselbe Vermengung eine Achse weiter gewesen.
+
+**Was vorher schon richtig war und bleibt** (aus der ersten Fassung uebernommen): der
+Spawn-Pfad. `spawn_isolated_native` bildete Code und Stack identisch ab und nahm die Physadresse
+des Code-Frames als **Einsprungadresse** -- beides geht jetzt ins Fenster, und die Entry-VA ist
+der **Rueckgabewert** der Abbildung (`ISO_USER_VA + slot * TWO_MIB`), also konstruktiv aus dem
+Platz abgeleitet und keine zweite Zahl, die zufaellig passen muss.
+`Scheduler::spawn_user` (ein Wert fuer EL0-SP UND Reap-Region) ist **geloescht**, nicht
+repariert; es gibt nur noch `spawn_user_at`.
+
+---
+
+## VA == PA, erste Fassung: die Annahme als Liste (2026-08-04, ueberholt am selben Tag)
 
 Nach dem Fenster-Umbau war die Frage nicht mehr „geht das?", sondern **„wo steckt dieselbe
 Annahme noch?"**. Der Kernel bildet an manchen Stellen identisch ab -- die VA, die ein Subjekt

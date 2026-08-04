@@ -2693,6 +2693,12 @@ pub fn run(multiboot_info: u64) -> ! {
             if erste == 0 {
                 erste = base;
             }
+            // Kernelsicht, kein Subjekt: das BAR-Fenster wird global eingeblendet, damit der
+            // Kernel enumerieren kann. Der Grund benennt genau das.
+            let _ = crate::addr::Va::identity(
+                crate::addr::IdentityReason::KernelGlobalDeviceWindow,
+                crate::addr::Pa::new(base),
+            );
             if hal::mmu::map_device_window_global(base, len) {
                 abgebildet += 1;
                 if hal::mmu::resolve_global(base) == Some(base) {

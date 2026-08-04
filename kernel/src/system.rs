@@ -1920,7 +1920,22 @@ pub fn spawn_user(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
     }; // MEM vor SCHEDS freigegeben (Ordnung MEM < SCHEDS)
     let tid = {
         let mut sched = SCHEDS[core].lock();
-        let r = sched.spawn_user(core, entry, arg, kbase, USER_KSTACK_SIZE, user_base, user_len, prio);
+        // **Beide Werte hingeschrieben, auch wenn sie hier gleich sind.** Ein SAS-Thread teilt
+        // sich die Identitaetskarte des Kernels, sein Stack ist also unter derselben Zahl
+        // virtuell wie physisch. Genau deshalb steht sie zweimal da: `spawn_user` (ein Wert
+        // fuer beides) ist geloescht, weil die Gleichheit hier ein Zufall der Umgebung ist und
+        // keine Eigenschaft des Aufrufs.
+        let r = sched.spawn_user_at(
+            core,
+            entry,
+            arg,
+            kbase,
+            USER_KSTACK_SIZE,
+            user_base + user_len, // EL0-SP (virtuell; im SAS identisch zur PA)
+            user_base,            // Reap-Region (physisch)
+            user_len,
+            prio,
+        );
         if let Some(t) = r {
             fp_reset_slot(t.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
             // Buchfuehrung NOCH UNTER SCHEDS -- s. Kommentar an `record_user_kstack`.
@@ -2136,18 +2151,6 @@ fn vspace_l1(asid: u16) -> Option<u64> {
     }
 }
 
-/// Einen 2-MiB-Frame `phys` in die VSpace `asid` mappen (EL0-RW) + ASID flushen.
-fn vspace_map_region(asid: u16, phys: u64) -> bool {
-    let Some(l2) = vspace_l2(asid) else {
-        return false;
-    };
-    if hal::mmu::vspace_map_block(l2, phys) {
-        hal::mmu::flush_asid(asid);
-        true
-    } else {
-        false
-    }
-}
 
 /// 4-KiB-Granularität: Region `[base, base+len)` (identity) mit `perm` in die VSpace
 /// `asid` mappen. 2-MiB-ausgerichtete 2-MiB-Regionen mit RW/RX nutzen den
@@ -2197,6 +2200,13 @@ fn vspace_map_masked(
     ok
 }
 
+/// **Die Platzbelegung des User-Fensters.** Zwei benannte Plaetze statt zweier Zahlen im
+/// Aufruf: `spawn_isolated_native` braucht beide, und „Slot 0 ist der Code" ist genau die Sorte
+/// Wissen, die sonst in zwei Dateien halb steht.
+const SLOT_CODE: usize = 0;
+/// Daten bzw. Stack. Bei `spawn_isolated`/`_colored` ist es der einzige belegte Platz.
+const SLOT_DATA: usize = 1;
+
 /// **Die private Region einer isolierten PD in ihr User-Fenster abbilden** (E-Rest 3d).
 ///
 /// Gibt die **virtuelle** Adresse zurück, unter der die PD sie sieht. Die Tabellen des Fensters
@@ -2204,6 +2214,7 @@ fn vspace_map_masked(
 /// sonst wäre A1 an genau der Stelle durchlöchert, an der eine neue Tabelle dazukommt.
 fn vspace_map_user_region(
     asid: u16,
+    slot: usize,
     phys: u64,
     len: u64,
     perm: hal::mmu::UserPerm,
@@ -2211,7 +2222,7 @@ fn vspace_map_user_region(
 ) -> Option<u64> {
     let l1 = vspace_l1(asid)?;
     let mut alloc = || mem_alloc_masked(4096, 4096, mask).map(|c| c.base());
-    let va = hal::mmu::vspace_map_user_window(l1, phys, len, perm, &mut alloc)?;
+    let va = hal::mmu::vspace_map_user_window(l1, slot, phys, len, perm, &mut alloc)?;
     hal::mmu::flush_asid(asid);
     Some(va)
 }
@@ -2360,7 +2371,8 @@ pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u
         return None;
     };
     // Stack-Region in das private User-Fenster mappen (EL0-RW, nicht-identisch).
-    let Some(rva) = vspace_map_user_region(asid, rbase, rlen, hal::mmu::UserPerm::Rw, None) else {
+    let Some(rva) = vspace_map_user_region(asid, SLOT_DATA, rbase, rlen, hal::mmu::UserPerm::Rw, None)
+    else {
         vspace_teardown(asid);
         MEM.lock().free_region(PhysRegion::new(rbase, rlen));
         release_user_kstack(kbase);
@@ -2519,7 +2531,7 @@ fn spawn_isolated_colored_inner(
     // Seitenweise statt Block — die gefaerbte Region ist kleiner als ein 2-MiB-Block. Die L3
     // entsteht im User-Fenster und kommt aus demselben Farbstreifen; `vspace_teardown` sammelt
     // sie ueber `vspace_collect_user_window` wieder ein.
-    let Some(rva) = vspace_map_user_region(asid, rbase, rlen, hal::mmu::UserPerm::Rw, Some(mask))
+    let Some(rva) = vspace_map_user_region(asid, SLOT_DATA, rbase, rlen, hal::mmu::UserPerm::Rw, Some(mask))
     else {
         vspace_teardown(asid);
         MEM.lock().free_region(PhysRegion::new(rbase, rlen));
@@ -2611,18 +2623,6 @@ pub fn destroy_pd(pd: usize) {
     CAPS.write().pds.free(pd);
 }
 
-/// Einen 2-MiB-Frame `phys` als **EL0-RX-Code** in die VSpace `asid` mappen + flushen.
-fn vspace_map_code_region(asid: u16, phys: u64) -> bool {
-    let Some(l2) = vspace_l2(asid) else {
-        return false;
-    };
-    if hal::mmu::vspace_map_code_block(l2, phys) {
-        hal::mmu::flush_asid(asid);
-        true
-    } else {
-        false
-    }
-}
 
 /// Eine isolierte PD mit **privat geladenem nativem Code** erzeugen: der Code
 /// `[code, code+code_len)` wird in einen frischen Frame kopiert, der **EL0-RX** in
@@ -2635,15 +2635,11 @@ pub fn spawn_isolated_native(code: *const u8, code_len: usize, prio: u8) -> Opti
     let kbase = claim_user_kstack()?; // EL0-Kernel-Stack aus MEM (16 KiB, ausgerichtet)
     let sz = hal::mmu::ISO_REGION_SIZE;
 
-    // Code-Frame + Stack-Frame (beide 2-MiB-ausgerichtet, in GiB 1). Beide werden ueber
-    // `vspace_map_code_block`/`vspace_map_block` **identisch** abgebildet (VA == PA) -- das ist
-    // eine BEDINGUNG, keine Vorliebe, und sie gehoert deshalb in die Anforderung (E-Rest 3d).
-    // Vorher stand hier `mem_alloc` und danach eine Pruefung: dieselbe Form „einmal fragen, bei
-    // Verfehlung aufgeben", die E-Rest 3b an drei anderen Stellen beseitigt hat.
-    let (floor, ceil) = gib0_zone();
-    let in_gib1 = |b: u64, l: u64| b >= floor && b + l <= ceil;
-    let ca = mem_alloc_below(sz, sz, ceil);
-    let sa = mem_alloc_below(sz, sz, ceil);
+    // Code-Frame + Stack-Frame. **Seit dem VA==PA-Durchgang ohne Zonenbindung:** beide gehen
+    // in das private User-Fenster (Plaetze `SLOT_CODE`/`SLOT_DATA`), nicht mehr identisch in
+    // GiB 0. Das war der letzte Spawn-Pfad, der die Identitaet noch vorausgesetzt hat.
+    let ca = mem_alloc_anywhere(sz, sz);
+    let sa = mem_alloc_anywhere(sz, sz);
     let (cf, sf) = match (ca, sa) {
         (Some(cf), Some(sf)) => (cf, sf),
         (ca, sa) => {
@@ -2661,7 +2657,7 @@ pub fn spawn_isolated_native(code: *const u8, code_len: usize, prio: u8) -> Opti
     };
     let (cbase, clen) = (cf.base(), cf.len());
     let (sbase, slen) = (sf.base(), sf.len());
-    if !in_gib1(cbase, clen) || !in_gib1(sbase, slen) || code_len > clen as usize {
+    if code_len > clen as usize {
         let mut mem = MEM.lock();
         mem.free_region(PhysRegion::new(cbase, clen));
         mem.free_region(PhysRegion::new(sbase, slen));
@@ -2687,20 +2683,33 @@ pub fn spawn_isolated_native(code: *const u8, code_len: usize, prio: u8) -> Opti
         release_user_kstack(kbase);
         return None;
     };
-    vspace_map_code_region(asid, cbase); // Code: EL0-RX (W^X)
-    vspace_map_region(asid, sbase); //       Stack: EL0-RW
+    // Code EL0-RX (W^X), Stack EL0-RW -- beide im Fenster, beide nicht-identisch.
+    let cva = vspace_map_user_region(asid, SLOT_CODE, cbase, clen, hal::mmu::UserPerm::Rx, None);
+    let sva = vspace_map_user_region(asid, SLOT_DATA, sbase, slen, hal::mmu::UserPerm::Rw, None);
+    let (Some(cva), Some(sva)) = (cva, sva) else {
+        vspace_teardown(asid);
+        let mut mem = MEM.lock();
+        mem.free_region(PhysRegion::new(cbase, clen));
+        mem.free_region(PhysRegion::new(sbase, slen));
+        drop(mem);
+        release_user_kstack(kbase);
+        return None;
+    };
     let packed = ((asid as u64) << 48) | l1;
 
     let tid = {
         let mut sched = SCHEDS[core].lock();
-        // Entry = Anfang des privaten Code-Frames; User-Stack = privater Stack-Frame.
-        let r = sched.spawn_user(
+        // **Entry ist eine VA, die Reap-Region eine PA.** Vorher stand an beiden Stellen
+        // `cbase`/`sbase` -- dieselbe Zahl, zwei Bedeutungen. Genau diese Vermengung hat beim
+        // Heben des GiB-0-Deckels einen `#PF` im Kernel erzeugt.
+        let r = sched.spawn_user_at(
             core,
-            cbase as usize,
+            cva as usize,          // Entry: virtuell, Anfang des Code-Blocks
             0,
             kbase,
             USER_KSTACK_SIZE,
-            sbase as usize,
+            (sva + slen) as usize, // EL0-SP: virtuell
+            sbase as usize,        // Reap: physisch
             slen as usize,
             prio,
         );

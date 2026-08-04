@@ -1013,12 +1013,13 @@ unsafe fn table_or_new(slot: &mut u64, alloc: &mut dyn FnMut() -> Option<u64>) -
 /// Identität, sondern an der Ausrichtung der VA.
 pub fn vspace_map_user_window(
     l1_phys: u64,
+    slot: usize,
     phys: u64,
     len: u64,
     perm: UserPerm,
     alloc: &mut dyn FnMut() -> Option<u64>,
 ) -> Option<u64> {
-    if len == 0 || len % PAGE != 0 || phys % PAGE != 0 || len > TWO_MIB {
+    if len == 0 || len % PAGE != 0 || phys % PAGE != 0 || len > TWO_MIB || slot >= 512 {
         return None;
     }
     // SAFETY: gültige, beschreibbare L1 dieses Adressraums; die Tabellen darunter sind frisch
@@ -1028,12 +1029,12 @@ pub fn vspace_map_user_window(
         let l2_phys = table_or_new(&mut l1[ISO_USER_L1], alloc)?;
         let l2 = core::slice::from_raw_parts_mut(l2_phys as *mut u64, 512);
         if len == TWO_MIB && phys % TWO_MIB == 0 {
-            l2[0] = match perm {
+            l2[slot] = match perm {
                 UserPerm::Rx => user_code_block(phys),
                 _ => user_block(phys),
             };
         } else {
-            let l3_phys = table_or_new(&mut l2[0], alloc)?;
+            let l3_phys = table_or_new(&mut l2[slot], alloc)?;
             let l3 = core::slice::from_raw_parts_mut(l3_phys as *mut u64, 512);
             for i in 0..(len / PAGE) as usize {
                 l3[i] = user_page(phys + (i as u64) * PAGE, perm);
@@ -1041,7 +1042,7 @@ pub fn vspace_map_user_window(
         }
     }
     cpu::dsb_sy();
-    Some(ISO_USER_VA)
+    Some(ISO_USER_VA + (slot as u64) * TWO_MIB)
 }
 
 /// Die Tabellen des User-Fensters beim Abbau zurückgeben (Gegenstück zu
@@ -1055,10 +1056,13 @@ pub fn vspace_collect_user_window(l1_phys: u64, free: &mut dyn FnMut(u64)) {
         }
         let l2_phys = l1[ISO_USER_L1] & 0x0000_ffff_ffff_f000;
         let l2 = core::slice::from_raw_parts_mut(l2_phys as *mut u64, 512);
-        // Ein Blockdeskriptor ist keine Tabelle -- ihn freizugeben gäbe dem Allokator die
-        // Nutzregion zurück, die der Aufrufer selbst verwaltet.
-        if l2[0] & 0b11 == TABLE_DESC {
-            free(l2[0] & 0x0000_ffff_ffff_f000);
+        // **Alle** Plätze durchgehen, nicht nur den ersten (`spawn_isolated_native` belegt
+        // zwei). Ein Blockdeskriptor ist dabei keine Tabelle -- ihn freizugeben gäbe dem
+        // Allokator die Nutzregion zurück, die der Aufrufer verwaltet.
+        for &e in l2.iter() {
+            if e & 0b11 == TABLE_DESC {
+                free(e & 0x0000_ffff_ffff_f000);
+            }
         }
         free(l2_phys);
         l1[ISO_USER_L1] = 0;

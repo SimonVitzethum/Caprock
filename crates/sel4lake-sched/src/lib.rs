@@ -513,36 +513,22 @@ impl Scheduler {
         Some(self.id(t))
     }
 
-    /// Einen EL0-User-Thread erzeugen: Der initiale Frame liegt auf dem EL1-only
-    /// Kernel-Stack `[kstack_base, kstack_base+kstack_len)`, der Thread läuft auf
-    /// EL0 mit dem User-Stack `[user_base, user_base+user_len)`.
+    /// **Einen EL0-User-Thread erzeugen — mit GETRENNTEM EL0-SP und Reap-Region.**
     ///
-    /// Zum Reaping wird der **User-Stack** vermerkt (dynamisch alloziert, rückgebbar);
-    /// der Kernel-Stack stammt aus einem eigenen EL1-only Pool.
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn_user(
-        &mut self,
-        core: usize,
-        entry: usize,
-        arg: usize,
-        kstack_base: usize,
-        kstack_len: usize,
-        user_base: usize,
-        user_len: usize,
-        priority: u8,
-    ) -> Option<ThreadId> {
-        debug_assert_eq!(core, self.core);
-        let sp = init_thread_frame(kstack_base + kstack_len, entry, arg, true, user_base + user_len);
-        let t = self.alloc_tcb(sp, priority)?;
-        self.tcbs[t].stack_base = user_base;
-        self.tcbs[t].stack_len = user_len;
-        self.enqueue_ready(t);
-        Some(self.id(t))
-    }
-
-    /// Wie [`spawn_user`](Self::spawn_user), aber mit **getrenntem** EL0-SP und Reap-Region — für
-    /// den Binary-Loader (ext-26): ein geladenes Programm hat einen **nicht-identity** gemappten
-    /// Stack (SP ist eine virtuelle Adresse `el0_sp`, die freizugebende RAM-Region liegt an einer
+    /// Bis zum 2026-08-04 gab es daneben ein `spawn_user`, das **einen** Wert fuer beides nahm:
+    /// den Stackzeiger, den EL0 sieht, und die RAM-Region, die beim Thread-Tod an den Allokator
+    /// zurueckgeht. Solange jede User-Region identisch abgebildet war (VA == PA), war das
+    /// dieselbe Zahl -- und deshalb war die Vermengung unsichtbar. Beim Umbau auf ein VA-Fenster
+    /// wurde sie zu einem `#PF` im **Kernel**: der Reap-Pfad gab eine virtuelle Adresse als
+    /// Physadresse frei.
+    ///
+    /// Die Funktion ist deshalb geloescht statt repariert. Wer hier vorbeikommt, muss beide Werte
+    /// hinschreiben — auch dort, wo sie zufaellig gleich sind (SAS-Threads). Ein Parameter, der
+    /// zwei Bedeutungen traegt, ist so lange harmlos, wie die beiden zufaellig gleich sind.
+    ///
+    /// `el0_sp` ist eine **virtuelle** Adresse (der Stackzeiger, den EL0 sieht),
+    /// `reap_base`/`reap_len` sind **physisch** (die Region, die freigegeben wird). Beim
+    /// Binary-Loader (ext-26) und bei isolierten PDs (E-Rest 3d) liegen sie auseinander; bei
     /// anderen Physadresse `reap_base`). `entry` ist die virtuelle Entry-Adresse des Programms.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn_user_at(

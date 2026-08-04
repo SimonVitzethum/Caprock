@@ -1362,6 +1362,36 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       **Kernel** — der Reap-Pfad gab eine virtuelle Adresse als Physadresse frei. Behoben über
       das bereits vorhandene `spawn_user_at` (Ladepfad benutzt es seit A-2).
 
+- [x] **VA==PA systematisch aufgeräumt am 2026-08-04.** Nach dem Fenster-Umbau war die Frage
+      nicht mehr „geht das?", sondern „wo steckt dieselbe Annahme noch?". Ergebnis der
+      Bestandsaufnahme — die Fläche ist klein und jetzt **aufgezählt**:
+
+      * **Entfernt (die Identität war eine Altlast):** `spawn_isolated_native` bildete Code- und
+        Stack-Frame identisch ab **und nahm die Physadresse des Code-Frames als
+        Einsprungadresse**. Beide gehen jetzt ins Fenster (Plätze `SLOT_CODE`/`SLOT_DATA`), der
+        Entry ist eine VA. Damit sind `vspace_map_region`/`vspace_map_code_region` **ohne
+        Aufrufer** und gelöscht — kein toter Pfad, der später wieder benutzt wird.
+      * **Unmöglich gemacht:** `Scheduler::spawn_user` nahm EINEN Wert für den EL0-Stackzeiger
+        **und** die Reap-Region. Es ist **gelöscht**, nicht repariert; es gibt nur noch
+        `spawn_user_at`, das beide verlangt. Der letzte Aufrufer (SAS-Thread, wo die Zahlen
+        wirklich gleich sind) schreibt sie jetzt zweimal hin — die Gleichheit ist dort ein Zufall
+        der Umgebung, keine Eigenschaft des Aufrufs.
+      * **Benannt statt still (die Identität ist die Zusicherung):** neun Aufrufstellen bleiben,
+        alle mit Grund in `tools/identitaet.sh` — `SYS_MAP`/`SYS_UNMAP` (der Aufrufer nennt eine
+        Memory-Cap, also eine PA, und das ist die ABI), die Gerätefenster (ein Treiber rechnet mit
+        Adressen aus der PCI-Enumeration, und die sind physisch) und zwei globale
+        Kernel-Abbildungen ohne Subjekt.
+
+      **Der Wächter ist der eigentliche Ertrag:** `tools/identitaet.sh` hält die Liste gegen den
+      Quelltext. Eine neue identisch abbildende Stelle schlägt an und muss ihren Grund
+      hinschreiben, bevor sie durchgeht. Mit Selbsttest in **beide** Richtungen: eine
+      untergeschobene Stelle wird erkannt, ohne sie schweigt er wieder. Dabei prompt
+      hereingefallen — der erste Anlauf suchte mit absoluten Pfaden, die auf keinen Listeneintrag
+      passten, und meldete seine eigene Mechanik als Befund.
+
+      **Was er NICHT kann, und das steht in seinem Kopf:** er sieht Aufrufe, keine Absichten. Ob
+      eine erlaubte Stelle ihre Identität weiterhin zu Recht annimmt, prüft er nicht.
+
 - [ ] **E-Rest 3e: DMA-Regionen hängen weiterhin an GiB 0.** (2026-08-04, beim Heben des
       PD-Deckels stehengeblieben.) `alloc_dma_region` trägt die harte Bedingung `gib0_zone`
       unverändert, und zwar aus zwei Gründen, die auseinandergehalten gehören:

@@ -105,9 +105,23 @@ falsch.
   Frage dort nicht entscheidbar ist. Gegenprobe gefahren.
   Zwei eigene Annahmen widerlegt: der 2-MiB-Block-Fastpath geht **nicht** verloren (er hing an
   der Ausrichtung der VA, nicht an der Identitaet), und A1/B-4.1 ist gar nicht betroffen.
+* **VA == PA ist jetzt eine LISTE, keine Gewohnheit.** Bestandsaufnahme nach dem Fenster-Umbau:
+  neun Aufrufstellen in acht identisch abbildenden HAL-Funktionen, in drei Klassen.
+  **Entfernt:** `spawn_isolated_native` bildete Code und Stack identisch ab und nahm die
+  Physadresse des Code-Frames als **Einsprungadresse** -- beides geht jetzt ins Fenster,
+  `vspace_map_region`/`vspace_map_code_region` sind ohne Aufrufer und geloescht.
+  **Unmoeglich gemacht:** `Scheduler::spawn_user` (ein Wert fuer EL0-SP UND Reap-Region) ist
+  **geloescht**, nicht repariert; es gibt nur noch `spawn_user_at`. Der letzte Aufrufer schreibt
+  beide Werte hin, obwohl sie dort gleich sind -- die Gleichheit ist ein Zufall der Umgebung.
+  **Benannt:** die uebrigen neun stehen mit Grund in `tools/identitaet.sh` (SYS_MAP/SYS_UNMAP ist
+  die ABI, Geraetefenster sind physisch, zwei globale Abbildungen haben kein Subjekt).
+  Der Waechter haelt die Liste gegen den Quelltext, mit Selbsttest in **beide** Richtungen.
 * **Gemessen:** RAM-Reihe 512M · 2560M · 3G · 4G · 6G (Hauptsuite) und 512M · 3G · 6G
-  (Lade-Suite), alle `== ALL PASS ==`; x86 `RUNS=8` und aarch64 `RUNS=4` mit identischer
-  Signatur; Host-Tests, Verus, drei Modelltreue-Waechter, Kerngrenze, Typestate gruen.
+  (Lade-Suite), alle `== ALL PASS ==`; x86 `RUNS=8` mit identischer Signatur; Host-Tests, Verus,
+  drei Modelltreue-Waechter, Kerngrenze, Identitaets-Waechter, Typestate gruen.
+  **aarch64 mit Vorbehalt:** 11 gruene Laeufe (`RUNS=6` identische Signatur + 5 Einzellaeufe),
+  **ein** Fehlschlag unter dreifacher paralleler QEMU-Last. Passt zum offenen Haenger aus D6 und
+  trat auch vor diesen Aenderungen auf -- auseinandergehalten habe ich es nicht.
 
 ## Was am 2026-08-03 dazukam
 

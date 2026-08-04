@@ -81,6 +81,61 @@ prueft.
 
 ---
 
+## VA == PA: die Annahme ist jetzt eine Liste, keine Gewohnheit (2026-08-04)
+
+Nach dem Fenster-Umbau war die Frage nicht mehr „geht das?", sondern **„wo steckt dieselbe
+Annahme noch?"**. Der Kernel bildet an manchen Stellen identisch ab -- die VA, die ein Subjekt
+sieht, IST die PA. Jede solche Stelle traegt eine stillschweigende Annahme, und die Annahmen sehen
+einander alle gleich. Zwei Fehler dieses Projekts hatten dieselbe Form, und beide waren
+unsichtbar, **solange die zwei Zahlen zufaellig gleich waren**.
+
+**Die Bestandsaufnahme.** Die Flaeche ist klein: neun Aufrufstellen in acht identisch abbildenden
+HAL-Funktionen. Sie zerfallen in drei Klassen, und die Klasse entscheidet, was zu tun war.
+
+**(1) Entfernt -- die Identitaet war eine Altlast.** `spawn_isolated_native` bildete Code- und
+Stack-Frame identisch ab **und nahm die Physadresse des Code-Frames als Einsprungadresse**. Beide
+gehen jetzt ins private Fenster (Plaetze `SLOT_CODE`/`SLOT_DATA`), der Entry ist eine VA. Damit
+standen `vspace_map_region` und `vspace_map_code_region` ohne Aufrufer da -- **geloescht**, statt
+als toter Pfad liegenzubleiben, den der naechste wieder benutzt.
+
+**(2) Unmoeglich gemacht -- der Fehler, der schon zugeschlagen hatte.** `Scheduler::spawn_user`
+nahm EINEN Wert fuer zwei Dinge: den EL0-Stackzeiger und die Reap-Region, die beim Thread-Tod an
+den Allokator zurueckgeht. Beim Heben des GiB-0-Deckels wurde daraus ein `#PF
+cr2=0x80_0000_0000` im **Kernel**. Die Funktion ist **geloescht**, nicht repariert: es gibt nur
+noch `spawn_user_at`, das beide Werte verlangt. Der letzte Aufrufer -- ein SAS-Thread, bei dem die
+Zahlen wirklich gleich sind, weil er sich die Identitaetskarte des Kernels teilt -- schreibt sie
+jetzt zweimal hin. **Die Gleichheit ist dort ein Zufall der Umgebung und keine Eigenschaft des
+Aufrufs**, und genau das soll der Quelltext sagen.
+
+Reparieren haette hier nicht gereicht. Eine Funktion, die zwei Bedeutungen in einen Parameter
+faltet, ist auch mit Warnschild noch die bequemere von zweien.
+
+**(3) Benannt statt still -- die Identitaet IST die Zusicherung.** Neun Stellen bleiben:
+`SYS_MAP`/`SYS_UNMAP` (der Aufrufer nennt eine Memory-Cap, also eine PA, und bekommt sie unter
+derselben Zahl -- das ist die ABI, und sie zu aendern hiesse, ein Subjekt muesste eine VA nennen,
+die es nicht kennt), die Geraetefenster (ein Treiber rechnet mit Adressen aus der
+PCI-Enumeration, und die sind physisch) und zwei globale Kernel-Abbildungen ohne Subjekt.
+
+**Der eigentliche Ertrag ist der Waechter.** `tools/identitaet.sh` haelt die Liste gegen den
+Quelltext: jede identisch abbildende Stelle braucht einen Eintrag **mit Grund** -- und der Grund
+beantwortet „warum gilt die Identitaet hier, und was waere die Folge, wenn sie faellt?". Kommt
+eine Stelle dazu, schlaegt er an. Selbsttest in **beide** Richtungen: eine untergeschobene Stelle
+wird erkannt, ohne sie schweigt er wieder.
+
+Dabei prompt hereingefallen: der erste Anlauf suchte im Kopiebaum mit **absoluten** Pfaden, die
+auf keinen Listeneintrag passten -- also meldete der Selbsttest seine eigene Mechanik als Befund.
+Er hat damit funktioniert (er schlug an, wo nichts war), aber die Aussage war eine andere als
+gemeint. Ein Waechter, dessen Schluessel nicht die des Registers sind, prueft eine zweite
+Wirklichkeit -- dieselbe Falle wie `iova_window_clear_of_msi`, das die Fensterlage nachrechnete
+statt sie zu lesen.
+
+**Was der Waechter NICHT kann, und das steht in seinem Kopf:** er sieht Aufrufe, keine Absichten.
+Ob eine erlaubte Stelle ihre Identitaet weiterhin zu Recht annimmt, prueft er nicht. Dafuer stehen
+die Gruende in der Liste, und `isohigh` misst in beiden Suiten den Fall, der frueher strukturell
+unmoeglich war.
+
+---
+
 ## E-Rest 3d (Haelfte 2) — der GiB-0-Deckel fuer isolierte PDs ist weg (2026-08-04)
 
 **Der Deckel war eine Zahl, nicht ein Gefuehl: 504.** GiB 0 abzueglich der ersten 16 MiB, je

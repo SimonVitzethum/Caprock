@@ -1292,16 +1292,14 @@ unsafe fn table_or_new(slot: &mut u64, alloc: &mut dyn FnMut() -> Option<u64>) -
 /// Identität, sondern nur an der Ausrichtung der VA); alles andere wird seitenweise abgebildet.
 pub fn vspace_map_user_window(
     l1_phys: u64,
+    slot: usize,
     phys: u64,
     len: u64,
     perm: UserPerm,
     alloc: &mut dyn FnMut() -> Option<u64>,
 ) -> Option<u64> {
-    if len == 0 || len % PAGE != 0 || phys % PAGE != 0 {
+    if len == 0 || len % PAGE != 0 || phys % PAGE != 0 || len > TWO_MIB || slot >= 512 {
         return None;
-    }
-    if len > TWO_MIB {
-        return None; // ein Fenster, ein Block -- mehr braucht keine der beiden Spawn-Wege
     }
     // SAFETY: gültige, beschreibbare PML4 dieses Adressraums; alle Tabellen darunter sind frisch
     // alloziert oder von diesem Adressraum angelegt.
@@ -1312,12 +1310,12 @@ pub fn vspace_map_user_window(
         let pd_phys = table_or_new(&mut pdpt[0], alloc)?;
         let pd = table_mut(pd_phys);
         if len == TWO_MIB && phys % TWO_MIB == 0 {
-            pd[0] = match perm {
+            pd[slot] = match perm {
                 UserPerm::Rx => user_code_block(phys),
                 _ => user_block(phys),
             };
         } else {
-            let pt_phys = table_or_new(&mut pd[0], alloc)?;
+            let pt_phys = table_or_new(&mut pd[slot], alloc)?;
             let pt = table_mut(pt_phys);
             for i in 0..(len / PAGE) as usize {
                 pt[i] = user_page(phys + (i as u64) * PAGE, perm);
@@ -1325,7 +1323,7 @@ pub fn vspace_map_user_window(
         }
     }
     cpu::dsb_sy();
-    Some(ISO_USER_VA)
+    Some(ISO_USER_VA + (slot as u64) * TWO_MIB)
 }
 
 /// Die Tabellen des User-Fensters beim Abbau zurückgeben (Gegenstück zu
@@ -1343,10 +1341,13 @@ pub fn vspace_collect_user_window(l1_phys: u64, free: &mut dyn FnMut(u64)) {
         if pdpt[0] & P != 0 {
             let pd_phys = pdpt[0] & 0x000f_ffff_ffff_f000;
             let pd = table_mut(pd_phys);
-            // Ein Blockdeskriptor (`PS`) ist keine Tabelle -- ihn freizugeben gäbe dem Allokator
-            // die Nutzregion zurück, die der Aufrufer selbst verwaltet.
-            if pd[0] & P != 0 && pd[0] & PS == 0 {
-                free(pd[0] & 0x000f_ffff_ffff_f000);
+            // **Alle** Plätze durchgehen, nicht nur den ersten: `spawn_isolated_native` belegt
+            // zwei (Code und Stack). Ein Blockdeskriptor (`PS`) ist dabei keine Tabelle -- ihn
+            // freizugeben gäbe dem Allokator die Nutzregion zurück, die der Aufrufer verwaltet.
+            for &e in pd.iter() {
+                if e & P != 0 && e & PS == 0 {
+                    free(e & 0x000f_ffff_ffff_f000);
+                }
             }
             free(pd_phys);
         }

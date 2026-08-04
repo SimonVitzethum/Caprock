@@ -231,7 +231,6 @@ CODE_PRIMITIV = {
 CODE_AUSSERHALB = {
     'init_core':            'Idle-Thread beim Hochlauf -- kein Uebergang im Modell',
     'spawn':                'Thread-Erzeugung -- kein Uebergang im Modell',
-    'spawn_user':           'dito',
     'spawn_user_at':        'dito',
     'alloc_tcb':            'Slot-Belegung + gid-Vergabe -- kein Uebergang im Modell',
     'exit_current':         'Selbstbeendigung -- Zombie/Reap-Lebenszyklus (README 10)',

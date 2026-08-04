@@ -340,6 +340,23 @@ fi
 # Cache -> die Positivkontrolle kann nicht tragen), aber Aufbau, Farbwahl und Bilanz sind auch
 # dort pruefbar -- und werden geprueft. Ein SKIP, der ueber den Aufbau nichts sagt, waere eine
 # Aussage ueber gar nichts.
+# E-Rest 3d: haengt die private Region einer isolierten PD noch an GiB 0?
+#
+# `SKIP` ist hier ein ehrliches Urteil und kein Durchwinken: auf einer Maschine ohne RAM
+# oberhalb 4 GiB ist die Frage NICHT ENTSCHEIDBAR -- die Region kann dort gar nicht hoch liegen.
+# Deshalb faehrt die RAM-Reihe (`die x86-Reihe`) den Fall, in dem sie es kann.
+if echo "$OUT" | grep -q "^isohigh : FAILURES"; then
+    echo "  FAIL: E-Rest 3d: die Region liegt nicht oberhalb 4 GiB, obwohl dort RAM ist --"
+    echo "        die Identitaetsbindung ist zurueck (oder die Farbtrennung gab nach)."
+    fail=1
+elif echo "$OUT" | grep -q "^isohigh : ALL PASS"; then
+    echo "  PASS: E-Rest 3d: die private Region einer isolierten PD liegt OBERHALB 4 GiB und die Farbtrennung haelt -- die Abbildung laeuft ueber ein VA-Fenster ausserhalb der Identitaetskarte statt identisch. Der gemessene Deckel von 504 gleichzeitigen isolierten PDs (Host-Test gib0_deckel_ist_eine_zahl) faellt damit"
+elif echo "$OUT" | grep -q "^isohigh : SKIP"; then
+    echo "  SKIP: E-Rest 3d (nicht entscheidbar auf dieser RAM-Groesse): $(echo "$OUT" | grep -m1 -oE '^isohigh : SKIP -- [^(]*')"
+else
+    echo "  FAIL: E-Rest 3d: die Zeile isohigh fehlt ganz -- der Pruefer ist nicht sprechfaehig."
+    fail=1
+fi
 if echo "$OUT" | grep -q "^pprobe  : FAILURES"; then
     echo "  FAIL: B-4.5: $(echo "$OUT" | grep -m1 '^pprobe  : FAILURES')"
     fail=1

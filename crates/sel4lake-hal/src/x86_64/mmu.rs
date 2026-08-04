@@ -1234,6 +1234,127 @@ pub fn vspace_collect_device_tables(l1_phys: u64, free: &mut dyn FnMut(u64)) {
     }
 }
 
+// ================================================================================================
+// Das private User-VA-Fenster einer isolierten PD (E-Rest 3d, zweite Hälfte)
+// ================================================================================================
+//
+// **Warum es das gibt.** Bis hierher wurde die private Region einer isolierten PD **identisch**
+// abgebildet (VA == PA) — `vspace_map_block` leitet den Index aus der *Physadresse* ab. Damit war
+// sie an GiB 0 gebunden, denn nur dafür hat eine isolierte VSpace ein eigenes Seitenverzeichnis.
+// Gemessen: **504** solche Regionen passen hinein (`gib0_deckel_ist_eine_zahl`), und das war der
+// bindende Deckel für die Zahl gleichzeitiger Mandanten — nicht `MAX_VSPACES` (4096).
+//
+// **Warum das Fenster oberhalb der Identitätskarte liegen MUSS und nicht einfach woanders in
+// GiB 0.** Der Kernel läuft beim Syscall im Adressraum *dieser* PD und greift dort über die
+// Identitätskarte auf beliebiges physisches RAM zu. Eine User-VA in GiB 0, die auf eine andere PA
+// zeigt, **verdeckt** genau diese Sicht: der Kernel läse an der Stelle den Speicher der PD statt
+// den eigenen. Das Fenster gehört deshalb dorthin, wo der Kernel nie identisch zugreift.
+//
+// Auf x86-64 belegt die Identitätskarte ausschließlich `PML4[0]` (0..512 GiB, s. `MAPPED_GIB`).
+// `PML4[1]` ist frei — dort liegt das Fenster, und jede isolierte PD bekommt darin ihre eigenen
+// Tabellen. Der Preis sind zwei bis drei 4-KiB-Rahmen je PD; sie sind reiner Kernel-Speicher und
+// dürfen selbst oberhalb 4 GiB liegen.
+
+/// Wieviele GiB oberhalb von [`LOW_MAPPED_END`] als RAM in die Karte aufgenommen wurden.
+/// `0` heisst: diese Maschine hat dort keinen Speicher — eine Aussage ueber die Maschine, nicht
+/// ueber den Kernel (E-Rest 3d, `isohigh`).
+pub fn high_ram_gib() -> usize {
+    HIGH_RAM_GIB.load(Ordering::Acquire)
+}
+
+/// Basis des privaten User-VA-Fensters einer isolierten PD: `PML4[1]`, also 512 GiB.
+pub const ISO_USER_VA: u64 = 512 * ONE_GIB;
+
+/// Eine Tabelle beschaffen oder anlegen: gibt die Physadresse des nächsten Levels zurück.
+///
+/// # Safety
+/// `slot` muss auf einen gültigen Tabelleneintrag zeigen, der beschreibbar ist.
+unsafe fn table_or_new(slot: &mut u64, alloc: &mut dyn FnMut() -> Option<u64>) -> Option<u64> {
+    if *slot & P != 0 {
+        return Some(*slot & 0x000f_ffff_ffff_f000);
+    }
+    let new = alloc()?;
+    // SAFETY: frisch alloziertes, identity-gemapptes Frame.
+    unsafe {
+        for e in table_mut(new).iter_mut() {
+            *e = 0;
+        }
+    }
+    *slot = table_desc(new);
+    Some(new)
+}
+
+/// **Die private Region `[phys, phys+len)` in das User-Fenster dieser PD abbilden.**
+///
+/// Gibt die **virtuelle** Adresse zurück, unter der die PD sie sieht — die Physadresse ist damit
+/// frei wählbar, und genau das hebt den GiB-0-Deckel. Ein 2-MiB-ausgerichteter 2-MiB-Block nimmt
+/// weiterhin **einen Blockdeskriptor** (der Fastpath geht nicht verloren: er hing nie an der
+/// Identität, sondern nur an der Ausrichtung der VA); alles andere wird seitenweise abgebildet.
+pub fn vspace_map_user_window(
+    l1_phys: u64,
+    phys: u64,
+    len: u64,
+    perm: UserPerm,
+    alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Option<u64> {
+    if len == 0 || len % PAGE != 0 || phys % PAGE != 0 {
+        return None;
+    }
+    if len > TWO_MIB {
+        return None; // ein Fenster, ein Block -- mehr braucht keine der beiden Spawn-Wege
+    }
+    // SAFETY: gültige, beschreibbare PML4 dieses Adressraums; alle Tabellen darunter sind frisch
+    // alloziert oder von diesem Adressraum angelegt.
+    unsafe {
+        let pml4 = table_mut(l1_phys);
+        let pdpt_phys = table_or_new(&mut pml4[1], alloc)?;
+        let pdpt = table_mut(pdpt_phys);
+        let pd_phys = table_or_new(&mut pdpt[0], alloc)?;
+        let pd = table_mut(pd_phys);
+        if len == TWO_MIB && phys % TWO_MIB == 0 {
+            pd[0] = match perm {
+                UserPerm::Rx => user_code_block(phys),
+                _ => user_block(phys),
+            };
+        } else {
+            let pt_phys = table_or_new(&mut pd[0], alloc)?;
+            let pt = table_mut(pt_phys);
+            for i in 0..(len / PAGE) as usize {
+                pt[i] = user_page(phys + (i as u64) * PAGE, perm);
+            }
+        }
+    }
+    cpu::dsb_sy();
+    Some(ISO_USER_VA)
+}
+
+/// Die Tabellen des User-Fensters beim Abbau zurückgeben (Gegenstück zu
+/// [`vspace_map_user_window`]). Gibt **nur** Rahmen frei, die aus dem Allokator stammen — hier
+/// sind das alle, denn das Fenster hat keine geteilten Tabellen.
+pub fn vspace_collect_user_window(l1_phys: u64, free: &mut dyn FnMut(u64)) {
+    // SAFETY: gültige, lesbare PML4 des abzubauenden Adressraums.
+    unsafe {
+        let pml4 = table_mut(l1_phys);
+        if pml4[1] & P == 0 {
+            return;
+        }
+        let pdpt_phys = pml4[1] & 0x000f_ffff_ffff_f000;
+        let pdpt = table_mut(pdpt_phys);
+        if pdpt[0] & P != 0 {
+            let pd_phys = pdpt[0] & 0x000f_ffff_ffff_f000;
+            let pd = table_mut(pd_phys);
+            // Ein Blockdeskriptor (`PS`) ist keine Tabelle -- ihn freizugeben gäbe dem Allokator
+            // die Nutzregion zurück, die der Aufrufer selbst verwaltet.
+            if pd[0] & P != 0 && pd[0] & PS == 0 {
+                free(pd[0] & 0x000f_ffff_ffff_f000);
+            }
+            free(pd_phys);
+        }
+        free(pdpt_phys);
+        pml4[1] = 0;
+    }
+}
+
 /// **W^X-Audit der Geräte-Tabellen**: `false`, wenn eine für den User schreibbare Seite zugleich
 /// ausführbar ist.
 ///

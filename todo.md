@@ -1335,18 +1335,45 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       Die Kernel-Stacks sind dabei der lohnendste Posten: 16 KiB je EL0-Thread, bei tausenden
       Threads die bestimmende Größe in der knappen Zone.
 
-- [ ] **E-Rest 3d (Rest): der 1-GiB-Deckel liegt im VSpace-Layout, nicht im Allokator.**
-      Solange `vspace_map_block`/`vspace_map_page` **identisch** abbilden (VA == PA) und GiB 1..3
-      jeder isolierten PD an geteilten statischen Tabellen hängen, sind DMA-Regionen und die
-      privaten Regionen isolierter PDs strukturell auf GiB 0 begrenzt — **1 GiB für alle
-      Mandanten zusammen**. Für das Zielbild (viele tausend Prozesse, viele Mandanten je
-      Maschine) ist das der bindende Deckel, und er ist mit Allokatorarbeit **nicht** zu heben.
+- [x] **E-Rest 3d (Rest) BEHOBEN am 2026-08-04: der 1-GiB-Deckel für isolierte PDs ist weg.**
+      Die private Region einer isolierten PD wird nicht mehr **identisch** abgebildet, sondern in
+      ein **VA-Fenster ausserhalb der Identitätskarte** (`hal::mmu::ISO_USER_VA`; x86 `PML4[1]`
+      = 512 GiB, aarch64 `L1[9]` = 9 GiB — beides Bereiche, in denen der Kernel nie identisch
+      zugreift). Damit ist die Physadresse frei.
 
-      Was ihn hebt: eine nicht-identische Abbildung für PD-private Regionen — also derselbe
-      Schritt, den `load_into_pd` schon geht (`vspace_map_page_at` mit getrennter VA und PA).
-      Der Preis ist der Verlust des 2-MiB-Block-Fastpaths (`vspace_map_block`) für diese
-      Regionen: seitenweises Mapping statt eines Blockdeskriptors. Das ist dieselbe Abwägung wie
-      bei A1/`spawn_isolated_colored` und gehört mit B-4.1 zusammen entschieden, nicht einzeln.
+      **Der gemessene Deckel war 504** (Host-Test `gib0_deckel_ist_eine_zahl`: GiB 0 abzüglich
+      der ersten 16 MiB, je 2 MiB) — nicht `MAX_VSPACES` (4096). Belegt, dass er fällt:
+      `isohigh : ALL PASS` bei 3G/4G/6G, Regionen bei `0x1_02b0_0000` (4,04 GiB), und die
+      Farbtrennung hält unverändert — sie ist eine Aussage über die **Phys**adresse und von der
+      virtuellen Lage unberührt. Bei 512M/2560M meldet die Zeile `SKIP`, weil es dort keinen
+      Speicher oberhalb 4 GiB gibt und die Frage **nicht entscheidbar** ist. Gegenprobe gefahren:
+      die alte Zuteilung wieder eingesetzt → `isohigh : FAILURES`.
+
+      **Zwei Annahmen dieses Eintrags waren falsch.** (a) „Der Preis ist der Verlust des
+      2-MiB-Block-Fastpaths" — nein: der Fastpath hing nie an der Identität, sondern nur an der
+      **Ausrichtung der VA**. Ein 2-MiB-Block bleibt ein Blockdeskriptor. (b) „Gehört mit B-4.1
+      zusammen entschieden" — nein: A1 ist davon gar nicht betroffen, die Farbbedingung liegt auf
+      der Physadresse. Der Preis sind zwei bis drei 4-KiB-Rahmen je isolierter PD für die
+      Fenstertabellen, und die dürfen selbst oben liegen.
+
+      Der Fehler, der das teuer gemacht hätte: `spawn_user` nimmt **einen** Wert für den EL0-SP
+      **und** die Reap-Region, die beim Thread-Tod an den Allokator zurückgeht. Solange VA == PA
+      galt, war das dieselbe Zahl; jetzt sind es zwei. Gemessen als `#PF cr2=0x80_0000_0000` im
+      **Kernel** — der Reap-Pfad gab eine virtuelle Adresse als Physadresse frei. Behoben über
+      das bereits vorhandene `spawn_user_at` (Ladepfad benutzt es seit A-2).
+
+- [ ] **E-Rest 3e: DMA-Regionen hängen weiterhin an GiB 0.** (2026-08-04, beim Heben des
+      PD-Deckels stehengeblieben.) `alloc_dma_region` trägt die harte Bedingung `gib0_zone`
+      unverändert, und zwar aus zwei Gründen, die auseinandergehalten gehören:
+      **(a)** sie wird über `map_dma_into_thread`/`map_region_into_thread` **identisch** in die
+      Treiber-PD abgebildet — dieselbe Bindung, die der PD-Deckel gerade verloren hat, und mit
+      demselben Fenster-Mechanismus zu lösen;
+      **(b)** sie ist **gerätesichtbar**, und ob ein Gerät oberhalb 4 GiB adressieren kann, ist
+      eine Eigenschaft des Geräts. Gemessen ist nur, dass `virtio-blk` unter QEMU es kann
+      (E-Rest 3d); die Angebotsliste führt die Adressbreite nicht
+      (`dmawin : Geraete-ohne-deklarierte-Adressbreite=1`). (a) ist Arbeit, (b) ist eine
+      Enumerationsfrage — und ohne (b) wäre das Heben von (a) ein Vertrauensvorschuss an
+      unbekannte Hardware.
 
 - [x] **E-Rest 1 BEHOBEN am 2026-08-04: `iova_window_clear_of_msi` gibt im schwachen Zweig „in Ordnung" zurück, ohne
       urteilen zu können.** (2026-08-03, gemessen) `kernel/src/system.rs:3900`:

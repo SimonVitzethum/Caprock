@@ -96,6 +96,15 @@ falsch.
   **Lade-Suite** bei 3G — waehrend die **Hauptsuite gruen bleibt**. Dieselbe Form wie D8/D9/D11.
   Dabei zwei eigene Vermutungen widerlegt: geladene Segmente brauchen GiB 0 **nicht** (VA und PA
   sind getrennt), und das Geraet erreicht Speicher oberhalb 4 GiB sehr wohl.
+* **Der GiB-0-Deckel fuer isolierte PDs ist WEG — und er war eine Zahl: 504.** Die private
+  Region einer isolierten PD wird nicht mehr identisch abgebildet, sondern in ein **VA-Fenster
+  ausserhalb der Identitaetskarte** (x86 `PML4[1]`, aarch64 `L1[9]` — Bereiche, in denen der
+  Kernel nie identisch zugreift; sonst verdeckte eine User-VA seine eigene Sicht auf physisches
+  RAM). Belegt: `isohigh : ALL PASS` bei 3G/4G/6G, Regionen bei 4,04 GiB, Farbtrennung
+  unveraendert — die Farbbedingung liegt auf der **Phys**adresse. `SKIP` bei 512M/2560M, weil die
+  Frage dort nicht entscheidbar ist. Gegenprobe gefahren.
+  Zwei eigene Annahmen widerlegt: der 2-MiB-Block-Fastpath geht **nicht** verloren (er hing an
+  der Ausrichtung der VA, nicht an der Identitaet), und A1/B-4.1 ist gar nicht betroffen.
 * **Gemessen:** RAM-Reihe 512M · 2560M · 3G · 4G · 6G (Hauptsuite) und 512M · 3G · 6G
   (Lade-Suite), alle `== ALL PASS ==`; x86 `RUNS=8` und aarch64 `RUNS=4` mit identischer
   Signatur; Host-Tests, Verus, drei Modelltreue-Waechter, Kerngrenze, Typestate gruen.
@@ -492,6 +501,18 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   4 GiB gar keinen Speicher gibt — gezaehlt hatte er eine absichtlich uebergrosse Anforderung,
   die NIRGENDS passte. „Unten war kein Platz" und „es wurde oben genommen" sind zwei Aussagen;
   dieselbe Verwechslung wie `rx_used` gegen „Daten sind angekommen".
+* **Ein Parameter, der zwei Bedeutungen traegt, ist so lange harmlos, wie die beiden zufaellig
+  gleich sind.** `Scheduler::spawn_user` nahm EINEN Wert fuer den EL0-Stackzeiger UND die
+  Reap-Region, die beim Thread-Tod an den Allokator zurueckgeht. Solange die private Region
+  identisch abgebildet war (VA == PA), war das dieselbe Zahl. Nach dem Fenster-Umbau nicht mehr:
+  `#PF cr2=0x0000008000000000` im KERNEL, weil der Reap-Pfad eine virtuelle Adresse als
+  Physadresse freigab. Dieselbe Form wie das `blocked`-Bit im Scheduler (D9). Das Gegenstueck
+  `spawn_user_at` gab es laengst -- der Ladepfad benutzt es seit A-2.
+* **Ein User-VA-Fenster gehoert dorthin, wo der Kernel NIE identisch zugreift.** Der Kernel
+  laeuft beim Syscall im Adressraum der PD und erreicht physisches RAM ueber die
+  Identitaetskarte. Eine User-VA in GiB 0, die auf eine andere PA zeigt, verdeckt genau diese
+  Sicht -- der Kernel laese dort den Speicher der PD statt den eigenen. Deshalb `PML4[1]` (x86)
+  bzw. `L1[9]` (aarch64) und nicht „irgendwo in GiB 0".
 * **Eine Messung an einem kaputten Aufbau ist keine Messung.** Der Befund „geladene
   Programmsegmente brauchen GiB 0" stand einen halben Tag als Tatsache im Kopf -- er kam aus
   einem Lauf, in dem gleichzeitig ein Selbst-Deadlock steckte. Nach dessen Behebung war er

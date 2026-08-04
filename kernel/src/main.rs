@@ -232,7 +232,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     println!("smp     : starte Kerne 1..{} via PSCI CPU_ON (hvc) ...", cores - 1);
     // Sekundär-Stacks aus dem RAM (ein Block, ein Slot je Kern; Slot 0 bleibt ungenutzt —
     // der Bootkern hat seinen Stack aus dem Linker-Image).
-    let stacks = system::alloc_kernel(cores as u64 * SEC_STACK_SIZE, SEC_STACK_SIZE)
+    let stacks = system::alloc_anywhere(cores as u64 * SEC_STACK_SIZE, SEC_STACK_SIZE)
         .expect("Sekundaer-Stacks: RAM erschoepft");
     SEC_STACKS_BASE.store(stacks.base(), core::sync::atomic::Ordering::Relaxed);
     let entry = _start_secondary as *const () as u64;

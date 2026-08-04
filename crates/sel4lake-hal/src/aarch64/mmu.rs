@@ -958,6 +958,113 @@ pub fn vspace_map_device(
 /// Tabelle (durch [`vspace_map_device`] aufgespalten), `free(...)` für jede Device-L3
 /// **und** die Device-L2. (Die EL1-only Device-Blöcke/Seiten zeigen auf MMIO, nicht auf
 /// RAM — es wird nur der Tabellen-Speicher freigegeben.)
+// ================================================================================================
+// Das private User-VA-Fenster einer isolierten PD (E-Rest 3d, zweite Hälfte)
+// ================================================================================================
+//
+// Begründung wortgleich zur x86-Seite (s. dort): die private Region einer isolierten PD wurde
+// **identisch** abgebildet und war damit an GiB 1 gebunden — gemessen **504** Regionen, der
+// bindende Deckel für die Zahl gleichzeitiger Mandanten.
+//
+// Das Fenster muss dort liegen, wo der Kernel **nie identisch** zugreift, sonst verdeckt eine
+// User-VA seine eigene Sicht auf physisches RAM. Auf aarch64 belegt `vspace_create_base` die
+// L1-Einträge `[0]` (Device), `[1]` (GiB 1, die private RAM-Sicht) und `[2..=8]` (restliches RAM,
+// EL1-only). **`L1[9]` und höher sind leer** — dort liegt das Fenster.
+//
+// Der Preis ist ein 4-KiB-Rahmen je PD (die L2 für dieses GiB), plus eine L3, wenn die Region
+// kleiner als 2 MiB ist (gefärbter Pfad).
+
+/// Gegenstueck zur x86-Funktion: dieser Zweig kennt die Zweiteilung „unterhalb/oberhalb der
+/// Kartengrenze" nicht (s. [`LOW_MAPPED_END`]), also gibt es dort auch nichts zu zaehlen. `0`
+/// heisst hier „die Frage stellt sich nicht", und die Pruefzeile meldet folgerichtig `SKIP`.
+pub fn high_ram_gib() -> usize {
+    0
+}
+
+/// Basis des privaten User-VA-Fensters einer isolierten PD: `L1[9]`, also 9 GiB.
+pub const ISO_USER_VA: u64 = 9 * ONE_GIB;
+/// Der L1-Index dazu.
+const ISO_USER_L1: usize = 9;
+
+/// Eine Tabelle beschaffen oder anlegen; gibt die Physadresse der nächsten Ebene zurück.
+///
+/// # Safety
+/// `slot` muss auf einen gültigen, beschreibbaren Tabelleneintrag zeigen.
+unsafe fn table_or_new(slot: &mut u64, alloc: &mut dyn FnMut() -> Option<u64>) -> Option<u64> {
+    if *slot & 0b11 == TABLE_DESC {
+        return Some(*slot & 0x0000_ffff_ffff_f000);
+    }
+    let new = alloc()?;
+    // SAFETY: frisch alloziertes, identity-gemapptes Frame.
+    unsafe {
+        let t = core::slice::from_raw_parts_mut(new as *mut u64, 512);
+        for e in t.iter_mut() {
+            *e = 0;
+        }
+    }
+    *slot = table_desc(new);
+    Some(new)
+}
+
+/// **Die private Region `[phys, phys+len)` in das User-Fenster dieser PD abbilden.**
+///
+/// Gibt die **virtuelle** Adresse zurück; die Physadresse ist damit frei wählbar. Ein
+/// 2-MiB-ausgerichteter 2-MiB-Block bleibt **ein** Blockdeskriptor — der Fastpath hing nie an der
+/// Identität, sondern an der Ausrichtung der VA.
+pub fn vspace_map_user_window(
+    l1_phys: u64,
+    phys: u64,
+    len: u64,
+    perm: UserPerm,
+    alloc: &mut dyn FnMut() -> Option<u64>,
+) -> Option<u64> {
+    if len == 0 || len % PAGE != 0 || phys % PAGE != 0 || len > TWO_MIB {
+        return None;
+    }
+    // SAFETY: gültige, beschreibbare L1 dieses Adressraums; die Tabellen darunter sind frisch
+    // alloziert oder von diesem Adressraum angelegt.
+    unsafe {
+        let l1 = core::slice::from_raw_parts_mut(l1_phys as *mut u64, 512);
+        let l2_phys = table_or_new(&mut l1[ISO_USER_L1], alloc)?;
+        let l2 = core::slice::from_raw_parts_mut(l2_phys as *mut u64, 512);
+        if len == TWO_MIB && phys % TWO_MIB == 0 {
+            l2[0] = match perm {
+                UserPerm::Rx => user_code_block(phys),
+                _ => user_block(phys),
+            };
+        } else {
+            let l3_phys = table_or_new(&mut l2[0], alloc)?;
+            let l3 = core::slice::from_raw_parts_mut(l3_phys as *mut u64, 512);
+            for i in 0..(len / PAGE) as usize {
+                l3[i] = user_page(phys + (i as u64) * PAGE, perm);
+            }
+        }
+    }
+    cpu::dsb_sy();
+    Some(ISO_USER_VA)
+}
+
+/// Die Tabellen des User-Fensters beim Abbau zurückgeben (Gegenstück zu
+/// [`vspace_map_user_window`]).
+pub fn vspace_collect_user_window(l1_phys: u64, free: &mut dyn FnMut(u64)) {
+    // SAFETY: gültige, lesbare L1 des abzubauenden Adressraums.
+    unsafe {
+        let l1 = core::slice::from_raw_parts_mut(l1_phys as *mut u64, 512);
+        if l1[ISO_USER_L1] & 0b11 != TABLE_DESC {
+            return;
+        }
+        let l2_phys = l1[ISO_USER_L1] & 0x0000_ffff_ffff_f000;
+        let l2 = core::slice::from_raw_parts_mut(l2_phys as *mut u64, 512);
+        // Ein Blockdeskriptor ist keine Tabelle -- ihn freizugeben gäbe dem Allokator die
+        // Nutzregion zurück, die der Aufrufer selbst verwaltet.
+        if l2[0] & 0b11 == TABLE_DESC {
+            free(l2[0] & 0x0000_ffff_ffff_f000);
+        }
+        free(l2_phys);
+        l1[ISO_USER_L1] = 0;
+    }
+}
+
 pub fn vspace_collect_device_tables(l1_phys: u64, free: &mut dyn FnMut(u64)) {
     // SAFETY: gültige L1-Tabelle (read-only Scan).
     let l1 = unsafe { core::slice::from_raw_parts(l1_phys as *const u64, 512) };

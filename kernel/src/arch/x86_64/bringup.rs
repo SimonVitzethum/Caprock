@@ -3196,7 +3196,7 @@ pub fn run(multiboot_info: u64) -> ! {
             if id == boot_id {
                 continue;
             }
-            let Some(stack) = system::alloc_kernel(AP_STACK_BYTES, 4096) else {
+            let Some(stack) = system::alloc_anywhere(AP_STACK_BYTES, 4096) else {
                 break;
             };
             let top = stack.base() + stack.len();

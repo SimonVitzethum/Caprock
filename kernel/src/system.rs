@@ -830,7 +830,7 @@ pub fn configure(cores: usize) -> (usize, usize, usize, u64) {
     // MemoryCap wird bewusst fallen gelassen (kein `Drop` -> die Region kehrt nie in den
     // Allokator zurück). Kerneltabellen leben bis zum Reboot.
     let mut table = |size: usize, align: usize| -> *mut u8 {
-        let cap = mem_alloc_kernel(size as u64, align as u64).expect("Kerneltabelle: RAM erschoepft");
+        let cap = mem_alloc_anywhere(size as u64, align as u64).expect("Kerneltabelle: RAM erschoepft");
         bytes += cap.len();
         cap.base() as *mut u8
     };
@@ -933,7 +933,7 @@ pub fn configure_caps() -> u64 {
     // Wie in `configure`: der Speicher gehört ab hier dauerhaft dem Kernel (die MemoryCap wird
     // bewusst fallen gelassen — Kerneltabellen leben bis zum Reboot).
     let mut table = |size: usize, align: usize| -> *mut u8 {
-        let cap = mem_alloc_kernel(size as u64, align as u64).expect("Cap-Tabelle: RAM erschoepft");
+        let cap = mem_alloc_anywhere(size as u64, align as u64).expect("Cap-Tabelle: RAM erschoepft");
         bytes += cap.len();
         cap.base() as *mut u8
     };
@@ -1045,7 +1045,7 @@ const NNTFNS: usize = sel4lake_microkit::NOTIFICATIONS_FOR_ALL_PDS + 64;
 pub fn configure_ipc() -> u64 {
     let mut bytes = 0u64;
     let mut table = |size: usize, align: usize| -> *mut u8 {
-        let cap = mem_alloc_kernel(size as u64, align as u64).expect("IPC-Tabelle: RAM erschoepft");
+        let cap = mem_alloc_anywhere(size as u64, align as u64).expect("IPC-Tabelle: RAM erschoepft");
         bytes += cap.len();
         cap.base() as *mut u8
     };
@@ -1128,7 +1128,7 @@ fn zero_phys(base: u64, len: u64) {
 /// Region ist bereits exklusiv unsere, und das Nullen großer Blöcke soll den Allokator
 /// nicht blockieren.
 fn mem_alloc(size: u64, align: u64) -> Option<MemoryCap> {
-    zoned_alloc(size, align, Zone::PdMappable)
+    zoned_alloc(size, align, Zone::IdentityMapped)
 }
 
 /// **Reiner Kernel-Speicher** (E-Rest 3d): dieser Puffer wird NIE in den Adressraum einer PD
@@ -1136,11 +1136,11 @@ fn mem_alloc(size: u64, align: u64) -> Option<MemoryCap> {
 /// eigene Identitaetskarte. Er soll deshalb **oberhalb 4 GiB** liegen, wenn es dort Speicher gibt.
 ///
 /// Das ist keine Optimierung, sondern die Auflösung einer Ressourcenkonkurrenz: GiB 0 ist die
-/// knappe Zone (nur dort kann eine PD-eigene Abbildung entstehen, s. [`Zone::PdMappable`]), und
+/// knappe Zone (nur dort kann eine PD-eigene Abbildung entstehen, s. [`Zone::IdentityMapped`]), und
 /// jeder Kernel-Stack, jede Seitentabelle und jede Kerneltabelle, die dort liegt, nimmt einem
 /// Mandanten den Platz weg.
-fn mem_alloc_kernel(size: u64, align: u64) -> Option<MemoryCap> {
-    zoned_alloc(size, align, Zone::KernelOnly)
+fn mem_alloc_anywhere(size: u64, align: u64) -> Option<MemoryCap> {
+    zoned_alloc(size, align, Zone::Anywhere)
 }
 
 /// **Wofuer der Speicher gebraucht wird — und daraus folgt, wo er liegen darf.**
@@ -1151,7 +1151,7 @@ fn mem_alloc_kernel(size: u64, align: u64) -> Option<MemoryCap> {
 ///
 /// # Die Aufzaehlung, um die es in E-Rest 3d ging
 ///
-/// **[`Zone::KernelOnly`] — bevorzugt oberhalb 4 GiB, gemessen tragfaehig:**
+/// **[`Zone::Anywhere`] — bevorzugt oberhalb 4 GiB, gemessen tragfaehig:**
 /// Thread-/Cap-/IPC-Tabellen ([`Slab`]-Rueckwaende), Kernel-Thread-Stacks (`STACK_SIZE`),
 /// die Segment- und Stack-Frames **geladener Programme** (`load_into_pd` bildet ueber
 /// `vspace_map_page_at` ab, das VA und PA **getrennt** nimmt — die Physadresse ist frei),
@@ -1160,11 +1160,11 @@ fn mem_alloc_kernel(size: u64, align: u64) -> Option<MemoryCap> {
 /// Gemessen bei `-m 3G` und `-m 6G`: **alle 28** dieser Allokationen liegen oberhalb 4 GiB,
 /// Haupt- und Lade-Suite `== ALL PASS ==`.
 ///
-/// **[`Zone::PdMappable`] — muss tief liegen, und das ist strukturell:**
+/// **[`Zone::IdentityMapped`] — muss tief liegen, und das ist strukturell:**
 /// alles, was ueber [`vspace_map`]/`map_frame`/[`map_into_thread`] **identisch** abgebildet wird
 /// (VA == PA). `hal::mmu::vspace_map_page_at` weist `va >= GIB1_END` ab, `pd_block_index`
 /// ebenso — eine Region darueber ist fuer eine PD schlicht nicht adressierbar.
-/// **Gegenprobe gefahren:** wird `alloc` auf [`Zone::KernelOnly`] gestellt, faellt die
+/// **Gegenprobe gefahren:** wird `alloc` auf [`Zone::Anywhere`] gestellt, faellt die
 /// **Lade-Suite** bei `-m 3G` aus (`drv`/`blkdev`/`dmaiso`: die Treiber-PD wird nie bereit) —
 /// die Hauptsuite bleibt dabei gruen und haette den Fehler durchgelassen.
 ///
@@ -1172,24 +1172,29 @@ fn mem_alloc_kernel(size: u64, align: u64) -> Option<MemoryCap> {
 /// Region einer isolierten PD, die Code-/Stack-Frames von [`spawn_isolated_native`] und
 /// [`alloc_dma_region`]. Diese bekommen `None` statt einer unbrauchbaren Adresse.
 ///
-/// **Noch nicht klassifiziert** (bewusst konservativ auf [`Zone::PdMappable`], s. `todo.md`):
+/// **Noch nicht klassifiziert** (bewusst konservativ auf [`Zone::IdentityMapped`], s. `todo.md`):
 /// die EL0-Kernel-Stacks ([`claim_user_kstack`]), der EL0-User-Stack von [`spawn_user`], die
 /// IOMMU-Tabellen (`alloc_zeroed`) und die Sentinel-Page des DMA-Tests. Fuer keine davon ist
 /// gezeigt, dass sie oben liegen **darf**; „konservativ" heisst hier ungeprueft, nicht sicher.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Zone {
-    /// **Wird in den Adressraum einer PD abgebildet oder einem Geraet gezeigt.** Muss deshalb
-    /// tief liegen: `vspace_map_block`/`vspace_map_page` bilden **identisch** ab (VA == PA), und
-    /// die per-PD-Tabelle deckt nur GiB 1 ab — eine Region darueber ist fuer eine PD schlicht
-    /// nicht adressierbar. Die harte Grenze steht bei den Aufrufern ([`gib0_zone`]); hier gilt
-    /// sie als **Vorliebe**, damit auch die Stellen tief bleiben, deren Bedingung noch nicht
-    /// einzeln nachgewiesen ist.
-    PdMappable,
-    /// **Reiner Kernel-Speicher** — bevorzugt hoch, s. [`mem_alloc_kernel`].
-    KernelOnly,
+    /// **Wird IDENTISCH abgebildet** (VA == PA) — ueber `vspace_map_block`/`vspace_map_page`,
+    /// `map_frame` oder [`map_into_thread`]. Muss deshalb tief liegen: die per-PD-Tabelle deckt
+    /// nur GiB 1 ab, und `vspace_map_page_at` weist jede VA `>= GIB1_END` ab. Die harte Grenze
+    /// steht bei den Aufrufern ([`gib0_zone`]); hier gilt sie als **Vorliebe**, damit auch die
+    /// Stellen tief bleiben, deren Bedingung noch nicht einzeln nachgewiesen ist.
+    ///
+    /// **Das Kriterium ist die Identitaet, nicht „eine PD sieht es".** Seit E-Rest 3d wird die
+    /// private Region einer isolierten PD ueber ein **Fenster** abgebildet
+    /// (`vspace_map_user_window`) — eine PD sieht sie, und sie darf trotzdem ueberall liegen.
+    IdentityMapped,
+    /// **Keine Identitaetsbindung** — bevorzugt hoch, s. [`mem_alloc_anywhere`]. Reiner
+    /// Kernel-Speicher gehoert hierher, seit E-Rest 3d aber auch die fensterabgebildeten
+    /// Regionen isolierter PDs.
+    Anywhere,
 }
 
-/// Die gemeinsame Mechanik hinter [`mem_alloc`] und [`mem_alloc_kernel`].
+/// Die gemeinsame Mechanik hinter [`mem_alloc`] und [`mem_alloc_anywhere`].
 ///
 /// Beide Zonen sind **Vorlieben mit Ausweich**, keine Bedingungen: wer eine echte Bedingung hat,
 /// nimmt [`mem_alloc_below`] und bekommt `None` statt einer unbrauchbaren Adresse. Hier dagegen
@@ -1199,15 +1204,15 @@ fn zoned_alloc(size: u64, align: u64, zone: Zone) -> Option<MemoryCap> {
     let grenze = hal::mmu::LOW_MAPPED_END;
     // **Architekturen ohne die Zweiteilung.** Auf aarch64 ist `LOW_MAPPED_END` bewusst
     // `u64::MAX` -- es gibt dort keinen Bereich oberhalb einer Kartengrenze. Ohne diese Zeile
-    // waere `KernelOnly` das LEERE Intervall `[MAX, MAX)`: die Suche schluege immer fehl, jede
+    // waere `Zone::Anywhere` das LEERE Intervall `[MAX, MAX)`: die Suche schluege immer fehl, jede
     // Allokation liefe ueber den Ausweich, und der Zaehler meldete lauter Fehlschlaege fuer eine
     // Vorliebe, die auf dieser Architektur gar nicht existiert.
     let (lo, hi) = if grenze == 0 || grenze == u64::MAX {
         (0, u64::MAX)
     } else {
         match zone {
-            Zone::PdMappable => (0, grenze),
-            Zone::KernelOnly => (grenze, u64::MAX),
+            Zone::IdentityMapped => (0, grenze),
+            Zone::Anywhere => (grenze, u64::MAX),
         }
     };
     // **EIN Lock, nicht zwei.** `match MEM.lock() { .. }` haelt den Guard bis zum Ende des
@@ -1227,8 +1232,8 @@ fn zoned_alloc(size: u64, align: u64, zone: Zone) -> Option<MemoryCap> {
             None => match mem.alloc(size, align) {
                 Some(c) => {
                     let ausgewichen = match zone {
-                        Zone::PdMappable => c.base() >= grenze,
-                        Zone::KernelOnly => c.base() < grenze,
+                        Zone::IdentityMapped => c.base() >= grenze,
+                        Zone::Anywhere => c.base() < grenze,
                     };
                     if ausgewichen {
                         ZONE_MISSED[zone as usize].fetch_add(1, Ordering::Relaxed);
@@ -1247,16 +1252,16 @@ fn zoned_alloc(size: u64, align: u64, zone: Zone) -> Option<MemoryCap> {
 /// wurde — je Zone getrennt (E-Rest 3b/3d). `0` heisst **nicht** „geht nicht", sondern „kam nicht
 /// vor"; die Zeile im Bericht sagt das ausdruecklich.
 ///
-/// Zwei Zahlen, weil es zwei verschiedene Lagen sind: `PdMappable` ausgewichen heisst „GiB 0 ist
+/// Zwei Zahlen, weil es zwei verschiedene Lagen sind: `IdentityMapped` ausgewichen heisst „GiB 0 ist
 /// voll, und die Region liegt jetzt dort, wo eine PD sie NICHT sehen kann" — das ist ein Befund.
-/// `KernelOnly` ausgewichen heisst nur „oben war nichts frei" und ist harmlos.
+/// `Anywhere` ausgewichen heisst nur „oben war nichts frei" und ist harmlos.
 static ZONE_MISSED: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 
-/// Zaehlerstaende fuer den Bericht: `(PdMappable ausgewichen, KernelOnly ausgewichen)`.
+/// Zaehlerstaende fuer den Bericht: `(IdentityMapped ausgewichen, Anywhere ausgewichen)`.
 pub fn zone_misses() -> (u32, u32) {
     (
-        ZONE_MISSED[Zone::PdMappable as usize].load(Ordering::Relaxed),
-        ZONE_MISSED[Zone::KernelOnly as usize].load(Ordering::Relaxed),
+        ZONE_MISSED[Zone::IdentityMapped as usize].load(Ordering::Relaxed),
+        ZONE_MISSED[Zone::Anywhere as usize].load(Ordering::Relaxed),
     )
 }
 
@@ -1302,26 +1307,56 @@ pub fn alloc(size: u64, align: u64) -> Option<MemoryCap> {
 /// einem Geraet gezeigt wird (E-Rest 3d) — er liegt bevorzugt oberhalb 4 GiB und laesst GiB 0
 /// denen, die es brauchen. Wer sich nicht sicher ist, nimmt [`alloc`]: die Vorgabe ist die
 /// vorsichtige.
-pub fn alloc_kernel(size: u64, align: u64) -> Option<MemoryCap> {
-    mem_alloc_kernel(size, align)
+pub fn alloc_anywhere(size: u64, align: u64) -> Option<MemoryCap> {
+    mem_alloc_anywhere(size, align)
 }
 /// Wie [`alloc`], aber jede Seite trägt eine Farbe aus `mask` (todo A1). Genullt wie jede
 /// Region, die an ein Subjekt gehen kann.
 pub fn alloc_colored(size: u64, align: u64, mask: sel4lake_mem::ColorMask) -> Option<MemoryCap> {
+    zoned_alloc_colored(size, align, mask, Zone::IdentityMapped)
+}
+
+/// Wie [`alloc_colored`], aber ohne Identitaetsbindung (E-Rest 3d) — bevorzugt oberhalb 4 GiB.
+/// Fuer die fensterabgebildete Region einer isolierten PD: die Farbbedingung ist eine Aussage
+/// ueber die **Physadresse** und von der virtuellen Lage vollstaendig unberuehrt.
+fn alloc_colored_anywhere(
+    size: u64,
+    align: u64,
+    mask: sel4lake_mem::ColorMask,
+) -> Option<MemoryCap> {
+    zoned_alloc_colored(size, align, mask, Zone::Anywhere)
+}
+
+/// Die gemeinsame Mechanik — dieselbe Zonenwahl und derselbe EINE Lock wie in [`zoned_alloc`].
+fn zoned_alloc_colored(
+    size: u64,
+    align: u64,
+    mask: sel4lake_mem::ColorMask,
+    zone: Zone,
+) -> Option<MemoryCap> {
     let colors = crate::colors::count();
-    // Gefaerbte Regionen gehen an ein Subjekt (A1) und werden PD-privat abgebildet -> immer
-    // `Zone::PdMappable`. Dieselbe Mechanik wie in `zoned_alloc`, und aus demselben Grund unter
-    // EINEM Lock.
     let grenze = hal::mmu::LOW_MAPPED_END;
+    let (lo, hi) = if grenze == 0 || grenze == u64::MAX {
+        (0, u64::MAX)
+    } else {
+        match zone {
+            Zone::IdentityMapped => (0, grenze),
+            Zone::Anywhere => (grenze, u64::MAX),
+        }
+    };
     let cap = {
         let mut mem = MEM.lock();
-        match mem.alloc_colored_in(size, align, colors, mask, 0, grenze) {
+        match mem.alloc_colored_in(size, align, colors, mask, lo, hi) {
             Some(c) => Some(c),
-            // Gezaehlt wird nur, was oben auch WIRKLICH genommen wurde.
+            // Gezaehlt wird nur, was in der anderen Zone auch WIRKLICH genommen wurde.
             None => match mem.alloc_colored(size, align, colors, mask) {
                 Some(c) => {
-                    if c.base() >= grenze {
-                        ZONE_MISSED[Zone::PdMappable as usize].fetch_add(1, Ordering::Relaxed);
+                    let ausgewichen = match zone {
+                        Zone::IdentityMapped => c.base() >= grenze,
+                        Zone::Anywhere => c.base() < grenze,
+                    };
+                    if ausgewichen {
+                        ZONE_MISSED[zone as usize].fetch_add(1, Ordering::Relaxed);
                     }
                     Some(c)
                 }
@@ -1861,7 +1896,7 @@ pub fn spawn_balanced(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
 /// [`bind_cores`] gebunden sein. Lock-Ordnung RES vor SCHEDS[core].
 pub fn spawn_on_core(core: usize, entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
     let (base, len) = {
-        let stack = mem_alloc_kernel(STACK_SIZE, 16)?;
+        let stack = mem_alloc_anywhere(STACK_SIZE, 16)?;
         (stack.base() as usize, stack.len() as usize)
     }; // MEM vor SCHEDS freigegeben (Ordnung MEM < SCHEDS)
     let mut sched = SCHEDS[core].lock();
@@ -2162,6 +2197,25 @@ fn vspace_map_masked(
     ok
 }
 
+/// **Die private Region einer isolierten PD in ihr User-Fenster abbilden** (E-Rest 3d).
+///
+/// Gibt die **virtuelle** Adresse zurück, unter der die PD sie sieht. Die Tabellen des Fensters
+/// kommen aus demselben Farbstreifen wie alles andere dieser PD, wenn einer vorgegeben ist —
+/// sonst wäre A1 an genau der Stelle durchlöchert, an der eine neue Tabelle dazukommt.
+fn vspace_map_user_region(
+    asid: u16,
+    phys: u64,
+    len: u64,
+    perm: hal::mmu::UserPerm,
+    mask: Option<sel4lake_mem::ColorMask>,
+) -> Option<u64> {
+    let l1 = vspace_l1(asid)?;
+    let mut alloc = || mem_alloc_masked(4096, 4096, mask).map(|c| c.base());
+    let va = hal::mmu::vspace_map_user_window(l1, phys, len, perm, &mut alloc)?;
+    hal::mmu::flush_asid(asid);
+    Some(va)
+}
+
 /// 4-KiB-Granularität: Region `[base, base+len)` aus der VSpace `asid` entfernen.
 fn vspace_unmap(asid: u16, base: u64, len: u64) -> bool {
     let Some(l2) = vspace_l2(asid) else {
@@ -2241,6 +2295,12 @@ fn vspace_teardown(asid: u16) {
         hal::mmu::vspace_collect_device_tables(ent.l1, &mut |p| {
             mem.free_region(PhysRegion::new(p, 4096));
         });
+        // Die Tabellen des privaten User-Fensters (E-Rest 3d). Sie haengen an einem eigenen
+        // obersten Eintrag und werden von keiner der beiden Zeilen darueber beruehrt -- ohne
+        // diese waere jede isolierte PD ein Leck von zwei bis drei Rahmen.
+        hal::mmu::vspace_collect_user_window(ent.l1, &mut |p| {
+            mem.free_region(PhysRegion::new(p, 4096));
+        });
         mem.free_region(PhysRegion::new(ent.l1, 4096));
         mem.free_region(PhysRegion::new(ent.l2, 4096));
         drop(mem);
@@ -2274,45 +2334,58 @@ fn vspace_bind_stripe(asid: u16, stripe: u32) {
 /// ist die geteilte `.user_text` (EL0-RX in jeder VSpace). Greift er auf **fremdes**
 /// User-RAM zu, ist das in seiner VSpace EL1-only -> Fault -> Kernel beendet ihn.
 /// Zur Laufzeit kann er weitere Frames per `MAP`-Syscall (cap-gated) hinzunehmen.
-/// Gibt `(ThreadId, region_base)`. VSpace-Tabellen werden beim Thread-Ende abgebaut.
+/// Gibt `(ThreadId, region_base)` — die **Physadresse**; der Thread sieht die Region unter
+/// [`hal::mmu::ISO_USER_VA`]. Bis E-Rest 3d war beides dasselbe. Die Kernelseite braucht die PA
+/// (Farbprüfung, Rücklesen), der Thread die VA — sie auseinanderzuhalten ist der ganze Umbau.
+/// VSpace-Tabellen werden beim Thread-Ende abgebaut.
 pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u64)> {
     let core = hal::cpu::core_id();
     let kbase = claim_user_kstack()?; // EL0-Kernel-Stack aus MEM (16 KiB, ausgerichtet)
 
-    // Private 2-MiB-Stack-Region (2-MiB-ausgerichtet, in GiB 1). Der Zonenwunsch geht in die
-    // Anforderung (E-Rest 3b) -- vorher wurde irgendeine Region genommen, die Grenze danach
-    // geprueft und bei Verfehlung aufgegeben, ohne ein zweites Mal zu fragen.
+    // **Private 2-MiB-Stack-Region -- seit E-Rest 3d ohne Zonenbindung.** Sie wird nicht mehr
+    // identisch abgebildet, sondern in das private User-Fenster dieser PD
+    // (`hal::mmu::ISO_USER_VA`, ausserhalb der Identitaetskarte). Damit ist die PHYSADRESSE frei,
+    // und der GiB-0-Deckel von gemessenen 504 gleichzeitigen isolierten PDs faellt.
     let region_sz = hal::mmu::ISO_REGION_SIZE;
-    let (floor, ceil) = gib0_zone();
-    let (rbase, rlen) = match mem_alloc_below(region_sz, region_sz, ceil) {
+    let (rbase, rlen) = match mem_alloc_anywhere(region_sz, region_sz) {
         Some(r) => (r.base(), r.len()),
         None => {
             release_user_kstack(kbase);
             return None;
         }
     };
-    // Die Untergrenze bleibt eine Pruefung: `alloc_below` kennt nur eine Obergrenze, und
-    // unterhalb von `USER_RAM_MIN` liegt ohnehin nichts in der Freiliste (der Bereich gehoert
-    // dem Kernel-Image). Faellt diese Zusage, soll es auffallen statt durchzurutschen.
-    if rbase < floor || rbase + rlen > ceil {
-        MEM.lock().free_region(PhysRegion::new(rbase, rlen));
-        release_user_kstack(kbase);
-        return None;
-    }
     let Some((asid, l1)) = create_vspace() else {
         MEM.lock().free_region(PhysRegion::new(rbase, rlen));
         release_user_kstack(kbase);
         return None;
     };
-    // Stack-Region in die neue VSpace mappen (EL0-RW).
-    vspace_map_region(asid, rbase);
+    // Stack-Region in das private User-Fenster mappen (EL0-RW, nicht-identisch).
+    let Some(rva) = vspace_map_user_region(asid, rbase, rlen, hal::mmu::UserPerm::Rw, None) else {
+        vspace_teardown(asid);
+        MEM.lock().free_region(PhysRegion::new(rbase, rlen));
+        release_user_kstack(kbase);
+        return None;
+    };
     let packed = ((asid as u64) << 48) | l1;
 
-    // Thread: Kernel-Stack aus dem Pool, User-Stack = die gemappte Region.
-    let (user_base, user_len) = (rbase as usize, rlen as usize);
+    // **`spawn_user_at` statt `spawn_user`, und das ist der Kern des Umbaus.** `spawn_user`
+    // nimmt EINEN Wert fuer zwei Dinge: den EL0-Stackzeiger und die Reap-Region, die beim
+    // Thread-Tod an den Allokator zurueckgeht. Solange VA == PA galt, war das dieselbe Zahl;
+    // jetzt sind es zwei, und die Verwechslung ist teuer -- gemessen als `#PF cr2=0x80_0000_0000`
+    // im KERNEL, weil der Reap-Pfad eine virtuelle Adresse als Physadresse freigab.
     let tid = {
         let mut sched = SCHEDS[core].lock();
-        let r = sched.spawn_user(core, entry, arg, kbase, USER_KSTACK_SIZE, user_base, user_len, prio);
+        let r = sched.spawn_user_at(
+            core,
+            entry,
+            arg,
+            kbase,
+            USER_KSTACK_SIZE,
+            (rva + rlen) as usize, // EL0-SP: virtuell, waechst nach unten
+            rbase as usize,        // Reap: physisch
+            rlen as usize,
+            prio,
+        );
         if let Some(t) = r {
             fp_reset_slot(t.slot()); // FP + VSPACE_OF[slot]=0 (global) zurücksetzen
             // Buchfuehrung NOCH UNTER SCHEDS -- s. Kommentar an `record_user_kstack`.
@@ -2412,14 +2485,10 @@ fn spawn_isolated_colored_inner(
     // Region, Kernel-Stack UND Seitentabellen dieser PD kommen aus demselben Streifen.
     let kbase = claim_user_kstack_masked(Some(mask))?;
 
-    // Farbe UND Zone in EINER Entscheidung (E-Rest 3b): zwei nacheinander laufende Politiken
-    // kaempfen gegeneinander -- der Farbstreifen erzwingt eine Physadresse, die Zone eine andere,
-    // und wer zuerst zuteilt, gewinnt. Dasselbe Argument steht in todo.md Z8 fuer NUMA.
-    let (floor, ceil) = gib0_zone();
-    let cap = match MEM
-        .lock()
-        .alloc_colored_below(region_sz, crate::colors::PAGE, colors, mask, ceil)
-    {
+    // **Seit E-Rest 3d ohne Zonenbindung:** die Region wird nicht mehr identisch abgebildet,
+    // sondern in das private User-Fenster dieser PD. Die Farbbedingung bleibt -- sie ist eine
+    // Aussage ueber die PHYSADRESSE und von der virtuellen Lage unberuehrt.
+    let cap = match alloc_colored_anywhere(region_sz, crate::colors::PAGE, mask) {
         Some(c) => c,
         None => {
             release_user_kstack(kbase);
@@ -2428,11 +2497,6 @@ fn spawn_isolated_colored_inner(
     };
     let (rbase, rlen) = (cap.base(), cap.len());
     zero_phys(rbase, rlen); // wie `mem_alloc`: nichts geht ungenullt an ein Subjekt
-    if rbase < floor || rbase + rlen > ceil {
-        MEM.lock().free_region(PhysRegion::new(rbase, rlen));
-        release_user_kstack(kbase);
-        return None;
-    }
     let Some((asid, l1)) = create_vspace_masked(Some(mask)) else {
         MEM.lock().free_region(PhysRegion::new(rbase, rlen));
         release_user_kstack(kbase);
@@ -2452,20 +2516,32 @@ fn spawn_isolated_colored_inner(
     if let Some(i) = stripe {
         vspace_bind_stripe(asid, i);
     }
-    // Seitenweise statt Block — s. Funktionsdoku. `vspace_map` legt die L3 bei Bedarf an und
-    // `vspace_teardown` sammelt sie beim Abbau wieder ein.
-    if !vspace_map_masked(asid, rbase, rlen, hal::mmu::UserPerm::Rw, Some(mask)) {
+    // Seitenweise statt Block — die gefaerbte Region ist kleiner als ein 2-MiB-Block. Die L3
+    // entsteht im User-Fenster und kommt aus demselben Farbstreifen; `vspace_teardown` sammelt
+    // sie ueber `vspace_collect_user_window` wieder ein.
+    let Some(rva) = vspace_map_user_region(asid, rbase, rlen, hal::mmu::UserPerm::Rw, Some(mask))
+    else {
         vspace_teardown(asid);
         MEM.lock().free_region(PhysRegion::new(rbase, rlen));
         release_user_kstack(kbase);
         return None;
-    }
+    };
     let packed = ((asid as u64) << 48) | l1;
 
-    let (user_base, user_len) = (rbase as usize, rlen as usize);
+    // EL0-SP virtuell, Reap-Region physisch -- s. `spawn_isolated`.
     let tid = {
         let mut sched = SCHEDS[core].lock();
-        let r = sched.spawn_user(core, entry, arg, kbase, USER_KSTACK_SIZE, user_base, user_len, prio);
+        let r = sched.spawn_user_at(
+            core,
+            entry,
+            arg,
+            kbase,
+            USER_KSTACK_SIZE,
+            (rva + rlen) as usize,
+            rbase as usize,
+            rlen as usize,
+            prio,
+        );
         if let Some(t) = r {
             fp_reset_slot(t.slot());
             // Buchfuehrung NOCH UNTER SCHEDS -- s. Kommentar an `record_user_kstack`.
@@ -2804,7 +2880,7 @@ pub fn load_into_pd(
     let mut nrec = 0usize;
     for seg in img.segments() {
         let total = (((seg.memsz as u64) + 4095) & !4095) as usize;
-        let Some(region) = mem_alloc_kernel(total as u64, 4096) else {
+        let Some(region) = mem_alloc_anywhere(total as u64, 4096) else {
             return cleanup(asid, kbase, &seglist[..nrec], None);
         };
         let pa = region.base(); // MemoryCap-Drop = nur Deskriptor (kein Free); RAM bleibt belegt
@@ -2822,7 +2898,7 @@ pub fn load_into_pd(
         };
         let mut off = 0u64;
         while (off as usize) < total {
-            let mut a3 = || mem_alloc_kernel(4096, 4096).map(|c| c.base());
+            let mut a3 = || mem_alloc_anywhere(4096, 4096).map(|c| c.base());
             if !hal::mmu::vspace_map_page_at(l2, seg.vaddr + off, pa + off, perm, &mut a3) {
                 return cleanup(asid, kbase, &seglist[..nrec], None);
             }
@@ -2834,13 +2910,13 @@ pub fn load_into_pd(
     }
 
     // 2. Stack (nicht-identity an festes VA-Fenster, EL0-RW).
-    let Some(stack_region) = mem_alloc_kernel(LOADED_STACK_BYTES, 4096) else {
+    let Some(stack_region) = mem_alloc_anywhere(LOADED_STACK_BYTES, 4096) else {
         return cleanup(asid, kbase, &seglist[..nrec], None);
     };
     let stack_pa = stack_region.base();
     let mut off = 0u64;
     while off < LOADED_STACK_BYTES {
-        let mut a3 = || mem_alloc_kernel(4096, 4096).map(|c| c.base());
+        let mut a3 = || mem_alloc_anywhere(4096, 4096).map(|c| c.base());
         if !hal::mmu::vspace_map_page_at(l2, LOADED_STACK_VA + off, stack_pa + off, hal::mmu::UserPerm::Rw, &mut a3) {
             // Stack ist alloziert, aber noch NICHT als Reap-Region des Threads vermerkt -> mitfreigeben.
             return cleanup(asid, kbase, &seglist[..nrec], Some((stack_pa, LOADED_STACK_BYTES)));
@@ -2994,7 +3070,7 @@ pub fn map_region_into_thread(tid: ThreadId, phys: u64, len: u64, kind: MappingK
     let asid = (vspace_of(tid.slot()) >> 48) as u16;
     // Reine Seitentabellen (E-Rest 3d): der Kernel schreibt sie ueber seine Identitaetskarte,
     // die PD sieht sie nie -- sie ist der Baum, nicht das Blatt.
-    let mut alloc = || mem_alloc_kernel(4096, 4096).map(|c| c.base());
+    let mut alloc = || mem_alloc_anywhere(4096, 4096).map(|c| c.base());
     let ok = match kind {
         MappingKind::Device { ro } => match vspace_l1(asid) {
             Some(l1) => hal::mmu::vspace_map_device(l1, phys, len, ro, &mut alloc),

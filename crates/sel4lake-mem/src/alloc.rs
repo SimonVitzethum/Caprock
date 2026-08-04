@@ -612,6 +612,49 @@ mod tests {
         assert!(cap.base() + cap.len() <= GIB, "Farbe erfuellt, Zone verletzt: {:#x}", cap.base());
     }
 
+    /// **Der GiB-0-Deckel als ZAHL, nicht als Schaetzung** (E-Rest 3d, zweite Haelfte).
+    ///
+    /// Eine isolierte PD braucht eine private, 2-MiB-ausgerichtete Region. Solange die Abbildung
+    /// **identisch** ist (VA == PA), muss sie in `[USER_RAM_MIN, GIB1_END)` liegen — also in
+    /// GiB 0. Wieviele PDs das sind, stand bisher als „rund 500" in einer Notiz; hier wird es
+    /// gerechnet, und zwar auf demselben Speicherplan, den `-m 6G` erzeugt.
+    ///
+    /// Der Test ist die **Positivkontrolle des Umbaus**: fiele die Identitaetsbindung, muesste
+    /// die zweite Zahl auf ein Vielfaches steigen. Steht er hier, kann „der Deckel ist weg"
+    /// nicht behauptet werden, ohne dass sich diese Zeile aendert.
+    #[test]
+    fn gib0_deckel_ist_eine_zahl() {
+        const ISO: u64 = 2 * 1024 * 1024;
+        let bau = || {
+            let mut a = PhysAllocator::new();
+            assert!(a.add_region(16 * 1024 * 1024, 2032 * 1024 * 1024)); // unten, wie -m 6G
+            assert!(a.add_region(4 * GIB, 4 * GIB)); //                     oben
+            a
+        };
+
+        // (1) An GiB 0 gebunden -- der heutige Stand.
+        let mut a = bau();
+        let mut gebunden = 0;
+        while a.alloc_below(ISO, ISO, GIB).is_some() {
+            gebunden += 1;
+        }
+
+        // (2) Ohne die Bindung -- was derselbe Speicher hergaebe.
+        let mut b = bau();
+        let mut frei = 0;
+        while b.alloc(ISO, ISO).is_some() {
+            frei += 1;
+        }
+
+        // GiB 0 abzueglich der ersten 16 MiB: (1024 - 16) / 2 = 504.
+        assert_eq!(gebunden, 504, "der GiB-0-Deckel hat sich verschoben");
+        // Derselbe Speicher, ohne die Bindung: rund das Sechsfache.
+        assert!(
+            frei >= 6 * gebunden,
+            "ohne Identitaetsbindung sollten es ein Vielfaches sein, sind aber {frei} gegen {gebunden}"
+        );
+    }
+
     // -- E-Rest 3d: die Zone als INTERVALL ------------------------------------------------------
 
     /// **Die Untergrenze wirkt** — und die Positivkontrolle steht daneben: dieselbe Anforderung

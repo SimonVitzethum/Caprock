@@ -239,6 +239,9 @@ pub struct ColorTest {
     pub usable: bool,
     /// Beide PDs bekamen überhaupt eine Region.
     pub spawned: bool,
+    /// Physadressen der beiden privaten Regionen (E-Rest 3d): oberhalb 4 GiB heisst, dass die
+    /// Identitaetsbindung wirklich gefallen ist.
+    pub region_pa: [u64; 2],
     /// Jede Seite jeder PD-Region liegt im Farbsatz ihrer PD.
     pub in_mask: bool,
     /// Auch Kernel-Stack und die obersten Seitentabellen der PD liegen in ihrem Farbsatz.
@@ -353,6 +356,11 @@ pub fn run_color(entry: usize, prio: u8) -> ColorTest {
         // wo er stabil ist: aus dem Spawn selbst, vor der Existenz des Threads.
         let kernelseite: [(u64, u64, u64); 2] = [ksa, ksb];
 
+        // **E-Rest 3d, der Zahlungseingang:** wo liegen die beiden Regionen physisch? Seit dem
+        // Fenster-Umbau duerfen sie oberhalb 4 GiB liegen -- vorher war das strukturell
+        // unmoeglich (identische Abbildung, per-PD-Tabelle nur fuer GiB 0). Die Zahl steht im
+        // Bericht, damit „der Deckel ist weg" eine Beobachtung ist und keine Behauptung.
+        r.region_pa = [ba, bb];
         r.in_mask = region_in_mask(ba, sz, r.colors, m0) && region_in_mask(bb, sz, r.colors, m1);
         r.disjoint = !regions_share_color((ba, sz), (bb, sz), r.colors);
         // Kernel-Seite: Stack (16 KiB) und die beiden obersten Tabellen (je 4 KiB) jeder PD.
@@ -448,6 +456,30 @@ pub fn report_color(c: &ColorTest) {
         // `FAILURES`, nicht `FAIL` — s. den Kommentar am Kopf dieser Funktion.
         "color   : {} (zwei isolierte PDs teilen sich keine Cache-Farbe)",
         if c.ok { "ALL PASS" } else { "FAILURES" }
+    );
+    // **E-Rest 3d: wo liegen die Regionen wirklich?** Vor dem Fenster-Umbau war die Antwort
+    // strukturell „unterhalb 1 GiB" -- die Abbildung war identisch, und die per-PD-Tabelle deckt
+    // nur GiB 0. Jetzt ist sie eine Beobachtung. `SKIP` heisst hier ehrlich: diese Maschine hat
+    // keinen Speicher oberhalb 4 GiB, der Fall ist also nicht entscheidbar -- **nicht**, dass er
+    // nicht traegt.
+    let oben = c.region_pa[0] >= hal::mmu::LOW_MAPPED_END && c.region_pa[1] >= hal::mmu::LOW_MAPPED_END;
+    let hoch_vorhanden = hal::mmu::high_ram_gib() > 0;
+    println!(
+        "isohigh : Regionen zweier isolierter PDs bei {:#x} / {:#x}; oberhalb 4 GiB = {}",
+        c.region_pa[0], c.region_pa[1], oben as u8
+    );
+    println!(
+        "isohigh : {} (E-Rest 3d: die private Region einer isolierten PD haengt nicht mehr an \
+         GiB 0. Sie wird ueber ein VA-Fenster ausserhalb der Identitaetskarte abgebildet, statt \
+         identisch -- damit faellt der gemessene Deckel von 504 gleichzeitigen isolierten PDs. \
+         Die Farbbedingung gilt unveraendert: sie ist eine Aussage ueber die Physadresse)",
+        if !hoch_vorhanden {
+            "SKIP -- kein RAM oberhalb 4 GiB auf dieser Maschine, der Fall ist nicht entscheidbar"
+        } else if oben && c.ok {
+            "ALL PASS"
+        } else {
+            "FAILURES"
+        }
     );
 }
 

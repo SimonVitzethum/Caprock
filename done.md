@@ -81,6 +81,62 @@ prueft.
 
 ---
 
+## E-Rest 3d (Haelfte 2) — der GiB-0-Deckel fuer isolierte PDs ist weg (2026-08-04)
+
+**Der Deckel war eine Zahl, nicht ein Gefuehl: 504.** GiB 0 abzueglich der ersten 16 MiB, je
+2 MiB private Region — so viele isolierte PDs passten gleichzeitig, und das band frueher als
+`MAX_VSPACES` (4096). Der Host-Test `gib0_deckel_ist_eine_zahl` rechnet es auf dem Speicherplan
+von `-m 6G` nach und ist zugleich die Positivkontrolle des Umbaus.
+
+**Die Ursache war die IDENTITAET, nicht „eine PD sieht es".** `vspace_map_block` leitet den
+Tabellenindex aus der **Phys**adresse ab (VA == PA), und eine isolierte VSpace hat ihr eigenes
+Seitenverzeichnis nur fuer GiB 0. Also musste die Region dorthin.
+
+**Die Behebung: ein VA-Fenster ausserhalb der Identitaetskarte.** Es MUSS dort liegen, und das ist
+der Punkt, an dem die naheliegende Loesung scheitert: der Kernel laeuft beim Syscall im Adressraum
+*dieser* PD und greift dort ueber die Identitaetskarte auf beliebiges physisches RAM zu. Eine
+User-VA irgendwo in GiB 0, die auf eine andere PA zeigt, **verdeckt** genau diese Sicht — der
+Kernel laese an der Stelle den Speicher der PD statt den eigenen. Gewaehlt sind deshalb Bereiche,
+die der Kernel nie identisch belegt: auf x86 `PML4[1]` (512 GiB; die Identitaetskarte benutzt
+ausschliesslich `PML4[0]`), auf aarch64 `L1[9]` (die Eintraege 0..=8 sind belegt, 9..511 leer).
+`vspace_map_user_window` legt die Tabellen an, `vspace_collect_user_window` gibt sie beim Abbau
+zurueck.
+
+**Belegt:** `isohigh : ALL PASS` bei 3G/4G/6G — die Regionen zweier isolierter PDs liegen bei
+`0x1_02b0_0000` (4,04 GiB), und die **Farbtrennung haelt unveraendert**: die Farbbedingung ist
+eine Aussage ueber die Physadresse und von der virtuellen Lage vollstaendig unberuehrt. Bei
+512M/2560M meldet die Zeile `SKIP` — dort gibt es keinen Speicher oberhalb 4 GiB, die Frage ist
+**nicht entscheidbar**, und das ist kein bestandener Test. Gegenprobe gefahren: die alte
+Zuteilung wieder eingesetzt -> `isohigh : FAILURES` und die Suite rot.
+
+**Zwei Annahmen der eigenen Notiz waren falsch — beide zugunsten der Sache.**
+
+* „Der Preis ist der Verlust des 2-MiB-Block-Fastpaths." **Nein.** Der Fastpath hing nie an der
+  Identitaet, sondern nur an der **Ausrichtung der VA**. Ein 2-MiB-ausgerichteter Block bleibt
+  ein Blockdeskriptor; nur der Index kommt jetzt aus der VA statt aus der PA.
+* „Gehoert mit B-4.1 zusammen entschieden." **Nein.** A1 ist gar nicht betroffen. Der Preis sind
+  zwei bis drei 4-KiB-Rahmen je isolierter PD, und die duerfen selbst oben liegen.
+
+**Der Fehler, der es teuer gemacht haette.** `Scheduler::spawn_user` nimmt EINEN Wert fuer zwei
+Dinge: den EL0-Stackzeiger und die **Reap-Region**, die beim Thread-Tod an den Allokator
+zurueckgeht. Solange VA == PA galt, war das dieselbe Zahl. Nach dem Umbau nicht mehr — gemessen
+als `#PF cr2=0x0000008000000000` im **Kernel**: der Reap-Pfad gab eine virtuelle Adresse als
+Physadresse frei. Behoben ueber das laengst vorhandene `spawn_user_at`, das der Ladepfad seit
+A-2 benutzt (dort war VA != PA schon immer der Normalfall). **Ein Parameter, der zwei Bedeutungen
+traegt, ist so lange harmlos, wie die beiden zufaellig gleich sind** — dieselbe Form wie das
+`blocked`-Bit im Scheduler (D9) und wie „unten zuerst" als Zufall der Groessenrelation (E-Rest 3b).
+
+**Gemessen:** RAM-Reihe 512M · 2560M · 3G · 4G · 6G (Hauptsuite) und 512M · 3G · 6G (Lade-Suite),
+alle `== ALL PASS ==`; x86 `RUNS=8` und aarch64 `RUNS=4` mit identischer Signatur; Host-Tests,
+Kerngrenze.
+
+**Offen bleibt E-Rest 3e:** DMA-Regionen haengen weiterhin an GiB 0 — aus zwei Gruenden, die
+auseinandergehoeren: sie werden identisch in die Treiber-PD abgebildet (dasselbe Fenster wuerde
+es loesen), und sie sind **geraetesichtbar** — ob ein Geraet oberhalb 4 GiB adressiert, ist eine
+Eigenschaft des Geraets, und die Angebotsliste fuehrt sie nicht.
+
+---
+
 ## E-Rest 3d (Haelfte 1) — die Stellen sind aufgezaehlt, und der Speicher oben traegt (2026-08-04)
 
 3b hatte den Zonenwunsch eingefuehrt, aber mit einer Vorsichtsmassnahme bezahlt: `mem_alloc` gab

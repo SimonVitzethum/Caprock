@@ -87,6 +87,18 @@ impl PhysAllocator {
     ///
     /// `limit == u64::MAX` heisst „egal" und ist bit-identisch zum bisherigen Verhalten.
     pub fn alloc_below(&mut self, size: u64, align: u64, limit: u64) -> Option<MemoryCap> {
+        self.alloc_in(size, align, 0, limit)
+    }
+
+    /// Wie [`alloc_below`](Self::alloc_below), aber die Zone ist ein **Intervall** `[lo, hi)`.
+    ///
+    /// Die Untergrenze kam mit E-Rest 3d dazu, und sie hat einen anderen Zweck als die obere:
+    /// die obere ist eine **Bedingung** („diese Region muss PD-privat abbildbar sein"), die
+    /// untere eine **Vorliebe** („nimm bitte nicht aus dem knappen GiB 0, wenn du es nicht
+    /// brauchst"). Beide über dieselbe Suche zu führen, ist billiger als zwei Verfahren — und
+    /// vor allem: der Aufrufer sagt in EINEM Ausdruck, was er meint, statt es aus der
+    /// Reihenfolge zweier Aufrufe folgen zu lassen.
+    pub fn alloc_in(&mut self, size: u64, align: u64, lo: u64, hi: u64) -> Option<MemoryCap> {
         let align = align.max(PAGE);
         let size = align_up(size.max(1), PAGE);
 
@@ -99,20 +111,21 @@ impl PhysAllocator {
         // die des Fragments. Sonst gewänne ein riesiges Fragment, von dem nur ein Zipfel unter
         // der Grenze liegt, gegen ein kleines, das ganz hineinpasst — und Best-Fit hiesse etwas
         // anderes, sobald jemand eine Grenze nennt.
-        let mut best: Option<(usize, u64)> = None;
+        let mut best: Option<(usize, u64, u64)> = None;
         for i in 0..self.len {
             let r = self.regions[i];
-            let start = align_up(r.base, align);
+            // Der in der Zone nutzbare Teil dieses Fragments -- an BEIDEN Enden beschnitten.
+            let zone_start = r.base.max(lo);
+            let zone_end = r.end().min(hi);
+            if zone_end <= zone_start {
+                continue; // liegt vollständig ausserhalb der Zone
+            }
+            let start = align_up(zone_start, align);
             // Overflow beim Ausrichten/Addieren -> dieses Fragment überspringen.
             let Some(end) = start.checked_add(size) else {
                 continue;
             };
-            // Der in der Zone nutzbare Teil dieses Fragments.
-            let zone_end = r.end().min(limit);
-            if zone_end <= r.base {
-                continue; // liegt vollständig jenseits der Grenze
-            }
-            let nutzbar = zone_end - r.base;
+            let nutzbar = zone_end - zone_start;
             if start >= r.base && end <= zone_end {
                 // Beidseitiger Verschnitt erhöht die Fragmentzahl um 1; ist die Liste dann voll,
                 // ginge das Suffix beim `insert` verloren (Leck) -> dieses Fragment überspringen.
@@ -120,14 +133,17 @@ impl PhysAllocator {
                 if two_sided && self.len >= MAX_FRAGMENTS {
                     continue;
                 }
-                if best.map_or(true, |(_, n)| nutzbar < n) {
-                    best = Some((i, nutzbar));
+                // Gemerkt wird der **Startpunkt**, nicht nur das Fragment. Ihn danach aus
+                // `r.base` neu auszurechnen war der Fehler der ersten Fassung: die Suche kannte
+                // die Untergrenze, der Zuschnitt nicht -- gefunden wurde in der Zone,
+                // herausgeschnitten darunter. Drei Host-Tests haben das sofort gezeigt.
+                if best.map_or(true, |(_, _, n)| nutzbar < n) {
+                    best = Some((i, start, nutzbar));
                 }
             }
         }
-        let (i, _) = best?;
+        let (i, start, _) = best?;
         let r = self.regions[i];
-        let start = align_up(r.base, align);
         let end = start + size;
         self.remove(i);
         self.insert(PhysRegion::new(r.base, start - r.base)); // Präfix (evtl. leer)
@@ -171,11 +187,25 @@ impl PhysAllocator {
         mask: ColorMask,
         limit: u64,
     ) -> Option<MemoryCap> {
+        self.alloc_colored_in(size, align, colors, mask, 0, limit)
+    }
+
+    /// Wie [`alloc_colored_below`](Self::alloc_colored_below), aber mit dem Zonen-**Intervall**
+    /// aus [`alloc_in`](Self::alloc_in).
+    pub fn alloc_colored_in(
+        &mut self,
+        size: u64,
+        align: u64,
+        colors: u32,
+        mask: ColorMask,
+        lo: u64,
+        hi: u64,
+    ) -> Option<MemoryCap> {
         if mask.is_empty() {
             return None;
         }
         if colors <= 1 || mask == ColorMask::ALL {
-            return self.alloc_below(size, align, limit);
+            return self.alloc_in(size, align, lo, hi);
         }
         let align = align.max(PAGE);
         let size = align_up(size.max(1), PAGE);
@@ -191,12 +221,13 @@ impl PhysAllocator {
         let mut best_nutzbar = u64::MAX;
         for i in 0..self.len {
             let r = self.regions[i];
-            let mut start = align_up(r.base, align);
-            let zone_end = r.end().min(limit);
-            if zone_end <= r.base {
-                continue; // liegt vollständig jenseits der Grenze
+            let zone_start = r.base.max(lo);
+            let zone_end = r.end().min(hi);
+            if zone_end <= zone_start {
+                continue; // liegt vollständig ausserhalb der Zone
             }
-            let nutzbar = zone_end - r.base;
+            let mut start = align_up(zone_start, align);
+            let nutzbar = zone_end - zone_start;
             // Das Farbmuster wiederholt sich spätestens nach `colors` Schritten; mehr zu
             // probieren kann nichts Neues finden.
             let mut tries = 0u32;
@@ -579,6 +610,94 @@ mod tests {
             .expect("unten ist Platz in jeder Farbe");
         assert!(all_pages_in(&cap, m), "Seite mit unerlaubter Farbe vergeben");
         assert!(cap.base() + cap.len() <= GIB, "Farbe erfuellt, Zone verletzt: {:#x}", cap.base());
+    }
+
+    // -- E-Rest 3d: die Zone als INTERVALL ------------------------------------------------------
+
+    /// **Die Untergrenze wirkt** — und die Positivkontrolle steht daneben: dieselbe Anforderung
+    /// ohne Untergrenze landet unten. Ohne sie waere nicht zu unterscheiden, ob `alloc_in`
+    /// wirklich waehlt oder ob zufaellig oben lag, was ohnehin gekommen waere.
+    ///
+    /// **Der Speicherplan ist deshalb `wie_6g` und NICHT `wie_3g`.** Bei 3G ist der obere Bereich
+    /// der kleinere, Best-Fit nimmt ihn also von sich aus — die Positivkontrolle wuerde dort
+    /// fehlschlagen, und zwar zu Recht (`ohne_zone_waehlt_best_fit_den_oberen_bereich` belegt
+    /// genau das). Erst gebaut, prompt darauf hereingefallen: eine Positivkontrolle muss zu dem
+    /// Aufbau passen, in dem sie steht.
+    #[test]
+    fn untergrenze_waehlt_den_oberen_bereich() {
+        // Wie `-m 6G`: unten 2032 MiB, oben 4096 MiB -- hier ist der UNTERE der kleinere.
+        let bau = || {
+            let mut a = PhysAllocator::new();
+            assert!(a.add_region(16 * 1024 * 1024, 2032 * 1024 * 1024));
+            assert!(a.add_region(4 * GIB, 4 * GIB));
+            a
+        };
+        let mut a = bau();
+        let unten = a.alloc_in(PAGE * 4, PAGE, 0, u64::MAX).expect("ohne Untergrenze");
+        assert!(unten.base() < 4 * GIB, "Positivkontrolle: ohne Untergrenze kam {:#x}", unten.base());
+
+        let mut b = bau();
+        let oben = b.alloc_in(PAGE * 4, PAGE, 4 * GIB, u64::MAX).expect("oben ist Platz");
+        assert!(oben.base() >= 4 * GIB, "Untergrenze missachtet: {:#x}", oben.base());
+    }
+
+    /// Ein Fragment, das die **Untergrenze** ueberquert, wird an ihr beschnitten -- symmetrisch
+    /// zur Obergrenze. Sonst waere ein durchgehender Speicher fuer die obere Zone unbenutzbar.
+    #[test]
+    fn bereich_ueber_die_untergrenze_wird_beschnitten() {
+        let mut a = PhysAllocator::new();
+        assert!(a.add_region(GIB / 2, GIB)); // 512 MiB .. 1,5 GiB -- ueberquert GIB
+        let cap = a.alloc_in(64 * 1024 * 1024, PAGE, GIB, u64::MAX).expect("obere Haelfte reicht");
+        assert!(cap.base() >= GIB, "Untergrenze verletzt: {:#x}", cap.base());
+        // Und was darunter liegt, bleibt vergebbar.
+        assert!(a.alloc_below(256 * 1024 * 1024, PAGE, GIB).is_some(), "unterer Teil verloren");
+    }
+
+    /// Beide Grenzen zugleich: die Region liegt im Intervall, und ausserhalb bleibt alles frei.
+    #[test]
+    fn intervall_haelt_beide_grenzen() {
+        let mut a = PhysAllocator::new();
+        assert!(a.add_region(0, 8 * GIB));
+        let cap = a.alloc_in(PAGE * 8, PAGE, 2 * GIB, 3 * GIB).expect("Intervall ist gross genug");
+        assert!(cap.base() >= 2 * GIB && cap.base() + cap.len() <= 3 * GIB,
+                "ausserhalb des Intervalls: {:#x}", cap.base());
+    }
+
+    /// Ein leeres oder verkehrtes Intervall liefert `None` -- nicht „irgendwas".
+    #[test]
+    fn leeres_intervall_liefert_none() {
+        let mut a = PhysAllocator::new();
+        assert!(a.add_region(0, 8 * GIB));
+        assert!(a.alloc_in(PAGE, PAGE, 3 * GIB, 2 * GIB).is_none(), "verkehrtes Intervall bedient");
+        assert!(a.alloc_in(PAGE, PAGE, 2 * GIB, 2 * GIB).is_none(), "leeres Intervall bedient");
+        assert!(a.alloc(PAGE, PAGE).is_some(), "der Allokator ist danach unbrauchbar");
+    }
+
+    /// Farbe und Intervall zugleich -- beide Bedingungen gelten, keine ueberstimmt die andere.
+    #[test]
+    fn farbe_und_intervall_gelten_gemeinsam() {
+        let mut a = PhysAllocator::new();
+        assert!(a.add_region(0, 8 * GIB));
+        let m = stripe(1, 4, COLORS).unwrap();
+        let cap = a
+            .alloc_colored_in(4 * PAGE, PAGE, COLORS, m, 4 * GIB, 5 * GIB)
+            .expect("Platz in jeder Farbe");
+        assert!(all_pages_in(&cap, m), "Seite mit unerlaubter Farbe vergeben");
+        assert!(cap.base() >= 4 * GIB && cap.base() + cap.len() <= 5 * GIB,
+                "Farbe erfuellt, Intervall verletzt: {:#x}", cap.base());
+    }
+
+    /// `alloc_in(.., 0, u64::MAX)` ist bit-identisch zu `alloc` -- sonst haette das Intervall das
+    /// Verhalten aller uebrigen Aufrufer still verschoben.
+    #[test]
+    fn offenes_intervall_identisch_zu_alloc() {
+        let mut a = wie_3g();
+        let mut b = wie_3g();
+        for _ in 0..8 {
+            let x = a.alloc(PAGE * 3, PAGE).unwrap();
+            let y = b.alloc_in(PAGE * 3, PAGE, 0, u64::MAX).unwrap();
+            assert_eq!(x.base(), y.base(), "alloc und alloc_in(0, MAX) laufen auseinander");
+        }
     }
 
     /// Der Zonenwunsch leckt nicht: nach der Rueckgabe steht die Bilanz wieder.

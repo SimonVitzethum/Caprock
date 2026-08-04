@@ -81,6 +81,66 @@ prueft.
 
 ---
 
+## E-Rest 3d (Haelfte 1) — die Stellen sind aufgezaehlt, und der Speicher oben traegt (2026-08-04)
+
+3b hatte den Zonenwunsch eingefuehrt, aber mit einer Vorsichtsmassnahme bezahlt: `mem_alloc` gab
+„unten zuerst" vor, **weil** unbekannt war, wer alles darauf baut. Damit war der gesamte Speicher
+oberhalb 4 GiB praktisch Reserve -- der Ausweichzaehler meldete ehrlich `0x`, also einen Pfad, der
+nie lief.
+
+**Die Aufzaehlung steht jetzt an EINER Stelle** (`enum Zone` in `kernel/src/system.rs`), nicht
+verstreut in Kommentaren:
+
+* `KernelOnly` (bevorzugt **oben**): Thread-/Cap-/IPC-Tabellen, Kernel-Thread-Stacks, die
+  Segment- und Stack-Frames **geladener Programme**, alle L3-Seitentabellen, AP- und
+  Sekundaerstacks. Gemessen bei 3G und 6G: **alle 28** dieser Allokationen liegen oberhalb
+  4 GiB, Haupt- und Lade-Suite gruen.
+* `PdMappable` (muss **tief**): alles, was identisch abgebildet wird (VA == PA). Das ist
+  strukturell, nicht empirisch: `vspace_map_page_at` weist `va >= GIB1_END` ab, `pd_block_index`
+  ebenso.
+* harte Bedingung (`gib0_zone`, `None` statt einer unbrauchbaren Adresse): die private Region
+  einer isolierten PD, `spawn_isolated_native` und `alloc_dma_region`. Der mittlere Fall kam
+  hier dazu -- er stand noch auf „einmal fragen, danach pruefen, bei Verfehlung aufgeben".
+
+**Die Gegenprobe ist der eigentliche Beleg.** Stellt man `system::alloc` auf `KernelOnly`, faellt
+die **Lade-Suite** bei `-m 3G` aus (`drv`/`blkdev`/`dmaiso` -- die Treiber-PD wird nie bereit),
+waehrend die **Hauptsuite gruen bleibt**. Eine Klassifikation, die nur gegen die Hauptsuite
+geprueft worden waere, haette den Fehler durchgelassen. Das ist dieselbe Form wie D8/D9/D11: die
+Suite loest den Fall nicht aus, den sie zu decken scheint.
+
+**Zwei eigene Vermutungen widerlegt, beide gemessen statt geglaubt:**
+
+* „Geladene Programmsegmente brauchen GiB 0." **Falsch.** `load_into_pd` bildet ueber
+  `vspace_map_page_at` ab, und das nimmt VA und PA **getrennt** -- die Physadresse ist frei.
+  Diese Vermutung hatte ich am selben Tag als Befund notiert; sie stand auf einer Messung, die
+  durch einen anderen Fehler (den Selbst-Deadlock aus 3b) verfaelscht war. Eine Messung an einem
+  kaputten Aufbau ist keine Messung.
+* „Das Geraet erreicht nur GiB 0." **Falsch.** Mit der virtio-Region oberhalb 4 GiB liest
+  `virtio-blk` den Sektor korrekt (`Geraet-DMA=1`, Magie stimmt). Die Region bleibt trotzdem
+  konservativ tief -- aber aus einem anderen Grund: die 32-Bit-Faehigkeit ist eine Eigenschaft
+  des Geraets, und die Angebotsliste enthaelt sie nicht (`Geraete-ohne-deklarierte-Adressbreite=1`).
+
+**Der Zaehler ist zweiteilig und sagt jetzt etwas.** „PD-abbildbar musste nach oben ausweichen"
+waere ein Befund (GiB 0 ist voll, und die Region liegt dort, wo eine PD sie nicht sieht); „reiner
+Kernel-Speicher musste nach unten" ist harmlos. Gemessen: 512M und 2560M -> 0 / **28** (es gibt
+oben nichts, der Pfad ist also GEFAHREN), 3G/4G/6G -> 0 / 0.
+
+**Gemessen:** RAM-Reihe 512M · 2560M · 3G · 4G · 6G (Hauptsuite) und 512M (3x) · 3G · 6G
+(Lade-Suite), alle `== ALL PASS ==`; x86 `RUNS=8` und aarch64 `RUNS=4` mit identischer Signatur;
+sechs neue Host-Tests fuer das Zonen-**Intervall** (`alloc_in`), darunter eine Positivkontrolle,
+die beim ersten Anlauf zu Recht durchfiel: sie stand auf dem 3G-Speicherplan, wo Best-Fit von
+sich aus oben waehlt -- eine Positivkontrolle muss zu dem Aufbau passen, in dem sie steht.
+
+Nebenbefund beim Bauen: die Suche kannte die Untergrenze, der **Zuschnitt** danach nicht (er
+rechnete `start` aus `r.base` neu). Gefunden wurde in der Zone, herausgeschnitten darunter --
+drei Host-Tests haben es sofort gezeigt.
+
+**Offen bleibt** (s. `todo.md`): der Rest der Aufzaehlung (EL0-Kernel-Stacks, EL0-User-Stack,
+IOMMU-Tabellen, Sentinel-Page -- alle konservativ, keine geprueft) und der 1-GiB-Deckel selbst,
+der im VSpace-Layout liegt und nur mit einer nicht-identischen Abbildung faellt.
+
+---
+
 ## E-Rest 3b — die Freiliste kennt den Zonenwunsch (2026-08-04)
 
 **Der Befund war groesser als der Eintrag.** Notiert war: `alloc_dma_region` und isolierte

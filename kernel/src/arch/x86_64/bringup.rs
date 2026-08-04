@@ -1685,6 +1685,14 @@ fn virtio_blk_versuch(
     max_poll: u64,
 ) -> Option<hal::virtio::blk::BlkResult> {
     let d = dev?;
+    // **Diese Region sieht ein GERAET** (Bus-Master-DMA, vor dem VT-d-Aufbau als rohe
+    // Physadresse). `system::alloc` steht hier als die vorsichtige Wahl -- **nicht**, weil das
+    // Geraet oben nicht hinkaeme: gemessen (E-Rest 3d, `-m 3G`, Region oberhalb 4 GiB) liest
+    // virtio-blk den Sektor korrekt, `Geraet-DMA=1`. Die Vermutung „das Geraet erreicht nur
+    // GiB 0" war also falsch, und sie steht hier, damit sie nicht ein zweites Mal aufkommt.
+    // Konservativ bleibt es trotzdem: die 32-Bit-Faehigkeit eines Geraets ist eine Eigenschaft
+    // des Geraets, und die Angebotsliste enthaelt sie nicht (s. `dmawin`:
+    // `Geraete-ohne-deklarierte-Adressbreite=1`).
     let cap = system::alloc(hal::virtio::blk::REGION_BYTES, 4096)?;
     let base = cap.base();
     let r = hal::virtio::probe_blk(d).map(|blk| {
@@ -1708,6 +1716,7 @@ fn virtio_net_versuch(
     max_poll: u64,
 ) -> Option<hal::virtio::net::NetResult> {
     let d = dev?;
+    // Geraete-sichtbar wie in `virtio_blk_versuch` -- s. dort.
     let cap = system::alloc(hal::virtio::net::REGION_BYTES, 4096)?;
     let base = cap.base();
     let r = hal::virtio::probe_net(d).map(|net| {
@@ -1893,16 +1902,17 @@ const DONE_FLAGS: usize = 21;
 /// das hier ist die Spiegelung, nicht eine neue Erfindung.
 #[cfg(feature = "selftest")]
 fn report_and_off(watchdog: bool) -> ! {
-    // **E-Rest 3b, und die Zahl gehoert an den SCHLUSS, nicht an den Hochlauf.** Sie sagt, wie oft
-    // die Vorgabe „unten zuerst" nicht erfuellt werden konnte und oberhalb 4 GiB ausgewichen
-    // wurde. `0` heisst „kam nicht vor" -- **nicht** „geht nicht": auf diesen Aufbauten reicht
-    // der untere Bereich, der Ueberlaufpfad ist damit in QEMU ungefahren. Ohne diese Zeile saehe
-    // ein ungefahrener Pfad genauso aus wie ein tragender. Gefahren wird er in den Host-Tests
-    // (`zone_ohne_platz_liefert_none`).
+    // **E-Rest 3b/3d, und die Zahlen gehoeren an den SCHLUSS, nicht an den Hochlauf.** Zwei
+    // Zahlen, weil es zwei verschiedene Lagen sind: „PD-abbildbar musste nach oben ausweichen"
+    // heisst, GiB 0 ist voll und die Region liegt jetzt dort, wo eine PD sie NICHT sehen kann --
+    // das ist ein Befund. „Reiner Kernel-Speicher musste nach unten" heisst nur, dass oben nichts
+    // frei war, und ist harmlos. `0` heisst in beiden Faellen „kam nicht vor", nicht „geht
+    // nicht" -- ohne diese Zeile saehe ein ungefahrener Pfad genauso aus wie ein tragender.
+    let (pd_miss, kern_miss) = system::zone_misses();
     println!(
-        "mem     : Zonenvorgabe 'unten zuerst' -- Ausweichen oberhalb 4 GiB: {}x (0 = kam nicht \
-         vor, nicht 'geht nicht')",
-        system::high_fallbacks()
+        "mem     : Zonen (E-Rest 3d) -- PD-abbildbar musste {pd_miss}x nach oben ausweichen, \
+         reiner Kernel-Speicher {kern_miss}x nach unten (0 heisst 'kam nicht vor', nicht \
+         'geht nicht'; ein PD-Ausweich waere ein Befund, ein Kernel-Ausweich ist harmlos)"
     );
     let ticks = hal::timer::ticks(0);
     let mut all_tick = true;
@@ -3186,7 +3196,7 @@ pub fn run(multiboot_info: u64) -> ! {
             if id == boot_id {
                 continue;
             }
-            let Some(stack) = system::alloc(AP_STACK_BYTES, 4096) else {
+            let Some(stack) = system::alloc_kernel(AP_STACK_BYTES, 4096) else {
                 break;
             };
             let top = stack.base() + stack.len();

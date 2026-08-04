@@ -830,7 +830,7 @@ pub fn configure(cores: usize) -> (usize, usize, usize, u64) {
     // MemoryCap wird bewusst fallen gelassen (kein `Drop` -> die Region kehrt nie in den
     // Allokator zurück). Kerneltabellen leben bis zum Reboot.
     let mut table = |size: usize, align: usize| -> *mut u8 {
-        let cap = mem_alloc(size as u64, align as u64).expect("Kerneltabelle: RAM erschoepft");
+        let cap = mem_alloc_kernel(size as u64, align as u64).expect("Kerneltabelle: RAM erschoepft");
         bytes += cap.len();
         cap.base() as *mut u8
     };
@@ -933,7 +933,7 @@ pub fn configure_caps() -> u64 {
     // Wie in `configure`: der Speicher gehört ab hier dauerhaft dem Kernel (die MemoryCap wird
     // bewusst fallen gelassen — Kerneltabellen leben bis zum Reboot).
     let mut table = |size: usize, align: usize| -> *mut u8 {
-        let cap = mem_alloc(size as u64, align as u64).expect("Cap-Tabelle: RAM erschoepft");
+        let cap = mem_alloc_kernel(size as u64, align as u64).expect("Cap-Tabelle: RAM erschoepft");
         bytes += cap.len();
         cap.base() as *mut u8
     };
@@ -1045,7 +1045,7 @@ const NNTFNS: usize = sel4lake_microkit::NOTIFICATIONS_FOR_ALL_PDS + 64;
 pub fn configure_ipc() -> u64 {
     let mut bytes = 0u64;
     let mut table = |size: usize, align: usize| -> *mut u8 {
-        let cap = mem_alloc(size as u64, align as u64).expect("IPC-Tabelle: RAM erschoepft");
+        let cap = mem_alloc_kernel(size as u64, align as u64).expect("IPC-Tabelle: RAM erschoepft");
         bytes += cap.len();
         cap.base() as *mut u8
     };
@@ -1128,46 +1128,110 @@ fn zero_phys(base: u64, len: u64) {
 /// Region ist bereits exklusiv unsere, und das Nullen großer Blöcke soll den Allokator
 /// nicht blockieren.
 fn mem_alloc(size: u64, align: u64) -> Option<MemoryCap> {
-    // **„Unten zuerst" war bis zum 2026-08-04 ein ZUFALL, jetzt ist es eine Politik** (E-Rest 3b).
-    //
-    // Best-Fit nimmt das kleinste passende Fragment. Solange der Bereich oberhalb 4 GiB zufaellig
-    // groesser war als der untere (`-m 4G`, `-m 6G`), landete damit alles Unbenannte unten -- und
-    // die Stellen, die das brauchen, kamen ohne Zonenwunsch aus. Bei `-m 3G` (unten 2032 MiB, oben
-    // 1024 MiB) kehrt sich die Relation um, und dieselbe Zeile liefert oben.
-    //
-    // Wieviele Stellen darauf bauen, ist NICHT vollstaendig bekannt -- und das ist der Grund fuer
-    // diese Reihenfolge statt eines mutigeren Umbaus: `vspace_map_block` bildet **identisch** ab
-    // (VA == PA), also ist jede so gemappte Region strukturell an GiB 0 gebunden; der Ladepfad
-    // haengt daran ebenso. Gemessen wurde ausserdem ein dritter Fall (Z4-Kette, dritter Boot), der
-    // ohne diese Politik ausfaellt. Solange diese Menge nicht aufgezaehlt ist, ist „unten zuerst"
-    // die ehrliche Vorgabe: sie reproduziert das gemessene Verhalten, statt eine unbelegte
-    // Freiheit zu behaupten.
-    //
-    // Der Unterschied zum alten Behelf ist trotzdem wesentlich: hoher Speicher liegt jetzt
-    // **vollstaendig** in der Freiliste und wird als Ueberlauf benutzt, statt gar nicht vergeben
-    // zu werden (bei `-m 3G` vorher 0 von 1024 MiB).
+    zoned_alloc(size, align, Zone::PdMappable)
+}
+
+/// **Reiner Kernel-Speicher** (E-Rest 3d): dieser Puffer wird NIE in den Adressraum einer PD
+/// abgebildet und nie einem Geraet gezeigt — der Kernel erreicht ihn ausschliesslich ueber seine
+/// eigene Identitaetskarte. Er soll deshalb **oberhalb 4 GiB** liegen, wenn es dort Speicher gibt.
+///
+/// Das ist keine Optimierung, sondern die Auflösung einer Ressourcenkonkurrenz: GiB 0 ist die
+/// knappe Zone (nur dort kann eine PD-eigene Abbildung entstehen, s. [`Zone::PdMappable`]), und
+/// jeder Kernel-Stack, jede Seitentabelle und jede Kerneltabelle, die dort liegt, nimmt einem
+/// Mandanten den Platz weg.
+fn mem_alloc_kernel(size: u64, align: u64) -> Option<MemoryCap> {
+    zoned_alloc(size, align, Zone::KernelOnly)
+}
+
+/// **Wofuer der Speicher gebraucht wird — und daraus folgt, wo er liegen darf.**
+///
+/// Bis E-Rest 3d gab es diese Unterscheidung nicht: `mem_alloc` gab „unten zuerst" vor, **weil**
+/// unbekannt war, wer alles darauf baut. Das war eine Vorsichtsmassnahme, keine Zusicherung — und
+/// eine Vorsichtsmassnahme, die den gesamten Speicher oberhalb 4 GiB praktisch zur Reserve machte.
+///
+/// # Die Aufzaehlung, um die es in E-Rest 3d ging
+///
+/// **[`Zone::KernelOnly`] — bevorzugt oberhalb 4 GiB, gemessen tragfaehig:**
+/// Thread-/Cap-/IPC-Tabellen ([`Slab`]-Rueckwaende), Kernel-Thread-Stacks (`STACK_SIZE`),
+/// die Segment- und Stack-Frames **geladener Programme** (`load_into_pd` bildet ueber
+/// `vspace_map_page_at` ab, das VA und PA **getrennt** nimmt — die Physadresse ist frei),
+/// alle L3-Seitentabellen (Ladepfad und [`map_region_into_thread`]), AP-Stacks und die
+/// Sekundaerstacks aus `main.rs`.
+/// Gemessen bei `-m 3G` und `-m 6G`: **alle 28** dieser Allokationen liegen oberhalb 4 GiB,
+/// Haupt- und Lade-Suite `== ALL PASS ==`.
+///
+/// **[`Zone::PdMappable`] — muss tief liegen, und das ist strukturell:**
+/// alles, was ueber [`vspace_map`]/`map_frame`/[`map_into_thread`] **identisch** abgebildet wird
+/// (VA == PA). `hal::mmu::vspace_map_page_at` weist `va >= GIB1_END` ab, `pd_block_index`
+/// ebenso — eine Region darueber ist fuer eine PD schlicht nicht adressierbar.
+/// **Gegenprobe gefahren:** wird `alloc` auf [`Zone::KernelOnly`] gestellt, faellt die
+/// **Lade-Suite** bei `-m 3G` aus (`drv`/`blkdev`/`dmaiso`: die Treiber-PD wird nie bereit) —
+/// die Hauptsuite bleibt dabei gruen und haette den Fehler durchgelassen.
+///
+/// **Harte Bedingung statt Vorliebe** ([`mem_alloc_below`] mit [`gib0_zone`]): die private
+/// Region einer isolierten PD, die Code-/Stack-Frames von [`spawn_isolated_native`] und
+/// [`alloc_dma_region`]. Diese bekommen `None` statt einer unbrauchbaren Adresse.
+///
+/// **Noch nicht klassifiziert** (bewusst konservativ auf [`Zone::PdMappable`], s. `todo.md`):
+/// die EL0-Kernel-Stacks ([`claim_user_kstack`]), der EL0-User-Stack von [`spawn_user`], die
+/// IOMMU-Tabellen (`alloc_zeroed`) und die Sentinel-Page des DMA-Tests. Fuer keine davon ist
+/// gezeigt, dass sie oben liegen **darf**; „konservativ" heisst hier ungeprueft, nicht sicher.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Zone {
+    /// **Wird in den Adressraum einer PD abgebildet oder einem Geraet gezeigt.** Muss deshalb
+    /// tief liegen: `vspace_map_block`/`vspace_map_page` bilden **identisch** ab (VA == PA), und
+    /// die per-PD-Tabelle deckt nur GiB 1 ab — eine Region darueber ist fuer eine PD schlicht
+    /// nicht adressierbar. Die harte Grenze steht bei den Aufrufern ([`gib0_zone`]); hier gilt
+    /// sie als **Vorliebe**, damit auch die Stellen tief bleiben, deren Bedingung noch nicht
+    /// einzeln nachgewiesen ist.
+    PdMappable,
+    /// **Reiner Kernel-Speicher** — bevorzugt hoch, s. [`mem_alloc_kernel`].
+    KernelOnly,
+}
+
+/// Die gemeinsame Mechanik hinter [`mem_alloc`] und [`mem_alloc_kernel`].
+///
+/// Beide Zonen sind **Vorlieben mit Ausweich**, keine Bedingungen: wer eine echte Bedingung hat,
+/// nimmt [`mem_alloc_below`] und bekommt `None` statt einer unbrauchbaren Adresse. Hier dagegen
+/// ist „woanders" besser als „gar nicht" — ein Kernel, der wegen einer Vorliebe keinen Stack mehr
+/// bekommt, waere schlechter dran als einer, der ihn tief nimmt.
+fn zoned_alloc(size: u64, align: u64, zone: Zone) -> Option<MemoryCap> {
+    let grenze = hal::mmu::LOW_MAPPED_END;
+    // **Architekturen ohne die Zweiteilung.** Auf aarch64 ist `LOW_MAPPED_END` bewusst
+    // `u64::MAX` -- es gibt dort keinen Bereich oberhalb einer Kartengrenze. Ohne diese Zeile
+    // waere `KernelOnly` das LEERE Intervall `[MAX, MAX)`: die Suche schluege immer fehl, jede
+    // Allokation liefe ueber den Ausweich, und der Zaehler meldete lauter Fehlschlaege fuer eine
+    // Vorliebe, die auf dieser Architektur gar nicht existiert.
+    let (lo, hi) = if grenze == 0 || grenze == u64::MAX {
+        (0, u64::MAX)
+    } else {
+        match zone {
+            Zone::PdMappable => (0, grenze),
+            Zone::KernelOnly => (grenze, u64::MAX),
+        }
+    };
     // **EIN Lock, nicht zwei.** `match MEM.lock() { .. }` haelt den Guard bis zum Ende des
     // `match` -- ein zweites `MEM.lock()` im `None`-Zweig ist ein Selbst-Deadlock auf einem
     // Spinlock, und zwar genau im Ausweichpfad, der selten laeuft. Selbst gebaut und gemessen:
     // die Lade-Suite blieb stehen, sobald der untere Bereich einmal nicht reichte.
     let cap = {
         let mut mem = MEM.lock();
-        match mem.alloc_below(size, align, hal::mmu::LOW_MAPPED_END) {
+        match mem.alloc_in(size, align, lo, hi) {
             Some(c) => Some(c),
-            // Ueberlauf: oben ist besser als gar nicht -- und er wird GEZAEHLT. Ein Pfad, der in
-            // keinem Lauf vorkommt, ist ungeprueft; ohne diese Zahl saehe „nie gebraucht"
-            // genauso aus wie „funktioniert".
-            //
-            // **Gezaehlt wird die WIRKUNG, nicht der Versuch.** Die erste Fassung zaehlte hier
-            // bedingungslos und meldete deshalb `1x` auf einer 512-MiB-Maschine, auf der es
-            // ueberhaupt keinen Speicher oberhalb 4 GiB gibt -- gezaehlt hatte sie in Wahrheit
-            // eine Anforderung, die NIRGENDS passte (eine absichtlich uebergrosse aus dem
-            // Farbtest). „Unten war kein Platz" und „es wurde oben genommen" sind zwei
-            // verschiedene Aussagen; dieselbe Verwechslung wie `rx_used` gegen „Daten angekommen".
+            // Ausweich in die andere Zone. Er wird GEZAEHLT, und zwar nach WIRKUNG: eine
+            // Anforderung, die nirgends passt, ist kein Ausweich. Die erste Fassung zaehlte
+            // bedingungslos und meldete `1x` auf einer 512-MiB-Maschine, auf der es oberhalb
+            // 4 GiB ueberhaupt keinen Speicher gibt -- gezaehlt hatte sie eine absichtlich
+            // uebergrosse Anforderung aus dem Farbtest. Dieselbe Verwechslung wie `rx_used`
+            // gegen „Daten sind angekommen".
             None => match mem.alloc(size, align) {
                 Some(c) => {
-                    if c.base() >= hal::mmu::LOW_MAPPED_END {
-                        HIGH_FALLBACK.fetch_add(1, Ordering::Relaxed);
+                    let ausgewichen = match zone {
+                        Zone::PdMappable => c.base() >= grenze,
+                        Zone::KernelOnly => c.base() < grenze,
+                    };
+                    if ausgewichen {
+                        ZONE_MISSED[zone as usize].fetch_add(1, Ordering::Relaxed);
                     }
                     Some(c)
                 }
@@ -1179,13 +1243,21 @@ fn mem_alloc(size: u64, align: u64) -> Option<MemoryCap> {
     Some(cap)
 }
 
-/// Wie oft die Zonenvorgabe „unten zuerst" nicht erfuellt werden konnte und oberhalb 4 GiB
-/// ausgewichen wurde (E-Rest 3b). `0` heisst **nicht** „geht nicht", sondern „kam nicht vor".
-static HIGH_FALLBACK: AtomicU32 = AtomicU32::new(0);
+/// Wie oft eine Zonenvorliebe nicht erfuellt werden konnte und in die andere Zone ausgewichen
+/// wurde — je Zone getrennt (E-Rest 3b/3d). `0` heisst **nicht** „geht nicht", sondern „kam nicht
+/// vor"; die Zeile im Bericht sagt das ausdruecklich.
+///
+/// Zwei Zahlen, weil es zwei verschiedene Lagen sind: `PdMappable` ausgewichen heisst „GiB 0 ist
+/// voll, und die Region liegt jetzt dort, wo eine PD sie NICHT sehen kann" — das ist ein Befund.
+/// `KernelOnly` ausgewichen heisst nur „oben war nichts frei" und ist harmlos.
+static ZONE_MISSED: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 
-/// Zaehlerstand fuer den Bericht.
-pub fn high_fallbacks() -> u32 {
-    HIGH_FALLBACK.load(Ordering::Relaxed)
+/// Zaehlerstaende fuer den Bericht: `(PdMappable ausgewichen, KernelOnly ausgewichen)`.
+pub fn zone_misses() -> (u32, u32) {
+    (
+        ZONE_MISSED[Zone::PdMappable as usize].load(Ordering::Relaxed),
+        ZONE_MISSED[Zone::KernelOnly as usize].load(Ordering::Relaxed),
+    )
 }
 
 /// **Die Zone, aus der alles kommen muss, was eine PD-eigene Abbildung braucht** (E-Rest 3b).
@@ -1226,20 +1298,30 @@ fn mem_alloc_masked(
 pub fn alloc(size: u64, align: u64) -> Option<MemoryCap> {
     mem_alloc(size, align)
 }
+/// Wie [`alloc`], aber fuer Speicher, der **nie** in den Adressraum einer PD abgebildet und nie
+/// einem Geraet gezeigt wird (E-Rest 3d) — er liegt bevorzugt oberhalb 4 GiB und laesst GiB 0
+/// denen, die es brauchen. Wer sich nicht sicher ist, nimmt [`alloc`]: die Vorgabe ist die
+/// vorsichtige.
+pub fn alloc_kernel(size: u64, align: u64) -> Option<MemoryCap> {
+    mem_alloc_kernel(size, align)
+}
 /// Wie [`alloc`], aber jede Seite trägt eine Farbe aus `mask` (todo A1). Genullt wie jede
 /// Region, die an ein Subjekt gehen kann.
 pub fn alloc_colored(size: u64, align: u64, mask: sel4lake_mem::ColorMask) -> Option<MemoryCap> {
     let colors = crate::colors::count();
-    // Dieselbe Politik wie in [`mem_alloc`] -- und aus demselben Grund unter EINEM Lock.
+    // Gefaerbte Regionen gehen an ein Subjekt (A1) und werden PD-privat abgebildet -> immer
+    // `Zone::PdMappable`. Dieselbe Mechanik wie in `zoned_alloc`, und aus demselben Grund unter
+    // EINEM Lock.
+    let grenze = hal::mmu::LOW_MAPPED_END;
     let cap = {
         let mut mem = MEM.lock();
-        match mem.alloc_colored_below(size, align, colors, mask, hal::mmu::LOW_MAPPED_END) {
+        match mem.alloc_colored_in(size, align, colors, mask, 0, grenze) {
             Some(c) => Some(c),
-            // Wie in [`mem_alloc`]: gezaehlt wird nur, was oben auch WIRKLICH genommen wurde.
+            // Gezaehlt wird nur, was oben auch WIRKLICH genommen wurde.
             None => match mem.alloc_colored(size, align, colors, mask) {
                 Some(c) => {
-                    if c.base() >= hal::mmu::LOW_MAPPED_END {
-                        HIGH_FALLBACK.fetch_add(1, Ordering::Relaxed);
+                    if c.base() >= grenze {
+                        ZONE_MISSED[Zone::PdMappable as usize].fetch_add(1, Ordering::Relaxed);
                     }
                     Some(c)
                 }
@@ -1779,7 +1861,7 @@ pub fn spawn_balanced(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
 /// [`bind_cores`] gebunden sein. Lock-Ordnung RES vor SCHEDS[core].
 pub fn spawn_on_core(core: usize, entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
     let (base, len) = {
-        let stack = mem_alloc(STACK_SIZE, 16)?;
+        let stack = mem_alloc_kernel(STACK_SIZE, 16)?;
         (stack.base() as usize, stack.len() as usize)
     }; // MEM vor SCHEDS freigegeben (Ordnung MEM < SCHEDS)
     let mut sched = SCHEDS[core].lock();
@@ -2477,10 +2559,15 @@ pub fn spawn_isolated_native(code: *const u8, code_len: usize, prio: u8) -> Opti
     let kbase = claim_user_kstack()?; // EL0-Kernel-Stack aus MEM (16 KiB, ausgerichtet)
     let sz = hal::mmu::ISO_REGION_SIZE;
 
-    // Code-Frame + Stack-Frame (beide 2-MiB-ausgerichtet, in GiB 1).
-    let in_gib1 = |b: u64, l: u64| b >= hal::mmu::USER_RAM_MIN && b + l <= hal::mmu::GIB1_END;
-    let ca = mem_alloc(sz, sz);
-    let sa = mem_alloc(sz, sz);
+    // Code-Frame + Stack-Frame (beide 2-MiB-ausgerichtet, in GiB 1). Beide werden ueber
+    // `vspace_map_code_block`/`vspace_map_block` **identisch** abgebildet (VA == PA) -- das ist
+    // eine BEDINGUNG, keine Vorliebe, und sie gehoert deshalb in die Anforderung (E-Rest 3d).
+    // Vorher stand hier `mem_alloc` und danach eine Pruefung: dieselbe Form „einmal fragen, bei
+    // Verfehlung aufgeben", die E-Rest 3b an drei anderen Stellen beseitigt hat.
+    let (floor, ceil) = gib0_zone();
+    let in_gib1 = |b: u64, l: u64| b >= floor && b + l <= ceil;
+    let ca = mem_alloc_below(sz, sz, ceil);
+    let sa = mem_alloc_below(sz, sz, ceil);
     let (cf, sf) = match (ca, sa) {
         (Some(cf), Some(sf)) => (cf, sf),
         (ca, sa) => {
@@ -2717,7 +2804,7 @@ pub fn load_into_pd(
     let mut nrec = 0usize;
     for seg in img.segments() {
         let total = (((seg.memsz as u64) + 4095) & !4095) as usize;
-        let Some(region) = mem_alloc(total as u64, 4096) else {
+        let Some(region) = mem_alloc_kernel(total as u64, 4096) else {
             return cleanup(asid, kbase, &seglist[..nrec], None);
         };
         let pa = region.base(); // MemoryCap-Drop = nur Deskriptor (kein Free); RAM bleibt belegt
@@ -2735,7 +2822,7 @@ pub fn load_into_pd(
         };
         let mut off = 0u64;
         while (off as usize) < total {
-            let mut a3 = || mem_alloc(4096, 4096).map(|c| c.base());
+            let mut a3 = || mem_alloc_kernel(4096, 4096).map(|c| c.base());
             if !hal::mmu::vspace_map_page_at(l2, seg.vaddr + off, pa + off, perm, &mut a3) {
                 return cleanup(asid, kbase, &seglist[..nrec], None);
             }
@@ -2747,13 +2834,13 @@ pub fn load_into_pd(
     }
 
     // 2. Stack (nicht-identity an festes VA-Fenster, EL0-RW).
-    let Some(stack_region) = mem_alloc(LOADED_STACK_BYTES, 4096) else {
+    let Some(stack_region) = mem_alloc_kernel(LOADED_STACK_BYTES, 4096) else {
         return cleanup(asid, kbase, &seglist[..nrec], None);
     };
     let stack_pa = stack_region.base();
     let mut off = 0u64;
     while off < LOADED_STACK_BYTES {
-        let mut a3 = || mem_alloc(4096, 4096).map(|c| c.base());
+        let mut a3 = || mem_alloc_kernel(4096, 4096).map(|c| c.base());
         if !hal::mmu::vspace_map_page_at(l2, LOADED_STACK_VA + off, stack_pa + off, hal::mmu::UserPerm::Rw, &mut a3) {
             // Stack ist alloziert, aber noch NICHT als Reap-Region des Threads vermerkt -> mitfreigeben.
             return cleanup(asid, kbase, &seglist[..nrec], Some((stack_pa, LOADED_STACK_BYTES)));
@@ -2905,7 +2992,9 @@ pub enum MappingKind {
 /// bei nicht-isolierter VSpace oder fehlgeschlagenem Mapping.
 pub fn map_region_into_thread(tid: ThreadId, phys: u64, len: u64, kind: MappingKind) -> bool {
     let asid = (vspace_of(tid.slot()) >> 48) as u16;
-    let mut alloc = || mem_alloc(4096, 4096).map(|c| c.base());
+    // Reine Seitentabellen (E-Rest 3d): der Kernel schreibt sie ueber seine Identitaetskarte,
+    // die PD sieht sie nie -- sie ist der Baum, nicht das Blatt.
+    let mut alloc = || mem_alloc_kernel(4096, 4096).map(|c| c.base());
     let ok = match kind {
         MappingKind::Device { ro } => match vspace_l1(asid) {
             Some(l1) => hal::mmu::vspace_map_device(l1, phys, len, ro, &mut alloc),

@@ -86,9 +86,19 @@ falsch.
   zufaellig groesser war (4G, 6G), landete alles Unbenannte unten. Bei 3G kehrt sich das um, und
   der ganze Ladepfad faellt aus. „Unten zuerst" ist jetzt eine ausgesprochene Politik.
   Zwei eigene Fehler dabei, beide in der Fallenliste unten.
+* **E-Rest 3d zur Haelfte: die Allokationsstellen sind AUFGEZAEHLT, und der Speicher oberhalb
+  4 GiB traegt gemessen.** Die Klassifikation steht als `enum Zone` an EINER Stelle:
+  `KernelOnly` (Kerneltabellen, Kernel-Stacks, Segmente **und** Stacks geladener Programme, alle
+  L3-Tabellen, AP-Stacks) bevorzugt **oben** — bei 3G/6G liegen alle 28 dieser Allokationen
+  oberhalb 4 GiB; `PdMappable` muss tief, und das ist strukturell (`vspace_map_page_at` weist
+  `va >= GIB1_END` ab); drei Stellen tragen eine **harte** Bedingung.
+  **Die Gegenprobe ist der Beleg:** `system::alloc` auf `KernelOnly` gestellt reisst die
+  **Lade-Suite** bei 3G — waehrend die **Hauptsuite gruen bleibt**. Dieselbe Form wie D8/D9/D11.
+  Dabei zwei eigene Vermutungen widerlegt: geladene Segmente brauchen GiB 0 **nicht** (VA und PA
+  sind getrennt), und das Geraet erreicht Speicher oberhalb 4 GiB sehr wohl.
 * **Gemessen:** RAM-Reihe 512M · 2560M · 3G · 4G · 6G (Hauptsuite) und 512M · 3G · 6G
-  (Lade-Suite), alle `== ALL PASS ==`; x86 `RUNS=8` mit identischer Signatur; Host-Tests, Verus,
-  drei Modelltreue-Waechter, Kerngrenze, Typestate gruen.
+  (Lade-Suite), alle `== ALL PASS ==`; x86 `RUNS=8` und aarch64 `RUNS=4` mit identischer
+  Signatur; Host-Tests, Verus, drei Modelltreue-Waechter, Kerngrenze, Typestate gruen.
 
 ## Was am 2026-08-03 dazukam
 
@@ -482,6 +492,15 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   4 GiB gar keinen Speicher gibt — gezaehlt hatte er eine absichtlich uebergrosse Anforderung,
   die NIRGENDS passte. „Unten war kein Platz" und „es wurde oben genommen" sind zwei Aussagen;
   dieselbe Verwechslung wie `rx_used` gegen „Daten sind angekommen".
+* **Eine Messung an einem kaputten Aufbau ist keine Messung.** Der Befund „geladene
+  Programmsegmente brauchen GiB 0" stand einen halben Tag als Tatsache im Kopf -- er kam aus
+  einem Lauf, in dem gleichzeitig ein Selbst-Deadlock steckte. Nach dessen Behebung war er
+  widerlegt: `vspace_map_page_at` nimmt VA und PA getrennt, die Physadresse ist frei. Wer
+  waehrend einer Fehlersuche misst, muss den Aufbau zuerst gesundmachen.
+* **Eine Klassifikation, die nur gegen die HAUPTSUITE geprueft ist, prueft die Haelfte.** Stellt
+  man `system::alloc` auf „reiner Kernel-Speicher", bleibt die Hauptsuite gruen und die
+  Lade-Suite faellt bei 3G aus. Dieselbe Form wie D8/D9/D11: die Suite loest den Fall nicht aus,
+  den sie zu decken scheint.
 * **„Unten zuerst" war jahrelang ein Zufall der Groessenrelation, kein Entwurf.** Best-Fit nimmt
   das kleinste passende Fragment. Solange der Speicherbereich oberhalb 4 GiB zufaellig groesser
   war als der untere, landete alles Unbenannte unten — und Dutzende Stellen kamen ohne

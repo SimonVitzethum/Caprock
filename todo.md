@@ -1302,19 +1302,51 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       Tabellen — eine DMA-Region oder eine isolierte PD *kann* deshalb nur in GiB 0 liegen. Das
       ist eine Eigenschaft des VSpace-Layouts; es zu heben ist eigene Arbeit (s. E-Rest 3d).
 
-- [ ] **E-Rest 3d: die Menge der Stellen, die GiB 0 brauchen, ist nicht aufgezählt.**
-      (2026-08-04, beim Beheben von 3b bemerkt.) `mem_alloc` gibt „unten zuerst" vor, **weil**
-      unbekannt ist, wer alles darauf baut — das ist eine Vorsichtsmaßnahme, keine Zusicherung.
-      Gemessen ist nur, dass es ohne sie bricht (Ladepfad bei 3G). Zu tun: die Bedingung je
-      Aufrufer benennen (wer wird PD-privat abgebildet? wer geht an ein Gerät? wer ist reiner
-      Kernel-Speicher?) und den Rest ausdrücklich **freigeben** — sonst bleibt der obere
-      Speicher praktisch Reserve. Der Ausweichzähler in der `mem`-Zeile sagt heute ehrlich `0x`:
-      der Überlaufpfad ist in QEMU **ungefahren**, seine Wirkung nur host-getestet.
+- [~] **E-Rest 3d ZUR HÄLFTE ERLEDIGT am 2026-08-04: die Stellen sind aufgezählt, der Speicher
+      oberhalb 4 GiB trägt gemessen.** Die Klassifikation steht als Aufzählung an **einer** Stelle
+      (`enum Zone` in `kernel/src/system.rs`), nicht verstreut:
 
-      Der zweite Teil ist das VSpace-Layout selbst: solange `vspace_map_block` identisch abbildet,
-      sind DMA-Regionen und isolierte PDs strukturell auf GiB 0 begrenzt — 1 GiB für alle
-      Mandanten zusammen. Für das Zielbild (viele tausend Prozesse) ist das der bindende Deckel,
-      und er ist mit Allokatorarbeit **nicht** zu heben.
+      | Klasse | wer | Stand |
+      |---|---|---|
+      | `KernelOnly` — bevorzugt **oben** | Thread-/Cap-/IPC-Tabellen, Kernel-Thread-Stacks, Segment- **und** Stack-Frames geladener Programme, alle L3-Seitentabellen, AP- und Sekundärstacks | gemessen: bei 3G/6G liegen **alle 28** oberhalb 4 GiB, beide Suiten grün |
+      | `PdMappable` — muss **tief** | alles identisch Abgebildete (`vspace_map`/`map_frame`/`map_into_thread`) | strukturell: `vspace_map_page_at` weist `va >= GIB1_END` ab; **Gegenprobe gefahren** |
+      | harte Bedingung (`gib0_zone`) | isolierte PD-Region, `spawn_isolated_native`, `alloc_dma_region` | bekommen `None` statt einer unbrauchbaren Adresse |
+
+      **Die Gegenprobe ist der eigentliche Beleg:** stellt man `system::alloc` auf `KernelOnly`,
+      fällt die **Lade-Suite** bei `-m 3G` aus (`drv`/`blkdev`/`dmaiso` — die Treiber-PD wird nie
+      bereit), während die **Hauptsuite grün bleibt**. Eine Klassifikation, die nur die Hauptsuite
+      prüft, hätte den Fehler durchgelassen.
+
+      **Zwei eigene Vermutungen dabei widerlegt, beide gemessen statt geglaubt.** (a) „Geladene
+      Programmsegmente brauchen GiB 0" — falsch: `vspace_map_page_at` nimmt VA und PA getrennt,
+      sie liegen jetzt oben. (b) „Das Gerät erreicht nur GiB 0" — falsch: mit der virtio-Region
+      oberhalb 4 GiB liest `virtio-blk` den Sektor korrekt (`Geraet-DMA=1`). Die erste Vermutung
+      hatte ich am selben Tag noch als Befund notiert; sie stand auf einer Messung, die durch
+      einen anderen Fehler (Selbst-Deadlock) verfälscht war.
+
+      Der Ausweichzähler ist jetzt **zweiteilig** und sagt etwas: bei 512M/2560M weichen 28
+      Kernel-Allokationen nach unten aus (es gibt oben nichts) — der Pfad ist also **gefahren**,
+      nicht bloß vorhanden; bei 3G/4G/6G ist er 0 in beide Richtungen.
+
+      **Offen bleibt (a) der Rest der Aufzählung:** EL0-Kernel-Stacks (`claim_user_kstack`),
+      der EL0-User-Stack von `spawn_user`, die IOMMU-Tabellen (`alloc_zeroed`) und die
+      Sentinel-Page des DMA-Tests stehen weiter konservativ auf `PdMappable`. Für keine ist
+      gezeigt, dass sie oben liegen **darf** — „konservativ" heisst hier ungeprüft, nicht sicher.
+      Die Kernel-Stacks sind dabei der lohnendste Posten: 16 KiB je EL0-Thread, bei tausenden
+      Threads die bestimmende Größe in der knappen Zone.
+
+- [ ] **E-Rest 3d (Rest): der 1-GiB-Deckel liegt im VSpace-Layout, nicht im Allokator.**
+      Solange `vspace_map_block`/`vspace_map_page` **identisch** abbilden (VA == PA) und GiB 1..3
+      jeder isolierten PD an geteilten statischen Tabellen hängen, sind DMA-Regionen und die
+      privaten Regionen isolierter PDs strukturell auf GiB 0 begrenzt — **1 GiB für alle
+      Mandanten zusammen**. Für das Zielbild (viele tausend Prozesse, viele Mandanten je
+      Maschine) ist das der bindende Deckel, und er ist mit Allokatorarbeit **nicht** zu heben.
+
+      Was ihn hebt: eine nicht-identische Abbildung für PD-private Regionen — also derselbe
+      Schritt, den `load_into_pd` schon geht (`vspace_map_page_at` mit getrennter VA und PA).
+      Der Preis ist der Verlust des 2-MiB-Block-Fastpaths (`vspace_map_block`) für diese
+      Regionen: seitenweises Mapping statt eines Blockdeskriptors. Das ist dieselbe Abwägung wie
+      bei A1/`spawn_isolated_colored` und gehört mit B-4.1 zusammen entschieden, nicht einzeln.
 
 - [x] **E-Rest 1 BEHOBEN am 2026-08-04: `iova_window_clear_of_msi` gibt im schwachen Zweig „in Ordnung" zurück, ohne
       urteilen zu können.** (2026-08-03, gemessen) `kernel/src/system.rs:3900`:

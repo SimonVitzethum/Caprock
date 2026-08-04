@@ -105,6 +105,13 @@ falsch.
   Frage dort nicht entscheidbar ist. Gegenprobe gefahren.
   Zwei eigene Annahmen widerlegt: der 2-MiB-Block-Fastpath geht **nicht** verloren (er hing an
   der Ausrichtung der VA, nicht an der Identitaet), und A1/B-4.1 ist gar nicht betroffen.
+* **VA == PA: die BINDUNG, nicht nur die Liste.** Der Grund war ein **freies Argument**
+  (`Va::identity(reason, pa)`) -- nichts hinderte `Va::identity(Mmio, dma_pa)`, und der Waechter
+  haette einen gueltigen Grund gesehen. Jetzt gibt es einen Konstruktor **je Stelle**
+  (`Va::for_*`), kein verwechselbares Argument, und die Engstellen nehmen den Konstruktor als
+  Funktionswert. Dazu `IdentityClass::{Invariant, Debt}`: „die Identitaet IST die Zusicherung"
+  und „behebbar, jemand sollte" standen ununterscheidbar nebeneinander -- die Schuld waere
+  unsichtbar geworden. `IDENTITY_DEBTS = 3` ist eine **Ratsche** und darf nur fallen.
 * **VA == PA steht jetzt im TYP.** `addr::Va` hat **keinen** Konstruktor aus `u64` oder `Pa` --
   der einzige Weg ist `Va::identity(reason, pa)` mit einer Variante des geschlossenen Enums
   `IdentityReason`. Die Liste IST damit der Quelltext. Die erste Fassung war ein Skript mit einer
@@ -524,6 +531,13 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   4 GiB gar keinen Speicher gibt — gezaehlt hatte er eine absichtlich uebergrosse Anforderung,
   die NIRGENDS passte. „Unten war kein Platz" und „es wurde oben genommen" sind zwei Aussagen;
   dieselbe Verwechslung wie `rx_used` gegen „Daten sind angekommen".
+* **Ein waehlbarer Grund ist ein Warnschild, keine Struktur.** `Va::identity(reason, pa)` schloss
+  die Liste der Gruende, aber nicht die Zuordnung Stelle<->Grund: der falsche Grund war weiterhin
+  tippbar, und der Pruefer haette ihn durchgewinkt. Ein Konstruktor je Stelle nimmt das Argument
+  weg, das man verwechseln kann.
+* **Eine Messung, die bei der erwarteten Effektgroesse nicht trennen KANN, ist teure Wandzeit.**
+  Der aarch64-Bisect (0/6 vorher gegen 1/18 nachher) gibt Fisher p ≈ 1 -- bei gleicher Rate
+  liefert ein 6-Lauf-Vorher zu 71 % null Fehlschlaege. Vor dem Start rechnen, nicht danach.
 * **Ein Waechter prueft die EXISTENZ eines Grundes, nie seine WAHRHEIT -- ein falscher Grund ist
   damit unsterblich.** Der Eintrag zu `SYS_MAP` sagte „das ist die ABI"; tatsaechlich traegt
   `sys::MAP` kein Adressargument, und die Identitaet entsteht erst in der Cap-Aufloesung des

@@ -1405,11 +1405,21 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       | vor dem Umbau (`986bb40`) | 6 | **6** |
       | nach dem Umbau (HEAD) | 6 + 12 | **17** |
 
-      **Was das heißt und was nicht.** 0 von 6 schließt eine Rate von ~6 % nicht aus
-      (`0,94⁶ ≈ 0,69`) — die Vorher-Stichprobe ist zu klein, um den Nachher-Wert von rund 1/18 zu
-      widerlegen. Ein Regressionsnachweis ist das **nicht**. Aber meine Entlastung ist damit
-      ebenfalls weg: ich habe keine Messung, die den Umbau entlastet, und hatte behauptet, es
-      gäbe eine.
+      **Diese Messung konnte die Frage NIE beantworten — und das hätte vor dem Start auffallen
+      müssen.** Bei der beobachteten Rate von 1/18 ≈ 5,5 % liefert ein 6-Lauf-Vorher mit rund
+      **71 %** Wahrscheinlichkeit null Fehlschläge, *auch wenn die Rate identisch ist*
+      (`0,945⁶ ≈ 0,71`). Fisher über 0/6 gegen 1/18 gibt **p ≈ 1**. Ich habe also Wandzeit gegen
+      ein Ergebnis getauscht, das unter beiden Hypothesen gleich wahrscheinlich war — eine
+      Messung, die sich wie Erkenntnis anfühlt und keine ist. Für eine Unterscheidung bräuchte
+      es grob **50+ Vorher-Läufe**.
+
+      **Die Lehre gehört zu „billig falsifizieren" dazu:** vor dem Start prüfen, ob der Aufbau
+      bei der *erwarteten Effektgröße* überhaupt trennen kann. Ein Bisect über die Last ist
+      billig im Engineering und teuer in Wandzeit — genau dort lohnt die Rechnung vorher.
+
+      **Was bleibt.** Meine Entlastung („trat auch vorher auf") war unbelegt und ist es
+      weiterhin; die Messung hat sie weder gestützt noch widerlegt. Der Unterschied zu vorher ist
+      nur, dass ich das jetzt **weiss**.
 
       **Was fehlt, und das ist der eigentliche Mangel:** ich habe **kein Protokoll** eines
       Fehlschlags. `tools/`-Nachbau steht (`armfang.sh` im Scratchpad hält das volle Log bei
@@ -1426,17 +1436,56 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       2026-08-04 zweimal aus — beide Male innerhalb eines längeren Sammellaufs, isoliert
       danach 6 von 6 grün (und davor schon 3 von 3). Auch dafür habe ich **kein Protokoll**.
 
-      **Der gemeinsame Nenner ist mein Messaufbau, nicht der Kernel.** Beide Sammelläufe hielten
-      nur `tail -1` fest und warfen die Ausgabe weg. Die Suiten selbst legen bei Abweichung ein
-      volles Log ab (`build/diag/`); meine Schleife darüber tat es nicht. Ein Fehlschlag ohne
-      Protokoll ist ein verlorener Fehlschlag — und bei einer Rate um 1/20 kostet jeder verlorene
-      Stunden.
+      **Die Protokolle waren nicht „von meiner Schleife weggeworfen" — es gab sie nie.** Ich
+      hatte geschrieben, die Suiten legten bei Abweichung selbst ein Log ab und nur meine
+      Sammelschleife habe es verworfen. Nachgesehen (2026-08-05): das stimmt für **keine** der
+      drei. Die Lade-Suite benutzte ein `mktemp` und löschte es am Ende **bedingungslos**; die
+      x86-Suite löschte ihres direkt nach dem Einlesen, lange vor den Prüfungen; die ARM-Suite
+      hob nur bei abweichender **Signatur** eines Wiederholungslaufs etwas auf. In `build/diag/`
+      liegt nichts vom 2026-08-04.
 
-      **Zu tun:** (1) die Sammelläufe halten das volle Log bei Abweichung fest — das ist die
-      Voraussetzung für alles Weitere und kostet zehn Zeilen; (2) das Fangnetz nach `tools/`
-      heben und länger laufen lassen, bis ein Protokoll da ist; (3) beide Stände mit gleicher,
-      größerer Stichprobe messen (je 30+), sonst bleibt die Tabelle oben ein Hinweis und kein
-      Urteil.
+      **Behoben, und die Rückhaltung ist gefahren worden.** Alle drei Suiten legen jetzt bei
+      `fail != 0` das volle Protokoll unter `build/diag/` ab. Der erste Anlauf war dabei selbst
+      ein stummer Prüfer: der Block stand am Dateiende, das Log war zu dem Zeitpunkt aber schon
+      gelöscht — er **konnte** nie feuern. Gegenprobe mit erzwungenem Fehlschlag gefahren: 176
+      Zeilen (x86-Suite) bzw. 193 Zeilen (Lade-Suite) abgelegt.
+
+      **Die Rückhaltung hat sofort gefeuert — und dabei das nächste Loch gezeigt.** Am
+      2026-08-05 fiel `RUNS=8` auf x86 aus; das Kernel-Protokoll lag diesmal vor
+      (`build/diag/ABWEICHUNG-…`, 176 Zeilen). Ergebnis der Auswertung:
+
+      * die **Signatur** des abgelegten Laufs ist **identisch** mit der eines grünen Laufs
+        (diff leer) — der Fehlschlag war also **keine** Signaturabweichung,
+      * es entstand auch kein `abweichung-lauf-N.log`, der Wiederholungsvergleich schlug also
+        ebenfalls nicht an,
+      * womit die durchgefallene Prüfung eine der **abgeleiteten** sein muss (Zeitlimit,
+        `checks`-Abschnitt) — und **deren Zeile steht in der stdout der Suite**, die meine
+        Sammelschleife wieder nur als `tail -1` festhielt.
+
+      **Dieselbe Lücke, eine Ebene höher.** Die Suite bewahrt jetzt das *Kernel*-Protokoll; was
+      fehlt, ist die *Urteilsausgabe*. Drei weitere `RUNS=8`-Durchgänge (24 Läufe) danach waren
+      grün — die Rate liegt also grob bei 1/32, und ohne die Prüfzeile ist nicht einmal bekannt,
+      **welche** Aussage bricht.
+
+      **Zu tun, in dieser Reihenfolge:** (1) Sammelläufe halten die **vollständige stdout** der
+      Suite fest, nicht nur die letzte Zeile — ohne das ist jede weitere Messung wieder blind;
+      (2) das Fangnetz nach `tools/` heben und laufen lassen, bis eine Prüfzeile vorliegt;
+      (3) beide Stände mit **je 50+** Läufen messen — alles darunter kann bei dieser Effektgröße
+      nicht trennen (s. o.).
+
+- [ ] **E-Rest 3f: der Abbau leitet die Adresse NEU HER, statt zu konsumieren, was das Abbilden
+      zurückgab.** (2026-08-05.) `unmap_dma_from_thread(tid, phys, len)` nimmt dieselben rohen
+      Werte noch einmal entgegen und rechnet die VA erneut aus. Dass er dabei dieselbe Achse
+      trifft, hält heute ein **Konstruktorname** (`Va::for_dma_window` an beiden Stellen) und der
+      Wächter, der ihn zählt — also Auffindbarkeit, nicht Unmöglichkeit.
+
+      **Die strukturelle Fassung:** das Abbilden gibt ein **Handle** zurück, der Abbau konsumiert
+      genau dieses Handle. Dann ist die Adresse im Teardown nie wieder ein freier Wert, und die
+      Asymmetrie ist **unkonstruierbar** statt auffindbar. Das passt zu den vorhandenen
+      Teardown-Token (ext-37) und zum `Owned<T>`-Typestate der virtio-Crate — dieselbe Bauform,
+      eine Ebene tiefer.
+
+      Reihenfolge: nach E-Rest 3e (a), weil der Fenster-Umbau die Signatur ohnehin anfasst.
 
 - [ ] **E-Rest 3e: DMA-Regionen hängen an GiB 0 — und das sind ZWEI Fragen, keine.**
       (2026-08-04, beim VA==PA-Durchgang neu zerlegt; die erste Fassung dieses Eintrags faltete
@@ -1454,14 +1503,22 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       **Politik des Allokators**, die beim IOMMU-Detect gewählt gehört, und keine Eigenschaft der
       Region.
 
-      **Was wirklich fehlt, ist die Ausdrückbarkeit:** eine `dma_mask` gehört in die Cap bzw. in
-      den Angebotseintrag, damit die Einschränkung überhaupt formulierbar ist, statt in eine
-      Basisadresse eingebacken zu sein. Heute meldet die Suite sie als Abwesenheit
-      (`dmawin : Geraete-ohne-deklarierte-Adressbreite=1`) — das ist ehrlich, aber es ist ein
-      **Zähler für eine fehlende Angabe** und keine Angabe. Solange sie fehlt, ist jede Wahl der
-      Basisadresse ein Rateschritt: unten liegen heisst „für alle Geräte sicher", und das ist
-      dieselbe Sorte Vorsichtsmaßnahme wie „unten zuerst" aus E-Rest 3b — sie kostet die knappe
-      Zone und belegt nichts.
+      **Was wirklich fehlt, ist die Ausdrückbarkeit — und sie gehört an die GERÄTE-Seite.** Eine
+      `dma_mask` in der **Memory**-Cap wäre dieselbe Faltung eine Achse weiter: die 32-Bit-Grenze
+      ist eine Eigenschaft des **Geräts**, nicht der Speicherregion. Stünde sie in der
+      Memory-Cap, entstünde Speicher, der „für 32-Bit-Geräte" ist und für nichts anderes taugt —
+      ein Angebot, das die Begrenzung seines Konsumenten trägt. (So stand es bis zum 2026-08-05
+      in diesem Eintrag; falsch.)
+
+      Richtig: die Einschränkung gehört an die **Geräte-Cap** bzw. an die DMA-Domäne, und die
+      Zuteilung ist dann ein **Join** aus Regionsangebot und Gerätebeschränkung — dieselbe Form
+      wie „Farbe UND Zone in einer Entscheidung" (E-Rest 3b) und wie Farbe+NUMA (Z8).
+
+      Heute meldet die Suite die Angabe als Abwesenheit
+      (`dmawin : Geraete-ohne-deklarierte-Adressbreite=1`) — ehrlich, aber ein **Zähler für eine
+      fehlende Angabe** und keine Angabe. Solange sie fehlt, ist jede Wahl der Basisadresse ein
+      Rateschritt: unten liegen heisst „für alle Geräte sicher", dieselbe Sorte Vorsichtsmaßnahme
+      wie „unten zuerst" aus E-Rest 3b — sie kostet die knappe Zone und belegt nichts.
 
       Reihenfolge: **(b) vor (a)**. (a) ohne (b) wäre ein Vertrauensvorschuss an unbekannte
       Hardware — die Region läge dann oben, weil es geht, nicht weil das Gerät es kann.

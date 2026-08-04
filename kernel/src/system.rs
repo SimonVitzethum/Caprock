@@ -540,7 +540,7 @@ impl SchedOps for KernelSched {
         };
         vspace_map(
             asid,
-            crate::addr::IdentityReason::SyscallMapByCap,
+            crate::addr::Va::for_syscall_map,
             crate::addr::Pa::new(base),
             len,
             perm,
@@ -553,7 +553,7 @@ impl SchedOps for KernelSched {
         }
         vspace_unmap(
             asid,
-            crate::addr::IdentityReason::SyscallMapByCap,
+            crate::addr::Va::for_syscall_map,
             crate::addr::Pa::new(base),
             len,
         )
@@ -601,7 +601,7 @@ impl SchedOps for KernelSched {
         // beiden Faellen dieselbe, der Grund also der schwaechere der beiden.
         vspace_unmap(
             asid,
-            crate::addr::IdentityReason::DeviceMmioWindow,
+            crate::addr::Va::for_mmio_window,
             crate::addr::Pa::new(base),
             len,
         )
@@ -2179,18 +2179,18 @@ fn vspace_l1(asid: u16) -> Option<u64> {
 /// Block-Fastpath; sonst seitenweise (L3 wird bei Bedarf aus `MEM` angelegt).
 fn vspace_map(
     asid: u16,
-    reason: crate::addr::IdentityReason,
+    als_va: fn(crate::addr::Pa) -> crate::addr::Va,
     pa: crate::addr::Pa,
     len: u64,
     perm: hal::mmu::UserPerm,
 ) -> bool {
-    vspace_map_masked(asid, reason, pa, len, perm, None)
+    vspace_map_masked(asid, als_va, pa, len, perm, None)
 }
 
 /// Wie [`vspace_map`], aber die bei Bedarf angelegten L3-Tabellen kommen aus `mask` (todo A1).
 fn vspace_map_masked(
     asid: u16,
-    reason: crate::addr::IdentityReason,
+    als_va: fn(crate::addr::Pa) -> crate::addr::Va,
     pa: crate::addr::Pa,
     len: u64,
     perm: hal::mmu::UserPerm,
@@ -2200,7 +2200,11 @@ fn vspace_map_masked(
     // danach mit `base`, weil die HAL an dieser Stelle EINEN Wert nimmt; das ist der Sinn der
     // identischen Abbildung. Der Unterschied zu vorher ist, dass die Gleichsetzung eine
     // benannte Handlung ist und keine Zeile, die man beim Lesen ueberspringt.
-    let base = crate::addr::Va::identity(reason, pa).raw();
+    // **Der Aufrufer reicht den KONSTRUKTOR, nicht einen Grund.** Ein Grund waere ein Wert, den
+    // man verwechseln kann (`Va::identity(Mmio, dma_pa)` haette der Waechter durchgewinkt); ein
+    // Konstruktor traegt seine Stelle im Namen. Die Bindung Stelle<->Grund ist damit typgeprueft
+    // statt disziplingeprueft.
+    let base = als_va(pa).raw();
     let Some(l2) = vspace_l2(asid) else {
         return false;
     };
@@ -2264,13 +2268,13 @@ fn vspace_map_user_region(
 /// 4-KiB-Granularität: Region `[base, base+len)` aus der VSpace `asid` entfernen.
 fn vspace_unmap(
     asid: u16,
-    reason: crate::addr::IdentityReason,
+    als_va: fn(crate::addr::Pa) -> crate::addr::Va,
     pa: crate::addr::Pa,
     len: u64,
 ) -> bool {
     // Muss dieselbe Achse benutzen wie das Mappen, sonst raeumt es an der falschen Stelle ab --
     // deshalb dieselbe benannte Umwandlung und nicht etwa ein roher Wert.
-    let base = crate::addr::Va::identity(reason, pa).raw();
+    let base = als_va(pa).raw();
     let Some(l2) = vspace_l2(asid) else {
         return false;
     };
@@ -2308,7 +2312,7 @@ pub fn map_into_thread(tid: ThreadId, base: u64, len: u64, perm_code: u8) -> boo
     };
     vspace_map(
         asid,
-        crate::addr::IdentityReason::KernelSetupMapping,
+        crate::addr::Va::for_kernel_setup,
         crate::addr::Pa::new(base),
         len,
         perm,
@@ -2327,7 +2331,7 @@ pub fn unmap_into_thread(tid: ThreadId, base: u64, len: u64) -> bool {
     }
     vspace_unmap(
         asid,
-        crate::addr::IdentityReason::KernelSetupMapping,
+        crate::addr::Va::for_kernel_setup,
         crate::addr::Pa::new(base),
         len,
     )
@@ -3141,20 +3145,14 @@ pub fn map_region_into_thread(tid: ThreadId, phys: u64, len: u64, kind: MappingK
     let ok = match kind {
         MappingKind::Device { ro } => match vspace_l1(asid) {
             Some(l1) => {
-                let va = crate::addr::Va::identity(
-                    crate::addr::IdentityReason::DeviceMmioWindow,
-                    crate::addr::Pa::new(phys),
-                );
+                let va = crate::addr::Va::for_mmio_window(crate::addr::Pa::new(phys));
                 hal::mmu::vspace_map_device(l1, va.raw(), len, ro, &mut alloc)
             }
             None => return false, // nicht isoliert / ungültige ASID
         },
         MappingKind::Dma { coherent } => match vspace_l2(asid) {
             Some(l2) => {
-                let va = crate::addr::Va::identity(
-                    crate::addr::IdentityReason::DeviceDmaWindow,
-                    crate::addr::Pa::new(phys),
-                );
+                let va = crate::addr::Va::for_dma_window(crate::addr::Pa::new(phys));
                 hal::mmu::vspace_map_dma(l2, va.raw(), len, coherent, &mut alloc)
             }
             None => return false,
@@ -4882,11 +4880,7 @@ pub fn unmap_dma_from_thread(tid: ThreadId, phys: u64, len: u64) -> bool {
     // Engstelle und bildete identisch ab, ohne dass irgendwo stand warum. Raeumte sie auf einer
     // anderen Achse ab als das Mappen, bliebe eine Abbildung stehen -- und ein DMA-Fenster, das
     // beim Abbau stehenbleibt, ist genau das, was `dma_audit` Code 8 meldet.
-    let base = crate::addr::Va::identity(
-        crate::addr::IdentityReason::DeviceDmaWindow,
-        crate::addr::Pa::new(phys),
-    )
-    .raw();
+    let base = crate::addr::Va::for_dma_window(crate::addr::Pa::new(phys)).raw();
     let mut p = base;
     let mut ok = true;
     while p < base + len {
@@ -6275,8 +6269,7 @@ mod pcie_arm {
         // Kein Subjekt beteiligt: der Kernel bildet sich selbst das ECAM-Fenster ein, um zu
         // enumerieren. Der Grund steht trotzdem hin -- er unterscheidet diese Stelle von einer,
         // an der eine PD etwas zu sehen bekaeme.
-        let _ = crate::addr::Va::identity(
-            crate::addr::IdentityReason::KernelGlobalDeviceWindow,
+        let _ = crate::addr::Va::for_kernel_global_window(
             crate::addr::Pa::new((hal::pcie::ECAM_GIB as u64) << 30),
         );
         hal::mmu::map_device_block_global(hal::pcie::ECAM_GIB);

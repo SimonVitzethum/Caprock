@@ -223,7 +223,7 @@ if [ -z "$OUT" ]; then
     echo "== Das ist KEIN Testergebnis -- Aufbau pruefen (QEMU? Zeitlimit zu knapp?) =="
     rm -f "$LOG1"; exit 2
 fi
-rm -f "$LOG1"
+# `$LOG1` bleibt bis zum Schluss liegen -- s. die Begruendung in test-qemu-x86.sh (D12).
 
 echo "$OUT"
 echo "== checks =="
@@ -400,5 +400,15 @@ if [ "$RUNS" -gt 1 ]; then
     fi
 fi
 
+# **Bei einem Fehlschlag das volle Protokoll BEHALTEN** (D12, 2026-08-05).
+#
+# Die Wiederholungsmessung legt bei abweichender SIGNATUR ein Log ab -- aber nur dann. Faellt ein
+# Lauf durch, waehrend die Signatur haelt (oder laeuft die Suite mit RUNS=1), blieb bisher nichts
+# zurueck. Genau so gingen am 2026-08-04 zwei Fehlschlaege verloren.
+if [ "$fail" != 0 ] && [ -s "${LOG1:-}" ]; then
+    mkdir -p build/diag
+    ZIEL="build/diag/ABWEICHUNG-$(date +%Y%m%d-%H%M%S).log"
+    cp -f "$LOG" "$ZIEL" 2>/dev/null && echo "  (volles Log: $ZIEL)"
+fi
 echo "== $([ $fail -eq 0 ] && echo 'ALL PASS' || echo 'FAILURES') =="
 exit $fail

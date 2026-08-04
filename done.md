@@ -81,6 +81,55 @@ prueft.
 
 ---
 
+## VA == PA, dritter Anlauf: die BINDUNG, nicht nur die Liste (2026-08-05)
+
+Der zweite Anlauf schloss die *Liste* (ein geschlossenes Enum), aber nicht die *Bindung*: `reason`
+war ein **freies Argument** von `Va::identity(reason, pa)`. Nichts hinderte einen Aufrufer an
+`Va::identity(Mmio, dma_pa)` -- der Waechter haette einen gueltigen Grund gesehen und geschwiegen.
+**Solange der Grund waehlbar ist, ist die bequemste Variante wieder die falsche.**
+
+**Behoben durch einen Konstruktor JE STELLE:** `Va::for_syscall_map`, `for_kernel_setup`,
+`for_mmio_window`, `for_dma_window`, `for_kernel_global_window`. Kein Grund-Argument mehr, das man
+verwechseln kann -- der Konstruktor traegt seine Stelle im Namen. Die beiden Engstellen
+(`vspace_map_masked`, `vspace_unmap`) nehmen den **Konstruktor als Funktionswert** statt eines
+Grundes; die Zuordnung Stelle<->Grund ist damit typgeprueft statt disziplingeprueft.
+
+Der Waechter prueft dazu die **Stelligkeit**: jeder Konstruktor wird ein- **oder zweimal**
+benutzt. Zwei ist der Normalfall und richtig -- Abbilden und Gegenstueck muessen dieselbe Achse
+nehmen, und genau das war der `unmap_dma_from_thread`-Befund. Die erste Fassung dieser Pruefung
+verlangte „hoechstens einmal" und schlug prompt bei allen fuenf an; sie hatte das Gegenstueck
+nicht mitgedacht.
+
+**Invariante und Schuld sind jetzt getrennt.** `IdentityReason` faltete zwei Dinge in einen
+Begriff: „die Identitaet IST hier die Zusicherung, sie faellt nie" (MMIO, globale Kernelfenster)
+und „die Identitaet ist eine Entscheidung, behebbar ohne ABI-Bruch" (`SYS_MAP`, Kernel-Setup,
+DMA-Fenster). Dieselbe Faltung, gegen die der ganze Umbau geht -- und die Folge waere gewesen,
+dass die **Schuld unsichtbar** wird: wer die Liste in einem halben Jahr liest, saehe ueberall
+einen Grund und schloesse, alles sei nach Absicht.
+
+`IdentityClass::{Invariant, Debt}` trennt sie, und `IDENTITY_DEBTS = 3` ist eine **Ratsche**: der
+Waechter vergleicht gegen die Zahl, und sie darf nur fallen. Eine neue Schuld schlaegt an; eine
+behobene verlangt, dass die Zahl nachgezogen wird (sie faellt nicht von selbst).
+
+**Die Protokolle waren nicht weggeworfen -- es gab sie nie.** Ich hatte geschrieben, die Suiten
+legten bei Abweichung selbst ein Log ab und nur meine Sammelschleife habe es verworfen.
+Nachgesehen: das stimmt fuer **keine** der drei. Die Lade-Suite loeschte ihr `mktemp` am Ende
+bedingungslos, die x86-Suite ihres direkt nach dem Einlesen (lange vor den Pruefungen), die
+ARM-Suite hob nur bei abweichender Signatur eines Wiederholungslaufs etwas auf.
+
+Alle drei legen jetzt bei `fail != 0` das volle Protokoll unter `build/diag/` ab. **Der erste
+Anlauf war dabei selbst ein stummer Pruefer**: der Block stand am Dateiende, das Log war zu dem
+Zeitpunkt aber schon geloescht -- er konnte nie feuern. Gegenprobe mit erzwungenem Fehlschlag
+gefahren: 176 bzw. 193 Zeilen abgelegt.
+
+Und die Rueckhaltung hat sofort geliefert: der naechste `RUNS=8`-Ausfall hinterliess ein
+Protokoll, dessen **Signatur mit der eines gruenen Laufs identisch** ist. Damit ist bekannt, was
+es NICHT war (Signaturabweichung, Wiederholungsvergleich) -- und dass die durchgefallene Pruefung
+in der **stdout der Suite** steht, die meine Sammelschleife weiterhin nur als `tail -1` festhielt.
+Dieselbe Luecke, eine Ebene hoeher. Steht als D12.
+
+---
+
 ## VA == PA: die Annahme steht jetzt im TYP, nicht in einer Liste daneben (2026-08-04)
 
 **Die erste Fassung war disziplinarisch und hat sich binnen Stunden selbst widerlegt.** Ein

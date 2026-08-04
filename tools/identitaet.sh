@@ -55,15 +55,43 @@ echo "== Identitaets-Annahmen (VA == PA): der Typ, nicht die Textflaeche =="
 # `IdentityReason` eine Bitte und keine Bedingung.
 ADDR="kernel/src/addr.rs"
 [ -f "$ADDR" ] || { echo "FEHLER: $ADDR fehlt -- der Waechter liest ins Leere." >&2; exit 2; }
-if grep -qE "impl +From<u64> +for +Va|impl +From<Pa> +for +Va|fn +new\(.*\) *-> *Va|pub +const +fn +new" <<<"$(sed -n '/impl Va {/,/^}/p' "$ADDR")"; then
-    nok "es gibt einen zweiten Konstruktor fuer \`Va\` -- die Gruende sind damit unverbindlich."
+if grep -qE "impl +From<u64> +for +Va|impl +From<Pa> +for +Va|pub +const +fn +new" <<<"$(sed -n '/impl Va {/,/^}/p' "$ADDR")"; then
+    nok "es gibt einen allgemeinen Konstruktor fuer \`Va\` -- die Bindung Stelle<->Grund waere damit unverbindlich."
 else
-    ok "\`Va\` hat keinen Konstruktor aus \`u64\`/\`Pa\` ausser \`identity(reason, pa)\`"
+    ok "\`Va\` hat keinen allgemeinen Konstruktor aus \`u64\`/\`Pa\`"
 fi
-# Und die drei benannten Wege gibt es wirklich (sonst prueft (1) eine leere Menge).
-for f in "pub const fn identity" "pub const fn window" "pub const fn link"; do
-    grep -q "$f" "$ADDR" || nok "der benannte Weg \`$f\` fehlt -- \`Va\` waere unbenutzbar oder anders gebaut."
+# **Kein WAEHLBARER Grund mehr.** `Va::identity(reason, pa)` war ein freies Argument: nichts
+# hinderte `Va::identity(Mmio, dma_pa)`, und der Waechter haette einen gueltigen Grund gesehen und
+# geschwiegen. Es gibt jetzt einen Konstruktor JE STELLE.
+if grep -q "pub const fn identity" "$ADDR"; then
+    nok "\`Va::identity(reason, pa)\` existiert wieder -- ein waehlbarer Grund ist ein Warnschild, keine Bindung."
+else
+    ok "kein waehlbarer Grund: es gibt einen Konstruktor je Stelle (\`Va::for_*\`), kein Grund-Argument"
+fi
+KONSTRUKTOREN="$(grep -oE 'pub const fn for_[a-z_]+' "$ADDR" | sed 's/pub const fn //' | sort -u)"
+[ -n "$KONSTRUKTOREN" ] || nok "keine \`Va::for_*\`-Konstruktoren gefunden -- der Umbau ist nicht da, wo der Waechter ihn sucht."
+for f in "pub const fn window" "pub const fn link"; do
+    grep -q "$f" "$ADDR" || nok "der benannte Weg \`$f\` fehlt -- \`Va\` waere anders gebaut als angenommen."
 done
+# Jeder Konstruktor bezeichnet eine STELLE, und eine Stelle hat hoechstens zwei Haelften: das
+# Abbilden und sein Gegenstueck. **Genau zwei ist der Normalfall und richtig so** -- der Befund an
+# `unmap_dma_from_thread` war ja, dass der Abbau eine ANDERE Achse benutzte als das Mappen.
+# Geprueft wird deshalb nach unten (ein Grund ohne Benutzung ist eine Fiktion) und nach oben
+# (mehr als zwei hiesse: mehrere Stellen teilen sich einen Grund, und die Bindung waere lose).
+#
+# Die erste Fassung dieser Pruefung verlangte „hoechstens einmal" und schlug prompt bei ALLEN an
+# -- sie hatte das Gegenstueck nicht mitgedacht.
+schief=""
+for k in $KONSTRUKTOREN; do
+    z=$(grep -rho "Va::$k" kernel/src --include=*.rs | wc -l)
+    [ "$z" -ge 1 ] || schief="$schief $k(unbenutzt)"
+    [ "$z" -le 2 ] || schief="$schief $k($z)"
+done
+if [ -n "$schief" ]; then
+    nok "Konstruktor(en) nicht bei ein oder zwei Benutzungen:$schief"
+else
+    ok "jeder der $(echo "$KONSTRUKTOREN" | wc -w) Stellen-Konstruktoren wird ein- oder zweimal benutzt (Abbilden + Gegenstueck)"
+fi
 
 # -- 2. Traegt jede Variante einen Grund? ---------------------------------------------------------
 #
@@ -88,6 +116,27 @@ if [ -n "$ohne_grund" ]; then
     nok "Variante(n) ohne Grundtext:$ohne_grund"
 else
     ok "alle $(echo "$VARIANTEN" | wc -w) Varianten von \`IdentityReason\` tragen einen Grund"
+fi
+if true; then :
+fi
+
+# -- 1b. Die SCHULD-Ratsche ----------------------------------------------------------------------
+#
+# `IdentityReason` faltete anfangs zwei Dinge in einen Begriff: „die Identitaet IST hier die
+# Zusicherung" und „die Identitaet ist eine Entscheidung, behebbar". Damit waere die Schuld
+# unsichtbar geworden -- wer die Liste liest, saehe ueberall einen Grund und schloesse, alles sei
+# nach Absicht. Jetzt traegt jede Variante eine **Klasse**, und die Zahl der Schulden darf nur
+# fallen.
+SCHULDEN="$(sed -n '/pub const fn class(self)/,/^    }/p' "$ADDR" | grep -c 'IdentityClass::Debt')"
+RATSCHE="$(grep -oE 'pub const IDENTITY_DEBTS: usize = [0-9]+' "$ADDR" | grep -oE '[0-9]+$')"
+if [ -z "$RATSCHE" ]; then
+    nok "die Ratsche \`IDENTITY_DEBTS\` fehlt -- die Schuldzahl waere eine Beobachtung ohne Schranke."
+elif [ "$SCHULDEN" -gt "$RATSCHE" ]; then
+    nok "$SCHULDEN Schuld-Varianten, erlaubt sind $RATSCHE. Eine Identitaets-Schuld ist dazugekommen."
+elif [ "$SCHULDEN" -lt "$RATSCHE" ]; then
+    nok "$SCHULDEN Schuld-Varianten bei einer Ratsche von $RATSCHE -- eine ist behoben. \`IDENTITY_DEBTS\` nachziehen (die Ratsche darf nur FALLEN, und sie faellt nicht von selbst)."
+else
+    ok "$SCHULDEN von $(echo "$VARIANTEN" | wc -w) Identitaets-Annahmen sind SCHULD, und die Ratsche steht auf genau dieser Zahl"
 fi
 
 # -- 3. Rufen nur die Engstellen die identisch abbildenden HAL-Funktionen? ------------------------
@@ -115,11 +164,12 @@ pruefe_aufrufer() {
             case " $ENGSTELLEN " in
                 *" $umgebung "*) ;;
                 *)
-                    # Erlaubt bleibt, was unmittelbar von einem `Va::identity` begleitet wird
-                    # (die beiden globalen Kernel-Fenster stehen so da).
+                    # Erlaubt bleibt, was unmittelbar von einem Stellen-Konstruktor (`Va::for_*`)
+                    # begleitet wird -- die beiden globalen Kernel-Fenster und der DMA-Abbau
+                    # stehen so da.
                     von=$(( nr > 9 ? nr - 9 : 1 ))
                     fenster="$( (cd "$wurzel" && sed -n "${von},${nr}p" "$datei") )"
-                    grep -q "Va::identity" <<<"$fenster" || ausserhalb+=("$datei:$nr ($f, in fn $umgebung)")
+                    grep -qE "Va::for_[a-z_]+" <<<"$fenster" || ausserhalb+=("$datei:$nr ($f, in fn $umgebung)")
                     ;;
             esac
         done < <(cd "$wurzel" && grep -rn "hal::mmu::$f(" kernel/src --include=*.rs 2>/dev/null | cut -d: -f1,2)
@@ -127,7 +177,7 @@ pruefe_aufrufer() {
 }
 pruefe_aufrufer "$ROOT"
 if [ "${#ausserhalb[@]}" -gt 0 ]; then
-    nok "identisch abbildende HAL-Aufrufe ausserhalb der Engstellen und ohne \`Va::identity\`:"
+    nok "identisch abbildende HAL-Aufrufe ausserhalb der Engstellen und ohne \`Va::for_*\`:"
     printf '            %s\n' "${ausserhalb[@]}" >&2
 else
     ok "jeder Aufruf einer identisch abbildenden HAL-Funktion steht in einer Engstelle oder bei einem benannten Grund ($(echo "$FUNKTIONEN" | wc -w) Funktionen aus der HAL gelesen)"

@@ -636,7 +636,25 @@ else
     echo "  FAIL: Negativfall 5 liess sich nicht bauen"; fail=1
 fi
 
-rm -f "$LOG"
+# **Bei einem Fehlschlag das volle Protokoll BEHALTEN** (D12, 2026-08-05).
+#
+# Bis hierher loeschte diese Zeile das Log bedingungslos -- und zwar auch dann, wenn der Lauf
+# durchgefallen war. Am 2026-08-04 fiel die Suite bei `-m 512M` zweimal aus; isoliert danach
+# 6 von 6 gruen. Untersuchen liess sich keiner der beiden, weil das Protokoll in dem Moment weg
+# war, in dem es gebraucht wurde. Ich hatte das damals meiner Sammelschleife angelastet -- falsch:
+# die anderen beiden Suiten legen bei Abweichung ein Log unter `build/diag/` ab, DIESE hatte den
+# Mechanismus nie.
+#
+# Bei einer Rate um 1/20 kostet jeder verlorene Fehlschlag Stunden. Ein Testaufbau, der seinen
+# eigenen Befund wegwirft, misst zwar -- aber er laesst nichts zurueck, woran man arbeiten kann.
+if [ "$fail" = 0 ]; then
+    rm -f "$LOG"
+else
+    mkdir -p build/diag
+    ZIEL="build/diag/load-abweichung-$(date +%Y%m%d-%H%M%S)-${RAM}.log"
+    cp -f "$LOG" "$ZIEL" 2>/dev/null && echo "  (volles Log: $ZIEL)"
+    rm -f "$LOG"
+fi
 rm -f "$BLK_IMG"
 if [ "$fail" = 0 ]; then echo "== ALL PASS =="; else echo "== FAILURES =="; fi
 exit "$fail"

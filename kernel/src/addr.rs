@@ -85,57 +85,111 @@ impl Iova {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct Va(u64);
 
-/// **Warum an dieser Stelle VA == PA gelten darf.**
+/// **Wie belastbar die Identität an einer Stelle ist** — Invariante oder Schuld.
 ///
-/// Jede Variante ist eine Entscheidung mit Begründung, kein Etikett. Die Frage, die sie
-/// beantworten muss, lautet: *warum gilt die Identität hier, und was wäre die Folge, wenn sie
-/// fällt?* Wo eine Variante zusätzlich **falsifizierbar** ist, steht der Falsifikator dabei —
-/// ein Grund, den niemand widerlegen kann, überlebt seinen Autor auch dann, wenn er falsch ist.
+/// Die erste Fassung hatte nur *einen* Begriff („Grund"), und damit standen zwei völlig
+/// verschiedene Dinge ununterscheidbar nebeneinander: „die Identität IST hier die Zusicherung,
+/// sie fällt nie" und „die Identität ist eine Entscheidung des Kernels, behebbar ohne
+/// ABI-Bruch". Das ist dieselbe Faltung, gegen die dieser ganze Umbau geht — ein Feld, zwei
+/// Bedeutungen.
+///
+/// Die Folge wäre gewesen, dass die **Schuld unsichtbar** wird: wer die Liste in einem halben
+/// Jahr liest, sieht überall einen Grund und schliesst, alles sei nach Absicht.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IdentityClass {
+    /// **Invariante.** Die Identität ist hier die Zusicherung selbst; sie aufzugeben hiesse, eine
+    /// Eigenschaft aufzugeben, die jemand braucht.
+    Invariant,
+    /// **Schuld.** Die Identität ist eine Bequemlichkeit oder eine Altlast — behebbar, und
+    /// jemand sollte es tun. Der Wächter zählt diese Fälle, und die Zahl darf nur **fallen**.
+    Debt,
+}
+
+/// **Warum an dieser Stelle VA == PA gilt — und ob das so bleiben muss.**
+///
+/// **Nicht mehr als freies Argument.** Die erste Fassung nahm den Grund als Parameter von
+/// `Va::identity(reason, pa)`. Das schloss die *Liste*, aber nicht die *Bindung*: nichts hinderte
+/// einen Aufrufer an `Va::identity(Mmio, dma_pa)`, und der Wächter hätte einen gültigen Grund
+/// gesehen und geschwiegen. Solange der Grund wählbar ist, ist die bequemste Variante wieder die
+/// falsche.
+///
+/// Deshalb gibt es **einen Konstruktor je Stelle** (`Va::for_*` unten) und **kein** Argument, das
+/// man verwechseln kann. Dieses Enum bleibt als Klassifikation für den Wächter und als Ort, an
+/// dem die Begründung steht.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IdentityReason {
-    /// **`SYS_MAP`/`SYS_UNMAP`.** Der Aufrufer nennt eine **Cap**, keine Adresse — die ABI trägt
-    /// kein Adressargument (`sel4lake_abi::sys::MAP` liest `x1` als Cap-Index; die Basis kommt
-    /// aus `ObjectKind::Memory(r).base`, also aus der Cap-Auflösung **im Kernel**).
+    /// **`SYS_MAP`/`SYS_UNMAP`** — Klasse: **Schuld**.
     ///
-    /// **Damit liegt die Identität NICHT in der ABI, sondern in einer Entscheidung des Kernels**
-    /// — er nimmt die PA des Frames als VA. Das ist behebbar, ohne die ABI anzufassen: der
-    /// Rückgabewert nennt dem Aufrufer die Adresse ohnehin (`reg::MSG0`), er muss sie also nicht
-    /// vorher kennen. Bis zum 2026-08-04 stand hier „das ist die ABI" — eine falsche Ursache,
-    /// die den Punkt als unbehebbar erscheinen liess.
+    /// Der Aufrufer nennt eine **Cap**, keine Adresse: `sel4lake_abi::sys::MAP` trägt kein
+    /// Adressargument, und die Basis kommt aus `ObjectKind::Memory(r).base`, also aus der
+    /// Cap-Auflösung **im Kernel**. Die Identität liegt damit in einer Entscheidung des Kernels
+    /// und ist behebbar, **ohne die ABI anzufassen** — der Rückgabewert nennt dem Aufrufer die
+    /// Adresse ohnehin (`reg::MSG0`), er muss sie nicht vorher kennen.
     ///
-    /// **Falsifikator:** `tools/identitaet.sh` prüft, dass der `SYS_MAP`-Zweig **keine** Adresse
-    /// aus dem Frame liest. Träte eine auf, wäre dieser Grund widerlegt.
+    /// Bis zum 2026-08-04 stand hier „das ist die ABI". Eine falsche Ursache, die den Punkt als
+    /// unbehebbar erscheinen liess.
+    ///
+    /// **Falsifikator** (`tools/identitaet.sh`): der `SYS_MAP`-Zweig darf **keine** Adresse aus
+    /// dem Frame lesen. Träte eine auf, wäre dieser Grund widerlegt.
     SyscallMapByCap,
-    /// **Kernel-seitiges Einblenden für Tests/Demos** (`map_into_thread`). Der Kernel hält die
-    /// PA bereits in der Hand und blendet sie einem Thread ein; ein VA-Fenster wäre möglich, hier
-    /// aber ohne Nutzen, weil beide Seiten derselbe Code sind. Kein Subjekt nennt die Adresse.
+    /// **Kernel-seitiges Einblenden für Tests/Demos** (`map_into_thread`) — Klasse: **Schuld**.
+    /// Ein VA-Fenster wäre möglich, hier aber ohne Nutzen, weil beide Seiten derselbe Code sind.
+    /// Kein Subjekt nennt die Adresse.
     KernelSetupMapping,
-    /// **MMIO-Registerfenster eines Geräts.** Hier ist die Identität die **Zusicherung selbst**:
-    /// ein Treiber rechnet mit Adressen aus der PCI-Enumeration, und die sind physisch (CPU-Sicht,
-    /// [`Pa`]). Gäbe man ihm eine andere VA, müsste er sie erst erfahren — und die BAR-Werte, die
-    /// er im Konfigurationsraum liest, wären falsch.
+    /// **MMIO-Registerfenster eines Geräts** — Klasse: **Invariante**.
+    /// Ein Treiber rechnet mit Adressen aus der PCI-Enumeration, und die sind physisch
+    /// (CPU-Sicht, [`Pa`]). Gäbe man ihm eine andere VA, wären die BAR-Werte, die er im
+    /// Konfigurationsraum liest, falsch.
     DeviceMmioWindow,
-    /// **DMA-Fenster einer Treiber-PD.** Getrennt von [`Self::DeviceMmioWindow`], weil hier
-    /// **zwei** Achsen im Spiel sind: die PD sieht die Region unter einer VA, das **Gerät** unter
-    /// einer [`Iova`]. Dass die CPU-seitige Abbildung identisch ist, ist eine Eigenschaft der
-    /// **Abbildung**; dass die Region tief liegen muss, wäre eine der **Allokation** (32-Bit-
-    /// Geräte) — s. `todo.md` E-Rest 3e. Die beiden in einen Eintrag zu falten war der Fehler der
-    /// ersten Fassung dieser Liste.
+    /// **DMA-Fenster einer Treiber-PD** — Klasse: **Schuld** (E-Rest 3e (a)).
+    /// Getrennt von [`Self::DeviceMmioWindow`], weil hier **zwei** Achsen im Spiel sind: die PD
+    /// sieht die Region unter einer VA, das **Gerät** unter einer [`Iova`]. Die CPU-seitige
+    /// Abbildung identisch zu halten ist eine Bequemlichkeit; das Fenster löst sie.
     DeviceDmaWindow,
-    /// **Globale Kernel-Abbildung eines Gerätefensters** (ECAM, BAR-Fenster beim Hochlauf). Kein
-    /// Subjekt beteiligt: der Kernel bildet sich selbst ein Registerfenster ein, um zu
-    /// enumerieren. „Identisch" heisst hier nur „in der Identitätskarte des Kernels".
+    /// **Globale Kernel-Abbildung eines Gerätefensters** (ECAM, BAR beim Hochlauf) — Klasse:
+    /// **Invariante**. Kein Subjekt beteiligt: der Kernel bildet sich selbst ein Registerfenster
+    /// ein, um zu enumerieren. „Identisch" heisst hier nur „in der Identitätskarte des Kernels".
     KernelGlobalDeviceWindow,
 }
 
+impl IdentityReason {
+    /// Invariante oder Schuld? Steht hier und nicht in einem Skript, damit der Wächter dieselbe
+    /// Quelle liest wie der Leser.
+    pub const fn class(self) -> IdentityClass {
+        match self {
+            IdentityReason::SyscallMapByCap => IdentityClass::Debt,
+            IdentityReason::KernelSetupMapping => IdentityClass::Debt,
+            IdentityReason::DeviceDmaWindow => IdentityClass::Debt,
+            IdentityReason::DeviceMmioWindow => IdentityClass::Invariant,
+            IdentityReason::KernelGlobalDeviceWindow => IdentityClass::Invariant,
+        }
+    }
+}
+
+/// **Wieviele Stellen heute noch eine SCHULD tragen.** Der Wächter vergleicht gegen diese Zahl,
+/// und sie darf nur **fallen** — eine Ratsche. Ohne sie wäre „drei Schulden" eine Beobachtung,
+/// die sich unbemerkt in „fünf Schulden" verwandeln kann.
+pub const IDENTITY_DEBTS: usize = 3;
+
 impl Va {
-    /// **Die einzige Umwandlung `Pa -> Va`.**
-    ///
-    /// Sie verlangt einen Grund, und der Grund ist ein Wert eines geschlossenen Enums — also
-    /// etwas, das im Quelltext steht und nicht in einer Liste daneben. Wer eine neue identische
-    /// Abbildung braucht, braucht eine neue Variante; das ist die Stelle, an der jemand
-    /// nachdenkt.
-    pub const fn identity(_reason: IdentityReason, pa: Pa) -> Va {
+    /// **`SYS_MAP`/`SYS_UNMAP`** — s. [`IdentityReason::SyscallMapByCap`].
+    pub const fn for_syscall_map(pa: Pa) -> Va {
+        Va(pa.raw())
+    }
+    /// **Kernel-Setup** — s. [`IdentityReason::KernelSetupMapping`].
+    pub const fn for_kernel_setup(pa: Pa) -> Va {
+        Va(pa.raw())
+    }
+    /// **MMIO-Fenster** — s. [`IdentityReason::DeviceMmioWindow`].
+    pub const fn for_mmio_window(pa: Pa) -> Va {
+        Va(pa.raw())
+    }
+    /// **DMA-Fenster** — s. [`IdentityReason::DeviceDmaWindow`].
+    pub const fn for_dma_window(pa: Pa) -> Va {
+        Va(pa.raw())
+    }
+    /// **Globales Kernel-Gerätefenster** — s. [`IdentityReason::KernelGlobalDeviceWindow`].
+    pub const fn for_kernel_global_window(pa: Pa) -> Va {
         Va(pa.raw())
     }
 

@@ -216,7 +216,12 @@ if [ -z "$OUT" ]; then
     rm -f "$LOG" "$BLK_IMG"
     exit 2
 fi
-rm -f "$LOG" "$BLK_IMG"
+# **`$LOG` bleibt bis zum Schluss liegen** (D12): es wird erst geloescht, wenn feststeht, dass der
+# Lauf durchging. Die erste Fassung der Rueckhaltung loeschte hier -- und der Block am Dateiende,
+# der bei `fail != 0` ein Log ablegen sollte, fand nie eines vor. Ein Pruefer, dessen Vorbedingung
+# nie gilt, schweigt und sieht dabei aus wie einer, der nichts zu melden hat. Genau die Form, vor
+# der der Kopf dieses Projekts warnt -- diesmal in meinem eigenen Werkzeug.
+rm -f "$BLK_IMG"
 echo "$OUT"
 
 echo "== checks =="
@@ -485,5 +490,16 @@ if [ "$RUNS" -gt 1 ]; then
         fail=1
     fi
 fi
+# **Bei einem Fehlschlag das volle Protokoll BEHALTEN** (D12, 2026-08-05).
+#
+# Die Wiederholungsmessung legt bei abweichender SIGNATUR ein Log ab -- aber nur dann. Faellt ein
+# Lauf durch, waehrend die Signatur haelt (oder laeuft die Suite mit RUNS=1), blieb bisher nichts
+# zurueck. Genau so gingen am 2026-08-04 zwei Fehlschlaege verloren.
+if [ "$fail" != 0 ] && [ -s "${LOG:-}" ]; then
+    mkdir -p build/diag
+    ZIEL="build/diag/ABWEICHUNG-$(date +%Y%m%d-%H%M%S).log"
+    cp -f "$LOG" "$ZIEL" 2>/dev/null && echo "  (volles Log: $ZIEL)"
+fi
+rm -f "$LOG"
 if [ "$fail" = 0 ]; then echo "== ALL PASS =="; else echo "== FAILURES =="; fi
 exit "$fail"

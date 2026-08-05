@@ -114,8 +114,13 @@ pub enum IdentityClass {
 /// falsche.
 ///
 /// Deshalb gibt es **einen Konstruktor je Stelle** (`Va::for_*` unten) und **kein** Argument, das
-/// man verwechseln kann. Dieses Enum bleibt als Klassifikation für den Wächter und als Ort, an
-/// dem die Begründung steht.
+/// man verwechseln kann. Seit dem 2026-08-05 verlangt jeder zusätzlich einen **Zeugen**
+/// (`crate::system::*Witness`) — ein Typ mit privatem Feld, der nur im Modul seiner Engstelle
+/// herstellbar ist. Damit prüft **rustc** die Bindung Stelle↔Grund; die Tabelle im Wächter, die
+/// dafür Funktionsnamen aus dem Quelltext las, ist ersatzlos entfallen.
+///
+/// Dieses Enum bleibt als Klassifikation (Invariante/Schuld) und als Ort, an dem die Begründung
+/// steht.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum IdentityReason {
     /// **`SYS_MAP`/`SYS_UNMAP`** — Klasse: **Schuld**.
@@ -184,23 +189,23 @@ pub const IDENTITY_DEBTS: [&str; 3] = [
 
 impl Va {
     /// **`SYS_MAP`/`SYS_UNMAP`** — s. [`IdentityReason::SyscallMapByCap`].
-    pub const fn for_syscall_map(pa: Pa) -> Va {
+    pub fn for_syscall_map(_w: crate::system::SyscallMapWitness, pa: Pa) -> Va {
         Va(pa.raw())
     }
     /// **Kernel-Setup** — s. [`IdentityReason::KernelSetupMapping`].
-    pub const fn for_kernel_setup(pa: Pa) -> Va {
+    pub fn for_kernel_setup(_w: crate::system::KernelSetupWitness, pa: Pa) -> Va {
         Va(pa.raw())
     }
     /// **MMIO-Fenster** — s. [`IdentityReason::DeviceMmioWindow`].
-    pub const fn for_mmio_window(pa: Pa) -> Va {
+    pub fn for_mmio_window(_w: crate::system::MmioWindowWitness, pa: Pa) -> Va {
         Va(pa.raw())
     }
     /// **DMA-Fenster** — s. [`IdentityReason::DeviceDmaWindow`].
-    pub const fn for_dma_window(pa: Pa) -> Va {
+    pub fn for_dma_window(_w: crate::system::DmaWindowWitness, pa: Pa) -> Va {
         Va(pa.raw())
     }
     /// **Globales Kernel-Gerätefenster** — s. [`IdentityReason::KernelGlobalDeviceWindow`].
-    pub const fn for_kernel_global_window(pa: Pa) -> Va {
+    pub fn for_kernel_global_window(_w: crate::system::KernelGlobalWindowWitness, pa: Pa) -> Va {
         Va(pa.raw())
     }
 

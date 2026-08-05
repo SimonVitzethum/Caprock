@@ -63,56 +63,47 @@ fi
 # **Kein WAEHLBARER Grund mehr.** `Va::identity(reason, pa)` war ein freies Argument: nichts
 # hinderte `Va::identity(Mmio, dma_pa)`, und der Waechter haette einen gueltigen Grund gesehen und
 # geschwiegen. Es gibt jetzt einen Konstruktor JE STELLE.
-if grep -q "pub const fn identity" "$ADDR"; then
+if grep -qE "pub (const )?fn identity" "$ADDR"; then
     nok "\`Va::identity(reason, pa)\` existiert wieder -- ein waehlbarer Grund ist ein Warnschild, keine Bindung."
 else
     ok "kein waehlbarer Grund: es gibt einen Konstruktor je Stelle (\`Va::for_*\`), kein Grund-Argument"
 fi
-KONSTRUKTOREN="$(grep -oE 'pub const fn for_[a-z_]+' "$ADDR" | sed 's/pub const fn //' | sort -u)"
+KONSTRUKTOREN="$(grep -oE 'pub fn for_[a-z_]+' "$ADDR" | sed 's/pub fn //' | sort -u)"
 [ -n "$KONSTRUKTOREN" ] || nok "keine \`Va::for_*\`-Konstruktoren gefunden -- der Umbau ist nicht da, wo der Waechter ihn sucht."
 for f in "pub const fn window" "pub const fn link"; do
     grep -q "$f" "$ADDR" || nok "der benannte Weg \`$f\` fehlt -- \`Va\` waere anders gebaut als angenommen."
 done
-# **Die Zuordnung Konstruktor -> AUFRUFENDE FUNKTION, als Menge.**
+# **Die Bindung Stelle<->Grund haelt seit dem 2026-08-05 RUSTC, nicht mehr dieses Skript.**
 #
-# Die erste Fassung zaehlte nur: „ein- oder zweimal". Das ist dieselbe Form, gegen die dieser
-# ganze Umbau geht -- **eine Kardinalzahl steht, wo eine Menge gemeint ist**. Zwei Aufrufe aus dem
-# FALSCHEN Paar sind von Abbilden+Gegenstueck nicht zu unterscheiden, solange nur gezaehlt wird;
-# und die Lockerung von „hoechstens einmal" auf „zwei" hat genau das Loch aufgemacht, das sie
-# schliessen sollte.
+# Hier stand eine Tabelle Konstruktor -> aufrufende Funktionen, aus dem Quelltext gelesen. Sie war
+# die zweitbeste Loesung, und mein Grund dafuer („`pub(in path)` verlangt einen Vorfahren, `Va`
+# liegt in `crate::addr`") ging am Punkt vorbei: der **Zeuge** braucht keinen Vorfahren. Jeder
+# `Va::for_*` verlangt jetzt einen Typ mit privatem Feld aus dem Modul seiner Engstelle -- nennbar,
+# aber nur dort herstellbar. Die Tabelle ist ersatzlos entfallen.
 #
-# **Warum das ein Skript tut und nicht rustc.** Die saubere Fassung waere
-# `pub(in crate::system) const fn for_mmio_window(..)` -- aber `Va` liegt in `crate::addr`, und
-# Rusts `pub(in path)` verlangt einen VORFAHREN des Elements. Ein Modul, das nicht ueber `addr`
-# liegt, ist nicht ausdrueckbar. Der strukturelle Weg waere, die Engstellen in ein privates
-# Untermodul zu ziehen, das seine Zeugen-Typen selbst besitzt; das steht als eigener Punkt in
-# `todo.md`. Bis dahin haelt diese Tabelle die Bindung -- und sie haelt NAMEN, keine Zahlen.
-declare -A BINDUNG=(
-    [for_syscall_map]="map_frame unmap_frame"
-    [for_kernel_setup]="map_into_thread unmap_into_thread"
-    [for_mmio_window]="map_region_into_thread unmap_window"
-    [for_dma_window]="map_region_into_thread unmap_dma_from_thread"
-    [for_kernel_global_window]="pcie_find_virtio run"
-)
-schief=""
-for k in $KONSTRUKTOREN; do
-    erwartet="$(tr ' ' '\n' <<<"${BINDUNG[$k]:-}" | grep -v '^$' | sort -u)"
-    if [ -z "$erwartet" ]; then
-        schief="$schief\n    $k: kein Eintrag in der Bindungstabelle"
-        continue
-    fi
-    gefunden="$(grep -rn "Va::$k" kernel/src --include=*.rs 2>/dev/null | while IFS= read -r z; do
-        d="$(cut -d: -f1 <<<"$z")"; n="$(cut -d: -f2 <<<"$z")"
-        head -n "$n" "$d" | grep -oE '^[a-z ]*fn [a-z_0-9]+' | tail -1 | sed 's/.*fn //'
-    done | sort -u)"
-    if [ "$erwartet" != "$gefunden" ]; then
-        schief="$schief\n    $k: erwartet [$(tr '\n' ' ' <<<"$erwartet")] gefunden [$(tr '\n' ' ' <<<"$gefunden")]"
-    fi
-done
-if [ -n "$schief" ]; then
-    nok "die Bindung Konstruktor<->aufrufende Funktion stimmt nicht:$(printf '%b' "$schief")"
+# Der Beleg, dass es greift, ist der Bau selbst: `bringup.rs` konnte den Zeugen fuer das globale
+# Geraetefenster nicht herstellen und scheiterte mit „argument #1 of type
+# `KernelGlobalWindowWitness` is missing". Der Aufruf ist deshalb hinter `system::` gewandert.
+#
+# Geprueft wird hier nur noch, dass die Zeugen ueberhaupt so gebaut sind: privates Feld, und je
+# Konstruktor einer.
+ZEUGEN="$(grep -oE '^pub struct [A-Za-z]+Witness\(\(\)\);' kernel/src/system.rs | sed 's/pub struct //; s/(());//')"
+if [ -z "$ZEUGEN" ]; then
+    nok "keine Zeugen-Typen (\`*Witness(())\`) gefunden -- die Bindung haengt dann wieder an nichts."
+elif [ "$(echo "$ZEUGEN" | wc -w)" -ne "$(echo "$KONSTRUKTOREN" | wc -w)" ]; then
+    nok "$(echo "$ZEUGEN" | wc -w) Zeugen gegen $(echo "$KONSTRUKTOREN" | wc -w) Konstruktoren -- je Stelle gehoert genau einer."
 else
-    ok "jeder der $(echo "$KONSTRUKTOREN" | wc -w) Stellen-Konstruktoren wird von GENAU den eingetragenen Funktionen gerufen (Namen, nicht Anzahl)"
+    ok "$(echo "$ZEUGEN" | wc -w) Zeugen mit privatem Feld, einer je Stellen-Konstruktor -- die Bindung prueft rustc"
+fi
+# Und: jeder Konstruktor NIMMT auch einen Zeugen. Ohne das waeren die Typen Zierde.
+ohne_zeuge=""
+for k in $KONSTRUKTOREN; do
+    grep -qE "pub fn $k\(_w: crate::system::[A-Za-z]+Witness" "$ADDR" || ohne_zeuge="$ohne_zeuge $k"
+done
+if [ -n "$ohne_zeuge" ]; then
+    nok "Konstruktor(en) ohne Zeugen-Parameter:$ohne_zeuge -- dort ist die Bindung wieder offen."
+else
+    ok "jeder Stellen-Konstruktor verlangt seinen Zeugen"
 fi
 
 # -- 2. Traegt jede Variante einen Grund? ---------------------------------------------------------
@@ -154,6 +145,20 @@ IST="$(sed -n '/pub const fn class(self)/,/^    }/p' "$ADDR" \
        | grep -E 'IdentityReason::[A-Za-z]+ *=> *IdentityClass::Debt' \
        | grep -oE 'IdentityReason::[A-Za-z]+' | sed 's/IdentityReason:://' | sort -u)"
 SOLL="$(sed -n '/pub const IDENTITY_DEBTS/,/\];/p' "$ADDR" | grep -oE '"[A-Za-z]+"' | tr -d '"' | sort -u)"
+# **Ankertest -- fehlte bis zum 2026-08-05.** Ohne ihn koennte `IDENTITY_DEBTS` Namen tragen, die
+# gar keine Variante mehr sind (Umbenennung!), und die Mengenpruefung liefe ins Leere: sie
+# meldete einen „Austausch", waehrend in Wahrheit ihr eigener Anker weg ist. Beim
+# `SyscallMapByCap`-Falsifikator steht dieser Test seit dem ersten Tag; hier fehlte er.
+ALLE_VARIANTEN="$(sed -n '/pub enum IdentityReason {/,/^}/p' "$ADDR" | grep -oE '^ {4}[A-Z][A-Za-z]+,' | tr -d ' ,' | sort -u)"
+fremd=""
+for name in $SOLL; do
+    grep -qx "$name" <<<"$ALLE_VARIANTEN" || fremd="$fremd $name"
+done
+if [ -n "$fremd" ]; then
+    nok "\`IDENTITY_DEBTS\` nennt Namen, die KEINE Variante von \`IdentityReason\` sind:$fremd -- die Mengenpruefung laese ins Leere (Umbenennung?)."
+else
+    ok "jeder Name in \`IDENTITY_DEBTS\` ist eine echte Variante von \`IdentityReason\` (Anker haelt)"
+fi
 if [ -z "$SOLL" ]; then
     nok "die Ratsche \`IDENTITY_DEBTS\` fehlt oder ist leer -- die Schuldmenge waere unbeschraenkt."
 elif [ "$IST" != "$SOLL" ]; then

@@ -531,6 +531,20 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   4 GiB gar keinen Speicher gibt — gezaehlt hatte er eine absichtlich uebergrosse Anforderung,
   die NIRGENDS passte. „Unten war kein Platz" und „es wurde oben genommen" sind zwei Aussagen;
   dieselbe Verwechslung wie `rx_used` gegen „Daten sind angekommen".
+* **Ein Loch im Pruefer beschaedigt die GRUEN-Bilanz, nicht nur die rote.** „Leere Schlusszeile
+  galt als Erfolg" hat kein Fehlerbild verloren -- es hat einen **Erfolg erfunden**: ein
+  abgebrochener Lauf wurde gruen gebucht, und weil bei Erfolg geloescht wurde, war nicht
+  nachzaehlbar, wie oft. Wer ein solches Loch findet, muss die Gruen-Zahlen nachrechnen, nicht nur
+  die Ausfaelle beklagen.
+* **Ein Sammler darf nur `$?` lesen.** Erfolg ueber Textvergleich der Schlusszeile heisst: mit
+  jeder neuen Suite waechst eine Formel, und jede Formel ist ein Loch. Der Schluessel des
+  Registers ist der Exit-Code; gibt eine Suite bei Fehlschlag 0 zurueck, ist DAS der Fehler --
+  einer in der Suite. Der Text wird gegengelesen, nicht befragt.
+* **Ein Zeuge braucht keinen Vorfahren.** „`pub(in path)` verlangt einen Vorfahren" stimmt und ist
+  trotzdem kein Blocker: ein `pub struct Witness(())` im Modul der Engstelle ist ausserhalb
+  nennbar, aber nicht herstellbar -- damit prueft rustc die Bindung Stelle<->Grund, und die
+  Namenstabelle im Waechter entfaellt. Eine Zeile je Stelle. Als „Entwurfsarbeit" eingestuft zu
+  haben war dieselbe Fehleinstufung wie `tail -1`.
 * **Eine Kardinalzahl, wo eine Menge gemeint ist, ist eine Ratsche mit einem Loch.** Zweimal am
   2026-08-05 im selben Werkzeug: die Stelligkeitspruefung zaehlte Aufrufe („ein- oder zweimal")
   statt sie zu binden -- zwei Aufrufe aus dem FALSCHEN Paar sind so von Abbilden+Gegenstueck

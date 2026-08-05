@@ -1439,6 +1439,22 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       Die drei zusammen zu behandeln und zuerst dort zu suchen, ist billiger als drei getrennte
       Jagden.
 
+      **Das Prior braucht einen AUSSTIEG, sonst kippt es.** „Zuerst das Gerüst prüfen" ist nach
+      fünf Treffern richtig — aber ohne vorab festgelegtes Kriterium wird daraus in drei Wochen
+      „war bestimmt wieder das Gerüst", dieselbe unfalsifizierbare Bequemlichkeit wie „trat auch
+      vorher auf", nur mit umgekehrtem Vorzeichen. Deshalb **jetzt** hingeschrieben, solange das
+      Prior noch nicht liebgewonnen ist:
+
+      Ein Ausfall gilt als **Kernel-Befund**, wenn *eine* der beiden Bedingungen erfüllt ist:
+      * eine **reproduzierbare Prüfzeile** bei korrektem Exit-Code — die Suite kommt zu Ende,
+        meldet ihr Urteil, und dieselbe Zeile fällt in einem zweiten Lauf wieder durch;
+      * oder die Ausgabe **weicht inhaltlich ab, statt abzubrechen** — Werte, Zähler oder
+        Reihenfolge sind anders, nicht bloss kürzer.
+
+      Alles andere — abgeschnittene Ausgabe, fehlende Schlusszeile, Zeitlimit im
+      Erwartungsabgleich, Exit-Code ohne passendes Urteil — ist bis auf Weiteres ein
+      **Gerüst-Befund** und wird dort gesucht.
+
       **Nicht als „Umgebung" ablegen.** Ein Fehler, der nur bei Überbuchung des Wirts auftritt,
       ist ein Kandidat für ein verpasstes `WFE`-Wakeup oder ein Timer/IPI-Rennen — zeitabhängige
       Kernelfehler leben genau dort, und die Emulation verschiebt nur die Wahrscheinlichkeit,
@@ -1486,32 +1502,51 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       unbestimmt.** Und ohne die Prüfzeile ist nicht einmal bekannt, **welche** Aussage bricht.
 
       **(1) erledigt am 2026-08-05:** `tools/sammellauf.sh` hält die **vollständige stdout** je
-      Lauf fest, löscht sie nur bei Erfolg und zeigt bei Ausfall die durchgefallenen Prüfzeilen
-      gleich mit. Es wertet **beide** Melder aus (Rückgabewert *und* Schlusszeile), weil manche
-      Suite `0` liefert und trotzdem `== FAILURES ==` meldet. Gegenprobe in beide Richtungen
-      gefahren. Das stand hier zu Unrecht als Punkt neben Entwurfsarbeit — es war eine Zeile, und
-      es hat dreimal ein Fehlerbild gekostet.
+      Lauf fest. Zwei eigene Fehler dieser Datei sind dabei aufgefallen, und der zweite hat die
+      Bilanz-Frage gedreht:
+
+      * Erfolg war als „`ALL PASS` in der Schlusszeile" definiert — und legte damit die
+        Protokolle der **grünen Wächter** ab, die anders schliessen.
+      * Eine **leere** Schlusszeile galt als Erfolg. Das hat kein Fehlerbild *verloren*, es hat
+        einen **Erfolg erfunden**: ein Lauf, der mitten in der Ausgabe endete, wurde grün
+        verbucht. **Damit ist die Grün-Bilanz beschädigt, nicht nur die rote** — und weil bei
+        Erfolg gelöscht wurde, liess sich nicht nachzählen, wie oft.
+
+      **Reichweite, so genau wie sie geht:** die Datei existierte für **einen** Sammellauf, bevor
+      der Fehler auffiel; dort zeigte `load 6G` die leere Schlusszeile und wurde grün gebucht (der
+      Wiederholungslauf war dann echt grün). Die aarch64-Bisect-Reihe lief **nicht** über diese
+      Datei, sondern über ein Skript mit exaktem Zeichenvergleich
+      (`[ "$r" = "== ALL PASS ==" ]`) — eine abgeschnittene Zeile wäre dort **nicht** als grün
+      gezählt worden. Die 6/6 sind davon also unberührt.
+
+      **Zwei Festlegungen daraus.** (A) Der Ausgang entscheidet sich am **Exit-Code**, nicht am
+      Text — sonst wächst mit jeder neuen Suite eine Formel und mit ihr ein Loch. Der Text wird
+      nur gegengelesen; ein Widerspruch ist ein Befund **über die Suite**. (B) Protokolle werden
+      **vorerst auch bei Erfolg behalten**, bis die Datei ein paar Dutzend Läufe getragen hat.
+      Fünf Fälle als Gegenprobe gefahren (Erfolg, Wächter-Formel, leere Zeile, `exit 0` mit
+      FAILURES, `exit 1`).
 
       **Zu tun:** (2) alle Sammelläufe über `sammellauf.sh` führen und laufen lassen, bis eine
       Prüfzeile vorliegt; (3) **zuerst das Gerüst prüfen** (s. o.), nicht den Kernel; (4) beide
       Stände mit **je 50+** Läufen messen — alles darunter kann bei dieser Effektgröße nicht
       trennen.
 
-- [ ] **E-Rest 3g: die Bindung Stelle↔Grund hält ein Skript, nicht der Compiler.**
-      (2026-08-05.) `Va::for_mmio_window` ist eine öffentliche Methode auf `Va` — der DMA-Pfad
-      *könnte* sie rufen. Dass er es nicht tut, hält heute `tools/identitaet.sh` über eine
-      Tabelle Konstruktor→aufrufende Funktion (**Namen**, nicht Anzahl — die erste Fassung zählte
-      und hätte zwei Aufrufe aus dem falschen Paar nicht von Abbilden+Gegenstück unterschieden).
+- [x] **E-Rest 3g BEHOBEN am 2026-08-05: die Bindung Stelle↔Grund hält rustc.**
+      Mein Grund für die Vertagung („`pub(in path)` verlangt einen Vorfahren, `Va` liegt in
+      `crate::addr`") ging am Punkt vorbei: der **Zeuge** braucht keinen Vorfahren. Jeder
+      `Va::for_*` verlangt jetzt einen Typ mit privatem Feld aus dem Modul seiner Engstelle
+      (`crate::system::*Witness`) — nennbar, aber nur dort herstellbar. Eine Zeile je Engstelle.
 
-      **Warum nicht rustc.** Die saubere Fassung wäre `pub(in crate::system) const fn
-      for_mmio_window(..)` — aber `Va` liegt in `crate::addr`, und Rusts `pub(in path)` verlangt
-      einen **Vorfahren** des Elements. Ein Modul, das nicht über `addr` liegt, ist nicht
-      ausdrückbar.
+      **Der Beleg ist der Bau selbst:** `bringup.rs` konnte den Zeugen für das globale
+      Gerätefenster nicht herstellen und scheiterte mit „argument #1 of type
+      `KernelGlobalWindowWitness` is missing". Statt den Zeugen öffentlich konstruierbar zu machen
+      (was ihn wertlos machte), wandert der Aufruf hinter `system::map_device_window_global` —
+      Nebenertrag: die Schichtung stimmt danach besser.
 
-      **Der strukturelle Weg:** die Engstellen in ein privates Untermodul ziehen, das seine
-      Zeugen-Typen selbst besitzt (`mod vmap { mod mmio { pub(super) struct Site(()); … } }`).
-      Dann prüft der Compiler die Bindung, und der Wächter darf wieder dumm sein. Kostet einen
-      Umzug von `vspace_map_masked`/`vspace_unmap`/`map_region_into_thread` aus `system.rs`.
+      Die Tabelle Konstruktor→aufrufende Funktion im Wächter ist **ersatzlos entfallen**; er prüft
+      nur noch, dass die Zeugen so gebaut sind (privates Feld, einer je Konstruktor) und dass jeder
+      Konstruktor seinen verlangt. Ich hatte das als „Entwurfsarbeit" eingestuft — dieselbe
+      Fehleinstufung, die `tail -1` neben Entwurfsarbeit geparkt hat.
 
 - [ ] **E-Rest 3f: der Abbau leitet die Adresse NEU HER, statt zu konsumieren, was das Abbilden
       zurückgab.** (2026-08-05.) `unmap_dma_from_thread(tid, phys, len)` nimmt dieselben rohen

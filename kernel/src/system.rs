@@ -540,7 +540,7 @@ impl SchedOps for KernelSched {
         };
         vspace_map(
             asid,
-            crate::addr::Va::for_syscall_map,
+            &|pa| crate::addr::Va::for_syscall_map(SyscallMapWitness(()), pa),
             crate::addr::Pa::new(base),
             len,
             perm,
@@ -553,7 +553,7 @@ impl SchedOps for KernelSched {
         }
         vspace_unmap(
             asid,
-            crate::addr::Va::for_syscall_map,
+            &|pa| crate::addr::Va::for_syscall_map(SyscallMapWitness(()), pa),
             crate::addr::Pa::new(base),
             len,
         )
@@ -601,7 +601,7 @@ impl SchedOps for KernelSched {
         // beiden Faellen dieselbe, der Grund also der schwaechere der beiden.
         vspace_unmap(
             asid,
-            crate::addr::Va::for_mmio_window,
+            &|pa| crate::addr::Va::for_mmio_window(MmioWindowWitness(()), pa),
             crate::addr::Pa::new(base),
             len,
         )
@@ -2179,7 +2179,7 @@ fn vspace_l1(asid: u16) -> Option<u64> {
 /// Block-Fastpath; sonst seitenweise (L3 wird bei Bedarf aus `MEM` angelegt).
 fn vspace_map(
     asid: u16,
-    als_va: fn(crate::addr::Pa) -> crate::addr::Va,
+    als_va: &dyn Fn(crate::addr::Pa) -> crate::addr::Va,
     pa: crate::addr::Pa,
     len: u64,
     perm: hal::mmu::UserPerm,
@@ -2190,7 +2190,7 @@ fn vspace_map(
 /// Wie [`vspace_map`], aber die bei Bedarf angelegten L3-Tabellen kommen aus `mask` (todo A1).
 fn vspace_map_masked(
     asid: u16,
-    als_va: fn(crate::addr::Pa) -> crate::addr::Va,
+    als_va: &dyn Fn(crate::addr::Pa) -> crate::addr::Va,
     pa: crate::addr::Pa,
     len: u64,
     perm: hal::mmu::UserPerm,
@@ -2238,6 +2238,53 @@ fn vspace_map_masked(
     ok
 }
 
+// ================================================================================================
+// Zeugen fuer die identischen Abbildungen (E-Rest 3g, 2026-08-05)
+// ================================================================================================
+//
+// **Die Bindung Stelle<->Grund haelt jetzt rustc, nicht mehr eine Tabelle im Pruefskript.**
+//
+// `Va::for_mmio_window` war eine oeffentliche Methode: der DMA-Pfad *koennte* sie rufen, und das
+// haette nur ein Skript gemerkt, das Funktionsnamen aus dem Quelltext liest. Der Einwand dagegen
+// war richtig -- und mein Gegenargument („`pub(in path)` verlangt einen Vorfahren, `Va` liegt in
+// `crate::addr`") ging am Punkt vorbei: der ZEUGE braucht keinen Vorfahren.
+//
+// Jeder dieser Typen hat ein **privates** Feld und ist damit nur in DIESEM Modul herstellbar.
+// `crate::addr` kann ihn nennen (er ist `pub`), aber nicht erzeugen. Wer die falsche Umwandlung
+// nehmen will, muss den Zeugen dafuer haben -- und den gibt es an seiner Stelle nicht.
+//
+// Kosten: eine Zeile je Engstelle. Ich hatte das als „Entwurfsarbeit" eingestuft; dieselbe
+// Fehleinstufung, die `tail -1` neben Entwurfsarbeit geparkt hat.
+
+/// Zeuge fuer `SYS_MAP`/`SYS_UNMAP` (`map_frame`/`unmap_frame`).
+pub struct SyscallMapWitness(());
+/// Zeuge fuer das kernel-seitige Einblenden (`map_into_thread`/`unmap_into_thread`).
+pub struct KernelSetupWitness(());
+/// Zeuge fuer MMIO-Registerfenster (`map_region_into_thread`/`unmap_window`).
+pub struct MmioWindowWitness(());
+/// Zeuge fuer DMA-Fenster (`map_region_into_thread`/`unmap_dma_from_thread`).
+pub struct DmaWindowWitness(());
+/// Zeuge fuer globale Kernel-Geraetefenster (ECAM, BAR beim Hochlauf).
+pub struct KernelGlobalWindowWitness(());
+
+/// **Ein BAR-Fenster global einblenden**, damit der Kernel enumerieren kann (kein Subjekt
+/// beteiligt).
+///
+/// Diese Funktion gibt es, weil `bringup` den Zeugen nicht herstellen kann -- und das ist der
+/// Beleg dafuer, dass die Bindung wirkt: der erste Bauversuch scheiterte genau hier mit
+/// „argument #1 of type `KernelGlobalWindowWitness` is missing". Statt den Zeugen oeffentlich
+/// konstruierbar zu machen (was ihn wertlos machte), wandert der Aufruf hierher. Nebenertrag:
+/// die Schichtung stimmt danach besser -- `bringup` sagt, WAS eingeblendet werden soll, `system`
+/// entscheidet, unter welcher Achse.
+#[cfg(target_arch = "x86_64")]
+pub fn map_device_window_global(base: u64, len: u64) -> bool {
+    let _ = crate::addr::Va::for_kernel_global_window(
+        KernelGlobalWindowWitness(()),
+        crate::addr::Pa::new(base),
+    );
+    hal::mmu::map_device_window_global(base, len)
+}
+
 /// **Die Platzbelegung des User-Fensters.** Zwei benannte Plaetze statt zweier Zahlen im
 /// Aufruf: `spawn_isolated_native` braucht beide, und „Slot 0 ist der Code" ist genau die Sorte
 /// Wissen, die sonst in zwei Dateien halb steht.
@@ -2268,7 +2315,7 @@ fn vspace_map_user_region(
 /// 4-KiB-Granularität: Region `[base, base+len)` aus der VSpace `asid` entfernen.
 fn vspace_unmap(
     asid: u16,
-    als_va: fn(crate::addr::Pa) -> crate::addr::Va,
+    als_va: &dyn Fn(crate::addr::Pa) -> crate::addr::Va,
     pa: crate::addr::Pa,
     len: u64,
 ) -> bool {
@@ -2312,7 +2359,7 @@ pub fn map_into_thread(tid: ThreadId, base: u64, len: u64, perm_code: u8) -> boo
     };
     vspace_map(
         asid,
-        crate::addr::Va::for_kernel_setup,
+        &|pa| crate::addr::Va::for_kernel_setup(KernelSetupWitness(()), pa),
         crate::addr::Pa::new(base),
         len,
         perm,
@@ -2331,7 +2378,7 @@ pub fn unmap_into_thread(tid: ThreadId, base: u64, len: u64) -> bool {
     }
     vspace_unmap(
         asid,
-        crate::addr::Va::for_kernel_setup,
+        &|pa| crate::addr::Va::for_kernel_setup(KernelSetupWitness(()), pa),
         crate::addr::Pa::new(base),
         len,
     )
@@ -3145,14 +3192,14 @@ pub fn map_region_into_thread(tid: ThreadId, phys: u64, len: u64, kind: MappingK
     let ok = match kind {
         MappingKind::Device { ro } => match vspace_l1(asid) {
             Some(l1) => {
-                let va = crate::addr::Va::for_mmio_window(crate::addr::Pa::new(phys));
+                let va = crate::addr::Va::for_mmio_window(MmioWindowWitness(()), crate::addr::Pa::new(phys));
                 hal::mmu::vspace_map_device(l1, va.raw(), len, ro, &mut alloc)
             }
             None => return false, // nicht isoliert / ungültige ASID
         },
         MappingKind::Dma { coherent } => match vspace_l2(asid) {
             Some(l2) => {
-                let va = crate::addr::Va::for_dma_window(crate::addr::Pa::new(phys));
+                let va = crate::addr::Va::for_dma_window(DmaWindowWitness(()), crate::addr::Pa::new(phys));
                 hal::mmu::vspace_map_dma(l2, va.raw(), len, coherent, &mut alloc)
             }
             None => return false,
@@ -4880,7 +4927,7 @@ pub fn unmap_dma_from_thread(tid: ThreadId, phys: u64, len: u64) -> bool {
     // Engstelle und bildete identisch ab, ohne dass irgendwo stand warum. Raeumte sie auf einer
     // anderen Achse ab als das Mappen, bliebe eine Abbildung stehen -- und ein DMA-Fenster, das
     // beim Abbau stehenbleibt, ist genau das, was `dma_audit` Code 8 meldet.
-    let base = crate::addr::Va::for_dma_window(crate::addr::Pa::new(phys)).raw();
+    let base = crate::addr::Va::for_dma_window(DmaWindowWitness(()), crate::addr::Pa::new(phys)).raw();
     let mut p = base;
     let mut ok = true;
     while p < base + len {
@@ -6270,6 +6317,7 @@ mod pcie_arm {
         // enumerieren. Der Grund steht trotzdem hin -- er unterscheidet diese Stelle von einer,
         // an der eine PD etwas zu sehen bekaeme.
         let _ = crate::addr::Va::for_kernel_global_window(
+            KernelGlobalWindowWitness(()),
             crate::addr::Pa::new((hal::pcie::ECAM_GIB as u64) << 30),
         );
         hal::mmu::map_device_block_global(hal::pcie::ECAM_GIB);

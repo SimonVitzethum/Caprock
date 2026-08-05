@@ -39,27 +39,52 @@ ZIEL="build/diag/sammellauf-${NAME}-$(date +%Y%m%d-%H%M%S).log"
 rc=$?
 LETZTE="$(tail -1 "$ZIEL" 2>/dev/null)"
 
-# **Zwei Melder, und der Rueckgabewert ist der fuehrende.** Manche Suiten liefern 0 und melden
-# trotzdem `== FAILURES ==`; umgekehrt ist ein rc != 0 auch ohne diese Zeile ein Ausfall.
+# ================================================================================================
+# ZWEI FESTLEGUNGEN, beide aus eigenen Fehlern dieser Datei
+# ================================================================================================
 #
-# Die erste Fassung verlangte zusaetzlich das Wort „ALL PASS" in der Schlusszeile -- und hielt
-# damit die Protokolle der WAECHTER fest, die gruen sind und anders schliessen
-# („== Kerngrenze eingehalten ==", „== Identitaet: ... =="). Ein Sammler, der Erfolge als
-# Ausfaelle ablegt, macht sein eigenes Verzeichnis unlesbar; geprueft wird deshalb auf das
-# **Fehlerwort**, nicht auf ein bestimmtes Erfolgswort.
-# **Eine LEERE Schlusszeile ist kein Erfolg.** Ein Lauf, der mitten in der Ausgabe endet (SIGKILL,
-# Zeitlimit, abgeschnittene Pipe), hat keine Schlusszeile -- und ein Praedikat, das nur auf das
-# Fehlerwort prueft, liest daraus „kein Fehler". Genau die Form, vor der der Kopf dieses Projekts
-# warnt: Schweigen als Erfolg. Selbst beobachtet, eine Stunde nach dem Bau dieser Datei.
-if [ "$rc" -eq 0 ] && [ -n "$LETZTE" ] \
-   && ! grep -qE "FAILURES|VERLETZT|NICHT SPRECHFAEHIG|BEFUND" <<<"$LETZTE"; then
-    echo "$LETZTE"
-    rm -f "$ZIEL"
+# Binnen einer Stunde nach dem Bau hatte sie zwei Loecher. Das zweite war das schlimmere, und
+# zwar aus einem Grund, den ich zuerst uebersehen habe: eine **leere** Schlusszeile galt als
+# Erfolg. Das hat kein Fehlerbild VERLOREN -- es hat einen **Erfolg ERFUNDEN**: ein Lauf, der
+# mitten in der Ausgabe endete, wurde gruen verbucht. Und weil bei Erfolg geloescht wurde, liess
+# sich hinterher nicht nachzaehlen, wie oft. Ein Zaehler, der hochzaehlt, wenn nichts geschieht,
+# beschaedigt die GRUEN-Bilanz, nicht nur die rote.
+#
+# **(A) Der Ausgang entscheidet sich am EXIT-CODE, nicht am Text.** Die erste Fassung verglich
+# Schlusszeilen -- erst gegen `ALL PASS`, dann zusaetzlich gegen die Formel der Waechter, morgen
+# gegen die der naechsten Suite. Das ist derselbe Befund wie beim ersten Identitaets-Waechter:
+# ein Pruefer, dessen Schluessel nicht die des Registers sind. Der Schluessel ist `$?`. Gibt eine
+# Suite bei Fehlschlag `0` zurueck, ist **das** der Fehler -- einer in der Suite. Der Text wird
+# nur GEGENGELESEN und ein Widerspruch gemeldet; er urteilt nicht.
+#
+# **(B) Vorerst wird AUCH BEI ERFOLG behalten** (`SAMMELLAUF_BEHALTEN=0` schaltet es ab). Solange
+# nicht ein paar Dutzend Laeufe hier durchgegangen sind, ist „gruen" eine Aussage dieser Datei
+# ueber sich selbst. Speicher ist billiger als eine zweite Runde dieser Erkenntnis.
+
+# Widerspruch Text <-> Exit-Code: ein BEFUND ueber die Suite, kein Urteil dieses Sammlers.
+if [ "$rc" -eq 0 ] && grep -qE "FAILURES|VERLETZT|NICHT SPRECHFAEHIG|BEFUND" <<<"$LETZTE"; then
+    echo "  BEFUND ueber die SUITE: Exit-Code 0, Schlusszeile meldet einen Fehlschlag" >&2
+    echo "    ($NAME: \"$LETZTE\") -- Fehler der Suite, nicht dieses Sammlers." >&2
+    rc=1
+fi
+# Keine Schlusszeile heisst: der Lauf hat nicht zu Ende geschrieben.
+if [ "$rc" -eq 0 ] && [ -z "$LETZTE" ]; then
+    echo "  BEFUND: Exit-Code 0, aber KEINE Schlusszeile -- der Lauf endete mitten in der" >&2
+    echo "    Ausgabe ($NAME). Ein abgebrochener Lauf ist kein bestandener." >&2
+    rc=1
+fi
+
+if [ "$rc" -eq 0 ]; then
+    echo "${LETZTE:-(keine Ausgabe)}"
+    if [ "${SAMMELLAUF_BEHALTEN:-1}" = "0" ]; then
+        rm -f "$ZIEL"
+    else
+        echo "  (behalten: $ZIEL -- Festlegung (B))"
+    fi
     exit 0
 fi
-echo "$LETZTE"
+echo "${LETZTE:-(keine Ausgabe)}"
 echo "  (volle Ausgabe: $ZIEL)"
-# Die durchgefallenen Pruefzeilen gleich mitzeigen -- sie sind der Grund, warum diese Datei
-# ueberhaupt existiert.
+# Die durchgefallenen Pruefzeilen gleich mitzeigen -- sie sind der Grund, warum es diese Datei gibt.
 grep -E "^  FAIL|weicht vom ersten ab|WATCHDOG|KEIN OUTPUT" "$ZIEL" | head -8 | sed 's/^/  /'
 exit "$rc"

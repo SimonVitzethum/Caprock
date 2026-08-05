@@ -2694,9 +2694,9 @@ pub fn run(multiboot_info: u64) -> ! {
                 erste = base;
             }
             // Kernelsicht, kein Subjekt: das BAR-Fenster wird global eingeblendet, damit der
-            // Kernel enumerieren kann. Der Grund benennt genau das.
-            let _ = crate::addr::Va::for_kernel_global_window(crate::addr::Pa::new(base));
-            if hal::mmu::map_device_window_global(base, len) {
+            // Kernel enumerieren kann. Der Weg geht ueber `system`, weil nur dort der Zeuge
+            // herstellbar ist (E-Rest 3g) -- rustc haelt die Bindung, nicht ein Skript.
+            if system::map_device_window_global(base, len) {
                 abgebildet += 1;
                 if hal::mmu::resolve_global(base) == Some(base) {
                     aufloesbar += 1;

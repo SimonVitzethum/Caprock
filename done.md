@@ -81,6 +81,71 @@ prueft.
 
 ---
 
+## Erfundene Erfolge, und warum der Sammler nur `$?` lesen darf (2026-08-05)
+
+**Der schwerere Teil des Sammler-Fehlers war nicht der verlorene Fehlschlag.** Ich hatte die zwei
+Loecher als „Fehlerbilder weg" verbucht. Das zweite -- eine **leere** Schlusszeile galt als
+Erfolg -- hat aber kein Bild verloren, sondern einen **Erfolg erfunden**: ein Lauf, der mitten in
+der Ausgabe endete, wurde gruen gebucht. Und weil bei Erfolg geloescht wurde, liess sich nicht
+nachzaehlen, wie oft. **Ein Zaehler, der hochzaehlt, wenn nichts geschieht, beschaedigt die
+GRUEN-Bilanz, nicht nur die rote.**
+
+**Reichweite, so genau wie sie geht** -- und das ist der Unterschied zwischen „Bilanz kaputt" und
+„Bilanz nachgerechnet": die Datei existierte fuer **einen** Sammellauf, bevor der Fehler auffiel;
+dort zeigte `load 6G` die leere Schlusszeile (der Wiederholungslauf war dann echt gruen). Die
+aarch64-Bisect-Reihe lief **nicht** ueber diese Datei, sondern ueber ein Skript mit exaktem
+Zeichenvergleich (`[ "$r" = "== ALL PASS ==" ]`) -- eine abgeschnittene Zeile waere dort NICHT als
+gruen gezaehlt worden. Die 6/6 sind unberuehrt.
+
+**(A) Der Ausgang entscheidet sich am EXIT-CODE.** Die erste Fassung verglich Schlusszeilen --
+erst gegen `ALL PASS`, dann zusaetzlich gegen die Formel der Waechter, morgen gegen die der
+naechsten Suite. Das ist derselbe Befund wie beim ersten Identitaets-Waechter: ein Pruefer, dessen
+Schluessel nicht die des Registers sind. Der Schluessel ist `$?`. Gibt eine Suite bei Fehlschlag
+`0` zurueck, ist **das** der Fehler -- einer in der Suite; der Sammler meldet den Widerspruch als
+Befund UEBER die Suite, richtet sein Urteil aber nicht danach. So waechst keine Formelliste, und
+diese Fehlerklasse ist strukturell weg.
+
+**(B) Protokolle werden vorerst auch bei ERFOLG behalten**, bis die Datei ein paar Dutzend Laeufe
+getragen hat. Solange ist „gruen" eine Aussage des Sammlers ueber sich selbst. Speicher ist
+billiger als eine zweite Runde dieser Erkenntnis.
+
+Fuenf Faelle als Gegenprobe gefahren: Erfolg, Waechter-Formel mit eigener Schlussformel, leere
+Schlusszeile, `exit 0` mit `FAILURES`, `exit 1`.
+
+## Der Zeuge: die Bindung Stelle<->Grund haelt jetzt rustc (E-Rest 3g, 2026-08-05)
+
+Mein Grund fuer die Vertagung war falsch. „`pub(in path)` verlangt einen Vorfahren, und `Va` liegt
+in `crate::addr`" stimmt -- geht aber am Punkt vorbei: **der Zeuge braucht keinen Vorfahren.**
+
+```rust
+// im Modul der Engstelle:
+pub struct MmioWindowWitness(());        // Feld privat -> nur hier herstellbar
+// in crate::addr:
+pub fn for_mmio_window(_w: crate::system::MmioWindowWitness, pa: Pa) -> Va { .. }
+```
+
+Der Typ ist ausserhalb **nennbar**, aber nicht **herstellbar**. Eine Zeile je Engstelle, kein
+Umzug. Ich hatte es als „Entwurfsarbeit" eingestuft -- dieselbe Fehleinstufung, die `tail -1`
+neben Entwurfsarbeit geparkt hat.
+
+**Der Beleg ist der Bau selbst:** `bringup.rs` konnte den Zeugen fuer das globale Geraetefenster
+nicht herstellen und scheiterte mit „argument #1 of type `KernelGlobalWindowWitness` is missing".
+Statt den Zeugen oeffentlich konstruierbar zu machen (was ihn wertlos machte), wandert der Aufruf
+hinter `system::map_device_window_global`. Nebenertrag: die Schichtung stimmt danach besser --
+`bringup` sagt WAS, `system` entscheidet unter welcher Achse.
+
+**Die Tabelle Konstruktor->aufrufende Funktion im Waechter ist ersatzlos entfallen.** Er prueft
+nur noch, dass die Zeugen so gebaut sind (privates Feld, einer je Konstruktor) und dass jeder
+Konstruktor seinen verlangt -- also das, was ein Typ nicht ueber sich selbst aussagen kann.
+
+**Dazu der fehlende Ankertest der Mengenpruefung.** `IDENTITY_DEBTS` wurde gegen die Schuldnamen
+aus `class()` verglichen -- aber niemand prueft, ob diese Namen ueberhaupt noch Varianten sind.
+Eine Umbenennung haette einen „Austausch" gemeldet, waehrend in Wahrheit der Anker weg ist. Beim
+`SyscallMapByCap`-Falsifikator stand dieser Test seit dem ersten Tag; hier fehlte er. Gegenprobe
+gefahren.
+
+---
+
 ## Kardinalzahl statt Menge: derselbe Fehler in zwei neuen Waechtern (2026-08-05)
 
 Zwei am selben Tag gebaute Waechter trugen denselben Defekt -- und es ist der, gegen den der

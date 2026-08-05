@@ -531,6 +531,17 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   4 GiB gar keinen Speicher gibt — gezaehlt hatte er eine absichtlich uebergrosse Anforderung,
   die NIRGENDS passte. „Unten war kein Platz" und „es wurde oben genommen" sind zwei Aussagen;
   dieselbe Verwechslung wie `rx_used` gegen „Daten sind angekommen".
+* **Eine Kardinalzahl, wo eine Menge gemeint ist, ist eine Ratsche mit einem Loch.** Zweimal am
+  2026-08-05 im selben Werkzeug: die Stelligkeitspruefung zaehlte Aufrufe („ein- oder zweimal")
+  statt sie zu binden -- zwei Aufrufe aus dem FALSCHEN Paar sind so von Abbilden+Gegenstueck
+  nicht zu unterscheiden. Und `IDENTITY_DEBTS` war ein `usize`: eine Ratsche ueber einer Zahl
+  greift nur gegen Zuwachs, nicht gegen **Austausch** -- und Austausch fuehlt sich beim Umbauen
+  wie Fortschritt an. Beides sind jetzt Mengen von Namen.
+* **Ein Sammler, der Erfolge als Ausfaelle ablegt, macht sein Verzeichnis unlesbar -- und eine
+  LEERE Schlusszeile ist kein Erfolg.** `tools/sammellauf.sh` hatte binnen einer Stunde beide
+  Fehler: Erfolg als „ALL PASS in der Schlusszeile" (die gruenen Waechter schliessen anders), und
+  ein Lauf ohne Schlusszeile (SIGKILL, Zeitlimit) galt als gruen -- **Schweigen als Erfolg**, im
+  eigenen Werkzeug.
 * **Ein waehlbarer Grund ist ein Warnschild, keine Struktur.** `Va::identity(reason, pa)` schloss
   die Liste der Gruende, aber nicht die Zuordnung Stelle<->Grund: der falsche Grund war weiterhin
   tippbar, und der Pruefer haette ihn durchgewinkt. Ein Konstruktor je Stelle nimmt das Argument

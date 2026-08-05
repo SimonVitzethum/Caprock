@@ -73,24 +73,46 @@ KONSTRUKTOREN="$(grep -oE 'pub const fn for_[a-z_]+' "$ADDR" | sed 's/pub const 
 for f in "pub const fn window" "pub const fn link"; do
     grep -q "$f" "$ADDR" || nok "der benannte Weg \`$f\` fehlt -- \`Va\` waere anders gebaut als angenommen."
 done
-# Jeder Konstruktor bezeichnet eine STELLE, und eine Stelle hat hoechstens zwei Haelften: das
-# Abbilden und sein Gegenstueck. **Genau zwei ist der Normalfall und richtig so** -- der Befund an
-# `unmap_dma_from_thread` war ja, dass der Abbau eine ANDERE Achse benutzte als das Mappen.
-# Geprueft wird deshalb nach unten (ein Grund ohne Benutzung ist eine Fiktion) und nach oben
-# (mehr als zwei hiesse: mehrere Stellen teilen sich einen Grund, und die Bindung waere lose).
+# **Die Zuordnung Konstruktor -> AUFRUFENDE FUNKTION, als Menge.**
 #
-# Die erste Fassung dieser Pruefung verlangte „hoechstens einmal" und schlug prompt bei ALLEN an
-# -- sie hatte das Gegenstueck nicht mitgedacht.
+# Die erste Fassung zaehlte nur: „ein- oder zweimal". Das ist dieselbe Form, gegen die dieser
+# ganze Umbau geht -- **eine Kardinalzahl steht, wo eine Menge gemeint ist**. Zwei Aufrufe aus dem
+# FALSCHEN Paar sind von Abbilden+Gegenstueck nicht zu unterscheiden, solange nur gezaehlt wird;
+# und die Lockerung von „hoechstens einmal" auf „zwei" hat genau das Loch aufgemacht, das sie
+# schliessen sollte.
+#
+# **Warum das ein Skript tut und nicht rustc.** Die saubere Fassung waere
+# `pub(in crate::system) const fn for_mmio_window(..)` -- aber `Va` liegt in `crate::addr`, und
+# Rusts `pub(in path)` verlangt einen VORFAHREN des Elements. Ein Modul, das nicht ueber `addr`
+# liegt, ist nicht ausdrueckbar. Der strukturelle Weg waere, die Engstellen in ein privates
+# Untermodul zu ziehen, das seine Zeugen-Typen selbst besitzt; das steht als eigener Punkt in
+# `todo.md`. Bis dahin haelt diese Tabelle die Bindung -- und sie haelt NAMEN, keine Zahlen.
+declare -A BINDUNG=(
+    [for_syscall_map]="map_frame unmap_frame"
+    [for_kernel_setup]="map_into_thread unmap_into_thread"
+    [for_mmio_window]="map_region_into_thread unmap_window"
+    [for_dma_window]="map_region_into_thread unmap_dma_from_thread"
+    [for_kernel_global_window]="pcie_find_virtio run"
+)
 schief=""
 for k in $KONSTRUKTOREN; do
-    z=$(grep -rho "Va::$k" kernel/src --include=*.rs | wc -l)
-    [ "$z" -ge 1 ] || schief="$schief $k(unbenutzt)"
-    [ "$z" -le 2 ] || schief="$schief $k($z)"
+    erwartet="$(tr ' ' '\n' <<<"${BINDUNG[$k]:-}" | grep -v '^$' | sort -u)"
+    if [ -z "$erwartet" ]; then
+        schief="$schief\n    $k: kein Eintrag in der Bindungstabelle"
+        continue
+    fi
+    gefunden="$(grep -rn "Va::$k" kernel/src --include=*.rs 2>/dev/null | while IFS= read -r z; do
+        d="$(cut -d: -f1 <<<"$z")"; n="$(cut -d: -f2 <<<"$z")"
+        head -n "$n" "$d" | grep -oE '^[a-z ]*fn [a-z_0-9]+' | tail -1 | sed 's/.*fn //'
+    done | sort -u)"
+    if [ "$erwartet" != "$gefunden" ]; then
+        schief="$schief\n    $k: erwartet [$(tr '\n' ' ' <<<"$erwartet")] gefunden [$(tr '\n' ' ' <<<"$gefunden")]"
+    fi
 done
 if [ -n "$schief" ]; then
-    nok "Konstruktor(en) nicht bei ein oder zwei Benutzungen:$schief"
+    nok "die Bindung Konstruktor<->aufrufende Funktion stimmt nicht:$(printf '%b' "$schief")"
 else
-    ok "jeder der $(echo "$KONSTRUKTOREN" | wc -w) Stellen-Konstruktoren wird ein- oder zweimal benutzt (Abbilden + Gegenstueck)"
+    ok "jeder der $(echo "$KONSTRUKTOREN" | wc -w) Stellen-Konstruktoren wird von GENAU den eingetragenen Funktionen gerufen (Namen, nicht Anzahl)"
 fi
 
 # -- 2. Traegt jede Variante einen Grund? ---------------------------------------------------------
@@ -127,16 +149,17 @@ fi
 # unsichtbar geworden -- wer die Liste liest, saehe ueberall einen Grund und schloesse, alles sei
 # nach Absicht. Jetzt traegt jede Variante eine **Klasse**, und die Zahl der Schulden darf nur
 # fallen.
-SCHULDEN="$(sed -n '/pub const fn class(self)/,/^    }/p' "$ADDR" | grep -c 'IdentityClass::Debt')"
-RATSCHE="$(grep -oE 'pub const IDENTITY_DEBTS: usize = [0-9]+' "$ADDR" | grep -oE '[0-9]+$')"
-if [ -z "$RATSCHE" ]; then
-    nok "die Ratsche \`IDENTITY_DEBTS\` fehlt -- die Schuldzahl waere eine Beobachtung ohne Schranke."
-elif [ "$SCHULDEN" -gt "$RATSCHE" ]; then
-    nok "$SCHULDEN Schuld-Varianten, erlaubt sind $RATSCHE. Eine Identitaets-Schuld ist dazugekommen."
-elif [ "$SCHULDEN" -lt "$RATSCHE" ]; then
-    nok "$SCHULDEN Schuld-Varianten bei einer Ratsche von $RATSCHE -- eine ist behoben. \`IDENTITY_DEBTS\` nachziehen (die Ratsche darf nur FALLEN, und sie faellt nicht von selbst)."
+# Die Schuld-Varianten aus `class()` -- und die eingetragene Menge aus `IDENTITY_DEBTS`.
+IST="$(sed -n '/pub const fn class(self)/,/^    }/p' "$ADDR" \
+       | grep -E 'IdentityReason::[A-Za-z]+ *=> *IdentityClass::Debt' \
+       | grep -oE 'IdentityReason::[A-Za-z]+' | sed 's/IdentityReason:://' | sort -u)"
+SOLL="$(sed -n '/pub const IDENTITY_DEBTS/,/\];/p' "$ADDR" | grep -oE '"[A-Za-z]+"' | tr -d '"' | sort -u)"
+if [ -z "$SOLL" ]; then
+    nok "die Ratsche \`IDENTITY_DEBTS\` fehlt oder ist leer -- die Schuldmenge waere unbeschraenkt."
+elif [ "$IST" != "$SOLL" ]; then
+    nok "die Schuld-MENGE weicht ab -- eingetragen [$(tr '\n' ' ' <<<"$SOLL")], im Code [$(tr '\n' ' ' <<<"$IST")]. Eine Ratsche ueber einer ZAHL haette einen Austausch durchgelassen."
 else
-    ok "$SCHULDEN von $(echo "$VARIANTEN" | wc -w) Identitaets-Annahmen sind SCHULD, und die Ratsche steht auf genau dieser Zahl"
+    ok "die Schuld-Menge stimmt ueberein: $(tr '\n' ' ' <<<"$IST")($(echo "$IST" | wc -w) von $(echo "$VARIANTEN" | wc -w))"
 fi
 
 # -- 3. Rufen nur die Engstellen die identisch abbildenden HAL-Funktionen? ------------------------

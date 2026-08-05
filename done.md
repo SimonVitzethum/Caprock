@@ -81,6 +81,62 @@ prueft.
 
 ---
 
+## Kardinalzahl statt Menge: derselbe Fehler in zwei neuen Waechtern (2026-08-05)
+
+Zwei am selben Tag gebaute Waechter trugen denselben Defekt -- und es ist der, gegen den der
+ganze VA==PA-Umbau geht: **eine Zahl steht, wo eine Menge gemeint ist.**
+
+**(1) Die Stelligkeitspruefung zaehlte Aufrufe, statt sie zu binden.** Sie verlangte „ein- oder
+zweimal". Ein Konstruktor je Stelle bindet aber nur den **Namen**, nicht den **Ort**:
+`Va::for_mmio_window` ist eine oeffentliche Methode, der DMA-Pfad *koennte* sie rufen. Zwei
+Aufrufe aus dem FALSCHEN Paar sind von Abbilden+Gegenstueck nicht zu unterscheiden, solange nur
+gezaehlt wird -- die Lockerung von „hoechstens einmal" auf „zwei" hat genau das Loch aufgemacht,
+das sie schliessen sollte. Der Waechter haelt jetzt eine Tabelle Konstruktor -> **aufrufende
+Funktionen** und vergleicht Mengen.
+
+Dass es ein Skript tut und nicht rustc, hat einen Grund und steht als E-Rest 3g: `pub(in path)`
+verlangt einen **Vorfahren** des Elements, und `Va` liegt in `crate::addr` -- ein Modul, das nicht
+darueber liegt, ist nicht ausdrueckbar. Der strukturelle Weg waere, die Engstellen in ein privates
+Untermodul mit eigenen Zeugen-Typen zu ziehen.
+
+**(2) `IDENTITY_DEBTS` war ein `usize`.** Eine Ratsche ueber einer Zahl greift nur gegen
+**Zuwachs**, nicht gegen **Austausch** -- und Austausch ist der wahrscheinlichere Vorgang, weil er
+sich beim Umbauen wie Fortschritt anfuehlt. Jetzt eine Liste von Namen und Mengengleichheit.
+Gegenprobe gefahren: eine Schuld gegen eine andere getauscht (Zahl bleibt 3) -> der Waechter
+schlaegt an und sagt dazu, dass eine Zahl das durchgelassen haette.
+
+**(3) `tail -1` -- dreimal ein Fehlerbild gekostet, und es war eine Zeile.** Es stand als Punkt
+neben Entwurfsarbeit in `todo.md`; das war die falsche Behandlung. `tools/sammellauf.sh` haelt
+jetzt die **vollstaendige stdout** je Lauf fest, loescht sie nur bei Erfolg und zeigt bei Ausfall
+die durchgefallenen Pruefzeilen gleich mit.
+
+Er hat dabei binnen einer Stunde **zwei eigene Loecher** gezeigt, beide von der Sorte, die dieses
+Projekt sammelt:
+* Erfolg war als „`ALL PASS` in der Schlusszeile" definiert -- und legte damit die Protokolle der
+  gruenen WAECHTER ab, die anders schliessen (`== Kerngrenze eingehalten ==`). Ein Sammler, der
+  Erfolge als Ausfaelle ablegt, macht sein eigenes Verzeichnis unlesbar. Geprueft wird jetzt auf
+  das **Fehlerwort**, nicht auf ein bestimmtes Erfolgswort.
+* eine **leere** Schlusszeile galt als Erfolg. Ein Lauf, der mitten in der Ausgabe endet
+  (SIGKILL, Zeitlimit, abgeschnittene Pipe), hat keine -- und ein Praedikat, das nur auf das
+  Fehlerwort prueft, liest daraus „kein Fehler". **Schweigen als Erfolg**, im eigenen Werkzeug,
+  eine Stunde nach dem Bau.
+
+**(4) Keine Punktschaetzung aus n=1.** „Die Rate liegt bei 1/32" waere derselbe Fehler wie der
+aarch64-Bisect, eine Ebene hoeher: ein Ausfall in 32 Laeufen gibt ein 95-%-Intervall von grob
+0,5 % bis 16 %. Eine als Baseline notierte Zahl macht jede spaetere Messung unfalsifizierbar.
+Festgehalten ist: **ein Ausfall in 32, Intervall breit, Rate unbestimmt.**
+
+**(5) Die drei seltenen Ausfaelle gehoeren wahrscheinlich zusammen -- und das Prior liegt beim
+GERUEST.** Der aussagekraeftigste Befund ist der `RUNS=8`-Ausfall mit einem Protokoll, dessen
+**Signatur mit der eines gruenen Laufs identisch** ist: wenn alle Ergebniszeilen stimmen und der
+Lauf trotzdem durchfaellt, bricht eine Pruefung, die nichts mit der gepruefeten Eigenschaft zu tun
+hat. In dieser Sitzung wurde der Messaufbau **fuenfmal** als schuldig ueberfuehrt (`tail -1`;
+drei Suiten ohne Protokoll; Rueckhalteblock hinter der Loeschung; und die zwei Loecher im Sammler
+selbst). Nach fuenf Treffern ist „drei seltene Kernelfehler" nicht mehr die naheliegende
+Hypothese.
+
+---
+
 ## VA == PA, dritter Anlauf: die BINDUNG, nicht nur die Liste (2026-08-05)
 
 Der zweite Anlauf schloss die *Liste* (ein geschlossenes Enum), aber nicht die *Bindung*: `reason`

@@ -166,10 +166,21 @@ impl IdentityReason {
     }
 }
 
-/// **Wieviele Stellen heute noch eine SCHULD tragen.** Der Wächter vergleicht gegen diese Zahl,
-/// und sie darf nur **fallen** — eine Ratsche. Ohne sie wäre „drei Schulden" eine Beobachtung,
-/// die sich unbemerkt in „fünf Schulden" verwandeln kann.
-pub const IDENTITY_DEBTS: usize = 3;
+/// **WELCHE Stellen heute noch eine Schuld tragen** — als Menge, nicht als Zahl.
+///
+/// Die erste Fassung war ein `usize`. Das ist dieselbe Form, gegen die dieser ganze Umbau geht:
+/// eine **Kardinalzahl, wo eine Menge gemeint ist**. Eine Ratsche über einer Zahl greift nur
+/// gegen *Zuwachs* — eine Schuld gegen eine andere zu tauschen lässt sie stehen. Und Austausch
+/// ist der wahrscheinlichere Vorgang, weil er sich beim Umbauen wie Fortschritt anfühlt.
+///
+/// Der Wächter vergleicht **Mengengleichheit**: verschwindet eine, muss diese Liste nachgezogen
+/// werden (sie zieht sich nicht von selbst); kommt eine dazu oder wird eine gegen eine andere
+/// getauscht, schlägt er an.
+pub const IDENTITY_DEBTS: [&str; 3] = [
+    "SyscallMapByCap",
+    "KernelSetupMapping",
+    "DeviceDmaWindow",
+];
 
 impl Va {
     /// **`SYS_MAP`/`SYS_UNMAP`** — s. [`IdentityReason::SyscallMapByCap`].

@@ -1426,6 +1426,19 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       Abweichung), hat aber in 12 Läufen nicht ausgelöst. Ohne die fehlschlagende Zeile ist jede
       Ursachenvermutung Prosa.
 
+      **Die drei Ausfälle gehören wahrscheinlich zusammen — und das Prior liegt beim GERÜST.**
+      aarch64 unter Parallellast, x86-Lade-Suite bei 512M sequenziell, x86 `RUNS=8` mit einem
+      Protokoll, dessen **Signatur mit der eines grünen Laufs identisch** ist. Der letzte Befund
+      ist der aussagekräftigste: wenn alle Ergebniszeilen stimmen und der Lauf trotzdem
+      durchfällt, bricht eine Prüfung, die **nichts mit der geprüften Eigenschaft zu tun hat** —
+      abgeschnittene Ausgabe, Zeitlimit im Erwartungsabgleich, ein verlorenes letztes Zeichen.
+
+      In dieser Sitzung wurde der Messaufbau **dreimal** als schuldig überführt (`tail -1`; drei
+      Suiten ohne Protokoll; ein Rückhalteblock hinter der Löschung). Nach drei Treffern ist die
+      naheliegende Hypothese nicht mehr „drei seltene Kernelfehler", sondern **ein Gerüstfehler**.
+      Die drei zusammen zu behandeln und zuerst dort zu suchen, ist billiger als drei getrennte
+      Jagden.
+
       **Nicht als „Umgebung" ablegen.** Ein Fehler, der nur bei Überbuchung des Wirts auftritt,
       ist ein Kandidat für ein verpasstes `WFE`-Wakeup oder ein Timer/IPI-Rennen — zeitabhängige
       Kernelfehler leben genau dort, und die Emulation verschiebt nur die Wahrscheinlichkeit,
@@ -1463,15 +1476,42 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
         Sammelschleife wieder nur als `tail -1` festhielt.
 
       **Dieselbe Lücke, eine Ebene höher.** Die Suite bewahrt jetzt das *Kernel*-Protokoll; was
-      fehlt, ist die *Urteilsausgabe*. Drei weitere `RUNS=8`-Durchgänge (24 Läufe) danach waren
-      grün — die Rate liegt also grob bei 1/32, und ohne die Prüfzeile ist nicht einmal bekannt,
-      **welche** Aussage bricht.
+      fehlte, war die *Urteilsausgabe*. Drei weitere `RUNS=8`-Durchgänge (24 Läufe) danach waren
+      grün.
 
-      **Zu tun, in dieser Reihenfolge:** (1) Sammelläufe halten die **vollständige stdout** der
-      Suite fest, nicht nur die letzte Zeile — ohne das ist jede weitere Messung wieder blind;
-      (2) das Fangnetz nach `tools/` heben und laufen lassen, bis eine Prüfzeile vorliegt;
-      (3) beide Stände mit **je 50+** Läufen messen — alles darunter kann bei dieser Effektgröße
-      nicht trennen (s. o.).
+      **Keine Punktschätzung daraus.** „Die Rate liegt bei 1/32" wäre genau der Fehler von
+      oben, eine Ebene höher: ein Ausfall in 32 Läufen gibt ein 95-%-Intervall von grob
+      **0,5 % bis 16 %** — eine Zahl, die als Baseline notiert wird, macht jede spätere Messung
+      unfalsifizierbar. Festhalten lässt sich: **ein Ausfall in 32, Intervall breit, Rate
+      unbestimmt.** Und ohne die Prüfzeile ist nicht einmal bekannt, **welche** Aussage bricht.
+
+      **(1) erledigt am 2026-08-05:** `tools/sammellauf.sh` hält die **vollständige stdout** je
+      Lauf fest, löscht sie nur bei Erfolg und zeigt bei Ausfall die durchgefallenen Prüfzeilen
+      gleich mit. Es wertet **beide** Melder aus (Rückgabewert *und* Schlusszeile), weil manche
+      Suite `0` liefert und trotzdem `== FAILURES ==` meldet. Gegenprobe in beide Richtungen
+      gefahren. Das stand hier zu Unrecht als Punkt neben Entwurfsarbeit — es war eine Zeile, und
+      es hat dreimal ein Fehlerbild gekostet.
+
+      **Zu tun:** (2) alle Sammelläufe über `sammellauf.sh` führen und laufen lassen, bis eine
+      Prüfzeile vorliegt; (3) **zuerst das Gerüst prüfen** (s. o.), nicht den Kernel; (4) beide
+      Stände mit **je 50+** Läufen messen — alles darunter kann bei dieser Effektgröße nicht
+      trennen.
+
+- [ ] **E-Rest 3g: die Bindung Stelle↔Grund hält ein Skript, nicht der Compiler.**
+      (2026-08-05.) `Va::for_mmio_window` ist eine öffentliche Methode auf `Va` — der DMA-Pfad
+      *könnte* sie rufen. Dass er es nicht tut, hält heute `tools/identitaet.sh` über eine
+      Tabelle Konstruktor→aufrufende Funktion (**Namen**, nicht Anzahl — die erste Fassung zählte
+      und hätte zwei Aufrufe aus dem falschen Paar nicht von Abbilden+Gegenstück unterschieden).
+
+      **Warum nicht rustc.** Die saubere Fassung wäre `pub(in crate::system) const fn
+      for_mmio_window(..)` — aber `Va` liegt in `crate::addr`, und Rusts `pub(in path)` verlangt
+      einen **Vorfahren** des Elements. Ein Modul, das nicht über `addr` liegt, ist nicht
+      ausdrückbar.
+
+      **Der strukturelle Weg:** die Engstellen in ein privates Untermodul ziehen, das seine
+      Zeugen-Typen selbst besitzt (`mod vmap { mod mmio { pub(super) struct Site(()); … } }`).
+      Dann prüft der Compiler die Bindung, und der Wächter darf wieder dumm sein. Kostet einen
+      Umzug von `vspace_map_masked`/`vspace_unmap`/`map_region_into_thread` aus `system.rs`.
 
 - [ ] **E-Rest 3f: der Abbau leitet die Adresse NEU HER, statt zu konsumieren, was das Abbilden
       zurückgab.** (2026-08-05.) `unmap_dma_from_thread(tid, phys, len)` nimmt dieselben rohen
@@ -1484,6 +1524,11 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       Asymmetrie ist **unkonstruierbar** statt auffindbar. Das passt zu den vorhandenen
       Teardown-Token (ext-37) und zum `Owned<T>`-Typestate der virtio-Crate — dieselbe Bauform,
       eine Ebene tiefer.
+
+      **Das Handle muss an die PD gebunden sein**, sonst entsteht die nächste Faltung: ein Handle
+      aus PD A, das in PD B abbaut, wäre wieder derselbe Wert mit zwei Bedeutungen. Die Bindung
+      gehört in den Typ (ASID oder PD-Id im Handle, vom Abbau geprüft), nicht in eine
+      Aufrufkonvention.
 
       Reihenfolge: nach E-Rest 3e (a), weil der Fenster-Umbau die Signatur ohnehin anfasst.
 
@@ -1513,6 +1558,12 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       Richtig: die Einschränkung gehört an die **Geräte-Cap** bzw. an die DMA-Domäne, und die
       Zuteilung ist dann ein **Join** aus Regionsangebot und Gerätebeschränkung — dieselbe Form
       wie „Farbe UND Zone in einer Entscheidung" (E-Rest 3b) und wie Farbe+NUMA (Z8).
+
+      **Der Fehlerfall des Joins — leere Schnittmenge — gehört an die Cap-ABLEITUNG, nicht an den
+      DMA-Zeitpunkt.** Eine Geräte-Cap, für die kein zulässiges Angebot existiert, sollte gar
+      nicht erst herstellbar sein. Sonst entsteht eine Cap, die aussieht wie Autorität und beim
+      ersten Gebrauch scheitert — dieselbe Form wie ein Manifest-Eintrag, dessen Selektor auf kein
+      Gerät passt (A-5.3), und dort ist die Antwort schon „abweisen statt raten".
 
       Heute meldet die Suite die Angabe als Abwesenheit
       (`dmawin : Geraete-ohne-deklarierte-Adressbreite=1`) — ehrlich, aber ein **Zähler für eine

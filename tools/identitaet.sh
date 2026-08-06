@@ -95,6 +95,39 @@ elif [ "$(echo "$ZEUGEN" | wc -w)" -ne "$(echo "$KONSTRUKTOREN" | wc -w)" ]; the
 else
     ok "$(echo "$ZEUGEN" | wc -w) Zeugen mit privatem Feld, einer je Stellen-Konstruktor -- die Bindung prueft rustc"
 fi
+# **rustc prueft HERSTELLBARKEIT, nicht NICHT-WEITERGABE** -- und genau da bleibt eine Luecke,
+# die kein Typ schliesst. Innerhalb des Engstellen-Moduls ist ein Zeuge beliebig oft
+# konstruierbar; nichts hindert dort
+#   * ein `pub fn witness() -> MmioWindowWitness`,
+#   * ein `#[derive(Clone, Copy)]` auf dem Zeugen,
+#   * oder ein oeffentliches Feld/Rueckgabewert, der einen traegt.
+# Jede dieser drei Zeilen gaebe die Bindung wieder frei -- und die Namenstabelle, die das frueher
+# gemerkt haette, ist mit dem Zeugen-Umbau entfallen. Also wird hier geprueft, was der Compiler
+# nicht abdeckt.
+ausbruch=""
+for z in $ZEUGEN; do
+    # (a) Ableitungen, die den Zeugen kopierbar oder herstellbar machen.
+    if grep -B 3 "^pub struct $z(());" kernel/src/system.rs | grep -qE '#\[derive\(.*(Clone|Copy|Default)'; then
+        ausbruch="$ausbruch\n    $z: leitet Clone/Copy/Default ab -- ein Zeuge, den man vervielfaeltigen kann, bindet nichts"
+    fi
+    # (b) Der Zeuge in RUECKGABEPOSITION einer oeffentlichen Funktion.
+    if grep -qE "^ *pub (const )?fn [a-z_0-9]+\(.*\) *-> *(\w+::)?$z\b" kernel/src/system.rs; then
+        ausbruch="$ausbruch\n    $z: wird von einer oeffentlichen Funktion ZURUECKGEGEBEN -- damit ist er ausserhalb beschaffbar"
+    fi
+    # (c) Der Zeuge als oeffentliches Feld. **Nicht zeilenanfangs verankern:** die erste Fassung
+    # tat es und uebersah ein `pub struct T { pub w: MmioWindowWitness }` in EINER Zeile -- die
+    # Gegenprobe zeigte es sofort. Ein Muster, das nur die uebliche Formatierung trifft, prueft
+    # den Stil und nicht die Eigenschaft.
+    if grep -qE "pub +[a-z_0-9]+ *: *(\w+::)?$z\b" kernel/src/system.rs; then
+        ausbruch="$ausbruch\n    $z: steht als oeffentliches FELD -- wer die Struktur hat, hat den Zeugen"
+    fi
+done
+if [ -n "$ausbruch" ]; then
+    nok "Zeuge(n) koennen ENTKOMMEN:$(printf '%b' "$ausbruch")"
+else
+    ok "kein Zeuge entkommt: keiner leitet Clone/Copy/Default ab, keiner steht in Rueckgabeposition oder als oeffentliches Feld"
+fi
+
 # Und: jeder Konstruktor NIMMT auch einen Zeugen. Ohne das waeren die Typen Zierde.
 ohne_zeuge=""
 for k in $KONSTRUKTOREN; do

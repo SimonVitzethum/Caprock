@@ -1445,15 +1445,27 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       vorher auf", nur mit umgekehrtem Vorzeichen. Deshalb **jetzt** hingeschrieben, solange das
       Prior noch nicht liebgewonnen ist:
 
-      Ein Ausfall gilt als **Kernel-Befund**, wenn *eine* der beiden Bedingungen erfüllt ist:
-      * eine **reproduzierbare Prüfzeile** bei korrektem Exit-Code — die Suite kommt zu Ende,
-        meldet ihr Urteil, und dieselbe Zeile fällt in einem zweiten Lauf wieder durch;
-      * oder die Ausgabe **weicht inhaltlich ab, statt abzubrechen** — Werte, Zähler oder
-        Reihenfolge sind anders, nicht bloss kürzer.
+      **Das Kriterium hängt an der FORM des Artefakts, nicht an der Wiederholbarkeit.** Die erste
+      Fassung verlangte eine *reproduzierbare* Prüfzeile — und hätte damit genau die Klasse
+      ausgeschlossen, um die es hier geht: ein verpasstes `WFE`-Wakeup oder ein Timer/IPI-Rennen
+      bei 1 in 32 reproduziert nicht und wäre auf ewig unter „Gerüst" gefallen. Das wäre dem
+      Prior eine Tür gegeben, durch die es nicht widerlegt werden kann — dieselbe Bequemlichkeit
+      wie „trat auch vorher auf", nur mit umgekehrtem Vorzeichen.
+
+      Ein Ausfall ist ein **Kernel-Befund**, wenn **alle drei** Merkmale zutreffen — ein
+      **einzelner** Lauf kann das erfüllen:
+      1. die Ausgabe ist **vollständig bis zum Ende** (Schlusszeile vorhanden),
+      2. der **Exit-Code passt zum Urteil** (kein `exit 0` mit `FAILURES`, kein Abbruch),
+      3. eine Prüfzeile **weicht inhaltlich ab** — Werte, Zähler oder Reihenfolge sind anders,
+         nicht bloss kürzer oder fehlend.
 
       Alles andere — abgeschnittene Ausgabe, fehlende Schlusszeile, Zeitlimit im
       Erwartungsabgleich, Exit-Code ohne passendes Urteil — ist bis auf Weiteres ein
       **Gerüst-Befund** und wird dort gesucht.
+
+      **Wiederholbarkeit gehört in die Priorisierung, nicht in die Klassifikation.** Ein
+      einmaliger Kernel-Befund ist ein Kernel-Befund; dass er schwerer zu jagen ist, ändert
+      nichts daran, was er ist.
 
       **Nicht als „Umgebung" ablegen.** Ein Fehler, der nur bei Überbuchung des Wirts auftritt,
       ist ein Kandidat für ein verpasstes `WFE`-Wakeup oder ein Timer/IPI-Rennen — zeitabhängige
@@ -1512,12 +1524,25 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
         verbucht. **Damit ist die Grün-Bilanz beschädigt, nicht nur die rote** — und weil bei
         Erfolg gelöscht wurde, liess sich nicht nachzählen, wie oft.
 
-      **Reichweite, so genau wie sie geht:** die Datei existierte für **einen** Sammellauf, bevor
-      der Fehler auffiel; dort zeigte `load 6G` die leere Schlusszeile und wurde grün gebucht (der
-      Wiederholungslauf war dann echt grün). Die aarch64-Bisect-Reihe lief **nicht** über diese
-      Datei, sondern über ein Skript mit exaktem Zeichenvergleich
-      (`[ "$r" = "== ALL PASS ==" ]`) — eine abgeschnittene Zeile wäre dort **nicht** als grün
-      gezählt worden. Die 6/6 sind davon also unberührt.
+      **Reichweite, und diesmal für ALLE Messreihen dieser Sitzung nachgesehen — nicht nur für
+      den neuen Sammler.**
+
+      | Bau | Grün-Kriterium | fehlsicher? |
+      |---|---|---|
+      | `sammellauf.sh` (1 Lauf, vor der Behebung) | leere Zeile galt als Erfolg | **nein** — `load 6G` betroffen, Wiederholung dann echt grün |
+      | `armlast.sh` (aarch64-Bisect, 6+6 Läufe) | `[ "$r" = "== ALL PASS ==" ]`, exakter Zeichenvergleich | ja |
+      | `armfang.sh` (12 Läufe) | `grep -q "ALL PASS"` auf der Schlusszeile | ja |
+      | die `for M in …`-Schleifen (RAM-Reihen, `RUNS=8`) | letzte Zeile **gedruckt**, von mir gelesen | ja, mit Einschränkung |
+
+      Der Grund, warum die letzten drei tragen, steht im Quelltext der Suiten und wurde
+      nachgesehen: `== ALL PASS ==` wird **ausschliesslich** im `fail = 0`-Zweig als letzte
+      Ausgabe vor `exit "$fail"` geschrieben. Ein abgebrochener, abgeschnittener oder
+      durchgefallener Lauf kann diese Zeile nicht als letzte tragen, und Text und Exit-Code können
+      in der grünen Richtung nicht auseinanderlaufen. Die Einschränkung bei den Schleifen ist
+      menschlich (ich habe die Zeilen gelesen), nicht mechanisch — und leere Zeilen sind mir
+      beide Male aufgefallen.
+
+      **Damit steht die Grün-Bilanz dieser Sitzung**, mit der einen benannten Ausnahme.
 
       **Zwei Festlegungen daraus.** (A) Der Ausgang entscheidet sich am **Exit-Code**, nicht am
       Text — sonst wächst mit jeder neuen Suite eine Formel und mit ihr ein Loch. Der Text wird

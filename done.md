@@ -81,6 +81,56 @@ prueft.
 
 ---
 
+## Ein Ausstieg, der nicht ausschliesst -- und Zeugen, die nicht entkommen (2026-08-06)
+
+**Der D12-Ausstieg schloss seltene Kernelfehler per Definition aus.** Die erste Fassung verlangte
+eine **reproduzierbare** Pruefzeile. Die Ausfaelle liegen bei grob 1 in 32 -- die Klasse, um die
+es geht, ist genau die, die nicht reproduziert: ein verpasstes `WFE`-Wakeup, ein Timer/IPI-Rennen.
+Beide haetten das Kriterium nie erfuellt und waeren auf ewig unter „Geruest" gefallen. Damit haette
+das Prior eine Tuer bekommen, durch die es nicht widerlegt werden kann -- **dieselbe Bequemlichkeit
+wie „trat auch vorher auf", nur mit umgekehrtem Vorzeichen.**
+
+Das Kriterium haengt jetzt an der **Form des Artefakts**, und ein **einzelner** Lauf kann es
+erfuellen: vollstaendige Ausgabe bis zum Ende, Exit-Code passend zum Urteil, und eine Pruefzeile,
+die **inhaltlich** abweicht (Werte, Zaehler, Reihenfolge) statt bloss zu fehlen. Wiederholbarkeit
+gehoert in die **Priorisierung**, nicht in die Klassifikation: ein einmaliger Kernel-Befund ist
+einer, auch wenn er schwerer zu jagen ist.
+
+**Die Zeugen konnten entkommen.** `MmioWindowWitness(())` ist ausserhalb nicht herstellbar --
+innerhalb des Engstellen-Moduls aber beliebig oft, und nichts hinderte dort ein
+`pub fn witness() -> MmioWindowWitness`, ein `#[derive(Clone, Copy)]` oder ein oeffentliches Feld.
+**rustc prueft Herstellbarkeit, nicht Nicht-Weitergabe** -- und die Namenstabelle, die das frueher
+gemerkt haette, war mit dem Zeugen-Umbau entfallen. Der Waechter prueft jetzt genau diese Luecke:
+kein Zeuge leitet `Clone`/`Copy`/`Default` ab, keiner steht in Rueckgabeposition einer
+oeffentlichen Funktion, keiner als oeffentliches Feld. Alle drei Wege als Gegenprobe gefahren.
+
+Der dritte fiel dabei zuerst durch: mein Muster war zeilenanfangs verankert und uebersah ein
+`pub struct T { pub w: MmioWindowWitness }` in EINER Zeile. **Ein Muster, das nur die uebliche
+Formatierung trifft, prueft den Stil und nicht die Eigenschaft.**
+
+**Die Reichweiten-Nachrechnung deckte nur den neuen Sammler.** Nachgeholt fuer alle Messreihen
+dieser Sitzung:
+
+| Bau | Gruen-Kriterium | fehlsicher? |
+|---|---|---|
+| `sammellauf.sh` (1 Lauf, vor der Behebung) | leere Zeile galt als Erfolg | **nein** -- `load 6G`, Wiederholung dann echt gruen |
+| `armlast.sh` (aarch64-Bisect) | exakter Zeichenvergleich | ja |
+| `armfang.sh` | `grep -q "ALL PASS"` auf der Schlusszeile | ja |
+| die `for M in …`-Schleifen | letzte Zeile gedruckt, von mir gelesen | ja, mit menschlicher Einschraenkung |
+
+Der Grund steht im Quelltext der Suiten und wurde nachgesehen: `== ALL PASS ==` wird
+**ausschliesslich** im `fail = 0`-Zweig als letzte Ausgabe vor `exit "$fail"` geschrieben. Ein
+abgebrochener oder durchgefallener Lauf kann sie nicht als letzte tragen; Text und Exit-Code
+koennen in der gruenen Richtung nicht auseinanderlaufen. **Damit steht die Gruen-Bilanz dieser
+Sitzung**, mit der einen benannten Ausnahme.
+
+**`SAMMELLAUF_BEHALTEN=0` ist weg -- Rotation statt Abschalter.** So ein Schalter wird irgendwann
+aus Platzgruenden gesetzt und nie zurueckgenommen; danach ist die Rueckhaltung weg, und niemand
+merkt es. Jetzt hoechstens `SAMMELLAUF_MAX` (200) Protokolle, aelteste fallen weg. Dieselbe
+Ueberlegung wie beim Loeschen der Logs vor der Pruefung, eine Ebene hoeher.
+
+---
+
 ## Erfundene Erfolge, und warum der Sammler nur `$?` lesen darf (2026-08-05)
 
 **Der schwerere Teil des Sammler-Fehlers war nicht der verlorene Fehlschlag.** Ich hatte die zwei

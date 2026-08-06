@@ -35,6 +35,16 @@ NAME="$1"; shift
 mkdir -p build/diag
 ZIEL="build/diag/sammellauf-${NAME}-$(date +%Y%m%d-%H%M%S).log"
 
+# Rotation: hoechstens `SAMMELLAUF_MAX` Protokolle, aelteste zuerst weg. Kein Abschalter.
+rotieren() {
+    local max="${SAMMELLAUF_MAX:-200}"
+    local n
+    n="$(ls -1 build/diag/sammellauf-*.log 2>/dev/null | wc -l)"
+    if [ "$n" -gt "$max" ]; then
+        ls -1t build/diag/sammellauf-*.log 2>/dev/null | tail -n "+$((max + 1))" | xargs -r rm -f
+    fi
+}
+
 "$@" >"$ZIEL" 2>&1
 rc=$?
 LETZTE="$(tail -1 "$ZIEL" 2>/dev/null)"
@@ -57,9 +67,16 @@ LETZTE="$(tail -1 "$ZIEL" 2>/dev/null)"
 # Suite bei Fehlschlag `0` zurueck, ist **das** der Fehler -- einer in der Suite. Der Text wird
 # nur GEGENGELESEN und ein Widerspruch gemeldet; er urteilt nicht.
 #
-# **(B) Vorerst wird AUCH BEI ERFOLG behalten** (`SAMMELLAUF_BEHALTEN=0` schaltet es ab). Solange
-# nicht ein paar Dutzend Laeufe hier durchgegangen sind, ist „gruen" eine Aussage dieser Datei
-# ueber sich selbst. Speicher ist billiger als eine zweite Runde dieser Erkenntnis.
+# **(B) Es wird AUCH BEI ERFOLG behalten -- mit Obergrenze und Rotation statt Abschalter.**
+# Solange nicht ein paar Dutzend Laeufe hier durchgegangen sind, ist „gruen" eine Aussage dieser
+# Datei ueber sich selbst.
+#
+# Ein `SAMMELLAUF_BEHALTEN=0` stand hier zuerst. Das waere derselbe Fehler eine Ebene hoeher: so
+# ein Schalter wird irgendwann aus Platzgruenden gesetzt und nie zurueckgenommen -- danach ist die
+# Rueckhaltung weg, und niemand merkt es. Stattdessen eine **Rotation**: hoechstens
+# `SAMMELLAUF_MAX` (Vorgabe 200) Protokolle, die aeltesten fallen weg. Das Verhalten bleibt
+# stabil, ohne dass jemand die Eigenschaft abschalten muss -- dieselbe Ueberlegung wie beim
+# Loeschen der Logs vor der Pruefung.
 
 # Widerspruch Text <-> Exit-Code: ein BEFUND ueber die Suite, kein Urteil dieses Sammlers.
 if [ "$rc" -eq 0 ] && grep -qE "FAILURES|VERLETZT|NICHT SPRECHFAEHIG|BEFUND" <<<"$LETZTE"; then
@@ -76,11 +93,8 @@ fi
 
 if [ "$rc" -eq 0 ]; then
     echo "${LETZTE:-(keine Ausgabe)}"
-    if [ "${SAMMELLAUF_BEHALTEN:-1}" = "0" ]; then
-        rm -f "$ZIEL"
-    else
-        echo "  (behalten: $ZIEL -- Festlegung (B))"
-    fi
+    echo "  (behalten: $ZIEL -- Festlegung (B))"
+    rotieren
     exit 0
 fi
 echo "${LETZTE:-(keine Ausgabe)}"

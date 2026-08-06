@@ -531,6 +531,21 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   4 GiB gar keinen Speicher gibt — gezaehlt hatte er eine absichtlich uebergrosse Anforderung,
   die NIRGENDS passte. „Unten war kein Platz" und „es wurde oben genommen" sind zwei Aussagen;
   dieselbe Verwechslung wie `rx_used` gegen „Daten sind angekommen".
+* **Ein Ausstiegskriterium, das Wiederholbarkeit verlangt, schliesst seltene Fehler per
+  Definition aus.** Der erste D12-Ausstieg tat das -- und die Klasse, um die es geht (verpasstes
+  WFE-Wakeup, Timer/IPI-Rennen bei 1 in 32), reproduziert gerade nicht. Ein Kriterium gehoert an
+  die **Form des Artefakts** (vollstaendige Ausgabe, passender Exit-Code, inhaltlich abweichende
+  Pruefzeile); Wiederholbarkeit gehoert in die Priorisierung.
+* **rustc prueft HERSTELLBARKEIT, nicht NICHT-WEITERGABE.** Ein Zeuge mit privatem Feld ist
+  ausserhalb nicht konstruierbar -- innerhalb seines Moduls aber beliebig, und ein
+  `pub fn witness()`, ein `#[derive(Copy)]` oder ein oeffentliches Feld gibt die Bindung wieder
+  frei. Was der Typ nicht abdeckt, muss der Waechter pruefen.
+* **Ein Muster, das nur die uebliche Formatierung trifft, prueft den Stil und nicht die
+  Eigenschaft.** Die Feldpruefung war zeilenanfangs verankert und uebersah
+  `pub struct T { pub w: Witness }` in einer Zeile.
+* **Ein Abschalter fuer eine Sicherheitseigenschaft wird gesetzt und nie zurueckgenommen.**
+  `SAMMELLAUF_BEHALTEN=0` ist durch eine Rotation ersetzt: das Verhalten bleibt stabil, ohne dass
+  jemand die Eigenschaft ganz abschalten muss.
 * **Ein Loch im Pruefer beschaedigt die GRUEN-Bilanz, nicht nur die rote.** „Leere Schlusszeile
   galt als Erfolg" hat kein Fehlerbild verloren -- es hat einen **Erfolg erfunden**: ein
   abgebrochener Lauf wurde gruen gebucht, und weil bei Erfolg geloescht wurde, war nicht

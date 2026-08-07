@@ -126,7 +126,48 @@ auf ein Modellfeld abzubilden, das etwas anderes heißt, wäre schlimmer, als es
 führen — der Beweis zeigte dann eine Aussage über `in_ready`, und man **läse** sie als Aussage
 über `admitted`.
 
-### 6. Der Melder, ohne den nichts davon messbar gewesen wäre
+### 6. Die Abnahme: 0 von 50 000
+
+| | vorher (2026-08-07, 09:xx) | nachher (2026-08-07, 16:35–18:35) |
+|---|---|---|
+| Läufe | 50 000 | 50 000 |
+| D0-Treffer | **9** | **0** |
+| Rate | 0,0180 % | — |
+
+* `P(0 Treffer | unveränderte Rate)` = `e⁻⁹` ≈ **1,2·10⁻⁴**
+* Alle 9 Treffer in der ersten Reihe, keiner in der zweiten: `0,5⁹` ≈ **0,002** (einseitig)
+* Obere 95-%-Schranke der neuen Rate (Dreierregel): **0,006 %**, also höchstens einer je 16 666 —
+  mindestens ein Faktor 3 unter der alten Rate, und mit Null verträglich.
+
+Beide Reihen liefen mit **demselben Messaufbau**, und der hat den Fehler nachweislich gesehen:
+9-mal in Reihe 1, 5-mal in einer Zwischenreihe über 6895 Läufe. Eine Nullmessung ist nur so viel
+wert wie der Beleg, dass der Aufbau überhaupt sprechen kann.
+
+### 7. Die vier Abweichungen, die übrig blieben — und warum sie kein Kernelbefund sind
+
+Die zweite Reihe meldete 4 Abweichungen in 50 000 Läufen, **keine davon D0** (`Schleife
+verlassen: nein` in allen vieren). Zwei Bilder:
+
+| Bild | Zahl | Messwert |
+|---|---|---|
+| `cycles : FAILURES` | 2 | 1-ms-Fenster = 11 689 334 bzw. 11 720 490 Zyklen statt 2 803 578 — **Faktor 4,2** |
+| `freeze : FAILURES` | 2 | ein ~30-ms-Fenster sah **0** Worker-Runden statt 3 |
+
+**Die Entscheidung fällt nicht an der Zahl, sondern an der FORM.** Bei einem der beiden
+`freeze`-Fehlschläge fiel `laeuft-vorher=false (49->49)` durch — das ist die **Positivkontrolle**,
+gemessen *bevor* überhaupt eingefroren wird. Ein Fehler im Auftaupfad kann sie strukturell nicht
+verursachen. Damit ist die naheliegende Lesart („die Umstellung hat `thaw` beschädigt") widerlegt,
+ohne dass man den Auftaupfad überhaupt ansehen muss.
+
+Was beide Bilder gemeinsam haben: ein Fenster, das in **Wanduhrzeit** definiert ist. Der Messstand
+fährt 16 Gäste zu je 4 vCPU auf 20 Kernen — **3,2-fache Überbuchung**. Wird eine vCPU vom Wirt
+verdrängt, laufen Ticks und TSC weiter, die Gastausführung nicht. Der Faktor 4,2 im
+`cycles`-Fenster ist genau das, gemessen.
+
+Das ist ein Befund über den **Messstand**, nicht über den Kernel — steht als eigener Punkt in
+`todo.md`. Belege: `docs/befunde/d0/lastartefakt-{freeze,cycles}-2026-08-07.log`.
+
+### 8. Der Melder, ohne den nichts davon messbar gewesen wäre
 
 Der Server-Rumpf lautete `if m.result != result::OK { break; }` — der **Grund** des Ausstiegs fiel
 auf den Boden. Eine Zeile (`IPC_SERVER_EXIT.store(m.result, ..)` plus eine Berichtszeile) machte

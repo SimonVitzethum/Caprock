@@ -25,7 +25,7 @@ Zweig `arch/x86_64` (2026-08-03).
 
 | | |
 |---|---|
-| x86_64 | **49 991 von 50 000** mit identischer Signatur (2026-08-07, `tools/d0-messen.sh`, 16 parallele Stroeme gegen EINE Referenz). Die 9 Abweichungen sind D0 — alle neun zeichengleich, Vollprotokolle in `docs/befunde/d0/`. Rate 0,0180 %, 95-%-Intervall [0,0082 %, 0,0342 %] |
+| x86_64 | **49 996 von 50 000** nach der D0-Behebung (2026-08-07 abends, `tools/d0-messen.sh`, 16 parallele Stroeme gegen EINE Referenz). **0 D0-Treffer** — davor 9 in 50 000. Die 4 Abweichungen sind Lastartefakte des Messstands (3,2-fache vCPU-Ueberbuchung), s. todo D13 |
 | x86_64 RAM-Reihe | `== ALL PASS ==` bei **512M · 2560M · 3G · 6G**, Haupt- **und** Lade-Suite (2026-08-04). Vor E-Rest 3 starb ab 3G der Boot mit `#PF cr2=0x70_0000_0014` — der Zweig „RAM oberhalb 4 GiB" war nie gelaufen |
 | x86_64 Lade-Suite | `== ALL PASS ==` (2026-08-03: 39 Pruefungen — 5 Module, **zwei** Treiber-PDs, Austausch, A-5.3/A-5.4, dazu **drei** verkettete Boots fuer Z4 Stufe 2, inkl. sieben Negativfaellen) |
 | aarch64 | `RUNS=6` → **6 von 6** mit identischer Signatur, `== ALL PASS ==` (2026-08-02, **mit Root-Task**; davor 16/16 ohne, s. D6/D5) |
@@ -33,7 +33,12 @@ Zweig `arch/x86_64` (2026-08-03).
 | Verus | **16 Beweisdateien, 0 errors** — dazu **drei** Modell-Treue-Waechter (cap_space, IPC, Scheduler) mit 28 · 28 · 30 Selbsttestfaellen (2026-08-03) |
 | Scheduler-Messung | `tools/sched-erschoepfung-messen.sh`: 208 Messwerte, Positivkontrolle bestanden, vier Fassungen (echt/V0/H-a/H-b) — belegt D8, D9 und D10 |
 
-**D0 ist am 2026-08-07 gefangen worden — mit 50 000 Läufen.** 9 Abweichungen, alle neun
+**D0 ist am 2026-08-07 gefangen UND behoben worden.** Abnahme: **0 Treffer in 50 000 Läufen**
+gegen 9 in 50 000 davor, gleicher Messstand. `P(0 | unveränderte Rate) = e⁻⁹ ≈ 1,2·10⁻⁴`; dass alle
+9 in die erste Reihe fallen, hat `0,5⁹ ≈ 0,002`. Obere 95-%-Schranke der neuen Rate: 0,006 %.
+Die Ursache und der Umbau stehen in `done.md`; hier bleibt, wie der Fehler aussah:
+
+**Der Fund selbst — mit 50 000 Läufen.** 9 Abweichungen, alle neun
 zeichengleich (gleiche MD5 über den Signaturdiff, verteilt über fünf Ströme). Rate **0,0180 %**,
 95-%-Intervall **[0,0082 %, 0,0342 %]**, einer je **5556** Läufen.
 
@@ -151,8 +156,16 @@ falsch.
   macht er sein erstes `RECV` mit LEEREM Cspace, bekommt `ERR_NOPD` und verlaesst seine Schleife
   fuer immer. Gemessen: 9 Treffer in 50 000 Laeufen (0,0180 %, einer je 5556), alle neun
   zeichengleich; danach 5 in 6895 mit dem Melder, **4 von 4 `ERR_NOPD`**.
-  Behoben strukturell: der Scheduler trennt `spawn_parked` von `admit`, 58 Aufrufstellen
-  umgestellt, `load_into_pd` mit dazu. Details in `done.md`.
+  Behoben strukturell: der Scheduler trennt `spawn_parked` von `admit`, 61 Aufrufstellen
+  umgestellt, `load_into_pd` mit dazu. **Abnahme: 0 Treffer in 50 000 Laeufen** am selben
+  Messstand, der den Fehler vorher 9-mal gefangen hat. Details in `done.md`.
+* **Die vier uebrig gebliebenen Abweichungen sind ein Befund ueber den MESSSTAND.** Zwei
+  `cycles`, zwei `freeze` -- und entschieden hat nicht die Zahl, sondern die FORM: bei einem der
+  `freeze`-Fehlschlaege fiel die **Positivkontrolle** durch (`laeuft-vorher=false`), gemessen
+  bevor ueberhaupt eingefroren wird. Ein Fehler im Auftaupfad kann sie strukturell nicht
+  verursachen. Gemeinsam ist beiden Bildern ein Fenster in **Wanduhrzeit**, und der Stand faehrt
+  16 Gaeste zu je 4 vCPU auf 20 Kernen -- 3,2-fache Ueberbuchung; das `cycles`-Fenster mass
+  Faktor 4,2. Steht als D13 in `todo.md`.
 * **Warum niemand es frueher sah — und die Zahl, die dazugehoert.** Die 2300 sauberen Laeufe
   vom 2026-08-03 galten als „die alte Quote ist ausgeschlossen". Bei der wahren Rate ist
   `0,99982²³⁰⁰ ≈ 66 %` — ein Nullbefund war der **wahrscheinlichste** Ausgang. Die belastbare

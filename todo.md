@@ -827,380 +827,48 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
 
 ---
 
-## D0. Instabilität des x86-Laufs (2026-07-29, **gefangen am 2026-08-07**)
-**Klasse:** Fehler · **Aufwand:** Fehlerbild vollständig protokolliert, Ursache eingegrenzt auf
-den Ausstieg des IPC-Servers aus seiner `RECV`-Schleife
+## D13. Die Suite hat Prüfungen, die in WANDUHRZEIT messen — und der Messstand ist überbucht
+**Klasse:** Messstand · **Aufwand:** klein, aber die Abgrenzung ist die eigentliche Arbeit
 
-- [ ] **50 000 Läufe am 2026-08-07: 9 Abweichungen, alle neun zeichengleich — D0 hat zum ersten
-      Mal ein Vollprotokoll.** `tools/d0-messen.sh`, 16 parallele Ströme gegen EINE
-      Referenzsignatur, jeder abweichende Lauf vollständig abgelegt.
+- [ ] **Gemessen am 2026-08-07: 4 Abweichungen in 50 000 Läufen, alle vier Lastartefakte.** Der
+      D0-Messstand fährt 16 Gäste zu je 4 vCPU auf 20 Kernen — **3,2-fache Überbuchung**. Wird eine
+      vCPU vom Wirt verdrängt, laufen Ticks und TSC weiter, die Gastausführung nicht.
 
-      | | |
-      |---|---|
-      | gefahren | 50 000 |
-      | normal | 49 991 |
-      | abweichend | **9** |
-      | Rate | **0,0180 %** — einer je **5556** Läufen |
-      | 95-%-Intervall (Wilson) | **[0,0082 %, 0,0342 %]** |
-
-      Damit ist auch die dritte Erklärung von 2026-08-03 entschieden: die Rate lag **nie** bei
-      0,5 %, und die 2300 sauberen Läufe waren keine Behebung, sondern eine zu kleine
-      Stichprobe — `0,99982²³⁰⁰ ≈ 66 %`, ein Nullbefund war der wahrscheinlichste Ausgang.
-      Belege: `docs/befunde/d0/d0-lauf-2026-08-07.log` (Vollprotokoll), `.sigdiff`,
-      `referenz-2026-08-07.log`.
-
-      **Alle neun sind derselbe Fehler**, nicht neun Zufälle: identische MD5 über den
-      Signaturdiff, verteilt über fünf verschiedene Ströme.
-
-- [ ] **Das Fehlerbild — und es ist ein anderes als das von 2026-08-01 vermutete.** Der Diff
-      gegen die Referenz besteht aus genau vier Zeilen:
-
-          ipc     : CALL(21) ueber Endpoint-Cap -> 0 (erwartet 42)     [Referenz: 42]
-          ipc     : FAILURES
-          freeze  : ... IPC-Rolle-abgewiesen=false                     [Referenz: true]
-          == SELFTEST FAILED (watchdog)   (nach 61 s, 16 961 785 Umdrehungen)
-
-      **Der Knoten hängt nicht.** `sched : core 0..3 ticks=6104/6070/6065/6060` gegen 52 in der
-      Referenz, Worker-Runden `[4182, 4176, 4179]` gegen 27 — das System lief die vollen 61 s
-      durch und bestand jede andere Prüfung. Blockiert ist **ein einziger Thread**: der
-      IPC-Client, der auf eine Antwort wartet, die nie kommt.
-
-      Die Zeile, die es verrät, ist `IPC-Rolle-abgewiesen=false`. Sie prüft
-      `freeze_thread(IPC_SERVER_TID)` und erwartet `Busy`, weil ein Thread in `RECV` eine
-      offene IPC-Beziehung hat. Sie meldet `false`, also: **der Server steht in keiner
-      IPC-Rolle mehr** — er hat seine `RECV`/`REPLY`-Schleife verlassen. Danach dreht er in
-      `loop { spin_loop() }`, und der Client wartet auf einen Empfänger, den es nicht mehr gibt.
-
-      Das ist NICHT der „Hänger ab `sched`" von 2026-08-01: dort fehlten alle Zeilen ab dem
-      Scheduler-Test. Hier ist die gesamte Suite da und grün, bis auf `ipc` und die daran
-      hängende `freeze`-Zeile. Die alte Beschreibung („SMP-Hochlauf, Konsolensperre,
-      Idle-Schleife") trifft dieses Bild nicht.
-
-- [ ] **Die Ursache, gemessen (2026-08-07, zweiter Lauf).** `ERR_NOPD`, `Server bediente 0
-      Anfrage(n)` — in **4 von 4** Treffern zeichengleich. Das allererste `RECV` des Servers
-      scheiterte, weil er **noch keine PD hatte**:
-
-          let (srv, cli) = (spawn(ipc_server, ..), spawn(ipc_client, ..));  // ab hier LAUFFAEHIG
-          bind_pd(srv_pd, srv);                                             // Autoritaet erst hier
-
-      Dazwischen liegt der komplette Aufbau des Clients: eine Stackbelegung unter der MEM-Sperre,
-      ein `sched.spawn`, ein `CAPS.write()`. Fällt der Server in dieses Fenster, sieht er einen
-      **leeren Cspace** — dann ist nicht eine Cap unsichtbar, sondern jede.
-
-      **Der Riss steckt auch im Produktionspfad, nicht nur im Testaufbau.** `load_into_pd` macht
-      den Thread mit `spawn_user_at` lauffähig, bindet **danach** die PD und installiert
-      **danach** das Endowment. Dort deckt ein `local_irq_save` die Lücke — aber nur unter zwei
-      Bedingungen, die nirgends festgeschrieben sind: die Ready-Queue ist streng kernlokal, und
-      der Lastausgleich ist aus (Vorgabe). Wer den Schalter umlegt, öffnet ein Fenster, in dem
-      eine geladene Treiber-PD **ohne jede Cap** anläuft.
-
-      **Und das Wissen war da.** An genau **einer** von 53 Stellen steht seit jeher
-      `hal::cpu::local_irq_disable()` mit dem Kommentar „atomar gegen Preempt, damit es nicht vor
-      dem Bind läuft" (`stale_victim`). Eine Gefahr, die an einer Stelle per Hand abgewehrt wird
-      und an 52 nicht, ist keine Sorgfaltsfrage — sie ist ein fehlender Mechanismus.
-
-- [ ] **Behoben am 2026-08-07 — strukturell, nicht durch Reihenfolge.** Es gibt keine
-      Reihenfolge, die trägt: `bind_pd` braucht die `tid`, die `spawn` erst liefert; die Lücke
-      lässt sich verkleinern, nicht schließen. Deshalb trennt der Scheduler jetzt **erzeugen**
-      von **zulassen**:
-
-      | | |
-      |---|---|
-      | `Scheduler::spawn_parked` | legt den Thread an, reiht ihn **nicht** ein |
-      | `Scheduler::admit` | reiht ein — ab hier darf er laufen |
-      | `system::spawn_*_parked` | dieselbe Trennung eine Ebene höher (5 Erzeuger) |
-      | `system::admit_in_pd(pd, tid)` | binden, dann zulassen |
-      | `system::spawn_in_pd(pd, ..)` | alles drei in einem Aufruf |
-
-      Kein `park: bool`. Ein Schalter wäre wieder ein wählbarer Grund, und die bequeme Belegung
-      wäre die falsche — derselbe Befund wie bei `IdentityReason`.
-
-      Umgestellt: **58 Aufrufstellen** (46 mechanisch, 12 von Hand), dazu `load_into_pd` und der
-      IPC-Aufbau in `bringup`. Eine der 12 war ein eigener Fehler derselben Art: die
-      `page_probe`-Sonde bekam ihre drei Mappings **nach** dem Binden — ein `admit_in_pd` an
-      dieser Stelle hätte sie loslaufen lassen, bevor die Seiten standen, und der Test hätte auf
-      P statt auf P+8KiB gefaultet.
-
-- [ ] **Der Wächter dazu zählt die GELEGENHEIT, nicht den Treffer** (`pdbind`-Zeile). Bei 0,018 %
-      wäre ein Melder, der nur beim Unglück spricht, in 5555 von 5556 Läufen stumm — als Wächter
-      wertlos. Die **Reihenfolge** dagegen ist in jedem Lauf prüfbar: `bind_pd` fragt vorher
-      `is_admitted(tid)` (auf dem Kern des **Threads**, nicht des Aufrufers — sonst wäre er
-      ausgerechnet bei `spawn_on_core(1, ..)` blind) und zählt `LATE_PD_BIND`.
-
-      Dazu drei Dinge, ohne die die Zeile weniger wert wäre:
-      * `unklar` getrennt gezählt — „nicht auflösbar" ist kein „rechtzeitig".
-      * **Sprechprobe**: die Zeile fällt durch, wenn in diesem Lauf gar keine Bindung beobachtet
-        wurde. Ein Zähler, der auf Null steht, weil nichts passierte, ist kein Testergebnis.
-      * **erklärte** Spätbindungen tragen einen Namen (`SpaetbindungsGrund`, heute genau einer:
-        Z4 Stufe 2 bindet dem Checkpoint-Subjekt seinen Umfang nachträglich an, und der Worker
-        *benutzt* keine Cap). Kein `if tid == WORKER_TID0` — eine Ausnahme ohne Namen wächst
-        unsichtbar. Gleiche Form wie `IdentityReason`/`IDENTITY_DEBTS`.
-
-- [ ] **Offen: die schärfere Fassung.** Ein `Parked(ThreadId)`, das nur `admit` konsumieren kann,
-      machte das Vergessen zum **Typfehler** statt zu einer Zahl im Bericht. Es wäre ein Umbau
-      aller 93 Spawn-Stellen; der Zähler leistet heute dasselbe über eine Messung und sieht dabei
-      auch die Stellen, die es morgen erst gibt. Die Verschärfung bleibt trotzdem richtig —
-      der Zähler meldet erst zur Laufzeit, der Typ schon beim Übersetzen.
-
-- [ ] **Abnahme (läuft):** dieselbe Messung gegen den behobenen Kernel. Zwischenstand aus zwei
-      abgebrochenen Anläufen (beide wegen eigener Nacharbeit gestoppt, nicht wegen eines Befunds):
-      **0 Abweichungen in 1361 + 5361 Läufen**. Das ist noch keine Aussage — bei 1/5556 sind
-      6722 Läufe `P(0 | unverändert) ≈ 30 %`. Der volle Lauf über 50 000 (`≈ 1,2·10⁻⁴`) steht aus.
-
-      Die **Positivkontrolle steht schon**: derselbe Aufbau hat den Fehler heute zweimal gefangen,
-      9-mal in 50 000 und 5-mal in 6895. Eine Nullmessung ist nur dann etwas wert, wenn der
-      Messaufbau den Fehler nachweislich sehen kann — hier kann er es.
-
-- [ ] **Was die Behebung NICHT abdeckt.** `admit` gibt `false` zurück, wenn die `tid` nicht mehr
-      auflösbar ist; alle Aufrufstellen verwerfen das mit `let _ =`. Für einen frisch geparkten
-      Thread ist der Fall unerreichbar (er hat nie gelaufen, kann also nicht gestorben sein) —
-      aber „unerreichbar, weil heute niemand dazwischenkommt" ist dieselbe Art von Begründung wie
-      die IRQ-Maske in `load_into_pd`. Wenn ein Reaper künftig geparkte Threads einsammelt, hängt
-      hier ein Thread still. Das gehört an einen Zähler, nicht an ein Argument.
-
-- [ ] **Was der Server verschluckt hat — und wie es sichtbar wurde.** Sein Rumpf lautete
-      `let m = invoke(sys::RECV, ..); if m.result != result::OK { break; }` — der **Grund** des
-      Ausstiegs fiel dabei auf den Boden. Seit 2026-08-07 hält `IPC_SERVER_EXIT` ihn fest und
-      der Bericht druckt ihn mitsamt Klarnamen (`ipc : Server bediente N Anfrage(n); Schleife
-      verlassen: …`); im Normalfall steht dort `nein (noch in der Schleife)`.
-
-      Die Kandidatenliste ist kurz und die Codes sind unterscheidbar:
-      `1 ERR_BADCAP` (Startrennen: `RECV` läuft, bevor die Endpoint-Cap installiert ist),
-      `8 ERR_QUIESCING`, `9 ERR_EP_FULL` (D11, seit 2026-08-05 ein eigener Code).
-      **Abnahme:** ein abweichender Lauf mit dieser Zeile im Protokoll — bei 1 Treffer je 5556
-      Läufen reichen dafür ~20 000.
-
-- [ ] **2300 Läufe am 2026-08-03, keine einzige Abweichung. Die alte Quote ist damit
-      ausgeschlossen — die URSACHE ist es nicht.** Gemessen nach dem Tagesstand (Z4 Stufe 2,
-      A-5.4, B-7.3):
-
-      | Reihe | Läufe | Bedingung | Ergebnis |
-      |---|---|---|---|
-      | vormittags | 200 | Leerlauf, KVM | 200 von 200, identische Signatur |
-      | mittags | 600 | 5 parallele Ströme à 120, 20 vCPU auf 20 Kernen | 600 von 600 |
-      | nachmittags | 1500 | 5 parallele Ströme à 300, 8 min Wandzeit | 1500 von 1500 |
-
-      Alle fünf Ströme beider Lastreihen tragen dieselbe Signatur `e419003d625f` — auch über
-      die beiden getrennten Aufrufe hinweg.
-
-      **Die Grundlinie, gegen die zu rechnen ist.** Nicht die alte Gesamtquote von 1,5 %
-      (6/400): davon waren **4 das Farbrennen**, und das ist seit dem 2026-08-01 behoben
-      (500/500). Für das hier noch offene Bild, den **Hänger ab `sched`**, lautet sie 2/400
-      unter Last und 1/200 im Leerlauf, also rund **0,5 %**.
-
-      | Frage | Antwort |
-      |---|---|
-      | Ist eine Rate von 0,5 % noch haltbar? | **Nein.** `0,995²³⁰⁰ ≈ 1·10⁻⁵` |
-      | Ist eine Rate von 0,1 % ausgeschlossen? | **Nein.** `0,999²³⁰⁰ ≈ 10 %` |
-      | Obere 95-%-Schranke (Dreierregel) | `3/2300 ≈ 0,13 %` |
-
-      **Was hier NICHT behauptet wird, und das ist der eigentliche Punkt.** Niemand hat diesen
-      Hänger behoben. Die letzte D0-Arbeit hat das *Farbrennen* beseitigt, nicht ihn. Er ist
-      also nicht *repariert*, sondern **unter die Messschwelle gefallen** — und dafür gibt es
-      drei Erklärungen, die diese Messung nicht auseinanderhält: (a) eine der vielen Änderungen
-      seither (A-5.x, B-5.1, Root-Task auf x86, Z4) hat ihn nebenbei mitgenommen, (b) die
-      Lastform ist eine andere — die alte Serie lief parallel zur **Lade-Suite**, die neue gegen
-      fünf Kopien ihrer selbst, (c) die alte Quote 2/400 war eine Schwankung und die wahre Rate
-      lag immer bei ~0,1 %, wo sie auch jetzt noch liegen dürfte.
-
-      Ein Fehler, der ohne bekannte Ursache verschwindet, ist nicht zu. Er ist nur nicht mehr
-      **greifbar** — und damit auch nicht mehr debuggbar, was die Lage schlechter macht, nicht
-      besser. Der Eintrag bleibt offen und wandert nicht nach `done.md`.
-
-      **Was ihn wirklich schließen würde:** ein Lauf gegen die *ursprüngliche* Lastform (parallel
-      zur Lade-Suite, nicht gegen Kopien der eigenen Suite) in derselben Größenordnung. Fällt er
-      auch dort sauber aus, ist (b) erledigt und nur noch (a)/(c) offen.
-
-      **Zwei Vorbehalte, die zur Zahl gehören.** (a) Die alte Serie lief parallel zur
-      **Lade-Suite**, die neue gegen fünf Kopien ihrer selbst. Beides ist Last, aber ein
-      Fehlerbild, das am Zusammenspiel mit dem Blockgerät hängt, träfe die neue Anordnung
-      schwächer. (b) `pprobe` meldet unter KVM grundsätzlich `SKIP` (`CPUID.1:ECX[31]`) und
-      urteilt in dieser Reihe nicht mit — der Eintrag steht in der Signatur, fällt also auf,
-      ist aber kein bestandener Test.
-
-      **Nebenertrag: die Signaturprüfung hatte ein Loch.** `test-qemu-x86.sh` vergleicht jeden
-      Lauf gegen den **ersten Lauf desselben Aufrufs**. Fünf parallele Ströme mit je einer in
-      sich stimmigen, untereinander aber verschiedenen Signatur hätten damit fünfmal grün
-      gemeldet. Der Quervergleich über die Ströme ist deshalb Teil der Messung (alle fünf
-      `e419003d625f`).
-
-      Dabei fast eine falsche Aussage produziert: ein erster Quervergleich über die *rohen*
-      Zusammenfassungszeilen ergab fünf verschiedene Hashes — das war die **Kalibrierung**
-      (LAPIC 999937800 gegen 1000032500 Hz, TSC 2804 gegen 2803 MHz), nicht der Kernel. Der
-      Vergleich muss durch dieselbe `run_signature`-Extraktion laufen, die auch der Test
-      benutzt; alles andere misst Rauschen.
-
-- [ ] **Der x86-Lauf ist noch nicht deterministisch — aber zwei Größenordnungen seltener als
-      gedacht.** Neu gemessen am 2026-08-01 (200 Läufe, KVM, `-cpu host,+invtsc`, lastfreier
-      Rechner mit 20 Kernen):
-
-      | Messung | Quote |
-      |---|---|
-      | 2026-07-29, 8 Läufe, TCG | 4–6 von 8 vollständig |
-      | 2026-08-01, 200 Läufe, KVM | **199 von 200 mit identischer Ergebnissignatur** |
-
-      Der eine abweichende Lauf (Nr. 174) **riss das Zeitlimit** — er wurde von außen erkannt
-      (`rc=124`), nicht aus dem Logtext. Ihm fehlen ausschließlich die Zeilen ab dem
-      Scheduler-Test (`sched`, `ipc`, `ring3`, `capsz`, `capsum`, `iso`, `root`, `cdelete`,
-      `audit`, `SELFTEST COMPLETE`); alles davor ist vollständig. Er blieb also nach
-      `bringup : 3 Worker + 2 PDs eingeplant` stehen. Das trifft genau die drei Kandidaten,
-      die hier schon standen: **SMP-Hochlauf** (`cpu_on`/`ap_entry`), **Konsolensperre**,
-      **Idle-Schleife mit `all_done()`**.
-
-      **Warum die alte Zahl nicht belastbar war.** Drei Schichten verdeckten einander, jede
-      musste einzeln weg, bevor eine Messung überhaupt etwas aussagen konnte:
-
-      1. `report_and_off()` druckte `SELFTEST COMPLETE` **bedingungslos**, auch nach dem
-         Watchdog (behoben in B-1.8) — ein abgebrochener Lauf zählte als vollständig.
-      2. `color` druckte als einzige Stelle im Kernel `FAIL` statt `FAILURES` (behoben
-         2026-08-01) — ein durchgefallener Test fiel damit aus der Ergebnissignatur **heraus**
-         statt als Abweichung aufzufallen.
-      3. `-no-shutdown` ließ **jeden** Lauf ins Zeitlimit laufen (behoben 2026-08-01) —
-         `rc=124` war immer wahr und trug keine Information. Ein Hänger musste deshalb aus
-         einer Zeile erschlossen werden, die der Kernel selbst drucken muss.
-
-      Seit (3) ist der Rückgabewert ein **zweiter, unabhängiger Melder**: er liegt außerhalb
-      des Kernels und lässt sich von keinem Kernelfehler stillstellen. Genau er hat Lauf 174
-      gefangen.
-
-      Nebenbefund von (3): ein Lauf dauert jetzt 0,86 s statt 130 s (Faktor 152, zeichengleiche
-      Ausgabe). Erst dadurch sind 200 Läufe bezahlbar — vorher hätte dieselbe Aussage sieben
-      Stunden gekostet, und deshalb gab es sie nicht.
-
-- [ ] **Zwei getrennte Fehlerbilder** (400 Läufe am 2026-08-01, davon 6 Abweichungen; die
-      Serie lief parallel zur Load-Suite, die Quote gilt also *unter Last* — im Leerlauf waren
-      es 1 von 200):
-
-      | Bild | Läufe | Rate | vor dem 2026-08-01 sichtbar? |
-      |---|---|---|---|
-      | `color : FAILURES`, `rueckgelesen=0` | 138, 141, 228, 377 | 4/400 | **nein** — `FAIL` fiel aus der Signatur |
-      | Hänger ab `sched` | 115, 235 | 2/400 | **nein** — `rc` war immer 124 |
-
-      Beide waren strukturell unsichtbar. Vollprotokolle liegen unter
-      `build/diag/abweichung-lauf-N.log`.
-
-- [ ] **`color`-Fehlschlag: die Buchführung wird geschrieben, NACHDEM der Thread lauffähig ist**
-      (Ursache am 2026-08-01 im Kernel lokalisiert, noch nicht behoben — ein erster Versuch im
-      Test hat nicht gewirkt, weil das Fenster nicht dort liegt). Alle vier Fehlschläge sind zeichengleich:
-
-          gut:    rueckgelesen=1 (kstack=1 l1=1 l2=1)
-          kaputt: rueckgelesen=0 (kstack=0 l1=0 l2=0)
-
-      Alles andere stimmt in allen Läufen — `in_mask`, `kernelseite`, `disjunkt`,
-      `uebergross_abgewiesen`, `bilanz`. Es ist **kein Farbfehler**, die Zuteilung ist richtig.
-
-      Die drei Felder kommen aus `kstack_of(t.slot())` und `vspace_tables_of(asid_of(...))`;
-      beide liefern `0`, sobald Slot bzw. ASID nicht mehr belegt sind. Dass sie **immer
-      gemeinsam** kippen und nie einzeln, spricht für eine Ursache statt drei.
-
-      `run_color` in `kernel/src/colors.rs` beschreibt dasselbe Rennen bereits — für
-      `balanced`: „nebenher sammelt ein anderer Kern den Stack des gerade gefaulteten
-      `iso_probe`-Threads ein, und je nachdem, ob dieser Rückgang ins Messfenster fällt, wurde
-      derselbe Kernel mal grün und mal rot gemeldet". Der `iso_probe`-Thread faultet
-      **absichtlich** (Isolationstest). Wird er eingesammelt, bevor die Kernelseite gelesen
-      wird, sind Stack und ASID weg.
-
-      **Die Stelle** (`spawn_isolated_colored_inner` in `kernel/src/system.rs`):
-
-          let tid = { let mut sched = SCHEDS[core].lock();
-                      sched.spawn_user(core, entry, arg, kbase, …) };   // lauffähig ab hier
-          match tid { Some(t) => { record_user_kstack(t.slot(), kbase); // Buchführung DANACH
-                                   set_vspace_of(t.slot(), packed);
-
-      Der Thread läuft, sobald `SCHEDS[core]` frei ist; Stack- und VSpace-Buchführung folgen
-      erst danach. Auf vier Kernen kann er dazwischen anlaufen, faulten und eingesammelt
-      werden.
-
-      **Folge jenseits des Tests:** Trifft der Einsammler das Fenster, sieht er
-      `base_of[slot] == 0` und gibt den Kernel-Stack **nie frei** — ein Leck, das kein Test
-      heute sucht. `set_vspace_of` schreibt danach in einen Slot, der bereits neu vergeben sein
-      kann.
-
-      Zu tun: die Buchführung **innerhalb** von `SCHEDS[core].lock()` erledigen, bevor der
-      Thread lauffähig wird — nicht danach. Der Test bekäme die Werte dann verlässlich; das
-      Leck verschwände als Nebenwirkung. Ein Versuch, allein im Test früher zu lesen, wurde
-      gemessen und half nicht (3 von 500 statt 4 von 400 — Rauschen).
-
-- [ ] **Hänger ab `sched` — NICHT behoben, und seit dem 2026-08-01 abends deutlich häufiger.**
-      Die Notbremse ist repariert und greift nachweislich; der Hänger selbst ist offen.
-
-      **Gemessene Rate, gleicher Tag, gleiche Maschine:**
-
-          Stand 15bc289 (vor virtio/pprobe):   1 von 500   (0,2 %)
-          Stand 9503212 (danach):              4 von 100   (4 %)
-
-      Kein neuer Fehler: 3 der 4 tragen die `WATCHDOG`-Zeile, alle brechen bei ~144 statt 190
-      Ausgabezeilen ab, die abweichende Signaturzeile ist immer `ipc : FAILURES`. Es ist derselbe
-      Hänger. Aber der virtio-Test macht zwei vollständige Geräte-Handshakes mit langen
-      Poll-Schleifen, und das hat das Timing so verschoben, dass ein latenter Fehler um den Faktor
-      20 sichtbarer wurde.
-
-      **Das ist ein Geschenk, kein Rückschritt:** ein Fehler mit 0,2 % ist praktisch nicht
-      debuggierbar, einer mit 4 % schon. Wer ihn sucht, sollte den aktuellen Stand nehmen, nicht
-      den ruhigeren von vorher.
-      Läufe 115 und 235 blieben **nach** `smp : 4 von 4 Kern(en) online` stehen, ohne
-      `WATCHDOG`-Zeile. Der SMP-Hochlauf war also erfolgreich. Die Notbremse stand hinter
-      `system::reap()`, und das nimmt `SCHEDS[core].lock()` und `MEM.lock()` — blockiert der
-      Einsammler, dreht sich die Schleife nie weiter: **die Notbremse wurde von dem
-      ausgehungert, was sie überwachen soll**. Sie steht jetzt davor und zählt Ticks statt
-      Umdrehungen (50 Mio Umdrehungen sind unter KVM Millisekunden und unter TCG Minuten —
-      dieselbe Zahl meinte je nach Aufbau etwas anderes).
-      Gegenprobe, zwei Serien zu je 500 Läufen: **kein einziger riss das Zeitlimit** (vorher 2 von
-      400). Das heißt aber **nicht „keine Hänger mehr"** — in der zweiten Serie steht in Lauf 328
-
-          bringup : WATCHDOG — nicht alle Aussagen belegt (nach 61s, 14898083 Umdrehungen)
-
-      und derselbe Lauf zeigt `ipc : FAILURES`. Der Hänger trat also weiterhin auf (~1 von 500); die
-      Notbremse hat ihn in eine saubere, sichtbare Abweichung verwandelt statt in ein Zeitlimit.
-      Das ist der gewünschte Ausgang — und zugleich der erste Beleg, dass dieser Wächter überhaupt
-      auslösen kann. Vorher war „0 Zeitlimits" zweideutig: er konnte funktionieren oder stumm sein.
-      **Offen bleibt:** blockiert `reap()` selbst, hilft auch das nicht — dafür bräuchte es
-      eine Notbremse im Timer-Interrupt, außerhalb dieses Fadens. Steht so im Code.
-
-- [x] **D0-Hypothese GEPRÜFT und AUSGESCHLOSSEN (2026-08-07): „GRUB-Speicher früh im Bootprozess".**
-      Anlass war ein Hinweis von Simon: bei GRUB führe die Belegung bestimmter Speicheradressen
-      früh im Boot zu undefiniertem Verhalten; Abhilfe sei, die Belegung nach hinten zu schieben
-      oder einen eigenen Bootloader zu schreiben.
-
-      **Die Klasse dahinter ist real** und in der OSDev-Literatur beschrieben: ein Lader meldet
-      den Speicher von 0 bis zum EBDA als frei, obwohl dort BIOS-Datenbereich, EBDA und — je nach
-      Modulgröße unvorhersehbar — GRUBs eigene Ablagen liegen. Die Standardempfehlung lautet,
-      **alles unter 1 MiB als belegt zu behandeln**. Die genannte Quote „>0,1 %" ist dabei keine
-      dokumentierte Größe; der Effekt ist maschinen- und größenabhängig, nicht zufällig.
-
-      **Als Ursache für D0 scheidet sie aus — vier unabhängige Gründe, alle nachgesehen:**
-
-      | # | Grund | Beleg |
+      | Bild | Zahl | Messwert |
       |---|---|---|
-      | 1 | Die Suite, in der D0 auftrat, bootet über QEMUs `-kernel`, **nicht über GRUB** | `test-qemu-x86.sh:141` |
-      | 2 | `ram_regions` nimmt **nur Typ 1** und verwirft `base < 1 MiB` | `multiboot.rs:148` |
-      | 3 | `free_base = max(kernel_end, USER_RAM_MIN)`, `USER_RAM_MIN = 16 MiB` | `bringup.rs`, `mmu.rs:88` |
-      | 4 | Modulbereiche werden **ausgeschnitten**, nicht nachträglich markiert | `subtract_holes`, Prüfzeile `mbmod` |
+      | `cycles : FAILURES` | 2 | 1-ms-Fenster = 11 689 334 bzw. 11 720 490 Zyklen statt 2 803 578 — **Faktor 4,2** |
+      | `freeze : FAILURES` | 2 | ein ~30-ms-Fenster sah **0** Worker-Runden statt 3 |
 
-      Der GRUB-Pfad (`tools/mkgrubiso.sh`) existiert, ist aber ein anderer Weg — und auch dort
-      trägt (2)–(4), weil es Untergrenzen sind und keine karten-abhängigen Annahmen.
+      Belege: `docs/befunde/d0/lastartefakt-{freeze,cycles}-2026-08-07.log`.
 
-      **Ein echter Fund am Rande, und er gehörte in genau diese Klasse:** die
-      Multiboot-Info-Struktur selbst wird **nicht** ausgeschnitten. Dass sie sicher ist, hing
-      allein an `USER_RAM_MIN` — unter QEMU liegt sie bei `0x9500` (QEMUs `MULTIBOOT_STRUCT_ADDR`
-      ist `0x9000`, die MBI bei `+0x500`), unter einem anderen Lader kann sie anderswo liegen.
-      Senkt jemand `USER_RAM_MIN`, fällt der Schutz **lautlos** weg — und der Allokator vergäbe
-      die Struktur, aus der der Speicherplan stammt. Steht jetzt als gemessene Zeile
-      (`mbi : Bootloader-Struktur bei 0x9500, Freiliste ab 0x1000000 -- ausserhalb: 1`) mit
-      Prüfung in der Suite.
+- [ ] **Wie man es von einem Kernelfehler unterscheidet — an der FORM, nicht an der Zahl.** Bei
+      einem der beiden `freeze`-Fehlschläge fiel `laeuft-vorher=false (49->49)` durch: die
+      **Positivkontrolle**, gemessen *bevor* eingefroren wird. Ein Fehler im Auftaupfad kann sie
+      strukturell nicht verursachen. Die naheliegende Lesart („die D0-Umstellung hat `thaw`
+      beschädigt") war damit widerlegt, ohne den Auftaupfad überhaupt anzusehen.
 
-      **Was D0 weiterhin erklären müsste** und wovon diese Hypothese nichts erklärt: der Hänger
-      trat **nach** `smp : 4 von 4 Kern(en) online` auf, die abweichende Signaturzeile war
-      `ipc : FAILURES`. Eine Korruption durch früh vergebenen Low-Memory-Speicher sagt ein
-      anderes, früheres und breiter gestreutes Bild voraus.
+      Das ist die allgemeine Regel für diesen Messstand: **bei einer Abweichung zuerst fragen,
+      welche Konjunkte fallen — nicht, wie oft sie fällt.** Ein Zähler allein hätte hier zu einer
+      Fehlersuche im Scheduler geführt.
 
-- [ ] **Sobald die Ursache feststeht:** der Lauf muss wieder wiederholbar sein, bevor A1 als
-      abgenommen gilt. Ein Testaufbau, der stehenbleibt, kann keine Aussage über irgendeine
-      Eigenschaft tragen — auch nicht über die, die er gerade grün meldet. Bei 0,5 % ist die
-      Frage allerdings eine andere als bei 25 %: es geht nicht mehr um Brauchbarkeit der Suite,
-      sondern um einen echten, seltenen Fehler im Kernel.
+- [ ] **Was zu tun ist.** Die betroffenen Fenster sind in Wanduhrzeit definiert (`hal::timer::ticks`
+      bzw. eine 1-ms-Kalibrierung). Zwei Wege, und der erste ist der bessere:
 
----
+      1. **In der gemessenen Größe zählen statt in der Zeit.** Für `freeze` heißt das: warten, bis
+         der Zähler sich um N bewegt hat, mit einer Obergrenze — dann ist „er steht" die Aussage,
+         und nicht „er hat sich in 30 ms nicht bewegt". Dieselbe Überlegung wie bei D10, wo eine
+         Iterationszahl eine Stoppuhr ersetzt hat: *eine Iterationszahl ist eine Eigenschaft des
+         Programms, eine Zeitmessung nicht.*
+      2. Das Fenster verlängern. Billiger, aber es verschiebt die Grenze nur — bei 6-facher
+         Überbuchung fällt es wieder.
+
+      **Nicht**: die Prüfung unter Last aushängen. Ein Test, der bei Last schweigt, schweigt genau
+      dann, wenn er gebraucht wird.
+
+- [ ] **Vorbehalt zur Zahl.** 2 `freeze`-Artefakte in 50 000 gegen 0 in den 56 895 Läufen davor ist
+      **nicht** signifikant (Fisher p ≈ 0,2). Es gibt also keinen Beleg, dass die Empfindlichkeit
+      neu ist — nur, dass sie existiert.
+
 ## D. Verifikation
 
 - [ ] **KEIN CI-RUNNER — alle Gates warten (2026-08-03). Das ist der Rest eines Befunds, dessen

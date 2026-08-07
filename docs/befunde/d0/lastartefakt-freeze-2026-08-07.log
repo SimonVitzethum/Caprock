@@ -1,0 +1,181 @@
+c[?7l[2J[0mSeaBIOS (version Arch Linux 1.17.0-2-2)
+
+
+iPXE (http://ipxe.org) 00:04.0 C900 PCI2.10 PnP PMM+1EFD3AD0+1EF33AD0 C900
+Press Ctrl-B to configure iPXE (PCI 00:04.0)...                                                                               
+
+
+Booting from ROM..========================================
+ SEL4Lake — capability microkernel
+ x86_64 (Multiboot -> Long Mode)
+========================================
+mmu     : identity-map, paging=1 caches=1 CR0.WP=1
+arch    : x86_64 (CPL 0 = Ring 0)
+timer   : LAPIC-Timer 100 Hz (Basis 999998800 Hz, gegen PIT kalibriert), Vektor 32
+spec    : CSV2=1 CSV3=1 FEAT_SB=1 · nospec-Indizes an
+cache   : LLC L3 24576 KiB, 12-fach, 64 B/Zeile, 32768 Sets -> 512 Seitenfarbe(n)
+mbi     : Speicherplan gelesen -> RAM bis 0x1ffdc000 (511 MiB)
+mbi     : Bootloader-Struktur bei 0x9500, Freiliste ab 0x1000000 -- ausserhalb: 1
+mem     : 8 Bereiche / 495 MiB ueber HandoverInfo (Quelle Multiboot), verworfen=0
+mem     : freies RAM ab 0x1000000 aus 1 gemeldeten Bereich(en), RAM-Oberkante 0x1ffdc000
+cap     : 80256 Slots / 80256 Objekte / 10000 PDs, Tabellen 17872 KiB aus dem RAM (Summe aller PD-Budgets: 80000)
+ipc     : 10064 Endpoints / 10064 Notifications, Tabellen 16908 KiB aus dem RAM (eine PD, ein Endpoint: 10000 PDs)
+mbmod   : ALL PASS (Modulbereiche werden aus der Freiliste ausgeschnitten: Rand, Ueberlappung, unsortiert, Vollabdeckung)
+archive : kein gueltiges Boot-Archiv (0 Module, FAILURES)
+manifest: kein angenommenes System-Manifest (Audit-Code 0; dieser Kernel-Code-Hash beginnt a0f4d5ec)
+manifest: ALL PASS (Signatur ueber die GESAMTE Nachricht, an DIESES Kernel-Image gebunden, Anti-Downgrade; manipulierte Kopie wird abgewiesen)
+memtest : freies RAM = 461 MiB (1 Fragmente)
+memtest: PASS  alloc 1 Seite
+memtest: PASS  alloc 4 Seiten, 8-KiB-aligned
+memtest: PASS  disjunkte Allokationen
+memtest: PASS  freies RAM um 5 Seiten reduziert
+memtest: PASS  split 4 -> 1 + 3 Seiten
+memtest: PASS  split-Adressen zusammenhaengend
+memtest: PASS  restrict RW -> R
+memtest: PASS  transfer per Move erhaelt Cap
+memtest: PASS  free + Coalescing stellt RAM wieder her
+memtest : ALL PASS
+zerotest: PASS  frische Allokation ist genullt
+zerotest: PASS  Muster geschrieben (Kontrolle)
+zerotest: PASS  Allokator gibt dieselbe Region erneut aus
+zerotest: PASS  wiederverwendete Region ist genullt (keine Datenremanenz)
+zerotest: ALL PASS
+captest: PASS  install belegt keinen zusaetzlichen Speicher
+captest: PASS  Wurzel-Cap: RW, refcount 1
+captest: PASS  refcount 4 nach copy/mint/copy
+captest: PASS  Wurzel hat 2 Kinder
+captest: PASS  CDT konsistent (abgeleiteter Baum)
+captest: PASS  mint: Rechte READ + Badge gesetzt
+captest: PASS  keine Rechte-Eskalation bei copy
+captest: PASS  altes Handle nach move ungueltig
+captest: PASS  neues Handle nach move gueltig
+captest: PASS  delete mit Kindern -> HasChildren
+captest: PASS  revoke entfernt alle Abkoemmlinge (refcount 1)
+captest: PASS  Abkoemmling-Handles ungueltig nach revoke
+captest: PASS  Speicher noch gehalten (Wurzel lebt)
+captest: PASS  CDT konsistent nach revoke
+captest: PASS  Wurzel-Handle nach delete ungueltig
+captest: PASS  CDT konsistent nach Teardown
+captest: PASS  Finalisierung gibt Speicher zurueck
+captest : ALL PASS
+budget: PASS  Installationen bis zum Budget gelingen
+budget: PASS  Installation ueber das Budget hinaus wird abgewiesen
+budget: PASS  Ersetzen eines belegten Slots bleibt erlaubt
+budget: PASS  CDT konsistent nach Teardown
+budget: PASS  Speicher zurueckgegeben
+budget  : ALL PASS
+dmaalign: SKIP  (kohaerente Architektur, Granule 1 -> keine Bedingung)
+dmaalign: ALL PASS
+acpi    : 4 CPU(s) laut MADT
+acpi    : PCI-ECAM @ 0xb0000000, Busse 0..255
+pci     : 00:00.0 8086:29c0 class=0x060000
+pci     : 00:01.0 1234:1111 class=0x030000
+pci     : 00:02.0 1af4:1044 class=0x00ff00
+pci     : 00:03.0 1af4:1042 class=0x010000
+pci     : 00:04.0 1af4:1041 class=0x020000
+pci     : 00:1f.0 8086:2918 class=0x060100
+pci     : 6 Geraet(e); virtio-rng gefunden (RID 0x0010, MMIO-BAR 0xfebd1000, Bus-Master true)
+pci     : ALL PASS
+himap   : BAR-Fenster oberhalb 4 GiB: 0 gefunden, 0 abgebildet, 0 durch die Seitentabellen aufloesbar (erstes 0x0); hohe GiB: 0 Geraet + 0 RAM, 1-GiB-Seiten=true, unabgebildetes GiB bleibt unabgebildet=true
+himap   : ALL PASS
+virtio  : Transport (vor VT-d): Caps=1 Geraet-DMA=1 (64 Byte)
+vblk    : Lesen (vor VT-d): Caps=1 Kapazitaet=32768 Sektor(en) Status=0x00 geschrieben=513 Byte Magie=0x454b414c344c4553 (erwartet 0x454b414c344c4553)
+vnet    : MAC 52:54:00:12:34:56; Caps=1 Sendepuffer abgeholt=1 Rahmen empfangen=1 (76 Byte) ARP-Antwort von 10.0.2.2=1
+vnet    : ALL PASS (A-5.2: virtio-net auf x86 -- zwei Queues mit getrennter Notify-Adresse; die ARP-ANTWORT auf die eigene Anfrage belegt beide Richtungen inhaltlich, ein bloss gefuellter Puffer koennte Restspeicher sein)
+iommu   : VT-d Version 0x10 CAP 0x80d2008c222f06c6 (Root-Tabelle mit lauter 'not present' = Default-Block)
+vtdcaps : SAGAW 0x6 -> gewaehlt 39 Bit (3 Level), MGAW 48 Bit, Domains 65536, CM=true RWBF=false ECAP.C=false QI=true IR=true SC=false ScalableMode=false
+vtdcaps : Fault-Recording 1 Register @ +0x220, Overflow(FSTS.PFO)=false; Eingangsgrenze 0x8000000000; brauchbar=true
+vtdcaps : ALL PASS (Schritt 1: Faehigkeiten gelesen -- als Minimum ueber ALLE Einheiten (B-3.3), nicht nur ueber Einheit 0. IR/CFI stehen seit B-3.2; attach TEILT ZU (A-5.1: die Treiber-PD bekommt eine uebersetzte DMA-Region); die IOVA-Fensterwahl meidet den Interrupt-Nachrichtenbereich (B-3.4). Offen: QI und IR laufen weiterhin nur auf Einheit 0 -- fuer die Uebersetzung folgenlos, fuer Interrupt Remapping nicht)
+vtdgrp  : Selbsttest: parse=true Catch-all-zuletzt=true Bridge-Scope-Subhierarchie=true Gruppen=true Alias-Mengen=true RMRR-ausgeschlossen=true Firmware-Muell-abgefangen=true Oracle=0
+vtdgrp  : real: 8 Geraet(e), 1 Einheit(en), 6 Gruppe(n), 0 ausgeschlossen, ATSR-Eintraege 0, Segment!=0 false, Oracle 0
+vtdgrp  : ALL PASS
+iommu   : Uebersetzung aktiv=true (GSTS.TES), Kontext-Cache-Invalidierung quittiert=true, dma_audit=0
+qi      : Queued Invalidation aktiv=true; Kontext-Cache ueber die Warteschlange quittiert=true; Interrupt-Entry-Cache invalidiert=true (fuer den gibt es KEINEN Registerpfad -- deshalb ist B-3.1 Vorbedingung von B-3.2, nicht Geschmackssache)
+qi      : ALL PASS (B-3.1: Invalidierung laeuft ueber die Warteschlange, und der Interrupt-Entry-Cache ist erreichbar)
+ir      : Interrupt Remapping aktiv=true (GSTS.IRES), Compatibility-Format abgeschaltet=true (GSTS.CFIS==0); Tabelle mit lauter 'not present' = Default-Block, ein Geraet ohne IRTE kann keinen Interrupt ausloesen
+ir      : ALL PASS (B-3.2: ohne IR koennte ein durchgereichtes Geraet beliebige Interrupt-Nachrichten erzeugen -- MSI ist eine DMA-Schreibung, die die Uebersetzung gar nicht ansieht)
+iommu   : ALL PASS
+apic    : x2APIC (MSR-Pfad) (LAPIC-ID 0); x2APIC adressiert 32-Bit-IDs, xAPIC nur 8 -> 255 Kerne
+sched   : 4 Kern, 10000 Thread-Slots (5000 hostbar), Tabellen 8960 KiB aus dem RAM
+virtio  : Sperre (nach VT-d, Geraet nicht zugeteilt): Caps=1 Geraet-DMA=0 (0 Byte) VT-d-Faults davor=0 danach=1
+virtio  : ALL PASS (A-5.2: der virtio-pci-Transport laeuft auf x86 -- arch-neutraler Treiber, Caps, Handshake, Feature-Aushandlung inkl. VIRTIO_F_ACCESS_PLATFORM, Virtqueue, echte Geraete-DMA. Und nach dem VT-d-Aufbau kommt dasselbe Geraet OHNE Zuteilung nicht mehr durch -- beide Richtungen belegt, nicht nur die bequeme)
+vblk    : Sperre (nach VT-d, Geraet nicht zugeteilt): abgeschlossen=0 Status=0xff (0xff = vom Geraet unberuehrt) VT-d-Faults=1
+vblk    : ALL PASS (A-5.2: virtio-blk auf x86 -- dreigliedrige Deskriptorkette, das Geraet LIEST den Anfragekopf und liefert den angeforderten Sektor mit der erwarteten Magie. Nach dem VT-d-Aufbau erreicht es den Kopf nicht mehr -- damit ist auch die LESERICHTUNG gesperrt belegt, die der RNG-Test nicht zeigen kann)
+devassign: zuteilbar: RID 0x0018 1af4:1042 Klasse 0x010000, Konfigurationsseite 0xb0018000, BAR 0xfe004000+0x4000
+devassign: zuteilbar: RID 0x0020 1af4:1041 Klasse 0x020000, Konfigurationsseite 0xb0020000, BAR 0xfe008000+0x4000
+devassign: 2 Geraet(e) angeboten (A-5.1/A-5.3: der Kern enumeriert und teilt zu; was fuer Geraete das sind, weiss er nicht -- das Manifest sagt, WER WELCHES bekommt, und die Reihenfolge dieser Liste ist ausdruecklich KEINE Zusage)
+cycles  : invariant-TSC=true 2803 MHz; 1-ms-Fenster = 2803188 Zyklen (40967 Iterationen); Aufloesung 99 Zyklen (Tick-Uhr: 28030297 Zyklen)
+cycles  : ALL PASS (serialisierender Zeitstempel: rdtscp+lfence, gegen den PIT kalibriert, auf EINEM Kern gemessen; Invarianz gefuehrt statt angenommen)
+dmawin  : B-3.4 Fenster gegen den Interrupt-Nachrichtenbereich (0xFEE0_0000..0xFEF0_0000): GEPRUEFT, frei (jedes der NDMA_CTX Slot-Fenster liegt vollstaendig ausserhalb) -- dorthin geschriebene DMA waere fuer VT-d eine Interrupt-Nachricht und wuerde gar nicht uebersetzt: kein Fault, keine Fehlerzeile, nur Daten, die nirgends ankommen
+dmawin  : B-3.4 belegte-DMA-Kontexte=1 davon-schwaches-Fenster=0 Fenster-weicht-von-der-Politik-ab=0 eingetragenes-Fenster-im-Sperrbereich=0 (das schwache Fenster ist [0, 512 GiB) und enthaelt den Sperrbereich -- die Zahl erklaert ein VERLETZT, statt es zu ersetzen)
+dmawin  : 32-Bit-Geraet-abgewiesen=true Fenster-voll-abgewiesen=true Kontext-danach-intakt=true balanciert=true Geraete-ohne-deklarierte-Adressbreite=1
+dmawin  : ALL PASS
+dmatok  : attach-installierte-Uebersetzung=true delete-ohne-detach-baut-ab=true Region-danach-frei=true unbestaetigte-Stilllegung-bleibt-pending=true Audit-Code-7-haelt=true
+dmatok  : ALL PASS
+el0-trap: User-Thread 0x5 faultete (EC=0x00 FAR=0x0000000000100000) -> beendet, Kernel laeuft weiter
+el0-trap: User-Thread 0x7 faultete (EC=0x00 FAR=0x0000000003c14000) -> beendet, Kernel laeuft weiter
+el0-trap: User-Thread 0x9 faultete (EC=0x00 FAR=0x0000000003c14000) -> beendet, Kernel laeuft weiter
+color   : 512 Farben, 4 Partitionen, Region 64 KiB · in_mask=1 kernelseite=1 (kstack=1 l1=1 l2=1) rueckgelesen=1 (kstack=1 l1=1 l2=1) disjunkt=1 uebergross_abgewiesen=1 bilanz=1
+color   : ALL PASS (zwei isolierte PDs teilen sich keine Cache-Farbe)
+isohigh : Regionen zweier isolierter PDs bei 0x3c80000 / 0x3c90000; oberhalb 4 GiB = 0
+isohigh : SKIP -- kein RAM oberhalb 4 GiB auf dieser Maschine, der Fall ist nicht entscheidbar (E-Rest 3d: die private Region einer isolierten PD haengt nicht mehr an GiB 0. Sie wird ueber ein VA-Fenster ausserhalb der Identitaetskarte abgebildet, statt identisch -- damit faellt der gemessene Deckel von 504 gleichzeitigen isolierten PDs. Die Farbbedingung gilt unveraendert: sie ist eine Aussage ueber die Physadresse)
+stripe  : 4 Streifen vergeben, 5. Versuch abgewiesen: true; nach Freigabe wieder vergebbar: true
+stripe  : ALL PASS (B-4.2: erschoepfte Farbpartitionierung scheitert SAUBER, statt einen Satz still ein zweites Mal auszugeben)
+pprobe  : Opfer 4096 KiB (privat 1280, ueber-privat=ja), Angreifer 32768 KiB je Farbsatz (133% des LLC), 18 Bloecke, Kette 65536 Glieder, 9 Proben · Zyklen je Durchlauf (min/median/max): ungestoert=12795069/17959395/26718921 disjunkt=18678031/20066982/26649906 gleichfarbig=18356207/19359567/22031088 · je Glied (Median): 274.0/306.1/295.4 · farbtreu=1 bilanz=1 fragmente 3->3
+pprobe  : SKIP -- die Positivkontrolle traegt nicht: der GLEICHFARBIGE Angreifer hat nicht messbar verdraengt (Median gleichfarbig=19359567 vs ungestoert=17959395). Auf einer Maschine, die Verdraengung nicht zeigen kann (TCG hat keinen echten Cache), ist ueber den disjunkten Fall nichts auszusagen -- 'kein Unterschied' waere kein Beleg, sondern ein Artefakt
+loader  : A-4.4 ABGEWIESEN -- program_id 172228609 wurde mit iface_version 7 geladen, das Archiv bietet 8. Ein Austausch ueber dieselbe Endpoint-Cap darf die Schnittstelle nicht aendern.
+iface   : erstes Laden true; gleiche Version true; GEAENDERTE Version abgewiesen true; andere program_id unberuehrt true; ohne Manifest-Eintrag keine Hot-Reload-Sperre true; Erstladung nie gesperrt true
+iface   : ALL PASS (A-4.4: ein Austausch, der die Schnittstellenversion aendert, wird abgewiesen -- beide Ausgaenge belegt, nicht nur der erlaubte)
+quiesce : unbelegt nicht stilllegbar true; unbelegt -> BADCAP (nicht QUIESCING) true; unbelegt ohne Rollen true; frisch offen true/ruhig true; stilllegen greift true; ZWEITER Austausch abgewiesen true; Tor zu true; meldet still true; still+ohne offene Transaktion = ruhig true; freigeben greift true; Tor wieder offen true; doppelte Freigabe gemeldet true
+quiesce : ALL PASS (A-4.2: der ruhende Punkt -- waehrend eines Austauschs wird KEINE neue Transaktion eroeffnet, laufende duerfen abschliessen)
+rebind  : unbelegt -> NoEndpoint true/nicht bindbar true; OHNE Stilllegung abgewiesen true; ungebunden gemeldet true; Selbsttausch gemeldet true; binden greift true/Doppelbindung abgewiesen true/ist Empfaenger true; FREMDER Empfaenger blockiert true; Tausch ohne Ueberlappung true (alt geloest true, neu gebunden true); Tausch MIT Ueberlappung true (nur noch die neue true, durchgehend ein Empfaenger true)
+rebind  : ALL PASS (A-4.1: Pruefung und Tausch unter EINEM Lock -- zwischen 'alter Server weg' und 'neuer empfangsbereit' liegt kein Zustand ohne Empfaenger)
+epfull  : 32 gebunden (alle auffindbar true); der 33. abgewiesen true/nicht eingetragen true/keinen verdraengt true/audit sauber true; nach Freigabe wieder vergebbar true
+epfull  : ALL PASS (D11: der Ueberlauf einer Endpoint-Warteschlange wird BENANNT statt still verworfen. Vorher meldete bind_receiver Erfolg, waehrend der Eintrag verschwand -- und call/recv blockierten den Faden, ohne ihn irgendwo einzutragen: er hing dauerhaft, und is_quiescent/audit/purge_thread meldeten Ordnung)
+state   : frisch -> NoState true; angelegt true (Generation 0 true, Nutzlast schreibbar true); UEBERNOMMEN true (Zustand ueberlebt true, zweite Uebernahme zaehlt weiter true); falsche state_version abgewiesen true; fremde program_id abgewiesen true; Abweisung zaehlt nicht true; luegender Kopf erkannt true; zu kleine Region abgewiesen true; echte Zustandsregion None (auf x86 keine -- die Demo laeuft dort nicht; Beleg im aarch64-Lauf via ckpt)
+state   : ALL PASS (A-4.3: der Zustand liegt in einer Region mit VERSIONIERTEM Kopf -- passt das Layout nicht, wird abgewiesen statt fehlinterpretiert)
+bringup : 3 Worker + 2 PDs (IPC-Server/Client) eingeplant
+root    : FAILURES (NoArchive) -- kein Root-Task, der Kernel hat nichts auszufuehren
+smp     : 4 von 4 Kern(en) online
+mem     : Zonen (E-Rest 3d) -- PD-abbildbar musste 0x nach oben ausweichen, reiner Kernel-Speicher 31x nach unten (0 heisst 'kam nicht vor', nicht 'geht nicht'; ein PD-Ausweich waere ein Befund, ein Kernel-Ausweich ist harmlos)
+sched   : core 0 ticks=40
+sched   : core 1 ticks=12
+sched   : core 2 ticks=8
+sched   : core 3 ticks=4
+sched   : Worker-Runden [27, 28, 27] (jeder >= 3 -> Timer verdraengt sie gegeneinander)
+sched   : ALL PASS
+ipc     : Server bediente 1 Anfrage(n); Schleife verlassen: nein (noch in der Schleife) (roh 18446744073709551615)
+ipc     : CALL(21) ueber Endpoint-Cap -> 42 (erwartet 42)
+pdbind  : gebunden=3 spaet-gebunden=0 unklar=0 erklaert-gefeuert=0x1 (D0: eine PD, die an einen bereits zugelassenen Thread geht, kommt zu spaet -- der Thread kann seinen ersten Syscall schon gemacht und ERR_NOPD bekommen haben. Erklaerte Gruende zaehlen NICHT als spaet, stehen aber hier)
+pdbind  :   erklaert zulaessig: CheckpointSubjektNachtraeglich
+pdbind  : ALL PASS
+ipc     : ALL PASS
+ring3   : Ring-3-Thread machte 8 Syscalls; abgefangene Ring-3-Faults: 3
+ring3   : ALL PASS (Ring-3-Thread laeuft + syscallt; Zugriff auf Kernel-Speicher faultet, Thread beendet, Kernel laeuft weiter)
+capsz   : Cap-Slots Hoechststand 11/80256, Objekte 3/80256; bei vollem Budget (8 Slots/PD) passen 10032 PDs in die globale Tabelle
+capsz   : ALL PASS (A-3.4: der globale Cap-Space wurde NICHT erschoepft -- gemessen am Hoechststand, nicht am Endstand)
+capsum  : 1/256 Slots ausserhalb aller PD-Budgets (Kernel-Wurzelcaps); Kapazitaet 80256 = 80000 PD-Budgets + 256 Reserve
+capsum  : ALL PASS (A-3.4: der Kernel bleibt in seiner Reserve -- sonst bekommt eine PD INNERHALB ihres Budgets keinen Slot mehr)
+iso     : SAS-Thread las 0x5e141a4e0bedc0de (erwartet 0x5e141a4e0bedc0de); isolierter Thread faultete 2x an derselben Adresse
+iso     : ALL PASS (eigener Adressraum je PD: dieselbe Adresse ist fuer SAS lesbar, fuer die isolierte PD nicht)
+root    : Notification-Badge 0x0 (Root-Task lief: false; er selbst hat 'hello' nachgeladen: false)
+root    : FAILURES (A-2.1: ein extern gebautes, aus dem signierten Manifest ausgewaehltes Programm laeuft -- und laedt seinerseits ueber SEINE Loader-Cap ein weiteres)
+cdelete : Loader-Cap geloescht und Autoritaet danach weg: false; Cap mit abgeleiteten Kopien abgewiesen und weiter benutzbar: false
+cdelete : FAILURES (A-3.1: SYS_CDELETE aus Ring 3 -- beide Ausgaenge belegt, nicht nur der erfolgreiche)
+drv     : SKIP (keine Zuteilung erfolgt -- entweder war kein Geraet da, oder es gibt keine Treiber-PD, die eines anfordert: ohne Boot-Archiv laeuft kein geladenes Programm, und ohne Manifest-Eintrag mit mmio,dma verlangt keines Geraete-Autoritaet)
+blkdev  : SKIP (kein Treiber-Dienst -- s. die Begruendung eine Zeile darueber)
+part    : SKIP (kein Treiber-Dienst -- s. die Begruendung zwei Zeilen darueber)
+fs      : SKIP (kein Treiber-Dienst -- s. die Begruendung drei Zeilen darueber)
+dmaiso  : SKIP (kein zweiter Treiber -- ohne eine zweite Treiber-PD gibt es nichts, wovon getrennt werden koennte, und eine gruene Zeile hiesse nichts)
+hiiso   : geteilte Geraete-Tabellen oberhalb 4 GiB=0, private Kopien fuer isolierte PDs=0, unzulaessige Eintraege in den geteilten=0
+hiiso   : SKIP
+bootckpt: SKIP (kein Blockdienst -- ohne Platte gibt es keine Bootgrenze, ueber die etwas wandern koennte. Die Hauptsuite bootet ohne Archiv und damit ohne Treiber-PD)
+freeze  : laeuft-vorher=true (33->36) eingefroren=true steht=true (36->36) aufgetaut=true laeuft-wieder=false (36->36) IPC-Rolle-abgewiesen=true
+freeze  : FAILURES (Z4a: ein Thread haelt an einer BENENNBAREN Grenze -- deplant, auf keinem Kern, in keiner IPC-Rolle. Geprueft wird die WIRKUNG, nicht der Rueckgabewert: der Zaehler muss sich vorher bewegen, danach stehen und nach dem Auftauen wieder laufen. Ohne den ersten Schritt belegt 'er steht' nichts; ohne den dritten waere ein freeze, das den Thread kaputtmacht, davon nicht zu unterscheiden. Ein Thread mit offener IPC-Beziehung wird ABGEWIESEN -- 'blockiert' und 'ruhend' sehen von aussen gleich aus)
+devsel  : SKIP (kein Manifest -- ohne Autoritaetsdokument wird nichts zugeteilt)
+audit   : sched_audit=0 cdt_audit=0
+cdtlen  : B-5.5 Hoechststaende als OPERATIONSZAHL -- Abstieg 1/80256 Schritte, Revoke 4/80256 Loeschungen (Schranke = Slotzahl: ein azyklischer Lauf besucht keinen Slot zweimal). Zeit waere das falsche Mass -- sie haengt an Taktrate und Emulation, nicht an der Struktur
+audit   : ALL PASS
+cycacct : ALL PASS -- B-5.1: 104 Zyklenproben gegen 66 Ticks (3664090145 Zyklen verbucht; verworfen: rueckwaerts=0 unplausibel=0 Kernwechsel=0 Quelle-nicht-zugesichert=0; Maschine invariant=true). Proben > Ticks IST die Aussage: die Tick-Rechnung kann hoechstens einmal je Tick belasten, jede weitere Probe ist Rechenzeit, die vorher niemand zahlte. Welcher Zweig gilt, sagt die MASCHINE (invariant_tsc) -- sonst bestuende ein Kernel, der gar nicht abrechnet, ueber den Untrusted-Zweig
+x86_64 Stufe 4: Kernel-Kern laeuft (Selbsttests + Scheduler + cap-gesicherte IPC)
+== SELFTEST COMPLETE -> system_off ==

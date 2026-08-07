@@ -893,6 +893,11 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       monoton in der Richtung, die zählt. `ARBEITER_FEST=24 tools/d0-messen.sh 50000`.
       Die Bilanz nennt die Bedingung seit 2026-08-07 selbst.
 
+- [x] **Belegt, warum die aarch64-Reihe mehr wert ist — sie hat eine Regression gefunden, die
+      56 895 x86-Läufe nicht sahen** (2026-08-07). `scale : FAILURES`, `sched_audit=7`: der
+      Audit-Code „lauffähig und in keiner Liste" ist wörtlich der Zustand eines geparkten Threads.
+      1 von 600 aarch64-Läufen. Behoben (`t.admitted` in der Bedingung), Details in `done.md`.
+
 - [ ] **Die x86-Reihe prüft den Umbau fast nicht.** `pdbind` zählt auf x86 **3** Bindungen, auf
       aarch64 **70** (`kernel/src/threads/mod.rs` ist `#[cfg(target_arch = "aarch64")]`). 50 000
       x86-Läufe decken drei Zulassungsstellen ab. Der Messstand fährt seit 2026-08-07 `ARCH=arm`;

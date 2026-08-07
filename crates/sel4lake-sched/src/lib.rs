@@ -1330,7 +1330,28 @@ impl Scheduler {
                         && (e & D_LOCAL_MASK) as usize == local => {}
                 _ => return 8,
             }
-            if !t.blocked && !t.depleted && self.current != Some(local) && t.queued == NOT_QUEUED {
+            // **`t.admitted` gehoert in diese Bedingung** (2026-08-07, gefunden vom Audit selbst).
+            //
+            // Vor der D0-Behebung konnte ein benutzter, nicht blockierter, nicht laufender TCB
+            // nicht ausserhalb jeder Warteschlange stehen -- `spawn` reihte sofort ein. Seit
+            // `spawn_parked` gibt es diesen Zustand, und er ist RICHTIG: ein geparkter Thread
+            // wartet darauf, dass sein Erzeuger ihm PD, Caps und Mappings gibt.
+            //
+            // Der Audit meldete ihn als Code 7 -- zu Recht, denn seine Bedingung kannte das Parken
+            // nicht. Gemessen: 1 Abweichung in 600 aarch64-Laeufen (`scale : FAILURES`,
+            // `sched_audit=7`, sonst alles identisch), waehrend das Bild in 56 895 x86-Laeufen nie
+            // auftrat -- auf x86 gibt es 3 Zulassungsstellen, auf aarch64 70.
+            //
+            // **Die Schaerfe bleibt.** Fuer alles, wofuer Code 7 gebaut wurde (D8: ein erschoepfter
+            // Thread, der ueber `unblock` auf leerem Konto lauffaehig wird), gilt `admitted == true`
+            // -- die Bedingung greift dort unveraendert. Ausgenommen ist ausschliesslich der
+            // Zustand zwischen `spawn_parked` und `admit`.
+            if !t.blocked
+                && !t.depleted
+                && t.admitted
+                && self.current != Some(local)
+                && t.queued == NOT_QUEUED
+            {
                 return 7;
             }
         }

@@ -336,6 +336,48 @@ Bewacht wird der Zeuge von `tools/zulassung.sh` (kein öffentliches Feld, kein `
 liegt auch der **Ankertest** für `ERLAUBTE_SPAETBINDUNGEN`: Menge statt Zahl, und jeder Name muss
 eine echte Variante bezeichnen, in beide Richtungen.
 
+### 6bb. Der Umbau hat eine Regression erzeugt — gefunden vom Audit des Kernels selbst
+
+Die aarch64-Reihe (600 Läufe, feste Parallelität 6) meldete **23 Abweichungen**. 22 davon sind
+D13 (`offen: color`). Die dreiundzwanzigste ist etwas anderes, und sie ist der eigentliche Ertrag
+der Reihe:
+
+    scale : 1024 von 1024 Threads GLEICHZEITIG erzeugt (alle auffindbar=true,
+            Slot-Buchhaltung=true), danach abgebaut -> Baseline=true, sched_audit=7
+    scale : FAILURES
+
+Der Lauf ist **vollständig durchgelaufen** (`SELFTEST COMPLETE`, kein Watchdog), jedes andere Feld
+ist identisch zur Referenz. Nur `sched_audit` steht auf 7 statt 0.
+
+**Code 7 ist wörtlich der Zustand eines geparkten Threads:**
+
+    if !t.blocked && !t.depleted && self.current != Some(local) && t.queued == NOT_QUEUED {
+        return 7;    // „lauffaehig und in keiner Liste"
+    }
+
+Vor der D0-Behebung konnte es diesen Zustand nicht geben — `spawn` reihte sofort ein. Seit
+`spawn_parked` gibt es ihn, und er ist **richtig**: der Thread wartet darauf, dass sein Erzeuger
+ihm PD, Caps und Mappings gibt. Der Audit kannte das Parken nicht und meldete zu Recht, was er
+sah. Behoben durch `t.admitted` in der Bedingung — für alles, wofür Code 7 gebaut wurde (D8: ein
+erschöpfter Thread, der über `unblock` lauffähig wird), gilt `admitted == true`, die Schärfe bleibt.
+
+**Drei Dinge, die daran hängen:**
+
+1. **Die x86-Messung konnte das nicht finden.** `pdbind` zählt auf x86 3 Bindungen, auf aarch64 70
+   — das Fenster zwischen `spawn_parked` und `admit` gibt es auf x86 dreimal je Lauf, auf aarch64
+   siebzigmal. In 56 895 x86-Läufen trat das Bild nie auf; in 600 aarch64-Läufen einmal. Eine
+   aarch64-Reihe ist hier mehr wert als weitere x86-Läufe, und das ist jetzt gemessen statt
+   argumentiert.
+2. **Der Modell-Treue-Wächter hat die Berichtigung sofort beanstandet** und die Bedingung
+   vorher/nachher gegenübergestellt. Dabei fiel ein Eintrag auf, den ich am selben Tag geschrieben
+   hatte: `admitted` stand als „von keiner Einplanungsentscheidung gelesen" — seit der Audit es
+   liest, stimmt das nicht mehr. Eine Einplanungs*entscheidung* ist es weiterhin nicht, aber ein
+   **Urteil** hängt daran, und das ist mehr als Beobachtung.
+3. **Das ist die Klasse, vor der gewarnt war.** Ein Umbau, der einen neuen Zustand einführt, muss
+   jede Stelle mitnehmen, die über Zustände urteilt — nicht nur die, die sie erzeugen. Gefunden
+   hat es kein Gegenlesen und kein Typ, sondern eine **Messung unter Last auf der Architektur, wo
+   der neue Zustand oft vorkommt**.
+
 ### 6c. Die Gegenprobe fand, dass der Wächter nichts gattert
 
 `pdbind` stand im Bericht — und in keiner Abschlussbedingung. Eine Mutation, die `spawn_in_pd`

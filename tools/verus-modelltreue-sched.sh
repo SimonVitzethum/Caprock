@@ -223,9 +223,14 @@ TCB_AUSSERHALB = {
     # zaehlbar zu machen. Ein Feld auf ein Modellfeld abzubilden, das etwas anderes bedeutet, waere
     # schlimmer als es ausserhalb zu fuehren: der Beweis zeigte dann eine Aussage ueber `in_ready`
     # und man LAESE sie als Aussage ueber `admitted`.
-    'admitted':    'D0: „schon zugelassen?" -- reine Beobachtung fuer den `pdbind`-Waechter, von '
-                   'keiner Einplanungsentscheidung gelesen. NICHT `in_ready` (das faellt zurueck, '
-                   'dieses nicht)',
+    # **Berichtigt am 2026-08-07.** Der Eintrag sagte „von keiner Einplanungsentscheidung
+    # gelesen". Das stimmte einen halben Tag: seit der Audit das Parken kennen muss, LIEST er
+    # `admitted` (Code 7). Eine Einplanungs-ENTSCHEIDUNG ist es weiterhin nicht -- der Scheduler
+    # waehlt nichts danach aus --, aber ein Urteil haengt daran, und das ist mehr als Beobachtung.
+    'admitted':    'D0: „schon zugelassen?". Keine Einplanungsentscheidung (die Auswahl haengt '
+                   'nicht daran), aber der AUDIT liest es: Code 7 („lauffaehig und in keiner '
+                   'Liste") muss den Zustand zwischen `spawn_parked` und `admit` ausnehmen. '
+                   'NICHT `in_ready` -- das faellt zurueck, dieses nicht',
 }
 
 # [2] Funktionen in `lib.rs`, die Modellzustand schreiben.
@@ -548,7 +553,7 @@ AUDIT_QUEUE = [
 ]
 AUDIT_REST = [
     (8, '#dir_load passt nicht'),
-    (7, '!t.blocked && !t.depleted && self.current != Some(local) && t.queued == NOT_QUEUED'),
+    (7, '!t.blocked && !t.depleted && t.admitted && self.current != Some(local) && t.queued == NOT_QUEUED'),
     # Seit 2026-08-03 (D10). Code 10 ist die NACHZAEHLUNG von `budget_blocked_count` gegen die
     # Tabelle -- und sie ist der Preis dafuer, dass `refill_depleted`/`set_budget` den teuren
     # Weckelauf jetzt an einem Zaehler aufhaengen. Ohne sie waere der Waechter im Code eine

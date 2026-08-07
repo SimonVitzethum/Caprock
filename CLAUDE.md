@@ -235,6 +235,16 @@ falsch.
   (`map_region_into_thread` an drei Geraete-Backends) -- und die naheliegende mechanische
   Umstellung nahm den Fehler mit. Bewacht von `tools/zulassung.sh` (7 von 7 im Selbsttest), dort
   auch der Ankertest fuer `ERLAUBTE_SPAETBINDUNGEN`.
+* **Der D0-Umbau hat eine Regression erzeugt, und der Kernel-Audit hat sie selbst gefunden.**
+  Audit-Code 7 lautet „lauffaehig und in keiner Liste" -- woertlich der Zustand eines GEPARKTEN
+  Threads, den es vor der Behebung nicht geben konnte. Gemessen in der aarch64-Reihe:
+  `scale : FAILURES`, `sched_audit=7`, Lauf vollstaendig durchgelaufen, jedes andere Feld
+  identisch. **1 von 600 aarch64-Laeufen -- und 0 von 56 895 x86-Laeufen**, weil das Fenster
+  zwischen `spawn_parked` und `admit` auf x86 dreimal je Lauf existiert und auf aarch64
+  siebzigmal. Behoben durch `t.admitted` in der Bedingung; die Schaerfe fuer D8 bleibt.
+  **Die Lehre:** ein Umbau, der einen neuen Zustand einfuehrt, muss jede Stelle mitnehmen, die
+  ueber Zustaende URTEILT -- nicht nur die, die sie erzeugen. Gefunden hat es weder ein Gegenlesen
+  noch der Typ, sondern eine Messung unter Last auf der Architektur, wo der Zustand oft vorkommt.
 * **Die Gegenprobe fand, dass der Waechter nichts gatterte.** Eine Mutation ergab
   `pdbind : FAILURES` -- und die Suite meldete `== ALL PASS ==`. x86s `all_done()` baute eine Liste
   fuer den BERICHT und gab eine getrennte `&&`-Kette zurueck: 21 Glieder gegen 24 Eintraege,

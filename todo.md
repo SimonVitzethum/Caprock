@@ -1147,44 +1147,6 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
 
       Der Rest des Eintrags bleibt als Herleitung stehen.
 
-- [ ] **D11 (Herleitung) der 33. Sender an einem Endpoint hängt für immer — und kein
-      Prüfer kann ihn sehen.** (2026-08-03) **Klasse:** Fehler · **Aufwand:** Behebung
-      vorgeschlagen, nicht angewandt · **Fundort:** beim Erweitern des IPC-Modells (D7).
-
-      `TidQueue::enqueue` ist `if self.count < QCAP { … }` **ohne `else`**. Bei `QUEUE_CAP = 32`
-      landen von 33 CALLs 32 in der Queue. Der 33.:
-
-      | | |
-      |---|---|
-      | wird **trotzdem blockiert** | `block_current` läuft |
-      | bekommt **keinen** Ergebniscode | der Sentinel `0xDEADBEEF` steht unberührt im Frame |
-      | steht in **keiner** Struktur des Endpoints | weder Sender- noch Empfängerliste |
-      | `quiescence_of(…).is_quiescent()` | meldet ihn als **ruhig** |
-      | 33 nachfolgende RECVs | bedienen 32 — er wird **nie** geweckt |
-      | `audit` | `(false, false)` |
-      | `purge_thread` | `false` |
-
-      Er hängt dauerhaft, und **jeder** Prüfer meldet Ordnung. Das ist dieselbe Form wie die
-      leere Ereigniswarteschlange ohne `CD.R` — nur schlimmer, weil hier ein Thread verloren
-      geht und die Ruhemeldung einen Hot-Reload (A-4.2) fälschlich freigäbe.
-
-      **Dieselbe Zeile trifft drei weitere Stellen, alle gemessen:** der 33. RECV ebenso;
-      `bind_receiver` meldet `true`, obwohl verworfen; `migrate_owner` meldet `true`, löscht die
-      Antwortpflicht und verliert den Aufrufer.
-
-      **Zwei weitere Befunde aus demselben Lauf:** das Reply-Token wird beim zweiten RECV
-      **überschrieben** — der übergangene Aufrufer hängt, und `is_idle()` meldet den Endpoint
-      danach als *ruhig*, ein A-4.1-Austausch träfe also scheinbar niemanden. Und nach
-      `migrate_owner` bei geparktem Empfänger ist ein Rendezvous fällig, während **beide Seiten**
-      blockiert sind — ein Dritter überholt den migrierten Aufrufer.
-
-      **Vorschlag (nicht angewandt, `crates/` unberührt):** `enqueue -> bool`; ein voller
-      Endpoint gibt einen eigenen `ERR_EP_FULL` zurück **statt** zu blockieren; `bind_receiver`
-      und `migrate_owner` geben `false`. Vorher zu klären: ist „voll" für den Client dieselbe
-      Lage wie „stillgelegt"? A-4.2 hat für genau diese Unterscheidung `ERR_QUIESCING` von
-      `ERR_BADCAP` getrennt — „kommt gleich wieder" ist etwas anderes als „gibt es nicht", und
-      „gerade kein Platz" ist ein drittes.
-
 - [ ] **E-Rest 3c: `hiiso` hat noch nie ein Urteil gefällt.** (2026-08-04, gemessen direkt nach
       der E-Rest-3-Behebung.) Die Zeile meldet in **allen vier** RAM-Größen `SKIP` — auch bei 3G
       und 6G, wo die geteilte hohe Gerätetabelle existiert (`=1`). In der **Lade-Suite** kommt

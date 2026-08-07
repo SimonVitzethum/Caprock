@@ -104,18 +104,45 @@ und Microkit-Runtime im Image") und zieht Konsequenzen nach sich, die über sie 
       dort steht. Nachladen über Netz/Platte gibt es erst, wenn die zugehörigen Treiber laufen.
       Ohne diese Trennung („Startmenge vom Bootloader" vs. „Nachladen zur Laufzeit") wird das
       Manifest ein Wunschzettel, den niemand einlösen kann.
-- [ ] **Z11b. Das Manifest ist ein Autoritätsdokument, kein Konfigurationsfile.** Es legt fest,
-      wer geladen wird *und welche Caps er bekommt* — also die gesamte Anfangsverteilung von
-      Autorität. Damit **muss** es signiert und gegen das Kernel-Image gebunden sein. Wer die
-      Datei tauschen kann, besitzt die Maschine; ein Manifest ohne Signatur wäre eine
-      Hintertür mit Dateiendung. Verwandt mit ADR 0014, aber nicht dasselbe: dort werden
-      *Binaries* zertifiziert, hier die *Zuteilung*.
-- [ ] **Z11c. Das Manifest ist der natürliche Ort für die Politik.** Farbstreifen ([A1](#a1-cache--timing-seitenkanäle-zwischen-pds)),
-      NUMA-Knoten ([Z8](#z8-numa)), Kern-Affinität, Budget, Priorität — alles Dinge, die heute im
-      Code stehen oder gar nicht existieren. Wenn sie ins Manifest wandern, sind sie
-      *überprüfbar* und *änderbar ohne Neubau*. Wichtig dabei: die Farbe selbst gehört **nicht**
-      hinein (sie ist maschinenlokal, s. [Z4c](#z4-checkpointrestore-eines-threads)) — wohl aber
-      „diese Komponente bekommt einen exklusiven Streifen".
+- [x] **Z11b. Das Manifest ist ein Autoritätsdokument — erledigt** (A-1.2/A-1.3, hier bis
+      2026-08-07 nur nicht nachgetragen). Es ist Ed25519-signiert über die **gesamte** Nachricht
+      und über `kernel_hash` an **dieses** Kernel-Image gebunden; die Prüfreihenfolge trägt der
+      Typ (`SystemManifest::parse` liefert keine Einträge, die gibt es nur über `Verified`).
+      Anti-Downgrade über `manifest_version`. Belegt als `manifest: ALL PASS` mit Negativfällen
+      (manipulierte Kopie, Manifest für einen anderen Kernel).
+
+- [~] **Z11c. Die Politik steht im Manifest und wird ANGEWANDT** (2026-08-07). Bis dahin las der
+      Kernel die Felder und **druckte** sie; eingehalten wurde nur `POLICY_ROOT_TASK`. Ein
+      Politikfeld, das nur gedruckt wird, ist schlechter als keins — es sieht konfiguriert aus.
+
+      | Feld | Stand |
+      |---|---|
+      | `POLICY_EXCLUSIVE_STRIPE` | **eingehalten** (A1, `pdcolor : ALL PASS`) |
+      | `priority`, `core_affinity` | **eingehalten** (`ladepol : ALL PASS` — prio 2 verlangt, prio 2 bekommen) |
+      | `POLICY_ROOT_TASK`, `POLICY_NO_HOTRELOAD`, `iface_version` | eingehalten (A-2.1 / A-4.5 / A-4.4) |
+      | `numa_node != 0` | **abgewiesen** — der Allokator hat keine Knoten (Z8) |
+      | `POLICY_PINNED` | **abgewiesen** — „Lastausgleich ist per Vorgabe aus" ist keine Zusicherung |
+      | `budget_us != 0` | **abgewiesen**, s. den offenen Punkt darunter |
+
+      **Offen: `budget_us` ist als Format nicht einhaltbar.** Eine MCS-Reservierung braucht Budget
+      **und** Periode; das Manifest hat eine Zahl. Aus einer Zahl eine Reservierung zu machen hieße,
+      die Periode zu erfinden — sie stünde dann in keinem Dokument. Dazu die Auflösung: `set_budget`
+      rechnet in Ticks (100 Hz → 10 000 µs), alles darunter wäre 0 oder aufgerundet. Das ist eine
+      **Formatfrage**: entweder ein `period_us`-Feld (die reservierten Bytes sind weg, also eine
+      neue `entry_len` und damit eine Formatversion), oder `budget_us` fällt.
+
+      **Offen: `priority = 0` ist nicht von „nichts gesagt" zu unterscheiden.** 0 ist im Scheduler
+      die niedrigste gültige Priorität; heute bekommt ein Eintrag mit 0 die Vorgabe. Wer wirklich 0
+      will, kann es nicht sagen. Dieselbe Formatfrage wie oben.
+
+      **Ein Befund nebenbei, der größer ist als der Eintrag:** die Prioritäten standen seit jeher
+      im Test-Manifest (3/1/2/2/2) und wurden nie eingelöst — es waren Platzhalter. Eingehalten
+      **reißt** dieselbe Zuteilung die Lade-Suite: ein *pollender* Treiber (B-3.2, kein IRQ) auf
+      einer höheren Priorität als sein Client lässt den Client verhungern. Richtig zugeteilt und
+      trotzdem unbrauchbar. Ein Feld, das nie eingelöst wird, sammelt Werte an, die niemand geprüft
+      hat — und der Tag, an dem es eingelöst wird, ist der Tag, an dem sie alle falsch sind.
+      (Genau deshalb braucht ein pollender Treiber ein **Budget**, s. oben.)
+
 - [ ] **Z11d. Hot-Reload ohne IPC-Verlust — was dafür wirklich nötig ist.** Auf ARM existiert der
       Fall bereits (Phase 7: eine Server-PD wird über *dieselbe* Endpoint-Cap ersetzt). Für einen
       Betriebsanspruch reicht das aber nicht; drei Dinge fehlen:
@@ -134,15 +161,18 @@ und Microkit-Runtime im Image") und zieht Konsequenzen nach sich, die über sie 
          Speicherregion, die den Austausch überlebt (dann ist ihr Format eine ABI und muss
          versioniert werden), oder ein ausdrückliches Übergabeprotokoll. Ohne Festlegung wird
          Hot-Reload ein Neustart mit Datenverlust und heißt nur anders.
-- [ ] **Z11e. Protokollversionen prüfen, nicht hoffen.** Das Manifest nennt die Schnittstellen-
-      version je Komponente; ein Austausch, der die Version ändert, wird **abgewiesen** statt
-      durchgelassen. Sonst redet ein neuer Server mit alten Clients in einer Sprache, die beide
-      für dieselbe halten.
-- [ ] **Z11f. Was NICHT hot-reloadbar sein kann, muss benannt sein.** Der Kernel selbst, und
-      alles, was eine Cap auf maschinenlokale Hardware hält, während sie in Benutzung ist
-      (IOMMU-Kontexte, aktive DMA-Regionen). Eine Liste dessen, was der Austausch *nicht* umfasst,
-      gehört in `docs/invariants.md` — sonst wird aus „alles ist austauschbar" im Betrieb eine
-      Überraschung.
+- [x] **Z11e. Protokollversionen werden geprüft — erledigt** (A-4.4, hier nur nicht
+      nachgetragen). `iface_gate` hält die `iface_version` beim ersten Laden einer `program_id`
+      fest und weist jeden weiteren Ladevorgang mit anderer Version ab. Der Abweisungszweig ist
+      über das Manifest allein **nicht erreichbar** (pro Boot gibt es genau ein Manifest) —
+      deshalb füttert der Selbsttest `iface_record_or_check` direkt, statt einen ungeprüften Zweig
+      stehen zu lassen.
+- [x] **Z11f. Die Negativliste steht — erledigt** (`docs/invariants.md` §13, normativ). Sie nennt
+      den Kernel selbst (das Manifest ist an sein Image gebunden — ein getauschter Kernel entwertet
+      jede Signatur), IOMMU-Kontexte, aktive DMA-Regionen und gebundene IRQ-Zustellung; dazu die
+      Grenze, die beim Schreiben dazukam: **eine gefärbte PD ist nicht hot-reloadbar, wenn alle
+      Streifen vergeben sind** (Hot-Reload erzeugt die neue Instanz, bevor die alte verschwindet —
+      beide brauchen gleichzeitig einen eigenen Streifen).
 
 ### Z4. Checkpoint/Restore eines Threads
 **Klasse:** neues Subsystem · **Aufwand:** groß, mehrstufig
@@ -445,13 +475,31 @@ teilen sich nachweislich keine Cache-Farbe — Region, Kernel-Stack und Seitenta
 QEMU 256 erfundene), aarch64 seit 2026-08-02 (16 Farben — die Aufteilung, an der die
 `MASK_BITS`-Verwechslung hing). Offen bleibt das Folgende.
 
-- [ ] **Der reguläre Weg ist weiterhin ungefärbt.** `spawn_isolated` (2-MiB-Region) kann es
-      strukturell nicht sein: 2 MiB sind 512 Seiten, also 512 aufeinanderfolgende Farben — bei den
-      gemessenen 256 Farben überstreicht ein einziger Blockdeskriptor jede Farbe zweimal. Färbung
-      gibt es nur über `spawn_isolated_colored`, und die kostet die kleinere Region
-      (`colors::region_bytes()`, bei 4 Partitionen 64 KiB) plus seitenweises Mapping statt eines
-      Block-PTE. **Die Entscheidung, welcher Weg der reguläre sein soll, steht aus** — solange
-      `spawn_isolated` der Normalfall ist, ist A1 im Normalbetrieb *nicht* wirksam.
+- [x] **Der reguläre Weg ist gefärbt — und die Entscheidung steht im Manifest, nicht im Code**
+      (2026-08-07). Ein Programm mit `POLICY_EXCLUSIVE_STRIPE` wird stückweise aus **einem**
+      Streifen geladen: Segmente, Stack, Seitentabellen, EL0-Kernel-Stack. Belegt als
+      `pdcolor : ALL PASS` (5 Seiten in 16 von 512 Farben, gemessen an der Teardown-Buchhaltung).
+      Details in [done.md](done.md). `spawn_isolated` bleibt ungefärbt und ist kernel-intern;
+      der Produktpfad ist der Lader.
+
+- [ ] **Way-Partitionierung (Intel CAT / AMD L3-QoS / ARM MPAM) — bewertet 2026-08-07, nicht
+      gebaut, und der Grund ist eine Messung.** Auf dem Entwicklungsrechner gibt es sie nicht:
+      13th-Gen-Core-i7, keine `cat_l3`/`rdt_a`-Flag in `/proc/cpuinfo`, kein `resctrl`. Sie ließe
+      sich hier also bauen, aber **nicht prüfen** — und eine Zusicherung ohne Messung ist in diesem
+      Projekt kein Fortschritt, sondern eine Zeile in `docs/invariants.md`, die niemand einlösen
+      kann. (Auf dem Produktziel Dual-EPYC gibt es L3-CAT; dort wäre es messbar.)
+
+      **Der Entwurfspunkt, der davon unabhängig gilt:** Färbung und Way-Partitionierung lösen
+      dasselbe Problem auf verschiedenen Ebenen, und **beide gleichzeitig ohne gemeinsame Politik
+      ist schlechter als eine**. Die Farbe schränkt ein, welche *Sets* eine PD belegen kann; CAT
+      schränkt ein, welche *Ways* sie belegen darf. Zwei unabhängig entwickelte Zuteiler kämpfen
+      gegeneinander — dieselbe Falle wie Farbe gegen NUMA ([Z8](#z8-numa)), wo sie ausdrücklich
+      benannt ist. Wer CAT einführt, muss zuerst entscheiden, ob es die Färbung **ersetzt**
+      (dann fällt `region_bytes()` weg und PDs dürfen wieder große Blöcke nehmen) oder **ergänzt**.
+
+      Der Vorteil von CAT wäre genau das, was der Färbung fehlt: keine Bindung an Physadressen,
+      also **auch als Gast wirksam** — s. §12, wo gemessen ist, dass Färbung unter KVM gar nicht
+      trägt (`disjunkt=234` gegen `gleichfarbig=210`).
 
 - [x] **Die Farbanzahl begrenzt die Anzahl gleichzeitig getrennter PDs** — erledigt mit B-4.2,
       hier bis 2026-08-01 nur nicht nachgetragen. `claim_stripe`/`release_stripe`

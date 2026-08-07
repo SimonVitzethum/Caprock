@@ -962,16 +962,127 @@ fn policy_gate(program_id: u32) -> Result<(), LoaderError> {
     let Some((_, flags)) = manifest_entry_of(program_id) else {
         return Ok(());
     };
-    if flags & sel4lake_loader::manifest::POLICY_EXCLUSIVE_STRIPE != 0 {
+    use sel4lake_loader::manifest as m;
+    // **EXCLUSIVE_STRIPE wird seit dem 2026-08-07 EINGEHALTEN** (A1/Z11c) und steht deshalb nicht
+    // mehr hier. Die alte Begruendung ("Segmente kommen zusammenhaengend aus mem_alloc") beschrieb
+    // die damalige Allokation, nicht eine Notwendigkeit -- gemappt wurde schon immer seitenweise.
+    // Siehe `system::load_into_pd_colored`.
+    //
+    // Was hier bleibt, ist der Rest, und der Grundsatz ist derselbe: **was der Kernel nicht
+    // einhalten kann, wird abgewiesen, nicht ignoriert.** Ein Politikfeld, das nur gedruckt wird,
+    // ist schlechter als keins -- es sieht konfiguriert aus.
+    if flags & m::POLICY_PINNED != 0 {
         println!(
-            "loader  : POLICY ABGEWIESEN -- program_id {program_id} verlangt EXCLUSIVE_STRIPE. \
-             Die Streifenvergabe steht (B-4.2), aber Segmente/Stack eines geladenen Programms \
-             kommen zusammenhaengend aus mem_alloc; ein Farbstreifen traegt nur \
-             MASK_BITS/PARTITIONS Seiten. Teilweise gefaerbt ist NICHT gefaerbt."
+            "loader  : POLICY ABGEWIESEN -- program_id {program_id} verlangt PINNED. Der \
+             Lastausgleich ist heute per Vorgabe AUS, aber \"aus\" ist keine Zusicherung: \
+             `balance_once` ist aufrufbar, und eine Affinitaet, die nur solange gilt, wie niemand \
+             sie anfasst, ist keine."
         );
         return Err(LoaderError::UnsupportedPolicy);
     }
     Ok(())
+}
+
+/// **Die Politikfelder ausserhalb der Bitmaske** -- gilt fuer JEDEN Ladevorgang.
+///
+/// Getrennt von [`policy_gate`], weil sie eine andere Quelle haben: `policy_flags` ist eine
+/// Bitmaske mit `POLICY_KNOWN`-Pruefung im Parser, diese hier sind Zahlen, und eine Zahl hat kein
+/// "unbekannt". `numa_node = 0` heisst nicht "keine Aussage", sondern "Knoten 0" -- auf einer
+/// Maschine ohne NUMA-Begriff ist das zufaellig richtig und auf der naechsten falsch.
+fn zahlenpolitik_gate(program_id: u32) -> Result<(), LoaderError> {
+    let Some(e) = manifest_zahlen_of(program_id) else {
+        return Ok(());
+    };
+    let (numa, affin, prio, budget) = e;
+    // NUMA gibt es nicht (Z8 offen): der `PhysAllocator` hat eine flache Freiliste ohne
+    // Knotenbegriff. Ein Manifest, das Knoten 1 verlangt, bekaeme heute Knoten 0 und niemand
+    // erfuehre es. Knoten 0 ist die einzige einhaltbare Angabe -- und auch nur, weil es genau
+    // einen gibt.
+    if numa != 0 {
+        println!(
+            "loader  : POLICY ABGEWIESEN -- program_id {program_id} verlangt numa_node={numa}. \
+             Der Allokator hat keine Knoten (todo Z8); jede Angabe ausser 0 waere still falsch."
+        );
+        return Err(LoaderError::UnsupportedPolicy);
+    }
+    // Affinitaet, Prioritaet und Budget werden EINGEHALTEN -- s. `endow_and_load`. Hier steht nur
+    // die Schranke: eine Kernnummer, die es nicht gibt, ist ein Fehler im Dokument.
+    if affin != sel4lake_loader::manifest::ANY_CORE && (affin as usize) >= crate::system::num_cores()
+    {
+        println!(
+            "loader  : POLICY ABGEWIESEN -- program_id {program_id} verlangt core_affinity={affin}, \
+             die Maschine hat {} Kerne.",
+            crate::system::num_cores()
+        );
+        return Err(LoaderError::UnsupportedPolicy);
+    }
+    // **Prioritaet**: der Scheduler kennt 0..NPRIO-1 (8). Eine Zahl darueber ist kein "so hoch wie
+    // moeglich", sondern ein Fehler im Dokument.
+    if prio as usize >= sel4lake_sched::NPRIO {
+        println!(
+            "loader  : POLICY ABGEWIESEN -- program_id {program_id} verlangt priority={prio}, der \
+             Scheduler kennt 0..{}.",
+            sel4lake_sched::NPRIO - 1
+        );
+        return Err(LoaderError::UnsupportedPolicy);
+    }
+    // **Budget: abgewiesen, und zwar nicht aus Bequemlichkeit.**
+    //
+    // Eine MCS-Reservierung besteht aus ZWEI Zahlen -- Budget *und* Periode ("wie viel je
+    // wie lang"). Das Manifest hat nur `budget_us`. Aus einer Zahl eine Reservierung zu machen
+    // hiesse, die Periode zu erfinden; sie stuende dann in keinem Dokument, waere auf keiner
+    // Maschine nachlesbar, und ein Manifest, das "200 us" sagt, bekaeme eine Garantie, die es nie
+    // verlangt hat.
+    //
+    // Dazu kommt die Aufloesung: `set_budget` rechnet in TICKS (100 Hz -> 10 000 us). Alles unter
+    // einem Tick waere entweder 0 (kein Budget, also das Gegenteil des Gewuenschten) oder
+    // aufgerundet -- eine stille Vervielfachung.
+    //
+    // Das ist deshalb eine **Formatfrage**, keine Kernelfrage: solange das Manifest keine Periode
+    // traegt, ist `budget_us` nicht einhaltbar. Steht als offener Punkt in `todo.md` Z11c.
+    if budget != 0 {
+        println!(
+            "loader  : POLICY ABGEWIESEN -- program_id {program_id} verlangt budget_us={budget}. \
+             Eine MCS-Reservierung braucht Budget UND Periode; das Manifestformat hat nur eine \
+             Zahl. Eine erfundene Periode waere eine Zusicherung, die niemand verlangt hat."
+        );
+        return Err(LoaderError::UnsupportedPolicy);
+    }
+    Ok(())
+}
+
+/// `(numa_node, core_affinity, priority, budget_us)` dieser `program_id`.
+fn manifest_zahlen_of(program_id: u32) -> Option<(u32, u32, u32, u32)> {
+    let m = read_manifest()?;
+    (0..m.count())
+        .filter_map(|i| m.entry(i))
+        .find(|e| e.program_id == program_id)
+        .map(|e| (e.numa_node, e.core_affinity, e.priority, e.budget_us))
+}
+
+/// Die [`crate::system::LadePolitik`] dieser `program_id` aus dem angenommenen Manifest.
+///
+/// **Nach den Gates**, nie davor: hier wird nichts mehr geprueft, sondern nur uebersetzt. Was der
+/// Kernel nicht einhalten kann, hat `policy_gate`/`zahlenpolitik_gate` bereits abgewiesen -- diese
+/// Funktion darf deshalb annehmen, dass jeder Wert gilt. Steht kein Eintrag im Manifest, gilt die
+/// Vorgabe, und die ist bitgleich das Verhalten vor Z11c.
+fn ladepolitik(program_id: u32) -> crate::system::LadePolitik {
+    use crate::system::LadePolitik;
+    let farbig = manifest_entry_of(program_id)
+        .is_some_and(|(_, f)| f & sel4lake_loader::manifest::POLICY_EXCLUSIVE_STRIPE != 0);
+    let Some((_numa, affin, prio, _budget)) = manifest_zahlen_of(program_id) else {
+        return LadePolitik { farbig, ..LadePolitik::VORGABE };
+    };
+    LadePolitik {
+        farbig,
+        // `priority = 0` heisst im Manifest "nichts gesagt" -- 0 ist im Scheduler eine gueltige
+        // (die niedrigste) Prioritaet, aber ein Dokument, das schweigt, soll die Vorgabe bekommen
+        // und nicht die niedrigste. Wer wirklich 0 will, sagt es heute nicht unterscheidbar; das
+        // ist eine Formatgrenze und steht als solche in `todo.md`.
+        prio: if prio == 0 { LadePolitik::VORGABE.prio } else { prio as u8 },
+        core: (affin != sel4lake_loader::manifest::ANY_CORE).then_some(affin as usize),
+        budget_us: 0, // abgewiesen, s. `zahlenpolitik_gate`
+    }
 }
 
 /// **A-4.5 mit Zaehnen:** ein als nicht austauschbar markiertes Programm wird kein zweites Mal
@@ -1001,6 +1112,7 @@ fn hotreload_gate(program_id: u32, schon_geladen: bool) -> Result<(), LoaderErro
 /// bei jedem weiteren gegen sie geprueft.
 fn iface_gate(program_id: u32) -> Result<(), LoaderError> {
     policy_gate(program_id)?; // zuerst: eine unerfuellbare Politik macht alles Weitere sinnlos
+    zahlenpolitik_gate(program_id)?;
     let schon = iface_bekannt(program_id);
     hotreload_gate(program_id, schon)?;
     let Some(jetzt) = manifest_iface_version(program_id) else {
@@ -1058,6 +1170,69 @@ fn iface_record_or_check(program_id: u32, jetzt: u32) -> Result<(), LoaderError>
 /// ueber das Manifest ist der Abweisungszweig heute nicht erreichbar. Benutzt `program_id`-Werte,
 /// die kein Archiv vergibt, damit die echte Buchhaltung unberuehrt bleibt.
 #[cfg(feature = "selftest")]
+/// **A1 auf dem regulaeren Weg messen** (2026-08-07). `true`, wenn die Zeile ALL PASS meldet
+/// oder die Frage auf dieser Maschine nicht entscheidbar ist (SKIP).
+///
+/// Ohne gefaerbt geladene PD gibt es nichts zu messen -- dann SKIP mit Grund, nicht ALL PASS.
+/// Eine Zeile, die schweigt, weil der Fall nicht vorkam, darf nicht wie ein bestandener Test
+/// aussehen.
+#[cfg(feature = "selftest")]
+pub fn run_pdcolor() -> bool {
+    let Some((asid_g, mask, asid_u)) = crate::system::pdcolor_kandidaten() else {
+        println!(
+            "pdcolor : SKIP -- in diesem Lauf wurde kein Programm mit POLICY_EXCLUSIVE_STRIPE \
+             geladen. Es gibt nichts zu messen; ALL PASS waere hier eine Aussage ueber die \
+             Abwesenheit des Falls, nicht ueber die Faerbung"
+        );
+        return true;
+    };
+    let t = crate::colors::run_pd_color(asid_g, mask, asid_u);
+    crate::colors::report_pd_color(&t);
+    t.ok || !t.entscheidbar
+}
+
+/// **Z11c: wird die Politik des Manifests wirklich ANGEWANDT?** (2026-08-07)
+///
+/// Die Frage ist nicht, ob der Lader die Zahl gelesen hat -- das druckt die `manifest:`-Zeile
+/// seit A-1.4. Die Frage ist, ob der Thread sie **hat**. Gelesen wird deshalb der TCB
+/// (`system::priority_of`), nicht der Ladepfad.
+///
+/// **Warum der Kern dieser Zeile nicht das Scheduling-Verhalten ist.** Die naheliegende Pruefung
+/// waere „laeuft der hoeher priorisierte Thread zuerst?". Die haengt am Verhalten der geladenen
+/// Programme und misst damit die Programme, nicht die Zuteilung. Sie hat beim Bau dieser Sache
+/// auch prompt etwas anderes gezeigt: ein POLLENDER Treiber (B-3.2, kein IRQ) auf einer hoeheren
+/// Prioritaet als sein Client laesst den Client verhungern -- richtig zugeteilt und trotzdem
+/// unbrauchbar. Das ist ein Befund ueber Treiber ohne Budget, nicht ueber die Zuteilung.
+#[cfg(feature = "selftest")]
+pub fn run_ladepolitik() -> bool {
+    let Some((verlangt, bekommen, kern, kern_bekommen)) = crate::system::ladepolitik_abweichend()
+    else {
+        println!(
+            "ladepol : SKIP -- in diesem Lauf verlangte kein Manifest-Eintrag eine Politik, die \
+             von der Vorgabe abweicht. Ein Vergleich 'verlangt == bekommen' waere hier auch dann \
+             wahr, wenn der Ladepfad die Angabe gar nicht liest"
+        );
+        return true;
+    };
+    let kern_ok = match kern {
+        None => true, // keine Affinitaet verlangt -> nichts zu pruefen
+        Some(k) => kern_bekommen == Some(k),
+    };
+    let prio_ok = bekommen == Some(verlangt);
+    println!(
+        "ladepol : Thread mit ABWEICHENDER Politik: Manifest verlangte prio={verlangt} \
+         kern={kern:?}, Scheduler gab prio={bekommen:?} kern={kern_bekommen:?} (beim LADEN \
+         erfasst, nicht im Bericht zurueckgelesen -- der Thread darf inzwischen tot sein)"
+    );
+    println!(
+        "ladepol : {} (Z11c: die Politik des Manifests wird ANGEWANDT, nicht nur gelesen. \
+         Gelesen wird der TCB, nicht der Ladepfad -- ein Lader, der bestaetigt, was er selbst \
+         getan hat, bestaetigt nichts)",
+        if prio_ok && kern_ok { "ALL PASS" } else { "FAILURES" }
+    );
+    prio_ok && kern_ok
+}
+
 pub fn run_iface_gate() -> bool {
     const ID: u32 = 0xA44_0001; // kein Archiv vergibt IDs in dieser Gegend
     let erst = iface_record_or_check(ID, 7).is_ok();
@@ -1108,7 +1283,12 @@ pub fn load_image(
         _ => return Err(LoaderError::UnsupportedDomain),
     };
     let img = ElfImage::parse(prog.elf)?; // Safe-Rust-Validierung; unsafe erst im Kopier-Glue
-    crate::system::load_elf(&img, domain, endow, boot_arg).ok_or(LoaderError::NoResources)
+    // **Beide Ladepfade, sonst ist die Politik umgehbar** -- genau wie beim A-4.4-Gate daneben.
+    // Der erste Anlauf stellte nur `load_program_into_pd` um; `hello` kommt aber ueber DIESEN Weg,
+    // und die `pdcolor`-Zeile meldete daraufhin SKIP. Dass sie SKIP meldete und nicht ALL PASS,
+    // ist der Grund, warum es aufgefallen ist.
+    crate::system::load_elf_mit(&img, domain, endow, boot_arg, ladepolitik(prog.program_id))
+        .ok_or(LoaderError::NoResources)
 }
 
 /// Ein Programm in eine **vor-erstellte** PD laden (ext-26, L3) — fuer HardwareLand-Backends
@@ -1126,7 +1306,8 @@ pub fn load_program_into_pd(
     }
     iface_gate(prog.program_id)?; // A-4.4 -- gilt auf BEIDEN Ladepfaden, sonst ist er umgehbar
     let img = ElfImage::parse(prog.elf)?;
-    crate::system::load_into_pd(&img, pd, endow, boot_arg).ok_or(LoaderError::NoResources)
+    crate::system::load_into_pd_mit(&img, pd, endow, boot_arg, ladepolitik(prog.program_id))
+        .ok_or(LoaderError::NoResources)
 }
 
 /// **Integritaets-/Trust-Gate** (ADR 0011 §7 + ADR 0014, ext-28): darf dieses Image geladen werden?

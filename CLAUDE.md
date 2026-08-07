@@ -148,6 +148,40 @@ falsch.
   **ein** Fehlschlag unter dreifacher paralleler QEMU-Last. Passt zum offenen Haenger aus D6 und
   trat auch vor diesen Aenderungen auf -- auseinandergehalten habe ich es nicht.
 
+## Was am 2026-08-07 dazukam (zweiter Teil: A1 + Z11c)
+
+* **A1 wirkt jetzt auf dem REGULAEREN Weg — und die Entscheidung steht im Manifest.** Ein Programm
+  mit `POLICY_EXCLUSIVE_STRIPE` wird stueckweise aus EINEM Farbstreifen geladen (Segmente, Stack,
+  Seitentabellen, EL0-Kernel-Stack). Belegt als `pdcolor : ALL PASS` — 5 Seiten in 16 von 512
+  Farben, gemessen an der **Teardown-Buchhaltung**, nicht am Ladepfad.
+  Die alte Begruendung, warum das nicht gehe, war zur Haelfte falsch: „Segmente kommen
+  zusammenhaengend aus `mem_alloc`" beschrieb die damalige ALLOKATION, nicht eine Notwendigkeit —
+  gemappt wurde laengst seitenweise.
+* **Die Politik des Manifests wird ANGEWANDT, nicht nur gedruckt** (`ladepol : ALL PASS`).
+  `priority`/`core_affinity` eingehalten; `numa_node != 0`, `POLICY_PINNED` und `budget_us != 0`
+  **abgewiesen** statt still ignoriert. Bei `budget_us` ist das eine Formatfrage: eine
+  MCS-Reservierung braucht Budget UND Periode, das Manifest hat eine Zahl — aus einer Zahl eine
+  Reservierung zu machen hiesse, die Periode zu erfinden.
+* **Der Befund, der groesser ist als der Eintrag:** die Prioritaeten standen seit jeher im
+  Test-Manifest (3/1/2/2/2) und wurden nie eingeloest — Platzhalter. Eingehalten REISST dieselbe
+  Zuteilung die Lade-Suite: ein **pollender** Treiber auf hoeherer Prioritaet als sein Client
+  laesst den Client verhungern. Ein Feld, das nie eingeloest wird, sammelt ungepruefte Werte an,
+  und der Tag der Einloesung ist der Tag, an dem sie alle falsch sind.
+* **Drei eigene Fehler im Pruefer, alle gemessen:** die erste Gegenprobe war NICHT ERFUELLBAR
+  (sie verlangte von einer 2-Seiten-PD mehr Farben, als ein Streifen fasst — sie fiel durch,
+  unabhaengig davon, ob die Faerbung traegt); die Messung stand zuerst in `all_done()`, das
+  GEPOLLT wird; und die Prioritaet wurde im Bericht zurueckgelesen, wo der Thread schon tot sein
+  darf. Den dritten hat die Zeile selbst gefangen — sie meldete **SKIP** statt ALL PASS, weil ich
+  nur einen der beiden Ladepfade umgestellt hatte.
+* **Way-Partitionierung (CAT/MPAM) bewertet, nicht gebaut, und der Grund ist eine Messung:** auf
+  dem Entwicklungsrechner gibt es sie nicht (keine `cat_l3`/`rdt_a`-Flag, kein `resctrl`). Baubar,
+  aber nicht pruefbar. Der Entwurfspunkt gilt trotzdem: Faerbung trennt SETS, CAT trennt WAYS —
+  beide ohne gemeinsame Politik ist schlechter als eine.
+* **Drei Eintraege standen offen und waren erledigt:** Z11b (Manifest signiert und ans Image
+  gebunden), Z11e (`iface_version` durchgesetzt), Z11f (Negativliste in `docs/invariants.md` §13).
+  Dazu D11 tags zuvor. Ein Register, das Erledigtes fuehrt, macht die Frage „was ist offen"
+  unbeantwortbar — genau die Form, die der Modell-Treue-Waechter an sich selbst gemeldet hat.
+
 ## Was am 2026-08-07 dazukam
 
 * **D0 ist gefangen UND behoben — nach zehn Tagen und vier Messreihen.** Die Ursache war keine

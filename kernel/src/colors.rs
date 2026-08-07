@@ -1343,3 +1343,168 @@ pub fn report_prime_probe(p: &PrimeProbe) {
         if p.ok { "ALL PASS" } else { "FAILURES" }
     );
 }
+
+// ================================================================================================
+// A1 / Z11c: der Farbnachweis fuer eine GELADENE PD (2026-08-07)
+// ================================================================================================
+//
+// Bis heute galt A1 nur fuer `spawn_isolated_colored` -- eine PD, die der Kernel selbst erzeugt.
+// Der REGULAERE Weg, ein Programm auf diesen Knoten zu bringen, ist aber der Lader, und der war
+// ungefaerbt. Genau das stand als offener Punkt in A1: „solange `spawn_isolated` der Normalfall
+// ist, ist A1 im Normalbetrieb *nicht* wirksam."
+//
+// **Warum die Messung nicht aus dem Ladepfad kommt.** Der Lader hat die Frames selbst aus dem
+// gefaerbten Allokator geholt; ihn zu fragen, ob sie gefaerbt sind, hiesse, einen Schreiber sein
+// eigenes Ergebnis bestaetigen zu lassen. Gelesen wird deshalb die **Teardown-Buchhaltung**
+// (`system::loaded_frames_of`): was dort steht, ist das, was der PD gehoert -- dieselbe Quelle,
+// aus der die Freigabe kommt.
+//
+// **Die Positivkontrolle ist der wichtigere Teil.** „Alle Frames dieser PD liegen im Streifen"
+// ist trivial wahr, wenn die PD gar keine Frames hat oder wenn es nur eine Farbe gibt. Beides
+// wird getrennt gemeldet, und beides macht die Zeile zu SKIP statt zu ALL PASS. Dazu die
+// Gegenprobe an einer UNGEFAERBTEN PD: liegen deren Frames zufaellig auch alle in einem Streifen,
+// misst der Test nicht die Faerbung, sondern die Groesse der Zuteilung.
+
+/// Ergebnis von [`run_pd_color`].
+#[cfg(feature = "selftest")]
+#[derive(Default)]
+pub struct PdColorTest {
+    /// Farbanzahl der Maschine.
+    pub colors: u32,
+    /// Frames der gefaerbten PD (Stuecke, nicht Seiten).
+    pub frames_gefaerbt: usize,
+    /// Seiten der gefaerbten PD.
+    pub seiten_gefaerbt: usize,
+    /// Liegen ALLE Seiten der gefaerbten PD in ihrem Streifen?
+    pub in_maske: bool,
+    /// Wie viele verschiedene Farben belegt die gefaerbte PD?
+    pub farben_gefaerbt: u32,
+    /// Seiten der ungefaerbten Vergleichs-PD (0 = keine da).
+    pub seiten_ungefaerbt: usize,
+    /// Wie viele Farben fasst ein Streifen?
+    pub farben_je_streifen: u32,
+    /// Laege die UNGEFAERBTE PD zufaellig auch im Streifen der gefaerbten? (Beobachtung -- bei
+    /// kleinen PDs kommt das vor und macht die Messung dieses Laufs schwaecher, aber nicht falsch.)
+    pub ungefaerbt_im_streifen: bool,
+    /// Teilen die beiden PDs keine einzige Farbe?
+    pub disjunkt: bool,
+    /// Ist die Frage auf dieser Maschine ueberhaupt entscheidbar?
+    pub entscheidbar: bool,
+    pub ok: bool,
+}
+
+/// Den Farbsatz der Frames einer `asid` einsammeln: `(Seiten, Farbmaske als Bitfeld ueber
+/// `MASK_BITS`, alle-in-`mask`)`.
+#[cfg(feature = "selftest")]
+fn farben_der_asid(asid: u16, mask: Option<ColorMask>) -> (usize, u64, bool) {
+    let colors = count();
+    let mut frames = [(0u64, 0u64); 64];
+    let n = crate::system::loaded_frames_of(asid, &mut frames);
+    let (mut seiten, mut bits, mut drin) = (0usize, 0u64, true);
+    for &(base, len) in &frames[..n] {
+        let mut off = 0u64;
+        while off < len {
+            let p = base + off;
+            let c = color_of(p, colors);
+            bits |= 1u64 << (c % sel4lake_mem::MASK_BITS);
+            if let Some(m) = mask {
+                if !m.contains(c) {
+                    drin = false;
+                }
+            }
+            seiten += 1;
+            off += PAGE;
+        }
+    }
+    (seiten, bits, drin)
+}
+
+/// **A1 fuer den regulaeren Weg**: liegen die Frames einer gefaerbt geladenen PD in ihrem
+/// Streifen, und teilt sie mit einer anderen PD keine Farbe?
+#[cfg(feature = "selftest")]
+pub fn run_pd_color(asid_gefaerbt: u16, mask: ColorMask, asid_ungefaerbt: u16) -> PdColorTest {
+    let mut t = PdColorTest { colors: count(), ..Default::default() };
+    // **Entscheidbarkeit zuerst.** Unter zwei Farben gibt es nichts zu trennen, und ohne Frames
+    // gibt es nichts zu messen -- in beiden Faellen waere „alle liegen im Streifen" wahr, ohne
+    // etwas belegt zu haben.
+    let (seiten, bits_g, drin) = farben_der_asid(asid_gefaerbt, Some(mask));
+    t.seiten_gefaerbt = seiten;
+    t.in_maske = drin;
+    t.farben_gefaerbt = bits_g.count_ones();
+    let (seiten_u, bits_u, _) = farben_der_asid(asid_ungefaerbt, None);
+    t.seiten_ungefaerbt = seiten_u;
+    let je_streifen = (count().min(sel4lake_mem::MASK_BITS) / PARTITIONS).max(1);
+    t.farben_je_streifen = je_streifen;
+    t.ungefaerbt_im_streifen = seiten_u > 0 && (bits_u & !maske_bits(mask)) == 0;
+    t.disjunkt = (bits_g & bits_u) == 0;
+    // **Wann die Messung ueberhaupt etwas sagen kann -- und was der erste Entwurf falsch machte.**
+    //
+    // Dort lautete die Gegenprobe „die ungefaerbte PD belegt MEHR Farben, als ein Streifen fasst".
+    // Das war nicht erfuellbar: die geladenen Programme sind klein (gemessen 2 und 5 Seiten), und
+    // 2 Seiten koennen nie mehr als 16 Farben belegen. Das Kriterium fiel durch, unabhaengig
+    // davon, ob die Faerbung traegt -- ein Pruefer, der nicht bestehen KANN, misst nichts.
+    //
+    // Was hier wirklich traegt, ist `in_maske` selbst, und seine Kraft steht in der Zeile: die
+    // gefaerbte PD haelt N Seiten in einem Streifen von `je_streifen` aus `colors` Farben. Ein
+    // ungefaerbter Lauf traefe das nur zufaellig, und wie zufaellig, sagt das Verhaeltnis. Nicht
+    // entscheidbar ist es dagegen, wenn
+    //   * die Maschine unter zwei Farben hat (nichts zu trennen),
+    //   * der Streifen ALLE Farben umfasst (die Bedingung waere leer),
+    //   * die gefaerbte PD weniger als zwei Seiten hat oder alle auf einer Farbe liegen
+    //     (dann ist „alle im Streifen" eine Aussage ueber eine einzige Seite).
+    t.entscheidbar =
+        usable() && je_streifen < count() && seiten >= 2 && t.farben_gefaerbt >= 2;
+    t.ok = t.entscheidbar && t.in_maske;
+    t
+}
+
+/// Die Farbmaske als Bitfeld ueber `MASK_BITS` -- dieselbe Verdichtung wie in [`farben_der_asid`].
+#[cfg(feature = "selftest")]
+fn maske_bits(mask: ColorMask) -> u64 {
+    let mut b = 0u64;
+    for c in 0..count() {
+        if mask.contains(c) {
+            b |= 1u64 << (c % sel4lake_mem::MASK_BITS);
+        }
+    }
+    b
+}
+
+/// Die Berichtszeile zu [`run_pd_color`] -- **eine** Druckstelle (s. den `FAIL`/`FAILURES`-Fehler).
+#[cfg(feature = "selftest")]
+pub fn report_pd_color(t: &PdColorTest) {
+    println!(
+        "pdcolor : Farben={} Streifen={} Farben | gefaerbte-PD: {} Seiten in {} Farbe(n), \
+         alle-im-Streifen={} | ungefaerbte-PD: {} Seiten, zufaellig-auch-im-Streifen={}, \
+         disjunkt={}",
+        t.colors,
+        t.farben_je_streifen,
+        t.seiten_gefaerbt,
+        t.farben_gefaerbt,
+        t.in_maske,
+        t.seiten_ungefaerbt,
+        t.ungefaerbt_im_streifen,
+        t.disjunkt
+    );
+    if !t.entscheidbar {
+        println!(
+            "pdcolor : SKIP -- nicht entscheidbar auf dieser Maschine ({} Farben, {} bzw. {} \
+             Seiten). Eine Aussage ueber Trennung braucht mindestens zwei Farben UND zwei PDs mit \
+             Frames; ohne beides waere ALL PASS eine leere Beobachtung",
+            t.colors, t.seiten_gefaerbt, t.seiten_ungefaerbt
+        );
+        return;
+    }
+    println!(
+        "pdcolor : {} (A1 auf dem REGULAEREN Weg: eine ueber das Manifest als EXCLUSIVE_STRIPE \
+         geladene PD haelt ihre Segmente, ihren Stack und ihre Seitentabellen in EINEM \
+         Farbstreifen -- {} Seiten in {} von {} Farben. Gemessen an der TEARDOWN-Buchhaltung, \
+         nicht am Ladepfad: ein Lader, der bestaetigt, was er selbst getan hat, bestaetigt nichts. \
+         Ein ungefaerbter Lauf traefe diesen Streifen nur zufaellig -- vor dem 2026-08-07 wies der \
+         Lader die Politik ueberhaupt ab, die Zeile meldete dann SKIP statt ALL PASS)",
+        if t.ok { "ALL PASS" } else { "FAILURES" },
+        t.seiten_gefaerbt,
+        t.farben_je_streifen,
+        t.colors
+    );
+}

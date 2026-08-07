@@ -933,6 +933,11 @@ fn drv_service_step(archive: bool) {
                     && q(7) == 3,
                 Ordering::Release,
             );
+            // **A1 auf dem regulaeren Weg, EINMAL gemessen.** Hier, weil `init` seine PDs
+            // laengst geladen hat -- frueher waere die Kandidatenliste leer, und leer haette
+            // wie "nichts zu beanstanden" ausgesehen.
+            PDCOLOR_OK.store(crate::loader::run_pdcolor(), Ordering::Release);
+            LADEPOL_OK.store(crate::loader::run_ladepolitik(), Ordering::Release);
             PART_OK.store(
                 q(8) == 0
                     && q(9) == ERWARTET_PARTITIONEN
@@ -1862,6 +1867,12 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
     let blkdev = BLKDEV_OK.load(Ordering::Acquire);
     let part = PART_OK.load(Ordering::Acquire);
     let iface = IFACE_GATE_OK.load(Ordering::Acquire);
+    // **A1 auf dem regulaeren Weg** (2026-08-07). Gelesen, nicht gemessen: die Messung DRUCKT,
+    // und `all_done()` wird gepollt -- eine druckende Messung gehoert hier so wenig hin wie ein
+    // Urteil, das erst im Bericht entsteht. Beim ersten Anlauf stand der Aufruf hier und die
+    // Suite lief in den Watchdog. Gemessen wird einmal, in Schritt 2 unten.
+    let pdcolor = PDCOLOR_OK.load(Ordering::Acquire);
+    let ladepol = LADEPOL_OK.load(Ordering::Acquire);
     // A-4.2 aus demselben Grund wie B-4.2 in der Abschlussbedingung: eine Zusicherung, die nur
     // im Bericht steht, faellt beim Brechen niemandem auf.
     let quiesce = QUIESCE_OK.load(Ordering::Acquire);
@@ -1902,6 +1913,8 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             ("dmaiso", DMAISO_OK.load(Ordering::Acquire)),
             ("part", part),
             ("iface", iface),
+            ("pdcolor", pdcolor),
+            ("ladepol", ladepol),
             ("quiesce", quiesce),
             ("rebind", rebind),
             ("epfull", epfull),
@@ -1933,7 +1946,14 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 21;
+const DONE_FLAGS: usize = 23;
+
+/// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
+#[cfg(feature = "selftest")]
+static PDCOLOR_OK: AtomicBool = AtomicBool::new(false);
+/// Z11c: wird die Manifest-Politik angewandt? Ergebnis der EINMALIGEN Messung.
+#[cfg(feature = "selftest")]
+static LADEPOL_OK: AtomicBool = AtomicBool::new(false);
 
 /// Bericht + Abschaltung (das Testskript wertet die Marker aus).
 ///

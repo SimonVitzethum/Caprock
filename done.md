@@ -9,6 +9,134 @@ schon einmal nicht getragen hat.
 
 ---
 
+## A1 + Z11c — der reguläre Weg ist gefärbt, und die Politik steht im Manifest (2026-08-07)
+
+### 1. Was offen war
+
+A1 galt nur für `spawn_isolated_colored` — eine PD, die der Kernel selbst erzeugt. Der **reguläre**
+Weg, ein Programm auf diesen Knoten zu bringen, ist der Lader, und der war ungefärbt. So stand es
+im Eintrag: *„solange `spawn_isolated` der Normalfall ist, ist A1 im Normalbetrieb nicht wirksam."*
+
+Z11c sagte, die Politik gehöre ins Manifest. Das Format hatte die Felder seit A-1.4
+(`policy_flags`, `numa_node`, `core_affinity`, `priority`, `budget_us`) — der Kernel **druckte**
+sie und hielt nur `POLICY_ROOT_TASK` ein. `POLICY_EXCLUSIVE_STRIPE` wurde ausdrücklich
+**abgewiesen**, was fail-closed und richtig war; die übrigen fünf wurden **still ignoriert**.
+
+Beide Punkte sind dieselbe Frage: *wer entscheidet, ob eine PD einen Farbstreifen bekommt?* Die
+Antwort ist das Autoritätsdokument, nicht der Code.
+
+### 2. Die Begründung, warum gefärbtes Laden nicht ginge, war zur Hälfte falsch
+
+`policy_gate` schrieb: Segmente und Stack kämen „zusammenhängend aus `mem_alloc`", ein Farbstreifen
+trage aber nur `region_bytes()`. Der zweite Teil stimmt. Der erste beschrieb die damalige
+**Allokation**, nicht eine Notwendigkeit — gemappt wurde längst **seitenweise**
+(`vspace_map_page_at` in einer 4-KiB-Schleife). Physische Zusammenhängung wird gar nicht gebraucht.
+
+Damit war die Aufgabe nicht „stückweises Mapping bauen", sondern nur: **stückweise allozieren und
+jedes Stück einzeln buchen.** Stückgröße ist `colors::region_bytes()` — die größte am Stück
+gleichfarbige Menge (x86 512 KiB, aarch64 16 KiB). Ungefärbt bleibt es bei einem Stück je Segment,
+der bisherige Pfad verschiebt sich also nicht.
+
+**Ein Leck, das dabei sichtbar wurde.** `loaded_register` nahm `segs.iter().take(MAX_IMG_SEGS)` —
+was darüber lag, wurde stillschweigend weggelassen und beim Teardown nie freigegeben. Das ist
+wörtlich die Form von D11 (`if cap { .. }` ohne `else`). Solange die Segmentzahl vorher gegen
+dieselbe Schranke geprüft wurde, war es unerreichbar; mit der stückweisen Allokation nicht mehr.
+Jetzt `#[must_use] -> bool`, und der Aufrufer räumt auf.
+
+**Ein benannter Unterschied, kein Versehen:** der Stack einer gefärbten PD wandert in die
+Teardown-Liste statt in die **Reap-Region** des Threads. Eine Reap-Region ist *eine*
+zusammenhängende Region; dem Scheduler eine Liste zu geben wäre ein Umbau des Thread-Todes für
+einen Randfall. Folge: der Stack einer gefärbt geladenen PD überlebt den Tod ihres Threads bis zum
+Abbau der PD — genau wie ihre Segmente es heute schon tun.
+
+### 3. Der Nachweis — und warum er nicht aus dem Ladepfad kommt
+
+    pdcolor : Farben=512 Streifen=16 Farben | gefaerbte-PD: 5 Seiten in 5 Farbe(n),
+              alle-im-Streifen=true | ungefaerbte-PD: 2 Seiten,
+              zufaellig-auch-im-Streifen=false, disjunkt=true
+    pdcolor : ALL PASS
+
+Gemessen wird die **Teardown-Buchhaltung** (`system::loaded_frames_of`), nicht der Ladepfad: der
+hat die Frames selbst aus dem gefärbten Allokator geholt, ihn zu fragen wäre ein Schreiber, der
+sein eigenes Ergebnis bestätigt. Dieselbe Überlegung wie bei `tools/checkfat.py`.
+
+**Zwei eigene Fehler im Prüfer, beide gemessen statt vermutet:**
+
+1. **Die erste Gegenprobe war nicht erfüllbar.** Sie verlangte, die ungefärbte Vergleichs-PD müsse
+   *mehr* Farben belegen, als ein Streifen fasst. Die geladenen Programme sind aber klein (2 und 5
+   Seiten), und 2 Seiten können nie mehr als 16 Farben belegen. Das Kriterium fiel durch,
+   **unabhängig davon, ob die Färbung trägt** — ein Prüfer, der nicht bestehen *kann*, misst nichts.
+   Jetzt trägt `in_maske` selbst die Aussage, und ihre Kraft steht in der Zeile: 5 Seiten in 16 von
+   512 Farben. Nicht entscheidbar ist es bei <2 Farben, bei einem Streifen über alle Farben, oder
+   wenn die PD weniger als zwei Seiten bzw. Farben hat — dann SKIP.
+2. **Die Messung stand zuerst in `all_done()`.** Die wird *gepollt*; eine druckende Messung gehört
+   dorthin so wenig wie ein Urteil, das erst im Bericht entsteht. Die Suite lief in den Watchdog.
+   Jetzt einmal gemessen, Ergebnis in einem Atomic, `all_done()` liest.
+
+**Und ein dritter, den die Zeile selbst gefangen hat.** Ich hatte nur `load_program_into_pd`
+umgestellt; `hello` kommt aber über `load_image` → `load_elf`. Die Zeile meldete daraufhin
+**SKIP** („kein Programm mit EXCLUSIVE_STRIPE geladen") statt ALL PASS — und genau deshalb ist es
+aufgefallen. Ein Prüfer, der Abwesenheit als Erfolg gebucht hätte, hätte hier grün gemeldet.
+
+### 4. Z11c: die Politik wird angewandt, nicht nur gelesen
+
+    ladepol : Thread mit ABWEICHENDER Politik: Manifest verlangte prio=2 kern=None,
+              Scheduler gab prio=Some(2) kern=Some(0)   -> ALL PASS
+
+| Feld | Stand |
+|---|---|
+| `POLICY_EXCLUSIVE_STRIPE` | eingehalten |
+| `priority`, `core_affinity` | eingehalten |
+| `numa_node != 0` | **abgewiesen** — der Allokator hat keine Knoten (Z8) |
+| `POLICY_PINNED` | **abgewiesen** — „Lastausgleich ist per Vorgabe aus" ist keine Zusicherung |
+| `budget_us != 0` | **abgewiesen** — eine MCS-Reservierung braucht Budget *und* Periode |
+
+Der Grundsatz ist derselbe wie bei `EXCLUSIVE_STRIPE` vorher: **was der Kernel nicht einhalten
+kann, wird abgewiesen, nicht ignoriert.** Bei `budget_us` heißt das ausdrücklich: aus einer Zahl
+eine Reservierung zu machen hieße, die Periode zu **erfinden** — sie stünde dann in keinem
+Dokument, und ein Manifest bekäme eine Garantie, die es nie verlangt hat.
+
+**Zwei eigene Fehler auch hier:**
+
+1. Die Zeile verglich zuerst den **zuletzt** geladenen Thread. Der verlangt `prio=1`, und 1 ist die
+   Vorgabe — ein Ladepfad, der die Angabe komplett ignoriert, hätte dieselbe Zeile gedruckt.
+   Gefragt ist der Fall, in dem sich verlangt und bekommen **unterscheiden**.
+2. Danach las sie die Priorität **im Bericht** zurück und bekam `None`: `hello` läuft kurz und
+   beendet sich. Wörtlich die Falle aus dem Farbtest — *ein Wert, der an der Lebendigkeit eines
+   Threads hängt, taugt nicht als Messgröße*. Jetzt beim Laden erfasst, wo der Thread noch nicht
+   einmal zugelassen ist.
+
+### 5. Der Befund, der größer ist als der Eintrag
+
+Die Prioritäten standen seit jeher im Test-Manifest (3/1/2/2/2) und wurden **nie eingelöst** — es
+waren Platzhalter. Eingehalten *reißt* dieselbe Zuteilung die Lade-Suite: ein **pollender** Treiber
+(B-3.2, kein IRQ, s. `todo.md`) auf einer höheren Priorität als sein Client lässt den Client
+verhungern. Richtig zugeteilt und trotzdem unbrauchbar.
+
+**Ein Feld, das nie eingelöst wird, sammelt Werte an, die niemand geprüft hat — und der Tag, an dem
+es eingelöst wird, ist der Tag, an dem sie alle falsch sind.** Genau deshalb braucht ein pollender
+Treiber ein Budget, und genau deshalb ist `budget_us` als Einzahl-Feld nicht einhaltbar.
+
+### 6. Way-Partitionierung (CAT/MPAM): bewertet, nicht gebaut — und der Grund ist eine Messung
+
+Auf dem Entwicklungsrechner gibt es sie nicht: 13th-Gen-Core-i7, keine `cat_l3`/`rdt_a`-Flag in
+`/proc/cpuinfo`, kein `resctrl`. Sie ließe sich hier bauen, aber **nicht prüfen** — und eine
+Zusicherung ohne Messung ist hier kein Fortschritt.
+
+Der Entwurfspunkt gilt unabhängig davon: Färbung schränkt ein, welche *Sets* eine PD belegen kann,
+CAT, welche *Ways*. **Beide gleichzeitig ohne gemeinsame Politik ist schlechter als eine** —
+dieselbe Falle wie Farbe gegen NUMA. Der Vorteil von CAT wäre genau das, was der Färbung fehlt:
+keine Bindung an Physadressen, also **auch als Gast wirksam** (§12 misst, dass Färbung unter KVM
+gar nicht trägt).
+
+### 7. Drei Einträge, die offen standen und erledigt waren
+
+Beim Nachlesen gefunden, nicht beim Bauen: **Z11b** (Manifest signiert und an das Kernel-Image
+gebunden — steht seit A-1.2/A-1.3), **Z11e** (`iface_version` wird durchgesetzt — A-4.4) und
+**Z11f** (die Negativliste in `docs/invariants.md` §13). Alle drei sind aus `todo.md` heraus.
+
+---
+
 ## D0 — der Thread lief, bevor er seine PD hatte (gefangen und behoben 2026-08-07)
 
 **Wie lange das offen war.** Seit dem 2026-07-29. Vier Messreihen, drei Erklärungsversuche, eine

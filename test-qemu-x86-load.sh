@@ -167,11 +167,11 @@ build_archive() {   # $1 = Ausgabedatei, $2 = Kernel-ELF, $3 = manifest-version,
     local sel="${4:-vendor=1af4,device=1042}"
     python3 tools/sign_manifest.py --kernel "$2" --key "$MANKEY" --manifest-version "$3" \
         --out build/system.manifest \
-        --entry "1:init:0:1:$PROG/init.elf:loader,ntfn:root:3::any:0" \
-        --entry "2:hello:2:1:$PROG/hello.elf:ntfn::1::any:0" \
-        --entry "3:virtio-blk:1:1:$PROG/virtio-blk.elf:mmio,dma,ntfn,ep::2::any:0:$sel" \
-        --entry "4:fs:0:1:$PROG/fs.elf:ntfn,ep::2::any:0::3" \
-        --entry "5:virtio-net:1:1:$PROG/virtio-net.elf:mmio,dma,ntfn,ep::2::any:0:vendor=1af4,device=1041" \
+        --entry "1:init:0:1:$PROG/init.elf:loader,ntfn:root:1::any:0" \
+        --entry "2:hello:2:1:$PROG/hello.elf:ntfn:stripe:2::any:0" \
+        --entry "3:virtio-blk:1:1:$PROG/virtio-blk.elf:mmio,dma,ntfn,ep::1::any:0:$sel" \
+        --entry "4:fs:0:1:$PROG/fs.elf:ntfn,ep::1::any:0::3" \
+        --entry "5:virtio-net:1:1:$PROG/virtio-net.elf:mmio,dma,ntfn,ep::1::any:0:vendor=1af4,device=1041" \
         >/dev/null 2>&1 || return 1
     python3 tools/mkarchive.py "$1" --system-manifest build/system.manifest \
         "1:init:0:1:$PROG/init.elf::certs/init-x86.cert" \
@@ -222,6 +222,9 @@ LOG="$(mktemp)"
 echo "== boot ($SECONDS_RUN s) =="
 boot build/boot-archive-x86.bin "$LOG"
 OUT="$(grep -vE "SeaBIOS|iPXE|Press Ctrl|Booting from|C900|PMM|PnP" "$LOG" 2>/dev/null)"
+# **Die neuen Urteilszeilen immer zeigen** -- sie sind das Ergebnis, nicht Diagnose. Eine Zeile,
+# die man nur im Fehlerfall zu sehen bekommt, laesst sich nicht gegenlesen.
+echo "$OUT" | grep -E "^(pdcolor|ladepol)" || true
 if [ -z "$OUT" ]; then
     echo "== KEIN OUTPUT -- das ist KEIN Testergebnis, sondern ein Aufbauproblem (QEMU? Zeitlimit?) =="
     rm -f "$LOG" "$BLK_IMG"; exit 2
@@ -240,6 +243,14 @@ check "mbmod   : ALL PASS" \
 # Treiberfehler statt wie ein fehlendes Modul.
 check "archive : 5 Modul(e)" \
     "A-1.1/A-1.5: das Archiv liegt an der vom Bootloader gemeldeten Adresse und parst (init + hello + virtio-blk + fs)"
+# A1 / Z11c (2026-08-07). **Auf `ALL PASS` geprueft, nicht auf die Zeile** -- die Zeile gibt es
+# auch als SKIP („kein Programm mit EXCLUSIVE_STRIPE geladen"), und genau der Fall ist beim Bau
+# eingetreten: der zweite Ladepfad war nicht umgestellt, `hello` kam ungefaerbt an, und die Suite
+# waere gruen geblieben, haette hier nur die Zeile gestanden.
+check "pdcolor : ALL PASS" \
+    "A1: eine ueber das Manifest als EXCLUSIVE_STRIPE geladene PD haelt Segmente, Stack und Seitentabellen in EINEM Farbstreifen -- gemessen an der Teardown-Buchhaltung, mit Gegenprobe an einer ungefaerbten PD"
+check "ladepol : ALL PASS" \
+    "Z11c: die Politik des Manifests wird ANGEWANDT, nicht nur gelesen (Prioritaet/Affinitaet aus dem TCB zurueckgelesen, nicht aus dem Ladepfad)"
 check "manifest: ALL PASS" \
     "A-1.2..A-1.4: System-Manifest -- signiert ueber die GESAMTE Nachricht, an DIESES Kernel-Image gebunden, Anti-Downgrade, manipulierte Kopie wird abgewiesen"
 check "manifest:   \[1\]init .* ROOT" \

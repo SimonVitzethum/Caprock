@@ -1349,6 +1349,22 @@ fn alloc_colored_anywhere(
     zoned_alloc_colored(size, align, mask, Zone::Anywhere)
 }
 
+/// [`mem_alloc_anywhere`] oder [`alloc_colored_anywhere`], je nachdem ob ein Farbsatz vorliegt.
+///
+/// Das Gegenstueck zu [`mem_alloc_masked`], nur ohne Identitaetsbindung -- fuer die Segmente und
+/// den Stack einer gefaerbt geladenen PD (A1/Z11c). **Ohne Maske ist es bitgleich der bisherige
+/// Pfad**: der ungefaerbte Ladeweg soll sich durch diese Aenderung nicht verschieben.
+fn mem_alloc_masked_anywhere(
+    size: u64,
+    align: u64,
+    mask: Option<sel4lake_mem::ColorMask>,
+) -> Option<MemoryCap> {
+    match mask {
+        Some(m) => alloc_colored_anywhere(size, align, m),
+        None => mem_alloc_anywhere(size, align),
+    }
+}
+
 /// Die gemeinsame Mechanik — dieselbe Zonenwahl und derselbe EINE Lock wie in [`zoned_alloc`].
 fn zoned_alloc_colored(
     size: u64,
@@ -2883,7 +2899,7 @@ pub fn spawn_isolated_native_parked(code: *const u8, code_len: usize, prio: u8) 
             // 2-MiB-Block (kein L3) am L2 -> vspace_teardown faende ihn nicht. Unter der ASID
             // registrieren, damit ein spaeteres destroy_isolated ihn via loaded_free freigibt
             // (sonst leckt der Code-Frame beim Abbau). Der Stack wird separat via Reap freigegeben.
-            loaded_register(asid, &[(cbase, clen)]);
+            let _ = loaded_register(asid, &[(cbase, clen)]);
             Some(t)
         }
         None => {
@@ -2917,6 +2933,26 @@ const LOADED_STACK_BYTES: u64 = 0x4000; // 16 KiB
 /// `src` (filesz Bytes) nach `dst_phys` kopieren + `[src.len(), total)` nullen (`.bss` + Padding).
 /// Die **einzige** unsafe-Stelle des Ladepfads (ADR 0011 §2): Kopieren bereits **validierter**
 /// Segmente in den Zielspeicher.
+/// Ein **Stueck** eines Segments kopieren: `n` Bytes ab `off` aus `src`, Rest mit Null.
+///
+/// Die stueckweise Fassung von [`copy_segment`] (A1/Z11c). `off` kann hinter `src.len()` liegen --
+/// dann ist das Stueck reines BSS und wird vollstaendig genullt. Ohne diesen Fall waere ein
+/// Segment mit `memsz > filesz`, dessen Nullteil ueber eine Stueckgrenze faellt, falsch gefuellt.
+fn copy_segment_at(dst_phys: u64, src: &[u8], off: usize, n: usize) {
+    let aus_datei = src.len().saturating_sub(off).min(n);
+    // SAFETY: `dst_phys` ist ein frisch allozierter, identity-gemappter RW-Frame der Groesse `n`;
+    // es werden genau `n` Bytes geschrieben, und `aus_datei <= n` sowie `off + aus_datei <=
+    // src.len()` gelten nach Konstruktion.
+    unsafe {
+        let dst = dst_phys as *mut u8;
+        if aus_datei > 0 {
+            core::ptr::copy_nonoverlapping(src.as_ptr().add(off), dst, aus_datei);
+        }
+        core::ptr::write_bytes(dst.add(aus_datei), 0, n - aus_datei);
+    }
+}
+
+#[allow(dead_code)]
 fn copy_segment(dst_phys: u64, src: &[u8], total: usize) {
     // SAFETY: `dst_phys` ist ein frisch allozierter, identity-gemappter RW-Frame der Größe `total`
     // (auf Seiten aufgerundet, >= `src.len()`); es werden genau `total` Bytes im Frame geschrieben.
@@ -2934,7 +2970,12 @@ fn copy_segment(dst_phys: u64, src: &[u8], total: usize) {
 // an die geladene PD/VSpace uebergeht). Damit sie beim Teardown der VSpace NICHT lecken, werden
 // sie hier je `asid` registriert und von [`vspace_teardown`] mitfreigegeben.
 const NLOADED_IMG: usize = 16; //   gleichzeitig geladene Programme
-const MAX_IMG_SEGS: usize = 8; //   Frames je Programm (Segmente + Stack)
+// **64 statt 8** (A1/Z11c, 2026-08-07). Eine gefaerbte geladene PD kann ihre Segmente nicht als
+// EINE zusammenhaengende Region nehmen: Farbe ist eine Funktion der Physadresse, und innerhalb
+// eines Streifens sind hoechstens `colors::region_bytes()` aufeinanderfolgende Bytes gleichfarbig
+// (x86 512 KiB, aarch64 16 KiB). Sie wird deshalb stueckweise alloziert, und jedes Stueck muss
+// einzeln zurueckgegeben werden koennen.
+const MAX_IMG_SEGS: usize = 64; // Frames je Programm (Segmentstuecke + Stackstuecke)
 #[derive(Clone, Copy)]
 struct LoadedImage {
     asid: u16, // 0 = freier Slot
@@ -2948,17 +2989,91 @@ static LOADED_IMAGES: SpinLock<[LoadedImage; NLOADED_IMG]> =
     SpinLock::new([LoadedImage::EMPTY; NLOADED_IMG]);
 
 /// Die RAM-Frames `segs` eines geladenen Programms unter `asid` registrieren (für den Teardown).
-fn loaded_register(asid: u16, segs: &[(u64, u64)]) {
-    let mut t = LOADED_IMAGES.lock();
-    if let Some(slot) = t.iter().position(|i| i.asid == 0) {
-        let mut img = LoadedImage::EMPTY;
-        img.asid = asid;
-        for &s in segs.iter().take(MAX_IMG_SEGS) {
-            img.segs[img.nseg] = s;
-            img.nseg += 1;
-        }
-        t[slot] = img;
+///
+/// **Gibt `false` zurueck, wenn nicht ALLES registriert werden konnte** -- kein Slot frei, oder
+/// mehr Stuecke als [`MAX_IMG_SEGS`].
+///
+/// Vorher stand hier ein `take(MAX_IMG_SEGS)` ohne Rueckmeldung: was darueber lag, wurde
+/// stillschweigend weggelassen und beim Teardown nie freigegeben. Das ist wortwoertlich die Form
+/// von D11 (`if cap { .. }` ohne `else`) -- eine Kapazitaet, deren Ueberlauf niemand erfaehrt.
+/// Solange die Segmentzahl vorher gegen dieselbe Schranke geprueft wurde, war es unerreichbar;
+/// mit der stueckweisen Allokation der gefaerbten PDs ist es das nicht mehr.
+#[must_use = "ein nicht registriertes Stueck wird beim Teardown nie freigegeben -- ein Leck"]
+fn loaded_register(asid: u16, segs: &[(u64, u64)]) -> bool {
+    if segs.len() > MAX_IMG_SEGS {
+        return false;
     }
+    let mut t = LOADED_IMAGES.lock();
+    let Some(slot) = t.iter().position(|i| i.asid == 0) else {
+        return false;
+    };
+    let mut img = LoadedImage::EMPTY;
+    img.asid = asid;
+    for &s in segs {
+        img.segs[img.nseg] = s;
+        img.nseg += 1;
+    }
+    t[slot] = img;
+    true
+}
+
+/// Die zuletzt **gefaerbt** geladene PD: `(asid, Farbsatz)`. Nur fuer den Nachweis.
+#[cfg(feature = "selftest")]
+static PDCOLOR_GEFAERBT: SpinLock<Option<(u16, sel4lake_mem::ColorMask)>> = SpinLock::new(None);
+/// Die zuletzt **ungefaerbt** geladene PD -- die Gegenprobe.
+#[cfg(feature = "selftest")]
+static PDCOLOR_UNGEFAERBT: SpinLock<u16> = SpinLock::new(0);
+
+/// Die Prioritaet, die der SCHEDULER diesem Thread gibt.
+#[cfg(feature = "selftest")]
+pub fn priority_of(tid: ThreadId) -> Option<u8> {
+    sel4lake_sched::owner_core(tid).and_then(|c| SCHEDS[c].lock().priority_of(tid))
+}
+
+/// Der letzte Ladevorgang mit einer Politik, die **von der Vorgabe abweicht**:
+/// `(tid_roh, verlangt, Kern_verlangt)`. Nur fuer den Z11c-Nachweis.
+///
+/// **Nicht „der zuletzt geladene".** Der erste Entwurf tat das, und die Zeile las sich gut und
+/// belegte nichts: das zuletzt geladene Programm der Lade-Suite verlangt `prio=1`, und 1 ist die
+/// Vorgabe. Ein Ladepfad, der die Manifest-Prioritaet komplett ignoriert, haette dieselbe Zeile
+/// gedruckt. Gefragt ist der Fall, in dem sich beides UNTERSCHEIDET.
+#[cfg(feature = "selftest")]
+#[allow(clippy::type_complexity)]
+static LADEPOLITIK_ABWEICHEND: SpinLock<Option<(u8, Option<u8>, Option<usize>, Option<usize>)>> =
+    SpinLock::new(None);
+
+/// `(verlangte Prio, bekommene Prio, verlangter Kern, bekommener Kern)` des letzten
+/// Ladevorgangs mit abweichender Politik. `None`, wenn jedes Programm die Vorgabe verlangt hat.
+#[cfg(feature = "selftest")]
+pub fn ladepolitik_abweichend() -> Option<(u8, Option<u8>, Option<usize>, Option<usize>)> {
+    *LADEPOLITIK_ABWEICHEND.lock()
+}
+
+/// `(asid_gefaerbt, maske, asid_ungefaerbt)` fuer [`crate::colors::run_pd_color`].
+#[cfg(feature = "selftest")]
+pub fn pdcolor_kandidaten() -> Option<(u16, sel4lake_mem::ColorMask, u16)> {
+    let g = (*PDCOLOR_GEFAERBT.lock())?;
+    Some((g.0, g.1, *PDCOLOR_UNGEFAERBT.lock()))
+}
+
+/// **Die registrierten Frames einer `asid` lesen** (A1-Nachweis, 2026-08-07).
+///
+/// Der Farbnachweis einer gefaerbt geladenen PD kann nicht aus dem Ladepfad kommen -- der wuerde
+/// bestaetigen, was er selbst getan hat. Er kommt aus der Buchhaltung, die auch der **Teardown**
+/// benutzt: was hier nicht steht, wird nie freigegeben, und was hier steht, ist genau das, was der
+/// PD gehoert. Dieselbe Ueberlegung wie bei `tools/checkfat.py` -- ein Schreiber, der sein eigenes
+/// Ergebnis bestaetigt, bestaetigt nichts.
+///
+/// Gibt die Zahl der geschriebenen Eintraege; `0` heisst "keine solche `asid`".
+#[cfg(feature = "selftest")]
+pub fn loaded_frames_of(asid: u16, out: &mut [(u64, u64)]) -> usize {
+    let t = LOADED_IMAGES.lock();
+    let Some(slot) = t.iter().position(|i| i.asid == asid && i.asid != 0) else {
+        return 0;
+    };
+    let n = t[slot].nseg.min(out.len());
+    out[..n].copy_from_slice(&t[slot].segs[..n]);
+    n
 }
 
 /// Die registrierten RAM-Frames der `asid` an den Allokator zurückgeben + den Slot freigeben.
@@ -2997,12 +3112,101 @@ pub fn load_into_pd(
     endow: &[(usize, CapPtr)],
     boot_arg: usize,
 ) -> Option<ThreadId> {
-    let core = hal::cpu::core_id();
-    let kbase = claim_user_kstack()?; // EL0-Kernel-Stack aus MEM (16 KiB, ausgerichtet)
-    let Some((asid, l1)) = create_vspace() else {
-        release_user_kstack(kbase);
+    load_into_pd_mit(img, pd, endow, boot_arg, LadePolitik::VORGABE)
+}
+
+/// **Die Politik, unter der ein Programm geladen wird** (Z11c, 2026-08-07).
+///
+/// Ein Verbund statt vier Argumenten, und das ist keine Kosmetik: `load_into_pd(img, pd, endow,
+/// boot_arg, true, 1, None, 0)` waere eine Zeile, in der `true` und `1` beliebig vertauschbar
+/// aussehen. Dieses Projekt hat genau diese Falle schon bezahlt -- `Scheduler::spawn_user` nahm
+/// EINEN Wert fuer EL0-SP und Reap-Region, und solange beide zufaellig gleich waren, war es
+/// harmlos.
+///
+/// Die Werte kommen aus dem **Manifest** (`policy_flags`, `core_affinity`, `priority`,
+/// `budget_us`). Was der Kernel nicht einhalten kann, weist der Lader vorher ab -- hier kommt
+/// also nur an, was gilt.
+#[derive(Clone, Copy)]
+pub struct LadePolitik {
+    /// Exklusiver Farbstreifen (`POLICY_EXCLUSIVE_STRIPE`).
+    pub farbig: bool,
+    /// Prioritaet des Threads.
+    pub prio: u8,
+    /// Fester Kern, oder `None` fuer den aufrufenden.
+    pub core: Option<usize>,
+    /// MCS-Budget in Mikrosekunden; `0` = kein Budget (Round-Robin).
+    pub budget_us: u32,
+}
+
+impl LadePolitik {
+    /// Was ohne Manifest-Angabe gilt -- **bitgleich das Verhalten vor Z11c**.
+    pub const VORGABE: LadePolitik =
+        LadePolitik { farbig: false, prio: IDLE_PRIO, core: None, budget_us: 0 };
+}
+
+/// **Wie [`load_into_pd`], aber mit exklusivem Farbstreifen** (A1 / Z11c, 2026-08-07).
+///
+/// # Warum das bis heute nicht ging -- und warum die Begruendung nur halb stimmte
+///
+/// `policy_gate` wies `POLICY_EXCLUSIVE_STRIPE` mit dem Argument ab, Segmente und Stack eines
+/// geladenen Programms kaemen „zusammenhaengend aus `mem_alloc`", ein Farbstreifen trage aber nur
+/// `region_bytes()`. Der zweite Teil stimmt; der erste beschrieb die damalige **Allokation**, nicht
+/// eine Notwendigkeit: gemappt wird hier laengst **seitenweise** (`vspace_map_page_at` in einer
+/// 4-KiB-Schleife), physische Zusammenhaengung wird also gar nicht gebraucht.
+///
+/// Damit ist die Behebung nicht „stueckweises Mapping bauen", sondern nur: **stueckweise
+/// allozieren und jedes Stueck einzeln buchen.**
+///
+/// # Was gefaerbt wird -- und was nicht
+///
+/// Gefaerbt aus **einem** Streifen: PT_LOAD-Segmente, User-Stack, die Seitentabellen der PD
+/// (`create_vspace_masked`, und die L3-Tabellen ueber den `a3`-Allokator) und der
+/// EL0-Kernel-Stack (`claim_user_kstack_masked`). Das ist derselbe Umfang wie bei
+/// [`spawn_isolated_colored`]; die Zusicherung lautet „die private Region zweier PDs teilt keine
+/// Cache-Farbe", nicht „die PDs teilen keinerlei Cache-Zeile".
+///
+/// # Fail-closed
+///
+/// Ist kein Streifen frei, entsteht die PD **gar nicht erst** -- es gibt bewusst keine ungefaerbte
+/// Rueckfallebene. Eine Trennung, die unter Last leise verschwindet, waere schlimmer als gar keine:
+/// danach weiss niemand mehr, welche PD getrennt ist und welche nicht. Dieselbe Festlegung wie bei
+/// `spawn_isolated_colored_auto`.
+pub fn load_into_pd_mit(
+    img: &ElfImage,
+    pd: usize,
+    endow: &[(usize, CapPtr)],
+    boot_arg: usize,
+    pol: LadePolitik,
+) -> Option<ThreadId> {
+    // **Der Kern steht VOR jeder Allokation fest**, denn er bestimmt, welcher Scheduler den Thread
+    // bekommt -- und `spawn_user_at_parked` prueft das per `debug_assert_eq!`. Eine Affinitaet, die
+    // erst nach dem Anlegen wirkt, waere eine Migration und keine Zuteilung.
+    let core = pol.core.unwrap_or_else(hal::cpu::core_id);
+    // Der Streifen zuerst: schlaegt er fehl, ist noch nichts alloziert, was zurueckmuesste.
+    let stripe = if pol.farbig { Some(crate::colors::claim_stripe()?) } else { None };
+    let mask = stripe.map(|(_, m)| m);
+    // Ab hier gibt jeder Fehlerausgang den Streifen zurueck -- bis `vspace_bind_stripe` ihn an die
+    // Lebensdauer der VSpace haengt (dann tut es `vspace_teardown`).
+    let streifen_zurueck = |st: Option<(u32, sel4lake_mem::ColorMask)>| {
+        if let Some((i, _)) = st {
+            crate::colors::release_stripe(i);
+        }
+    };
+    let Some(kbase) = claim_user_kstack_masked(mask) else {
+        streifen_zurueck(stripe);
         return None;
     };
+    let Some((asid, l1)) = create_vspace_masked(mask) else {
+        release_user_kstack(kbase);
+        streifen_zurueck(stripe);
+        return None;
+    };
+    // **Sofort binden, nicht am Ende.** Ab hier ruft jeder Fehlerausgang `vspace_teardown`, und der
+    // gibt den Streifen selbst zurueck. Wer hier spaeter bindet, gibt ihn auf jedem Fehlerpfad
+    // doppelt oder gar nicht frei -- dieselbe Ueberlegung wie in `spawn_isolated_colored_inner`.
+    if let Some((i, _)) = stripe {
+        vspace_bind_stripe(asid, i);
+    }
     let Some(l2) = vspace_l2(asid) else {
         vspace_teardown(asid);
         release_user_kstack(kbase);
@@ -3038,22 +3242,39 @@ pub fn load_into_pd(
     // beim Thread-Ende via Reap freigegeben).
     // Mehr Segmente als registrierbar (MAX_IMG_SEGS) würden beim Teardown lecken (loaded_register
     // merkt nur die ersten MAX_IMG_SEGS) -> **fail-closed**, bevor irgendetwas alloziert ist.
-    if img.segments().count() > MAX_IMG_SEGS {
+    // **Die Stueckgroesse.** Ungefaerbt bleibt es bei EINEM Stueck je Segment (wie bisher, und der
+    // Fastpath bleibt damit unveraendert). Gefaerbt ist die groesste am Stueck gleichfarbige Menge
+    // `colors::region_bytes()` -- x86 512 KiB, aarch64 16 KiB. Groesser anzufordern hiesse, eine
+    // Farbe zu verlangen, die es am Stueck nicht gibt; `alloc_colored` weist das ab.
+    let stueck = |gesamt: u64| -> u64 {
+        match mask {
+            None => gesamt,
+            Some(_) => crate::colors::region_bytes().min(gesamt).max(4096),
+        }
+    };
+    // **Fail-closed VOR jeder Allokation.** Die Zahl der Stuecke, nicht die der Segmente, ist die
+    // Groesse, die `seglist` fuellen muss -- bis heute waren sie gleich, gefaerbt sind sie es
+    // nicht. Der Stack zaehlt mit: er liegt in derselben Liste, wenn das Mapping scheitert.
+    let stuecke_noetig: usize = img
+        .segments()
+        .map(|sg| {
+            let total = ((sg.memsz as u64) + 4095) & !4095;
+            let st = stueck(total.max(4096));
+            (total.max(4096)).div_ceil(st) as usize
+        })
+        .sum::<usize>()
+        + (LOADED_STACK_BYTES.div_ceil(stueck(LOADED_STACK_BYTES)) as usize);
+    if stuecke_noetig > MAX_IMG_SEGS {
+        println!(
+            "loader  : ABGEWIESEN -- das Image braucht {stuecke_noetig} Frame-Stuecke, die \
+             Teardown-Buchhaltung fasst {MAX_IMG_SEGS}. Lieber gar nicht laden als ein Leck."
+        );
         return cleanup(asid, kbase, &[], None);
     }
     let mut seglist = [(0u64, 0u64); MAX_IMG_SEGS];
     let mut nrec = 0usize;
     for seg in img.segments() {
-        let total = (((seg.memsz as u64) + 4095) & !4095) as usize;
-        let Some(region) = mem_alloc_anywhere(total as u64, 4096) else {
-            return cleanup(asid, kbase, &seglist[..nrec], None);
-        };
-        let pa = region.base(); // MemoryCap-Drop = nur Deskriptor (kein Free); RAM bleibt belegt
-        // VOR dem Mappen registrieren -> ein späterer Map-Fehler gibt diesen Frame mit frei.
-        // (Die Segmentzahl ist oben auf MAX_IMG_SEGS begrenzt -> kein Überlauf von `seglist`.)
-        seglist[nrec] = (pa, total as u64);
-        nrec += 1;
-        copy_segment(pa, img.segment_bytes(&seg), total);
+        let total = (((seg.memsz as u64) + 4095) & !4095).max(4096) as usize;
         let perm = if seg.flags & PF_X != 0 {
             hal::mmu::UserPerm::Rx
         } else if seg.flags & PF_W != 0 {
@@ -3061,33 +3282,92 @@ pub fn load_into_pd(
         } else {
             hal::mmu::UserPerm::Ro
         };
-        let mut off = 0u64;
-        while (off as usize) < total {
-            let mut a3 = || mem_alloc_anywhere(4096, 4096).map(|c| c.base());
-            if !hal::mmu::vspace_map_page_at(l2, seg.vaddr + off, pa + off, perm, &mut a3) {
+        let sz = stueck(total as u64) as usize;
+        let mut done = 0usize;
+        while done < total {
+            let n = sz.min(total - done);
+            let Some(region) = mem_alloc_masked_anywhere(n as u64, 4096, mask) else {
                 return cleanup(asid, kbase, &seglist[..nrec], None);
+            };
+            let pa = region.base(); // MemoryCap-Drop = nur Deskriptor (kein Free); RAM bleibt belegt
+            // VOR dem Mappen registrieren -> ein späterer Map-Fehler gibt diesen Frame mit frei.
+            seglist[nrec] = (pa, n as u64);
+            nrec += 1;
+            copy_segment_at(pa, img.segment_bytes(&seg), done, n);
+            let mut off = 0u64;
+            while (off as usize) < n {
+                let mut a3 = || mem_alloc_masked_anywhere(4096, 4096, mask).map(|c| c.base());
+                if !hal::mmu::vspace_map_page_at(
+                    l2,
+                    seg.vaddr + done as u64 + off,
+                    pa + off,
+                    perm,
+                    &mut a3,
+                ) {
+                    return cleanup(asid, kbase, &seglist[..nrec], None);
+                }
+                off += 4096;
             }
-            off += 4096;
-        }
-        if seg.flags & PF_X != 0 {
-            hal::cpu::sync_code_range(pa as usize, total); // I-Cache kohärent vor der Ausführung
+            if seg.flags & PF_X != 0 {
+                hal::cpu::sync_code_range(pa as usize, n); // I-Cache kohärent vor der Ausführung
+            }
+            done += n;
         }
     }
 
     // 2. Stack (nicht-identity an festes VA-Fenster, EL0-RW).
-    let Some(stack_region) = mem_alloc_anywhere(LOADED_STACK_BYTES, 4096) else {
-        return cleanup(asid, kbase, &seglist[..nrec], None);
-    };
-    let stack_pa = stack_region.base();
-    let mut off = 0u64;
-    while off < LOADED_STACK_BYTES {
-        let mut a3 = || mem_alloc_anywhere(4096, 4096).map(|c| c.base());
-        if !hal::mmu::vspace_map_page_at(l2, LOADED_STACK_VA + off, stack_pa + off, hal::mmu::UserPerm::Rw, &mut a3) {
-            // Stack ist alloziert, aber noch NICHT als Reap-Region des Threads vermerkt -> mitfreigeben.
-            return cleanup(asid, kbase, &seglist[..nrec], Some((stack_pa, LOADED_STACK_BYTES)));
+    //
+    // **Zwei Wege, und der Unterschied ist die Freigabe** (A1/Z11c).
+    //
+    // Ungefaerbt: EINE Region, und sie wird dem Thread als **Reap-Region** mitgegeben -- stirbt er
+    // (etwa durch einen absichtlichen Fault, s. die Intruder-Tests), gibt der Scheduler sie sofort
+    // zurueck. Das bleibt bitgleich wie bisher.
+    //
+    // Gefaerbt: mehrere Stuecke. Eine Reap-Region ist EINE zusammenhaengende Region -- mehr kann
+    // der Scheduler nicht halten, und ihm eine Liste zu geben waere ein Umbau des Thread-Todes fuer
+    // einen Randfall. Stattdessen wandern die Stuecke in `seglist`, werden also erst beim
+    // VSpace-Teardown frei. Das ist ein **benannter Unterschied**, kein Versehen: der Stack einer
+    // gefaerbt geladenen PD ueberlebt den Tod ihres Threads bis zum Abbau der PD -- genauso wie
+    // ihre Segmente es heute schon tun.
+    let stack_sz = stueck(LOADED_STACK_BYTES) as usize;
+    let mut stack_reap: Option<(u64, u64)> = None;
+    let mut sdone = 0usize;
+    while sdone < LOADED_STACK_BYTES as usize {
+        let n = stack_sz.min(LOADED_STACK_BYTES as usize - sdone);
+        let Some(region) = mem_alloc_masked_anywhere(n as u64, 4096, mask) else {
+            return cleanup(asid, kbase, &seglist[..nrec], stack_reap);
+        };
+        let pa = region.base();
+        if mask.is_none() {
+            // Ein Stueck, und es gehoert dem Thread (Reap).
+            stack_reap = Some((pa, n as u64));
+        } else {
+            seglist[nrec] = (pa, n as u64);
+            nrec += 1;
         }
-        off += 4096;
+        let mut off = 0u64;
+        while (off as usize) < n {
+            let mut a3 = || mem_alloc_masked_anywhere(4096, 4096, mask).map(|c| c.base());
+            if !hal::mmu::vspace_map_page_at(
+                l2,
+                LOADED_STACK_VA + sdone as u64 + off,
+                pa + off,
+                hal::mmu::UserPerm::Rw,
+                &mut a3,
+            ) {
+                // Das gerade allozierte Stueck ist noch nicht als Reap-Region vermerkt (ungefaerbt)
+                // bzw. steht schon in `seglist` (gefaerbt) -> beide Wege geben es mit frei.
+                return cleanup(asid, kbase, &seglist[..nrec], stack_reap);
+            }
+            off += 4096;
+        }
+        sdone += n;
     }
+    // Ungefaerbt ist das die eine Region von oben; gefaerbt gibt es keine Reap-Region.
+    let (stack_pa, stack_reap_len) = match stack_reap {
+        Some((b, l)) => (b, l),
+        None => (0, 0),
+    };
     hal::mmu::flush_asid(asid);
 
     // 3. PD + Thread + Endowment IRQ-maskiert: der Thread darf nicht vor dem Setup starten.
@@ -3114,9 +3394,9 @@ pub fn load_into_pd(
             kbase,
             USER_KSTACK_SIZE,
             (LOADED_STACK_VA + LOADED_STACK_BYTES) as usize, // EL0-SP (virtuell)
-            stack_pa as usize,                               // Reap-Region (physisch)
-            LOADED_STACK_BYTES as usize,
-            IDLE_PRIO,
+            stack_pa as usize,                               // Reap-Region (physisch; 0 = keine)
+            stack_reap_len as usize,
+            pol.prio,
         );
         if let Some(t) = r {
             fp_reset_slot(t.slot());
@@ -3131,10 +3411,39 @@ pub fn load_into_pd(
     let Some(tid) = tid else {
         hal::cpu::local_irq_restore(daif);
         // Spawn fehlgeschlagen -> der Stack ist noch nicht als Reap-Region eines Threads vermerkt;
-        // Segmente + Stack mitfreigeben (loaded_register lief noch nicht).
-        return cleanup(asid, kbase, &seglist[..nrec], Some((stack_pa, LOADED_STACK_BYTES)));
+        // Segmente + Stack mitfreigeben (loaded_register lief noch nicht). Gefaerbt stehen die
+        // Stackstuecke bereits in `seglist`, `stack_reap` ist dann `None`.
+        return cleanup(asid, kbase, &seglist[..nrec], stack_reap);
     };
-    loaded_register(asid, &seglist[..nrec]); // Segment-Frames fuer den Teardown merken (L4)
+    // **Der Rueckgabewert wird geprueft** (s. `loaded_register`): passt die Liste nicht mehr,
+    // waeren die Stuecke beim Teardown verloren. Oben ist das bereits fail-closed abgefangen --
+    // hier steht die zweite Schranke, weil die erste eine RECHNUNG ist und diese eine TATSACHE.
+    // **Den bekommenen Wert JETZT erfassen, nicht im Bericht.** Hier lebt der Thread mit
+    // Sicherheit -- er ist noch nicht einmal zugelassen. Zurueckgelesen waere er es nicht:
+    // `hello` laeuft kurz und beendet sich, und `priority_of` gab im Bericht `None`. Genau
+    // dieselbe Falle wie beim Farbtest, wo `kstack_of` 0 lieferte, sobald die Sonde eingesammelt
+    // war -- ein Wert, der an der Lebendigkeit eines Threads haengt, taugt nicht als Messgroesse.
+    #[cfg(feature = "selftest")]
+    {
+        if pol.prio != LadePolitik::VORGABE.prio || pol.core.is_some() {
+            let bekommen = SCHEDS[core].lock().priority_of(tid);
+            *LADEPOLITIK_ABWEICHEND.lock() =
+                Some((pol.prio, bekommen, pol.core, sel4lake_sched::owner_core(tid)));
+        }
+    }
+    // Fuer den A1-Nachweis festhalten, WELCHE asid gefaerbt geladen wurde -- die Messung liest
+    // spaeter die Teardown-Buchhaltung dieser asid, nicht den Ladepfad.
+    #[cfg(feature = "selftest")]
+    {
+        match stripe {
+            Some((_, m)) => *PDCOLOR_GEFAERBT.lock() = Some((asid, m)),
+            None => *PDCOLOR_UNGEFAERBT.lock() = asid,
+        }
+    }
+    if !loaded_register(asid, &seglist[..nrec]) {
+        hal::cpu::local_irq_restore(daif);
+        return cleanup(asid, kbase, &seglist[..nrec], stack_reap);
+    }
     bind_pd(pd, tid);
     for &(slot, cap) in endow {
         // Policy-geprüft (Domänen-Policy bleibt gültig). Lehnt die Policy die Cap ab (false), wurde
@@ -3165,8 +3474,19 @@ pub fn load_elf(
     endow: &[(usize, CapPtr)],
     boot_arg: usize,
 ) -> Option<(ThreadId, usize)> {
+    load_elf_mit(img, domain, endow, boot_arg, LadePolitik::VORGABE)
+}
+
+/// Wie [`load_elf`], aber unter einer benannten [`LadePolitik`] (Z11c).
+pub fn load_elf_mit(
+    img: &ElfImage,
+    domain: Domain,
+    endow: &[(usize, CapPtr)],
+    boot_arg: usize,
+    pol: LadePolitik,
+) -> Option<(ThreadId, usize)> {
     let pd = create_pd_in_domain(domain)?;
-    match load_into_pd(img, pd, endow, boot_arg) {
+    match load_into_pd_mit(img, pd, endow, boot_arg, pol) {
         Some(tid) => Some((tid, pd)),
         None => {
             // load_into_pd baut `pd` bei Fehler bewusst NICHT ab (gehört dem Aufrufer) -> hier

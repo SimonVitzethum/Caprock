@@ -643,7 +643,8 @@ Details + Herleitung: `docs/phase-reports/ext-30-migration-und-kapazitaet.md`.
 
 ## 12. Cache-Partitionierung zwischen PDs (A1) — und ihre Grenzen
 
-**Invariante:** Zwei über `system::spawn_isolated_colored` erzeugte PDs mit disjunkten Farbsätzen
+**Invariante:** Zwei über `system::spawn_isolated_colored` **oder über den Lader mit
+`POLICY_EXCLUSIVE_STRIPE`** erzeugte PDs mit disjunkten Farbsätzen
 teilen sich **keine Cache-Farbe des Last-Level-Cache** — weder in ihrer privaten Region noch im
 Kernel-Stack noch in ihren obersten Seitentabellen. Geprüft im Lauf (`color : ALL PASS`), die
 Arithmetik zusätzlich auf dem Host (`sel4lake-mem`, `hal::cache_decode`).
@@ -672,10 +673,21 @@ kennt, wird im Betrieb überdehnt.
   diese Invariante auf einer SMT-Maschine **deutlich schwächer, als sie klingt**. Abhilfe wäre SMT
   abschalten oder Gang-Scheduling der Geschwister (`todo.md` Z6); beides steht aus, und der
   Scheduler liest die CPU-Topologie heute nicht.
-* **Der reguläre Weg.** `spawn_isolated` (2-MiB-Region, ein Blockdeskriptor) ist **ungefärbt** und
-  kann es nicht sein: 512 Seiten überstreichen bei den gemessenen 256 Farben jede Farbe zweimal.
-  Das ist Arithmetik, kein Zuteilungsproblem. Solange `spawn_isolated` der Normalfall ist, wirkt
-  A1 im Normalbetrieb **nicht** (`todo.md` Z1/B-4.1).
+* **Der reguläre Weg — seit 2026-08-07 gefärbt, und zwar über das Manifest.** Ein Programm, dessen
+  Manifest-Eintrag `POLICY_EXCLUSIVE_STRIPE` trägt, wird **stückweise aus einem Streifen** geladen:
+  PT_LOAD-Segmente, User-Stack, Seitentabellen und EL0-Kernel-Stack. Fail-closed — ist kein
+  Streifen frei, entsteht die PD gar nicht erst. Geprüft als `pdcolor : ALL PASS`, gemessen an der
+  **Teardown-Buchhaltung** (`system::loaded_frames_of`), nicht am Ladepfad: ein Lader, der
+  bestätigt, was er selbst getan hat, bestätigt nichts.
+
+  Die frühere Begründung, warum das nicht ginge, war zur Hälfte falsch: „Segmente kommen
+  zusammenhängend aus `mem_alloc`" beschrieb die damalige *Allokation*, nicht eine Notwendigkeit —
+  gemappt wurde längst seitenweise, physische Zusammenhängung wird gar nicht gebraucht.
+
+  **Was weiterhin ungefärbt ist:** `spawn_isolated` (2-MiB-Region, ein Blockdeskriptor) — 512
+  Seiten überstreichen jede Farbe mehrfach, das ist Arithmetik und kein Zuteilungsproblem. Der Weg
+  ist kernel-intern (Selbsttests, Sonden); der **Produktpfad** ist der Lader, und der ist gefärbt,
+  wenn das Manifest es sagt. Wer `spawn_isolated` benutzt, bekommt keine Farbzusage.
 * **Mehr PDs als Streifen — behoben (B-4.2), aber die Grenze bleibt.** `claim_stripe` führt
   Belegung; ist kein Streifen frei, gibt es `None`, und die PD entsteht **gar nicht erst**. Es gibt
   keine ungefärbte Rückfallebene. Die Zusicherung wird also nicht mehr still schwächer — sie hört

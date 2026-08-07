@@ -567,6 +567,15 @@ impl Scheduler {
         true
     }
 
+    /// Die **tatsaechliche** Prioritaet eines Threads. `None`, wenn die `tid` hier nicht auflösbar ist.
+    ///
+    /// Fuer den Z11c-Nachweis: dass das Manifest eine Prioritaet NENNT, heisst nicht, dass der
+    /// Scheduler sie hat. Der Ladepfad zu fragen waere ein Schreiber, der sein eigenes Ergebnis
+    /// bestaetigt -- gelesen wird deshalb der TCB.
+    pub fn priority_of(&self, tid: ThreadId) -> Option<u8> {
+        self.resolve(tid).map(|t| self.tcbs[t].priority)
+    }
+
     /// Darf dieser Thread schon laufen? `None`, wenn die `tid` auf diesem Kern nicht auflösbar ist.
     ///
     /// Der Kernel fragt das in `bind_pd`, um die D0-Reihenfolge **zaehlbar** zu machen: eine PD,

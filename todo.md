@@ -827,8 +827,148 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
 
 ---
 
-## D0. Instabilität des x86-Laufs (2026-07-29, **neu gemessen 2026-08-01 und 2026-08-03**)
-**Klasse:** Fehler · **Aufwand:** eingegrenzt, Vollprotokoll eines Hängers steht aus
+## D0. Instabilität des x86-Laufs (2026-07-29, **gefangen am 2026-08-07**)
+**Klasse:** Fehler · **Aufwand:** Fehlerbild vollständig protokolliert, Ursache eingegrenzt auf
+den Ausstieg des IPC-Servers aus seiner `RECV`-Schleife
+
+- [ ] **50 000 Läufe am 2026-08-07: 9 Abweichungen, alle neun zeichengleich — D0 hat zum ersten
+      Mal ein Vollprotokoll.** `tools/d0-messen.sh`, 16 parallele Ströme gegen EINE
+      Referenzsignatur, jeder abweichende Lauf vollständig abgelegt.
+
+      | | |
+      |---|---|
+      | gefahren | 50 000 |
+      | normal | 49 991 |
+      | abweichend | **9** |
+      | Rate | **0,0180 %** — einer je **5556** Läufen |
+      | 95-%-Intervall (Wilson) | **[0,0082 %, 0,0342 %]** |
+
+      Damit ist auch die dritte Erklärung von 2026-08-03 entschieden: die Rate lag **nie** bei
+      0,5 %, und die 2300 sauberen Läufe waren keine Behebung, sondern eine zu kleine
+      Stichprobe — `0,99982²³⁰⁰ ≈ 66 %`, ein Nullbefund war der wahrscheinlichste Ausgang.
+      Belege: `docs/befunde/d0/d0-lauf-2026-08-07.log` (Vollprotokoll), `.sigdiff`,
+      `referenz-2026-08-07.log`.
+
+      **Alle neun sind derselbe Fehler**, nicht neun Zufälle: identische MD5 über den
+      Signaturdiff, verteilt über fünf verschiedene Ströme.
+
+- [ ] **Das Fehlerbild — und es ist ein anderes als das von 2026-08-01 vermutete.** Der Diff
+      gegen die Referenz besteht aus genau vier Zeilen:
+
+          ipc     : CALL(21) ueber Endpoint-Cap -> 0 (erwartet 42)     [Referenz: 42]
+          ipc     : FAILURES
+          freeze  : ... IPC-Rolle-abgewiesen=false                     [Referenz: true]
+          == SELFTEST FAILED (watchdog)   (nach 61 s, 16 961 785 Umdrehungen)
+
+      **Der Knoten hängt nicht.** `sched : core 0..3 ticks=6104/6070/6065/6060` gegen 52 in der
+      Referenz, Worker-Runden `[4182, 4176, 4179]` gegen 27 — das System lief die vollen 61 s
+      durch und bestand jede andere Prüfung. Blockiert ist **ein einziger Thread**: der
+      IPC-Client, der auf eine Antwort wartet, die nie kommt.
+
+      Die Zeile, die es verrät, ist `IPC-Rolle-abgewiesen=false`. Sie prüft
+      `freeze_thread(IPC_SERVER_TID)` und erwartet `Busy`, weil ein Thread in `RECV` eine
+      offene IPC-Beziehung hat. Sie meldet `false`, also: **der Server steht in keiner
+      IPC-Rolle mehr** — er hat seine `RECV`/`REPLY`-Schleife verlassen. Danach dreht er in
+      `loop { spin_loop() }`, und der Client wartet auf einen Empfänger, den es nicht mehr gibt.
+
+      Das ist NICHT der „Hänger ab `sched`" von 2026-08-01: dort fehlten alle Zeilen ab dem
+      Scheduler-Test. Hier ist die gesamte Suite da und grün, bis auf `ipc` und die daran
+      hängende `freeze`-Zeile. Die alte Beschreibung („SMP-Hochlauf, Konsolensperre,
+      Idle-Schleife") trifft dieses Bild nicht.
+
+- [ ] **Die Ursache, gemessen (2026-08-07, zweiter Lauf).** `ERR_NOPD`, `Server bediente 0
+      Anfrage(n)` — in **4 von 4** Treffern zeichengleich. Das allererste `RECV` des Servers
+      scheiterte, weil er **noch keine PD hatte**:
+
+          let (srv, cli) = (spawn(ipc_server, ..), spawn(ipc_client, ..));  // ab hier LAUFFAEHIG
+          bind_pd(srv_pd, srv);                                             // Autoritaet erst hier
+
+      Dazwischen liegt der komplette Aufbau des Clients: eine Stackbelegung unter der MEM-Sperre,
+      ein `sched.spawn`, ein `CAPS.write()`. Fällt der Server in dieses Fenster, sieht er einen
+      **leeren Cspace** — dann ist nicht eine Cap unsichtbar, sondern jede.
+
+      **Der Riss steckt auch im Produktionspfad, nicht nur im Testaufbau.** `load_into_pd` macht
+      den Thread mit `spawn_user_at` lauffähig, bindet **danach** die PD und installiert
+      **danach** das Endowment. Dort deckt ein `local_irq_save` die Lücke — aber nur unter zwei
+      Bedingungen, die nirgends festgeschrieben sind: die Ready-Queue ist streng kernlokal, und
+      der Lastausgleich ist aus (Vorgabe). Wer den Schalter umlegt, öffnet ein Fenster, in dem
+      eine geladene Treiber-PD **ohne jede Cap** anläuft.
+
+      **Und das Wissen war da.** An genau **einer** von 53 Stellen steht seit jeher
+      `hal::cpu::local_irq_disable()` mit dem Kommentar „atomar gegen Preempt, damit es nicht vor
+      dem Bind läuft" (`stale_victim`). Eine Gefahr, die an einer Stelle per Hand abgewehrt wird
+      und an 52 nicht, ist keine Sorgfaltsfrage — sie ist ein fehlender Mechanismus.
+
+- [ ] **Behoben am 2026-08-07 — strukturell, nicht durch Reihenfolge.** Es gibt keine
+      Reihenfolge, die trägt: `bind_pd` braucht die `tid`, die `spawn` erst liefert; die Lücke
+      lässt sich verkleinern, nicht schließen. Deshalb trennt der Scheduler jetzt **erzeugen**
+      von **zulassen**:
+
+      | | |
+      |---|---|
+      | `Scheduler::spawn_parked` | legt den Thread an, reiht ihn **nicht** ein |
+      | `Scheduler::admit` | reiht ein — ab hier darf er laufen |
+      | `system::spawn_*_parked` | dieselbe Trennung eine Ebene höher (5 Erzeuger) |
+      | `system::admit_in_pd(pd, tid)` | binden, dann zulassen |
+      | `system::spawn_in_pd(pd, ..)` | alles drei in einem Aufruf |
+
+      Kein `park: bool`. Ein Schalter wäre wieder ein wählbarer Grund, und die bequeme Belegung
+      wäre die falsche — derselbe Befund wie bei `IdentityReason`.
+
+      Umgestellt: **58 Aufrufstellen** (46 mechanisch, 12 von Hand), dazu `load_into_pd` und der
+      IPC-Aufbau in `bringup`. Eine der 12 war ein eigener Fehler derselben Art: die
+      `page_probe`-Sonde bekam ihre drei Mappings **nach** dem Binden — ein `admit_in_pd` an
+      dieser Stelle hätte sie loslaufen lassen, bevor die Seiten standen, und der Test hätte auf
+      P statt auf P+8KiB gefaultet.
+
+- [ ] **Der Wächter dazu zählt die GELEGENHEIT, nicht den Treffer** (`pdbind`-Zeile). Bei 0,018 %
+      wäre ein Melder, der nur beim Unglück spricht, in 5555 von 5556 Läufen stumm — als Wächter
+      wertlos. Die **Reihenfolge** dagegen ist in jedem Lauf prüfbar: `bind_pd` fragt vorher
+      `is_admitted(tid)` (auf dem Kern des **Threads**, nicht des Aufrufers — sonst wäre er
+      ausgerechnet bei `spawn_on_core(1, ..)` blind) und zählt `LATE_PD_BIND`.
+
+      Dazu drei Dinge, ohne die die Zeile weniger wert wäre:
+      * `unklar` getrennt gezählt — „nicht auflösbar" ist kein „rechtzeitig".
+      * **Sprechprobe**: die Zeile fällt durch, wenn in diesem Lauf gar keine Bindung beobachtet
+        wurde. Ein Zähler, der auf Null steht, weil nichts passierte, ist kein Testergebnis.
+      * **erklärte** Spätbindungen tragen einen Namen (`SpaetbindungsGrund`, heute genau einer:
+        Z4 Stufe 2 bindet dem Checkpoint-Subjekt seinen Umfang nachträglich an, und der Worker
+        *benutzt* keine Cap). Kein `if tid == WORKER_TID0` — eine Ausnahme ohne Namen wächst
+        unsichtbar. Gleiche Form wie `IdentityReason`/`IDENTITY_DEBTS`.
+
+- [ ] **Offen: die schärfere Fassung.** Ein `Parked(ThreadId)`, das nur `admit` konsumieren kann,
+      machte das Vergessen zum **Typfehler** statt zu einer Zahl im Bericht. Es wäre ein Umbau
+      aller 93 Spawn-Stellen; der Zähler leistet heute dasselbe über eine Messung und sieht dabei
+      auch die Stellen, die es morgen erst gibt. Die Verschärfung bleibt trotzdem richtig —
+      der Zähler meldet erst zur Laufzeit, der Typ schon beim Übersetzen.
+
+- [ ] **Abnahme (läuft):** dieselbe Messung gegen den behobenen Kernel. Zwischenstand aus zwei
+      abgebrochenen Anläufen (beide wegen eigener Nacharbeit gestoppt, nicht wegen eines Befunds):
+      **0 Abweichungen in 1361 + 5361 Läufen**. Das ist noch keine Aussage — bei 1/5556 sind
+      6722 Läufe `P(0 | unverändert) ≈ 30 %`. Der volle Lauf über 50 000 (`≈ 1,2·10⁻⁴`) steht aus.
+
+      Die **Positivkontrolle steht schon**: derselbe Aufbau hat den Fehler heute zweimal gefangen,
+      9-mal in 50 000 und 5-mal in 6895. Eine Nullmessung ist nur dann etwas wert, wenn der
+      Messaufbau den Fehler nachweislich sehen kann — hier kann er es.
+
+- [ ] **Was die Behebung NICHT abdeckt.** `admit` gibt `false` zurück, wenn die `tid` nicht mehr
+      auflösbar ist; alle Aufrufstellen verwerfen das mit `let _ =`. Für einen frisch geparkten
+      Thread ist der Fall unerreichbar (er hat nie gelaufen, kann also nicht gestorben sein) —
+      aber „unerreichbar, weil heute niemand dazwischenkommt" ist dieselbe Art von Begründung wie
+      die IRQ-Maske in `load_into_pd`. Wenn ein Reaper künftig geparkte Threads einsammelt, hängt
+      hier ein Thread still. Das gehört an einen Zähler, nicht an ein Argument.
+
+- [ ] **Was der Server verschluckt hat — und wie es sichtbar wurde.** Sein Rumpf lautete
+      `let m = invoke(sys::RECV, ..); if m.result != result::OK { break; }` — der **Grund** des
+      Ausstiegs fiel dabei auf den Boden. Seit 2026-08-07 hält `IPC_SERVER_EXIT` ihn fest und
+      der Bericht druckt ihn mitsamt Klarnamen (`ipc : Server bediente N Anfrage(n); Schleife
+      verlassen: …`); im Normalfall steht dort `nein (noch in der Schleife)`.
+
+      Die Kandidatenliste ist kurz und die Codes sind unterscheidbar:
+      `1 ERR_BADCAP` (Startrennen: `RECV` läuft, bevor die Endpoint-Cap installiert ist),
+      `8 ERR_QUIESCING`, `9 ERR_EP_FULL` (D11, seit 2026-08-05 ein eigener Code).
+      **Abnahme:** ein abweichender Lauf mit dieser Zeile im Protokoll — bei 1 Treffer je 5556
+      Läufen reichen dafür ~20 000.
 
 - [ ] **2300 Läufe am 2026-08-03, keine einzige Abweichung. Die alte Quote ist damit
       ausgeschlossen — die URSACHE ist es nicht.** Gemessen nach dem Tagesstand (Z4 Stufe 2,

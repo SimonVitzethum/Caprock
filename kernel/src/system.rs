@@ -1916,21 +1916,68 @@ pub fn spawn_balanced(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
 /// Wie [`spawn`], aber auf einem **bestimmten** Kern `core` (z. B. vom Bootkern aus,
 /// um Arbeit über die Kerne zu verteilen). Der Zielkern muss vorab via
 /// [`bind_cores`] gebunden sein. Lock-Ordnung RES vor SCHEDS[core].
-pub fn spawn_on_core(core: usize, entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
+pub fn spawn_on_core_parked(core: usize, entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
     let (base, len) = {
         let stack = mem_alloc_anywhere(STACK_SIZE, 16)?;
         (stack.base() as usize, stack.len() as usize)
     }; // MEM vor SCHEDS freigegeben (Ordnung MEM < SCHEDS)
     let mut sched = SCHEDS[core].lock();
-    let tid = sched.spawn(core, entry, arg, base, len, prio)?;
+    let tid = sched.spawn_parked(core, entry, arg, base, len, prio)?;
     fp_reset_slot(tid.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
+    Some(tid)
+}
+
+/// **Einen Thread erzeugen, der seine PD schon hat, bevor er das erste Mal laufen darf** (D0).
+///
+/// # Warum es diese Funktion gibt
+///
+/// Bis zum 2026-08-07 lautete das Muster ueberall:
+///
+/// ```text
+/// let tid = spawn(..);      // <-- ab HIER lauffaehig
+/// bind_pd(pd, tid);         // <-- die Autoritaet kommt erst hier
+/// ```
+///
+/// Dazwischen liegt eine Luecke: eine Speicherbelegung, ein `CAPS.write()`, ein Timer-Tick. Der
+/// Thread kann in dieser Luecke anlaufen, seinen ersten Syscall machen und `ERR_NOPD` bekommen --
+/// mit einem leeren Cspace ist **jede** Cap unsichtbar, nicht nur eine.
+///
+/// Das ist keine Theorie: es ist **D0**. Gemessen am 2026-08-07 ueber 50 000 Laeufe, 9 Treffer
+/// (0,018 %, einer je 5556). Der IPC-Server der x86-Suite fiel dabei mit `ERR_NOPD` aus seiner
+/// `RECV`-Schleife und kam nie zurueck; der Client wartete 61 s auf eine Antwort von einem
+/// Empfaenger, den es nicht mehr gab. Die Suite lief dabei ansonsten vollstaendig durch --
+/// deshalb hat sie den Fehler 2300 Laeufe lang nicht gezeigt.
+///
+/// # Warum nicht einfach die Reihenfolge umdrehen
+///
+/// Weil es keine Reihenfolge GIBT, die traegt: `bind_pd` braucht die `tid`, die `spawn` erst
+/// liefert. Die Luecke laesst sich verkleinern, nicht schliessen. Deshalb parkt der Scheduler den
+/// Thread jetzt (`spawn_parked`) und laesst ihn erst auf `admit` los -- die PD steht dann schon.
+pub fn spawn_in_pd(pd: usize, entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
+    let core = hal::cpu::core_id();
+    let (base, len) = {
+        let stack = mem_alloc_anywhere(STACK_SIZE, 16)?;
+        (stack.base() as usize, stack.len() as usize)
+    }; // MEM vor SCHEDS freigegeben (Ordnung MEM < SCHEDS)
+    let tid = {
+        let mut sched = SCHEDS[core].lock();
+        let t = sched.spawn_parked(core, entry, arg, base, len, prio)?;
+        fp_reset_slot(t.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
+        t
+    }; // SCHEDS freigegeben, BEVOR CAPS genommen wird (Ordnung SCHEDS < CAPS gilt hier nicht)
+    bind_pd(pd, tid);
+    // Erst jetzt darf er laufen. Schlaegt das Zulassen fehl, ist die `tid` nicht mehr auflösbar --
+    // dann ist der Thread ohnehin weg, und ein stiller `true` waere eine Luege.
+    if !SCHEDS[core].lock().admit(tid) {
+        return None;
+    }
     Some(tid)
 }
 
 /// Einen **EL0-User-Thread** erzeugen: Kernel-Stack aus dem EL1-only Pool (per
 /// Free-List, beim Thread-Ende zurückgegeben), User-Stack aus dem EL0-zugänglichen
 /// RAM. Der Thread läuft auf EL0 und kann nur per Syscall mit dem Kernel interagieren.
-pub fn spawn_user(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
+pub fn spawn_user_parked(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
     let core = hal::cpu::core_id();
     let kbase = claim_user_kstack()?; // EL0-Kernel-Stack aus MEM (16 KiB, ausgerichtet)
     let (user_base, user_len) = match mem_alloc(STACK_SIZE, 16) {
@@ -1947,7 +1994,7 @@ pub fn spawn_user(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
         // virtuell wie physisch. Genau deshalb steht sie zweimal da: `spawn_user` (ein Wert
         // fuer beides) ist geloescht, weil die Gleichheit hier ein Zufall der Umgebung ist und
         // keine Eigenschaft des Aufrufs.
-        let r = sched.spawn_user_at(
+        let r = sched.spawn_user_at_parked(
             core,
             entry,
             arg,
@@ -2453,7 +2500,7 @@ fn vspace_bind_stripe(asid: u16, stripe: u32) {
 /// [`hal::mmu::ISO_USER_VA`]. Bis E-Rest 3d war beides dasselbe. Die Kernelseite braucht die PA
 /// (Farbprüfung, Rücklesen), der Thread die VA — sie auseinanderzuhalten ist der ganze Umbau.
 /// VSpace-Tabellen werden beim Thread-Ende abgebaut.
-pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u64)> {
+pub fn spawn_isolated_parked(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u64)> {
     let core = hal::cpu::core_id();
     let kbase = claim_user_kstack()?; // EL0-Kernel-Stack aus MEM (16 KiB, ausgerichtet)
 
@@ -2491,7 +2538,7 @@ pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u
     // im KERNEL, weil der Reap-Pfad eine virtuelle Adresse als Physadresse freigab.
     let tid = {
         let mut sched = SCHEDS[core].lock();
-        let r = sched.spawn_user_at(
+        let r = sched.spawn_user_at_parked(
             core,
             entry,
             arg,
@@ -2563,7 +2610,12 @@ pub fn spawn_isolated_colored(
 ) -> Option<(ThreadId, u64, (u64, u64, u64))> {
     // Ohne Streifennummer: der Aufrufer hat die Maske selbst gewaehlt (Selbsttest) und fuehrt
     // keine Belegung. Fuer PDs ist `spawn_isolated_colored_auto` der richtige Weg.
-    spawn_isolated_colored_inner(entry, arg, prio, mask, None)
+    //
+    // **Zulassen nicht vergessen** (D0): `spawn_isolated_colored_inner` liefert seit dem
+    // 2026-08-07 einen GEPARKTEN Thread. Diese Fassung bindet keine PD nach, also darf sie ihn
+    // sofort loslassen -- aber „sofort" muss dastehen, sonst laeuft die Farbsonde nie an.
+    let (t, r, ks) = spawn_isolated_colored_inner(entry, arg, prio, mask, None)?;
+    admit(t).then_some((t, r, ks))
 }
 
 /// **Gefaerbte PD mit gefuehrter Streifenvergabe** (B-4.2) — der Weg, den B-4.1 zum Normalfall
@@ -2574,7 +2626,7 @@ pub fn spawn_isolated_colored(
 /// gar nicht erst. Es gibt bewusst keine ungefaerbte Rueckfallebene: eine Trennung, die unter
 /// Last leise verschwindet, waere schlimmer als gar keine, weil niemand mehr weiss, welche PD
 /// getrennt ist und welche nicht.
-pub fn spawn_isolated_colored_auto(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u64)> {
+pub fn spawn_isolated_colored_auto_parked(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u64)> {
     let (i, mask) = crate::colors::claim_stripe()?;
     match spawn_isolated_colored_inner(entry, arg, prio, mask, Some(i)) {
         // Die Kernelseite interessiert nur den Selbsttest (s. `spawn_isolated_colored`).
@@ -2647,7 +2699,7 @@ fn spawn_isolated_colored_inner(
     // EL0-SP virtuell, Reap-Region physisch -- s. `spawn_isolated`.
     let tid = {
         let mut sched = SCHEDS[core].lock();
-        let r = sched.spawn_user_at(
+        let r = sched.spawn_user_at_parked(
             core,
             entry,
             arg,
@@ -2734,7 +2786,7 @@ pub fn destroy_pd(pd: usize) {
 /// privater EL0-RW-Stack. Der Thread startet am Anfang des Code-Frames. Beweist, dass
 /// eine isolierte PD beliebigen, nicht-geteilten Code in ihrer eigenen VSpace
 /// ausführt. Gibt die `ThreadId`.
-pub fn spawn_isolated_native(code: *const u8, code_len: usize, prio: u8) -> Option<ThreadId> {
+pub fn spawn_isolated_native_parked(code: *const u8, code_len: usize, prio: u8) -> Option<ThreadId> {
     let core = hal::cpu::core_id();
     let kbase = claim_user_kstack()?; // EL0-Kernel-Stack aus MEM (16 KiB, ausgerichtet)
     let sz = hal::mmu::ISO_REGION_SIZE;
@@ -2806,7 +2858,7 @@ pub fn spawn_isolated_native(code: *const u8, code_len: usize, prio: u8) -> Opti
         // **Entry ist eine VA, die Reap-Region eine PA.** Vorher stand an beiden Stellen
         // `cbase`/`sbase` -- dieselbe Zahl, zwei Bedeutungen. Genau diese Vermengung hat beim
         // Heben des GiB-0-Deckels einen `#PF` im Kernel erzeugt.
-        let r = sched.spawn_user_at(
+        let r = sched.spawn_user_at_parked(
             core,
             cva as usize,          // Entry: virtuell, Anfang des Code-Blocks
             0,
@@ -3045,7 +3097,17 @@ pub fn load_into_pd(
     let daif = hal::cpu::local_irq_save();
     let tid = {
         let mut sched = SCHEDS[core].lock();
-        let r = sched.spawn_user_at(
+        // **Geparkt** (D0, 2026-08-07). Vorher stand hier `spawn_user_at`, und der Thread war ab
+        // dieser Zeile lauffaehig -- `bind_pd` und das Endowment kamen erst 20 Zeilen spaeter. Die
+        // `local_irq_save` darueber hat das bisher gedeckt, aber nur unter zwei Bedingungen, die
+        // nirgends festgeschrieben sind: die Ready-Queue ist streng kernlokal, und der
+        // Lastausgleich ist aus (`MIGRATIONS`, Vorgabe aus). Wer den Schalter umlegt, oeffnet
+        // damit ein Fenster, in dem eine geladene Treiber-PD **ohne jede Cap** anlaeuft.
+        //
+        // Eine lokale IRQ-Sperre, die eine geteilte Groesse schuetzt, hat dieses Projekt schon
+        // einmal bezahlt (`loadstop`, 2026-08-02). Hier haelt sie zufaellig -- das ist kein Grund,
+        // sie halten zu lassen.
+        let r = sched.spawn_user_at_parked(
             core,
             img.entry() as usize,
             boot_arg,
@@ -3082,6 +3144,13 @@ pub fn load_into_pd(
         if !install_pd_cap(pd, slot, cap) {
             let _ = cap_delete(cap);
         }
+    }
+    // **Jetzt erst darf er laufen** -- PD gebunden, Endowment vollstaendig. Das ist die Stelle,
+    // die der Kommentar an Schritt 3 seit jeher behauptet hat („der Thread darf nicht vor dem
+    // Setup starten"); bis zum 2026-08-07 stand sie nur nicht im Code, sondern in der IRQ-Maske.
+    if !SCHEDS[core].lock().admit(tid) {
+        hal::cpu::local_irq_restore(daif);
+        return None;
     }
     hal::cpu::local_irq_restore(daif);
     Some(tid)
@@ -6523,7 +6592,165 @@ pub fn create_hardware_backend(
 pub fn pd_partner(pd: usize) -> Option<usize> {
     CAPS.read().pds.partner_of(pd)
 }
+// ==============================================================================================
+// ZULASSUNG -- die zweite Haelfte jedes `spawn` (D0, 2026-08-07)
+// ==============================================================================================
+//
+// Bis zum 2026-08-07 machte `spawn` den Thread in einem Zug lauffaehig. Wer ihm danach noch etwas
+// geben musste -- eine PD, Caps, eine VSpace -- kam grundsaetzlich zu spaet; die Frage war nur, ob
+// der Scheduler in der Luecke zuschlug. Gemessen: 9-mal in 50 000 Laeufen (D0).
+//
+// Seither gilt: **`spawn_*_parked` erzeugt, `admit_*` laesst zu.** Die uebliche Fassung `spawn_*`
+// ist beides hintereinander und bleibt fuer jeden Thread richtig, dem keine Autoritaet
+// nachgereicht wird. Wer eine PD bindet, nimmt die geparkte Fassung -- sonst zaehlt
+// `LATE_PD_BIND` mit und die Berichtszeile `pdbind` faellt durch.
+//
+// **Warum nicht ein `must_use`-Token statt zweier Namen.** Es waere schaerfer: ein `Parked(tid)`,
+// das nur `admit` konsumieren kann, machte das Vergessen zum Typfehler. Es waere aber auch ein
+// Umbau aller 93 Spawn-Stellen, und der Zaehler leistet dasselbe ueber eine MESSUNG statt ueber
+// eine Portierung -- er sieht auch die Stellen, die es morgen erst gibt. Als Verschaerfung in
+// `todo.md` D0 vermerkt.
+
+/// Einen geparkten Thread zulassen. `false`, wenn die `tid` nicht (mehr) auflösbar ist.
+#[must_use = "ein nicht zugelassener Thread laeuft nie"]
+pub fn admit(tid: ThreadId) -> bool {
+    sel4lake_sched::owner_core(tid).is_some_and(|c| SCHEDS[c].lock().admit(tid))
+}
+
+/// **Erst binden, dann zulassen** -- die Reihenfolge, um die es bei D0 geht.
+#[must_use = "ein nicht zugelassener Thread laeuft nie"]
+pub fn admit_in_pd(pd: usize, tid: ThreadId) -> bool {
+    bind_pd(pd, tid);
+    admit(tid)
+}
+
+pub fn spawn_on_core(core: usize, entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
+    let t = spawn_on_core_parked(core, entry, arg, prio)?;
+    admit(t).then_some(t)
+}
+
+/// Geparkte Fassung von [`spawn`] -- auf dem aufrufenden Kern, noch nicht lauffaehig.
+pub fn spawn_parked(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
+    spawn_on_core_parked(hal::cpu::core_id(), entry, arg, prio)
+}
+
+/// Geparkte Fassung von [`spawn_balanced`].
+pub fn spawn_balanced_parked(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
+    spawn_on_core_parked(least_loaded_core(), entry, arg, prio)
+}
+
+pub fn spawn_user(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
+    let t = spawn_user_parked(entry, arg, prio)?;
+    admit(t).then_some(t)
+}
+
+pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u64)> {
+    let (t, r) = spawn_isolated_parked(entry, arg, prio)?;
+    admit(t).then_some((t, r))
+}
+
+pub fn spawn_isolated_colored_auto(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u64)> {
+    let (t, r) = spawn_isolated_colored_auto_parked(entry, arg, prio)?;
+    admit(t).then_some((t, r))
+}
+
+pub fn spawn_isolated_native(code: *const u8, code_len: usize, prio: u8) -> Option<ThreadId> {
+    let t = spawn_isolated_native_parked(code, code_len, prio)?;
+    admit(t).then_some(t)
+}
+
+/// **Die Gruende, aus denen eine PD ABSICHTLICH spaet gebunden wird.**
+///
+/// Es gibt sie, und sie sind nicht alle ein Fehler: Z4 Stufe 2 braucht ein Subjekt mit einem
+/// UMFANG, und der Umfang (eine Speicher- und eine SchedContext-Cap) entsteht erst am Ende von
+/// `spawn_demo` -- nach den Farbtests, weil ein Test, der Speicher belegt, baseline-empfindliche
+/// Tests kippt. Der Worker laeuft da laengst.
+///
+/// **Warum ein Aufzaehlungstyp und keine Ausnahme im Zaehler.** Ein `if tid == WORKER_TID0` waere
+/// unsichtbar und wuechse mit jedem naechsten Sonderfall. Ein Grund mit Namen steht im Diff, im
+/// Bericht und in [`ERLAUBTE_SPAETBINDUNGEN`] -- dieselbe Form wie `IdentityReason`/`IDENTITY_DEBTS`.
+/// Wer eine Variante hinzufuegt, tut das sichtbar; wer `bind_pd` benutzt, wird gezaehlt.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SpaetbindungsGrund {
+    /// Z4 Stufe 2: das Checkpoint-Subjekt bekommt seinen Umfang erst am Ende des Aufbaus.
+    /// Unkritisch, weil der Worker keine Cap BENUTZT -- er zaehlt. Die PD ist Gegenstand des
+    /// Checkpoints, nicht Werkzeug des Threads.
+    CheckpointSubjektNachtraeglich,
+}
+
+impl SpaetbindungsGrund {
+    pub const fn name(self) -> &'static str {
+        match self {
+            SpaetbindungsGrund::CheckpointSubjektNachtraeglich => "CheckpointSubjektNachtraeglich",
+        }
+    }
+}
+
+/// Die erklaerten Spaetbindungen -- Ratsche. Waechst die Liste, faellt es im Diff auf.
+pub const ERLAUBTE_SPAETBINDUNGEN: [&str; 1] = ["CheckpointSubjektNachtraeglich"];
+
+/// Bitmaske der Gruende, die in diesem Lauf tatsaechlich gefeuert haben (Bit = Variantenindex).
+pub static SPAETBINDUNG_GESEHEN: AtomicUsize = AtomicUsize::new(0);
+
+/// **Alle** Bindungen, rechtzeitige wie spaete, erklaerte wie unerklaerte -- die Sprechprobe.
+///
+/// Ein eigener Zaehler, und der erste Entwurf hatte hier den falschen. Er fragte
+/// `SPAETBINDUNG_GESEHEN != 0`, also: „hat die erklaerte AUSNAHME gefeuert?" Das ist zweimal
+/// verkehrt. Auf aarch64 gibt es diese Ausnahme gar nicht (sie sitzt im x86-Checkpoint-Aufbau) --
+/// die Zeile waere dort durchgefallen, obwohl alles stimmt. Und auf x86 haette sie angefangen
+/// durchzufallen, sobald jemand die Ausnahme beseitigt, also **als Antwort auf eine Verbesserung**.
+///
+/// Eine Sprechprobe gehoert an den GEPRUEFTEN PFAD, nicht an einen Sonderfall darin: gefragt ist
+/// „wurde in diesem Lauf ueberhaupt eine PD gebunden?", denn nur dann kann `LATE_PD_BIND` etwas
+/// gesehen haben. Derselbe Fehler wie eine Veraltungsmeldung, die an die Beobachtung statt an das
+/// Register gekoppelt ist (s. D8).
+pub static PD_BIND_GESAMT: AtomicUsize = AtomicUsize::new(0);
+
+/// Eine **erklaerte** Spaetbindung. Zaehlt nicht in [`LATE_PD_BIND`], erscheint aber im Bericht.
+pub fn bind_pd_late(pd: usize, tid: ThreadId, grund: SpaetbindungsGrund) {
+    let bit = match grund {
+        SpaetbindungsGrund::CheckpointSubjektNachtraeglich => 1usize,
+    };
+    SPAETBINDUNG_GESEHEN.fetch_or(bit, Ordering::Relaxed);
+    PD_BIND_GESAMT.fetch_add(1, Ordering::Relaxed);
+    CAPS.write().pds.bind_thread(pd, tid);
+}
+
+/// Zaehlt die Bindungen, die **zu spaet** kamen: der Thread war schon zugelassen (D0).
+///
+/// Das ist kein Diagnosekomfort, sondern die Abnahmebedingung. Es gibt im Kernel ueber 50 Stellen
+/// mit dem Muster `spawn(); bind_pd()`, und die Frage „welche davon sind das Rennen?" ist per Grep
+/// nicht zu beantworten -- ein `spawn` auf einem anderen Kern, unter IRQ-Maske oder mit einer
+/// Prioritaet, die nie verdraengt, sieht im Text genauso aus. Ein Zaehler beantwortet sie.
+///
+/// **Er ist NICHT dasselbe wie „D0 ist aufgetreten".** Er zaehlt die *Gelegenheit*, nicht den
+/// Treffer -- genau deshalb taugt er: bei 0,018 % Trefferquote braeuchte man 5556 Laeufe fuer eine
+/// Beobachtung, aber die Gelegenheit tritt in JEDEM Lauf auf. Ein Melder, der nur beim Unglueck
+/// spricht, ist bei dieser Rate stumm.
+pub static LATE_PD_BIND: AtomicUsize = AtomicUsize::new(0);
+
+/// Wie oft dabei die Gelegenheit an einem Thread bestand, den dieser Kern gar nicht kennt
+/// (`is_admitted` gibt `None`). Getrennt gezaehlt, weil „nicht auflösbar" kein „rechtzeitig" ist.
+pub static LATE_PD_BIND_UNKLAR: AtomicUsize = AtomicUsize::new(0);
+
 pub fn bind_pd(pd: usize, tid: ThreadId) {
+    // **Vor** der Bindung fragen: danach saehe man nur noch das Ergebnis, nicht die Reihenfolge.
+    //
+    // **Auf dem Kern des THREADS, nicht dem des Aufrufers.** `is_admitted` loest die `tid` gegen
+    // `self.core` auf und gaebe sonst fuer jeden `spawn_on_core(1, ..)`-Thread `None` -- der
+    // Melder waere genau dort blind, wo das Rennen am ehesten trifft. Das Ergebnis wird in eine
+    // Bindung gelegt, damit die SCHEDS-Sperre vor `CAPS.write()` sicher wieder faellt.
+    let bereits = sel4lake_sched::owner_core(tid).and_then(|c| SCHEDS[c].lock().is_admitted(tid));
+    match bereits {
+        Some(true) => {
+            LATE_PD_BIND.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(false) => {}
+        None => {
+            LATE_PD_BIND_UNKLAR.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    PD_BIND_GESAMT.fetch_add(1, Ordering::Relaxed);
     CAPS.write().pds.bind_thread(pd, tid);
 }
 /// Cap **policy-geprüft** in eine PD eintragen (Hardware-Caps nur HardwareLand, `PdControl`

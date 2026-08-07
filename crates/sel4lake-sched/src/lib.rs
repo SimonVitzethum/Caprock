@@ -214,6 +214,9 @@ struct Tcb {
     // --- intrusive Verkettung (ext-30) ---
     /// Priorität der Queue, in der der Thread hängt, oder [`NOT_QUEUED`].
     queued: u8,
+    /// Wurde der Thread nach [`Scheduler::spawn_parked`] **zugelassen**? Siehe D0: ein `bind_pd`
+    /// auf einen bereits zugelassenen Thread ist die Reihenfolge, die den Fehler erzeugt hat.
+    admitted: bool,
     /// Nachfolger/Vorgänger in der Ready-Queue bzw. Nachfolger in der Freiliste.
     qnext: u32,
     qprev: u32,
@@ -264,6 +267,10 @@ impl Tcb {
         stack_base: 0,
         stack_len: 0,
         queued: NOT_QUEUED,
+        // **Ein Bit fuer „darf laufen"** (D0). Es traegt GENAU einen Grund -- der Scheduler kennt
+        // schon ein `blocked`, das frueher drei Bedeutungen hatte (s. D9), und ein viertes waere
+        // derselbe Fehler noch einmal. Hier geht es nur um die Zulassung nach `spawn_parked`.
+        admitted: false,
         qnext: NIL,
         qprev: NIL,
         budget: 0,
@@ -504,13 +511,69 @@ impl Scheduler {
         stack_len: usize,
         priority: u8,
     ) -> Option<ThreadId> {
+        let t = self.spawn_parked(core, entry, arg, stack_base, stack_len, priority)?;
+        let _ = self.admit(t);
+        Some(t)
+    }
+
+    /// **Erzeugen, aber noch NICHT laufen lassen** (D0, 2026-08-07).
+    ///
+    /// Der Unterschied zu [`Scheduler::spawn`] ist eine einzige Zeile — das fehlende
+    /// `enqueue_ready` — und er ist der Kern von D0. Ein Thread, der ab `spawn` lauffähig ist,
+    /// kann **auf einem anderen Kern anlaufen, bevor der Aufrufer ihm seine PD gegeben hat**.
+    /// Genau das war der Fehler: der IPC-Server der x86-Suite lief 9-mal in 50 000 Läufen in sein
+    /// erstes `RECV`, bekam `ERR_NOPD` und verließ seine Schleife für immer.
+    ///
+    /// Die Reihenfolge „erst lauffähig, dann Autorität" ist nicht durch Sorgfalt zu retten: die
+    /// Lücke zwischen den beiden Aufrufen ist beliebig kurz und trifft trotzdem. Deshalb gibt es
+    /// hier zwei Funktionen statt einer Reihenfolge — wer eine PD braucht, ruft
+    /// [`Scheduler::admit`] erst, wenn sie steht.
+    ///
+    /// **Kein `park: bool`-Parameter.** Ein Schalter wäre wieder ein wählbarer Grund, und die
+    /// bequeme Belegung wäre die falsche. Zwei Namen sind nicht zu verwechseln.
+    pub fn spawn_parked(
+        &mut self,
+        core: usize,
+        entry: usize,
+        arg: usize,
+        stack_base: usize,
+        stack_len: usize,
+        priority: u8,
+    ) -> Option<ThreadId> {
         debug_assert_eq!(core, self.core);
         let sp = init_thread_frame(stack_base + stack_len, entry, arg, false, 0);
         let t = self.alloc_tcb(sp, priority)?;
         self.tcbs[t].stack_base = stack_base;
         self.tcbs[t].stack_len = stack_len;
-        self.enqueue_ready(t);
         Some(self.id(t))
+    }
+
+    /// Einen geparkten Thread **zulassen**: ab hier darf er laufen.
+    ///
+    /// Gibt `false` zurück, wenn die `tid` nicht (mehr) auf diesem Kern auflösbar ist. Zweimal
+    /// zulassen ist kein Fehler, aber auch kein zweites Einreihen — `enqueue_ready` ist gegen
+    /// Doppeleinträge gesichert (s. `remove_from_ready` davor).
+    #[must_use = "ein nicht zugelassener Thread laeuft nie -- genau das war D0, nur andersherum"]
+    pub fn admit(&mut self, tid: ThreadId) -> bool {
+        let Some(t) = self.resolve(tid) else {
+            return false;
+        };
+        // **Nur `enqueue_ready`, kein `remove_from_ready` davor.** Die Funktion ist gegen
+        // Doppeleintraege gesichert (`queued != NOT_QUEUED -> return`); ein Entfernen davor waere
+        // kein Schutz, sondern eine stille Aenderung: der Thread landete am ENDE seiner
+        // Prioritaetsschlange, obwohl er schon vorne stand.
+        self.tcbs[t].admitted = true;
+        self.enqueue_ready(t);
+        true
+    }
+
+    /// Darf dieser Thread schon laufen? `None`, wenn die `tid` auf diesem Kern nicht auflösbar ist.
+    ///
+    /// Der Kernel fragt das in `bind_pd`, um die D0-Reihenfolge **zaehlbar** zu machen: eine PD,
+    /// die an einen bereits zugelassenen Thread gebunden wird, kommt zu spaet -- vielleicht nur um
+    /// Nanosekunden, aber genau die haben 9-mal in 50 000 Laeufen gereicht.
+    pub fn is_admitted(&self, tid: ThreadId) -> Option<bool> {
+        self.resolve(tid).map(|t| self.tcbs[t].admitted)
     }
 
     /// **Einen EL0-User-Thread erzeugen — mit GETRENNTEM EL0-SP und Reap-Region.**
@@ -544,11 +607,36 @@ impl Scheduler {
         priority: u8,
     ) -> Option<ThreadId> {
         debug_assert_eq!(core, self.core);
+        let t = self.spawn_user_at_parked(
+            core, entry, arg, kstack_base, kstack_len, el0_sp, reap_base, reap_len, priority,
+        )?;
+        let _ = self.admit(t);
+        Some(t)
+    }
+
+    /// Wie [`Scheduler::spawn_user_at`], aber **noch nicht lauffähig** — s. [`Scheduler::spawn_parked`].
+    ///
+    /// Diese Fassung ist die wichtigere von beiden: `load_into_pd` machte den Thread eines
+    /// geladenen Programms lauffähig, band **danach** seine PD und installierte **danach** die
+    /// Endowment-Caps. Eine Treiber-PD konnte also anlaufen, bevor sie irgendeine Autorität hatte.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_user_at_parked(
+        &mut self,
+        core: usize,
+        entry: usize,
+        arg: usize,
+        kstack_base: usize,
+        kstack_len: usize,
+        el0_sp: usize,
+        reap_base: usize,
+        reap_len: usize,
+        priority: u8,
+    ) -> Option<ThreadId> {
+        debug_assert_eq!(core, self.core);
         let sp = init_thread_frame(kstack_base + kstack_len, entry, arg, true, el0_sp);
         let t = self.alloc_tcb(sp, priority)?;
         self.tcbs[t].stack_base = reap_base;
         self.tcbs[t].stack_len = reap_len;
-        self.enqueue_ready(t);
         Some(self.id(t))
     }
 

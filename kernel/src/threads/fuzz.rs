@@ -1085,8 +1085,8 @@ fn ipcf_snapshot() -> (u64, usize, usize, usize, usize, usize) {
 fn ipcf_respawn(act: &mut [Actor; IPCF_N]) {
     for a in act.iter_mut() {
         if !system::thread_alive(ThreadId::from_raw(a.tid_raw)) {
-            if let Some(t) = system::spawn_on_core(a.core, a.entry, a.arg, IPCF_PRIO) {
-                system::bind_pd(a.pd, t);
+            if let Some(t) = system::spawn_on_core_parked(a.core, a.entry, a.arg, IPCF_PRIO) {
+                let _ = system::admit_in_pd(a.pd, t);
                 a.tid_raw = t.to_raw();
             }
         }
@@ -1167,8 +1167,8 @@ extern "C" fn ipcfuzz_controller(_arg: usize) -> ! {
 
     // --- Aktoren spawnen + binden ---
     for a in act.iter_mut() {
-        if let Some(t) = system::spawn_on_core(a.core, a.entry, a.arg, IPCF_PRIO) {
-            system::bind_pd(a.pd, t);
+        if let Some(t) = system::spawn_on_core_parked(a.core, a.entry, a.arg, IPCF_PRIO) {
+            let _ = system::admit_in_pd(a.pd, t);
             a.tid_raw = t.to_raw();
         }
     }

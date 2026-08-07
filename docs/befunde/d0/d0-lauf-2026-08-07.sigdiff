@@ -1,0 +1,12 @@
+17c17
+< freeze  : ALL PASS
+---
+> freeze  : FAILURES
+23c23
+< ipc     : ALL PASS
+---
+> ipc     : FAILURES
+39c39
+< == SELFTEST COMPLETE
+---
+> == SELFTEST FAILED (watchdog)

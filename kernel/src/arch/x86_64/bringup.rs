@@ -68,12 +68,36 @@ extern "C" fn worker(arg: usize) -> ! {
 /// IPC-Server: verdoppelt die erste Nachricht und antwortet. Erreichbar **nur** über die
 /// Endpoint-Cap in Slot 0 seiner PD.
 #[cfg(feature = "selftest")]
+/// **Warum der Server seine Schleife verlassen hat** — `u64::MAX` heisst „er ist noch drin".
+///
+/// D0-Diagnose (2026-08-07). Aus 50000 Laeufen kamen 9 Abweichungen, alle byte-identisch:
+/// `bringup : offen waren: ipc`, `CALL(21) -> 0 (erwartet 42)` und `IPC-Rolle-abgewiesen=false`.
+/// Die letzte Zeile prueft `freeze_thread(IPC_SERVER_TID)` und erwartet `Busy`, weil der Server in
+/// `RECV` parkt — im Fehlerfall ist er **in keiner IPC-Rolle**. Zusammen mit dem haengenden
+/// Client heisst das: der Server ist nicht mehr in der Schleife.
+///
+/// Wohin er gegangen ist, verschwieg der Rumpf: `if m.result != result::OK { break; }` warf den
+/// Grund weg. Genau die Form, die dieses Projekt sonst jagt — ein Ausgang ohne Namen. Hier steht
+/// er jetzt, und die Berichtszeile zeigt ihn.
+#[cfg(feature = "selftest")]
+static IPC_SERVER_EXIT: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Wieviele Anfragen der Server beantwortet hat, bevor er ausstieg.
+#[cfg(feature = "selftest")]
+static IPC_SERVER_BEDIENT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "selftest")]
 extern "C" fn ipc_server(_arg: usize) -> ! {
     loop {
         let m = invoke(sys::RECV, 0, [0; 4], 0);
         if m.result != result::OK {
+            // **Den Grund festhalten, bevor die Schleife endet.** Ohne diese Zeile ist der
+            // Unterschied zwischen „ERR_BADCAP (Startrennen)", „ERR_QUIESCING" und
+            // „ERR_EP_FULL" von aussen nicht zu sehen — und der Server dreht sich stumm weiter,
+            // waehrend der Client fuer immer auf einen Empfaenger wartet.
+            IPC_SERVER_EXIT.store(m.result, Ordering::Release);
             break;
         }
+        IPC_SERVER_BEDIENT.fetch_add(1, Ordering::Relaxed);
         invoke(sys::REPLY, 0, [2 * m.msg[0], 0, 0, 0], 0);
     }
     loop {
@@ -300,14 +324,28 @@ fn spawn_demo() -> bool {
     if !system::install_pd_cap(srv_pd, 0, recv) || !system::install_pd_cap(cli_pd, 0, send) {
         return false;
     }
-    let (Some(srv), Some(cli)) = (
-        system::spawn(ipc_server as *const () as usize, 0, system::IDLE_PRIO),
-        system::spawn(ipc_client as *const () as usize, 0, system::IDLE_PRIO),
+    // **D0 sass genau hier** (gemessen 2026-08-07, 9 Treffer in 50 000 Laeufen). Vorher stand da
+    //
+    //     let (srv, cli) = (spawn(ipc_server, ..), spawn(ipc_client, ..));   // ab hier lauffaehig
+    //     bind_pd(srv_pd, srv); bind_pd(cli_pd, cli);                        // Autoritaet erst hier
+    //
+    // Zwischen den beiden Zeilen liegt der ganze Aufbau des Clients: eine Stackbelegung unter der
+    // MEM-Sperre, ein `sched.spawn`, ein `CAPS.write()`. Faellt der Server in dieses Fenster, macht
+    // er sein erstes `RECV` mit LEEREM Cspace, bekommt `ERR_NOPD` und verlaesst seine Schleife --
+    // fuer immer. Der Client wartet danach 61 s auf einen Empfaenger, den es nicht mehr gibt, und
+    // der Rest des Knotens laeuft munter weiter (`ticks=6104` gegen 52). Deshalb sah es nie nach
+    // einem Deadlock aus, und deshalb hat die Suite es 2300 Laeufe lang nicht gezeigt.
+    //
+    // `spawn_in_pd` parkt den Thread, bindet die PD und laesst ihn erst dann zu. Die Reihenfolge
+    // ist damit keine Sorgfaltsfrage mehr: es gibt keinen Aufruf, der sie umdrehen koennte.
+    // `_cli` -- die Client-`tid` wurde bisher nur fuer `bind_pd` gebraucht; `spawn_in_pd` erledigt
+    // das. Sie wird trotzdem gebunden, damit der Fehlschlag beider Spawns EIN Muster bleibt.
+    let (Some(srv), Some(_cli)) = (
+        system::spawn_in_pd(srv_pd, ipc_server as *const () as usize, 0, system::IDLE_PRIO),
+        system::spawn_in_pd(cli_pd, ipc_client as *const () as usize, 0, system::IDLE_PRIO),
     ) else {
         return false;
     };
-    system::bind_pd(srv_pd, srv);
-    system::bind_pd(cli_pd, cli);
     // Z4a: der IPC-Server steht spaeter in `RECV` -- er sieht von aussen ruhend aus und ist es
     // nicht. Genau daran wird die Absage geprueft.
     IPC_SERVER_TID.store(srv.to_raw(), Ordering::Release);
@@ -335,9 +373,15 @@ fn spawn_demo() -> bool {
             system::install_sched_context_cap(4, 10, Rights::RW),
         ) {
             if system::install_pd_cap(pd, 0, mcap) && system::install_pd_cap(pd, 1, sc) {
-                system::bind_pd(pd, sel4lake_sched::ThreadId::from_raw(
-                    WORKER_TID0.load(Ordering::Acquire),
-                ));
+                // **Erklaerte Spaetbindung** (D0): Worker 0 laeuft hier laengst. Das ist kein
+                // Rennen -- er BENUTZT keine Cap, die PD ist Gegenstand des Checkpoints. Der
+                // Grund steht als Variante da, damit er im Bericht auftaucht statt im Zaehler
+                // zu fehlen.
+                system::bind_pd_late(
+                    pd,
+                    sel4lake_sched::ThreadId::from_raw(WORKER_TID0.load(Ordering::Acquire)),
+                    system::SpaetbindungsGrund::CheckpointSubjektNachtraeglich,
+                );
                 CKPT_PD.store(pd as u32 + 1, Ordering::Release);
             }
         }
@@ -851,11 +895,11 @@ fn drv_service_step(archive: bool) {
             if !system::install_pd_cap(cli_pd, 0, ep_cap) {
                 return;
             }
-            let Some(cli) = system::spawn(drv_client as *const () as usize, 0, system::IDLE_PRIO)
+            let Some(cli) = system::spawn_parked(drv_client as *const () as usize, 0, system::IDLE_PRIO)
             else {
                 return;
             };
-            system::bind_pd(cli_pd, cli);
+            let _ = system::admit_in_pd(cli_pd, cli);
             DRV_STEP.store(1, Ordering::Release);
         }
         1 => {
@@ -928,11 +972,11 @@ fn drv_service_step(archive: bool) {
             if !system::install_pd_cap(cli_pd, 0, ep_cap) {
                 return;
             }
-            let Some(cli) = system::spawn(ckpt_client as *const () as usize, 0, system::IDLE_PRIO)
+            let Some(cli) = system::spawn_parked(ckpt_client as *const () as usize, 0, system::IDLE_PRIO)
             else {
                 return;
             };
-            system::bind_pd(cli_pd, cli);
+            let _ = system::admit_in_pd(cli_pd, cli);
             CKPT_REQ.store(1, Ordering::Release);
             DRV_STEP.store(6, Ordering::Release);
         }
@@ -1231,11 +1275,11 @@ fn drv_service_step(archive: bool) {
             if !system::install_pd_cap(cli_pd, 0, ep_cap) {
                 return;
             }
-            let Some(cli) = system::spawn(net_client as *const () as usize, 0, system::IDLE_PRIO)
+            let Some(cli) = system::spawn_parked(net_client as *const () as usize, 0, system::IDLE_PRIO)
             else {
                 return;
             };
-            system::bind_pd(cli_pd, cli);
+            let _ = system::admit_in_pd(cli_pd, cli);
             DRV_STEP.store(4, Ordering::Release);
         }
         4 => {
@@ -1929,7 +1973,66 @@ fn report_and_off(watchdog: bool) -> ! {
     println!("sched   : {}", if sched_ok { "ALL PASS" } else { "FAILURES" });
 
     let ipc = IPC_RESULT.load(Ordering::Acquire);
+    // **Der Ausgang des Servers gehoert neben das Ergebnis des Clients.** Ohne ihn sagt
+    // `-> 0 (erwartet 42)` nur, DASS nichts ankam. D0-Diagnose, s. `IPC_SERVER_EXIT`.
+    {
+        let ex = IPC_SERVER_EXIT.load(Ordering::Acquire);
+        let name = match ex {
+            u64::MAX => "nein (noch in der Schleife)",
+            1 => "ja, Code 1 = ERR_BADCAP (Startrennen: RECV vor der Cap)",
+            2 => "ja, Code 2 = ERR_BADSYS",
+            3 => "ja, Code 3 = ERR_RIGHTS",
+            4 => "ja, Code 4 = ERR_NOPD",
+            5 => "ja, Code 5 = ERR_SERVER_GONE",
+            8 => "ja, Code 8 = ERR_QUIESCING",
+            9 => "ja, Code 9 = ERR_EP_FULL",
+            // Ein unbekannter Code darf nicht als bekannter durchgehen -- die Zahl steht dabei.
+            _ => "ja, ANDERER Code",
+        };
+        println!(
+            "ipc     : Server bediente {} Anfrage(n); Schleife verlassen: {name} (roh {ex})",
+            IPC_SERVER_BEDIENT.load(Ordering::Relaxed)
+        );
+    }
     println!("ipc     : CALL(21) ueber Endpoint-Cap -> {ipc} (erwartet 42)");
+    // **Die Gelegenheit zaehlen, nicht den Treffer** (D0). Der Fehler selbst trat in 0,018 % der
+    // Laeufe auf -- eine Zeile, die nur dann spricht, ist in 5555 von 5556 Laeufen stumm und taugt
+    // als Waechter nicht. Die REIHENFOLGE dagegen ist in jedem Lauf pruefbar: wird eine PD an einen
+    // Thread gebunden, der schon laufen darf, war das Rennen offen -- ob es diesmal getroffen hat
+    // oder nicht.
+    //
+    // `unklar` steht daneben, weil „nicht auflösbar" kein „rechtzeitig" ist: ein Thread, der beim
+    // Binden schon gestorben ist, faellt hier hinein. Eine Null in beiden Spalten ist die Aussage;
+    // eine Null in der ersten allein waere eine halbe.
+    {
+        let spaet = system::LATE_PD_BIND.load(Ordering::Relaxed);
+        let unklar = system::LATE_PD_BIND_UNKLAR.load(Ordering::Relaxed);
+        let gesamt = system::PD_BIND_GESAMT.load(Ordering::Relaxed);
+        let gesehen = system::SPAETBINDUNG_GESEHEN.load(Ordering::Relaxed);
+        println!(
+            "pdbind  : gebunden={gesamt} spaet-gebunden={spaet} unklar={unklar} \
+             erklaert-gefeuert={gesehen:#x} (D0: eine PD, die an einen bereits zugelassenen Thread \
+             geht, kommt zu spaet -- der Thread kann seinen ersten Syscall schon gemacht und \
+             ERR_NOPD bekommen haben. Erklaerte Gruende zaehlen NICHT als spaet, stehen aber hier)"
+        );
+        for g in system::ERLAUBTE_SPAETBINDUNGEN {
+            println!("pdbind  :   erklaert zulaessig: {g}");
+        }
+        // **Sprechprobe am gepruefte Pfad, nicht an einer Ausnahme darin.** `gebunden == 0` heisst:
+        // dieser Lauf ist an `bind_pd` gar nicht vorbeigekommen -- dann sagt eine Null bei `spaet`
+        // nichts. Nicht `erklaert-gefeuert` abfragen: das ist ein Sonderfall, den es auf aarch64
+        // nicht gibt und den eine kuenftige Verbesserung wegnehmen darf.
+        println!(
+            "pdbind  : {}",
+            if gesamt == 0 {
+                "FAILURES (NICHT SPRECHFAEHIG: in diesem Lauf wurde keine einzige PD gebunden)"
+            } else if spaet == 0 && unklar == 0 {
+                "ALL PASS"
+            } else {
+                "FAILURES"
+            }
+        );
+    }
     println!("ipc     : {}", if ipc == 42 { "ALL PASS" } else { "FAILURES" });
 
     let syscalls = USER_SYSCALLS.load(Ordering::Relaxed);

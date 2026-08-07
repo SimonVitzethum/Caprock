@@ -133,22 +133,47 @@ echo "== Speicherbedarf eines Laufs messen =="
 # `comm` ist auf 15 Zeichen gekuerzt, und was der erste Anlauf dann mass, waren 2479 MiB je Lauf
 # -- fuer einen 512-MiB-Gast unmoeglich, und die Folge waere gewesen, dass der Regler bei drei
 # Arbeitern stehenbleibt. Gemessen ueber die PID: 240 MiB.
+# **Ueber den ganzen Prozessbaum, nicht ueber die PID allein.** Das war bis zum 2026-08-07 falsch:
+# `$!` ist die Subshell, die `ein_lauf` ausfuehrt -- QEMU ist ihr KIND. Gemessen wurden also ein
+# paar MiB Bash, der Wert fiel unter die Untergrenze, und die griff still. Im Protokoll stand dann
+# „je Lauf rund 192 MiB" -- das ist exakt `128 * 3/2`, also die Untergrenze und kein Messwert.
+#
+# Eine Untergrenze, die einspringt, wenn die Messung nichts sieht, ist derselbe Fehler wie ein
+# Pruefer, der bei Schweigen Erfolg meldet: sie macht den Ausfall der Messung unsichtbar. Deshalb
+# steht darunter jetzt eine **Sprechprobe**.
+baum_rss_mib() {
+    local wurzel="$1" i=0 k
+    local -a pids=("$wurzel")
+    while [ "$i" -lt "${#pids[@]}" ]; do
+        for k in $(ps -o pid= --ppid "${pids[$i]}" 2>/dev/null); do pids+=("$k"); done
+        i=$((i + 1))
+    done
+    local liste; liste="$(IFS=,; echo "${pids[*]}")"
+    ps -o rss= -p "$liste" 2>/dev/null | awk '{s+=$1} END {print int(s/1024)}'
+}
+
 ein_lauf "$D0/mess.log" &
 MESS_PID=$!
 PRO_LAUF_MIB=0
 for _ in $(seq 1 60); do
     sleep 0.1
-    r="$(ps -o rss= -p "$MESS_PID" 2>/dev/null | tr -d ' ')"
-    [ -n "$r" ] && [ "$r" -gt 0 ] 2>/dev/null && {
-        m=$((r / 1024)); [ "$m" -gt "$PRO_LAUF_MIB" ] && PRO_LAUF_MIB=$m; }
+    m="$(baum_rss_mib "$MESS_PID")"
+    [ -n "$m" ] && [ "$m" -gt "$PRO_LAUF_MIB" ] 2>/dev/null && PRO_LAUF_MIB=$m
 done
 wait "$MESS_PID" 2>/dev/null
 rm -f "$D0/mess.log"
-# Der gemessene Wert ist ein Hoechststand ueber ein kurzes Fenster; ein Zuschlag deckt, was
-# danach noch dazukommt. Untergrenze, falls die Messung gar nichts sah.
-[ "$PRO_LAUF_MIB" -lt 128 ] && PRO_LAUF_MIB=128
+# **Sprechprobe der Speichermessung.** Ein 512-MiB-Gast unter QEMU/KVM kostet den Wirt zwangslaeufig
+# mehr als 64 MiB; sieht die Messung weniger, hat sie den falschen Prozess beobachtet -- und dann
+# ist der Regler blind, nicht vorsichtig. Abbruch statt Untergrenze.
+if [ "$PRO_LAUF_MIB" -lt 64 ]; then
+    echo "FEHLER: die Speichermessung sah nur $PRO_LAUF_MIB MiB je Lauf." >&2
+    echo "        Fuer einen 512-MiB-Gast ist das unmoeglich -- vermutlich wurde der falsche" >&2
+    echo "        Prozess beobachtet. Ein Regler auf einer kaputten Messung ist gefaehrlicher" >&2
+    echo "        als gar keiner; es gibt hier bewusst KEINE Untergrenze, die das verdeckt." >&2
+    exit 2
+fi
 PRO_LAUF_MIB=$(( PRO_LAUF_MIB * 3 / 2 ))
-echo "  je Lauf rund $PRO_LAUF_MIB MiB (Hoechststand + 50 % Zuschlag)"
+echo "  je Lauf rund $PRO_LAUF_MIB MiB (Hoechststand ueber den Prozessbaum + 50 % Zuschlag)"
 
 VERFUEGBAR_MIB="$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)"
 BUDGET_MIB=$(( RAM_ZIEL_MIB < RAM_DECKE_MIB ? RAM_ZIEL_MIB : RAM_DECKE_MIB ))

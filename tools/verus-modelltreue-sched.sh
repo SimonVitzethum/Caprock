@@ -216,6 +216,16 @@ TCB_AUSSERHALB = {
                    '-- Teil der Budget-Donation, ADR 0019: ausserhalb',
     'cyc':         'Zyklenabrechnung (B-5.1) -- Messung, nicht Einplanung',
     'stamp':       'dito',
+    # D0, 2026-08-07. **Nicht** auf `in_ready` abgebildet, und das ist der Punkt: die beiden sind
+    # verschieden. `in_ready` faellt zurueck auf falsch, sobald der Thread blockiert oder laeuft;
+    # `admitted` bleibt wahr. Es heisst „ist ueberhaupt schon einmal zugelassen worden" und wird
+    # von KEINER Einplanungsentscheidung gelesen -- nur von `bind_pd`, um die D0-Reihenfolge
+    # zaehlbar zu machen. Ein Feld auf ein Modellfeld abzubilden, das etwas anderes bedeutet, waere
+    # schlimmer als es ausserhalb zu fuehren: der Beweis zeigte dann eine Aussage ueber `in_ready`
+    # und man LAESE sie als Aussage ueber `admitted`.
+    'admitted':    'D0: „schon zugelassen?" -- reine Beobachtung fuer den `pdbind`-Waechter, von '
+                   'keiner Einplanungsentscheidung gelesen. NICHT `in_ready` (das faellt zurueck, '
+                   'dieses nicht)',
 }
 
 # [2] Funktionen in `lib.rs`, die Modellzustand schreiben.
@@ -230,8 +240,22 @@ CODE_PRIMITIV = {
 }
 CODE_AUSSERHALB = {
     'init_core':            'Idle-Thread beim Hochlauf -- kein Uebergang im Modell',
-    'spawn':                'Thread-Erzeugung -- kein Uebergang im Modell',
-    'spawn_user_at':        'dito',
+    # D0, 2026-08-07: `spawn`/`spawn_user_at` schreiben selbst nichts mehr -- sie sind duenne
+    # Huellen um `*_parked` + `admit`. Der Waechter hat genau das gemeldet („ist als
+    # zustandsschreibend benannt, schreibt aber nichts (mehr)"), und die Eintraege sind deshalb
+    # umgezogen statt stehengelassen. Ein Register, das eine Funktion fuehrt, die es so nicht mehr
+    # gibt, ist derselbe Fehler wie eine Beschriftung, die neben der Sache herlaeuft.
+    # Und weiter: auch `spawn_parked`/`spawn_user_at_parked` stehen hier NICHT. Sie schreiben
+    # nichts Modellrelevantes mehr -- der eine modellsichtbare Schreibzugriff der Erzeugung war
+    # `enqueue_ready`, und der ist nach `admit` gewandert. Was sie sonst noch anfassen
+    # (`stack_base`, `stack_len`) steht in TCB_AUSSERHALB. Ein Eintrag „vorsichtshalber" waere
+    # genau der Eintrag, den der Waechter oben zu Recht als veraltet gemeldet hat.
+    # `admit` ist die zweite Haelfte der Erzeugung: der neue Thread tritt in die Ready-Menge ein.
+    # Das Modell kennt keine Erzeugung, also auch diesen Eintritt nicht -- dieselbe Begruendung wie
+    # fuer `spawn` selbst, und aus demselben Grund KEIN Uebergang, den man nachtragen koennte:
+    # `in_ready := true` gibt es im Modell nur fuer Threads, die es schon gibt.
+    'admit':                'D0: Zulassung eines neu erzeugten Threads -- die zweite Haelfte von '
+                            '`spawn_parked`, und Erzeugung ist im Modell nicht abgebildet',
     'alloc_tcb':            'Slot-Belegung + gid-Vergabe -- kein Uebergang im Modell',
     'exit_current':         'Selbstbeendigung -- Zombie/Reap-Lebenszyklus (README 10)',
     'kill':                 'Fremdbeendigung -- dito',

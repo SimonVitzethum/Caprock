@@ -25,7 +25,7 @@ Zweig `arch/x86_64` (2026-08-03).
 
 | | |
 |---|---|
-| x86_64 | **2300 von 2300** mit identischer Signatur, `== ALL PASS ==` (2026-08-03: 200 im Leerlauf + 600 + 1500 unter Last in je 5 parallelen Stroemen, 20 vCPU auf 20 Kernen; alle Stroeme auch **untereinander** deckungsgleich, `e419003d625f`, ueber beide Aufrufe hinweg) |
+| x86_64 | **49 991 von 50 000** mit identischer Signatur (2026-08-07, `tools/d0-messen.sh`, 16 parallele Stroeme gegen EINE Referenz). Die 9 Abweichungen sind D0 — alle neun zeichengleich, Vollprotokolle in `docs/befunde/d0/`. Rate 0,0180 %, 95-%-Intervall [0,0082 %, 0,0342 %] |
 | x86_64 RAM-Reihe | `== ALL PASS ==` bei **512M · 2560M · 3G · 6G**, Haupt- **und** Lade-Suite (2026-08-04). Vor E-Rest 3 starb ab 3G der Boot mit `#PF cr2=0x70_0000_0014` — der Zweig „RAM oberhalb 4 GiB" war nie gelaufen |
 | x86_64 Lade-Suite | `== ALL PASS ==` (2026-08-03: 39 Pruefungen — 5 Module, **zwei** Treiber-PDs, Austausch, A-5.3/A-5.4, dazu **drei** verkettete Boots fuer Z4 Stufe 2, inkl. sieben Negativfaellen) |
 | aarch64 | `RUNS=6` → **6 von 6** mit identischer Signatur, `== ALL PASS ==` (2026-08-02, **mit Root-Task**; davor 16/16 ohne, s. D6/D5) |
@@ -33,20 +33,24 @@ Zweig `arch/x86_64` (2026-08-03).
 | Verus | **16 Beweisdateien, 0 errors** — dazu **drei** Modell-Treue-Waechter (cap_space, IPC, Scheduler) mit 28 · 28 · 30 Selbsttestfaellen (2026-08-03) |
 | Scheduler-Messung | `tools/sched-erschoepfung-messen.sh`: 208 Messwerte, Positivkontrolle bestanden, vier Fassungen (echt/V0/H-a/H-b) — belegt D8, D9 und D10 |
 
-**Was diese 2300 Läufe heißen — und was nicht.** Die noch offene Hälfte von D0 (Hänger ab `sched`)
-hatte eine Grundlinie von rund **0,5 %** (2/400 unter Last, 1/200 im Leerlauf). Die ist jetzt
-ausgeschlossen: `0,995²³⁰⁰ ≈ 1·10⁻⁵`. Eine Rate von **0,1 % ist es nicht** (`0,999²³⁰⁰ ≈ 10 %`);
-die obere 95-%-Schranke liegt bei `3/2300 ≈ 0,13 %`.
+**D0 ist am 2026-08-07 gefangen worden — mit 50 000 Läufen.** 9 Abweichungen, alle neun
+zeichengleich (gleiche MD5 über den Signaturdiff, verteilt über fünf Ströme). Rate **0,0180 %**,
+95-%-Intervall **[0,0082 %, 0,0342 %]**, einer je **5556** Läufen.
 
-**D0 bleibt trotzdem offen, und das ist der Punkt.** Niemand hat diesen Hänger behoben — die letzte
-D0-Arbeit beseitigte das *Farbrennen*, nicht ihn. Er ist unter die Messschwelle gefallen, nicht
-repariert. Ein Fehler ohne bekannte Ursache, der aufhört sich zu zeigen, ist damit auch nicht mehr
-**debuggbar**; das macht die Lage schlechter, nicht besser. Was ihn wirklich schlösse, steht in
-`todo.md` D0.
+**Damit ist auch die Lesart von gestern erledigt.** Die 2300 sauberen Läufe waren keine Behebung,
+sondern eine zu kleine Stichprobe: bei 0,018 % ist `0,99982²³⁰⁰ ≈ 66 %` — ein Nullbefund war der
+**wahrscheinlichste** Ausgang. Die alte Grundlinie von 0,5 % (2/400) hat nie gestimmt. Wer aus
+„2300 grün" auf „behoben" geschlossen hätte, hätte 66 % Zufall für einen Beweis gehalten.
 
-Zwei Vorbehalte, die zur Zahl gehören: die alte Serie lief parallel zur **Lade-Suite**, die neue
-gegen fünf Kopien ihrer selbst — beides ist Last, aber nicht dieselbe. Und `pprobe` meldet unter
-KVM grundsätzlich `SKIP` (`CPUID.1:ECX[31]`), urteilt in dieser Reihe also nicht mit.
+**Das Fehlerbild ist nicht der vermutete Hänger.** Der Knoten läuft die vollen 61 s durch
+(`ticks=6104` gegen 52 in der Referenz, Worker-Runden 4182 gegen 27) und besteht jede andere
+Prüfung. Blockiert ist **ein** Thread: der IPC-Client wartet auf eine Antwort, die nie kommt, weil
+der Server seine `RECV`/`REPLY`-Schleife verlassen hat (`IPC-Rolle-abgewiesen=false`). Der Grund
+des Ausstiegs fiel bis 2026-08-07 auf den Boden — ein `if m.result != OK { break }` ohne Ablage.
+Seither hält `IPC_SERVER_EXIT` ihn fest und der Bericht druckt ihn. Details in `todo.md` D0.
+
+Ein Vorbehalt, der zur Zahl gehört: `pprobe` meldet unter KVM grundsätzlich `SKIP`
+(`CPUID.1:ECX[31]`) und urteilt in dieser Reihe nicht mit.
 
 Neu an der Messung ist der **Quervergleich**: bis dahin verglich jeder Lauf nur gegen den *ersten
 Lauf seines eigenen Stroms*. Fünf Ströme mit je einer in sich stimmigen, untereinander aber
@@ -138,6 +142,39 @@ falsch.
   **aarch64 mit Vorbehalt:** 11 gruene Laeufe (`RUNS=6` identische Signatur + 5 Einzellaeufe),
   **ein** Fehlschlag unter dreifacher paralleler QEMU-Last. Passt zum offenen Haenger aus D6 und
   trat auch vor diesen Aenderungen auf -- auseinandergehalten habe ich es nicht.
+
+## Was am 2026-08-07 dazukam
+
+* **D0 ist gefangen UND behoben — nach zehn Tagen und vier Messreihen.** Die Ursache war keine
+  der drei Hypothesen, die im Eintrag standen: **ein Thread war lauffaehig, bevor er seine PD
+  hatte.** `spawn()` reihte ein, `bind_pd()` kam danach; faellt der IPC-Server in dieses Fenster,
+  macht er sein erstes `RECV` mit LEEREM Cspace, bekommt `ERR_NOPD` und verlaesst seine Schleife
+  fuer immer. Gemessen: 9 Treffer in 50 000 Laeufen (0,0180 %, einer je 5556), alle neun
+  zeichengleich; danach 5 in 6895 mit dem Melder, **4 von 4 `ERR_NOPD`**.
+  Behoben strukturell: der Scheduler trennt `spawn_parked` von `admit`, 58 Aufrufstellen
+  umgestellt, `load_into_pd` mit dazu. Details in `done.md`.
+* **Warum niemand es frueher sah — und die Zahl, die dazugehoert.** Die 2300 sauberen Laeufe
+  vom 2026-08-03 galten als „die alte Quote ist ausgeschlossen". Bei der wahren Rate ist
+  `0,99982²³⁰⁰ ≈ 66 %` — ein Nullbefund war der **wahrscheinlichste** Ausgang. Die belastbare
+  Groesse ist nicht die Stichprobe, sondern die **erwartete Trefferzahl**: 0,41 damals, 9,0 jetzt.
+* **Der Riss steckte auch im Produktionspfad.** `load_into_pd` band die PD und installierte das
+  Endowment NACH dem Lauffaehigmachen; gedeckt war das nur durch ein `local_irq_save` — also durch
+  zwei Bedingungen, die nirgends festgeschrieben sind (kernlokale Ready-Queue, Lastausgleich aus).
+  Und das Wissen war da: an **einer** von 53 Stellen stand seit jeher ein `local_irq_disable()`
+  mit genau dieser Begruendung. Eine Gefahr, die an einer Stelle per Hand abgewehrt wird und an
+  52 nicht, ist ein fehlender Mechanismus, keine Sorgfaltsfrage.
+* **Der Waechter dazu zaehlt die GELEGENHEIT, nicht den Treffer** (`pdbind`). Bei 0,018 % waere
+  ein Melder, der nur beim Unglueck spricht, in 5555 von 5556 Laeufen stumm. Die REIHENFOLGE
+  dagegen ist in jedem Lauf pruefbar. Mit Sprechprobe, getrenntem `unklar` und **benannten**
+  Ausnahmen (`SpaetbindungsGrund`) statt eines `if tid == ..`.
+* **Der Modell-Treue-Waechter hat die Aenderung von selbst beanstandet** — und dabei einen
+  veralteten Registereintrag gefunden, den sonst niemand bemerkt haette (`spawn` stand als
+  zustandsschreibend, schreibt aber nichts mehr).
+* **Die Speichermessung des D0-Reglers mass die falsche PID** (die Subshell statt QEMUs
+  Prozessbaum). Der Wert fiel unter die Untergrenze, und die griff **still**: im Protokoll stand
+  „je Lauf rund 192 MiB" — exakt `128 * 3/2`, also die Untergrenze und kein Messwert. Jetzt ueber
+  den ganzen Baum (361 MiB), und statt der Untergrenze steht dort eine **Sprechprobe mit Abbruch**:
+  eine Untergrenze, die einspringt, wenn die Messung nichts sieht, macht deren Ausfall unsichtbar.
 
 ## Was am 2026-08-03 dazukam
 
@@ -626,6 +663,36 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   Zonenwunsch aus. Bei `-m 3G` (1024 gegen 2032 MiB) kehrt sich die Relation um, und der ganze
   Ladepfad faellt aus. Wo eine Eigenschaft aus einer Groessenrelation folgt statt aus der
   Struktur, verschwindet sie beim naechsten Messwert.
+* **Ein Thread, der lauffaehig ist, bevor er seine Autoritaet hat.** `spawn()` reihte ein,
+  `bind_pd()` kam danach -- dazwischen eine Speicherbelegung, ein `CAPS.write()`, ein Tick. Wer in
+  dieses Fenster faellt, macht seinen ersten Syscall mit LEEREM Cspace: nicht *eine* Cap ist
+  unsichtbar, sondern jede. Das war **D0**, zehn Tage lang unter dem Namen „Haenger ab `sched`",
+  und die Rate war 0,018 %. Es gibt keine Reihenfolge, die traegt -- `bind_pd` braucht die `tid`,
+  die `spawn` erst liefert. Die Luecke laesst sich verkleinern, nicht schliessen. Seit 2026-08-07
+  trennt der Scheduler deshalb `spawn_parked` von `admit`.
+* **Eine Messung, deren wahrscheinlichstes Ergebnis „nichts" ist, belegt nichts.** Die 2300
+  sauberen Laeufe vom 2026-08-03 lasen sich wie ein Freispruch; bei der wahren Rate war
+  `0,99982²³⁰⁰ ≈ 66 %`. Die Zahl, die zu einer Nullmessung gehoert, ist nicht die
+  Stichprobengroesse, sondern die **erwartete Trefferzahl** (0,41 damals, 9,0 bei 50 000).
+* **Eine Sprechprobe gehoert an den GEPRUEFTEN PFAD, nicht an eine Ausnahme darin.** Der erste
+  Entwurf des `pdbind`-Waechters fragte „hat die erklaerte Ausnahme gefeuert?" -- auf aarch64 gibt
+  es die gar nicht (sie sitzt im x86-Checkpoint-Aufbau), die Zeile waere dort durchgefallen,
+  obwohl alles stimmt. Und auf x86 haette sie angefangen durchzufallen, sobald jemand die Ausnahme
+  BESEITIGT, also als Antwort auf eine Verbesserung. Gefragt ist „wurde ueberhaupt eine PD
+  gebunden?".
+* **Ein Waechter, der die GELEGENHEIT zaehlt, schlaegt einen, der den Treffer zaehlt** -- wenn die
+  Trefferquote klein ist. Bei 0,018 % ist ein Melder, der nur beim Unglueck spricht, in 5555 von
+  5556 Laeufen stumm. Die REIHENFOLGE dagegen ist in jedem Lauf pruefbar.
+* **Eine Untergrenze, die einspringt, wenn die Messung nichts sieht, macht deren Ausfall
+  unsichtbar.** Der D0-Regler mass den RSS der Subshell statt QEMUs Prozessbaum; der Wert fiel
+  unter die 128-MiB-Untergrenze, und im Protokoll stand „je Lauf rund 192 MiB" -- exakt
+  `128 * 3/2`. Das sah wie ein Messwert aus und war die Untergrenze. Jetzt: Baum-Summe, und statt
+  der Untergrenze eine Sprechprobe mit **Abbruch**.
+* **Die naheliegende Fassung einer Behebung kann den Fehler mitnehmen.** Bei der D0-Umstellung
+  bekam die `page_probe`-Sonde mit `admit_in_pd` ihre drei Mappings NACH der Zulassung -- sie waere
+  losgelaufen, bevor die Seiten standen, und haette auf P statt auf P+8KiB gefaultet. Gruene Zeile,
+  anderer Test. (Dieselbe Form wie D8: dort machte der offensichtliche Waechter den Thread
+  vollstaendig verhungern.)
 * **`wrapping_sub` auf einer Zeitdifferenz ist die teuerste bequeme Zeile.** Ein Zähler, der um
   100 Zyklen zurückspringt, ergäbe rund `2^64` — ein Konto, das so belastet wird, ist sofort und
   dauerhaft erschöpft. Rückwärts heisst **verworfen**, nicht „fast einmal herum".

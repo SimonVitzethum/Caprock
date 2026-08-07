@@ -9,6 +9,132 @@ schon einmal nicht getragen hat.
 
 ---
 
+## D0 — der Thread lief, bevor er seine PD hatte (gefangen und behoben 2026-08-07)
+
+**Wie lange das offen war.** Seit dem 2026-07-29. Vier Messreihen, drei Erklärungsversuche, eine
+Umbenennung des Fehlerbilds — und am Ende war es keine der drei Hypothesen aus dem Eintrag
+(SMP-Hochlauf, Konsolensperre, Idle-Schleife).
+
+### 1. Warum er sich so lange nicht fangen ließ
+
+Die Rate ist **0,0180 %** — einer je 5556 Läufen. Jede bisherige Messreihe war zu klein:
+
+| Reihe | Läufe | Erwartete Treffer | Ergebnis |
+|---|---|---|---|
+| 2026-08-01 | 200 | 0,04 | 1 (Zufall — das war ein *anderes* Bild) |
+| 2026-08-03 | 2300 | 0,41 | 0 → „ausgeschlossen" |
+| 2026-08-07 | **50 000** | **9,0** | **9** |
+
+Die 2300 sauberen Läufe vom 2026-08-03 wurden damals als „die alte Quote von 0,5 % ist
+ausgeschlossen" gelesen. Das stimmte — und war trotzdem irreführend: bei der **wahren** Rate war
+`0,99982²³⁰⁰ ≈ 66 %`, ein Nullbefund also der *wahrscheinlichste* Ausgang. **Eine Messung, deren
+wahrscheinlichstes Ergebnis „nichts" ist, belegt nichts.** Die Zahl, die dazugehört, ist nicht die
+Stichprobengröße, sondern die erwartete Trefferzahl.
+
+### 2. Der Fehler
+
+    let (srv, cli) = (spawn(ipc_server, ..), spawn(ipc_client, ..));   // ab hier LAUFFAEHIG
+    bind_pd(srv_pd, srv); bind_pd(cli_pd, cli);                        // Autoritaet erst hier
+
+Zwischen den beiden Zeilen liegt der gesamte Aufbau des Clients: eine Stackbelegung unter der
+MEM-Sperre, ein `sched.spawn`, ein `CAPS.write()`. Fällt der Server in dieses Fenster, macht er
+sein erstes `RECV` mit **leerem Cspace** — dann ist nicht *eine* Cap unsichtbar, sondern jede. Er
+bekommt `ERR_NOPD`, verlässt seine Schleife und dreht für immer in `spin_loop()`. Der Client
+wartet 61 s auf eine Antwort von einem Empfänger, den es nicht mehr gibt.
+
+**Es sah deshalb nie nach einem Deadlock aus.** Der Knoten lief die vollen 61 s durch
+(`ticks=6104` gegen 52 in der Referenz, Worker-Runden 4182 gegen 27) und bestand jede andere
+Prüfung. Nur zwei Zeilen wichen ab — und die zweite (`freeze : IPC-Rolle-abgewiesen=false`) war
+die, die es verriet: sie prüft `freeze_thread(IPC_SERVER_TID)` und erwartet `Busy`, weil ein
+Thread in `RECV` eine offene IPC-Beziehung hat. `false` heißt: **der Server ist in keiner
+IPC-Rolle mehr.**
+
+**Der Riss steckt auch im Produktionspfad.** `load_into_pd` macht den Thread lauffähig, bindet
+danach die PD und installiert **danach** das Endowment. Dort deckt ein `local_irq_save` die
+Lücke — aber nur unter zwei Bedingungen, die nirgends festgeschrieben sind: die Ready-Queue ist
+streng kernlokal, und der Lastausgleich ist aus (Vorgabe). Wer den Schalter umlegt, öffnet ein
+Fenster, in dem eine geladene Treiber-PD **ohne jede Cap** anläuft. Dieses Projekt hat den
+Formfehler schon einmal bezahlt: *„Eine lokale IRQ-Sperre ist kein Fenster über eine geteilte
+Größe."* Hier hält sie zufällig — das ist kein Grund, sie halten zu lassen.
+
+**Und das Wissen war da.** An genau **einer** von 53 Stellen steht seit jeher
+`hal::cpu::local_irq_disable()` mit dem Kommentar *„atomar gegen Preempt, damit es nicht vor dem
+Bind läuft"*. Eine Gefahr, die an einer Stelle per Hand abgewehrt wird und an 52 nicht, ist keine
+Sorgfaltsfrage — sie ist ein **fehlender Mechanismus**.
+
+### 3. Die Behebung
+
+Es gibt keine Reihenfolge, die trägt: `bind_pd` braucht die `tid`, die `spawn` erst liefert. Die
+Lücke lässt sich verkleinern, nicht schließen. Also wird **erzeugen** von **zulassen** getrennt:
+
+| | |
+|---|---|
+| `Scheduler::spawn_parked` / `spawn_user_at_parked` | legt an, reiht **nicht** ein |
+| `Scheduler::admit` | reiht ein — ab hier darf er laufen |
+| `system::spawn_*_parked` (7 Erzeuger) | dieselbe Trennung eine Ebene höher |
+| `system::admit_in_pd(pd, tid)` | binden, dann zulassen |
+| `system::spawn_in_pd(pd, ..)` | alles drei in einem Aufruf |
+
+Kein `park: bool`. Ein Schalter wäre wieder ein **wählbarer Grund**, und die bequeme Belegung wäre
+die falsche — derselbe Befund wie bei `IdentityReason`. Zwei Namen sind nicht zu verwechseln.
+
+Umgestellt: **58 Aufrufstellen** (46 mechanisch, 12 von Hand), dazu `load_into_pd` und der
+IPC-Aufbau. Eine der zwölf war ein eigener Fehler derselben Art: die `page_probe`-Sonde bekam ihre
+drei Mappings **nach** dem Binden. Ein `admit_in_pd` an dieser Stelle hätte sie loslaufen lassen,
+bevor die Seiten standen — sie hätte auf P statt auf P+8KiB gefaultet, und der Test hätte etwas
+anderes gemessen, als er sagt. **Die naheliegende Fassung einer Behebung kann den Fehler
+mitnehmen.**
+
+**Und die PD ist nicht die ganze Autorität.** Ein systematisches Gegenlesen — nicht nach `bind_pd`,
+sondern nach *allem*, was nach der Zulassung noch Autorität vergibt — fand drei weitere Stellen
+(`killer`, `producer`, `consumer`): dort stand `install_pd_cap` **hinter** dem `admit_in_pd`. Für
+den Thread sind ein leerer Cspace und ein Cspace ohne die eine gebrauchte Cap **dasselbe** — er
+bekommt `ERR_BADCAP` statt `ERR_NOPD`, und beim Killer-Test hätte das eine Verweigerung gemeldet,
+die keine ist. Sie lauten jetzt `bind_pd` → `install_pd_cap` → `admit`.
+
+Das Gegenlesen selbst ist der Punkt: gesucht wurde nach `map_into_thread`, `install_pd_cap` und
+`set_vspace_of` **nach** einer Zulassung auf demselben Ziel — nicht nach dem Muster, das den
+Befund ausgelöst hatte. Ein Audit, der nur die gefundene Form sucht, findet nur sie wieder.
+
+### 4. Der Wächter zählt die GELEGENHEIT, nicht den Treffer
+
+Bei 0,018 % wäre ein Melder, der nur beim Unglück spricht, in 5555 von 5556 Läufen stumm. Die
+**Reihenfolge** dagegen ist in jedem Lauf prüfbar: `bind_pd` fragt vorher `is_admitted(tid)` und
+zählt `LATE_PD_BIND`. Drei Dinge gehören dazu:
+
+* **Auf dem Kern des Threads**, nicht des Aufrufers — `is_admitted` löst gegen `self.core` auf und
+  wäre sonst ausgerechnet bei `spawn_on_core(1, ..)` blind, also dort, wo das Rennen am ehesten
+  trifft.
+* `unklar` **getrennt** gezählt: „nicht auflösbar" ist kein „rechtzeitig".
+* **Sprechprobe**: die Zeile fällt durch, wenn in diesem Lauf gar keine Bindung beobachtet wurde.
+  Ein Zähler, der auf Null steht, weil nichts passierte, ist kein Testergebnis.
+
+Erklärte Spätbindungen tragen einen **Namen** (`SpaetbindungsGrund`, heute genau einer: Z4 Stufe 2
+bindet dem Checkpoint-Subjekt seinen Umfang nachträglich an, und der Worker *benutzt* keine Cap).
+Kein `if tid == WORKER_TID0` — eine Ausnahme ohne Namen wächst unsichtbar.
+
+### 5. Was der Modell-Treue-Wächter dazu gesagt hat
+
+Er hat die Änderung **von selbst** beanstandet, und zwar dreifach richtig: `Tcb.admitted` sei
+keinem Modellfeld zugeordnet; `admit` schreibe Scheduler-Zustand, ohne benannt zu sein; und
+`spawn`/`spawn_user_at` seien *„als zustandsschreibend benannt, schreiben aber nichts (mehr)"* —
+ein **veralteter Registereintrag**, den ohne ihn niemand bemerkt hätte.
+
+`admitted` ist bewusst **nicht** auf `in_ready` abgebildet: die beiden bedeuten Verschiedenes.
+`in_ready` fällt zurück, sobald der Thread blockiert oder läuft; `admitted` bleibt wahr. Ein Feld
+auf ein Modellfeld abzubilden, das etwas anderes heißt, wäre schlimmer, als es außerhalb zu
+führen — der Beweis zeigte dann eine Aussage über `in_ready`, und man **läse** sie als Aussage
+über `admitted`.
+
+### 6. Der Melder, ohne den nichts davon messbar gewesen wäre
+
+Der Server-Rumpf lautete `if m.result != result::OK { break; }` — der **Grund** des Ausstiegs fiel
+auf den Boden. Eine Zeile (`IPC_SERVER_EXIT.store(m.result, ..)` plus eine Berichtszeile) machte
+aus einer Hypothese eine Messung: **4 von 4** Treffern `ERR_NOPD`, `bediente 0 Anfrage(n)`. Ohne
+sie hätte das Vollprotokoll nur gesagt, *dass* der Server weg ist, nicht *warum*.
+
+---
+
 ## D11 — der Ueberlauf einer Endpoint-Warteschlange ist benannt (2026-08-04)
 
 **Der Fehler.** `TidQueue::enqueue` war ein `if self.count < QCAP { .. }` **ohne `else`**. Bei

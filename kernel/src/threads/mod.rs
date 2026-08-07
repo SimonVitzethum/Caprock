@@ -683,12 +683,12 @@ fn run_sysload_start() -> usize {
         if !system::install_pd_cap(pd, 0, lcap) || !system::install_pd_cap(pd, 1, ncap) {
             return None; // Loader-/Notification-Cap muss in TrustedSAS installierbar sein
         }
-        let tid = system::spawn(
+        let tid = system::spawn_parked(
             sysload_caller as *const () as usize,
             hello_idx,
             system::IDLE_PRIO,
         )?;
-        system::bind_pd(pd, tid);
+        let _ = system::admit_in_pd(pd, tid);
         Some(ntfn)
     })();
     hal::cpu::local_irq_enable();
@@ -1701,10 +1701,10 @@ pub fn spawn_demo() {
     system::install_pd_cap(v2_pd, EP_CAP as usize, recv_cap_v2);
 
     let prio = system::IDLE_PRIO; // gewöhnliche Demo-Threads: Round-Robin mit Idle
-    let v1 = system::spawn(server_v1 as *const () as usize, 0, prio).expect("v1 thread");
-    system::bind_pd(v1_pd, v1);
-    let client = system::spawn(client as *const () as usize, 0, prio).expect("client thread");
-    system::bind_pd(client_pd, client);
+    let v1 = system::spawn_parked(server_v1 as *const () as usize, 0, prio).expect("v1 thread");
+    let _ = system::admit_in_pd(v1_pd, v1);
+    let client = system::spawn_parked(client as *const () as usize, 0, prio).expect("client thread");
+    let _ = system::admit_in_pd(client_pd, client);
 
     for id in 0..NWORKERS {
         system::spawn(worker as *const () as usize, id, prio);
@@ -1717,16 +1717,16 @@ pub fn spawn_demo() {
     let fp_wait = system::cap_mint(fp_nroot, Rights::READ, 0).expect("fp wait cap");
     let fp_coll_pd = system::create_pd().expect("fp collector pd");
     system::install_pd_cap(fp_coll_pd, 0, fp_wait);
-    let fp_coll = system::spawn(fp_collector as *const () as usize, 0, prio).expect("fp collector");
-    system::bind_pd(fp_coll_pd, fp_coll);
+    let fp_coll = system::spawn_parked(fp_collector as *const () as usize, 0, prio).expect("fp collector");
+    let _ = system::admit_in_pd(fp_coll_pd, fp_coll);
     let fp_entry = core::ptr::addr_of!(user_fp_entry) as usize;
     for id in 0..FP_WORKERS {
         let sig = system::cap_mint(fp_nroot, Rights::WRITE, 1 << id).expect("fp signal cap");
         let pd = system::create_pd().expect("fp pd");
         system::install_pd_cap(pd, 0, sig);
         let t =
-            system::spawn_user(fp_entry, FP_PATTERN[id] as usize, FP_PRIO).expect("fp user thread");
-        system::bind_pd(pd, t);
+            system::spawn_user_parked(fp_entry, FP_PATTERN[id] as usize, FP_PRIO).expect("fp user thread");
+        let _ = system::admit_in_pd(pd, t);
     }
     // Prioritätstest: höhere Priorität (4) zuerst, dann 3, dann 2.
     for id in 0..NPRIO_TEST {
@@ -1737,9 +1737,14 @@ pub fn spawn_demo() {
     let victim = system::spawn(victim as *const () as usize, 0, prio).expect("victim");
     let kill_cap = system::install_tcb_cap(victim, Rights::WRITE).expect("tcb cap");
     let killer_pd = system::create_pd().expect("killer pd");
-    let killer = system::spawn(killer as *const () as usize, 0, prio).expect("killer");
+    // **Cap VOR der Zulassung** (D0). Die PD zu binden reicht nicht -- ein leerer Cspace und ein
+    // Cspace ohne die eine gebrauchte Cap sehen fuer den Thread gleich aus. Der Killer greift
+    // sofort auf Slot 0 zu; laeuft er, bevor die Cap steht, bekommt er BADCAP und der Test misst
+    // eine Verweigerung, die keine ist.
+    let killer = system::spawn_parked(killer as *const () as usize, 0, prio).expect("killer");
     system::bind_pd(killer_pd, killer);
     system::install_pd_cap(killer_pd, 0, kill_cap); // Slot 0 = Tcb-Cap; Slot 5 leer
+    let _ = system::admit(killer);
 
     // Notifications: ein Objekt, zwei abgeleitete Caps (Signal mit Badge, Wait).
     let ntfn = system::create_notification().expect("ntfn");
@@ -1748,12 +1753,15 @@ pub fn spawn_demo() {
     let wait_cap = system::cap_mint(nroot, Rights::READ, 0).expect("wait cap");
     let producer_pd = system::create_pd().expect("producer pd");
     let consumer_pd = system::create_pd().expect("consumer pd");
-    let producer = system::spawn(producer as *const () as usize, 0, prio).expect("producer");
+    // Dito fuer Producer/Consumer: binden, Cap einsetzen, DANN zulassen.
+    let producer = system::spawn_parked(producer as *const () as usize, 0, prio).expect("producer");
     system::bind_pd(producer_pd, producer);
     system::install_pd_cap(producer_pd, 0, signal_cap);
-    let consumer = system::spawn(consumer as *const () as usize, 0, prio).expect("consumer");
+    let _ = system::admit(producer);
+    let consumer = system::spawn_parked(consumer as *const () as usize, 0, prio).expect("consumer");
     system::bind_pd(consumer_pd, consumer);
     system::install_pd_cap(consumer_pd, 0, wait_cap);
+    let _ = system::admit(consumer);
 
     // Capability-Transfer: Service-Endpoint + Broker, der dem Client eine
     // svc-Send-Cap per REPLY delegiert.
@@ -1763,8 +1771,8 @@ pub fn spawn_demo() {
     let svc_send = system::cap_mint(svc_root, Rights::WRITE, 0).expect("svc send");
     let svc_pd = system::create_pd().expect("svc pd");
     system::install_pd_cap(svc_pd, 0, svc_recv);
-    let svc = system::spawn(svc_server as *const () as usize, 0, prio).expect("svc thread");
-    system::bind_pd(svc_pd, svc);
+    let svc = system::spawn_parked(svc_server as *const () as usize, 0, prio).expect("svc thread");
+    let _ = system::admit_in_pd(svc_pd, svc);
 
     let brk_ep = system::create_endpoint().expect("brk ep");
     let brk_root = system::install_endpoint_cap(brk_ep as u32, Rights::RWX).expect("brk cap");
@@ -1774,13 +1782,13 @@ pub fn spawn_demo() {
     system::install_pd_cap(brk_pd, 0, brk_recv);
     system::install_pd_cap(brk_pd, 2, svc_send); // Slot 2 = die zu delegierende Cap
     *XFER_SRC_CAP.lock() = Some(svc_send); // Quelle der Grant-Ableitungen (Leak-Regression)
-    let brk = system::spawn(broker_server as *const () as usize, 0, prio).expect("brk thread");
-    system::bind_pd(brk_pd, brk);
+    let brk = system::spawn_parked(broker_server as *const () as usize, 0, prio).expect("brk thread");
+    let _ = system::admit_in_pd(brk_pd, brk);
 
     let xfer_pd = system::create_pd().expect("xfer pd");
     system::install_pd_cap(xfer_pd, 0, brk_send); // Slot 0 = Broker; Slot 1 wird per Grant gefüllt
-    let xfer = system::spawn(xfer_client as *const () as usize, 0, prio).expect("xfer thread");
-    system::bind_pd(xfer_pd, xfer);
+    let xfer = system::spawn_parked(xfer_client as *const () as usize, 0, prio).expect("xfer thread");
+    let _ = system::admit_in_pd(xfer_pd, xfer);
 
     // Stateful Hot-Reload: Zähler-Service, dessen Zustand in einer Memory-Region
     // liegt und den Tausch v1(+1) -> v2(+10) überlebt.
@@ -1797,10 +1805,10 @@ pub fn spawn_demo() {
     system::install_pd_cap(cs_v1_pd, EP_CAP as usize, cs_recv1);
     system::install_pd_cap(cs_v2_pd, EP_CAP as usize, cs_recv2);
     system::install_pd_cap(cs_client_pd, EP_CAP as usize, cs_send);
-    let cs_v1 = system::spawn(counter_v1 as *const () as usize, 0, prio).expect("cs v1");
-    system::bind_pd(cs_v1_pd, cs_v1);
-    let csc = system::spawn(cs_client as *const () as usize, 0, prio).expect("cs client");
-    system::bind_pd(cs_client_pd, csc);
+    let cs_v1 = system::spawn_parked(counter_v1 as *const () as usize, 0, prio).expect("cs v1");
+    let _ = system::admit_in_pd(cs_v1_pd, cs_v1);
+    let csc = system::spawn_parked(cs_client as *const () as usize, 0, prio).expect("cs client");
+    let _ = system::admit_in_pd(cs_client_pd, csc);
     *CS_RELOAD_INFO.lock() = Some(ReloadInfo {
         ep: cs_ep,
         v1: cs_v1,
@@ -1815,18 +1823,18 @@ pub fn spawn_demo() {
     let urecv = system::cap_mint(uroot, Rights::READ, 0).expect("user recv");
     let usrv_pd = system::create_pd().expect("user server pd");
     system::install_pd_cap(usrv_pd, 0, urecv);
-    let usrv = system::spawn(user_server as *const () as usize, 0, prio).expect("user server");
-    system::bind_pd(usrv_pd, usrv);
+    let usrv = system::spawn_parked(user_server as *const () as usize, 0, prio).expect("user server");
+    let _ = system::admit_in_pd(usrv_pd, usrv);
     let user_pd = system::create_pd().expect("user pd");
     system::install_pd_cap(user_pd, 0, usend);
-    let ut = system::spawn_user(user_entry as *const () as usize, 0, prio).expect("user thread");
-    system::bind_pd(user_pd, ut);
+    let ut = system::spawn_user_parked(user_entry as *const () as usize, 0, prio).expect("user thread");
+    let _ = system::admit_in_pd(user_pd, ut);
 
     // EL0-Isolation: ein bösartiger EL0-Thread liest EL1-only Kernel-Speicher. Der
     // Kernel muss ihn isolieren (Thread beenden) statt anzuhalten.
     let bad_pd = system::create_pd().expect("bad user pd");
-    let bad = system::spawn_user(bad_user as *const () as usize, 0, prio).expect("bad user thread");
-    system::bind_pd(bad_pd, bad);
+    let bad = system::spawn_user_parked(bad_user as *const () as usize, 0, prio).expect("bad user thread");
+    let _ = system::admit_in_pd(bad_pd, bad);
 
     // Per-Kern-paralleler Scheduler: je einen Worker auf JEDEN Sekundärkern (1..N)
     // einplanen (die Kerne booten gleich per PSCI und picken ihn auf). Sie laufen
@@ -1853,14 +1861,14 @@ pub fn spawn_demo() {
     let xrecv = system::cap_mint(xroot, Rights::READ, 0).expect("xipc recv");
     let xsrv_pd = system::create_pd().expect("xipc server pd");
     system::install_pd_cap(xsrv_pd, 0, xrecv);
-    let xsrv = system::spawn_on_core(XIPC_SERVER_CORE, xipc_server as *const () as usize, 0, prio)
+    let xsrv = system::spawn_on_core_parked(XIPC_SERVER_CORE, xipc_server as *const () as usize, 0, prio)
         .expect("xipc server");
-    system::bind_pd(xsrv_pd, xsrv);
+    let _ = system::admit_in_pd(xsrv_pd, xsrv);
     let xcli_pd = system::create_pd().expect("xipc client pd");
     system::install_pd_cap(xcli_pd, 0, xsend);
     let xcli =
-        system::spawn_on_core(0, xipc_client as *const () as usize, 0, prio).expect("xipc client");
-    system::bind_pd(xcli_pd, xcli);
+        system::spawn_on_core_parked(0, xipc_client as *const () as usize, 0, prio).expect("xipc client");
+    let _ = system::admit_in_pd(xcli_pd, xcli);
 
     // --- Weg C (Hybrid): isolierte PD vs. SAS-PD lesen dieselbe fremde Adresse X ---
     // X ist eine fremde RAM-Adresse (eigene kleine Region) mit einem Geheimwert. Die
@@ -1879,16 +1887,16 @@ pub fn spawn_demo() {
     let iso_wait = system::cap_mint(introot, Rights::READ, 0).expect("iso wait");
     let icoll_pd = system::create_pd().expect("iso collector pd");
     system::install_pd_cap(icoll_pd, 0, iso_wait);
-    let icoll = system::spawn(iso_collector as *const () as usize, 0, prio).expect("iso collector");
-    system::bind_pd(icoll_pd, icoll);
+    let icoll = system::spawn_parked(iso_collector as *const () as usize, 0, prio).expect("iso collector");
+    let _ = system::admit_in_pd(icoll_pd, icoll);
 
     // Vertrauenswürdige SAS-Probe: liest X (erlaubt) und meldet Badge TRUSTED.
     let t_sig = system::cap_mint(introot, Rights::WRITE, ISO_BADGE_TRUSTED).expect("trusted sig");
     let t_pd = system::create_pd().expect("trusted probe pd");
     system::install_pd_cap(t_pd, 0, t_sig);
-    let tp = system::spawn_user(trusted_probe as *const () as usize, xaddr as usize, prio)
+    let tp = system::spawn_user_parked(trusted_probe as *const () as usize, xaddr as usize, prio)
         .expect("trusted probe");
-    system::bind_pd(t_pd, tp);
+    let _ = system::admit_in_pd(t_pd, tp);
 
     // Isolierte Probe (eigene VSpace): Slot 0 = Badge RAN, Slot 1 = Badge READ.
     let i_sig0 = system::cap_mint(introot, Rights::WRITE, ISO_BADGE_RAN).expect("iso sig0");
@@ -1897,9 +1905,9 @@ pub fn spawn_demo() {
     system::install_pd_cap(i_pd, 0, i_sig0);
     system::install_pd_cap(i_pd, 1, i_sig1);
     if let Some((ip, _region)) =
-        system::spawn_isolated(iso_probe as *const () as usize, xaddr as usize, prio)
+        system::spawn_isolated_parked(iso_probe as *const () as usize, xaddr as usize, prio)
     {
-        system::bind_pd(i_pd, ip);
+        let _ = system::admit_in_pd(i_pd, ip);
     }
 
     // Allgemeiner VMM: eine isolierte PD mappt/entmappt einen **4-KiB**-Frame G per
@@ -1913,9 +1921,9 @@ pub fn spawn_demo() {
     system::install_pd_cap(vmm_pd, 0, gmem); // Slot 0 = Memory-Cap (MAP/UNMAP)
     system::install_pd_cap(vmm_pd, 1, vmm_sig); // Slot 1 = SIGNAL (Badge MAPPED)
     if let Some((vp, _)) =
-        system::spawn_isolated(vmm_probe as *const () as usize, gbase as usize, prio)
+        system::spawn_isolated_parked(vmm_probe as *const () as usize, gbase as usize, prio)
     {
-        system::bind_pd(vmm_pd, vp);
+        let _ = system::admit_in_pd(vmm_pd, vp);
     }
 
     // Shared-Memory-IPC: zwei isolierte PDs teilen den Frame F (in BEIDE VSpaces
@@ -1937,9 +1945,9 @@ pub fn spawn_demo() {
     system::install_pd_cap(w_pd, 0, w_f);
     system::install_pd_cap(w_pd, 1, w_sig);
     if let Some((wp, _)) =
-        system::spawn_isolated(shm_writer as *const () as usize, fbase as usize, prio)
+        system::spawn_isolated_parked(shm_writer as *const () as usize, fbase as usize, prio)
     {
-        system::bind_pd(w_pd, wp);
+        let _ = system::admit_in_pd(w_pd, wp);
     }
     // Reader-PD: Slot 0 = F-Cap (derselbe Frame!), Slot 1 = shm-WAIT, Slot 2 = SIGNAL.
     let r_f = system::cap_mint(froot, Rights::WRITE, 0).expect("r F");
@@ -1950,9 +1958,9 @@ pub fn spawn_demo() {
     system::install_pd_cap(r_pd, 1, r_wait);
     system::install_pd_cap(r_pd, 2, r_done);
     if let Some((rp, _)) =
-        system::spawn_isolated(shm_reader as *const () as usize, fbase as usize, prio)
+        system::spawn_isolated_parked(shm_reader as *const () as usize, fbase as usize, prio)
     {
-        system::bind_pd(r_pd, rp);
+        let _ = system::admit_in_pd(r_pd, rp);
     }
 
     // Natives Code-Laden: eine isolierte PD fuehrt PRIVAT geladenen Code (Kopie des
@@ -1962,9 +1970,9 @@ pub fn spawn_demo() {
     let nat_pd = system::create_pd().expect("native pd");
     system::install_pd_cap(nat_pd, 0, nat_sig);
     if let Some(nt) =
-        system::spawn_isolated_native(native_template as *const () as *const u8, 64, prio)
+        system::spawn_isolated_native_parked(native_template as *const () as *const u8, 64, prio)
     {
-        system::bind_pd(nat_pd, nt);
+        let _ = system::admit_in_pd(nat_pd, nt);
     }
 
     // 4-KiB-Seiten: eine isolierte PD bekommt eine 12-KiB-Region feingranular gemappt
@@ -1979,12 +1987,16 @@ pub fn spawn_demo() {
     let p_pd = system::create_pd().expect("page pd");
     system::install_pd_cap(p_pd, 0, p_sig);
     if let Some((pp, _)) =
-        system::spawn_isolated(page_probe as *const () as usize, preg as usize, prio)
+        system::spawn_isolated_parked(page_probe as *const () as usize, preg as usize, prio)
     {
+        // **Binden, mappen, DANN zulassen** (D0). Ein `admit_in_pd` an dieser Stelle waere die
+        // Behebung mit demselben Fehler drin: die Sonde liefe los, bevor ihre drei Seiten stehen,
+        // und faultete auf P statt auf P+8KiB -- der Test misst dann etwas anderes, als er sagt.
         system::bind_pd(p_pd, pp);
         system::map_into_thread(pp, preg, 4096, 1); // P: RW
         system::map_into_thread(pp, preg + 4096, 4096, 0); // P+4KiB: RO
                                                            // P+8KiB bleibt ungemappt (Guard).
+        let _ = system::admit(pp);
     }
 
     *RELOAD_INFO.lock() = Some(ReloadInfo {
@@ -2086,8 +2098,8 @@ fn reload_swap(info: ReloadInfo, v2_entry: usize, v2_arg: usize) {
     system::clear_pd_cap(info.v1_pd, EP_CAP as usize);
     // Atomar gegen Preemption, damit v2 nicht vor dem Bind läuft.
     hal::cpu::local_irq_disable();
-    if let Some(v2) = system::spawn(v2_entry, v2_arg, system::IDLE_PRIO) {
-        system::bind_pd(info.v2_pd, v2);
+    if let Some(v2) = system::spawn_parked(v2_entry, v2_arg, system::IDLE_PRIO) {
+        let _ = system::admit_in_pd(info.v2_pd, v2);
     }
     hal::cpu::local_irq_enable();
 }
@@ -3648,9 +3660,9 @@ pub fn demo_report_then_idle() -> ! {
                     // nicht vor dem Bind läuft). Es CALLt sofort -> blockiert in `senders`.
                     hal::cpu::local_irq_disable();
                     if let Some(v) =
-                        system::spawn_on_core(0, stale_victim as *const () as usize, 0, 3)
+                        system::spawn_on_core_parked(0, stale_victim as *const () as usize, 0, 3)
                     {
-                        system::bind_pd(STALE_VICTIM_PD.load(Ordering::Relaxed), v);
+                        let _ = system::admit_in_pd(STALE_VICTIM_PD.load(Ordering::Relaxed), v);
                         STALE_VICTIM_TID.store(v.to_raw(), Ordering::Relaxed);
                         STALE_STEP.store(1, Ordering::Release);
                     }
@@ -3671,9 +3683,9 @@ pub fn demo_report_then_idle() -> ! {
                     // überspringen (Fix) statt zu paniken, dann als Empfänger blockieren.
                     hal::cpu::local_irq_disable();
                     if let Some(s) =
-                        system::spawn_on_core(0, stale_server as *const () as usize, 0, 3)
+                        system::spawn_on_core_parked(0, stale_server as *const () as usize, 0, 3)
                     {
-                        system::bind_pd(STALE_SERVER_PD.load(Ordering::Relaxed), s);
+                        let _ = system::admit_in_pd(STALE_SERVER_PD.load(Ordering::Relaxed), s);
                         STALE_STEP.store(3, Ordering::Release);
                     }
                     hal::cpu::local_irq_enable();
@@ -3682,9 +3694,9 @@ pub fn demo_report_then_idle() -> ! {
                     // Lebenden Client erzeugen: sein CALL wird vom wartenden Server bedient.
                     hal::cpu::local_irq_disable();
                     if let Some(c) =
-                        system::spawn_on_core(0, stale_client as *const () as usize, 0, 3)
+                        system::spawn_on_core_parked(0, stale_client as *const () as usize, 0, 3)
                     {
-                        system::bind_pd(STALE_CLIENT_PD.load(Ordering::Relaxed), c);
+                        let _ = system::admit_in_pd(STALE_CLIENT_PD.load(Ordering::Relaxed), c);
                         STALE_STEP.store(4, Ordering::Release);
                     }
                     hal::cpu::local_irq_enable();
@@ -3712,9 +3724,9 @@ pub fn demo_report_then_idle() -> ! {
                     // Server erzeugen + binden. Er RECVt sofort -> blockiert (kein Caller).
                     hal::cpu::local_irq_disable();
                     if let Some(s) =
-                        system::spawn_on_core(0, rgone_server as *const () as usize, 0, 3)
+                        system::spawn_on_core_parked(0, rgone_server as *const () as usize, 0, 3)
                     {
-                        system::bind_pd(RGONE_SERVER_PD.load(Ordering::Relaxed), s);
+                        let _ = system::admit_in_pd(RGONE_SERVER_PD.load(Ordering::Relaxed), s);
                         RGONE_SERVER_TID.store(s.to_raw(), Ordering::Relaxed);
                         RGONE_STEP.store(1, Ordering::Release);
                     }
@@ -3726,9 +3738,9 @@ pub fn demo_report_then_idle() -> ! {
                     // die Antwort.
                     hal::cpu::local_irq_disable();
                     if let Some(c) =
-                        system::spawn_on_core(0, rgone_client as *const () as usize, 0, 3)
+                        system::spawn_on_core_parked(0, rgone_client as *const () as usize, 0, 3)
                     {
-                        system::bind_pd(RGONE_CLIENT_PD.load(Ordering::Relaxed), c);
+                        let _ = system::admit_in_pd(RGONE_CLIENT_PD.load(Ordering::Relaxed), c);
                         RGONE_STEP.store(2, Ordering::Release);
                     }
                     hal::cpu::local_irq_enable();
@@ -3749,9 +3761,9 @@ pub fn demo_report_then_idle() -> ! {
                     if RGONE_RESULT.load(Ordering::Acquire) != u64::MAX {
                         hal::cpu::local_irq_disable();
                         if let Some(s) =
-                            system::spawn_on_core(0, rgone_server as *const () as usize, 0, 3)
+                            system::spawn_on_core_parked(0, rgone_server as *const () as usize, 0, 3)
                         {
-                            system::bind_pd(RGONE_SERVER_PD.load(Ordering::Relaxed), s);
+                            let _ = system::admit_in_pd(RGONE_SERVER_PD.load(Ordering::Relaxed), s);
                             RGONE_SERVER_TID.store(s.to_raw(), Ordering::Relaxed);
                             RGONE_STEP.store(4, Ordering::Release);
                         }
@@ -3763,9 +3775,9 @@ pub fn demo_report_then_idle() -> ! {
                     // Owner + parkt, Client blockiert auf die Antwort.
                     hal::cpu::local_irq_disable();
                     if let Some(c) =
-                        system::spawn_on_core(0, rgone_client2 as *const () as usize, 0, 3)
+                        system::spawn_on_core_parked(0, rgone_client2 as *const () as usize, 0, 3)
                     {
-                        system::bind_pd(RGONE_CLIENT_PD.load(Ordering::Relaxed), c);
+                        let _ = system::admit_in_pd(RGONE_CLIENT_PD.load(Ordering::Relaxed), c);
                         RGONE_STEP.store(5, Ordering::Release);
                     }
                     hal::cpu::local_irq_enable();
@@ -3806,9 +3818,9 @@ pub fn demo_report_then_idle() -> ! {
                     // Server erzeugen + binden (RECVt, blockiert). prio 3.
                     hal::cpu::local_irq_disable();
                     if let Some(s) =
-                        system::spawn_on_core(0, ddon_server as *const () as usize, 0, 3)
+                        system::spawn_on_core_parked(0, ddon_server as *const () as usize, 0, 3)
                     {
-                        system::bind_pd(DDON_SERVER_PD.load(Ordering::Relaxed), s);
+                        let _ = system::admit_in_pd(DDON_SERVER_PD.load(Ordering::Relaxed), s);
                         DDON_STEP.store(1, Ordering::Release);
                     }
                     hal::cpu::local_irq_enable();
@@ -3819,9 +3831,9 @@ pub fn demo_report_then_idle() -> ! {
                     // Client läuft (kein wfi dazwischen).
                     hal::cpu::local_irq_disable();
                     if let Some(c) =
-                        system::spawn_on_core(0, ddon_client as *const () as usize, 0, 3)
+                        system::spawn_on_core_parked(0, ddon_client as *const () as usize, 0, 3)
                     {
-                        system::bind_pd(DDON_CLIENT_PD.load(Ordering::Relaxed), c);
+                        let _ = system::admit_in_pd(DDON_CLIENT_PD.load(Ordering::Relaxed), c);
                         DDON_CLIENT_TID.store(c.to_raw(), Ordering::Relaxed);
                         if let Ok(sc) = system::install_sched_context_cap(
                             DDON_CBUDGET,
@@ -3859,9 +3871,9 @@ pub fn demo_report_then_idle() -> ! {
                     // Server erzeugen (RECVt + parkt, antwortet nie).
                     hal::cpu::local_irq_disable();
                     if let Some(s) =
-                        system::spawn_on_core(0, rgone_server as *const () as usize, 0, 3)
+                        system::spawn_on_core_parked(0, rgone_server as *const () as usize, 0, 3)
                     {
-                        system::bind_pd(RCAP_SERVER_PD.load(Ordering::Relaxed), s);
+                        let _ = system::admit_in_pd(RCAP_SERVER_PD.load(Ordering::Relaxed), s);
                         RCAP_STEP.store(1, Ordering::Release);
                     }
                     hal::cpu::local_irq_enable();
@@ -3870,9 +3882,9 @@ pub fn demo_report_then_idle() -> ! {
                     // Client erzeugen -> CALL -> Rendezvous (Server parkt, Client blockiert).
                     hal::cpu::local_irq_disable();
                     if let Some(c) =
-                        system::spawn_on_core(0, rcap_client as *const () as usize, 0, 3)
+                        system::spawn_on_core_parked(0, rcap_client as *const () as usize, 0, 3)
                     {
-                        system::bind_pd(RCAP_CLIENT_PD.load(Ordering::Relaxed), c);
+                        let _ = system::admit_in_pd(RCAP_CLIENT_PD.load(Ordering::Relaxed), c);
                         RCAP_CLIENT_TID.store(c.to_raw(), Ordering::Relaxed);
                         RCAP_STEP.store(2, Ordering::Release);
                     }
@@ -3909,9 +3921,9 @@ pub fn demo_report_then_idle() -> ! {
                     // v1-Server erzeugen + binden (RECVt, blockiert als Empfänger).
                     hal::cpu::local_irq_disable();
                     if let Some(s) =
-                        system::spawn_on_core(0, rmig_server_v1 as *const () as usize, 0, 3)
+                        system::spawn_on_core_parked(0, rmig_server_v1 as *const () as usize, 0, 3)
                     {
-                        system::bind_pd(RMIG_SERVER_PD.load(Ordering::Relaxed), s);
+                        let _ = system::admit_in_pd(RMIG_SERVER_PD.load(Ordering::Relaxed), s);
                         RMIG_V1_TID.store(s.to_raw(), Ordering::Relaxed);
                         RMIG_STEP.store(1, Ordering::Release);
                     }
@@ -3922,9 +3934,9 @@ pub fn demo_report_then_idle() -> ! {
                     // setzt RMIG_RECEIVED, parkt ohne REPLY; Client blockiert auf Antwort).
                     hal::cpu::local_irq_disable();
                     if let Some(c) =
-                        system::spawn_on_core(0, rmig_client as *const () as usize, 0, 3)
+                        system::spawn_on_core_parked(0, rmig_client as *const () as usize, 0, 3)
                     {
-                        system::bind_pd(RMIG_CLIENT_PD.load(Ordering::Relaxed), c);
+                        let _ = system::admit_in_pd(RMIG_CLIENT_PD.load(Ordering::Relaxed), c);
                         RMIG_STEP.store(2, Ordering::Release);
                     }
                     hal::cpu::local_irq_enable();
@@ -3970,9 +3982,9 @@ pub fn demo_report_then_idle() -> ! {
                         RMIG_RESUMED.store(system::endpoint_end_quiesce(ep), Ordering::Release);
                         hal::cpu::local_irq_disable();
                         if let Some(v2) =
-                            system::spawn_on_core(0, rmig_server_v2 as *const () as usize, 0, 3)
+                            system::spawn_on_core_parked(0, rmig_server_v2 as *const () as usize, 0, 3)
                         {
-                            system::bind_pd(RMIG_V2_PD.load(Ordering::Relaxed), v2);
+                            let _ = system::admit_in_pd(RMIG_V2_PD.load(Ordering::Relaxed), v2);
                         }
                         hal::cpu::local_irq_enable();
                         RMIG_STEP.store(3, Ordering::Release);
@@ -4061,9 +4073,9 @@ pub fn demo_report_then_idle() -> ! {
                     // SENSITIVITAET P1 (geprueft): spawn_isolated -> spawn (global) =>
                     // HardwareLand laeuft global => domain_audit()==3 => domain FAILURES.
                     if let Some((h, _)) =
-                        system::spawn_isolated(churn_dummy as *const () as usize, 0, 3)
+                        system::spawn_isolated_parked(churn_dummy as *const () as usize, 0, 3)
                     {
-                        system::bind_pd(hpd, h);
+                        let _ = system::admit_in_pd(hpd, h);
                         DOMAIN_HW_TID.store(h.to_raw(), Ordering::Relaxed);
                     }
                     DOMAIN_HW_PD.store(hpd, Ordering::Relaxed);
@@ -4071,9 +4083,9 @@ pub fn demo_report_then_idle() -> ! {
             }
             if let Some(upd) = system::create_pd_in_domain(Domain::UserLand) {
                 if let Some((u, _)) =
-                    system::spawn_isolated(churn_dummy as *const () as usize, 0, 3)
+                    system::spawn_isolated_parked(churn_dummy as *const () as usize, 0, 3)
                 {
-                    system::bind_pd(upd, u);
+                    let _ = system::admit_in_pd(upd, u);
                     DOMAIN_USER_TID.store(u.to_raw(), Ordering::Relaxed);
                 }
                 DOMAIN_USER_PD.store(upd, Ordering::Relaxed);
@@ -4144,15 +4156,15 @@ pub fn demo_report_then_idle() -> ! {
                     let fbase = PDCTL_FRAME.load(Ordering::Acquire) as usize;
                     hal::cpu::local_irq_disable();
                     if let Some((t, _)) =
-                        system::spawn_isolated(pdctl_target as *const () as usize, fbase, 3)
+                        system::spawn_isolated_parked(pdctl_target as *const () as usize, fbase, 3)
                     {
-                        system::bind_pd(PDCTL_TARGET_PD.load(Ordering::Relaxed), t);
+                        let _ = system::admit_in_pd(PDCTL_TARGET_PD.load(Ordering::Relaxed), t);
                         PDCTL_TARGET_TID.store(t.to_raw(), Ordering::Relaxed);
                     }
                     if let Some(c) =
-                        system::spawn_on_core(0, pdctl_controller as *const () as usize, 0, 3)
+                        system::spawn_on_core_parked(0, pdctl_controller as *const () as usize, 0, 3)
                     {
-                        system::bind_pd(PDCTL_CTRL_PD.load(Ordering::Relaxed), c);
+                        let _ = system::admit_in_pd(PDCTL_CTRL_PD.load(Ordering::Relaxed), c);
                     }
                     hal::cpu::local_irq_enable();
                     PDCTL_STEP.store(2, Ordering::Release);
@@ -4218,18 +4230,18 @@ pub fn demo_report_then_idle() -> ! {
                 1 => {
                     // Backend (isoliert EL0) erzeugen + binden -> RECVt, blockiert.
                     if let Some((b, _)) =
-                        system::spawn_isolated(chan_backend as *const () as usize, 0, 3)
+                        system::spawn_isolated_parked(chan_backend as *const () as usize, 0, 3)
                     {
-                        system::bind_pd(CHAN_BE_PD.load(Ordering::Relaxed), b);
+                        let _ = system::admit_in_pd(CHAN_BE_PD.load(Ordering::Relaxed), b);
                     }
                     CHAN_STEP.store(2, Ordering::Release);
                 }
                 2 => {
                     // Trusted-Client (EL1) erzeugen + binden -> CALLt das Backend.
                     if let Some(c) =
-                        system::spawn_on_core(0, chan_client as *const () as usize, 0, 3)
+                        system::spawn_on_core_parked(0, chan_client as *const () as usize, 0, 3)
                     {
-                        system::bind_pd(CHAN_TS_PD.load(Ordering::Relaxed), c);
+                        let _ = system::admit_in_pd(CHAN_TS_PD.load(Ordering::Relaxed), c);
                     }
                     CHAN_STEP.store(3, Ordering::Release);
                 }
@@ -4290,12 +4302,12 @@ pub fn demo_report_then_idle() -> ! {
                 1 => {
                     // Backend (isoliert EL0) erzeugen + binden, dann die RTC-Registerseite
                     // EL0-RO in seine VSpace mappen (generischer Device-Mechanismus).
-                    if let Some((b, _)) = system::spawn_isolated(
+                    if let Some((b, _)) = system::spawn_isolated_parked(
                         rtc_backend as *const () as usize,
                         RTC_PHYS as usize,
                         3,
                     ) {
-                        system::bind_pd(RTC_BE_PD.load(Ordering::Relaxed), b);
+                        let _ = system::admit_in_pd(RTC_BE_PD.load(Ordering::Relaxed), b);
                         // RTC-Registerseite EL0-RO in die Backend-VSpace mappen (generisch).
                         // SENSITIVITAET P4 (geprueft): ohne dieses Mapping faultet das Backend
                         // beim RTC-Read (FAR=0x09010000) -> Isolation greift.
@@ -4311,9 +4323,9 @@ pub fn demo_report_then_idle() -> ! {
                 2 => {
                     // Trusted-Zeitdienst (EL1) erzeugen + binden -> CALLt das RTC-Backend.
                     if let Some(c) =
-                        system::spawn_on_core(0, rtc_timeservice as *const () as usize, 0, 3)
+                        system::spawn_on_core_parked(0, rtc_timeservice as *const () as usize, 0, 3)
                     {
-                        system::bind_pd(RTC_TS_PD.load(Ordering::Relaxed), c);
+                        let _ = system::admit_in_pd(RTC_TS_PD.load(Ordering::Relaxed), c);
                     }
                     RTC_STEP.store(3, Ordering::Release);
                 }
@@ -4387,12 +4399,12 @@ pub fn demo_report_then_idle() -> ! {
                 }
                 1 => {
                     // Backend (isoliert EL0) + RTC RW-Mapping; es armiert den IRQ und WAITet.
-                    if let Some((b, _)) = system::spawn_isolated(
+                    if let Some((b, _)) = system::spawn_isolated_parked(
                         rtc_irq_backend as *const () as usize,
                         RTC_PHYS as usize,
                         3,
                     ) {
-                        system::bind_pd(IRQT_BE_PD.load(Ordering::Relaxed), b);
+                        let _ = system::admit_in_pd(IRQT_BE_PD.load(Ordering::Relaxed), b);
                         system::map_region_into_thread(
                             b,
                             RTC_PHYS,
@@ -4405,9 +4417,9 @@ pub fn demo_report_then_idle() -> ! {
                 2 => {
                     // Trusted-Zeitdienst (EL1) -> CALLt das Backend (kehrt erst nach dem IRQ zurueck).
                     if let Some(c) =
-                        system::spawn_on_core(0, irq_timeservice as *const () as usize, 0, 3)
+                        system::spawn_on_core_parked(0, irq_timeservice as *const () as usize, 0, 3)
                     {
-                        system::bind_pd(IRQT_TS_PD.load(Ordering::Relaxed), c);
+                        let _ = system::admit_in_pd(IRQT_TS_PD.load(Ordering::Relaxed), c);
                     }
                     IRQT_STEP.store(3, Ordering::Release);
                 }
@@ -4475,9 +4487,9 @@ pub fn demo_report_then_idle() -> ! {
                     // Normal-NC in seine VSpace mappen (generischer DMA-Mechanismus).
                     let phys = DMA_PHYS.load(Ordering::Acquire);
                     if let Some((b, _)) =
-                        system::spawn_isolated(dma_backend as *const () as usize, phys as usize, 3)
+                        system::spawn_isolated_parked(dma_backend as *const () as usize, phys as usize, 3)
                     {
-                        system::bind_pd(DMA_BE_PD.load(Ordering::Relaxed), b);
+                        let _ = system::admit_in_pd(DMA_BE_PD.load(Ordering::Relaxed), b);
                         // SENSITIVITAET D0 (geprueft): ohne dieses Mapping faultet das Backend
                         // beim DMA-Zugriff (FAR in der DMA-Region) -> Isolation greift.
                         system::map_region_into_thread(
@@ -4492,9 +4504,9 @@ pub fn demo_report_then_idle() -> ! {
                 2 => {
                     // Trusted-Dienst (EL1) erzeugen + binden -> CALLt das DMA-Backend.
                     if let Some(c) =
-                        system::spawn_on_core(0, dma_timeservice as *const () as usize, 0, 3)
+                        system::spawn_on_core_parked(0, dma_timeservice as *const () as usize, 0, 3)
                     {
-                        system::bind_pd(DMA_TS_PD.load(Ordering::Relaxed), c);
+                        let _ = system::admit_in_pd(DMA_TS_PD.load(Ordering::Relaxed), c);
                     }
                     DMA_STEP.store(3, Ordering::Release);
                 }
@@ -5216,7 +5228,54 @@ fn all_done() -> bool {
         && fuzz::all_passed()
 }
 
+/// **Derselbe Waechter auf beiden Architekturen.** Der x86-Bericht sitzt in
+/// `arch/x86_64/bringup.rs`, der aarch64-Bericht hier -- zwei Wege, ein Kernel. Ein Waechter, den
+/// nur einer der beiden faehrt, ist kein Waechter, sondern eine Stichprobe: genau deshalb liegen
+/// auch die DMA-Tests architekturneutral in `dmatests.rs`.
+fn pdbind_bericht() {
+    use crate::system;
+    // **Die Gelegenheit zaehlen, nicht den Treffer** (D0). Der Fehler selbst trat in 0,018 % der
+    // Laeufe auf -- eine Zeile, die nur dann spricht, ist in 5555 von 5556 Laeufen stumm und taugt
+    // als Waechter nicht. Die REIHENFOLGE dagegen ist in jedem Lauf pruefbar: wird eine PD an einen
+    // Thread gebunden, der schon laufen darf, war das Rennen offen -- ob es diesmal getroffen hat
+    // oder nicht.
+    //
+    // `unklar` steht daneben, weil „nicht auflösbar" kein „rechtzeitig" ist: ein Thread, der beim
+    // Binden schon gestorben ist, faellt hier hinein. Eine Null in beiden Spalten ist die Aussage;
+    // eine Null in der ersten allein waere eine halbe.
+    {
+        let spaet = system::LATE_PD_BIND.load(Ordering::Relaxed);
+        let unklar = system::LATE_PD_BIND_UNKLAR.load(Ordering::Relaxed);
+        let gesamt = system::PD_BIND_GESAMT.load(Ordering::Relaxed);
+        let gesehen = system::SPAETBINDUNG_GESEHEN.load(Ordering::Relaxed);
+        println!(
+            "pdbind  : gebunden={gesamt} spaet-gebunden={spaet} unklar={unklar} \
+             erklaert-gefeuert={gesehen:#x} (D0: eine PD, die an einen bereits zugelassenen Thread \
+             geht, kommt zu spaet -- der Thread kann seinen ersten Syscall schon gemacht und \
+             ERR_NOPD bekommen haben. Erklaerte Gruende zaehlen NICHT als spaet, stehen aber hier)"
+        );
+        for g in system::ERLAUBTE_SPAETBINDUNGEN {
+            println!("pdbind  :   erklaert zulaessig: {g}");
+        }
+        // **Sprechprobe am gepruefte Pfad, nicht an einer Ausnahme darin.** `gebunden == 0` heisst:
+        // dieser Lauf ist an `bind_pd` gar nicht vorbeigekommen -- dann sagt eine Null bei `spaet`
+        // nichts. Nicht `erklaert-gefeuert` abfragen: das ist ein Sonderfall, den es auf aarch64
+        // nicht gibt und den eine kuenftige Verbesserung wegnehmen darf.
+        println!(
+            "pdbind  : {}",
+            if gesamt == 0 {
+                "FAILURES (NICHT SPRECHFAEHIG: in diesem Lauf wurde keine einzige PD gebunden)"
+            } else if spaet == 0 && unklar == 0 {
+                "ALL PASS"
+            } else {
+                "FAILURES"
+            }
+        );
+    }
+}
+
 fn report() {
+    pdbind_bericht();
     let mut sched_ok = true;
     for c in 0..system::num_cores() {
         let t = hal::timer::ticks(c);

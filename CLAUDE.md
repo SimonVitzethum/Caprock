@@ -531,6 +531,12 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   4 GiB gar keinen Speicher gibt — gezaehlt hatte er eine absichtlich uebergrosse Anforderung,
   die NIRGENDS passte. „Unten war kein Platz" und „es wurde oben genommen" sind zwei Aussagen;
   dieselbe Verwechslung wie `rx_used` gegen „Daten sind angekommen".
+* **Der Lader meldet seinen eigenen Speicher als frei.** Die klassische GRUB/Multiboot-Falle:
+  von 0 bis zum EBDA gilt als frei, dort liegen aber BIOS-Datenbereich, EBDA und die Ablagen des
+  Laders. Hier dreifach gedeckt (nur Typ-1-Bereiche, `base >= 1 MiB` verworfen, Freiliste ab
+  16 MiB, Module ausgeschnitten) -- **aber die Multiboot-Info-Struktur wird NICHT ausgeschnitten**.
+  Ihr Schutz hing allein an `USER_RAM_MIN`; senkt jemand die Konstante, faellt er lautlos weg.
+  Seit 2026-08-07 eine gemessene Zeile statt einer Annahme.
 * **Ein Ausstiegskriterium, das Wiederholbarkeit verlangt, schliesst seltene Fehler per
   Definition aus.** Der erste D12-Ausstieg tat das -- und die Klasse, um die es geht (verpasstes
   WFE-Wakeup, Timer/IPI-Rennen bei 1 in 32), reproduziert gerade nicht. Ein Kriterium gehoert an

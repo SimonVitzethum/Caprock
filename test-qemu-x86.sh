@@ -340,6 +340,16 @@ fi
 check "iface   : ALL PASS" "A-4.4: die Versionssperre des Laders weist eine GEAENDERTE Schnittstellenversion ab und laesst die gleiche durch -- beide Ausgaenge belegt; eine andere program_id bleibt unberuehrt"
 check "quiesce : ALL PASS" "A-4.2: der ruhende Punkt -- ein stillgelegter Endpoint weist NEUE Transaktionen ab (ERR_QUIESCING, nicht ERR_BADCAP: 'kommt gleich wieder' ist fuer den Client eine andere Lage als 'gibt es nicht'), laufende duerfen abschliessen; ein ZWEITER Austausch am selben Endpoint wird abgewiesen"
 check "rebind  : ALL PASS" "A-4.1: atomares Umbinden -- Pruefung und Tausch unter EINEM Lock; OHNE Stilllegung wird abgewiesen (der Befund waere sonst eine Momentaufnahme), ein fremder Empfaenger blockiert, und im ueberlappenden Fall hat der Endpoint zu KEINEM Zeitpunkt null Empfaenger"
+# Die Struktur des Bootloaders darf nicht in der Freiliste liegen (die klassische
+# GRUB/Multiboot-Falle: der Lader meldet seinen eigenen Speicher als frei). Heute haengt der
+# Schutz an `USER_RAM_MIN` -- diese Zeile macht ihn zu einer gepruefeten Aussage.
+if echo "$OUT" | grep -q "^mbi     : Bootloader-Struktur .* ausserhalb: 1"; then
+    echo "  PASS: die Multiboot-Info-Struktur liegt UNTERHALB der Freiliste -- sie wird nicht ausgeschnitten, sondern liegt (heute) unter USER_RAM_MIN. Faellt das weg, koennte der Allokator die Struktur vergeben, aus der der Speicherplan stammt"
+else
+    echo "  FAIL: die Bootloader-Struktur liegt IN der Freiliste (oder die Zeile fehlt) --"
+    echo "        $(echo "$OUT" | grep -m1 '^mbi     : Bootloader-Struktur' || echo '(keine mbi-Zeile)')"
+    fail=1
+fi
 check "epfull  : ALL PASS" "D11: der Ueberlauf einer Endpoint-Warteschlange wird BENANNT statt still verworfen. Der 33. Eintrag wird abgewiesen, verdraengt keinen der 32 und ist nach einer Freigabe wieder vergebbar -- die Positivkontrolle steckt in der Anlage (die ersten 32 muessen gelingen UND auffindbar sein, sonst waere die Zeile von 'bind_receiver geht nie' nicht zu unterscheiden). Die drei blockierenden Wege (call/recv/migrate_owner) misst tools/verus-modelltreue-ipc.sh gegen denselben Quelltext"
 check "state   : ALL PASS" "A-4.3: Zustandsuebergabe ueber eine Region mit VERSIONIERTEM Kopf -- ein abweichendes state_version-Layout und eine fremde program_id werden ABGEWIESEN, statt die Bytes der alten Fassung im eigenen Sinn zu lesen (das waere kein Datenverlust, sondern ein fehlinterpretierter Zustand); eine frische Region meldet NoState statt 'Version 0'; der Uebernahmezaehler zaehlt weiter und wird von Abweisungen nicht erhoeht"
 # Anmerkung: der ERNSTFALL (v2 uebernimmt den Zaehler von v1, Marker `ckpt`) laeuft NICHT auf x86 --

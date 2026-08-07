@@ -914,6 +914,43 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       **Offen bleibt:** blockiert `reap()` selbst, hilft auch das nicht — dafür bräuchte es
       eine Notbremse im Timer-Interrupt, außerhalb dieses Fadens. Steht so im Code.
 
+- [x] **D0-Hypothese GEPRÜFT und AUSGESCHLOSSEN (2026-08-07): „GRUB-Speicher früh im Bootprozess".**
+      Anlass war ein Hinweis von Simon: bei GRUB führe die Belegung bestimmter Speicheradressen
+      früh im Boot zu undefiniertem Verhalten; Abhilfe sei, die Belegung nach hinten zu schieben
+      oder einen eigenen Bootloader zu schreiben.
+
+      **Die Klasse dahinter ist real** und in der OSDev-Literatur beschrieben: ein Lader meldet
+      den Speicher von 0 bis zum EBDA als frei, obwohl dort BIOS-Datenbereich, EBDA und — je nach
+      Modulgröße unvorhersehbar — GRUBs eigene Ablagen liegen. Die Standardempfehlung lautet,
+      **alles unter 1 MiB als belegt zu behandeln**. Die genannte Quote „>0,1 %" ist dabei keine
+      dokumentierte Größe; der Effekt ist maschinen- und größenabhängig, nicht zufällig.
+
+      **Als Ursache für D0 scheidet sie aus — vier unabhängige Gründe, alle nachgesehen:**
+
+      | # | Grund | Beleg |
+      |---|---|---|
+      | 1 | Die Suite, in der D0 auftrat, bootet über QEMUs `-kernel`, **nicht über GRUB** | `test-qemu-x86.sh:141` |
+      | 2 | `ram_regions` nimmt **nur Typ 1** und verwirft `base < 1 MiB` | `multiboot.rs:148` |
+      | 3 | `free_base = max(kernel_end, USER_RAM_MIN)`, `USER_RAM_MIN = 16 MiB` | `bringup.rs`, `mmu.rs:88` |
+      | 4 | Modulbereiche werden **ausgeschnitten**, nicht nachträglich markiert | `subtract_holes`, Prüfzeile `mbmod` |
+
+      Der GRUB-Pfad (`tools/mkgrubiso.sh`) existiert, ist aber ein anderer Weg — und auch dort
+      trägt (2)–(4), weil es Untergrenzen sind und keine karten-abhängigen Annahmen.
+
+      **Ein echter Fund am Rande, und er gehörte in genau diese Klasse:** die
+      Multiboot-Info-Struktur selbst wird **nicht** ausgeschnitten. Dass sie sicher ist, hing
+      allein an `USER_RAM_MIN` — unter QEMU liegt sie bei `0x9500` (QEMUs `MULTIBOOT_STRUCT_ADDR`
+      ist `0x9000`, die MBI bei `+0x500`), unter einem anderen Lader kann sie anderswo liegen.
+      Senkt jemand `USER_RAM_MIN`, fällt der Schutz **lautlos** weg — und der Allokator vergäbe
+      die Struktur, aus der der Speicherplan stammt. Steht jetzt als gemessene Zeile
+      (`mbi : Bootloader-Struktur bei 0x9500, Freiliste ab 0x1000000 -- ausserhalb: 1`) mit
+      Prüfung in der Suite.
+
+      **Was D0 weiterhin erklären müsste** und wovon diese Hypothese nichts erklärt: der Hänger
+      trat **nach** `smp : 4 von 4 Kern(en) online` auf, die abweichende Signaturzeile war
+      `ipc : FAILURES`. Eine Korruption durch früh vergebenen Low-Memory-Speicher sagt ein
+      anderes, früheres und breiter gestreutes Bild voraus.
+
 - [ ] **Sobald die Ursache feststeht:** der Lauf muss wieder wiederholbar sein, bevor A1 als
       abgenommen gilt. Ein Testaufbau, der stehenbleibt, kann keine Aussage über irgendeine
       Eigenschaft tragen — auch nicht über die, die er gerade grün meldet. Bei 0,5 % ist die

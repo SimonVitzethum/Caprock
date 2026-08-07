@@ -2449,6 +2449,29 @@ pub fn run(multiboot_info: u64) -> ! {
     }
     let free_base = hal::mmu::kernel_end().max(hal::mmu::USER_RAM_MIN);
     /*
+     * **Die Struktur des Bootloaders liegt unter der Freiliste -- gemessen, nicht angenommen.**
+     *
+     * Der klassische Fehler dieser Klasse (OSDev, GRUB): ein Lader meldet den Speicher unter
+     * 1 MiB als frei, obwohl dort EBDA, BIOS-Datenbereich und seine eigenen Strukturen liegen --
+     * die Empfehlung lautet, alles darunter als belegt zu behandeln. Hier ist das dreifach
+     * gedeckt: `ram_regions` nimmt nur Typ 1 und verwirft `base < 1 MiB`, `free_base` liegt bei
+     * mindestens 16 MiB, und die Modulbereiche werden ausgeschnitten.
+     *
+     * Aber: **die Multiboot-Info-Struktur selbst wird NICHT ausgeschnitten.** Dass sie trotzdem
+     * sicher ist, haengt heute allein an `USER_RAM_MIN` -- unter QEMU liegt sie bei `0x9500`,
+     * unter einem anderen Lader kann sie anderswo liegen. Genau die Sorte Eigenschaft, die aus
+     * einer Konstante folgt, die niemand daraufhin prueft: senkt jemand `USER_RAM_MIN`, faellt
+     * der Schutz lautlos weg.
+     *
+     * Deshalb steht die Bedingung hier als Zeile und nicht als Annahme.
+     */
+    let mbi_geschuetzt = multiboot_info < free_base;
+    println!(
+        "mbi     : Bootloader-Struktur bei {multiboot_info:#x}, Freiliste ab {free_base:#x} -- \
+         ausserhalb: {}",
+        mbi_geschuetzt as u8
+    );
+    /*
      * Den freien Speicher **absichtlich zerstueckelt** uebergeben, statt als einen Block.
      *
      * Fuer die Kern-Uebergabe an Linux (Variante B) kommt der Speicher als Sammlung dessen,

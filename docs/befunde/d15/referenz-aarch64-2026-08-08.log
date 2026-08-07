@@ -1,0 +1,242 @@
+
+boot: primary core up (pre-MMU)
+[mmu] WARNUNG: Kernelimage > 2 MiB, W^X-Mapping unvollständig!
+========================================
+ SEL4Lake — capability microkernel
+ phase 1: HAL bring-up
+========================================
+arch    : aarch64 (running at EL1)
+boot-x0 : 0x0000000000000000 (DTB-Zeiger; bei QEMU-ELF 0 -> DTB eingebettet)
+mmu     : identity-map, M=1 C=1 I=1 (caches an)
+core 0  : online (vectors, gic, timer @ 100 Hz)
+timer   : CNTFRQ=62500000 Hz, PPI 30
+spec    : CSV2=0 CSV3=0 FEAT_SB=0 · nospec-Indizes an, Barriere beim VSpace-Wechsel
+cache   : LLC L2 1024 KiB, 16-fach, 64 B/Zeile, 1024 Sets -> 16 Seitenfarbe(n)
+dtb     : RAM base=0x40000000 size=4096 MiB (aus Device Tree)
+dtb     : 8 CPUs (aus Device Tree; Kernel-Obergrenze 256)
+dtb     : ALL PASS
+mem     : freies RAM [0x40248000, 0x13f000000)  (Loader-Fenster [0x13f000000, 0x140000000) reserviert)
+cap     : 80256 Slots / 80256 Objekte, Tabellen 17872 KiB aus dem RAM (Summe aller PD-Budgets: 80000)
+ipc     : 10064 Endpoints / 10064 Notifications, Tabellen 16908 KiB aus dem RAM (eine PD, ein Endpoint: 10000 PDs)
+archive : 11 Modul(e): [1]init@v1 [10]hello@v1 [11]hwhello@v1 [12]trusted-x@v1 [2]probe@v1 [20]aggressor-u@v1 [21]intruder-u@v1 [22]aggressor-h@v1 [23]intruder-h@v1 [24]aggressor-t@v1 [25]intruder-t@v1 -> ALL PASS
+memtest : freies RAM = 4043 MiB (1 Fragmente)
+memtest: PASS  alloc 1 Seite
+memtest: PASS  alloc 4 Seiten, 8-KiB-aligned
+memtest: PASS  disjunkte Allokationen
+memtest: PASS  freies RAM um 5 Seiten reduziert
+memtest: PASS  split 4 -> 1 + 3 Seiten
+memtest: PASS  split-Adressen zusammenhaengend
+memtest: PASS  restrict RW -> R
+memtest: PASS  transfer per Move erhaelt Cap
+memtest: PASS  free + Coalescing stellt RAM wieder her
+memtest : ALL PASS
+zerotest: PASS  frische Allokation ist genullt
+zerotest: PASS  Muster geschrieben (Kontrolle)
+zerotest: PASS  Allokator gibt dieselbe Region erneut aus
+zerotest: PASS  wiederverwendete Region ist genullt (keine Datenremanenz)
+zerotest: ALL PASS
+captest: PASS  install belegt keinen zusaetzlichen Speicher
+captest: PASS  Wurzel-Cap: RW, refcount 1
+captest: PASS  refcount 4 nach copy/mint/copy
+captest: PASS  Wurzel hat 2 Kinder
+captest: PASS  CDT konsistent (abgeleiteter Baum)
+captest: PASS  mint: Rechte READ + Badge gesetzt
+captest: PASS  keine Rechte-Eskalation bei copy
+captest: PASS  altes Handle nach move ungueltig
+captest: PASS  neues Handle nach move gueltig
+captest: PASS  delete mit Kindern -> HasChildren
+captest: PASS  revoke entfernt alle Abkoemmlinge (refcount 1)
+captest: PASS  Abkoemmling-Handles ungueltig nach revoke
+captest: PASS  Speicher noch gehalten (Wurzel lebt)
+captest: PASS  CDT konsistent nach revoke
+captest: PASS  Wurzel-Handle nach delete ungueltig
+captest: PASS  CDT konsistent nach Teardown
+captest: PASS  Finalisierung gibt Speicher zurueck
+captest : ALL PASS
+budget: PASS  Installationen bis zum Budget gelingen
+budget: PASS  Installation ueber das Budget hinaus wird abgewiesen
+budget: PASS  Ersetzen eines belegten Slots bleibt erlaubt
+budget: PASS  CDT konsistent nach Teardown
+budget: PASS  Speicher zurueckgegeben
+budget  : ALL PASS
+dmaalign: PASS  ausgerichtete Region wird angenommen
+dmaalign: PASS  unausgerichteter Anfang -> Unaligned
+dmaalign: PASS  angebrochene Laenge -> Unaligned
+dmaalign: PASS  CDT konsistent (keine Cap aus Fehlschlaegen)
+dmaalign: ALL PASS
+sched   : 8 Kerne, 10000 Thread-Slots (2500 hostbar je Kern), Tabellen 9120 KiB aus dem RAM
+sched   : Round-Robin + cap-gesicherte IPC (2 PDs + 3 Worker + Idle)
+manifest: v1 vom Schluessel 209d7d3a.., an dieses Kernel-Image gebunden, 1 Eintrag/Eintraege
+manifest:   [1]init dom=0 iface=v1 caps=0x0005 politik=0x2 prio=3 numa=0 kern=beliebig budget=0us ROOT
+manifest: ALL PASS (Signatur ueber die GESAMTE Nachricht, an DIESES Kernel-Image gebunden, Anti-Downgrade; manipulierte Kopie wird abgewiesen)
+root    : ALL PASS (Startprogramm aus der Startmenge geladen: Thread 44, PD 40; Manifest-Hash geprueft, Wurzel-Caps endowt)
+smp     : starte Kerne 1..7 via PSCI CPU_ON (hvc) ...
+core 4  : online (EL1, MMU on)
+core 2  : online (EL1, MMU on)
+core 6  : online (EL1, MMU on)
+core 7  : online (EL1, MMU on)
+core 1  : online (EL1, MMU on)
+core 5  : online (EL1, MMU on)
+core 3  : online (EL1, MMU on)
+el0-trap: User-Thread 0x17 faultete (EC=0x24 FAR=0x0000000040080000) -> beendet, Kernel laeuft weiter
+el0-trap: User-Thread 0x27 faultete (EC=0x24 FAR=0x0000000042f94000) -> beendet, Kernel laeuft weiter
+el0-trap: User-Thread 0x2b faultete (EC=0x24 FAR=0x0000000042fb3000) -> beendet, Kernel laeuft weiter
+el0-trap: User-Thread 0x26 faultete (EC=0x24 FAR=0x0000000042f68000) -> beendet, Kernel laeuft weiter
+dma: StreamID 0x100 ohne deklarierte Adressbreite -- angenommen 64 Bit (dma_declare_device_addr_bits)
+dma: StreamID 0x40 ohne deklarierte Adressbreite -- angenommen 64 Bit (dma_declare_device_addr_bits)
+dma: StreamID 0x51 ohne deklarierte Adressbreite -- angenommen 64 Bit (dma_declare_device_addr_bits)
+dma: StreamID 0x60 ohne deklarierte Adressbreite -- angenommen 64 Bit (dma_declare_device_addr_bits)
+dma: Region pa=0x42fbe000 len=0x1000 bleibt dauerhaft pending -- Stilllegung nicht bestaetigt
+el0-trap: User-Thread 0x400000421 faultete (EC=0x24 FAR=0x0000000040000000) -> beendet, Kernel laeuft weiter
+el0-trap: User-Thread 0x10000041f faultete (EC=0x24 FAR=0x0000000040000000) -> beendet, Kernel laeuft weiter
+el0-trap: User-Thread 0x10000041b faultete (EC=0x24 FAR=0x0000000040000000) -> beendet, Kernel laeuft weiter
+el0-trap: User-Thread 0x10000041a faultete (EC=0x24 FAR=0x0000000000000001) -> beendet, Kernel laeuft weiter
+color   : 16 Farben, 4 Partitionen, Region 16 KiB · in_mask=1 kernelseite=1 (kstack=1 l1=1 l2=1) rueckgelesen=1 (kstack=1 l1=1 l2=1) disjunkt=1 uebergross_abgewiesen=1 bilanz=1
+color   : ALL PASS (zwei isolierte PDs teilen sich keine Cache-Farbe)
+isohigh : Regionen zweier isolierter PDs bei 0x432d0000 / 0x432b4000; oberhalb 4 GiB = 0
+isohigh : SKIP -- kein RAM oberhalb 4 GiB auf dieser Maschine, der Fall ist nicht entscheidbar (E-Rest 3d: die private Region einer isolierten PD haengt nicht mehr an GiB 0. Sie wird ueber ein VA-Fenster ausserhalb der Identitaetskarte abgebildet, statt identisch -- damit faellt der gemessene Deckel von 504 gleichzeitigen isolierten PDs. Die Farbbedingung gilt unveraendert: sie ist eine Aussage ueber die Physadresse)
+stripe  : 4 Streifen vergeben, 5. Versuch abgewiesen: true; nach Freigabe wieder vergebbar: true
+stripe  : ALL PASS (B-4.2: erschoepfte Farbpartitionierung scheitert SAUBER, statt einen Satz still ein zweites Mal auszugeben)
+pprobe  : Opfer 256 KiB (privat 32, ueber-privat=ja), Angreifer 1536 KiB je Farbsatz (150% des LLC), 1 Bloecke, Kette 4096 Glieder, 9 Proben · Zyklen je Durchlauf (min/median/max): ungestoert=2605/2639/3917 disjunkt=2818/3590/7002 gleichfarbig=2779/3198/7790 · je Glied (Median): 0.6/0.8/0.7 · farbtreu=1 bilanz=1 fragmente 12->12
+pprobe  : SKIP -- die Zahlen sind keine Speicherlatenzen: ein ungestoertes Glied kostete 0 Zyklen, unter der Untergrenze von 3 (eine abhaengige Ladeoperation kostet auf echter Hardware mindestens die L1-Trefferlatenz). Gemessen wurde eine EMULATION, deren Zeit an der Befehlszahl haengt -- dort ist ein groesserer Arbeitssatz zuverlaessig langsamer, und die Positivkontrolle traegt aus dem falschen Grund
+DBG pending: workers=true fp=true prio=true life=true notif=true xfer=true ckpt=true el0=true smp=true xipc=true reclaim=true balance=true vspace=true vmm=true shm=true native=true pages4k=true churn=true mcs=true stale=true strand=true rgone=true ddon=true rcap=true rmig=true fuzz=true ipcfuzz=true caplk=false domain=true pdctl=true chan=true rtc=true irq=true dma=true pcie=true smmu=true smmubind=true virtiorng=true dmagen=true sasheap=true load=true sysload=true loadhw=true loadstop=true loaderfuzz=true aggru=true intru=true aggrh=true intrh=true aggrt=true intrt=true cross=true hwfuzz=true
+pdbind  : gebunden=70 spaet-gebunden=0 unklar=0 erklaert-gefeuert=0x0 (D0: eine PD, die an einen bereits zugelassenen Thread geht, kommt zu spaet -- der Thread kann seinen ersten Syscall schon gemacht und ERR_NOPD bekommen haben. Erklaerte Gruende zaehlen NICHT als spaet, stehen aber hier)
+pdbind  :   erklaert zulaessig: CheckpointSubjektNachtraeglich
+pdbind  : ALL PASS
+sched   : core 0 ticks=1448
+sched   : core 1 ticks=2614
+sched   : core 2 ticks=2611
+sched   : core 3 ticks=2609
+sched   : core 4 ticks=2611
+sched   : core 5 ticks=2614
+sched   : core 6 ticks=2548
+sched   : core 7 ticks=2610
+sched   : worker 0 count=26848
+sched   : worker 1 count=26955
+sched   : worker 2 count=26985
+sched   : ALL PASS
+fp      : EL0-FP-Threads-OK=0b11/0b11, Lazy-FP-Owner-Wechsel=399
+fp      : ALL PASS (Lazy-FP: FP-Kontext ueber Owner-Wechsel erhalten)
+prio    : id 0 (prio 4) fertig als #0
+prio    : id 1 (prio 3) fertig als #1
+prio    : id 2 (prio 2) fertig als #2
+prio    : ALL PASS
+life    : victim-count nach KILL=2130, später=2130 (eingefroren: true)
+life    : KILL ohne Cap -> result=1 (verweigert: true)
+life    : 148 Threads eingesammelt, 4176400 KiB Stack zurueckgewonnen
+life    : ALL PASS
+notif   : 5 Signale empfangen, Badge=0xa5 (erwartet 0xa5)
+notif   : ALL PASS
+xfer    : svc call(7) ueber transferierte Cap -> 21 (erwartet 21)
+xfer    : ALL PASS
+migrate : Migrant lief auf core 0 (before_ok=true), migriert nach core 3 (moved=true), laeuft dort weiter (after_ok=true, zuletzt gesehen core 0), Tcb-Cap bezeichnet ihn weiterhin (cap_ok=true), balance_once() verschob (auto_ok=true), cross-core-KILL (killed=true), sched_audit=0
+migrate : ALL PASS (Thread wechselt den Kern, behaelt Identitaet + Tcb-Cap, laeuft weiter)
+scale   : 1024 von 1024 Threads GLEICHZEITIG erzeugt (alle auffindbar=true, Slot-Buchhaltung=true), danach abgebaut -> Slots+RAM zurueck auf Baseline=true, sched_audit=0
+scale   : ALL PASS (Kapazitaet kommt zur Boot-Zeit aus dem RAM, Spawn/Teardown O(1))
+grantlk : nach 64+1 Grants in denselben Slot: 1 lebende Ableitung(en) der Quell-Cap (erwartet 1), Cap weiter nutzbar -> 21 (erwartet 21), cdt_audit=0
+grantlk : ALL PASS (verdraengte Grant-Cap wird freigegeben — kein Slot-Leck in der geteilten Cap-Tabelle)
+el0     : EL1-Server empfing 0xc0de (erwartet 0xc0de); EL0-Syscall gesehen: true
+el0     : ALL PASS (User-Thread laeuft auf EL0, nur via Syscall)
+el0iso  : EL0-Faults abgefangen=8 (Kernel laeuft -> dieser Bericht beweist es)
+el0iso  : ALL PASS (EL0-Zugriff auf Kernel-Speicher faultet, Thread beendet, Kernel ueberlebt)
+ckpt    : v1(+1)=[1, 2, 3] -> Reload -> v2(+10)=[13, 23] (Uebernahme Generation 1)
+ckpt    : ALL PASS (Zustand ueber Komponententausch erhalten -- und nachweislich UEBERNOMMEN, nicht neu erzeugt)
+ipc     : v1 call(5) -> 10 (erwartet 10)
+ipc     : v1 call(6) -> 12 (erwartet 12)
+ipc     : ALL PASS
+reload  : v2 call(5) -> 15 (erwartet 15)
+reload  : v2 call(6) -> 18 (erwartet 18)
+reload  : ALL PASS (Komponente ohne Kernel-Neustart getauscht)
+smp     : core 1 Worker-Fortschritt=5/5
+smp     : core 2 Worker-Fortschritt=5/5
+smp     : core 3 Worker-Fortschritt=5/5
+smp     : core 4 Worker-Fortschritt=5/5
+smp     : core 5 Worker-Fortschritt=5/5
+smp     : core 6 Worker-Fortschritt=5/5
+smp     : core 7 Worker-Fortschritt=5/5
+smp     : Cross-Core-IPI-Wake (core 0 -> core 1 Parker) erfolgreich=true
+smp     : ALL PASS (per-Kern-parallele Einplanung + IPI-Cross-Core-Wake)
+xipc    : core0->core2 call(3) -> 21 (erwartet 21)
+xipc    : core0->core2 call(5) -> 35 (erwartet 35)
+xipc    : core0->core2 call(7) -> 49 (erwartet 49)
+xipc    : ALL PASS (synchrone IPC ueber Kerngrenze, CALL+REPLY je per IPI)
+reclaim : 16 transiente EL0-Threads erzeugt (Pool=8), jetzt 9989 Slots frei
+reclaim : ALL PASS (EL0-Kernel-Stack-Pool-Slots werden beim Thread-Ende zurueckgegeben)
+balance : 16 Worker verteilt [0, 2, 2, 2, 3, 3, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] (Kerne genutzt=7, max/Kern=3)
+balance : ALL PASS (lastbewusste Platzierung verteilt Threads ueber die Kerne)
+vspace  : X=0x42f68000; SAS-Probe las X=true; isol. Probe lief+IPC=true, faultete=true, las-X=false
+vspace  : ALL PASS (per-Prozess-VSpace: echte User<->User-Trennung, nur IPC)
+vmm     : VMM-Probe mappte+beschrieb Frame=true; isolierte Faults gesamt=7 (>=2 => unmap wirkte)
+vmm     : ALL PASS (Frame-Caps + map/unmap-Syscalls + VSpace-Teardown)
+shm     : Reader las Writer-Wert via geteiltem Frame (zwei isol. VSpaces)=true
+shm     : ALL PASS (Shared-Memory-IPC: ein Frame in zwei isolierte VSpaces, cap-gewaehrt)
+native  : privat geladener Code lief in eigener VSpace (nicht geteilte .user_text)=true
+native  : ALL PASS (natives Code-Laden je isolierter VSpace, EL0-RX/W^X + I-Cache-Sync)
+pages4k : einzelne 4-KiB-Seiten RW-Schreiben+RO-Lesen ok=true (Guard-Seite faultet danach)
+pages4k : ALL PASS (4-KiB-Mappings: gemischte RW/RO-Rechte + Guard Pages + L3)
+churn   : 2000 spawn/destroy-Zyklen isolierter PDs; MEM/TCB/ASID/kstack zurueck=Baseline: true
+churn   : ALL PASS (keine Mapping-/ASID-/TCB-/Speicher-Leaks ueber tausende Zyklen)
+mcs     : Budget per Cap gebunden=true (budget=2/Periode=16); Erschoepfungen=8, Refills=8
+mcs     : Fortschritt budgetiert=14896 vs. greedy=123295 (budgetiert gedrosselt + garantiert > 0)
+mcs     : ALL PASS (MCS-Budget: Verbrauch/Tick, Erschoepfung->Block, Refill nach Periode, cap-vergeben)
+stale   : Opfer in senders gekillt; Server uebersprang toten Eintrag (keine Panik); Client-Antwort=0xaf43c000 (erwartet 0xaf43c000)
+stale   : ALL PASS (IPC paniert nicht bei gekilltem, in Endpoint-Queue blockiertem Thread)
+strand  : erschoepfter Worker nach Re-Bind: Zaehler 2989 -> 211815 (muss wachsen)
+strand  : ALL PASS (set_budget/bind_sched_context strandet einen erschoepften Thread nicht)
+rgone   : kill-Runde Client=5, quiesce-Runde Client=5 (Server lebt=true); erwartet ERR_SERVER_GONE=5
+rgone   : ALL PASS (toter ODER zurueckgezogener Reply-Owner entblockt den CALL-Aufrufer statt ihn haengen zu lassen)
+ddon    : budgetierter Client x14 Calls -> unbeschr. Server; Client-Konto-Erschoepfungen=14 (erwartet >=6)
+ddon    : ALL PASS (Budget-Donation: intra-core CALL belastet die Server-Arbeit gegen das Aufrufer-Budget)
+rcap    : Reply-Cap fuer ausstehenden Call gepraegt + geloescht; Client-CALL-Ergebnis=5 (erwartet ERR_SERVER_GONE=5)
+rcap    : ALL PASS (first-class ObjectKind::Reply: Revocation/Loeschen der Reply-Cap bricht den Call ab)
+rmig    : v1 empfaengt Call, Hot-Reload migriert die Antwortpflicht auf v2; Client-Ergebnis=0 (erwartet OK=0) Wert=35 (erwartet 35=5*7) migriert=true
+rmig    : ALL PASS (Reply-Cap-Server-Migration: ausstehende Reply-Cap ueberlebt den Server-Wechsel, v2 schliesst den Call ab)
+caplk   : 2 Sonden auf Kern 1+2; gleichzeitige CAPS-Leser-Hoechststand=2 (erwartet >=2; exklusiver Lock waere strukturell 1)
+caplk   : ALL PASS (CAPS-Reader-Writer-Lock: heisse Cap-Lookups laufen nebenlaeufig statt serialisiert)
+domain  : TrustedSas(global)+HardwareLand(iso)+UserLand(iso); domain_audit=0 (erwartet 0); Domaenen round-trippen
+domain  : ALL PASS (Domaenen-Policy: Cap-Typen je Domaene + untrusted Domaenen sind isoliert)
+pdctl   : Controller steuert UserLand-Ziel: lief=true PAUSE-eingefroren=true RESUME-waechst=true leerer-Slot-ERR_BADCAP=true PdControl-in-UserLand-denied=true STOP=true
+pdctl   : ALL PASS (Management-Cap PdControl: nur TrustedSas steuert nur UserLand, jede Op cap-gated)
+chan    : Trusted CALLt Backend ueber gebundenen Kanal -> 18 (erwartet 18=2*9); 1:N=true Fremd-Cap-denied=true recv-cap-ok=true
+chan    : ALL PASS (unveraenderliche paarweise HardwareLand<->Trusted-Bindung, 1:N, Backend spricht nur mit Partner)
+rtc     : HardwareLand-Backend liest PL031 RTC_DR=1786138129 (>0 erwartet) ueber MMIO-Cap+Device-Mapping; MMIO-in-HW=true MMIO-in-UserLand-denied=true
+rtc     : ALL PASS (generisches vspace_map_device + MMIO-Cap: Device-Zugriff nur in HardwareLand, kernel-autorisiert, W^X)
+irq     : HardwareLand-Backend armiert PL031-Match-IRQ (INTID 34); Kernel routet+deferred-zustellt -> Backend-Antwort=1 (1 erwartet), zugestellte IRQs=1; IRQ-Cap-in-HW=true in-UserLand-denied=true
+irq     : ALL PASS (IRQ-Cap + GICD_ITARGETSR-Routing + Deferred-Signal: Geraete-IRQ als Notification an HardwareLand, lock-/deadlock-frei)
+dma     : HardwareLand-Backend schreibt+liest DMA-Region (EL0 Normal-NC) ueber DmaCap; EL0-read=0x600dbeef (0x600dbeef erwartet); Kohaerenz(Kernel-Identity)+DmaCap-in-HW=true in-UserLand-denied=true bounds-audit-greift=true
+dma     : ALL PASS (DmaCap hinter DmaEnforcer-Abstraktion: kernel-ausgeschnittene Region, nur HardwareLand, Normal-NC-Mapping, dma_audit)
+pcie    : virtio-rng-pci gefunden: vendor=0x1af4 device=0x1044 RID/StreamID=0x0100 BAR=0x10000000 bus-master=true bogus-vendor-not-found=true
+pcie    : ALL PASS (ECAM-Enumeration + BAR-Zuweisung + Bus-Master; RID == SMMU-StreamID, kernel-/Trusted-Setup)
+smmu    : SMMUv3 IDR0=0x0d44101b SIDSIZE=16 -> Bring-up: SMMUEN=true CMD_SYNC-Round-Trip=true Event-Queue-leer=true GERROR=0x0
+smmu    : ALL PASS (SMMUv3-Bring-up hinter DmaEnforcer: Command-/Event-Queue + lineare Stream-Tabelle, Default-Abort, CR0)
+smmubind: enable_dma(StreamID=0x0100) STE->CD->Stage-1 installiert=true Event-Queue-leer=true Stage-1/CD-Frames balanciert nach disable=true
+smmubind: ALL PASS (enable_dma/disable_dma: STE->CD->Stage-1 bildet NUR die DMA-Region ab; Revoke gibt Tabellen frei)
+virtiorng: Geraet DMAt 64 Zufallsbytes in die DmaCap-Region: used-adv=true bytes[0..8]=0xd285ab842c6fce24 SMMU-Event-Queue-leer=true
+virtiorng: KRONJUWEL out-of-window: L1-Software-abgewiesen=true Ziel-unveraendert=true (Sensitivitaet: ohne-Pruefung-Geraet-schrieb=false); L2-SMMU-Fault=true (Stage-1-STE->CD->Pagetable greift, Fault wird als Event aufgezeichnet)
+virtiorng: Kontrollen: Bypass-STE-Geraet-schrieb=true Event-Queue-hat-gesprochen=true keine-Konfig-Fehler=true
+virtiorng: ext-36b Achsen getrennt: IOVA!=PA=true ; Negativtest (Deskriptor traegt absichtlich die PA): Event-F_TRANSLATION=true StreamID-passt=true Input-Adresse-passt=true (mit iommu_platform=on uebersetzt QEMU wirklich -> beobachtbar)
+virtiorng: ALL PASS (echter Bus-Master-DMA in die DmaCap-Region; zweistufig: Level-1-Software-Bounds erzwingt In-Window demonstrierbar, Level-2-SMMU als HW-Backstop fuer reale HW)
+dmagen  : Multi-Region(3-in-1-Kontext)=true Richtung(Read=RO/Write=RW)=true Kohaerenz(WB/NC)=true Stream-Gruppe(2 SIDs)=true Scatter-Gather=true Sub-Puffer=true balanciert=true
+dmagen  : ALL PASS (generische DMA-Infra: Richtung/Kohaerenz als DmaCap-Attribute, Multi-Region-Kontext, Stream-Gruppen, SG-Validierung, disjunkte Sub-Puffer ueber den SG-Pfad — baut auf DmaCap/DmaEnforcer auf)
+dmawin  : 32-Bit-Geraet-abgewiesen=true Fenster-voll-abgewiesen=true Kontext-danach-intakt=true balanciert=true Geraete-ohne-deklarierte-Adressbreite=3 (gefuehrt, nicht stillschweigend 64)
+dmawin  : B-3.4 Fenster gegen den Interrupt-Nachrichtenbereich: GEPRUEFT, frei (jedes der NDMA_CTX Slot-Fenster liegt vollstaendig ausserhalb) -- belegte-DMA-Kontexte=1 davon-schwaches-Fenster=0 Fenster-weicht-von-der-Politik-ab=0 eingetragenes-Fenster-im-Sperrbereich=0
+dmawin  : ALL PASS (IOVA-Fenstergrenzen: Geraete-Adressbreite + Fenster-Erschoepfung scheitern laut statt still abzuschneiden; kein halb aufgebauter Kontext)
+dmatok  : delete-ohne-detach-baut-ab=true Region-danach-frei=true unbestaetigte-Stilllegung-bleibt-pending=true Audit-Code-7-haelt=true
+dmatok  : ALL PASS (Teardown-Token: die Cap-Crate gibt DMA-Regionen nicht mehr selbst frei, sondern meldet sie; Freigabe nur gegen Nachweis -- aus einer bewiesenen wird eine erzwungene Reihenfolge)
+sasheap : Trusted-SAS-Heap (Slabs+Bump ueber Regionsliste): Vec(4096,Realloc/grow)=true Box=true BTreeMap(256)=true Large-Alloc(dedizierte Region)=true Region-angefordert=true balanciert(alle Regionen zurueck)=true
+sasheap : ALL PASS (echter Box/Vec/BTreeMap-Heap auf realen Physadressen; Testcode 100% safe, unsafe nur in der Region-Runtime; prozess-lokaler Allokator ueber RegionSource grow/shrink)
+load    : extern gebautes 'hello' aus Boot-Archiv geladen (eigene isolierte UserLand-VSpace, W^X-Segmente an Link-VA, vom Allokator beliebige Phys) -> signalisierte HELLO_BADGE=ja
+load    : ALL PASS (generischer Binary-Loader: ELF64-Parse in Safe Rust, Segment-Kopie W^X, cap-gegatete PD + Endowment, EL0-Spawn -- extern gebauter Code laeuft NICHT aus dem Kernel-Image)
+sysload : SYS_LOAD result=0 (OK=0) Negativ(ohne Loader-Cap -> ERR_BADCAP)=true hello-Signal=ja
+sysload : ALL PASS (Laden zur LAUFZEIT via SYS_LOAD: cap-gegatet ueber Loader-Cap, Caller delegiert eigene Notification-Cap in die neue PD; ohne Loader-Cap abgewiesen)
+loadhw  : HardwareLand-Programm in vor-erstellte Backend-PD geladen (Partner+Kanal) -> Kanal-Signal=ja ; TrustedSAS als EL0-isolierte PD geladen(domain_audit ok)=true
+loadhw  : ALL PASS (HardwareLand-Laden: Backend-PD mit Partner+Kanal, Kanal-Cap-Policy gilt; TrustedSAS (zertifiziertes svc-demo) laeuft GELADEN EL0-isoliert -- nur mit gueltigem Zertifikat (ext-28) + trust_audit==0 (Key-DB selbstkonsistent, Gate setzt aktiv durch))
+loadstop: ALL PASS (geladenen Prozess vollstaendig abgebaut: Thread+VSpace-Tabellen+geladene Segment-Frames+Kstack+PD -> MEM/VSpace/kstack-Baseline wiederhergestellt, kein Leck)
+aggru   : ALL PASS (extern geladener UserLand-Aggressor: Cap-Confusion (leerer Slot/falscher Typ/falsche Rechte) + Eskalation (PDCTL/LOAD/KILL ohne Autoritaet) -> alle als BADCAP/RIGHTS/BADSYS abgewiesen; Dienst signalisiert SUCCESS nur bei voller Abweisung; Audits==0)
+intru   : ALL PASS (extern geladener UserLand-Intruder: las Kernel-RAM aus EL0 -> Translation-Fault (Ziel nicht in der isolierten VSpace gemappt) -> Kernel terminiert den Angreifer-Thread + laeuft weiter; PRE-Badge erhalten + el0_fault_count++ + Audits==0)
+aggrh   : ALL PASS (extern geladenes HardwareLand-Backend als Aggressor: trotz 'Hardware'-Domaene KEINE Management-Autoritaet (PDCTL/LOAD/KILL -> BADCAP) + nichts ausserhalb des eigenen Kanals erreichbar; Cap-Confusion alle BADCAP/RIGHTS/BADSYS; meldet SUCCESS ueber den Kanal nur bei voller Abweisung; Audits==0)
+intrh   : ALL PASS (extern geladenes HardwareLand-Backend als Intruder: las Kernel-RAM aus EL0 -> Fault -> terminiert, Kernel laeuft weiter; Speicher-Isolation DOMAENEN-UNABHAENGIG (auch ein Hardware-Backend ist EL0-isoliert); PRE + el0_fault_count++ + Audits==0)
+aggrt   : ALL PASS (extern geladener TrustedSAS-Aggressor (EL0-isoliert): TRUST != PRIVILEG -- hoechste Cap-Autoritaet der Domaene, doch ohne tatsaechliche PdControl/Loader-Cap scheitern PDCTL/LOAD/KILL als BADCAP; Cap-Confusion alle abgewiesen; SUCCESS nur bei voller Abweisung; Audits==0)
+intrt   : ALL PASS (ext-28 Zertifikats-Gate: UNZERTIFIZIERTES TrustedSAS wird abgewiesen -- intruder-t traegt absichtlich `unsafe` (nicht zertifizierbar), liegt OHNE Zertifikat im Archiv -> verify_image (ADR 0014) weist das Laden mit Unverified ab; KEIN Thread/keine PD entsteht; Audits==0)
+cross   : ALL PASS (Cross-Service-Matrix: drei extern geladene Angreifer DREIER Domaenen NEBENLAEUFIG -- aggressor-u (UserLand) + aggressor-t (TrustedSAS) melden UNABHAENGIG SUCCESS (gleichzeitige cross-domain Angreifer stoeren einander nicht), intruder-h (HardwareLand) faultet beim Fremdspeicher-Zugriff; kernel-geschuetztes Canary BIT-FUER-BIT unberuehrt; Audits==0)
+== SELFTEST COMPLETE -> system_off ==

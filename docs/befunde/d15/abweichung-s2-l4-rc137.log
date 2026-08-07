@@ -1,0 +1,97 @@
+
+boot: primary core up (pre-MMU)
+[mmu] WARNUNG: Kernelimage > 2 MiB, W^X-Mapping unvollständig!
+========================================
+ SEL4Lake — capability microkernel
+ phase 1: HAL bring-up
+========================================
+arch    : aarch64 (running at EL1)
+boot-x0 : 0x0000000000000000 (DTB-Zeiger; bei QEMU-ELF 0 -> DTB eingebettet)
+mmu     : identity-map, M=1 C=1 I=1 (caches an)
+core 0  : online (vectors, gic, timer @ 100 Hz)
+timer   : CNTFRQ=62500000 Hz, PPI 30
+spec    : CSV2=0 CSV3=0 FEAT_SB=0 · nospec-Indizes an, Barriere beim VSpace-Wechsel
+cache   : LLC L2 1024 KiB, 16-fach, 64 B/Zeile, 1024 Sets -> 16 Seitenfarbe(n)
+dtb     : RAM base=0x40000000 size=4096 MiB (aus Device Tree)
+dtb     : 8 CPUs (aus Device Tree; Kernel-Obergrenze 256)
+dtb     : ALL PASS
+mem     : freies RAM [0x40248000, 0x13f000000)  (Loader-Fenster [0x13f000000, 0x140000000) reserviert)
+cap     : 80256 Slots / 80256 Objekte, Tabellen 17872 KiB aus dem RAM (Summe aller PD-Budgets: 80000)
+ipc     : 10064 Endpoints / 10064 Notifications, Tabellen 16908 KiB aus dem RAM (eine PD, ein Endpoint: 10000 PDs)
+archive : 11 Modul(e): [1]init@v1 [10]hello@v1 [11]hwhello@v1 [12]trusted-x@v1 [2]probe@v1 [20]aggressor-u@v1 [21]intruder-u@v1 [22]aggressor-h@v1 [23]intruder-h@v1 [24]aggressor-t@v1 [25]intruder-t@v1 -> ALL PASS
+memtest : freies RAM = 4043 MiB (1 Fragmente)
+memtest: PASS  alloc 1 Seite
+memtest: PASS  alloc 4 Seiten, 8-KiB-aligned
+memtest: PASS  disjunkte Allokationen
+memtest: PASS  freies RAM um 5 Seiten reduziert
+memtest: PASS  split 4 -> 1 + 3 Seiten
+memtest: PASS  split-Adressen zusammenhaengend
+memtest: PASS  restrict RW -> R
+memtest: PASS  transfer per Move erhaelt Cap
+memtest: PASS  free + Coalescing stellt RAM wieder her
+memtest : ALL PASS
+zerotest: PASS  frische Allokation ist genullt
+zerotest: PASS  Muster geschrieben (Kontrolle)
+zerotest: PASS  Allokator gibt dieselbe Region erneut aus
+zerotest: PASS  wiederverwendete Region ist genullt (keine Datenremanenz)
+zerotest: ALL PASS
+captest: PASS  install belegt keinen zusaetzlichen Speicher
+captest: PASS  Wurzel-Cap: RW, refcount 1
+captest: PASS  refcount 4 nach copy/mint/copy
+captest: PASS  Wurzel hat 2 Kinder
+captest: PASS  CDT konsistent (abgeleiteter Baum)
+captest: PASS  mint: Rechte READ + Badge gesetzt
+captest: PASS  keine Rechte-Eskalation bei copy
+captest: PASS  altes Handle nach move ungueltig
+captest: PASS  neues Handle nach move gueltig
+captest: PASS  delete mit Kindern -> HasChildren
+captest: PASS  revoke entfernt alle Abkoemmlinge (refcount 1)
+captest: PASS  Abkoemmling-Handles ungueltig nach revoke
+captest: PASS  Speicher noch gehalten (Wurzel lebt)
+captest: PASS  CDT konsistent nach revoke
+captest: PASS  Wurzel-Handle nach delete ungueltig
+captest: PASS  CDT konsistent nach Teardown
+captest: PASS  Finalisierung gibt Speicher zurueck
+captest : ALL PASS
+budget: PASS  Installationen bis zum Budget gelingen
+budget: PASS  Installation ueber das Budget hinaus wird abgewiesen
+budget: PASS  Ersetzen eines belegten Slots bleibt erlaubt
+budget: PASS  CDT konsistent nach Teardown
+budget: PASS  Speicher zurueckgegeben
+budget  : ALL PASS
+dmaalign: PASS  ausgerichtete Region wird angenommen
+dmaalign: PASS  unausgerichteter Anfang -> Unaligned
+dmaalign: PASS  angebrochene Laenge -> Unaligned
+dmaalign: PASS  CDT konsistent (keine Cap aus Fehlschlaegen)
+dmaalign: ALL PASS
+sched   : 8 Kerne, 10000 Thread-Slots (2500 hostbar je Kern), Tabellen 9120 KiB aus dem RAM
+sched   : Round-Robin + cap-gesicherte IPC (2 PDs + 3 Worker + Idle)
+manifest: v1 vom Schluessel 209d7d3a.., an dieses Kernel-Image gebunden, 1 Eintrag/Eintraege
+manifest:   [1]init dom=0 iface=v1 caps=0x0005 politik=0x2 prio=3 numa=0 kern=beliebig budget=0us ROOT
+manifest: ALL PASS (Signatur ueber die GESAMTE Nachricht, an DIESES Kernel-Image gebunden, Anti-Downgrade; manipulierte Kopie wird abgewiesen)
+root    : ALL PASS (Startprogramm aus der Startmenge geladen: Thread 44, PD 40; Manifest-Hash geprueft, Wurzel-Caps endowt)
+smp     : starte Kerne 1..7 via PSCI CPU_ON (hvc) ...
+core 4  : online (EL1, MMU on)
+core 3  : online (EL1, MMU on)
+core 7  : online (EL1, MMU on)
+core 5  : online (EL1, MMU on)
+core 2  : online (EL1, MMU on)
+core 6  : online (EL1, MMU on)
+core 1  : online (EL1, MMU on)
+el0-trap: User-Thread 0x17 faultete (EC=0x24 FAR=0x0000000040080000) -> beendet, Kernel laeuft weiter
+el0-trap: User-Thread 0x26 faultete (EC=0x24 FAR=0x0000000042f68000) -> beendet, Kernel laeuft weiter
+el0-trap: User-Thread 0x27 faultete (EC=0x24 FAR=0x0000000042f94000) -> beendet, Kernel laeuft weiter
+el0-trap: User-Thread 0x2b faultete (EC=0x24 FAR=0x0000000042fb3000) -> beendet, Kernel laeuft weiter
+dma: StreamID 0x100 ohne deklarierte Adressbreite -- angenommen 64 Bit (dma_declare_device_addr_bits)
+dma: StreamID 0x40 ohne deklarierte Adressbreite -- angenommen 64 Bit (dma_declare_device_addr_bits)
+dma: StreamID 0x51 ohne deklarierte Adressbreite -- angenommen 64 Bit (dma_declare_device_addr_bits)
+dma: StreamID 0x60 ohne deklarierte Adressbreite -- angenommen 64 Bit (dma_declare_device_addr_bits)
+dma: Region pa=0x42fbe000 len=0x1000 bleibt dauerhaft pending -- Stilllegung nicht bestaetigt
+el0-trap: User-Thread 0x100000426 faultete (EC=0x20 FAR=0x0000000000000000) -> beendet, Kernel laeuft weiter
+
+[EXCEPTION] unerwarteter Trap
+  kind=4 (Current EL SPx)
+  ESR=0x000000008600000d (EC=0x21)
+  ELR=0x0000000000000000
+  FAR=0x0000000000000000
+  SPSR=0x00000000200003c5

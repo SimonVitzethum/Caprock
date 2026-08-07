@@ -235,6 +235,15 @@ falsch.
   (`map_region_into_thread` an drei Geraete-Backends) -- und die naheliegende mechanische
   Umstellung nahm den Fehler mit. Bewacht von `tools/zulassung.sh` (7 von 7 im Selbsttest), dort
   auch der Ankertest fuer `ERLAUBTE_SPAETBINDUNGEN`.
+* **OFFEN, und ernst: der Kernel springt nach Adresse 0** (2 von 600 aarch64-Laeufen, 2026-08-08).
+  Ein EL0-Thread faultet mit `EC=0x20 FAR=0` (Instruction Abort, PC stand auf 0), danach nimmt der
+  KERNEL `EC=0x21` mit `ELR=0`. Beide betroffenen Threads liegen auf **wiederverwendeten Slots**
+  (Generation 1, Slots 1060/1062 — der `scale`-Test erzeugt 1024 gleichzeitig).
+  In keinem aarch64-Protokoll vor dem D0-Umbau aufgetaucht; `0/600` gegen `2/600` ist aber
+  **Fisher p ≈ 0,25** — daraus folgt nichts. Zwei Ereignisse tragen keine Rate.
+  Hypothese, unbelegt: der neue Zustand „existiert, aber nicht zugelassen" trifft auf den
+  Reap-/Wiederverwendungspfad. Dieselbe Klasse wie Audit-Code 7 einen Tag zuvor. Details und der
+  Messplan in `todo.md` D15, Protokolle in `docs/befunde/d15/`.
 * **Der D0-Umbau hat eine Regression erzeugt, und der Kernel-Audit hat sie selbst gefunden.**
   Audit-Code 7 lautet „lauffaehig und in keiner Liste" -- woertlich der Zustand eines GEPARKTEN
   Threads, den es vor der Behebung nicht geben konnte. Gemessen in der aarch64-Reihe:

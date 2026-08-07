@@ -875,7 +875,73 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
 
 ---
 
-## D14. Was nach der D0-Behebung offen bleibt
+## D15. Der Kernel springt nach Adresse 0 — 2 von 600 aarch64-Läufen (2026-08-08)
+**Klasse:** Fehler · **Aufwand:** offen, Ursache unbekannt · **Fundort:** aarch64-Messreihe nach
+der Audit-Berichtigung
+
+- [ ] **Das Bild, zweimal formgleich:**
+
+          el0-trap: User-Thread 0x100000426 faultete (EC=0x20 FAR=0x0) -> beendet, Kernel laeuft weiter
+
+          [EXCEPTION] unerwarteter Trap
+            kind=4 (Current EL SPx)
+            ESR=0x000000008600000d (EC=0x21)
+            ELR=0x0000000000000000
+            FAR=0x0000000000000000
+
+      `EC=0x20` beim User-Thread ist ein **Instruction Abort aus einer niedrigeren EL** mit
+      `FAR=0` — sein PC stand auf 0. Danach nimmt der **Kernel** `EC=0x21` (Instruction Abort auf
+      derselben EL) mit `ELR=0`: er ist selbst nach 0 gesprungen. Der Lauf endet dort; das externe
+      Zeitlimit räumt ihn ab (`rc=137`).
+
+      Zum Vergleich: die *absichtlichen* Isolationssonden faulten in derselben Reihe mit
+      `EC=0x24 FAR=0x40000000` (Datenzugriff). `EC=0x20 FAR=0` ist ein anderes Tier.
+
+- [ ] **Was die Zahlen hergeben — und was nicht.**
+
+      | Reihe | Läufe | dieses Bild |
+      |---|---|---|
+      | aarch64 vor der Audit-Berichtigung | 600 | **0** |
+      | aarch64 nach der Audit-Berichtigung | 600 | **2** |
+      | alle älteren aarch64-Protokolle | — | **0** (nie gesehen) |
+
+      `0/600` gegen `2/600` ist **Fisher p ≈ 0,25** — daraus folgt **nicht**, dass die
+      Audit-Berichtigung es verursacht hat. Sie liest nur; ein Sprung nach 0 kann daraus nicht
+      folgen. Zwei Ereignisse tragen keine Rate, und genau dieser Fehlschluss hat in diesem
+      Projekt schon Tage gekostet.
+
+      Was sich sagen lässt: das Bild ist in **keinem** aarch64-Protokoll vor dem D0-Umbau
+      aufgetaucht.
+
+- [ ] **Die Spur, die es gibt: beide Threads liegen auf WIEDERVERWENDETEN Slots.**
+      `0x100000424` und `0x100000426` — Generation **1**, Slots 1060 und 1062. Der `scale`-Test
+      erzeugt 1024 Threads gleichzeitig und baut sie ab; Generation 1 heißt, der Slot ist schon
+      einmal recycelt worden.
+
+      **Hypothese (nicht belegt):** der Zustand, den der D0-Umbau neu eingeführt hat — ein Thread,
+      der existiert, aber noch nicht zugelassen ist — trifft auf den Reap-/Wiederverwendungspfad.
+      Ein geparkter Thread ist in keiner Ready-Queue; `kill`/`record_zombie`/`alloc_tcb` haben
+      diesen Fall bis zum 2026-08-07 nicht gekannt. Ein Slot, der recycelt wird, während noch
+      jemand auf ihn zeigt, ergäbe genau ein `sp`/`entry` von 0.
+
+      Dieselbe Klasse hat sich einen Tag vorher schon einmal gezeigt: Audit-Code 7 kannte das
+      Parken nicht. **Ein Umbau, der einen neuen Zustand einführt, muss jede Stelle mitnehmen, die
+      über Zustände urteilt oder sie aufräumt** — und `reap`/`kill` räumen auf.
+
+- [ ] **Was als Nächstes zu tun ist, in dieser Reihenfolge:**
+      1. **Eine Reihe, die eine Rate ergibt.** Bei ~0,3 % braucht eine belastbare Aussage
+         Größenordnung 2000+ Läufe (erwartete Trefferzahl ≥ 6). `ARCH=arm ARBEITER_FEST=6
+         tools/d0-messen.sh 2000`.
+      2. **Dieselbe Reihe auf dem Stand VOR dem D0-Umbau** (eigener Worktree, `2ef9ddb`). Erst
+         das trennt „durch den Umbau entstanden" von „war immer da und ist nie aufgefallen".
+         Vorher rechnen, ob die Reihe bei der erwarteten Effektgröße überhaupt trennen kann —
+         der aarch64-Bisect vom 2026-08-04 konnte es nicht (`p ≈ 1`), und das stand hinterher fest
+         statt vorher.
+      3. **Einen Melder in den Reap-Pfad**, der die *Gelegenheit* zählt statt des Treffers: wird
+         ein Slot recycelt, dessen `Parked` nie zugelassen wurde? Bei 0,3 % ist ein Melder, der
+         nur beim Unglück spricht, in 333 von 334 Läufen stumm.
+
+
 **Klasse:** Beleglücke · **Aufwand:** eine Messung, ein Verus-Modell
 
 - [ ] **Die Abnahmemessung ist nicht mit der Fundmessung vergleichbar.** Zwischen beiden wurde der

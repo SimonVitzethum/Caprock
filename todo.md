@@ -235,7 +235,110 @@ Reihenfolge ist hier keine Geschmacksfrage — jede Stufe ist Vorbedingung der n
       (`precondition_bits`), aber niemand wertet sie aus — sie zu tragen und nicht zu prüfen ist
       der halbe Weg, und der halbe Weg sieht von aussen aus wie der ganze.
 
-### Z5. Tickless für Rechenkerne
+#### Z12. Wire-Formate deklarativ beschreiben und erzeugen (Vorschlag Simon, 2026-08-07)
+**Klasse:** Werkzeug/Userspace · **Aufwand:** klein für den ersten Schnitt, wächst mit dem Umfang
+
+**Die Idee:** fremde Protokolle (Ethernet, später IPv4/UDP, EDID/Display) stehen als
+Beschreibungsdatei im Repo und werden zu Rust übersetzt. Ein neues oder altes Format kostet dann
+eine Datei statt eines Parsers.
+
+**Das passt zur Kerngrenze, und zwar genau.** Erzeugte Parser sind reine Funktionen über
+Byte-Slices — keine Caps, keine Syscalls, keine Allokation. Sie gehören dorthin, wo `sel4lake-part`
+(502 Zeilen, 0 Abhängigkeiten, `forbid(unsafe_code)`) und `sel4lake-fat` (703 Zeilen, ebenso)
+schon stehen: **Userspace**. Der Generator ist ein **Bauzeit-Werkzeug** auf dem Host; im Kern
+ändert sich nichts.
+
+**Wo der Ertrag wirklich liegt.** Nicht in der Bequemlichkeit, sondern in den zwei Fehlern, die
+handgeschriebene Parser tatsächlich machen: **Endianness** und **Bereichsprüfung**. Ein Generator
+macht beide gleichförmig, und mit `forbid(unsafe_code)` plus stets längengeprüften Zugriffen ist
+das ein Sicherheitsgewinn, kein Komfortgewinn.
+
+**Der Umfang entscheidet über den Nutzen — und er ist ungleich verteilt:**
+
+| Format | Anteil, der LAYOUT ist | Eignung |
+|---|---|---|
+| Ethernet II / 802.3 / VLAN, ARP | fast alles | **sehr gut** |
+| IPv4/UDP-Köpfe | groß (Optionen sind der Rest) | gut |
+| EDID (128-Byte-Blöcke) | fast alles | gut |
+| TCP | der Kopf ist ein Bruchteil | schlecht — der Zustandsautomat ist die Arbeit |
+| Display/Grafik allgemein | wenig (Register, Timings, Framebuffer) | schlecht — kein Wire-Format |
+
+**„Nur die Protokolldatei ändern, nichts am Code" gilt fürs LESEN und SCHREIBEN, nicht fürs
+VERHALTEN.** Eine Tabelle erzeugt den Kopf; sie erzeugt keine ARP-Auflösung, kein DHCP, keine
+Neuübertragung, kein Mode-Setting. Bei Ethernet/ARP ist das Verhältnis günstig (der Rahmen *ist*
+fast die ganze Arbeit), bei TCP nicht. Das sollte den Geltungsbereich bestimmen, nicht die
+Begeisterung.
+
+**Die Falle, und sie ist die bekannte:** kommen Sender und Parser aus **derselben** Beschreibung,
+macht eine falsche Beschreibung beide **gemeinsam falsch** — und jede Prüfzeile bleibt grün.
+Wörtlich die Form von D8/D9/D11 („die Suite hat den Fehler nie ausgelöst") und von `send_no_loss`
+(„der Beweis war richtig, der Code war falsch"). Das Gegenmittel gibt es hier schon:
+`tools/checkfat.py` liest das Abbild in einer **anderen Sprache**, mit noch einmal
+hingeschriebenem Muster. Für Rahmen heisst das: ein **Golden-Hexdump aus einem echten Mitschnitt**,
+von Hand geprüft und **nicht** aus der Beschreibung erzeugt.
+
+**Zum Format: YAML ist die teuerste der möglichen Wahlen.** `serde_yaml` ist seit März 2024
+archiviert, die Nachfolge zersplittert (`serde_yaml2`, `serde_yml`, `yaml-serde`) ohne
+offensichtlichen Gewinner. Dazu braucht eine Layout-Beschreibung mehr als eine flache Tabelle
+(variable Längen, TLVs, bedingte Felder) — und genau dort wachsen deklarative Formate entweder zu
+einer Programmiersprache heran oder reichen nicht. Zwei ehrliche Wege:
+* **Kaitai Struct** — reifer DSL mit Compiler, erzeugt bereits Rust, und es gibt fertige
+  `.ksy`-Dateien für Ethernet/IPv4/EDID. Preis: ein Java-Compiler im Bauweg und erzeugter Code,
+  dessen Form (Allokation, `no_std`) man nicht bestimmt. **Einen Versuch wert, bevor entschieden
+  wird** — geerbte Beschreibungen sind eine echte Ersparnis.
+* **Eine winzige eigene Beschreibung** (TOML oder zeilenbasiert), Parser abhängigkeitsfrei in
+  `tools/`. Passt zum Stil des Hauses und lässt die Form des Erzeugnisses in eigener Hand.
+
+**Vorschlag für den ersten Schnitt — an vorhandenem Code, nicht auf der grünen Wiese:**
+1. **Ethernet II + ARP** beschreiben. Beides steht heute handgeschrieben in
+   `crates/sel4lake-virtio/src/net.rs` (`ETHERTYPE_ARP`, `ARP_REQUEST/REPLY`, 42-Byte-Rahmen von
+   Hand gebaut) — es gibt also ein Vorher und ein Nachher zu vergleichen.
+2. Erzeugnis als **abhängigkeitsfreie, `forbid(unsafe_code)`** Crate, **ins Repo eingecheckt**:
+   der Bau läuft ohne Generator, und der Diff ist lesbar.
+3. **Wächter nach dem Muster von `tools/identitaet.sh`:** das eingecheckte Erzeugnis muss
+   byte-gleich zu dem sein, was der Generator jetzt erzeugt — mit Selbsttest, der belegt, dass er
+   fehlschlagen kann.
+4. **Unabhängiger Zeuge:** Golden-Hexdump je Rahmen. Dazu trägt der vorhandene
+   ARP-Hin-und-Rückweg (`virtio-net`, A-5.2) die Verhaltensaussage — er belegt Senden *und*
+   Empfangen inhaltlich.
+5. Erst danach über IPv4/UDP und EDID entscheiden.
+
+**Abnahmebedingung:** der handgeschriebene Rahmenbau in `net.rs` verschwindet, und die
+ARP-Prüfzeile bleibt grün — gleiches Verhalten, eine Quelle.
+
+**Was es NICHT löst:** Z10 (kein Netzstack). Der Generator ist die kleinere Hälfte; wer ihn für
+den Stack hält, verwechselt den Kopf mit dem Protokoll.
+
+**Nebenbefund bei der Untersuchung, eigener Punkt:** dasselbe Problem existiert bereits, aber bei
+**unseren eigenen** Dienstprotokollen — s. Z13.
+
+### Z13. Das Blockdienst-Protokoll steht DREIMAL (gemessen 2026-08-07)
+**Klasse:** Drift · **Aufwand:** klein
+
+Bei der Untersuchung zu Z12 gemessen:
+
+| Kopie | Opcodes | Statuscodes |
+|---|---|---|
+| `programs/hardware/virtio-blk` (Server) | 6 | 5 |
+| `programs/trusted/fs` (Client) | 5 | 1 |
+| `kernel/src/arch/x86_64/bringup.rs` (Client) | 7 | 0 |
+
+Drei Herkünfte für **eine** Aussage, gehalten allein von Disziplin — und sie **weichen bereits
+ab**: `OP_STOP` kennt nur der Server, die Statuscodes kennen die Clients fast gar nicht (`fs`
+prüft nur gegen `ST_OK`, der Kernel gegen keinen). Das ist heute kein Fehler, weil die Zahlen
+übereinstimmen; nichts erzwingt es.
+
+Dasselbe beim **Layout der Übertragungsfläche**: `OFF_ERGEBNIS = 4096` (fs), `OFF_SERVED = 0x600`
+(Server), `OFF_DATA` aus `sel4lake_virtio::blk` — das Dienstprotokoll leiht sich sein Layout aus
+der Treiber-Crate.
+
+**Das ist der billigere und näherliegende Schnitt als Z12**, weil es unser eigenes Format ist:
+eine Quelle, drei Erzeugnisse, und der vorhandene `iface_version`-Gate aus A-4.4 könnte seine
+Version **aus dem Hash der Beschreibung** beziehen — dann kann sich das Drahtformat nicht ändern,
+ohne dass ein Hot-Reload abgewiesen wird. Kein neuer Mechanismus, nur eine Kopplung, die heute
+fehlt.
+
+## Z5. Tickless für Rechenkerne
 **Klasse:** Scheduler/Timer · **Aufwand:** mittel
 
 - [ ] Der 100-Hz-Tick läuft auf **jedem** Kern. Für einen Kern, auf dem genau ein rechenbereiter

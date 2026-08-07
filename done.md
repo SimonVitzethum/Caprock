@@ -254,22 +254,107 @@ auf ein Modellfeld abzubilden, das etwas anderes heißt, wäre schlimmer, als es
 führen — der Beweis zeigte dann eine Aussage über `in_ready`, und man **läse** sie als Aussage
 über `admitted`.
 
-### 6. Die Abnahme: 0 von 50 000
+### 6. Die Abnahme — und was sie NICHT sagt
 
-| | vorher (2026-08-07, 09:xx) | nachher (2026-08-07, 16:35–18:35) |
+| | vorher | nachher |
 |---|---|---|
 | Läufe | 50 000 | 50 000 |
 | D0-Treffer | **9** | **0** |
-| Rate | 0,0180 % | — |
 
-* `P(0 Treffer | unveränderte Rate)` = `e⁻⁹` ≈ **1,2·10⁻⁴**
-* Alle 9 Treffer in der ersten Reihe, keiner in der zweiten: `0,5⁹` ≈ **0,002** (einseitig)
-* Obere 95-%-Schranke der neuen Rate (Dreierregel): **0,006 %**, also höchstens einer je 16 666 —
-  mindestens ein Faktor 3 unter der alten Rate, und mit Null verträglich.
+**Was gedeckt ist:** Ursache identifiziert, 5 von 5 Treffern zeichengleich (`ERR_NOPD`, null
+bediente Anfragen), strukturell umgebaut, 50 000 Läufe ohne Treffer.
 
-Beide Reihen liefen mit **demselben Messaufbau**, und der hat den Fehler nachweislich gesehen:
-9-mal in Reihe 1, 5-mal in einer Zwischenreihe über 6895 Läufe. Eine Nullmessung ist nur so viel
-wert wie der Beleg, dass der Aufbau überhaupt sprechen kann.
+**Was NICHT gedeckt ist, und das gehört danebengeschrieben:**
+
+1. **Die Bedingungen der beiden Reihen sind nicht dieselben.** Zwischen ihnen wurde der
+   Speicherregler berichtigt — vorher maß er den RSS der Subshell statt QEMUs Prozessbaum, fiel
+   unter die Untergrenze und rechnete mit 192 statt 361 MiB je Lauf. Bei einem **Startrennen** ist
+   die Parallelität genau die Größe, die die Trefferrate erzeugt. `P(0 | unveränderte Rate) ≈
+   1,2·10⁻⁴` rechnet damit gegen die Rate der *alten* Bedingungen und misst unter *neuen*: die
+   Zahl steht für „behoben **oder** weniger Druck", und die beiden sind nicht getrennt.
+2. **Schlimmer: die Bedingung der Fundmessung ist nicht mehr feststellbar.** Ihr Protokoll ist in
+   der Mitte abgeschnitten; die Zeile „Regler steht bei N Arbeitern" fehlt. Ich kann nicht sagen,
+   unter welcher Parallelität die 9 Treffer entstanden sind. Deshalb nimmt `tools/d0-messen.sh`
+   jetzt `ARBEITER_FEST=N` und **nennt die Bedingung in der Bilanz** — eine Messbedingung, die
+   nicht im Ergebnis steht, ist beim nächsten Vergleich verloren.
+3. **Die x86-Reihe prüft den Umbau fast nicht.** `pdbind` zählt auf x86 **3** Bindungen, auf
+   aarch64 **70** — `kernel/src/threads/mod.rs` ist `#[cfg(target_arch = "aarch64")]`. 50 000
+   x86-Läufe decken also drei Zulassungsstellen ab und lassen siebzig am unbeobachteten Ende.
+   Der Messstand fährt seit 2026-08-07 deshalb auch `ARCH=arm`.
+
+Was die Nullmessung trotzdem wert macht: derselbe Aufbau hat den Fehler nachweislich **gesehen** —
+9-mal in Reihe 1, 5-mal in einer Zwischenreihe über 6895 Läufe. Eine Nullmessung ohne diesen Beleg
+wäre gar nichts.
+
+### 6a. Der aarch64-Hänger: gemessen, nicht zugeordnet
+
+Beim Umbau meldete ich „die aarch64-Suite hängt jetzt: irgendein Thread wird geparkt und nie
+zugelassen", fand danach 6 von 6 grün und ordnete es dem bekannten Sporadikum zu. **Das war eine
+Entlastung durch Erinnerung** — bei einer Rate um 5 % liefert 6/6 grün nichts (die eigene Rechnung
+aus D12: 71 % Chance auf null Treffer bei identischer Rate), und die Zuordnung zu einem bekannten
+Sporadikum ist genau die Struktur von „trat auch vorher auf".
+
+Nachgeholt als Messung, 32 Läufe bei 16-facher Parallelität, **9 Abweichungen**:
+
+* **9 von 9: `bringup : offen: color`** — dieselbe Aussage, jedes Mal.
+* Die Farbzeilen sind **byte-identisch zur Referenz** (`color : ALL PASS`, `stripe : ALL PASS`,
+  `pprobe : SKIP`). Es fällt also nichts durch.
+* Der Watchdog feuert **zwischen** dem Druck der Farbsuite (Zeile 102) und dem `COLOR_DONE`-Store
+  (Zeile 104). Die Frist sind 6000 **Ticks** — Wanduhrzeit — und die Farbsuite ist auf `cross`,
+  `strand` und `loadstop` gegatet, läuft also als letzte. Unter Überbuchung laufen Ticks weiter,
+  die Gastausführung nicht.
+
+Also **D13, nicht D0 und nicht D6** — und kein geparkter Thread. Die Frage war überhaupt erst
+beantwortbar, weil der aarch64-Watchdog seit 2026-08-07 **nennt**, was offen war: bis dahin
+versprach die Kopfzeile „offene Tests:" und druckte den vollen Bericht, in dem eine nie gesetzte
+Aussage von einer bestandenen nicht zu unterscheiden ist. x86 nennt sie seit jeher, und genau
+diese Zeile hat D0 eingegrenzt.
+
+### 6b. Was der Zähler NICHT sehen kann — und der Typ, der es schließt
+
+`spaet == 0` zählt **späte Bindungen**, nicht **ausbleibende Zulassungen**. Eine 62. Aufrufstelle,
+die `spawn_parked` ruft und `admit` vergisst, ist daran nicht zu sehen. Und die vier Stellen mit
+Autorität *nach* der Zulassung fand ein Gegenlesen — Auffindbarkeit, nicht Unmöglichkeit.
+
+Seit 2026-08-07 gibt `spawn_*_parked` deshalb ein **`Parked`** zurück: `#[must_use]`, kein
+`Drop`-Impl (sonst ließe sich das Feld in `admit` nicht herausbewegen), kein öffentlicher Weg an
+die `ThreadId`. Wer sie braucht, ruft `admit`, und das verbraucht den Zeugen. Alles, was vorher
+geschehen muss — PD binden, Caps setzen, Seiten mappen — läuft über `&Parked`.
+
+**Der Typ hat sofort eine fünfte Stelle gefunden, die das Gegenlesen übersehen hatte:**
+`map_region_into_thread` an drei Geräte-Backends (RTC, IRQ, DMA) lief **nach** der Zulassung. Mein
+Scan suchte nach `map_into_thread` und `install_pd_cap`; diese Variante kam darin nicht vor. Der
+Kommentar an einer der Stellen sagt selbst, was dann passiert: *„ohne dieses Mapping faultet das
+Backend beim RTC-Read"*.
+
+**Und die naheliegende Umstellung nahm den Fehler mit:** das mechanische Rebinding machte `b`
+wieder zu einer `ThreadId`, also übersetzte `map_region_into_thread` weiter — das Rennen blieb.
+Erst von Hand ist daraus binden → mappen → zulassen geworden.
+
+Bewacht wird der Zeuge von `tools/zulassung.sh` (kein öffentliches Feld, kein `Copy`, kein
+öffentlicher Ausgang, `admit` nimmt per Wert), mit Selbsttest in beide Richtungen — 7 von 7. Dort
+liegt auch der **Ankertest** für `ERLAUBTE_SPAETBINDUNGEN`: Menge statt Zahl, und jeder Name muss
+eine echte Variante bezeichnen, in beide Richtungen.
+
+### 6c. Die Gegenprobe fand, dass der Wächter nichts gattert
+
+`pdbind` stand im Bericht — und in keiner Abschlussbedingung. Eine Mutation, die `spawn_in_pd`
+zuerst zulassen und dann binden ließ, ergab `pdbind : FAILURES`, **und die Suite meldete
+`== ALL PASS ==`**.
+
+Die Ursache war größer als die Zeile: x86s `all_done()` baute eine Liste **für den Bericht** und
+gab eine **getrennte `&&`-Kette** zurück. Zwei Wirklichkeiten aus derselben Hand — die Kette hatte
+21 Glieder, die Liste 24; `pdcolor`, `ladepol` und `pdbind` standen im Bericht und gatterten
+nichts. Seit 2026-08-07 ist die Liste **das Urteil** (`flags.iter().all(..)`), auf beiden
+Architekturen. Danach zeigt die Mutation `bringup : offen waren: pdbind` → `== FAILURES ==`.
+
+### 6d. Was Verus dazu NICHT sagt
+
+Das IPC-Modell kennt den Begriff „Thread ohne PD" **nicht** — null Vorkommen von PD-Bindung oder
+`ERR_NOPD` in `Verification/ipc/proofs/`. „16 Beweisdateien, 0 errors" heißt hier also nur, dass
+die vorhandenen Beweise weiter halten; über die neue Eigenschaft sagt es **nichts**. Eine
+Invariante, die `RECV` an eine gebundene PD knüpft, gibt es nicht, und bloße Repräsentierbarkeit
+des Zustands wäre auch keine. Das steht als offener Punkt in `todo.md`.
 
 ### 7. Die vier Abweichungen, die übrig blieben — und warum sie kein Kernelbefund sind
 

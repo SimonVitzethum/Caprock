@@ -33,9 +33,19 @@ Zweig `arch/x86_64` (2026-08-03).
 | Verus | **16 Beweisdateien, 0 errors** — dazu **drei** Modell-Treue-Waechter (cap_space, IPC, Scheduler) mit 28 · 28 · 30 Selbsttestfaellen (2026-08-03) |
 | Scheduler-Messung | `tools/sched-erschoepfung-messen.sh`: 208 Messwerte, Positivkontrolle bestanden, vier Fassungen (echt/V0/H-a/H-b) — belegt D8, D9 und D10 |
 
-**D0 ist am 2026-08-07 gefangen UND behoben worden.** Abnahme: **0 Treffer in 50 000 Läufen**
-gegen 9 in 50 000 davor, gleicher Messstand. `P(0 | unveränderte Rate) = e⁻⁹ ≈ 1,2·10⁻⁴`; dass alle
-9 in die erste Reihe fallen, hat `0,5⁹ ≈ 0,002`. Obere 95-%-Schranke der neuen Rate: 0,006 %.
+**D0 ist am 2026-08-07 gefangen und behoben worden — die Abnahme steht unter Vorbehalt.**
+0 Treffer in 50 000 Läufen gegen 9 in 50 000 davor. **Aber:** zwischen beiden Reihen wurde der
+Speicherregler berichtigt, die Parallelität war also eine andere, und bei einem Startrennen ist
+genau die Last die Größe, die die Rate erzeugt. `P(0 | unverändert) ≈ 1,2·10⁻⁴` steht damit für
+„behoben ODER weniger Druck" — die beiden sind nicht getrennt. Schlimmer: die Bedingung der
+Fundmessung ist aus ihrem (in der Mitte abgeschnittenen) Protokoll **nicht mehr feststellbar**.
+Seither nimmt `tools/d0-messen.sh` eine feste Arbeiterzahl und **nennt die Bedingung in der
+Bilanz**.
+
+Dazu: `pdbind` zählt auf x86 **3** Bindungen, auf aarch64 **70** — 50 000 x86-Läufe decken drei
+Zulassungsstellen ab und lassen siebzig am unbeobachteten Ende. Der Messstand fährt deshalb jetzt
+auch `ARCH=arm`. Details und die aarch64-Klassifikation in `done.md`.
+
 Die Ursache und der Umbau stehen in `done.md`; hier bleibt, wie der Fehler aussah:
 
 **Der Fund selbst — mit 50 000 Läufen.** 9 Abweichungen, alle neun
@@ -217,6 +227,26 @@ falsch.
 * **Der Modell-Treue-Waechter hat die Aenderung von selbst beanstandet** — und dabei einen
   veralteten Registereintrag gefunden, den sonst niemand bemerkt haette (`spawn` stand als
   zustandsschreibend, schreibt aber nichts mehr).
+* **Die Luecke, die der Zaehler NICHT sieht — und der Typ, der sie schliesst.** `spaet == 0` zaehlt
+  SPAETE BINDUNGEN, nicht AUSBLEIBENDE ZULASSUNGEN. Seit 2026-08-07 gibt `spawn_*_parked` ein
+  **`Parked`** zurueck: `#[must_use]`, kein `Drop` (sonst liesse sich das Feld in `admit` nicht
+  herausbewegen), **kein oeffentlicher Weg an die `ThreadId`**. Der Typ fand sofort eine fuenfte
+  Stelle mit Autoritaet nach der Zulassung, die das Gegenlesen uebersehen hatte
+  (`map_region_into_thread` an drei Geraete-Backends) -- und die naheliegende mechanische
+  Umstellung nahm den Fehler mit. Bewacht von `tools/zulassung.sh` (7 von 7 im Selbsttest), dort
+  auch der Ankertest fuer `ERLAUBTE_SPAETBINDUNGEN`.
+* **Die Gegenprobe fand, dass der Waechter nichts gatterte.** Eine Mutation ergab
+  `pdbind : FAILURES` -- und die Suite meldete `== ALL PASS ==`. x86s `all_done()` baute eine Liste
+  fuer den BERICHT und gab eine getrennte `&&`-Kette zurueck: 21 Glieder gegen 24 Eintraege,
+  `pdcolor`/`ladepol`/`pdbind` gatterten nichts. Jetzt ist die Liste das Urteil, auf beiden Zweigen.
+* **Der aarch64-Watchdog nennt jetzt, was offen war.** Bis dahin versprach die Kopfzeile „offene
+  Tests:" und druckte den vollen Bericht -- darin ist eine nie gesetzte Aussage von einer
+  bestandenen nicht zu unterscheiden. Damit war mein eigener aarch64-Haenger unklassifizierbar.
+  Nachgemessen: **9 von 9 Abweichungen `offen: color`**, Farbzeilen byte-identisch zur Referenz,
+  Watchdog feuert zwischen Druck und `COLOR_DONE`-Store -- **D13**, kein geparkter Thread.
+* **Was Verus dazu NICHT sagt:** das IPC-Modell kennt „Thread ohne PD" nicht (null Vorkommen von
+  PD-Bindung oder `ERR_NOPD`). „16 Dateien, 0 errors" heisst hier nur, dass die vorhandenen
+  Beweise weiter halten -- ueber die neue Eigenschaft sagt es nichts.
 * **Die Speichermessung des D0-Reglers mass die falsche PID** (die Subshell statt QEMUs
   Prozessbaum). Der Wert fiel unter die Untergrenze, und die griff **still**: im Protokoll stand
   „je Lauf rund 192 MiB" — exakt `128 * 3/2`, also die Untergrenze und kein Messwert. Jetzt ueber

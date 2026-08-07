@@ -1932,7 +1932,7 @@ pub fn spawn_balanced(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
 /// Wie [`spawn`], aber auf einem **bestimmten** Kern `core` (z. B. vom Bootkern aus,
 /// um Arbeit über die Kerne zu verteilen). Der Zielkern muss vorab via
 /// [`bind_cores`] gebunden sein. Lock-Ordnung RES vor SCHEDS[core].
-pub fn spawn_on_core_parked(core: usize, entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
+pub fn spawn_on_core_parked(core: usize, entry: usize, arg: usize, prio: u8) -> Option<Parked> {
     let (base, len) = {
         let stack = mem_alloc_anywhere(STACK_SIZE, 16)?;
         (stack.base() as usize, stack.len() as usize)
@@ -1940,7 +1940,7 @@ pub fn spawn_on_core_parked(core: usize, entry: usize, arg: usize, prio: u8) -> 
     let mut sched = SCHEDS[core].lock();
     let tid = sched.spawn_parked(core, entry, arg, base, len, prio)?;
     fp_reset_slot(tid.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
-    Some(tid)
+    Some(Parked(tid))
 }
 
 /// **Einen Thread erzeugen, der seine PD schon hat, bevor er das erste Mal laufen darf** (D0).
@@ -1993,7 +1993,7 @@ pub fn spawn_in_pd(pd: usize, entry: usize, arg: usize, prio: u8) -> Option<Thre
 /// Einen **EL0-User-Thread** erzeugen: Kernel-Stack aus dem EL1-only Pool (per
 /// Free-List, beim Thread-Ende zurückgegeben), User-Stack aus dem EL0-zugänglichen
 /// RAM. Der Thread läuft auf EL0 und kann nur per Syscall mit dem Kernel interagieren.
-pub fn spawn_user_parked(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
+pub fn spawn_user_parked(entry: usize, arg: usize, prio: u8) -> Option<Parked> {
     let core = hal::cpu::core_id();
     let kbase = claim_user_kstack()?; // EL0-Kernel-Stack aus MEM (16 KiB, ausgerichtet)
     let (user_base, user_len) = match mem_alloc(STACK_SIZE, 16) {
@@ -2029,7 +2029,7 @@ pub fn spawn_user_parked(entry: usize, arg: usize, prio: u8) -> Option<ThreadId>
         r
     }; // SCHEDS freigegeben
     match tid {
-        Some(t) => Some(t),
+        Some(t) => Some(Parked(t)),
         None => {
             release_user_kstack(kbase);
             MEM.lock().free_region(PhysRegion::new(user_base as u64, user_len as u64));
@@ -2516,7 +2516,7 @@ fn vspace_bind_stripe(asid: u16, stripe: u32) {
 /// [`hal::mmu::ISO_USER_VA`]. Bis E-Rest 3d war beides dasselbe. Die Kernelseite braucht die PA
 /// (Farbprüfung, Rücklesen), der Thread die VA — sie auseinanderzuhalten ist der ganze Umbau.
 /// VSpace-Tabellen werden beim Thread-Ende abgebaut.
-pub fn spawn_isolated_parked(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u64)> {
+pub fn spawn_isolated_parked(entry: usize, arg: usize, prio: u8) -> Option<(Parked, u64)> {
     let core = hal::cpu::core_id();
     let kbase = claim_user_kstack()?; // EL0-Kernel-Stack aus MEM (16 KiB, ausgerichtet)
 
@@ -2574,7 +2574,7 @@ pub fn spawn_isolated_parked(entry: usize, arg: usize, prio: u8) -> Option<(Thre
         r
     };
     match tid {
-        Some(t) => Some((t, rbase)),
+        Some(t) => Some((Parked(t), rbase)),
         None => {
             vspace_teardown(asid);
             MEM.lock().free_region(PhysRegion::new(rbase, rlen));
@@ -2630,8 +2630,8 @@ pub fn spawn_isolated_colored(
     // **Zulassen nicht vergessen** (D0): `spawn_isolated_colored_inner` liefert seit dem
     // 2026-08-07 einen GEPARKTEN Thread. Diese Fassung bindet keine PD nach, also darf sie ihn
     // sofort loslassen -- aber „sofort" muss dastehen, sonst laeuft die Farbsonde nie an.
-    let (t, r, ks) = spawn_isolated_colored_inner(entry, arg, prio, mask, None)?;
-    admit(t).then_some((t, r, ks))
+    let (p, r, ks) = spawn_isolated_colored_inner(entry, arg, prio, mask, None)?;
+    admit(p).map(|t| (t, r, ks))
 }
 
 /// **Gefaerbte PD mit gefuehrter Streifenvergabe** (B-4.2) — der Weg, den B-4.1 zum Normalfall
@@ -2642,7 +2642,7 @@ pub fn spawn_isolated_colored(
 /// gar nicht erst. Es gibt bewusst keine ungefaerbte Rueckfallebene: eine Trennung, die unter
 /// Last leise verschwindet, waere schlimmer als gar keine, weil niemand mehr weiss, welche PD
 /// getrennt ist und welche nicht.
-pub fn spawn_isolated_colored_auto_parked(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u64)> {
+pub fn spawn_isolated_colored_auto_parked(entry: usize, arg: usize, prio: u8) -> Option<(Parked, u64)> {
     let (i, mask) = crate::colors::claim_stripe()?;
     match spawn_isolated_colored_inner(entry, arg, prio, mask, Some(i)) {
         // Die Kernelseite interessiert nur den Selbsttest (s. `spawn_isolated_colored`).
@@ -2662,9 +2662,9 @@ fn spawn_isolated_colored_inner(
     prio: u8,
     mask: sel4lake_mem::ColorMask,
     stripe: Option<u32>,
-) -> Option<(ThreadId, u64, (u64, u64, u64))> {
+) -> Option<(Parked, u64, (u64, u64, u64))> {
     let core = hal::cpu::core_id();
-    let colors = crate::colors::count();
+    let _colors = crate::colors::count();
     let region_sz = crate::colors::region_bytes();
     // Region, Kernel-Stack UND Seitentabellen dieser PD kommen aus demselben Streifen.
     let kbase = claim_user_kstack_masked(Some(mask))?;
@@ -2735,7 +2735,7 @@ fn spawn_isolated_colored_inner(
         r
     };
     match tid {
-        Some(t) => Some((t, rbase, kernelseite)),
+        Some(t) => Some((Parked(t), rbase, kernelseite)),
         None => {
             vspace_teardown(asid);
             MEM.lock().free_region(PhysRegion::new(rbase, rlen));
@@ -2802,7 +2802,7 @@ pub fn destroy_pd(pd: usize) {
 /// privater EL0-RW-Stack. Der Thread startet am Anfang des Code-Frames. Beweist, dass
 /// eine isolierte PD beliebigen, nicht-geteilten Code in ihrer eigenen VSpace
 /// ausführt. Gibt die `ThreadId`.
-pub fn spawn_isolated_native_parked(code: *const u8, code_len: usize, prio: u8) -> Option<ThreadId> {
+pub fn spawn_isolated_native_parked(code: *const u8, code_len: usize, prio: u8) -> Option<Parked> {
     let core = hal::cpu::core_id();
     let kbase = claim_user_kstack()?; // EL0-Kernel-Stack aus MEM (16 KiB, ausgerichtet)
     let sz = hal::mmu::ISO_REGION_SIZE;
@@ -2900,7 +2900,7 @@ pub fn spawn_isolated_native_parked(code: *const u8, code_len: usize, prio: u8) 
             // registrieren, damit ein spaeteres destroy_isolated ihn via loaded_free freigibt
             // (sonst leckt der Code-Frame beim Abbau). Der Stack wird separat via Reap freigegeben.
             let _ = loaded_register(asid, &[(cbase, clen)]);
-            Some(t)
+            Some(Parked(t))
         }
         None => {
             vspace_teardown(asid);
@@ -6931,52 +6931,124 @@ pub fn pd_partner(pd: usize) -> Option<usize> {
 // eine Portierung -- er sieht auch die Stellen, die es morgen erst gibt. Als Verschaerfung in
 // `todo.md` D0 vermerkt.
 
-/// Einen geparkten Thread zulassen. `false`, wenn die `tid` nicht (mehr) auflösbar ist.
-#[must_use = "ein nicht zugelassener Thread laeuft nie"]
-pub fn admit(tid: ThreadId) -> bool {
-    sel4lake_sched::owner_core(tid).is_some_and(|c| SCHEDS[c].lock().admit(tid))
+/// **Ein erzeugter, aber noch nicht zugelassener Thread** (D0, verschaerft 2026-08-07).
+///
+/// # Warum ein Typ und nicht eine `ThreadId` mit Disziplin
+///
+/// Die erste Fassung der D0-Behebung trennte `spawn_parked` von `admit` und zaehlte mit einem
+/// Waechter (`pdbind`), ob eine PD zu spaet gebunden wurde. Das schliesst die Luecke **nicht**:
+///
+/// * `spaet == 0` zaehlt *spaete Bindungen*, nicht *ausbleibende Zulassungen*. Eine 62.
+///   Aufrufstelle, die `spawn_parked` ruft und `admit` vergisst, ist an dem Zaehler nicht zu sehen
+///   -- der Thread laeuft nie, und der Waechter schweigt.
+/// * Die vier Stellen, an denen Autoritaet NACH der Zulassung vergeben wurde (`page_probe`,
+///   `killer`, `producer`, `consumer`), fand ein Gegenlesen. Auffindbarkeit ist nicht
+///   Unmoeglichkeit, und der Befund selbst hatte sie nicht genannt.
+///
+/// Dieser Typ schliesst beide Klassen mit derselben Konstruktion: **es gibt keinen oeffentlichen
+/// Weg an die `ThreadId`.** Wer sie braucht, muss [`admit`] rufen, und das verbraucht den Zeugen.
+/// Alles, was VOR der Zulassung geschehen muss -- PD binden, Caps setzen, Seiten mappen -- laeuft
+/// ueber eine Funktion, die `&Parked` nimmt. Danach existiert kein Griff mehr, ueber den Autoritaet
+/// nachgereicht werden koennte.
+///
+/// **Kein `Drop`-Impl**, und das ist Absicht: mit einem `Drop` liesse sich das Feld in [`admit`]
+/// nicht mehr herausbewegen, und der Typ verlore genau die Eigenschaft, um die es geht. Der Preis
+/// ist, dass ein *fallengelassener* `Parked` kein Uebersetzungsfehler ist -- `#[must_use]` macht
+/// ihn zur Warnung, und der Thread laeuft dann nie, was laut ist. Was der Typ deckt, ist der
+/// gefaehrlichere Fall: eine `ThreadId`, die vor der Zulassung in die Welt entkommt.
+#[must_use = "ein Parked, der nicht durch `admit`/`admit_in_pd` geht, laeuft NIE -- genau die \
+              Luecke, die der pdbind-Zaehler nicht sehen kann"]
+pub struct Parked(ThreadId);
+
+impl Parked {
+    /// **Modulintern.** Es gibt bewusst kein `pub fn tid()`: der einzige Weg an die `ThreadId` ist
+    /// [`admit`], und der verbraucht den Zeugen.
+    fn tid(&self) -> ThreadId {
+        self.0
+    }
+}
+
+/// Einen geparkten Thread zulassen. Gibt seine `ThreadId` -- oder `None`, wenn sie nicht (mehr)
+/// auflösbar ist (dann ist der Thread ohnehin weg).
+pub fn admit(p: Parked) -> Option<ThreadId> {
+    let tid = p.0;
+    sel4lake_sched::owner_core(tid)
+        .and_then(|c| SCHEDS[c].lock().admit(tid).then_some(tid))
 }
 
 /// **Erst binden, dann zulassen** -- die Reihenfolge, um die es bei D0 geht.
-#[must_use = "ein nicht zugelassener Thread laeuft nie"]
-pub fn admit_in_pd(pd: usize, tid: ThreadId) -> bool {
-    bind_pd(pd, tid);
-    admit(tid)
+pub fn admit_in_pd(pd: usize, p: Parked) -> Option<ThreadId> {
+    bind_pd(pd, p.tid());
+    admit(p)
+}
+
+/// Eine PD an einen **geparkten** Thread binden, ohne ihn zuzulassen.
+///
+/// Fuer die Stellen, an denen zwischen Bindung und Zulassung noch etwas geschehen muss -- Caps in
+/// die PD setzen, Seiten mappen. Wer das nach der Zulassung taete, haette dasselbe Rennen eine
+/// Ebene tiefer: fuer den Thread sind ein leerer Cspace und ein Cspace ohne die eine gebrauchte
+/// Cap dasselbe.
+pub fn bind_pd_parked(p: &Parked, pd: usize) {
+    bind_pd(pd, p.tid());
+}
+
+/// Eine **Region** in den Adressraum eines geparkten Threads mappen (s. `map_region_into_thread`).
+///
+/// Diese Variante hat der Typ gefunden, nicht das Gegenlesen: drei Backends (RTC, IRQ, DMA)
+/// mappten ihre Geraeteseite **nach** der Zulassung. Der Kommentar an einer der Stellen sagt sogar,
+/// was dann passiert -- „ohne dieses Mapping faultet das Backend beim RTC-Read". Mein Scan suchte
+/// nach `map_into_thread` und `install_pd_cap`; `map_region_into_thread` kam darin nicht vor.
+/// Ein Audit, der nur die gefundene Form sucht, findet nur sie wieder.
+#[cfg(feature = "selftest")]
+pub fn map_region_into_parked(p: &Parked, base: u64, len: u64, kind: MappingKind) -> bool {
+    map_region_into_thread(p.tid(), base, len, kind)
+}
+
+/// Eine Seite in den Adressraum eines **geparkten** Threads mappen (s. [`map_into_thread`]).
+#[cfg(feature = "selftest")]
+pub fn map_into_parked(p: &Parked, base: u64, len: u64, perm: u8) -> bool {
+    map_into_thread(p.tid(), base, len, perm)
+}
+
+/// Die `ThreadId` eines geparkten Threads **nur zur Buchfuehrung** (Telemetrie, Ablagen).
+///
+/// Ausdruecklich nicht `pub`: ein oeffentlicher Ausgang waere die Hintertuer, gegen die der ganze
+/// Typ gebaut ist. Innerhalb von `system` ist er noetig, weil der Ladepfad die `tid` fuer
+/// `record_user_kstack`/`set_vspace_of` braucht, bevor der Thread laufen darf.
+fn parked_tid(p: &Parked) -> ThreadId {
+    p.tid()
 }
 
 pub fn spawn_on_core(core: usize, entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
-    let t = spawn_on_core_parked(core, entry, arg, prio)?;
-    admit(t).then_some(t)
+    admit(spawn_on_core_parked(core, entry, arg, prio)?)
 }
 
 /// Geparkte Fassung von [`spawn`] -- auf dem aufrufenden Kern, noch nicht lauffaehig.
-pub fn spawn_parked(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
+pub fn spawn_parked(entry: usize, arg: usize, prio: u8) -> Option<Parked> {
     spawn_on_core_parked(hal::cpu::core_id(), entry, arg, prio)
 }
 
 /// Geparkte Fassung von [`spawn_balanced`].
-pub fn spawn_balanced_parked(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
+pub fn spawn_balanced_parked(entry: usize, arg: usize, prio: u8) -> Option<Parked> {
     spawn_on_core_parked(least_loaded_core(), entry, arg, prio)
 }
 
 pub fn spawn_user(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
-    let t = spawn_user_parked(entry, arg, prio)?;
-    admit(t).then_some(t)
+    admit(spawn_user_parked(entry, arg, prio)?)
 }
 
 pub fn spawn_isolated(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u64)> {
-    let (t, r) = spawn_isolated_parked(entry, arg, prio)?;
-    admit(t).then_some((t, r))
+    let (p, r) = spawn_isolated_parked(entry, arg, prio)?;
+    admit(p).map(|t| (t, r))
 }
 
 pub fn spawn_isolated_colored_auto(entry: usize, arg: usize, prio: u8) -> Option<(ThreadId, u64)> {
-    let (t, r) = spawn_isolated_colored_auto_parked(entry, arg, prio)?;
-    admit(t).then_some((t, r))
+    let (p, r) = spawn_isolated_colored_auto_parked(entry, arg, prio)?;
+    admit(p).map(|t| (t, r))
 }
 
 pub fn spawn_isolated_native(code: *const u8, code_len: usize, prio: u8) -> Option<ThreadId> {
-    let t = spawn_isolated_native_parked(code, code_len, prio)?;
-    admit(t).then_some(t)
+    admit(spawn_isolated_native_parked(code, code_len, prio)?)
 }
 
 /// **Die Gruende, aus denen eine PD ABSICHTLICH spaet gebunden wird.**

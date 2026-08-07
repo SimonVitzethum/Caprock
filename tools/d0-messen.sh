@@ -58,7 +58,12 @@ MAX_ABWEICHUNGEN="${MAX_ABWEICHUNGEN:-2000}"
 # ("Cannot load x86-64 image, give a 32bit one") -- der erste Anlauf zeigte das im Referenzlauf,
 # und genau dafuer gibt es ihn: eine Messung, die mit einem nicht ladbaren Bild startet, haette
 # 50000 leere Protokolle erzeugt.
-ELF="build/target/x86_64-unknown-none/release/sel4lake-kernel.mb32"
+ARCH="${ARCH:-x86}"
+if [ "$ARCH" = "arm" ]; then
+    ELF="build/target/aarch64-sel4lake/release/sel4lake-kernel.elf"
+else
+    ELF="build/target/x86_64-unknown-none/release/sel4lake-kernel.mb32"
+fi
 D0="build/d0"
 rm -rf "$D0"; mkdir -p "$D0"
 
@@ -67,11 +72,17 @@ echo "== bauen =="
 # **`--features selftest`, wie die Suite.** Ohne das Feature gibt es keine Pruefinfrastruktur,
 # `all_done()` wird nie wahr, der Gast faehrt nicht herunter -- der Referenzlauf lief ins
 # Zeitlimit (rc=124, 8 Signaturzeilen statt 30). Auch das hat die Referenzpruefung gefangen.
-./build-x86.sh --features selftest >/dev/null 2>&1 || { echo "BUILD FAILED" >&2; exit 2; }
+if [ "$ARCH" = "arm" ]; then
+    # Die aarch64-Suite baut Kernel UND Boot-Archiv; ein einzelner Lauf davon stellt beides her.
+    RUNS=1 ./test-qemu.sh >/dev/null 2>&1 || true
+else
+    ./build-x86.sh --features selftest >/dev/null 2>&1 || { echo "BUILD FAILED" >&2; exit 2; }
+fi
 [ -f "$ELF" ] || { echo "FEHLER: $ELF fehlt." >&2; exit 2; }
 
 # -- Master-Abbild: EINES fuer alle, dank `snapshot=on` nur gelesen. -----------------------------
 MASTER="$D0/master.img"
+# (aarch64 fuehrt keine Platte -- der Abschnitt darunter laeuft trotzdem durch und kostet nichts.)
 # **Wortgleich zur Hauptsuite.** Zwei Suiten, die dieselbe Platte verschieden aufsetzen, waeren
 # derselbe Riss wie zwei, die dasselbe Geraet verschieden aufsetzen (CLAUDE.md) -- und hier waere
 # er schlimmer: die Referenzsignatur haenge dann an einer anderen Platte als die Vergleichslaeufe.
@@ -95,8 +106,28 @@ signatur() {
         | sort
 }
 
+# **Beide Architekturen, EIN Messstand** (2026-08-07). `ARCH=arm` faehrt die aarch64-Suite.
+#
+# Der Grund ist eine Zahl: die D0-Behebung stellte 61 Aufrufstellen um, und `pdbind` zaehlt auf
+# x86 **3** Bindungen, auf aarch64 **70** -- `kernel/src/threads/mod.rs` ist
+# `#[cfg(target_arch = "aarch64")]`. Eine 50 000-Lauf-Messung auf x86 deckt also drei
+# Zulassungsstellen ab und laesst siebzig am unbeobachteten Ende. Wo Wandzeit knapp ist, ist eine
+# aarch64-Reihe mehr wert als weitere x86-Laeufe.
+#
+# **Zwei Suiten, die dasselbe Geraet verschieden aufsetzen, sind ein Riss** -- deshalb steht der
+# aarch64-Aufruf hier neben dem x86-Aufruf und nicht in einem zweiten Skript.
 ein_lauf() {   # ein_lauf <logdatei>
     local log="$1"
+    if [ "$ARCH" = "arm" ]; then
+        timeout --signal=KILL "$ZEITLIMIT" qemu-system-aarch64 \
+            -machine virt,iommu=smmuv3 -cpu cortex-a72 -smp 8 -m 4G \
+            -nographic -serial "file:$log" -no-reboot \
+            -net none -device pcie-root-port,id=rp0,chassis=1 \
+            -device virtio-rng-pci,bus=rp0,iommu_platform=on \
+            -device loader,file=build/boot-archive.bin,addr=0x13F000000 \
+            -kernel "$ELF" </dev/null >/dev/null 2>/dev/null
+        return $?
+    fi
     timeout "$ZEITLIMIT" qemu-system-x86_64 \
         -kernel "$ELF" -m "$RAM" -smp 4 "${ACCEL[@]}" \
         -machine q35,kernel-irqchip=split -device intel-iommu,caching-mode=on,intremap=on \
@@ -257,6 +288,20 @@ cpu_last() {
 # Sichtbar wurde es an der Bilanz: 195 statt 200 Laeufe. Fuenf Laeufe, die niemand gezaehlt hat --
 # und in einer 50000er-Messung waeren das Hunderte, die weder als normal noch als abweichend
 # erscheinen. Ein Zaehler, der still verliert, ist schlimmer als einer, der falsch zaehlt.
+# **Die Arbeiterzahl festnageln** (2026-08-07, nach einer berechtigten Ruege).
+#
+# Zwischen der Fundmessung und der Abnahmemessung wurde der Speicherregler berichtigt (er mass
+# vorher die Subshell statt QEMUs Prozessbaum). Damit lief die Fundmessung unter einer ANDEREN
+# Parallelitaet als die Abnahme -- und bei einem Startrennen ist genau die Last die Groesse, die
+# die Trefferrate erzeugt. `P(0 | unveraendert)` rechnet dann gegen die Rate der alten Bedingungen
+# und misst unter neuen; die Zahl steht fuer „behoben ODER weniger Druck", und die beiden sind
+# nicht getrennt.
+#
+# Schlimmer: die Arbeiterzahl der Fundmessung ist aus dem Protokoll gar nicht mehr feststellbar.
+# Deshalb zwei Aenderungen: `ARBEITER_FEST=N` nagelt die Zahl fest (der Regler laeuft dann nicht),
+# und die **Bilanz nennt sie immer**. Eine Messbedingung, die nicht im Ergebnis steht, ist beim
+# naechsten Vergleich verloren.
+ARBEITER_FEST="${ARBEITER_FEST:-0}"
 ARBEITER=0
 starte_arbeiter() { ARBEITER=$((ARBEITER + 1)); strom "$ARBEITER" & }
 starte_arbeiter; starte_arbeiter
@@ -275,6 +320,12 @@ bilanz_lesen() {   # setzt G_OK und G_ABW
 
 hoch=1
 letzte_meldung=0
+# Feste Vorgabe: alle Arbeiter sofort starten, Regler aus.
+if [ "$ARBEITER_FEST" -gt 0 ]; then
+    while [ "$ARBEITER" -lt "$ARBEITER_FEST" ]; do starte_arbeiter; done
+    hoch=0
+    echo "  [$(date +%H:%M:%S)] $ARBEITER Arbeiter FEST vorgegeben (Regler aus)"
+fi
 while :; do
     [ -e "$D0/STOP" ] && break
     [ "$(zahl "$(cat "$D0/vorrat" 2>/dev/null)")" -le 0 ] && break
@@ -314,6 +365,7 @@ bilanz_lesen
 gesamt_ok=$G_OK; gesamt_abw=$G_ABW
 gefahren=$((gesamt_ok + gesamt_abw))
 echo "== Bilanz =="
+echo "  Bedingung  : $ARBEITER gleichzeitige Laeufe$([ "$ARBEITER_FEST" -gt 0 ] && echo " (fest vorgegeben)" || echo " (vom Regler eingestellt)"), RAM $RAM je Gast, Zeitlimit ${ZEITLIMIT}s"
 echo "  gefahren   : $gefahren"
 echo "  normal     : $gesamt_ok"
 echo "  abweichend : $gesamt_abw"

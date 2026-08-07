@@ -1871,8 +1871,20 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
     // und `all_done()` wird gepollt -- eine druckende Messung gehoert hier so wenig hin wie ein
     // Urteil, das erst im Bericht entsteht. Beim ersten Anlauf stand der Aufruf hier und die
     // Suite lief in den Watchdog. Gemessen wird einmal, in Schritt 2 unten.
-    let pdcolor = PDCOLOR_OK.load(Ordering::Acquire);
-    let ladepol = LADEPOL_OK.load(Ordering::Acquire);
+    // **Ohne Archiv nicht anwendbar** -- dieselbe Form wie `root` darueber. Es wird dann kein
+    // Programm geladen, also gibt es weder eine gefaerbte PD noch eine abweichende Politik; ein
+    // dauerhaft falsches Konjunkt waere kein Befund, sondern eine Anforderung, die diese
+    // Konfiguration nicht belegen KANN.
+    let pdcolor = !archive || PDCOLOR_OK.load(Ordering::Acquire);
+    let ladepol = !archive || LADEPOL_OK.load(Ordering::Acquire);
+    // **In die ABSCHLUSSBEDINGUNG, nicht nur in den Bericht** (2026-08-07). Die Gegenprobe hat es
+    // gezeigt: eine Mutation, die `spawn_in_pd` zuerst zulassen und dann binden liess, ergab
+    // `pdbind : FAILURES` -- und die Suite meldete `== ALL PASS ==`. Eine Zusicherung, die nur im
+    // Bericht steht, faellt beim Brechen niemandem auf; das steht seit B-4.2 im Projekt und galt
+    // fuer diese Zeile trotzdem nicht.
+    let pdbind = system::LATE_PD_BIND.load(Ordering::Relaxed) == 0
+        && system::LATE_PD_BIND_UNKLAR.load(Ordering::Relaxed) == 0
+        && system::PD_BIND_GESAMT.load(Ordering::Relaxed) > 0;
     // A-4.2 aus demselben Grund wie B-4.2 in der Abschlussbedingung: eine Zusicherung, die nur
     // im Bericht steht, faellt beim Brechen niemandem auf.
     let quiesce = QUIESCE_OK.load(Ordering::Acquire);
@@ -1894,8 +1906,13 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
     //
     // Der Grund wird deshalb ZURUECKGEGEBEN, nicht bloss verrechnet. Kostenlos ist das nicht ganz
     // (ein `&mut` je Runde), aber die Schleife dreht ohnehin Millionen Mal ohne etwas zu tun.
-    if let Some(w) = warum {
-        *w = [
+    // **Die Liste IST das Urteil** (2026-08-07). Bis hierher baute diese Funktion eine Liste
+    // fuer den Bericht UND gab eine getrennte `&&`-Kette zurueck. Zwei Wirklichkeiten aus
+    // derselben Hand: die Kette hatte 21 Glieder, die Liste 24 -- `pdcolor`, `ladepol` und
+    // `pdbind` standen im Bericht und gatterten NICHTS. Gefunden hat das eine Gegenprobe:
+    // eine Mutation, die zuerst zulaesst und dann bindet, ergab `pdbind : FAILURES`, und die
+    // Suite meldete `== ALL PASS ==`.
+    let flags: [(&'static str, bool); DONE_FLAGS] = [
             ("workers", workers),
             ("ipc", IPC_DONE.load(Ordering::Acquire)),
             ("cores", cores),
@@ -1915,38 +1932,21 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             ("iface", iface),
             ("pdcolor", pdcolor),
             ("ladepol", ladepol),
+            ("pdbind", pdbind),
             ("quiesce", quiesce),
             ("rebind", rebind),
             ("epfull", epfull),
             ("state", state),
-        ];
+    ];
+    if let Some(w) = warum {
+        *w = flags;
     }
-    workers
-        && IPC_DONE.load(Ordering::Acquire)
-        && cores
-        && ring3
-        && iso
-        && root
-        && stripes
-        && pprobe
-        && virtio
-        && vblk
-        && vnet
-        && drv_seq
-        && ckpt_seq
-        && blkdev
-        && DMAISO_OK.load(Ordering::Acquire)
-        && part
-        && iface
-        && quiesce
-        && rebind
-        && epfull
-        && state
+    flags.iter().all(|&(_, v)| v)
 }
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 23;
+const DONE_FLAGS: usize = 24;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]

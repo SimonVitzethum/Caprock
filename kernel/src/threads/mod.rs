@@ -688,7 +688,7 @@ fn run_sysload_start() -> usize {
             hello_idx,
             system::IDLE_PRIO,
         )?;
-        let _ = system::admit_in_pd(pd, tid);
+        let tid = system::admit_in_pd(pd, tid).expect("zulassen");
         Some(ntfn)
     })();
     hal::cpu::local_irq_enable();
@@ -1702,9 +1702,9 @@ pub fn spawn_demo() {
 
     let prio = system::IDLE_PRIO; // gewöhnliche Demo-Threads: Round-Robin mit Idle
     let v1 = system::spawn_parked(server_v1 as *const () as usize, 0, prio).expect("v1 thread");
-    let _ = system::admit_in_pd(v1_pd, v1);
+    let v1 = system::admit_in_pd(v1_pd, v1).expect("zulassen");
     let client = system::spawn_parked(client as *const () as usize, 0, prio).expect("client thread");
-    let _ = system::admit_in_pd(client_pd, client);
+    let client = system::admit_in_pd(client_pd, client).expect("zulassen");
 
     for id in 0..NWORKERS {
         system::spawn(worker as *const () as usize, id, prio);
@@ -1718,7 +1718,7 @@ pub fn spawn_demo() {
     let fp_coll_pd = system::create_pd().expect("fp collector pd");
     system::install_pd_cap(fp_coll_pd, 0, fp_wait);
     let fp_coll = system::spawn_parked(fp_collector as *const () as usize, 0, prio).expect("fp collector");
-    let _ = system::admit_in_pd(fp_coll_pd, fp_coll);
+    let fp_coll = system::admit_in_pd(fp_coll_pd, fp_coll).expect("zulassen");
     let fp_entry = core::ptr::addr_of!(user_fp_entry) as usize;
     for id in 0..FP_WORKERS {
         let sig = system::cap_mint(fp_nroot, Rights::WRITE, 1 << id).expect("fp signal cap");
@@ -1726,7 +1726,7 @@ pub fn spawn_demo() {
         system::install_pd_cap(pd, 0, sig);
         let t =
             system::spawn_user_parked(fp_entry, FP_PATTERN[id] as usize, FP_PRIO).expect("fp user thread");
-        let _ = system::admit_in_pd(pd, t);
+        let t = system::admit_in_pd(pd, t).expect("zulassen");
     }
     // Prioritätstest: höhere Priorität (4) zuerst, dann 3, dann 2.
     for id in 0..NPRIO_TEST {
@@ -1742,9 +1742,9 @@ pub fn spawn_demo() {
     // sofort auf Slot 0 zu; laeuft er, bevor die Cap steht, bekommt er BADCAP und der Test misst
     // eine Verweigerung, die keine ist.
     let killer = system::spawn_parked(killer as *const () as usize, 0, prio).expect("killer");
-    system::bind_pd(killer_pd, killer);
+    system::bind_pd_parked(&killer, killer_pd);
     system::install_pd_cap(killer_pd, 0, kill_cap); // Slot 0 = Tcb-Cap; Slot 5 leer
-    let _ = system::admit(killer);
+    let killer = system::admit(killer).expect("zulassen");
 
     // Notifications: ein Objekt, zwei abgeleitete Caps (Signal mit Badge, Wait).
     let ntfn = system::create_notification().expect("ntfn");
@@ -1755,13 +1755,13 @@ pub fn spawn_demo() {
     let consumer_pd = system::create_pd().expect("consumer pd");
     // Dito fuer Producer/Consumer: binden, Cap einsetzen, DANN zulassen.
     let producer = system::spawn_parked(producer as *const () as usize, 0, prio).expect("producer");
-    system::bind_pd(producer_pd, producer);
+    system::bind_pd_parked(&producer, producer_pd);
     system::install_pd_cap(producer_pd, 0, signal_cap);
-    let _ = system::admit(producer);
+    let producer = system::admit(producer).expect("zulassen");
     let consumer = system::spawn_parked(consumer as *const () as usize, 0, prio).expect("consumer");
-    system::bind_pd(consumer_pd, consumer);
+    system::bind_pd_parked(&consumer, consumer_pd);
     system::install_pd_cap(consumer_pd, 0, wait_cap);
-    let _ = system::admit(consumer);
+    let consumer = system::admit(consumer).expect("zulassen");
 
     // Capability-Transfer: Service-Endpoint + Broker, der dem Client eine
     // svc-Send-Cap per REPLY delegiert.
@@ -1772,7 +1772,7 @@ pub fn spawn_demo() {
     let svc_pd = system::create_pd().expect("svc pd");
     system::install_pd_cap(svc_pd, 0, svc_recv);
     let svc = system::spawn_parked(svc_server as *const () as usize, 0, prio).expect("svc thread");
-    let _ = system::admit_in_pd(svc_pd, svc);
+    let svc = system::admit_in_pd(svc_pd, svc).expect("zulassen");
 
     let brk_ep = system::create_endpoint().expect("brk ep");
     let brk_root = system::install_endpoint_cap(brk_ep as u32, Rights::RWX).expect("brk cap");
@@ -1783,12 +1783,12 @@ pub fn spawn_demo() {
     system::install_pd_cap(brk_pd, 2, svc_send); // Slot 2 = die zu delegierende Cap
     *XFER_SRC_CAP.lock() = Some(svc_send); // Quelle der Grant-Ableitungen (Leak-Regression)
     let brk = system::spawn_parked(broker_server as *const () as usize, 0, prio).expect("brk thread");
-    let _ = system::admit_in_pd(brk_pd, brk);
+    let brk = system::admit_in_pd(brk_pd, brk).expect("zulassen");
 
     let xfer_pd = system::create_pd().expect("xfer pd");
     system::install_pd_cap(xfer_pd, 0, brk_send); // Slot 0 = Broker; Slot 1 wird per Grant gefüllt
     let xfer = system::spawn_parked(xfer_client as *const () as usize, 0, prio).expect("xfer thread");
-    let _ = system::admit_in_pd(xfer_pd, xfer);
+    let xfer = system::admit_in_pd(xfer_pd, xfer).expect("zulassen");
 
     // Stateful Hot-Reload: Zähler-Service, dessen Zustand in einer Memory-Region
     // liegt und den Tausch v1(+1) -> v2(+10) überlebt.
@@ -1806,9 +1806,9 @@ pub fn spawn_demo() {
     system::install_pd_cap(cs_v2_pd, EP_CAP as usize, cs_recv2);
     system::install_pd_cap(cs_client_pd, EP_CAP as usize, cs_send);
     let cs_v1 = system::spawn_parked(counter_v1 as *const () as usize, 0, prio).expect("cs v1");
-    let _ = system::admit_in_pd(cs_v1_pd, cs_v1);
+    let cs_v1 = system::admit_in_pd(cs_v1_pd, cs_v1).expect("zulassen");
     let csc = system::spawn_parked(cs_client as *const () as usize, 0, prio).expect("cs client");
-    let _ = system::admit_in_pd(cs_client_pd, csc);
+    let csc = system::admit_in_pd(cs_client_pd, csc).expect("zulassen");
     *CS_RELOAD_INFO.lock() = Some(ReloadInfo {
         ep: cs_ep,
         v1: cs_v1,
@@ -1824,17 +1824,17 @@ pub fn spawn_demo() {
     let usrv_pd = system::create_pd().expect("user server pd");
     system::install_pd_cap(usrv_pd, 0, urecv);
     let usrv = system::spawn_parked(user_server as *const () as usize, 0, prio).expect("user server");
-    let _ = system::admit_in_pd(usrv_pd, usrv);
+    let usrv = system::admit_in_pd(usrv_pd, usrv).expect("zulassen");
     let user_pd = system::create_pd().expect("user pd");
     system::install_pd_cap(user_pd, 0, usend);
     let ut = system::spawn_user_parked(user_entry as *const () as usize, 0, prio).expect("user thread");
-    let _ = system::admit_in_pd(user_pd, ut);
+    let ut = system::admit_in_pd(user_pd, ut).expect("zulassen");
 
     // EL0-Isolation: ein bösartiger EL0-Thread liest EL1-only Kernel-Speicher. Der
     // Kernel muss ihn isolieren (Thread beenden) statt anzuhalten.
     let bad_pd = system::create_pd().expect("bad user pd");
     let bad = system::spawn_user_parked(bad_user as *const () as usize, 0, prio).expect("bad user thread");
-    let _ = system::admit_in_pd(bad_pd, bad);
+    let bad = system::admit_in_pd(bad_pd, bad).expect("zulassen");
 
     // Per-Kern-paralleler Scheduler: je einen Worker auf JEDEN Sekundärkern (1..N)
     // einplanen (die Kerne booten gleich per PSCI und picken ihn auf). Sie laufen
@@ -1863,12 +1863,12 @@ pub fn spawn_demo() {
     system::install_pd_cap(xsrv_pd, 0, xrecv);
     let xsrv = system::spawn_on_core_parked(XIPC_SERVER_CORE, xipc_server as *const () as usize, 0, prio)
         .expect("xipc server");
-    let _ = system::admit_in_pd(xsrv_pd, xsrv);
+    let xsrv = system::admit_in_pd(xsrv_pd, xsrv).expect("zulassen");
     let xcli_pd = system::create_pd().expect("xipc client pd");
     system::install_pd_cap(xcli_pd, 0, xsend);
     let xcli =
         system::spawn_on_core_parked(0, xipc_client as *const () as usize, 0, prio).expect("xipc client");
-    let _ = system::admit_in_pd(xcli_pd, xcli);
+    let xcli = system::admit_in_pd(xcli_pd, xcli).expect("zulassen");
 
     // --- Weg C (Hybrid): isolierte PD vs. SAS-PD lesen dieselbe fremde Adresse X ---
     // X ist eine fremde RAM-Adresse (eigene kleine Region) mit einem Geheimwert. Die
@@ -1888,7 +1888,7 @@ pub fn spawn_demo() {
     let icoll_pd = system::create_pd().expect("iso collector pd");
     system::install_pd_cap(icoll_pd, 0, iso_wait);
     let icoll = system::spawn_parked(iso_collector as *const () as usize, 0, prio).expect("iso collector");
-    let _ = system::admit_in_pd(icoll_pd, icoll);
+    let icoll = system::admit_in_pd(icoll_pd, icoll).expect("zulassen");
 
     // Vertrauenswürdige SAS-Probe: liest X (erlaubt) und meldet Badge TRUSTED.
     let t_sig = system::cap_mint(introot, Rights::WRITE, ISO_BADGE_TRUSTED).expect("trusted sig");
@@ -1896,7 +1896,7 @@ pub fn spawn_demo() {
     system::install_pd_cap(t_pd, 0, t_sig);
     let tp = system::spawn_user_parked(trusted_probe as *const () as usize, xaddr as usize, prio)
         .expect("trusted probe");
-    let _ = system::admit_in_pd(t_pd, tp);
+    let tp = system::admit_in_pd(t_pd, tp).expect("zulassen");
 
     // Isolierte Probe (eigene VSpace): Slot 0 = Badge RAN, Slot 1 = Badge READ.
     let i_sig0 = system::cap_mint(introot, Rights::WRITE, ISO_BADGE_RAN).expect("iso sig0");
@@ -1907,7 +1907,7 @@ pub fn spawn_demo() {
     if let Some((ip, _region)) =
         system::spawn_isolated_parked(iso_probe as *const () as usize, xaddr as usize, prio)
     {
-        let _ = system::admit_in_pd(i_pd, ip);
+        let ip = system::admit_in_pd(i_pd, ip).expect("zulassen");
     }
 
     // Allgemeiner VMM: eine isolierte PD mappt/entmappt einen **4-KiB**-Frame G per
@@ -1923,7 +1923,7 @@ pub fn spawn_demo() {
     if let Some((vp, _)) =
         system::spawn_isolated_parked(vmm_probe as *const () as usize, gbase as usize, prio)
     {
-        let _ = system::admit_in_pd(vmm_pd, vp);
+        let vp = system::admit_in_pd(vmm_pd, vp).expect("zulassen");
     }
 
     // Shared-Memory-IPC: zwei isolierte PDs teilen den Frame F (in BEIDE VSpaces
@@ -1947,7 +1947,7 @@ pub fn spawn_demo() {
     if let Some((wp, _)) =
         system::spawn_isolated_parked(shm_writer as *const () as usize, fbase as usize, prio)
     {
-        let _ = system::admit_in_pd(w_pd, wp);
+        let wp = system::admit_in_pd(w_pd, wp).expect("zulassen");
     }
     // Reader-PD: Slot 0 = F-Cap (derselbe Frame!), Slot 1 = shm-WAIT, Slot 2 = SIGNAL.
     let r_f = system::cap_mint(froot, Rights::WRITE, 0).expect("r F");
@@ -1960,7 +1960,7 @@ pub fn spawn_demo() {
     if let Some((rp, _)) =
         system::spawn_isolated_parked(shm_reader as *const () as usize, fbase as usize, prio)
     {
-        let _ = system::admit_in_pd(r_pd, rp);
+        let rp = system::admit_in_pd(r_pd, rp).expect("zulassen");
     }
 
     // Natives Code-Laden: eine isolierte PD fuehrt PRIVAT geladenen Code (Kopie des
@@ -1972,7 +1972,7 @@ pub fn spawn_demo() {
     if let Some(nt) =
         system::spawn_isolated_native_parked(native_template as *const () as *const u8, 64, prio)
     {
-        let _ = system::admit_in_pd(nat_pd, nt);
+        let nt = system::admit_in_pd(nat_pd, nt).expect("zulassen");
     }
 
     // 4-KiB-Seiten: eine isolierte PD bekommt eine 12-KiB-Region feingranular gemappt
@@ -1992,11 +1992,11 @@ pub fn spawn_demo() {
         // **Binden, mappen, DANN zulassen** (D0). Ein `admit_in_pd` an dieser Stelle waere die
         // Behebung mit demselben Fehler drin: die Sonde liefe los, bevor ihre drei Seiten stehen,
         // und faultete auf P statt auf P+8KiB -- der Test misst dann etwas anderes, als er sagt.
-        system::bind_pd(p_pd, pp);
-        system::map_into_thread(pp, preg, 4096, 1); // P: RW
-        system::map_into_thread(pp, preg + 4096, 4096, 0); // P+4KiB: RO
+        system::bind_pd_parked(&pp, p_pd);
+        system::map_into_parked(&pp, preg, 4096, 1); // P: RW
+        system::map_into_parked(&pp, preg + 4096, 4096, 0); // P+4KiB: RO
                                                            // P+8KiB bleibt ungemappt (Guard).
-        let _ = system::admit(pp);
+        let pp = system::admit(pp).expect("zulassen");
     }
 
     *RELOAD_INFO.lock() = Some(ReloadInfo {
@@ -2099,7 +2099,7 @@ fn reload_swap(info: ReloadInfo, v2_entry: usize, v2_arg: usize) {
     // Atomar gegen Preemption, damit v2 nicht vor dem Bind läuft.
     hal::cpu::local_irq_disable();
     if let Some(v2) = system::spawn_parked(v2_entry, v2_arg, system::IDLE_PRIO) {
-        let _ = system::admit_in_pd(info.v2_pd, v2);
+        let v2 = system::admit_in_pd(info.v2_pd, v2).expect("zulassen");
     }
     hal::cpu::local_irq_enable();
 }
@@ -3662,7 +3662,7 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some(v) =
                         system::spawn_on_core_parked(0, stale_victim as *const () as usize, 0, 3)
                     {
-                        let _ = system::admit_in_pd(STALE_VICTIM_PD.load(Ordering::Relaxed), v);
+                        let v = system::admit_in_pd(STALE_VICTIM_PD.load(Ordering::Relaxed), v).expect("zulassen");
                         STALE_VICTIM_TID.store(v.to_raw(), Ordering::Relaxed);
                         STALE_STEP.store(1, Ordering::Release);
                     }
@@ -3685,7 +3685,7 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some(s) =
                         system::spawn_on_core_parked(0, stale_server as *const () as usize, 0, 3)
                     {
-                        let _ = system::admit_in_pd(STALE_SERVER_PD.load(Ordering::Relaxed), s);
+                        let s = system::admit_in_pd(STALE_SERVER_PD.load(Ordering::Relaxed), s).expect("zulassen");
                         STALE_STEP.store(3, Ordering::Release);
                     }
                     hal::cpu::local_irq_enable();
@@ -3696,7 +3696,7 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some(c) =
                         system::spawn_on_core_parked(0, stale_client as *const () as usize, 0, 3)
                     {
-                        let _ = system::admit_in_pd(STALE_CLIENT_PD.load(Ordering::Relaxed), c);
+                        let c = system::admit_in_pd(STALE_CLIENT_PD.load(Ordering::Relaxed), c).expect("zulassen");
                         STALE_STEP.store(4, Ordering::Release);
                     }
                     hal::cpu::local_irq_enable();
@@ -3726,7 +3726,7 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some(s) =
                         system::spawn_on_core_parked(0, rgone_server as *const () as usize, 0, 3)
                     {
-                        let _ = system::admit_in_pd(RGONE_SERVER_PD.load(Ordering::Relaxed), s);
+                        let s = system::admit_in_pd(RGONE_SERVER_PD.load(Ordering::Relaxed), s).expect("zulassen");
                         RGONE_SERVER_TID.store(s.to_raw(), Ordering::Relaxed);
                         RGONE_STEP.store(1, Ordering::Release);
                     }
@@ -3740,7 +3740,7 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some(c) =
                         system::spawn_on_core_parked(0, rgone_client as *const () as usize, 0, 3)
                     {
-                        let _ = system::admit_in_pd(RGONE_CLIENT_PD.load(Ordering::Relaxed), c);
+                        let c = system::admit_in_pd(RGONE_CLIENT_PD.load(Ordering::Relaxed), c).expect("zulassen");
                         RGONE_STEP.store(2, Ordering::Release);
                     }
                     hal::cpu::local_irq_enable();
@@ -3763,7 +3763,7 @@ pub fn demo_report_then_idle() -> ! {
                         if let Some(s) =
                             system::spawn_on_core_parked(0, rgone_server as *const () as usize, 0, 3)
                         {
-                            let _ = system::admit_in_pd(RGONE_SERVER_PD.load(Ordering::Relaxed), s);
+                            let s = system::admit_in_pd(RGONE_SERVER_PD.load(Ordering::Relaxed), s).expect("zulassen");
                             RGONE_SERVER_TID.store(s.to_raw(), Ordering::Relaxed);
                             RGONE_STEP.store(4, Ordering::Release);
                         }
@@ -3777,7 +3777,7 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some(c) =
                         system::spawn_on_core_parked(0, rgone_client2 as *const () as usize, 0, 3)
                     {
-                        let _ = system::admit_in_pd(RGONE_CLIENT_PD.load(Ordering::Relaxed), c);
+                        let c = system::admit_in_pd(RGONE_CLIENT_PD.load(Ordering::Relaxed), c).expect("zulassen");
                         RGONE_STEP.store(5, Ordering::Release);
                     }
                     hal::cpu::local_irq_enable();
@@ -3820,7 +3820,7 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some(s) =
                         system::spawn_on_core_parked(0, ddon_server as *const () as usize, 0, 3)
                     {
-                        let _ = system::admit_in_pd(DDON_SERVER_PD.load(Ordering::Relaxed), s);
+                        let s = system::admit_in_pd(DDON_SERVER_PD.load(Ordering::Relaxed), s).expect("zulassen");
                         DDON_STEP.store(1, Ordering::Release);
                     }
                     hal::cpu::local_irq_enable();
@@ -3833,7 +3833,7 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some(c) =
                         system::spawn_on_core_parked(0, ddon_client as *const () as usize, 0, 3)
                     {
-                        let _ = system::admit_in_pd(DDON_CLIENT_PD.load(Ordering::Relaxed), c);
+                        let c = system::admit_in_pd(DDON_CLIENT_PD.load(Ordering::Relaxed), c).expect("zulassen");
                         DDON_CLIENT_TID.store(c.to_raw(), Ordering::Relaxed);
                         if let Ok(sc) = system::install_sched_context_cap(
                             DDON_CBUDGET,
@@ -3873,7 +3873,7 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some(s) =
                         system::spawn_on_core_parked(0, rgone_server as *const () as usize, 0, 3)
                     {
-                        let _ = system::admit_in_pd(RCAP_SERVER_PD.load(Ordering::Relaxed), s);
+                        let s = system::admit_in_pd(RCAP_SERVER_PD.load(Ordering::Relaxed), s).expect("zulassen");
                         RCAP_STEP.store(1, Ordering::Release);
                     }
                     hal::cpu::local_irq_enable();
@@ -3884,7 +3884,7 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some(c) =
                         system::spawn_on_core_parked(0, rcap_client as *const () as usize, 0, 3)
                     {
-                        let _ = system::admit_in_pd(RCAP_CLIENT_PD.load(Ordering::Relaxed), c);
+                        let c = system::admit_in_pd(RCAP_CLIENT_PD.load(Ordering::Relaxed), c).expect("zulassen");
                         RCAP_CLIENT_TID.store(c.to_raw(), Ordering::Relaxed);
                         RCAP_STEP.store(2, Ordering::Release);
                     }
@@ -3923,7 +3923,7 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some(s) =
                         system::spawn_on_core_parked(0, rmig_server_v1 as *const () as usize, 0, 3)
                     {
-                        let _ = system::admit_in_pd(RMIG_SERVER_PD.load(Ordering::Relaxed), s);
+                        let s = system::admit_in_pd(RMIG_SERVER_PD.load(Ordering::Relaxed), s).expect("zulassen");
                         RMIG_V1_TID.store(s.to_raw(), Ordering::Relaxed);
                         RMIG_STEP.store(1, Ordering::Release);
                     }
@@ -3936,7 +3936,7 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some(c) =
                         system::spawn_on_core_parked(0, rmig_client as *const () as usize, 0, 3)
                     {
-                        let _ = system::admit_in_pd(RMIG_CLIENT_PD.load(Ordering::Relaxed), c);
+                        let c = system::admit_in_pd(RMIG_CLIENT_PD.load(Ordering::Relaxed), c).expect("zulassen");
                         RMIG_STEP.store(2, Ordering::Release);
                     }
                     hal::cpu::local_irq_enable();
@@ -3984,7 +3984,7 @@ pub fn demo_report_then_idle() -> ! {
                         if let Some(v2) =
                             system::spawn_on_core_parked(0, rmig_server_v2 as *const () as usize, 0, 3)
                         {
-                            let _ = system::admit_in_pd(RMIG_V2_PD.load(Ordering::Relaxed), v2);
+                            let v2 = system::admit_in_pd(RMIG_V2_PD.load(Ordering::Relaxed), v2).expect("zulassen");
                         }
                         hal::cpu::local_irq_enable();
                         RMIG_STEP.store(3, Ordering::Release);
@@ -4075,7 +4075,7 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some((h, _)) =
                         system::spawn_isolated_parked(churn_dummy as *const () as usize, 0, 3)
                     {
-                        let _ = system::admit_in_pd(hpd, h);
+                        let h = system::admit_in_pd(hpd, h).expect("zulassen");
                         DOMAIN_HW_TID.store(h.to_raw(), Ordering::Relaxed);
                     }
                     DOMAIN_HW_PD.store(hpd, Ordering::Relaxed);
@@ -4085,7 +4085,7 @@ pub fn demo_report_then_idle() -> ! {
                 if let Some((u, _)) =
                     system::spawn_isolated_parked(churn_dummy as *const () as usize, 0, 3)
                 {
-                    let _ = system::admit_in_pd(upd, u);
+                    let u = system::admit_in_pd(upd, u).expect("zulassen");
                     DOMAIN_USER_TID.store(u.to_raw(), Ordering::Relaxed);
                 }
                 DOMAIN_USER_PD.store(upd, Ordering::Relaxed);
@@ -4158,13 +4158,13 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some((t, _)) =
                         system::spawn_isolated_parked(pdctl_target as *const () as usize, fbase, 3)
                     {
-                        let _ = system::admit_in_pd(PDCTL_TARGET_PD.load(Ordering::Relaxed), t);
+                        let t = system::admit_in_pd(PDCTL_TARGET_PD.load(Ordering::Relaxed), t).expect("zulassen");
                         PDCTL_TARGET_TID.store(t.to_raw(), Ordering::Relaxed);
                     }
                     if let Some(c) =
                         system::spawn_on_core_parked(0, pdctl_controller as *const () as usize, 0, 3)
                     {
-                        let _ = system::admit_in_pd(PDCTL_CTRL_PD.load(Ordering::Relaxed), c);
+                        let c = system::admit_in_pd(PDCTL_CTRL_PD.load(Ordering::Relaxed), c).expect("zulassen");
                     }
                     hal::cpu::local_irq_enable();
                     PDCTL_STEP.store(2, Ordering::Release);
@@ -4232,7 +4232,7 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some((b, _)) =
                         system::spawn_isolated_parked(chan_backend as *const () as usize, 0, 3)
                     {
-                        let _ = system::admit_in_pd(CHAN_BE_PD.load(Ordering::Relaxed), b);
+                        let b = system::admit_in_pd(CHAN_BE_PD.load(Ordering::Relaxed), b).expect("zulassen");
                     }
                     CHAN_STEP.store(2, Ordering::Release);
                 }
@@ -4241,7 +4241,7 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some(c) =
                         system::spawn_on_core_parked(0, chan_client as *const () as usize, 0, 3)
                     {
-                        let _ = system::admit_in_pd(CHAN_TS_PD.load(Ordering::Relaxed), c);
+                        let c = system::admit_in_pd(CHAN_TS_PD.load(Ordering::Relaxed), c).expect("zulassen");
                     }
                     CHAN_STEP.store(3, Ordering::Release);
                 }
@@ -4307,16 +4307,22 @@ pub fn demo_report_then_idle() -> ! {
                         RTC_PHYS as usize,
                         3,
                     ) {
-                        let _ = system::admit_in_pd(RTC_BE_PD.load(Ordering::Relaxed), b);
+                        // **Binden und mappen VOR der Zulassung** (D0-Verschaerfung). Diese Stelle hat
+                        // der TYP gefunden, nicht das Gegenlesen: mein Scan suchte nach
+                        // `map_into_thread`/`install_pd_cap`, und `map_region_into_thread` kam darin
+                        // nicht vor. Der Kommentar daneben sagt selbst, was sonst passiert -- das
+                        // Backend liest die Geraeteseite, bevor sie da ist, und faultet.
+                        system::bind_pd_parked(&b, RTC_BE_PD.load(Ordering::Relaxed));
                         // RTC-Registerseite EL0-RO in die Backend-VSpace mappen (generisch).
                         // SENSITIVITAET P4 (geprueft): ohne dieses Mapping faultet das Backend
                         // beim RTC-Read (FAR=0x09010000) -> Isolation greift.
-                        system::map_region_into_thread(
-                            b,
+                        system::map_region_into_parked(
+                            &b,
                             RTC_PHYS,
                             RTC_LEN,
                             system::MappingKind::Device { ro: true },
                         );
+                        let _ = system::admit(b).expect("zulassen");
                     }
                     RTC_STEP.store(2, Ordering::Release);
                 }
@@ -4325,7 +4331,7 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some(c) =
                         system::spawn_on_core_parked(0, rtc_timeservice as *const () as usize, 0, 3)
                     {
-                        let _ = system::admit_in_pd(RTC_TS_PD.load(Ordering::Relaxed), c);
+                        let c = system::admit_in_pd(RTC_TS_PD.load(Ordering::Relaxed), c).expect("zulassen");
                     }
                     RTC_STEP.store(3, Ordering::Release);
                 }
@@ -4404,13 +4410,19 @@ pub fn demo_report_then_idle() -> ! {
                         RTC_PHYS as usize,
                         3,
                     ) {
-                        let _ = system::admit_in_pd(IRQT_BE_PD.load(Ordering::Relaxed), b);
-                        system::map_region_into_thread(
-                            b,
+                        // **Binden und mappen VOR der Zulassung** (D0-Verschaerfung). Diese Stelle hat
+                        // der TYP gefunden, nicht das Gegenlesen: mein Scan suchte nach
+                        // `map_into_thread`/`install_pd_cap`, und `map_region_into_thread` kam darin
+                        // nicht vor. Der Kommentar daneben sagt selbst, was sonst passiert -- das
+                        // Backend liest die Geraeteseite, bevor sie da ist, und faultet.
+                        system::bind_pd_parked(&b, IRQT_BE_PD.load(Ordering::Relaxed));
+                        system::map_region_into_parked(
+                            &b,
                             RTC_PHYS,
                             RTC_LEN,
                             system::MappingKind::Device { ro: false },
                         ); // RW (armieren)
+                        let _ = system::admit(b).expect("zulassen");
                     }
                     IRQT_STEP.store(2, Ordering::Release);
                 }
@@ -4419,7 +4431,7 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some(c) =
                         system::spawn_on_core_parked(0, irq_timeservice as *const () as usize, 0, 3)
                     {
-                        let _ = system::admit_in_pd(IRQT_TS_PD.load(Ordering::Relaxed), c);
+                        let c = system::admit_in_pd(IRQT_TS_PD.load(Ordering::Relaxed), c).expect("zulassen");
                     }
                     IRQT_STEP.store(3, Ordering::Release);
                 }
@@ -4489,15 +4501,21 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some((b, _)) =
                         system::spawn_isolated_parked(dma_backend as *const () as usize, phys as usize, 3)
                     {
-                        let _ = system::admit_in_pd(DMA_BE_PD.load(Ordering::Relaxed), b);
+                        // **Binden und mappen VOR der Zulassung** (D0-Verschaerfung). Diese Stelle hat
+                        // der TYP gefunden, nicht das Gegenlesen: mein Scan suchte nach
+                        // `map_into_thread`/`install_pd_cap`, und `map_region_into_thread` kam darin
+                        // nicht vor. Der Kommentar daneben sagt selbst, was sonst passiert -- das
+                        // Backend liest die Geraeteseite, bevor sie da ist, und faultet.
+                        system::bind_pd_parked(&b, DMA_BE_PD.load(Ordering::Relaxed));
                         // SENSITIVITAET D0 (geprueft): ohne dieses Mapping faultet das Backend
                         // beim DMA-Zugriff (FAR in der DMA-Region) -> Isolation greift.
-                        system::map_region_into_thread(
-                            b,
+                        system::map_region_into_parked(
+                            &b,
                             phys,
                             DMA_LEN,
                             system::MappingKind::Dma { coherent: false },
                         );
+                        let _ = system::admit(b).expect("zulassen");
                     }
                     DMA_STEP.store(2, Ordering::Release);
                 }
@@ -4506,7 +4524,7 @@ pub fn demo_report_then_idle() -> ! {
                     if let Some(c) =
                         system::spawn_on_core_parked(0, dma_timeservice as *const () as usize, 0, 3)
                     {
-                        let _ = system::admit_in_pd(DMA_TS_PD.load(Ordering::Relaxed), c);
+                        let c = system::admit_in_pd(DMA_TS_PD.load(Ordering::Relaxed), c).expect("zulassen");
                     }
                     DMA_STEP.store(3, Ordering::Release);
                 }
@@ -5015,7 +5033,7 @@ pub fn demo_report_then_idle() -> ! {
         // (Generativer Fuzzer + IPC-State-Machine-Fuzzer werden jetzt in `fuzz::drive()` gespawnt,
         // ADR 0013.)
 
-        if !reported && ALL_DONE.load(Ordering::Acquire) && all_done() {
+        if !reported && ALL_DONE.load(Ordering::Acquire) && all_done(None) {
             report();
             reported = true;
             // Soak (Burn-in #2): statt herunterzufahren in den Dauerbetrieb gehen (Endlosschleife,
@@ -5048,6 +5066,18 @@ pub fn demo_report_then_idle() -> ! {
             println!(
                 "== SELFTEST WATCHDOG: all_done() nicht erreicht nach ~60s -> offene Tests: =="
             );
+            // **Die Liste, die die Kopfzeile verspricht.** Ohne sie ist ein Haenger nicht
+            // klassifizierbar -- der volle Bericht darunter unterscheidet eine nie gesetzte
+            // Aussage nicht von einer bestandenen.
+            let mut w = [("", true); DONE_FLAGS_ARM];
+            let _ = all_done(Some(&mut w));
+            // Eine Zeile je offene Aussage: `print!` ist hier nicht importiert, und eine
+            // Sammelzeile waere ohnehin abgeschnitten, sobald mehrere offen sind.
+            for (n, v) in w {
+                if !v {
+                    println!("bringup : offen: {n}");
+                }
+            }
             report();
             println!("== SELFTEST FAILED (watchdog) -> system_off ==");
             hal::power::system_off();
@@ -5056,7 +5086,10 @@ pub fn demo_report_then_idle() -> ! {
     }
 }
 
-fn all_done() -> bool {
+/// Die Zahl der benannten Abschlussaussagen (aarch64).
+const DONE_FLAGS_ARM: usize = 57;
+
+fn all_done(warum: Option<&mut [(&'static str, bool); DONE_FLAGS_ARM]>) -> bool {
     let workers = (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD);
     let cores = (0..system::num_cores()).all(|c| hal::timer::ticks(c) > 0);
     let fp = FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0;
@@ -5169,63 +5202,83 @@ fn all_done() -> bool {
     // ext-27 T4: Cross-Service-Matrix — 3 Domaenen nebenlaeufig, kein Stoeren, Canary intakt.
     let cross = CROSS_DONE.load(Ordering::Acquire) && CROSS_OK.load(Ordering::Acquire);
     // In-Kernel-Fuzzer (ADR 0013): bei `--features kernel-fuzz` alle vier bestanden; sonst (Stub) true.
-    workers
-        && cores
-        && fp
-        && prio
-        && life
-        && notif
-        && xfer
-        && ckpt
-        && el0
-        && el0iso
-        && smp
-        && xipc
-        && reclaim
-        && balanced
-        && vspace
-        && vmm
-        && shm
-        && native
-        && pages4k
-        && churn
-        && mcs
-        && stale
-        && strand
-        && rgone
-        && ddon
-        && rcap
-        && rmig
-        && caplk
-        && domain
-        && pdctl
-        && chan
-        && rtc
-        && irq
-        && dma
-        && pcie
-        && smmu
-        && smmubind
-        && virtiorng
-        && dmagen
-        && dmawin
-        && dmatok
-        && color
-        && sasheap
-        && load
-        && sysload
-        && loadhw
-        && loadstop
-        && aggru
-        && intru
-        && aggrh
-        && intrh
-        && aggrt
-        && intrt
-        && cross
-        && migrate
-        && scale
-        && fuzz::all_passed()
+    // **Welche Aussage offen ist, muss der Watchdog NENNEN koennen** (2026-08-07).
+    //
+    // Bis hierher war das eine `&&`-Kette, und die Kopfzeile des Watchdogs versprach „offene
+    // Tests:", ohne welche zu nennen -- gedruckt wurde der volle Bericht, in dem eine noch nie
+    // gesetzte Aussage von einer bestandenen nicht zu unterscheiden ist. Ein aarch64-Haenger war
+    // damit nicht klassifizierbar: die Frage „welches Konjunkt fehlte?" hatte keine Antwort im
+    // Protokoll, und die naheliegende Ersatzantwort ist die bequeme („das bekannte Sporadikum").
+    // x86 nennt sie seit jeher (`bringup : offen waren: ipc`), und genau diese Zeile hat D0
+    // eingegrenzt.
+    // Dieselbe Bedingung wie auf x86 -- ein Waechter, den nur eine der beiden Architekturen
+    // durchsetzt, ist eine Stichprobe. (Und der Zaehler steht in `system`, gilt also fuer beide.)
+    let pdbind = system::LATE_PD_BIND.load(Ordering::Relaxed) == 0
+        && system::LATE_PD_BIND_UNKLAR.load(Ordering::Relaxed) == 0
+        && system::PD_BIND_GESAMT.load(Ordering::Relaxed) > 0;
+    let flags: [(&'static str, bool); DONE_FLAGS_ARM] = [
+        ("pdbind", pdbind),
+        ("workers", workers),
+        ("cores", cores),
+        ("fp", fp),
+        ("prio", prio),
+        ("life", life),
+        ("notif", notif),
+        ("xfer", xfer),
+        ("ckpt", ckpt),
+        ("el0", el0),
+        ("el0iso", el0iso),
+        ("smp", smp),
+        ("xipc", xipc),
+        ("reclaim", reclaim),
+        ("balanced", balanced),
+        ("vspace", vspace),
+        ("vmm", vmm),
+        ("shm", shm),
+        ("native", native),
+        ("pages4k", pages4k),
+        ("churn", churn),
+        ("mcs", mcs),
+        ("stale", stale),
+        ("strand", strand),
+        ("rgone", rgone),
+        ("ddon", ddon),
+        ("rcap", rcap),
+        ("rmig", rmig),
+        ("caplk", caplk),
+        ("domain", domain),
+        ("pdctl", pdctl),
+        ("chan", chan),
+        ("rtc", rtc),
+        ("irq", irq),
+        ("dma", dma),
+        ("pcie", pcie),
+        ("smmu", smmu),
+        ("smmubind", smmubind),
+        ("virtiorng", virtiorng),
+        ("dmagen", dmagen),
+        ("dmawin", dmawin),
+        ("dmatok", dmatok),
+        ("color", color),
+        ("sasheap", sasheap),
+        ("load", load),
+        ("sysload", sysload),
+        ("loadhw", loadhw),
+        ("loadstop", loadstop),
+        ("aggru", aggru),
+        ("intru", intru),
+        ("aggrh", aggrh),
+        ("intrh", intrh),
+        ("aggrt", aggrt),
+        ("intrt", intrt),
+        ("cross", cross),
+        ("migrate", migrate),
+        ("scale", scale),
+    ];
+    if let Some(w) = warum {
+        *w = flags;
+    }
+    flags.iter().all(|&(_, v)| v) && fuzz::all_passed()
 }
 
 /// **Derselbe Waechter auf beiden Architekturen.** Der x86-Bericht sitzt in

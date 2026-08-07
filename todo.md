@@ -875,6 +875,44 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
 
 ---
 
+## D14. Was nach der D0-Behebung offen bleibt
+**Klasse:** Beleglücke · **Aufwand:** eine Messung, ein Verus-Modell
+
+- [ ] **Die Abnahmemessung ist nicht mit der Fundmessung vergleichbar.** Zwischen beiden wurde der
+      Speicherregler berichtigt (RSS an der Subshell statt an QEMUs Prozessbaum, 192 statt
+      361 MiB je Lauf) — die Parallelität war also eine andere. Bei einem **Startrennen** ist genau
+      die Last die Größe, die die Trefferrate erzeugt: `P(0 | unverändert) ≈ 1,2·10⁻⁴` steht damit
+      für „behoben **oder** weniger Druck", und die beiden sind nicht getrennt.
+
+      **Und die Bedingung der Fundmessung ist nicht mehr feststellbar** — ihr Protokoll ist in der
+      Mitte abgeschnitten, die Zeile „Regler steht bei N Arbeitern" fehlt.
+
+      **Zu tun:** den behobenen Kernel unter *fester* Arbeiterzahl fahren, mindestens so hoch wie
+      die Fundmessung gekonnt hätte (ihr RAM-Budget erlaubte 42, CPU band bei ~16). Wird bei
+      **fest 24** nichts getroffen, ist „weniger Druck" ausgeschlossen — die Bedingung ist dann
+      monoton in der Richtung, die zählt. `ARBEITER_FEST=24 tools/d0-messen.sh 50000`.
+      Die Bilanz nennt die Bedingung seit 2026-08-07 selbst.
+
+- [ ] **Die x86-Reihe prüft den Umbau fast nicht.** `pdbind` zählt auf x86 **3** Bindungen, auf
+      aarch64 **70** (`kernel/src/threads/mod.rs` ist `#[cfg(target_arch = "aarch64")]`). 50 000
+      x86-Läufe decken drei Zulassungsstellen ab. Der Messstand fährt seit 2026-08-07 `ARCH=arm`;
+      eine Reihe in der Größenordnung 2000 ist dort mehr wert als weitere x86-Läufe.
+
+- [ ] **Verus sagt zu D0 nichts.** Das IPC-Modell kennt den Begriff „Thread ohne PD" nicht — null
+      Vorkommen von PD-Bindung oder `ERR_NOPD` in `Verification/ipc/proofs/`. „16 Dateien, 0
+      errors" heißt hier nur, dass die vorhandenen Beweise weiter halten.
+
+      Was fehlte, ist eine **Invariante**, die `RECV` an eine gebundene PD knüpft — bloße
+      Repräsentierbarkeit des Zustands beweist nichts. Das ist kein kleiner Zusatz: das Modell
+      kennt heute nur Endpoints und Warteschlangen, keine PDs; ein `pd_bound`-Prädikat einzuführen
+      heißt, den Modellzustand zu erweitern und die bestehenden Beweise darüber neu zu führen.
+
+- [ ] **Ein fallengelassener `Parked` ist kein Übersetzungsfehler.** `#[must_use]` macht ihn zur
+      Warnung; ein `let _ = spawn_parked(..)` schluckt sie. Der Typ deckt den gefährlicheren Fall
+      (eine `ThreadId`, die vor der Zulassung entkommt), nicht diesen. Ein `Drop`-Impl wäre **kein**
+      Ausweg — damit ließe sich das Feld in `admit` nicht mehr herausbewegen, und der Typ verlöre
+      genau die Eigenschaft, um die es geht.
+
 ## D13. Die Suite hat Prüfungen, die in WANDUHRZEIT messen — und der Messstand ist überbucht
 **Klasse:** Messstand · **Aufwand:** klein, aber die Abgrenzung ist die eigentliche Arbeit
 
@@ -912,6 +950,17 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
 
       **Nicht**: die Prüfung unter Last aushängen. Ein Test, der bei Last schweigt, schweigt genau
       dann, wenn er gebraucht wird.
+
+- [ ] **Auf aarch64 ist es dasselbe, und dort ist es die HÄUFIGSTE Ursache** (gemessen
+      2026-08-07): 32 Läufe bei 16-facher Parallelität, **9 Abweichungen, alle neun
+      `bringup : offen: color`**. Die Farbzeilen sind byte-identisch zur Referenz (`color`/`stripe`
+      ALL PASS, `pprobe` SKIP) — es fällt nichts durch. Der Watchdog feuert **zwischen** dem Druck
+      der Farbsuite und dem `COLOR_DONE`-Store: die Frist sind 6000 **Ticks**, und die Farbsuite
+      ist auf `cross`/`strand`/`loadstop` gegatet, läuft also als letzte.
+
+      Damit ist auch eine Zuordnung berichtigt: der aarch64-Hänger beim D0-Umbau war **nicht** D6
+      und **kein geparkter Thread**. Beantwortbar wurde die Frage erst dadurch, dass der
+      aarch64-Watchdog seit 2026-08-07 **nennt**, was offen war.
 
 - [ ] **Vorbehalt zur Zahl.** 2 `freeze`-Artefakte in 50 000 gegen 0 in den 56 895 Läufen davor ist
       **nicht** signifikant (Fisher p ≈ 0,2). Es gibt also keinen Beleg, dass die Empfindlichkeit

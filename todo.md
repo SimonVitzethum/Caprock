@@ -902,8 +902,7 @@ der Audit-Berichtigung
       (`offen: color`) und **0** ein Audit-Befund — die Code-7-Berichtigung trägt über 2000 Läufe
       (vorher 1 in 600).
 
-      Die erste Beobachtung (2 in 600) war zu klein für eine Rate; erst diese Reihe gibt eine. Das
-      Bild ist in **keinem** aarch64-Protokoll vor dem D0-Umbau aufgetaucht.
+      Die erste Beobachtung (2 in 600) war zu klein für eine Rate; erst diese Reihe gibt eine.
 
 - [ ] **Die Vorher-Reihe — und die Trennschärfe, VOR dem Start gerechnet.** Wenn D15 durch den
       Umbau entstand, ist die Vorher-Rate 0. Wie groß muss die Reihe sein, damit ein Nullbefund
@@ -922,33 +921,55 @@ der Audit-Berichtigung
       Läuft seit dem 2026-08-08 in einem Worktree auf `2ef9ddb` (Stand vor dem D0-Umbau), mit dem
       **neuen** Messstand: der ist Messinfrastruktur, nicht Prüfgegenstand.
 
-- [ ] **Die Spur, die es gibt: beide Threads liegen auf WIEDERVERWENDETEN Slots.**
+- [x] **ENTSCHIEDEN (2026-08-08): D15 ist NICHT durch den D0-Umbau entstanden — er war vorher
+      da.** Die Vorher-Reihe auf `2ef9ddb`, gleiche Bedingung, gleiche Größe:
+
+      | Stand | Läufe | D15 | Rate |
+      |---|---|---|---|
+      | **vor** dem D0-Umbau (`2ef9ddb`) | 2000 | **3** | 0,15 % |
+      | **nach** dem Umbau | 2000 | **6** | 0,30 % |
+      | gepoolt | 4000 | 9 | **0,225 %** |
+
+      `P(≥6 von 9 Treffern in einer Reihe, wenn kein Unterschied)` = **0,254** einseitig, ≈ 0,51
+      zweiseitig. **Kein Hinweis auf einen Unterschied.**
+
+      **Damit ist meine eigene Hypothese widerlegt** — „der neue Zustand *geparkt* trifft auf den
+      Reap-Pfad" kann nicht stimmen, wenn das Bild ohne diesen Zustand genauso oft auftritt.
+
+- [ ] **Und die Aussage, die dazu geführt hatte, war ein Nullbefund ohne Größe.** Ich schrieb, das
+      Bild sei „in **keinem** aarch64-Protokoll vor dem D0-Umbau aufgetaucht". Das stimmte für die
+      Protokolle, die ich hatte — eine Handvoll `RUNS=6`-Läufe. Bei 0,15 % ist die erwartete
+      Trefferzahl darin **0,02**. „Nie gesehen" war also die wahrscheinlichste Beobachtung, ganz
+      gleich ob der Fehler da war.
+
+      Genau derselbe Fehlschluss wie bei D0 am 2026-08-03 (2300 saubere Läufe → „ausgeschlossen",
+      tatsächlich 66 % Chance auf einen Nullbefund). Er ist hier ein zweites Mal passiert, in
+      derselben Sitzung, in der er als Lehre aufgeschrieben wurde — diesmal in der Form
+      **„ich habe es noch nie gesehen"**, die keine Stichprobengröße nennt und deshalb noch
+      leichter durchrutscht.
+
+- [ ] **Die Spur, die bleibt: beide Threads liegen auf WIEDERVERWENDETEN Slots.**
       `0x100000424` und `0x100000426` — Generation **1**, Slots 1060 und 1062. Der `scale`-Test
       erzeugt 1024 Threads gleichzeitig und baut sie ab; Generation 1 heißt, der Slot ist schon
-      einmal recycelt worden.
+      einmal recycelt worden. Ein Slot, der recycelt wird, während noch jemand auf ihn zeigt,
+      ergäbe genau ein `sp`/`entry` von 0.
 
-      **Hypothese (nicht belegt):** der Zustand, den der D0-Umbau neu eingeführt hat — ein Thread,
-      der existiert, aber noch nicht zugelassen ist — trifft auf den Reap-/Wiederverwendungspfad.
-      Ein geparkter Thread ist in keiner Ready-Queue; `kill`/`record_zombie`/`alloc_tcb` haben
-      diesen Fall bis zum 2026-08-07 nicht gekannt. Ein Slot, der recycelt wird, während noch
-      jemand auf ihn zeigt, ergäbe genau ein `sp`/`entry` von 0.
-
-      Dieselbe Klasse hat sich einen Tag vorher schon einmal gezeigt: Audit-Code 7 kannte das
-      Parken nicht. **Ein Umbau, der einen neuen Zustand einführt, muss jede Stelle mitnehmen, die
-      über Zustände urteilt oder sie aufräumt** — und `reap`/`kill` räumen auf.
+      Das gilt unabhängig vom D0-Umbau weiter und ist der nächste Ansatzpunkt — der Verdacht
+      richtet sich jetzt auf `reap`/`record_zombie`/`alloc_tcb` **als solche**, nicht auf ihr
+      Zusammenspiel mit dem Parken.
 
 - [ ] **Was als Nächstes zu tun ist, in dieser Reihenfolge:**
-      1. **Eine Reihe, die eine Rate ergibt.** Bei ~0,3 % braucht eine belastbare Aussage
-         Größenordnung 2000+ Läufe (erwartete Trefferzahl ≥ 6). `ARCH=arm ARBEITER_FEST=6
-         tools/d0-messen.sh 2000`.
-      2. **Dieselbe Reihe auf dem Stand VOR dem D0-Umbau** (eigener Worktree, `2ef9ddb`). Erst
-         das trennt „durch den Umbau entstanden" von „war immer da und ist nie aufgefallen".
-         Vorher rechnen, ob die Reihe bei der erwarteten Effektgröße überhaupt trennen kann —
-         der aarch64-Bisect vom 2026-08-04 konnte es nicht (`p ≈ 1`), und das stand hinterher fest
-         statt vorher.
-      3. **Einen Melder in den Reap-Pfad**, der die *Gelegenheit* zählt statt des Treffers: wird
-         ein Slot recycelt, dessen `Parked` nie zugelassen wurde? Bei 0,3 % ist ein Melder, der
-         nur beim Unglück spricht, in 333 von 334 Läufen stumm.
+      1. ~~Eine Reihe, die eine Rate ergibt~~ — erledigt: 0,225 % gepoolt über 4000 Läufe.
+      2. ~~Dieselbe Reihe auf dem Stand VOR dem Umbau~~ — erledigt, s. oben: der Umbau ist es nicht.
+      3. **Einen Melder in den Reap-Pfad**, der die *Gelegenheit* zählt statt des Treffers. Bei
+         0,225 % ist ein Melder, der nur beim Unglück spricht, in 444 von 445 Läufen stumm.
+         Zu zählen wäre: wird ein TCB-Slot recycelt, auf den noch ein Verweis zeigt (Directory,
+         Ready-Queue, `sc_donee`, Reply-Token)? Die Generation ist dafür da — ein Zugriff mit
+         veralteter Generation ist die Gelegenheit, und sie ist in jedem Lauf zählbar.
+      4. **Den Einstiegspunkt festhalten, wo er gilt.** `entry`/`sp` eines Threads beim
+         `alloc_tcb` mitschreiben und beim EL0-Fault mit `FAR=0` ausgeben — dann sagt das
+         Protokoll, ob der Thread mit `entry=0` erzeugt wurde oder unterwegs dorthin geriet.
+         Das ist der Unterschied zwischen „falsch aufgesetzt" und „überschrieben".
 
 
 **Klasse:** Beleglücke · **Aufwand:** eine Messung, ein Verus-Modell

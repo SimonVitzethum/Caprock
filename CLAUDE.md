@@ -235,15 +235,15 @@ falsch.
   (`map_region_into_thread` an drei Geraete-Backends) -- und die naheliegende mechanische
   Umstellung nahm den Fehler mit. Bewacht von `tools/zulassung.sh` (7 von 7 im Selbsttest), dort
   auch der Ankertest fuer `ERLAUBTE_SPAETBINDUNGEN`.
-* **OFFEN, und ernst: der Kernel springt nach Adresse 0** (2 von 600 aarch64-Laeufen, 2026-08-08).
-  Ein EL0-Thread faultet mit `EC=0x20 FAR=0` (Instruction Abort, PC stand auf 0), danach nimmt der
-  KERNEL `EC=0x21` mit `ELR=0`. Beide betroffenen Threads liegen auf **wiederverwendeten Slots**
-  (Generation 1, Slots 1060/1062 — der `scale`-Test erzeugt 1024 gleichzeitig).
-  In keinem aarch64-Protokoll vor dem D0-Umbau aufgetaucht; `0/600` gegen `2/600` ist aber
-  **Fisher p ≈ 0,25** — daraus folgt nichts. Zwei Ereignisse tragen keine Rate.
-  Hypothese, unbelegt: der neue Zustand „existiert, aber nicht zugelassen" trifft auf den
-  Reap-/Wiederverwendungspfad. Dieselbe Klasse wie Audit-Code 7 einen Tag zuvor. Details und der
-  Messplan in `todo.md` D15, Protokolle in `docs/befunde/d15/`.
+* **OFFEN, und ernst: der Kernel springt nach Adresse 0** — **0,225 % gepoolt ueber 4000
+  aarch64-Laeufe** (2026-08-08). Ein EL0-Thread faultet mit `EC=0x20 FAR=0` (Instruction Abort,
+  sein PC stand auf 0), danach nimmt der KERNEL `EC=0x21` mit `ELR=0`. Die betroffenen Threads
+  liegen auf **wiederverwendeten Slots** (Generation 1, im Bereich des 1024-Thread-`scale`-Tests).
+  **Nicht durch den D0-Umbau entstanden** — gemessen, nicht vermutet: 3 in 2000 Laeufen auf dem
+  Stand VOR dem Umbau gegen 6 in 2000 danach, `P(>=6 von 9 in einer Reihe) = 0,254` einseitig.
+  Damit ist auch meine Hypothese widerlegt („der neue Zustand *geparkt* trifft auf den Reap-Pfad"
+  kann nicht stimmen, wenn es das Bild ohne diesen Zustand genauso oft gibt).
+  Details in `todo.md` D15, Protokolle in `docs/befunde/d15/`.
 * **Der D0-Umbau hat eine Regression erzeugt, und der Kernel-Audit hat sie selbst gefunden.**
   Audit-Code 7 lautet „lauffaehig und in keiner Liste" -- woertlich der Zustand eines GEPARKTEN
   Threads, den es vor der Behebung nicht geben konnte. Gemessen in der aarch64-Reihe:
@@ -766,6 +766,14 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   und die Rate war 0,018 %. Es gibt keine Reihenfolge, die traegt -- `bind_pd` braucht die `tid`,
   die `spawn` erst liefert. Die Luecke laesst sich verkleinern, nicht schliessen. Seit 2026-08-07
   trennt der Scheduler deshalb `spawn_parked` von `admit`.
+* **„Ich habe das noch nie gesehen" ist ein Nullbefund ohne Groesse — und rutscht deshalb noch
+  leichter durch als eine Zahl.** Bei D15 stand „in KEINEM aarch64-Protokoll vor dem Umbau
+  aufgetaucht" als Indiz im Eintrag. Die Protokolle waren eine Handvoll `RUNS=6`-Laeufe; bei
+  0,15 % ist die erwartete Trefferzahl darin **0,02**. „Nie gesehen" war die wahrscheinlichste
+  Beobachtung, ganz gleich ob der Fehler da war. Die Messung hat es dann widerlegt (3 in 2000).
+  Derselbe Fehlschluss wie bei D0 am 2026-08-03 -- ein zweites Mal, in derselben Sitzung, in der
+  er als Lehre aufgeschrieben wurde. Eine Aussage ueber Abwesenheit braucht eine
+  Stichprobengroesse, auch wenn sie als Erinnerung daherkommt.
 * **Eine Messung, deren wahrscheinlichstes Ergebnis „nichts" ist, belegt nichts.** Die 2300
   sauberen Laeufe vom 2026-08-03 lasen sich wie ein Freispruch; bei der wahren Rate war
   `0,99982²³⁰⁰ ≈ 66 %`. Die Zahl, die zu einer Nullmessung gehoert, ist nicht die

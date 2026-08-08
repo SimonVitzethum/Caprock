@@ -897,21 +897,30 @@ der Audit-Berichtigung
       Zum Vergleich: die *absichtlichen* Isolationssonden faulten in derselben Reihe mit
       `EC=0x24 FAR=0x40000000` (Datenzugriff). `EC=0x20 FAR=0` ist ein anderes Tier.
 
-- [ ] **Was die Zahlen hergeben — und was nicht.**
+- [ ] **Die Rate: 6 in 2000 Läufen = 0,30 %** (95-%-Intervall rund [0,11 %, 0,65 %]), gemessen am
+      2026-08-08 bei fester Parallelität 6. Von 63 Abweichungen derselben Reihe sind 57 D13
+      (`offen: color`) und **0** ein Audit-Befund — die Code-7-Berichtigung trägt über 2000 Läufe
+      (vorher 1 in 600).
 
-      | Reihe | Läufe | dieses Bild |
+      Die erste Beobachtung (2 in 600) war zu klein für eine Rate; erst diese Reihe gibt eine. Das
+      Bild ist in **keinem** aarch64-Protokoll vor dem D0-Umbau aufgetaucht.
+
+- [ ] **Die Vorher-Reihe — und die Trennschärfe, VOR dem Start gerechnet.** Wenn D15 durch den
+      Umbau entstand, ist die Vorher-Rate 0. Wie groß muss die Reihe sein, damit ein Nullbefund
+      etwas heißt?
+
+      | Vorher-Reihe | `P(0 Treffer, wenn unverändert)` | `P(alle 6 in der Nachher-Reihe)` |
       |---|---|---|
-      | aarch64 vor der Audit-Berichtigung | 600 | **0** |
-      | aarch64 nach der Audit-Berichtigung | 600 | **2** |
-      | alle älteren aarch64-Protokolle | — | **0** (nie gesehen) |
+      | 600 | 0,165 | **0,207** — trägt nicht |
+      | 1000 | 0,050 | **0,088** — trägt nicht |
+      | **2000** | 0,0025 | **0,0156** — trägt |
+      | 3000 | 0,0001 | 0,0041 |
 
-      `0/600` gegen `2/600` ist **Fisher p ≈ 0,25** — daraus folgt **nicht**, dass die
-      Audit-Berichtigung es verursacht hat. Sie liest nur; ein Sprung nach 0 kann daraus nicht
-      folgen. Zwei Ereignisse tragen keine Rate, und genau dieser Fehlschluss hat in diesem
-      Projekt schon Tage gekostet.
+      Also **2000**, nicht 600. Der aarch64-Bisect vom 2026-08-04 hat genau diesen Schritt
+      ausgelassen (0/6 gegen 1/18, Fisher p ≈ 1) — und das stand hinterher fest statt vorher.
 
-      Was sich sagen lässt: das Bild ist in **keinem** aarch64-Protokoll vor dem D0-Umbau
-      aufgetaucht.
+      Läuft seit dem 2026-08-08 in einem Worktree auf `2ef9ddb` (Stand vor dem D0-Umbau), mit dem
+      **neuen** Messstand: der ist Messinfrastruktur, nicht Prüfgegenstand.
 
 - [ ] **Die Spur, die es gibt: beide Threads liegen auf WIEDERVERWENDETEN Slots.**
       `0x100000424` und `0x100000426` — Generation **1**, Slots 1060 und 1062. Der `scale`-Test
@@ -1021,6 +1030,10 @@ der Audit-Berichtigung
 
       **Nicht**: die Prüfung unter Last aushängen. Ein Test, der bei Last schweigt, schweigt genau
       dann, wenn er gebraucht wird.
+
+- [ ] **Die Rate auf aarch64: 57 in 2000 Läufen = 2,85 %** bei fester Parallelität 6 (gemessen
+      2026-08-08) — mit Abstand die häufigste Abweichung dieser Reihe, und sie ist ein Artefakt
+      des Messstands, kein Kernelbefund.
 
 - [ ] **Auf aarch64 ist es dasselbe, und dort ist es die HÄUFIGSTE Ursache** (gemessen
       2026-08-07): 32 Läufe bei 16-facher Parallelität, **9 Abweichungen, alle neun

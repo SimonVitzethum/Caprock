@@ -539,16 +539,137 @@ ohne sie startet nicht einmal ein `main(){return 0;}`.
       (Übersetzer, Kompression, Kryptografie, Datenstrukturen, Rechenlasten), aber es ist eine
       benennbare Menge und keine Allaussage.
 
-- [ ] **Reihenfolge, und sie ist erfreulich kurz.**
-      1. **A4** (`CR4.OSFXSR`) — die `fp`-Prüfzeile steht schon und wird dabei grün.
-      2. **A1** (Startstack + `auxv`) — ohne den läuft kein `_start`.
-      3. **A2** (`PT_TLS`, TLS-Basis, im Kontextwechsel geführt) — ohne den kein `errno`.
-      4. **A3** (Stackgröße ins Manifest).
-      5. **B** Speicher, Konsole, Zeit.
-      **Abnahme nach 1–4:** ein **Zig**-Programm mit `FixedBufferAllocator`, das rechnet und über
-      die Konsole ein *gerechnetes* Ergebnis meldet. Zig zuerst, weil es als einziges ohne B(1)
-      auskommt — damit trennt die Abnahme den Prozessstart von der Speicherfrage, statt beides
-      zugleich zu prüfen.
+---
+
+## Z19 — der vollständige Plan (2026-08-09)
+
+**Grundsatz, der jede Einzelentscheidung unten bestimmt:** so wenig wie möglich in den Kernel. Für
+jeden Punkt steht deshalb dabei, was der Kernel *tun muss* und was Userland selbst erledigt.
+
+### Schritt 1 — A4: `CR4.OSFXSR` (der kleinste, und die Prüfzeile steht schon)
+
+- **Wo:** `kernel/src/arch/x86_64/mod.rs:80 ff.` (Boot-Assembler des BSP, dort wird heute `CR4.PAE`
+  gesetzt) **und** im AP-Hochlauf. **Zwei Stellen.** Eine zu vergessen heißt: FP läuft auf Kern 0
+  und nirgends sonst — und das fällt erst unter Last auf, also spät und teuer.
+- **Was:** `CR4.OSFXSR` (Bit 9) schaltet FXSAVE/FXRSTOR und SSE frei; `CR4.OSXMMEXCPT` (Bit 10)
+  lenkt SIMD-Ausnahmen auf `#XM` statt `#UD`.
+- **Vorher prüfen:** `CPUID.1:EDX.FXSR` und `.SSE`. Auf einer Maschine ohne beides ist das Setzen
+  ein `#GP` — und der Kernel liefe unter `-cpu host` auf fremder Hardware.
+- **Abnahme:** `fp : ALL PASS` (`0b11`) — **und die Zeile wandert dann in `all_done()`**. Das ist
+  der eigentliche Abschluss, nicht die grüne Zeile: solange sie nicht gattert, ist sie Dekoration.
+- **Gegenprobe:** eine Mutation, die den `fxsave64`-Zweig überspringt, muss die Zeile rot machen.
+  Ohne sie belegt `ALL PASS` nur, dass SSE geht — nicht, dass **gesichert** wird.
+
+### Schritt 2 — A1: der Prozessstart-Stack
+
+- **Ein Fund, der vorher zu klären war:** die Program-Header liegen in **keinem** `PT_LOAD`.
+  `programs/user-x86.ld` beginnt mit `. = 0x20000000;` ohne `SIZEOF_HEADERS`; `readelf` bestätigt
+  es (erstes `LOAD` bei Offset `0x1000`). **`AT_PHDR` zeigte damit ins Leere** — und daran hinge
+  sowohl die TLS-Einrichtung als auch der C++-Entroller. Behebung im Linkerskript:
+  `. = 0x20000000 + SIZEOF_HEADERS;`, damit das erste Segment ab Offset 0 abbildet. Standard­praxis,
+  kostet nichts, muss aber **vor** A1 passieren.
+- **Wo:** `load_into_pd_mit` (`system.rs`), unmittelbar vor `spawn_user_at_parked`; und
+  `init_thread_frame` (`crates/sel4lake-hal/src/x86_64/exception.rs:338`) bekommt einen fertigen
+  `rsp` statt eines Arguments in `rdi`.
+- **Aufbau, von oben nach unten:** Zeichenketten (`argv[0]`, Umgebung) · Auffüllung ·
+  `auxv` (mit `AT_NULL` abgeschlossen) · `envp` (NULL) · `argv` (NULL) · `argc`. `rsp` zeigt auf
+  `argc`.
+- **`auxv`-Mindestmenge:** `AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_ENTRY`, `AT_RANDOM`
+  (16 Byte), `AT_HWCAP`, `AT_NULL`.
+- **Falle, und sie ist im Quelltext schon halb dokumentiert:** SysV verlangt beim **Funktions**-
+  eintritt `rsp % 16 == 8` (so, als hätte ein `call` gerade die Rücksprungadresse abgelegt) — beim
+  **Prozess**-eintritt dagegen `rsp % 16 == 0`. Der Kommentar an `init_thread_frame` beschreibt
+  heute den ersten Fall; für `_start` gilt der zweite. Wer das verwechselt, bekommt einen
+  `#GP` bei der ersten 16-Byte-ausgerichteten SSE-Operation — also **erst nach Schritt 1**, und
+  dann sieht es wie ein FP-Fehler aus.
+- **`AT_RANDOM` braucht echten Zufall, und den gibt es beim Laden noch nicht.** `virtio-rng` ist
+  eine Treiber-PD und läuft später. Eine TSC-Mischung ist **kein** Zufall; wer sie einsetzt, muss
+  es hinschreiben, sonst ist der Stack-Canary Schmuck. Ehrliche Zwischenlösung: `AT_RANDOM` mit
+  einer benannten, als schwach markierten Quelle füllen und den Punkt offen führen.
+- **Abnahme:** ein Zig-Programm liest `argc` und `AT_PAGESZ` aus seinem Startstack und meldet die
+  **Werte**. Nicht „gestartet" — ein Programm, das startet und Unsinn liest, sähe genauso aus.
+
+### Schritt 3 — A2: TLS
+
+- **Die Erkenntnis, die den Aufwand halbiert:** musl richtet TLS **selbst** ein. `__init_tls`
+  findet `PT_TLS` über `AT_PHDR`, legt den Block an und ruft dann `arch_prctl(ARCH_SET_FS)`. Der
+  Kernel muss `PT_TLS` also **nicht verstehen** — der Lader bleibt unverändert. Er braucht drei
+  Dinge:
+  1. `AT_PHDR` (kommt aus Schritt 2),
+  2. **einen Syscall „setze die TLS-Basis dieses Threads"**,
+  3. die Basis **im TCB** und über den Kontextwechsel geführt.
+- **Kernelanteil:** x86 `MSR_FS_BASE` (`0xC000_0100`) schreiben — oder `CR4.FSGSBASE` + `wrfsbase`,
+  was schneller ist und einen eigenen Punkt darstellt. aarch64: `TPIDR_EL0`. Dazu ein Feld im TCB
+  und ein Schreibzugriff im Wechsel.
+- **Sicherheitsnotiz, die dazugehört:** die TLS-Basis ist eine beliebige User-Adresse. Der Kernel
+  **dereferenziert sie nie** — `%fs:0` liest ausschließlich Ring 3. Sonst wäre der Syscall ein
+  „lies mir eine Adresse meiner Wahl"-Dienst.
+- **Der Modelltreue-Wächter wird das beanstanden** (neues TCB-Feld, neue Schreibstelle). Das ist
+  erwartet und gehört ins Register — s. `admitted` am 2026-08-07.
+- **Abnahme:** zwei Threads mit **verschiedenen** TLS-Werten, wechselseitig über N Wechsel geprüft
+  — dieselbe Form wie die `fp`-Sonde. Verschieden ist wieder der Punkt: mit gleichen Werten fiele
+  ein fehlendes Sichern nicht auf.
+
+### Schritt 4 — A3: Stack und Guard-Page
+
+- **Nicht raten, messen.** Wie tief geht ein Zig-/C-Hello wirklich? Stack mit einem Muster füllen,
+  nach dem Lauf das Wasserzeichen zählen. Erst danach eine Zahl festlegen.
+- **Interim:** `LOADED_STACK_BYTES` (heute 16 KiB) auf den gemessenen Bedarf plus Reserve.
+- **Richtig:** ins Manifest — und das braucht mehr als `entry_len = 96`, also **Formatversion 2**.
+  Diese Version kann `period_us` aus [Z16](#z16-quelltext-übersetzen-statt-binaries-laufen-lassen--bewertet-2026-08-09)
+  gleich mitnehmen: **eine** Version für zwei Felder statt zweier Versionen.
+- **Eine Guard-Page gehört dazu, sonst ist „größerer Stack" nur „später kaputt".** Ohne sie
+  überschreibt ein Überlauf still, was darunter liegt.
+  **Abnahme:** eine Rekursion definierter Tiefe läuft; eine tiefere **faultet sauber** — und der
+  Fault liegt in der Guard-Page, nicht irgendwo.
+
+### Schritt 5 — B: die drei Dienste
+
+| | Entwurf | Anmerkung |
+|---|---|---|
+| **Speicher** | Z14 Stufe 1: eine PD hält eine große Memory-Cap und gibt abgeleitete per IPC-REPLY | TCB-neutral, `CCOPY` und Cap-Transfer stehen beide schon |
+| **Zeit** | vDSO-Seite (W2): nur-lesbar in jede PD, Tickzähler + Frequenz | kein Syscall; genau das, was Linux selbst tut |
+| **Konsole** | s. u. — **hier ist eine Entwurfsentscheidung zu treffen, keine Umsetzung** | |
+
+**Die Konsolenfrage, ausgeschrieben:** der Kernel besitzt heute die serielle Schnittstelle für
+seine eigenen Berichte. Drei Wege:
+
+* **(a) Debug-Syscall.** Billig, aber die TCB wächst, und ein „nur zum Debuggen"-Syscall bleibt.
+* **(b) Konsolen-PD bekommt das Gerät.** Sauber — aber der Kernel verlöre seine Ausgabe, und die
+  ist der Träger jeder Prüfzeile. Für den Selbsttest nicht hinnehmbar.
+* **(c) Geteilter Ringpuffer.** Das Programm schreibt in eine Seite, der Kernel leert sie beim
+  Bericht. **TCB-neutral**, und es ist dieselbe Form wie Z18(5).
+
+**Empfehlung: (c).** Falls (a) als Zwischenschritt genommen wird, gehört er als *Debug* markiert
+und in `docs/invariants.md` ausdrücklich als nicht-produktiv benannt — sonst bleibt er.
+
+### Die Abnahmekette, und warum sie in dieser Reihenfolge trennt
+
+1. nach **A4**: `fp : ALL PASS`, in `all_done()` — SSE **und** Lazy-Save belegt.
+2. nach **A1**: Zig meldet `argc` und `AT_PAGESZ` — der Prozessstart trägt, **ohne** Speicherdienst.
+3. nach **A2**: zwei Threads, verschiedene TLS-Werte, über Wechsel erhalten — `errno` wäre möglich.
+4. nach **A3**: definierte Rekursion läuft, tiefere faultet in der Guard-Page.
+5. nach **B**: ein **Zig**-Programm mit `FixedBufferAllocator` rechnet und meldet ein
+   **gerechnetes** Ergebnis über die Konsole.
+
+**Zig zuerst, und das ist kein Geschmack:** es ist die einzige der vier Sprachen, die ohne
+Speicherdienst auskommt (Allokatoren werden explizit durchgereicht). Damit trennt die Abnahme den
+**Prozessstart** von der **Speicherfrage**, statt beides zugleich zu prüfen — und wenn Schritt 5
+fehlschlägt, ist bekannt, dass 1–4 stehen.
+
+### Was dieser Plan NICHT löst, und das gehört dazu
+
+* **C++-Ausnahmen** brauchen den Entroller (`.eh_frame` + `AT_PHDR`). A1 liefert die Vorbedingung,
+  mehr nicht.
+* **Rusts `std`** braucht zusätzlich den `sys`-Port; `panic = "abort"` steht schon, ein Entroller
+  ist dort also nicht nötig.
+* **Threads** kommen nicht vor. Ein Programm, das `std::thread` *benutzt*, läuft nach diesem Plan
+  nicht — nur eines, das sie höchstens linkt.
+* **`fork`, `dlopen`, `mmap` einer Datei, `/proc`** bleiben außerhalb, s. Z19-Abgrenzung.
+
+**Aufwandsschätzung, ausdrücklich als Schätzung markiert:** A4 ist Stunden, A1 und A2 je Tage,
+A3 Stunden plus die Formatversion, B(Zeit) Stunden, B(Speicher) und B(Konsole) je Tage. Die Zahlen
+sind geraten — was sie belastbar machte, wäre die erste Umsetzung, und deshalb steht A4 vorn.
 
 ### Z18. Hohe Leistung für übersetzten Fremdcode — vermessen 2026-08-09
 **Klasse:** Leistung · **Aufwand:** ein Punkt ist fast umsonst, einer ist Voraussetzung für alles

@@ -287,7 +287,51 @@ bekannt_rot_pruefen() {
 }
 
 fail=0
-check() { if echo "$OUT" | grep -q "$1"; then echo "  PASS: $2"; else echo "  FAIL: $2"; fail=1; fi; }
+check() { if grep -q "$1" <<<"$OUT"; then echo "  PASS: $2"; else echo "  FAIL: $2"; fail=1; fi; }
+
+# ================================================================================================
+# SPRECHPROBE DES PRUEFERS SELBST (2026-08-10)
+# ================================================================================================
+#
+# Am 2026-08-10 meldete `check` **FAIL fuer Zeilen, die im Protokoll STANDEN**. Die Ursache lag
+# nicht im Kernel, sondern hier: `echo "$OUT" | grep -q MUSTER`. `grep -q` steigt beim ersten
+# Treffer aus, `echo` bekommt SIGPIPE, und `set -o pipefail` (Zeile 5) macht daraus den
+# Rueckgabewert der ganzen Pipeline -- rc=141, also "nicht gefunden".
+#
+# **Das kippt erst oberhalb des Pipe-Puffers**: gemessen zwischen 66 und 70 KiB Ausgabe. Damit hing
+# das Urteil der Suite an der **Groesse ihrer eigenen Ausgabe** -- solange das Protokoll klein
+# blieb, war das Gruen Glueck. Ein sechster Archiveintrag hat es ueber die Kante geschoben, und
+# neun Pruefungen meldeten FAIL fuer vorhandene Zeilen. Das ist die schlimmere Richtung von
+# "erfundene Erfolge": erfundene MISSERFOLGE ertraenken den echten Befund.
+#
+# Behoben durch Here-Strings (`grep -q MUSTER <<<"$OUT"`) -- keine Pipeline, kein SIGPIPE, kein
+# pipefail. Bewacht durch diese Sprechprobe, und zwar an einer bewusst **grossen** Eingabe:
+# an einer kleinen waere sie waehrend des ganzen Fehlers gruen gewesen.
+#
+# Beide Richtungen, wie ueberall in diesem Projekt: vorhanden -> PASS, abwesend -> FAIL.
+pruefer_selbsttest() {
+    local gross da weg alt_out="$OUT"
+    gross="MARKER-VORHANDEN
+$(head -c 262144 /dev/zero | tr '\0' 'x')"
+    OUT="$gross"
+    da="$(check "MARKER-VORHANDEN" "selbsttest")"
+    weg="$(check "MARKER-FEHLT-ABSICHTLICH" "selbsttest")"
+    OUT="$alt_out"
+    case "$da" in
+        *PASS*) ;;
+        *) echo "== PRUEFER DEFEKT: findet ein VORHANDENES Muster nicht (256 KiB Eingabe) --"
+           echo "   das ist KEIN Testergebnis, sondern ein Aufbauproblem. Siehe SIGPIPE/pipefail oben. =="
+           return 1 ;;
+    esac
+    case "$weg" in
+        *FAIL*) ;;
+        *) echo "== PRUEFER DEFEKT: meldet ein ABWESENDES Muster als vorhanden =="
+           return 1 ;;
+    esac
+    echo "  Pruefer-Sprechprobe: beide Richtungen an 256 KiB Eingabe (vorhanden->PASS, abwesend->FAIL)"
+}
+pruefer_selbsttest || exit 2
+
 check "acpi    : 4 CPU(s) laut MADT"  "ACPI-MADT: CPU-Liste gelesen (x86-Gegenstueck zum DTB)"
 check "mbi     : Speicherplan gelesen" "Multiboot-Speicherplan (RAM-Groesse gelesen statt fest verdrahtet)"
 check "smp     : 4 von 4 Kern(en) online" "SMP: alle Sekundaerkerne per INIT-SIPI-SIPI gestartet (16-bit-Trampolin -> Long Mode)"
@@ -320,11 +364,11 @@ check "himap   : ALL PASS" "E-Rest 3: jedes BAR-Fenster oberhalb 4 GiB ist abgeb
 #   FAILURES -- in der geteilten Tabelle steht etwas, das dort nicht stehen darf: dann haette das
 #               Fenster einer PD JEDE isolierte PD erreicht, bei korrekt durchlaufender Cap-Pruefung.
 # Die FEHLENDE Zeile ist ebenfalls ein FAIL: sie wird bedingungslos gedruckt.
-if echo "$OUT" | grep -q "^hiiso   : FAILURES"; then
-    echo "  FAIL: E-Rest 3: $(echo "$OUT" | grep -m1 '^hiiso   :')"; fail=1
-elif echo "$OUT" | grep -q "^hiiso   : ALL PASS"; then
+if grep -q "^hiiso   : FAILURES" <<<"$OUT"; then
+    echo "  FAIL: E-Rest 3: $(grep -m1 '^hiiso   :' <<<"$OUT")"; fail=1
+elif grep -q "^hiiso   : ALL PASS" <<<"$OUT"; then
     echo "  PASS: E-Rest 3: eine isolierte PD bekam ihr Geraetefenster oberhalb 4 GiB in einer PRIVATEN Kopie -- die geteilte Tabelle blieb unberuehrt"
-elif echo "$OUT" | grep -q "^hiiso   : SKIP"; then
+elif grep -q "^hiiso   : SKIP" <<<"$OUT"; then
     echo "  SKIP (keine Treiber-PD mit Fenster oberhalb 4 GiB -- diese Suite laedt kein Archiv; die Lade-Suite urteilt): geteilte Geraete-Tabelle oberhalb 4 GiB"
 else
     echo "  FAIL: E-Rest 3: keine hiiso-Zeile im Protokoll -- der Hochlauf ist vorher stehengeblieben"; fail=1
@@ -338,11 +382,11 @@ check "vnet    : ALL PASS" "A-5.2: virtio-net -- ZWEI Queues mit getrenntem queu
 # Capability falsch lokalisiert -- ein Fehler, den die Magie im Sektor allein nicht faende, weil
 # der Datenpfad davon unberuehrt ist. Die erwartete Zahl steht HIER, wo das Abbild entsteht, und
 # nicht im Kernel: seine Aufgabe ist, die Kapazitaet zu MELDEN, nicht sie zu kennen.
-if echo "$OUT" | grep -q "vblk    : Lesen (vor VT-d).*Kapazitaet=$BLK_SECTORS Sektor"; then
+if grep -q "vblk    : Lesen (vor VT-d).*Kapazitaet=$BLK_SECTORS Sektor" <<<"$OUT"; then
     echo "  PASS: A-5.2: das Blockgeraet meldet $BLK_SECTORS Sektoren -- genau die Groesse des Abbilds, das diese Suite anlegt (geraetespezifischer Konfigurationsraum korrekt lokalisiert)"
 else
     echo "  FAIL: A-5.2: gemeldete Kapazitaet passt nicht zum Abbild ($BLK_SECTORS Sektoren erwartet):"
-    echo "$OUT" | grep -m1 "vblk    : Lesen" | sed 's/^/          /'
+    grep -m1 "vblk    : Lesen" <<<"$OUT" | sed 's/^/          /'
     fail=1
 fi
 check "vtdcaps : ALL PASS" "VT-d-Faehigkeiten (Schritt 1): SAGAW/MGAW/ND/CM/RWBF/ECAP.C/QI/IR/SC/ScalableMode einmal gelesen und protokolliert; jede spaetere Bit-Entscheidung leitet sich daraus ab"
@@ -360,21 +404,21 @@ check "iso     : ALL PASS"            "Stufe 5: per-Prozess-Adressraeume (isolie
 # Plattform keine Cache-Geometrie, gibt es genau eine Seitenfarbe, und "die Farbsaetze zweier PDs
 # sind disjunkt" waere dann wahr, ohne geprueft zu sein. Genau diese Verwechslung -- Abwesenheit
 # als Erfuellung zu lesen -- hat dieses Projekt bei der SMMU-Event-Queue schon einmal bezahlt.
-if echo "$OUT" | grep -q "color   : SKIP"; then
+if grep -q "color   : SKIP" <<<"$OUT"; then
     echo "  SKIP (Plattform meldet keine Cache-Geometrie -> 1 Farbe): Cache-Partitionierung zwischen PDs"
 else
     check "color   : ALL PASS" "A1: zwei isolierte PDs teilen sich KEINE Cache-Farbe -- Region, Kernel-Stack und Seitentabellen jeder PD stammen aus disjunkten Farbsaetzen; eine Region jenseits der Streifenbreite wird abgewiesen statt fremde Farben mitzunehmen"
 fi
 # A-3.4: die Thread-Kapazitaet ist eine ZUSAGE, keine Eigenschaft des Testaufbaus. Geprueft wird,
 # dass sie erreicht wird -- nicht bloss, dass irgendeine Zahl gemeldet wird.
-NTHREADS=$(echo "$OUT" | grep -m1 -oE '^sched   : [0-9]+ Kern, [0-9]+ Thread-Slots' | grep -oE '[0-9]+ Thread-Slots' | grep -oE '^[0-9]+')
+NTHREADS=$(grep -m1 -oE '^sched   : [0-9]+ Kern, [0-9]+ Thread-Slots' <<<"$OUT" | grep -oE '[0-9]+ Thread-Slots' | grep -oE '^[0-9]+')
 if [ -n "${NTHREADS:-}" ] && [ "$NTHREADS" -ge 10000 ]; then
     echo "  PASS: A-3.4: $NTHREADS Thread-Slots (Ziel 10000) -- die Kapazitaet haengt an der Zusage, nicht an der Kernzahl des Testaufbaus"
 else
     echo "  FAIL: A-3.4: nur ${NTHREADS:-?} Thread-Slots, Ziel 10000"; fail=1
 fi
 # A-3.4 Teil 3: die PD-Kapazitaet ist eine Zusage, keine .bss-Konstante.
-NPD=$(echo "$OUT" | grep -m1 -oE '^cap     : [0-9]+ Slots / [0-9]+ Objekte / [0-9]+ PDs' | grep -oE '[0-9]+ PDs' | grep -oE '^[0-9]+')
+NPD=$(grep -m1 -oE '^cap     : [0-9]+ Slots / [0-9]+ Objekte / [0-9]+ PDs' <<<"$OUT" | grep -oE '[0-9]+ PDs' | grep -oE '^[0-9]+')
 if [ -n "${NPD:-}" ] && [ "$NPD" -ge 10000 ]; then
     echo "  PASS: A-3.4: $NPD PD-Slots -- 10000 Threads koennen jetzt 10000 EIGENE Adressraeume haben, nicht nur geteilte"
 else
@@ -384,8 +428,8 @@ fi
 # gedreht -- eine PD ohne Endpoint ist aber kein Tenant, sondern ein Prozess, mit dem niemand
 # reden kann. Geprueft wird, dass jede PD mindestens einen Endpoint UND eine Notification haben
 # kann, nicht bloss, dass eine Zahl gemeldet wird.
-NEP=$(echo "$OUT" | grep -m1 -oE '^ipc     : [0-9]+ Endpoints / [0-9]+ Notifications' | grep -oE '^ipc     : [0-9]+' | grep -oE '[0-9]+$')
-NNT=$(echo "$OUT" | grep -m1 -oE '^ipc     : [0-9]+ Endpoints / [0-9]+ Notifications' | grep -oE '/ [0-9]+ Notifications' | grep -oE '[0-9]+')
+NEP=$(grep -m1 -oE '^ipc     : [0-9]+ Endpoints / [0-9]+ Notifications' <<<"$OUT" | grep -oE '^ipc     : [0-9]+' | grep -oE '[0-9]+$')
+NNT=$(grep -m1 -oE '^ipc     : [0-9]+ Endpoints / [0-9]+ Notifications' <<<"$OUT" | grep -oE '/ [0-9]+ Notifications' | grep -oE '[0-9]+')
 if [ -n "${NEP:-}" ] && [ "$NEP" -ge 10000 ] && [ -n "${NNT:-}" ] && [ "$NNT" -ge 10000 ]; then
     echo "  PASS: A-3.4: $NEP Endpoints / $NNT Notifications -- jede der 10000 PDs kann Server sein; vorher waren es 32, ab der 33. PD gab es keinen Endpoint mehr"
 else
@@ -395,7 +439,7 @@ check "capsz   : ALL PASS" "A-3.4: der globale Cap-Space wurde nicht erschoepft 
 check "capsum  : ALL PASS" "A-3.4 Abschluss: die SUMME wird geprueft, nicht nur das Budget je PD -- die Slots ausserhalb aller PD-Budgets (Wurzelcaps des Kernels) bleiben in der Reserve; sonst bekaeme eine PD INNERHALB ihres Budgets kein Slot mehr"
 # Die Summenpruefung darf nicht still ausfallen: eine zu kleine Zaehlflaeche ist ein eigener
 # Befund, kein bestandener Test (dieselbe Trennung wie Code 8 im CDT-Audit).
-if echo "$OUT" | grep -q "capsum  : Summenpruefung KONNTE NICHT LAUFEN"; then
+if grep -q "capsum  : Summenpruefung KONNTE NICHT LAUFEN" <<<"$OUT"; then
     echo "  FAIL: A-3.4: die Summenpruefung konnte nicht laufen (Zaehlflaeche zu klein) -- das ist kein Bestehen"; fail=1
 fi
 check "iface   : ALL PASS" "A-4.4: die Versionssperre des Laders weist eine GEAENDERTE Schnittstellenversion ab und laesst die gleiche durch -- beide Ausgaenge belegt; eine andere program_id bleibt unberuehrt"
@@ -404,11 +448,11 @@ check "rebind  : ALL PASS" "A-4.1: atomares Umbinden -- Pruefung und Tausch unte
 # Die Struktur des Bootloaders darf nicht in der Freiliste liegen (die klassische
 # GRUB/Multiboot-Falle: der Lader meldet seinen eigenen Speicher als frei). Heute haengt der
 # Schutz an `USER_RAM_MIN` -- diese Zeile macht ihn zu einer gepruefeten Aussage.
-if echo "$OUT" | grep -q "^mbi     : Bootloader-Struktur .* ausserhalb: 1"; then
+if grep -q "^mbi     : Bootloader-Struktur .* ausserhalb: 1" <<<"$OUT"; then
     echo "  PASS: die Multiboot-Info-Struktur liegt UNTERHALB der Freiliste -- sie wird nicht ausgeschnitten, sondern liegt (heute) unter USER_RAM_MIN. Faellt das weg, koennte der Allokator die Struktur vergeben, aus der der Speicherplan stammt"
 else
     echo "  FAIL: die Bootloader-Struktur liegt IN der Freiliste (oder die Zeile fehlt) --"
-    echo "        $(echo "$OUT" | grep -m1 '^mbi     : Bootloader-Struktur' || echo '(keine mbi-Zeile)')"
+    echo "        $(grep -m1 '^mbi     : Bootloader-Struktur' <<<"$OUT" || echo '(keine mbi-Zeile)')"
     fail=1
 fi
 check "epfull  : ALL PASS" "D11: der Ueberlauf einer Endpoint-Warteschlange wird BENANNT statt still verworfen. Der 33. Eintrag wird abgewiesen, verdraengt keinen der 32 und ist nach einer Freigabe wieder vergebbar -- die Positivkontrolle steckt in der Anlage (die ersten 32 muessen gelingen UND auffindbar sein, sonst waere die Zeile von 'bind_receiver geht nie' nicht zu unterscheiden). Die drei blockierenden Wege (call/recv/migrate_owner) misst tools/verus-modelltreue-ipc.sh gegen denselben Quelltext"
@@ -437,32 +481,32 @@ check "stripe  : ALL PASS" "B-4.2: erschoepfte Farbpartitionierung scheitert SAU
 # `SKIP` ist hier ein ehrliches Urteil und kein Durchwinken: auf einer Maschine ohne RAM
 # oberhalb 4 GiB ist die Frage NICHT ENTSCHEIDBAR -- die Region kann dort gar nicht hoch liegen.
 # Deshalb faehrt die RAM-Reihe (`./test-qemu-x86.sh 120 6G`) den Fall, in dem sie es kann.
-if echo "$OUT" | grep -q "^isohigh : FAILURES"; then
+if grep -q "^isohigh : FAILURES" <<<"$OUT"; then
     echo "  FAIL: E-Rest 3d: die Region liegt nicht oberhalb 4 GiB, obwohl dort RAM ist --"
     echo "        die Identitaetsbindung ist zurueck (oder die Farbtrennung gab nach)."
     fail=1
-elif echo "$OUT" | grep -q "^isohigh : ALL PASS"; then
+elif grep -q "^isohigh : ALL PASS" <<<"$OUT"; then
     echo "  PASS: E-Rest 3d: die private Region einer isolierten PD liegt OBERHALB 4 GiB und die Farbtrennung haelt -- die Abbildung laeuft ueber ein VA-Fenster ausserhalb der Identitaetskarte statt identisch. Der gemessene Deckel von 504 gleichzeitigen isolierten PDs (Host-Test gib0_deckel_ist_eine_zahl) faellt damit"
-elif echo "$OUT" | grep -q "^isohigh : SKIP"; then
-    echo "  SKIP: E-Rest 3d (nicht entscheidbar auf dieser RAM-Groesse): $(echo "$OUT" | grep -m1 -oE '^isohigh : SKIP -- [^(]*')"
+elif grep -q "^isohigh : SKIP" <<<"$OUT"; then
+    echo "  SKIP: E-Rest 3d (nicht entscheidbar auf dieser RAM-Groesse): $(grep -m1 -oE '^isohigh : SKIP -- [^(]*' <<<"$OUT")"
 else
     echo "  FAIL: E-Rest 3d: die Zeile isohigh fehlt ganz -- der Pruefer ist nicht sprechfaehig."
     fail=1
 fi
-if echo "$OUT" | grep -q "^pprobe  : FAILURES"; then
-    echo "  FAIL: B-4.5: $(echo "$OUT" | grep -m1 '^pprobe  : FAILURES')"
+if grep -q "^pprobe  : FAILURES" <<<"$OUT"; then
+    echo "  FAIL: B-4.5: $(grep -m1 '^pprobe  : FAILURES' <<<"$OUT")"
     fail=1
-elif echo "$OUT" | grep -q "^pprobe  : ALL PASS"; then
+elif grep -q "^pprobe  : ALL PASS" <<<"$OUT"; then
     echo "  PASS: B-4.5: disjunkte Farbsaetze verdraengen einander messbar weniger -- die WIRKUNG von A1"
-elif echo "$OUT" | grep -q "^pprobe  : SKIP"; then
-    echo "  SKIP: B-4.5 (nicht entscheidbar, Grund in der Zeile): $(echo "$OUT" | grep -m1 -oE '^pprobe  : SKIP -- [^.]*')"
+elif grep -q "^pprobe  : SKIP" <<<"$OUT"; then
+    echo "  SKIP: B-4.5 (nicht entscheidbar, Grund in der Zeile): $(grep -m1 -oE '^pprobe  : SKIP -- [^.]*' <<<"$OUT")"
     # Auch im SKIP-Fall pruefbar und geprueft: der Aufbau hat seinen Speicher zurueckgegeben und
     # die Farbwahl war korrekt. Ohne diese beiden waere ein SKIP eine Aussage ueber gar nichts.
-    if echo "$OUT" | grep -q "^pprobe  : Opfer"; then
-        if echo "$OUT" | grep -q "^pprobe  : Opfer.*farbtreu=1 bilanz=1"; then
+    if grep -q "^pprobe  : Opfer" <<<"$OUT"; then
+        if grep -q "^pprobe  : Opfer.*farbtreu=1 bilanz=1" <<<"$OUT"; then
             echo "  PASS: B-4.5: der Aufbau ist trotzdem geprueft -- Farbwahl korrekt und JEDER Rueckspeicherblock wieder frei (region_fully_free je Block, nicht Summenvergleich)"
         else
-            echo "  FAIL: B-4.5: SKIP, aber Aufbau nicht sauber: $(echo "$OUT" | grep -m1 -oE 'farbtreu=[01] bilanz=[01]')"
+            echo "  FAIL: B-4.5: SKIP, aber Aufbau nicht sauber: $(grep -m1 -oE 'farbtreu=[01] bilanz=[01]' <<<"$OUT")"
             fail=1
         fi
     fi
@@ -491,7 +535,7 @@ check "root    : FAILURES (NoArchive)" "B-1.5: ERWARTET -- ohne Archiv nennt der
 # beide Zeilen standen im selben Lauf untereinander. Ausgerechnet dieser Marker traegt aber die
 # Wiederholungsmessung (B-1.2/B-1.3 zaehlen ihn). Jetzt trennt der Kernel die Ausgaenge; hier wird
 # die Trennung abgenommen. Ein Watchdog-Lauf ist ein FAIL, kein "meistens grün".
-if echo "$OUT" | grep -q "bringup : WATCHDOG"; then
+if grep -q "bringup : WATCHDOG" <<<"$OUT"; then
     echo "  FAIL: B-1.8: der Bericht kam aus der NOTBREMSE, nicht aus all_done() -- die Aussagen darunter sind zu einem Zeitpunkt abgelesen, nicht nach ihrem Beleg"; fail=1
 else
     echo "  PASS: B-1.8: der Bericht kam aus all_done() (kein Watchdog) -- die Aussagen sind belegt, nicht abgelesen"

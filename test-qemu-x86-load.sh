@@ -286,7 +286,51 @@ bekannt_rot_pruefen() {
 }
 
 fail=0
-check() { if echo "$OUT" | grep -q "$1"; then echo "  PASS: $2"; else echo "  FAIL: $2"; fail=1; fi; }
+check() { if grep -q "$1" <<<"$OUT"; then echo "  PASS: $2"; else echo "  FAIL: $2"; fail=1; fi; }
+
+# ================================================================================================
+# SPRECHPROBE DES PRUEFERS SELBST (2026-08-10)
+# ================================================================================================
+#
+# Am 2026-08-10 meldete `check` **FAIL fuer Zeilen, die im Protokoll STANDEN**. Die Ursache lag
+# nicht im Kernel, sondern hier: `echo "$OUT" | grep -q MUSTER`. `grep -q` steigt beim ersten
+# Treffer aus, `echo` bekommt SIGPIPE, und `set -o pipefail` (Zeile 5) macht daraus den
+# Rueckgabewert der ganzen Pipeline -- rc=141, also "nicht gefunden".
+#
+# **Das kippt erst oberhalb des Pipe-Puffers**: gemessen zwischen 66 und 70 KiB Ausgabe. Damit hing
+# das Urteil der Suite an der **Groesse ihrer eigenen Ausgabe** -- solange das Protokoll klein
+# blieb, war das Gruen Glueck. Ein sechster Archiveintrag hat es ueber die Kante geschoben, und
+# neun Pruefungen meldeten FAIL fuer vorhandene Zeilen. Das ist die schlimmere Richtung von
+# "erfundene Erfolge": erfundene MISSERFOLGE ertraenken den echten Befund.
+#
+# Behoben durch Here-Strings (`grep -q MUSTER <<<"$OUT"`) -- keine Pipeline, kein SIGPIPE, kein
+# pipefail. Bewacht durch diese Sprechprobe, und zwar an einer bewusst **grossen** Eingabe:
+# an einer kleinen waere sie waehrend des ganzen Fehlers gruen gewesen.
+#
+# Beide Richtungen, wie ueberall in diesem Projekt: vorhanden -> PASS, abwesend -> FAIL.
+pruefer_selbsttest() {
+    local gross da weg alt_out="$OUT"
+    gross="MARKER-VORHANDEN
+$(head -c 262144 /dev/zero | tr '\0' 'x')"
+    OUT="$gross"
+    da="$(check "MARKER-VORHANDEN" "selbsttest")"
+    weg="$(check "MARKER-FEHLT-ABSICHTLICH" "selbsttest")"
+    OUT="$alt_out"
+    case "$da" in
+        *PASS*) ;;
+        *) echo "== PRUEFER DEFEKT: findet ein VORHANDENES Muster nicht (256 KiB Eingabe) --"
+           echo "   das ist KEIN Testergebnis, sondern ein Aufbauproblem. Siehe SIGPIPE/pipefail oben. =="
+           return 1 ;;
+    esac
+    case "$weg" in
+        *FAIL*) ;;
+        *) echo "== PRUEFER DEFEKT: meldet ein ABWESENDES Muster als vorhanden =="
+           return 1 ;;
+    esac
+    echo "  Pruefer-Sprechprobe: beide Richtungen an 256 KiB Eingabe (vorhanden->PASS, abwesend->FAIL)"
+}
+pruefer_selbsttest || exit 2
+
 check "mbi     : 1 Modul(e)" \
     "A-1.1: der Bootloader liefert die Startmenge als Multiboot-Modul (Flag Bit 3 ausgewertet)"
 check "mbmod   : ALL PASS" \
@@ -331,11 +375,11 @@ check "dmaiso  : ALL PASS" \
 # statischen Tabelle, und wer ein PD-Fenster dorthin schriebe, gaebe es JEDER isolierten PD --
 # lautlos, denn die Cap-Pruefung liefe korrekt durch. SKIP heisst hier "die BARs lagen unter
 # 4 GiB" (der Fall bei der Vorgabe 512M) und ist ausdruecklich KEIN Bestehen.
-if echo "$OUT" | grep -q "^hiiso   : FAILURES"; then
-    echo "  FAIL: E-Rest 3: $(echo "$OUT" | grep -m1 '^hiiso   :')"; fail=1
-elif echo "$OUT" | grep -q "^hiiso   : ALL PASS"; then
+if grep -q "^hiiso   : FAILURES" <<<"$OUT"; then
+    echo "  FAIL: E-Rest 3: $(grep -m1 '^hiiso   :' <<<"$OUT")"; fail=1
+elif grep -q "^hiiso   : ALL PASS" <<<"$OUT"; then
     echo "  PASS: E-Rest 3: die Treiber-PD bekam ihr Fenster oberhalb 4 GiB in einer PRIVATEN Kopie des Seitenverzeichnisses -- die geteilte Tabelle traegt keinen PD-spezifischen Eintrag"
-elif echo "$OUT" | grep -q "^hiiso   : SKIP"; then
+elif grep -q "^hiiso   : SKIP" <<<"$OUT"; then
     echo "  SKIP (keine BARs oberhalb 4 GiB -- mit '$RAM' legt die Firmware sie darunter; mit '6G' wird die Aussage scharf): private Geraete-Tabelle oberhalb 4 GiB"
 else
     echo "  FAIL: E-Rest 3: keine hiiso-Zeile im Protokoll"; fail=1
@@ -349,25 +393,25 @@ check "devsel  : ALL PASS" \
 #   2. der Empfaenger wurde OHNE LUECKE ausgetauscht (A-4.1 am echten Dienst, nicht am lokalen
 #      Objekt -- dort war der ueberlappende Fall bisher nur konstruiert erreichbar),
 #   3. die neue Fassung erbt die REGION (Bedienungszaehler 1 -> 2, nicht 1 -> 1).
-if echo "$OUT" | grep -q "drv     : Anfrage 1 an v1: Status=0 "; then
+if grep -q "drv     : Anfrage 1 an v1: Status=0 " <<<"$OUT"; then
     echo "  PASS: A-5.1: der Treiber-DIENST beantwortet eine Anfrage -- der Kernel ist Client, nicht Treiber (Richtungsumkehr)"
 else
     echo "  FAIL: A-5.1: die erste Anfrage an den Dienst kam nicht durch:"
-    echo "$OUT" | grep -m1 "drv     : Anfrage 1" | sed 's/^/          /'
+    grep -m1 "drv     : Anfrage 1" <<<"$OUT" | sed 's/^/          /'
     fail=1
 fi
-if echo "$OUT" | grep -q "drv     : Austausch: Ergebnis=0 .*v1 meldete bereit=1 v2 meldete bereit=1"; then
+if grep -q "drv     : Austausch: Ergebnis=0 .*v1 meldete bereit=1 v2 meldete bereit=1" <<<"$OUT"; then
     echo "  PASS: A-5.1/A-4.1: der Dienst wurde am LAUFENDEN Endpoint ausgetauscht, und der Endpoint hatte zu keinem Zeitpunkt null Empfaenger; beide Fassungen haben sich gemeldet"
 else
     echo "  FAIL: A-5.1/A-4.1: der Austausch lief nicht sauber:"
-    echo "$OUT" | grep -m1 "drv     : Austausch" | sed 's/^/          /'
+    grep -m1 "drv     : Austausch" <<<"$OUT" | sed 's/^/          /'
     fail=1
 fi
-if echo "$OUT" | grep -q "drv     : Anfrage 2 an v2: Status=0 "; then
+if grep -q "drv     : Anfrage 2 an v2: Status=0 " <<<"$OUT"; then
     echo "  PASS: A-5.1: die NEUE Fassung bedient weiter und hat die DMA-Region geerbt (Zaehler 1 -> 2) -- ein Austausch, kein Neustart"
 else
     echo "  FAIL: A-5.1: die neue Fassung bediente nicht oder bekam eine frische Region:"
-    echo "$OUT" | grep -m1 "drv     : Anfrage 2" | sed 's/^/          /'
+    grep -m1 "drv     : Anfrage 2" <<<"$OUT" | sed 's/^/          /'
     fail=1
 fi
 # A-6.1: das Dienstprotokoll ueber dem Treiber.
@@ -376,21 +420,21 @@ check "blkdev  : ALL PASS" \
 # Der Rueckleseschritt einzeln, weil er die eigentliche Aussage traegt: eine quittierte
 # Schreibanfrage ist eine Quittung, keine Daten. Faellt nur er aus, ist das ein Befund am
 # Schreibpfad -- und kein Sammel-FAIL, dem man nicht ansieht, welcher Schritt riss.
-if echo "$OUT" | grep -q "blkdev  : .*Rueckgelesen=0x454b414c344c4553 (erwartet 0x454b414c344c4553)"; then
+if grep -q "blkdev  : .*Rueckgelesen=0x454b414c344c4553 (erwartet 0x454b414c344c4553)" <<<"$OUT"; then
     echo "  PASS: A-6.1: geschrieben und ZURUECKGELESEN -- die Daten stehen wirklich auf der Platte, nicht bloss in einer Quittung"
 else
     echo "  FAIL: A-6.1: das Zurueckgelesene passt nicht zum Geschriebenen:"
-    echo "$OUT" | grep -m1 "blkdev  : INFO" | sed 's/^/          /'
+    grep -m1 "blkdev  : INFO" <<<"$OUT" | sed 's/^/          /'
     fail=1
 fi
 # A-6.2: die Partitionstabelle -- gelesen im Blockdienst, nicht im Kern.
 check "part    : ALL PASS" \
     "A-6.2: GPT im BLOCKDIENST gelesen (sel4lake-part: abhaengigkeitsfrei, forbid(unsafe_code), host-getestet). Beide Pruefsummen geprueft; die Eintragsliste passt nicht in eine Anfrage und wird stueckweise gelesen, die Pruefsumme aber ueber das GANZE gebildet"
-if echo "$OUT" | grep -q "part    : .*erste Partition LBA $BLK_PART1_LBA ueber $BLK_PART1_SECTORS Sektoren"; then
+if grep -q "part    : .*erste Partition LBA $BLK_PART1_LBA ueber $BLK_PART1_SECTORS Sektoren" <<<"$OUT"; then
     echo "  PASS: A-6.2: die gemeldete erste Partition passt zu der, die diese Suite ins Abbild geschrieben hat (LBA $BLK_PART1_LBA, $BLK_PART1_SECTORS Sektoren)"
 else
     echo "  FAIL: A-6.2: die gemeldete Partition passt nicht zum Abbild:"
-    echo "$OUT" | grep -m1 "part    : GPT-Scan" | sed 's/^/          /'
+    grep -m1 "part    : GPT-Scan" <<<"$OUT" | sed 's/^/          /'
     fail=1
 fi
 # A-6.3: das Dateisystem -- eine EIGENE PD, die kein Geraet faehrt.
@@ -398,11 +442,11 @@ check "fs      : ALL PASS" \
     "A-6.3: ein lesendes Dateisystem als eigene PD -- sie ruft den Blockdienst ueber dessen Kanal und liest die Bytes aus der geteilten Uebertragungsflaeche. GPT (sel4lake-part) und FAT16 (sel4lake-fat) sind kernfrei und forbid(unsafe_code); der Kern kennt weder Partitionen noch Dateien"
 # Der Inhalt einzeln, weil er die eigentliche Aussage traegt: eine gefundene Datei ist noch keine
 # gelesene. Groesse UND erste Bytes muessen zu dem passen, was `tools/mkgpt.py --file` hineinlegt.
-if echo "$OUT" | grep -q "fs      : Status=0 .*Groesse=20 erste acht Byte=0x454b414c344c4553"; then
+if grep -q "fs      : Status=0 .*Groesse=20 erste acht Byte=0x454b414c344c4553" <<<"$OUT"; then
     echo "  PASS: A-6.3: die Datei wurde nicht bloss GEFUNDEN, sondern GELESEN -- Groesse und Inhalt passen zu dem, was diese Suite ins Dateisystem geschrieben hat"
 else
     echo "  FAIL: A-6.3: Groesse oder Inhalt der gelesenen Datei passen nicht:"
-    echo "$OUT" | grep -m1 "fs      : Status" | sed 's/^/          /'
+    grep -m1 "fs      : Status" <<<"$OUT" | sed 's/^/          /'
     fail=1
 fi
 # A-6.4: **die zweite, unabhaengige Quelle.** Der Kernel meldet, dass die PD geschrieben und
@@ -453,11 +497,11 @@ ck() { echo "$1" | sed -n "s/^bootckpt: $2 .*[ (]$3=\([0-9a-fx]\{1,\}\).*/\1/p" 
 #    gab: Grund 5 (Partner nicht im Umfang) waere durch einen groesseren Umfang behebbar und
 #    belegte die Regel deshalb nicht. Der Kanal der Treiber-PD liegt darum ausdruecklich IM
 #    Umfang; was uebrigbleibt, ist Geraete-Autoritaet (1=MMIO-Fenster, 2=IRQ, 3=DMA-Region).
-if echo "$OUT" | grep -qE "^bootckpt: Verweigerung: .* Grund (1|2|3) "; then
+if grep -qE "^bootckpt: Verweigerung: .* Grund (1|2|3) " <<<"$OUT"; then
     echo "  PASS: Z4b: eine nicht uebertragbare Cap im Umfang verhindert das SPEICHERN -- die Treiber-PD haelt Geraete-Autoritaet, und die kann auf der Zielmaschine nichts bezeichnen. Der Grund ist EINZELN (Geraetefenster/IRQ/DMA), nicht ein Sammel-Nein, und er ist durch keinen groesseren Umfang behebbar"
 else
     echo "  FAIL: Z4b: die Treiber-PD wurde nicht mit einem GERAETE-Grund abgewiesen:"
-    echo "$OUT" | grep -m1 "^bootckpt: Verweigerung" | sed 's/^/          /'
+    grep -m1 "^bootckpt: Verweigerung" <<<"$OUT" | sed 's/^/          /'
     fail=1
 fi
 
@@ -473,7 +517,7 @@ if [ -n "$P1" ] && [ "$P1" != 0 ] && [ -n "$N1" ] && [ "$N1" != "0x0000000000000
     echo "  PASS: Z4a am echten Gegenstand: Lauf 1 speicherte Fortschritt=$P1 Nonce=$N1 als Epoche 1 (am EINGEFRORENEN Thread gelesen -- ein Wert, der waehrend des Lesens weiterlaeuft, gehoert zu keinem Zeitpunkt)"
 else
     echo "  FAIL: Z4 Stufe 2: Lauf 1 hat nichts Brauchbares gespeichert (Fortschritt=$P1 Nonce=$N1 Epoche=$E1):"
-    echo "$OUT" | grep -m1 "^bootckpt: gespeichert" | sed 's/^/          /'
+    grep -m1 "^bootckpt: gespeichert" <<<"$OUT" | sed 's/^/          /'
     fail=1
 fi
 
@@ -505,7 +549,7 @@ if [ "$S2E" = 2 ] && [ -n "$S2P" ] && [ -n "$P1" ] && [ "$S2P" -gt "$P1" ] 2>/de
 else
     echo "  FAIL: Z4 Stufe 2: die Kette waechst nicht (Epoche=$S2E Fortschritt=$S2P gegen $P1)"; fail=1
 fi
-if echo "$OUT2" | grep -q "^bootckpt: ALL PASS"; then
+if grep -q "^bootckpt: ALL PASS" <<<"$OUT2"; then
     echo "  PASS: Z4 Stufe 2: der wiederhergestellte Thread lief danach weiter und kam um mindestens 100 Runden voran -- ein Wiederherstellen, das den Thread kaputtmacht, waere sonst von einem korrekten nicht zu unterscheiden"
 else
     echo "  FAIL: Z4 Stufe 2: der zweite Lauf meldet keinen sauberen Checkpoint-Ausgang:"
@@ -542,7 +586,7 @@ else
     echo "  FAIL: Z4 Stufe 2: Lauf 3 uebernahm den Zustand aus Lauf 2 nicht (erwartet Fortschritt=$S2P Nonce=$S2N Epoche=2 Zaehler-danach=$S2P Folge-Epoche=3; bekam $R3P / $R3N / $R3E / $R3NACH / $S3E)"
     fail=1
 fi
-echo "$OUT4" | grep -q "^bootckpt: ALL PASS" \
+grep -q "^bootckpt: ALL PASS" <<<"$OUT4" \
     && echo "  PASS: Z4 Stufe 2: auch das dritte Glied ist sauber (eingefroren, gesetzt, weitergelaufen, neu geschrieben)" \
     || { echo "  FAIL: Z4 Stufe 2: der dritte Lauf meldet keinen sauberen Ausgang"; fail=1; }
 
@@ -580,8 +624,8 @@ then
     boot build/boot-archive-x86.bin "$LOG3"
     OUT3="$(grep -vE "SeaBIOS|iPXE|Press Ctrl|Booting from|C900|PMM|PnP" "$LOG3" 2>/dev/null)"
     echo "$OUT3" | grep -E "^bootckpt" || true
-    if echo "$OUT3" | grep -q "^bootckpt: ABGEWIESEN .*Lesecode=7" \
-        && ! echo "$OUT3" | grep -q "^bootckpt: wiederhergestellt"; then
+    if grep -q "^bootckpt: ABGEWIESEN .*Lesecode=7" <<<"$OUT3" \
+        && ! grep -q "^bootckpt: wiederhergestellt" <<<"$OUT3"; then
         echo "  PASS: Z4f in klein -- ein STRUKTURELL HEILER Checkpoint eines anderen Kernel-Images wird ABGEWIESEN (Lesecode 7), nicht geladen. Die Pruefsumme stimmt, die Laengen stimmen, die Kennung stimmt: was allein nicht stimmt, ist die Bindung ans Image"
     else
         echo "  FAIL: Z4f -- ein fremd gebundener Checkpoint wurde nicht mit Lesecode 7 abgewiesen:"
@@ -590,7 +634,7 @@ then
     fi
     # Und er darf den fremden Checkpoint weder ueberschrieben noch geladen haben: aus einer
     # Abweisung wuerde sonst beim naechsten Lauf stillschweigend ein eigener Zustand.
-    if echo "$OUT3" | grep -q "^bootckpt: gespeichert"; then
+    if grep -q "^bootckpt: gespeichert" <<<"$OUT3"; then
         echo "  FAIL: Z4f -- nach der Abweisung wurde trotzdem gespeichert; damit waere der fremde Zustand lautlos durch einen eigenen ersetzt"
         fail=1
     elif python3 -c "

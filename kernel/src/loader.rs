@@ -274,6 +274,11 @@ pub fn manifest_report() -> u32 {
             }
         }
     }
+    // **Die Client-Notification-Bilanz steht NICHT hier.** Sie gehörte einen Anlauf lang an diese
+    // Stelle und war dort wertlos: `manifest_audit` läuft **vor** dem Laden, die Zahl war immer
+    // `0 PD(s), 0 verloren`. Eine Zahl, die zum Messzeitpunkt gar nicht anders sein kann, gattert
+    // nichts — dieselbe Form wie ein Urteil, das erst im Bericht entsteht. Sie steht jetzt im
+    // Abschlussbericht, wo die PDs geladen sind, und in `all_done`.
     println!(
         "manifest: {} (Signatur ueber die GESAMTE Nachricht, an DIESES Kernel-Image gebunden, Anti-Downgrade; manipulierte Kopie wird abgewiesen)",
         if audit == 0 { "ALL PASS" } else { "FAILURES" }
@@ -440,7 +445,7 @@ fn endow_from_manifest(
             } else if is_driver {
                 DRIVER_NTFN.store(ntfn as u64 + 1, Ordering::Relaxed);
             } else {
-                CLIENT_NTFN.store(ntfn as u64 + 1, Ordering::Relaxed);
+                client_ntfn_store(e.program_id, ntfn);
             }
             Some(cap)
         });
@@ -752,13 +757,74 @@ pub const DRIVER_V2_BADGE: u64 = 1 << 41;
 /// **Badge einer Client-PD** eines Dienstes (A-6.3) — wieder ein eigenes Bit.
 pub const CLIENT_NTFN_BADGE: u64 = 1 << 44;
 
-/// Die Notification einer Client-PD (`0` = keine endowt).
-static CLIENT_NTFN: AtomicU64 = AtomicU64::new(0);
+/// **Die Notification einer Client-PD — je PROGRAMM, nicht je ROLLE.**
+///
+/// Bis zum 2026-08-10 stand hier **ein** Slot. Die Behebung von A-6.3 lautete „drei Rollen, drei
+/// Badges, drei Ablagen" — und *Client* ist eine **Rolle**, keine Instanz. Mit der zweiten
+/// Client-PD (`wasmhost`, 2026-08-09) kam derselbe Fehler eine Ebene höher zurück: die zuletzt
+/// geladene überschrieb die Ablage der früheren, der `drv`-Ablauf wartete auf das Badge der
+/// **Dateisystem**-PD an **wasmhosts** Objekt, und drei Prüfzeilen (`drv`/`blkdev`/`part`) fielen
+/// aus, **ohne dass am Treiber irgendetwas kaputt war**.
+///
+/// Gefunden per Bisect (erster schlechter Commit `a159b6b`), isoliert durch Weglassen genau dieses
+/// einen Archiveintrags — der Commit änderte auch 69 Zeilen Bring-up, und ohne die Isolation wäre
+/// nur der Commit bekannt, nicht die Ursache.
+///
+/// **Die Schranke ist hergeleitet, nicht erfunden:** so viele Einträge, wie ein Manifest überhaupt
+/// haben darf ([`MAN_MAX_ENTRIES`]). Damit ist ein Überlauf **strukturell unerreichbar** statt
+/// ein ungetesteter Pfad — dieselbe Lehre wie bei der `audit_cdt`-Schranke (B-5.5). Der Zähler
+/// unten bleibt trotzdem, weil eine Schranke, deren Überlauf niemand benennt, kein Schutz ist
+/// (D11), sondern ein Loch.
+///
+/// `0` in der Programm-Spalte heißt „frei" — `program_id` 0 vergibt kein Manifest.
+const MAN_MAX_ENTRIES: usize = sel4lake_loader::manifest::MAX_ENTRIES;
+static CLIENT_NTFN_PID: [core::sync::atomic::AtomicU32; MAN_MAX_ENTRIES] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAN_MAX_ENTRIES];
+/// Zugehörige Notification-Id, `+1` (damit `0` = „keine" bleibt).
+static CLIENT_NTFN_ID: [AtomicU64; MAN_MAX_ENTRIES] =
+    [const { AtomicU64::new(0) }; MAN_MAX_ENTRIES];
+/// Verlorene Eintragungen. **Heute unerreichbar** (s. o.) — und genau deshalb gezählt statt
+/// wegkommentiert: der Tag, an dem die Schranke sich ändert, ist der Tag, an dem das zählt.
+static CLIENT_NTFN_LOST: AtomicU64 = AtomicU64::new(0);
 
-/// Die Notification-Id der Client-PD (`None` = keine endowt).
-pub fn client_notification() -> Option<usize> {
-    let v = CLIENT_NTFN.load(Ordering::Relaxed);
-    (v != 0).then(|| (v - 1) as usize)
+/// Eintragen. Läuft ausschließlich im Ladepfad, der je Programm einmal und **sequenziell**
+/// durchlaufen wird — deshalb genügt `Relaxed` ohne Sperre, wie bei den drei Vorgängern.
+fn client_ntfn_store(program_id: u32, ntfn: usize) {
+    for (p, n) in CLIENT_NTFN_PID.iter().zip(CLIENT_NTFN_ID.iter()) {
+        let cur = p.load(Ordering::Relaxed);
+        if cur == program_id || cur == 0 {
+            p.store(program_id, Ordering::Relaxed);
+            n.store(ntfn as u64 + 1, Ordering::Relaxed);
+            return;
+        }
+    }
+    CLIENT_NTFN_LOST.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Die Notification-Id **dieser** Client-PD (`None` = keine endowt).
+///
+/// Es gibt bewusst **keine** Fassung ohne Argument mehr. „Die Client-Notification" war der Name
+/// einer Mehrdeutigkeit: zwei Aufrufstellen meinten zwei verschiedene PDs und lasen dieselbe
+/// Zelle. Wer hier nicht sagen kann, **wessen** Signal er meint, hat die Frage nicht gestellt.
+pub fn client_notification_of(program_id: u32) -> Option<usize> {
+    for (p, n) in CLIENT_NTFN_PID.iter().zip(CLIENT_NTFN_ID.iter()) {
+        if p.load(Ordering::Relaxed) == program_id {
+            let v = n.load(Ordering::Relaxed);
+            return (v != 0).then(|| (v - 1) as usize);
+        }
+    }
+    None
+}
+
+/// Wie viele Client-PDs eine Notification bekommen haben, und wie viele **verlorengingen**.
+/// Für den Bericht: `(0, 0)` ist von „es gab keine Clients" nicht zu unterscheiden, und genau
+/// diese Ununterscheidbarkeit hat den Fehler oben getragen.
+pub fn client_notification_stats() -> (usize, u64) {
+    let n = CLIENT_NTFN_PID
+        .iter()
+        .filter(|p| p.load(Ordering::Relaxed) != 0)
+        .count();
+    (n, CLIENT_NTFN_LOST.load(Ordering::Relaxed))
 }
 
 /// Die Notification-Id der Treiber-PD (`None` = keine endowt).

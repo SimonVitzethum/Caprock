@@ -807,6 +807,14 @@ static VNET_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool:
 const TEST_BLK_SERVICE_ID: u32 = 3;
 /// Die Treiber-PD, deren Zuteilung der Test misst — dieselbe Komponente.
 const TEST_BLK_PROGRAM_ID: u32 = 3;
+/// `program_id` der **Dateisystem**-PD im Manifest der Lade-Suite.
+///
+/// Sie muss genannt werden, seit es **zwei** Client-PDs gibt. Vorher fragte diese Folge nach
+/// „der Client-Notification"; mit `wasmhost` als zweitem Client zeigte dieselbe Zelle auf
+/// dessen Objekt, und die Folge wartete auf ein Badge, das dort nie ankommt (Bisect `a159b6b`).
+const TEST_FS_PROGRAM_ID: u32 = 4;
+/// `program_id` der **WASM**-PD im Manifest der Lade-Suite — der zweite Client.
+const TEST_WASM_PROGRAM_ID: u32 = 6;
 
 
 /// Ergebnis der EINMALIGEN Park-Messung: Bit 0..5 die sechs Aussagen, Bit 8..15 die
@@ -1346,11 +1354,14 @@ fn drv_service_step(archive: bool) {
             // Dienstes; liefen sie gleichzeitig, mischten sich ihre Anfragen, und der Austausch
             // fiele mitten in ein fremdes Gespraech. Der Bedienungszaehler waere dann auch keine
             // Aussage mehr ueber DIESE Folge.
-            if crate::loader::client_notification().is_some() {
-                let cb = crate::loader::client_notification()
-                    .map(system::notification_pending)
-                    .unwrap_or(0);
-                if cb & crate::loader::CLIENT_NTFN_BADGE == 0 {
+            // **Genannt, nicht „die" Client-PD.** Bis zum 2026-08-10 stand hier
+            // `client_notification()` ohne Argument -- eine Zelle, zwei Subjekte: diese Zeile
+            // meint die DATEISYSTEM-PD, die Zeile in Schritt 2 meint `wasmhost`. Solange es nur
+            // einen Client gab, war das dieselbe Zahl. Mit dem zweiten zeigte sie auf wasmhost,
+            // dieses Badge kam nie, und `drv`/`blkdev`/`part` fielen aus, ohne dass am Treiber
+            // etwas kaputt war.
+            if let Some(n) = crate::loader::client_notification_of(TEST_FS_PROGRAM_ID) {
+                if system::notification_pending(n) & crate::loader::CLIENT_NTFN_BADGE == 0 {
                     return;
                 }
             }
@@ -1406,7 +1417,7 @@ fn drv_service_step(archive: bool) {
             // wie "nichts zu beanstanden" ausgesehen.
             PDCOLOR_OK.store(crate::loader::run_pdcolor(), Ordering::Release);
             {
-                let b = crate::loader::client_notification()
+                let b = crate::loader::client_notification_of(TEST_WASM_PROGRAM_ID)
                     .map(system::notification_pending)
                     .unwrap_or(0);
                 let alle = WASM_INST | WASM_RESULT | WASM_REJECT | WASM_TRAP;
@@ -2442,6 +2453,25 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
         if fp_ok { "ALL PASS" } else { "FAILURES" }
     );
 
+    // **Die Client-Notification-Bilanz** (2026-08-10). Hier und nicht in `manifest_audit`: das
+    // laeuft VOR dem Laden, dort waere die Zahl immer 0 gewesen -- eine Groesse, die zum
+    // Messzeitpunkt gar nicht anders sein kann, gattert nichts.
+    //
+    // Was sie belegt: bis zum 2026-08-10 gab es EINE Zelle fuer die Rolle „Client". Die
+    // Behebung von A-6.3 lautete „drei Rollen, drei Badges, drei Ablagen" -- und mit der ZWEITEN
+    // Client-PD kam derselbe Fehler eine Ebene hoeher zurueck: `wasmhost` ueberschrieb die Ablage
+    // der Dateisystem-PD, der `drv`-Ablauf wartete auf ein Badge an einem fremden Objekt, und
+    // `drv`/`blkdev`/`part` fielen aus, ohne dass am Treiber etwas kaputt war.
+    let (clients, ntfn_verloren) = crate::loader::client_notification_stats();
+    println!(
+        "clientn : {clients} Client-PD(s) mit EIGENER Ablage, {ntfn_verloren} verloren (muss 0 \
+         sein). Verschluesselt ist die Ablage mit der program_id, nicht mit der ROLLE -- „Client\" \
+         ist eine Rolle, und die zweite Client-PD ueberschrieb bis 2026-08-10 die Ablage der \
+         ersten. Die Schranke ist die Hoechstzahl der Manifest-Eintraege, also HERGELEITET: ein \
+         Ueberlauf ist strukturell unerreichbar, und der Zaehler ist die Ratsche dagegen, dass \
+         jemand die Schranke senkt"
+    );
+
     // **Das Vektor-Inventar.** Gedruckt wird JEDER Vektor, der ueberhaupt genommen wurde -- nicht
     // nur die auffaelligen. Ein Melder, der nur beim Unglueck spricht, ist in einem gesunden Lauf
     // stumm, und dann weiss niemand, ob er sprechfaehig ist. Ein Inventar ist in jedem Lauf
@@ -2543,6 +2573,10 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             // Draussenbleiben das Gegenteil: eine gruene Zeile, die nichts gattert -- genau der
             // `pdbind`-Fehler drei Zeilen weiter oben.
             ("fp", fp_urteil()),
+            // **Der Ueberlauf ist BENANNT, nicht bloss verhindert** (D11). Die Schranke ist die
+            // Hoechstzahl der Manifest-Eintraege, also hergeleitet -- damit ist der Fall heute
+            // unerreichbar. Das Konjunkt ist die Ratsche dagegen, dass jemand die Schranke senkt.
+            ("clientntfn", crate::loader::client_notification_stats().1 == 0),
     ];
     if let Some(w) = warum {
         *w = flags;
@@ -2552,7 +2586,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 27;
+const DONE_FLAGS: usize = 28;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]
@@ -2745,7 +2779,9 @@ fn report_and_off(watchdog: bool) -> ! {
     // gebadgten Kopien von seiner EIGENEN, aus dem Manifest endowten Cap ab (Slot 1, RWX) --
     // die vom Root-Task delegierte Cap in Slot 0 ist eine reine Signal-Cap, und `ccopy` kann
     // Rechte nicht verstaerken.
-    let b = crate::loader::client_notification().map(system::notification_pending).unwrap_or(0);
+    let b = crate::loader::client_notification_of(TEST_WASM_PROGRAM_ID)
+        .map(system::notification_pending)
+        .unwrap_or(0);
     let (w_inst, w_wert, w_mut, w_trap) = (
         b & WASM_INST != 0,
         b & WASM_RESULT != 0,

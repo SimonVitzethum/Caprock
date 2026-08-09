@@ -1131,12 +1131,70 @@ Die Aufteilung, die daraus folgt:
       **Latent**, weil `count` anderswo begrenzt war; die Schranke stand trotzdem an der falschen
       Grösse.
 
-- [ ] **Vorgefunden, NICHT von P3: `drv`/`blkdev` sind in der Lade-Suite rot.** Gemessen am
-      Stand `f1932ff` **vor** jeder P3-Änderung: `Anfrage 1 an v1: Status=-1`, `Austausch:
-      Ergebnis=4294967295`, `v2 meldete bereit=0`. `fs` ist dabei grün — der Blockdienst trägt
-      also, was reisst, ist der **Austauschpfad** (A-5.1/A-4.1). CLAUDE.md führt die Lade-Suite
-      seit dem 2026-08-03 als `== ALL PASS ==`; das gilt nicht mehr, und wann es kippte, ist
-      nicht festgehalten. Eigener Eintrag nötig.
+- [x] **`drv`/`blkdev`/`part`: gefunden, isoliert, behoben — und die Ursache war eine ZWEITE
+      Client-PD.** (2026-08-10)
+
+      **Der Weg dorthin, weil er die halbe Aussage ist.** Erst gehämmert (`tools/lade-haemmern.sh`):
+      12 Läufe, **ein** Binary (Fingerprint `7aae3ed5531e`), 12× rot, **verhaltensgleich** — der
+      einzige Unterschied zwischen zwei Protokollen war eine Thread-Nummer in einer PASS-Zeile.
+      Damit war „Flattern **oder** veralteter Build" endgültig erledigt und die Suite als
+      Bisect-Orakel brauchbar. Ehrlich zur Schranke: 12 Läufe schliessen eine Grünquote von 20 %
+      mit p < 0,07 aus, 5 % nicht — „flattert nicht" heisst hier „nicht in einer Grössenordnung,
+      die ein Bisect verdirbt", nicht „nie".
+      Das Orakel urteilt über **die drei Zeilen**, nicht über die Schlusszeile: ältere Stände haben
+      andere Prüfzeilen, und wer auf `== ALL PASS ==` bisectet, bisectet die Geschichte der Suite.
+
+      **Erster schlechter Commit: `a159b6b`** („Z15/W1: wasmhost baut und LÄUFT"), `28cc05d` grün.
+      Der Commit ändert **zwei** Dinge — 69 Zeilen Bring-up **und** einen sechsten Archiveintrag.
+      Ohne Isolation wäre nur der Commit bekannt, nicht die Ursache; das Weglassen genau dieses
+      einen Eintrags macht die drei Zeilen grün.
+
+      **Die Ursache: `CLIENT_NTFN` war EIN Slot für eine ROLLE.** Die Behebung von A-6.3 lautete
+      „drei Rollen, drei Badges, drei Ablagen" — und *Client* ist eine **Rolle**, keine Instanz.
+      Mit `wasmhost` als zweitem Client zeigte dieselbe Zelle auf dessen Objekt; der `drv`-Ablauf
+      wartete auf das Badge der **Dateisystem**-PD, das dort nie ankommt, blieb auf `DRV_STEP=0`
+      stehen, und drei Prüfzeilen fielen aus — **ohne dass am Treiber irgendetwas kaputt war**.
+      Der Kommentar an der Stelle beschreibt den Fehler wörtlich („die zuletzt geladene PD
+      überschriebe die Ablage der früheren … Genau das ist beim Bau von A-6.3 passiert") und
+      verhindert ihn nicht: die Behebung war eine Ebene zu flach.
+      Behoben mit einer Ablage **je `program_id`** (dieselbe Lösung wie bei den vier versteckten
+      Politiken aus A-5.4), Schranke = Höchstzahl der Manifest-Einträge (**hergeleitet**, also
+      Überlauf strukturell unerreichbar), Überlauf trotzdem **gezählt und gegattert**
+      (`clientntfn`, D11-Lehre). `client_notification()` ohne Argument gibt es **nicht mehr** —
+      „die Client-Notification" war der Name einer Mehrdeutigkeit.
+      Gemessen: `clientn : 3 Client-PD(s) mit EIGENER Ablage, 0 verloren`. **Drei** teilten sich
+      bis dahin eine Zelle.
+
+- [x] **Der zweite Befund war grösser: der PRÜFER meldete FAIL für Zeilen, die im Protokoll
+      STANDEN.** (2026-08-10) Nach dem Fix blieben 9 rote Prüfungen, deren Zeilen nachweislich da
+      waren. Ursache: `echo "$OUT" | grep -q MUSTER`. `grep -q` steigt beim **ersten Treffer** aus,
+      `echo` bekommt SIGPIPE, und `set -o pipefail` (Zeile 5 jeder Suite) macht daraus rc=141 —
+      also „nicht gefunden".
+      **Das kippt erst oberhalb des Pipe-Puffers: gemessen zwischen 66 und 70 KiB Ausgabe.** Damit
+      hing das Urteil der Suite an der **Grösse ihrer eigenen Ausgabe**; solange das Protokoll klein
+      blieb, war das Grün Glück, und der sechste Archiveintrag hat es über die Kante geschoben.
+      Betroffen waren **71 Stellen in drei QEMU-Suiten** und `tools/hang-stress.sh` — alle auf
+      Here-Strings umgestellt (keine Pipeline ⇒ kein `pipefail`, kein SIGPIPE). Die sieben
+      verbliebenen Pipelines haben **keinen** frühen Ausstieg (`grep -E`/`-c`/`-v` lesen bis EOF)
+      und können die Form nicht auslösen.
+      **Bewacht durch eine Sprechprobe des Prüfers selbst**, an bewusst **256 KiB** Eingabe und in
+      beide Richtungen: vorhanden → PASS, abwesend → FAIL. An einer kleinen Eingabe wäre sie
+      während des ganzen Fehlers grün gewesen. Gegenprobe gefahren: mit der alten Fassung meldet
+      sie `PRUEFER DEFEKT` und bricht mit `exit 2` ab („kein Testergebnis, sondern ein
+      Aufbauproblem").
+      **Die Richtung ist die schlimmere Hälfte:** erfundene **Misserfolge**. Sie kosten kein
+      Fehlerbild, sie **ertränken** es — neun falsche FAILs neben einem echten, und der echte war
+      nicht mehr zu sehen. Bilanz: 30 → 1 Prüfung rot, und der Rest ist echte offene Arbeit
+      (`wasm : SKIP`, s. Z15/W1).
+      Dazu die eigene Falle beim Umbau: mein Ersetzer hielt ein `|` **innerhalb** eines Regex für
+      ein Pipe-Zeichen und zerlegte `Grund (1|2|3)`. `bash -n` fand das **nicht** — die kaputte
+      Zeile war syntaktisch gültig. Gefunden hat es erst eine Prüfung jeder geänderten Zeile auf
+      „Here-String steht am Ende der grep-Invocation".
+
+- [ ] **Offen, davon abgetrennt: `wasm : SKIP`.** `wasmhost` liegt im Archiv, aber keins der vier
+      Badges kommt an — der Stand, den `a159b6b` selbst offen führt. Die Suite weigert sich zu
+      Recht, ein SKIP als Erfolg zu zählen. **Jetzt sichtbar**, statt unter 29 falschen FAILs zu
+      liegen.
 
 - [~] **P1 — x86 MSI-X + IRTE: die KODIERUNG steht, die Vergabe fehlt** (2026-08-09).
       **Fertig:** `crates/sel4lake-hal/src/x86_64/irte.rs` — IRTE- und MSI-Adress-Kodierung als

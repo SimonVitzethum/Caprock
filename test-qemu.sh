@@ -228,7 +228,7 @@ fi
 echo "$OUT"
 echo "== checks =="
 fail=0
-check() { if echo "$OUT" | grep -q "$1"; then echo "  PASS: $2"; else echo "  FAIL: $2"; fail=1; fi; }
+check() { if grep -q "$1" <<<"$OUT"; then echo "  PASS: $2"; else echo "  FAIL: $2"; fail=1; fi; }
 # Fuzzer-Check: nur im `KERNEL_FUZZ=1`-Lauf relevant (im Release-Build ohne Fuzzer entfaellt die
 # Zeile -> nicht als Fehler werten, sondern als bewusst uebersprungen melden).
 fcheck() { if [ -n "${KERNEL_FUZZ:-}" ]; then check "$1" "$2"; else echo "  SKIP (release ohne Fuzzer): $2"; fi; }
@@ -320,17 +320,17 @@ fcheck "hwfuzz  : ALL PASS" "Domaenen/HW-Fuzzer: HW-/Management-Cap-Churn gegen 
 # Jetzt laufen die Tests (am ENDE der Kette, hinter cross/strand/loadstop) und melden. Geprueft
 # wird hier deshalb auch die ANWESENHEIT der Zeile: fehlt sie, ist die Kette vorher
 # stehengeblieben, und genau das soll nicht wieder in der Stille verschwinden.
-if echo "$OUT" | grep -q "^color   : SKIP"; then
+if grep -q "^color   : SKIP" <<<"$OUT"; then
     echo "  SKIP (Plattform meldet weniger als 2 Seitenfarben): A1 Cache-Partitionierung"
-elif echo "$OUT" | grep -q "^color   : ALL PASS"; then
+elif grep -q "^color   : ALL PASS" <<<"$OUT"; then
     echo "  PASS: A1: zwei isolierte PDs teilen sich KEINE Cache-Farbe -- Region, Kernel-Stack und Seitentabellen jeder PD aus disjunkten Farbsaetzen; eine Region jenseits der Streifenbreite wird abgewiesen. Auf aarch64 (16 Farben) laeuft das seit 2026-08-02 zum ersten Mal -- die 16-Farben-Aufteilung ist genau der Fall, den die MASK_BITS-Verwechslung falsch machte"
 else
     echo "  FAIL: A1: keine verwertbare 'color'-Zeile -- der Farbtest lief nicht oder fiel durch"
     fail=1
 fi
-if echo "$OUT" | grep -q "^stripe  : SKIP"; then
+if grep -q "^stripe  : SKIP" <<<"$OUT"; then
     echo "  SKIP (weniger als 2 Seitenfarben): B-4.2 Streifenvergabe"
-elif echo "$OUT" | grep -q "^stripe  : ALL PASS"; then
+elif grep -q "^stripe  : ALL PASS" <<<"$OUT"; then
     echo "  PASS: B-4.2: erschoepfte Farbpartitionierung scheitert SAUBER -- der 5. Streifenversuch wird abgewiesen statt den Satz der ersten PD still ein zweites Mal auszugeben; nach Freigabe wieder vergebbar (kein Leck)"
 else
     echo "  FAIL: B-4.2: keine verwertbare 'stripe'-Zeile"
@@ -345,30 +345,30 @@ fi
 # `SKIP` ist hier ein ehrliches Urteil und kein Durchwinken: auf einer Maschine ohne RAM
 # oberhalb 4 GiB ist die Frage NICHT ENTSCHEIDBAR -- die Region kann dort gar nicht hoch liegen.
 # Deshalb faehrt die RAM-Reihe (`die x86-Reihe`) den Fall, in dem sie es kann.
-if echo "$OUT" | grep -q "^isohigh : FAILURES"; then
+if grep -q "^isohigh : FAILURES" <<<"$OUT"; then
     echo "  FAIL: E-Rest 3d: die Region liegt nicht oberhalb 4 GiB, obwohl dort RAM ist --"
     echo "        die Identitaetsbindung ist zurueck (oder die Farbtrennung gab nach)."
     fail=1
-elif echo "$OUT" | grep -q "^isohigh : ALL PASS"; then
+elif grep -q "^isohigh : ALL PASS" <<<"$OUT"; then
     echo "  PASS: E-Rest 3d: die private Region einer isolierten PD liegt OBERHALB 4 GiB und die Farbtrennung haelt -- die Abbildung laeuft ueber ein VA-Fenster ausserhalb der Identitaetskarte statt identisch. Der gemessene Deckel von 504 gleichzeitigen isolierten PDs (Host-Test gib0_deckel_ist_eine_zahl) faellt damit"
-elif echo "$OUT" | grep -q "^isohigh : SKIP"; then
-    echo "  SKIP: E-Rest 3d (nicht entscheidbar auf dieser RAM-Groesse): $(echo "$OUT" | grep -m1 -oE '^isohigh : SKIP -- [^(]*')"
+elif grep -q "^isohigh : SKIP" <<<"$OUT"; then
+    echo "  SKIP: E-Rest 3d (nicht entscheidbar auf dieser RAM-Groesse): $(grep -m1 -oE '^isohigh : SKIP -- [^(]*' <<<"$OUT")"
 else
     echo "  FAIL: E-Rest 3d: die Zeile isohigh fehlt ganz -- der Pruefer ist nicht sprechfaehig."
     fail=1
 fi
-if echo "$OUT" | grep -q "^pprobe  : FAILURES"; then
-    echo "  FAIL: B-4.5: $(echo "$OUT" | grep -m1 '^pprobe  : FAILURES')"
+if grep -q "^pprobe  : FAILURES" <<<"$OUT"; then
+    echo "  FAIL: B-4.5: $(grep -m1 '^pprobe  : FAILURES' <<<"$OUT")"
     fail=1
-elif echo "$OUT" | grep -q "^pprobe  : ALL PASS"; then
+elif grep -q "^pprobe  : ALL PASS" <<<"$OUT"; then
     echo "  PASS: B-4.5: disjunkte Farbsaetze verdraengen einander messbar weniger -- die WIRKUNG von A1"
-elif echo "$OUT" | grep -q "^pprobe  : SKIP"; then
-    echo "  SKIP: B-4.5 (nicht entscheidbar, Grund in der Zeile): $(echo "$OUT" | grep -m1 -oE '^pprobe  : SKIP -- [^.]*')"
-    if echo "$OUT" | grep -q "^pprobe  : Opfer"; then
-        if echo "$OUT" | grep -q "^pprobe  : Opfer.*farbtreu=1 bilanz=1"; then
+elif grep -q "^pprobe  : SKIP" <<<"$OUT"; then
+    echo "  SKIP: B-4.5 (nicht entscheidbar, Grund in der Zeile): $(grep -m1 -oE '^pprobe  : SKIP -- [^.]*' <<<"$OUT")"
+    if grep -q "^pprobe  : Opfer" <<<"$OUT"; then
+        if grep -q "^pprobe  : Opfer.*farbtreu=1 bilanz=1" <<<"$OUT"; then
             echo "  PASS: B-4.5: der Aufbau ist trotzdem geprueft -- Farbwahl korrekt und JEDER Rueckspeicherblock wieder frei (region_fully_free je Block, nicht Summenvergleich)"
         else
-            echo "  FAIL: B-4.5: SKIP, aber Aufbau nicht sauber: $(echo "$OUT" | grep -m1 -oE 'farbtreu=[01] bilanz=[01]')"
+            echo "  FAIL: B-4.5: SKIP, aber Aufbau nicht sauber: $(grep -m1 -oE 'farbtreu=[01] bilanz=[01]' <<<"$OUT")"
             fail=1
         fi
     fi

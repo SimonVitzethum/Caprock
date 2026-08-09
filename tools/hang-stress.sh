@@ -47,7 +47,7 @@ for i in $(seq 1 "$N"); do
         -device pcie-root-port,id=rp0,chassis=1 -device virtio-rng-pci,bus=rp0 \
         -device loader,file=build/boot-archive.bin,addr=0x13F000000 \
         -kernel "$ELF" </dev/null 2>/dev/null)
-    if echo "$out" | grep -q "SELFTEST COMPLETE"; then
+    if grep -q "SELFTEST COMPLETE" <<<"$out"; then
         ok=$((ok + 1))
     else
         hang=$((hang + 1))

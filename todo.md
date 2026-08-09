@@ -342,6 +342,76 @@ den Stack hält, verwechselt den Kopf mit dem Protokoll.
 **Nebenbefund bei der Untersuchung, eigener Punkt:** dasselbe Problem existiert bereits, aber bei
 **unseren eigenen** Dienstprotokollen — s. Z13.
 
+### Z14. Fremde Software ohne Gastschicht — bewertet 2026-08-09
+**Klasse:** Produktlücke · **Aufwand:** gestuft, die erste Stufe ist klein · **Randbedingung
+(Simon, 2026-08-09): Isolation und die sehr kleine TCB bleiben erhalten.**
+
+**Die Zahl, die den Rahmen setzt:** die ausgelieferte TCB ist `.text` **212 KiB** + `.rodata`
+24 KiB (Release ohne `selftest`; mit Testcode 360/52 KiB). Alles, was hier bewertet wird, darf
+diese Zahl nicht erhöhen.
+
+- [ ] **Der Ist-Stand, gemessen.** Die ABI hat **17 Syscalls**, alle cap-basiert. Für fremde
+      Software fehlen vier Dinge, und drei davon sind keine Kleinigkeit:
+
+      | Fehlt | Befund |
+      |---|---|
+      | `brk`/`mmap` | **kein Weg, zur Laufzeit Speicher zu bekommen.** `SYS_MAP` bildet ab, was die PD **schon hält**; ihr Speicher steht mit dem Endowment beim Laden fest |
+      | Threads in einer PD | kein Erzeuger in der ABI (0 Treffer für `SPAWN`/`CLONE`) — eine PD hat **einen** Thread |
+      | Uhr | keine Zeit-ABI (0 Treffer für `CLOCK`/`GETTIME`) |
+      | dynamisches Linken | `PT_INTERP` wird nirgends behandelt — nur statische Binaries |
+
+      **Was es dagegen schon gibt und was der Schlüssel ist:** Cap-Transfer über IPC (der
+      `xfer`-Test delegiert eine Cap per REPLY). Eine PD kann einer anderen Autorität geben,
+      **ohne dass der Kernel etwas Neues lernt**.
+
+- [ ] **Was die Randbedingung ausschließt: „unmodifizierte Linux-Binaries".** Ein Linux-Programm
+      führt `syscall` mit seiner eigenen Nummer aus (x86_64: 1 = `write`). SEL4Lake liest dieselbe
+      Stelle als eigene Nummer (1 = `CALL`). Es scheitert also **sicher** (die Cap-Prüfung weist
+      ab), aber es scheitert.
+
+      Damit es nicht scheitert, müsste der **Kernel** einen zweiten Nummernraum, einen zweiten
+      Einsprung und die Übersetzung von 300+ Linux-Syscalls kennen — oder den Fault-Pfad an eine
+      PD umleiten, was einen User-Fault-Handler in der ABI bedeutet. Beides wächst die TCB, und
+      der Linux-Syscall-Satz ist als *Menge* nicht klein zu bekommen. **Ausgeschlossen.**
+
+      Was **nicht** ausgeschlossen ist: derselbe Quelltext, **neu gelinkt**.
+
+- [ ] **Stufe 1 (klein, und Vorbedingung für alles Weitere): ein Speicher-Server in Userspace.**
+      Eine PD hält eine große Memory-Cap und gibt auf Anfrage abgeleitete Caps per IPC-REPLY
+      heraus; der Client mappt sie mit `SYS_MAP`. Das ist `brk`/`mmap` — **ohne eine einzige neue
+      Kernelzeile**, weil Cap-Ableitung (`CCOPY`) und Cap-Transfer beide schon stehen.
+
+      Der Kern bleibt unberührt, die Politik („wer bekommt wie viel") wandert dorthin, wo sie
+      hingehört: in eine PD und ins Manifest. Das ist derselbe Schritt wie A-5.1 beim Treiber und
+      A-6.3 beim Dateisystem.
+
+      **Abnahme:** eine PD, die beim Laden 4 KiB bekommt, fordert zur Laufzeit 1 MiB an, schreibt
+      sie voll und gibt sie zurück — und eine zweite PD bekommt dieselbe Region **nicht** zu
+      sehen (Positivkontrolle über denselben Server, nur eine Anfrage wandert).
+
+- [ ] **Stufe 2, drei Wege — und sie schließen einander nicht aus.**
+
+      | Weg | TCB-Wirkung | was läuft damit | Preis |
+      |---|---|---|---|
+      | **WASM in einer PD** | **null** (die Engine ist Userland) | alles, was zu WASM/WASI kompiliert — heute der Großteil dessen, wofür „Vercel-artige Dienste" steht | keine bestehenden nativen Binaries; eine `no_std`-Engine muss rein |
+      | **musl gegen `libsel4lake` neu gelinkt** | null | fast alles, was aus Quelltext baut | libc-Portierung: Datei-Deskriptoren, Pfade, Threads, Signale — jedes davon ein eigener Dienst |
+      | **eigene Kompat-Bibliothek** | null | was man selbst dagegen baut | ehrlichste, aber kleinste Reichweite |
+
+      **Bewertung:** WASM passt zur Produktthese und zur Randbedingung am besten — die Sandbox
+      liegt **in** der PD, nicht im Kern, und der WASI-Satz ist klein und geschlossen (im
+      Gegensatz zum Linux-Satz, der es per Definition nicht ist). Der Speicherbedarf ist beim
+      Start bekannt (WASM-Linearspeicher), also trägt sogar das heutige Modell ohne Stufe 1 —
+      allerdings ohne `memory.grow`.
+
+      Der musl-Weg ist der mit der größten Reichweite und dem größten Preis; er wird erst
+      sinnvoll, wenn Stufe 1 steht **und** ein Dateisystem-Dienst mit Pfaden existiert (heute:
+      FAT16 über eine feste Datei, A-6.3).
+
+- [ ] **Was zuerst gemessen gehört, bevor irgendetwas gebaut wird.** Wie viel Speicher braucht
+      eine `no_std`-WASM-Engine (`wasmi`) im Leerlauf, und wie groß wird eine PD damit? Wenn die
+      Engine 2 MiB braucht und eine PD heute 2 MiB private Region hat, ist die Antwort schon da.
+      Eine Bewertung, die diese Zahl nicht kennt, ist eine Meinung.
+
 ### Z13. Das Blockdienst-Protokoll steht DREIMAL (gemessen 2026-08-07)
 **Klasse:** Drift · **Aufwand:** klein
 

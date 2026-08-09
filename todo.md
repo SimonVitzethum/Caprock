@@ -559,6 +559,56 @@ jemand anfängt — nicht als Überraschung im dritten Monat. Für SEL4Lake hies
 PD führt Fremdcode aus, und sein `syscall`-Eintritt wird an eine **andere PD** zugestellt statt an
 den Kernel. Das ist eine echte Erweiterung des Thread-Modells, kein Aufsatz.
 
+### Die vierte Vorbedingung, cap-förmig — und damit VIEL kleiner als `restricted mode`
+
+**Der Vorschlag (Simon, 2026-08-09): über Capabilities BEIDER Prozesse.** Er trägt, und er ist
+besser als Fuchsias Form, weil er fast keine neue Mechanik braucht — SEL4Lake hat die Bausteine
+schon.
+
+**Der Kern:** der Syscall-Eintritt eines Threads wird nicht *behandelt*, sondern **an einen
+Endpoint zugestellt**. Der Kernel marshallt den Trap-Frame in eine IPC-Nachricht, blockiert den
+Thread, weckt den Handler; dessen `REPLY` schreibt die Ergebnisregister zurück und setzt fort. Das
+ist **wörtlich das Fault-Handler-Muster von seL4** — und `RECV`/`REPLY`, Trap-Frames und der
+`switch_to`-Fastpath existieren hier alle bereits.
+
+**TCB-Kosten:** ein Cap-Slot je Thread („Syscalls gehen an E") plus das Marshalling. Kein neuer
+Ausführungsmodus, kein zweiter Kontext je Thread.
+
+#### Wer hält was — und die Asymmetrie ist der Punkt
+
+| Seite | hält | bedeutet |
+|---|---|---|
+| **Handler-PD** | die **Endpoint-Cap** | darf die Syscalls des Gastes empfangen **und seine Ergebnisregister schreiben** — sie kann ihn also belügen. Substanzielle Autorität, deshalb eine Cap und kein globaler Schalter |
+| **Gast-PD** | **nichts** | ihre Autorität wird *verringert*: sie erreicht den SEL4Lake-Kernel gar nicht mehr |
+
+**Und die dritte Partei, die der Entwurf nennen muss: wer schaltet um?** Nicht der Handler — sonst
+könnte jede PD die Syscalls eines fremden Threads an sich ziehen. Umschalten darf nur, wer
+**Autorität über den Thread** hat. Also braucht der Aufruf **beides**:
+
+    SYS_SETHANDLER(tcb_cap, endpoint_cap)
+
+Genau das ist „Capabilities beider Prozesse", präzise gemacht: die Tcb-Cap sagt *wessen* Syscalls,
+die Endpoint-Cap sagt *wohin*.
+
+#### Die Regel, ohne die es eine Rechteausweitung wäre
+
+**Fällt die Handler-Cap weg (gelöscht, entzogen, Handler tot), muss der Gast FAULTEN — nicht auf
+die native ABI zurückfallen.** Ein Rückfall machte aus dem Entzug einer Cap eine **Beförderung**:
+der Gast spräche plötzlich direkt mit dem Kernel. Fail-closed, und es ist dieselbe Form wie
+`ERR_SERVER_GONE` beim Endpoint-Austausch.
+
+#### Was noch zu entscheiden ist
+
+* **Faults getrennt oder mitgeführt?** `mmap`-Semantik verlangt, dass der Handler auch
+  **Seitenfehler** sieht. seL4 trennt Fault-Endpoint von Syscall-Zustellung; hier wäre eine zweite
+  Cap sauberer als ein überladener Kanal — ein Kanal mit zwei Bedeutungen ist die Form, die dieses
+  Projekt schon dreimal bezahlt hat.
+* **Die Messung, die (a) gegen (b) entscheidet:** Kosten eines IPC-Umlaufs gegen einen nativen
+  Syscall auf dieser Maschine. Fuchsia ging zu `restricted mode` **wegen der Kosten**; hier ist der
+  Vergleich aber ein anderer, weil `switch_to` auf demselben Kern direkt umschaltet (mit
+  Budget-Spende) statt über den Scheduler zu laufen. **Vor dem Bau messen, nicht danach** — und
+  die Zahl gehört neben die von gVisors ptrace-Weg, damit klar ist, welcher Vergleich gilt.
+
 ### 2. `Magma` → das Vorbild für A1/A2
 
 Fuchsias **GPU-Architektur**: geteilt in einen *system driver* (im Treiberprozess) und einen

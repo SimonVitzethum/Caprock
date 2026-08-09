@@ -281,6 +281,25 @@ const FP_ITERS: u64 = 64;
 #[link_section = ".user_data"]
 static FP_OK: AtomicU64 = AtomicU64::new(0);
 
+/// **Was die Sonde STATT ihres Musters vorfand** — je Sonde ein Wort (Z25).
+///
+/// `Muster = 0b0` kollabiert drei grundverschiedene Fehlerbilder in ein Bit, und genau das hat die
+/// Diagnose eine Runde gekostet. Der gefundene Wert trennt sie:
+///
+/// * **Nullen** -> es wird ein frisch resetteter Slot restauriert (Reset-nach-Save-Reihenfolge,
+///   oder Restore aus einem nie beschriebenen Slot).
+/// * **das Muster des PARTNERS** -> Identitaetsvertauschung im Save/Restore-Pfad: der FP-Zustand
+///   folgt der CPU statt dem Thread.
+/// * **Muell** -> Layout-, Groessen- oder Ausrichtungsfehler.
+#[cfg(feature = "selftest")]
+#[link_section = ".user_data"]
+static FP_FOUND: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Restliche Versuche der Sofortpruefung (von 1000). `1000` = beim ersten Versuch gelungen.
+#[cfg(feature = "selftest")]
+#[link_section = ".user_data"]
+static FP_TRIES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 #[cfg(feature = "selftest")]
 core::arch::global_asm!(
     r#"
@@ -296,6 +315,49 @@ user_fp_probe_x86:
     // Sprechprobe: Bit 2 sagt „diese Sonde lief und konnte schreiben" -- BEVOR FP angefasst wird.
     // Ohne sie waere „0b00" nicht von „lief nicht" zu unterscheiden.
     lock or qword ptr [rip + {ok}], 4
+    movq    xmm0, r12
+    movq    xmm1, r12
+    movq    xmm2, r12
+    movq    xmm3, r12
+    // **Sofortpruefung, OHNE jeden Wechsel** (Z25): Muster schreiben, sofort lesen. Sie halbiert
+    // den Suchraum -- gruen entlastet die Register selbst, `enable_sse` und das Target; rot hiesse,
+    // die Sonde misst etwas anderes, als sie glaubt.
+    // **1000 Versuche, nicht einer** (Z25): "die Instruktion wirkt nie" und "ein Wechsel
+    // dazwischen loescht" sehen bei EINEM Versuch gleich aus. Gelingt auch nur EINER, ist das
+    // Schreiben in Ordnung und es ist ein Rennen; gelingt keiner, wirkt `movq xmm, r64` hier
+    // ueberhaupt nicht -- und dann misst die Sonde etwas anderes, als sie glaubt.
+    mov     rbx, 1000
+5:
+    movq    xmm0, r12
+    movq    r14, xmm0
+    cmp     r14, r12
+    je      6f
+    dec     rbx
+    jne     5b
+    // Kein einziger Versuch gelang -> den gefundenen Wert ablegen und weiter (die Schleife
+    // unten faengt es ohnehin, aber der Wert soll HIER schon stehen).
+    mov     rax, r12
+    and     rax, 1
+    shl     rax, 3
+    lea     rcx, [rip + {found}]
+    mov     [rcx + rax], r14
+    jmp     4f
+6:
+    // **`shl rcx, cl` waere hier falsch** und war es einen Lauf lang: `cl` ist das niedrige Byte
+    // von `rcx` SELBST. Der Schiebebetrag muss ueber `cl` kommen, also zuerst nach rcx.
+    mov     rcx, r12
+    and     rcx, 1
+    mov     rax, 8
+    shl     rax, cl                    // Bit 3 fuer Sonde 0, Bit 4 fuer Sonde 1
+    lock or qword ptr [rip + {ok}], rax
+    // Und wie viele Versuche es brauchte -- 1000 heisst "sofort", weniger heisst "es gab ein
+    // Rennen und wie oft".
+    mov     rax, r12
+    and     rax, 1
+    shl     rax, 3
+    lea     rcx, [rip + {tries}]
+    mov     [rcx + rax], rbx
+4:
     movq    xmm0, r12
     movq    xmm1, r12
     movq    xmm2, r12
@@ -325,12 +387,24 @@ user_fp_probe_x86:
     int     0x80
     jmp     1b
 3:
+    // Markierung "hier war ich" in Bit 63 -- sonst ist ein gefundener Wert 0 nicht vom
+    // Anfangswert zu unterscheiden, und genau das hat eine Messrunde gekostet.
+    bts     r14, 63
+    // **Den GEFUNDENEN Wert ablegen, bevor geparkt wird.** Ohne ihn ist „nicht meins" die einzige
+    // Aussage, und drei verschiedene Ursachen sehen gleich aus.
+    mov     rax, r12
+    and     rax, 1
+    shl     rax, 3
+    lea     rbx, [rip + {found}]
+    mov     [rbx + rax], r14
     mov     rax, 5                // Korruption erkannt: OHNE Vermerk parken
     int     0x80
     jmp     3b
 "#,
     iters = const FP_ITERS,
     ok = sym FP_OK,
+    found = sym FP_FOUND,
+    tries = sym FP_TRIES,
 );
 
 #[cfg(feature = "selftest")]
@@ -2228,6 +2302,24 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
     println!(
         "fp      : gelaufen={fp_gelaufen} · Muster ueber {FP_ITERS} Abgaben erhalten = {:#b}          (erwartet 0b11) · CR0.TS-gesetzt-vorgefunden={ts_gesehen} (eager: muss 0 sein)          (zwei Sonden mit VERSCHIEDENEN Mustern in xmm0..xmm3; verschieden ist der Punkt -- mit          demselben Muster fiele ein fehlendes fxsave nicht auf, weil der Dieb genau das          zuruecklaesst, was das Opfer erwartet)",
         fpmask & 0b11
+    );
+    // **Die drei Hypothesen trennen** -- ohne den gefundenen Wert sehen sie gleich aus.
+    let f0 = FP_FOUND[0].load(Ordering::Relaxed);
+    let f1 = FP_FOUND[1].load(Ordering::Relaxed);
+    println!(
+        "fp      : sofort-ok (OHNE Wechsel) = {:#b} (erwartet 0b11 in Bit 3/4) · gefunden statt \
+         des Musters: Sonde0={f0:#018x} Sonde1={f1:#018x}. Nullen = frisch resetteter Slot \
+         restauriert · Muster des PARTNERS = Identitaetsvertauschung, der FP-Zustand folgt der \
+         CPU statt dem Thread · Muell = Layout/Ausrichtung. 0 in BEIDEN bei gruener \
+         Sofortpruefung hiesse: nie eine Korruption erreicht",
+        (fpmask >> 3) & 0b11
+    );
+    println!(
+        "fp      : Sofortpruefung -- Restversuche von 1000: Sonde0={} Sonde1={} (1000 = beim \
+         ERSTEN Versuch gelungen; kleiner = es gab ein Rennen; 0 zusammen mit sofort-ok=0 heisst: \
+         `movq xmm, r64` wirkt hier ueberhaupt nicht, und dann ist die Korruption eine Attrappe)",
+        FP_TRIES[0].load(Ordering::Relaxed),
+        FP_TRIES[1].load(Ordering::Relaxed)
     );
     println!(
         "fp      : FP-Wechsel gesamt = {} (Save eines vorigen Besitzers). **0 hiesse: es wurde nie \

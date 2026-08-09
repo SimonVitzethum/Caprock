@@ -30,7 +30,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-license = "BSD-2-Clause"
+license = "GPL-3.0-or-later"
 authors = ["SEL4Lake"]
 version = "0.0.1"
 

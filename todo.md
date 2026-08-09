@@ -475,6 +475,79 @@ diese Zahl nicht erhöhen.
       Folge für die Reihenfolge: Stufe 1 (Speicher-Server) ist **nicht** Vorbedingung für den
       ersten WASM-Schritt — wohl aber für `memory.grow` und für mehr als einen Gast.
 
+### Z18. Hohe Leistung für übersetzten Fremdcode — vermessen 2026-08-09
+**Klasse:** Leistung · **Aufwand:** ein Punkt ist fast umsonst, einer ist Voraussetzung für alles
+Weitere · **Randbedingung:** Isolation und kleine TCB bleiben.
+
+Kompatibilität ([Z16](#z16-quelltext-übersetzen-statt-binaries-laufen-lassen--bewertet-2026-08-09))
+und **Leistung** sind verschiedene Achsen, und auf der zweiten verlieren Mikrokerne historisch.
+Die Gründe sind aber benennbar und einzeln messbar.
+
+- [ ] **(1) Das User-Ziel rechnet Fliesskomma in SOFTWARE — gemessen, nicht vermutet.**
+      Dieselbe Funktion (Skalarprodukt über 64 `f64`), einmal für ein normales x86_64-Ziel und
+      einmal für `programs/x86_64-sel4lake-user.json` übersetzt:
+
+      | | Befehle | SSE-FP | Bibliotheksaufrufe |
+      |---|---|---|---|
+      | normales x86_64-Ziel | 18 | **8** (`mulsd`/`addsd`) | keine |
+      | **Projektziel** | 53 | **0** | **4× `__muldf3` + 4× `__adddf3`** |
+
+      Jede Multiplikation und jede Addition wird ein **Aufruf**. Ein `mulsd` kostet ~4 Zyklen;
+      `__muldf3` entpackt, multipliziert 64×64→128 Bit, normalisiert, rundet, packt — Größenordnung
+      50–150 Zyklen mit Aufrufkosten. Für numerischen Code ist das der Unterschied zwischen
+      brauchbar und unbrauchbar.
+
+      **Und der Kern verlangt es nicht.** Er hat vollständiges Lazy-FP: `fxsave64`/`fxrstor64` mit
+      `CR0.TS`-Trap auf x86, `CPACR_EL1.FPEN` auf aarch64 — genau damit User-Threads FP benutzen
+      *können*. Das `+soft-float` im **User**-Ziel ist aus der Entscheidung „soft-float
+      Microkernel" (ext-3/ext-5) mitgewandert; für den Kern ist sie richtig, für Userland nicht.
+
+      **Zwei Bedingungen, bevor das umgestellt wird:**
+      * **Auf x86 gibt es keine `fp`-Prüfzeile** — nur aarch64 misst den Lazy-FP-Pfad
+        (`fp : EL0-FP-Threads-OK=0b11/0b11, Owner-Wechsel=399`). SSE einzuschalten hiesse, einen
+        Pfad scharfzustellen, der auf dieser Architektur **nie ausgeführt** wurde. Dieselbe
+        Fehlerform wie „der Farbtest lag im x86-Hochlauf und lief auf aarch64 nie", nur
+        gespiegelt. Erst die Prüfzeile, dann das Ziel.
+      * **`fxsave` deckt x87/MMX/SSE ab, nicht AVX.** SSE/SSE2 sind mit dem vorhandenen Sicherer
+        erlaubt; AVX zu erlauben, ohne auf `xsave` umzustellen, wäre ein stiller
+        Registerverlust zwischen zwei Threads — die schlimmste Sorte Fehler.
+
+- [ ] **(2) Die IPC-Kosten sind NICHT GEMESSEN — und das ist die eigentliche Lücke.**
+      Es gibt im ganzen Baum keine Zyklenmessung eines IPC-Umlaufs. Auf einem Mikrokern ist das
+      die bestimmende Größe: jeder Dienstaufruf (Datei lesen, Speicher holen, futex wecken) ist ein
+      Umlauf statt eines Syscalls. **„Hohe Leistung" ohne diese Zahl ist ein Wunsch, keine
+      Aussage** — und ohne sie ist auch nicht entscheidbar, ob Punkt (3) und (5) sich lohnen.
+
+      Die Infrastruktur steht: `crates/sel4lake-sched/src/cycles.rs` (B-5.1), `hal::timer::cycles()`
+      mit `rdtscp`+`lfence`, und `cpuid` ist als Falle bereits bekannt (3556 statt 51 Zyklen unter
+      KVM). **Abnahme:** eine Zeile `ipccost` mit Median und Streuung über N Umläufe, getrennt nach
+      Fastpath (`switch_to`, gleicher Kern) und Umweg über den Scheduler — und eine Positivkontrolle,
+      die zeigt, dass die Messung einen künstlich verlangsamten Pfad auch sieht.
+
+- [ ] **(3) Jeder Adressraumwechsel leert den GANZEN TLB.** Die ASID ist heute „eine reine
+      **Software**-Nummer des Kernels" (`mmu.rs`), PCID ist nicht benutzt. Bei IPC-lastigen Lasten
+      wechselt der Adressraum zweimal je Umlauf. Steht als Optimierung schon in
+      [C3](#c3-cap--pd--ipc-tabellen-dynamisch); mit (2) wird es messbar statt plausibel.
+
+- [ ] **(4) Daten nicht durch IPC kopieren, sondern Speicher teilen.** Das Muster steht bereits:
+      die fs-PD liest über eine **geteilte Übertragungsfläche**, nicht über Nachrichtenwörter. Der
+      nächste Schritt ist, Dateiseiten direkt in die Client-PD zu mappen (`mmap` einer Datei) —
+      dann kostet ein Lesezugriff **null** IPC statt einem je Puffer.
+
+- [ ] **(5) Bündeln statt einzeln fragen.** Ein Ring aus Anforderungen und Fertigmeldungen
+      zwischen zwei PDs (io_uring-Form) macht aus N Umläufen einen. Das ist genau die Form, die
+      [Z17](#z17-turso-als-native-datenbank--vorgemessen-2026-08-09-nicht-begonnen) ohnehin
+      erwartet — Tursos I/O-Traits sind darum herum gebaut.
+
+- [ ] **(6) Was schon da ist und nur benannt gehört.** Budget-Spende (ADR 0019, `sc_donor`/
+      `sc_donee`): der Server rechnet auf dem Konto des Clients, statt eigene Zeit zu brauchen —
+      das ist die klassische Antwort auf „der Dienst wird nicht eingeplant, wenn der Client
+      wartet". Der IPC-Fastpath (`switch_to`) existiert ebenfalls.
+
+- [ ] **Reihenfolge.** (2) zuerst — ohne die Zahl ist alles Weitere geraten. Dann (1), weil es
+      die größte gemessene Einzelwirkung hat und fast nichts kostet, sobald die x86-`fp`-Prüfzeile
+      steht. Danach entscheidet die Messung, ob (3), (4) oder (5) zuerst lohnt.
+
 ### Z17. Turso als NATIVE Datenbank — vorgemessen 2026-08-09, nicht begonnen
 **Klasse:** Anwendung · **Aufwand:** klein für den Kern der Sache, groß für das Drumherum ·
 **Reihenfolge: NACH dem Rust-`std`-Port aus [Z16](#z16-quelltext-übersetzen-statt-binaries-laufen-lassen--bewertet-2026-08-09)**

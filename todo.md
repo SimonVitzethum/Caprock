@@ -546,13 +546,67 @@ ohne sie startet nicht einmal ein `main(){return 0;}`.
 **Grundsatz, der jede Einzelentscheidung unten bestimmt:** so wenig wie möglich in den Kernel. Für
 jeden Punkt steht deshalb dabei, was der Kernel *tun muss* und was Userland selbst erledigt.
 
-### Schritt 1 — A4: `CR4.OSFXSR` (der kleinste, und die Prüfzeile steht schon)
+### Schritt 0 — die Konsole (vorgezogen)
 
-- **Wo:** `kernel/src/arch/x86_64/mod.rs:80 ff.` (Boot-Assembler des BSP, dort wird heute `CR4.PAE`
-  gesetzt) **und** im AP-Hochlauf. **Zwei Stellen.** Eine zu vergessen heißt: FP läuft auf Kern 0
-  und nirgends sonst — und das fällt erst unter Last auf, also spät und teuer.
-- **Was:** `CR4.OSFXSR` (Bit 9) schaltet FXSAVE/FXRSTOR und SSE frei; `CR4.OSXMMEXCPT` (Bit 10)
-  lenkt SIMD-Ausnahmen auf `#XM` statt `#UD`.
+Jede Abnahme **ab Schritt 2** ist eine Ausgabe („Zig meldet `argc`", „zwei Threads melden
+verschiedene TLS-Werte", „gerechnetes Ergebnis"). Ohne Konsole wäre die erste Abnahme, die
+*fehlschlagen kann*, nicht von einer zu unterscheiden, die nur **nichts sagen kann** — genau die
+Prüfer-Falle aus dem eigenen Protokoll. Der Ringpuffer (TCB-neutral, der Kernel behält seine
+eigene Ausgabe) gehört deshalb **vor** Schritt 2.
+
+**Nicht vor Schritt 1:** dessen Abnahme ist die `fp`-Zeile, und die druckt der **Kernel**.
+Schritt 1 ist damit selbsttragend.
+
+### Schritt 1 — A4: SSE freischalten (VIER Bits) + die Eager/Lazy-Entscheidung
+
+- **`[~]` Angefangen am 2026-08-09, NICHT gelandet — s. „Stand" unten.**
+- **Vier Bits, nicht eines:**
+
+  | Bit | wofür |
+  |---|---|
+  | `CR0.EM` = **0** | solange gesetzt, faultet jede FP-Instruktion — **unabhängig** von OSFXSR |
+  | `CR0.MP` = **1** | lässt `WAIT`/`FWAIT` zusammen mit `TS` richtig trappen |
+  | `CR4.OSFXSR` = 1 | schaltet `FXSAVE`/`FXRSTOR` **und** SSE frei |
+  | `CR4.OSXMMEXCPT` = 1 | lenkt SIMD-FP-Ausnahmen auf `#XM` statt `#UD` |
+
+- **Auf JEDEM Kern** — `CR0`/`CR4` sind kernlokal. Eine gemeinsame Funktion `hal::fp::enable_sse()`
+  für BSP und AP, damit die zwei Stellen nicht auseinanderlaufen können, plus ein Zähler
+  „auf wie vielen Kernen freigeschaltet", der `num_cores()` sein muss.
+- **Vorher `CPUID.1:EDX` prüfen** (FXSR Bit 24, SSE Bit 25) — sonst `#GP` auf fremder Hardware.
+- **Die Abnahme läuft auf einem AP, nicht auf dem BSP.** Eine Sonde nur auf Kern 0 prüft genau die
+  eine Stelle, die man am ehesten richtig macht.
+
+- **Die Sicherheitsentscheidung gehört HIERHER: eager statt lazy.**
+  Lazy-FP über `CR0.TS` ist auf Intel **LazyFP, CVE-2018-3665** — spekulative Ausführung liest den
+  *alten* FP-Registersatz, bevor der `#NM`-Trap den Wechsel nachholt; die XMM-Register des vorigen
+  Threads werden über einen Spectre-Kanal auslesbar. Linux, Windows und die BSDs sind deshalb auf
+  eager umgestiegen.
+
+  **Bis heute war das folgenlos** — Userland war soft-float, SSE war aus, in XMM stand nichts. Mit
+  `enable_sse()` stehen dort echte Daten, und XMM ist genau der Ort, an dem
+  AES-NI-Schlüsselmaterial lebt. Für ein System, dessen Verkaufsargument Isolation ist, wäre lazy
+  über PD-Grenzen kein Abwägen zwischen Leistung und Sicherheit, sondern **zwischen Leistung und
+  der eigenen These**.
+
+  **Die Vorher-Zahl steht schon:** `Lazy-FP-Owner-Wechsel=399` aus der aarch64-Suite. Damit lassen
+  sich die Eager-Kosten beziffern, falls jemand zurückdrehen will — ohne sie wäre so ein Rückbau
+  eine Meinung.
+
+- **STAND (2026-08-09, ehrlich):** `enable_sse()` ist geschrieben (vier Bits, CPUID-Prüfung, eine
+  Funktion für beide Stellen), eager ist eingebaut, die Sonde läuft auf einem AP. **Der Lauf fällt
+  aus: die Sekundärkerne kommen nicht mehr hoch.** Ein eigener Fehler ist dabei gefunden und
+  behoben (`options(nostack)` an einem `asm!`-Block, der `push rbx` macht — eine Zusicherung, die
+  schlicht falsch war). Er war aber **nicht** die Ursache: auch mit abgeschaltetem Eager, ohne die
+  AP-Freischaltung und mit der Sonde zurück auf dem BSP bleibt SMP rot.
+
+  Die Arbeit liegt im **Stash** („Z19/A4 angefangen…"), der Baum steht wieder grün auf `61da820`.
+
+  **Nächste Schritte, in dieser Reihenfolge:** (a) den Stash Änderung für Änderung anwenden statt
+  in einem Stück — die drei Teile sind unabhängig und je einzeln prüfbar; (b) der erste Verdacht
+  ist die neu eingefügte `spawn_user_on_core_parked`: ihre Nachbarfunktion trägt den Kommentar
+  „Der Zielkern muss vorab via `bind_cores` gebunden sein", und das habe ich nicht getan; (c) der
+  zweite ist `enable_sse()` auf dem BSP selbst — `CR0.MP`/`EM` ändern das Verhalten von `CR0.TS`
+  auch für den **Kernel**, und der ist soft-float übersetzt.
 - **Vorher prüfen:** `CPUID.1:EDX.FXSR` und `.SSE`. Auf einer Maschine ohne beides ist das Setzen
   ein `#GP` — und der Kernel liefe unter `-cpu host` auf fremder Hardware.
 - **Abnahme:** `fp : ALL PASS` (`0b11`) — **und die Zeile wandert dann in `all_done()`**. Das ist

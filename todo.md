@@ -475,6 +475,86 @@ diese Zahl nicht erhöhen.
       Folge für die Reihenfolge: Stufe 1 (Speicher-Server) ist **nicht** Vorbedingung für den
       ersten WASM-Schritt — wohl aber für `memory.grow` und für mehr als einen Gast.
 
+### Z21. Linux-Treiber als PD-Prozesse — bewertet 2026-08-09
+**Klasse:** Kompatibilitätsschicht · **Aufwand:** groß, aber **einmalig statt je Treiber** ·
+**TCB:** neutral
+
+- [ ] **Möglich? Ja, und es ist erprobt — kein Neuschreiben, sondern ein BAU.** Genode fährt
+      Linux-Treiber in Userspace-Komponenten (`dde_linux`/`lx_emul`), Intel-Grafik eingeschlossen;
+      Rump-Kernel machen dasselbe für NetBSD. Entscheidend an dem Ansatz: **die echten
+      Linux-Quellen werden übersetzt**, gegen eine Emulationsschicht. Deshalb skaliert er auf viele
+      Treiber, statt einen zu ersetzen.
+
+- [ ] **Was die Schicht liefern muss** — die Liste ist lang, aber endlich:
+      Speicher (`kmalloc`/`vmalloc`, Seitenallokator, **DMA-API**), Synchronisation (Spinlocks,
+      Mutexe, Completions, Wait-Queues, RCU), Zeit (`jiffies`, `ktime`, Timer, Delays),
+      Nebenläufigkeit (`kthread`, Workqueues, Tasklets), **Interrupts** (`request_irq`, threaded
+      IRQs), PCI (Konfigurationsraum, BARs, MSI/MSI-X), Gerätemodell (`struct device`,
+      probe/remove), `request_firmware`, `readl`/`writel`/`ioremap`.
+
+- [ ] **Vier harte Stellen, die spezifisch für eine PD sind — und drei davon sind Arbeit, nicht
+      Zweifel:**
+
+      1. **`CAP_IRQ` fehlt.** Im Manifestformat definiert, nicht umgesetzt; jeder Treiber pollt.
+         Für GPU oder WiFi nicht gangbar. Braucht IRTE-Vergabe (B-3), und die Remapping-Tabelle
+         steht seit B-3.2 absichtlich auf „not present". **Das ist die konkrete Sperre.**
+      2. **„Interrupts sperren" ist in einer PD bedeutungslos.** `spin_lock_irqsave` ist in Linux
+         Ausschluss gegen den *eigenen* IRQ-Handler. In einer PD wird daraus Ausschluss zwischen
+         **Threads derselben PD** — braucht also Threads-in-PD (Z19) und die Abbildung
+         „Handler = Thread", was genau ein *threaded IRQ* ist.
+      3. **`virt_to_phys` gegen IOVA.** Linux-Treiber rechnen mit Physadressen. Hier sind `Pa` und
+         `Iova` **getrennte Typen** — die Verwechslung, die dieses Projekt absichtlich unmöglich
+         gemacht hat, ist in Linux-Treibern der Normalfall. Die DMA-API muss auf die DMA-Cap
+         abgebildet werden. Eher ein Vorteil (die Trennung existiert), aber Arbeit an jeder Stelle.
+      4. **Treiber schlafen.** `msleep`, `wait_event`. In einer PD heißt das IPC/Notification —
+         machbar, bestimmt aber die Struktur der ganzen Schicht.
+
+- [ ] **Der Preis, der nicht in Zeilen steht.**
+      * **Wartung:** Linux' *interne* API ändert sich mit jeder Version. Genode pinnt Kernelstände
+        und zieht periodisch nach. Das sind **Dauerkosten**, keine Einmalkosten — dieselbe Sorte,
+        die bei [Z17](#z17-turso-als-native-datenbank--vorgemessen-2026-08-09-nicht-begonnen) gegen
+        einen Fork gesprochen hat, hier aber unvermeidlich ist.
+      * **Lizenz:** Linux-Treiber sind GPLv2, dieses Projekt ist **BSD-2-Clause**. Die PD-Trennung
+        ist hier ein **Vorteil**: Treibercode in einem eigenen Prozess hinter einer IPC-Grenze ist
+        etwas anderes als ins Kernelbinary gelinkt. Die Emulationsschicht selbst wäre abgeleitetes
+        Werk und damit GPL — sauber trennbar, so löst Genode es auch. **Keine juristische Aussage,
+        aber die Architektur steht auf der günstigeren Seite.**
+
+- [ ] **Mesa: neu übersetzen JA, portieren NEIN — und der Grund stützt den ganzen Entwurf.**
+
+      Mesa läuft **schon** in Userspace. Die Linux-Trennung ist:
+      Kern = i915/xe (Modesetting, Speicherverwaltung, Command-Submission) ·
+      Userspace = Mesa/`iris` (Shader übersetzen, Command-Buffer bauen) → `ioctl` auf `/dev/dri/cardN`.
+
+      **Die DRM-uAPI ist stabil und dokumentiert; die interne Kernel-API ist es nicht.** Die
+      PD-Grenze fällt also genau dorthin, wo die Schnittstelle stabil ist — die instabile Seite
+      liegt *innerhalb* der Schicht. Das ist kein Zufall, sondern derselbe Schnitt, den Linux
+      selbst zieht.
+
+      Mesa braucht damit:
+      * **Neu übersetzen** gegen die SEL4Lake-libc — wie alles in Z16, kein Sonderfall.
+      * `ioctl` → **IPC**. Genau die Form, die `virtio-blk` heute schon hat: OP-Codes über einen
+        Endpoint (`OP_INFO`/`OP_READ`/`OP_WRITE`/…). Die ABI dieses Kernels kennt kein `ioctl`
+        (0 Vorkommen) und braucht auch keines.
+      * `mmap` von GEM-Puffern → Speicher-Caps + `SYS_MAP`.
+      * Fences/Sync → Notifications.
+
+      **Mesa wird also nicht umgeschrieben**, und dieser Teil veraltet auch nicht mit jeder
+      Linux-Version.
+
+- [ ] **Sinnvoll? Bedingt ja — und die Bedingung ist die Reihenfolge.**
+      * Für den **Server** ist es **nicht** der nächste Schritt. NVMe (~1500 Zeilen, selbst
+        geschrieben) und die RTL8168 sind billiger als eine Linux-Schicht, und ein Server braucht
+        keine GPU.
+      * Für den **Desktop** ist es der einzige realistische Weg — i915 neu zu schreiben ist keiner.
+      * **Der Wendepunkt:** sobald mehr als zwei oder drei nichttriviale Linux-Treiber gebraucht
+        werden, ist die Schicht billiger als die Einzelportierungen. Bei WiFi (MT7925, `mac80211`)
+        allein wäre sie es vermutlich schon.
+
+      **Empfehlung: nicht jetzt.** Aber **`CAP_IRQ` ist Vorbedingung für beides** — für eigene
+      Treiber wie für geliehene — und gehört deshalb vorgezogen, unabhängig davon, wie diese Frage
+      entschieden wird.
+
 ### Z20. Was bis zu einem nutzbaren SERVER-OS fehlt — und was ein Desktop kosten würde
 **Klasse:** Einordnung · **Stand:** 2026-08-09 · Messwerte sind gemessen, Schätzungen sind als
 solche markiert.

@@ -475,6 +475,82 @@ diese Zahl nicht erhöhen.
       Folge für die Reihenfolge: Stufe 1 (Speicher-Server) ist **nicht** Vorbedingung für den
       ersten WASM-Schritt — wohl aber für `memory.grow` und für mehr als einen Gast.
 
+### Z17. Turso als NATIVE Datenbank — vorgemessen 2026-08-09, nicht begonnen
+**Klasse:** Anwendung · **Aufwand:** klein für den Kern der Sache, groß für das Drumherum ·
+**Reihenfolge: NACH dem Rust-`std`-Port aus [Z16](#z16-quelltext-übersetzen-statt-binaries-laufen-lassen--bewertet-2026-08-09)**
+
+- [ ] **Erst die Rollenfrage, denn daran hing eine Fehlentscheidung.** `sqlite3` steht in Z16 als
+      **Messinstrument**, nicht als Nutzlast: die Abnahme „sqlite3 besteht seine Testsuite" prüft
+      nicht, ob es eine Datenbank gibt, sondern ob die POSIX-Schicht `fcntl`-Sperren, `fdatasync`,
+      `pread64`/`pwrite64` und die Fehlerpfade richtig macht — unter einer Last, die ein fremdes
+      Team über 25 Jahre gehärtet hat.
+
+      **Es durch eine Rust-Neuimplementierung zu ersetzen wäre zirkulär:** die Plattform würde mit
+      Software geprüft, die durch den **eigenen** Rust-`std`-Port läuft — also über einen Unterbau,
+      den dieses Projekt selbst geschrieben hat. Über die musl-Schicht, die der Meilenstein misst,
+      bewiese das nichts. Dazu die Abhängigkeitsinversion: Turso braucht den Rust-`std`-Port, und
+      der kommt in Z16 **nach** dem sqlite3-Meilenstein — die Abnahme von Stufe 5 stünde auf
+      Stufe 7.
+
+      **Z16 bleibt deshalb unverändert.** `sqlite3` in C über musl.
+
+- [ ] **Und ein Fork wäre die schlechteste der Varianten.** Ein eigener Zweig eines Beta-Projekts
+      mit Vollzeit-Team ist ein Dauer-Rebase gegen ein bewegliches Ziel. Entweder from scratch
+      oder upstream unverändert — aber keine gepflegte Divergenz.
+
+- [ ] **Wo es richtig gut ist: als natives Backend, das die POSIX-Schicht UMGEHT.** Turso
+      abstrahiert seine I/O hinter Traits; io_uring ist **ein** Backend, nicht die Annahme. Ein
+      SEL4Lake-Backend bildete diese Traits direkt auf IPC und Caps ab — kein `fcntl`, keine vDSO,
+      kein VFS-Umweg — und wäre ein **Upstream-Beitrag statt eines Forks**. Es wäre zugleich die
+      erste Anwendung, die den eigentlichen Vorteil dieser Architektur zeigt: native Software
+      **braucht** die POSIX-Umgebung nicht, nur die Kompatibilitätsschicht bekommt sie.
+
+- [ ] **Die Vormessung, vor der ersten Zeile** (2026-08-09, `tursodatabase/turso`, flacher Klon):
+
+      | | |
+      |---|---|
+      | Vorhandene Backends | **7** (`io_uring`, `unix`, `windows`, `win_iocp`, `generic`, `memory`, `vfs`) — die Abstraktion trägt nachweislich |
+      | `trait File` | 17 Methoden, davon **7 ohne Vorgabe** |
+      | `trait IO` | 15 Methoden, davon **2 ohne Vorgabe** |
+      | Pflichtfläche insgesamt | **9 Methoden** |
+      | Kleinstes vollständiges Backend (`generic.rs`) | **117 Zeilen** |
+      | `supports_shared_wal_coordination` | Vorgabe **`false`** — die ganze `shared_wal_*`-Familie ist freiwillig |
+
+      **Und die Zuordnung auf das, was SEL4Lake schon hat:**
+
+      | Methode | Abbildung | Stand |
+      |---|---|---|
+      | `pread` / `pwrite` | Blockdienst `OP_READ`/`OP_WRITE` (sektorweise, positionsbehaftet) | **steht** (A-6.1) |
+      | `sync` | `OP_FLUSH` | **steht** |
+      | `size` | `OP_INFO` bzw. die Dateigröße der fs-PD | **steht** |
+      | `open_file` | fs-PD | halb (A-6.3 liest eine Datei; keine Pfade) |
+      | `truncate`, `remove_file` | fs-PD, FAT-Ebene | fehlt, gewöhnliche Arbeit |
+      | `current_time_*` | die vDSO-Seite aus **W2** | fehlt, billig |
+      | `lock_file` / `unlock_file` | **hier ist das Cap-Modell BESSER als POSIX** | s. u. |
+
+      Vier der neun bilden also direkt auf den vorhandenen Blockdienst ab.
+
+- [ ] **Der interessante Punkt sind die Sperren, und er fällt zu unseren Gunsten aus.**
+      `generic.rs` macht `lock_file` als **No-Op** (`Ok(())`) — das Backend nimmt an, es sei der
+      einzige Schreiber. POSIX-`fcntl`-Sperren sind beratend, prozessweit und berüchtigt
+      brüchig; auf einem Cap-System ist „exklusiver Zugriff auf diese Datei" dagegen genau das,
+      was eine **Cap** ausdrückt: wer sie hat, hat ihn, und es gibt keinen zweiten Weg.
+
+      Das ist der Satz, der diesen Strang lohnend macht — nicht „läuft auch", sondern „ist hier
+      strenger als auf Linux". Er ist allerdings **unbelegt**, solange es das Backend nicht gibt,
+      und gehört deshalb nicht in `docs/invariants.md`, bevor er gemessen ist.
+
+- [ ] **Abnahme, wenn es soweit ist: nicht „läuft", sondern „besteht Tursos DST-Suite"** —
+      deterministische Simulation und Fuzzing. Mit dem Vorbehalt, der dazugehört: das ist ein
+      **Kompatibilitätstest gegen SQLite**, kein eigenständiges Korrektheitskorpus in der
+      Größenordnung von TCL plus TH3. Als Messlatte für *das Backend* reicht es; als Messlatte für
+      die Dateisemantik einer Plattform wäre es das schwächere Instrument — genau deshalb bleibt
+      `sqlite3` in Z16 stehen.
+
+- [ ] **Vorbehalt zum Reifegrad, aus zweiter Hand und nicht selbst gemessen:** die Maintainer
+      bezeichnen libSQL als produktionsreif und die Rust-Engine als Beta. Vor einem Produktschritt
+      wäre das nachzuprüfen; für einen Backend-Beitrag ist es unerheblich.
+
 ### Z16. Quelltext übersetzen statt Binaries laufen lassen — bewertet 2026-08-09
 **Klasse:** Produktstrang · **Aufwand:** groß, aber **eine Größenordnung kleiner als
 Binärkompatibilität** · **Randbedingung:** Isolation und kleine TCB bleiben.

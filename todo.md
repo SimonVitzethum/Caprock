@@ -475,6 +475,54 @@ diese Zahl nicht erhöhen.
       Folge für die Reihenfolge: Stufe 1 (Speicher-Server) ist **nicht** Vorbedingung für den
       ersten WASM-Schritt — wohl aber für `memory.grow` und für mehr als einen Gast.
 
+### Z24. Der Blockadegrund ist eine MENGE, keine Bit-Sammlung — geplant 2026-08-09
+**Klasse:** Struktur · **Ersetzt** den ursprünglich als „Spurious-Wake-Vertrag" geplanten Schritt;
+der Vertrag bleibt, aber als Beigabe, nicht als Kern.
+
+**Warum das kein weiterer Waechter ist, sondern ein Umbau: es ist die DRITTE Instanz derselben
+Klasse.**
+
+| | |
+|---|---|
+| D9 | `blocked` trug drei Bedeutungen → `budget_blocked` abgespalten |
+| Z22 P4 | `parked` als weiteres Bit dazu |
+| 2026-08-09 | die Naht `thaw × park` reisst — verlorenes Wecken **und** verlorenes Pausieren |
+
+Jede Abspaltung repariert die letzte Kollision und **stellt die nächste auf**. Der Checkpoint,
+`thread_quiescence` und jeder künftige Grund (Signalzustellung aus Z16 steht schon auf der Liste)
+müssen jeweils **alle** Bits kennen, und jede Stelle, die eines vergisst, ist ein neuer stiller
+Pfad. Beim dritten Mal ist das Muster kein Zufall.
+
+- [ ] **`blocked_reasons: BitSet`** (IPC · Budget · Pause · Park · …). Lauffähig **genau dann,
+      wenn die Menge leer ist**. `unblock(grund)` entfernt **einen** Grund und plant **nur bei
+      leerer Menge** ein.
+      Damit ist `thaw` **per Konstruktion unfähig**, einen geparkten Thread zu wecken: es entfernt
+      *Pause*, *Park* bleibt, die Menge ist nicht leer. Der gefundene Fehler wird nicht behoben,
+      sondern **unformulierbar** — und die vierte Instanz kann nicht entstehen.
+      Der Umbau ist klein: die Bits existieren, sie werden zur Menge zusammengezogen.
+
+- [ ] **Die D9-Aussage wird vom Sonderfall zur Instanz einer Regel.** „`unpark` weckt keinen
+      IPC-Wartenden" ist dann kein eigener Wächter mehr, sondern folgt aus „`unpark` entfernt
+      *Park*, sonst nichts".
+
+- [ ] **Verlorenes PAUSIEREN braucht die Menge — der Vertrag fängt es NICHT.** `while` statt `if`
+      macht Warteplätze robust gegen überzählige Wecks. Aber „`PDCTL PAUSE` wird durch den `unpark`
+      eines Geschwisters still aufgehoben" ist **kein** spurious wake, sondern der Verlust einer
+      **Autoritätsentscheidung** — ein Debugger oder der Gruppenschnitt aus Z23 pausiert und sieht
+      den Thread trotzdem laufen. Keine Zusicherung auf der Warteseite deckt das.
+      Ohne die Menge braucht dieser Fall eine **eigene** Gegenprobe.
+
+- [ ] **Der Spurious-Wake-Vertrag bleibt — mit gedrehter Begründung.** Nicht „das System erzeugt
+      heute spurious wakeups, also legitimieren wir sie", sondern: der Vertrag ist
+      **Verteidigungstiefe**, während die Grund-Menge dafür sorgt, dass der Kernel sie **nicht mehr
+      systematisch erzeugt**. Ein Kernel, der Wecks gratis verteilt und sich auf die Schleifen
+      seiner Nutzer verlässt, hat die Beweislast nur verschoben.
+      Als Satz in `sel4lake-wait` (`while`, nie `if`) **und** als injizierte Gegenprobe: ein
+      überzähliger Weckruf darf keine der elf Aussagen kippen.
+
+- [ ] **Der Scheduler-Modelltreue-Wächter prüft den Umbau mit** — `parked`/`park_wake` sind dort
+      schon als „ausserhalb des Modells" eingetragen und müssen auf die Menge umgeschrieben werden.
+
 ### Z23. Prozess-Freeze — geplant 2026-08-09, NICHT begonnen
 **Klasse:** Nebenstrang · **Vorbedingung:** mehrere Threads je PD (Z22 P2, offen) — ohne die ist
 jeder Nachweis hier nur ein zweites Z4a
@@ -510,6 +558,19 @@ Die Bausteine sind da (`endpoint_quiesce`/`ERR_QUIESCING`, `thread_quiescence`, 
       öffentlicher Weg an die ThreadIds, kein `Drop` (sonst liesse sich der Inhalt beim Auftauen
       nicht herausbewegen) — und ein ausdrückliches `abort_freeze`, das die schon eingefrorenen
       wieder auftaut. Bewacht wie `tools/zulassung.sh`, mit Selbsttest in beide Richtungen.
+
+- [ ] **Was das NACH AUSSEN heisst, und es gehört in beide Protokolle.** „Der Checkpoint trägt
+      keinen Thread" bedeutet: **Resume-Latenz und Live-Migration haben derzeit kein messbares
+      Objekt.** Was existiert, ist ein **Anwendungs**-Checkpoint (Fortschrittszähler +
+      Cap-Klassifikation); eine Latenzzahl darauf misst etwas anderes, als „Resume" in einer
+      PaaS-Zusage bedeutet.
+      **Der Zwei-Phasen-Gruppenschnitt muss als Entwurf spezifiziert sein, BEVOR Benchmarks nach
+      aussen benannt werden** — sonst entsteht die Zahl zuerst und definiert rückwirkend, was sie
+      gemessen haben soll. Der Satz, der dafür fehlt, ist die Reihenfolge **mit ihren
+      Fehlerfällen**: was passiert mit einer Transaktion, die nicht ausläuft — Frist, Abbruch, oder
+      Vererbung an den Checkpoint? Drei verschiedene Zusagen, und keine davon ist getroffen.
+      (Dieselbe Ehrlichkeit wie „*ein Thread überlebt eine Bootgrenze* liest sich stärker, als die
+      Sache ist". **Gehört auch ins Velve-Protokoll**, nicht nur hierher.)
 
 - [ ] **S4 — den Zustand aufzählen, der mitwandern MUSS.** Heute wandert **nichts**: `Image` trägt
       `progress`, `nonce`, `epoch`, `caps` — eine Anwendungsgrösse und die Cap-Klassifikation. Kein

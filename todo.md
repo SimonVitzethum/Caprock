@@ -592,27 +592,45 @@ Schritt 1 ist damit selbsttragend.
   sich die Eager-Kosten beziffern, falls jemand zurückdrehen will — ohne sie wäre so ein Rückbau
   eine Meinung.
 
-- **STAND (2026-08-09, ehrlich):** `enable_sse()` ist geschrieben (vier Bits, CPUID-Prüfung, eine
-  Funktion für beide Stellen), eager ist eingebaut, die Sonde läuft auf einem AP. **Der Lauf fällt
-  aus: die Sekundärkerne kommen nicht mehr hoch.** Ein eigener Fehler ist dabei gefunden und
-  behoben (`options(nostack)` an einem `asm!`-Block, der `push rbx` macht — eine Zusicherung, die
-  schlicht falsch war). Er war aber **nicht** die Ursache: auch mit abgeschaltetem Eager, ohne die
-  AP-Freischaltung und mit der Sonde zurück auf dem BSP bleibt SMP rot.
+- **STAND (2026-08-09, nach einem zweiten Anlauf mit besserer Methodik):**
 
-  Die Arbeit liegt im **Stash** („Z19/A4 angefangen…"), der Baum steht wieder grün auf `61da820`.
+  **Zuerst das Messinstrument geprüft, wie es sich gehört.** Die Baseline `61da820` zwanzigmal
+  gebootet: **20 von 20 mit identischer Signatur.** Damit war der Widerspruch „sauberer Baum grün,
+  alles abgeschaltet rot" aufgelöst — die Baseline ist nicht flaky, also war **mein Abschalten
+  unvollständig**. Genau so ist es gewesen.
 
-  **Nächste Schritte, in dieser Reihenfolge:** (a) den Stash Änderung für Änderung anwenden statt
-  in einem Stück — die drei Teile sind unabhängig und je einzeln prüfbar; (b) der erste Verdacht
-  ist die neu eingefügte `spawn_user_on_core_parked`: ihre Nachbarfunktion trägt den Kommentar
-  „Der Zielkern muss vorab via `bind_cores` gebunden sein", und das habe ich nicht getan; (c) der
-  zweite ist `enable_sse()` auf dem BSP selbst — `CR0.MP`/`EM` ändern das Verhalten von `CR0.TS`
-  auch für den **Kernel**, und der ist soft-float übersetzt.
-- **Vorher prüfen:** `CPUID.1:EDX.FXSR` und `.SSE`. Auf einer Maschine ohne beides ist das Setzen
-  ein `#GP` — und der Kernel liefe unter `-cpu host` auf fremder Hardware.
-- **Abnahme:** `fp : ALL PASS` (`0b11`) — **und die Zeile wandert dann in `all_done()`**. Das ist
-  der eigentliche Abschluss, nicht die grüne Zeile: solange sie nicht gattert, ist sie Dekoration.
-- **Gegenprobe:** eine Mutation, die den `fxsave64`-Zweig überspringt, muss die Zeile rot machen.
-  Ohne sie belegt `ALL PASS` nur, dass SSE geht — nicht, dass **gesichert** wird.
+  **Die Binärdifferenz hat es bewiesen statt es zu vermuten.** Sektionsadressen identisch, `.text`
+  und `.data` unverändert, einziger echter Symbolunterschied `SSE_CORES` in `.bss` — und der
+  `enable_sse()`-Aufruf auf dem **BSP** war die ganze Zeit noch drin. Die Frage „war das
+  Abschalten vollständig?" gehört mechanisiert, nicht der eigenen Sorgfalt überlassen.
+
+  **Es waren ZWEI Fehler, und ich habe sie über die Zwischenbehebung hinweg vermengt:**
+  1. `options(nostack)` an einem `asm!`-Block, der `push rbx` macht — **das war die SMP-Ursache**,
+     und die Behebung war richtig. Dass ich sie damals *nicht* zur Ursache erklärt habe, war
+     ebenfalls richtig, aber aus dem falschen Grund: die Messung stützte es nicht, weil der zweite
+     Fehler sie überdeckte.
+  2. `SSE_CORES` hinter `#[cfg(feature = "selftest")]`, die Aufrufstelle im Hochlauf aber
+     unbedingt → **`--no-default-features` baute nicht mehr**, und genau das prüft die Suite (F1).
+
+  **Das verbleibende Symptom hatte ich zweimal falsch gelesen.** Es ist **kein** Testfehlschlag,
+  sondern ein **Hänger**: der Lauf reißt das 120-s-Limit, und alle 14 `FAIL`-Zeilen sind Folgen
+  davon. Erst beim dritten Hinsehen die vollständige Liste gelesen statt der ersten drei Zeilen.
+
+  **Die Ursache, so weit eingegrenzt wie es heute geht:** der CPUID-Block allein ist harmlos (Lauf
+  grün). **Jedes einzelne der vier Bits** hängt den Kern — CR0-allein wie CR4-allein. Alle vier
+  haben dieselbe Wirkung auf die Fault-Leitung: FP/SSE-Instruktionen lösen kein `#UD` mehr aus,
+  sondern `#NM`. Der `#NM`-Hook ist installiert (`system.rs:751` → `fp_trap`), aber er ist auf x86
+  **noch nie ausgeführt worden**: mit `CR0.EM = 1` war SSE ein `#UD`, und x87 benutzt ein
+  soft-float-Kernel nicht. **SSE freizuschalten macht toten Code lebendig** — und der hängt.
+
+  **Nächster Schritt, konkret:** `fp_trap` und den x86-`#NM`-Pfad daraufhin lesen, welche
+  Annahmen sie treffen, die nie geprüft wurden. Die naheliegenden Kandidaten sind der
+  `FpState`-Slab-Zugriff aus einem Trap heraus (Sperrordnung!) und `clear_ts` vor dem `fxrstor64`.
+  Ein Melder im Hook, der die **erste** Ausführung zählt, wäre der billigste Anfang — bei
+  totem Code ist „lief nie" von „lief und hing" sonst nicht zu unterscheiden.
+
+  Der Baum steht grün auf `0715651`; die Arbeit ist verworfen und aus der Beschreibung
+  rekonstruierbar (sie war klein: eine Funktion, vier Bits, zwei Aufrufstellen).
 
 ### Schritt 2 — A1: der Prozessstart-Stack
 

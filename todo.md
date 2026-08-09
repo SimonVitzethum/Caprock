@@ -632,6 +632,73 @@ Deshalb eigene Arten:
 `tcb_cap` sagt **wessen** Syscalls (und die hält, wer den Thread kontrolliert — nicht der Handler),
 die beiden anderen sagen **wohin**.
 
+#### VIER NACHTRÄGE VOR DEM BAU (Einwand vom 2026-08-09, alle vier berechtigt)
+
+**(1) Dieser Strang KEHRT EINE PROTOKOLLIERTE ENTSCHEIDUNG UM — und sagte es nicht.**
+Z16 steht auf dem Satz: *„Quelltext klonen und übersetzen streicht die Binärkompatibilität — und
+damit die Syscall-Abfangung, genau das, woran WSL1 und gVisor gescheitert sind."* Ein
+`SyscallHandler`, der Gast-Syscalls an eine Persönlichkeits-PD umleitet, **IST** die
+Syscall-Abfangung — der WSL1-Bauplan mit besserer Cap-Hygiene.
+Die Umkehr ist vermutlich **richtig** (unveränderte Binaries, Go ohne libc, Kunden-Workloads, die
+niemand neu übersetzt) — aber sie ist eine **neue Entscheidung gegen eine alte** und gehört mit
+ihrem Grund ins Protokoll, nicht implizit in einen Cap-Entwurf. Sonst stehen hier zwei Stränge mit
+widersprechenden Prämissen, und in drei Monaten weiss niemand, welcher gilt.
+**Und die alte Analyse stellt eine Forderung an die neue:** WSL1 scheiterte **nicht** an der
+Umleitungsmechanik, sondern an der **Verhaltenstreue** dahinter. Die wird durch eine Cap kein
+Gramm leichter.
+
+**(2) Die Autoritätsliste ist registergross geschrieben und damit falsch.** Drei Löcher,
+aufsteigend:
+* **Welche Register?** `rax` genügt für `read`. `rt_sigreturn` ersetzt den **kompletten**
+  Trap-Frame, `clone` braucht einen **zweiten** Frame auf neuem Stack, Signalzustellung schreibt
+  `rsp`/`rip`. Entweder darf `REPLY` den ganzen Frame schreiben — dann ist die Cap faktisch eine
+  **Debugger-Cap** und „kann den Gast belügen: ja" untertreibt noch — oder sie darf es nicht, und
+  die Persönlichkeit kann Signale und `clone` **nicht** implementieren. **Diese Grenzziehung ist
+  die eigentliche Entscheidung und fehlt.**
+* **Die Argumente.** Fast jeder Linux-Syscall übergibt **Zeiger**. Der Handler muss Gast-Speicher
+  lesen und schreiben (`copy_from_user`-Äquivalent) — Zugriff auf den **gesamten**
+  Gast-Adressraum, um Grössenordnungen breiter als ein Ergebnisregister. Woher kommt sie:
+  Mapping des Gast-AS in die Handler-PD (**welche Cap trägt das?**) oder ein Kernel-Kopierdienst
+  (**TCB-Kosten je Syscall**)?
+* **`mmap`.** Der `FaultHandler` **sieht** Seitenfehler; sie zu **beheben** heisst, Mappings im
+  **Gast-Vspace** zu installieren — eine dritte Autorität, die in `SYS_SETHANDLER` nicht vorkommt.
+
+**Ehrlich zusammengezählt hält die Persönlichkeits-PD: Frame-Schreibrecht, vollen Speicherzugriff,
+Vspace-Manipulation. Sie IST der Kernel des Gastes** und gehört in dessen TCB — das ist in Ordnung,
+aber der Eintrag muss es **so nennen**, statt die Autorität klein zu schreiben. Die
+Manifest-Deklarierbarkeit wird dadurch **wichtiger**: in der signierten Fläche steht dann, wer
+Gast-Kernel sein darf, und das ist genau die Zeile, die ein Auditor sucht.
+
+**(3) Die Blockiernaht ist die FÜNFTE Instanz — diesmal vorhersagbar statt gefunden.**
+Ein Gast-Thread, der auf die Handler-Antwort wartet, ist blockiert, mit einem **neuen Grund**. Der
+gehört **von Tag eins** in die Grund-Menge ([Z24](#z24)), sonst wiederholt sich die Park-Naht:
+`thaw` weckt einen Handler-Wartenden, der `unpark` eines Geschwisters verbraucht die Marke, und der
+Gast läuft **mit halbem Syscall** weiter.
+Dazu drei Nähte, die heute niemand nennt:
+* **Zu Z23:** eine Persönlichkeits-PD einzufrieren macht **alle ihre Gäste** unfrierbar oder
+  hängend — die Partner-Nennung in der Freeze-Absage muss den Handler-Wartefall kennen.
+* **Die asynchrone Hälfte der Entzugs-Regel:** stirbt die Handler-PD, muss der wartende Gast
+  **sofort** faulten, nicht ewig warten. „Faulten statt zurückfallen" deckt bisher nur den
+  synchronen Fall.
+* **Zyklen:** A behandelt B, B behandelt A ist ein **Deadlock per Konstruktion**. Die billige
+  Absage — „Threads einer PD mit `SyscallHandler`-Bindung dürfen selbst nicht gebunden werden" —
+  muss **im Kernel** stehen, nicht in der Doku.
+
+**(4) Die Messmatrix, mit Schwelle VORHER.** Umlauf gegen nativen Syscall ist nur der **Sockel**;
+je Syscall kommen die Speicherzugriffe des Handlers auf Gast-Puffer dazu, und die **dominieren**
+bei `read`/`write` mit realen Grössen. Also zwei Lasten:
+| Last | misst |
+|---|---|
+| `getpid` (null Argumente) | den Sockel: Umlauf, Marshalling, Rückkehr |
+| `read` mit 4 KiB und 64 KiB | den Vollpfad **mit** Gast-Speicherzugriff |
+**Die Schwelle, ab der die cap-förmige Fassung fällt, steht VOR der Messung fest** — sonst wird
+danach verhandelt, was vorher hätte feststehen müssen.
+**Und der Fuchsia-Vergleich hinkt in BEIDE Richtungen:** `switch_to` spart den Scheduler (zu
+unseren Gunsten) — aber `restricted mode` spart auch den **Adressraumwechsel**, weil Gast und
+Supervisor sich einen teilen, und diese Fassung wechselt **zweimal je Syscall** (zu unseren
+Lasten). Das ist genau die TLB-Frage aus **Z18 (3)**, und die PCID/ASID-Zahl von dort ist die
+zweite Hälfte der Rechnung.
+
 #### Die Regel, ohne die es eine Rechteausweitung wäre
 
 **Fällt die Handler-Cap weg (gelöscht, entzogen, Handler tot), muss der Gast FAULTEN — nicht auf

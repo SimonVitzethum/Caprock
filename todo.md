@@ -475,6 +475,58 @@ diese Zahl nicht erhöhen.
       Folge für die Reihenfolge: Stufe 1 (Speicher-Server) ist **nicht** Vorbedingung für den
       ersten WASM-Schritt — wohl aber für `memory.grow` und für mehr als einen Gast.
 
+### Z20. Was bis zu einem nutzbaren SERVER-OS fehlt — und was ein Desktop kosten würde
+**Klasse:** Einordnung · **Stand:** 2026-08-09 · Messwerte sind gemessen, Schätzungen sind als
+solche markiert.
+
+- [ ] **Server-OS: erreichbar, und der vorhandene Plan deckt den größeren Teil.** Z19 liefert das
+      Substrat, Z16 die libc, Z14 den Speicher-Server. **Was darüber hinaus fehlt und heute in
+      keinem Punkt steht:**
+
+      | fehlt | Größe (Schätzung) | TCB |
+      |---|---|---|
+      | **Dateisystem über FAT16 hinaus** — Verzeichnisse, Pfade, VFS; FAT16 mit *einer* Datei ist kein Serverdateisystem | groß, aber abhängigkeitsfrei wie `sel4lake-part`/`-fat` | neutral |
+      | **TCP/IP** — `smoltcp` in einer PD (Rust, `no_std`, erprobt) | Wochen zum Laufen, Monate zur Härtung | neutral |
+      | **NVMe-Treiber** — `virtio-blk` läuft nur in VMs | klein: Queue-Paare, Admin- + IO-Queue, PRP-Listen | neutral (PD) |
+      | **Realtek RTL8168** — die Netzkarte dieses Laptops, klassisch und dokumentiert | mittel, weit billiger als WiFi | neutral (PD) |
+      | **Eigenständiger Boot auf Blech** | GRUB-ISO steht; offen sind ACPI/APIC auf echten Chipsätzen | — |
+      | **Dienstverwaltung, Protokollierung, Konfiguration** | mittel | neutral |
+
+      **Der Ist-Stand auf echter Hardware ist besser als „nie".** Die Kern-Übergabe
+      (`tools/handover/`, Stufen 0/1a/1b belegt) nimmt fünf E-Cores offline und schickt ihnen
+      INIT-SIPI-SIPI — SEL4Lake hat auf diesem Blech schon Befehle ausgeführt, nur nicht
+      eigenständig.
+
+      **Schätzung, ausdrücklich als solche:** ein *demonstrierbarer* Server — statisch gebaute
+      Rust/C-Binaries, HTTP über `smoltcp`, Daten auf NVMe, eigenständig gebootet — liegt bei
+      **6–12 Monaten** fokussierter Arbeit für eine Person. *Nutzbar* im Sinne von „ein Fremder
+      betreibt das" eher **1–3 Jahre** mit kleinem Team. Was die Schätzung trägt: jeder Punkt oben
+      ist **begrenzt und TCB-neutral**, und genau eine Zeile im ganzen Vorhaben braucht den Kernel.
+
+- [ ] **Desktop mit KDE auf diesem Laptop: zwei bis drei Größenordnungen mehr — und nicht dieselbe
+      Art Arbeit.** Das ist der Punkt: die Volumina liegen dort, wo Messen und kleine TCB sie
+      **nicht** verkleinern.
+
+      | Baustein | warum es die Kategorie sprengt |
+      |---|---|
+      | **Grafik** | KDE braucht einen Compositor mit OpenGL/Vulkan. Auf Raptor Lake heißt das ein moderner DRM-Treiber: GuC-Firmware, GEM/TTM, Modesetting, Display-Pipes. **Das i915-Modul dieser Maschine ist 1,9 MB übersetzt — die gesamte TCB dieses Kernels ist 236 KiB.** Eine kleine Fassung gibt es nicht. |
+      | **Ausweg Framebuffer** | EFI-GOP ohne Beschleunigung ist machbar — ohne 3D, ohne Videodekodierung, ohne Moduswechsel, ohne externen Monitor, ohne Hotplug |
+      | **Qt6** | ~5 Mio. Zeilen, braucht volles POSIX plus fontconfig, freetype, harfbuzz, ICU, D-Bus, Wayland. Portierbar (QNX zeigt es), aber ein eigenes Projekt |
+      | **KDE Frameworks + Plasma** | nochmals Millionen Zeilen darüber |
+      | **WiFi MT7925** | 802.11be, sehr neu; braucht Firmware und setzt auf `mac80211` (~200k Zeilen) auf |
+      | **Eingabe** | xHCI + USB-HID + I2C-HID (Touchpad) + eine libinput-artige Schicht |
+      | **Suspend/Resume, Akku, Thermik, Helligkeit** | berührt **jeden** Treiber — kein Feature, sondern eine Eigenschaft des ganzen Systems |
+
+      **Und es dient der Produktthese nicht.** Die These ist eine Cloud für Vercel-artige Dienste,
+      Isolation durch den Kern statt durch VMs. Ein Desktop wäre ein Hobbymeilenstein.
+
+- [ ] **Die interessante Mitte, geteilt mit dem Serverpfad: HEADLESS auf echtem Blech.**
+      NVMe + RTL8168 + serielle oder Framebuffer-Konsole, eigenständig gebootet. Belegt „läuft auf
+      echter Hardware" — heute nur halb wahr — und **jede Zeile zählt für den Server**.
+
+      Nebenbei fällt dort etwas, das dieses Projekt ausdrücklich offen führt: die Farbtrennung (A1)
+      ist **auf Blech** als Wirkung messbar, unter KVM strukturell nicht (§12).
+
 ### Z19. Das SUBSTRAT der Sprachlaufzeiten — was C/C++/Rust/Zig brauchen, bevor irgendein Dienst existiert
 **Klasse:** Grundlage · **Aufwand:** überschaubar und **vollständig aufzählbar** ·
 **Abgrenzung:** ohne Netzstack, ohne Dateisystem — nur, was eine Laufzeit zum *Starten und Rechnen*

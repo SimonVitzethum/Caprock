@@ -502,8 +502,45 @@ Die Gründe sind aber benennbar und einzeln messbar.
       *können*. Das `+soft-float` im **User**-Ziel ist aus der Entscheidung „soft-float
       Microkernel" (ext-3/ext-5) mitgewandert; für den Kern ist sie richtig, für Userland nicht.
 
+      **BERICHTIGUNG (2026-08-09, nach Einwand): das ist kein Leistungspunkt, sondern ein
+      Z16-BLOCKER auf x86.** Die x86-64-SysV-ABI *setzt SSE2 voraus* — `double` wird in
+      XMM-Registern übergeben und zurückgegeben. Nachgemessen an derselben Funktion `f64 -> f64`:
+
+      | | Argumente | Rückgabe |
+      |---|---|---|
+      | normales x86_64 (SysV) | `%xmm0`, `%xmm1` | `%xmm0` |
+      | **Projektziel** | `%rdi`, `%rsi` | `%rax` |
+
+      Das sind **zwei Aufrufkonventionen**. Ein upstream gebautes musl nimmt die erste an; der
+      Linker sieht nur gleiche Symbolnamen und kann die Verwechslung nicht bemerken — soft-float-
+      Aufrufer gegen hard-float-Bibliothek ist **stille Korruption**, keine Fehlermeldung. Die
+      Alternative wäre ein Custom-ABI-musl, also genau die Fork-Pflege, die bei
+      [Z17](#z17-turso-als-native-datenbank--vorgemessen-2026-08-09-nicht-begonnen) verworfen
+      wurde. Die Entscheidung steht damit **vor** dem musl-Port fest, unabhängig von jeder
+      Zyklenzahl.
+
       **Zwei Bedingungen, bevor das umgestellt wird:**
-      * **Auf x86 gibt es keine `fp`-Prüfzeile** — nur aarch64 misst den Lazy-FP-Pfad
+      * **[x] Die x86-`fp`-Prüfzeile steht seit 2026-08-09 — und sie hat sofort etwas gefunden.**
+        Zwei Ring-3-Sonden laden verschiedene Muster in `xmm0..xmm3`, geben per `YIELD` ab und
+        prüfen nach jeder Rückkehr. Ergebnis: `gelaufen=true`, Muster erhalten **`0b0`** von
+        `0b11`.
+
+        **Ursache gemessen, nicht vermutet: `CR4.OSFXSR` wird nirgends gesetzt.** Ohne dieses Bit
+        löst *jede* SSE-Instruktion ein **`#UD`** aus statt eines `#NM` — die Sonde faultet beim
+        ersten `movq xmm0` und erreicht den Owner-Wechsel nie. Der `#NM`-Handler existiert
+        (`exception.rs:437`), `fxsave64`/`fxrstor64` auch; was fehlt, ist das **Freischalten des
+        Befehlssatzes**.
+
+        Damit ist auch klar, dass `+soft-float` im User-Ziel kein Überbleibsel war, sondern zu
+        einem Kernel passt, der SSE nie eingeschaltet hat. Die Arbeit ist also: `CR4.OSFXSR` (+
+        `OSXMMEXCPT`) setzen, die Prüfzeile grün bekommen, **dann** das Ziel umstellen.
+
+        Die Zeile steht **nicht** in `all_done()`. Das ist eine Entscheidung: eine bekannte Lücke
+        dauerhaft rot zu färben verdeckt jede künftige Regression. Sie wird gegattert, sobald
+        `CR4.OSFXSR` gesetzt ist — vorher wäre es eine Anforderung, die diese Konfiguration nicht
+        erfüllen *kann*, dieselbe Form wie `root` ohne Archiv.
+
+      * ~~Auf x86 gibt es keine `fp`-Prüfzeile~~ — nur aarch64 maß den Lazy-FP-Pfad
         (`fp : EL0-FP-Threads-OK=0b11/0b11, Owner-Wechsel=399`). SSE einzuschalten hiesse, einen
         Pfad scharfzustellen, der auf dieser Architektur **nie ausgeführt** wurde. Dieselbe
         Fehlerform wie „der Farbtest lag im x86-Hochlauf und lief auf aarch64 nie", nur
@@ -520,14 +557,39 @@ Die Gründe sind aber benennbar und einzeln messbar.
 
       Die Infrastruktur steht: `crates/sel4lake-sched/src/cycles.rs` (B-5.1), `hal::timer::cycles()`
       mit `rdtscp`+`lfence`, und `cpuid` ist als Falle bereits bekannt (3556 statt 51 Zyklen unter
-      KVM). **Abnahme:** eine Zeile `ipccost` mit Median und Streuung über N Umläufe, getrennt nach
-      Fastpath (`switch_to`, gleicher Kern) und Umweg über den Scheduler — und eine Positivkontrolle,
-      die zeigt, dass die Messung einen künstlich verlangsamten Pfad auch sieht.
+      KVM).
 
-- [ ] **(3) Jeder Adressraumwechsel leert den GANZEN TLB.** Die ASID ist heute „eine reine
-      **Software**-Nummer des Kernels" (`mmu.rs`), PCID ist nicht benutzt. Bei IPC-lastigen Lasten
-      wechselt der Adressraum zweimal je Umlauf. Steht als Optimierung schon in
-      [C3](#c3-cap--pd--ipc-tabellen-dynamisch); mit (2) wird es messbar statt plausibel.
+      **Damit die Messung ENTSCHEIDUNGSFÄHIG wird, braucht sie drei Trennungen und zwei Anker** —
+      ein nackter Umlaufwert trägt wenig:
+
+      | Trennung | warum |
+      |---|---|
+      | Fastpath gegen Slowpath | falls der IPC-Pfad die Unterscheidung überhaupt hat; hat er sie nicht, ist **das** der Befund |
+      | mit gegen ohne Adressraumwechsel | dieselbe PD über Notification anpingen gegen Umlauf zwischen zwei PDs |
+      | warm gegen kalt | der heiße Messloop misst den besten Fall; ein Umlauf nach künstlicher TLB-Verschmutzung misst den, den ein Dienst unter Last sieht — **und das ist zugleich die Vorher-Zahl für (3)**, sonst ist der PCID-Gewinn später nicht zu beziffern |
+
+      **Die zwei Anker, ohne die die Zahl bedeutungslos ist:** seL4 veröffentlicht Fastpath-IPC in
+      der Gegend weniger hundert Zyklen auf x86; ein Linux-Syscall liegt mit Mitigations bei grob
+      100–200. **Unter 1000** hieße: die Dienst-Architektur trägt. **Mehrere tausend** hieße:
+      (4)/(5) sind keine Optimierungen, sondern Voraussetzungen.
+
+      **Abnahme:** eine Zeile `ipccost` mit Median und Streuung je Fall, plus eine
+      Positivkontrolle, die zeigt, dass die Messung einen künstlich verlangsamten Pfad auch sieht.
+
+- [ ] **(3) Jeder Adressraumwechsel leert den GANZEN TLB — und PCID ist KEIN Bit, das man setzt.**
+      Ohne `invpcid` muss beim Entmappen über *alle* PCIDs invalidiert oder ein Generationszähler
+      geführt werden. **Stale TLB-Einträge über PCID-Grenzen sind die stillste Fehlerklasse, die
+      ein Kernel haben kann:** ein Cap-Entzug, dessen Mapping im TLB einer fremden PCID überlebt,
+      wäre eine **Sicherheitslücke**, kein Leistungsfehler.
+
+      Auf aarch64 gibt es das Gegenstück dagegen fast geschenkt (ASID im `TTBR`, `tlbi aside1is`).
+      **Billige Reihenfolge, falls (2) zeigt, dass der TLB-Verlust dominiert:** ASIDs auf aarch64
+      zuerst scharfstellen und den Gewinn dort messen, bevor die PCID-Maschinerie auf x86 entsteht.
+
+      Zum Ist-Stand: die ASID ist heute „eine reine **Software**-Nummer des Kernels" (`mmu.rs`),
+      PCID ist nicht benutzt; bei IPC-lastigen Lasten wechselt der Adressraum zweimal je Umlauf.
+      Steht als Optimierung schon in [C3](#c3-cap--pd--ipc-tabellen-dynamisch) — mit (2) wird es
+      messbar statt plausibel.
 
 - [ ] **(4) Daten nicht durch IPC kopieren, sondern Speicher teilen.** Das Muster steht bereits:
       die fs-PD liest über eine **geteilte Übertragungsfläche**, nicht über Nachrichtenwörter. Der
@@ -741,7 +803,12 @@ möglichst viele Linux-Bibliotheken aus C, C++, Zig, Rust, Go.
       Syscalls — auf 0,7 % der Sperroperationen. **TCB-Wachstum: null.**
 
       **Was diese Entscheidung umstoßen würde** (und das gehört dazu, sonst ist sie unwiderlegbar):
-      eine Last, bei der die Contention-Rate so hoch ist, dass der Umlauf dominiert. Die Messung
+      eine Last, bei der die Contention-Rate so hoch ist, dass der Umlauf dominiert. **Und die
+      bekannte Alternative gehört mitgenannt, damit die Entscheidung nicht alternativlos dasteht:**
+      mit einem Anforderungsring ([Z18](#z18-hohe-leistung-für-übersetzten-fremdcode--vermessen-2026-08-09) (5))
+      plus Notification wird das Wecken zum **Eintrag** statt zum Umlauf — die Rechnung „2 Umläufe
+      je kontendiertem Warten" gilt dann nicht mehr, und ein Kernel-futex wäre auch dann nicht die
+      einzige Antwort. Die Messung
       dafür steht fest: dieselbe Sperrschleife, Rate der futex-Aufrufe je Sperroperation, und die
       Wandzeit gegen eine Fassung mit Kernel-futex. Erst dann ist ein Kernel-futex ein Befund und
       keine Vorliebe.

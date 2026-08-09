@@ -146,6 +146,97 @@ extern "C" fn ring3_worker(_arg: usize) -> ! {
     }
 }
 
+// ================================================================================================
+// LAZY-FP AUF X86 — die Pruefzeile, die es bisher nur auf aarch64 gab (Z18, 2026-08-09)
+// ================================================================================================
+//
+// **Warum das VOR jeder SSE-Entscheidung kommt.** Der Kernel hat Lazy-FP fuer Ring 3
+// (`fxsave64`/`fxrstor64` mit `CR0.TS`-Trap, `crates/sel4lake-hal/src/x86_64/fp.rs`), aber gemessen
+// wurde der Pfad nur auf aarch64 (`fp : EL0-FP-Threads-OK=0b11/0b11`). SSE im User-Ziel
+// einzuschalten hiesse, einen Pfad scharfzustellen, der auf DIESER Architektur nie ausgefuehrt
+// wurde — dieselbe Fehlerform wie beim Farbtest, nur gespiegelt.
+//
+// **Und die SSE-Entscheidung ist keine Leistungsfrage.** Gemessen am 2026-08-09: dieselbe Funktion
+// `f64 -> f64` uebergibt ihre Argumente auf einem normalen x86_64-Ziel in `xmm0`/`xmm1`, auf
+// `x86_64-sel4lake-user` dagegen in `rdi`/`rsi`. Das sind zwei AUFRUFKONVENTIONEN. Ein upstream
+// gebautes musl nimmt die erste an; der Linker sieht nur gleiche Symbolnamen und kann die
+// Verwechslung nicht bemerken. Das ist stille Korruption, kein langsamer Code — und damit ein
+// Blocker fuer Z16 auf x86, unabhaengig von jeder Zyklenzahl.
+//
+// **Was diese Sonde belegt.** Zwei Ring-3-Threads laden je ein eigenes Muster in `xmm0..xmm3`,
+// geben per `YIELD` ab (dabei stiehlt der andere die FP-Register) und pruefen nach jeder Rueckkehr,
+// dass ihr Muster unveraendert ist. Nur korrektes Lazy-Save/Restore laesst das ueberstehen; ohne
+// `fxsave` traegt der zweite Thread das Muster des ersten davon, und die Pruefung faellt durch.
+//
+// Eigener `global_asm!`-Block: der Kernel ist mit `-sse` uebersetzt, `xmm`-Registerklassen sind in
+// `asm!` damit nicht benutzbar. Ein getrennter Block hat dieses Problem nicht — dieselbe Loesung
+// wie der `.arch armv8-a`-Block auf aarch64.
+#[cfg(feature = "selftest")]
+const FP_ITERS: u64 = 64;
+/// Bit `i` = FP-Thread `i` hat sein Muster ueber alle Abgaben behalten. Liegt in `.user_data`
+/// (US-schreibbar), damit Ring 3 es ohne Cap setzen kann — wie `USER_SYSCALLS`.
+#[cfg(feature = "selftest")]
+#[link_section = ".user_data"]
+static FP_OK: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "selftest")]
+core::arch::global_asm!(
+    r#"
+.section .user_text,"ax"
+.globl user_fp_probe_x86
+user_fp_probe_x86:
+    mov     r12, rdi              // r12 = Muster (Entry-Argument; der Spawn setzt nur EINS)
+    // Die Erfolgsmaske aus dem Muster ableiten: niedrigstes Bit 0 -> Wert 1, 1 -> Wert 2. Damit
+    // hat jede der beiden Sonden ihr eigenes Bit, ohne ein zweites Argument zu brauchen.
+    mov     r15, r12
+    and     r15, 1
+    inc     r15
+    // Sprechprobe: Bit 2 sagt „diese Sonde lief und konnte schreiben" -- BEVOR FP angefasst wird.
+    // Ohne sie waere „0b00" nicht von „lief nicht" zu unterscheiden.
+    lock or qword ptr [rip + {ok}], 4
+    movq    xmm0, r12
+    movq    xmm1, r12
+    movq    xmm2, r12
+    movq    xmm3, r12
+    mov     r13, {iters}
+2:
+    movq    r14, xmm0             // Muster nach jeder Abgabe pruefen
+    cmp     r14, r12
+    jne     3f
+    movq    r14, xmm1
+    cmp     r14, r12
+    jne     3f
+    movq    r14, xmm2
+    cmp     r14, r12
+    jne     3f
+    movq    r14, xmm3
+    cmp     r14, r12
+    jne     3f
+    xor     eax, eax              // sys::YIELD -> FP-Besitz abgeben
+    xor     edi, edi
+    int     0x80
+    dec     r13
+    jne     2b
+    lock or qword ptr [rip + {ok}], r15   // Erfolg vermerken (US-schreibbare Seite)
+1:
+    mov     rax, 5                // sys::PARK
+    int     0x80
+    jmp     1b
+3:
+    mov     rax, 5                // Korruption erkannt: OHNE Vermerk parken
+    int     0x80
+    jmp     3b
+"#,
+    iters = const FP_ITERS,
+    ok = sym FP_OK,
+);
+
+#[cfg(feature = "selftest")]
+extern "C" {
+    /// Einsprung der Ring-3-FP-Sonde (s. `global_asm!` oben).
+    static user_fp_probe_x86: u8;
+}
+
 /// Ring-3-Eindringling: liest **Kernel**-Speicher. Muss faulten — der Kernel beendet ihn und
 /// läuft weiter (das x86-Gegenstück zum `el0iso`-Test auf aarch64).
 #[link_section = ".user_text"]
@@ -324,6 +415,20 @@ fn spawn_demo() -> bool {
     if !system::install_pd_cap(srv_pd, 0, recv) || !system::install_pd_cap(cli_pd, 0, send) {
         return false;
     }
+    // Z18: zwei Ring-3-FP-Sonden mit VERSCHIEDENEN Mustern. Verschieden ist der Punkt -- mit
+    // demselben Muster wuerde ein fehlendes `fxsave` nicht auffallen, weil der Dieb genau das
+    // zurueckliesse, was das Opfer erwartet.
+    {
+        let entry = core::ptr::addr_of!(user_fp_probe_x86) as usize;
+        // Die beiden Muster unterscheiden sich im NIEDRIGSTEN Bit -- daraus leitet die Sonde ihr
+        // Erfolgsbit ab (0 -> Bit 0, 1 -> Bit 1).
+        for muster in [0x1234_5678_9ABC_DEF0u64, 0xA5A5_5A5A_3C3C_C3C3u64] {
+            if let Some(t) = system::spawn_user_parked(entry, muster as usize, system::IDLE_PRIO) {
+                let _ = system::admit(t);
+            }
+        }
+    }
+
     // **D0 sass genau hier** (gemessen 2026-08-07, 9 Treffer in 50 000 Laeufen). Vorher stand da
     //
     //     let (srv, cli) = (spawn(ipc_server, ..), spawn(ipc_client, ..));   // ab hier lauffaehig
@@ -1879,6 +1984,46 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
         || CKPT_DONE.load(Ordering::Acquire);
     let blkdev = BLKDEV_OK.load(Ordering::Acquire);
     let part = PART_OK.load(Ordering::Acquire);
+    // Z18: Lazy-FP auf x86 -- die Zeile, die es bisher nur auf aarch64 gab.
+    let fpmask = FP_OK.load(Ordering::Relaxed);
+    let fp_gelaufen = fpmask & 0b100 != 0;
+    let fp_ok = fpmask & 0b11 == 0b11;
+    println!(
+        "fp      : gelaufen={fp_gelaufen} · Muster ueber {FP_ITERS} Abgaben erhalten = \
+         {:#b} (erwartet 0b11) \
+         (zwei Sonden mit VERSCHIEDENEN Mustern in xmm0..xmm3; verschieden ist der Punkt -- mit \
+         demselben Muster fiele ein fehlendes fxsave nicht auf, weil der Dieb genau das \
+         zuruecklaesst, was das Opfer erwartet)",
+        fpmask & 0b11
+    );
+    println!(
+        "fp      : {} (Lazy-FP fuer Ring 3: fxsave64/fxrstor64 mit CR0.TS. Diese Zeile ist die \
+         VORBEDINGUNG dafuer, SSE im User-Ziel einzuschalten -- und das ist kein Leistungspunkt, \
+         sondern ein ABI-Punkt: `f64` geht auf einem normalen x86_64-Ziel in xmm0/xmm1, auf \
+         x86_64-sel4lake-user in rdi/rsi. Zwei Aufrufkonventionen, die der Linker nicht \
+         unterscheiden kann)",
+        if fp_ok {
+            "ALL PASS"
+        } else {
+            "FAILURES -- BEKANNTE LUECKE, nicht in der Abschlussbedingung"
+        }
+    );
+    if !fp_ok {
+        println!(
+            "fp      : Ursache gemessen: `CR4.OSFXSR` wird NIRGENDS gesetzt. Ohne dieses Bit loest \
+             JEDE SSE-Instruktion ein #UD aus statt eines #NM -- die Sonde faultet beim ersten \
+             `movq xmm0` und erreicht den Owner-Wechsel nie. Der #NM-Handler existiert \
+             (exception.rs) und fxsave64/fxrstor64 auch; was fehlt, ist das Freischalten des \
+             Befehlssatzes. Steht als Z18 in todo.md"
+        );
+        println!(
+            "fp      : NICHT in `all_done()` -- und das ist eine Entscheidung, keine Nachlaessigkeit. \
+             Das ist eine BEKANNTE Luecke, kein Rueckschritt; die Suite dauerhaft rot zu faerben \
+             wuerde jede kuenftige Regression verdecken. Sie wird gegattert, sobald CR4.OSFXSR \
+             gesetzt ist -- vorher waere es eine Anforderung, die diese Konfiguration nicht \
+             erfuellen KANN (dieselbe Form wie `root` ohne Archiv)"
+        );
+    }
     let iface = IFACE_GATE_OK.load(Ordering::Acquire);
     // **A1 auf dem regulaeren Weg** (2026-08-07). Gelesen, nicht gemessen: die Messung DRUCKT,
     // und `all_done()` wird gepollt -- eine druckende Messung gehoert hier so wenig hin wie ein

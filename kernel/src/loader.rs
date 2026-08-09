@@ -268,7 +268,30 @@ pub fn manifest_report() -> u32 {
                             m.kernel_hash[0], m.kernel_hash[1], m.kernel_hash[2], m.kernel_hash[3],
                             m.entry_count, m.signature().len()
                         ),
-                        Err(_) => println!("manifest:   im Archiv liegen {} B, die nicht parsen", raw.len()),
+                        // **Der Versionsfall wird BENANNT.** Drei Zeilen weiter oben steht schon
+                        // „die haeufigste echte Ursache ist *neuer Kernel, altes Manifest*, deshalb
+                        // steht hier, WORAN gebunden wurde -- sonst raet man". Fuer den
+                        // Kernel-Hash war die Lehre gezogen, fuer die FORMATVERSION nicht: bis
+                        // 2026-08-10 endete auch sie in „Bytes, die nicht parsen". Dieselbe
+                        // Fehlerklasse eine Ebene tiefer, mit derselben Folge -- man sucht nach
+                        // Korruption, wo ein Versionsunterschied steht.
+                        Err(sel4lake_loader::LoaderError::UnsupportedManifestFormat {
+                            format_version,
+                            entry_len,
+                        }) => println!(
+                            "manifest:   im Archiv liegt ein Manifest in einem FORMAT, das dieser \
+                             Kernel nicht kennt: format_version={format_version} entry_len={entry_len} \
+                             (dieser Kernel: {} bzw. {}). Das ist KEINE Korruption -- gelesen wird \
+                             NICHTS davon, auch nicht die bekannten Felder: signiert ist die ganze \
+                             Nachricht, ein teilgelesenes Manifest waere echt und missverstanden \
+                             zugleich. **Die Absage faellt VOR der Signaturpruefung und ist damit \
+                             unauthentifiziert** -- ein gekipptes Byte kann sie provozieren; was \
+                             der signierte Kopf traegt, ist die andere Richtung (ein ANGENOMMENES \
+                             Manifest hat keine untergeschobene Version)",
+                            sel4lake_loader::manifest::MANIFEST_FORMAT_VERSION,
+                            sel4lake_loader::manifest::ENTRY_LEN
+                        ),
+                        Err(_) => println!("manifest:   im Archiv liegen {} B, die nicht parsen (Form, nicht Version -- die Formatversion haette einen eigenen Satz)", raw.len()),
                     }
                 }
             }

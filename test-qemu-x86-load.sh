@@ -701,6 +701,37 @@ else
     echo "  FAIL: A-1.2 -- abweichender Modul-Hash wurde nicht bemerkt"; fail=1
 fi
 
+echo "== Negativfall 3b: Manifest in einem FORMAT, das dieser Kernel nicht kennt =="
+# **Der Fall, den die Regel verbietet.** Signiert wird die GANZE Nachricht -- ein Lader, der aus
+# einem v2-Manifest die ihm bekannten 96 von 104 Byte je Eintrag liest, bekaeme ein Ergebnis, das
+# ECHT und MISSVERSTANDEN zugleich ist: `initial_caps` und `policy_flags` laegen auf fremden Bytes,
+# und die Signatur stimmte darueber. Geprueft wird deshalb nicht bloss "abgewiesen", sondern dass
+# die Absage den VERSIONSUNTERSCHIED BENENNT -- "neuer Kernel, altes Manifest" und "kaputte Bytes"
+# fuehren zu entgegengesetzten Handlungen, und bis 2026-08-10 sahen sie gleich aus.
+python3 tools/sign_manifest.py --kernel "$KELF" --key "$MANKEY" --manifest-version 1 \
+    --out build/system.manifest \
+    --entry "1:init:0:1:$PROG/init.elf:loader,ntfn:root:3::any:0" >/dev/null 2>&1
+python3 - build/system.manifest <<'PYEOF' >/dev/null 2>&1
+import sys
+# NUR `entry_len` im Kopf auf 104 setzen. Die Signatur bleibt gueltig ueber die veraenderten
+# Bytes? Nein -- und genau das ist hier egal: die Formatpruefung faellt VOR jeder Krypto, und
+# dieser Test prueft genau diese Reihenfolge mit.
+d = bytearray(open(sys.argv[1],'rb').read())
+d[20:24] = (104).to_bytes(4,'little')
+open(sys.argv[1],'wb').write(d)
+PYEOF
+python3 tools/mkarchive.py build/boot-archive-fmt.bin --system-manifest build/system.manifest \
+    "1:init:0:1:$PROG/init.elf::certs/init-x86.cert" >/dev/null 2>&1
+boot build/boot-archive-fmt.bin "$LOG" 25
+if grep -q "im Archiv liegt ein Manifest in einem FORMAT, das dieser Kernel nicht kennt" "$LOG" \
+    && grep -q "entry_len=104" "$LOG"; then
+    echo "  PASS: A-1.2/Z11: eine unbekannte entry_len wird BENANNT abgewiesen (mit beiden Zahlen), nicht als Formfehler -- und gelesen wird nichts davon"
+else
+    echo "  FAIL: A-1.2/Z11: unbekanntes Manifest-Format nicht benannt abgewiesen:"
+    grep -m1 "^manifest:   im Archiv" "$LOG" | sed 's/^/          /'
+    fail=1
+fi
+
 echo "== Negativfall 4 (A-5.3): der Selektor passt auf KEIN vorhandenes Geraet =="
 # **Der wichtigste der vier.** Die bequeme Zeile im Kernel waere "nichts passt -> nimm irgendeins",
 # und sie waere unsichtbar: der Treiber liefe, der Bericht saehe gruen aus, und die Zuteilung

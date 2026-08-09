@@ -821,6 +821,30 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
 * **`wrapping_sub` auf einer Zeitdifferenz ist die teuerste bequeme Zeile.** Ein Zähler, der um
   100 Zyklen zurückspringt, ergäbe rund `2^64` — ein Konto, das so belastet wird, ist sofort und
   dauerhaft erschöpft. Rückwärts heisst **verworfen**, nicht „fast einmal herum".
+* **`echo "$X" | grep -q MUSTER` unter `set -o pipefail` meldet „nicht gefunden", sobald die
+  Ausgabe den Pipe-Puffer überschreitet.** `grep -q` steigt beim **ersten Treffer** aus, `echo`
+  bekommt SIGPIPE, `pipefail` reicht rc=141 durch. Gemessen kippt es zwischen **66 und 70 KiB** —
+  damit hing das Urteil dreier QEMU-Suiten an der **Größe ihrer eigenen Ausgabe**, und ein
+  sechster Archiveintrag hat es über die Kante geschoben: **neun Prüfungen meldeten FAIL für
+  Zeilen, die im Protokoll standen**. Das ist die schlimmere Richtung von „erfundene Erfolge":
+  erfundene **Misserfolge** kosten kein Fehlerbild, sie **ertränken** es. Abhilfe:
+  `grep -q MUSTER <<<"$X"` (keine Pipeline), und eine Sprechprobe des Prüfers an einer bewusst
+  **großen** Eingabe — an einer kleinen wäre sie während des ganzen Fehlers grün gewesen.
+  `bash -n` fängt das nicht: die kaputte Zeile ist syntaktisch gültig.
+* **Eine Ablage je ROLLE ist eine Ablage zu wenig, sobald es zwei Instanzen der Rolle gibt.**
+  „Drei Rollen, drei Badges, drei Ablagen" behob A-6.3 — und `Client` ist eine **Rolle**. Mit der
+  zweiten Client-PD überschrieb sie die Ablage der ersten, ein Prüfablauf wartete auf ein Badge
+  an einem fremden Objekt, und drei Prüfzeilen fielen aus, **ohne dass die geprüfte Sache kaputt
+  war**. Der Kommentar an der Stelle beschrieb den Fehler bereits wörtlich und verhinderte ihn
+  nicht: die Behebung lag eine Ebene zu flach. Verschlüsselt wird mit der `program_id`, nicht mit
+  der Rolle — dieselbe Lösung wie bei den vier versteckten Politiken aus A-5.4.
+* **Ein Kriterium, das die geprüfte Sache nicht erreichen KANN, ist kein strenges Kriterium,
+  sondern gar keins.** Die FP-Sonde musste „alle 64 Abgaben überstehen"; erreichbar waren 3, weil
+  sie je Rundlauf-Runde eine Iteration vorankommt und eine Runde durch den **Tick** begrenzt ist,
+  nicht durch das `YIELD`. Grün war unmöglich, also sagte rot nichts — die Zeile hatte keine
+  Trennschärfe, und ihre Begründung im Bericht war zusätzlich seit A4 **überholt**. Gefragt ist
+  die Größe, die sich wirklich ändert (Fortschritt, Korruptionsmeldung, **eigene**
+  Verdrängungszahl), nicht die bequem formulierbare.
 
 ## Aufbau, grob
 

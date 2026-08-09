@@ -17,8 +17,13 @@
 //!
 //! Das Manifest wird **vor** jeder Signaturprüfung geparst — der Parser ist also die erste Stelle,
 //! die fremde Bytes anfasst. Deshalb: feste Feldbreiten, Längenpräfixe, kein TOML, kein JSON, kein
-//! `unsafe` (Crate-weit verboten), und jeder Fehlerpfad endet in [`LoaderError::BadManifest`]
-//! statt in einem Zugriff daneben.
+//! `unsafe` (Crate-weit verboten), und jeder Fehlerpfad endet in einem **benannten** Fehler statt
+//! in einem Zugriff daneben.
+//!
+//! **Benannt heisst: unterscheidbar.** Formfehler ergeben [`LoaderError::BadManifest`], ein
+//! unbekanntes **Format** dagegen [`LoaderError::UnsupportedManifestFormat`] samt der beiden
+//! Zahlen. Die beiden Lagen fuehren zu entgegengesetzten Handlungen — Kernel aktualisieren gegen
+//! Herkunft untersuchen —, und bis 2026-08-10 waren sie hier nicht zu unterscheiden.
 //!
 //! ## Prüfreihenfolge: Signatur zuerst, Inhalt danach — **strukturell**
 //!
@@ -37,8 +42,12 @@
 //!   8  flags:u32
 //!  12  manifest_version:u32   (monoton; Anti-Downgrade)
 //!  16  entry_count:u32
-//!  20  entry_len:u32          = 96  (selbstbeschreibend: ein Kernel mit anderem Eintragsformat
-//!                                    ERKENNT das, statt die Felder zu verrutschen)
+//!  20  entry_len:u32          = 96  (selbstbeschreibend -- aber NIE zum Teil-Lesen: ein Kernel
+//!                                    mit anderem Eintragsformat weist BENANNT ab, statt die
+//!                                    bekannten Felder zu lesen und den Rest zu ueberspringen.
+//!                                    Das waere hier besonders tueckisch, weil die Signatur ueber
+//!                                    die GANZE Nachricht laeuft: das Ergebnis waere echt und
+//!                                    missverstanden zugleich, mit verrutschtem `initial_caps`)
 //!  24  kernel_hash:[u8;32]    SHA-256 des Kernel-Codes -> bindet das Manifest an DIESEN Kernel
 //!  56  key_id:[u8;16]
 //!  72  reserved:[u8;8]        = 0
@@ -291,14 +300,20 @@ impl<'a> SystemManifest<'a> {
         if rd_u32(data, 0) != MANIFEST_MAGIC {
             return Err(LoaderError::BadManifest);
         }
+        // **Formatversion und Eintragsbreite werden BENANNT abgewiesen, nicht als Formfehler.**
+        //
+        // „Neuer als dieser Kernel" und „kaputte Bytes" führen zu entgegengesetzten Handlungen;
+        // bis 2026-08-10 waren sie hier nicht zu unterscheiden. Und **niemals** wird gelesen, was
+        // man kennt, und der Rest übersprungen: signiert ist die GANZE Nachricht, ein
+        // teilgelesenes v2-Manifest wäre authentisch und unverstanden zugleich — mit verrutschtem
+        // `initial_caps`/`policy_flags` und gültiger Signatur darüber. S. `LoaderError`.
         let format_version = rd_u16(data, 4);
-        if format_version != MANIFEST_FORMAT_VERSION {
-            return Err(LoaderError::BadManifest);
-        }
-        // Selbstbeschreibende Eintragsbreite: passt sie nicht, ist es ein anderes Format. Das
-        // hier ist der Unterschied zwischen "erkannt" und "um vier Bytes verrutscht gelesen".
-        if rd_u32(data, 20) as usize != ENTRY_LEN {
-            return Err(LoaderError::BadManifest);
+        let entry_len = rd_u32(data, 20);
+        if format_version != MANIFEST_FORMAT_VERSION || entry_len as usize != ENTRY_LEN {
+            return Err(LoaderError::UnsupportedManifestFormat {
+                format_version,
+                entry_len,
+            });
         }
         let entry_count = rd_u32(data, 16);
         if entry_count as usize > MAX_ENTRIES {
@@ -705,18 +720,68 @@ mod tests {
         assert_eq!(SystemManifest::parse(&raw).unwrap_err(), LoaderError::BadManifest);
     }
 
+    /// **Eine unbekannte Formatversion ist von kaputten Bytes UNTERSCHEIDBAR.**
+    ///
+    /// Die beiden führen zu entgegengesetzten Handlungen — Kernel aktualisieren gegen Herkunft
+    /// untersuchen. Bis 2026-08-10 endeten sie in derselben Variante, und dieser Test hat die
+    /// Ununterscheidbarkeit **festgeschrieben** statt sie zu beanstanden.
     #[test]
     fn bad_format_version_rejected() {
         let mut raw = build(&[root("init", 1)], 64);
         raw[4] = 0xEE;
-        assert_eq!(SystemManifest::parse(&raw).unwrap_err(), LoaderError::BadManifest);
+        assert_eq!(
+            SystemManifest::parse(&raw).unwrap_err(),
+            LoaderError::UnsupportedManifestFormat {
+                format_version: 0xEE,
+                entry_len: ENTRY_LEN as u32,
+            }
+        );
     }
 
+    /// Eine fremde Eintragsbreite wird **erkannt**, nicht um acht Bytes verrutscht gelesen.
+    ///
+    /// Der Fall, den die Regel verbietet: signiert ist die GANZE Nachricht. Läse ein v1-Lader
+    /// 96 von 104 Byte je Eintrag, wäre das Ergebnis authentisch und unverstanden zugleich —
+    /// `initial_caps` und `policy_flags` lägen dann auf fremden Bytes, und die Signatur stimmte
+    /// darüber trotzdem.
     #[test]
     fn foreign_entry_width_is_detected_not_misread() {
         let mut raw = build(&[root("init", 1)], 64);
         raw[20..24].copy_from_slice(&104u32.to_le_bytes());
-        assert_eq!(SystemManifest::parse(&raw).unwrap_err(), LoaderError::BadManifest);
+        assert_eq!(
+            SystemManifest::parse(&raw).unwrap_err(),
+            LoaderError::UnsupportedManifestFormat {
+                format_version: MANIFEST_FORMAT_VERSION,
+                entry_len: 104,
+            }
+        );
+    }
+
+    /// **Sprechprobe der Unterscheidung selbst.** Ohne sie belegte keiner der beiden Tests oben,
+    /// dass die Absagen überhaupt verschieden sind: zwei Tests, die je eine Variante erwarten,
+    /// wären auch dann grün, wenn beide Varianten denselben Wert hätten.
+    #[test]
+    fn version_refusal_differs_from_form_refusal() {
+        let mut v = build(&[root("init", 1)], 64);
+        v[4] = 0xEE;
+        let mut f = build(&[root("init", 1)], 64);
+        f[0] ^= 0xFF; // kaputte Magic
+        let a = SystemManifest::parse(&v).unwrap_err();
+        let b = SystemManifest::parse(&f).unwrap_err();
+        assert_ne!(a, b, "Versionsabsage und Formabsage muessen unterscheidbar sein");
+        assert_eq!(b, LoaderError::BadManifest);
+    }
+
+    /// Der Kopf wird **vollständig** abgewiesen — es gibt keinen Weg an einen Eintrag heran.
+    ///
+    /// Die Absage fällt vor der Signaturprüfung; deshalb ist sie **unauthentifiziert** und durch
+    /// ein gekipptes Byte provozierbar. Was der signierte Kopf trägt, ist die andere Richtung:
+    /// ein *angenommenes* Manifest kann keine untergeschobene Formatversion haben.
+    #[test]
+    fn unknown_format_yields_no_entries_at_all() {
+        let mut raw = build(&[root("init", 1)], 64);
+        raw[20..24].copy_from_slice(&104u32.to_le_bytes());
+        assert!(SystemManifest::parse(&raw).is_err());
     }
 
     #[test]

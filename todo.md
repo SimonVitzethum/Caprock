@@ -135,6 +135,51 @@ und Microkit-Runtime im Image") und zieht Konsequenzen nach sich, die über sie 
       die niedrigste gültige Priorität; heute bekommt ein Eintrag mit 0 die Vorgabe. Wer wirklich 0
       will, kann es nicht sagen. Dieselbe Formatfrage wie oben.
 
+      **ERLEDIGT, und es ist die Vorbedingung für beide: die Absage bei unbekanntem Format ist
+      LAUT.** (2026-08-10) Die Regel, ausgesprochen bevor irgendjemand die Formatversion anfasst:
+
+      > Ein Lader, der auf eine `format_version` oder `entry_len` trifft, die er nicht kennt,
+      > **weist ab** — und die Absage sagt, dass es ein **Versionsunterschied** ist, nicht ein
+      > Formfehler. Er liest **niemals** die ihm bekannten Felder heraus und überspringt den Rest.
+
+      Beide Hälften sind nötig, und die erste ist die schärfere: **signiert wird `[0..msg_len)`,
+      also die ganze Nachricht.** Ein v2-Manifest, aus dem ein v1-Lader 96 von 104 Byte je Eintrag
+      liest, wäre **authentisch und unverstanden zugleich** — eine gültige Signatur belegt
+      Echtheit, **nicht Verständnis**, und der Byteversatz verschöbe ausgerechnet `initial_caps`,
+      `policy_flags` und `priority`: eine **Autoritätszuteilung**, still verrutscht.
+
+      Abgewiesen hat der Parser schon vorher — aber **stumm**: sechs strukturell verschiedene
+      Gründe endeten in einem `BadManifest`, und sieben Host-Tests schrieben diese
+      Ununterscheidbarkeit fest. Zwei davon heißen „neuer als dieser Kernel", vier „kaputte
+      Bytes", und sie führen zu **entgegengesetzten** Handlungen. Im Kernel endete es als
+      `im Archiv liegen N B, die nicht parsen` — drei Zeilen unter einem Kommentar, der für den
+      **Kernel-Hash** genau diese Lehre schon zieht („die häufigste echte Ursache ist *neuer
+      Kernel, altes Manifest*, deshalb steht hier, WORAN gebunden wurde — sonst rät man").
+      Für den Hash gezogen, für die Formatversion nicht. Und eine Datei weiter unterscheidet
+      `Archive::parse` längst **fünf** benannte Gründe — ausgerechnet der sicherheitskritischere
+      Parser tat es nicht.
+
+      Neu: `LoaderError::UnsupportedManifestFormat { format_version, entry_len }` — **mit den
+      Zahlen**, denn eine Absage ohne sie ist dieselbe Rateübung wie vorher. Kernel-Berichtszeile
+      mit beiden Werten *und* dem, was dieser Kernel kann. Host-Tests: die vier Formfälle bleiben
+      `BadManifest`, zwei neue Fälle ergeben die neue Variante mit den richtigen Zahlen, dazu eine
+      **Sprechprobe der Unterscheidung selbst** (`assert_ne!`) — ohne die wären beide Tests auch
+      dann grün, wenn die Varianten denselben Wert hätten. System-Negativfall 3b in der Lade-Suite:
+      `entry_len=104` → benannte Absage, und die Zahl 104 erscheint nur, wenn der Kernel wirklich
+      diesen Zweig genommen hat.
+
+      **Der Nachtrag, der zur ehrlichen Fassung gehört:** die Absage fällt **vor** der
+      Signaturprüfung — sie muss, man kann nicht verifizieren, was man nicht parsen kann. Die
+      Diagnose ist damit **unauthentifiziert** und durch ein gekipptes Byte provozierbar. Was der
+      signierte Kopf trägt, ist die **andere** Richtung: ein *angenommenes* Manifest kann keine
+      untergeschobene Formatversion haben. Beide Hälften stehen im Code; nur die angenehme zu
+      nennen machte daraus eine Zusicherung, die nicht gilt.
+
+      Damit ist der Weg zu Formatversion 2 (`period_us`, `priority`-Sagbarkeit) frei: ein
+      v2-Manifest auf einem v1-Kernel ist ab jetzt **von Korruption unterscheidbar**. Vorher wäre
+      der Formatsprung ein Feldeinsatz mit einer Fehlermeldung gewesen, die in die falsche
+      Richtung zeigt.
+
       **Ein Befund nebenbei, der größer ist als der Eintrag:** die Prioritäten standen seit jeher
       im Test-Manifest (3/1/2/2/2) und wurden nie eingelöst — es waren Platzhalter. Eingehalten
       **reißt** dieselbe Zuteilung die Lade-Suite: ein *pollender* Treiber (B-3.2, kein IRQ) auf

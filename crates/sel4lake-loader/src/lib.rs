@@ -71,10 +71,48 @@ pub enum LoaderError {
     HotReloadForbidden,
     /// Zertifikat-Parse-Fehler (falsche Länge/Magic/Formatversion) — siehe [`cert`].
     BadCert,
-    /// System-Manifest-Parse-Fehler (Magic/Formatversion/Eintragsbreite/-zahl, fehlende Signatur)
-    /// — siehe [`manifest`]. **Strukturell**, noch vor jeder Krypto: das Manifest ist die erste
-    /// Struktur, die der Kernel von außen anfasst.
+    /// System-Manifest-Parse-Fehler (Magic, Eintragszahl, Längen, fehlende Signatur) — siehe
+    /// [`manifest`]. **Strukturell**, noch vor jeder Krypto: das Manifest ist die erste Struktur,
+    /// die der Kernel von außen anfasst.
+    ///
+    /// **Nicht** mehr für den Versionsfall: dafür gibt es [`LoaderError::UnsupportedManifestFormat`].
     BadManifest,
+    /// **Das Manifest ist in einem Format, das dieser Kernel nicht kennt** — andere
+    /// `format_version` oder andere `entry_len`.
+    ///
+    /// ## Warum das eine EIGENE Variante ist und kein `BadManifest`
+    ///
+    /// Bis 2026-08-10 endeten sechs strukturell verschiedene Gründe in einem einzigen
+    /// `BadManifest`, und die Host-Tests schrieben diese Ununterscheidbarkeit fest. Zwei davon
+    /// heißen „dieses Manifest ist **neuer** als dieser Kernel", vier heißen „diese Bytes sind
+    /// **kaputt**" — und sie führen zu **entgegengesetzten** Handlungen: Kernel aktualisieren
+    /// gegen Herkunft untersuchen. Der Archiv-Parser eine Datei weiter unterscheidet längst fünf
+    /// Gründe ([`BadMagic`](Self::BadMagic), [`BadVersion`](Self::BadVersion), …); ausgerechnet
+    /// der sicherheitskritischere Parser tat es nicht.
+    ///
+    /// ## Warum niemals „lies, was du kennst, überspring den Rest"
+    ///
+    /// Signiert wird `[0..msg_len)`, also die **ganze** Nachricht. Ein v2-Manifest, aus dem ein
+    /// v1-Lader 96 von 104 Byte je Eintrag liest, wäre **authentisch und unverstanden zugleich**:
+    /// die Signatur belegt Echtheit, **nicht Verständnis**. Der Byteversatz verschöbe
+    /// `initial_caps`, `policy_flags` und `priority` — eine **Autoritätszuteilung**, still
+    /// verrutscht, mit gültiger Signatur darüber.
+    ///
+    /// ## Der Nachtrag, der zur ehrlichen Fassung gehört
+    ///
+    /// Diese Absage fällt **vor** der Signaturprüfung — sie muss, man kann nicht verifizieren, was
+    /// man nicht parsen kann. Die Diagnose ist damit **unauthentifiziert**: ein gekipptes Byte in
+    /// `entry_len` provoziert „neuer als dieser Kernel", ohne dass es stimmt. Was der signierte
+    /// Kopf trägt, ist die **andere** Richtung — ein *angenommenes* Manifest kann keine
+    /// untergeschobene Formatversion haben. Beide Hälften gehören genannt; nur die angenehme zu
+    /// nennen machte daraus eine Zusicherung, die nicht gilt.
+    UnsupportedManifestFormat {
+        /// Die im Kopf angegebene Formatversion (dieser Kernel kennt
+        /// [`manifest::MANIFEST_FORMAT_VERSION`]).
+        format_version: u16,
+        /// Die im Kopf angegebene Eintragsbreite (dieser Kernel kennt [`manifest::ENTRY_LEN`]).
+        entry_len: u32,
+    },
     /// Kernel-Ressourcen erschöpft (VSpace/ASID/RAM/TCB/PD) beim Laden.
     NoResources,
 }

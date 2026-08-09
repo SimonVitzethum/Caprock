@@ -15,7 +15,13 @@ pub mod sys {
     pub const RECV: u64 = 2;
     /// Den zuletzt empfangenen Aufrufer beantworten.
     pub const REPLY: u64 = 3;
-    /// Den aufrufenden Thread dauerhaft blockieren (Selbst-Park; kein Cap nötig).
+    /// Den aufrufenden Thread schlafen legen — **es sei denn, eine Weckmarke liegt vor**
+    /// (Selbst-Park; kein Cap nötig, weil er nur auf sich selbst wirkt).
+    ///
+    /// Zusammen mit [`UNPARK`] ist das der Baustein, auf dem eine PD `wait_event`, Completions
+    /// und Mutex-Warteschlangen baut, **ohne je ein Kernelobjekt anzulegen** (Z22, P4): die
+    /// Warteschlange ist eine Liste im Speicher der PD. Ohne Weckmarke ist der unbelastete Weg
+    /// „Bedingung ist schon wahr" **null Syscalls**.
     pub const PARK: u64 = 5;
     /// Den aufrufenden Thread beenden (Stack/TCB werden zurückgewonnen; kein Cap).
     pub const EXIT: u64 = 6;
@@ -66,6 +72,22 @@ pub mod sys {
     /// landete jeder Grant im festen [`GRANT_RECV_SLOT`], und ein Server konnte damit den Cap
     /// verdrängen, den sein Client dort gerade hielt.
     pub const SETRECV: u64 = 17;
+    /// **Einen Thread der EIGENEN PD wecken** (Z22, P4). `x1` = rohe `ThreadId` des Ziels.
+    ///
+    /// Gegenstück zu [`PARK`]. Die Weckmarke wird **immer** hinterlegt, auch wenn das Ziel noch
+    /// gar nicht schläft — genau dann ginge das Wecken sonst verloren. Geweckt wird nur, wer
+    /// **wegen `PARK`** blockiert ist; wer in IPC wartet oder pausiert wurde, bleibt liegen.
+    ///
+    /// ## Warum das ohne Cap geht, und warum das keine Lücke ist
+    ///
+    /// Das Ziel muss in **derselben PD** liegen wie der Aufrufer (fail-closed: keine PD, fremde
+    /// PD oder unbekannter Thread → [`result::ERR_BADCAP`]). Innerhalb einer PD teilen sich die
+    /// Threads ohnehin den Adressraum — wer einen Nachbarthread wecken kann, konnte vorher schon
+    /// seinen Stack beschreiben. Es kommt also **keine** Autorität hinzu, und eine Tcb-Cap je
+    /// Thread wäre ein Slot je Warteschlangeneintrag, ohne etwas zu schützen.
+    ///
+    /// PD-übergreifend wecken bleibt, was es war: eine Notification.
+    pub const UNPARK: u64 = 18;
 }
 
 /// Sub-Operationen für [`sys::PDCTL`] (Register `x2`). Jede ist auf den Besitz der

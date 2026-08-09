@@ -715,9 +715,46 @@ pub fn dispatch(
         return ops.on_tick(core, frame);
     }
     if nr == sys::PARK {
-        // Selbst-Park: Aufrufer blockieren (verlässt die Ready-Queue dauerhaft);
-        // kein Capability nötig. Kehrt nie zum Aufrufer zurück.
-        return ops.block_current(core, frame);
+        // Selbst-Park: Aufrufer schlafen legen; kein Capability nötig (wirkt nur auf ihn selbst).
+        //
+        // **Kehrt sofort zurück, wenn eine Weckmarke vorliegt** (Z22, P4) -- ohne das wäre die
+        // Folge „Bedingung prüfen (falsch)" → „parken" unterbrechbar, und ein dazwischen
+        // eintreffendes `UNPARK` ginge verloren. Wer `PARK` weiterhin als „für immer anhalten"
+        // benutzt (Fuzz-Threads, geparkte Demo-Threads), merkt davon nichts: ohne ein `UNPARK`
+        // wird nie eine Marke gesetzt.
+        return match ops.park_current(core, frame) {
+            Some(next) => next,
+            None => {
+                frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
+                frame
+            }
+        };
+    }
+    if nr == sys::UNPARK {
+        // Ziel muss in DERSELBEN PD liegen. Fail-closed in allen drei Richtungen: der Aufrufer
+        // ohne PD, das Ziel ohne PD, oder verschiedene PDs -> abweisen. Siehe `sys::UNPARK`,
+        // warum das ohne Cap auskommt und trotzdem keine Autorität hinzufügt.
+        let target = ThreadId::from_raw(frame_reg(frame, reg::EP_BADGE));
+        let me = ops.current_id(core);
+        // **Auf sich selbst wirken braucht keine Autoritaet** -- derselbe Grund, aus dem `PARK`
+        // ohne Cap auskommt. Und es ist nicht bloss ein Sonderfall: „erst die Marke setzen, dann
+        // schlafen" ist die Redewendung, mit der ein Thread einen Weckruf ueberlebt, der ihn
+        // erreicht, bevor er ueberhaupt eingeschlafen ist. Ohne diese Zeile waere sie in einem
+        // Thread ohne PD (Boot-Umgebung) nicht formulierbar.
+        let erlaubt = target == me || {
+            let g = caps.read();
+            match (g.pds.pd_of(me), g.pds.pd_of(target)) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            }
+        };
+        if !erlaubt {
+            frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_BADCAP);
+            return frame;
+        }
+        ops.unpark(target);
+        frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
+        return frame;
     }
     if nr == sys::EXIT {
         // Selbst-Beenden: Stack/TCB werden zurückgewonnen; kein Capability nötig.

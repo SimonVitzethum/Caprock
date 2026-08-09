@@ -154,6 +154,101 @@ extern "C" fn ring3_worker(_arg: usize) -> ! {
 }
 
 // ================================================================================================
+// PARK/UNPARK — SCHLAFEN OHNE KERNELOBJEKT (Z22 P4, 2026-08-09)
+// ================================================================================================
+//
+// Ein Linux-Treiber schlaeft an vielen Stellen (`msleep`, `wait_event`, Completions, der
+// bestrittene Zweig jedes Mutex). Jede dieser Warteschlangen auf eine **Notification** abzubilden
+// hiesse: ein Kernelobjekt und einen Cap-Slot je Warteschlange — und `Notification` fasst ohnehin
+// nur EINEN Wartenden (dieselbe Kapazitaetsform wie D11). Mit `PARK`/`UNPARK` liegt die
+// Warteschlange als gewoehnliche Liste im Speicher der PD, und der Kernel kennt nur „schlafe" und
+// „wecke Thread T".
+//
+// **Was diese Sonde belegt — und warum jeder einzelne Punkt gebraucht wird:**
+//
+//  1. `UNPARK(self)` gefolgt von `PARK` kehrt **sofort** zurueck. Ohne Weckmarke schliefe der
+//     Faden hier fuer immer; das ist das verlorene Wecken, gegen das ein Futex seinen
+//     Vergleichswert braucht.
+//  2. **Positivkontrolle:** das ZWEITE `PARK` (ohne Marke) muss wirklich blockieren. Ohne diesen
+//     Punkt waere Punkt 1 auch von einem `PARK` erfuellt, das gar nichts tut — und ein `PARK`,
+//     das nie blockiert, besteht Punkt 1 mit Bestnote.
+//  3. Nach einem `unpark` **von aussen** laeuft er weiter. Sonst waere ein `PARK`, das den Thread
+//     kaputtmacht, von einem richtigen nicht zu unterscheiden (dieselbe Dreiteilung wie bei
+//     `freeze`).
+//  4. `UNPARK` auf eine **fremde** ThreadId wird abgewiesen. Fail-closed, nicht still.
+//  5. Und die Aussage, die den D9-Fehler verhindert: `unpark` auf einen Thread, der **in IPC**
+//     wartet, weckt ihn NICHT. Ein Bit, das zwei Blockadegruende traegt, macht den Wecker
+//     unbestimmbar — dort hingen vier von fuenf D9-Befunden.
+#[cfg(feature = "selftest")]
+#[link_section = ".user_data"]
+static PARK_PROBE_TID: AtomicU64 = AtomicU64::new(0);
+/// Bit 0 = `PARK` mit Marke kehrte zurueck · Bit 1 = nach dem `unpark` von aussen weitergelaufen ·
+/// Bit 2 = fremde ThreadId abgewiesen · Bit 3 = das zweite `PARK` wurde ueberhaupt erreicht.
+#[cfg(feature = "selftest")]
+#[link_section = ".user_data"]
+static PARK_PROBE_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// Ein `int 0x80` aus Ring 3 mit einem Argument; gibt den Ergebniscode zurueck.
+///
+/// # Safety
+/// Nur aus Ring-3-Kontext zu rufen. `int 0x80` ist der dafuer freigegebene Vektor (IDT-Gate
+/// DPL 3); der Kernel liest/schreibt nur die ABI-Register dieses Frames.
+#[cfg(feature = "selftest")]
+#[inline(always)]
+unsafe fn ring3_syscall1(nr: u64, a1: u64) -> u64 {
+    let out: u64;
+    // SAFETY: siehe Funktionsdoku.
+    unsafe {
+        core::arch::asm!("int 0x80", inlateout("rax") nr => out, in("rdi") a1,
+                         clobber_abi("sysv64"));
+    }
+    out
+}
+
+#[cfg(feature = "selftest")]
+#[link_section = ".user_text"]
+extern "C" fn ring3_park_probe(_arg: usize) -> ! {
+    // Auf die eigene ThreadId **warten**, statt sie vorauszusetzen. Sie wird erst nach der
+    // Zulassung bekannt (`Parked` gibt sie nicht heraus, D0), und ein Faden, der ohne sie
+    // losrechnet, waere genau der Fehler, gegen den dieser Typ gebaut ist: er wuerde `UNPARK(0)`
+    // rufen und damit einen fremden Thread meinen.
+    let mut me = PARK_PROBE_TID.load(Ordering::Acquire);
+    while me == 0 {
+        core::hint::spin_loop();
+        me = PARK_PROBE_TID.load(Ordering::Acquire);
+    }
+
+    // 1. Marke an sich selbst, dann schlafen -> muss durchlaufen.
+    // SAFETY: Ring-3-Kontext, freigegebener Syscall-Vektor.
+    let r_self = unsafe { ring3_syscall1(sel4lake_abi::sys::UNPARK, me) };
+    // SAFETY: dito.
+    unsafe { ring3_syscall1(sel4lake_abi::sys::PARK, 0) };
+    if r_self == sel4lake_abi::result::OK {
+        PARK_PROBE_BITS.fetch_or(1, Ordering::Release);
+    }
+
+    // 2. Jetzt OHNE Marke. Bit 3 sagt „ich stehe gleich im zweiten PARK" -- ohne das waere ein
+    //    Thread, der schon in Punkt 1 haengengeblieben ist, von einem blockierten nicht zu
+    //    unterscheiden.
+    PARK_PROBE_BITS.fetch_or(8, Ordering::Release);
+    // SAFETY: dito.
+    unsafe { ring3_syscall1(sel4lake_abi::sys::PARK, 0) };
+    PARK_PROBE_BITS.fetch_or(2, Ordering::Release);
+
+    // 3. Eine ThreadId, die es nicht gibt -- muss abgewiesen werden, nicht still nichts tun.
+    // SAFETY: dito.
+    let r_fremd = unsafe { ring3_syscall1(sel4lake_abi::sys::UNPARK, 0xDEAD_BEEF) };
+    if r_fremd == sel4lake_abi::result::ERR_BADCAP {
+        PARK_PROBE_BITS.fetch_or(4, Ordering::Release);
+    }
+
+    loop {
+        // SAFETY: dito.
+        unsafe { ring3_syscall1(sel4lake_abi::sys::PARK, 0) };
+    }
+}
+
+// ================================================================================================
 // LAZY-FP AUF X86 — die Pruefzeile, die es bisher nur auf aarch64 gab (Z18, 2026-08-09)
 // ================================================================================================
 //
@@ -356,6 +451,15 @@ fn spawn_demo() -> bool {
     }
     if system::spawn_user(ring3_intruder as *const () as usize, 0, system::IDLE_PRIO).is_none() {
         return false;
+    }
+
+    // Park-Sonde. Sie braucht ihre **eigene** ThreadId, und `Parked` gibt sie absichtlich nicht
+    // heraus -- das ist der ganze Zweck des Typs (D0). Der Weg ist deshalb nicht „vorher lesen",
+    // sondern: die Sonde **wartet**, bis der Kernel sie veroeffentlicht hat. Das ist rennfrei ohne
+    // eine neue Kernel-Schnittstelle, die den Zeugen aufweichen wuerde.
+    match system::spawn_user(ring3_park_probe as *const () as usize, 0, system::IDLE_PRIO) {
+        Some(t) => PARK_PROBE_TID.store(t.to_raw(), Ordering::Release),
+        None => return false,
     }
 
     // Isolierter Adressraum vs. SAS: beide lesen dieselbe fremde Adresse.
@@ -561,6 +665,104 @@ const TEST_BLK_SERVICE_ID: u32 = 3;
 /// Die Treiber-PD, deren Zuteilung der Test misst — dieselbe Komponente.
 const TEST_BLK_PROGRAM_ID: u32 = 3;
 
+
+/// Ergebnis der EINMALIGEN Park-Messung: Bit 0..5 die sechs Aussagen, Bit 8..15 die
+/// Sondenbits, Bit 63 „gemessen". **Das Urteil entsteht hier und nicht im Bericht** — es steht
+/// in `all_done()`, und was der Bericht setzt, kann den Bericht nicht auslösen.
+#[cfg(feature = "selftest")]
+static PARK_MESS: AtomicU64 = AtomicU64::new(0);
+
+/// **Z22 P4: schlafen und geweckt werden, ohne dass ein Kernelobjekt entsteht.**
+///
+/// Fuenf Aussagen, jede mit ihrem eigenen Zweck — s. den Block bei [`ring3_park_probe`].
+/// Laeuft **einmal**, aus der Hauptschleife; das Ergebnis liegt danach in [`PARK_MESS`].
+#[cfg(feature = "selftest")]
+fn park_messen() {
+    if PARK_MESS.load(Ordering::Acquire) != 0 {
+        return; // schon gemessen
+    }
+    let ok = park_messen_inner();
+    let b = PARK_PROBE_BITS.load(Ordering::Acquire) & 0xff;
+    PARK_MESS.store((1 << 63) | (b << 8) | u64::from(ok), Ordering::Release);
+}
+
+#[cfg(feature = "selftest")]
+fn park_messen_inner() -> bool {
+    let warten = || {
+        let t0 = hal::timer::ticks(0);
+        let mut wache = 0u64;
+        while hal::timer::ticks(0) < t0 + 3 && wache < 200_000_000 {
+            core::hint::spin_loop();
+            wache += 1;
+        }
+    };
+    let raw = PARK_PROBE_TID.load(Ordering::Acquire);
+    let Some(tid) = (raw != 0).then(|| sel4lake_sched::ThreadId::from_raw(raw)) else {
+        println!("park    : FAILURES (keine Sonde -- ohne sie ist nichts gemessen)");
+        return false;
+    };
+    // Ihr Zeitfenster: sie muss bis in das zweite `PARK` gekommen sein.
+    for _ in 0..64 {
+        if PARK_PROBE_BITS.load(Ordering::Acquire) & 8 != 0 {
+            break;
+        }
+        warten();
+    }
+    let b = PARK_PROBE_BITS.load(Ordering::Acquire);
+    let marke_wirkt = b & 1 != 0; // 1. PARK mit Marke kam zurueck
+    let erreichte_zweites = b & 8 != 0;
+
+    // 2. **Positivkontrolle.** Blockiert das zweite `PARK` wirklich? Ohne diese Zeile bestuende
+    //    Punkt 1 auch ein `PARK`, das gar nichts tut.
+    let blockiert = erreichte_zweites && (b & 2 == 0) && system::is_parked(tid);
+
+    // 5. **Die D9-Aussage, und sie kommt VOR dem Wecken:** ein Thread, der in IPC wartet, darf
+    //    von `unpark` nicht hochkommen. Gemessen am IPC-Server, der in `RECV` steht -- er sieht
+    //    von aussen genauso „blockiert" aus wie ein geparkter, und genau das ist die Falle.
+    let sraw = IPC_SERVER_TID.load(Ordering::Acquire);
+    let ipc_bleibt = if sraw != 0 {
+        let stid = sel4lake_sched::ThreadId::from_raw(sraw);
+        // **Gemessen wird `blocked`, nicht `parked`.** Die erste Fassung las `is_parked` vorher
+        // und nachher -- an einem IPC-Wartenden ist dieses Bit aber in BEIDEN Faellen falsch, ob
+        // `unpark` ihn nun weckt oder nicht. Der Pruefer haette den Fehler, gegen den er gebaut
+        // ist, strukturell nicht sehen koennen; die Gegenprobe hat das gezeigt.
+        let vorher_geparkt = system::is_parked(stid);
+        let vorher_blockiert = system::is_blocked(stid);
+        system::unpark_thread(stid);
+        !vorher_geparkt && vorher_blockiert && system::is_blocked(stid)
+    } else {
+        false // nicht anwendbar heisst hier NICHT bestanden -- ohne Server ist nichts gemessen
+    };
+
+    // 3. Wecken -> laeuft weiter.
+    let geweckt_ok = system::unpark_thread(tid);
+    let mut lief_weiter = false;
+    for _ in 0..64 {
+        if PARK_PROBE_BITS.load(Ordering::Acquire) & 2 != 0 {
+            lief_weiter = true;
+            break;
+        }
+        warten();
+    }
+    // 4. Fremde ThreadId abgewiesen (setzt die Sonde nach dem Weiterlaufen).
+    let mut fremd_abgewiesen = false;
+    for _ in 0..64 {
+        if PARK_PROBE_BITS.load(Ordering::Acquire) & 4 != 0 {
+            fremd_abgewiesen = true;
+            break;
+        }
+        warten();
+    }
+
+    let ok = marke_wirkt && blockiert && geweckt_ok && lief_weiter && fremd_abgewiesen && ipc_bleibt;
+    println!(
+        "park    : marke-wirkt={marke_wirkt} zweites-blockiert={blockiert} \
+         geweckt={geweckt_ok} lief-weiter={lief_weiter} fremd-abgewiesen={fremd_abgewiesen} \
+         ipc-bleibt-liegen={ipc_bleibt} bits={b:#06b} : {}",
+        if ok { "ALL PASS" } else { "FAILURES" }
+    );
+    ok
+}
 
 /// **Z4a: der Haltepunkt — und der Beleg, dass er einer ist.**
 ///
@@ -2111,6 +2313,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             ("rebind", rebind),
             ("epfull", epfull),
             ("state", state),
+            ("park", PARK_MESS.load(Ordering::Acquire) & 1 != 0),
     ];
     if let Some(w) = warum {
         *w = flags;
@@ -2120,7 +2323,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 25;
+const DONE_FLAGS: usize = 26;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]
@@ -3643,6 +3846,7 @@ pub fn run(multiboot_info: u64) -> ! {
             }
             system::reap();
             drv_service_step(archive);
+            park_messen(); // laeuft genau einmal; das Urteil steht danach in `all_done()`
             if all_done(archive, None) {
                 report_and_off(false);
             }

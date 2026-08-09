@@ -475,6 +475,54 @@ diese Zahl nicht erhöhen.
       Folge für die Reihenfolge: Stufe 1 (Speicher-Server) ist **nicht** Vorbedingung für den
       ersten WASM-Schritt — wohl aber für `memory.grow` und für mehr als einen Gast.
 
+### Z22. Die vier harten Stellen aus Z21 — gebaut
+**Klasse:** Substrat · **Stand:** 2026-08-09 · Leitlinie: *so viel wie möglich in der PD, TCB so
+klein wie möglich, Leistung maximal.*
+
+Die Aufteilung, die daraus folgt:
+
+| Punkt | im Kernel (TCB) | in der PD |
+|---|---|---|
+| 1 IRQ | IRTE-Vergabe mit SID-Prüfung, Vektor→Notification | Maskieren am Gerät (eigene MSI-X-Tabelle), Handler |
+| 2 threaded IRQ | **nichts Neues** | Workqueue, Ausschluss zwischen eigenen Threads |
+| 3 DMA | Region **einmal** mappen (steht schon) | IOVA-Allokator über dem Fenster, `dma_map` ohne Syscall |
+| 4 Schlafen | ein Syscall + zwei Bits je TCB | Warteschlangen, Completions, `wait_event` |
+
+- [x] **P4 — `wait_event`/`wake_up` ohne Kernelobjekt** (2026-08-09, `park : ALL PASS`).
+      `SYS_PARK` legt schlafen, `SYS_UNPARK` weckt. Die **Warteschlange liegt in der PD** — eine
+      gewöhnliche Liste; der Kernel kennt nur „schlafe" und „wecke Thread T".
+      **Warum nicht Notifications:** ein Linux-Treiber schläft an vielen Stellen (jedes
+      `wait_queue_head_t`, jede Completion, der bestrittene Zweig jedes Mutex). Je Warteschlange
+      ein Kernelobjekt **und** ein Cap-Slot wäre die TCB-Rechnung genau falsch herum — und
+      `Notification` fasst ohnehin nur **einen** Wartenden (dieselbe Kapazitätsform wie D11).
+      **Die Weckmarke ist nicht optional.** Ohne sie ist „Bedingung prüfen (falsch)" → „parken"
+      unterbrechbar, und ein dazwischen eintreffendes Wecken verpufft. Marke setzen und Blockade
+      prüfen stehen deshalb **unter demselben Kern-Lock**.
+      **Zwei Bits, jedes mit genau einer Bedeutung** (`parked`, `park_wake`) — die D9-Lehre:
+      `unpark` weckt **nur**, wer wegen `PARK` blockiert ist; ein IPC-Wartender bleibt liegen.
+      **Kosten:** ein Syscall, zwei Bits je TCB. Der unbelastete Weg („Bedingung ist schon wahr")
+      ist **null Syscalls** — er fasst den Kernel gar nicht an.
+      **Gemessen, sechs Aussagen** mit Positivkontrolle (das zweite `PARK` **muss** blockieren,
+      sonst bestünde ein `PARK`, das nichts tut, die erste Aussage mit Bestnote). Zwei
+      Gegenproben: Marke entfernt → `marke-wirkt=false`; Grundprüfung entfernt →
+      **nur** `ipc-bleibt-liegen=false`.
+      **Zwei eigene Fehler dabei, beide in der Fallenliste.**
+
+- [ ] **P3 — DMA: der IOVA-Allokator gehört in die PD.** Region einmal vorgemappt, danach ist
+      `dma_map_single` reine Adressarithmetik in der PD: **null Syscalls im heissen Pfad**. Die
+      Trennung `Pa`/`Iova` existiert hier bereits als Typ — in Linux-Treibern ist ihre
+      Verwechslung der Normalfall.
+
+- [ ] **P1 — x86: MSI-X + IRTE-Vergabe.** Der Rest von Z21 Punkt 1 (s. dort). MSI ist
+      **flankengetriggert** — das Maskieren/Demaskieren, das ein level-getriggerter GIC-SPI
+      braucht, entfällt, und wo doch maskiert werden muss, tut es die PD an **ihrem eigenen**
+      Gerät. Die IRTE trägt `SVT`/`SID`: eine PD, die den Handle einer fremden IRTE in ihre
+      MSI-X-Tabelle schriebe, wird von der Einheit abgewiesen.
+
+- [ ] **P2 — threaded IRQ.** `spin_lock_irqsave` wird zu Ausschluss zwischen Threads **derselben
+      PD**. Braucht mehrere Threads je PD; der billigste Weg ist das **Manifest** (der Lader legt
+      N an), nicht ein neuer Syscall — dann kostet P2 im Kernel **nichts**.
+
 ### Z21. Linux-Treiber als PD-Prozesse — bewertet 2026-08-09
 **Klasse:** Kompatibilitätsschicht · **Aufwand:** groß, aber **einmalig statt je Treiber** ·
 **TCB:** neutral
@@ -495,9 +543,19 @@ diese Zahl nicht erhöhen.
 - [ ] **Vier harte Stellen, die spezifisch für eine PD sind — und drei davon sind Arbeit, nicht
       Zweifel:**
 
-      1. **`CAP_IRQ` fehlt.** Im Manifestformat definiert, nicht umgesetzt; jeder Treiber pollt.
-         Für GPU oder WiFi nicht gangbar. Braucht IRTE-Vergabe (B-3), und die Remapping-Tabelle
-         steht seit B-3.2 absichtlich auf „not present". **Das ist die konkrete Sperre.**
+      1. **`CAP_IRQ` ist auf x86 wirkungslos** — **berichtigt am 2026-08-09, nachgesehen statt
+         erinnert.** Der Eintrag sagte „im Manifestformat definiert, nicht umgesetzt". Das ist
+         falsch: der ganze Weg steht (`install_irq_cap`, `bind_irq`, ein **lock-freier** Hook im
+         IRQ-Kontext, der maskiert und vermerkt, und `drain_pending_irqs`, das ausserhalb des
+         IRQ-Kontexts als Notification-Badge zustellt) — und er **läuft auf aarch64**, mit
+         Prüfzeile (`RTC_INTID`, Badge, `irqs_delivered() >= 1`).
+         Wirkungslos ist er auf **x86**, und zwar an einer eng umrissenen Stelle: `enable_intid`,
+         `mask_intid` und `route_spi` sind dort dokumentierte **No-Ops** („IOAPIC noch nicht
+         portiert"). Es fehlt also nicht der Mechanismus, sondern die x86-Zustellung — und für
+         PCIe ist der richtige Weg **MSI-X**, nicht der IOAPIC. Dazu die IRTE-Vergabe (B-3.2 hat
+         die Tabelle auf „not present" gesetzt, das ist Absicht).
+         **Zweite Lücke, die der Eintrag nicht nannte:** `bind_irq` ist **kernelintern**. Eine
+         Treiber-PD kann ihren IRQ nicht selbst binden — der Test tut es von Kernelseite.
       2. **„Interrupts sperren" ist in einer PD bedeutungslos.** `spin_lock_irqsave` ist in Linux
          Ausschluss gegen den *eigenen* IRQ-Handler. In einer PD wird daraus Ausschluss zwischen
          **Threads derselben PD** — braucht also Threads-in-PD (Z19) und die Abbildung

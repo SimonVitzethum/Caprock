@@ -236,6 +236,15 @@ struct Tcb {
     /// aus IPC oder PAUSE. `blocked` allein kann das nicht sagen, und genau daran haengt der
     /// Donee-Zweig: er hebt eine Blockade auf, deren Grund er nicht kennt.
     budget_blocked: bool,
+    /// Blockiert, WEIL der Thread `SYS_PARK` gerufen hat -- **genau ein** Grund, aus demselben
+    /// Motiv wie `budget_blocked` und `admitted` (D9): `unpark` darf einen Thread, der in IPC
+    /// wartet, nicht wecken. Ohne dieses Bit waere `unpark` ein `unblock` mit unbekanntem Grund.
+    parked: bool,
+    /// **Weckmarke**: jemand hat `unpark` gerufen. Ohne sie gaebe es ein verlorenes Wecken --
+    /// wer die Bedingung prueft (falsch), dann geweckt wird, dann parkt, schliefe fuer immer.
+    /// Genau die Stelle, an der ein Futex seinen Vergleichswert braucht; hier reicht eine Marke,
+    /// weil sie **im selben Scheduler-Lock** gesetzt und geprueft wird wie die Blockade.
+    park_wake: bool,
     // --- Budget-Donation (MCS, intra-core IPC): bei einem CALL leiht der Aufrufer dem
     // Server seinen Scheduling-Context; der Server wird gegen das **Konto** des Aufrufers
     // belastet (geteilter SC), bis er antwortet. So begrenzt das Budget des Aufrufers die
@@ -279,6 +288,8 @@ impl Tcb {
         next_refill: 0,
         depleted: false,
         budget_blocked: false,
+        parked: false,
+        park_wake: false,
         sc_donor: None,
         sc_donee: None,
         cyc: CycleStats::EMPTY,
@@ -804,6 +815,84 @@ impl Scheduler {
             }
         }
         true
+    }
+
+    /// **Den laufenden Thread parken — es sei denn, eine Weckmarke liegt schon vor** (Z22, P4).
+    ///
+    /// Das ist die Grundlage, auf der eine PD `wait_event`, Completions und Mutex-Warteschlangen
+    /// baut, **ohne je ein Kernelobjekt anzulegen**: die Warteschlange selbst ist eine Liste im
+    /// Speicher der PD, der Kernel kennt nur „schlafe" und „wecke Thread T".
+    ///
+    /// ## Warum die Marke nicht weggelassen werden kann
+    ///
+    /// Ohne sie ist die Folge `Bedingung pruefen (falsch)` → `parken` unterbrechbar: setzt ein
+    /// anderer Thread dazwischen die Bedingung und weckt, trifft das Wecken einen Thread, der noch
+    /// nicht schlaeft — es verpufft, und danach schlaeft er fuer immer. Das ist dasselbe verlorene
+    /// Wecken, gegen das ein Futex seinen Vergleichswert braucht. Hier genuegt eine Marke, weil
+    /// Pruefung und Blockade **unter demselben Kern-Lock** stattfinden.
+    ///
+    /// `None` heisst „nicht blockiert, die Marke war da und ist verbraucht" — der Aufrufer laeuft
+    /// weiter. `Some(sp)` ist der Stackpointer des naechsten Threads.
+    pub fn park_current(&mut self, core: usize, frame: usize) -> Option<usize> {
+        debug_assert_eq!(core, self.core);
+        let cur = self.current.expect("kein laufender Thread");
+        if self.tcbs[cur].park_wake {
+            // Verbraucht: eine Marke weckt genau einmal. Sonst liefe der naechste `park` durch,
+            // obwohl niemand mehr geweckt hat.
+            self.tcbs[cur].park_wake = false;
+            return None;
+        }
+        self.tcbs[cur].parked = true;
+        Some(self.block_current(core, frame))
+    }
+
+    /// **Einen geparkten Thread wecken — und die Marke IMMER hinterlegen** (Z22, P4).
+    ///
+    /// Die Marke wird auch dann gesetzt, wenn der Thread gar nicht schlaeft: genau das ist der
+    /// Fall, in dem das Wecken sonst verlorenginge (er ist zwischen Pruefung und `park`).
+    ///
+    /// **Geweckt wird nur, wer WEGEN `park` blockiert ist.** Ein Thread, der in IPC wartet oder
+    /// pausiert wurde, bleibt liegen — eine Blockade aufzuheben, deren Grund man nicht kennt, ist
+    /// der Fehler aus D9, und er hat dort vier von fuenf Befunden erzeugt.
+    ///
+    /// Rückgabe wie [`unblock`](Self::unblock): konnte der Thread auf **diesem** Kern aufgelöst
+    /// werden? `false` heisst „tot oder migriert" — der Aufrufer wiederholt beim neuen Besitzer.
+    pub fn unpark(&mut self, tid: ThreadId) -> bool {
+        let Some(s) = self.resolve(tid) else {
+            return false;
+        };
+        self.tcbs[s].park_wake = true;
+        if self.tcbs[s].parked {
+            self.tcbs[s].parked = false;
+            // Die Marke ist gesetzt UND er schlief -> sie hat ihre Wirkung hier getan und wird
+            // sofort verbraucht. Bliebe sie stehen, liefe sein naechstes `park` grundlos durch.
+            self.tcbs[s].park_wake = false;
+            // Bewusst ueber `unblock` und nicht mit `blocked = false` von Hand: dort haengen die
+            // Waechter fuer `depleted` und `budget_blocked` (D8/D10), und die gelten hier genauso.
+            self.unblock(tid);
+        }
+        true
+    }
+
+    /// Schläft dieser Thread **wegen `park`**? (Nur Telemetrie/Prüfung — der `park`-Nachweis in
+    /// der Suite braucht die Unterscheidung zu einer IPC-Blockade.)
+    pub fn is_parked(&self, tid: ThreadId) -> bool {
+        self.resolve(tid).is_some_and(|s| self.tcbs[s].parked)
+    }
+
+    /// Liegt für diesen Thread eine unverbrauchte Weckmarke vor? (Nur Telemetrie/Prüfung.)
+    pub fn has_wake_token(&self, tid: ThreadId) -> bool {
+        self.resolve(tid).is_some_and(|s| self.tcbs[s].park_wake)
+    }
+
+    /// Ist dieser Thread blockiert — **gleich aus welchem Grund**? (Nur Telemetrie/Prüfung.)
+    ///
+    /// Genau die Größe, die der D9-Nachweis braucht: ob `unpark` einen Thread aus seiner Blockade
+    /// geholt hat, ist an `parked` **nicht** ablesbar (das Bit ist bei einem IPC-Wartenden ohnehin
+    /// falsch, vorher wie nachher). Die erste Fassung des Prüfers las genau dort nach und hätte
+    /// den Fehler nie gesehen.
+    pub fn is_blocked(&self, tid: ThreadId) -> bool {
+        self.resolve(tid).is_some_and(|s| self.tcbs[s].blocked)
     }
 
     /// Einen **bestimmten** Thread dieses Kerns extern pausieren (`SYS_PDCTL` PAUSE).
@@ -1582,6 +1671,12 @@ pub trait SchedOps {
     fn block_current(&mut self, core: usize, frame: usize) -> usize;
     fn switch_to(&mut self, core: usize, frame: usize, target: ThreadId) -> usize;
     fn unblock(&mut self, tid: ThreadId);
+    /// **Selbst-Park mit Weckmarke** (Z22, P4). `None` = nicht blockiert (Marke war da und ist
+    /// verbraucht), der Aufrufer läuft weiter. Siehe [`Scheduler::park_current`].
+    fn park_current(&mut self, core: usize, frame: usize) -> Option<usize>;
+    /// **Einen geparkten Thread wecken**; die Marke wird immer hinterlegt, geweckt wird nur, wer
+    /// wegen `park` blockiert ist. Siehe [`Scheduler::unpark`].
+    fn unpark(&mut self, tid: ThreadId);
     /// Einen bestimmten Thread extern pausieren (blockieren; mit `unblock` reversibel).
     fn pause(&mut self, tid: ThreadId);
     /// Einen bestimmten (nicht laufenden) Thread auf irgendeinem Kern beenden + abbauen

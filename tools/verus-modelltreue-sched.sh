@@ -231,6 +231,28 @@ TCB_AUSSERHALB = {
                    'nicht daran), aber der AUDIT liest es: Code 7 („lauffaehig und in keiner '
                    'Liste") muss den Zustand zwischen `spawn_parked` und `admit` ausnehmen. '
                    'NICHT `in_ready` -- das faellt zurueck, dieses nicht',
+    # Z22 P4, 2026-08-09. **Ausdruecklich NICHT auf `blocked` abgebildet**, und aus genau dem
+    # Grund, aus dem es die beiden Felder ueberhaupt gibt: `blocked` sagt DASS, `parked` sagt
+    # WARUM. Sie auf dasselbe Modellfeld zu legen hiesse, die Unterscheidung im Modell wieder
+    # einzuziehen, die im Code eingefuehrt wurde -- und der Beweis zeigte dann eine Aussage ueber
+    # „ist blockiert", waehrend man sie als Aussage ueber „ist geparkt" laese. Dieselbe Falle wie
+    # bei `admitted` gegen `in_ready`.
+    #
+    # Das Modell kennt keinen Park-Zustand: seine Uebergaenge sind Einplanung und Budget. Ein
+    # geparkter Thread ist fuer das Modell ein blockierter, und alle Einplanungsaussagen gelten
+    # unveraendert -- `park_current` geht durch `block_current`, `unpark` durch `unblock`, also
+    # durch die Partnerfunktionen, die schon abgebildet sind.
+    #
+    # **Was das Modell damit NICHT sagt** (und was hier stehen muss, damit niemand es hineinliest):
+    # dass eine Weckmarke nicht verlorengeht. Diese Eigenschaft ist gemessen (Pruefzeile `park`,
+    # zwei Gegenproben), nicht bewiesen.
+    'parked':      'Z22: „blockiert WEIL geparkt". NICHT auf `blocked` abgebildet -- das sagt '
+                   'DASS, dieses sagt WARUM, und die Trennung ist der ganze Zweck (D9). Keine '
+                   'Einplanungsentscheidung: `park_current`/`unpark` laufen ueber '
+                   '`block_current`/`unblock`, die abgebildet sind',
+    'park_wake':   'Z22: die Weckmarke. Reine Uebergabe zwischen `unpark` und dem naechsten '
+                   '`park_current`; das Modell kennt kein Wecken ohne Schlaefer. Dass sie nicht '
+                   'verlorengeht, ist GEMESSEN (Pruefzeile `park`), nicht bewiesen',
 }
 
 # [2] Funktionen in `lib.rs`, die Modellzustand schreiben.

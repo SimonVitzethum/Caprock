@@ -480,6 +480,17 @@ impl SchedOps for KernelSched {
             kick(c);
         }
     }
+    fn park_current(&mut self, core: usize, frame: usize) -> Option<usize> {
+        SCHEDS[core].lock().park_current(core, frame)
+    }
+    fn unpark(&mut self, tid: ThreadId) {
+        // Dieselbe Migrationsschleife wie `unblock`: zwischen „Besitzer nachschlagen" und
+        // „Kern sperren" kann der Thread den Kern wechseln. `unpark` gibt `false` genau dann,
+        // wenn er auf DIESEM Kern nicht aufloesbar war -- `with_owner` wiederholt dann.
+        if let Some((_, c)) = with_owner(tid, |s, _| s.unpark(tid).then_some(())) {
+            kick(c);
+        }
+    }
     fn pause(&mut self, tid: ThreadId) {
         // Läuft das Ziel gerade auf einem anderen Kern, per Reschedule-IPI deplanen.
         if let Some((_, c)) = with_owner(tid, |s, _| s.pause(tid).then_some(())) {
@@ -7369,6 +7380,33 @@ pub fn freeze_thread(tid: ThreadId) -> Freeze {
 /// Einen eingefrorenen Thread wieder laufen lassen.
 pub fn thaw_thread(tid: ThreadId) -> bool {
     with_owner(tid, |s, _| s.unblock(tid).then_some(())).is_some()
+}
+
+/// **Einen geparkten Thread vom Kernel aus wecken** (Z22, P4) — dieselbe Operation wie
+/// [`sys::UNPARK`](sel4lake_abi::sys::UNPARK), nur ohne die PD-Prüfung, die dort die Autorität
+/// des Aufrufers begrenzt. Für Prüfpfade und für den IRQ-Weg.
+pub fn unpark_thread(tid: ThreadId) -> bool {
+    if let Some((_, c)) = with_owner(tid, |s, _| s.unpark(tid).then_some(())) {
+        kick(c);
+        return true;
+    }
+    false
+}
+
+/// Ist dieser Thread blockiert, **gleich aus welchem Grund**? Die Größe, an der sich zeigt, ob
+/// `unpark` eine fremde Blockade aufgehoben hat — `is_parked` kann das nicht sagen.
+pub fn is_blocked(tid: ThreadId) -> bool {
+    with_owner(tid, |s, _| Some(s.is_blocked(tid)))
+        .map(|(b, _)| b)
+        .unwrap_or(false)
+}
+
+/// Schläft dieser Thread **wegen `PARK`**? (Prüfpfad: eine IPC-Blockade sieht von aussen
+/// genauso aus, und genau die Verwechslung ist der D9-Fehler.)
+pub fn is_parked(tid: ThreadId) -> bool {
+    with_owner(tid, |s, _| Some(s.is_parked(tid)))
+        .map(|(b, _)| b)
+        .unwrap_or(false)
 }
 
 // -- A-4.1: atomares Umbinden ----------------------------------------------------------

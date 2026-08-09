@@ -797,6 +797,27 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   losgelaufen, bevor die Seiten standen, und haette auf P statt auf P+8KiB gefaultet. Gruene Zeile,
   anderer Test. (Dieselbe Form wie D8: dort machte der offensichtliche Waechter den Thread
   vollstaendig verhungern.)
+* **Ein Pruefer, der die falsche GROESSE liest, kann den Fehler, gegen den er gebaut ist,
+  strukturell nicht sehen.** Die `park`-Zeile sollte belegen, dass `unpark` einen IPC-Wartenden
+  NICHT weckt (der D9-Fehler). Sie las dafuer `is_parked` vorher und nachher -- an einem
+  IPC-Wartenden ist dieses Bit aber in **beiden** Faellen falsch, ob geweckt wird oder nicht. Die
+  Zeile stand auf ALL PASS und haette bei eingebautem Fehler weiter darauf gestanden. Gefunden hat
+  es die Gegenprobe, nicht das Gegenlesen. Gemessen wird jetzt `blocked` -- die Groesse, die sich
+  tatsaechlich aendert.
+* **Eine Mutation, die zwei Dinge zugleich kaputtmacht, beweist nichts ueber das gemeinte.** Die
+  erste D9-Gegenprobe ersetzte `if self.tcbs[s].parked` durch `if true` -- damit wurde die
+  Weckmarke im selben Zug **immer sofort geloescht**. Die Suite fiel durch, aber an der ERSTEN
+  Aussage (`marke-wirkt=false`), nicht an der gemeinten. Die saubere Fassung verschiebt nur den
+  `unblock`-Aufruf aus dem `if` heraus; dann faellt genau ein Feld (`ipc-bleibt-liegen=false`) und
+  alle uebrigen bleiben gruen. Eine Gegenprobe muss **isolieren**, sonst misst sie die Reihenfolge
+  der Pruefungen und nicht die Eigenschaft.
+* **Ring-3-Code gehoert in `.user_text`, und die Fehlermeldung dafuer sieht aus wie ein
+  Kernelfehler.** Eine neue Ring-3-Sonde ohne `#[link_section = ".user_text"]` landet in `.text`,
+  ist aus Ring 3 nicht ausfuehrbar und faultet **an ihrer eigenen Einsprungadresse**. Im Log stand
+  nur „User-Thread 0x6 faultete (FAR=0x134930)" und eine Pruefzeile mit lauter `false` -- was wie
+  ein kaputter Mechanismus aussieht und eine fehlende Zeile ist. Entschieden hat `nm`: die Adresse
+  des Symbols war die Fault-Adresse. Ein mitgerufener Helfer muss `#[inline(always)]` sein, sonst
+  liegt ER in `.text` und der Fehler wandert nur eine Ebene tiefer.
 * **`wrapping_sub` auf einer Zeitdifferenz ist die teuerste bequeme Zeile.** Ein Zähler, der um
   100 Zyklen zurückspringt, ergäbe rund `2^64` — ein Konto, das so belastet wird, ist sofort und
   dauerhaft erschöpft. Rückwärts heisst **verworfen**, nicht „fast einmal herum".

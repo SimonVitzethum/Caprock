@@ -569,6 +569,36 @@ Pfad. Beim dritten Mal ist das Muster kein Zufall.
       Als Satz in `sel4lake-wait` (`while`, nie `if`) **und** als injizierte Gegenprobe: ein
       überzähliger Weckruf darf keine der elf Aussagen kippen.
 
+- [ ] **Die Umrechnungstabelle — Stelle für Stelle, damit der Umbau eine ABSCHRIFT wird.**
+      Aufgenommen am 2026-08-09 aus `crates/sel4lake-sched/src/lib.rs` (Zeilennummern vom Stand
+      `3a5fd5e`; sie verschieben sich, die **Funktionen** nicht).
+      **Der Punkt dieser Tabelle:** an 19 Stellen ist jeweils die *richtige* Begründung zu wählen.
+      Eine mechanische Ersetzung `blocked -> reasons != 0` wäre genau der Fehler, den der Umbau
+      beseitigen soll — sie schriebe die Mehrdeutigkeit in die neue Struktur hinein.
+
+      | Zeile | Funktion | Wirkung | Grund |
+      |---|---|---|---|
+      | 743 | `block_current` | setzt | **vom Aufrufer**: der Weg wird von IPC *und* von `park_current` benutzt. Deshalb `block_current_mit(core, frame, grund)`; `block_current` bleibt als IPC-Fassung |
+      | 757 | `switch_to` | setzt | `IPC` (der Aufrufer blockiert für das Rendezvous) |
+      | 759 | `switch_to` | löscht | `IPC` am **Ziel** |
+      | 783 | `unblock` | liest | `reasons != 0` |
+      | 798 | `unblock` | löscht | `IPC` — **und nur einreihen, wenn die Menge danach LEER ist** |
+      | 895 | `is_blocked` | liest | `reasons != 0` |
+      | 909/910 | `pause` | setzt | `PAUSE` |
+      | 1090 | `on_tick` | liest | `reasons == 0` (requeue) |
+      | 1103/1107 | `on_tick` | setzt | `BUDGET` (Konto erschöpft) |
+      | 1161 · 1218 · 1557 | `refill_depleted` | löscht | `BUDGET` |
+      | 1179 · 1223 | Auswahl | liest | `reasons == 0` |
+      | 1370 · 1438 | `audit` | liest | `reasons != 0` |
+
+      Dazu: `budget_blocked` (46 Erwähnungen) wird zu `reasons & BUDGET`, `parked` zu
+      `reasons & PARK`. **`park_wake` bleibt ein eigenes Bit** — es ist eine *Marke*, kein
+      Blockadegrund, und es in die Menge zu ziehen wäre dieselbe Verwechslung noch einmal.
+      `Z23` fügt später genau **einen** Wert hinzu: `FREEZE`.
+
+      **Die Aussage, die den ganzen Umbau trägt**, steht in Zeile 798: eingereiht wird **nur bei
+      leerer Menge**. Ohne sie ist die Menge bloss eine andere Schreibweise für dieselben Bits.
+
 - [ ] **Der Scheduler-Modelltreue-Wächter prüft den Umbau mit** — `parked`/`park_wake` sind dort
       schon als „ausserhalb des Modells" eingetragen und müssen auf die Menge umgeschrieben werden.
 

@@ -838,6 +838,16 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   war**. Der Kommentar an der Stelle beschrieb den Fehler bereits wörtlich und verhinderte ihn
   nicht: die Behebung lag eine Ebene zu flach. Verschlüsselt wird mit der `program_id`, nicht mit
   der Rolle — dieselbe Lösung wie bei den vier versteckten Politiken aus A-5.4.
+* **Ein Wecker, der seinen Grund nicht NENNT, weckt fremde Entscheidungen mit auf.** `blocked` war
+  ein Bit für vier Lagen (IPC, Budget, Pause, Park); jede Abspaltung reparierte die letzte
+  Kollision und **stellte die nächste auf**. Seit der Grund-Menge (Z24) entfernt jeder Wecker
+  genau seinen Grund, und eingereiht wird **nur bei leerer Menge** — ohne diesen zweiten Halbsatz
+  ist die Menge bloss eine andere Schreibweise für dieselben Bits. Der Umbau deckte vier Stellen
+  auf, die vom Durcheinander lebten: `RESUME` rief `unblock`, `thaw_thread` ebenso (obwohl
+  `freeze` über `pause` einfriert), der IPC-**Fastpath** liess ein pausiertes Ziel unmittelbar
+  laufen, und ein Cross-Core-Test weckte einen *geparkten* Thread mit dem Wecker für IPC.
+  Merkmal der Klasse: Sie fallen nicht beim Gegenlesen auf, sondern in der Suite der Architektur,
+  auf der der Zustand oft vorkommt.
 * **Ein Kriterium, das die geprüfte Sache nicht erreichen KANN, ist kein strenges Kriterium,
   sondern gar keins.** Die FP-Sonde musste „alle 64 Abgaben überstehen"; erreichbar waren 3, weil
   sie je Rundlauf-Runde eine Iteration vorankommt und eine Runde durch den **Tick** begrenzt ist,

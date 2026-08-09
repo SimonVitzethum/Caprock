@@ -1,3 +1,16 @@
+## Lizenz
+
+SEL4Lake steht unter **GPL-3.0-or-later** (`LICENSE`).
+
+Dazu eine **zusätzliche Erlaubnis** nach GPLv3 §7: die **ABI-Ausnahme** in
+`LICENSE-EXCEPTION.md`. Ein Programm, das nur über die veröffentlichte System-Schnittstelle mit
+dem Kernel verkehrt, ist allein deswegen kein abgeleitetes Werk. Sie gilt **nichtkommerziell
+immer**; für kommerzielle Nutzung nur mit schriftlicher Zustimmung des Urhebers — wobei die GPLv3
+kommerzielle Nutzung ohnehin und unabhängig davon erlaubt (die Ausnahme nimmt nichts weg, sie gibt
+nur eine Klarstellung).
+
+Welche Crates dafür permissiv werden müssen, steht in `docs/grenze.md`.
+
 # SEL4Lake
 
 Ein eigenständiger, capability-basierter **Microkernel in Rust**, inspiriert von **seL4** und der

@@ -527,9 +527,56 @@ Binaries fahren) — das ist eine Richtungsentscheidung, keine Erweiterung.
 **`nouveau` (Kernel, GPL-2.0) + `NVK` (Mesa, Vulkan-Treiber, offen)** — beides Quelltext, beides
 über Z16 übersetzbar, keine binäre ABI nötig. Ergebnis: **Vulkan/OpenGL, kein CUDA.**
 
-## Die Entscheidung, die vor dem Plan steht
+## ENTSCHIEDEN: CUDA JA → Weg A (2026-08-09, Simon)
 
-**Wird CUDA gebraucht?** Die Antwort legt den Weg fest, und sie ist eine Produktfrage:
+Damit ist die binäre Linux-ABI (A3) **kein optionaler Strang mehr, sondern Voraussetzung** — und
+Z16 („Quelltext übersetzen statt Binaries fahren") ist nicht mehr die einzige Linie, sondern eine
+von zweien. Die Blobs sind nicht verhandelbar: `libcuda` gibt es nicht als Quelltext, und ROCm oder
+oneAPI wären ein anderer Hersteller, kein anderer Weg.
+
+**Was das konkret verschiebt:** Z14 rückt von „bewertet, zurückgestellt" auf den kritischen Pfad,
+und der teuerste Teil des GPU-Vorhabens ist **nicht** der Treiber.
+
+## Fuchsia als Vorbild — und es sind ZWEI Bausteine
+
+Die Frage „kann man sich an Fuchsias Schicht orientieren" trifft, und zwar doppelt. Beide Teile
+sind **BSD-3-Clause**, also permissiv — anders als `dde_linux` (GPLv2) gäbe es hier **keine**
+Lizenzreibung mit AGPL.
+
+### 1. `Starnix` → das Vorbild für A3
+
+Eine **Linux-Binärkompatibilität im Userland**: ein Zircon-Prozess, der die Linux-Syscall-Fläche
+implementiert (`/proc`, `/dev`, `futex`, Signale, `mmap`) und unveränderte Linux-ELFs fährt — in
+Rust geschrieben, TCB-neutral. Genau die Stellung, die eine PD hier hätte.
+
+**Die wichtigste übertragbare Lehre ist aber nicht der Aufbau, sondern was Fuchsia dafür am KERNEL
+ändern musste:** *restricted mode* (`zx_restricted_enter`) — ein Kernel-Primitiv, mit dem ein
+Thread fremden User-Code ausführt und dessen Syscalls **zurück in den Userspace-Handler** fallen
+statt in den Kernel. Reine Abfangerei aus dem Userland (der gVisor-ptrace-Weg) war zu teuer.
+
+**Das ist die eine Zeile TCB, die Weg A kosten wird**, und sie sollte im Entwurf stehen, bevor
+jemand anfängt — nicht als Überraschung im dritten Monat. Für SEL4Lake hiesse das: ein Thread einer
+PD führt Fremdcode aus, und sein `syscall`-Eintritt wird an eine **andere PD** zugestellt statt an
+den Kernel. Das ist eine echte Erweiterung des Thread-Modells, kein Aufsatz.
+
+### 2. `Magma` → das Vorbild für A1/A2
+
+Fuchsias **GPU-Architektur**: geteilt in einen *system driver* (im Treiberprozess) und einen
+*application driver* (Herstellercode im Anwendungsprozess, z. B. Mesa), die über Kanäle reden.
+Also exakt der Schnitt, den SEL4Lake ohnehin braucht — Kommandopuffer werden in der Anwendung
+gebaut und über IPC eingereicht, statt über `ioctl` auf ein Gerät.
+
+**Der Nutzen liegt im Entwurf, nicht im Code.** Zircons Objektmodell (Handles, VMOs, Kanäle) ist
+nicht das von SEL4Lake (Caps, PDs, Endpoints); es geht um die **Schnittführung**, und die ist
+übertragbar. Fuchsia zu portieren wäre keine Abkürzung, sondern ein zweites Betriebssystem.
+
+**Vor der Übernahme zu prüfen** (aus der Quelle, nicht aus dem Gedächtnis): der genaue Umfang von
+`zx_restricted_enter`, wie Starnix `mmap`/`fork` auf VMOs abbildet, und ob Magmas Schnitt die
+CUDA-Fläche überhaupt trägt — Magma ist auf Grafik zugeschnitten, und `libcuda` spricht mit
+`/dev/nvidia*` und `/dev/nvidia-uvm`, nicht mit einer Grafik-uAPI. **Das ist der Punkt, an dem das
+Vorbild enden könnte.**
+
+## Die Frage, die der Entscheidung vorausging
 
 * **PaaS mit GPU-Compute** (Inferenz, Training) → **CUDA ist der Markt**, also Weg A, also binäre
   ABI. Es gibt keine Abkürzung; ROCm/oneAPI wären ein anderer Hersteller, nicht ein anderer Weg.
@@ -543,9 +590,11 @@ Unabhängig vom Weg: **`CAP_IRQ` auf x86** (IRTE-Vergabe), **grosse/zusammenhän
 **Firmware-Laden aus einem Dateisystem**. Ohne diese drei ist keine Variante lauffähig — und alle
 drei stehen ohnehin auf dem Weg zum Server.
 
-**Nicht empfohlen als nächster Schritt.** Der Eintrag steht, damit die Entscheidung *CUDA ja/nein*
-bewusst fällt, bevor irgendjemand anfängt — sie kostet, einmal getroffen, den Unterschied zwischen
-„übersetzen" und „fremde Binaries fahren".
+**Weiterhin nicht der nächste Schritt** — aber die Entscheidung ist gefallen, und sie kostet den
+Unterschied zwischen „übersetzen" und „fremde Binaries fahren". Die drei Vorbedingungen (`CAP_IRQ`
+auf x86, grosse DMA, Firmware aus einem Dateisystem) stehen ohnehin auf dem Weg zum Server; die
+vierte — **das Kernel-Primitiv für umgeleitete Syscalls** — steht auf keinem anderen Weg und ist
+damit der ehrliche Preis dieser Entscheidung.
 
 ### Z25. Eager-FP auf x86 — der Dreier-Commit, 2026-08-09
 **Klasse:** Sicherheit · **Stand:** drei Teile fertig und gemessen, **die FP-Sonde bleibt rot**

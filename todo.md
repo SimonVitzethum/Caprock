@@ -475,6 +475,95 @@ diese Zahl nicht erhöhen.
       Folge für die Reihenfolge: Stufe 1 (Speicher-Server) ist **nicht** Vorbedingung für den
       ersten WASM-Schritt — wohl aber für `memory.grow` und für mehr als einen Gast.
 
+### Z16. Quelltext übersetzen statt Binaries laufen lassen — bewertet 2026-08-09
+**Klasse:** Produktstrang · **Aufwand:** groß, aber **eine Größenordnung kleiner als
+Binärkompatibilität** · **Randbedingung:** Isolation und kleine TCB bleiben.
+
+**Das Ziel (Simon, 2026-08-09):** Quelltext klonen, übersetzen, auf dem Mikrokern laufen lassen —
+möglichst viele Linux-Bibliotheken aus C, C++, Zig, Rust, Go.
+
+- [ ] **Was dieses Ziel STREICHT, und das ist der eigentliche Ertrag.** Binärkompatibilität fällt
+      weg. Damit entfallen alle vier Kerneloperationen aus [Z14](#z14-fremde-software-ohne-gastschicht--bewertet-2026-08-09):
+      keine Syscall-Umleitung, kein `ld.so` für fremde Binaries, keine ABI-Treue gegenüber Linux,
+      kein Persönlichkeitsserver. Übrig bleibt **eine libc und die Dienste dahinter** — und die
+      dürfen ihre eigene ABI haben, weil alles neu übersetzt wird.
+
+      Das ist auch der Unterschied zu WSL1/gVisor, an denen die Binärkompatibilität gescheitert
+      ist: dort musste Linux-**Verhalten** nachgebildet werden. Hier muss nur POSIX-**Semantik**
+      stimmen, und wo eine Bibliothek darüber hinausgeht, ist der Quelltext da.
+
+- [ ] **Gemessen am 2026-08-09, `strace -f` über fünf echte Programme:**
+
+      | Programm | verschiedene Syscalls |
+      |---|---|
+      | C-Hello, statisch gelinkt | **14** |
+      | `git --version` | 22 |
+      | `python3 -c pass` | 34 |
+      | `sqlite3` | 36 |
+      | `git clone` (lokal) | 38 |
+      | **Vereinigung** | **48** |
+
+      Nebenbefund, der W2 bestätigt: **`clock_gettime` erscheint nicht** — glibc holt die Zeit aus
+      der **vDSO**. Die nur-lesbar gemappte Seite mit Tickzähler ist also nicht ein Behelf, sondern
+      genau das, was Linux selbst tut.
+
+- [ ] **Die Arbeit ist nicht die libc, sondern was hinter ihr steht.** Die Vereinigung, nach
+      Diensten sortiert — und daneben, was SEL4Lake davon heute hat:
+
+      | Dienst | im Messsatz | Stand heute |
+      |---|---|---|
+      | Speicher (`mmap`/`brk`/`mprotect`) | 4 | **fehlt** — Z14 Stufe 1 (Speicher-Server), TCB-neutral |
+      | Dateien (`openat`/`read`/`getdents64`/…) | 10 | halb: fs-PD liest/schreibt FAT16 **eine Datei**; keine Pfade, kein `/dev`, kein `/proc` |
+      | Threads (`futex`, `set_tid_address`, …) | 5 | **fehlt** — ein Thread je PD; braucht eine Kerneloperation |
+      | Prozesse (`execve`, `clone`, `wait4`) | 5 | halb: `SYS_LOAD` erzeugt PDs; kein `fork` |
+      | Signale | 3 | **fehlt** |
+      | Zeit | (vDSO) | **fehlt** — s. W2, billig |
+      | Netz | 0 im Messsatz, für eine Cloud unverzichtbar | virtio-net-Treiber steht, **kein TCP/IP** |
+
+      **Genau eine dieser Zeilen braucht den Kernel** (Threads in einer PD). Alle anderen sind
+      Dienste in PDs — die TCB bleibt bei 236 KiB.
+
+- [ ] **Je Sprache, und die Reihenfolge folgt daraus.**
+
+      | Sprache | Weg | Schwierigkeit |
+      |---|---|---|
+      | **C** | musl portieren (~90 000 Zeilen, portiert wird nur die Syscall-Schicht) | **Grundlage für alles Weitere** |
+      | **Rust** | `std`-Port (eine `sys`-Schicht, wie Redox/Hermit/UEFI sie haben) | mittel — und es ist die Sprache dieses Projekts |
+      | **Zig** | bringt musl selbst mit; `std.os` braucht eine Schicht | vermutlich am billigsten nach C |
+      | **C++** | libc++ über musl, plus Unwinding für Ausnahmen | mittel, hängt an C |
+      | **Go** | eigener Runtime, **umgeht libc grundsätzlich**, braucht Threads, Signale (Präemption), `mmap` | **eigener Strang**, teuerste Zeile — realistisch zuletzt oder über WASI |
+
+- [ ] **Der Präzedenzfall, und er macht Mut statt Angst.** **Redox OS** ist dieselbe Form: ein
+      Mikrokern in Rust, eine eigene libc (`relibc`), und darauf portierte Software in Menge — mit
+      einem kleinen Team. Das ist die belastbare Referenz für diesen Weg, nicht gVisor oder WSL1;
+      die scheiterten an einer Anforderung, die dieses Ziel gar nicht stellt.
+
+- [ ] **Die Falle, die dieser Strang mitbringt: „übersetzt" ist nicht „funktioniert".** Eine
+      Bibliothek, die durchbaut, kann in jedem zweiten Aufruf falsch liegen. Die Abnahme ist
+      **ihre eigene Testsuite**, nicht der Compiler — und für jede portierte Bibliothek gehört die
+      Zahl ins Protokoll (`sqlite3` hat rund 700 Tests, `zlib` eine Handvoll, `openssl` Tausende).
+      Sonst entsteht dieselbe Sorte Grün wie bei einem Prüfer, der nicht fehlschlagen kann.
+
+- [ ] **Eine Annahme, die ausgesprochen gehört: übersetzt wird auf einem Linux-Rechner
+      (cross), nicht auf dem Kern.** Selbst-Hosting („klonen und kompilieren **auf** SEL4Lake")
+      ist eine andere Größenordnung: es braucht `fork`/`exec`, ein volles Dateisystem, viel
+      Speicher und einen Compiler als portierte Anwendung. Das ist die Kür, nicht der Einstieg —
+      und wenn es doch das Ziel ist, ändert es die Reihenfolge unten.
+
+- [ ] **Reihenfolge, jede Stufe mit einer eigenen Abnahme.**
+      1. **Speicher-Server** (Z14 Stufe 1) — ohne `mmap`/`brk` läuft keine libc. TCB-neutral.
+      2. **Uhr als vDSO-Seite** (W2) — billig, und ohne sie ist fast jede Bibliothek unbrauchbar.
+      3. **musl-Port**, erst gegen ein Ziel ohne Dateien: `write`/`exit`/`brk`/`mmap`.
+         **Abnahme:** ein C-Hello, aus Quelltext gebaut, läuft — und seine 14 Syscalls sind
+         einzeln belegt, nicht bloß „es lief".
+      4. **fd-Tabelle + VFS-Dienst** über die vorhandene fs-PD; Pfade, `getdents64`.
+         **Abnahme:** `zlib` baut und besteht seine Testsuite.
+      5. **Threads** (die eine Kerneloperation) + `futex` als Dienst.
+         **Abnahme:** `sqlite3` besteht seine Testsuite.
+      6. **Rust-`std`-Port**, danach C++/Zig.
+      7. **TCP/IP-Dienst** über den vorhandenen virtio-net-Treiber — ab hier ist es eine Cloud.
+      8. Go: eigener Strang, eigene Entscheidung.
+
 ### Z15. WASM in einer PD — der Plan (2026-08-09)
 **Klasse:** neues Subsystem · **Aufwand:** gestuft, W1 ist klein · **TCB-Wirkung:** null bis W2
 

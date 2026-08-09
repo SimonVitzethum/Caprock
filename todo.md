@@ -543,10 +543,27 @@ Die Bausteine sind da (`endpoint_quiesce`/`ERR_QUIESCING`, `thread_quiescence`, 
       **Subjekt** hängen, nicht am Objekt.
       **TCB-Kosten, benannt:** ein Bit je PD und eine Prüfung in `CALL`/`RECV`. Mehr nicht.
 
+- [ ] **S1b — was ein FREMDER Aufrufer erlebt, ist offen — und das exportiert den Deadlock.**
+      Das Subjekt-Gating stoppt, was die PD selbst **anfängt**. Ihre Endpoints existieren aber
+      weiter: eine dritte PD, die während des Fensters oder nach dem Einfrieren **hineinruft**,
+      bekommt ohne definierte Antwort **unbegrenztes Blockieren** — der Freeze reicht genau den
+      Deadlock an Unbeteiligte weiter, den die Partner-Nennung auf der eigenen Seite vermeidet.
+      Drei ehrliche Optionen, und keine ist gratis:
+      * **`ERR_QUIESCING` auch an Aufrufer** — macht den Freeze für Clients sichtbar. Ehrlich,
+        aber **jeder** Client braucht Retry-Logik.
+      * **Begrenztes Anstellen** mit benannter Schranke — dann ist zu sagen, **wer den Pufferplatz
+        bezahlt** (und der Überlauf ist wieder ein D11-Fall).
+      * **Blockieren als dokumentierter Vertrag** („ein Call in eine eingefrorene PD wartet bis zum
+        Thaw"). Für eine PaaS mit Migration vertretbar — aber dann gehört die Aussage **in die
+        Zusicherung des Endpoints**, nicht ins Kleingedruckte.
+
 - [ ] **S2 — die Absage muss den PARTNER nennen.** Ein Thread, der in einem `CALL` an einen
       **fremden** Server hängt, der nie antwortet, macht die PD unfrierbar. Das ist kein
       vorübergehender Zustand und darf kein Hänger sein: `Freeze::BusyOn { tid, partner }` statt
       `Busy(Quiescence)`.
+      **An WEN der Name geht, ist Teil der Spezifikation:** an den **Halter der Freeze-Autorität**,
+      nicht an die eingefrorene PD. Sonst wird die Absage zum **Orakel**, mit dem eine PD die
+      IPC-Topologie fremder PDs ausforschen kann — eine Fehlermeldung mit Namen ist ein Kanal.
       Dazu eine **Frist** mit benanntem Ausgang. „Wir warten, bis es ruhig ist" terminiert nicht
       beweisbar, und eine Stilllegung ohne Frist ist von einem Deadlock nicht zu unterscheiden —
       genau die Ununterscheidbarkeit, die `docs/fehlerdomaene.md` schon einmal gekostet hat.
@@ -558,6 +575,12 @@ Die Bausteine sind da (`endpoint_quiesce`/`ERR_QUIESCING`, `thread_quiescence`, 
       öffentlicher Weg an die ThreadIds, kein `Drop` (sonst liesse sich der Inhalt beim Auftauen
       nicht herausbewegen) — und ein ausdrückliches `abort_freeze`, das die schon eingefrorenen
       wieder auftaut. Bewacht wie `tools/zulassung.sh`, mit Selbsttest in beide Richtungen.
+      **`abort_freeze` ist der am wenigsten geübte und gefährlichste Pfad und braucht seine EIGENE
+      Gegenprobe:** Teilerfolg → Abbruch → alle Threads wieder lauffähig, **keine Weckmarke
+      verloren, kein Grund-Bit hängengeblieben**. Das ist schwerer als der Erfolgsfall, weil es
+      jeden Zwischenzustand rückwärts durchläuft — und mit der Grund-Menge aus **Z24** fast
+      geschenkt (den Freeze-Grund aus der Menge entfernen, fertig). **Noch ein Grund, Z24 VOR Z23
+      zu ziehen.**
 
 - [ ] **Was das NACH AUSSEN heisst, und es gehört in beide Protokolle.** „Der Checkpoint trägt
       keinen Thread" bedeutet: **Resume-Latenz und Live-Migration haben derzeit kein messbares
@@ -579,7 +602,21 @@ Die Bausteine sind da (`endpoint_quiesce`/`ERR_QUIESCING`, `thread_quiescence`, 
       `period`/`remaining`, der **Blockadegrund**, und — als Schuld aus Z22 P4 — **`parked` und
       `park_wake`**. Je PD: Adressraum (welche Seiten, welche Farben) und Cspace. Dazu die
       schwebende IPC-Lage: Reply-Token und die `pending`-Badges der Notifications.
-      **Die Regel dafür steht schon:** was nicht übertragbar ist, wird **benannt abgewiesen** —
+      **Ausdrücklich dazu: der FP-Zustand.** Er liegt nach dem Eager-Umbau im `FP_STATES`-Slot,
+      **nicht** im Trap-Frame. Wird er nicht genannt, wandert ein Thread **ohne seine XMM** und
+      rechnet nach dem Thaw mit fremden oder genullten Registern weiter — der stille
+      Registerverlust, nur über die Bootgrenze.
+      **Und die Entscheidung, die JETZT zu treffen ist, nicht später implizit im Migrationscode:
+      ein Bild mit Threadzustand trägt GEHEIMNISSE.** Trap-Frame + Stack + Speicherinhalt heisst
+      Schlüsselmaterial im Bild — nach dem Eager-Umbau ausdrücklich **auch die XMM-Register**, also
+      genau das Material, dessentwegen eager beschlossen wurde. Ein `Image` mit `progress` und
+      Cap-Klassen war ein **Metadatum**; eines mit Registern und Speicher ist ein **Datenträger**.
+      Wer es lesen darf, wo es liegt, ob es ruhend verschlüsselt ist — bei Migration **verlässt das
+      Bild die Maschine**, das ist dieselbe Sorte Entscheidung wie `SVT`/`SID` bei der IRTE:
+      Autorität, vorab zu spezifizieren.
+      **Regel, ab sofort im Plan:** *Bild enthält Registerzustand ⇒ vertraulich; Ablage- und
+      Transportregel steht, bevor S4 gebaut wird.*
+      **Die Regel für den Rest steht schon:** was nicht übertragbar ist, wird **benannt abgewiesen** —
       `classify` tut das für Caps. S4 heisst, `Scope`/`classify` von Caps auf **Threadzustand**
       auszudehnen, nicht ein neues Verfahren zu erfinden.
 
@@ -594,14 +631,29 @@ Die Bausteine sind da (`endpoint_quiesce`/`ERR_QUIESCING`, `thread_quiescence`, 
         **Protokoll**, kein Kernelmechanismus, und damit TCB-neutral. Der richtige Endzustand.
       * **(c) den IOMMU-Kontext abhängen** — generisch und kernelseitig, zerstört aber laufende
         Anfragen. Nur als Notbremse.
-      **Und die Messung dazu, die fehlschlagen kann:** ein Kanarienwort in der DMA-Region, vor und
-      nach dem Einfrieren gelesen. Ändert es sich, war die PD nicht eingefroren — unabhängig davon,
-      was der Freeze-Pfad gemeldet hat. Ohne diese Zeile ist S5 eine Behauptung.
+      **Berichtigt (Einwand vom 2026-08-09): der stärkere Mechanismus existiert schon — die IOMMU
+      selbst.** Ein Kanarienwort fängt nur das Gerät, das zufällig **dieses Wort** beschreibt; DMA
+      in alle übrigen Seiten bleibt unsichtbar, und die falsche Beruhigung überwiegt. Der Freeze
+      dreht stattdessen die **Domäne des Geräts auf non-present**: jede DMA während des
+      Eingefroren-Seins wird ein **IOMMU-Fault**, und der Fault-Weg ist bereits gebaut — laut,
+      gemessen, **flächendeckend statt wortgross**.
+      Das Kanarienwort bleibt trotzdem: als **Tripwire im Selbsttest**, der den **Prüfer** prüft.
+      Aber die Zusicherung „kein DMA während Freeze" gehört an die Hardware-Grenze, die sie
+      vollständig durchsetzen kann.
+      **Damit wird auch die erste Absage präziser:** nicht „eine PD mit DMA-Cap wird nicht
+      eingefroren", sondern „wird nicht eingefroren, **solange der Domänen-Schwenk nicht gebaut
+      ist**" — der Weg vom fail-closed zum Endzustand läuft über eine Zeile, die es schon gibt.
 
 - [ ] **S6 — Auftauen ist nicht die Umkehrung.** Tore öffnen, wiederherstellen, fortsetzen — und
       zwei Dinge, die heute schon falsch sind (s. den Befund unten): `thaw` muss den Park-Zustand
       kennen, und ein Thread, der **mit** gesetzter Weckmarke eingefroren wurde, muss nach dem
       Auftauen **sofort** weiterlaufen und darf nicht schlafen.
+
+- [ ] **Benannte Auslassung: die ZEIT.** Ein aufgetauter Thread sieht die Uhr **springen**; jede
+      Frist, die er vor dem Freeze berechnet hat, ist danach Unsinn. Ob die Antwort „die monotone
+      Uhr pausiert mit" oder „Fristen werden beim Thaw neu gestellt" lautet, ist später
+      entscheidbar — **benannt** muss sie jetzt sein, sonst findet der erste Timeout-Test sie als
+      Heisenbug.
 
 - [ ] **Abnahme — und sie muss fehlschlagen können.** Vier Aussagen, von denen nur die dritte neu
       ist; die ersten beiden sind die Z4a-Form (Positivkontrolle, Beobachtungsfenster **länger als
@@ -615,6 +667,9 @@ Die Bausteine sind da (`endpoint_quiesce`/`ERR_QUIESCING`, `thread_quiescence`, 
          nichts, was Z4a nicht schon zeigt.
       4. Eine PD, die auf einen **fremden** Server wartet, bekommt eine Absage, die den **Partner
          nennt** — kein Hänger, kein `false`.
+      5. **Eine DRITTE PD ruft während des Fensters hinein** — und das **definierte** Verhalten
+         wird **gemessen**, nicht angenommen (s. S1b). Ohne diesen Fall ist die Zusage über
+         Unbeteiligte unbelegt.
       Dazu die Gegenprobe: eine Mutation, die die Tore **nicht** schliesst, muss Fall 3 reissen.
 
 - [ ] **Vorher zu beheben, weil Z23 sonst auf einem kaputten Fundament plant** (Befund vom

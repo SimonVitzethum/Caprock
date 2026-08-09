@@ -475,6 +475,81 @@ diese Zahl nicht erhöhen.
       Folge für die Reihenfolge: Stufe 1 (Speicher-Server) ist **nicht** Vorbedingung für den
       ersten WASM-Schritt — wohl aber für `memory.grow` und für mehr als einen Gast.
 
+### Z19. Das SUBSTRAT der Sprachlaufzeiten — was C/C++/Rust/Zig brauchen, bevor irgendein Dienst existiert
+**Klasse:** Grundlage · **Aufwand:** überschaubar und **vollständig aufzählbar** ·
+**Abgrenzung:** ohne Netzstack, ohne Dateisystem — nur, was eine Laufzeit zum *Starten und Rechnen*
+braucht.
+
+Nachgesehen am 2026-08-09. Die Liste ist kurz, aber vier ihrer Punkte stehen **vor** allem, was in
+[Z16](#z16-quelltext-übersetzen-statt-binaries-laufen-lassen--bewertet-2026-08-09) geplant ist —
+ohne sie startet nicht einmal ein `main(){return 0;}`.
+
+- [ ] **A1. Der Prozessstart-Stack fehlt vollständig.** Ein geladenes Programm bekommt heute
+      `boot_arg` in **einem Register**. `_start` von musl, `lang_start` von Rust und Zigs `_start`
+      erwarten dagegen den **System-V-Prozessstartstack**: `argc`, `argv[]`, `envp[]` und —
+      entscheidend — **`auxv`**.
+
+      `auxv` ist keine Formalie: `AT_PHDR`/`AT_PHNUM` sagen der Laufzeit, wo ihre eigenen
+      Program-Header liegen (der Entroller und die TLS-Einrichtung brauchen das), `AT_PAGESZ` die
+      Seitengröße, `AT_RANDOM` die Bytes für den Stack-Canary, `AT_HWCAP` die CPU-Merkmale.
+      Ohne `auxv` fällt musl beim Start um, bevor eine Zeile Nutzcode läuft.
+
+- [ ] **A2. Es gibt keine TLS-Basis — und das trifft C schon ohne Threads.** Weder `IA32_FS_BASE`/
+      `wrfsbase` (x86) noch `TPIDR_EL0` (aarch64) werden für Userland gesetzt, und der Trap-Frame
+      führt sie nicht mit; ein Kontextwechsel würde sie also auch nicht erhalten.
+
+      **`errno` ist in musl thread-lokal.** Ohne TLS ist damit nicht „Threading kaputt", sondern
+      **die C-Bibliothek als solche**. Dasselbe gilt für Rusts `#[thread_local]` und C++'
+      `thread_local`.
+
+      Dazu gehört: **der Lader kennt `PT_TLS` nicht** (`elf.rs` liefert ausschließlich `PT_LOAD`).
+      Das TLS-Abbild eines Programms wird also gar nicht erst gefunden. Drei Teile: `PT_TLS` lesen,
+      den Block je Thread anlegen, die Basis setzen **und über den Kontextwechsel führen**.
+
+- [ ] **A3. Der Stack ist 16 KiB.** `LOADED_STACK_BYTES = 0x4000`. Übliche Vorgabe für den
+      Hauptthread ist **8 MiB** (glibc, musl, Rust). Rekursion, große Stackrahmen in C++ oder ein
+      Formatierer mit Puffer auf dem Stack laufen darüber. Das ist kein Feintuning, sondern eine
+      Größenordnung — und es gehört ins Manifest, nicht in eine Konstante.
+
+- [ ] **A4. SSE ist auf x86 nicht eingeschaltet** — s. [Z18](#z18-hohe-leistung-für-übersetzten-fremdcode--vermessen-2026-08-09) (1).
+      `CR4.OSFXSR` wird nirgends gesetzt, die SysV-ABI verlangt XMM für `double`. Gemessen mit der
+      neuen `fp`-Prüfzeile.
+
+- [ ] **B. Danach erst wird es interessant — und diese drei sind alles, was ohne Dienste fehlt:**
+
+      | | wofür | Stand |
+      |---|---|---|
+      | **Speicher** (`mmap`/`brk`) | jedes `malloc`, jedes `Vec`, jedes `new` | fehlt (Z14 Stufe 1) |
+      | **Konsole** (`write` auf 1/2) | ohne sie kann kein Programm etwas berichten — kein Dateisystem, ein Dienst | fehlt |
+      | **Zeit** (`clock_gettime`) | Rusts `std::time`, C++ `<chrono>` | fehlt (vDSO-Seite, W2) |
+
+- [ ] **C. Was sprachspezifisch dazukommt.**
+
+      | Sprache | zusätzlich | Bemerkung |
+      |---|---|---|
+      | **Zig** | fast nichts | Allokatoren sind **explizit** (werden durchgereicht), kein verstecktes `malloc`. Ein Zig-Programm mit `FixedBufferAllocator` braucht nur A1–A4. **Die billigste erste Sprache.** |
+      | **C** | A1–A4 + B | `errno` macht A2 zur Pflicht |
+      | **Rust** | + `std::sys`-Port | `panic = "abort"` steht schon → **kein Entroller nötig**; dafür fällt `catch_unwind` weg |
+      | **C++** | + **Entroller** (`.eh_frame`, `libunwind`) | Ausnahmen sind die eine echte Zusatzforderung. Braucht keine Syscalls, aber `AT_PHDR` aus A1 |
+
+- [ ] **Was „alle möglichen Programme" NICHT heißen kann, und das gehört danebengeschrieben.**
+      Auch mit A und B und C laufen nicht alle: `fork` ohne `exec`, `dlopen`, `mmap` einer Datei,
+      `/proc`, und jedes Programm, das `syscall` direkt schreibt statt über die libc. Die ehrliche
+      Formulierung ist **„alles, was CPU, Speicher, Konsole und Zeit braucht"** — das ist sehr viel
+      (Übersetzer, Kompression, Kryptografie, Datenstrukturen, Rechenlasten), aber es ist eine
+      benennbare Menge und keine Allaussage.
+
+- [ ] **Reihenfolge, und sie ist erfreulich kurz.**
+      1. **A4** (`CR4.OSFXSR`) — die `fp`-Prüfzeile steht schon und wird dabei grün.
+      2. **A1** (Startstack + `auxv`) — ohne den läuft kein `_start`.
+      3. **A2** (`PT_TLS`, TLS-Basis, im Kontextwechsel geführt) — ohne den kein `errno`.
+      4. **A3** (Stackgröße ins Manifest).
+      5. **B** Speicher, Konsole, Zeit.
+      **Abnahme nach 1–4:** ein **Zig**-Programm mit `FixedBufferAllocator`, das rechnet und über
+      die Konsole ein *gerechnetes* Ergebnis meldet. Zig zuerst, weil es als einziges ohne B(1)
+      auskommt — damit trennt die Abnahme den Prozessstart von der Speicherfrage, statt beides
+      zugleich zu prüfen.
+
 ### Z18. Hohe Leistung für übersetzten Fremdcode — vermessen 2026-08-09
 **Klasse:** Leistung · **Aufwand:** ein Punkt ist fast umsonst, einer ist Voraussetzung für alles
 Weitere · **Randbedingung:** Isolation und kleine TCB bleiben.

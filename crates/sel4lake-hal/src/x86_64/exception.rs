@@ -25,6 +25,7 @@
 use super::{console, cpu, intc};
 use crate::hook::AtomicHook;
 use core::arch::{asm, global_asm};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Auf dem Stack gesicherter Registerkontext eines Traps.
 ///
@@ -282,6 +283,30 @@ static FAULT_HOOK: AtomicHook<FaultHook> = AtomicHook::new();
 static FP_HOOK: AtomicHook<FpHook> = AtomicHook::new();
 static IRQ_HOOK: AtomicHook<IrqHook> = AtomicHook::new();
 
+/// **Das Vektor-Inventar** (Z25): ein Zähler je CPU-Ausnahmevektor.
+///
+/// **Warum nur Vektor 0..31:** das sind die Ausnahmen, von denen die meisten *nie* vorkommen
+/// dürfen — und genau die verschwinden sonst spurlos, weil niemand nach ihnen sucht. Die heissen
+/// Vektoren (Syscall, Timer) sind bewusst **nicht** dabei: dort kostete ein zusätzliches Atomic
+/// je Eintritt etwas auf dem heissesten Pfad des Systems, und beide werden ohnehin an anderer
+/// Stelle gezählt (`USER_SYSCALLS`, Ticks).
+///
+/// Der Anlass war `#NM` (Vektor 7): unter eager darf er nicht auftreten, und ein Melder, der nur
+/// beim Unglück spricht, wäre in jedem gesunden Lauf stumm — man wüsste nie, ob er sprechfähig
+/// ist. Ein Inventar dagegen ist in **jedem** Lauf ablesbar.
+#[allow(clippy::declare_interior_mutable_const)]
+static VECTOR_HITS: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+
+/// Wie oft Ausnahmevektor `v` (0..31) genommen wurde.
+pub fn vector_hits(v: usize) -> u64 {
+    VECTOR_HITS.get(v).map_or(0, |c| c.load(Ordering::Relaxed))
+}
+
+/// Klartextname eines Ausnahmevektors — für das Inventar.
+pub fn vector_label(v: u64) -> &'static str {
+    vector_name(v)
+}
+
 pub fn set_reschedule_hook(hook: RescheduleHook) {
     RESCHED_HOOK.store(hook);
 }
@@ -398,6 +423,10 @@ fn resume(frame: *mut TrapFrame) -> *mut TrapFrame {
 pub extern "C" fn handle_exception(frame: *mut TrapFrame) -> *mut TrapFrame {
     // SAFETY: der Stub übergibt den eben angelegten, gültigen Frame.
     let vector = unsafe { (*frame).vector };
+    // Vektor-Inventar (Z25): nur die CPU-Ausnahmen, nicht der heisse Syscall-/Timer-Pfad.
+    if vector < 32 {
+        VECTOR_HITS[vector as usize].fetch_add(1, Ordering::Relaxed);
+    }
 
     // --- Syscall (`int 0x80`) ---
     if vector == SYSCALL_VECTOR {

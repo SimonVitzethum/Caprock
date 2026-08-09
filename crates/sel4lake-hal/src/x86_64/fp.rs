@@ -1,4 +1,30 @@
-//! Lazy-FP/SIMD-Kontextverwaltung (x86_64) — API-gleich zur aarch64-Fassung.
+//! **EAGER** FP/SIMD-Kontextverwaltung (x86_64) — API-gleich zur aarch64-Fassung, aber mit
+//! **bewusst anderer Politik**. Siehe den Divergenz-Absatz unten; er gehört zum Vertrag dieses
+//! Moduls und nicht in einen Commit-Text.
+//!
+//! ## Warum x86 eager ist und aarch64 lazy — eine begründete Divergenz, kein Versehen
+//!
+//! | | x86_64 | aarch64 |
+//! |---|---|---|
+//! | Schalter | `CR0.TS` | `CPACR_EL1.FPEN` |
+//! | Reichweite | **jede** Privilegstufe | **nur EL0** |
+//! | Politik | **eager** (Wechsel im Wechsel) | lazy (Wechsel im Trap) |
+//!
+//! Der Grund ist **CVE-2018-3665 (LazyFP)**: mit gesetztem `CR0.TS` wird der `FXRSTOR`
+//! aufgeschoben, und spekulative Ausführung kann die FP-Register des **vorigen** Besitzers lesen,
+//! bevor das `#NM` zugestellt ist. Über eine PD-Grenze hinweg ist das ein Isolationsbruch — und
+//! seit SSE für Userland scharf ist, kann dort Schlüsselmaterial liegen. Für ein System, dessen
+//! Verkaufsargument Isolation ist, wäre lazy-FP ein Widerspruch im Kern des Anspruchs.
+//!
+//! Auf aarch64 gilt das nicht: `CPACR_EL1.FPEN` trappt **präzise** und **nur an EL0**, und es gibt
+//! keine veröffentlichte Entsprechung. Die Trap-Reichweiten sind verschieden, und die Exponierung
+//! ist es auch — deshalb bleibt dort lazy.
+//!
+//! **Folge für diese Datei:** `CR0.TS` wird nach [`enable_sse`] **nie** gesetzt. Ein `#NM` ist
+//! damit per Definition ein Kernelfehler; der Kernel meldet ihn laut und **je Kern** (s.
+//! `system::fp_unerwartet`), und [`ts_vorgefunden`] muss 0 bleiben.
+//!
+//! ## Historisch (überholt, steht hier als Falle)
 //!
 //! Der Microkernel selbst ist **soft-float** (Target ohne SSE): kein Kernel-Code berührt die
 //! FP/SIMD-Register. Damit gehören sie ausschließlich den User-Threads und können **lazy**
@@ -35,15 +61,47 @@ impl Default for FpState {
 }
 
 /// Aktuelle FP/SIMD-Register in `state` sichern.
-/// `CR0.TS` löschen. **Muss vor jedem `fxsave64`/`fxrstor64` geschehen** — s. [`save`].
+/// `CR0` lesen — für die Diagnose eines unerwarteten `#NM` (welches der drei Bits war es?).
+pub fn cr0_lesen() -> u64 {
+    let cr0: u64;
+    // SAFETY: reines Lesen von CR0, keine Nebenwirkung.
+    unsafe { asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags)) };
+    cr0
+}
+
+/// **Wie oft `CR0.TS` gesetzt vorgefunden wurde.** Unter eager muss das **0** sein.
+///
+/// Das ist die Zusicherung in beobachtbarer Form. Ein `debug_assert!` wäre im Release-Bau weg —
+/// und genau dort läuft die Suite. Ein Zähler, der in einer Prüfzeile steht, kann dagegen nicht
+/// stillschweigend wahr werden.
+static TS_VORGEFUNDEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Stand des Zählers aus [`TS_VORGEFUNDEN`].
+pub fn ts_vorgefunden() -> u64 {
+    TS_VORGEFUNDEN.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// `CR0.TS` löschen — **und melden, wenn es gesetzt war**.
+///
+/// Bis zum Eager-Umbau war das eine notwendige Reparatur vor jedem `FXSAVE`/`FXRSTOR` (beide sind
+/// selbst FP-Instruktionen und trappen mit gesetztem `TS`). Unter eager wird `TS` **nie** gesetzt,
+/// also darf hier auch nie etwas zu löschen sein.
+///
+/// **Warum trotzdem geschrieben und nicht nur geprüft:** ein Kernel, der an dieser Stelle stehen
+/// bliebe, liefe in ein rekursives `#NM` — und das sähe aus wie ein Hänger, nicht wie ein Fehler.
+/// Die Zusicherung wird also **gezählt** und die Reparatur ausgeführt; rot wird der Lauf über die
+/// Prüfzeile, nicht über einen Absturz.
 #[inline]
 fn ts_loeschen() {
     // SAFETY: Read-Modify-Write auf CR0, ausschliesslich Bit 3 (TS).
     unsafe {
         let mut cr0: u64;
         asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
-        cr0 &= !(1u64 << 3);
-        asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack, preserves_flags));
+        if cr0 & (1u64 << 3) != 0 {
+            TS_VORGEFUNDEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            cr0 &= !(1u64 << 3);
+            asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack, preserves_flags));
+        }
     }
 }
 

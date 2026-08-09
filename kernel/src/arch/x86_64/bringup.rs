@@ -2199,46 +2199,74 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
         || CKPT_DONE.load(Ordering::Acquire);
     let blkdev = BLKDEV_OK.load(Ordering::Acquire);
     let part = PART_OK.load(Ordering::Acquire);
-    // Z18: Lazy-FP auf x86 -- die Zeile, die es bisher nur auf aarch64 gab.
+    // ------------------------------------------------------------------------------------------
+    // Z25: EAGER-FP + das VEKTOR-INVENTAR
+    // ------------------------------------------------------------------------------------------
+    //
+    // Der FP-Wechsel haengt nicht mehr am ersten Zugriff, sondern am Wechsel. Damit ist ein `#NM`
+    // per Definition ein Kernelfehler -- und diese Zeile ist der Ort, an dem das nachpruefbar
+    // wird. Drei Aussagen, und die dritte ist die eigentliche Invariante:
+    //
+    //  1. Die Sonde traegt ihr Muster ueber Abgaben (dass ueberhaupt gewechselt wird).
+    //  2. `CR0.TS` wurde NIE gesetzt vorgefunden (`ts_vorgefunden == 0`) -- die eager-Zusicherung
+    //     in beobachtbarer Form. Ein `debug_assert!` waere im Release-Bau weg, und dort laeuft
+    //     die Suite.
+    //  3. **Kein `#NM`, und zwar JE KERN.** Global summiert waere ein einzelner AP, dessen
+    //     `enable_sse` in einem Refactor aus der Reihenfolge rutscht, im Rauschen der uebrigen
+    //     unsichtbar -- und das ist die wahrscheinlichste kuenftige Regression.
     let fpmask = FP_OK.load(Ordering::Relaxed);
     let fp_gelaufen = fpmask & 0b100 != 0;
-    let fp_ok = fpmask & 0b11 == 0b11;
+    let muster_ok = fpmask & 0b11 == 0b11;
+    let ts_gesehen = hal::fp::ts_vorgefunden();
+    let mut nm_je_kern = [0u64; 8];
+    let kerne = system::num_cores().min(8);
+    for (c, n) in nm_je_kern.iter_mut().enumerate().take(kerne) {
+        *n = system::nm_traps(c);
+    }
+    let nm_gesamt: u64 = nm_je_kern.iter().take(kerne).sum();
+    let fp_ok = fp_gelaufen && muster_ok && ts_gesehen == 0 && nm_gesamt == 0;
     println!(
-        "fp      : gelaufen={fp_gelaufen} · Muster ueber {FP_ITERS} Abgaben erhalten = \
-         {:#b} (erwartet 0b11) \
-         (zwei Sonden mit VERSCHIEDENEN Mustern in xmm0..xmm3; verschieden ist der Punkt -- mit \
-         demselben Muster fiele ein fehlendes fxsave nicht auf, weil der Dieb genau das \
-         zuruecklaesst, was das Opfer erwartet)",
+        "fp      : gelaufen={fp_gelaufen} · Muster ueber {FP_ITERS} Abgaben erhalten = {:#b}          (erwartet 0b11) · CR0.TS-gesetzt-vorgefunden={ts_gesehen} (eager: muss 0 sein)          (zwei Sonden mit VERSCHIEDENEN Mustern in xmm0..xmm3; verschieden ist der Punkt -- mit          demselben Muster fiele ein fehlendes fxsave nicht auf, weil der Dieb genau das          zuruecklaesst, was das Opfer erwartet)",
         fpmask & 0b11
     );
     println!(
-        "fp      : {} (Lazy-FP fuer Ring 3: fxsave64/fxrstor64 mit CR0.TS. Diese Zeile ist die \
-         VORBEDINGUNG dafuer, SSE im User-Ziel einzuschalten -- und das ist kein Leistungspunkt, \
-         sondern ein ABI-Punkt: `f64` geht auf einem normalen x86_64-Ziel in xmm0/xmm1, auf \
-         x86_64-sel4lake-user in rdi/rsi. Zwei Aufrufkonventionen, die der Linker nicht \
-         unterscheiden kann)",
-        if fp_ok {
-            "ALL PASS"
-        } else {
-            "FAILURES -- BEKANNTE LUECKE, nicht in der Abschlussbedingung"
-        }
+        "fp      : FP-Wechsel gesamt = {} (Save eines vorigen Besitzers). **0 hiesse: es wurde nie \
+         gewechselt** -- dann sagt die Musterpruefung nichts ueber Save/Restore aus, sondern nur, \
+         dass niemand die Register angefasst hat",
+        system::fp_switch_count()
     );
-    if !fp_ok {
-        println!(
-            "fp      : Ursache gemessen: `CR4.OSFXSR` wird NIRGENDS gesetzt. Ohne dieses Bit loest \
-             JEDE SSE-Instruktion ein #UD aus statt eines #NM -- die Sonde faultet beim ersten \
-             `movq xmm0` und erreicht den Owner-Wechsel nie. Der #NM-Handler existiert \
-             (exception.rs) und fxsave64/fxrstor64 auch; was fehlt, ist das Freischalten des \
-             Befehlssatzes. Steht als Z18 in todo.md"
-        );
-        println!(
-            "fp      : NICHT in `all_done()` -- und das ist eine Entscheidung, keine Nachlaessigkeit. \
-             Das ist eine BEKANNTE Luecke, kein Rueckschritt; die Suite dauerhaft rot zu faerben \
-             wuerde jede kuenftige Regression verdecken. Sie wird gegattert, sobald CR4.OSFXSR \
-             gesetzt ist -- vorher waere es eine Anforderung, die diese Konfiguration nicht \
-             erfuellen KANN (dieselbe Form wie `root` ohne Archiv)"
-        );
+    print!("fp      : #NM je Kern =");
+    for (c, n) in nm_je_kern.iter().enumerate().take(kerne) {
+        print!(" k{c}={n}");
     }
+    println!(
+        " (Summe {nm_gesamt}, muss 0 sein). Unter eager ist ein #NM per Definition ein          KERNELFEHLER -- gezaehlt je Kern, weil ein einzelner AP ohne `enable_sse` in einer          Summe untergeht"
+    );
+    println!(
+        "fp      : {} (EAGER-FP fuer Ring 3: der Wechsel liegt im WECHSEL, nicht im ersten          Zugriff. Der Grund ist CVE-2018-3665 (LazyFP) -- mit gesetztem CR0.TS kann spekulative          Ausfuehrung die FP-Register des VORIGEN Besitzers lesen, bevor das #NM zugestellt ist.          Ueber eine PD-Grenze ist das ein Isolationsbruch, und seit SSE fuer Userland scharf ist,          kann dort Schluesselmaterial liegen. aarch64 bleibt lazy -- CPACR_EL1.FPEN trappt          praezise und nur EL0; die Begruendung steht im HAL-Vertrag beider Seiten)",
+        if fp_ok { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // **Das Vektor-Inventar.** Gedruckt wird JEDER Vektor, der ueberhaupt genommen wurde -- nicht
+    // nur die auffaelligen. Ein Melder, der nur beim Unglueck spricht, ist in einem gesunden Lauf
+    // stumm, und dann weiss niemand, ob er sprechfaehig ist. Ein Inventar ist in jedem Lauf
+    // ablesbar, und Vektor 7 ist seine erste Zeile.
+    print!("vektor  : Inventar (CPU-Ausnahmen 0..31, genommen):");
+    let mut gesehen = 0;
+    for v in 0..32u64 {
+        let n = hal::exception::vector_hits(v as usize);
+        if n > 0 {
+            print!(" {v}({})={n}", hal::exception::vector_label(v));
+            gesehen += 1;
+        }
+    }
+    if gesehen == 0 {
+        print!(" keine");
+    }
+    println!(
+        " -- Vektor 7 (#NM) ist die Zeile, um die es geht; die uebrigen stehen dabei, damit          sichtbar ist, dass hier ueberhaupt gezaehlt wird"
+    );
+
     let iface = IFACE_GATE_OK.load(Ordering::Acquire);
     // **A1 auf dem regulaeren Weg** (2026-08-07). Gelesen, nicht gemessen: die Messung DRUCKT,
     // und `all_done()` wird gepollt -- eine druckende Messung gehoert hier so wenig hin wie ein

@@ -175,6 +175,11 @@ const FP_OWNER_NONE: u64 = u64::MAX;
 /// Eintrag -> Atomics genügen, keine Sperre nötig).
 #[allow(clippy::declare_interior_mutable_const)]
 static FP_OWNER: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(FP_OWNER_NONE) }; MAX_CORES];
+/// Unerwartete `#NM` **je Kern** (x86, unter eager immer 0). Nicht global: die wahrscheinlichste
+/// kuenftige Regression ist ein einzelner AP, dessen `enable_sse` aus der Reihenfolge rutscht --
+/// und der ginge in einer Summe unter. S. `fp_unerwartet`.
+#[allow(clippy::declare_interior_mutable_const)]
+static NM_TRAPS: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
 /// Per-Thread-Slot FP-Kontextpuffer. Zugriff ausschließlich unter dem SCHED-Lock
 /// (fp_trap hält SCHED; spawn ebenfalls) -> für gleiche Slots serialisiert,
 /// verschiedene Slots sind disjunkt. Lock-Ordnung: …->SCHED->FP_STATES (innerste).
@@ -624,8 +629,48 @@ impl SchedOps for KernelSched {
 /// sein erster FP-Zugriff und löst den Lazy-Owner-Wechsel aus); sonst FP freigeben.
 /// Am Ende jedes Hooks aufzurufen, der den laufenden Thread gewechselt haben kann.
 fn sync_fp_trap(core: usize, sched: &Scheduler) {
-    let cur = sched.current_id(core).to_raw();
+    let cur_id = sched.current_id(core);
+    let cur = cur_id.to_raw();
     let owner = FP_OWNER[core].load(Ordering::Relaxed);
+
+    // ------------------------------------------------------------------------------------------
+    // x86_64: EAGER. Der Auslöser des Wechsels ist der WECHSEL, nicht der erste Zugriff.
+    // ------------------------------------------------------------------------------------------
+    //
+    // **Warum, und es ist keine Leistungsfrage:** Lazy-FP über eine PD-Grenze ist auf x86
+    // CVE-2018-3665 (LazyFP). Mit gesetztem `CR0.TS` wird der `FXRSTOR` aufgeschoben, und
+    // spekulative Ausführung kann die Register des **vorigen** Besitzers lesen, bevor das `#NM`
+    // zugestellt ist. Für ein Cap-System, dessen Verkaufsargument Isolation ist, wäre das ein
+    // Widerspruch im Kern des Anspruchs — und seit SSE für Userland scharf ist, kann in diesen
+    // Registern Schlüsselmaterial liegen.
+    //
+    // **Die Trennung bleibt trotzdem billig:** wechselt der laufende Thread nicht (der häufige
+    // Fall — jeder Syscall ohne Umplanung), passiert hier gar nichts. Gespart wird also alles
+    // ausser dem, was ein Wechsel wirklich kostet.
+    //
+    // Die Trap-Konfiguration wird hier NICHT mehr angefasst: `CR0.TS` bleibt dauerhaft aus (einmal
+    // je Kern in `enable_sse`). Ein `#NM` ist ab jetzt per Definition ein Kernelfehler und wird
+    // als solcher gemeldet, s. `fp_unerwartet`.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if owner != cur {
+            let mut states = FP_STATES.lock();
+            if owner != FP_OWNER_NONE {
+                let prev_slot = ThreadId::from_raw(owner).slot();
+                hal::fp::save(&mut states[prev_slot]);
+                FP_SWITCHES.fetch_add(1, Ordering::Relaxed);
+            }
+            hal::fp::restore(&states[cur_id.slot()]);
+            drop(states);
+            FP_OWNER[core].store(cur, Ordering::Relaxed);
+        }
+    }
+    // ------------------------------------------------------------------------------------------
+    // aarch64: LAZY. **Bewusste Divergenz** — die Begründung steht im HAL-Vertrag
+    // (`crates/sel4lake-hal/src/aarch64/fp.rs`), damit der nächste Leser sie nicht für ein
+    // Versehen hält. Kurz: `CPACR_EL1.FPEN` trappt **nur EL0** und ist präzise; es gibt keine
+    // LazyFP-Entsprechung. Die Trap-Reichweiten sind verschieden, und die Exponierung ist es auch.
+    #[cfg(not(target_arch = "x86_64"))]
     hal::fp::set_el0_trap(cur != owner);
 }
 
@@ -653,6 +698,54 @@ fn sync_vspace(core: usize, sched: &Scheduler) {
 /// Alten Owner sichern, FP-Kontext dieses Threads laden, ihn zum Owner machen und
 /// FP freigeben. Rückgabe: derselbe Frame — der `eret` wiederholt die getrappte
 /// Instruktion, jetzt mit aktivem FP. Hält SCHED (current_id) und FP_STATES.
+/// **Unter EAGER ist ein `#NM` ein KERNELFEHLER — und wird als solcher laut.**
+///
+/// Er kann nur aus drei Gründen kommen, und alle drei sind Fehler *dieses* Kernels:
+/// `CR0.EM` ist gesetzt (SSE nie freigegeben), `CR0.TS` ist gesetzt (jemand hat es geschrieben),
+/// oder `enable_sse` ist auf **diesem** Kern nie gelaufen. Der letzte Fall ist die
+/// wahrscheinlichste künftige Regression — deshalb zählt der Melder **je Kern**: ein AP, dessen
+/// `enable_sse` in einem Refactor aus der Reihenfolge rutscht, ginge in einer globalen Summe
+/// unter, und zwar genau in dem Lauf, in dem alle anderen Kerne ihn übertönen.
+///
+/// Gemeldet werden **RIP und Kern-ID** — ohne beides ist „irgendwo trappte etwas" keine Diagnose.
+/// Dazu der gelesene `CR0`, damit die drei Gründe unterscheidbar sind, statt geraten zu werden.
+///
+/// **Es wird nicht angehalten.** Ein Panic hier reisst den Knoten nachweislich *nicht* mit
+/// (`docs/invariants.md` §14, gemessen), er würde also nur die Diagnose verschlechtern. Statt
+/// dessen ist der Zähler Teil der Prüfzeile: **jedes** Vorkommen macht den Lauf rot.
+#[cfg(target_arch = "x86_64")]
+fn fp_unerwartet(frame: *mut TrapFrame) -> *mut TrapFrame {
+    let core = hal::cpu::core_id();
+    NM_TRAPS[core].fetch_add(1, Ordering::Relaxed);
+    // SAFETY: gültiger, vom Stub angelegter Trap-Frame.
+    let rip = unsafe { (*frame).rip };
+    let cr0 = hal::fp::cr0_lesen();
+    println!(
+        "fp      : INVARIANTE VERLETZT -- #NM unter eager auf Kern {core} (rip={rip:#018x} \
+         cr0={cr0:#x} TS={} EM={}). Unter eager darf dieser Trap nicht vorkommen: entweder \
+         lief `enable_sse` auf diesem Kern nicht, oder jemand hat CR0.TS geschrieben.",
+        (cr0 >> 3) & 1,
+        (cr0 >> 2) & 1
+    );
+    // `TS` löschen, damit der Lauf weitergeht und die Zeile den Lauf rot macht, statt in einer
+    // Trap-Schleife zu verschwinden -- ein rekursives `#NM` sähe aus wie ein Hänger.
+    hal::fp::clear_task_switched();
+    frame
+}
+
+/// Wie viele unerwartete `#NM` je Kern (x86, unter eager immer 0) — Erstzeile des
+/// Vektor-Inventars.
+pub fn nm_traps(core: usize) -> u64 {
+    NM_TRAPS.get(core).map_or(0, |c| c.load(Ordering::Relaxed))
+}
+
+/// Summe über alle Kerne. **Nur für die Kurzfassung** — das Urteil hängt an den Einzelwerten,
+/// s. [`fp_unerwartet`].
+pub fn nm_traps_gesamt() -> u64 {
+    NM_TRAPS.iter().map(|c| c.load(Ordering::Relaxed)).sum()
+}
+
+#[allow(dead_code)] // auf aarch64 ungenutzt (dort ist Lazy-FP der reguläre Weg)
 fn fp_trap(frame: *mut TrapFrame) -> *mut TrapFrame {
     let core = hal::cpu::core_id();
     let sched = SCHEDS[core].lock();
@@ -759,7 +852,10 @@ pub fn set_hooks() {
     hal::exception::set_syscall_hook(syscall);
     hal::exception::set_fault_hook(el0_fault);
     hal::exception::set_irq_hook(irq_hook); // Geräte-IRQ-Hook (ext-22, P5)
-    hal::exception::set_fp_hook(fp_trap);
+    #[cfg(target_arch = "x86_64")]
+    hal::exception::set_fp_hook(fp_unerwartet); // eager: ein `#NM` ist ein Kernelfehler
+    #[cfg(not(target_arch = "x86_64"))]
+    hal::exception::set_fp_hook(fp_trap); // aarch64: Lazy-FP ist dort der regulaere Weg
 }
 
 /// Freies RAM `[free_base, ram_end)` beim Allokator registrieren.

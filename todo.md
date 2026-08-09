@@ -475,6 +475,55 @@ diese Zahl nicht erhöhen.
       Folge für die Reihenfolge: Stufe 1 (Speicher-Server) ist **nicht** Vorbedingung für den
       ersten WASM-Schritt — wohl aber für `memory.grow` und für mehr als einen Gast.
 
+### Z25. Eager-FP auf x86 — der Dreier-Commit, 2026-08-09
+**Klasse:** Sicherheit · **Stand:** drei Teile fertig und gemessen, **die FP-Sonde bleibt rot**
+(vorbestehend, s. unten)
+
+- [x] **Der Auslöser liegt im WECHSEL, nicht im ersten Zugriff.** `CR0.TS` bleibt nach `enable_sse`
+      dauerhaft aus; `sync_fp_trap` sichert/lädt beim Wechsel. Grund ist **CVE-2018-3665
+      (LazyFP)**: mit gesetztem `TS` wird der `FXRSTOR` aufgeschoben, und spekulative Ausführung
+      kann die Register des **vorigen** Besitzers lesen, bevor das `#NM` zugestellt ist. Seit SSE
+      für Userland scharf ist, kann dort Schlüsselmaterial liegen.
+      Billig bleibt es trotzdem: wechselt der laufende Thread nicht (jeder Syscall ohne
+      Umplanung), passiert nichts.
+
+- [x] **`#NM` ist eine laute Invariante — mit RIP, Kern-ID und `CR0` —, und der Zähler läuft JE
+      KERN.** Global summiert ginge ein einzelner AP, dessen `enable_sse` in einem Refactor aus
+      der Reihenfolge rutscht, im Rauschen der übrigen unter — und das ist die wahrscheinlichste
+      künftige Regression. **Gemessen: `k0=0 k1=0 k2=0 k3=0`.**
+      Nicht angehalten wird: ein Panic reisst den Knoten nachweislich **nicht** mit (§14), er
+      verschlechterte nur die Diagnose. Der Zähler macht den Lauf rot, das genügt.
+
+- [x] **`ts_loeschen` meldet, statt still zu reparieren.** `ts_vorgefunden()` zählt, wie oft
+      `CR0.TS` gesetzt **vorgefunden** wurde — unter eager muss das 0 sein. Ein `debug_assert!`
+      wäre im Release-Bau weg, und dort läuft die Suite. **Gemessen: 0.**
+
+- [x] **Das Vektor-Inventar** — ein Zähler je CPU-Ausnahme (0..31), von der Suite gedruckt.
+      Vektor 7 ist die Zeile, um die es geht; die übrigen stehen dabei, **damit sichtbar ist, dass
+      überhaupt gezählt wird** (ein Melder, der nur beim Unglück spricht, ist in jedem gesunden
+      Lauf stumm). Der heisse Syscall-/Timer-Pfad ist bewusst **nicht** dabei.
+      **Gemessen: `14(#PF)=2`, sonst nichts — Vektor 7 kommt gar nicht vor.**
+
+- [x] **Die aarch64-Divergenz ist begründet, in BEIDEN HAL-Verträgen.** `CPACR_EL1.FPEN` trappt
+      präzise und **nur EL0**; eine LazyFP-Entsprechung ist nicht veröffentlicht. Die
+      Trap-Reichweiten sind verschieden, und die Exponierung ist es auch. Beide Dateien nennen die
+      jeweils andere Seite — die vorige Fassung sah auf einer Architektur eager und auf der anderen
+      lazy aus, **ohne dass irgendwo stand warum**, und war damals tatsächlich ein Versehen.
+
+- [ ] **OFFEN und vorbestehend: die FP-Sonde meldet `Muster = 0b0`.** Gemessen, nicht vermutet:
+      **an der Grundlinie `5d94f14` (noch lazy) genauso rot** — es ist kein Eager-Effekt.
+      Was dazu feststeht: **77 FP-Wechsel** (Save/Restore läuft also wirklich), `ts_vorgefunden=0`,
+      `#NM=0` auf allen vier Kernen, keine `#GP` im Inventar (`fxsave` ist also ausgerichtet und
+      faultet nicht), `fp_reset_slot` läuft beim Spawn, und der Slab-Index paniced bei Überlauf —
+      **kein Aliasing zweier Threads auf denselben Slot**. Beide Sonden erkennen Korruption.
+      **Der alte Berichtstext nannte als Ursache `CR4.OSFXSR` wird nirgends gesetzt. Das ist seit
+      A4 überholt** — die Zeile blieb rot, die Erklärung stimmte nicht mehr, und nachdiagnostiziert
+      hat es niemand. Genau die Form, die dieses Projekt als „ein Grund, der nicht mehr stimmt,
+      macht den Punkt unbehebbar" führt.
+      **Deshalb steht `fp` weiterhin NICHT in `all_done()`** — und das ist hier eine benannte
+      Auslassung, kein Übersehen: die Zeile zu gattern, bevor die Ursache bekannt ist, färbte die
+      Suite dauerhaft rot und verdeckte jede künftige Regression.
+
 ### Z24. Der Blockadegrund ist eine MENGE, keine Bit-Sammlung — geplant 2026-08-09
 **Klasse:** Struktur · **Ersetzt** den ursprünglich als „Spurious-Wake-Vertrag" geplanten Schritt;
 der Vertrag bleibt, aber als Beigabe, nicht als Kern.

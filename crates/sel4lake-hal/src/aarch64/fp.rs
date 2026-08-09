@@ -1,3 +1,19 @@
+//! **LAZY** FP/SIMD-Kontextverwaltung (aarch64) — und das ist die **andere Hälfte einer
+//! begründeten Divergenz**, nicht der Rest eines halben Umbaus.
+//!
+//! Auf x86_64 ist die Politik seit dem 2026-08-09 **eager**, weil `CR0.TS` für **jede**
+//! Privilegstufe gilt und Lazy-FP dort CVE-2018-3665 (LazyFP) ist: spekulative Ausführung kann
+//! die FP-Register des vorigen Besitzers lesen, bevor das `#NM` zugestellt ist.
+//!
+//! Hier gilt das nicht. `CPACR_EL1.FPEN = 0b01` trappt **präzise** und **nur an EL0**; eine
+//! LazyFP-Entsprechung ist nicht veröffentlicht. Die Trap-Reichweiten sind verschieden, und die
+//! Exponierung ist es auch — deshalb bleibt aarch64 lazy.
+//!
+//! **Wer das ändert, ändert beide Seiten.** Die vorige Fassung sah auf einer Architektur eager und
+//! auf der anderen lazy aus, **ohne** dass irgendwo stand warum — und war damals tatsächlich ein
+//! Versehen. Dieser Absatz existiert, damit der nächste Leser die Divergenz nicht wieder für eines
+//! hält.
+//!
 //! Lazy-FP/SIMD-Kontextverwaltung (aarch64).
 //!
 //! Der Microkernel selbst ist **soft-float** (Target ohne NEON, soft-float-ABI):

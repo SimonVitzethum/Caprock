@@ -550,6 +550,70 @@ möglichst viele Linux-Bibliotheken aus C, C++, Zig, Rust, Go.
       Speicher und einen Compiler als portierte Anwendung. Das ist die Kür, nicht der Einstieg —
       und wenn es doch das Ziel ist, ändert es die Reihenfolge unten.
 
+- [ ] **Gemessen am 2026-08-09 an TESTLASTEN statt an Startaufrufen** — und das verschiebt die
+      Prioritäten. `strace -f` über zlib (`example`), sqlite3 (echte Platte, WAL, 20 000 Zeilen,
+      `VACUUM`, `integrity_check`), einen 4-Thread-Sperrtest und Git:
+
+      | Last | Syscalls | futex | fork/`clone` | Signal-**Zustellung** |
+      |---|---|---|---|---|
+      | zlib `example` | 19 | — | — | — |
+      | sqlite3 (Platte, WAL, VACUUM) | 33 | — | — | — |
+      | `git status` | — | 1 | — | — |
+      | 4 Threads, 800 000 Sperrzyklen | — | **5 863** | 4× `clone3` | — |
+      | `git clone` | 38 | 903 | 29× `clone3`, 4× `wait4`, 6× `execve` | — |
+      | `python3 -c pass` | 34 | 1 | — | — (66× `rt_sigaction`, also nur INSTALLIEREN) |
+
+      **Drei Befunde, die den Plan ändern:**
+
+      1. **Der schwere Teil ist die Dateisemantik, nicht die Threads.** sqlite allein verlangt
+         `fcntl` (Sperren), `fdatasync`, `pread64`/`pwrite64`, `ftruncate`, `mremap`, `getcwd`,
+         `unlink` — und braucht dabei **weder futex noch fork noch Signalzustellung**.
+      2. **Signal-ZUSTELLUNG kommt in keiner gemessenen Last vor.** Nur `rt_sigaction`/
+         `rt_sigprocmask`, also das Eintragen von Handlern. `rt_sigreturn` erschien ausschließlich
+         über die `sh`-Hülle, nicht aus den Programmen.
+      3. **0,7 %.** 800 000 Sperrzyklen ergaben 5 863 futex-Aufrufe — der unkontendierte Pfad
+         betritt den Kernel nie. Was ein Userspace-futex kostet, betrifft also 0,7 % der
+         Sperroperationen, nicht alle.
+
+- [ ] **DREI Entscheidungen, die VOR den musl-Port gehören — nicht als Überraschung in einen
+      späteren Meilenstein.** (Und eine Berichtigung: „genau eine Zeile braucht den Kernel" war zu
+      bequem. Es ist **eine sicher**, eine **zweite bedingt**, und eine dritte ist vermeidbar —
+      aber das ist eine Entscheidung, keine Tatsache.)
+
+      **(1) futex: Dienst über die VORHANDENE Blockierprimitive, kein neuer Syscall.**
+      Die harte Frage ist „worauf blockiert der Aufrufer?", und sie hat hier eine Antwort, die
+      nichts kostet: **auf seiner eigenen Notification, über das vorhandene `SYS_WAIT`.** Der
+      Kernel hat die Blockierprimitive bereits; der Dienst führt nur die Warteschlange und
+      signalisiert gezielt. `Notification::wait` fasst genau **einen** Wartenden (seit D11
+      ausdrücklich, mit `ERR_EP_FULL` statt stillem Überschreiben) — das passt, wenn jeder Thread
+      seine eigene hat.
+
+      **Kosten, gemessen statt geschätzt:** 2 IPC-Umläufe je *kontendiertem* Warten statt eines
+      Syscalls — auf 0,7 % der Sperroperationen. **TCB-Wachstum: null.**
+
+      **Was diese Entscheidung umstoßen würde** (und das gehört dazu, sonst ist sie unwiderlegbar):
+      eine Last, bei der die Contention-Rate so hoch ist, dass der Umlauf dominiert. Die Messung
+      dafür steht fest: dieselbe Sperrschleife, Rate der futex-Aufrufe je Sperroperation, und die
+      Wandzeit gegen eine Fassung mit Kernel-futex. Erst dann ist ein Kernel-futex ein Befund und
+      keine Vorliebe.
+
+      **(2) Signale: synchron zuerst, asynchron ist ein KERNEL-Upcall.**
+      Stufe A — Handler werden in der libc geführt und an **Syscall-Grenzen** ausgeliefert
+      (`EINTR`, `SIGPIPE` als `EPIPE`, `SIGCHLD` beim `wait`). Das deckt **jede gemessene Last**
+      ab und kostet den Kernel nichts.
+      Stufe B — echte asynchrone Zustellung (SIGALRM in eine Rechenschleife, SIGINT vom Terminal)
+      verlangt, einen laufenden Thread zu unterbrechen und ihm einen Handler-Frame aufzubauen.
+      **Das kann kein Dienst per IPC**, das ist ein Upcall und damit eine TCB-Änderung. Sie wird
+      gebaut, wenn eine Testsuite sie nachweislich verlangt — und die Zeile im Protokoll ist dann
+      `rt_sigreturn` aus dem Programm selbst, nicht aus einer Hülle.
+
+      **(3) fork: `posix_spawn` zuerst, echtes `fork()` nur auf Nachweis.**
+      Gemessen forkt `git clone` (29× `clone3`, 6× `execve`, 4× `wait4`) — aber als
+      **fork+exec**, und genau das deckt `posix_spawn` ab. Es bildet sauber auf den vorhandenen
+      Weg ab: PD anlegen, laden, starten (`SYS_LOAD`). Echtes COW-`fork()` bräuchte
+      Fault-Umleitung und Mappen in eine fremde PD — beides TCB — und wird erst gebaut, wenn eine
+      Testsuite es verlangt (ein `fork` **ohne** folgendes `exec`, das den Kindzustand benutzt).
+
 - [ ] **Reihenfolge, jede Stufe mit einer eigenen Abnahme.**
       1. **Speicher-Server** (Z14 Stufe 1) — ohne `mmap`/`brk` läuft keine libc. TCB-neutral.
       2. **Uhr als vDSO-Seite** (W2) — billig, und ohne sie ist fast jede Bibliothek unbrauchbar.
@@ -557,12 +621,17 @@ möglichst viele Linux-Bibliotheken aus C, C++, Zig, Rust, Go.
          **Abnahme:** ein C-Hello, aus Quelltext gebaut, läuft — und seine 14 Syscalls sind
          einzeln belegt, nicht bloß „es lief".
       4. **fd-Tabelle + VFS-Dienst** über die vorhandene fs-PD; Pfade, `getdents64`.
-         **Abnahme:** `zlib` baut und besteht seine Testsuite.
-      5. **Threads** (die eine Kerneloperation) + `futex` als Dienst.
-         **Abnahme:** `sqlite3` besteht seine Testsuite.
-      6. **Rust-`std`-Port**, danach C++/Zig.
-      7. **TCP/IP-Dienst** über den vorhandenen virtio-net-Treiber — ab hier ist es eine Cloud.
-      8. Go: eigener Strang, eigene Entscheidung.
+         **Abnahme:** `zlib` baut und besteht seine Testsuite (19 Syscalls, gemessen).
+      5. **Der eigentliche Brocken: Dateisemantik.** `fcntl`-Sperren, `fdatasync`,
+         `pread64`/`pwrite64`, `ftruncate`, `unlink`, `getcwd`. **TCB-neutral**, aber es ist die
+         größte Einzelstufe — gemessen an sqlite, das genau das braucht und sonst nichts.
+         **Abnahme:** `sqlite3` besteht seine Testsuite **ohne** Threads, ohne fork, ohne Signale.
+      6. **Threads** (die eine Kerneloperation) + `futex` als Dienst über Notifications.
+         **Abnahme:** der 4-Thread-Sperrtest liefert 800 000 als Ergebnis, und die gemessene
+         Rate der Blockierungen steht im Protokoll.
+      7. **Rust-`std`-Port**, danach C++/Zig.
+      8. **TCP/IP-Dienst** über den vorhandenen virtio-net-Treiber — ab hier ist es eine Cloud.
+      9. Go: eigener Strang, eigene Entscheidung.
 
 ### Z15. WASM in einer PD — der Plan (2026-08-09)
 **Klasse:** neues Subsystem · **Aufwand:** gestuft, W1 ist klein · **TCB-Wirkung:** null bis W2

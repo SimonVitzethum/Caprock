@@ -475,6 +475,104 @@ diese Zahl nicht erhöhen.
       Folge für die Reihenfolge: Stufe 1 (Speicher-Server) ist **nicht** Vorbedingung für den
       ersten WASM-Schritt — wohl aber für `memory.grow` und für mehr als einen Gast.
 
+### Z23. Prozess-Freeze — geplant 2026-08-09, NICHT begonnen
+**Klasse:** Nebenstrang · **Vorbedingung:** mehrere Threads je PD (Z22 P2, offen) — ohne die ist
+jeder Nachweis hier nur ein zweites Z4a
+
+**Der Ist-Stand, gemessen:** `freeze_thread` ist die **einzige** Freeze-Funktion im Baum. Es gibt
+keinen Prozess-Freeze, und die naheliegende Fassung („alle Threads der Reihe nach") ist nicht bloss
+unimplementiert, sondern **strukturell unmöglich**: treiben zwei Threads einer PD miteinander IPC,
+gibt `freeze_thread` für **beide** `Busy`, und es existiert keine Reihenfolge, die das auflöst.
+Die Bausteine sind da (`endpoint_quiesce`/`ERR_QUIESCING`, `thread_quiescence`, `Freeze`, `Parked`,
+`checkpoint::Scope`/`classify`); der Ablauf darüber ist nie gebaut worden.
+
+- [ ] **S1 — Zwei-Phasen-Stilllegung.** Erst die **Tore schliessen**, dann einfrieren.
+      Ein `PD_QUIESCING`-Bit je PD, geprüft im Syscall-Pfad: `CALL`/`RECV` **aus** der PD heraus
+      scheitern mit `ERR_QUIESCING`, laufende Transaktionen dürfen **abschliessen** (`REPLY` bleibt
+      erlaubt) — dieselbe Torlogik wie A-4.2, nur mit der PD als Umfang statt einem Endpoint.
+      **Warum nicht einfach alle Endpoints der PD stilllegen:** an einem Endpoint hängen auch
+      **fremde** PDs. Ein Endpoint-weiter Riegel fröre Dritte mit ein — die Stilllegung muss am
+      **Subjekt** hängen, nicht am Objekt.
+      **TCB-Kosten, benannt:** ein Bit je PD und eine Prüfung in `CALL`/`RECV`. Mehr nicht.
+
+- [ ] **S2 — die Absage muss den PARTNER nennen.** Ein Thread, der in einem `CALL` an einen
+      **fremden** Server hängt, der nie antwortet, macht die PD unfrierbar. Das ist kein
+      vorübergehender Zustand und darf kein Hänger sein: `Freeze::BusyOn { tid, partner }` statt
+      `Busy(Quiescence)`.
+      Dazu eine **Frist** mit benanntem Ausgang. „Wir warten, bis es ruhig ist" terminiert nicht
+      beweisbar, und eine Stilllegung ohne Frist ist von einem Deadlock nicht zu unterscheiden —
+      genau die Ununterscheidbarkeit, die `docs/fehlerdomaene.md` schon einmal gekostet hat.
+
+- [ ] **S3 — der Freeze ist eine MENGE, kein Ablauf.** Entweder steht die ganze PD oder keiner
+      ihrer Threads. Ein Teilerfolg, der liegen bleibt, ist schlimmer als ein Fehlschlag: die PD
+      wäre halb tot und **jeder Prüfer meldete Ordnung** (D11-Form).
+      Also ein Zeuge `FrozenPd` nach dem Vorbild von [`Parked`](#z22): `#[must_use]`, **kein**
+      öffentlicher Weg an die ThreadIds, kein `Drop` (sonst liesse sich der Inhalt beim Auftauen
+      nicht herausbewegen) — und ein ausdrückliches `abort_freeze`, das die schon eingefrorenen
+      wieder auftaut. Bewacht wie `tools/zulassung.sh`, mit Selbsttest in beide Richtungen.
+
+- [ ] **S4 — den Zustand aufzählen, der mitwandern MUSS.** Heute wandert **nichts**: `Image` trägt
+      `progress`, `nonce`, `epoch`, `caps` — eine Anwendungsgrösse und die Cap-Klassifikation. Kein
+      Trap-Frame, keine Register, kein Stack, kein Speicherinhalt.
+      Aufzuzählen ist mindestens: je Thread Registerzustand, Stackinhalt, `priority`/`budget`/
+      `period`/`remaining`, der **Blockadegrund**, und — als Schuld aus Z22 P4 — **`parked` und
+      `park_wake`**. Je PD: Adressraum (welche Seiten, welche Farben) und Cspace. Dazu die
+      schwebende IPC-Lage: Reply-Token und die `pending`-Badges der Notifications.
+      **Die Regel dafür steht schon:** was nicht übertragbar ist, wird **benannt abgewiesen** —
+      `classify` tut das für Caps. S4 heisst, `Scope`/`classify` von Caps auf **Threadzustand**
+      auszudehnen, nicht ein neues Verfahren zu erfinden.
+
+- [ ] **S5 — Gerät und DMA: hier gibt es heute NULL Zeilen.** Eine eingefrorene Treiber-PD, deren
+      Gerät gerade in ihre Region schreibt, ist **nicht** eingefroren — der Deskriptorring läuft
+      weiter, und mit MSI (Z22 P1) wird das mehr, nicht weniger.
+      Drei Wege, und der erste ist die richtige erste Fassung:
+      * **(a) fail-closed:** eine PD mit DMA-Cap wird **nicht** eingefroren. Billig, ehrlich,
+        sofort. Eine Absage, die stimmt, ist besser als eine Zusage, die nicht hält.
+      * **(b) das Gerät stilllegen** — treiberspezifisch, gehört also **in die PD**: ein
+        `PD_FREEZE_PREPARE`-Upcall, den der Treiber beantwortet („DMA steht"). Das ist ein
+        **Protokoll**, kein Kernelmechanismus, und damit TCB-neutral. Der richtige Endzustand.
+      * **(c) den IOMMU-Kontext abhängen** — generisch und kernelseitig, zerstört aber laufende
+        Anfragen. Nur als Notbremse.
+      **Und die Messung dazu, die fehlschlagen kann:** ein Kanarienwort in der DMA-Region, vor und
+      nach dem Einfrieren gelesen. Ändert es sich, war die PD nicht eingefroren — unabhängig davon,
+      was der Freeze-Pfad gemeldet hat. Ohne diese Zeile ist S5 eine Behauptung.
+
+- [ ] **S6 — Auftauen ist nicht die Umkehrung.** Tore öffnen, wiederherstellen, fortsetzen — und
+      zwei Dinge, die heute schon falsch sind (s. den Befund unten): `thaw` muss den Park-Zustand
+      kennen, und ein Thread, der **mit** gesetzter Weckmarke eingefroren wurde, muss nach dem
+      Auftauen **sofort** weiterlaufen und darf nicht schlafen.
+
+- [ ] **Abnahme — und sie muss fehlschlagen können.** Vier Aussagen, von denen nur die dritte neu
+      ist; die ersten beiden sind die Z4a-Form (Positivkontrolle, Beobachtungsfenster **länger als
+      ein Tick** — die erste Z4a-Fassung mass mit einem kürzeren und meldete Stillstand für einen
+      Thread, der völlig in Ordnung war):
+      1. Die PD läuft nachweislich **vorher** (ein Zähler bewegt sich).
+      2. Eingefroren steht er über ein Fenster von mehreren Ticks, und **nach** dem Auftauen läuft
+         er wieder.
+      3. **Der Fall, den die Reihenfolge nicht kann:** zwei Threads derselben PD, die **miteinander
+         IPC treiben**, werden gemeinsam eingefroren. Ohne diesen Fall beweist der ganze Strang
+         nichts, was Z4a nicht schon zeigt.
+      4. Eine PD, die auf einen **fremden** Server wartet, bekommt eine Absage, die den **Partner
+         nennt** — kein Hänger, kein `false`.
+      Dazu die Gegenprobe: eine Mutation, die die Tore **nicht** schliesst, muss Fall 3 reissen.
+
+- [ ] **Vorher zu beheben, weil Z23 sonst auf einem kaputten Fundament plant** (Befund vom
+      2026-08-09, aus dem Code gelesen): `parked`/`park_wake` werden **ausserhalb des Schedulers
+      von nichts gelesen** — nicht von `thread_quiescence`, nicht vom Checkpoint, **und nicht von
+      `thaw_thread`/`PDCTL RESUME`**. Daraus folgt heute schon:
+      * `thaw_thread` ruft `unblock`, und `unblock` fasst `parked` nicht an → ein aufgetauter
+        geparkter Thread läuft mit `parked == true` weiter, und `is_parked` lügt ab da.
+      * Der nächste `unpark` sieht dieses veraltete `parked == true`, **verbraucht die Marke
+        sofort** und ruft `unblock` auf einen laufenden Thread. Die Weckmarke ist damit weg, ohne
+        dass jemand geschlafen hat — **ein verlorenes Wecken**, exakt das, wogegen Z22 P4 gebaut
+        ist.
+      * Umgekehrt hebt der `unpark` eines Geschwisterthreads ein `PDCTL PAUSE` auf einen geparkten
+        Thread **stillschweigend** auf.
+      Wieder „ein Bit, zwei Gründe" (D9), diesmal an der Naht zwischen Park und Pause/Resume: in
+      `unpark` vermieden, an der anderen Seite stehengelassen. **Und es verschiebt den Status des
+      Spurious-Wake-Vertrags:** das System erzeugt schon heute spurious wakeups, der Vertrag ist
+      also keine Vorsorge, sondern die einzige Fassung, die stimmt.
+
 ### Z22. Die vier harten Stellen aus Z21 — gebaut
 **Klasse:** Substrat · **Stand:** 2026-08-09 · Leitlinie: *so viel wie möglich in der PD, TCB so
 klein wie möglich, Leistung maximal.*

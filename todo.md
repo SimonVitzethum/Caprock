@@ -592,45 +592,74 @@ Schritt 1 ist damit selbsttragend.
   sich die Eager-Kosten beziffern, falls jemand zurückdrehen will — ohne sie wäre so ein Rückbau
   eine Meinung.
 
-- **STAND (2026-08-09, nach einem zweiten Anlauf mit besserer Methodik):**
+- **`[x]` A4 GELANDET (2026-08-09, dritter Anlauf) — und der Weg dahin war der Ertrag.**
 
-  **Zuerst das Messinstrument geprüft, wie es sich gehört.** Die Baseline `61da820` zwanzigmal
-  gebootet: **20 von 20 mit identischer Signatur.** Damit war der Widerspruch „sauberer Baum grün,
-  alles abgeschaltet rot" aufgelöst — die Baseline ist nicht flaky, also war **mein Abschalten
-  unvollständig**. Genau so ist es gewesen.
+  **Zuerst zwei eigene Fehlaussagen, die berichtigt gehören:**
+  * „Alle vier Bits haben dieselbe Wirkung auf die Fault-Leitung" war **architektonisch falsch**
+    und methodisch unbelegt. `CR4.OSXMMEXCPT` verschiebt nichts von `#UD` nach `#NM` — es
+    entscheidet nur, ob eine *unmaskierte SIMD-Ausnahme* als `#XM` gemeldet wird, und die setzt
+    laufenden SSE-Code voraus. Gemessen hatte ich ausserdem drei **Kombinationen**, nicht vier
+    Einzelbits. Eine Verallgemeinerung über Messungen, die es nicht gab.
+  * Das Symptom hatte ich zweimal falsch gelesen: es war ein **Hänger** (Zeitlimit), und alle 14
+    `FAIL`-Zeilen waren Folgen davon.
 
-  **Die Binärdifferenz hat es bewiesen statt es zu vermuten.** Sektionsadressen identisch, `.text`
-  und `.data` unverändert, einziger echter Symbolunterschied `SSE_CORES` in `.bss` — und der
-  `enable_sse()`-Aufruf auf dem **BSP** war die ganze Zeit noch drin. Die Frage „war das
-  Abschalten vollständig?" gehört mechanisiert, nicht der eigenen Sorgfalt überlassen.
+  **Die billige Messung hat die teure Analyse ersetzt.** Roter Build unter **TCG** mit
+  `-d int -D fault.log` (unter KVM sieht man nichts — der Wirtskern behandelt die Interrupts):
 
-  **Es waren ZWEI Fehler, und ich habe sie über die Zwischenbehebung hinweg vermengt:**
-  1. `options(nostack)` an einem `asm!`-Block, der `push rbx` macht — **das war die SMP-Ursache**,
-     und die Behebung war richtig. Dass ich sie damals *nicht* zur Ursache erklärt habe, war
-     ebenfalls richtig, aber aus dem falschen Grund: die Messung stützte es nicht, weil der zweite
-     Fehler sie überdeckte.
-  2. `SSE_CORES` hinter `#[cfg(feature = "selftest")]`, die Aufrufstelle im Hochlauf aber
-     unbedingt → **`--no-default-features` baute nicht mehr**, und genau das prüft die Suite (F1).
+      22: v=07 e=0000 cpl=3 IP=0023:...16a016   <- Ring 3 faultet auf FP (erwartet)
+      23: v=07 e=0000 cpl=0 IP=0008:...12791b   <- der KERNEL faultet auf FP -- IM HANDLER
 
-  **Das verbleibende Symptom hatte ich zweimal falsch gelesen.** Es ist **kein** Testfehlschlag,
-  sondern ein **Hänger**: der Lauf reißt das 120-s-Limit, und alle 14 `FAIL`-Zeilen sind Folgen
-  davon. Erst beim dritten Hinsehen die vollständige Liste gelesen statt der ersten drei Zeilen.
+  Zwei Zeilen, und die Ursache steht da. **Kein `#GP` beim CR-Schreiben** — der Schreibpfad ist
+  damit entlastet, die Alternativhypothese widerlegt.
 
-  **Die Ursache, so weit eingegrenzt wie es heute geht:** der CPUID-Block allein ist harmlos (Lauf
-  grün). **Jedes einzelne der vier Bits** hängt den Kern — CR0-allein wie CR4-allein. Alle vier
-  haben dieselbe Wirkung auf die Fault-Leitung: FP/SSE-Instruktionen lösen kein `#UD` mehr aus,
-  sondern `#NM`. Der `#NM`-Hook ist installiert (`system.rs:751` → `fp_trap`), aber er ist auf x86
-  **noch nie ausgeführt worden**: mit `CR0.EM = 1` war SSE ein `#UD`, und x87 benutzt ein
-  soft-float-Kernel nicht. **SSE freizuschalten macht toten Code lebendig** — und der hängt.
+  **Die Ursache:** `fp_trap` rief `hal::fp::save`/`restore` **vor** `set_el0_trap(false)`.
+  `FXSAVE`/`FXRSTOR` sind selbst FP-Instruktionen — mit gesetztem `CR0.TS` lösen sie genau den
+  Trap aus, aus dem heraus sie gerufen werden. Rekursion, Hänger.
 
-  **Nächster Schritt, konkret:** `fp_trap` und den x86-`#NM`-Pfad daraufhin lesen, welche
-  Annahmen sie treffen, die nie geprüft wurden. Die naheliegenden Kandidaten sind der
-  `FpState`-Slab-Zugriff aus einem Trap heraus (Sperrordnung!) und `clear_ts` vor dem `fxrstor64`.
-  Ein Melder im Hook, der die **erste** Ausführung zählt, wäre der billigste Anfang — bei
-  totem Code ist „lief nie" von „lief und hing" sonst nicht zu unterscheiden.
+  **Warum es nie aufgefallen ist, und das ist die eigentliche Lehre:** `CR0.TS` gilt für **jede**
+  Privilegstufe, `CPACR_EL1.FPEN` auf ARM dagegen nur für EL0 — dort darf der Kernel immer
+  rechnen, und **derselbe Aufrufercode ist korrekt**. Der x86-Pfad war tot (`CR0.EM = 1` machte SSE
+  zu `#UD`, x87 benutzt ein soft-float-Kernel nicht), also feuerte `#NM` nie. **SSE freizuschalten
+  macht toten Code lebendig.**
 
-  Der Baum steht grün auf `0715651`; die Arbeit ist verworfen und aus der Beschreibung
-  rekonstruierbar (sie war klein: eine Funktion, vier Bits, zwei Aufrufstellen).
+  **Behoben in der HAL, nicht beim Aufrufer:** `save`/`restore` löschen `CR0.TS` selbst. Beim
+  Aufrufer wäre es Disziplin; in der HAL kann die nächste Aufrufstelle es nicht vergessen.
+
+  **Gelandet:** `enable_sse()` (vier Bits, CPUID-Prüfung, eine Funktion für BSP und AP),
+  aufgerufen auf beiden — auf dem AP **nach** `init_core()`, weil davor kein Scheduler existiert,
+  und **vor** der Freigabe, weil `fxsave` XMM nur mit `OSFXSR` zuverlässig sichert. Zähler
+  `SSE_CORES` **ohne** `cfg` (ein `cfg` nur am Zähler bei unbedingter Aufrufstelle liess
+  `--no-default-features` nicht mehr übersetzen — das war der zweite der beiden vermengten Fehler).
+  Abnahme: beide Konfigurationen bauen, x86 `RUNS=5` grün.
+
+- [ ] **A4-Rest, und er folgt aus der Eager-Entscheidung:** im Eager-Modus ist `#NM` **kein zu
+      behandelnder Fall mehr, sondern per Definition ein Kernelfehler** — der Trap existiert nur,
+      weil `TS` gesetzt war, und eager heisst: `TS` ist nie gesetzt. Den Handler zu *härten* wäre
+      also die falsche Konsequenz; richtig ist, ihn durch eine **laute Meldung mit RIP und Kern-ID**
+      zu ersetzen und die Invariante **„`TS == 0` nach jedem Wechsel"** in die Prüfzeile zu nehmen.
+
+      Dabei ist auf den **Lazy-Restbestand** zu achten: die alte Maschinerie *setzt* `TS` beim
+      Ownerwechsel. Bleibt ein Pfad davon stehen, ist eager deklariert und lazy gebaut — und der
+      erste FP-nutzende User-Thread findet es heraus.
+
+      Und: die aarch64-Zeile `Lazy-FP-Owner-Wechsel=399` misst danach **etwas anderes** und muss
+      umbenannt oder neu definiert werden, sonst vergleicht das Protokoll Vorher und Nachher über
+      einen Bedeutungswechsel hinweg.
+
+- [ ] **Die Verallgemeinerung, die mehr wert ist als der Einzelfall: ein VEKTOR-INVENTAR.**
+      „Handler installiert, nie ausgeführt" ist eine **Klasse**, und sie ist jetzt zweimal
+      getroffen worden (die fehlende x86-`fp`-Prüfzeile war dieselbe Lücke von der anderen Seite).
+      Ein Melder für die erste Ausführung ist zu klein gedacht: **jeder Trap-Vektor bekommt einen
+      Zähler**, und die Suite druckt am Ende, welche Vektoren auf welcher Architektur je gefeuert
+      haben. Ein Array und eine Druckzeile — und aus „toter Code, den niemand kennt" wird eine
+      Inventarliste, die bei jedem Lauf mitkommt. Ein Pfad, der laut Inventar auf aarch64 feuert
+      und auf x86 nie, ist dann kein Zufallsfund beim Debuggen, sondern eine offene Zeile im
+      Protokoll.
+
+- [ ] **Noch nicht wieder drin** (fielen beim Zurücksetzen weg, sind aus der Beschreibung
+      rekonstruierbar): die Ring-3-`fp`-Sonde mit zwei verschiedenen Mustern, ihr Lauf auf einem
+      **AP** statt dem BSP, und die `fp`-Zeile in `all_done()`. Sie kommen mit dem Vektor-Inventar
+      zusammen, das ihr Zeuge ist.
 
 ### Schritt 2 — A1: der Prozessstart-Stack
 

@@ -129,6 +129,13 @@ extern "C" fn ipc_client(_arg: usize) -> ! {
 #[cfg(feature = "selftest")]
 static USER_SYSCALLS: AtomicU64 = AtomicU64::new(0);
 
+/// Z19/A4: auf wie vielen Kernen wurde SSE freigeschaltet? Muss `num_cores()` sein.
+///
+/// **Nicht hinter `selftest`** -- die Aufrufstelle steht im Hochlauf, der immer laeuft. Ein `cfg`
+/// nur am Zaehler liess `--no-default-features` nicht mehr uebersetzen, und genau das prueft F1.
+/// Acht Byte; ihn zu gaten waere Sparsamkeit an der falschen Stelle.
+static SSE_CORES: AtomicU64 = AtomicU64::new(0);
+
 /// Ring-3-Arbeiter: ruft den Kernel per Syscall (`SYS_YIELD`) und zählt die Runden.
 #[link_section = ".user_text"]
 #[cfg(feature = "selftest")]
@@ -315,6 +322,12 @@ extern "C" fn ap_entry() -> ! {
     hal::intc::init_cpu(); // eigener LAPIC
     hal::timer::init(TICK_HZ); // eigener Timer
     system::init_core(); // dieser Kontext wird der Idle-Thread dieses Kerns
+    // **NACH `init_core()`**: davor hat dieser Kern keine Scheduler-Instanz, und ein `#NM` in
+    // diesem Fenster findet niemanden. Aber VOR der Scheduler-Freigabe: `fxsave`/`fxrstor`
+    // sichern XMM nur bei gesetztem `OSFXSR` zuverlaessig (SDM).
+    if hal::fp::enable_sse() {
+        SSE_CORES.fetch_add(1, Ordering::Relaxed);
+    }
     hal::power::ap_report_online();
     hal::cpu::local_irq_enable();
     loop {
@@ -2725,6 +2738,10 @@ pub fn run(multiboot_info: u64) -> ! {
     hal::intc::init_dist(); // 8259-PIC stilllegen
     hal::intc::init_cpu(); // LAPIC aktivieren
     hal::timer::init(TICK_HZ);
+    // Z19/A4: SSE auf dem BSP freischalten -- dieselbe Funktion wie im AP-Pfad.
+    if hal::fp::enable_sse() {
+        SSE_CORES.fetch_add(1, Ordering::Relaxed);
+    }
     println!(
         "timer   : LAPIC-Timer {} Hz (Basis {} Hz, gegen PIT kalibriert), Vektor {}",
         TICK_HZ,

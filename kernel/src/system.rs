@@ -186,6 +186,19 @@ static NM_TRAPS: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORE
 static FP_STATES: SpinLock<Slab<FpState>> = SpinLock::new(Slab::empty());
 /// Zähler abgeschlossener Lazy-FP-Owner-Wechsel (Save+Restore), für den Test.
 static FP_SWITCHES: AtomicUsize = AtomicUsize::new(0);
+/// **Die Sprechprobe der FP-Sonde: wie oft wurde der Zustand DIESES Threads restauriert.**
+///
+/// `fp_switch_count()` belegt, dass *irgendwo* gewechselt wurde — nicht, dass die Sonde daran
+/// beteiligt war. Zwei Sonden, die auf zwei Kernen liegen und einander nie verdrängen, ergäben
+/// 77 Wechsel und **null** Aussage über ihr Muster: sie prüften dann Register, die zwischen ihren
+/// Abgaben niemand angefasst hat. Dieselbe Form wie `rx_used` gegen „Daten sind angekommen".
+///
+/// Beobachtet werden zwei Threads, eingetragen von der Sonde selbst. `FP_OWNER_NONE` = unbesetzt
+/// (roh `0` taugt nicht als Sentinel — Slot 0/Generation 0 ist eine gültige `ThreadId`).
+#[cfg(feature = "selftest")]
+static FP_WATCH_TID: [AtomicU64; 2] = [const { AtomicU64::new(FP_OWNER_NONE) }; 2];
+#[cfg(feature = "selftest")]
+static FP_WATCH_RESTORES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// Summe der per `reap` an den Allokator zurückgegebenen Stack-Bytes (monoton).
 static REAPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -662,6 +675,7 @@ fn sync_fp_trap(core: usize, sched: &Scheduler) {
             }
             hal::fp::restore(&states[cur_id.slot()]);
             drop(states);
+            fp_watch_note(cur);
             FP_OWNER[core].store(cur, Ordering::Relaxed);
         }
     }
@@ -765,6 +779,7 @@ fn fp_trap(frame: *mut TrapFrame) -> *mut TrapFrame {
     hal::fp::restore(&states[cur_slot]);
     drop(states);
 
+    fp_watch_note(cur);
     FP_OWNER[core].store(cur, Ordering::Relaxed);
     hal::fp::set_el0_trap(false); // FP für diesen (jetzt Owner-)Thread freigeben
     frame
@@ -789,6 +804,41 @@ fn fp_reset_slot(slot: usize) {
 pub fn fp_switch_count() -> usize {
     FP_SWITCHES.load(Ordering::Relaxed)
 }
+
+/// Einen Thread für die Restore-Zählung eintragen (`idx` 0 oder 1). Von der Sonde selbst gerufen,
+/// sobald sie ihre eigene `ThreadId` kennt.
+#[cfg(feature = "selftest")]
+pub fn fp_watch(idx: usize, tid: ThreadId) {
+    if let Some(s) = FP_WATCH_TID.get(idx) {
+        s.store(tid.to_raw(), Ordering::Relaxed);
+    }
+}
+
+/// Wie oft der FP-Zustand des beobachteten Threads `idx` **aus seinem Slot geladen** wurde.
+///
+/// Der erste Restore lädt einen frisch genullten Slot — also *bevor* die Sonde ihr Muster
+/// geschrieben hat. Für „das Muster hat eine Verdrängung überstanden" braucht es deshalb **zwei**,
+/// nicht einen.
+#[cfg(feature = "selftest")]
+pub fn fp_watch_restores(idx: usize) -> u64 {
+    FP_WATCH_RESTORES
+        .get(idx)
+        .map_or(0, |c| c.load(Ordering::Relaxed))
+}
+
+/// Im Wechselpfad: gehört `cur` zu einem beobachteten Thread, diesen Restore zählen.
+#[cfg(feature = "selftest")]
+#[inline]
+fn fp_watch_note(cur: u64) {
+    for (t, c) in FP_WATCH_TID.iter().zip(FP_WATCH_RESTORES.iter()) {
+        if t.load(Ordering::Relaxed) == cur {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+#[cfg(not(feature = "selftest"))]
+#[inline]
+fn fp_watch_note(_cur: u64) {}
 
 /// EL0-Fault-Hook: ein User-Thread hat einen synchronen Fault ausgelöst (Zugriff
 /// auf EL1-only Kernel-Speicher, privilegierte Instruktion o. Ä.). Statt den

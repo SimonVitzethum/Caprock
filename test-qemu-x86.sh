@@ -248,7 +248,10 @@ BEKANNT_ROT=(
   "archive :|immer|B-1.5|bauartbedingt: diese Suite hat kein Boot-Archiv; dass der Kernel den Grund NENNT, ist die gepruefte Eigenschaft"
   "root    :|immer|B-1.5|dito -- ohne Archiv gibt es keinen Root-Task"
   "cdelete :|immer|B-1.5|dito -- der Pfad braucht ein geladenes Programm"
-  "fp      :|2026-08-09|Z25|Diagnose vom 2026-08-09: Sonden erreichen weder Erfolg noch Korruption -- Schleifenfortschritt noch nicht gezaehlt. Die FRUEHERE Diagnose (CR4.OSFXSR nie gesetzt) ist seit A4 ueberholt und war 1 Tag lang falsch stehengeblieben"
+  # `fp` stand hier bis zum 2026-08-09. Es ist AUSGETRAGEN, nicht vergessen: die Ursache war ein
+  # unerreichbares Kriterium ("alle 64 Abgaben ueberstanden"), nicht ein Fehler im Kernel. Seit dem
+  # Umbau auf Fortschritt/Korruption/eigene Verdraengungszahl ist die Zeile gruen UND gattert
+  # (`all_done`). Ein Eintrag hier waere jetzt das Gegenteil eines Waechters.
 )
 fingerprint() {
     local f="$1"

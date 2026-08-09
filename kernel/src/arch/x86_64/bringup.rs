@@ -308,6 +308,41 @@ static FP_TRIES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[link_section = ".user_data"]
 static FP_PROGRESS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// **Das FP-Urteil an EINER Stelle.** `all_done` und der Bericht rufen dieselbe Funktion.
+///
+/// Zwei Wirklichkeiten aus derselben Hand waren der `pdbind`-Fehler: eine Liste fuer den Bericht,
+/// eine getrennte `&&`-Kette fuer das Urteil -- und drei Zeilen gatterten nichts. Hier gibt es
+/// nur diese Funktion; der Bericht druckt die Bestandteile, entscheidet aber nicht.
+///
+/// **Was NICHT drinsteht, und warum:** „alle {FP_ITERS} Abgaben ueberstanden". Das konnte die
+/// Sonde nie liefern (gemessen 3/64 bei gruener Sofortpruefung und null Korruptionen) -- sie kommt
+/// je Rundlauf-Runde eine Iteration voran, und eine Runde ist durch den Tick begrenzt. Ein
+/// Kriterium, das die geprueft Sache nicht erreichen kann, hat keine Trennschaerfe: gruen ist
+/// unmoeglich, also sagt rot nichts.
+#[cfg(feature = "selftest")]
+fn fp_urteil() -> bool {
+    let fpmask = FP_OK.load(Ordering::Relaxed);
+    let gelaufen = fpmask & 0b100 != 0; // Sprechprobe: die Sonde lief und konnte schreiben
+    let sofort_ok = (fpmask >> 3) & 0b11 == 0b11; // Muster schreiben/lesen OHNE jeden Wechsel
+    // **Zwei, nicht eins**: der erste Restore laedt einen frisch genullten Slot, also *bevor* die
+    // Sonde ihr Muster geschrieben hat. Erst der zweite belegt, dass ein GESCHRIEBENES Muster eine
+    // Verdraengung ueberstanden hat. Dasselbe Argument fuer den Fortschritt.
+    let verdraengt =
+        system::fp_watch_restores(0) >= 2 && system::fp_watch_restores(1) >= 2;
+    let fortschritt = FP_PROGRESS[0].load(Ordering::Relaxed) >= 2
+        && FP_PROGRESS[1].load(Ordering::Relaxed) >= 2;
+    let keine_korruption =
+        FP_FOUND[0].load(Ordering::Relaxed) == 0 && FP_FOUND[1].load(Ordering::Relaxed) == 0;
+    let nm: u64 = (0..system::num_cores()).map(system::nm_traps).sum();
+    gelaufen
+        && sofort_ok
+        && verdraengt
+        && fortschritt
+        && keine_korruption
+        && hal::fp::ts_vorgefunden() == 0
+        && nm == 0
+}
+
 #[cfg(feature = "selftest")]
 core::arch::global_asm!(
     r#"
@@ -631,9 +666,25 @@ fn spawn_demo() -> bool {
         let entry = core::ptr::addr_of!(user_fp_probe_x86) as usize;
         // Die beiden Muster unterscheiden sich im NIEDRIGSTEN Bit -- daraus leitet die Sonde ihr
         // Erfolgsbit ab (0 -> Bit 0, 1 -> Bit 1).
-        for muster in [0x1234_5678_9ABC_DEF0u64, 0xA5A5_5A5A_3C3C_C3C3u64] {
+        for (i, muster) in [0x1234_5678_9ABC_DEF0u64, 0xA5A5_5A5A_3C3C_C3C3u64]
+            .into_iter()
+            .enumerate()
+        {
             if let Some(t) = system::spawn_user_parked(entry, muster as usize, system::IDLE_PRIO) {
-                let _ = system::admit(t);
+                // **Die Sprechprobe dieser Sonde ist ihre eigene Restore-Zahl, nicht die globale.**
+                // `fp_switch_count()` zaehlt Wechsel irgendwo im Knoten; lagen beide Sonden auf
+                // verschiedenen Kernen und haben einander nie verdraengt, sagt eine hohe Zahl
+                // ueber ihr Muster **nichts** -- sie pruefen dann Register, die zwischen ihren
+                // Abgaben niemand angefasst hat. Dieselbe Form wie `rx_used` gegen „Daten sind
+                // angekommen".
+                //
+                // Eingetragen wird NACH der Zulassung, weil es die `ThreadId` erst dort gibt
+                // (`Parked` gibt sie absichtlich nicht heraus). Der Zaehler ist damit eine
+                // **Untergrenze** -- er verliert hoechstens die ersten Restores, und in der
+                // Richtung, die den Test strenger macht statt nachsichtiger.
+                if let Some(tid) = system::admit(t) {
+                    system::fp_watch(i, tid);
+                }
             }
         }
     }
@@ -2306,6 +2357,19 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
     //  3. **Kein `#NM`, und zwar JE KERN.** Global summiert waere ein einzelner AP, dessen
     //     `enable_sse` in einem Refactor aus der Reihenfolge rutscht, im Rauschen der uebrigen
     //     unsichtbar -- und das ist die wahrscheinlichste kuenftige Regression.
+    //
+    // **Das Urteil hing bis zum 2026-08-09 an „alle 64 Abgaben ueberstanden" -- und genau das
+    // konnte die Sonde nie liefern.** Gemessen: Fortschritt 4/64 und 7/64 bei gruener
+    // Sofortpruefung und **null** gemeldeten Korruptionen. Die Sonde war nicht kaputt, sie war
+    // **langsamer als der Bericht**: sie kommt je Runde des Rundlaufs genau eine Iteration voran,
+    // und eine Runde ist durch den Tick begrenzt, nicht durch das YIELD. 64 war eine Zahl ohne
+    // Bezug zur Rundenlaenge.
+    //
+    // Ein Kriterium, das die geprüfte Sache nie erreichen kann, ist kein strenges Kriterium,
+    // sondern **gar keins** -- es hat keine Trennschaerfe: gruen ist unmoeglich, also sagt rot
+    // nichts. Das Urteil liest deshalb jetzt die drei Groessen, die sich wirklich aendern:
+    // **Fortschritt**, **Korruptionsmeldung** und die **eigene Restore-Zahl** der Sonde.
+    // Die 64 laufen weiter und stehen im Bericht -- als Auskunft, nicht als Bedingung.
     let fpmask = FP_OK.load(Ordering::Relaxed);
     let fp_gelaufen = fpmask & 0b100 != 0;
     let muster_ok = fpmask & 0b11 == 0b11;
@@ -2316,14 +2380,24 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
         *n = system::nm_traps(c);
     }
     let nm_gesamt: u64 = nm_je_kern.iter().take(kerne).sum();
-    let fp_ok = fp_gelaufen && muster_ok && ts_gesehen == 0 && nm_gesamt == 0;
+    // Die drei Groessen, die das Urteil jetzt traegt.
+    let (f0, f1) = (
+        FP_FOUND[0].load(Ordering::Relaxed),
+        FP_FOUND[1].load(Ordering::Relaxed),
+    );
+    let (p0, p1) = (
+        FP_PROGRESS[0].load(Ordering::Relaxed),
+        FP_PROGRESS[1].load(Ordering::Relaxed),
+    );
+    let (r0, r1) = (system::fp_watch_restores(0), system::fp_watch_restores(1));
+    // **Das Urteil kommt aus `fp_urteil()`, nicht von hier.** Der Bericht druckt die Bestandteile;
+    // entschieden wird an EINER Stelle, die auch `all_done` liest.
+    let fp_ok = fp_urteil();
     println!(
-        "fp      : gelaufen={fp_gelaufen} · Muster ueber {FP_ITERS} Abgaben erhalten = {:#b}          (erwartet 0b11) · CR0.TS-gesetzt-vorgefunden={ts_gesehen} (eager: muss 0 sein)          (zwei Sonden mit VERSCHIEDENEN Mustern in xmm0..xmm3; verschieden ist der Punkt -- mit          demselben Muster fiele ein fehlendes fxsave nicht auf, weil der Dieb genau das          zuruecklaesst, was das Opfer erwartet)",
+        "fp      : gelaufen={fp_gelaufen} · Muster ueber ALLE {FP_ITERS} Abgaben erhalten = {:#b} (vollstaendig={muster_ok}) -- **Auskunft, nicht Bedingung**, s. u. · CR0.TS-gesetzt-vorgefunden={ts_gesehen} (eager: muss 0 sein)          (zwei Sonden mit VERSCHIEDENEN Mustern in xmm0..xmm3; verschieden ist der Punkt -- mit          demselben Muster fiele ein fehlendes fxsave nicht auf, weil der Dieb genau das          zuruecklaesst, was das Opfer erwartet)",
         fpmask & 0b11
     );
     // **Die drei Hypothesen trennen** -- ohne den gefundenen Wert sehen sie gleich aus.
-    let f0 = FP_FOUND[0].load(Ordering::Relaxed);
-    let f1 = FP_FOUND[1].load(Ordering::Relaxed);
     println!(
         "fp      : sofort-ok (OHNE Wechsel) = {:#b} (erwartet 0b11 in Bit 3/4) · gefunden statt \
          des Musters: Sonde0={f0:#018x} Sonde1={f1:#018x}. Nullen = frisch resetteter Slot \
@@ -2340,16 +2414,20 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
         FP_TRIES[1].load(Ordering::Relaxed)
     );
     println!(
-        "fp      : Schleifenfortschritt = Sonde0={}/{FP_ITERS} Sonde1={}/{FP_ITERS}. Weder \
-         Erfolgs- noch Korruptionsbit heisst: sie STECKT -- und dann sagt das Ergebnis nichts, \
-         der Fortschritt aber alles ({FP_ITERS} = durchgelaufen, 0 = nie begonnen)",
-        FP_PROGRESS[0].load(Ordering::Relaxed),
-        FP_PROGRESS[1].load(Ordering::Relaxed)
+        "fp      : Schleifenfortschritt = Sonde0={p0}/{FP_ITERS} Sonde1={p1}/{FP_ITERS} (gefordert \
+         >=2 je Sonde: 1 = einmal geprueft und abgegeben, 2 = nach einer Abgabe NOCH EINMAL \
+         geprueft -- und das ist die Aussage). {FP_ITERS} = durchgelaufen, 0 = nie begonnen. \
+         **Die Sonde kommt je Rundlauf-Runde genau eine Iteration voran, und eine Runde ist \
+         durch den Tick begrenzt, nicht durch das YIELD** -- deshalb ist der volle Durchlauf \
+         Auskunft und nicht Bedingung"
     );
     println!(
-        "fp      : FP-Wechsel gesamt = {} (Save eines vorigen Besitzers). **0 hiesse: es wurde nie \
-         gewechselt** -- dann sagt die Musterpruefung nichts ueber Save/Restore aus, sondern nur, \
-         dass niemand die Register angefasst hat",
+        "fp      : Verdraengungen DIESER Sonden = Sonde0={r0} Sonde1={r1} (gefordert >=2; der \
+         erste Restore laedt einen frisch genullten Slot, also VOR dem Muster) · FP-Wechsel \
+         gesamt = {} (Save eines vorigen Besitzers). **Die Gesamtzahl ist NICHT die Sprechprobe**: \
+         laegen beide Sonden auf verschiedenen Kernen und verdraengten einander nie, waere sie \
+         hoch und die Musterpruefung trotzdem gegenstandslos -- dieselbe Form wie `rx_used` gegen \
+         „Daten sind angekommen\"",
         system::fp_switch_count()
     );
     print!("fp      : #NM je Kern =");
@@ -2459,6 +2537,12 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             ("epfull", epfull),
             ("state", state),
             ("park", PARK_MESS.load(Ordering::Acquire) & 1 != 0),
+            // **Seit dem 2026-08-09 gattert `fp` wirklich.** Vorher stand die Zeile bewusst
+            // draussen, weil ihr Kriterium („alle 64 Abgaben") unerreichbar war und die Suite
+            // dauerhaft rot gefaerbt haette. Mit einem erreichbaren Kriterium waere ein
+            // Draussenbleiben das Gegenteil: eine gruene Zeile, die nichts gattert -- genau der
+            // `pdbind`-Fehler drei Zeilen weiter oben.
+            ("fp", fp_urteil()),
     ];
     if let Some(w) = warum {
         *w = flags;
@@ -2468,7 +2552,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 26;
+const DONE_FLAGS: usize = 27;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]

@@ -755,9 +755,9 @@ auf x86, grosse DMA, Firmware aus einem Dateisystem) stehen ohnehin auf dem Weg 
 vierte — **das Kernel-Primitiv für umgeleitete Syscalls** — steht auf keinem anderen Weg und ist
 damit der ehrliche Preis dieser Entscheidung.
 
-### Z25. Eager-FP auf x86 — der Dreier-Commit, 2026-08-09
-**Klasse:** Sicherheit · **Stand:** drei Teile fertig und gemessen, **die FP-Sonde bleibt rot**
-(vorbestehend, s. unten)
+### Z25. Eager-FP auf x86 — der Dreier-Commit, 2026-08-09 — **ZU**
+**Klasse:** Sicherheit · **Stand:** alles fertig und gemessen; `fp : ALL PASS` und die Zeile
+**gattert** (`all_done`, 27 Flags). Zwei Gegenproben mit unterscheidbarer Signatur, s. unten.
 
 - [x] **Der Auslöser liegt im WECHSEL, nicht im ersten Zugriff.** `CR0.TS` bleibt nach `enable_sse`
       dauerhaft aus; `sync_fp_trap` sichert/lädt beim Wechsel. Grund ist **CVE-2018-3665
@@ -790,19 +790,51 @@ damit der ehrliche Preis dieser Entscheidung.
       jeweils andere Seite — die vorige Fassung sah auf einer Architektur eager und auf der anderen
       lazy aus, **ohne dass irgendwo stand warum**, und war damals tatsächlich ein Versehen.
 
-- [ ] **OFFEN und vorbestehend: die FP-Sonde meldet `Muster = 0b0`.** Gemessen, nicht vermutet:
-      **an der Grundlinie `5d94f14` (noch lazy) genauso rot** — es ist kein Eager-Effekt.
-      Was dazu feststeht: **77 FP-Wechsel** (Save/Restore läuft also wirklich), `ts_vorgefunden=0`,
-      `#NM=0` auf allen vier Kernen, keine `#GP` im Inventar (`fxsave` ist also ausgerichtet und
-      faultet nicht), `fp_reset_slot` läuft beim Spawn, und der Slab-Index paniced bei Überlauf —
-      **kein Aliasing zweier Threads auf denselben Slot**. Beide Sonden erkennen Korruption.
-      **Der alte Berichtstext nannte als Ursache `CR4.OSFXSR` wird nirgends gesetzt. Das ist seit
-      A4 überholt** — die Zeile blieb rot, die Erklärung stimmte nicht mehr, und nachdiagnostiziert
-      hat es niemand. Genau die Form, die dieses Projekt als „ein Grund, der nicht mehr stimmt,
-      macht den Punkt unbehebbar" führt.
-      **Deshalb steht `fp` weiterhin NICHT in `all_done()`** — und das ist hier eine benannte
-      Auslassung, kein Übersehen: die Zeile zu gattern, bevor die Ursache bekannt ist, färbte die
-      Suite dauerhaft rot und verdeckte jede künftige Regression.
+- [x] **Die rote FP-Sonde war ein Fehler im KRITERIUM, nicht im Kernel — und das Kriterium war
+      unerreichbar.** Verlangt war „das Muster hat **alle 64** Abgaben überstanden". Gemessen kam
+      die Sonde bis **3/64** — bei grüner Sofortprüfung (1000/1000, also beim ersten Versuch) und
+      **null** gemeldeten Korruptionen. Sie war nie korrumpiert, sie war **langsamer als der
+      Bericht**: eine Iteration je Rundlauf-Runde, und eine Runde ist durch den **Tick** begrenzt,
+      nicht durch das `YIELD`. Die 64 war eine Zahl ohne Bezug zur Rundenlänge.
+      **Ein Kriterium, das die geprüfte Sache nicht erreichen kann, ist kein strenges Kriterium,
+      sondern gar keins:** grün ist unmöglich, also sagt rot nichts. Es hat keine Trennschärfe —
+      dieselbe Form wie ein Prüfer, der die falsche Größe liest, nur von der anderen Seite.
+- [x] **Die Sprechprobe ist die EIGENE Verdrängungszahl der Sonde, nicht die globale.**
+      `fp_switch_count()` sagt, dass irgendwo gewechselt wurde. Lägen beide Sonden auf
+      verschiedenen Kernen und verdrängten einander nie, wäre die Zahl hoch und die
+      Musterprüfung **gegenstandslos** — sie prüfte Register, die zwischen ihren Abgaben niemand
+      angefasst hat. Dieselbe Form wie `rx_used` gegen „Daten sind angekommen".
+      Neu: `fp_watch`/`fp_watch_restores` zählen die Restores **dieser** Threads, eingetragen nach
+      der Zulassung (der Zähler ist damit eine **Untergrenze** — er verliert höchstens die ersten
+      Restores, und in der Richtung, die den Test strenger macht).
+      **Gemessen: Verdrängungen 4/4 bei Fortschritt 3/3** — also ≈ eine Verdrängung je Iteration.
+      Die Sonden kontrahieren wirklich; das war vorher nicht belegt, sondern angenommen.
+- [x] **Gefordert wird `>= 2`, nicht `>= 1`** — der erste Restore lädt einen frisch genullten Slot,
+      also *bevor* die Sonde ihr Muster geschrieben hat. Erst der zweite belegt, dass ein
+      **geschriebenes** Muster eine Verdrängung überstanden hat.
+- [x] **Das Urteil steht an EINER Stelle (`fp_urteil()`), und `fp` gattert jetzt** (`all_done`,
+      26 → 27 Flags). Vorher war das Draussenbleiben richtig (ein unerreichbares Kriterium hätte
+      die Suite dauerhaft rot gefärbt); mit einem erreichbaren Kriterium wäre es das Gegenteil —
+      eine grüne Zeile, die nichts gattert, also genau der `pdbind`-Fehler.
+      Der Eintrag in `BEKANNT_ROT` ist **ausgetragen**, mit dem Grund an der Stelle.
+- [x] **Zwei Gegenproben, und sie sind UNTERSCHEIDBAR rot** — der gefundene Wert benennt die
+      Ursache, statt nur „nicht meins" zu sagen:
+      * **kein Save des vorigen Besitzers** → `Sonde0=0x8000000000000000` = Markerbit 63 plus
+        lauter Nullen, also „ein frisch genullter Slot wurde restauriert". Verdrängungen blieben
+        bei 2/2 — die Sprechprobe spricht also **weiter**, während die Eigenschaft fällt, und das
+        ist ihre Aufgabe.
+      * **kein Restore** → `Sonde0=0xa5a55a5a3c3cc3c3`, wörtlich das **Muster des Partners**:
+        Identitätsvertauschung, der FP-Zustand folgt der CPU statt dem Thread.
+      Beide `fp : FAILURES`, danach wieder `== ALL PASS ==`.
+      Ehrlich dazu: die Isolation ist hier **nicht** vollständig — mit der Korruption fällt
+      zwangsläufig auch der Fortschritt, weil die Sonde bei Erkennung parkt. Das sind nicht zwei
+      Fehler, sondern eine Wirkung mit zwei sichtbaren Folgen; die Konjunkte sind kausal verkettet,
+      nicht unabhängig.
+- [x] **Was die alte Diagnose kostete, bleibt als Lehre stehen.** Der Berichtstext nannte als
+      Ursache „`CR4.OSFXSR` wird nirgends gesetzt" — seit A4 überholt. Die Zeile blieb rot, die
+      Erklärung stimmte nicht mehr, und nachdiagnostiziert hat es niemand. **Ein Grund, der nicht
+      mehr stimmt, macht den Punkt unbehebbar** — dieselbe Form wie der falsche `SYS_MAP`-Grund im
+      Identitäts-Wächter.
 
 ### Z24. Der Blockadegrund ist eine MENGE, keine Bit-Sammlung — geplant 2026-08-09
 **Klasse:** Struktur · **Ersetzt** den ursprünglich als „Spurious-Wake-Vertrag" geplanten Schritt;

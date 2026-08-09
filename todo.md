@@ -507,9 +507,38 @@ solche markiert.
       Art Arbeit.** Das ist der Punkt: die Volumina liegen dort, wo Messen und kleine TCB sie
       **nicht** verkleinern.
 
-      | Baustein | warum es die Kategorie sprengt |
+      **BERICHTIGUNG (2026-08-09, nach Einwand): der Vergleich „i915 ist 1,9 MB, die TCB 236 KiB"
+      war schief — und zwar nach der eigenen Logik dieses Projekts.** Ein Grafiktreiber gehört in
+      eine **HardwareLand-PD**, genau wie `virtio-blk` und `virtio-net`, und dann wächst die TCB um
+      **null**. Dieselbe Rechnung wie bei der WASM-Engine (216 KiB Code, so groß wie der Kern, aber
+      in einer PD). Ein abstürzender Grafiktreiber reißt dann seine PD ab und nicht das System —
+      das ist ein **Vorteil** gegenüber Linux, wo ein GPU-Treiberfehler ein Kernelfehler ist, und
+      es ist die Produktthese am schwersten möglichen Fall.
+
+      Die Architektur dafür steht zum großen Teil: MMIO-Fenster auf der eigenen
+      Konfigurationsraum-Seite, DMA-Region mit eigenem VT-d-Kontext und eigenem IOVA-Fenster,
+      Gerätezuteilung aus dem Manifest, und die Trennung zweier Treiber-PDs ist **gemessen**
+      (A-5.4). Was fehlt, ist nicht die Isolation, sondern:
+
+      | Baustein | die tatsächliche Schwierigkeit |
       |---|---|
-      | **Grafik** | KDE braucht einen Compositor mit OpenGL/Vulkan. Auf Raptor Lake heißt das ein moderner DRM-Treiber: GuC-Firmware, GEM/TTM, Modesetting, Display-Pipes. **Das i915-Modul dieser Maschine ist 1,9 MB übersetzt — die gesamte TCB dieses Kernels ist 236 KiB.** Eine kleine Fassung gibt es nicht. |
+      | **`CAP_IRQ`** | im Manifestformat definiert, **nicht umgesetzt** — jeder Treiber pollt. Für eine GPU nicht gangbar. Braucht IRTE-Vergabe (B-3), und die Remapping-Tabelle steht seit B-3.2 absichtlich auf „not present" |
+      | **Die Linux-Treiber-API** | i915 lässt sich nicht allein herausheben: es hängt an DRM-Core, GEM/TTM, dma-buf, Workqueues, PCI-Subsystem. Portieren heißt eine **Schicht** bauen, die Linux-Treibercode ohne Linux ausführt |
+      | **Firmware** | GuC/HuC-Blobs laden — braucht ein Dateisystem |
+      | **Menge** | ~150k Zeilen für i915 allein, TCB-neutral hin oder her. Neutral heißt nicht billig |
+
+      **Der Präzedenzfall, und er macht die Sache plausibler als ich sie dargestellt habe:**
+      **Genode** fährt Linux-Treiber in Userspace-Komponenten (`dde_linux`), Intel-Grafik
+      eingeschlossen. Das ist erprobt, nicht hypothetisch.
+
+      **Und es ändert die Wirtschaftlichkeit:** die Schicht ist die Investition, die Treiber sind
+      danach vergleichsweise billig — sie schaltet **alle** Linux-Treiber frei, nicht einen: WiFi,
+      GPU, Audio, USB. Wer den Desktop will, baut nicht i915, sondern `dde_linux`. Das ist ein
+      eigener Strang in der Größenordnung von Z16, und er hat denselben Charakter:
+      **Kompatibilitätsschicht in Userland, Kern unberührt.**
+
+      | Baustein | warum der Desktop trotzdem teuer bleibt |
+      |---|---|
       | **Ausweg Framebuffer** | EFI-GOP ohne Beschleunigung ist machbar — ohne 3D, ohne Videodekodierung, ohne Moduswechsel, ohne externen Monitor, ohne Hotplug |
       | **Qt6** | ~5 Mio. Zeilen, braucht volles POSIX plus fontconfig, freetype, harfbuzz, ICU, D-Bus, Wayland. Portierbar (QNX zeigt es), aber ein eigenes Projekt |
       | **KDE Frameworks + Plasma** | nochmals Millionen Zeilen darüber |

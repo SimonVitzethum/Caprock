@@ -267,6 +267,10 @@ name = "sel4lake-virtio"
 version = "0.1.0"
 
 [[package]]
+name = "sel4lake-wait"
+version = "0.0.1"
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"

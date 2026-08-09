@@ -77,7 +77,7 @@ mit_deps() { # $1 = Name, $2 = Crate-Verzeichnis, $3.. = Abhaengigkeiten (Verzei
     rm -rf "$SA"
 }
 
-ZIELE="${*:-mem part fat cycles loader cap virtio dma dmar dmarneg typestate ipctreue}"
+ZIELE="${*:-mem part fat cycles loader cap virtio dma wait dmar dmarneg typestate ipctreue}"
 for z in $ZIELE; do
     case "$z" in
         mem)  einzeln mem  "$ROOT/crates/sel4lake-mem/src/lib.rs" ;;
@@ -106,6 +106,11 @@ for z in $ZIELE; do
         # ausloesen laesst statt mit einer Maschine -- die entscheidende Aussage („eine Adresse
         # ausserhalb des Pools bekommt KEINE IOVA") braucht kein Geraet, nur einen Zahlenbereich.
         dma)  einzeln dma  "$ROOT/crates/sel4lake-dma/src/lib.rs" ;;
+        # `sel4lake-wait` (Z22 P2): Mutex/WaitQueue/Completion fuer eine PD mit mehreren Threads.
+        # Der ganze Vertrag mit dem Kernel ist ein Trait mit zwei Methoden, also laesst sich die
+        # Logik gegen einen STELLVERTRETER pruefen -- die Fallen hier sind Reihenfolgen (verlorenes
+        # Wecken, voller Warteraum), keine Hardware. Derselbe Weg wie bei `ipctreue`.
+        wait) einzeln wait "$ROOT/crates/sel4lake-wait/src/lib.rs" ;;
         # `sel4lake-hal` als Ganzes ist arch-Asm und baut auf dem Host nie. `dmar.rs` ist die
         # Ausnahme: **reine Funktion ueber eingespeiste Daten** (`forbid(unsafe_code)`, keine
         # `use`-Zeile ausser `super::*` im Testmodul), also als DATEI pruefbar -- derselbe Weg wie
@@ -149,7 +154,7 @@ for z in $ZIELE; do
             else
                 bash "$ROOT/tools/verus-modelltreue-ipc.sh" || fail=1
             fi ;;
-        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio dma dmar dmarneg typestate ipctreue)"; fail=1 ;;
+        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio dma wait dmar dmarneg typestate ipctreue)"; fail=1 ;;
     esac
 done
 

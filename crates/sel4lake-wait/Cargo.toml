@@ -1,0 +1,16 @@
+# `sel4lake-wait` — Mutex, Warteschlange und Completion fuer eine PD (Z22, P2).
+#
+# **Keine Abhaengigkeiten**, und das ist der Zweck: der ganze Vertrag mit dem Kernel ist EIN Trait
+# mit ZWEI Methoden (`park`/`unpark`). Was hier nicht steht, kann die TCB auch nicht kosten -- und
+# jede Warteschlange ist eine Liste im Speicher der PD, kein Kernelobjekt.
+#
+# `forbid(unsafe_code)`, reine Reihenfolgen -> auf dem HOST pruefbar, gegen einen Stellvertreter
+# statt gegen eine Maschine (derselbe Weg wie `ipctreue`):
+#   rustc --test --edition 2021 -O crates/sel4lake-wait/src/lib.rs -o /tmp/t && /tmp/t
+[package]
+name = "sel4lake-wait"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

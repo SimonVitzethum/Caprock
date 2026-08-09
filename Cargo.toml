@@ -25,6 +25,7 @@ members = [
     "crates/sel4lake-microkit",
     "crates/sel4lake-dtb",
     "crates/sel4lake-dma",
+    "crates/sel4lake-wait",
 ]
 
 [workspace.package]

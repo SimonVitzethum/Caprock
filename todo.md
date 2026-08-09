@@ -475,6 +475,78 @@ diese Zahl nicht erhöhen.
       Folge für die Reihenfolge: Stufe 1 (Speicher-Server) ist **nicht** Vorbedingung für den
       ersten WASM-Schritt — wohl aber für `memory.grow` und für mehr als einen Gast.
 
+### Z26. GPU — der Plan, 2026-08-09 (gemessen auf DIESER Maschine)
+**Klasse:** Bewertung · **nicht begonnen** · Anlass: GPU-Code schreibt man am wenigsten selbst,
+und NVIDIA-Userland ist proprietär.
+
+## Die zwei Messungen, die alles entscheiden
+
+| gemessen | Wert |
+|---|---|
+| `modinfo -F license nvidia` | **`Dual MIT/GPL`** |
+| `/lib/firmware/nvidia/610.43.03/gsp_ga10x.bin` | **84 MB** |
+| GPU | `10de:2d18` GB206M, RTX 5070 Max-Q (Blackwell) |
+
+**Beide drehen die Erwartung.**
+
+**Erstens: der NVIDIA-KERNELTREIBER ist offen und MIT.** Seit 2022 sind das die
+`open-gpu-kernel-modules`; auf dieser Maschine läuft genau die Variante. MIT ist mit AGPLv3
+**vereinbar** — der Treiber müsste **nicht** durch die GPLv2-Zone. Das ist die günstigste
+Lizenzlage aller bisher betrachteten Treiber, günstiger als NVMe (21/21 v2-only).
+
+**Zweitens, und das ist der eigentliche Hebel: 84 MB Firmware.** Seit Turing läuft die
+Treiberlogik auf dem **GSP** (einem RISC-V-Kern *auf der GPU*). Das Kernelmodul ist damit
+weitgehend **Firmware-Lader + RPC-Transport**, nicht ein Monolith aus Hardwarelogik. Die
+Größenordnung, die in Z20 für i915 genannt wurde (1,9 MB Modul), gilt für NVIDIA-Blackwell so
+**nicht**.
+
+## Der Bruch liegt woanders: im USERLAND
+
+`libcuda`, `libnvidia-glcore` und die übrigen Userland-Bibliotheken sind **proprietäre Blobs**.
+Sie lassen sich **nicht neu übersetzen** — und damit ist der ganze Z16-Weg („Quelltext klonen und
+übersetzen") für sie versperrt. Was sie brauchen, ist **binäre Linux-ABI-Kompatibilität**: glibc-
+Symbole, `ioctl` auf `/dev/nvidia*`, `mmap`-Semantik, `futex`, Signale. Das ist Z14, der Strang,
+der bisher zurückgestellt war.
+
+**Daraus folgen zwei Wege, und sie schliessen einander aus.**
+
+### Weg A — mit Blob: CUDA, aber binäre ABI
+
+| Stufe | Inhalt |
+|---|---|
+| A1 | Kernelmodul (MIT) portieren: PCI/BARs, **grosse DMA**, MSI-X, GSP-Firmware laden, RPC-Kanal |
+| A2 | `/dev/nvidia*`-**ioctl-Fläche** als PD-Protokoll — die uAPI ist die stabile Seite |
+| A3 | **Binäre Linux-ABI** für die Blobs: Loader für fremde ELFs, glibc-Symbolfläche, Signale, `futex`, `mmap` |
+| A4 | 84 MB Firmware ausliefern und laden → Dateisystem, und die **Attestierungsfrage** (was signiert die 84 MB?) |
+
+**A3 ist das Projekt**, nicht A1. Und es widerspricht der bisherigen Linie (Z16: übersetzen statt
+Binaries fahren) — das ist eine Richtungsentscheidung, keine Erweiterung.
+
+### Weg B — ohne Blob: alles offen und übersetzbar, aber kein CUDA
+
+**`nouveau` (Kernel, GPL-2.0) + `NVK` (Mesa, Vulkan-Treiber, offen)** — beides Quelltext, beides
+über Z16 übersetzbar, keine binäre ABI nötig. Ergebnis: **Vulkan/OpenGL, kein CUDA.**
+
+## Die Entscheidung, die vor dem Plan steht
+
+**Wird CUDA gebraucht?** Die Antwort legt den Weg fest, und sie ist eine Produktfrage:
+
+* **PaaS mit GPU-Compute** (Inferenz, Training) → **CUDA ist der Markt**, also Weg A, also binäre
+  ABI. Es gibt keine Abkürzung; ROCm/oneAPI wären ein anderer Hersteller, nicht ein anderer Weg.
+* **Nur Darstellung/Compositing** → Weg B, und dann ist auch **i915 der billigere Einstieg**
+  (728 der 900 Dateien MIT, gemessen).
+* **Server ohne Grafik** → gar keine GPU, und der ganze Strang entfällt.
+
+## Was in JEDEM Fall zuerst kommt
+
+Unabhängig vom Weg: **`CAP_IRQ` auf x86** (IRTE-Vergabe), **grosse/zusammenhängende DMA** und
+**Firmware-Laden aus einem Dateisystem**. Ohne diese drei ist keine Variante lauffähig — und alle
+drei stehen ohnehin auf dem Weg zum Server.
+
+**Nicht empfohlen als nächster Schritt.** Der Eintrag steht, damit die Entscheidung *CUDA ja/nein*
+bewusst fällt, bevor irgendjemand anfängt — sie kostet, einmal getroffen, den Unterschied zwischen
+„übersetzen" und „fremde Binaries fahren".
+
 ### Z25. Eager-FP auf x86 — der Dreier-Commit, 2026-08-09
 **Klasse:** Sicherheit · **Stand:** drei Teile fertig und gemessen, **die FP-Sonde bleibt rot**
 (vorbestehend, s. unten)

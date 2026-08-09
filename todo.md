@@ -533,15 +533,36 @@ Die Aufteilung, die daraus folgt:
       seit dem 2026-08-03 als `== ALL PASS ==`; das gilt nicht mehr, und wann es kippte, ist
       nicht festgehalten. Eigener Eintrag nötig.
 
-- [ ] **P1 — x86: MSI-X + IRTE-Vergabe.** Der Rest von Z21 Punkt 1 (s. dort). MSI ist
-      **flankengetriggert** — das Maskieren/Demaskieren, das ein level-getriggerter GIC-SPI
-      braucht, entfällt, und wo doch maskiert werden muss, tut es die PD an **ihrem eigenen**
-      Gerät. Die IRTE trägt `SVT`/`SID`: eine PD, die den Handle einer fremden IRTE in ihre
-      MSI-X-Tabelle schriebe, wird von der Einheit abgewiesen.
+- [~] **P1 — x86 MSI-X + IRTE: die KODIERUNG steht, die Vergabe fehlt** (2026-08-09).
+      **Fertig:** `crates/sel4lake-hal/src/x86_64/irte.rs` — IRTE- und MSI-Adress-Kodierung als
+      **reine Funktion**, 10 Host-Tests, als Ziel `irte` eingehängt. Nach dem Vorbild von `dmar.rs`
+      eine eigene Datei, und aus demselben Grund: ein Bit an der falschen Stelle äussert sich als
+      *„das Gerät unterbricht einfach nicht"* — ohne Fault, ohne Meldung, ohne irgendetwas, das
+      nach einem Fehler aussieht. Mit Literalen in Sekunden prüfbar; in QEMU bräuchte es Gerät,
+      Treiber und Glück.
+      Die Sicherheitsaussage ist `SVT=01`/`SID`: die PD schreibt ihre MSI-X-Tabelle **selbst**
+      (sie besitzt das Fenster, das spart einen Syscall je Vektor) — und könnte damit den Handle
+      einer **fremden** IRTE eintragen. Die Quellprüfung der Einheit weist das ab. Ohne sie wäre
+      das ein Loch, das im Normalbetrieb nie auffällt.
+      Drei Absagen statt stiller Kürzung: Vektor < 32 (ein Gerät auf Vektor 14 sähe wie ein
+      Seitenfehler aus), APIC-ID > 255 ohne `EIME` (abgeschnitten zeigte sie auf einen **anderen**
+      Kern — ein Interrupt, der still am falschen Ort ankommt, sieht aus wie Erfolg), und eine
+      Gerätenummer > 31 (liefe in die Busnummer hinein und ordnete den Eintrag einem **fremden**
+      Gerät zu).
+      **Offen:** die Vergabe (Index-Allokator + Schreiben in die Tabelle + `IEC`-Invalidierung),
+      der Weg vom Manifest zur IRTE, ein `SYS_MSI`-artiger Zugang oder eine Vergabe im Lader,
+      und die Zustellung bis in eine Treiber-PD. Dazu die drei x86-No-Ops in `intc`.
 
-- [ ] **P2 — threaded IRQ.** `spin_lock_irqsave` wird zu Ausschluss zwischen Threads **derselben
-      PD**. Braucht mehrere Threads je PD; der billigste Weg ist das **Manifest** (der Lader legt
-      N an), nicht ein neuer Syscall — dann kostet P2 im Kernel **nichts**.
+- [~] **P2 — die Userland-Hälfte steht, die Threads fehlen** (2026-08-09).
+      **Fertig:** `crates/sel4lake-wait` — Mutex, `WaitQueue`, `Completion` über einem Trait mit
+      **zwei** Methoden (`park`/`unpark` aus P4). 11 Host-Tests gegen einen Stellvertreter. Der
+      unbestrittene Weg ist **null Syscalls**; der volle Warteraum ist **benannt** und der Aufrufer
+      parkt dann nicht (D11); der Selbst-Deadlock wird gemeldet statt zu hängen; `Completion`
+      **zählt**, weil ein `complete()` vor dem Warten in einem Treiber der Normalfall ist.
+      **Offen:** mehrere Threads je PD. Billigster Weg ist das **Manifest** (der Lader legt N an,
+      kein neuer Syscall, Kernel kostet **nichts**) — der 96-Byte-Eintrag ist aber voll, es
+      bräuchte einen `entry_len`-Bump. Das Format ist dafür selbstbeschreibend ausgelegt; es
+      berührt aber die **signierte** Fläche und verdient einen eigenen Durchgang.
 
 ### Z21. Linux-Treiber als PD-Prozesse — bewertet 2026-08-09
 **Klasse:** Kompatibilitätsschicht · **Aufwand:** groß, aber **einmalig statt je Treiber** ·

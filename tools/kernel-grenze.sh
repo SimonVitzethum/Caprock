@@ -39,6 +39,13 @@ declare -A ERLAUBT=(
   [iommu]="DMA-Eindaemmung -- Isolation gegenueber Geraeten"
   [smmu]="IOMMU (aarch64)"
   [vtd]="IOMMU (x86)"
+  # Z22 P1. Eine IRTE entscheidet, WELCHES Geraet WELCHEN Vektor auf WELCHEM Kern ausloesen darf --
+  # das ist Autoritaet, nicht Geraetesteuerung, und damit genau das Kriterium dieser Grenze. Die
+  # Treiber-PD schreibt zwar ihre MSI-X-Tabelle selbst (sie besitzt das Fenster), aber der EINTRAG,
+  # gegen den die Einheit prueft, gehoert dem Kern: sonst duerfte eine PD den Handle einer fremden
+  # IRTE benutzen. Die Datei selbst fasst keine Hardware an (reine Bitrechnung, host-getestet) --
+  # sie steht hier, weil ihr ERGEBNIS eine Autoritaetsentscheidung ist.
+  [irte]="Interrupt-Remapping-Eintraege (x86): wer darf welchen Vektor ausloesen"
   [dmar]="IOMMU-Entdeckung aus ACPI"
   [acpi]="Plattformentdeckung (Kerne, ECAM) beim Hochlauf"
   [pcie]="Bus-ENUMERATION + RID-Ermittlung fuer die IOMMU -- nicht Geraetetreiber"

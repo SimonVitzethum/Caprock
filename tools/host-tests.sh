@@ -77,7 +77,7 @@ mit_deps() { # $1 = Name, $2 = Crate-Verzeichnis, $3.. = Abhaengigkeiten (Verzei
     rm -rf "$SA"
 }
 
-ZIELE="${*:-mem part fat cycles loader cap virtio dma wait dmar dmarneg typestate ipctreue}"
+ZIELE="${*:-mem part fat cycles loader cap virtio dma wait irte dmar dmarneg typestate ipctreue}"
 for z in $ZIELE; do
     case "$z" in
         mem)  einzeln mem  "$ROOT/crates/sel4lake-mem/src/lib.rs" ;;
@@ -117,6 +117,11 @@ for z in $ZIELE; do
         # `cycles`. Bis zum 2026-08-03 lief das Testmodul deshalb NIRGENDS: vier Tests, kein
         # Aufrufer. Neu dazu die RMRR-Gruppenfaelle (E-Rest 2), die q35 mit seinen 0 RMRRs
         # strukturell nicht zeigen kann -- die QEMU-Suiten sind hier blind, nicht nachlaessig.
+        # Z22 P1: die IRTE-/MSI-Kodierung. Dieselbe Begruendung wie `dmar` -- reine Schieberei,
+        # und ein Bit an der falschen Stelle aeussert sich als „das Geraet unterbricht einfach
+        # nicht": ohne Fehlermeldung, ohne Fault, ohne irgendetwas, das nach einem Fehler
+        # aussieht. Mit Literalen in Sekunden pruefbar; in QEMU braeuchte es Geraet und Glueck.
+        irte) einzeln irte "$ROOT/crates/sel4lake-hal/src/x86_64/irte.rs" ;;
         dmar) einzeln dmar "$ROOT/crates/sel4lake-hal/src/x86_64/dmar.rs" ;;
         # ... und die Gegenprobe dazu: die Tests oben sehen nur den BEHOBENEN Zustand. Vier
         # Mutationen bauen den Fehler einzeln wieder ein, jede mit dem NAMEN des Tests, der fallen
@@ -154,7 +159,7 @@ for z in $ZIELE; do
             else
                 bash "$ROOT/tools/verus-modelltreue-ipc.sh" || fail=1
             fi ;;
-        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio dma wait dmar dmarneg typestate ipctreue)"; fail=1 ;;
+        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio dma wait irte dmar dmarneg typestate ipctreue)"; fail=1 ;;
     esac
 done
 

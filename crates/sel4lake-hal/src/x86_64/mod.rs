@@ -19,6 +19,8 @@ pub mod exception;
 pub mod fp;
 pub mod gdt;
 pub mod intc;
+/// Z22 P1: IRTE- und MSI-Kodierung. Reine Bitrechnung -> als DATEI host-pruefbar, wie `dmar`.
+pub mod irte;
 pub mod iommu;
 pub mod mmu;
 pub mod pcie;

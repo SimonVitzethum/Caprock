@@ -364,17 +364,66 @@ diese Zahl nicht erhöhen.
       `xfer`-Test delegiert eine Cap per REPLY). Eine PD kann einer anderen Autorität geben,
       **ohne dass der Kernel etwas Neues lernt**.
 
-- [ ] **Was die Randbedingung ausschließt: „unmodifizierte Linux-Binaries".** Ein Linux-Programm
-      führt `syscall` mit seiner eigenen Nummer aus (x86_64: 1 = `write`). SEL4Lake liest dieselbe
-      Stelle als eigene Nummer (1 = `CALL`). Es scheitert also **sicher** (die Cap-Prüfung weist
-      ab), aber es scheitert.
+- [ ] **Beliebige Linux-Programme: möglich — und meine erste Bewertung war falsch** (berichtigt
+      2026-08-09).
 
-      Damit es nicht scheitert, müsste der **Kernel** einen zweiten Nummernraum, einen zweiten
-      Einsprung und die Übersetzung von 300+ Linux-Syscalls kennen — oder den Fault-Pfad an eine
-      PD umleiten, was einen User-Fault-Handler in der ABI bedeutet. Beides wächst die TCB, und
-      der Linux-Syscall-Satz ist als *Menge* nicht klein zu bekommen. **Ausgeschlossen.**
+      Ich hatte geschrieben, das sei durch die TCB-Randbedingung **ausgeschlossen**, weil der
+      Kernel „300+ Linux-Syscalls kennen" müsste. Das ist der falsche Entwurf, und er ist nicht
+      der einzige. Der richtige steht seit zwanzig Jahren in seL4: **der Kernel kennt keinen
+      einzigen Linux-Syscall — er leitet sie um.**
 
-      Was **nicht** ausgeschlossen ist: derselbe Quelltext, **neu gelinkt**.
+      **Der Mechanismus.** Eine PD trägt ein Bit „fremde Persönlichkeit" und eine Handler-Cap.
+      Ist es gesetzt, wird *jeder* Syscall aus dieser PD nicht dispatcht, sondern als IPC-Nachricht
+      an den Handler geschickt — Registerinhalt als Nachrichtenwörter. Der Handler ist eine
+      gewöhnliche PD und emuliert dort, was Linux verspricht. Kernelkosten: ein Bit je PD, ein
+      Zweig im Syscall-Einsprung, und der vorhandene IPC-Sendepfad. Das ist keine Schätzung von
+      300 Syscalls, sondern von **einer Verzweigung**.
+
+      **Was darüber hinaus im Kern fehlt — vier begrenzte Operationen:**
+
+      | Fehlt | wofür | warum begrenzt |
+      |---|---|---|
+      | Syscall-/Fault-Umleitung an eine PD | jeder Linux-Syscall, jeder Seitenfehler (COW!) | ein Bit + ein Zweig; heute beendet ein Fault den Thread im Kern |
+      | Thread in eine **bestehende** PD legen | `clone`, pthreads | heute hat eine PD **einen** Thread (0 Treffer für `SPAWN`/`CLONE` in der ABI) |
+      | Mappen/Entmappen in eine **fremde** PD | `mmap`, `mprotect`, `ld.so`, COW | `SYS_MAP` bildet heute nur in die **eigene** VSpace ab |
+      | Thread-Kontext einer fremden PD lesen/schreiben | Signale, `ptrace`, COW-Wiederaufnahme | cap-gated wie `PDCTL` |
+
+      Zusammen grob 500–800 Zeilen, also **5–8 % TCB-Wachstum** (212 KiB → ~225 KiB). Nicht
+      nichts, aber weit entfernt von „ausgeschlossen". Jede dieser vier ist außerdem für sich
+      nützlich — die Fault-Umleitung z. B. wäre der erste Schritt zu einem Pager in Userspace.
+
+- [ ] **Und trotzdem ist es die falsche Wette. Die Begründung ist empirisch, nicht ästhetisch.**
+
+      * **„Beliebig" ist das Problemwort.** Neunzig Prozent der Programme brauchen ~50 Syscalls;
+        die letzten zehn brauchen die anderen 250 **plus** `/proc`, `/sys`, netlink, epoll,
+        io_uring, Namespaces, cgroups — Schnittstellen, die keine Syscalls sind und deren
+        Verhalten nirgends spezifiziert ist außer im Linux-Quelltext.
+      * **gVisor** implementiert rund 260 Syscalls in ~100 000 Zeilen Go und hat weiterhin Lücken;
+        es ist ein Google-Projekt mit einem Jahrzehnt Arbeit.
+      * **WSL1 war genau dieser Entwurf** — eine Linux-Persönlichkeit im NT-Kernel. Microsoft hat
+        ihn **aufgegeben und durch eine VM ersetzt** (WSL2), weil ABI-Treue und
+        Dateisystemleistung nicht einzuholen waren. Das ist das stärkste verfügbare Datum, und es
+        stammt von jemandem mit mehr Mitteln als diesem Projekt.
+      * **Der TCB-Vorteil wird für den Linux-Mandanten selbst zunichte.** Für das System und für
+        andere Mandanten bleibt die TCB klein — für das Linux-Programm besteht sie aus Kern **plus**
+        Persönlichkeitsserver. Wer „kleine TCB" als Produktversprechen führt, muss diesen Satz
+        mitliefern, sonst ist er unehrlich.
+      * **Leistung:** jeder Syscall wird ein IPC-Umlauf. gVisor zahlt dafür 2–10× bei
+        syscall-lastigen Lasten. Der IPC-Fastpath dieses Kerns hilft, hebt es aber nicht auf.
+
+      **Bewertung:** technisch möglich mit begrenztem Kernelwachstum, wirtschaftlich ein
+      mehrjähriger Strang mit einem bekannten schlechten Ausgang. WASM liefert den größten Teil des
+      Kompatibilitätsnutzens zu einem Bruchteil der Kosten und **stützt** die Produktthese, statt
+      sie zu untergraben.
+
+      **Wenn es trotzdem gemacht wird, dann in dieser Reihenfolge:** die vier Kerneloperationen
+      zuerst und einzeln abgenommen (jede ist für sich nützlich), dann eine Persönlichkeit für
+      **statisch gelinkte, einthreadige** Programme, dann `clone`, dann `fork`. Und die erste
+      Messung ist nicht „läuft busybox", sondern: **wie viele verschiedene Syscalls ruft die
+      Zielanwendung wirklich?** `strace -c -f` auf dem Zielprogramm ist eine Stunde Arbeit und
+      entscheidet den ganzen Strang.
+
+      Was **nicht** ausgeschlossen und viel billiger ist: derselbe Quelltext, **neu gelinkt**.
 
 - [ ] **Stufe 1 (klein, und Vorbedingung für alles Weitere): ein Speicher-Server in Userspace.**
       Eine PD hält eine große Memory-Cap und gibt auf Anfrage abgeleitete Caps per IPC-REPLY
@@ -407,10 +456,79 @@ diese Zahl nicht erhöhen.
       sinnvoll, wenn Stufe 1 steht **und** ein Dateisystem-Dienst mit Pfaden existiert (heute:
       FAT16 über eine feste Datei, A-6.3).
 
-- [ ] **Was zuerst gemessen gehört, bevor irgendetwas gebaut wird.** Wie viel Speicher braucht
-      eine `no_std`-WASM-Engine (`wasmi`) im Leerlauf, und wie groß wird eine PD damit? Wenn die
-      Engine 2 MiB braucht und eine PD heute 2 MiB private Region hat, ist die Antwort schon da.
-      Eine Bewertung, die diese Zahl nicht kennt, ist eine Meinung.
+- [x] **Gemessen am 2026-08-09, bevor geplant wurde.** `wasmi 0.31`, `no_std`, `opt-level="z"`,
+      LTO, für `x86_64-unknown-none` gebaut und gelinkt:
+
+      | | |
+      |---|---|
+      | Engine-Code | **`.text` 216 KiB + `.rodata` 17 KiB** |
+      | Heap, triviales Modul (`main() -> i32`) | 5,1 KiB |
+      | Heap, realistisches Rust-Modul (24 KB `.wasm`, Vec + sort) | **1 233 KiB** |
+      | private Region einer isolierten PD (heute) | 2 MiB |
+      | TCB des Kerns | 212 KiB `.text` |
+
+      **Zwei Befunde daraus.** Erstens: die Engine ist **so groß wie der ganze Mikrokern** — aber
+      sie liegt in einer PD, für andere Mandanten wächst die TCB um null. Zweitens: **es passt
+      heute schon**, 233 KiB Code + 1,2 MiB Heap in 2 MiB — mit rund 0,5 MiB Luft. Der Preis der
+      Engine ist ihr **Code**, nicht ihr Speicher; der Speicher gehört dem Gast (Linearspeicher).
+
+      Folge für die Reihenfolge: Stufe 1 (Speicher-Server) ist **nicht** Vorbedingung für den
+      ersten WASM-Schritt — wohl aber für `memory.grow` und für mehr als einen Gast.
+
+### Z15. WASM in einer PD — der Plan (2026-08-09)
+**Klasse:** neues Subsystem · **Aufwand:** gestuft, W1 ist klein · **TCB-Wirkung:** null bis W2
+
+Alle Zahlen aus [Z14](#z14-fremde-software-ohne-gastschicht--bewertet-2026-08-09). Jede Stufe hat
+eine Abnahme, die **fehlschlagen kann**; eine Stufe ohne Gegenprobe gilt nicht als fertig.
+
+- [ ] **W1 — die Engine läuft in einer PD, ohne eine einzige neue Kernelzeile.** Ein neues Programm
+      `programs/userland/wasmhost` linkt `wasmi` gegen `libsel4lake`, nimmt ein `.wasm` aus dem
+      Boot-Archiv (dritter Weg neben ELF und Manifest), instanziiert es und meldet das Ergebnis
+      über seinen Endpoint.
+
+      **Der Heap ist ein Bump-Allokator über die private Region** — das ist genau das Modell, das
+      eine PD heute hat (fester Speicher, kein `brk`), und es ist gemessen ausreichend.
+
+      **Abnahme:** `wasm : ALL PASS` mit dem *gerechneten* Ergebnis des Gastmoduls, nicht mit
+      „lief durch". Dazu zwei Negativfälle, denn sonst belegt die Zeile nur, dass eine Engine
+      startet: ein **mutiertes** Modul (ein Byte im Code-Abschnitt) muss abgewiesen werden, und
+      ein Modul, das über seinen Linearspeicher hinausgreift, muss einen WASM-Trap auslösen —
+      **ohne** dass die PD faultet. Der zweite Fall ist die eigentliche Aussage: die Sandbox hält
+      *innerhalb* der PD, und die PD-Isolation ist die zweite Linie.
+
+- [ ] **W2 — der WASI-Kern, und ein Blocker, der klein ist.** `proc_exit`, `fd_write` (Konsole),
+      `random_get`, `clock_time_get`. Die ersten drei gehen über vorhandene Dienste bzw. Caps.
+
+      **`clock_time_get` hat heute keine Grundlage: es gibt keine Zeit-ABI** (0 Treffer für
+      `CLOCK`/`GETTIME`). Der billigste Weg, der die TCB fast nicht anfasst, ist **kein Syscall**,
+      sondern eine **nur-lesbar in jede PD gemappte Seite mit Tickzähler und Frequenz** — der
+      Kernel schreibt sie ohnehin, der Leser braucht keinen Übergang. Das ist der vDSO-Gedanke,
+      und er kostet ein Mapping plus einen Schreibzugriff im Timer-Pfad.
+
+      **Abnahme:** die Uhr muss *monoton* und *plausibel* sein — zwei Lesungen mit einer
+      bekannten Wartezeit dazwischen, und die Differenz liegt im erwarteten Band. Ein Zähler, der
+      steht, ist von einem, der läuft, sonst nicht zu unterscheiden.
+
+- [ ] **W3 — Speicher-Server (Z14 Stufe 1) → `memory.grow` und mehr als ein Gast.** Erst hier
+      wird die Sache mehrmandantenfähig. Abnahme wie in Z14 beschrieben, plus: zwei WASM-PDs
+      gleichzeitig, und die eine sieht den Linearspeicher der anderen **nicht** (Positivkontrolle
+      über denselben Server, nur eine Adresse wandert — dieselbe Form wie A-5.4).
+
+- [ ] **W4 — Dateien über die fs-PD** (A-6.3): `path_open`, `fd_read`, `fd_seek`, `fd_close`.
+      Die PD fährt kein Gerät, sie ruft den Blockdienst — der Weg steht seit A-6.3. Abnahme: ein
+      Gast liest eine Datei, deren Inhalt ein **unabhängiger** Leser (`tools/checkfat.py`)
+      bestätigt.
+
+- [ ] **W5 — ein Gast je PD, und das bleibt so.** Mehrere Gäste in einer Engine wären billiger und
+      wären die Aufgabe der Isolationsaussage: die Trennung zweier Mandanten läge dann in der
+      Engine statt im Kern. Das ist genau die Schicht, die dieses Projekt nicht haben will.
+      **Gehört als Festlegung in `docs/invariants.md`**, nicht in einen Kommentar.
+
+- [ ] **Was NICHT geplant ist und warum.** Ein JIT (Cranelift): er braucht ausführbaren, zur
+      Laufzeit beschriebenen Speicher — also W^X aufzuweichen oder eine `mprotect`-ähnliche
+      Operation. Beides ist teuer an der Stelle, an der dieses Projekt am wenigsten nachgeben
+      will. Der Interpreter kostet Faktor 5–20 an Rechenzeit; das ist der Preis, und er ist
+      messbar statt behauptet.
 
 ### Z13. Das Blockdienst-Protokoll steht DREIMAL (gemessen 2026-08-07)
 **Klasse:** Drift · **Aufwand:** klein

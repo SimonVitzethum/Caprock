@@ -405,10 +405,14 @@ fi
 # Die Wiederholungsmessung legt bei abweichender SIGNATUR ein Log ab -- aber nur dann. Faellt ein
 # Lauf durch, waehrend die Signatur haelt (oder laeuft die Suite mit RUNS=1), blieb bisher nichts
 # zurueck. Genau so gingen am 2026-08-04 zwei Fehlschlaege verloren.
+# **Der Block prueft `LOG1` und kopierte `LOG`** -- eine Variable, die es in diesem Skript gar
+# nicht gibt. Unter `set -u` bricht er ab („LOG ist nicht gesetzt"), und zwar GENAU im Fehlerfall:
+# der Code, der geschrieben wurde, damit keine Fehlschlagsprotokolle mehr verlorengehen, verlor
+# sie selbst. Gefunden am 2026-08-10, als ein aarch64-Fehlschlag ausgewertet werden sollte.
 if [ "$fail" != 0 ] && [ -s "${LOG1:-}" ]; then
     mkdir -p build/diag
     ZIEL="build/diag/ABWEICHUNG-$(date +%Y%m%d-%H%M%S).log"
-    cp -f "$LOG" "$ZIEL" 2>/dev/null && echo "  (volles Log: $ZIEL)"
+    cp -f "$LOG1" "$ZIEL" 2>/dev/null && echo "  (volles Log: $ZIEL)"
 fi
 echo "== $([ $fail -eq 0 ] && echo 'ALL PASS' || echo 'FAILURES') =="
 exit $fail

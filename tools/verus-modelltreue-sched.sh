@@ -190,7 +190,14 @@ def fehler(*z):
 
 # [1] Modellfeld -> TCB-Feld. `in_ready` ist im Code kein Feld, sondern die Liste selbst
 #     (`queued` + `queues[p]` + `bitmap`); es wird als ENQ/DEQ modelliert.
-FELDPAAR = {'used': 'used', 'blocked': 'blocked', 'depleted': 'depleted',
+# **Z24, 2026-08-10.** `blocked` ist kein Feld mehr -- die drei Bits `blocked`/`budget_blocked`/
+# `parked` sind zur MENGE `reasons` zusammengezogen. Das Modell hat weiterhin EIN `blocked`, und
+# das ist richtig und muss trotzdem hier stehen: die Abbildung ist jetzt
+# `blocked  <->  reasons != {}`, also eine PROJEKTION, keine Gleichsetzung. Was das Modell damit
+# NICHT sagt: welcher Grund vorliegt und dass ein Wecker nur seinen eigenen entfernt. Genau das
+# ist die Eigenschaft, um derentwillen der Umbau stattfand -- sie ist GEMESSEN (Pruefzeile `park`,
+# zwei Gegenproben M1/M2), nicht bewiesen.
+FELDPAAR = {'used': 'used', 'blocked': 'reasons', 'depleted': 'depleted',
             'budget': 'budget', 'remaining': 'remaining', 'prio': 'priority',
             'in_ready': 'queued'}
 
@@ -211,9 +218,10 @@ TCB_AUSSERHALB = {
     # ausschliesslich dort gesetzt und gelesen, wo ein Thread gegen ein FREMDES Konto laeuft, es
     # gehoert also ganz zur Donation, und die ist bereits ausserhalb. Der Preis dafuer steht
     # ebenfalls im Kopf: die Liveness-Aussage des Modells gilt damit fuer eine Welt ohne Spende.
-    'budget_blocked':
-                   'H-b: der GRUND einer Blockade („wartet auf den Refill eines FREMDEN Kontos") '
-                   '-- Teil der Budget-Donation, ADR 0019: ausserhalb',
+    # Z24: `budget_blocked` ist als FELD verschwunden -- es ist jetzt der Grund
+    # `BlockReasons::BUDGET` innerhalb von `reasons`. Der Eintrag bleibt als Ankertext stehen,
+    # damit die Umstellung nachlesbar ist; ein Register, das einen Namen fuehrt, den es nicht mehr
+    # gibt, ist genau der Befund, den dieser Waechter am 2026-08-07 an sich selbst gemeldet hat.
     'cyc':         'Zyklenabrechnung (B-5.1) -- Messung, nicht Einplanung',
     'stamp':       'dito',
     # D0, 2026-08-07. **Nicht** auf `in_ready` abgebildet, und das ist der Punkt: die beiden sind
@@ -246,10 +254,11 @@ TCB_AUSSERHALB = {
     # **Was das Modell damit NICHT sagt** (und was hier stehen muss, damit niemand es hineinliest):
     # dass eine Weckmarke nicht verlorengeht. Diese Eigenschaft ist gemessen (Pruefzeile `park`,
     # zwei Gegenproben), nicht bewiesen.
-    'parked':      'Z22: „blockiert WEIL geparkt". NICHT auf `blocked` abgebildet -- das sagt '
-                   'DASS, dieses sagt WARUM, und die Trennung ist der ganze Zweck (D9). Keine '
-                   'Einplanungsentscheidung: `park_current`/`unpark` laufen ueber '
-                   '`block_current`/`unblock`, die abgebildet sind',
+    # Z24: dito -- `parked` ist `BlockReasons::PARK` in `reasons` und kein eigenes Feld mehr.
+    # **`reasons` selbst ist ABGEBILDET** (auf `blocked`, s. FELDPAAR) und steht deshalb nicht
+    # hier. Was NICHT abgebildet ist, ist seine Struktur: das Modell sieht „blockiert ja/nein",
+    # nicht die Menge. Die Aussage „ein Wecker entfernt nur seinen eigenen Grund" ist damit
+    # ausserhalb des Modells und ausschliesslich gemessen.
     'park_wake':   'Z22: die Weckmarke. Reine Uebergabe zwischen `unpark` und dem naechsten '
                    '`park_current`; das Modell kennt kein Wecken ohne Schlaefer. Dass sie nicht '
                    'verlorengeht, ist GEMESSEN (Pruefzeile `park`), nicht bewiesen',
@@ -259,7 +268,14 @@ TCB_AUSSERHALB = {
 #     `partner`  -- hat einen Uebergang im Modell (s. PAARE).
 #     `ausserhalb` -- schreibt Modellzustand, hat aber KEINEN Uebergang im Modell (Befund B5).
 #     `primitiv` -- die Realisierung von `in_ready` bzw. von `pick` selbst.
-CODE_PARTNER = ['block_current', 'unblock', 'pause', 'on_tick', 'refill_depleted', 'set_budget']
+# Z24, 2026-08-10: der Schreibzugriff sitzt jetzt in `block_current_mit` -- `block_current` ist
+# eine duenne Huelle mit festem Grund (IPC). **Der Waechter hat genau das von selbst gemeldet**
+# („leere Ereignisfolge fuer block_current"), zum zweiten Mal nach der D0-Umstellung, und der
+# Eintrag ist deshalb UMGEZOGEN statt stehengelassen worden.
+# `resume` ist neu und hier drin: es ist der Partner von `pause` und schreibt denselben
+# Modellzustand (`blocked`), nur in die andere Richtung.
+CODE_PARTNER = ['block_current_mit', 'unblock', 'pause', 'resume', 'on_tick', 'refill_depleted',
+                'set_budget']
 CODE_PRIMITIV = {
     'enqueue_ready':    'Realisierung von in_ready := true',
     'remove_from_ready':'Realisierung von in_ready := false',
@@ -267,6 +283,25 @@ CODE_PRIMITIV = {
 }
 CODE_AUSSERHALB = {
     'init_core':            'Idle-Thread beim Hochlauf -- kein Uebergang im Modell',
+    # Z24: `block_current` steht hier NICHT -- es ist eine duenne Huelle um `block_current_mit`
+    # und schreibt selbst nichts. Ein Eintrag „vorsichtshalber" waere genau der veraltete
+    # Registereintrag, den dieser Waechter schon zweimal an sich selbst gemeldet hat (D0:
+    # `spawn`/`spawn_user_at`).
+    #
+    # **Und zwei Funde, die erst der Umbau sichtbar gemacht hat:** `unpark` und
+    # `set_budget_blocked` schrieben schon vorher Zustand -- ueber `parked` bzw. `budget_blocked`.
+    # Beide Felder standen **nicht** in `SCHREIBT`, also hat der Waechter diese Schreibzugriffe
+    # nie gesehen. Er hielt zwei Funktionen fuer stumm, die es nie waren. Seit die Menge EIN Feld
+    # ist, faellt das nicht mehr durch: was `blocked` bedeutet, steht an genau einer Stelle.
+    'unpark':               'Z22/Z24: entfernt den PARK-Grund und reiht bei leerer Menge ein. Das '
+                            'Modell kennt keinen Park-Zustand (s. `park_wake` oben) -- also kein '
+                            'Uebergang, den man nachtragen koennte',
+    'set_budget_blocked':   'H-b/D10/Z24: der EINZIGE Mutator des BUDGET-Grundes, samt Zaehler. '
+                            'Teil der Budget-Donation, ADR 0019: ausserhalb',
+    'wecke_falls_lauffaehig':
+                            'Z24: die EINE Stelle, die wieder einreiht („nur bei leerer '
+                            'Grund-Menge"). Realisierung von `in_ready := true` unter Bedingung -- '
+                            'die Bedingung selbst kennt das Modell nicht, es hat nur EIN `blocked`',
     # D0, 2026-08-07: `spawn`/`spawn_user_at` schreiben selbst nichts mehr -- sie sind duenne
     # Huellen um `*_parked` + `admit`. Der Waechter hat genau das gemeldet („ist als
     # zustandsschreibend benannt, schreibt aber nichts (mehr)"), und die Eintraege sind deshalb
@@ -302,7 +337,8 @@ PAARE = [
         name='block_current',
         modell=[(r'pub open spec fn block_current\(', {}, None),
                 (r'pub open spec fn pick\(', {'n': 'naechster'}, None)],
-        code=[(r'pub fn block_current\(&mut self', {}, None)],
+        # Z24: der Rumpf sitzt in `block_current_mit`; `block_current` ist die IPC-Huelle.
+        code=[(r'pub fn block_current_mit\(&mut self', {}, None)],
         luecke=[
             ' SETZE laeufer.blocked := true',
             '+DEQ laeufer',
@@ -322,10 +358,13 @@ PAARE = [
         code=[(r'pub fn unblock\(&mut self', {}, None)],
         luecke=[
             '-WENN #aufloesbar',
-            '-WENN ziel.blocked',
-            '-WENN ziel.#budget_blocked',
+            '-WENN !ziel.blocked.is_empty()',
             '-WENN konto != ziel && konto.depleted',
             ' SETZE ziel.blocked := false',
+            '-SETZE ziel.blocked := false',
+            '-WENN !ziel.depleted && ziel.blocked.is_empty()',
+            '+WENN !ziel.depleted',
+            ' ENQ ziel'
         ],
         ausserhalb=['ziel.#budget_blocked := true'],
         grund='Vier Zeilen, und sie zerfallen in zwei Paare mit sehr verschiedenem Gewicht. '
@@ -363,13 +402,16 @@ PAARE = [
         code=[(r'pub fn pause\(&mut self', {}, None)],
         luecke=[
             '-WENN #aufloesbar',
-            '-WENN !ziel.blocked',
             ' SETZE ziel.blocked := true',
             ' DEQ ziel',
             '+WENN LAEUFT == ziel',
-            '+LAEUFT := keiner',
+            '+LAEUFT := keiner'
         ],
-        ausserhalb=['ziel.#budget_blocked := false'],
+        # **Z24: dieser Zugriff ist WEGGEFALLEN, nicht umgeschrieben.** Bis dahin loeschte
+        # `pause` den Budget-Grund („PAUSE UEBERNIMMT die Blockade") -- ein fremder Grund musste
+        # weichen, weil ein einziges Bit keine zwei Gruende tragen kann. Mit der Menge kommt
+        # `PAUSE` einfach dazu. Die Zeile hier steht deshalb leer und nicht neu belegt.
+        ausserhalb=[],
         grund='Handle-Aufloesung + Idempotenz auf der Codeseite; auf der Modellseite die '
               'Deplanierung des laufenden Threads (BEFUND B4). Der Code laesst einen pausierten '
               '`current` stehen, bis der naechste Tick ihn nicht wieder einreiht -- in diesem '
@@ -397,14 +439,13 @@ PAARE = [
             '-WENN tick',
             '-WENN #depleted_count > 0',
             '-WENN LAEUFT != keiner',
-            '-MERKER MERKER1 := !laeufer.blocked',
+            '-MERKER MERKER1 := laeufer.blocked.is_empty()',
             '-WENN konto.budget > 0 && tick',
             '-SETZE konto.remaining := konto.remaining - 1',
             '-WENN konto.remaining == 0',
             '-SETZE konto.depleted := true',
             '-MERKER MERKER1 := false',
-            '-WENN !laeufer.blocked && konto != laeufer',
-            '-SETZE laeufer.blocked := true',
+            '-WENN konto != laeufer',
             '-WENN MERKER1',
             '-ENQ laeufer',
             '-DEQ naechster',
@@ -415,7 +456,7 @@ PAARE = [
             '+DEQ laeufer',
             '+LAEUFT := keiner',
             '+SONST',
-            '+SETZE laeufer.remaining := laeufer.remaining - 1',
+            '+SETZE laeufer.remaining := laeufer.remaining - 1'
         ],
         ausserhalb=['#now', 'laeufer.#sp := frame',
                     'konto.#next_refill := #now + konto.#period', '#depleted_count', '#depletions',
@@ -451,14 +492,12 @@ PAARE = [
             ' SETZE ziel.remaining := ziel.budget',
             ' SETZE ziel.depleted := false',
             '-WENN #budget_blocked_count > 0',
-            '-WENN ziel != ziel && ziel.#budget_blocked && ziel.#sc_donor == Some(ziel) && ziel.used',
-            '-SETZE ziel.blocked := false',
-            ' ENQ ziel',
+            '-WENN ziel != ziel && ziel.#sc_donor == Some(ziel) && ziel.blocked.has(BlockReasons::BUDGET) && ziel.used',
             '-WENN donee != ziel',
             '-MERKER MERKER1 := donee',
             '-SONST',
-            '-WENN !ziel.blocked && LAEUFT != ziel',
-            '-ENQ ziel',
+            '-WENN LAEUFT != ziel',
+            '+ENQ ziel'
         ],
         ausserhalb=['#depleted_count', '#refills', 'ziel.#budget_blocked := false'],
         grund='Der Kern deckt sich Zeile fuer Zeile (`remaining := budget`, `depleted := false`, '
@@ -521,12 +560,11 @@ PAARE = [
             ' SETZE ziel.depleted := false',
             '-WENN MERKER1',
             '-WENN #budget_blocked_count > 0',
-            '-WENN ziel != ziel && ziel.#budget_blocked && ziel.#sc_donor == Some(ziel) && ziel.used',
-            '-SETZE ziel.blocked := false',
-            '-ENQ ziel',
-            ' WENN !ziel.blocked && LAEUFT != ziel',
-            ' ENQ ziel',
+            '-WENN ziel != ziel && ziel.#sc_donor == Some(ziel) && ziel.blocked.has(BlockReasons::BUDGET) && ziel.used',
+            '-WENN LAEUFT != ziel',
             '-SONST',
+            '+WENN !ziel.blocked && LAEUFT != ziel',
+            '+ENQ ziel'
         ],
         ausserhalb=['ziel.#period := period.max(1)', 'ziel.#next_refill := #now + period',
                     '#depleted_count', 'ziel.#budget_blocked := false'],
@@ -565,7 +603,7 @@ AUDIT_QUEUE = [
     (5, '((self.bitmap >> p) & 1 == 1) != (q.count > 0)'),
     (1, '#tcbs.get schlaegt fehl'),
     (1, '!t.used'),
-    (2, 't.blocked'),
+    (2, '!t.reasons.is_empty()'),
     (9, 't.depleted'),  # seit 2026-08-03 (D8/B2): die Gegenrichtung zu Code 7
     (6, 't.queued as usize != p || t.priority as usize != p'),
     (3, 't.qprev != prev'),
@@ -575,7 +613,7 @@ AUDIT_QUEUE = [
 ]
 AUDIT_REST = [
     (8, '#dir_load passt nicht'),
-    (7, '!t.blocked && !t.depleted && t.admitted && self.current != Some(local) && t.queued == NOT_QUEUED'),
+    (7, 't.reasons.is_empty() && !t.depleted && t.admitted && self.current != Some(local) && t.queued == NOT_QUEUED'),
     # Seit 2026-08-03 (D10). Code 10 ist die NACHZAEHLUNG von `budget_blocked_count` gegen die
     # Tabelle -- und sie ist der Preis dafuer, dass `refill_depleted`/`set_budget` den teuren
     # Weckelauf jetzt an einem Zaehler aufhaengen. Ohne sie waere der Waechter im Code eine
@@ -780,6 +818,7 @@ CODE_PAT = re.compile(r'''
   | (?P<deq>self\.remove_from_ready\s*\(\s*(?P<dq>\w+)\s*\))
   | (?P<cur_set>self\.current\s*=(?!=)\s*(?P<cv>Some\(\s*\w+\s*\)|None))
   | (?P<tcb_ganz>self\.tcbs\[\s*(?P<tw>\w+)\s*\]\s*=(?!=)\s*(?P<twv>[^;]+))
+  | (?P<rea>self\.tcbs\[\s*(?P<rt>\w+)\s*\]\.reasons\.(?P<rop>insert|remove)\s*\(\s*(?P<rv>[^)]*)\))
   | (?P<setf>self\.tcbs\[\s*(?P<sft>\w+)\s*\]\.(?P<sff>\w+)\s*=(?!=)\s*(?P<sfv>[^;]+))
   | (?P<bbset>self\.set_budget_blocked\s*\(\s*(?P<bbt>\w+)\s*,\s*(?P<bbv>true|false)\s*\))
   | (?P<selfop>self\.(?P<so>\w+)\s*(?:\+=|-=|=(?!=))\s*[^;]+)
@@ -830,6 +869,14 @@ def code_ereignisse(text, rollen, param):
                       else 'LAEUFT := %s' % k.rolle(re.search(r'Some\(\s*(\w+)', v).group(1)))
         elif m.group('tcb_ganz'):
             ev.append('SETZE %s.* := %s' % (k.rolle(m.group('tw')), normausdruck(m.group('twv'), k)))
+        elif m.group('rea'):
+            # **Z24: die Menge auf das EINE Modellfeld projizieren.** Das Modell kennt nur
+            # „blockiert ja/nein"; `insert(grund)` macht die Menge nichtleer, `remove(grund)`
+            # kann sie leeren. Die Projektion ist damit `insert -> := true`, `remove -> := false`
+            # -- und sie ist BEWUSST unscharf: welcher Grund es war, sieht das Modell nicht.
+            # Genau diese Unschaerfe ist der Preis, der oben bei FELDPAAR benannt ist.
+            ev.append('SETZE %s.blocked := %s'
+                      % (k.rolle(m.group('rt')), 'true' if m.group('rop') == 'insert' else 'false'))
         elif m.group('setf'):
             f, ziel = m.group('sff'), '%s.%s' % (k.rolle(m.group('sft')), normfeld(m.group('sff')))
             wert = normausdruck(m.group('sfv'), k)
@@ -983,12 +1030,19 @@ for u in erwartet:
         mangel(2, "Zugeordnet ist `%s`, das Modell hat diesen Uebergang nicht (mehr)." % u)
 
 # Jede Schreibstelle am Modellzustand muss in einer benannten Funktion liegen.
+# **Z24, 2026-08-10:** `blocked` ist kein Feld mehr, sondern die Menge `reasons`. Die
+# Schreibformen sind damit `.reasons.insert(..)`, `.reasons.remove(..)` und `.reasons = ..` --
+# **`insert`/`remove` MUESSEN mit hinein**, sonst saehe der Waechter die Umstellung als „schreibt
+# nichts mehr" und waere ab da blind fuer jede Blockade. Dazu `wecke_falls_lauffaehig`, die
+# einzige bedingte Einreihung.
 SCHREIBT = re.compile(
-    r'self\.tcbs\[\s*\w+\s*\]\.(?:used|blocked|depleted|budget|remaining|priority|queued)\s*=(?!=)'
+    r'self\.tcbs\[\s*\w+\s*\]\.(?:used|reasons|depleted|budget|remaining|priority|queued)\s*=(?!=)'
+    r'|self\.tcbs\[\s*\w+\s*\]\.reasons\.(?:insert|remove)\s*\('
     r'|self\.tcbs\[\s*\w+\s*\]\s*=(?!=)'
-    r'|\btcb\.(?:used|blocked|depleted|budget|remaining|priority|queued)\s*=(?!=)'
+    r'|\btcb\.(?:used|reasons|depleted|budget|remaining|priority|queued)\s*=(?!=)'
     r'|self\.enqueue_ready\s*\('
     r'|self\.remove_from_ready\s*\('
+    r'|self\.wecke_falls_lauffaehig\s*\('
     r'|self\.current\s*=(?!=)')
 benannt = set(CODE_PARTNER) | set(CODE_PRIMITIV) | set(CODE_AUSSERHALB)
 # WICHTIG: Fundstellen und Funktionsgrenzen muessen aus DEMSELBEN Text kommen. Wer die
@@ -1244,15 +1298,17 @@ PY
             self.tcbs[s].budget = budget;""", 1)'
     erwarte kracht "Code: zwei Schreibzugriffe getauscht (budget <-> remaining)"
 
-    mutieren code 's = s.replace("        if !self.tcbs[s].blocked {\n            self.tcbs[s].blocked = true;",
-                                 "        if self.tcbs[s].blocked {\n            self.tcbs[s].blocked = true;", 1)'
-    erwarte kracht "Code: Verzweigung invertiert (pause: !blocked -> blocked)"
+    # Z24: die alte Verzweigung `if !blocked { blocked = true }` gibt es nicht mehr -- `pause`
+    # fuegt einen Grund HINZU. Die Mutation trifft jetzt die Richtung: hinzufuegen statt entfernen.
+    mutieren code 's = s.replace("self.tcbs[s].reasons.insert(BlockReasons::PAUSE);",
+                                 "self.tcbs[s].reasons.remove(BlockReasons::PAUSE);", 1)'
+    erwarte kracht "Code: pause ENTFERNT den Grund, statt ihn hinzuzufuegen (Z24)"
 
     # Muster nachgezogen am 2026-08-03: seit der D8-Behebung steht das Einreihen in `unblock`
     # hinter `if !self.tcbs[s].depleted`. Das ALTE Muster traf danach nichts mehr -- und der
     # Waechter hat das als harten Fehler gemeldet statt als "schweigt". Genau dafuer ist die
     # Regel da.
-    mutieren code 's = s.replace("""            if !self.tcbs[s].depleted {
+    mutieren code 's = s.replace("""            if self.tcbs[s].reasons.is_empty() && !self.tcbs[s].depleted {
                 self.enqueue_ready(s);
             }""", "", 1)'
     erwarte kracht "Code: unblock reiht nicht mehr ein"
@@ -1260,10 +1316,12 @@ PY
     # Und die Gegenrichtung, neu seit der Behebung: faellt der Waechter WEG (also wieder
     # bedingungsloses Einreihen wie vor D8), muss es ebenfalls anschlagen. Ohne diesen Fall
     # koennte die Behebung still zurueckgedreht werden, ohne dass etwas meldet.
-    mutieren code 's = s.replace("""            if !self.tcbs[s].depleted {
+    # Deckt seit Z24 BEIDE Haelften der tragenden Regel ab: faellt die Bedingung, faellt mit dem
+    # D8-Waechter (`!depleted`) auch „nur bei leerer Grund-Menge" -- also genau die Gegenprobe M2.
+    mutieren code 's = s.replace("""            if self.tcbs[s].reasons.is_empty() && !self.tcbs[s].depleted {
                 self.enqueue_ready(s);
             }""", "            self.enqueue_ready(s);", 1)'
-    erwarte kracht "Code: der D8-Waechter in unblock faellt weg (Rueckfall auf bedingungsloses Einreihen)"
+    erwarte kracht "Code: unblock reiht BEDINGUNGSLOS ein (D8-Waechter UND die leere Menge weg -- Z24/M2)"
 
     # -- H-b / D9 (2026-08-03): fuenf Faelle, die es vor H-b nicht geben KONNTE ------------------
     # Sie halten die Behebung fest, ohne die der Waechter sie nur beschreibt. Jeder einzelne dreht
@@ -1278,8 +1336,13 @@ PY
     # Die Gegenrichtung im selben `on_tick`: ohne den `!blocked`-Konjunkt schreibt der Tick eine
     # Blockade aus IPC oder PAUSE still zu einer Budget-Blockade um -- und der naechste Refill hebt
     # sie mit auf. Das ist D9/D1, und es steht als Zeile in der Uebertragungsluecke.
-    mutieren code 's = s.replace("if acct != cur && !self.tcbs[cur].blocked {", "if acct != cur {", 1)'
-    erwarte kracht "Code: on_tick ueberschreibt wieder eine fremde Blockade (!blocked-Konjunkt weg)"
+    # **Z24: dieser Fall ist ERSETZT, weil sein Ziel weggefallen ist.** Der `!blocked`-Konjunkt
+    # war noetig, solange `blocked = true` einen fremden Grund UEBERSCHRIEB; mit `insert` kommt der
+    # Budget-Grund einfach dazu, und „ueberschreiben" ist nicht mehr formulierbar -- ausser man
+    # ersetzt das Hinzufuegen durch eine Zuweisung. Genau das mutiert dieser Fall.
+    mutieren code 's = s.replace("                        self.set_budget_blocked(cur, true);",
+                                 "                        self.tcbs[cur].reasons = BlockReasons::NONE;", 1)'
+    erwarte kracht "Code: on_tick SETZT die Grund-Menge statt zu ergaenzen (Z24)"
 
     # Der Kern von D9: der Refill-Lauf ueber ALLE `sc_donor == slot` faellt auf den einzelnen
     # `sc_donee` zurueck -- also auf die Spitze eines Stapels. Gemessen war das: niemand weckt den
@@ -1297,16 +1360,25 @@ PY
     # PAUSE uebernimmt die Blockade nicht mehr: die Zeile steht VOR `if !blocked` und ist deshalb
     # kein Zweig, sondern ein wegabstrahierter Schreibzugriff -- ohne sie hoebe der Refill eine
     # PAUSE auf, die Erfolg gemeldet hat.
-    mutieren code 's = s.replace("        self.set_budget_blocked(s, false);\n", "", 1)'
-    erwarte kracht "Code: pause uebernimmt die Budget-Blockade nicht mehr (H-b/D9)"
+    # **Z24: dieser Fall ist ZURUECKGEZOGEN, nicht repariert -- und das ist die Aussage.** Er hielt
+    # fest, dass `pause` den Budget-Grund LOESCHT („PAUSE uebernimmt die Blockade"). Genau diese
+    # Zeile ist mit der Grund-Menge weggefallen: `pause` fuegt `PAUSE` hinzu, `BUDGET` bleibt
+    # stehen, der Refill entfernt spaeter `BUDGET`, und `PAUSE` bleibt. Ein Selbsttest fuer ein
+    # Verhalten, das es nicht mehr geben DARF, waere eine Ratsche in die falsche Richtung.
+    # Bewacht wird der Wegfall stattdessen ueber `ausserhalb=[]` im Paar `pause` -- kaeme die Zeile
+    # zurueck, meldete Schicht [3] einen wegabstrahierten Schreibzugriff, den niemand eingetragen
+    # hat.
 
     # Und der Waechter in `unblock`, der eine Budget-Blockade stehen laesst. Faellt er weg, ist D6
     # wieder da: RESUME am Donee -> in die Liste, wird `current`, ein voller Tick auf leerem Konto.
-    mutieren code 's = s.replace("""            if self.tcbs[s].budget_blocked {
-                return true;
-            }
-""", "", 1)'
-    erwarte kracht "Code: unblock hebt eine Budget-Blockade wieder auf (H-b/D9)"
+    # **Z24, 2026-08-10: die Mutation ist ERSETZT, nicht repariert.** Ihr Ziel war der H-b-Waechter
+    # in `unblock` (`if budget_blocked { return true }`) -- den gibt es nicht mehr, weil `unblock`
+    # nur noch den IPC-Grund entfernt und einen fremden Grund gar nicht mehr anfassen KANN. Die
+    # Gefahr, gegen die H-b gebaut war, hat in der neuen Struktur eine andere Gestalt: „entferne
+    # ALLE Gruende statt EINEM". Genau das ist die Gegenprobe M1 aus Z24, hier als Selbsttest.
+    mutieren code 's = s.replace("            self.tcbs[s].reasons.remove(BlockReasons::IPC);",
+                                 "            self.tcbs[s].reasons = BlockReasons::NONE;", 1)'
+    erwarte kracht "Code: unblock entfernt ALLE Gruende statt des IPC-Grundes (Z24/D9)"
 
     mutieren code 's = s.replace("    pub fn set_budget(&mut self", "    pub fn set_budget_v2(&mut self", 1)'
     erwarte kracht "Code: Funktion umbenannt (Waechter liest NICHT ins Leere)"
@@ -1325,7 +1397,7 @@ s = s.replace("""    pub fn load(&self) -> usize {""",
     mutieren code 's = s.replace("    depleted: bool,", "    depleted: bool,\n    neues_feld: u32,", 1)'
     erwarte kracht "Code: neues TCB-Feld, dem Modell unbekannt (Schicht 1)"
 
-    mutieren code 's = s.replace("                if t.blocked {\n                    return 2;",
+    mutieren code 's = s.replace("                if !t.reasons.is_empty() {\n                    return 2;",
                                  "                if t.depleted {\n                    return 2;", 1)'
     erwarte kracht "Code: audit prueft depleted statt blocked (Schicht 4 + Befund-Register)"
 
@@ -1402,7 +1474,7 @@ s = s.replace("""    pub fn load(&self) -> usize {""",
     # von dem niemand je etwas gehoert hat, ist keiner -- genau die Form, die dieses Projekt bei
     # der leeren Ereigniswarteschlange ohne `CD.R` schon einmal bezahlt hat. Die zwei Faelle
     # zeigen, dass er sprechen KANN, und sie halten zugleich fest, WAS er sagt.
-    mutieren code 's = s.replace("            self.remove_from_ready(s); // No-Op, falls er gerade `current` ist",
+    mutieren code 's = s.replace("        self.remove_from_ready(s); // No-Op, falls er gerade `current` oder nicht eingereiht ist",
       "            self.remove_from_ready(s);\n            if self.current == Some(s) {\n                self.current = None;\n            }", 1)'
     erwarte_meldung "BEFUND B4 ist damit veraltet" "Sprechprobe: pause deplaniert -> Register B4 meldet sich veraltet"
 

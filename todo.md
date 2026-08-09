@@ -881,7 +881,80 @@ damit der ehrliche Preis dieser Entscheidung.
       mehr stimmt, macht den Punkt unbehebbar** — dieselbe Form wie der falsche `SYS_MAP`-Grund im
       Identitäts-Wächter.
 
-### Z24. Der Blockadegrund ist eine MENGE, keine Bit-Sammlung — geplant 2026-08-09
+### Z24. Der Blockadegrund ist eine MENGE, keine Bit-Sammlung — **GEBAUT 2026-08-10**
+
+**Stand:** umgesetzt und gemessen. x86 Haupt-Suite `== ALL PASS ==`, Lade-Suite unverändert
+(nur der bekannte `wasm`-Rest), **aarch64 `== ALL PASS ==`**, Host-Tests, alle drei
+Modelltreue-Wächter, Kerngrenze/Zulassung/Identität grün. Zwei Gegenproben, beide isolierend.
+
+- [x] **`BlockReasons` steht, und die tragende Aussage steht in EINER Zeile:** eingereiht wird
+      **nur bei leerer Menge** (`wecke_falls_lauffaehig`). Ohne diesen Halbsatz wäre die Menge
+      bloss eine andere Schreibweise für dieselben Bits.
+      `blocked`/`budget_blocked`/`parked` sind als Felder **verschwunden**; `park_wake` bleibt
+      eigenes Feld — es ist eine Marke, kein Grund.
+
+- [x] **Zwei Gegenproben, jede kippt GENAU EIN Konjunkt.**
+      * **M1** — `unpark` entfernt *alle* Gründe statt `PARK`: `lief-trotz-pause=true`, alle
+        sechs übrigen Aussagen bleiben grün.
+      * **M2** — eingereiht wird *ohne* die leere Menge zu verlangen: dasselbe eine Konjunkt kippt.
+      Beide `park : FAILURES`, danach wieder `== ALL PASS ==`. Damit ist belegt, dass **beide**
+      Hälften der Regel tragen, nicht nur die griffigere.
+
+- [x] **Neu: die Aussage „verlorenes Pausieren" — die es bis dahin nicht gab.** Gemessen an der
+      **Wirkung** (ein Rundenzähler der Park-Sonde), nicht an einem Bit: einfrieren, dann das
+      `UNPARK` eines Geschwisters — der Zähler darf sich **nicht** bewegen. Mit Sprechprobe
+      (`laeuft-nach-thaw`), denn sonst wäre „bewegt sich nicht" von „darf sich nicht bewegen"
+      nicht zu unterscheiden.
+
+- [x] **`H-b` ist WEGGEFALLEN, nicht umgeschrieben.** `pause` löschte bis dahin den Budget-Grund
+      („PAUSE ÜBERNIMMT die Blockade") — es **musste** einen fremden Grund löschen, um den eigenen
+      durchzusetzen, weil ein einziges Bit keine zwei Gründe trägt. Der Preis stand im Kommentar
+      daneben: ein pausierter und wieder fortgesetzter Thread lief auf **leerem Konto** weiter.
+      Mit der Menge verschwindet der Griff ersatzlos. Dieselbe Auflösung wie bei der D9-Aussage.
+
+- [x] **Ein Wecker muss ab jetzt seinen Grund NENNEN — und das hat drei Stellen aufgedeckt:**
+      * `SYS_PDCTL` RESUME/START rief `unblock`, also „hebe irgendeine Blockade auf". Neu:
+        `resume` (entfernt `PAUSE`), durch alle drei Schichten (`SchedOps`, Kernel, microkit).
+      * `thaw_thread` rief `unblock`, obwohl `freeze_thread` über `pause` einfriert — **genau die
+        Naht `thaw × park`, um derentwillen der Umbau geplant wurde.** Sie stand offen im Code.
+      * **Der aarch64-Cross-Core-Test weckte einen GEPARKTEN Thread mit `wake_remote`** (dem
+        Wecker für IPC). Das ging, solange ein Bit beide Gründe trug.
+
+- [x] **Der Fastpath war die vierte Instanz — und er steckte NICHT in `unblock`.** `switch_to`
+      schrieb `blocked = false` am Ziel und liess es **unmittelbar** laufen: ein Thread, der in
+      `RECV` steht und pausiert wurde, lief beim nächsten `send` los, und die Pausen-Entscheidung
+      war still weg. Jetzt ist der Fastpath **bedingt**: die Nachricht ist zugestellt (der
+      IPC-Grund fällt), aber gewechselt wird nur zu einem wirklich lauffähigen Ziel.
+
+- [x] **Gefunden durch MESSUNG, nicht durch Gegenlesen: aarch64 `offen: smp`, 4 von 4 Läufen.**
+      x86 blieb dabei grün — den Pfad gibt es dort nicht. Die Grundlinie (`00c8e73`) wurde
+      nachgemessen und war grün, bevor die Ursache gesucht wurde; „vermutlich vorbestehend" wäre
+      hier falsch gewesen. Dieselbe Lehre wie beim Audit-Code 7 nach dem D0-Umbau: **ein Umbau,
+      der einen neuen Zustand einführt, muss jede Stelle mitnehmen, die über Zustände URTEILT —
+      und gefunden wird das unter Last auf der Architektur, wo der Zustand oft vorkommt.**
+
+- [x] **Der Modelltreue-Wächter hat den Umbau von selbst beanstandet** — und dabei **zwei
+      Funktionen aufgedeckt, die er nie gesehen hatte**: `unpark` und `set_budget_blocked`
+      schrieben Zustand über `parked` bzw. `budget_blocked`, und **beide Felder standen nicht in
+      seinem Schreibmuster**. Er hielt zwei Funktionen für stumm, die es nie waren. Seit die Menge
+      EIN Feld ist, fällt das nicht mehr durch.
+      Die Abbildung ist jetzt eine **Projektion** (`blocked <-> reasons != {}`), keine
+      Gleichsetzung; was das Modell damit *nicht* sagt, steht dort ausdrücklich.
+      Fünf Selbsttest-Mutationen zielten auf Konstrukte, die der Umbau beseitigt hat — vier sind
+      **umgeschrieben** (die Gefahr hat eine neue Gestalt), eine ist **zurückgezogen** mit Grund:
+      ein Selbsttest für ein Verhalten, das es nicht mehr geben darf, wäre eine Ratsche in die
+      falsche Richtung.
+
+- [x] **Nebenbefund, vorgefunden:** `test-qemu.sh` prüfte `$LOG1` und kopierte `$LOG` — eine
+      Variable, die es dort nicht gibt. Unter `set -u` brach der Block ab, und zwar **genau im
+      Fehlerfall**: der Code, der geschrieben wurde, damit keine Fehlschlagsprotokolle mehr
+      verlorengehen, verlor sie selbst.
+
+---
+
+**Die ursprüngliche Planung, zum Nachlesen:**
+
+### Z24 (Plan vom 2026-08-09)
 **Klasse:** Struktur · **Ersetzt** den ursprünglich als „Spurious-Wake-Vertrag" geplanten Schritt;
 der Vertrag bleibt, aber als Beigabe, nicht als Kern.
 

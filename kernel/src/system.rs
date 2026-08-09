@@ -515,6 +515,14 @@ impl SchedOps for KernelSched {
             kick(c);
         }
     }
+    fn resume(&mut self, tid: ThreadId) {
+        // Z24: `RESUME` hebt **die Pause** auf, nicht „die Blockade". Vorher lief das ueber
+        // `unblock`, das seit dem Umbau den IPC-Grund entfernt -- ein Wecker ohne Namen weckt
+        // sonst eine fremde Entscheidung mit weg.
+        if let Some((_, c)) = with_owner(tid, |s, _| s.resume(tid).then_some(())) {
+            kick(c);
+        }
+    }
     fn stop(&mut self, tid: ThreadId) -> bool {
         // STOP = vollständiger Teardown: cross-core kill + (falls isoliert) VSpace/ASID
         // freigeben, damit ein gestopptes Backend/UserLand keine Ressourcen leakt.
@@ -7524,8 +7532,15 @@ pub fn freeze_thread(tid: ThreadId) -> Freeze {
 }
 
 /// Einen eingefrorenen Thread wieder laufen lassen.
+///
+/// **`resume`, nicht `unblock`** (Z24) — und das ist genau die Naht, für die der Umbau gebaut
+/// wurde. `freeze_thread` friert über `pause` ein, hebt also `PAUSE` auf; `unblock` hob früher
+/// „die Blockade" auf, gleich welche. Damit riss es einem Thread, der zugleich in IPC wartete oder
+/// geparkt war, einen **fremden** Grund weg — und umgekehrt weckte ein `unpark` des Nachbarn eine
+/// Einfrier-Entscheidung mit auf. Seit der Grund-Menge ist das nicht mehr formulierbar: `thaw`
+/// entfernt `PAUSE`, und wer noch aus einem anderen Grund liegt, bleibt liegen.
 pub fn thaw_thread(tid: ThreadId) -> bool {
-    with_owner(tid, |s, _| s.unblock(tid).then_some(())).is_some()
+    with_owner(tid, |s, _| s.resume(tid).then_some(())).is_some()
 }
 
 /// **Einen geparkten Thread vom Kernel aus wecken** (Z22, P4) — dieselbe Operation wie

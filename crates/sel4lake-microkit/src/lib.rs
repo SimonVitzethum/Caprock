@@ -1100,9 +1100,12 @@ pub fn dispatch(
                     ops.pause(t);
                     true
                 }
-                // START und RESUME: einen (initial) blockierten Ziel-Thread wecken.
+                // START und RESUME heben die **Pause** auf -- Z24. Vorher stand hier `unblock`,
+                // also „hebe irgendeine Blockade auf": ein Ziel, das gerade in IPC wartete, lief
+                // damit los, obwohl niemand es geweckt hatte. Seit dem Umbau nennt jeder Wecker
+                // seinen Grund, und der Grund von PDCTL ist PAUSE.
                 (pdctl::RESUME, Some(t)) | (pdctl::START, Some(t)) => {
-                    ops.unblock(t);
+                    ops.resume(t);
                     true
                 }
                 (pdctl::STOP, Some(t)) => ops.stop(t),

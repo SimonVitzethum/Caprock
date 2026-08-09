@@ -242,11 +242,21 @@ extern "C" fn ring3_park_probe(_arg: usize) -> ! {
         PARK_PROBE_BITS.fetch_or(4, Ordering::Release);
     }
 
+    // 4. Danach: eine Runde je Aufwachen zaehlen. **Der Zaehler ist die Messgroesse fuer
+    //    „verlorenes Pausieren"** -- ob ein Thread laeuft, ist an keinem Bit ablesbar, an einem
+    //    Fortschritt schon. Dieselbe Unterscheidung wie bei der FP-Sonde: Ergebnis gegen Wirkung.
     loop {
+        PARK_PROBE_RUNDEN.fetch_add(1, Ordering::Release);
         // SAFETY: dito.
         unsafe { ring3_syscall1(sel4lake_abi::sys::PARK, 0) };
     }
 }
+
+/// Runden der Park-Sonde in ihrer Schlussschleife (Z24). Liegt in `.user_data`, damit Ring 3 sie
+/// ohne Cap hochzaehlen kann.
+#[cfg(feature = "selftest")]
+#[link_section = ".user_data"]
+static PARK_PROBE_RUNDEN: AtomicU64 = AtomicU64::new(0);
 
 // ================================================================================================
 // LAZY-FP AUF X86 — die Pruefzeile, die es bisher nur auf aarch64 gab (Z18, 2026-08-09)
@@ -905,11 +915,71 @@ fn park_messen_inner() -> bool {
         warten();
     }
 
-    let ok = marke_wirkt && blockiert && geweckt_ok && lief_weiter && fremd_abgewiesen && ipc_bleibt;
+    // 6. **VERLORENES PAUSIEREN** (Z24) -- die Aussage, die es bis zum 2026-08-10 nicht gab.
+    //
+    // Das ist NICHT dasselbe wie ein spurious wake, und keine `while`-Schleife auf der Warteseite
+    // deckt es: hier geht eine **Autoritaetsentscheidung** verloren. Ein Debugger (oder der
+    // Gruppenschnitt aus Z23) friert einen Thread ein, ein Geschwister ruft `UNPARK` -- und der
+    // eingefrorene laeuft. Vorher war das formulierbar, weil `unpark` ueber `unblock` ging und
+    // `blocked` EIN Bit war; seit der Grund-Menge entfernt jeder Wecker nur SEINEN Grund.
+    //
+    // Gemessen wird die **Wirkung**, nicht ein Bit: ein Rundenzaehler, den die Sonde in ihrer
+    // Schlussschleife hochzaehlt. Ob ein Thread laeuft, ist an keinem Zustandsbit ablesbar, an
+    // einem Fortschritt schon -- dieselbe Unterscheidung wie bei der FP-Sonde.
+    let mut in_schlussschleife = false;
+    for _ in 0..64 {
+        if system::is_parked(tid) && PARK_PROBE_RUNDEN.load(Ordering::Acquire) > 0 {
+            in_schlussschleife = true;
+            break;
+        }
+        warten();
+    }
+    // Einfrieren geht ueber genau den Pfad, um den es geht: `freeze_thread` pausiert.
+    let eingefroren = matches!(system::freeze_thread(tid), system::Freeze::Frozen);
+    let runden_vor = PARK_PROBE_RUNDEN.load(Ordering::Acquire);
+    // Jetzt das Geschwister-`UNPARK`. Es nimmt den PARK-Grund -- und **nur** den.
+    let _ = system::unpark_thread(tid);
+    let mut lief_trotz_pause = false;
+    for _ in 0..64 {
+        warten();
+        if PARK_PROBE_RUNDEN.load(Ordering::Acquire) != runden_vor {
+            lief_trotz_pause = true;
+            break;
+        }
+    }
+    let pause_haelt = in_schlussschleife && eingefroren && !lief_trotz_pause;
+    // **Sprechprobe**: der Thread muss danach WIRKLICH wieder laufen. Ohne sie bestuende
+    // `pause_haelt` auch ein Kernel, in dem die Sonde schlicht tot ist -- „bewegt sich nicht" ist
+    // von „darf sich nicht bewegen" sonst nicht zu unterscheiden.
+    let aufgetaut = system::thaw_thread(tid);
+    let mut laeuft_nach_thaw = false;
+    for _ in 0..256 {
+        if PARK_PROBE_RUNDEN.load(Ordering::Acquire) != runden_vor {
+            laeuft_nach_thaw = true;
+            break;
+        }
+        warten();
+    }
+
+    let ok = marke_wirkt
+        && blockiert
+        && geweckt_ok
+        && lief_weiter
+        && fremd_abgewiesen
+        && ipc_bleibt
+        && pause_haelt
+        && aufgetaut
+        && laeuft_nach_thaw;
     println!(
         "park    : marke-wirkt={marke_wirkt} zweites-blockiert={blockiert} \
          geweckt={geweckt_ok} lief-weiter={lief_weiter} fremd-abgewiesen={fremd_abgewiesen} \
-         ipc-bleibt-liegen={ipc_bleibt} bits={b:#06b} : {}",
+         ipc-bleibt-liegen={ipc_bleibt} bits={b:#06b}"
+    );
+    println!(
+        "park    : Z24 verlorenes-Pausieren: in-schlussschleife={in_schlussschleife} \
+         eingefroren={eingefroren} lief-trotz-pause={lief_trotz_pause} (muss false sein) \
+         aufgetaut={aufgetaut} laeuft-nach-thaw={laeuft_nach_thaw} (Sprechprobe: sonst waere \
+         „bewegt sich nicht\" von „darf sich nicht bewegen\" nicht zu unterscheiden) : {}",
         if ok { "ALL PASS" } else { "FAILURES" }
     );
     ok

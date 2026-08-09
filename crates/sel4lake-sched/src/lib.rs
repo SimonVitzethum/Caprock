@@ -195,6 +195,71 @@ impl ThreadId {
 // TCB
 // ---------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------
+// Der Blockadegrund ist eine MENGE (Z24)
+// ---------------------------------------------------------------------------------------
+
+/// **Warum ein Thread nicht laufen darf — als MENGE, nicht als Sammlung einzelner Bits.**
+///
+/// Lauffähig ist ein Thread **genau dann, wenn die Menge leer ist**. Ein Grund wird **einzeln**
+/// entfernt, und eingereiht wird **nur bei leerer Menge**; ohne diesen zweiten Halbsatz wäre die
+/// Menge bloss eine andere Schreibweise für dieselben Bits.
+///
+/// ## Warum das kein weiterer Wächter ist, sondern ein Umbau
+///
+/// Es war die **dritte** Instanz derselben Klasse: D9 spaltete `budget_blocked` von `blocked` ab,
+/// Z22 P4 legte `parked` daneben, und die Naht `thaw × park` riss erneut. Jede Abspaltung
+/// repariert die letzte Kollision und **stellt die nächste auf** — jede Stelle, die über „läuft
+/// er?" urteilt, muss ab da *alle* Bits kennen, und die eine, die eines vergisst, ist ein neuer
+/// stiller Pfad.
+///
+/// Mit der Menge ist der gefundene Fehler nicht behoben, sondern **unformulierbar**: `thaw`
+/// entfernt `PAUSE`; ist `PARK` gesetzt, ist die Menge nicht leer, und der geparkte Thread läuft
+/// nicht los.
+///
+/// ## Was NICHT hineingehört
+///
+/// [`Tcb::park_wake`] bleibt ein eigenes Feld. Es ist eine **Marke** („jemand hat geweckt, bevor
+/// du schliefst"), kein Blockadegrund — es in die Menge zu ziehen wäre dieselbe Verwechslung noch
+/// einmal, nur mit einem hübscheren Typ.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct BlockReasons(u8);
+
+impl BlockReasons {
+    /// Wartet auf ein IPC-Rendezvous. Wecker: `unblock` (aus `send`/`reply`).
+    pub const IPC: u8 = 1 << 0;
+    /// Das belastete Konto ist leer. Wecker: `refill_depleted` — und **nur** der.
+    pub const BUDGET: u8 = 1 << 1;
+    /// Eine **Autoritätsentscheidung** (`SYS_PDCTL` PAUSE, später der Gruppenschnitt aus Z23).
+    /// Wecker: `resume`/`thaw`.
+    pub const PAUSE: u8 = 1 << 2;
+    /// Der Thread hat `SYS_PARK` gerufen. Wecker: `unpark` — und **nur** der.
+    pub const PARK: u8 = 1 << 3;
+
+    /// Leere Menge = lauffähig.
+    pub const NONE: Self = Self(0);
+    /// Darf dieser Thread laufen?
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+    /// Ist dieser Grund gesetzt?
+    pub fn has(self, grund: u8) -> bool {
+        self.0 & grund != 0
+    }
+    /// Grund hinzufügen (idempotent).
+    pub fn insert(&mut self, grund: u8) {
+        self.0 |= grund;
+    }
+    /// **Einen** Grund entfernen — nie „alle".
+    pub fn remove(&mut self, grund: u8) {
+        self.0 &= !grund;
+    }
+    /// Rohbits, nur für Bericht und Modelltreue-Wächter.
+    pub fn bits(self) -> u8 {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Tcb {
     used: bool,
@@ -206,8 +271,9 @@ struct Tcb {
     sp: usize,
     /// Priorität (0..NPRIO-1).
     priority: u8,
-    /// True, wenn der Thread blockiert ist (nicht in der Ready-Queue).
-    blocked: bool,
+    /// **Warum** der Thread nicht laufen darf (Z24). Leer = lauffähig. Ersetzt die drei früheren
+    /// Bits `blocked`/`budget_blocked`/`parked`, die einander verdeckten.
+    reasons: BlockReasons,
     /// Stack-Region des Threads (für die Rückgewinnung beim Beenden).
     stack_base: usize,
     stack_len: usize,
@@ -232,14 +298,6 @@ struct Tcb {
     /// True, wenn das Budget erschöpft ist (Thread weder laufend noch in Ready-Queue,
     /// wartet auf Refill).
     depleted: bool,
-    /// H-b: blockiert, WEIL das belastete Konto leer ist -- im Unterschied zu einer Blockade
-    /// aus IPC oder PAUSE. `blocked` allein kann das nicht sagen, und genau daran haengt der
-    /// Donee-Zweig: er hebt eine Blockade auf, deren Grund er nicht kennt.
-    budget_blocked: bool,
-    /// Blockiert, WEIL der Thread `SYS_PARK` gerufen hat -- **genau ein** Grund, aus demselben
-    /// Motiv wie `budget_blocked` und `admitted` (D9): `unpark` darf einen Thread, der in IPC
-    /// wartet, nicht wecken. Ohne dieses Bit waere `unpark` ein `unblock` mit unbekanntem Grund.
-    parked: bool,
     /// **Weckmarke**: jemand hat `unpark` gerufen. Ohne sie gaebe es ein verlorenes Wecken --
     /// wer die Bedingung prueft (falsch), dann geweckt wird, dann parkt, schliefe fuer immer.
     /// Genau die Stelle, an der ein Futex seinen Vergleichswert braucht; hier reicht eine Marke,
@@ -272,7 +330,7 @@ impl Tcb {
         gen: 0,
         sp: 0,
         priority: 0,
-        blocked: false,
+        reasons: BlockReasons::NONE,
         stack_base: 0,
         stack_len: 0,
         queued: NOT_QUEUED,
@@ -287,8 +345,6 @@ impl Tcb {
         remaining: 0,
         next_refill: 0,
         depleted: false,
-        budget_blocked: false,
-        parked: false,
         park_wake: false,
         sc_donor: None,
         sc_donee: None,
@@ -736,11 +792,21 @@ impl Scheduler {
     }
 
     /// Den laufenden Thread blockieren und zum nächsten *bereiten* Thread wechseln.
+    ///
+    /// **Der Grund kommt vom Aufrufer** (Z24). Dieser Weg wird von IPC *und* von
+    /// [`park_current`](Self::park_current) benutzt; ein fest verdrahteter Grund hier wäre genau
+    /// die Mehrdeutigkeit, die der Umbau beseitigt. `block_current` bleibt als **IPC-Fassung**,
+    /// weil das der überwiegende Aufrufer ist und ein Argument an 40 Stellen nichts erklärt.
     pub fn block_current(&mut self, core: usize, frame: usize) -> usize {
+        self.block_current_mit(core, frame, BlockReasons::IPC)
+    }
+
+    /// Wie [`block_current`](Self::block_current), aber mit **benanntem** Grund.
+    pub fn block_current_mit(&mut self, core: usize, frame: usize, grund: u8) -> usize {
         debug_assert_eq!(core, self.core);
         let cur = self.current.expect("kein laufender Thread");
         self.tcbs[cur].sp = frame;
-        self.tcbs[cur].blocked = true;
+        self.tcbs[cur].reasons.insert(grund);
         let next = self
             .dequeue_highest()
             .expect("Idle-Thread sollte immer bereit sein");
@@ -754,9 +820,29 @@ impl Scheduler {
         debug_assert_eq!(core, self.core);
         let cur = self.current.expect("kein laufender Thread");
         self.tcbs[cur].sp = frame;
-        self.tcbs[cur].blocked = true;
+        self.tcbs[cur].reasons.insert(BlockReasons::IPC);
         let t = self.resolve(target).expect("Zielthread ungültig/fremder Kern");
-        self.tcbs[t].blocked = false;
+        // **EINEN Grund entfernen, nicht alle** (Z24). Das Ziel wartete auf das Rendezvous; war es
+        // zusätzlich pausiert oder erschöpft, bleibt es das -- vorher hätte `blocked = false`
+        // beides mit weggewischt.
+        self.tcbs[t].reasons.remove(BlockReasons::IPC);
+        // **Und hier ist der Fastpath BEDINGT** (Z24). `switch_to` laesst das Ziel *unmittelbar*
+        // laufen -- das darf nur, wer wirklich lauffaehig ist. Vorher stand hier
+        // `blocked = false`, also „laufe, gleich was sonst gegen dich vorliegt": ein Thread, der
+        // in `RECV` steht und **pausiert** wurde, lief beim naechsten `send` los, und die
+        // Pausen-Entscheidung war still verloren. Genau die vierte Instanz, gegen die dieser
+        // Umbau gebaut ist -- sie steckte im Fastpath, nicht in `unblock`.
+        //
+        // Ist noch ein Grund offen, ist die **Nachricht trotzdem zugestellt** (der IPC-Grund ist
+        // weg); nur der Wechsel entfaellt, und der Aufrufer gibt an den naechsten *bereiten*
+        // Thread ab. Der Empfaenger laeuft, sobald sein letzter Grund faellt.
+        if !self.tcbs[t].reasons.is_empty() {
+            let next = self
+                .dequeue_highest()
+                .expect("Idle-Thread sollte immer bereit sein");
+            self.current = Some(next);
+            return self.tcbs[next].sp;
+        }
         self.remove_from_ready(t); // war er bereits bereit, jetzt läuft er -> ausklinken
         // Budget-Donation: der Aufrufer (`cur`) leiht dem Server (`t`) seinen
         // Scheduling-Context. Belastet wird das **Wurzel-Konto** des Aufrufers (folgt
@@ -766,6 +852,24 @@ impl Scheduler {
         self.tcbs[account].sc_donee = Some(t);
         self.current = Some(t);
         self.tcbs[t].sp
+    }
+
+    /// **Der einzige Weg zurueck in die Ready-Queue** (Z24).
+    ///
+    /// Eingereiht wird **nur bei leerer Grund-Menge**. Das ist die Aussage, die den ganzen Umbau
+    /// traegt: ohne sie waere die Menge bloss eine andere Schreibweise fuer dieselben Bits, und
+    /// jeder Wecker koennte weiterhin eine fremde Entscheidung mit aufheben.
+    ///
+    /// `depleted` steht daneben und nicht darin: es ist eine Eigenschaft des **Kontos**, kein
+    /// Grund des Threads -- ein Thread kann auf einem erschoepften Konto sitzen, ohne dass ihm
+    /// selbst etwas vorliegt. Sein Wecker ist `refill_depleted`.
+    fn wecke_falls_lauffaehig(&mut self, local: usize) {
+        if self.tcbs[local].reasons.is_empty()
+            && !self.tcbs[local].depleted
+            && self.current != Some(local)
+        {
+            self.enqueue_ready(local);
+        }
     }
 
     /// Einen blockierten Thread **dieses Kerns** wieder bereit machen. Kern-übergreifend
@@ -780,37 +884,35 @@ impl Scheduler {
         let Some(s) = self.resolve(tid) else {
             return false;
         };
-        if self.tcbs[s].blocked {
-            // H-b: WARUM ist er blockiert? Eine Blockade auf ein leeres Konto hebt nur der
-            // Refill auf. Der Waechter ist hier -- anders als G-a -- gefahrlos, weil der Wecker
-            // BENANNT ist: `refill_depleted` weckt genau `budget_blocked`.
-            if self.tcbs[s].budget_blocked {
-                return true;
-            }
+        if !self.tcbs[s].reasons.is_empty() {
+            // **Der IPC-Grund faellt, und NUR er** (Z24). Die alte Fassung schrieb
+            // `blocked = false` und musste deshalb vorher von Hand pruefen, ob nicht ein anderer
+            // Grund dahintersteckt (H-b). Diese Handpruefung entfaellt: was `unblock` nicht
+            // entfernt, bleibt stehen.
             let acct = self.tcbs[s].sc_donor.unwrap_or(s);
             if acct != s && self.tcbs[acct].depleted {
-                // Zurueck in den Lauf ja -- aber nicht auf ein leeres Konto. Die Blockade
-                // wechselt den GRUND, und der neue Grund hat einen Wecker.
+                // Zurueck in den Lauf ja -- aber nicht auf ein leeres Konto. Der IPC-Grund faellt,
+                // dafuer kommt der Budget-Grund, und **der hat einen Wecker** (`refill_depleted`).
                 // D10: **Erhöhung 2 von 2** von `budget_blocked_count`.
+                self.tcbs[s].reasons.remove(BlockReasons::IPC);
                 self.set_budget_blocked(s, true);
                 return true;
             }
-            self.tcbs[s].blocked = false;
-            // **Erschöpft heisst: nicht einplanen** (D8, gemessen 2026-08-03). Bis hierher
+            self.tcbs[s].reasons.remove(BlockReasons::IPC);
+            // **Erschöpft heisst: nicht einplanen** (D8, gemessen 2026-08-03). Bis dahin
             // reihte `unblock` bedingungslos ein, und ein erschöpfter Thread lief danach eine
             // volle Zeitscheibe auf leerem Konto -- mit einer bereitstehenden Alternative
             // daneben und `audit() == 0`. Erreichbar OHNE Cap: `switch_to` spendet beim
             // IPC-CALL das Konto des Aufrufers, `on_tick` belastet es und setzt `depleted` am
             // **blockierten** Aufrufer, `reply` ruft `unblock(caller)`.
             //
-            // Der Wächter gehört INNERHALB des Rumpfes. Die naheliegende Fassung
-            // `if blocked && !depleted { .. }` ist gemessen SCHÄDLICH: sie überspringt auch
-            // `blocked = false`, das RESUME wird verschluckt, und zusammen mit dem Wächter in
-            // `refill_depleted` verhungert der Thread vollständig (0 Ticks mit Budget).
-            //
-            // Wer ihn danach einreiht, ist `refill_depleted` -- gemessen (2 Refills, 6 Ticks
-            // mit echtem Budget, am Ende nicht blockiert).
-            if !self.tcbs[s].depleted {
+            // **Und hier steht die Aussage, die den ganzen Umbau traegt** (Z24): eingereiht wird
+            // nur bei **leerer Menge**. Ohne diesen Halbsatz waere die Menge bloss eine andere
+            // Schreibweise fuer dieselben Bits -- ein pausierter oder geparkter Thread liefe beim
+            // naechsten `reply` seines Partners los, und die fremde Entscheidung waere still weg.
+            // `depleted` bleibt zusaetzlich stehen: es ist eine Konto-Eigenschaft, kein Grund,
+            // und sein Wecker ist `refill_depleted`.
+            if self.tcbs[s].reasons.is_empty() && !self.tcbs[s].depleted {
                 self.enqueue_ready(s);
             }
         }
@@ -842,8 +944,7 @@ impl Scheduler {
             self.tcbs[cur].park_wake = false;
             return None;
         }
-        self.tcbs[cur].parked = true;
-        Some(self.block_current(core, frame))
+        Some(self.block_current_mit(core, frame, BlockReasons::PARK))
     }
 
     /// **Einen geparkten Thread wecken — und die Marke IMMER hinterlegen** (Z22, P4).
@@ -862,14 +963,17 @@ impl Scheduler {
             return false;
         };
         self.tcbs[s].park_wake = true;
-        if self.tcbs[s].parked {
-            self.tcbs[s].parked = false;
+        if self.tcbs[s].reasons.has(BlockReasons::PARK) {
             // Die Marke ist gesetzt UND er schlief -> sie hat ihre Wirkung hier getan und wird
             // sofort verbraucht. Bliebe sie stehen, liefe sein naechstes `park` grundlos durch.
             self.tcbs[s].park_wake = false;
-            // Bewusst ueber `unblock` und nicht mit `blocked = false` von Hand: dort haengen die
-            // Waechter fuer `depleted` und `budget_blocked` (D8/D10), und die gelten hier genauso.
-            self.unblock(tid);
+            // **Genau EIN Grund faellt** (Z24). Die alte Fassung setzte `parked = false` und rief
+            // dann `unblock`, das `blocked = false` schrieb -- also zwei Schreibvorgaenge fuer
+            // eine Aussage, und der zweite konnte einen fremden Grund mitnehmen. Jetzt ist es
+            // eine Zeile, und die D9-Aussage („`unpark` weckt keinen IPC-Wartenden") ist keine
+            // eigene Regel mehr, sondern folgt daraus, dass PARK nicht IPC ist.
+            self.tcbs[s].reasons.remove(BlockReasons::PARK);
+            self.wecke_falls_lauffaehig(s);
         }
         true
     }
@@ -877,7 +981,8 @@ impl Scheduler {
     /// Schläft dieser Thread **wegen `park`**? (Nur Telemetrie/Prüfung — der `park`-Nachweis in
     /// der Suite braucht die Unterscheidung zu einer IPC-Blockade.)
     pub fn is_parked(&self, tid: ThreadId) -> bool {
-        self.resolve(tid).is_some_and(|s| self.tcbs[s].parked)
+        self.resolve(tid)
+            .is_some_and(|s| self.tcbs[s].reasons.has(BlockReasons::PARK))
     }
 
     /// Liegt für diesen Thread eine unverbrauchte Weckmarke vor? (Nur Telemetrie/Prüfung.)
@@ -892,7 +997,8 @@ impl Scheduler {
     /// falsch, vorher wie nachher). Die erste Fassung des Prüfers las genau dort nach und hätte
     /// den Fehler nie gesehen.
     pub fn is_blocked(&self, tid: ThreadId) -> bool {
-        self.resolve(tid).is_some_and(|s| self.tcbs[s].blocked)
+        self.resolve(tid)
+            .is_some_and(|s| !self.tcbs[s].reasons.is_empty())
     }
 
     /// Einen **bestimmten** Thread dieses Kerns extern pausieren (`SYS_PDCTL` PAUSE).
@@ -901,15 +1007,34 @@ impl Scheduler {
         let Some(s) = self.resolve(tid) else {
             return false;
         };
-        // H-b: PAUSE UEBERNIMMT die Blockade. Ohne diese Zeile ist sie ein No-Op an einem
-        // Thread, der schon auf sein Konto-Budget geblockt ist (er ist ja `blocked`) -- und der
-        // Refill hebt sie dann mit auf, obwohl PAUSE Erfolg gemeldet hat.
-        // D10: **Senkung 1 von 4** von `budget_blocked_count`.
-        self.set_budget_blocked(s, false);
-        if !self.tcbs[s].blocked {
-            self.tcbs[s].blocked = true;
-            self.remove_from_ready(s); // No-Op, falls er gerade `current` ist
-        }
+        // **H-b ist WEGGEFALLEN, nicht umgeschrieben** (Z24). Bis dahin stand hier
+        // `set_budget_blocked(s, false)` mit der Begruendung „PAUSE UEBERNIMMT die Blockade" --
+        // `pause` musste einen **fremden** Grund LOESCHEN, um den eigenen durchzusetzen, weil es
+        // mit einem einzigen Bit keine andere Moeglichkeit gab. Der Preis stand im Kommentar
+        // daneben: ein pausierter und wieder fortgesetzter Thread lief auf einem LEEREN Konto
+        // weiter, weil sein Budget-Grund vergessen war.
+        //
+        // Mit der Menge verschwindet der Griff ersatzlos: `PAUSE` kommt dazu, `BUDGET` bleibt
+        // stehen, `refill_depleted` entfernt spaeter `BUDGET`, und `PAUSE` bleibt.
+        self.tcbs[s].reasons.insert(BlockReasons::PAUSE);
+        self.remove_from_ready(s); // No-Op, falls er gerade `current` oder nicht eingereiht ist
+        true
+    }
+
+    /// **Eine Pause aufheben** (`SYS_PDCTL` RESUME/START) — Z24.
+    ///
+    /// Entfernt `PAUSE` und **nur** das. Ein Thread, der zusaetzlich in IPC wartet oder auf einem
+    /// leeren Konto sitzt, bleibt liegen: sein Wecker ist ein anderer, und ihn hier mitzuwecken
+    /// waere genau der D9-Fehler von der anderen Seite.
+    ///
+    /// Rückgabe wie [`unblock`](Self::unblock): konnte der Thread auf **diesem** Kern aufgelöst
+    /// werden?
+    pub fn resume(&mut self, tid: ThreadId) -> bool {
+        let Some(s) = self.resolve(tid) else {
+            return false;
+        };
+        self.tcbs[s].reasons.remove(BlockReasons::PAUSE);
+        self.wecke_falls_lauffaehig(s);
         true
     }
 
@@ -981,7 +1106,7 @@ impl Scheduler {
         // der Aufruf ist oben schon an `sc_donor.is_some()` gescheitert. Die Zeile steht
         // trotzdem hier: die Richtigkeit des Zaehlers soll nicht davon abhaengen, dass diese
         // Herleitung jede kuenftige Aenderung ueberlebt.
-        if self.tcbs[s].budget_blocked {
+        if self.tcbs[s].reasons.has(BlockReasons::BUDGET) {
             self.budget_blocked_count -= 1;
         }
         self.tcbs[s] = Tcb::EMPTY;
@@ -1009,7 +1134,7 @@ impl Scheduler {
         // D10: Gegenstueck zu `detach_for_migration` -- ein ankommender `Tcb` bringt sein
         // `budget_blocked` mit, ohne den Helfer zu durchlaufen. Heute ebenso unerreichbar
         // (was nicht abwandern kann, kommt auch nicht an), und aus demselben Grund hier.
-        if tcb.budget_blocked {
+        if tcb.reasons.has(BlockReasons::BUDGET) {
             self.budget_blocked_count += 1;
         }
         tcb.queued = NOT_QUEUED;
@@ -1087,7 +1212,7 @@ impl Scheduler {
             self.tcbs[cur].sp = frame;
             // Ein extern als blockiert markierter `current` (z. B. via `pause`/`SYS_PDCTL`)
             // wird NICHT wieder eingereiht -> er deplaniert sauber.
-            let mut requeue = !self.tcbs[cur].blocked;
+            let mut requeue = self.tcbs[cur].reasons.is_empty();
             // Gegen das **Konto** belasten (eigenes oder via Donation geliehenes).
             let acct = self.tcbs[cur].sc_donor.unwrap_or(cur);
             if tick && self.tcbs[acct].budget > 0 {
@@ -1100,11 +1225,12 @@ impl Scheduler {
                     self.depleted_count += 1;
                     self.depletions += 1;
                     requeue = false;
-                    if acct != cur && !self.tcbs[cur].blocked {
-                        // H-b: nur wer nicht schon aus einem ANDEREN Grund blockiert ist, wird
-                        // hier blockiert -- und der Grund wird mitgeschrieben.
+                    if acct != cur {
+                        // **Der Waechter „nur wer nicht schon blockiert ist" ist WEG** (Z24): der
+                        // Budget-Grund kommt einfach dazu, gleich was sonst vorliegt. Vorher war
+                        // er noetig, weil `blocked = true` einen fremden Grund ueberschrieben und
+                        // sein spaeteres `false` ihn geloescht haette.
                         // D10: **Erhöhung 1 von 2** von `budget_blocked_count`.
-                        self.tcbs[cur].blocked = true;
                         self.set_budget_blocked(cur, true);
                     }
                 }
@@ -1153,13 +1279,13 @@ impl Scheduler {
                     for d in 0..self.tcbs.len() {
                         if d != slot
                             && self.tcbs[d].used
-                            && self.tcbs[d].budget_blocked
+                            && self.tcbs[d].reasons.has(BlockReasons::BUDGET)
                             && self.tcbs[d].sc_donor == Some(slot)
                         {
-                            // D10: **Senkung 2 von 4**.
+                            // D10: **Senkung 2 von 4**. Der Budget-Grund faellt -- und eingereiht
+                            // wird nur, wenn danach kein anderer mehr steht (Z24).
                             self.set_budget_blocked(d, false);
-                            self.tcbs[d].blocked = false;
-                            self.enqueue_ready(d);
+                            self.wecke_falls_lauffaehig(d);
                         }
                     }
                 }
@@ -1176,8 +1302,10 @@ impl Scheduler {
                     // zugleich in einer Ready-Liste), wenn der Refill einen gerade laufenden
                     // erschöpften Thread trifft.
                     _ => {
-                        if !self.tcbs[slot].blocked && self.current != Some(slot) {
-                            self.enqueue_ready(slot);
+                        // **Einen PAUSIERTEN Thread weckt der Refill nicht** -- und das ist
+                        // seit Z24 keine eigene Regel mehr, sondern die leere Menge.
+                        if self.current != Some(slot) {
+                            self.wecke_falls_lauffaehig(slot);
                         }
                     }
                 }
@@ -1210,18 +1338,17 @@ impl Scheduler {
                     for d in 0..self.tcbs.len() {
                         if d != s
                             && self.tcbs[d].used
-                            && self.tcbs[d].budget_blocked
+                            && self.tcbs[d].reasons.has(BlockReasons::BUDGET)
                             && self.tcbs[d].sc_donor == Some(s)
                         {
                             // D10: **Senkung 3 von 4**.
                             self.set_budget_blocked(d, false);
-                            self.tcbs[d].blocked = false;
-                            self.enqueue_ready(d);
+                            self.wecke_falls_lauffaehig(d);
                         }
                     }
                 }
-                if self.current != Some(s) && !self.tcbs[s].blocked {
-                    self.enqueue_ready(s);
+                if self.current != Some(s) {
+                    self.wecke_falls_lauffaehig(s);
                 }
             }
             true
@@ -1367,7 +1494,7 @@ impl Scheduler {
                 if !t.used {
                     return 1;
                 }
-                if t.blocked {
+                if !t.reasons.is_empty() {
                     return 2;
                 }
                 // **Die Gegenrichtung zu Code 7** (D8/B2, 2026-08-03). Code 7 meldet
@@ -1407,7 +1534,7 @@ impl Scheduler {
             if !t.used {
                 continue;
             }
-            if t.budget_blocked {
+            if t.reasons.has(BlockReasons::BUDGET) {
                 bb += 1;
             }
             // Der Directory-Eintrag MUSS auf genau diesen Kern + Slot zeigen.
@@ -1435,7 +1562,7 @@ impl Scheduler {
             // Thread, der ueber `unblock` auf leerem Konto lauffaehig wird), gilt `admitted == true`
             // -- die Bedingung greift dort unveraendert. Ausgenommen ist ausschliesslich der
             // Zustand zwischen `spawn_parked` und `admit`.
-            if !t.blocked
+            if t.reasons.is_empty()
                 && !t.depleted
                 && t.admitted
                 && self.current != Some(local)
@@ -1464,10 +1591,14 @@ impl Scheduler {
     /// Ein Zähler, der über „läuft der teure Pfad?" entscheidet, ist dann kein Zähler mehr,
     /// sondern eine dauerhaft wahre Bedingung.
     fn set_budget_blocked(&mut self, local: usize, an: bool) {
-        if self.tcbs[local].budget_blocked == an {
+        if self.tcbs[local].reasons.has(BlockReasons::BUDGET) == an {
             return;
         }
-        self.tcbs[local].budget_blocked = an;
+        if an {
+            self.tcbs[local].reasons.insert(BlockReasons::BUDGET);
+        } else {
+            self.tcbs[local].reasons.remove(BlockReasons::BUDGET);
+        }
         if an {
             self.budget_blocked_count += 1;
         } else {
@@ -1551,11 +1682,10 @@ impl Scheduler {
         for d in 0..self.tcbs.len() {
             if d != local && self.tcbs[d].used && self.tcbs[d].sc_donor == Some(local) {
                 self.tcbs[d].sc_donor = None;
-                if self.tcbs[d].budget_blocked {
+                if self.tcbs[d].reasons.has(BlockReasons::BUDGET) {
                     // D10: **Senkung 4 von 4**.
                     self.set_budget_blocked(d, false);
-                    self.tcbs[d].blocked = false;
-                    self.enqueue_ready(d);
+                    self.wecke_falls_lauffaehig(d);
                 }
             }
         }
@@ -1579,7 +1709,7 @@ impl Scheduler {
         // D10: der Sterbende SELBST kann budget-blockiert sein (ein Donee, dessen Konto leer
         // ist, wird gekillt). Die Zuweisung darunter loescht das Feld, ohne den Helfer zu
         // durchlaufen -- eine der drei Stellen, die den Zaehler von Hand nachfuehren.
-        if self.tcbs[local].budget_blocked {
+        if self.tcbs[local].reasons.has(BlockReasons::BUDGET) {
             self.budget_blocked_count -= 1;
         }
         self.tcbs[local] = Tcb::EMPTY;
@@ -1677,8 +1807,15 @@ pub trait SchedOps {
     /// **Einen geparkten Thread wecken**; die Marke wird immer hinterlegt, geweckt wird nur, wer
     /// wegen `park` blockiert ist. Siehe [`Scheduler::unpark`].
     fn unpark(&mut self, tid: ThreadId);
-    /// Einen bestimmten Thread extern pausieren (blockieren; mit `unblock` reversibel).
+    /// Einen bestimmten Thread extern pausieren — reversibel mit [`Self::resume`], **nicht** mit
+    /// `unblock`. Seit Z24 nennt jeder Wecker den Grund, den er aufhebt.
     fn pause(&mut self, tid: ThreadId);
+    /// Eine **Pause** aufheben (`SYS_PDCTL` RESUME/START).
+    ///
+    /// Bis Z24 war das `unblock` — und genau daran hing der Fehler: `unblock` hob *irgendeine*
+    /// Blockade auf, also auch eine, deren Grund der Aufrufer nicht kannte. Jetzt entfernt jeder
+    /// Wecker **seinen** Grund, und `resume` entfernt `PAUSE`.
+    fn resume(&mut self, tid: ThreadId);
     /// Einen bestimmten (nicht laufenden) Thread auf irgendeinem Kern beenden + abbauen
     /// (`SYS_PDCTL` STOP). Gibt `false`, falls er gerade läuft (erst pausieren).
     fn stop(&mut self, tid: ThreadId) -> bool;

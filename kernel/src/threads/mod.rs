@@ -2962,7 +2962,7 @@ extern "C" fn strand_worker(_arg: usize) -> ! {
 // `fuzz`, ADR 0013 — sie werden ausschliesslich von den Fuzzern benutzt.)
 
 /// Cross-Core-Park/Wake-Thread (EL1, auf core 1): blockiert sich per `PARK`; core 0
-/// weckt ihn kern-übergreifend per `wake_remote` (Reschedule-IPI). Setzt nach dem
+/// weckt ihn kern-übergreifend per `unpark_thread` (Reschedule-IPI). Setzt nach dem
 /// Aufwachen `XCORE_WOKEN` — Beleg für den IPI-getriebenen Cross-Core-Unblock.
 extern "C" fn xcore_parker(_arg: usize) -> ! {
     XCORE_PARKED.store(true, Ordering::Release);
@@ -3450,12 +3450,23 @@ pub fn demo_report_then_idle() -> ! {
             cs_reloaded = true;
         }
         // Cross-Core-Wake: sobald der Parker (auf core 1) blockiert ist, ihn per
-        // IPI wecken. Idempotent + Wiederholung pro Tick -> race-frei (trifft ein
-        // Wake den noch nicht blockierten Parker, weckt der nächste ihn).
+        // IPI wecken. Idempotent + Wiederholung pro Tick.
+        //
+        // **`unpark_thread`, nicht `wake_remote`** (Z24, 2026-08-10). Der Parker schläft wegen
+        // `SYS_PARK`; `wake_remote` ist der Wecker für eine **IPC**-Blockade. Bis zur Grund-Menge
+        // war das dieselbe Operation — ein Bit, drei Bedeutungen —, und dieser Test hat genau
+        // davon gelebt: er weckte einen geparkten Thread mit einem Wecker, der ihn gar nicht
+        // meinte. Gefunden hat es nicht das Gegenlesen, sondern die aarch64-Suite, die nach dem
+        // Umbau in **4 von 4** Läufen `offen: smp` meldete, während x86 grün blieb (dort gibt es
+        // diesen Pfad nicht).
+        //
+        // Nebenertrag: die Weckmarke macht das Rennen, das der alte Kommentar noch mit
+        // „Wiederholung pro Tick" abfing, **strukturell** unmöglich — `unpark` legt sie auch ab,
+        // wenn der Parker noch nicht schläft.
         if XCORE_PARKED.load(Ordering::Acquire) && !XCORE_WOKEN.load(Ordering::Acquire) {
             let raw = XCORE_PARKER_TID.load(Ordering::Relaxed);
             if raw != u64::MAX {
-                system::wake_remote(ThreadId::from_raw(raw));
+                system::unpark_thread(ThreadId::from_raw(raw));
             }
         }
 

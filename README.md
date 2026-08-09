@@ -4,10 +4,10 @@ SEL4Lake steht unter **GPL-3.0-or-later** (`LICENSE`).
 
 Dazu eine **zusätzliche Erlaubnis** nach GPLv3 §7: die **ABI-Ausnahme** in
 `LICENSE-EXCEPTION.md`. Ein Programm, das nur über die veröffentlichte System-Schnittstelle mit
-dem Kernel verkehrt, ist allein deswegen kein abgeleitetes Werk. Sie gilt **nichtkommerziell
-immer**; für kommerzielle Nutzung nur mit schriftlicher Zustimmung des Urhebers — wobei die GPLv3
-kommerzielle Nutzung ohnehin und unabhängig davon erlaubt (die Ausnahme nimmt nichts weg, sie gibt
-nur eine Klarstellung).
+dem Kernel verkehrt, ist allein deswegen kein abgeleitetes Werk. Sie gilt **für jeden,
+unbeschränkt und ohne Antrag** — kommerziell wie nichtkommerziell. Dieselbe Konstruktion, die
+Linux für seine System-Schnittstelle gewählt hat; der Copyleft-Charakter des Kerns bleibt
+unberührt.
 
 Welche Crates dafür permissiv werden müssen, steht in `docs/grenze.md`.
 

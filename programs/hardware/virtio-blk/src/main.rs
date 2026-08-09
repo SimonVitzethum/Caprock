@@ -262,7 +262,28 @@ fn run(_arg: usize) -> ! {
         exit(); // das Registerfenster wird nicht direkt adressiert, muss aber gemappt sein
     }
     let Some(dma) = map_window(DMA) else { exit() };
-    let (dma_cpu, dma_len, dma_dev) = (dma.base(), dma.len(), dma.iova());
+    // **Der Pool ist das Tor** (Z22 P3). `sel4lake_virtio::Region::from_raw` prueft nichts; hier
+    // faellt die Identitaetsabbildung (`dev == cpu`), die fehlende Geraetesicht (`dev == 0`) und
+    // der Ueberlauf **strukturell** aus, statt in einem `if` je Treiber wiederholt zu werden.
+    let pool = match sel4lake_dma::DmaPool::new(dma.base(), dma.iova(), dma.len()) {
+        Ok(p) => p,
+        Err(e) => {
+            // DIAGNOSE (Z22 P3): still zu sterben macht die Ursache unauffindbar.
+            signal(NTFN, 0xD1A6_0000 | (e as u64));
+            exit()
+        }
+    };
+    let ganz = pool.whole();
+    let (dma_cpu, dma_len, dma_dev) = (ganz.cpu(), ganz.len(), ganz.dev());
+    // Der Datenbereich als **ein Stueck**. Ab hier ist seine Laenge eine Eigenschaft des Wertes
+    // und nicht eine Konstante, die an drei Stellen von Hand richtig sein muss.
+    let Some(daten) = pool.map(
+        dma_cpu + sel4lake_virtio::blk::OFF_DATA,
+        sel4lake_virtio::blk::REGION_BYTES - sel4lake_virtio::blk::OFF_DATA,
+    ) else {
+        signal(NTFN, 0xD1A6_00FF);
+        exit()
+    };
     let Some(shared_win) = map_window(SHARED) else { exit() };
     let (shared, shared_len) = (shared_win.base(), shared_win.len());
     // Die Gerätesicht MUSS eine eigene Achse sein. Wäre sie gleich der CPU-Sicht, liefe dieser
@@ -334,12 +355,17 @@ fn run(_arg: usize) -> ! {
                 }
                 let o = if op == OP_READ { Op::Read } else { Op::Write };
                 if o == Op::Write {
-                    let n = (count * SECTOR as u64).min(shared_len) as usize;
-                    // SAFETY: wie oben.
+                    // **Gegen BEIDE Laengen begrenzt.** Bis hierher stand hier nur
+                    // `.min(shared_len)` -- die Laenge der QUELLE als Schranke fuer eine
+                    // Kopie ins ZIEL. Das ging gut, solange `count` anderswo begrenzt war;
+                    // die Schranke stand aber an der falschen Groesse, und das ist dieselbe
+                    // Verwechslung wie `rx_used` gegen „Daten angekommen".
+                    let n = (count * SECTOR as u64).min(shared_len).min(daten.len()) as usize;
+                    // SAFETY: wie oben; `n` liegt jetzt nachweislich in beiden Bereichen.
                     unsafe {
                         core::ptr::copy_nonoverlapping(
                             shared as *const u8,
-                            (dma_cpu + sel4lake_virtio::blk::OFF_DATA) as *mut u8,
+                            daten.cpu() as *mut u8,
                             n,
                         );
                     }
@@ -351,11 +377,13 @@ fn run(_arg: usize) -> ! {
                 // Gelesene Sektoren in die geteilte Flaeche kopieren, damit der Client sie
                 // SEHEN kann. Beim Schreiben umgekehrt -- dort hat er sie vorher hineingelegt.
                 if r.completed() {
-                    let n = (r.sectors as u64 * SECTOR as u64).min(shared_len) as usize;
+                    let n = (r.sectors as u64 * SECTOR as u64)
+                        .min(shared_len)
+                        .min(daten.len()) as usize;
                     // SAFETY: beide Bereiche gehoeren dieser PD; `n` ist durch die kleinere der
                     // beiden Laengen begrenzt.
                     unsafe {
-                        let von = (dma_cpu + sel4lake_virtio::blk::OFF_DATA) as *const u8;
+                        let von = daten.cpu() as *const u8;
                         let nach = shared as *mut u8;
                         if op == OP_READ {
                             core::ptr::copy_nonoverlapping(von, nach, n);

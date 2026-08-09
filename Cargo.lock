@@ -155,6 +155,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sel4lake-dma"
+version = "0.0.1"
+
+[[package]]
 name = "sel4lake-dtb"
 version = "0.0.1"
 

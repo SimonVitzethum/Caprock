@@ -24,3 +24,7 @@ sel4lake-virtio = { path = "../../../crates/sel4lake-virtio" }
 # A-6.2: der GPT-Parser. Ebenfalls abhaengigkeitsfrei und `forbid(unsafe_code)` -- er liest fremde
 # Bytes von der Platte, und die gehoeren nicht in den Kern.
 sel4lake-part = { path = "../../../crates/sel4lake-part" }
+# Z22 P3: der DMA-Pool. Ebenfalls abhaengigkeitsfrei und `forbid(unsafe_code)`. Er ist das TOR vor
+# `sel4lake_virtio::Region`: dessen `from_raw` ist ungeprueft, und eine Region mit `dev == cpu`
+# (Identitaet) oder `dev == 0` liefe scheinbar, bis das Geraet ins Leere schriebe.
+sel4lake-dma = { path = "../../../crates/sel4lake-dma" }

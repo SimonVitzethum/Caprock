@@ -508,10 +508,30 @@ Die Aufteilung, die daraus folgt:
       **nur** `ipc-bleibt-liegen=false`.
       **Zwei eigene Fehler dabei, beide in der Fallenliste.**
 
-- [ ] **P3 — DMA: der IOVA-Allokator gehört in die PD.** Region einmal vorgemappt, danach ist
-      `dma_map_single` reine Adressarithmetik in der PD: **null Syscalls im heissen Pfad**. Die
-      Trennung `Pa`/`Iova` existiert hier bereits als Typ — in Linux-Treibern ist ihre
-      Verwechslung der Normalfall.
+- [x] **P3 — der DMA-Pool liegt in der PD** (2026-08-09, `crates/sel4lake-dma`, 13 Host-Tests).
+      Der Kernel mappt die Region **einmal** und vergibt das IOVA-Fenster; alles danach ist
+      Arithmetik **innerhalb eines bereits gewährten Fensters** und fügt keine Autorität hinzu —
+      also gehört es nicht in die TCB. Der heisse Pfad ist **null Syscalls**.
+      **Das Loch, das der Typ schliesst:** die Treiber-PD reichte zwei lose `u64` durch
+      (`dma_cpu`, `dma_dev`), die per **Konvention** zusammengehörten — während der Kernel genau
+      diese beiden Achsen seit jeher im Typ trennt. Ein `DmaBuf` trägt beide und lässt sich nicht
+      falsch herum auspacken.
+      **Die wichtigste Absage:** `map` (= `dma_map_single`) gibt für jede Adresse **ausserhalb**
+      des Pools `None`. Einen Stapelpuffer für DMA anzumelden ist in Linux-Treibern ein
+      verbreiteter Fehler; ohne diese Prüfung entstünde daraus eine IOVA auf fremden Speicher.
+      **Befund unterwegs:** `sel4lake_virtio::Region::from_raw` prüft **nichts** — eine Region mit
+      `dev == cpu` (Identität!) oder `dev == 0` liesse sich bauen und liefe scheinbar. Der Pool ist
+      jetzt das **Tor** davor, fail-closed in vier Richtungen. Und die Kopie in den Datenbereich
+      war gegen `shared_len` begrenzt — die Länge der **Quelle** als Schranke für das **Ziel**.
+      **Latent**, weil `count` anderswo begrenzt war; die Schranke stand trotzdem an der falschen
+      Grösse.
+
+- [ ] **Vorgefunden, NICHT von P3: `drv`/`blkdev` sind in der Lade-Suite rot.** Gemessen am
+      Stand `f1932ff` **vor** jeder P3-Änderung: `Anfrage 1 an v1: Status=-1`, `Austausch:
+      Ergebnis=4294967295`, `v2 meldete bereit=0`. `fs` ist dabei grün — der Blockdienst trägt
+      also, was reisst, ist der **Austauschpfad** (A-5.1/A-4.1). CLAUDE.md führt die Lade-Suite
+      seit dem 2026-08-03 als `== ALL PASS ==`; das gilt nicht mehr, und wann es kippte, ist
+      nicht festgehalten. Eigener Eintrag nötig.
 
 - [ ] **P1 — x86: MSI-X + IRTE-Vergabe.** Der Rest von Z21 Punkt 1 (s. dort). MSI ist
       **flankengetriggert** — das Maskieren/Demaskieren, das ein level-getriggerter GIC-SPI

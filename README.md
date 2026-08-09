@@ -1,13 +1,19 @@
 ## Lizenz
 
-SEL4Lake steht unter **GPL-3.0-or-later** (`LICENSE`).
+SEL4Lake steht unter **AGPL-3.0-or-later** (`LICENSE`).
+
+**§13 („Remote Network Interaction") ist der Punkt der Wahl:** wer eine **veränderte** Fassung über
+ein Netz anbietet, muss ihren Quelltext den Nutzern anbieten — die Pflicht entsteht beim **Betrieb**,
+nicht erst bei der Weitergabe. Ein Kunde, der sein **eigenes Programm** als PD darauf fährt, ist
+davon **nicht** erfasst (s. ABI-Ausnahme).
 
 Dazu eine **zusätzliche Erlaubnis** nach GPLv3 §7: die **ABI-Ausnahme** in
 `LICENSE-EXCEPTION.md`. Ein Programm, das nur über die veröffentlichte System-Schnittstelle mit
 dem Kernel verkehrt, ist allein deswegen kein abgeleitetes Werk. Sie gilt **für jeden,
 unbeschränkt und ohne Antrag** — kommerziell wie nichtkommerziell. Dieselbe Konstruktion, die
 Linux für seine System-Schnittstelle gewählt hat; der Copyleft-Charakter des Kerns bleibt
-unberührt.
+unberührt. **Unter AGPL ist sie tragend, nicht bequem** — sie ist es, die §13 von Kundencode
+fernhält.
 
 Welche Crates dafür permissiv werden müssen, steht in `docs/grenze.md`.
 

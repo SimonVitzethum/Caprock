@@ -3,8 +3,8 @@
 **Kein Rechtsrat.** Das ist die Struktur der Regel, wie sie allgemein verstanden wird. Vor einer
 Produkt- oder Vertriebsentscheidung gehört sie vor jemanden mit Zulassung.
 
-SEL4Lake steht unter `GPL-3.0-or-later` (s. `LICENSE`). Dieses Dokument gewährt eine **zusätzliche
-Erlaubnis** im Sinne von GPLv3 §7 — es nimmt **nichts** weg und beschränkt niemanden.
+SEL4Lake steht unter `AGPL-3.0-or-later` (s. `LICENSE`). Dieses Dokument gewährt eine
+**zusätzliche Erlaubnis** im Sinne von (A)GPLv3 §7 — es nimmt **nichts** weg und beschränkt niemanden.
 
 ---
 
@@ -62,8 +62,26 @@ lässt sich weder umlizenzieren noch eine Ausnahme ändern, ohne alle zu fragen.
 DCO kommen soll, ist der Zeitpunkt **vor** dem ersten externen Beitrag. Dieselbe Logik wie bei der
 signierten Manifestfläche: die Regel muss stehen, bevor der erste Fall eintritt.
 
-**Zweitens: für den Betrieb greift die GPL ohnehin kaum.** Die Pflichten der GPLv3 entstehen bei
-**Weitergabe**, nicht beim Betrieb. Wer SEL4Lake nur betreibt (etwa als PaaS), gibt nichts weiter
-und schuldet nichts — das wäre erst unter **AGPL** anders. Ob das ein Vorteil (Hosting ohne
-Copyleft-Zwang) oder eine Lücke ist, ist eine Geschäftsentscheidung; sie sollte bewusst gefallen
-sein und nicht als Nebeneffekt der Wahl zwischen drei Kürzeln in `Cargo.toml`.
+**Zweitens: unter AGPL greift das Copyleft AUCH beim Betrieb — und genau deshalb ist diese
+Ausnahme jetzt tragend statt nur bequem.**
+
+`AGPL-3.0` §13 („Remote Network Interaction") verlangt: wer eine **veränderte** Fassung betreibt
+und sie über ein Netz anbietet, muss den Nutzern den **Quelltext dieser Fassung** anbieten. Die
+Pflicht entsteht damit beim **Betrieb**, nicht erst bei der Weitergabe — das ist der Unterschied
+zur GPLv3 und der Grund für den Wechsel.
+
+Was das konkret trennt:
+
+| | trifft §13 |
+|---|---|
+| jemand **verändert** den Kernel und betreibt ihn als Dienst | **ja** — Quelltext an die Nutzer |
+| jemand betreibt SEL4Lake **unverändert** als Dienst | nein (nichts verändert) |
+| ein Kunde fährt sein **eigenes Programm** als PD darauf | **nein** — es ist kein abgeleitetes Werk, s. die Ausnahme oben |
+
+**Die dritte Zeile ist der Grund, warum die ABI-Ausnahme jetzt tragend ist.** Ohne sie stünde für
+jeden Kunden die Frage im Raum, ob sein Workload durch §13 erfasst wird — und eine PaaS, deren
+Kunden erst einen Anwalt fragen müssen, ob ihr Code offengelegt werden muss, hat kein
+Lizenzproblem, sondern ein Vertriebsproblem. Mit der Ausnahme ist die Antwort ein Satz.
+
+**Der Preis, der dazugehört:** etliche Unternehmen schliessen AGPL-Software pauschal aus, ohne die
+Unterscheidung oben zu prüfen. Das ist eine reale Kostenseite der Wahl und keine Rechtsfrage.

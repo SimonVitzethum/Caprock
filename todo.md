@@ -590,6 +590,48 @@ könnte jede PD die Syscalls eines fremden Threads an sich ziehen. Umschalten da
 Genau das ist „Capabilities beider Prozesse", präzise gemacht: die Tcb-Cap sagt *wessen* Syscalls,
 die Endpoint-Cap sagt *wohin*.
 
+#### Es sind NEUE Cap-Arten, kein umgewidmeter Endpoint (Simon, 2026-08-09)
+
+Der erste Entwurf oben nahm einen gewöhnlichen `Endpoint`. Das ist zu wenig, und zwar aus dem
+Grund, den dieses Projekt schon mehrfach bezahlt hat: **ein Wert, der zwei Bedeutungen trägt, ist
+so lange harmlos, wie die beiden zufällig gleich sind.**
+
+Die Autorität ist hier eine **andere** als „darf IPC empfangen":
+
+| | gewöhnlicher Endpoint | Syscall-Handler |
+|---|---|---|
+| empfängt Nachrichten | ja | ja |
+| schreibt **fremde Ergebnisregister** | nein — `REPLY` schreibt die Antwort, nicht beliebigen Zustand | **ja** |
+| kann den Gast **belügen** | nein | **ja** |
+| ist von einem Dienst-Endpoint unterscheidbar | — | **muss es sein** |
+
+Deshalb eigene Arten:
+
+* **`SyscallHandler`** — „darf den Syscall-Strom der an mich gebundenen Threads empfangen und ihre
+  Ergebnisregister schreiben". **Nur der an mich gebundenen**: die Bindung steht im Kernel je
+  Thread, und ein `REPLY` wirkt ausschliesslich auf den Absender. Ohne diese Einschränkung wäre die
+  Cap ein Generalschlüssel auf fremde Registerzustände.
+* **`FaultHandler`** — getrennt, weil `mmap`-Semantik verlangt, dass der Handler **Seitenfehler**
+  sieht. Ein Kanal mit zwei Bedeutungen ist die Form, die hier dreimal gerissen ist (`blocked`,
+  die Park-Naht, `CR0.TS`); die vierte muss nicht sein.
+
+**Was der eigene Typ zusätzlich möglich macht** und ein Endpoint nicht:
+
+* **Im Manifest deklarierbar** (`CAP_SYSHANDLER`) — wer eine Linux-Persönlichkeit sein darf, steht
+  dann in der **signierten** Fläche, fail-closed, statt sich aus dem Besitz eines Endpoints zu
+  ergeben.
+* **Im Audit benennbar** — `cdt_audit` kann die Frage „wer darf fremde Register schreiben"
+  beantworten; über einen gewöhnlichen Endpoint kann sie niemand stellen.
+* **Verwechslung ausgeschlossen** — eine PD kann nicht versehentlich ihren *Dienst*-Endpoint als
+  Syscall-Handler binden. Der Übersetzer weist es ab, nicht ein Kommentar.
+
+**Der Aufruf trägt damit drei Autoritäten, jede von einer anderen Seite:**
+
+    SYS_SETHANDLER(tcb_cap, syshandler_cap, faulthandler_cap)
+
+`tcb_cap` sagt **wessen** Syscalls (und die hält, wer den Thread kontrolliert — nicht der Handler),
+die beiden anderen sagen **wohin**.
+
 #### Die Regel, ohne die es eine Rechteausweitung wäre
 
 **Fällt die Handler-Cap weg (gelöscht, entzogen, Handler tot), muss der Gast FAULTEN — nicht auf

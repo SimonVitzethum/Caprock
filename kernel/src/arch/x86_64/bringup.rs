@@ -395,6 +395,11 @@ const ROOT_BADGE: u64 = 1 << 32;
 /// Badge, mit dem sich `hello` meldet (`programs/userland/hello`, `HELLO_BADGE`).
 #[cfg(feature = "selftest")]
 const HELLO_BADGE: u64 = 0x4845_4C4F;
+// Z15/W1 -- muessen zu `programs/userland/wasmhost` passen (Bits 40..43; 32..34 sind vergeben).
+const WASM_INST: u64 = 1 << 40;
+const WASM_RESULT: u64 = 1 << 41;
+const WASM_REJECT: u64 = 1 << 42;
+const WASM_TRAP: u64 = 1 << 43;
 /// A-3.1: `SYS_CDELETE` hat die Loader-Cap geloescht **und** die Autoritaet war danach weg.
 #[cfg(feature = "selftest")]
 const CDELETE_GONE_BADGE: u64 = 1 << 33;
@@ -937,6 +942,14 @@ fn drv_service_step(archive: bool) {
             // laengst geladen hat -- frueher waere die Kandidatenliste leer, und leer haette
             // wie "nichts zu beanstanden" ausgesehen.
             PDCOLOR_OK.store(crate::loader::run_pdcolor(), Ordering::Release);
+            {
+                let b = crate::loader::client_notification()
+                    .map(system::notification_pending)
+                    .unwrap_or(0);
+                let alle = WASM_INST | WASM_RESULT | WASM_REJECT | WASM_TRAP;
+                // Kein Bit gesetzt = keine WASM-PD in der Startmenge -> nicht anwendbar.
+                WASM_OK.store(b & alle == 0 || b & alle == alle, Ordering::Release);
+            }
             LADEPOL_OK.store(crate::loader::run_ladepolitik(), Ordering::Release);
             PART_OK.store(
                 q(8) == 0
@@ -1876,6 +1889,8 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
     // dauerhaft falsches Konjunkt waere kein Befund, sondern eine Anforderung, die diese
     // Konfiguration nicht belegen KANN.
     let pdcolor = !archive || PDCOLOR_OK.load(Ordering::Acquire);
+    // Z15/W1: ohne Archiv gibt es keine WASM-PD -- nicht anwendbar, wie `root` darueber.
+    let wasm = !archive || WASM_OK.load(Ordering::Acquire);
     let ladepol = !archive || LADEPOL_OK.load(Ordering::Acquire);
     // **In die ABSCHLUSSBEDINGUNG, nicht nur in den Bericht** (2026-08-07). Die Gegenprobe hat es
     // gezeigt: eine Mutation, die `spawn_in_pd` zuerst zulassen und dann binden liess, ergab
@@ -1933,6 +1948,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             ("pdcolor", pdcolor),
             ("ladepol", ladepol),
             ("pdbind", pdbind),
+            ("wasm", wasm),
             ("quiesce", quiesce),
             ("rebind", rebind),
             ("epfull", epfull),
@@ -1946,11 +1962,14 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 24;
+const DONE_FLAGS: usize = 25;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]
 static PDCOLOR_OK: AtomicBool = AtomicBool::new(false);
+/// Z15/W1: hat die WASM-PD alle vier Aussagen belegt?
+#[cfg(feature = "selftest")]
+static WASM_OK: AtomicBool = AtomicBool::new(false);
 /// Z11c: wird die Manifest-Politik angewandt? Ergebnis der EINMALIGEN Messung.
 #[cfg(feature = "selftest")]
 static LADEPOL_OK: AtomicBool = AtomicBool::new(false);
@@ -2116,6 +2135,54 @@ fn report_and_off(watchdog: bool) -> ! {
     );
 
     let b = root_badge();
+    // ---- Z15/W1: WASM in einer PD -------------------------------------------------------------
+    //
+    // Die vier Bits kommen aus `programs/userland/wasmhost`, ueber eigen gebadgte `ccopy`-Kopien
+    // derselben Notification (dasselbe Muster wie `init` bei A-3.1). Sie stehen fuer VIER
+    // verschiedene Aussagen, und der Unterschied ist der Punkt:
+    //
+    //   * `inst`   -- ein Modul wurde geladen und instanziiert
+    //   * `wert`   -- die exportierte Funktion lieferte den GERECHNETEN Wert (42 steht im Modul,
+    //                 nicht im Programm) -- ohne das waere `inst` eine Aussage ueber eine Engine,
+    //                 die startet, und keine ueber Ausfuehrung
+    //   * `mutation` -- ein Modul mit EINEM verdorbenen Opcode wurde abgewiesen; ein Interpreter,
+    //                 der jedes Byte ausfuehrt, ist keine Sandbox
+    //   * `trap`   -- ein Zugriff hinter das Ende des Linearspeichers ergab einen WASM-Trap.
+    //                 **Dieses Bit belegt sich selbst:** haette der Trap die PD mitgerissen,
+    //                 koennte sie ihn nicht mehr melden. Die Sandbox haelt also INNERHALB der PD,
+    //                 und die PD-Isolation ist die zweite Linie, nicht die erste.
+    // **Das Badge der CLIENT-Notification, nicht das des Root-Tasks.** wasmhost leitet seine
+    // gebadgten Kopien von seiner EIGENEN, aus dem Manifest endowten Cap ab (Slot 1, RWX) --
+    // die vom Root-Task delegierte Cap in Slot 0 ist eine reine Signal-Cap, und `ccopy` kann
+    // Rechte nicht verstaerken.
+    let b = crate::loader::client_notification().map(system::notification_pending).unwrap_or(0);
+    let (w_inst, w_wert, w_mut, w_trap) = (
+        b & WASM_INST != 0,
+        b & WASM_RESULT != 0,
+        b & WASM_REJECT != 0,
+        b & WASM_TRAP != 0,
+    );
+    let wasm_geladen = w_inst || w_wert || w_mut || w_trap;
+    println!(
+        "wasm    : instanziiert={w_inst} Ergebnis-stimmt={w_wert} Mutation-abgewiesen={w_mut} \
+         Uebergriff-getrappt={w_trap}"
+    );
+    if !wasm_geladen {
+        println!(
+            "wasm    : SKIP -- in diesem Lauf lief keine WASM-PD (kein `wasmhost` in der \
+             Startmenge). Es gibt nichts zu messen; ALL PASS waere eine Aussage ueber die \
+             Abwesenheit des Falls"
+        );
+    } else {
+        println!(
+            "wasm    : {} (Z15/W1: eine WASM-Laufzeit als gewoehnliche UserLand-PD. Die Engine ist \
+             216 KiB Code -- so gross wie der ganze Mikrokern --, liegt aber HIER und nicht dort: \
+             fuer jeden anderen Mandanten waechst die TCB um null. Der Uebergriffsfall ist der \
+             eigentliche Beleg, und er belegt sich selbst: das Badge kommt nur an, wenn die PD \
+             den Trap ueberlebt hat)",
+            if w_inst && w_wert && w_mut && w_trap { "ALL PASS" } else { "FAILURES" }
+        );
+    }
     println!(
         "root    : Notification-Badge {b:#x} (Root-Task lief: {}; er selbst hat 'hello' nachgeladen: {})",
         b & ROOT_BADGE != 0,

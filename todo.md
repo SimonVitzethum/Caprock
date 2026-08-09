@@ -481,7 +481,40 @@ diese Zahl nicht erhöhen.
 Alle Zahlen aus [Z14](#z14-fremde-software-ohne-gastschicht--bewertet-2026-08-09). Jede Stufe hat
 eine Abnahme, die **fehlschlagen kann**; eine Stufe ohne Gegenprobe gilt nicht als fertig.
 
-- [ ] **W1 — die Engine läuft in einer PD, ohne eine einzige neue Kernelzeile.** Ein neues Programm
+- [~] **W1 — angefangen 2026-08-09, Stand: die PD läuft, der MELDEWEG nicht.**
+
+      **Belegt (nicht vermutet):** `programs/userland/wasmhost` baut gegen `wasmi 0.31` für
+      `x86_64-sel4lake-user` (429 KB ELF, drei PT_LOAD: 257 KB Code, 30 KB rodata, **2 MiB reines
+      BSS** als Heap-Arena). Der Lader nimmt es an — das BSS-Segment mit `FileSiz 0` ist genau der
+      Fall, den `copy_segment_at` seit dem Farbumbau behandelt. **Die PD läuft**, gemessen mit
+      einer cap-freien Sonde (ein Fault an `0xDEAD_0000` erscheint im Protokoll), sowohl mit
+      64 KiB als auch mit 2 MiB Arena.
+
+      **Offen:** keins der vier Badges kommt an. Der Meldeweg ist `ccopy` (eigen gebadgte Kopie)
+      + `signal`, dasselbe Muster wie `init` bei A-3.1.
+
+      Ausgeschlossen durch Nachsehen im Handler, nicht durch Probieren:
+      * **Rechte-Verstärkung** — `ccopy` *schneidet* (`rights_from_bits(mask).intersect(have)`),
+        eine zu große Maske ist also harmlos. (Meine erste „Korrektur" von `7` auf `0b010` beruhte
+        auf der falschen Annahme und war selbst ein Fehler.)
+      * **Slot-Bereich** — `NCAPS = 16`, die Zielslots 6..9 sind gültig.
+      * **Belegter Zielslot** — der Lader endowt nach 0..5.
+      * **Ladefehler / Segmentgröße** — s. o., die Sonde läuft.
+
+      **Die nächste Spur, und sie ist konkret:** der Handler reicht einen bei
+      `install_cap_checked` **abgelehnten** Kopie-Cap heraus, um ihn zu löschen — die
+      Domänen-Policy urteilt also über die Kopie. `init` ist TrustedSas, `wasmhost` ist UserLand.
+      Zu prüfen ist, ob eine UserLand-PD überhaupt eine selbst gemintete Notification-Kopie
+      installieren darf. Zweite Spur: welches Notification-**Objekt** der Kernel liest —
+      `CLIENT_NTFN` wird von jeder nicht-Root-, nicht-Treiber-PD überschrieben, und in dieser
+      Startmenge sind das `hello`, `fs` und `wasmhost`.
+
+      **Was diese Suche schon gelehrt hat:** ich habe zweimal zwei Dinge gleichzeitig geändert
+      (Heapgröße und Meldeweg; Rechte und Quellslot) und mir damit zwei Läufe wertlos gemacht.
+      Die cap-freie Sonde war der erste Schritt, der etwas entschieden hat — weil sie **eine**
+      Frage stellt und keine Cap braucht.
+
+- [ ] **W1 (Rest) — die Engine läuft in einer PD, ohne eine einzige neue Kernelzeile.** Ein neues Programm
       `programs/userland/wasmhost` linkt `wasmi` gegen `libsel4lake`, nimmt ein `.wasm` aus dem
       Boot-Archiv (dritter Weg neben ELF und Manifest), instanziiert es und meldet das Ergebnis
       über seinen Endpoint.

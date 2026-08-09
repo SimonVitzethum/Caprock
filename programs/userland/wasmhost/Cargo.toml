@@ -1,0 +1,19 @@
+# `wasmhost` — eine WASM-Laufzeit als gewoehnliche UserLand-PD (Z15/W1).
+#
+# **Die TCB waechst um null.** Die Engine ist 216 KiB Code -- so gross wie der ganze Mikrokern --,
+# aber sie liegt hier, nicht dort. Fuer jeden anderen Mandanten ist sie unsichtbar.
+[package]
+name = "wasmhost"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wasmhost"
+path = "src/main.rs"
+
+[dependencies]
+libsel4lake = { path = "../../libsel4lake" }
+# `default-features = false` ist hier keine Sparmassnahme, sondern Pflicht: mit `std` zieht die
+# Engine eine Standardbibliothek, die es auf diesem Ziel nicht gibt.
+wasmi = { version = "0.31", default-features = false }

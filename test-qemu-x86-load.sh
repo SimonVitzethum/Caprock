@@ -172,13 +172,15 @@ build_archive() {   # $1 = Ausgabedatei, $2 = Kernel-ELF, $3 = manifest-version,
         --entry "3:virtio-blk:1:1:$PROG/virtio-blk.elf:mmio,dma,ntfn,ep::1::any:0:$sel" \
         --entry "4:fs:0:1:$PROG/fs.elf:ntfn,ep::1::any:0::3" \
         --entry "5:virtio-net:1:1:$PROG/virtio-net.elf:mmio,dma,ntfn,ep::1::any:0:vendor=1af4,device=1041" \
+        --entry "6:wasmhost:2:1:$PROG/wasmhost.elf:ntfn::1::any:0" \
         >/dev/null 2>&1 || return 1
     python3 tools/mkarchive.py "$1" --system-manifest build/system.manifest \
         "1:init:0:1:$PROG/init.elf::certs/init-x86.cert" \
         "2:hello:2:1:$PROG/hello.elf" \
         "3:virtio-blk:1:1:$PROG/virtio-blk.elf" \
         "4:fs:0:1:$PROG/fs.elf::certs/fs-x86.cert" \
-        "5:virtio-net:1:1:$PROG/virtio-net.elf" >/dev/null 2>&1
+        "5:virtio-net:1:1:$PROG/virtio-net.elf" \
+        "6:wasmhost:2:1:$PROG/wasmhost.elf" >/dev/null 2>&1
 }
 
 echo "== Boot-Archiv bauen =="
@@ -241,7 +243,7 @@ check "mbmod   : ALL PASS" \
 # Die ZAHL steht hier, nicht bloss "das Archiv parst": ein Archiv, aus dem beim Bauen still ein
 # Modul herausfiel, parst genauso gut -- und der Treiber-Test darunter saehe dann aus wie ein
 # Treiberfehler statt wie ein fehlendes Modul.
-check "archive : 5 Modul(e)" \
+check "archive : 6 Modul(e)" \
     "A-1.1/A-1.5: das Archiv liegt an der vom Bootloader gemeldeten Adresse und parst (init + hello + virtio-blk + fs)"
 # A1 / Z11c (2026-08-07). **Auf `ALL PASS` geprueft, nicht auf die Zeile** -- die Zeile gibt es
 # auch als SKIP („kein Programm mit EXCLUSIVE_STRIPE geladen"), und genau der Fall ist beim Bau
@@ -251,6 +253,9 @@ check "pdcolor : ALL PASS" \
     "A1: eine ueber das Manifest als EXCLUSIVE_STRIPE geladene PD haelt Segmente, Stack und Seitentabellen in EINEM Farbstreifen -- gemessen an der Teardown-Buchhaltung, mit Gegenprobe an einer ungefaerbten PD"
 check "ladepol : ALL PASS" \
     "Z11c: die Politik des Manifests wird ANGEWANDT, nicht nur gelesen (Prioritaet/Affinitaet aus dem TCB zurueckgelesen, nicht aus dem Ladepfad)"
+# Z15/W1. **Auf `ALL PASS` geprueft, nicht auf die Zeile** -- es gibt sie auch als SKIP.
+check "wasm    : ALL PASS" \
+    "Z15/W1: eine WASM-Laufzeit als gewoehnliche PD -- Modul instanziiert, GERECHNETES Ergebnis, mutiertes Modul abgewiesen, Uebergriff auf den Linearspeicher als WASM-Trap ohne dass die PD faultet"
 check "manifest: ALL PASS" \
     "A-1.2..A-1.4: System-Manifest -- signiert ueber die GESAMTE Nachricht, an DIESES Kernel-Image gebunden, Anti-Downgrade, manipulierte Kopie wird abgewiesen"
 check "manifest:   \[1\]init .* ROOT" \

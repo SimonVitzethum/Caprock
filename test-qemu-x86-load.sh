@@ -234,6 +234,57 @@ fi
 echo "$OUT" | grep -E "^(mbi|mbmod|archive|manifest|root|devassign|devsel|dmaiso|drv|blkdev|part|fs|bootckpt) *:" || true
 
 echo "== checks =="
+# ================================================================================================
+# FINGERPRINT + BEKANNT-ROTE ZEILEN
+# ================================================================================================
+#
+# **Der Fingerprint schliesst eine Hypothese fuer immer aus.** Am 2026-08-09 war ein roter Lauf
+# nicht zuzuordnen: "Flattern oder veralteter Build" -- und *oder* ist keine Diagnose. Steht der
+# Hash des gerade gepruefen Binaries in der Ausgabe, ist die zweite Haelfte nie wieder zu fragen.
+#
+# **Die known-red-Liste macht aus einer benannten Auslassung einen BEWACHTEN Zustand.** Eine rote
+# Zeile ausserhalb des Gates ist genau der Zustand, in dem die Lade-Suite unbemerkt kippte: "bekannt
+# rot" und "neu rot" sahen gleich aus. Jede rote Zeile, die NICHT auf der Liste steht, faerbt den
+# Lauf; jede Zeile AUF der Liste traegt ein Datum -- eine Diagnose, die aelter ist als der letzte
+# Umbau ihres Pfads, ist automatisch verdaechtig.
+#
+# Format: "praefix|seit|eintrag|diagnose vom"
+BEKANNT_ROT=(
+  "fp      :|2026-08-09|Z25|Diagnose vom 2026-08-09: Sonden erreichen weder Erfolg noch Korruption -- Schleifenfortschritt noch nicht gezaehlt. Die FRUEHERE Diagnose (CR4.OSFXSR nie gesetzt) ist seit A4 ueberholt und war 1 Tag lang falsch stehengeblieben"
+)
+fingerprint() {
+    local f="$1"
+    if [ -f "$f" ]; then
+        printf '%s %s' "$(sha256sum "$f" | cut -c1-12)" "$(stat -c %y "$f" 2>/dev/null | cut -d. -f1)"
+    else
+        printf 'KEIN-BINARY'
+    fi
+}
+# Rote Zeilen gegen die Liste halten. Gibt 1, wenn eine rote Zeile NICHT erklaert ist.
+bekannt_rot_pruefen() {
+    local out="$1" unerklaert=0
+    echo "== bekannt-rote Zeilen =="
+    while IFS= read -r zeile; do
+        local praefix="${zeile%%:*}:" erklaert=0
+        for e in "${BEKANNT_ROT[@]}"; do
+            IFS='|' read -r p seit eintrag diag <<< "$e"
+            if [ "${zeile:0:${#p}}" = "$p" ]; then
+                echo "  bekannt: ${p}FAILURES -- rot seit $seit, $eintrag"
+                echo "           $diag"
+                erklaert=1; break
+            fi
+        done
+        [ "$erklaert" = 1 ] || { echo "  NEU ROT: $zeile"; unerklaert=1; }
+    done < <(echo "$out" | grep -E "^[a-z]+ *: .*FAILURES" | sort -u)
+    if [ "$unerklaert" = 1 ]; then
+        echo "  BEFUND: eine rote Zeile steht NICHT auf der Liste -- das ist eine neue Regression,"
+        echo "          keine bekannte Luecke. Genau dieser Unterschied war bei der Lade-Suite unsichtbar."
+        return 1
+    fi
+    echo "  (keine unerklaerte rote Zeile)"
+    return 0
+}
+
 fail=0
 check() { if echo "$OUT" | grep -q "$1"; then echo "  PASS: $2"; else echo "  FAIL: $2"; fail=1; fi; }
 check "mbi     : 1 Modul(e)" \
@@ -672,5 +723,8 @@ else
     rm -f "$LOG"
 fi
 rm -f "$BLK_IMG"
+echo "fingerprint: $(fingerprint "$KELF") (Kernel-Binary, das GERADE geprueft wurde -- schliesst"
+echo "             'veralteter Build' als Erklaerung fuer eine Abweichung aus)"
+bekannt_rot_pruefen "$OUT" || fail=1
 if [ "$fail" = 0 ]; then echo "== ALL PASS =="; else echo "== FAILURES =="; fi
 exit "$fail"

@@ -300,6 +300,14 @@ static FP_FOUND: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[link_section = ".user_data"]
 static FP_TRIES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// **Wie weit die Sonde in ihrer Schleife gekommen ist** (Z25). Weder Erfolgs- noch
+/// Korruptionsbit gesetzt heisst: sie steckt darin — und dann sagt das *Ergebnis* nichts, der
+/// *Fortschritt* aber alles. `FP_ITERS` = durchgelaufen, 0 = nie begonnen, dazwischen = sie kommt
+/// voran, aber langsam (oder wurde beendet).
+#[cfg(feature = "selftest")]
+#[link_section = ".user_data"]
+static FP_PROGRESS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 #[cfg(feature = "selftest")]
 core::arch::global_asm!(
     r#"
@@ -376,6 +384,15 @@ user_fp_probe_x86:
     movq    r14, xmm3
     cmp     r14, r12
     jne     3f
+    // Fortschritt ablegen, BEVOR abgegeben wird -- sonst steht bei einem Thread, der beim Yield
+    // haengt, eine Runde zu wenig da.
+    mov     rax, r12
+    and     rax, 1
+    shl     rax, 3
+    lea     rcx, [rip + {prog}]
+    mov     rdx, {iters}
+    sub     rdx, r13
+    mov     [rcx + rax], rdx
     xor     eax, eax              // sys::YIELD -> FP-Besitz abgeben
     xor     edi, edi
     int     0x80
@@ -405,6 +422,7 @@ user_fp_probe_x86:
     ok = sym FP_OK,
     found = sym FP_FOUND,
     tries = sym FP_TRIES,
+    prog = sym FP_PROGRESS,
 );
 
 #[cfg(feature = "selftest")]
@@ -2320,6 +2338,13 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
          `movq xmm, r64` wirkt hier ueberhaupt nicht, und dann ist die Korruption eine Attrappe)",
         FP_TRIES[0].load(Ordering::Relaxed),
         FP_TRIES[1].load(Ordering::Relaxed)
+    );
+    println!(
+        "fp      : Schleifenfortschritt = Sonde0={}/{FP_ITERS} Sonde1={}/{FP_ITERS}. Weder \
+         Erfolgs- noch Korruptionsbit heisst: sie STECKT -- und dann sagt das Ergebnis nichts, \
+         der Fortschritt aber alles ({FP_ITERS} = durchgelaufen, 0 = nie begonnen)",
+        FP_PROGRESS[0].load(Ordering::Relaxed),
+        FP_PROGRESS[1].load(Ordering::Relaxed)
     );
     println!(
         "fp      : FP-Wechsel gesamt = {} (Save eines vorigen Besitzers). **0 hiesse: es wurde nie \

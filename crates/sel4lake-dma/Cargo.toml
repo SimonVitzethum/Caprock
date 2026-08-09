@@ -11,6 +11,9 @@
 name = "sel4lake-dma"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+# **GRENZ-CRATE: permissiv, und das ist tragend** (docs/grenze.md). Jede PD linkt das hier --
+# stuende es unter AGPL, waere jedes Programm mit AGPL-Code gelinkt und die ABI-Ausnahme
+# gegenstandslos. Dieselbe Grenze, fuer die Linux die UAPI-Header-Ausnahme hat.
+license = "MIT OR Apache-2.0"
 
 [dependencies]

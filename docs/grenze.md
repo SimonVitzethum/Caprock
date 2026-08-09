@@ -1,8 +1,9 @@
 # Die Grenz-Crates — was permissiv werden muss, und warum genau diese
 
-**Stand: 2026-08-09. Noch NICHT umgesetzt** — dieses Dokument ist die Liste, nicht der Vollzug.
+**Stand: 2026-08-09. UMGESETZT** — alle sieben Crates tragen `MIT OR Apache-2.0`. Der Kern bleibt
+`AGPL-3.0-or-later`.
 
-SEL4Lake ist `GPL-3.0-or-later`. Alles, was ein **Programm ausserhalb des Kerns** linkt, ist damit
+SEL4Lake ist `AGPL-3.0-or-later`. Alles, was ein **Programm ausserhalb des Kerns** linkt, ist damit
 eine Lizenzgrenze: eine PD, die gegen eine GPLv3-Crate baut, ist mit GPLv3-Code gelinkt — und dann
 hilft weder die Prozesstrennung noch die ABI-Ausnahme, denn beide handeln von der *Schnittstelle*,
 nicht vom *Linken*.
@@ -50,5 +51,6 @@ Umlizenzieren braucht die Zustimmung **aller** Urheber. Solange das eine Person 
 Commit; nach dem ersten gemergten fremden Beitrag ist es ein Einsammelprozess — und dann gilt
 dasselbe für jede künftige ABI-Ausnahme (s. `LICENSE-EXCEPTION.md`).
 
-**Nicht umgesetzt, weil es eine Entscheidung über fremdes Werk wäre.** Die Liste steht; der Vollzug
-gehört dem Urheber.
+**Umgesetzt am 2026-08-09.** Unter AGPL ist das nicht mehr nur sauber, sondern tragend: §13 knüpft
+die Copyleft-Pflicht an den **Betrieb**, und stünden die Grenz-Crates unter AGPL, wäre jede PD mit
+AGPL-Code gelinkt — die ABI-Ausnahme liefe leer, und jeder Kunden-Workload stünde unter §13-Verdacht.

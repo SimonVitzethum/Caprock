@@ -48,6 +48,11 @@
 mod cycles;
 pub use cycles::{CycleStats, Reject, Sample, Source, Stamp, MAX_PLAUSIBLE_SLICE};
 
+/// **Umgeleitete Syscalls** (Z26/A3). Abhängigkeitsfrei und **als Datei** host-getestet — dieselbe
+/// Begründung wie bei [`cycles`]: die Fallen sind Reihenfolgen und Zahlenbereiche, mit Literalen
+/// auslösbar, ohne Maschine.
+pub mod redirect;
+
 use core::sync::atomic::{AtomicU64, Ordering};
 use caprock_hal::exception::init_thread_frame;
 use caprock_slab::{AtomicTable, FreeList, Slab};
@@ -235,6 +240,21 @@ impl BlockReasons {
     pub const PAUSE: u8 = 1 << 2;
     /// Der Thread hat `SYS_PARK` gerufen. Wecker: `unpark` — und **nur** der.
     pub const PARK: u8 = 1 << 3;
+    /// **Der Syscall (oder Fault) dieses Threads liegt bei seiner Persönlichkeits-PD** (Z26/A3).
+    /// Wecker: [`Scheduler::handler_reply`] — und **nur** der.
+    ///
+    /// ## Warum das von Tag eins ein Grund IST und kein Bit daneben
+    ///
+    /// Z26/Nachtrag 3 nennt diesen Fall die **fünfte Instanz** derselben Klasse — diesmal
+    /// vorhersagbar statt gefunden. Läge er als eigenes Bit neben der Menge, wiederholte sich die
+    /// Park-Naht wörtlich: `thaw` weckt einen Handler-Wartenden, oder das `unpark` eines
+    /// Geschwisters verbraucht die Marke, und der Gast **läuft mit halbem Syscall weiter** — mit
+    /// einem Frame, den sein Kernel noch nicht fertig beschrieben hat.
+    ///
+    /// In der Menge ist genau das **unformulierbar**: `resume` entfernt `PAUSE`, `unpark`
+    /// entfernt `PARK`, `unblock` entfernt `IPC` — keiner von ihnen entfernt `HANDLER`, und
+    /// eingereiht wird nur bei leerer Menge.
+    pub const HANDLER: u8 = 1 << 4;
 
     /// Leere Menge = lauffähig.
     pub const NONE: Self = Self(0);
@@ -321,6 +341,14 @@ struct Tcb {
     cyc: CycleStats,
     /// Offener Stempel, solange der Thread **läuft**. `None` heisst „läuft gerade nicht".
     stamp: Option<Stamp>,
+    /// **„Die Syscalls dieses Threads gehen an H"** (Z26/A3). `None` = an den Caprock-Kernel.
+    ///
+    /// Steht im TCB und **nicht** in der PD-Tabelle, aus zwei Gründen. Erstens ist die Bindung
+    /// per Entwurf **je Thread**: eine PD kann Threads mit und ohne Persönlichkeit haben (der
+    /// Ladeprozess einer Persönlichkeit ist selbst kein Gast). Zweitens wandert sie so bei einer
+    /// Migration **umsonst** mit — `Migrant` trägt den ganzen `Tcb`. Läge sie neben dem Thread,
+    /// wäre sie die nächste Stelle, die eine Migration vergisst.
+    handler: Option<redirect::Bindung>,
 }
 
 impl Tcb {
@@ -350,6 +378,7 @@ impl Tcb {
         sc_donee: None,
         cyc: CycleStats::EMPTY,
         stamp: None,
+        handler: None,
     };
 }
 
@@ -1050,6 +1079,101 @@ impl Scheduler {
         self.tcbs[s].reasons.remove(BlockReasons::PAUSE);
         self.wecke_falls_lauffaehig(s);
         true
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Z26/A3: umgeleitete Syscalls
+    // -----------------------------------------------------------------------------------
+
+    /// **Die Handler-Bindung eines Threads setzen oder aufheben** (Z26/A3).
+    ///
+    /// Der Scheduler **entscheidet hier nichts** — Cap-Prüfung, Zyklusverbot und Slot-Vergabe
+    /// liegen im Dispatch, wo die Caps und die PD-Tabelle sind. Diese Funktion ist die Ablage.
+    /// Das ist Absicht: eine Prüfung, die an zwei Stellen steht, ist an einer davon irgendwann
+    /// falsch.
+    ///
+    /// Rückgabe wie [`unblock`](Self::unblock): auf **diesem** Kern auflösbar?
+    pub fn set_handler(&mut self, tid: ThreadId, bindung: Option<redirect::Bindung>) -> bool {
+        let Some(s) = self.resolve(tid) else {
+            return false;
+        };
+        self.tcbs[s].handler = bindung;
+        true
+    }
+
+    /// Die Handler-Bindung eines Threads **dieses** Kerns.
+    pub fn handler_of(&self, tid: ThreadId) -> Option<redirect::Bindung> {
+        self.resolve(tid).and_then(|s| self.tcbs[s].handler)
+    }
+
+    /// Die Handler-Bindung des **laufenden** Threads — der heisse Pfad: genau ein Zugriff je
+    /// Syscall, ohne `resolve`.
+    pub fn current_handler(&self, core: usize) -> Option<redirect::Bindung> {
+        debug_assert_eq!(core, self.core);
+        self.current.and_then(|c| self.tcbs[c].handler)
+    }
+
+    /// **Den laufenden Thread blockieren, weil sein Syscall bei seiner Persönlichkeits-PD liegt.**
+    ///
+    /// Geht durch [`block_current_mit`](Self::block_current_mit) — es ist keine neue Blockade-Art,
+    /// sondern ein neuer **Grund** in derselben Menge. Genau das verlangt Z26/Nachtrag 3, und
+    /// genau deshalb kann kein fremder Wecker ihn aufheben.
+    pub fn block_for_handler(&mut self, core: usize, frame: usize) -> usize {
+        self.block_current_mit(core, frame, BlockReasons::HANDLER)
+    }
+
+    /// **Einem bereits blockierten Thread den Handler-Grund anhängen** (Z26/A3).
+    ///
+    /// Die Zustellung läuft über den vorhandenen Endpoint-Transport; `call` hat den Gast mit
+    /// `IPC` blockiert und weggewechselt. Der zweite Grund kommt hier dazu, und **er ist der
+    /// wichtigere**: die IPC-Antwort des Handlers entfernt `IPC`, aber der Gast darf erst laufen,
+    /// wenn sein Frame aus dem Sidecar zurückgeschrieben ist — und das meldet `handler_reply`.
+    ///
+    /// Ohne diesen zweiten Grund liefe der Gast **mit halbem Syscall** weiter, genau die Wirkung,
+    /// die Z26/Nachtrag 3 vorhersagt.
+    pub fn mark_handler_wait(&mut self, tid: ThreadId) -> bool {
+        let Some(s) = self.resolve(tid) else {
+            return false;
+        };
+        self.tcbs[s].reasons.insert(BlockReasons::HANDLER);
+        // **Und aus der Ready-Queue nehmen, falls er darin steht.** Zwischen `call` und hier kann
+        // niemand laufen (IRQs sind im Trap maskiert, der Kern-Lock wird je Operation genommen) --
+        // aber `call` kann den Gast auch OHNE Blockade zurückgelassen haben, wenn ein Handler
+        // schon wartete und der Fastpath griff. Dann steht er bereit, und ein Grund ohne
+        // Ausreihung waere ein Thread, der blockiert IST und trotzdem in der Liste steht: genau
+        // Audit-Code 2.
+        self.remove_from_ready(s);
+        true
+    }
+
+    /// **Der EINZIGE Wecker des Handler-Grundes** (Z26/A3).
+    ///
+    /// Entfernt `HANDLER` und **nur** das. Ein Gast, der zusätzlich pausiert wurde oder auf einem
+    /// leeren Konto sitzt, bleibt liegen — sein Kernel hat geantwortet, seine Zulassung steht
+    /// deshalb noch aus.
+    ///
+    /// Rückgabe wie [`unblock`](Self::unblock).
+    pub fn handler_reply(&mut self, tid: ThreadId) -> bool {
+        let Some(s) = self.resolve(tid) else {
+            return false;
+        };
+        self.tcbs[s].reasons.remove(BlockReasons::HANDLER);
+        self.wecke_falls_lauffaehig(s);
+        true
+    }
+
+    /// Wartet dieser Thread auf seine Persönlichkeits-PD? (Nur Telemetrie/Prüfung.)
+    pub fn is_handler_blocked(&self, tid: ThreadId) -> bool {
+        self.resolve(tid)
+            .is_some_and(|s| self.tcbs[s].reasons.has(BlockReasons::HANDLER))
+    }
+
+    /// Wie viele Threads dieses Kerns sind **gebunden**? (Sprechprobe: ein Prüfer, der über
+    /// Abwesenheit einer Umleitung urteilt, muss belegen können, dass überhaupt gebunden wurde.)
+    pub fn handler_bound_count(&self) -> usize {
+        (0..self.tcbs.len())
+            .filter(|&s| self.tcbs[s].used && self.tcbs[s].handler.is_some())
+            .count()
     }
 
     /// Auflösung `ThreadId -> lokaler TCB-Index` **dieses** Kerns.
@@ -1824,6 +1948,28 @@ pub trait SchedOps {
     /// Einen bestimmten Thread extern pausieren — reversibel mit [`Self::resume`], **nicht** mit
     /// `unblock`. Seit Z24 nennt jeder Wecker den Grund, den er aufhebt.
     fn pause(&mut self, tid: ThreadId);
+    /// **Die Handler-Bindung des LAUFENDEN Threads** (Z26/A3) — der heisse Pfad.
+    ///
+    /// Wird **einmal je Syscall** gerufen, ganz oben im Dispatch, und ist damit die einzige neue
+    /// Größe auf dem unbelasteten Pfad. Deshalb liest sie den laufenden Thread direkt statt über
+    /// `current_id` + `handler_of` (zwei Sperrungen statt einer).
+    fn current_handler(&mut self, core: usize) -> Option<redirect::Bindung>;
+    /// Die Handler-Bindung eines **beliebigen** Threads (für `SYS_SETHANDLER` und das Audit).
+    fn handler_of(&mut self, tid: ThreadId) -> Option<redirect::Bindung>;
+    /// Die Bindung setzen/aufheben. `false` = Thread nicht auflösbar.
+    fn set_handler(&mut self, tid: ThreadId, bindung: Option<redirect::Bindung>) -> bool;
+    /// Den laufenden Thread blockieren, **weil sein Syscall beim Handler liegt**
+    /// ([`BlockReasons::HANDLER`]).
+    fn block_for_handler(&mut self, core: usize, frame: usize) -> usize;
+    /// Einem **bereits blockierten** Thread den Handler-Grund zusätzlich anhängen.
+    ///
+    /// Getrennt von [`Self::block_for_handler`], weil die Zustellung über den vorhandenen
+    /// Endpoint-Transport läuft: `call` blockiert den Gast mit `IPC` und wechselt weg — er ist
+    /// danach nicht mehr `current`. Der zweite Grund muss also an einen **benannten** Thread,
+    /// nicht an „den laufenden".
+    fn mark_handler_wait(&mut self, tid: ThreadId);
+    /// **Der einzige Wecker des Handler-Grundes.** Entfernt `HANDLER` und nur das.
+    fn handler_reply(&mut self, tid: ThreadId);
     /// Eine **Pause** aufheben (`SYS_PDCTL` RESUME/START).
     ///
     /// Bis Z24 war das `unblock` — und genau daran hing der Fehler: `unblock` hob *irgendeine*

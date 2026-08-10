@@ -262,6 +262,23 @@ TCB_AUSSERHALB = {
     'park_wake':   'Z22: die Weckmarke. Reine Uebergabe zwischen `unpark` und dem naechsten '
                    '`park_current`; das Modell kennt kein Wecken ohne Schlaefer. Dass sie nicht '
                    'verlorengeht, ist GEMESSEN (Pruefzeile `park`), nicht bewiesen',
+    # Z26/A3, 2026-08-10. **Nicht auf `blocked` abgebildet**, und zwar aus der Gegenrichtung als
+    # bei `park_wake`: `handler` ist keine Blockade, sondern eine ZUSTAENDIGKEIT („wer bearbeitet
+    # die Syscalls dieses Threads"). Die zugehoerige Blockade steckt in `reasons`
+    # (`BlockReasons::HANDLER`) und ist ueber die Projektion `blocked <-> reasons != {}` bereits
+    # abgebildet. Das Feld selbst wird von KEINER Einplanungsentscheidung gelesen -- der Scheduler
+    # waehlt nichts danach aus; gelesen wird es im Dispatch, also ausserhalb dieses Modells.
+    #
+    # **Was das Modell damit NICHT sagt** (und was hier stehen muss, damit niemand es
+    # hineinliest): dass ein Wecker den Handler-Grund nicht mitnimmt. Das Modell hat EIN
+    # `blocked` und kennt keine Gruende -- die Aussage ist GEMESSEN (Pruefzeile `handler`, drei
+    # Wecker) und durch einen Quelltext-Waechter gesichert (`tools/redirect-negativ.sh` Q1:
+    # genau eine Stelle entfernt `BlockReasons::HANDLER`), nicht bewiesen.
+    'handler':     'Z26/A3: „die Syscalls dieses Threads gehen an H". Eine ZUSTAENDIGKEIT, keine '
+                   'Blockade -- die zugehoerige Blockade ist `BlockReasons::HANDLER` in `reasons` '
+                   'und damit ueber die Projektion schon abgebildet. Keine '
+                   'Einplanungsentscheidung liest es; der Dispatch liest es, und der ist '
+                   'ausserhalb',
 }
 
 # [2] Funktionen in `lib.rs`, die Modellzustand schreiben.
@@ -326,6 +343,22 @@ CODE_AUSSERHALB = {
                             'dazu Budget-Donation -- ADR 0019 ausdruecklich ausserhalb (Befund B5)',
     'detach_for_migration': 'Migration -- ausserhalb (Einkern-Modell)',
     'attach_migrated':      'dito',
+    # Z26/A3, 2026-08-10. Beide sind Mutatoren des Grundes `BlockReasons::HANDLER` -- also
+    # desselben Feldes `reasons`, das ueber die Projektion `blocked <-> reasons != {}` abgebildet
+    # ist. Ein Uebergang im Modell waere trotzdem falsch: das Modell kennt KEINE Gruende, nur
+    # „blockiert ja/nein". `mark_handler_wait` haette dort den Uebergang `blocked := true`,
+    # `handler_reply` `blocked := false` -- und beides waere WENIGER wahr als der Code, weil die
+    # tragende Aussage gerade ist, dass die Blockade NICHT von einem beliebigen Wecker faellt.
+    #
+    # Dieselbe Begruendung wie bei `unpark` daneben, und dieselbe Ehrlichkeit: die Eigenschaft ist
+    # gemessen (Pruefzeile `handler`), nicht bewiesen. Was das Modell hier gaebe, waere ein
+    # Beweis, der die Wunschform beweist -- die Falle aus der Fallenliste.
+    'mark_handler_wait':    'Z26/A3: haengt den Grund HANDLER an einen bereits blockierten Thread '
+                            'und reiht ihn aus. Das Modell kennt keine Gruende (nur EIN '
+                            '`blocked`) -- also kein Uebergang, den man nachtragen koennte',
+    'handler_reply':        'Z26/A3: der EINZIGE Wecker des HANDLER-Grundes; entfernt ihn und '
+                            'reiht bei leerer Menge ein. Dito -- und die Aussage „nur dieser eine '
+                            'Wecker" ist genau die, die das Modell nicht ausdruecken kann',
 }
 
 # [3] Die Paare Modell <-> Code samt eingefrorener Uebertragungsluecke.

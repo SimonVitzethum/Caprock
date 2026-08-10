@@ -3486,6 +3486,48 @@ Nebensatz: Z16 Stufe 1 steht damit vor Arbeiten, die nur eine Zusage schärfen, 
       Fehlschlag des Thread-Slots seine 64 KiB Stack** (`?` ohne Rückgabe) — genau an der
       Kapazitätsgrenze, wo dieser Zweig läuft. Beides behoben bzw. benannt.
 
+- [x] **Der Mangel-Sweep: aus „gegengelesen" ist „kann nicht schweigen" geworden** (2026-08-10,
+      abends). Die `mangel`-Zeile belegte **eine** Meldestelle; die übrigen standen im Quelltext
+      als „gegengelesen, nicht gemessen" — ehrlich und trotzdem ein Nullbefund.
+      **Zuerst gezählt, denn „rund zwanzig" war falsch: es sind 31** (`system::MELDESTELLEN`,
+      nachgezählt von `tools/mangel-stellen.sh` mit Selbsttest in beide Richtungen) — 17
+      handgeschriebene `mangel(..)`-Aufrufe, die **schweigen können**, und 14 über
+      `benannt_alloc`/`benannt_slot`, die es strukturell nicht können.
+      **Provoziert wird mit einer Sperre im Allokator**, nicht mit einer Mutation je Stelle:
+      `sperre_scharf(k)` lässt `k` Anforderungen durch und weist ab der `k+1`-ten jede ab; über
+      wachsendes `k` wandert der Fehlschlag den Pfad entlang. Der Allokator sagt nein, den Weg
+      danach geht der echte Code — die Sperre schreibt keinen Mangel-Code. Sie merkt sich die
+      **abgewiesene Menge**, und die gemeldete Zahl wird gegen *diese* geprüft, nicht gegen eine
+      Konstante im Prüfer, die mit einem Literal gemeinsam falsch sein könnte.
+      Gemessen: **23 provozierte Abweisungen auf 6 spawn-Pfaden**, 5 von 6 bis zum Ende gefahren,
+      `geschwiegen=0 · keiner=0 · Menge-nicht-aus-dem-Aufruf=0`. Abdeckung **11 von 31**; die
+      Summanden gehen auf: 11 provoziert + 9 Platz-Töpfe + 10 Ladepfad + 1 (2917).
+      **Drei Gegenproben, jede isoliert genau ein Konjunkt:** eine stumm gemachte Meldestelle →
+      `geschwiegen=5`; eine Menge aus einem Literal → `Menge NICHT aus dem Aufruf=4`; und die
+      dritte ist der eigentliche Befund (s. u.).
+      **Der Befund, der größer ist als der Eintrag: die vergiftete Marke war seit ihrer Einführung
+      tot.** Jeder `spawn_*`-Pfad ruft `mangel_zuruecksetzen()` als **erste** Anweisung — also
+      zwischen dem Vergiften und der ersten Anforderung. „Der Pfad hat geschwiegen" war damit
+      strukturell unerreichbar, während die Berichtszeile ihn wörtlich versprach. Gemessen mit
+      derselben stumm gemachten Stelle: **mit** der Behebung `geschwiegen=5`, **ohne** sie
+      `keiner=5` — und `keiner` heißt „lag an keiner Ressource", genau das, wovon die Marke
+      trennen sollte. Seit heute überlebt die Marke das Zurücksetzen; `mangel_entgiften()` nimmt
+      sie hinterher weg.
+      **Nebenbefund, der eine Stelle als solche einordnet:** die drei
+      `MANGEL_MAPPING_ABGEWIESEN`-Stellen (2917/4057/4120) können gegen einen leeren Allokator
+      **nie** feuern — sie melden den Fall „der Allokator wurde NICHT gefragt". Wer sie prüfen
+      will, braucht eine krumme VA/PA, keinen leeren Topf. Das ist kein Loch, sondern die
+      Bedeutung der Stelle; sie steht deshalb als eigener Summand in der Bilanz.
+
+- [ ] **Die 20 nicht provozierten Meldestellen** (Rest des obigen Punktes). Zwei Gruppen, zwei
+      verschiedene Arbeiten — und beide sind heute **benannt**, nicht vergessen:
+      * **9 Platz-Töpfe** (Thread-Slot, ASID, Farbstreifen, PD-Slot): die Sperre sitzt im
+        Speicher-Allokator und trifft sie nicht. Eine zweite Sperre auf den Platz-Töpfen wäre
+        billig — die Frage ist, wohin sie gehört, ohne dass die Kapazitätskurve sie mitzieht.
+      * **10 Ladepfad-Stellen**: sie brauchen ein Boot-Archiv, das es nur in der **Lade-Suite**
+        gibt. Der Sweep müsste dort laufen, nicht in der Hauptsuite. Das ist der billigere der
+        beiden Punkte: die Mechanik steht, es fehlt der Einsprung.
+
 - [ ] **Noch ohne Füllstandsanzeige** (Rest des obigen Punktes): der **FP-Slab**, die
       **VSpace-/ASID-Tabelle** (nur als `free_vspaces()` in der Kurve, nicht im Bericht), die
       **IRTE-Tabelle** und der **Finalisierungspuffer**.

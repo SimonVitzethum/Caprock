@@ -1629,6 +1629,11 @@ enum Zone {
 /// ist „woanders" besser als „gar nicht" — ein Kernel, der wegen einer Vorliebe keinen Stack mehr
 /// bekommt, waere schlechter dran als einer, der ihn tief nimmt.
 fn zoned_alloc(size: u64, align: u64, zone: Zone) -> Option<MemoryCap> {
+    // Trichter fuer die Sperre des Mangel-Sweeps -- s. dort.
+    #[cfg(feature = "selftest")]
+    if sperre_greift(size) {
+        return None;
+    }
     let grenze = hal::mmu::LOW_MAPPED_END;
     // **Architekturen ohne die Zweiteilung.** Auf aarch64 ist `LOW_MAPPED_END` bewusst
     // `u64::MAX` -- es gibt dort keinen Bereich oberhalb einer Kartengrenze. Ohne diese Zeile
@@ -1710,6 +1715,11 @@ fn gib0_zone() -> (u64, u64) {
 /// verlässt sich stillschweigend auf die Belegungsordnung des Allokators — und die ist keine
 /// Zusicherung, sondern eine Nebenwirkung von Best-Fit über einen zufälligen Speicherplan.
 fn mem_alloc_below(size: u64, align: u64, limit: u64) -> Option<MemoryCap> {
+    // Trichter fuer die Sperre des Mangel-Sweeps -- s. dort.
+    #[cfg(feature = "selftest")]
+    if sperre_greift(size) {
+        return None;
+    }
     let cap = MEM.lock().alloc_below(size, align, limit)?;
     zero_phys(cap.base(), cap.len());
     Some(cap)
@@ -1778,6 +1788,11 @@ fn zoned_alloc_colored(
     mask: caprock_mem::ColorMask,
     zone: Zone,
 ) -> Option<MemoryCap> {
+    // Trichter fuer die Sperre des Mangel-Sweeps -- s. dort.
+    #[cfg(feature = "selftest")]
+    if sperre_greift(size) {
+        return None;
+    }
     let colors = crate::colors::count();
     let grenze = hal::mmu::LOW_MAPPED_END;
     let (lo, hi) = if grenze == 0 || grenze == u64::MAX {
@@ -3877,8 +3892,95 @@ pub const MANGEL_GUARD_TABELLE: u32 = 13;
 /// Steht er hinterher noch da, hat der gepruefte Pfad **geschwiegen** — und das ist von „es lag
 /// an keiner Ressource" nicht zu unterscheiden, solange man nicht vorher vergiftet hat.
 pub const MANGEL_VERGIFTET: u32 = 255;
+/// **Wie viele Stellen im Kern einen Mangel MELDEN — gezaehlt, nicht geschaetzt.**
+///
+/// Bis zum 2026-08-10 stand an der `mangel`-Pruefzeile „rund zwanzig". Eine Zahl ohne Zaehlung ist
+/// derselbe Nullbefund wie „ich habe das noch nie gesehen": sie klingt nach einer Groesse und ist
+/// eine Erinnerung. Gezaehlt sind es **31** — 17 handgeschriebene [`mangel`]-Aufrufe, 8
+/// [`benannt_alloc`] und 6 [`benannt_slot`]. Der Setzer der Marke ([`mangel_vergiften`]) zaehlt
+/// **nicht** mit: er meldet keinen Mangel, er stellt eine Frage.
+///
+/// Die Unterscheidung, die daran haengt: die 14 Stellen ueber [`benannt_alloc`]/[`benannt_slot`]
+/// koennen **strukturell nicht schweigen** (der Helfer meldet bei jedem `None`), die 17
+/// handgeschriebenen koennen es sehr wohl — dort ist ein `return None` ohne `mangel(..)` daneben
+/// eine Zeile Unaufmerksamkeit.
+///
+/// Bewacht von `tools/mangel-stellen.sh`: das Skript zaehlt im Quelltext nach und bricht ab, wenn
+/// diese Zahl nicht mehr stimmt. Eine Zahl im Kommentar verrottet, eine Zahl mit Waechter nicht.
+pub const MELDESTELLEN: usize = 31;
+
 /// `code << 32 | angeforderte_bytes`
 static LADE_MANGEL: AtomicU64 = AtomicU64::new(0);
+
+// ================================================================================================
+// DIE SPERRE — der Allokator sagt auf Ansage NEIN, damit jede Meldestelle einmal sprechen muss
+// ================================================================================================
+//
+// **Warum eine Sperre und nicht zwanzig Mutationen.** Die Frage je Meldestelle lautet „kann diese
+// Stelle SCHWEIGEN?". Eine Mutation je Stelle beantwortet sie, kostet aber einen Bau je Stelle.
+// Die Sperre beantwortet sie fuer einen ganzen Pfad in einem Lauf: sie laesst `n` Anforderungen
+// durch und weist ab der `n+1`-ten alles ab. Ueber wachsendes `n` wandert der Fehlschlag den Pfad
+// entlang und trifft jede Anforderung genau einmal.
+//
+// **Der Allokator sagt nein, nicht die Meldestelle.** Die Sperre sitzt in den drei Trichtern
+// ([`zoned_alloc`], [`zoned_alloc_colored`], [`mem_alloc_below`]) und gibt `None` zurueck — den
+// Weg danach geht der echte Code. Sie faelscht keinen Mangel-Code; steht hinterher einer da, hat
+// ihn der gepruefte Pfad geschrieben. Eine Sperre, die den Code selbst setzte, pruefte sich selbst.
+//
+// **Sie merkt sich die abgewiesene MENGE** — und das ist der Konjunkt gegen die Falle vom
+// 2026-08-10 (`mangel(MANGEL_SEITENTABELLE, 4096)` als Literal neben einer Stelle, an der der
+// Allokator nie gefragt worden war). Verglichen wird die gemeldete Zahl gegen diese — nicht gegen
+// eine Konstante im Pruefer, die mit dem Literal gemeinsam falsch sein koennte.
+//
+// **Grenze, die hier steht, damit sie auffaellt:** die Sperre gilt nur auf dem Kern, der sie scharf
+// gestellt hat. Wird der Pruefer dort verdraengt und der fremde Faden alloziert, verbraucht er
+// einen Durchlass — dann gelingt der provozierte Aufruf, und der Sweep zaehlt den Durchgang als
+// `fremd`, statt ihn zu bewerten. Ein verbrauchter Durchlass wird sichtbar und nicht still als
+// Erfolg gebucht.
+
+/// Restliche Durchlaesse; `u64::MAX` heisst **aus**.
+#[cfg(feature = "selftest")]
+static SPERRE_REST: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Menge der ERSTEN abgewiesenen Anforderung; `u64::MAX` heisst „hat nie gefeuert".
+#[cfg(feature = "selftest")]
+static SPERRE_MENGE: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Der Kern, auf dem die Sperre gilt.
+#[cfg(feature = "selftest")]
+static SPERRE_KERN: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Sperre scharf stellen: `durchlass` Anforderungen gehen noch durch, danach jede `None`.
+#[cfg(feature = "selftest")]
+pub fn sperre_scharf(durchlass: u32) {
+    SPERRE_MENGE.store(u64::MAX, Ordering::Relaxed);
+    SPERRE_KERN.store(hal::cpu::core_id(), Ordering::Relaxed);
+    SPERRE_REST.store(u64::from(durchlass), Ordering::Release);
+}
+
+/// Sperre wegnehmen. Gibt `(hat gefeuert, Menge der ersten abgewiesenen Anforderung)`.
+#[cfg(feature = "selftest")]
+pub fn sperre_aus() -> (bool, u64) {
+    SPERRE_REST.store(u64::MAX, Ordering::Release);
+    let m = SPERRE_MENGE.load(Ordering::Relaxed);
+    (m != u64::MAX, m)
+}
+
+#[cfg(feature = "selftest")]
+fn sperre_greift(size: u64) -> bool {
+    let rest = SPERRE_REST.load(Ordering::Acquire);
+    if rest == u64::MAX {
+        return false;
+    }
+    // Nur der armierte Kern ist betroffen; fremde Kerne allozieren unbehelligt weiter.
+    if SPERRE_KERN.load(Ordering::Relaxed) != hal::cpu::core_id() {
+        return false;
+    }
+    if rest > 0 {
+        SPERRE_REST.store(rest - 1, Ordering::Release);
+        return false;
+    }
+    let _ = SPERRE_MENGE.compare_exchange(u64::MAX, size, Ordering::Relaxed, Ordering::Relaxed);
+    true
+}
 
 fn mangel(code: u32, bytes: u64) {
     LADE_MANGEL.store((u64::from(code) << 32) | (bytes & 0xffff_ffff), Ordering::Relaxed);
@@ -3890,7 +3992,37 @@ fn mangel(code: u32, bytes: u64) {
 /// ist schlimmer als keiner: er macht den Punkt unbehebbar, weil die Diagnose an einer Stelle
 /// sucht, an der nichts ist.
 fn mangel_zuruecksetzen() {
+    // **Die Marke der Sprechprobe ueberlebt das Zuruecksetzen** (2026-08-10, zweiter Durchgang).
+    //
+    // Ohne diese Zeile war der Ausgang, den [`MANGEL_VERGIFTET`] benennen soll, **strukturell
+    // unerreichbar**: alle sieben Ruecksetzstellen liegen in der ERSTEN Anweisung ihres
+    // `spawn_*`-Pfades, also zwischen dem Vergiften und der ersten Anforderung. Ein Pfad, der
+    // schweigt, meldete damit `MANGEL_KEINER` -- exakt den Zustand, den das Vergiften
+    // unterscheidbar machen sollte. Die Berichtszeile versprach „steht er noch da, hat der Pfad
+    // GESCHWIEGEN" fuer einen Fall, den es nicht geben konnte.
+    //
+    // **Gemessen, nicht ueberlegt:** mit einer stumm gemachten Meldestelle meldet der Sweep mit
+    // dieser Zeile `geschwiegen=5`, ohne sie `keiner=5` -- und `keiner` ist von „lag an keiner
+    // Ressource" nicht zu unterscheiden.
+    //
+    // Die Marke setzt ausschliesslich der Pruefpfad, und er raeumt sie mit [`mangel_entgiften`]
+    // wieder weg. Ein liegengebliebenes Gift faellt sofort auf: es steht als solches im Bericht.
+    #[cfg(feature = "selftest")]
+    if (LADE_MANGEL.load(Ordering::Relaxed) >> 32) as u32 == MANGEL_VERGIFTET {
+        return;
+    }
     LADE_MANGEL.store(0, Ordering::Relaxed);
+}
+
+/// Die Marke wieder wegnehmen — das Gegenstueck zu [`mangel_vergiften`].
+///
+/// Der Pruefpfad raeumt hinter sich auf, damit ein spaeterer echter Fehlschlag nicht die Marke
+/// einer laengst gelaufenen Sprechprobe meldet. Ein veralteter Grund ist schlimmer als keiner.
+#[cfg(feature = "selftest")]
+pub fn mangel_entgiften() {
+    if (LADE_MANGEL.load(Ordering::Relaxed) >> 32) as u32 == MANGEL_VERGIFTET {
+        LADE_MANGEL.store(0, Ordering::Relaxed);
+    }
 }
 
 /// **Die Marke fuer die Sprechprobe setzen** ([`MANGEL_VERGIFTET`]).

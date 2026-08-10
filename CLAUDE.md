@@ -876,6 +876,27 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   Trennschärfe, und ihre Begründung im Bericht war zusätzlich seit A4 **überholt**. Gefragt ist
   die Größe, die sich wirklich ändert (Fortschritt, Korruptionsmeldung, **eigene**
   Verdrängungszahl), nicht die bequem formulierbare.
+* **Eine Skalierungskurve ohne Lebendigkeitsbeweis zählt Leichen.** Die isolierte Reihe der
+  Kapazitätskurve meldete 224/1504/3040 „isolierte Prozesse" — tatsächlich lag `kurven_arbeiter`
+  in `.text`, jeder EL0-Thread faultete sofort an seiner eigenen Einsprungadresse (**228
+  `el0-trap`-Zeilen bei 224 PDs**, am Ende **0 belegte VSpaces**). Gemessen war die
+  Geschwindigkeit des Sterbens. Die Bedingung dahinter gilt weiter und ist allgemeiner als der
+  Einsprungfehler: **jede gezählte Einheit muss eine Arbeit nachweisen, die nur ein LAUFENDER
+  Träger leisten kann.** „Angelegt" ist keine solche Arbeit — `spawn` gibt `Some`, auch wenn der
+  Thread nie eine Instruktion ausführt, und eine Kurve, die Rückgabewerte zählt, steigt dann
+  genauso schön. Die berichtigte Reihe (220/1477) hängt an **belegten VSpaces** und **gehaltenen
+  Seitentabellen-Rahmen**: Größen, die zurückgehen, sobald die Träger sterben. Dieselbe
+  Unterscheidung wie `rx_used` gegen „Daten sind angekommen".
+* **Eine Marke, die der geprüfte Pfad in seiner ersten Zeile löscht, ist keine Marke.**
+  `MANGEL_VERGIFTET = 255` sollte „der Pfad hat geschwiegen" von „es lag an keiner Ressource"
+  unterscheidbar machen — aber jeder `spawn_*`-Pfad ruft `mangel_zuruecksetzen()` als **erste**
+  Anweisung, also zwischen dem Vergiften und der ersten Anforderung. Der Ausgang, den die
+  Berichtszeile wörtlich versprach („steht er noch da, hat der Pfad GESCHWIEGEN"), war damit
+  strukturell unerreichbar. Gemessen mit einer stumm gemachten Meldestelle: mit der Behebung
+  meldet der Sweep `geschwiegen=5`, ohne sie `keiner=5` — und `keiner` heißt „lag an keiner
+  Ressource", also genau das, wovon die Marke trennen sollte. **Wer eine Marke setzt, muss den
+  Weg prüfen, den sie überleben soll** — sonst prüft der Prüfer eine Eigenschaft, die vor seiner
+  ersten Messung schon weg ist. Dieselbe Form wie die leere Event-Queue ohne `CD.R`.
 
 ## Aufbau, grob
 

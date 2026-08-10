@@ -109,9 +109,46 @@ ohne nachfragen zu müssen.
 ## Vor jeder Übergabe
 
 ```sh
-./test-qemu-x86.sh                                                    # x86-Suite
-rustc --test --edition 2021 -O crates/caprock-mem/src/lib.rs -o /tmp/t && /tmp/t   # Host-Tests
+./tools/abnahme.sh          # die ganze Reihe, mit Schlusszeilen und Bilanz
 ```
+
+**Wandzeit: 922 s (rund 15 min) bei warmem `build/`, gemessen am 2026-08-10** — davon gehen 846 s
+auf die drei Läufe der Lade-Suite (je ~280 s, sie baut ein Archiv), die fünf Läufe der Hauptsuite
+kosten zusammen 53 s. Der **erste** Lauf in einem frischen Arbeitsbaum baut den Kernel von Grund
+auf und dauert entsprechend länger; das ist Absicht und kein Defekt (s. unten).
+
+**Die RAM-Größe ist ein Testparameter, kein Detail — und die Reihe steht hier, weil sie schon
+einmal übersprungen wurde.** Am 2026-08-10 fiel `grossdma : FAILURES` bei `-m 3G` durch, weil die
+Abnahme eines Merges nur 512M gefahren hatte. Dass die Reihe grün sein muss, stand zu dem
+Zeitpunkt seit sechs Tagen als gemessener Stand in `CLAUDE.md` — der Fehler war also nicht
+Unwissen, sondern eine bekannte Reihe, die niemand gefahren hat. Deshalb ist sie jetzt ein
+Werkzeug: ein Merkzettel wird gelesen, wenn man ohnehin schon daran denkt.
+
+Was `tools/abnahme.sh` fährt:
+
+| | |
+|---|---|
+| Hauptsuite | `512M · 2560M · 3G · 4G · 6G` |
+| Lade-Suite | `512M · 3G · 6G` — sie hat als einzige einen **Ladepfad**, und der ist die Hälfte, die die Hauptsuite strukturell nicht prüft |
+| Wächter | `tools/host-tests.sh`, `tools/kernel-grenze.sh`, `tools/mangel-stellen.sh` |
+
+`3G` ist der Punkt, an dem sich die **Größenrelation umkehrt** (oben 1024 MiB gegen unten
+2032 MiB). Genau daran fiel E-Rest 3b auf: „unten zuerst" war jahrelang ein Zufall dieser
+Relation, und bei 3G fällt der ganze Ladepfad aus. Bei 512M und 6G ist der Fall nicht sichtbar.
+
+Von Hand geht es weiterhin (`./test-qemu-x86.sh <sek> <ram>`), und für einen Zwischenstand gibt
+es `--schnell` — das sagt dann aber selbst an, dass es **keine Abnahme** ist.
+
+**Die Abnahme hinterlässt zwei geänderte, VERSIONIERTE Dateien**, und das ist keine Regression:
+`test-qemu-x86-load.sh` ruft `gen_manifest_key.py --ensure`, und in einem Arbeitsbaum ohne `keys/`
+(gitignored, maschinenlokal) entsteht dabei ein frisches Testschlüsselpaar. Der öffentliche Teil
+wird nach `kernel/src/manifest_keys.rs` und `kernel/src/trusted_keys.rs` geschrieben — beide sind
+getrackt. Nach der Abnahme stehen sie also in `git status`, mit einem Schlüssel, der nur auf
+dieser Maschine etwas bedeutet. **Vor dem Commit zurücksetzen** (`git checkout --` auf die beiden);
+der nächste Lauf schreibt sie ohnehin neu. Genau hierfür gilt Regel 2 (`git add <datei>`, niemals
+`git add -A`) ein zweites Mal: ein Sammel-Add committet den lokalen Testschlüssel in die
+Key-DB des Kernel-Images.
+
 Was nicht grün ist, wird **begründet** — nicht weggelassen. Und: gegen `SELFTEST COMPLETE` prüfen,
 nicht gegen die gerade interessierende Zeile. Ein Lauf, der danach hängenbleibt, zählte sonst als
 Erfolg (dieser Fehler ist hier schon einmal gemacht worden).

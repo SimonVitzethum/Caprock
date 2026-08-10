@@ -58,4 +58,77 @@ if [ "$MB_MAGIC_OFF" -ge 8192 ]; then
     exit 1
 fi
 echo "multiboot: Header bei Dateioffset $MB_MAGIC_OFF (< 8192 -- QEMU findet ihn)"
+
+# **Kein LOAD-Segment darf Dateiinhalt tragen, wo nur NOBITS-Sektionen liegen.**
+#
+# Diese Zeile wandelt eine Behauptung in eine geprueffte Eigenschaft. Am 2026-08-10 stand nach
+# einem halben Tag Suche der Satz "der Blocker existierte als Codeproblem nie" -- belegt war aber
+# nur, dass er auf frischem Zweig NICHT REPRODUZIERT. Die Beobachtungen davor (acht einander
+# ueberlappende LOADs, ~1 MiB `filesz` fuer nachweislich NOBITS-Sektionen) waren echte
+# readelf-Ausgaben IRGENDEINES Binaries. War es der veraltete Stand: gut. Macht aber irgendeine
+# Kombination aus Sektionsreihenfolge und Skript das Layout REIHENFOLGEABHAENGIG, kommt der Fall
+# wieder -- und dann fehlte die Zeile, die ihn sofort erkennt.
+#
+# Geprueft wird die Form, an der er sich zeigte, nicht die vermutete Ursache: ein Segment, dessen
+# Adressbereich ausschliesslich von NOBITS-Sektionen belegt ist, aber `filesz > 0` hat. Das ist
+# genau die Signatur "der Linker schreibt den BSS-Bereich als Dateiinhalt aus, um etwas dahinter
+# zu platzieren".
+python3 - "$ELF" <<'PYEOF' || exit 1
+import subprocess, sys, re
+elf = sys.argv[1]
+
+# **Die Zuordnung Sektion -> Segment wird GELESEN, nicht nachgerechnet.**
+# Die erste Fassung dieser Pruefung leitete sie aus vaddr-Bereichen ab -- und ordnete dem Segment
+# bei 0x9000 prompt `.boot`, `.text` und `.rodata` zu, weil dessen `memsz` den ganzen Bildbereich
+# ueberspannt (VMA 0x9000, aber die BSS-Reservierung liegt hoch). Ein Pruefer, der die gepruefte
+# Groesse nachrechnet statt sie zu lesen, prueft eine zweite Wirklichkeit -- dieselbe Falle wie
+# `iova_window_clear_of_msi`. readelf druckt die Zuordnung; sie ist die eine Quelle.
+aus = subprocess.run(["readelf","-lW",elf],capture_output=True,text=True).stdout
+
+art = {}
+for l in subprocess.run(["readelf","-SW",elf],capture_output=True,text=True).stdout.split("\n"):
+    m = re.match(r"\s*\[\s*\d+\]\s+(\S+)\s+(\S+)\s+[0-9a-f]+\s+[0-9a-f]+\s+([0-9a-f]+)", l)
+    if m and m.group(2) in ("PROGBITS","NOBITS"):
+        art[m.group(1)] = (m.group(2), int(m.group(3),16))
+
+lo = []
+for l in aus.split("\n"):
+    m = re.match(r"\s*LOAD\s+0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+0x([0-9a-f]+)", l)
+    if m:
+        lo.append((int(m.group(2),16), int(m.group(4),16)))   # vaddr, filesz
+
+zuordnung = []
+in_map = False
+for l in aus.split("\n"):
+    if "Section to Segment mapping" in l: in_map = True; continue
+    if in_map:
+        m = re.match(r"\s*(\d+)\s+(.*)$", l)
+        if m: zuordnung.append(m.group(2).split())
+        elif l.strip() == "": continue
+
+if not lo or not zuordnung:
+    print("BUILD FAILED: LOAD-Segmente oder Sektionszuordnung nicht lesbar -- die Pruefung konnte "
+          "nicht laufen. Das ist KEIN bestandener Test.", file=sys.stderr)
+    sys.exit(1)
+
+# Die Zuordnungsliste zaehlt ALLE Segmenttypen; nur die LOADs interessieren, in ihrer Reihenfolge.
+loads_idx = [i for i, l in enumerate(aus.split("\n")) if re.match(r"\s*LOAD\s", l)]
+typ_folge = [l.split()[0] for l in aus.split("\n") if re.match(r"\s*(LOAD|PHDR|NOTE|GNU_\S+|TLS|INTERP|DYNAMIC)\s", l)]
+schlecht = 0
+li = 0
+for i, sektionen in enumerate(zuordnung):
+    if i >= len(typ_folge) or typ_folge[i] != "LOAD":
+        continue
+    if li >= len(lo): break
+    vaddr, filesz = lo[li]; li += 1
+    echte = [x for x in sektionen if art.get(x, ("?",0))[1] > 0]
+    if filesz > 0 and echte and all(art[x][0] == "NOBITS" for x in echte):
+        print(f"BUILD FAILED: LOAD @ {vaddr:#x} traegt {filesz} Byte Dateiinhalt, enthaelt aber "
+              f"nur NOBITS-Sektionen ({', '.join(echte)}).", file=sys.stderr)
+        print("  Signatur eines reihenfolgeabhaengigen Layouts: der Linker schreibt den", file=sys.stderr)
+        print("  BSS-Bereich als Datei aus, um etwas dahinter zu platzieren. S. todo.md.", file=sys.stderr)
+        schlecht += 1
+sys.exit(1 if schlecht else 0)
+PYEOF
+echo "multiboot: $(readelf -lW "$ELF" | grep -c '^  LOAD') LOAD-Segmente, keines traegt Dateiinhalt ueber reinem NOBITS"
 echo "x86_64-Kernel: $ELF (ELF64) + $ELF.mb32 (Multiboot-ELF32 fuer 'qemu-system-x86_64 -kernel')"

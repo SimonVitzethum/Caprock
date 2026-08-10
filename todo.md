@@ -51,6 +51,38 @@ Spalte „bootet" nicht misst, was sie behauptet, ist schlimmer als keine.
       über `git fsck` zurückgelegt, nichts verloren).
 
 
+## LESEHILFE: was welche Kennung bedeutet — und der Stand der vier Z26-Nachträge
+
+**Eine Kennung, zwei Bedeutungen** (bemerkt 2026-08-10, bevor sie zur Fussnote wurde):
+
+| Kennung | in **Z19** (Substrat der Sprachlaufzeiten) | in **Z26** (GPU/CUDA) |
+|---|---|---|
+| `A1` | der Prozessstart-Stack (`argc`, `auxv`) | NVIDIA-**Kernelmodul** portieren |
+| `A2` | TLS | die `/dev/nvidia*`-**ioctl-Fläche** als PD-Protokoll |
+| `A3` | **Stack und Guard-Page** | die **binäre Linux-ABI** (Loader für fremde ELFs, Signale, `futex`, `mmap`) |
+| `A4` | SSE freischalten (erledigt) | 84 MB **GSP-Firmware** ausliefern + Attestierung |
+
+Wer „A3" ohne Strang nennt, hat zwei verschiedene Arbeiten gemeint. **Ab hier immer mit Strang:
+`Z19/A3` oder `Z26/A3`.** Dieselbe Sorte Drift wie „seL4 → SEL4 → Sel4lake", nur bei Kennungen
+statt bei Namen — und aus demselben Grund teuer: in drei Monaten rekonstruiert es niemand mehr.
+
+**Was am 2026-08-10 gebaut wurde, ist `Z26/A3` — genauer: nur dessen Kernstück**, das
+Kernel-Primitiv für umgeleitete Syscalls. Nicht der Loader für fremde ELFs, nicht die
+glibc-Symbolfläche, nicht Signale/`futex`/`mmap`.
+
+**Stand der vier Nachträge, die vor dem Bau zu klären waren:**
+
+| | Nachtrag | Stand |
+|---|---|---|
+| 1 | Die Umkehr der protokollierten Entscheidung **Z16** muss als neue Entscheidung benannt sein | **erledigt** — steht als Eintrag; die Forderung der alten Analyse (WSL1 scheiterte an der **Verhaltenstreue**) ist mit übernommen |
+| 2 | Die **Autoritätsliste** war registergross: Frame-Schreibumfang, Gast-**Speicherzugriff**, **Vspace**-Recht | **offen** — das Primitiv vergibt nach eigener Messung **1,5 von 4**. Ohne Gast-Speicherzugriff ist *jeder Syscall mit Zeiger* nicht implementierbar (`read`, `write`, `ioctl` — für CUDA die ganze Fläche); ohne Vspace-Manipulation kein `mmap` |
+| 3 | Die **Blockiernaht** (Zyklusverbot **im Kernel**, Wartegrund in der Grund-Menge) | **erledigt, beide Hälften** — `pruefe_bindung` geht den Graphen (nicht nur den direkten Partner), Wartegrund von Tag eins in `BlockReasons` |
+| 4 | **Messmatrix mit vorab fixierter Schwelle** | **halb** — die Schwelle steht (umgeleiteter `getpid` ≤ 2000 Zyklen, verankert an Z18 (2)), **gemessen ist nichts**. Für `read` 4/64 KiB ist keine Schwelle festlegbar, weil der Pfad nicht existiert (Gast-Speicher-Autorität fehlt, s. Nachtrag 2) |
+
+**Dazu die grösste offene Lücke des Primitivs, aus seinem eigenen Bericht:** die **Nutzlast**
+fehlt — Frame ↔ Sidecar wird nicht kopiert, und kein Pfad prägt eine Handler-Cap. Das Primitiv ist
+damit richtig, aber **nicht benutzbar**, und `SYS_SETHANDLER` kann heute nie erfolgreich sein.
+
 ## Z. Zielarchitektur (Stand 2026-07-29) — woran alles andere zu messen ist
 
 > **Reihenfolge und Begründung:** [docs/plan-betriebsbereit.md](docs/plan-betriebsbereit.md).

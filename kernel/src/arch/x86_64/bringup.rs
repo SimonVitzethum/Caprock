@@ -259,6 +259,81 @@ extern "C" fn ring3_park_probe(_arg: usize) -> ! {
 static PARK_PROBE_RUNDEN: AtomicU64 = AtomicU64::new(0);
 
 // ================================================================================================
+// Z23 S1 — DIE TORE EINER PD (Zwei-Phasen-Stilllegung)
+// ================================================================================================
+//
+// **Was diese Sonde belegt, und was sie ausdruecklich NICHT belegt.**
+//
+// Belegt wird die erste Phase: eine PD mit geschlossenen Toren kann nichts **anfangen**
+// (`RECV` -> `ERR_QUIESCING`), und nach dem Oeffnen kann sie es wieder. Das zweite ist die
+// Sprechprobe, und sie ist der schwierigere Teil: „weist ab" ist von „ist kaputt" nur zu
+// unterscheiden, wenn derselbe Aufruf danach **anders** ausgeht.
+//
+// **Gemessen wird der Unterschied SOFORT-ABWEISUNG gegen BLOCKIEREN**, nicht ein zweiter
+// Ergebniscode. Nach dem Oeffnen gibt es keinen Sender, also blockiert das `RECV` -- und genau
+// das ist der Beleg, dass es durch das Tor gekommen ist. Ablesbar ist es an der **Grund-Menge**
+// aus Z24 (`IPC` gesetzt): der Umbau von heute frueh liefert Z23 sein Messinstrument.
+//
+// **NICHT belegt** ist S1b -- was ein FREMDER Aufrufer erlebt, der in diese PD hineinruft. Die
+// Endpoints existieren weiter, und ein Dritter blockiert dort bis zum Thaw. Das ist eine offene
+// Entwurfsentscheidung mit drei Optionen (todo Z23/S1b), und eine stillschweigende Wahl waere die
+// schlechteste.
+#[cfg(feature = "selftest")]
+static Q_PROBE_TID: AtomicU64 = AtomicU64::new(0);
+/// Der PD-Index der Sonde -- der Kernel muss ihre Tore wieder oeffnen koennen.
+#[cfg(feature = "selftest")]
+static Q_PROBE_PD: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Ergebnis der EINMALIGEN Messung: Bit 0..5 die Aussagen, Bit 63 „gemessen". Das Urteil entsteht
+/// HIER und nicht im Bericht -- was der Bericht setzt, kann den Bericht nicht ausloesen.
+#[cfg(feature = "selftest")]
+static Q_MESS: AtomicU64 = AtomicU64::new(0);
+/// Bit 0 = die Sonde lief · Bit 1 = das erste `RECV` gab `ERR_QUIESCING` · Bit 2 = sie steht
+/// gleich im zweiten `RECV` (nach dem Oeffnen). Liegt in `.user_data` (US-schreibbar).
+#[cfg(feature = "selftest")]
+#[link_section = ".user_data"]
+static Q_PROBE_BITS: AtomicU64 = AtomicU64::new(0);
+/// Der Ergebniscode des ERSTEN `RECV` -- roh, nicht als bool. „Abgewiesen" und „mit DIESEM Grund
+/// abgewiesen" sind zwei Aussagen, und nur die zweite belegt, dass das Tor gefeuert hat und nicht
+/// irgendetwas anderes.
+#[cfg(feature = "selftest")]
+#[link_section = ".user_data"]
+static Q_PROBE_CODE: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Ring-3-Sonde fuer Z23 S1. Liegt in `.user_text` — ohne das faultet sie an ihrer eigenen
+/// Einsprungadresse, und das sieht wie ein kaputter Mechanismus aus (s. Fallenliste).
+#[link_section = ".user_text"]
+#[cfg(feature = "selftest")]
+extern "C" fn ring3_quiesce_probe(_arg: usize) -> ! {
+    let mut me = Q_PROBE_TID.load(Ordering::Acquire);
+    while me == 0 {
+        core::hint::spin_loop();
+        me = Q_PROBE_TID.load(Ordering::Acquire);
+    }
+    Q_PROBE_BITS.fetch_or(1, Ordering::Release);
+    // 1. Tore zu -> `RECV` muss SOFORT abweisen. Der Code wird abgelegt, nicht bloss ein Ja/Nein.
+    // SAFETY: Ring-3-Kontext, freigegebener Syscall-Vektor.
+    let r = unsafe { ring3_syscall1(sel4lake_abi::sys::RECV, 0) };
+    Q_PROBE_CODE.store(r, Ordering::Release);
+    Q_PROBE_BITS.fetch_or(2, Ordering::Release);
+    // 2. Warten, bis der Kernel die Tore geoeffnet hat.
+    // SAFETY: dito.
+    unsafe { ring3_syscall1(sel4lake_abi::sys::PARK, 0) };
+    // 3. Jetzt noch einmal dasselbe `RECV`. Es gibt keinen Sender -> es muss BLOCKIEREN.
+    //    Bit 2 wird VORHER gesetzt: ein Thread, der schon in Schritt 1 haengengeblieben waere,
+    //    ist von einem blockierten sonst nicht zu unterscheiden.
+    Q_PROBE_BITS.fetch_or(4, Ordering::Release);
+    // SAFETY: dito.
+    unsafe { ring3_syscall1(sel4lake_abi::sys::RECV, 0) };
+    // Hierher kommt sie nur, wenn das zweite `RECV` NICHT blockiert hat -- Bit 3 ist damit das
+    // Gegenteil der erwarteten Aussage und faerbt die Zeile.
+    Q_PROBE_BITS.fetch_or(8, Ordering::Release);
+    loop {
+        // SAFETY: dito.
+        unsafe { ring3_syscall1(sel4lake_abi::sys::PARK, 0) };
+    }
+}
+
+// ================================================================================================
 // LAZY-FP AUF X86 — die Pruefzeile, die es bisher nur auf aarch64 gab (Z18, 2026-08-09)
 // ================================================================================================
 //
@@ -597,6 +672,33 @@ fn spawn_demo() -> bool {
     match system::spawn_user(ring3_park_probe as *const () as usize, 0, system::IDLE_PRIO) {
         Some(t) => PARK_PROBE_TID.store(t.to_raw(), Ordering::Release),
         None => return false,
+    }
+
+    // --- Z23 S1: eine PD mit GESCHLOSSENEN Toren --------------------------------------------
+    //
+    // Die Tore werden zugemacht, **bevor** der Thread zugelassen wird. Andersherum haette die
+    // Sonde ein Zeitfenster, in dem ihr `RECV` noch durchginge -- und ein Test, der von der
+    // Reihenfolge zweier Ereignisse abhaengt, misst die Reihenfolge und nicht die Eigenschaft.
+    // Dieselbe Lehre wie D0, nur eine Ebene hoeher.
+    #[cfg(feature = "selftest")]
+    {
+        if let (Some(qep), Some(qpd)) = (system::create_endpoint(), system::create_pd()) {
+            if let Ok(cap) = system::install_endpoint_cap(qep as u32, Rights::RW) {
+                if system::install_pd_cap(qpd, 0, cap) {
+                    Q_PROBE_PD.store(qpd as u64, Ordering::Release);
+                    system::pd_quiesce(qpd, true);
+                    if let Some(t) = system::spawn_parked(
+                        ring3_quiesce_probe as *const () as usize,
+                        0,
+                        system::IDLE_PRIO,
+                    ) {
+                        if let Some(tid) = system::admit_in_pd(qpd, t) {
+                            Q_PROBE_TID.store(tid.to_raw(), Ordering::Release);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Isolierter Adressraum vs. SAS: beide lesen dieselbe fremde Adresse.
@@ -986,6 +1088,108 @@ fn park_messen_inner() -> bool {
          eingefroren={eingefroren} lief-trotz-pause={lief_trotz_pause} (muss false sein) \
          aufgetaut={aufgetaut} laeuft-nach-thaw={laeuft_nach_thaw} (Sprechprobe: sonst waere \
          „bewegt sich nicht\" von „darf sich nicht bewegen\" nicht zu unterscheiden) : {}",
+        if ok { "ALL PASS" } else { "FAILURES" }
+    );
+    ok
+}
+
+/// **Z23 S1: die Tore einer PD — gemessen an der WIRKUNG, nicht am Bit.**
+///
+/// Sechs Aussagen, und die dritte ist die Sprechprobe:
+///
+/// 1. Die Sonde lief (sonst ist nichts gemessen).
+/// 2. Ihr erstes `RECV` wurde **sofort** abgewiesen — und zwar mit `ERR_QUIESCING`. Der ROHE Code
+///    steht in der Zeile: „abgewiesen" und „mit DIESEM Grund abgewiesen" sind zwei Aussagen, und
+///    nur die zweite belegt, dass das Tor gefeuert hat und nicht irgendetwas anderes.
+/// 3. Das Öffnen **ändert etwas** (`pd_quiesce(.., false)` gibt `true`) — ein Tor, das schon offen
+///    war, belegt nichts.
+/// 4. Nach dem Öffnen **blockiert** dasselbe `RECV`, statt abzuweisen. Das ist der eigentliche
+///    Beleg: derselbe Aufruf, anderer Ausgang. Ablesbar an der **Grund-Menge** aus Z24.
+/// 5. Die Sonde ist dabei nicht durchgelaufen (Bit 3 bleibt aus).
+/// 6. `pd_is_quiescing` sagt danach `false` — der Zustand ist wirklich weg und nicht nur die
+///    Wirkung ausgeblieben.
+#[cfg(feature = "selftest")]
+fn quiesce_messen() -> bool {
+    if Q_MESS.load(Ordering::Acquire) & (1 << 63) != 0 {
+        return Q_MESS.load(Ordering::Acquire) & 1 != 0;
+    }
+    let ok = quiesce_messen_inner();
+    Q_MESS.store((1 << 63) | u64::from(ok), Ordering::Release);
+    ok
+}
+
+#[cfg(feature = "selftest")]
+fn quiesce_messen_inner() -> bool {
+    let warten = || {
+        let t0 = hal::timer::ticks(0);
+        let mut wache = 0u64;
+        while hal::timer::ticks(0) == t0 && wache < 5_000_000 {
+            core::hint::spin_loop();
+            wache += 1;
+        }
+    };
+    let raw = Q_PROBE_TID.load(Ordering::Acquire);
+    let pd = Q_PROBE_PD.load(Ordering::Acquire);
+    let (Some(tid), true) = (
+        (raw != 0).then(|| sel4lake_sched::ThreadId::from_raw(raw)),
+        pd != u64::MAX,
+    ) else {
+        println!("qgate   : FAILURES (keine Sonde/PD -- ohne sie ist nichts gemessen)");
+        return false;
+    };
+    let pd = pd as usize;
+    // 1./2. Auf das Ergebnis des ersten `RECV` warten.
+    let mut lief = false;
+    for _ in 0..64 {
+        if Q_PROBE_BITS.load(Ordering::Acquire) & 0b11 == 0b11 {
+            lief = true;
+            break;
+        }
+        warten();
+    }
+    let code = Q_PROBE_CODE.load(Ordering::Acquire);
+    let abgewiesen = code == sel4lake_abi::result::ERR_QUIESCING;
+    // 3. Tore oeffnen -- und das MUSS etwas aendern.
+    let geoeffnet = system::pd_quiesce(pd, false);
+    let zu_danach = system::pd_is_quiescing(pd);
+    let _ = system::unpark_thread(tid);
+    // 4./5. Jetzt muss dasselbe `RECV` BLOCKIEREN statt abzuweisen.
+    let mut steht_im_zweiten = false;
+    for _ in 0..64 {
+        if Q_PROBE_BITS.load(Ordering::Acquire) & 4 != 0 {
+            steht_im_zweiten = true;
+            break;
+        }
+        warten();
+    }
+    let mut blockiert = false;
+    for _ in 0..128 {
+        if system::is_blocked(tid) {
+            blockiert = true;
+            break;
+        }
+        warten();
+    }
+    let durchgelaufen = Q_PROBE_BITS.load(Ordering::Acquire) & 8 != 0;
+    let ok = lief && abgewiesen && geoeffnet && !zu_danach && steht_im_zweiten && blockiert
+        && !durchgelaufen;
+    println!(
+        "qgate   : lief={lief} erstes-RECV-Code={code} (erwartet {} = ERR_QUIESCING) \
+         oeffnen-aenderte-etwas={geoeffnet} danach-zu={zu_danach} steht-im-zweiten-RECV={steht_im_zweiten} \
+         blockiert-jetzt={blockiert} (statt abgewiesen -- DAS ist der Beleg) durchgelaufen={durchgelaufen} : {}",
+        sel4lake_abi::result::ERR_QUIESCING,
+        if ok { "ALL PASS" } else { "FAILURES" }
+    );
+    println!(
+        "qgate   : {} (Z23 S1: die Tore haengen am SUBJEKT, nicht am Objekt -- an einem Endpoint \
+         haengen auch fremde PDs, und ein Riegel dort fröre Dritte mit ein. `REPLY` bleibt \
+         erlaubt, sonst koennte ein Server seine offene Antwort nicht loswerden und der Freeze \
+         erzeugte genau den Deadlock, den er aufloesen soll. **OFFEN (S1b): was ein FREMDER \
+         Aufrufer erlebt, der hineinruft** -- die Endpoints existieren weiter, drei Optionen \
+         stehen in todo Z23/S1b, und eine stillschweigende Wahl waere die schlechteste). \
+         **`REPLY bleibt erlaubt` ist GEBAUT, aber NICHT GEMESSEN**: dafuer braucht es eine offene \
+         Transaktion, also zwei Threads in derselben PD (Z22 P2, offen). Eine Zusicherung ohne \
+         Messung wird hier benannt und nicht mitgezaehlt)",
         if ok { "ALL PASS" } else { "FAILURES" }
     );
     ok
@@ -2681,6 +2885,10 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             ("epfull", epfull),
             ("state", state),
             ("park", PARK_MESS.load(Ordering::Acquire) & 1 != 0),
+            // Z23 S1: gattert von Anfang an. Anders als bei `fp`/`wasm` ist das Kriterium hier
+            // erreichbar -- es wurde gegen die WIRKUNG formuliert (blockiert statt abgewiesen),
+            // nicht gegen eine Zahl, die vom Zeitpunkt abhaengt.
+            ("qgate", Q_MESS.load(Ordering::Acquire) & 1 != 0),
             // **Seit dem 2026-08-09 gattert `fp` wirklich.** Vorher stand die Zeile bewusst
             // draussen, weil ihr Kriterium („alle 64 Abgaben") unerreichbar war und die Suite
             // dauerhaft rot gefaerbt haette. Mit einem erreichbaren Kriterium waere ein
@@ -2700,7 +2908,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 27;
+const DONE_FLAGS: usize = 28;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]
@@ -4230,6 +4438,7 @@ pub fn run(multiboot_info: u64) -> ! {
             system::reap();
             drv_service_step(archive);
             park_messen(); // laeuft genau einmal; das Urteil steht danach in `all_done()`
+            let _ = quiesce_messen(); // Z23 S1, ebenso einmalig
             if all_done(archive, None) {
                 report_and_off(false);
             }

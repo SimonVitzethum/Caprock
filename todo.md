@@ -1043,7 +1043,40 @@ gibt `freeze_thread` für **beide** `Busy`, und es existiert keine Reihenfolge, 
 Die Bausteine sind da (`endpoint_quiesce`/`ERR_QUIESCING`, `thread_quiescence`, `Freeze`, `Parked`,
 `checkpoint::Scope`/`classify`); der Ablauf darüber ist nie gebaut worden.
 
-- [ ] **S1 — Zwei-Phasen-Stilllegung.** Erst die **Tore schliessen**, dann einfrieren.
+- [x] **S1 — Zwei-Phasen-Stilllegung: GEBAUT und gemessen** (2026-08-10, `qgate : ALL PASS`,
+      gattert in `all_done`).
+
+      `Pd::quiescing` je PD, geprüft im Syscall-Pfad: `CALL`/`RECV` **aus** der PD heraus →
+      `ERR_QUIESCING`, `REPLY` bleibt erlaubt. Kernel-API `pd_quiesce`/`pd_is_quiescing`.
+      **TCB-Kosten wie geplant: ein Bit je PD und eine Prüfung.**
+
+      **Gemessen wird die WIRKUNG, nicht ein Bit** — und das ist der Kniff, der die Zeile
+      aussagekräftig macht: eine Ring-3-Sonde in einer PD mit geschlossenen Toren bekommt auf
+      `RECV` **sofort** `ERR_QUIESCING`; nach dem Öffnen **blockiert derselbe Aufruf**, weil es
+      keinen Sender gibt. Derselbe Syscall, anderer Ausgang. Ablesbar an der **Grund-Menge aus
+      Z24** — der Umbau vom selben Tag liefert Z23 sein Messinstrument.
+      Sechs Aussagen, darunter „das Öffnen hat wirklich etwas geändert" (ein Tor, das schon offen
+      war, belegt nichts) und der **rohe Ergebniscode** (»abgewiesen« und »mit DIESEM Grund
+      abgewiesen« sind zwei Aussagen).
+
+      **Die Tore werden geschlossen, BEVOR der Thread zugelassen wird** — andersherum gäbe es ein
+      Fenster, in dem das `RECV` noch durchginge, und der Test misste die Reihenfolge zweier
+      Ereignisse statt der Eigenschaft. Dieselbe Lehre wie D0, eine Ebene höher.
+
+      **Zwei Gegenproben:**
+      * **M1** — Tor entfernt: rot. **Nicht isoliert** (drei Felder kippen), und das ist
+        strukturell: ohne Tor blockiert die Sonde im ersten `RECV` und kann gar nichts
+        aufschreiben. Eine Wirkung mit drei sichtbaren Folgen, keine drei Fehler.
+      * **M2** — abgewiesen, aber mit `ERR_BADCAP` statt `ERR_QUIESCING`: **perfekt isoliert**,
+        nur der Ergebniscode kippt (1 statt 8), die fünf übrigen Aussagen bleiben grün. Damit ist
+        belegt, dass die Zeile den **Grund** liest und nicht bloss „abgewiesen".
+
+      **Was NICHT gemessen ist, und es steht auch in der Prüfzeile:** dass `REPLY` erlaubt bleibt.
+      Dafür braucht es eine offene Transaktion, also **zwei Threads in derselben PD** (Z22 P2,
+      offen). Gebaut ist es; gemessen nicht — und eine Zusicherung ohne Messung wird hier benannt
+      statt mitgezählt.
+
+- [ ] **S1 (ursprünglicher Plan, zum Nachlesen).** Erst die **Tore schliessen**, dann einfrieren.
       Ein `PD_QUIESCING`-Bit je PD, geprüft im Syscall-Pfad: `CALL`/`RECV` **aus** der PD heraus
       scheitern mit `ERR_QUIESCING`, laufende Transaktionen dürfen **abschliessen** (`REPLY` bleibt
       erlaubt) — dieselbe Torlogik wie A-4.2, nur mit der PD als Umfang statt einem Endpoint.

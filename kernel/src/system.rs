@@ -1918,6 +1918,26 @@ pub fn caps_read_concurrency_probe(want: u32, spin_limit: u32) -> bool {
 // --- Endpoints / Notifications (per-Objekt-Locks) ---
 
 /// Einen freien Endpoint-Slot reservieren (scannt die per-Endpoint-Locks).
+/// **Z23 S1: die Tore einer PD schliessen oder oeffnen.** Rueckgabe: hat sich etwas geaendert?
+///
+/// Erste Phase der Zwei-Phasen-Stilllegung: was die PD **anfaengt** (`CALL`/`RECV`), wird
+/// abgewiesen; was schon laeuft, darf **auslaufen** (`REPLY` bleibt erlaubt). Erst danach ist
+/// Einfrieren ueberhaupt sinnvoll -- ein Freeze ohne geschlossene Tore friert eine PD ein, die im
+/// naechsten Moment eine neue Transaktion angefangen haette.
+pub fn pd_quiesce(pd: usize, an: bool) -> bool {
+    CAPS.write().pds.set_quiescing(pd, an)
+}
+
+/// Sind die Tore dieser PD zu? (Bericht/Pruefpfad.)
+pub fn pd_is_quiescing(pd: usize) -> bool {
+    CAPS.read().pds.is_quiescing(pd)
+}
+
+/// Wie viele PDs gerade stillgelegt sind -- fuer den Bericht.
+pub fn pd_quiescing_count() -> usize {
+    CAPS.read().pds.quiescing_count()
+}
+
 pub fn create_endpoint() -> Option<usize> {
     for (i, ep) in eps().iter().enumerate() {
         let mut e = ep.lock();

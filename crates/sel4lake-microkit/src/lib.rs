@@ -406,6 +406,21 @@ pub struct Pd {
     /// (PD-Index), mit dem dieses Backend ausschließlich kommunizieren darf. Bei der Erzeugung
     /// gesetzt; `None` für Trusted/User.
     partner: Option<u16>,
+    /// **Z23 S1: die Tore dieser PD sind zu.** Erste Phase der Zwei-Phasen-Stilllegung.
+    ///
+    /// Gesetzt heisst: was diese PD **anfängt**, wird abgewiesen (`CALL`/`RECV` → `ERR_QUIESCING`);
+    /// was schon läuft, darf **auslaufen** (`REPLY` bleibt erlaubt). Ohne diese Trennung wäre die
+    /// Stilllegung entweder wirkungslos (alles erlaubt) oder ein Deadlock-Erzeuger (auch `REPLY`
+    /// gesperrt → ein Server kann seine offene Antwort nicht mehr loswerden, und sein Client
+    /// hängt für immer).
+    ///
+    /// **Am SUBJEKT, nicht am Objekt** — und das ist der Grund, warum es hier steht und nicht in
+    /// `Endpoint`. An einem Endpoint hängen auch **fremde** PDs; ein Riegel dort fröre Dritte mit
+    /// ein, die mit dem Freeze nichts zu tun haben. `Endpoint::begin_quiesce` (A-4.2) bleibt
+    /// daneben bestehen: es legt **einen Kanal** still, dieses Bit **einen Teilnehmer**.
+    ///
+    /// **TCB-Kosten, benannt:** ein Bit je PD und eine Prüfung im Syscall-Pfad. Mehr nicht.
+    quiescing: bool,
     /// Stabile **Backend-Id** (ext-22): identifiziert ein HardwareLand-Backend unabhängig vom
     /// PD-Index (für später: mehrere NICs/USB-Controller, Hotplug, PCIe). `0` = keins.
     backend_id: u16,
@@ -429,6 +444,7 @@ impl Pd {
         thread: None,
         cspace: [None; NCAPS],
         domain: Domain::TrustedSas, // Default: alle Altbestand-PDs sind Trusted-SAS
+        quiescing: false,
         partner: None,
         backend_id: 0,
         chan_ep: u32::MAX,
@@ -497,6 +513,31 @@ impl PdTable {
     }
 
     /// Die (unveränderliche) Domäne einer PD.
+    /// **Z23 S1: die Tore dieser PD schliessen oder öffnen.** Rückgabe: hat sich etwas geändert?
+    ///
+    /// Idempotent. `false` heisst „war schon so" **oder** „PD gibt es nicht" — der Aufrufer
+    /// unterscheidet das über [`is_quiescing`](Self::is_quiescing), das für eine unbekannte PD
+    /// ebenfalls `false` gibt. Zwei Bedeutungen in einem `bool` wären hier harmlos, aber der
+    /// nächste Leser weiss es nicht — deshalb steht es da.
+    pub fn set_quiescing(&mut self, pd: usize, an: bool) -> bool {
+        if pd >= self.pds.len() || !self.pds[pd].used || self.pds[pd].quiescing == an {
+            return false;
+        }
+        self.pds[pd].quiescing = an;
+        true
+    }
+
+    /// Sind die Tore dieser PD zu? Unbekannte PD → `false` (sie kann nichts anfangen).
+    pub fn is_quiescing(&self, pd: usize) -> bool {
+        pd < self.pds.len() && self.pds[pd].used && self.pds[pd].quiescing
+    }
+
+    /// Wie viele PDs gerade stillgelegt werden — für den Bericht. `0` ist von „es gibt keine PDs"
+    /// nicht zu unterscheiden, deshalb wird die Gesamtzahl daneben genannt.
+    pub fn quiescing_count(&self) -> usize {
+        self.pds.iter().filter(|p| p.used && p.quiescing).count()
+    }
+
     pub fn domain_of(&self, pd: usize) -> Option<Domain> {
         if pd < self.pds.len() && self.pds[pd].used {
             Some(self.pds[pd].domain)
@@ -923,6 +964,31 @@ pub fn dispatch(
             let need = if nr == sys::CALL { Rights::WRITE } else { Rights::READ };
             if !rights.contains(need) {
                 return deny(result::ERR_RIGHTS);
+            }
+            // --- Z23 S1: die Tore dieser PD ---------------------------------------------------
+            //
+            // **Was sie ANFAENGT, wird abgewiesen; was schon laeuft, darf auslaufen.** `CALL` und
+            // `RECV` beginnen etwas Neues, `REPLY` beendet etwas Bestehendes. Waere `REPLY` mit
+            // gesperrt, koennte ein Server seine offene Antwort nicht mehr loswerden -- sein
+            // Client haenge fuer immer, und die Stilllegung erzeugte genau den Deadlock, den sie
+            // ermoeglichen soll aufzuloesen.
+            //
+            // Am **Subjekt** geprueft, nicht am Objekt: an einem Endpoint haengen auch fremde PDs
+            // (`Endpoint::begin_quiesce` aus A-4.2 legt den KANAL stumm, dieses Bit den
+            // TEILNEHMER). Ein Riegel am Objekt fröre Dritte mit ein.
+            //
+            // **`ERR_QUIESCING` und nicht `ERR_EP_FULL`/`ERR_BADCAP`:** der Code heisst „kommt
+            // gleich wieder", die anderen heissen „gibt es nicht". Ein Aufrufer, der die beiden
+            // nicht unterscheiden kann, muss raten, ob er wiederholen soll (s. der Grund fuer den
+            // dritten Code in `sel4lake-abi`).
+            //
+            // **OFFEN und ausdruecklich nicht hier entschieden (S1b):** was ein FREMDER Aufrufer
+            // erlebt, der in diese PD hineinruft. Das Subjekt-Gating stoppt nur, was sie selbst
+            // anfaengt; ihre Endpoints existieren weiter, und ein Dritter blockiert dort bis zum
+            // Thaw. Drei Optionen stehen in `todo.md` Z23/S1b -- keine ist gratis, und eine
+            // stillschweigende Wahl waere die schlechteste.
+            if nr != sys::REPLY && caps.read().pds.is_quiescing(pd) {
+                return deny(result::ERR_QUIESCING);
             }
             // `ep_id` kommt aus der (cap-geprüften) Endpoint-Cap; die Schranke wird zusätzlich
             // spekulationssicher maskiert (s. `cap_at`), da die Cap-Auswahl EL0-gesteuert ist.

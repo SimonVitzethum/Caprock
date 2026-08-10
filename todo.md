@@ -51,6 +51,43 @@ Abbild ausliefert, ist die Bauzeit-Fassung von „Schweigen als Erfolg".
       korrekt `NOBITS`; der Unterschied zum gesunden Baum ist die **Reihenfolge** (`.bss` vor statt
       nach dem Trampolin), und das letzte Segment trägt weiterhin `filesz=0xf7000`.
 
+      **BERICHTIGUNG (2026-08-10, nach berechtigtem Einwand): die drei Versuche stehen unter
+      Vorbehalt, und zwar aus einem Grund im BAUSYSTEM.** Cargo kannte Linkerskripte nicht als
+      Eingabe — jeder Versuch, bei dem das `touch` auf eine Quelldatei fehlte, hat den
+      **Vorgängerstand** gemessen. Damit hat die Widersprüchlichkeit der Tabelle ((b) bootet,
+      (b2) mit *mehr* Reservierung nicht) eine zweite mögliche Erklärung, die nichts mit dem
+      Layout zu tun hat. **Eine Versuchstabelle, deren Spalte „bootet" nicht misst, was sie
+      behauptet, ist wertlos** — dieselbe Prüferregel, nur auf die eigene Messtabelle angewandt.
+      Behoben strukturell: `kernel/build.rs` und `programs/libcaprock/build.rs` melden die vier
+      `.ld`-Dateien als `rerun-if-changed`; **gemessen**, dass ein `touch` aufs Skript allein jetzt
+      neu linkt. Dieselbe Rolle wie der Binary-Fingerprint der Suiten, nur eine Ebene früher: eine
+      Messung muss wissen, welches Artefakt sie gemessen hat.
+      **Jeder der drei Versuche ist mit garantiert frischem Link zu wiederholen, bevor eine
+      Schlussfolgerung daraus stehen bleibt.**
+
+      **Der schärfste Messwert bisher — und er zeigt woandershin als das Segment-Layout:** der
+      kaputte Bau trägt einen **zweiten, LEEREN Satz derselben Ausgabesektionen**:
+
+      | Sektion | Adresse | Offset | Größe |
+      |---|---|---|---|
+      | `.text` `.rodata` `.user_text` `.user_data` | `0x100000` | `0x185000` | **0** |
+      | `.aptramp` | `0x8000` | `0x185000` | **0** |
+      | `.bss` | `0x101000` | `0x185000` | **0** |
+
+      Der **gesunde** Bau hat sie **nicht** — dort kommt jede Sektion genau einmal vor. Daraus
+      entsteht das nullgrosse Segment, und daran scheitert objcopy. Die Frage ist also nicht „warum
+      sagt der Linker `NOBITS` falsch", sondern **wer erzeugt diese verwaisten Duplikate**.
+      Nicht mehr behauptet wird: dass es an der A3-Änderung liegt. Ein Gegenversuch (A3-Code im
+      selben Worktree zurückgenommen) baute **ebenfalls** fehlerhaft — der Worktree-Zustand ist
+      damit selbst verdächtig, und die saubere Fortsetzung ist ein **frischer** Integrationszweig
+      im Hauptbaum, mit `rerun-if-changed` von Anfang an.
+
+      **Und eine Messregel, die daraus folgt:** `KEIN OUTPUT` ist als Befund **unterbestimmt**.
+      „Lädt nicht" und „läuft, aber die Konsole hängt an einer verschobenen Adresse" sind darunter
+      ununterscheidbar, und nach einem Layoutwechsel ist das zweite mindestens gleich
+      wahrscheinlich. Künftig gehören `-d int` (kommen überhaupt Faults?) und `info registers`
+      (wo steht das System?) dazu, bevor ein `KEIN OUTPUT` als Zeile ins Register geht.
+
       **Zwischenstand nach drei Versuchen:** (b) ist der einzige, der bootet. Was ihm fehlt, ist
       **nicht** mehr Reservierung, sondern die Antwort auf die Frage, warum `lld` dem letzten
       Segment ~1 MiB **Dateiinhalt** gibt, obwohl beide BSS-Sektionen `NOBITS` sind. Die nächste

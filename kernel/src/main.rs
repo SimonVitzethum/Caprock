@@ -43,6 +43,9 @@ mod dmatests;
 /// Z26, Vorbedingung 2: grosse, zusammenhaengende DMA mit Geraetesicht — und eine **benannte**
 /// Absage statt `None`. Arch-neutral; die Klassifikation liegt host-getestet in `caprock-dma`.
 mod grossdma;
+/// C4: die **Stack-Wasserstandsmarke** — reichen 16 KiB, oder sind sie nur gross? Arch-neutral;
+/// die Zaehler laufen auf beiden Architekturen mit, die Berichtszeile steht heute nur auf x86.
+mod kstackmark;
 /// Kernel-Glue des generischen Binary-Loaders. **Seit A-1 auf beiden Architekturen** — die
 /// Archiv-Quelle ist nicht mehr ein fest verdrahtetes ARM-Fenster, sondern eine zur Laufzeit
 /// gemeldete Spanne (auf x86 ein Multiboot-Modul).

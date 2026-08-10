@@ -3324,13 +3324,50 @@ Zeitmessung nicht (D10).
       am Datum des Eintrags. Gemessen an der Kurve: eine SAS-PD mit Kernel-Thread kostet
       **64 KiB**, und bei `-m 512M` ist genau das die Schranke (7212 Prozesse, freies RAM auf 0).
 
-- [ ] **Kernel-Stacks lazy oder geteilt** — der nächste Schritt, und die Zahl dazu steht jetzt:
-      10 000 EL0-Threads × 16 KiB = **160 MiB**, auf einer 512-MiB-Maschine **31 % nur für
-      schlafende Threads**; mit Kernel-Threads (64 KiB) wären es 640 MiB und damit unmöglich.
-      **Was noch fehlt, um die Grösse zu wählen: ein Stack-Wasserzeichen je Thread** (Muster wie
-      beim User-Stack in Z19/A4). Gemessen ist bisher, wie **gross** die Stacks sind — nicht, ob
-      sie **reichen**; das entscheidet der tiefste Kernelpfad (verschachtelte Traps, seit
-      neuestem der Syscall-Umleitungspfad). Ohne das Wasserzeichen ist jede kleinere Zahl geraten.
+- [ ] **Kernel-Stacks lazy oder geteilt** — 10 000 EL0-Threads × 16 KiB = **160 MiB**, auf einer
+      512-MiB-Maschine **31 % nur für schlafende Threads**; mit Kernel-Threads (64 KiB) wären es
+      640 MiB und damit unmöglich.
+
+      **Das Wasserzeichen gibt es seit 2026-08-10 (`kstack`-Zeile, gattert), und es beantwortet
+      die Frage GEGEN die Erwartung: 16 KiB sind nicht grosszügig, sie sind knapp.**
+
+      | Suite | Höchststand EL0-Kstack | Reserve |
+      |---|---|---|
+      | `test-qemu-x86.sh` (ohne Archiv) | 832 / 16384 B (**5,0 %**) | 15552 B |
+      | `test-qemu-x86-load.sh` (mit Archiv) | **12008 / 16384 B (73,2 %)** | **4376 B** |
+
+      **Der tiefste Pfad ist `SYS_LOAD`** — `loader::load_by_index` verifiziert eine
+      **Ed25519-Signatur und einen SHA-2-Hash im Kernel**, also auf dem 16-KiB-Stack des
+      aufrufenden EL0-Threads (grösste Rahmen des Abbilds:
+      `vartime_double_scalar_mul_basepoint` 3528 B, `NafLookupTable::from` 1928 B,
+      `ed25519 verify` 1384 B, dazu `load_into_pd_mit` 1416 B). Rekordhalter gemessen:
+      Thread-Slot 14, **Programm 1 = `init`**, der Root-Task.
+
+      **Damit ist die ursprüngliche Frage umgedreht.** „Kann man 16 KiB senken" hiess bisher
+      „wieviel Luft ist da"; die Antwort ist **27 %**, und sie hängt an einer Kryptobibliothek,
+      deren Stackbedarf niemand in diesem Projekt festgelegt hat. Drei Folgeposten, in dieser
+      Reihenfolge:
+
+      1. **Die Verifikation gehört vom Aufrufer-Stack herunter**, nicht der Stack vergrössert.
+         Ein `SYS_LOAD` ist der einzige Syscall, der 12 KiB braucht — alle anderen bleiben unter
+         1 KiB. Solange das so bleibt, zahlt **jeder** der 10 000 Threads für **einen** Pfad.
+         Wandert die Verifikation auf einen eigenen, kernlokalen Arbeitsstack (einer je Kern
+         statt einer je Thread), sind 4 KiB je Thread plausibel — das wären **40 MiB statt
+         160 MiB**, und die Rechnung oben fällt um den Faktor 4.
+      2. **Eine Guard-Page fehlt.** Der Kstack liegt aus `mem_alloc` ohne unmapped Nachbarn;
+         ein Überlauf schreibt **still** in fremden Kernelspeicher. Bei 73 % Auslastung des
+         tiefsten Pfads ist das kein theoretischer Posten. Dieselbe Forderung steht in
+         [Z19/A4](#schritt-4--a3-stack-und-guard-page) für den **User**-Stack — sie gilt hier
+         genauso, und hier trifft ein Überlauf den Kernel.
+      3. **Erst danach lazy/geteilt.** Eine kleinere Zahl zu wählen, ohne (1) zu machen, hiesse
+         den Ladepfad zu brechen.
+
+      **Was die Messung NICHT erreicht** (steht so auch in der Berichtszeile): den
+      **Syscall-Umleitungspfad** (Z26/A3) — in beiden x86-Suiten läuft kein gebundener Gast, die
+      `redirect`-Kette ist im Wasserstand also nicht enthalten; **aarch64** (die Zähler laufen
+      dort mit, die Berichtszeile steht nur auf x86); und einen **restlos** aufgebrauchten
+      64-KiB-Kernel-Thread-Stack (der wird am Muster erkannt, und ohne Muster fällt er aus der
+      Erkennung — für die EL0-Klasse gilt das nicht, dort wird der Kstack direkt gemessen).
 
 ### C7. Die Kapazitätskurve — wo es WIRKLICH bricht (gemessen 2026-08-10)
 
@@ -3341,6 +3378,11 @@ nachmittags) — C7 und [C4](#c4-die-on-bilanz) bleiben OFFEN.** Die Kurve sagte
 beide gattern, beide mit isolierender Gegenprobe. Es fehlt noch die **Stack-Wasserstandsmarke**.
 **Und die isolierte Zeile der Tabelle unten ist neu zu messen**: ihre Arbeiter faulteten alle
 sofort (s. unten).
+
+**Die Stack-Wasserstandsmarke ist seit 2026-08-10 erbracht** (`kstack`-Zeile, gattert in beiden
+x86-Suiten) — und sie hat die Erwartung umgedreht: nicht „16 KiB sind grosszügig", sondern
+**12008 von 16384 B (73,2 %) auf dem Ladepfad**. Zahlen, Ursache und die drei Folgeposten stehen
+bei [C4](#c4-effizienz-bei-tausenden-threads-lineare-scans-beseitigen).
 
 `tools/kapazitaet-messen.sh` legt PDs **mit je einem Thread** an (eine PD ohne Thread ist kein
 Prozess) und druckt den Füllstand über wachsendes N. Ziel parametrisierbar über

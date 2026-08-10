@@ -387,6 +387,13 @@ check "pdcolor : ALL PASS" \
     "A1: eine ueber das Manifest als EXCLUSIVE_STRIPE geladene PD haelt Segmente, Stack und Seitentabellen in EINEM Farbstreifen -- gemessen an der Teardown-Buchhaltung, mit Gegenprobe an einer ungefaerbten PD"
 check "ladepol : ALL PASS" \
     "Z11c: die Politik des Manifests wird ANGEWANDT, nicht nur gelesen (Prioritaet/Affinitaet aus dem TCB zurueckgelesen, nicht aus dem Ladepfad)"
+# C4: die Stack-Wasserstandsmarke. **Diese Suite ist die interessantere von beiden** -- hier laufen
+# geladene Programme, zwei Treiber-PDs, eine Dateisystem-PD und die verkettete IPC
+# `fs -> Blockdienst -> Treiber`. Der Hoechststand aus der Hauptsuite deckt diese Pfade NICHT ab.
+# Positiv geprueft und nicht bloss 'nicht rot': eine Zeile, die gar nicht kommt, faengt kein
+# Rotzeilen-Scanner.
+check "kstack  : ALL PASS" \
+    "C4: die Stack-Wasserstandsmarke -- gemessen wird nicht, wie GROSS die Kernel-Stacks sind, sondern wieviel davon je BENUTZT wurde (Muster beim Anlegen, Abzaehlen beim Tod des Threads und am Ende des Laufs). Faellt die Fuellung aus, meldet die Messung die VOLLE Groesse als benutzt und die Zeile faellt durch"
 # Z15/W1. **Auf `ALL PASS` geprueft, nicht auf die Zeile** -- es gibt sie auch als SKIP.
 check "wasm    : ALL PASS" \
     "Z15/W1: eine WASM-Laufzeit als gewoehnliche PD -- Modul instanziiert, GERECHNETES Ergebnis, mutiertes Modul abgewiesen, Uebergriff auf den Linearspeicher als WASM-Trap ohne dass die PD faultet"

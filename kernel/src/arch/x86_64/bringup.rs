@@ -3653,6 +3653,16 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             // Zeile, die nichts gattert, waere der `pdbind`-Fehler von neuem.
             ("ptab", PTAB_MESS.load(Ordering::Acquire) & 1 != 0),
             ("mangel", MANGEL_MESS.load(Ordering::Acquire) & 1 != 0),
+            // C4: die **Stack-Wasserstandsmarke**. Sie gattert aus demselben Grund wie `vorrat`,
+            // und ihr Kriterium ist gegen die WIRKUNG formuliert (benutzte Tiefe), nicht gegen
+            // eine Zahl, die vom Zeitpunkt abhaengt. Erreichbar ist es gemessen und nicht
+            // gehofft: der Hoechststand lag bei der Einfuehrung bei 6,6 % des Stacks, die
+            // Schwelle liegt bei 25 %.
+            //
+            // **Faellt die Fuellung aus, faellt dieses Konjunkt** -- ohne Muster am Fuss meldet
+            // die Messung die volle Stackgroesse als benutzt. Ein Wasserzeichen, das immer „viel
+            // Luft" sagt, ist damit strukturell ausgeschlossen und nicht bloss unwahrscheinlich.
+            ("kstack", crate::kstackmark::urteil()),
             // **Seit dem 2026-08-09 gattert `fp` wirklich.** Vorher stand die Zeile bewusst
             // draussen, weil ihr Kriterium („alle 64 Abgaben") unerreichbar war und die Suite
             // dauerhaft rot gefaerbt haette. Mit einem erreichbaren Kriterium waere ein
@@ -3672,7 +3682,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 32;
+const DONE_FLAGS: usize = 33;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]
@@ -3840,6 +3850,106 @@ fn report_and_off(watchdog: bool) -> ! {
              Zeile belegt, dass er auf einem spawn_*-Pfad greift UND die Menge aus dem Aufruf \
              traegt, nicht aus einem Literal daneben)",
             if mangel_messen() { "ALL PASS" } else { "FAILURES" }
+        );
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // C4: DIE STACK-WASSERSTANDSMARKE -- reichen 16 KiB, oder sind sie nur gross?
+    // ------------------------------------------------------------------------------------------
+    //
+    // Die `vorrat`-Zeile darueber sagt, wie GROSS die Kernel-Stacks sind. Sie sagt nicht, ob sie
+    // REICHEN -- und das ist der Unterschied zwischen einer Zahl und einem Beleg. Ohne diese
+    // Zeile ist jede kleinere Groesse geraten: 10 000 EL0-Threads x 16 KiB sind 160 MiB, auf einer
+    // 512-MiB-Maschine 31 % nur fuer schlafende Threads. Wer die Zahl senken will, muss wissen,
+    // wie tief der tiefste Kernelpfad wirklich geht.
+    //
+    // **Zuerst fegen, dann urteilen.** `reclaim_user_kstack` misst nur die Stacks STERBENDER
+    // Threads; die langlebigen (IPC-Server, Treiber-PDs, Root-Task) sterben in einem gruenen Lauf
+    // nie -- und gerade sie fahren die Pfade, um die es geht. Ein Wasserstand nur aus den Toten
+    // waere eine Stichprobe mit Auswahlfehler. Gefegt wird deshalb hier, am SCHLUSS, nach jedem
+    // anderen Urteil: eine Schleife ueber alle lebenden Kstacks haelt kurz das KSTACKS-Blattlock
+    // und wuerde jede baseline-empfindliche Zeile davor stoeren.
+    //
+    // **Das Fegen kann das Urteil nur VERSCHLECHTERN**, nie verbessern (es hebt den Hoechststand
+    // und senkt die Reserve). Der Unterschied zwischen dem Gatter in `all_done` (das ohne den
+    // Fegelauf entscheidet) und dieser Zeile faellt damit fail-closed aus: das Gatter laesst
+    // durch, was der Bericht danach noch rot faerben kann -- und eine rote `kstack`-Zeile faengt
+    // der allgemeine Rotzeilen-Scanner der Suite.
+    {
+        let (gefegt, tiefster) = system::kstack_marke_fegen();
+        let e = crate::kstackmark::marke(crate::kstackmark::KL_EL0);
+        let k = crate::kstackmark::marke(crate::kstackmark::KL_KERN);
+        let anteil = |m: &crate::kstackmark::Marke| -> u64 {
+            if m.groesse == 0 {
+                0
+            } else {
+                (m.tiefe_max as u64 * 1000) / m.groesse as u64
+            }
+        };
+        println!(
+            "kstack  : Wasserstand EL0-Kstack -- Hoechststand {} von {} B ({}.{} %), Reserve \
+             mindestens {} B · {} gefuellt / {} gemessen ({gefegt} davon am Schluss ueber LEBENDE \
+             Stacks gefegt, tiefster lebender Thread-Slot {}) · ohne Muster am Fuss: {} (muss 0 \
+             sein -- das heisst 'aufgebraucht ODER nie gefuellt', beide sollen dasselbe Urteil \
+             ausloesen)",
+            e.tiefe_max,
+            e.groesse,
+            anteil(&e) / 10,
+            anteil(&e) % 10,
+            if e.frei_min == usize::MAX { 0 } else { e.frei_min },
+            e.gefuellt,
+            e.gemessen,
+            if tiefster == usize::MAX { u64::MAX } else { tiefster as u64 },
+            e.erschoepft,
+        );
+        // **Die Herkunft trennt eine Zahl von einer Aussage.** Ein STERBENDER Thread wurde zuletzt
+        // im Fault-/Exit-Pfad gemessen -- dort laeuft `println!` mit voller Formatierung und der
+        // VSpace-Teardown auf eben diesem Stack; ein LEBENDER im Zustand seines letzten Syscalls.
+        // Welcher der beiden den Hoechststand haelt, sagt, wo die naechste Vertiefung herkaeme.
+        println!(
+            "kstack  : Herkunft des Hoechststands -- sterbende Threads {} B ({} Messungen, \
+             DIESE sieht das Gatter), lebende Threads {} B ({gefegt} Messungen, erst im Bericht) \
+             · Rekordhalter Thread-Slot {} (Programm {}). Auf x86 sind alle IDT-Tore \
+             INTERRUPT-Gates (Typ 0x8E): IF ist waehrend des Handlers 0, ein Timer-Tick kann also \
+             NICHT auf einem Syscall-Frame schachteln -- der Hoechststand ist eine AUFRUFKETTE, \
+             kein Stapel von Frames. Der tiefste bekannte Pfad ist SYS_LOAD: `load_by_index` \
+             verifiziert eine Ed25519-Signatur und einen SHA-2-Hash IM KERNEL, also auf dem \
+             16-KiB-Stack des aufrufenden EL0-Threads (groesste Rahmen des Abbilds: \
+             vartime_double_scalar_mul_basepoint 3528 B, NafLookupTable::from 1928 B). \
+             Eine Guard-Page gibt es dort NICHT -- ein Ueberlauf schriebe still in den Nachbarn",
+            e.tiefe_tod,
+            e.gemessen_tod,
+            e.tiefe_lebend,
+            if e.tiefster_slot == usize::MAX { u64::MAX } else { e.tiefster_slot as u64 },
+            match crate::loader::program_of_slot(e.tiefster_slot) {
+                Some(p) => p as i64,
+                None => -1,
+            },
+        );
+        println!(
+            "kstack  : Wasserstand Kernel-Thread (64 KiB) -- Hoechststand {} von {} B ({}.{} %), \
+             {} gefuellt / {} beim Reap wiedererkannt. **Auskunft, kein Konjunkt**: erkannt wird \
+             am Muster, ein RESTLOS aufgebrauchter Kernel-Stack traegt keines mehr und faellt hier \
+             heraus -- fuer die EL0-Klasse gilt die Einschraenkung nicht (dort wird der Kstack \
+             direkt gemessen, nicht gesucht)",
+            k.tiefe_max,
+            k.groesse,
+            anteil(&k) / 10,
+            anteil(&k) % 10,
+            k.gefuellt,
+            k.gemessen,
+        );
+        println!(
+            "kstack  : {} (C4: geforderte Mindestreserve {} B = 1/{} des Stacks, Eichung \
+             {:#06b}/{:#06b}, mindestens {} Messungen vor dem Gatter. Die Schwelle ist die \
+             RESERVE und nicht der Verbrauch -- sie bleibt richtig, wenn jemand USER_KSTACK_SIZE \
+             aendert, und sie benennt die Groesse, um die es geht)",
+            if crate::kstackmark::urteil() { "ALL PASS" } else { "FAILURES" },
+            crate::kstackmark::mindestreserve(e.groesse),
+            crate::kstackmark::MIND_RESERVE_NENNER,
+            crate::kstackmark::eichstand(),
+            crate::kstackmark::EICH_ALLE,
+            crate::kstackmark::MIND_MESSUNGEN,
         );
     }
 

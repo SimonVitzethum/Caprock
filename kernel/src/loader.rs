@@ -651,6 +651,25 @@ pub fn program_of_thread(tid: ThreadId) -> Option<u32> {
         .map(|(pid, _)| pid.load(Ordering::Relaxed))
 }
 
+/// Wie [`program_of_thread`], aber ueber den **Thread-Slot**: die Stack-Wasserstandsmarke (C4)
+/// misst in `reclaim_user_kstack`, und dort ist der Slot bekannt, die volle `ThreadId` nicht mehr
+/// zuverlaessig. Diagnose, keine Autoritaet — bei einem wiederverwendeten Slot kann die Antwort
+/// die Generation daneben liegen, und genau deshalb steht sie in einer Berichtszeile und nicht in
+/// einer Entscheidung.
+pub fn program_of_slot(slot: usize) -> Option<u32> {
+    if slot == usize::MAX {
+        return None;
+    }
+    PROG_TIDS
+        .iter()
+        .zip(PROG_TID_RAW.iter())
+        .find(|(_, raw)| {
+            let v = raw.load(Ordering::Relaxed);
+            v != 0 && ThreadId::from_raw(v - 1).slot() == slot
+        })
+        .map(|(pid, _)| pid.load(Ordering::Relaxed))
+}
+
 /// **Der Thread dieses Programms** — die Gegenrichtung zu [`program_of_thread`].
 ///
 /// Damit ist ein Programm direkt befragbar: existiert sein Thread, ist er zugelassen, worin

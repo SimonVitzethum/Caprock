@@ -99,6 +99,71 @@ pub enum ObjectKind {
         dir: DmaDir,
         coherence: DmaCoherence,
     },
+    /// Eine **Syscall-Handler-Capability** (Z26/A3): die Autorität, der **Kernel eines Gastes**
+    /// zu sein — den Syscall-Strom der an sie gebundenen Threads zu empfangen und ihre
+    /// Trap-Frames zu beantworten.
+    ///
+    /// ## Warum das kein umgewidmeter Endpoint ist
+    ///
+    /// Die Autorität ist eine **andere** als „darf IPC empfangen": ein gewöhnlicher `REPLY`
+    /// schreibt die Antwort einer Transaktion, dieser hier schreibt den **Ausführungszustand**
+    /// eines fremden Threads. Er kann den Gast belügen. Läge beides auf derselben Art, könnte eine
+    /// PD ihren *Dienst*-Endpoint versehentlich als Persönlichkeit binden, und `cdt_audit` könnte
+    /// die Frage „wer darf hier fremde Frames schreiben" **nicht stellen**.
+    ///
+    /// ## Die Felder — und warum das Sidecar zur Cap gehört
+    ///
+    /// * `ep` — Endpoint, an dem die Umleitungsnachricht zugestellt wird (Transport; der Handler
+    ///   `RECV`t dort). Die Nachricht sagt nur *welcher Gast* und *warum*.
+    /// * `sidecar` / `len` — das **geteilte Fenster**, in dem der Kernel den Trap-Frame des Gastes
+    ///   ablegt und aus dem er ihn zurückliest, ein Slot je gebundenem Gast-Thread
+    ///   (`caprock_sched::redirect::SLOT_BYTES`).
+    ///
+    /// Der Frame liegt dort und nicht in der Nachricht, weil `caprock_abi::MSG_WORDS` **4** ist
+    /// und ein Trap-Frame 22 (x86_64) bzw. 34 (aarch64) Wörter hat. `rt_sigreturn` ersetzt den
+    /// **ganzen** Frame und `clone` braucht einen **zweiten** — beides ist über vier Wörter
+    /// strukturell unmöglich, nicht bloss unbequem.
+    ///
+    /// Und es ist die Form, die Fuchsias `zx_restricted_bind_state` nimmt: der Handler bekommt
+    /// **eine Region**, keine Fähigkeit, fremde Register zu schreiben. Damit halbiert sich die
+    /// erste der drei Autoritäten aus Z26/Nachtrag 2 — die Persönlichkeits-PD bleibt der Kernel
+    /// des Gastes, aber ihr Zugriff auf dessen Registerzustand ist **eine benannte Region** und
+    /// steht in der Speicherbuchhaltung, nicht nur im Cap-Audit.
+    ///
+    /// `pd` ist die **Persönlichkeits-PD** — der Knoten, an dem das Zyklusverbot hängt.
+    ///
+    /// Sie steht **in der Cap** und wird nicht aus dem Besitz abgeleitet, und das ist eine
+    /// Entscheidung: eine Cap darf kopiert werden, „der Besitzer" ist danach mehrdeutig. Die Cap
+    /// bezeichnet eine bestimmte PD mit einem bestimmten Endpoint und einem bestimmten Fenster;
+    /// wer sie weitergibt, gibt genau diese Autorität weiter und macht den Empfänger **nicht** zum
+    /// Gast-Kernel. Nur kernelseitig geprägt — kein User-Syscall erzeugt beliebige Handler-Caps.
+    ///
+    /// Hält keinen Allokator-Eintrag (das Fenster wird über eine `Memory`-Cap vergeben) → keine
+    /// Finalisierung.
+    SyscallHandler {
+        ep: u32,
+        pd: u16,
+        sidecar: u64,
+        len: u64,
+    },
+    /// Eine **Fault-Handler-Capability** (Z26/A3): die Autorität, die **Seitenfehler** der an sie
+    /// gebundenen Threads zu sehen.
+    ///
+    /// **Getrennt von [`Self::SyscallHandler`]**, weil es eine andere Autorität ist: Syscalls zu
+    /// beantworten heisst „ich bin der Kernel dieses Gastes", Faults zu sehen heisst „ich verwalte
+    /// seinen Speicher" — `mmap`-Semantik braucht das zweite, ein Debugger nur das zweite, eine
+    /// reine Syscall-Persönlichkeit nur das erste. Ein Kanal mit zwei Bedeutungen ist die Form,
+    /// die dieses Projekt schon dreimal bezahlt hat (`blocked`, die Park-Naht, `CR0.TS`).
+    ///
+    /// **Was sie NICHT gewährt:** einen Fault zu *beheben* heisst, Mappings im **Gast-Vspace** zu
+    /// installieren. Das ist eine dritte Autorität, sie kommt in diesem Primitiv nicht vor, und
+    /// ohne sie ist `mmap` nicht implementierbar (s. `todo.md` Z26/A3, „was offen bleibt").
+    FaultHandler {
+        ep: u32,
+        pd: u16,
+        sidecar: u64,
+        len: u64,
+    },
 }
 
 /// Eintrag der Objekt-Tabelle.

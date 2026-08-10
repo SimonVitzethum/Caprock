@@ -81,6 +81,22 @@ pub enum LocalReason {
     /// hieße, die Isolationszusage aus A-5.4 an der Maschinengrenze fallen zu lassen.
     DmaRegion,
     /// Eine Reply-Cap bezeichnet **einen konkreten blockierten Aufrufer**. Er bleibt hier.
+    ///
+    /// **Z26/A3, 2026-08-10: hier landen auch `SyscallHandler`/`FaultHandler`** — und das ist eine
+    /// benannte Ungenauigkeit, keine Gleichsetzung. Der Refusal-Grund ist derselbe (im Sidecar
+    /// stehen die Trap-Frames konkreter blockierter Gäste, und die bleiben hier), die Cap-Art ist
+    /// es nicht. Gewählt wurde dieser Grund, weil er als einziger **nicht** zur falschen Behebung
+    /// führt: `PeerNotInScope`/`ThreadNotInScope`/`PdNotInScope` lesen sich alle als „nimm es in
+    /// den Umfang auf", und genau das hilft hier nichts — ein halber Syscall ist auf der
+    /// Zielmaschine kein halber Syscall, sondern Datenmüll in Registerform (der Frame ist
+    /// architekturspezifisch: x86_64 22 Wörter, aarch64 34).
+    ///
+    /// **Warum kein eigener Grund:** ein neuer `LocalReason` bricht den *erschöpfenden* `match` in
+    /// `ckpt_reason` (`kernel/src/arch/x86_64/bringup.rs`) — genau das ist der Sinn eines
+    /// erschöpfenden `match`, und hier ist es die richtige Wirkung. Die Zeile
+    /// `L::HandlerBinding => 9,` steht als offener Punkt in `todo.md` Z26/A3; solange sie fehlt,
+    /// pinnt `handler_caps_wandern_nicht` das heutige Verhalten fest, damit die Umstellung
+    /// **sichtbar** wird statt still.
     PendingReply,
     /// Der Partner (Endpoint/Notification) ist **nicht** Teil des Checkpoints — die Cap zeigte
     /// nach dem Transfer ins Leere. Behebbar: den Partner in den Umfang aufnehmen.
@@ -203,6 +219,18 @@ pub fn classify(kind: &ObjectKind, scope: &Scope) -> Transfer {
         ObjectKind::Irq { .. } => Transfer::Refused(LocalReason::InterruptLine),
         ObjectKind::Dma { .. } => Transfer::Refused(LocalReason::DmaRegion),
         ObjectKind::Loader { .. } => Transfer::Refused(LocalReason::LoaderSource),
+        // Z26/A3. **Auch wenn Endpoint und Gäste im Umfang lägen**, bleibt sie verweigert: das
+        // Sidecar enthält halbe Trap-Frames, und ein halber Syscall ist auf der Zielmaschine kein
+        // halber Syscall, sondern Datenmüll in Registerform. Der Umfang wird deshalb gar nicht
+        // erst befragt — anders als bei `PdControl`, wo er geprüft wird, damit der GRUND stimmt;
+        // hier wäre auch der geprüfte Grund der falsche.
+        //
+        // `PendingReply` ist eine **benannte Ungenauigkeit** (s. dort): der Refusal-GRUND stimmt
+        // („konkrete blockierte Aufrufer bleiben hier"), die Cap-Art nicht. Ein eigener Grund
+        // bräuchte eine Zeile in `ckpt_reason` (bringup.rs) — offener Punkt in todo.md Z26/A3.
+        ObjectKind::SyscallHandler { .. } | ObjectKind::FaultHandler { .. } => {
+            Transfer::Refused(LocalReason::PendingReply)
+        }
     }
 }
 
@@ -600,6 +628,33 @@ mod tests {
             classify(&ObjectKind::Mmio { phys: 0, len: 1 }, &s),
             classify(&ObjectKind::Irq { intid: 1 }, &s)
         );
+    }
+
+    /// **Z26/A3: eine Handler-Cap wandert NIE — auch nicht mit vollem Umfang.**
+    ///
+    /// Der Unterschied zu einer Endpoint-Cap ist der Punkt: die ist *behebbar* verweigert (nimm
+    /// den Partner in den Umfang), diese nicht. Im Sidecar stehen halbe Trap-Frames — 22 Wörter
+    /// auf x86_64, 34 auf aarch64, mit verschiedener Bedeutung —, und die andere Hälfte des
+    /// Syscalls ist ein Thread, der hier blockiert bleibt.
+    ///
+    /// **Der Test pinnt zugleich eine benannte Ungenauigkeit fest:** der Grund ist heute
+    /// `PendingReply` und nicht ein eigener `HandlerBinding`, weil ein neuer `LocalReason` den
+    /// erschöpfenden `match` in `ckpt_reason` (bringup.rs) bricht — s. `todo.md` Z26/A3. Wird die
+    /// Zeile dort nachgetragen, **fällt dieser Test**, und das ist seine Aufgabe: die Umstellung
+    /// soll sichtbar sein statt still.
+    #[test]
+    fn handler_caps_wandern_nicht() {
+        // Voller Umfang: Endpoint 7 IST im Umfang -- eine gewoehnliche Endpoint-Cap darauf waere
+        // portabel. Die Handler-Cap auf denselben Endpoint ist es nicht.
+        let eps = [7u32];
+        let voll = Scope { endpoints: &eps, ..Scope::EMPTY };
+        assert!(classify(&ObjectKind::Endpoint(7), &voll).is_portable());
+        let sys = ObjectKind::SyscallHandler { ep: 7, pd: 3, sidecar: 0x20_0000, len: 0x1000 };
+        let flt = ObjectKind::FaultHandler { ep: 7, pd: 3, sidecar: 0x20_0000, len: 0x1000 };
+        assert_eq!(classify(&sys, &voll), Transfer::Refused(LocalReason::PendingReply));
+        assert_eq!(classify(&flt, &voll), Transfer::Refused(LocalReason::PendingReply));
+        assert!(!classify(&sys, &voll).is_portable());
+        assert!(!classify(&flt, &voll).is_portable());
     }
 
     /// **Dieselbe Cap, zwei Antworten** — je nach Umfang. Genau deshalb nimmt `classify` ihn.

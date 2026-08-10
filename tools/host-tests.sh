@@ -77,7 +77,7 @@ mit_deps() { # $1 = Name, $2 = Crate-Verzeichnis, $3.. = Abhaengigkeiten (Verzei
     rm -rf "$SA"
 }
 
-ZIELE="${*:-mem part fat cycles loader cap virtio dma wait irte dmar dmarneg typestate ipctreue}"
+ZIELE="${*:-mem part fat cycles loader cap virtio dma wait irte dmar dmarneg redirect redirectneg typestate ipctreue}"
 for z in $ZIELE; do
     case "$z" in
         mem)  einzeln mem  "$ROOT/crates/caprock-mem/src/lib.rs" ;;
@@ -88,6 +88,12 @@ for z in $ZIELE; do
         # Modul und wird als **Datei** geprueft -- die Fallen dort sind reine u64-Rechnung und
         # brauchen keine Maschine, sondern Literale.
         cycles) einzeln cycles "$ROOT/crates/caprock-sched/src/cycles.rs" ;;
+        # Z26/A3: das Kernel-Primitiv fuer UMGELEITETE SYSCALLS. Dieselbe Begruendung wie bei
+        # `cycles` -- die Fallen sind Reihenfolgen und Zahlenbereiche (ein Zyklus in der
+        # Handler-Kette, ein Slot-Index um eins daneben, ein Rueckfall auf die native ABI nach dem
+        # Entzug einer Cap) und mit LITERALEN ausloesbar. Der Rest des Primitivs (Cap-Aufloesung,
+        # Frame-Transport, Scheduler) haengt an `caprock-hal` und wird in QEMU geprueft.
+        redirect) einzeln redirect "$ROOT/crates/caprock-sched/src/redirect.rs" ;;
         # `caprock-loader` ist abhaengigkeitsfrei und traegt die Parser fuer Boot-Archiv, ELF64
         # und **System-Manifest**. Es gibt kein `.github/workflows/` in diesem Baum -- die Tests
         # liefen also nirgends, genau wie die von `caprock-cap` vor B-5.5. Kani prueft Beweise,
@@ -138,6 +144,17 @@ for z in $ZIELE; do
         # NICHT uebersetzt -- und ein solcher Code steht per Definition in keinem Testbinary. Der
         # Nachweis muss deshalb `rustc` selbst befragen, mit Positivkontrolle und mit ERWARTETEN
         # Fehlercodes (sonst waere jeder Tippfehler ein Beleg).
+        # ... und die Gegenprobe: die Tests oben sehen nur den GEBAUTEN Zustand. Sieben
+        # Mutationen bauen je EINEN Fehler wieder ein, jede mit dem NAMEN des Tests, der fallen
+        # muss.
+        redirectneg)
+            if [ ! -f "$ROOT/tools/redirect-negativ.sh" ]; then
+                echo "== Host-Tests: redirectneg =="
+                echo "  FEHLT: tools/redirect-negativ.sh ist nicht vorhanden -- Ziel nicht gelaufen"
+                fail=1
+            else
+                bash "$ROOT/tools/redirect-negativ.sh" || fail=1
+            fi ;;
         typestate)
             if [ ! -f "$ROOT/tools/typestate-negativ.sh" ]; then
                 echo "== Host-Tests: typestate =="
@@ -159,7 +176,7 @@ for z in $ZIELE; do
             else
                 bash "$ROOT/tools/verus-modelltreue-ipc.sh" || fail=1
             fi ;;
-        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio dma wait irte dmar dmarneg typestate ipctreue)"; fail=1 ;;
+        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio dma wait irte dmar dmarneg redirect redirectneg typestate ipctreue)"; fail=1 ;;
     esac
 done
 

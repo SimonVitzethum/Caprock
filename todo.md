@@ -520,6 +520,67 @@ diese Zahl nicht erhöhen.
       Folge für die Reihenfolge: Stufe 1 (Speicher-Server) ist **nicht** Vorbedingung für den
       ersten WASM-Schritt — wohl aber für `memory.grow` und für mehr als einen Gast.
 
+### Z27. Binärkompatibilität ist ab jetzt eine LINIE — die Umkehr von Z16, entschieden 2026-08-10
+**Klasse:** Richtungsentscheidung · **Anlass:** [Z26](#z26-gpu--der-plan-2026-08-09-gemessen-auf-dieser-maschine)/Nachtrag 1, eingelöst beim Bau von A3.
+
+**Diese Entscheidung KEHRT EINE PROTOKOLLIERTE UM, und deshalb steht sie hier und nicht in einem
+Cap-Entwurf.** Ohne diesen Eintrag stünden zwei Stränge mit widersprechenden Prämissen im
+Register, und in drei Monaten wüsste niemand, welcher gilt.
+
+**Was Z16 sagte** (2026-08-09, wörtlich): *„Was dieses Ziel STREICHT, und das ist der eigentliche
+Ertrag: Binärkompatibilität fällt weg. Damit entfallen alle vier Kerneloperationen aus Z14 —
+**keine Syscall-Umleitung**, kein `ld.so` für fremde Binaries, keine ABI-Treue gegenüber Linux,
+kein Persönlichkeitsserver."*
+
+**Was ab heute gilt:** die Syscall-Umleitung ist **gebaut** (Z26/A3, s. u.). Damit ist Z16 nicht
+falsch und nicht abgelöst — es ist **eine von zwei Linien**:
+
+| | Z16 — übersetzen | Z27 — fahren |
+|---|---|---|
+| Eingabe | Quelltext | unveränderte Linux-ELFs |
+| Anforderung | POSIX-**Semantik** | Linux-**Verhalten** |
+| Kernelkosten | eine Kerneloperation (Threads in einer PD) | das Umleitungsprimitiv + drei Autoritäten (s. A3) |
+| Präzedenz, die trägt | Redox OS (`relibc`) | Fuchsia/Starnix |
+| Präzedenz, die scheiterte | — | WSL1, gVisor |
+
+**Der Grund für die Umkehr** — und er ist nicht „schöner", sondern **unumgänglich**: `libcuda`,
+`libnvidia-glcore` und die übrigen NVIDIA-Userland-Bibliotheken gibt es **nicht als Quelltext**.
+Z16 kann sie strukturell nicht erreichen, gleich wie gut es wird. Dasselbe gilt für jede
+Kunden-Last, die niemand neu übersetzt, und für Go (eigener Runtime, umgeht libc grundsätzlich).
+Wer „PaaS mit GPU-Compute" will, hat hier keine Wahl, sondern eine Rechnung.
+
+**Und jetzt die Forderung, die die alte Analyse an die neue stellt — sie ist der eigentliche
+Inhalt dieses Eintrags:**
+
+> **WSL1 ist nicht an der Umleitungsmechanik gescheitert, sondern an der VERHALTENSTREUE. Eine Cap
+> macht das kein Gramm leichter.**
+
+Das Primitiv aus A3 löst das Problem „wie kommt der Syscall zur Persönlichkeit". Es löst **nichts**
+von dem, woran WSL1 gestorben ist:
+
+- [ ] **Die Fläche ist nicht die Zahl der Syscalls, sondern die Zahl der beobachtbaren
+      Verhaltensweisen.** Z16 hat 48 verschiedene Syscalls über fünf Programme gemessen. Für
+      Z27 ist diese Zahl **die falsche Größe**: `ioctl` ist EIN Syscall und eine unbegrenzte
+      Fläche; `/proc` ist gar kein Syscall; `futex` hat Dutzende Untermodi mit
+      Zeitverhalten. Bevor irgendjemand Aufwand schätzt, muss **eine Messgröße für Treue**
+      festgelegt sein. „48 Syscalls, davon haben wir 30" wäre genau die Sorte Grün, die dieses
+      Projekt bei einem Prüfer nicht durchgehen lässt.
+
+- [ ] **Die Abnahme ist eine fremde Testsuite, nicht der eigene Prüfer.** Dieselbe Regel wie in
+      Z16 („übersetzt ist nicht funktioniert"), nur schärfer: hier gibt es nicht einmal einen
+      Compiler, der widerspricht. Ein Kandidat, der **misst statt zu behaupten**, ist die
+      **LTP** (Linux Test Project) — Zahl der bestandenen Fälle je Untermenge, ins Protokoll,
+      mit Datum und Stichprobengröße.
+
+- [ ] **Wo die beiden Linien einander widersprechen, gilt der ANWENDUNGSFALL, nicht die
+      Reihenfolge im Register.** Z16 bleibt der billigere Weg für alles, was als Quelltext
+      vorliegt (und das ist der grössere Teil eines Server-OS). Z27 ist der einzige Weg für
+      Blobs. Ein Programm, das über Z27 läuft, obwohl sein Quelltext vorliegt, zahlt die
+      Umleitungskosten umsonst.
+
+- [ ] **Diese Umkehr verschiebt Z14 auf den kritischen Pfad** (stand dort als „bewertet,
+      zurückgestellt"). Der teuerste Teil des GPU-Vorhabens ist damit **nicht der Treiber**.
+
 ### Z26. GPU — der Plan, 2026-08-09 (gemessen auf DIESER Maschine)
 **Klasse:** Bewertung · **nicht begonnen** · Anlass: GPU-Code schreibt man am wenigsten selbst,
 und NVIDIA-Userland ist proprietär.
@@ -680,6 +741,9 @@ die beiden anderen sagen **wohin**.
 #### VIER NACHTRÄGE VOR DEM BAU (Einwand vom 2026-08-09, alle vier berechtigt)
 
 **(1) Dieser Strang KEHRT EINE PROTOKOLLIERTE ENTSCHEIDUNG UM — und sagte es nicht.**
+**EINGELÖST am 2026-08-10 als [Z27](#z27-binärkompatibilität-ist-ab-jetzt-eine-linie--die-umkehr-von-z16-entschieden-2026-08-10)**, samt der Forderung, die die alte Analyse an
+die neue stellt (Verhaltenstreue, Messgröße dafür, LTP als Abnahme). Der Text unten bleibt als
+Begründung stehen.
 Z16 steht auf dem Satz: *„Quelltext klonen und übersetzen streicht die Binärkompatibilität — und
 damit die Syscall-Abfangung, genau das, woran WSL1 und gVisor gescheitert sind."* Ein
 `SyscallHandler`, der Gast-Syscalls an eine Persönlichkeits-PD umleitet, **IST** die
@@ -728,6 +792,9 @@ Dazu drei Nähte, die heute niemand nennt:
 * **Zyklen:** A behandelt B, B behandelt A ist ein **Deadlock per Konstruktion**. Die billige
   Absage — „Threads einer PD mit `SyscallHandler`-Bindung dürfen selbst nicht gebunden werden" —
   muss **im Kernel** stehen, nicht in der Doku.
+  **GEBAUT am 2026-08-10 (s. A3), und zwar NICHT in der billigen Fassung:** die verböte auch
+  gestapelte Persönlichkeiten. Gebaut ist die allgemeine Azyklizität als Gang über einen
+  funktionalen Graphen. Der Wartegrund steht als `BlockReasons::HANDLER` in der Grund-Menge.
 
 **(4) Die Messmatrix, mit Schwelle VORHER.** Umlauf gegen nativen Syscall ist nur der **Sockel**;
 je Syscall kommen die Speicherzugriffe des Handlers auf Gast-Puffer dazu, und die **dominieren**
@@ -743,6 +810,201 @@ unseren Gunsten) — aber `restricted mode` spart auch den **Adressraumwechsel**
 Supervisor sich einen teilen, und diese Fassung wechselt **zweimal je Syscall** (zu unseren
 Lasten). Das ist genau die TLB-Frage aus **Z18 (3)**, und die PCID/ASID-Zahl von dort ist die
 zweite Hälfte der Rechnung.
+
+#### A3 — DAS KERNEL-PRIMITIV IST GEBAUT (2026-08-10). Was steht, was offen ist, und die Schwelle
+
+**Stand:** das Primitiv trägt; die **Nutzlast** fehlt. Gemessen: `redirect` 22/22 Host-Tests,
+`tools/redirect-negativ.sh` 7 Mutationen + 1 Quelltext-Wächter mit Sprechprobe **ALL PASS**,
+`== HOST-TESTS: ALL PASS ==`, Scheduler-Modelltreue **29 Selbsttestfälle** grün, Kerngrenze,
+Identität, Zulassung grün, Kernel baut (`x86_64-unknown-none`, `--features selftest`).
+
+##### Was steht
+
+- [x] **Eigene Cap-ARTEN, kein umgewidmeter Endpoint.** `ObjectKind::SyscallHandler { ep, pd,
+      sidecar, len }` und `FaultHandler { .. }`. Ein gewöhnlicher Endpoint wird von
+      `SYS_SETHANDLER` **abgewiesen** (`ERR_BADCAP`), ein `SyscallHandler` im Fault-Slot ebenso.
+      `CALL` auf einer Handler-Cap ist abgewiesen (sonst gäbe ein Handler sich als Gast aus);
+      `RECV`/`REPLY` sind erlaubt, und **`REPLY` hat dort eine Wirkung, die ein Endpoint nicht
+      haben kann**: es lässt zusätzlich den Blockadegrund `HANDLER` fallen. Genau das ist der
+      Unterschied, um dessentwillen es eigene Arten sind.
+      Beide Arten sind über `domain_allows_kind` auf **TrustedSas** beschränkt — dieselbe Klasse
+      wie `PdControl`/`Loader`, weil Z26 die Autorität ehrlich zusammenrechnet: die
+      Persönlichkeits-PD **ist der Kernel des Gastes**.
+
+- [x] **Der Aufruf braucht ZWEI Autoritäten von ZWEI Seiten.**
+      `SYS_SETHANDLER(tcb_cap, syshandler_cap, faulthandler_cap)` (Nr. 19), beide im Cspace des
+      **Aufrufers**, Tcb-Cap mit `WRITE` (nicht `READ` — die Bindung ändert, wer den Thread
+      ausführt, das ist `KILL`-Klasse). Wer umschaltet, ist damit weder Gast noch Handler.
+
+- [x] **Die Gast-PD hält nichts, und ihre Autorität wird verringert.** Die Weiche steht **ganz
+      oben** im Dispatch, vor `YIELD`/`EXIT`/`SETHANDLER`. Ein gebundener Thread erreicht den
+      Caprock-Kernel gar nicht mehr und kann sich insbesondere **nicht selbst entbinden**.
+      Entbinden darf, wer die Tcb-Cap hält — und Entbinden braucht keine Handler-Cap („Autorität
+      abzugeben darf nie an einer Erlaubnis hängen", dieselbe Regel wie `CDELETE`).
+
+- [x] **Fail-closed, und benannt.** Handler weg → der Gast **faultet** mit `ERR_HANDLER_GONE`
+      (11), er fällt **nicht** auf die native ABI zurück. Das ist als Kreuzprodukt-Test
+      formuliert (`bindung_vorhanden_heisst_niemals_kernel`) und mit einer Mutation belegt, die
+      genau diesen Rückfall wieder einbaut.
+      **Und die Asymmetrie ist gebaut, nicht übersehen:** bei einem Syscall ist „der Kernel macht
+      es" eine **Beförderung**, bei einem Fault eine **Herabstufung**. Deshalb zwei Funktionen
+      (`weiche_syscall`/`weiche_fault`) und nicht ein Parameter mit zwei Bedeutungen.
+
+- [x] **Nachtrag 3, BAUPFLICHT: das Zyklusverbot steht IM KERNEL.** `pruefe_bindung` geht die
+      Handler-Kette vom Handler aufwärts; erreicht sie den Gast, wird abgewiesen
+      (`ERR_HANDLER_CYCLE` = 10). **Gebaut ist die allgemeine Azyklizität, nicht die billige
+      Absage aus Z26** („Threads einer PD mit Handler-Bindung dürfen selbst nicht gebunden
+      werden") — die verböte auch **gestapelte Persönlichkeiten**, und die sind legitim
+      (`gestapelte_persoenlichkeiten_bleiben_erlaubt`). Der Gang braucht keinen Hilfsspeicher und
+      keine Besuchsmarken, weil der Graph **funktional** ist: eine PD hat höchstens einen Kernel.
+      Sechs unterscheidbare Absagen, drei ABI-Codes, ein Zählregister (`HANDLER_URTEILE`) — denn
+      `KetteZuLang` heisst „es gibt bereits einen Kreis ohne den Gast", also **Kernelfehler**, und
+      der darf im Audit nicht mit einem Aufruferfehler verschmelzen.
+
+- [x] **Nachtrag 3, zweite Hälfte: der Wartegrund ist von Tag eins in der Grund-Menge (Z24).**
+      `BlockReasons::HANDLER` (Bit 4), **ein** Wecker (`handler_reply`), und
+      `tools/redirect-negativ.sh` Q1 hält per Quelltext-Wächter fest, dass es genau **eine**
+      Stelle im Baum gibt, die ihn entfernt — mit Sprechprobe (mit einer eingebauten zweiten
+      Stelle findet der Wächter 2). Damit ist die von Nachtrag 3 vorhergesagte fünfte Instanz
+      **unformulierbar** statt bewacht.
+
+- [x] **Ein Rennen gefunden und geschlossen, das der Entwurf nicht genannt hatte.** Die Zustellung
+      läuft über den vorhandenen Endpoint-Transport; im **kernübergreifenden** Zweig ruft
+      `Endpoint::call` erst `unblock(server)` **mit IPI** und dann `block_current`. Der Handler
+      kann auf seinem Kern losgelaufen sein und geantwortet haben, bevor der Aufruf zurückkommt —
+      `handler_reply` liefe dann **vor** `mark_handler_wait`, entfernte einen Grund, den es noch
+      nicht gibt, und der Gast hinge für immer, mit jedem Prüfer auf grün. Wörtlich das D11-Bild.
+      Der Grund wird deshalb **vor** dem `call` gesetzt.
+
+##### Die Entwurfsentscheidung, die Z26 noch nicht hatte: SIDECAR statt Register-Schreib-Cap
+
+Z26 gab dem Handler eine Cap, mit der er **fremde Ergebnisregister schreibt**. Gebaut ist etwas
+anderes, und der Grund ist **gemessen**:
+
+| | Wörter | Bytes |
+|---|---|---|
+| `caprock_abi::MSG_WORDS` | **4** | 32 |
+| `TrapFrame` x86_64 (15 GPR + Vektor/Fehler/rip/cs/rflags/rsp/ss) | **22** | 176 |
+| `TrapFrame` aarch64 (x0..x30 + ELR + SPSR + SP_EL0) | **34** | 272 |
+
+Vier Wörter können `rt_sigreturn` (ersetzt den **ganzen** Frame) und `clone` (braucht einen
+**zweiten**) strukturell nicht tragen — das ist keine Unbequemlichkeit, sondern die Grenze, die
+Nachtrag 2 als „die eigentliche Entscheidung, und sie fehlt" benannt hat. Also liegt der Frame in
+einem geteilten Fenster, dem **Sidecar**, ein Slot je gebundenem Gast (512 B, hergeleitet aus 272
+aufgerundet auf die nächste Zweierpotenz), Slot-Vergabe als **Maske** (nicht als Zähler — ein
+Zähler vergäbe nach einer Einzelfreigabe einen Slot zweimal, und dann liest ein Gast den halben
+Syscall eines anderen).
+
+**Das ist die Form von Fuchsias `zx_restricted_bind_state`, und sie halbiert die erste der drei
+Autoritäten aus Nachtrag 2:** es gibt **keine** Operation „schreibe die Register des Threads T".
+Es gibt ein Fenster, in dem die Frames **seiner eigenen** Gäste liegen. Der Unterschied ist
+auditierbar (eine Region in der Speicherbuchhaltung statt einer Fähigkeit im Cap-Audit) und die
+Einschränkung „nur an mich gebundene Threads", die Z26 als Kernelprüfung fordert, ist damit
+**strukturell** statt geprüft.
+
+**Was die Sidecar-Form nicht kann, und es ist genau eine Sache:** sie braucht einen Slot je
+gebundenem **Gast-Thread**, nicht je Handler-Thread. Bei Fuchsia gehört das Sidecar dem Thread,
+der `restricted mode` betritt — dort ist nichts umzuhängen. Hier hängen mehrere Gäste an einer
+Handler-PD; ein Fenster für alle wäre ein Rennen zwischen zwei gleichzeitigen Gast-Syscalls. Preis:
+Speicher und eine Schranke (64 Slots je Handler-PD, `ERR_NOSPACE`), nicht Umhängen.
+
+##### Die Autoritätsrechnung, ehrlich: das Primitiv vergibt EINEINHALB von vier
+
+| Autorität (Nachtrag 2) | hier | Folge |
+|---|---|---|
+| Frame lesen **und schreiben** | **ja**, ganzer Frame über das Sidecar | `rt_sigreturn`, `clone`, Signalzustellung sind damit **möglich** |
+| Gast-**Speicher** (Zeigerargumente) | **nein** | **jeder Syscall mit Zeiger ist nicht implementierbar** — `read`, `write`, `openat`, `ioctl`. Für CUDA heisst das: die ganze `ioctl`-Fläche fehlt |
+| **Vspace** des Gastes manipulieren | **nein** | **`mmap`/`mprotect`/Demand-Paging sind nicht implementierbar** |
+| Faults **sehen** | **ja**, eigene Cap | ein Fault-Handler *sieht*; **beheben** kann er nicht (das ist Zeile 3) |
+
+Die beiden Neins sind **kein Versehen**: es sind eigene Caps mit eigenen Entwurfsfragen (welche
+Cap trägt „der ganze Adressraum von G"? ein Kernel-Kopierdienst kostet TCB je Syscall). Sie
+mitzunehmen hiesse, drei Entscheidungen in einer Zeile zu treffen.
+
+##### DIE SCHWELLE — festgelegt VOR jeder Messung (Nachtrag 4)
+
+**Der Adressraumwechsel ist die offene Größe, und sie ist eine Entwurfsentscheidung, keine
+Nachlässigkeit.** Bei Starnix teilen sich Gast und `starnix_kernel` **einen** Adressraum (untere
+Hälfte Gast, obere Hälfte Supervisor); ein Rundlauf kostet dort einen **Moduswechsel**, keinen
+Adressraumwechsel. Diese Fassung setzt den Handler in eine **eigene PD** und wechselt **zweimal je
+umgeleitetem Syscall**.
+
+Die Starnix-Form wäre hier **nicht billig**: Caprocks isolierte PDs teilen sich die statischen
+oberen Tabellen (`ISO_PD_HIGH`, GiB 1..3) — einen Handler dort einzublenden gäbe ihn **jeder**
+isolierten PD (die Falle „Geteilte Seitenverzeichnisse vertragen keine PD-spezifischen Einträge").
+Sie verlangte private obere Tabellen je Gast und setzte den Kernel des Gastes **in dessen
+Adressraum**. Deshalb: eigene PD, zwei Wechsel, Preis benannt.
+
+**Die Schwelle, ab der die cap-förmige Fassung fällt und `restricted mode` gebaut werden muss:**
+
+| Last | Schwelle | verankert an |
+|---|---|---|
+| umgeleiteter **`getpid`** (Sockel: kein Gast-Speicherzugriff) | **≤ 2000 Zyklen** Median | Z18 (2): ein Linux-Syscall liegt mit Mitigations bei 100–200; „unter 1000" hiess dort, die Dienst-Architektur trägt. Ein Redirect **ist** ein solcher Umlauf plus Marshalling — das Doppelte ist die grosszügige Fassung derselben Zahl |
+| **`read` 4 KiB / 64 KiB** | noch **nicht** festlegbar | er braucht die Gast-Speicher-Autorität, und die ist nicht gebaut. Eine Schwelle für einen Pfad, den es nicht gibt, wäre eine Zahl ohne Gegenstand |
+
+Über 2000 Zyklen ist **nicht** „dann optimieren wir": dann ist der Entwurf gefallen, und die
+Antwort heisst geteilter Adressraum (private obere Tabellen je Gast) oder PCID (Z18 (3)).
+**Die Zahl steht hier, bevor gemessen wurde** — sonst wird danach verhandelt, was vorher hätte
+feststehen müssen.
+
+##### WAS OFFEN IST — und das ist mehr, als oben steht
+
+- [ ] **Die Nutzlast: das Kopieren Frame ↔ Sidecar fehlt.** `zustellen()` stellt die **Nachricht**
+      zu (welcher Gast, welcher Slot, welcher Anlass) und blockiert den Gast korrekt. Der Handler
+      erfährt *dass* und *wer*, aber **nicht *was***. Es fehlt die Physadresse des Fensters im
+      Kernel und ein architekturabhängiger Frame-Serialisierer. **Ohne das ist das Primitiv nicht
+      benutzbar**, nur richtig.
+
+- [ ] **Das Sidecar-Fenster wird nirgends ANGELEGT und in die Handler-PD gemappt.** Die Cap trägt
+      `sidecar`/`len`, aber es gibt keinen Pfad, der eine Handler-Cap prägt. Solange der fehlt,
+      kann `SYS_SETHANDLER` nie erfolgreich sein — es gibt keine Cap der neuen Arten.
+      **Das ist der Grund, warum die Prüfzeile `handler` das Primitiv über den Kernel-Prüfpfad
+      misst und nicht über einen echten Gast.**
+
+- [ ] **`handler_lebt` liest die falsche Größe — benannt, nicht versteckt.** Geprüft wird, ob die
+      Handler-**PD** existiert und nicht stillgelegt ist. **Nicht** geprüft: ob die Handler-*Cap*
+      noch im Cspace liegt. Eine gelöschte Cap bei lebender PD führt heute dazu, dass der Handler
+      nicht mehr `RECV`t — der Gast wartet dann in `BlockReasons::HANDLER`, **statt zu faulten**.
+      Damit deckt die Fail-closed-Regel den Fall „Cap entzogen" nur zur Hälfte. Ein Prüfer, der
+      die falsche Größe liest, kann den Fehler strukturell nicht sehen; deshalb steht es hier und
+      im Quelltext an der Funktion.
+
+- [ ] **Die asynchrone Hälfte der Entzugs-Regel fehlt** (Nachtrag 3): stirbt die Handler-PD,
+      während ein Gast wartet, wird der Gast heute **nicht** geweckt. Er hängt. Es braucht einen
+      Pfad im PD-Teardown, der alle Gäste dieser Handler-PD mit `ERR_HANDLER_GONE` freigibt —
+      und die Gästeliste gibt es noch nicht (nur die Kante `gast -> handler`, nicht ihre
+      Umkehrung).
+
+- [ ] **Zu Z23 (Freeze): die Partner-Nennung kennt den Handler-Wartefall nicht.** Eine
+      Persönlichkeits-PD einzufrieren macht alle ihre Gäste hängend. `handler_lebt` gibt
+      `quiescing`-PDs bereits als tot aus (der Gast faultet also statt zu hängen) — aber die
+      **Freeze-Absage** nennt den Handler-Wartefall nicht, und das gehört zusammen entschieden.
+
+- [ ] **Der eigene `LocalReason` für Handler-Caps fehlt.** `classify` verweigert sie korrekt, aber
+      mit dem Grund `PendingReply` — eine **benannte Ungenauigkeit**: der Refusal-Grund stimmt
+      („konkrete blockierte Aufrufer bleiben hier"), die Cap-Art nicht. Ein eigener
+      `LocalReason::HandlerBinding` braucht **eine Zeile** in `ckpt_reason`
+      (`kernel/src/arch/x86_64/bringup.rs`): `L::HandlerBinding => 9,`. Der Host-Test
+      `handler_caps_wandern_nicht` pinnt das heutige Verhalten fest und **fällt**, sobald die
+      Umstellung kommt — das ist seine Aufgabe.
+
+- [ ] **Die Prüfzeile `handler` ist geschrieben, aber nicht eingehängt.** `kernel/src/handlermess.rs`
+      (über `system.rs` per `#[path]` eingebunden, damit `main.rs` unberührt bleibt) misst drei
+      Dinge: die ABI-Konstanten-Klammer, das Zyklusverbot **gegen die echte PD-Tabelle**, die
+      Sidecar-Slot-Buchhaltung, und als Hauptaussage, dass **kein fremder Wecker** den
+      Handler-Grund aufhebt (`unpark`, `resume`, `pause`+`resume`) — gemessen an der **Wirkung**
+      (Rundenzähler einer Sonde), mit Positivkontrolle davor und Sprechprobe danach
+      (`laeuft-nach-reply`).
+      Einzuhängen sind **drei** Zeilen in `bringup.rs` (s. Abschlussbericht des Strangs); solange
+      sie fehlen, ist die Aussage **ungemessen**, und die betreffenden Funktionen stehen als
+      „never used" im Bau.
+
+- [ ] **Nicht gemessen: die Kosten.** Kein Zyklenwert, weder für die Weiche noch für den Umlauf.
+      Der Umlauf braucht die Nutzlast (s. o.); die Weiche kostet auf dem unbelasteten Pfad ein
+      `Option`-Lesen am laufenden TCB je Syscall (eine Sperrung, ein Vergleich, kein Cap-Lookup) —
+      **auch das ist eine Behauptung über den Code, keine Messung.** Sie gehört an
+      [Z18](#z18-hohe-leistung-für-übersetzten-fremdcode--vermessen-2026-08-09) (2), das ohnehin
+      als „die eigentliche Lücke" offen ist.
 
 #### Die Regel, ohne die es eine Rechteausweitung wäre
 
@@ -2163,6 +2425,14 @@ Die Gründe sind aber benennbar und einzeln messbar.
 ### Z16. Quelltext übersetzen statt Binaries laufen lassen — bewertet 2026-08-09
 **Klasse:** Produktstrang · **Aufwand:** groß, aber **eine Größenordnung kleiner als
 Binärkompatibilität** · **Randbedingung:** Isolation und kleine TCB bleiben.
+
+> **ACHTUNG, 2026-08-10: die Prämisse dieses Eintrags gilt nicht mehr allein.** Der Satz weiter
+> unten — „Binärkompatibilität fällt weg, damit entfällt die Syscall-Umleitung" — ist durch
+> [Z27](#z27-binärkompatibilität-ist-ab-jetzt-eine-linie--die-umkehr-von-z16-entschieden-2026-08-10)
+> **umgekehrt**: die Syscall-Umleitung ist gebaut (Z26/A3). Z16 ist damit **eine von zwei
+> Linien**, nicht die Linie. Was hier steht, bleibt richtig für alles, was als Quelltext
+> vorliegt; für Blobs (`libcuda`) gilt Z27. Wer nur diesen Eintrag liest, liest die halbe
+> Entscheidung.
 
 **Das Ziel (Simon, 2026-08-09):** Quelltext klonen, übersetzen, auf dem Mikrokern laufen lassen —
 möglichst viele Linux-Bibliotheken aus C, C++, Zig, Rust, Go.

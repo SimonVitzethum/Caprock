@@ -22,7 +22,7 @@ use caprock_hal::cpu::array_index_nospec;
 use caprock_hal::exception::{frame_reg, frame_set_reg};
 use caprock_ipc::{Endpoint, Notification};
 use caprock_mem::Rights;
-use caprock_sched::{SchedOps, ThreadId};
+use caprock_sched::{redirect, SchedOps, ThreadId};
 use caprock_slab::Slab;
 use caprock_sync::{RwSpinLock, SpinLock};
 
@@ -380,12 +380,31 @@ fn kind_is_pd_control(kind: ObjectKind) -> bool {
     matches!(kind, ObjectKind::PdControl { .. } | ObjectKind::Loader { .. })
 }
 
+/// Ist `kind` eine **Handler-Cap** (Z26/A3)? Wer eine hält, ist der **Kernel eines Gastes**.
+fn kind_is_handler(kind: ObjectKind) -> bool {
+    matches!(
+        kind,
+        ObjectKind::SyscallHandler { .. } | ObjectKind::FaultHandler { .. }
+    )
+}
+
 /// Darf eine PD der Domäne `domain` eine Cap des Typs `kind` halten?
-/// HW-Caps nur HardwareLand; `PdControl`/`Loader` nur TrustedSas; alles andere überall.
+/// HW-Caps nur HardwareLand; `PdControl`/`Loader` und **Handler-Caps** nur TrustedSas; alles
+/// andere überall.
+///
+/// **Warum Handler-Caps in dieselbe Klasse wie `PdControl` gehören** (Z26/A3): Z26 rechnet die
+/// Autorität ehrlich zusammen — die Persönlichkeits-PD **ist der Kernel des Gastes**. Sie liest
+/// und schreibt dessen ganzen Trap-Frame und kann ihn belügen. Das ist mindestens so viel wie
+/// „darf eine PD starten und stoppen", und es an eine UserLand-PD zu vergeben hiesse, den Gast
+/// einem Nachbarn auszuliefern, der selbst keiner Prüfung unterliegt.
+///
+/// Damit steht auch die Manifest-Frage aus Z26 schon halb beantwortet: wer Gast-Kernel sein darf,
+/// ist eine Domänen-Eigenschaft der **signierten** Fläche und ergibt sich nicht aus dem Besitz
+/// eines Endpoints.
 fn domain_allows_kind(domain: Domain, kind: ObjectKind) -> bool {
     if kind_is_hardware(kind) {
         domain == Domain::HardwareLand
-    } else if kind_is_pd_control(kind) {
+    } else if kind_is_pd_control(kind) || kind_is_handler(kind) {
         domain == Domain::TrustedSas
     } else {
         true
@@ -436,6 +455,78 @@ pub struct Pd {
     /// nicht. Dürfte er den Slot wählen, könnte ein Server jeden Cap seines Clients verdrängen —
     /// eine Schreiboperation in fremdes Eigentum, verkleidet als Antwort.
     recv_slot: usize,
+    /// **Die ausgehende Kante im Handler-Graphen** (Z26/A3): PD, deren Persönlichkeit die Threads
+    /// **dieser** PD behandelt. `u16::MAX` = keine.
+    ///
+    /// Die Bindung selbst steht **je Thread** im TCB; hier steht die **PD-Sicht**, weil die Frage
+    /// „schliesst das einen Kreis?" eine Frage über PDs ist und nicht über Threads: der Handler
+    /// ist eine PD, und *jeder* ihrer Threads erbt beim `RECV` das Schicksal ihrer Bindung.
+    ///
+    /// Zwei Strukturen für eine Sache sind ein Riss — deshalb ist der Graph **funktional** (eine
+    /// PD hat höchstens eine ausgehende Kante) und [`handler_bound`] zählt die Threads, die an
+    /// ihr hängen. Fällt der Zähler auf 0, fällt die Kante. Eine PD hat höchstens EINEN Kernel;
+    /// zwei Persönlichkeiten über einem Adressraum wären zwei Wahrheiten über denselben Speicher.
+    handler_pd: u16,
+    /// Wie viele Threads dieser PD hängen an [`handler_pd`]? Hält Kante und TCB-Bindungen
+    /// zusammen: `handler_bound == 0` **genau dann**, wenn `handler_pd == u16::MAX`.
+    handler_bound: u32,
+    /// **Belegungsbitmaske der Sidecar-Slots**, wenn diese PD ein *Handler* ist. Bit `i` gesetzt =
+    /// Slot `i` vergeben. 64 Gäste je Handler-PD; darüber [`caprock_abi::result::ERR_NOSPACE`].
+    ///
+    /// Warum eine Maske und keine Zahl: Slots werden **einzeln** frei (ein Gast stirbt), und ein
+    /// Zähler könnte danach einen Slot zweimal vergeben — zwei Gäste im selben Fenster, und der
+    /// eine liest den halben Syscall des anderen. Dieselbe Form wie `sc_donee` vor D9: ein
+    /// Zeiger, wo eine Menge gemeint war.
+    sidecar_used: u64,
+}
+
+/// „Keine Handler-Kante."
+pub const KEIN_HANDLER_PD: u16 = u16::MAX;
+/// Sidecar-Slots je Handler-PD (Breite von [`Pd::sidecar_used`]).
+pub const SIDECAR_SLOTS: u16 = 64;
+
+/// **Das Register der Bindungsurteile** (Z26/A3) — ein Zähler je [`redirect::BindUrteil`].
+///
+/// ## Warum gezählt und nicht nur abgewiesen
+///
+/// Nach aussen tragen `Zyklus`, `SelbstBindung` und `KetteZuLang` **denselben** ABI-Code: der
+/// Aufrufer kann in allen drei Fällen nichts anderes tun. Innen sind sie **verschieden**, und
+/// zwar so, dass es zählt: `KetteZuLang` heisst „es gibt bereits einen Kreis, an dem der Gast gar
+/// nicht beteiligt ist" — ein **Kernelfehler**, kein Aufruferfehler. Wer die drei zusammenwirft,
+/// verliert genau den, der auf einen Fehler im Kernel zeigt.
+///
+/// Und die Sprechprobe hängt daran: ein Prüfer, der meldet „kein Zyklus aufgetreten", muss
+/// belegen können, dass überhaupt gebunden wurde. `HANDLER_URTEILE[0]` (= `Ok`) ist dieser Beleg.
+pub static HANDLER_URTEILE: [core::sync::atomic::AtomicU32; 7] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; 7];
+
+/// Index eines Urteils im Register. **Erschöpfend** — ein neues Urteil bricht hier den Bau, statt
+/// still in einen Sammeleimer zu fallen.
+pub fn urteil_index(u: redirect::BindUrteil) -> usize {
+    use redirect::BindUrteil as B;
+    match u {
+        B::Ok => 0,
+        B::Zyklus => 1,
+        B::SelbstBindung => 2,
+        B::FremderHandler => 3,
+        B::KetteZuLang => 4,
+        B::KeinSlot => 5,
+        B::Wirkungslos => 6,
+    }
+}
+
+/// Zählerstand eines Urteils (für Bericht und Prüfzeile).
+pub fn handler_urteil_count(u: redirect::BindUrteil) -> u32 {
+    HANDLER_URTEILE[urteil_index(u)].load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Alle sieben Zählerstände auf einmal — in der Reihenfolge von [`urteil_index`].
+pub fn handler_urteile() -> [u32; 7] {
+    let mut o = [0u32; 7];
+    for (i, x) in o.iter_mut().enumerate() {
+        *x = HANDLER_URTEILE[i].load(core::sync::atomic::Ordering::Relaxed);
+    }
+    o
 }
 
 impl Pd {
@@ -450,6 +541,9 @@ impl Pd {
         chan_ep: u32::MAX,
         chan_ntfn: u32::MAX,
         recv_slot: caprock_abi::GRANT_RECV_SLOT,
+        handler_pd: KEIN_HANDLER_PD,
+        handler_bound: 0,
+        sidecar_used: 0,
     };
 }
 
@@ -500,6 +594,117 @@ impl PdTable {
         } else {
             false
         }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Z26/A3: der Handler-Graph
+    // ---------------------------------------------------------------------------------
+
+    /// Knotenzahl des Handler-Graphen = Länge der PD-Tabelle. Die **Schrittschranke** der
+    /// Zyklusprüfung; sie wird aus der Tabelle hergeleitet und steht nicht als Konstante daneben
+    /// (dieselbe Begründung wie `eps.len()` statt `NENDPOINTS` in A-3.4 Teil 4).
+    pub fn pd_capacity(&self) -> usize {
+        self.pds.len()
+    }
+
+    /// Die Handler-PD von `pd` (die ausgehende Kante), oder `None`.
+    pub fn handler_pd_of(&self, pd: usize) -> Option<u16> {
+        if pd < self.pds.len() && self.pds[pd].used && self.pds[pd].handler_pd != KEIN_HANDLER_PD {
+            Some(self.pds[pd].handler_pd)
+        } else {
+            None
+        }
+    }
+
+    /// **Einen freien Sidecar-Slot bei der Handler-PD belegen.** `None` = alle 64 vergeben.
+    ///
+    /// Der Slot gehört ab hier **genau einem** Gast-Thread; nur der Kernel schreibt hinein.
+    pub fn sidecar_belegen(&mut self, handler_pd: usize) -> Option<u16> {
+        if handler_pd >= self.pds.len() || !self.pds[handler_pd].used {
+            return None;
+        }
+        let frei = self.pds[handler_pd].sidecar_used;
+        if frei == u64::MAX {
+            return None;
+        }
+        let slot = frei.trailing_ones() as u16;
+        // `trailing_ones` findet das erste 0-Bit. Bei `u64::MAX` waere das 64 -- deshalb steht die
+        // Vollprobe DAVOR und nicht als `if slot >= 64` danach: eine Schranke, die den Ueberlauf
+        // erst nach dem Rechnen prueft, ist eine Schranke mit einem Loch.
+        self.pds[handler_pd].sidecar_used |= 1u64 << slot;
+        Some(slot)
+    }
+
+    /// Einen Sidecar-Slot wieder freigeben (Gast entbunden oder tot).
+    pub fn sidecar_freigeben(&mut self, handler_pd: usize, slot: u16) -> bool {
+        if handler_pd >= self.pds.len() || !self.pds[handler_pd].used || slot >= SIDECAR_SLOTS {
+            return false;
+        }
+        let bit = 1u64 << slot;
+        let war = self.pds[handler_pd].sidecar_used & bit != 0;
+        self.pds[handler_pd].sidecar_used &= !bit;
+        war
+    }
+
+    /// Freie Sidecar-Slots bei `handler_pd` (für die Vorprüfung und den Bericht).
+    pub fn sidecar_frei(&self, handler_pd: usize) -> u16 {
+        if handler_pd >= self.pds.len() || !self.pds[handler_pd].used {
+            return 0;
+        }
+        SIDECAR_SLOTS - self.pds[handler_pd].sidecar_used.count_ones() as u16
+    }
+
+    /// **Die Kante `gast -> handler` setzen** und den Thread-Zähler erhöhen.
+    ///
+    /// Der Aufrufer hat die Zulässigkeit **vorher** geprüft (Zyklus, fremder Handler, Slot); diese
+    /// Funktion legt ab. Absichtlich getrennt, damit die Prüfung nicht an zwei Stellen steht — und
+    /// damit sie in einer host-testbaren, abhängigkeitsfreien Datei stehen kann.
+    pub fn handler_kante_setzen(&mut self, gast: usize, handler: u16) -> bool {
+        if gast >= self.pds.len() || !self.pds[gast].used {
+            return false;
+        }
+        self.pds[gast].handler_pd = handler;
+        self.pds[gast].handler_bound += 1;
+        true
+    }
+
+    /// **Eine Bindung zurücknehmen.** Fällt der Zähler auf 0, fällt die Kante.
+    ///
+    /// Ohne diesen zweiten Halbsatz bliebe eine Kante stehen, an der kein Thread mehr hängt — und
+    /// das Zyklusverbot verböte danach für immer eine Bindung, die längst zulässig wäre. Ein
+    /// Verbot, das aus einer Leiche folgt, ist von einem echten Verbot nicht zu unterscheiden.
+    pub fn handler_kante_loesen(&mut self, gast: usize) -> bool {
+        if gast >= self.pds.len() || !self.pds[gast].used || self.pds[gast].handler_bound == 0 {
+            return false;
+        }
+        self.pds[gast].handler_bound -= 1;
+        if self.pds[gast].handler_bound == 0 {
+            self.pds[gast].handler_pd = KEIN_HANDLER_PD;
+        }
+        true
+    }
+
+    /// Wie viele Threads dieser PD sind gebunden? (Sprechprobe/Bericht.)
+    pub fn handler_bound_of(&self, pd: usize) -> u32 {
+        if pd < self.pds.len() && self.pds[pd].used {
+            self.pds[pd].handler_bound
+        } else {
+            0
+        }
+    }
+
+    /// **Lebt die Handler-PD noch?** Die Größe, die [`caprock_sched::redirect::weiche_syscall`]
+    /// als `handler_lebt` bekommt.
+    ///
+    /// **Was diese Funktion NICHT prüft** — und das gehört hierhin, nicht in einen Bericht: dass
+    /// die Handler-*Cap* noch im Cspace der Handler-PD liegt. Geprüft wird, ob die PD existiert
+    /// und nicht stillgelegt ist. Eine gelöschte Cap bei lebender PD führt heute dazu, dass der
+    /// Handler nicht mehr `RECV`t — der Gast wartet dann in `BlockReasons::HANDLER`, statt zu
+    /// faulten. **Das ist eine offene Lücke** (todo.md Z26/A3), und sie steht hier, weil ein
+    /// Prüfer, der die falsche Größe liest, den Fehler strukturell nicht sehen kann.
+    pub fn handler_lebt(&self, handler_pd: u16) -> bool {
+        let i = handler_pd as usize;
+        i < self.pds.len() && self.pds[i].used && !self.pds[i].quiescing
     }
 
     /// Die lokalen Cap-Slots einer PD (für den Teardown: jeden installierten Cap löschen). Gibt
@@ -752,6 +957,171 @@ pub fn dispatch(
     delete_cap: fn(CapPtr) -> bool,
 ) -> usize {
     let nr = frame_reg(frame, reg::SYSNO_RESULT);
+
+    // --- Z26/A3: DIE WEICHE ------------------------------------------------------------------
+    //
+    // **Ganz oben, vor jedem Sonderfall** — und das ist die tragende Aussage des Primitivs: eine
+    // gebundene PD erreicht den Caprock-Kernel **gar nicht mehr**. Kein `YIELD`, kein `EXIT`,
+    // kein `SETHANDLER`. Insbesondere kann sich ein gebundener Thread nicht selbst entbinden;
+    // rückgängig macht es, wer die Tcb-Cap hält, und das ist per Entwurf eine dritte Partei.
+    //
+    // Stünde die Weiche weiter unten, wäre jeder Syscall darüber ein **Loch** — und ein Loch,
+    // das man einer Persönlichkeit nicht ansieht: sie bekäme genau die Aufrufe nicht zu sehen,
+    // die der Kernel vorher schon abgefangen hat.
+    //
+    // **Kosten auf dem unbelasteten Pfad:** ein `Option`-Lesen am laufenden TCB je Syscall
+    // (`current_handler`), also eine Sperrung und ein Vergleich. Kein Cap-Lookup, keine
+    // Tabellensuche.
+    if let Some(bindung) = ops.current_handler(core) {
+        let lebt = handler_lebt(caps, bindung.handler_pd);
+        return match redirect::weiche_syscall(Some(bindung), lebt) {
+            // Unerreichbar bei `Some(..)` mit Syscall-Handler; s. den Kreuzprodukt-Test
+            // `bindung_vorhanden_heisst_niemals_kernel`. Ein gebundener Thread OHNE
+            // Syscall-Handler (nur Fault) landet hier und wird regulär bearbeitet -- das ist die
+            // halbe Bindung, und sie ist gewollt (Debugger/Speicherserver ohne Persönlichkeit).
+            redirect::Weiche::Kernel => dispatch_nativ(
+                frame, core, ops, caps, eps, ntfns, load, delete_cap, nr,
+            ),
+            redirect::Weiche::Fault(code) => {
+                // **Kein Rückfall auf die native ABI.** Aus dem Entzug einer Cap darf keine
+                // Beförderung werden. Der Gast bekommt den Code und wird blockiert -- er läuft
+                // NICHT weiter, denn sein Kernel ist weg und niemand wird ihm antworten.
+                frame_set_reg(frame, reg::SYSNO_RESULT, code);
+                ops.block_for_handler(core, frame)
+            }
+            redirect::Weiche::Handler { ep, slot } => zustellen(
+                frame, core, ops, eps, ep, slot, redirect::Anlass::Syscall, 0,
+            ),
+        };
+    }
+    dispatch_nativ(frame, core, ops, caps, eps, ntfns, load, delete_cap, nr)
+}
+
+/// **Lebt die Handler-PD?** — die Größe, die die Weiche als `handler_lebt` liest.
+fn handler_lebt(caps: &RwSpinLock<Caps>, handler_pd: u16) -> bool {
+    caps.read().pds.handler_lebt(handler_pd)
+}
+
+/// **Die Weiche für einen FAULT** (Z26/A3) — der Einstieg aus dem architekturabhängigen
+/// Fault-Hook des Kernels.
+///
+/// Gibt `None` zurück, wenn der Kernel weitermachen soll (keine Fault-Bindung) — dann läuft der
+/// native Pfad: den Thread beenden. `Some(next)` heisst „zugestellt oder benannt abgewiesen, der
+/// Thread ist blockiert".
+///
+/// **Warum das hier steht und nicht im Kernel:** die Sperrordnung ist `CAPS < EPS < SCHEDS`. Der
+/// Fault-Hook hält bei seiner Diagnose den `SCHEDS`-Lock; würde er von dort aus zustellen, nähme
+/// er `EPS` unter `SCHEDS` und drehte die Ordnung um. Diese Funktion wird deshalb **vor** dem
+/// Diagnoseblock gerufen, mit allen Locks frei.
+pub fn fault_dispatch(
+    frame: usize,
+    core: usize,
+    ops: &mut dyn SchedOps,
+    caps: &RwSpinLock<Caps>,
+    eps: &[SpinLock<Endpoint>],
+    ec: u64,
+) -> Option<usize> {
+    let bindung = ops.current_handler(core)?;
+    if !bindung.hat_fault() {
+        return None; // halbe Bindung: nur Syscalls umgeleitet -- Faults bleiben nativ
+    }
+    let lebt = handler_lebt(caps, bindung.handler_pd);
+    Some(match redirect::weiche_fault(Some(bindung), lebt) {
+        redirect::Weiche::Kernel => return None,
+        redirect::Weiche::Fault(code) => {
+            // Der Fault-Handler ist weg. Der Gast wird **benannt** blockiert statt still beendet:
+            // „dein Kernel ist verschwunden" und „du hast Mist gebaut" sind zwei Diagnosen, und
+            // wer sie zusammenwirft, sucht die Ursache im falschen Programm.
+            frame_set_reg(frame, reg::SYSNO_RESULT, code);
+            ops.block_for_handler(core, frame)
+        }
+        redirect::Weiche::Handler { ep, slot } => {
+            zustellen(frame, core, ops, eps, ep, slot, redirect::Anlass::Fault, ec)
+        }
+    })
+}
+
+/// **Eine Umleitung zustellen.**
+///
+/// Der Trap-Frame des Gastes gehört ins **Sidecar** (das geteilte Fenster an der Handler-Cap);
+/// die Nachricht sagt nur, *welcher* Gast und *warum*. Der Grund ist eine Zahl: `MSG_WORDS` ist 4,
+/// ein Trap-Frame hat 22 (x86_64) bzw. 34 (aarch64) Wörter — `rt_sigreturn` (ersetzt den ganzen
+/// Frame) und `clone` (braucht einen zweiten) sind über vier Wörter strukturell unmöglich.
+///
+/// **NOCH NICHT GEBAUT und ausdrücklich benannt:** das Kopieren Frame ↔ Sidecar. Es braucht die
+/// physische Adresse des Fensters und einen architekturabhängigen Frame-Serialisierer; beides
+/// liegt im Kernel, nicht hier. Solange es fehlt, stellt diese Funktion die **Nachricht** zu und
+/// blockiert den Gast korrekt — der Handler erfährt also *dass* und *wer*, aber nicht *was*.
+/// Der Zustand ist damit ehrlich unvollständig statt scheinbar fertig; s. `todo.md` Z26/A3.
+#[allow(clippy::too_many_arguments)]
+fn zustellen(
+    frame: usize,
+    core: usize,
+    ops: &mut dyn SchedOps,
+    eps: &[SpinLock<Endpoint>],
+    ep: u32,
+    slot: u16,
+    anlass: redirect::Anlass,
+    code: u64,
+) -> usize {
+    let ep_i = ep as usize;
+    if ep_i >= eps.len() {
+        // Der Endpoint ist weg -> derselbe Fall wie ein toter Handler, und **dieselbe** Antwort.
+        // Nicht `ERR_BADCAP`: der Gast hat keine Cap benutzt, er hat einen Syscall gemacht.
+        frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_HANDLER_GONE);
+        return ops.block_for_handler(core, frame);
+    }
+    let guest = ops.current_id(core);
+    frame_set_reg(frame, caprock_abi::redirect_msg::SLOT, slot as u64);
+    frame_set_reg(frame, caprock_abi::redirect_msg::GUEST_TID, guest.to_raw());
+    frame_set_reg(frame, caprock_abi::redirect_msg::ANLASS, anlass as u64);
+    frame_set_reg(frame, caprock_abi::redirect_msg::CODE, code);
+    // --- Der Grund kommt VOR die Zustellung, und das ist kein Stilfrage ----------------------
+    //
+    // Ein Gast, dessen Syscall beim Handler liegt, trägt **zwei** Gründe: `IPC` (setzt `call`)
+    // und `HANDLER`. Der `reply` des Handlers entfernt `IPC`, `handler_reply` entfernt
+    // `HANDLER`, und lauffähig wird der Gast erst bei **leerer Menge** (Z24). Ohne den zweiten
+    // Grund liefe er los, sobald die IPC-Antwort da ist — also **bevor** sein Frame aus dem
+    // Sidecar zurückgeschrieben ist. Genau die halbe Ausführung, die Z26/Nachtrag 3 vorhersagt.
+    //
+    // **Und die Reihenfolge ist der Punkt.** Nachher wäre ein Rennen: im kernübergreifenden
+    // Zweig ruft `call` erst `ops.unblock(server)` (mit IPI!) und dann `block_current` — der
+    // Handler kann auf seinem Kern **losgelaufen sein und geantwortet haben**, bevor wir
+    // zurückkommen. `handler_reply` liefe dann vor `mark_handler_wait`, entfernte einen Grund,
+    // den es noch nicht gibt, und der Gast hinge **für immer** — mit jedem Prüfer auf grün.
+    // Wörtlich das Bild aus D11, und wörtlich der Grund, aus dem `unpark` seine Weckmarke
+    // IMMER hinterlegt (Z22 P4).
+    ops.mark_handler_wait(guest);
+    // Über den **vorhandenen** Endpoint-Transport. Der Endpoint bleibt unverändert — A-5.1 hat
+    // gezeigt, dass ein Transport, der von seinem Inhalt nichts weiss, der billigere ist.
+    let next = eps[array_index_nospec(ep_i, eps.len())]
+        .lock()
+        .call(ops, core, frame);
+    if next == frame {
+        // **`call` hat NICHT blockiert** — Endpoint stillgelegt (`ERR_QUIESCING`) oder
+        // Warteschlange voll (`ERR_EP_FULL`); der Code steht in `x0`. Ein gewöhnlicher Client
+        // liefe hier weiter und wiederholte. Ein **Gast** darf das nicht: weiterlaufen hiesse,
+        // mit der nativen ABI weiterzulaufen, und das ist die Beförderung, gegen die das ganze
+        // Primitiv steht. Er bleibt liegen — mit `HANDLER` gesetzt und dem Grund im Frame.
+        // Auflösen muss, wer die Tcb-Cap hält; der Gast selbst kann es per Entwurf nicht.
+        return ops.block_for_handler(core, frame);
+    }
+    next
+}
+
+/// Der Dispatch **ohne** Umleitung — der Rumpf, den es vor Z26/A3 gab.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_nativ(
+    frame: usize,
+    core: usize,
+    ops: &mut dyn SchedOps,
+    caps: &RwSpinLock<Caps>,
+    eps: &[SpinLock<Endpoint>],
+    ntfns: &[SpinLock<Notification>],
+    load: fn(u32, usize, &[(usize, CapPtr)]) -> Option<usize>,
+    delete_cap: fn(CapPtr) -> bool,
+    nr: u64,
+) -> usize {
     if nr == sys::YIELD {
         return ops.on_tick(core, frame);
     }
@@ -958,8 +1328,29 @@ pub fn dispatch(
 
     match nr {
         sys::CALL | sys::RECV | sys::REPLY => {
-            let ObjectKind::Endpoint(ep_id) = kind else {
-                return deny(result::ERR_BADCAP);
+            // --- Z26/A3: eine Handler-Cap darf hier EMPFANGEN und ANTWORTEN, aber nicht rufen ---
+            //
+            // `RECV`/`REPLY` sind die Operationen, mit denen eine Persönlichkeits-PD ihre Gäste
+            // bedient. `CALL` ist es **nicht**: darüber gäbe ein Handler sich als Gast aus und
+            // stellte sich selbst eine Umleitung zu.
+            //
+            // Der Unterschied zu einem gewöhnlichen Endpoint steckt im `REPLY`: es beendet nicht
+            // nur eine Transaktion, es **schliesst einen Syscall ab** — und deshalb fällt dort
+            // zusätzlich der Grund `HANDLER`. Genau diese Wirkung kann ein Endpoint nicht haben,
+            // und genau deshalb sind es eigene Cap-Arten.
+            let handler_kanal = matches!(
+                kind,
+                ObjectKind::SyscallHandler { .. } | ObjectKind::FaultHandler { .. }
+            );
+            let ep_id = match kind {
+                ObjectKind::Endpoint(id) => id,
+                ObjectKind::SyscallHandler { ep, .. } | ObjectKind::FaultHandler { ep, .. } => {
+                    if nr == sys::CALL {
+                        return deny(result::ERR_BADCAP);
+                    }
+                    ep
+                }
+                _ => return deny(result::ERR_BADCAP),
             };
             let need = if nr == sys::CALL { Rights::WRITE } else { Rights::READ };
             if !rights.contains(need) {
@@ -1023,7 +1414,26 @@ pub fn dispatch(
                         }
                         next
                     } else {
-                        eps[ep].lock().reply(ops, core, frame)
+                        // **Der Handler-Fall: den Gast-Grund fallen lassen** (Z26/A3).
+                        //
+                        // Der Gast trägt zwei Gründe: `IPC` (setzt `call`, entfernt `reply`) und
+                        // `HANDLER`. Erst wenn **beide** weg sind, ist die Menge leer und er läuft
+                        // — und die Reihenfolge ist hier gutartig: `handler_reply` entfernt seinen
+                        // Grund, `reply` den anderen, und wer zuletzt kommt, reiht ein.
+                        //
+                        // Der Aufrufer wird **vor** dem `reply` gelesen: danach hat der Endpoint
+                        // ihn vergessen (`caller` ist zurückgesetzt), und wir wüssten nicht mehr,
+                        // wessen Syscall gerade fertig geworden ist.
+                        let guest = if handler_kanal {
+                            eps[ep].lock().caller()
+                        } else {
+                            None
+                        };
+                        let next = eps[ep].lock().reply(ops, core, frame);
+                        if let Some(g) = guest {
+                            ops.handler_reply(g);
+                        }
+                        next
                     }
                 }
             }
@@ -1056,6 +1466,161 @@ pub fn dispatch(
             let ok = ops.kill(ThreadId::from_raw(raw), core);
             frame_set_reg(frame, reg::SYSNO_RESULT, if ok { result::OK } else { result::ERR_BADCAP });
             frame
+        }
+        // --- Z26/A3: SYS_SETHANDLER ---------------------------------------------------------
+        //
+        // **Zwei Autoritäten von zwei Seiten, beide im Cspace des AUFRUFERS.** Die Tcb-Cap sagt
+        // *wessen* Syscalls, die Handler-Caps sagen *wohin*. Wer umschaltet, ist damit weder Gast
+        // noch Handler — ohne die Tcb-Cap könnte jede PD, die zufällig eine Handler-Cap hält, die
+        // Syscalls eines fremden Threads an sich ziehen.
+        //
+        // Die generische Auflösung oben hat bereits `x1` als Tcb-Cap aufgelöst (`kind`/`rights`);
+        // die beiden Handler-Caps kommen aus `x2`/`x3` und werden hier einzeln nachgeschlagen.
+        sys::SETHANDLER => {
+            let ObjectKind::Tcb(raw) = kind else {
+                return deny(result::ERR_BADCAP);
+            };
+            // **WRITE, nicht READ.** Die Bindung ändert, wer den Thread ausführt — das ist
+            // dieselbe Klasse Eingriff wie `KILL`, nicht wie „nachsehen".
+            if !rights.contains(Rights::WRITE) {
+                return deny(result::ERR_RIGHTS);
+            }
+            let ziel = ThreadId::from_raw(raw);
+            let sys_slot = frame_reg(frame, reg::MSG0);
+            let flt_slot = frame_reg(frame, reg::MSG1);
+            let entbinden = sys_slot == u64::MAX && flt_slot == u64::MAX;
+
+            // --- Entbinden: immer zulässig, und es braucht keine Handler-Cap ------------------
+            //
+            // **Autorität abzugeben darf nie an einer Erlaubnis hängen** — dieselbe Regel wie bei
+            // `CDELETE`. Und eine Kante zu entfernen kann keinen Kreis schliessen.
+            if entbinden {
+                let alt = ops.handler_of(ziel);
+                let Some(alt) = alt else {
+                    // Nicht gebunden -> nichts zu tun. **OK und nicht ERR**: ein Entbinden, das
+                    // schon erreicht ist, ist erreicht. Ein Fehler hier zwänge jeden Aufräumpfad,
+                    // vorher zu fragen — und wer fragen muss, hat ein Rennen.
+                    return deny(result::OK);
+                };
+                if !ops.set_handler(ziel, None) {
+                    return deny(result::ERR_BADCAP);
+                }
+                let mut g = caps.write();
+                if let Some(gast_pd) = g.pds.pd_of(ziel) {
+                    g.pds.handler_kante_loesen(gast_pd);
+                }
+                g.pds.sidecar_freigeben(alt.handler_pd as usize, alt.slot);
+                return deny(result::OK);
+            }
+
+            // --- Binden ----------------------------------------------------------------------
+            let (sys_ep, flt_ep, handler_pd) = {
+                let g = caps.read();
+                let mut sys_ep = redirect::KEIN_EP;
+                let mut flt_ep = redirect::KEIN_EP;
+                let mut hpd: Option<u16> = None;
+                // Beide Caps müssen auf **dieselbe** Handler-PD zeigen. Zwei PDs, von denen die
+                // eine die Syscalls und die andere die Faults eines Gastes sieht, wären zwei
+                // Kernel über einem Adressraum — und im Zyklus-Graphen zwei Kanten von einem
+                // Knoten, also genau die Form, die den billigen Gang unmöglich macht.
+                for (slot, ist_sys) in [(sys_slot, true), (flt_slot, false)] {
+                    if slot == u64::MAX {
+                        continue;
+                    }
+                    let Some(cap) = g.pds.cap_at(pd, slot as usize) else {
+                        return deny(result::ERR_BADCAP);
+                    };
+                    let Some((k, r, _)) = g.cspace.lookup(cap) else {
+                        return deny(result::ERR_BADCAP);
+                    };
+                    if !r.contains(Rights::WRITE) {
+                        return deny(result::ERR_RIGHTS);
+                    }
+                    let (ep, hp) = match (k, ist_sys) {
+                        (ObjectKind::SyscallHandler { ep, pd, .. }, true) => (ep, pd),
+                        (ObjectKind::FaultHandler { ep, pd, .. }, false) => (ep, pd),
+                        // **Ein gewöhnlicher Endpoint wird hier ABGEWIESEN** — das ist der Grund
+                        // für die eigenen Cap-Arten. Eine PD kann ihren Dienst-Endpoint nicht
+                        // versehentlich als Persönlichkeit binden, und ein `SyscallHandler` im
+                        // Fault-Slot ist ebenso wenig zulässig wie umgekehrt.
+                        _ => return deny(result::ERR_BADCAP),
+                    };
+                    match hpd {
+                        None => hpd = Some(hp),
+                        Some(x) if x != hp => return deny(result::ERR_HANDLER_BUSY),
+                        _ => {}
+                    }
+                    if ist_sys {
+                        sys_ep = ep;
+                    } else {
+                        flt_ep = ep;
+                    }
+                }
+                let Some(hpd) = hpd else {
+                    return deny(result::ERR_BADCAP);
+                };
+                (sys_ep, flt_ep, hpd)
+            }; // CAPS-Read freigegeben
+
+            // --- Das Zyklusverbot, IM KERNEL (Z26/Nachtrag 3) ---------------------------------
+            let mut g = caps.write();
+            let Some(gast_pd) = g.pds.pd_of(ziel) else {
+                return deny(result::ERR_NOPD);
+            };
+            let frei = g.pds.sidecar_frei(handler_pd as usize);
+            let n_knoten = g.pds.pd_capacity();
+            let urteil = redirect::pruefe_bindung(
+                gast_pd as u16,
+                handler_pd,
+                sys_ep != redirect::KEIN_EP,
+                flt_ep != redirect::KEIN_EP,
+                // Der Gang liest die PD-Tabelle **direkt**. Ein kopiertes Kantenarray wäre bei
+                // `NPDS = 10 000` zwanzig Kilobyte Stack je `SETHANDLER` -- und ein zweites
+                // Abbild einer Wahrheit, die schon existiert.
+                |p| g.pds.handler_pd_of(p as usize),
+                n_knoten,
+                frei,
+            );
+            HANDLER_URTEILE[urteil_index(urteil)].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            match urteil {
+                redirect::BindUrteil::Ok => {}
+                // **Drei Absagen, drei Codes** — und die Trennung ist nicht Kosmetik. „Kreis"
+                // heisst: nimm eine andere Handler-PD. „Schon gebunden" heisst: jemand muss eine
+                // Entscheidung zurücknehmen. „Kein Slot" heisst: warte oder gib einen frei.
+                // `KetteZuLang` ist ein KERNELfehler (ein Kreis, an dem der Gast gar nicht
+                // beteiligt ist) und trägt nach aussen denselben Code — der Aufrufer kann nichts
+                // anderes tun —, wird aber getrennt gezählt.
+                redirect::BindUrteil::Zyklus
+                | redirect::BindUrteil::SelbstBindung
+                | redirect::BindUrteil::KetteZuLang => {
+                    return deny(result::ERR_HANDLER_CYCLE)
+                }
+                redirect::BindUrteil::FremderHandler => return deny(result::ERR_HANDLER_BUSY),
+                redirect::BindUrteil::KeinSlot => return deny(result::ERR_NOSPACE),
+                redirect::BindUrteil::Wirkungslos => return deny(result::ERR_BADCAP),
+            }
+            let Some(slot) = g.pds.sidecar_belegen(handler_pd as usize) else {
+                return deny(result::ERR_NOSPACE);
+            };
+            let bindung = redirect::Bindung {
+                sys_ep,
+                fault_ep: flt_ep,
+                handler_pd,
+                slot,
+            };
+            g.pds.handler_kante_setzen(gast_pd, handler_pd);
+            drop(g);
+            if !ops.set_handler(ziel, Some(bindung)) {
+                // **Rückwärts abbauen, nicht liegenlassen.** Der Thread ist zwischen Prüfung und
+                // Ablage gestorben oder migriert; Kante und Slot stünden sonst für einen Gast,
+                // den es nicht mehr gibt — und das Zyklusverbot verböte danach für immer eine
+                // Bindung, die längst zulässig wäre.
+                let mut g = caps.write();
+                g.pds.handler_kante_loesen(gast_pd);
+                g.pds.sidecar_freigeben(handler_pd as usize, slot);
+                return deny(result::ERR_BADCAP);
+            }
+            deny(result::OK)
         }
         sys::MAP | sys::UNMAP => {
             // Frame über eine Memory-Cap in die eigene VSpace mappen/entfernen. Das

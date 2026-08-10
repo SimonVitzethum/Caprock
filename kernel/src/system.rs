@@ -163,6 +163,16 @@ static EL0_FAULTS: AtomicUsize = AtomicUsize::new(0);
 /// (Beleg, dass die Hardware-Adressraumtrennung Fremd-/unmapped-Zugriffe verhindert.)
 static ISO_FAULTS: AtomicUsize = AtomicUsize::new(0);
 
+/// **Z26/A3: wie oft ist ein Fault an eine Persönlichkeits-PD gegangen** (statt den Thread zu
+/// beenden)? Die **Sprechprobe** der Fault-Weiche: ein Prüfer, der meldet „kein Gast ist am
+/// nativen Fault-Pfad gestorben", muss belegen können, dass überhaupt umgeleitet wurde.
+static HANDLER_FAULTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Zählerstand von [`HANDLER_FAULTS`].
+pub fn handler_fault_count() -> usize {
+    HANDLER_FAULTS.load(Ordering::Relaxed)
+}
+
 // --- Lazy-FP-Zustand ---
 //
 // Pro Kern besitzt höchstens ein Thread die FP/SIMD-Register (der „FP-Owner").
@@ -515,6 +525,40 @@ impl SchedOps for KernelSched {
             kick(c);
         }
     }
+    // --- Z26/A3: umgeleitete Syscalls -------------------------------------------------------
+    fn current_handler(&mut self, core: usize) -> Option<caprock_sched::redirect::Bindung> {
+        // **Der heisse Pfad**: einmal je Syscall, eine Sperrung, ein `Option`-Lesen am laufenden
+        // TCB. Kein `current_id` + `handler_of` (das wären zwei Sperrungen) und kein Cap-Lookup.
+        SCHEDS[core].lock().current_handler(core)
+    }
+    fn handler_of(&mut self, tid: ThreadId) -> Option<caprock_sched::redirect::Bindung> {
+        // `with_owner` wiederholt nur bei `None` -- deshalb wird das INNERE `Option` in ein
+        // `Some(..)` gewickelt: „kein Handler gebunden" ist eine Antwort und kein Fehlschlag.
+        // Ohne diese Hülle liefe die Migrationsschleife bei jedem ungebundenen Thread vier Runden
+        // leer und meldete am Ende dasselbe -- teuer und irreführend zugleich.
+        with_owner(tid, |s, _| Some(s.handler_of(tid))).and_then(|(b, _)| b)
+    }
+    fn set_handler(&mut self, tid: ThreadId, b: Option<caprock_sched::redirect::Bindung>) -> bool {
+        with_owner(tid, |s, _| s.set_handler(tid, b).then_some(())).is_some()
+    }
+    fn block_for_handler(&mut self, core: usize, frame: usize) -> usize {
+        // Abgerechnet wie jede andere Blockade (B-5.1): wer hier blockiert, hat bis eben
+        // gerechnet, und die Zyklen gehören ihm.
+        charged(core, &mut SCHEDS[core].lock(), |s| {
+            s.block_for_handler(core, frame)
+        })
+    }
+    fn mark_handler_wait(&mut self, tid: ThreadId) {
+        // **Kein `kick`.** Ein Grund hinzuzufügen macht niemanden lauffähig — ein IPI wäre hier
+        // reine Last. Geweckt wird bei `handler_reply`.
+        let _ = with_owner(tid, |s, _| s.mark_handler_wait(tid).then_some(()));
+    }
+    fn handler_reply(&mut self, tid: ThreadId) {
+        // Dieselbe Migrationsschleife wie `unblock`/`unpark`, und aus demselben Grund.
+        if let Some((_, c)) = with_owner(tid, |s, _| s.handler_reply(tid).then_some(())) {
+            kick(c);
+        }
+    }
     fn resume(&mut self, tid: ThreadId) {
         // Z24: `RESUME` hebt **die Pause** auf, nicht „die Blockade". Vorher lief das ueber
         // `unblock`, das seit dem Umbau den IPC-Grund entfernt -- ein Wecker ohne Namen weckt
@@ -858,6 +902,36 @@ fn el0_fault(frame: *mut TrapFrame, esr: u64, far: u64) -> *mut TrapFrame {
     let core = hal::cpu::core_id();
     let ec = (esr >> 26) & 0x3f;
     EL0_FAULTS.fetch_add(1, Ordering::Relaxed);
+    // --- Z26/A3: die Weiche für FAULTS -------------------------------------------------------
+    //
+    // Sie ist **nicht** die Spiegelung der Syscall-Weiche, und der Unterschied ist der Punkt: bei
+    // einem Syscall ist „der Kernel macht es" eine **Beförderung** (der Gast bekäme die native ABI
+    // zurück), bei einem Fault ist es eine **Herabstufung** (der Kernel beendet den Thread).
+    // Fail-closed heisst hier also nicht dasselbe -- deshalb zwei Funktionen und nicht ein
+    // Parameter mit zwei Bedeutungen.
+    //
+    // **Ganz oben, mit allen Locks frei.** Die Sperrordnung ist `CAPS < EPS < SCHEDS`; der
+    // Diagnoseblock darunter hält `SCHEDS`, und von dort aus zuzustellen drehte die Ordnung um.
+    //
+    // Ohne Fault-Bindung fällt der Weg unverändert in den Pfad darunter: beenden. Das ist richtig
+    // und keine Lücke -- der native Fault-Pfad gewährt nichts.
+    {
+        let mut ops = KernelSched;
+        if let Some(next) = caprock_microkit::fault_dispatch(
+            frame as usize,
+            core,
+            &mut ops,
+            &CAPS,
+            eps(),
+            ec,
+        ) {
+            HANDLER_FAULTS.fetch_add(1, Ordering::Relaxed);
+            let sched = SCHEDS[core].lock();
+            sync_fp_trap(core, &sched);
+            sync_vspace(core, &sched);
+            return next as *mut TrapFrame;
+        }
+    }
     let (next, tid) = {
         let mut sched = SCHEDS[core].lock();
         let tid = sched.current_id(core);
@@ -7734,6 +7808,121 @@ pub fn is_parked(tid: ThreadId) -> bool {
     with_owner(tid, |s, _| Some(s.is_parked(tid)))
         .map(|(b, _)| b)
         .unwrap_or(false)
+}
+
+/// **Die Prüfzeile `handler`** (Z26/A3). Liegt in einer eigenen Datei und wird von hier aus
+/// eingehängt statt aus `main.rs`: die Messung gehört zum Primitiv, und ein `mod` im Wurzelmodul
+/// wäre eine Änderung an einer Datei, die dieser Strang sonst nicht anfasst.
+#[cfg(feature = "selftest")]
+#[path = "handlermess.rs"]
+pub mod handlermess;
+
+// -- Z26/A3: Prüfpfad für die Handler-Bindung ------------------------------------------
+
+/// Wartet dieser Thread auf seine **Persönlichkeits-PD** (`BlockReasons::HANDLER`)?
+///
+/// Getrennt von [`is_blocked`] und [`is_parked`] aus demselben Grund, aus dem es die Grund-Menge
+/// gibt: von aussen sehen alle drei Blockaden gleich aus, und ein Prüfer, der die falsche Größe
+/// liest, kann den Fehler, gegen den er gebaut ist, strukturell nicht sehen (der `park`-Befund
+/// vom 2026-08-09).
+pub fn is_handler_blocked(tid: ThreadId) -> bool {
+    with_owner(tid, |s, _| Some(s.is_handler_blocked(tid)))
+        .map(|(b, _)| b)
+        .unwrap_or(false)
+}
+
+/// Die rohe Grund-Menge eines Threads (Z24) — für den Bericht, nicht für Entscheidungen.
+pub fn reasons_bits(tid: ThreadId) -> Option<u8> {
+    with_owner(tid, |s, _| Some(s.reasons_of(tid))).and_then(|(r, _)| r.map(|x| x.bits()))
+}
+
+/// Dem Thread den Handler-Grund anhängen (Prüfpfad; im Betrieb macht das der Dispatch).
+pub fn mark_handler_wait(tid: ThreadId) -> bool {
+    with_owner(tid, |s, _| s.mark_handler_wait(tid).then_some(())).is_some()
+}
+
+/// **Der einzige Wecker des Handler-Grundes**, auch für den Prüfpfad.
+pub fn handler_reply(tid: ThreadId) -> bool {
+    if let Some((_, c)) = with_owner(tid, |s, _| s.handler_reply(tid).then_some(())) {
+        kick(c);
+        return true;
+    }
+    false
+}
+
+/// Eine **Pause** aufheben (Prüfpfad) — `resume` entfernt `PAUSE` und nur das.
+pub fn resume_thread(tid: ThreadId) -> bool {
+    if let Some((_, c)) = with_owner(tid, |s, _| s.resume(tid).then_some(())) {
+        kick(c);
+        return true;
+    }
+    false
+}
+
+/// Einen Thread pausieren (Prüfpfad).
+pub fn pause_thread(tid: ThreadId) -> bool {
+    if let Some((_, c)) = with_owner(tid, |s, _| s.pause(tid).then_some(())) {
+        kick(c);
+        return true;
+    }
+    false
+}
+
+/// Die Handler-Bindung eines Threads setzen/aufheben (Prüfpfad; im Betrieb `SYS_SETHANDLER`).
+pub fn set_handler(tid: ThreadId, b: Option<caprock_sched::redirect::Bindung>) -> bool {
+    with_owner(tid, |s, _| s.set_handler(tid, b).then_some(())).is_some()
+}
+
+/// Wie viele Threads dieses Kerns sind gebunden? (Sprechprobe.)
+pub fn handler_bound_count(core: usize) -> usize {
+    SCHEDS[core].lock().handler_bound_count()
+}
+
+/// **Die Handler-Kante einer PD im Graphen setzen/lösen** (Prüfpfad für das Zyklusverbot).
+pub fn handler_kante_setzen(gast: usize, handler: u16) -> bool {
+    CAPS.write().pds.handler_kante_setzen(gast, handler)
+}
+
+/// Gegenstück zu [`handler_kante_setzen`].
+pub fn handler_kante_loesen(gast: usize) -> bool {
+    CAPS.write().pds.handler_kante_loesen(gast)
+}
+
+/// Das Urteil über eine gewünschte Bindung — **gegen die echte PD-Tabelle**, nicht gegen ein
+/// Modell davon. Genau der Aufruf, den `SYS_SETHANDLER` macht.
+pub fn pruefe_bindung(
+    gast_pd: u16,
+    handler_pd: u16,
+    hat_syscall: bool,
+    hat_fault: bool,
+) -> caprock_sched::redirect::BindUrteil {
+    let g = CAPS.read();
+    let n = g.pds.pd_capacity();
+    let frei = g.pds.sidecar_frei(handler_pd as usize);
+    caprock_sched::redirect::pruefe_bindung(
+        gast_pd,
+        handler_pd,
+        hat_syscall,
+        hat_fault,
+        |p| g.pds.handler_pd_of(p as usize),
+        n,
+        frei,
+    )
+}
+
+/// Freie Sidecar-Slots bei einer Handler-PD.
+pub fn sidecar_frei(handler_pd: usize) -> u16 {
+    CAPS.read().pds.sidecar_frei(handler_pd)
+}
+
+/// Einen Sidecar-Slot belegen / freigeben (Prüfpfad).
+pub fn sidecar_belegen(handler_pd: usize) -> Option<u16> {
+    CAPS.write().pds.sidecar_belegen(handler_pd)
+}
+
+/// Gegenstück zu [`sidecar_belegen`].
+pub fn sidecar_freigeben(handler_pd: usize, slot: u16) -> bool {
+    CAPS.write().pds.sidecar_freigeben(handler_pd, slot)
 }
 
 // -- A-4.1: atomares Umbinden ----------------------------------------------------------

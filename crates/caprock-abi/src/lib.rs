@@ -88,6 +88,57 @@ pub mod sys {
     ///
     /// PD-übergreifend wecken bleibt, was es war: eine Notification.
     pub const UNPARK: u64 = 18;
+    /// **Die Syscalls eines Threads an eine Persönlichkeits-PD umleiten** (Z26/A3).
+    ///
+    /// `x1` = Slot der **Tcb-Cap** des Zielthreads · `x2` = Slot der **`SyscallHandler`-Cap**
+    /// (`u64::MAX` = keiner) · `x3` = Slot der **`FaultHandler`-Cap** (`u64::MAX` = keiner).
+    /// Beide `u64::MAX` heisst **entbinden**.
+    ///
+    /// ## Der Aufruf braucht ZWEI Autoritäten von ZWEI Seiten
+    ///
+    /// Die Tcb-Cap sagt **wessen** Syscalls, die Handler-Caps sagen **wohin**. Beide werden im
+    /// Cspace des **Aufrufers** aufgelöst — und der Aufrufer ist damit eine dritte Partei, weder
+    /// Gast noch Handler. Ohne die Tcb-Cap könnte jede PD, die zufällig eine Handler-Cap hält, die
+    /// Syscalls eines fremden Threads an sich ziehen; ohne die Handler-Cap wäre „umleiten" ein
+    /// globaler Schalter statt einer Autorität.
+    ///
+    /// ## Die Gast-PD hält NICHTS — ihre Autorität wird verringert
+    ///
+    /// Sie bekommt keinen Cap und keine Operation. Nach der Bindung erreicht sie den
+    /// Caprock-Kernel **gar nicht mehr**: auch dieser Syscall wird umgeleitet, ein gebundener
+    /// Thread kann sich also nicht selbst entbinden. Rückgängig macht es, wer die Tcb-Cap hält.
+    ///
+    /// Rückgabe in `x0`: [`result::OK`], [`result::ERR_BADCAP`], [`result::ERR_RIGHTS`],
+    /// [`result::ERR_HANDLER_CYCLE`], [`result::ERR_HANDLER_BUSY`], [`result::ERR_NOSPACE`].
+    pub const SETHANDLER: u64 = 19;
+}
+
+/// **Das Register-Layout der Umleitungsnachricht** (Z26/A3) — was der Handler in seinem `RECV`
+/// vorfindet.
+///
+/// Die **Nutzlast** ist ausdrücklich nicht hier: der Trap-Frame des Gastes liegt im **Sidecar**,
+/// dem geteilten Fenster, das an der `SyscallHandler`-Cap hängt. Der Grund ist eine Zahl:
+/// [`MSG_WORDS`] ist **4**, ein x86_64-Trap-Frame hat **22** Wörter und ein aarch64-Frame **34**.
+/// Eine Nachricht kann ihn nicht tragen — und `rt_sigreturn` (ersetzt den ganzen Frame) und
+/// `clone` (braucht einen zweiten) wären damit strukturell unmöglich, nicht bloss unbequem.
+///
+/// Die Nachricht sagt also nur, **welcher** Gast und **warum**; gelesen und geschrieben wird im
+/// Fenster.
+pub mod redirect_msg {
+    /// `x2`: Sidecar-Slot des Gastes. Der Frame steht bei `slot * 512` im Fenster.
+    pub const SLOT: usize = super::reg::MSG0;
+    /// `x3`: rohe `ThreadId` des Gastes (für `KILL`/Diagnose; der Handler kennt seine Gäste).
+    pub const GUEST_TID: usize = super::reg::MSG1;
+    /// `x4`: Anlass — `0` = Syscall, `1` = Fault (s. `caprock_sched::redirect::Anlass`).
+    pub const ANLASS: usize = super::reg::MSG2;
+    /// `x5`: architekturabhängiger Anlasscode (x86: Vektor · aarch64: `ESR_EL1.EC`), `0` bei
+    /// einem Syscall.
+    pub const CODE: usize = super::reg::MSG3;
+    /// Bytes je Sidecar-Slot — hergeleitet aus dem grössten Trap-Frame (aarch64: 272 B),
+    /// aufgerundet auf die nächste Zweierpotenz. Muss mit
+    /// `caprock_sched::redirect::SLOT_BYTES` übereinstimmen; der Kernel prüft das
+    /// (`handler_selbsttest`).
+    pub const SLOT_BYTES: u64 = 512;
 }
 
 /// Sub-Operationen für [`sys::PDCTL`] (Register `x2`). Jede ist auf den Besitz der
@@ -183,4 +234,31 @@ pub mod result {
     /// nähme dem Client genau die Unterscheidung, die A-4.2 zwischen `ERR_QUIESCING` und
     /// `ERR_BADCAP` gerade eingeführt hat.
     pub const ERR_EP_FULL: u64 = 9;
+    /// **Die gewünschte Handler-Bindung schlösse einen Kreis** (Z26/A3, Nachtrag 3): der Handler
+    /// wird — direkt oder über eine Kette — selbst von der Gast-PD behandelt. Das ist ein
+    /// **Deadlock per Konstruktion**: der Handler kann sein eigenes `RECV` nicht absetzen, ohne
+    /// dass es umgeleitet wird, und zwar an einen Thread, der auf ihn wartet.
+    ///
+    /// **Warum das im Kernel steht und nicht in der Doku:** ein Kreis erzeugt kein Fehlerbild,
+    /// sondern Stille. Beide PDs sind blockiert, `is_quiescent()` meldet Ruhe, kein Audit-Code
+    /// schlägt an — dasselbe Bild wie der 33. Sender vor D11. Eine Regel, die nur aufgeschrieben
+    /// ist, ist bei dieser Fehlerform keine Regel.
+    pub const ERR_HANDLER_CYCLE: u64 = 10;
+    /// **Der Handler ist weggefallen** (Cap gelöscht, entzogen, PD tot) — der Gast **faultet**
+    /// damit, statt auf die native ABI zurückzufallen.
+    ///
+    /// Der Rückfall wäre aus dem Entzug einer Cap eine **Beförderung**: der Gast spräche plötzlich
+    /// direkt mit dem Caprock-Kernel, mit genau der Autorität, die die Bindung ihm genommen hatte.
+    /// Fail-closed, und es ist dieselbe Form wie [`ERR_SERVER_GONE`] beim Endpoint-Austausch —
+    /// nur schwerer, weil dort eine Transaktion verloren ist und hier eine Autoritätsgrenze.
+    pub const ERR_HANDLER_GONE: u64 = 11;
+    /// **Die Gast-PD hat bereits einen anderen Handler.** Eine PD ist EIN Adressraum und hat
+    /// höchstens EINEN Kernel; zwei Persönlichkeiten darüber wären zwei Wahrheiten über denselben
+    /// Speicher. Dieselbe Bindung noch einmal ist [`OK`] (idempotent — ein zweiter Thread
+    /// derselben Gast-PD).
+    ///
+    /// **Nicht [`ERR_NOSPACE`]:** dort ist etwas voll und wird wieder frei, hier liegt eine
+    /// **Entscheidung** vor, die jemand zurücknehmen muss. Ein Aufrufer, der die beiden nicht
+    /// unterscheiden kann, wiederholt in einem Fall sinnvoll und im anderen für immer.
+    pub const ERR_HANDLER_BUSY: u64 = 12;
 }

@@ -143,6 +143,38 @@ Spalte „bootet" nicht misst, was sie behauptet, ist schlimmer als keine.
       über `git fsck` zurückgelegt, nichts verloren).
 
 
+## NULL IST EIN BEFUND, KEIN MESSWERT — der Durchgang durch die einseitigen Vergleiche
+
+**Klasse:** Prüferform · **Stand:** durchgegangen 2026-08-10, **eine** lebende Fundstelle, behoben
+
+Der F1-Fund trägt eine Regel, die über F1 hinausgeht. `0 < 0x62000 ⇒ PASS` ist ein Prüfer, der
+**bei Totalausfall der Messung grün wird** — dieselbe Form wie ein nie gesetztes Bit, das als
+„kein Fehler" gelesen wird, nur als Schwellenvergleich statt als Flagge. Die Regel:
+
+> Jede gemessene Grösse, die in einen Vergleich mit **nur einer** Schranke geht, braucht eine
+> **Plausibilitätsuntergrenze** — oder der Wert Null muss ausdrücklich als **„nicht gemessen"**
+> ausscheiden. „Nicht messbar" ist kein bestandener Test.
+
+**Der Durchgang, mit Zahlen — damit „ich habe nachgesehen" nicht wieder ein Nullbefund ohne
+Grösse ist** (dieselbe Falle wie „habe ich noch nie gesehen"):
+
+| gesucht | gefunden |
+|---|---|
+| numerische Vergleiche in den drei QEMU-Suiten und allen `tools/*.sh` (`-lt/-gt/-le/-ge`) | **41** |
+| davon ohne vorherige `-n`/`-z`-Absicherung oder `> 0`-Wächter | **1** — die F1-Zeile |
+| Urteilszeilen im Kernel der Form `wert </<= KONSTANTE` | **0** (alle Treffer sind Schleifenwächter, keine Urteile) |
+| Urteilszeilen im Kernel der Form `wert > 0 && …` | durchgehend, das ist die gesunde Form |
+
+Behoben ist die eine: F1 hat jetzt `F1_MIN = 0x10000` **und** einen eigenen Zweig für „nicht
+messbar" (leerer Wert ⇒ `FAIL`, nicht stillschweigend `else`). Die Untergrenze ist begründet und
+nicht gegriffen: ein Kernel ohne Prüfinfrastruktur hat weiterhin Scheduler, IPC,
+Speicherverwaltung und HAL; unter 64 KiB `.text` ist das kein kleineres Abbild, sondern ein
+kaputter Bau.
+
+**Was der Durchgang NICHT abdeckt und offen bleibt:** Prüfer, die eine Grösse gar nicht erst
+erheben (die Klasse „ein Test, der nirgends läuft"), und Vergleiche innerhalb der Verus-Modelle.
+Ein Durchgang, der seine eigene Reichweite nicht nennt, ist die nächste Nullaussage.
+
 ## LESEHILFE: was welche Kennung bedeutet — und der Stand der vier Z26-Nachträge
 
 **Eine Kennung, zwei Bedeutungen** (bemerkt 2026-08-10, bevor sie zur Fussnote wurde):

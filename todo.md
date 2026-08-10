@@ -5,103 +5,51 @@ Reihenfolge innerhalb eines Abschnitts = Priorität. `[~]` = teilweise erledigt,
 
 ---
 
-## SPERRT DIE INTEGRATION: das nullgrosse LOAD-Duplikat (2026-08-10)
+## Der „Integrations-Blocker" war ein ARTEFAKT DES BAUSYSTEMS — aufgelöst 2026-08-10
 
-**Klasse:** Bauwerkzeug · **Stand:** Ursache gemessen, Wächter gebaut, **Behebung offen**
+**Klasse:** Messfehler · **Stand:** aufgelöst; die beiden Werkzeuge, die dabei entstanden, bleiben
 
-Der Hauptzweig ist gesund (`.boot` bei Dateioffset 4096, warm **und** kalt gebaut, beide Suiten
-grün). **Zwei Änderungszweige kippen die Sektionslage** und erzeugen ein nicht bootbares Abbild —
-und das ist keine Eigenheit dieser Zweige, sondern eine **grenzwertige** Bedingung, in die jede
-hinreichend grosse Änderung laufen kann.
+Ein halber Tag ging an einen Blocker, den es als Codeproblem **nie gab**. Der Ablauf, weil er die
+Lehre trägt:
 
-**Die Ursache, gemessen:** `lld` legt wegen der `AT()`-Ladeadressen des AP-Trampolins zusätzliche,
-einander überlappende Segmente an, darunter ein **nullgrosses**, das eine fremde `vaddr`
-dupliziert (`LOAD off=0x185000 vaddr=0x9000 filesz=0 memsz=0xf8000`). GNU objcopy **2.46.1**
-bildet dieses Duplikat beim Umwandeln nach ELF32 nicht ab und legt `.boot` danach **ausserhalb
-jedes Segments** — Dateioffset ~740 000 statt 4096. QEMU findet den Multiboot-Header nicht und
-lädt kommentarlos gar nicht: `Error loading uncompressed kernel without PVH ELF Note`, Logdatei
-**0 Byte**.
+1. Zwei Agenten meldeten unabhängig, die x86-Suite laufe „in diesem Baum nicht"
+   (`Error loading uncompressed kernel without PVH ELF Note`, Logdatei 0 Byte), und schrieben es
+   der **Grundlinie** zu.
+2. Nachgemessen: der Hauptbaum war gesund (`.boot` bei Offset 4096, warm **und kalt** gebaut,
+   beide Suiten grün), die Änderungszweige nicht. Daraus wurde „die Änderungen kippen die
+   Sektionslage" — **auch das war falsch**.
+3. Drei Behebungsversuche am Linkerskript, jeder gemessen, jeder zurückgenommen.
+4. **Die Ursache war, dass Cargo Linkerskripte nicht als Bau-Eingabe kannte.** Ohne
+   `rerun-if-changed` löst eine `.ld`-Änderung **kein Neu-Linken** aus; in den Agenten-Worktrees
+   war der Linkerschritt damit gegen einen Stand gelaufen, den es so nicht mehr gab.
+5. Gegenprobe: ein **frischer** Integrationszweig im Hauptbaum, mit den `rerun-if-changed`-Haken
+   von Anfang an, mit derselben A3-Arbeit gemerged → **keine leeren Duplikatsektionen**, Header
+   bei 4096, `== ALL PASS ==` in **beiden** Suiten, alle Wächter grün.
 
-**Gebaut ist der Wächter** (`build-x86.sh`): er sucht `0x1BADB002` 4-Byte-ausgerichtet, bricht mit
-dem gemessenen Offset ab und druckt die LOAD-Tabelle dazu. Ein Bauwerkzeug, das ein unbootbares
-Abbild ausliefert, ist die Bauzeit-Fassung von „Schweigen als Erfolg".
+**Die Lehre ist nicht „Linkerskripte sind heikel", sondern: eine Messung muss wissen, welches
+Artefakt sie gemessen hat.** Der Binary-Fingerprint der Suiten schliesst „veralteter Build" als
+Erklärung für einen *Suitenlauf* aus — für den *Linkerschritt* war dieselbe Tür offen, und drei
+Versuchszeilen einer Tabelle beschrieben einen Stand, den es nie gab. Eine Versuchstabelle, deren
+Spalte „bootet" nicht misst, was sie behauptet, ist schlimmer als keine.
 
-- [ ] **Die Behebung selbst.** Zwei Versuche, beide gemessen und beide zurückgenommen — sie stehen
-      hier, damit der nächste sie nicht wiederholt:
+**Was bleibt und sich gelohnt hat:**
 
-      **(a) Explizite `PHDRS` + DWARF-Sektionen an Adresse 0.** Ergebnis: Header wieder bei 4096
-      und **null** nullgrosse Segmente — aber acht einander **überlappende** LOADs mit absurden
-      Grössen (`filesz=0x8b132` bei einem Segment, dessen Nachbar 0x11000 weiter beginnt). Der
-      gesunde Baum hat an dieser Stelle saubere, nicht überlappende Segmente. `:NONE` an den
-      Debug-Sektionen änderte daran **nichts** — sie waren also nicht die Ursache. Bootete nicht.
+- [x] `kernel/build.rs` + `programs/libcaprock/build.rs` melden die vier `.ld`-Dateien als
+      `rerun-if-changed`. Gemessen: ein `touch` aufs Skript allein löst `Compiling caprock-kernel`
+      aus. Eine Datei statt sieben bei den Programmen, weil jedes Programm `libcaprock` linkt.
+- [x] **Der Bauzeit-Wächter in `build-x86.sh`**: der Multiboot-Header muss in den ersten 8192
+      Dateibytes liegen, sonst `BUILD FAILED` mit dem gemessenen Offset **und** der LOAD-Tabelle.
+      Die Bedingung stand seit jeher im Linkerskript und wurde von nichts durchgesetzt. Sie ist
+      **grenzwertig**, nicht stabil — ein Bauwerkzeug, das ein unbootbares Abbild ausliefert, ist
+      die Bauzeit-Fassung von „Schweigen als Erfolg".
+- [ ] **Messregel, ab sofort:** `KEIN OUTPUT` ist als Befund **unterbestimmt**. „Lädt nicht" und
+      „läuft, aber die Konsole hängt an einer verschobenen Adresse" sind darunter
+      ununterscheidbar. `-d int` (kommen überhaupt Faults?) und `info registers` (wo steht das
+      System?) gehören dazu, bevor ein `KEIN OUTPUT` als Zeile ins Register geht.
+- [ ] **Und für Agenten in Worktrees:** `git stash` nicht benutzen — `refs/stash` ist über alle
+      Worktrees geteilt, und zwei Agenten haben sich damit gegenseitig den Stand gepoppt (beide
+      über `git fsck` zurückgelegt, nichts verloren).
 
-      **(b) Den AP-Trampolin-Block ans ENDE der Ladesektionen verschieben** (statt in die Mitte).
-      Ergebnis: Header bei 4096, **null** nullgrosse Segmente, saubere nicht überlappende LOADs —
-      **und es bootet**, der Kernel läuft an. Aber er kommt nicht weit (ACPI/MADT, Speicherplan,
-      SMP, Paging fallen durch), weil `.aptramp_data` jetzt die BSS als **Dateiinhalt**
-      verschluckt: `filesz=0xf7000` statt `0x58`. Die `. = __aptramp_data_lma + SIZEOF(…)`-
-      Arithmetik gilt an der neuen Stelle nicht mehr.
-
-      **(b2) Wie (b), aber mit im Image RESERVIERTEM Platz** (`__aptramp_lma = .; . = . + 0x2000;`,
-      Sektionen ganz am Ende, `ASSERT` auf je eine Seite — die müssen bei `lld` **ausserhalb** von
-      `SECTIONS` stehen). Gedacht war das gegen den Fehler von (b): ohne Reservierung liegt die
-      BSS **physisch auf der LMA** des Trampolins, und die BSS-Nullung löscht die Kopie, bevor der
-      BSP sie nach `0x8000` bringt. Ergebnis: Header bei 4096, null nullgrosse Segmente — aber
-      **`KEIN OUTPUT`**, also schlechter als (b), das immerhin anlief. Die Sektionen sind weiterhin
-      korrekt `NOBITS`; der Unterschied zum gesunden Baum ist die **Reihenfolge** (`.bss` vor statt
-      nach dem Trampolin), und das letzte Segment trägt weiterhin `filesz=0xf7000`.
-
-      **BERICHTIGUNG (2026-08-10, nach berechtigtem Einwand): die drei Versuche stehen unter
-      Vorbehalt, und zwar aus einem Grund im BAUSYSTEM.** Cargo kannte Linkerskripte nicht als
-      Eingabe — jeder Versuch, bei dem das `touch` auf eine Quelldatei fehlte, hat den
-      **Vorgängerstand** gemessen. Damit hat die Widersprüchlichkeit der Tabelle ((b) bootet,
-      (b2) mit *mehr* Reservierung nicht) eine zweite mögliche Erklärung, die nichts mit dem
-      Layout zu tun hat. **Eine Versuchstabelle, deren Spalte „bootet" nicht misst, was sie
-      behauptet, ist wertlos** — dieselbe Prüferregel, nur auf die eigene Messtabelle angewandt.
-      Behoben strukturell: `kernel/build.rs` und `programs/libcaprock/build.rs` melden die vier
-      `.ld`-Dateien als `rerun-if-changed`; **gemessen**, dass ein `touch` aufs Skript allein jetzt
-      neu linkt. Dieselbe Rolle wie der Binary-Fingerprint der Suiten, nur eine Ebene früher: eine
-      Messung muss wissen, welches Artefakt sie gemessen hat.
-      **Jeder der drei Versuche ist mit garantiert frischem Link zu wiederholen, bevor eine
-      Schlussfolgerung daraus stehen bleibt.**
-
-      **Der schärfste Messwert bisher — und er zeigt woandershin als das Segment-Layout:** der
-      kaputte Bau trägt einen **zweiten, LEEREN Satz derselben Ausgabesektionen**:
-
-      | Sektion | Adresse | Offset | Größe |
-      |---|---|---|---|
-      | `.text` `.rodata` `.user_text` `.user_data` | `0x100000` | `0x185000` | **0** |
-      | `.aptramp` | `0x8000` | `0x185000` | **0** |
-      | `.bss` | `0x101000` | `0x185000` | **0** |
-
-      Der **gesunde** Bau hat sie **nicht** — dort kommt jede Sektion genau einmal vor. Daraus
-      entsteht das nullgrosse Segment, und daran scheitert objcopy. Die Frage ist also nicht „warum
-      sagt der Linker `NOBITS` falsch", sondern **wer erzeugt diese verwaisten Duplikate**.
-      Nicht mehr behauptet wird: dass es an der A3-Änderung liegt. Ein Gegenversuch (A3-Code im
-      selben Worktree zurückgenommen) baute **ebenfalls** fehlerhaft — der Worktree-Zustand ist
-      damit selbst verdächtig, und die saubere Fortsetzung ist ein **frischer** Integrationszweig
-      im Hauptbaum, mit `rerun-if-changed` von Anfang an.
-
-      **Und eine Messregel, die daraus folgt:** `KEIN OUTPUT` ist als Befund **unterbestimmt**.
-      „Lädt nicht" und „läuft, aber die Konsole hängt an einer verschobenen Adresse" sind darunter
-      ununterscheidbar, und nach einem Layoutwechsel ist das zweite mindestens gleich
-      wahrscheinlich. Künftig gehören `-d int` (kommen überhaupt Faults?) und `info registers`
-      (wo steht das System?) dazu, bevor ein `KEIN OUTPUT` als Zeile ins Register geht.
-
-      **Zwischenstand nach drei Versuchen:** (b) ist der einzige, der bootet. Was ihm fehlt, ist
-      **nicht** mehr Reservierung, sondern die Antwort auf die Frage, warum `lld` dem letzten
-      Segment ~1 MiB **Dateiinhalt** gibt, obwohl beide BSS-Sektionen `NOBITS` sind. Die nächste
-      Sitzung sollte dort mit einem Vergleich der **Sektions**tabelle (nicht der Segmente) gesund
-      gegen krank anfangen — die Segmentsicht hat dreimal in die Irre geführt.
-
-      **(b) ist der aussichtsreichere Weg** — er löst das Segmentproblem vollständig, und was
-      übrigbleibt, ist eine Adressarithmetik, die mitwandern muss (`.bss`/`.boot_bss` dürfen ihre
-      NOLOAD-Eigenschaft nicht verlieren). Die Abnahme ist billig: `filesz` des letzten Segments
-      muss wieder in der Grössenordnung `0x58` liegen, nicht `0xf7000`.
-
-      **Und eine Falle, die dabei zweimal zugeschlagen hat:** *Cargo kennt Linkerskripte nicht als
-      Eingabe.* Eine Änderung an `.ld` löst **kein** Neu-Linken aus; ohne `touch` auf eine
-      Quelldatei misst man den vorigen Stand und hält ihn für das Ergebnis.
 
 ## Z. Zielarchitektur (Stand 2026-07-29) — woran alles andere zu messen ist
 

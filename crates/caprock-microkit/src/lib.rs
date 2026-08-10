@@ -282,12 +282,14 @@ impl Caps {
             // Isolations-Mechanismus: untrusted Domänen MÜSSEN isoliert sein. TrustedSas
             // darf global ODER isoliert sein (mehr Isolation ist keine Verletzung).
             if domain != Domain::TrustedSas {
-                if let Some(tid) = self.pds.thread_of(pd) {
-                    // Verletzung nur, wenn der gebundene Thread LEBT und global läuft
-                    // (ein toter/gestoppter Thread zählt nicht).
-                    if is_live_global(tid) {
-                        return 3;
-                    }
+                // **ALLE Threads dieser PD, nicht nur der erste** (Z22 P2). Bis mehrere Threads
+                // je PD möglich wurden, waren „die PD" und „ihr Thread" dasselbe; seither wäre
+                // `thread_of(pd)` genau die Lücke, vor der die D0-Lehre warnt: ein Umbau, der
+                // einen neuen Zustand einführt, muss jede Stelle mitnehmen, die über Zustände
+                // URTEILT. Ein zweiter, global laufender Thread einer isolierten PD wäre sonst
+                // unsichtbar — und der Audit-Code 3 ist genau dafür da.
+                if self.pds.any_thread(pd, is_live_global) {
+                    return 3;
                 }
             }
             // Paarweise Bindung (HardwareLand-Backend):
@@ -396,7 +398,25 @@ fn domain_allows_kind(domain: Domain, kind: ObjectKind) -> bool {
 #[derive(Clone, Copy)]
 pub struct Pd {
     used: bool,
+    /// **Der ERSTE gebundene Thread** — nicht mehr „der" Thread (Z22 P2).
+    ///
+    /// Seit eine PD mehrere Threads tragen darf, ist dieses Feld nur noch ein *Vertreter*: es
+    /// beantwortet „gibt es hier überhaupt einen Thread, und welcher war zuerst da". Die
+    /// Zuordnung Thread → PD steht seither in [`PdTable::owner`] und nicht mehr hier; sie
+    /// hier zu suchen hiesse, mehrere Threads gar nicht darstellen zu können.
     thread: Option<ThreadId>,
+    /// Wie viele Threads gerade an diese PD gebunden sind (Z22 P2). Auskunft für den Bericht —
+    /// und die einzige Grösse, an der „mehrere Threads je PD" von aussen ablesbar ist.
+    nthreads: u32,
+    /// **Belegungs-Generation.** Wird bei jeder Freigabe erhöht und in jedem Rückwärts-Eintrag
+    /// mitgeführt.
+    ///
+    /// Ohne sie hätte der O(1)-Weg eine Lücke, die der lineare Scan nicht hatte: eine PD wird
+    /// freigegeben, ihr **Index** sofort neu vergeben — und ein noch lebender Thread der alten PD
+    /// zeigte über den Rückwärts-Index auf die **neue**. Der alte Scan gab dort `None`, weil die
+    /// neue PD den Thread nicht in ihrem `thread`-Feld trug. Eine Beschleunigung, die eine
+    /// Fremd-PD-Zuordnung erfindet, wäre schlimmer als der lineare Scan.
+    epoch: u32,
     /// Lokaler Cap-Index -> globaler CapPtr.
     cspace: [Option<CapPtr>; NCAPS],
     /// Sicherheitsdomäne — **unveränderlich** nach der Erzeugung (Policy: bestimmt die
@@ -442,6 +462,8 @@ impl Pd {
     const EMPTY: Pd = Pd {
         used: false,
         thread: None,
+        nthreads: 0,
+        epoch: 0,
         cspace: [None; NCAPS],
         domain: Domain::TrustedSas, // Default: alle Altbestand-PDs sind Trusted-SAS
         quiescing: false,
@@ -453,9 +475,81 @@ impl Pd {
     };
 }
 
+/// **Ein Eintrag der Rückwärts-Tabelle Thread-Slot → PD** (Z22 P2 / C4).
+///
+/// Der globale Thread-Slot (`ThreadId::slot()`) ist bereits der stabile Index der per-Thread-
+/// Tabellen des Kernels (`FpState`, `VSPACE_OF`, `KSTACKS`); diese ist die vierte.
+///
+/// Warum die **volle** `ThreadId` (Slot **und** Generation) und nicht nur der PD-Index: ein
+/// Thread-Slot wird wiederverwendet. Steht dort nur „Slot 7 → PD 3", erbt der nächste Thread auf
+/// Slot 7 die PD seines Vorgängers — also dessen gesamten Cspace. Mit der Generation im Eintrag
+/// ist das nicht bloss unwahrscheinlich, sondern nicht formulierbar.
+#[derive(Clone, Copy)]
+pub struct ThreadOwner {
+    /// `ThreadId::to_raw()` des gebundenen Threads (Slot + Generation).
+    tid: u64,
+    /// PD-Index **+ 1**; `0` heisst „kein Eintrag". Spart ein `Option` in einer Tabelle mit
+    /// zehntausend Einträgen und macht den leeren Zustand zum Nullmuster.
+    pd1: u32,
+    /// Belegungs-Generation der PD zum Zeitpunkt der Bindung (s. [`Pd::epoch`]).
+    epoch: u32,
+}
+
+impl ThreadOwner {
+    pub const EMPTY: ThreadOwner = ThreadOwner {
+        tid: 0,
+        pd1: 0,
+        epoch: 0,
+    };
+}
+
+/// **Wie oft [`PdTable::pd_of`] gefragt wurde** — der Nenner jeder Aussage über die Auflösung.
+///
+/// Ohne ihn wäre `PD_OF_SCAN_ITER == 0` von „nie gefragt" nicht zu unterscheiden: dieselbe
+/// Sprechprobe wie bei `pdbind` (die Gelegenheit zählen, nicht nur den Treffer).
+pub static PD_OF_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// **Iterationen im LINEAREN Rückfallpfad von [`PdTable::pd_of`]** (C4).
+///
+/// `pd_of` löst bei **jedem** Syscall die aufrufende PD auf — und tat das bis Z22 P2 mit einem
+/// linearen Scan über die ganze PD-Tabelle. Bei `NPDS = 10_000` ist das der teuerste O(n)-Pfad
+/// im System und stand in der C4-Liste nicht drin: die dort genannten Stellen laufen je
+/// Cap-Allokation bzw. je Thread-Tod, diese je **Syscall**.
+///
+/// Gezählt statt gestoppt: eine Iterationszahl ist eine Eigenschaft des Programms, eine
+/// Zeitmessung nicht (D10). Nach dem Umbau muss diese Zahl **0** sein, während `PD_OF_CALLS`
+/// gross ist — beides zusammen ist die Aussage, keine der beiden allein.
+pub static PD_OF_SCAN_ITER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// **Wie viele Aufrufe** in den linearen Rückfallpfad gerieten (nicht wie viele Iterationen).
+///
+/// Getrennt gezählt, weil die beiden verschiedene Fragen beantworten: die Iterationszahl sagt,
+/// was es gekostet hat, diese hier, ob es **einmal** oder **immer** passiert. Eine grosse
+/// Iterationszahl aus einem einzigen Aufruf ist ein anderer Befund als dieselbe Zahl aus
+/// tausend.
+pub static PD_OF_SCAN_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Der **erste** Thread-Slot, der in den Rückfallpfad geriet, `+1` (0 = keiner). Ohne ihn ist
+/// „ein Aufruf war linear" nicht diagnostizierbar — und ein Rückfall, den niemand erklären kann,
+/// ist keine Messung, sondern ein offener Posten.
+pub static PD_OF_SCAN_ERSTER_SLOT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Iterationen im linearen Scan von [`PdTable::create_in_domain`]/`create_hardware_backend` (C4).
+pub static PD_CREATE_SCAN_ITER: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Wie oft eine Bindung an der Rückwärts-Tabelle **vorbeilief**, weil sie (noch) keinen Speicher
+/// hat. `> 0` heisst: `attach_owner` fehlt oder kam zu spät — dann ist die Auflösung wieder
+/// linear, und der Bericht sagt es, statt still langsam zu sein.
+pub static PD_OWNER_UNANGEHAENGT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Tabelle aller Protection Domains.
 pub struct PdTable {
     pds: Slab<Pd>,
+    /// Rückwärts-Index Thread-Slot → PD (Z22 P2 / C4). Länge = Thread-Kapazität des Systems.
+    owner: Slab<ThreadOwner>,
 }
 
 impl Default for PdTable {
@@ -468,6 +562,7 @@ impl PdTable {
     pub const fn new() -> Self {
         Self {
             pds: Slab::empty(),
+            owner: Slab::empty(),
         }
     }
 
@@ -480,13 +575,29 @@ impl PdTable {
     /// Eine neue PD in einer bestimmten **Sicherheitsdomäne** anlegen. Die Domäne ist
     /// danach **unveränderlich** (es gibt bewusst keinen Setter).
     pub fn create_in_domain(&mut self, domain: Domain) -> Option<usize> {
-        let i = self.pds.iter().position(|p| !p.used)?;
+        let i = self.freien_slot_suchen()?;
+        let epoch = self.pds[i].epoch;
         self.pds[i] = Pd {
             used: true,
             domain,
+            epoch,
             ..Pd::EMPTY
         };
         Some(i)
+    }
+
+    /// Der lineare Scan nach einem freien PD-Slot — **gezählt** (C4).
+    ///
+    /// Er ist weiterhin O(`NPDS`); was sich geändert hat, ist, dass die Zahl im Bericht steht.
+    /// Ein fester Vorrat ohne Füllstandsanzeige spricht erst, wenn es zu spät ist.
+    fn freien_slot_suchen(&self) -> Option<usize> {
+        let mut iter = 0u64;
+        let r = self.pds.iter().position(|p| {
+            iter += 1;
+            !p.used
+        });
+        PD_CREATE_SCAN_ITER.fetch_add(iter, core::sync::atomic::Ordering::Relaxed);
+        r
     }
 
     /// Eine PD **freigeben** (ext-26, L4): den Slot leeren (used=false, Cspace/Domäne/Partner
@@ -495,7 +606,13 @@ impl PdTable {
     /// `false`, wenn die PD nicht belegt war.
     pub fn free(&mut self, pd: usize) -> bool {
         if pd < self.pds.len() && self.pds[pd].used {
+            // **Die Generation überlebt die Freigabe und wird erhöht.** Damit werden alle
+            // Rückwärts-Einträge, die auf diese Belegung zeigen, in EINER Operation ungültig —
+            // ohne die Thread-Tabelle abzulaufen (das wäre ein neuer O(n)-Pfad im Teardown,
+            // also genau die Sorte, die C4 beseitigen will).
+            let e = self.pds[pd].epoch.wrapping_add(1);
             self.pds[pd] = Pd::EMPTY;
+            self.pds[pd].epoch = e;
             true
         } else {
             false
@@ -570,7 +687,8 @@ impl PdTable {
         if partner >= self.pds.len() {
             return None;
         }
-        let i = self.pds.iter().position(|p| !p.used)?;
+        let i = self.freien_slot_suchen()?;
+        let epoch = self.pds[i].epoch;
         self.pds[i] = Pd {
             used: true,
             domain: Domain::HardwareLand,
@@ -578,6 +696,7 @@ impl PdTable {
             backend_id,
             chan_ep: ep,
             chan_ntfn: ntfn,
+            epoch,
             ..Pd::EMPTY
         };
         Some(i)
@@ -599,6 +718,11 @@ impl PdTable {
         } else {
             (u32::MAX, u32::MAX)
         }
+    }
+
+    /// Wie viele PD-Slots gerade belegt sind — der **Füllstand** des Vorrats.
+    pub fn used_count(&self) -> usize {
+        self.pds.iter().filter(|p| p.used).count()
     }
 
     /// Ist `pd` belegt?
@@ -634,11 +758,101 @@ impl PdTable {
         unsafe { self.pds.attach(ptr, len, |_| Pd::EMPTY) };
     }
 
-    /// Den Thread einer PD setzen (Affinität Thread<->PD).
+    /// **Der Rückwärts-Tabelle ihren Speicher geben** (Z22 P2 / C4) — einmalig beim Boot,
+    /// vor der ersten Bindung. `len` = Thread-Kapazität des Systems (`ThreadId::slot()` ist
+    /// darin der Index).
+    ///
+    /// # Safety
+    /// Vertrag von [`Slab::attach`]: exklusiver, ausgerichteter, dauerhafter Speicher für
+    /// mindestens `len` Elemente, genau einmal.
+    pub unsafe fn attach_owner(&mut self, ptr: *mut ThreadOwner, len: usize) {
+        // SAFETY: an den Aufrufer durchgereicht (s. Funktionsdoku).
+        unsafe { self.owner.attach(ptr, len, |_| ThreadOwner::EMPTY) };
+    }
+
+    /// **Einen Thread an eine PD binden — mehrere Threads je PD sind erlaubt** (Z22 P2).
+    ///
+    /// Bis hierher hiess das Feld `Pd::thread` und trug genau einen Thread; eine zweite Bindung
+    /// hat die erste **überschrieben**, und der erste Thread verlor damit lautlos seinen ganzen
+    /// Cspace (`pd_of` fand ihn nicht mehr → `ERR_NOPD` bei jedem Syscall). Das ist dieselbe
+    /// Form wie „eine Ablage je ROLLE" bei `CLIENT_NTFN`: eine Zelle für etwas, das es mehrfach
+    /// gibt.
     pub fn bind_thread(&mut self, pd: usize, thread: ThreadId) {
-        if pd < self.pds.len() {
+        if pd >= self.pds.len() {
+            return;
+        }
+        let s = thread.slot();
+        if s < self.owner.len() {
+            // Ein wiederverwendeter Thread-Slot kann noch die Bindung seines Vorgängers tragen —
+            // dessen PD verliert dann einen Thread aus der Zählung.
+            let alt = self.owner[s];
+            if alt.pd1 != 0 {
+                let ap = (alt.pd1 - 1) as usize;
+                if ap < self.pds.len()
+                    && self.pds[ap].epoch == alt.epoch
+                    && self.pds[ap].nthreads > 0
+                {
+                    self.pds[ap].nthreads -= 1;
+                }
+            }
+            self.owner[s] = ThreadOwner {
+                tid: thread.to_raw(),
+                pd1: (pd + 1) as u32,
+                epoch: self.pds[pd].epoch,
+            };
+            self.pds[pd].nthreads += 1;
+        } else {
+            // Kein stiller Rückfall: ohne Tabelle ist die Auflösung wieder linear, und das
+            // gehört in den Bericht statt in eine Vermutung.
+            PD_OWNER_UNANGEHAENGT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        // Der Vertreter bleibt der ERSTE Thread (s. `Pd::thread`).
+        if self.pds[pd].thread.is_none() {
             self.pds[pd].thread = Some(thread);
         }
+    }
+
+    /// Die PD eines Threads — öffentlich für Prüfer und Bericht, und **derselbe Weg**, den auch
+    /// der Syscall-Dispatch nimmt. Ein Prüfer, der die Größe nachrechnet statt sie zu lesen,
+    /// prüft eine zweite Wirklichkeit (s. `iova_window_clear_of_msi` in der Fallenliste).
+    pub fn pd_of_thread(&self, thread: ThreadId) -> Option<usize> {
+        self.pd_of(thread)
+    }
+
+    /// **Gilt `praedikat` für IRGENDEINEN Thread dieser PD?** (Z22 P2)
+    ///
+    /// Der Ersatz für „nimm `thread_of(pd)` und prüfe den": mit mehreren Threads je PD ist der
+    /// erste keine Auskunft über die PD. Läuft über den Rückwärts-Index, ist also O(Threads)
+    /// und **nicht** O(PDs × Threads).
+    ///
+    /// Solange die Rückwärts-Tabelle keinen Speicher hat, bleibt nur der Vertreter — das ist
+    /// dann genau das alte Verhalten und keine stille Verschlechterung.
+    pub fn any_thread(&self, pd: usize, praedikat: &dyn Fn(ThreadId) -> bool) -> bool {
+        if pd >= self.pds.len() || !self.pds[pd].used {
+            return false;
+        }
+        if self.owner.is_empty() {
+            return self.pds[pd].thread.is_some_and(praedikat);
+        }
+        let (pd1, epoch) = ((pd + 1) as u32, self.pds[pd].epoch);
+        self.owner
+            .iter()
+            .any(|e| e.pd1 == pd1 && e.epoch == epoch && praedikat(ThreadId::from_raw(e.tid)))
+    }
+
+    /// Wie viele Threads an dieser PD hängen (Z22 P2). `0` für eine unbekannte/freie PD.
+    pub fn thread_count(&self, pd: usize) -> u32 {
+        if pd < self.pds.len() && self.pds[pd].used {
+            self.pds[pd].nthreads
+        } else {
+            0
+        }
+    }
+
+    /// Der grösste je erreichte `nthreads` über alle PDs — Auskunft für den Bericht: ohne ihn
+    /// wäre „mehrere Threads je PD" von „einer, wie immer" nicht zu unterscheiden.
+    pub fn max_threads_per_pd(&self) -> u32 {
+        self.pds.iter().map(|p| p.nthreads).max().unwrap_or(0)
     }
 
     /// Eine globale Capability in den Cspace einer PD an `slot` eintragen.
@@ -679,10 +893,58 @@ impl PdTable {
         }
     }
 
+    /// **Die PD eines Threads — O(1) über den Rückwärts-Index** (Z22 P2 / C4).
+    ///
+    /// Diese Funktion läuft bei **jedem** Syscall (der Dispatch löst damit die aufrufende PD auf).
+    /// Bis Z22 P2 war sie ein linearer Scan über die ganze PD-Tabelle, also O(`NPDS`) = 10 000
+    /// Vergleiche je Syscall. In der C4-Liste stand sie nicht.
+    ///
+    /// Der Rückfall auf den Scan bleibt, aber **gezählt**: eine Tabelle, die nicht angehängt
+    /// wurde, macht das System langsam und nicht falsch — und genau das soll man sehen können,
+    /// statt es zu vermuten.
     fn pd_of(&self, thread: ThreadId) -> Option<usize> {
-        self.pds
-            .iter()
-            .position(|p| p.used && p.thread == Some(thread))
+        use core::sync::atomic::Ordering::Relaxed;
+        PD_OF_CALLS.fetch_add(1, Relaxed);
+        let s = thread.slot();
+        // **Ein Slot JENSEITS der Tabelle ist keine Frage an die Tabelle, sondern die Antwort.**
+        // Solange die Rückwärts-Tabelle hängt, kann ein solcher Thread nirgends gebunden sein —
+        // `bind_thread` hätte ihn in `PD_OWNER_UNANGEHAENGT` gezählt und nichts eingetragen.
+        // Ihn trotzdem linear zu suchen hiesse, den langsamsten Weg ausgerechnet für die
+        // **Angriffs**eingabe zu nehmen: die Park-Sonde ruft `UNPARK 0xDEAD_BEEF`, und jeder
+        // EL0-Thread kann dasselbe. Ein O(n)-Pfad, den ein Mandant per Syscall auslöst, ist
+        // genau die Form, gegen die C4 gebaut wird.
+        if !self.owner.is_empty() {
+            if s >= self.owner.len() {
+                return None;
+            }
+            let e = self.owner[s];
+            if e.pd1 == 0 || e.tid != thread.to_raw() {
+                return None;
+            }
+            let pd = (e.pd1 - 1) as usize;
+            // Drei Bedingungen, und keine ist entbehrlich: der Eintrag muss diesem Thread
+            // gehören (Generation der ThreadId), die PD muss belegt sein, und es muss
+            // **dieselbe Belegung** sein wie bei der Bindung (Generation der PD).
+            if pd < self.pds.len() && self.pds[pd].used && self.pds[pd].epoch == e.epoch {
+                return Some(pd);
+            }
+            return None;
+        }
+        let mut iter = 0u64;
+        let r = self.pds.iter().position(|p| {
+            iter += 1;
+            p.used && p.thread == Some(thread)
+        });
+        PD_OF_SCAN_ITER.fetch_add(iter, Relaxed);
+        PD_OF_SCAN_CALLS.fetch_add(1, Relaxed);
+        let _ = PD_OF_SCAN_ERSTER_SLOT.compare_exchange(0, s as u64 + 1, Relaxed, Relaxed);
+        r
+    }
+
+    /// Länge der Rückwärts-Tabelle (0 = nie angehängt). Gehört in den Bericht: ohne sie ist
+    /// „ein Aufruf lief linear" nicht von „die Tabelle fehlt ganz" zu unterscheiden.
+    pub fn owner_len(&self) -> usize {
+        self.owner.len()
     }
 
     /// Anzahl der aktuell belegten Cap-Slots einer PD (Verbrauch gegen [`CAP_BUDGET_PER_PD`]).

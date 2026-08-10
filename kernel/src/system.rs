@@ -1092,6 +1092,26 @@ pub fn configure(cores: usize) -> (usize, usize, usize, u64) {
             .attach(ks as *mut u64, total, |_| 0u64)
     };
 
+    // **Rueckwaerts-Index Thread-Slot -> PD** (Z22 P2 / C4). Die vierte per-Thread-Tabelle, und
+    // sie wird HIER angehaengt und nicht in `configure_caps`: dort ist die Thread-Kapazitaet
+    // noch nicht bekannt (`configure_caps` laeuft frueher). Vor dem ersten `bind_thread` ist sie
+    // trotzdem da -- Threads gibt es erst nach diesem Aufruf.
+    //
+    // Ohne sie loest `pd_of` linear ueber alle `NPDS` PDs auf, und das bei JEDEM Syscall. Was
+    // sie kostet, steht im Boot-Report (`bytes`), damit die Entscheidung an einer gemessenen
+    // Groesse haengt.
+    let owner = table(
+        total * core::mem::size_of::<caprock_microkit::ThreadOwner>(),
+        core::mem::align_of::<caprock_microkit::ThreadOwner>().max(4096),
+    );
+    // SAFETY: wie oben (exklusiv, ausgerichtet, dauerhaft, einmalig) -- und vor der ersten
+    // PD-Bindung, weil es vor dem ersten Thread liegt.
+    unsafe {
+        CAPS.write()
+            .pds
+            .attach_owner(owner as *mut caprock_microkit::ThreadOwner, total)
+    };
+
     (cores, total, per_core, bytes)
 }
 
@@ -2354,6 +2374,36 @@ pub fn cap_capacity() -> (usize, usize) {
 /// Tatsaechliche PD-Kapazitaet (A-3.4 Teil 3) -- die angehaengte, nicht die Konstante.
 pub fn pd_capacity() -> usize {
     CAPS.read().pds.capacity()
+}
+
+/// **Wie oft [`purge_ipc_queues`] lief** und **wie viele IPC-Objekte es dabei durchlaufen hat**
+/// (C4). Das PAAR ist die Aussage: die Iterationszahl allein waere von „nie gestorben" nicht zu
+/// unterscheiden.
+pub static PURGE_IPC_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static PURGE_IPC_ITER: AtomicU64 = AtomicU64::new(0);
+
+/// **Fuellstand der festen Vorraete** -- (belegte PDs, PD-Kapazitaet, belegte Endpoints,
+/// Endpoint-Kapazitaet, belegte Notifications, Notification-Kapazitaet).
+///
+/// Ein fester Vorrat ohne Fuellstandsanzeige spricht erst, wenn er leer ist -- und dann als
+/// `NoResources` an einer Stelle, die mit der Ursache nichts zu tun hat (so ist `wasmhost` bei
+/// SECHS Programmen gescheitert). Dieselbe Bewegung wie beim Vektor-Inventar: die Groesse
+/// hinschreiben, solange sie noch harmlos ist.
+pub fn vorrat_fuellstand() -> (usize, usize, usize, usize, usize, usize) {
+    let (pds_used, pds_cap) = {
+        let g = CAPS.read();
+        (g.pds.used_count(), g.pds.capacity())
+    };
+    let eps_used = eps().iter().filter(|e| e.lock().is_used()).count();
+    let ntfns_used = ntfns().iter().filter(|n| n.lock().is_used()).count();
+    (
+        pds_used,
+        pds_cap,
+        eps_used,
+        eps().len(),
+        ntfns_used,
+        ntfns().len(),
+    )
 }
 
 pub fn cap_peaks() -> (usize, usize, usize, usize) {
@@ -7437,6 +7487,58 @@ pub static LATE_PD_BIND: AtomicUsize = AtomicUsize::new(0);
 /// (`is_admitted` gibt `None`). Getrennt gezaehlt, weil „nicht auflösbar" kein „rechtzeitig" ist.
 pub static LATE_PD_BIND_UNKLAR: AtomicUsize = AtomicUsize::new(0);
 
+/// Einen **PD-Slot** freigeben, ohne den vollen Teardown (der Aufrufer haelt keine Caps darin).
+///
+/// Fuer Messpfade, die eine PD anlegen und den Slot bei einem Fehlschlag sofort zurueckgeben --
+/// ihn liegen zu lassen waere ein Leck im Messwerkzeug und wuerde die naechste Runde der
+/// Messung verfaelschen.
+pub fn free_pd_slot(pd: usize) -> bool {
+    CAPS.write().pds.free(pd)
+}
+
+/// Die PD eines Threads (Z22 P2) — **derselbe Weg wie im Syscall-Dispatch**, nicht nachgerechnet.
+pub fn pd_of_thread(tid: ThreadId) -> Option<usize> {
+    CAPS.read().pds.pd_of_thread(tid)
+}
+
+/// Wie viele Threads an dieser PD haengen (Z22 P2). Die Groesse, an der „mehrere Threads je PD"
+/// von „einer, wie immer" zu unterscheiden ist.
+pub fn pd_thread_count(pd: usize) -> u32 {
+    CAPS.read().pds.thread_count(pd)
+}
+
+/// Der Hoechststand `Threads je PD` ueber alle PDs (Auskunft fuer den Bericht).
+pub fn pd_threads_max() -> u32 {
+    CAPS.read().pds.max_threads_per_pd()
+}
+
+/// **Die O(n)-Bilanz der PD-Tabelle** (C4): `(pd_of-Aufrufe, pd_of-Scan-Iterationen,
+/// create-Scan-Iterationen, Bindungen ohne Rueckwaerts-Tabelle)`.
+///
+/// Gezaehlt statt gestoppt -- eine Iterationszahl ist eine Eigenschaft des Programms, eine
+/// Zeitmessung nicht (D10). Die Aussage ist das PAAR aus Aufrufen und Iterationen: eine Null
+/// bei den Iterationen allein waere von „nie gefragt" nicht zu unterscheiden.
+pub fn pd_scan_bilanz() -> (u64, u64, u64, u64) {
+    (
+        caprock_microkit::PD_OF_CALLS.load(Ordering::Relaxed),
+        caprock_microkit::PD_OF_SCAN_ITER.load(Ordering::Relaxed),
+        caprock_microkit::PD_CREATE_SCAN_ITER.load(Ordering::Relaxed),
+        caprock_microkit::PD_OWNER_UNANGEHAENGT.load(Ordering::Relaxed),
+    )
+}
+
+/// Diagnose zum Rueckfallpfad: `(Aufrufe im Scan, erster betroffener Thread-Slot + 1,
+/// Laenge der Rueckwaerts-Tabelle)`. Ein Rueckfall, den niemand erklaeren kann, ist ein offener
+/// Posten und kein Messwert -- deshalb steht hier, WELCHER Slot es war und ob die Tabelle
+/// ueberhaupt haengt.
+pub fn pd_scan_diagnose() -> (u64, u64, usize) {
+    (
+        caprock_microkit::PD_OF_SCAN_CALLS.load(Ordering::Relaxed),
+        caprock_microkit::PD_OF_SCAN_ERSTER_SLOT.load(Ordering::Relaxed),
+        CAPS.read().pds.owner_len(),
+    )
+}
+
 pub fn bind_pd(pd: usize, tid: ThreadId) {
     // **Vor** der Bindung fragen: danach saehe man nur noch das Ergebnis, nicht die Reihenfolge.
     //
@@ -8159,6 +8261,13 @@ pub fn purge_ipc_queues(tid: ThreadId) {
     // Sperrordnung: IPC_ORPHANS ist damit **aeusserer** Lock ->
     // IPC_ORPHANS < EPS[i]/NTFNS[i] < SCHEDS. Kein anderer Pfad nimmt ihn, insbesondere keiner
     // mit gehaltenem EPS oder SCHEDS -> kein Zyklus.
+    // **C4: dieser Pfad ist O(Endpoints + Notifications) JE THREAD-TOD** -- und er sperrt jedes
+    // Objekt einzeln. Gezaehlt, nicht gestoppt: eine Iterationszahl ist eine Eigenschaft des
+    // Programms, eine Zeitmessung nicht (D10). Bei `NEPS + NNTFNS = 20 128` und 10 000
+    // sterbenden Threads sind das 201 Millionen Sperroperationen -- das ist die Groesse, die
+    // ein Teardown von zehntausend PDs kostet, und sie stand bisher nirgends.
+    PURGE_IPC_CALLS.fetch_add(1, Ordering::Relaxed);
+    PURGE_IPC_ITER.fetch_add((eps().len() + ntfns().len()) as u64, Ordering::Relaxed);
     let mut orphans = IPC_ORPHANS.lock();
     let mut no = 0usize;
     for ep in eps().iter() {

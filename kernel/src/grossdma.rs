@@ -63,6 +63,20 @@ use caprock_mem::{Rights, MAX_FRAGMENTS};
 ///
 /// `#[must_use]`: ein weggeworfener Grant ist eine angehängte Übersetzung und eine Region, die
 /// niemand mehr freigibt.
+// **Warum hier `allow(dead_code)` steht — und was das GENAU heisst.**
+//
+// Der Weg bis zur Gerätesicht (`belege`/`gib_frei`/`GrossDmaGrant`/`pruefe_ende_zu_ende`) hat in
+// diesem Stand **keinen Aufrufer**: er müsste hinter `dma_enforcer_init()` gerufen werden, und
+// das steht in `kernel/src/arch/x86_64/bringup.rs` — eine Datei, die dieser Durchgang
+// ausdrücklich nicht anfasst (ein zweiter Agent arbeitet parallel daran). Die genaue Einfügezeile
+// steht im Abschlussbericht.
+//
+// Das ist ausdrücklich **kein** „wird schon jemand brauchen": ein Test, der nirgends läuft, ist
+// kein Test, und ein Pfad, den niemand ruft, ist keine Fähigkeit. Bis die Zeile eingefügt ist,
+// gilt für diese Hälfte: **gebaut und host-geprüft, nie ausgeführt.** Die Zuteilungshälfte
+// (`zone`/`groesster_block`/`pruefe`) hängt dagegen in `crate::selftest::run()` und braucht keine
+// IOMMU.
+#[allow(dead_code)]
 #[must_use = "ein verworfener Grant laesst eine Uebersetzung und eine Region stehen"]
 pub struct GrossDmaGrant {
     pa: Pa,
@@ -73,6 +87,7 @@ pub struct GrossDmaGrant {
     handle: system::DmaHandle,
 }
 
+#[allow(dead_code)]
 impl GrossDmaGrant {
     /// Die **physische** Adresse (CPU-Sicht). Cache-Wartung und Allokator-Buchhaltung laufen
     /// darüber.
@@ -132,6 +147,7 @@ pub fn groesster_block() -> u64 {
 }
 
 /// Die gemessene Lage des Allokators (für die Klassifikation).
+#[allow(dead_code)]
 fn lage() -> Lage {
     Lage {
         groesster_block: groesster_block(),
@@ -155,6 +171,7 @@ fn lage() -> Lage {
 /// 5. Achsen prüfen. Fällt das durch, wird **alles** zurückgebaut: eine ausgelieferte Identität
 ///    wäre schlimmer als ein Fehlschlag, weil sie funktioniert, bis jemand die Trennung
 ///    durchsetzt.
+#[allow(dead_code)]
 pub fn belege(rid: u32, len: u64) -> Result<GrossDmaGrant, GrossDmaFehler> {
     // Schritt 1 ohne Messung: Formfehler hängen nicht am Zustand der Maschine, und die Messung
     // kostet 18 Allokationen. `Lage::groesster_block` bleibt dafür bewusst ungemessen — die
@@ -231,6 +248,7 @@ pub fn belege(rid: u32, len: u64) -> Result<GrossDmaGrant, GrossDmaFehler> {
 /// **In dieser Reihenfolge.** Umgekehrt gäbe es ein Fenster, in dem die Region schon wieder
 /// vergeben werden darf, während die Übersetzung noch steht — und ein Gerät, dessen in-flight
 /// Write ankommt, träfe fremden Speicher. Dieselbe Abwägung wie beim Einzug einer IRTE.
+#[allow(dead_code)]
 pub fn gib_frei(g: GrossDmaGrant) {
     system::dma_detach(g.rid, g.handle);
     let _ = system::cap_delete(g.cap);
@@ -356,6 +374,7 @@ pub fn pruefe() -> GrossDmaBericht {
 /// steht. Sie wird hier gemeldet und nicht bloss vorausgesetzt, weil [`belege`] sie **abweist**:
 /// ohne diese Zeile wäre nicht unterscheidbar, ob die Trennung gilt oder ob der Fall nie eintrat.
 #[cfg(feature = "selftest")]
+#[allow(dead_code)]
 pub fn pruefe_ende_zu_ende(rid: u32) -> (bool, bool) {
     match belege(rid, PROBE_BYTES) {
         Ok(g) => {

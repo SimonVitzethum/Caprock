@@ -3272,6 +3272,19 @@ Zeitmessung nicht (D10).
       Thread-Tod (`NEPS + NNTFNS`), jedes einzeln gesperrt. Bei 10 000 sterbenden Threads sind
       das **201 Millionen** Sperroperationen. Das ist die grösste verbliebene Zahl der Liste.
 
+      **Es ist dieselbe Struktur wie `pd_of` vor seiner Behebung: der Kernel SUCHT, wer auf den
+      Toten zeigt, statt es zu WISSEN.** Und die strukturelle Fassung ist dieselbe — eine
+      **intrusive Warteliste je Thread**: wer blockiert, trägt sich beim Objekt *und* bei sich
+      selbst ein; der Tod läuft die **eigene** Liste ab. Damit wird der Pfad `O(Grad)` statt
+      `O(alle Objekte)`, und der Grad ist in der Praxis 1–2.
+      **Der Anker dafür existiert schon:** die Grund-Menge aus [Z24](#z24) weiss ohnehin je
+      Thread, **worauf** er wartet — heute nur als Grund*klasse* (`IPC`), nicht als Zeiger auf das
+      Objekt. Die Erweiterung von „welcher Grund" auf „welches Objekt" ist die natürliche Stelle;
+      sie ersetzt die Suche durch die Angabe, die beim Blockieren ohnehin vorlag.
+      **Vorsicht bei der naheliegenden Fassung** (D8-Muster): wer die Liste beim Wecken nicht
+      genauso sorgfältig austrägt wie beim Eintragen, tauscht eine teure Schleife gegen einen
+      Zeiger auf ein totes Objekt.
+
 - [x] **Registerkorrektur: „Kernel-Stacks 64 KiB je Thread" stimmt — für KERNEL-Threads.**
       Es sind **zwei** Grössen, und beide sind real: `STACK_SIZE = 64 KiB` (Kernel-Thread) und
       `USER_KSTACK_SIZE = 16 KiB` (EL1-Stack eines EL0-Threads). Die Korrektur „es sind 16, nicht
@@ -3289,7 +3302,11 @@ Zeitmessung nicht (D10).
 
 ### C7. Die Kapazitätskurve — wo es WIRKLICH bricht (gemessen 2026-08-10)
 
-**Klasse:** Messung · **Stand:** gefahren, drei verschiedene Schranken benannt
+**Klasse:** Messung · **Stand:** **Beleg zur HÄLFTE erbracht — C7 und [C4](#c4-die-on-bilanz)
+bleiben OFFEN.** Die Kurve sagt, *dass* es bis 9984 ging; sie sagt **nicht**, *welcher Vorrat als
+nächster reisst*. Solange die drei unten benannten Zeilen fehlen (Seitentabellen-Topf bei N,
+Stack-Wasserstandsmarke, benannter Mangel auf den `spawn_*`-Pfaden), ist das eine **Zählung, kein
+Beleg**. Die drei sind zusammen kleiner als die Messkampagne, die schon gelaufen ist.
 
 `tools/kapazitaet-messen.sh` legt PDs **mit je einem Thread** an (eine PD ohne Thread ist kein
 Prozess) und druckt den Füllstand über wachsendes N. Ziel parametrisierbar über
@@ -3314,6 +3331,24 @@ eine Messung, die tausende PDs belegt, kippt sonst jede baseline-empfindliche Ze
 3. **Wer alle Prozesse aus einem Thread heraus erzeugt, trifft 5000 und hält es für die
    Systemgrenze.** Der Unterschied zwischen den ersten beiden Zeilen ist eine Zeile Code
    (`spawn_parked` gegen `spawn_balanced_parked`) und ein Faktor 2.
+
+**Welche Zeile für das Produktziel zählt — und warum sie die schlechteste ist.** Die zweite Zeile
+belegt die **Kernel-Datenstrukturen**; für eine PaaS zählt die **dritte**. Dort ist die Schranke
+RAM bei **2 MiB je PD**, also ≈ `RAM / 2 MiB` Mandanten — auf einer 64-GiB-Maschine rund **32 000**,
+auf der Messmaschine dreistellig. **„10 000 Prozesse" ist als Zusage nur in der Fassung wahr, die
+kein Mandantenmodell ist.** So gehört es gesagt, und nicht weicher.
+
+**Damit sind die 2 MiB der Hebel Nummer eins — und die Frage ist, woraus sie bestehen.** Stecken
+darin vorab belegte private Regionen oder eine eifrig gefüllte BSS, sind die klassischen Antworten
+**Lazy-Zuteilung** und eine **geteilte Nullseite mit COW**. Beides ist Territorium des
+**Speicher-Servers** ([Z16](#z16) Stufe 1) — der damit aufhört, nur „Grundlage für musl" zu sein,
+und zusätzlich **der Hebel für Mandantendichte** wird. Das ist ein Prioritätsargument, kein
+Nebensatz: Z16 Stufe 1 steht damit vor Arbeiten, die nur eine Zusage schärfen, ohne die Dichte zu
+ändern.
+
+- [ ] **Woraus bestehen die 2 MiB?** Aufschlüsseln (private Region, Seitentabellen, Stack,
+      Endowment), dann entscheiden, was davon lazy werden kann. **Vor** dem Umbau messen, sonst
+      ist hinterher nicht zu sagen, was die Verbesserung gebracht hat.
 
 - [ ] **Offen, und es ist eine Lücke im MESSINSTRUMENT:** `lade_mangel()` meldete in **jedem**
       Abbruch `keiner (der Fehlschlag lag NICHT an einer Ressource)` — auch dort, wo das freie

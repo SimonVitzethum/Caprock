@@ -3368,8 +3368,18 @@ eine Messung, die tausende PDs belegt, kippt sonst jede baseline-empfindliche Ze
    (`spawn_parked` gegen `spawn_balanced_parked`) und ein Faktor 2.
 
 **Welche Zeile für das Produktziel zählt — und warum sie die schlechteste ist.** Die zweite Zeile
-belegt die **Kernel-Datenstrukturen**; für eine PaaS zählt die **dritte**. Dort ist die Schranke
-RAM bei **2 MiB je PD**, also ≈ `RAM / 2 MiB` Mandanten — auf einer 64-GiB-Maschine rund **32 000**,
+belegt die **Kernel-Datenstrukturen**; für eine PaaS zählt die **dritte**.
+
+> **Berichtigung der eigenen Aussage vom selben Tag.** Als dieser Absatz zuerst geschrieben wurde,
+> stützte er sich auf die Zeile `224 / 1504 / 3040` — und die maß PDs, **deren Thread sofort
+> starb** (`kurven_arbeiter` lag in `.text`). Die Schlussfolgerung hat den Wechsel auf lebende
+> Threads überstanden (220 statt 224, 1477 statt 1504; die Größenordnung ist dieselbe), **die
+> Herkunft der Zahl aber nicht**: sie kam aus einer Reihe, die nicht maß, was ihr Name sagt. Wer
+> aus einer entwerteten Zeile eine Produktzusage ableitet, hat Glück gehabt, nicht recht behalten.
+> Die Zahlen unten sind die der berichtigten Reihe.
+
+Dort ist die Schranke RAM bei **2084 KiB je PD** (2 MiB private Region **+ 20 KiB
+Seitentabellen**, jetzt getrennt gemessen), also ≈ `RAM / 2 MiB` Mandanten — auf einer 64-GiB-Maschine rund **32 000**,
 auf der Messmaschine dreistellig. **„10 000 Prozesse" ist als Zusage nur in der Fassung wahr, die
 kein Mandantenmodell ist.** So gehört es gesagt, und nicht weicher.
 

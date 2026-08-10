@@ -848,6 +848,27 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   laufen, und ein Cross-Core-Test weckte einen *geparkten* Thread mit dem Wecker für IPC.
   Merkmal der Klasse: Sie fallen nicht beim Gegenlesen auf, sondern in der Suite der Architektur,
   auf der der Zustand oft vorkommt.
+* **Cargo mischt `.cargo/config.toml` aus JEDEM Vorfahrenverzeichnis — und HÄNGT Arrays an.**
+  Ein Arbeitsbaum unterhalb eines anderen Checkouts (`<repo>/.claude/worktrees/<id>`) erbt die
+  Konfiguration ein zweites Mal; `-Tkernel/x86_64-link.ld` steht dann **zweimal** auf der
+  Linkerzeile, `lld` wertet `SECTIONS` **zweimal** aus, und **alle** Linkersymbole tragen die
+  Werte des zweiten Durchlaufs (`__text_start = 0x100000`). Der Bau läuft durch, das Abbild
+  bootet nie. Das hat einen halben Tag und drei Behebungsversuche am **Linkerskript** gekostet —
+  einem Symptom. Der Hauptbaum war nur zufällig immun (dort gibt es eine Konfiguration). Seit
+  2026-08-10 steht das Skript in `kernel/build.rs` (`rustc-link-arg`, je Crate **genau einmal**,
+  absoluter Pfad) und ein Wächter bricht bei einem zweiten `-T` ab. **Ein Entdoppler wäre die
+  falsche Antwort gewesen:** er müsste raten, welche Wiederholung Absicht ist — das Wegwerfen
+  eines legitim doppelten Flags ist eine stille Semantikänderung.
+* **„`cargo build` läuft durch" ist kein Beleg, solange niemand die KONFIGURATION bindet.** Der
+  Binärfingerabdruck schliesst „veralteter Build" für einen *Suitenlauf* aus; für die
+  *Bauumgebung* stand dieselbe Tür offen. Jede Bauzeile, die als Beleg dient, druckt ihre
+  effektiven Flags — und der Kernel trägt ihren Fingerabdruck (`CAPROCK_FLAGS_FP`) im Abbild.
+  Eine Suite, die ihre Bauausgabe nach `/dev/null` schickt, ist dabei der eigentliche Riss.
+* **Null ist ein Befund, kein Messwert.** Ein einseitiger Schwellenvergleich (`x < Schranke`) ist
+  **grün, sobald die Messung ausfällt**. `NOSEL_TEXT` stand auf 0, weil der Bau kaputt war, und
+  die F1-Zeile meldete `PASS` für „0 < 0x62000". Dieselbe Form wie ein nie gesetztes Bit, das als
+  „kein Fehler" gelesen wird. Jede gemessene Grösse mit nur **einer** Schranke braucht eine
+  Plausibilitätsuntergrenze — oder Null muss ausdrücklich als „nicht gemessen" ausscheiden.
 * **Ein Kriterium, das die geprüfte Sache nicht erreichen KANN, ist kein strenges Kriterium,
   sondern gar keins.** Die FP-Sonde musste „alle 64 Abgaben überstehen"; erreichbar waren 3, weil
   sie je Rundlauf-Runde eine Iteration vorankommt und eine Runde durch den **Tick** begrenzt ist,

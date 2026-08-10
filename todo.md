@@ -42,6 +42,21 @@ Abbild ausliefert, ist die Bauzeit-Fassung von „Schweigen als Erfolg".
       verschluckt: `filesz=0xf7000` statt `0x58`. Die `. = __aptramp_data_lma + SIZEOF(…)`-
       Arithmetik gilt an der neuen Stelle nicht mehr.
 
+      **(b2) Wie (b), aber mit im Image RESERVIERTEM Platz** (`__aptramp_lma = .; . = . + 0x2000;`,
+      Sektionen ganz am Ende, `ASSERT` auf je eine Seite — die müssen bei `lld` **ausserhalb** von
+      `SECTIONS` stehen). Gedacht war das gegen den Fehler von (b): ohne Reservierung liegt die
+      BSS **physisch auf der LMA** des Trampolins, und die BSS-Nullung löscht die Kopie, bevor der
+      BSP sie nach `0x8000` bringt. Ergebnis: Header bei 4096, null nullgrosse Segmente — aber
+      **`KEIN OUTPUT`**, also schlechter als (b), das immerhin anlief. Die Sektionen sind weiterhin
+      korrekt `NOBITS`; der Unterschied zum gesunden Baum ist die **Reihenfolge** (`.bss` vor statt
+      nach dem Trampolin), und das letzte Segment trägt weiterhin `filesz=0xf7000`.
+
+      **Zwischenstand nach drei Versuchen:** (b) ist der einzige, der bootet. Was ihm fehlt, ist
+      **nicht** mehr Reservierung, sondern die Antwort auf die Frage, warum `lld` dem letzten
+      Segment ~1 MiB **Dateiinhalt** gibt, obwohl beide BSS-Sektionen `NOBITS` sind. Die nächste
+      Sitzung sollte dort mit einem Vergleich der **Sektions**tabelle (nicht der Segmente) gesund
+      gegen krank anfangen — die Segmentsicht hat dreimal in die Irre geführt.
+
       **(b) ist der aussichtsreichere Weg** — er löst das Segmentproblem vollständig, und was
       übrigbleibt, ist eine Adressarithmetik, die mitwandern muss (`.bss`/`.boot_bss` dürfen ihre
       NOLOAD-Eigenschaft nicht verlieren). Die Abnahme ist billig: `filesz` des letzten Segments

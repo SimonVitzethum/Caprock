@@ -40,6 +40,9 @@ mod colors;
 // noch nicht aktiv — er wird Stufe fuer Stufe fuer x86_64 eingeschaltet (s. README-X86.md).
 #[cfg(feature = "selftest")]
 mod dmatests;
+/// Z26, Vorbedingung 2: grosse, zusammenhaengende DMA mit Geraetesicht — und eine **benannte**
+/// Absage statt `None`. Arch-neutral; die Klassifikation liegt host-getestet in `caprock-dma`.
+mod grossdma;
 /// Kernel-Glue des generischen Binary-Loaders. **Seit A-1 auf beiden Architekturen** — die
 /// Archiv-Quelle ist nicht mehr ein fest verdrahtetes ARM-Fenster, sondern eine zur Laufzeit
 /// gemeldete Spanne (auf x86 ein Multiboot-Modul).

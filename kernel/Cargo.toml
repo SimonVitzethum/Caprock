@@ -42,7 +42,9 @@ path = "src/main.rs"
 # verrottet still -- diese Fehlerform hat hier schon viermal zugeschlagen (leere Event-Queue, nie
 # ausgefuehrter x86-Testpfad, DMAR-Ausschlusspfad, und `--no-default-features` auf aarch64).
 default = []
-selftest = []
+# Zieht die Pruefinfrastruktur der HAL mit: der IRTE-Vergabe-Selbsttest (Z22 P1) muss in dem
+# Augenblick laufen, in dem Interrupt Remapping aufgesetzt wird -- den gibt es nur in `vtd::init`.
+selftest = ["caprock-hal/selftest"]
 kernel-fuzz = []
 # Continuous-Soak-Treiber (Burn-in #2): nach dem Selbsttest faehrt der Idle-Manager statt
 # `system_off` eine Endlos-Epochenschleife (Dauerbetrieb EINER Instanz). NUR Harness/Testcode; der
@@ -59,6 +61,10 @@ caprock-hal = { path = "../crates/caprock-hal" }
 caprock-sync = { path = "../crates/caprock-sync" }
 caprock-slab = { path = "../crates/caprock-slab" }
 caprock-mem = { path = "../crates/caprock-mem" }
+# Z26: die BENANNTE Absage grosser, zusammenhaengender DMA (`gross`) und der DMA-Pool einer
+# Treiber-PD. Abhaengigkeitsfrei und `forbid(unsafe_code)`; der Kernel benutzt daraus nur die
+# Klassifikation -- sie liegt dort, weil sie sich mit Literalen host-pruefen laesst.
+caprock-dma = { path = "../crates/caprock-dma" }
 caprock-region = { path = "../crates/caprock-region" }
 caprock-loader = { path = "../crates/caprock-loader" }
 caprock-trust = { path = "../crates/caprock-trust" }

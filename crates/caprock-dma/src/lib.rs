@@ -37,6 +37,11 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+/// **Grosse, zusammenhängende DMA** (Z26, Vorbedingung 2): die benannte Absage und die
+/// Achsenprüfung. Eigene Datei aus demselben Grund wie `irte.rs` in der HAL — reine
+/// Grössenarithmetik, mit Literalen auslösbar.
+pub mod gross;
+
 /// Warum ein Pool nicht entstehen konnte. Ein `Option` wäre hier zu wenig: „geht nicht" und
 /// „geht nicht, WEIL die Gerätesicht gleich der CPU-Sicht ist" sind sehr verschiedene Befunde,
 /// und der zweite ist ein Sicherheitsbefund.

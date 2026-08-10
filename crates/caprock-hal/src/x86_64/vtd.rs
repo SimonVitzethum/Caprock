@@ -128,8 +128,14 @@ const GSTS_CFIS: u32 = 1 << 23;
 
 /// Eintraege der Interrupt-Remapping-Tabelle. 256 x 16 B = eine 4-KiB-Seite; das Groessenfeld in
 /// `IRTA` ist `log2(n) - 1`.
-const IRT_ENTRIES: u64 = 256;
-const IRTA_SIZE_FIELD: u64 = 7; // 2^(7+1) = 256
+///
+/// **Beide Zahlen kommen seit dem 2026-08-10 aus `irte.rs`** -- dort sitzt der Zuteiler, und ein
+/// Zuteiler, der ueber eine andere Tabellengroesse vergibt als die, die der Einheit gemeldet
+/// wird, schreibt an Eintraegen vorbei oder ueber das Ende hinaus. Zwei Zahlen fuer dieselbe
+/// Sache sind die `iova_window_clear_of_msi`-Falle; `irte.rs` haelt sie mit einem Host-Test
+/// aneinander (`groessenfeld_passt_zur_tabellengroesse`).
+const IRT_ENTRIES: u64 = super::irte::IRT_EINTRAEGE as u64;
+const IRTA_SIZE_FIELD: u64 = super::irte::IRTA_GROESSENFELD;
 
 /// Basisadresse der Interrupt-Remapping-Tabelle (0 = IR nicht aktiv).
 static IRT: [AtomicU64; super::dmar::MAX_UNITS] =
@@ -856,6 +862,41 @@ pub fn init(root_table: u64, alloc: &mut dyn FnMut() -> Option<u64>) -> bool {
     // offen und ist hier vermerkt, damit es nicht in der Aggregation verschwindet.
     qi_enable(alloc);
     ir_enable(alloc);
+    // **Der einzige Punkt im Hochlauf, an dem die IRTE-Vergabe pruefbar ist** (Z22 P1): die
+    // Tabelle steht frisch, QI laeuft, und noch kein Geraet haelt einen Vektor. Nur mit
+    // `selftest`; der Release-Bau enthaelt das nicht.
+    #[cfg(feature = "selftest")]
+    {
+        let b = irte_selbsttest();
+        if !b.sprechfaehig {
+            // **SKIP mit Grund, nicht PASS.** Ein leerer Lauf ist kein Testergebnis -- und die
+            // vier Zahlen sagen, WELCHE Vorbedingung fehlt.
+            crate::println!(
+                "irtevgb : SKIP  (IR nicht scharf: tabelle={} ire={} qi={} einheiten={})",
+                IRT[0].load(Ordering::Acquire) != 0,
+                ir_active(),
+                qi_active(),
+                unit_count()
+            );
+        } else {
+            crate::println!(
+                "irtevgb : {}  vergabe={} eintrag-steht={} quellpruefung={} getrennt={} \
+                 adresse-remappable={} fail-closed={} erschoepfung-benannt={} einzug={} \
+                 belegt-am-ende={} hoechststand={}",
+                if b.ok() { "ALL PASS" } else { "FAILURES" },
+                b.vergabe,
+                b.eintrag_steht,
+                b.quellpruefung,
+                b.getrennt,
+                b.adresse_remappable,
+                b.fail_closed,
+                b.erschoepfung_benannt,
+                b.einzug,
+                b.belegt_am_ende,
+                b.hoechststand
+            );
+        }
+    }
     invalidate_context_cache();
     // Übersetzung auf **allen** Einheiten aktivieren.
     for u in 0..unit_count() {
@@ -987,6 +1028,178 @@ pub fn invalidate_iec_global() -> bool {
         return false;
     }
     qi_submit(QI_IEC_INV, 0)
+}
+
+/// **Interrupt-Entry-Cache fuer GENAU EINEN Index invalidieren.**
+///
+/// Deskriptorfelder (VT-d, `iec_inv_dsc`): Typ in 3:0, `G` (Granularitaet) in Bit 4
+/// (`1` = index-selektiv), `IM` in 31:27, `IIDX` in 47:32. `IM = 0` heisst „genau dieser eine
+/// Index" -- damit gibt es keine Ausrichtungsbedingung an einen Block, und eine Bedingung, die
+/// nicht gilt, kann auch niemand vergessen.
+///
+/// **Warum nicht global.** Global ist bequem und richtig, wirft aber bei JEDER Vergabe die
+/// Eintraege ALLER Geraete weg. Auf einer Maschine, die im Betrieb Treiber nachlaedt, zwingt
+/// damit jedes neu geladene Geraet jedes andere zu einem Tabellendurchlauf. Der Preis ist ein
+/// Deskriptor je Eintrag statt einer je Block, und das laeuft einmal beim Aufsetzen.
+fn invalidate_iec_index(index: u16) -> bool {
+    if !qi_active() {
+        return false;
+    }
+    qi_submit(QI_IEC_INV | (1 << 4) | ((index as u64) << 32), 0)
+}
+
+// --- Die IRTE-Vergabe (Z22 P1, zweiter Teil -- 2026-08-10) ---------------------------------------
+//
+// Der Zuteiler selbst (Bitfeld, Formbedingungen, benannte Absagen, Reihenfolge) und die LOGIK des
+// Selbsttests liegen in `irte.rs` und sind dort mit Literalen host-geprueft. Hier steht nur, was
+// zwingend Hardware ist: WO die Tabelle liegt, wie ein Eintrag hineinkommt, wie er
+// zurueckgelesen wird und wie die Einheit zur Kenntnisnahme gezwungen wird.
+//
+// **Die Trennlinie ist nicht Bequemlichkeit.** Ein Bit an der falschen Stelle in einer IRTE
+// aeussert sich als „das Geraet unterbricht einfach nicht" -- ohne Fault, ohne Meldung. Was in
+// QEMU Geraet, Treiber und Glueck braucht, ist als reine Funktion in Sekunden pruefbar; hier
+// bleibt so wenig wie moeglich.
+
+/// Der Index-Allokator der Tabelle von **Einheit 0**.
+///
+/// Nur Einheit 0: `ir_enable` setzt Interrupt Remapping ausschliesslich dort auf (s. dort; der
+/// Rest von B-3.2 steht als offener Punkt). Ein Geraet hinter Einheit 1..n bekaeme hier einen
+/// Handle, den seine Einheit gar nicht nachschlaegt -- deshalb verlangt [`irte_vergabe_moeglich`]
+/// ausdruecklich `unit_count() == 1`, statt still zu vergeben.
+static IRTE_ALLOC: caprock_sync::SpinLock<super::irte::IrteAllocator> =
+    caprock_sync::SpinLock::new(super::irte::IrteAllocator::new());
+
+/// Zugriff auf die echte Tabelle im Speicher + die echte Invalidierung.
+struct IrtHardware {
+    tabelle: u64,
+}
+
+impl super::irte::IrtZugriff for IrtHardware {
+    fn schreibe_hi(&mut self, index: u16, hi: u64) {
+        // SAFETY: `tabelle` ist das in `ir_enable` allozierte, identity-gemappte 4-KiB-Frame;
+        // `index < IRT_ENTRIES` ist durch den Allokator garantiert (256 * 16 B == 4096 B).
+        unsafe { write_entry(self.tabelle + index as u64 * 16 + 8, hi) };
+    }
+    fn schreibe_lo(&mut self, index: u16, lo: u64) {
+        // SAFETY: wie oben.
+        unsafe { write_entry(self.tabelle + index as u64 * 16, lo) };
+    }
+    fn invalidiere(&mut self, index: u16) -> bool {
+        invalidate_iec_index(index)
+    }
+    fn lies(&self, index: u16) -> (u64, u64) {
+        // SAFETY: wie oben.
+        unsafe {
+            let a = self.tabelle + index as u64 * 16;
+            (
+                core::ptr::read_volatile(a as *const u64),
+                core::ptr::read_volatile((a + 8) as *const u64),
+            )
+        }
+    }
+}
+
+/// **Kann die Vergabe ueberhaupt etwas eintragen?** — die Sprechprobe.
+///
+/// Ein Pruefer, der ueber Abwesenheit entscheidet („kein Geraet hat einen Vektor bekommen"),
+/// muss belegen koennen, dass er sprechfaehig ist. Diese Funktion sagt, ob die Vorbedingungen
+/// stehen, **ohne** etwas zu vergeben — damit ist „0 Vektoren vergeben" von „konnte gar nicht"
+/// unterscheidbar.
+///
+/// Alle vier Bedingungen sind noetig: ohne Tabelle gibt es nichts zu schreiben, ohne `IRE`
+/// schaut die Einheit nicht hinein, ohne QI ist der Eintrag nicht invalidierbar, und bei mehr
+/// als einer Einheit weiss diese Datei nicht, hinter welcher das Geraet haengt.
+pub fn irte_vergabe_moeglich() -> bool {
+    IRT[0].load(Ordering::Acquire) != 0 && ir_active() && qi_active() && unit_count() == 1
+}
+
+/// **Einen MSI-/MSI-X-Vektorblock an ein Geraet vergeben.**
+///
+/// Das ist die Stelle, an der aus „dieses Geraet gehoert dieser PD" wird: „dieses Geraet darf
+/// diesen Vektor auf diesem Kern ausloesen, und kein anderes". Getragen wird das von `SVT = 01`
+/// und `SID` im Eintrag -- die PD schreibt ihre MSI-X-Tabelle selbst (sie besitzt das Fenster)
+/// und koennte den Handle einer FREMDEN IRTE eintragen; die Quellpruefung der Einheit weist das
+/// ab.
+///
+/// `rid` ist die Requester-ID des Geraets, also `(bus << 8) | (dev << 3) | func` -- genau das
+/// Format einer `SID`.
+///
+/// **Geraeteneutral.** Hier kommt keine Geraeteklasse vor: NVMe, Netzkarte, USB-Controller und
+/// GPU laufen durch dieselbe Vergabe. Was sich unterscheidet, ist [`super::irte::Vektorform`] --
+/// und die **nennt der Aufrufer**, statt dass sie hier geraten wird.
+pub fn irte_vergib(
+    rid: u32,
+    basis_vektor: u8,
+    apic_id: u32,
+    form: super::irte::Vektorform,
+    anzahl: usize,
+) -> Result<super::irte::MsiZiel, super::irte::VergabeFehler> {
+    let tabelle = IRT[0].load(Ordering::Acquire);
+    let aktiv = irte_vergabe_moeglich();
+    let w = super::irte::Vektorwunsch {
+        basis_vektor,
+        apic_id,
+        sid: (rid & 0xFFFF) as u16,
+        form,
+        anzahl,
+    };
+    let mut hw = IrtHardware { tabelle };
+    let mut a = IRTE_ALLOC.lock();
+    super::irte::vergib(&mut hw, &mut a, aktiv, &w)
+}
+
+/// Einen vergebenen Block wieder einziehen (Teardown, Hot-Reload).
+pub fn irte_zieh_ein(ziel: &super::irte::MsiZiel) -> Result<(), super::irte::VergabeFehler> {
+    let tabelle = IRT[0].load(Ordering::Acquire);
+    if tabelle == 0 {
+        return Err(super::irte::VergabeFehler::TabelleNichtAktiv);
+    }
+    let mut hw = IrtHardware { tabelle };
+    let mut a = IRTE_ALLOC.lock();
+    super::irte::zieh_ein(&mut hw, &mut a, ziel)
+}
+
+/// Belegung der Remapping-Tabelle: `(belegt, frei, hoechststand)` — Telemetrie fuer den Bericht.
+/// Die Zahl, mit der sich eine Tabellengroesse begruenden laesst, statt sie zu raten.
+pub fn irte_belegung() -> (usize, usize, usize) {
+    let a = IRTE_ALLOC.lock();
+    (a.belegt_anzahl(), a.frei_anzahl(), a.hoechststand())
+}
+
+// --- Selbsttest der Vergabe (nur mit `selftest`) -------------------------------------------------
+//
+// **Die LOGIK steht in `irte.rs`, nicht hier.** Ein Selbsttest, der nur auf einer bootenden
+// Maschine laeuft, ist so viel wert, wie diese Maschine bootet -- und ein Bauwerkzeug kann das
+// jederzeit kippen (in dieser Sitzung: `objcopy` 2.46.1, s. Bericht). Hardware ist nur, WO die
+// Tabelle liegt; alles andere ist gegen einen speicherbasierten Stellvertreter host-geprueft,
+// mit Positivkontrolle und drei Gegenproben.
+
+/// Der Bericht — der Typ liegt bei der Logik.
+#[cfg(feature = "selftest")]
+pub use super::irte::VergabeBericht as IrteVergabeBericht;
+
+/// **Der Selbsttest der IRTE-Vergabe** — laeuft in [`init`], unmittelbar nachdem Interrupt
+/// Remapping aufgesetzt ist.
+///
+/// Warum genau dort: `crate::selftest::run()` laeuft im x86-Hochlauf **vor**
+/// `dma_enforcer_init()`; dort ist die Tabelle noch nicht da, und ein Pruefer, der strukturell
+/// nichts sehen kann, ist kein Pruefer. Spaeter im Hochlauf naehme er einem Treiber Eintraege weg.
+#[cfg(feature = "selftest")]
+pub fn irte_selbsttest() -> IrteVergabeBericht {
+    let tabelle = IRT[0].load(Ordering::Acquire);
+    let aktiv = irte_vergabe_moeglich();
+    // Zwei synthetische Quellen: die Aussage ist „zwei QUELLEN werden getrennt", und die Einheit
+    // prueft die SID im Eintrag -- nicht, ob dort ein Geraet steckt. Ein echtes Geraet zu nehmen
+    // hiesse, ihm im Hochlauf eine IRTE wegzunehmen.
+    let (Some(sid_a), Some(sid_b)) = (
+        super::irte::sid_from_bdf(0, 0x1e, 0),
+        super::irte::sid_from_bdf(0, 0x1e, 1),
+    ) else {
+        return IrteVergabeBericht::default();
+    };
+    let mut hw = IrtHardware { tabelle };
+    let mut a = IRTE_ALLOC.lock();
+    super::irte::selbsttest(&mut hw, &mut a, aktiv, sid_a, sid_b, 0x70)
 }
 
 /// Globale Invalidierung des Kontext-Caches (Gegenstück zum `CMD_SYNC`-Round-Trip auf ARM):

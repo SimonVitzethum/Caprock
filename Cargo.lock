@@ -59,6 +59,7 @@ version = "0.0.1"
 dependencies = [
  "caprock-abi",
  "caprock-cap",
+ "caprock-dma",
  "caprock-dtb",
  "caprock-hal",
  "caprock-ipc",

@@ -113,6 +113,28 @@ pub enum LoaderError {
         /// Die im Kopf angegebene Eintragsbreite (dieser Kernel kennt [`manifest::ENTRY_LEN`]).
         entry_len: u32,
     },
+    /// **Ein PT_LOAD-Segment beginnt auf einer nicht seitenausgerichteten `p_vaddr`** — der
+    /// Kernel kann es nie abbilden, also wird es gar nicht erst angenommen.
+    ///
+    /// ## Warum das eine ELF-Prüfung ist und keine Kernel-Ausrede
+    ///
+    /// `vspace_map_page_at` weist eine krumme VA ab (`va % PAGE != 0`, in **beiden** HALs) — das
+    /// ist keine Bequemlichkeit, sondern die Bedingung, unter der eine Seitentabelle überhaupt
+    /// einen Eintrag hat. Ein Image mit krummem Segment ist damit nicht „schwierig", sondern
+    /// **unabbildbar**. Es trotzdem anzunehmen heisst, eine Absage bis tief in den Ladepfad zu
+    /// verschieben, wo sie zwischen echten Ressourcenmängeln steht.
+    ///
+    /// ## Was das gekostet hat, bevor es die Prüfung gab
+    ///
+    /// `wasmhost` trug am 2026-08-10 ein RW-Segment auf `0x2004_6700` (`.bss : ALIGN(8)`, und es
+    /// war das einzige Programm mit schreibbarem Segment ohne `.data`). Der Ladepfad meldete
+    /// `NoResources` und benannte fälschlich „Speicher für eine Seitentabelle, 4096 Byte" — eine
+    /// Zahl, die als **Literal im Quelltext** stand. Zwei Diagnoserunden gingen an die Frage,
+    /// welcher Speicher knapp sei; knapp war keiner.
+    UnalignedSegment {
+        /// Die krumme virtuelle Adresse, damit die Absage nicht nur sagt DASS, sondern WELCHE.
+        vaddr: u64,
+    },
     /// Kernel-Ressourcen erschöpft (VSpace/ASID/RAM/TCB/PD) beim Laden.
     NoResources,
 }

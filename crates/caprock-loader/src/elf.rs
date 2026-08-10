@@ -8,6 +8,10 @@
 
 use crate::LoaderError;
 
+/// Seitengroesse beider Architekturen (4 KiB). Die Bedingung, unter der ein Segment ueberhaupt
+/// abbildbar ist -- s. `LoaderError::UnalignedSegment`.
+const PAGE_SIZE: u64 = 4096;
+
 // --- ELF64-Konstanten (nur die benötigten) ---
 const EI_NIDENT: usize = 16;
 const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
@@ -139,6 +143,14 @@ impl<'a> ElfImage<'a> {
         let vaddr = rd_u64(p, 16).ok_or(LoaderError::OutOfBounds)?;
         let filesz = rd_u64(p, 32).ok_or(LoaderError::OutOfBounds)? as usize;
         let memsz = rd_u64(p, 40).ok_or(LoaderError::OutOfBounds)? as usize;
+        // **Krumme Segmentadresse: BENANNT abgewiesen, und zwar HIER** (2026-08-10). Der Kernel
+        // kann ein PT_LOAD, dessen `p_vaddr` nicht seitenausgerichtet ist, nie abbilden -- die
+        // Bedingung `va % PAGE != 0` steht in beiden HALs. Bis zu diesem Tag nahm der Lader ein
+        // solches Image an, und die Absage fiel erst tief im Ladepfad, wo sie zwischen echten
+        // Ressourcenmaengeln stand und faelschlich als einer gemeldet wurde.
+        if vaddr % PAGE_SIZE != 0 {
+            return Err(LoaderError::UnalignedSegment { vaddr });
+        }
         if memsz < filesz {
             return Err(LoaderError::BadElf);
         }
@@ -268,6 +280,45 @@ mod tests {
         let mut raw = build_elf(0x1000, &[(0x1000, PF_R, b"a", 0)]);
         raw[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
         assert_eq!(ElfImage::parse(&raw).unwrap_err(), LoaderError::BadElf);
+    }
+
+    /// **Ein krummes Segment wird abgewiesen, und die Absage nennt die ADRESSE.**
+    ///
+    /// Der Fall, den `wasmhost` am 2026-08-10 gekostet hat: `.bss` auf `0x..6700`, weil das
+    /// Linkerskript `ALIGN(8)` sagte und das Programm keine `.data` hatte. Der Lader nahm das
+    /// Image an, und die Absage fiel erst tief im Ladepfad -- als angeblicher Ressourcenmangel.
+    #[test]
+    fn unaligned_segment_rejected_by_name() {
+        let raw = build_elf(0x1700, &[(0x1700, PF_R | PF_W, b"abcdefgh", 0)]);
+        assert_eq!(
+            ElfImage::parse(&raw).unwrap_err(),
+            LoaderError::UnalignedSegment { vaddr: 0x1700 }
+        );
+    }
+
+    /// **Die Gegenrichtung, und ohne sie belegt der Test oben nichts.** Dieselbe Form, nur
+    /// ausgerichtet, muss durchgehen -- sonst wäre „wird abgewiesen" auch von einem Parser wahr,
+    /// der gar nichts mehr annimmt.
+    #[test]
+    fn aligned_segment_accepted() {
+        let raw = build_elf(0x1000, &[(0x1000, PF_R | PF_W, b"abcdefgh", 0)]);
+        let img = ElfImage::parse(&raw).expect("ausgerichtetes Segment muss durchgehen");
+        assert_eq!(img.entry(), 0x1000);
+    }
+
+    /// **Die Absage ist von den anderen UNTERSCHEIDBAR** — sonst hätten die beiden Tests oben
+    /// auch dann bestanden, wenn alle Ablehnungen denselben Wert trügen. Genau diese Sprechprobe
+    /// hat am 2026-08-10 im Manifest-Parser gefehlt.
+    #[test]
+    fn unaligned_differs_from_bad_elf() {
+        let krumm = build_elf(0x1700, &[(0x1700, PF_R, b"abcd", 0)]);
+        let mut kaputt = build_elf(0x1000, &[(0x1000, PF_R, b"abcdefgh", 0)]);
+        let base = EHDR_LEN + 40;
+        kaputt[base..base + 8].copy_from_slice(&4u64.to_le_bytes()); // memsz < filesz
+        let a = ElfImage::parse(&krumm).unwrap_err();
+        let b = ElfImage::parse(&kaputt).unwrap_err();
+        assert_ne!(a, b, "krummes Segment und kaputtes ELF muessen unterscheidbar sein");
+        assert_eq!(b, LoaderError::BadElf);
     }
 
     #[test]

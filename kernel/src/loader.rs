@@ -902,6 +902,24 @@ pub fn client_notification_of(program_id: u32) -> Option<usize> {
 /// Wie viele Client-PDs eine Notification bekommen haben, und wie viele **verlorengingen**.
 /// Für den Bericht: `(0, 0)` ist von „es gab keine Clients" nicht zu unterscheiden, und genau
 /// diese Ununterscheidbarkeit hat den Fehler oben getragen.
+/// Die Notification-**Ids** der Client-PDs, fuer den Bericht: `(program_id, ntfn_id)`.
+///
+/// Ohne die Ids ist eine **Id-Kollision** nicht sichtbar -- und genau die steht als Verdacht im
+/// Raum, seit die ROOT-Notification einmal das CLIENT-Badge trug (`0x1000_0000_0000`, Bit 44).
+/// Eine Zahl, die zweimal vorkommt, ist eine Antwort; „das Badge stimmt nicht" ist keine.
+pub fn client_notification_ids(out: &mut [(u32, usize)]) -> usize {
+    let mut n = 0;
+    for (pid, raw) in CLIENT_NTFN_PID.iter().zip(CLIENT_NTFN_ID.iter()) {
+        let p = pid.load(Ordering::Relaxed);
+        let v = raw.load(Ordering::Relaxed);
+        if p != 0 && v != 0 && n < out.len() {
+            out[n] = (p, (v - 1) as usize);
+            n += 1;
+        }
+    }
+    n
+}
+
 pub fn client_notification_stats() -> (usize, u64) {
     let n = CLIENT_NTFN_PID
         .iter()

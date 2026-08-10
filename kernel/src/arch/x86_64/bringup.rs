@@ -2547,6 +2547,27 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
     // der Dateisystem-PD, der `drv`-Ablauf wartete auf ein Badge an einem fremden Objekt, und
     // `drv`/`blkdev`/`part` fielen aus, ohne dass am Treiber etwas kaputt war.
     let (clients, ntfn_verloren) = crate::loader::client_notification_stats();
+    {
+        // **Die IDs, nicht nur die Zahl.** Eine Id-Kollision (Root und ein Client auf demselben
+        // Objekt) erklaerte alles auf einmal: warum das Root-Badge einmal das CLIENT-Bit trug und
+        // warum Badges „nicht ankommen". Ohne die Ids ist das nicht entscheidbar.
+        let mut ids = [(0u32, 0usize); 8];
+        let n = crate::loader::client_notification_ids(&mut ids);
+        print!("clientn : Objekt-Ids: root=");
+        match crate::loader::root_notification() {
+            Some(r) => print!("#{r}"),
+            None => print!("keine"),
+        }
+        print!(" driver=");
+        match crate::loader::driver_notification() {
+            Some(d) => print!("#{d}"),
+            None => print!("keine"),
+        }
+        for &(pid, id) in ids.iter().take(n) {
+            print!(" · Programm {pid}=#{id}");
+        }
+        println!(" (zwei gleiche Zahlen = EIN Objekt fuer zwei Rollen -- dann sind alle Badges an derselben Stelle)");
+    }
     println!(
         "clientn : {clients} Client-PD(s) mit EIGENER Ablage, {ntfn_verloren} verloren (muss 0 \
          sein). Verschluesselt ist die Ablage mit der program_id, nicht mit der ROLLE -- „Client\" \

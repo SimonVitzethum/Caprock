@@ -1345,11 +1345,28 @@ Die Aufteilung, die daraus folgt:
       erreichbaren Kriterium liefe sonst **jeder** Lade-Suite-Lauf in den Watchdog — dieselbe
       Abwägung wie bei `fp` bis zum 2026-08-09: erst die Ursache, dann das Gatter.
 
-- [ ] **Als Nächstes, und es ist EINE Frage für beide:** warum kommt ein `SIGNAL` aus einer
-      **geladenen** PD nicht an, während die Treiber-PD signalisiert? Das Orakel ist billig
-      (`Root-Task lief: true`), der Bereich ist bekannt (`94a92ea`..`a159b6b`), und der
-      Archiveintrag ist als Ursache bereits ausgeschlossen — es bleiben die 69 Zeilen `bringup.rs`
-      desselben Commits oder etwas, das erst danach dazukam. **Nicht raten: bisecten.**
+- [ ] **Als Nächstes, und es ist EINE Frage für beide.** Was gemessen ist, grenzt sie schon ein:
+
+      | | Objekt | Badge kommt an |
+      |---|---|---|
+      | `init` (dom 0, **ROOT**) | `#0` | **nein** |
+      | `hello` (dom 2, UserLand) | `#1` | **nein** |
+      | `fs` (dom 0, TrustedSas) | `#3` | **ja** (der `drv`-Ablauf wartet darauf und läuft weiter) |
+      | `virtio-blk` (Treiber) | `#4` | **ja** |
+      | `wasmhost` (dom 2, UserLand) | `#5` | **nein** |
+
+      **Die Objekt-Ids sind alle verschieden** — eine Id-Kollision ist damit ausgeschlossen, und
+      zwar gemessen, nicht überlegt (die Zeile `clientn : Objekt-Ids:` steht dafür im Bericht).
+      Die Vermutung war naheliegend, weil das Root-Badge in einem Lauf ausgerechnet das
+      **CLIENT**-Bit trug (`0x1000_0000_0000`); sie ist widerlegt.
+
+      Damit steht die Frage scharf: **`fs` läuft und meldet sich, `hello` und `wasmhost` nicht** —
+      und beide sind `UserLand`, also **isoliert**, während `fs` `TrustedSas` ist. `init` fällt
+      aus der Reihe (dom 0, aber Root und über einen anderen Ladepfad). Ob die isolierten PDs gar
+      nicht laufen oder nur ihr `SIGNAL` nicht ankommt, ist die nächste Trennung — und sie braucht
+      eine Sonde, die **ohne jede Cap** wirkt (ein Fault an einer erkennbaren Adresse), weil jede
+      Meldung über eine Cap genau den Pfad benutzt, der in Frage steht.
+      Orakel für den Bisect ist billig und schon da: `Root-Task lief: true`.
 
 - [~] **P1 — x86 MSI-X + IRTE: die KODIERUNG steht, die Vergabe fehlt** (2026-08-09).
       **Fertig:** `crates/sel4lake-hal/src/x86_64/irte.rs` — IRTE- und MSI-Adress-Kodierung als

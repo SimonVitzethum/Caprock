@@ -1437,8 +1437,15 @@ fn kapazitaet_kurve() {
         // Threads). Wer alle Prozesse aus einem Thread heraus erzeugt, trifft die Kernschranke,
         // nicht die Systemschranke -- und haelt sie fuer die Kapazitaet des Systems.
         let geparkt = if SCALE_ISOLIERT {
-            system::spawn_isolated_parked(kurven_arbeiter as *const () as usize, n, system::IDLE_PRIO)
-                .map(|(p, _region)| p)
+            // **EL0-Einsprung aus `.user_text`**, nicht der Kernel-Arbeiter -- s. dort. Mit dem
+            // falschen Einsprung faultet jeder einzelne Thread sofort, und die Kurve misst das
+            // Anlegen statt das Bestehen.
+            system::spawn_isolated_parked(
+                kurven_arbeiter_el0 as *const () as usize,
+                n,
+                system::IDLE_PRIO,
+            )
+            .map(|(p, _region)| p)
         } else {
             system::spawn_balanced_parked(kurven_arbeiter as *const () as usize, n, system::IDLE_PRIO)
         };
@@ -1461,21 +1468,32 @@ fn kapazitaet_kurve() {
             let (pds_u, pds_c, _, _, _, _) = system::vorrat_fuellstand();
             let (ps, _, po, _) = system::cap_peaks();
             let (cs, co) = system::cap_capacity();
+            // **Der Seitentabellen-Topf ueber wachsendes N** (C7). Er ist der Kandidat fuer „was
+            // reisst als naechstes", und bis heute hatte er keine Kurve: die SAS-Reihe fragt ihn
+            // strukturell nie (eine PD im globalen Adressraum bekommt keine eigene VSpace), die
+            // isolierte Reihe erschlaegt ihn mit der privaten 2-MiB-Region. Hier steht er als
+            // eigene Zahl daneben -- gezaehlt an der Quelle, nicht als RAM-Differenz.
+            let (_pt_raus, _pt_zur, pt_gehalten, pt_peak) = system::seitentabellen_topf();
             println!(
                 "kurve   : n={n} · PDs {pds_u}/{pds_c} · Threads {}/{} · Cap-Slots {ps}/{cs} · \
-                 Cap-Objekte {po}/{co} · freie VSpaces {} · freies RAM {} MiB (Start {} MiB, \
-                 verbraucht {} KiB je PD+Thread)",
+                 Cap-Objekte {po}/{co} · freie VSpaces {} · Seitentabellen {pt_gehalten} Rahmen \
+                 = {} KiB (Hoechststand {pt_peak}, {} Byte je Prozess) · freies RAM {} MiB \
+                 (Start {} MiB, verbraucht {} KiB je PD+Thread)",
                 system::thread_capacity() - system::threads_available(),
                 system::thread_capacity(),
                 system::free_vspaces(),
+                (pt_gehalten * 4096) >> 10,
+                (pt_gehalten * 4096) / (n as u64),
                 system::total_free() >> 20,
                 frei0 >> 20,
                 (frei0.saturating_sub(system::total_free())) / (n as u64) >> 10
             );
         }
     }
-    // Die benannte Ressource aus dem Ladepfad -- dieselbe Quelle, die `SYS_LOAD` befragt.
+    // Die benannte Ressource -- **seit 2026-08-10 auch von den `spawn_*`-Pfaden**, nicht mehr nur
+    // von `SYS_LOAD`. Vorher stand hier in JEDEM Abbruch `keiner`, auch bei 2 MiB freiem RAM.
     let (mcode, mbytes, mfrei) = system::lade_mangel();
+    let (pt_raus, pt_zur, pt_gehalten, pt_peak) = system::seitentabellen_topf();
     println!(
         "kurve   : ENDE bei n={n} von {SCALE_TARGET} -- Grund: {grund}. Zuletzt gemeldeter \
          Allokationsmangel: {} (angefordert {mbytes} Byte, frei waren {mfrei}). Freies RAM \
@@ -1492,17 +1510,96 @@ fn kapazitaet_kurve() {
         system::stack_bytes() >> 10,
         system::USER_KSTACK_SIZE >> 10
     );
+    println!(
+        "kurve   : Seitentabellen-Topf am Ende -- {pt_gehalten} Rahmen = {} KiB gehalten \
+         (Hoechststand {pt_peak}, {pt_raus} geholt / {pt_zur} zurueck), {} Byte je Prozess bei \
+         n={n}, {} belegte VSpaces. Die SAS-Reihe fragt diesen Topf STRUKTURELL nie (eine PD im \
+         globalen Adressraum bekommt keine eigene VSpace) -- steht hier eine Null bei n in den \
+         Tausenden, ist das ein Befund ueber den Aufbau und kein Messwert",
+        (pt_gehalten * 4096) >> 10,
+        if n > 0 { (pt_gehalten * 4096) / (n as u64) } else { 0 },
+        system::used_vspaces()
+    );
 }
 
-/// Arbeiter der Kapazitätskurve: sofort parken. Es geht um die **Verwaltung** vieler
-/// gleichzeitig existierender Prozesse, nicht um Rechenlast (dieselbe Wahl wie `scale_worker`
-/// auf aarch64).
+/// Arbeiter der Kapazitätskurve **für die SAS-Reihe**: ein KERNEL-Thread (Ring 0), der sofort
+/// parkt. Es geht um die **Verwaltung** vieler gleichzeitig existierender Prozesse, nicht um
+/// Rechenlast (dieselbe Wahl wie `scale_worker` auf aarch64).
 #[cfg(feature = "selftest")]
 extern "C" fn kurven_arbeiter(_arg: usize) -> ! {
     invoke(sys::PARK, 0, [0; 4], 0);
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// Arbeiter der Kapazitätskurve **für die ISOLIERTE Reihe** — und der Unterschied ist keine
+/// Formsache, sondern war ein Messfehler.
+///
+/// Eine isolierte PD bekommt einen **EL0**-Thread. `kurven_arbeiter` liegt in `.text`, also in
+/// supervisor-only Seiten: der Thread faultet an seiner eigenen Einsprungadresse, bevor er eine
+/// einzige Instruktion ausführt. Gemessen am 2026-08-10: **228 `el0-trap`-Zeilen in einem Lauf,
+/// der 224 isolierte PDs anlegt** — jede einzelne. Am Ende der Kurve standen **0 belegte
+/// VSpaces**, der Seitentabellen-Topf war auf 15 Rahmen zurückgefallen (Höchststand 215 bei
+/// n=224), und die Zahl „3040 isolierte Prozesse" der C7-Tabelle war in Wahrheit „3040 mal eine
+/// PD angelegt, deren Thread sofort starb".
+///
+/// Das ist die Falle aus `CLAUDE.md` wörtlich („Ring-3-Code gehört in `.user_text`, und die
+/// Fehlermeldung dafür sieht aus wie ein Kernelfehler") — nur hat sie hier keine Prüfzeile rot
+/// gefärbt, sondern eine **Kapazitätszahl** erzeugt, die etwas anderes misst als ihr Name sagt.
+///
+/// Der `int 0x80` steht direkt hier: eine Ring-3-Funktion darf keine Kernel-Funktion aufrufen
+/// (`invoke` liegt in `.text`), sonst wandert der Fault nur eine Ebene tiefer.
+#[link_section = ".user_text"]
+#[cfg(feature = "selftest")]
+extern "C" fn kurven_arbeiter_el0(_arg: usize) -> ! {
+    // SAFETY: `int 0x80` ist der für Ring 3 freigegebene Syscall-Vektor (s. `ring3_worker`).
+    // `PARK` braucht KEINE Cap und keine PD — der Dispatch kehrt vor der Cap-Auflösung zurück.
+    unsafe {
+        core::arch::asm!("int 0x80", in("rax") sys::PARK, in("rdi") 0u64,
+                         lateout("rax") _, lateout("rdi") _, clobber_abi("sysv64"));
+    }
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// **C7: der SEITENTABELLEN-TOPF — die drei Konjunkte, an EINER Stelle.**
+///
+/// Der Topf wird an der Quelle gezählt (`system::pt_rahmen`), nicht als Differenz des freien RAM
+/// — eine Differenz misst Kernel-Stacks, private Regionen und Segmente mit und beantwortet die
+/// Frage nach *diesem* Topf so wenig wie `rx_used` die Frage nach angekommenen Daten.
+///
+/// * `raus > 0` — **Sprechprobe der Allokationsseite.** Ohne sie bestünde die Zeile auch ein
+///   System, in dem gar nicht gezählt wird; eine Null wäre dann von „keine Tabellen nötig" nicht
+///   zu unterscheiden.
+/// * `zurueck > 0` — **Sprechprobe der Freigabeseite.** Der Abbau kommt in jedem Lauf vor
+///   (Farbtest und Churn-Test bauen isolierte PDs ab); wird die Buchung dort entfernt, fällt das
+///   hier auf und nicht erst, wenn der Füllstand unerklärlich wächst.
+/// * `raus >= zurueck` — die **Bilanz, und der schärfste der vier.** Es kann nichts zurückkommen,
+///   was nie herausgegeben wurde. Die Freigabeseite zählt, was die Einsammler des HAL
+///   **tatsächlich** liefern; fehlt die Buchung an *irgendeiner* der acht Allokationsstellen, ist
+///   die Rückgabe größer als die Ausgabe, sobald die betroffene VSpace abgebaut wird. Gemessen in
+///   der Hauptsuite: 17 raus / 17 zurück — der Topf schließt auf null, und das ist zugleich die
+///   erste Leckprüfung, die dieser Topf je hatte.
+/// * `gehalten >= PT_RAHMEN_JE_VSPACE * used_vspaces` — der **Quervergleich gegen eine zweite,
+///   unabhängige Buchführung** (die `VSPACES`-Tabelle). Jede belegte VSpace hält mindestens ihre
+///   L1 und ihre L2.
+///   **Ehrlich dazu:** in der HAUPTSUITE ist dieser Konjunkt gehaltlos — dort sind am Ende null
+///   VSpaces belegt, die Aussage lautet `0 >= 0`. Er beißt in der LADE-Suite, wo geladene PDs
+///   leben. Ein Konjunkt, der in einer Suite nichts prüft, muss das sagen; sonst liest sich seine
+///   grüne Farbe wie ein Beleg.
+///
+/// **Wieviel Luft der Quervergleich hat:** x86 hält *drei* Basisrahmen je VSpace (PML4, PDPT, PD)
+/// plus die L3-Tabellen, verlangt werden zwei — der Abstand ist mindestens ein Rahmen je VSpace.
+/// Der Grund für die Untergrenze statt der genauen Zahl ist ein Rennen: `create_vspace_masked`
+/// belegt den ASID-Slot, **bevor** es die Rahmen holt. Eine Gleichheit wäre in genau diesem
+/// Fenster falsch, ohne dass etwas kaputt ist.
+#[cfg(feature = "selftest")]
+fn ptab_urteil() -> (bool, bool, bool, bool) {
+    let (raus, zurueck, gehalten, _peak) = system::seitentabellen_topf();
+    let noetig = system::PT_RAHMEN_JE_VSPACE * system::used_vspaces() as u64;
+    (raus > 0, zurueck > 0, raus >= zurueck, gehalten >= noetig)
 }
 
 /// **Das Urteil der `vorrat`-Zeile — an EINER Stelle**, damit `all_done` und der Bericht nicht
@@ -1518,6 +1615,107 @@ extern "C" fn kurven_arbeiter(_arg: usize) -> ! {
 fn vorrat_urteil() -> bool {
     let (pd_calls, pd_scan, _, owner_fehlt) = system::pd_scan_bilanz();
     pd_scan == 0 && pd_calls > 0 && owner_fehlt == 0
+}
+
+/// Ergebnis der EINMALIGEN Seitentabellen-Messung: Bit 63 = gemessen, Bit 0 = Urteil.
+///
+/// **Einmalig und nicht in `all_done`**, weil `used_vspaces()` die `VSPACES`-Tabelle sperrt und
+/// über 4096 Einträge läuft — in einer Schleife, die Milliarden Umdrehungen macht, wäre das ein
+/// Prüfer, der die Sache aushungert, die er beobachtet (dieselbe Überlegung wie bei der
+/// Notbremse vor `reap()`).
+#[cfg(feature = "selftest")]
+static PTAB_MESS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "selftest")]
+fn ptab_messen() -> bool {
+    if PTAB_MESS.load(Ordering::Acquire) & (1 << 63) != 0 {
+        return PTAB_MESS.load(Ordering::Acquire) & 1 != 0;
+    }
+    let (a, b, c, d) = ptab_urteil();
+    let ok = a && b && c && d;
+    PTAB_MESS.store((1 << 63) | u64::from(ok), Ordering::Release);
+    ok
+}
+
+/// **C7: ist der Mangel-Melder auf den `spawn_*`-Pfaden überhaupt SPRECHFÄHIG?**
+///
+/// Bis zum 2026-08-10 meldete `lade_mangel()` in **jedem** Abbruch der Kapazitätskurve
+/// `keiner (der Fehlschlag lag NICHT an einer Ressource)` — auch dort, wo das freie RAM
+/// nachweislich auf 2 MiB stand. Der Grund war kein Messfehler, sondern eine Lücke: der
+/// Benennungsmechanismus hing allein am `SYS_LOAD`-Pfad, die `spawn_*`-Pfade gaben ein nacktes
+/// `None`. Eine Kurve, die zählt, ohne die Ressource zu nennen, ist eine Zählung und kein Beleg.
+///
+/// **Warum eine provozierte Anforderung und nicht eine Beobachtung.** In einem gesunden Lauf
+/// scheitert kein `spawn_*` — ein Prüfer, der auf einen Fehlschlag wartet, wäre in jedem grünen
+/// Lauf stumm und damit von einem abgeklemmten nicht zu unterscheiden. Deshalb wird der Allokator
+/// hier **wirklich gefragt** und sagt **wirklich nein**: eine leere Farbmaske hat keine Seite, die
+/// passt. Der Weg dorthin ist der reguläre (`spawn_isolated_colored` → der EL0-Kernel-Stack ist
+/// die erste Anforderung des Pfades), nicht ein Testeinsprung daneben.
+///
+/// **Warum vorher vergiftet wird.** Ohne die Marke wäre „der Pfad hat geschwiegen" von „der Pfad
+/// hat `MANGEL_KEINER` geschrieben" nicht zu unterscheiden, und beides sähe wie `0` aus. Mit der
+/// Marke ist Schweigen ein eigener, benannter Ausgang.
+///
+/// Drei Konjunkte:
+/// * `abgewiesen` — **Positivkontrolle der Provokation.** Gelingt der Spawn, ist nichts gemessen;
+///   dann sagt auch ein grüner Code nichts. (Der Thread wird in diesem Fall abgebaut, sonst
+///   verschöbe die Probe die Baseline der folgenden Zeilen.)
+/// * `benannt` — der gemeldete Code ist der des angefragten Topfes, nicht `MANGEL_KEINER` und
+///   nicht die Marke.
+/// * `menge` — die gemeldete Byte-Zahl ist die **angeforderte**. Das ist der Konjunkt gegen die
+///   Falle vom Vormittag: `mangel(MANGEL_SEITENTABELLE, 4096)` stand als Literal da, wo der
+///   Allokator nie gefragt worden war. Verglichen wird gegen `USER_KSTACK_SIZE` — dieselbe
+///   Konstante, die in den Allokator geht, nicht eine zweite Rechnung daneben.
+///
+/// **Was diese Zeile NICHT belegt:** dass jede der rund zwanzig neuen Meldestellen die richtige
+/// Ressource nennt. Sie belegt, dass der Mechanismus auf einem `spawn_*`-Pfad greift und die
+/// Menge aus dem Aufruf trägt. Die übrigen Stellen sind gegengelesen, nicht gemessen.
+#[cfg(feature = "selftest")]
+static MANGEL_MESS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "selftest")]
+fn mangel_messen() -> bool {
+    if MANGEL_MESS.load(Ordering::Acquire) & (1 << 63) != 0 {
+        return MANGEL_MESS.load(Ordering::Acquire) & 1 != 0;
+    }
+    let ok = mangel_messen_inner();
+    MANGEL_MESS.store((1 << 63) | u64::from(ok), Ordering::Release);
+    ok
+}
+
+/// Ergebnis der Mangel-Sprechprobe für den Bericht: `(abgewiesen, code, bytes, farben)`.
+#[cfg(feature = "selftest")]
+static MANGEL_PROBE: caprock_sync::SpinLock<(bool, u32, u64, u32)> =
+    caprock_sync::SpinLock::new((false, 0, 0, 0));
+
+#[cfg(feature = "selftest")]
+fn mangel_messen_inner() -> bool {
+    let farben = crate::colors::count();
+    // **Eine benannte Absage, kein Schweigen.** Bei einer Farbe ist die leere Maske wirkungslos
+    // (`alloc_colored` nimmt dann den ungefärbten Weg) — die Provokation griffe nicht, und ein
+    // grünes Urteil wäre eine Behauptung über einen Pfad, der nie gelaufen ist.
+    if farben <= 1 {
+        *MANGEL_PROBE.lock() = (false, system::MANGEL_VERGIFTET, 0, farben);
+        return false;
+    }
+    system::mangel_vergiften();
+    let r = system::spawn_isolated_colored(
+        kurven_arbeiter as *const () as usize,
+        0,
+        system::IDLE_PRIO,
+        caprock_mem::ColorMask::EMPTY,
+    );
+    let (code, bytes, _frei) = system::lade_mangel();
+    let abgewiesen = r.is_none();
+    // Wider Erwarten entstanden? Dann sofort abbauen — eine Probe, die Ressourcen liegen lässt,
+    // kippt die baseline-empfindlichen Zeilen hinter ihr.
+    if let Some((tid, _, _)) = r {
+        system::destroy_isolated(tid);
+    }
+    *MANGEL_PROBE.lock() = (abgewiesen, code, bytes, farben);
+    abgewiesen
+        && code == system::MANGEL_KERNEL_STACK
+        && bytes == system::USER_KSTACK_SIZE as u64
 }
 
 /// **Z22 P2 + Z23 S1: zwei Threads in EINER PD — gemessen an der Wirkung.**
@@ -3449,6 +3647,12 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             // C4/A3: die Fuellstands- und O(n)-Zeile gattert ebenfalls -- sonst waere sie genau
             // die Sorte Zeile, die niemand liest (dieselbe Begruendung wie bei B-4.2).
             ("vorrat", vorrat_urteil()),
+            // C7: beide gattern von Anfang an. Ihre Kriterien sind erreichbar und gegen die
+            // WIRKUNG formuliert (gezaehlte Rahmen; eine provozierte, wirklich abgewiesene
+            // Anforderung) -- nicht gegen eine Zahl, die vom Zeitpunkt abhaengt. Eine gruene
+            // Zeile, die nichts gattert, waere der `pdbind`-Fehler von neuem.
+            ("ptab", PTAB_MESS.load(Ordering::Acquire) & 1 != 0),
+            ("mangel", MANGEL_MESS.load(Ordering::Acquire) & 1 != 0),
             // **Seit dem 2026-08-09 gattert `fp` wirklich.** Vorher stand die Zeile bewusst
             // draussen, weil ihr Kriterium („alle 64 Abgaben") unerreichbar war und die Suite
             // dauerhaft rot gefaerbt haette. Mit einem erreichbaren Kriterium waere ein
@@ -3468,7 +3672,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 30;
+const DONE_FLAGS: usize = 32;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]
@@ -3535,13 +3739,24 @@ fn report_and_off(watchdog: bool) -> ! {
         system::PURGE_IPC_CALLS.load(Ordering::Relaxed),
         system::PURGE_IPC_ITER.load(Ordering::Relaxed),
     );
+    // **Der Seitentabellen-Topf gehoert IN diese Zeile** (C7). Er war der einzige der genannten
+    // Vorraete ohne Fuellstandsanzeige -- und ausgerechnet der, an dem `wasmhost` bei SECHS
+    // Programmen gescheitert ist. Gezaehlt an der Quelle (was der Allokator FUER Seitentabellen
+    // herausgibt), nicht als Differenz des freien RAM: eine Differenz misst Stacks, private
+    // Regionen und Segmente mit.
+    let (pt_raus, pt_zurueck, pt_gehalten, pt_peak) = system::seitentabellen_topf();
+    let pt_vspaces = system::used_vspaces();
     println!(
         "vorrat  : Fuellstaende -- PDs {pds_used}/{pds_cap} · Cap-Slots {peak_slots}/{cap_slots} \
          (Hoechststand) · Cap-Objekte {peak_objs}/{cap_objs} · Endpoints {eps_used}/{eps_cap} · \
          Notifications {nt_used}/{nt_cap} · Thread-Slots {thr_live}/{thr_cap} · freies RAM {} MiB \
-         · Kernel-Stacks {kstack_mib} MiB ({} KiB je Thread)",
+         · Kernel-Stacks {kstack_mib} MiB ({} KiB je Thread) · Seitentabellen {pt_gehalten} \
+         Rahmen = {} KiB (Hoechststand {pt_peak}; {pt_raus} raus / {pt_zurueck} zurueck; \
+         {pt_vspaces} belegte VSpaces, also {} Rahmen je VSpace)",
         system::total_free() >> 20,
-        system::USER_KSTACK_SIZE >> 10
+        system::USER_KSTACK_SIZE >> 10,
+        (pt_gehalten * 4096) >> 10,
+        if pt_vspaces > 0 { pt_gehalten / pt_vspaces as u64 } else { 0 }
     );
     println!(
         "vorrat  : O(n)-Bilanz (Iterationen, nicht Zeit) -- pd_of: {pd_calls} cap-aufloesende \
@@ -3578,6 +3793,55 @@ fn report_and_off(watchdog: bool) -> ! {
          Iterationszahlen oben sind die Grundlinie, gegen die eine Behebung zu messen ist)",
         if vorrat_ok { "ALL PASS" } else { "FAILURES" }
     );
+    // ------------------------------------------------------------------------------------------
+    // C7: das URTEIL ueber den Seitentabellen-Topf -- getrennt von `vorrat`, damit eine
+    // Gegenprobe genau EIN Konjunkt kippen kann und nicht die halbe Zeile.
+    // ------------------------------------------------------------------------------------------
+    {
+        let (a, b, c, d) = ptab_urteil();
+        let noetig = system::PT_RAHMEN_JE_VSPACE * pt_vspaces as u64;
+        println!(
+            "ptab    : Seitentabellen-Topf -- allokationsseite-spricht={a} ({pt_raus} Rahmen \
+             geholt) · freigabeseite-spricht={b} ({pt_zurueck} Rahmen zurueck) · \
+             bilanz={c} (raus >= zurueck: es kann nichts zurueckkommen, was nie herausgegeben \
+             wurde -- faellt, sobald EINE Allokationsstelle nicht mehr bucht) · \
+             quervergleich={d} ({pt_gehalten} gehalten >= {noetig} = {} je VSpace x \
+             {pt_vspaces} belegte; bei NULL belegten VSpaces sagt dieser Konjunkt nichts, und \
+             das gehoert dazu). Gemessen AN DER QUELLE (was der Allokator fuer eine \
+             Seitentabelle herausgibt), nicht als Differenz des freien RAM -- eine Differenz \
+             misst Stacks, private Regionen und Segmente mit",
+            system::PT_RAHMEN_JE_VSPACE
+        );
+        println!(
+            "ptab    : {} (C7: eine PD im GLOBALEN Adressraum zieht diesen Topf gar nicht, und \
+             in der isolierten Kurve erschlaegt ihn die private 2-MiB-Region -- deshalb hatte \
+             ausgerechnet der Topf, an dem `wasmhost` bei SECHS Programmen gescheitert ist, bis \
+             heute keine Anzeige)",
+            if ptab_messen() { "ALL PASS" } else { "FAILURES" }
+        );
+    }
+    // ------------------------------------------------------------------------------------------
+    // C7: die SPRECHPROBE des Mangel-Melders auf einem `spawn_*`-Pfad.
+    // ------------------------------------------------------------------------------------------
+    {
+        let (abgewiesen, code, bytes, farben) = *MANGEL_PROBE.lock();
+        println!(
+            "mangel  : Sprechprobe auf spawn_isolated_colored (leere Farbmaske, {farben} Farben) \
+             -- abgewiesen={abgewiesen} · Code {code} = {} · gemeldet {bytes} Byte (angefordert \
+             {} Byte) · vergiftet war {} (kein Kernelpfad schreibt diesen Code -- steht er noch \
+             da, hat der Pfad GESCHWIEGEN)",
+            system::mangel_name(code),
+            system::USER_KSTACK_SIZE,
+            system::MANGEL_VERGIFTET
+        );
+        println!(
+            "mangel  : {} (C7: bis zum 2026-08-10 meldete `lade_mangel()` in JEDEM Kurvenabbruch \
+             'keiner', auch bei 2 MiB freiem RAM -- der Melder hing allein am SYS_LOAD-Pfad. Die \
+             Zeile belegt, dass er auf einem spawn_*-Pfad greift UND die Menge aus dem Aufruf \
+             traegt, nicht aus einem Literal daneben)",
+            if mangel_messen() { "ALL PASS" } else { "FAILURES" }
+        );
+    }
 
     let ticks = hal::timer::ticks(0);
     let mut all_tick = true;
@@ -5139,6 +5403,11 @@ pub fn run(multiboot_info: u64) -> ! {
             park_messen(); // laeuft genau einmal; das Urteil steht danach in `all_done()`
             let _ = quiesce_messen(); // Z23 S1, ebenso einmalig
             let _ = pd_threads_messen(); // Z22 P2 + die Z23-S1-REPLY-Messung, ebenso einmalig
+            // C7. **Nicht in `all_done`**, obwohl beide dort gattern: `used_vspaces()` sperrt eine
+            // Tabelle mit 4096 Eintraegen, und die Mangel-Sprechprobe fragt den Allokator. Beides
+            // je Umdrehung waere ein Pruefer, der die Sache aushungert, die er beobachtet.
+            let _ = ptab_messen();
+            let _ = mangel_messen();
             if all_done(archive, None) {
                 report_and_off(false);
             }

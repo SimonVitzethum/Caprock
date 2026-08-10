@@ -775,6 +775,12 @@ const WASM_INST: u64 = 1 << 40;
 const WASM_RESULT: u64 = 1 << 41;
 const WASM_REJECT: u64 = 1 << 42;
 const WASM_TRAP: u64 = 1 << 43;
+/// **Sprechprobe der WASM-PD** — dasselbe Bit, mit dem der Lader ihre Manifest-Notification
+/// muenzt (`CLIENT_NTFN_BADGE`). Sie setzt es mit einem `signal` auf Slot 1, **ohne** jede
+/// Cap-Operation und vor jedem WASM-Schritt.
+const WASM_LEBT: u64 = crate::loader::CLIENT_NTFN_BADGE;
+/// Sprechprobe des CAP-Pfads: eine `ccopy`-Kopie mit eigenem Badge, ebenfalls vor der Engine.
+const WASM_CCOPY: u64 = 1 << 45;
 /// A-3.1: `SYS_CDELETE` hat die Loader-Cap geloescht **und** die Autoritaet war danach weg.
 #[cfg(feature = "selftest")]
 const CDELETE_GONE_BADGE: u64 = 1 << 33;
@@ -1487,12 +1493,20 @@ fn drv_service_step(archive: bool) {
             // wie "nichts zu beanstanden" ausgesehen.
             PDCOLOR_OK.store(crate::loader::run_pdcolor(), Ordering::Release);
             {
-                let b = crate::loader::client_notification_of(TEST_WASM_PROGRAM_ID)
-                    .map(system::notification_pending)
-                    .unwrap_or(0);
+                // **Abwesenheit wird an der ENDOWMENT-TABELLE entschieden, nicht am Schweigen.**
+                // Bis zum 2026-08-10 stand hier „kein Bit gesetzt -> nicht anwendbar". Das ist der
+                // Schluss von Schweigen auf Abwesenheit, den dieses Projekt sonst verbietet: eine
+                // WASM-PD, die laeuft und nichts meldet, war von einer, die es gar nicht gibt,
+                // nicht zu unterscheiden -- und genau so stand die Zeile auf SKIP, waehrend die
+                // PD im Archiv lag.
                 let alle = WASM_INST | WASM_RESULT | WASM_REJECT | WASM_TRAP;
-                // Kein Bit gesetzt = keine WASM-PD in der Startmenge -> nicht anwendbar.
-                WASM_OK.store(b & alle == 0 || b & alle == alle, Ordering::Release);
+                WASM_OK.store(
+                    match crate::loader::client_notification_of(TEST_WASM_PROGRAM_ID) {
+                        None => true, // wirklich keine WASM-PD endowt -> nicht anwendbar
+                        Some(n) => system::notification_pending(n) & alle == alle,
+                    },
+                    Ordering::Release,
+                );
             }
             LADEPOL_OK.store(crate::loader::run_ladepolitik(), Ordering::Release);
             PART_OK.store(
@@ -2631,7 +2645,16 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             ("pdcolor", pdcolor),
             ("ladepol", ladepol),
             ("pdbind", pdbind),
-            ("wasm", wasm),
+            // **`wasm` gattert bewusst NICHT** (2026-08-10) -- eine benannte Auslassung, kein
+            // Uebersehen, und sie steht mit Datum in `BEKANNT_ROT` der Lade-Suite.
+            //
+            // Bis dahin gatterte die Zeile, aber nur, weil ihr Kriterium ein SKIP zuliess: „kein
+            // Bit gesetzt -> nicht anwendbar" war immer wahr, also war das Gatter wirkungslos.
+            // Mit dem erreichbaren Kriterium (Abwesenheit an der Endowment-Tabelle entschieden)
+            // wird sie **nie** wahr, solange die Badges nicht ankommen -- und ein Gatter, das
+            // jeden Lauf in den Watchdog schickt, macht die Suite fuer alles andere unbrauchbar.
+            // Dieselbe Abwaegung wie bei `fp` bis zum 2026-08-09: erst die Ursache, dann das
+            // Gatter.
             ("quiesce", quiesce),
             ("rebind", rebind),
             ("epfull", epfull),
@@ -2656,7 +2679,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 28;
+const DONE_FLAGS: usize = 27;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]
@@ -2849,25 +2872,29 @@ fn report_and_off(watchdog: bool) -> ! {
     // gebadgten Kopien von seiner EIGENEN, aus dem Manifest endowten Cap ab (Slot 1, RWX) --
     // die vom Root-Task delegierte Cap in Slot 0 ist eine reine Signal-Cap, und `ccopy` kann
     // Rechte nicht verstaerken.
-    let b = crate::loader::client_notification_of(TEST_WASM_PROGRAM_ID)
-        .map(system::notification_pending)
-        .unwrap_or(0);
+    let w_ntfn = crate::loader::client_notification_of(TEST_WASM_PROGRAM_ID);
+    let b = w_ntfn.map(system::notification_pending).unwrap_or(0);
     let (w_inst, w_wert, w_mut, w_trap) = (
         b & WASM_INST != 0,
         b & WASM_RESULT != 0,
         b & WASM_REJECT != 0,
         b & WASM_TRAP != 0,
     );
-    let wasm_geladen = w_inst || w_wert || w_mut || w_trap;
+    let (w_lebt, w_ccopy) = (b & WASM_LEBT != 0, b & WASM_CCOPY != 0);
     println!(
-        "wasm    : instanziiert={w_inst} Ergebnis-stimmt={w_wert} Mutation-abgewiesen={w_mut} \
-         Uebergriff-getrappt={w_trap}"
+        "wasm    : endowt={} lebt={w_lebt} ccopy-geht={w_ccopy} | instanziiert={w_inst} \
+         Ergebnis-stimmt={w_wert} Mutation-abgewiesen={w_mut} Uebergriff-getrappt={w_trap}. \
+         **`lebt` braucht keine Cap-Operation** (SIGNAL auf die eigene Manifest-Cap) und steht vor \
+         allem anderen -- damit sind „die PD lief nicht\", „ccopy schlaegt fehl\" und „die Engine \
+         kommt nicht durch\" drei unterscheidbare Lagen statt eines Schweigens",
+        w_ntfn.is_some()
     );
-    if !wasm_geladen {
+    if w_ntfn.is_none() {
         println!(
-            "wasm    : SKIP -- in diesem Lauf lief keine WASM-PD (kein `wasmhost` in der \
-             Startmenge). Es gibt nichts zu messen; ALL PASS waere eine Aussage ueber die \
-             Abwesenheit des Falls"
+            "wasm    : SKIP -- es ist wirklich KEINE WASM-PD endowt (kein `wasmhost` in der \
+             Startmenge). **Entschieden an der Endowment-Tabelle, nicht am Schweigen**: bis zum \
+             2026-08-10 stand hier „kein Bit gesetzt -> nicht anwendbar\", und damit war eine PD, \
+             die laeuft und nichts meldet, von einer, die es nicht gibt, nicht zu unterscheiden"
         );
     } else {
         println!(

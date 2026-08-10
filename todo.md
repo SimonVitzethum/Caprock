@@ -1309,10 +1309,47 @@ Die Aufteilung, die daraus folgt:
       Zeile war syntaktisch gültig. Gefunden hat es erst eine Prüfung jeder geänderten Zeile auf
       „Here-String steht am Ende der grep-Invocation".
 
-- [ ] **Offen, davon abgetrennt: `wasm : SKIP`.** `wasmhost` liegt im Archiv, aber keins der vier
-      Badges kommt an — der Stand, den `a159b6b` selbst offen führt. Die Suite weigert sich zu
-      Recht, ein SKIP als Erfolg zu zählen. **Jetzt sichtbar**, statt unter 29 falschen FAILs zu
-      liegen.
+- [~] **`wasm`: die Zeile sagt jetzt, WELCHE Lage vorliegt — die Ursache ist NICHT gefunden.**
+      (2026-08-10) Vier Fehlerbilder waren in dasselbe Schweigen kollabiert; drei davon sind
+      seither getrennt, und der Rest ist eingegrenzt:
+
+      **Was die Sonde jetzt sagt** (`endowt=true lebt=false ccopy-geht=false | instanziiert=false …`):
+      * `lebt` — ein `SIGNAL` auf die **eigene Manifest-Cap**, **ohne jede Cap-Operation**, als
+        allererste Anweisung. Es kommt **nicht** an. Damit sind „ccopy schlägt fehl" und „die
+        Engine kommt nicht durch" als Erklärung **ausgeschlossen** — beide lägen dahinter.
+      * Die PD **faultet auch nicht**: alle drei `el0-trap`-Zeilen stammen von Threads, die
+        **kein Ladepfad erzeugt hat** (die kernel-eigenen Sonden). Dafür nennt die Fault-Zeile
+        seit heute das **Programm** statt nur eine Thread-Nummer.
+
+      **Der Befund, der grösser ist als der Eintrag: es trifft auch den ROOT-Task.**
+      `root : Notification-Badge 0x0 (Root-Task lief: false)` — und zwar **seit `a159b6b`**
+      (`94a92ea` meldete `true`). Aus den bereits vorhandenen Bisect-Protokollen abgelesen, ohne
+      einen einzigen zusätzlichen Lauf. **Treiber**-Badges kommen dabei an (`drv`/`blkdev` sind
+      grün), Badges aus **geladenen** PDs nicht. Das ist eine gemeinsame Ursache und keine
+      wasm-Eigenheit.
+      Isoliert gemessen: `wasmhost` aus dem Archiv zu nehmen macht `drv`/`blkdev`/`part` grün,
+      **nicht** aber das Root-Badge. Der Commit hat also **zwei** Wirkungen, und nur eine ist
+      behoben.
+
+      **Drei Prüfer waren dabei selbst kaputt** — alle drei von derselben Form:
+      1. `wasm` schloss von **Schweigen auf Abwesenheit** (`kein Bit gesetzt -> SKIP`). Jetzt wird
+         Abwesenheit an der **Endowment-Tabelle** entschieden; beide Richtungen gemessen
+         (`endowt=false` → SKIP, `endowt=true` → Urteil).
+      2. `root` druckt `Root-Task lief: false` und darunter `ALL PASS` — es **urteilt unabhängig
+         von der Zahl, die es gerade gedruckt hat**. Dritte Instanz des `pdbind`-Fehlers.
+      3. Das abgelegte Fehlerprotokoll war das des **letzten** Boots (ein Negativfall), nicht des
+         Hauptlaufs. Ich habe daraus zweimal eine Diagnose gelesen, die die Frage gar nicht
+         stellte. Die Suite legt jetzt **beide** ab.
+
+      **`wasm` gattert bewusst nicht** und steht mit Datum und Diagnose in `BEKANNT_ROT`. Mit dem
+      erreichbaren Kriterium liefe sonst **jeder** Lade-Suite-Lauf in den Watchdog — dieselbe
+      Abwägung wie bei `fp` bis zum 2026-08-09: erst die Ursache, dann das Gatter.
+
+- [ ] **Als Nächstes, und es ist EINE Frage für beide:** warum kommt ein `SIGNAL` aus einer
+      **geladenen** PD nicht an, während die Treiber-PD signalisiert? Das Orakel ist billig
+      (`Root-Task lief: true`), der Bereich ist bekannt (`94a92ea`..`a159b6b`), und der
+      Archiveintrag ist als Ursache bereits ausgeschlossen — es bleiben die 69 Zeilen `bringup.rs`
+      desselben Commits oder etwas, das erst danach dazukam. **Nicht raten: bisecten.**
 
 - [~] **P1 — x86 MSI-X + IRTE: die KODIERUNG steht, die Vergabe fehlt** (2026-08-09).
       **Fertig:** `crates/sel4lake-hal/src/x86_64/irte.rs` — IRTE- und MSI-Adress-Kodierung als

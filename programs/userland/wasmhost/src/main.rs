@@ -49,6 +49,23 @@ pub const WASM_INST: u64 = 1 << 40;
 pub const WASM_RESULT: u64 = 1 << 41;
 pub const WASM_REJECT: u64 = 1 << 42;
 pub const WASM_TRAP: u64 = 1 << 43;
+/// **Die Sprechprobe dieser PD** — Bit 44 ist das Badge, mit dem der Lader die Notification aus
+/// dem Manifest gemuenzt hat (`CLIENT_NTFN_BADGE`). Ein `signal` auf Slot 1 setzt es **ohne jede
+/// Cap-Operation**: es belegt „diese PD laeuft und kann signalisieren", und zwar bevor irgendein
+/// `ccopy` oder irgendein WASM-Schritt stattgefunden hat.
+///
+/// Ohne sie kollabierten vier grundverschiedene Fehlerbilder in dasselbe Schweigen: die PD lief
+/// nicht, `ccopy` schlug fehl, `signal` schlug fehl, oder die Engine kam nicht durch. Genau deshalb
+/// meldete die Pruefzeile **Abwesenheit** („keine WASM-PD in der Startmenge") statt eines
+/// Fehlschlags -- ein Schweigen, das wie ein bestandener Test aussieht.
+pub const WASM_LEBT: u64 = 1 << 44;
+/// **Die zweite Sprechprobe: geht `ccopy` ueberhaupt?** Eine Kopie mit eigenem Badge, gemacht
+/// BEVOR die Engine laeuft. Kommt dieses Badge an und die vier anderen nicht, liegt es an der
+/// Engine; kommt es nicht an, liegt es am Cap-Pfad. Das trennt die beiden Haelften, die sich
+/// vorher gegenseitig verdeckt haben.
+pub const WASM_CCOPY: u64 = 1 << 45;
+/// Slot fuer die `ccopy`-Sprechprobe (s. `N_INST` fuer die Begruendung der Slot-Wahl).
+const N_PROBE: u64 = 10;
 
 /// Cap-Slot der **eigenen**, aus dem Manifest endowten Notification.
 ///
@@ -194,6 +211,16 @@ fn fahre(wasm: &[u8]) -> Option<i32> {
 
 #[no_mangle]
 pub extern "C" fn _start(_arg: usize) -> ! {
+    // 0a. **Sprechprobe ohne jede Cap-Operation.** Slot 1 traegt die vom Manifest endowte
+    //     Notification mit ihrem Lader-Badge; ein `signal` darauf belegt „ich laufe und kann
+    //     signalisieren". Muss VOR allem anderen stehen -- eine Sprechprobe hinter dem
+    //     geprueften Pfad ist keine.
+    libsel4lake::signal(NTFN, 0);
+
+    // 0b. **Sprechprobe fuer den Cap-Pfad.** Eine Kopie mit eigenem Badge, bevor die Engine
+    //     ueberhaupt anlaeuft. Damit ist „ccopy geht nicht" von „die Engine kommt nicht durch"
+    //     unterscheidbar -- vorher sahen beide gleich aus.
+    melde(N_PROBE, WASM_CCOPY);
 
     // 1. Das gute Modul: instanziieren und rechnen lassen.
     if let Some(r) = fahre(MODUL_GUT) {

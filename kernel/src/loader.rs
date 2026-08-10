@@ -601,6 +601,67 @@ const MAX_SERVICES: usize = 4;
 static DRIVER_SERVICES: SpinLock<[Option<DriverService>; MAX_SERVICES]> =
     SpinLock::new([None; MAX_SERVICES]);
 
+/// Hoechstzahl der Manifest-Eintraege -- die Schranke aller Registertabellen hier ist damit
+/// **hergeleitet** und nicht erfunden.
+const MAN_MAX_ENTRIES: usize = sel4lake_loader::manifest::MAX_ENTRIES;
+
+/// **Welches PROGRAMM gehoert zu diesem Thread** — die Zuordnung, die einer Fehlermeldung erst
+/// eine Diagnose macht.
+///
+/// „`el0-trap: User-Thread 0x8 faultete (FAR=0x3c28000)`" nennt eine Zahl, die niemand zuordnen
+/// kann; drei solcher Zeilen sahen am 2026-08-10 gleich aus, waehrend genau eine davon die
+/// gesuchte war. Dasselbe Muster wie bei `manifest:   im Archiv liegen N B, die nicht parsen`:
+/// abgewiesen wird richtig, gesagt wird nichts.
+///
+/// Fassungsvermoegen = Hoechstzahl der Manifest-Eintraege, also **hergeleitet**; wer nicht
+/// hineinpasst, wird gezaehlt statt still vergessen.
+static PROG_TIDS: [core::sync::atomic::AtomicU32; MAN_MAX_ENTRIES] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAN_MAX_ENTRIES];
+/// Rohe `ThreadId` zum Eintrag darueber, `+1` (damit `0` = „frei" bleibt; Slot 0/Generation 0 ist
+/// eine gueltige `ThreadId`).
+static PROG_TID_RAW: [AtomicU64; MAN_MAX_ENTRIES] =
+    [const { AtomicU64::new(0) }; MAN_MAX_ENTRIES];
+/// Nicht eingetragene Zuordnungen. Heute unerreichbar (s. o.) -- gezaehlt, weil eine Schranke,
+/// deren Ueberlauf niemand benennt, kein Schutz ist (D11).
+static PROG_TID_LOST: AtomicU64 = AtomicU64::new(0);
+
+/// Zuordnung eintragen. Ein Programm kann im Betrieb neu geladen werden (Hot-Reload) -- dann
+/// ersetzt der neue Thread den alten unter derselben `program_id`.
+pub fn record_program_thread(program_id: u32, tid: ThreadId) {
+    for (pid, raw) in PROG_TIDS.iter().zip(PROG_TID_RAW.iter()) {
+        let cur = pid.load(Ordering::Relaxed);
+        if cur == program_id || cur == 0 {
+            pid.store(program_id, Ordering::Relaxed);
+            raw.store(tid.to_raw() + 1, Ordering::Relaxed);
+            return;
+        }
+    }
+    PROG_TID_LOST.fetch_add(1, Ordering::Relaxed);
+}
+
+/// **Zu welchem Programm gehoert dieser Thread?** `None` = keine Zuordnung bekannt (Kernel-Thread,
+/// Testfaden, oder ein Thread, den kein Ladepfad erzeugt hat) -- und das heisst *unbekannt*, nicht
+/// *keins*.
+pub fn program_of_thread(tid: ThreadId) -> Option<u32> {
+    let ziel = tid.to_raw() + 1;
+    PROG_TIDS
+        .iter()
+        .zip(PROG_TID_RAW.iter())
+        .find(|(_, raw)| raw.load(Ordering::Relaxed) == ziel)
+        .map(|(pid, _)| pid.load(Ordering::Relaxed))
+}
+
+/// Wie viele Zuordnungen bekannt sind und wie viele verlorengingen.
+pub fn program_thread_stats() -> (usize, u64) {
+    (
+        PROG_TIDS
+            .iter()
+            .filter(|p| p.load(Ordering::Relaxed) != 0)
+            .count(),
+        PROG_TID_LOST.load(Ordering::Relaxed),
+    )
+}
+
 /// Der **eindeutige** Treiber-Dienst — `None`, wenn es keinen oder **mehrere** gibt.
 ///
 /// „Mehrere" liefert bewusst `None` und nicht „den ersten": eine Auswahl, die niemand
@@ -800,7 +861,6 @@ pub const CLIENT_NTFN_BADGE: u64 = 1 << 44;
 /// (D11), sondern ein Loch.
 ///
 /// `0` in der Programm-Spalte heißt „frei" — `program_id` 0 vergibt kein Manifest.
-const MAN_MAX_ENTRIES: usize = sel4lake_loader::manifest::MAX_ENTRIES;
 static CLIENT_NTFN_PID: [core::sync::atomic::AtomicU32; MAN_MAX_ENTRIES] =
     [const { core::sync::atomic::AtomicU32::new(0) }; MAN_MAX_ENTRIES];
 /// Zugehörige Notification-Id, `+1` (damit `0` = „keine" bleibt).
@@ -1376,8 +1436,12 @@ pub fn load_image(
     // Der erste Anlauf stellte nur `load_program_into_pd` um; `hello` kommt aber ueber DIESEN Weg,
     // und die `pdcolor`-Zeile meldete daraufhin SKIP. Dass sie SKIP meldete und nicht ALL PASS,
     // ist der Grund, warum es aufgefallen ist.
-    crate::system::load_elf_mit(&img, domain, endow, boot_arg, ladepolitik(prog.program_id))
-        .ok_or(LoaderError::NoResources)
+    // Zuordnung Thread -> Programm auf BEIDEN Ladepfaden eintragen, aus demselben Grund wie das
+    // A-4.4-Gate und die Ladepolitik daneben: was nur an einem Weg haengt, ist am anderen weg.
+    let r = crate::system::load_elf_mit(&img, domain, endow, boot_arg, ladepolitik(prog.program_id))
+        .ok_or(LoaderError::NoResources)?;
+    record_program_thread(prog.program_id, r.0);
+    Ok(r)
 }
 
 /// Ein Programm in eine **vor-erstellte** PD laden (ext-26, L3) — fuer HardwareLand-Backends
@@ -1395,8 +1459,10 @@ pub fn load_program_into_pd(
     }
     iface_gate(prog.program_id)?; // A-4.4 -- gilt auf BEIDEN Ladepfaden, sonst ist er umgehbar
     let img = ElfImage::parse(prog.elf)?;
-    crate::system::load_into_pd_mit(&img, pd, endow, boot_arg, ladepolitik(prog.program_id))
-        .ok_or(LoaderError::NoResources)
+    let tid = crate::system::load_into_pd_mit(&img, pd, endow, boot_arg, ladepolitik(prog.program_id))
+        .ok_or(LoaderError::NoResources)?;
+    record_program_thread(prog.program_id, tid);
+    Ok(tid)
 }
 
 /// **Integritaets-/Trust-Gate** (ADR 0011 §7 + ADR 0014, ext-28): darf dieses Image geladen werden?

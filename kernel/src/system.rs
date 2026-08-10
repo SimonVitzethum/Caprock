@@ -866,10 +866,20 @@ fn el0_fault(frame: *mut TrapFrame, esr: u64, far: u64) -> *mut TrapFrame {
             // Adressraumtrennung hat einen Fremd-/unmapped-Zugriff verhindert.
             ISO_FAULTS.fetch_add(1, Ordering::Release);
         }
-        println!(
-            "el0-trap: User-Thread {:#x} faultete (EC={ec:#04x} FAR={far:#018x}) -> beendet, Kernel laeuft weiter",
-            tid.to_raw()
-        );
+        // **Wer** faultete, nicht nur welche Zahl. Drei Zeilen „User-Thread 0x8 faultete" sahen
+        // am 2026-08-10 gleich aus, waehrend genau eine davon die gesuchte war -- eine
+        // Fehlermeldung ohne Subjekt ist Buchhaltung, keine Diagnose. `unbekannt` heisst
+        // ausdruecklich *unbekannt* (Kernel-Thread, Testfaden), nicht *keins*.
+        match crate::loader::program_of_thread(tid) {
+            Some(pid) => println!(
+                "el0-trap: User-Thread {:#x} (Programm {pid}) faultete (EC={ec:#04x} FAR={far:#018x}) -> beendet, Kernel laeuft weiter",
+                tid.to_raw()
+            ),
+            None => println!(
+                "el0-trap: User-Thread {:#x} (Programm unbekannt -- kein Ladepfad hat ihn erzeugt) faultete (EC={ec:#04x} FAR={far:#018x}) -> beendet, Kernel laeuft weiter",
+                tid.to_raw()
+            ),
+        }
         let next = charged(core, &mut sched, |s| s.exit_current(core, frame as usize));
         // Auf den nächsten Thread gewechselt -> FP-Trap + VSpace passend setzen.
         sync_fp_trap(core, &sched);

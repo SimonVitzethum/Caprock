@@ -231,7 +231,11 @@ if [ -z "$OUT" ]; then
     echo "== KEIN OUTPUT -- das ist KEIN Testergebnis, sondern ein Aufbauproblem (QEMU? Zeitlimit?) =="
     rm -f "$LOG" "$BLK_IMG"; exit 2
 fi
-echo "$OUT" | grep -E "^(mbi|mbmod|archive|manifest|root|devassign|devsel|dmaiso|drv|blkdev|part|fs|bootckpt) *:" || true
+# `wasm` und `clientn` gehoeren hierher: sie sind ERGEBNISzeilen. Eine Zeile, die man nur im
+# abgelegten Fehlerprotokoll zu sehen bekommt, laesst sich nicht gegenlesen -- und das abgelegte
+# Protokoll ist der LETZTE Boot (ein Negativfall), nicht der Hauptlauf. Genau daran habe ich am
+# 2026-08-10 eine Diagnose aus dem falschen Boot gelesen.
+echo "$OUT" | grep -E "^(mbi|mbmod|archive|manifest|clientn|root|devassign|devsel|dmaiso|drv|blkdev|part|fs|wasm|bootckpt) *:" || true
 
 echo "== checks =="
 # ================================================================================================
@@ -250,6 +254,7 @@ echo "== checks =="
 #
 # Format: "praefix|seit|eintrag|diagnose vom"
 BEKANNT_ROT=(
+  "wasm    :|2026-08-10|Z15/W1|Diagnose vom 2026-08-10: die PD ist endowt (`endowt=true`), erreicht aber nicht einmal ihr erstes SIGNAL (`lebt=false`) -- und das braucht KEINE Cap-Operation. Sie faultet auch nicht (die drei el0-traps stammen alle von Threads, die kein Ladepfad erzeugt hat). Derselbe Ausfall trifft den ROOT-Task: `Root-Task lief: false`, seit `a159b6b` (94a92ea war true) -- Badges aus geladenen PDs kommen nicht an, Treiber-Badges dagegen schon. Ursache NICHT gefunden; die Zeile sagt jetzt wenigstens, WELCHE der vier Lagen es ist"
   "fp      :|2026-08-09|Z25|Diagnose vom 2026-08-09: Sonden erreichen weder Erfolg noch Korruption -- Schleifenfortschritt noch nicht gezaehlt. Die FRUEHERE Diagnose (CR4.OSFXSR nie gesetzt) ist seit A4 ueberholt und war 1 Tag lang falsch stehengeblieben"
 )
 fingerprint() {
@@ -793,8 +798,16 @@ if [ "$fail" = 0 ]; then
     rm -f "$LOG"
 else
     mkdir -p build/diag
-    ZIEL="build/diag/load-abweichung-$(date +%Y%m%d-%H%M%S)-${RAM}.log"
-    cp -f "$LOG" "$ZIEL" 2>/dev/null && echo "  (volles Log: $ZIEL)"
+    STEMPEL="$(date +%Y%m%d-%H%M%S)"
+    ZIEL="build/diag/load-abweichung-$STEMPEL-${RAM}.log"
+    cp -f "$LOG" "$ZIEL" 2>/dev/null && echo "  (Log des LETZTEN Boots: $ZIEL)"
+    # **Und der HAUPTBOOT eigens.** `$LOG` wird von jedem weiteren Boot ueberschrieben, und der
+    # letzte ist ein NEGATIVFALL -- wer nach einem Fehlschlag „das abgelegte Protokoll" liest,
+    # liest also den falschen Lauf. Am 2026-08-10 ist genau das zweimal passiert, mit Zahlen aus
+    # einem Boot, der die Frage gar nicht stellte. Ein Protokoll, das den falschen Lauf zeigt, ist
+    # schlimmer als keins: es sieht aus wie eine Antwort.
+    HAUPT="build/diag/load-hauptboot-$STEMPEL-${RAM}.log"
+    printf '%s\n' "$OUT" > "$HAUPT" && echo "  (Log des HAUPTboots:      $HAUPT)"
     rm -f "$LOG"
 fi
 rm -f "$BLK_IMG"

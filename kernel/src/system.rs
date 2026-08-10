@@ -99,12 +99,17 @@ fn claim_user_kstack() -> Option<usize> {
 /// 16 KiB sind vier Seiten und passen damit in jeden Streifen (kleinster Streifen: 16 Seiten).
 fn claim_user_kstack_masked(mask: Option<caprock_mem::ColorMask>) -> Option<usize> {
     let (sz, al) = (USER_KSTACK_SIZE as u64, USER_KSTACK_SIZE as u64);
-    let base = match mask {
+    // **Der Topf benennt sich hier, nicht bei seinen fuenf Aufrufern.** Ein Aufrufer, der den
+    // Mangel selbst hinschreibt, muss die Groesse ein zweites Mal nennen -- und eine zweite
+    // Quelle fuer dieselbe Zahl ist die Falle, wegen der `mangel(MANGEL_SEITENTABELLE, 4096)`
+    // ueberhaupt entstehen konnte.
+    let base = benannt_alloc(MANGEL_KERNEL_STACK, sz, |n| match mask {
         // Ueber die Politik aus `mem_alloc`/`alloc_colored` (unten zuerst), nicht daran vorbei:
         // eine Vorgabe, an der eine einzige Stelle vorbeigreift, ist keine Vorgabe (E-Rest 3b).
-        Some(m) => alloc_colored(sz, al, m)?.base(),
-        None => mem_alloc(sz, al)?.base(),
-    };
+        Some(m) => alloc_colored(n, al, m),
+        None => mem_alloc(n, al),
+    })?
+    .base();
     KSTACKS.lock().live += 1;
     Some(base as usize)
 }
@@ -2222,13 +2227,29 @@ pub fn spawn_balanced(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
 /// um Arbeit über die Kerne zu verteilen). Der Zielkern muss vorab via
 /// [`bind_cores`] gebunden sein. Lock-Ordnung RES vor SCHEDS[core].
 pub fn spawn_on_core_parked(core: usize, entry: usize, arg: usize, prio: u8) -> Option<Parked> {
+    mangel_zuruecksetzen();
     let (base, len) = {
-        let stack = mem_alloc_anywhere(STACK_SIZE, 16)?;
+        let stack = benannt_alloc(MANGEL_KERNEL_THREAD_STACK, STACK_SIZE, |n| {
+            mem_alloc_anywhere(n, 16)
+        })?;
         (stack.base() as usize, stack.len() as usize)
     }; // MEM vor SCHEDS freigegeben (Ordnung MEM < SCHEDS)
-    let mut sched = SCHEDS[core].lock();
-    let tid = sched.spawn_parked(core, entry, arg, base, len, prio)?;
-    fp_reset_slot(tid.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
+    let tid = {
+        let mut sched = SCHEDS[core].lock();
+        let r = sched.spawn_parked(core, entry, arg, base, len, prio);
+        if let Some(t) = r {
+            fp_reset_slot(t.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
+        }
+        r
+    };
+    // **Der Stack muss zurueck, wenn kein Thread daraus wird.** Bis heute stand hier ein `?`, und
+    // der 64-KiB-Rahmen war weg: gerade an der Kapazitaetsgrenze, wo dieser Zweig laeuft, verliert
+    // der Kernel damit bei JEDEM Versuch einen Stack. Gefunden beim Benennen des Mangels, nicht
+    // gesucht.
+    let Some(tid) = benannt_slot(MANGEL_THREAD_SLOT, tid) else {
+        MEM.lock().free_region(PhysRegion::new(base as u64, len as u64));
+        return None;
+    };
     Some(Parked(tid))
 }
 
@@ -2260,16 +2281,26 @@ pub fn spawn_on_core_parked(core: usize, entry: usize, arg: usize, prio: u8) -> 
 /// Thread jetzt (`spawn_parked`) und laesst ihn erst auf `admit` los -- die PD steht dann schon.
 pub fn spawn_in_pd(pd: usize, entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
     let core = hal::cpu::core_id();
+    mangel_zuruecksetzen();
     let (base, len) = {
-        let stack = mem_alloc_anywhere(STACK_SIZE, 16)?;
+        let stack = benannt_alloc(MANGEL_KERNEL_THREAD_STACK, STACK_SIZE, |n| {
+            mem_alloc_anywhere(n, 16)
+        })?;
         (stack.base() as usize, stack.len() as usize)
     }; // MEM vor SCHEDS freigegeben (Ordnung MEM < SCHEDS)
-    let tid = {
+    let roh = {
         let mut sched = SCHEDS[core].lock();
-        let t = sched.spawn_parked(core, entry, arg, base, len, prio)?;
-        fp_reset_slot(t.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
-        t
+        let r = sched.spawn_parked(core, entry, arg, base, len, prio);
+        if let Some(t) = r {
+            fp_reset_slot(t.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
+        }
+        r
     }; // SCHEDS freigegeben, BEVOR CAPS genommen wird (Ordnung SCHEDS < CAPS gilt hier nicht)
+    // Wie in `spawn_on_core_parked`: kein Thread -> der Stack geht zurueck.
+    let Some(tid) = benannt_slot(MANGEL_THREAD_SLOT, roh) else {
+        MEM.lock().free_region(PhysRegion::new(base as u64, len as u64));
+        return None;
+    };
     bind_pd(pd, tid);
     // Erst jetzt darf er laufen. Schlaegt das Zulassen fehl, ist die `tid` nicht mehr auflösbar --
     // dann ist der Thread ohnehin weg, und ein stiller `true` waere eine Luege.
@@ -2284,8 +2315,11 @@ pub fn spawn_in_pd(pd: usize, entry: usize, arg: usize, prio: u8) -> Option<Thre
 /// RAM. Der Thread läuft auf EL0 und kann nur per Syscall mit dem Kernel interagieren.
 pub fn spawn_user_parked(entry: usize, arg: usize, prio: u8) -> Option<Parked> {
     let core = hal::cpu::core_id();
-    let kbase = claim_user_kstack()?; // EL0-Kernel-Stack aus MEM (16 KiB, ausgerichtet)
-    let (user_base, user_len) = match mem_alloc(STACK_SIZE, 16) {
+    mangel_zuruecksetzen();
+    let kbase = claim_user_kstack()?; // benennt sich selbst (s. `claim_user_kstack_masked`)
+    let (user_base, user_len) = match benannt_alloc(MANGEL_STACK_SPEICHER, STACK_SIZE, |n| {
+        mem_alloc(n, 16)
+    }) {
         Some(s) => (s.base() as usize, s.len() as usize),
         None => {
             release_user_kstack(kbase);
@@ -2376,23 +2410,43 @@ fn create_vspace_masked(mask: Option<caprock_mem::ColorMask>) -> Option<(u16, u6
         // (statische Reserve), genutzt wird aber nur bis `usable`.
         let usable = MAX_VSPACES.min(hal::mmu::max_asid() as usize);
         let mut t = VSPACES.lock();
-        let i = t.iter().take(usable).position(|v| !v.used)?;
+        // **Zwei Toepfe in EINER Funktion, und sie muessen unterscheidbar bleiben.** Hier ist der
+        // ASID-Vorrat leer -- eine Zahl fester Groesse. Zwei Zeilen weiter unten waere es
+        // Seitentabellen-SPEICHER, ein dynamischer Topf. Wer beides `MANGEL_VSPACE_ASID` nennt,
+        // schickt die naechste Diagnose an die falsche Stelle.
+        let Some(i) = t.iter().take(usable).position(|v| !v.used) else {
+            drop(t);
+            mangel(MANGEL_VSPACE_ASID, 0);
+            return None;
+        };
         t[i] = VSpaceEnt { used: true, l1: 0, l2: 0, stripe: None }; // reserviert
         (i + 1) as u16
     };
-    let a = mem_alloc_masked(4096, 4096, mask);
-    let b = mem_alloc_masked(4096, 4096, mask);
+    // Ab hier zaehlt jeder Rahmen in den Seitentabellen-Topf (C7) -- und der Fehlerpfad bucht
+    // ihn wieder aus, sonst waere der Fuellstand nach dem ersten Fehlschlag dauerhaft zu hoch.
+    let a = pt_rahmen(mem_alloc_masked(4096, 4096, mask));
+    let b = pt_rahmen(mem_alloc_masked(4096, 4096, mask));
     let (l1, l2) = match (a, b) {
         (Some(l1), Some(l2)) => (l1, l2),
         (a, b) => {
+            // **Der Allokator hat gesprochen, nicht der Aufrufer.** Genau hier stand am
+            // 2026-08-10 die Verwechslung, die die `wasmhost`-Diagnose zweimal in die falsche
+            // Richtung geschickt hat: der leere Topf ist der SEITENTABELLEN-Speicher, nicht der
+            // ASID-Vorrat -- die beiden liegen in derselben Funktion und haben nichts miteinander
+            // zu tun.
+            mangel(MANGEL_SEITENTABELLE, 4096);
             let mut mem = MEM.lock();
+            let mut zurueck = 0u64;
             if let Some(c) = a {
-                mem.free_region(PhysRegion::new(c.base(), c.len()));
+                mem.free_region(PhysRegion::new(c, 4096));
+                zurueck += 1;
             }
             if let Some(c) = b {
-                mem.free_region(PhysRegion::new(c.base(), c.len()));
+                mem.free_region(PhysRegion::new(c, 4096));
+                zurueck += 1;
             }
             drop(mem);
+            pt_zurueck(zurueck);
             VSPACES.lock()[asid as usize - 1].used = false; // Slot zurückgeben
             return None;
         }
@@ -2401,38 +2455,123 @@ fn create_vspace_masked(mask: Option<caprock_mem::ColorMask>) -> Option<(u16, u6
     // zusätzlichen Tabellenebene ab (x86_64: PML4 -> PDPT -> PD); schlägt er fehl, werden die
     // beiden bereits belegten Frames wieder freigegeben.
     let mut extra: Option<u64> = None;
-    let ok = hal::mmu::vspace_create_base(l1.base(), l2.base(), &mut || {
+    let ok = hal::mmu::vspace_create_base(l1, l2, &mut || {
         // **Auch diese Ebene traegt die Maske.** Sie ging bisher ueber das ungefaerbte
         // `mem_alloc` — auf x86_64 (PML4 -> PDPT -> PD) lag damit eine der drei Tabellen einer
         // gefaerbten PD ausserhalb ihres Farbsatzes, und der Farbtest sah es nicht, weil er nur
         // `l1`/`l2` zurueckliest. Ein Seitenlauf der MMU im Namen der PD hinterlaesst dort
         // dieselben Spuren wie in den beiden anderen. Schlaegt die gefaerbte Zuteilung fehl,
         // scheitert das Anlegen der VSpace — kein stiller Rueckfall auf fremde Farben.
-        let f = mem_alloc_masked(4096, 4096, mask)?;
-        extra = Some(f.base());
-        Some(f.base())
+        let f = pt_rahmen(mem_alloc_masked(4096, 4096, mask))?;
+        extra = Some(f);
+        Some(f)
     });
     if !ok {
+        // Auch hier hat der Allokator gesprochen: `vspace_create_base` gibt `false`
+        // ausschliesslich dann, wenn der Rueckkanal nichts geliefert hat.
+        mangel(MANGEL_SEITENTABELLE, 4096);
         let mut mem = MEM.lock();
-        mem.free_region(PhysRegion::new(l1.base(), 4096));
-        mem.free_region(PhysRegion::new(l2.base(), 4096));
+        mem.free_region(PhysRegion::new(l1, 4096));
+        mem.free_region(PhysRegion::new(l2, 4096));
+        let mut zurueck = 2u64;
         if let Some(e) = extra {
             mem.free_region(PhysRegion::new(e, 4096));
+            zurueck += 1;
         }
         drop(mem);
+        pt_zurueck(zurueck);
         VSPACES.lock()[asid as usize - 1].used = false;
         return None;
     }
     VSPACES.lock()[asid as usize - 1] = VSpaceEnt {
         used: true,
-        l1: l1.base(),
-        l2: l2.base(),
+        l1,
+        l2,
         // Der Streifen wird nach dem Anlegen gesetzt (`vspace_bind_stripe`): hier ist noch nicht
         // entschieden, ob diese VSpace eine gefärbte PD trägt.
         stripe: None,
     };
-    Some((asid, l1.base()))
+    Some((asid, l1))
 }
+
+// ----------------------------------------------------------------------------------------------
+// C7: DER SEITENTABELLEN-TOPF -- gemessen AN DER QUELLE
+// ----------------------------------------------------------------------------------------------
+//
+// **Warum es diesen Zaehler gibt.** Die Kapazitaetskurve (C7) sagt, DASS es bis 9984 Prozesse
+// ging; sie sagt nicht, welcher Vorrat als naechster reisst. Fuer den einen Topf, an dem
+// `wasmhost` bei SECHS Programmen wirklich gescheitert ist -- Speicher fuer Seitentabellen --
+// gibt es bis heute keine Kurve: eine PD im GLOBALEN Adressraum zieht davon gar nichts (sie
+// bekommt keine eigene VSpace), und in der isolierten Kurve erschlaegt die private 2-MiB-Region
+// ihn um den Faktor 500.
+//
+// **Warum an der Quelle und nicht als Differenz des freien RAM.** Eine Differenz misst alles
+// andere mit: Kernel-Stacks, private Regionen, Segmente, Slabs. Sie beantwortet die Frage nach
+// dem SEITENTABELLEN-Topf so wenig, wie `rx_used` die Frage beantwortet, ob Daten angekommen
+// sind. Gezaehlt wird deshalb, was der Allokator FUER eine Seitentabelle herausgibt -- an genau
+// den Stellen, die ihn dafuer fragen, und nirgends sonst.
+//
+// **Was der Zaehler NICHT deckt** (und das gehoert hierher, nicht in eine Fussnote): die
+// IOMMU-Tabellen (`VtdEnforcer::alloc_zeroed`, `SmmuV3Enforcer::alloc_zeroed`) sind ein EIGENER
+// Topf mit eigener Lebensdauer und stehen bewusst nicht darin. Ein Zaehler, der zwei Toepfe
+// addiert, kann keinen von beiden beantworten.
+/// Rahmen, die der Allokator fuer eine **CPU-Seitentabelle** herausgegeben hat.
+static PT_RAHMEN_RAUS: AtomicU64 = AtomicU64::new(0);
+/// ... und die wieder eingesammelt wurden (`vspace_teardown` und die Fehlerpfade des Anlegens).
+static PT_RAHMEN_ZURUECK: AtomicU64 = AtomicU64::new(0);
+/// Hoechststand der Differenz. Der Endstand allein sagt ueber Erschoepfung nichts -- dieselbe
+/// Ueberlegung wie bei den Cap-Hoechststaenden (A-3.4).
+static PT_RAHMEN_PEAK: AtomicU64 = AtomicU64::new(0);
+
+/// **Die EINZIGE Stelle, an der der Seitentabellen-Topf waechst.**
+///
+/// Nimmt den Rueckgabewert des Allokators und gibt die Basis weiter -- der Zaehler haengt damit
+/// am Erfolg der Anforderung selbst und nicht an einer Zahl daneben.
+fn pt_rahmen(r: Option<MemoryCap>) -> Option<u64> {
+    let c = r?;
+    let raus = PT_RAHMEN_RAUS.fetch_add(1, Ordering::Relaxed) + 1;
+    let zurueck = PT_RAHMEN_ZURUECK.load(Ordering::Relaxed);
+    PT_RAHMEN_PEAK.fetch_max(raus.saturating_sub(zurueck), Ordering::Relaxed);
+    Some(c.base())
+}
+
+/// `n` Seitentabellen-Rahmen sind an den Allokator zurueck.
+fn pt_zurueck(n: u64) {
+    PT_RAHMEN_ZURUECK.fetch_add(n, Ordering::Relaxed);
+}
+
+/// `(herausgegeben, zurueck, gehalten, Hoechststand)` -- in **Rahmen** zu je 4 KiB.
+///
+/// `gehalten` ist die Differenz und damit der Fuellstand; sie steht neben den beiden Rohwerten,
+/// weil eine Differenz allein nicht sagen kann, ob sie klein ist, weil wenig geholt oder viel
+/// zurueckgegeben wurde.
+pub fn seitentabellen_topf() -> (u64, u64, u64, u64) {
+    let raus = PT_RAHMEN_RAUS.load(Ordering::Relaxed);
+    let zurueck = PT_RAHMEN_ZURUECK.load(Ordering::Relaxed);
+    (
+        raus,
+        zurueck,
+        raus.saturating_sub(zurueck),
+        PT_RAHMEN_PEAK.load(Ordering::Relaxed),
+    )
+}
+
+/// Belegte VSpace-/ASID-Slots -- die **zweite, unabhaengige** Buchfuehrung, gegen die sich der
+/// Seitentabellen-Zaehler halten laesst.
+///
+/// Jede belegte VSpace haelt mindestens ihre L1 und ihre L2 (beide aus [`create_vspace_masked`],
+/// beide gezaehlt). Faellt die Zaehlung an der Quelle weg, unterschreitet der Topf diese Schranke
+/// -- ohne den Quervergleich waere ein Zaehler, der nur sich selbst befragt, von einem
+/// abgeklemmten nicht zu unterscheiden.
+pub fn used_vspaces() -> usize {
+    VSPACES.lock().iter().filter(|v| v.used).count()
+}
+
+/// Rahmen je VSpace, die **jede** Architektur unbedingt anlegt: L1 und L2. x86 legt zusaetzlich
+/// eine PDPT an (`vspace_create_base`), aarch64 nicht -- deshalb steht hier die Untergrenze und
+/// nicht die x86-Zahl. Ein Pruefer, der die architekturabhaengige Zahl nachrechnet, prueft eine
+/// zweite Wirklichkeit (`iova_window_clear_of_msi`).
+pub const PT_RAHMEN_JE_VSPACE: u64 = 2;
 
 /// **A-3.4-Telemetrie:** `(Slot-Hoechststand, Slot-Kapazitaet, Objekt-Hoechststand,
 /// Objekt-Kapazitaet)` des globalen Cap-Space.
@@ -2604,7 +2743,7 @@ fn vspace_map_masked(
         while p < base + len {
             let mapped =
                 hal::mmu::vspace_map_page(l2, p, perm, &mut || {
-                    mem_alloc_masked(4096, 4096, mask).map(|c| c.base())
+                    pt_rahmen(mem_alloc_masked(4096, 4096, mask))
                 });
             if !mapped {
                 all = false;
@@ -2688,8 +2827,25 @@ fn vspace_map_user_region(
     mask: Option<caprock_mem::ColorMask>,
 ) -> Option<u64> {
     let l1 = vspace_l1(asid)?;
-    let mut alloc = || mem_alloc_masked(4096, 4096, mask).map(|c| c.base());
-    let va = hal::mmu::vspace_map_user_window(l1, slot, phys, len, perm, &mut alloc)?;
+    // **Der Allokator markiert sich SELBST** -- dieselbe Form wie im Ladepfad (`a3`). Ein
+    // Aufrufer, der hinterher nachrechnet, WARUM das Abbilden scheiterte, baut eine zweite
+    // Wirklichkeit neben die erste (`iova_window_clear_of_msi`).
+    let mut alloc = || {
+        let r = pt_rahmen(mem_alloc_masked(4096, 4096, mask));
+        if r.is_none() {
+            mangel(MANGEL_SEITENTABELLE, 4096);
+        }
+        r
+    };
+    let va = hal::mmu::vspace_map_user_window(l1, slot, phys, len, perm, &mut alloc);
+    let Some(va) = va else {
+        // Nur wenn der Allokator NICHTS gemeldet hat, lag es am Abbilden selbst -- und dann ist
+        // die ehrliche Antwort „KEINE Ressource", nicht die naechstbeste Zahl.
+        if lade_mangel().0 == MANGEL_KEINER {
+            mangel(MANGEL_MAPPING_ABGEWIESEN, 0);
+        }
+        return None;
+    };
     hal::mmu::flush_asid(asid);
     Some(va)
 }
@@ -2784,23 +2940,35 @@ fn vspace_teardown(asid: u16) {
     if ent.used {
         hal::mmu::flush_asid(asid); // 1. TLB für diese ASID leeren (Tabellen noch intakt)
         let mut mem = MEM.lock();
+        // **Die Freigabeseite des Seitentabellen-Topfs** (C7). Gezaehlt wird, was hier
+        // tatsaechlich zurueckgeht -- die drei Einsammler liefern je Aufruf eine unbekannte
+        // Anzahl, also zaehlt der Rueckruf selbst und nicht eine Schaetzung daneben.
+        let mut zurueck = 0u64;
         // 2. feingranulare L3-Tabellen (aus Seiten-Mappings) einsammeln.
         hal::mmu::vspace_collect_l3s(ent.l2, &mut |p| {
             mem.free_region(PhysRegion::new(p, 4096));
+            zurueck += 1;
         });
         // GiB-0-Device-Tabellen (aus MMIO-Mappings, ext-22) einsammeln, falls vorhanden.
         hal::mmu::vspace_collect_device_tables(ent.l1, &mut |p| {
             mem.free_region(PhysRegion::new(p, 4096));
+            zurueck += 1;
         });
         // Die Tabellen des privaten User-Fensters (E-Rest 3d). Sie haengen an einem eigenen
         // obersten Eintrag und werden von keiner der beiden Zeilen darueber beruehrt -- ohne
         // diese waere jede isolierte PD ein Leck von zwei bis drei Rahmen.
         hal::mmu::vspace_collect_user_window(ent.l1, &mut |p| {
             mem.free_region(PhysRegion::new(p, 4096));
+            zurueck += 1;
         });
         mem.free_region(PhysRegion::new(ent.l1, 4096));
         mem.free_region(PhysRegion::new(ent.l2, 4096));
         drop(mem);
+        // `+ 2` sind L1 und L2 aus den beiden Zeilen darueber. Die PDPT der x86-Fassung zaehlt
+        // NICHT hier, sondern im Rueckruf von `vspace_collect_device_tables` -- die gibt sie
+        // selbst frei. Wer sie hier noch einmal addierte, buchte einen Rahmen zweimal aus, und
+        // der Fuellstand liefe langsam ins Negative.
+        pt_zurueck(zurueck + 2);
     }
     // 3. Slot erst JETZT freigeben (nach Flush) -> keine Wiederverwendung mit veralteten Einträgen.
     VSPACES.lock()[asid as usize - 1] = VSpaceEnt { used: false, l1: 0, l2: 0, stripe: None };
@@ -2837,6 +3005,7 @@ fn vspace_bind_stripe(asid: u16, stripe: u32) {
 /// VSpace-Tabellen werden beim Thread-Ende abgebaut.
 pub fn spawn_isolated_parked(entry: usize, arg: usize, prio: u8) -> Option<(Parked, u64)> {
     let core = hal::cpu::core_id();
+    mangel_zuruecksetzen();
     let kbase = claim_user_kstack()?; // EL0-Kernel-Stack aus MEM (16 KiB, ausgerichtet)
 
     // **Private 2-MiB-Stack-Region -- seit E-Rest 3d ohne Zonenbindung.** Sie wird nicht mehr
@@ -2844,13 +3013,17 @@ pub fn spawn_isolated_parked(entry: usize, arg: usize, prio: u8) -> Option<(Park
     // (`hal::mmu::ISO_USER_VA`, ausserhalb der Identitaetskarte). Damit ist die PHYSADRESSE frei,
     // und der GiB-0-Deckel von gemessenen 504 gleichzeitigen isolierten PDs faellt.
     let region_sz = hal::mmu::ISO_REGION_SIZE;
-    let (rbase, rlen) = match mem_alloc_anywhere(region_sz, region_sz) {
+    let (rbase, rlen) = match benannt_alloc(MANGEL_PRIVATREGION, region_sz, |n| {
+        mem_alloc_anywhere(n, n)
+    }) {
         Some(r) => (r.base(), r.len()),
         None => {
             release_user_kstack(kbase);
             return None;
         }
     };
+    // `create_vspace_masked` benennt selbst, WELCHER der beiden Toepfe leer war (ASID-Platz oder
+    // Seitentabellen-Speicher) -- deshalb hier keine zweite, groebere Meldung darueber.
     let Some((asid, l1)) = create_vspace() else {
         MEM.lock().free_region(PhysRegion::new(rbase, rlen));
         release_user_kstack(kbase);
@@ -2892,7 +3065,7 @@ pub fn spawn_isolated_parked(entry: usize, arg: usize, prio: u8) -> Option<(Park
         }
         r
     };
-    match tid {
+    match benannt_slot(MANGEL_THREAD_SLOT, tid) {
         Some(t) => Some((Parked(t), rbase)),
         None => {
             vspace_teardown(asid);
@@ -2949,6 +3122,7 @@ pub fn spawn_isolated_colored(
     // **Zulassen nicht vergessen** (D0): `spawn_isolated_colored_inner` liefert seit dem
     // 2026-08-07 einen GEPARKTEN Thread. Diese Fassung bindet keine PD nach, also darf sie ihn
     // sofort loslassen -- aber „sofort" muss dastehen, sonst laeuft die Farbsonde nie an.
+    mangel_zuruecksetzen();
     let (p, r, ks) = spawn_isolated_colored_inner(entry, arg, prio, mask, None)?;
     admit(p).map(|t| (t, r, ks))
 }
@@ -2962,7 +3136,8 @@ pub fn spawn_isolated_colored(
 /// Last leise verschwindet, waere schlimmer als gar keine, weil niemand mehr weiss, welche PD
 /// getrennt ist und welche nicht.
 pub fn spawn_isolated_colored_auto_parked(entry: usize, arg: usize, prio: u8) -> Option<(Parked, u64)> {
-    let (i, mask) = crate::colors::claim_stripe()?;
+    mangel_zuruecksetzen();
+    let (i, mask) = benannt_slot(MANGEL_FARBSTREIFEN, crate::colors::claim_stripe())?;
     match spawn_isolated_colored_inner(entry, arg, prio, mask, Some(i)) {
         // Die Kernelseite interessiert nur den Selbsttest (s. `spawn_isolated_colored`).
         Some((t, rbase, _kernelseite)) => Some((t, rbase)),
@@ -2991,7 +3166,9 @@ fn spawn_isolated_colored_inner(
     // **Seit E-Rest 3d ohne Zonenbindung:** die Region wird nicht mehr identisch abgebildet,
     // sondern in das private User-Fenster dieser PD. Die Farbbedingung bleibt -- sie ist eine
     // Aussage ueber die PHYSADRESSE und von der virtuellen Lage unberuehrt.
-    let cap = match alloc_colored_anywhere(region_sz, crate::colors::PAGE, mask) {
+    let cap = match benannt_alloc(MANGEL_PRIVATREGION, region_sz, |n| {
+        alloc_colored_anywhere(n, crate::colors::PAGE, mask)
+    }) {
         Some(c) => c,
         None => {
             release_user_kstack(kbase);
@@ -3053,7 +3230,7 @@ fn spawn_isolated_colored_inner(
         }
         r
     };
-    match tid {
+    match benannt_slot(MANGEL_THREAD_SLOT, tid) {
         Some(t) => Some((Parked(t), rbase, kernelseite)),
         None => {
             vspace_teardown(asid);
@@ -3123,14 +3300,15 @@ pub fn destroy_pd(pd: usize) {
 /// ausführt. Gibt die `ThreadId`.
 pub fn spawn_isolated_native_parked(code: *const u8, code_len: usize, prio: u8) -> Option<Parked> {
     let core = hal::cpu::core_id();
+    mangel_zuruecksetzen();
     let kbase = claim_user_kstack()?; // EL0-Kernel-Stack aus MEM (16 KiB, ausgerichtet)
     let sz = hal::mmu::ISO_REGION_SIZE;
 
     // Code-Frame + Stack-Frame. **Seit dem VA==PA-Durchgang ohne Zonenbindung:** beide gehen
     // in das private User-Fenster (Plaetze `SLOT_CODE`/`SLOT_DATA`), nicht mehr identisch in
     // GiB 0. Das war der letzte Spawn-Pfad, der die Identitaet noch vorausgesetzt hat.
-    let ca = mem_alloc_anywhere(sz, sz);
-    let sa = mem_alloc_anywhere(sz, sz);
+    let ca = benannt_alloc(MANGEL_PRIVATREGION, sz, |n| mem_alloc_anywhere(n, n));
+    let sa = benannt_alloc(MANGEL_PRIVATREGION, sz, |n| mem_alloc_anywhere(n, n));
     let (cf, sf) = match (ca, sa) {
         (Some(cf), Some(sf)) => (cf, sf),
         (ca, sa) => {
@@ -3177,6 +3355,7 @@ pub fn spawn_isolated_native_parked(code: *const u8, code_len: usize, prio: u8) 
     // Code EL0-RX (W^X), Stack EL0-RW -- beide im Fenster, beide nicht-identisch.
     let cva = vspace_map_user_region(asid, SLOT_CODE, cbase, clen, hal::mmu::UserPerm::Rx, None);
     let sva = vspace_map_user_region(asid, SLOT_DATA, sbase, slen, hal::mmu::UserPerm::Rw, None);
+    // `vspace_map_user_region` benennt selbst (Seitentabellen-Speicher bzw. abgewiesenes Mapping).
     let (Some(cva), Some(sva)) = (cva, sva) else {
         vspace_teardown(asid);
         let mut mem = MEM.lock();
@@ -3212,7 +3391,7 @@ pub fn spawn_isolated_native_parked(code: *const u8, code_len: usize, prio: u8) 
         }
         r
     };
-    match tid {
+    match benannt_slot(MANGEL_THREAD_SLOT, tid) {
         Some(t) => {
             // Der private Code-Frame ist KEINE Reap-Region (das ist der Stack) und haengt als
             // 2-MiB-Block (kein L3) am L2 -> vspace_teardown faende ihn nicht. Unter der ASID
@@ -3503,6 +3682,18 @@ impl LadePolitik {
 /// einen Aufruf, `start_root_task` läuft einmal beim Hochlauf). **Was das kaputt machen würde:**
 /// zwei gleichzeitige Ladevorgänge — dann gewönne der letzte Schreiber. Die Annahme steht hier,
 /// damit sie beim ersten parallelen Lader auffällt und nicht danach.
+///
+/// **Seit 2026-08-10 melden auch die `spawn_*`-Pfade hierher** (C7). Damit gilt die Annahme
+/// „sequenziell" ausdrücklich auch für sie: zwei Kerne, die gleichzeitig einen Thread anlegen und
+/// beide scheitern, überschreiben einander. Der Wert ist eine **Diagnose**, kein Rückgabewert —
+/// gelesen wird er unmittelbar nach dem Fehlschlag im selben Faden (`kapazitaet_kurve`,
+/// `SYS_LOAD`). Wer ihn als Ergebnis benutzen will, braucht eine Rückgabe, keinen Zähler; die
+/// Grenze steht hier, damit sie beim ersten Aufrufer auffällt, der sie überschreitet.
+///
+/// **Warum `MANGEL_KEINER` in einem Fehlerfall trotzdem eine Aussage ist:** dann lag es an keinem
+/// Vorrat, sondern an einer Prüfung (krumme Adresse, zu viele Segmentstücke, abgelehnte Politik).
+/// Genau dafür gibt es [`MANGEL_MAPPING_ABGEWIESEN`] — „keine Ressource" muss man sagen können,
+/// ohne zu schweigen.
 pub const MANGEL_KEINER: u32 = 0;
 pub const MANGEL_FARBSTREIFEN: u32 = 1;
 pub const MANGEL_KERNEL_STACK: u32 = 2;
@@ -3523,11 +3714,73 @@ pub const MANGEL_PD_SLOT: u32 = 9;
 /// Sie hat den `wasmhost`-Fall ein zweites Mal in die falsche Richtung geschickt (472 MiB frei,
 /// und „der Allokator" als Erklaerung).
 pub const MANGEL_MAPPING_ABGEWIESEN: u32 = 10;
+/// **Stack eines KERNEL-Threads** (`STACK_SIZE`, 64 KiB) — nicht zu verwechseln mit
+/// [`MANGEL_KERNEL_STACK`], dem 16-KiB-EL1-Stack eines EL0-Threads. Es sind zwei Toepfe mit
+/// verschiedenen Groessen, und welcher gilt, haengt an der ART des Threads. In der
+/// Kapazitaetskurve ist genau dieser der Grund, an dem die SAS-Reihe bei `-m 512M` endet.
+pub const MANGEL_KERNEL_THREAD_STACK: u32 = 11;
+/// **Die private Region einer isolierten PD** (2 MiB bei `spawn_isolated`, ein Farbstreifen-Stueck
+/// bei der gefaerbten Fassung). Der Topf, an dem die isolierte Kurve reisst -- 224 Prozesse bei
+/// 512 MiB, 3040 bei 6 GiB, und der Zusammenhang ist linear in der RAM-Groesse.
+pub const MANGEL_PRIVATREGION: u32 = 12;
+/// **Kein Mangel, sondern eine Marke fuer die Sprechprobe.** Keine Stelle des Kernels schreibt
+/// diesen Code; er wird ausschliesslich VOR einer absichtlich fehlschlagenden Anforderung gesetzt.
+/// Steht er hinterher noch da, hat der gepruefte Pfad **geschwiegen** — und das ist von „es lag
+/// an keiner Ressource" nicht zu unterscheiden, solange man nicht vorher vergiftet hat.
+pub const MANGEL_VERGIFTET: u32 = 255;
 /// `code << 32 | angeforderte_bytes`
 static LADE_MANGEL: AtomicU64 = AtomicU64::new(0);
 
 fn mangel(code: u32, bytes: u64) {
     LADE_MANGEL.store((u64::from(code) << 32) | (bytes & 0xffff_ffff), Ordering::Relaxed);
+}
+
+/// **Beim EINTRITT in einen Pfad loeschen, der einen Mangel melden koennte.**
+///
+/// Ohne das stuende beim naechsten Fehlschlag der Grund des VORIGEN da, und ein veralteter Grund
+/// ist schlimmer als keiner: er macht den Punkt unbehebbar, weil die Diagnose an einer Stelle
+/// sucht, an der nichts ist.
+fn mangel_zuruecksetzen() {
+    LADE_MANGEL.store(0, Ordering::Relaxed);
+}
+
+/// **Die Marke fuer die Sprechprobe setzen** ([`MANGEL_VERGIFTET`]).
+///
+/// Nur fuer den Pruefpfad: er setzt sie VOR einer absichtlich fehlschlagenden Anforderung. Steht
+/// sie danach noch da, hat der gepruefte Pfad geschwiegen -- und ohne das Vergiften waere
+/// Schweigen von „lag an keiner Ressource" nicht zu unterscheiden.
+#[cfg(feature = "selftest")]
+pub fn mangel_vergiften() {
+    mangel(MANGEL_VERGIFTET, 0);
+}
+
+/// **Eine Anforderung, die sich bei Misserfolg SELBST benennt** — und zwar mit der Menge, die
+/// tatsaechlich in den Allokator gegangen ist.
+///
+/// `size` kommt genau EINMAL vor: als Argument dieser Funktion, das sie an `f` weiterreicht und im
+/// Fehlerfall meldet. Damit kann die Meldung keine andere Zahl tragen als die angeforderte.
+///
+/// **Warum das eine eigene Funktion ist.** Am 2026-08-10 stand `mangel(MANGEL_SEITENTABELLE, 4096)`
+/// als **Literal** neben einer Stelle, an der der Allokator gar nicht gefragt worden war. Die Zeile
+/// log, und sie hat die `wasmhost`-Diagnose zweimal in die falsche Richtung geschickt (472 MiB
+/// frei, und „der Allokator" als Erklaerung). Nur der Allokator darf behaupten, dass es am
+/// Allokator lag.
+fn benannt_alloc<T>(code: u32, size: u64, f: impl FnOnce(u64) -> Option<T>) -> Option<T> {
+    let r = f(size);
+    if r.is_none() {
+        mangel(code, size);
+    }
+    r
+}
+
+/// Wie [`benannt_alloc`], aber fuer Toepfe, die keine BYTES vergeben, sondern **Plaetze**
+/// (Thread-Slot, PD-Slot, ASID, Farbstreifen). `0` steht hier fuer „keine Byte-Groesse", nicht
+/// fuer „nichts angefordert" — der Code sagt, welcher Platz fehlte.
+fn benannt_slot<T>(code: u32, r: Option<T>) -> Option<T> {
+    if r.is_none() {
+        mangel(code, 0);
+    }
+    r
 }
 
 /// `(Code, angeforderte Bytes, freier Rest)`. Der **freie Rest** steht daneben, weil „4096 Byte
@@ -3554,6 +3807,12 @@ pub fn mangel_name(code: u32) -> &'static str {
             "KEINE Ressource -- das Abbilden wurde abgewiesen (krumme VA/PA oder ausserhalb des \
              Fensters). Der Allokator wurde dabei NICHT gefragt"
         }
+        MANGEL_KERNEL_THREAD_STACK => "Speicher fuer den Stack eines KERNEL-Threads (64 KiB)",
+        MANGEL_PRIVATREGION => "Speicher fuer die private Region einer isolierten PD",
+        MANGEL_VERGIFTET => {
+            "VERGIFTET -- der gepruefte Pfad hat GESCHWIEGEN. Kein Kernelpfad schreibt diesen \
+             Code; er stand vor der Anforderung da und steht immer noch da"
+        }
         _ => "unbekannt",
     }
 }
@@ -3572,7 +3831,7 @@ pub fn load_into_pd_mit(
     // Der Streifen zuerst: schlaegt er fehl, ist noch nichts alloziert, was zurueckmuesste.
     // Beim EINTRITT loeschen -- sonst stuende beim naechsten Fehlschlag der Grund des vorigen da,
     // und ein veralteter Grund ist schlimmer als keiner (er macht den Punkt unbehebbar).
-    LADE_MANGEL.store(0, Ordering::Relaxed);
+    mangel_zuruecksetzen();
     let stripe = if pol.farbig {
         match crate::colors::claim_stripe() {
             Some(st) => Some(st),
@@ -3592,13 +3851,16 @@ pub fn load_into_pd_mit(
             crate::colors::release_stripe(i);
         }
     };
+    // **Beide benennen sich selbst** (2026-08-10, zweiter Durchgang): `claim_user_kstack_masked`
+    // meldet den EL0-Kernel-Stack MIT der angeforderten Menge, `create_vspace_masked`
+    // unterscheidet den ASID-Platz vom Seitentabellen-Speicher. Eine zweite, groebere Meldung
+    // hier wuerde die feinere ueberschreiben -- und ein groeberer Grund ist keine Sicherheit,
+    // sondern eine falsche Faehrte.
     let Some(kbase) = claim_user_kstack_masked(mask) else {
-        mangel(MANGEL_KERNEL_STACK, 0);
         streifen_zurueck(stripe);
         return None;
     };
     let Some((asid, l1)) = create_vspace_masked(mask) else {
-        mangel(MANGEL_VSPACE_ASID, 0);
         release_user_kstack(kbase);
         streifen_zurueck(stripe);
         return None;
@@ -3705,7 +3967,7 @@ pub fn load_into_pd_mit(
                 // warum das Abbilden scheiterte. Zwei Nachrechnungen derselben Groesse waeren die
                 // `iova_window_clear_of_msi`-Falle: Zuteiler und Pruefer brauchen EINE Quelle.
                 let mut a3 = || {
-                    let r = mem_alloc_masked_anywhere(4096, 4096, mask).map(|c| c.base());
+                    let r = pt_rahmen(mem_alloc_masked_anywhere(4096, 4096, mask));
                     if r.is_none() {
                         mangel(MANGEL_SEITENTABELLE, 4096);
                     }
@@ -3767,7 +4029,7 @@ pub fn load_into_pd_mit(
         let mut off = 0u64;
         while (off as usize) < n {
             let mut a3 = || {
-                let r = mem_alloc_masked_anywhere(4096, 4096, mask).map(|c| c.base());
+                let r = pt_rahmen(mem_alloc_masked_anywhere(4096, 4096, mask));
                 if r.is_none() {
                     mangel(MANGEL_SEITENTABELLE, 4096);
                 }
@@ -3917,7 +4179,7 @@ pub fn load_elf_mit(
     // Loeschen schon HIER: `create_pd_in_domain` liegt VOR `load_into_pd_mit`, und ohne das
     // Loeschen stuende bei einem Fehlschlag der Grund des VORIGEN Ladevorgangs da -- ein
     // veralteter Grund ist schlimmer als keiner.
-    LADE_MANGEL.store(0, Ordering::Relaxed);
+    mangel_zuruecksetzen();
     let Some(pd) = create_pd_in_domain(domain) else {
         mangel(MANGEL_PD_SLOT, 0);
         return None;
@@ -4008,7 +4270,13 @@ pub fn map_region_into_thread(tid: ThreadId, phys: u64, len: u64, kind: MappingK
     let asid = (vspace_of(tid.slot()) >> 48) as u16;
     // Reine Seitentabellen (E-Rest 3d): der Kernel schreibt sie ueber seine Identitaetskarte,
     // die PD sieht sie nie -- sie ist der Baum, nicht das Blatt.
-    let mut alloc = || mem_alloc_anywhere(4096, 4096).map(|c| c.base());
+    let mut alloc = || {
+        let r = pt_rahmen(mem_alloc_anywhere(4096, 4096));
+        if r.is_none() {
+            mangel(MANGEL_SEITENTABELLE, 4096);
+        }
+        r
+    };
     // **Zwei Arten, zwei Gruende -- und das ist keine Formsache.** Bei MMIO IST die Identitaet
     // die Zusicherung: ein Treiber rechnet mit BAR-Adressen aus der PCI-Enumeration, und die sind
     // physisch. Bei DMA ist sie nur die **CPU-seitige** Haelfte; was das Geraet sieht, ist eine

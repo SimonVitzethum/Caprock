@@ -3334,11 +3334,13 @@ Zeitmessung nicht (D10).
 
 ### C7. Die Kapazitätskurve — wo es WIRKLICH bricht (gemessen 2026-08-10)
 
-**Klasse:** Messung · **Stand:** **Beleg zur HÄLFTE erbracht — C7 und [C4](#c4-die-on-bilanz)
-bleiben OFFEN.** Die Kurve sagt, *dass* es bis 9984 ging; sie sagt **nicht**, *welcher Vorrat als
-nächster reisst*. Solange die drei unten benannten Zeilen fehlen (Seitentabellen-Topf bei N,
-Stack-Wasserstandsmarke, benannter Mangel auf den `spawn_*`-Pfaden), ist das eine **Zählung, kein
-Beleg**. Die drei sind zusammen kleiner als die Messkampagne, die schon gelaufen ist.
+**Klasse:** Messung · **Stand:** **zwei der drei fehlenden Zeilen stehen (2026-08-10,
+nachmittags) — C7 und [C4](#c4-die-on-bilanz) bleiben OFFEN.** Die Kurve sagte, *dass* es bis
+9984 ging, aber nicht, *welcher Vorrat als nächster reisst*. Seit heute nennt sie die Ressource
+(Prüfzeile `mangel`) und zeigt den Seitentabellen-Topf über wachsendes N (Prüfzeile `ptab`) —
+beide gattern, beide mit isolierender Gegenprobe. Es fehlt noch die **Stack-Wasserstandsmarke**.
+**Und die isolierte Zeile der Tabelle unten ist neu zu messen**: ihre Arbeiter faulteten alle
+sofort (s. unten).
 
 `tools/kapazitaet-messen.sh` legt PDs **mit je einem Thread** an (eine PD ohne Thread ist kein
 Prozess) und druckt den Füllstand über wachsendes N. Ziel parametrisierbar über
@@ -3350,7 +3352,8 @@ eine Messung, die tausende PDs belegt, kippt sonst jede baseline-empfindliche Ze
 |---|---|---|---|---|
 | SAS-PD, **kernlokaler** Spawn | 4987 | — | **4987** | **Hosting-Kapazität EINES Kerns** = `je_kern × MIGRATION_HEADROOM` = 2500 × 2 = 5000. **Nicht RAM**: bei 6 GiB blieben 5771 MiB frei |
 | SAS-PD, **lastverteilter** Spawn | 7212 | **9984** | **9984** | 512M: **RAM** (freies RAM auf 0, 64 KiB je Prozess). 3G/6G: **Thread-Slots** — 9984 + 16 schon lebende = **10 000 = `TARGET_THREADS`**, exakt die Zusage |
-| **Isolierte** PD | 224 | 1504 | 3040 | **RAM**, und zwar **2 MiB je Prozess** (private Region). Linear in der RAM-Grösse; freie VSpaces bei n=1000 noch 4087, also **nicht** VSpace/ASID |
+| **Isolierte** PD *(überholt, s. u.)* | 224 | 1504 | 3040 | **RAM**, und zwar **2 MiB je Prozess** (private Region). Linear in der RAM-Grösse; freie VSpaces bei n=1000 noch 4087, also **nicht** VSpace/ASID |
+| **Isolierte** PD, Arbeiter in `.user_text` | **220** | **1477** | — | **RAM**, 2084 KiB je Prozess (2 MiB Region + **20 KiB Seitentabellen**). Diese Zeile misst PDs, deren Thread **lebt** — die darüber tat es nicht |
 
 **Die drei Aussagen, die daraus folgen:**
 
@@ -3382,23 +3385,65 @@ Nebensatz: Z16 Stufe 1 steht damit vor Arbeiten, die nur eine Zusage schärfen, 
       Endowment), dann entscheiden, was davon lazy werden kann. **Vor** dem Umbau messen, sonst
       ist hinterher nicht zu sagen, was die Verbesserung gebracht hat.
 
-- [ ] **Offen, und es ist eine Lücke im MESSINSTRUMENT:** `lade_mangel()` meldete in **jedem**
-      Abbruch `keiner (der Fehlschlag lag NICHT an einer Ressource)` — auch dort, wo das freie
-      RAM nachweislich auf 2 MiB stand. Der benannte Mangel ist heute nur am **`SYS_LOAD`-Pfad**
-      verdrahtet; `spawn_balanced_parked`/`spawn_isolated_parked` geben ein nacktes `None`.
-      Genau die Krankheit, die `NoResources` eine Ebene höher gerade erst behoben hat.
-      **Zu verallgemeinern auf jeden festen Vorrat**: die `vorrat`-Zeile deckt heute PDs,
-      Cap-Slots, Cap-Objekte, Endpoints, Notifications, Thread-Slots, freies RAM und
-      Kernel-Stack-RAM ab. Ohne Füllstandsanzeige sind weiterhin: der **FP-Slab**, die
+- [x] **Der benannte Mangel gilt jetzt auch auf den `spawn_*`-Pfaden** (2026-08-10, nachmittags).
+      Statt `keiner (der Fehlschlag lag NICHT an einer Ressource)` steht am Kurvenende die
+      gemessene Ursache: SAS bei `-m 512M` **„Speicher fuer den Stack eines KERNEL-Threads
+      (64 KiB), angefordert 65536 Byte, frei waren 40960"**; isoliert bei 3 GiB **„Speicher fuer
+      die private Region einer isolierten PD, angefordert 2097152 Byte, frei waren 4706304"**.
+      Zwei neue Codes (`MANGEL_KERNEL_THREAD_STACK`, `MANGEL_PRIVATREGION`),
+      `create_vspace_masked` unterscheidet jetzt **ASID-Platz** von **Seitentabellen-Speicher**
+      (zwei Töpfe in einer Funktion), und `vspace_map_user_region` trennt „Allokator sagte nein"
+      von `MANGEL_MAPPING_ABGEWIESEN`.
+      **Die Menge steht im TYP, nicht daneben:** `benannt_alloc(code, size, f)` reicht `size` an
+      den Allokator weiter *und* meldet sie — die Zahl kommt genau einmal vor. Damit ist die
+      Falle vom Vormittag (`mangel(MANGEL_SEITENTABELLE, 4096)` als Literal) strukturell zu.
+      Bewacht als Prüfzeile `mangel` (gattert): eine **provozierte, wirklich abgewiesene**
+      Anforderung auf `spawn_isolated_colored`, vorher **vergiftet** (`MANGEL_VERGIFTET = 255`),
+      damit Schweigen ein eigener Ausgang ist. Gegenprobe gefahren: das Literal statt der Messung
+      kippt **genau ein** Konjunkt (`gemeldet 4096 Byte (angefordert 16384 Byte)`), die Suite
+      läuft in den Watchdog (`offen waren: mangel`).
+      **Zwei Zahlen, die der Melder nebenbei sichtbar gemacht hat:** die isolierte Kurve endet
+      mit **4,7 MiB freiem RAM** bei einer 2-MiB-Anforderung — die Schranke ist dort
+      **Fragmentierung**, nicht Erschöpfung. Und `spawn_on_core_parked` **verlor bei jedem
+      Fehlschlag des Thread-Slots seine 64 KiB Stack** (`?` ohne Rückgabe) — genau an der
+      Kapazitätsgrenze, wo dieser Zweig läuft. Beides behoben bzw. benannt.
+
+- [ ] **Noch ohne Füllstandsanzeige** (Rest des obigen Punktes): der **FP-Slab**, die
       **VSpace-/ASID-Tabelle** (nur als `free_vspaces()` in der Kurve, nicht im Bericht), die
       **IRTE-Tabelle** und der **Finalisierungspuffer**.
 
-- [ ] **Ebenfalls offen, und es begrenzt die Aussage der Kurve:** eine PD im **globalen**
-      Adressraum zieht **gar keinen** Seitentabellen-Speicher. Die SAS-Kurve kann den Topf, an dem
-      `wasmhost` bei sechs Programmen gescheitert ist, deshalb strukturell nicht erreichen — sie
-      fragt ihn nie. Die isolierte Kurve tut es, und dort ist die private 2-MiB-Region so
-      dominant, dass die Seitentabellen im Rauschen liegen. Eine Kurve, die **den
-      Seitentabellen-Topf** isoliert misst, gibt es noch nicht.
+- [x] **Der Seitentabellen-Topf hat eine Kurve — und die Zahl ist 5 Rahmen (20 KiB) je isolierter
+      PD** (2026-08-10, nachmittags). Gemessen **an der Quelle** (`pt_rahmen` an allen acht
+      Allokationsstellen, `pt_zurueck` an den fünf Freigabestellen), nicht als Differenz des
+      freien RAM — eine Differenz misst Stacks, private Regionen und Segmente mit. Steht in der
+      `vorrat`-Zeile und in jedem Kurvenpunkt.
+      Gemessen bei `-m 3G`, isoliert: n=200 → 1000 Rahmen, n=400 → 2000, … n=1400 → 7000,
+      Ende bei n=1477 → 7385 Rahmen = 29,5 MiB. **Streng linear, 20 480 Byte je Prozess.**
+      Eine geladene PD (Lade-Suite) kostet **7 Rahmen = 28 KiB**; die SAS-Reihe fragt den Topf
+      strukturell nie (0 Rahmen bei n=7206), und **das steht jetzt in der Zeile**.
+      Bewacht als Prüfzeile `ptab` (gattert) mit vier benannten Konjunkten; der schärfste ist die
+      **Bilanz** `raus >= zurueck` — es kann nichts zurückkommen, was nie herausgegeben wurde.
+      Gegenprobe gefahren: eine einzige nicht mehr buchende Allokationsstelle ergibt
+      `9 raus / 17 zurueck`, kippt **genau diesen** Konjunkt, und der Lauf endet im Watchdog
+      (`offen waren: ptab`).
+      Nebenertrag: die Hauptsuite schließt den Topf auf **17 raus / 17 zurueck** — die erste
+      Leckprüfung, die dieser Topf je hatte.
+
+- [x] **Die isolierte Reihe der Tabelle oben maß etwas anderes, als ihr Name sagt.** Der
+      Kurvenarbeiter lag in `.text`; eine isolierte PD bekommt einen **EL0**-Thread, also
+      faultete **jeder einzelne** an seiner eigenen Einsprungadresse. Gemessen: **228
+      `el0-trap`-Zeilen in einem Lauf mit 224 isolierten PDs**, am Ende **0 belegte VSpaces** und
+      ein Seitentabellen-Topf, der auf 15 Rahmen zurückgefallen war. „3040 isolierte Prozesse"
+      hieß in Wahrheit „3040 mal eine PD angelegt, deren Thread sofort starb". Mit
+      `kurven_arbeiter_el0` in `.user_text`: 220 statt 224 bei 512 MiB, **220 belegte VSpaces**,
+      1100 gehaltene Rahmen, 3 Faults im ganzen Lauf.
+      Das ist die Falle aus `CLAUDE.md` wörtlich — nur hat sie hier keine Prüfzeile rot gefärbt,
+      sondern eine **Kapazitätszahl** erzeugt. **Die Zahlen der Tabelle oben (224/1504/3040) sind
+      damit neu zu messen**; die Ersatzwerte lauten bisher 220 (512M) und 1477 (3G).
+
+- [ ] **Die dritte Zeile fehlt weiterhin: die Stack-Wasserstandsmarke** (s. [C4](#c4-die-on-bilanz),
+      „Kernel-Stacks lazy oder geteilt"). Gemessen ist, wie **gross** die Stacks sind — nicht, ob
+      sie **reichen**.
 
 ### C5. GIC-Skalierung (ARM-Blocker für > 8 Kerne) — **weiterhin offen**
 

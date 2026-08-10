@@ -5,6 +5,52 @@ Reihenfolge innerhalb eines Abschnitts = Priorität. `[~]` = teilweise erledigt,
 
 ---
 
+## SPERRT DIE INTEGRATION: das nullgrosse LOAD-Duplikat (2026-08-10)
+
+**Klasse:** Bauwerkzeug · **Stand:** Ursache gemessen, Wächter gebaut, **Behebung offen**
+
+Der Hauptzweig ist gesund (`.boot` bei Dateioffset 4096, warm **und** kalt gebaut, beide Suiten
+grün). **Zwei Änderungszweige kippen die Sektionslage** und erzeugen ein nicht bootbares Abbild —
+und das ist keine Eigenheit dieser Zweige, sondern eine **grenzwertige** Bedingung, in die jede
+hinreichend grosse Änderung laufen kann.
+
+**Die Ursache, gemessen:** `lld` legt wegen der `AT()`-Ladeadressen des AP-Trampolins zusätzliche,
+einander überlappende Segmente an, darunter ein **nullgrosses**, das eine fremde `vaddr`
+dupliziert (`LOAD off=0x185000 vaddr=0x9000 filesz=0 memsz=0xf8000`). GNU objcopy **2.46.1**
+bildet dieses Duplikat beim Umwandeln nach ELF32 nicht ab und legt `.boot` danach **ausserhalb
+jedes Segments** — Dateioffset ~740 000 statt 4096. QEMU findet den Multiboot-Header nicht und
+lädt kommentarlos gar nicht: `Error loading uncompressed kernel without PVH ELF Note`, Logdatei
+**0 Byte**.
+
+**Gebaut ist der Wächter** (`build-x86.sh`): er sucht `0x1BADB002` 4-Byte-ausgerichtet, bricht mit
+dem gemessenen Offset ab und druckt die LOAD-Tabelle dazu. Ein Bauwerkzeug, das ein unbootbares
+Abbild ausliefert, ist die Bauzeit-Fassung von „Schweigen als Erfolg".
+
+- [ ] **Die Behebung selbst.** Zwei Versuche, beide gemessen und beide zurückgenommen — sie stehen
+      hier, damit der nächste sie nicht wiederholt:
+
+      **(a) Explizite `PHDRS` + DWARF-Sektionen an Adresse 0.** Ergebnis: Header wieder bei 4096
+      und **null** nullgrosse Segmente — aber acht einander **überlappende** LOADs mit absurden
+      Grössen (`filesz=0x8b132` bei einem Segment, dessen Nachbar 0x11000 weiter beginnt). Der
+      gesunde Baum hat an dieser Stelle saubere, nicht überlappende Segmente. `:NONE` an den
+      Debug-Sektionen änderte daran **nichts** — sie waren also nicht die Ursache. Bootete nicht.
+
+      **(b) Den AP-Trampolin-Block ans ENDE der Ladesektionen verschieben** (statt in die Mitte).
+      Ergebnis: Header bei 4096, **null** nullgrosse Segmente, saubere nicht überlappende LOADs —
+      **und es bootet**, der Kernel läuft an. Aber er kommt nicht weit (ACPI/MADT, Speicherplan,
+      SMP, Paging fallen durch), weil `.aptramp_data` jetzt die BSS als **Dateiinhalt**
+      verschluckt: `filesz=0xf7000` statt `0x58`. Die `. = __aptramp_data_lma + SIZEOF(…)`-
+      Arithmetik gilt an der neuen Stelle nicht mehr.
+
+      **(b) ist der aussichtsreichere Weg** — er löst das Segmentproblem vollständig, und was
+      übrigbleibt, ist eine Adressarithmetik, die mitwandern muss (`.bss`/`.boot_bss` dürfen ihre
+      NOLOAD-Eigenschaft nicht verlieren). Die Abnahme ist billig: `filesz` des letzten Segments
+      muss wieder in der Grössenordnung `0x58` liegen, nicht `0xf7000`.
+
+      **Und eine Falle, die dabei zweimal zugeschlagen hat:** *Cargo kennt Linkerskripte nicht als
+      Eingabe.* Eine Änderung an `.ld` löst **kein** Neu-Linken aus; ohne `touch` auf eine
+      Quelldatei misst man den vorigen Stand und hält ihn für das Ergebnis.
+
 ## Z. Zielarchitektur (Stand 2026-07-29) — woran alles andere zu messen ist
 
 > **Reihenfolge und Begründung:** [docs/plan-betriebsbereit.md](docs/plan-betriebsbereit.md).

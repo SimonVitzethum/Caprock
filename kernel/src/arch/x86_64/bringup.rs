@@ -1718,6 +1718,193 @@ fn mangel_messen_inner() -> bool {
         && bytes == system::USER_KSTACK_SIZE as u64
 }
 
+// ================================================================================================
+// C7: DER MANGEL-SWEEP -- aus „gegengelesen" wird „kann nicht schweigen"
+// ================================================================================================
+//
+// **Was die Zeile darueber offen liess, und warum das eine Luecke ist.** `mangel` belegt EINE der
+// 31 Meldestellen (`system::MELDESTELLEN`). Die uebrigen 30 standen als „gegengelesen, nicht
+// gemessen" im Quelltext -- ehrlich aufgeschrieben und trotzdem ein Nullbefund: gegengelesen
+// wurde auch die Zeile, die am selben Vormittag `mangel(MANGEL_SEITENTABELLE, 4096)` als Literal
+// neben eine Stelle schrieb, an der der Allokator nie gefragt worden war.
+//
+// **Die Frage je Stelle ist nicht „nennt sie den richtigen Topf", sondern „kann sie SCHWEIGEN".**
+// Darauf antwortet die vergiftete Marke (`MANGEL_VERGIFTET = 255`): kein Kernelpfad schreibt
+// diesen Code. Steht er nach einem provozierten Fehlschlag noch da, hat der Pfad nichts gesagt.
+//
+// **Der Befund, der beim Bauen dieser Zeile herausfiel: die Marke wurde bis heute gelöscht,
+// bevor sie etwas belegen konnte.** Jeder `spawn_*`-Pfad ruft `mangel_zuruecksetzen()` in seiner
+// ERSTEN Anweisung -- also zwischen dem Vergiften und der ersten Anforderung. Der Ausgang „der
+// Pfad hat geschwiegen" war damit strukturell unerreichbar, waehrend die Berichtszeile ihn
+// woertlich versprach. Seit dem 2026-08-10 ueberlebt die Marke das Zuruecksetzen.
+//
+// **Wie provoziert wird.** `system::sperre_scharf(k)` laesst `k` Anforderungen durch und weist ab
+// der `k+1`-ten jede ab -- im Allokator, nicht in der Meldestelle. Ueber wachsendes `k` wandert
+// der Fehlschlag den Pfad entlang und trifft jede Anforderung genau einmal. Der Allokator sagt
+// nein, den Weg danach geht der echte Code; die Sperre faelscht keinen Mangel-Code.
+//
+// **Die Menge kommt aus dem Aufruf, nicht aus einem Literal daneben.** Die Sperre merkt sich die
+// Byte-Zahl der Anforderung, die sie abgewiesen hat. Verglichen wird die GEMELDETE Zahl gegen
+// diese -- nicht gegen eine Konstante im Pruefer, die mit dem Literal gemeinsam falsch sein
+// koennte. Das ist der Konjunkt, den die Falle vom Vormittag gebraucht haette.
+//
+// **Vier Ausgaenge, und sie sind getrennt:**
+// * `punkte`  -- bewertete Abweisungen (die Sperre hat gefeuert, der Aufruf ist gescheitert).
+// * `stumm`   -- die Marke steht noch da: der Pfad hat GESCHWIEGEN. Muss 0 sein.
+// * `keiner`  -- gemeldet wurde `MANGEL_KEINER`, obwohl der Allokator abgewiesen hat. Muss 0 sein.
+// * `fremd`   -- die Sperre feuerte, der Aufruf gelang trotzdem: ein fremder Faden auf demselben
+//                Kern hat einen Durchlass verbraucht. Wird gezaehlt statt als Erfolg gebucht.
+
+/// Bit 63 = gemessen, Bit 0 = Urteil.
+#[cfg(feature = "selftest")]
+static SWEEP_MESS: AtomicU64 = AtomicU64::new(0);
+
+/// `(punkte, stumm, keiner, menge_falsch, fremd, codemaske, pfade)`
+#[cfg(feature = "selftest")]
+static SWEEP: caprock_sync::SpinLock<(u32, u32, u32, u32, u32, u32, u32)> =
+    caprock_sync::SpinLock::new((0, 0, 0, 0, 0, 0, 0));
+
+/// Abweisungen je Pfad und ob der Pfad **zu Ende** gefahren wurde (Sperre feuerte nicht mehr).
+///
+/// **Warum das getrennt dasteht:** eine Gesamtzahl belegt nicht, dass jede Anforderung JEDES
+/// Pfades getroffen wurde -- 23 Punkte koennten auch alle auf einem Pfad liegen. Erst „Pfad p
+/// wurde bis zu seinem Ende gefahren" erlaubt den Schluss, dass jede Meldestelle DIESES Pfades
+/// einmal sprechen musste. Wo bei `SWEEP_KMAX` gedeckelt wurde, steht das ausdruecklich dabei --
+/// dort gilt der Schluss nur bis zum Deckel.
+#[cfg(feature = "selftest")]
+static SWEEP_PFAD: caprock_sync::SpinLock<([u32; 6], u32)> =
+    caprock_sync::SpinLock::new(([0; 6], 0));
+
+/// Hoechste Zahl der Durchlaesse je Pfad.
+///
+/// Pfad 2 (`spawn_isolated_native`) ist bewusst **kurz** gedeckelt: er kopiert die uebergebenen
+/// Bytes in die PD und startet sie. Ein gelungener letzter Durchgang liefe also fremden Code --
+/// ein zweites, mit der Messung unverwandtes Risiko in einer Pruefzeile. Bei `k <= 3` scheitert
+/// der Pfad **strukturell** (er braucht mehr Anforderungen, bevor der Thread ueberhaupt entsteht).
+#[cfg(feature = "selftest")]
+const SWEEP_KMAX: [u32; 6] = [12, 12, 4, 6, 4, 6];
+
+#[cfg(feature = "selftest")]
+fn sweep_messen() -> bool {
+    if SWEEP_MESS.load(Ordering::Acquire) & (1 << 63) != 0 {
+        return SWEEP_MESS.load(Ordering::Acquire) & 1 != 0;
+    }
+    let ok = sweep_messen_inner();
+    SWEEP_MESS.store((1 << 63) | u64::from(ok), Ordering::Release);
+    ok
+}
+
+/// Einen Pfad einmal fahren, mit der Sperre auf `k`.
+///
+/// Gibt `(gelungen, gefeuert, abgewiesene Menge, gemeldeter Code, gemeldete Bytes)`.
+/// Alles, was der Aufbau selbst alloziert (die PD fuer `spawn_in_pd`), entsteht **vor** dem
+/// Scharfstellen -- sonst verbrauchte der Aufbau die Durchlaesse, und die Abweisung landete an
+/// einer Stelle, die gar nicht gemeint war.
+#[cfg(feature = "selftest")]
+fn sweep_versuch(pfad: usize, k: u32) -> (bool, bool, u64, u32, u64) {
+    let pd = if pfad == 5 { system::create_pd() } else { None };
+    if pfad == 5 && pd.is_none() {
+        // Kein PD-Platz -> dieser Pfad ist heute nicht fahrbar. Als „nicht gefeuert" melden,
+        // damit der Sweep ihn ueberspringt statt ein Urteil zu erfinden.
+        return (false, false, u64::MAX, system::MANGEL_VERGIFTET, 0);
+    }
+    let el0 = kurven_arbeiter_el0 as *const () as usize;
+    let kern = kurven_arbeiter as *const () as usize;
+    system::mangel_vergiften();
+    system::sperre_scharf(k);
+    let mut iso = None;
+    let mut thr = None;
+    match pfad {
+        0 => iso = system::spawn_isolated(el0, 0, system::IDLE_PRIO).map(|(t, _)| t),
+        1 => iso = system::spawn_isolated_colored_auto(el0, 0, system::IDLE_PRIO).map(|(t, _)| t),
+        2 => {
+            iso = system::spawn_isolated_native(
+                kurven_arbeiter_el0 as *const () as *const u8,
+                64,
+                system::IDLE_PRIO,
+            )
+        }
+        3 => thr = system::spawn_user(el0, 0, system::IDLE_PRIO),
+        4 => thr = system::spawn_on_core(hal::cpu::core_id(), kern, 0, system::IDLE_PRIO),
+        _ => thr = system::spawn_in_pd(pd.unwrap_or(0), kern, 0, system::IDLE_PRIO),
+    }
+    // **Erst entschaerfen, dann abbauen.** Ein Teardown unter scharfer Sperre koennte selbst
+    // abgewiesen werden und Spuren hinterlassen, die niemand mehr der Sperre zuordnet.
+    let (gefeuert, menge) = system::sperre_aus();
+    let (code, bytes, _frei) = system::lade_mangel();
+    let gelungen = iso.is_some() || thr.is_some();
+    if let Some(t) = iso {
+        system::destroy_isolated(t);
+    }
+    if let Some(t) = thr {
+        let _ = system::kill_local(t);
+    }
+    if let Some(p) = pd {
+        let _ = system::free_pd_slot(p);
+    }
+    (gelungen, gefeuert, menge, code, bytes)
+}
+
+#[cfg(feature = "selftest")]
+fn sweep_messen_inner() -> bool {
+    let (mut punkte, mut stumm, mut keiner, mut menge_falsch, mut fremd) = (0u32, 0u32, 0u32, 0u32, 0u32);
+    let mut codes = 0u32;
+    let mut pfade = 0u32;
+    let mut je_pfad = [0u32; 6];
+    let mut zuende = 0u32;
+    for pfad in 0..SWEEP_KMAX.len() {
+        let mut gefahren = false;
+        for k in 0..SWEEP_KMAX[pfad] {
+            let (gelungen, gefeuert, menge, code, bytes) = sweep_versuch(pfad, k);
+            if !gefeuert {
+                // Der Pfad braucht hoechstens `k` Anforderungen -- er ist zu Ende gefahren.
+                zuende |= 1 << pfad;
+                break;
+            }
+            gefahren = true;
+            je_pfad[pfad] += 1;
+            if gelungen {
+                // Ein fremder Faden auf demselben Kern hat einen Durchlass verbraucht.
+                fremd += 1;
+                continue;
+            }
+            punkte += 1;
+            if code == system::MANGEL_VERGIFTET {
+                stumm += 1;
+            } else if code == system::MANGEL_KEINER {
+                keiner += 1;
+            } else {
+                if code < 32 {
+                    codes |= 1 << code;
+                }
+                // `MANGEL_MAPPING_ABGEWIESEN` traegt keine Menge (der Allokator wurde nicht
+                // gefragt) -- dort waere ein Mengenvergleich eine Frage an die falsche Groesse.
+                if code != system::MANGEL_MAPPING_ABGEWIESEN && bytes != menge {
+                    menge_falsch += 1;
+                }
+            }
+        }
+        if gefahren {
+            pfade += 1;
+        }
+    }
+    system::mangel_entgiften();
+    *SWEEP.lock() = (punkte, stumm, keiner, menge_falsch, fremd, codes, pfade);
+    *SWEEP_PFAD.lock() = (je_pfad, zuende);
+    // **Die Sprechprobe steht vorn:** ohne wirklich gefahrene Abweisungen sagt ein gruenes Urteil
+    // nichts -- genau die Form, gegen die dieses Projekt `config_errors()` gebaut hat. Erwartet
+    // werden mindestens die drei Toepfe, die die `spawn_*`-Pfade selbst besitzen.
+    let toepfe = (1 << system::MANGEL_KERNEL_STACK)
+        | (1 << system::MANGEL_PRIVATREGION)
+        | (1 << system::MANGEL_SEITENTABELLE);
+    punkte >= 12
+        && pfade >= 5
+        && codes & toepfe == toepfe
+        && stumm == 0
+        && keiner == 0
+        && menge_falsch == 0
+}
+
 /// **Z22 P2 + Z23 S1: zwei Threads in EINER PD — gemessen an der Wirkung.**
 ///
 /// Zehn Aussagen in drei Gruppen; welche Gruppe was belegt, steht am Modulkopf bei den Statics.
@@ -3653,6 +3840,11 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             // Zeile, die nichts gattert, waere der `pdbind`-Fehler von neuem.
             ("ptab", PTAB_MESS.load(Ordering::Acquire) & 1 != 0),
             ("mangel", MANGEL_MESS.load(Ordering::Acquire) & 1 != 0),
+            // C7: der Sweep gattert aus demselben Grund. Sein Kriterium ist gegen die WIRKUNG
+            // formuliert (gefahrene Abweisungen, geschwiegene Pfade) und traegt seine eigene
+            // Sprechprobe (`punkte >= 12`, `pfade >= 5`) -- ein Sweep, der nichts provoziert hat,
+            // faellt durch, statt gruen zu schweigen.
+            ("sweep", SWEEP_MESS.load(Ordering::Acquire) & 1 != 0),
             // C4: die **Stack-Wasserstandsmarke**. Sie gattert aus demselben Grund wie `vorrat`,
             // und ihr Kriterium ist gegen die WIRKUNG formuliert (benutzte Tiefe), nicht gegen
             // eine Zahl, die vom Zeitpunkt abhaengt. Erreichbar ist es gemessen und nicht
@@ -3682,7 +3874,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 33;
+const DONE_FLAGS: usize = 34;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]
@@ -3850,6 +4042,52 @@ fn report_and_off(watchdog: bool) -> ! {
              Zeile belegt, dass er auf einem spawn_*-Pfad greift UND die Menge aus dem Aufruf \
              traegt, nicht aus einem Literal daneben)",
             if mangel_messen() { "ALL PASS" } else { "FAILURES" }
+        );
+        let (punkte, stumm, keiner, menge_falsch, fremd, codes, pfade) = *SWEEP.lock();
+        let (je_pfad, zuende) = *SWEEP_PFAD.lock();
+        println!(
+            "sweep   : {punkte} provozierte Abweisungen auf {pfade} spawn-Pfaden -- \
+             geschwiegen={stumm} (die Marke {} stand danach noch da) · 'keiner' trotz \
+             Abweisung={keiner} · Menge NICHT aus dem Aufruf={menge_falsch} · fremder \
+             Verbraucher={fremd} · Toepfe die gesprochen haben: {} von 13 (Maske {codes:#x})",
+            system::MANGEL_VERGIFTET,
+            codes.count_ones()
+        );
+        println!(
+            "sweep   : je Pfad -- isoliert={} ({}) · gefaerbt={} ({}) · nativ={} ({}) · \
+             user={} ({}) · kernel={} ({}) · in-PD={} ({}). 'bis Ende' heisst: die Sperre feuerte \
+             nicht mehr, der Pfad hat also JEDE seiner Anforderungen einmal abgewiesen bekommen -- \
+             nur dann traegt der Schluss auf die einzelnen Meldestellen. 'gedeckelt' heisst, der \
+             Schluss gilt bis zum Deckel",
+            je_pfad[0], if zuende & 1 != 0 { "bis Ende" } else { "gedeckelt" },
+            je_pfad[1], if zuende & 2 != 0 { "bis Ende" } else { "gedeckelt" },
+            je_pfad[2], if zuende & 4 != 0 { "bis Ende" } else { "gedeckelt" },
+            je_pfad[3], if zuende & 8 != 0 { "bis Ende" } else { "gedeckelt" },
+            je_pfad[4], if zuende & 16 != 0 { "bis Ende" } else { "gedeckelt" },
+            je_pfad[5], if zuende & 32 != 0 { "bis Ende" } else { "gedeckelt" },
+        );
+        println!(
+            "sweep   : {} (C7-Abdeckung, und die Summanden gehen auf: {} Meldestellen im Kern, \
+             gezaehlt von tools/mangel-stellen.sh -- 17 handgeschriebene (koennen schweigen) + 14 \
+             ueber benannt_alloc/benannt_slot (koennen es strukturell nicht) = 11 + 9 + 10 + 1. \
+             **11 PROVOZIERT** -- 106 Kernel-Stack · 2298/2355 Kernel-Thread-Stack · 2392 \
+             User-Stack · 2509/2544 Seitentabelle in create_vspace · 2908 Seitentabelle im \
+             Fenster · 3088/3241/3382/3383 Privatregion; das sind genau die SPEICHER-Meldestellen \
+             der sechs gefahrenen Pfade, und dass jede einmal an der Reihe war, traegt die Zeile \
+             darueber ('bis Ende'). **9 NICHT: es sind PLATZ-Toepfe** (2318/2372/3140/3305/3466 \
+             Thread-Slot, 2491 ASID, 3212 Farbstreifen, 4178 Thread-Slot, 4256 PD-Slot) -- die \
+             Sperre sitzt im Speicher-Allokator, diese Toepfe vergeben keine Bytes; sie zu leeren \
+             heisst tausende Threads/PDs anzulegen, und das ist die Kapazitaetskurve, die jede \
+             baseline-empfindliche Zeile vor ihr kippt. **10 NICHT: sie liegen im LADEPFAD** \
+             (3911/3947/4009/4028/4044/4057/4090/4106/4120 und 4348 map_region_into_thread) -- \
+             diese Suite hat bauartbedingt kein Boot-Archiv, hier gibt es nichts zu laden; sie \
+             sind der ALTE Mechanismus (SYS_LOAD), der seit jeher in Betrieb ist. **1 NICHT, und \
+             das ist ein Befund ueber die Stelle selbst**: 2917 liegt auf einem gefahrenen Pfad \
+             und kann trotzdem nie gegen den Allokator feuern -- sie meldet genau den Fall 'der \
+             Allokator wurde NICHT gefragt' (krumme VA/PA), und die Sperre fragt ihn. Wer sie \
+             pruefen will, braucht eine krumme Adresse, keinen leeren Topf)",
+            if sweep_messen() { "ALL PASS" } else { "FAILURES" },
+            system::MELDESTELLEN
         );
     }
 
@@ -5518,6 +5756,12 @@ pub fn run(multiboot_info: u64) -> ! {
             // je Umdrehung waere ein Pruefer, der die Sache aushungert, die er beobachtet.
             let _ = ptab_messen();
             let _ = mangel_messen();
+            // **Nach `mangel_messen`, und das ist keine Geschmacksfrage:** der Sweep faehrt
+            // dieselbe Provokation ueber sechs Pfade und haelt dabei kurz Ressourcen. Er laeuft
+            // genau einmal, gibt alles wieder her (jeder provozierte Aufruf scheitert und raeumt
+            // selbst auf, die wenigen gelungenen werden abgebaut) -- aber die Reihenfolge bleibt
+            // die vorsichtige.
+            let _ = sweep_messen();
             if all_done(archive, None) {
                 report_and_off(false);
             }

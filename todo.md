@@ -26,6 +26,26 @@ Lehre trägt:
    von Anfang an, mit derselben A3-Arbeit gemerged → **keine leeren Duplikatsektionen**, Header
    bei 4096, `== ALL PASS ==` in **beiden** Suiten, alle Wächter grün.
 
+**BERICHTIGUNG des eigenen Schlusses.** „Der Blocker existierte als Codeproblem nie" ist eine
+Hypothese im Ergebniskostüm. **Belegt** ist nur: er **reproduziert auf frischem Zweig nicht**.
+Ursache mit hoher Wahrscheinlichkeit ein Bau-Artefakt; **Residualrisiko: ein reihenfolgeabhängiges
+Layout**. Der Unterschied ist nicht akademisch — die drei Versuchszeilen sind als *Messwerte*
+entwertet, aber die *Beobachtungen* (acht überlappende LOADs, ~1 MiB `filesz` über reinem NOBITS)
+waren echte `readelf`-Ausgaben **irgendeines** Binaries. War es der veraltete Stand: gut. Macht
+aber eine Kombination aus Sektionsreihenfolge und Skript das Layout reihenfolgeabhängig, kommt der
+Fall wieder.
+
+**Deshalb ist die Eigenschaft jetzt dauerhaft geprüft statt behauptet:** der Bauzeit-Wächter
+verlangt zusätzlich, dass **kein LOAD-Segment Dateiinhalt trägt, wo nur NOBITS-Sektionen liegen** —
+genau die Form, an der sich der Fall zeigte, nicht die vermutete Ursache. Dieselbe Bewegung, die
+aus dem wasm-Fall die Vollzähligkeits-Zeile gemacht hat.
+Zwei eigene Fehler dabei, beide gemessen: die erste Fassung **rechnete die Zuordnung
+Sektion → Segment nach** statt sie zu lesen und ordnete dem Segment bei `0x9000` prompt `.boot`,
+`.text` und `.rodata` zu (dessen `memsz` überspannt den ganzen Bildbereich) — die
+`iova_window_clear_of_msi`-Falle, im eigenen Wächter. Jetzt wird die Zuordnung aus `readelf`
+gelesen. Und die Sprechprobe hat das gefangen, nicht das Gegenlesen: mit `all` → `any` mutiert
+nennt der Wächter jetzt genau `.aptramp_data, .bss, .boot_bss`.
+
 **Die Lehre ist nicht „Linkerskripte sind heikel", sondern: eine Messung muss wissen, welches
 Artefakt sie gemessen hat.** Der Binary-Fingerprint der Suiten schliesst „veralteter Build" als
 Erklärung für einen *Suitenlauf* aus — für den *Linkerschritt* war dieselbe Tür offen, und drei

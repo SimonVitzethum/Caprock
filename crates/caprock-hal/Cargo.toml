@@ -9,6 +9,18 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# **Pruefinfrastruktur der HAL** — heute genau eine Zeile: der Selbsttest der IRTE-Vergabe
+# (Z22 P1). Er steht hier und nicht im Kernel, weil er GENAU DANN laufen muss, wenn Interrupt
+# Remapping frisch aufgesetzt ist: davor ist er strukturell blind (die Tabelle steht noch nicht),
+# danach gibt es im Hochlauf keinen Punkt, an dem er ohne Aenderung an `bringup.rs` erreichbar
+# waere.
+#
+# **NICHT in `default`** — aus demselben Grund wie `caprock-kernel/selftest`: der Release-Build
+# enthaelt keinen Testcode. `caprock-kernel/selftest` schaltet ihn mit ein, damit beide Suiten
+# genau eine Konfiguration bauen (zwei Suiten, die dasselbe verschieden aufsetzen, sind ein Riss).
+selftest = []
+
 [dependencies]
 # Treiberlogik liegt bewusst AUSSERHALB der HAL (todo A-5.1) -- diese Crate haengt an nichts.
 caprock-virtio = { path = "../caprock-virtio" }

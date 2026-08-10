@@ -77,7 +77,7 @@ mit_deps() { # $1 = Name, $2 = Crate-Verzeichnis, $3.. = Abhaengigkeiten (Verzei
     rm -rf "$SA"
 }
 
-ZIELE="${*:-mem part fat cycles loader cap virtio dma wait irte dmar dmarneg redirect redirectneg typestate ipctreue}"
+ZIELE="${*:-mem part fat cycles loader cap virtio dma wait irte irteneg grossdmaneg dmar dmarneg redirect redirectneg typestate ipctreue}"
 for z in $ZIELE; do
     case "$z" in
         mem)  einzeln mem  "$ROOT/crates/caprock-mem/src/lib.rs" ;;
@@ -128,6 +128,30 @@ for z in $ZIELE; do
         # nicht": ohne Fehlermeldung, ohne Fault, ohne irgendetwas, das nach einem Fehler
         # aussieht. Mit Literalen in Sekunden pruefbar; in QEMU braeuchte es Geraet und Glueck.
         irte) einzeln irte "$ROOT/crates/caprock-hal/src/x86_64/irte.rs" ;;
+        # ... und die Gegenprobe dazu (Z22 P1, 2026-08-10). Dieselbe Begruendung wie bei `dmarneg`:
+        # die Tests in `irte.rs` sehen nur den BEHOBENEN Zustand. Sieben Mutationen bauen den
+        # Fehler einzeln wieder ein, jede mit dem NAMEN des Tests, der fallen muss. In QEMU waere
+        # das nicht zu zeigen -- ein falsches Bit in einer IRTE aeussert sich als „das Geraet
+        # unterbricht einfach nicht".
+        irteneg)
+            if [ ! -f "$ROOT/tools/irte-vergabe-negativ.sh" ]; then
+                echo "== Host-Tests: irteneg =="
+                echo "  FEHLT: tools/irte-vergabe-negativ.sh ist nicht vorhanden -- Ziel nicht gelaufen"
+                fail=1
+            else
+                bash "$ROOT/tools/irte-vergabe-negativ.sh" || fail=1
+            fi ;;
+        # Die Gegenprobe zur Klassifikation grosser DMA (Z26 V2). Der interessante Teil ist die
+        # REIHENFOLGE der Pruefungen: dieselbe Lage kann zwei wahre Namen haben, und der falsche
+        # schickt den Leser in die falsche Richtung.
+        grossdmaneg)
+            if [ ! -f "$ROOT/tools/grossdma-negativ.sh" ]; then
+                echo "== Host-Tests: grossdmaneg =="
+                echo "  FEHLT: tools/grossdma-negativ.sh ist nicht vorhanden -- Ziel nicht gelaufen"
+                fail=1
+            else
+                bash "$ROOT/tools/grossdma-negativ.sh" || fail=1
+            fi ;;
         dmar) einzeln dmar "$ROOT/crates/caprock-hal/src/x86_64/dmar.rs" ;;
         # ... und die Gegenprobe dazu: die Tests oben sehen nur den BEHOBENEN Zustand. Vier
         # Mutationen bauen den Fehler einzeln wieder ein, jede mit dem NAMEN des Tests, der fallen
@@ -176,7 +200,7 @@ for z in $ZIELE; do
             else
                 bash "$ROOT/tools/verus-modelltreue-ipc.sh" || fail=1
             fi ;;
-        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio dma wait irte dmar dmarneg redirect redirectneg typestate ipctreue)"; fail=1 ;;
+        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio dma wait irte irteneg grossdmaneg dmar dmarneg redirect redirectneg typestate ipctreue)"; fail=1 ;;
     esac
 done
 

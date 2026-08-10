@@ -27,7 +27,11 @@ fn run_is_colored(start: u64, npages: u64, colors: u32, mask: ColorMask) -> bool
 /// Maximale Anzahl freier Fragmente. 64 genügte QEMU, wird aber auf realer HW mit vielen
 /// GLEICHZEITIG lebenden isolierten PDs überschritten -> `alloc` gibt `None` trotz freiem RAM
 /// (Split-Rest passt nicht in die Liste). 1024 * 16 B = 16 KiB BSS; alloc/free scannen linear (O(n)).
-const MAX_FRAGMENTS: usize = 1024;
+/// **Öffentlich seit 2026-08-10**, weil ein Aufrufer den Fall „freies RAM ist da, die Liste ist
+/// voll" sonst nicht von „zu wenig Speicher" unterscheiden kann — und dann im Speicherverbrauch
+/// sucht, wo eine Kapazität fehlt (s. `caprock_dma::gross::GrossDmaFehler::FreilisteVoll`). Eine
+/// Kapazität, die niemand lesen kann, macht ihren Überlauf unbenennbar.
+pub const MAX_FRAGMENTS: usize = 1024;
 
 /// Physischer Speicher-Allokator über eine feste Freiliste.
 pub struct PhysAllocator {

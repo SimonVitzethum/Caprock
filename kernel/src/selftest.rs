@@ -25,6 +25,43 @@ pub fn run() {
     captest();
     budgettest();
     dmaaligntest();
+    grossdmatest();
+}
+
+/// **Grosse, zusammenhängende DMA** (Z26, Vorbedingung 2) — die Zuteilungshälfte.
+///
+/// Steht hier und nicht bei den DMA-Tests, weil sie **keine IOMMU** braucht: geprüft werden der
+/// Allokator und die Klassifikation. Die Hälfte, die eine Gerätesicht braucht
+/// (`grossdma::pruefe_ende_zu_ende`), gehört hinter `dma_enforcer_init()` und läuft hier
+/// ausdrücklich **nicht** mit — eine Zeile, die zwei Aussagen mischt, von denen eine gar nicht
+/// gemessen werden konnte, ist genau die Sorte stiller Zustimmung, gegen die dieses Projekt steht.
+fn grossdmatest() {
+    let b = crate::grossdma::pruefe();
+    if !b.sprechfaehig {
+        // SKIP mit Zahlen, nicht PASS: auf einer Maschine, deren grösster Block kleiner ist als
+        // die Probe, sagt die Zeile nichts — und das soll man ihr ansehen.
+        println!(
+            "grossdma: SKIP  (groesster Block {} B < Probe {} B; Zone {} B)",
+            b.groesster_block,
+            crate::grossdma::PROBE_BYTES,
+            b.zone
+        );
+        return;
+    }
+    println!(
+        "grossdma: {}  probe={}B gross-geht={} in-der-zone={} zu-gross-benannt={} \
+         erschoepft-benannt={} krumm-benannt={} kein-verlust={} groesster-block={}B zone={}B",
+        if b.ok() { "ALL PASS" } else { "FAILURES" },
+        crate::grossdma::PROBE_BYTES,
+        b.gross_geht,
+        b.in_der_zone,
+        b.zu_gross_benannt,
+        b.erschoepft_benannt,
+        b.krumm_benannt,
+        b.kein_verlust,
+        b.groesster_block,
+        b.zone
+    );
 }
 
 /// **Granularitäts-Bedingung der DMA-Cap** (ext-35): ein Puffer, dessen Anfang oder Länge nicht

@@ -3907,7 +3907,13 @@ pub const MANGEL_VERGIFTET: u32 = 255;
 ///
 /// Bewacht von `tools/mangel-stellen.sh`: das Skript zaehlt im Quelltext nach und bricht ab, wenn
 /// diese Zahl nicht mehr stimmt. Eine Zahl im Kommentar verrottet, eine Zahl mit Waechter nicht.
-pub const MELDESTELLEN: usize = 31;
+///
+/// **Die Ratsche hat sofort gegriffen, und zwar auf einem Zusammenfluss zweier Zweige:** die
+/// Guard-Page am Kernel-Stack brachte mit `MANGEL_GUARD_TABELLE` eine 32. Stelle mit, waehrend
+/// der Sweep parallel gegen 31 gezaehlt hatte. Beide Aenderungen waren fuer sich richtig, der
+/// Nenner war es nach dem Merge nicht mehr -- und ein falscher Nenner macht aus einer Abdeckung
+/// eine Behauptung. Aufgefallen ist es nicht beim Gegenlesen, sondern in `tools/abnahme.sh`.
+pub const MELDESTELLEN: usize = 32;
 
 /// `code << 32 | angeforderte_bytes`
 static LADE_MANGEL: AtomicU64 = AtomicU64::new(0);

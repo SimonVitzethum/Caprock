@@ -105,6 +105,122 @@ extern "C" fn ipc_server(_arg: usize) -> ! {
     }
 }
 
+// ================================================================================================
+// Z22 P2: MEHRERE THREADS JE PD — und die Messung, die Z23 S1 dadurch erst bekommt
+// ================================================================================================
+//
+// Bis heute trug eine PD **einen** Thread: `Pd::thread` war ein Feld, `pd_of` ein linearer Scan
+// darüber. Eine zweite Bindung überschrieb die erste, und der erste Thread verlor damit lautlos
+// seinen ganzen Cspace — `pd_of` fand ihn nicht mehr, jeder seiner Syscalls endete in
+// `ERR_NOPD`. Dieselbe Form wie „eine Ablage je ROLLE" (`CLIENT_NTFN`): eine Zelle für etwas,
+// das es mehrfach gibt.
+//
+// Gemessen wird hier die **Wirkung**, nicht das Feld — an drei verschiedenen Größen:
+//
+//  1. **Derselbe Cspace.** Server und Client sind zwei Threads DERSELBEN PD und reden über
+//     **denselben lokalen Cap-Slot** miteinander. Gelänge die Bindung nur einem von beiden,
+//     bekäme der andere `ERR_NOPD` statt `OK`.
+//  2. **Getrennte Grund-Mengen (Z24).** Der Server parkt sich; sein Rundenzähler muss stehen,
+//     **während der des Clients weiterläuft**. Ohne die zweite Hälfte wäre „steht" von „ist
+//     tot" nicht zu unterscheiden — und ohne die erste hieße eine gemeinsame Grund-Menge, dass
+//     ein `PARK` des einen den anderen mitnimmt.
+//  3. **Z23 S1: `REPLY` bleibt erlaubt.** Diese Zusicherung war *gebaut, aber nicht gemessen*,
+//     und der Grund stand in der `qgate`-Zeile: es braucht eine **offene Transaktion**, also
+//     zwei Threads in derselben PD. Genau die gibt es jetzt: der Client hängt in seinem `CALL`,
+//     der Server hält den Reply-Token — und **in diesem Zustand** werden die Tore geschlossen.
+//     `RECV` und `CALL` müssen dann `ERR_QUIESCING` geben, `REPLY` muss durchgehen, und der
+//     Client muss seine Antwort bekommen.
+//
+// **Warum die Tore erst NACH dem Rendezvous zugehen** (und nicht wie bei `qgate` vorher): hier
+// ist die offene Transaktion der Messgegenstand. Vorher geschlossen gäbe es sie gar nicht, und
+// der Test würde wieder nur belegen, dass ein Tor schließt.
+#[cfg(feature = "selftest")]
+static PT_PD: AtomicU64 = AtomicU64::new(u64::MAX);
+/// ThreadIds der beiden Threads DERSELBEN PD (0 = noch nicht veröffentlicht).
+#[cfg(feature = "selftest")]
+static PT_S_TID: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "selftest")]
+static PT_C_TID: AtomicU64 = AtomicU64::new(0);
+/// Ergebniscodes — **roh**. „Abgewiesen" und „mit DIESEM Grund abgewiesen" sind zwei Aussagen.
+#[cfg(feature = "selftest")]
+static PT_RECV1_CODE: AtomicU64 = AtomicU64::new(u64::MAX);
+#[cfg(feature = "selftest")]
+static PT_RECV2_CODE: AtomicU64 = AtomicU64::new(u64::MAX);
+#[cfg(feature = "selftest")]
+static PT_CALL_GATE_CODE: AtomicU64 = AtomicU64::new(u64::MAX);
+#[cfg(feature = "selftest")]
+static PT_REPLY_CODE: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Was der Client aus seinem `CALL` zurückbekommt (erwartet 42) und ob er überhaupt fertig ist.
+#[cfg(feature = "selftest")]
+static PT_CLIENT_ANTWORT: AtomicU64 = AtomicU64::new(u64::MAX);
+#[cfg(feature = "selftest")]
+static PT_CLIENT_FERTIG: AtomicBool = AtomicBool::new(false);
+/// Rundenzähler beider Threads — die Größe, an der „läuft" ablesbar ist (kein Zustandsbit tut das).
+#[cfg(feature = "selftest")]
+static PT_S_RUNDEN: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "selftest")]
+static PT_C_RUNDEN: AtomicU64 = AtomicU64::new(0);
+/// Handschlag Kernel -> Server: 1 = „die Tore sind zu, mach weiter"; der Server quittiert mit 2.
+#[cfg(feature = "selftest")]
+static PT_TOR_ZU: AtomicU64 = AtomicU64::new(0);
+/// Handschlag Kernel -> Server: 1 = „parke dich"; der Server quittiert mit 2, bevor er parkt.
+#[cfg(feature = "selftest")]
+static PT_PARK_BITTE: AtomicU64 = AtomicU64::new(0);
+/// Ergebnis der EINMALIGEN Messung (Bit 63 = gemessen, Bit 0 = Urteil). Das Urteil entsteht
+/// HIER und nicht im Bericht — was der Bericht setzt, kann den Bericht nicht auslösen.
+#[cfg(feature = "selftest")]
+static PT_MESS: AtomicU64 = AtomicU64::new(0);
+
+/// Der **Server**-Thread der Zwei-Thread-PD.
+#[cfg(feature = "selftest")]
+extern "C" fn pd_thread_server(_arg: usize) -> ! {
+    // 1. Auf den Client warten. Gelingt die PD-Bindung nur einem der beiden, endet das hier
+    //    sofort mit ERR_NOPD statt OK — der Code steht in der Prüfzeile.
+    let m = invoke(sys::RECV, 0, [0; 4], 0);
+    PT_RECV1_CODE.store(m.result, Ordering::Release);
+    if m.result != result::OK {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    // Ab hier ist die Transaktion OFFEN: der Client hängt in seinem CALL, wir halten den
+    // Reply-Token. Jetzt darf der Kernel die Tore schliessen.
+    while PT_TOR_ZU.load(Ordering::Acquire) != 1 {
+        core::hint::spin_loop();
+    }
+    PT_TOR_ZU.store(2, Ordering::Release);
+    // 2. Was die PD ANFAENGT, muss abgewiesen werden — beide Wege einzeln.
+    PT_RECV2_CODE.store(invoke(sys::RECV, 0, [0; 4], 0).result, Ordering::Release);
+    PT_CALL_GATE_CODE.store(invoke(sys::CALL, 0, [7, 0, 0, 0], 0).result, Ordering::Release);
+    // 3. Was schon LAEUFT, muss auslaufen duerfen. Das ist die Zusicherung, die Z23 S1 gebaut
+    //    und nie gemessen hat.
+    PT_REPLY_CODE.store(
+        invoke(sys::REPLY, 0, [2 * m.msg[0], 0, 0, 0], 0).result,
+        Ordering::Release,
+    );
+    // 4. Schlussschleife: der Rundenzaehler ist die Groesse, an der „laeuft" ablesbar ist.
+    loop {
+        PT_S_RUNDEN.fetch_add(1, Ordering::Relaxed);
+        if PT_PARK_BITTE.load(Ordering::Acquire) == 1 {
+            PT_PARK_BITTE.store(2, Ordering::Release);
+            invoke(sys::PARK, 0, [0; 4], 0);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Der **Client**-Thread derselben PD — gleicher Cspace, gleicher lokaler Cap-Slot.
+#[cfg(feature = "selftest")]
+extern "C" fn pd_thread_client(_arg: usize) -> ! {
+    let r = invoke(sys::CALL, 0, [21, 0, 0, 0], 0);
+    PT_CLIENT_ANTWORT.store(if r.result == result::OK { r.msg[0] } else { u64::MAX }, Ordering::Release);
+    PT_CLIENT_FERTIG.store(true, Ordering::Release);
+    loop {
+        PT_C_RUNDEN.fetch_add(1, Ordering::Relaxed);
+        core::hint::spin_loop();
+    }
+}
+
 /// IPC-Client: ruft den Server über seine Send-Cap und hält das Ergebnis fest.
 #[cfg(feature = "selftest")]
 extern "C" fn ipc_client(_arg: usize) -> ! {
@@ -701,6 +817,42 @@ fn spawn_demo() -> bool {
         }
     }
 
+    // --- Z22 P2: EINE PD, ZWEI THREADS ------------------------------------------------------
+    //
+    // Beide gehen ueber `admit_in_pd(pd, ..)` an DIESELBE PD -- das ist der ganze Umbau von
+    // aussen: bis heute haette die zweite Bindung die erste ueberschrieben. Der Server wird
+    // ZUERST zugelassen, damit er im `RECV` steht, bevor der Client ruft; ein CALL ohne
+    // Empfaenger blockiert zwar korrekt, aber dann misst die Zeile die Reihenfolge zweier
+    // Ereignisse statt der Eigenschaft (dieselbe Lehre wie bei `qgate`).
+    #[cfg(feature = "selftest")]
+    {
+        if let (Some(pep), Some(ppd)) = (system::create_endpoint(), system::create_pd()) {
+            if let Ok(cap) = system::install_endpoint_cap(pep as u32, Rights::RW) {
+                if system::install_pd_cap(ppd, 0, cap) {
+                    PT_PD.store(ppd as u64, Ordering::Release);
+                    if let Some(sp) = system::spawn_parked(
+                        pd_thread_server as *const () as usize,
+                        0,
+                        system::IDLE_PRIO,
+                    ) {
+                        if let Some(stid) = system::admit_in_pd(ppd, sp) {
+                            PT_S_TID.store(stid.to_raw(), Ordering::Release);
+                            if let Some(cp) = system::spawn_parked(
+                                pd_thread_client as *const () as usize,
+                                0,
+                                system::IDLE_PRIO,
+                            ) {
+                                if let Some(ctid) = system::admit_in_pd(ppd, cp) {
+                                    PT_C_TID.store(ctid.to_raw(), Ordering::Release);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Isolierter Adressraum vs. SAS: beide lesen dieselbe fremde Adresse.
     let Some(probe) = system::alloc(4096, 4096) else {
         return false;
@@ -1187,9 +1339,367 @@ fn quiesce_messen_inner() -> bool {
          erzeugte genau den Deadlock, den er aufloesen soll. **OFFEN (S1b): was ein FREMDER \
          Aufrufer erlebt, der hineinruft** -- die Endpoints existieren weiter, drei Optionen \
          stehen in todo Z23/S1b, und eine stillschweigende Wahl waere die schlechteste). \
-         **`REPLY bleibt erlaubt` ist GEBAUT, aber NICHT GEMESSEN**: dafuer braucht es eine offene \
-         Transaktion, also zwei Threads in derselben PD (Z22 P2, offen). Eine Zusicherung ohne \
-         Messung wird hier benannt und nicht mitgezaehlt)",
+         **`REPLY bleibt erlaubt` wird seit Z22 P2 GEMESSEN** -- nicht hier, sondern in \
+         `pdthrd`: dafuer braucht es eine offene Transaktion, also zwei Threads in derselben PD, \
+         und die gibt es seit dem 2026-08-10)",
+        if ok { "ALL PASS" } else { "FAILURES" }
+    );
+    ok
+}
+
+/// **Wie viele PDs die Kurve anlegen soll** — Bauzeit-Parameter, Vorgabe 0 (aus).
+///
+/// **Parametrisierbar und nicht verdrahtet**, weil die Frage „wo bricht es wirklich" von der
+/// Maschine abhängt (RAM, Kerne) und nicht von einer Zahl im Quelltext. `0` heisst aus: der
+/// normale Suitenlauf ist dann bit-identisch zu einem ohne diesen Code — eine Messung, die
+/// tausende PDs anlegt, hat in einem Lauf nichts zu suchen, der Baselines vergleicht.
+///
+/// Gesetzt über die Umgebung (`CAPROCK_SCALE_TARGET=…`); `kernel/build.rs` meldet die Variable
+/// als Bau-Eingabe, sonst misst man beim nächsten Drehen wieder den Vorgängerstand — dieselbe
+/// Falle wie bei den Linkerskripten.
+#[cfg(feature = "selftest")]
+const SCALE_TARGET: usize = match option_env!("CAPROCK_SCALE_TARGET") {
+    Some(s) => konst_parse(s.as_bytes(), 0),
+    None => 0,
+};
+
+/// **ISOLIERTE PDs statt SAS-PDs** (`CAPROCK_SCALE_ISOLIERT=1`) — und das ist eine ganz andere
+/// Frage, nicht eine strengere Variante derselben.
+///
+/// Eine PD im **globalen** Adressraum zieht Seitentabellen-Speicher **gar nicht**: sie teilt sich
+/// die Karte des Kernels. Genau deshalb kann eine Kurve über SAS-PDs den Topf, an dem `wasmhost`
+/// bei SECHS Programmen gescheitert ist, strukturell nicht erreichen — sie fragt ihn nie.
+/// Eine isolierte PD dagegen braucht eine eigene VSpace, eine ASID und einen Satz Tabellen.
+///
+/// Beide Kurven zu haben ist der Punkt: die eine misst Tabellen und Stacks, die andere den
+/// dynamischen Vorrat. Nur eine zu fahren und „10 000 Prozesse" zu sagen wäre dieselbe
+/// Verwechslung wie `rx_used` gegen „Daten sind angekommen".
+#[cfg(feature = "selftest")]
+const SCALE_ISOLIERT: bool = match option_env!("CAPROCK_SCALE_ISOLIERT") {
+    Some(s) => konst_parse(s.as_bytes(), 0) != 0,
+    None => false,
+};
+
+/// `usize` aus einem Byte-String in `const`-Kontext (kein `parse` in `const fn`).
+#[cfg(feature = "selftest")]
+const fn konst_parse(b: &[u8], acc: usize) -> usize {
+    match b {
+        [] => acc,
+        [d, rest @ ..] if *d >= b'0' && *d <= b'9' => {
+            konst_parse(rest, acc * 10 + (*d - b'0') as usize)
+        }
+        // Ein unlesbares Zeichen macht den Parameter **0** (= aus) statt eine Zahl zu raten.
+        _ => 0,
+    }
+}
+
+/// **Die Kapazitätskurve: wie weit trägt der Vorrat wirklich?** (C4 / A3)
+///
+/// Die Zahlen, die dieses Projekt über seine Kapazität führt, sind alle **statisch** —
+/// PD-Tabelle, Thread-Slots, Cap-Slots. Die Schranke, an der es zuletzt tatsächlich gescheitert
+/// ist, war ein **dynamischer** Vorrat: `SYS_LOAD` gab `NoResources`, und die Ressource war
+/// Speicher für eine **Seitentabelle** — bei sechs Programmen. In keiner Kapazitätstabelle kommt
+/// dieser Topf vor.
+///
+/// Deshalb misst diese Funktion nicht „geht N", sondern **den Füllstand über wachsendes N** und
+/// benennt die Ressource, an der es endet. Ein einzelner grüner Lauf bei einer Zahl belegt die
+/// Tabellengrössen und verfehlt die reale Schranke.
+///
+/// Jede Runde legt eine PD **mit einem Thread** an — das ist die Einheit, um die es geht (eine
+/// PD ohne Thread ist kein Prozess), und sie zieht genau die Töpfe, die zur Debatte stehen:
+/// PD-Slot, Thread-Slot, Kernel-Stack-RAM.
+#[cfg(feature = "selftest")]
+fn kapazitaet_kurve() {
+    if SCALE_TARGET == 0 {
+        println!(
+            "kurve   : SKIP -- CAPROCK_SCALE_TARGET=0 (aus). Das ist eine BENANNTE Absage, kein \
+             Schweigen: die Messung belegt tausende PDs und gehoert deshalb nicht in einen Lauf, \
+             der Baselines vergleicht. Fahren mit tools/kapazitaet-messen.sh"
+        );
+        return;
+    }
+    let frei0 = system::total_free();
+    let mut n = 0usize;
+    let mut grund = "Ziel erreicht (keine Schranke gefunden -- die Kurve endet am Parameter, \
+                     nicht am Vorrat)";
+    // Schrittweite der Kurvenpunkte: zehn Stuetzstellen, mindestens jede.
+    let schritt = (SCALE_TARGET / 10).max(1);
+    while n < SCALE_TARGET {
+        let Some(pd) = system::create_pd() else {
+            grund = "PD-Tabelle erschoepft (create_pd -> None)";
+            break;
+        };
+        // **`spawn_balanced_parked` und nicht `spawn_parked`** -- und der Unterschied IST ein
+        // Messergebnis. Mit dem kernlokalen `spawn_parked` endete die Kurve bei **n=4987**, und
+        // zwar bei `-m 512M` UND bei `-m 6G` (dort mit 5771 MiB frei): das ist keine
+        // RAM-Schranke, sondern die **Hosting-Kapazitaet EINES Kerns**
+        // (`je_kern * MIGRATION_HEADROOM` = 2500 * 2 = 5000, abzueglich der schon lebenden
+        // Threads). Wer alle Prozesse aus einem Thread heraus erzeugt, trifft die Kernschranke,
+        // nicht die Systemschranke -- und haelt sie fuer die Kapazitaet des Systems.
+        let geparkt = if SCALE_ISOLIERT {
+            system::spawn_isolated_parked(kurven_arbeiter as *const () as usize, n, system::IDLE_PRIO)
+                .map(|(p, _region)| p)
+        } else {
+            system::spawn_balanced_parked(kurven_arbeiter as *const () as usize, n, system::IDLE_PRIO)
+        };
+        let Some(p) = geparkt else {
+            let _ = system::free_pd_slot(pd);
+            grund = if SCALE_ISOLIERT {
+                "VSpace/ASID, Seitentabellen-Speicher, Thread-Slot oder Kernel-Stack-RAM \
+                 erschoepft (spawn_isolated_parked -> None) -- WELCHER, sagt der Mangel unten"
+            } else {
+                "Thread-Slot oder Kernel-Stack-RAM erschoepft (spawn_balanced_parked -> None)"
+            };
+            break;
+        };
+        if system::admit_in_pd(pd, p).is_none() {
+            grund = "Zulassung fehlgeschlagen (admit -> None)";
+            break;
+        }
+        n += 1;
+        if n % schritt == 0 || n == SCALE_TARGET {
+            let (pds_u, pds_c, _, _, _, _) = system::vorrat_fuellstand();
+            let (ps, _, po, _) = system::cap_peaks();
+            let (cs, co) = system::cap_capacity();
+            println!(
+                "kurve   : n={n} · PDs {pds_u}/{pds_c} · Threads {}/{} · Cap-Slots {ps}/{cs} · \
+                 Cap-Objekte {po}/{co} · freie VSpaces {} · freies RAM {} MiB (Start {} MiB, \
+                 verbraucht {} KiB je PD+Thread)",
+                system::thread_capacity() - system::threads_available(),
+                system::thread_capacity(),
+                system::free_vspaces(),
+                system::total_free() >> 20,
+                frei0 >> 20,
+                (frei0.saturating_sub(system::total_free())) / (n as u64) >> 10
+            );
+        }
+    }
+    // Die benannte Ressource aus dem Ladepfad -- dieselbe Quelle, die `SYS_LOAD` befragt.
+    let (mcode, mbytes, mfrei) = system::lade_mangel();
+    println!(
+        "kurve   : ENDE bei n={n} von {SCALE_TARGET} -- Grund: {grund}. Zuletzt gemeldeter \
+         Allokationsmangel: {} (angefordert {mbytes} Byte, frei waren {mfrei}). Freies RAM \
+         {} MiB von {} MiB am Start. Je Prozess kostete es {} KiB (Kernel-Thread: {} KiB Stack \
+         + Seitentabellen/PD-Metadaten; ein EL0-Thread haette {} KiB EL1-Stack).",
+        system::mangel_name(mcode),
+        system::total_free() >> 20,
+        frei0 >> 20,
+        if n > 0 {
+            (frei0.saturating_sub(system::total_free())) / (n as u64) >> 10
+        } else {
+            0
+        },
+        system::stack_bytes() >> 10,
+        system::USER_KSTACK_SIZE >> 10
+    );
+}
+
+/// Arbeiter der Kapazitätskurve: sofort parken. Es geht um die **Verwaltung** vieler
+/// gleichzeitig existierender Prozesse, nicht um Rechenlast (dieselbe Wahl wie `scale_worker`
+/// auf aarch64).
+#[cfg(feature = "selftest")]
+extern "C" fn kurven_arbeiter(_arg: usize) -> ! {
+    invoke(sys::PARK, 0, [0; 4], 0);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// **Das Urteil der `vorrat`-Zeile — an EINER Stelle**, damit `all_done` und der Bericht nicht
+/// zwei Wirklichkeiten aus derselben Hand werden (der `pdbind`-Fehler: 21 Glieder in der Kette
+/// gegen 24 Einträge in der Liste).
+///
+/// Zwei Konjunkte, beide falsifizierbar:
+/// * `scan == 0` — die Auflösung Thread → PD ist O(1). Fällt, sobald die Rückwärts-Tabelle
+///   fehlt (Gegenprobe: `attach_owner` weglassen).
+/// * `aufrufe > 0` — die **Sprechprobe**: ohne sie bestünde die Zeile auch ein System, das gar
+///   keine Syscalls macht, und eine Null bei den Iterationen wäre bedeutungslos.
+#[cfg(feature = "selftest")]
+fn vorrat_urteil() -> bool {
+    let (pd_calls, pd_scan, _, owner_fehlt) = system::pd_scan_bilanz();
+    pd_scan == 0 && pd_calls > 0 && owner_fehlt == 0
+}
+
+/// **Z22 P2 + Z23 S1: zwei Threads in EINER PD — gemessen an der Wirkung.**
+///
+/// Zehn Aussagen in drei Gruppen; welche Gruppe was belegt, steht am Modulkopf bei den Statics.
+/// Das Urteil entsteht hier (einmalig) und nicht im Bericht.
+#[cfg(feature = "selftest")]
+fn pd_threads_messen() -> bool {
+    if PT_MESS.load(Ordering::Acquire) & (1 << 63) != 0 {
+        return PT_MESS.load(Ordering::Acquire) & 1 != 0;
+    }
+    let ok = pd_threads_messen_inner();
+    PT_MESS.store((1 << 63) | u64::from(ok), Ordering::Release);
+    ok
+}
+
+#[cfg(feature = "selftest")]
+fn pd_threads_messen_inner() -> bool {
+    let warten = || {
+        let t0 = hal::timer::ticks(0);
+        let mut wache = 0u64;
+        while hal::timer::ticks(0) == t0 && wache < 5_000_000 {
+            core::hint::spin_loop();
+            wache += 1;
+        }
+    };
+    let (sraw, craw, pd) = (
+        PT_S_TID.load(Ordering::Acquire),
+        PT_C_TID.load(Ordering::Acquire),
+        PT_PD.load(Ordering::Acquire),
+    );
+    if sraw == 0 || craw == 0 || pd == u64::MAX {
+        println!(
+            "pdthrd  : FAILURES (Aufbau unvollstaendig: server={sraw:#x} client={craw:#x} \
+             pd={pd} -- ohne beide Threads ist NICHTS gemessen, und ein SKIP hier waere ein \
+             Schluss von Schweigen auf Abwesenheit)"
+        );
+        return false;
+    }
+    let (stid, ctid, pd) = (
+        caprock_sched::ThreadId::from_raw(sraw),
+        caprock_sched::ThreadId::from_raw(craw),
+        pd as usize,
+    );
+
+    // --- Gruppe 1: BEIDE Threads gehoeren derselben PD ---------------------------------------
+    //
+    // Vom Kernel aus nachgefragt, ueber genau den Weg, den auch der Syscall-Dispatch nimmt.
+    // `anzahl` ist die Groesse, an der „mehrere" von „einer, wie immer" zu unterscheiden ist.
+    let pd_s = system::pd_of_thread(stid);
+    let pd_c = system::pd_of_thread(ctid);
+    let anzahl = system::pd_thread_count(pd);
+    let beide_gebunden = pd_s == Some(pd) && pd_c == Some(pd) && anzahl == 2;
+
+    // --- Gruppe 2: Z23 S1 -- die offene Transaktion -------------------------------------------
+    //
+    // Erst warten, bis der Server sein `RECV` beantwortet bekommen hat: DANN haelt er den
+    // Reply-Token, und der Client haengt in seinem CALL. Genau dieser Zustand ist der
+    // Messgegenstand.
+    let mut rendezvous = false;
+    for _ in 0..256 {
+        if PT_RECV1_CODE.load(Ordering::Acquire) != u64::MAX {
+            rendezvous = true;
+            break;
+        }
+        warten();
+    }
+    let recv1 = PT_RECV1_CODE.load(Ordering::Acquire);
+    // Sprechprobe fuer „offene Transaktion": der Client darf noch NICHT fertig sein.
+    let client_haengt = !PT_CLIENT_FERTIG.load(Ordering::Acquire);
+    // Jetzt die Tore schliessen -- und es MUSS etwas aendern (ein Tor, das schon zu war,
+    // belegt nichts).
+    let tor_aenderte = system::pd_quiesce(pd, true);
+    PT_TOR_ZU.store(1, Ordering::Release);
+    let mut quittiert = false;
+    for _ in 0..256 {
+        if PT_TOR_ZU.load(Ordering::Acquire) == 2 {
+            quittiert = true;
+            break;
+        }
+        warten();
+    }
+    let mut alle_drei = false;
+    for _ in 0..512 {
+        if PT_REPLY_CODE.load(Ordering::Acquire) != u64::MAX {
+            alle_drei = true;
+            break;
+        }
+        warten();
+    }
+    let (recv2, callg, replyc) = (
+        PT_RECV2_CODE.load(Ordering::Acquire),
+        PT_CALL_GATE_CODE.load(Ordering::Acquire),
+        PT_REPLY_CODE.load(Ordering::Acquire),
+    );
+    let mut client_fertig = false;
+    for _ in 0..512 {
+        if PT_CLIENT_FERTIG.load(Ordering::Acquire) {
+            client_fertig = true;
+            break;
+        }
+        warten();
+    }
+    let antwort = PT_CLIENT_ANTWORT.load(Ordering::Acquire);
+    // Tore wieder auf -- sonst stuende die PD fuer den Rest des Laufs still.
+    let _ = system::pd_quiesce(pd, false);
+
+    // --- Gruppe 3: getrennte Grund-Mengen (Z24) ------------------------------------------------
+    //
+    // Der Server parkt sich; sein Zaehler muss stehen, waehrend der des Clients weiterlaeuft.
+    // Beide Haelften zusammen sind die Aussage: ohne die zweite waere „steht" von „ist tot"
+    // nicht zu unterscheiden.
+    PT_PARK_BITTE.store(1, Ordering::Release);
+    let mut geparkt = false;
+    for _ in 0..256 {
+        if PT_PARK_BITTE.load(Ordering::Acquire) == 2 && system::is_parked(stid) {
+            geparkt = true;
+            break;
+        }
+        warten();
+    }
+    let (s0, c0) = (
+        PT_S_RUNDEN.load(Ordering::Acquire),
+        PT_C_RUNDEN.load(Ordering::Acquire),
+    );
+    for _ in 0..8 {
+        warten();
+    }
+    let (s1, c1) = (
+        PT_S_RUNDEN.load(Ordering::Acquire),
+        PT_C_RUNDEN.load(Ordering::Acquire),
+    );
+    let server_steht = s1 == s0;
+    let client_laeuft = c1 > c0;
+    // Sprechprobe: nach dem Wecken muss er WIRKLICH weiterlaufen.
+    let _ = system::unpark_thread(stid);
+    let mut server_laeuft_wieder = false;
+    for _ in 0..256 {
+        if PT_S_RUNDEN.load(Ordering::Acquire) > s1 {
+            server_laeuft_wieder = true;
+            break;
+        }
+        warten();
+    }
+
+    let q = caprock_abi::result::ERR_QUIESCING;
+    let ok = beide_gebunden
+        && rendezvous
+        && recv1 == result::OK
+        && client_haengt
+        && tor_aenderte
+        && quittiert
+        && alle_drei
+        && recv2 == q
+        && callg == q
+        && replyc == result::OK
+        && client_fertig
+        && antwort == 42
+        && geparkt
+        && server_steht
+        && client_laeuft
+        && server_laeuft_wieder;
+    println!(
+        "pdthrd  : EINE PD, ZWEI Threads: pd(server)={pd_s:?} pd(client)={pd_c:?} (PD {pd}) \
+         gebundene-Threads={anzahl} (erwartet 2) · erstes-RECV-Code={recv1} (erwartet \
+         {} = OK -- beide Threads sehen DENSELBEN Cap-Slot; nur einer gebunden hiesse {} = ERR_NOPD)",
+        result::OK,
+        result::ERR_NOPD
+    );
+    println!(
+        "pdthrd  : Z23 S1 an der OFFENEN Transaktion: rendezvous={rendezvous} \
+         client-haengt-noch={client_haengt} tor-aenderte-etwas={tor_aenderte} \
+         server-quittiert={quittiert} · zweites-RECV={recv2} CALL={callg} (beide erwartet {q} = \
+         ERR_QUIESCING) · REPLY={replyc} (erwartet {} = OK -- DAS ist die bis heute ungemessene \
+         Zusicherung) · Client bekam {antwort} (erwartet 42), fertig={client_fertig}",
+        result::OK
+    );
+    println!(
+        "pdthrd  : Z24 getrennte Grund-Mengen: geparkt={geparkt} server-Runden {s0}->{s1} \
+         (muss STEHEN) waehrend client-Runden {c0}->{c1} (muss LAUFEN -- ohne diese Haelfte \
+         waere 'steht' von 'ist tot' nicht zu unterscheiden) · nach UNPARK laeuft der Server \
+         wieder={server_laeuft_wieder} : {}",
         if ok { "ALL PASS" } else { "FAILURES" }
     );
     ok
@@ -2933,6 +3443,12 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             // erreichbar -- es wurde gegen die WIRKUNG formuliert (blockiert statt abgewiesen),
             // nicht gegen eine Zahl, die vom Zeitpunkt abhaengt.
             ("qgate", Q_MESS.load(Ordering::Acquire) & 1 != 0),
+            // Z22 P2: gattert aus demselben Grund wie `qgate` -- das Kriterium ist gegen die
+            // WIRKUNG formuliert (Rundenzaehler, Ergebniscodes), nicht gegen einen Zustand.
+            ("pdthrd", PT_MESS.load(Ordering::Acquire) & 1 != 0),
+            // C4/A3: die Fuellstands- und O(n)-Zeile gattert ebenfalls -- sonst waere sie genau
+            // die Sorte Zeile, die niemand liest (dieselbe Begruendung wie bei B-4.2).
+            ("vorrat", vorrat_urteil()),
             // **Seit dem 2026-08-09 gattert `fp` wirklich.** Vorher stand die Zeile bewusst
             // draussen, weil ihr Kriterium („alle 64 Abgaben") unerreichbar war und die Suite
             // dauerhaft rot gefaerbt haette. Mit einem erreichbaren Kriterium waere ein
@@ -2952,7 +3468,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 28;
+const DONE_FLAGS: usize = 30;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]
@@ -2987,6 +3503,82 @@ fn report_and_off(watchdog: bool) -> ! {
          reiner Kernel-Speicher {kern_miss}x nach unten (0 heisst 'kam nicht vor', nicht \
          'geht nicht'; ein PD-Ausweich waere ein Befund, ein Kernel-Ausweich ist harmlos)"
     );
+    // ------------------------------------------------------------------------------------------
+    // C4 / A3: DIE FUELLSTAENDE DER FESTEN VORRAETE -- und die Bilanz der O(n)-Pfade
+    // ------------------------------------------------------------------------------------------
+    //
+    // **Warum das eine eigene Zeile ist und nicht Telemetrie am Rand.** Der Kernel hat mehrere
+    // Vorraete FESTER Groesse (PD-Tabelle, Cap-Slots, Cap-Objekte, Endpoints, Notifications,
+    // Thread-Slots, Kernel-Stack-RAM). Keiner davon hatte eine Fuellstandsanzeige. Was daraus
+    // wird, hat dieses Projekt am 2026-08-10 vorgefuehrt: `SYS_LOAD` scheiterte mit
+    // `NoResources` bei SECHS Programmen, und der leere Topf war keiner aus der obigen Liste,
+    // sondern der Speicher fuer eine Seitentabelle. Ein fester Vorrat ohne Anzeige spricht erst,
+    // wenn er leer ist -- und dann an einer Stelle, die mit der Ursache nichts zu tun hat.
+    //
+    // **Die zweite Haelfte sind ITERATIONSZAHLEN, keine Zeiten** (D10-Lehre). `pd_of` loest die
+    // aufrufende PD bei jedem Syscall auf, der eine CAP aufloest (CALL/RECV/REPLY/SIGNAL/WAIT/
+    // MAP/...); YIELD und PARK/UNPARK kehren im Dispatch vorher zurueck und kommen deshalb NICHT
+    // vor -- die Zahl unten ist entsprechend kleiner als die Gesamtzahl der Syscalls, und das
+    // gehoert dazu, sonst laese sich die 15 als Widerspruch zum Wort „jeder".
+    // In der C4-Liste stand diese Stelle nicht -- die dort genannten laufen je Cap-Allokation
+    // bzw. je Thread-Tod, diese je Syscall. Nach dem Umbau muss `scan=0` sein, WAEHREND
+    // `aufrufe` gross ist: erst beide Zahlen zusammen sind die Aussage, eine Null allein waere
+    // von „nie gefragt" nicht zu unterscheiden.
+    let (pd_calls, pd_scan, pd_create_scan, owner_fehlt) = system::pd_scan_bilanz();
+    let (pds_used, pds_cap, eps_used, eps_cap, nt_used, nt_cap) = system::vorrat_fuellstand();
+    let (cap_slots, cap_objs) = system::cap_capacity();
+    let (peak_slots, _, peak_objs, _) = system::cap_peaks();
+    let (thr_frei, thr_cap) = (system::threads_available(), system::thread_capacity());
+    let thr_live = thr_cap.saturating_sub(thr_frei);
+    let kstack_mib = (thr_live as u64 * system::USER_KSTACK_SIZE as u64) >> 20;
+    let (purge_calls, purge_iter) = (
+        system::PURGE_IPC_CALLS.load(Ordering::Relaxed),
+        system::PURGE_IPC_ITER.load(Ordering::Relaxed),
+    );
+    println!(
+        "vorrat  : Fuellstaende -- PDs {pds_used}/{pds_cap} · Cap-Slots {peak_slots}/{cap_slots} \
+         (Hoechststand) · Cap-Objekte {peak_objs}/{cap_objs} · Endpoints {eps_used}/{eps_cap} · \
+         Notifications {nt_used}/{nt_cap} · Thread-Slots {thr_live}/{thr_cap} · freies RAM {} MiB \
+         · Kernel-Stacks {kstack_mib} MiB ({} KiB je Thread)",
+        system::total_free() >> 20,
+        system::USER_KSTACK_SIZE >> 10
+    );
+    println!(
+        "vorrat  : O(n)-Bilanz (Iterationen, nicht Zeit) -- pd_of: {pd_calls} cap-aufloesende \
+         Syscalls (YIELD/PARK kehren vorher zurueck und zaehlen NICHT mit) / \
+         {pd_scan} Scan-Iterationen (muss 0 sein: seit Z22 P2 O(1) ueber den Rueckwaerts-Index; \
+         linear waeren es {} gewesen) · PdTable::create: {pd_create_scan} Iterationen · \
+         purge_ipc_queues: {purge_calls} Aufrufe / {purge_iter} IPC-Objekte durchlaufen \
+         (O(Endpoints+Notifications) JE Thread-Tod -- offen, C4) · Bindungen ohne \
+         Rueckwaerts-Tabelle={owner_fehlt}",
+        pd_calls.saturating_mul(pds_cap as u64)
+    );
+    {
+        let (scan_calls, erster, owner_len) = system::pd_scan_diagnose();
+        println!(
+            "vorrat  : Rueckfall-Diagnose -- {scan_calls} Aufruf(e) liefen linear, erster \
+             betroffener Thread-Slot={} (u64::MAX = keiner), Rueckwaerts-Tabelle haengt mit \
+             {owner_len} Eintraegen (0 = gar nicht). Ein Rueckfall, den niemand erklaeren kann, \
+             ist ein offener Posten und kein Messwert",
+            if erster == 0 {
+                u64::MAX
+            } else {
+                erster - 1
+            }
+        );
+    }
+    // **Zwei Konjunkte, und beide sind falsifizierbar.** `scan == 0` faellt, sobald die
+    // Rueckwaerts-Tabelle fehlt (Gegenprobe: `attach_owner` weglassen -> die Zahl springt auf
+    // Aufrufe x PD-Kapazitaet). `aufrufe > 0` ist die Sprechprobe am gepruefte Pfad selbst:
+    // ohne sie bestuende die Zeile auch ein System, das gar keine Syscalls macht.
+    let vorrat_ok = vorrat_urteil();
+    println!(
+        "vorrat  : {} (C4: der teuerste O(n)-Pfad des Systems lief je SYSCALL und stand nicht \
+         in der C4-Liste. Die uebrigen drei stehen dort und sind weiterhin linear -- ihre \
+         Iterationszahlen oben sind die Grundlinie, gegen die eine Behebung zu messen ist)",
+        if vorrat_ok { "ALL PASS" } else { "FAILURES" }
+    );
+
     let ticks = hal::timer::ticks(0);
     let mut all_tick = true;
     for c in 0..system::num_cores() {
@@ -3586,6 +4178,16 @@ fn report_and_off(watchdog: bool) -> ! {
          Untrusted-Zweig",
         if cyc_ok { "ALL PASS" } else { "FAILURES" }
     );
+
+    // **Die Kapazitaetskurve ganz zum SCHLUSS** -- nach jedem Urteil, vor dem Herunterfahren.
+    //
+    // Der Platz ist die halbe Entscheidung. Diese Messung belegt tausende PDs, Threads und
+    // Seitentabellen; irgendwo weiter oben ausgefuehrt kippte sie jede baseline-empfindliche
+    // Zeile des Laufs (`loadstop`, `capsz`, die Farbtests) -- genau die Falle, an der schon der
+    // aarch64-Farbtest haengengeblieben ist: „ein Test, der Speicher belegt, kippt
+    // baseline-empfindliche Tests". Hier kann sie strukturell nichts mehr beeinflussen, weil
+    // alle Zeilen bereits gedruckt sind.
+    kapazitaet_kurve();
 
     println!("x86_64 Stufe 4: Kernel-Kern laeuft (Selbsttests + Scheduler + cap-gesicherte IPC)");
     // Der Marker trennt die beiden Ausgänge -- s. Funktionsdoku. Ein Lauf, der aus der Notbremse
@@ -4523,6 +5125,7 @@ pub fn run(multiboot_info: u64) -> ! {
             drv_service_step(archive);
             park_messen(); // laeuft genau einmal; das Urteil steht danach in `all_done()`
             let _ = quiesce_messen(); // Z23 S1, ebenso einmalig
+            let _ = pd_threads_messen(); // Z22 P2 + die Z23-S1-REPLY-Messung, ebenso einmalig
             if all_done(archive, None) {
                 report_and_off(false);
             }

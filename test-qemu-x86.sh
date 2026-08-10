@@ -80,6 +80,14 @@ echo "== build (x86_64-unknown-none, --features selftest) =="
 # Geprueft wird also genau das, was pruefbar ist -- dass er uebersetzt und linkt.
 echo "== build (--no-default-features: ohne Pruefinfrastruktur) =="
 NOSEL_OK=1
+# **Dieser Bau ruft cargo direkt und muss deshalb die Entdoppelung selbst machen.** In einem
+# Agenten-Worktree (der im Hauptbaum liegt) erbt Cargo die Linkerflags doppelt; das Abbild
+# bekommt dann einen ZWEITEN, leeren Satz Ausgabesektionen -- und `grep -A1 " .text " | tail -1`
+# liest genau den. `NOSEL_TEXT` stand deshalb auf **0**, und die F1-Zeile meldete PASS
+# ("0 < 0x62000") fuer eine Zahl, die kein Messwert war. Ein Vergleich gegen eine 0 aus einem
+# kaputten Bau ist die Bauzeit-Fassung von "Schweigen als Erfolg". S. tools/rustflags-entdoppeln.py.
+F1FLAGS="$(python3 tools/rustflags-entdoppeln.py x86_64-unknown-none)"; F1RC=$?
+if [ "$F1RC" = "10" ]; then export RUSTFLAGS="$F1FLAGS"; fi
 rustup run nightly cargo build --release --no-default-features \
     --target x86_64-unknown-none -p caprock-kernel >/dev/null 2>&1 || NOSEL_OK=0
 # Der Vergleich gehoert dazu: schrumpft das Image NICHT, ist das Gating wirkungslos geworden
@@ -511,6 +519,20 @@ elif grep -q "^isohigh : SKIP" <<<"$OUT"; then
     echo "  SKIP: E-Rest 3d (nicht entscheidbar auf dieser RAM-Groesse): $(grep -m1 -oE '^isohigh : SKIP -- [^(]*' <<<"$OUT")"
 else
     echo "  FAIL: E-Rest 3d: die Zeile isohigh fehlt ganz -- der Pruefer ist nicht sprechfaehig."
+    fail=1
+fi
+# Z22 P2: mehrere Threads je PD -- und die Z23-S1-Zusicherung, die dadurch erst messbar wird.
+#
+# Die FEHLENDE Zeile ist hier das eigentliche Risiko und deshalb ausdruecklich ein FAIL: der
+# allgemeine Rotzeilen-Scanner sieht nur `: FAILURES`, ein Hochlauf, der vorher stehenbleibt,
+# haette gar keine Zeile -- und Schweigen darf nicht als Erfolg durchgehen.
+if grep -q "^pdthrd  : FAILURES" <<<"$OUT"; then
+    echo "  FAIL: Z22 P2: $(grep -m1 '^pdthrd  : FAILURES' <<<"$OUT")"
+    fail=1
+elif grep -q "^pdthrd  : .*ALL PASS" <<<"$OUT"; then
+    echo "  PASS: Z22 P2: EINE PD traegt ZWEI Threads -- beide im selben Cspace (sie reden ueber DENSELBEN lokalen Cap-Slot miteinander), mit GETRENNTEN Grund-Mengen (der eine parkt, der andere laeuft weiter), und an der dadurch erst moeglichen OFFENEN Transaktion ist Z23 S1 gemessen: CALL/RECV -> ERR_QUIESCING, REPLY -> OK, Client bekommt seine Antwort"
+else
+    echo "  FAIL: Z22 P2: die Zeile pdthrd fehlt ganz -- der Pruefer ist nicht sprechfaehig."
     fail=1
 fi
 if grep -q "^pprobe  : FAILURES" <<<"$OUT"; then

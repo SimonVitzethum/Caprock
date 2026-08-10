@@ -5,9 +5,71 @@ Reihenfolge innerhalb eines Abschnitts = Priorität. `[~]` = teilweise erledigt,
 
 ---
 
-## Der „Integrations-Blocker" war ein ARTEFAKT DES BAUSYSTEMS — aufgelöst 2026-08-10
+## ~~SPERRT DIE INTEGRATION~~: das nullgrosse LOAD-Duplikat — **URSACHE GEFUNDEN, BEHOBEN** (2026-08-10, abends)
 
-**Klasse:** Messfehler · **Stand:** aufgelöst; die beiden Werkzeuge, die dabei entstanden, bleiben
+**Die Ursache lag NICHT im Linkerskript, sondern in der BAUUMGEBUNG — und deshalb hat kein
+einziger der drei Versuche daran etwas ändern können.**
+
+Gemessen, mit einer Zeile:
+
+```
+$ cargo -Zunstable-options config get target.x86_64-unknown-none.rustflags
+["-C","link-arg=-Tkernel/x86_64-link.ld","-C","relocation-model=static",
+ "-C","link-arg=-Tkernel/x86_64-link.ld","-C","relocation-model=static"]
+```
+
+**Cargo liest `.cargo/config.toml` aus JEDEM Vorfahrenverzeichnis und hängt Array-Werte
+aneinander.** Ein Agenten-Worktree liegt unter `<repo>/.claude/worktrees/<id>`, also **innerhalb**
+des Hauptbaums — Cargo findet die Konfiguration deshalb zweimal, und `-Tkernel/x86_64-link.ld`
+steht doppelt auf der Linkerzeile. `lld` wertet den `SECTIONS`-Block dann **zweimal** aus. Alles
+Weitere folgt daraus:
+
+* **Die sieben leeren Doppel-Sektionen** sind genau die Ausgabesektionen, die ausser
+  Eingabe-Beschreibungen noch etwas enthalten (`. = ALIGN(..)`, Symbolzuweisung, feste Adresse).
+  `.boot`, `.data`, `.boot_bss` bestehen nur aus `*(...)` — leere Ausgabesektionen dieser Art
+  verwirft lld, deshalb fehlen genau diese drei in der Duplikatliste. Das Muster, an dem der
+  Befund hing, war die ganze Zeit die Antwort.
+* **Alle Linkersymbole trugen die Werte des ZWEITEN Durchlaufs** (`. ` fängt wieder bei 1M an):
+  `__text_start = 0x100000`, `__bss_start = 0x101000`, `__aptramp_lma = 0x100000`. Der gesunde
+  Hauptbaum hat `0x101000 / 0x18e000 / 0x18d000`. **Das ist der eigentliche Schaden** — das
+  nullgrosse LOAD-Segment und der verschobene Multiboot-Header sind nur seine sichtbarste Folge.
+
+**Warum der Gegenversuch aus dem alten Eintrag ebenfalls fehlerhaft baute** („A3-Code im selben
+Worktree zurückgenommen"): die Ursache war der **Ort** des Worktrees, nicht sein Inhalt. Die
+Vermutung „der Worktree-Zustand ist selbst verdächtig" war richtig, nur eine Ebene zu vage.
+
+**Behoben** in `build-x86.sh` und `build.sh`: `tools/rustflags-entdoppeln.py` liest die
+**effektive** Flagliste, entdoppelt sie und setzt sie als `RUSTFLAGS` — und meldet **laut**, dass
+es das getan hat (eine stille Reparatur wäre dieselbe Krankheit wie das stille Mischen).
+`RUSTFLAGS` und **nicht** `CARGO_TARGET_<T>_RUSTFLAGS`: gemessen wird die zielspezifische
+Variable von Cargo mit der Konfiguration **mitgemischt** — danach standen die Flags dreifach da
+und das Abbild war schlechter statt besser. `RUSTFLAGS` ersetzt.
+
+**Belegt:** 22 Sektionen statt 29, sieben LOAD-Segmente ohne nullgrosses, letztes Segment
+`filesz=0x58` statt `0xf7000`, Multiboot-Header bei Dateioffset 4096, `./test-qemu-x86.sh` →
+`== ALL PASS ==`. **Das Linkerskript ist dabei unverändert geblieben** (`git diff` leer) — die
+drei Versuche (a)/(b)/(b2) haben ein Symptom bearbeitet und können aus dem Register.
+
+**Zwei Dinge, die daraus folgen und breiter gelten:**
+
+* **Die literale Abnahmezeile `cargo build --release -p caprock-kernel --target
+  x86_64-unknown-none --features selftest` ist in einem Worktree SELBST betroffen** — sie umgeht
+  `build-x86.sh` und erzeugt das kaputte Abbild. Wer sie zur Abnahme benutzt, misst ein Artefakt,
+  das nie gebootet hätte.
+* **Dasselbe Loch stand im F1-Gate der Suite.** `test-qemu-x86.sh` baute die
+  `--no-default-features`-Konfiguration mit direktem `cargo`, las die `.text`-Grösse mit
+  `grep -A1 " .text " | tail -1` — und traf damit die **leere Doppel-Sektion**. `NOSEL_TEXT` stand
+  auf **0**, und die Zeile meldete `PASS` („0 < 0x62000") für eine Zahl, die kein Messwert war.
+  Behoben; die Grösse ist jetzt wieder eine gemessene (`0x362a5`).
+
+- [ ] **Offen bleibt die strukturelle Frage:** ein Worktree im Repo erbt jede
+      Vorfahren-Konfiguration doppelt — das betrifft auch `programs/.cargo/config.toml` (dort
+      steht `-Tuser.ld` **neben** dem geerbten `-Tkernel/...`) und damit die Lade-Suite. Geprüft
+      ist das nicht; der Entdoppler deckt heute nur die beiden Kernel-Bauwege ab.
+
+## Das nullgrosse LOAD-Duplikat — der Stand VOR der Ursachenfindung (zum Nachlesen)
+
+**Klasse:** Bauwerkzeug · **Stand:** überholt, s. o.
 
 Ein halber Tag ging an einen Blocker, den es als Codeproblem **nie gab**. Der Ablauf, weil er die
 Lehre trägt:
@@ -26,14 +88,24 @@ Lehre trägt:
    von Anfang an, mit derselben A3-Arbeit gemerged → **keine leeren Duplikatsektionen**, Header
    bei 4096, `== ALL PASS ==` in **beiden** Suiten, alle Wächter grün.
 
-**BERICHTIGUNG des eigenen Schlusses.** „Der Blocker existierte als Codeproblem nie" ist eine
-Hypothese im Ergebniskostüm. **Belegt** ist nur: er **reproduziert auf frischem Zweig nicht**.
-Ursache mit hoher Wahrscheinlichkeit ein Bau-Artefakt; **Residualrisiko: ein reihenfolgeabhängiges
-Layout**. Der Unterschied ist nicht akademisch — die drei Versuchszeilen sind als *Messwerte*
-entwertet, aber die *Beobachtungen* (acht überlappende LOADs, ~1 MiB `filesz` über reinem NOBITS)
-waren echte `readelf`-Ausgaben **irgendeines** Binaries. War es der veraltete Stand: gut. Macht
-aber eine Kombination aus Sektionsreihenfolge und Skript das Layout reihenfolgeabhängig, kommt der
-Fall wieder.
+**ZWEI BERICHTIGUNGEN, in dieser Reihenfolge gezogen — und die zweite hat die erste überholt.**
+
+*Erste (vormittags):* „Der Blocker existierte als Codeproblem nie" war eine Hypothese im
+Ergebniskostüm; belegt war nur „**reproduziert auf frischem Zweig nicht**". Richtig gezogen — aber
+das benannte **Residualrisiko („ein reihenfolgeabhängiges Layout")** zeigte in die **falsche
+Richtung**. Die Reihenfolge war nie das Thema.
+
+*Zweite (abends, s. o.):* die Ursache ist ein **benennbarer, jederzeit auslösbarer Mechanismus** —
+Cargo mischt Vorfahren-Konfigurationen und hängt Arrays an. „Aufgelöst" war damit ebenfalls zu
+früh: der Mechanismus ist nicht weg, er **verschonte den Hauptbaum nur zufällig** (dort gibt es
+genau eine Konfiguration) und trifft jeden, der in einem verschachtelten Arbeitsbaum baut.
+
+Der Unterschied ist nicht akademisch. Die drei Versuchszeilen sind als *Messwerte* entwertet, die
+*Beobachtungen* aber waren echte `readelf`-Ausgaben — nur eben von einem Abbild, dessen
+Linkerskript zweimal ausgewertet worden war. **Zusammen mit dem wasm-Eintrag ist das der Grund,
+warum „aufgelöst" ein Messwert sein muss und kein Gefühl:** dort sagte das Muster die falsche
+Hypothese exakt voraus, hier hat die zweite Grabung die bequeme erste Erklärung („Bau-Artefakt,
+weg damit") durch die unbequeme richtige ersetzt.
 
 **Deshalb ist die Eigenschaft jetzt dauerhaft geprüft statt behauptet:** der Bauzeit-Wächter
 verlangt zusätzlich, dass **kein LOAD-Segment Dateiinhalt trägt, wo nur NOBITS-Sektionen liegen** —
@@ -1431,10 +1503,25 @@ Die Bausteine sind da (`endpoint_quiesce`/`ERR_QUIESCING`, `thread_quiescence`, 
         nur der Ergebniscode kippt (1 statt 8), die fünf übrigen Aussagen bleiben grün. Damit ist
         belegt, dass die Zeile den **Grund** liest und nicht bloss „abgewiesen".
 
-      **Was NICHT gemessen ist, und es steht auch in der Prüfzeile:** dass `REPLY` erlaubt bleibt.
-      Dafür braucht es eine offene Transaktion, also **zwei Threads in derselben PD** (Z22 P2,
-      offen). Gebaut ist es; gemessen nicht — und eine Zusicherung ohne Messung wird hier benannt
-      statt mitgezählt.
+      **~~Was NICHT gemessen ist~~ — seit 2026-08-10 GEMESSEN, in `pdthrd`.** Mit zwei Threads
+      derselben PD (Z22 P2) gibt es die offene Transaktion: der Client hängt in seinem `CALL`,
+      der Server hält den Reply-Token, **und in diesem Zustand** werden die Tore geschlossen.
+      Gemessen: zweites `RECV` → **8** (`ERR_QUIESCING`), `CALL` → **8**, `REPLY` → **0** (`OK`),
+      Client bekommt **42**. Die Tore gehen hier ausdrücklich **nach** dem Rendezvous zu (anders
+      als bei `qgate`): vorher geschlossen gäbe es die offene Transaktion gar nicht, und der Test
+      belegte wieder nur, dass ein Tor schliesst.
+
+      **Gegenprobe (M2): auch `REPLY` gegattert** → `REPLY=8` statt 0, und der Client **hängt für
+      immer** (`Client bekam u64::MAX, fertig=false`, sein Rundenzähler `0→0`), während
+      `zweites-RECV=8` und `CALL=8` grün bleiben. Drei Konjunkte kippen aus **einer** Änderung,
+      und diese Kausalkette **ist** die Zusicherung: genau der Deadlock, den der Entwurfssatz
+      vorhersagt („sonst könnte ein Server seine offene Antwort nicht loswerden").
+
+      **Gegenprobe (M1), nicht isoliert und aus einem strukturellen Grund:** das Tor nur für
+      `CALL` gelten zu lassen macht das zweite `RECV` **blockierend** statt abweisend — der
+      Server kommt nie zu `CALL`/`REPLY`, und alles danach fällt mit aus. Eine Sonde, die eine
+      **Folge** von Syscalls abarbeitet, kann an einem blockierenden Glied nicht weiterzählen;
+      dieselbe Kopplung wie bei der M1-Gegenprobe von `qgate`.
 
 - [ ] **S1 (ursprünglicher Plan, zum Nachlesen).** Erst die **Tore schliessen**, dann einfrieren.
       Ein `PD_QUIESCING`-Bit je PD, geprüft im Syscall-Pfad: `CALL`/`RECV` **aus** der PD heraus
@@ -1830,7 +1917,64 @@ Die Aufteilung, die daraus folgt:
       der Weg vom Manifest zur IRTE, ein `SYS_MSI`-artiger Zugang oder eine Vergabe im Lader,
       und die Zustellung bis in eine Treiber-PD. Dazu die drei x86-No-Ops in `intc`.
 
-- [~] **P2 — die Userland-Hälfte steht, die Threads fehlen** (2026-08-09).
+- [x] **P2 — mehrere Threads je PD: GEBAUT und gemessen** (2026-08-10, `pdthrd : ALL PASS`,
+      gattert in `all_done`, eigene Prüfzeile in der Suite).
+
+      **Die Ursache war ein Feld, kein fehlender Mechanismus.** `Pd::thread` trug **einen**
+      Thread, `pd_of` war ein linearer Scan darüber. Eine zweite Bindung **überschrieb** die
+      erste — der erste Thread verlor damit lautlos seinen ganzen Cspace und bekam bei jedem
+      Syscall `ERR_NOPD`. Dieselbe Form wie „eine Ablage je ROLLE" bei `CLIENT_NTFN`: eine Zelle
+      für etwas, das es mehrfach gibt.
+
+      Ersetzt durch einen **Rückwärts-Index Thread-Slot → PD** (`PdTable::owner`, die vierte
+      per-Thread-Tabelle neben `FpState`/`VSPACE_OF`/`KSTACKS`). Der Eintrag trägt die **volle**
+      `ThreadId` (Slot **und** Generation) und die **Belegungs-Generation der PD** — ohne die
+      zweite hätte der schnelle Weg eine Lücke, die der lineare Scan nicht hatte: eine PD wird
+      frei, ihr Index sofort neu vergeben, und ein noch lebender Thread der alten PD zeigte auf
+      die **neue**. Eine Beschleunigung, die eine Fremd-PD-Zuordnung erfindet, wäre schlimmer als
+      der Scan.
+
+      **Gemessen wird die WIRKUNG, an drei verschiedenen Grössen** (`pdthrd`, 16 Aussagen):
+      * *Derselbe Cspace* — Server und Client sind zwei Threads DERSELBEN PD und reden über
+        **denselben lokalen Cap-Slot** miteinander: `pd(server)=Some(1) pd(client)=Some(1)`,
+        `gebundene-Threads=2`, erstes `RECV` → `OK` (bei nur einer Bindung wäre es `ERR_NOPD`).
+      * *Getrennte Grund-Mengen (Z24)* — der Server parkt, sein Rundenzähler steht
+        (`1078337 → 1078337`), **während** der des Clients läuft (`1120791 → 5560605`); nach
+        `UNPARK` läuft er wieder. Ohne die zweite Hälfte wäre „steht" von „ist tot" nicht zu
+        unterscheiden.
+      * *Z23 S1* — s. den Eintrag dort.
+
+      **Der Weg über das Manifest war gar nicht nötig.** Der alte Eintrag nannte ihn als
+      „billigsten Weg" und den vollen 96-Byte-Eintrag als Blocker (`entry_len`-Bump auf der
+      **signierten** Fläche). Beides entfällt: `admit_in_pd(pd, ..)` zweimal auf dieselbe PD
+      genügt, sobald die Zuordnung nicht mehr in einem Feld der PD steht. Das Format bleibt
+      unangetastet.
+
+      **Eine Stelle, die das Gegenlesen fast übersehen hätte:** `domain_audit` prüfte die
+      Isolationsregel (Code 3) über `thread_of(pd)`, also über den **ersten** Thread. Ein
+      zweiter, global laufender Thread einer isolierten PD wäre damit unsichtbar geworden —
+      genau die D0-Lehre („ein Umbau, der einen neuen Zustand einführt, muss jede Stelle
+      mitnehmen, die über Zustände URTEILT"). Ersetzt durch `any_thread(pd, ..)` über den
+      Rückwärts-Index, O(Threads) statt O(PDs × Threads).
+
+      **Gegenprobe (M3): `attach_owner` weggelassen** → `pd(server)=Some(1)`,
+      **`pd(client)=None`**, `gebundene-Threads=0`, `Bindungen ohne Rueckwaerts-Tabelle=6`,
+      `pd_of` wieder linear (**40 019** Scan-Iterationen statt 0). Das ist wörtlich das alte
+      Verhalten, und es reisst `pdthrd` **und** `vorrat`. Nicht isoliert, und die Kopplung ist
+      strukturell: derselbe Index trägt beide Eigenschaften.
+
+- [x] **Der teuerste O(n)-Pfad des Systems fiel dabei mit ab — und er stand nicht in C4.**
+      `pd_of` löst bei jedem **cap-auflösenden** Syscall die aufrufende PD auf (CALL/RECV/REPLY/
+      SIGNAL/WAIT/MAP; YIELD und PARK kehren im Dispatch vorher zurück) und tat das linear über
+      alle `NPDS = 10 000` PDs. Die drei Stellen, die C4 nennt, laufen je Cap-Allokation bzw. je
+      Thread-Tod — diese je Syscall. Jetzt O(1); gemessen `0` Scan-Iterationen bei 15 Aufrufen
+      (Sprechprobe: eine Null allein wäre von „nie gefragt" nicht zu unterscheiden).
+      **Nebenbefund:** der Rückfallpfad wurde von `UNPARK 0xDEAD_BEEF` ausgelöst — einer
+      **EL0-erreichbaren** Eingabe. Ein Thread-Slot jenseits der Tabelle beantwortet sich selbst
+      (`None`); ihn linear zu suchen hiess, den langsamsten Weg ausgerechnet für die
+      Angriffseingabe zu nehmen.
+
+- [~] **P2 (Stand vom 2026-08-09, überholt) — die Userland-Hälfte steht, die Threads fehlen.**
       **Fertig:** `crates/caprock-wait` — Mutex, `WaitQueue`, `Completion` über einem Trait mit
       **zwei** Methoden (`park`/`unpark` aus P4). 11 Host-Tests gegen einen Stellvertreter. Der
       unbestrittene Weg ist **null Syscalls**; der volle Warteraum ist **benannt** und der Aufrufer
@@ -3036,6 +3180,13 @@ HW (STM32MP257F-DK) umsetzbar/testbar. Boot-Report `spec :` zeigt bereits, was d
 `CAP_BUDGET_PER_PD` begrenzt jetzt den **Schaden**, ersetzt aber nicht das seL4-Modell (jede PD
 bekommt ihren CNode aus dem **eigenen** Untyped-Budget). Solange die Tabelle geteilt ist, bleibt
 Kapazität eine globale Größe.
+
+**Gemessen dazu (2026-08-10, s. [C7](#c7-die-kapazitätskurve--wo-es-wirklich-bricht-gemessen-2026-08-10)):
+die geteilte Cap-Tabelle ist heute NICHT der Engpass — bei 9984 gleichzeitigen Prozessen stehen
+11 von 80 256 Slots.** Das entkräftet die Dringlichkeit, nicht das Argument: der Höchststand hängt
+daran, wie viele Caps eine PD **hält**, und die Kurven-PDs halten keine. Eine Zahl, die aus einem
+Lastfall ohne Caps stammt, sagt über einen Lastfall mit Caps nichts — dieselbe Unterscheidung wie
+`rx_used` gegen „Daten sind angekommen".
 **Nebenbedingung beim Vergrößern: erledigt** (A-3.3). `ReplyFinal`/`Finalized` hielt sein
 `[(u32,u64); NOBJECTS]`-Array **auf dem Kernelstack**, und nicht als einziges: `dma_finalize` hielt
 eine Kopie derselben Regionen, jede `finalize`-Implementierung der Enforcer nochmals ein
@@ -3096,14 +3247,91 @@ Tabellen, die GIC-Skalierung und der x86-Port.
 Kapazität allein reicht nicht — mehrere Pfade sind **O(n)** in der Tabellengröße und werden bei
 tausenden Threads zum Engpass:
 
-- [ ] `CapSpace::{free_slot_index, alloc_object}` — lineare Scans → Freilisten.
+**Seit 2026-08-10 gibt es dafür eine gemessene Grundlinie statt einer Liste** — die Zeile
+`vorrat` druckt Füllstände **und** Iterationszahlen in jedem Lauf (`tools/boot-x86-log.sh`).
+Gezählt, nicht gestoppt: eine Iterationszahl ist eine Eigenschaft des Programms, eine
+Zeitmessung nicht (D10).
 
-- [ ] `PdTable::create` — linearer Scan → Freiliste.
+- [x] **`pd_of` — der teuerste O(n)-Pfad, und er stand in dieser Liste NICHT.** Behoben, s.
+      [Z22 P2](#z22-die-vier-harten-stellen-aus-z21--gebaut). Er lief je **cap-auflösendem
+      Syscall** über alle 10 000 PDs; die drei Stellen unten laufen je Cap-Allokation bzw. je
+      Thread-Tod. Vorher/Nachher gemessen: **40 019 → 0** Scan-Iterationen (Gegenprobe: den
+      Rückwärts-Index nicht anhängen).
+
+- [ ] `CapSpace::{free_slot_index, alloc_object}` — lineare Scans → Freilisten.
+      **Grundlinie:** in der Kapazitätskurve nie der Engpass — bei 9984 Prozessen stehen die
+      Cap-Slots bei **11/80256**. Die Tabelle ist für diesen Lastfall um drei Grössenordnungen
+      überdimensioniert; der Scan ist trotzdem linear und wird es unter cap-hungrigen PDs.
+
+- [ ] `PdTable::create` — linearer Scan → Freiliste. **Grundlinie: 16 Iterationen** im normalen
+      Suitenlauf; in der Kurve wächst er quadratisch mit der PD-Zahl (jede Anlage scannt von
+      vorn bis zum ersten freien Slot).
 
 - [ ] `purge_ipc_queues` — iteriert **alle** Endpoints + Notifications je Thread-Tod.
+      **Grundlinie gemessen: 6 Aufrufe → 120 768 durchlaufene IPC-Objekte**, also 20 128 je
+      Thread-Tod (`NEPS + NNTFNS`), jedes einzeln gesperrt. Bei 10 000 sterbenden Threads sind
+      das **201 Millionen** Sperroperationen. Das ist die grösste verbliebene Zahl der Liste.
 
-- [ ] **Kernel-Stacks: 64 KiB je Thread.** Bei zehntausenden Threads ist das die bestimmende
-      Speichergröße (nicht die Tabellen) — 10 000 Threads = 640 MiB nur Stacks.
+- [x] **Registerkorrektur: „Kernel-Stacks 64 KiB je Thread" stimmt — für KERNEL-Threads.**
+      Es sind **zwei** Grössen, und beide sind real: `STACK_SIZE = 64 KiB` (Kernel-Thread) und
+      `USER_KSTACK_SIZE = 16 KiB` (EL1-Stack eines EL0-Threads). Die Korrektur „es sind 16, nicht
+      64" ist damit nur zur Hälfte richtig — welche gilt, hängt an der **Art** des Threads, nicht
+      am Datum des Eintrags. Gemessen an der Kurve: eine SAS-PD mit Kernel-Thread kostet
+      **64 KiB**, und bei `-m 512M` ist genau das die Schranke (7212 Prozesse, freies RAM auf 0).
+
+- [ ] **Kernel-Stacks lazy oder geteilt** — der nächste Schritt, und die Zahl dazu steht jetzt:
+      10 000 EL0-Threads × 16 KiB = **160 MiB**, auf einer 512-MiB-Maschine **31 % nur für
+      schlafende Threads**; mit Kernel-Threads (64 KiB) wären es 640 MiB und damit unmöglich.
+      **Was noch fehlt, um die Grösse zu wählen: ein Stack-Wasserzeichen je Thread** (Muster wie
+      beim User-Stack in Z19/A4). Gemessen ist bisher, wie **gross** die Stacks sind — nicht, ob
+      sie **reichen**; das entscheidet der tiefste Kernelpfad (verschachtelte Traps, seit
+      neuestem der Syscall-Umleitungspfad). Ohne das Wasserzeichen ist jede kleinere Zahl geraten.
+
+### C7. Die Kapazitätskurve — wo es WIRKLICH bricht (gemessen 2026-08-10)
+
+**Klasse:** Messung · **Stand:** gefahren, drei verschiedene Schranken benannt
+
+`tools/kapazitaet-messen.sh` legt PDs **mit je einem Thread** an (eine PD ohne Thread ist kein
+Prozess) und druckt den Füllstand über wachsendes N. Ziel parametrisierbar über
+`CAPROCK_SCALE_TARGET` (`kernel/build.rs` meldet die Variable als Bau-Eingabe — sonst misst man
+den Vorgängerstand). Die Kurve läuft **ganz am Schluss** von `report_and_off`, nach jedem Urteil:
+eine Messung, die tausende PDs belegt, kippt sonst jede baseline-empfindliche Zeile des Laufs.
+
+| Aufbau | 512 MiB | 3 GiB | 6 GiB | Schranke |
+|---|---|---|---|---|
+| SAS-PD, **kernlokaler** Spawn | 4987 | — | **4987** | **Hosting-Kapazität EINES Kerns** = `je_kern × MIGRATION_HEADROOM` = 2500 × 2 = 5000. **Nicht RAM**: bei 6 GiB blieben 5771 MiB frei |
+| SAS-PD, **lastverteilter** Spawn | 7212 | **9984** | **9984** | 512M: **RAM** (freies RAM auf 0, 64 KiB je Prozess). 3G/6G: **Thread-Slots** — 9984 + 16 schon lebende = **10 000 = `TARGET_THREADS`**, exakt die Zusage |
+| **Isolierte** PD | 224 | 1504 | 3040 | **RAM**, und zwar **2 MiB je Prozess** (private Region). Linear in der RAM-Grösse; freie VSpaces bei n=1000 noch 4087, also **nicht** VSpace/ASID |
+
+**Die drei Aussagen, die daraus folgen:**
+
+1. **10 000 Prozesse sind erreicht — wenn sie sich einen Adressraum teilen und ab 3 GiB RAM.**
+   Die Schranke ist dann die statische Thread-Kapazität, und sie ist auf die Zahl genau bemessen.
+2. **10 000 isolierte Tenants sind es nicht.** Bei 2 MiB je privater Region bräuchten sie
+   **≈ 20 GiB** allein dafür — und das ist der Fall, um den es beim Produktziel geht. Die
+   Kapazitätstabelle (`NPDS = 10 000`) beschreibt eine **Tabelle**, keine erreichbare
+   Tenant-Zahl.
+3. **Wer alle Prozesse aus einem Thread heraus erzeugt, trifft 5000 und hält es für die
+   Systemgrenze.** Der Unterschied zwischen den ersten beiden Zeilen ist eine Zeile Code
+   (`spawn_parked` gegen `spawn_balanced_parked`) und ein Faktor 2.
+
+- [ ] **Offen, und es ist eine Lücke im MESSINSTRUMENT:** `lade_mangel()` meldete in **jedem**
+      Abbruch `keiner (der Fehlschlag lag NICHT an einer Ressource)` — auch dort, wo das freie
+      RAM nachweislich auf 2 MiB stand. Der benannte Mangel ist heute nur am **`SYS_LOAD`-Pfad**
+      verdrahtet; `spawn_balanced_parked`/`spawn_isolated_parked` geben ein nacktes `None`.
+      Genau die Krankheit, die `NoResources` eine Ebene höher gerade erst behoben hat.
+      **Zu verallgemeinern auf jeden festen Vorrat**: die `vorrat`-Zeile deckt heute PDs,
+      Cap-Slots, Cap-Objekte, Endpoints, Notifications, Thread-Slots, freies RAM und
+      Kernel-Stack-RAM ab. Ohne Füllstandsanzeige sind weiterhin: der **FP-Slab**, die
+      **VSpace-/ASID-Tabelle** (nur als `free_vspaces()` in der Kurve, nicht im Bericht), die
+      **IRTE-Tabelle** und der **Finalisierungspuffer**.
+
+- [ ] **Ebenfalls offen, und es begrenzt die Aussage der Kurve:** eine PD im **globalen**
+      Adressraum zieht **gar keinen** Seitentabellen-Speicher. Die SAS-Kurve kann den Topf, an dem
+      `wasmhost` bei sechs Programmen gescheitert ist, deshalb strukturell nicht erreichen — sie
+      fragt ihn nie. Die isolierte Kurve tut es, und dort ist die private 2-MiB-Region so
+      dominant, dass die Seitentabellen im Rauschen liegen. Eine Kurve, die **den
+      Seitentabellen-Topf** isoliert misst, gibt es noch nicht.
 
 ### C5. GIC-Skalierung (ARM-Blocker für > 8 Kerne) — **weiterhin offen**
 

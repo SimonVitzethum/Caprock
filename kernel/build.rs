@@ -24,4 +24,9 @@ fn main() {
     // Sonderfall.
     println!("cargo:rerun-if-changed=x86_64-link.ld");
     println!("cargo:rerun-if-changed=linker.ld");
+    // Dieselbe Regel eine Zeile weiter: `CAPROCK_SCALE_TARGET` geht über `option_env!` in den
+    // Code ein. Ohne diese Meldung ändert ein anderer Wert **nichts** am Bau — man misst den
+    // Vorgängerstand und hält ihn für das Ergebnis der Parameteränderung. Genau der Fehler, den
+    // die Linkerskript-Zeilen darüber schon einmal gekostet haben.
+    println!("cargo:rerun-if-env-changed=CAPROCK_SCALE_TARGET");
 }

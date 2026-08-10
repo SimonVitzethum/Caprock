@@ -4,6 +4,33 @@
 #   build/target/x86_64-unknown-none/release/caprock-kernel
 set -euo pipefail
 cd "$(dirname "$0")"
+
+# ================================================================================================
+# DIE LINKERFLAGS DUERFEN NICHT DOPPELT STEHEN -- und in einem Agenten-Worktree TUN SIE ES
+# ================================================================================================
+#
+# Cargo liest `.cargo/config.toml` aus JEDEM Vorfahrenverzeichnis und **haengt Array-Werte
+# aneinander**. Ein Worktree unter `<repo>/.claude/worktrees/<id>` liegt innerhalb des Hauptbaums,
+# erbt dessen Konfiguration also ein zweites Mal -- `-Tkernel/x86_64-link.ld` steht danach ZWEIMAL
+# auf der Linkerzeile, lld wertet den `SECTIONS`-Block zweimal aus, und heraus faellt ein Abbild
+# mit sieben leeren Doppel-Sektionen, mit allen Linkersymbolen auf `0x100000` und mit einem
+# nullgrossen LOAD-Segment. Das ist die gemessene Ursache des Eintrags „das nullgrosse
+# LOAD-Duplikat" (todo.md) -- ein Fehler der BAUUMGEBUNG, nicht der Quelle. Begruendung und
+# Beleg stehen in `tools/rustflags-entdoppeln.py`.
+#
+# Repariert wird **laut**: eine stille Reparatur waere dieselbe Krankheit wie das stille Mischen.
+ENTDOPPELT="$(python3 tools/rustflags-entdoppeln.py x86_64-unknown-none)" && RC=0 || RC=$?
+if [ "${RC:-0}" = "10" ]; then
+    echo "rustflags: DOPPELT geerbt (Worktree liegt im Hauptbaum) -- entdoppelt auf: $ENTDOPPELT"
+    echo "rustflags:   ohne diese Zeile linkt lld den SECTIONS-Block ZWEIMAL; s. tools/rustflags-entdoppeln.py"
+    # **`RUSTFLAGS` und nicht `CARGO_TARGET_<T>_RUSTFLAGS`** -- gemessen: die zielspezifische
+    # Variable wird von Cargo mit der Konfiguration MITGEMISCHT (danach standen die Flags
+    # dreifach da, das Abbild wurde schlechter statt besser). `RUSTFLAGS` dagegen ERSETZT
+    # `build.rustflags` und `target.*.rustflags` vollstaendig -- das ist der einzige Weg, der
+    # das Anhaengen aus den Vorfahren-Konfigurationen wirklich abschaltet.
+    export RUSTFLAGS="$ENTDOPPELT"
+fi
+
 rustup run nightly cargo build --release --target x86_64-unknown-none -p caprock-kernel "$@"
 ELF=build/target/x86_64-unknown-none/release/caprock-kernel
 # QEMUs Multiboot1-Loader akzeptiert nur ELF32. Der ELF-Container wird auf ELF32 downgecastet

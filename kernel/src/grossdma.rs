@@ -279,7 +279,28 @@ pub struct GrossDmaBericht {
     pub zu_gross_benannt: bool,
     /// Eine Anforderung eine Seite über dem gemessenen Block wird als **`ZoneErschoepft`**
     /// abgewiesen, **und die genannte Zahl ist der Messwert**.
+    ///
+    /// **Am ECHTEN Allokatorstand — und der ist nicht auf jeder Maschine konstruierbar.** Ist der
+    /// grösste Block so gross wie die ganze Zone (gemessen bei `-m 3G`: beide 1 056 964 608 B),
+    /// dann liegt `groesster_block + SEITE` bereits **über** der Zone, und die Klassifikation
+    /// antwortet — richtig — mit `GroesserAlsZone`. Es gibt dort **keine** Länge, die zugleich in
+    /// die Zone passt und den grössten Block übersteigt. Genau das hat die erste Fassung dieser
+    /// Zeile bei 3 GiB rot gemeldet: nicht weil die Sache kaputt war, sondern weil das Kriterium
+    /// **unerfüllbar** war. Dieselbe Falle wie die FP-Sonde, die „alle 64 Abgaben" verlangte.
     pub erschoepft_benannt: bool,
+    /// **War der echte Fall auf DIESER Maschine überhaupt konstruierbar?** Ist er es nicht, sagt
+    /// `erschoepft_benannt` nichts — und dann darf es weder als Erfolg noch als Fehlschlag
+    /// zählen. Die Zahl steht in der Zeile, damit „nicht entscheidbar" von „bestanden"
+    /// unterscheidbar bleibt.
+    pub erschoepft_entscheidbar: bool,
+    /// Derselbe Fall an einer **gestellten** Lage — und der läuft **immer**.
+    ///
+    /// `klassifiziere` ist eine reine Funktion: die Lage ist ihr Argument, keine Eigenschaft der
+    /// Maschine. Also wird die Erschöpfung zusätzlich mit einem halb so grossen „grössten Block"
+    /// vorgelegt. Ohne diesen Konjunkt wäre die Aussage auf einer 3-GiB-Maschine **vakuum** —
+    /// und ein Konjunkt, das dort stillschweigend `true` wird, weil der Fall nicht eintritt, ist
+    /// die Bauform von „Schweigen als Erfolg".
+    pub erschoepft_gestellt: bool,
     /// Eine krumme Länge wird abgewiesen statt aufgerundet.
     pub krumm_benannt: bool,
     /// Der Allokatorstand ist nach allen Proben **unverändert** — eine Prüfzeile, die Speicher
@@ -294,7 +315,9 @@ impl GrossDmaBericht {
             && self.gross_geht
             && self.in_der_zone
             && self.zu_gross_benannt
-            && self.erschoepft_benannt
+            // Der echte Fall zählt nur, wo er konstruierbar ist -- der gestellte immer.
+            && (self.erschoepft_benannt || !self.erschoepft_entscheidbar)
+            && self.erschoepft_gestellt
             && self.krumm_benannt
             && self.kein_verlust
     }
@@ -349,11 +372,28 @@ pub fn pruefe() -> GrossDmaBericht {
         klassifiziere(zone(), zone().groesse() + SEITE, l),
         Err(GrossDmaFehler::GroesserAlsZone { .. })
     );
-    b.erschoepft_benannt = matches!(
-        klassifiziere(zone(), b.groesster_block + SEITE, l),
-        Err(GrossDmaFehler::ZoneErschoepft { groesster_block, .. })
-            if groesster_block == b.groesster_block
-    );
+    // **Der echte Fall, sofern er auf dieser Maschine existiert.** Fuellt der groesste Block die
+    // ganze Zone aus, gibt es keine Laenge, die zugleich hineinpasst und ihn uebersteigt.
+    b.erschoepft_entscheidbar = b.groesster_block + SEITE <= b.zone;
+    b.erschoepft_benannt = b.erschoepft_entscheidbar
+        && matches!(
+            klassifiziere(zone(), b.groesster_block + SEITE, l),
+            Err(GrossDmaFehler::ZoneErschoepft { groesster_block, .. })
+                if groesster_block == b.groesster_block
+        );
+    // **Und derselbe Fall an einer gestellten Lage -- der laeuft ueberall.** `klassifiziere` ist
+    // rein; die Lage ist ein Argument und keine Eigenschaft der Maschine. Damit haengt die
+    // Aussage nicht mehr daran, wie der Speicher dieser Maschine gerade geschnitten ist.
+    let halb = (b.zone / 2) & !(SEITE - 1);
+    let l_gestellt = Lage {
+        groesster_block: halb,
+        ..l
+    };
+    b.erschoepft_gestellt = halb >= SEITE
+        && matches!(
+            klassifiziere(zone(), halb + SEITE, l_gestellt),
+            Err(GrossDmaFehler::ZoneErschoepft { groesster_block, .. }) if groesster_block == halb
+        );
     b.krumm_benannt = matches!(
         klassifiziere(zone(), PROBE_BYTES + 1, l),
         Err(GrossDmaFehler::NichtSeitenausgerichtet { len }) if len == PROBE_BYTES + 1

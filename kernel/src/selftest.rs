@@ -93,13 +93,16 @@ fn grossdmatest() {
     }
     println!(
         "grossdma: {}  probe={}B gross-geht={} in-der-zone={} zu-gross-benannt={} \
-         erschoepft-benannt={} krumm-benannt={} kein-verlust={} groesster-block={}B zone={}B",
+         erschoepft-benannt={} (echter Fall konstruierbar={}) erschoepft-gestellt={} \
+         krumm-benannt={} kein-verlust={} groesster-block={}B zone={}B",
         if b.ok() { "ALL PASS" } else { "FAILURES" },
         crate::grossdma::PROBE_BYTES,
         b.gross_geht,
         b.in_der_zone,
         b.zu_gross_benannt,
         b.erschoepft_benannt,
+        b.erschoepft_entscheidbar,
+        b.erschoepft_gestellt,
         b.krumm_benannt,
         b.kein_verlust,
         b.groesster_block,

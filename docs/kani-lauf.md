@@ -45,7 +45,7 @@ jeweiligen Harness formulierten Struktur-Invarianten. Das ist stark: es deckt al
 innerhalb der gesetzten Schranken ab, nicht nur die, an die jemand gedacht hat.
 
 **Kani modelliert keine Nebenläufigkeit.** Das steht im Werkzeug-Output selbst und gilt besonders
-für `sel4lake-sync`:
+für `caprock-sync`:
 
 ```
 warning: Kani currently does not support concurrency. The following constructs will be treated as
@@ -130,7 +130,7 @@ ausschliesst. Ein Beweis mit unbenannter Schranke ist eine Zusage, deren Reichwe
 ## Befund vom 2026-08-01: `sync` ist grün — und sagt über ext-29 nichts
 
 D1 stand als „Kani lokal nicht ausführbar (nur CI-Gate) — die ext-29-Änderung an
-`sel4lake-sync` ist dort **nicht** gegengeprüft worden". Die erste Hälfte ist erledigt: Kani
+`caprock-sync` ist dort **nicht** gegengeprüft worden". Die erste Hälfte ist erledigt: Kani
 0.67.0 läuft lokal, `bash tools/kani-verify.sh sync` liefert
 
 ```
@@ -143,7 +143,7 @@ ersten Mal belegt — und der Beleg steht im Lauf selbst.
 ### Was der grüne Lauf ausschließt
 
 Kani baut für das **Host**-Ziel; im Log steht 287-mal `x86_64-unknown-linux-gnu`. Damit greift
-in `sel4lake-sync` der dritte `cfg`-Zweig:
+in `caprock-sync` der dritte `cfg`-Zweig:
 
 ```rust
 #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_os = "none"))))]
@@ -199,7 +199,7 @@ entscheidet, muss belegen können, dass er sprechfähig ist. Hier ist er es nach
 
 ### Was daraus folgt — und was am 2026-08-01 daraufhin gebaut wurde
 
-Ein Kani-Lauf gegen `sel4lake-sync` wird die ext-29-Eigenschaft **nie** abdecken, solange er
+Ein Kani-Lauf gegen `caprock-sync` wird die ext-29-Eigenschaft **nie** abdecken, solange er
 auf dem Host-Ziel baut. Getragen wird sie allein vom Wächter zur Übersetzungszeit. Damit stand
 die Frage: löst dieser Wächter überhaupt aus?
 

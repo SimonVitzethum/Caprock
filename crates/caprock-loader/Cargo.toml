@@ -1,0 +1,17 @@
+# Binary-Loader-Parser (ext-26): reine, bounds-geprüfte Parser für das Boot-Archiv
+# und (ab L1) Minimal-ELF64. KEIN `unsafe`, keine Kernel-/HW-Abhängigkeit — daher
+# vollständig per Host-`cargo test` verifizier- und fuzzbar. Der privilegierte Teil
+# (Segmente kopieren, mappen, spawnen) lebt im Kernel-Glue (kernel/src/loader.rs).
+[package]
+name = "caprock-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+# `kani` ist ein externes cfg (Tier-1-Verifikation; nur unter `cargo kani` gesetzt, im Normalbuild
+# inert). Als erwartetes cfg deklarieren -> kein `unexpected_cfgs`-Warning (Rust >= 1.80).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

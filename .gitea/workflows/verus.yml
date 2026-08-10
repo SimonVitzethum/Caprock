@@ -9,7 +9,7 @@
 # nicht laeuft, sind derselbe Riss wie zwei Suiten, die dasselbe Geraet verschieden aufsetzen --
 # wer hier etwas aendert, aendert es auch drueben, oder loescht diese Datei.
 #
-# SEL4Lake — Formale Verifikation (Tier 2, Verus) als CI-Gate.
+# Caprock — Formale Verifikation (Tier 2, Verus) als CI-Gate.
 #
 # Ziel wie beim Kani-Gate: jeder Push/PR fuehrt die Verus-Beweise (dokumentierte Kernel-Invarianten:
 # cap_audit_cdt, domain_audit, vspace_audit, dma_audit, loader_audit, trust_audit) erneut aus.

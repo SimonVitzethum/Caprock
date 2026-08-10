@@ -9,7 +9,7 @@ die PL011-Konsole einen Banner ausgibt.
 
 - **Workspace + Build** (ADR 0001): Cargo-Workspace, `rust-toolchain.toml`
   (nightly + `rust-src`/`llvm-tools`), custom Bare-Metal-Target
-  `targets/aarch64-sel4lake.json`, `-Z build-std`, `.cargo/config.toml`,
+  `targets/aarch64-caprock.json`, `-Z build-std`, `.cargo/config.toml`,
   `build.sh`, `run-qemu.sh`.
 - **Linker-Script** `kernel/linker.ld`: Ladeadresse `0x4008_0000`, Segmente
   RX/R/RW, `.bss` (NOLOAD) + 64 KiB Boot-Stack.
@@ -30,7 +30,7 @@ drei LOAD-Segmente (RX/R/RW). Boot in QEMU (`-machine virt -cpu cortex-a72
 
 ```
 ========================================
- SEL4Lake — capability microkernel
+ Caprock — capability microkernel
  phase 0: bare-metal bring-up
 ========================================
 arch    : aarch64 (running at EL1)
@@ -47,7 +47,7 @@ defensiv). Kernel läuft wie geplant in **EL1** (QEMU ohne `virtualization=on`).
 ## Getroffene Entscheidungen
 
 - **Eigenständiger Kernel statt Microkit-PD** (ADR 0001-B verworfen):
-  `microkit_rust` baut Userland-PDs *auf* seL4 — SEL4Lake ist ein eigener
+  `microkit_rust` baut Userland-PDs *auf* seL4 — Caprock ist ein eigener
   Kernel, den QEMU direkt via `-kernel` lädt. `microkit_rust` bleibt Referenz
   für `no_std`/IPC/Build, nicht Kernelbasis.
 - **SAS statt VM** (ADR 0002): „kein virtueller RAM“ wird als Single-Address-Space
@@ -87,6 +87,6 @@ Kein `unsafe` außerhalb dieser Bereiche.
 2. **MMU: eine Identity-Map** (Block-Mappings für 4 GiB RAM, MMIO als Device),
    Caches + `W^X`/`XN`/`RO`-Attribute aktivieren (ADR 0002).
 3. **GIC** (v2/v3) initialisieren, **Generic Timer** als Tick-Quelle.
-4. **Per-CPU-Daten** + **Ticket-Spinlock** (`crates/sel4lake-sync`), SMP-Bring-up
+4. **Per-CPU-Daten** + **Ticket-Spinlock** (`crates/caprock-sync`), SMP-Bring-up
    der Sekundärkerne via **PSCI `CPU_ON`**.
 5. Tests: Boot, Multicore-Boot (alle 8 Kerne melden sich), Timer-Tick.

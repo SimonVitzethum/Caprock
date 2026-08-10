@@ -1,4 +1,4 @@
-# SEL4Lake — Systeminvarianten (Konsolidierung, ext-22…ext-28)
+# Caprock — Systeminvarianten (Konsolidierung, ext-22…ext-28)
 
 Dieses Dokument macht die bis ext-25 **impliziten** Invarianten explizit: die Sperrordnung, die
 DMA-Revoke-Reihenfolge, die Region-Balance, den `RegionView`/`Pod`-Sicherheitsvertrag und das
@@ -435,7 +435,7 @@ Alloc-/Free-Zyklus bleibt `MEM.total_free()` unverändert.
 
 ## 4. `RegionView`/`Pod`-Sicherheitsvertrag (das gesamte Speicher-`unsafe`)
 
-Das gesamte Speicher-`unsafe` der Trusted-SAS-Schicht liegt in `crates/sel4lake-region` (RegionView-
+Das gesamte Speicher-`unsafe` der Trusted-SAS-Schicht liegt in `crates/caprock-region` (RegionView-
 Accessoren + Allokator-Glue). Es ist begründet durch:
 
 1. **Cap-validierter Besitz:** eine `Region` hält eine `MemoryCap` (lineares Eigentum); die Bytes
@@ -525,7 +525,7 @@ für sie eine zusätzliche Lade-Invariante. Maßgeblich: `kernel::loader::verify
   existiert **kein** Syscall dafür. `verify_strict` (nicht `verify`) → keine Signatur-Malleability.
 - **Unsafe-Invariante (host-erzwungen).** Ein zertifiziertes TrustedSAS-Programm ist
   `#![forbid(unsafe_code)]`; `unsafe` existiert im gesamten App-Dep-Baum **nur** in der Allowlist
-  `{libsel4lake}`. `tools/sign_trusted.py` verweigert sonst das Zertifikat; der Kernel verlangt
+  `{libcaprock}`. `tools/sign_trusted.py` verweigert sonst das Zertifikat; der Kernel verlangt
   `unsafe_status == ALL_PASS`.
 - **`trust_audit()` (Laufzeit-Oracle).** Key-DB-Selbstkonsistenz (`key_id == fingerprint(pubkey)`,
   Eindeutigkeit, nicht leer) **plus** Live-Test: ein bekannt gültiges Zertifikat wird akzeptiert,
@@ -647,7 +647,7 @@ Details + Herleitung: `docs/phase-reports/ext-30-migration-und-kapazitaet.md`.
 `POLICY_EXCLUSIVE_STRIPE`** erzeugte PDs mit disjunkten Farbsätzen
 teilen sich **keine Cache-Farbe des Last-Level-Cache** — weder in ihrer privaten Region noch im
 Kernel-Stack noch in ihren obersten Seitentabellen. Geprüft im Lauf (`color : ALL PASS`), die
-Arithmetik zusätzlich auf dem Host (`sel4lake-mem`, `hal::cache_decode`).
+Arithmetik zusätzlich auf dem Host (`caprock-mem`, `hal::cache_decode`).
 
 **Grundlage:** Der LLC ist physisch indiziert. Die Set-Indexbits oberhalb des Seitenoffsets hängen
 damit an der Physadresse und sind seitenkonstant — das ist die *Farbe*. Die Geometrie wird
@@ -706,7 +706,7 @@ kennt, wird im Betrieb überdehnt.
       ungestoert=41   disjunkt=234   gleichfarbig=210
 
   Der disjunkte Farbsatz schützt dort **nicht**. Das widerlegt A1 nicht — es zeigt, dass A1 eine
-  Aussage über die *physische* Adresse ist und ein Gast diese nicht besitzt. Wer SEL4Lake als Gast
+  Aussage über die *physische* Adresse ist und ein Gast diese nicht besitzt. Wer Caprock als Gast
   betreibt, darf sich auf §12 **nicht** verlassen, solange der Wirt nicht farberhaltend hinterlegt
   (z. B. 1-GiB-Seiten). Der Test erkennt den Gastfall (`CPUID.1:ECX[31]`) und meldet SKIP mit
   Begründung, statt eine Zahl zu liefern, die etwas anderes bedeutet, als sie zu bedeuten scheint.
@@ -804,6 +804,6 @@ je nachdem *wo* der Panic auftrat — Belege, Zahlen und die Liste der ungeprüf
 
 **Für diesen Abschnitt heißt das:** die Sperrordnung aus §1 sichert Verklemmungsfreiheit im
 **fehlerfreien** Betrieb. Sie sagt nichts über einen Kern, der *mitten in* einem kritischen
-Abschnitt stehenbleibt. Der Ticket-Lock (`crates/sel4lake-sync`) hat keine Schranke; ein Panic
+Abschnitt stehenbleibt. Der Ticket-Lock (`crates/caprock-sync`) hat keine Schranke; ein Panic
 unter `MEM` oder `CAPS` friert damit alle Kerne ein, ohne eine weitere Zeile auszugeben — gemessen.
 Wer §1 erweitert, erweitert damit **nicht** die Fehlerdomäne.

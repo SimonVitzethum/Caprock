@@ -1,7 +1,7 @@
-// SEL4Lake — Verus-Pilot (Tier 2, funktionale Verifikation).
+// Caprock — Verus-Pilot (Tier 2, funktionale Verifikation).
 //
 // Erste FORMALE SPEZIFIKATION einer bereits dokumentierten Kernel-Invariante: der Refcount-Anteil
-// von `cap_audit_cdt` (crates/sel4lake-cap/src/space.rs, Codes 1-3). Zur Laufzeit prueft das Audit
+// von `cap_audit_cdt` (crates/caprock-cap/src/space.rs, Codes 1-3). Zur Laufzeit prueft das Audit
 // die Invariante nur an Quiescenz-Punkten; hier wird statisch + fuer ALLE Zustaende bewiesen, dass
 // die Capability-Operationen `copy`/`delete` sie ERHALTEN.
 //

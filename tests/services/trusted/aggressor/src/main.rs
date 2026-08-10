@@ -15,10 +15,10 @@
 #![no_main]
 // ext-28: vollstaendig unsafe-frei -> als TrustedSAS **zertifizierbar** (Signatur-Gate, ADR 0014).
 // Der Entry-Point `_start` (mit dem unsafe-Attribut `#[no_mangle]`) kommt aus der auditierten
-// SDK-Schicht libsel4lake (Allowlist) via `entry!` — dieser Dienst selbst bleibt forbid-rein.
+// SDK-Schicht libcaprock (Allowlist) via `entry!` — dieser Dienst selbst bleibt forbid-rein.
 #![forbid(unsafe_code)]
 
-use libsel4lake::{exit, invoke, result, sys};
+use libcaprock::{exit, invoke, result, sys};
 
 /// Erfolgs-Badge "AGRT" (muss zum Kernel-Test `AGGRT_SUCCESS` passen).
 pub const SUCCESS_BADGE: u64 = 0x4147_5254;
@@ -34,7 +34,7 @@ fn expect(nr: u64, cap: u64, want: u64, ok: &mut bool) {
     }
 }
 
-libsel4lake::entry!(run);
+libcaprock::entry!(run);
 
 fn run(_arg: usize) -> ! {
     let mut ok = true;
@@ -66,7 +66,7 @@ fn run(_arg: usize) -> ! {
 
     // Erfolg melden — NUR bei vollstaendig abgewiesener Batterie.
     if ok {
-        libsel4lake::signal(REPORT, SUCCESS_BADGE);
+        libcaprock::signal(REPORT, SUCCESS_BADGE);
     }
     exit();
 }

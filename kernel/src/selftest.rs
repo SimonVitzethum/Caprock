@@ -5,9 +5,9 @@
 //! CDT, Refcount-Finalisierung, Generations-Handles, keine Rechte-Eskalation).
 
 use crate::system as mm;
-use sel4lake_cap::CapError;
-use sel4lake_hal::println;
-use sel4lake_mem::{MemoryCap, Rights, PAGE};
+use caprock_cap::CapError;
+use caprock_hal::println;
+use caprock_mem::{MemoryCap, Rights, PAGE};
 
 fn check(prefix: &str, cond: bool, name: &str, fail: &mut bool) {
     if cond {
@@ -39,7 +39,7 @@ pub fn run() {
 /// nicht — der Test meldet dort `SKIP` statt eine Eigenschaft zu behaupten, die es nicht gibt.
 fn dmaaligntest() {
     let p = "dmaalign";
-    let g = sel4lake_hal::mmu::dma_granule();
+    let g = caprock_hal::mmu::dma_granule();
     if g <= 1 {
         println!("{p}: SKIP  (kohaerente Architektur, Granule {g} -> keine Bedingung)");
         println!("dmaalign: ALL PASS");
@@ -145,12 +145,12 @@ fn region_is_zero(base: u64, len: u64) -> bool {
 
 /// **Cap-Budget-Test** (ext-29): eine PD kann die systemweit geteilte Cap-Tabelle nicht
 /// monopolisieren. `install_cap_checked` weist jede Installation über
-/// [`CAP_BUDGET_PER_PD`](sel4lake_microkit::CAP_BUDGET_PER_PD) hinaus ab; ein Überschreiben
+/// [`CAP_BUDGET_PER_PD`](caprock_microkit::CAP_BUDGET_PER_PD) hinaus ab; ein Überschreiben
 /// eines schon belegten Slots bleibt erlaubt (kein zusätzlicher Verbrauch).
 fn budgettest() {
     let p = "budget";
     let mut fail = false;
-    const BUDGET: usize = sel4lake_microkit::CAP_BUDGET_PER_PD;
+    const BUDGET: usize = caprock_microkit::CAP_BUDGET_PER_PD;
 
     let free_before = mm::total_free();
     let pd = mm::create_pd().expect("budget pd");
@@ -273,7 +273,7 @@ fn captest() {
         &mut fail,
     );
     let ri = mm::cap_inspect(root).expect("inspect root");
-    let region_ok = matches!(ri.kind, sel4lake_cap::ObjectKind::Memory(r) if r.len == len);
+    let region_ok = matches!(ri.kind, caprock_cap::ObjectKind::Memory(r) if r.len == len);
     check(
         p,
         region_ok && ri.rights == Rights::RW && ri.refcount == 1,

@@ -13,7 +13,7 @@
 #![no_std]
 #![no_main]
 
-use libsel4lake::{exit, invoke, result, sys};
+use libcaprock::{exit, invoke, result, sys};
 
 /// Erfolgs-Badge "AGRH" (muss zum Kernel-Test `AGGRH_SUCCESS` passen).
 pub const SUCCESS_BADGE: u64 = 0x4147_5248;
@@ -58,7 +58,7 @@ pub extern "C" fn _start(_arg: usize) -> ! {
 
     // Erfolg ueber den EIGENEN Kanal melden — NUR bei vollstaendig abgewiesener Batterie.
     if ok {
-        libsel4lake::signal(CHAN, SUCCESS_BADGE);
+        libcaprock::signal(CHAN, SUCCESS_BADGE);
     }
     exit();
 }

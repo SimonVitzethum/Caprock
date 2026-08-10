@@ -1,6 +1,6 @@
-# SEL4Lake — Architekturübersicht
+# Caprock — Architekturübersicht
 
-SEL4Lake ist ein eigenständiger, capability-basierter Microkernel in Rust,
+Caprock ist ein eigenständiger, capability-basierter Microkernel in Rust,
 inspiriert von seL4 und der seL4-Microkit-Laufzeit, aber mit einem bewusst
 anderen Speichermodell. Ziel ist ein Betriebssystem, das zugleich
 **hochsicher, hochperformant, capability-basiert, deterministisch und vollständig
@@ -23,7 +23,7 @@ Drei existierende Systeme bilden die geistige Grundlage:
 | **seL4 Microkit** | Protection-Domain-Modell, Channels, statisches Systemlayout, schlanke Runtime | Microkit-Runtime wird Teil des Kernelimages; Komponenten sind hot-reloadbar |
 | **Theseus OS** | Single-Address-Space (SAS), Speichersicherheit *intralingual* durch Rust, Live-Austausch von Modulen | Zusätzlich explizites seL4-Capability-Modell als Autoritätsschicht |
 
-Der zentrale, definierende Unterschied zu seL4: **SEL4Lake nutzt keine
+Der zentrale, definierende Unterschied zu seL4: **Caprock nutzt keine
 per-Prozess-Adressräume und keine MMU-basierte Speicherisolation**. Jede Adresse
 ist eine echte physische Adresse. Speichersicherheit entsteht aus zwei sich
 ergänzenden Mechanismen — der Rust-Typsicherheit (verhindert Speicherfehler
@@ -45,7 +45,7 @@ Komponenten). Details und Konsequenzen: [ADR 0002](adr/0002-no-virtual-memory-sa
 **Nicht im Kernelimage** (laufen als Userland-Komponenten, hot-reloadbar):
 
 Strukturierte Karte des seL4-C-Kernels unter
-`/home/simon/Dokumente/SEL4Lake/seL4/src`. **Referenz, kein Fork-Vorbild zum
+`/home/simon/Dokumente/Caprock/seL4/src`. **Referenz, kein Fork-Vorbild zum
 Kopieren** — sie dient dazu, bewährte Muster für die Rust-Neuimplementierung zu
 verstehen. Pfade sind relativ zu `seL4/src` (Header teils unter `seL4/include`).
 
@@ -60,7 +60,7 @@ verstehen. Pfade sind relativ zu `seL4/src` (Header teils unter `seL4/include`).
 | `machine/` | HW-Abstraktion: IO, FPU, Profiling | ~56K |
 | `arch/` | Architekturspezifisch (ARM/x86/RISC-V) | ~1.7M |
 Strukturierte Karte des seL4-C-Kernels unter
-`/home/simon/Dokumente/SEL4Lake/seL4/src`. **Referenz, kein Fork-Vorbild zum
+`/home/simon/Dokumente/Caprock/seL4/src`. **Referenz, kein Fork-Vorbild zum
 Kopieren** — sie dient dazu, bewährte Muster für die Rust-Neuimplementierung zu
 verstehen. Pfade sind relativ zu `seL4/src` (Header teils unter `seL4/include`).
 
@@ -129,11 +129,11 @@ architekturunabhängig; `arch/`+`plat/` (~2.4M) tragen die Hardware-Spezifik.
 
 - `arch/arm/64/head.S` (Boot-Entry), `traps.S` (Vektoren/Handler),
   `c_traps.c` (C-Dispatch), `kernel/thread.c` (Kontextwechsel),
-  `kernel/vspace.c` (MMU/Page-Tables/ASID — in SEL4Lake **entfällt** der
+  `kernel/vspace.c` (MMU/Page-Tables/ASID — in Caprock **entfällt** der
   per-Prozess-Teil, ADR 0002), `machine/registerset.c`, `machine/fpu.c`.
 - Boot: MMU-aus-Entry → Boot-Page-Tables → MMU an → `init_kernel` → Rootserver.
 
-## Konsequenzen für SEL4Lake
+## Konsequenzen für Caprock
 
 Übernommen werden die *Konzepte* (Caps/CDT, Endpoint/Notification/Reply,
 Bitmap-Scheduler, Retype-Idee), neu sind: Rust statt C, **kein per-Prozess-VSpace**
@@ -195,11 +195,11 @@ architekturunabhängig; `arch/`+`plat/` (~2.4M) tragen die Hardware-Spezifik.
 
 - `arch/arm/64/head.S` (Boot-Entry), `traps.S` (Vektoren/Handler),
   `c_traps.c` (C-Dispatch), `kernel/thread.c` (Kontextwechsel),
-  `kernel/vspace.c` (MMU/Page-Tables/ASID — in SEL4Lake **entfällt** der
+  `kernel/vspace.c` (MMU/Page-Tables/ASID — in Caprock **entfällt** der
   per-Prozess-Teil, ADR 0002), `machine/registerset.c`, `machine/fpu.c`.
 - Boot: MMU-aus-Entry → Boot-Page-Tables → MMU an → `init_kernel` → Rootserver.
 
-## Konsequenzen für SEL4Lake
+## Konsequenzen für Caprock
 
 Übernommen werden die *Konzepte* (Caps/CDT, Endpoint/Notification/Reply,
 Bitmap-Scheduler, Retype-Idee), neu sind: Rust statt C, **kein per-Prozess-VSpace**
@@ -219,22 +219,22 @@ ein Userland-Dienst. Siehe [ADR 0006](adr/0006-hot-reload-architecture.md).
 
 Subsysteme werden erst als eigene Crate ausgegliedert, sobald sie echten Inhalt
 haben (keine leeren Abstraktionen auf Vorrat). Vorhanden nach Phase 6:
-`kernel`, `crates/sel4lake-{sync, abi, hal, mem, cap, sched, ipc, microkit}`.
+`kernel`, `crates/caprock-{sync, abi, hal, mem, cap, sched, ipc, microkit}`.
 Zielstruktur:
 
 ```
-SEL4Lake/
+Caprock/
   kernel/              # bootbares Image: Boot, Arch-Glue, verdrahtet Subsysteme
   crates/
-    sel4lake-abi/      # geteilte Kernel<->User-ABI: Syscall-Nrn, Nachrichten-Layout, Cap-Rechte
-    sel4lake-sync/     # no_std-Synchronisation: Ticket-Spinlock, Per-CPU-Daten
-    sel4lake-hal/      # aarch64-HAL: Kontextwechsel, Traps, GIC, Timer, Identity-MMU, SMP
-    sel4lake-mem/      # capability-basierter physischer Allokator (Untyped-artig)
-    sel4lake-cap/      # Capability-Typen, CNode, Derivation-Tree (CDT)
-    sel4lake-sched/    # deterministischer Multicore-Scheduler
-    sel4lake-ipc/      # Endpoints, Notifications, Reply, Transfer, Fastpath
+    caprock-abi/      # geteilte Kernel<->User-ABI: Syscall-Nrn, Nachrichten-Layout, Cap-Rechte
+    caprock-sync/     # no_std-Synchronisation: Ticket-Spinlock, Per-CPU-Daten
+    caprock-hal/      # aarch64-HAL: Kontextwechsel, Traps, GIC, Timer, Identity-MMU, SMP
+    caprock-mem/      # capability-basierter physischer Allokator (Untyped-artig)
+    caprock-cap/      # Capability-Typen, CNode, Derivation-Tree (CDT)
+    caprock-sched/    # deterministischer Multicore-Scheduler
+    caprock-ipc/      # Endpoints, Notifications, Reply, Transfer, Fastpath
   microkit/
-    sel4lake-microkit/ # In-Image-Microkit-Runtime (PD-/Channel-Modell)
+    caprock-microkit/ # In-Image-Microkit-Runtime (PD-/Channel-Modell)
   user/                # Out-of-Image-Komponenten (Treiber, Dienste) — hot-reloadbar
   targets/  docs/  build.sh  run-qemu.sh
 ```

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""SEL4Lake — System-Manifest bauen + signieren (A-1.2 bis A-1.4).
+"""Caprock — System-Manifest bauen + signieren (A-1.2 bis A-1.4).
 
 Das Manifest legt die **gesamte Anfangsverteilung von Autoritaet** fest: welche Komponente mit
 welchem erwarteten Hash in welche Domaene geladen wird, welche Anfangs-Caps sie bekommt und unter
 welcher Politik sie laeuft. Wer die Datei tauschen kann, besitzt sonst die Maschine -- deshalb wird
 sie signiert, und die Signatur ist an das Kernel-Image gebunden (`--kernel`).
 
-Format: crates/sel4lake-loader/src/manifest.rs (eingefroren, feste Feldbreiten, Little-Endian).
+Format: crates/caprock-loader/src/manifest.rs (eingefroren, feste Feldbreiten, Little-Endian).
 Signiert wird die **gesamte** Nachricht `[0..msg_len)`, also Kopf UND alle Eintraege.
 
 Aufruf:
@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover
     )
     raise SystemExit(3)
 
-# Muss EXAKT zu crates/sel4lake-loader/src/manifest.rs passen (eingefrorenes Format).
+# Muss EXAKT zu crates/caprock-loader/src/manifest.rs passen (eingefrorenes Format).
 MAGIC = 0x534C_4B4D
 FORMAT_VERSION = 1
 SIG_ALG_ED25519 = 1

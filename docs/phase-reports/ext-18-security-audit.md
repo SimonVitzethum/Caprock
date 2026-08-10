@@ -3,7 +3,7 @@
 **Datum:** 2026-06-24 · **Status:** 2 reale Bugs behoben + regressionsgetestet; übrige
 Funde verifiziert (real/sicher/by-design) und mit Empfehlungen dokumentiert.
 
-SEL4Lake wurde als **potenziell feindliches Zielsystem** behandelt: gezielte
+Caprock wurde als **potenziell feindliches Zielsystem** behandelt: gezielte
 adversariale Code-Analyse aller Subsysteme (Capabilities, Speicher/VSpace, IPC, SMP,
 MCS, Hot-Reload) + reproduzierbare QEMU-Tests für die plausibelsten Funde. Jeder Fund
 wurde **selbst am Code verifiziert** (keine ungeprüften Subagent-Behauptungen). Für die
@@ -16,7 +16,7 @@ der **ohne Fix nachweislich fehlschlägt**.
 
 ### BUG 1 — Kernel-Panik-DoS: toter Thread in Endpoint-Queue (HOCH)
 
-**Ort:** `crates/sel4lake-ipc/src/lib.rs`, `recv()` (Z. 183) und `call()` (Z. 155).
+**Ort:** `crates/caprock-ipc/src/lib.rs`, `recv()` (Z. 183) und `call()` (Z. 155).
 
 **Fehler:** Beide machten `ops.frame_of(x).expect(...)` auf einen aus der
 `senders`/`receivers`-Queue entnommenen Thread. **Kein Pfad entfernt einen gekillten/
@@ -43,7 +43,7 @@ bedient (Antwort = 2× `STALE_MAGIC`). **Verifiziert:** mit zurückgerolltem Fix
 
 ### BUG 2 — MCS-Thread-Stranding bei erneutem Budget-Bind (HOCH)
 
-**Ort:** `crates/sel4lake-sched/src/lib.rs`, `set_budget()`.
+**Ort:** `crates/caprock-sched/src/lib.rs`, `set_budget()`.
 
 **Fehler:** `set_budget` (von `bind_sched_context` genutzt) setzte `depleted = false`,
 **ohne den Thread wieder einzureihen**. Ein erschöpfter Thread ist per Konstruktion

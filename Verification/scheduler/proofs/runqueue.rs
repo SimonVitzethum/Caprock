@@ -1,6 +1,6 @@
-// SEL4Lake — Phase 5 (Scheduler), Schritt A/B: Runqueue-Konsistenz + MCS-Budget.
+// Caprock — Phase 5 (Scheduler), Schritt A/B: Runqueue-Konsistenz + MCS-Budget.
 //
-// Formale Spezifikation der Scheduler-Kern-Invarianten (crate sel4lake-sched, `Scheduler::audit`):
+// Formale Spezifikation der Scheduler-Kern-Invarianten (crate caprock-sched, `Scheduler::audit`):
 // die Ready-Queue-Mitgliedschaft jedes Threads stimmt EXAKT mit seinem Zustand ueberein
 // (kein toter/blockierter/erschoepfter Thread in der Queue, kein Duplikat, der laufende Thread
 // nicht zugleich bereit, kein verlorener lauffaehiger Thread) UND die MCS-Budget-Buchhaltung ist
@@ -17,7 +17,7 @@
 // **WIE WEIT DIESES MODELL TRAEGT** — festgehalten von `tools/verus-modelltreue-sched.sh`.
 // ------------------------------------------------------------------------------------------------
 //
-// Dieses Modell hat 7 Thread-Felder und 7 Uebergaenge. `crates/sel4lake-sched/src/lib.rs::Tcb` hat
+// Dieses Modell hat 7 Thread-Felder und 7 Uebergaenge. `crates/caprock-sched/src/lib.rs::Tcb` hat
 // 20 Felder, und 20 Funktionen schreiben Scheduler-Zustand. Ein 1:1-Strukturvergleich wie bei
 // `unlink` (s. `Verification/capability-system/proofs/cap_space.rs`) waere hier unehrlich — er
 // muesste so weit aufgeweicht werden, dass er nicht mehr anschlagen KANN. Der Waechter prueft

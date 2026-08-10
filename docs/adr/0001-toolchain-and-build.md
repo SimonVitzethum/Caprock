@@ -13,7 +13,7 @@ Boot-Pfad, der ohne Bootloader-SDK direkt unter QEMU lädt.
 ### A) Eigener Kernel via `qemu -kernel` (gewählt)
 Eigene Boot-Assembly, eigenes Linker-Script, Laden des ELF direkt durch QEMU.
 
-- **+** Voll unabhängig von der seL4-/Microkit-SDK; SEL4Lake ist ein
+- **+** Voll unabhängig von der seL4-/Microkit-SDK; Caprock ist ein
   eigenständiger Kernel, kein PD auf fremdem Kernel.
 - **+** Minimale bewegliche Teile, schneller Boot, einfache Tests.
 - **−** Wir müssen Trap-Vektoren, Timer, GIC, MMU selbst aufsetzen (ohnehin Ziel).
@@ -37,7 +37,7 @@ seL4-Kernel mittels Microkit-SDK und `loader.img`.
   `-Z build-std` (es gibt kein vorkompiliertes `core`/`alloc` für ein
   freistehendes Target). `/usr/bin/cargo` ist auf diesem System ein
   rustup-Proxy, daher greift das Pinning automatisch.
-- **Target:** custom JSON-Spec `targets/aarch64-sel4lake.json`
+- **Target:** custom JSON-Spec `targets/aarch64-caprock.json`
   (`llvm-target: aarch64-unknown-none`, `panic-strategy: abort`,
   `relocation-model: static`, `+strict-align`, `rust-lld` als Linker). Neuere
   Nightlies verlangen zusätzlich `-Z json-target-spec` (in `.cargo/config.toml`).
@@ -71,4 +71,4 @@ in Phase 1 wird eine Identity-Map mit aktivierten Caches eingeführt.
 ./run-qemu.sh     # qemu-system-aarch64 -machine virt -cpu cortex-a72 -smp 8 -m 4G ...
 ```
 
-Artefakt: `build/target/aarch64-sel4lake/release/sel4lake-kernel.elf`.
+Artefakt: `build/target/aarch64-caprock/release/caprock-kernel.elf`.

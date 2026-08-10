@@ -60,9 +60,9 @@ MAX_ABWEICHUNGEN="${MAX_ABWEICHUNGEN:-2000}"
 # 50000 leere Protokolle erzeugt.
 ARCH="${ARCH:-x86}"
 if [ "$ARCH" = "arm" ]; then
-    ELF="build/target/aarch64-sel4lake/release/sel4lake-kernel.elf"
+    ELF="build/target/aarch64-caprock/release/caprock-kernel.elf"
 else
-    ELF="build/target/x86_64-unknown-none/release/sel4lake-kernel.mb32"
+    ELF="build/target/x86_64-unknown-none/release/caprock-kernel.mb32"
 fi
 D0="build/d0"
 rm -rf "$D0"; mkdir -p "$D0"
@@ -88,7 +88,7 @@ MASTER="$D0/master.img"
 # er schlimmer: die Referenzsignatur haenge dann an einer anderen Platte als die Vergleichslaeufe.
 python3 tools/mkgpt.py "$MASTER" --sectors 32768 \
     --part 34:20000 --part 20001:32700 --magic-at 20001 \
-    --fat16 34:20000 --file "HELLO.TXT=SEL4LAKE-DATEIINHALT" >/dev/null 2>&1 || {
+    --fat16 34:20000 --file "HELLO.TXT=CAPROCKS-DATEIINHALT" >/dev/null 2>&1 || {
     echo "FEHLER: mkgpt.py hat kein Abbild erzeugt." >&2; exit 2; }
 [ -s "$MASTER" ] || { echo "FEHLER: Master-Abbild leer." >&2; exit 2; }
 

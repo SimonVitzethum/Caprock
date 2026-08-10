@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SEL4Lake — den **Kernel-Code-Hash** aus einem ELF berechnen (A-1.3).
+"""Caprock — den **Kernel-Code-Hash** aus einem ELF berechnen (A-1.3).
 
 Der Hash bindet das System-Manifest an genau diesen Kernel: `sign_manifest.py` schreibt ihn in die
 signierte Nachricht, der Kernel berechnet ihn beim Hochlauf aus seinem eigenen Speicher und

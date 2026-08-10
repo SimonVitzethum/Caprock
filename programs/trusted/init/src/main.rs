@@ -57,14 +57,14 @@ const NTFN_GONE_SLOT: u64 = 4;
 /// Rechte-Bitmaske fuer die Kopien (R+W+X; wird ohnehin mit den Rechten des Originals geschnitten).
 const RWX: u64 = 7;
 
-libsel4lake::entry!(run);
+libcaprock::entry!(run);
 
 fn run(arg: usize) -> ! {
     let index = (arg & 0xffff_ffff) as u64;
     let count = (arg >> 32) as u64;
 
     // 1. "Ich laufe."
-    libsel4lake::signal(NTFN_SLOT, ROOT_BADGE);
+    libcaprock::signal(NTFN_SLOT, ROOT_BADGE);
 
     // 2. Die uebrige Startmenge laden. Fehler werden NICHT stillschweigend uebergangen: was nicht
     //    laedt, meldet sich als gesetztes Bit im Badge -- sonst saehe ein leerer Lauf aus wie ein
@@ -77,21 +77,21 @@ fn run(arg: usize) -> ! {
             // Die eigene Notification delegieren, aber mit EIGENEM Badge fuer das Kind -- sonst
             // signalisierten alle Kinder unter dem Badge des Root-Tasks und waeren nicht
             // auseinanderzuhalten (das Badge steckt in der Cap, nicht in der Nachricht).
-            if libsel4lake::load(LOADER_SLOT, i, NTFN_SLOT, CHILD_BADGE) != libsel4lake::result::OK {
+            if libcaprock::load(LOADER_SLOT, i, NTFN_SLOT, CHILD_BADGE) != libcaprock::result::OK {
                 failed |= 1 << (i.min(30) + 1);
             }
         }
         i += 1;
     }
     if failed != 0 {
-        libsel4lake::signal(NTFN_SLOT, failed);
+        libcaprock::signal(NTFN_SLOT, failed);
     }
 
     // 3. Zwei eigene, unterschiedlich gebadgte Kopien der Notification anlegen (A-3.2, `CCOPY`).
     //    Ohne sie koennte dieses Programm dem Kernel nur EINE Tatsache melden -- naemlich die, die
     //    im Badge seiner endowten Cap steht. Mit ihnen wird jedes Teilergebnis unterscheidbar.
-    let ok_children = libsel4lake::ccopy(NTFN_SLOT, NTFN_CHILDREN_SLOT, RWX, CDELETE_CHILDREN_BADGE);
-    let ok_gone = libsel4lake::ccopy(NTFN_SLOT, NTFN_GONE_SLOT, RWX, CDELETE_GONE_BADGE);
+    let ok_children = libcaprock::ccopy(NTFN_SLOT, NTFN_CHILDREN_SLOT, RWX, CDELETE_CHILDREN_BADGE);
+    let ok_gone = libcaprock::ccopy(NTFN_SLOT, NTFN_GONE_SLOT, RWX, CDELETE_GONE_BADGE);
 
     // 4. A-3.1 aus Ring 3 pruefen -- hier und nicht im Kernel, weil genau der Weg geprueft werden
     //    soll, den ein echter Dienst nimmt: ueber die ABI, aus einer isolierten PD heraus.
@@ -99,21 +99,21 @@ fn run(arg: usize) -> ! {
     //    4a. Die eigene Notification (Slot 1) hat jetzt abgeleitete Kopien. Sie zu loeschen MUSS
     //        scheitern, und sie MUSS danach weiter funktionieren -- das Signal ueber die KOPIE ist
     //        der Beweis fuer beides in einem (die Kopie zeigt auf dasselbe Objekt).
-    if ok_children == libsel4lake::result::OK
-        && libsel4lake::cdelete(NTFN_SLOT) == libsel4lake::result::ERR_HASCHILDREN
+    if ok_children == libcaprock::result::OK
+        && libcaprock::cdelete(NTFN_SLOT) == libcaprock::result::ERR_HASCHILDREN
     {
-        libsel4lake::signal(NTFN_CHILDREN_SLOT, 0);
+        libcaprock::signal(NTFN_CHILDREN_SLOT, 0);
     }
     //    4b. Die Loader-Cap dagegen hat keine Ableitungen -- sie laesst sich loeschen. Und danach
     //        ist die Faehigkeit weg: ein weiteres `SYS_LOAD` wird abgewiesen. Erst das zusammen ist
     //        die Aussage; ein geraeumter Slot allein waere Buchhaltung.
-    if ok_gone == libsel4lake::result::OK
-        && libsel4lake::cdelete(LOADER_SLOT) == libsel4lake::result::OK
-        && libsel4lake::load(LOADER_SLOT, 0, u64::MAX, 0) != libsel4lake::result::OK
+    if ok_gone == libcaprock::result::OK
+        && libcaprock::cdelete(LOADER_SLOT) == libcaprock::result::OK
+        && libcaprock::load(LOADER_SLOT, 0, u64::MAX, 0) != libcaprock::result::OK
     {
-        libsel4lake::signal(NTFN_GONE_SLOT, 0);
+        libcaprock::signal(NTFN_GONE_SLOT, 0);
     }
 
     // 5. Fertig.
-    libsel4lake::exit();
+    libcaprock::exit();
 }

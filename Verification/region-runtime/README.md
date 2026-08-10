@@ -5,7 +5,7 @@
 > ist bereits mit Kani bewiesen. Eigenständig verständlich (ohne Quellcode).
 
 Bezug: [ADR 0017](../../docs/adr/0017-region-runtime-formal-verification.md), ADR 0010 (Region-Runtime),
-`docs/verification.md` (Kani-Speichersicherheit von `sel4lake-region`).
+`docs/verification.md` (Kani-Speichersicherheit von `caprock-region`).
 
 ## 1. Motivation und Ziel
 
@@ -42,7 +42,7 @@ der Größen lebender Regionen (rekursiv). `pool_inv(p)` = `free + live_bytes ==
 
 [`proofs/conservation.rs`](proofs/conservation.rs), per `tools/verus-verify.sh` + Verus-CI-Gate.
 Abstraktes Bilanz-Modell (V2, ADR 0017); die Speichersicherheit der RegionViews liefert **Kani**
-(`sel4lake-region`, `docs/verification.md`). Realer Code unverändert.
+(`caprock-region`, `docs/verification.md`). Realer Code unverändert.
 
 ## 7. Beweisstrategie
 

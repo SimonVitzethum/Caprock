@@ -1,4 +1,4 @@
-// SEL4Lake — Verus-Pilot (Tier 2), Teil 5: W^X-Invariante (`vspace_audit` / `vspace_wx_ok`, ext-21).
+// Caprock — Verus-Pilot (Tier 2), Teil 5: W^X-Invariante (`vspace_audit` / `vspace_wx_ok`, ext-21).
 //
 // Formale Spezifikation der **W^X**-Invariante (Write XOR eXecute): KEINE gemappte EL0-Seite ist
 // gleichzeitig schreibbar UND ausfuehrbar. Das ist die zentrale Code-Integritaets-Eigenschaft (ein

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * sel4lake_handover — Kern-Uebergabe an SEL4Lake (Variante B), Stufe 0 + 1a.
+ * caprock_handover — Kern-Uebergabe an Caprock (Variante B), Stufe 0 + 1a.
  *
  * Stufe 0 (`arm=0`, Voreinstellung): meldet die APIC-ID der Zielkerne und nimmt sie offline.
  *   Vollstaendig reversibel — `rmmod` bringt sie zurueck.
@@ -28,7 +28,7 @@
 #include <asm/apic.h>
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("SEL4Lake: Kern-Uebergabe (Stufe 0/1a)");
+MODULE_DESCRIPTION("Caprock: Kern-Uebergabe (Stufe 0/1a)");
 
 static int cpus[5] = { 15, 16, 17, 18, 19 };
 static int ncpus = 5;
@@ -50,7 +50,7 @@ MODULE_PARM_DESC(arm, "1 = Kerne wirklich uebernehmen (Long-Mode-Trampolin)");
  *
  * Voreingestellt ist deshalb die Rueckgabe. Sie setzt voraus, dass der Kern in einem
  * **definierten** Zustand parkt (unsere `cli; hlt`-Schleife). Fuehrt er spaeter echten
- * SEL4Lake-Code aus, ist das nicht mehr selbstverstaendlich — dann `release=0` setzen und den
+ * Caprock-Code aus, ist das nicht mehr selbstverstaendlich — dann `release=0` setzen und den
  * Reboot nehmen. Die Entscheidung gehoert an den Aufrufer, nicht in eine Annahme.
  */
 static int release = 1;
@@ -79,7 +79,7 @@ static bool reclaim_page(ulong pa)
 	struct page *p;
 
 	if (!pa || (pa & ~PAGE_MASK) || !pfn_valid(PHYS_PFN(pa))) {
-		pr_err("sel4lake: reclaim=0x%lx ist keine gueltige Seitenadresse\n", pa);
+		pr_err("caprock: reclaim=0x%lx ist keine gueltige Seitenadresse\n", pa);
 		return false;
 	}
 	p = pfn_to_page(PHYS_PFN(pa));
@@ -89,12 +89,12 @@ static bool reclaim_page(ulong pa)
 	 * als hoffen.
 	 */
 	if (PageReserved(p) || PageSlab(p) || PageLRU(p) || page_count(p) != 1) {
-		pr_err("sel4lake: reclaim 0x%lx abgelehnt (count=%d reserved=%d slab=%d lru=%d) — die Seite gehoert jemandem\n",
+		pr_err("caprock: reclaim 0x%lx abgelehnt (count=%d reserved=%d slab=%d lru=%d) — die Seite gehoert jemandem\n",
 		       pa, page_count(p), PageReserved(p), PageSlab(p), PageLRU(p));
 		return false;
 	}
 	__free_pages(p, 0);
-	pr_info("sel4lake: Seite 0x%lx zurueckgegeben (Leck eines frueheren Laufs behoben)\n", pa);
+	pr_info("caprock: Seite 0x%lx zurueckgegeben (Leck eines frueheren Laufs behoben)\n", pa);
 	return true;
 }
 
@@ -106,14 +106,14 @@ static bool reclaim_page(ulong pa)
 #define OFF_GDT   0x100
 #define OFF_GDTR  0x120
 #define OFF_CR3   0x130
-#define SIG_VALUE  0x5345
-#define SIG2_VALUE 0x5346
+#define SIG_VALUE  0x4341
+#define SIG2_VALUE 0x4342
 
 /* Das Trampolin liegt in `tramp.S` — lesbarer Assembler statt eines Opcode-Blobs. */
-extern const u8 sel4lake_t16_start[], sel4lake_t16_end[], sel4lake_t16_target[];
-extern const u8 sel4lake_t64_start[], sel4lake_t64_end[], sel4lake_t64_sig[];
-extern const u8 sel4lake_t64_park[];
-extern const u8 sel4lake_park_start[], sel4lake_park_end[];
+extern const u8 caprock_t16_start[], caprock_t16_end[], caprock_t16_target[];
+extern const u8 caprock_t64_start[], caprock_t64_end[], caprock_t64_sig[];
+extern const u8 caprock_t64_park[];
+extern const u8 caprock_park_start[], caprock_park_end[];
 
 static struct page *low_page;
 static struct page *park_pages[8];	/* je uebernommenem Kern eine */
@@ -235,14 +235,14 @@ static struct page *__init alloc_low_page(void)
 	while (n--)
 		__free_pages(pool[n], 0);
 	if (!keep)
-		pr_err("sel4lake: %d Seiten aus ZONE_DMA geprueft, tiefste war %pa — keine unter 1 MiB frei\n",
+		pr_err("caprock: %d Seiten aus ZONE_DMA geprueft, tiefste war %pa — keine unter 1 MiB frei\n",
 		       i, &lowest);
 	return keep;
 }
 
 static void report_cpu(int cpu)
 {
-	pr_info("sel4lake: CPU %d -> APIC-ID %u, online=%d\n",
+	pr_info("caprock: CPU %d -> APIC-ID %u, online=%d\n",
 		cpu, cpu_physical_id(cpu), cpu_online(cpu));
 }
 
@@ -270,7 +270,7 @@ static int __init handover_init(void)
 	if (reclaim && !reclaim_page(reclaim))
 		return -EINVAL;
 
-	pr_info("sel4lake: Stufe %s, Zielkerne:", arm ? "1b (arm=1, Uebernahme)" : "0 (nur offline)");
+	pr_info("caprock: Stufe %s, Zielkerne:", arm ? "1b (arm=1, Uebernahme)" : "0 (nur offline)");
 	for (i = 0; i < ncpus; i++)
 		report_cpu(cpus[i]);
 
@@ -283,28 +283,28 @@ static int __init handover_init(void)
 		 * durchzureichen erzeugte die Kernel-Ruege "init suspiciously returned 1".
 		 */
 		if (!cpu_online(cpus[i])) {
-			pr_info("sel4lake: CPU %d war bereits offline — uebersprungen\n",
+			pr_info("caprock: CPU %d war bereits offline — uebersprungen\n",
 				cpus[i]);
 			continue;
 		}
 		rc = remove_cpu(cpus[i]);
 		if (rc) {
-			pr_err("sel4lake: CPU %d offline fehlgeschlagen (%d)\n", cpus[i], rc);
+			pr_err("caprock: CPU %d offline fehlgeschlagen (%d)\n", cpus[i], rc);
 			rc = (rc > 0) ? -EBUSY : rc;
 			goto undo;
 		}
 		we_offlined[i] = true;	/* nur diese duerfen wir zurueckgeben */
-		pr_info("sel4lake: CPU %d offline\n", cpus[i]);
+		pr_info("caprock: CPU %d offline\n", cpus[i]);
 	}
 
 	if (!arm) {
-		pr_info("sel4lake: Stufe 0 fertig — rmmod bringt die Kerne zurueck\n");
+		pr_info("caprock: Stufe 0 fertig — rmmod bringt die Kerne zurueck\n");
 		return 0;
 	}
 
 	low_page = alloc_low_page();
 	if (!low_page) {
-		pr_err("sel4lake: keine Seite unter 1 MiB bekommen\n");
+		pr_err("caprock: keine Seite unter 1 MiB bekommen\n");
 		rc = -ENOMEM;
 		goto undo;
 	}
@@ -314,7 +314,7 @@ static int __init handover_init(void)
 		u64 cr3 = build_identity_tables();
 
 		if (!cr3) {
-			pr_err("sel4lake: Seitentabellen fehlgeschlagen\n");
+			pr_err("caprock: Seitentabellen fehlgeschlagen\n");
 			rc = -ENOMEM;
 			goto undo;
 		}
@@ -324,12 +324,12 @@ static int __init handover_init(void)
 		 * sie zuletzt.
 		 */
 		if (cr3 >> 32) {
-			pr_err("sel4lake: Seitentabellen-Wurzel 0x%llx liegt oberhalb 4 GiB — CR3 wuerde abgeschnitten\n",
+			pr_err("caprock: Seitentabellen-Wurzel 0x%llx liegt oberhalb 4 GiB — CR3 wuerde abgeschnitten\n",
 			       cr3);
 			rc = -EIO;
 			goto undo;
 		}
-		pr_info("sel4lake: Trampolin @ phys %pa, SIPI-Vektor 0x%02llx, CR3 0x%llx\n",
+		pr_info("caprock: Trampolin @ phys %pa, SIPI-Vektor 0x%02llx, CR3 0x%llx\n",
 			&pa, (u64)(pa >> 12), cr3);
 
 		/*
@@ -348,29 +348,29 @@ static int __init handover_init(void)
 
 			park_pages[i] = alloc_page(GFP_KERNEL | GFP_DMA32 | __GFP_ZERO);
 			if (!park_pages[i]) {
-				pr_err("sel4lake: keine Park-Seite unter 4 GiB fuer CPU %d\n",
+				pr_err("caprock: keine Park-Seite unter 4 GiB fuer CPU %d\n",
 				       cpus[i]);
 				break;
 			}
-			memcpy(page_address(park_pages[i]), sel4lake_park_start,
-			       sel4lake_park_end - sel4lake_park_start);
+			memcpy(page_address(park_pages[i]), caprock_park_start,
+			       caprock_park_end - caprock_park_start);
 
 			memset(va, 0, PAGE_SIZE);
-			memcpy((u8 *)va + OFF_T16, sel4lake_t16_start,
-			       sel4lake_t16_end - sel4lake_t16_start);
-			memcpy((u8 *)va + OFF_T64, sel4lake_t64_start,
-			       sel4lake_t64_end - sel4lake_t64_start);
+			memcpy((u8 *)va + OFF_T16, caprock_t16_start,
+			       caprock_t16_end - caprock_t16_start);
+			memcpy((u8 *)va + OFF_T64, caprock_t64_start,
+			       caprock_t64_end - caprock_t64_start);
 			build_gdt(va, pa);
 			*(u32 *)((u8 *)va + OFF_CR3) = (u32)cr3;
 			/* Die drei Werte, die erst zur Laufzeit feststehen (s. `tramp.S`). */
 			*(u32 *)((u8 *)va + OFF_T16 +
-				 (sel4lake_t16_target - sel4lake_t16_start)) =
+				 (caprock_t16_target - caprock_t16_start)) =
 				(u32)(pa + OFF_T64);
 			*(u64 *)((u8 *)va + OFF_T64 +
-				 (sel4lake_t64_sig - sel4lake_t64_start)) =
+				 (caprock_t64_sig - caprock_t64_start)) =
 				(u64)(pa + SIG2_OFF);
 			*(u64 *)((u8 *)va + OFF_T64 +
-				 (sel4lake_t64_park - sel4lake_t64_start)) =
+				 (caprock_t64_park - caprock_t64_start)) =
 				(u64)page_to_phys(park_pages[i]);
 			wmb();
 
@@ -380,7 +380,7 @@ static int __init handover_init(void)
 			sig2 = *(volatile u16 *)((u8 *)va + SIG2_OFF);
 
 			if (sig != SIG_VALUE) {
-				pr_err("sel4lake: CPU %d (APIC %u): FEHLGESCHLAGEN — Real Mode nicht erreicht (0x%04x)\n",
+				pr_err("caprock: CPU %d (APIC %u): FEHLGESCHLAGEN — Real Mode nicht erreicht (0x%04x)\n",
 				       cpus[i], apicid, sig);
 				__free_page(park_pages[i]);
 				park_pages[i] = NULL;
@@ -388,11 +388,11 @@ static int __init handover_init(void)
 			}
 			narmed = i + 1;	/* ab hier laeuft der Kern unseren Code */
 			if (sig2 != SIG2_VALUE) {
-				pr_err("sel4lake: CPU %d (APIC %u): Real Mode erreicht, LONG MODE nicht (0x%04x)\n",
+				pr_err("caprock: CPU %d (APIC %u): Real Mode erreicht, LONG MODE nicht (0x%04x)\n",
 				       cpus[i], apicid, sig2);
 				break;
 			}
-			pr_info("sel4lake: CPU %d (APIC %u): LONG MODE, eigene GDT + eigenes CR3, parkt @ phys 0x%llx\n",
+			pr_info("caprock: CPU %d (APIC %u): LONG MODE, eigene GDT + eigenes CR3, parkt @ phys 0x%llx\n",
 				cpus[i], apicid, (u64)page_to_phys(park_pages[i]));
 		}
 
@@ -405,10 +405,10 @@ static int __init handover_init(void)
 		low_page = NULL;
 
 		if (narmed == ncpus)
-			pr_info("sel4lake: STUFE 1b BESTANDEN — %d von %d Kernen im Long Mode; niedrige Seite zurueckgegeben\n",
+			pr_info("caprock: STUFE 1b BESTANDEN — %d von %d Kernen im Long Mode; niedrige Seite zurueckgegeben\n",
 				narmed, ncpus);
 		else
-			pr_err("sel4lake: STUFE 1b UNVOLLSTAENDIG — %d von %d Kernen uebernommen\n",
+			pr_err("caprock: STUFE 1b UNVOLLSTAENDIG — %d von %d Kernen uebernommen\n",
 			       narmed, ncpus);
 	}
 	return 0;
@@ -433,7 +433,7 @@ static void __exit handover_exit(void)
 		if (i < narmed && !release)
 			continue;
 		if (we_offlined[i] && !add_cpu(cpus[i]))
-			pr_info("sel4lake: CPU %d wieder online%s\n", cpus[i],
+			pr_info("caprock: CPU %d wieder online%s\n", cpus[i],
 				i < narmed ? " (war uebernommen)" : "");
 	}
 	if (narmed && !release) {
@@ -445,7 +445,7 @@ static void __exit handover_exit(void)
 		 * an" ist eine Aussage ueber das Verhalten, nicht ueber die Zuordnung.
 		 * Ein Leck bis zum Reboot ist der richtige Failure-Mode.
 		 */
-		pr_warn("sel4lake: %d Kern(e) bleiben uebernommen; Park-Seiten + Tabellen bleiben belegt, Reboot stellt alles wieder her\n",
+		pr_warn("caprock: %d Kern(e) bleiben uebernommen; Park-Seiten + Tabellen bleiben belegt, Reboot stellt alles wieder her\n",
 			narmed);
 		return;
 	}
@@ -461,7 +461,7 @@ static void __exit handover_exit(void)
 			__free_page(park_pages[i]);
 	free_identity_tables();
 	if (narmed)
-		pr_info("sel4lake: %d uebernommene Kern(e) zurueckgegeben, alle Seiten frei\n",
+		pr_info("caprock: %d uebernommene Kern(e) zurueckgegeben, alle Seiten frei\n",
 			narmed);
 }
 

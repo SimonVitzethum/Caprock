@@ -1,4 +1,4 @@
-# SEL4Lake — offene Punkte
+# Caprock — offene Punkte
 
 Nur **noch nicht Erledigtes**. Was fertig ist, steht mitsamt Begründung in [done.md](done.md).
 Reihenfolge innerhalb eines Abschnitts = Priorität. `[~]` = teilweise erledigt, Rest benannt.
@@ -32,7 +32,7 @@ drei Größen fest, die sonst frei wählbar aussähen:
   Maschine sind für diese Lastform um Größenordnungen zu wenig. Und Erhöhen ist nicht gratis:
   `region_bytes()` ist `min(Farben, 64) / PARTITIONS` Seiten, bei `PARTITIONS = 64` also **eine
   Seite** je zusammenhängender Region. Diese Spannung ist der eigentliche Inhalt von B-4.1.
-* **Die Maschine muss Blech sein.** Neu belegt am 2026-08-01 (B-4.5): läuft SEL4Lake selbst als
+* **Die Maschine muss Blech sein.** Neu belegt am 2026-08-01 (B-4.5): läuft Caprock selbst als
   Gast, schreibt der Wirt die Farbbits um, und die Cache-Trennung ist wirkungslos — gemessen, nicht
   vermutet. Wer „Isolation ohne VMs" verkauft und dafür gemietete VMs benutzt, verkauft nichts.
 
@@ -239,7 +239,7 @@ Reihenfolge ist hier keine Geschmacksfrage — jede Stufe ist Vorbedingung der n
       das Warten gehört dem Aufrufer. Ein blockierender Syscall darüber ist eine ABI-Frage und
       eine eigene Stufe.
 - [~] **Z4b: die Verweigerungsregel steht, der Serialisierer nicht** (2026-08-02,
-      `crates/sel4lake-cap/src/checkpoint.rs`, 7 Host-Tests). Der Registersatz war ohnehin der
+      `crates/caprock-cap/src/checkpoint.rs`, 7 Host-Tests). Der Registersatz war ohnehin der
       leichte Teil; gebaut ist der schwere: **was auf der Zielmaschine nicht dasselbe bezeichnen
       kann, wandert nicht mit — es wird verweigert, nicht ersetzt.** Verweigert werden `Mmio`,
       `Irq`, `Dma`, `Reply`, `Loader` und jede Beziehungs-Cap, deren Partner nicht im Umfang ist;
@@ -259,7 +259,7 @@ Reihenfolge ist hier keine Geschmacksfrage — jede Stufe ist Vorbedingung der n
       speichert und stellt wieder her und **entscheidet selbst welches** — er liest den Sektor
       (`CKPT_SECTOR = 32710`, ausserhalb beider Partitionen). Transport ist der vorhandene
       Blockdienst; der Kern ist Client, `programs/hardware/virtio-blk` blieb unverändert. Das
-      Format liegt in `crates/sel4lake-cap/src/checkpoint.rs` (feste Breiten, LE, CRC-32,
+      Format liegt in `crates/caprock-cap/src/checkpoint.rs` (feste Breiten, LE, CRC-32,
       host-getestet), und `Image::build` ruft `classify_all`: **eine nicht übertragbare Cap
       verhindert den Checkpoint vor dem Schreiben.**
 
@@ -318,8 +318,8 @@ Beschreibungsdatei im Repo und werden zu Rust übersetzt. Ein neues oder altes F
 eine Datei statt eines Parsers.
 
 **Das passt zur Kerngrenze, und zwar genau.** Erzeugte Parser sind reine Funktionen über
-Byte-Slices — keine Caps, keine Syscalls, keine Allokation. Sie gehören dorthin, wo `sel4lake-part`
-(502 Zeilen, 0 Abhängigkeiten, `forbid(unsafe_code)`) und `sel4lake-fat` (703 Zeilen, ebenso)
+Byte-Slices — keine Caps, keine Syscalls, keine Allokation. Sie gehören dorthin, wo `caprock-part`
+(502 Zeilen, 0 Abhängigkeiten, `forbid(unsafe_code)`) und `caprock-fat` (703 Zeilen, ebenso)
 schon stehen: **Userspace**. Der Generator ist ein **Bauzeit-Werkzeug** auf dem Host; im Kern
 ändert sich nichts.
 
@@ -366,7 +366,7 @@ einer Programmiersprache heran oder reichen nicht. Zwei ehrliche Wege:
 
 **Vorschlag für den ersten Schnitt — an vorhandenem Code, nicht auf der grünen Wiese:**
 1. **Ethernet II + ARP** beschreiben. Beides steht heute handgeschrieben in
-   `crates/sel4lake-virtio/src/net.rs` (`ETHERTYPE_ARP`, `ARP_REQUEST/REPLY`, 42-Byte-Rahmen von
+   `crates/caprock-virtio/src/net.rs` (`ETHERTYPE_ARP`, `ARP_REQUEST/REPLY`, 42-Byte-Rahmen von
    Hand gebaut) — es gibt also ein Vorher und ein Nachher zu vergleichen.
 2. Erzeugnis als **abhängigkeitsfreie, `forbid(unsafe_code)`** Crate, **ins Repo eingecheckt**:
    der Bau läuft ohne Generator, und der Diff ist lesbar.
@@ -488,7 +488,7 @@ diese Zahl nicht erhöhen.
       | Weg | TCB-Wirkung | was läuft damit | Preis |
       |---|---|---|---|
       | **WASM in einer PD** | **null** (die Engine ist Userland) | alles, was zu WASM/WASI kompiliert — heute der Großteil dessen, wofür „Vercel-artige Dienste" steht | keine bestehenden nativen Binaries; eine `no_std`-Engine muss rein |
-      | **musl gegen `libsel4lake` neu gelinkt** | null | fast alles, was aus Quelltext baut | libc-Portierung: Datei-Deskriptoren, Pfade, Threads, Signale — jedes davon ein eigener Dienst |
+      | **musl gegen `libcaprock` neu gelinkt** | null | fast alles, was aus Quelltext baut | libc-Portierung: Datei-Deskriptoren, Pfade, Threads, Signale — jedes davon ein eigener Dienst |
       | **eigene Kompat-Bibliothek** | null | was man selbst dagegen baut | ehrlichste, aber kleinste Reichweite |
 
       **Bewertung:** WASM passt zur Produktthese und zur Randbedingung am besten — die Sandbox
@@ -600,14 +600,14 @@ Thread fremden User-Code ausführt und dessen Syscalls **zurück in den Userspac
 statt in den Kernel. Reine Abfangerei aus dem Userland (der gVisor-ptrace-Weg) war zu teuer.
 
 **Das ist die eine Zeile TCB, die Weg A kosten wird**, und sie sollte im Entwurf stehen, bevor
-jemand anfängt — nicht als Überraschung im dritten Monat. Für SEL4Lake hiesse das: ein Thread einer
+jemand anfängt — nicht als Überraschung im dritten Monat. Für Caprock hiesse das: ein Thread einer
 PD führt Fremdcode aus, und sein `syscall`-Eintritt wird an eine **andere PD** zugestellt statt an
 den Kernel. Das ist eine echte Erweiterung des Thread-Modells, kein Aufsatz.
 
 ### Die vierte Vorbedingung, cap-förmig — und damit VIEL kleiner als `restricted mode`
 
 **Der Vorschlag (Simon, 2026-08-09): über Capabilities BEIDER Prozesse.** Er trägt, und er ist
-besser als Fuchsias Form, weil er fast keine neue Mechanik braucht — SEL4Lake hat die Bausteine
+besser als Fuchsias Form, weil er fast keine neue Mechanik braucht — Caprock hat die Bausteine
 schon.
 
 **Der Kern:** der Syscall-Eintritt eines Threads wird nicht *behandelt*, sondern **an einen
@@ -624,7 +624,7 @@ Ausführungsmodus, kein zweiter Kontext je Thread.
 | Seite | hält | bedeutet |
 |---|---|---|
 | **Handler-PD** | die **Endpoint-Cap** | darf die Syscalls des Gastes empfangen **und seine Ergebnisregister schreiben** — sie kann ihn also belügen. Substanzielle Autorität, deshalb eine Cap und kein globaler Schalter |
-| **Gast-PD** | **nichts** | ihre Autorität wird *verringert*: sie erreicht den SEL4Lake-Kernel gar nicht mehr |
+| **Gast-PD** | **nichts** | ihre Autorität wird *verringert*: sie erreicht den Caprock-Kernel gar nicht mehr |
 
 **Und die dritte Partei, die der Entwurf nennen muss: wer schaltet um?** Nicht der Handler — sonst
 könnte jede PD die Syscalls eines fremden Threads an sich ziehen. Umschalten darf nur, wer
@@ -767,11 +767,11 @@ der Gast spräche plötzlich direkt mit dem Kernel. Fail-closed, und es ist dies
 
 Fuchsias **GPU-Architektur**: geteilt in einen *system driver* (im Treiberprozess) und einen
 *application driver* (Herstellercode im Anwendungsprozess, z. B. Mesa), die über Kanäle reden.
-Also exakt der Schnitt, den SEL4Lake ohnehin braucht — Kommandopuffer werden in der Anwendung
+Also exakt der Schnitt, den Caprock ohnehin braucht — Kommandopuffer werden in der Anwendung
 gebaut und über IPC eingereicht, statt über `ioctl` auf ein Gerät.
 
 **Der Nutzen liegt im Entwurf, nicht im Code.** Zircons Objektmodell (Handles, VMOs, Kanäle) ist
-nicht das von SEL4Lake (Caps, PDs, Endpoints); es geht um die **Schnittführung**, und die ist
+nicht das von Caprock (Caps, PDs, Endpoints); es geht um die **Schnittführung**, und die ist
 übertragbar. Fuchsia zu portieren wäre keine Abkürzung, sondern ein zweites Betriebssystem.
 
 **Vor der Übernahme zu prüfen** (aus der Quelle, nicht aus dem Gedächtnis): der genaue Umfang von
@@ -996,11 +996,11 @@ Pfad. Beim dritten Mal ist das Muster kein Zufall.
       **Verteidigungstiefe**, während die Grund-Menge dafür sorgt, dass der Kernel sie **nicht mehr
       systematisch erzeugt**. Ein Kernel, der Wecks gratis verteilt und sich auf die Schleifen
       seiner Nutzer verlässt, hat die Beweislast nur verschoben.
-      Als Satz in `sel4lake-wait` (`while`, nie `if`) **und** als injizierte Gegenprobe: ein
+      Als Satz in `caprock-wait` (`while`, nie `if`) **und** als injizierte Gegenprobe: ein
       überzähliger Weckruf darf keine der elf Aussagen kippen.
 
 - [ ] **Die Umrechnungstabelle — Stelle für Stelle, damit der Umbau eine ABSCHRIFT wird.**
-      Aufgenommen am 2026-08-09 aus `crates/sel4lake-sched/src/lib.rs` (Zeilennummern vom Stand
+      Aufgenommen am 2026-08-09 aus `crates/caprock-sched/src/lib.rs` (Zeilennummern vom Stand
       `3a5fd5e`; sie verschieben sich, die **Funktionen** nicht).
       **Der Punkt dieser Tabelle:** an 19 Stellen ist jeweils die *richtige* Begründung zu wählen.
       Eine mechanische Ersetzung `blocked -> reasons != 0` wäre genau der Fehler, den der Umbau
@@ -1264,7 +1264,7 @@ Die Aufteilung, die daraus folgt:
       **nur** `ipc-bleibt-liegen=false`.
       **Zwei eigene Fehler dabei, beide in der Fallenliste.**
 
-- [x] **P3 — der DMA-Pool liegt in der PD** (2026-08-09, `crates/sel4lake-dma`, 13 Host-Tests).
+- [x] **P3 — der DMA-Pool liegt in der PD** (2026-08-09, `crates/caprock-dma`, 13 Host-Tests).
       Der Kernel mappt die Region **einmal** und vergibt das IOVA-Fenster; alles danach ist
       Arithmetik **innerhalb eines bereits gewährten Fensters** und fügt keine Autorität hinzu —
       also gehört es nicht in die TCB. Der heisse Pfad ist **null Syscalls**.
@@ -1275,7 +1275,7 @@ Die Aufteilung, die daraus folgt:
       **Die wichtigste Absage:** `map` (= `dma_map_single`) gibt für jede Adresse **ausserhalb**
       des Pools `None`. Einen Stapelpuffer für DMA anzumelden ist in Linux-Treibern ein
       verbreiteter Fehler; ohne diese Prüfung entstünde daraus eine IOVA auf fremden Speicher.
-      **Befund unterwegs:** `sel4lake_virtio::Region::from_raw` prüft **nichts** — eine Region mit
+      **Befund unterwegs:** `caprock_virtio::Region::from_raw` prüft **nichts** — eine Region mit
       `dev == cpu` (Identität!) oder `dev == 0` liesse sich bauen und liefe scheinbar. Der Pool ist
       jetzt das **Tor** davor, fail-closed in vier Richtungen. Und die Kopie in den Datenbereich
       war gegen `shared_len` begrenzt — die Länge der **Quelle** als Schranke für das **Ziel**.
@@ -1413,7 +1413,7 @@ Die Aufteilung, die daraus folgt:
       Orakel für den Bisect ist billig und schon da: `Root-Task lief: true`.
 
 - [~] **P1 — x86 MSI-X + IRTE: die KODIERUNG steht, die Vergabe fehlt** (2026-08-09).
-      **Fertig:** `crates/sel4lake-hal/src/x86_64/irte.rs` — IRTE- und MSI-Adress-Kodierung als
+      **Fertig:** `crates/caprock-hal/src/x86_64/irte.rs` — IRTE- und MSI-Adress-Kodierung als
       **reine Funktion**, 10 Host-Tests, als Ziel `irte` eingehängt. Nach dem Vorbild von `dmar.rs`
       eine eigene Datei, und aus demselben Grund: ein Bit an der falschen Stelle äussert sich als
       *„das Gerät unterbricht einfach nicht"* — ohne Fault, ohne Meldung, ohne irgendetwas, das
@@ -1433,7 +1433,7 @@ Die Aufteilung, die daraus folgt:
       und die Zustellung bis in eine Treiber-PD. Dazu die drei x86-No-Ops in `intc`.
 
 - [~] **P2 — die Userland-Hälfte steht, die Threads fehlen** (2026-08-09).
-      **Fertig:** `crates/sel4lake-wait` — Mutex, `WaitQueue`, `Completion` über einem Trait mit
+      **Fertig:** `crates/caprock-wait` — Mutex, `WaitQueue`, `Completion` über einem Trait mit
       **zwei** Methoden (`park`/`unpark` aus P4). 11 Host-Tests gegen einen Stellvertreter. Der
       unbestrittene Weg ist **null Syscalls**; der volle Warteraum ist **benannt** und der Aufrufer
       parkt dann nicht (D11); der Selbst-Deadlock wird gemeldet statt zu hängen; `Completion`
@@ -1510,7 +1510,7 @@ Die Aufteilung, die daraus folgt:
       selbst zieht.
 
       Mesa braucht damit:
-      * **Neu übersetzen** gegen die SEL4Lake-libc — wie alles in Z16, kein Sonderfall.
+      * **Neu übersetzen** gegen die Caprock-libc — wie alles in Z16, kein Sonderfall.
       * `ioctl` → **IPC**. Genau die Form, die `virtio-blk` heute schon hat: OP-Codes über einen
         Endpoint (`OP_INFO`/`OP_READ`/`OP_WRITE`/…). Die ABI dieses Kernels kennt kein `ioctl`
         (0 Vorkommen) und braucht auch keines.
@@ -1543,7 +1543,7 @@ solche markiert.
 
       | fehlt | Größe (Schätzung) | TCB |
       |---|---|---|
-      | **Dateisystem über FAT16 hinaus** — Verzeichnisse, Pfade, VFS; FAT16 mit *einer* Datei ist kein Serverdateisystem | groß, aber abhängigkeitsfrei wie `sel4lake-part`/`-fat` | neutral |
+      | **Dateisystem über FAT16 hinaus** — Verzeichnisse, Pfade, VFS; FAT16 mit *einer* Datei ist kein Serverdateisystem | groß, aber abhängigkeitsfrei wie `caprock-part`/`-fat` | neutral |
       | **TCP/IP** — `smoltcp` in einer PD (Rust, `no_std`, erprobt) | Wochen zum Laufen, Monate zur Härtung | neutral |
       | **NVMe-Treiber** — `virtio-blk` läuft nur in VMs | klein: Queue-Paare, Admin- + IO-Queue, PRP-Listen | neutral (PD) |
       | **Realtek RTL8168** — die Netzkarte dieses Laptops, klassisch und dokumentiert | mittel, weit billiger als WiFi | neutral (PD) |
@@ -1552,7 +1552,7 @@ solche markiert.
 
       **Der Ist-Stand auf echter Hardware ist besser als „nie".** Die Kern-Übergabe
       (`tools/handover/`, Stufen 0/1a/1b belegt) nimmt fünf E-Cores offline und schickt ihnen
-      INIT-SIPI-SIPI — SEL4Lake hat auf diesem Blech schon Befehle ausgeführt, nur nicht
+      INIT-SIPI-SIPI — Caprock hat auf diesem Blech schon Befehle ausgeführt, nur nicht
       eigenständig.
 
       **Schätzung, ausdrücklich als solche:** ein *demonstrierbarer* Server — statisch gebaute
@@ -1809,7 +1809,7 @@ Schritt 1 ist damit selbsttragend.
   `. = 0x20000000 + SIZEOF_HEADERS;`, damit das erste Segment ab Offset 0 abbildet. Standard­praxis,
   kostet nichts, muss aber **vor** A1 passieren.
 - **Wo:** `load_into_pd_mit` (`system.rs`), unmittelbar vor `spawn_user_at_parked`; und
-  `init_thread_frame` (`crates/sel4lake-hal/src/x86_64/exception.rs:338`) bekommt einen fertigen
+  `init_thread_frame` (`crates/caprock-hal/src/x86_64/exception.rs:338`) bekommt einen fertigen
   `rsp` statt eines Arguments in `rdi`.
 - **Aufbau, von oben nach unten:** Zeichenketten (`argv[0]`, Umgebung) · Auffüllung ·
   `auxv` (mit `AT_NULL` abgeschlossen) · `envp` (NULL) · `argv` (NULL) · `argc`. `rsp` zeigt auf
@@ -1921,7 +1921,7 @@ Die Gründe sind aber benennbar und einzeln messbar.
 
 - [ ] **(1) Das User-Ziel rechnet Fliesskomma in SOFTWARE — gemessen, nicht vermutet.**
       Dieselbe Funktion (Skalarprodukt über 64 `f64`), einmal für ein normales x86_64-Ziel und
-      einmal für `programs/x86_64-sel4lake-user.json` übersetzt:
+      einmal für `programs/x86_64-caprock-user.json` übersetzt:
 
       | | Befehle | SSE-FP | Bibliotheksaufrufe |
       |---|---|---|---|
@@ -1991,7 +1991,7 @@ Die Gründe sind aber benennbar und einzeln messbar.
       Umlauf statt eines Syscalls. **„Hohe Leistung" ohne diese Zahl ist ein Wunsch, keine
       Aussage** — und ohne sie ist auch nicht entscheidbar, ob Punkt (3) und (5) sich lohnen.
 
-      Die Infrastruktur steht: `crates/sel4lake-sched/src/cycles.rs` (B-5.1), `hal::timer::cycles()`
+      Die Infrastruktur steht: `crates/caprock-sched/src/cycles.rs` (B-5.1), `hal::timer::cycles()`
       mit `rdtscp`+`lfence`, und `cpuid` ist als Falle bereits bekannt (3556 statt 51 Zyklen unter
       KVM).
 
@@ -2071,7 +2071,7 @@ Die Gründe sind aber benennbar und einzeln messbar.
 
 - [ ] **Wo es richtig gut ist: als natives Backend, das die POSIX-Schicht UMGEHT.** Turso
       abstrahiert seine I/O hinter Traits; io_uring ist **ein** Backend, nicht die Annahme. Ein
-      SEL4Lake-Backend bildete diese Traits direkt auf IPC und Caps ab — kein `fcntl`, keine vDSO,
+      Caprock-Backend bildete diese Traits direkt auf IPC und Caps ab — kein `fcntl`, keine vDSO,
       kein VFS-Umweg — und wäre ein **Upstream-Beitrag statt eines Forks**. Es wäre zugleich die
       erste Anwendung, die den eigentlichen Vorteil dieser Architektur zeigt: native Software
       **braucht** die POSIX-Umgebung nicht, nur die Kompatibilitätsschicht bekommt sie.
@@ -2087,7 +2087,7 @@ Die Gründe sind aber benennbar und einzeln messbar.
       | Kleinstes vollständiges Backend (`generic.rs`) | **117 Zeilen** |
       | `supports_shared_wal_coordination` | Vorgabe **`false`** — die ganze `shared_wal_*`-Familie ist freiwillig |
 
-      **Und die Zuordnung auf das, was SEL4Lake schon hat:**
+      **Und die Zuordnung auf das, was Caprock schon hat:**
 
       | Methode | Abbildung | Stand |
       |---|---|---|
@@ -2155,7 +2155,7 @@ möglichst viele Linux-Bibliotheken aus C, C++, Zig, Rust, Go.
       genau das, was Linux selbst tut.
 
 - [ ] **Die Arbeit ist nicht die libc, sondern was hinter ihr steht.** Die Vereinigung, nach
-      Diensten sortiert — und daneben, was SEL4Lake davon heute hat:
+      Diensten sortiert — und daneben, was Caprock davon heute hat:
 
       | Dienst | im Messsatz | Stand heute |
       |---|---|---|
@@ -2192,7 +2192,7 @@ möglichst viele Linux-Bibliotheken aus C, C++, Zig, Rust, Go.
       Sonst entsteht dieselbe Sorte Grün wie bei einem Prüfer, der nicht fehlschlagen kann.
 
 - [ ] **Eine Annahme, die ausgesprochen gehört: übersetzt wird auf einem Linux-Rechner
-      (cross), nicht auf dem Kern.** Selbst-Hosting („klonen und kompilieren **auf** SEL4Lake")
+      (cross), nicht auf dem Kern.** Selbst-Hosting („klonen und kompilieren **auf** Caprock")
       ist eine andere Größenordnung: es braucht `fork`/`exec`, ein volles Dateisystem, viel
       Speicher und einen Compiler als portierte Anwendung. Das ist die Kür, nicht der Einstieg —
       und wenn es doch das Ziel ist, ändert es die Reihenfolge unten.
@@ -2294,7 +2294,7 @@ eine Abnahme, die **fehlschlagen kann**; eine Stufe ohne Gegenprobe gilt nicht a
 - [~] **W1 — angefangen 2026-08-09, Stand: die PD läuft, der MELDEWEG nicht.**
 
       **Belegt (nicht vermutet):** `programs/userland/wasmhost` baut gegen `wasmi 0.31` für
-      `x86_64-sel4lake-user` (429 KB ELF, drei PT_LOAD: 257 KB Code, 30 KB rodata, **2 MiB reines
+      `x86_64-caprock-user` (429 KB ELF, drei PT_LOAD: 257 KB Code, 30 KB rodata, **2 MiB reines
       BSS** als Heap-Arena). Der Lader nimmt es an — das BSS-Segment mit `FileSiz 0` ist genau der
       Fall, den `copy_segment_at` seit dem Farbumbau behandelt. **Die PD läuft**, gemessen mit
       einer cap-freien Sonde (ein Fault an `0xDEAD_0000` erscheint im Protokoll), sowohl mit
@@ -2325,7 +2325,7 @@ eine Abnahme, die **fehlschlagen kann**; eine Stufe ohne Gegenprobe gilt nicht a
       Frage stellt und keine Cap braucht.
 
 - [ ] **W1 (Rest) — die Engine läuft in einer PD, ohne eine einzige neue Kernelzeile.** Ein neues Programm
-      `programs/userland/wasmhost` linkt `wasmi` gegen `libsel4lake`, nimmt ein `.wasm` aus dem
+      `programs/userland/wasmhost` linkt `wasmi` gegen `libcaprock`, nimmt ein `.wasm` aus dem
       Boot-Archiv (dritter Weg neben ELF und Manifest), instanziiert es und meldet das Ergebnis
       über seinen Endpoint.
 
@@ -2390,7 +2390,7 @@ prüft nur gegen `ST_OK`, der Kernel gegen keinen). Das ist heute kein Fehler, w
 übereinstimmen; nichts erzwingt es.
 
 Dasselbe beim **Layout der Übertragungsfläche**: `OFF_ERGEBNIS = 4096` (fs), `OFF_SERVED = 0x600`
-(Server), `OFF_DATA` aus `sel4lake_virtio::blk` — das Dienstprotokoll leiht sich sein Layout aus
+(Server), `OFF_DATA` aus `caprock_virtio::blk` — das Dienstprotokoll leiht sich sein Layout aus
 der Treiber-Crate.
 
 **Das ist der billigere und näherliegende Schnitt als Z12**, weil es unser eigenes Format ist:
@@ -2475,7 +2475,7 @@ fehlt.
 
 - [ ] Kein Netzstack, kein Dateisystem. Eine Cloud ohne Netz und Speicher ist keine.
       *(Zwei Schritte erledigt, 2026-08-01: **A-5.2** brachte Treiberlogik für Blockgerät und
-      Netzkarte, kernfrei in `crates/sel4lake-virtio`; **A-5.1** brachte die erste Treiber-PD —
+      Netzkarte, kernfrei in `crates/caprock-virtio`; **A-5.1** brachte die erste Treiber-PD —
       `programs/hardware/virtio-blk` liest einen Sektor als geladenes Userland-Programm, mit
       eigener Gerätezuteilung aus dem Manifest.)*
       Seit 2026-08-02 ist der Treiber ein **Dienst**: er bedient Anfragen über seinen Kanal und
@@ -2561,11 +2561,11 @@ QEMU 256 erfundene), aarch64 seit 2026-08-02 (16 Farben — die Aufteilung, an d
       **Der Umzug hat sofort zwei echte Fehler gefunden — beide nur auf aarch64 sichtbar, beide
       inzwischen BEHOBEN:**
 
-      1. `region_bytes()` rechnete mit `sel4lake_mem::MASK_BITS` (64) statt mit der tatsächlichen
+      1. `region_bytes()` rechnete mit `caprock_mem::MASK_BITS` (64) statt mit der tatsächlichen
          Farbanzahl. Auf x86 (256 Farben) zufällig richtig; auf aarch64 (16 Farben) umfasst ein
          Streifen nur 4 Farben, eine 64-KiB-Region aber 16 aufeinanderfolgende Seiten — also jede
          Farbe, mehrfach. **Behoben** (Laufzeitrechnung `min(count(), MASK_BITS) / PARTITIONS`).
-      2. `sel4lake_mem::stripe` teilte ebenfalls `MASK_BITS` auf statt `count()`. Bei 16 Farben
+      2. `caprock_mem::stripe` teilte ebenfalls `MASK_BITS` auf statt `count()`. Bei 16 Farben
          umfasste Streifen 0 damit *alle* Farben und die Streifen 1–3 keine — und weil leere Mengen
          sich nicht schneiden, meldete der Selbsttest trotzdem „disjunkt". **Behoben am
          2026-08-02**: `stripe(i, n, colors)` nimmt die Farbanzahl als Parameter, mit Host-Tests
@@ -2701,7 +2701,7 @@ tausenden Threads zum Engpass:
 
 ### C5. GIC-Skalierung (ARM-Blocker für > 8 Kerne) — **weiterhin offen**
 
-`sel4lake-hal::gic` ist **GICv2** (8-CPU-Grenze, `GICD_SGIR`-Zielmaske ist 8 Bit). Mehr als 8 Kerne
+`caprock-hal::gic` ist **GICv2** (8-CPU-Grenze, `GICD_SGIR`-Zielmaske ist 8 Bit). Mehr als 8 Kerne
 brauchen auf ARM **GICv3/GICv4** (Redistributoren je Kern, `ICC_SGI1R_EL1`, ITS für MSI). QEMU:
 `-machine virt,gic-version=3` (bis 512 vCPUs). **Solange das fehlt, sind >8 Kerne auf ARM nicht
 testbar**, unabhängig von den Kapazitäten. Die Kapazitätsseite ist seit ext-30 vorbereitet
@@ -2709,7 +2709,7 @@ testbar**, unabhängig von den Kapazitäten. Die Kapazitätsseite ist seit ext-3
 
 ### C6. x86-64-Port — Rest
 
-`sel4lake-hal` ist jetzt architekturselektiv (`src/aarch64/` + `src/x86_64/` hinter derselben API).
+`caprock-hal` ist jetzt architekturselektiv (`src/aarch64/` + `src/x86_64/` hinter derselben API).
 Der **Kernel-Kern läuft auf x86_64**: dieselben Selbsttests, derselbe präemptive Scheduler,
 dasselbe cap-gesicherte IPC — ohne ein einziges `cfg(target_arch)` im Kern. Details:
 `README-X86.md`.
@@ -2737,7 +2737,7 @@ dasselbe cap-gesicherte IPC — ohne ein einziges `cfg(target_arch)` im Kern. De
 
 Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
 
-- [ ] **Kern-Uebergabe an SEL4Lake (Variante B) — Stufe 2.** Stufe 0/1a/1b sind belegt:
+- [ ] **Kern-Uebergabe an Caprock (Variante B) — Stufe 2.** Stufe 0/1a/1b sind belegt:
       `tools/handover/` nimmt fuenf E-Cores offline, schickt ihnen INIT-SIPI-SIPI in ein
       Trampolin und bringt sie in den Long Mode mit eigener GDT, eigenen Seitentabellen und
       eigenem CR3 — wiederholbar, ohne Reboot, `rmmod` gibt alles zurueck.
@@ -2863,7 +2863,7 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
 - [x] **x86-Fensterwahl — im Kern ERLEDIGT und RAM-UNABHAENGIG (gemessen 2026-08-03).** Die
       Befuerchtung im Eintrag („auf einer kleineren Maschine nicht") trifft **nicht** zu, und
       zwar aus einem Grund, den der Eintrag nicht nannte: das Fenster kommt als **feste Zusage**
-      aus der HAL (`crates/sel4lake-hal/src/x86_64/iommu.rs:32`), nicht aus `RAM_TOP`. Es gibt
+      aus der HAL (`crates/caprock-hal/src/x86_64/iommu.rs:32`), nicht aus `RAM_TOP`. Es gibt
       nur zwei Faelle, beide enden oberhalb des Sperrbereichs — bis ~4 GiB springt die Basis auf
       `0xFF00_0000`, darueber liegt sie ohnehin hoeher.
       Gemessen ueber **fuenf RAM-Groessen** (256M / 512M / 1G / 2G / 2560M), alle `msi_clear=1`,
@@ -2884,7 +2884,7 @@ Reihenfolge nach struktureller Wirkung, nicht nach Aufwand.
       auf einer kleineren nicht. Gehört als Bedingung an die Fensterwahl, zusammen mit IR, ACS
       und RMRR.
 
-- [x] **Descriptor-Typestate ERLEDIGT (2026-08-03).** `crates/sel4lake-virtio/src/owned.rs`:
+- [x] **Descriptor-Typestate ERLEDIGT (2026-08-03).** `crates/caprock-virtio/src/owned.rs`:
       `Owned<Driver>`/`Owned<Device>` mit unbewohnten Markern, `Region::carve` (monoton → keine
       ueberlappenden Puffer), `Completion` als Abschlussbeleg. `Queue::set_desc` ist **privat**;
       der einzige Weg ist `Queue::arm`, das den Puffer **by value** nimmt. Zurueck nur ueber
@@ -3170,7 +3170,7 @@ der Audit-Berichtigung
       Sektionsmessung zusätzlich möglich (Auflösung 51 Zyklen), also beides.
 
 - [ ] **D1** *(Kernfrage beantwortet, Rest ist eine Entwurfsentscheidung)* Kani deckt die
-      ext-29-Eigenschaft von `sel4lake-sync` **strukturell nicht** ab — belegt 2026-08-01: Kani
+      ext-29-Eigenschaft von `caprock-sync` **strukturell nicht** ab — belegt 2026-08-01: Kani
       baut für das Host-Ziel, dort greift der dritte `cfg`-Zweig mit
       `IRQ_MASKING_IMPLEMENTED = false` und `irq_save_disable()` als No-Op; der Lauf sagt es
       selbst (`warning: constant IRQ_MASKING_IMPLEMENTED is never used`). Ein grünes `sync`
@@ -3185,7 +3185,7 @@ der Audit-Berichtigung
       Eigenschaft formuliert. Das wäre ein echter Beweis statt eines Wächters — aber er fände
       einen `cfg`-Auswahlfehler weiterhin nicht, denn er liefe auf demselben Host-Ziel.
 - [~] **D2 halb erledigt (2026-08-02, B-7.2).** Die **Kopie** ist weg: Loom prüft den echten
-      `sel4lake-sync`-Quelltext (das Skript kopiert ihn unverändert, die Beweise stehen in
+      `caprock-sync`-Quelltext (das Skript kopiert ihn unverändert, die Beweise stehen in
       derselben Datei), die alten Nachbauten sind gelöscht. Der Fund dabei: mit
       `core::cell::UnsafeCell` prüft Loom nur das **Atomic-Protokoll** — eine abgeschwächte
       Ordnung im Ticket-Release lief durch ALLE Beweise; erst mit `loom::cell::UnsafeCell` fallen
@@ -3271,7 +3271,7 @@ der Audit-Berichtigung
       Kernel.
 
       Werkzeug: `tools/sched-erschoepfung-messen.sh` (~3 s, 96 Messwerte, `--nur-echt` für den
-      Einzellauf). Der **echte** `crates/sel4lake-sched/src/lib.rs` wird gelinkt — genau eine
+      Einzellauf). Der **echte** `crates/caprock-sched/src/lib.rs` wird gelinkt — genau eine
       Zeile unterscheidet den Harness vom Original (`#![no_std]`), Stellvertreter ist nur
       `init_thread_frame`. Keine Zweitfassung des Schedulers.
 
@@ -3280,7 +3280,7 @@ der Audit-Berichtigung
       `switch_to` setzt beim IPC-CALL `blocked = true` am **Aufrufer** und spendet dem Server
       dessen Konto (`sc_donor`) → `on_tick` belastet über `acct = sc_donor.unwrap_or(cur)` und
       setzt `depleted = true` **am blockierten Aufrufer** → `reply` ruft `ops.unblock(caller)`
-      (`sel4lake-ipc:653`) → `unblock` (`sched:658`) prüft `depleted` nicht →
+      (`caprock-ipc:653`) → `unblock` (`sched:658`) prüft `depleted` nicht →
       `enqueue_ready` (`sched:1099`) auch nicht.
 
       | Gemessen (M1 / M2) | Wert |
@@ -3349,7 +3349,7 @@ der Audit-Berichtigung
       **Auch das noch nicht gemessen:** dass die Kette in einem *laufenden* Kernel eintritt.
       Gemessen ist die Zustandsmaschine am echten `Scheduler`; die Erreichbarkeit aus dem
       Syscall ist aus dem Quelltext argumentiert (`system.rs:6588`, `system.rs:2743`,
-      `sel4lake-ipc:653`), nicht end-to-end ausgelöst.
+      `caprock-ipc:653`), nicht end-to-end ausgelöst.
 
 - [x] **D11 BEHOBEN am 2026-08-04: der Überlauf einer Endpoint-Warteschlange ist BENANNT.**
       Neuer ABI-Code `ERR_EP_FULL = 9`; `TidQueue::enqueue` gibt `bool` und ist `#[must_use]`;
@@ -3410,7 +3410,7 @@ der Audit-Berichtigung
       fehlt dort weiterhin.
 
 - [x] **E-Rest 3b BEHOBEN am 2026-08-04: die Freiliste kennt den Zonenwunsch, statt ihn zu
-      erraten.** `sel4lake_mem::alloc_below`/`alloc_colored_below` nehmen eine Obergrenze; Farbe
+      erraten.** `caprock_mem::alloc_below`/`alloc_colored_below` nehmen eine Obergrenze; Farbe
       **und** Zone werden dabei in EINER Entscheidung getroffen (dasselbe Argument wie Z8 für
       NUMA). Die drei Stellen mit einer *benannten* GiB-0-Bedingung (`alloc_dma_region`,
       `spawn_isolated`, `spawn_isolated_colored`) nennen sie jetzt und **suchen** statt einmal zu
@@ -3920,7 +3920,7 @@ der Audit-Berichtigung
 
 - [x] **D9 (Herleitung — kein offener Punkt, sondern das Protokoll zur Behebung darüber.)
       Der DONEE-Zweig in `refill_depleted`, gemessen am 2026-08-03, fünf Befunde.** Werkzeug: `tools/sched-erschoepfung-messen.sh` (jetzt **208 Messwerte**, die
-      D-Reihe kam dazu). Der echte `crates/sel4lake-sched/src/lib.rs` wird gelinkt; Mutationen
+      D-Reihe kam dazu). Der echte `crates/caprock-sched/src/lib.rs` wird gelinkt; Mutationen
       nur auf Kopien.
 
       **Positivkontrolle zuerst (P2):** der gesunde Fall trägt — Konto erschöpft, während der
@@ -3939,7 +3939,7 @@ der Audit-Berichtigung
 
       **F2 (D2): an der Scheduler-Schnittstelle auslösbar, im Kernel nicht.** Ein Donee mit
       **eigenem** erschöpftem Konto wird vom Zweig eingereiht — und **Audit-Code 9 meldet es**
-      (`audit() = 9`), der Zustand ist also nicht unbeobachtbar. Über `sel4lake-ipc` ist er
+      (`audit() = 9`), der Zustand ist also nicht unbeobachtbar. Über `caprock-ipc` ist er
       derzeit nicht herstellbar: Donee wird man nur über `switch_to` aus `call`, und das Ziel
       kommt aus der Empfängerliste — dort landet nur, wer `recv` ausgeführt hat, also gelaufen
       ist, also nicht erschöpft war. **Offene Entwurfsfrage:** ob Code 9 einen Thread ausnehmen
@@ -3972,7 +3972,7 @@ der Audit-Berichtigung
       D8, als Sprechprobe der Mechanik: die alten Befunde tauchen dort wieder auf), `H-a`, `H-b`.
 
       **Nicht gemessen:** dass D1/D5 in einem *laufenden* Kernel eintreten. Die Aufruffolgen
-      sind die von `sel4lake-ipc` (`call` → `switch_to`, `reply` → `end_donation` + `unblock`,
+      sind die von `caprock-ipc` (`call` → `switch_to`, `reply` → `end_donation` + `unblock`,
       `recv` → `block_current`) und `system::freeze_thread` (das **vor** der Quiescence-Prüfung
       `pause` absetzt und die PAUSE bei `Busy` stehen lässt), aber nicht end-to-end ausgelöst.
 
@@ -4004,7 +4004,7 @@ der Audit-Berichtigung
 - [x] **D7 (Herleitung) Das IPC-Modell trägt für den echten Endpoint nur einen Ausschnitt — gemessen, nicht
       geschätzt** (2026-08-03, `tools/verus-modelltreue-ipc.sh`, 32 Fälle · 12 Selbsttestfälle).
 
-      Der Wächter fährt den **echten** `sel4lake-ipc`-Quelltext gegen ein aus der Beweisdatei
+      Der Wächter fährt den **echten** `caprock-ipc`-Quelltext gegen ein aus der Beweisdatei
       **übersetztes** Modell (nicht abgeschrieben) und misst die Entsprechung unter einer
       hingeschriebenen Abbildung. Ergebnis: `call`/`recv` entsprechen `send`/`recv` in beiden
       Zweigen, über beide Kern-Pfade, FIFO-treu, über Ketten hinweg. Und drei Löcher, jedes

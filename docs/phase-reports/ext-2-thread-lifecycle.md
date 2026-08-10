@@ -54,7 +54,7 @@ weiterhin grün. Kernel-Crate **0 `unsafe`-Blöcke**.
   einen nicht-laufenden (blockierten/bereiten) Thread — dessen Stack könnte sofort
   frei werden; aus Einheitlichkeit läuft auch er über das Reaping.
 - **TCBs im einen Cap-System** (kein zweites): `ObjectKind::Tcb`; `ThreadId` wird
-  als `u64` gepackt, damit `sel4lake-cap` nicht von `sel4lake-sched` abhängen muss.
+  als `u64` gepackt, damit `caprock-cap` nicht von `caprock-sched` abhängen muss.
 - **`KILL` braucht WRITE:** Thread-Zerstörung ist eine schreibende Autorität.
 
 ## Risiken / offene Punkte

@@ -3,9 +3,9 @@
 **Status:** umgesetzt (Kern) · **Datum:** 2026-06-23
 
 > **Umsetzungsstand:**
-> - *Phase 2* (`crates/sel4lake-mem`): physisches Speichermodell — `MemoryCap`
+> - *Phase 2* (`crates/caprock-mem`): physisches Speichermodell — `MemoryCap`
 >   als lineare (move-only) Capability, `PhysAllocator` (koaleszierende Freiliste).
-> - *Phase 3* (`crates/sel4lake-cap`): der **CDT-Kern** ist implementiert —
+> - *Phase 3* (`crates/caprock-cap`): der **CDT-Kern** ist implementiert —
 >   `CapSpace` (typsichere Slots + Derivation-Tree), Objekt-Tabelle mit Refcount
 >   und Finalisierung, Generations-Handles (`CapPtr`), Operationen `copy`/`mint`/
 >   `move`/`delete`/`revoke` (Rechte nur einschränkbar). Alles sicheres Rust

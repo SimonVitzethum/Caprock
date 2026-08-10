@@ -16,7 +16,7 @@ Verlässliches.
 ## B-1. Der Lauf muss wiederholbar sein (D0) — **zuerst, für beide Stränge**
 
 - [x] **B-1.1 Ursache gefunden und behoben (2026-07-29): auf x86 war kein `SpinLock` IRQ-sicher.**
-      `sel4lake-sync::irq_save_disable`/`irq_restore` waren **nur für aarch64** implementiert; der
+      `caprock-sync::irq_save_disable`/`irq_restore` waren **nur für aarch64** implementiert; der
       No-Op-Zweig darunter war für *Host*-Builds gedacht (`cargo test`), fing aber auch das
       x86_64-Kernel-Ziel. Damit lag genau der reentrante Ticket-Deadlock vor, vor dem der
       Kommentar am Modulanfang warnt: der Timer-Tick trifft einen Kontext, der ein Ticket hält,
@@ -33,7 +33,7 @@ Verlässliches.
 - [x] **B-1.3 erledigt (2026-07-29).** `RUNS=8 ./test-qemu-x86.sh` fährt den Bootlauf N-fach und
       meldet die Quote; eine Quote unter 100 % ist ein **FAIL**, nicht „meistens grün". Vorgabe
       bleibt 1, damit der übliche Aufruf schnell ist. Probelauf: 5 von 5.
-- [x] **B-1.4 erledigt (2026-07-29).** `sel4lake-sync` war die **einzige** Bibliotheks-Crate mit
+- [x] **B-1.4 erledigt (2026-07-29).** `caprock-sync` war die **einzige** Bibliotheks-Crate mit
       arch-`cfg`s; die acht `cfg(not(target_arch = "aarch64"))` in `system.rs` sind ungefährlich,
       weil die Kernel-Crate nie für ein Host-Ziel baut. Damit die Annahme nicht ungeprüft bleibt:
       `IRQ_MASKING_IMPLEMENTED` prüft zur **Übersetzungszeit**, dass jedes Ziel mit
@@ -123,7 +123,7 @@ Verlässliches.
       wirklich `CCSIDR_EL1` gelesen wird und keine Konstante zurückkommt. Die ARM-Modelle melden
       nur einen L2 als höchste Ebene, daher 16 statt 256 Farben wie auf x86.
 - [x] **B-2.2b erledigt (2026-07-29, `02a1407`).** Die Feldzerlegung liegt jetzt als **reine
-      Funktion** in `crates/sel4lake-hal/src/cache_decode.rs`, arch-neutral und ohne Hardware —
+      Funktion** in `crates/caprock-hal/src/cache_decode.rs`, arch-neutral und ohne Hardware —
       beide Layouts werden auf dem Host gegen eingespeiste Registerwerte geprüft (5 von 5 grün,
       0,00 s). Damit ist der CCIDX-Zweig belegt, obwohl **keine** verfügbare QEMU-CPU ihn meldet.
       Das war der Punkt: bei gesetztem CCIDX stehen Assoziativität und Setzahl an **anderen
@@ -202,7 +202,7 @@ Verlässliches.
       überstreichen alle 256 gemessenen Farben) — also kleinere Regionen mit seitenweisem Mapping
       oder mehrere gefärbte Läufe je PD. **(Strang A ruft das auf: A-2.1.)**
 - [x] **B-4.2 erledigt (2026-07-30).** Geführte Streifenbelegung statt `i % PARTITIONS`.
-      `sel4lake_mem::pick_free` (rein, host-getestet: 18 von 18, davon fünf neue — darunter
+      `caprock_mem::pick_free` (rein, host-getestet: 18 von 18, davon fünf neue — darunter
       „erschöpft ergibt `None` und ausdrücklich nicht wieder Streifen 0") liegt neben `stripe`,
       nicht im Kernel: eine zweite Fassung derselben Arithmetik bestätigt am Ende nur sich selbst.
       Im Kernel führen `claim_stripe`/`release_stripe` die Belegung über eine CAS-Schleife.
@@ -296,7 +296,7 @@ Verlässliches.
       nicht „bis zu 10 ms", sondern **vollständig** — wer kurz vor dem Tick blockiert, zahlte
       **null**, und wer das systematisch tut, rechnet dauerhaft umsonst.
 
-      Die Arithmetik liegt abhängigkeitsfrei in `crates/sel4lake-sched/src/cycles.rs` und wird auf
+      Die Arithmetik liegt abhängigkeitsfrei in `crates/caprock-sched/src/cycles.rs` und wird auf
       dem Host geprüft (`tools/host-tests.sh cycles`, 9 Tests); die **Uhr** bleibt beim Kernel.
       Drei Fallen sind benannt und einzeln getestet: Rückwärtssprung wird **verworfen statt
       gewrappt** (`wrapping_sub` hätte aus 20 ns Messfehler ein für immer erschöpftes Konto
@@ -341,7 +341,7 @@ Verlässliches.
       auf einem Zyklus" **hängt** und musste nach 60 s abgebrochen werden. Dass er zurückkehrt,
       ist das Ergebnis.
 
-      **Nebenertrag:** `sel4lake-cap` hatte **keinen** Host-Test-Pfad — seine Tests liefen
+      **Nebenertrag:** `caprock-cap` hatte **keinen** Host-Test-Pfad — seine Tests liefen
       nirgends. `tools/host-tests.sh` sammelt jetzt alle reinen Crates (mem, part, fat, cap):
       **62 Tests**, `ALL PASS`.
 
@@ -372,7 +372,7 @@ Verlässliches.
       * Panic auf einem Sekundärkern → Prüfsignatur **identisch** zum sauberen Lauf, `rc=0`.
         Ohne die Konsolenzeile wäre der Panic durch nichts nachweisbar.
       * Panic unter gehaltener `MEM`-Sperre → **stiller Totalausfall**, kein Watchdog, `rc=124`
-        (der Ticket-Lock in `sel4lake-sync` dreht unbegrenzt).
+        (der Ticket-Lock in `caprock-sync` dreht unbegrenzt).
       * Panic im Steuerfaden des Bootkerns → Knoten läuft, meldet aber nie wieder etwas — von außen
         **nicht** von einem Deadlock zu unterscheiden. Das betrifft die Diagnose von D0.
 
@@ -403,15 +403,15 @@ Verlässliches.
       Sensitivität am echten Lock gemessen (vier Mutationen, je andere Zahl fallender Beweise);
       selbst nachgemessen: `store(0)` statt `fetch_and(!RW_WRITER)` → **7 verified, 1 failure**.
 
-      **Der Inert-Check der CI deckte nur `sel4lake-loader` ab** — jetzt auch `sel4lake-sync`, die
+      **Der Inert-Check der CI deckte nur `caprock-loader` ab** — jetzt auch `caprock-sync`, die
       Crate mit **zwei** externen cfgs (`kani` *und* `loom`). Der Kernel-Build fing das mit ab, aber
       nicht als benannte Zusicherung, und ein Schutz, den niemand ausspricht, fällt beim nächsten
       Umbau unbemerkt weg.
 
-      *(Alter Text:)* **B-7.1** Kani läuft nur im CI-Gate; die ext-29-Änderung an `sel4lake-sync` ist dort nicht
+      *(Alter Text:)* **B-7.1** Kani läuft nur im CI-Gate; die ext-29-Änderung an `caprock-sync` ist dort nicht
       gegengeprüft — **und genau diese Crate hatte gerade den x86-IRQ-Fehler.**
 - [x] **B-7.2 erledigt (2026-08-02).** Die Kopie ist weg: `tools/loom-verify.sh` übernimmt
-      `crates/sel4lake-sync/src/lib.rs` **unverändert**, die Beweise stehen in derselben Datei.
+      `crates/caprock-sync/src/lib.rs` **unverändert**, die Beweise stehen in derselben Datei.
       `Verification/concurrency/loom/src/{lib,ticket}.rs` sind **gelöscht** — eine tote Kopie, die
       autoritativ aussieht, ist schlimmer als keine. Details in
       [done.md](done.md#b-72-loom-prüfte-eine-kopie--und-die-kopie-war-nicht-das-problem).
@@ -438,7 +438,7 @@ Verlässliches.
       **beide** Hälften (keine Kante zeigt mehr auf den gelöschten Slot **und** kein fremder Elter
       hat sich bewegt), 8 von 9 Mutationen fallen — die neunte ist eine **bewiesene** Redundanz,
       keine Lücke. Neu dabei: `tools/verus-modelltreue.sh` (Wächter mit Selbsttest, hält das
-      Modell an `crates/sel4lake-cap/src/space.rs`).
+      Modell an `crates/caprock-cap/src/space.rs`).
 
       **Was für Scheduler/IPC noch offen ist:** `Verification/scheduler/proofs/runqueue.rs`
       (13 verified) und `Verification/ipc/proofs/endpoint.rs` (6 verified) sind grün, aber ihr

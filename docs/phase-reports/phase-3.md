@@ -7,7 +7,7 @@
 Das konzeptionelle Herzstück: ein Capability-System mit Derivation-Tree,
 Revocation und Speicher-Finalisierung — vollständig in **sicherem Rust**.
 
-### `crates/sel4lake-cap`
+### `crates/caprock-cap`
 
 - **`CapSpace`** — flache Tabelle typsicherer Capability-Slots (CTE-artig:
   Capability + MDB-/CDT-Knoten) + Objekt-Tabelle. Feste Kapazität
@@ -80,10 +80,10 @@ Plus weiterhin: MMU+Caches, memtest ALL PASS, 8/8 Kerne online + Ticks.
 
 ## Unsafe-Bilanz
 
-- `sel4lake-cap`: **0 unsafe** (reine Datenstruktur-Logik über feste Arrays).
+- `caprock-cap`: **0 unsafe** (reine Datenstruktur-Logik über feste Arrays).
 - Kernel-Crate weiterhin **0 `unsafe`-Blöcke**.
-- Gesamtsystem: `unsafe` ausschließlich in `sel4lake-hal` (Low-Level, erlaubt),
-  `sel4lake-sync` (Lock-Primitive) und 2 Zeilen Boot-Assembler.
+- Gesamtsystem: `unsafe` ausschließlich in `caprock-hal` (Low-Level, erlaubt),
+  `caprock-sync` (Lock-Primitive) und 2 Zeilen Boot-Assembler.
 
 ## Risiken / offene Punkte
 

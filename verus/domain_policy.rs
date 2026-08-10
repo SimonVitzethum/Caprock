@@ -1,6 +1,6 @@
-// SEL4Lake — Verus-Pilot (Tier 2), Teil 4: Domaenen-Policy (`domain_audit`, ext-22).
+// Caprock — Verus-Pilot (Tier 2), Teil 4: Domaenen-Policy (`domain_audit`, ext-22).
 //
-// Formale Spezifikation der Cap-Typ-pro-Domaene-Policy (crates/sel4lake-microkit/src/lib.rs,
+// Formale Spezifikation der Cap-Typ-pro-Domaene-Policy (crates/caprock-microkit/src/lib.rs,
 // `domain_audit` Codes 1+2): Hardware-Caps (MMIO/IRQ/DMA) duerfen NUR HardwareLand-PDs halten,
 // Autoritaets-Caps (PdControl/Loader) NUR TrustedSas-PDs. Bewiesen: das Gate `install_cap_checked`
 // **erhaelt** diese Policy-Invariante (eine HW-Cap landet nie in einer Nicht-HardwareLand-PD, eine

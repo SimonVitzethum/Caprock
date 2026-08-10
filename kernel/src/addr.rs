@@ -125,7 +125,7 @@ pub enum IdentityClass {
 pub enum IdentityReason {
     /// **`SYS_MAP`/`SYS_UNMAP`** — Klasse: **Schuld**.
     ///
-    /// Der Aufrufer nennt eine **Cap**, keine Adresse: `sel4lake_abi::sys::MAP` trägt kein
+    /// Der Aufrufer nennt eine **Cap**, keine Adresse: `caprock_abi::sys::MAP` trägt kein
     /// Adressargument, und die Basis kommt aus `ObjectKind::Memory(r).base`, also aus der
     /// Cap-Auflösung **im Kernel**. Die Identität liegt damit in einer Entscheidung des Kernels
     /// und ist behebbar, **ohne die ABI anzufassen** — der Rückgabewert nennt dem Aufrufer die

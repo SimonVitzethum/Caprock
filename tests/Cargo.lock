@@ -6,44 +6,44 @@ version = 4
 name = "aggressor-h"
 version = "0.0.1"
 dependencies = [
- "libsel4lake",
+ "libcaprock",
 ]
 
 [[package]]
 name = "aggressor-t"
 version = "0.0.1"
 dependencies = [
- "libsel4lake",
+ "libcaprock",
 ]
 
 [[package]]
 name = "aggressor-u"
 version = "0.0.1"
 dependencies = [
- "libsel4lake",
+ "libcaprock",
 ]
 
 [[package]]
 name = "intruder-h"
 version = "0.0.1"
 dependencies = [
- "libsel4lake",
+ "libcaprock",
 ]
 
 [[package]]
 name = "intruder-t"
 version = "0.0.1"
 dependencies = [
- "libsel4lake",
+ "libcaprock",
 ]
 
 [[package]]
 name = "intruder-u"
 version = "0.0.1"
 dependencies = [
- "libsel4lake",
+ "libcaprock",
 ]
 
 [[package]]
-name = "libsel4lake"
+name = "libcaprock"
 version = "0.0.1"

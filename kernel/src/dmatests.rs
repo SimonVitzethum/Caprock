@@ -12,9 +12,9 @@
 
 use crate::system;
 use crate::system::{MsiClearance, MsiWindows};
-use sel4lake_cap::{DmaCoherence, DmaDir};
-use sel4lake_mem::Rights;
-use sel4lake_hal as hal;
+use caprock_cap::{DmaCoherence, DmaDir};
+use caprock_mem::Rights;
+use caprock_hal as hal;
 
 /// Wie eine Zusammenfassungszeile ausgeht. Drei Werte, weil `bool` den dritten nicht tragen kann
 /// (B-1.2c: jede Zusammenfassungszeile ist `ALL PASS`, `FAILURES` oder `SKIP` — sonst faellt sie

@@ -1,7 +1,7 @@
 //! Kernel-Glue des **generischen Binary-Loaders** (ext-26, [ADR 0011](../../docs/adr/0011-binary-loader.md)).
 //!
 //! Die **reine**, bounds-geprüfte Parse-Logik (Boot-Archiv, ab L1 Minimal-ELF64) liegt im Crate
-//! `sel4lake-loader` (0 `unsafe`, host-getestet). Hier liegt der **privilegierte** Teil, der RAM
+//! `caprock-loader` (0 `unsafe`, host-getestet). Hier liegt der **privilegierte** Teil, der RAM
 //! liest und (ab L1) Segmente in Regionen kopiert, W^X mappt, VSpace/PD anlegt, Caps endowt und
 //! Threads spawnt — alles über die bestehenden `system::`-Primitive (keine neuen Sonderrechte).
 //!
@@ -10,20 +10,20 @@
 use crate::manifest_keys::{MANIFEST_KEYS, MIN_MANIFEST_VERSION};
 use crate::trusted_keys::{MIN_VERSION, TRUSTED_KEYS};
 use core::sync::atomic::{AtomicU64, Ordering};
-use sel4lake_cap::CapPtr;
-use sel4lake_hal::{print, println};
-use sel4lake_sync::SpinLock;
-use sel4lake_loader::archive::Archive;
-use sel4lake_loader::cert::{TrustedCert, SIG_ALG_ED25519, SIG_ED25519_LEN};
-use sel4lake_loader::elf::ElfImage;
-use sel4lake_loader::manifest::{
+use caprock_cap::CapPtr;
+use caprock_hal::{print, println};
+use caprock_sync::SpinLock;
+use caprock_loader::archive::Archive;
+use caprock_loader::cert::{TrustedCert, SIG_ALG_ED25519, SIG_ED25519_LEN};
+use caprock_loader::elf::ElfImage;
+use caprock_loader::manifest::{
     Entry as ManifestEntry, SystemManifest, Verified, SIG_ALG_ED25519 as MAN_SIG_ALG_ED25519,
 };
-use sel4lake_loader::{LoaderError, Program, DOMAIN_HARDWARE, DOMAIN_TRUSTED, DOMAIN_USERLAND};
-use sel4lake_mem::Rights;
-use sel4lake_microkit::Domain;
-use sel4lake_sched::ThreadId;
-use sel4lake_trust::{fingerprint, sha256, verify_sig};
+use caprock_loader::{LoaderError, Program, DOMAIN_HARDWARE, DOMAIN_TRUSTED, DOMAIN_USERLAND};
+use caprock_mem::Rights;
+use caprock_microkit::Domain;
+use caprock_sched::ThreadId;
+use caprock_trust::{fingerprint, sha256, verify_sig};
 
 /// Größe des reservierten RAM-Fensters für das Boot-Archiv (oben in RAM, vom `PhysAllocator`
 /// ausgenommen — siehe `init_mem`-Aufruf in `main.rs`). QEMU legt das Archiv per
@@ -82,7 +82,7 @@ pub fn read_archive() -> Option<Archive<'static>> {
     // statische Fenster (vom PhysAllocator ausgenommen, s. `system::init_mem`-Aufruf), auf x86 der
     // vom Bootloader gemeldete Modulbereich, der vor der ersten Allokation aus der Freiliste
     // ausgeschnitten wurde (`arch::x86_64::bringup`). Nur **lesender** Zugriff; der Parser
-    // (`sel4lake-loader`) ist vollständig bounds-geprüft und panik-frei.
+    // (`caprock-loader`) ist vollständig bounds-geprüft und panik-frei.
     let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, len as usize) };
     Archive::parse(bytes).ok()
 }
@@ -241,7 +241,7 @@ pub fn manifest_report() -> u32 {
                     e.program_id, e.name(), e.domain, e.iface_version, e.initial_caps,
                     e.policy_flags, e.priority, e.numa_node
                 );
-                if e.core_affinity == sel4lake_loader::manifest::ANY_CORE {
+                if e.core_affinity == caprock_loader::manifest::ANY_CORE {
                     print!("beliebig");
                 } else {
                     print!("{}", e.core_affinity);
@@ -275,7 +275,7 @@ pub fn manifest_report() -> u32 {
                         // 2026-08-10 endete auch sie in „Bytes, die nicht parsen". Dieselbe
                         // Fehlerklasse eine Ebene tiefer, mit derselben Folge -- man sucht nach
                         // Korruption, wo ein Versionsunterschied steht.
-                        Err(sel4lake_loader::LoaderError::UnsupportedManifestFormat {
+                        Err(caprock_loader::LoaderError::UnsupportedManifestFormat {
                             format_version,
                             entry_len,
                         }) => println!(
@@ -288,8 +288,8 @@ pub fn manifest_report() -> u32 {
                              unauthentifiziert** -- ein gekipptes Byte kann sie provozieren; was \
                              der signierte Kopf traegt, ist die andere Richtung (ein ANGENOMMENES \
                              Manifest hat keine untergeschobene Version)",
-                            sel4lake_loader::manifest::MANIFEST_FORMAT_VERSION,
-                            sel4lake_loader::manifest::ENTRY_LEN
+                            caprock_loader::manifest::MANIFEST_FORMAT_VERSION,
+                            caprock_loader::manifest::ENTRY_LEN
                         ),
                         Err(_) => println!("manifest:   im Archiv liegen {} B, die nicht parsen (Form, nicht Version -- die Formatversion haette einen eigenen Satz)", raw.len()),
                     }
@@ -392,7 +392,7 @@ fn endow_from_manifest(
 ) -> Result<[Option<(usize, CapPtr)>; 7], RootTaskError> {
     let channel_ep = channel.map(|(ep, _)| ep);
     let channel_ntfn = channel.map(|(_, ntfn)| ntfn);
-    use sel4lake_loader::manifest as man;
+    use caprock_loader::manifest as man;
     let mut out: [Option<(usize, CapPtr)>; 7] = [None; 7];
     // Bis hierher erzeugte Caps wieder abräumen, wenn ein späterer Schritt scheitert — sie sind
     // dann nirgends installiert und würden sonst in der geteilten Tabelle belegt bleiben.
@@ -603,7 +603,7 @@ static DRIVER_SERVICES: SpinLock<[Option<DriverService>; MAX_SERVICES]> =
 
 /// Hoechstzahl der Manifest-Eintraege -- die Schranke aller Registertabellen hier ist damit
 /// **hergeleitet** und nicht erfunden.
-const MAN_MAX_ENTRIES: usize = sel4lake_loader::manifest::MAX_ENTRIES;
+const MAN_MAX_ENTRIES: usize = caprock_loader::manifest::MAX_ENTRIES;
 
 /// **Welches PROGRAMM gehoert zu diesem Thread** — die Zuordnung, die einer Fehlermeldung erst
 /// eine Diagnose macht.
@@ -762,7 +762,7 @@ pub enum ReloadOutcome {
 ///    also durchgehend einen Empfänger;
 /// 4. Stilllegung aufheben, alte Fassung entkoppeln.
 pub fn reload_driver(program_id: u32) -> ReloadOutcome {
-    use sel4lake_ipc::Rebind;
+    use caprock_ipc::Rebind;
     // **Genau dieser Dienst** (A-5.4). `driver_service()` liefert bei zwei Diensten bewusst
     // `None` -- „der zuletzt geladene" waere hier keine Abkuerzung, sondern ein Austausch am
     // falschen Empfaenger, und zwar lautlos.
@@ -967,7 +967,7 @@ pub fn root_notification() -> Option<usize> {
 ///
 /// Reihenfolge, und jede Stufe hat einen Grund:
 /// 1. Manifest (signiert, an dieses Kernel-Image gebunden) — **wer** darf **was**;
-/// 2. Eintrag mit [`POLICY_ROOT_TASK`](sel4lake_loader::manifest::POLICY_ROOT_TASK), eindeutig;
+/// 2. Eintrag mit [`POLICY_ROOT_TASK`](caprock_loader::manifest::POLICY_ROOT_TASK), eindeutig;
 /// 3. das Modul im Archiv finden und seinen **Hash gegen das Manifest** prüfen. Ohne diesen
 ///    Schritt sagte das Manifest nur, *dass* etwas geladen wird, nicht *was*;
 /// 4. Domäne von Manifest und Archiv müssen übereinstimmen (zwei Quellen, eine Aussage);
@@ -1145,7 +1145,7 @@ fn policy_gate(program_id: u32) -> Result<(), LoaderError> {
     let Some((_, flags)) = manifest_entry_of(program_id) else {
         return Ok(());
     };
-    use sel4lake_loader::manifest as m;
+    use caprock_loader::manifest as m;
     // **EXCLUSIVE_STRIPE wird seit dem 2026-08-07 EINGEHALTEN** (A1/Z11c) und steht deshalb nicht
     // mehr hier. Die alte Begruendung ("Segmente kommen zusammenhaengend aus mem_alloc") beschrieb
     // die damalige Allokation, nicht eine Notwendigkeit -- gemappt wurde schon immer seitenweise.
@@ -1190,7 +1190,7 @@ fn zahlenpolitik_gate(program_id: u32) -> Result<(), LoaderError> {
     }
     // Affinitaet, Prioritaet und Budget werden EINGEHALTEN -- s. `endow_and_load`. Hier steht nur
     // die Schranke: eine Kernnummer, die es nicht gibt, ist ein Fehler im Dokument.
-    if affin != sel4lake_loader::manifest::ANY_CORE && (affin as usize) >= crate::system::num_cores()
+    if affin != caprock_loader::manifest::ANY_CORE && (affin as usize) >= crate::system::num_cores()
     {
         println!(
             "loader  : POLICY ABGEWIESEN -- program_id {program_id} verlangt core_affinity={affin}, \
@@ -1201,11 +1201,11 @@ fn zahlenpolitik_gate(program_id: u32) -> Result<(), LoaderError> {
     }
     // **Prioritaet**: der Scheduler kennt 0..NPRIO-1 (8). Eine Zahl darueber ist kein "so hoch wie
     // moeglich", sondern ein Fehler im Dokument.
-    if prio as usize >= sel4lake_sched::NPRIO {
+    if prio as usize >= caprock_sched::NPRIO {
         println!(
             "loader  : POLICY ABGEWIESEN -- program_id {program_id} verlangt priority={prio}, der \
              Scheduler kennt 0..{}.",
-            sel4lake_sched::NPRIO - 1
+            caprock_sched::NPRIO - 1
         );
         return Err(LoaderError::UnsupportedPolicy);
     }
@@ -1252,7 +1252,7 @@ fn manifest_zahlen_of(program_id: u32) -> Option<(u32, u32, u32, u32)> {
 fn ladepolitik(program_id: u32) -> crate::system::LadePolitik {
     use crate::system::LadePolitik;
     let farbig = manifest_entry_of(program_id)
-        .is_some_and(|(_, f)| f & sel4lake_loader::manifest::POLICY_EXCLUSIVE_STRIPE != 0);
+        .is_some_and(|(_, f)| f & caprock_loader::manifest::POLICY_EXCLUSIVE_STRIPE != 0);
     let Some((_numa, affin, prio, _budget)) = manifest_zahlen_of(program_id) else {
         return LadePolitik { farbig, ..LadePolitik::VORGABE };
     };
@@ -1263,7 +1263,7 @@ fn ladepolitik(program_id: u32) -> crate::system::LadePolitik {
         // und nicht die niedrigste. Wer wirklich 0 will, sagt es heute nicht unterscheidbar; das
         // ist eine Formatgrenze und steht als solche in `todo.md`.
         prio: if prio == 0 { LadePolitik::VORGABE.prio } else { prio as u8 },
-        core: (affin != sel4lake_loader::manifest::ANY_CORE).then_some(affin as usize),
+        core: (affin != caprock_loader::manifest::ANY_CORE).then_some(affin as usize),
         budget_us: 0, // abgewiesen, s. `zahlenpolitik_gate`
     }
 }
@@ -1281,7 +1281,7 @@ fn hotreload_gate(program_id: u32, schon_geladen: bool) -> Result<(), LoaderErro
     let Some((_, flags)) = manifest_entry_of(program_id) else {
         return Ok(());
     };
-    if flags & sel4lake_loader::manifest::POLICY_NO_HOTRELOAD != 0 {
+    if flags & caprock_loader::manifest::POLICY_NO_HOTRELOAD != 0 {
         println!(
             "loader  : A-4.5 ABGEWIESEN -- program_id {program_id} ist als NO_HOTRELOAD markiert \
              und wurde bereits geladen."

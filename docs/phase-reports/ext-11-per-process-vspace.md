@@ -27,7 +27,7 @@ hält die Änderung am Kernel minimal.
 
 ## Umsetzung
 
-- **mmu** ([mmu.rs](crates/sel4lake-hal/src/mmu.rs)): erste 2 MiB sind reine
+- **mmu** ([mmu.rs](crates/caprock-hal/src/mmu.rs)): erste 2 MiB sind reine
   Kernel-L3 (kein EL0-freies-RAM mehr → von jeder VSpace teilbar; User-RAM ab 2 MiB).
   User-Daten (`UserRw`) sind jetzt `nG` (ASID-spezifisch), User-Code/Kernel/Device
   global. Neu: `global_root`, `set_user_vspace(root, asid)`,

@@ -12,6 +12,134 @@ dependencies = [
 ]
 
 [[package]]
+name = "caprock-abi"
+version = "0.0.1"
+
+[[package]]
+name = "caprock-cap"
+version = "0.0.1"
+dependencies = [
+ "caprock-mem",
+ "caprock-slab",
+]
+
+[[package]]
+name = "caprock-dma"
+version = "0.0.1"
+
+[[package]]
+name = "caprock-dtb"
+version = "0.0.1"
+
+[[package]]
+name = "caprock-fat"
+version = "0.0.1"
+
+[[package]]
+name = "caprock-hal"
+version = "0.0.1"
+dependencies = [
+ "caprock-abi",
+ "caprock-sync",
+ "caprock-virtio",
+]
+
+[[package]]
+name = "caprock-ipc"
+version = "0.0.1"
+dependencies = [
+ "caprock-abi",
+ "caprock-hal",
+ "caprock-sched",
+]
+
+[[package]]
+name = "caprock-kernel"
+version = "0.0.1"
+dependencies = [
+ "caprock-abi",
+ "caprock-cap",
+ "caprock-dtb",
+ "caprock-hal",
+ "caprock-ipc",
+ "caprock-loader",
+ "caprock-mem",
+ "caprock-microkit",
+ "caprock-region",
+ "caprock-sched",
+ "caprock-slab",
+ "caprock-sync",
+ "caprock-trust",
+]
+
+[[package]]
+name = "caprock-loader"
+version = "0.0.1"
+
+[[package]]
+name = "caprock-mem"
+version = "0.0.1"
+
+[[package]]
+name = "caprock-microkit"
+version = "0.0.1"
+dependencies = [
+ "caprock-abi",
+ "caprock-cap",
+ "caprock-hal",
+ "caprock-ipc",
+ "caprock-mem",
+ "caprock-sched",
+ "caprock-slab",
+ "caprock-sync",
+]
+
+[[package]]
+name = "caprock-part"
+version = "0.0.1"
+
+[[package]]
+name = "caprock-region"
+version = "0.0.1"
+dependencies = [
+ "caprock-mem",
+ "caprock-sync",
+]
+
+[[package]]
+name = "caprock-sched"
+version = "0.0.1"
+dependencies = [
+ "caprock-hal",
+ "caprock-slab",
+ "caprock-sync",
+]
+
+[[package]]
+name = "caprock-slab"
+version = "0.0.1"
+
+[[package]]
+name = "caprock-sync"
+version = "0.0.1"
+
+[[package]]
+name = "caprock-trust"
+version = "0.0.1"
+dependencies = [
+ "ed25519-dalek",
+ "sha2",
+]
+
+[[package]]
+name = "caprock-virtio"
+version = "0.1.0"
+
+[[package]]
+name = "caprock-wait"
+version = "0.0.1"
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -141,134 +269,6 @@ checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
 ]
-
-[[package]]
-name = "sel4lake-abi"
-version = "0.0.1"
-
-[[package]]
-name = "sel4lake-cap"
-version = "0.0.1"
-dependencies = [
- "sel4lake-mem",
- "sel4lake-slab",
-]
-
-[[package]]
-name = "sel4lake-dma"
-version = "0.0.1"
-
-[[package]]
-name = "sel4lake-dtb"
-version = "0.0.1"
-
-[[package]]
-name = "sel4lake-fat"
-version = "0.0.1"
-
-[[package]]
-name = "sel4lake-hal"
-version = "0.0.1"
-dependencies = [
- "sel4lake-abi",
- "sel4lake-sync",
- "sel4lake-virtio",
-]
-
-[[package]]
-name = "sel4lake-ipc"
-version = "0.0.1"
-dependencies = [
- "sel4lake-abi",
- "sel4lake-hal",
- "sel4lake-sched",
-]
-
-[[package]]
-name = "sel4lake-kernel"
-version = "0.0.1"
-dependencies = [
- "sel4lake-abi",
- "sel4lake-cap",
- "sel4lake-dtb",
- "sel4lake-hal",
- "sel4lake-ipc",
- "sel4lake-loader",
- "sel4lake-mem",
- "sel4lake-microkit",
- "sel4lake-region",
- "sel4lake-sched",
- "sel4lake-slab",
- "sel4lake-sync",
- "sel4lake-trust",
-]
-
-[[package]]
-name = "sel4lake-loader"
-version = "0.0.1"
-
-[[package]]
-name = "sel4lake-mem"
-version = "0.0.1"
-
-[[package]]
-name = "sel4lake-microkit"
-version = "0.0.1"
-dependencies = [
- "sel4lake-abi",
- "sel4lake-cap",
- "sel4lake-hal",
- "sel4lake-ipc",
- "sel4lake-mem",
- "sel4lake-sched",
- "sel4lake-slab",
- "sel4lake-sync",
-]
-
-[[package]]
-name = "sel4lake-part"
-version = "0.0.1"
-
-[[package]]
-name = "sel4lake-region"
-version = "0.0.1"
-dependencies = [
- "sel4lake-mem",
- "sel4lake-sync",
-]
-
-[[package]]
-name = "sel4lake-sched"
-version = "0.0.1"
-dependencies = [
- "sel4lake-hal",
- "sel4lake-slab",
- "sel4lake-sync",
-]
-
-[[package]]
-name = "sel4lake-slab"
-version = "0.0.1"
-
-[[package]]
-name = "sel4lake-sync"
-version = "0.0.1"
-
-[[package]]
-name = "sel4lake-trust"
-version = "0.0.1"
-dependencies = [
- "ed25519-dalek",
- "sha2",
-]
-
-[[package]]
-name = "sel4lake-virtio"
-version = "0.1.0"
-
-[[package]]
-name = "sel4lake-wait"
-version = "0.0.1"
 
 [[package]]
 name = "semver"

@@ -90,11 +90,11 @@ Format-/API-Bruch** nachrüsten.
 ## Verfeinerungen (Nutzer-Review, vor L1 eingebaut)
 
 1. **Loader als eigener Kernel-Dienst, kleine öffentliche API.** Der Loader lebt im Kernel, ist aber
-   ein eigenes Modul (`kernel/src/loader.rs` + Crate `sel4lake-loader`) mit **minimaler** öffentlicher
+   ein eigenes Modul (`kernel/src/loader.rs` + Crate `caprock-loader`) mit **minimaler** öffentlicher
    API: im Kern eine einzige Operation `loader::load_image(&Program, …) -> Result<Pd, LoaderError>`.
    So bleibt er formal analysierbar + später austauschbar.
 2. **ELF vollständig in Safe Rust parsen.** Alle Header-/Offset-/Größenprüfungen liegen im Crate
-   `sel4lake-loader` (`#![forbid(unsafe_code)]`). `unsafe` entsteht **erst** beim Kopieren bereits
+   `caprock-loader` (`#![forbid(unsafe_code)]`). `unsafe` entsteht **erst** beim Kopieren bereits
    **validierter** Segmente in den Zielspeicher (Kernel-Glue) — nie im Parser.
 3. **Quelle austauschbar — API NICHT archiv-abhängig.** Das Boot-Archiv ist nur die **erste** Quelle.
    Die interne Loader-API spricht einen **quellen-agnostischen** `Program`-Deskriptor (Metadaten +
@@ -144,7 +144,7 @@ ELF-Parser begrenzt und nutzt die bestehenden cap-/domänen-geprüften Pfade.
 - **Neue Strukturen außerhalb des Kernels:** `programs/{trusted,hardware,userland}/…` und
   `tests/{trusted,hardware,userland}-test-N/` als **unabhängige** Cargo-Projekte (eigenes
   Target/Linker, eigene Build/Docs/Tests, keine Querabhängigkeiten). Ein gemeinsames, minimales
-  **SDK-Crate** (`libsel4lake`: Syscall-Stubs, `_start`/crt0, Panic-Handler, Boot-Info) ist eine
+  **SDK-Crate** (`libcaprock`: Syscall-Stubs, `_start`/crt0, Panic-Handler, Boot-Info) ist eine
   *gemeinsame* Abhängigkeit, **keine** gegenseitige zwischen Diensten.
 - **Kerneländerung (sanktioniert):** ELF-Loader-Modul, `ObjectKind::Loader`, `SYS_LOAD`,
   Boot-Archiv-Leser, Allokator-Fenster-Reservierung, `loader_audit` + Fuzzer. Die bestehende

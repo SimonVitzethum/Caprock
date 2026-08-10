@@ -34,7 +34,7 @@ wird. Alles andere liegt außerhalb.
       Politikfelder aus [A-1.4](#a-14-politikfelder-schnittstelle-zu-strang-b). Format bewusst
       **einfach und selbstbegrenzend** (feste Feldbreiten, Längenpräfixe) — es wird vor jeder
       Signaturprüfung geparst, ist also Angriffsfläche. Kein TOML, kein JSON im Kernel.
-      → `crates/sel4lake-loader/src/manifest.rs` (80-B-Kopf, 96-B-Einträge, `entry_len` im Kopf,
+      → `crates/caprock-loader/src/manifest.rs` (80-B-Kopf, 96-B-Einträge, `entry_len` im Kopf,
       damit ein fremdes Eintragsformat **erkannt** statt verrutscht gelesen wird). Host-getestet
       inkl. Mutations-Durchlauf; Kani-Beweise für Crash-Freiheit und exakte Partitionierung.
 - [x] **A-1.3 Manifest ist ein Autoritätsdokument.** Es legt die gesamte Anfangsverteilung von
@@ -67,7 +67,7 @@ wird. Alles andere liegt außerhalb.
       nicht gefärbt** — deshalb ablehnen statt halb liefern.
       `POLICY_NO_HOTRELOAD` **wird durchgesetzt** (s. A-4.5).
 - [x] **A-1.5 `SYS_LOAD` auf x86 zum Laufen bringen.** Scheitert heute sauber, weil es nichts zu
-      laden gibt. Der ELF-Lader existiert (`sel4lake-loader`); es fehlt die Quelle.
+      laden gibt. Der ELF-Lader existiert (`caprock-loader`); es fehlt die Quelle.
       → Loader baut auf beiden Architekturen, `load_by_index` ist kein `None`-Stub mehr.
       Nebenbefund: der ELF-Parser kannte nur `EM_AARCH64` — ein x86-Binary war für ihn schlicht
       kein ELF. Jetzt `EXPECTED_MACHINE` per `cfg(target_arch)`, mit einem Test gegen die jeweils
@@ -178,7 +178,7 @@ Für einen Betriebsanspruch fehlen drei Dinge.
       genug entwerfen.
 - [x] **A-4.3 erledigt (2026-07-31).** Gewählt ist die **Region, die den Austausch überlebt** —
       und damit ist ihr Format eine ABI, also mit **versioniertem Kopf** (`state.rs` in
-      `sel4lake-region`). Der Kopf trägt `state_version`, `program_id` und einen
+      `caprock-region`). Der Kopf trägt `state_version`, `program_id` und einen
       Übernahmezähler. **Der Punkt, an dem die Sache hängt:** eine abweichende Version wird
       ABGEWIESEN, statt die Bytes der alten Fassung im eigenen Sinn zu lesen. Das ist der
       Unterschied zwischen Datenverlust (merkt man) und fehlinterpretiertem Zustand (merkt man
@@ -255,7 +255,7 @@ Für einen Betriebsanspruch fehlen drei Dinge.
       Der Treiber **pollt** seinen used-Ring. Ein Geraete-Interrupt kaeme auf x86 per MSI-X, und
       seit B-3.2 steht die Interrupt-Remapping-Tabelle auf lauter „not present": ein Geraet ohne
       IRTE kann keinen Interrupt ausloesen — mit Absicht. Eine **IRTE-Vergabe gibt es nicht**
-      (geprueft, `crates/sel4lake-hal/src/x86_64/vtd.rs`). Der Weg dorthin ist damit B-3-Arbeit
+      (geprueft, `crates/caprock-hal/src/x86_64/vtd.rs`). Der Weg dorthin ist damit B-3-Arbeit
       (Vergabe + Invalidierung ueber QI), nicht A-5.1. `endow_from_manifest` weist `CAP_IRQ`
       deshalb **ab**, statt eine Autoritaet zu erteilen, die niemand einloest — dieselbe Regel wie
       bei `CAP_PD_CONTROL` in A-2.1.
@@ -276,7 +276,7 @@ Für einen Betriebsanspruch fehlen drei Dinge.
       unseren Speicher, es liest nie etwas von uns. `blk` schließt die Lücke mit einer
       dreigliedrigen Deskriptorkette (Anfragekopf, den das Gerät **liest**), `net` fügt die zweite
       Queue mit eigenem `queue_notify_off` hinzu. Beide Treiber liegen kernfrei in
-      `crates/sel4lake-virtio`; in der HAL blieb das Auffinden der Strukturen.
+      `crates/caprock-virtio`; in der HAL blieb das Auffinden der Strukturen.
 
       **Korrektur zu einer Zeile, die hier erst falsch stand:** „`attach` liefert auf x86 weiter
       `None`" stimmt nicht. `VtdEnforcer::attach` ist implementiert und teilt zu — der `dmatok`-Test
@@ -291,7 +291,7 @@ Für einen Betriebsanspruch fehlen drei Dinge.
 
 Alles hier laeuft **ausserhalb des Kerns** (Simon, 2026-08-02: *„moeglichst als Treiber, nicht im
 Kernel"*). Der Kern bekommt davon nichts: die Parser sind abhaengigkeitsfreie Crates wie
-`sel4lake-virtio`, gelinkt von Userland-PDs.
+`caprock-virtio`, gelinkt von Userland-PDs.
 
 - [x] **A-6.1 erledigt (2026-08-02): das Dienstprotokoll ueber dem Treiber.**
       `OP_INFO` (Kapazitaet, Hoechstzahl je Anfrage, Sektorgroesse), `OP_READ`, `OP_WRITE`,
@@ -306,7 +306,7 @@ Kernel"*). Der Kern bekommt davon nichts: die Parser sind abhaengigkeitsfreie Cr
       A-6.2 dazu, wo es einen Abnehmer dafuer gibt — eine Schnittstelle vor ihrem ersten Benutzer
       belegt nur eine Vermutung.
 
-- [x] **A-6.2 erledigt (2026-08-02): die Partitionstabelle.** `crates/sel4lake-part` —
+- [x] **A-6.2 erledigt (2026-08-02): die Partitionstabelle.** `crates/caprock-part` —
       GPT-Parser, `#![no_std]`, `forbid(unsafe_code)`, **keine Abhaengigkeiten**, **14 von 14**
       Host-Tests. Gelesen wird sie im **Blockdienst**, nicht im Kern.
       Details in [done.md](done.md#a-62-die-partitionstabelle--im-dienst-gelesen-nicht-im-kern).
@@ -329,7 +329,7 @@ Kernel"*). Der Kern bekommt davon nichts: die Parser sind abhaengigkeitsfreie Cr
       Treiber — ein echter Treiber tut das ohnehin, wenn der Client-Puffer nicht DMA-faehig ist.
 
 - [x] **A-6.3 erledigt (2026-08-02): ein lesendes Dateisystem als eigene PD.**
-      `crates/sel4lake-fat` (FAT16, **16 von 16** Host-Tests) + `programs/trusted/fs`.
+      `crates/caprock-fat` (FAT16, **16 von 16** Host-Tests) + `programs/trusted/fs`.
       Details in [done.md](done.md#a-63-ein-lesendes-dateisystem-als-eigene-pd).
 
       **Gemessen:** `fs : Status=0; Groesse=20 erste acht Byte=0x454b414c344c4553 Cluster=1` —
@@ -413,10 +413,10 @@ Kernel"*). Der Kern bekommt davon nichts: die Parser sind abhaengigkeitsfreie Cr
 **Dateibesitz.** Wer eine Datei besitzt, ändert sie ohne Rückfrage; wer sie nicht besitzt, meldet
 sich vorher.
 
-* **Strang A besitzt:** `kernel/src/loader.rs`, `crates/sel4lake-loader/`, `crates/sel4lake-cap/`,
-  `crates/sel4lake-ipc/`, `crates/sel4lake-abi/`, `crates/sel4lake-microkit/`,
+* **Strang A besitzt:** `kernel/src/loader.rs`, `crates/caprock-loader/`, `crates/caprock-cap/`,
+  `crates/caprock-ipc/`, `crates/caprock-abi/`, `crates/caprock-microkit/`,
   `kernel/src/arch/x86_64/bootinfo.rs`, `tools/`, `programs/`, `kernel/Cargo.toml`.
-* **Strang B besitzt:** `crates/sel4lake-sync/`, `crates/sel4lake-mem/`, `crates/sel4lake-hal/`,
+* **Strang B besitzt:** `crates/caprock-sync/`, `crates/caprock-mem/`, `crates/caprock-hal/`,
   `kernel/src/colors.rs`, `kernel/src/dmatests.rs`, `test-qemu*.sh`, `build*.sh`, `docs/`.
 * **Geteilt, deshalb mit Ansage:** `kernel/src/system.rs`, `kernel/src/arch/x86_64/bringup.rs`,
   `kernel/src/main.rs`, `docs/invariants.md`, `todo.md`.
@@ -435,4 +435,4 @@ sich vorher.
 Testaufbau, der sporadisch hängt, macht jede Messung beider Stränge wertlos.
 
 **Vor jeder Übergabe:** `./test-qemu-x86.sh` grün (bzw. begründet, was nicht), und die
-Host-Unit-Tests: `rustc --test --edition 2021 -O crates/sel4lake-mem/src/lib.rs -o /tmp/t && /tmp/t`.
+Host-Unit-Tests: `rustc --test --edition 2021 -O crates/caprock-mem/src/lib.rs -o /tmp/t && /tmp/t`.

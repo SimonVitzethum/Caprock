@@ -8,37 +8,37 @@ commit+push. Die bestehende Microkernel-Semantik bleibt unverändert; der Loader
 
 ## Architektur-Bausteine
 
-- **`crates/sel4lake-loader` (NEU, 0 `unsafe`):** reine, bounds-geprüfte Parser für (a) das
+- **`crates/caprock-loader` (NEU, 0 `unsafe`):** reine, bounds-geprüfte Parser für (a) das
   **Boot-Archiv** und (b) **Minimal-ELF64** (`ElfImage` = Entry + `PT_LOAD`-Segment-Iterator) +
   **Manifest**. Host-`cargo test` (Unit-Tests gegen gültige + fehlerhafte Eingaben). Keine
   Kernel-/HW-Abhängigkeit → maximal testbar/fuzzbar.
 - **Kernel-Glue (`kernel/src/loader.rs`, NEU):** der *privilegierte* Teil — Segmente in
   Region-Runtime-Regionen kopieren, W^X mappen, VSpace/PD anlegen, Caps via `install_cap_checked`
   endowen, Entry-Thread spawnen. Nutzt ausschließlich bestehende `system::`-Primitive.
-- **`crates/libsel4lake` (NEU, Userspace-SDK):** `_start`/crt0, Syscall-Stubs (die `invoke`-ABI),
+- **`crates/libcaprock` (NEU, Userspace-SDK):** `_start`/crt0, Syscall-Stubs (die `invoke`-ABI),
   Panic-Handler, Boot-Info-Zugriff. Gemeinsame Abhängigkeit der externen Programme (keine
   *gegenseitige* Abhängigkeit zwischen Diensten).
 - **`tools/mkarchive` (NEU, Host-Tool, kein Kernelcode):** assembliert `boot-archive.bin` aus den
   extern gebauten Programm-ELFs + Manifesten.
-- **Externer Target/Linker für Programme:** `targets/aarch64-sel4lake-user.json` +
+- **Externer Target/Linker für Programme:** `targets/aarch64-caprock-user.json` +
   `programs/user.ld` (ET_EXEC, fixe Lade-VA, `PT_LOAD`, no_std, panic=abort).
 
 ## Phasen
 
 ### L0 — Boot-Delivery + Archiv-Leser + RAM-Reservierung
 - `MOD_BASE`/`MOD_WINDOW` (oben in RAM); `init_mem` gibt dem Allokator nur `[free_base, MOD_BASE)`.
-- `sel4lake-loader`: Archiv-Header/Entry-Parser (bounds-geprüft) + Unit-Tests.
+- `caprock-loader`: Archiv-Header/Entry-Parser (bounds-geprüft) + Unit-Tests.
 - Kernel liest das Archiv (Telemetrie: Anzahl/Names). `test-qemu.sh`: `-device loader,
   file=build/boot-archive.bin,addr=MOD_BASE` (+ leeres Dummy-Archiv im Build).
 - **Test `archive`:** Kernel findet N Einträge, Magic/Version korrekt. **Sensitivität:** Bad-Magic/
   Out-of-Window-Offset → abgelehnt, Kernel läuft weiter. Allokator-Fenster nie vergeben.
 
 ### L1 — Minimal-ELF64-Parser + EL0-isoliertes Laden (erstes externes Programm)
-- `sel4lake-loader::parse_elf` (Header + `PT_LOAD`, vollständig bounds-geprüft) + Unit-Tests.
+- `caprock-loader::parse_elf` (Header + `PT_LOAD`, vollständig bounds-geprüft) + Unit-Tests.
 - `kernel/src/loader.rs::load_isolated(bytes, domain)`: VSpace anlegen, je Segment Region
   allozieren, `filesz` kopieren, `.bss` nullen, an `p_vaddr` W^X mappen (X→RX/I-Cache-Sync, W→RW,
   sonst RO), EL0-Thread am Entry spawnen.
-- `libsel4lake` + `programs/userland/hello` (minimal: SIGNAL + PARK), Build → Archiv.
+- `libcaprock` + `programs/userland/hello` (minimal: SIGNAL + PARK), Build → Archiv.
 - **Test `load`:** externes UserLand-Programm aus dem Archiv läuft + signalisiert (Badge beobachtet).
   **Sensitivität:** abgeschnittenes ELF / Memsz<Filesz / Bad-Entry → abgelehnt.
 
@@ -73,7 +73,7 @@ commit+push. Die bestehende Microkernel-Semantik bleibt unverändert; der Loader
 - **Tests `loaderaudit`, `loaderfuzz`.**
 
 ### L6 — Projektstruktur + SDK + Doku
-- `libsel4lake`-SDK finalisieren; `programs/{trusted,hardware,userland}/` Beispiel-Dienste;
+- `libcaprock`-SDK finalisieren; `programs/{trusted,hardware,userland}/` Beispiel-Dienste;
   Top-Level-Build-Skript (alle externen Programme → Archiv).
 - Doku: ADR 0011 (fertig), dieser Plan, Phasenbericht, per-Programm-READMEs, Memory.
 
@@ -83,12 +83,12 @@ Die **aggressive Blackbox-/Greybox-Testumgebung** (sechs sich gegenseitig angrei
 Cap-/CDT-Angriffe in der bestehenden In-Kernel-Selftest-Suite (s. ADR-0011-Abgrenzung).
 
 ## Kritische Dateien
-- NEU: `crates/sel4lake-loader/`, `crates/libsel4lake/`, `kernel/src/loader.rs`, `tools/mkarchive`,
-  `targets/aarch64-sel4lake-user.json`, `programs/user.ld`, `programs/**`, `tests/**`.
+- NEU: `crates/caprock-loader/`, `crates/libcaprock/`, `kernel/src/loader.rs`, `tools/mkarchive`,
+  `targets/aarch64-caprock-user.json`, `programs/user.ld`, `programs/**`, `tests/**`.
 - GEÄNDERT (Kernel): `kernel/src/main.rs` (init_mem-Fenster, Archiv lesen, Loader-Setup),
   `kernel/src/system.rs` (Loader-Glue-Aufrufe, `SYS_LOAD`-Hook, `loader_audit`-Aggregation),
-  `crates/sel4lake-cap/src/object.rs` (`ObjectKind::Loader`), `crates/sel4lake-cap/src/space.rs`
-  (`install_loader`), `crates/sel4lake-abi/src/lib.rs` (`SYS_LOAD`), `crates/sel4lake-microkit`
+  `crates/caprock-cap/src/object.rs` (`ObjectKind::Loader`), `crates/caprock-cap/src/space.rs`
+  (`install_loader`), `crates/caprock-abi/src/lib.rs` (`SYS_LOAD`), `crates/caprock-microkit`
   (Dispatch `SYS_LOAD` + Domänen-Check), `kernel/src/threads.rs` (Tests), `test-qemu.sh` (`-device
   loader` + neue Checks), Workspace-`Cargo.toml` (neue Crates).
 

@@ -48,8 +48,8 @@
 #![no_std]
 #![no_main]
 
-use libsel4lake::{exit, map_window, recv, reply, result, signal};
-use sel4lake_virtio::blk::{Op, VirtioBlk, SECTOR};
+use libcaprock::{exit, map_window, recv, reply, result, signal};
+use caprock_virtio::blk::{Op, VirtioBlk, SECTOR};
 
 /// Slot der Kanal-Notification. Ihr Badge steckt in der **Cap** (der Kernel hat es beim Endowment
 /// gesetzt) — dieses Programm kann es nicht wählen und soll es auch nicht.
@@ -103,7 +103,7 @@ const OP_FLUSH: u64 = 4;
 const OP_SCAN: u64 = 5;
 
 /// Antwortstatus: es gibt keine (lesbare) Partitionstabelle. Der genaue Grund steht in `msg[1]`
-/// als [`sel4lake_part::PartError`]-Ordnungszahl -- „keine GPT" und „eine kaputte GPT" sind
+/// als [`caprock_part::PartError`]-Ordnungszahl -- „keine GPT" und „eine kaputte GPT" sind
 /// verschiedene Lagen, und nur die zweite ist ein Datenverlust.
 const ST_NOTABLE: u64 = 4;
 
@@ -140,7 +140,7 @@ const MAX_POLL: u64 = 50_000_000;
 /// x86 ein `mfence`) und auf aarch64 falsch: dort übersetzt er zu `dmb ish`, und Device-Memory
 /// liegt nicht in der inner-shareable Domäne. Eine Barriere, die auf einer Architektur trägt und
 /// auf der anderen still schwächer ist, ist eine Falle mit Verfallsdatum — genau deshalb nimmt
-/// `sel4lake-virtio` sie als Parameter entgegen, statt sie selbst zu wählen.
+/// `caprock-virtio` sie als Parameter entgegen, statt sie selbst zu wählen.
 #[cfg(target_arch = "x86_64")]
 fn device_fence() {
     // SAFETY: reine Barriere, kein Speicher-/Registereffekt.
@@ -168,8 +168,8 @@ fn bump_served(dma_cpu: u64) -> u64 {
 }
 
 /// Fehlergruende als Zahl -- damit der Aufrufer sie unterscheiden kann, ohne den Typ zu kennen.
-fn fehlercode(e: sel4lake_part::PartError) -> u64 {
-    use sel4lake_part::PartError as E;
+fn fehlercode(e: caprock_part::PartError) -> u64 {
+    use caprock_part::PartError as E;
     match e {
         E::TooShort => 1,
         E::BadSignature => 2,
@@ -190,8 +190,8 @@ fn fehlercode(e: sel4lake_part::PartError) -> u64 {
 ///
 /// Gibt `(Zahl belegter Eintraege, erste LBA der ersten Partition, deren Sektorzahl)`.
 fn scan_partitions(blk: &VirtioBlk, dma_cpu: u64, dma_dev: u64) -> Result<(u64, u64, u64), u64> {
-    use sel4lake_part::{entry_at, parse_header, verify_entries, Crc32, PartError};
-    let buf = dma_cpu + sel4lake_virtio::blk::OFF_DATA;
+    use caprock_part::{entry_at, parse_header, verify_entries, Crc32, PartError};
+    let buf = dma_cpu + caprock_virtio::blk::OFF_DATA;
     // 1. Kopf von LBA 1.
     // SAFETY: MMIO im gemappten BAR; der Puffer gehoert dieser PD allein.
     let r = unsafe { blk.request(dma_cpu, dma_dev, Op::Read, 1, 1, MAX_POLL) };
@@ -209,7 +209,7 @@ fn scan_partitions(blk: &VirtioBlk, dma_cpu: u64, dma_dev: u64) -> Result<(u64, 
     let mut belegt = 0u64;
     let mut erste = (0u64, 0u64);
     let mut gelesen = 0u64;
-    let stueck = sel4lake_virtio::blk::MAX_SECTORS as u64 * SECTOR as u64;
+    let stueck = caprock_virtio::blk::MAX_SECTORS as u64 * SECTOR as u64;
     while gelesen < gesamt {
         let lba = hdr.entry_lba + gelesen / SECTOR as u64;
         let rest = gesamt - gelesen;
@@ -250,7 +250,7 @@ fn sektor<'a>(buf: u64, len: usize) -> &'a [u8] {
     unsafe { core::slice::from_raw_parts(buf as *const u8, len) }
 }
 
-libsel4lake::entry!(run);
+libcaprock::entry!(run);
 
 fn run(_arg: usize) -> ! {
     // 1. Die drei Fenster mappen. Jeder Fehlschlag beendet den Treiber **ohne** Bereit-Meldung:
@@ -262,10 +262,10 @@ fn run(_arg: usize) -> ! {
         exit(); // das Registerfenster wird nicht direkt adressiert, muss aber gemappt sein
     }
     let Some(dma) = map_window(DMA) else { exit() };
-    // **Der Pool ist das Tor** (Z22 P3). `sel4lake_virtio::Region::from_raw` prueft nichts; hier
+    // **Der Pool ist das Tor** (Z22 P3). `caprock_virtio::Region::from_raw` prueft nichts; hier
     // faellt die Identitaetsabbildung (`dev == cpu`), die fehlende Geraetesicht (`dev == 0`) und
     // der Ueberlauf **strukturell** aus, statt in einem `if` je Treiber wiederholt zu werden.
-    let pool = match sel4lake_dma::DmaPool::new(dma.base(), dma.iova(), dma.len()) {
+    let pool = match caprock_dma::DmaPool::new(dma.base(), dma.iova(), dma.len()) {
         Ok(p) => p,
         Err(e) => {
             // DIAGNOSE (Z22 P3): still zu sterben macht die Ursache unauffindbar.
@@ -278,8 +278,8 @@ fn run(_arg: usize) -> ! {
     // Der Datenbereich als **ein Stueck**. Ab hier ist seine Laenge eine Eigenschaft des Wertes
     // und nicht eine Konstante, die an drei Stellen von Hand richtig sein muss.
     let Some(daten) = pool.map(
-        dma_cpu + sel4lake_virtio::blk::OFF_DATA,
-        sel4lake_virtio::blk::REGION_BYTES - sel4lake_virtio::blk::OFF_DATA,
+        dma_cpu + caprock_virtio::blk::OFF_DATA,
+        caprock_virtio::blk::REGION_BYTES - caprock_virtio::blk::OFF_DATA,
     ) else {
         signal(NTFN, 0xD1A6_00FF);
         exit()
@@ -288,14 +288,14 @@ fn run(_arg: usize) -> ! {
     let (shared, shared_len) = (shared_win.base(), shared_win.len());
     // Die Gerätesicht MUSS eine eigene Achse sein. Wäre sie gleich der CPU-Sicht, liefe dieser
     // Treiber auf einer identity-Abbildung -- und genau die soll es nicht mehr geben.
-    if dma_dev == 0 || dma_len < sel4lake_virtio::blk::REGION_BYTES {
+    if dma_dev == 0 || dma_len < caprock_virtio::blk::REGION_BYTES {
         exit();
     }
 
     // 2. Das eigene Gerät auflösen — auf der eigenen Seite, ohne den Kernel.
     // SAFETY: `cfg` ist die gemappte Konfigurationsraum-Seite genau dieser Funktion, und das darin
     // genannte BAR ist über Slot 4 in dieser VSpace erreichbar.
-    let Some(transport) = (unsafe { sel4lake_virtio::probe_ecam(cfg, device_fence) }) else {
+    let Some(transport) = (unsafe { caprock_virtio::probe_ecam(cfg, device_fence) }) else {
         exit();
     };
     let blk = VirtioBlk::from_transport(transport);
@@ -331,7 +331,7 @@ fn run(_arg: usize) -> ! {
                 capacity = r.capacity_sectors;
                 reply(
                     EP,
-                    [ST_OK, capacity, sel4lake_virtio::blk::MAX_SECTORS as u64, SECTOR as u64],
+                    [ST_OK, capacity, caprock_virtio::blk::MAX_SECTORS as u64, SECTOR as u64],
                 );
             }
             OP_READ | OP_WRITE => {
@@ -345,7 +345,7 @@ fn run(_arg: usize) -> ! {
                 // Ende hinaus gefragt wird, darf antworten, wie es will; der Dienst hat vorher
                 // nein zu sagen. Und `count` wird gegen die Puffergroesse geprueft, sonst
                 // schriebe das Geraet hinter das Ende der Region.
-                let zu_gross = count > sel4lake_virtio::blk::MAX_SECTORS as u64;
+                let zu_gross = count > caprock_virtio::blk::MAX_SECTORS as u64;
                 let ueber_ende = capacity == 0
                     || sector >= capacity
                     || count > capacity - sector;

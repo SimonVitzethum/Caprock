@@ -1,4 +1,4 @@
-/* SEL4Lake-Kernel-Linker — x86_64 (Multiboot1, QEMU `-kernel`).
+/* Caprock-Kernel-Linker — x86_64 (Multiboot1, QEMU `-kernel`).
  *
  * Geladen bei 1 MiB (physisch = virtuell, identitätsgemappt). Der Multiboot-Header MUSS in den
  * ersten 8 KiB der Datei liegen -> `.multiboot` zuerst. `.boot.bss` (Boot-Seitentabellen + -Stack)

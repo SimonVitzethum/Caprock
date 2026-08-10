@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # **Kann der RMRR-Gruppentest ueberhaupt anschlagen?** (E-Rest 2, 2026-08-03)
 #
-# `crates/sel4lake-hal/src/x86_64/dmar.rs` behauptet seit dem 2026-08-03: eine RMRR schliesst die
+# `crates/caprock-hal/src/x86_64/dmar.rs` behauptet seit dem 2026-08-03: eine RMRR schliesst die
 # ganze ACS-Gruppe aus, nicht nur die einzelne Funktion. Die Tests in der Datei sehen den
 # BEHOBENEN Zustand -- und ein Test, der nur den behobenen Zustand sieht, belegt nichts. Auf q35
 # ist der Fall ausserdem unsichtbar (0 RMRRs), die QEMU-Suiten koennen hier also nicht mitreden.
@@ -32,7 +32,7 @@ trap 'rm -rf "$TMP"' EXIT
 RUSTC="rustup run nightly rustc"
 fail=0
 
-QUELLE="$ROOT/crates/sel4lake-hal/src/x86_64/dmar.rs"
+QUELLE="$ROOT/crates/caprock-hal/src/x86_64/dmar.rs"
 if [ ! -f "$QUELLE" ]; then
     echo "  FEHLT: $QUELLE ist nicht vorhanden -- Ziel nicht gelaufen (kein Uebersetzungsfehler)"
     exit 1

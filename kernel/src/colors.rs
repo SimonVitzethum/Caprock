@@ -18,13 +18,13 @@
 //! Abwesenheit als Erfüllung lesen. [`usable`] trennt das deshalb explizit: unter zwei Farben
 //! ist die Eigenschaft **nicht vorhanden**, nicht etwa trivial erfüllt.
 
-use sel4lake_hal::{self as hal, println};
-use sel4lake_mem::{color_of, ColorMask};
+use caprock_hal::{self as hal, println};
+use caprock_mem::{color_of, ColorMask};
 
 /// Seitengröße, gegen die Farben gerechnet werden.
 pub const PAGE: u64 = 4096;
 
-// `color_of` kommt aus `sel4lake-mem` — **dieselbe** Funktion, die auch der Allokator benutzt.
+// `color_of` kommt aus `caprock-mem` — **dieselbe** Funktion, die auch der Allokator benutzt.
 // Eine zweite Fassung hier wäre der klassische Fehler: der Test rechnete die Farbe anders als
 // die Zuteilung und bestätigte am Ende nur seine eigene Arithmetik.
 
@@ -45,7 +45,7 @@ pub fn usable() -> bool {
 
 /// In wie viele disjunkte Farbsätze der Farbraum geteilt wird.
 ///
-/// Zweierpotenz und höchstens [`sel4lake_mem::MASK_BITS`]. Der Wert ist eine **Politik**, keine
+/// Zweierpotenz und höchstens [`caprock_mem::MASK_BITS`]. Der Wert ist eine **Politik**, keine
 /// Hardwaregröße: mehr Partitionen heißt bessere Trennung und weniger Cache je PD — und, weil
 /// ein zusammenhängender Seitenlauf nur so lange in einem Streifen bleibt wie der Streifen
 /// breit ist, auch eine kleinere größtmögliche zusammenhängende Region (s. [`region_bytes`]).
@@ -62,7 +62,7 @@ pub const PARTITIONS: u32 = 4;
 /// richtig; für die Zuteilung an PDs ist es die stille Farbüberschneidung aus B-4.2. Wer eine PD
 /// bedient, nimmt [`claim_stripe`].
 pub fn mask_for(i: u32) -> Option<ColorMask> {
-    sel4lake_mem::stripe(i % PARTITIONS, PARTITIONS, count())
+    caprock_mem::stripe(i % PARTITIONS, PARTITIONS, count())
 }
 
 // --- Streifenvergabe mit Belegung (B-4.2) ---------------------------------------------------
@@ -82,7 +82,7 @@ pub fn mask_for(i: u32) -> Option<ColorMask> {
 /// Bit `i` gesetzt = Streifen `i` ist vergeben. Höchstens [`PARTITIONS`] Bits in Gebrauch.
 static STRIPES_TAKEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-// Die Auswahl selbst (`sel4lake_mem::pick_free`) liegt bei `stripe`, nicht hier — aus demselben
+// Die Auswahl selbst (`caprock_mem::pick_free`) liegt bei `stripe`, nicht hier — aus demselben
 // Grund wie `color_of` oben: eine zweite Fassung derselben Arithmetik im Kernel würde am Ende nur
 // sich selbst bestätigen. Dort ist sie ohne Hardware host-getestet (Technik wie `cache_decode`).
 
@@ -95,10 +95,10 @@ pub fn claim_stripe() -> Option<(u32, ColorMask)> {
     use core::sync::atomic::Ordering;
     loop {
         let cur = STRIPES_TAKEN.load(Ordering::Acquire);
-        let i = sel4lake_mem::pick_free(cur, PARTITIONS)?;
+        let i = caprock_mem::pick_free(cur, PARTITIONS)?;
         // Der Farbsatz muss VOR dem Belegen feststehen: geht die Aufteilung nicht auf, wäre ein
         // belegter Streifen ohne Maske ein Leck, das niemand je freigibt.
-        let mask = sel4lake_mem::stripe(i, PARTITIONS, count())?;
+        let mask = caprock_mem::stripe(i, PARTITIONS, count())?;
         if STRIPES_TAKEN
             .compare_exchange_weak(cur, cur | (1u32 << i), Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -126,7 +126,7 @@ pub fn stripes_in_use() -> u32 {
 /// **B-4.2 auf der laufenden Maschine belegen:** die Streifen erschöpfen und prüfen, dass der
 /// Versuch danach *scheitert*, statt einen Satz ein zweites Mal auszugeben.
 ///
-/// Die Arithmetik dahinter ist host-getestet (`sel4lake_mem::pick_free`); hier geht es um die
+/// Die Arithmetik dahinter ist host-getestet (`caprock_mem::pick_free`); hier geht es um die
 /// Zustandsführung im Kernel — dass die Belegung wirklich atomar geführt und die Freigabe wirklich
 /// wirksam ist. Der Test stellt den Ausgangszustand danach wieder her; er läuft vor dem Anlegen
 /// gefärbter PDs, belegt also nichts, was jemandem gehört.
@@ -158,7 +158,7 @@ pub fn run_stripe_alloc() -> bool {
             Some((i, m)) => {
                 // Jeder Satz muss nichtleer sein und darf keinen früheren überlappen.
                 for prev in held.iter().take(n).flatten() {
-                    if let Some(pm) = sel4lake_mem::stripe(*prev, PARTITIONS, count()) {
+                    if let Some(pm) = caprock_mem::stripe(*prev, PARTITIONS, count()) {
                         if pm.0 & m.0 != 0 {
                             println!("stripe  : FAILURES (Streifen {i} ueberlappt {prev})");
                             return false;
@@ -222,7 +222,7 @@ pub fn region_bytes() -> u64 {
     //
     // Aufgefallen ist das erst, als der Test arch-neutral wurde (A1): auf einem Zweig gemessen,
     // auf dem anderen nie ausgefuehrt -- genau die Fehlerform, gegen die der Umzug gemacht wurde.
-    let farben = count().min(sel4lake_mem::MASK_BITS);
+    let farben = count().min(caprock_mem::MASK_BITS);
     (farben / PARTITIONS).max(1) as u64 * PAGE
 }
 
@@ -597,7 +597,7 @@ pub fn report() {
 // benutzten Seite wird an der Verwendungsstelle nachgerechnet, statt einem `alloc_colored`
 // geglaubt zu werden. Und die Bilanz wird an genau den Blöcken geprüft, die der Test geholt hat
 // (`region_fully_free`), nicht am globalen Summenzähler — der ist nachweislich untauglich, weil
-// ein anderer Kern ihn nebenher bewegt (s. `sel4lake_mem::PhysAllocator::fully_free`).
+// ein anderer Kern ihn nebenher bewegt (s. `caprock_mem::PhysAllocator::fully_free`).
 
 /// **Opfergröße, aus der Geometrie abgeleitet** — und zwar aus BEIDEN Schranken.
 ///
@@ -681,7 +681,7 @@ const PROBEN: usize = 9;
 /// Vorgängerfassung dieses Tests trug sie mit 12,8 KiB unbemerkt mit sich herum.
 #[cfg(feature = "selftest")]
 struct PpArena {
-    bloecke: [Option<sel4lake_mem::MemoryCap>; MAX_BLOECKE],
+    bloecke: [Option<caprock_mem::MemoryCap>; MAX_BLOECKE],
     /// Die Spannen der geholten Blöcke — **getrennt von den Caps geführt**, und das ist keine
     /// Redundanz, sondern die ganze Aussagekraft der Bilanzprüfung.
     ///
@@ -697,7 +697,7 @@ struct PpArena {
 }
 
 #[cfg(feature = "selftest")]
-static PP_ARENA: sel4lake_sync::SpinLock<PpArena> = sel4lake_sync::SpinLock::new(PpArena {
+static PP_ARENA: caprock_sync::SpinLock<PpArena> = caprock_sync::SpinLock::new(PpArena {
     bloecke: [const { None }; MAX_BLOECKE],
     spannen: [(0, 0); MAX_BLOECKE],
     laeufe: [(0, 0); 3 * RUNS_JE_ROLLE],
@@ -896,7 +896,7 @@ fn belegte_maskenbits(runs: &[(u64, u64)], colors: u32) -> u64 {
     for &(b, l) in runs {
         let mut p = b;
         while p < b + l {
-            m |= 1u64 << (color_of(p, colors) % sel4lake_mem::MASK_BITS);
+            m |= 1u64 << (color_of(p, colors) % caprock_mem::MASK_BITS);
             p += PAGE;
         }
     }
@@ -1406,7 +1406,7 @@ fn farben_der_asid(asid: u16, mask: Option<ColorMask>) -> (usize, u64, bool) {
         while off < len {
             let p = base + off;
             let c = color_of(p, colors);
-            bits |= 1u64 << (c % sel4lake_mem::MASK_BITS);
+            bits |= 1u64 << (c % caprock_mem::MASK_BITS);
             if let Some(m) = mask {
                 if !m.contains(c) {
                     drin = false;
@@ -1433,7 +1433,7 @@ pub fn run_pd_color(asid_gefaerbt: u16, mask: ColorMask, asid_ungefaerbt: u16) -
     t.farben_gefaerbt = bits_g.count_ones();
     let (seiten_u, bits_u, _) = farben_der_asid(asid_ungefaerbt, None);
     t.seiten_ungefaerbt = seiten_u;
-    let je_streifen = (count().min(sel4lake_mem::MASK_BITS) / PARTITIONS).max(1);
+    let je_streifen = (count().min(caprock_mem::MASK_BITS) / PARTITIONS).max(1);
     t.farben_je_streifen = je_streifen;
     t.ungefaerbt_im_streifen = seiten_u > 0 && (bits_u & !maske_bits(mask)) == 0;
     t.disjunkt = (bits_g & bits_u) == 0;
@@ -1464,7 +1464,7 @@ fn maske_bits(mask: ColorMask) -> u64 {
     let mut b = 0u64;
     for c in 0..count() {
         if mask.contains(c) {
-            b |= 1u64 << (c % sel4lake_mem::MASK_BITS);
+            b |= 1u64 << (c % caprock_mem::MASK_BITS);
         }
     }
     b

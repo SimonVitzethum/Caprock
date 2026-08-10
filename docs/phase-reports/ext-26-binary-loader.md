@@ -13,17 +13,17 @@ Sicherheitsarchitektur (Capabilities, Domänen, Region-Runtime, Audits, W^X) ble
 
 ## Phasen
 
-- **L0 — Boot-Delivery + Archiv.** `crates/sel4lake-loader` (`#![forbid(unsafe_code)]`, host-
+- **L0 — Boot-Delivery + Archiv.** `crates/caprock-loader` (`#![forbid(unsafe_code)]`, host-
   getestet): bounds-geprüfter Boot-Archiv-Parser. QEMU `-device loader` legt das Archiv in ein
   oben in RAM **reserviertes 16-MiB-Fenster** (`MOD_BASE`, vom `PhysAllocator` ausgenommen); der
   Kernel liest es (`kernel/src/loader.rs`, ein begründetes `unsafe` für den Read-only-Slice).
   Host-Tool `tools/mkarchive.py`.
-- **L1a — Minimal-ELF64-Parser.** `sel4lake-loader::elf`: nur `ET_EXEC`/AArch64-Header + `PT_LOAD`-
+- **L1a — Minimal-ELF64-Parser.** `caprock-loader::elf`: nur `ET_EXEC`/AArch64-Header + `PT_LOAD`-
   Segmente, vollständig bounds-geprüft, panik-frei. 9 Host-Unit-Tests. **Kein** Dynamic-Linking/
   Relokationen.
 - **L1b — Externe Programm-Toolchain.** `programs/` = **eigener** Cargo-Workspace (eigene
   Target-Spec + Linker `user.ld`, festgelinkt an VA `0x4100_0000`, getrennte W^X-`PT_LOAD`-
-  Segmente). SDK `libsel4lake` (Syscall-Stubs + Panik-Handler). Erstes Programm `hello`.
+  Segmente). SDK `libcaprock` (Syscall-Stubs + Panik-Handler). Erstes Programm `hello`.
 - **L1c — EL0-isoliertes Laden.** Neues HAL-Primitiv `vspace_map_page_at(va→pa)` (nicht-identity:
   Programme an fester VA gelinkt, an **beliebige** Phys geladen). `system::load_elf`: Segmente in
   RAM-Frames kopieren (die **einzige** `unsafe`-Stelle), **W^X** an die Link-VA mappen, Stack,
@@ -69,7 +69,7 @@ Sicherheitsarchitektur (Capabilities, Domänen, Region-Runtime, Audits, W^X) ble
   `loader_audit==0`. (Der Parser ist zusätzlich per 17 Host-`cargo test` umfassend fuzz-getestet.)
 - **L6 — Projektstruktur + SDK-Doku.** `programs/` nach Domäne gegliedert (`userland/`, `hardware/`,
   `trusted/`); `hello` → `userland/hello`. `programs/README.md` (Build, Struktur, Programm
-  hinzufügen) + `programs/libsel4lake/README.md` (Syscall-ABI + API). Die externen Programme bauen
+  hinzufügen) + `programs/libcaprock/README.md` (Syscall-ABI + API). Die externen Programme bauen
   unabhängig (`cd programs && cargo build`).
 
 ## Nutzer-Review-Verfeinerungen (eingebaut)

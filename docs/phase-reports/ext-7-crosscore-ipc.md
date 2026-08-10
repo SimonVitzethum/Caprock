@@ -16,7 +16,7 @@ deadlock-gefährdet (Kern A will B, Kern B will A).
 
 ## Lösung: `SchedOps`-Facade, je Operation genau ein Lock
 
-- **`sel4lake-sched::SchedOps`** abstrahiert die Scheduler-Operationen, die der
+- **`caprock-sched::SchedOps`** abstrahiert die Scheduler-Operationen, die der
   IPC-/Dispatch-Pfad braucht (`current_id`, `frame_of`, `block_current`,
   `switch_to`, `unblock`, `on_tick`, `exit_current`, `kill`). `frame_of`/`unblock`
   dürfen einen Thread auf **irgendeinem** Kern betreffen.

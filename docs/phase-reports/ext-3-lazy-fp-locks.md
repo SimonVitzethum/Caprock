@@ -10,7 +10,7 @@ beim Threadwechsel FP trappen; bei der ersten FP-Nutzung den FP-Kontext lazy
 umladen. Implementiert wurde der vollständige Mechanismus (CPACR-Steuerung,
 per-TCB-FP-Bereich, per-Kern-`fp_owner`, FP-Trap-Hook, `save_fp`/`restore_fp`).
 
-**Befund (in QEMU):** **Hang.** Ursache ist grundlegend: In SEL4Lake laufen alle
+**Befund (in QEMU):** **Hang.** Ursache ist grundlegend: In Caprock laufen alle
 Threads **auf EL1** (noch kein EL0-Userland). `CPACR_EL1.FPEN` trappt FP bei EL1
 aber **auch für den Kernel selbst** — und rustc/LLVM emittieren NEON im
 Kernel-Code (Exception-Handler, Hooks). Sobald FP getrappt war, löste der erste

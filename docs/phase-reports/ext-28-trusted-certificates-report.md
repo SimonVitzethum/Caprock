@@ -21,7 +21,7 @@ Zentrale Sicherheitsregeln (ADR 0014):
 - **Etablierte Krypto, keine Eigenentwicklung:** Ed25519 (RFC 8032, `ed25519-dalek`) + SHA-256
   (`sha2`).
 - Ein Build-/Signier-Tool beweist host-seitig, dass das Programm **unsafe-frei** ist (Allowlist
-  **nur** `libsel4lake`), hasht Binary + Manifest, baut das Zertifikat und signiert es.
+  **nur** `libcaprock`), hasht Binary + Manifest, baut das Zertifikat und signiert es.
 
 ## Vertrauenskette (Ende zu Ende)
 
@@ -30,7 +30,7 @@ Zentrale Sicherheitsregeln (ADR 0014):
  ────────────                           ──────                 ──────────────────────
  tools/sign_trusted.py                  boot-archive.bin       loader::verify_image (DOMAIN_TRUSTED)
   1. Unsafe-Audit (cargo metadata,       Eintrag (v2):          1. TrustedCert::parse  (bounds, panik-frei)
-     Allowlist {libsel4lake})              blob (ELF)           2. signature_algorithm_id==Ed25519, |sig|==64
+     Allowlist {libcaprock})              blob (ELF)           2. signature_algorithm_id==Ed25519, |sig|==64
   2. SHA-256(ELF), SHA-256(Manifest)       manifest            3. key_id -> TRUSTED_KEYS (read-only, kompiliert)
   3. Zertifikatsnachricht füllen           cert  <─────────┐      revoked? key_id==fingerprint(pubkey)?
      (eingefrorenes Format)              ─────────────────┘   4. verify_strict(pubkey, message, sig)
@@ -47,7 +47,7 @@ Nachricht.
 
 ## Zertifikatsformat (eingefroren)
 
-Definiert + bounds-geprüft geparst in [`crates/sel4lake-loader/src/cert.rs`](../../crates/sel4lake-loader/src/cert.rs)
+Definiert + bounds-geprüft geparst in [`crates/caprock-loader/src/cert.rs`](../../crates/caprock-loader/src/cert.rs)
 (`#![forbid(unsafe_code)]`, panik-frei, host-fuzzbar). Little-Endian, die **gesamte** Nachricht
 `[0..msg_len)` wird signiert:
 
@@ -80,18 +80,18 @@ ausschließlich darauf auf.
 
 Ein TrustedSAS-Programm wird **vollständig ohne `unsafe`** entwickelt (`#![forbid(unsafe_code)]`).
 Die **einzige** zugelassene Ausnahme im gesamten Dependency-Baum ist die explizit auditierte
-Syscall-ABI-Schicht `libsel4lake` (Allowlist). `tools/sign_trusted.py` setzt das durch:
+Syscall-ABI-Schicht `libcaprock` (Allowlist). `tools/sign_trusted.py` setzt das durch:
 
 - `cargo metadata` → transitiver App-Dep-Baum (Sysroot `core`/`alloc`/`compiler_builtins` =
   vertraute Sprach-Laufzeit, außer Scope).
 - Je Crate: Scan auf reale `unsafe`-Nutzung; das Programm-Crate muss `#![forbid(unsafe_code)]`
-  tragen + 0 `unsafe` haben; `unsafe` ist **nur** in `libsel4lake` erlaubt.
+  tragen + 0 `unsafe` haben; `unsafe` ist **nur** in `libcaprock` erlaubt.
 - Jede Verletzung → **Abbruch, KEIN Zertifikat**. Ein Audit-Bericht (`<cert>.audit.txt`) listet die
   `unsafe`-Anzahl je Crate; sein SHA-256 wird als `unsafe_audit_hash` im Zertifikat verankert.
 
 **Spannung gelöst:** In aktuellem Rust ist `#[no_mangle]` ein *unsafe* Attribut und von
 `forbid(unsafe_code)` blockiert. Der ELF-Entry-Point `_start` gehört daher in die auditierte
-SDK-Schicht: `libsel4lake::entry!(run)` erzeugt die `#[no_mangle]`-Glue (Makro-Hygiene der externen
+SDK-Schicht: `libcaprock::entry!(run)` erzeugt die `#[no_mangle]`-Glue (Makro-Hygiene der externen
 Crate), das Programm selbst stellt nur eine **sichere** `fn run(arg: usize) -> !` bereit und bleibt
 forbid-rein. Das ist **kein** „Trampolin zum Verstecken von Programm-`unsafe`", sondern
 Standard-Runtime-Support in der Allowlist-Crate.
@@ -114,8 +114,8 @@ Standard-Runtime-Support in der Allowlist-Crate.
 ## Verifikation (Belege)
 
 **Host (eigenständig, außerhalb des build-std-Workspace):**
-- `sel4lake-trust`: 5/5 Tests (RFC-8032-Vektoren) unter `verify_strict`.
-- `sel4lake-loader`: 26 Tests (Archiv v2 + Cert-Parser inkl. Negativfälle).
+- `caprock-trust`: 5/5 Tests (RFC-8032-Vektoren) unter `verify_strict`.
+- `caprock-loader`: 26 Tests (Archiv v2 + Cert-Parser inkl. Negativfälle).
 - Round-Trip `python-cryptography` ↔ `ed25519-dalek`: Signatur gültig, `key_id ==
   fingerprint(pubkey)`, `binary_hash == sha256(ELF)`, `ALL_PASS`, Tamper abgelehnt.
 - `sign_trusted.py` lehnt ein Programm mit `unsafe` ab (FAIL, kein Cert, Exit 1).
@@ -141,13 +141,13 @@ Standard-Runtime-Support in der Allowlist-Crate.
 
 | Datei | Rolle |
 |---|---|
-| `crates/sel4lake-loader/src/cert.rs` | Eingefrorener Cert-Parser (forbid-unsafe, panik-frei) |
-| `crates/sel4lake-trust/` | Ed25519-`verify_strict` + SHA-256 + `fingerprint` + `TrustedKey` (no_std, no-alloc) |
-| `crates/sel4lake-loader/src/archive.rs` | Archiv-Format v2 (`cert_off/cert_len`) |
+| `crates/caprock-loader/src/cert.rs` | Eingefrorener Cert-Parser (forbid-unsafe, panik-frei) |
+| `crates/caprock-trust/` | Ed25519-`verify_strict` + SHA-256 + `fingerprint` + `TrustedKey` (no_std, no-alloc) |
+| `crates/caprock-loader/src/archive.rs` | Archiv-Format v2 (`cert_off/cert_len`) |
 | `kernel/src/loader.rs` | `verify_image`/`verify_trusted_cert` (Gate) + `trust_audit` + `verify_only` |
 | `kernel/src/trusted_keys.rs` | Read-only Key-DB (autogeneriert; nur PubKeys) |
 | `kernel/src/threads/{mod.rs,fuzz.rs}` | `trust_audit`-Wiring, `intruder-t`-Umwidmung, `certfuzz` |
-| `programs/libsel4lake/src/lib.rs` | `entry!`-Makro (Entry-Glue in der Allowlist-Schicht) |
+| `programs/libcaprock/src/lib.rs` | `entry!`-Makro (Entry-Glue in der Allowlist-Schicht) |
 | `programs/trusted/svc-demo/` | Sauberes, zertifiziertes Demo-TrustedSAS-Programm |
 | `tools/sign_trusted.py` | Unsafe-Audit + Hashes + Ed25519-Signatur (host) |
 | `tools/gen_trusted_key.py` | Keypair + Key-DB-Generierung |

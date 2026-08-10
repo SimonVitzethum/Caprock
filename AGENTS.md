@@ -27,8 +27,8 @@ Verzeichnissen. Wer pauschal hinzufügt, committet fremde Arbeit.
 **3. Halte HEAD baubar.** Beide Ziele:
 ```sh
 . /opt/tools/… bzw. export RUSTUP_HOME=/opt/tools/rustup CARGO_HOME=/opt/tools/cargo PATH=/opt/tools/cargo/bin:$PATH
-cargo build --release --target x86_64-unknown-none -p sel4lake-kernel   # x86
-cargo build --release -p sel4lake-kernel                                # aarch64
+cargo build --release --target x86_64-unknown-none -p caprock-kernel   # x86
+cargo build --release -p caprock-kernel                                # aarch64
 ```
 Wenn eine Änderung nur zusammen mit einer zweiten baut (z. B. `mod x;` entgatet, aber `x.rs` noch
 nicht angepasst), gehören **beide in denselben Commit**. Ein zwischenzeitlich kaputtes HEAD kostet
@@ -36,8 +36,8 @@ den anderen eine Fehlersuche an einem Fehler, den es gar nicht gibt.
 
 **4. Eigene Identität beim Commit** — nicht global setzen, sonst überschreibt ihr euch:
 ```sh
-GIT_AUTHOR_NAME="Claude (Strang A)" GIT_AUTHOR_EMAIL="claude-a@sel4lake.local" \
-GIT_COMMITTER_NAME="Claude (Strang A)" GIT_COMMITTER_EMAIL="claude-a@sel4lake.local" \
+GIT_AUTHOR_NAME="Claude (Strang A)" GIT_AUTHOR_EMAIL="claude-a@caprock.local" \
+GIT_COMMITTER_NAME="Claude (Strang A)" GIT_COMMITTER_EMAIL="claude-a@caprock.local" \
 git commit -F - <<'EOF'
 …
 EOF
@@ -54,7 +54,7 @@ zwischendurch nicht berichten. Hintergrundausführung über die Tool-Option ist 
 
 ```sh
 nohup sh -c 'export RUSTUP_HOME=/opt/tools/rustup CARGO_HOME=/opt/tools/cargo PATH=/opt/tools/cargo/bin:$PATH;
-             cd /home/node/.openclaw/workspace/SEL4Lake; ./test-qemu-x86.sh' \
+             cd /home/node/.openclaw/workspace/Caprock; ./test-qemu-x86.sh' \
      > build/diag/lauf.log 2>&1 &
 echo "gestartet, Log: build/diag/lauf.log"
 ```
@@ -73,10 +73,10 @@ Standardbibliothek und lief 16 Minuten am Stück — 16 Minuten ohne ein Lebensz
 Wer besitzt, ändert ohne Rückfrage. Wer nicht besitzt, hinterlässt vorher eine Mitteilung unten.
 
 * **A besitzt:** `kernel/src/loader.rs`, `kernel/src/arch/*/multiboot.rs`,
-  `kernel/src/arch/x86_64/bootinfo.rs`, `crates/sel4lake-loader/`, `crates/sel4lake-cap/`,
-  `crates/sel4lake-ipc/`, `crates/sel4lake-abi/`, `crates/sel4lake-microkit/`, `tools/`,
+  `kernel/src/arch/x86_64/bootinfo.rs`, `crates/caprock-loader/`, `crates/caprock-cap/`,
+  `crates/caprock-ipc/`, `crates/caprock-abi/`, `crates/caprock-microkit/`, `tools/`,
   `programs/`, `kernel/Cargo.toml`.
-* **B besitzt:** `crates/sel4lake-sync/`, `crates/sel4lake-mem/`, `crates/sel4lake-hal/`,
+* **B besitzt:** `crates/caprock-sync/`, `crates/caprock-mem/`, `crates/caprock-hal/`,
   `kernel/src/colors.rs`, `kernel/src/dmatests.rs`, `kernel/src/selftest.rs`, `test-qemu*.sh`,
   `build*.sh`, `docs/`.
 * **Geteilt, mit Mitteilung:** `kernel/src/system.rs`, `kernel/src/arch/x86_64/bringup.rs`,
@@ -110,7 +110,7 @@ ohne nachfragen zu müssen.
 
 ```sh
 ./test-qemu-x86.sh                                                    # x86-Suite
-rustc --test --edition 2021 -O crates/sel4lake-mem/src/lib.rs -o /tmp/t && /tmp/t   # Host-Tests
+rustc --test --edition 2021 -O crates/caprock-mem/src/lib.rs -o /tmp/t && /tmp/t   # Host-Tests
 ```
 Was nicht grün ist, wird **begründet** — nicht weggelassen. Und: gegen `SELFTEST COMPLETE` prüfen,
 nicht gegen die gerade interessierende Zeile. Ein Lauf, der danach hängenbleibt, zählte sonst als
@@ -118,7 +118,7 @@ Erfolg (dieser Fehler ist hier schon einmal gemacht worden).
 
 ## Werkzeugkette
 
-Das Image bringt rustc/cargo **stable** mit; SEL4Lake braucht **nightly** (`-Z build-std`).
+Das Image bringt rustc/cargo **stable** mit; Caprock braucht **nightly** (`-Z build-std`).
 Nightly liegt in `/opt/tools/rustup` (gemountet, überlebt Image-Neubauten):
 ```sh
 export RUSTUP_HOME=/opt/tools/rustup CARGO_HOME=/opt/tools/cargo PATH=/opt/tools/cargo/bin:$PATH
@@ -342,7 +342,7 @@ angefasst (beide geteilt) und in `c413012` committet. Konkret:
   und ihr einziger Aufrufer ist `threads/mod.rs`. In der Default-Konfiguration ändert sich
   nichts, und ohne das Gate übersetzt der `--no-default-features`-Bau auf ARM gar nicht.
 
-**Der Fund dahinter:** `cargo build --release -p sel4lake-kernel --no-default-features` ist auf
+**Der Fund dahinter:** `cargo build --release -p caprock-kernel --no-default-features` ist auf
 **aarch64 nie übersetzt worden**. Fünf Fehler, der letzte der aussagekräftige: `kernel_main` ist
 `-> !`, und die divergierende Schleife war `threads::demo_report_then_idle()` — ohne Testcode hatte
 die Funktion kein Ende. Dein x86-Gegenstück (`test-qemu-x86.sh` baut die Konfiguration mit) hat
@@ -493,7 +493,7 @@ Kommentar zur Multiboot-Archivquelle). Sie ist in `7a87182` gelandet.
 * Deshalb Regel 1 oben: früh committen. Es gibt keinen anderen Schutz.
 
 Was von mir schon drin ist (`ab76273`, `7a87182`):
-* **`sel4lake-sync`: auf x86 war kein `SpinLock` IRQ-sicher.** `irq_save_disable` war nur für
+* **`caprock-sync`: auf x86 war kein `SpinLock` IRQ-sicher.** `irq_save_disable` war nur für
   aarch64 implementiert, der No-Op-Zweig für Host-Builds fing das Kernel-Ziel mit. Ergebnis war ein
   reentranter Ticket-Deadlock: sporadisches Stehenbleiben mitten in `println!`, etwa jeder achte
   Lauf. **Falls du vor heute Mittag rätselhafte Hänger gesehen hast — das war es.** Vorher 7 von 8

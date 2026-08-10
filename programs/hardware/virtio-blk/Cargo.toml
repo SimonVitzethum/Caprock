@@ -2,9 +2,9 @@
 #
 # Zwei Abhaengigkeiten, und beide sind der Punkt:
 #
-#   * `libsel4lake`  — das Minimal-SDK (Syscalls, Panik-Handler), wie jedes andere Programm.
-#   * `sel4lake-virtio` — die Treiberlogik. Sie liegt im KERNEL-Workspace unter `crates/`, haengt
-#     aber an **nichts** (kein sel4lake-hal, kein Kernel, keine Architektur). Genau dafuer wurde
+#   * `libcaprock`  — das Minimal-SDK (Syscalls, Panik-Handler), wie jedes andere Programm.
+#   * `caprock-virtio` — die Treiberlogik. Sie liegt im KERNEL-Workspace unter `crates/`, haengt
+#     aber an **nichts** (kein caprock-hal, kein Kernel, keine Architektur). Genau dafuer wurde
 #     sie am 2026-08-01 dorthin entkoppelt: damit ein Userland-Programm sie linken kann, ohne den
 #     Kernel mitzuziehen. Dass dieser Pfad hier funktioniert, ist die Probe aufs Exempel -- waere
 #     auch nur eine Kernel-Abhaengigkeit uebriggeblieben, liesse sich dieses Programm nicht bauen.
@@ -19,12 +19,12 @@ name = "virtio-blk"
 path = "src/main.rs"
 
 [dependencies]
-libsel4lake = { path = "../../libsel4lake" }
-sel4lake-virtio = { path = "../../../crates/sel4lake-virtio" }
+libcaprock = { path = "../../libcaprock" }
+caprock-virtio = { path = "../../../crates/caprock-virtio" }
 # A-6.2: der GPT-Parser. Ebenfalls abhaengigkeitsfrei und `forbid(unsafe_code)` -- er liest fremde
 # Bytes von der Platte, und die gehoeren nicht in den Kern.
-sel4lake-part = { path = "../../../crates/sel4lake-part" }
+caprock-part = { path = "../../../crates/caprock-part" }
 # Z22 P3: der DMA-Pool. Ebenfalls abhaengigkeitsfrei und `forbid(unsafe_code)`. Er ist das TOR vor
-# `sel4lake_virtio::Region`: dessen `from_raw` ist ungeprueft, und eine Region mit `dev == cpu`
+# `caprock_virtio::Region`: dessen `from_raw` ist ungeprueft, und eine Region mit `dev == cpu`
 # (Identitaet) oder `dev == 0` liefe scheinbar, bis das Geraet ins Leere schriebe.
-sel4lake-dma = { path = "../../../crates/sel4lake-dma" }
+caprock-dma = { path = "../../../crates/caprock-dma" }

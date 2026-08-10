@@ -4,14 +4,14 @@
 // in Stufe 0 nur Boot+Serial aktiv (Kern folgt) -> nur fuer aarch64 anfordern.
 #![cfg_attr(target_arch = "aarch64", feature(allocator_api))]
 #![cfg_attr(target_arch = "aarch64", feature(btreemap_alloc))]
-//! SEL4Lake kernel — bootable image entry point.
+//! Caprock kernel — bootable image entry point.
 //!
 //! Phase 1 (HAL): Boot, Exception-Vektoren, Identity-MMU + Caches (W^X), GICv2,
 //! Timer, SMP-Bring-up. Phase 2: capability-basiertes physisches Speichermodell
-//! (`sel4lake-mem`, hier per Selbsttest exerziert). Die Hardware-Spezifik liegt
-//! in `sel4lake-hal`; diese Crate verdrahtet Boot-Trampolin und Init-Reihenfolge.
+//! (`caprock-mem`, hier per Selbsttest exerziert). Die Hardware-Spezifik liegt
+//! in `caprock-hal`; diese Crate verdrahtet Boot-Trampolin und Init-Reihenfolge.
 
-// ext-25: prozess-lokale Heaps (sel4lake-region) nutzen den allocator_api — `Box`/`Vec` werden
+// ext-25: prozess-lokale Heaps (caprock-region) nutzen den allocator_api — `Box`/`Vec` werden
 // stets mit EXPLIZITEM Allokator (`*_in(&heap)`) erzeugt. Es gibt bewusst KEINEN globalen Heap;
 // der Global-Allocator unten ist ein Wächter, der versehentliche `Box::new`/`Vec::new` abfängt.
 #[cfg(target_arch = "aarch64")]
@@ -58,7 +58,7 @@ mod threads;
 mod trusted_keys;
 
 #[cfg(target_arch = "aarch64")]
-use sel4lake_hal::{self as hal, println};
+use caprock_hal::{self as hal, println};
 
 // --- aarch64-Kernel-Kern (auf dem x86_64-Branch noch inaktiv; Boot-Entry kommt aus arch). ---
 
@@ -79,7 +79,7 @@ const RAM_BASE: u64 = 0x4000_0000;
 #[cfg(target_arch = "aarch64")]
 const RAM_END: u64 = RAM_BASE + 4 * 1024 * 1024 * 1024;
 
-/// Von QEMU erzeugter Device Tree (eingebettet — siehe `sel4lake-dtb`).
+/// Von QEMU erzeugter Device Tree (eingebettet — siehe `caprock-dtb`).
 #[cfg(target_arch = "aarch64")]
 static DTB_BYTES: &[u8] = include_bytes!("virt.dtb");
 
@@ -126,7 +126,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
 
     let (m, c, i) = hal::mmu::sctlr_flags();
     println!("========================================");
-    println!(" SEL4Lake — capability microkernel");
+    println!(" Caprock — capability microkernel");
     println!(" phase 1: HAL bring-up");
     println!("========================================");
     println!("arch    : aarch64 (running at EL{})", hal::cpu::current_el());
@@ -157,7 +157,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     crate::colors::report();
 
     // RAM-Layout aus dem Device Tree lesen (statt fest verdrahtet).
-    let (ram_base, ram_size) = sel4lake_dtb::Dtb::parse(DTB_BYTES)
+    let (ram_base, ram_size) = caprock_dtb::Dtb::parse(DTB_BYTES)
         .and_then(|d| d.memory())
         .unwrap_or((RAM_BASE, RAM_END - RAM_BASE));
     let ram_end = ram_base + ram_size;
@@ -166,12 +166,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         ram_size >> 20
     );
     // Kernzahl ebenfalls aus dem Device Tree (ext-30) statt fest verdrahtet.
-    let cores = sel4lake_dtb::Dtb::parse(DTB_BYTES)
+    let cores = caprock_dtb::Dtb::parse(DTB_BYTES)
         .and_then(|d| d.cpu_count())
         .filter(|&n| n > 0)
         .unwrap_or(FALLBACK_CORES)
-        .min(sel4lake_sched::MAX_CORES);
-    println!("dtb     : {cores} CPUs (aus Device Tree; Kernel-Obergrenze {})", sel4lake_sched::MAX_CORES);
+        .min(caprock_sched::MAX_CORES);
+    println!("dtb     : {cores} CPUs (aus Device Tree; Kernel-Obergrenze {})", caprock_sched::MAX_CORES);
     let dtb_ok = ram_base == RAM_BASE && ram_size == 4 * 1024 * 1024 * 1024 && cores > 0;
     println!("dtb     : {}", if dtb_ok { "ALL PASS" } else { "FAILURES" });
 
@@ -190,7 +190,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     println!(
         "cap     : {cap_slots} Slots / {cap_objs} Objekte, Tabellen {} KiB aus dem RAM (Summe aller PD-Budgets: {})",
         cap_bytes >> 10,
-        sel4lake_microkit::CAP_SLOTS_FOR_ALL_PDS
+        caprock_microkit::CAP_SLOTS_FOR_ALL_PDS
     );
     // A-3.4 Teil 4: IPC-Tabellen VOR dem ersten Endpoint — der Selbsttest und die Bringup-Kanäle
     // reservieren gleich welche. Meldet sich selbst (`ipc :`).

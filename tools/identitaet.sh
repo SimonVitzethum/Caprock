@@ -11,7 +11,7 @@
 #   * `hal::mmu::vspace_map_dma` stand in ihrer Funktionsliste **gar nicht** -- der DMA-Pfad einer
 #     Treiber-PD bildet identisch ab, und der Waechter sah ihn nie. Eine Textflaeche ueber einem
 #     Loch.
-#   * der Grundtext zu `SYS_MAP` war **falsch**: er sagte „das ist die ABI". `sel4lake_abi::sys::MAP`
+#   * der Grundtext zu `SYS_MAP` war **falsch**: er sagte „das ist die ABI". `caprock_abi::sys::MAP`
 #     traegt aber kein Adressargument -- der Aufrufer nennt eine **Cap**, und die Basis kommt aus
 #     `ObjectKind::Memory(r).base`, also aus der Cap-Aufloesung IM KERNEL. Die Identitaet liegt
 #     damit in einer Entscheidung des Kernels, nicht in der Schnittstelle, und ist behebbar, ohne
@@ -205,7 +205,7 @@ fi
 # **Die Funktionsliste kommt aus der HAL**, nicht von Hand: `vspace_map_dma` hat in der ersten
 # Fassung genau deshalb gefehlt. Ausgenommen sind die beiden, die VA und PA GETRENNT nehmen
 # (`_page_at`, `_user_window`) -- sie sind das Gegenteil einer Identitaetsannahme.
-HAL="crates/sel4lake-hal/src/x86_64/mmu.rs"
+HAL="crates/caprock-hal/src/x86_64/mmu.rs"
 FUNKTIONEN="$(grep -oE '^pub fn (vspace_map[a-z_]*|vspace_unmap[a-z_]*|map_device[a-z_]*)\(' "$HAL" \
               | sed 's/^pub fn //; s/($//; s/(//' \
               | grep -vE '^(vspace_map_page_at|vspace_map_user_window)$' | sort -u)"
@@ -250,7 +250,7 @@ fi
 # das falsch, laege die Identitaet wirklich in der Schnittstelle und der Punkt waere unbehebbar.
 # Also wird versucht, ihn zu widerlegen: im `SYS_MAP`-Zweig darf die Basis NICHT aus dem Frame
 # gelesen werden, sondern muss aus der aufgeloesten Cap stammen.
-MK="crates/sel4lake-microkit/src/lib.rs"
+MK="crates/caprock-microkit/src/lib.rs"
 if [ ! -f "$MK" ]; then
     nok "$MK fehlt -- der Falsifikator kann nicht laufen."
 elif grep -q 'ObjectKind::Memory(r) => (r.base, r.len' "$MK"; then

@@ -6,14 +6,14 @@
 //! Paging, lädt eine 64-bit-GDT und springt nach `long_mode` (`.code64`). Dort werden Stack
 //! und `.bss` gesetzt und `x86_rust_entry` gerufen.
 //!
-//! Stufe 0 ist bewusst self-contained (kein `sel4lake-hal`): nur 16550-Serial + Banner. Die volle
+//! Stufe 0 ist bewusst self-contained (kein `caprock-hal`): nur 16550-Serial + Banner. Die volle
 //! HAL (Paging-API, IDT, APIC, Timer, Syscall, SMP) folgt in den Stufen 1–5; der Kernel-Kern
 //! (Caps/Sched/IPC/…) ist arch-agnostisch und wird schrittweise für x86_64 aktiviert.
 
 use core::arch::{asm, global_asm};
 
 // ext-31: Paging/IDT/LAPIC/GDT/Syscall/Context sind in die HAL gewandert
-// (`sel4lake-hal::x86_64`) — dort stehen sie hinter derselben API wie ihre ARM-Pendants,
+// (`caprock-hal::x86_64`) — dort stehen sie hinter derselben API wie ihre ARM-Pendants,
 // sodass der Kernel-Kern sie ohne `cfg` benutzt. Hier bleibt nur das Boot-Trampolin.
 mod bootinfo;
 mod bringup;

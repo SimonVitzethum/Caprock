@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 
 N="${1:-30}"
 TMO="${2:-40}"
-ELF="build/target/aarch64-sel4lake/release/sel4lake-kernel.elf"
+ELF="build/target/aarch64-caprock/release/caprock-kernel.elf"
 
 # Default: RELEASE-Build OHNE Fuzzer (Langzeittest-/Produktivkonfiguration, ADR 0013). Mit
 # `KERNEL_FUZZ=1` wird `--features kernel-fuzz` gebaut (Deadlock-Regression inkl. Fuzzer).
@@ -28,8 +28,8 @@ mkdir -p build
 # ext-27-Tests (Dienst nicht im Archiv) und der Selbsttest erreicht NIE SELFTEST COMPLETE (= "Hang").
 ( cd tests && rustup run nightly cargo build --release ) >/dev/null 2>&1 \
     || { echo "TESTS BUILD FAILED"; exit 1; }
-HELLO="programs/build/target/aarch64-sel4lake-user/release/hello.elf"
-TBIN="tests/build/target/aarch64-sel4lake-user/release"
+HELLO="programs/build/target/aarch64-caprock-user/release/hello.elf"
+TBIN="tests/build/target/aarch64-caprock-user/release"
 printf 'PLACEHOLDER' > build/_probe.bin
 python3 tools/mkarchive.py build/boot-archive.bin \
     10:hello:2:1:"$HELLO" 11:hwhello:1:1:"$HELLO" 12:trusted-x:0:1:"$HELLO" 2:probe:2:1:build/_probe.bin \

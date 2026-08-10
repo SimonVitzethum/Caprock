@@ -1,0 +1,19 @@
+# Runtime-Speicherabstraktion (ext-25): RegionView + Hybrid-Allokator (Slabs + Bump-Arenen).
+#
+# Die EINZIGE Crate mit `unsafe`-Speicherzugriff im Userland-Pfad — klar auditierbar.
+# Die oeffentliche API ist vollstaendig Safe Rust; alle rohen Zeiger bleiben hier gekapselt.
+[package]
+name = "caprock-region"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+caprock-mem = { path = "../caprock-mem" }
+caprock-sync = { path = "../caprock-sync" }
+
+# `kani` ist ein externes cfg (Tier-1-Verifikation; nur unter `cargo kani` gesetzt, im Normalbuild
+# inert). Als erwartetes cfg deklarieren -> kein `unexpected_cfgs`-Warning (Rust >= 1.80).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

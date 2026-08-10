@@ -1,4 +1,4 @@
-# SEL4Lake — adversariale externe Testdienste (ext-27)
+# Caprock — adversariale externe Testdienste (ext-27)
 
 Dieser **eigene** Cargo-Workspace (getrennt vom Kernel **und** von `programs/`) baut die
 **adversarialen Testdienste**: extern gebaute, statisch gelinkte `ET_EXEC`-ELF64-EL0-Programme,
@@ -12,9 +12,9 @@ Syscall-ABI an und beweisen so empirisch die Isolations-Invarianten (Architektur
 cd tests && cargo build --release
 ```
 
-Erzeugt die ELFs unter `tests/build/target/aarch64-sel4lake-user/release/<name>.elf` (eigene
+Erzeugt die ELFs unter `tests/build/target/aarch64-caprock-user/release/<name>.elf` (eigene
 Target-Spec/Linker wie `programs/`). `test-qemu.sh` legt sie per `tools/mkarchive.py` ins
-Boot-Archiv (Domäne pro Eintrag). Einzige Abhängigkeit: das SDK `../programs/libsel4lake`.
+Boot-Archiv (Domäne pro Eintrag). Einzige Abhängigkeit: das SDK `../programs/libcaprock`.
 
 ## Beobachtungsprotokoll — „der Dienst ist sein eigener Richter"
 

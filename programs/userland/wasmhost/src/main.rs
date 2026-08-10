@@ -191,8 +191,8 @@ const MODUL_UEBERGRIFF: &[u8] = &[
 
 fn melde(slot: u64, badge: u64) {
     // Die Kopie traegt das Badge; das Nachrichtenwort spielt bei SIGNAL keine Rolle (s. `init`).
-    if libsel4lake::ccopy(NTFN, slot, W, badge) == libsel4lake::result::OK {
-        libsel4lake::signal(slot, 0);
+    if libcaprock::ccopy(NTFN, slot, W, badge) == libcaprock::result::OK {
+        libcaprock::signal(slot, 0);
     }
 }
 
@@ -215,7 +215,7 @@ pub extern "C" fn _start(_arg: usize) -> ! {
     //     Notification mit ihrem Lader-Badge; ein `signal` darauf belegt „ich laufe und kann
     //     signalisieren". Muss VOR allem anderen stehen -- eine Sprechprobe hinter dem
     //     geprueften Pfad ist keine.
-    libsel4lake::signal(NTFN, 0);
+    libcaprock::signal(NTFN, 0);
 
     // 0b. **Sprechprobe fuer den Cap-Pfad.** Eine Kopie mit eigenem Badge, bevor die Engine
     //     ueberhaupt anlaeuft. Damit ist „ccopy geht nicht" von „die Engine kommt nicht durch"
@@ -242,5 +242,5 @@ pub extern "C" fn _start(_arg: usize) -> ! {
         melde(N_TRAP, WASM_TRAP);
     }
 
-    libsel4lake::exit();
+    libcaprock::exit();
 }

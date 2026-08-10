@@ -5,7 +5,7 @@
 //! `trusted_keys.rs`: ein Zertifikat bezeugt die Herkunft eines Binaries, ein Manifest die
 //! Zuteilung der ganzen Maschine. Wer das eine darf, darf nicht automatisch das andere.
 
-use sel4lake_trust::TrustedKey;
+use caprock_trust::TrustedKey;
 
 /// Akzeptierte oeffentliche Manifest-Root-Schluessel (per `key_id` referenziert).
 pub static MANIFEST_KEYS: &[TrustedKey] = &[

@@ -31,8 +31,8 @@ else
     echo "== Beschleunigung: TCG (kein /dev/kvm) =="
 fi
 
-KELF=build/target/x86_64-unknown-none/release/sel4lake-kernel
-PROG=programs/build/target/x86_64-sel4lake-user/release
+KELF=build/target/x86_64-unknown-none/release/caprock-kernel
+PROG=programs/build/target/x86_64-caprock-user/release
 MANKEY=keys/manifest-test.manifest.ed25519
 
 python3 -c "import cryptography" 2>/dev/null || {
@@ -58,8 +58,8 @@ echo "== build (Kernel, --features selftest) =="
 # die B fuer test-qemu-x86.sh eingezogen hat.
 ./build-x86.sh --features selftest >/dev/null 2>&1 || { echo "BUILD FAILED (Kernel)"; exit 1; }
 
-echo "== build (Programme, x86_64-sel4lake-user) =="
-( cd programs && rustup run nightly cargo build --release --target x86_64-sel4lake-user.json ) \
+echo "== build (Programme, x86_64-caprock-user) =="
+( cd programs && rustup run nightly cargo build --release --target x86_64-caprock-user.json ) \
     >/dev/null 2>&1 || { echo "BUILD FAILED (Programme)"; exit 1; }
 
 echo "== zertifizieren (TrustedSAS: init) =="
@@ -143,7 +143,7 @@ BLK_PART1_LBA=34
 BLK_PART1_SECTORS=19967
 python3 tools/mkgpt.py "$BLK_IMG" --sectors "$BLK_SECTORS" \
     --part "$BLK_PART1_LBA:20000" --part 20001:32700 --magic-at 20001 \
-    --fat16 "$BLK_PART1_LBA:20000" --file "HELLO.TXT=SEL4LAKE-DATEIINHALT" \
+    --fat16 "$BLK_PART1_LBA:20000" --file "HELLO.TXT=CAPROCKS-DATEIINHALT" \
     || { echo "  FEHLER: GPT-Abbild liess sich nicht bauen"; exit 2; }
 
 # --- Das Boot-Image: Kernel + EINE Datei ---------------------------------------------------------
@@ -425,7 +425,7 @@ check "blkdev  : ALL PASS" \
 # Der Rueckleseschritt einzeln, weil er die eigentliche Aussage traegt: eine quittierte
 # Schreibanfrage ist eine Quittung, keine Daten. Faellt nur er aus, ist das ein Befund am
 # Schreibpfad -- und kein Sammel-FAIL, dem man nicht ansieht, welcher Schritt riss.
-if grep -q "blkdev  : .*Rueckgelesen=0x454b414c344c4553 (erwartet 0x454b414c344c4553)" <<<"$OUT"; then
+if grep -q "blkdev  : .*Rueckgelesen=0x534b434f52504143 (erwartet 0x534b434f52504143)" <<<"$OUT"; then
     echo "  PASS: A-6.1: geschrieben und ZURUECKGELESEN -- die Daten stehen wirklich auf der Platte, nicht bloss in einer Quittung"
 else
     echo "  FAIL: A-6.1: das Zurueckgelesene passt nicht zum Geschriebenen:"
@@ -434,7 +434,7 @@ else
 fi
 # A-6.2: die Partitionstabelle -- gelesen im Blockdienst, nicht im Kern.
 check "part    : ALL PASS" \
-    "A-6.2: GPT im BLOCKDIENST gelesen (sel4lake-part: abhaengigkeitsfrei, forbid(unsafe_code), host-getestet). Beide Pruefsummen geprueft; die Eintragsliste passt nicht in eine Anfrage und wird stueckweise gelesen, die Pruefsumme aber ueber das GANZE gebildet"
+    "A-6.2: GPT im BLOCKDIENST gelesen (caprock-part: abhaengigkeitsfrei, forbid(unsafe_code), host-getestet). Beide Pruefsummen geprueft; die Eintragsliste passt nicht in eine Anfrage und wird stueckweise gelesen, die Pruefsumme aber ueber das GANZE gebildet"
 if grep -q "part    : .*erste Partition LBA $BLK_PART1_LBA ueber $BLK_PART1_SECTORS Sektoren" <<<"$OUT"; then
     echo "  PASS: A-6.2: die gemeldete erste Partition passt zu der, die diese Suite ins Abbild geschrieben hat (LBA $BLK_PART1_LBA, $BLK_PART1_SECTORS Sektoren)"
 else
@@ -444,10 +444,10 @@ else
 fi
 # A-6.3: das Dateisystem -- eine EIGENE PD, die kein Geraet faehrt.
 check "fs      : ALL PASS" \
-    "A-6.3: ein lesendes Dateisystem als eigene PD -- sie ruft den Blockdienst ueber dessen Kanal und liest die Bytes aus der geteilten Uebertragungsflaeche. GPT (sel4lake-part) und FAT16 (sel4lake-fat) sind kernfrei und forbid(unsafe_code); der Kern kennt weder Partitionen noch Dateien"
+    "A-6.3: ein lesendes Dateisystem als eigene PD -- sie ruft den Blockdienst ueber dessen Kanal und liest die Bytes aus der geteilten Uebertragungsflaeche. GPT (caprock-part) und FAT16 (caprock-fat) sind kernfrei und forbid(unsafe_code); der Kern kennt weder Partitionen noch Dateien"
 # Der Inhalt einzeln, weil er die eigentliche Aussage traegt: eine gefundene Datei ist noch keine
 # gelesene. Groesse UND erste Bytes muessen zu dem passen, was `tools/mkgpt.py --file` hineinlegt.
-if grep -q "fs      : Status=0 .*Groesse=20 erste acht Byte=0x454b414c344c4553" <<<"$OUT"; then
+if grep -q "fs      : Status=0 .*Groesse=20 erste acht Byte=0x534b434f52504143" <<<"$OUT"; then
     echo "  PASS: A-6.3: die Datei wurde nicht bloss GEFUNDEN, sondern GELESEN -- Groesse und Inhalt passen zu dem, was diese Suite ins Dateisystem geschrieben hat"
 else
     echo "  FAIL: A-6.3: Groesse oder Inhalt der gelesenen Datei passen nicht:"

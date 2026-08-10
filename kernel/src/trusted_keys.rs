@@ -4,7 +4,7 @@
 //! kompiliert, NICHT per Syscall aenderbar. Erweiterung/Rotation/Revocation nur durch erneutes
 //! Generieren + Neukompilieren (Firmware-/Kernel-Update). Private Schluessel liegen NIE hier.
 
-use sel4lake_trust::TrustedKey;
+use caprock_trust::TrustedKey;
 
 /// Akzeptierte oeffentliche Root-Schluessel (per `key_id` referenziert).
 pub static TRUSTED_KEYS: &[TrustedKey] = &[

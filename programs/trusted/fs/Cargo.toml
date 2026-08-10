@@ -21,6 +21,6 @@ name = "fs"
 path = "src/main.rs"
 
 [dependencies]
-libsel4lake = { path = "../../libsel4lake" }
-sel4lake-part = { path = "../../../crates/sel4lake-part" }
-sel4lake-fat = { path = "../../../crates/sel4lake-fat" }
+libcaprock = { path = "../../libcaprock" }
+caprock-part = { path = "../../../crates/caprock-part" }
+caprock-fat = { path = "../../../crates/caprock-fat" }

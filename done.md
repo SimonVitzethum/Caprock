@@ -1,4 +1,4 @@
-# SEL4Lake — erledigte Punkte
+# Caprock — erledigte Punkte
 
 Ausgelagert aus [todo.md](todo.md), damit dort nur steht, was noch zu tun ist.
 
@@ -732,7 +732,7 @@ angestossen:
 * `hal::mmu::vspace_map_dma` stand in seiner Funktionsliste **gar nicht**. Der DMA-Pfad einer
   Treiber-PD bildet identisch ab, und der Waechter sah ihn nie -- eine Textflaeche ueber einem
   Loch.
-* der Grundtext zu `SYS_MAP` war **falsch**. Er sagte „das ist die ABI". `sel4lake_abi::sys::MAP`
+* der Grundtext zu `SYS_MAP` war **falsch**. Er sagte „das ist die ABI". `caprock_abi::sys::MAP`
   traegt aber **kein Adressargument**: der Aufrufer nennt eine Cap, und die Basis kommt aus
   `ObjectKind::Memory(r).base` -- aus der Cap-Aufloesung IM KERNEL. Die Identitaet liegt damit in
   einer Entscheidung des Kernels und ist behebbar, **ohne die ABI anzufassen** (der Rueckgabewert
@@ -971,7 +971,7 @@ Gemessen, nachdem der alte Behelf entfernt war: nicht nur `dmawin`/`dmatok`/`iso
 sondern der ganze Ladepfad — `drv`, `blkdev`, `fs`, `part` reihenweise rot, die Treiber-PD kam gar
 nicht hoch.
 
-**Die Behebung, zweiteilig.** (1) `sel4lake_mem::alloc_below`/`alloc_colored_below` nehmen eine
+**Die Behebung, zweiteilig.** (1) `caprock_mem::alloc_below`/`alloc_colored_below` nehmen eine
 Obergrenze; gesucht wird nur unter Fragmenten, die sie erfuellen koennen, und ein Fragment ueber
 die Grenze hinweg wird an ihr **beschnitten** statt verworfen. Best-Fit vergleicht dabei den
 **nutzbaren** Teil, nicht die Fragmentlaenge — sonst gewaenne ein riesiges Fragment, von dem nur
@@ -1057,8 +1057,8 @@ Messfenster, sah eine bilanzneutrale Operation aus wie ein Gewinn. Ersetzt durch
 frei", unabhängig von fremder Nebenläufigkeit. Ein Test, der aus fremdem Grund fehlschlägt, ist so
 wenig wert wie einer, der nicht fehlschlagen kann.
 
-**Wo die Arithmetik geprüft wird.** Farb- und Allokatorlogik liegen in `sel4lake-mem` und sind
-reine Rechnung ohne Hardware — 13 Host-Unit-Tests (`rustc --test crates/sel4lake-mem/src/lib.rs`,
+**Wo die Arithmetik geprüft wird.** Farb- und Allokatorlogik liegen in `caprock-mem` und sind
+reine Rechnung ohne Hardware — 13 Host-Unit-Tests (`rustc --test crates/caprock-mem/src/lib.rs`,
 Laufzeit 0,00 s; der Umweg über `cargo` würde wegen `build-std` die halbe Standardbibliothek
 übersetzen). Darunter ein **Sensitivitätstest**: ohne Maske muss die Eigenschaft umfallen. Ohne
 ihn könnte der Disjunktheitstest grün sein, weil die Anordnung es zufällig hergibt, statt weil die
@@ -1081,7 +1081,7 @@ eine zweite Fassung im Testmodul hätte am Ende nur die eigene Arithmetik bestä
 
 ## C. Flexible Kapazitäten — **weitgehend erledigt** (ext-30)
 
-- [x] **C1** Neue Crate `sel4lake-slab` (`Slab`/`AtomicTable`/`FreeList`); Thread-Directory,
+- [x] **C1** Neue Crate `caprock-slab` (`Slab`/`AtomicTable`/`FreeList`); Thread-Directory,
       per-Kern-TCB-Tabellen, FP-Kontexte, `VSPACE_OF`, Kernel-Stack-Zuordnung **und** die
       Sekundär-Stacks kommen beim Boot aus dem RAM (`system::configure`).
 
@@ -1265,7 +1265,7 @@ das Gerät den Anfragekopf **nicht einmal gelesen** hat, und nicht bloß, dass k
 ### Warum der Inhalt geprüft wird und nicht die Länge
 
 Ein Puffer voller Nullen ist von einem nie beschriebenen Puffer nicht zu unterscheiden — und ein
-frisches Plattenabbild besteht genau daraus. Die Suite legt deshalb eine Magie („SEL4LAKE") in
+frisches Plattenabbild besteht genau daraus. Die Suite legt deshalb eine Magie („CAPROCK") in
 Sektor 0. Die **Kapazität** ist die zweite, unabhängige Aussage: sie kommt aus dem
 gerätespezifischen Konfigurationsraum (`VIRTIO_PCI_CAP_DEVICE_CFG`), den der RNG nicht hat und der
 deshalb bis hierher nirgends aufgelöst wurde. Steht dort Müll, ist die Capability falsch
@@ -1354,7 +1354,7 @@ auf genau eine Seite. Eine Funktion ist mappbar, ohne die Nachbarn mitzugeben.
 
 Damit fällt die Aufteilung anders und besser aus: der Kern behält die **Enumeration** (welches
 Gerät gibt es, wer bekommt es), der Treiber macht seinen **Capability-Lauf** auf seiner eigenen
-Seite. `sel4lake_virtio::probe_ecam` ist dafür da — und die HAL ruft **dieselbe** Routine auf, statt
+Seite. `caprock_virtio::probe_ecam` ist dafür da — und die HAL ruft **dieselbe** Routine auf, statt
 eine zweite Fassung davon zu halten.
 
 ### Zwei Aussagen aus zwei Quellen
@@ -1615,7 +1615,7 @@ Dazu **14 von 14** Host-Tests des Parsers (Sekunden, über `rustc --test`, nicht
 
 Eine Partitionstabelle sind **fremde Bytes auf einer Platte**, die ein beliebiger Mandant
 geschrieben haben kann. Sie mit Kernprivileg zu interpretieren ist genau die Klasse Fehler, die man
-dort nicht haben will. `sel4lake-part` hängt deshalb an nichts, ist `forbid(unsafe_code)`, und wird
+dort nicht haben will. `caprock-part` hängt deshalb an nichts, ist `forbid(unsafe_code)`, und wird
 vom **Blockdienst** gelinkt — der außerhalb des Kerns läuft (A-5.1).
 
 Dass ein Blockdienst Partitionen meldet, ist dabei nichts Ungewöhnliches: das ist die Aufgabe einer
@@ -1720,7 +1720,7 @@ gewesen, die PD nach UserLand zu verschieben (kein Zertifikat nötig) — und da
 umgehen, statt ihr zu folgen.
 
 Der richtige Ausweg war, das `unsafe` **dorthin zu legen, wo es hingehört**: ins auditierte SDK,
-das ohnehin auf der Allowlist steht. `libsel4lake::Window` ist die Kapsel — er entsteht **nur** aus
+das ohnehin auf der Allowlist steht. `libcaprock::Window` ist die Kapsel — er entsteht **nur** aus
 `map_window` (also aus Basis und Länge, die der Kernel gerade selbst gemappt hat), seine Felder sind
 privat, und **jeder** Zugriff wird gegen die Länge geprüft, mit geprüfter Addition. Dieselbe Bauart
 wie `Verified` im Manifest-Parser: die Bedingung trägt der Typ, nicht die Disziplin des Aufrufers.
@@ -1872,11 +1872,11 @@ Genau deshalb muss die Aussage einzeln dastehen.
 
 ---
 
-## A1-Rest. `sel4lake_mem::stripe` rechnete über 64 Bit statt über die Farben
+## A1-Rest. `caprock_mem::stripe` rechnete über 64 Bit statt über die Farben
 
 **Erledigt 2026-08-02** (parallel bearbeitet, Ergebnis hier integriert).
 
-CLAUDE.md führte das seit dem 2026-08-01 als offen: „`sel4lake_mem::stripe` hat denselben Fehler".
+CLAUDE.md führte das seit dem 2026-08-01 als offen: „`caprock_mem::stripe` hat denselben Fehler".
 Es stimmte — und der Fehler war schlimmer als die Notiz vermuten ließ.
 
 ### Gemessen, nicht argumentiert
@@ -2015,7 +2015,7 @@ Lock-Logik". Zeile für Zeile geprüft waren die Ordnungen **heute** sogar ident
 kein Trost, sondern der Punkt: **nichts hielt sie zusammen**. Eine geänderte Ordnung im echten Lock
 hätte den Beweis nicht gestreift.
 
-Jetzt übernimmt `tools/loom-verify.sh` `crates/sel4lake-sync/src/lib.rs` **unverändert**; die
+Jetzt übernimmt `tools/loom-verify.sh` `crates/caprock-sync/src/lib.rs` **unverändert**; die
 Beweise stehen in derselben Datei (`#[cfg(all(loom, test))] mod loom_proofs`), wie die
 Kani-Beweise auch. Vier cfg-Schalter genügen: `no_std` nur ohne Loom, Atomics und `UnsafeCell` aus
 `loom`, und ein `spin_hint()`, das unter Loom `yield_now()` ist (Looms Threads laufen kooperativ —
@@ -2078,7 +2078,7 @@ einer Zeile sichtbar.
 
 **Erledigt 2026-08-02** (parallel bearbeitet, integriert und selbst nachgemessen).
 
-Die Notiz sagte: „Kani läuft nur im CI-Gate; die ext-29-Änderung an `sel4lake-sync` ist dort nicht
+Die Notiz sagte: „Kani läuft nur im CI-Gate; die ext-29-Änderung an `caprock-sync` ist dort nicht
 abgedeckt." Gemessen stimmte das **nicht**: `tools/kani-verify.sh` führt `sync` seit Längerem als
 Ziel, und die CI ruft das Skript **ohne Argumente**, also mit allen vier Zielen.
 
@@ -2115,7 +2115,7 @@ Selbst nachgemessen: **7 verified, 1 failure**, danach wieder 8/0.
 ### Der Inert-Check deckte nur eine Crate ab
 
 Er soll belegen, dass `cfg(kani)` den Normalbau nicht bricht — und kopierte dafür ausschließlich
-`sel4lake-loader`. `sel4lake-sync` trägt seit B-7.1/B-7.2 **zwei** externe cfgs (`kani` *und*
+`caprock-loader`. `caprock-sync` trägt seit B-7.1/B-7.2 **zwei** externe cfgs (`kani` *und*
 `loom`). Der Kernel-Build fängt das mit ab, aber nicht als benannte Zusicherung, und ein Schutz, den
 niemand ausspricht, fällt beim nächsten Umbau unbemerkt weg. Jetzt ist er dabei; lokal
 nachgestellt: `Finished`.
@@ -2189,7 +2189,7 @@ ohne Schranke läuft dieselbe Schleife endlos, im Kernel unter der CAPS-Sperre.
 
 ### Nebenertrag: sechs Tests, die nirgends liefen
 
-`sel4lake-cap` hatte **keinen** Host-Test-Pfad. `cargo test -p sel4lake-cap` scheitert am
+`caprock-cap` hatte **keinen** Host-Test-Pfad. `cargo test -p caprock-cap` scheitert am
 erzwungenen Custom-Target (`build-std`), und kein Skript baute die Crate außerhalb des Workspace.
 Die sechs neuen Tests wären also entstanden und nie gelaufen.
 
@@ -2212,7 +2212,7 @@ Bis dahin trägt Code 9 die Aussage.
 ## B-5.1. Die Abrechnung hing am Tick
 
 **Der Zustand vorher war schlimmer als die Notiz vermutete.** `grep cycles` in
-`crates/sel4lake-sched/`: kein Treffer. Belastet wurde ausschliesslich in `on_tick`, und auch dort
+`crates/caprock-sched/`: kein Treffer. Belastet wurde ausschliesslich in `on_tick`, und auch dort
 nur bei `tick == true`; `block_current`, `switch_to` und der YIELD-Pfad rechneten **gar nichts** ab.
 Die Verzerrung war damit nicht „bis zu 10 ms je Umplanung", sondern **vollstaendig**: ein Thread,
 der 9,9 ms rechnet und dann blockiert, zahlte **null**. Wer das systematisch tut, rechnet dauerhaft
@@ -2224,9 +2224,9 @@ Stempel beim Ein- und Auslasten erhoeht nur die Aufloesung.
 
 ### Der Schnitt: die Uhr gehoert dem Kernel, die Rechnung nicht
 
-Die Arithmetik liegt **abhaengigkeitsfrei** in `crates/sel4lake-sched/src/cycles.rs` und wird als
-Datei auf dem Host geprueft (`tools/host-tests.sh cycles`, 9 Tests). `sel4lake-sched` als Ganzes
-haengt an `sel4lake-hal` (arch-Asm) und wird auf dem Host nie bauen; laese das Modul die Uhr selbst,
+Die Arithmetik liegt **abhaengigkeitsfrei** in `crates/caprock-sched/src/cycles.rs` und wird als
+Datei auf dem Host geprueft (`tools/host-tests.sh cycles`, 9 Tests). `caprock-sched` als Ganzes
+haengt an `caprock-hal` (arch-Asm) und wird auf dem Host nie bauen; laese das Modul die Uhr selbst,
 waere jede Falle nur auf einer bestimmten Maschine ausloesbar statt mit einem Literal.
 
 ### Die drei Fallen
@@ -2435,7 +2435,7 @@ funktionierenden Kernel fuer kaputt erklaert.
 
 ### Nebenertrag am Werkzeug
 
-`sel4lake-loader` hat **49** `#[test]`s -- und lief in keinem Skript. Es gibt kein
+`caprock-loader` hat **49** `#[test]`s -- und lief in keinem Skript. Es gibt kein
 `.github/workflows/` in diesem Baum, und Kani prueft Beweise, keine `#[test]`s; das ist nicht
 dasselbe. Jetzt in `tools/host-tests.sh` (Gesamtstand: mem 22 · part 14 · fat 20 · cycles 9 ·
 loader 49 · cap 6).
@@ -2748,7 +2748,7 @@ in TrustedSAS" keine Vorsichtsmaßnahme mehr, sondern die Konsequenz einer benan
 **Beim Aufschreiben fiel eine Ungenauigkeit auf, die man leicht übernimmt:** „TrustedSAS teilt
 einen Adressraum" stimmt so nicht. `Domain::TrustedSas` ist eine Vertrauens*stufe* und darf global
 **oder** isoliert laufen (`domain_audit` verlangt Isolation nur für `HardwareLand`/`UserLand`,
-`crates/sel4lake-microkit/src/lib.rs:246–250`); **extern geladene** TrustedSAS-PDs bekommen heute
+`crates/caprock-microkit/src/lib.rs:246–250`); **extern geladene** TrustedSAS-PDs bekommen heute
 sogar immer eine eigene VSpace (`kernel/src/loader.rs:719–722`). Die Fehlerdomäne hängt also am
 **Adressraum**, nicht am Etikett — und eine Zusicherung, die das Etikett nennt, wäre in beide
 Richtungen falsch: zu streng für geladene Trusted-Dienste, zu lasch, falls je etwas anderes global
@@ -2772,14 +2772,14 @@ die **häufigsten** Fälle nicht:
 
 Die Ursache steht in zwei Zeilen: `panic.rs` ruft ein `halt()`, das die Interrupts **nicht
 maskiert** — x86 `kernel/src/arch/x86_64/mod.rs:294` ist `loop { hlt }` **ohne `cli`** (die
-HAL-Fassung `crates/sel4lake-hal/src/x86_64/cpu.rs:257` würde maskieren, der Panic-Pfad benutzt sie
+HAL-Fassung `crates/caprock-hal/src/x86_64/cpu.rs:257` würde maskieren, der Panic-Pfad benutzt sie
 nicht), aarch64 `loop { wfe }` mit unverändertem DAIF. Der nächste Timer-Tick holt den Kern in den
 Scheduler zurück.
 
 **Und für die anderen beiden Fälle stimmt der Satz — dort aber still:**
 
 * **Panic unter gehaltener `MEM`-Sperre**: das Log endet mitten im Hochlauf, kein `smp : ... online`,
-  **keine Watchdog-Zeile**, `rc=124`. Der Ticket-Lock (`crates/sel4lake-sync/src/lib.rs:170–178`)
+  **keine Watchdog-Zeile**, `rc=124`. Der Ticket-Lock (`crates/caprock-sync/src/lib.rs:170–178`)
   hat keine Schranke; `now_serving` steht für immer, und weil es ein *Ticket*-Lock ist, blockiert
   nicht nur der nächste Zieher, sondern jeder.
 * **Panic im Steuerfaden des Bootkerns**: der Knoten läuft weiter, meldet aber nie wieder etwas —
@@ -2803,7 +2803,7 @@ herstellbar — ein `panic!()` und ein Bootvorgang.
 ### Doppelfehler: es gibt keinen Wächter
 
 Ein Panic im Panic-Handler rekursiert unbegrenzt. Gemessen **362 Ebenen** auf einem 64-KiB-AP-Stack,
-**ohne** `#DF` (Vektor 8 ist in `crates/sel4lake-hal/src/x86_64/exception.rs:494` nur *benannt*, es
+**ohne** `#DF` (Vektor 8 ist in `crates/caprock-hal/src/x86_64/exception.rs:494` nur *benannt*, es
 gibt keinen IST-Stack dafür), **ohne** Schutzseite am Kernel-Stack. Der Lauf endete erst, als der
 Bootkern die Maschine abschaltete — was jenseits des Stackendes passiert wäre, ist damit **nicht**
 gemessen und steht in der Nicht-gemessen-Liste. Sichtbarer Nebeneffekt: die Ausgabe des sterbenden
@@ -2824,9 +2824,9 @@ IST; Schutzseiten; Panic-IPI, der ohne NMI genau den Fall verfehlt, den er treff
 
 ### Der ehrliche VM-Vergleich steht jetzt da, wo ein Betreiber ihn liest
 
-Ein Wirt mit 100 VMs verliert bei einem **Gastkern**-Panic einen Gast; ein SEL4Lake-Knoten hat gar
+Ein Wirt mit 100 VMs verliert bei einem **Gastkern**-Panic einen Gast; ein Caprock-Knoten hat gar
 keine Gastkernschicht — was ein Gastkern täte, tut der geteilte Kern. Der Handel in einem Satz: eine
-VM-Plattform hat *viele große* Fehlerdomänen (Größenordnung 10⁷ LOC je Mandant), SEL4Lake hat *eine
+VM-Plattform hat *viele große* Fehlerdomänen (Größenordnung 10⁷ LOC je Mandant), Caprock hat *eine
 kleine* (~18 kLOC `kernel/src`, ~36 kLOC mit `crates/`). Weniger Code kann ausfallen — aber wenn er
 ausfällt, fällt alles aus. Daraus zwei betriebliche Sätze, die vorher nirgends standen:
 **ein Knoten ist keine Redundanzeinheit** (zwei Repliken auf einem Knoten sind eine), und
@@ -3034,7 +3034,7 @@ kaputtmacht, von einem korrekten nicht zu unterscheiden. Dazu die vierte Aussage
 
 ### Z4b: was auf keinen Fall mitwandert
 
-`crates/sel4lake-cap/src/checkpoint.rs`, abhaengigkeitsfrei und host-getestet (7 Tests). Die Regel
+`crates/caprock-cap/src/checkpoint.rs`, abhaengigkeitsfrei und host-getestet (7 Tests). Die Regel
 in einem Satz: **was auf der Zielmaschine nicht dasselbe bezeichnen kann, wandert nicht mit — es
 wird verweigert, nicht ersetzt.** Der bequeme Weg waere, eine MMIO-Cap „auf das entsprechende
 Geraet drueben" abzubilden; es gibt kein entsprechendes Geraet, es gibt ein anderes.
@@ -3107,9 +3107,9 @@ ist **unveraendert**.
 
 ### Das Format
 
-`crates/sel4lake-cap/src/checkpoint.rs`, neben der Regel, die entscheidet, was hineindarf.
+`crates/caprock-cap/src/checkpoint.rs`, neben der Regel, die entscheidet, was hineindarf.
 Abhaengigkeitsfrei, ohne `unsafe`, host-getestet — fremde Bytes werden nirgends mit Kernprivileg
-interpretiert, dieselbe Linie wie `sel4lake-part`/`sel4lake-fat`.
+interpretiert, dieselbe Linie wie `caprock-part`/`caprock-fat`.
 
 | Offset | Breite | Feld |
 |---|---|---|

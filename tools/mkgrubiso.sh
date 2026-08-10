@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SEL4Lake — Boot-Image für einen ECHTEN Bootloader bauen (GRUB, Multiboot1, El-Torito-ISO).
+# Caprock — Boot-Image für einen ECHTEN Bootloader bauen (GRUB, Multiboot1, El-Torito-ISO).
 #
 # WARUM es das gibt. Bisher wird x86 ausschliesslich über QEMUs `-kernel`/`-initrd` gestartet.
 # Das ist bequem, aber es ist kein Bootloader: QEMU hat einen eingebauten Minimal-Multiboot-
@@ -22,7 +22,7 @@
 #   bash tools/mkgrubiso.sh --no-archive             # nur Kernel (Negativfall: keine Startmenge)
 #   bash tools/mkgrubiso.sh --out build/x.iso
 #
-# Danach:  qemu-system-x86_64 -cdrom build/sel4lake-grub.iso -nographic ...
+# Danach:  qemu-system-x86_64 -cdrom build/caprock-grub.iso -nographic ...
 
 if [ -z "${BASH_VERSION:-}" ]; then
     echo "FEHLER: dieses Skript braucht bash, nicht sh/dash." >&2
@@ -33,9 +33,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-KERNEL="build/target/x86_64-unknown-none/release/sel4lake-kernel.mb32"
+KERNEL="build/target/x86_64-unknown-none/release/caprock-kernel.mb32"
 ARCHIVE="build/boot-archive-x86.bin"
-OUT="build/sel4lake-grub.iso"
+OUT="build/caprock-grub.iso"
 MIT_ARCHIV=1
 
 while [ $# -gt 0 ]; do
@@ -71,7 +71,7 @@ cp "$KERNEL" "$BAUM/boot/kernel.mb32"
     echo "set timeout=0"
     echo "set default=0"
     echo ""
-    echo 'menuentry "SEL4Lake" {'
+    echo 'menuentry "Caprock" {'
     echo "    multiboot /boot/kernel.mb32"
 } > "$BAUM/boot/grub/grub.cfg"
 

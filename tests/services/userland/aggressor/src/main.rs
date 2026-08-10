@@ -16,7 +16,7 @@
 #![no_std]
 #![no_main]
 
-use libsel4lake::{exit, invoke, result, sys};
+use libcaprock::{exit, invoke, result, sys};
 
 /// Erfolgs-Badge "AGRU" (muss zum Kernel-Test `AGGRU_SUCCESS` passen).
 pub const SUCCESS_BADGE: u64 = 0x4147_5255;
@@ -74,7 +74,7 @@ pub extern "C" fn _start(_arg: usize) -> ! {
     // Erfolg melden — NUR wenn jeder einzelne Angriff korrekt abgewiesen wurde. signal() nutzt den
     // Cap-Badge (SUCCESS_BADGE), das x2-Argument ist irrelevant.
     if ok {
-        libsel4lake::signal(REPORT, SUCCESS_BADGE);
+        libcaprock::signal(REPORT, SUCCESS_BADGE);
     }
     exit();
 }

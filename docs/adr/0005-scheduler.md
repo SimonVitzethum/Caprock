@@ -3,7 +3,7 @@
 **Status:** umgesetzt + verfeinert · **Datum:** 2026-06-23
 
 > **Umsetzungsstand:** Pro-Kern-Bitmap-Scheduler (Ansatz B) mit fester Affinität
-> ist implementiert (`sel4lake-sched`): präemptiv, O(1)-Auswahl,
+> ist implementiert (`caprock-sched`): präemptiv, O(1)-Auswahl,
 > `block`/`unblock`/`switch_to`, `exit`/`kill`/`reap`. **FP-Kontext: eager**
 > (volles q0..q31-Save/Restore im Trap-Pfad). **Lazy-FP wurde versucht und
 > verworfen** — `CPACR`-Trapping bei EL1 trappt auch den NEON-Code des Kernels

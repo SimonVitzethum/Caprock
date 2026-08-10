@@ -48,7 +48,7 @@ bewusst und in der Architektur dokumentiert.
 ### 1. Externe Dienste in eigenem `tests/`-Workspace, geladen wie Drittsoftware
 Die sechs Dienste liegen in `tests/services/{userland,hardware,trusted}/` — ein **eigener**
 Cargo-Workspace, getrennt von `programs/` (legitime Programme) und vom Kernel. Sie hängen **nur**
-vom SDK `programs/libsel4lake` ab (kein Kernel-Workspace), bauen mit derselben Target-Spec/Linker
+vom SDK `programs/libcaprock` ab (kein Kernel-Workspace), bauen mit derselben Target-Spec/Linker
 und werden per `tools/mkarchive.py` ins Boot-Archiv gelegt — **nicht** Teil des Kernel-Images. Die
 Domäne jedes Dienstes legt der **Archiv-Eintrag** fest (nicht das Binary), sodass dieselbe
 Angriffslogik domänen-übergreifend instanziiert werden kann.
@@ -98,7 +98,7 @@ Canary intakt = Isolation bewiesen, für jedes (Angreifer-Domäne, Opfer-Domäne
 - **Klare Abgrenzung dokumentiert:** Cap-/CDT-Angriffe bleiben in-Kernel (nicht ABI-ausdrückbar);
   ext-27 deckt die ABI- + Hardware-Isolations-Fläche ab.
 - **Wiederverwendbar:** neue Dienste = neues Crate in `tests/services/` + Archiv-Eintrag + ein
-  Idle-Manager-Schritt. Das SDK `libsel4lake` trägt die gemeinsame Angriffslogik.
+  Idle-Manager-Schritt. Das SDK `libcaprock` trägt die gemeinsame Angriffslogik.
 
 ## Alternativen (verworfen)
 

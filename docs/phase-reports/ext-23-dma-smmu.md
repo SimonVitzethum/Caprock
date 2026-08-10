@@ -61,10 +61,10 @@ Testlauf leistet Level 1.
 
 ## Neue/erweiterte Komponenten
 
-- `crates/sel4lake-cap/src/{object.rs,space.rs}`: `Dma`-Variante, `install_dma`, `for_each_dma`,
+- `crates/caprock-cap/src/{object.rs,space.rs}`: `Dma`-Variante, `install_dma`, `for_each_dma`,
   `delete_leaf`-Dma-Arm (`free_region`).
-- `crates/sel4lake-microkit/src/lib.rs`: `kind_is_hardware`(Dma), `Caps::dma_audit`.
-- `crates/sel4lake-hal/src/{mmu.rs,gic.rs}` + neu `pcie.rs`, `smmu.rs`, `virtio.rs`.
+- `crates/caprock-microkit/src/lib.rs`: `kind_is_hardware`(Dma), `Caps::dma_audit`.
+- `crates/caprock-hal/src/{mmu.rs,gic.rs}` + neu `pcie.rs`, `smmu.rs`, `virtio.rs`.
 - `kernel/src/system.rs`: `DmaEnforcer`/`SmmuV3Enforcer`, `install_dma_cap`, `alloc_dma_region`,
   `map_dma_into_thread`, `revoke_dma`, `dma_enable/disable`, `dma_addr_in_region`, `dma_audit`,
   `pcie_find_virtio`, `virtio_rng_dma_demo`, SMMU-Bindungstabelle.

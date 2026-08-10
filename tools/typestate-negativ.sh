@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # **Der Descriptor-Typestate muss WIRKEN, nicht dastehen** (todo E).
 #
-# `Owned<Driver>` / `Owned<Device>` in `crates/sel4lake-virtio/src/owned.rs` behaupten: ein Puffer,
+# `Owned<Driver>` / `Owned<Device>` in `crates/caprock-virtio/src/owned.rs` behaupten: ein Puffer,
 # der dem Geraet uebergeben wurde, ist im Treibercode nicht mehr adressierbar, bis das Geraet ihn
 # zurueckgibt. Eine Behauptung ueber den Uebersetzer ist so lange wertlos, wie niemand den
 # Uebersetzer gefragt hat.
@@ -19,7 +19,7 @@
 # dieselbe Falle wie die leere Event-Queue: eine Aussage sieht wahr aus, weil der Fall, der sie
 # widerlegen koennte, nie laeuft.
 #
-# **Warum kein `trybuild`:** das waere eine Abhaengigkeit, und `sel4lake-virtio` hat KEINE. Das ist
+# **Warum kein `trybuild`:** das waere eine Abhaengigkeit, und `caprock-virtio` hat KEINE. Das ist
 # Absicht (A-5.1: die Crate wird von einer Userland-Treiber-PD gelinkt), nicht Sparsamkeit.
 if [ -z "${BASH_VERSION:-}" ]; then echo "FEHLER: braucht bash, nicht sh/dash." >&2; exit 2; fi
 set -uo pipefail
@@ -30,16 +30,16 @@ trap 'rm -rf "$TMP"' EXIT
 RUSTC="rustup run nightly rustc"
 fail=0
 
-QUELLE="$ROOT/crates/sel4lake-virtio/src/lib.rs"
+QUELLE="$ROOT/crates/caprock-virtio/src/lib.rs"
 if [ ! -f "$QUELLE" ]; then
     echo "  FEHLT: $QUELLE ist nicht vorhanden -- Ziel nicht gelaufen (kein Uebersetzungsfehler)"
     exit 1
 fi
 
 # Die Crate einmal als rlib bauen. `no_std` als rlib braucht keinen Panic-Handler.
-if ! $RUSTC --edition 2021 --crate-type rlib --crate-name sel4lake_virtio \
-        "$QUELLE" -o "$TMP/libsel4lake_virtio.rlib" 2>"$TMP/lib.err"; then
-    echo "  FEHLER: sel4lake-virtio uebersetzt selbst nicht -- der Negativtest kann nichts aussagen"
+if ! $RUSTC --edition 2021 --crate-type rlib --crate-name caprock_virtio \
+        "$QUELLE" -o "$TMP/libcaprock_virtio.rlib" 2>"$TMP/lib.err"; then
+    echo "  FEHLER: caprock-virtio uebersetzt selbst nicht -- der Negativtest kann nichts aussagen"
     head -20 "$TMP/lib.err"
     exit 1
 fi
@@ -49,7 +49,7 @@ fi
 kopf() {
     cat <<'EOF'
 #![no_std]
-extern crate sel4lake_virtio as v;
+extern crate caprock_virtio as v;
 use v::{Owned, Driver, Device, Region};
 
 /// Ein Stellvertreter fuer `Queue::arm`: er nimmt den Puffer `by value` und gibt ihn als
@@ -64,7 +64,7 @@ EOF
 
 pruefe() { # $1 = Name, $2 = erwarteter Fehlercode ("" = muss uebersetzen), $3 = Datei
     local name="$1" code="$2" datei="$3"
-    if $RUSTC --edition 2021 --crate-type rlib --extern sel4lake_virtio="$TMP/libsel4lake_virtio.rlib" \
+    if $RUSTC --edition 2021 --crate-type rlib --extern caprock_virtio="$TMP/libcaprock_virtio.rlib" \
             "$datei" -o "$TMP/out.rlib" >"$TMP/o.err" 2>&1; then
         if [ -z "$code" ]; then
             echo "  PASS  $name -- uebersetzt (Positivkontrolle)"

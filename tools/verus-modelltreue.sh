@@ -3,7 +3,7 @@
 #
 # Der Verus-Beweis in `Verification/capability-system/proofs/cap_space.rs` gilt an einem MODELL,
 # nicht am Code: Verus braucht seinen eigenen Dialekt, also ist die Beziehung zwischen
-# `crates/sel4lake-cap/src/space.rs::unlink` und den Spezifikationen `unlink1`/`unlink2`/
+# `crates/caprock-cap/src/space.rs::unlink` und den Spezifikationen `unlink1`/`unlink2`/
 # `unlink_slots` zwangslaeufig eine **Uebertragung**.
 #
 # Bis hierher war diese Uebertragung eine BEHAUPTUNG (README §11/§12: „Modell-Treue ... eine
@@ -25,7 +25,7 @@ if [ -z "${BASH_VERSION:-}" ]; then echo "FEHLER: braucht bash, nicht sh/dash." 
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-CODE_STD="$ROOT/crates/sel4lake-cap/src/space.rs"
+CODE_STD="$ROOT/crates/caprock-cap/src/space.rs"
 MODELL_STD="$ROOT/Verification/capability-system/proofs/cap_space.rs"
 
 # ------------------------------------------------------------------------------------------------
@@ -287,7 +287,7 @@ case "$MODUS" in
     --selftest)
         selbsttest; exit $? ;;
     alles|"")
-        echo "== Modell-Treue: Verus-cap_space gegen sel4lake-cap::space =="
+        echo "== Modell-Treue: Verus-cap_space gegen caprock-cap::space =="
         pruefen "$CODE_STD" "$MODELL_STD" || { echo "== MODELL-TREUE VERLETZT ==" >&2; exit 1; }
         echo "-- Selbsttest --"
         selbsttest || { echo "== WAECHTER NICHT SPRECHFAEHIG ==" >&2; exit 1; }

@@ -1,5 +1,5 @@
 #![no_std]
-//! SEL4Lake — Speichersicherheit der **Software-`unsafe`-Stellen** (Kategorie A, ADR 0021).
+//! Caprock — Speichersicherheit der **Software-`unsafe`-Stellen** (Kategorie A, ADR 0021).
 //!
 //! Eigenständiges Kani-Verifikationsartefakt: jede hier enthaltene Funktion ist eine **getreue Kopie**
 //! der unsafe-Glue-Logik einer konkreten Kernel-Stelle (Zeile angegeben). Kani führt die **echten**
@@ -38,7 +38,7 @@ pub fn round_up_4k(memsz: u64) -> u64 {
 }
 
 // ===========================================================================
-// Stelle 2: crates/sel4lake-region/src/heap.rs  (heap.rs:106 read, heap.rs:175 write)
+// Stelle 2: crates/caprock-region/src/heap.rs  (heap.rs:106 read, heap.rs:175 write)
 //   Intrusive Slab-Free-Liste: ein freier Slot trägt in seinen ersten Bytes den Zeiger auf den
 //   nächsten freien Slot. `slab_alloc` liest ihn (`read`), `deallocate` schreibt ihn (`write`).
 //   Vorbedingung: der Slot ist >= eine Größenklasse groß (kleinste = 16 B) und größen-ausgerichtet

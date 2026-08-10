@@ -13,7 +13,7 @@
 #
 # `Verification/scheduler/proofs/runqueue.rs` ist etwas anderes. Das Modell ist ein abstraktes
 # Einkern-Mitgliedschaftsmodell: `Seq<Thread>` mit einem `in_ready`-**Flag**, sieben Uebergaenge,
-# keine Zeit, keine Prioritaeten, keine Donation, keine Migration. `crates/sel4lake-sched/src/lib.rs`
+# keine Zeit, keine Prioritaeten, keine Donation, keine Migration. `crates/caprock-sched/src/lib.rs`
 # hat 20 TCB-Felder, intrusive doppelt verkettete Listen je Prioritaet, eine Bitmap, MCS-Perioden,
 # Budget-Donation, ein lock-freies Thread-Directory und Zombies. Wer beides auf **dieselbe**
 # Ereignisfolge reduziert und Gleichheit verlangt, bekommt entweder einen Waechter, der immer rot
@@ -162,7 +162,7 @@ if [ -z "${BASH_VERSION:-}" ]; then echo "FEHLER: braucht bash, nicht sh/dash." 
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-CODE_STD="$ROOT/crates/sel4lake-sched/src/lib.rs"
+CODE_STD="$ROOT/crates/caprock-sched/src/lib.rs"
 MODELL_STD="$ROOT/Verification/scheduler/proofs/runqueue.rs"
 
 # Der Selbsttest arbeitet ausschliesslich auf KOPIEN -- die Originale werden nie beschrieben.
@@ -1568,7 +1568,7 @@ case "$MODUS" in
     --selftest)
         selbsttest; exit $? ;;
     alles|"")
-        echo "== Modell-Treue: Verus-runqueue gegen sel4lake-sched::Scheduler =="
+        echo "== Modell-Treue: Verus-runqueue gegen caprock-sched::Scheduler =="
         pruefen "$CODE_STD" "$MODELL_STD" || { echo "== MODELL-TREUE (SCHED) VERLETZT ==" >&2; exit 1; }
         echo "-- Selbsttest --"
         selbsttest || { echo "== WAECHTER NICHT SPRECHFAEHIG ==" >&2; exit 1; }

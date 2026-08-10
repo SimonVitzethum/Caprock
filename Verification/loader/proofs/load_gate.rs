@@ -1,4 +1,4 @@
-// SEL4Lake — Phase 2 (Loader), Schritt A/B: Zertifikats-Gate + Lade-Zustandsautomat.
+// Caprock — Phase 2 (Loader), Schritt A/B: Zertifikats-Gate + Lade-Zustandsautomat.
 //
 // Formale Spezifikation der Loader-SICHERHEITSLOGIK (kernel/src/loader.rs `verify_image`/
 // `verify_trusted_cert`, ADR 0014/0015): ein TrustedSAS-Image wird NUR mit gueltigem, bindendem

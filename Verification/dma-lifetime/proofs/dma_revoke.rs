@@ -1,6 +1,6 @@
-// SEL4Lake — Phase 7 (DMA-Lifetime), Schritt A/B: Revoke-Reihenfolge + Use-after-free-Sicherheit.
+// Caprock — Phase 7 (DMA-Lifetime), Schritt A/B: Revoke-Reihenfolge + Use-after-free-Sicherheit.
 //
-// Formale Spezifikation der DMA-Lebenszyklus-Kern-Invariante (kernel/sel4lake, `dma_audit` Code 4,
+// Formale Spezifikation der DMA-Lebenszyklus-Kern-Invariante (kernel/caprock, `dma_audit` Code 4,
 // `revoke_dma`, docs/invariants.md §2): eine RAM-Region, die noch in einem SMMU-/IOMMU-Kontext
 // **DMA-aktiviert** (attached) ist, darf **niemals** freigegeben sein — sonst koennte ein bus-
 // masterndes Geraet in bereits recyceltes RAM schreiben (**DMA-use-after-free**, ein direkter Bruch

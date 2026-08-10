@@ -25,7 +25,7 @@ Operation erhält die **vollständige** `cap_audit_cdt`-Invariante.
 
 ## Analyse (Ist-Stand)
 
-Reales System (`crates/sel4lake-cap/src/space.rs`): `CapSpace` = Slot-Tabelle (`Slot{used, object, mdb}`
+Reales System (`crates/caprock-cap/src/space.rs`): `CapSpace` = Slot-Tabelle (`Slot{used, object, mdb}`
 mit `mdb = {parent, first_child, next_sibling, prev_sibling}`) + Objekt-Tabelle (`Object{used, refcount,
 gen, …}`). Operationen: `install_*` (Wurzel-Cap auf neues Objekt), `copy`/`mint` (Kind ableiten,
 refcount++), `move`, `delete`/`delete_leaf`, `revoke` (Teilbaum löschen). Laufzeit-Oracle
@@ -44,7 +44,7 @@ Struktur (4-lokal+5+6) derive; Azyklizität (rank-Zertifikat) derive + allgemein
 |---|---|---|---|
 | V1 getrennte Modelle | wie Pilot: je Aspekt ein Datentyp + Invariante | einfachste Einzelbeweise | beweist **nicht**, dass *eine* Operation **alle** Invarianten zugleich erhält (Interaktionen entgehen) |
 | **V2 vereintes Modell, volle Invariante (gewählt)** | **ein** `CapSpace`-Datentyp, Invariante = **Konjunktion** aller Klauseln (Refcount + Struktur + Azyklizität); jede Operation gegen die **volle** Invariante | erfasst Operationen-Interaktionen; entspricht exakt `cap_audit_cdt`; „erste **vollständig** verifizierte Komponente" | aufwändiger (revoke über Teilbäume gegen die Konjunktion) |
-| V3 reale-Code-Annotation | `sel4lake-cap` direkt mit Verus annotieren | kein Modell↔Code-Gap | **verändert die Architektur** (Nutzer-Verbot); Verus auf den realen Fixed-Arrays + generischem Code ist deutlich aufwändiger |
+| V3 reale-Code-Annotation | `caprock-cap` direkt mit Verus annotieren | kein Modell↔Code-Gap | **verändert die Architektur** (Nutzer-Verbot); Verus auf den realen Fixed-Arrays + generischem Code ist deutlich aufwändiger |
 
 **Frage 2 — Modell vs. realer Code:** Da die Architektur unverändert bleiben soll, wird ein
 **faithful abstraktes Modell** des `CapSpace` gebaut (mirror der realen Datenstruktur + Operationen),

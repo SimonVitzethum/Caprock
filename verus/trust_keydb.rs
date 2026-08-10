@@ -1,4 +1,4 @@
-// SEL4Lake — Verus-Pilot (Tier 2), Teil 9: TrustedSAS-Key-DB-Konsistenz (`trust_audit`, ext-28).
+// Caprock — Verus-Pilot (Tier 2), Teil 9: TrustedSAS-Key-DB-Konsistenz (`trust_audit`, ext-28).
 //
 // Formale Spezifikation der `trust_audit`-Invariante (kernel/src/loader.rs, ADR 0014, Codes 2+3):
 // die read-only Key-DB ist **selbst-zertifizierend** -- fuer JEDEN Eintrag gilt

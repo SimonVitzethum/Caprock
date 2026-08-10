@@ -1,4 +1,4 @@
-# SEL4Lake — CI-Gates auf dem Server, der sie auch liest.
+# Caprock — CI-Gates auf dem Server, der sie auch liest.
 #
 # **Warum diese Datei existiert.** Bis zum 2026-08-03 lagen alle drei Gates (Kani, Loom, Verus) in
 # `.gitea/workflows/`. Der Server unter git.simonsmp.jocraft.cc:8443 ist aber **GitLab**
@@ -97,16 +97,16 @@ kani:
       set -euo pipefail
       SA="$CI_PROJECT_DIR/.tmp/loader_host"
       rm -rf "$SA"; mkdir -p "$SA/src"
-      cp crates/sel4lake-loader/src/*.rs "$SA/src/"
-      printf '[package]\nname="sel4lake-loader"\nversion="0.0.0"\nedition="2021"\n[workspace]\n[lib]\npath="src/lib.rs"\n' > "$SA/Cargo.toml"
+      cp crates/caprock-loader/src/*.rs "$SA/src/"
+      printf '[package]\nname="caprock-loader"\nversion="0.0.0"\nedition="2021"\n[workspace]\n[lib]\npath="src/lib.rs"\n' > "$SA/Cargo.toml"
       ( cd "$SA" && cargo test )
       SB="$CI_PROJECT_DIR/.tmp/sync_host"
       rm -rf "$SB"; mkdir -p "$SB/src"
-      cp crates/sel4lake-sync/src/*.rs "$SB/src/"
-      printf '[package]\nname="sel4lake-sync"\nversion="0.0.0"\nedition="2021"\n[workspace]\n[lib]\npath="src/lib.rs"\n[lints.rust]\nunexpected_cfgs = { level = "warn", check-cfg = [%s, %s] }\n' "'cfg(kani)'" "'cfg(loom)'" > "$SB/Cargo.toml"
+      cp crates/caprock-sync/src/*.rs "$SB/src/"
+      printf '[package]\nname="caprock-sync"\nversion="0.0.0"\nedition="2021"\n[workspace]\n[lib]\npath="src/lib.rs"\n[lints.rust]\nunexpected_cfgs = { level = "warn", check-cfg = [%s, %s] }\n' "'cfg(kani)'" "'cfg(loom)'" > "$SB/Cargo.toml"
       ( cd "$SB" && cargo build )
     - bash tools/kani-verify.sh
-    # Kani baut fuers Host-Ziel; dort greift in sel4lake-sync der cfg-Zweig mit
+    # Kani baut fuers Host-Ziel; dort greift in caprock-sync der cfg-Zweig mit
     # IRQ_MASKING_IMPLEMENTED = false. Ein gruenes Kani sagt ueber die IRQ-Eigenschaft NICHTS —
     # die traegt allein der Waechter zur Uebersetzungszeit, und der wird hier in BEIDE Richtungen
     # geprueft (unveraendert muss uebersetzen, mit zerstoertem cfg muss der Bau abbrechen).
@@ -116,7 +116,7 @@ kani:
 
 # ---------------------------------------------------------------------------------------------
 # Loom — alle Interleavings der Sync-Primitive. Seit B-7.2 gegen den ECHTEN
-# sel4lake-sync-Quelltext; die frueheren Kopien sind geloescht.
+# caprock-sync-Quelltext; die frueheren Kopien sind geloescht.
 # ---------------------------------------------------------------------------------------------
 loom:
   stage: gate

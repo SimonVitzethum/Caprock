@@ -17,7 +17,7 @@ Seiten-Rechte für den Kernelbereich:
 - Linker-Script liefert 4-KiB-ausgerichtete Sektionsgrenzen; der Kernelbereich
   (erste 2 MiB) wird seitengenau gemappt, der Rest per 2-MiB-/1-GiB-Blöcke.
 
-### Capability-basiertes Speichermodell — `crates/sel4lake-mem`
+### Capability-basiertes Speichermodell — `crates/caprock-mem`
 
 Reine, **unsafe-freie** Arithmetik über physische Regionen (ADR 0003):
 
@@ -77,7 +77,7 @@ W^X + alle 8 Kerne booten weiterhin; Timer-Ticks auf allen Kernen.
 
 ## Unsafe-Bilanz
 
-- `sel4lake-mem`: **0 unsafe** (reine Region-Arithmetik).
+- `caprock-mem`: **0 unsafe** (reine Region-Arithmetik).
 - Neuer `unsafe`: nur 2 Zeilen Boot-Assembler (`CPACR_EL1`-Freigabe, CPU-Init).
 - Kernel-Crate weiterhin **0 `unsafe`-Blöcke** (außer Boot-`global_asm!`).
 

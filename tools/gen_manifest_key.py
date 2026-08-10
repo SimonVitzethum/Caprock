@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SEL4Lake — Manifest-Root-Schluessel erzeugen + Kernel-Key-DB generieren (A-1.3).
+"""Caprock — Manifest-Root-Schluessel erzeugen + Kernel-Key-DB generieren (A-1.3).
 
 Das System-Manifest ist ein **anderes** Autoritaetsdokument als ein TrustedSAS-Zertifikat
 (ADR 0014): das Zertifikat bezeugt, wie ein Binary gebaut wurde, das Manifest, wer beim Start
@@ -74,7 +74,7 @@ def write_db():
         "//! `trusted_keys.rs`: ein Zertifikat bezeugt die Herkunft eines Binaries, ein Manifest die",
         "//! Zuteilung der ganzen Maschine. Wer das eine darf, darf nicht automatisch das andere.",
         "",
-        "use sel4lake_trust::TrustedKey;",
+        "use caprock_trust::TrustedKey;",
         "",
         "/// Akzeptierte oeffentliche Manifest-Root-Schluessel (per `key_id` referenziert).",
         "pub static MANIFEST_KEYS: &[TrustedKey] = &[",

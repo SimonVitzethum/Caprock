@@ -1,4 +1,4 @@
-# SEL4Lake — Formale Verifikation (komponentenweise)
+# Caprock — Formale Verifikation (komponentenweise)
 
 Dieser Ordner dokumentiert die **schrittweise funktionale Verifikation des Kernelkerns** mit **Verus**
 (deduktive Korrektheit) — eigenständig verständlich **ohne Quellcode**. Jede Komponente hat einen
@@ -55,5 +55,5 @@ definierte TCB beschrieben (Aufwandsanalyse: `ARMTest/unsafe-memory-safety-aufwa
 tools/verus-verify.sh      # alle Verus-Beweise (CI-Gate: .gitea/workflows/verus.yml)
 tools/kani-verify.sh       # alle Kani-Beweise   (CI-Gate: .gitea/workflows/kani.yml)
 tools/loom-verify.sh       # Loom-Concurrency-Modelle der Sync-Primitive (CI-Gate: .gitea/workflows/loom.yml)
-tools/guard-verify.sh      # IRQ-Waechter in sel4lake-sync: loest er aus? (im Kani-Gate)
+tools/guard-verify.sh      # IRQ-Waechter in caprock-sync: loest er aus? (im Kani-Gate)
 ```

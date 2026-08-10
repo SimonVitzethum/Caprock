@@ -39,7 +39,7 @@ inkonsistenter DB-Eintrag fällt sofort auf (`loadhw : FAILURES`).
 ```sh
 tools/sign_trusted.py \
   --crate programs/trusted/<name> \
-  --elf programs/build/target/aarch64-sel4lake-user/release/<name>.elf \
+  --elf programs/build/target/aarch64-caprock-user/release/<name>.elf \
   --program-id <id> --version <v> --policy internal-test \
   --key keys/<root-name>.ed25519 \
   --out certs/<name>.cert
@@ -47,7 +47,7 @@ tools/sign_trusted.py \
 - `--program-id`/`--version` **müssen** zum Archiv-Eintrag passen (Identitäts-Bindung; sonst lehnt
   der Kernel ab).
 - Schlägt der Unsafe-Audit fehl (Programm nicht `#![forbid(unsafe_code)]` oder `unsafe` außerhalb
-  der Allowlist `{libsel4lake}`), entsteht **kein** Zertifikat (Exit ≠ 0).
+  der Allowlist `{libcaprock}`), entsteht **kein** Zertifikat (Exit ≠ 0).
 - Das Zertifikat ins Boot-Archiv legen: `mkarchive.py`-Spec `id:name:0:version:elf::certs/<name>.cert`
   (Domäne `0` = TrustedSAS; leeres Manifest-Feld → kein Manifest).
 

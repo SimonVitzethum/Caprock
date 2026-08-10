@@ -13,7 +13,7 @@
 //! Host-Orchestrator `tools/soak.py` verfolgt daraus die **Kurven über die Zeit**.
 
 use super::*;
-use sel4lake_hal::println;
+use caprock_hal::println;
 
 /// Heartbeat-Abstand in Timer-Ticks (TICK_HZ=100 → 6000 = ~60 s).
 const SOAK_HEARTBEAT_TICKS: u64 = 6000;

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SEL4Lake — Prüft, ob der IRQ-Wächter in `sel4lake-sync` auslösen KANN.
+# Caprock — Prüft, ob der IRQ-Wächter in `caprock-sync` auslösen KANN.
 #
 # WARUM es dieses Skript gibt. Am 2026-08-01 wurde belegt, dass Kani über die IRQ-Sicherheit
 # der SpinLocks **nichts** aussagt: Kani baut für das Host-Ziel, dort greift der dritte
@@ -41,7 +41,7 @@ fi
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-QUELLE="$ROOT/crates/sel4lake-sync"
+QUELLE="$ROOT/crates/caprock-sync"
 ZIEL="${1:-x86_64-unknown-none}"
 MELDUNG="Bare-Metal-Ziel ohne Interrupt-Maskierung"
 ARBEIT="$(mktemp -d)"
@@ -55,7 +55,7 @@ vorbereiten() {
     cp "$QUELLE/src/"*.rs "$ARBEIT/src/"
     cat > "$ARBEIT/Cargo.toml" <<'ENDE'
 [package]
-name = "sel4lake-sync"
+name = "caprock-sync"
 version = "0.0.0"
 edition = "2021"
 [lib]
@@ -91,10 +91,10 @@ vorbereiten
 # Fallen beide Zweige weg, greift der dritte (`not(any(...))`) fuer JEDES Ziel, und dort ist
 # IRQ_MASKING_IMPLEMENTED false. Auf einem Bare-Metal-Ziel muss der Waechter dann ausloesen.
 sed -i \
-    -e 's/all(target_arch = "x86_64", target_os = "none")/all(target_arch = "x86_64", target_os = "sel4lake-regressionstest")/g' \
-    -e 's/target_arch = "aarch64"/target_arch = "sel4lake-regressionstest"/g' \
+    -e 's/all(target_arch = "x86_64", target_os = "none")/all(target_arch = "x86_64", target_os = "caprock-regressionstest")/g' \
+    -e 's/target_arch = "aarch64"/target_arch = "caprock-regressionstest"/g' \
     "$ARBEIT/src/lib.rs"
-treffer="$(grep -c 'sel4lake-regressionstest' "$ARBEIT/src/lib.rs" || true)"
+treffer="$(grep -c 'caprock-regressionstest' "$ARBEIT/src/lib.rs" || true)"
 if [ "$treffer" -lt 2 ]; then
     echo "   FEHLER: die cfg-Bedingungen sehen anders aus als erwartet ($treffer Treffer) --" >&2
     echo "           dieses Skript pruefte damit NICHTS. Bitte an den geaenderten Code anpassen." >&2

@@ -16,10 +16,10 @@
 #![allow(clippy::too_many_arguments)]
 
 use super::*;
-use sel4lake_hal::println;
+use caprock_hal::println;
 // Diese drei nutzt nur der Fuzzer-Code -> hier explizit importiert (aus threads/mod.rs gezogen).
-use sel4lake_cap::CapPtr;
-use sel4lake_loader::{Program, DOMAIN_TRUSTED, DOMAIN_USERLAND};
+use caprock_cap::CapPtr;
+use caprock_loader::{Program, DOMAIN_TRUSTED, DOMAIN_USERLAND};
 
 // Einmalige Spawn-Flags (ersetzen die frueheren Idle-Loop-Locals `fuzz_spawned`/`ipcfuzz_spawned`).
 static FUZZ_SPAWNED: AtomicBool = AtomicBool::new(false);

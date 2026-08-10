@@ -1,6 +1,6 @@
-# SEL4Lake — externe Programme (ext-26)
+# Caprock — externe Programme (ext-26)
 
-Dieser **eigene** Cargo-Workspace (getrennt vom Kernel) baut die **extern geladenen** SEL4Lake-
+Dieser **eigene** Cargo-Workspace (getrennt vom Kernel) baut die **extern geladenen** Caprock-
 Programme: statisch gelinkte `ET_EXEC`-ELF64-Binaries, die der generische Binary-Loader des Kernels
 (ADR 0011) zur Laufzeit lädt — **nicht** Teil des Kernel-Images.
 
@@ -10,8 +10,8 @@ Programme: statisch gelinkte `ET_EXEC`-ELF64-Binaries, die der generische Binary
 cd programs && cargo build --release
 ```
 
-Erzeugt die ELFs unter `programs/build/target/aarch64-sel4lake-user/release/<name>.elf`. Eigene
-Target-Spec (`aarch64-sel4lake-user.json`) + Linker-Skript (`user.ld`, festgelinkt an VA
+Erzeugt die ELFs unter `programs/build/target/aarch64-caprock-user/release/<name>.elf`. Eigene
+Target-Spec (`aarch64-caprock-user.json`) + Linker-Skript (`user.ld`, festgelinkt an VA
 `0x4100_0000`, getrennte **W^X**-`PT_LOAD`-Segmente) via `.cargo/config.toml`.
 
 Die ELFs werden anschließend mit `tools/mkarchive.py` (im Repo-Root) in ein Boot-Archiv gelegt und
@@ -21,7 +21,7 @@ von QEMU `-device loader` in das reservierte RAM-Fenster geladen (siehe `test-qe
 
 | Verzeichnis | Inhalt |
 |---|---|
-| `libsel4lake/` | Minimal-SDK (Syscall-Stubs + Panik-Handler) — gemeinsame, **nicht** gegenseitige Abhängigkeit aller Programme. |
+| `libcaprock/` | Minimal-SDK (Syscall-Stubs + Panik-Handler) — gemeinsame, **nicht** gegenseitige Abhängigkeit aller Programme. |
 | `userland/` | UserLand-Programme (EL0-isoliert, **keine** Hardware-/Management-Rechte). |
 | `hardware/` | HardwareLand-Programme (EL0-isoliert, Hardware-Caps + ein Trusted-Partner). |
 | `trusted/` | TrustedSAS-Programme — **geladen EL0-isoliert** (nicht EL1), behalten aber die Trust-Stufe (dürfen PdControl/Loader-Caps halten). |
@@ -32,9 +32,9 @@ nur die **Cap-Autorität** fest (welche Cap-Typen die PD halten darf), nicht den
 ## Ein Programm hinzufügen
 
 1. `programs/<domäne>/<name>/` als Cargo-Bin anlegen (`[[bin]] name = "<name>"`).
-2. `dependencies: libsel4lake = { path = "../../libsel4lake" }`.
+2. `dependencies: libcaprock = { path = "../../libcaprock" }`.
 3. Entry definieren. Empfohlen (und für TrustedSAS **Pflicht**, s. u.): eine **sichere**
-   `fn run(arg: usize) -> !` + `libsel4lake::entry!(run);`. Das Makro erzeugt die `_start`-Glue (das
+   `fn run(arg: usize) -> !` + `libcaprock::entry!(run);`. Das Makro erzeugt die `_start`-Glue (das
    `#[no_mangle]`-Attribut ist in aktuellem Rust *unsafe*) in der auditierten SDK-Schicht, sodass das
    Programm selbst `#![forbid(unsafe_code)]` bleiben kann. (Der Kernel setzt SP, übergibt Boot-Info
    in `x0`.)
@@ -46,6 +46,6 @@ nur die **Cap-Autorität** fest (welche Cap-Typen die PD halten darf), nicht den
 
 TrustedSAS-Binaries (`trusted/`) werden vom Kernel **nur mit gültigem Ed25519-Zertifikat** geladen
 (ext-28, [ADR 0014](../docs/adr/0014-trusted-sas-certificates.md)). Sie müssen vollständig
-`#![forbid(unsafe_code)]` sein (Allowlist `{libsel4lake}`) und mit `tools/sign_trusted.py` signiert
+`#![forbid(unsafe_code)]` sein (Allowlist `{libcaprock}`) und mit `tools/sign_trusted.py` signiert
 werden. Ablauf + Schlüsselverwaltung: [`trusted/README.md`](trusted/README.md) +
 [`docs/runbook-trusted-keys.md`](../docs/runbook-trusted-keys.md).

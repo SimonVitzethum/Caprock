@@ -185,7 +185,7 @@ Threads über KILL/EXIT/Reload/MCS-während-IPC.
   prüft Prägen+Löschen einer Reply-Cap für einen ausstehenden Call (Ergebnis=5).
   Sensitivität: Finalisierungs-Push deaktiviert → Client hängt → `== FAILURES ==`.
 - **#3 CAPS-Reader-Writer-Lock** (Commit `b649b4f`): neuer writer-bevorzugender
-  `RwSpinLock<T>` in sel4lake-sync; CAPS = `RwSpinLock<Caps>`. Heiße Lookups → read
+  `RwSpinLock<T>` in caprock-sync; CAPS = `RwSpinLock<Caps>`. Heiße Lookups → read
   (parallel), Mutationen → write (exklusiv). `microkit::dispatch` löst per read auf,
   REPLY+GRANT nimmt write vor EPS. 21 Aufrufstellen klassifiziert (6 read / 15 write).
   `caplk` (2 Sonden, Kern 1+2, Barriere im Read-Abschnitt): Höchststand gleichzeitiger

@@ -2,7 +2,7 @@
 
 **Status:** akzeptiert (Phase 0, umzusetzen ab Phase 1) · **Datum:** 2026-06-23
 
-Dies ist die *definierende* Architekturentscheidung von SEL4Lake und der größte
+Dies ist die *definierende* Architekturentscheidung von Caprock und der größte
 Unterschied zu seL4.
 
 ## Anforderung (aus der Spezifikation)
@@ -65,7 +65,7 @@ Kontextwechsel (kein `TTBR`-Wechsel, kein ASID-Roundtrip).
 
 ## Entscheidung
 
-**Ansatz B.** SEL4Lake fährt einen **Single-Address-Space (SAS)** mit aktiver
+**Ansatz B.** Caprock fährt einen **Single-Address-Space (SAS)** mit aktiver
 MMU, aber **einer einzigen, statischen Identity-Map** und aktivierten Caches.
 Es gibt keine per-Prozess-Adressräume und keine Adressübersetzung im
 semantischen Sinn. Speicher-Autorität wird über **Memory-Capabilities**
@@ -109,7 +109,7 @@ nicht vertrauenswürdigen nativen Codes. Daher:
 ## Nachtrag: EL0/EL1-Privileg-Trennung im SAS (implementiert)
 
 Der Single-Address-Space schließt **virtuellen Speicher** und per-Prozess-VSpaces
-aus — er schließt aber **nicht** die ARM-Exception-Level aus. SEL4Lake nutzt die
+aus — er schließt aber **nicht** die ARM-Exception-Level aus. Caprock nutzt die
 *eine* Identity-Map, um eine **Privileg-Grenze** (keine Adressraum-Grenze) per
 AP-Bits zu ziehen:
 

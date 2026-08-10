@@ -1,6 +1,6 @@
-// SEL4Lake — Phase 4 (IPC), Schritt A/B: Endpoint-Rendezvous, Abweisungstor und Reply-Token.
+// Caprock — Phase 4 (IPC), Schritt A/B: Endpoint-Rendezvous, Abweisungstor und Reply-Token.
 //
-// Formale Spezifikation der IPC-Kern-Invarianten (`crates/sel4lake-ipc`, `ipc_audit`): wann ein
+// Formale Spezifikation der IPC-Kern-Invarianten (`crates/caprock-ipc`, `ipc_audit`): wann ein
 // Rendezvous faellig sein darf und wann nicht; dass keine Nachricht unbemerkt verschwindet; dass
 // eine ausstehende Antwort zu **genau einem** blockierten Aufrufer gehoert und **genau einmal**
 // konsumiert wird; und dass das Stilllegungstor (A-4.2) zwei UNTERSCHEIDBARE Abweisungsgruende
@@ -15,7 +15,7 @@
 // **WIE WEIT DIESES MODELL TRAEGT** — gemessen von `tools/verus-modelltreue-ipc.sh`, nicht behauptet.
 // ------------------------------------------------------------------------------------------------
 //
-// Dieses Modell hat NEUN Felder und ACHT Operationen. `crates/sel4lake-ipc/src/lib.rs::Endpoint`
+// Dieses Modell hat NEUN Felder und ACHT Operationen. `crates/caprock-ipc/src/lib.rs::Endpoint`
 // hat SECHS Felder und rund fuenfzehn Operationen. Die sechs Codefelder haben hier alle ein
 // Gegenstueck (`used`, `quiescing`, `senders`, `receivers`, `caller`, `reply_owner`); die drei
 // zusaetzlichen (`delivered`, `rejected_senders`, `rejected_receivers`) sind **Buchhaltung ohne
@@ -105,7 +105,7 @@ use vstd::prelude::*;
 
 verus! {
 
-/// Ein Endpoint. Die ersten sechs Felder haben ein Gegenstueck in `sel4lake_ipc::Endpoint`, die
+/// Ein Endpoint. Die ersten sechs Felder haben ein Gegenstueck in `caprock_ipc::Endpoint`, die
 /// letzten drei sind Buchhaltung, die der Waechter effektbasiert fuellt.
 pub struct Endpoint {
     /// Belegt (von `create` reserviert)? Sonst `ERR_BADCAP`.
@@ -129,7 +129,7 @@ pub struct Endpoint {
     pub rejected_receivers: nat,
 }
 
-/// **Die Warteschlangen-Schranke.** Muss mit `sel4lake_ipc::QUEUE_CAP` uebereinstimmen; der
+/// **Die Warteschlangen-Schranke.** Muss mit `caprock_ipc::QUEUE_CAP` uebereinstimmen; der
 /// Waechter prueft das, weil ein Modell mit der falschen Schranke genau den Fall verfehlt, um den
 /// es hier geht.
 pub open spec fn queue_cap() -> nat { 32 }

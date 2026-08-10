@@ -1,4 +1,4 @@
-// SEL4Lake — Verus-Pilot (Tier 2), Teil 8: Loader-Use-after-free-Schutz (`loader_audit`, ext-26 L5).
+// Caprock — Verus-Pilot (Tier 2), Teil 8: Loader-Use-after-free-Schutz (`loader_audit`, ext-26 L5).
 //
 // Formale Spezifikation der `loader_audit`-Invariante (kernel/src/loader.rs / system.rs): KEIN
 // registriertes geladenes Segment ueberlappt eine **freie** RAM-Region. Das verhindert

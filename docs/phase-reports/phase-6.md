@@ -8,14 +8,14 @@ Die Microkit-Runtime im Kernelimage: **Protection Domains** mit eigenem
 Capability-Space und **cap-gesicherte IPC** — schließt die Phase-5-Lücke
 (IPC war per Endpoint-ID adressiert, ohne Zugriffskontrolle).
 
-### Endpoints als Capabilities (`crates/sel4lake-cap`)
+### Endpoints als Capabilities (`crates/caprock-cap`)
 
 `ObjectKind::Endpoint(id)` ergänzt das eine Capability-System (kein zweites!).
 `install_endpoint` prägt einen Endpoint-Cap; `lookup(ptr) -> (ObjectKind,
 Rights)` löst einen Cap für die Invokation auf. `inspect`/Finalisierung wurden
 auf mehrere Objektarten erweitert (Endpoints halten keinen Allokator-Speicher).
 
-### Microkit-Runtime (`crates/sel4lake-microkit`)
+### Microkit-Runtime (`crates/caprock-microkit`)
 
 - **Protection Domain** = Thread + eigener **Capability-Space**: eine Tabelle,
   die *lokale* Cap-Indizes auf *globale* `CapPtr`s abbildet. Ein Thread kann nur
@@ -65,10 +65,10 @@ passendes Recht wird IPC verweigert** — die Sicherheitslücke aus Phase 5 ist 
 
 ## Unsafe-Bilanz
 
-- `sel4lake-microkit`: **0 unsafe** (reine Orchestrierung). `sel4lake-cap`-
+- `caprock-microkit`: **0 unsafe** (reine Orchestrierung). `caprock-cap`-
   Erweiterung: 0 neue unsafe. Kernel-Crate weiterhin **0 `unsafe`-Blöcke**.
-- Gesamtsystem-`unsafe` unverändert nur in `sel4lake-hal` (Low-Level),
-  `sel4lake-sync` (Lock) und dem Boot-Assembler.
+- Gesamtsystem-`unsafe` unverändert nur in `caprock-hal` (Low-Level),
+  `caprock-sync` (Lock) und dem Boot-Assembler.
 
 ## Risiken / offene Punkte
 

@@ -1,4 +1,4 @@
-// SEL4Lake — Verus-Pilot (Tier 2), Teil 3: vollstaendige CDT-**Struktur**-Invariante (lokal).
+// Caprock — Verus-Pilot (Tier 2), Teil 3: vollstaendige CDT-**Struktur**-Invariante (lokal).
 //
 // Vereint die Sibling-Konsistenz (Code 5) mit der Eltern/Kind-Verkettung (audit_cdt Codes 4-lokal
 // + 6) in EINEM Knotenmodell und beweist, dass `derive` (eine Capability ableiten: ein neues Kind am

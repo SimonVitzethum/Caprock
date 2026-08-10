@@ -1,6 +1,6 @@
-// SEL4Lake — Phase 6 (Notifications), Schritt A/B: Badge-Akkumulation + Single-Waiter-Rendezvous.
+// Caprock — Phase 6 (Notifications), Schritt A/B: Badge-Akkumulation + Single-Waiter-Rendezvous.
 //
-// Formale Spezifikation der Notification-Kern-Invariante (crate sel4lake-ipc, `Notification`,
+// Formale Spezifikation der Notification-Kern-Invariante (crate caprock-ipc, `Notification`,
 // `Notification::audit`): ein Notification-Objekt akkumuliert Badge-Bits per ODER (`signal`) und hat
 // **hoechstens einen** blockierten Wartenden. Bewiesen: kein Signal geht verloren (jedes signalisierte
 // Bit ist danach entweder im pending-Wort ODER an den geweckten Wartenden zugestellt); ein blockierter

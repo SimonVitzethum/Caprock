@@ -13,7 +13,7 @@ name = "wasmhost"
 path = "src/main.rs"
 
 [dependencies]
-libsel4lake = { path = "../../libsel4lake" }
+libcaprock = { path = "../../libcaprock" }
 # `default-features = false` ist hier keine Sparmassnahme, sondern Pflicht: mit `std` zieht die
 # Engine eine Standardbibliothek, die es auf diesem Ziel nicht gibt.
 wasmi = { version = "0.31", default-features = false }

@@ -9,7 +9,7 @@
 #![no_std]
 #![no_main]
 
-use libsel4lake::{exit, signal};
+use libcaprock::{exit, signal};
 
 /// PRE-Badge "INRH" (muss zum Kernel-Test `INTRH_PRE` passen).
 pub const PRE_BADGE: u64 = 0x494E_5248;

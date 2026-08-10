@@ -13,7 +13,7 @@
 #![no_std]
 #![no_main]
 
-use libsel4lake::{exit, signal};
+use libcaprock::{exit, signal};
 
 /// PRE-Badge "INTR" (muss zum Kernel-Test `INTRU_PRE` passen).
 pub const PRE_BADGE: u64 = 0x494E_5452;

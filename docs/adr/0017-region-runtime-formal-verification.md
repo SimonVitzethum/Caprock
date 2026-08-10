@@ -5,7 +5,7 @@ Bezug: ADR 0010 (Region-Runtime + Prozess-Heap), ADR 0015 (Verifikationsansatz),
 
 ## Kontext
 
-Die Region-Runtime (`sel4lake-region`) ist die **einzige** Crate mit Speicher-`unsafe` im Userland-Pfad;
+Die Region-Runtime (`caprock-region`) ist die **einzige** Crate mit Speicher-`unsafe` im Userland-Pfad;
 ihre **Speichersicherheit** (RegionView-Zugriffe nie OOB) ist bereits mit **Kani** bewiesen
 (`docs/verification.md`). Phase 3 ergaenzt die **funktionale** Schicht: die **Ressourcen-Bilanz** des
 Allokators — Konservierung, Ownership, Balance —, die zur Laufzeit von `churn`/`sasheap`

@@ -4,7 +4,7 @@
 //! Ring-3-Round-Trip — jeweils direkt gegen die Hardware, ohne den eigentlichen Microkernel.
 //! Hier läuft nun der **echte Kern**: derselbe `system.rs`, derselbe Capability-Space,
 //! derselbe per-Kern-Scheduler, dasselbe cap-gesicherte IPC wie auf aarch64. Möglich wurde
-//! das, weil `sel4lake-hal` jetzt architekturselektiv ist — der Kern selbst enthält kein
+//! das, weil `caprock-hal` jetzt architekturselektiv ist — der Kern selbst enthält kein
 //! einziges `cfg(target_arch)`.
 //!
 //! Was hier läuft:
@@ -20,9 +20,9 @@
 //! (PCID + per-VSpace-Tabellen), Ring-3-PDs im Kernel-Kern, Boot-Archiv/Loader, IOMMU.
 
 use crate::system;
-use sel4lake_abi::{result, sys};
-use sel4lake_hal::{self as hal, print, println, syscall::invoke};
-use sel4lake_mem::Rights;
+use caprock_abi::{result, sys};
+use caprock_hal::{self as hal, print, println, syscall::invoke};
+use caprock_mem::Rights;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Rückfall-RAM-Obergrenze, falls der Bootloader keinen Speicherplan mitgibt.
@@ -220,10 +220,10 @@ extern "C" fn ring3_park_probe(_arg: usize) -> ! {
 
     // 1. Marke an sich selbst, dann schlafen -> muss durchlaufen.
     // SAFETY: Ring-3-Kontext, freigegebener Syscall-Vektor.
-    let r_self = unsafe { ring3_syscall1(sel4lake_abi::sys::UNPARK, me) };
+    let r_self = unsafe { ring3_syscall1(caprock_abi::sys::UNPARK, me) };
     // SAFETY: dito.
-    unsafe { ring3_syscall1(sel4lake_abi::sys::PARK, 0) };
-    if r_self == sel4lake_abi::result::OK {
+    unsafe { ring3_syscall1(caprock_abi::sys::PARK, 0) };
+    if r_self == caprock_abi::result::OK {
         PARK_PROBE_BITS.fetch_or(1, Ordering::Release);
     }
 
@@ -232,13 +232,13 @@ extern "C" fn ring3_park_probe(_arg: usize) -> ! {
     //    unterscheiden.
     PARK_PROBE_BITS.fetch_or(8, Ordering::Release);
     // SAFETY: dito.
-    unsafe { ring3_syscall1(sel4lake_abi::sys::PARK, 0) };
+    unsafe { ring3_syscall1(caprock_abi::sys::PARK, 0) };
     PARK_PROBE_BITS.fetch_or(2, Ordering::Release);
 
     // 3. Eine ThreadId, die es nicht gibt -- muss abgewiesen werden, nicht still nichts tun.
     // SAFETY: dito.
-    let r_fremd = unsafe { ring3_syscall1(sel4lake_abi::sys::UNPARK, 0xDEAD_BEEF) };
-    if r_fremd == sel4lake_abi::result::ERR_BADCAP {
+    let r_fremd = unsafe { ring3_syscall1(caprock_abi::sys::UNPARK, 0xDEAD_BEEF) };
+    if r_fremd == caprock_abi::result::ERR_BADCAP {
         PARK_PROBE_BITS.fetch_or(4, Ordering::Release);
     }
 
@@ -248,7 +248,7 @@ extern "C" fn ring3_park_probe(_arg: usize) -> ! {
     loop {
         PARK_PROBE_RUNDEN.fetch_add(1, Ordering::Release);
         // SAFETY: dito.
-        unsafe { ring3_syscall1(sel4lake_abi::sys::PARK, 0) };
+        unsafe { ring3_syscall1(caprock_abi::sys::PARK, 0) };
     }
 }
 
@@ -312,24 +312,24 @@ extern "C" fn ring3_quiesce_probe(_arg: usize) -> ! {
     Q_PROBE_BITS.fetch_or(1, Ordering::Release);
     // 1. Tore zu -> `RECV` muss SOFORT abweisen. Der Code wird abgelegt, nicht bloss ein Ja/Nein.
     // SAFETY: Ring-3-Kontext, freigegebener Syscall-Vektor.
-    let r = unsafe { ring3_syscall1(sel4lake_abi::sys::RECV, 0) };
+    let r = unsafe { ring3_syscall1(caprock_abi::sys::RECV, 0) };
     Q_PROBE_CODE.store(r, Ordering::Release);
     Q_PROBE_BITS.fetch_or(2, Ordering::Release);
     // 2. Warten, bis der Kernel die Tore geoeffnet hat.
     // SAFETY: dito.
-    unsafe { ring3_syscall1(sel4lake_abi::sys::PARK, 0) };
+    unsafe { ring3_syscall1(caprock_abi::sys::PARK, 0) };
     // 3. Jetzt noch einmal dasselbe `RECV`. Es gibt keinen Sender -> es muss BLOCKIEREN.
     //    Bit 2 wird VORHER gesetzt: ein Thread, der schon in Schritt 1 haengengeblieben waere,
     //    ist von einem blockierten sonst nicht zu unterscheiden.
     Q_PROBE_BITS.fetch_or(4, Ordering::Release);
     // SAFETY: dito.
-    unsafe { ring3_syscall1(sel4lake_abi::sys::RECV, 0) };
+    unsafe { ring3_syscall1(caprock_abi::sys::RECV, 0) };
     // Hierher kommt sie nur, wenn das zweite `RECV` NICHT blockiert hat -- Bit 3 ist damit das
     // Gegenteil der erwarteten Aussage und faerbt die Zeile.
     Q_PROBE_BITS.fetch_or(8, Ordering::Release);
     loop {
         // SAFETY: dito.
-        unsafe { ring3_syscall1(sel4lake_abi::sys::PARK, 0) };
+        unsafe { ring3_syscall1(caprock_abi::sys::PARK, 0) };
     }
 }
 
@@ -338,14 +338,14 @@ extern "C" fn ring3_quiesce_probe(_arg: usize) -> ! {
 // ================================================================================================
 //
 // **Warum das VOR jeder SSE-Entscheidung kommt.** Der Kernel hat Lazy-FP fuer Ring 3
-// (`fxsave64`/`fxrstor64` mit `CR0.TS`-Trap, `crates/sel4lake-hal/src/x86_64/fp.rs`), aber gemessen
+// (`fxsave64`/`fxrstor64` mit `CR0.TS`-Trap, `crates/caprock-hal/src/x86_64/fp.rs`), aber gemessen
 // wurde der Pfad nur auf aarch64 (`fp : EL0-FP-Threads-OK=0b11/0b11`). SSE im User-Ziel
 // einzuschalten hiesse, einen Pfad scharfzustellen, der auf DIESER Architektur nie ausgefuehrt
 // wurde — dieselbe Fehlerform wie beim Farbtest, nur gespiegelt.
 //
 // **Und die SSE-Entscheidung ist keine Leistungsfrage.** Gemessen am 2026-08-09: dieselbe Funktion
 // `f64 -> f64` uebergibt ihre Argumente auf einem normalen x86_64-Ziel in `xmm0`/`xmm1`, auf
-// `x86_64-sel4lake-user` dagegen in `rdi`/`rsi`. Das sind zwei AUFRUFKONVENTIONEN. Ein upstream
+// `x86_64-caprock-user` dagegen in `rdi`/`rsi`. Das sind zwei AUFRUFKONVENTIONEN. Ein upstream
 // gebautes musl nimmt die erste an; der Linker sieht nur gleiche Symbolnamen und kann die
 // Verwechslung nicht bemerken. Das ist stille Korruption, kein langsamer Code — und damit ein
 // Blocker fuer Z16 auf x86, unabhaengig von jeder Zyklenzahl.
@@ -856,7 +856,7 @@ fn spawn_demo() -> bool {
                 // zu fehlen.
                 system::bind_pd_late(
                     pd,
-                    sel4lake_sched::ThreadId::from_raw(WORKER_TID0.load(Ordering::Acquire)),
+                    caprock_sched::ThreadId::from_raw(WORKER_TID0.load(Ordering::Acquire)),
                     system::SpaetbindungsGrund::CheckpointSubjektNachtraeglich,
                 );
                 CKPT_PD.store(pd as u32 + 1, Ordering::Release);
@@ -966,7 +966,7 @@ fn park_messen_inner() -> bool {
         }
     };
     let raw = PARK_PROBE_TID.load(Ordering::Acquire);
-    let Some(tid) = (raw != 0).then(|| sel4lake_sched::ThreadId::from_raw(raw)) else {
+    let Some(tid) = (raw != 0).then(|| caprock_sched::ThreadId::from_raw(raw)) else {
         println!("park    : FAILURES (keine Sonde -- ohne sie ist nichts gemessen)");
         return false;
     };
@@ -990,7 +990,7 @@ fn park_messen_inner() -> bool {
     //    von aussen genauso „blockiert" aus wie ein geparkter, und genau das ist die Falle.
     let sraw = IPC_SERVER_TID.load(Ordering::Acquire);
     let ipc_bleibt = if sraw != 0 {
-        let stid = sel4lake_sched::ThreadId::from_raw(sraw);
+        let stid = caprock_sched::ThreadId::from_raw(sraw);
         // **Gemessen wird `blocked`, nicht `parked`.** Die erste Fassung las `is_parked` vorher
         // und nachher -- an einem IPC-Wartenden ist dieses Bit aber in BEIDEN Faellen falsch, ob
         // `unpark` ihn nun weckt oder nicht. Der Pruefer haette den Fehler, gegen den er gebaut
@@ -1131,7 +1131,7 @@ fn quiesce_messen_inner() -> bool {
     let raw = Q_PROBE_TID.load(Ordering::Acquire);
     let pd = Q_PROBE_PD.load(Ordering::Acquire);
     let (Some(tid), true) = (
-        (raw != 0).then(|| sel4lake_sched::ThreadId::from_raw(raw)),
+        (raw != 0).then(|| caprock_sched::ThreadId::from_raw(raw)),
         pd != u64::MAX,
     ) else {
         println!("qgate   : FAILURES (keine Sonde/PD -- ohne sie ist nichts gemessen)");
@@ -1148,7 +1148,7 @@ fn quiesce_messen_inner() -> bool {
         warten();
     }
     let code = Q_PROBE_CODE.load(Ordering::Acquire);
-    let abgewiesen = code == sel4lake_abi::result::ERR_QUIESCING;
+    let abgewiesen = code == caprock_abi::result::ERR_QUIESCING;
     // 3. Tore oeffnen -- und das MUSS etwas aendern.
     let geoeffnet = system::pd_quiesce(pd, false);
     let zu_danach = system::pd_is_quiescing(pd);
@@ -1177,7 +1177,7 @@ fn quiesce_messen_inner() -> bool {
         "qgate   : lief={lief} erstes-RECV-Code={code} (erwartet {} = ERR_QUIESCING) \
          oeffnen-aenderte-etwas={geoeffnet} danach-zu={zu_danach} steht-im-zweiten-RECV={steht_im_zweiten} \
          blockiert-jetzt={blockiert} (statt abgewiesen -- DAS ist der Beleg) durchgelaufen={durchgelaufen} : {}",
-        sel4lake_abi::result::ERR_QUIESCING,
+        caprock_abi::result::ERR_QUIESCING,
         if ok { "ALL PASS" } else { "FAILURES" }
     );
     println!(
@@ -1230,7 +1230,7 @@ fn freeze_bericht() {
         }
     };
     let raw = WORKER_TID0.load(Ordering::Acquire);
-    let Some(tid) = (raw != 0).then(|| sel4lake_sched::ThreadId::from_raw(raw)) else {
+    let Some(tid) = (raw != 0).then(|| caprock_sched::ThreadId::from_raw(raw)) else {
         println!("freeze  : SKIP (kein Worker-Thread -- ohne einen laufenden Thread gibt es nichts anzuhalten)");
         return;
     };
@@ -1270,7 +1270,7 @@ fn freeze_bericht() {
     let sraw = IPC_SERVER_TID.load(Ordering::Acquire);
     let ipc_abgewiesen = if sraw != 0 {
         matches!(
-            system::freeze_thread(sel4lake_sched::ThreadId::from_raw(sraw)),
+            system::freeze_thread(caprock_sched::ThreadId::from_raw(sraw)),
             Freeze::Busy(_)
         )
     } else {
@@ -1499,8 +1499,8 @@ fn devsel_bericht() {
         if !e.device.matches(ven, dev, u32::MAX) {
             alle_passen = false;
         }
-        if e.device.vendor == sel4lake_loader::manifest::ANY16
-            && e.device.device == sel4lake_loader::manifest::ANY16
+        if e.device.vendor == caprock_loader::manifest::ANY16
+            && e.device.device == caprock_loader::manifest::ANY16
         {
             ids_genannt = false;
         }
@@ -1529,10 +1529,10 @@ static BLKDEV_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 static PART_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// A-6.3: hat die Dateisystem-PD ihre Datei gelesen?
 static FS_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// Was `tools/mkgpt.py --file` ins Dateisystem legt: "SEL4LAKE-DATEIINHALT" (20 Byte).
+/// Was `tools/mkgpt.py --file` ins Dateisystem legt: "CAPROCKS-DATEIINHALT" (20 Byte).
 const FS_DATEI_GROESSE: u64 = 20;
-/// Die ersten acht Bytes davon, little-endian gelesen ("SEL4LAKE").
-const FS_ERSTE_ACHT: u64 = 0x454B_414C_344C_4553;
+/// Die ersten acht Bytes davon, little-endian gelesen ("CAPROCKS").
+const FS_ERSTE_ACHT: u64 = 0x534B_434F_5250_4143;
 /// A-6.4: auf diese Groesse schreibt die Probe die Datei — ueber einen zweiten Cluster hinaus.
 /// Eine Schreibprobe, die in den vorhandenen Cluster passt, prueft die Kettenverlaengerung nicht.
 const FS_NEU_GROESSE: u64 = 700;
@@ -1782,7 +1782,7 @@ fn drv_service_step(archive: bool) {
             // ausdruecklich IM Umfang: damit bleibt als Grund nur die Geraete-Autoritaet uebrig,
             // und die Absage ist keine, die ein groesserer Umfang beheben koennte.
             if let Some(svc) = crate::loader::driver_service_of(TEST_BLK_SERVICE_ID) {
-                use sel4lake_cap::checkpoint::{classify_all, Scope};
+                use caprock_cap::checkpoint::{classify_all, Scope};
                 let mut kinds = [None; 16];
                 let n = system::pd_object_kinds(svc.pd, &mut kinds);
                 let (eps, ns) = ([svc.ep as u32], [svc.ntfn as u32]);
@@ -1803,7 +1803,7 @@ fn drv_service_step(archive: bool) {
             }
 
             let kh = crate::loader::kernel_code_hash();
-            match sel4lake_cap::checkpoint::Image::decode(&sek, &kh) {
+            match caprock_cap::checkpoint::Image::decode(&sek, &kh) {
                 Ok(img) => {
                     CKPT_DECODE.store(0, Ordering::Release);
                     CKPT_PROGRESS.store(img.progress, Ordering::Release);
@@ -1815,7 +1815,7 @@ fn drv_service_step(archive: bool) {
                 }
                 Err(e) => {
                     CKPT_DECODE.store(ckpt_code(&e), Ordering::Release);
-                    if e == sel4lake_cap::checkpoint::ImageError::NoImage {
+                    if e == caprock_cap::checkpoint::ImageError::NoImage {
                         CKPT_STATE.store(CKPT_SAVED, Ordering::Release); // Vorhaben, noch kein Befund
                     } else {
                         // **Abgewiesen -- und der Sektor bleibt, wie er ist.** Ihn hier zu
@@ -1846,7 +1846,7 @@ fn drv_service_step(archive: bool) {
         7 => {
             use system::Freeze;
             let raw = WORKER_TID0.load(Ordering::Acquire);
-            let Some(tid) = (raw != 0).then(|| sel4lake_sched::ThreadId::from_raw(raw)) else {
+            let Some(tid) = (raw != 0).then(|| caprock_sched::ThreadId::from_raw(raw)) else {
                 CKPT_STATE.store(CKPT_ERROR, Ordering::Release);
                 CKPT_REQ.store(3, Ordering::Release);
                 CKPT_DONE.store(true, Ordering::Release);
@@ -1911,7 +1911,7 @@ fn drv_service_step(archive: bool) {
         11 => {
             use system::Freeze;
             let raw = WORKER_TID0.load(Ordering::Acquire);
-            let Some(tid) = (raw != 0).then(|| sel4lake_sched::ThreadId::from_raw(raw)) else {
+            let Some(tid) = (raw != 0).then(|| caprock_sched::ThreadId::from_raw(raw)) else {
                 CKPT_STATE.store(CKPT_ERROR, Ordering::Release);
                 CKPT_REQ.store(3, Ordering::Release);
                 CKPT_DONE.store(true, Ordering::Release);
@@ -1955,8 +1955,8 @@ fn drv_service_step(archive: bool) {
             } else {
                 system::pd_object_kinds(pd as usize - 1, &mut kinds)
             };
-            let scope = sel4lake_cap::checkpoint::Scope::EMPTY;
-            match sel4lake_cap::checkpoint::Image::build(kh, p, nonce, epoche, &kinds[..n], &scope)
+            let scope = caprock_cap::checkpoint::Scope::EMPTY;
+            match caprock_cap::checkpoint::Image::build(kh, p, nonce, epoche, &kinds[..n], &scope)
             {
                 Ok(img) => {
                     let Some((shared, _)) = system::driver_shared_region(TEST_BLK_SERVICE_ID)
@@ -1998,7 +1998,7 @@ fn drv_service_step(archive: bool) {
             }
             let raw = WORKER_TID0.load(Ordering::Acquire);
             if raw != 0 {
-                let tid = sel4lake_sched::ThreadId::from_raw(raw);
+                let tid = caprock_sched::ThreadId::from_raw(raw);
                 // **Auftauen gehoert zum Speichern.** Ein Checkpoint, der sein Subjekt stehen
                 // laesst, ist ein Abbruch mit Nebenwirkung -- und `freeze_bericht` weiter unten
                 // braucht einen laufenden Thread als Positivkontrolle.
@@ -2160,7 +2160,7 @@ static DMAISO_STATE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 /// Client-Thread der Netz-PD: Positivkontrolle, dann der Fremdversuch.
 #[cfg(feature = "selftest")]
 extern "C" fn net_client(_arg: usize) -> ! {
-    let store = |slot: &[core::sync::atomic::AtomicU64; 4], r: sel4lake_hal::syscall::Ret| {
+    let store = |slot: &[core::sync::atomic::AtomicU64; 4], r: caprock_hal::syscall::Ret| {
         for (a, v) in slot.iter().zip(r.msg) {
             a.store(if r.result == result::OK { v } else { u64::MAX }, Ordering::Release);
         }
@@ -2203,7 +2203,7 @@ extern "C" fn drv_client(_arg: usize) -> ! {
     // Sie laeuft nach dem Austausch, und das ist kein Zufall: was hier durchgeht, geht durch
     // einen Dienst, der eben ausgetauscht wurde. Ein Protokoll, das nur die erste Fassung
     // bedient, waere kein Dienst, sondern ein Startvorgang.
-    let st = |r: sel4lake_hal::syscall::Ret| if r.result == result::OK { r.msg[0] } else { u64::MAX };
+    let st = |r: caprock_hal::syscall::Ret| if r.result == result::OK { r.msg[0] } else { u64::MAX };
     // 1. Auskunft: Kapazitaet, Hoechstzahl je Anfrage, Sektorgroesse.
     let info = invoke(sys::CALL, 0, [OP_INFO, 0, 0, 0], 0);
     DRV_SEQ[0].store(st(info), Ordering::Release);
@@ -2385,7 +2385,7 @@ static CKPT_FREEZE_DEADLINE: AtomicU64 = AtomicU64::new(0);
 /// Kernel zwischen Lesen und Schreiben entscheiden kann, was ueberhaupt geschrieben wird.
 #[cfg(feature = "selftest")]
 extern "C" fn ckpt_client(_arg: usize) -> ! {
-    let st = |r: sel4lake_hal::syscall::Ret| if r.result == result::OK { r.msg[0] } else { u64::MAX };
+    let st = |r: caprock_hal::syscall::Ret| if r.result == result::OK { r.msg[0] } else { u64::MAX };
     loop {
         let req = CKPT_REQ.load(Ordering::Acquire);
         let ack = CKPT_ACK.load(Ordering::Acquire);
@@ -2414,8 +2414,8 @@ extern "C" fn ckpt_client(_arg: usize) -> ! {
 
 /// Diagnosecode fuer den Ausgang des Lesens — eine Zahl je Ursache, kein Sammel-Fehlschlag.
 #[cfg(feature = "selftest")]
-fn ckpt_code(e: &sel4lake_cap::checkpoint::ImageError) -> u32 {
-    use sel4lake_cap::checkpoint::ImageError as E;
+fn ckpt_code(e: &caprock_cap::checkpoint::ImageError) -> u32 {
+    use caprock_cap::checkpoint::ImageError as E;
     match e {
         E::NoImage => 1,
         E::Version { .. } => 2,
@@ -2430,8 +2430,8 @@ fn ckpt_code(e: &sel4lake_cap::checkpoint::ImageError) -> u32 {
 
 /// Grund-Code fuer eine verweigerte Cap (`LocalReason`) — dieselbe Form, aus demselben Grund.
 #[cfg(feature = "selftest")]
-fn ckpt_reason(r: sel4lake_cap::checkpoint::LocalReason) -> u32 {
-    use sel4lake_cap::checkpoint::LocalReason as L;
+fn ckpt_reason(r: caprock_cap::checkpoint::LocalReason) -> u32 {
+    use caprock_cap::checkpoint::LocalReason as L;
     match r {
         L::DeviceWindow => 1,
         L::InterruptLine => 2,
@@ -2444,12 +2444,12 @@ fn ckpt_reason(r: sel4lake_cap::checkpoint::LocalReason) -> u32 {
     }
 }
 
-/// Die Magie, die die Testsuiten in Sektor 0 des Plattenabbilds legen ("SEL4LAKE", LE).
+/// Die Magie, die die Testsuiten in Sektor 0 des Plattenabbilds legen ("CAPROCKS", LE).
 ///
 /// Warum ueberhaupt eine: ein Puffer voller Nullen ist von einem nie beschriebenen Puffer nicht
 /// zu unterscheiden, und ein frisches Abbild besteht genau daraus. Ein Test, der nur "das Geraet
 /// hat geantwortet" prueft, waere auch dann gruen, wenn der Datenpfad gar nichts uebertraegt.
-const BLK_MAGIC: u64 = 0x454B_414C_344C_4553;
+const BLK_MAGIC: u64 = 0x534B_434F_5250_4143;
 
 /// LBA, auf der die Magie liegt.
 ///
@@ -2466,7 +2466,7 @@ const MAGIC_LBA: u64 = 20001;
 /// Adressen der Testumgebung fuer den ARP-Austausch (QEMU `-netdev user`): der eingebaute
 /// Gateway liegt auf 10.0.2.2, der Gast bekommt 10.0.2.15.
 ///
-/// Sie stehen **hier** und nicht im Treiber: `sel4lake-virtio` bekommt sie hereingereicht. Ein
+/// Sie stehen **hier** und nicht im Treiber: `caprock-virtio` bekommt sie hereingereicht. Ein
 /// Treiber, der die Adressen seiner Testumgebung kennt, ist keiner mehr -- und genau diese
 /// Kenntnis ist das, was mit A-5.1 in die Treiber-PD bzw. deren Manifest wandert.
 #[cfg(feature = "selftest")]
@@ -3047,11 +3047,11 @@ fn report_and_off(watchdog: bool) -> ! {
     // traegt seit A-3.4 die Dimensionierung (`CAP_SLOTS_TOTAL`). Nachgezaehlt wird sie von
     // `capsum` weiter unten.
     let (pslots, cslots, pobjs, cobjs) = system::cap_peaks();
-    let pd_voll = cslots / sel4lake_microkit::CAP_BUDGET_PER_PD;
+    let pd_voll = cslots / caprock_microkit::CAP_BUDGET_PER_PD;
     println!(
         "capsz   : Cap-Slots Hoechststand {pslots}/{cslots}, Objekte {pobjs}/{cobjs}; bei vollem \
          Budget ({} Slots/PD) passen {pd_voll} PDs in die globale Tabelle",
-        sel4lake_microkit::CAP_BUDGET_PER_PD
+        caprock_microkit::CAP_BUDGET_PER_PD
     );
     let capsz_ok = pslots < cslots && pobjs < cobjs;
     println!(
@@ -3072,7 +3072,7 @@ fn report_and_off(watchdog: bool) -> ! {
         println!(
             "capsum  : {nonbudget}/{reserve} Slots ausserhalb aller PD-Budgets (Kernel-Wurzelcaps); \
              Kapazitaet {cslots} = {} PD-Budgets + {reserve} Reserve",
-            sel4lake_microkit::CAP_SLOTS_FOR_ALL_PDS
+            caprock_microkit::CAP_SLOTS_FOR_ALL_PDS
         );
     }
     println!(
@@ -3348,7 +3348,7 @@ fn report_and_off(watchdog: bool) -> ! {
         }
         println!(
             "part    : {} (A-6.2: die Partitionstabelle wird im BLOCKDIENST gelesen, nicht im \
-             Kern -- `sel4lake-part` ist abhaengigkeitsfrei, ohne unsafe und host-getestet. \
+             Kern -- `caprock-part` ist abhaengigkeitsfrei, ohne unsafe und host-getestet. \
              Geprueft werden beide Pruefsummen; die Eintragsliste passt nicht in eine Anfrage und \
              wird stueckweise gelesen, die Pruefsumme aber ueber das GANZE gebildet)",
             if PART_OK.load(Ordering::Acquire) { "ALL PASS" } else { "FAILURES" }
@@ -3571,7 +3571,7 @@ pub fn run(multiboot_info: u64) -> ! {
     // --- Hardware in der Reihenfolge hochziehen, in der sie voneinander abhängt ---
     hal::console::init();
     println!("========================================");
-    println!(" SEL4Lake — capability microkernel");
+    println!(" Caprock — capability microkernel");
     println!(" x86_64 (Multiboot -> Long Mode)");
     println!("========================================");
     hal::exception::init(); // IDT: Faults ab hier diagnostizierbar
@@ -3759,7 +3759,7 @@ pub fn run(multiboot_info: u64) -> ! {
      * Der Behelf war fail-closed und hat den nutzbaren Speicher fuer DMA-Regionen und isolierte
      * PDs bei 1 GiB gedeckelt -- fuer das Zielbild der haertere Deckel als die alte 4-GiB-Karte.
      *
-     * Behoben ist es jetzt dort, wo die Ursache lag: `sel4lake_mem::alloc_below` kennt den
+     * Behoben ist es jetzt dort, wo die Ursache lag: `caprock_mem::alloc_below` kennt den
      * Zonenwunsch, und die drei Aufrufer nennen ihn (`system::gib0_zone`). Damit haengt nichts
      * mehr an der Belegungsordnung, und hoher Speicher geht vollstaendig in die Freiliste --
      * fuer alles, was keine PD-eigene Abbildung braucht (Kernel-Stacks, Heap, Slabs, Archiv).
@@ -3837,7 +3837,7 @@ pub fn run(multiboot_info: u64) -> ! {
         "cap     : {cap_slots} Slots / {cap_objs} Objekte / {} PDs, Tabellen {} KiB aus dem RAM (Summe aller PD-Budgets: {})",
         system::pd_capacity(),
         cap_bytes >> 10,
-        sel4lake_microkit::CAP_SLOTS_FOR_ALL_PDS
+        caprock_microkit::CAP_SLOTS_FOR_ALL_PDS
     );
     // A-3.4 Teil 4: IPC-Tabellen VOR dem ersten Endpoint. Meldet sich selbst (`ipc :`).
     system::configure_ipc();

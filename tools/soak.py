@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SEL4Lake — Continuous-Soak-Orchestrator (Burn-in #2).
+"""Caprock — Continuous-Soak-Orchestrator (Burn-in #2).
 
 EINE Kernelinstanz (Feature `soak`) laeuft viele Stunden OHNE Neustart und arbeitet kontinuierlich:
 nach dem regulaeren Selbsttest faehrt der Idle-Manager statt `system_off` eine Endlos-Epochenschleife
@@ -19,11 +19,11 @@ Abschlussbericht (Speicher-Kurve Start<->Ende, Drift-Analyse, Audit-Zeitreihe, A
 import argparse, json, os, re, select, signal, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ELF = "build/target/aarch64-sel4lake/release/sel4lake-kernel.elf"
+ELF = "build/target/aarch64-caprock/release/caprock-kernel.elf"
 ARCHIVE = "build/boot-archive.bin"
-HELLO = "programs/build/target/aarch64-sel4lake-user/release/hello.elf"
-SVCDEMO = "programs/build/target/aarch64-sel4lake-user/release/svc-demo.elf"
-TBIN = "tests/build/target/aarch64-sel4lake-user/release"
+HELLO = "programs/build/target/aarch64-caprock-user/release/hello.elf"
+SVCDEMO = "programs/build/target/aarch64-caprock-user/release/svc-demo.elf"
+TBIN = "tests/build/target/aarch64-caprock-user/release"
 
 QEMU = [
     "qemu-system-aarch64", "-machine", "virt,iommu=smmuv3", "-cpu", "cortex-a72",
@@ -107,7 +107,7 @@ def write_report(state, outdir, final=False):
     base = s["base"] or {}
     lines, A = [], lambda x: lines.append(x)
     up_h = (time.time() - s["started_at"]) / 3600.0
-    A("# SEL4Lake — Continuous-Soak-Bericht (Burn-in #2, EINE Instanz, Feature `soak`)")
+    A("# Caprock — Continuous-Soak-Bericht (Burn-in #2, EINE Instanz, Feature `soak`)")
     A("")
     A(f"Status: {'ABGESCHLOSSEN' if final else 'LAUFEND'} · Start: {s['started_iso']} · "
       f"Stand: {time.strftime('%Y-%m-%d %H:%M:%S')}")

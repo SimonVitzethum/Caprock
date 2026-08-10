@@ -15,4 +15,4 @@ path = "src/main.rs"
 
 [dependencies]
 # Gemeinsames SDK (liegt im programs/-Workspace, hier per Pfad referenziert).
-libsel4lake = { path = "../../../../programs/libsel4lake" }
+libcaprock = { path = "../../../../programs/libcaprock" }

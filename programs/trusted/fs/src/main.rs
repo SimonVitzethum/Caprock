@@ -2,7 +2,7 @@
 //!
 //! Diese PD fährt **kein Gerät**. Sie ruft den Blockdienst über dessen Kanal, liest die Bytes aus
 //! der geteilten Übertragungsfläche und wertet sie mit zwei kernfreien Crates aus:
-//! `sel4lake-part` (GPT) und `sel4lake-fat` (FAT16). Beide sind `forbid(unsafe_code)` und
+//! `caprock-part` (GPT) und `caprock-fat` (FAT16). Beide sind `forbid(unsafe_code)` und
 //! host-getestet.
 //!
 //! ## Warum das eine eigene PD ist
@@ -17,7 +17,7 @@
 //!
 //! 1. `INFO` — wie groß ist die Platte;
 //! 2. `SCAN` — wo beginnt die erste Partition (GPT, geprüfte Prüfsummen);
-//! 3. Bootsektor der Partition lesen → `sel4lake_fat::parse_boot`;
+//! 3. Bootsektor der Partition lesen → `caprock_fat::parse_boot`;
 //! 4. Wurzelverzeichnis lesen → den gesuchten Namen finden;
 //! 5. der Clusterkette folgen und die Datei lesen.
 //!
@@ -34,11 +34,11 @@
 #![no_std]
 #![no_main]
 // TrustedSAS: das Zertifikats-Gate (ADR 0014) verlangt Auditierbarkeit. Der rohe Zugriff auf das
-// gemappte Fenster liegt deshalb im auditierten SDK (`libsel4lake::Window`), nicht hier.
+// gemappte Fenster liegt deshalb im auditierten SDK (`libcaprock::Window`), nicht hier.
 #![forbid(unsafe_code)]
 
-use libsel4lake::{call, exit, map_window, result, signal, Window};
-use sel4lake_fat::{dir_entry_at, name83, parse_boot, DIR_ENTRY};
+use libcaprock::{call, exit, map_window, result, signal, Window};
+use caprock_fat::{dir_entry_at, name83, parse_boot, DIR_ENTRY};
 
 /// Slot der eigenen Notification (Manifest `ntfn`) — der Meldekanal.
 const NTFN: u64 = 1;
@@ -69,7 +69,7 @@ const OFF_ERGEBNIS: u64 = 4096;
 /// Wie viele Sektoren eine Anfrage höchstens holt (muss zum Blockdienst passen).
 const MAX_SECTORS: u64 = 8;
 
-libsel4lake::entry!(run);
+libcaprock::entry!(run);
 
 /// Ein Ergebniswort in die Übertragungsfläche legen. Der Bereichsschutz liegt im `Window`-Typ.
 fn schreibe(shared: &Window, index: u64, wert: u64) {
@@ -241,9 +241,9 @@ fn run(_arg: usize) -> ! {
 /// aktualisieren, flushen. `0` = gut, sonst ein Grund.
 fn schreibe_datei(
     shared: &Window,
-    fs: &sel4lake_fat::Fat16,
+    fs: &caprock_fat::Fat16,
     part_lba: u64,
-    datei: &sel4lake_fat::DirEntry,
+    datei: &caprock_fat::DirEntry,
     dir_lba: u64,
     dir_index: u32,
 ) -> u64 {
@@ -255,7 +255,7 @@ fn schreibe_datei(
         return 10;
     }
     let Some(fatsek) = shared.bytes(0, 512) else { return 11 };
-    let Some(c2) = sel4lake_fat::find_free(fatsek, 0, fs.clusters) else { return 12 };
+    let Some(c2) = caprock_fat::find_free(fatsek, 0, fs.clusters) else { return 12 };
     if c2 == c1 {
         return 13;
     }
@@ -298,8 +298,8 @@ fn schreibe_datei(
     if !lies(dir_lba, 1) {
         return 21;
     }
-    let off = (dir_index % (512 / sel4lake_fat::DIR_ENTRY as u32)) as u64
-        * sel4lake_fat::DIR_ENTRY as u64;
+    let off = (dir_index % (512 / caprock_fat::DIR_ENTRY as u32)) as u64
+        * caprock_fat::DIR_ENTRY as u64;
     if shared.write_u16(off + 26, c1).is_none() || shared.write_u32(off + 28, NEU_LEN).is_none() {
         return 22;
     }
@@ -321,7 +321,7 @@ fn schreibe_datei(
 /// Gibt `(Status, gemeldete Groesse, geprueft gelesene Bytes)`.
 fn lies_zurueck(
     shared: &Window,
-    fs: &sel4lake_fat::Fat16,
+    fs: &caprock_fat::Fat16,
     part_lba: u64,
     dir_lba: u64,
     dir_index: u32,
@@ -330,7 +330,7 @@ fn lies_zurueck(
         return (30, 0, 0);
     }
     let Some(chunk) = shared.bytes(0, 512) else { return (31, 0, 0) };
-    let first = dir_index - (dir_index % (512 / sel4lake_fat::DIR_ENTRY as u32));
+    let first = dir_index - (dir_index % (512 / caprock_fat::DIR_ENTRY as u32));
     let Some(e) = dir_entry_at(chunk, first, dir_index) else { return (32, 0, 0) };
     let mut cluster = e.first_cluster;
     let mut gelesen = 0u32;

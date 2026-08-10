@@ -1,4 +1,4 @@
-//! Loom-Modell der CROSS-CORE-IPC/Wake-Pfade (sel4lake: KernelSched-Facade nimmt je Op GENAU EINEN
+//! Loom-Modell der CROSS-CORE-IPC/Wake-Pfade (caprock: KernelSched-Facade nimmt je Op GENAU EINEN
 //! SCHEDS-Lock, NIE zwei zugleich -> deadlock-frei, auch wenn zwei Kerne gleichzeitig cross-core
 //! aufeinander zugreifen). Modelliert das call()-Muster: EPS halten, dann SCHEDS[other] (unblock,
 //! sofort frei), dann SCHEDS[self] (block_current, sofort frei). Gegenprobe: das (hypothetisch

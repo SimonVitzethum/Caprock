@@ -13,4 +13,4 @@ name = "aggressor-t"
 path = "src/main.rs"
 
 [dependencies]
-libsel4lake = { path = "../../../../programs/libsel4lake" }
+libcaprock = { path = "../../../../programs/libcaprock" }

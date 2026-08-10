@@ -6,7 +6,7 @@ Bezug: ADR 0015 (Verifikationsansatz), ADR 0005 (per-Kern-paralleler MCS-Schedul
 
 ## Kontext
 
-Der Scheduler (`sel4lake-sched`) entscheidet, **welcher** Thread laeuft. Eine inkonsistente
+Der Scheduler (`caprock-sched`) entscheidet, **welcher** Thread laeuft. Eine inkonsistente
 Ready-Queue (toter/blockierter Eintrag, Duplikat, verlorener lauffaehiger Thread) bricht die
 Verfuegbarkeit; eine fehlerhafte MCS-Budget-Buchhaltung erlaubt Laufzeit-Diebstahl (ein Thread laeuft
 ueber sein Budget hinaus) oder Aushungerung (ein Thread wird nie wieder eingeplant). Zur Laufzeit

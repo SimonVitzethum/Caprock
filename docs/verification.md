@@ -1,6 +1,6 @@
-# SEL4Lake — Formale Verifikation (Tier 1: Kani, Tier 2: Verus-Pilot)
+# Caprock — Formale Verifikation (Tier 1: Kani, Tier 2: Verus-Pilot)
 
-Dieses Dokument beschreibt die **dauerhafte Verifikationspipeline** von SEL4Lake. Strategie-Analyse
+Dieses Dokument beschreibt die **dauerhafte Verifikationspipeline** von Caprock. Strategie-Analyse
 (Stufenmodell Tier 1–3, seL4-Vergleich, Tool-Landschaft): `ARMTest/formale-verifikation-aufwand.md`.
 
 ## Stufenmodell (Kurzfassung)
@@ -17,20 +17,20 @@ Dieses Dokument beschreibt die **dauerhafte Verifikationspipeline** von SEL4Lake
 
 | Komponente | Harness | Aussage |
 |---|---|---|
-| `sel4lake-loader/cert.rs` | `parse_never_panics` | `TrustedCert::parse` paniert/OOBt/überläuft **nie** (beliebige Eingabe) |
+| `caprock-loader/cert.rs` | `parse_never_panics` | `TrustedCert::parse` paniert/OOBt/überläuft **nie** (beliebige Eingabe) |
 | | `parse_partitions_input` | bei Erfolg: `message()+signature()` partitionieren die Eingabe exakt, Sig nicht leer, `len==152+build_info` |
-| `sel4lake-loader/archive.rs` | `parse_never_panics` | `Archive::parse` (+ `program(i)`) panik-/OOB-frei |
-| `sel4lake-loader/elf.rs` | `parse_never_panics` | `ElfImage::parse` panik-/OOB-/overflow-frei |
+| `caprock-loader/archive.rs` | `parse_never_panics` | `Archive::parse` (+ `program(i)`) panik-/OOB-frei |
+| `caprock-loader/elf.rs` | `parse_never_panics` | `ElfImage::parse` panik-/OOB-/overflow-frei |
 | | `segments_are_sound` | bei Erfolg: jedes Segment `memsz>=filesz`, `segment_bytes().len()==filesz`, `offset+filesz<=len` |
-| `sel4lake-region/lib.rs` | `split_at_partitions` | `split_at` partitioniert exakt + lückenlos + nicht-überlappend, overflow-/underflow-frei |
+| `caprock-region/lib.rs` | `split_at_partitions` | `split_at` partitioniert exakt + lückenlos + nicht-überlappend, overflow-/underflow-frei |
 | | `subview_within_parent` | `subview` liegt vollständig in der Eltern-Region (`off+sublen<=len`, kein Escape) |
 | | `get_set_never_oob` | rohe `get`/`set` greifen (über echten Puffer) nie ausserhalb der Region zu |
 | | `copy_fill_never_oob` | rohe `copy_from`/`copy_to`/`fill` bounds-respektierend (kein OOB) |
-| `sel4lake-sync/lib.rs` | `spinlock_roundtrip` | `SpinLock`: Guard-Deref memory-safe, Lock/Unlock-Round-Trip (`next==serving`), Daten-Persistenz |
+| `caprock-sync/lib.rs` | `spinlock_roundtrip` | `SpinLock`: Guard-Deref memory-safe, Lock/Unlock-Round-Trip (`next==serving`), Daten-Persistenz |
 | | `rwlock_write_then_read` | `RwSpinLock`: write→read sieht den Wert; nach allen Drops Zustand `0` |
 | | `rwlock_state_arithmetic` | Reader-Count + Writer-Bit over-/underflow-frei; Writer-Drop löscht **nur** das WRITER-Bit |
 
-> **Reichweite bei `sel4lake-sync`:** Kani ist ein **single-threaded** Modellprüfer, **kein**
+> **Reichweite bei `caprock-sync`:** Kani ist ein **single-threaded** Modellprüfer, **kein**
 > Nebenläufigkeits-Checker. Bewiesen sind Memory-Safety der Guards, Single-Thread-Round-Trips +
 > Daten-Persistenz und die Zähler-**Arithmetik**. Der **gegenseitige Ausschluss unter gleichzeitigem
 > Mehrkern-Zugriff** (Interleavings) liegt **außerhalb** Kanis Reichweite — dafür wäre ein
@@ -169,8 +169,8 @@ Richtung Scheduler/IPC.
 - [x] Boot-Archiv-Parser (`archive.rs`)
 - [x] ELF-Parser (`elf.rs`)
 - [x] CI-Gate (Gitea Actions)
-- [x] Region-Runtime (`sel4lake-region`: RegionView — Bounds-/Slice-/Overflow-Verträge um die `unsafe`-Blöcke)
-- [x] Synchronisationsprimitive (`sel4lake-sync`: Memory-Safety/Round-Trip/Arithmetik, single-thread)
+- [x] Region-Runtime (`caprock-region`: RegionView — Bounds-/Slice-/Overflow-Verträge um die `unsafe`-Blöcke)
+- [x] Synchronisationsprimitive (`caprock-sync`: Memory-Safety/Round-Trip/Arithmetik, single-thread)
 - [x] Concurrency-Modellprüfung der Locks (Loom, Stufe 2, seit `c2116ac`) — **mit einer Grenze,
       die 2026-07-29 teuer wurde, s. unten**
 - [ ] kernweite Overflow-/Arithmetik-Checks

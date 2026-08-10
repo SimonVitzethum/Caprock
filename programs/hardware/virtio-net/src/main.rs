@@ -41,8 +41,8 @@
 #![no_std]
 #![no_main]
 
-use libsel4lake::{exit, map_window, recv, reply, result, signal};
-use sel4lake_virtio::net::VirtioNet;
+use libcaprock::{exit, map_window, recv, reply, result, signal};
+use caprock_virtio::net::VirtioNet;
 
 const NTFN: u64 = 1;
 const EP: u64 = 2;
@@ -68,7 +68,7 @@ const DST_IP: [u8; 4] = [10, 0, 2, 2];
 ///
 /// **Keine arch-neutrale Barriere.** `core::sync::atomic::fence(SeqCst)` wird auf aarch64 zu
 /// `dmb ish` — Device-Memory liegt nicht in dieser Domäne. Der bequeme Weg schwächte die Semantik
-/// still ab; das Projekt hat diese Falle beim Entkoppeln von `sel4lake-virtio` schon einmal
+/// still ab; das Projekt hat diese Falle beim Entkoppeln von `caprock-virtio` schon einmal
 /// gesehen.
 #[cfg(target_arch = "x86_64")]
 fn device_fence() {
@@ -82,7 +82,7 @@ fn device_fence() {
     unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) }
 }
 
-libsel4lake::entry!(run);
+libcaprock::entry!(run);
 
 fn run(_arg: usize) -> ! {
     // 1. Fenster mappen. Jeder Fehlschlag endet **ohne** Bereit-Meldung: ein Treiber, der ohne
@@ -95,14 +95,14 @@ fn run(_arg: usize) -> ! {
     let Some(dma) = map_window(DMA) else { exit() };
     let (dma_cpu, dma_len, dma_dev) = (dma.base(), dma.len(), dma.iova());
     // Die Gerätesicht MUSS eine eigene Achse sein — eine identity-Abbildung soll es nicht geben.
-    if dma_dev == 0 || dma_len < sel4lake_virtio::net::REGION_BYTES {
+    if dma_dev == 0 || dma_len < caprock_virtio::net::REGION_BYTES {
         exit();
     }
 
     // 2. Das eigene Gerät auflösen — auf der eigenen Seite, ohne den Kernel.
     // SAFETY: `cfg` ist die gemappte Konfigurationsraum-Seite genau dieser Funktion; das darin
     // genannte BAR ist über Slot 4 in dieser VSpace erreichbar.
-    let Some(transport) = (unsafe { sel4lake_virtio::probe_ecam(cfg, device_fence) }) else {
+    let Some(transport) = (unsafe { caprock_virtio::probe_ecam(cfg, device_fence) }) else {
         exit();
     };
     let net = VirtioNet::from_transport(transport);
@@ -119,7 +119,7 @@ fn run(_arg: usize) -> ! {
         let op = m.msg[0];
         // Bei `OP_SELF` die eigene Pufferadresse, bei `OP_FOREIGN` die genannte fremde.
         let rx_dev = match op {
-            OP_SELF => dma_dev + sel4lake_virtio::net::OFF_RXBUF,
+            OP_SELF => dma_dev + caprock_virtio::net::OFF_RXBUF,
             OP_FOREIGN => m.msg[1],
             _ => {
                 reply(EP, [u64::MAX, 0, 0, 0]);

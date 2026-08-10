@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SEL4Lake — Formale Verifikation Tier 2: Verus (deduktive funktionale Verifikation).
+# Caprock — Formale Verifikation Tier 2: Verus (deduktive funktionale Verifikation).
 #
 # Beweist, dass dokumentierte Kernel-Invarianten (`cap_audit_cdt`, `dma_audit`, `loader_audit`, …)
 # von den jeweiligen Operationen ERHALTEN werden — statisch + fuer ALLE Zustaende, nicht nur an den
@@ -68,7 +68,7 @@ lauf() {   # lauf  -> setzt $rc; gibt die Ergebniszeilen aus
 # (a) garantiert nicht durchgeht und (b) an einem Ort liegt, den die alten zwei Globs NICHT
 # getroffen haetten. Findet das Skript sie nicht, ist genau die Luecke wieder da.
 selbsttest() {
-    local P="$ROOT/Verification/capability-system/sel4lake_waechterprobe.rs"
+    local P="$ROOT/Verification/capability-system/caprock_waechterprobe.rs"
     trap 'rm -f "$P"' RETURN
     cat > "$P" <<'EOF'
 // Wegwerfdatei des Selbsttests von tools/verus-verify.sh. Sie MUSS fehlschlagen.
@@ -85,7 +85,7 @@ EOF
     # stirbt an SIGPIPE, und `pipefail` macht daraus einen Fehlschlag der ganzen Pipeline. Der
     # Selbsttest haette dann „wird nicht eingesammelt" gemeldet, obwohl sie eingesammelt wird.
     local liste; liste="$(beweisdateien)"
-    if printf '%s\n' "$liste" | grep -q 'sel4lake_waechterprobe.rs'; then
+    if printf '%s\n' "$liste" | grep -q 'caprock_waechterprobe.rs'; then
         echo "  Selbsttest 1/2: die untergeschobene Datei wird eingesammelt (auch ausserhalb von proofs/)"
     else
         echo "  FEHLER: die untergeschobene Beweisdatei wird NICHT eingesammelt." >&2
@@ -119,7 +119,7 @@ bash "$ROOT/tools/verus-modelltreue-ipc.sh" || rc=1
 
 # Der Scheduler-Waechter hat noch einmal eine andere Bauform, aus demselben Grund wie beim IPC --
 # 7 Modellfelder gegen 20 TCB-Felder, 7 Uebergaenge gegen 20 zustandsschreibende Funktionen.
-# Ausfuehren wie beim IPC geht hier nicht (`Scheduler` haengt an `sel4lake-hal`/`-slab`/`-sync` und
+# Ausfuehren wie beim IPC geht hier nicht (`Scheduler` haengt an `caprock-hal`/`-slab`/`-sync` und
 # baut nicht auf dem Host). Deshalb: Feld- und Uebergangs-Abdeckung als echte Kreuzpruefung, dazu
 # ein Strukturvergleich, der nicht Gleichheit verlangt, sondern die eingetragene, begruendete
 # UEBERTRAGUNGSLUECKE. Siehe Kopf des Skripts -- dort steht auch, was er NICHT prueft.

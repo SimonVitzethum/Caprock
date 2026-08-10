@@ -9,7 +9,7 @@ Capability** vergeben.
 
 ## Scheduling-Context-Objekt (Scheduler)
 
-Jeder `Tcb` (in `sel4lake-sched`) trägt MCS-Felder: `budget` (Ticks je Periode, `0` =
+Jeder `Tcb` (in `caprock-sched`) trägt MCS-Felder: `budget` (Ticks je Periode, `0` =
 unbeschränkt/Round-Robin), `period`, `remaining`, `next_refill`, `depleted`. Der
 Scheduler-`now`-Zähler taktet die Perioden; `depletions`/`refills` sind Telemetrie.
 
@@ -30,7 +30,7 @@ Scheduler-`now`-Zähler taktet die Perioden; `depletions`/`refills` sind Telemet
 
 ## Scheduling-Context-Capability (Autorität nur über Caps)
 
-Neue Objektart `ObjectKind::SchedContext { budget, period }` im `sel4lake-cap`-CapSpace,
+Neue Objektart `ObjectKind::SchedContext { budget, period }` im `caprock-cap`-CapSpace,
 eingebracht über `CapSpace::install_sched_context(budget, period, rights)`. Die Cap
 **ist** die Autorität, einem Thread Budget zuzuweisen — analog zu seL4
 `SchedContext_Bind`:

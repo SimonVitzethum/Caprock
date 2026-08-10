@@ -1,0 +1,18 @@
+# `caprock-part` — GPT-Partitionstabellen lesen (A-6.2).
+#
+# **Keine Abhaengigkeiten**, und das ist der Zweck: die Crate wird von einer Userland-PD gelinkt,
+# nicht vom Kern. Eine Partitionstabelle sind fremde Bytes auf einer Platte; sie mit Kernprivileg
+# zu interpretieren waere genau die Klasse Fehler, die man dort nicht haben will.
+#
+# `forbid(unsafe_code)` und reine Byte-Arithmetik -> auf dem HOST pruefbar, in Sekunden:
+#   rustc --test --edition 2021 -O crates/caprock-part/src/lib.rs -o /tmp/t && /tmp/t
+[package]
+name = "caprock-part"
+version.workspace = true
+edition.workspace = true
+# **GRENZ-CRATE: permissiv, und das ist tragend** (docs/grenze.md). Jede PD linkt das hier --
+# stuende es unter AGPL, waere jedes Programm mit AGPL-Code gelinkt und die ABI-Ausnahme
+# gegenstandslos. Dieselbe Grenze, fuer die Linux die UAPI-Header-Ausnahme hat.
+license = "MIT OR Apache-2.0"
+
+[dependencies]

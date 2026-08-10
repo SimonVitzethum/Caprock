@@ -1,4 +1,4 @@
-// SEL4Lake — Phase 1 (Capability-System), Schritt B+C: VEREINTES Modell + VOLLE Invariante.
+// Caprock — Phase 1 (Capability-System), Schritt B+C: VEREINTES Modell + VOLLE Invariante.
 //
 // Ein einziges `CapSpace`-Modell (Objekt- + Slot-/CDT-Tabelle) mit der VOLLSTAENDIGEN
 // `cap_audit_cdt`-Invariante als EINE `spec fn cap_inv` (Konjunktion der Klauseln 1-7). Jede
@@ -318,7 +318,7 @@ pub proof fn mint(cs: CapSpace, src: nat) -> (cs2: CapSpace)
 // ============================ Operation: delete (Leaf) ============================
 //
 // **Modell-Treue (Schritt C2b).** Die vier Schreibzugriffe unten spiegeln `CapSpace::unlink` +
-// `CapSpace::release_slot` in `crates/sel4lake-cap/src/space.rs` Schritt fuer Schritt: gleiche
+// `CapSpace::release_slot` in `crates/caprock-cap/src/space.rs` Schritt fuer Schritt: gleiche
 // Verzweigung, gleiche Reihenfolge, gleiche Feldzuweisung.
 //
 //     let mdb = self.slots[slot].mdb;                                   // `inode` unten

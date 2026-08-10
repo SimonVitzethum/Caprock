@@ -11,7 +11,7 @@ zuvor verworfenen Lazy-FP-Pfad (ext-3).
 
 ## 1. MMU: Privileg-Grenze über AP-Bits ✅
 
-Die *eine* Identity-Map mappt nun pro Seite differenziert (`sel4lake-hal::mmu`):
+Die *eine* Identity-Map mappt nun pro Seite differenziert (`caprock-hal::mmu`):
 
 | Region                              | EL0 | EL1 | XN-Bits     |
 |-------------------------------------|-----|-----|-------------|

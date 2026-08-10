@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SEL4Lake — TrustedSAS-Root-Schluessel erzeugen + Kernel-Key-DB generieren (ext-28, ADR 0014).
+"""Caprock — TrustedSAS-Root-Schluessel erzeugen + Kernel-Key-DB generieren (ext-28, ADR 0014).
 
 Erzeugt ein Ed25519-Schluesselpaar. Der **private** Schluessel bleibt lokal unter `keys/` (gitignored,
 NIE im Repo/Kernel). Der **oeffentliche** Schluessel + die Key-ID (= SHA-256(pubkey)[..16]) werden in
@@ -89,7 +89,7 @@ def regen_db():
         "//! kompiliert, NICHT per Syscall aenderbar. Erweiterung/Rotation/Revocation nur durch erneutes\n"
         "//! Generieren + Neukompilieren (Firmware-/Kernel-Update). Private Schluessel liegen NIE hier.\n"
         "\n"
-        "use sel4lake_trust::TrustedKey;\n"
+        "use caprock_trust::TrustedKey;\n"
         "\n"
         "/// Akzeptierte oeffentliche Root-Schluessel (per `key_id` referenziert).\n"
         "pub static TRUSTED_KEYS: &[TrustedKey] = &[\n"

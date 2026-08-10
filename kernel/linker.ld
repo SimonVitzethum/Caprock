@@ -1,9 +1,9 @@
-/* SEL4Lake kernel link script — QEMU `virt` (aarch64).
+/* Caprock kernel link script — QEMU `virt` (aarch64).
  *
  * QEMU loads an ELF passed via `-kernel` according to its program headers and
  * jumps to the ELF entry point (`_start`). RAM on the `virt` machine starts at
  * 0x4000_0000; QEMU's conventional kernel load offset is 0x4008_0000, which we
- * use as the kernel base. There is no virtual memory in SEL4Lake — these are
+ * use as the kernel base. There is no virtual memory in Caprock — these are
  * real physical addresses (see docs/adr/0002-no-virtual-memory-sas.md).
  */
 
@@ -21,7 +21,7 @@ SECTIONS {
 
     /* Section boundaries are 4 KiB-aligned so the MMU can enforce W^X per page
      * (.text = R-X, .rodata = R--, everything else = RW + XN). See
-     * docs/adr/0002-no-virtual-memory-sas.md and sel4lake-hal::mmu. */
+     * docs/adr/0002-no-virtual-memory-sas.md and caprock-hal::mmu. */
     .text : ALIGN(4096) {
         __text_start = .;
         KEEP(*(.text.boot))   /* _start must lead the image */

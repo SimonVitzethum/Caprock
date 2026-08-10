@@ -9,7 +9,7 @@ ist weg; jeder Kern hat eine eigene Scheduler-Instanz hinter eigenem Lock und pl
 
 ## 1. Per-Kern-Scheduler-Instanzen + TCB-Partitionierung ✅
 
-- `sel4lake-sched::Scheduler` ist jetzt eine **einzelne Kern-Instanz**: eigene
+- `caprock-sched::Scheduler` ist jetzt eine **einzelne Kern-Instanz**: eigene
   TCB-Partition, Run-Queues (eine je Priorität), `current`, Zombies. Der Kernel hält
   `SCHEDS: [SpinLock<Scheduler>; NUM_CORES]` — eine je Kern.
 - **TCB-Partitionierung:** Der globale Slot-Raum (`NTHREADS = NUM_CORES*PER_CORE`,

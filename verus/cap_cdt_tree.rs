@@ -1,6 +1,6 @@
-// SEL4Lake — Verus-Pilot (Tier 2), Teil 2: CDT-**Struktur**-Invariante.
+// Caprock — Verus-Pilot (Tier 2), Teil 2: CDT-**Struktur**-Invariante.
 //
-// Zweite formale Spezifikation aus `cap_audit_cdt` (crates/sel4lake-cap/src/space.rs): die
+// Zweite formale Spezifikation aus `cap_audit_cdt` (crates/caprock-cap/src/space.rs): die
 // **Sibling-Konsistenz** (Code 5) der Capability-Derivation-Tree-Geschwisterliste — eine
 // doppelt-verkettete Liste, deren `next_sibling`/`prev_sibling` **gegenseitige Inverse** sind
 // (und nur auf gueltige, belegte Knoten zeigen). Bewiesen: die Listenoperationen `insert_before`

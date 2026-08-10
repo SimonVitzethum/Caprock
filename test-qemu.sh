@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Automatisierter QEMU-Boot-/SMP-/Timer-Test für SEL4Lake.
+# Automatisierter QEMU-Boot-/SMP-/Timer-Test für Caprock.
 #
 # Baut den Kernel, bootet ihn unter QEMU (ARM virt, 8 Kerne, 4 GiB), erfasst die
 # serielle Ausgabe für einige Sekunden und prüft auf die erwarteten Marker:
@@ -18,7 +18,7 @@ CORES=8
 # single-threaded QEMU-TCG eine Host-CPU; unter schwerer Host-Last emuliert alles
 # deutlich länger (kein Kernel-Hang — der Manager druckt sonst eine `DBG pending`-Zeile).
 SECONDS_RUN="${1:-360}"
-ELF="build/target/aarch64-sel4lake/release/sel4lake-kernel.elf"
+ELF="build/target/aarch64-caprock/release/caprock-kernel.elf"
 
 # In-Kernel-Fuzzer (ADR 0013) sind ein optionales Feature. Default: RELEASE-Build OHNE Fuzzer
 # (genau die Konfiguration des Langzeittests/Produktivkernels) -> die vier Fuzzer-Checks entfallen.
@@ -54,13 +54,13 @@ mkdir -p build
 # greifen den Kernel + sich gegenseitig an (ADR 0012). NICHT Teil des Kernel-Images.
 ( cd tests && rustup run nightly cargo build --release ) >/dev/null 2>&1 \
     || { echo "TESTS BUILD FAILED"; exit 1; }
-HELLO="programs/build/target/aarch64-sel4lake-user/release/hello.elf"
-SVCDEMO="programs/build/target/aarch64-sel4lake-user/release/svc-demo.elf"
-INIT="programs/build/target/aarch64-sel4lake-user/release/init.elf"
-TBIN="tests/build/target/aarch64-sel4lake-user/release"
+HELLO="programs/build/target/aarch64-caprock-user/release/hello.elf"
+SVCDEMO="programs/build/target/aarch64-caprock-user/release/svc-demo.elf"
+INIT="programs/build/target/aarch64-caprock-user/release/init.elf"
+TBIN="tests/build/target/aarch64-caprock-user/release"
 printf 'PLACEHOLDER' > build/_probe.bin
 # ext-28 (ADR 0014): TrustedSAS-Binaries signieren. tools/sign_trusted.py fuehrt zuerst den
-# Unsafe-Audit (Allowlist {libsel4lake}) durch -> KEIN Zertifikat bei Verletzung, dann SHA-256-
+# Unsafe-Audit (Allowlist {libcaprock}) durch -> KEIN Zertifikat bei Verletzung, dann SHA-256-
 # Bindung an genau dies ELF + Ed25519-Signatur ueber die volle Nachricht. program_id/version MUESSEN
 # zum Archiv-Eintrag passen (Identitaets-Bindung). Schluessel: keys/trusted-test (privat, gitignored).
 mkdir -p certs
@@ -235,7 +235,7 @@ fcheck() { if [ -n "${KERNEL_FUZZ:-}" ]; then check "$1" "$2"; else echo "  SKIP
 
 check "M=1 C=1 I=1" "MMU + Caches aktiv"
 check "dtb     : ALL PASS" "DTB-Parsing (RAM-Größe aus dem Device Tree)"
-check "archive : 11 Modul" "ext-26 L0: Boot-Archiv extern geladen + vom Kernel-Parser gelesen (reserviertes RAM-Fenster, sel4lake-loader)"
+check "archive : 11 Modul" "ext-26 L0: Boot-Archiv extern geladen + vom Kernel-Parser gelesen (reserviertes RAM-Fenster, caprock-loader)"
 check "manifest: ALL PASS" "A-1.2/A-1.4 (D5): das System-Manifest wird auch auf aarch64 geprueft -- Signatur ueber die GESAMTE Nachricht, an DIESES Kernel-Image gebunden, Anti-Downgrade"
 check "root    : ALL PASS" "A-2.1 (D5): der aarch64-Kernel hat einen Root-Task. Bis hierher meldete er 'root : FAILURES (NoManifest)', und diese Suite sah sich die Zeile ueberhaupt nicht an -- ein dauerhaft rotes Teilurteil lag unbeachtet im Bericht. Ein Urteil, das niemand ansieht, unterscheidet nicht mehr zwischen 'wie immer' und 'gerade gebrochen'"
 check "memtest : ALL PASS" "Speichermodell-Selbsttest (alloc/split/transfer/free)"

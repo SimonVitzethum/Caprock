@@ -3,7 +3,7 @@
 **Kein Rechtsrat.** Das ist die Struktur der Regel, wie sie allgemein verstanden wird. Vor einer
 Produkt- oder Vertriebsentscheidung gehört sie vor jemanden mit Zulassung.
 
-SEL4Lake steht unter `AGPL-3.0-or-later` (s. `LICENSE`). Dieses Dokument gewährt eine
+Caprock steht unter `AGPL-3.0-or-later` (s. `LICENSE`). Dieses Dokument gewährt eine
 **zusätzliche Erlaubnis** im Sinne von (A)GPLv3 §7 — es nimmt **nichts** weg und beschränkt niemanden.
 
 ---
@@ -11,12 +11,12 @@ SEL4Lake steht unter `AGPL-3.0-or-later` (s. `LICENSE`). Dieses Dokument gewähr
 ## Die Ausnahme
 
 > Ein eigenständiges Programm, das ausschliesslich über die **veröffentlichte
-> System-Schnittstelle** von SEL4Lake mit dem Kernel verkehrt, gilt allein aus diesem Grund
+> System-Schnittstelle** von Caprock mit dem Kernel verkehrt, gilt allein aus diesem Grund
 > **nicht** als abgeleitetes Werk (*derivative work*) des Kernels, und seine Weitergabe unterliegt
 > allein aus diesem Grund **nicht** der GPL.
 >
 > Zur veröffentlichten System-Schnittstelle zählen: die Syscall-Nummern, Ergebniscodes und
-> Registerbelegungen aus `crates/sel4lake-abi`, die IPC-Nachrichtenformate, das Manifestformat,
+> Registerbelegungen aus `crates/caprock-abi`, die IPC-Nachrichtenformate, das Manifestformat,
 > die Dienstprotokolle der mitgelieferten PDs — sowie die **Grenz-Crates** (s. `docs/grenze.md`),
 > soweit sie unter einer permissiven Lizenz stehen.
 >
@@ -45,12 +45,12 @@ Ausnahme gilt allen, und der Copyleft-Charakter des Kerns bleibt davon unberühr
 
 ## Was die Ausnahme NICHT tut
 
-* Sie ändert **nichts** an der GPLv3 für SEL4Lake selbst. Wer den Kernel oder kernnahe Crates
+* Sie ändert **nichts** an der GPLv3 für Caprock selbst. Wer den Kernel oder kernnahe Crates
   verändert und weitergibt, gibt unter GPLv3 weiter.
 * Sie macht **keine** Aussage über Programme, die Kernelcode enthalten oder statisch einbinden.
 * Sie ist **keine** Aussage über fremden Code: eine Linux-Kompatibilitätsschicht enthält
   Linux-Code und ist damit ein abgeleitetes Werk des **Linux**-Kernels — dafür gilt GPLv2, und
-  daran ändert diese Ausnahme nichts (s. das getrennte Repo `sel4lake-linux-compat`).
+  daran ändert diese Ausnahme nichts (s. das getrennte Repo `caprock-linux-compat`).
 
 ---
 
@@ -75,7 +75,7 @@ Was das konkret trennt:
 | | trifft §13 |
 |---|---|
 | jemand **verändert** den Kernel und betreibt ihn als Dienst | **ja** — Quelltext an die Nutzer |
-| jemand betreibt SEL4Lake **unverändert** als Dienst | nein (nichts verändert) |
+| jemand betreibt Caprock **unverändert** als Dienst | nein (nichts verändert) |
 | ein Kunde fährt sein **eigenes Programm** als PD darauf | **nein** — es ist kein abgeleitetes Werk, s. die Ausnahme oben |
 
 **Die dritte Zeile ist der Grund, warum die ABI-Ausnahme jetzt tragend ist.** Ohne sie stünde für

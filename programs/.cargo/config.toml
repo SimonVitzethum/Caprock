@@ -1,11 +1,11 @@
-# Build-Konfiguration für die externen SEL4Lake-EL0-Programme (ext-26).
+# Build-Konfiguration für die externen Caprock-EL0-Programme (ext-26).
 #
 # Eigenständig baubar: `cd programs && cargo build --release` erzeugt statisch gelinkte
 # ET_EXEC-ELF64-Binaries (eigene Target-Spec + Linker-Skript, GETRENNT vom Kernel-Workspace).
 # Die Binaries werden vom generischen Binary-Loader des Kernels geladen.
 
 [build]
-target = "aarch64-sel4lake-user.json"
+target = "aarch64-caprock-user.json"
 target-dir = "build/target"
 
 [unstable]
@@ -13,7 +13,7 @@ json-target-spec = true
 build-std = ["core", "compiler_builtins"]
 build-std-features = ["compiler-builtins-mem"]
 
-[target.aarch64-sel4lake-user]
+[target.aarch64-caprock-user]
 rustflags = [
     # Eigenes Linker-Skript (relativ zum programs/-Verzeichnis, aus dem `cargo build` läuft):
     # festgelinkt an 0x4100_0000, getrennte W^X-PT_LOAD-Segmente.
@@ -23,9 +23,9 @@ rustflags = [
     "-C", "link-arg=-zmax-page-size=4096",
 ]
 
-# x86_64 (A-1.5). Bauen: `cd programs && cargo build --release --target x86_64-sel4lake-user.json`
+# x86_64 (A-1.5). Bauen: `cd programs && cargo build --release --target x86_64-caprock-user.json`
 # — das `[build] target` oben bleibt die Vorgabe, `--target` schlägt sie.
-[target.x86_64-sel4lake-user]
+[target.x86_64-caprock-user]
 rustflags = [
     # Eigenes Linker-Skript: festgelinkt an 0x2000_0000 (das x86-VSpace-Fenster für isolierte PDs
     # reicht nur bis 1 GiB — Begründung steht in `user-x86.ld`).

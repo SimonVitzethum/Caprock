@@ -86,7 +86,7 @@ bewusst: „Mechanismus fertig" ≠ „Policy standardmäßig an". Offen in [tod
 
 ## 4. Kapazität kommt zur Boot-Zeit aus dem RAM
 
-Neue Crate `sel4lake-slab`:
+Neue Crate `caprock-slab`:
 
 * `Slab<T>` — Tabelle, die `const` **leer** konstruierbar ist (statische Instanzen bleiben
   möglich) und ihren Speicher beim Boot bekommt. `Index`/`IndexMut` paniken bei Überschreitung

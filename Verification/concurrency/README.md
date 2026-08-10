@@ -4,14 +4,14 @@
 > Sync-Primitive (RwSpinLock/Ticket-Lock), **globale Lock-Hierarchie** (aufsteigend = deadlock-frei)
 > und **Cross-Core-IPC** (one-lock-per-op). Krypto-/Trust-Flow review-verifiziert (kein Befund).
 
-Bezug: [ADR 0023](../../docs/adr/0023-concurrency-verification-loom.md), `crates/sel4lake-sync`,
-`crates/sel4lake-trust`, `kernel/src/loader.rs` (verify_trusted_cert), `docs/invariants.md` §1a.
+Bezug: [ADR 0023](../../docs/adr/0023-concurrency-verification-loom.md), `crates/caprock-sync`,
+`crates/caprock-trust`, `kernel/src/loader.rs` (verify_trusted_cert), `docs/invariants.md` §1a.
 
 ## 1. Loom — Concurrency-Verifikation der Sync-Primitive
 
 Verus ist single-threaded; **Nebenläufigkeit** war bisher ausgeklammert. [Loom](https://docs.rs/loom)
 exploriert **alle** Thread-Interleavings des **echten** Lock-Codes. Das Artefakt
-[`loom/`](loom/) enthält **getreue Kopien** der Lock-Logik aus `sel4lake-sync` (mit `loom`-Atomics +
+[`loom/`](loom/) enthält **getreue Kopien** der Lock-Logik aus `caprock-sync` (mit `loom`-Atomics +
 `loom::cell::UnsafeCell` statt `core`):
 
 | Modell | Bereich | Eigenschaft | Status |
@@ -62,8 +62,8 @@ sonst build-std/Custom-Target erzwingt (gleiches Muster wie `tools/kani-verify.s
 
 ## 2. Krypto-/Trust-Review (kein Befund)
 
-Gezielter Review des TrustedSAS-Zertifikats-Flows (`sel4lake-trust` + `loader::verify_trusted_cert` +
-`sel4lake-loader/cert.rs`). **Ergebnis: kein Befund** — der Flow ist korrekt:
+Gezielter Review des TrustedSAS-Zertifikats-Flows (`caprock-trust` + `loader::verify_trusted_cert` +
+`caprock-loader/cert.rs`). **Ergebnis: kein Befund** — der Flow ist korrekt:
 
 - **Etablierte Krypto:** Ed25519 (`ed25519-dalek` v2) + SHA-256 (`sha2`), keine Eigenentwicklung;
   **`verify_strict`** (nicht `verify`) → keine Signatur-Malleability an der Vertrauensgrenze.

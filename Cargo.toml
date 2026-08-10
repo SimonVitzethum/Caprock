@@ -1,4 +1,4 @@
-# SEL4Lake — capability-based Rust microkernel.
+# Caprock — capability-based Rust microkernel.
 #
 # Workspace root. Phase 0 contains only the bootable `kernel` image crate.
 # Subsystem crates (capabilities, IPC, scheduler, memory) are split out in
@@ -8,30 +8,30 @@
 resolver = "2"
 members = [
     "kernel",
-    "crates/sel4lake-sync",
-    "crates/sel4lake-slab",
-    "crates/sel4lake-abi",
-    "crates/sel4lake-hal",
-    "crates/sel4lake-virtio",
-    "crates/sel4lake-part",
-    "crates/sel4lake-fat",
-    "crates/sel4lake-mem",
-    "crates/sel4lake-region",
-    "crates/sel4lake-loader",
-    "crates/sel4lake-trust",
-    "crates/sel4lake-cap",
-    "crates/sel4lake-sched",
-    "crates/sel4lake-ipc",
-    "crates/sel4lake-microkit",
-    "crates/sel4lake-dtb",
-    "crates/sel4lake-dma",
-    "crates/sel4lake-wait",
+    "crates/caprock-sync",
+    "crates/caprock-slab",
+    "crates/caprock-abi",
+    "crates/caprock-hal",
+    "crates/caprock-virtio",
+    "crates/caprock-part",
+    "crates/caprock-fat",
+    "crates/caprock-mem",
+    "crates/caprock-region",
+    "crates/caprock-loader",
+    "crates/caprock-trust",
+    "crates/caprock-cap",
+    "crates/caprock-sched",
+    "crates/caprock-ipc",
+    "crates/caprock-microkit",
+    "crates/caprock-dtb",
+    "crates/caprock-dma",
+    "crates/caprock-wait",
 ]
 
 [workspace.package]
 edition = "2021"
 license = "AGPL-3.0-or-later"
-authors = ["SEL4Lake"]
+authors = ["Caprock"]
 version = "0.0.1"
 
 # Bare-metal kernel: no unwinding, abort on panic.

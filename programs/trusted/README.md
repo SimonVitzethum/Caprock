@@ -10,8 +10,8 @@ Gate: `kernel::loader::verify_image`).
 
 1. **Vollständig `#![forbid(unsafe_code)]`** — kein `unsafe` im Programm selbst.
 2. Einzige zulässige `unsafe`-Quelle im gesamten Dependency-Baum ist die auditierte Syscall-ABI
-   `libsel4lake` (**Allowlist**). Keine weiteren Abhängigkeiten mit `unsafe`.
-3. Entry über `libsel4lake::entry!(run)` mit sicherer `fn run(arg: usize) -> !` — die
+   `libcaprock` (**Allowlist**). Keine weiteren Abhängigkeiten mit `unsafe`.
+3. Entry über `libcaprock::entry!(run)` mit sicherer `fn run(arg: usize) -> !` — die
    `#[no_mangle] _start`-Glue lebt in der Allowlist-Schicht, nicht im Programm.
 
 Referenz: [`svc-demo/`](svc-demo/) — minimales, sauberes, zertifiziertes Demo.
@@ -25,7 +25,7 @@ cd programs && cargo build --release
 # 2. Auditieren (Unsafe-Allowlist) + hashen + signieren -> Zertifikat
 tools/sign_trusted.py \
   --crate programs/trusted/<name> \
-  --elf programs/build/target/aarch64-sel4lake-user/release/<name>.elf \
+  --elf programs/build/target/aarch64-caprock-user/release/<name>.elf \
   --program-id <id> --version <v> --policy internal-test \
   --key keys/trusted-test.ed25519 \
   --out certs/<name>.cert

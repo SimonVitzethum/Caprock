@@ -6,7 +6,7 @@
 # ================================================================================================
 #
 # `Verification/ipc/proofs/endpoint.rs` beweist etwas ueber ein Modell mit NEUN Feldern und ACHT
-# Operationen. `crates/sel4lake-ipc/src/lib.rs::Endpoint` hat SECHS Felder (`used`, `quiescing`,
+# Operationen. `crates/caprock-ipc/src/lib.rs::Endpoint` hat SECHS Felder (`used`, `quiescing`,
 # `senders`, `receivers`, `caller`, `reply_owner`) und rund fuenfzehn Operationen. Alle sechs haben
 # im Modell inzwischen ein Gegenstueck; die drei weiteren (`delivered`, `rejected_senders`,
 # `rejected_receivers`) sind Buchhaltung, die im Code nirgends steht und deshalb **gemessen** wird.
@@ -22,7 +22,7 @@
 #      die B-7.2 bezahlt hat. Der Uebersetzer ist fail-closed: was er nicht kennt, ist ein Fehler,
 #      kein Ueberspringen; und er prueft die Menge der `spec fn`/`proof fn` gegen die Liste, die
 #      dieser Kopf benennt.
-#   2. Der ECHTE Quelltext von `sel4lake-ipc` wird **unveraendert** uebernommen (eine einzige,
+#   2. Der ECHTE Quelltext von `caprock-ipc` wird **unveraendert** uebernommen (eine einzige,
 #      geprueft vorhandene Zeile `#![no_std]` faellt weg, damit ein Host-Binary entsteht) und
 #      gegen Stellvertreter fuer HAL/Scheduler/ABI gelinkt.
 #   3. Die Abbildung `echter Endpoint -> Modell-Endpoint` (`alpha`) steht an EINER Stelle:
@@ -117,13 +117,13 @@ if [ -z "${BASH_VERSION:-}" ]; then echo "FEHLER: braucht bash, nicht sh/dash." 
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-CODE_STD="$ROOT/crates/sel4lake-ipc/src/lib.rs"
+CODE_STD="$ROOT/crates/caprock-ipc/src/lib.rs"
 MODELL_STD="$ROOT/Verification/ipc/proofs/endpoint.rs"
-ABI_STD="$ROOT/crates/sel4lake-abi/src/lib.rs"
+ABI_STD="$ROOT/crates/caprock-abi/src/lib.rs"
 RUSTC="${RUSTC:-rustc}"
 
 # **Alle Wegwerfdateien unter EINER Wurzel, mit einem Aufraeumer, der auch bei Abbruch greift.**
-# Der Selbsttest arbeitet ausschliesslich auf Kopien; die Originale (`sel4lake-ipc/src/lib.rs`,
+# Der Selbsttest arbeitet ausschliesslich auf Kopien; die Originale (`caprock-ipc/src/lib.rs`,
 # `Verification/ipc/proofs/endpoint.rs`) werden nie beschrieben. Ein Ctrl-C mitten im Lauf darf
 # weder etwas stehenlassen noch etwas zuruecklassen, das nach Zustand aussieht.
 WURZEL="$(mktemp -d)"
@@ -496,7 +496,7 @@ PY
 }
 
 # ================================================================================================
-# 2. Der Stellvertreter fuer `sel4lake-abi` -- **extrahiert**, nicht abgeschrieben.
+# 2. Der Stellvertreter fuer `caprock-abi` -- **extrahiert**, nicht abgeschrieben.
 #    Die Registerindizes entscheiden mit, wo eine Nachricht landet; sie hier noch einmal
 #    hinzuschreiben waere dieselbe Kopie-Falle wie ein handgeschriebenes Modell.
 # ================================================================================================
@@ -527,8 +527,8 @@ mw = re.search(r'pub const MSG_WORDS\s*:\s*usize\s*=\s*\d+\s*;', s)
 if not mw:
     sys.exit("FEHLER: `pub const MSG_WORDS` in %s NICHT GEFUNDEN." % pfad)
 teile = [mw.group(0), block(r'pub mod reg\s*\{'), block(r'pub mod result\s*\{')]
-print("// Aus crates/sel4lake-abi/src/lib.rs uebernommen (extrahiert, nicht abgeschrieben).")
-print("mod sel4lake_abi {")
+print("// Aus crates/caprock-abi/src/lib.rs uebernommen (extrahiert, nicht abgeschrieben).")
+print("mod caprock_abi {")
 for t in teile:
     print("\n".join("    " + z if z.strip() else z for z in t.splitlines()))
 print("}")
@@ -543,13 +543,13 @@ anbau_schreiben() {   # anbau_schreiben <zieldatei>
     cat > "$1" <<'RSEOF'
 
 // ================================================================================================
-// Ab hier: der Anbau des Modell-Treue-Waechters. Nicht Teil von `sel4lake-ipc`.
+// Ab hier: der Anbau des Modell-Treue-Waechters. Nicht Teil von `caprock-ipc`.
 // ================================================================================================
 
-/// Stellvertreter fuer `sel4lake-hal`: ein Frame ist ein Index in eine globale Registerablage.
+/// Stellvertreter fuer `caprock-hal`: ein Frame ist ein Index in eine globale Registerablage.
 /// Was ein echter Frame tut, sagt dieser Lauf NICHT -- hier zaehlt nur, dass ein `transfer`
 /// beobachtbar wird.
-mod sel4lake_hal {
+mod caprock_hal {
     pub mod exception {
         use std::sync::Mutex;
         pub const NREG: usize = 8;
@@ -569,10 +569,10 @@ mod sel4lake_hal {
     }
 }
 
-/// Stellvertreter fuer `sel4lake-sched`. `ThreadId` ist quelltextgleich zum Original (die
+/// Stellvertreter fuer `caprock-sched`. `ThreadId` ist quelltextgleich zum Original (die
 /// Packung nach `u64` ist die Bruecke zu den `nat`s des Modells); `SchedOps` traegt genau die
-/// Methoden, die `sel4lake-ipc` aufruft -- ruft es eine weitere, bricht die Uebersetzung ab.
-mod sel4lake_sched {
+/// Methoden, die `caprock-ipc` aufruft -- ruft es eine weitere, bricht die Uebersetzung ab.
+mod caprock_sched {
     use std::sync::Mutex;
 
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -617,9 +617,9 @@ mod modell;
 
 mod treue {
     use crate::modell;
-    use crate::sel4lake_abi::{reg, result};
-    use crate::sel4lake_hal::exception::{frame_neu, frame_reg, frame_set_reg};
-    use crate::sel4lake_sched::{owner_core, setze_kern, SchedOps, ThreadId};
+    use crate::caprock_abi::{reg, result};
+    use crate::caprock_hal::exception::{frame_neu, frame_reg, frame_set_reg};
+    use crate::caprock_sched::{owner_core, setze_kern, SchedOps, ThreadId};
     use crate::{Endpoint, QUEUE_CAP};
     use std::collections::{HashMap, HashSet};
 
@@ -2068,7 +2068,7 @@ case "$MODUS" in
     --selftest)
         selbsttest; exit $? ;;
     alles|"")
-        echo "== Modell-Treue IPC: Verus-endpoint gegen sel4lake-ipc::Endpoint =="
+        echo "== Modell-Treue IPC: Verus-endpoint gegen caprock-ipc::Endpoint =="
         pruefen; rc=$?
         [ "$rc" -eq 0 ] || { echo "== MODELL-TREUE (IPC) VERLETZT ==" >&2; exit "$rc"; }
         echo "-- Selbsttest --"

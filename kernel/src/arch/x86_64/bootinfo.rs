@@ -21,7 +21,7 @@
 //! nicht ihr Format.
 
 /// Erkennungswort — eine übergebene Struktur, die das nicht trägt, wird nicht benutzt.
-pub const MAGIC: u64 = 0x5345_4C34_4C41_4B45; // "SEL4LAKE"
+pub const MAGIC: u64 = 0x4341_5052_4F43_4B53; // "CAPROCKS"
 /// Format-Version. Wird erhöht, sobald sich das Layout ändert; das Modul prüft sie mit.
 pub const VERSION: u32 = 1;
 

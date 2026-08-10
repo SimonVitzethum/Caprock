@@ -32,8 +32,8 @@
 	.section .rodata, "a"
 	.code16
 
-	.globl sel4lake_t16_start, sel4lake_t16_end, sel4lake_t16_target
-sel4lake_t16_start:
+	.globl caprock_t16_start, caprock_t16_end, caprock_t16_target
+caprock_t16_start:
 	cli
 
 	/* SIPI setzt CS = Vektor<<8, IP = 0 -> DS auf dieselbe Seite legen. */
@@ -42,7 +42,7 @@ sel4lake_t16_start:
 
 	/* Signatur 1: der Kern ist angekommen und fuehrt unseren Code aus. */
 	mov	$OFF_SIG1, %di
-	movw	$0x5345, (%di)
+	movw	$0x4341, (%di)
 
 	/* GDT laden (der Deskriptor traegt eine **lineare** Basis, Paging ist noch aus). */
 	mov	$OFF_GDTR, %si
@@ -72,26 +72,26 @@ sel4lake_t16_start:
 	/*
 	 * Fernsprung in das 64-Bit-Codesegment. Das Ziel ist eine **lineare** Adresse, die erst
 	 * zur Laufzeit feststeht (die Seite, die der Allokator hergegeben hat) -- das Modul
-	 * traegt sie in die vier Bytes ab `sel4lake_t16_target` ein.
+	 * traegt sie in die vier Bytes ab `caprock_t16_target` ein.
 	 */
 	.byte	0x66, 0xea		/* ljmpl ptr16:32 */
-sel4lake_t16_target:
+caprock_t16_target:
 	.long	0			/* lineare Adresse des 64-Bit-Stubs (gepatcht) */
 	.word	SEL_CODE64
-sel4lake_t16_end:
+caprock_t16_end:
 
 	/* --------------------------------------------------------------------------------- */
 
 	.code64
-	.globl sel4lake_t64_start, sel4lake_t64_end, sel4lake_t64_sig, sel4lake_t64_park
-sel4lake_t64_start:
+	.globl caprock_t64_start, caprock_t64_end, caprock_t64_sig, caprock_t64_park
+caprock_t64_start:
 	/*
 	 * Absolute Adressierung statt RIP-relativer: der Stub wird verschoben ausgefuehrt, und
 	 * eine RIP-relative Referenz zeigte dann auf die Kopie im Modul statt auf die Seite.
 	 * Die linearen Adressen traegt das Modul ein.
 	 */
 	movabs	$0, %rax
-sel4lake_t64_sig = . - 8
+caprock_t64_sig = . - 8
 	movw	$0x5346, (%rax)
 
 	/*
@@ -106,18 +106,18 @@ sel4lake_t64_sig = . - 8
 	 * Die niedrige Seite ist danach wieder frei — fuer den naechsten Kern.
 	 */
 	movabs	$0, %rax
-sel4lake_t64_park = . - 8
+caprock_t64_park = . - 8
 	jmp	*%rax
-sel4lake_t64_end:
+caprock_t64_end:
 
 	/*
 	 * Park-Schleife, liegt in einer gewoehnlichen Seite unterhalb 4 GiB (die
 	 * Identitaetsabbildung deckt nicht mehr ab). Der Kern ruehrt ab hier nichts an: kein
 	 * Speicherzugriff, keine Interrupts, kein Tabellenwechsel. Fuer Linux bleibt er "offline".
 	 */
-	.globl sel4lake_park_start, sel4lake_park_end
-sel4lake_park_start:
+	.globl caprock_park_start, caprock_park_end
+caprock_park_start:
 	cli
 	hlt
 	jmp	.
-sel4lake_park_end:
+caprock_park_end:

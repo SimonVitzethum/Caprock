@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""SEL4Lake — TrustedSAS-Zertifikat erzeugen + signieren (ext-28, ADR 0014).
+"""Caprock — TrustedSAS-Zertifikat erzeugen + signieren (ext-28, ADR 0014).
 
 Die vollstaendige Vertrauenskette host-seitig:
   1. UNSAFE-AUDIT des gesamten App-Dependency-Baums (cargo metadata): das Programm-Crate muss
      `#![forbid(unsafe_code)]` haben (+ 0 unsafe), ALLE projektinternen Crates 0 unsafe; `unsafe` ist
-     NUR in der Allowlist erlaubt (genau `libsel4lake`, die Syscall-ABI). Jede Verletzung -> Abbruch,
+     NUR in der Allowlist erlaubt (genau `libcaprock`, die Syscall-ABI). Jede Verletzung -> Abbruch,
      KEIN Zertifikat. Ein Audit-Bericht listet die unsafe-Anzahl je Crate; sein SHA-256 wird im
      Zertifikat verankert. (Sysroot core/alloc/compiler_builtins = vertraute Sprach-Laufzeit, ausser
      Scope -- erscheint nicht in cargo metadata.)
   2. SHA-256(ELF) + SHA-256(Manifest).
-  3. Zertifikatsnachricht (eingefrorenes Format, s. sel4lake-loader::cert) fuellen -- inkl.
+  3. Zertifikatsnachricht (eingefrorenes Format, s. caprock-loader::cert) fuellen -- inkl.
      unsafe_status, unsafe_audit_hash, build_info, Algorithmus-/Policy-IDs + Verfahrens-Versionen.
   4. Die GESAMTE Nachricht mit dem PRIVATEN Ed25519-Schluessel signieren.
 
@@ -33,7 +33,7 @@ from cryptography.hazmat.primitives import serialization
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Muss EXAKT zu crates/sel4lake-loader/src/cert.rs passen (eingefrorenes Format).
+# Muss EXAKT zu crates/caprock-loader/src/cert.rs passen (eingefrorenes Format).
 MAGIC = 0x5453_4331
 CERT_FORMAT_VERSION = 1
 SIG_FORMAT_VERSION = 1
@@ -52,7 +52,7 @@ UNSAFE_ALL_PASS = UNSAFE_PROGRAM_FORBID | UNSAFE_PROJECT_CLEAN | UNSAFE_ALLOWLIS
 POLICIES = {"trustedsas-v1": 1, "formal": 2, "internal-test": 3, "production": 4}
 
 # Genau eine Crate darf `unsafe` enthalten: die Syscall-ABI.
-ALLOWLIST = {"libsel4lake"}
+ALLOWLIST = {"libcaprock"}
 
 # Reale unsafe-Nutzung (nicht jedes Vorkommen des Worts in Kommentaren/Strings): unsafe vor
 # fn/impl/trait/extern/Block.
@@ -170,8 +170,8 @@ def build_cert(args, status, audit_hash):
 
     rustc = subprocess.run(["rustc", "--version"], capture_output=True, text=True)
     rustc_ver = rustc.stdout.strip() if rustc.returncode == 0 else "rustc ?"
-    build_info = (f"sel4lake-trusted; buildregeln v{BUILD_RULES_VERSION}; "
-                  f"target aarch64-sel4lake-user; profile release; {rustc_ver}").encode("utf-8")
+    build_info = (f"caprock-trusted; buildregeln v{BUILD_RULES_VERSION}; "
+                  f"target aarch64-caprock-user; profile release; {rustc_ver}").encode("utf-8")
 
     msg = bytearray(HEADER_LEN + len(build_info))
     struct.pack_into("<I", msg, 0, MAGIC)

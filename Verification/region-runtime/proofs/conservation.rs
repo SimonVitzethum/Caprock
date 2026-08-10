@@ -1,4 +1,4 @@
-// SEL4Lake — Phase 3 (Region-Runtime), Schritt A/B: Ressourcen-Konservierung + Balance + Ownership.
+// Caprock — Phase 3 (Region-Runtime), Schritt A/B: Ressourcen-Konservierung + Balance + Ownership.
 //
 // Funktionale Korrektheit ueber die Kani-Speichersicherheit hinaus (RegionView ist bereits memory-safe
 // bewiesen, docs/verification.md): hier wird die RESSOURCEN-BILANZ des Region-Allokators bewiesen:

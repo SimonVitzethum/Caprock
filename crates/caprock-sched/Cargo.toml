@@ -1,0 +1,13 @@
+# Scheduler: Per-Kern-Run-Queues + Thread-Control-Blocks. Die eigentliche
+# Datenstrukturlogik ist sicher; der Kontextwechsel selbst liegt in caprock-hal.
+[package]
+name = "caprock-sched"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+caprock-hal = { path = "../caprock-hal" }
+caprock-slab = { path = "../caprock-slab" }
+caprock-sync = { path = "../caprock-sync" }

@@ -1,0 +1,16 @@
+# Hardware-Abstraktion (aarch64 / QEMU virt) für Caprock.
+#
+# Hier liegt der Großteil des erlaubten `unsafe`-Codes (Registerzugriffe,
+# MMU-/Interrupt-Init, Low-Level-Routinen) — jeweils begründet und gekapselt.
+[package]
+name = "caprock-hal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Treiberlogik liegt bewusst AUSSERHALB der HAL (todo A-5.1) -- diese Crate haengt an nichts.
+caprock-virtio = { path = "../caprock-virtio" }
+caprock-sync = { path = "../caprock-sync" }
+caprock-abi = { path = "../caprock-abi" }

@@ -1,4 +1,4 @@
-# Build configuration for the SEL4Lake kernel.
+# Build configuration for the Caprock kernel.
 #
 # We cross-compile to a custom bare-metal aarch64 target and build `core`,
 # `alloc` and `compiler_builtins` from source (no precompiled std exists for a
@@ -6,7 +6,7 @@
 # linker-script path below resolves.
 
 [build]
-target = "targets/aarch64-sel4lake.json"
+target = "targets/aarch64-caprock.json"
 target-dir = "build/target"
 
 [unstable]
@@ -15,7 +15,7 @@ json-target-spec = true
 build-std = ["core", "compiler_builtins", "alloc"]
 build-std-features = ["compiler-builtins-mem"]
 
-[target.aarch64-sel4lake]
+[target.aarch64-caprock]
 rustflags = [
     # Use our linker script (sets load address + sections for QEMU `virt`).
     "-C", "link-arg=-Tkernel/linker.ld",
@@ -33,5 +33,5 @@ rustflags = [
 # `neon`; disabling them is being phased out by rustc). The kernel itself avoids
 # floating point, and FP/SIMD register state will be saved on context switch
 # only when a thread uses it (lazy FP) — handled in the context-switch phase.
-# `strict-align` is set in the target spec (targets/aarch64-sel4lake.json):
+# `strict-align` is set in the target spec (targets/aarch64-caprock.json):
 # with the MMU off, all accesses are Device-typed and must be aligned.

@@ -19,5 +19,5 @@ name = "virtio-net"
 path = "src/main.rs"
 
 [dependencies]
-libsel4lake = { path = "../../libsel4lake" }
-sel4lake-virtio = { path = "../../../crates/sel4lake-virtio" }
+libcaprock = { path = "../../libcaprock" }
+caprock-virtio = { path = "../../../crates/caprock-virtio" }

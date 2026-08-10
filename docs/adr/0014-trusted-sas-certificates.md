@@ -89,8 +89,8 @@ Schlüssel liegen **nie** im Kernel.
 ### 5. Zertifikat im Boot-Archiv (eigener Blob)
 Archiv-Format-Version → 2: die freien Entry-`reserved`-Felder werden `cert_off`/`cert_len`. Der
 quellen-agnostische `Program`-Deskriptor erhält `cert:&[u8]`. Das **Parsing** des Zertifikats liegt
-im `sel4lake-loader` (no_std, `#![forbid(unsafe_code)]`, host-fuzzbar); die **Krypto-Verifikation**
-in einem neuen Crate **`sel4lake-trust`** (hält die `ed25519-dalek`/`sha2`-Dep). Die Key-DB liegt im
+im `caprock-loader` (no_std, `#![forbid(unsafe_code)]`, host-fuzzbar); die **Krypto-Verifikation**
+in einem neuen Crate **`caprock-trust`** (hält die `ed25519-dalek`/`sha2`-Dep). Die Key-DB liegt im
 Kernel; `loader::verify_image` orchestriert: TrustedSAS → Zertifikat zwingend + verifiziert; UserLand/
 HardwareLand → unverändert (kein Zertifikat nötig).
 
@@ -98,9 +98,9 @@ HardwareLand → unverändert (kein Zertifikat nötig).
 Ein Host-Build-Schritt für ein TrustedSAS-Programm:
 1. **unsafe-Audit** des gesamten App-Dependency-Baums (`cargo geiger`): das Programm-Crate und
    **alle projektinternen Crates** müssen **0** `unsafe` enthalten; `unsafe` ist **ausschließlich**
-   in einer expliziten **Allowlist** zulässig — genau **`libsel4lake`** (Syscall-ABI/SVC-Stub).
+   in einer expliziten **Allowlist** zulässig — genau **`libcaprock`** (Syscall-ABI/SVC-Stub).
    Jede `unsafe`-Nutzung außerhalb → **sofortiger Abbruch, kein Zertifikat**. Ein **Audit-Bericht**
-   listet die Anzahl der `unsafe`-Blöcke je erlaubter Crate (Soll: nur `libsel4lake` > 0).
+   listet die Anzahl der `unsafe`-Blöcke je erlaubter Crate (Soll: nur `libcaprock` > 0).
    (Scope: der Rust-**Sysroot** core/alloc/compiler_builtins ist die vertraute Sprach-Laufzeit —
    wie die CPU/ISA — und außerhalb des Audits; sonst bräche jeder Build.)
 2. ELF-Hash + Manifest-Hash (SHA-256) berechnen.

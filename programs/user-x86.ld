@@ -1,4 +1,4 @@
-/* Linker-Skript für extern geladene SEL4Lake-Ring-3-Programme auf **x86_64** (A-1.5).
+/* Linker-Skript für extern geladene Caprock-Ring-3-Programme auf **x86_64** (A-1.5).
  *
  * Gleiche Bauart wie `user.ld` (aarch64) — nur die feste Link-Adresse ist eine andere, und das
  * ist keine Geschmacksfrage:

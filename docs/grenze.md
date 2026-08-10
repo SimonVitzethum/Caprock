@@ -3,7 +3,7 @@
 **Stand: 2026-08-09. UMGESETZT** — alle sieben Crates tragen `MIT OR Apache-2.0`. Der Kern bleibt
 `AGPL-3.0-or-later`.
 
-SEL4Lake ist `AGPL-3.0-or-later`. Alles, was ein **Programm ausserhalb des Kerns** linkt, ist damit
+Caprock ist `AGPL-3.0-or-later`. Alles, was ein **Programm ausserhalb des Kerns** linkt, ist damit
 eine Lizenzgrenze: eine PD, die gegen eine GPLv3-Crate baut, ist mit GPLv3-Code gelinkt — und dann
 hilft weder die Prozesstrennung noch die ABI-Ausnahme, denn beide handeln von der *Schnittstelle*,
 nicht vom *Linken*.
@@ -14,32 +14,32 @@ Das ist dieselbe Grenze, für die Linux die **UAPI-Header-Ausnahme** hat.
 
 | Programm | linkt |
 |---|---|
-| `init`, `hello`, `svc-demo` | `libsel4lake` |
-| `wasmhost` | `libsel4lake`, `wasmi` |
-| `fs` | `libsel4lake`, `sel4lake-part`, `sel4lake-fat` |
-| `virtio-blk` | `libsel4lake`, `sel4lake-virtio`, `sel4lake-part`, `sel4lake-dma` |
-| `virtio-net` | `libsel4lake`, `sel4lake-virtio` |
+| `init`, `hello`, `svc-demo` | `libcaprock` |
+| `wasmhost` | `libcaprock`, `wasmi` |
+| `fs` | `libcaprock`, `caprock-part`, `caprock-fat` |
+| `virtio-blk` | `libcaprock`, `caprock-virtio`, `caprock-part`, `caprock-dma` |
+| `virtio-net` | `libcaprock`, `caprock-virtio` |
 
 ## Muss permissiv werden (`MIT OR Apache-2.0`)
 
 | Crate | warum |
 |---|---|
-| `programs/libsel4lake` | **das SDK. Jedes Programm linkt es** — ohne diese Zeile ist alles Weitere gegenstandslos |
-| `crates/sel4lake-abi` | Syscall-Nummern, Ergebniscodes, Registerbelegung. **Die ABI selbst** |
-| `crates/sel4lake-dma` | `DmaPool`/`DmaBuf` — jede Treiber-PD rechnet damit |
-| `crates/sel4lake-wait` | der `Park`-Trait, Mutex/Completion — jede PD mit mehreren Threads |
-| `crates/sel4lake-virtio` | `Region`, Deskriptor-Typestate, Transport — jede virtio-PD |
-| `crates/sel4lake-part` | GPT-Parser, in Dienst-PDs |
-| `crates/sel4lake-fat` | FAT16-Parser, ebenso |
+| `programs/libcaprock` | **das SDK. Jedes Programm linkt es** — ohne diese Zeile ist alles Weitere gegenstandslos |
+| `crates/caprock-abi` | Syscall-Nummern, Ergebniscodes, Registerbelegung. **Die ABI selbst** |
+| `crates/caprock-dma` | `DmaPool`/`DmaBuf` — jede Treiber-PD rechnet damit |
+| `crates/caprock-wait` | der `Park`-Trait, Mutex/Completion — jede PD mit mehreren Threads |
+| `crates/caprock-virtio` | `Region`, Deskriptor-Typestate, Transport — jede virtio-PD |
+| `crates/caprock-part` | GPT-Parser, in Dienst-PDs |
+| `crates/caprock-fat` | FAT16-Parser, ebenso |
 
 **Sieben.** Alle sieben sind bereits abhängigkeitsfrei oder hängen nur untereinander — die
 Umstellung ist eine Zeile je `Cargo.toml` plus ein Lizenzhinweis, kein Umbau.
 
 ## Bleibt GPLv3 (Kern und Kernnahes)
 
-`kernel`, `sel4lake-sched`, `sel4lake-ipc`, `sel4lake-microkit`, `sel4lake-hal`, `sel4lake-cap`,
-`sel4lake-mem`, `sel4lake-slab`, `sel4lake-loader`, `sel4lake-trust`, `sel4lake-region`,
-`sel4lake-sync`, `sel4lake-dtb`.
+`kernel`, `caprock-sched`, `caprock-ipc`, `caprock-microkit`, `caprock-hal`, `caprock-cap`,
+`caprock-mem`, `caprock-slab`, `caprock-loader`, `caprock-trust`, `caprock-region`,
+`caprock-sync`, `caprock-dtb`.
 
 Kein Programm ausserhalb des Kerns linkt eines davon — das ist die Probe darauf, dass die Grenze
 an der richtigen Stelle liegt, und `tools/kernel-grenze.sh` hält sie ohnehin schon gegen den

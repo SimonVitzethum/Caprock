@@ -1,4 +1,4 @@
-// SEL4Lake — Verus-Pilot (Tier 2), Teil 6: DMA-Regionen-Disjunktheit (`dma_audit`, ext-23/24).
+// Caprock — Verus-Pilot (Tier 2), Teil 6: DMA-Regionen-Disjunktheit (`dma_audit`, ext-23/24).
 //
 // Formale Spezifikation der DMA-Bounds-Invariante (kernel/src/system.rs `dma_audit`, Invariante 1):
 // kernel-ausgeschnittene DMA-Regionen sind **paarweise disjunkt** UND disjunkt von der reservierten

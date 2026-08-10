@@ -1,4 +1,4 @@
-# SEL4Lake — x86_64-Port (Branch `arch/x86_64`)
+# Caprock — x86_64-Port (Branch `arch/x86_64`)
 
 Portierung des aarch64-Microkernels auf **x86_64**, gestaffelt mit häufigen QEMU-Läufen. Ziel:
 **ein Branch pro Architektur** — `master` = aarch64 (QEMU `virt`), `arch/x86_64` = x86_64
@@ -9,7 +9,7 @@ baut x86_64.
 ## Bauen + Testen
 
 ```sh
-./build-x86.sh                 # -> build/target/x86_64-unknown-none/release/sel4lake-kernel(.mb32)
+./build-x86.sh                 # -> build/target/x86_64-unknown-none/release/caprock-kernel(.mb32)
 ./test-qemu-x86.sh             # baut + bootet unter qemu-system-x86_64 + prueft Marker
 ./build.sh && ./test-qemu.sh   # aarch64 weiterhin unveraendert gruen (Regression)
 ```
@@ -49,8 +49,8 @@ Mode die aktive Identity-Map nicht löscht; PML4/PDPT werden im 32-bit-Trampolin
 ### Stufe 4 (ext-31): der eigentliche Microkernel
 
 Bis Stufe 3 war der x86-Zweig eine Kette von **Hardware-Demos** — der Kernel-Kern selbst war
-auf diesem Branch gar nicht einkompiliert (`sel4lake-*` waren aarch64-only). Seit ext-31 ist
-`sel4lake-hal` **architekturselektiv** (`src/aarch64/` und `src/x86_64/` hinter derselben API),
+auf diesem Branch gar nicht einkompiliert (`caprock-*` waren aarch64-only). Seit ext-31 ist
+`caprock-hal` **architekturselektiv** (`src/aarch64/` und `src/x86_64/` hinter derselben API),
 und damit läuft auf x86 derselbe Kern wie auf ARM:
 
 ```
@@ -167,5 +167,5 @@ Was auf x86 **noch fehlt** (ehrlich als „nicht unterstützt" gemeldet, nicht h
 - `kernel/x86_64-link.ld` — Multiboot1-Linker (@ 1 MiB, `.boot.bss` außerhalb der genullten `.bss`).
 - `build-x86.sh`, `test-qemu-x86.sh` — x86-Build (+ELF32-Cast) & QEMU-Test.
 - `.cargo/config.toml` — `[target.x86_64-unknown-none]` (Linker-Skript, static).
-- `kernel/Cargo.toml` — `sel4lake-*`-Deps aarch64-only (x86 Stufe 0 = nur Boot+Serial).
+- `kernel/Cargo.toml` — `caprock-*`-Deps aarch64-only (x86 Stufe 0 = nur Boot+Serial).
 - `kernel/src/{main,panic}.rs`, `kernel/src/arch/mod.rs` — `cfg(target_arch)`-Trennung.

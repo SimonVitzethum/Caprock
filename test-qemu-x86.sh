@@ -61,7 +61,7 @@ else
     ACCEL=(-cpu Skylake-Client)
     echo "== Beschleunigung: TCG (kein /dev/kvm) -- Zyklenwerte sind dann indikativ =="
 fi
-ELF="build/target/x86_64-unknown-none/release/sel4lake-kernel.mb32"
+ELF="build/target/x86_64-unknown-none/release/caprock-kernel.mb32"
 
 # **Der gebootete Bau verlangt `selftest` AUSDRUECKLICH** -- nicht, weil es heute noetig waere
 # (das Feature steht in `default`), sondern weil es das nach A-2.2 nicht mehr tut. Ohne diese
@@ -81,14 +81,14 @@ echo "== build (x86_64-unknown-none, --features selftest) =="
 echo "== build (--no-default-features: ohne Pruefinfrastruktur) =="
 NOSEL_OK=1
 rustup run nightly cargo build --release --no-default-features \
-    --target x86_64-unknown-none -p sel4lake-kernel >/dev/null 2>&1 || NOSEL_OK=0
+    --target x86_64-unknown-none -p caprock-kernel >/dev/null 2>&1 || NOSEL_OK=0
 # Der Vergleich gehoert dazu: schrumpft das Image NICHT, ist das Gating wirkungslos geworden
 # (jemand hat Testcode ausserhalb des Features abgelegt), und der Build allein wuerde das nicht zeigen.
-NOSEL_TEXT=$(readelf -S build/target/x86_64-unknown-none/release/sel4lake-kernel 2>/dev/null \
+NOSEL_TEXT=$(readelf -S build/target/x86_64-unknown-none/release/caprock-kernel 2>/dev/null \
     | grep -A1 " .text " | tail -1 | tr -s ' ' | cut -d' ' -f2)
 # Rueckbau MIT Feature -- das ist das Image, das gleich gebootet wird.
 ./build-x86.sh --features selftest >/dev/null 2>&1 || { echo "BUILD FAILED (Rueckbau)"; exit 1; }
-SEL_TEXT=$(readelf -S build/target/x86_64-unknown-none/release/sel4lake-kernel 2>/dev/null \
+SEL_TEXT=$(readelf -S build/target/x86_64-unknown-none/release/caprock-kernel 2>/dev/null \
     | grep -A1 " .text " | tail -1 | tr -s ' ' | cut -d' ' -f2)
 
 # Zuverlaessiger Capture ueber eine Datei (Pipe + SIGKILL verliert sonst QEMUs stdout-Puffer).
@@ -99,7 +99,7 @@ LOG="$(mktemp)"
 # Der Inhalt ist der Test. Ein frisch angelegtes Abbild besteht aus Nullen, und ein Puffer voller
 # Nullen ist von einem NIE BESCHRIEBENEN Puffer nicht zu unterscheiden -- eine Leseanfrage gegen
 # ein leeres Abbild waere also auch dann gruen, wenn das Geraet gar keine Daten uebertraegt.
-# Deshalb steht eine Magie ("SEL4LAKE") auf der Platte, gegen die der Kernel rechnet -- seit
+# Deshalb steht eine Magie ("CAPROCKS") auf der Platte, gegen die der Kernel rechnet -- seit
 # A-6.2 auf LBA 34, dem ersten Sektor der ersten Partition (s. u.).
 #
 # Die Groesse ist die zweite, unabhaengige Aussage: 1 MiB sind genau 2048 Sektoren zu 512 Byte,
@@ -116,7 +116,7 @@ BLK_SECTORS=32768
 # Flaeche teilen, sind ein Riss, durch den beide fallen koennen.
 python3 tools/mkgpt.py "$BLK_IMG" --sectors "$BLK_SECTORS" \
     --part 34:20000 --part 20001:32700 --magic-at 20001 \
-    --fat16 34:20000 --file "HELLO.TXT=SEL4LAKE-DATEIINHALT" \
+    --fat16 34:20000 --file "HELLO.TXT=CAPROCKS-DATEIINHALT" \
     || { echo "  FEHLER: GPT-Abbild liess sich nicht bauen"; exit 2; }
 # Zaehlt Laeufe, die das Zeitlimit rissen -- s. die Begruendung in boot_once().
 BOOT_TIMEOUTS=0
@@ -616,7 +616,7 @@ if [ "$fail" != 0 ] && [ -s "${LOG:-}" ]; then
     cp -f "$LOG" "$ZIEL" 2>/dev/null && echo "  (volles Log: $ZIEL)"
 fi
 rm -f "$LOG"
-echo "fingerprint: $(fingerprint build/target/x86_64-unknown-none/release/sel4lake-kernel) (Kernel-Binary, das GERADE geprueft wurde -- schliesst"
+echo "fingerprint: $(fingerprint build/target/x86_64-unknown-none/release/caprock-kernel) (Kernel-Binary, das GERADE geprueft wurde -- schliesst"
 echo "             'veralteter Build' als Erklaerung fuer eine Abweichung aus)"
 bekannt_rot_pruefen "$OUT" || fail=1
 if [ "$fail" = 0 ]; then echo "== ALL PASS =="; else echo "== FAILURES =="; fi

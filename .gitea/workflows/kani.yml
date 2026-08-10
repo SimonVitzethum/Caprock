@@ -2,7 +2,7 @@
 # Der Server ist GitLab und liest .gitea/workflows/ nicht; der laufende Stand steht in
 # `.gitlab-ci.yml`. Begruendung und Messung im Kopf von .gitea/workflows/verus.yml.
 #
-# SEL4Lake — Formale Verifikation (Tier 1, Kani) als CI-Gate.
+# Caprock — Formale Verifikation (Tier 1, Kani) als CI-Gate.
 #
 # Ziel: jeder Push/PR führt die bewiesenen Eigenschaften automatisch erneut aus. Schlägt ein
 # Kani-Harness fehl (eine spätere Änderung bricht einen Beweis), schlägt die CI fehl -> bereits
@@ -51,17 +51,17 @@ jobs:
           set -euo pipefail
           SA="$RUNNER_TEMP/loader_host"
           rm -rf "$SA"; mkdir -p "$SA/src"
-          cp crates/sel4lake-loader/src/*.rs "$SA/src/"
-          printf '[package]\nname="sel4lake-loader"\nversion="0.0.0"\nedition="2021"\n[workspace]\n[lib]\npath="src/lib.rs"\n' > "$SA/Cargo.toml"
+          cp crates/caprock-loader/src/*.rs "$SA/src/"
+          printf '[package]\nname="caprock-loader"\nversion="0.0.0"\nedition="2021"\n[workspace]\n[lib]\npath="src/lib.rs"\n' > "$SA/Cargo.toml"
           ( cd "$SA" && cargo test )
-          # `sel4lake-sync` traegt seit B-7.1/B-7.2 ZWEI externe cfgs (`kani` UND `loom`). Dass
+          # `caprock-sync` traegt seit B-7.1/B-7.2 ZWEI externe cfgs (`kani` UND `loom`). Dass
           # keines davon den Normalbau bricht, faengt der Kernel-Build zwar mit ab -- aber nicht
           # als benannte Zusicherung, und ein Schutz, den niemand ausspricht, faellt beim naechsten
           # Umbau unbemerkt weg.
           SB="$RUNNER_TEMP/sync_host"
           rm -rf "$SB"; mkdir -p "$SB/src"
-          cp crates/sel4lake-sync/src/*.rs "$SB/src/"
-          printf '[package]\nname="sel4lake-sync"\nversion="0.0.0"\nedition="2021"\n[workspace]\n[lib]\npath="src/lib.rs"\n[lints.rust]\nunexpected_cfgs = { level = "warn", check-cfg = [\'cfg(kani)\', \'cfg(loom)\'] }\n' > "$SB/Cargo.toml"
+          cp crates/caprock-sync/src/*.rs "$SB/src/"
+          printf '[package]\nname="caprock-sync"\nversion="0.0.0"\nedition="2021"\n[workspace]\n[lib]\npath="src/lib.rs"\n[lints.rust]\nunexpected_cfgs = { level = "warn", check-cfg = [\'cfg(kani)\', \'cfg(loom)\'] }\n' > "$SB/Cargo.toml"
           ( cd "$SB" && cargo build )
 
       # Anfuehrungszeichen sind hier PFLICHT und nicht Kosmetik: das `: ` in „alle Ziele: loader"
@@ -72,7 +72,7 @@ jobs:
 
       # --- Was Kani NICHT abdeckt, und warum hier trotzdem ein Schritt dafür steht ---------
       #
-      # Kani baut für das Host-Ziel. In `sel4lake-sync` greift dort der dritte `cfg`-Zweig mit
+      # Kani baut für das Host-Ziel. In `caprock-sync` greift dort der dritte `cfg`-Zweig mit
       # `IRQ_MASKING_IMPLEMENTED = false` und `irq_save_disable()` als No-Op — die geprüfte
       # Fassung enthält die IRQ-Eigenschaft also gar nicht (belegt 2026-08-01, s.
       # docs/kani-lauf.md). Ein grünes Kani sagt über die ext-29-Änderung nichts.

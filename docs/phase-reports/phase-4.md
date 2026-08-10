@@ -7,7 +7,7 @@
 Präemptives Multithreading: ein deterministischer Per-Kern-Scheduler, getrieben
 vom Timer-Tick, mit echtem Kontextwechsel.
 
-### Kontextwechsel über den Trap-Pfad (`sel4lake-hal`)
+### Kontextwechsel über den Trap-Pfad (`caprock-hal`)
 
 - `handle_exception` gibt jetzt den **wiederherzustellenden** `TrapFrame` zurück;
   der Assembler-Epilog (`__trap_dispatch`) setzt `sp` darauf, bevor er Register
@@ -21,7 +21,7 @@ vom Timer-Tick, mit echtem Kontextwechsel.
   Timer-IRQ-Pfad aufruft (entkoppelt die HAL vom Scheduler; saubere Schichtung).
 - `gic::handle_irq` liefert die behandelte INTID zurück (Timer-Tick erkennen).
 
-### Scheduler (`crates/sel4lake-sched`)
+### Scheduler (`crates/caprock-sched`)
 
 - TCB-Tabelle (speichert nur den gesicherten SP) + Per-Kern-Run-Queues
   (FIFO-Ring). Feste Kapazität → allokationsfrei, deterministisch.
@@ -70,10 +70,10 @@ Scheduler je Kern). Build ohne Warnungen.
 
 ## Unsafe-Bilanz
 
-- Neu in `sel4lake-hal`: 2 Stellen — `init_thread_frame` (Thread-Kontext-Setup)
+- Neu in `caprock-hal`: 2 Stellen — `init_thread_frame` (Thread-Kontext-Setup)
   und der `transmute` des Reschedule-Hooks (Trap-Dispatch-Plumbing). Beide in
   erlaubten Low-Level-Domänen, kommentiert.
-- `sel4lake-sched`: **0 unsafe**. Kernel-Crate weiterhin **0 `unsafe`-Blöcke**.
+- `caprock-sched`: **0 unsafe**. Kernel-Crate weiterhin **0 `unsafe`-Blöcke**.
 
 ## Risiken / offene Punkte
 
@@ -94,7 +94,7 @@ Scheduler je Kern). Build ohne Warnungen.
 
 1. `ObjectKind::Endpoint`/`Notification`/`Reply`; Endpoint-Warteschlangen.
 2. Syscall-Eintritt via `SVC` (synchroner Trap-Pfad ist vorbereitet), ABI
-   (`sel4lake-abi`): Syscall-Nummern, Nachrichten-Layout.
+   (`caprock-abi`): Syscall-Nummern, Nachrichten-Layout.
 3. Synchrone IPC (Call/ReplyRecv) + Notifications; Block/Unblock über den
    Scheduler (Threads blockieren an Endpoints).
 4. Tests: IPC zwischen zwei Threads (Round-Trip), Notification-Signale.

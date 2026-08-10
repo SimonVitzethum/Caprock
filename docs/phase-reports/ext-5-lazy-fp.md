@@ -15,7 +15,7 @@ trappte → verschachtelter Trap → Hang. Zwei Änderungen lösen das:
 
 1. **`FPEN = 0b01`** — FP/SIMD trappt **nur an EL0**, nie an EL1. Der Kernel kann
    nicht mehr von seinem eigenen FP-Trap getroffen werden.
-2. **Soft-float Microkernel** — das Target (`targets/aarch64-sel4lake.json`) setzt
+2. **Soft-float Microkernel** — das Target (`targets/aarch64-caprock.json`) setzt
    `"rustc-abi": "softfloat"` + `"features": "+v8a,+strict-align,-neon"`. Der
    Kernel (EL1) emittiert **gar kein** FP/SIMD mehr. Damit gehören die FP-Register
    ausschließlich den EL0-User-Threads, und kein Kernel-Code kann den Lazy-Owner

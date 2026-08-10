@@ -17,4 +17,4 @@ name = "init"
 path = "src/main.rs"
 
 [dependencies]
-libsel4lake = { path = "../../libsel4lake" }
+libcaprock = { path = "../../libcaprock" }

@@ -1,5 +1,5 @@
 # `svc-demo` — signiertes TrustedSAS-Demoprogramm (ext-28, ADR 0014).
-# Vollstaendig `#![forbid(unsafe_code)]`; einzige Abhaengigkeit ist das auditierte SDK libsel4lake
+# Vollstaendig `#![forbid(unsafe_code)]`; einzige Abhaengigkeit ist das auditierte SDK libcaprock
 # (Syscall-ABI). Wird vom Build-/Signier-Tool (tools/sign_trusted.py) auditiert + signiert und nur
 # mit gueltigem Zertifikat als TrustedSAS geladen.
 [package]
@@ -13,4 +13,4 @@ name = "svc-demo"
 path = "src/main.rs"
 
 [dependencies]
-libsel4lake = { path = "../../libsel4lake" }
+libcaprock = { path = "../../libcaprock" }

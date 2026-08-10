@@ -12,14 +12,14 @@
 use crate::loader;
 use crate::system;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use sel4lake_abi::{pdctl, result, sys, GRANT_FLAG, GRANT_RECV_SLOT};
-use sel4lake_cap::{DmaCoherence, DmaDir};
-use sel4lake_hal::{self as hal, println, syscall::invoke};
-use sel4lake_loader::LoaderError;
-use sel4lake_mem::{peek_u64, poke_u64, Rights};
-use sel4lake_microkit::Domain;
-use sel4lake_sched::ThreadId;
-use sel4lake_sync::SpinLock;
+use caprock_abi::{pdctl, result, sys, GRANT_FLAG, GRANT_RECV_SLOT};
+use caprock_cap::{DmaCoherence, DmaDir};
+use caprock_hal::{self as hal, println, syscall::invoke};
+use caprock_loader::LoaderError;
+use caprock_mem::{peek_u64, poke_u64, Rights};
+use caprock_microkit::Domain;
+use caprock_sched::ThreadId;
+use caprock_sync::SpinLock;
 
 // In-Kernel-Fuzzer (ADR 0013): nur mit Feature `kernel-fuzz` einkompiliert (eigenes Kindmodul
 // `threads/fuzz.rs`). Im Release-Build (ohne Feature) stellt ein Stub-Modul dieselbe API als No-Op
@@ -61,7 +61,7 @@ mod soak;
 
 /// Compile-Zeit-Obergrenze für die Demo-Telemetrie-Arrays (die **tatsächliche** Kernzahl
 /// liefert `system::num_cores()`; die Demos laufen darüber).
-const NUM_CORES: usize = sel4lake_sched::MAX_CORES;
+const NUM_CORES: usize = caprock_sched::MAX_CORES;
 const NWORKERS: usize = 3;
 const THRESHOLD: u64 = 3;
 /// Lazy-FP-Test: zwei **echte EL0-User-Threads** halten je ein eindeutiges Muster
@@ -129,7 +129,7 @@ static XFER_DONE: AtomicBool = AtomicBool::new(false);
 // `XFER_GRANT_LOOPS` zusaetzlichen Grants: **genau 1** lebende Ableitung (die aktuelle).
 const XFER_GRANT_LOOPS: usize = 64;
 /// Quell-Cap des Grants (Slot 2 des Brokers) — fuer die Kindzaehler-Messung.
-static XFER_SRC_CAP: SpinLock<Option<sel4lake_cap::CapPtr>> = SpinLock::new(None);
+static XFER_SRC_CAP: SpinLock<Option<caprock_cap::CapPtr>> = SpinLock::new(None);
 /// Beobachtete Ableitungen der Quell-Cap nach den Wiederhol-Grants (Soll: 1).
 static XFER_SRC_CHILDREN: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// Ergebnis des Cap-Aufrufs NACH den Wiederhol-Grants (die Cap muss weiter funktionieren).
@@ -505,7 +505,7 @@ static DMATOK_AUDIT7: AtomicBool = AtomicBool::new(false); //       Code 7 haelt
 static DMAGEN_OK: AtomicBool = AtomicBool::new(false);
 
 // Prozess-Heap (ext-25): ein Trusted-SAS-Thread (safe Rust) nutzt einen prozess-lokalen
-// Heap (sel4lake_region::heap::Heap ueber KernelRegionSource) fuer ECHTE Box/Vec/BTreeMap.
+// Heap (caprock_region::heap::Heap ueber KernelRegionSource) fuer ECHTE Box/Vec/BTreeMap.
 // Der Allokator (Groessenklassen-Slabs + Bump-Arenen) fordert Regionen ueber den RegionSource
 // an (grow) und gibt sie zurueck (shrink/Drop). Alle Adressen sind reale Physadressen (SAS);
 // das einzige unsafe liegt in der Region-Runtime, der Testcode ist 100% safe.
@@ -1230,7 +1230,7 @@ fn run_sasheap() -> bool {
     use alloc::boxed::Box;
     use alloc::collections::BTreeMap;
     use alloc::vec::Vec;
-    use sel4lake_region::heap::Heap;
+    use caprock_region::heap::Heap;
 
     hal::cpu::local_irq_disable();
     let free0 = system::total_free();
@@ -1512,7 +1512,7 @@ extern "C" fn migrate_driver(_arg: usize) -> ! {
         // 4) **Identität**: dieselbe Tcb-Cap bezeichnet weiterhin genau diesen (nun auf einem
         //    anderen Kern laufenden) Thread.
         let cap_ok = match system::cap_inspect(cap).map(|i| i.kind) {
-            Some(sel4lake_cap::ObjectKind::Tcb(raw)) => {
+            Some(caprock_cap::ObjectKind::Tcb(raw)) => {
                 ThreadId::from_raw(raw) == tid && system::thread_alive(tid)
             }
             _ => false,

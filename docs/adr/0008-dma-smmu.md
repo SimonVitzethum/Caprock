@@ -4,7 +4,7 @@ Status: **Akzeptiert** (ext-23, umgesetzt D0–D5)
 
 ## Kontext
 
-Mit ext-22 besitzt SEL4Lake drei kernel-getrennte Domänen und Hardware-Caps für **MMIO** und
+Mit ext-22 besitzt Caprock drei kernel-getrennte Domänen und Hardware-Caps für **MMIO** und
 **IRQ**. Bewusst aufgeschoben war **DMA** — die einzige HW-Cap-Kategorie, bei der ein
 bus-masterndes Gerät **direkt** Physikspeicher liest/schreibt, **vorbei an der CPU-MMU**. Ein
 HardwareLand-Backend, das die DMA-Register eines Geräts programmiert, könnte das Gerät sonst

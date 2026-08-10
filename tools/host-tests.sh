@@ -2,7 +2,7 @@
 # **Die Host-Tests der reinen Crates — an einem Ort** (B-5.5-Nachtrag, 2026-08-02).
 #
 # Warum es dieses Skript gibt: mehrere Crates tragen `#[cfg(test)]`-Module mit echter Deckung, und
-# ein Teil davon lief **nirgends**. `sel4lake-cap` ist das deutlichste Beispiel — sechs Tests der
+# ein Teil davon lief **nirgends**. `caprock-cap` ist das deutlichste Beispiel — sechs Tests der
 # CDT-Laufgrenzen, die kein Skript und keine CI anfasste. Ein Test, der nirgends laeuft, ist kein
 # Test, sondern eine Absichtserklaerung.
 #
@@ -80,38 +80,38 @@ mit_deps() { # $1 = Name, $2 = Crate-Verzeichnis, $3.. = Abhaengigkeiten (Verzei
 ZIELE="${*:-mem part fat cycles loader cap virtio dma wait irte dmar dmarneg typestate ipctreue}"
 for z in $ZIELE; do
     case "$z" in
-        mem)  einzeln mem  "$ROOT/crates/sel4lake-mem/src/lib.rs" ;;
-        part) einzeln part "$ROOT/crates/sel4lake-part/src/lib.rs" ;;
-        fat)  einzeln fat  "$ROOT/crates/sel4lake-fat/src/lib.rs" ;;
-        # `sel4lake-sched` als Ganzes haengt an `sel4lake-hal` (arch-Asm) und wird auf dem Host nie
+        mem)  einzeln mem  "$ROOT/crates/caprock-mem/src/lib.rs" ;;
+        part) einzeln part "$ROOT/crates/caprock-part/src/lib.rs" ;;
+        fat)  einzeln fat  "$ROOT/crates/caprock-fat/src/lib.rs" ;;
+        # `caprock-sched` als Ganzes haengt an `caprock-hal` (arch-Asm) und wird auf dem Host nie
         # bauen. Die Zyklenarithmetik (B-5.1) liegt deshalb abhaengigkeitsfrei in einem eigenen
         # Modul und wird als **Datei** geprueft -- die Fallen dort sind reine u64-Rechnung und
         # brauchen keine Maschine, sondern Literale.
-        cycles) einzeln cycles "$ROOT/crates/sel4lake-sched/src/cycles.rs" ;;
-        # `sel4lake-loader` ist abhaengigkeitsfrei und traegt die Parser fuer Boot-Archiv, ELF64
+        cycles) einzeln cycles "$ROOT/crates/caprock-sched/src/cycles.rs" ;;
+        # `caprock-loader` ist abhaengigkeitsfrei und traegt die Parser fuer Boot-Archiv, ELF64
         # und **System-Manifest**. Es gibt kein `.github/workflows/` in diesem Baum -- die Tests
-        # liefen also nirgends, genau wie die von `sel4lake-cap` vor B-5.5. Kani prueft Beweise,
+        # liefen also nirgends, genau wie die von `caprock-cap` vor B-5.5. Kani prueft Beweise,
         # keine `#[test]`s; das ist nicht dasselbe.
-        loader) einzeln loader "$ROOT/crates/sel4lake-loader/src/lib.rs" ;;
-        # `sel4lake-cap` haengt an `sel4lake-mem` und `sel4lake-slab`. Bis B-5.5 liefen seine Tests
+        loader) einzeln loader "$ROOT/crates/caprock-loader/src/lib.rs" ;;
+        # `caprock-cap` haengt an `caprock-mem` und `caprock-slab`. Bis B-5.5 liefen seine Tests
         # deshalb nirgends -- die Huerde war das Manifest, nicht der Code.
-        cap)  mit_deps cap sel4lake-cap sel4lake-mem sel4lake-slab ;;
-        # `sel4lake-virtio` ist abhaengigkeitsfrei (A-5.1). Host-pruefbar ist daran die
+        cap)  mit_deps cap caprock-cap caprock-mem caprock-slab ;;
+        # `caprock-virtio` ist abhaengigkeitsfrei (A-5.1). Host-pruefbar ist daran die
         # Typestate-Buchhaltung (`owned.rs`, todo E): Schnittarithmetik ueber Adressen, ohne
         # Zugriff und ohne Geraet. Alles andere in der Crate fasst MMIO an und gehoert in die
         # QEMU-Suiten.
-        virtio) einzeln virtio "$ROOT/crates/sel4lake-virtio/src/lib.rs" ;;
-        # `sel4lake-dma` ist der DMA-Pool einer Treiber-PD (Z22 P3): abhaengigkeitsfrei,
+        virtio) einzeln virtio "$ROOT/crates/caprock-virtio/src/lib.rs" ;;
+        # `caprock-dma` ist der DMA-Pool einer Treiber-PD (Z22 P3): abhaengigkeitsfrei,
         # `forbid(unsafe_code)`, reine Adressarithmetik. Genau die Sorte, die sich mit LITERALEN
         # ausloesen laesst statt mit einer Maschine -- die entscheidende Aussage („eine Adresse
         # ausserhalb des Pools bekommt KEINE IOVA") braucht kein Geraet, nur einen Zahlenbereich.
-        dma)  einzeln dma  "$ROOT/crates/sel4lake-dma/src/lib.rs" ;;
-        # `sel4lake-wait` (Z22 P2): Mutex/WaitQueue/Completion fuer eine PD mit mehreren Threads.
+        dma)  einzeln dma  "$ROOT/crates/caprock-dma/src/lib.rs" ;;
+        # `caprock-wait` (Z22 P2): Mutex/WaitQueue/Completion fuer eine PD mit mehreren Threads.
         # Der ganze Vertrag mit dem Kernel ist ein Trait mit zwei Methoden, also laesst sich die
         # Logik gegen einen STELLVERTRETER pruefen -- die Fallen hier sind Reihenfolgen (verlorenes
         # Wecken, voller Warteraum), keine Hardware. Derselbe Weg wie bei `ipctreue`.
-        wait) einzeln wait "$ROOT/crates/sel4lake-wait/src/lib.rs" ;;
-        # `sel4lake-hal` als Ganzes ist arch-Asm und baut auf dem Host nie. `dmar.rs` ist die
+        wait) einzeln wait "$ROOT/crates/caprock-wait/src/lib.rs" ;;
+        # `caprock-hal` als Ganzes ist arch-Asm und baut auf dem Host nie. `dmar.rs` ist die
         # Ausnahme: **reine Funktion ueber eingespeiste Daten** (`forbid(unsafe_code)`, keine
         # `use`-Zeile ausser `super::*` im Testmodul), also als DATEI pruefbar -- derselbe Weg wie
         # `cycles`. Bis zum 2026-08-03 lief das Testmodul deshalb NIRGENDS: vier Tests, kein
@@ -121,8 +121,8 @@ for z in $ZIELE; do
         # und ein Bit an der falschen Stelle aeussert sich als „das Geraet unterbricht einfach
         # nicht": ohne Fehlermeldung, ohne Fault, ohne irgendetwas, das nach einem Fehler
         # aussieht. Mit Literalen in Sekunden pruefbar; in QEMU braeuchte es Geraet und Glueck.
-        irte) einzeln irte "$ROOT/crates/sel4lake-hal/src/x86_64/irte.rs" ;;
-        dmar) einzeln dmar "$ROOT/crates/sel4lake-hal/src/x86_64/dmar.rs" ;;
+        irte) einzeln irte "$ROOT/crates/caprock-hal/src/x86_64/irte.rs" ;;
+        dmar) einzeln dmar "$ROOT/crates/caprock-hal/src/x86_64/dmar.rs" ;;
         # ... und die Gegenprobe dazu: die Tests oben sehen nur den BEHOBENEN Zustand. Vier
         # Mutationen bauen den Fehler einzeln wieder ein, jede mit dem NAMEN des Tests, der fallen
         # muss (sonst waere „irgendetwas ist rot" schon ein Beleg).
@@ -146,8 +146,8 @@ for z in $ZIELE; do
             else
                 bash "$ROOT/tools/typestate-negativ.sh" || fail=1
             fi ;;
-        # `sel4lake-ipc` haengt an `sel4lake-hal` (arch-Asm) und wird auf dem Host nie bauen -- wie
-        # `sel4lake-sched`. Anders als bei `cycles` liegt die Logik aber NICHT abhaengigkeitsfrei in
+        # `caprock-ipc` haengt an `caprock-hal` (arch-Asm) und wird auf dem Host nie bauen -- wie
+        # `caprock-sched`. Anders als bei `cycles` liegt die Logik aber NICHT abhaengigkeitsfrei in
         # einem eigenen Modul, sondern mitten im Endpoint. Der Ausweg sind Stellvertreter fuer
         # HAL/Scheduler/ABI; weil derselbe Aufbau zugleich das Verus-Modell gegen den echten Code
         # faehrt, liegt er in `tools/verus-modelltreue-ipc.sh` und wird hier nur gerufen.

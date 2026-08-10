@@ -12,7 +12,7 @@ Architektur von Anfang an auf **mehrere Regionen** ausgelegt. Siehe
 
 ## Phasen
 
-- **R0 — Runtime `sel4lake-region`.** Neues Crate, die **einzige** Stelle mit Speicher-`unsafe`.
+- **R0 — Runtime `caprock-region`.** Neues Crate, die **einzige** Stelle mit Speicher-`unsafe`.
   `Region` (besitzt `MemoryCap` + `RegionTag{id,Purpose}`); `RegionView<'a>` mit ausschließlich
   sicheren Operationen: `get<T:Pod>`/`set<T:Pod>`/`copy_from`/`copy_to`/`fill`, scoped
   `with_bytes(|&mut [u8]| …)` (Slice kann die Closure nicht verlassen), `split_at`/`subview`.
@@ -39,7 +39,7 @@ als Allgemein-Heap (kein mixed-lifetime-Free) — bleibt der Large-/Arena-Pfad.
 
 ## `unsafe`-Bilanz
 
-Das gesamte Speicher-`unsafe` liegt in `crates/sel4lake-region` (RegionView-Accessoren +
+Das gesamte Speicher-`unsafe` liegt in `crates/caprock-region` (RegionView-Accessoren +
 Allokator-Glue), begründet durch cap-validierte Bounds. App-/Testcode ist 100% Safe Rust. Der
 Kernel-`#[global_allocator]` ist ein **Wächter** (`NoGlobalHeap`), der versehentliches `Box::new`/
 `Vec::new` paniert — prozess-lokale Heaps (`*_in`) sind Pflicht.

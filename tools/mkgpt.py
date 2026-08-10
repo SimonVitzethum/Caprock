@@ -53,7 +53,7 @@ def build_entries(parts):
         entries[o + 16 : o + 32] = bytes((i + 1,)) * 16   # eindeutige GUID, Inhalt gleichgueltig
         struct.pack_into("<Q", entries, o + 32, first)
         struct.pack_into("<Q", entries, o + 40, last)
-        name = f"sel4lake{i}".encode("utf-16-le")
+        name = f"caprock{i}".encode("utf-16-le")
         entries[o + 56 : o + 56 + len(name)] = name
     return bytes(entries)
 
@@ -151,7 +151,7 @@ def main():
     ap.add_argument("--sectors", type=int, required=True)
     ap.add_argument("--part", action="append", default=[], metavar="FIRST:LAST")
     ap.add_argument("--magic-at", type=int, default=None,
-                    help="LBA, auf die 'SEL4LAKE' geschrieben wird")
+                    help="LBA, auf die 'CAPROCKS' geschrieben wird")
     ap.add_argument("--fat16", metavar="FIRST:LAST",
                     help="in diese Partition ein lesbares FAT16 legen (A-6.3)")
     ap.add_argument("--file", action="append", default=[], metavar="NAME=INHALT",
@@ -195,7 +195,7 @@ def main():
 
     if a.magic_at is not None:
         o = a.magic_at * SECTOR
-        disk[o : o + 8] = b"SEL4LAKE"
+        disk[o : o + 8] = b"CAPROCKS"
 
     with open(a.out, "wb") as f:
         f.write(disk)

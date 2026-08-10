@@ -10,9 +10,9 @@ weil die **Endpoint-Capability stabil** bleibt (ADR 0006).
 
 ### Neue Primitive
 
-- `sel4lake-ipc`: `EndpointTable::retire_receiver(ep, tid)` zieht einen
+- `caprock-ipc`: `EndpointTable::retire_receiver(ep, tid)` zieht einen
   blockierten Empfänger von einem Endpoint zurück (Quiesce).
-- `sel4lake-microkit`: `PdTable::clear_cap(pd, slot)` entzieht einer PD eine
+- `caprock-microkit`: `PdTable::clear_cap(pd, slot)` entzieht einer PD eine
   Capability (Autoritätsentzug).
 - `kernel/system`: Wrapper `endpoint_retire_receiver` / `clear_pd_cap`.
 

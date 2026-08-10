@@ -1,6 +1,6 @@
 ## Lizenz
 
-SEL4Lake steht unter **AGPL-3.0-or-later** (`LICENSE`).
+Caprock steht unter **AGPL-3.0-or-later** (`LICENSE`).
 
 **§13 („Remote Network Interaction") ist der Punkt der Wahl:** wer eine **veränderte** Fassung über
 ein Netz anbietet, muss ihren Quelltext den Nutzern anbieten — die Pflicht entsteht beim **Betrieb**,
@@ -17,7 +17,7 @@ fernhält.
 
 Welche Crates dafür permissiv werden müssen, steht in `docs/grenze.md`.
 
-# SEL4Lake
+# Caprock
 
 Ein eigenständiger, capability-basierter **Microkernel in Rust**, inspiriert von **seL4** und der
 **seL4-Microkit**-Laufzeit. Er läuft auf **aarch64 und x86_64**.
@@ -102,9 +102,9 @@ also 54 % weniger):
 
 ```sh
 # ohne Prüfinfrastruktur
-cargo build --release --no-default-features --target x86_64-unknown-none -p sel4lake-kernel
+cargo build --release --no-default-features --target x86_64-unknown-none -p caprock-kernel
 # mit
-cargo build --release --features selftest   --target x86_64-unknown-none -p sel4lake-kernel
+cargo build --release --features selftest   --target x86_64-unknown-none -p caprock-kernel
 ```
 
 Die Testsuiten fordern `--features selftest` für das gebootete Image **ausdrücklich** an, statt es

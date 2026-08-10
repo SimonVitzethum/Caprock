@@ -4,7 +4,7 @@
 use core::panic::PanicInfo;
 
 #[cfg(target_arch = "aarch64")]
-use sel4lake_hal as hal;
+use caprock_hal as hal;
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

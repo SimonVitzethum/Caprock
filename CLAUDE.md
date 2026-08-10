@@ -1,4 +1,4 @@
-# SEL4Lake
+# Caprock
 
 Faehigkeitsbasierter Mikrokern in Rust, von Grund auf geschrieben — kein seL4-Fork.
 Stand dieser Notiz: 2026-08-03. Nur Geprueftes.
@@ -278,7 +278,7 @@ falsch.
   stellt wieder her und **entscheidet selbst welches** — er liest einen Sektor (32710, ausserhalb
   beider Partitionen), prueft Magie, Formatversion und `kernel_code_hash` und handelt danach. Der
   Transport ist der vorhandene Blockdienst; der Kern ist Client, `virtio-blk` blieb unveraendert.
-  Format in `crates/sel4lake-cap/src/checkpoint.rs` (feste Breiten, LE, CRC-32, abhaengigkeitsfrei,
+  Format in `crates/caprock-cap/src/checkpoint.rs` (feste Breiten, LE, CRC-32, abhaengigkeitsfrei,
   host-getestet), und `Image::build` ruft `classify_all`: **eine nicht uebertragbare Cap verhindert
   den Checkpoint vor dem Schreiben.** Belegt ueber drei verkettete Boots (244 → 345 → 446, Epochen
   1 → 2 → 3) und zwei Negativfaelle. Details in `done.md`.
@@ -322,7 +322,7 @@ falsch.
 * **Z4 angefangen — die zwei Stufen, die heute prüfbar sind.** **Z4a**: `freeze_thread` hält an
   einer *benennbaren* Grenze (nicht auf einem Kern **und** keine offene IPC-Beziehung), geprüft
   über die **Wirkung** — Zähler bewegt sich, steht, läuft wieder. **Z4b**: die Verweigerungsregel
-  (`crates/sel4lake-cap/src/checkpoint.rs`, host-getestet) — was drüben nicht dasselbe bezeichnen
+  (`crates/caprock-cap/src/checkpoint.rs`, host-getestet) — was drüben nicht dasselbe bezeichnen
   kann, wandert nicht mit, und die Entscheidung braucht den **Umfang** des Checkpoints, nicht nur
   die Cap. Drei Fehler im eigenen Entwurf gemessen, darunter ein Beobachtungsfenster kürzer als
   ein Tick und ein `all_done()`-Konjunkt, das erst im Bericht entsteht.
@@ -364,7 +364,7 @@ falsch.
   das Blockgerät in der Angebotsliste davor steht.
 * **B-5.1: die Abrechnung hing am Tick — und zwar ganz.** Nicht „bis zu 10 ms Verzerrung":
   `block_current`, `switch_to` und YIELD belasteten **gar nichts**. Wer kurz vor dem Tick
-  blockiert, zahlte null. Jetzt wird jede Umplanung gestempelt (`crates/sel4lake-sched/src/cycles.rs`,
+  blockiert, zahlte null. Jetzt wird jede Umplanung gestempelt (`crates/caprock-sched/src/cycles.rs`,
   abhängigkeitsfrei, host-geprüft), geprüft als `cycacct`: **Proben > Ticks** ist die Aussage.
 * **D5: der aarch64-Kernel hat einen Root-Task** — und der Weg dorthin fand zwei Fehler, die mit
   dem Manifest nichts zu tun hatten: `boot_arg` gab die **Archiv**-Größe statt der Startmenge
@@ -372,7 +372,7 @@ falsch.
   **lokalen** IRQ-Sperre.
 * **B-5.5: begrenzt war der Prüfer, nicht `revoke`.** `cdt_audit`-Code 9, Höchststände als
   Operationszahl im Bericht.
-* **`tools/host-tests.sh`** existiert — `sel4lake-cap` hatte gar keinen Host-Test-Pfad, seine
+* **`tools/host-tests.sh`** existiert — `caprock-cap` hatte gar keinen Host-Test-Pfad, seine
   sechs Tests wären nirgends gelaufen.
 
 ## Was am 2026-08-01 dazukam
@@ -383,7 +383,7 @@ falsch.
 * **Ein echtes Leck nebenbei behoben:** `record_user_kstack` lief *hinter* dem kritischen
   Abschnitt; traf der Einsammler das Fenster, wurde der Kernel-Stack nie freigegeben.
 * **A-5.2 ist zu:** virtio-**Transport**, **Blockgerät** und **Netzkarte** auf x86, alle drei
-  kernfrei in `crates/sel4lake-virtio`. Wichtiger als die Geräte ist, was sie belegen: der RNG
+  kernfrei in `crates/caprock-virtio`. Wichtiger als die Geräte ist, was sie belegen: der RNG
   zeigte nur, dass ein Gerät in unseren Speicher **schreibt** — `blk` schickt eine Deskriptorkette,
   deren erstes Glied das Gerät **lesen** muss, und belegt damit die andere Richtung. Auch im
   Negativtest: nach dem VT-d-Aufbau bleibt das Statusbyte auf `0xff`, das Gerät hat den Anfragekopf
@@ -411,7 +411,7 @@ falsch.
   (`audit_cdt`); `revoke`, `move_cap` und `child_count` liefen unbegrenzt — auf Mandantenwunsch und
   unter der CAPS-Sperre. Schranke jetzt hergeleitet (`slots.len()`), Ueberlauf gezaehlt und als
   `cdt_audit`-Code 9 geprueft, Hoechststaende als **Operationszahl** im Bericht.
-  Nebenertrag: `sel4lake-cap` hatte gar keinen Host-Test-Pfad — `tools/host-tests.sh` sammelt jetzt
+  Nebenertrag: `caprock-cap` hatte gar keinen Host-Test-Pfad — `tools/host-tests.sh` sammelt jetzt
   **62 Tests** (mem, part, fat, cap) an einem Ort.
 * **B-7.1 ist zu — und die Notiz war ueberholt.** Kani deckte `sync` laengst ab; die CI beschrieb
   sich nur falsch (`Job: „…(Loader-Parser)"`, tatsaechlich alle vier Ziele) — und genau daraus war
@@ -419,7 +419,7 @@ falsch.
   derselben Groessenordnung wie Loom. Fuenf neue Harnesses nehmen den Zustand **symbolisch**
   (2^31 Leserzahlen, u32-Ticketueberlauf); `sync` steht bei 8 statt 3 Beweisen.
 * **B-7.2 ist zu — und die Kopie war nicht der Grund.** Loom prueft jetzt den **echten**
-  `sel4lake-sync`-Quelltext (das Skript kopiert ihn unveraendert, Beweise in derselben Datei), und
+  `caprock-sync`-Quelltext (das Skript kopiert ihn unveraendert, Beweise in derselben Datei), und
   die alten Kopien sind geloescht. Der Fund dabei: mit `core::cell::UnsafeCell` prueft Loom nur das
   **Atomic-Protokoll** — eine abgeschwaechte Ordnung im Ticket-Release lief durch ALLE Beweise
   durch. Erst mit `loom::cell::UnsafeCell` fallen 2 von 10. Selbst nachgemessen.
@@ -433,8 +433,8 @@ falsch.
   das Fenster lag vorher wirklich darin.
 * **A-6 ist zu: ueber dem Sektor liegt ein Speicherstapel — vollstaendig ausserhalb des Kerns.**
   **A-6.1** Blockdienst (Auskunft, Lesen, **Schreiben**, Flush, Bereichsfehler mit eigenem Status);
-  **A-6.2** `crates/sel4lake-part` liest GPT (14/14 Host-Tests, drei kaputte Tabellen mit
-  unterscheidbaren Gruenden abgewiesen); **A-6.3** `crates/sel4lake-fat` + `programs/trusted/fs`
+  **A-6.2** `crates/caprock-part` liest GPT (14/14 Host-Tests, drei kaputte Tabellen mit
+  unterscheidbaren Gruenden abgewiesen); **A-6.3** `crates/caprock-fat` + `programs/trusted/fs`
   lesen eine Datei ueber GPT → FAT16 → Blockdienst → Treiber (16/16 Host-Tests). Beide Parser sind
   abhaengigkeitsfrei und `forbid(unsafe_code)` — fremde Plattenbytes werden nirgends mit
   Kernprivileg interpretiert. **A-6.4** die PD SCHREIBT auch (zweiter Cluster, beide FAT-Kopien,
@@ -501,14 +501,14 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   hat sie nicht.
 * **Eine „arch-neutrale" Barriere ist keine.** `core::sync::atomic::fence(SeqCst)` wird auf aarch64
   zu `dmb ish` — Device-Memory liegt nicht in dieser Domaene, dort braucht es `dsb sy`. Beim
-  Entkoppeln von `sel4lake-virtio` waere das der bequeme Weg gewesen und haette die Semantik still
+  Entkoppeln von `caprock-virtio` waere das der bequeme Weg gewesen und haette die Semantik still
   abgeschwaecht.
 * **Ein Test, der Speicher belegt, kippt baseline-empfindliche Tests.** Der Farbtest am Anfang von
   `threads::spawn_demo` liess auf aarch64 mal `captest`, mal `sched` durchfallen. Er ist dort
   deshalb ausgehaengt (x86 laeuft ihn). Ein Test, der andere Tests kippt, macht das GESAMTE
   Ergebnis unbrauchbar.
 * **`MASK_BITS` ist nicht die Farbanzahl.** `region_bytes()` rechnete mit 64 statt mit `count()` —
-  auf x86 (256 Farben) zufaellig richtig, auf aarch64 (16) falsch. `sel4lake_mem::stripe` hatte
+  auf x86 (256 Farben) zufaellig richtig, auf aarch64 (16) falsch. `caprock_mem::stripe` hatte
   denselben Fehler; **behoben am 2026-08-02**, und er war schlimmer als gedacht: bei 16 Farben
   bekam Streifen 0 ALLE Farben und die Streifen 1..3 KEINE — und weil leere Mengen sich nicht
   schneiden, meldete der Selbsttest „disjunkt". Gruen, ohne dass etwas getrennt war.
@@ -540,7 +540,7 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
 * **Ein Urteil, das in `all_done()` steht, darf nicht erst im Bericht entstehen.** Sonst kann es
   den Bericht nicht ausloesen: der Lauf laeuft in den Watchdog und druckt das Ergebnis trotzdem.
   Im Log sieht das aus wie „gruen, aber gehangen". Zweimal an einem Tag passiert (A-6.1).
-* **Ein Test, der nirgends laeuft, ist kein Test.** `sel4lake-cap` hatte `#[cfg(test)]`-Module und
+* **Ein Test, der nirgends laeuft, ist kein Test.** `caprock-cap` hatte `#[cfg(test)]`-Module und
   keinen Weg, sie auszufuehren (`cargo test -p` scheitert am erzwungenen Custom-Target). Seit
   2026-08-02: `tools/host-tests.sh`.
 * **Wer eine Schleife begrenzt, pruefe zuerst, WELCHE begrenzt ist.** Hier war es der Pruefer und
@@ -865,19 +865,19 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
 | `kernel/src/dmatests.rs` | architekturneutrale DMA-Tests, von beiden Hochlaufwegen gefahren |
 | `kernel/src/arch/x86_64/bootinfo.rs` | `HandoverInfo` — eine Struktur, zwei Herkuenfte |
 | `kernel/src/arch/x86_64/dmar_selftest.rs` | synthetisches DMAR fuer den Selbsttest |
-| `crates/sel4lake-hal/` | `vtd`, `dmar`, `intc`, `timer`, `fault`, `iommu`-Fassade |
-| `crates/sel4lake-cap/src/space.rs` | `Finalized`, CDT, `delete_leaf` |
-| `crates/sel4lake-cap/src/checkpoint.rs` | Z4: die Verweigerungsregel (`classify`) **und** das Checkpoint-Format (`Image`, CRC-32). Abhaengigkeitsfrei, ohne `unsafe`, host-getestet — ein Checkpoint ist Eingabe, kein Zustand |
-| `crates/sel4lake-virtio/` | virtio: `Transport` + `Queue`, darauf `rng`/`blk`/`net`, plus `probe_ecam`. **Ohne jede Abhaengigkeit** — wird von der Treiber-PD gelinkt (A-5.1) |
+| `crates/caprock-hal/` | `vtd`, `dmar`, `intc`, `timer`, `fault`, `iommu`-Fassade |
+| `crates/caprock-cap/src/space.rs` | `Finalized`, CDT, `delete_leaf` |
+| `crates/caprock-cap/src/checkpoint.rs` | Z4: die Verweigerungsregel (`classify`) **und** das Checkpoint-Format (`Image`, CRC-32). Abhaengigkeitsfrei, ohne `unsafe`, host-getestet — ein Checkpoint ist Eingabe, kein Zustand |
+| `crates/caprock-virtio/` | virtio: `Transport` + `Queue`, darauf `rng`/`blk`/`net`, plus `probe_ecam`. **Ohne jede Abhaengigkeit** — wird von der Treiber-PD gelinkt (A-5.1) |
 | `programs/hardware/virtio-blk/` | **der erste Treiber ausserhalb des Kerns** (A-5.1): loest sein Geraet selbst auf, bedient Anfragen ueber seinen Kanal, austauschbar im Betrieb; seit A-6 auch Blockdienst + GPT-Scan |
-| `crates/sel4lake-part/` | GPT-Parser (A-6.2). Abhaengigkeitsfrei, `forbid(unsafe_code)`, host-getestet — fremde Plattenbytes gehoeren nicht in den Kern |
-| `crates/sel4lake-fat/` | FAT16-Parser (A-6.3), ebenso |
+| `crates/caprock-part/` | GPT-Parser (A-6.2). Abhaengigkeitsfrei, `forbid(unsafe_code)`, host-getestet — fremde Plattenbytes gehoeren nicht in den Kern |
+| `crates/caprock-fat/` | FAT16-Parser (A-6.3), ebenso |
 | `programs/trusted/fs/` | **Dateisystem-PD** (A-6.3): faehrt kein Geraet, ruft den Blockdienst |
 | `tools/mkgpt.py` | baut die GPT-Testabbilder, auch **kaputte** (`--break`) — beide Suiten benutzen dasselbe Werkzeug |
 | `kernel/src/colors.rs` | Farbzuteilung, `run_color`, Prime+Probe (B-4.5) — arch-neutral |
-| `crates/sel4lake-sched/src/cycles.rs` | Zyklenabrechnung (B-5.1) — **ohne jede Abhaengigkeit**, damit die Fallen mit Literalen statt mit einer Maschine ausloesbar sind |
+| `crates/caprock-sched/src/cycles.rs` | Zyklenabrechnung (B-5.1) — **ohne jede Abhaengigkeit**, damit die Fallen mit Literalen statt mit einer Maschine ausloesbar sind |
 | `tools/kernel-grenze.sh` | prueft, dass keine Treiber in die HAL wandern; mit Selbsttest |
-| `tools/host-tests.sh` | die Host-Tests der reinen Crates an **einem** Ort (`sel4lake-cap` lief vorher nirgends) |
+| `tools/host-tests.sh` | die Host-Tests der reinen Crates an **einem** Ort (`caprock-cap` lief vorher nirgends) |
 | `tools/handover/` | Linux-Kernelmodul fuer die Kern-Uebergabe (Variante B) |
 
 ## Wenn du hier auf dem Server arbeitest

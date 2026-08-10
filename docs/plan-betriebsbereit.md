@@ -47,7 +47,7 @@ Nicht verhandelbar, weil jede Messung darauf steht.
 Das ist die Stufe, die aus einem Testgerüst ein Betriebssystem macht.
 
 4. **[C6] Boot-Archiv auf x86 über Multiboot-Module.** `SYS_LOAD` scheitert heute sauber, weil es
-   nichts zu laden gibt. Auf ARM existiert der Weg (`tools/mkarchive.py`, `sel4lake-loader`) —
+   nichts zu laden gibt. Auf ARM existiert der Weg (`tools/mkarchive.py`, `caprock-loader`) —
    x86 braucht das Gegenstück über die Multiboot-Modulliste.
 5. **[F2] Root-Task.** Der seL4-Weg: ein Startprogramm aus dem Archiv laden und ihm die
    Wurzel-Caps übergeben. **Erst danach** darf `default = []` werden (todo F2) — vorher wäre das

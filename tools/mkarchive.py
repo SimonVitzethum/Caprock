@@ -3,7 +3,7 @@
 #
 # Baut `boot-archive.bin` aus extern gebauten Programm-Blobs + Manifesten. Das Archiv wird per
 # QEMU `-device loader,file=...,addr=MOD_BASE` in das reservierte RAM-Fenster geladen; der Kernel
-# liest es mit dem `sel4lake-loader`-Parser. Format: crates/sel4lake-loader/src/archive.rs.
+# liest es mit dem `caprock-loader`-Parser. Format: crates/caprock-loader/src/archive.rs.
 #
 # Das Boot-Archiv ist nur EINE Quelle (ADR 0011, Verfeinerung 3); jeder Eintrag traegt eine stabile
 # numerische program_id + version (Verfeinerung 4).

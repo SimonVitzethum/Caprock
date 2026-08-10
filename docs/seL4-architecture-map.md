@@ -1,7 +1,7 @@
 # seL4-Architektur-Referenz (Quellanalyse)
 
 Strukturierte Karte des seL4-C-Kernels unter
-`/home/simon/Dokumente/SEL4Lake/seL4/src`. **Referenz, kein Fork-Vorbild zum
+`/home/simon/Dokumente/Caprock/seL4/src`. **Referenz, kein Fork-Vorbild zum
 Kopieren** — sie dient dazu, bewährte Muster für die Rust-Neuimplementierung zu
 verstehen. Pfade sind relativ zu `seL4/src` (Header teils unter `seL4/include`).
 
@@ -70,11 +70,11 @@ architekturunabhängig; `arch/`+`plat/` (~2.4M) tragen die Hardware-Spezifik.
 
 - `arch/arm/64/head.S` (Boot-Entry), `traps.S` (Vektoren/Handler),
   `c_traps.c` (C-Dispatch), `kernel/thread.c` (Kontextwechsel),
-  `kernel/vspace.c` (MMU/Page-Tables/ASID — in SEL4Lake **entfällt** der
+  `kernel/vspace.c` (MMU/Page-Tables/ASID — in Caprock **entfällt** der
   per-Prozess-Teil, ADR 0002), `machine/registerset.c`, `machine/fpu.c`.
 - Boot: MMU-aus-Entry → Boot-Page-Tables → MMU an → `init_kernel` → Rootserver.
 
-## Konsequenzen für SEL4Lake
+## Konsequenzen für Caprock
 
 Übernommen werden die *Konzepte* (Caps/CDT, Endpoint/Notification/Reply,
 Bitmap-Scheduler, Retype-Idee), neu sind: Rust statt C, **kein per-Prozess-VSpace**

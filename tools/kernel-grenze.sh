@@ -49,12 +49,12 @@ declare -A ERLAUBT=(
   [dmar]="IOMMU-Entdeckung aus ACPI"
   [acpi]="Plattformentdeckung (Kerne, ECAM) beim Hochlauf"
   [pcie]="Bus-ENUMERATION + RID-Ermittlung fuer die IOMMU -- nicht Geraetetreiber"
-  [virtio]="nur noch das AUFFINDEN der virtio-Strukturen im Konfigurationsraum (Enumeration, wie pcie). Die Treiberlogik liegt seit 2026-08-01 in crates/sel4lake-virtio -- ohne jede Abhaengigkeit, damit sie in eine Userland-PD kann (A-5.1)"
+  [virtio]="nur noch das AUFFINDEN der virtio-Strukturen im Konfigurationsraum (Enumeration, wie pcie). Die Treiberlogik liegt seit 2026-08-01 in crates/caprock-virtio -- ohne jede Abhaengigkeit, damit sie in eine Userland-PD kann (A-5.1)"
 )
 
 # Bekannte Ausnahmen: liegen im Kern, gehoeren dort NICHT hin, mit benanntem Ausgang.
 # Leer -- und das ist der Punkt. Am 2026-08-01 stand hier `virtio`, weil das Protokoll im Kern
-# lag. Es liegt jetzt in `crates/sel4lake-virtio` (keine Abhaengigkeiten); in der HAL blieb nur das
+# lag. Es liegt jetzt in `crates/caprock-virtio` (keine Abhaengigkeiten); in der HAL blieb nur das
 # Auffinden der Strukturen, also Enumeration. Eine Ausnahme weniger, nicht eine Ausnahme
 # umgeschrieben.
 declare -A AUSNAHME=()
@@ -79,7 +79,7 @@ while IFS= read -r f; do
     echo "          selbst braucht. Stillschweigend aufnehmen ist der Weg, auf dem aus einem" >&2
     echo "          Mikrokern ein Monolith wird." >&2
     fehler=1
-done < <(find crates/sel4lake-hal/src -name '*.rs' -not -path '*/tests/*')
+done < <(find crates/caprock-hal/src -name '*.rs' -not -path '*/tests/*')
 
 echo "  geprueft: ${#gefunden[@]} HAL-Module"
 if [ "$fehler" -ne 0 ]; then echo "== KERNGRENZE VERLETZT =="; exit 1; fi
@@ -88,7 +88,7 @@ if [ "$fehler" -ne 0 ]; then echo "== KERNGRENZE VERLETZT =="; exit 1; fi
 # muss sprechfaehig sein. Also einmal ein Modul unterschieben, das dort nichts zu suchen hat, und
 # nachsehen, ob er es findet. Ohne diesen Schritt waere "keine Verletzung" auch dann die Antwort,
 # wenn der `find`-Aufruf ins Leere liefe oder die Schleife nie durchlaufen wuerde.
-PROBE=crates/sel4lake-hal/src/sel4lake_regressionsgeraet.rs
+PROBE=crates/caprock-hal/src/caprock_regressionsgeraet.rs
 trap 'rm -f "$PROBE"' EXIT
 printf '// Wegwerfdatei des Waechter-Selbsttests.\n' > "$PROBE"
 if "$0" --nur-pruefen >/dev/null 2>&1; then

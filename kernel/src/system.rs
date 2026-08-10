@@ -15,20 +15,20 @@
 //! nimmt zwei verschiedene `SCHEDS[*]` gleichzeitig. Vollständige Herleitung + alle belegten
 //! Schachtelungen: `docs/invariants.md` §1.
 
-use sel4lake_cap::{CapError, CapInfo, CapPtr, DmaCoherence, DmaDir, ObjectKind};
-use sel4lake_hal::{self as hal, exception::TrapFrame, fp::FpState, println};
-use sel4lake_ipc::{Endpoint, Notification, Quiescence, Rebind};
-use sel4lake_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
-use sel4lake_microkit::{Caps, Domain};
-use sel4lake_region::heap::RegionSource;
-use sel4lake_region::{state, Purpose, Region, RegionTag};
-use sel4lake_loader::elf::{ElfImage, PF_W, PF_X};
-use sel4lake_loader::manifest as man;
+use caprock_cap::{CapError, CapInfo, CapPtr, DmaCoherence, DmaDir, ObjectKind};
+use caprock_hal::{self as hal, exception::TrapFrame, fp::FpState, println};
+use caprock_ipc::{Endpoint, Notification, Quiescence, Rebind};
+use caprock_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
+use caprock_microkit::{Caps, Domain};
+use caprock_region::heap::RegionSource;
+use caprock_region::{state, Purpose, Region, RegionTag};
+use caprock_loader::elf::{ElfImage, PF_W, PF_X};
+use caprock_loader::manifest as man;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::addr::{DmaRegion, Iova, Pa};
-use sel4lake_sched::{SchedOps, Scheduler, ThreadId, MAX_CORES};
-use sel4lake_slab::{AtomicTable, Slab};
-use sel4lake_sync::{RwSpinLock, SpinLock};
+use caprock_sched::{SchedOps, Scheduler, ThreadId, MAX_CORES};
+use caprock_slab::{AtomicTable, Slab};
+use caprock_sync::{RwSpinLock, SpinLock};
 
 /// **Tatsächliche** Kernzahl (beim Boot gesetzt, s. [`configure`]). Alle per-Kern-Schleifen
 /// laufen hierüber; die Compile-Zeit-Konstante [`MAX_CORES`] dimensioniert nur die Arrays
@@ -42,12 +42,12 @@ pub fn stack_bytes() -> u64 {
 
 /// Noch freie **Thread-Slots** im globalen Thread-Directory (Kapazitäts-Telemetrie).
 pub fn threads_available() -> usize {
-    sel4lake_sched::threads_available()
+    caprock_sched::threads_available()
 }
 
 /// Gesamtzahl der Thread-Slots (Boot-Kapazität).
 pub fn thread_capacity() -> usize {
-    sel4lake_sched::thread_capacity()
+    caprock_sched::thread_capacity()
 }
 
 /// Anzahl aktiver Kerne (Laufzeitwert).
@@ -97,7 +97,7 @@ fn claim_user_kstack() -> Option<usize> {
 /// seine Cache-Zeilen tragen also dessen Zugriffsmuster. Ihn ungefärbt zu lassen hieße, die
 /// Trennung an genau der Stelle aufzugeben, an der der Kernel für das Subjekt arbeitet.
 /// 16 KiB sind vier Seiten und passen damit in jeden Streifen (kleinster Streifen: 16 Seiten).
-fn claim_user_kstack_masked(mask: Option<sel4lake_mem::ColorMask>) -> Option<usize> {
+fn claim_user_kstack_masked(mask: Option<caprock_mem::ColorMask>) -> Option<usize> {
     let (sz, al) = (USER_KSTACK_SIZE as u64, USER_KSTACK_SIZE as u64);
     let base = match mask {
         // Ueber die Politik aus `mem_alloc`/`alloc_colored` (unten zuerst), nicht daran vorbei:
@@ -152,7 +152,7 @@ fn reclaim_user_kstack(thread_slot: usize) {
 /// Virtuelle „freie Kstack-Kapazität" (jetzt RAM-begrenzt): `MAX_THREADS - live`. Für den
 /// Reclaim-Test (spawnt, solange > 0) + Diagnose.
 pub fn user_kstack_free_count() -> usize {
-    sel4lake_sched::thread_capacity().saturating_sub(KSTACKS.lock().live)
+    caprock_sched::thread_capacity().saturating_sub(KSTACKS.lock().live)
 }
 /// Sticky: wurde jemals ein Syscall von EL0 (User-Thread) gesehen?
 static EL0_SYSCALL_SEEN: AtomicBool = AtomicBool::new(false);
@@ -383,7 +383,7 @@ fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
 /// `None`), statt etwas Halbes zu laden.
 use crate::loader::load_by_index;
 
-fn dispatch_delete_cap(cap: sel4lake_cap::CapPtr) -> bool {
+fn dispatch_delete_cap(cap: caprock_cap::CapPtr) -> bool {
     cap_delete(cap).is_ok()
 }
 
@@ -397,7 +397,7 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
     // Sperrordnung CAPS < EPS[i]/NTFNS[i] < SCHEDS -> deadlockfrei. IRQs im Trap
     // maskiert -> kein Preempt beim Lock-Halten.
     let mut ops = KernelSched;
-    let next = sel4lake_microkit::dispatch(
+    let next = caprock_microkit::dispatch(
         frame as usize,
         core,
         &mut ops,
@@ -446,7 +446,7 @@ fn with_owner<R>(
     mut f: impl FnMut(&mut Scheduler, usize) -> Option<R>,
 ) -> Option<(R, usize)> {
     for _ in 0..MIGRATION_RETRIES {
-        let c = sel4lake_sched::owner_core(tid)?;
+        let c = caprock_sched::owner_core(tid)?;
         if c >= num_cores() {
             return None;
         }
@@ -458,7 +458,7 @@ fn with_owner<R>(
             return Some((r, c));
         }
         // Fehlgeschlagen: nur wiederholen, wenn der Thread inzwischen woanders lebt.
-        match sel4lake_sched::owner_core(tid) {
+        match caprock_sched::owner_core(tid) {
             Some(c2) if c2 != c => continue,
             _ => return None,
         }
@@ -468,7 +468,7 @@ fn with_owner<R>(
 
 /// Besitzender Kern eines Threads (lock-frei; kann beim Sperren bereits veraltet sein).
 pub fn owner_core_of(tid: ThreadId) -> Option<usize> {
-    sel4lake_sched::owner_core(tid)
+    caprock_sched::owner_core(tid)
 }
 
 /// Einen Reschedule-IPI an `core` schicken, falls es nicht der eigene ist.
@@ -689,7 +689,7 @@ fn sync_fp_trap(core: usize, sched: &Scheduler) {
     }
     // ------------------------------------------------------------------------------------------
     // aarch64: LAZY. **Bewusste Divergenz** — die Begründung steht im HAL-Vertrag
-    // (`crates/sel4lake-hal/src/aarch64/fp.rs`), damit der nächste Leser sie nicht für ein
+    // (`crates/caprock-hal/src/aarch64/fp.rs`), damit der nächste Leser sie nicht für ein
     // Versehen hält. Kurz: `CPACR_EL1.FPEN` trappt **nur EL0** und ist präzise; es gibt keine
     // LazyFP-Entsprechung. Die Trap-Reichweiten sind verschieden, und die Exponierung ist es auch.
     #[cfg(not(target_arch = "x86_64"))]
@@ -1034,18 +1034,18 @@ pub fn configure(cores: usize) -> (usize, usize, usize, u64) {
 
     // Thread-Directory (gid -> Kern/Slot) + gid-Freiliste.
     let dir = table(
-        sel4lake_sched::directory_bytes(total),
-        sel4lake_sched::directory_align().max(4096),
+        caprock_sched::directory_bytes(total),
+        caprock_sched::directory_align().max(4096),
     );
     // SAFETY: frisch allozierter, exklusiver, korrekt ausgerichteter Speicher der
     // geforderten Größe, der bis zum Reboot lebt; einmaliger Aufruf beim Boot, bevor ein
     // anderer Kern läuft.
-    unsafe { sel4lake_sched::attach_directory(dir, total) };
+    unsafe { caprock_sched::attach_directory(dir, total) };
 
     // Per-Kern-Tabellen (TCBs + Zombie-Ring + Freiliste).
-    let core_bytes = sel4lake_sched::core_storage_bytes(per_core);
+    let core_bytes = caprock_sched::core_storage_bytes(per_core);
     for c in 0..cores {
-        let mem = table(core_bytes, sel4lake_sched::core_storage_align().max(4096));
+        let mem = table(core_bytes, caprock_sched::core_storage_align().max(4096));
         // SAFETY: wie oben; jede Instanz bekommt ihren **eigenen** Block (exklusiv).
         unsafe { SCHEDS[c].lock().attach_storage(c, mem, per_core) };
         // B-5.1: die Zyklenquelle **zusichern oder nicht**. `invariant_tsc()` fragt die Hardware
@@ -1055,9 +1055,9 @@ pub fn configure(cores: usize) -> (usize, usize, usize, u64) {
         // Genau darum wird hier **gefragt** und nicht angenommen: unter TCG lautet die Antwort
         // je nach CPU-Modell verschieden, und eine erfundene Rechnung wäre schlimmer als keine.
         SCHEDS[c].lock().set_cycle_source(if hal::timer::invariant_tsc() {
-            sel4lake_sched::Source::Invariant
+            caprock_sched::Source::Invariant
         } else {
-            sel4lake_sched::Source::Untrusted
+            caprock_sched::Source::Untrusted
         });
     }
 
@@ -1099,10 +1099,10 @@ pub fn configure(cores: usize) -> (usize, usize, usize, u64) {
 ///
 /// Summe aller PD-Budgets plus Kernel-Reserve. Die Rechnung stand hier als
 /// `CAP_SLOTS_FOR_ALL_PDS + 256` und damit an einer zweiten Stelle neben der Definition der
-/// Budgets; sie ist nach `sel4lake_microkit::CAP_SLOTS_TOTAL` gezogen. Was die Reserve deckt und
+/// Budgets; sie ist nach `caprock_microkit::CAP_SLOTS_TOTAL` gezogen. Was die Reserve deckt und
 /// warum sie neben der Summe steht, ist dort dokumentiert — **nachgezählt** wird sie von
 /// `cap_nonbudget_slots`.
-const CAP_SLOTS: usize = sel4lake_microkit::CAP_SLOTS_TOTAL;
+const CAP_SLOTS: usize = caprock_microkit::CAP_SLOTS_TOTAL;
 
 /// **Objekt-Kapazität** — genauso viele wie Slots.
 ///
@@ -1136,27 +1136,27 @@ pub fn configure_caps() -> u64 {
     };
 
     let slots_mem = table(
-        CAP_SLOTS * core::mem::size_of::<sel4lake_cap::CapSlot>(),
-        core::mem::align_of::<sel4lake_cap::CapSlot>().max(4096),
+        CAP_SLOTS * core::mem::size_of::<caprock_cap::CapSlot>(),
+        core::mem::align_of::<caprock_cap::CapSlot>().max(4096),
     );
     let objs_mem = table(
-        CAP_OBJECTS * core::mem::size_of::<sel4lake_cap::Object>(),
-        core::mem::align_of::<sel4lake_cap::Object>().max(4096),
+        CAP_OBJECTS * core::mem::size_of::<caprock_cap::Object>(),
+        core::mem::align_of::<caprock_cap::Object>().max(4096),
     );
-    let mut slots: Slab<sel4lake_cap::CapSlot> = Slab::empty();
-    let mut objects: Slab<sel4lake_cap::Object> = Slab::empty();
+    let mut slots: Slab<caprock_cap::CapSlot> = Slab::empty();
+    let mut objects: Slab<caprock_cap::Object> = Slab::empty();
     // SAFETY: frisch allozierter, exklusiver, korrekt ausgerichteter Speicher der geforderten
     // Größe, der bis zum Reboot lebt; einmaliger Aufruf beim Boot vor jeder Cap-Operation.
     unsafe {
         slots.attach(
-            slots_mem as *mut sel4lake_cap::CapSlot,
+            slots_mem as *mut caprock_cap::CapSlot,
             CAP_SLOTS,
-            |_| sel4lake_cap::CapSlot::EMPTY,
+            |_| caprock_cap::CapSlot::EMPTY,
         );
         objects.attach(
-            objs_mem as *mut sel4lake_cap::Object,
+            objs_mem as *mut caprock_cap::Object,
             CAP_OBJECTS,
-            |_| sel4lake_cap::Object::EMPTY,
+            |_| caprock_cap::Object::EMPTY,
         );
     }
     CAPS.write().cspace.attach(slots, objects);
@@ -1168,7 +1168,7 @@ pub fn configure_caps() -> u64 {
         let g = CAPS.read();
         let (have_slots, have_objs) = g.cspace.capacity();
         assert!(
-            have_slots >= sel4lake_microkit::CAP_SLOTS_TOTAL && have_objs >= CAP_OBJECTS,
+            have_slots >= caprock_microkit::CAP_SLOTS_TOTAL && have_objs >= CAP_OBJECTS,
             "Cap-Tabellen kleiner als gerechnet: {have_slots}/{have_objs} Slots/Objekte"
         );
     }
@@ -1205,15 +1205,15 @@ pub fn configure_caps() -> u64 {
     // waren -- `[Pd; 256]` im `.bss`. Ab hier gilt dasselbe wie fuer die Cap-Tabellen: die Zahl
     // kostet RAM, keine Struktur, und was sie kostet, steht im Boot-Report.
     let pds_mem = table(
-        sel4lake_microkit::NPDS * core::mem::size_of::<sel4lake_microkit::Pd>(),
-        core::mem::align_of::<sel4lake_microkit::Pd>().max(4096),
+        caprock_microkit::NPDS * core::mem::size_of::<caprock_microkit::Pd>(),
+        core::mem::align_of::<caprock_microkit::Pd>().max(4096),
     );
     // SAFETY: frisch allozierter, exklusiver, ausgerichteter Speicher der geforderten Groesse,
     // der bis zum Reboot lebt; einmaliger Aufruf beim Boot VOR der ersten PD.
     unsafe {
         CAPS.write().pds.attach(
-            pds_mem as *mut sel4lake_microkit::Pd,
-            sel4lake_microkit::NPDS,
+            pds_mem as *mut caprock_microkit::Pd,
+            caprock_microkit::NPDS,
         )
     };
 
@@ -1225,9 +1225,9 @@ pub fn configure_caps() -> u64 {
 ///
 /// Die Reserve steht **neben** der Summe, nicht in ihr — aus demselben Grund wie bei `CAP_SLOTS`:
 /// eine PD, die ihren Endpoint nimmt, soll dem Kernel keinen wegnehmen können.
-const NEPS: usize = sel4lake_microkit::ENDPOINTS_FOR_ALL_PDS + 64;
+const NEPS: usize = caprock_microkit::ENDPOINTS_FOR_ALL_PDS + 64;
 /// **Notification-Kapazität** — wie [`NEPS`], eine je PD plus Reserve.
-const NNTFNS: usize = sel4lake_microkit::NOTIFICATIONS_FOR_ALL_PDS + 64;
+const NNTFNS: usize = caprock_microkit::NOTIFICATIONS_FOR_ALL_PDS + 64;
 
 /// **IPC-Tabellen zur Boot-Zeit anlegen** (A-3.4 Teil 4) — Endpoints, Notifications und die
 /// Sammelfläche für verwaiste Aufrufer.
@@ -1283,7 +1283,7 @@ pub fn configure_ipc() -> u64 {
     println!(
         "ipc     : {n_eps} Endpoints / {n_ntfns} Notifications, Tabellen {} KiB aus dem RAM (eine PD, ein Endpoint: {} PDs)",
         bytes >> 10,
-        sel4lake_microkit::ENDPOINTS_FOR_ALL_PDS,
+        caprock_microkit::ENDPOINTS_FOR_ALL_PDS,
     );
     bytes
 }
@@ -1489,7 +1489,7 @@ fn mem_alloc_below(size: u64, align: u64, limit: u64) -> Option<MemoryCap> {
 fn mem_alloc_masked(
     size: u64,
     align: u64,
-    mask: Option<sel4lake_mem::ColorMask>,
+    mask: Option<caprock_mem::ColorMask>,
 ) -> Option<MemoryCap> {
     match mask {
         Some(m) => alloc_colored(size, align, m),
@@ -1509,7 +1509,7 @@ pub fn alloc_anywhere(size: u64, align: u64) -> Option<MemoryCap> {
 }
 /// Wie [`alloc`], aber jede Seite trägt eine Farbe aus `mask` (todo A1). Genullt wie jede
 /// Region, die an ein Subjekt gehen kann.
-pub fn alloc_colored(size: u64, align: u64, mask: sel4lake_mem::ColorMask) -> Option<MemoryCap> {
+pub fn alloc_colored(size: u64, align: u64, mask: caprock_mem::ColorMask) -> Option<MemoryCap> {
     zoned_alloc_colored(size, align, mask, Zone::IdentityMapped)
 }
 
@@ -1519,7 +1519,7 @@ pub fn alloc_colored(size: u64, align: u64, mask: sel4lake_mem::ColorMask) -> Op
 fn alloc_colored_anywhere(
     size: u64,
     align: u64,
-    mask: sel4lake_mem::ColorMask,
+    mask: caprock_mem::ColorMask,
 ) -> Option<MemoryCap> {
     zoned_alloc_colored(size, align, mask, Zone::Anywhere)
 }
@@ -1532,7 +1532,7 @@ fn alloc_colored_anywhere(
 fn mem_alloc_masked_anywhere(
     size: u64,
     align: u64,
-    mask: Option<sel4lake_mem::ColorMask>,
+    mask: Option<caprock_mem::ColorMask>,
 ) -> Option<MemoryCap> {
     match mask {
         Some(m) => alloc_colored_anywhere(size, align, m),
@@ -1544,7 +1544,7 @@ fn mem_alloc_masked_anywhere(
 fn zoned_alloc_colored(
     size: u64,
     align: u64,
-    mask: sel4lake_mem::ColorMask,
+    mask: caprock_mem::ColorMask,
     zone: Zone,
 ) -> Option<MemoryCap> {
     let colors = crate::colors::count();
@@ -1682,8 +1682,8 @@ pub fn cap_nonbudget_slots() -> (usize, usize, bool) {
     let mut scratch = CAP_SEEN.lock();
     let g = CAPS.read();
     match g.nonbudget_slots(scratch.as_mut_slice()) {
-        Some(n) => (n, sel4lake_microkit::CAP_SLOTS_KERNEL_RESERVE, n <= sel4lake_microkit::CAP_SLOTS_KERNEL_RESERVE),
-        None => (usize::MAX, sel4lake_microkit::CAP_SLOTS_KERNEL_RESERVE, false),
+        Some(n) => (n, caprock_microkit::CAP_SLOTS_KERNEL_RESERVE, n <= caprock_microkit::CAP_SLOTS_KERNEL_RESERVE),
+        None => (usize::MAX, caprock_microkit::CAP_SLOTS_KERNEL_RESERVE, false),
     }
 }
 
@@ -1711,7 +1711,7 @@ pub fn cap_inspect(ptr: CapPtr) -> Option<CapInfo> {
 /// todo C3) hätte den Stack **jedes** Threads mitvergrößert. Genau das nennt todo A3 als
 /// Nebenbedingung, und deshalb steht A-3.3 vor A-3.4.
 ///
-/// Die Kapazität kommt aus der Cap-Crate ([`sel4lake_cap::MAX_FINALIZED`]) statt aus einer
+/// Die Kapazität kommt aus der Cap-Crate ([`caprock_cap::MAX_FINALIZED`]) statt aus einer
 /// zweiten Konstante hier; wächst die Tabelle, wächst der Puffer mit, ohne dass jemand daran
 /// denken muss.
 struct FinalizeBuf {
@@ -1783,7 +1783,7 @@ pub fn finalize_overflow_count() -> u32 {
 ///
 /// Deshalb laut und sofort, nicht nur als Zähler: ein Fehler dieser Klasse ist im Nachhinein an
 /// nichts mehr zu erkennen — man sieht nur einen Thread, der steht.
-fn note_finalize_overflow(rf: &sel4lake_cap::Finalized<'_>) {
+fn note_finalize_overflow(rf: &caprock_cap::Finalized<'_>) {
     if rf.overflowed() {
         FINALIZE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
         println!(
@@ -1799,7 +1799,7 @@ pub fn cap_delete(ptr: CapPtr) -> Result<(), CapError> {
     // Freigeben von CAPS/MEM, da das Entblocken EPS<SCHEDS sperrt -> CAPS < EPS).
     let mut buf = FINALIZE.lock();
     let b = &mut *buf;
-    let mut rf = sel4lake_cap::Finalized::new(b.items.as_mut_slice(), b.dma.as_mut_slice());
+    let mut rf = caprock_cap::Finalized::new(b.items.as_mut_slice(), b.dma.as_mut_slice());
     let r = {
         let mut caps = CAPS.write();
         let mut mem = MEM.lock();
@@ -1813,7 +1813,7 @@ pub fn cap_delete(ptr: CapPtr) -> Result<(), CapError> {
 pub fn cap_revoke(ptr: CapPtr) -> Result<(), CapError> {
     let mut buf = FINALIZE.lock();
     let b = &mut *buf;
-    let mut rf = sel4lake_cap::Finalized::new(b.items.as_mut_slice(), b.dma.as_mut_slice());
+    let mut rf = caprock_cap::Finalized::new(b.items.as_mut_slice(), b.dma.as_mut_slice());
     let r = {
         let mut caps = CAPS.write();
         let mut mem = MEM.lock();
@@ -1828,7 +1828,7 @@ pub fn cap_revoke(ptr: CapPtr) -> Result<(), CapError> {
 /// Für jede beim Löschen/Revoke finalisierte Reply-Cap den ausstehenden Call abbrechen:
 /// den noch wartenden Aufrufer mit `ERR_SERVER_GONE` entblocken (Revocation eines
 /// Calls). Läuft OHNE gehaltenen CAPS/MEM-Lock (Ordnung CAPS < EPS < SCHEDS).
-fn abort_finalized_replies(rf: &sel4lake_cap::Finalized<'_>) {
+fn abort_finalized_replies(rf: &caprock_cap::Finalized<'_>) {
     for (ep, caller_raw) in rf.iter() {
         endpoint_abort_call(ep as usize, ThreadId::from_raw(caller_raw));
     }
@@ -1845,7 +1845,7 @@ pub fn endpoint_abort_call(ep: usize, caller: ThreadId) -> bool {
         e.abort_call(caller)
     };
     if let Some(c) = orphan {
-        unblock_with_error(c, sel4lake_abi::result::ERR_SERVER_GONE);
+        unblock_with_error(c, caprock_abi::result::ERR_SERVER_GONE);
         true
     } else {
         false
@@ -2002,7 +2002,7 @@ pub fn least_loaded_core() -> usize {
     let mut best = 0usize;
     let mut best_load = usize::MAX;
     for c in 0..num_cores() {
-        let load = sel4lake_sched::core_load(c);
+        let load = caprock_sched::core_load(c);
         if load < best_load {
             best_load = load;
             best = c;
@@ -2054,7 +2054,7 @@ pub fn migrate_to(tid: ThreadId, dst: usize) -> bool {
     if dst == src || dst >= num_cores() {
         return false;
     }
-    if sel4lake_sched::owner_core(tid) != Some(src) {
+    if caprock_sched::owner_core(tid) != Some(src) {
         return false; // nur der besitzende Kern schiebt (s. o.)
     }
     // Lazy-FP: gehören die FP-Register dieses Kerns dem Migranten, MÜSSEN sie jetzt in
@@ -2105,9 +2105,9 @@ const IMBALANCE_THRESHOLD: usize = 2;
 
 pub fn balance_once() -> bool {
     let src = hal::cpu::core_id();
-    let my_load = sel4lake_sched::core_load(src);
+    let my_load = caprock_sched::core_load(src);
     let dst = least_loaded_core();
-    if dst == src || my_load < sel4lake_sched::core_load(dst) + IMBALANCE_THRESHOLD {
+    if dst == src || my_load < caprock_sched::core_load(dst) + IMBALANCE_THRESHOLD {
         return false;
     }
     let Some(cand) = SCHEDS[src].lock().migration_candidate() else {
@@ -2271,7 +2271,7 @@ fn create_vspace() -> Option<(u16, u64)> {
 /// Tabellenzeilen werden vom **Seitenlaufwerk der MMU** geladen und liegen im selben LLC wie
 /// alles andere; ein Walk im Namen einer PD hinterlaesst also Spuren. Sie mitzufaerben kostet
 /// nichts (zwei bzw. drei 4-KiB-Seiten) und schliesst einen Kanal, den man sonst uebersieht.
-fn create_vspace_masked(mask: Option<sel4lake_mem::ColorMask>) -> Option<(u16, u64)> {
+fn create_vspace_masked(mask: Option<caprock_mem::ColorMask>) -> Option<(u16, u64)> {
     // ASID/VSpace-Slot aus der **Free-List** (VSPACES) belegen — wiederverwendbar
     // (kein monoton wachsender Zähler -> keine ASID-Leaks). Reservierung unter EINEM
     // Lock (Platzhalter), damit zwei Kerne nicht denselben Slot greifen.
@@ -2452,7 +2452,7 @@ fn vspace_map_masked(
     pa: crate::addr::Pa,
     len: u64,
     perm: hal::mmu::UserPerm,
-    mask: Option<sel4lake_mem::ColorMask>,
+    mask: Option<caprock_mem::ColorMask>,
 ) -> bool {
     // **Hier und nur hier** wird aus einer PA eine VA — mit Grund. Der Rest der Funktion rechnet
     // danach mit `base`, weil die HAL an dieser Stelle EINEN Wert nimmt; das ist der Sinn der
@@ -2561,7 +2561,7 @@ fn vspace_map_user_region(
     phys: u64,
     len: u64,
     perm: hal::mmu::UserPerm,
-    mask: Option<sel4lake_mem::ColorMask>,
+    mask: Option<caprock_mem::ColorMask>,
 ) -> Option<u64> {
     let l1 = vspace_l1(asid)?;
     let mut alloc = || mem_alloc_masked(4096, 4096, mask).map(|c| c.base());
@@ -2817,7 +2817,7 @@ pub fn spawn_isolated_colored(
     entry: usize,
     arg: usize,
     prio: u8,
-    mask: sel4lake_mem::ColorMask,
+    mask: caprock_mem::ColorMask,
 ) -> Option<(ThreadId, u64, (u64, u64, u64))> {
     // Ohne Streifennummer: der Aufrufer hat die Maske selbst gewaehlt (Selbsttest) und fuehrt
     // keine Belegung. Fuer PDs ist `spawn_isolated_colored_auto` der richtige Weg.
@@ -2855,7 +2855,7 @@ fn spawn_isolated_colored_inner(
     entry: usize,
     arg: usize,
     prio: u8,
-    mask: sel4lake_mem::ColorMask,
+    mask: caprock_mem::ColorMask,
     stripe: Option<u32>,
 ) -> Option<(Parked, u64, (u64, u64, u64))> {
     let core = hal::cpu::core_id();
@@ -3214,7 +3214,7 @@ fn loaded_register(asid: u16, segs: &[(u64, u64)]) -> bool {
 
 /// Die zuletzt **gefaerbt** geladene PD: `(asid, Farbsatz)`. Nur fuer den Nachweis.
 #[cfg(feature = "selftest")]
-static PDCOLOR_GEFAERBT: SpinLock<Option<(u16, sel4lake_mem::ColorMask)>> = SpinLock::new(None);
+static PDCOLOR_GEFAERBT: SpinLock<Option<(u16, caprock_mem::ColorMask)>> = SpinLock::new(None);
 /// Die zuletzt **ungefaerbt** geladene PD -- die Gegenprobe.
 #[cfg(feature = "selftest")]
 static PDCOLOR_UNGEFAERBT: SpinLock<u16> = SpinLock::new(0);
@@ -3222,7 +3222,7 @@ static PDCOLOR_UNGEFAERBT: SpinLock<u16> = SpinLock::new(0);
 /// Die Prioritaet, die der SCHEDULER diesem Thread gibt.
 #[cfg(feature = "selftest")]
 pub fn priority_of(tid: ThreadId) -> Option<u8> {
-    sel4lake_sched::owner_core(tid).and_then(|c| SCHEDS[c].lock().priority_of(tid))
+    caprock_sched::owner_core(tid).and_then(|c| SCHEDS[c].lock().priority_of(tid))
 }
 
 /// Der letzte Ladevorgang mit einer Politik, die **von der Vorgabe abweicht**:
@@ -3246,7 +3246,7 @@ pub fn ladepolitik_abweichend() -> Option<(u8, Option<u8>, Option<usize>, Option
 
 /// `(asid_gefaerbt, maske, asid_ungefaerbt)` fuer [`crate::colors::run_pd_color`].
 #[cfg(feature = "selftest")]
-pub fn pdcolor_kandidaten() -> Option<(u16, sel4lake_mem::ColorMask, u16)> {
+pub fn pdcolor_kandidaten() -> Option<(u16, caprock_mem::ColorMask, u16)> {
     let g = (*PDCOLOR_GEFAERBT.lock())?;
     Some((g.0, g.1, *PDCOLOR_UNGEFAERBT.lock()))
 }
@@ -3382,7 +3382,7 @@ pub fn load_into_pd_mit(
     let mask = stripe.map(|(_, m)| m);
     // Ab hier gibt jeder Fehlerausgang den Streifen zurueck -- bis `vspace_bind_stripe` ihn an die
     // Lebensdauer der VSpace haengt (dann tut es `vspace_teardown`).
-    let streifen_zurueck = |st: Option<(u32, sel4lake_mem::ColorMask)>| {
+    let streifen_zurueck = |st: Option<(u32, caprock_mem::ColorMask)>| {
         if let Some((i, _)) = st {
             crate::colors::release_stripe(i);
         }
@@ -3623,7 +3623,7 @@ pub fn load_into_pd_mit(
         if pol.prio != LadePolitik::VORGABE.prio || pol.core.is_some() {
             let bekommen = SCHEDS[core].lock().priority_of(tid);
             *LADEPOLITIK_ABWEICHEND.lock() =
-                Some((pol.prio, bekommen, pol.core, sel4lake_sched::owner_core(tid)));
+                Some((pol.prio, bekommen, pol.core, caprock_sched::owner_core(tid)));
         }
     }
     // Fuer den A1-Nachweis festhalten, WELCHE asid gefaerbt geladen wurde -- die Messung liest
@@ -5631,7 +5631,7 @@ fn park_pending(region: DmaRegion) {
 /// Vorher lagen hier **zwei** weitere Arrays auf dem Kernelstack: eine Kopie der Regionen (nur um
 /// aus dem Kollektor einen zusammenhängenden Slice zu machen — den liefert er jetzt selbst) und
 /// das Ergebnisfeld.
-fn dma_finalize(fin: &sel4lake_cap::Finalized<'_>, ok: &mut [bool], ctx_of: &mut [usize]) {
+fn dma_finalize(fin: &caprock_cap::Finalized<'_>, ok: &mut [bool], ctx_of: &mut [usize]) {
     let regs = fin.dma_regions();
     let n = regs.len().min(ok.len());
     if n == 0 {
@@ -6974,7 +6974,7 @@ pub fn budget_stats(core: usize) -> (u64, u64) {
 /// ist kern-lokal: `tid` muss auf dem aufrufenden Kern liegen und darf nicht laufen.
 pub fn kill_local(tid: ThreadId) -> bool {
     let core = hal::cpu::core_id();
-    if sel4lake_sched::owner_core(tid) != Some(core) {
+    if caprock_sched::owner_core(tid) != Some(core) {
         return false;
     }
     let ok = SCHEDS[core].lock().kill(tid, core);
@@ -7028,7 +7028,7 @@ pub fn reap_core(core: usize) -> usize {
         } // MEM freigegeben
         // Thread-Slots (`gid`) zurückgeben — erst jetzt kann eine `gid` neu vergeben werden.
         for &(_, _, gid) in &zombies[..n] {
-            sel4lake_sched::release_gid(gid);
+            caprock_sched::release_gid(gid);
         }
     }
     n
@@ -7046,7 +7046,7 @@ pub fn kill_remote(tid: ThreadId) -> bool {
         reclaim_user_kstack(tid.slot());
         // Der Zielkern soll bald reapen; er kann inzwischen ein anderer sein — der IPI geht
         // an den Kern, auf dem der Kill tatsächlich stattfand.
-        if let Some(c) = sel4lake_sched::owner_core(tid) {
+        if let Some(c) = caprock_sched::owner_core(tid) {
             kick(c);
         }
     }
@@ -7167,7 +7167,7 @@ impl Parked {
 /// auflösbar ist (dann ist der Thread ohnehin weg).
 pub fn admit(p: Parked) -> Option<ThreadId> {
     let tid = p.0;
-    sel4lake_sched::owner_core(tid)
+    caprock_sched::owner_core(tid)
         .and_then(|c| SCHEDS[c].lock().admit(tid).then_some(tid))
 }
 
@@ -7327,7 +7327,7 @@ pub fn bind_pd(pd: usize, tid: ThreadId) {
     // `self.core` auf und gaebe sonst fuer jeden `spawn_on_core(1, ..)`-Thread `None` -- der
     // Melder waere genau dort blind, wo das Rennen am ehesten trifft. Das Ergebnis wird in eine
     // Bindung gelegt, damit die SCHEDS-Sperre vor `CAPS.write()` sicher wieder faellt.
-    let bereits = sel4lake_sched::owner_core(tid).and_then(|c| SCHEDS[c].lock().is_admitted(tid));
+    let bereits = caprock_sched::owner_core(tid).and_then(|c| SCHEDS[c].lock().is_admitted(tid));
     match bereits {
         Some(true) => {
             LATE_PD_BIND.fetch_add(1, Ordering::Relaxed);
@@ -7350,7 +7350,7 @@ pub fn clear_pd_cap(pd: usize, slot: usize) {
 }
 
 /// **Die Objektarten, die im Cspace einer PD stehen** — die Eingabe für
-/// [`sel4lake_cap::checkpoint::classify_all`] (Z4b/Z4 Stufe 2).
+/// [`caprock_cap::checkpoint::classify_all`] (Z4b/Z4 Stufe 2).
 ///
 /// Gibt die Zahl der betrachteten Slots zurück; `out[i]` ist `None`, wo der Slot leer ist. Der
 /// **Platz** bleibt erhalten und wird nicht weggelassen: der Grund einer Verweigerung nennt den
@@ -7393,7 +7393,7 @@ pub fn endpoint_quiesce_owner(ep: usize, tid: ThreadId) -> bool {
         e.owner_died(tid)
     }; // EPS freigegeben, bevor SCHEDS gesperrt wird
     if let Some(caller) = orphan {
-        unblock_with_error(caller, sel4lake_abi::result::ERR_SERVER_GONE);
+        unblock_with_error(caller, caprock_abi::result::ERR_SERVER_GONE);
         true
     } else {
         false
@@ -7574,7 +7574,7 @@ pub fn thaw_thread(tid: ThreadId) -> bool {
 }
 
 /// **Einen geparkten Thread vom Kernel aus wecken** (Z22, P4) — dieselbe Operation wie
-/// [`sys::UNPARK`](sel4lake_abi::sys::UNPARK), nur ohne die PD-Prüfung, die dort die Autorität
+/// [`sys::UNPARK`](caprock_abi::sys::UNPARK), nur ohne die PD-Prüfung, die dort die Autorität
 /// des Aufrufers begrenzt. Für Prüfpfade und für den IRQ-Weg.
 pub fn unpark_thread(tid: ThreadId) -> bool {
     if let Some((_, c)) = with_owner(tid, |s, _| s.unpark(tid).then_some(())) {
@@ -7651,7 +7651,7 @@ pub fn endpoint_bind_receiver(ep: usize, tid: ThreadId) -> bool {
 /// `rmig`-Szenario abgenommen.
 #[cfg(feature = "selftest")]
 pub fn run_rebind() -> bool {
-    use sel4lake_ipc::RebindBlocked;
+    use caprock_ipc::RebindBlocked;
     let v1 = ThreadId::from_raw(0xA41_0001);
     let v2 = ThreadId::from_raw(0xA41_0002);
     let fremd = ThreadId::from_raw(0xA41_0003);
@@ -7762,14 +7762,14 @@ pub fn run_epfull() -> bool {
 
     // 1..QUEUE_CAP fuellen. Jeder einzelne muss gelingen -- sonst misst der Rest nichts.
     let mut alle_gebunden = true;
-    for i in 0..sel4lake_ipc::QUEUE_CAP {
+    for i in 0..caprock_ipc::QUEUE_CAP {
         let t = ThreadId::from_raw(0xD11_0000 + i as u64);
         alle_gebunden &= e.bind_receiver(t);
     }
     // Und sie stehen wirklich alle drin -- nicht nur "hat true gesagt". Genau diese Lücke war
     // der Befund: die Meldung stimmte, der Eintrag fehlte.
     let mut alle_auffindbar = true;
-    for i in 0..sel4lake_ipc::QUEUE_CAP {
+    for i in 0..caprock_ipc::QUEUE_CAP {
         let t = ThreadId::from_raw(0xD11_0000 + i as u64);
         alle_auffindbar &= e.quiescence_of(t).as_receiver;
     }
@@ -7801,8 +7801,8 @@ pub fn run_epfull() -> bool {
         "epfull  : {} gebunden (alle auffindbar {alle_auffindbar}); der {}. abgewiesen \
          {abgewiesen}/nicht eingetragen {nicht_eingetragen}/keinen verdraengt {erster_noch_da}/\
          audit sauber {audit_sauber}; nach Freigabe wieder vergebbar {nach_freigabe}",
-        sel4lake_ipc::QUEUE_CAP,
-        sel4lake_ipc::QUEUE_CAP + 1
+        caprock_ipc::QUEUE_CAP,
+        caprock_ipc::QUEUE_CAP + 1
     );
     println!(
         "epfull  : {} (D11: der Ueberlauf einer Endpoint-Warteschlange wird BENANNT statt still \
@@ -7950,7 +7950,7 @@ pub fn run_state() -> bool {
 /// Call im Hot-Reload-Szenario (`rmig`) abgenommen, nicht an einer Attrappe.
 #[cfg(feature = "selftest")]
 pub fn run_quiesce() -> bool {
-    use sel4lake_abi::result;
+    use caprock_abi::result;
     let fremd = ThreadId::from_raw(0xA42_0001);
     let mut e = Endpoint::EMPTY;
 
@@ -8064,7 +8064,7 @@ pub fn purge_ipc_queues(tid: ThreadId) {
     }
     for i in 0..no {
         if let Some(caller) = orphans[i].take() {
-            unblock_with_error(caller, sel4lake_abi::result::ERR_SERVER_GONE);
+            unblock_with_error(caller, caprock_abi::result::ERR_SERVER_GONE);
         }
     }
 }
@@ -8090,7 +8090,7 @@ pub fn sched_audit_all() -> u32 {
 fn unblock_with_error(caller: ThreadId, code: u64) {
     let done = with_owner(caller, |sched, _| {
         let frame = sched.frame_of(caller)?; // fremder Kern/tot -> ggf. wiederholen
-        hal::exception::frame_set_reg(frame, sel4lake_abi::reg::SYSNO_RESULT, code);
+        hal::exception::frame_set_reg(frame, caprock_abi::reg::SYSNO_RESULT, code);
         sched.unblock(caller);
         Some(())
     });
@@ -8103,7 +8103,7 @@ fn unblock_with_error(caller: ThreadId, code: u64) {
 pub fn thread_alive(tid: ThreadId) -> bool {
     // Lock-frei über das Thread-Directory (ext-30): kein Sperren eines fremden Kerns nötig,
     // und immun dagegen, dass der Thread gerade migriert.
-    sel4lake_sched::is_live(tid)
+    caprock_sched::is_live(tid)
 }
 
 /// **IPC-Konsistenz-Oracle** (Fuzzer): jedes belegte Endpoint/Notification + jeden
@@ -8113,7 +8113,7 @@ pub fn thread_alive(tid: ThreadId) -> bool {
 /// audit`). Sperrt je Objekt einzeln; die Liveness-Prüfung verschachtelt EPS/NTFNS ->
 /// SCHEDS (zulässige Ordnung), nie zwei Objekte gleichzeitig.
 pub fn ipc_audit() -> u32 {
-    let live = &mut |t: ThreadId| -> bool { sel4lake_sched::is_live(t) };
+    let live = &mut |t: ThreadId| -> bool { caprock_sched::is_live(t) };
     for ep in eps().iter() {
         let e = ep.lock();
         if e.is_used() {

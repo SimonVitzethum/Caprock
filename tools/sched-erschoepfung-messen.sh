@@ -10,11 +10,11 @@
 # koennte, nie laeuft (leere Event-Queue ohne `CD.R`; `virtio-rng` als "Beleg" fuer den DMA-Pfad).
 # Ein Befund, den niemand ausloest, ist eine Lesart, kein Messwert.
 #
-# Dieses Werkzeug fuehrt den ECHTEN `crates/sel4lake-sched/src/lib.rs` aus -- unveraendert, bis auf
+# Dieses Werkzeug fuehrt den ECHTEN `crates/caprock-sched/src/lib.rs` aus -- unveraendert, bis auf
 # die eine `#![no_std]`-Zeile, die einem Host-Binary im Weg steht. Es gibt KEINE handgeschriebene
 # Zweitfassung des Schedulers; das waere die B-7.2-Falle ("ein Beweis ueber eine Kopie beweist
 # etwas ueber die Kopie"). Gegen die HAL steht ein Stellvertreter mit genau EINER Funktion
-# (`init_thread_frame`); `sel4lake-slab` und `sel4lake-sync` werden im ECHTEN Quelltext gelinkt.
+# (`init_thread_frame`); `caprock-slab` und `caprock-sync` werden im ECHTEN Quelltext gelinkt.
 #
 # ================================================================================================
 # WAS GEMESSEN WIRD
@@ -66,7 +66,7 @@
 # **NICHT gemessen:** Nebenlaeufigkeit (der Waechter ist sequentiell, die Kern-Locks bleiben
 # ausserhalb), der echte Kontextwechsel (HAL-Stellvertreter), und die Erreichbarkeit aus dem
 # Syscall-Pfad des Kernels (dazu braeuchte es einen hwfuzz-Fall; hier wird nur die Aufruffolge
-# nachgestellt, die `sel4lake-ipc` / `kernel/src/system.rs` an dieser Stelle absetzen).
+# nachgestellt, die `caprock-ipc` / `kernel/src/system.rs` an dieser Stelle absetzen).
 #
 # ================================================================================================
 # GEGENPROBE
@@ -87,10 +87,10 @@ if [ -z "${BASH_VERSION:-}" ]; then echo "FEHLER: braucht bash, nicht sh/dash." 
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-CODE_STD="$ROOT/crates/sel4lake-sched/src/lib.rs"
-CYCLES_STD="$ROOT/crates/sel4lake-sched/src/cycles.rs"
-SLAB_STD="$ROOT/crates/sel4lake-slab/src/lib.rs"
-SYNC_STD="$ROOT/crates/sel4lake-sync/src/lib.rs"
+CODE_STD="$ROOT/crates/caprock-sched/src/lib.rs"
+CYCLES_STD="$ROOT/crates/caprock-sched/src/cycles.rs"
+SLAB_STD="$ROOT/crates/caprock-slab/src/lib.rs"
+SYNC_STD="$ROOT/crates/caprock-sync/src/lib.rs"
 RUSTC="${RUSTC:-rustc}"
 
 WURZEL="$(mktemp -d)"
@@ -104,13 +104,13 @@ anbau_schreiben() {
     cat > "$1" <<'RSEOF'
 
 // ================================================================================================
-// Ab hier: der Anbau des Messwerkzeugs. Nicht Teil von `sel4lake-sched`.
+// Ab hier: der Anbau des Messwerkzeugs. Nicht Teil von `caprock-sched`.
 // ================================================================================================
 
-/// Stellvertreter fuer `sel4lake-hal`. Der Scheduler braucht davon genau eine Funktion. Was ein
+/// Stellvertreter fuer `caprock-hal`. Der Scheduler braucht davon genau eine Funktion. Was ein
 /// echter Frame ist, sagt dieser Lauf NICHT -- hier zaehlt nur, dass jeder Thread einen
 /// unterscheidbaren `sp` bekommt.
-mod sel4lake_hal {
+mod caprock_hal {
     pub mod exception {
         pub fn init_thread_frame(
             stack_top: usize,
@@ -155,7 +155,7 @@ mod messung {
     // Iterationszahl ist eine Eigenschaft des Programms und ueber Laeufe hinweg identisch --
     // und genau darum kann sie ueberhaupt in eine Gegenprobentabelle.
     //
-    // Die `fetch_add`-Zeilen stehen NICHT im Quelltext von `sel4lake-sched`. Sie werden vom
+    // Die `fetch_add`-Zeilen stehen NICHT im Quelltext von `caprock-sched`. Sie werden vom
     // Werkzeug in eine KOPIE eingesetzt (s. `INSTR_*` unten) -- deshalb tragen die
     // Verhaltensmessungen (P/M/D) und die Kostenmessungen (L) getrennte Binaries: die
     // Verhaltensaussage soll am unveraenderten Quelltext haengen.
@@ -1066,7 +1066,7 @@ in_liste={} flag={} current={}",
         b.k("D5.nach_call2.sc_donee_ist_inn", ja(s.tcbs[la].sc_donee == Some(lin)));
         b.k("D5.nach_call2.mid_sc_donor_bleibt", ja(s.tcbs[lm].sc_donor == Some(la)));
         b.k("D5.nach_call2.mid_blocked", ja(s.tcbs[lm].blocked));
-        // REPLY des inneren Servers -- genau die Folge aus `sel4lake_ipc::Endpoint::reply`:
+        // REPLY des inneren Servers -- genau die Folge aus `caprock_ipc::Endpoint::reply`:
         // erst `end_donation`, dann `unblock(caller)`.
         s.end_donation(0);
         s.unblock(tid(&s, lm));
@@ -1551,7 +1551,7 @@ in_liste={} flag={} current={}",
     }
 
     pub fn run(fassung: &str) -> i32 {
-        println!("== Messung am echten sel4lake-sched (Fassung: {fassung}) ==");
+        println!("== Messung am echten caprock-sched (Fassung: {fassung}) ==");
         let mut b = Bericht { zeilen: Vec::new() };
         p0(&mut b);
         p1(&mut b);
@@ -1689,11 +1689,11 @@ harness_bauen() {   # harness_bauen <lib.rs> <arbeitsverzeichnis>
     if ! no_std_raus "$code" "$W/harness.rs" '#![no_std]'; then return 2; fi
     cp "$CYCLES_STD" "$W/cycles.rs" || return 2
 
-    if ! ausgabe="$(einbetten "$SLAB_STD" sel4lake_slab '#![no_std]' 2>&1)"; then
+    if ! ausgabe="$(einbetten "$SLAB_STD" caprock_slab '#![no_std]' 2>&1)"; then
         printf '%s\n' "$ausgabe" >&2; return 2
     fi
     printf '%s\n' "$ausgabe" >> "$W/harness.rs"
-    if ! ausgabe="$(einbetten "$SYNC_STD" sel4lake_sync '#![cfg_attr(not(loom), no_std)]' 2>&1)"; then
+    if ! ausgabe="$(einbetten "$SYNC_STD" caprock_sync '#![cfg_attr(not(loom), no_std)]' 2>&1)"; then
         printf '%s\n' "$ausgabe" >&2; return 2
     fi
     printf '%s\n' "$ausgabe" >> "$W/harness.rs"
@@ -1826,7 +1826,7 @@ H_A='s = s.replace("""                            && self.tcbs[d].used
 
 # **H-b ist keine Mutation mehr, sondern der Quelltext.** Bis zum 2026-08-03 stand hier der
 # Vorschlag aus D9 (`budget_blocked`, der Refill weckt den ganzen Spenden-STAPEL). Er ist seit
-# Commit 068db2a in `crates/sel4lake-sched/src/lib.rs` -- und damit ist die Fassung `echt` die
+# Commit 068db2a in `crates/caprock-sched/src/lib.rs` -- und damit ist die Fassung `echt` die
 # Fassung H-b. Ihn hier stehen zu lassen hiesse, das Feld ein zweites Mal einzufuegen; das
 # Werkzeug wuerde mit einem Uebersetzungsfehler abbrechen. Was H-b war, steht in `todo.md` (D9)
 # und im Commit; was H-b TUT, misst jede Zeile der D-Reihe an der Fassung `echt`.

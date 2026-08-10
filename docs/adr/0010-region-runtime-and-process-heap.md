@@ -13,7 +13,7 @@ dynamischer Heap** (Box/Vec/BTreeMap) für safe-Rust-SAS-Prozesse auf realen Phy
 
 ## Entscheidung
 
-### 1. Runtime-Schicht `sel4lake-region` — die EINZIGE Stelle mit Speicher-`unsafe`
+### 1. Runtime-Schicht `caprock-region` — die EINZIGE Stelle mit Speicher-`unsafe`
 Zwei Typen kapseln allen rohen Zugriff; die öffentliche API ist vollständig Safe Rust:
 
 - **`Region`** — die **cap-besessene** Einheit: hält einen `MemoryCap` (lineares Eigentum) +
@@ -72,7 +72,7 @@ existiert bewusst nicht (welche Regionen welches Prozesses?).
 
 Mit *no unsafe im App-Code + buglosem Compiler* (ADR 0002): ein safe-Rust-Prozess kann keinen
 Zeiger fälschen und nur Speicher berühren, der von seinen legitimen Referenzen erreichbar ist —
-Stack, statische Daten, **sein Heap** (= seine `Region`-Menge). Die `sel4lake-region`-Runtime ist
+Stack, statische Daten, **sein Heap** (= seine `Region`-Menge). Die `caprock-region`-Runtime ist
 die **kleine, klar auditierbare** Schicht, in der das gesamte Speicher-`unsafe` konzentriert ist;
 ihre Korrektheit (Bounds + cap-Besitz) trägt die Isolation, **ohne** MMU. Capabilities regeln,
 *welche* Regionen der Kernel überhaupt gewährt (Least Privilege).

@@ -1,18 +1,18 @@
-# The SEL4Lake kernel image.
+# The Caprock kernel image.
 #
 # Phase 0: bootable skeleton. By design the kernel image will only ever contain
 # the microkernel, capability system, scheduler, IPC and the Microkit runtime —
 # drivers and services live in userland (see docs/adr/0006-hot-reload-architecture.md).
 
 [package]
-name = "sel4lake-kernel"
+name = "caprock-kernel"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "sel4lake-kernel"
+name = "caprock-kernel"
 path = "src/main.rs"
 
 [features]
@@ -52,22 +52,22 @@ soak = []
 # Der Kernel-Kern + die aarch64-HAL: derzeit aarch64-spezifisch. Auf dem x86_64-Branch (Stufe 0:
 # nur Boot+Serial) werden sie NICHT kompiliert; Stufe fuer Stufe werden die arch-agnostischen Crates
 # ext-31: Alle Subsystem-Crates bauen jetzt fuer BEIDE Architekturen (die HAL waehlt ihre
-# Implementierung per cfg(target_arch), s. sel4lake-hal). Die frueher aarch64-only Sektion
+# Implementierung per cfg(target_arch), s. caprock-hal). Die frueher aarch64-only Sektion
 # entfaellt damit.
 [dependencies]
-sel4lake-hal = { path = "../crates/sel4lake-hal" }
-sel4lake-sync = { path = "../crates/sel4lake-sync" }
-sel4lake-slab = { path = "../crates/sel4lake-slab" }
-sel4lake-mem = { path = "../crates/sel4lake-mem" }
-sel4lake-region = { path = "../crates/sel4lake-region" }
-sel4lake-loader = { path = "../crates/sel4lake-loader" }
-sel4lake-trust = { path = "../crates/sel4lake-trust" }
-sel4lake-cap = { path = "../crates/sel4lake-cap" }
-sel4lake-sched = { path = "../crates/sel4lake-sched" }
-sel4lake-ipc = { path = "../crates/sel4lake-ipc" }
-sel4lake-abi = { path = "../crates/sel4lake-abi" }
-sel4lake-microkit = { path = "../crates/sel4lake-microkit" }
+caprock-hal = { path = "../crates/caprock-hal" }
+caprock-sync = { path = "../crates/caprock-sync" }
+caprock-slab = { path = "../crates/caprock-slab" }
+caprock-mem = { path = "../crates/caprock-mem" }
+caprock-region = { path = "../crates/caprock-region" }
+caprock-loader = { path = "../crates/caprock-loader" }
+caprock-trust = { path = "../crates/caprock-trust" }
+caprock-cap = { path = "../crates/caprock-cap" }
+caprock-sched = { path = "../crates/caprock-sched" }
+caprock-ipc = { path = "../crates/caprock-ipc" }
+caprock-abi = { path = "../crates/caprock-abi" }
+caprock-microkit = { path = "../crates/caprock-microkit" }
 
 # Device-Tree gibt es nur auf der ARM-Plattform (x86 nutzt Multiboot/ACPI).
 [target.'cfg(target_arch = "aarch64")'.dependencies]
-sel4lake-dtb = { path = "../crates/sel4lake-dtb" }
+caprock-dtb = { path = "../crates/caprock-dtb" }

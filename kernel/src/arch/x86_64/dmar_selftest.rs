@@ -16,8 +16,8 @@
 //!   `tools/host-tests.sh dmar`.
 //! * Firmware-Eingabe: Prüfsumme, Länge 0, unbekannte Typen.
 
-use sel4lake_hal::dmar::{self, DevNode, DmarInfo, Exclusion, Scope};
-use sel4lake_hal::println;
+use caprock_hal::dmar::{self, DevNode, DmarInfo, Exclusion, Scope};
+use caprock_hal::println;
 
 /// Ein Scope-Eintrag in Bytes.
 fn put_scope(buf: &mut [u8], at: usize, kind: u8, start_bus: u8, path: &[(u8, u8)]) -> usize {
@@ -237,12 +237,12 @@ pub fn run() -> SelfTest {
 /// als „0 Ausschlüsse" erscheint, ist eine Aussage über *diese* Plattform, keine über den Code —
 /// dafür ist der Selbsttest oben zuständig.
 pub fn report_real() -> (usize, usize, usize) {
-    let Some(tbl) = sel4lake_hal::acpi::dmar_table() else {
+    let Some(tbl) = caprock_hal::acpi::dmar_table() else {
         return (0, 0, 0);
     };
     let info = dmar::parse(tbl);
     let mut topo = [DevNode::EMPTY; dmar::MAX_DEVS];
-    let n = sel4lake_hal::pcie::read_topology(&mut topo);
+    let n = caprock_hal::pcie::read_topology(&mut topo);
     let g = dmar::build_groups(&info, &topo[..n]);
     let mut excluded = 0;
     for i in 0..g.n_devs {

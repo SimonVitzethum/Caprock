@@ -10,8 +10,8 @@ periodischem Timer pro Kern.
 
 Neue/erweiterte Bausteine:
 
-- **`crates/sel4lake-sync`** — fairer **Ticket-Spinlock** (`SpinLock<T>`), `no_std`.
-- **`crates/sel4lake-hal`** — aarch64-HAL, gegliedert in Module:
+- **`crates/caprock-sync`** — fairer **Ticket-Spinlock** (`SpinLock<T>`), `no_std`.
+- **`crates/caprock-hal`** — aarch64-HAL, gegliedert in Module:
   - `cpu` — Registerzugriffe (CurrentEL, MPIDR, IRQ-Maske, Barrieren, wfi/halt).
   - `console` — PL011-Debug-UART; lock-freier (`emit_raw`/`emit_fmt`, Pre-MMU/Panic)
     und SMP-serialisierter Pfad (`println!`).

@@ -4,7 +4,7 @@ Status: **Akzeptiert** (ext-22, umgesetzt P1–P6)
 
 ## Kontext
 
-SEL4Lake hatte bis ext-21 zwei *operative* Prozessklassen: SAS-PDs (globaler
+Caprock hatte bis ext-21 zwei *operative* Prozessklassen: SAS-PDs (globaler
 Adressraum, vertrauenswürdiges Rust) und isolierte PDs (eigene VSpace+ASID). Es gab
 **keinen** Domänen-Begriff, keine Hardware-Capabilities (IRQs/MMIO waren kernel-intern),
 keine Management-Capabilities und keine erzwungene Kommunikations-Policy — Kommunikation

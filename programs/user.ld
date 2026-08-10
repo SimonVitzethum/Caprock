@@ -1,4 +1,4 @@
-/* Linker-Skript für extern geladene SEL4Lake-EL0-Programme (ext-26).
+/* Linker-Skript für extern geladene Caprock-EL0-Programme (ext-26).
  *
  * ET_EXEC, an einer KANONISCHEN festen VA gelinkt (0x4100_0000, in GiB 1). Der Loader lädt das
  * Programm an BELIEBIGE allokierte Physadressen und mappt seine PT_LOAD-Segmente per

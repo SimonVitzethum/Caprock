@@ -7,13 +7,13 @@
 Synchrone Inter-Thread-Kommunikation über Endpoints — Syscall-Eintritt, Rendezvous,
 Nachrichtentransfer und Blockieren/Entblocken im Scheduler.
 
-### ABI (`crates/sel4lake-abi`)
+### ABI (`crates/caprock-abi`)
 
 Geteilte, abhängigkeitsfreie Schnittstelle: Syscall-Nummern (`YIELD/CALL/RECV/
 REPLY`), Register-Layout (`x0`=Nr/Ergebnis, `x1`=EP/Badge, `x2..x5`=Nachricht,
 `x6`=Tag) und Ergebniscodes. Register-basierte IPC für niedrige Latenz.
 
-### HAL-Erweiterung (`crates/sel4lake-hal`)
+### HAL-Erweiterung (`crates/caprock-hal`)
 
 - **SVC-Dispatch:** `handle_exception` erkennt `ESR.EC=0x15` (SVC) und routet an
   einen registrierten **Syscall-Hook** (analog zum Reschedule-Hook). Der Hook
@@ -23,13 +23,13 @@ REPLY`), Register-Layout (`x0`=Nr/Ergebnis, `x1`=EP/Badge, `x2..x5`=Nachricht,
 - **`frame_reg`/`frame_set_reg`:** gekapselter Zugriff auf Register eines
   (gesicherten) TrapFrames — Grundlage des Nachrichtentransfers.
 
-### Scheduler-Erweiterung (`crates/sel4lake-sched`)
+### Scheduler-Erweiterung (`crates/caprock-sched`)
 
 `block_current` (blockieren + nächsten bereiten Thread wählen), `switch_to`
 (blockieren + **direkt** zum IPC-Partner wechseln — Rendezvous-Fastpath),
 `unblock`, `frame_of`, `current_id`. TCB trägt nun Kern-Affinität + Blockiert-Flag.
 
-### IPC (`crates/sel4lake-ipc`)
+### IPC (`crates/caprock-ipc`)
 
 Endpoint-Tabelle mit Sender-/Empfänger-Warteschlangen und einem „aktuellen
 Aufrufer". `call`/`recv`/`reply` realisieren das RPC-Muster: bei einem wartenden
@@ -74,10 +74,10 @@ Plus weiterhin: MMU, memtest, captest, sched (3 Worker preemptiv + Idle),
 
 ## Unsafe-Bilanz
 
-- Neu in `sel4lake-hal`: SVC-Dispatch (nutzt vorhandenes ESR-Lesen), Syscall-Hook
+- Neu in `caprock-hal`: SVC-Dispatch (nutzt vorhandenes ESR-Lesen), Syscall-Hook
   (`transmute` wie Reschedule), `frame_reg`/`frame_set_reg` (Kontextzugriff),
   `syscall::invoke` (`svc`-Asm). Alle in erlaubten Low-Level-Domänen, kommentiert.
-- `sel4lake-abi`, `sel4lake-ipc`, `sel4lake-sched`: **0 unsafe**.
+- `caprock-abi`, `caprock-ipc`, `caprock-sched`: **0 unsafe**.
 - Kernel-Crate weiterhin **0 `unsafe`-Blöcke**.
 
 ## Risiken / offene Punkte

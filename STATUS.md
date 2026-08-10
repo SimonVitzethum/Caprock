@@ -60,7 +60,7 @@ sind die 512 PTEs statt eines Blockdeskriptors, und der steht ohnehin schon in d
 | Punkt | Ergebnis | Commit |
 |---|---|---|
 | B-1.1/1.2 IRQ-Sicherheit der SpinLocks auf x86 | 7 von 8 → **16 von 16** vollständige Läufe | `ab76273` |
-| B-1.4 Fehlerklasse gesucht + Wächter zur Übersetzungszeit | `sel4lake-sync` war die einzige betroffene Crate; Empfindlichkeit belegt | `ab76273` |
+| B-1.4 Fehlerklasse gesucht + Wächter zur Übersetzungszeit | `caprock-sync` war die einzige betroffene Crate; Empfindlichkeit belegt | `ab76273` |
 | B-1.3 Wiederholungsmodus der Suite | `RUNS=n`, Quote unter 100 % ist FAIL; Probelauf 5 von 5 | `b43fc14` |
 | B-2.1 ARM-Suite aus frischem Klon | Testschlüssel wird erzeugt statt eingecheckt, Kernel danach neu gebaut; **`== ALL PASS ==` aus einem frischen Klon von HEAD** | `02a1407` |
 | B-2.2 `hal::cache` auf ARM wirklich ausgeführt | `cortex-a72`/`a53` → 16 Farben, `max` → 32: **die Werte unterscheiden sich**, also wird CCSIDR gelesen und keine Konstante | `d4d27f1` |
@@ -84,7 +84,7 @@ Merkmal grundsätzlich nicht (`TCG doesn't support requested feature: CPUID.01H:
 **Testlage aarch64: läuft** (seit B-2.1), zuletzt `== ALL PASS ==` aus einem frischen Klon. Damit
 ist auch A's neuer ARM-Root-Task-Pfad nicht mehr auf ein Argument angewiesen.
 
-**Host-Arithmetik (17:15):** `sel4lake-mem` 13 von 13, `hal::cache_decode` 5 von 5, je 0,00 s.
+**Host-Arithmetik (17:15):** `caprock-mem` 13 von 13, `hal::cache_decode` 5 von 5, je 0,00 s.
 
 **Blockiert:** nichts.
 
@@ -110,7 +110,7 @@ und damit ist ihr Format eine **ABI**. Der Punkt, an dem die Sache hängt, ist n
 Überleben der Bytes, sondern die Frage, ob die neue Fassung weiß, *welche* Bytes sie liest: eine
 Region ohne Kopf verlagert das Problem bloß, weil v2 die Daten von v1 dann im eigenen Sinn deutet.
 Das ist kein Datenverlust, sondern ein fehlinterpretierter Zustand — der eine fällt auf, der
-andere nicht. Also versionierter Kopf (`state.rs` in `sel4lake-region`): `state_version`,
+andere nicht. Also versionierter Kopf (`state.rs` in `caprock-region`): `state_version`,
 `program_id`, Übernahmezähler; abweichendes Layout und fremde `program_id` werden **abgewiesen**
 statt gedeutet, eine frische Region meldet `NoState` statt „Version 0", und der Übernahmezähler
 steigt nur bei tatsächlicher Übernahme — erhöhte ihn eine Abweisung, belegte er das Gegenteil
@@ -205,7 +205,7 @@ nicht deuten, ohne zu raten. Beides fällt weiterhin durch (`ok` fordert beide).
 wie bei `audit_cdt` (Code 8) seit Teil 2.
 
 **Teil 4 (`25d388a`) schliesst die letzte feste Tabelle der Kette:** `NENDPOINTS`/`NNOTIFICATIONS
-= 32` in `sel4lake-ipc` hiessen, dass mit `NPDS = 10000` zwar jede PD einen eigenen Adressraum
+= 32` in `caprock-ipc` hiessen, dass mit `NPDS = 10000` zwar jede PD einen eigenen Adressraum
 haben konnte, aber ab der 33. keine mehr Server sein. Beide sind jetzt `Slab<_>`, beim Boot
 dimensioniert nach „eine PD, ein Endpoint" (`NPDS` + Reserve = 10064) und in **beiden**
 Boot-Pfaden (`main.rs`, `bringup.rs`) vor dem Selbsttest angehängt — dieselbe `attach`-Mechanik
@@ -225,7 +225,7 @@ ausdrücklich **nicht** über `used_slots − Σ cap_count(pd)`: halten zwei PDs
 obwohl sie es nicht sollte. Stattdessen wird jeder gehaltene Slot markiert und ausgezählt, was
 belegt und unmarkiert blieb; eine zu kleine Zählfläche ist ein eigener Befund (`None`), kein
 stilles „in Ordnung" (dieselbe Trennung wie Code 8 im CDT-Audit). Dazu
-`CAP_SLOTS_TOTAL`/`CAP_SLOTS_KERNEL_RESERVE` in `sel4lake-microkit` — der Kernel hatte
+`CAP_SLOTS_TOTAL`/`CAP_SLOTS_KERNEL_RESERVE` in `caprock-microkit` — der Kernel hatte
 `CAP_SLOTS_FOR_ALL_PDS + 256` abgeschrieben, eine zweite Stelle, die beim nächsten Drehen an `NPDS`
 still auseinanderläuft — und eine Prüfung nach `attach`, dass die Tabelle wirklich so gross ist wie
 gerechnet. Gemessen: `capsum : 1/256 Slots ausserhalb aller PD-Budgets (Kernel-Wurzelcaps);

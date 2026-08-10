@@ -1,7 +1,7 @@
 # ADR 0023 — Concurrency-Verifikation der Sync-Primitive (Loom)
 
 Status: **angenommen** · Datum: 2026-06-29 · ergänzt die funktionale Verifikation (Verus/Kani).
-Bezug: ADR 0015 (Verifikationsansatz), `crates/sel4lake-sync`, `Verification/concurrency/`,
+Bezug: ADR 0015 (Verifikationsansatz), `crates/caprock-sync`, `Verification/concurrency/`,
 `docs/invariants.md` §1a (IRQ-safe Locks).
 
 ## Kontext
@@ -25,12 +25,12 @@ begründet.
 ## Entscheidung
 
 > **Überholt seit 2026-08-02 (B-7.2).** Die Kopien sind weg: `tools/loom-verify.sh` übernimmt
-> `crates/sel4lake-sync/src/lib.rs` **unverändert**, und die Beweise stehen in derselben Datei
+> `crates/caprock-sync/src/lib.rs` **unverändert**, und die Beweise stehen in derselben Datei
 > (`#[cfg(all(loom, test))] mod loom_proofs`). Gemessen, warum das zählt: eine abgeschwächte
 > Speicherordnung im Ticket-Release (`Release` → `Relaxed`) lief bei der Kopie durch **alle**
 > Beweise; am echten Code fallen 2 von 10. In `Verification/concurrency/loom/src/` liegen nur
 > noch `hierarchy.rs` und `crosscore.rs` — die modellieren **andere** Gegenstände (globale
-> Sperrordnung, Cross-Core-IPC) und sind keine Nachbildungen von `sel4lake-sync`.
+> Sperrordnung, Cross-Core-IPC) und sind keine Nachbildungen von `caprock-sync`.
 >
 > Der folgende Abschnitt beschreibt den überholten Zustand und bleibt stehen, weil die Begründung
 > für die Entscheidung dort steht.

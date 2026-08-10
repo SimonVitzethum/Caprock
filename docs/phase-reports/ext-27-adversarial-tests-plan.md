@@ -20,7 +20,7 @@ Deref → Fault. Kernel-Harness pollt das Badge + prüft `domain/vspace/cap_cdt/
 
 ### T0 — Infrastruktur + SDK + erster UserLand-Aggressor  ✅ Ziel
 - `tests/` = eigener Cargo-Workspace (Target-Spec/Linker/`.cargo` wie `programs/`), dep nur auf
-  `programs/libsel4lake`. SDK-Erweiterung in `libsel4lake`: `result`-Codes, `pdctl`-Sub-Ops,
+  `programs/libcaprock`. SDK-Erweiterung in `libcaprock`: `result`-Codes, `pdctl`-Sub-Ops,
   Wrapper `map/unmap/pdctl/load/kill/call/recv` + die rohe `invoke`-Schnittstelle.
 - Dienst `tests/services/userland/aggressor` (`aggressor-u`): Cap-Confusion-Batterie (leere Slots,
   falscher Typ über die Report-Cap, falsche Rechte) + Eskalation (PDCTL/LOAD/KILL ohne Autorität)
@@ -54,11 +54,11 @@ Deref → Fault. Kernel-Harness pollt das Badge + prüft `domain/vspace/cap_cdt/
 ### T5 — Abschluss/Doku
 - `dma_audit`-artige Gesamtprüfung, finaler Full-Stress (`hang-stress.sh`). ADR 0012 + dieser
   Bericht → `ext-27-adversarial-tests.md` (Angriffsmatrix: je Angriff Invariante/erwartet/beobachtet/
-  Urteil). `tests/README.md`. Memory `sel4lake-project.md`.
+  Urteil). `tests/README.md`. Memory `caprock-project.md`.
 
 ## Kritische Dateien
 - `tests/` (neu): Workspace + `services/{userland,hardware,trusted}/*`.
-- `programs/libsel4lake/src/lib.rs` — SDK-Erweiterung (result/pdctl/Wrapper).
+- `programs/libcaprock/src/lib.rs` — SDK-Erweiterung (result/pdctl/Wrapper).
 - `kernel/src/threads.rs` — neue Test-Funktionen + Idle-Manager-Schritte + `report()`/`all_done()`/DBG.
 - `test-qemu.sh` — `tests/`-Build + Archiv-Einträge + neue Checks.
 

@@ -1,4 +1,4 @@
-// SEL4Lake — Verus-Pilot (Tier 2), Teil 7: CDT-**Azyklizitaet** (`audit_cdt` Code 7).
+// Caprock — Verus-Pilot (Tier 2), Teil 7: CDT-**Azyklizitaet** (`audit_cdt` Code 7).
 //
 // Die schwierigste CDT-Invariante: die Eltern-Kette enthaelt **keine Zyklen**. Bewiesen ueber die
 // Standardtechnik eines **Wohlfundiertheits-Masses** -- ein `rank` je Knoten, der entlang `parent`

@@ -10,7 +10,7 @@ Per-Kern-Locks begründet zurückgestellt.
 **Problem:** Bis Phase 7 war der Kontextwechsel *integer-only* — Threads durften
 keinen FP/SIMD-Zustand über eine Preemption halten.
 
-**Lösung:** Der `TrapFrame` (`sel4lake-hal::exception`) enthält jetzt den vollen
+**Lösung:** Der `TrapFrame` (`caprock-hal::exception`) enthält jetzt den vollen
 FP-Zustand (`q0..q31`, `FPSR`, `FPCR`); er wird in `__trap_dispatch` **eager**
 gesichert/wiederhergestellt (Frame jetzt 800 statt 272 Byte). GP-`stp` erreicht
 nur Offset ±504, daher wird die Adresse für `FPSR/FPCR` (@784) per `add`
@@ -24,7 +24,7 @@ Optimierung; eager ist einfacher und sicherer.
 
 ## 2. Bitmap-Prioritäten (umgesetzt) ✅
 
-**Lösung (`sel4lake-sched`, ADR 0005):** Pro Kern eine Ready-Queue je Priorität
+**Lösung (`caprock-sched`, ADR 0005):** Pro Kern eine Ready-Queue je Priorität
 (`NPRIO = 8`) + ein **L1-Bitmap** für O(1)-Auswahl der höchsten nichtleeren
 Priorität (`leading_zeros`). Round-Robin innerhalb einer Priorität. `spawn`/
 `init_core` nehmen eine Priorität; `block_current`/`unblock`/`on_tick`/`switch_to`
@@ -57,4 +57,4 @@ IPC/Cap behalten ihren eigenen Lock mit fester Ordnung (Sched-Lock vor IPC-Lock)
 
 `./test-qemu.sh` → **ALL PASS**: MMU, memtest, captest, sched, **fp**, **prio**,
 ipc, reload, 8/8 Kerne. Kernel-Crate weiterhin **0 `unsafe`-Blöcke**; neuer
-`unsafe` nur im erweiterten FP-Save/Restore-Assembler (`sel4lake-hal`).
+`unsafe` nur im erweiterten FP-Save/Restore-Assembler (`caprock-hal`).

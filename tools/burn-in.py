@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SEL4Lake — Burn-in-/Langzeit-Orchestrator fuer den RELEASE-Kernel (ohne kernel-fuzz).
+"""Caprock — Burn-in-/Langzeit-Orchestrator fuer den RELEASE-Kernel (ohne kernel-fuzz).
 
 Reife-/Stabilitaetspruefung des EXAKTEN, UNVERAENDERTEN Release-Builds (keine Kerneländerung,
 keine neue Funktionalitaet). Methodik: Power-Cycle-/Reboot-Burn-in — der Kernel faehrt nach
@@ -16,10 +16,10 @@ Beendet bei Zieldauer/Iterationszahl ODER SIGINT (schreibt dann den Abschlussber
 import argparse, json, os, re, signal, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ELF = "build/target/aarch64-sel4lake/release/sel4lake-kernel.elf"
+ELF = "build/target/aarch64-caprock/release/caprock-kernel.elf"
 ARCHIVE = "build/boot-archive.bin"
-HELLO = "programs/build/target/aarch64-sel4lake-user/release/hello.elf"
-TBIN = "tests/build/target/aarch64-sel4lake-user/release"
+HELLO = "programs/build/target/aarch64-caprock-user/release/hello.elf"
+TBIN = "tests/build/target/aarch64-caprock-user/release"
 
 QEMU = [
     "qemu-system-aarch64", "-machine", "virt,iommu=smmuv3", "-cpu", "cortex-a72",
@@ -206,7 +206,7 @@ def write_report(state, outdir, final=False):
     runtime_h = el / 3600.0
     lines = []
     A = lines.append
-    A(f"# SEL4Lake — Burn-in-/Langzeitbericht (Release-Kernel, OHNE kernel-fuzz)")
+    A(f"# Caprock — Burn-in-/Langzeitbericht (Release-Kernel, OHNE kernel-fuzz)")
     A("")
     A(f"Status: {'ABGESCHLOSSEN' if final else 'LAUFEND'} · Start: {s['started_iso']} · "
       f"Stand: {time.strftime('%Y-%m-%d %H:%M:%S')}")

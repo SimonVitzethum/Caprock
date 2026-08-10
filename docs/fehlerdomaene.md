@@ -1,4 +1,4 @@
-# SEL4Lake — die Fehlerdomäne (B-6.2 / Z9)
+# Caprock — die Fehlerdomäne (B-6.2 / Z9)
 
 **Für Betreiber und Mandanten.** Dieses Dokument sagt, **was mitgeht, wenn etwas kaputtgeht** — und
 was ausdrücklich **nicht** zugesichert ist. Stand: 2026-08-02, Zweig `arch/x86_64`, Kernel `4963a19`.
@@ -15,7 +15,7 @@ einem absichtlich ausgelösten Panic an einer definierten Stelle. Die Messvorsch
 >
 > Ein Fehler **im Kernel** kann jede PD auf diesem Knoten treffen. Wer Ausfallsicherheit braucht,
 > baut sie **über Knoten hinweg**, nicht innerhalb eines Knotens. Zwei Repliken desselben Dienstes
-> auf demselben SEL4Lake-Knoten sind **eine** Replik.
+> auf demselben Caprock-Knoten sind **eine** Replik.
 
 Das ist die *billige* Variante aus Z9, bewusst gewählt: sie gilt ab sofort und ist ehrlich. Die
 teure Variante (Kernel-Fehler auf die verursachende PD eingrenzen) ist Forschungsklasse, s. [§7](#7-was-forschungsklasse-ist).
@@ -26,7 +26,7 @@ teure Variante (Kernel-Fehler auf die verursachende PD eingrenzen) ist Forschung
 |---|---|
 | Ein Fault einer **isolierten** PD (EL0/Ring 3) beendet **nur ihren Thread**. Der Kernel läuft weiter. | `el0-trap: … -> beendet, Kernel laeuft weiter`; `ring3 : ALL PASS` (x86), `el0iso : ALL PASS` (aarch64) |
 | Eine isolierte PD kann fremden Speicher **nicht** lesen — auch nicht beim Sterben. | `iso : … isolierter Thread faultete 1x an derselben Adresse` (x86), `vspace : … isol. Probe … las-X=false` (aarch64) |
-| Ein ungültiger Syscall ist **kein** Fault: er liefert `ERR_BADSYS`, der Thread lebt weiter. | `sel4lake-microkit`, `deny(ERR_BADSYS)` |
+| Ein ungültiger Syscall ist **kein** Fault: er liefert `ERR_BADSYS`, der Thread lebt weiter. | `caprock-microkit`, `deny(ERR_BADSYS)` |
 | Beim Fault-Tod werden IPC-Warteschlangen, Kernel-Stack, VSpace und Farbstreifen freigegeben. | `purge_ipc_queues`, `reclaim_user_kstack`, `vspace_teardown` in `kernel/src/system.rs:605–637` |
 
 **Was ausdrücklich NICHT zugesichert ist.** Diese Liste ist der wichtigere Teil. Eine Zusicherung,
@@ -64,9 +64,9 @@ Der Grund steht in zwei Zeilen. Der Panic-Handler (`kernel/src/panic.rs:9–25`)
 dann `halt()`. Dieses `halt()` **maskiert die Interrupts nicht**:
 
 * x86: `kernel/src/arch/x86_64/mod.rs:294` → `loop { hlt }`, ohne `cli`.
-  (Die HAL-Fassung `crates/sel4lake-hal/src/x86_64/cpu.rs:257` **würde** maskieren — der
+  (Die HAL-Fassung `crates/caprock-hal/src/x86_64/cpu.rs:257` **würde** maskieren — der
   Panic-Pfad benutzt sie nicht.)
-* aarch64: `crates/sel4lake-hal/src/aarch64/cpu.rs:203` → `loop { wfe }`, DAIF unverändert.
+* aarch64: `crates/caprock-hal/src/aarch64/cpu.rs:203` → `loop { wfe }`, DAIF unverändert.
 
 Waren die Interrupts beim Panic offen — und im laufenden Betrieb sind sie das —, holt der nächste
 Timer-Tick den Kern aus der Halt-Schleife zurück in den Scheduler. **Der Panic ist dann eine
@@ -80,7 +80,7 @@ gedruckte Zeile und sonst nichts.**
 | B | **Ungültiger Syscall / fehlende Cap** | nichts | Fehlercode (`ERR_BADSYS`/`BADCAP`), Thread läuft weiter |
 | C | **Kernel-Panic in einem Kernelfaden** (EL1/Ring 0), ohne gehaltene Sperre | **genau dieser eine Faden** — er landet in einer Halt-Schleife, wird vom Timer wieder eingeplant, dreht dort für immer und belegt seinen Scheduler-Slot. Der Knoten läuft weiter. | Ein Dienst hängt, ohne zu sterben. Kein Fehlercode, kein Signal, keine Meldung außer einer Konsolenzeile. **Der Kernel arbeitet nach einer verletzten Invariante weiter.** |
 | D | **Kernel-Panic auf einem Sekundärkern** | **nichts Sichtbares.** Der Kern kehrt über den Timer in den Scheduler zurück. | **gar nichts** — die Prüfsignatur ist identisch zum fehlerfreien Lauf |
-| E | **Kernel-Panic unter gehaltener globaler Sperre** (`MEM`, `CAPS`, …) | **der ganze Knoten**, still. Der Ticket-Lock (`crates/sel4lake-sync/src/lib.rs:170–178`) hat keine Schranke: `now_serving` steht für immer, **jeder** spätere Zieher blockiert. | Totalausfall ohne jede weitere Ausgabe. Kein Watchdog, keine Diagnose. Von außen nicht von einem Hardwarehänger unterscheidbar. |
+| E | **Kernel-Panic unter gehaltener globaler Sperre** (`MEM`, `CAPS`, …) | **der ganze Knoten**, still. Der Ticket-Lock (`crates/caprock-sync/src/lib.rs:170–178`) hat keine Schranke: `now_serving` steht für immer, **jeder** spätere Zieher blockiert. | Totalausfall ohne jede weitere Ausgabe. Kein Watchdog, keine Diagnose. Von außen nicht von einem Hardwarehänger unterscheidbar. |
 | F | **Kernel-Panic im Steuerfaden des Bootkerns** | der Steuerfaden. Der Knoten läuft weiter, **meldet aber nie wieder etwas** — Notbremse und Abschlussbericht hängen an genau diesem Faden. | sieht aus wie ein Hänger, ist ein Panic |
 | G | **Panic im Panic-Handler** (Doppelfehler) | unbegrenzte Rekursion. Kein Wächter, kein `#DF`-Handler mit IST, keine Schutzseite am Kernel-Stack. | Kernel-Stack läuft still in fremden Speicher |
 | H | **Fault einer PD im globalen SAS-Adressraum** | ihr Thread — die Hardware fängt den Fault wie bei jeder anderen PD. **Aber:** was sie vorher im geteilten Adressraum kaputtgeschrieben hat, bleibt kaputt, und die Nachbarn merken es nicht. | s. [§3](#3-trustedsas--der-fall-der-aus-dem-modell-folgt) |
@@ -198,7 +198,7 @@ Zustand; „läuft weiter mit verletzter Invariante" ist keiner.
 **Erst die Präzisierung, weil hier leicht das Falsche steht.** `Domain::TrustedSas` ist eine
 Vertrauens*stufe*, keine Adressraumaussage. Eine TrustedSAS-PD darf **global oder isoliert** laufen
 — `domain_audit` verlangt Isolation nur für `HardwareLand`/`UserLand`, und „mehr Isolation ist nie
-eine Verletzung" (`crates/sel4lake-microkit/src/lib.rs:113–121`, `:246–250`). Konkret heute:
+eine Verletzung" (`crates/caprock-microkit/src/lib.rs:113–121`, `:246–250`). Konkret heute:
 
 * **Im Kernel erzeugte** TrustedSAS-PDs laufen im **globalen SAS-Adressraum** (`VSPACE_OF == 0`).
   Das ist der Default und der Zweck: kein Adressraumwechsel.
@@ -241,18 +241,18 @@ Die Fehlerdomänen-Aussage hängt also am Adressraum, nicht am Domänen-Etikett:
 
 ## 4. Der Unterschied zur VM — ehrlich
 
-Das ist ein **Produktrisiko**, kein Implementierungsdetail. SEL4Lake tritt an, um VMs zu ersetzen
+Das ist ein **Produktrisiko**, kein Implementierungsdetail. Caprock tritt an, um VMs zu ersetzen
 ([Z1](../todo.md)); an dieser Stelle ist es schlechter als eine VM, und das muss dastehen.
 
-|  | Wirt mit 100 VMs | SEL4Lake-Knoten mit 100 PDs |
+|  | Wirt mit 100 VMs | Caprock-Knoten mit 100 PDs |
 |---|---|---|
 | Gast-/PD-Anwendung stürzt ab | 1 von 100 weg | 1 von 100 weg |
-| **Gast-Kernel** paniert | **1 von 100 weg** | *gibt es nicht* — die Aufgabe liegt im SEL4Lake-Kernel |
-| **Wirts-/SEL4Lake-Kernel** paniert | 100 von 100 weg | **100 von 100 weg** (bzw. der undefinierte Zustand aus §2) |
+| **Gast-Kernel** paniert | **1 von 100 weg** | *gibt es nicht* — die Aufgabe liegt im Caprock-Kernel |
+| **Wirts-/Caprock-Kernel** paniert | 100 von 100 weg | **100 von 100 weg** (bzw. der undefinierte Zustand aus §2) |
 | Größe des Codes in der geteilten Domäne | Hypervisor + Wirtskern | ~18 kLOC `kernel/src`, ~36 kLOC inkl. `crates/` |
 | Größe des Codes in der **privaten** Domäne | vollständiger Gastkern je Mandant (Größenordnung 10⁷ LOC) | **null** — es gibt keine private Kernschicht |
 
-**Der Handel, in einem Satz:** Eine VM-Plattform hat *viele große* Fehlerdomänen, SEL4Lake hat
+**Der Handel, in einem Satz:** Eine VM-Plattform hat *viele große* Fehlerdomänen, Caprock hat
 *eine kleine*. Weniger Code kann ausfallen — aber wenn er ausfällt, fällt **alles** aus.
 
 Ob das ein guter Handel ist, entscheidet nicht die Architektur, sondern die Fehlerrate pro Zeile
@@ -262,7 +262,7 @@ Festlegung aus §1: **Redundanz über Knoten.**
 **Zwei betriebliche Konsequenzen, die daraus unmittelbar folgen:**
 
 1. **Ein Knoten ist keine Redundanzeinheit.** Bei VMs darf ein Betreiber zwei Repliken eines
-   Mandanten auf denselben Wirt legen und einen Gast-Absturz überleben. Auf SEL4Lake nicht. Der
+   Mandanten auf denselben Wirt legen und einen Gast-Absturz überleben. Auf Caprock nicht. Der
    Scheduler kennt heute keinen Anti-Affinitäts-Begriff — die Regel muss **über** dem Knoten
    durchgesetzt werden.
 2. **Wartung ist knotengranular.** Ohne Live-Migration einzelner PDs (Z3/Z4 offen) heißt „Knoten
@@ -279,12 +279,12 @@ Wiederholbarkeit ist Teil der Aussage. Aufbau am 2026-08-02:
   (AGENTS.md: Cargo findet die `.cargo/config.toml` des Hauptcheckouts zusätzlich, das Linker-Skript
   wird zweimal übergeben, und **x86 scheitert dabei lautlos**). Der Quellbaum wurde nach `/tmp`
   kopiert und dort gebaut.
-* **x86_64:** `cargo build --release --target x86_64-unknown-none -p sel4lake-kernel --features selftest`,
+* **x86_64:** `cargo build --release --target x86_64-unknown-none -p caprock-kernel --features selftest`,
   danach `objcopy -I elf64-x86-64 -O elf32-i386`. QEMU: `-machine q35,kernel-irqchip=split
   -device intel-iommu,caching-mode=on,intremap=on -device virtio-rng-pci,disable-legacy=on,iommu_platform=on
   -m 512 -smp 4 -enable-kvm -cpu host,+invtsc -no-reboot`, Zeitlimit 120 s, Konsole in eine **Datei**
   (nicht in eine Pipe — die verliert beim SIGKILL den Puffer).
-* **aarch64:** `cargo build --release -p sel4lake-kernel --features selftest`. QEMU:
+* **aarch64:** `cargo build --release -p caprock-kernel --features selftest`. QEMU:
   `-machine virt,iommu=smmuv3 -cpu cortex-a72 -smp 8 -m 4G`, ohne Boot-Archiv (die
   archivabhängigen Prüfungen melden in diesem Lauf erwartungsgemäß `FAILURES` — der gemessene
   Gegenstand ist die Lebendigkeit der Kerne, nicht die Testsignatur).
@@ -303,13 +303,13 @@ Eine Fehlerdomäne auf ungeprüften Annahmen ist schlimmer als keine. Offen blei
 * **Der Kernel-Stack-Überlauf im Doppelfehler.** Gemessen sind 362 Rekursionsebenen ohne Ausnahme;
   was beim Überschreiten des Stackendes passiert, wurde nicht abgewartet (der Bootkern schaltete
   vorher ab). Dass es **keine** Schutzseite und **keinen** `#DF`-Handler mit IST gibt, ist am Code
-  belegt (`crates/sel4lake-hal/src/x86_64/exception.rs:494` benennt Vektor 8 nur), die Folge nicht.
+  belegt (`crates/caprock-hal/src/x86_64/exception.rs:494` benennt Vektor 8 nur), die Folge nicht.
 * **Panic unter `CAPS`** — gemessen wurde `MEM`. `CAPS` ist ein `RwSpinLock` mit derselben
   unbegrenzten Spin-Schleife; die Folge sollte dieselbe sein, gemessen ist sie nicht.
 * **Panic in einem Interrupt-Handler.** Nicht gemessen. Der Rückweg über den Timer, auf dem die
   Fälle C/D beruhen, könnte dort anders aussehen.
 * **Die aarch64-Fälle E, F, G.** Nur Fall C wurde auf aarch64 gegengeprüft. Für E ist die Ursache
-  (unbeschränkter Ticket-Lock in `sel4lake-sync`) architekturneutral, für F ebenfalls — belegt ist
+  (unbeschränkter Ticket-Lock in `caprock-sync`) architekturneutral, für F ebenfalls — belegt ist
   das nicht.
 * **Ob ein Panic auf einem Kern die Übersetzungstabellen der IOMMU in einem Zwischenzustand
   hinterlässt.** Ein Gerät liest diese Tabellen ohne den Kernel; ein Panic zwischen zwei
@@ -327,7 +327,7 @@ Nichts davon ist gebaut. Die Aufwände sind Schätzungen, die Reihenfolge ist Nu
 | 2 | **Rekursionswächter im Panic-Handler.** Ein `AtomicU32`; ab Tiefe 1 keine Formatierung mehr, nur eine feste Zeichenkette und halt. | **Minuten** | Beendet Fall G, bevor der Stack alle ist. Die `format_args!`-Maschinerie ist das, was rekursiert. |
 | 3 | **Panic-Marke, die andere Kerne sehen.** Ein globales `PANICKED`; jeder Kern prüft es im Timer-Tick und hält an. | **1–2 h** | Macht aus einem Ein-Kern-Panic einen sauberen Knotenstopp — **ohne** NMI, denn der Timer läuft ohnehin. Greift nicht bei einem Kern, der mit maskierten IRQs in einer Sperre dreht (dafür #5). |
 | 4 | **Panic → `system_off`.** Der panickende Kern schaltet die Maschine ab (ACPI S5 / PSCI `SYSTEM_OFF`); beide Wege existieren bereits (`x86_64/power.rs:295`, `aarch64/psci.rs:20`) und werden heute nur aus Testabschlusspfaden gerufen, **nie** aus `panic.rs`. | **~1 h** | Die einfachste Art, die Festlegung aus §1 zur **Tatsache** zu machen. Preis: die Ausgabe der anderen Kerne bricht mitten im Satz ab, und der Knoten ist sofort weg statt geordnet geleert. |
-| 5 | **Schranke im Ticket-Lock.** `SpinLock::lock` dreht unbegrenzt (`crates/sel4lake-sync/src/lib.rs:170–178`). Eine Obergrenze, die bei Überschreitung meldet und anhält. | **klein im Code, groß in der Abnahme** | Verwandelt Fall E aus einem stillen Totalausfall in einen diagnostizierten. **Aber:** das ist die zentrale Synchronisationsprimitive; jede Änderung daran zieht Loom (B-7.2) und Kani (B-7.1) nach sich, und eine zu knappe Schranke erzeugt Fehlalarme unter Last. Nicht „billig" im Sinne von risikoarm. |
+| 5 | **Schranke im Ticket-Lock.** `SpinLock::lock` dreht unbegrenzt (`crates/caprock-sync/src/lib.rs:170–178`). Eine Obergrenze, die bei Überschreitung meldet und anhält. | **klein im Code, groß in der Abnahme** | Verwandelt Fall E aus einem stillen Totalausfall in einen diagnostizierten. **Aber:** das ist die zentrale Synchronisationsprimitive; jede Änderung daran zieht Loom (B-7.2) und Kani (B-7.1) nach sich, und eine zu knappe Schranke erzeugt Fehlalarme unter Last. Nicht „billig" im Sinne von risikoarm. |
 | 6 | **`#DF`-Handler mit eigenem IST-Stack (x86).** Vektor 8 ist heute nur **benannt**. | **klein–mittel, HAL** | Ohne IST endet ein `#DF` auf kaputtem Stack im Triple Fault (Neustart ins BIOS). Mit IST gibt es eine letzte Meldung. |
 | 7 | **Schutzseiten an Kernel-Stacks.** Heute gibt es keine; ein Überlauf läuft still in Nachbarspeicher. | **mittel** | Macht Stacküberläufe (auch außerhalb von Panics) zu einem Fault statt zu stiller Verfälschung. Kostet eine Seite je Stack — bei 64 KiB je Thread und dem Zielbild „viele tausend Prozesse" ist das zu rechnen (`todo.md` C4). |
 | 8 | **Panic-IPI/NMI an alle Kerne.** Die IPI-Maschinerie existiert (`system.rs:432` `kick`, `send_sgi`), aber **kein NMI**. | **mittel** | Ein normaler IPI erreicht keinen Kern mit maskierten IRQs — genau den Fall, den man treffen will. Zuverlässig braucht es NMI (x86) bzw. FIQ/`sgi` an einer Gruppe-0-Quelle (ARM), und beides existiert im Projekt nicht. Deshalb ist #3+#4 der bessere erste Schritt. |

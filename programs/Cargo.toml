@@ -1,14 +1,14 @@
-# SEL4Lake — externe EL0-Programme (ext-26).
+# Caprock — externe EL0-Programme (ext-26).
 #
-# EIGENER Workspace, GETRENNT vom Kernel-Workspace: eigene Target-Spec (aarch64-sel4lake-user.json)
+# EIGENER Workspace, GETRENNT vom Kernel-Workspace: eigene Target-Spec (aarch64-caprock-user.json)
 # + Linker-Skript (user.ld) via programs/.cargo/config.toml. Build: `cd programs && cargo build
 # --release`. Die erzeugten ET_EXEC-ELF64-Binaries werden vom generischen Binary-Loader geladen.
 # Jedes Programm ist unabhaengig baubar/ladbar/aktualisierbar; gemeinsame (nicht gegenseitige)
-# Abhaengigkeit ist nur das Minimal-SDK `libsel4lake` (Syscall-Stubs + Panik-Handler).
+# Abhaengigkeit ist nur das Minimal-SDK `libcaprock` (Syscall-Stubs + Panik-Handler).
 [workspace]
 resolver = "2"
-# Programme nach Domaene gegliedert (userland/hardware/trusted). libsel4lake = gemeinsames SDK.
-members = ["libsel4lake", "userland/hello", "userland/wasmhost", "hardware/virtio-blk", "hardware/virtio-net", "trusted/init", "trusted/svc-demo", "trusted/fs"]
+# Programme nach Domaene gegliedert (userland/hardware/trusted). libcaprock = gemeinsames SDK.
+members = ["libcaprock", "userland/hello", "userland/wasmhost", "hardware/virtio-blk", "hardware/virtio-net", "trusted/init", "trusted/svc-demo", "trusted/fs"]
 
 [workspace.package]
 edition = "2021"

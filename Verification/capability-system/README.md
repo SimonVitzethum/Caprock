@@ -18,11 +18,11 @@
 Bezug: [ADR 0015](../../docs/adr/0015-capability-system-formal-verification.md) (Architekturentscheidung
 der Verifikation), ADR 0001 (Capabilities), `docs/verification.md` (Gesamtpipeline),
 `docs/invariants.md` (Systeminvarianten), Laufzeit-Oracle `cap_audit_cdt`
-(`crates/sel4lake-cap/src/space.rs`).
+(`crates/caprock-cap/src/space.rs`).
 
 ## 1. Motivation und Ziel
 
-Capabilities sind in SEL4Lake die **einzige Autoritätsquelle**: ein Subjekt darf genau das, wofür es
+Capabilities sind in Caprock die **einzige Autoritätsquelle**: ein Subjekt darf genau das, wofür es
 eine Capability hält. Die Integrität der Capability-Tabelle + des Capability-Derivation-Tree (CDT) ist
 damit die **Wurzel der gesamten Sicherheit**. Bisher wird sie zur Laufzeit vom Audit `cap_audit_cdt`
 (an Quiescenz-Punkten) + von Fuzzern geprüft. **Ziel von Phase 1:** diese Invariante **statisch +
@@ -42,7 +42,7 @@ erhalten.
   Freigabe oder Autoritäts-Leck möglich.
 - **Vertrauensgrenze:** die **HAL** (Speicher, Hardware) ist außerhalb — das Modell arbeitet auf der
   logischen Tabellen-/Baum-Ebene; die physische Speichersicherheit der Tabellen trägt die HAL-TCB +
-  die Kani-Beweise (`sel4lake-region`/`-sync`).
+  die Kani-Beweise (`caprock-region`/`-sync`).
 
 ## 3. Zu beweisende Invarianten (= `cap_audit_cdt`, Codes 1–7)
 
@@ -212,7 +212,7 @@ allein trägt, die Blatt-Eigenschaft allein trägt **nicht**.
 ## 11. Bekannte Grenzen der aktuellen Beweise
 
 - **Abstraktes Modell, nicht der reale Code:** die Beweise gelten am Modell. Die Treue zum echten
-  `sel4lake-cap` war bis 2026-08-03 eine **dokumentierte Annahme**; seither hält sie
+  `caprock-cap` war bis 2026-08-03 eine **dokumentierte Annahme**; seither hält sie
   `tools/verus-modelltreue.sh` (s. §12) — ein normalisierter Strukturvergleich mit Selbsttest.
   Was er **nicht** leistet: er vergleicht Verzweigung und Feldzuweisung, nicht die Bedeutung.
   Ein Umbau, der beide Seiten gleichartig verfälscht, käme durch.
@@ -225,7 +225,7 @@ allein trägt, die Blatt-Eigenschaft allein trägt **nicht**.
 
 1. **Modell-Treue:** das Verus-Modell bildet die reale `CapSpace`-Struktur + Operationen korrekt ab.
    *Absicherung, seit 2026-08-03 nicht mehr nur Prosa:* **`tools/verus-modelltreue.sh`** reduziert
-   `crates/sel4lake-cap/src/space.rs::unlink`/`delete_leaf` **und** `unlink1`/`unlink2`/
+   `crates/caprock-cap/src/space.rs::unlink`/`delete_leaf` **und** `unlink1`/`unlink2`/
    `unlink_slots` auf dieselbe normalisierte Ereignisfolge (Verzweigung + Feldzuweisung) und
    verlangt Gleichheit — heute 12 Ereignisse, deckungsgleich. Ein `match Option {Some/None}` und
    ein `if … is Some { } else { }` fallen dabei auf dieselbe Form; der Dialektunterschied
@@ -292,5 +292,5 @@ seL4s MDB-Beweise).
 
 ### Phasenübergreifend
 
-- Modell↔Code-Bindung (Richtung reale `sel4lake-cap`-Implementierung).
+- Modell↔Code-Bindung (Richtung reale `caprock-cap`-Implementierung).
 - Danach **Phase 2 (Loader)**, **Phase 3 (Region-Runtime)**, … (s. `Verification/README.md`).

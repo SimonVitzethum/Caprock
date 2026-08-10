@@ -26,6 +26,49 @@ pub fn run() {
     budgettest();
     dmaaligntest();
     grossdmatest();
+    kstackeichung();
+}
+
+/// **C4: die Eichung der Stack-Wasserstandsmarke** — die Sprechprobe des MESSGERAETS.
+///
+/// Sie steht hier und nicht im Bericht, und beides hat einen Grund. *Hier*, weil das Urteil der
+/// `kstack`-Zeile sie als Konjunkt liest und `all_done()` gepollt wird — eine Messung, die erst
+/// im Bericht entsteht, kann den Bericht nicht ausloesen. *Vor SMP*, weil das Eichfeld
+/// ausdruecklich nur von einem Faden benutzt werden darf.
+///
+/// Geprueft werden die drei Faelle, die ein Wasserzeichen unbrauchbar machen:
+/// **ungefuellt meldet 0** (der fail-closed-Fall — eine ausgefallene Fuellung muss wie der
+/// schlimmste Messwert aussehen, nicht wie der beste), **gefuellt und unberuehrt meldet die volle
+/// Laenge**, und **bis zu einer bekannten Tiefe beruehrt meldet genau diese Tiefe**. Ohne den
+/// dritten Punkt bestuende die Zeile auch eine Funktion, die nur zwei Zahlen kennt.
+fn kstackeichung() {
+    let p = "kstack";
+    let bits = crate::kstackmark::eichung();
+    let mut fail = false;
+    check(
+        p,
+        bits & crate::kstackmark::EICH_LEER != 0,
+        "ungefuelltes Feld meldet 0 unberuehrte Bytes (Ausfall der Fuellung = schlechtester Messwert)",
+        &mut fail,
+    );
+    check(
+        p,
+        bits & crate::kstackmark::EICH_VOLL != 0,
+        "gefuelltes, unberuehrtes Feld meldet die VOLLE Laenge",
+        &mut fail,
+    );
+    check(
+        p,
+        bits & crate::kstackmark::EICH_TIEFE != 0,
+        "bis zu bekannter Tiefe beruehrtes Feld meldet GENAU diese Tiefe",
+        &mut fail,
+    );
+    println!(
+        "kstack  : Eichung {:#06b} von {:#06b} -- {}",
+        bits,
+        crate::kstackmark::EICH_ALLE,
+        if fail { "FAILURES" } else { "das Messgeraet trennt" }
+    );
 }
 
 /// **Grosse, zusammenhängende DMA** (Z26, Vorbedingung 2) — die Zuteilungshälfte.

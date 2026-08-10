@@ -497,6 +497,12 @@ check "state   : ALL PASS" "A-4.3: Zustandsuebergabe ueber eine Region mit VERSI
 # Anmerkung: der ERNSTFALL (v2 uebernimmt den Zaehler von v1, Marker `ckpt`) laeuft NICHT auf x86 --
 # der zustandsbehaftete Hot-Reload haengt an der arch-neutralen Thread-Demo, die hier nicht startet.
 # Er wird von test-qemu.sh (aarch64) geprueft. Auf x86 belegt `state` die Torlogik, nicht den Lauf.
+# C4: die Stack-Wasserstandsmarke. **Positiv geprueft, nicht bloss 'nicht rot'** -- der allgemeine
+# Rotzeilen-Scanner faengt eine `kstack : FAILURES`, aber nicht eine Zeile, die GAR NICHT kommt.
+# Genau das ist der Fall, wenn jemand die Messung aushaengt, und eine fehlende Zeile sieht im
+# Sammelbericht aus wie eine bestandene.
+check "kstack  : ALL PASS" "C4: die Stack-Wasserstandsmarke -- gemessen wird nicht, wie GROSS die Kernel-Stacks sind (das sagt 'vorrat'), sondern wieviel davon je BENUTZT wurde. Der Stack wird beim Anlegen mit einem Muster gefuellt und beim Tod des Threads bzw. am Ende des Laufs von unten abgezaehlt; faellt die Fuellung aus, meldet die Messung die VOLLE Groesse als benutzt und die Zeile faellt durch -- ein Wasserzeichen, das immer 'viel Luft' sagt, ist damit strukturell ausgeschlossen"
+check "kstack  : Eichung 0b1111" "C4: das Messgeraet selbst trennt -- ungefuelltes Feld meldet 0, gefuelltes die volle Laenge, ein bis zu BEKANNTER Tiefe beruehrtes genau diese Tiefe. Ohne den dritten Punkt bestuende die Zeile auch eine Funktion, die nur zwei Zahlen kennt"
 check "stripe  : ALL PASS" "B-4.2: erschoepfte Farbpartitionierung scheitert SAUBER -- der 5. Streifenversuch wird abgewiesen, statt den Satz der ersten PD still ein zweites Mal auszugeben; nach Freigabe wieder vergebbar (kein Leck)"
 # B-4.5 (Prime+Probe): die WIRKUNG der Faerbung, nicht nur die Zuteilung.
 #

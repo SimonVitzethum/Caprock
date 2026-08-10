@@ -105,6 +105,11 @@ fn claim_user_kstack_masked(mask: Option<caprock_mem::ColorMask>) -> Option<usiz
         Some(m) => alloc_colored(sz, al, m)?.base(),
         None => mem_alloc(sz, al)?.base(),
     };
+    // C4: Wasserstandsmarke. **Hier und nicht spaeter** — `init_thread_frame` legt gleich den
+    // Startframe an den Stack-Top; wer danach fuellt, ueberschreibt ihn, und der Thread spraenge
+    // nach `MUSTER`.
+    // SAFETY: frisch allozierte, exklusiv gehaltene, 16-KiB-ausgerichtete Region; identity-gemappt.
+    unsafe { crate::kstackmark::fuellen(crate::kstackmark::KL_EL0, base as usize, sz as usize) };
     KSTACKS.lock().live += 1;
     Some(base as usize)
 }
@@ -146,9 +151,70 @@ fn reclaim_user_kstack(thread_slot: usize) {
         b
     };
     if base != 0 {
+        // C4: **hier** wird der Wasserstand abgelesen, nicht im Bericht — beim Tod des Threads
+        // steht sein tiefster Pfad noch im Speicher, nach der Freigabe gehoert die Region dem
+        // naechsten Anforderer. Der haeufigste Aufrufweg ist `exit_current`, also der sterbende
+        // Thread SELBST auf eben diesem Stack: das Lesen ist gefahrlos (IRQs maskiert), und die
+        // Tiefe des Messrahmens gehoert ehrlicherweise mit zur gemessenen Tiefe.
+        // SAFETY: die Region gehoert bis zum `free_region` unten noch diesem Thread.
+        unsafe {
+            crate::kstackmark::messen(
+                crate::kstackmark::KL_EL0,
+                base as usize,
+                USER_KSTACK_SIZE,
+                crate::kstackmark::Anlass::Tod(thread_slot),
+            )
+        };
         MEM.lock().free_region(PhysRegion::new(base, USER_KSTACK_SIZE as u64));
     }
 }
+/// **C4: ueber alle NOCH LEBENDEN EL0-Kstacks fegen** und ihren Wasserstand einrechnen. Gibt
+/// `(gefegt, tiefster_slot)` zurueck.
+///
+/// Warum das gebraucht wird: [`reclaim_user_kstack`] misst nur die Stacks **sterbender** Threads.
+/// Die langlebigen (IPC-Server, Treiber-PDs, Root-Task) sterben in einem gruenen Lauf nie — und
+/// gerade sie fahren die Pfade, um die es geht. Ein Wasserstand nur aus den Toten waere eine
+/// Stichprobe mit Auswahlfehler.
+///
+/// Gefegt wird am **Schluss** des Laufs (im Bericht), nicht laufend: die Schleife nimmt `KSTACKS`
+/// und liest fremde Stacks, waehrend deren Threads darauf rechnen koennen. Das ist fuer die
+/// **Messung** harmlos (nur Lesen, und ein gleichzeitig tiefer werdender Stack kann den Messwert
+/// nur zu **klein** machen, nie zu gross), waere aber Rauschen in jeder baseline-empfindlichen
+/// Zeile davor.
+pub fn kstack_marke_fegen() -> (usize, usize) {
+    let mut gefegt = 0usize;
+    let mut tiefster = usize::MAX;
+    let mut tiefe = 0usize;
+    // Gemessen wird UNTER der Sperre, und das ist die Entscheidung gegen einen Zwischenpuffer:
+    // ein Feld fester Groesse haette die Liste stillschweigend abgeschnitten, sobald mehr Threads
+    // leben als es Plaetze hat — bei 1024 lebenden Threads und 64 Plaetzen waere `gefegt=64` von
+    // „mehr gibt es nicht" nicht zu unterscheiden. `KSTACKS` ist ein Blattlock (es wird nirgends
+    // ein weiteres genommen, waehrend es gehalten wird), die Schleife kann also nur warten lassen,
+    // nicht verklemmen — und sie laeuft am Schluss des Laufs, wo Wandzeit nichts mehr kippt.
+    let p = KSTACKS.lock();
+    for slot in 0..p.base_of.len() {
+        let b = p.base_of[slot];
+        if b == 0 {
+            continue;
+        }
+        // SAFETY: der Kstack liegt identity-gemappt im RAM; gelesen wird nur.
+        let (benutzt, _) = unsafe {
+            crate::kstackmark::messen(
+                crate::kstackmark::KL_EL0,
+                b as usize,
+                USER_KSTACK_SIZE,
+                crate::kstackmark::Anlass::Fegen(slot),
+            )
+        };
+        gefegt += 1;
+        if benutzt > tiefe {
+            tiefe = benutzt;
+            tiefster = slot;
+        }
+    }
+    (gefegt, tiefster)
+}
+
 /// Virtuelle „freie Kstack-Kapazität" (jetzt RAM-begrenzt): `MAX_THREADS - live`. Für den
 /// Reclaim-Test (spawnt, solange > 0) + Diagnose.
 pub fn user_kstack_free_count() -> usize {
@@ -2226,6 +2292,9 @@ pub fn spawn_on_core_parked(core: usize, entry: usize, arg: usize, prio: u8) -> 
         let stack = mem_alloc_anywhere(STACK_SIZE, 16)?;
         (stack.base() as usize, stack.len() as usize)
     }; // MEM vor SCHEDS freigegeben (Ordnung MEM < SCHEDS)
+    // C4: Wasserstandsmarke fuer die 64-KiB-Klasse, s. `claim_user_kstack_masked`.
+    // SAFETY: frisch allozierte, exklusiv gehaltene Region; identity-gemappt.
+    unsafe { crate::kstackmark::fuellen(crate::kstackmark::KL_KERN, base, len) };
     let mut sched = SCHEDS[core].lock();
     let tid = sched.spawn_parked(core, entry, arg, base, len, prio)?;
     fp_reset_slot(tid.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
@@ -2264,6 +2333,9 @@ pub fn spawn_in_pd(pd: usize, entry: usize, arg: usize, prio: u8) -> Option<Thre
         let stack = mem_alloc_anywhere(STACK_SIZE, 16)?;
         (stack.base() as usize, stack.len() as usize)
     }; // MEM vor SCHEDS freigegeben (Ordnung MEM < SCHEDS)
+    // C4: Wasserstandsmarke fuer die 64-KiB-Klasse, s. `claim_user_kstack_masked`.
+    // SAFETY: frisch allozierte, exklusiv gehaltene Region; identity-gemappt.
+    unsafe { crate::kstackmark::fuellen(crate::kstackmark::KL_KERN, base, len) };
     let tid = {
         let mut sched = SCHEDS[core].lock();
         let t = sched.spawn_parked(core, entry, arg, base, len, prio)?;
@@ -7256,6 +7328,16 @@ pub fn reap_core(core: usize) -> usize {
         }
     } // SCHEDS freigegeben
     if n > 0 {
+        // C4: **vor** der MEM-Sperre, nicht darin — eine Messschleife unter dem innersten Lock
+        // waere derselbe Fehler wie ein `println!` dort. In dieser Liste liegen Kernel-Thread-
+        // Stacks und EL0-**User**-Stacks nebeneinander, beide `STACK_SIZE` gross; unterscheidbar
+        // sind sie nur am Muster, das nur die Kernel-Stacks tragen. Eine Region ohne Muster kostet
+        // dabei genau EINEN Lesezugriff.
+        for &(base, len, _) in &zombies[..n] {
+            // SAFETY: der Zombie ist eingesammelt, die Region gehoert bis zum `free_region` unten
+            // niemandem sonst.
+            unsafe { crate::kstackmark::messen_wenn_gefuellt(crate::kstackmark::KL_KERN, base, len) };
+        }
         {
             let mut mem = MEM.lock();
             let mut bytes = 0u64;

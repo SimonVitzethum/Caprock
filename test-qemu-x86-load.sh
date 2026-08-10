@@ -261,8 +261,15 @@ echo "== checks =="
 # Dieselbe Form wie die verschluckten Pruefergebnisse eine Ebene hoeher: der Text sagt weniger,
 # als er zu sagen scheint, und niemand sieht die Luecke.
 BEKANNT_ROT=(
-  'wasm    :|2026-08-10|Z15/W1|Diagnose vom 2026-08-10: die Ursache steht fest -- `wasmhost` wird gar nicht geladen. `SYS_LOAD` scheitert mit `NoResources` (Index 5, program_id 6), und die Ressource ist inzwischen BENANNT: "Speicher fuer eine Seitentabelle (Code 6); angefordert 4096 Byte, freier Rest 472666112 Byte". Vier KiB fehlen bei 472 MiB frei -- es ist also der ALLOKATOR, nicht der RAM. Damit ist jede fruehere Lesart ueberholt (Cap-Pfade, "erreicht nicht einmal sein erstes SIGNAL"): es gibt keine PD, keinen Thread und keine Cap, an denen etwas haette schiefgehen koennen. Und genau darin liegt die Falle, die die `fp`-Zeile dieses Projekt schon einmal gekostet hat -- ein known-red-Eintrag mit veralteter Diagnose liest sich wie Wissen und ist eine Spur ins Leere; er kostet mehr als gar keine Diagnose'
-  'vollzahl:|2026-08-10|Z15/W1|Diagnose vom 2026-08-10: dieselbe Ursache wie `wasm` -- program_id 6 laedt nicht, also sind 5 von 6 Programmen des Manifests da. Keine zweite Luecke, sondern der REGRESSIONSWAECHTER fuer die erste: diese Zeile MUSS gruen werden, sobald der Ladefehler behoben ist. Bleibt sie danach rot, ist er nicht behoben, sondern verschoben. Sie steht hier nur, damit sie den Lauf bis dahin nicht als unerklaerte Regression faerbt -- nicht, weil sie rot sein duerfte'
+  # **LEER, und das ist ein Ergebnis.** Bis zum 2026-08-10 standen hier `wasm` und `vollzahl`.
+  # Beide sind mit derselben Behebung gruen geworden (`.bss : ALIGN(4096)` in den beiden
+  # Programm-Linkerskripten -- ein PT_LOAD an einer krummen VA, das der Lader korrekt abwies).
+  # `vollzahl` war ausdruecklich als REGRESSIONSWAECHTER fuer `wasm` eingetragen: "diese Zeile MUSS
+  # gruen werden, sobald der Ladefehler behoben ist" -- sie ist es, in demselben Lauf.
+  #
+  # Herausgenommen hat sie die Veraltungserkennung dieser Liste selbst, nicht ein Gegenlesen. Ein
+  # Register, das Erledigtes fuehrt, macht die Frage "was ist offen" unbeantwortbar, und ein
+  # known-red-Eintrag mit ueberholter Diagnose liest sich wie Wissen und ist eine Spur ins Leere.
 )
 fingerprint() {
     local f="$1"

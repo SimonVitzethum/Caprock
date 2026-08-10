@@ -3366,6 +3366,74 @@ impl LadePolitik {
 /// Rueckfallebene. Eine Trennung, die unter Last leise verschwindet, waere schlimmer als gar keine:
 /// danach weiss niemand mehr, welche PD getrennt ist und welche nicht. Dieselbe Festlegung wie bei
 /// `spawn_isolated_colored_auto`.
+/// **WELCHE Ressource beim Laden fehlte** (2026-08-10).
+///
+/// `LoaderError::NoResources` ist ein **Sammelbegriff** — und ein Sammelbegriff im Fehlerwert ist
+/// die Prüfer-Krankheit eine Ebene tiefer: *ein Lader, der „NoResources" sagt, ist ein Prüfer, der
+/// „FAIL" sagt.* Dieselbe Bewegung wie beim `#NM`-Handler (drei Gründe unterscheidbar statt
+/// geraten) und beim Manifest-Format (Versionsunterschied statt Formfehler).
+///
+/// **Warum ein globaler Wert und keine Rückgabe:** die Umstellung auf `Result<_, Mangel>` ginge
+/// durch acht Fehlerausgänge und alle Aufrufer. Der Wert wird beim EINTRITT in den Ladepfad
+/// gelöscht und unmittelbar danach gelesen; der Ladepfad läuft **sequenziell** (`SYS_LOAD` bedient
+/// einen Aufruf, `start_root_task` läuft einmal beim Hochlauf). **Was das kaputt machen würde:**
+/// zwei gleichzeitige Ladevorgänge — dann gewönne der letzte Schreiber. Die Annahme steht hier,
+/// damit sie beim ersten parallelen Lader auffällt und nicht danach.
+pub const MANGEL_KEINER: u32 = 0;
+pub const MANGEL_FARBSTREIFEN: u32 = 1;
+pub const MANGEL_KERNEL_STACK: u32 = 2;
+pub const MANGEL_VSPACE_ASID: u32 = 3;
+pub const MANGEL_L2_TABELLE: u32 = 4;
+pub const MANGEL_SEGMENT_SPEICHER: u32 = 5;
+pub const MANGEL_SEITENTABELLE: u32 = 6;
+pub const MANGEL_STACK_SPEICHER: u32 = 7;
+pub const MANGEL_THREAD_SLOT: u32 = 8;
+pub const MANGEL_PD_SLOT: u32 = 9;
+/// **Keine Ressource, sondern eine krumme Adresse** (2026-08-10). `vspace_map_page_at` weist eine
+/// nicht seitenausgerichtete VA/PA ab, **ohne den Allokator je zu fragen**.
+///
+/// Dieser Code existiert, weil die erste Fassung genau das verschwieg: sie schrieb den Fehlschlag
+/// als „Speicher fuer eine Seitentabelle, 4096 Byte" fest — und die `4096` war ein **Literal im
+/// Quelltext**, kein Messwert. Eine Diagnose, die eine Ursache NENNT, die sie nicht gemessen hat,
+/// ist dieselbe Krankheit, gegen die `NoResources` eine Ebene hoeher gerade erst benannt wurde.
+/// Sie hat den `wasmhost`-Fall ein zweites Mal in die falsche Richtung geschickt (472 MiB frei,
+/// und „der Allokator" als Erklaerung).
+pub const MANGEL_MAPPING_ABGEWIESEN: u32 = 10;
+/// `code << 32 | angeforderte_bytes`
+static LADE_MANGEL: AtomicU64 = AtomicU64::new(0);
+
+fn mangel(code: u32, bytes: u64) {
+    LADE_MANGEL.store((u64::from(code) << 32) | (bytes & 0xffff_ffff), Ordering::Relaxed);
+}
+
+/// `(Code, angeforderte Bytes, freier Rest)`. Der **freie Rest** steht daneben, weil „4096 Byte
+/// angefordert" ohne ihn nicht sagt, ob der Speicher knapp oder der Pool falsch war.
+pub fn lade_mangel() -> (u32, u64, u64) {
+    let v = LADE_MANGEL.load(Ordering::Relaxed);
+    ((v >> 32) as u32, v & 0xffff_ffff, MEM.lock().total_free())
+}
+
+/// Klartext zum Code — damit die Berichtszeile keine Zahl bleibt.
+pub fn mangel_name(code: u32) -> &'static str {
+    match code {
+        MANGEL_KEINER => "keiner (der Fehlschlag lag NICHT an einer Ressource)",
+        MANGEL_FARBSTREIFEN => "Farbstreifen (A1: die Streifenvergabe ist erschoepft)",
+        MANGEL_KERNEL_STACK => "EL0-Kernel-Stack",
+        MANGEL_VSPACE_ASID => "VSpace/ASID",
+        MANGEL_L2_TABELLE => "L2-Seitentabelle",
+        MANGEL_SEGMENT_SPEICHER => "Speicher fuer ein PT_LOAD-Segment",
+        MANGEL_SEITENTABELLE => "Speicher fuer eine Seitentabelle",
+        MANGEL_STACK_SPEICHER => "Speicher fuer den User-Stack",
+        MANGEL_THREAD_SLOT => "Thread-Slot (TCB)",
+        MANGEL_PD_SLOT => "PD-Slot",
+        MANGEL_MAPPING_ABGEWIESEN => {
+            "KEINE Ressource -- das Abbilden wurde abgewiesen (krumme VA/PA oder ausserhalb des \
+             Fensters). Der Allokator wurde dabei NICHT gefragt"
+        }
+        _ => "unbekannt",
+    }
+}
+
 pub fn load_into_pd_mit(
     img: &ElfImage,
     pd: usize,
@@ -3378,7 +3446,20 @@ pub fn load_into_pd_mit(
     // erst nach dem Anlegen wirkt, waere eine Migration und keine Zuteilung.
     let core = pol.core.unwrap_or_else(hal::cpu::core_id);
     // Der Streifen zuerst: schlaegt er fehl, ist noch nichts alloziert, was zurueckmuesste.
-    let stripe = if pol.farbig { Some(crate::colors::claim_stripe()?) } else { None };
+    // Beim EINTRITT loeschen -- sonst stuende beim naechsten Fehlschlag der Grund des vorigen da,
+    // und ein veralteter Grund ist schlimmer als keiner (er macht den Punkt unbehebbar).
+    LADE_MANGEL.store(0, Ordering::Relaxed);
+    let stripe = if pol.farbig {
+        match crate::colors::claim_stripe() {
+            Some(st) => Some(st),
+            None => {
+                mangel(MANGEL_FARBSTREIFEN, 0);
+                return None;
+            }
+        }
+    } else {
+        None
+    };
     let mask = stripe.map(|(_, m)| m);
     // Ab hier gibt jeder Fehlerausgang den Streifen zurueck -- bis `vspace_bind_stripe` ihn an die
     // Lebensdauer der VSpace haengt (dann tut es `vspace_teardown`).
@@ -3388,10 +3469,12 @@ pub fn load_into_pd_mit(
         }
     };
     let Some(kbase) = claim_user_kstack_masked(mask) else {
+        mangel(MANGEL_KERNEL_STACK, 0);
         streifen_zurueck(stripe);
         return None;
     };
     let Some((asid, l1)) = create_vspace_masked(mask) else {
+        mangel(MANGEL_VSPACE_ASID, 0);
         release_user_kstack(kbase);
         streifen_zurueck(stripe);
         return None;
@@ -3403,6 +3486,7 @@ pub fn load_into_pd_mit(
         vspace_bind_stripe(asid, i);
     }
     let Some(l2) = vspace_l2(asid) else {
+        mangel(MANGEL_L2_TABELLE, 0);
         vspace_teardown(asid);
         release_user_kstack(kbase);
         return None;
@@ -3464,6 +3548,7 @@ pub fn load_into_pd_mit(
             "loader  : ABGEWIESEN -- das Image braucht {stuecke_noetig} Frame-Stuecke, die \
              Teardown-Buchhaltung fasst {MAX_IMG_SEGS}. Lieber gar nicht laden als ein Leck."
         );
+        mangel(MANGEL_SEGMENT_SPEICHER, 0);
         return cleanup(asid, kbase, &[], None);
     }
     let mut seglist = [(0u64, 0u64); MAX_IMG_SEGS];
@@ -3482,6 +3567,7 @@ pub fn load_into_pd_mit(
         while done < total {
             let n = sz.min(total - done);
             let Some(region) = mem_alloc_masked_anywhere(n as u64, 4096, mask) else {
+                mangel(MANGEL_SEGMENT_SPEICHER, n as u64);
                 return cleanup(asid, kbase, &seglist[..nrec], None);
             };
             let pa = region.base(); // MemoryCap-Drop = nur Deskriptor (kein Free); RAM bleibt belegt
@@ -3491,7 +3577,16 @@ pub fn load_into_pd_mit(
             copy_segment_at(pa, img.segment_bytes(&seg), done, n);
             let mut off = 0u64;
             while (off as usize) < n {
-                let mut a3 = || mem_alloc_masked_anywhere(4096, 4096, mask).map(|c| c.base());
+                // **Der Allokator markiert sich SELBST**, statt dass der Aufrufer nachrechnet,
+                // warum das Abbilden scheiterte. Zwei Nachrechnungen derselben Groesse waeren die
+                // `iova_window_clear_of_msi`-Falle: Zuteiler und Pruefer brauchen EINE Quelle.
+                let mut a3 = || {
+                    let r = mem_alloc_masked_anywhere(4096, 4096, mask).map(|c| c.base());
+                    if r.is_none() {
+                        mangel(MANGEL_SEITENTABELLE, 4096);
+                    }
+                    r
+                };
                 if !hal::mmu::vspace_map_page_at(
                     l2,
                     seg.vaddr + done as u64 + off,
@@ -3499,6 +3594,10 @@ pub fn load_into_pd_mit(
                     perm,
                     &mut a3,
                 ) {
+                    // Nur wenn `a3` NICHTS gemeldet hat, lag es am Abbilden selbst.
+                    if lade_mangel().0 == MANGEL_KEINER {
+                        mangel(MANGEL_MAPPING_ABGEWIESEN, 0);
+                    }
                     return cleanup(asid, kbase, &seglist[..nrec], None);
                 }
                 off += 4096;
@@ -3530,6 +3629,7 @@ pub fn load_into_pd_mit(
     while sdone < LOADED_STACK_BYTES as usize {
         let n = stack_sz.min(LOADED_STACK_BYTES as usize - sdone);
         let Some(region) = mem_alloc_masked_anywhere(n as u64, 4096, mask) else {
+            mangel(MANGEL_STACK_SPEICHER, n as u64);
             return cleanup(asid, kbase, &seglist[..nrec], stack_reap);
         };
         let pa = region.base();
@@ -3542,7 +3642,13 @@ pub fn load_into_pd_mit(
         }
         let mut off = 0u64;
         while (off as usize) < n {
-            let mut a3 = || mem_alloc_masked_anywhere(4096, 4096, mask).map(|c| c.base());
+            let mut a3 = || {
+                let r = mem_alloc_masked_anywhere(4096, 4096, mask).map(|c| c.base());
+                if r.is_none() {
+                    mangel(MANGEL_SEITENTABELLE, 4096);
+                }
+                r
+            };
             if !hal::mmu::vspace_map_page_at(
                 l2,
                 LOADED_STACK_VA + sdone as u64 + off,
@@ -3552,6 +3658,9 @@ pub fn load_into_pd_mit(
             ) {
                 // Das gerade allozierte Stueck ist noch nicht als Reap-Region vermerkt (ungefaerbt)
                 // bzw. steht schon in `seglist` (gefaerbt) -> beide Wege geben es mit frei.
+                if lade_mangel().0 == MANGEL_KEINER {
+                    mangel(MANGEL_MAPPING_ABGEWIESEN, 0);
+                }
                 return cleanup(asid, kbase, &seglist[..nrec], stack_reap);
             }
             off += 4096;
@@ -3608,6 +3717,7 @@ pub fn load_into_pd_mit(
         // Spawn fehlgeschlagen -> der Stack ist noch nicht als Reap-Region eines Threads vermerkt;
         // Segmente + Stack mitfreigeben (loaded_register lief noch nicht). Gefaerbt stehen die
         // Stackstuecke bereits in `seglist`, `stack_reap` ist dann `None`.
+        mangel(MANGEL_THREAD_SLOT, 0);
         return cleanup(asid, kbase, &seglist[..nrec], stack_reap);
     };
     // **Der Rueckgabewert wird geprueft** (s. `loaded_register`): passt die Liste nicht mehr,
@@ -3680,7 +3790,14 @@ pub fn load_elf_mit(
     boot_arg: usize,
     pol: LadePolitik,
 ) -> Option<(ThreadId, usize)> {
-    let pd = create_pd_in_domain(domain)?;
+    // Loeschen schon HIER: `create_pd_in_domain` liegt VOR `load_into_pd_mit`, und ohne das
+    // Loeschen stuende bei einem Fehlschlag der Grund des VORIGEN Ladevorgangs da -- ein
+    // veralteter Grund ist schlimmer als keiner.
+    LADE_MANGEL.store(0, Ordering::Relaxed);
+    let Some(pd) = create_pd_in_domain(domain) else {
+        mangel(MANGEL_PD_SLOT, 0);
+        return None;
+    };
     match load_into_pd_mit(img, pd, endow, boot_arg, pol) {
         Some(tid) => Some((tid, pd)),
         None => {

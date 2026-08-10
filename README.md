@@ -29,6 +29,33 @@ und was dafür noch fehlt, steht in [`todo.md`](todo.md) (Abschnitt Z) und
 
 Ziele: hochsicher · hochperformant · capability-basiert · deterministisch · vollständig modular.
 
+## Schreibweise des Namens
+
+**`Caprock`** in Prosa, **`caprock`** in Crate-Namen, Pfaden und Bezeichnern. Genau eine
+Schreibweise je Ort, keine Varianten — kein `CapRock`, kein `CAPRock`, kein `capRock`.
+
+Die Regel steht hier und nicht in einem Style-Guide, weil dieses Projekt die Drift schon einmal
+bezahlt hat: aus `seL4` wurde `SEL4` wurde `Sel4lake`, und am Ende standen `SEL4Lake`, `SeL4Lake`
+und `sel4lake` nebeneinander im Baum. Die Umbenennung musste deshalb **fallweise** ersetzen, über
+241 Dateien und 20 Crate-Verzeichnisse — ein Flächenersatz hätte an jeder Variante etwas anderes
+getroffen. Eine Schreibregel, die erst nach den ersten Varianten entsteht, kommt zu spät: sie
+beschreibt dann den Bestand, statt ihn zu verhindern.
+
+**`CAPROCKS` ist ausdrücklich KEINE Schreibvariante, sondern ein Datenwert.** Es ist die
+**8-Byte-Magie**, die die Testsuiten in Sektor 0 des Plattenabbilds legen und gegen die der Kernel
+rechnet — gegengeprüft an drei Stellen: `tools/mkgpt.py` schreibt sie, der Kernel rechnet dagegen,
+beide QEMU-Suiten hängen daran. Acht Zeichen, weil die **Breite** an genau diesen drei Stellen
+gilt; ein siebenstelliges `CAPROCK` hätte die Breitenprüfung gerissen, ohne dass irgendwo „Name"
+darübersteht. Der Wert folgt der Schreibregel nicht und definiert sie nicht — er ist von ihr
+getrennt zu behandeln, so wie beim letzten Mal.
+
+**OFFEN — ob die Schreibung mit K („Kaprock") gelten soll, ist nicht abschliessend entschieden.**
+Fällt die Entscheidung dafür, kostet sie zweierlei: einen weiteren vollständigen
+Umbenennungsdurchgang **und** eine erneute Vormessung — crates.io-Name `kaprock` samt Präfix
+`kaprock-`, dazu das Markenregister. Die Prüfung, die für `caprock` gelaufen ist, deckt `kaprock`
+**nicht** ab; ein freier Name sagt nichts über einen anderen. Realisiert ist derzeit **Caprock**,
+und so heisst auch das GitHub-Repo.
+
 ## Schnellstart
 
 ```sh

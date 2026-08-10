@@ -2793,6 +2793,38 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
          jemand die Schranke senkt"
     );
 
+    // **VOLLZAEHLIGKEIT** (2026-08-10) -- die Zeile, die es sechs Wochen lang nicht gab.
+    //
+    // Ein Programm, das nicht laedt, hatte nichts, woran es haette auffallen koennen: es fehlte
+    // einfach, und alle uebrigen Pruefzeilen blieben gruen, weil sie ueber ANDERE Programme
+    // urteilen. Der wasm-Fall hat das bezahlt -- gefunden wurde er ueber die Umwege zweier
+    // kaputter Pruefer, nicht ueber eine Pruefung.
+    //
+    // **Gemeldet werden die NAMEN der Fehlenden**, nicht eine Differenz: „einer fehlt" ist keine
+    // Diagnose, „program_id 6 fehlt" ist eine.
+    {
+        let mut fehlend = [0u32; 16];
+        let (erw, gel, n) = crate::loader::vollzaehligkeit(&mut fehlend);
+        if erw == 0 {
+            println!(
+                "vollzahl: SKIP -- kein Manifest, also keine Sollmenge (diese Suite faehrt ohne \
+                 Boot-Archiv; das ist bauartbedingt und kein Befund)"
+            );
+        } else {
+            print!("vollzahl: {gel} von {erw} Programmen des Manifests sind geladen");
+            if n > 0 {
+                print!(" · FEHLEND:");
+                for &pid in fehlend.iter().take(n) {
+                    print!(" program_id {pid}");
+                }
+            }
+            println!(
+                " : {} (der GRUND eines Ladefehlschlags steht in der `loader :`-Zeile darueber)",
+                if n == 0 { "ALL PASS" } else { "FAILURES" }
+            );
+        }
+    }
+
     // **Das Vektor-Inventar.** Gedruckt wird JEDER Vektor, der ueberhaupt genommen wurde -- nicht
     // nur die auffaelligen. Ein Melder, der nur beim Unglueck spricht, ist in einem gesunden Lauf
     // stumm, und dann weiss niemand, ob er sprechfaehig ist. Ein Inventar ist in jedem Lauf

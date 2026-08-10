@@ -667,6 +667,39 @@ pub fn thread_of_program(program_id: u32) -> Option<ThreadId> {
         })
 }
 
+/// **VOLLZAEHLIGKEIT: steht fuer jeden Manifest-Eintrag auch ein geladenes Programm?**
+///
+/// Die Zeile, die es sechs Wochen lang nicht gab -- und deren Fehlen den ganzen wasm-Fall
+/// getragen hat. `wasmhost` scheiterte seit `94a92ea` beim Laden; **keine einzige Pruefung hat es
+/// bemerkt**, weil niemand die beiden Zahlen verglich. Gefunden wurde es ueber die Umwege zweier
+/// kaputter Pruefer.
+///
+/// Vier Pruefer waren an dem Fall beteiligt und alle vier waren kaputt. Der fuenfte -- dieser --
+/// existierte nicht, und das war die eigentliche Luecke: ein stiller Ladeausfall hatte nichts,
+/// woran er haette auffallen koennen.
+///
+/// Rueckgabe: `(erwartet, geladen, fehlende program_ids, Zahl der fehlenden)`. Die **Namen** der
+/// Fehlenden, nicht bloss eine Differenz -- „einer fehlt" ist keine Diagnose.
+pub fn vollzaehligkeit(fehlend: &mut [u32]) -> (usize, usize, usize) {
+    let Some(man) = read_manifest() else {
+        return (0, 0, 0); // ohne Manifest gibt es keine Sollmenge -- das ist KEIN Befund
+    };
+    let mut erwartet = 0usize;
+    let mut geladen = 0usize;
+    let mut n = 0usize;
+    for i in 0..man.count() {
+        let Some(e) = man.entry(i) else { continue };
+        erwartet += 1;
+        if thread_of_program(e.program_id).is_some() {
+            geladen += 1;
+        } else if n < fehlend.len() {
+            fehlend[n] = e.program_id;
+            n += 1;
+        }
+    }
+    (erwartet, geladen, n)
+}
+
 /// Wie viele Zuordnungen bekannt sind und wie viele verlorengingen.
 pub fn program_thread_stats() -> (usize, u64) {
     (
@@ -1730,10 +1763,23 @@ pub fn load_by_index(index: u32, caller_pd: usize, endow: &[(usize, CapPtr)]) ->
         match load_image(&prog, endow, arg) {
             Ok((_, pd)) => Some(pd),
             Err(e) => {
+                // **`NoResources` benennt jetzt die Ressource.** Ein Sammelbegriff im Fehlerwert
+                // ist die Pruefer-Krankheit eine Ebene tiefer: ein Lader, der „NoResources" sagt,
+                // ist ein Pruefer, der „FAIL" sagt. Dazu die angeforderte Groesse UND der freie
+                // Rest -- ohne den sagt „n Byte angefordert" nicht, ob der Speicher knapp oder der
+                // Pool der falsche war.
+                let (code, bytes, frei) = crate::system::lade_mangel();
                 println!(
                     "loader  : SYS_LOAD fehlgeschlagen -- Index {index}, program_id {}, Grund {:?}",
                     prog.program_id, e
                 );
+                if e == LoaderError::NoResources {
+                    println!(
+                        "loader  :   fehlende Ressource: {} (Code {code}); angefordert {bytes} Byte, \
+                         freier Rest {frei} Byte",
+                        crate::system::mangel_name(code)
+                    );
+                }
                 None
             }
         }

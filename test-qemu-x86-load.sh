@@ -252,10 +252,17 @@ echo "== checks =="
 # Lauf; jede Zeile AUF der Liste traegt ein Datum -- eine Diagnose, die aelter ist als der letzte
 # Umbau ihres Pfads, ist automatisch verdaechtig.
 #
-# Format: "praefix|seit|eintrag|diagnose vom"
+# Format: 'praefix|seit|eintrag|diagnose vom'
+#
+# **EINFACHE Anfuehrungszeichen, und das ist keine Stilfrage.** In doppelten Anfuehrungszeichen ist
+# ein Backtick-Paar Kommandosubstitution: aus `Root-Task lief: false` wurde bis 2026-08-10 die
+# Fehlermeldung "Kommando nicht gefunden" auf stderr und ein LEERER String im Text. Getroffen hat
+# es ausgerechnet die zitierten Belege -- die Diagnose las sich vollstaendig und war es nicht.
+# Dieselbe Form wie die verschluckten Pruefergebnisse eine Ebene hoeher: der Text sagt weniger,
+# als er zu sagen scheint, und niemand sieht die Luecke.
 BEKANNT_ROT=(
-  "wasm    :|2026-08-10|Z15/W1|Diagnose vom 2026-08-10: die PD ist endowt (`endowt=true`), erreicht aber nicht einmal ihr erstes SIGNAL (`lebt=false`) -- und das braucht KEINE Cap-Operation. Sie faultet auch nicht (die drei el0-traps stammen alle von Threads, die kein Ladepfad erzeugt hat). Derselbe Ausfall trifft den ROOT-Task: `Root-Task lief: false`, seit `a159b6b` (94a92ea war true) -- Badges aus geladenen PDs kommen nicht an, Treiber-Badges dagegen schon. Ursache NICHT gefunden; die Zeile sagt jetzt wenigstens, WELCHE der vier Lagen es ist"
-  "fp      :|2026-08-09|Z25|Diagnose vom 2026-08-09: Sonden erreichen weder Erfolg noch Korruption -- Schleifenfortschritt noch nicht gezaehlt. Die FRUEHERE Diagnose (CR4.OSFXSR nie gesetzt) ist seit A4 ueberholt und war 1 Tag lang falsch stehengeblieben"
+  'wasm    :|2026-08-10|Z15/W1|Diagnose vom 2026-08-10: die Ursache steht fest -- `wasmhost` wird gar nicht geladen. `SYS_LOAD` scheitert mit `NoResources` (Index 5, program_id 6), und die Ressource ist inzwischen BENANNT: "Speicher fuer eine Seitentabelle (Code 6); angefordert 4096 Byte, freier Rest 472666112 Byte". Vier KiB fehlen bei 472 MiB frei -- es ist also der ALLOKATOR, nicht der RAM. Damit ist jede fruehere Lesart ueberholt (Cap-Pfade, "erreicht nicht einmal sein erstes SIGNAL"): es gibt keine PD, keinen Thread und keine Cap, an denen etwas haette schiefgehen koennen. Und genau darin liegt die Falle, die die `fp`-Zeile dieses Projekt schon einmal gekostet hat -- ein known-red-Eintrag mit veralteter Diagnose liest sich wie Wissen und ist eine Spur ins Leere; er kostet mehr als gar keine Diagnose'
+  'vollzahl:|2026-08-10|Z15/W1|Diagnose vom 2026-08-10: dieselbe Ursache wie `wasm` -- program_id 6 laedt nicht, also sind 5 von 6 Programmen des Manifests da. Keine zweite Luecke, sondern der REGRESSIONSWAECHTER fuer die erste: diese Zeile MUSS gruen werden, sobald der Ladefehler behoben ist. Bleibt sie danach rot, ist er nicht behoben, sondern verschoben. Sie steht hier nur, damit sie den Lauf bis dahin nicht als unerklaerte Regression faerbt -- nicht, weil sie rot sein duerfte'
 )
 fingerprint() {
     local f="$1"
@@ -268,19 +275,39 @@ fingerprint() {
 # Rote Zeilen gegen die Liste halten. Gibt 1, wenn eine rote Zeile NICHT erklaert ist.
 bekannt_rot_pruefen() {
     local out="$1" unerklaert=0
+    local -a getroffen=()
+    for _ in "${BEKANNT_ROT[@]}"; do getroffen+=(0); done
     echo "== bekannt-rote Zeilen =="
     while IFS= read -r zeile; do
-        local praefix="${zeile%%:*}:" erklaert=0
+        local praefix="${zeile%%:*}:" erklaert=0 i=0
         for e in "${BEKANNT_ROT[@]}"; do
             IFS='|' read -r p seit eintrag diag <<< "$e"
             if [ "${zeile:0:${#p}}" = "$p" ]; then
                 echo "  bekannt: ${p}FAILURES -- rot seit $seit, $eintrag"
                 echo "           $diag"
+                getroffen[$i]=1
                 erklaert=1; break
             fi
+            i=$((i+1))
         done
         [ "$erklaert" = 1 ] || { echo "  NEU ROT: $zeile"; unerklaert=1; }
     done < <(echo "$out" | grep -E "^[a-z]+ *: .*FAILURES" | sort -u)
+    # **Eintraege, die NICHTS erklaeren, sind Totholz -- und Totholz verrottet.** Ein
+    # known-red-Eintrag fuer eine Zeile, die laengst gruen ist, liest sich wie Wissen und ist eine
+    # Spur ins Leere; genau das war der `fp`-Eintrag am 2026-08-10, einen Tag nachdem die Zeile
+    # gruen wurde. Kein FEHLSCHLAG, sondern eine Meldung: eine Suitenvariante darf eine Zeile
+    # legitim gar nicht erzeugen, und ein Waechter, der in jedem gesunden Lauf schreit, wird
+    # abgeschaltet.
+    local i=0
+    for e in "${BEKANNT_ROT[@]}"; do
+        if [ "${getroffen[$i]}" = 0 ]; then
+            IFS='|' read -r p seit eintrag diag <<< "$e"
+            echo "  VERALTET? ${p} steht auf der Liste, war in diesem Lauf aber NICHT rot"
+            echo "            (seit $seit, $eintrag) -- entweder behoben und der Eintrag gehoert weg,"
+            echo "            oder diese Suitenvariante erzeugt die Zeile gar nicht."
+        fi
+        i=$((i+1))
+    done
     if [ "$unerklaert" = 1 ]; then
         echo "  BEFUND: eine rote Zeile steht NICHT auf der Liste -- das ist eine neue Regression,"
         echo "          keine bekannte Luecke. Genau dieser Unterschied war bei der Lade-Suite unsichtbar."

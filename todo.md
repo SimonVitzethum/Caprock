@@ -1382,12 +1382,50 @@ Die Aufteilung, die daraus folgt:
          wird jetzt eigens abgelegt.
       4. `SYS_LOAD` verlor den Grund im `.ok()` → er wird **genannt** (`Grund NoResources`).
 
-- [ ] **Was übrig bleibt: `NoResources` beim Laden von `wasmhost`.** Zu klären ist, **welche**
-      Ressource — 2 MiB BSS-Arena auf einer 512-MiB-Maschine, PD-/TCB-Slot oder ASID. Der Grund
-      ist jetzt benannt, aber `NoResources` ist selbst noch ein Sammelbegriff: dieselbe Sorte
-      Unschärfe eine Ebene tiefer. Erste Messung: dieselbe Suite mit `-m 3G`, dann sagt die
-      Speichergrösse allein, ob es RAM war.
+- [x] **BEHOBEN, und die Ursache war KEINE Ressource.** (2026-08-10) `wasmhost` hatte ein
+      PT_LOAD-Segment auf einer **nicht seitenausgerichteten** VA (`0x2004_6700`).
+      `vspace_map_page_at` weist eine krumme VA beim **allerersten** Aufruf ab — der Allokator
+      wurde nie gefragt.
 
+      **Der Bauweg:** `.bss : ALIGN(8)` in `programs/user.ld` und `user-x86.ld`. `wasmhost` ist das
+      einzige Programm mit einem **schreibbaren** Segment und hat keine `.data`; lld verwirft die
+      leere Ausgabesektion, das RW-PT_LOAD beginnt also bei `.bss` mit dessen 8-Byte-Ausrichtung.
+      Auf **beiden** Architekturen — das Image war nirgends ladbar.
+      Behoben mit `ALIGN(4096)`. **Nicht** kernelseitig die VA abrunden: `.rodata` reicht in
+      dieselbe Seite, sie wäre erst RO und dann RW gemappt — ein W^X-Loch als „Behebung".
+
+      **Alle vier Hypothesen sind widerlegt, auch die führende** („Seitentabellen kommen aus einem
+      eigenen festen Vorrat, `total_free()` liest den falschen Topf"). Sie erklärte beide Zahlen
+      zugleich und war trotzdem falsch: die Fragmentschranke greift bei `align == 4096` nie, die
+      Farbmaske ist `None` (Politik 0), und der Zonen-Ausweich läuft bedingungslos. **Die Prämisse
+      der ganzen Frage war falsch** — `mem_alloc_masked_anywhere` hat nie `None` gegeben, es wurde
+      nie gerufen.
+
+      **Und der Grund dafür war meine eigene, frisch „sprechfähig" gemachte Fehlerzeile.** Sie
+      schrieb den Fehlschlag als „Speicher für eine Seitentabelle, **4096 Byte**" fest — und diese
+      4096 war ein **Literal im Quelltext**, kein Messwert. Eine Diagnose, die eine Ursache
+      **nennt, die sie nicht gemessen hat**, ist dieselbe Krankheit, die `NoResources` eine Ebene
+      höher gerade erst behoben hatte. Sie hat den Fall ein zweites Mal in die falsche Richtung
+      geschickt.
+      Behoben strukturell: **nur der Allokator darf behaupten, es sei der Allokator gewesen** —
+      `a3` markiert sich selbst, wenn es `None` gibt; sonst meldet der Ausgang
+      `MANGEL_MAPPING_ABGEWIESEN` („KEINE Ressource, das Abbilden wurde abgewiesen; der Allokator
+      wurde dabei NICHT gefragt"). Zwei Nachrechnungen derselben Größe wären die
+      `iova_window_clear_of_msi`-Falle gewesen.
+
+      **Gemessen, in beide Richtungen:**
+      * `tools/segment-ausrichtung.sh` — zählt PT_LOAD mit `p_vaddr % 4096 != 0` über alle
+        Programm-ELFs, **ohne QEMU**. Vorher 1 je Architektur, danach **0**; mit Sprechprobe.
+      * Die sechs übrigen ELFs sind nach dem Eingriff **bit-identisch** (md5 verglichen) — das
+        Risiko ist gemessen, nicht behauptet.
+      * Gegenprobe: Ausrichtung zurückgedreht → dieselbe Stelle meldet jetzt **Code 10** statt
+        Code 6. Zwei Lagen, zwei Zeilen.
+      * `wasm : ALL PASS` mit allen vier Aussagen, `vollzahl: 6 von 6`, **Lade-Suite
+        `== ALL PASS ==`** — zum ersten Mal seit dem 2026-08-03.
+
+      **Was der Lader weiterhin NICHT prüft:** `ElfImage::parse_phdr` liest `p_vaddr` ohne
+      Ausrichtungsprüfung. Er nimmt also weiter ein Image an, das er nie abbilden kann — die
+      Absage fällt erst tief im Ladepfad. Eigener offener Punkt.
 
 - [ ] **Als Nächstes, und es ist EINE Frage für beide.** Was gemessen ist, grenzt sie schon ein:
 

@@ -264,19 +264,39 @@ fingerprint() {
 # Rote Zeilen gegen die Liste halten. Gibt 1, wenn eine rote Zeile NICHT erklaert ist.
 bekannt_rot_pruefen() {
     local out="$1" unerklaert=0
+    local -a getroffen=()
+    for _ in "${BEKANNT_ROT[@]}"; do getroffen+=(0); done
     echo "== bekannt-rote Zeilen =="
     while IFS= read -r zeile; do
-        local praefix="${zeile%%:*}:" erklaert=0
+        local praefix="${zeile%%:*}:" erklaert=0 i=0
         for e in "${BEKANNT_ROT[@]}"; do
             IFS='|' read -r p seit eintrag diag <<< "$e"
             if [ "${zeile:0:${#p}}" = "$p" ]; then
                 echo "  bekannt: ${p}FAILURES -- rot seit $seit, $eintrag"
                 echo "           $diag"
+                getroffen[$i]=1
                 erklaert=1; break
             fi
+            i=$((i+1))
         done
         [ "$erklaert" = 1 ] || { echo "  NEU ROT: $zeile"; unerklaert=1; }
     done < <(echo "$out" | grep -E "^[a-z]+ *: .*FAILURES" | sort -u)
+    # **Eintraege, die NICHTS erklaeren, sind Totholz -- und Totholz verrottet.** Ein
+    # known-red-Eintrag fuer eine Zeile, die laengst gruen ist, liest sich wie Wissen und ist eine
+    # Spur ins Leere; genau das war der `fp`-Eintrag am 2026-08-10, einen Tag nachdem die Zeile
+    # gruen wurde. Kein FEHLSCHLAG, sondern eine Meldung: eine Suitenvariante darf eine Zeile
+    # legitim gar nicht erzeugen, und ein Waechter, der in jedem gesunden Lauf schreit, wird
+    # abgeschaltet.
+    local i=0
+    for e in "${BEKANNT_ROT[@]}"; do
+        if [ "${getroffen[$i]}" = 0 ]; then
+            IFS='|' read -r p seit eintrag diag <<< "$e"
+            echo "  VERALTET? ${p} steht auf der Liste, war in diesem Lauf aber NICHT rot"
+            echo "            (seit $seit, $eintrag) -- entweder behoben und der Eintrag gehoert weg,"
+            echo "            oder diese Suitenvariante erzeugt die Zeile gar nicht."
+        fi
+        i=$((i+1))
+    done
     if [ "$unerklaert" = 1 ]; then
         echo "  BEFUND: eine rote Zeile steht NICHT auf der Liste -- das ist eine neue Regression,"
         echo "          keine bekannte Luecke. Genau dieser Unterschied war bei der Lade-Suite unsichtbar."

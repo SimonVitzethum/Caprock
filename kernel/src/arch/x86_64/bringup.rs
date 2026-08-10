@@ -4207,6 +4207,19 @@ pub fn run(multiboot_info: u64) -> ! {
     println!("========================================");
     println!(" Caprock — capability microkernel");
     println!(" x86_64 (Multiboot -> Long Mode)");
+    // **Die Konfiguration gehört an das Artefakt gebunden, nicht nur ins Bauprotokoll.**
+    // Der Binärfingerabdruck der Suiten schliesst „veralteter Build" für einen *Suitenlauf* aus;
+    // für die *Bauumgebung* stand dieselbe Tür offen, und am 2026-08-10 lieferte ein sauber
+    // übersetzender `cargo build` ein Abbild mit `__text_start = 0x100000`, das nie gebootet
+    // hätte (Cargo mischt `.cargo/config.toml` aus jedem Vorfahrenverzeichnis — s.
+    // `kernel/build.rs`). Seither steht der Fingerabdruck der **effektiven** Flags im Abbild und
+    // wird gedruckt: zwei Läufe mit verschiedener Bauumgebung sind damit unterscheidbar, ohne
+    // dass jemand die Umgebung nachträglich rekonstruieren muss.
+    println!(
+        " bauflags {} ({} Flags)",
+        env!("CAPROCK_FLAGS_FP"),
+        env!("CAPROCK_FLAGS_N")
+    );
     println!("========================================");
     hal::exception::init(); // IDT: Faults ab hier diagnostizierbar
     hal::gdt::init(); // GDT + TSS (Selektoren für Trap-/Ring-Wechsel)

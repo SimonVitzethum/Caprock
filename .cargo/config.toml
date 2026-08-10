@@ -15,18 +15,29 @@ json-target-spec = true
 build-std = ["core", "compiler_builtins", "alloc"]
 build-std-features = ["compiler-builtins-mem"]
 
+# **Das Linkerskript steht NICHT hier, sondern in `kernel/build.rs`.**
+#
+# Cargo mischt `.cargo/config.toml` aus JEDEM Vorfahrenverzeichnis und **haengt Array-Werte
+# aneinander**. Ein Arbeitsbaum innerhalb eines anderen Checkouts (`<repo>/.claude/worktrees/<id>`)
+# erbt diese Datei deshalb ein zweites Mal, und `-Tkernel/linker.ld` steht doppelt auf der
+# Linkerzeile -- `lld` wertet den `SECTIONS`-Block zweimal aus, alle Linkersymbole tragen danach
+# die Werte des zweiten Durchlaufs, und der Bau laeuft durch. Am 2026-08-10 gemessen; die
+# Begruendung samt Waechter steht in `kernel/build.rs`.
+#
+# `cargo:rustc-link-arg` in `build.rs` entsteht **je Crate genau einmal** und durchlaeuft diese
+# Mischung nicht. Nebenertrag: der Pfad ist dort absolut und setzt nicht mehr voraus, dass `cargo`
+# aus dem Wurzelverzeichnis laeuft.
+
 [target.aarch64-caprock]
-rustflags = [
-    # Use our linker script (sets load address + sections for QEMU `virt`).
-    "-C", "link-arg=-Tkernel/linker.ld",
-]
+rustflags = []
 
 # x86_64-Port (Branch arch/x86_64): eingebauter Bare-Metal-Target x86_64-unknown-none
 # (soft-float, kein SSE, static). Eigenes Linker-Skript (Multiboot1 @ 1 MiB). Per
 # `--target x86_64-unknown-none` gewaehlt (s. build-x86.sh / test-qemu-x86.sh).
+# Das Linkerskript steht auch hier nicht -- s. o. und `kernel/build.rs`. `relocation-model` bleibt:
+# es doppelt zu setzen ist folgenlos (derselbe Wert), und ein `build.rs` kann es nicht setzen.
 [target.x86_64-unknown-none]
 rustflags = [
-    "-C", "link-arg=-Tkernel/x86_64-link.ld",
     "-C", "relocation-model=static",
 ]
 # NOTE on FP/NEON: we keep them enabled (the aarch64 ABI ties `fp-armv8` to

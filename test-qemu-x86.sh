@@ -69,7 +69,16 @@ ELF="build/target/x86_64-unknown-none/release/caprock-kernel.mb32"
 # `SELFTEST COMPLETE`, das nie kommt: kein FAIL, sondern Stille -- und Stille ist die schlechteste
 # Art zu scheitern, weil sie wie Erfolg aussieht, bis jemand das Zeitlimit bemerkt.
 echo "== build (x86_64-unknown-none, --features selftest) =="
-./build-x86.sh --features selftest >/dev/null 2>&1 || { echo "BUILD FAILED"; exit 1; }
+# **Die Bauausgabe wird NICHT weggeworfen.** Sie traegt die effektive Flagliste und die Urteile
+# der beiden Bauzeit-Waechter (Multiboot-Offset, filesz ueber NOBITS). Am 2026-08-10 war
+# `>/dev/null 2>&1` genau der Grund, warum ein Bau mit doppelt uebergebenem Linkerskript in der
+# Suite unsichtbar blieb: der Fingerabdruck bindet das ARTEFAKT, aber niemand band die
+# KONFIGURATION, die es erzeugt hat.
+BAULOG="$(mktemp)"
+./build-x86.sh --features selftest >"$BAULOG" 2>&1 || {
+    echo "BUILD FAILED"; sed 's/^/  /' "$BAULOG"; exit 1; }
+grep -E "^(rustflags\(effektiv\)|multiboot):" "$BAULOG" | sed 's/^/  /'
+rm -f "$BAULOG"
 
 # todo F1: die Konfiguration OHNE Pruefinfrastruktur wird HIER MITGEBAUT.
 #
@@ -80,14 +89,14 @@ echo "== build (x86_64-unknown-none, --features selftest) =="
 # Geprueft wird also genau das, was pruefbar ist -- dass er uebersetzt und linkt.
 echo "== build (--no-default-features: ohne Pruefinfrastruktur) =="
 NOSEL_OK=1
-# **Dieser Bau ruft cargo direkt und muss deshalb die Entdoppelung selbst machen.** In einem
-# Agenten-Worktree (der im Hauptbaum liegt) erbt Cargo die Linkerflags doppelt; das Abbild
-# bekommt dann einen ZWEITEN, leeren Satz Ausgabesektionen -- und `grep -A1 " .text " | tail -1`
-# liest genau den. `NOSEL_TEXT` stand deshalb auf **0**, und die F1-Zeile meldete PASS
-# ("0 < 0x62000") fuer eine Zahl, die kein Messwert war. Ein Vergleich gegen eine 0 aus einem
-# kaputten Bau ist die Bauzeit-Fassung von "Schweigen als Erfolg". S. tools/rustflags-entdoppeln.py.
-F1FLAGS="$(python3 tools/rustflags-entdoppeln.py x86_64-unknown-none)"; F1RC=$?
-if [ "$F1RC" = "10" ]; then export RUSTFLAGS="$F1FLAGS"; fi
+# **Dieser Bau ruft cargo direkt** -- und war deshalb am 2026-08-10 selbst betroffen: in einem
+# Arbeitsbaum innerhalb des Hauptbaums erbte Cargo die Linkerflags doppelt, das Abbild bekam einen
+# ZWEITEN, leeren Satz Ausgabesektionen, und `grep -A1 " .text " | tail -1` las genau den.
+# `NOSEL_TEXT` stand auf **0**, und die F1-Zeile meldete PASS ("0 < 0x62000") fuer eine Zahl, die
+# kein Messwert war. Seit dem Umzug des Linkerskripts nach `kernel/build.rs` kann das nicht mehr
+# entstehen (dort steht auch der Waechter); die Untergrenze unten bleibt trotzdem -- **eine 0 ist
+# ein Befund, kein Messwert**, und ein einseitiger Schwellenvergleich ist gruen, sobald die
+# Messung ausfaellt.
 rustup run nightly cargo build --release --no-default-features \
     --target x86_64-unknown-none -p caprock-kernel >/dev/null 2>&1 || NOSEL_OK=0
 # Der Vergleich gehoert dazu: schrumpft das Image NICHT, ist das Gating wirkungslos geworden
@@ -629,8 +638,19 @@ fi
 # ohne), nicht zwischen "Default" und "Nicht-Default". So bleibt er richtig, egal ob `selftest`
 # in `default` steht oder nicht -- A-2.2 dreht genau das um, und eine Pruefung, die sich beim
 # Drehen einer Vorgabe mitdrehen muss, ist eine Pruefung, die man dabei vergisst.
-if [ -n "$SEL_TEXT" ] && [ -n "$NOSEL_TEXT" ] && [ $((0x$NOSEL_TEXT)) -lt $((0x$SEL_TEXT)) ]; then
-    echo "  PASS: F1: .text ohne 'selftest' (0x$NOSEL_TEXT) < mit 'selftest' (0x$SEL_TEXT) -- das Gating wirkt wirklich"
+# **NULL IST EIN BEFUND, KEIN MESSWERT.** Ein einseitiger Schwellenvergleich (`x < Schranke`)
+# ist gruen, sobald die MESSUNG ausfaellt -- dieselbe Form wie ein nie gesetztes Bit, das als
+# "kein Fehler" gelesen wird. Am 2026-08-10 stand `NOSEL_TEXT` auf 0 (der Bau war kaputt, s. o.),
+# und die Zeile meldete PASS fuer "0 < 0x62000". Deshalb eine PLAUSIBILITAETS-UNTERGRENZE: ein
+# Kernel ohne Pruefinfrastruktur hat immer noch Scheduler, IPC, Speicherverwaltung und HAL --
+# unter 64 KiB `.text` ist das keine kleinere Konfiguration, sondern ein kaputter Bau.
+F1_MIN=$((0x10000))
+if [ -z "$SEL_TEXT" ] || [ -z "$NOSEL_TEXT" ]; then
+    echo "  FAIL: F1: .text NICHT MESSBAR (mit='$SEL_TEXT', ohne='$NOSEL_TEXT') -- nicht messbar ist kein bestandener Test"; fail=1
+elif [ $((0x$NOSEL_TEXT)) -lt $F1_MIN ]; then
+    echo "  FAIL: F1: .text ohne 'selftest' ist 0x$NOSEL_TEXT und damit unter der Plausibilitaetsgrenze 0x$(printf %x $F1_MIN) -- das ist ein kaputter Bau, kein kleines Image"; fail=1
+elif [ $((0x$NOSEL_TEXT)) -lt $((0x$SEL_TEXT)) ]; then
+    echo "  PASS: F1: .text ohne 'selftest' (0x$NOSEL_TEXT) < mit 'selftest' (0x$SEL_TEXT), beide ueber 0x$(printf %x $F1_MIN) -- das Gating wirkt wirklich"
 else
     echo "  FAIL: F1: .text schrumpft nicht (mit: 0x$SEL_TEXT, ohne: 0x$NOSEL_TEXT) -- Testcode liegt ausserhalb des Features"; fail=1
 fi

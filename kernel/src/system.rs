@@ -88,6 +88,14 @@ static KSTACKS: SpinLock<KstackPool> = SpinLock::new(KstackPool {
 
 /// Einen EL0-Kernel-Stack (16 KiB, ausgerichtet) aus `MEM` allozieren. Gibt die **physische Basis**
 /// zurück (identity-gemappt = EL1-SP-Region), oder `None` bei RAM-Erschöpfung.
+/// **Was fuer EINEN EL0-Kernel-Stack wirklich angefordert wird**: der Stack plus seine Wache.
+///
+/// Die Konstante steht hier und nicht bei den Pruefern: eine zweite Quelle fuer dieselbe Zahl war
+/// genau die Falle, wegen der `mangel(MANGEL_SEITENTABELLE, 4096)` als Literal entstehen konnte.
+/// Wer die Wache abschafft oder vergroessert, aendert diese Zeile -- und jede Pruefung, die den
+/// gemeldeten Betrag gegenliest, folgt automatisch.
+pub const USER_KSTACK_ALLOC: u64 = USER_KSTACK_SIZE as u64 + caprock_mem::PAGE;
+
 fn claim_user_kstack() -> Option<usize> {
     claim_user_kstack_masked(None)
 }
@@ -103,13 +111,34 @@ fn claim_user_kstack_masked(mask: Option<caprock_mem::ColorMask>) -> Option<usiz
     // Mangel selbst hinschreibt, muss die Groesse ein zweites Mal nennen -- und eine zweite
     // Quelle fuer dieselbe Zahl ist die Falle, wegen der `mangel(MANGEL_SEITENTABELLE, 4096)`
     // ueberhaupt entstehen konnte.
-    let base = benannt_alloc(MANGEL_KERNEL_STACK, sz, |n| match mask {
+    // **Eine Seite mehr, und die unterste wird die WACHE.** Gemessen am 2026-08-10: der tiefste
+    // Kernelpfad (`SYS_LOAD` -> Ed25519 + SHA-2 im Kernel) benutzt 73 % dieses Stacks. Ohne Wache
+    // schriebe ein Ueberlauf still in den Nachbarn -- und der Pfad ist aus Ring 3 erreichbar,
+    // also ist das eine Privilegieneskalation und keine Diagnosefrage.
+    //
+    // **Eine Seite Aufschlag, nicht eine Stackgroesse.** Die erste Fassung forderte `sz + al` mit
+    // Ausrichtung `al` an, um den Stack ausgerichtet zu lassen -- 16 KiB Verschnitt je 16 KiB
+    // Stack, also 50 %. Der Stack braucht diese Ausrichtung nicht (die CPU verlangt fuer `rsp0`
+    // 16 Byte); die Wache dagegen muss seitenausgerichtet sein. Also: Seitenausrichtung, eine
+    // Seite Aufschlag, Wache ganz unten.
+    let _ = al;
+    let roh = benannt_alloc(MANGEL_KERNEL_STACK, USER_KSTACK_ALLOC, |n| match mask {
         // Ueber die Politik aus `mem_alloc`/`alloc_colored` (unten zuerst), nicht daran vorbei:
         // eine Vorgabe, an der eine einzige Stelle vorbeigreift, ist keine Vorgabe (E-Rest 3b).
         Some(m) => alloc_colored(n, al, m),
         None => mem_alloc(n, al),
     })?
     .base();
+    let wache = roh; // die unterste Seite des Blocks
+    let base = roh + caprock_mem::PAGE;
+    // **Fail-closed.** Der Vorrat aufgeteilter Bloecke ist fest (s. `mmu::guard_unmap`); reicht
+    // er nicht, wird die Anforderung BENANNT abgewiesen. Ein Stack ohne Wache waere die stille
+    // Fassung genau des Fehlers, gegen den die Wache gebaut ist.
+    if !hal::mmu::guard_unmap(wache) {
+        MEM.lock().free_region(PhysRegion::new(roh, sz + caprock_mem::PAGE));
+        mangel(MANGEL_GUARD_TABELLE, caprock_mem::PAGE);
+        return None;
+    }
     // C4: Wasserstandsmarke. **Hier und nicht spaeter** — `init_thread_frame` legt gleich den
     // Startframe an den Stack-Top; wer danach fuellt, ueberschreibt ihn, und der Thread spraenge
     // nach `MUSTER`.
@@ -120,7 +149,12 @@ fn claim_user_kstack_masked(mask: Option<caprock_mem::ColorMask>) -> Option<usiz
 }
 /// Einen (noch keinem Thread zugeordneten) Kstack wieder an `MEM` freigeben (Fehlerpfad vor `record`).
 fn release_user_kstack(base: usize) {
-    MEM.lock().free_region(PhysRegion::new(base as u64, USER_KSTACK_SIZE as u64));
+    // **Die Wache zuerst zurueck in die Karte** -- sonst gaebe der Allokator eine Seite heraus,
+    // die niemand mehr erreichen kann, und der naechste Zugriff darauf waere ein #PF an einer
+    // Adresse, die laut Freiliste in Ordnung ist.
+    let roh = base as u64 - caprock_mem::PAGE;
+    hal::mmu::guard_remap(roh);
+    MEM.lock().free_region(PhysRegion::new(roh, USER_KSTACK_SIZE as u64 + caprock_mem::PAGE));
     let mut p = KSTACKS.lock();
     p.live = p.live.saturating_sub(1);
 }
@@ -170,7 +204,18 @@ fn reclaim_user_kstack(thread_slot: usize) {
                 crate::kstackmark::Anlass::Tod(thread_slot),
             )
         };
-        MEM.lock().free_region(PhysRegion::new(base, USER_KSTACK_SIZE as u64));
+        // **Die Wache zurueck in die Karte, und den GANZEN Block freigeben** -- der Stack ist
+        // die obere Haelfte einer doppelt so grossen Anforderung (s. `claim_user_kstack_masked`).
+        //
+        // Hier stand zuerst nur `free_region(base, USER_KSTACK_SIZE)`. Das war die Fassung von
+        // vor der Guard-Page, und sie hat den Umbau ueberlebt: die untere Haelfte blieb belegt,
+        // die Wache blieb aus der Karte -- und der naechste Ring-3-Thread faultete auf seinem
+        // eigenen Stack. Sechs `el0-trap`-Zeilen, `ring3`/`iso`/`park` rot. **Wer eine
+        // Anforderung vergroessert, muss JEDEN Freigabepfad mitnehmen, nicht den erstbesten.**
+        let roh = base - caprock_mem::PAGE;
+        hal::mmu::guard_remap(roh);
+        MEM.lock()
+            .free_region(PhysRegion::new(roh, USER_KSTACK_SIZE as u64 + caprock_mem::PAGE));
     }
 }
 /// **C4: ueber alle NOCH LEBENDEN EL0-Kstacks fegen** und ihren Wasserstand einrechnen. Gibt
@@ -251,6 +296,27 @@ pub fn handler_fault_count() -> usize {
 // Nicht-Owners aus EL0 löst Save (alter Owner) + Restore (neuer) aus. EL1 ist
 // soft-float und berührt FP nie. Zähler `FP_SWITCHES` belegt, dass tatsächlich
 // gewechselt wurde.
+/// **Wer auf `core` zuletzt Ring-3-Kontext hatte -- SPERRFREI abfragbar** (fuer den `#DF`-Bericht).
+///
+/// Ein Double Fault darf **nichts sperren**: er kann genau den Kontext unterbrochen haben, der
+/// `SCHEDS`/`KSTACKS` haelt. Der Handler bliebe stehen, und heraus kaeme **kein Output** -- also
+/// exakt das Bild, gegen das die laute Meldung gebaut ist. Deshalb identifiziert der Bericht den
+/// betroffenen **Stack** (aus `TSS.rsp0`) und nicht den Thread.
+///
+/// Diese Zeile schliesst die Luecke: `FP_OWNER` ist ein `AtomicU64` und traegt die volle
+/// `ThreadId` des Kontexts, dessen FP-Zustand der Kern haelt -- ein sperrfreies Lesen. `None`
+/// heisst „kein Ring-3-Kontext auf diesem Kern", nicht „unbekannt": beide Faelle gehoeren im
+/// Bericht auseinander, sonst liest sich ein leerer Kern wie ein verlorener Thread.
+pub fn ring3_kontext_von_kern(core: usize) -> Option<u64> {
+    if core >= MAX_CORES {
+        return None;
+    }
+    match FP_OWNER[core].load(Ordering::Relaxed) {
+        FP_OWNER_NONE => None,
+        t => Some(t),
+    }
+}
+
 const FP_OWNER_NONE: u64 = u64::MAX;
 /// Raw-`ThreadId` des FP-Owners je Kern (nur der jeweilige Kern schreibt seinen
 /// Eintrag -> Atomics genügen, keine Sperre nötig).
@@ -3795,6 +3861,17 @@ pub const MANGEL_KERNEL_THREAD_STACK: u32 = 11;
 /// bei der gefaerbten Fassung). Der Topf, an dem die isolierte Kurve reisst -- 224 Prozesse bei
 /// 512 MiB, 3040 bei 6 GiB, und der Zusammenhang ist linear in der RAM-Groesse.
 pub const MANGEL_PRIVATREGION: u32 = 12;
+/// **Kein RAM, sondern eine aufgeteilte Seitentabelle fuer die Guard-Page** (2026-08-10).
+///
+/// Kernel-Stacks liegen oberhalb 16 MiB, wo die Identitaetskarte in 2-MiB-Bloecken steht; eine
+/// 4-KiB-Wache verlangt, den Block aufzuteilen, und der Vorrat solcher Tabellen ist in der HAL
+/// **fest** (sie hat keinen Allokator -- Kerngrenze). Reicht er nicht, wird die Stack-Anforderung
+/// abgewiesen statt unbewacht bedient: ein Stack ohne Wache waere die stille Fassung genau des
+/// Fehlers, gegen den die Wache gebaut ist.
+///
+/// Die gemeldete Menge ist eine SEITE und nicht der Stack -- der Speicher war da, die Wache
+/// nicht. Wer hier `USER_KSTACK_SIZE` meldete, schickte die Diagnose in Richtung RAM.
+pub const MANGEL_GUARD_TABELLE: u32 = 13;
 /// **Kein Mangel, sondern eine Marke fuer die Sprechprobe.** Keine Stelle des Kernels schreibt
 /// diesen Code; er wird ausschliesslich VOR einer absichtlich fehlschlagenden Anforderung gesetzt.
 /// Steht er hinterher noch da, hat der gepruefte Pfad **geschwiegen** — und das ist von „es lag
@@ -3881,6 +3958,11 @@ pub fn mangel_name(code: u32) -> &'static str {
         }
         MANGEL_KERNEL_THREAD_STACK => "Speicher fuer den Stack eines KERNEL-Threads (64 KiB)",
         MANGEL_PRIVATREGION => "Speicher fuer die private Region einer isolierten PD",
+        MANGEL_GUARD_TABELLE => {
+            "KEIN RAM -- eine aufgeteilte Seitentabelle fuer die Guard-Page. Der Vorrat in der HAL \
+             ist fest (sie hat keinen Allokator); ein Stack ohne Wache wird ABGEWIESEN statt \
+             unbewacht bedient"
+        }
         MANGEL_VERGIFTET => {
             "VERGIFTET -- der gepruefte Pfad hat GESCHWIEGEN. Kein Kernelpfad schreibt diesen \
              Code; er stand vor der Anforderung da und steht immer noch da"

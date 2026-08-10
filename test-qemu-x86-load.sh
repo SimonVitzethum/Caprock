@@ -394,6 +394,20 @@ check "ladepol : ALL PASS" \
 # Rotzeilen-Scanner.
 check "kstack  : ALL PASS" \
     "C4: die Stack-Wasserstandsmarke -- gemessen wird nicht, wie GROSS die Kernel-Stacks sind, sondern wieviel davon je BENUTZT wurde (Muster beim Anlegen, Abzaehlen beim Tod des Threads und am Ende des Laufs). Faellt die Fuellung aus, meldet die Messung die VOLLE Groesse als benutzt und die Zeile faellt durch"
+# Per-Kern-TSS + IST-Stacks. **Diese Suite ist auch hier die interessantere**: `SYS_LOAD`
+# verifiziert Ed25519 + SHA-2 IM KERNEL auf dem Stack des Aufrufers und ist damit der tiefste
+# Kernelpfad des Systems -- also genau der, dessen Ueberlauf ein #DF melden koennen muss. Positiv
+# geprueft und nicht bloss 'nicht rot': eine Zeile, die gar nicht kommt, faengt kein Rotzeilen-Scanner.
+check "ist     : ALL PASS" \
+    "Per-Kern-TSS + IST-Stacks fuer #DF/NMI/#MC: jeder Kern hat seine eigene TSS, und die IST-Wirkung ist an jedem Kern AUSGELOEST und zurueckgelesen. Der echte #DF-Nachweis liegt in tools/df-sonde.sh (ein Abort laesst sich nicht in einer gruenen Suite fahren)"
+check "#PF(14)=0" \
+    "#PF bekommt AUSDRUECKLICH KEINEN IST -- er muss wiedereintrittsfaehig bleiben; der Stackueberlauf wird ueber #DF gefangen"
+# **Die Antwort auf 'laufen Ring-3-Threads auf Sekundaerkernen?' gehoert in DIESE Suite.** Die
+# Hauptsuite kennt nur die Demo-Threads; hier laufen geladene PDs (Root-Task, zwei Treiber-PDs,
+# Dateisystem, WASM). Waere die Antwort hier 'ja', waere die frueher EINE gemeinsame TSS bereits
+# ein Riss gewesen und nicht bloss eine kuenftige Gefahr.
+check "ist     : Ring-3-Rueckkehr je Kern" \
+    "gezaehlt wird die GELEGENHEIT: je Kern steht im Protokoll, wie oft er eine Rueckkehr nach Ring 3 vorbereitet hat -- in JEDEM Lauf ablesbar, waehrend ein Melder fuer den Zusammenstoss in einem gesunden Lauf stumm waere"
 # Z15/W1. **Auf `ALL PASS` geprueft, nicht auf die Zeile** -- es gibt sie auch als SKIP.
 check "wasm    : ALL PASS" \
     "Z15/W1: eine WASM-Laufzeit als gewoehnliche PD -- Modul instanziiert, GERECHNETES Ergebnis, mutiertes Modul abgewiesen, Uebergriff auf den Linearspeicher als WASM-Trap ohne dass die PD faultet"

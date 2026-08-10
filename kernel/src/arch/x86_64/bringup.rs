@@ -741,7 +741,24 @@ const AP_STACK_BYTES: u64 = 64 * 1024;
 /// PIC-Stilllegung, Kerneltabellen — die stehen schon).
 extern "C" fn ap_entry() -> ! {
     hal::exception::init(); // IDT ist global, das IDTR-Register aber pro Kern
-    hal::gdt::init_ap();
+    // **Eigene TSS, eigene IST-Stacks — oder gar nicht laufen.** Ohne TSS hat dieser Kern kein
+    // `RSP0`; der erste Trap eines Ring-3-Threads auf ihm landete auf dem **User-Stack**, und das
+    // ist ein direkter Privilegienbruch. Ein Kern ohne Wache darf deshalb nicht in den Scheduler:
+    // `init_core()` würde ihn zum Idle-Thread machen und ihm damit Arbeit zuweisbar.
+    if !hal::gdt::init_ap() {
+        println!(
+            "smp     : Kern {} bekommt KEINE TSS (Kapazitaet {}) -- er wird angehalten statt \
+             ohne RSP0/IST zu laufen.",
+            hal::cpu::core_id(),
+            hal::gdt::kapazitaet()
+        );
+        hal::cpu::halt();
+    }
+    // **VOR `ap_report_online`**: der BSP druckt seinen Bericht erst, nachdem `cpu_on` den
+    // Online-Zaehler hat steigen sehen. Was hier vorher gemessen ist, kann er lesen; alles danach
+    // waere ein Rennen zwischen Messung und Bericht.
+    super::ist::stacks_fuellen();
+    super::ist::messen();
     hal::intc::init_cpu(); // eigener LAPIC
     hal::timer::init(TICK_HZ); // eigener Timer
     system::init_core(); // dieser Kontext wird der Idle-Thread dieses Kerns
@@ -1614,7 +1631,16 @@ fn ptab_urteil() -> (bool, bool, bool, bool) {
 #[cfg(feature = "selftest")]
 fn vorrat_urteil() -> bool {
     let (pd_calls, pd_scan, _, owner_fehlt) = system::pd_scan_bilanz();
-    pd_scan == 0 && pd_calls > 0 && owner_fehlt == 0
+    // **Die Wachen sind Teil des Urteils, mit Sprechprobe und Bilanz.**
+    //
+    // `gesetzt > 0` ist die Sprechprobe: null gesetzte Wachen hiesse „nie benutzt", und dann
+    // sagte die Zeile ueber die Wache nichts aus -- genau der leere Lauf, der in diesem Projekt
+    // kein Testergebnis ist. `abgewiesen == 0` ist die Bilanz: eine abgewiesene Wache bedeutet,
+    // dass ein Stack NICHT bewacht werden konnte, und die Anforderung wurde deshalb abgelehnt.
+    // In einem Lauf dieser Groesse darf das nicht vorkommen; kommt es vor, ist der feste Vorrat
+    // zu klein und das gehoert gesagt, nicht ueberlesen.
+    let (_, gd_total, gd_denied, _, _) = hal::mmu::guard_stats();
+    pd_scan == 0 && pd_calls > 0 && owner_fehlt == 0 && gd_total > 0 && gd_denied == 0
 }
 
 /// Ergebnis der EINMALIGEN Seitentabellen-Messung: Bit 63 = gemessen, Bit 0 = Urteil.
@@ -1664,7 +1690,7 @@ fn ptab_messen() -> bool {
 ///   nicht die Marke.
 /// * `menge` — die gemeldete Byte-Zahl ist die **angeforderte**. Das ist der Konjunkt gegen die
 ///   Falle vom Vormittag: `mangel(MANGEL_SEITENTABELLE, 4096)` stand als Literal da, wo der
-///   Allokator nie gefragt worden war. Verglichen wird gegen `USER_KSTACK_SIZE` — dieselbe
+///   Allokator nie gefragt worden war. Verglichen wird gegen `USER_KSTACK_ALLOC` — dieselbe
 ///   Konstante, die in den Allokator geht, nicht eine zweite Rechnung daneben.
 ///
 /// **Was diese Zeile NICHT belegt:** dass jede der rund zwanzig neuen Meldestellen die richtige
@@ -1715,7 +1741,7 @@ fn mangel_messen_inner() -> bool {
     *MANGEL_PROBE.lock() = (abgewiesen, code, bytes, farben);
     abgewiesen
         && code == system::MANGEL_KERNEL_STACK
-        && bytes == system::USER_KSTACK_SIZE as u64
+        && bytes == system::USER_KSTACK_ALLOC
 }
 
 /// **Z22 P2 + Z23 S1: zwei Threads in EINER PD — gemessen an der Wirkung.**
@@ -3663,6 +3689,13 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             // die Messung die volle Stackgroesse als benutzt. Ein Wasserzeichen, das immer „viel
             // Luft" sagt, ist damit strukturell ausgeschlossen und nicht bloss unwahrscheinlich.
             ("kstack", crate::kstackmark::urteil()),
+            // **Die Wache unter der Guard-Page** (2026-08-10). Gattert von Anfang an, und ihr
+            // Kriterium ist gegen die WIRKUNG formuliert: der Vektor wird ausgeloest, und die
+            // Frame-Adresse muss in der Region liegen, die fuer genau ihn gedacht ist. Ein
+            // IST-Eintrag, der nie benutzt wurde, ist von einem falsch aufgesetzten nicht zu
+            // unterscheiden -- eine Zeile, die nur die Konfiguration LIEST, waere deshalb genau
+            // die Sorte gruene Zeile, die nichts gattert.
+            ("ist", super::ist::urteil()),
             // **Seit dem 2026-08-09 gattert `fp` wirklich.** Vorher stand die Zeile bewusst
             // draussen, weil ihr Kriterium („alle 64 Abgaben") unerreichbar war und die Suite
             // dauerhaft rot gefaerbt haette. Mit einem erreichbaren Kriterium waere ein
@@ -3682,7 +3715,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 33;
+const DONE_FLAGS: usize = 34;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]
@@ -3755,6 +3788,12 @@ fn report_and_off(watchdog: bool) -> ! {
     // herausgibt), nicht als Differenz des freien RAM: eine Differenz misst Stacks, private
     // Regionen und Segmente mit.
     let (pt_raus, pt_zurueck, pt_gehalten, pt_peak) = system::seitentabellen_topf();
+    // **Der Wachen-Vorrat ist FEST** (die HAL hat keinen Allokator -- Kerngrenze), also gehoert
+    // sein Fuellstand hierher: ein fester Vorrat ohne Anzeige spricht erst, wenn er leer ist,
+    // und dann an einer Stelle, die mit der Ursache nichts zu tun hat. `gd_total > 0` ist
+    // zugleich die Sprechprobe -- null gesetzte Wachen hiesse „nie benutzt", und dann sagte die
+    // Zeile nichts ueber die Wache aus.
+    let (gd_live, gd_total, gd_denied, gd_blk, gd_blkcap) = hal::mmu::guard_stats();
     let pt_vspaces = system::used_vspaces();
     println!(
         "vorrat  : Fuellstaende -- PDs {pds_used}/{pds_cap} · Cap-Slots {peak_slots}/{cap_slots} \
@@ -3762,7 +3801,8 @@ fn report_and_off(watchdog: bool) -> ! {
          Notifications {nt_used}/{nt_cap} · Thread-Slots {thr_live}/{thr_cap} · freies RAM {} MiB \
          · Kernel-Stacks {kstack_mib} MiB ({} KiB je Thread) · Seitentabellen {pt_gehalten} \
          Rahmen = {} KiB (Hoechststand {pt_peak}; {pt_raus} raus / {pt_zurueck} zurueck; \
-         {pt_vspaces} belegte VSpaces, also {} Rahmen je VSpace)",
+         {pt_vspaces} belegte VSpaces, also {} Rahmen je VSpace) · Guard-Pages {gd_live} stehen / \
+         {gd_total} gesetzt / {gd_denied} abgewiesen, {gd_blk}/{gd_blkcap} aufgeteilte 2-MiB-Bloecke",
         system::total_free() >> 20,
         system::USER_KSTACK_SIZE >> 10,
         (pt_gehalten * 4096) >> 10,
@@ -3909,10 +3949,15 @@ fn report_and_off(watchdog: bool) -> ! {
         println!(
             "kstack  : Herkunft des Hoechststands -- sterbende Threads {} B ({} Messungen, \
              DIESE sieht das Gatter), lebende Threads {} B ({gefegt} Messungen, erst im Bericht) \
-             · Rekordhalter Thread-Slot {} (Programm {}). Auf x86 sind alle IDT-Tore \
-             INTERRUPT-Gates (Typ 0x8E): IF ist waehrend des Handlers 0, ein Timer-Tick kann also \
-             NICHT auf einem Syscall-Frame schachteln -- der Hoechststand ist eine AUFRUFKETTE, \
-             kein Stapel von Frames. Der tiefste bekannte Pfad ist SYS_LOAD: `load_by_index` \
+             · Rekordhalter Thread-Slot {} (Programm {}). Alle IDT-Tore sind INTERRUPT-Gates \
+             (Typ 0x8E), IF ist waehrend des Handlers 0 -- ein TIMER-Tick kann also nicht auf \
+             einem Syscall-Frame schachteln. **Das gilt aber nur fuer MASKIERBARE Interrupts: \
+             NMI und #MC fragen IF nicht.** Unter QEMU ohne Watchdog kommt keiner, deshalb misst \
+             diese Zahl eine reine AUFRUFKETTE; auf echter Hardware ist ein NMI Betriebsrealitaet, \
+             und dann muss die Reserve zusaetzlich einen NMI-Frame samt Handler tragen -- oder NMI \
+             bekommt seinen eigenen IST-Stack. Der Hoechststand hier ist also eine Aussage ueber \
+             das MESSUMFELD, nicht ueber die Maschine, auf der die Reserve gelten muss. \
+             Der tiefste bekannte Pfad ist SYS_LOAD: `load_by_index` \
              verifiziert eine Ed25519-Signatur und einen SHA-2-Hash IM KERNEL, also auf dem \
              16-KiB-Stack des aufrufenden EL0-Threads (groesste Rahmen des Abbilds: \
              vartime_double_scalar_mul_basepoint 3528 B, NafLookupTable::from 1928 B). \
@@ -3952,6 +3997,12 @@ fn report_and_off(watchdog: bool) -> ! {
             crate::kstackmark::MIND_MESSUNGEN,
         );
     }
+
+    // **Der Unterbau unter der Guard-Page**: per-Kern-TSS + IST-Stacks fuer #DF/NMI/#MC.
+    // Steht direkt hinter `kstack`, weil beide Zeilen dieselbe Gefahr behandeln -- die eine misst,
+    // wieviel Luft ein Kernel-Stack noch hat, die andere sorgt dafuer, dass sein Ueberlauf
+    // ueberhaupt jemand melden kann.
+    super::ist::bericht();
 
     let ticks = hal::timer::ticks(0);
     let mut all_tick = true;
@@ -4596,7 +4647,11 @@ pub fn run(multiboot_info: u64) -> ! {
     );
     println!("========================================");
     hal::exception::init(); // IDT: Faults ab hier diagnostizierbar
-    hal::gdt::init(); // GDT + TSS (Selektoren für Trap-/Ring-Wechsel)
+    hal::gdt::init(); // GDT + per-Kern-TSS (Selektoren für Trap-/Ring-Wechsel, IST-Stacks)
+    // **Sofort nach der TSS, vor allem anderen**: ab hier kann die CPU auf einen IST-Stack
+    // umschalten, und ein ungefüllter Stack macht den Wasserstand im `#DF`-Bericht wertlos.
+    super::ist::stacks_fuellen();
+    super::ist::haken_installieren();
     hal::mmu::init_primary(); // 4-Level-Paging, W^X, CR0.WP
     let (m, c, w) = hal::mmu::sctlr_flags();
     println!("mmu     : identity-map, paging={} caches={} CR0.WP={}", m as u8, c as u8, w as u8);
@@ -5456,6 +5511,11 @@ pub fn run(multiboot_info: u64) -> ! {
     }
     println!("smp     : {online} von {nc} Kern(en) online");
 
+    // **Die IST-Messung des BSP** — hier und nicht früher, weil `num_cores()` erst jetzt steht
+    // und die Zeile sonst gegen eine Kernzahl urteilte, die sich noch ändert. Die Sekundärkerne
+    // haben ihre Messung bereits in `ap_entry` abgelegt (vor ihrer Online-Meldung).
+    super::ist::messen();
+
     hal::mmu::seal_cache_granule(); // alle Kerne haben gemeldet (auf x86 wirkungslos)
 
     // Ab hier schedult der Timer-Interrupt präemptiv; dieser Kontext ist der Idle-Thread.
@@ -5493,6 +5553,15 @@ pub fn run(multiboot_info: u64) -> ! {
             // Timer-Interrupt, also ausserhalb dieses Fadens.
             spins += 1;
             let sekunden = hal::timer::ticks(0) / 100; // 100 Hz
+            // **Die #DF-Sonde** (nur mit `--features dfprobe`, eigener QEMU-Lauf). Hier und nicht
+            // frueher: erst wenn Ring-3-Threads gelaufen sind, traegt `TSS.rsp0` einen echten
+            // EL0-Kernel-Stack -- und nur dann kann der #DF-Bericht auch den WASSERSTAND DES
+            // BETROFFENEN STACKS zeigen. Vor dem ersten Ring-3-Wechsel waere `rsp0` null und die
+            // Sonde belegte die halbe Aussage.
+            #[cfg(feature = "dfprobe")]
+            if hal::timer::ticks(0) >= 200 {
+                super::ist::df_sonde_ausloesen();
+            }
             if sekunden > 60 || spins > 5_000_000_000 {
                 let mut w = [("", true); DONE_FLAGS];
                 let _ = all_done(archive, Some(&mut w));

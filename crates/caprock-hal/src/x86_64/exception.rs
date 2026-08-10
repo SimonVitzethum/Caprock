@@ -226,11 +226,12 @@ impl IdtEntry {
     };
 
     /// `dpl` = niedrigste Ring-Stufe, die diesen Vektor per `int n` auslösen darf.
-    fn gate(handler: u64, dpl: u8) -> IdtEntry {
+    /// `ist` = **einsbasierter** IST-Index (`0` = kein Stackwechsel, s. [`ist_fuer_vektor`]).
+    fn gate(handler: u64, dpl: u8, ist: u8) -> IdtEntry {
         IdtEntry {
             offset_low: handler as u16,
             selector: KERNEL_CS as u16,
-            ist: 0,
+            ist,
             // present(1) | dpl | 0 | Typ 0xE (64-bit Interrupt-Gate: löscht IF beim Eintritt)
             type_attr: 0x8E | (dpl << 5),
             offset_mid: (handler >> 16) as u16,
@@ -238,6 +239,58 @@ impl IdtEntry {
             zero: 0,
         }
     }
+}
+
+/// **Welcher Vektor bekommt einen eigenen Stack — und welcher ausdrücklich keinen.**
+///
+/// Die drei mit IST sind die, deren Handler laufen muss, **auch wenn der aktuelle Stack kaputt
+/// ist**:
+///
+/// * **`#DF` (8)** — die Wache gegen den Kernel-Stack-Überlauf. Eine Guard-Page macht aus dem
+///   Überlauf einen `#PF`; dessen Handler pusht auf denselben übergelaufenen Stack, und daraus
+///   wird der `#DF`. Ohne eigenen Stack pusht auch der dorthin -> **Triple Fault, keine Ausgabe**.
+/// * **`NMI` (2)** — kommt asynchron und ist nicht maskierbar. Er trifft jeden Stackzustand,
+///   auch den mitten in einem Stackwechsel.
+/// * **`#MC` (18)** — Machine Check, ebenfalls asynchron und ebenfalls nicht auf einen gesunden
+///   Stack angewiesen.
+///
+/// **Jeder von ihnen bekommt einen EIGENEN Stack, nicht einen gemeinsamen.** Teilten sich zwei
+/// Vektoren einen, wäre der eine im anderen nicht mehr diagnostizierbar: ein NMI, der einen
+/// laufenden `#DF`-Handler unterbricht, setzte den Stackzeiger zurück an den Anfang derselben
+/// Region und überschriebe dessen Frame — der `#DF` wäre danach spurlos.
+///
+/// # `#PF` (14) bekommt AUSDRÜCKLICH KEINEN IST — und das ist der wichtigste Eintrag hier
+///
+/// Ein IST-Gate lädt seinen Stackzeiger **bedingungslos**, also auch dann, wenn schon ein Handler
+/// desselben Vektors auf genau diesem Stack läuft. `#PF` ist aber **wiedereintrittsfähig zu
+/// sein gezwungen**: er ist der normale Betriebsfall (Demand Paging, EL0-Zugriffsfehler, jeder
+/// Isolationstest dieses Projekts löst ihn absichtlich aus), und ein zweiter `#PF` während der
+/// Behandlung des ersten ist ein alltäglicher Vorgang. Mit IST schriebe der zweite den Frame des
+/// ersten nieder, und der Rücksprung ginge ins Leere — aus einem behandelbaren Fault würde ein
+/// stiller Datenverlust.
+///
+/// Der **Stacküberlauf** wird deshalb nicht über `#PF` gefangen, sondern über `#DF`: genau dafür
+/// ist dessen IST da, und genau deshalb darf `#DF` niemals wiedereintrittsfähig sein müssen (er
+/// ist ein Abort — es gibt keine Rückkehr).
+const fn ist_fuer_vektor(v: u32) -> u8 {
+    match v {
+        // Die Gegenprobe (`kein-df-ist`) nimmt AUSSCHLIESSLICH dem `#DF` seinen Stack — sie
+        // isoliert damit genau eine Grösse. Eine Mutation, die zwei Dinge zugleich kaputtmacht,
+        // beweist nichts über das gemeinte.
+        #[cfg(not(feature = "kein-df-ist"))]
+        8 => super::gdt::IST_DF,
+        2 => super::gdt::IST_NMI,
+        18 => super::gdt::IST_MC,
+        _ => 0,
+    }
+}
+
+/// Der IST-Index, der im IDT-Gate von `vector` **wirklich steht** — zurückgelesen, nicht
+/// nachgerechnet. Für die `ist`-Prüfzeile des Kernels.
+pub fn idt_ist(vector: usize) -> u8 {
+    // SAFETY: reines Lesen eines statischen Tabelleneintrags; `IDT` wird nur in `init`
+    // beschrieben (vor der Interrupt-Freigabe).
+    unsafe { core::ptr::addr_of!((*core::ptr::addr_of!(IDT))[vector.min(255)].ist).read_volatile() }
 }
 
 static mut IDT: [IdtEntry; 256] = [IdtEntry::EMPTY; 256];
@@ -259,7 +312,7 @@ pub fn init() {
         for (v, entry) in idt.iter_mut().enumerate() {
             // Nur der Syscall-Vektor darf aus Ring 3 per `int` ausgelöst werden.
             let dpl = if v as u64 == SYSCALL_VECTOR { 3 } else { 0 };
-            *entry = IdtEntry::gate(table[v], dpl);
+            *entry = IdtEntry::gate(table[v], dpl, ist_fuer_vektor(v as u32));
         }
         let ptr = DescriptorTablePointer {
             limit: (core::mem::size_of_val(idt) - 1) as u16,
@@ -321,6 +374,105 @@ pub fn set_fp_hook(hook: FpHook) {
 }
 pub fn set_irq_hook(hook: IrqHook) {
     IRQ_HOOK.store(hook);
+}
+
+// ================================================================================================
+// #DF: DIE LAUTE MELDUNG (2026-08-10)
+// ================================================================================================
+
+/// **Wasserstand einer Stackregion** — wie viele Bytes am Fuss das Füllmuster NICHT mehr tragen.
+///
+/// Das Verfahren gehört dem Kernel (`kernel/src/kstackmark.rs`); die HAL darf es nicht kennen
+/// (Kerngrenze). Sie reicht deshalb nur die Region herüber und bekommt eine Zahl zurück.
+///
+/// **Fail-closed:** ist nichts installiert oder wurde nie gefüllt, kommt „voll benutzt" heraus —
+/// nicht „viel Luft". Ein Ausfall der Messung sieht damit aus wie der schlimmste Messwert.
+pub type WasserstandHook = fn(base: u64, len: u64) -> u64;
+
+static WASSERSTAND_HOOK: AtomicHook<WasserstandHook> = AtomicHook::new();
+
+pub fn set_wasserstand_hook(hook: WasserstandHook) {
+    WASSERSTAND_HOOK.store(hook);
+}
+
+/// **Wer auf diesem Kern zuletzt Ring-3-Kontext hatte** — SPERRFREI, fuer den `#DF`-Bericht.
+///
+/// Der Bericht identifiziert bisher den betroffenen **Stack** und nicht den **Thread**, weil
+/// Thread-Slot und -Id in `SCHEDS`/`KSTACKS` stehen und beide einen Spinlock brauchen. Ein `#DF`
+/// kann genau den Kontext unterbrochen haben, der ihn haelt: der Handler bliebe stehen, und
+/// heraus kaeme **kein Output** — also exakt das Bild, gegen das die laute Meldung gebaut ist.
+///
+/// Der Kernel hat die Angabe aber sperrfrei vorliegen (`FP_OWNER`, ein `AtomicU64`). Er reicht
+/// sie hier herein; die HAL kennt die Struktur dahinter nicht (Kerngrenze). `None` heisst
+/// **„kein Ring-3-Kontext auf diesem Kern"** und nicht „unbekannt" — die beiden gehoeren im
+/// Bericht auseinander, sonst liest sich ein leerer Kern wie ein verlorener Thread.
+pub type Ring3KontextHook = fn(core: usize) -> Option<u64>;
+
+static RING3_KONTEXT_HOOK: AtomicHook<Ring3KontextHook> = AtomicHook::new();
+
+pub fn set_ring3_kontext_hook(hook: Ring3KontextHook) {
+    RING3_KONTEXT_HOOK.store(hook);
+}
+
+/// Benutzte Tiefe einer Region, oder `None`, wenn niemand messen kann.
+fn wasserstand(base: u64, len: u64) -> Option<u64> {
+    WASSERSTAND_HOOK.load().map(|h| h(base, len))
+}
+
+/// **Die IST-Sonde** (nur `selftest`): welcher Stackzeiger kam bei einem IST-Vektor heraus?
+///
+/// Warum das überhaupt gemessen wird: ein IST-Eintrag, der **nie benutzt wurde**, ist von einem
+/// falsch aufgesetzten nicht zu unterscheiden. Ein Off-by-one im Gate-Index (`ist = 2` statt `1`)
+/// lädt einfach den Stack des Nachbarvektors — der Handler läuft, druckt, und alles sieht gesund
+/// aus, bis die beiden Vektoren einmal zusammentreffen.
+///
+/// Geprüft wird deshalb an der **Wirkung**: die Sonde löst `int 2` bzw. `int 18` aus und liest
+/// hinterher die Frame-Adresse zurück, die der Handler bekommen hat. Liegt sie in der Region, die
+/// für genau diesen Vektor gedacht ist, hat der Mechanismus gegriffen **und** der Index stimmt.
+///
+/// Für `#DF` (8) geht das **nicht** über `int 8`: bei einem Software-Interrupt schiebt die CPU
+/// keinen Fehlercode ein, der Stub für Vektor 8 erwartet aber einen (`ISR_ERR`) — das Frame-Layout
+/// wäre um 8 Byte verschoben. Der `#DF` wird deshalb in `tools/df-sonde.sh` **echt** ausgelöst.
+/// Der Zustand ist **je Kern**, nicht global: jeder Kern misst seine EIGENEN IST-Stacks. Eine
+/// gemeinsame Zelle hiesse, dass drei Kerne die Aussage eines vierten erben — dieselbe Form wie
+/// „eine Ablage je Rolle", die dieses Projekt schon zweimal bezahlt hat.
+#[cfg(feature = "selftest")]
+#[allow(clippy::declare_interior_mutable_const)]
+static IST_SONDE_ERWARTET: [AtomicU64; super::gdt::MAX_TSS_CORES] =
+    [const { AtomicU64::new(u64::MAX) }; super::gdt::MAX_TSS_CORES];
+#[cfg(feature = "selftest")]
+#[allow(clippy::declare_interior_mutable_const)]
+static IST_SONDE_RSP: [AtomicU64; super::gdt::MAX_TSS_CORES] =
+    [const { AtomicU64::new(0) }; super::gdt::MAX_TSS_CORES];
+
+/// Die Sonde des **aufrufenden** Kerns auf `vector` scharf stellen (nur 2 und 18, s. o.).
+#[cfg(feature = "selftest")]
+pub fn ist_sonde_armieren(vector: u64) -> bool {
+    if vector != 2 && vector != 18 {
+        return false;
+    }
+    let Some(c) = super::gdt::core_from_tr() else {
+        return false;
+    };
+    IST_SONDE_RSP[c].store(0, Ordering::Relaxed);
+    IST_SONDE_ERWARTET[c].store(vector, Ordering::Release);
+    true
+}
+
+/// Frame-Adresse, die der Handler beim letzten Sondenschuss von Kern `core` bekommen hat
+/// (`0` = kein Schuss).
+#[cfg(feature = "selftest")]
+pub fn ist_sonde_rsp(core: usize) -> u64 {
+    IST_SONDE_RSP.get(core).map_or(0, |c| c.load(Ordering::Acquire))
+}
+
+/// Steht die Sonde von Kern `core` noch scharf? (`true` heisst: der Schuss ist **nicht**
+/// angekommen — genau der Fall, den eine Sprechprobe von „gemessen" unterscheiden muss.)
+#[cfg(feature = "selftest")]
+pub fn ist_sonde_scharf(core: usize) -> bool {
+    IST_SONDE_ERWARTET
+        .get(core)
+        .is_none_or(|c| c.load(Ordering::Acquire) != u64::MAX)
 }
 
 // --- Frame-Zugriff (ABI) ----------------------------------------------------------------------
@@ -428,6 +580,39 @@ pub extern "C" fn handle_exception(frame: *mut TrapFrame) -> *mut TrapFrame {
         VECTOR_HITS[vector as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    // --- #DF: IMMER tödlich, und zwar VOR jeder anderen Verzweigung -----------------------------
+    //
+    // **Das ist eine Verhaltensänderung, und sie behebt einen Fehler.** Bis hierher lief ein `#DF`
+    // durch dieselbe Kette wie jeder andere Fault — und `frame_from_el0` entscheidet dort nach dem
+    // gesicherten `CS`. Bei genau dem Bild, gegen das die Guard-Page gebaut wird (ein Ring-3-Thread
+    // trappt, `RSP0` zeigt auf einen übergelaufenen Kernel-Stack, die Frame-Ablage faultet zweimal),
+    // trägt der gesicherte Frame **User-CS**. Der `#DF` wäre also im `FAULT_HOOK` gelandet, der
+    // Kernel hätte den User-Thread beendet und wäre weitergelaufen — auf einem Kernel-Stack, dessen
+    // Ende nachweislich überschrieben ist. Ein Abort, der als „unartiger User-Thread" verbucht wird,
+    // ist die schlechtestmögliche Form von „Schweigen als Erfolg".
+    //
+    // Ein `#DF` ist ein **Abort**: `RIP` im Frame ist nicht als Wiedereinstiegspunkt zugesichert,
+    // es gibt keine Rückkehr. Der einzige richtige Ausgang ist: laut reden, dann anhalten.
+    if vector == 8 {
+        df_fatal(frame);
+    }
+
+    // --- Die IST-Sonde (nur `selftest`) ---------------------------------------------------------
+    //
+    // Steht **hinter** dem `#DF`-Zweig, damit sie einen echten Double Fault unter keinen Umständen
+    // verschlucken kann, und sie nimmt ausschliesslich die beiden Vektoren, auf die sie armiert
+    // werden darf.
+    #[cfg(feature = "selftest")]
+    if vector == 2 || vector == 18 {
+        if let Some(c) = super::gdt::core_from_tr() {
+            if IST_SONDE_ERWARTET[c].load(Ordering::Acquire) == vector {
+                IST_SONDE_RSP[c].store(frame as u64, Ordering::Relaxed);
+                IST_SONDE_ERWARTET[c].store(u64::MAX, Ordering::Release);
+                return resume(frame);
+            }
+        }
+    }
+
     // --- Syscall (`int 0x80`) ---
     if vector == SYSCALL_VECTOR {
         return resume(match SYSCALL_HOOK.load() {
@@ -506,6 +691,144 @@ fn fatal(frame: *mut TrapFrame) -> ! {
     cpu::halt();
 }
 
+/// **Der Double Fault — die laute Meldung.**
+///
+/// Ein `#DF`, der nur „#DF" sagt, kostet denselben halben Tag wie ein leeres Protokoll: man weiss
+/// dann, dass etwas Schlimmes passiert ist, aber nicht **wo**. Gedruckt wird deshalb alles, was
+/// ohne eine einzige Sperre und ohne einen einzigen möglicherweise faultenden Zugriff erreichbar
+/// ist:
+///
+/// * **Kern** (aus `TR`, nicht aus `cpuid` — s. `gdt::core_from_tr`),
+/// * **`RIP`/`CS`/`RSP`/`RFLAGS`** des unterbrochenen Kontexts aus dem Frame; `CS & 3` sagt, ob
+///   der Überlauf einen Kernel- oder einen Ring-3-Kontext getroffen hat,
+/// * **`CR2`** — die Adresse, an der der *ursprüngliche* `#PF` scheiterte. Sie steht noch im
+///   Register und ist bei einem Stacküberlauf genau die Guard-Page,
+/// * **der IST-Stack, auf dem wir stehen** samt seinem eigenen Wasserstand: das ist zugleich der
+///   Beleg, dass der IST-Mechanismus überhaupt gegriffen hat,
+/// * **der betroffene EL0-Kernel-Stack** (aus `TSS.rsp0` dieses Kerns) samt Wasserstand.
+///
+/// **Warum hier keine Sperre genommen wird.** Der laufende Thread-Slot steht in `SCHEDS`/`KSTACKS`
+/// und wäre nur unter einem Spinlock lesbar. Ein `#DF` kann aber einen Kontext unterbrochen haben,
+/// der genau diese Sperre hält — der Handler bliebe darin stehen, und heraus käme **kein Output**,
+/// also exakt das Bild, gegen das diese Funktion gebaut ist. Der Thread wird deshalb über seinen
+/// **Stack** identifiziert (lock-frei aus `RSP0`) und nicht über seine Slot-Nummer. Die offene
+/// Lücke steht ausdrücklich in der Ausgabe.
+fn df_fatal(frame: *mut TrapFrame) -> ! {
+    // SAFETY: gültiger, vom Stub angelegter Frame.
+    let f = unsafe { &*frame };
+    let (error, rip, cs, rflags, rsp) = (f.error, f.rip, f.cs, f.rflags, f.rsp);
+    let cr2 = read_cr2();
+    let kern = super::gdt::core_from_tr();
+
+    console::emit_raw("\n[#DF] DOUBLE FAULT -- Abort, keine Rueckkehr moeglich.\n");
+    console::emit_fmt(format_args!(
+        "  kern={} (TR-Selektor {:#06x})\n  \
+         rip={:#018x} cs={:#06x} ({})\n  \
+         rsp={:#018x} rflags={:#010x} error={:#x}\n  \
+         cr2={:#018x}  <- hier scheiterte der URSPRUENGLICHE Fault\n",
+        match kern {
+            Some(c) => c as i64,
+            None => -1,
+        },
+        kern.map_or(0, super::gdt::tss_selector),
+        rip,
+        cs,
+        if cs & 3 == 3 { "Ring 3 unterbrochen" } else { "Ring 0 unterbrochen" },
+        rsp,
+        rflags,
+        error,
+        cr2,
+    ));
+
+    if let Some(c) = kern {
+        // (a) Der Stack, auf dem WIR stehen. `frame` liegt darin — das ist der Beleg, dass die
+        //     CPU auf den IST-Stack umgeschaltet hat und nicht auf dem kaputten weitergemacht hat.
+        let (ib, il) = super::gdt::ist_region(c, super::gdt::ISTF_DF);
+        let drin = (frame as u64) >= ib && (frame as u64) < ib + il;
+        console::emit_fmt(format_args!(
+            "  IST[#DF] = [{:#x},{:#x}) {} B · frame={:#x} liegt {}\n",
+            ib,
+            ib + il,
+            il,
+            frame as u64,
+            if drin { "DARIN (IST hat gegriffen)" } else { "NICHT darin -- IST-Aufbau falsch!" },
+        ));
+        match wasserstand(ib, il) {
+            Some(b) => console::emit_fmt(format_args!(
+                "  IST[#DF] Wasserstand: {} von {} B benutzt{}\n",
+                b,
+                il,
+                if b >= il { "  <- AUFGEBRAUCHT oder nie gefuellt" } else { "" },
+            )),
+            None => console::emit_raw("  IST[#DF] Wasserstand: kein Messhaken installiert\n"),
+        }
+
+        // (a2) **Wer**, soweit sperrfrei feststellbar. Steht vor dem Stack, weil ein Name die
+        //      erste Frage beantwortet, die jemand vor diesem Bericht hat.
+        match RING3_KONTEXT_HOOK.load().and_then(|h| h(c)) {
+            Some(t) => console::emit_fmt(format_args!(
+                "  letzter Ring-3-Kontext auf diesem Kern: Thread {t:#x} (sperrfrei aus dem \
+                 FP-Besitzregister -- ein #DF darf nichts sperren)\n"
+            )),
+            None => console::emit_raw(
+                "  letzter Ring-3-Kontext auf diesem Kern: KEINER (nicht: unbekannt)\n",
+            ),
+        }
+
+        // (b) Der Stack, der vermutlich uebergelaufen ist: der EL0-Kernel-Stack, den dieser Kern
+        //     zuletzt fuer Ring 3 scharf gemacht hat.
+        let rsp0 = super::gdt::tss_rsp0(c);
+        match super::gdt::kstack_basis_von_rsp0(rsp0) {
+            Some((kb, kl)) => {
+                console::emit_fmt(format_args!(
+                    "  betroffener EL1-Stack (aus TSS.rsp0={:#x}): [{:#x},{:#x}) {} B\n",
+                    rsp0,
+                    kb,
+                    kb + kl,
+                    kl,
+                ));
+                match wasserstand(kb, kl) {
+                    Some(b) => console::emit_fmt(format_args!(
+                        "  betroffener EL1-Stack Wasserstand: {} von {} B benutzt ({} B frei){}\n",
+                        b,
+                        kl,
+                        kl - b.min(kl),
+                        if b >= kl { "  <- UEBERGELAUFEN" } else { "" },
+                    )),
+                    None => console::emit_raw(
+                        "  betroffener EL1-Stack Wasserstand: kein Messhaken installiert\n",
+                    ),
+                }
+            }
+            None => console::emit_fmt(format_args!(
+                "  betroffener EL1-Stack: aus TSS.rsp0={rsp0:#x} nicht bestimmbar \
+                 (Kstack-Geometrie nicht gemeldet)\n"
+            )),
+        }
+    }
+    console::emit_raw(
+        "  thread-slot: nicht gedruckt -- er steht in SCHEDS/KSTACKS und braucht eine Sperre.\n  \
+         Ein Spinlock im #DF-Pfad kann genau die Stille erzeugen, gegen die diese Meldung gebaut\n  \
+         ist; identifiziert wird der Thread deshalb ueber SEINEN STACK (Zeile darueber).\n",
+    );
+    // **Der ENDSTAND, und er ist der Messwert, aus dem `IST_STACK_BYTES` hergeleitet ist.**
+    //
+    // Die Zeile weiter oben liest den Wasserstand MITTEN im Bericht — sie kann die Tiefe der
+    // danach folgenden `emit_fmt`-Aufrufe strukturell nicht kennen und wäre als Grundlage für die
+    // Stackgrösse also systematisch zu klein. Gemessen wird deshalb noch einmal ganz am Schluss,
+    // wenn der tiefste Rahmen dieses Pfads sicher gelaufen ist.
+    if let Some(c) = kern {
+        let (ib, il) = super::gdt::ist_region(c, super::gdt::ISTF_DF);
+        if let Some(b) = wasserstand(ib, il) {
+            console::emit_fmt(format_args!(
+                "  IST[#DF] ENDSTAND: {b} von {il} B benutzt -- DAS ist die Zahl, gegen die \
+                 IST_STACK_BYTES bemessen ist\n"
+            ));
+        }
+    }
+    cpu::halt();
+}
+
 /// `CR2` — bei einem #PF die fehlerhafte lineare Adresse (aarch64-`FAR`-Äquivalent).
 fn read_cr2() -> u64 {
     let v: u64;
@@ -517,6 +840,7 @@ fn read_cr2() -> u64 {
 fn vector_name(v: u64) -> &'static str {
     match v {
         0 => "#DE divide error",
+        2 => "NMI",
         3 => "#BP breakpoint",
         6 => "#UD invalid opcode",
         7 => "#NM device not available",
@@ -527,6 +851,7 @@ fn vector_name(v: u64) -> &'static str {
         14 => "#PF page fault",
         16 => "#MF x87 fp",
         17 => "#AC alignment check",
+        18 => "#MC machine check",
         19 => "#XM simd fp",
         _ => "(sonstiger Vektor)",
     }

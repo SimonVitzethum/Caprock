@@ -19,6 +19,8 @@ mod bootinfo;
 mod bringup;
 #[cfg(feature = "selftest")]
 mod dmar_selftest;
+/// Per-Kern-TSS + IST-Stacks (`#DF`/NMI/`#MC`) — Füllung, Messhaken, Prüfzeile `ist`.
+pub mod ist;
 mod multiboot;
 
 global_asm!(

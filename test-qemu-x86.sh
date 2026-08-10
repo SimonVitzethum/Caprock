@@ -503,6 +503,24 @@ check "state   : ALL PASS" "A-4.3: Zustandsuebergabe ueber eine Region mit VERSI
 # Sammelbericht aus wie eine bestandene.
 check "kstack  : ALL PASS" "C4: die Stack-Wasserstandsmarke -- gemessen wird nicht, wie GROSS die Kernel-Stacks sind (das sagt 'vorrat'), sondern wieviel davon je BENUTZT wurde. Der Stack wird beim Anlegen mit einem Muster gefuellt und beim Tod des Threads bzw. am Ende des Laufs von unten abgezaehlt; faellt die Fuellung aus, meldet die Messung die VOLLE Groesse als benutzt und die Zeile faellt durch -- ein Wasserzeichen, das immer 'viel Luft' sagt, ist damit strukturell ausgeschlossen"
 check "kstack  : Eichung 0b1111" "C4: das Messgeraet selbst trennt -- ungefuelltes Feld meldet 0, gefuelltes die volle Laenge, ein bis zu BEKANNTER Tiefe beruehrtes genau diese Tiefe. Ohne den dritten Punkt bestuende die Zeile auch eine Funktion, die nur zwei Zahlen kennt"
+# ------------------------------------------------------------------------------------------------
+# Per-Kern-TSS + IST-Stacks: der Unterbau unter der Guard-Page
+# ------------------------------------------------------------------------------------------------
+#
+# **Warum die Zeile ueberhaupt gebraucht wird.** Eine Guard-Page unter dem Kernel-Stack macht aus
+# einem Ueberlauf einen #PF; dessen Handler pusht auf denselben kaputten Stack -> #DF. Ohne
+# IST-Stack pusht auch der dorthin -> Triple Fault OHNE JEDE AUSGABE, also genau das
+# `KEIN OUTPUT`-Bild. Die Guard-Page allein macht das Bild schlechter, nicht besser.
+#
+# Geprueft wird die WIRKUNG: jeder Kern loest `int 2` und `int 18` aus und liest zurueck, auf
+# welchem Stack der Handler stand. Ein IST-Eintrag, der nie benutzt wurde, ist von einem falsch
+# aufgesetzten nicht zu unterscheiden -- der Gate-Index ist EINSBASIERT, und ein Off-by-one laedt
+# lautlos den Stack des Nachbarvektors.
+check "ist     : ALL PASS" "Per-Kern-TSS + IST-Stacks: jeder Kern hat seine EIGENE TSS (RSP0 und die IST-Zeiger sind kernlokal -- eine gemeinsame TSS gaebe dem Trap des einen Kerns den Kernel-Stack eines Threads vom anderen). Gemessen wird die WIRKUNG: int 2 und int 18 werden ausgeloest und die Frame-Adresse zurueckgelesen; sie MUSS in der Region liegen, die fuer genau diesen Vektor gedacht ist"
+check "#PF(14)=0" "#PF bekommt AUSDRUECKLICH KEINEN IST -- ein IST-Gate laedt bedingungslos und machte den #PF-Handler damit nicht-wiedereintrittsfaehig; ein zweiter #PF waehrend der Behandlung des ersten ist hier aber der Normalfall (Isolationstests). Der Stackueberlauf wird ueber #DF gefangen, dafuer ist dessen IST da"
+check "#DF(8)=1 NMI(2)=2 #MC(18)=3" "die drei IST-Gate-Indizes stehen ZURUECKGELESEN aus der IDT im Protokoll -- je Vektor ein EIGENER Stack, denn teilten sich zwei einen, waere der eine im anderen nicht mehr diagnostizierbar"
+check "TR-unbekannt=0 ohne-TSS=0" "fail-closed: kein Kern hat RSP0 gesetzt, ohne seine eigene TSS bestimmen zu koennen, und keiner wurde ohne TSS in den Scheduler gelassen (ein Kern ohne RSP0 liesse den ersten Trap eines Ring-3-Threads auf dem USER-Stack landen)"
+check "ist     : Ring-3-Rueckkehr je Kern" "die GELEGENHEIT wird gezaehlt, nicht das Unglueck: je Kern steht im Protokoll, wie oft er eine Rueckkehr nach Ring 3 vorbereitet hat. Steht bei einem Sekundaerkern etwas anderes als 0, waere EINE gemeinsame TSS bereits heute ein Riss -- ein Melder, der erst beim Zusammenstoss spricht, waere in jedem gesunden Lauf stumm"
 check "stripe  : ALL PASS" "B-4.2: erschoepfte Farbpartitionierung scheitert SAUBER -- der 5. Streifenversuch wird abgewiesen, statt den Satz der ersten PD still ein zweites Mal auszugeben; nach Freigabe wieder vergebbar (kein Leck)"
 # B-4.5 (Prime+Probe): die WIRKUNG der Faerbung, nicht nur die Zuteilung.
 #

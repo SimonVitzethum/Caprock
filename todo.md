@@ -3369,6 +3369,32 @@ Zeitmessung nicht (D10).
       64-KiB-Kernel-Thread-Stack (der wird am Muster erkannt, und ohne Muster fällt er aus der
       Erkennung — für die EL0-Klasse gilt das nicht, dort wird der Kstack direkt gemessen).
 
+- [x] **Der UNTERBAU unter der Guard-Page steht (2026-08-10, x86): per-Kern-TSS + IST-Stacks.**
+      Ohne ihn machte die Guard-Page das Bild *schlechter*: sie verwandelt den Überlauf in einen
+      `#PF`, dessen Handler auf denselben kaputten Stack pusht -> `#DF` -> ohne eigenen Stack
+      **Triple Fault ohne jede Ausgabe**. Gebaut: jeder Kern hat eine eigene TSS und drei eigene
+      IST-Stacks (`#DF`/`NMI`/`#MC`, je 4 KiB); `#PF` bekommt ausdrücklich **keinen** (mit IST wäre
+      er nicht mehr wiedereintrittsfähig). Belegt als `ist : ALL PASS` in beiden Suiten (die
+      Vektoren werden ausgelöst und die Frame-Adresse zurückgelesen) und durch `tools/df-sonde.sh`
+      — ein **echter** `#DF`, mit Gegenprobe ohne IST (dann stumm). `IST_STACK_BYTES` ist gemessen:
+      **816 von 4096 B**. Details in `crates/caprock-hal/src/x86_64/gdt.rs`.
+
+- [ ] **OFFEN, aus derselben Arbeit: der `#DF`-Bericht kann den Thread-SLOT nicht nennen.**
+      Er steht in `SCHEDS`/`KSTACKS`, und beide brauchen einen Spinlock. Ein `#DF` kann aber genau
+      den Kontext unterbrochen haben, der die Sperre hält — der Handler bliebe stehen und heraus
+      käme **kein Output**, also exakt das Bild, gegen das die Meldung gebaut ist. Identifiziert
+      wird deshalb der **Stack** (lock-frei aus `TSS.rsp0`), nicht der Thread. Behebbar mit einer
+      lock-freien Auskunft über den laufenden Thread je Kern — `FP_OWNER[core]` (`system.rs`) ist
+      bereits ein `AtomicU64` mit genau dieser Information und hat nur keinen öffentlichen Leser.
+      **Eine Zeile in `system.rs`, und der Slot steht in der Meldung.**
+
+- [ ] **OFFEN: `MAX_TSS_CORES = 16` ist eine statische Grenze.** Die TSS und ihre IST-Stacks müssen
+      stehen, bevor es einen Allokator gibt (`gdt::init()` läuft vor `mmu::init_primary`). Ein Kern
+      darüber wird **abgewiesen und angehalten** (fail-closed, `ohne-TSS`-Zähler im Bericht) statt
+      ohne `RSP0` zu laufen — auf einer Maschine mit mehr als 16 Kernen kostet das also Kerne, nicht
+      Sicherheit. Behebbar, indem die APs ihre IST-Stacks vom Allokator bekommen (nur der BSP
+      braucht statische).
+
 ### C7. Die Kapazitätskurve — wo es WIRKLICH bricht (gemessen 2026-08-10)
 
 **Klasse:** Messung · **Stand:** **zwei der drei fehlenden Zeilen stehen (2026-08-10,

@@ -20,6 +20,11 @@ authors.workspace = true
 # enthaelt keinen Testcode. `caprock-kernel/selftest` schaltet ihn mit ein, damit beide Suiten
 # genau eine Konfiguration bauen (zwei Suiten, die dasselbe verschieden aufsetzen, sind ein Riss).
 selftest = []
+# **Die Gegenprobe zur #DF-Sonde** (x86, 2026-08-10): nimmt dem #DF-Gate seinen IST-Eintrag.
+# Ohne eigenen Stack pusht der #DF-Handler auf denselben kaputten Stack -> Triple Fault ohne jede
+# Ausgabe. Genau dieser Lauf belegt, dass die laute Meldung im Positivfall AM IST-STACK haengt.
+# Nur zusammen mit `caprock-kernel/dfprobe` sinnvoll; nie in `default`.
+kein-df-ist = []
 
 [dependencies]
 # Treiberlogik liegt bewusst AUSSERHALB der HAL (todo A-5.1) -- diese Crate haengt an nichts.

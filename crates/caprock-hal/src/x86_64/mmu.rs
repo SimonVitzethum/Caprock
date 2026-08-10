@@ -570,6 +570,11 @@ fn is_static_table(phys: u64) -> bool {
         || in_range(core::ptr::addr_of!(PT) as u64, FINE_BLOCKS)
         || in_range(core::ptr::addr_of!(ISO_PD_HIGH) as u64, LOW_GIB - 1)
         || in_range(core::ptr::addr_of!(HIGH_DEV_PD) as u64, HIGH_DEV_SLOTS)
+        // **Die Wachen-Tabellen gehoeren dazu, und die Modul-Doku sagt warum:** wer eine neue
+        // statische Tabelle einfuehrt und sie hier vergisst, gibt dem Allokator Kernel-Speicher
+        // als freies RAM zurueck -- lautlos. Genau der Satz, der hier schon stand, bevor es
+        // `GUARD_PT` gab.
+        || in_range(core::ptr::addr_of!(GUARD_PT) as u64, GUARD_BLOCKS)
 }
 
 /// **Rechte einer einzelnen 4-KiB-Seite ändern** (nur im fein abgebildeten Bereich < 16 MiB).
@@ -595,6 +600,191 @@ pub fn protect_page(pa: u64, perm: Perm) -> bool {
         pt[block].0[idx] = pa | perm_bits(perm);
     }
     flush_va_global(pa);
+    true
+}
+
+// ==============================================================================================
+// GUARD-PAGES AM KERNEL-STACK -- und warum dafuer ein 2-MiB-Block AUFGETEILT werden muss
+// ==============================================================================================
+//
+// Am 2026-08-10 gemessen: der tiefste Kernelpfad (`SYS_LOAD` -> Ed25519 + SHA-2 **im Kernel**)
+// benutzt **73 %** des 16-KiB-EL1-Stacks eines EL0-Threads. Reserve: 4376 Byte. Ohne Wache
+// schreibt ein Ueberlauf **still** in den Nachbarn -- und weil der Pfad aus Ring 3 erreichbar
+// ist, ist das keine Diagnosefrage, sondern eine **Privilegieneskalation**.
+//
+// Die Wache ist eine **nicht abgebildete** Seite unterhalb des Stacks. Sie muss in der
+// **Identitaetskarte** fehlen, denn genau ueber die greift der Kernel auf seinen Stack zu.
+//
+// **Die Vorarbeit, die es dafuer braucht:** Kernel-Stacks kommen aus `mem_alloc`, dessen Freiliste
+// bei 16 MiB beginnt -- also **oberhalb** des mit 4-KiB-Seiten abgebildeten Bereichs
+// ([`FINE_BLOCKS`], die ersten 16 MiB). Dort steht die Karte in **2-MiB-Bloecken** (`PS`), und
+// `protect_page` weist Adressen darueber ausdruecklich ab. Eine 4-KiB-Luecke verlangt also, den
+// Block in eine Seitentabelle **aufzuteilen**: 512 Eintraege mit denselben Rechten schreiben, den
+// PD-Eintrag auf die Tabelle zeigen lassen, TLB werfen. Danach ist derselbe Block 4-KiB-granular,
+// und jede weitere Wache darin kostet nur noch einen Eintrag.
+//
+// **Der Vorrat ist FEST, und das ist eine benannte Grenze, keine Ueberraschung.** Die HAL hat
+// keinen Allokator (Kerngrenze), die Tabellen sind statisch. [`GUARD_PT`] traegt
+// [`GUARD_BLOCKS`] aufgeteilte Bloecke; reicht er nicht, gibt [`guard_unmap`] `false` zurueck und
+// der Aufrufer weist die Stack-Anforderung **benannt** ab. Fail-closed: ein Stack ohne Wache
+// waere die stille Fassung des Fehlers, gegen den diese Funktion gebaut ist.
+//
+// Was das NICHT deckt, steht als offener Punkt im Register: bei 10 000 Threads reichen die
+// Bloecke nicht, weil die Stacks ueber den ganzen Speicher streuen. Die strukturelle Antwort
+// waere eine **Stack-Arena** -- ein zusammenhaengender Bereich, dessen Bloecke einmal aufgeteilt
+// werden. Das ist ein Umbau der Stack-Zuteilung und nicht dieser Patch.
+
+/// Wie viele 2-MiB-Bloecke fuer Wachen aufgeteilt werden koennen.
+///
+/// **16 ist keine runde Zahl, sondern eine hergeleitete:** ein 16-KiB-Stack mit Wache belegt
+/// 20 KiB, in einen 2-MiB-Block passen also gut 100 davon. 16 Bloecke tragen damit rund
+/// **1600 bewachte Stacks** -- deutlich mehr als die 16 Threads eines Suitenlaufs und mehr als
+/// die 224..1477 einer isolierten Kapazitaetskurve, aber **weniger als 10 000**. Genau deshalb
+/// steht der Fuellstand im Bericht: ein fester Vorrat ohne Anzeige spricht erst, wenn er leer
+/// ist, und dann an einer Stelle, die mit der Ursache nichts zu tun hat.
+const GUARD_BLOCKS: usize = 16;
+
+static mut GUARD_PT: [Table; GUARD_BLOCKS] = [const { Table::EMPTY }; GUARD_BLOCKS];
+
+/// Welchen 2-MiB-Block der Platz `k` traegt (`usize::MAX` = frei).
+static GUARD_BLOCK_OF: [AtomicUsize; GUARD_BLOCKS] =
+    [const { AtomicUsize::new(usize::MAX) }; GUARD_BLOCKS];
+
+/// Wie viele Wachen zurzeit stehen (Bericht/Bilanz).
+static GUARDS_LIVE: AtomicUsize = AtomicUsize::new(0);
+/// Wie viele Wachen insgesamt gesetzt wurden (Sprechprobe: 0 heisst „nie benutzt").
+static GUARDS_TOTAL: AtomicUsize = AtomicUsize::new(0);
+/// Wie oft eine Wache **nicht** gesetzt werden konnte (Vorrat erschoepft).
+static GUARDS_DENIED: AtomicUsize = AtomicUsize::new(0);
+
+/// `(stehende Wachen, insgesamt gesetzte, abgewiesene, belegte Bloecke, Blockvorrat)`.
+pub fn guard_stats() -> (usize, usize, usize, usize, usize) {
+    let belegt = GUARD_BLOCK_OF
+        .iter()
+        .filter(|b| b.load(Ordering::Relaxed) != usize::MAX)
+        .count();
+    (
+        GUARDS_LIVE.load(Ordering::Relaxed),
+        GUARDS_TOTAL.load(Ordering::Relaxed),
+        GUARDS_DENIED.load(Ordering::Relaxed),
+        belegt,
+        GUARD_BLOCKS,
+    )
+}
+
+/// Den 2-MiB-Block von `pa` 4-KiB-granular machen; gibt den Platz in [`GUARD_PT`] zurueck.
+///
+/// Ist der Block schon aufgeteilt, wird sein Platz wiederverwendet -- der zweite Stack in
+/// demselben Block kostet keine zweite Tabelle.
+fn guard_block(pa: u64) -> Option<usize> {
+    let blk = (pa / TWO_MIB) as usize;
+    // Unterhalb von `FINE_BLOCKS` ist die Karte ohnehin fein -- dort gehoert kein Stack hin, und
+    // eine Aufteilung waere ein Doppelbild derselben Seiten.
+    if blk < FINE_BLOCKS || pa >= LOW_MAPPED_END {
+        return None;
+    }
+    if let Some(k) = GUARD_BLOCK_OF
+        .iter()
+        .position(|b| b.load(Ordering::Relaxed) == blk)
+    {
+        return Some(k);
+    }
+    let k = GUARD_BLOCK_OF
+        .iter()
+        .position(|b| b.load(Ordering::Relaxed) == usize::MAX)?;
+    let basis = (blk as u64) * TWO_MIB;
+    // SAFETY: `GUARD_PT` ist eine statische Tabelle dieses Kernels, der Platz `k` ist eben als
+    // frei ermittelt und wird nur hier belegt.
+    //
+    // **Die Rechte werden aus dem vorhandenen Eintrag GELESEN, nicht hingeschrieben.** Die erste
+    // Fassung setzte fest `P | RW | NX` -- und nahm damit jedem aufgeteilten Block sein `US`.
+    // Oberhalb `USER_RAM_MIN` traegt die Identitaetskarte `US` (SAS-Modell, ADR 0002: Stacks und
+    // Daten der Ring-3-Threads liegen darin), und ohne das Bit faultet ein Ring-3-Thread auf
+    // seinem EIGENEN Stack. Gemessen: sechs `el0-trap`-Zeilen, `ring3`/`iso`/`park` rot.
+    // Eine Aufteilung darf die Sicht nicht aendern, nur ihre Koernung -- also ist der alte
+    // Eintrag die Quelle und nicht eine zweite Meinung darueber, was dort stehen sollte.
+    unsafe {
+        let pd = &mut *core::ptr::addr_of_mut!(PD);
+        let gib = blk / 512;
+        let idx = blk % 512;
+        let alt = pd[gib].0[idx];
+        if alt & P == 0 || alt & PS == 0 {
+            return None; // nicht abgebildet oder schon aufgeteilt -- beides ist hier ein Fehler
+        }
+        // `PS` faellt weg (auf Blattebene bedeutet dasselbe Bit PAT), die Adresse kommt aus dem
+        // Index; alles andere bleibt, wie es war.
+        let rechte = alt & (P | RW | US | PWT | PCD | NX);
+        let pt = &mut *core::ptr::addr_of_mut!(GUARD_PT);
+        for (i, e) in pt[k].0.iter_mut().enumerate() {
+            *e = (basis + (i as u64) * PAGE) | rechte;
+        }
+        // **Erst die Tabelle fuellen, dann den Verweis setzen** -- in der anderen Reihenfolge
+        // saehe ein anderer Kern fuer einen Augenblick eine halb gefuellte Tabelle.
+        // **`US` gehoert an die ZWISCHENEBENE.** Auf x86 ist die effektive Berechtigung die
+        // UND-Verknuepfung ueber alle vier Ebenen: bisher WAR dieser Eintrag das Blatt und trug
+        // sein `US` selbst; jetzt ist er ein Verweis, und ohne `US` verweigert die CPU jeden
+        // Ring-3-Zugriff auf den ganzen 2-MiB-Block -- unabhaengig davon, was im Blatt steht.
+        // Gemessen, weil ich es zuerst weggelassen habe: fuenf `el0-trap`-Zeilen, Ring-3-Threads
+        // faulteten auf ihrem eigenen Stack, `ring3`/`iso`/`park` rot. Die Warnung stand
+        // woertlich zwanzig Zeilen ueber `init_primary` -- und ich habe sie beim Schreiben der
+        // Aufteilung nicht mitgelesen. Entschieden wird weiterhin am Blatt (dort steht `US` nur
+        // fuer User-Seiten), also aendert das die Sicht nicht, sondern erhaelt sie.
+        pd[gib].0[idx] = (core::ptr::addr_of!(pt[k]) as u64) | P | RW | US; // kein PS mehr
+    }
+    GUARD_BLOCK_OF[k].store(blk, Ordering::Relaxed);
+    flush_all();
+    Some(k)
+}
+
+/// **Eine Wache setzen**: die 4-KiB-Seite bei `pa` aus der Identitaetskarte nehmen.
+///
+/// `false` heisst „konnte nicht" -- der Aufrufer muss die Anforderung dann **abweisen**. Ein
+/// stillschweigend unbewachter Stack waere genau der Zustand, den diese Funktion verhindern soll.
+pub fn guard_unmap(pa: u64) -> bool {
+    if pa % PAGE != 0 {
+        return false;
+    }
+    let Some(k) = guard_block(pa) else {
+        GUARDS_DENIED.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    let idx = ((pa % TWO_MIB) / PAGE) as usize;
+    // SAFETY: Tabelle und Index sind eben ermittelt; ein 64-bit-Store, danach TLB-Wurf.
+    unsafe {
+        let pt = &mut *core::ptr::addr_of_mut!(GUARD_PT);
+        pt[k].0[idx] = 0; // nicht present -> jeder Zugriff faultet
+    }
+    flush_va_global(pa);
+    GUARDS_LIVE.fetch_add(1, Ordering::Relaxed);
+    GUARDS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Eine Wache wieder aufheben (beim Freigeben des Stacks -- sonst gaebe der Allokator eine
+/// Seite zurueck, die niemand mehr erreichen kann).
+pub fn guard_remap(pa: u64) -> bool {
+    if pa % PAGE != 0 {
+        return false;
+    }
+    let blk = (pa / TWO_MIB) as usize;
+    let Some(k) = GUARD_BLOCK_OF
+        .iter()
+        .position(|b| b.load(Ordering::Relaxed) == blk)
+    else {
+        return false;
+    };
+    let idx = ((pa % TWO_MIB) / PAGE) as usize;
+    // SAFETY: wie oben. **Die Rechte kommen aus einem NACHBAREINTRAG derselben Tabelle**, nicht
+    // aus einer Konstante -- aus demselben Grund wie beim Aufteilen: was dort steht, ist die
+    // Quelle. Ein Nachbar existiert immer, denn eine Wache belegt nie die ganze Tabelle.
+    unsafe {
+        let pt = &mut *core::ptr::addr_of_mut!(GUARD_PT);
+        let nachbar = if idx + 1 < 512 { idx + 1 } else { idx - 1 };
+        let rechte = pt[k].0[nachbar] & (P | RW | US | PWT | PCD | NX);
+        pt[k].0[idx] = pa | rechte;
+    }
+    flush_va_global(pa);
+    GUARDS_LIVE.fetch_sub(1, Ordering::Relaxed);
     true
 }
 

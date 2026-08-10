@@ -50,6 +50,20 @@ kernel-fuzz = []
 # `system_off` eine Endlos-Epochenschleife (Dauerbetrieb EINER Instanz). NUR Harness/Testcode; der
 # Kernel-Kern bleibt byte-identisch zum Release. Mit `soak,kernel-fuzz` kombinierbar.
 soak = []
+# **Die #DF-Sonde** (2026-08-10, x86): loest beim Hochlauf einen ECHTEN Double Fault aus, indem sie
+# den Stackzeiger auf eine nicht abgebildete Adresse setzt und pusht. Der Kernel HAELT danach an --
+# das ist der Sinn, ein #DF ist ein Abort.
+#
+# **Bewusst NICHT in `selftest`**: der regulaere Lauf soll gruen enden, und ein Kernel, der sich
+# absichtlich zerlegt, tut das nicht. Ohne den Nachweis waere die IST-Arbeit aber eine Behauptung --
+# ein IST-Eintrag, der nie benutzt wurde, ist von einem falsch aufgesetzten nicht zu unterscheiden.
+# Gefahren wird sie von `tools/df-sonde.sh` in einem eigenen QEMU-Aufruf; dieselbe Datei faehrt die
+# Gegenprobe `dfprobe,dfprobe-kein-ist`.
+dfprobe = []
+# **Die Gegenprobe zur #DF-Sonde**: nimmt dem #DF-Gate seinen IST-Eintrag. Damit MUSS derselbe Lauf
+# in einen Triple Fault ohne jede Ausgabe laufen -- und genau das belegt, dass die Meldung im
+# Positivfall am IST-Stack haengt und nicht daran, dass ein #DF ohnehin irgendwie spricht.
+dfprobe-kein-ist = ["caprock-hal/kein-df-ist"]
 
 # Der Kernel-Kern + die aarch64-HAL: derzeit aarch64-spezifisch. Auf dem x86_64-Branch (Stufe 0:
 # nur Boot+Serial) werden sie NICHT kompiliert; Stufe fuer Stufe werden die arch-agnostischen Crates

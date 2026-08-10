@@ -7586,6 +7586,25 @@ pub fn unpark_thread(tid: ThreadId) -> bool {
 
 /// Ist dieser Thread blockiert, **gleich aus welchem Grund**? Die Größe, an der sich zeigt, ob
 /// `unpark` eine fremde Blockade aufgehoben hat — `is_parked` kann das nicht sagen.
+/// **Den Scheduler nach einem Thread fragen** (2026-08-10) — die einzige Auskunft über eine PD,
+/// die **keinen** Cap-Pfad benutzt.
+///
+/// Gibt `(existiert, zugelassen, Grund-Bits)`. Eine PD, deren Signal nicht ankommt, lässt zwei
+/// grundverschiedene Lagen zu: *läuft nie an* (Lader/Scheduler) gegen *läuft, und das Signal
+/// versandet* (Cap-Pfad). Jede Meldung über eine Cap kann diese Frage nicht beantworten — sie
+/// benutzt genau den Pfad, der in Frage steht.
+pub fn thread_lage(tid: ThreadId) -> (bool, bool, u8) {
+    match with_owner(tid, |s, _| {
+        Some((
+            s.admitted_of(tid).unwrap_or(false),
+            s.reasons_of(tid).map(|r| r.bits()).unwrap_or(0),
+        ))
+    }) {
+        Some(((adm, bits), _)) => (true, adm, bits),
+        None => (false, false, 0),
+    }
+}
+
 pub fn is_blocked(tid: ThreadId) -> bool {
     with_owner(tid, |s, _| Some(s.is_blocked(tid)))
         .map(|(b, _)| b)

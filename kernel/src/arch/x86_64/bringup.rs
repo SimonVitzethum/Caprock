@@ -2771,6 +2771,18 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             print!(" · Programm {pid}=#{id}");
         }
         println!(" (zwei gleiche Zahlen = EIN Objekt fuer zwei Rollen -- dann sind alle Badges an derselben Stelle)");
+        // **Das Thread-Register als Ganzes.** Ohne es ist „Programm 6 hat keinen Thread" nicht von
+        // „die Registrierung laeuft ueberhaupt nicht" zu unterscheiden -- eine leere Tabelle sieht
+        // aus wie ein leerer Befund. Sprechprobe des Registers gegen sich selbst.
+        let (n_reg, verloren_reg) = crate::loader::program_thread_stats();
+        print!("clientn : Thread-Register: {n_reg} Eintrag/Eintraege, {verloren_reg} verloren ·");
+        for pid in 1..=8u32 {
+            if let Some(t) = crate::loader::thread_of_program(pid) {
+                let (ex, adm, g) = system::thread_lage(t);
+                print!(" P{pid}=tid{:#x}(da={ex} zul={adm} gr={g:#04b})", t.to_raw());
+            }
+        }
+        println!(" (leer BEI geladenen Programmen hiesse: die Registrierung selbst laeuft nicht)");
     }
     println!(
         "clientn : {clients} Client-PD(s) mit EIGENER Ablage, {ntfn_verloren} verloren (muss 0 \
@@ -3102,21 +3114,55 @@ fn report_and_off(watchdog: bool) -> ! {
     // die vom Root-Task delegierte Cap in Slot 0 ist eine reine Signal-Cap, und `ccopy` kann
     // Rechte nicht verstaerken.
     let w_ntfn = crate::loader::client_notification_of(TEST_WASM_PROGRAM_ID);
-    let b = w_ntfn.map(system::notification_pending).unwrap_or(0);
+    // **`wb`, nicht `b`.** Bis zum 2026-08-10 hiess diese Variable `b` -- und ueberdeckte damit
+    // `let b = root_badge()`, das dreissig Zeilen weiter unten von der `root`-Zeile gelesen wird.
+    // Seit `a159b6b` druckte die Root-Zeile also das Badge der CLIENT-Notification. Daraus wurde
+    // ein „Root-Task lief: false" (obwohl `pdcolor`/`ladepol` belegen, dass er lief und lud), ein
+    // vermeintlicher Kippunkt im Bisect und eine Hypothese ueber Cap-Fehlbindungen -- alles aus
+    // einer verdeckten Variablen. Ein Name, der zweimal vorkommt, ist teurer als ein langer.
+    let wb = w_ntfn.map(system::notification_pending).unwrap_or(0);
     let (w_inst, w_wert, w_mut, w_trap) = (
-        b & WASM_INST != 0,
-        b & WASM_RESULT != 0,
-        b & WASM_REJECT != 0,
-        b & WASM_TRAP != 0,
+        wb & WASM_INST != 0,
+        wb & WASM_RESULT != 0,
+        wb & WASM_REJECT != 0,
+        wb & WASM_TRAP != 0,
     );
-    let (w_lebt, w_ccopy) = (b & WASM_LEBT != 0, b & WASM_CCOPY != 0);
+    let (w_lebt, w_ccopy) = (wb & WASM_LEBT != 0, wb & WASM_CCOPY != 0);
+    // **Den SCHEDULER fragen, nicht eine Cap.** `SIGNAL` ist selbst eine Cap-Invokation -- die
+    // frühere Formulierung „ohne jede Cap-Operation" war schlicht falsch, gemeint war „ohne
+    // `ccopy`". Die Unterscheidung ist genau die, um die es geht, und sie erledigt sich nicht
+    // durch eine Sonde, die über eine Cap meldet.
+    //
+    // Diese Auskunft benutzt **keinen** Cap-Pfad: existiert der Thread, ist er zugelassen, worin
+    // blockiert er? Damit zerfällt „lebt nicht" in seine zwei Hälften -- *läuft nie an* gegen
+    // *läuft, und das Signal versandet*.
+    // **Drei Lagen, nicht zwei.** „Kein Registereintrag" und „Eintrag da, Thread nicht mehr
+    // aufloesbar" sind verschiedene Aussagen -- die erste heisst „nie geladen", die zweite „lief
+    // und ist gestorben". Sie in einen Wert zu werfen waere genau der Fehler, den dieser Bericht
+    // heute dreimal gefunden hat.
+    let w_reg = crate::loader::thread_of_program(TEST_WASM_PROGRAM_ID);
+    let (w_thread, w_adm, w_gruende) = match w_reg {
+        Some(t) => system::thread_lage(t),
+        None => (false, false, 0),
+    };
     println!(
         "wasm    : endowt={} lebt={w_lebt} ccopy-geht={w_ccopy} | instanziiert={w_inst} \
          Ergebnis-stimmt={w_wert} Mutation-abgewiesen={w_mut} Uebergriff-getrappt={w_trap}. \
          **`lebt` braucht keine Cap-Operation** (SIGNAL auf die eigene Manifest-Cap) und steht vor \
-         allem anderen -- damit sind „die PD lief nicht\", „ccopy schlaegt fehl\" und „die Engine \
-         kommt nicht durch\" drei unterscheidbare Lagen statt eines Schweigens",
+         allem anderen. **`SIGNAL` ist aber selbst eine Cap-Invokation** -- „lebt\" trennt also \
+         `ccopy` ab, nicht den Cap-Pfad. Die cap-freie Auskunft steht in der Zeile darunter",
         w_ntfn.is_some()
+    );
+    println!(
+        "wasm    : Scheduler-Auskunft (OHNE Cap-Pfad): Thread existiert={w_thread} \
+         im-Register={} zugelassen={w_adm} Grund-Bits={w_gruende:#06b} (1=IPC 2=BUDGET 4=PAUSE 8=PARK, 0=lauffaehig). \
+         **Das ist die Trennung**: existiert er nicht oder ist er nicht zugelassen, ist es ein \
+         Lader-/Scheduler-Problem; laeuft er und sein Signal kommt trotzdem nicht an, ist es der \
+         Cap-Pfad. Eine Meldung UEBER eine Cap kann diese Frage nicht beantworten -- sie benutzt \
+         genau den Pfad, der in Frage steht. Register leer = **nie geladen**; Register besetzt und \
+         Thread weg = **lief und ist gestorben** -- zwei Aussagen, ein Wert waere hier derselbe \
+         Fehler, den dieser Bericht heute schon dreimal gefunden hat",
+        w_reg.is_some()
     );
     if w_ntfn.is_none() {
         println!(
@@ -3135,10 +3181,16 @@ fn report_and_off(watchdog: bool) -> ! {
             if w_inst && w_wert && w_mut && w_trap { "ALL PASS" } else { "FAILURES" }
         );
     }
+    // **Der Name sagt jetzt, was gemessen wird.** „Root-Task lief" war falsch: gemessen wird die
+    // ANKUNFT eines Badges, nicht Leben. Dass Root laeuft und laedt, belegen `pdcolor` und
+    // `ladepol` unabhaengig -- und trotzdem hat diese Zeile unter ihrem alten Namen eine ganze
+    // Fehlspur getragen. Vierte Instanz derselben Form an einem Tag: ein Pruefer, der etwas
+    // anderes misst, als er behauptet.
+    let rb = root_badge();
     println!(
-        "root    : Notification-Badge {b:#x} (Root-Task lief: {}; er selbst hat 'hello' nachgeladen: {})",
-        b & ROOT_BADGE != 0,
-        b & HELLO_BADGE == HELLO_BADGE
+        "root    : Notification-Badge {rb:#x} (root-Badge angekommen: {}; hello-Badge angekommen: {})",
+        rb & ROOT_BADGE != 0,
+        rb & HELLO_BADGE == HELLO_BADGE
     );
     println!(
         "root    : {} (A-2.1: ein extern gebautes, aus dem signierten Manifest ausgewaehltes Programm laeuft -- und laedt seinerseits ueber SEINE Loader-Cap ein weiteres)",

@@ -1342,41 +1342,52 @@ Die Aufteilung, die daraus folgt:
       Zeile war syntaktisch gültig. Gefunden hat es erst eine Prüfung jeder geänderten Zeile auf
       „Here-String steht am Ende der grep-Invocation".
 
-- [~] **`wasm`: die Zeile sagt jetzt, WELCHE Lage vorliegt — die Ursache ist NICHT gefunden.**
-      (2026-08-10) Vier Fehlerbilder waren in dasselbe Schweigen kollabiert; drei davon sind
-      seither getrennt, und der Rest ist eingegrenzt:
+- [x] **`wasm`: ENTSCHIEDEN — und beide Hypothesen sind widerlegt, meine wie die älteste offene.**
+      (2026-08-10)
 
-      **Was die Sonde jetzt sagt** (`endowt=true lebt=false ccopy-geht=false | instanziiert=false …`):
-      * `lebt` — ein `SIGNAL` auf die **eigene Manifest-Cap**, **ohne jede Cap-Operation**, als
-        allererste Anweisung. Es kommt **nicht** an. Damit sind „ccopy schlägt fehl" und „die
-        Engine kommt nicht durch" als Erklärung **ausgeschlossen** — beide lägen dahinter.
-      * Die PD **faultet auch nicht**: alle drei `el0-trap`-Zeilen stammen von Threads, die
-        **kein Ladepfad erzeugt hat** (die kernel-eigenen Sonden). Dafür nennt die Fault-Zeile
-        seit heute das **Programm** statt nur eine Thread-Nummer.
+      **Die Antwort:** `loader  : SYS_LOAD fehlgeschlagen -- Index 5, program_id 6, Grund
+      NoResources`. `wasmhost` wird **nie geladen**. Es gibt keine PD, keinen Thread, keine Cap —
+      und damit nichts, was eine Domänen-Politik beim Installieren degradieren könnte.
 
-      **Der Befund, der grösser ist als der Eintrag: es trifft auch den ROOT-Task.**
-      `root : Notification-Badge 0x0 (Root-Task lief: false)` — und zwar **seit `a159b6b`**
-      (`94a92ea` meldete `true`). Aus den bereits vorhandenen Bisect-Protokollen abgelesen, ohne
-      einen einzigen zusätzlichen Lauf. **Treiber**-Badges kommen dabei an (`drv`/`blkdev` sind
-      grün), Badges aus **geladenen** PDs nicht. Das ist eine gemeinsame Ursache und keine
-      wasm-Eigenheit.
-      Isoliert gemessen: `wasmhost` aus dem Archiv zu nehmen macht `drv`/`blkdev`/`part` grün,
-      **nicht** aber das Root-Badge. Der Commit hat also **zwei** Wirkungen, und nur eine ist
-      behoben.
+      **Widerlegt 1 (die Spur aus W1, seit Wochen offen): die Domänen-Policy in
+      `install_cap_checked`.** Sie sagte für das gemessene Muster genau das Richtige voraus
+      (TrustedSas meldet sich, UserLand nicht) — und ist trotzdem falsch. `a159b6b` fasst den
+      Cap-Code gar nicht an (gemessen an der Dateiliste), und der Thread existiert nie. **Ein
+      Muster, das zu einer Hypothese passt, ist kein Beleg für sie** — es ist der Anlass, sie zu
+      prüfen. Die Spur gehört aus der Offen-Liste.
 
-      **Drei Prüfer waren dabei selbst kaputt** — alle drei von derselben Form:
-      1. `wasm` schloss von **Schweigen auf Abwesenheit** (`kein Bit gesetzt -> SKIP`). Jetzt wird
-         Abwesenheit an der **Endowment-Tabelle** entschieden; beide Richtungen gemessen
-         (`endowt=false` → SKIP, `endowt=true` → Urteil).
-      2. `root` druckt `Root-Task lief: false` und darunter `ALL PASS` — es **urteilt unabhängig
-         von der Zahl, die es gerade gedruckt hat**. Dritte Instanz des `pdbind`-Fehlers.
-      3. Das abgelegte Fehlerprotokoll war das des **letzten** Boots (ein Negativfall), nicht des
-         Hauptlaufs. Ich habe daraus zweimal eine Diagnose gelesen, die die Frage gar nicht
-         stellte. Die Suite legt jetzt **beide** ab.
+      **Widerlegt 2 (meine, vom selben Tag): „der Root-Task schweigt seit `a159b6b`".** Er hat nie
+      geschwiegen. `a159b6b` schob ein `let b = client_notification()…` **zwischen**
+      `let b = root_badge()` und die `root`-Zeile — seither druckte sie das Badge der
+      **Client**-Notification. Daraus wurde ein „Root-Task lief: false" (während `pdcolor` und
+      `ladepol` das Gegenteil belegten), ein vermeintlicher Kippunkt im Bisect und eine Hypothese
+      über Cap-Fehlbindungen. Nach dem Aufheben der Verdeckung: `0x748454c4f`, `root-Badge
+      angekommen: true`, `hello-Badge angekommen: true`.
+      **Und das Badge trug die Antwort die ganze Zeit**: `init` setzt bei einem Ladefehler Bit
+      `i+1`, für Index 5 also `0x40` — es steht in `0x748454c4f`. Die Diagnose lag einen
+      Variablennamen entfernt.
 
-      **`wasm` gattert bewusst nicht** und steht mit Datum und Diagnose in `BEKANNT_ROT`. Mit dem
-      erreichbaren Kriterium liefe sonst **jeder** Lade-Suite-Lauf in den Watchdog — dieselbe
-      Abwägung wie bei `fp` bis zum 2026-08-09: erst die Ursache, dann das Gatter.
+      **Was den Fall entschieden hat, war die cap-freie Auskunft.** `SIGNAL` **ist** eine
+      Cap-Invokation — die Formulierung „ohne jede Cap-Operation" war falsch und hätte den Cap-Pfad
+      fälschlich entlastet. Wirklich cap-frei ist nur der **Scheduler**: existiert der Thread, ist
+      er zugelassen, worin blockiert er? Antwort: er existiert nicht, und das Thread-Register hat
+      5 Einträge statt 6. Das trennt „läuft nie an" von „läuft, und das Signal versandet" in einem
+      Blick — und es hat drei geplante Sonden-Umbauten erspart.
+
+      **Vier Prüfer waren an diesem einen Fall beteiligt und alle vier waren kaputt:**
+      1. `wasm` schloss von Schweigen auf Abwesenheit → entscheidet jetzt an der Endowment-Tabelle.
+      2. `root` las die falsche Variable **und** hiess falsch → `root-Badge angekommen`, eigenes
+         Badge. „Lief" hat es nie gemessen.
+      3. Das abgelegte Fehlerprotokoll war das des letzten (Negativfall-)Boots → der **Hauptboot**
+         wird jetzt eigens abgelegt.
+      4. `SYS_LOAD` verlor den Grund im `.ok()` → er wird **genannt** (`Grund NoResources`).
+
+- [ ] **Was übrig bleibt: `NoResources` beim Laden von `wasmhost`.** Zu klären ist, **welche**
+      Ressource — 2 MiB BSS-Arena auf einer 512-MiB-Maschine, PD-/TCB-Slot oder ASID. Der Grund
+      ist jetzt benannt, aber `NoResources` ist selbst noch ein Sammelbegriff: dieselbe Sorte
+      Unschärfe eine Ebene tiefer. Erste Messung: dieselbe Suite mit `-m 3G`, dann sagt die
+      Speichergrösse allein, ob es RAM war.
+
 
 - [ ] **Als Nächstes, und es ist EINE Frage für beide.** Was gemessen ist, grenzt sie schon ein:
 

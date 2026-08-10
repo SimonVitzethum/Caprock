@@ -651,6 +651,22 @@ pub fn program_of_thread(tid: ThreadId) -> Option<u32> {
         .map(|(pid, _)| pid.load(Ordering::Relaxed))
 }
 
+/// **Der Thread dieses Programms** — die Gegenrichtung zu [`program_of_thread`].
+///
+/// Damit ist ein Programm direkt befragbar: existiert sein Thread, ist er zugelassen, worin
+/// blockiert er? Das sind Fragen an den **Scheduler**, nicht an eine Cap — und damit die einzigen,
+/// die etwas über eine PD sagen, deren Cap-Pfad selbst in Frage steht.
+pub fn thread_of_program(program_id: u32) -> Option<ThreadId> {
+    PROG_TIDS
+        .iter()
+        .zip(PROG_TID_RAW.iter())
+        .find(|(p, _)| p.load(Ordering::Relaxed) == program_id)
+        .and_then(|(_, raw)| {
+            let v = raw.load(Ordering::Relaxed);
+            (v != 0).then(|| ThreadId::from_raw(v - 1))
+        })
+}
+
 /// Wie viele Zuordnungen bekannt sind und wie viele verlorengingen.
 pub fn program_thread_stats() -> (usize, u64) {
     (
@@ -1706,7 +1722,21 @@ pub fn load_by_index(index: u32, caller_pd: usize, endow: &[(usize, CapPtr)]) ->
             set_driver_service(DriverService { ep, ntfn, pd: hpd, tid, index, program_id: prog.program_id });
             return Some(hpd);
         }
-        load_image(&prog, endow, arg).ok().map(|(_, pd)| pd)
+        // **Der GRUND eines Fehlschlags wird genannt** (2026-08-10). Bis dahin ging er hier mit
+        // `.ok()` verloren: `SYS_LOAD` gab dem Aufrufer `ERR_BADCAP`, `init` setzte ein Bit, und
+        // was wirklich schiefging (Hash? Zertifikat? Ressourcen? Politik?) stand nirgends. Genau
+        // die Form, die dieses Projekt beim Manifest-Format gerade erst behoben hat -- abgewiesen
+        // wird richtig, gesagt wird nichts.
+        match load_image(&prog, endow, arg) {
+            Ok((_, pd)) => Some(pd),
+            Err(e) => {
+                println!(
+                    "loader  : SYS_LOAD fehlgeschlagen -- Index {index}, program_id {}, Grund {:?}",
+                    prog.program_id, e
+                );
+                None
+            }
+        }
     };
     // Verdichten — mit dem ersten echten Cap als Füllwert, weil `CapPtr` bewusst keinen
     // öffentlichen Konstruktor hat (ein fabrizierbarer Cap-Handle wäre eine Einladung). Ohne einen

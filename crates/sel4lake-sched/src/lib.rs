@@ -990,6 +990,20 @@ impl Scheduler {
         self.resolve(tid).is_some_and(|s| self.tcbs[s].park_wake)
     }
 
+    /// **Die Grund-Menge dieses Threads, roh** (Z24) — für Diagnose, nicht für Entscheidungen.
+    ///
+    /// `None` heisst „auf DIESEM Kern nicht auflösbar" (tot oder migriert) und ist damit von
+    /// „läuft, ohne Grund" (`Some(leer)`) unterscheidbar. Genau diese Unterscheidung fehlt einem
+    /// `bool`, und sie ist die Frage, wenn eine PD schweigt: **gibt es den Thread überhaupt?**
+    pub fn reasons_of(&self, tid: ThreadId) -> Option<BlockReasons> {
+        self.resolve(tid).map(|s| self.tcbs[s].reasons)
+    }
+
+    /// Wurde dieser Thread **zugelassen** (D0)? `None` = nicht auflösbar.
+    pub fn admitted_of(&self, tid: ThreadId) -> Option<bool> {
+        self.resolve(tid).map(|s| self.tcbs[s].admitted)
+    }
+
     /// Ist dieser Thread blockiert — **gleich aus welchem Grund**? (Nur Telemetrie/Prüfung.)
     ///
     /// Genau die Größe, die der D9-Nachweis braucht: ob `unpark` einen Thread aus seiner Blockade

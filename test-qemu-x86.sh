@@ -502,6 +502,16 @@ check "state   : ALL PASS" "A-4.3: Zustandsuebergabe ueber eine Region mit VERSI
 # Genau das ist der Fall, wenn jemand die Messung aushaengt, und eine fehlende Zeile sieht im
 # Sammelbericht aus wie eine bestandene.
 check "kstack  : ALL PASS" "C4: die Stack-Wasserstandsmarke -- gemessen wird nicht, wie GROSS die Kernel-Stacks sind (das sagt 'vorrat'), sondern wieviel davon je BENUTZT wurde. Der Stack wird beim Anlegen mit einem Muster gefuellt und beim Tod des Threads bzw. am Ende des Laufs von unten abgezaehlt; faellt die Fuellung aus, meldet die Messung die VOLLE Groesse als benutzt und die Zeile faellt durch -- ein Wasserzeichen, das immer 'viel Luft' sagt, ist damit strukturell ausgeschlossen"
+# C7: der Mangel-Sweep. **Positiv gelesen und nicht bloss 'nicht rot'** -- eine Zeile, die gar
+# nicht kommt, faengt kein Rotzeilen-Scanner. `LADEN=0` ist hier die RICHTIGE Antwort: diese Suite
+# hat bauartbedingt kein Boot-Archiv, der Ladepfad ist also nicht fahrbar. Geprueft wird, dass die
+# Zeile das SAGT, statt zu schweigen -- die vier Ladepfad-Meldestellen misst die Lade-Suite.
+check "sweep   : ALL PASS" \
+    "C7: jede provozierbare Meldestelle hat einmal gesprochen -- provoziert ueber system::sperre_scharf(k) (der Allokator sagt nein, den Weg danach geht der echte Code), geschwiegen=0 an der GENERATION gemessen, und die gemeldete Menge kam aus dem AUFRUF"
+check "LADEN=0 (KEIN Boot-Archiv" \
+    "C7: der Ladepfad wird als NICHT FAHRBAR benannt statt uebersprungen -- 'kam nicht vor' und 'bestanden' sind zwei verschiedene Aussagen, und die Lade-Suite ist die, die ihn faehrt"
+check "sweep   : Bilanz .* VSpaces=0 · PD-Slots=0 · Thread-Slots=0 · Seitentabellen-Rahmen=0" \
+    "C7: nach dem Sweep bleibt nichts liegen -- vier exakt nachgezaehlte Groessen, nicht die Zusage einer Aufraeumroutine"
 check "kstack  : Eichung 0b1111" "C4: das Messgeraet selbst trennt -- ungefuelltes Feld meldet 0, gefuelltes die volle Laenge, ein bis zu BEKANNTER Tiefe beruehrtes genau diese Tiefe. Ohne den dritten Punkt bestuende die Zeile auch eine Funktion, die nur zwei Zahlen kennt"
 # ------------------------------------------------------------------------------------------------
 # Per-Kern-TSS + IST-Stacks: der Unterbau unter der Guard-Page

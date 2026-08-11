@@ -394,6 +394,31 @@ check "ladepol : ALL PASS" \
 # Rotzeilen-Scanner.
 check "kstack  : ALL PASS" \
     "C4: die Stack-Wasserstandsmarke -- gemessen wird nicht, wie GROSS die Kernel-Stacks sind, sondern wieviel davon je BENUTZT wurde (Muster beim Anlegen, Abzaehlen beim Tod des Threads und am Ende des Laufs). Faellt die Fuellung aus, meldet die Messung die VOLLE Groesse als benutzt und die Zeile faellt durch"
+# ------------------------------------------------------------------------------------------------
+# C7: der MANGEL-SWEEP auf dem LADEPFAD -- und warum er ausgerechnet hier geprueft wird
+# ------------------------------------------------------------------------------------------------
+#
+# Der Sweep provoziert jede Meldestelle einmal: `system::sperre_scharf(k)` laesst `k`
+# Speicheranforderungen durch und weist ab der `k+1`-ten jede ab. Zehn der 32 Meldestellen lagen
+# bis zum 2026-08-11 ungemessen im LADEPFAD, mit der Begruendung "braucht ein Boot-Archiv, das die
+# Hauptsuite bauartbedingt nicht hat". **Diese Suite HAT das Archiv** -- und der Ladepfad ist
+# derjenige, auf dem `NoResources` sechs Wochen lang stumm war und an dem `wasmhost` gestorben ist.
+# Wer nach Erreichbarkeit priorisiert statt nach Vorgeschichte, hat die Diagnosewerkzeuge am Ende
+# genau dort nicht, wo der letzte Fall lag.
+#
+# Drei Pruefungen, und sie sind verschieden:
+#   1. das Urteil (gattert ohnehin ueber `all_done`, wird hier aber POSITIV gelesen -- eine Zeile,
+#      die gar nicht kommt, faengt kein Rotzeilen-Scanner),
+#   2. dass der Ladepfad in DIESEM Lauf wirklich gefahren ist (`LADEN=n` mit n > 0). Ohne diese
+#      Zeile waere ein Sweep, der den Ladepfad ueberspringt, von einem, der ihn faehrt, nicht zu
+#      unterscheiden -- und die Hauptsuite meldet zu Recht `LADEN=0`,
+#   3. dass er nichts liegen laesst. Ein halb abgebauter Ladevorgang faelschte jede Zeile nach ihm.
+check "sweep   : ALL PASS" \
+    "C7: jede provozierbare Meldestelle hat einmal gesprochen -- geschwiegen=0 (an der GENERATION gemessen, nicht an der Marke), 'keiner' trotz Abweisung=0, und die gemeldete Menge kam aus dem AUFRUF und nicht aus einem Literal daneben"
+check "LADEN=[1-9][0-9]* (Boot-Archiv da" \
+    "C7: der ECHTE Ladepfad (system::load_into_pd_mit, dieselbe Funktion die SYS_LOAD ruft) wurde provoziert -- Segmentspeicher, Seitentabelle eines Segments, User-Stack und Seitentabelle des Stacks haben einzeln gesprochen. Die Hauptsuite meldet hier 0, und das ist dort die richtige Antwort: sie hat kein Boot-Archiv"
+check "sweep   : Bilanz .* VSpaces=0 · PD-Slots=0 · Thread-Slots=0 · Seitentabellen-Rahmen=0" \
+    "C7: nach dem Sweep bleibt nichts liegen -- vier exakt nachgezaehlte Groessen, nicht die Zusage einer Aufraeumroutine"
 # Per-Kern-TSS + IST-Stacks. **Diese Suite ist auch hier die interessantere**: `SYS_LOAD`
 # verifiziert Ed25519 + SHA-2 IM KERNEL auf dem Stack des Aufrufers und ist damit der tiefste
 # Kernelpfad des Systems -- also genau der, dessen Ueberlauf ein #DF melden koennen muss. Positiv
@@ -664,9 +689,38 @@ grep -q "^bootckpt: ALL PASS" <<<"$OUT4" \
 # Die Pruefsumme rechnet hier `zlib.crc32` und im Kernel `checkpoint::crc32`. Zwei
 # Implementierungen in zwei Sprachen, dieselbe Zahl -- dieselbe Form wie `tools/checkfat.py`:
 # ein Schreiber, der sein eigenes Ergebnis bestaetigt, bestaetigt nichts.
+#
+# ================================================================================================
+# D14: WARUM HIER EIN SHA-256 STEHT UND NICHT `d[16] != 0`  (gemessen 2026-08-11)
+# ================================================================================================
+#
+# Bis heute lautete die Nachpruefung „der Sektor ist unveraendert":
+#
+#     d[0:8] == b'SL4KCKPT' and d[16] != 0x00
+#
+# `d[16]` ist nach `crates/caprock-cap/src/checkpoint.rs` (OFF_BODY = 16) das **erste Byte des
+# KERNEL-HASHES**, und der Negativfall darueber kippt genau dieses Byte mit `^= 0xFF`. Damit hing
+# das Urteil an einer Groesse, die mit dem Schreiben des Sektors nichts zu tun hat: **am Hash des
+# gerade gebauten Kernels.**
+#
+# Zwei Richtungen, beide durchgerechnet (`d[16]` gegen alle 256 moeglichen Hash-Bytes):
+#   * **Falsch-Alarm:** ist `kernel_code_hash[0] == 0xFF`, ergibt das Kippen `0x00` -- die Zeile
+#     meldet „ueberschrieben", obwohl NICHTS geschrieben wurde. 1 von 256 Bauten.
+#   * **Blinder Fleck:** ueberschreibt der Kernel wirklich (er schreibt dann SEINEN Hash hin),
+#     meldet die Zeile in **255 von 256** Faellen „unveraendert". Sie hat den Fall, fuer den sie
+#     da ist, praktisch nie gesehen.
+#
+# **Das ist der Mechanismus hinter D14.** Der Eintrag lautete „eine zusaetzliche `println!`-Zeile
+# im Abschlussbericht kippt den Z4f-Negativfall -- nicht ihr Inhalt, ihre blosse Existenz", und
+# vermutete Wanduhrzeit. Die Groesse, die eine Berichtszeile DETERMINISTISCH aendert, ist aber der
+# **Kernel-Binaerinhalt** und damit sein Hash. Das erklaert jede Beobachtung des Eintrags: je Bau
+# reproduzierbar (2 von 2 Laeufen), unabhaengig vom Inhalt der Zeile, und beim Zuruecknehmen weg.
+#
+# Gemessen wird jetzt, was die Zeile behauptet: die **512 Byte selbst**, vor und nach dem Boot.
+# Ein Praedikat ueber EIN Byte kann „unveraendert" nicht ausdruecken.
 echo "== Negativfall Z4f: Checkpoint eines FREMDEN Kernel-Images =="
-if python3 - "$BLK_IMG" "$CKPT_SECTOR" <<'EOF'
-import struct, sys, zlib
+CKPT_VORHER="$(python3 - "$BLK_IMG" "$CKPT_SECTOR" <<'EOF'
+import hashlib, struct, sys, zlib
 img, lba = sys.argv[1], int(sys.argv[2])
 with open(img, "r+b") as f:
     f.seek(lba * 512)
@@ -678,8 +732,10 @@ with open(img, "r+b") as f:
     struct.pack_into("<I", s, 16 + body_len, zlib.crc32(bytes(s[:16 + body_len])) & 0xFFFFFFFF)
     f.seek(lba * 512)
     f.write(bytes(s))
+    print(hashlib.sha256(bytes(s)).hexdigest())
 EOF
-then
+)"
+if [ -n "$CKPT_VORHER" ]; then
     LOG3="$(mktemp)"
     boot build/boot-archive-x86.bin "$LOG3"
     OUT3="$(grep -vE "SeaBIOS|iPXE|Press Ctrl|Booting from|C900|PMM|PnP" "$LOG3" 2>/dev/null)"
@@ -697,13 +753,17 @@ then
     if grep -q "^bootckpt: gespeichert" <<<"$OUT3"; then
         echo "  FAIL: Z4f -- nach der Abweisung wurde trotzdem gespeichert; damit waere der fremde Zustand lautlos durch einen eigenen ersetzt"
         fail=1
-    elif python3 -c "
-import sys
-d = open(sys.argv[1],'rb').read()[int(sys.argv[2])*512:][:512]
-sys.exit(0 if d[0:8] == b'SL4KCKPT' and d[16] != 0x00 else 1)" "$BLK_IMG" "$CKPT_SECTOR"; then
-        echo "  PASS: der abgewiesene Checkpoint blieb auf der Platte UNVERAENDERT -- ein Kernel, der ihn ueberschriebe, machte aus einem fremden Zustand lautlos einen eigenen"
     else
-        echo "  FAIL: der abgewiesene Checkpoint wurde ueberschrieben"; fail=1
+        # Der VOLLE Sektor, nicht ein Byte daraus -- s. den D14-Block oben.
+        CKPT_NACHHER="$(python3 -c "
+import hashlib, sys
+d = open(sys.argv[1],'rb').read()[int(sys.argv[2])*512:][:512]
+print(hashlib.sha256(d).hexdigest())" "$BLK_IMG" "$CKPT_SECTOR")"
+        if [ "$CKPT_NACHHER" = "$CKPT_VORHER" ]; then
+            echo "  PASS: der abgewiesene Checkpoint blieb auf der Platte UNVERAENDERT -- alle 512 Byte byte-identisch (SHA-256 ${CKPT_VORHER:0:12}). Ein Kernel, der ihn ueberschriebe, machte aus einem fremden Zustand lautlos einen eigenen; die alte Fassung dieser Zeile las EIN Byte und haette 255 von 256 Ueberschreibungen durchgewinkt (D14)"
+        else
+            echo "  FAIL: der abgewiesene Checkpoint wurde ueberschrieben (SHA-256 vorher ${CKPT_VORHER:0:12}, nachher ${CKPT_NACHHER:0:12})"; fail=1
+        fi
     fi
     rm -f "$LOG3"
 else

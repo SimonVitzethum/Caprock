@@ -2920,6 +2920,36 @@ der Audit-Berichtigung
       Ausweg — damit ließe sich das Feld in `admit` nicht mehr herausbewegen, und der Typ verlöre
       genau die Eigenschaft, um die es geht.
 
+## C4-Nachtrag: die 40 MiB sind EINGELOEST, nicht mehr prognostiziert (2026-08-12)
+
+`USER_KSTACK_SIZE` steht auf **x86 bei 4 KiB** statt 16. Zweistufig gesenkt, jede Stufe mit beiden
+Suiten belegt:
+
+| Grösse | Höchststand (Lade-Suite) | Reserve | Suiten |
+|---|---|---|---|
+| 16 KiB, **vor** C8 | 11 992 B — **73,1 %** | 4392 B | ALL PASS |
+| 16 KiB, nach C8 | 1 312 B — 8,0 % | 15 072 B | ALL PASS |
+| 8 KiB | 1 312 B — 16,0 % | 6 880 B | ALL PASS |
+| **4 KiB** | **1 312 B — 32,0 %** | **2 784 B** | ALL PASS, Abnahme-Reihe 12/12 |
+
+**10 000 EL0-Threads kosten damit 40 MiB statt 160** — auf einer 512-MiB-Maschine 7,8 % statt 31 %.
+
+**Die Begründung hängt an drei Dingen, die es vorher nicht gab**, und ohne sie wäre die Zahl
+geraten: die **Guard-Page** (ein Überlauf ist ein `#PF`, kein stiller Treffer), die **IST-Stacks**
+für `#DF`/`NMI`/`#MC` — ein NMI fragt `IF` nicht und läuft **nicht** mehr auf diesem Stack —, und
+die **Wasserstandsmarke**, die den Wert bei jedem Lauf nachmisst statt ihn zu glauben.
+
+**Auf aarch64 bleibt es bei 16 KiB.** Dort fehlen alle drei. Eine Zahl, die auf einer Architektur
+gemessen und auf der anderen übernommen wird, ist auf der anderen geraten — `MASK_BITS` war auf
+x86 zufällig richtig.
+
+- [ ] **aarch64 nachziehen** — Guard-Page (Blockaufteilung), ein IST-Gegenstück und die
+      Wasserstandszeile. Erst dann ist die Konstante dort mehr als eine Vorsichtsmassnahme, und
+      erst dann zählt `unbewachte_stacks()` nicht mehr jeden Stack.
+- [ ] **Was die 4 KiB NICHT abdecken:** der Syscall-Umleitungspfad (Z26/A3) läuft in keiner der
+      beiden x86-Suiten; sein Beitrag zum Wasserstand ist ungemessen. Wer ihn verdrahtet, misst
+      die Zeile neu, bevor er sie glaubt.
+
 ## C8. Der VERIFIZIERERTHREAD — **gebaut** (2026-08-11); offen ist nur noch (c)
 
 **Klasse:** Kapazität / Sicherheit · **Stand:** (a) und (b) sind **gebaut und gemessen**, die

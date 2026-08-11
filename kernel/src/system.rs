@@ -69,7 +69,33 @@ pub const IDLE_PRIO: u8 = 1;
 // aus dem EL0-zugänglichen RAM. Der Kernel-Stack MUSS EL1-only sein (sonst könnte
 // der EL0-Thread seinen eigenen Kernel-Stack lesen/schreiben), daher der feste Pool
 // im Kernel-Image (nicht aus dem EL0-zugänglichen MEM-Allokator).
-pub(crate) const USER_KSTACK_SIZE: usize = 0x4000; // 16 KiB EL1-Kernel-Stack je EL0-Thread
+/// **Der EL1-Stack eines EL0-Threads — 4 KiB auf x86, 16 KiB auf aarch64, und der Unterschied
+/// ist eine Messung und keine Vorsicht.**
+///
+/// Bis zum 2026-08-11 waren es ueberall 16 KiB, und der tiefste Pfad benutzte davon **73 %**:
+/// `SYS_LOAD` verifizierte eine Ed25519-Signatur **im Kernel**, auf dem Stack des aufrufenden
+/// EL0-Threads. Seit C8 laeuft das auf einem eigenen Verifiziererthread; der Hoechststand hier
+/// faellt damit auf **1312 B** (Lade-Suite) bzw. **824 B** (Hauptsuite).
+///
+/// **Warum 4 KiB auf x86 verantwortbar sind — und die Begruendung haengt an drei Dingen, die es
+/// vorher nicht gab:**
+/// * die **Guard-Page** unter jedem Stack: ein Ueberlauf ist ein `#PF` und kein stiller Treffer,
+/// * die **IST-Staecke** fuer `#DF`, `NMI` und `#MC`: ein NMI (nicht maskierbar, er fragt `IF`
+///   nicht) laeuft **nicht** auf diesem Stack, sondern auf seinem eigenen — genau der Einwand,
+///   der die alte Reserve auf echter Hardware fraglich machte,
+/// * die **Wasserstandsmarke**, die den Wert bei jedem Lauf nachmisst statt ihn zu glauben.
+///
+/// Gemessen bei 4 KiB: 1312 von 4096 B (32,0 %), Reserve 2784 B, beide Suiten `ALL PASS`.
+///
+/// **Auf aarch64 bleibt es bei 16 KiB, und das ist kein Zoegern, sondern das Fehlen der drei
+/// Voraussetzungen:** dort gibt es (noch) keine Guard-Page, kein IST-Gegenstueck und keine
+/// Berichtszeile mit dem Wasserstand. Eine Zahl, die auf einer Architektur gemessen und auf der
+/// anderen uebernommen wird, ist auf der anderen geraten — und dieses Projekt hat genau dafuer
+/// schon bezahlt (`MASK_BITS`, das auf x86 zufaellig richtig war und auf aarch64 falsch).
+#[cfg(target_arch = "x86_64")]
+pub(crate) const USER_KSTACK_SIZE: usize = 0x1000;
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) const USER_KSTACK_SIZE: usize = 0x4000;
 
 /// Besitzer-Abbildung der **dynamisch aus `MEM` allozierten** EL0-Kernel-Stacks: `base_of[slot]`
 /// = physische Basis des Kstacks des Threads `slot` (0 = keiner). Kstacks kommen NICHT mehr aus

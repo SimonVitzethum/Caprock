@@ -9,6 +9,112 @@ schon einmal nicht getragen hat.
 
 ---
 
+## D14. Eine BERICHTSZEILE MEHR kippt die Z4f-Pruefung — **BEHOBEN, und es war nicht die Wanduhr**
+
+**Klasse:** Prueferform · **Stand:** **Ursache benannt und behoben (2026-08-11, abends).** Der
+Fehler lag nicht im Kernel und nicht in der Zeit, sondern in der Nachpruefung selbst.
+
+### Der Mechanismus
+
+Die Nachpruefung „der Sektor blieb unveraendert" lautete in `test-qemu-x86-load.sh`:
+
+```python
+d[0:8] == b'SL4KCKPT' and d[16] != 0x00
+```
+
+`d[16]` ist nach `crates/caprock-cap/src/checkpoint.rs` (`OFF_BODY = 16`, dort beginnen 32 Byte
+`kernel_hash`) das **erste Byte des KERNEL-HASHES** — und der Negativfall unmittelbar darueber
+kippt genau dieses Byte mit `s[16] ^= 0xFF`. Damit hing das Urteil an einer Groesse, die mit dem
+Schreiben des Sektors nichts zu tun hat: **am SHA-256 des gerade gebauten Kernels.**
+
+**Gemessen, nicht ueberlegt** (`d[16]` gegen alle 256 moeglichen Hash-Bytes, an einem echten
+Abbild; die Zuordnung `d[16] == kernel_code_hash(ELF)[0]` unabhaengig aus dem ELF nachgerechnet:
+`0xd0 == 0xd0`):
+
+| Richtung | Zahl |
+|---|---|
+| **Falsch-Alarm**: `kernel_code_hash[0] == 0xFF` → gekippt `0x00` → „ueberschrieben", obwohl NICHTS geschrieben wurde | **1 von 256 Bauten** |
+| **Blinder Fleck**: der Kernel ueberschreibt wirklich (schreibt SEINEN Hash hin) → Zeile meldet „unveraendert" | **255 von 256** |
+
+Das erklaert **jede** Beobachtung des alten Eintrags, und zwar besser als die Zeitthese:
+
+* *„je Bau reproduzierbar (2 von 2 Laeufen)"* — der Hash ist je Binary konstant. Eine
+  Wanduhr-Ursache waere geflattert.
+* *„nicht ihr Inhalt, ihre blosse Existenz"* — jede Aenderung am Kernel-Binaerinhalt wuerfelt den
+  Hash neu, gleich welchen Text die Zeile traegt.
+* *„beim Zuruecknehmen wieder gruen"* — das alte Binary hat wieder sein altes Hash-Byte.
+
+Die Zeitthese war eine naheliegende Verwechslung: eine `println!`-Zeile aendert **zwei** Dinge,
+die Ausgabelaenge und das Binary. Nur das zweite ist deterministisch, und nur das zweite wurde
+gelesen. **Dieselbe Klasse wie `rx_used` gegen „Daten sind angekommen": zwei Groessen bewegen sich
+zusammen, und man liest die falsche.**
+
+### Was daraus geworden ist
+
+* Geprueft werden jetzt die **512 Byte selbst**, vor und nach dem Boot (SHA-256 ueber den Sektor).
+  Ein Praedikat ueber EIN Byte kann „unveraendert" nicht ausdruecken — es hat den Fall, fuer den
+  es gebaut war, in 255 von 256 Faellen nicht gesehen.
+* Damit ist der Punkt „die naechste Zeile, die jemand hinzufuegt, kippt sie wieder" weg — die
+  Ausweichbewegung (NMI-Zahlen in die vorhandene `ist`-Zeile) darf bleiben oder zurueckgenommen
+  werden, sie traegt keine Zaehne mehr.
+* **Die Bilanz muss nachgerechnet werden, nicht nur der Ausfall beklagt:** die Zeile hat in
+  ihrer ganzen Lebensdauer **keine** Ueberschreibung belegen koennen. Jedes „PASS" von ihr war
+  eine Aussage ueber ein Hash-Byte. Ob der Kernel den Sektor je ueberschrieben hat, ist damit
+  fuer die Vergangenheit **unbeantwortet** — nicht „nein". (Der Kernelpfad sieht richtig aus:
+  `CKPT_REJECTED` setzen und sofort zurueckkehren. Belegt ist es seit heute, vorher war es
+  gegengelesen.)
+
+### Die Lehre
+
+**Ein Praedikat, das die gepruefte Groesse nur STELLVERTRETEND liest, prueft den Stellvertreter.**
+`d[16] != 0` sollte „512 Byte unveraendert" heissen und hiess „ein bestimmtes Hash-Byte ist nicht
+null". Solche Stellvertreter entstehen, weil der direkte Vergleich einen Wert VOR dem Lauf
+festhalten muss — genau die Zeile, die man sich sparen will.
+
+---
+
+<details>
+<summary>Der Eintrag, wie er bis zur Behebung dastand (2026-08-11 vormittags)</summary>
+
+Beim Einbau der NMI-Reentranz-Zahlen fiel die Lade-Suite aus:
+
+```
+FAIL: der abgewiesene Checkpoint wurde ueberschrieben
+```
+
+**Zugeordnet, nicht vermutet.** Die beiden geaenderten Dateien einzeln zurueckgesetzt:
+
+| Stand | Lade-Suite |
+|---|---|
+| beide Aenderungen | **FAILURES** (2 von 2 Laeufen) |
+| nur `exception.rs` (NMI-Buchhaltung) | ALL PASS |
+| nur der `urteil()`-Konjunkt, **ohne** die neue Berichtszeile | ALL PASS |
+| mit der neuen Berichtszeile | **FAILURES** |
+
+**Es ist also EINE zusaetzliche `println!`-Zeile im Abschlussbericht** — rund 450 Zeichen ueber
+eine byteweise Serielle. Nicht ihr Inhalt, nicht das Urteil, das sie traegt: ihre blosse Existenz.
+
+**Was das ueber die Pruefung sagt.** Der Z4f-Negativfall verlangt, dass ein Kernel einen
+strukturell heilen, aber **fremd gebundenen** Checkpoint abweist und den Sektor **unveraendert**
+laesst. Der Kernelpfad dafuer sieht richtig aus: `CKPT_REJECTED` setzen und **sofort
+zurueckkehren**, ohne zu schreiben. Trotzdem haengt der Ausgang an der Ausgabelaenge — also an
+Wanduhrzeit, und damit an genau der Groesse, die in D13 schon einmal vier Abweichungen erzeugt hat.
+
+**Umgangen, nicht behoben:** die NMI-Zahlen stehen jetzt in der **vorhandenen** `ist`-Zeile statt
+in einer eigenen. Das ist eine Ausweichbewegung und keine Erklaerung — und sie hat eine Zaehnezahl:
+**die naechste Zeile, die jemand hinzufuegt, kippt sie wieder**, und dann sucht er dort, wo er
+gerade gearbeitet hat, statt hier.
+
+- [x] **Den Mechanismus benennen.** ~~Wer schreibt den Sektor, wenn der Kernel laenger braucht?~~
+      **Niemand.** Der Sektor wurde nie ueberschrieben; die Pruefung las das falsche Byte, s. o.
+      Alle drei Kandidaten (`drv_service_step`, `reap`, eine Notschranke) waren daneben.
+- [x] **Die Pruefung von der Ausgabelaenge entkoppeln.** Sie hing nie an ihr — sie hing am
+      Kernel-Hash. Jetzt haengt sie an den 512 Byte, um die es geht.
+
+</details>
+
+---
+
 ## A1 + Z11c — der reguläre Weg ist gefärbt, und die Politik steht im Manifest (2026-08-07)
 
 ### 1. Was offen war

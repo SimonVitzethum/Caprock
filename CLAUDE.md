@@ -913,6 +913,31 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   Ressource", also genau das, wovon die Marke trennen sollte. **Wer eine Marke setzt, muss den
   Weg prüfen, den sie überleben soll** — sonst prüft der Prüfer eine Eigenschaft, die vor seiner
   ersten Messung schon weg ist. Dieselbe Form wie die leere Event-Queue ohne `CD.R`.
+* **Ein Prädikat, das die geprüfte Größe nur STELLVERTRETEND liest, prüft den Stellvertreter.**
+  Die Z4f-Nachprüfung „der abgewiesene Checkpoint blieb unverändert" las
+  `d[0:8] == b'SL4KCKPT' and d[16] != 0x00` — und `d[16]` ist das **erste Byte des
+  Kernel-Hashes** (`OFF_BODY = 16`), also genau das Byte, das der Negativfall zuvor mit `^= 0xFF`
+  kippt. Damit hing das Urteil am SHA-256 des gerade gebauten Kernels: **Falsch-Alarm bei 1 von
+  256 Bauten** (`hash[0] == 0xFF` → gekippt `0x00`, „überschrieben" ohne dass etwas geschrieben
+  wurde) und **blinder Fleck bei 255 von 256** echten Überschreibungen. Das war D14: „eine
+  `println!`-Zeile mehr kippt die Prüfung, nicht ihr Inhalt, ihre blosse Existenz" — eine
+  Berichtszeile ändert **zwei** Größen, die Ausgabelänge und das Binary; nur die zweite ist
+  deterministisch, und die Zeitthese las die falsche. Dieselbe Klasse wie `rx_used` gegen „Daten
+  sind angekommen". Verglichen werden jetzt die **512 Byte selbst**, vor und nach dem Boot.
+  Und: eine solche Zeile beschädigt die **Grün**-Bilanz — jedes ihrer PASS war eine Aussage über
+  ein Hash-Byte, nicht über den Sektor.
+* **Ein abgeleiteter Nenner neben handgeführten Summanden ist eine halbe Ableitung.**
+  `system::MELDESTELLEN` kommt seit dem 2026-08-11 aus einem Zähler — die Aufteilung der
+  C7-Abdeckung („11 provoziert + 9 Platz + 10 Ladepfad + 1") stand daneben als **Prosa**. Als die
+  Guard-Page eine 32. Meldestelle mitbrachte, ging der Nenner mit und die Summanden nicht: 31
+  gegen 32, im Bericht, unbemerkt. Prosa hat kein Gatter. Die Summanden stehen jetzt als
+  Konstanten mit `const _: () = assert!(… == MELDESTELLEN)` — wer eine Meldestelle hinzufügt,
+  bricht den Bau, bis er sie eingeordnet hat.
+* **Wer nach ERREICHBARKEIT priorisiert statt nach VORGESCHICHTE, hat das Werkzeug am Ende genau
+  dort nicht, wo der letzte Fall lag.** Die zehn ungemessenen Mangel-Meldestellen des Ladepfads
+  standen ein Jahr mit der Begründung „braucht ein Boot-Archiv, das die Hauptsuite bauartbedingt
+  nicht hat" — während die Lade-Suite das Archiv hatte. Der Ladepfad ist derjenige, auf dem
+  `NoResources` sechs Wochen lang stumm war und an dem `wasmhost` gestorben ist.
 
 ## Aufbau, grob
 

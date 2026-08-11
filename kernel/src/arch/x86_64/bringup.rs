@@ -1790,6 +1790,23 @@ static SWEEP_MESS: AtomicU64 = AtomicU64::new(0);
 static SWEEP: caprock_sync::SpinLock<(u32, u32, u32, u32, u32, u32, u32)> =
     caprock_sync::SpinLock::new((0, 0, 0, 0, 0, 0, 0));
 
+/// **Was der Sweep hinterlaesst** -- `(dVSpaces, dPD-Slots, dThread-Slots, dPT-Rahmen, dRAM)`,
+/// jeweils *nachher minus vorher*.
+///
+/// **Warum das ein eigener Konjunkt ist und nicht ein Kommentar.** Der Sweep legt PDs, Threads,
+/// Adressraeume und Seitentabellen an und weist mittendrin Anforderungen ab -- also genau in den
+/// Fehlerpfaden, die am seltensten gelaufen sind. Ein halb abgebauter Ladevorgang faelscht jede
+/// Zeile nach ihm, und zwar lautlos: die Suite meldet dann einen Speicherstand, den niemand mehr
+/// dem Sweep zuordnet. „Er raeumt auf" ist eine Behauptung, solange es niemand nachzaehlt.
+///
+/// Vier der fuenf Groessen sind **exakt**: VSpaces, PD-Slots, Thread-Slots und
+/// Seitentabellen-Rahmen bewegt in diesem Fenster nur der Sweep (er laeuft, nachdem jedes andere
+/// Urteil steht). Beim RAM steht bewusst nur „nicht weniger": ein sterbender Thread gibt
+/// waehrenddessen seinen Stack zurueck, das ist ein Zuwachs und kein Befund.
+#[cfg(feature = "selftest")]
+static SWEEP_BILANZ: caprock_sync::SpinLock<(i64, i64, i64, i64, i64)> =
+    caprock_sync::SpinLock::new((0, 0, 0, 0, 0));
+
 /// Abweisungen je Pfad und ob der Pfad **zu Ende** gefahren wurde (Sperre feuerte nicht mehr).
 ///
 /// **Warum das getrennt dasteht:** eine Gesamtzahl belegt nicht, dass jede Anforderung JEDES
@@ -1798,8 +1815,18 @@ static SWEEP: caprock_sync::SpinLock<(u32, u32, u32, u32, u32, u32, u32)> =
 /// einmal sprechen musste. Wo bei `SWEEP_KMAX` gedeckelt wurde, steht das ausdruecklich dabei --
 /// dort gilt der Schluss nur bis zum Deckel.
 #[cfg(feature = "selftest")]
-static SWEEP_PFAD: caprock_sync::SpinLock<([u32; 6], u32)> =
-    caprock_sync::SpinLock::new(([0; 6], 0));
+static SWEEP_PFAD: caprock_sync::SpinLock<([u32; SWEEP_PFADE], u32, [u32; SWEEP_PFADE])> =
+    caprock_sync::SpinLock::new(([0; SWEEP_PFADE], 0, [0; SWEEP_PFADE]));
+
+/// Wie viele Pfade der Sweep faehrt.
+#[cfg(feature = "selftest")]
+const SWEEP_PFADE: usize = 8;
+/// Pfad 6: [`system::map_region_into_thread`] -- **kein Ladepfad**, s. `SWEEP_KLASSEN`.
+#[cfg(feature = "selftest")]
+const PFAD_FENSTER: usize = 6;
+/// Pfad 7: der echte Ladepfad ([`system::load_into_pd_mit`]) -- braucht ein Boot-Archiv.
+#[cfg(feature = "selftest")]
+const PFAD_LADEN: usize = 7;
 
 /// Hoechste Zahl der Durchlaesse je Pfad.
 ///
@@ -1807,8 +1834,87 @@ static SWEEP_PFAD: caprock_sync::SpinLock<([u32; 6], u32)> =
 /// Bytes in die PD und startet sie. Ein gelungener letzter Durchgang liefe also fremden Code --
 /// ein zweites, mit der Messung unverwandtes Risiko in einer Pruefzeile. Bei `k <= 3` scheitert
 /// der Pfad **strukturell** (er braucht mehr Anforderungen, bevor der Thread ueberhaupt entsteht).
+///
+/// **Pfad 7 (Laden) ist aus demselben Grund gedeckelt, und zusaetzlich noch anders begrenzt** --
+/// s. die Halteregel in [`sweep_messen_inner`]: ein gelungener Ladevorgang startet ein fremdes
+/// Programm ohne jede Cap. Der Deckel allein waere geraten (die Zahl der Anforderungen haengt am
+/// Image), deshalb haelt der Sweep dort an einer **beobachteten** Groesse an.
 #[cfg(feature = "selftest")]
-const SWEEP_KMAX: [u32; 6] = [12, 12, 4, 6, 4, 6];
+const SWEEP_KMAX: [u32; SWEEP_PFADE] = [12, 12, 4, 6, 4, 6, 3, 24];
+
+// ------------------------------------------------------------------------------------------------
+// C7: DIE KLASSIFIKATION DER MELDESTELLEN -- und warum sie im TYP steht und nicht im Fliesstext
+// ------------------------------------------------------------------------------------------------
+//
+// **Der Nenner ist abgeleitet, die Summanden waren es nicht.** `system::MELDESTELLEN` kommt seit
+// dem 2026-08-11 aus `tools/mangel-zaehlen.py` -- gelesen, nicht gefuehrt. Die Aufteilung der
+// Abdeckung („11 provoziert + 9 Platz + 10 Ladepfad + 1") stand daneben als **Prosa**, und Prosa
+// hat kein Gatter: als die Guard-Page mit `MANGEL_GUARD_TABELLE` eine 32. Stelle mitbrachte, ging
+// der Nenner mit (er wird gezaehlt), die Summanden nicht -- 11+9+10+1 = 31 gegen einen Nenner von
+// 32, und niemand sah es. Genau die Klasse, gegen die die Ableitung des Nenners gebaut war, eine
+// Ebene weiter.
+//
+// Deshalb stehen die Summanden hier als Konstanten mit einer **Zusicherung zur Bauzeit**. Wer eine
+// Meldestelle hinzufuegt, bricht den Bau, bis er sie eingeordnet hat. Eine Klassifikation, die man
+// vergessen kann, ist keine.
+//
+// Die fuenf Klassen, mit Zeilennummern aus `tools/mangel-stellen.sh --liste` (2026-08-11):
+//
+//  1. **PROVOZIERT, ohne Boot-Archiv** (12): 125 Kernel-Stack · 2379/2436 Kernel-Thread-Stack ·
+//     2473 User-Stack · 2590/2625 Seitentabelle in `create_vspace` · 2989 Seitentabelle im
+//     Fenster · 3169/3322/3463/3464 Privatregion · **4608 `map_region_into_thread`**.
+//     Die letzte ist neu und ein Befund fuer sich: sie stand als „Ladepfad" gebucht und ist
+//     keiner -- sie ist der Weg, auf dem eine Treiber-PD ihr Geraetefenster bekommt, und der
+//     braucht kein Archiv. Ein Grund, der nie nachgeprueft wird, ueberlebt jede Umgebung.
+//  2. **PROVOZIERT, nur MIT Boot-Archiv** (4): 4288 Segmentspeicher · 4304 Seitentabelle eines
+//     Segments · 4350 User-Stack · 4366 Seitentabelle des Stacks. Das ist der Ladepfad, auf dem
+//     `NoResources` sechs Wochen stumm war; die Lade-Suite hat das Archiv, die Hauptsuite nicht.
+//  3. **PLATZ-TOEPFE** (10): 2399/2453/3221/3386/3547/4438 Thread-Slot · 2572 ASID ·
+//     3293/4171 Farbstreifen · 4516 PD-Slot. Die Sperre sitzt im SPEICHER-Allokator; diese Toepfe
+//     vergeben keine Bytes. Sie zu leeren heisst tausende Threads/PDs anzulegen -- das ist die
+//     Kapazitaetskurve, und die kippt jede baseline-empfindliche Zeile vor ihr.
+//  4. **DER ALLOKATOR WURDE NICHT GEFRAGT** (3): 2998/4317/4380 `MANGEL_MAPPING_ABGEWIESEN`.
+//     Sie melden genau den Fall „es lag NICHT am Speicher" (krumme VA/PA, ausserhalb des
+//     Fensters) -- eine Sperre im Allokator kann sie strukturell nicht ausloesen. Erreichbar sind
+//     sie ueber ein Image mit krummer Segment-VA; genau so ist der `wasm`-Ladefehler vom
+//     2026-08-10 entstanden, sie sind also keine tote Gegend.
+//  5. **KEIN ALLOKATOR-TOPF, sondern ein fester Vorrat** (1): 139 `MANGEL_GUARD_TABELLE`. Der
+//     Vorrat aufgeteilter Seitentabellen liegt in der HAL, die keinen Allokator hat.
+//  6. **STRUKTURELL NICHT AUSLOESBAR** (2), und das ist ein Befund ueber die Stellen selbst:
+//     * 4207 `MANGEL_L2_TABELLE` -- `vspace_l2(asid)` gibt fuer eine soeben von
+//       `create_vspace_masked` gelieferte ASID **immer** `Some`. Der Zweig ist auf diesem Pfad
+//       tot; er waere nur ueber einen nebenlaeufigen Teardown derselben ASID erreichbar.
+//     * 4269 `MANGEL_SEGMENT_SPEICHER` mit Menge 0 -- die Fail-closed-Schranke gegen mehr als
+//       `MAX_IMG_SEGS` (64) Frame-Stuecke. Sie braucht ein IMAGE mit mehr als 64 Stuecken, keinen
+//       leeren Topf; kein Programm des Testarchivs kommt in die Naehe.
+#[cfg(feature = "selftest")]
+const SWEEP_K1_PROVOZIERT_OHNE_ARCHIV: usize = 12;
+#[cfg(feature = "selftest")]
+const SWEEP_K2_PROVOZIERT_MIT_ARCHIV: usize = 4;
+#[cfg(feature = "selftest")]
+const SWEEP_K3_PLATZ: usize = 10;
+#[cfg(feature = "selftest")]
+const SWEEP_K4_NICHT_GEFRAGT: usize = 3;
+#[cfg(feature = "selftest")]
+const SWEEP_K5_HAL_VORRAT: usize = 1;
+#[cfg(feature = "selftest")]
+const SWEEP_K6_UNAUSLOESBAR: usize = 2;
+
+/// **Die Summanden MUESSEN aufgehen** -- zur Bauzeit, nicht im Bericht.
+#[cfg(feature = "selftest")]
+const _: () = assert!(
+    SWEEP_K1_PROVOZIERT_OHNE_ARCHIV
+        + SWEEP_K2_PROVOZIERT_MIT_ARCHIV
+        + SWEEP_K3_PLATZ
+        + SWEEP_K4_NICHT_GEFRAGT
+        + SWEEP_K5_HAL_VORRAT
+        + SWEEP_K6_UNAUSLOESBAR
+        == system::MELDESTELLEN,
+    "C7: die Summanden der Sweep-Abdeckung gehen nicht mehr gegen system::MELDESTELLEN auf. \
+     Es ist eine Meldestelle dazugekommen (oder weggefallen), und sie ist nicht eingeordnet. \
+     Ordne sie in eine der sechs Klassen bei SWEEP_KMAX ein -- eine Abdeckung mit einem \
+     falschen Nenner ist eine Behauptung."
+);
 
 #[cfg(feature = "selftest")]
 fn sweep_messen() -> bool {
@@ -1826,20 +1932,78 @@ fn sweep_messen() -> bool {
 /// Alles, was der Aufbau selbst alloziert (die PD fuer `spawn_in_pd`), entsteht **vor** dem
 /// Scharfstellen -- sonst verbrauchte der Aufbau die Durchlaesse, und die Abweisung landete an
 /// einer Stelle, die gar nicht gemeint war.
+/// **Das Fenster, das Pfad 6 in eine fremde VSpace legt** -- HPET, also ein Registerbereich, der
+/// mit Sicherheit **kein RAM** ist.
+///
+/// Ein RAM-Rahmen waere hier die bequeme Wahl und die falsche: er gehoerte jemandem. Ein
+/// Geraetefenster gehoert niemandem, und `map_region_into_thread` ist genau fuer diesen Fall
+/// gebaut -- ein Treiber bekommt die Registerseite seines Geraets. `ro: true`, und die PD wird
+/// unmittelbar danach abgebaut; gelesen wird die Seite nie (der Thread parkt sich in seiner
+/// ersten Instruktion).
+#[cfg(feature = "selftest")]
+const SWEEP_FENSTER_PA: u64 = 0xFED0_0000;
+
+/// **Das Bild, mit dem Pfad 7 den echten Ladepfad faehrt** -- das KLEINSTE Programm des Archivs.
+///
+/// Klein, weil die Zahl der Anforderungen an der Zahl der Segmentstuecke und der Seiten haengt:
+/// je kleiner das Bild, desto kuerzer der Weg bis zum Stack-Topf, und desto weniger Durchgaenge
+/// braucht der Sweep. Die Wahl ist **abgeleitet** (kleinste Summe der `memsz`), nicht ein Index
+/// im Quelltext -- ein Index waere eine zweite Wahrheit neben dem Archiv, und beim naechsten
+/// Modul waere er still falsch.
+///
+/// **Ohne Archiv gibt es hier nichts**, und das ist der ehrliche Ausgang: die Hauptsuite hat
+/// bauartbedingt kein Boot-Archiv. `None` heisst „dieser Pfad ist heute nicht fahrbar" und wird
+/// im Bericht als solcher genannt, nicht als bestandene Pruefung.
+#[cfg(feature = "selftest")]
+fn sweep_ladebild() -> Option<caprock_loader::elf::ElfImage<'static>> {
+    let archiv = crate::loader::read_archive()?;
+    let mut beste: Option<(u64, caprock_loader::elf::ElfImage<'static>)> = None;
+    for i in 0..archiv.count() {
+        let Some(prog) = archiv.program(i) else { continue };
+        let Ok(img) = caprock_loader::elf::ElfImage::parse(prog.elf) else { continue };
+        let gross: u64 = img.segments().map(|s| ((s.memsz as u64) + 4095) & !4095).sum();
+        if beste.as_ref().is_none_or(|(g, _)| gross < *g) {
+            beste = Some((gross, img));
+        }
+    }
+    beste.map(|(_, img)| img)
+}
+
 #[cfg(feature = "selftest")]
 fn sweep_versuch(pfad: usize, k: u32) -> (bool, bool, u64, u32, u64) {
-    let pd = if pfad == 5 { system::create_pd() } else { None };
-    if pfad == 5 && pd.is_none() {
-        // Kein PD-Platz -> dieser Pfad ist heute nicht fahrbar. Als „nicht gefeuert" melden,
-        // damit der Sweep ihn ueberspringt statt ein Urteil zu erfinden.
-        return (false, false, u64::MAX, system::MANGEL_VERGIFTET, 0);
+    // **Der ganze Aufbau entsteht VOR dem Scharfstellen** -- sonst verbrauchte er die
+    // Durchlaesse, und die Abweisung landete an einer Stelle, die gar nicht gemeint war.
+    // „Nicht fahrbar" wird als „nicht gefeuert" gemeldet, damit der Sweep den Pfad
+    // ueberspringt, statt ein Urteil zu erfinden.
+    let nicht_fahrbar = (false, false, u64::MAX, system::MANGEL_VERGIFTET, 0);
+    let pd = if pfad == 5 || pfad == PFAD_LADEN { system::create_pd() } else { None };
+    if (pfad == 5 || pfad == PFAD_LADEN) && pd.is_none() {
+        return nicht_fahrbar;
     }
     let el0 = kurven_arbeiter_el0 as *const () as usize;
     let kern = kurven_arbeiter as *const () as usize;
+    // Pfad 6 braucht eine lebende isolierte VSpace, in die das Fenster gelegt wird.
+    let wirt = if pfad == PFAD_FENSTER {
+        match system::spawn_isolated(el0, 0, system::IDLE_PRIO) {
+            Some((t, _)) => Some(t),
+            None => return nicht_fahrbar,
+        }
+    } else {
+        None
+    };
+    let bild = if pfad == PFAD_LADEN { sweep_ladebild() } else { None };
+    if pfad == PFAD_LADEN && bild.is_none() {
+        if let Some(p) = pd {
+            let _ = system::free_pd_slot(p);
+        }
+        return nicht_fahrbar;
+    }
     system::mangel_vergiften();
     system::sperre_scharf(k);
     let mut iso = None;
     let mut thr = None;
+    let mut geladen = None;
+    let mut fenster = false;
     match pfad {
         0 => iso = system::spawn_isolated(el0, 0, system::IDLE_PRIO).map(|(t, _)| t),
         1 => iso = system::spawn_isolated_colored_auto(el0, 0, system::IDLE_PRIO).map(|(t, _)| t),
@@ -1852,18 +2016,52 @@ fn sweep_versuch(pfad: usize, k: u32) -> (bool, bool, u64, u32, u64) {
         }
         3 => thr = system::spawn_user(el0, 0, system::IDLE_PRIO),
         4 => thr = system::spawn_on_core(hal::cpu::core_id(), kern, 0, system::IDLE_PRIO),
-        _ => thr = system::spawn_in_pd(pd.unwrap_or(0), kern, 0, system::IDLE_PRIO),
+        5 => thr = system::spawn_in_pd(pd.unwrap_or(0), kern, 0, system::IDLE_PRIO),
+        PFAD_FENSTER => {
+            fenster = system::map_region_into_thread(
+                wirt.expect("Pfad 6 hat seinen Wirt oben angelegt"),
+                SWEEP_FENSTER_PA,
+                caprock_mem::PAGE,
+                system::MappingKind::Device { ro: true },
+            )
+        }
+        // **Der ECHTE Ladepfad**, nicht ein Nachbau: dieselbe Funktion, die `SYS_LOAD` und
+        // `load_by_index` rufen. Ohne Endowment und mit der Vorgabepolitik -- die Politik ist
+        // hier nicht die gepruefte Sache, und ein abweichender Wert schriebe nebenbei die
+        // `ladepol`-Ablage voll.
+        _ => {
+            geladen = system::load_into_pd_mit(
+                bild.as_ref().expect("Pfad 7 hat sein Bild oben geholt"),
+                pd.unwrap_or(0),
+                &[],
+                0,
+                system::LadePolitik::VORGABE,
+            )
+        }
     }
     // **Erst entschaerfen, dann abbauen.** Ein Teardown unter scharfer Sperre koennte selbst
     // abgewiesen werden und Spuren hinterlassen, die niemand mehr der Sperre zuordnet.
     let (gefeuert, menge) = system::sperre_aus();
     let (code, bytes, _frei) = system::lade_mangel();
-    let gelungen = iso.is_some() || thr.is_some();
+    let gelungen = iso.is_some() || thr.is_some() || geladen.is_some() || fenster;
     if let Some(t) = iso {
         system::destroy_isolated(t);
     }
     if let Some(t) = thr {
         let _ = system::kill_local(t);
+    }
+    if let Some(t) = wirt {
+        // Baut die VSpace ab und gibt die dabei privat gewordenen Geraetetabellen zurueck --
+        // auch wenn das Fenster tatsaechlich entstanden ist.
+        system::destroy_isolated(t);
+    }
+    if let Some(t) = geladen {
+        // **Dieser Zweig soll nach der Halteregel gar nicht vorkommen** (s. `sweep_messen_inner`).
+        // Er steht hier trotzdem, weil „soll nicht" keine Zusicherung ist: ein halb geladenes
+        // Programm, das liegen bleibt, faelschte jede Zeile danach. `destroy_loaded` gibt den
+        // PD-Slot mit frei -- deshalb hier heraus, statt unten noch einmal freizugeben.
+        system::destroy_loaded(t, pd.unwrap_or(0));
+        return (true, gefeuert, menge, code, bytes);
     }
     if let Some(p) = pd {
         let _ = system::free_pd_slot(p);
@@ -1876,10 +2074,27 @@ fn sweep_messen_inner() -> bool {
     let (mut punkte, mut stumm, mut keiner, mut menge_falsch, mut fremd) = (0u32, 0u32, 0u32, 0u32, 0u32);
     let mut codes = 0u32;
     let mut pfade = 0u32;
-    let mut je_pfad = [0u32; 6];
+    let mut je_pfad = [0u32; SWEEP_PFADE];
+    let mut je_codes = [0u32; SWEEP_PFADE];
     let mut zuende = 0u32;
+    // **Vorher zaehlen, damit „nichts bleibt liegen" eine Messung ist und keine Zusage.**
+    // Vor dem Fegen der Zombies: `destroy_isolated` reapt selbst, der Vergleich soll denselben
+    // Zustand gegen denselben halten.
+    system::reap();
+    let bilanz_vor = sweep_bestand();
     for pfad in 0..SWEEP_KMAX.len() {
         let mut gefahren = false;
+        // **Die Halteregel des Ladepfades** (Pfad 7), und sie haengt an einer BEOBACHTETEN
+        // Groesse statt an einer geratenen Zahl.
+        //
+        // Der Ladepfad endet mit dem User-Stack: erst sein Rahmen (`MANGEL_STACK_SPEICHER`),
+        // dann dessen Seitentabelle. Danach alloziert er nichts mehr -- der naechste Durchgang
+        // gelaenge also, und ein gelungener Ladevorgang STARTET ein fremdes Programm, ohne jede
+        // Cap, mitten in einer Pruefzeile. Ein fester Deckel waere die naheliegende Abhilfe und
+        // eine geratene Zahl: wieviele Anforderungen ein Bild braucht, haengt an seinen
+        // Segmenten. Also: sobald der Stack-Topf gesprochen hat, noch **genau einen** Durchgang
+        // (das ist die Seitentabelle des Stacks), dann Schluss.
+        let mut stack_gesehen = false;
         for k in 0..SWEEP_KMAX[pfad] {
             // **Der Messende liest die Generation, nicht der gemessene Pfad.**
             let gen_vor = system::mangel_generation();
@@ -1917,11 +2132,22 @@ fn sweep_messen_inner() -> bool {
             } else {
                 if code < 32 {
                     codes |= 1 << code;
+                    je_codes[pfad] |= 1 << code;
                 }
                 // `MANGEL_MAPPING_ABGEWIESEN` traegt keine Menge (der Allokator wurde nicht
                 // gefragt) -- dort waere ein Mengenvergleich eine Frage an die falsche Groesse.
                 if code != system::MANGEL_MAPPING_ABGEWIESEN && bytes != menge {
                     menge_falsch += 1;
+                }
+            }
+            // Halteregel, s. oben. Erst zaehlen, dann anhalten -- der Durchgang, der den
+            // Stack-Topf gemeldet hat, ist ein vollwertiger Punkt.
+            if pfad == PFAD_LADEN {
+                if stack_gesehen {
+                    break;
+                }
+                if code == system::MANGEL_STACK_SPEICHER {
+                    stack_gesehen = true;
                 }
             }
         }
@@ -1930,20 +2156,67 @@ fn sweep_messen_inner() -> bool {
         }
     }
     system::mangel_entgiften();
+    system::reap();
+    let bilanz_nach = sweep_bestand();
+    let bilanz = (
+        bilanz_nach.0 - bilanz_vor.0,
+        bilanz_nach.1 - bilanz_vor.1,
+        bilanz_nach.2 - bilanz_vor.2,
+        bilanz_nach.3 - bilanz_vor.3,
+        bilanz_nach.4 - bilanz_vor.4,
+    );
+    *SWEEP_BILANZ.lock() = bilanz;
     *SWEEP.lock() = (punkte, stumm, keiner, menge_falsch, fremd, codes, pfade);
-    *SWEEP_PFAD.lock() = (je_pfad, zuende);
+    *SWEEP_PFAD.lock() = (je_pfad, zuende, je_codes);
     // **Die Sprechprobe steht vorn:** ohne wirklich gefahrene Abweisungen sagt ein gruenes Urteil
     // nichts -- genau die Form, gegen die dieses Projekt `config_errors()` gebaut hat. Erwartet
     // werden mindestens die drei Toepfe, die die `spawn_*`-Pfade selbst besitzen.
     let toepfe = (1 << system::MANGEL_KERNEL_STACK)
         | (1 << system::MANGEL_PRIVATREGION)
         | (1 << system::MANGEL_SEITENTABELLE);
+    // **Der Ladepfad wird JE PFAD belegt, nicht ueber die Gesamtmaske.** `MANGEL_STACK_SPEICHER`
+    // setzt auch `spawn_user` (Pfad 3) -- eine Gesamtmaske koennte den Ladepfad also gar nicht
+    // von ihm unterscheiden, und die Abdeckungsangabe waere eine Behauptung. Gefragt ist, welche
+    // Toepfe **auf diesem Pfad** gesprochen haben.
+    let lade_toepfe = (1 << system::MANGEL_SEGMENT_SPEICHER)
+        | (1 << system::MANGEL_STACK_SPEICHER)
+        | (1 << system::MANGEL_SEITENTABELLE);
+    // **Und ob er ueberhaupt fahrbar WAR, wird gemessen und nicht angenommen.** Die Hauptsuite
+    // hat bauartbedingt kein Boot-Archiv; dort ist „nicht gefahren" die richtige Antwort und
+    // kein Fehlschlag. In der Lade-Suite dagegen ist ein ungefahrener Ladepfad genau die stille
+    // Luecke, gegen die diese Zeile gebaut ist.
+    let mit_archiv = crate::loader::read_archive().is_some();
     punkte >= 12
-        && pfade >= 5
+        && pfade >= 6
         && codes & toepfe == toepfe
+        // Pfad 6 laeuft ohne Archiv -- er ist gar kein Ladepfad, s. `SWEEP_KLASSEN`.
+        && je_codes[PFAD_FENSTER] & (1 << system::MANGEL_SEITENTABELLE) != 0
+        && (!mit_archiv || je_codes[PFAD_LADEN] & lade_toepfe == lade_toepfe)
         && stumm == 0
         && keiner == 0
         && menge_falsch == 0
+        // **Nichts bleibt liegen** -- vier exakte Groessen, eine gerichtete.
+        && bilanz.0 == 0
+        && bilanz.1 == 0
+        && bilanz.2 == 0
+        && bilanz.3 == 0
+        && bilanz.4 >= 0
+}
+
+/// Der Bestand, gegen den die Sweep-Bilanz gehalten wird:
+/// `(belegte VSpaces, belegte PD-Slots, lebende Thread-Slots, gehaltene PT-Rahmen, freies RAM)`.
+#[cfg(feature = "selftest")]
+fn sweep_bestand() -> (i64, i64, i64, i64, i64) {
+    let (pds_used, _, _, _, _, _) = system::vorrat_fuellstand();
+    let (_, _, pt_gehalten, _) = system::seitentabellen_topf();
+    let thr_live = system::thread_capacity().saturating_sub(system::threads_available());
+    (
+        system::used_vspaces() as i64,
+        pds_used as i64,
+        thr_live as i64,
+        pt_gehalten as i64,
+        system::total_free() as i64,
+    )
 }
 
 /// **Z22 P2 + Z23 S1: zwei Threads in EINER PD — gemessen an der Wirkung.**
@@ -4099,9 +4372,18 @@ fn report_and_off(watchdog: bool) -> ! {
             if mangel_messen() { "ALL PASS" } else { "FAILURES" }
         );
         let (punkte, stumm, keiner, menge_falsch, fremd, codes, pfade) = *SWEEP.lock();
-        let (je_pfad, zuende) = *SWEEP_PFAD.lock();
+        let (je_pfad, zuende, je_codes) = *SWEEP_PFAD.lock();
+        // **Der Ladepfad wird GEMESSEN, nicht angenommen** -- und beide Zahlen stehen daneben,
+        // damit „nicht gefahren" von „gar nicht fahrbar" unterscheidbar bleibt.
+        let mit_archiv = crate::loader::read_archive().is_some();
+        let lade_gefahren = je_pfad[PFAD_LADEN];
+        // Wieviele der 32 Meldestellen dieser LAUF wirklich provoziert hat. Die Klassen stehen
+        // bei `SWEEP_KMAX` und gehen zur Bauzeit gegen `system::MELDESTELLEN` auf; was hier
+        // gerechnet wird, ist allein die Frage, ob der Ladepfad in DIESEM Lauf dabei war.
+        let provoziert = SWEEP_K1_PROVOZIERT_OHNE_ARCHIV
+            + if lade_gefahren > 0 { SWEEP_K2_PROVOZIERT_MIT_ARCHIV } else { 0 };
         println!(
-            "sweep   : {punkte} provozierte Abweisungen auf {pfade} spawn-Pfaden -- \
+            "sweep   : {punkte} provozierte Abweisungen auf {pfade} Pfaden -- \
              geschwiegen={stumm} (die Marke {} stand danach noch da) · 'keiner' trotz \
              Abweisung={keiner} · Menge NICHT aus dem Aufruf={menge_falsch} · fremder \
              Verbraucher={fremd} · Toepfe die gesprochen haben: {} von 13 (Maske {codes:#x})",
@@ -4110,39 +4392,75 @@ fn report_and_off(watchdog: bool) -> ! {
         );
         println!(
             "sweep   : je Pfad -- isoliert={} ({}) · gefaerbt={} ({}) · nativ={} ({}) · \
-             user={} ({}) · kernel={} ({}) · in-PD={} ({}). 'bis Ende' heisst: die Sperre feuerte \
+             user={} ({}) · kernel={} ({}) · in-PD={} ({}) · geraetefenster={} ({}) · \
+             LADEN={} ({}, Toepfe {:#x}). 'bis Ende' heisst: die Sperre feuerte \
              nicht mehr, der Pfad hat also JEDE seiner Anforderungen einmal abgewiesen bekommen -- \
              nur dann traegt der Schluss auf die einzelnen Meldestellen. 'gedeckelt' heisst, der \
-             Schluss gilt bis zum Deckel",
+             Schluss gilt bis zum Deckel; beim Ladepfad ist der Deckel die Halteregel (ein \
+             Durchgang nach dem Stack-Topf), denn der naechste Durchgang wuerde ein fremdes \
+             Programm STARTEN",
             je_pfad[0], if zuende & 1 != 0 { "bis Ende" } else { "gedeckelt" },
             je_pfad[1], if zuende & 2 != 0 { "bis Ende" } else { "gedeckelt" },
             je_pfad[2], if zuende & 4 != 0 { "bis Ende" } else { "gedeckelt" },
             je_pfad[3], if zuende & 8 != 0 { "bis Ende" } else { "gedeckelt" },
             je_pfad[4], if zuende & 16 != 0 { "bis Ende" } else { "gedeckelt" },
             je_pfad[5], if zuende & 32 != 0 { "bis Ende" } else { "gedeckelt" },
+            je_pfad[PFAD_FENSTER],
+            if zuende & (1 << PFAD_FENSTER) != 0 { "bis Ende" } else { "gedeckelt" },
+            lade_gefahren,
+            if mit_archiv { "Boot-Archiv da" } else { "KEIN Boot-Archiv -- nicht fahrbar" },
+            je_codes[PFAD_LADEN],
         );
+        {
+            let (dv, dp, dt, dr, dm) = *SWEEP_BILANZ.lock();
+            println!(
+                "sweep   : Bilanz (nachher minus vorher) -- VSpaces={dv} · PD-Slots={dp} · \
+                 Thread-Slots={dt} · Seitentabellen-Rahmen={dr} · freies RAM={dm} Byte. Die \
+                 ersten vier muessen 0 sein und sind Konjunkte: in diesem Fenster bewegt sie nur \
+                 der Sweep (er laeuft, nachdem jedes andere Urteil steht). Beim RAM steht 'nicht \
+                 weniger', weil ein sterbender Thread waehrenddessen seinen Stack zurueckgibt -- \
+                 ein Zuwachs ist kein Befund. Ohne diese Zeile waere 'der Sweep raeumt auf' eine \
+                 Behauptung, und ein halb abgebauter Ladevorgang faelschte jede Zeile nach ihm"
+            );
+        }
         println!(
-            "sweep   : {} (C7-Abdeckung, und die Summanden gehen auf: {} Meldestellen im Kern, \
-             gezaehlt von tools/mangel-stellen.sh -- 17 handgeschriebene (koennen schweigen) + 14 \
-             ueber benannt_alloc/benannt_slot (koennen es strukturell nicht) = 11 + 9 + 10 + 1. \
-             **11 PROVOZIERT** -- 106 Kernel-Stack · 2298/2355 Kernel-Thread-Stack · 2392 \
-             User-Stack · 2509/2544 Seitentabelle in create_vspace · 2908 Seitentabelle im \
-             Fenster · 3088/3241/3382/3383 Privatregion; das sind genau die SPEICHER-Meldestellen \
-             der sechs gefahrenen Pfade, und dass jede einmal an der Reihe war, traegt die Zeile \
-             darueber ('bis Ende'). **9 NICHT: es sind PLATZ-Toepfe** (2318/2372/3140/3305/3466 \
-             Thread-Slot, 2491 ASID, 3212 Farbstreifen, 4178 Thread-Slot, 4256 PD-Slot) -- die \
-             Sperre sitzt im Speicher-Allokator, diese Toepfe vergeben keine Bytes; sie zu leeren \
-             heisst tausende Threads/PDs anzulegen, und das ist die Kapazitaetskurve, die jede \
-             baseline-empfindliche Zeile vor ihr kippt. **10 NICHT: sie liegen im LADEPFAD** \
-             (3911/3947/4009/4028/4044/4057/4090/4106/4120 und 4348 map_region_into_thread) -- \
-             diese Suite hat bauartbedingt kein Boot-Archiv, hier gibt es nichts zu laden; sie \
-             sind der ALTE Mechanismus (SYS_LOAD), der seit jeher in Betrieb ist. **1 NICHT, und \
-             das ist ein Befund ueber die Stelle selbst**: 2917 liegt auf einem gefahrenen Pfad \
-             und kann trotzdem nie gegen den Allokator feuern -- sie meldet genau den Fall 'der \
-             Allokator wurde NICHT gefragt' (krumme VA/PA), und die Sperre fragt ihn. Wer sie \
-             pruefen will, braucht eine krumme Adresse, keinen leeren Topf)",
+            "sweep   : {} (C7-Abdeckung: {provoziert} von {} Meldestellen in DIESEM Lauf \
+             provoziert; der Nenner kommt aus tools/mangel-zaehlen.py, die Summanden aus einer \
+             Zusicherung zur Bauzeit -- eine Klassifikation, die man vergessen kann, ist keine. \
+             {}+{}+{}+{}+{}+{} = {}. **{} PROVOZIERT OHNE ARCHIV**: 125 Kernel-Stack · \
+             2379/2436 Kernel-Thread-Stack · 2473 User-Stack · 2590/2625 Seitentabelle in \
+             create_vspace · 2989 Seitentabelle im Fenster · 3169/3322/3463/3464 Privatregion · \
+             4608 map_region_into_thread -- die letzte stand bis heute als 'Ladepfad' gebucht und \
+             ist keiner: sie ist der Weg zum GERAETEFENSTER einer Treiber-PD und braucht kein \
+             Archiv. **{} PROVOZIERT NUR MIT ARCHIV** (in diesem Lauf: {}): 4288 Segmentspeicher · \
+             4304 Seitentabelle eines Segments · 4350 User-Stack · 4366 Seitentabelle des Stacks \
+             -- der echte load_into_pd_mit, dieselbe Funktion, die SYS_LOAD ruft. **{} PLATZ-\
+             TOEPFE** (2399/2453/3221/3386/3547/4438 Thread-Slot, 2572 ASID, 3293/4171 \
+             Farbstreifen, 4516 PD-Slot): die Sperre sitzt im SPEICHER-Allokator, diese Toepfe \
+             vergeben keine Bytes. **{} 'DER ALLOKATOR WURDE NICHT GEFRAGT'** \
+             (2998/4317/4380 MAPPING_ABGEWIESEN): sie melden genau den Fall 'es lag NICHT am \
+             Speicher' -- erreichbar ueber ein Image mit krummer Segment-VA, nicht ueber einen \
+             leeren Topf. **{} FESTER HAL-VORRAT** (139 Guard-Tabelle): die HAL hat keinen \
+             Allokator. **{} STRUKTURELL NICHT AUSLOESBAR, und das ist ein Befund ueber die \
+             Stellen**: 4207 (vspace_l2 gibt fuer eine soeben angelegte ASID immer Some -- toter \
+             Zweig) und 4269 (fail-closed gegen mehr als 64 Frame-Stuecke -- das braucht ein \
+             IMAGE, keinen leeren Topf))",
             if sweep_messen() { "ALL PASS" } else { "FAILURES" },
-            system::MELDESTELLEN
+            system::MELDESTELLEN,
+            SWEEP_K1_PROVOZIERT_OHNE_ARCHIV,
+            SWEEP_K2_PROVOZIERT_MIT_ARCHIV,
+            SWEEP_K3_PLATZ,
+            SWEEP_K4_NICHT_GEFRAGT,
+            SWEEP_K5_HAL_VORRAT,
+            SWEEP_K6_UNAUSLOESBAR,
+            system::MELDESTELLEN,
+            SWEEP_K1_PROVOZIERT_OHNE_ARCHIV,
+            SWEEP_K2_PROVOZIERT_MIT_ARCHIV,
+            if lade_gefahren > 0 { "gefahren" } else { "NICHT gefahren" },
+            SWEEP_K3_PLATZ,
+            SWEEP_K4_NICHT_GEFRAGT,
+            SWEEP_K5_HAL_VORRAT,
+            SWEEP_K6_UNAUSLOESBAR,
         );
     }
 
@@ -5848,14 +6166,31 @@ pub fn run(multiboot_info: u64) -> ! {
             // je Umdrehung waere ein Pruefer, der die Sache aushungert, die er beobachtet.
             let _ = ptab_messen();
             let _ = mangel_messen();
-            // **Nach `mangel_messen`, und das ist keine Geschmacksfrage:** der Sweep faehrt
-            // dieselbe Provokation ueber sechs Pfade und haelt dabei kurz Ressourcen. Er laeuft
-            // genau einmal, gibt alles wieder her (jeder provozierte Aufruf scheitert und raeumt
-            // selbst auf, die wenigen gelungenen werden abgebaut) -- aber die Reihenfolge bleibt
-            // die vorsichtige.
-            let _ = sweep_messen();
-            if all_done(archive, None) {
-                report_and_off(false);
+            // **Der Sweep laeuft GANZ AM SCHLUSS -- nach jedem anderen Urteil.**
+            //
+            // Er belegt Ressourcen und weist Anforderungen ab; beides kippt baseline-empfindliche
+            // Zeilen (`cycles`, `freeze` mit seiner Positivkontrolle, `color`). Bis heute stand er
+            // einfach in der Schleife und lief damit in der ERSTEN Umdrehung, also mitten in den
+            // Ladevorgaengen. Das ging gut, solange er nur `spawn_*` fuhr; seit er den echten
+            // Ladepfad fahrt (Pfad 7), waere es ein Pruefer, der die Sache aushungert, die er
+            // beobachtet -- genau die Ueberlegung, mit der die Kapazitaetskurve ans Ende von
+            // `report_and_off` gewandert ist.
+            //
+            // Der Platz ist deshalb an eine BEDINGUNG gebunden statt an eine Zeile: erst wenn
+            // jedes andere Konjunkt von `all_done` steht. Der Sweep gattert selbst mit -- er ist
+            // also genau das eine, das dann noch fehlt. Bleibt ein anderes Konjunkt offen, laeuft
+            // der Sweep nie, und der Watchdog nennt das echte Konjunkt zuerst statt es hinter
+            // einem ungefahrenen Sweep zu verstecken.
+            //
+            // Genau EIN `all_done` je Umdrehung wie bisher: die Zeugenliste ersetzt den alten
+            // Aufruf, und der zweite entsteht nur, wenn ohnehin alles andere steht.
+            let mut offen = [("", true); DONE_FLAGS];
+            let _ = all_done(archive, Some(&mut offen));
+            if offen.iter().all(|&(name, ok)| ok || name == "sweep") {
+                let _ = sweep_messen();
+                if all_done(archive, None) {
+                    report_and_off(false);
+                }
             }
             core::hint::spin_loop();
         }

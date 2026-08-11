@@ -564,11 +564,64 @@ pub const IPI_RESCHED_VECTOR: u64 = 33;
 /// Der Frame eines Ring-3-Threads liegt am oberen Ende seines Kernel-Stacks — die Adresse
 /// direkt darüber ist damit genau der richtige `RSP0`.
 fn resume(frame: *mut TrapFrame) -> *mut TrapFrame {
+    // **Der NMI-Wachtposten faellt hier**, auf dem einen Weg, den jede nicht-toedliche Rueckkehr
+    // nimmt. Ein `store(false)` an jedem `return` waere dieselbe Zahl an fuenf Stellen gefuehrt --
+    // und die fuenfte vergisst jemand.
+    // SAFETY: gültiger Frame; nur `vector` gelesen.
+    if unsafe { (*frame).vector } == 2 {
+        if let Some(c) = super::gdt::core_from_tr().filter(|c| *c < MAX_KERNE) {
+            NMI_AKTIV[c].store(false, Ordering::Release);
+        }
+    }
     // SAFETY: gültiger, vom Trap-Pfad angelegter bzw. vom Scheduler gelieferter Frame.
     if unsafe { (*frame).cs } & 3 == 3 {
         super::gdt::set_kernel_stack(frame as u64 + core::mem::size_of::<TrapFrame>() as u64);
     }
     frame
+}
+
+/// **Laeuft auf diesem Kern gerade ein NMI-Handler?** — und wie oft ist waehrenddessen ein
+/// anderer Fault BEENDET worden.
+///
+/// ## Warum das Paar und nicht ein Zaehler
+///
+/// Ein NMI ist nicht maskierbar; die CPU haelt ihn nach dem Eintritt zurueck, bis ein `iret`
+/// laeuft. Das ist die Reentranz-Falle: **jedes** `iret` gibt den Latch frei — auch das eines
+/// ganz anderen Faults, der zufaellig waehrend des NMI-Handlers auftrat und zurueckkehrt. Ab dem
+/// Augenblick kann ein zweiter NMI eintreffen und den IST-Frame des ersten ueberschreiben.
+///
+/// Gezaehlt wird deshalb die **Gelegenheit** und nicht der Zusammenstoss: ein Zaehler, der erst
+/// beim ueberschriebenen Frame anschlaegt, ist in jedem gesunden Lauf stumm und im kranken zu
+/// spaet. Dieselbe Konstruktion wie beim `pdbind`-Waechter (die Reihenfolge ist in jedem Lauf
+/// pruefbar, das Unglueck in einem von 5556) und wie beim TSS-Zaehler.
+///
+/// ## Der Vertrag, den die Zahl bewacht
+///
+/// **Der NMI-Handler darf nicht faulten.** Er fasst ausschliesslich seinen IST-Stack und
+/// Per-Kern-Atomics an — kein `println!` mit Formatierung ueber fremde Strukturen, keine Sperre,
+/// kein Zugriff auf Speicher, der unabgebildet sein koennte. Solange der Handler so klein bleibt,
+/// traegt der Vertrag durch Gegenlesen; waechst er, gehoert ein Symbol-Waechter dazu.
+static NMI_AKTIV: [core::sync::atomic::AtomicBool; MAX_KERNE] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_KERNE];
+static NMI_FENSTER: [AtomicU64; MAX_KERNE] = [const { AtomicU64::new(0) }; MAX_KERNE];
+static NMI_GESEHEN: [AtomicU64; MAX_KERNE] = [const { AtomicU64::new(0) }; MAX_KERNE];
+
+/// So viele Kerne fuehrt die NMI-Buchhaltung. Dieselbe Schranke wie die per-Kern-TSS.
+const MAX_KERNE: usize = 16;
+
+/// `(NMI gesehen, Fenster: Fault waehrend NMI beendet)` ueber alle Kerne.
+///
+/// **Beides gehoert in die Zeile.** `Fenster == 0` allein waere von „es kam nie ein NMI" nicht zu
+/// unterscheiden — und unter QEMU ohne Watchdog ist genau das der Normalfall. Erst das Paar sagt,
+/// ob die Aussage ueberhaupt Gegenstand hatte.
+pub fn nmi_bilanz() -> (u64, u64) {
+    let mut g = 0;
+    let mut f = 0;
+    for k in 0..MAX_KERNE {
+        g += NMI_GESEHEN[k].load(Ordering::Relaxed);
+        f += NMI_FENSTER[k].load(Ordering::Relaxed);
+    }
+    (g, f)
 }
 
 #[no_mangle]
@@ -595,6 +648,25 @@ pub extern "C" fn handle_exception(frame: *mut TrapFrame) -> *mut TrapFrame {
     // es gibt keine Rückkehr. Der einzige richtige Ausgang ist: laut reden, dann anhalten.
     if vector == 8 {
         df_fatal(frame);
+    }
+
+    // --- NMI-Reentranz: das Fenster BUCHEN, bevor irgendetwas anderes passiert -----------------
+    //
+    // Gesetzt beim Eintritt, geloescht beim Austritt (jeder `return`-Weg unten laeuft ueber
+    // `resume`/`fatal`, deshalb wird hier ein Wachtposten gesetzt und am Ende der Funktion
+    // geloescht). Jeder ANDERE Fault, der waehrend dieser Zeit zurueckkehrt, gibt den NMI-Latch
+    // frei -- das ist die Gelegenheit, und die wird gezaehlt.
+    let kern_idx = super::gdt::core_from_tr().filter(|c| *c < MAX_KERNE);
+    if vector == 2 {
+        if let Some(c) = kern_idx {
+            NMI_GESEHEN[c].fetch_add(1, Ordering::Relaxed);
+            NMI_AKTIV[c].store(true, Ordering::Release);
+        }
+    } else if let Some(c) = kern_idx {
+        // Ein anderer Fault kehrt gleich per `iret` zurueck -- WAEHREND ein NMI-Handler laeuft.
+        if NMI_AKTIV[c].load(Ordering::Acquire) {
+            NMI_FENSTER[c].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     // --- Die IST-Sonde (nur `selftest`) ---------------------------------------------------------
@@ -824,6 +896,28 @@ fn df_fatal(frame: *mut TrapFrame) -> ! {
                     kb + kl,
                     kl,
                 ));
+                // **Zeigt `rsp0` ueberhaupt noch auf einen VERGEBENEN Stack?**
+                //
+                // `TSS.rsp0` behaelt seinen Wert, auch wenn der Thread laengst tot und sein Stack
+                // freigegeben ist -- am 2026-08-11 gemessen, als eine Sonde daraus die Wache
+                // rechnete und einen toten Stack traf. Im Ernstfall hiesse das: der Bericht
+                // vermisst einen anderen Verdaechtigen als den, der ueberlaufen ist.
+                //
+                // Sperrfrei beantwortbar ist es trotzdem, und zwar mit der Wache selbst: sie wird
+                // beim Freigeben wieder eingehaengt. Steht sie, ist der Stack vergeben; fehlt sie,
+                // ist `rsp0` veraltet. Was die Zeile NICHT sagen kann: ob er noch demselben Thread
+                // gehoert -- ein neu vergebener Stack traegt wieder eine Wache. Dafuer steht die
+                // Zeile darueber (letzter Ring-3-Kontext), und beide zusammen ergeben ein Urteil.
+                //
+                // Warum nicht in `KSTACKS` nachsehen: das ist ein Ticket-Lock, und ein `#DF` kann
+                // den Kontext unterbrochen haben, der ihn haelt.
+                console::emit_raw(if kb >= 4096 && super::mmu::ist_wache(kb - 4096) {
+                    "  ... dieser Stack ist BEWACHT, also vergeben (ob an denselben Thread, sagt \
+                     das nicht -- ein neu vergebener traegt wieder eine Wache)\n"
+                } else {
+                    "  ... dieser Stack traegt KEINE Wache: er ist freigegeben, TSS.rsp0 ist \
+                     VERALTET -- der Wasserstand unten gehoert dann niemandem mehr\n"
+                });
                 match wasserstand(kb, kl) {
                     Some(b) => console::emit_fmt(format_args!(
                         "  betroffener EL1-Stack Wasserstand: {} von {} B benutzt ({} B frei){}\n",

@@ -225,6 +225,13 @@ pub fn urteil() -> bool {
         && hal::gdt::ohne_tss() == 0
         && n > 0
         && (0..n).all(|c| ERGEBNIS.get(c).is_some_and(|e| e.load(Ordering::Acquire) == B_ALLE))
+        // **Die NMI-Reentranz gattert mit.** `fenster == 0` heisst: kein fremder Fault ist
+        // zurueckgekehrt, waehrend ein NMI-Handler lief -- der Augenblick, in dem ein zweiter NMI
+        // den IST-Frame des ersten ueberschreiben koennte. Die Zahl `gesehen` gehoert NICHT in
+        // dieses Urteil: unter QEMU ohne Watchdog kommt kein NMI, und ein Konjunkt, das dort
+        // dauerhaft falsch waere, hiesse „die Suite ist rot, weil die Maschine keine NMIs hat".
+        // Sie steht in der Berichtszeile, damit ein Leser sieht, ob die Aussage Gegenstand hatte.
+        && hal::exception::nmi_bilanz().1 == 0
 }
 
 #[cfg(not(feature = "selftest"))]
@@ -280,6 +287,26 @@ pub fn bericht() {
         " (die Sonde beruehrt NMI und #MC; #DF bleibt hier unberuehrt und wird in \
          tools/df-sonde.sh echt gemessen)"
     );
+    // **Die NMI-Reentranz -- gezaehlt wird das FENSTER, nicht der Zusammenstoss.**
+    //
+    // Ein NMI ist nicht maskierbar, und die CPU haelt ihn nach dem Eintritt zurueck, bis ein
+    // `iret` laeuft. Brisant ist deshalb nicht der zweite NMI, sondern der Augenblick: JEDES
+    // `iret` gibt den Latch frei -- auch das eines fremden Faults, der zufaellig waehrend des
+    // NMI-Handlers auftrat. Ab da kann ein zweiter NMI den IST-Frame des ersten ueberschreiben.
+    //
+    // Deshalb das PAAR: `gesehen` sagt, ob die Aussage ueberhaupt Gegenstand hatte (unter QEMU
+    // ohne Watchdog kommt sonst nie einer), `fenster` zaehlt die Gelegenheiten. Ein Zaehler, der
+    // erst beim ueberschriebenen Frame anschlaegt, waere in jedem gesunden Lauf stumm und im
+    // kranken zu spaet -- dieselbe Ueberlegung wie bei `pdbind`.
+    let (nmi_gesehen, nmi_fenster) = hal::exception::nmi_bilanz();
+    println!(
+        "ist     : NMI-Reentranz -- gesehen={nmi_gesehen} · Fenster (fremder Fault kehrte \
+         zurueck, WAEHREND ein NMI-Handler lief)={nmi_fenster} (muss 0 sein). Der Vertrag dazu: \
+         der NMI-Handler fasst nur seinen IST-Stack und Per-Kern-Atomics an -- keine Sperre, \
+         keine Formatierung ueber fremde Strukturen, nichts, was faulten kann. `gesehen=0` \
+         hiesse: unter diesem Messstand kam kein NMI, die Zeile hatte keinen Gegenstand"
+    );
+
     // **Die Antwort auf „laufen heute Ring-3-Threads auf Sekundaerkernen?"** -- gezaehlt wird die
     // GELEGENHEIT (jede vorbereitete Rueckkehr nach Ring 3), nicht das Unglueck. Ein Melder, der
     // nur beim Zusammenstoss spricht, waere in jedem gesunden Lauf stumm.
@@ -368,6 +395,27 @@ pub fn df_wache_ausloesen() -> ! {
     // war: beide `push` gingen durch, der Kernel lief in ein `#UD` statt in einen `#DF`. Ein
     // gerechneter Aufbau ist dieselbe Falle wie ein Pruefer, der die gepruefte Groesse
     // nachrechnet. Nebenbefund, der bleibt: `TSS.rsp0` kann auf einen TOTEN Stack zeigen.
+    //
+    // **Das `#UD` ist erklaert und war KEINE Speicherkorruption** (nachgemessen 2026-08-11, weil
+    // ein unverstandener Fault unter einem gruenen Lauf ein offener Fall ist). Reproduziert mit
+    // der alten Fassung, und die Adresse im SELBEN Binary nachgelesen:
+    //
+    //     14ee55: 48 89 dc   mov %rbx,%rsp
+    //     14ee58: 50         push %rax
+    //     14ee59: 50         push %rax
+    //     14ee5b: 0f 0b      ud2      <- rip des #UD
+    //
+    // `asm!(.., options(noreturn))` verspricht dem Uebersetzer, dass die Kontrolle nicht
+    // zurueckkommt; rustc legt fuer den Fall, dass sie es doch tut, ein `ud2` dahinter. Genau das
+    // ist passiert, weil beide `push` durchgingen. Das `#UD` ist also die KORREKTE Anzeige eines
+    // Sondenfehlers und nicht die Spur eines Treffers.
+    //
+    // **Was die alte Fassung trotzdem angerichtet hat, und das bleibt wahr:** sie hat zwei Worte
+    // in Speicher geschrieben, der ihr nicht gehoerte -- der Stack war freigegeben, seine Wache
+    // wieder eingehaengt. Ob er in diesem Augenblick schon neu vergeben war, ist aus dem
+    // (geloeschten) Protokoll nicht mehr feststellbar; der Schreibzugriff selbst ist sicher.
+    // Die heutige Fassung kann das nicht mehr: sie zielt auf eine nachweislich NICHT abgebildete
+    // Seite, dort faultet der Zugriff, statt zu treffen.
     let Some(wache) = hal::mmu::erste_lebende_wache() else {
         println!(
             "dfsonde : KEINE stehende Wache gefunden -- Sonde bricht ab. Das ist ein \

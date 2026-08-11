@@ -3435,3 +3435,1614 @@ Gate fährt diesen Selbsttest jetzt vor den Beweisen.
 nicht eingesammelt", obwohl sie eingesammelt wurde. Ein Prüfer, der an seiner eigenen Mechanik
 scheitert und das als Befund ausgibt, ist derselbe Fehler wie die Pipe in der ARM-Suite, nur in
 klein.)*
+
+
+## Aus `todo.md` herübergeräumt am 2026-08-11
+
+`todo.md` ist die Quelle für **was ist noch offen**. Erledigtes darin macht genau diese
+Frage unbeantwortbar — dieselbe Form, die der Modell-Treue-Wächter einmal an sich selbst
+gemeldet hat. Was hier steht, ist deshalb **nicht** neu geschrieben, sondern wörtlich
+verschoben: die Begründungen sind der Wert, nicht die Häkchen.
+
+
+### Ganze Einträge, die nur noch Erledigtes trugen
+
+## ~~SPERRT DIE INTEGRATION~~: das nullgrosse LOAD-Duplikat — **URSACHE GEFUNDEN, BEHOBEN** (2026-08-10, abends)
+
+**Die Ursache lag NICHT im Linkerskript, sondern in der BAUUMGEBUNG — und deshalb hat kein
+einziger der drei Versuche daran etwas ändern können.**
+
+Gemessen, mit einer Zeile:
+
+```
+$ cargo -Zunstable-options config get target.x86_64-unknown-none.rustflags
+["-C","link-arg=-Tkernel/x86_64-link.ld","-C","relocation-model=static",
+ "-C","link-arg=-Tkernel/x86_64-link.ld","-C","relocation-model=static"]
+```
+
+**Cargo liest `.cargo/config.toml` aus JEDEM Vorfahrenverzeichnis und hängt Array-Werte
+aneinander.** Ein Agenten-Worktree liegt unter `<repo>/.claude/worktrees/<id>`, also **innerhalb**
+des Hauptbaums — Cargo findet die Konfiguration deshalb zweimal, und `-Tkernel/x86_64-link.ld`
+steht doppelt auf der Linkerzeile. `lld` wertet den `SECTIONS`-Block dann **zweimal** aus. Alles
+Weitere folgt daraus:
+
+* **Die sieben leeren Doppel-Sektionen** sind genau die Ausgabesektionen, die ausser
+  Eingabe-Beschreibungen noch etwas enthalten (`. = ALIGN(..)`, Symbolzuweisung, feste Adresse).
+  `.boot`, `.data`, `.boot_bss` bestehen nur aus `*(...)` — leere Ausgabesektionen dieser Art
+  verwirft lld, deshalb fehlen genau diese drei in der Duplikatliste. Das Muster, an dem der
+  Befund hing, war die ganze Zeit die Antwort.
+* **Alle Linkersymbole trugen die Werte des ZWEITEN Durchlaufs** (`. ` fängt wieder bei 1M an):
+  `__text_start = 0x100000`, `__bss_start = 0x101000`, `__aptramp_lma = 0x100000`. Der gesunde
+  Hauptbaum hat `0x101000 / 0x18e000 / 0x18d000`. **Das ist der eigentliche Schaden** — das
+  nullgrosse LOAD-Segment und der verschobene Multiboot-Header sind nur seine sichtbarste Folge.
+
+**Warum der Gegenversuch aus dem alten Eintrag ebenfalls fehlerhaft baute** („A3-Code im selben
+Worktree zurückgenommen"): die Ursache war der **Ort** des Worktrees, nicht sein Inhalt. Die
+Vermutung „der Worktree-Zustand ist selbst verdächtig" war richtig, nur eine Ebene zu vage.
+
+**Behoben** in `build-x86.sh` und `build.sh`: `tools/rustflags-entdoppeln.py` liest die
+**effektive** Flagliste, entdoppelt sie und setzt sie als `RUSTFLAGS` — und meldet **laut**, dass
+es das getan hat (eine stille Reparatur wäre dieselbe Krankheit wie das stille Mischen).
+`RUSTFLAGS` und **nicht** `CARGO_TARGET_<T>_RUSTFLAGS`: gemessen wird die zielspezifische
+Variable von Cargo mit der Konfiguration **mitgemischt** — danach standen die Flags dreifach da
+und das Abbild war schlechter statt besser. `RUSTFLAGS` ersetzt.
+
+**Belegt:** 22 Sektionen statt 29, sieben LOAD-Segmente ohne nullgrosses, letztes Segment
+`filesz=0x58` statt `0xf7000`, Multiboot-Header bei Dateioffset 4096, `./test-qemu-x86.sh` →
+`== ALL PASS ==`. **Das Linkerskript ist dabei unverändert geblieben** (`git diff` leer) — die
+drei Versuche (a)/(b)/(b2) haben ein Symptom bearbeitet und können aus dem Register.
+
+**Zwei Dinge, die daraus folgen und breiter gelten:**
+
+* **Die literale Abnahmezeile `cargo build --release -p caprock-kernel --target
+  x86_64-unknown-none --features selftest` ist in einem Worktree SELBST betroffen** — sie umgeht
+  `build-x86.sh` und erzeugt das kaputte Abbild. Wer sie zur Abnahme benutzt, misst ein Artefakt,
+  das nie gebootet hätte.
+* **Dasselbe Loch stand im F1-Gate der Suite.** `test-qemu-x86.sh` baute die
+  `--no-default-features`-Konfiguration mit direktem `cargo`, las die `.text`-Grösse mit
+  `grep -A1 " .text " | tail -1` — und traf damit die **leere Doppel-Sektion**. `NOSEL_TEXT` stand
+  auf **0**, und die Zeile meldete `PASS` („0 < 0x62000") für eine Zahl, die kein Messwert war.
+  Behoben; die Grösse ist jetzt wieder eine gemessene (`0x362a5`).
+
+- [ ] **Offen bleibt die strukturelle Frage:** ein Worktree im Repo erbt jede
+      Vorfahren-Konfiguration doppelt — das betrifft auch `programs/.cargo/config.toml` (dort
+      steht `-Tuser.ld` **neben** dem geerbten `-Tkernel/...`) und damit die Lade-Suite. Geprüft
+      ist das nicht; der Entdoppler deckt heute nur die beiden Kernel-Bauwege ab.
+
+## Das nullgrosse LOAD-Duplikat — der Stand VOR der Ursachenfindung (zum Nachlesen)
+
+**Klasse:** Bauwerkzeug · **Stand:** überholt, s. o.
+
+Ein halber Tag ging an einen Blocker, den es als Codeproblem **nie gab**. Der Ablauf, weil er die
+Lehre trägt:
+
+1. Zwei Agenten meldeten unabhängig, die x86-Suite laufe „in diesem Baum nicht"
+   (`Error loading uncompressed kernel without PVH ELF Note`, Logdatei 0 Byte), und schrieben es
+   der **Grundlinie** zu.
+2. Nachgemessen: der Hauptbaum war gesund (`.boot` bei Offset 4096, warm **und kalt** gebaut,
+   beide Suiten grün), die Änderungszweige nicht. Daraus wurde „die Änderungen kippen die
+   Sektionslage" — **auch das war falsch**.
+3. Drei Behebungsversuche am Linkerskript, jeder gemessen, jeder zurückgenommen.
+4. **Die Ursache war, dass Cargo Linkerskripte nicht als Bau-Eingabe kannte.** Ohne
+   `rerun-if-changed` löst eine `.ld`-Änderung **kein Neu-Linken** aus; in den Agenten-Worktrees
+   war der Linkerschritt damit gegen einen Stand gelaufen, den es so nicht mehr gab.
+5. Gegenprobe: ein **frischer** Integrationszweig im Hauptbaum, mit den `rerun-if-changed`-Haken
+   von Anfang an, mit derselben A3-Arbeit gemerged → **keine leeren Duplikatsektionen**, Header
+   bei 4096, `== ALL PASS ==` in **beiden** Suiten, alle Wächter grün.
+
+**ZWEI BERICHTIGUNGEN, in dieser Reihenfolge gezogen — und die zweite hat die erste überholt.**
+
+*Erste (vormittags):* „Der Blocker existierte als Codeproblem nie" war eine Hypothese im
+Ergebniskostüm; belegt war nur „**reproduziert auf frischem Zweig nicht**". Richtig gezogen — aber
+das benannte **Residualrisiko („ein reihenfolgeabhängiges Layout")** zeigte in die **falsche
+Richtung**. Die Reihenfolge war nie das Thema.
+
+*Zweite (abends, s. o.):* die Ursache ist ein **benennbarer, jederzeit auslösbarer Mechanismus** —
+Cargo mischt Vorfahren-Konfigurationen und hängt Arrays an. „Aufgelöst" war damit ebenfalls zu
+früh: der Mechanismus ist nicht weg, er **verschonte den Hauptbaum nur zufällig** (dort gibt es
+genau eine Konfiguration) und trifft jeden, der in einem verschachtelten Arbeitsbaum baut.
+
+Der Unterschied ist nicht akademisch. Die drei Versuchszeilen sind als *Messwerte* entwertet, die
+*Beobachtungen* aber waren echte `readelf`-Ausgaben — nur eben von einem Abbild, dessen
+Linkerskript zweimal ausgewertet worden war. **Zusammen mit dem wasm-Eintrag ist das der Grund,
+warum „aufgelöst" ein Messwert sein muss und kein Gefühl:** dort sagte das Muster die falsche
+Hypothese exakt voraus, hier hat die zweite Grabung die bequeme erste Erklärung („Bau-Artefakt,
+weg damit") durch die unbequeme richtige ersetzt.
+
+**Deshalb ist die Eigenschaft jetzt dauerhaft geprüft statt behauptet:** der Bauzeit-Wächter
+verlangt zusätzlich, dass **kein LOAD-Segment Dateiinhalt trägt, wo nur NOBITS-Sektionen liegen** —
+genau die Form, an der sich der Fall zeigte, nicht die vermutete Ursache. Dieselbe Bewegung, die
+aus dem wasm-Fall die Vollzähligkeits-Zeile gemacht hat.
+Zwei eigene Fehler dabei, beide gemessen: die erste Fassung **rechnete die Zuordnung
+Sektion → Segment nach** statt sie zu lesen und ordnete dem Segment bei `0x9000` prompt `.boot`,
+`.text` und `.rodata` zu (dessen `memsz` überspannt den ganzen Bildbereich) — die
+`iova_window_clear_of_msi`-Falle, im eigenen Wächter. Jetzt wird die Zuordnung aus `readelf`
+gelesen. Und die Sprechprobe hat das gefangen, nicht das Gegenlesen: mit `all` → `any` mutiert
+nennt der Wächter jetzt genau `.aptramp_data, .bss, .boot_bss`.
+
+**Die Lehre ist nicht „Linkerskripte sind heikel", sondern: eine Messung muss wissen, welches
+Artefakt sie gemessen hat.** Der Binary-Fingerprint der Suiten schliesst „veralteter Build" als
+Erklärung für einen *Suitenlauf* aus — für den *Linkerschritt* war dieselbe Tür offen, und drei
+Versuchszeilen einer Tabelle beschrieben einen Stand, den es nie gab. Eine Versuchstabelle, deren
+Spalte „bootet" nicht misst, was sie behauptet, ist schlimmer als keine.
+
+**Was bleibt und sich gelohnt hat:**
+
+- [x] `kernel/build.rs` + `programs/libcaprock/build.rs` melden die vier `.ld`-Dateien als
+      `rerun-if-changed`. Gemessen: ein `touch` aufs Skript allein löst `Compiling caprock-kernel`
+      aus. Eine Datei statt sieben bei den Programmen, weil jedes Programm `libcaprock` linkt.
+- [x] **Der Bauzeit-Wächter in `build-x86.sh`**: der Multiboot-Header muss in den ersten 8192
+      Dateibytes liegen, sonst `BUILD FAILED` mit dem gemessenen Offset **und** der LOAD-Tabelle.
+      Die Bedingung stand seit jeher im Linkerskript und wurde von nichts durchgesetzt. Sie ist
+      **grenzwertig**, nicht stabil — ein Bauwerkzeug, das ein unbootbares Abbild ausliefert, ist
+      die Bauzeit-Fassung von „Schweigen als Erfolg".
+- [ ] **Messregel, ab sofort:** `KEIN OUTPUT` ist als Befund **unterbestimmt**. „Lädt nicht" und
+      „läuft, aber die Konsole hängt an einer verschobenen Adresse" sind darunter
+      ununterscheidbar. `-d int` (kommen überhaupt Faults?) und `info registers` (wo steht das
+      System?) gehören dazu, bevor ein `KEIN OUTPUT` als Zeile ins Register geht.
+- [ ] **Und für Agenten in Worktrees:** `git stash` nicht benutzen — `refs/stash` ist über alle
+      Worktrees geteilt, und zwei Agenten haben sich damit gegenseitig den Stand gepoppt (beide
+      über `git fsck` zurückgelegt, nichts verloren).
+
+## NULL IST EIN BEFUND, KEIN MESSWERT — der Durchgang durch die einseitigen Vergleiche
+
+**Klasse:** Prüferform · **Stand:** durchgegangen 2026-08-10, **eine** lebende Fundstelle, behoben
+
+Der F1-Fund trägt eine Regel, die über F1 hinausgeht. `0 < 0x62000 ⇒ PASS` ist ein Prüfer, der
+**bei Totalausfall der Messung grün wird** — dieselbe Form wie ein nie gesetztes Bit, das als
+„kein Fehler" gelesen wird, nur als Schwellenvergleich statt als Flagge. Die Regel:
+
+> Jede gemessene Grösse, die in einen Vergleich mit **nur einer** Schranke geht, braucht eine
+> **Plausibilitätsuntergrenze** — oder der Wert Null muss ausdrücklich als **„nicht gemessen"**
+> ausscheiden. „Nicht messbar" ist kein bestandener Test.
+
+**Der Durchgang, mit Zahlen — damit „ich habe nachgesehen" nicht wieder ein Nullbefund ohne
+Grösse ist** (dieselbe Falle wie „habe ich noch nie gesehen"):
+
+| gesucht | gefunden |
+|---|---|
+| numerische Vergleiche in den drei QEMU-Suiten und allen `tools/*.sh` (`-lt/-gt/-le/-ge`) | **41** |
+| davon ohne vorherige `-n`/`-z`-Absicherung oder `> 0`-Wächter | **1** — die F1-Zeile |
+| Urteilszeilen im Kernel der Form `wert </<= KONSTANTE` | **0** (alle Treffer sind Schleifenwächter, keine Urteile) |
+| Urteilszeilen im Kernel der Form `wert > 0 && …` | durchgehend, das ist die gesunde Form |
+
+Behoben ist die eine: F1 hat jetzt `F1_MIN = 0x10000` **und** einen eigenen Zweig für „nicht
+messbar" (leerer Wert ⇒ `FAIL`, nicht stillschweigend `else`). Die Untergrenze ist begründet und
+nicht gegriffen: ein Kernel ohne Prüfinfrastruktur hat weiterhin Scheduler, IPC,
+Speicherverwaltung und HAL; unter 64 KiB `.text` ist das kein kleineres Abbild, sondern ein
+kaputter Bau.
+
+**Was der Durchgang NICHT abdeckt und offen bleibt:** Prüfer, die eine Grösse gar nicht erst
+erheben (die Klasse „ein Test, der nirgends läuft"), und Vergleiche innerhalb der Verus-Modelle.
+Ein Durchgang, der seine eigene Reichweite nicht nennt, ist die nächste Nullaussage.
+
+### Z25. Eager-FP auf x86 — der Dreier-Commit, 2026-08-09 — **ZU**
+**Klasse:** Sicherheit · **Stand:** alles fertig und gemessen; `fp : ALL PASS` und die Zeile
+**gattert** (`all_done`, 27 Flags). Zwei Gegenproben mit unterscheidbarer Signatur, s. unten.
+
+- [x] **Der Auslöser liegt im WECHSEL, nicht im ersten Zugriff.** `CR0.TS` bleibt nach `enable_sse`
+      dauerhaft aus; `sync_fp_trap` sichert/lädt beim Wechsel. Grund ist **CVE-2018-3665
+      (LazyFP)**: mit gesetztem `TS` wird der `FXRSTOR` aufgeschoben, und spekulative Ausführung
+      kann die Register des **vorigen** Besitzers lesen, bevor das `#NM` zugestellt ist. Seit SSE
+      für Userland scharf ist, kann dort Schlüsselmaterial liegen.
+      Billig bleibt es trotzdem: wechselt der laufende Thread nicht (jeder Syscall ohne
+      Umplanung), passiert nichts.
+
+- [x] **`#NM` ist eine laute Invariante — mit RIP, Kern-ID und `CR0` —, und der Zähler läuft JE
+      KERN.** Global summiert ginge ein einzelner AP, dessen `enable_sse` in einem Refactor aus
+      der Reihenfolge rutscht, im Rauschen der übrigen unter — und das ist die wahrscheinlichste
+      künftige Regression. **Gemessen: `k0=0 k1=0 k2=0 k3=0`.**
+      Nicht angehalten wird: ein Panic reisst den Knoten nachweislich **nicht** mit (§14), er
+      verschlechterte nur die Diagnose. Der Zähler macht den Lauf rot, das genügt.
+
+- [x] **`ts_loeschen` meldet, statt still zu reparieren.** `ts_vorgefunden()` zählt, wie oft
+      `CR0.TS` gesetzt **vorgefunden** wurde — unter eager muss das 0 sein. Ein `debug_assert!`
+      wäre im Release-Bau weg, und dort läuft die Suite. **Gemessen: 0.**
+
+- [x] **Das Vektor-Inventar** — ein Zähler je CPU-Ausnahme (0..31), von der Suite gedruckt.
+      Vektor 7 ist die Zeile, um die es geht; die übrigen stehen dabei, **damit sichtbar ist, dass
+      überhaupt gezählt wird** (ein Melder, der nur beim Unglück spricht, ist in jedem gesunden
+      Lauf stumm). Der heisse Syscall-/Timer-Pfad ist bewusst **nicht** dabei.
+      **Gemessen: `14(#PF)=2`, sonst nichts — Vektor 7 kommt gar nicht vor.**
+
+- [x] **Die aarch64-Divergenz ist begründet, in BEIDEN HAL-Verträgen.** `CPACR_EL1.FPEN` trappt
+      präzise und **nur EL0**; eine LazyFP-Entsprechung ist nicht veröffentlicht. Die
+      Trap-Reichweiten sind verschieden, und die Exponierung ist es auch. Beide Dateien nennen die
+      jeweils andere Seite — die vorige Fassung sah auf einer Architektur eager und auf der anderen
+      lazy aus, **ohne dass irgendwo stand warum**, und war damals tatsächlich ein Versehen.
+
+- [x] **Die rote FP-Sonde war ein Fehler im KRITERIUM, nicht im Kernel — und das Kriterium war
+      unerreichbar.** Verlangt war „das Muster hat **alle 64** Abgaben überstanden". Gemessen kam
+      die Sonde bis **3/64** — bei grüner Sofortprüfung (1000/1000, also beim ersten Versuch) und
+      **null** gemeldeten Korruptionen. Sie war nie korrumpiert, sie war **langsamer als der
+      Bericht**: eine Iteration je Rundlauf-Runde, und eine Runde ist durch den **Tick** begrenzt,
+      nicht durch das `YIELD`. Die 64 war eine Zahl ohne Bezug zur Rundenlänge.
+      **Ein Kriterium, das die geprüfte Sache nicht erreichen kann, ist kein strenges Kriterium,
+      sondern gar keins:** grün ist unmöglich, also sagt rot nichts. Es hat keine Trennschärfe —
+      dieselbe Form wie ein Prüfer, der die falsche Größe liest, nur von der anderen Seite.
+- [x] **Die Sprechprobe ist die EIGENE Verdrängungszahl der Sonde, nicht die globale.**
+      `fp_switch_count()` sagt, dass irgendwo gewechselt wurde. Lägen beide Sonden auf
+      verschiedenen Kernen und verdrängten einander nie, wäre die Zahl hoch und die
+      Musterprüfung **gegenstandslos** — sie prüfte Register, die zwischen ihren Abgaben niemand
+      angefasst hat. Dieselbe Form wie `rx_used` gegen „Daten sind angekommen".
+      Neu: `fp_watch`/`fp_watch_restores` zählen die Restores **dieser** Threads, eingetragen nach
+      der Zulassung (der Zähler ist damit eine **Untergrenze** — er verliert höchstens die ersten
+      Restores, und in der Richtung, die den Test strenger macht).
+      **Gemessen: Verdrängungen 4/4 bei Fortschritt 3/3** — also ≈ eine Verdrängung je Iteration.
+      Die Sonden kontrahieren wirklich; das war vorher nicht belegt, sondern angenommen.
+- [x] **Gefordert wird `>= 2`, nicht `>= 1`** — der erste Restore lädt einen frisch genullten Slot,
+      also *bevor* die Sonde ihr Muster geschrieben hat. Erst der zweite belegt, dass ein
+      **geschriebenes** Muster eine Verdrängung überstanden hat.
+- [x] **Das Urteil steht an EINER Stelle (`fp_urteil()`), und `fp` gattert jetzt** (`all_done`,
+      26 → 27 Flags). Vorher war das Draussenbleiben richtig (ein unerreichbares Kriterium hätte
+      die Suite dauerhaft rot gefärbt); mit einem erreichbaren Kriterium wäre es das Gegenteil —
+      eine grüne Zeile, die nichts gattert, also genau der `pdbind`-Fehler.
+      Der Eintrag in `BEKANNT_ROT` ist **ausgetragen**, mit dem Grund an der Stelle.
+- [x] **Zwei Gegenproben, und sie sind UNTERSCHEIDBAR rot** — der gefundene Wert benennt die
+      Ursache, statt nur „nicht meins" zu sagen:
+      * **kein Save des vorigen Besitzers** → `Sonde0=0x8000000000000000` = Markerbit 63 plus
+        lauter Nullen, also „ein frisch genullter Slot wurde restauriert". Verdrängungen blieben
+        bei 2/2 — die Sprechprobe spricht also **weiter**, während die Eigenschaft fällt, und das
+        ist ihre Aufgabe.
+      * **kein Restore** → `Sonde0=0xa5a55a5a3c3cc3c3`, wörtlich das **Muster des Partners**:
+        Identitätsvertauschung, der FP-Zustand folgt der CPU statt dem Thread.
+      Beide `fp : FAILURES`, danach wieder `== ALL PASS ==`.
+      Ehrlich dazu: die Isolation ist hier **nicht** vollständig — mit der Korruption fällt
+      zwangsläufig auch der Fortschritt, weil die Sonde bei Erkennung parkt. Das sind nicht zwei
+      Fehler, sondern eine Wirkung mit zwei sichtbaren Folgen; die Konjunkte sind kausal verkettet,
+      nicht unabhängig.
+- [x] **Was die alte Diagnose kostete, bleibt als Lehre stehen.** Der Berichtstext nannte als
+      Ursache „`CR4.OSFXSR` wird nirgends gesetzt" — seit A4 überholt. Die Zeile blieb rot, die
+      Erklärung stimmte nicht mehr, und nachdiagnostiziert hat es niemand. **Ein Grund, der nicht
+      mehr stimmt, macht den Punkt unbehebbar** — dieselbe Form wie der falsche `SYS_MAP`-Grund im
+      Identitäts-Wächter.
+
+### Z24. Der Blockadegrund ist eine MENGE, keine Bit-Sammlung — **GEBAUT 2026-08-10**
+
+**Stand:** umgesetzt und gemessen. x86 Haupt-Suite `== ALL PASS ==`, Lade-Suite unverändert
+(nur der bekannte `wasm`-Rest), **aarch64 `== ALL PASS ==`**, Host-Tests, alle drei
+Modelltreue-Wächter, Kerngrenze/Zulassung/Identität grün. Zwei Gegenproben, beide isolierend.
+
+- [x] **`BlockReasons` steht, und die tragende Aussage steht in EINER Zeile:** eingereiht wird
+      **nur bei leerer Menge** (`wecke_falls_lauffaehig`). Ohne diesen Halbsatz wäre die Menge
+      bloss eine andere Schreibweise für dieselben Bits.
+      `blocked`/`budget_blocked`/`parked` sind als Felder **verschwunden**; `park_wake` bleibt
+      eigenes Feld — es ist eine Marke, kein Grund.
+
+- [x] **Zwei Gegenproben, jede kippt GENAU EIN Konjunkt.**
+      * **M1** — `unpark` entfernt *alle* Gründe statt `PARK`: `lief-trotz-pause=true`, alle
+        sechs übrigen Aussagen bleiben grün.
+      * **M2** — eingereiht wird *ohne* die leere Menge zu verlangen: dasselbe eine Konjunkt kippt.
+      Beide `park : FAILURES`, danach wieder `== ALL PASS ==`. Damit ist belegt, dass **beide**
+      Hälften der Regel tragen, nicht nur die griffigere.
+
+- [x] **Neu: die Aussage „verlorenes Pausieren" — die es bis dahin nicht gab.** Gemessen an der
+      **Wirkung** (ein Rundenzähler der Park-Sonde), nicht an einem Bit: einfrieren, dann das
+      `UNPARK` eines Geschwisters — der Zähler darf sich **nicht** bewegen. Mit Sprechprobe
+      (`laeuft-nach-thaw`), denn sonst wäre „bewegt sich nicht" von „darf sich nicht bewegen"
+      nicht zu unterscheiden.
+
+- [x] **`H-b` ist WEGGEFALLEN, nicht umgeschrieben.** `pause` löschte bis dahin den Budget-Grund
+      („PAUSE ÜBERNIMMT die Blockade") — es **musste** einen fremden Grund löschen, um den eigenen
+      durchzusetzen, weil ein einziges Bit keine zwei Gründe trägt. Der Preis stand im Kommentar
+      daneben: ein pausierter und wieder fortgesetzter Thread lief auf **leerem Konto** weiter.
+      Mit der Menge verschwindet der Griff ersatzlos. Dieselbe Auflösung wie bei der D9-Aussage.
+
+- [x] **Ein Wecker muss ab jetzt seinen Grund NENNEN — und das hat drei Stellen aufgedeckt:**
+      * `SYS_PDCTL` RESUME/START rief `unblock`, also „hebe irgendeine Blockade auf". Neu:
+        `resume` (entfernt `PAUSE`), durch alle drei Schichten (`SchedOps`, Kernel, microkit).
+      * `thaw_thread` rief `unblock`, obwohl `freeze_thread` über `pause` einfriert — **genau die
+        Naht `thaw × park`, um derentwillen der Umbau geplant wurde.** Sie stand offen im Code.
+      * **Der aarch64-Cross-Core-Test weckte einen GEPARKTEN Thread mit `wake_remote`** (dem
+        Wecker für IPC). Das ging, solange ein Bit beide Gründe trug.
+
+- [x] **Der Fastpath war die vierte Instanz — und er steckte NICHT in `unblock`.** `switch_to`
+      schrieb `blocked = false` am Ziel und liess es **unmittelbar** laufen: ein Thread, der in
+      `RECV` steht und pausiert wurde, lief beim nächsten `send` los, und die Pausen-Entscheidung
+      war still weg. Jetzt ist der Fastpath **bedingt**: die Nachricht ist zugestellt (der
+      IPC-Grund fällt), aber gewechselt wird nur zu einem wirklich lauffähigen Ziel.
+
+- [x] **Gefunden durch MESSUNG, nicht durch Gegenlesen: aarch64 `offen: smp`, 4 von 4 Läufen.**
+      x86 blieb dabei grün — den Pfad gibt es dort nicht. Die Grundlinie (`00c8e73`) wurde
+      nachgemessen und war grün, bevor die Ursache gesucht wurde; „vermutlich vorbestehend" wäre
+      hier falsch gewesen. Dieselbe Lehre wie beim Audit-Code 7 nach dem D0-Umbau: **ein Umbau,
+      der einen neuen Zustand einführt, muss jede Stelle mitnehmen, die über Zustände URTEILT —
+      und gefunden wird das unter Last auf der Architektur, wo der Zustand oft vorkommt.**
+
+- [x] **Der Modelltreue-Wächter hat den Umbau von selbst beanstandet** — und dabei **zwei
+      Funktionen aufgedeckt, die er nie gesehen hatte**: `unpark` und `set_budget_blocked`
+      schrieben Zustand über `parked` bzw. `budget_blocked`, und **beide Felder standen nicht in
+      seinem Schreibmuster**. Er hielt zwei Funktionen für stumm, die es nie waren. Seit die Menge
+      EIN Feld ist, fällt das nicht mehr durch.
+      Die Abbildung ist jetzt eine **Projektion** (`blocked <-> reasons != {}`), keine
+      Gleichsetzung; was das Modell damit *nicht* sagt, steht dort ausdrücklich.
+      Fünf Selbsttest-Mutationen zielten auf Konstrukte, die der Umbau beseitigt hat — vier sind
+      **umgeschrieben** (die Gefahr hat eine neue Gestalt), eine ist **zurückgezogen** mit Grund:
+      ein Selbsttest für ein Verhalten, das es nicht mehr geben darf, wäre eine Ratsche in die
+      falsche Richtung.
+
+- [x] **Nebenbefund, vorgefunden:** `test-qemu.sh` prüfte `$LOG1` und kopierte `$LOG` — eine
+      Variable, die es dort nicht gibt. Unter `set -u` brach der Block ab, und zwar **genau im
+      Fehlerfall**: der Code, der geschrieben wurde, damit keine Fehlschlagsprotokolle mehr
+      verlorengehen, verlor sie selbst.
+
+---
+
+**Die ursprüngliche Planung, zum Nachlesen:**
+
+### Z24 (Plan vom 2026-08-09)
+**Klasse:** Struktur · **Ersetzt** den ursprünglich als „Spurious-Wake-Vertrag" geplanten Schritt;
+der Vertrag bleibt, aber als Beigabe, nicht als Kern.
+
+**Warum das kein weiterer Waechter ist, sondern ein Umbau: es ist die DRITTE Instanz derselben
+Klasse.**
+
+| | |
+|---|---|
+| D9 | `blocked` trug drei Bedeutungen → `budget_blocked` abgespalten |
+| Z22 P4 | `parked` als weiteres Bit dazu |
+| 2026-08-09 | die Naht `thaw × park` reisst — verlorenes Wecken **und** verlorenes Pausieren |
+
+Jede Abspaltung repariert die letzte Kollision und **stellt die nächste auf**. Der Checkpoint,
+`thread_quiescence` und jeder künftige Grund (Signalzustellung aus Z16 steht schon auf der Liste)
+müssen jeweils **alle** Bits kennen, und jede Stelle, die eines vergisst, ist ein neuer stiller
+Pfad. Beim dritten Mal ist das Muster kein Zufall.
+
+- [ ] **`blocked_reasons: BitSet`** (IPC · Budget · Pause · Park · …). Lauffähig **genau dann,
+      wenn die Menge leer ist**. `unblock(grund)` entfernt **einen** Grund und plant **nur bei
+      leerer Menge** ein.
+      Damit ist `thaw` **per Konstruktion unfähig**, einen geparkten Thread zu wecken: es entfernt
+      *Pause*, *Park* bleibt, die Menge ist nicht leer. Der gefundene Fehler wird nicht behoben,
+      sondern **unformulierbar** — und die vierte Instanz kann nicht entstehen.
+      Der Umbau ist klein: die Bits existieren, sie werden zur Menge zusammengezogen.
+
+- [ ] **Die D9-Aussage wird vom Sonderfall zur Instanz einer Regel.** „`unpark` weckt keinen
+      IPC-Wartenden" ist dann kein eigener Wächter mehr, sondern folgt aus „`unpark` entfernt
+      *Park*, sonst nichts".
+
+- [ ] **Verlorenes PAUSIEREN braucht die Menge — der Vertrag fängt es NICHT.** `while` statt `if`
+      macht Warteplätze robust gegen überzählige Wecks. Aber „`PDCTL PAUSE` wird durch den `unpark`
+      eines Geschwisters still aufgehoben" ist **kein** spurious wake, sondern der Verlust einer
+      **Autoritätsentscheidung** — ein Debugger oder der Gruppenschnitt aus Z23 pausiert und sieht
+      den Thread trotzdem laufen. Keine Zusicherung auf der Warteseite deckt das.
+      Ohne die Menge braucht dieser Fall eine **eigene** Gegenprobe.
+
+- [ ] **Der Spurious-Wake-Vertrag bleibt — mit gedrehter Begründung.** Nicht „das System erzeugt
+      heute spurious wakeups, also legitimieren wir sie", sondern: der Vertrag ist
+      **Verteidigungstiefe**, während die Grund-Menge dafür sorgt, dass der Kernel sie **nicht mehr
+      systematisch erzeugt**. Ein Kernel, der Wecks gratis verteilt und sich auf die Schleifen
+      seiner Nutzer verlässt, hat die Beweislast nur verschoben.
+      Als Satz in `caprock-wait` (`while`, nie `if`) **und** als injizierte Gegenprobe: ein
+      überzähliger Weckruf darf keine der elf Aussagen kippen.
+
+- [ ] **Die Umrechnungstabelle — Stelle für Stelle, damit der Umbau eine ABSCHRIFT wird.**
+      Aufgenommen am 2026-08-09 aus `crates/caprock-sched/src/lib.rs` (Zeilennummern vom Stand
+      `3a5fd5e`; sie verschieben sich, die **Funktionen** nicht).
+      **Der Punkt dieser Tabelle:** an 19 Stellen ist jeweils die *richtige* Begründung zu wählen.
+      Eine mechanische Ersetzung `blocked -> reasons != 0` wäre genau der Fehler, den der Umbau
+      beseitigen soll — sie schriebe die Mehrdeutigkeit in die neue Struktur hinein.
+
+      | Zeile | Funktion | Wirkung | Grund |
+      |---|---|---|---|
+      | 743 | `block_current` | setzt | **vom Aufrufer**: der Weg wird von IPC *und* von `park_current` benutzt. Deshalb `block_current_mit(core, frame, grund)`; `block_current` bleibt als IPC-Fassung |
+      | 757 | `switch_to` | setzt | `IPC` (der Aufrufer blockiert für das Rendezvous) |
+      | 759 | `switch_to` | löscht | `IPC` am **Ziel** |
+      | 783 | `unblock` | liest | `reasons != 0` |
+      | 798 | `unblock` | löscht | `IPC` — **und nur einreihen, wenn die Menge danach LEER ist** |
+      | 895 | `is_blocked` | liest | `reasons != 0` |
+      | 909/910 | `pause` | setzt | `PAUSE` |
+      | 1090 | `on_tick` | liest | `reasons == 0` (requeue) |
+      | 1103/1107 | `on_tick` | setzt | `BUDGET` (Konto erschöpft) |
+      | 1161 · 1218 · 1557 | `refill_depleted` | löscht | `BUDGET` |
+      | 1179 · 1223 | Auswahl | liest | `reasons == 0` |
+      | 1370 · 1438 | `audit` | liest | `reasons != 0` |
+
+      Dazu: `budget_blocked` (46 Erwähnungen) wird zu `reasons & BUDGET`, `parked` zu
+      `reasons & PARK`. **`park_wake` bleibt ein eigenes Bit** — es ist eine *Marke*, kein
+      Blockadegrund, und es in die Menge zu ziehen wäre dieselbe Verwechslung noch einmal.
+      `Z23` fügt später genau **einen** Wert hinzu: `FREEZE`.
+
+      **Die Aussage, die den ganzen Umbau trägt**, steht in Zeile 798: eingereiht wird **nur bei
+      leerer Menge**. Ohne sie ist die Menge bloss eine andere Schreibweise für dieselben Bits.
+
+- [ ] **Der Scheduler-Modelltreue-Wächter prüft den Umbau mit** — `parked`/`park_wake` sind dort
+      schon als „ausserhalb des Modells" eingetragen und müssen auf die Menge umgeschrieben werden.
+
+
+### Einzelne erledigte Punkte, nach ihrem Herkunfts-Eintrag
+
+
+#### aus: Z11. Boot-Image = Kernel + **eine** Manifestdatei; alles andere außerhalb und austauschbar
+
+- [x] **Z11b. Das Manifest ist ein Autoritätsdokument — erledigt** (A-1.2/A-1.3, hier bis
+      2026-08-07 nur nicht nachgetragen). Es ist Ed25519-signiert über die **gesamte** Nachricht
+      und über `kernel_hash` an **dieses** Kernel-Image gebunden; die Prüfreihenfolge trägt der
+      Typ (`SystemManifest::parse` liefert keine Einträge, die gibt es nur über `Verified`).
+      Anti-Downgrade über `manifest_version`. Belegt als `manifest: ALL PASS` mit Negativfällen
+      (manipulierte Kopie, Manifest für einen anderen Kernel).
+
+- [x] **Z11e. Protokollversionen werden geprüft — erledigt** (A-4.4, hier nur nicht
+      nachgetragen). `iface_gate` hält die `iface_version` beim ersten Laden einer `program_id`
+      fest und weist jeden weiteren Ladevorgang mit anderer Version ab. Der Abweisungszweig ist
+      über das Manifest allein **nicht erreichbar** (pro Boot gibt es genau ein Manifest) —
+      deshalb füttert der Selbsttest `iface_record_or_check` direkt, statt einen ungeprüften Zweig
+      stehen zu lassen.
+
+- [x] **Z11f. Die Negativliste steht — erledigt** (`docs/invariants.md` §13, normativ). Sie nennt
+      den Kernel selbst (das Manifest ist an sein Image gebunden — ein getauschter Kernel entwertet
+      jede Signatur), IOMMU-Kontexte, aktive DMA-Regionen und gebundene IRQ-Zustellung; dazu die
+      Grenze, die beim Schreiben dazukam: **eine gefärbte PD ist nicht hot-reloadbar, wenn alle
+      Streifen vergeben sind** (Hot-Reload erzeugt die neue Instanz, bevor die alte verschwindet —
+      beide brauchen gleichzeitig einen eigenen Streifen).
+
+
+#### aus: Z14. Fremde Software ohne Gastschicht — bewertet 2026-08-09
+
+- [x] **Gemessen am 2026-08-09, bevor geplant wurde.** `wasmi 0.31`, `no_std`, `opt-level="z"`,
+      LTO, für `x86_64-unknown-none` gebaut und gelinkt:
+
+      | | |
+      |---|---|
+      | Engine-Code | **`.text` 216 KiB + `.rodata` 17 KiB** |
+      | Heap, triviales Modul (`main() -> i32`) | 5,1 KiB |
+      | Heap, realistisches Rust-Modul (24 KB `.wasm`, Vec + sort) | **1 233 KiB** |
+      | private Region einer isolierten PD (heute) | 2 MiB |
+      | TCB des Kerns | 212 KiB `.text` |
+
+      **Zwei Befunde daraus.** Erstens: die Engine ist **so groß wie der ganze Mikrokern** — aber
+      sie liegt in einer PD, für andere Mandanten wächst die TCB um null. Zweitens: **es passt
+      heute schon**, 233 KiB Code + 1,2 MiB Heap in 2 MiB — mit rund 0,5 MiB Luft. Der Preis der
+      Engine ist ihr **Code**, nicht ihr Speicher; der Speicher gehört dem Gast (Linearspeicher).
+
+      Folge für die Reihenfolge: Stufe 1 (Speicher-Server) ist **nicht** Vorbedingung für den
+      ersten WASM-Schritt — wohl aber für `memory.grow` und für mehr als einen Gast.
+
+
+#### aus: A3 — DAS KERNEL-PRIMITIV IST GEBAUT (2026-08-10). Was steht, was offen ist, und die Schwelle
+
+- [x] **Eigene Cap-ARTEN, kein umgewidmeter Endpoint.** `ObjectKind::SyscallHandler { ep, pd,
+      sidecar, len }` und `FaultHandler { .. }`. Ein gewöhnlicher Endpoint wird von
+      `SYS_SETHANDLER` **abgewiesen** (`ERR_BADCAP`), ein `SyscallHandler` im Fault-Slot ebenso.
+      `CALL` auf einer Handler-Cap ist abgewiesen (sonst gäbe ein Handler sich als Gast aus);
+      `RECV`/`REPLY` sind erlaubt, und **`REPLY` hat dort eine Wirkung, die ein Endpoint nicht
+      haben kann**: es lässt zusätzlich den Blockadegrund `HANDLER` fallen. Genau das ist der
+      Unterschied, um dessentwillen es eigene Arten sind.
+      Beide Arten sind über `domain_allows_kind` auf **TrustedSas** beschränkt — dieselbe Klasse
+      wie `PdControl`/`Loader`, weil Z26 die Autorität ehrlich zusammenrechnet: die
+      Persönlichkeits-PD **ist der Kernel des Gastes**.
+
+- [x] **Der Aufruf braucht ZWEI Autoritäten von ZWEI Seiten.**
+      `SYS_SETHANDLER(tcb_cap, syshandler_cap, faulthandler_cap)` (Nr. 19), beide im Cspace des
+      **Aufrufers**, Tcb-Cap mit `WRITE` (nicht `READ` — die Bindung ändert, wer den Thread
+      ausführt, das ist `KILL`-Klasse). Wer umschaltet, ist damit weder Gast noch Handler.
+
+- [x] **Die Gast-PD hält nichts, und ihre Autorität wird verringert.** Die Weiche steht **ganz
+      oben** im Dispatch, vor `YIELD`/`EXIT`/`SETHANDLER`. Ein gebundener Thread erreicht den
+      Caprock-Kernel gar nicht mehr und kann sich insbesondere **nicht selbst entbinden**.
+      Entbinden darf, wer die Tcb-Cap hält — und Entbinden braucht keine Handler-Cap („Autorität
+      abzugeben darf nie an einer Erlaubnis hängen", dieselbe Regel wie `CDELETE`).
+
+- [x] **Fail-closed, und benannt.** Handler weg → der Gast **faultet** mit `ERR_HANDLER_GONE`
+      (11), er fällt **nicht** auf die native ABI zurück. Das ist als Kreuzprodukt-Test
+      formuliert (`bindung_vorhanden_heisst_niemals_kernel`) und mit einer Mutation belegt, die
+      genau diesen Rückfall wieder einbaut.
+      **Und die Asymmetrie ist gebaut, nicht übersehen:** bei einem Syscall ist „der Kernel macht
+      es" eine **Beförderung**, bei einem Fault eine **Herabstufung**. Deshalb zwei Funktionen
+      (`weiche_syscall`/`weiche_fault`) und nicht ein Parameter mit zwei Bedeutungen.
+
+- [x] **Nachtrag 3, BAUPFLICHT: das Zyklusverbot steht IM KERNEL.** `pruefe_bindung` geht die
+      Handler-Kette vom Handler aufwärts; erreicht sie den Gast, wird abgewiesen
+      (`ERR_HANDLER_CYCLE` = 10). **Gebaut ist die allgemeine Azyklizität, nicht die billige
+      Absage aus Z26** („Threads einer PD mit Handler-Bindung dürfen selbst nicht gebunden
+      werden") — die verböte auch **gestapelte Persönlichkeiten**, und die sind legitim
+      (`gestapelte_persoenlichkeiten_bleiben_erlaubt`). Der Gang braucht keinen Hilfsspeicher und
+      keine Besuchsmarken, weil der Graph **funktional** ist: eine PD hat höchstens einen Kernel.
+      Sechs unterscheidbare Absagen, drei ABI-Codes, ein Zählregister (`HANDLER_URTEILE`) — denn
+      `KetteZuLang` heisst „es gibt bereits einen Kreis ohne den Gast", also **Kernelfehler**, und
+      der darf im Audit nicht mit einem Aufruferfehler verschmelzen.
+
+- [x] **Nachtrag 3, zweite Hälfte: der Wartegrund ist von Tag eins in der Grund-Menge (Z24).**
+      `BlockReasons::HANDLER` (Bit 4), **ein** Wecker (`handler_reply`), und
+      `tools/redirect-negativ.sh` Q1 hält per Quelltext-Wächter fest, dass es genau **eine**
+      Stelle im Baum gibt, die ihn entfernt — mit Sprechprobe (mit einer eingebauten zweiten
+      Stelle findet der Wächter 2). Damit ist die von Nachtrag 3 vorhergesagte fünfte Instanz
+      **unformulierbar** statt bewacht.
+
+- [x] **Ein Rennen gefunden und geschlossen, das der Entwurf nicht genannt hatte.** Die Zustellung
+      läuft über den vorhandenen Endpoint-Transport; im **kernübergreifenden** Zweig ruft
+      `Endpoint::call` erst `unblock(server)` **mit IPI** und dann `block_current`. Der Handler
+      kann auf seinem Kern losgelaufen sein und geantwortet haben, bevor der Aufruf zurückkommt —
+      `handler_reply` liefe dann **vor** `mark_handler_wait`, entfernte einen Grund, den es noch
+      nicht gibt, und der Gast hinge für immer, mit jedem Prüfer auf grün. Wörtlich das D11-Bild.
+      Der Grund wird deshalb **vor** dem `call` gesetzt.
+
+
+#### aus: Z23. Prozess-Freeze — geplant 2026-08-09, NICHT begonnen
+
+- [x] **S1 — Zwei-Phasen-Stilllegung: GEBAUT und gemessen** (2026-08-10, `qgate : ALL PASS`,
+      gattert in `all_done`).
+
+      `Pd::quiescing` je PD, geprüft im Syscall-Pfad: `CALL`/`RECV` **aus** der PD heraus →
+      `ERR_QUIESCING`, `REPLY` bleibt erlaubt. Kernel-API `pd_quiesce`/`pd_is_quiescing`.
+      **TCB-Kosten wie geplant: ein Bit je PD und eine Prüfung.**
+
+      **Gemessen wird die WIRKUNG, nicht ein Bit** — und das ist der Kniff, der die Zeile
+      aussagekräftig macht: eine Ring-3-Sonde in einer PD mit geschlossenen Toren bekommt auf
+      `RECV` **sofort** `ERR_QUIESCING`; nach dem Öffnen **blockiert derselbe Aufruf**, weil es
+      keinen Sender gibt. Derselbe Syscall, anderer Ausgang. Ablesbar an der **Grund-Menge aus
+      Z24** — der Umbau vom selben Tag liefert Z23 sein Messinstrument.
+      Sechs Aussagen, darunter „das Öffnen hat wirklich etwas geändert" (ein Tor, das schon offen
+      war, belegt nichts) und der **rohe Ergebniscode** (»abgewiesen« und »mit DIESEM Grund
+      abgewiesen« sind zwei Aussagen).
+
+      **Die Tore werden geschlossen, BEVOR der Thread zugelassen wird** — andersherum gäbe es ein
+      Fenster, in dem das `RECV` noch durchginge, und der Test misste die Reihenfolge zweier
+      Ereignisse statt der Eigenschaft. Dieselbe Lehre wie D0, eine Ebene höher.
+
+      **Zwei Gegenproben:**
+      * **M1** — Tor entfernt: rot. **Nicht isoliert** (drei Felder kippen), und das ist
+        strukturell: ohne Tor blockiert die Sonde im ersten `RECV` und kann gar nichts
+        aufschreiben. Eine Wirkung mit drei sichtbaren Folgen, keine drei Fehler.
+      * **M2** — abgewiesen, aber mit `ERR_BADCAP` statt `ERR_QUIESCING`: **perfekt isoliert**,
+        nur der Ergebniscode kippt (1 statt 8), die fünf übrigen Aussagen bleiben grün. Damit ist
+        belegt, dass die Zeile den **Grund** liest und nicht bloss „abgewiesen".
+
+      **~~Was NICHT gemessen ist~~ — seit 2026-08-10 GEMESSEN, in `pdthrd`.** Mit zwei Threads
+      derselben PD (Z22 P2) gibt es die offene Transaktion: der Client hängt in seinem `CALL`,
+      der Server hält den Reply-Token, **und in diesem Zustand** werden die Tore geschlossen.
+      Gemessen: zweites `RECV` → **8** (`ERR_QUIESCING`), `CALL` → **8**, `REPLY` → **0** (`OK`),
+      Client bekommt **42**. Die Tore gehen hier ausdrücklich **nach** dem Rendezvous zu (anders
+      als bei `qgate`): vorher geschlossen gäbe es die offene Transaktion gar nicht, und der Test
+      belegte wieder nur, dass ein Tor schliesst.
+
+      **Gegenprobe (M2): auch `REPLY` gegattert** → `REPLY=8` statt 0, und der Client **hängt für
+      immer** (`Client bekam u64::MAX, fertig=false`, sein Rundenzähler `0→0`), während
+      `zweites-RECV=8` und `CALL=8` grün bleiben. Drei Konjunkte kippen aus **einer** Änderung,
+      und diese Kausalkette **ist** die Zusicherung: genau der Deadlock, den der Entwurfssatz
+      vorhersagt („sonst könnte ein Server seine offene Antwort nicht loswerden").
+
+      **Gegenprobe (M1), nicht isoliert und aus einem strukturellen Grund:** das Tor nur für
+      `CALL` gelten zu lassen macht das zweite `RECV` **blockierend** statt abweisend — der
+      Server kommt nie zu `CALL`/`REPLY`, und alles danach fällt mit aus. Eine Sonde, die eine
+      **Folge** von Syscalls abarbeitet, kann an einem blockierenden Glied nicht weiterzählen;
+      dieselbe Kopplung wie bei der M1-Gegenprobe von `qgate`.
+
+
+#### aus: Z22. Die vier harten Stellen aus Z21 — gebaut
+
+- [x] **P4 — `wait_event`/`wake_up` ohne Kernelobjekt** (2026-08-09, `park : ALL PASS`).
+      `SYS_PARK` legt schlafen, `SYS_UNPARK` weckt. Die **Warteschlange liegt in der PD** — eine
+      gewöhnliche Liste; der Kernel kennt nur „schlafe" und „wecke Thread T".
+      **Warum nicht Notifications:** ein Linux-Treiber schläft an vielen Stellen (jedes
+      `wait_queue_head_t`, jede Completion, der bestrittene Zweig jedes Mutex). Je Warteschlange
+      ein Kernelobjekt **und** ein Cap-Slot wäre die TCB-Rechnung genau falsch herum — und
+      `Notification` fasst ohnehin nur **einen** Wartenden (dieselbe Kapazitätsform wie D11).
+      **Die Weckmarke ist nicht optional.** Ohne sie ist „Bedingung prüfen (falsch)" → „parken"
+      unterbrechbar, und ein dazwischen eintreffendes Wecken verpufft. Marke setzen und Blockade
+      prüfen stehen deshalb **unter demselben Kern-Lock**.
+      **Zwei Bits, jedes mit genau einer Bedeutung** (`parked`, `park_wake`) — die D9-Lehre:
+      `unpark` weckt **nur**, wer wegen `PARK` blockiert ist; ein IPC-Wartender bleibt liegen.
+      **Kosten:** ein Syscall, zwei Bits je TCB. Der unbelastete Weg („Bedingung ist schon wahr")
+      ist **null Syscalls** — er fasst den Kernel gar nicht an.
+      **Gemessen, sechs Aussagen** mit Positivkontrolle (das zweite `PARK` **muss** blockieren,
+      sonst bestünde ein `PARK`, das nichts tut, die erste Aussage mit Bestnote). Zwei
+      Gegenproben: Marke entfernt → `marke-wirkt=false`; Grundprüfung entfernt →
+      **nur** `ipc-bleibt-liegen=false`.
+      **Zwei eigene Fehler dabei, beide in der Fallenliste.**
+
+- [x] **P3 — der DMA-Pool liegt in der PD** (2026-08-09, `crates/caprock-dma`, 13 Host-Tests).
+      Der Kernel mappt die Region **einmal** und vergibt das IOVA-Fenster; alles danach ist
+      Arithmetik **innerhalb eines bereits gewährten Fensters** und fügt keine Autorität hinzu —
+      also gehört es nicht in die TCB. Der heisse Pfad ist **null Syscalls**.
+      **Das Loch, das der Typ schliesst:** die Treiber-PD reichte zwei lose `u64` durch
+      (`dma_cpu`, `dma_dev`), die per **Konvention** zusammengehörten — während der Kernel genau
+      diese beiden Achsen seit jeher im Typ trennt. Ein `DmaBuf` trägt beide und lässt sich nicht
+      falsch herum auspacken.
+      **Die wichtigste Absage:** `map` (= `dma_map_single`) gibt für jede Adresse **ausserhalb**
+      des Pools `None`. Einen Stapelpuffer für DMA anzumelden ist in Linux-Treibern ein
+      verbreiteter Fehler; ohne diese Prüfung entstünde daraus eine IOVA auf fremden Speicher.
+      **Befund unterwegs:** `caprock_virtio::Region::from_raw` prüft **nichts** — eine Region mit
+      `dev == cpu` (Identität!) oder `dev == 0` liesse sich bauen und liefe scheinbar. Der Pool ist
+      jetzt das **Tor** davor, fail-closed in vier Richtungen. Und die Kopie in den Datenbereich
+      war gegen `shared_len` begrenzt — die Länge der **Quelle** als Schranke für das **Ziel**.
+      **Latent**, weil `count` anderswo begrenzt war; die Schranke stand trotzdem an der falschen
+      Grösse.
+
+- [x] **`drv`/`blkdev`/`part`: gefunden, isoliert, behoben — und die Ursache war eine ZWEITE
+      Client-PD.** (2026-08-10)
+
+      **Der Weg dorthin, weil er die halbe Aussage ist.** Erst gehämmert (`tools/lade-haemmern.sh`):
+      12 Läufe, **ein** Binary (Fingerprint `7aae3ed5531e`), 12× rot, **verhaltensgleich** — der
+      einzige Unterschied zwischen zwei Protokollen war eine Thread-Nummer in einer PASS-Zeile.
+      Damit war „Flattern **oder** veralteter Build" endgültig erledigt und die Suite als
+      Bisect-Orakel brauchbar. Ehrlich zur Schranke: 12 Läufe schliessen eine Grünquote von 20 %
+      mit p < 0,07 aus, 5 % nicht — „flattert nicht" heisst hier „nicht in einer Grössenordnung,
+      die ein Bisect verdirbt", nicht „nie".
+      Das Orakel urteilt über **die drei Zeilen**, nicht über die Schlusszeile: ältere Stände haben
+      andere Prüfzeilen, und wer auf `== ALL PASS ==` bisectet, bisectet die Geschichte der Suite.
+
+      **Erster schlechter Commit: `a159b6b`** („Z15/W1: wasmhost baut und LÄUFT"), `28cc05d` grün.
+      Der Commit ändert **zwei** Dinge — 69 Zeilen Bring-up **und** einen sechsten Archiveintrag.
+      Ohne Isolation wäre nur der Commit bekannt, nicht die Ursache; das Weglassen genau dieses
+      einen Eintrags macht die drei Zeilen grün.
+
+      **Die Ursache: `CLIENT_NTFN` war EIN Slot für eine ROLLE.** Die Behebung von A-6.3 lautete
+      „drei Rollen, drei Badges, drei Ablagen" — und *Client* ist eine **Rolle**, keine Instanz.
+      Mit `wasmhost` als zweitem Client zeigte dieselbe Zelle auf dessen Objekt; der `drv`-Ablauf
+      wartete auf das Badge der **Dateisystem**-PD, das dort nie ankommt, blieb auf `DRV_STEP=0`
+      stehen, und drei Prüfzeilen fielen aus — **ohne dass am Treiber irgendetwas kaputt war**.
+      Der Kommentar an der Stelle beschreibt den Fehler wörtlich („die zuletzt geladene PD
+      überschriebe die Ablage der früheren … Genau das ist beim Bau von A-6.3 passiert") und
+      verhindert ihn nicht: die Behebung war eine Ebene zu flach.
+      Behoben mit einer Ablage **je `program_id`** (dieselbe Lösung wie bei den vier versteckten
+      Politiken aus A-5.4), Schranke = Höchstzahl der Manifest-Einträge (**hergeleitet**, also
+      Überlauf strukturell unerreichbar), Überlauf trotzdem **gezählt und gegattert**
+      (`clientntfn`, D11-Lehre). `client_notification()` ohne Argument gibt es **nicht mehr** —
+      „die Client-Notification" war der Name einer Mehrdeutigkeit.
+      Gemessen: `clientn : 3 Client-PD(s) mit EIGENER Ablage, 0 verloren`. **Drei** teilten sich
+      bis dahin eine Zelle.
+
+- [x] **Der zweite Befund war grösser: der PRÜFER meldete FAIL für Zeilen, die im Protokoll
+      STANDEN.** (2026-08-10) Nach dem Fix blieben 9 rote Prüfungen, deren Zeilen nachweislich da
+      waren. Ursache: `echo "$OUT" | grep -q MUSTER`. `grep -q` steigt beim **ersten Treffer** aus,
+      `echo` bekommt SIGPIPE, und `set -o pipefail` (Zeile 5 jeder Suite) macht daraus rc=141 —
+      also „nicht gefunden".
+      **Das kippt erst oberhalb des Pipe-Puffers: gemessen zwischen 66 und 70 KiB Ausgabe.** Damit
+      hing das Urteil der Suite an der **Grösse ihrer eigenen Ausgabe**; solange das Protokoll klein
+      blieb, war das Grün Glück, und der sechste Archiveintrag hat es über die Kante geschoben.
+      Betroffen waren **71 Stellen in drei QEMU-Suiten** und `tools/hang-stress.sh` — alle auf
+      Here-Strings umgestellt (keine Pipeline ⇒ kein `pipefail`, kein SIGPIPE). Die sieben
+      verbliebenen Pipelines haben **keinen** frühen Ausstieg (`grep -E`/`-c`/`-v` lesen bis EOF)
+      und können die Form nicht auslösen.
+      **Bewacht durch eine Sprechprobe des Prüfers selbst**, an bewusst **256 KiB** Eingabe und in
+      beide Richtungen: vorhanden → PASS, abwesend → FAIL. An einer kleinen Eingabe wäre sie
+      während des ganzen Fehlers grün gewesen. Gegenprobe gefahren: mit der alten Fassung meldet
+      sie `PRUEFER DEFEKT` und bricht mit `exit 2` ab („kein Testergebnis, sondern ein
+      Aufbauproblem").
+      **Die Richtung ist die schlimmere Hälfte:** erfundene **Misserfolge**. Sie kosten kein
+      Fehlerbild, sie **ertränken** es — neun falsche FAILs neben einem echten, und der echte war
+      nicht mehr zu sehen. Bilanz: 30 → 1 Prüfung rot, und der Rest ist echte offene Arbeit
+      (`wasm : SKIP`, s. Z15/W1).
+      Dazu die eigene Falle beim Umbau: mein Ersetzer hielt ein `|` **innerhalb** eines Regex für
+      ein Pipe-Zeichen und zerlegte `Grund (1|2|3)`. `bash -n` fand das **nicht** — die kaputte
+      Zeile war syntaktisch gültig. Gefunden hat es erst eine Prüfung jeder geänderten Zeile auf
+      „Here-String steht am Ende der grep-Invocation".
+
+- [x] **`wasm`: ENTSCHIEDEN — und beide Hypothesen sind widerlegt, meine wie die älteste offene.**
+      (2026-08-10)
+
+      **Die Antwort:** `loader  : SYS_LOAD fehlgeschlagen -- Index 5, program_id 6, Grund
+      NoResources`. `wasmhost` wird **nie geladen**. Es gibt keine PD, keinen Thread, keine Cap —
+      und damit nichts, was eine Domänen-Politik beim Installieren degradieren könnte.
+
+      **Widerlegt 1 (die Spur aus W1, seit Wochen offen): die Domänen-Policy in
+      `install_cap_checked`.** Sie sagte für das gemessene Muster genau das Richtige voraus
+      (TrustedSas meldet sich, UserLand nicht) — und ist trotzdem falsch. `a159b6b` fasst den
+      Cap-Code gar nicht an (gemessen an der Dateiliste), und der Thread existiert nie. **Ein
+      Muster, das zu einer Hypothese passt, ist kein Beleg für sie** — es ist der Anlass, sie zu
+      prüfen. Die Spur gehört aus der Offen-Liste.
+
+      **Widerlegt 2 (meine, vom selben Tag): „der Root-Task schweigt seit `a159b6b`".** Er hat nie
+      geschwiegen. `a159b6b` schob ein `let b = client_notification()…` **zwischen**
+      `let b = root_badge()` und die `root`-Zeile — seither druckte sie das Badge der
+      **Client**-Notification. Daraus wurde ein „Root-Task lief: false" (während `pdcolor` und
+      `ladepol` das Gegenteil belegten), ein vermeintlicher Kippunkt im Bisect und eine Hypothese
+      über Cap-Fehlbindungen. Nach dem Aufheben der Verdeckung: `0x748454c4f`, `root-Badge
+      angekommen: true`, `hello-Badge angekommen: true`.
+      **Und das Badge trug die Antwort die ganze Zeit**: `init` setzt bei einem Ladefehler Bit
+      `i+1`, für Index 5 also `0x40` — es steht in `0x748454c4f`. Die Diagnose lag einen
+      Variablennamen entfernt.
+
+      **Was den Fall entschieden hat, war die cap-freie Auskunft.** `SIGNAL` **ist** eine
+      Cap-Invokation — die Formulierung „ohne jede Cap-Operation" war falsch und hätte den Cap-Pfad
+      fälschlich entlastet. Wirklich cap-frei ist nur der **Scheduler**: existiert der Thread, ist
+      er zugelassen, worin blockiert er? Antwort: er existiert nicht, und das Thread-Register hat
+      5 Einträge statt 6. Das trennt „läuft nie an" von „läuft, und das Signal versandet" in einem
+      Blick — und es hat drei geplante Sonden-Umbauten erspart.
+
+      **Vier Prüfer waren an diesem einen Fall beteiligt und alle vier waren kaputt:**
+      1. `wasm` schloss von Schweigen auf Abwesenheit → entscheidet jetzt an der Endowment-Tabelle.
+      2. `root` las die falsche Variable **und** hiess falsch → `root-Badge angekommen`, eigenes
+         Badge. „Lief" hat es nie gemessen.
+      3. Das abgelegte Fehlerprotokoll war das des letzten (Negativfall-)Boots → der **Hauptboot**
+         wird jetzt eigens abgelegt.
+      4. `SYS_LOAD` verlor den Grund im `.ok()` → er wird **genannt** (`Grund NoResources`).
+
+- [x] **BEHOBEN, und die Ursache war KEINE Ressource.** (2026-08-10) `wasmhost` hatte ein
+      PT_LOAD-Segment auf einer **nicht seitenausgerichteten** VA (`0x2004_6700`).
+      `vspace_map_page_at` weist eine krumme VA beim **allerersten** Aufruf ab — der Allokator
+      wurde nie gefragt.
+
+      **Der Bauweg:** `.bss : ALIGN(8)` in `programs/user.ld` und `user-x86.ld`. `wasmhost` ist das
+      einzige Programm mit einem **schreibbaren** Segment und hat keine `.data`; lld verwirft die
+      leere Ausgabesektion, das RW-PT_LOAD beginnt also bei `.bss` mit dessen 8-Byte-Ausrichtung.
+      Auf **beiden** Architekturen — das Image war nirgends ladbar.
+      Behoben mit `ALIGN(4096)`. **Nicht** kernelseitig die VA abrunden: `.rodata` reicht in
+      dieselbe Seite, sie wäre erst RO und dann RW gemappt — ein W^X-Loch als „Behebung".
+
+      **Alle vier Hypothesen sind widerlegt, auch die führende** („Seitentabellen kommen aus einem
+      eigenen festen Vorrat, `total_free()` liest den falschen Topf"). Sie erklärte beide Zahlen
+      zugleich und war trotzdem falsch: die Fragmentschranke greift bei `align == 4096` nie, die
+      Farbmaske ist `None` (Politik 0), und der Zonen-Ausweich läuft bedingungslos. **Die Prämisse
+      der ganzen Frage war falsch** — `mem_alloc_masked_anywhere` hat nie `None` gegeben, es wurde
+      nie gerufen.
+
+      **Und der Grund dafür war meine eigene, frisch „sprechfähig" gemachte Fehlerzeile.** Sie
+      schrieb den Fehlschlag als „Speicher für eine Seitentabelle, **4096 Byte**" fest — und diese
+      4096 war ein **Literal im Quelltext**, kein Messwert. Eine Diagnose, die eine Ursache
+      **nennt, die sie nicht gemessen hat**, ist dieselbe Krankheit, die `NoResources` eine Ebene
+      höher gerade erst behoben hatte. Sie hat den Fall ein zweites Mal in die falsche Richtung
+      geschickt.
+      Behoben strukturell: **nur der Allokator darf behaupten, es sei der Allokator gewesen** —
+      `a3` markiert sich selbst, wenn es `None` gibt; sonst meldet der Ausgang
+      `MANGEL_MAPPING_ABGEWIESEN` („KEINE Ressource, das Abbilden wurde abgewiesen; der Allokator
+      wurde dabei NICHT gefragt"). Zwei Nachrechnungen derselben Größe wären die
+      `iova_window_clear_of_msi`-Falle gewesen.
+
+      **Gemessen, in beide Richtungen:**
+      * `tools/segment-ausrichtung.sh` — zählt PT_LOAD mit `p_vaddr % 4096 != 0` über alle
+        Programm-ELFs, **ohne QEMU**. Vorher 1 je Architektur, danach **0**; mit Sprechprobe.
+      * Die sechs übrigen ELFs sind nach dem Eingriff **bit-identisch** (md5 verglichen) — das
+        Risiko ist gemessen, nicht behauptet.
+      * Gegenprobe: Ausrichtung zurückgedreht → dieselbe Stelle meldet jetzt **Code 10** statt
+        Code 6. Zwei Lagen, zwei Zeilen.
+      * `wasm : ALL PASS` mit allen vier Aussagen, `vollzahl: 6 von 6`, **Lade-Suite
+        `== ALL PASS ==`** — zum ersten Mal seit dem 2026-08-03.
+
+      **Was der Lader weiterhin NICHT prüft:** `ElfImage::parse_phdr` liest `p_vaddr` ohne
+      Ausrichtungsprüfung. Er nimmt also weiter ein Image an, das er nie abbilden kann — die
+      Absage fällt erst tief im Ladepfad. Eigener offener Punkt.
+
+- [x] **P2 — mehrere Threads je PD: GEBAUT und gemessen** (2026-08-10, `pdthrd : ALL PASS`,
+      gattert in `all_done`, eigene Prüfzeile in der Suite).
+
+      **Die Ursache war ein Feld, kein fehlender Mechanismus.** `Pd::thread` trug **einen**
+      Thread, `pd_of` war ein linearer Scan darüber. Eine zweite Bindung **überschrieb** die
+      erste — der erste Thread verlor damit lautlos seinen ganzen Cspace und bekam bei jedem
+      Syscall `ERR_NOPD`. Dieselbe Form wie „eine Ablage je ROLLE" bei `CLIENT_NTFN`: eine Zelle
+      für etwas, das es mehrfach gibt.
+
+      Ersetzt durch einen **Rückwärts-Index Thread-Slot → PD** (`PdTable::owner`, die vierte
+      per-Thread-Tabelle neben `FpState`/`VSPACE_OF`/`KSTACKS`). Der Eintrag trägt die **volle**
+      `ThreadId` (Slot **und** Generation) und die **Belegungs-Generation der PD** — ohne die
+      zweite hätte der schnelle Weg eine Lücke, die der lineare Scan nicht hatte: eine PD wird
+      frei, ihr Index sofort neu vergeben, und ein noch lebender Thread der alten PD zeigte auf
+      die **neue**. Eine Beschleunigung, die eine Fremd-PD-Zuordnung erfindet, wäre schlimmer als
+      der Scan.
+
+      **Gemessen wird die WIRKUNG, an drei verschiedenen Grössen** (`pdthrd`, 16 Aussagen):
+      * *Derselbe Cspace* — Server und Client sind zwei Threads DERSELBEN PD und reden über
+        **denselben lokalen Cap-Slot** miteinander: `pd(server)=Some(1) pd(client)=Some(1)`,
+        `gebundene-Threads=2`, erstes `RECV` → `OK` (bei nur einer Bindung wäre es `ERR_NOPD`).
+      * *Getrennte Grund-Mengen (Z24)* — der Server parkt, sein Rundenzähler steht
+        (`1078337 → 1078337`), **während** der des Clients läuft (`1120791 → 5560605`); nach
+        `UNPARK` läuft er wieder. Ohne die zweite Hälfte wäre „steht" von „ist tot" nicht zu
+        unterscheiden.
+      * *Z23 S1* — s. den Eintrag dort.
+
+      **Der Weg über das Manifest war gar nicht nötig.** Der alte Eintrag nannte ihn als
+      „billigsten Weg" und den vollen 96-Byte-Eintrag als Blocker (`entry_len`-Bump auf der
+      **signierten** Fläche). Beides entfällt: `admit_in_pd(pd, ..)` zweimal auf dieselbe PD
+      genügt, sobald die Zuordnung nicht mehr in einem Feld der PD steht. Das Format bleibt
+      unangetastet.
+
+      **Eine Stelle, die das Gegenlesen fast übersehen hätte:** `domain_audit` prüfte die
+      Isolationsregel (Code 3) über `thread_of(pd)`, also über den **ersten** Thread. Ein
+      zweiter, global laufender Thread einer isolierten PD wäre damit unsichtbar geworden —
+      genau die D0-Lehre („ein Umbau, der einen neuen Zustand einführt, muss jede Stelle
+      mitnehmen, die über Zustände URTEILT"). Ersetzt durch `any_thread(pd, ..)` über den
+      Rückwärts-Index, O(Threads) statt O(PDs × Threads).
+
+      **Gegenprobe (M3): `attach_owner` weggelassen** → `pd(server)=Some(1)`,
+      **`pd(client)=None`**, `gebundene-Threads=0`, `Bindungen ohne Rueckwaerts-Tabelle=6`,
+      `pd_of` wieder linear (**40 019** Scan-Iterationen statt 0). Das ist wörtlich das alte
+      Verhalten, und es reisst `pdthrd` **und** `vorrat`. Nicht isoliert, und die Kopplung ist
+      strukturell: derselbe Index trägt beide Eigenschaften.
+
+- [x] **Der teuerste O(n)-Pfad des Systems fiel dabei mit ab — und er stand nicht in C4.**
+      `pd_of` löst bei jedem **cap-auflösenden** Syscall die aufrufende PD auf (CALL/RECV/REPLY/
+      SIGNAL/WAIT/MAP; YIELD und PARK kehren im Dispatch vorher zurück) und tat das linear über
+      alle `NPDS = 10 000` PDs. Die drei Stellen, die C4 nennt, laufen je Cap-Allokation bzw. je
+      Thread-Tod — diese je Syscall. Jetzt O(1); gemessen `0` Scan-Iterationen bei 15 Aufrufen
+      (Sprechprobe: eine Null allein wäre von „nie gefragt" nicht zu unterscheiden).
+      **Nebenbefund:** der Rückfallpfad wurde von `UNPARK 0xDEAD_BEEF` ausgelöst — einer
+      **EL0-erreichbaren** Eingabe. Ein Thread-Slot jenseits der Tabelle beantwortet sich selbst
+      (`None`); ihn linear zu suchen hiess, den langsamsten Weg ausgerechnet für die
+      Angriffseingabe zu nehmen.
+
+
+#### aus: A1. Cache-/Timing-Seitenkanäle zwischen PDs
+
+- [x] **Der reguläre Weg ist gefärbt — und die Entscheidung steht im Manifest, nicht im Code**
+      (2026-08-07). Ein Programm mit `POLICY_EXCLUSIVE_STRIPE` wird stückweise aus **einem**
+      Streifen geladen: Segmente, Stack, Seitentabellen, EL0-Kernel-Stack. Belegt als
+      `pdcolor : ALL PASS` (5 Seiten in 16 von 512 Farben, gemessen an der Teardown-Buchhaltung).
+      Details in [done.md](done.md). `spawn_isolated` bleibt ungefärbt und ist kernel-intern;
+      der Produktpfad ist der Lader.
+
+- [x] **Die Farbanzahl begrenzt die Anzahl gleichzeitig getrennter PDs** — erledigt mit B-4.2,
+      hier bis 2026-08-01 nur nicht nachgetragen. `claim_stripe`/`release_stripe`
+      (`kernel/src/colors.rs`) führen Belegung über `STRIPES_TAKEN`; ist kein Streifen frei, gibt es
+      `None`, und die PD entsteht **gar nicht erst** — kein Ersatzsatz, keine „alle Farben"-Rückfallebene.
+      `mask_for` (rundläufig, ungeprüft) steht nur noch im Test selbst; der Spawn-Pfad
+      (`system.rs:2069`) nimmt `claim_stripe`. Der Test `stripe` deckt beide Ausgänge ab.
+
+- [x] **Nur auf x86 gemessen** — behoben am 2026-08-01. Der fehlende Schlüssel war nur die
+      *äußere* Hürde; B-2.1 erzeugt ihn inzwischen selbst. Die *innere* saß tiefer: `run_color` und
+      `run_stripe_alloc` hatten ihren **einzigen Aufrufer in `arch/x86_64/bringup.rs`**. Die ARM-Suite
+      hätte also auch mit Schlüssel nichts gemessen — sie rief nur `colors::report()` (Geometrie),
+      nie den Test. Genau die Fehlerform, die dieses Projekt dreimal bezahlt hat, ein viertes Mal.
+
+      Behandlung wie bei `dmatests.rs`: der Test liegt arch-neutral in `kernel/src/colors.rs` und
+      wird von **beiden** Hochlaufwegen gefahren (aarch64 aus `threads::spawn_demo`, ganz am Anfang —
+      `run_stripe_alloc` braucht den Ruhezustand). Die Druckstelle liegt **einmal** in
+      `colors::report_color`; die vorherige Verdopplung war die Ursache des `FAIL`-statt-`FAILURES`-
+      Fehlers. `color`/`stripe` stehen jetzt in der ARM-Abschlussbedingung und in `test-qemu.sh`.
+
+      **Nicht** neu ist die Geometriemessung — die steht seit B-2.2 (2026-07-29) und wurde dort
+      gegen drei CPU-Modelle geprüft, die *verschiedene* Werte liefern (`cortex-a72`/`a53` → 16,
+      `max` → 32). Genau das belegt, dass `CCSIDR_EL1` gelesen und nicht eine Konstante
+      zurückgegeben wird. Neu ist, dass die **Zuteilung** dort geprüft wird: bis heute lief auf
+      aarch64 die Meldung, nicht der Test.
+
+
+      **Der Umzug hat sofort zwei echte Fehler gefunden — beide nur auf aarch64 sichtbar, beide
+      inzwischen BEHOBEN:**
+
+      1. `region_bytes()` rechnete mit `caprock_mem::MASK_BITS` (64) statt mit der tatsächlichen
+         Farbanzahl. Auf x86 (256 Farben) zufällig richtig; auf aarch64 (16 Farben) umfasst ein
+         Streifen nur 4 Farben, eine 64-KiB-Region aber 16 aufeinanderfolgende Seiten — also jede
+         Farbe, mehrfach. **Behoben** (Laufzeitrechnung `min(count(), MASK_BITS) / PARTITIONS`).
+      2. `caprock_mem::stripe` teilte ebenfalls `MASK_BITS` auf statt `count()`. Bei 16 Farben
+         umfasste Streifen 0 damit *alle* Farben und die Streifen 1–3 keine — und weil leere Mengen
+         sich nicht schneiden, meldete der Selbsttest trotzdem „disjunkt". **Behoben am
+         2026-08-02**: `stripe(i, n, colors)` nimmt die Farbanzahl als Parameter, mit Host-Tests
+         gegen 16 **und** 256 Farben (ein Test nur gegen 256 wäre grün gewesen und hätte nichts
+         belegt).
+
+      **Drittens — der Test war auf aarch64 AUSGEHÄNGT, und das ist seit 2026-08-02 behoben.**
+      An seinem alten Platz ganz am Anfang von `threads::spawn_demo` belegte und gab er Speicher
+      frei, *bevor* die baseline-empfindlichen Tests ihre Ausgangswerte nehmen; danach fiel mal
+      `captest`, mal `sched` durch. Der Ausweg war damals, ihn auszuhängen — und dabei
+      `COLOR_OK`/`STRIPE_ALLOC_OK`/`PPROBE_OK` **hart auf `true`** zu setzen. Das war die
+      schlechtere Hälfte: drei dauerhaft wahre Konjunkte in `all_done()`, keine Berichtszeile,
+      kein Check in `test-qemu.sh` — die Abwesenheit war damit nicht bloß unbelegt, sie war
+      **unsichtbar**.
+
+      Die Lösung ist der **Platz**, nicht das Weglassen: die drei Tests hängen jetzt als letztes
+      Glied der Testkette in `demo_report_then_idle` (`run_color_suite`), hinter `cross`, `strand`
+      und `loadstop`. Danach nimmt keine Prüfung mehr eine Baseline. Gemessen (8 Läufe,
+      `test-qemu.sh`): `color : ALL PASS`, `stripe : ALL PASS`, `pprobe : SKIP` (unter TCG kann die
+      Positivkontrolle nicht tragen — kein echter Cache), `captest` und `sched` in allen acht
+      Läufen unverändert grün, identische Ergebnissignatur. Damit ist A1 **zum ersten Mal auf
+      aarch64 belegt** — und zwar auf der 16-Farben-Aufteilung, also genau dem Fall, den (2) falsch
+      machte. Details in [done.md](done.md).
+
+
+#### aus: C4. Effizienz bei tausenden Threads (lineare Scans beseitigen)
+
+- [x] **`pd_of` — der teuerste O(n)-Pfad, und er stand in dieser Liste NICHT.** Behoben, s.
+      [Z22 P2](#z22-die-vier-harten-stellen-aus-z21--gebaut). Er lief je **cap-auflösendem
+      Syscall** über alle 10 000 PDs; die drei Stellen unten laufen je Cap-Allokation bzw. je
+      Thread-Tod. Vorher/Nachher gemessen: **40 019 → 0** Scan-Iterationen (Gegenprobe: den
+      Rückwärts-Index nicht anhängen).
+
+- [x] **Registerkorrektur: „Kernel-Stacks 64 KiB je Thread" stimmt — für KERNEL-Threads.**
+      Es sind **zwei** Grössen, und beide sind real: `STACK_SIZE = 64 KiB` (Kernel-Thread) und
+      `USER_KSTACK_SIZE = 16 KiB` (EL1-Stack eines EL0-Threads). Die Korrektur „es sind 16, nicht
+      64" ist damit nur zur Hälfte richtig — welche gilt, hängt an der **Art** des Threads, nicht
+      am Datum des Eintrags. Gemessen an der Kurve: eine SAS-PD mit Kernel-Thread kostet
+      **64 KiB**, und bei `-m 512M` ist genau das die Schranke (7212 Prozesse, freies RAM auf 0).
+
+- [x] **Der UNTERBAU unter der Guard-Page steht (2026-08-10, x86): per-Kern-TSS + IST-Stacks.**
+      Ohne ihn machte die Guard-Page das Bild *schlechter*: sie verwandelt den Überlauf in einen
+      `#PF`, dessen Handler auf denselben kaputten Stack pusht -> `#DF` -> ohne eigenen Stack
+      **Triple Fault ohne jede Ausgabe**. Gebaut: jeder Kern hat eine eigene TSS und drei eigene
+      IST-Stacks (`#DF`/`NMI`/`#MC`, je 4 KiB); `#PF` bekommt ausdrücklich **keinen** (mit IST wäre
+      er nicht mehr wiedereintrittsfähig). Belegt als `ist : ALL PASS` in beiden Suiten (die
+      Vektoren werden ausgelöst und die Frame-Adresse zurückgelesen) und durch `tools/df-sonde.sh`
+      — ein **echter** `#DF`, mit Gegenprobe ohne IST (dann stumm). `IST_STACK_BYTES` ist gemessen:
+      **816 von 4096 B**. Details in `crates/caprock-hal/src/x86_64/gdt.rs`.
+
+
+#### aus: C7. Die Kapazitätskurve — wo es WIRKLICH bricht (gemessen 2026-08-10)
+
+- [x] **Der benannte Mangel gilt jetzt auch auf den `spawn_*`-Pfaden** (2026-08-10, nachmittags).
+      Statt `keiner (der Fehlschlag lag NICHT an einer Ressource)` steht am Kurvenende die
+      gemessene Ursache: SAS bei `-m 512M` **„Speicher fuer den Stack eines KERNEL-Threads
+      (64 KiB), angefordert 65536 Byte, frei waren 40960"**; isoliert bei 3 GiB **„Speicher fuer
+      die private Region einer isolierten PD, angefordert 2097152 Byte, frei waren 4706304"**.
+      Zwei neue Codes (`MANGEL_KERNEL_THREAD_STACK`, `MANGEL_PRIVATREGION`),
+      `create_vspace_masked` unterscheidet jetzt **ASID-Platz** von **Seitentabellen-Speicher**
+      (zwei Töpfe in einer Funktion), und `vspace_map_user_region` trennt „Allokator sagte nein"
+      von `MANGEL_MAPPING_ABGEWIESEN`.
+      **Die Menge steht im TYP, nicht daneben:** `benannt_alloc(code, size, f)` reicht `size` an
+      den Allokator weiter *und* meldet sie — die Zahl kommt genau einmal vor. Damit ist die
+      Falle vom Vormittag (`mangel(MANGEL_SEITENTABELLE, 4096)` als Literal) strukturell zu.
+      Bewacht als Prüfzeile `mangel` (gattert): eine **provozierte, wirklich abgewiesene**
+      Anforderung auf `spawn_isolated_colored`, vorher **vergiftet** (`MANGEL_VERGIFTET = 255`),
+      damit Schweigen ein eigener Ausgang ist. Gegenprobe gefahren: das Literal statt der Messung
+      kippt **genau ein** Konjunkt (`gemeldet 4096 Byte (angefordert 16384 Byte)`), die Suite
+      läuft in den Watchdog (`offen waren: mangel`).
+      **Zwei Zahlen, die der Melder nebenbei sichtbar gemacht hat:** die isolierte Kurve endet
+      mit **4,7 MiB freiem RAM** bei einer 2-MiB-Anforderung — die Schranke ist dort
+      **Fragmentierung**, nicht Erschöpfung. Und `spawn_on_core_parked` **verlor bei jedem
+      Fehlschlag des Thread-Slots seine 64 KiB Stack** (`?` ohne Rückgabe) — genau an der
+      Kapazitätsgrenze, wo dieser Zweig läuft. Beides behoben bzw. benannt.
+
+- [x] **Der Mangel-Sweep: aus „gegengelesen" ist „kann nicht schweigen" geworden** (2026-08-10,
+      abends). Die `mangel`-Zeile belegte **eine** Meldestelle; die übrigen standen im Quelltext
+      als „gegengelesen, nicht gemessen" — ehrlich und trotzdem ein Nullbefund.
+      **Zuerst gezählt, denn „rund zwanzig" war falsch: es sind 31** (`system::MELDESTELLEN`,
+      nachgezählt von `tools/mangel-stellen.sh` mit Selbsttest in beide Richtungen) — 17
+      handgeschriebene `mangel(..)`-Aufrufe, die **schweigen können**, und 14 über
+      `benannt_alloc`/`benannt_slot`, die es strukturell nicht können.
+      **Provoziert wird mit einer Sperre im Allokator**, nicht mit einer Mutation je Stelle:
+      `sperre_scharf(k)` lässt `k` Anforderungen durch und weist ab der `k+1`-ten jede ab; über
+      wachsendes `k` wandert der Fehlschlag den Pfad entlang. Der Allokator sagt nein, den Weg
+      danach geht der echte Code — die Sperre schreibt keinen Mangel-Code. Sie merkt sich die
+      **abgewiesene Menge**, und die gemeldete Zahl wird gegen *diese* geprüft, nicht gegen eine
+      Konstante im Prüfer, die mit einem Literal gemeinsam falsch sein könnte.
+      Gemessen: **23 provozierte Abweisungen auf 6 spawn-Pfaden**, 5 von 6 bis zum Ende gefahren,
+      `geschwiegen=0 · keiner=0 · Menge-nicht-aus-dem-Aufruf=0`. Abdeckung **11 von 31**; die
+      Summanden gehen auf: 11 provoziert + 9 Platz-Töpfe + 10 Ladepfad + 1 (2917).
+      **Drei Gegenproben, jede isoliert genau ein Konjunkt:** eine stumm gemachte Meldestelle →
+      `geschwiegen=5`; eine Menge aus einem Literal → `Menge NICHT aus dem Aufruf=4`; und die
+      dritte ist der eigentliche Befund (s. u.).
+      **Der Befund, der größer ist als der Eintrag: die vergiftete Marke war seit ihrer Einführung
+      tot.** Jeder `spawn_*`-Pfad ruft `mangel_zuruecksetzen()` als **erste** Anweisung — also
+      zwischen dem Vergiften und der ersten Anforderung. „Der Pfad hat geschwiegen" war damit
+      strukturell unerreichbar, während die Berichtszeile ihn wörtlich versprach. Gemessen mit
+      derselben stumm gemachten Stelle: **mit** der Behebung `geschwiegen=5`, **ohne** sie
+      `keiner=5` — und `keiner` heißt „lag an keiner Ressource", genau das, wovon die Marke
+      trennen sollte. Seit heute überlebt die Marke das Zurücksetzen; `mangel_entgiften()` nimmt
+      sie hinterher weg.
+      **Nebenbefund, der eine Stelle als solche einordnet:** die drei
+      `MANGEL_MAPPING_ABGEWIESEN`-Stellen (2917/4057/4120) können gegen einen leeren Allokator
+      **nie** feuern — sie melden den Fall „der Allokator wurde NICHT gefragt". Wer sie prüfen
+      will, braucht eine krumme VA/PA, keinen leeren Topf. Das ist kein Loch, sondern die
+      Bedeutung der Stelle; sie steht deshalb als eigener Summand in der Bilanz.
+
+- [x] **Der Seitentabellen-Topf hat eine Kurve — und die Zahl ist 5 Rahmen (20 KiB) je isolierter
+      PD** (2026-08-10, nachmittags). Gemessen **an der Quelle** (`pt_rahmen` an allen acht
+      Allokationsstellen, `pt_zurueck` an den fünf Freigabestellen), nicht als Differenz des
+      freien RAM — eine Differenz misst Stacks, private Regionen und Segmente mit. Steht in der
+      `vorrat`-Zeile und in jedem Kurvenpunkt.
+      Gemessen bei `-m 3G`, isoliert: n=200 → 1000 Rahmen, n=400 → 2000, … n=1400 → 7000,
+      Ende bei n=1477 → 7385 Rahmen = 29,5 MiB. **Streng linear, 20 480 Byte je Prozess.**
+      Eine geladene PD (Lade-Suite) kostet **7 Rahmen = 28 KiB**; die SAS-Reihe fragt den Topf
+      strukturell nie (0 Rahmen bei n=7206), und **das steht jetzt in der Zeile**.
+      Bewacht als Prüfzeile `ptab` (gattert) mit vier benannten Konjunkten; der schärfste ist die
+      **Bilanz** `raus >= zurueck` — es kann nichts zurückkommen, was nie herausgegeben wurde.
+      Gegenprobe gefahren: eine einzige nicht mehr buchende Allokationsstelle ergibt
+      `9 raus / 17 zurueck`, kippt **genau diesen** Konjunkt, und der Lauf endet im Watchdog
+      (`offen waren: ptab`).
+      Nebenertrag: die Hauptsuite schließt den Topf auf **17 raus / 17 zurueck** — die erste
+      Leckprüfung, die dieser Topf je hatte.
+
+- [x] **Die isolierte Reihe der Tabelle oben maß etwas anderes, als ihr Name sagt.** Der
+      Kurvenarbeiter lag in `.text`; eine isolierte PD bekommt einen **EL0**-Thread, also
+      faultete **jeder einzelne** an seiner eigenen Einsprungadresse. Gemessen: **228
+      `el0-trap`-Zeilen in einem Lauf mit 224 isolierten PDs**, am Ende **0 belegte VSpaces** und
+      ein Seitentabellen-Topf, der auf 15 Rahmen zurückgefallen war. „3040 isolierte Prozesse"
+      hieß in Wahrheit „3040 mal eine PD angelegt, deren Thread sofort starb". Mit
+      `kurven_arbeiter_el0` in `.user_text`: 220 statt 224 bei 512 MiB, **220 belegte VSpaces**,
+      1100 gehaltene Rahmen, 3 Faults im ganzen Lauf.
+      Das ist die Falle aus `CLAUDE.md` wörtlich — nur hat sie hier keine Prüfzeile rot gefärbt,
+      sondern eine **Kapazitätszahl** erzeugt. **Die Zahlen der Tabelle oben (224/1504/3040) sind
+      damit neu zu messen**; die Ersatzwerte lauten bisher 220 (512M) und 1477 (3G).
+
+
+#### aus: E. DMA-Härtung — Rest
+
+- [x] **x86-Fensterwahl — im Kern ERLEDIGT und RAM-UNABHAENGIG (gemessen 2026-08-03).** Die
+      Befuerchtung im Eintrag („auf einer kleineren Maschine nicht") trifft **nicht** zu, und
+      zwar aus einem Grund, den der Eintrag nicht nannte: das Fenster kommt als **feste Zusage**
+      aus der HAL (`crates/caprock-hal/src/x86_64/iommu.rs:32`), nicht aus `RAM_TOP`. Es gibt
+      nur zwei Faelle, beide enden oberhalb des Sperrbereichs — bis ~4 GiB springt die Basis auf
+      `0xFF00_0000`, darueber liegt sie ohnehin hoeher.
+      Gemessen ueber **fuenf RAM-Groessen** (256M / 512M / 1G / 2G / 2560M), alle `msi_clear=1`,
+      `dmawin : ALL PASS`, rc=0. Von den drei Nebenbedingungen: **IR** beruecksichtigt
+      (`GSTS.IRES=1`, `CFIS=0`), **ACS** beruecksichtigt (echtes `acs_enabled` je Funktion, die
+      Gruppen-Aliasmenge geht vollstaendig in `DmaCtx::sids`; q35: 8 Geraete, 6 Gruppen),
+      **RMRR nur teilweise**.
+      Was bleibt, steht als **E-Rest 1/2/3** im Abschnitt D — der luegende Pruefer im schwachen
+      Zweig, die RMRR-Faerbung, und der nicht ausfuehrbare 4-GiB-Zweig.
+      Nebenbefund: **Punkt 6.4 unten fuehrt IR noch als offen**, waehrend `bringup.rs:2621`
+      sagt „steht seit B-3.2". Eine Beschriftung, die neben der Sache herlaeuft — nachpruefen.
+
+- [x] **x86-Fensterwahl (Herleitung)**: `0xFEE0_0000–0xFEEF_FFFF` ist als
+      IOVA **unbenutzbar**. VT-d behandelt DMA-Requests dorthin als Interrupt-Nachrichten und
+      schickt sie durch das Interrupt-Remapping statt durch die Second-Level-Tabellen — eine IOVA
+      in diesem Fenster wird also *nicht übersetzt*, egal was in der Tabelle steht. Auf einer
+      Maschine mit RAM oberhalb 4 GiB liegt die aus `RAM_TOP` abgeleitete Basis ohnehin darüber,
+      auf einer kleineren nicht. Gehört als Bedingung an die Fensterwahl, zusammen mit IR, ACS
+      und RMRR.
+
+- [x] **Descriptor-Typestate ERLEDIGT (2026-08-03).** `crates/caprock-virtio/src/owned.rs`:
+      `Owned<Driver>`/`Owned<Device>` mit unbewohnten Markern, `Region::carve` (monoton → keine
+      ueberlappenden Puffer), `Completion` als Abschlussbeleg. `Queue::set_desc` ist **privat**;
+      der einzige Weg ist `Queue::arm`, das den Puffer **by value** nimmt. Zurueck nur ueber
+      `reclaim(buf, &Completion)` oder das benannte `reclaim_unproven` (das `blk` braucht, um
+      nach einem Timeout die `0xff` im Statusbyte lesen zu duerfen). Alle drei Treiber migriert.
+      Die Crate bleibt **abhaengigkeitsfrei** — nachgeprueft.
+      **Belegt statt behauptet:** `tools/typestate-negativ.sh` — Positivkontrolle plus drei
+      Negativfaelle, jeder mit **erwartetem Fehlercode** (E0382/E0599/E0624), damit ein
+      Tippfehler kein Beleg ist; drei Mutationen kippen je genau ihren Fall.
+      **Nebenbefund, im Code vermerkt:** `#[derive(Clone, Copy)]` auf `Owned` ist ein **No-op**
+      (das Derive erzeugt die Schranke `S: Copy`, und die Marker sind unbewohnt). Die erste
+      Mutation war dadurch wirkungslos und meldete faelschlich gruen.
+
+- [x] **Descriptor-Typestate (Herleitung)** (`Owned<Driver>`/`Owned<Device>`) treiberseitig. Ausdrücklich
+      **Ergonomie, nicht TCB**: eine Compile-Zeit-Disziplin innerhalb der Treiber-PD trägt an der
+      Vertrauensgrenze nichts — sie fängt Fehler des Treiberautors, nicht das Verhalten eines
+      kompromittierten Treibers. Lohnt trotzdem, weil „Puffer steht armiert in der Queue, ist im
+      sicheren Code aber wieder adressierbar" real und häufig ist.
+
+
+#### aus: D15. Der Kernel springt nach Adresse 0 — 2 von 600 aarch64-Läufen (2026-08-08)
+
+- [x] **ENTSCHIEDEN (2026-08-08): D15 ist NICHT durch den D0-Umbau entstanden — er war vorher
+      da.** Die Vorher-Reihe auf `2ef9ddb`, gleiche Bedingung, gleiche Größe:
+
+      | Stand | Läufe | D15 | Rate |
+      |---|---|---|---|
+      | **vor** dem D0-Umbau (`2ef9ddb`) | 2000 | **3** | 0,15 % |
+      | **nach** dem Umbau | 2000 | **6** | 0,30 % |
+      | gepoolt | 4000 | 9 | **0,225 %** |
+
+      `P(≥6 von 9 Treffern in einer Reihe, wenn kein Unterschied)` = **0,254** einseitig, ≈ 0,51
+      zweiseitig. **Kein Hinweis auf einen Unterschied.**
+
+      **Damit ist meine eigene Hypothese widerlegt** — „der neue Zustand *geparkt* trifft auf den
+      Reap-Pfad" kann nicht stimmen, wenn das Bild ohne diesen Zustand genauso oft auftritt.
+
+- [x] **Belegt, warum die aarch64-Reihe mehr wert ist — sie hat eine Regression gefunden, die
+      56 895 x86-Läufe nicht sahen** (2026-08-07). `scale : FAILURES`, `sched_audit=7`: der
+      Audit-Code „lauffähig und in keiner Liste" ist wörtlich der Zustand eines geparkten Threads.
+      1 von 600 aarch64-Läufen. Behoben (`t.admitted` in der Bedingung), Details in `done.md`.
+
+
+#### aus: D. Verifikation
+
+- [x] **D5 erledigt (2026-08-02): der aarch64-Kernel hat einen Root-Task — und der Weg dorthin fand
+      zwei Fehler, die nichts mit dem Manifest zu tun hatten.**
+      Details in [done.md](done.md#d5-eine-rote-zeile-die-niemand-ansah).
+
+      Der Anlass war die Zeile `root : FAILURES (NoManifest)`, die die Suite **gar nicht prüfte**.
+      Behoben: `test-qemu.sh` baut ein signiertes Manifest mit genau einem `root`-Eintrag, `init`
+      bekommt ein aarch64-Zertifikat (`certs/init-arm.cert`), `manifest_report()` wird auf ARM
+      gerufen wie auf x86, und die Suite prüft `root`, `manifest` und die Modulzahl.
+
+      **Was dabei herauskam, war wertvoller als der Anlass:**
+
+      1. **Die Startmenge stand im falschen Dokument.** `boot_arg` gab dem Root-Task
+         `archive.count()` — die Größe des *Behälters*, nicht der *Startmenge*. Auf x86 stimmte
+         beides überein, weil dasselbe Skript Archiv und Manifest erzeugte. Auf aarch64 liegen zehn
+         Testdienste im Archiv, die nicht zur Startmenge gehören; `init` hätte sie als Startmenge
+         geladen — darunter `probe`, das gar kein ELF ist. Jetzt kommt die Zahl aus dem Manifest,
+         und die dadurch nötige Zusage (Manifest-Einträge `0..n` liegen auf Archivpositionen
+         `0..n`) ist eine **geprüfte Regel**: `RootTaskError::StartSetNotPrefix`, fail-closed.
+         Negativkontrolle gefahren.
+      2. **`loadstop` maß eine globale Baseline mit einer lokalen Sperre.** `local_irq_disable()`
+         stellt einen Kern still; sieben andere und der Einsammler laufen weiter. Gemessen wurde
+         `free 4204597248 -> 4204613632` — **16 KiB mehr** hinterher, ein fremder `free`, kein Leck.
+         Die Prüfung stellt jetzt erst Ruhe fest und misst dann; ein Lauf, der nie ruhig wird,
+         fällt **durch** („nicht messbar" ist kein bestandener Test).
+
+      Nachgemessen wie gefordert: `RUNS=6` → 6/6 mit identischer Signatur, `== ALL PASS ==`.
+
+- [x] **D8 BEHOBEN am 2026-08-03 (gemessen davor und danach): ein erschöpfter Thread kam über
+      `unblock` zurück in die Ready-Liste und lief auf leerem Konto — ohne jede Cap.**
+      Behebung in drei Teilen: Wächter **innerhalb** des `unblock`-Rumpfes, `!blocked`-Wächter in
+      `refill_depleted`, neuer Audit-Code **9**. Nachgemessen: **jede** Wirkung (M1/M2/M3a/M5)
+      auf 0, Positivkontrolle weiter bestanden, `M7.ticks_mit_budget = 6` — **kein Verhungern**.
+      x86-Suite, Lade-Suite, Host-Tests, Verus + drei Wächter: alle grün. **500 Läufe** (5 Ströme
+      à 100) mit **derselben Signatur wie vor der Behebung** (`e419003d625f`) — keine Regression,
+      und zugleich der Beleg, dass die Suite diesen Fehler nie ausgelöst hat. Passt zu
+      `audit() == 0`: niemand konnte ihn sehen.
+
+      Der Rest des Eintrags bleibt als Herleitung stehen. **Zwei Punkte sind weiter offen** und
+      stehen am Ende: der Donee-Zweig in `refill_depleted` und die Erreichbarkeit im laufenden
+      Kernel.
+
+      Werkzeug: `tools/sched-erschoepfung-messen.sh` (~3 s, 96 Messwerte, `--nur-echt` für den
+      Einzellauf). Der **echte** `crates/caprock-sched/src/lib.rs` wird gelinkt — genau eine
+      Zeile unterscheidet den Harness vom Original (`#![no_std]`), Stellvertreter ist nur
+      `init_thread_frame`. Keine Zweitfassung des Schedulers.
+
+      **Die Kette, und sie braucht kein Privileg.** Der PDCTL-Weg (PAUSE → RESUME) verlangt eine
+      `PdControl`-Cap. Der zweite nicht:
+      `switch_to` setzt beim IPC-CALL `blocked = true` am **Aufrufer** und spendet dem Server
+      dessen Konto (`sc_donor`) → `on_tick` belastet über `acct = sc_donor.unwrap_or(cur)` und
+      setzt `depleted = true` **am blockierten Aufrufer** → `reply` ruft `ops.unblock(caller)`
+      (`caprock-ipc:653`) → `unblock` (`sched:658`) prüft `depleted` nicht →
+      `enqueue_ready` (`sched:1099`) auch nicht.
+
+      | Gemessen (M1 / M2) | Wert |
+      |---|---|
+      | in der Ready-Liste, **Liste gelaufen** statt `queued` gelesen | 1 |
+      | dabei `depleted` / `remaining` | 1 / 0 |
+      | `audit()` | **0** |
+      | Alternative im Augenblick der Wahl bereit | 1 |
+      | wird `current`, verbraucht eine volle Zeitscheibe | 1 |
+
+      **Warum die Aussage das Paar braucht.** „Läuft auf leerem Budget" allein kann denselben
+      Wert aus einem anderen Grund annehmen: ist **kein anderer Thread lauffähig** (M6), lässt
+      `dequeue_highest` `current` stehen, und `depleted_count` wächst auch ohne jedes `unblock`.
+      Deshalb trägt erst **„wird `current`" ∧ „eine Alternative stand im selben Augenblick
+      bereit"**. Dieselbe Unterscheidung wie bei Z4 („der Wert stimmt" gegen „der Wert wurde
+      geerbt").
+
+      **Korrektur an der ersten Herleitung.** „`depleted_count` wächst bei jedem Tick" stimmt
+      **nicht**: nach dem erneuten Erschöpfen setzt `on_tick` `requeue = false`, der Thread ist
+      wieder off-queue und läuft nicht von selbst weiter. Der Zuwachs ist **+1 je
+      PAUSE/RESUME-Paar** (M3a: 6 Runden → `depleted_count` 7 bei **einem** echt erschöpften
+      Konto), `next_refill` verschiebt sich um genau die eine dabei verbrauchte Tick.
+      Kontrolle M3b (dieselben Ticks ohne PAUSE/RESUME): Zähler bleibt 1, keine Drift.
+
+      **Die Folge, die bleibt (M5).** Nach vollständigem Refill steht `depleted_count = 3` bei
+      **0** wirklich erschöpften Konten. Der Zähler kehrt nie auf 0 zurück ⇒
+      `if self.depleted_count > 0 { self.refill_depleted(); }` ist **dauerhaft wahr**, der
+      O(n)-Scan läuft ab da in jedem Tick. Die Zusicherung im Kommentar darüber — „der Tick
+      kostet nichts, unabhängig von der Tabellengröße" — fällt damit.
+
+      **Gegenprobe.** Mit dem Wächter verschwindet **jede** M1/M2/M3a/M5-Wirkung; die
+      M4/M4b/M6-Werte bleiben. Der Test misst also genau diese Ursache und trennt sie sauber von
+      der anderen.
+
+      **Zweiter, unabhängiger Fehler (M4): PAUSE hält nicht.** `refill_depleted` reiht **ohne
+      `!blocked`-Prüfung** wieder ein. Gemessen: erschöpfen → PAUSE → 100 Ticks → der
+      **pausierte** Thread (`blocked = 1`) wird `current` und verbraucht eine Zeitscheibe,
+      `audit()` = 0. Dafür braucht es kein `unblock`. Steht ein höher priorisierter Läufer
+      daneben (M4b), bleibt er mit `blocked = 1` in der Ready-Liste und `audit()` = **2** — das
+      belegt zugleich, dass `audit()` sprechfähig ist und in M1 **geschwiegen** hat.
+
+      **Behebung — drei Teile, und die naheliegende Fassung ist die falsche.**
+      1. `if blocked && !depleted { … }` ist **schädlich** (gemessen als G-a): der Rumpf wird
+         übersprungen, `blocked` bleibt `true`, das RESUME wird verschluckt. Zusammen mit der
+         Behebung von M4 (G-d) misst man `ticks_mit_budget = 0`, `ende.blocked = 1` —
+         **vollständiges Verhungern.** Die halbe Behebung, die schlimmer ist als der Befund.
+      2. Richtig und modellgleich (G-b):
+         ```rust
+         if self.tcbs[s].blocked {
+             self.tcbs[s].blocked = false;
+             if !self.tcbs[s].depleted { self.enqueue_ready(s); }
+         }
+         ```
+         Wer ihn danach einreiht, ist gemessen: `refill_depleted` (M7: 2 Refills, 6 Ticks mit
+         echtem Budget, am Ende nicht blockiert). Kein Verhungern.
+      3. Dazu G-c in `refill_depleted`, sonst bleibt M4 stehen:
+         `_ => { if !self.tcbs[slot].blocked && self.current != Some(slot) { self.enqueue_ready(slot); } }`
+      4. Und **B2 schließen**: `audit()` braucht im Queue-Lauf ein `if t.depleted { return <neuer
+         Code> }`. Ohne das bleibt genau der Zustand unbeobachtbar, der die Aussage widerlegt —
+         dieselbe Form wie die leere Event-Queue ohne `CD.R`.
+
+      **Der Donee-Zweig ist am 2026-08-03 nachgemessen worden** — er trägt nicht, aber anders
+      als vermutet: nicht „er weckt zu viel", sondern **er weckt den Falschen und lässt den
+      Richtigen liegen**. Eigener Eintrag: **D9**.
+
+      **Auch das noch nicht gemessen:** dass die Kette in einem *laufenden* Kernel eintritt.
+      Gemessen ist die Zustandsmaschine am echten `Scheduler`; die Erreichbarkeit aus dem
+      Syscall ist aus dem Quelltext argumentiert (`system.rs:6588`, `system.rs:2743`,
+      `caprock-ipc:653`), nicht end-to-end ausgelöst.
+
+- [x] **D11 BEHOBEN am 2026-08-04: der Überlauf einer Endpoint-Warteschlange ist BENANNT.**
+      Neuer ABI-Code `ERR_EP_FULL = 9`; `TidQueue::enqueue` gibt `bool` und ist `#[must_use]`;
+      alle sechs Aufrufstellen werten ihn aus. `call`/`recv` weisen ab **ohne zu blockieren**,
+      `bind_receiver` und `migrate_owner` melden Misserfolg statt Erfolg — und `migrate_owner`
+      prüft **vor** dem `take()`, sodass die Antwortpflicht beim alten Besitzer stehenbleibt
+      statt gelöscht zu werden.
+
+      **Warum ein dritter Code und nicht `ERR_QUIESCING`** (die Frage, die dieser Eintrag
+      offenließ): „gibt es nicht" (nie wieder), „kommt gleich wieder" (nach dem Austausch) und
+      „gerade kein Platz" verlangen verschiedene Reaktionen. Der dritte ist eine **Lastaussage**
+      — er hängt an den anderen 32 Wartenden, kann sofort wieder gelten, und wer stumpf
+      wiederholt, verschärft ihn.
+
+      **Eine zweite Fundstelle, die dieser Eintrag nicht nannte:** `Notification::wait` hatte
+      dieselbe Form bei Kapazität 1 — ein zweiter `WAIT` **überschrieb** den Wartenden, und der
+      Überschriebene war danach in keiner Struktur mehr. Ebenfalls `ERR_EP_FULL`.
+
+      **Belegt, nicht behauptet.** Das Verus-Modell ist mitgezogen (`dropped_*` → `rejected_*`,
+      `send_gate`/`recv_gate` mit Code 3, **25 → 30 Beweise**), darunter `send_never_strands`:
+      unter offenem Tor gibt es nur noch zwei Ausgänge, zugestellt/eingereiht **oder**
+      abgewiesen-mit-Code. Der Modelltreue-Wächter fährt den echten Quelltext (93 → **99
+      Fälle**, 28 → **35 Selbsttestfälle**) und führt ein **Hauptbuch der Gestrandeten**: nach
+      einem Lauf über alle vier Überlaufwege muss es leer sein. Die Positivkontrolle sind fünf
+      Mutationen, die D11 einzeln wiederherstellen — jede wird erkannt. Dazu die Prüfzeile
+      `epfull` in der x86-Suite; eine Mutation macht sie rot und die Notbremse nennt sie
+      (`bringup : offen waren: epfull`).
+
+      Der Rest des Eintrags bleibt als Herleitung stehen.
+
+- [x] **E-Rest 3b BEHOBEN am 2026-08-04: die Freiliste kennt den Zonenwunsch, statt ihn zu
+      erraten.** `caprock_mem::alloc_below`/`alloc_colored_below` nehmen eine Obergrenze; Farbe
+      **und** Zone werden dabei in EINER Entscheidung getroffen (dasselbe Argument wie Z8 für
+      NUMA). Die drei Stellen mit einer *benannten* GiB-0-Bedingung (`alloc_dma_region`,
+      `spawn_isolated`, `spawn_isolated_colored`) nennen sie jetzt und **suchen** statt einmal zu
+      fragen und aufzugeben. Der Behelf im Speicherplan ist weg: hoher Speicher geht
+      **vollständig** in die Freiliste (bei `-m 3G` vorher 0 von 1024 MiB, jetzt 1024 von 1024).
+
+      **Der eigentliche Befund war ein anderer, als der Eintrag annahm.** Nicht nur die drei
+      benannten Stellen hingen an der Belegungsordnung — „unten zuerst" war überhaupt ein
+      **Zufall der Größenrelation**: Best-Fit nimmt das kleinste passende Fragment, und solange
+      der obere Bereich zufällig größer war (4G, 6G), landete alles Unbenannte unten. Sobald das
+      nicht mehr gilt, fällt der Ladepfad aus (gemessen: `drv`/`blkdev`/`fs`/`part` reihenweise
+      rot bei 3G). Deshalb ist „unten zuerst" jetzt eine **ausgesprochene Politik** in
+      `mem_alloc`/`alloc_colored` mit hohem Speicher als Überlauf — sie reproduziert das
+      gemessene Verhalten, statt eine unbelegte Freiheit zu behaupten. `claim_user_kstack` griff
+      als einzige Stelle am Wrapper vorbei und geht jetzt ebenfalls darüber.
+
+      **Zwei eigene Fehler dabei, beide gemessen.** (1) `match MEM.lock() { … None => MEM.lock() }`
+      hält den Guard bis zum Ende des `match` — der Ausweichpfad war ein **Selbst-Deadlock** auf
+      einem Spinlock, und zwar genau der Pfad, der selten läuft (Lade-Suite blieb stehen).
+      (2) Der Zähler für den Ausweich zählte zuerst *Versuche* statt *Wirkung* und meldete `1x`
+      auf einer 512-MiB-Maschine, auf der es oberhalb 4 GiB gar keinen Speicher gibt — gezählt
+      war in Wahrheit eine absichtlich übergroße Anforderung aus dem Farbtest. Dieselbe
+      Verwechslung wie `rx_used` gegen „Daten angekommen".
+
+      **Gemessen:** RAM-Reihe 512M · 2560M · 3G · 4G · 6G, Haupt- **und** Lade-Suite, alle
+      `== ALL PASS ==`; Host-Tests mit **Positivkontrolle** (`ohne_zone_waehlt_best_fit_den_oberen_bereich`
+      belegt, dass Best-Fit ohne Zone wirklich oben landet — sonst sagte der Test darunter nichts).
+
+      **Was NICHT behoben ist und jetzt benannt gehört:** der 1-GiB-Deckel für Regionen mit
+      **PD-eigener** Abbildung bleibt, und er liegt nicht im Allokator. `vspace_map_block` bildet
+      **identisch** ab (VA == PA) und GiB 1..3 jeder isolierten PD hängen an geteilten statischen
+      Tabellen — eine DMA-Region oder eine isolierte PD *kann* deshalb nur in GiB 0 liegen. Das
+      ist eine Eigenschaft des VSpace-Layouts; es zu heben ist eigene Arbeit (s. E-Rest 3d).
+
+- [x] **E-Rest 3d (Rest) BEHOBEN am 2026-08-04: der 1-GiB-Deckel für isolierte PDs ist weg.**
+      Die private Region einer isolierten PD wird nicht mehr **identisch** abgebildet, sondern in
+      ein **VA-Fenster ausserhalb der Identitätskarte** (`hal::mmu::ISO_USER_VA`; x86 `PML4[1]`
+      = 512 GiB, aarch64 `L1[9]` = 9 GiB — beides Bereiche, in denen der Kernel nie identisch
+      zugreift). Damit ist die Physadresse frei.
+
+      **Der gemessene Deckel war 504** (Host-Test `gib0_deckel_ist_eine_zahl`: GiB 0 abzüglich
+      der ersten 16 MiB, je 2 MiB) — nicht `MAX_VSPACES` (4096). Belegt, dass er fällt:
+      `isohigh : ALL PASS` bei 3G/4G/6G, Regionen bei `0x1_02b0_0000` (4,04 GiB), und die
+      Farbtrennung hält unverändert — sie ist eine Aussage über die **Phys**adresse und von der
+      virtuellen Lage unberührt. Bei 512M/2560M meldet die Zeile `SKIP`, weil es dort keinen
+      Speicher oberhalb 4 GiB gibt und die Frage **nicht entscheidbar** ist. Gegenprobe gefahren:
+      die alte Zuteilung wieder eingesetzt → `isohigh : FAILURES`.
+
+      **Zwei Annahmen dieses Eintrags waren falsch.** (a) „Der Preis ist der Verlust des
+      2-MiB-Block-Fastpaths" — nein: der Fastpath hing nie an der Identität, sondern nur an der
+      **Ausrichtung der VA**. Ein 2-MiB-Block bleibt ein Blockdeskriptor. (b) „Gehört mit B-4.1
+      zusammen entschieden" — nein: A1 ist davon gar nicht betroffen, die Farbbedingung liegt auf
+      der Physadresse. Der Preis sind zwei bis drei 4-KiB-Rahmen je isolierter PD für die
+      Fenstertabellen, und die dürfen selbst oben liegen.
+
+      Der Fehler, der das teuer gemacht hätte: `spawn_user` nimmt **einen** Wert für den EL0-SP
+      **und** die Reap-Region, die beim Thread-Tod an den Allokator zurückgeht. Solange VA == PA
+      galt, war das dieselbe Zahl; jetzt sind es zwei. Gemessen als `#PF cr2=0x80_0000_0000` im
+      **Kernel** — der Reap-Pfad gab eine virtuelle Adresse als Physadresse frei. Behoben über
+      das bereits vorhandene `spawn_user_at` (Ladepfad benutzt es seit A-2).
+
+- [x] **VA==PA systematisch aufgeräumt am 2026-08-04.** Nach dem Fenster-Umbau war die Frage
+      nicht mehr „geht das?", sondern „wo steckt dieselbe Annahme noch?". Ergebnis der
+      Bestandsaufnahme — die Fläche ist klein und jetzt **aufgezählt**:
+
+      * **Entfernt (die Identität war eine Altlast):** `spawn_isolated_native` bildete Code- und
+        Stack-Frame identisch ab **und nahm die Physadresse des Code-Frames als
+        Einsprungadresse**. Beide gehen jetzt ins Fenster (Plätze `SLOT_CODE`/`SLOT_DATA`), der
+        Entry ist eine VA. Damit sind `vspace_map_region`/`vspace_map_code_region` **ohne
+        Aufrufer** und gelöscht — kein toter Pfad, der später wieder benutzt wird.
+      * **Unmöglich gemacht:** `Scheduler::spawn_user` nahm EINEN Wert für den EL0-Stackzeiger
+        **und** die Reap-Region. Es ist **gelöscht**, nicht repariert; es gibt nur noch
+        `spawn_user_at`, das beide verlangt. Der letzte Aufrufer (SAS-Thread, wo die Zahlen
+        wirklich gleich sind) schreibt sie jetzt zweimal hin — die Gleichheit ist dort ein Zufall
+        der Umgebung, keine Eigenschaft des Aufrufs.
+      * **Benannt statt still (die Identität ist die Zusicherung):** neun Aufrufstellen bleiben,
+        alle mit Grund in `tools/identitaet.sh` — `SYS_MAP`/`SYS_UNMAP` (der Aufrufer nennt eine
+        Memory-Cap, also eine PA, und das ist die ABI), die Gerätefenster (ein Treiber rechnet mit
+        Adressen aus der PCI-Enumeration, und die sind physisch) und zwei globale
+        Kernel-Abbildungen ohne Subjekt.
+
+      **Der Wächter ist der eigentliche Ertrag:** `tools/identitaet.sh` hält die Liste gegen den
+      Quelltext. Eine neue identisch abbildende Stelle schlägt an und muss ihren Grund
+      hinschreiben, bevor sie durchgeht. Mit Selbsttest in **beide** Richtungen: eine
+      untergeschobene Stelle wird erkannt, ohne sie schweigt er wieder. Dabei prompt
+      hereingefallen — der erste Anlauf suchte mit absoluten Pfaden, die auf keinen Listeneintrag
+      passten, und meldete seine eigene Mechanik als Befund.
+
+      **Was er NICHT kann, und das steht in seinem Kopf:** er sieht Aufrufe, keine Absichten. Ob
+      eine erlaubte Stelle ihre Identität weiterhin zu Recht annimmt, prüft er nicht.
+
+- [x] **E-Rest 3g BEHOBEN am 2026-08-05: die Bindung Stelle↔Grund hält rustc.**
+      Mein Grund für die Vertagung („`pub(in path)` verlangt einen Vorfahren, `Va` liegt in
+      `crate::addr`") ging am Punkt vorbei: der **Zeuge** braucht keinen Vorfahren. Jeder
+      `Va::for_*` verlangt jetzt einen Typ mit privatem Feld aus dem Modul seiner Engstelle
+      (`crate::system::*Witness`) — nennbar, aber nur dort herstellbar. Eine Zeile je Engstelle.
+
+      **Der Beleg ist der Bau selbst:** `bringup.rs` konnte den Zeugen für das globale
+      Gerätefenster nicht herstellen und scheiterte mit „argument #1 of type
+      `KernelGlobalWindowWitness` is missing". Statt den Zeugen öffentlich konstruierbar zu machen
+      (was ihn wertlos machte), wandert der Aufruf hinter `system::map_device_window_global` —
+      Nebenertrag: die Schichtung stimmt danach besser.
+
+      Die Tabelle Konstruktor→aufrufende Funktion im Wächter ist **ersatzlos entfallen**; er prüft
+      nur noch, dass die Zeugen so gebaut sind (privates Feld, einer je Konstruktor) und dass jeder
+      Konstruktor seinen verlangt. Ich hatte das als „Entwurfsarbeit" eingestuft — dieselbe
+      Fehleinstufung, die `tail -1` neben Entwurfsarbeit geparkt hat.
+
+- [x] **E-Rest 1 BEHOBEN am 2026-08-04: `iova_window_clear_of_msi` gibt im schwachen Zweig „in Ordnung" zurück, ohne
+      urteilen zu können.** (2026-08-03, gemessen) `kernel/src/system.rs:3900`:
+
+          let Some(first) = strong_window_base() else {
+              return true; // kein starkes Fenster -> es gibt nichts zu ueberlappen
+          };
+
+      Der Kommentar stimmt nur, wenn es gar kein Fenster gibt. Tatsächlich ist es dann
+      `[0, 512 GiB)` und **enthält** den Sperrbereich `0xFEE0_0000–0xFEEF_FFFF`. Sichtbar
+      gemacht über eine HAL-Mutation: Suite `== ALL PASS ==`, `msi_clear = 1`, bei nachweislich
+      weggefallener Trennung. Erreichbar ab ~512 GiB RAM.
+
+      Genau das, was `docs/invariants.md` und CLAUDE.md als Entwurfsprinzip ausschließen: **ein
+      Prüfer, der über Abwesenheit entscheidet, muss belegen können, dass er sprechfähig ist.**
+      Hier gibt er Schweigen als Erfolg aus. Richtig wäre: im schwachen Zweig prüfen, ob das
+      Fenster den Bereich enthält, und sonst „nicht entscheidbar" melden — nicht `true`.
+
+      Dazu: **`DmaCtx::strong_window` wird geschrieben und nirgends gelesen** (`system.rs:3944`
+      und `:3952` setzen es, `:4217` deklariert es, kein Lesezugriff). Die Unterscheidung
+      „starkes Fenster ja/nein" ist erfasst und wird nicht verwendet — kein Bericht, kein
+      Audit-Code.
+
+- [x] **E-Rest 2 BEHOBEN am 2026-08-04: RMRR färbt die Gruppe.** (2026-08-03, gemessen)
+      `GroupSpansUnits` färbt die ganze ACS-Gruppe, `Rmrr` nur die einzelne Funktion. Gemessen
+      mit einem Sonderharness gegen den unveränderten `dmar.rs`: zwei Funktionen ohne ACS in
+      einer Gruppe, RMRR auf 05.1 → `excluded[0] = None`, Aliasmenge `[0x28, 0x29]`,
+      `audit() = 0`. Wird 05.0 zugeteilt, bekommt die RID des RMRR-Geräts einen Kontexteintrag
+      in dessen Domäne. **Auf q35 unsichtbar (0 RMRRs), auf echter Hardware der Normalfall** —
+      also genau die Sorte Lücke, die eine Emulation nie zeigt.
+
+- [x] **E-Rest 3 BEHOBEN am 2026-08-04: der Kernel bootet mit RAM über 4 GiB (3G/4G/6G gemessen), und der Zweig der Fensterwahl trägt.** (2026-08-03)
+      Ab `-m 3G` stirbt der Boot mit `#PF`, `cr2 = 0x0000_0070_0000_0014`, `rip` →
+      `Transport::status` (`0x14` = `DEVICE_STATUS`). Sobald QEMU Speicher oberhalb 4 GiB
+      anlegt, legt SeaBIOS die virtio-BARs bei `0x70_0000_0000` ab — und `mmu.rs:99` hat
+      `MAPPED_GIB = 4`. Solange das steht, kann die Fensterwahl in diesem Bereich nicht
+      gemessen werden.
+
+- [x] **D10 BEHOBEN am 2026-08-03: der Refill-Weckelauf läuft nur noch, wenn jemand darauf
+      wartet.** Gemessen in **Iterationen** (nicht Zeit — eine Iterationszahl ist eine
+      Eigenschaft des Programms), Sprechprobe Tabellengröße 32 gegen 10 000.
+
+      | | vorher | nachher |
+      |---|---|---|
+      | Ruhe (nichts erschöpft) | 0 | 0 |
+      | 100 Refills in **einem** Tick, kein Donee | 1 000 000 | **0** |
+      | dito, ein Donee | 1 000 000 | **10 000** |
+      | dito über **Migration** | 1 000 000 | **0** |
+      | `set_budget` | 10 000 | **0** |
+      | je Konto ein eigener Donee | 1 000 000 | **1 000 000** |
+
+      **Zwei Korrekturen an meiner eigenen Notiz.** Die `on_tick`-Zusicherung war nur **halb**
+      kaputt: der Normalfall kostet wirklich 0. Kaputt war der Fall „irgendein Konto erschöpft",
+      und die 10 000 kommen aus der **äußeren** Schleife, die schon vor der Donation da war.
+      Und der Einzelfall wird durch den Zähler nicht billiger.
+
+      **O(n²) ist erreichbar** — mein Einwand („pro Tick erschöpft nur eins") stimmt und reicht
+      nicht, weil die **Periode** die zweite Hälfte der Summe ist. Weg 1: Konto *i* erschöpft im
+      Tick `m+i`, Periode `Z−m−i` → alle Refills fallen auf Tick `Z`; gemessen 100 Refills in
+      *einem* Timer-Interrupt. Weg 2 braucht gar keine Periodenwahl: `attach_migrated` setzt
+      `next_refill = now + period`, mehrere erschöpfte Threads, die im selben Tick ankommen,
+      refillen gemeinsam — die Periode muss nur **geteilt** sein. Ausgelöst vom **Lastausgleich**,
+      nicht vom Mandanten. Weg 1 ist cap-vergittert, Weg 2 nicht.
+
+      **Der Zähler hat, was `depleted_count` heute Morgen fehlte:** eine **unabhängige
+      Nachzählung** in `audit()` → **Audit-Code 10**, wenn er von der Tabelle abweicht. Genau
+      diese Nachzählung fehlte damals, und deshalb log er. Bewegt wird er ausschließlich über
+      `set_budget_blocked(local, an)` (2 Erhöhungen, 4 Senkungen, 3 Bulk-Nachführungen, alle im
+      Kommentar aufgezählt). Die Lügen-Mutation „Senken weg" — die D8/M5-Form — schlägt an
+      allen vier Auflösungswegen an, die Positivkontrolle fällt durch.
+
+      **Was bleibt:** trägt jedes Konto einen eigenen blockierten Donee, ist k·n unverändert.
+      Ein Zähler kann „wer zeigt auf mich?" nicht beantworten; dafür bräuchte es eine
+      Donee-**Liste** je Konto.
+
+- [x] **D10 (Herleitung) Der Refill kostet seit H-b einen VOLLEN Tabellendurchlauf je
+      aufgefülltem Konto — gelesen, nicht gemessen.** (2026-08-03)
+
+      Die neue Schleife (`refill_depleted`, `for d in 0..self.tcbs.len()`) liegt **innerhalb** der
+      bestehenden Schleife über die Thread-Tabelle. `Slab::len()` ist die **Tabellengröße**, nicht
+      die Belegung — laut A-3.4 sind das **10 000** Slots.
+
+      | | |
+      |---|---|
+      | **sicher** (steht im Code) | ein Refill kostet ab jetzt 10 000 Iterationen statt einer konstanten Zahl |
+      | **nicht belegt** | ob „viele Konten refillen im selben Tick" (→ O(n²), 10⁸ Iterationen in einem Timer-Interrupt) erreichbar ist |
+
+      Dagegen spricht, dass pro Kern und Tick höchstens **ein** Konto erschöpft und `next_refill`
+      an die Erschöpfungszeit gekoppelt ist — die Refills verteilen sich von selbst. Gemessen ist
+      das nicht.
+
+      **Beschädigt ist eine ausgesprochene Zusicherung.** Der Kommentar in `on_tick` sagt:
+      „Refill-Scan NUR, wenn überhaupt ein Konto erschöpft ist (Normalfall: keins → der Tick
+      kostet nichts, **unabhängig von der Tabellengröße**)." Das gilt so nicht mehr.
+
+      **Die naheliegende Abkürzung funktioniert nicht:** „nur laufen, wenn `sc_donee.is_some()`"
+      reißt D5 sofort wieder auf — dort ist `sc_donee` gerade `None`, während Donees warten. Das
+      ist der ganze Punkt von H-b. Es braucht einen eigenen Zähler `budget_blocked_count`.
+
+      **Bewusst NICHT sofort gebaut.** Zähler haben am selben Tag schon einmal gelogen
+      (`depleted_count`, D8/M5), und ungemessenen Code nachzuschieben wäre genau der Fehler, den
+      D8 und D9 vermieden haben. Reihenfolge: erst ein Messfall mit großer Tabelle, der die Kosten
+      **zeigt**, dann der Zähler, dann die Gegenprobe.
+
+      Zwei kleinere Stellen derselben Änderung, ebenfalls neu O(n) statt O(1), aber nicht im
+      Tick-Pfad: `record_zombie` (je Thread-Tod) und `set_budget` (nur im `was_depleted`-Zweig).
+
+- [x] **D9 BEHOBEN am 2026-08-03 (H-b): der DONEE-Zweig — fünf Befunde, alle gemessen und alle
+      behoben.** Der Kern der Behebung ist ein neues TCB-Bit `budget_blocked`, das den **Grund**
+      einer Blockade trägt: bis dahin teilten sich „pausiert", „wartet in IPC" und „wartet auf
+      Konto-Refill" ein einziges `blocked`, und daran hingen D1, D4, D5 und D7. Dazu wird die
+      Spende als **Stapel** behandelt — `refill_depleted` weckt alle mit
+      `sc_donor == slot && budget_blocked` statt des einen `sc_donee`, den der zweite CALL
+      überschreibt und der innere REPLY löscht (das ist D5).
+
+      | Messgröße | vorher | nachher |
+      |---|---|---|
+      | `D1.pausierter_ist_current` (PAUSE hält) | 1 | **0** |
+      | `D4.ticks_donee_lief` (Konto stirbt) | 0 | **299** |
+      | `D5.ticks_mid_lief` (verschachtelte Spende) | 0 | **6** |
+      | `D6.wird_current` / `zaehler_luegt_um` | 1 / 1 | **0 / 0** |
+      | `D7.ticks_donee_lief` | 0 | **9** |
+      | `M1`/`M4`/`M5` (D8 — keine Regression) | 0 | **0** |
+      | `M7.ticks_mit_budget` (kein Verhungern) | 6 | **6** |
+      | Positivkontrolle P2 | bestanden | **bestanden** |
+
+      x86-Suite, Lade-Suite, Host-Tests, Verus + drei Wächter: alle grün. **500 Läufe** (5 × 100)
+      mit derselben Signatur `e419003d625f` wie vor D8 und vor H-b.
+
+      **Was H-b NICHT ist: ein Verus-Beweis.** `budget_blocked` ist als **außerhalb** eingetragen,
+      weil es vollständig zum Spenden-Mechanismus gehört und Donation laut ADR 0019 außerhalb des
+      Modells liegt. Die Kehrseite gehört benannt: `roundrobin_no_starve` und `no_lost_thread`
+      gelten damit für eine Welt **ohne** Spende — und genau in der Spende lagen D4, D5 und D7.
+      Ein gestrandeter Donee ist `depleted == false`, in keiner Liste, `audit() == 0`; er fällt
+      durch **jede** dieser Zusicherungen hindurch, weil sie über ihn gar nicht sprechen. Der
+      Beleg für H-b ist `sched-erschoepfung-messen.sh`, nicht Verus. Wer das ändern will, braucht
+      ein Modell **mit** Donation.
+
+      Neuer Aufwand daraus: **D10** (der Refill kostet jetzt einen vollen Tabellendurchlauf).
+
+      Die Herleitung und alle Zahlen der fünf Befunde stehen unverändert darunter.
+
+- [x] **D9 (Herleitung — kein offener Punkt, sondern das Protokoll zur Behebung darüber.)
+      Der DONEE-Zweig in `refill_depleted`, gemessen am 2026-08-03, fünf Befunde.** Werkzeug: `tools/sched-erschoepfung-messen.sh` (jetzt **208 Messwerte**, die
+      D-Reihe kam dazu). Der echte `crates/caprock-sched/src/lib.rs` wird gelinkt; Mutationen
+      nur auf Kopien.
+
+      **Positivkontrolle zuerst (P2):** der gesunde Fall trägt — Konto erschöpft, während der
+      Donee läuft; der Donee ist *nachweislich* auf das Konto-Budget geblockt (`blocked = 1`,
+      **nicht** in der Liste, `audit() = 0`); nach 100 Ticks Refill wird er `current`, während
+      eine Alternative bereitsteht, und der nächste Tick belastet ein Konto **mit** Budget.
+      Ohne diese Zeile wäre keine Zahl darunter etwas wert.
+
+      | Befund | gemessen |
+      |---|---|
+      | **D1 (F1) PAUSE hält nicht** — gesetzt, während das Konto noch Budget hat (`konto_depleted = 0`, `depleted_count = 0`), also nachweislich die PAUSE und nicht das Budget | nach dem Refill `blocked = 0`, **wird `current`**, Alternative stand bereit, verbraucht Budget, `audit() = 0` |
+      | **D5 verschachtelte Spende** (fs → Blockdienst → Treiber ist genau diese Form) — der zweite CALL überschreibt `sc_donee`, der innere REPLY (`end_donation`) löscht es; der äußere Server behält seinen `sc_donor` | beim Erschöpfen ist `sc_donee = None` → `_`-Zweig → **niemand weckt ihn**: 0 Ticks in 3 Perioden, `blocked = 1`, `audit() = 0`. Client **und** Server dauerhaft fest. **Kein Privileg nötig: zwei CALLs und ein REPLY.** |
+      | **D4 das Konto stirbt**, während der Donee auf sein Budget geblockt ist | `record_zombie` löst `sc_donor`, lässt `blocked = 1` — mit dem Konto verschwindet der einzige Wecker: 0 Ticks in 3 Perioden, `audit() = 0` |
+      | **D7 `set_budget`/`bind_sched_context` auf das Konto** räumt `depleted` weg — und damit den Anlass des Refills | 0 Ticks in 3 Perioden. Die vorhandene Prüfzeile `strand` deckt genau diese Strandung ab — aber nur für **einen einzelnen** budgetierten Thread, nicht für seinen Donee |
+      | **D6 `unblock` prüft das falsche Konto** — der D8-Wächter fragt `self.tcbs[s].depleted`, belastet wird aber `sc_donor.unwrap_or(s)` | RESUME am Donee → in der Liste, wird `current` mit bereitstehender Alternative, **ein voller Tick auf leerem Konto**, `depletions +1`, `depleted_count` driftet +1 (M5-Form) |
+
+      **F2 (D2): an der Scheduler-Schnittstelle auslösbar, im Kernel nicht.** Ein Donee mit
+      **eigenem** erschöpftem Konto wird vom Zweig eingereiht — und **Audit-Code 9 meldet es**
+      (`audit() = 9`), der Zustand ist also nicht unbeobachtbar. Über `caprock-ipc` ist er
+      derzeit nicht herstellbar: Donee wird man nur über `switch_to` aus `call`, und das Ziel
+      kommt aus der Empfängerliste — dort landet nur, wer `recv` ausgeführt hat, also gelaufen
+      ist, also nicht erschöpft war. **Offene Entwurfsfrage:** ob Code 9 einen Thread ausnehmen
+      muss, der auf einem **fremden** Konto läuft.
+
+      **F3: nicht auslösbar, und der Grund ist benannt.** Ein veralteter `sc_donee` entsteht
+      nicht — Tod löscht ihn (`record_zombie`), Migration wird für Donee *und* Konto verweigert
+      (`detach_for_migration`). Sprechprobe dazu: ein Thread **ohne** Spende lässt sich sehr wohl
+      herauslösen. Die Gegenrichtung ist der Befund: `sc_donee` wird **zu früh** gelöscht (D5).
+
+      **Behebungsvorschlag, gemessen (H-b im Werkzeug): der GRUND der Blockade gehört
+      mitgeschrieben.** Ein Bit `budget_blocked` im TCB; `on_tick` setzt es nur, wenn der Donee
+      nicht schon aus einem anderen Grund blockiert war; `refill_depleted` weckt **alle**
+      Threads mit `sc_donor == slot && budget_blocked` (die Spende ist ein **Stapel**, `sc_donee`
+      nur seine Spitze); `pause` übernimmt die Blockade; `unblock` lässt eine Budget-Blockade
+      stehen (gefahrlos, weil der Wecker **benannt** ist) und schiebt eine Blockade auf ein
+      leeres fremdes Konto in denselben Zustand; `record_zombie`/`set_budget` lassen ihre Donees
+      frei. Gemessen: D1/D4/D5/D6/D7 auf 0 bzw. „läuft wieder" (D4 299 Ticks, D5 6, D7 9),
+      Positivkontrolle bestanden, **M1…M7 unverändert** (keine D8-Regression).
+
+      **Und die Frage aus D8 noch einmal gestellt:** der naheliegende Wächter ist wieder der
+      falsche. `if !blocked && current != Some(d)` — wörtlich aus dem `_`-Zweig übertragen —
+      **fällt in der Positivkontrolle durch**: der Donee ist an dieser Stelle *immer* blockiert
+      (`on_tick` hat ihn gerade blockiert), also weckt ihn niemand mehr. Verhungerungsprobe zu
+      H-b: nach RESUME 4 Ticks **mit** Budget (echt: 3).
+
+      **Nebenbefund am Werkzeug selbst:** die Gegenproben von D8 waren nach ihrer eigenen
+      Behebung stumm abgebrochen („der Anker passt nicht mehr") — der Lauf am echten Quelltext
+      blieb grün und meldete das nicht als Fehler. Die Fassungen heißen jetzt `V0` (Stand vor
+      D8, als Sprechprobe der Mechanik: die alten Befunde tauchen dort wieder auf), `H-a`, `H-b`.
+
+      **Nicht gemessen:** dass D1/D5 in einem *laufenden* Kernel eintreten. Die Aufruffolgen
+      sind die von `caprock-ipc` (`call` → `switch_to`, `reply` → `end_donation` + `unblock`,
+      `recv` → `block_current`) und `system::freeze_thread` (das **vor** der Quiescence-Prüfung
+      `pause` absetzt und die PAUSE bei `Busy` stehen lässt), aber nicht end-to-end ausgelöst.
+
+- [x] **D7 ERLEDIGT am 2026-08-03: das IPC-Modell sagt jetzt, was gilt.** Nicht „mehr Beweise",
+      sondern ehrlicher: 3 Felder → **9**, 4 Operationen → **13**, 5 Beweise → **24**
+      (**25 verified, 0 errors**).
+      * `send_no_loss` traegt die Kapazitaetsschranke als **Vorbedingung**, und der Verlust
+        darueber ist **bewiesen** statt weggelassen.
+      * `ep_inv` ist auf das abgeschwaecht, was haelt (`quiescing || ep_inv_strong`); die
+        Aufrufdisziplin steht als Vorbedingung **im Modell** statt in einem Kommentar, und der
+        Bruch der starken Fassung ist bewiesen.
+      * neu: `reply` (Token-Konsum, kein Doppel-Reply, `token_inv`), das Tor
+        (`gate_distinguishes`, `gate_rejects_are_noops`, `reply_not_gated_by_quiescing`),
+        `queue_cap()`.
+      **Bewusst NICHT bewiesen, weil falsch:** `ep_inv_strong` als erhalten, unbedingte
+      Verlustfreiheit, Token-Erhalt — ihr **Gegenteil** ist bewiesen. Liveness ebenfalls nicht:
+      das ist eine Scheduler-Eigenschaft und wird gemessen, nicht bewiesen.
+      Waechter: **93 Prueffaelle** (32), **28 Selbsttestfaelle** (12), darunter 14 Sprechproben
+      **am Modell allein** — ohne die bliebe ein auf `true` aufgeweichtes `ep_inv`/`token_inv`
+      unbemerkt. Ein veralteter Anker ist jetzt ein **harter Fehler**; im Baseline-Lauf ging
+      „die kosmetische Mutation hat nichts geaendert" vorher direkt in „still" ueber — die
+      Negativkontrolle bestand, **weil** nichts geaendert wurde.
+      **Was der Beweis jetzt traegt:** das Protokoll eines Endpoints unter der Aufrufdisziplin
+      des Kernels — 8 von ~15 Operationen, alle 6 Zustandsfelder. **Nicht** getragen: Tod,
+      `rebind_server` (ausgerechnet *die* A-4.1-Operation), Nebenlaeufigkeit, Liveness. Die drei
+      dabei gefundenen Fehler (**D11**) liegen alle genau dort, wo Modell und Wirklichkeit sich
+      nur am Rand beruehren.
+
+- [x] **D7 (Herleitung) Das IPC-Modell trägt für den echten Endpoint nur einen Ausschnitt — gemessen, nicht
+      geschätzt** (2026-08-03, `tools/verus-modelltreue-ipc.sh`, 32 Fälle · 12 Selbsttestfälle).
+
+      Der Wächter fährt den **echten** `caprock-ipc`-Quelltext gegen ein aus der Beweisdatei
+      **übersetztes** Modell (nicht abgeschrieben) und misst die Entsprechung unter einer
+      hingeschriebenen Abbildung. Ergebnis: `call`/`recv` entsprechen `send`/`recv` in beiden
+      Zweigen, über beide Kern-Pfade, FIFO-treu, über Ketten hinweg. Und drei Löcher, jedes
+      einzeln nachgemessen:
+
+      **(a) `ep_inv` gilt am echten Endpoint NICHT.** Über die *öffentliche* Schnittstelle sind
+      Zustände mit wartenden Sendern UND geparkten Empfängern erreichbar: `bind_receiver` sieht
+      die Sender-Queue nicht an, und `migrate_owner` reiht den Aufrufer wieder als Sender ein,
+      während ein Empfänger geparkt sein darf. Beides ist gewollt (A-4.1/A-4.3) — aber es heißt,
+      die Rendezvous-Invariante hält der **Typ** nicht, sondern die Aufrufdisziplin des Kernels,
+      und über die sagt der Beweis nichts. Dass `threads::mod` heute erst migriert und dann v2
+      erzeugt, ist eine Reihenfolge, keine Zusicherung.
+
+      **(b) `send_no_loss` gilt am echten Endpoint NICHT.** `Seq::push` ist unbeschränkt,
+      `TidQueue::enqueue` verwirft ab `QUEUE_CAP` **still**. Gemessen am 33. Sender an *einem*
+      Endpoint: `msgs_total` bleibt auf 32. Im Quelltext benannt, nirgends gemessen — bis jetzt.
+      (Das ist zugleich die alte Baustelle „der 33. Sender wird still verworfen".)
+
+      **(c)** `!used` (`ERR_BADCAP`), `quiescing` (`ERR_QUIESCING`) und der Leichen-Zweig
+      (`frame_of == None`) haben im Modell **kein** Gegenstück.
+
+      Offen ist nicht der Wächter, sondern das Modell. Damit es weiter trägt, bräuchte es
+      mindestens: `used`/`quiescing` als Bits mit Abweisung; eine **Schranke** auf beiden
+      Warteschlangen (dann wäre `send_no_loss` nur unter `len < QUEUE_CAP` beweisbar — was der
+      Wahrheit entspricht); `caller`/`reply_owner` samt `reply` als dritter Operation; und
+      `bind_receiver`/`migrate_owner` als Operationen, unter denen `ep_inv` dann nachweislich
+      *nicht* erhalten bleibt — die Invariante müsste zu „kein Rendezvous ist fällig, außer
+      während eines laufenden Austauschs" abgeschwächt werden. Kernel-Quelltext ist deshalb
+      **nicht** geändert worden; die Befunde stehen im Kopf von
+      `Verification/ipc/proofs/endpoint.rs`.
+
+
+#### aus: F. Debug-/Testcode aus dem Release-Build nehmen
+
+- [x] **F1/F2 erledigt (2026-07-30, A-2.2).** `feature = "selftest"` steht, `default = []` ist
+      gedreht, und **beide** Konfigurationen werden gebaut: `test-qemu-x86.sh` baut den
+      `--no-default-features`-Bau mit und vergleicht die `.text`-Größe — ein Gating, das nichts
+      schrumpfen lässt, ist wirkungslos geworden, und der Build allein zeigte das nicht.
+      Vorbedingung war der Root-Task (A-2.1): vorher wäre das Gating kein schlankerer Kernel
+      gewesen, sondern ein leerer.
+
+#### aus: Z22. Die vier harten Stellen aus Z21 — gebaut
+
+- [x] **BEANTWORTET (2026-08-11) — und die Frage war die falsche.** Gemessen wurde damals
+      „`fs` meldet sich, `hello` und `wasmhost` nicht", und daraus wurde eine Frage über
+      **Badges und Isolation**. Die Ursache lag im Ladepfad: `wasmhost` hatte ein `PT_LOAD` an
+      einer krummen VA (`.bss : ALIGN(8)` in den Programm-Linkerskripten), der Lader wies es
+      korrekt ab, und das Programm lief nie. Heute laden alle sechs, `clientn` meldet **3
+      Client-PDs mit eigener Ablage, 0 verloren**, und die Objekt-Ids sind sämtlich verschieden.
+      Ein Programm, das gar nicht erst geladen wird, sieht von aussen aus wie eines, dessen
+      Signal nicht ankommt.
+

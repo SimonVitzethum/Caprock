@@ -245,13 +245,19 @@ pub fn bericht() {
     let n = crate::system::num_cores();
     println!(
         "ist     : per-Kern-TSS -- Kapazitaet {} Kerne, benutzt {} · je Kern {} IST-Stacks zu \
-         {} B · TR-unbekannt={} ohne-TSS={}",
+         {} B · TR-unbekannt={} ohne-TSS={} · NMI-Reentranz: gesehen={} Fenster={} (muss 0 \
+         sein -- ein fremder Fault, der WAEHREND eines NMI-Handlers zurueckkehrt, gibt den \
+         NMI-Latch frei, und der naechste NMI ueberschriebe den IST-Frame des ersten; gezaehlt \
+         wird die GELEGENHEIT, nicht der Zusammenstoss. gesehen=0 hiesse: kein NMI auf diesem \
+         Messstand, die Aussage haette keinen Gegenstand)",
         hal::gdt::kapazitaet(),
         n,
         hal::gdt::IST_ANZ,
         hal::gdt::IST_STACK_BYTES,
         hal::gdt::tr_unbekannt(),
         hal::gdt::ohne_tss(),
+        hal::exception::nmi_bilanz().0,
+        hal::exception::nmi_bilanz().1,
     );
     println!(
         "ist     : IDT-Gates (zurueckgelesen) -- #DF(8)={} NMI(2)={} #MC(18)={} · #PF(14)={} \
@@ -298,15 +304,6 @@ pub fn bericht() {
     // ohne Watchdog kommt sonst nie einer), `fenster` zaehlt die Gelegenheiten. Ein Zaehler, der
     // erst beim ueberschriebenen Frame anschlaegt, waere in jedem gesunden Lauf stumm und im
     // kranken zu spaet -- dieselbe Ueberlegung wie bei `pdbind`.
-    let (nmi_gesehen, nmi_fenster) = hal::exception::nmi_bilanz();
-    println!(
-        "ist     : NMI-Reentranz -- gesehen={nmi_gesehen} · Fenster (fremder Fault kehrte \
-         zurueck, WAEHREND ein NMI-Handler lief)={nmi_fenster} (muss 0 sein). Der Vertrag dazu: \
-         der NMI-Handler fasst nur seinen IST-Stack und Per-Kern-Atomics an -- keine Sperre, \
-         keine Formatierung ueber fremde Strukturen, nichts, was faulten kann. `gesehen=0` \
-         hiesse: unter diesem Messstand kam kein NMI, die Zeile hatte keinen Gegenstand"
-    );
-
     // **Die Antwort auf „laufen heute Ring-3-Threads auf Sekundaerkernen?"** -- gezaehlt wird die
     // GELEGENHEIT (jede vorbereitete Rueckkehr nach Ring 3), nicht das Unglueck. Ein Melder, der
     // nur beim Zusammenstoss spricht, waere in jedem gesunden Lauf stumm.

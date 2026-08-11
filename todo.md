@@ -2902,6 +2902,47 @@ der Audit-Berichtigung
       Ausweg — damit ließe sich das Feld in `admit` nicht mehr herausbewegen, und der Typ verlöre
       genau die Eigenschaft, um die es geht.
 
+## D14. Eine BERICHTSZEILE MEHR kippt die Z4f-Pruefung (gemessen 2026-08-11)
+
+**Klasse:** Prueferform / Wanduhrzeit · **Stand:** offen, umgangen, Ursache NICHT benannt
+
+Beim Einbau der NMI-Reentranz-Zahlen fiel die Lade-Suite aus:
+
+```
+FAIL: der abgewiesene Checkpoint wurde ueberschrieben
+```
+
+**Zugeordnet, nicht vermutet.** Die beiden geaenderten Dateien einzeln zurueckgesetzt:
+
+| Stand | Lade-Suite |
+|---|---|
+| beide Aenderungen | **FAILURES** (2 von 2 Laeufen) |
+| nur `exception.rs` (NMI-Buchhaltung) | ALL PASS |
+| nur der `urteil()`-Konjunkt, **ohne** die neue Berichtszeile | ALL PASS |
+| mit der neuen Berichtszeile | **FAILURES** |
+
+**Es ist also EINE zusaetzliche `println!`-Zeile im Abschlussbericht** — rund 450 Zeichen ueber
+eine byteweise Serielle. Nicht ihr Inhalt, nicht das Urteil, das sie traegt: ihre blosse Existenz.
+
+**Was das ueber die Pruefung sagt.** Der Z4f-Negativfall verlangt, dass ein Kernel einen
+strukturell heilen, aber **fremd gebundenen** Checkpoint abweist und den Sektor **unveraendert**
+laesst. Der Kernelpfad dafuer sieht richtig aus: `CKPT_REJECTED` setzen und **sofort
+zurueckkehren**, ohne zu schreiben. Trotzdem haengt der Ausgang an der Ausgabelaenge — also an
+Wanduhrzeit, und damit an genau der Groesse, die in D13 schon einmal vier Abweichungen erzeugt hat.
+
+**Umgangen, nicht behoben:** die NMI-Zahlen stehen jetzt in der **vorhandenen** `ist`-Zeile statt
+in einer eigenen. Das ist eine Ausweichbewegung und keine Erklaerung — und sie hat eine Zaehnezahl:
+**die naechste Zeile, die jemand hinzufuegt, kippt sie wieder**, und dann sucht er dort, wo er
+gerade gearbeitet hat, statt hier.
+
+- [ ] **Den Mechanismus benennen.** Wer schreibt den Sektor, wenn der Kernel laenger braucht?
+      Kandidaten: ein Pfad, der nach dem Bericht noch laeuft (`drv_service_step`, `reap`), oder
+      eine Notschranke, die bei ueberschrittener Frist doch speichert. Ein `-d int`-Lauf und ein
+      Melder an jeder Schreibstelle des Sektors trennen das in einer Sitzung.
+- [ ] **Die Pruefung von der Ausgabelaenge entkoppeln.** Solange sie an ihr haengt, ist sie kein
+      Test der Eigenschaft, sondern eine Messung des Messstands -- und ein gruener Lauf belegt
+      dann nur, dass gerade niemand eine Zeile hinzugefuegt hat.
+
 ## D13. Die Suite hat Prüfungen, die in WANDUHRZEIT messen — und der Messstand ist überbucht
 **Klasse:** Messstand · **Aufwand:** klein, aber die Abgrenzung ist die eigentliche Arbeit
 

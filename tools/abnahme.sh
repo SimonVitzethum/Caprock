@@ -50,6 +50,14 @@ SEK="${ABNAHME_SEK:-120}"
 
 # Die Reihe. Ein Eintrag ist `Name|Befehl...`.
 PUNKTE=()
+# **Der aarch64-BAU gehoert in die Reihe, und der Grund ist ein bezahlter Fehler.** Am 2026-08-10
+# hat die Guard-Page-Arbeit (x86) den aarch64-Kernel unuebersetzbar gemacht -- `hal::mmu::guard_*`
+# gab es dort nicht --, und niemand hat es gesehen, weil diese Reihe nur x86 faehrt. Gefunden hat
+# es zwei Tage spaeter ein Agent nebenbei. **Eine Abnahme, die eine Architektur auslaesst, laesst
+# sie verrotten**; der Bau ist der billigste Teil davon (rund 30 s) und faengt genau diese Klasse.
+# Die aarch64-SUITE laeuft hier nicht mit: sie braucht QEMU-aarch64 und ein Vielfaches der Zeit --
+# das ist eine benannte Luecke und keine Vollstaendigkeit.
+PUNKTE+=("aarch64-bau|./build.sh")
 PUNKTE+=("kernel-grenze|./tools/kernel-grenze.sh")
 PUNKTE+=("host-tests|./tools/host-tests.sh")
 PUNKTE+=("mangel-stellen|./tools/mangel-stellen.sh")

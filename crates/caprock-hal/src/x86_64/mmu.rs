@@ -1657,3 +1657,15 @@ pub fn map_device_block_global(gib: usize) -> bool {
     }
     map_device_window_global((gib as u64) * ONE_GIB, ONE_GIB)
 }
+
+/// **Kann diese Architektur Guard-Pages?** Auf x86 ja (s. `guard_unmap`). Das Gegenstueck in der
+/// aarch64-HAL gibt `false` und zaehlt stattdessen die unbewachten Stacks -- der Aufrufer
+/// unterscheidet damit „Vorrat leer" (abweisen) von „hier gibt es das nicht" (zaehlen).
+pub fn guard_unterstuetzt() -> bool {
+    true
+}
+
+/// Auf x86 gibt es Wachen; die Zahl ohne Wache ist deshalb immer 0.
+pub fn unbewachte_stacks() -> usize {
+    0
+}

@@ -136,11 +136,18 @@ fn claim_user_kstack_masked(mask: Option<caprock_mem::ColorMask>) -> Option<usiz
     })?
     .base();
     let wache = roh; // die unterste Seite des Blocks
+    if !hal::mmu::guard_unterstuetzt() {
+        let _ = hal::mmu::guard_unmap(wache); // zaehlt nur -- s. aarch64-HAL
+    }
     let base = roh + caprock_mem::PAGE;
     // **Fail-closed.** Der Vorrat aufgeteilter Bloecke ist fest (s. `mmu::guard_unmap`); reicht
     // er nicht, wird die Anforderung BENANNT abgewiesen. Ein Stack ohne Wache waere die stille
     // Fassung genau des Fehlers, gegen den die Wache gebaut ist.
-    if !hal::mmu::guard_unmap(wache) {
+    // **„Vorrat leer" und „diese Architektur kann es nicht" sind zwei Antworten.** Nur die erste
+    // ist ein Grund abzuweisen; die zweite darf nicht fail-closed sein, sonst koennte aarch64
+    // keinen einzigen EL0-Thread mehr anlegen. Verschwiegen wird sie trotzdem nicht: die
+    // aarch64-HAL zaehlt jeden unbewachten Stack, und die Zahl steht im Bericht.
+    if hal::mmu::guard_unterstuetzt() && !hal::mmu::guard_unmap(wache) {
         MEM.lock().free_region(PhysRegion::new(roh, sz + caprock_mem::PAGE));
         mangel(MANGEL_GUARD_TABELLE, caprock_mem::PAGE);
         return None;

@@ -1179,3 +1179,66 @@ pub fn flush_va_global(va: u64) {
         );
     }
 }
+
+// ==============================================================================================
+// GUARD-PAGES: auf aarch64 NICHT GEBAUT -- und das wird GEZAEHLT, nicht verschwiegen
+// ==============================================================================================
+//
+// Auf x86 liegt seit dem 2026-08-10 unter jedem EL0-Kernel-Stack eine nicht abgebildete Seite
+// (`mmu::guard_unmap`). Der Grund ist eine Messung: der tiefste Kernelpfad benutzte **73 %** des
+// 16-KiB-Stacks, und ein Ueberlauf schrieb still in den Nachbarn -- aus Ring 3 erreichbar, also
+// eine Privilegieneskalation.
+//
+// **Auf aarch64 gibt es das nicht.** Nicht, weil es hier nicht noetig waere -- die Lage ist
+// dieselbe --, sondern weil die Aufteilung eines Blocks in 4-KiB-Seiten hier noch niemand gebaut
+// hat. Das ist ein offener Punkt und keine Eigenschaft der Architektur.
+//
+// **Warum diese Datei trotzdem `true` zurueckgibt.** Fail-closed waere hier fail-*alles*: der
+// Kernel koennte keinen einzigen EL0-Thread mehr anlegen. Die ehrliche Fassung ist deshalb nicht
+// „abweisen" und schon gar nicht „stillschweigend durchlassen", sondern **durchlassen und
+// zaehlen**: [`unbewachte_stacks`] steht im Bericht, und solange die Zahl > 0 ist, sagt sie, dass
+// auf dieser Architektur jeder Kernel-Stack ohne Wache laeuft.
+//
+// Der Fehler, der hierher gehoert: die x86-Arbeit hat den aarch64-Bau **gerissen**, und die
+// Abnahme-Reihe hat es nicht gesehen, weil sie nur x86 faehrt. Eine Reihe, die eine Architektur
+// auslaesst, laesst sie verrotten.
+
+use core::sync::atomic::{AtomicUsize, Ordering as GuardOrdering};
+
+/// Wie viele Kernel-Stacks ohne Wache angelegt wurden (auf aarch64: alle).
+static UNBEWACHT: AtomicUsize = AtomicUsize::new(0);
+
+/// **Kann diese Architektur Guard-Pages?** Der Aufrufer entscheidet danach, ob ein Fehlschlag
+/// „Vorrat leer" (abweisen) oder „hier gibt es das nicht" (zaehlen und weitermachen) heisst.
+pub fn guard_unterstuetzt() -> bool {
+    false
+}
+
+/// Auf aarch64 ein No-Op mit Zaehler -- s. Modulabschnitt oben.
+pub fn guard_unmap(_pa: u64) -> bool {
+    UNBEWACHT.fetch_add(1, GuardOrdering::Relaxed);
+    true
+}
+
+/// Gegenstueck zu [`guard_unmap`]; hier ebenfalls ein No-Op.
+pub fn guard_remap(_pa: u64) -> bool {
+    UNBEWACHT.fetch_sub(1, GuardOrdering::Relaxed);
+    true
+}
+
+/// Wie viele Stacks zurzeit ohne Wache laufen.
+pub fn unbewachte_stacks() -> usize {
+    UNBEWACHT.load(GuardOrdering::Relaxed)
+}
+
+/// `(stehend, gesetzt, abgewiesen, belegte Bloecke, Blockvorrat)` -- hier durchgehend 0, weil es
+/// keine Wachen gibt. Die Zahl, die auf dieser Architektur etwas sagt, ist
+/// [`unbewachte_stacks`].
+pub fn guard_stats() -> (usize, usize, usize, usize, usize) {
+    (0, 0, 0, 0, 0)
+}
+
+/// Auf aarch64 gibt es keine Wachen, also liegt keine Adresse auf einer.
+pub fn ist_wache(_pa: u64) -> bool {
+    false
+}

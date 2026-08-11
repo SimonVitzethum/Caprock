@@ -1175,6 +1175,28 @@ impl PdTable {
     }
 }
 
+/// **Ausgang der Übergabe eines `SYS_LOAD` an den Verifiziererthread** (C8).
+///
+/// Vor C8 lud der Callback synchron und gab `Option<usize>` — die Signaturprüfung (Ed25519 +
+/// SHA-2) lief damit auf dem Kernel-Stack des *aufrufenden* Threads. Gemessen füllte sie ihn zu
+/// 73 %, und **jeder** Thread musste die 16 KiB dafür vorhalten, obwohl nur dieser eine Syscall
+/// sie braucht.
+///
+/// Die drei Ausgänge sind mit Absicht unterscheidbar. Ein Aufrufer muss auf sie verschieden
+/// reagieren: bei `Ausgelastet` lohnt ein zweiter Versuch, bei `KeinVerifizierer` nie.
+pub enum LadeUebergabe {
+    /// Der Auftrag liegt beim Verifizierer, der Aufrufer ist **blockiert** und weggewechselt;
+    /// der Wert ist der Stackpointer des nächsten Threads. Das Ergebnis schreibt der Verifizierer
+    /// später in den Frame des Aufrufers, **bevor** er dessen Wartegrund entfernt.
+    Uebergeben(usize),
+    /// Die Auftragsschlange ist voll — eine **Lastaussage**. Der Aufrufer wird **nicht** blockiert
+    /// und bekommt [`result::ERR_LOAD_BUSY`].
+    Ausgelastet,
+    /// Es gibt keinen Verifiziererthread (Aufbaufehler). Der Aufrufer bekommt
+    /// [`result::ERR_SERVER_GONE`] — „gibt es nicht", nicht „gerade voll".
+    KeinVerifizierer,
+}
+
 /// Cap-gesicherter Syscall-Dispatch.
 ///
 /// Liest Syscall-Nummer (`x0`) und *lokalen* Cap-Index (`x1`) aus dem Frame,
@@ -1209,7 +1231,14 @@ pub fn dispatch(
     // HardwareLand-Backend ist per Entwurf an einen **Partner** gebunden (ext-22, unveraenderlich,
     // 1:N). Wer es laedt, ist dieser Partner -- eine andere Antwort gibt es nicht, und sie muss
     // vom Dispatch kommen, weil nur er weiss, wer gerade syscallt.
-    load: fn(u32, usize, &[(usize, CapPtr)]) -> Option<usize>,
+    //
+    // **Seit C8 ist der Callback eine ÜBERGABE, kein Aufruf** (2026-08-11). Er lädt nicht mehr
+    // selbst, sondern reicht den Auftrag an den Verifiziererthread und **blockiert den Aufrufer**;
+    // deshalb bekommt er `core` und `frame` und liefert eine [`LadeUebergabe`] statt einer PD-Id.
+    // Der Grund ist gemessen: die Ed25519-/SHA-2-Verifikation lief auf dem 16-KiB-Kernel-Stack des
+    // aufrufenden EL0-Threads und füllte ihn zu 73 % — jeder Thread zahlte 16 KiB für diesen einen
+    // Pfad.
+    load: fn(u32, usize, &[(usize, CapPtr)], usize, usize) -> LadeUebergabe,
     // Cap löschen (Finalisierung inkl. Speicherfreigabe/Call-Abbruch) — der Kernel sperrt darin
     // selbst `CAPS`+`MEM` und bricht finalisierte Reply-Calls ab. Nur zu rufen, wenn hier KEIN
     // Lock mehr gehalten wird. Wird für die beim Grant verdrängte Cap gebraucht (s. `grant_cap`)
@@ -1380,7 +1409,7 @@ fn dispatch_nativ(
     caps: &RwSpinLock<Caps>,
     eps: &[SpinLock<Endpoint>],
     ntfns: &[SpinLock<Notification>],
-    load: fn(u32, usize, &[(usize, CapPtr)]) -> Option<usize>,
+    load: fn(u32, usize, &[(usize, CapPtr)], usize, usize) -> LadeUebergabe,
     delete_cap: fn(CapPtr) -> bool,
     nr: u64,
 ) -> usize {
@@ -2060,13 +2089,36 @@ fn dispatch_nativ(
             } else {
                 &[]
             };
-            match load(index, pd, endow) {
-                Some(pd_new) => {
-                    frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
-                    frame_set_reg(frame, reg::EP_BADGE, pd_new as u64); // x1 = neue PD-Id
-                    frame
+            // **C8: der Auftrag wandert, der Aufrufer wartet.**
+            //
+            // Bis dahin lief `load` hier synchron -- also Ed25519 + SHA-2 auf dem 16-KiB-
+            // Kernel-Stack des aufrufenden EL0-Threads (gemessen: 73 % davon). Jetzt reicht der
+            // Dispatch den Auftrag an den Verifiziererthread und blockiert den Aufrufer regulaer;
+            // das Ergebnis schreibt der Verifizierer in genau diesen Frame, bevor er den
+            // Wartegrund entfernt.
+            //
+            // Die drei Ausgaenge sind unterscheidbar, und das ist keine Kosmetik: „gerade voll"
+            // wiederholt man, „gibt es nicht" nicht.
+            match load(index, pd, endow, core, frame) {
+                LadeUebergabe::Uebergeben(next) => next,
+                // **Die abgeleiteten Caps muessen zurueck, wenn der Auftrag nicht angenommen
+                // wird.** Auf dem angenommenen Weg raeumt `load_by_index` sie bei Misserfolg auf;
+                // hier kommt der Loader gar nicht erst dran. Ohne diese Zeilen lecken sie als
+                // verwaiste CDT-Kinder und blockieren sogar das `delete` des Eltern-Caps --
+                // dieselbe Falle, die der Abweispfad im Loader schon einmal bezahlt hat, nur an
+                // einer Stelle, die es vor C8 nicht gab.
+                LadeUebergabe::Ausgelastet => {
+                    if let Some(c) = endowed {
+                        let _ = delete_cap(c);
+                    }
+                    deny(result::ERR_LOAD_BUSY)
                 }
-                None => deny(result::ERR_BADCAP), // Laden fehlgeschlagen (Archiv/ELF/Ressourcen)
+                LadeUebergabe::KeinVerifizierer => {
+                    if let Some(c) = endowed {
+                        let _ = delete_cap(c);
+                    }
+                    deny(result::ERR_SERVER_GONE)
+                }
             }
         }
         _ => deny(result::ERR_BADSYS),

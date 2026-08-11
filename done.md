@@ -9,6 +9,135 @@ schon einmal nicht getragen hat.
 
 ---
 
+## C8. Der VERIFIZIERERTHREAD — die Krypto ist vom Aufrufer-Stack herunter (2026-08-11)
+
+**Klasse:** Kapazität / Sicherheit · **Stand:** (a) und (b) **gebaut und gemessen**; (c) bleibt
+offen und steht weiter in [todo.md](todo.md).
+
+### Die Zahl, um die es ging — vorher und nachher
+
+Gemessen mit dem vorhandenen `kstackmark` (Muster beim Anlegen, Abzählen beim Tod des Threads und
+beim Schlussfegen), in **beiden** Suiten, `-m 512M`, 4 vCPU:
+
+| Messung | vorher | nachher |
+|---|---|---|
+| **Lade-Suite**, EL0-Kstack | **11 992 / 16 384 B (73,1 %)**, Reserve 4392 B | **1 312 / 16 384 B (8,0 %)**, Reserve 15 072 B |
+| Hauptsuite, EL0-Kstack | 824 / 16 384 B (5,0 %) | 824 / 16 384 B (5,0 %) — unverändert |
+| **Verifiziererstack** (64 KiB), Lade-Suite | — | **12 328 / 65 536 B (18,8 %)**, Reserve 53 208 B |
+| Verifiziererstack, Hauptsuite | — | 2040 / 65 536 B (3,1 %) |
+
+Die Hauptsuite bleibt gleich, und **das ist die Kontrolle**: sie hat kein Boot-Archiv, also lief
+über ihren `SYS_LOAD` nie echte Krypto. Wäre ihre Zahl mitgefallen, hätte der Umzug etwas anderes
+verschoben als das Gemeinte.
+
+Die 12 328 B des Verifizierers gegen die 11 992 B von vorher sind die **erwartete** Differenz: es
+ist derselbe Pfad plus zwei Rahmen (Schleifenrumpf des Threads, das Verdichten der Endowment-Liste).
+Der tiefste Kernelpfad ist damit nicht billiger geworden — er steht nur nicht mehr auf einem Stack,
+den jeder Thread bezahlt.
+
+**Die Rechnung, um die es geht:** 10 000 EL0-Threads × 16 KiB = 160 MiB. Der Restpfad braucht
+1312 B; 4 KiB je Thread wären damit **nicht mehr geraten, sondern gemessen** — 40 MiB statt 160.
+Gesenkt ist die Konstante hier **noch nicht** (das ist Folgeposten 3 in [C4](todo.md)); erbracht ist
+die Bedingung dafür.
+
+### Die `kstack`-Zeile misst seither etwas anderes — und sagt das selbst
+
+Das ist die Randbedingung (b), und sie ist der Grund, warum die Zeile jetzt einen Absatz über sich
+selbst druckt: **vorher war sie eine Messung des Ladepfads, jetzt ist sie eine des Restpfads.** Wer
+1312 gegen 11 992 hält, vergleicht über einen Bedeutungswechsel hinweg. Genau daran ist in diesem
+Projekt schon einmal eine Zahl wertlos geworden (die 399er-Lehre), deshalb steht die Umdefinition
+in der Berichtszeile, in beiden Suiten-Skripten und hier.
+
+### Der Bau
+
+* **Ein neuer Grund in der Grund-Menge**, nicht ein viertes Bit: `BlockReasons::LOAD` (Z24, sechste
+  Instanz derselben Klasse). Wecker ist **ausschliesslich** `Scheduler::load_reply` — `resume`
+  entfernt `PAUSE`, `unpark` `PARK`, `unblock` `IPC`, `handler_reply` `HANDLER`, und eingereiht
+  wird nur bei **leerer** Menge. Der Aufrufer eines `SYS_LOAD` kann damit nicht von einem fremden
+  Wecker losgelassen werden, bevor sein Ergebnisregister geschrieben ist.
+* **`SYS_LOAD` ist eine ÜBERGABE geworden.** Der Dispatch-Callback lädt nicht mehr, er reicht den
+  Auftrag weiter und blockiert; sein Rückgabetyp ist `LadeUebergabe` mit drei unterscheidbaren
+  Ausgängen (`Uebergeben(sp)`, `Ausgelastet`, `KeinVerifizierer`).
+* **Die Serialisierung ist ein benannter DoS-Kanal.** `AUFTRAEGE_MAX = 4`, Überlauf →
+  **`ERR_LOAD_BUSY = 13`**, und der Überläufer wird **gar nicht erst blockiert**. Das ist D11
+  wörtlich: wer eine Kapazität einführt und den Überlauf nicht benennt, hat ein Loch gebaut.
+  `KeinVerifizierer` bekommt einen **anderen** Code (`ERR_SERVER_GONE`) — „gerade voll" und „gibt es
+  nicht" verlangen vom Aufrufer verschiedene Antworten.
+
+### Die Reihenfolge, an der alles hängt — und warum es hier KEINE Weckmarke gibt
+
+Der Aufrufer wird blockiert, **bevor** sein Auftrag sichtbar wird; beides unter *einer* Sperrung der
+Auftragsschlange. Andersherum könnte der Verifizierer auf einem anderen Kern fertig sein, bevor der
+Aufrufer blockiert ist — `load_reply` entfernte einen Grund, den es noch nicht gibt, und der
+Aufrufer setzte ihn danach für immer. Für `PARK` fängt eine Weckmarke genau das ab; hier tut es die
+Sperrung, und sie ist billiger als ein zweiter Zustand. Sperrordnung `SCHLANGE (R1.5) → SCHEDS (R2)`,
+eingetragen in `docs/invariants.md` §1.
+
+### Die Absage ist GEFAHREN, nicht behauptet
+
+Prüfzeile `verif`, gattert in `all_done()`, läuft in **beiden** Suiten:
+
+```
+verif   : Absage gefahren -- 5 Sonden gegen eine Schranke von 4: abgewiesen=1 bedient=4 ·
+          beim Beobachten wegen LOAD blockiert=4 · Ueberlaeufer NICHT blockiert=true und
+          danach WEITERGELAUFEN=true · Fuellstand erreichte 4/4
+```
+
+Der Verifizierer wird pausiert (`PAUSE` steht **neben** seinem `PARK` in der Menge und stört es
+nicht — genau die Eigenschaft, die Z24 hergestellt hat), dann melden sich fünf Aufrufer gegen vier
+Plätze. Der Archivindex ist absichtlich **ungültig**: gemessen wird die Schlange, nicht das Laden,
+und so läuft die Sonde auch in der Hauptsuite, die kein Archiv hat. Die beiden Ausgänge sind dadurch
+trennscharf — `ERR_BADCAP` heisst „war beim Verifizierer und ist dort gescheitert", `ERR_LOAD_BUSY`
+heisst „kam nie hin".
+
+Dass der Überläufer **weiterläuft**, wird an einem Rundenzähler gemessen und nicht an einem
+Zustandsbit: ob ein Thread läuft, ist an keinem Bit ablesbar, an einem Fortschritt schon (dieselbe
+Unterscheidung wie bei der FP- und der Park-Sonde). Und `Fuellstand erreichte 4/4` ist die
+Sprechprobe: ohne sie wäre jede Aussage über den Überlauf eine Aussage über einen Fall, der nie
+eingetreten ist.
+
+### Zwei Gegenproben, beide isolierend
+
+| Mutation | Wirkung | offen laut Watchdog |
+|---|---|---|
+| `load_reply` entfernt `LOAD` **nicht** | `bedient=0` (die vier Bedienten hängen), `abgewiesen=1`, `blockiert=4`, alles andere unverändert | `verif` — **genau eins** |
+| `platz_nehmen` ohne `else`-Zweig (die D11-Form: still verwerfen, trotzdem blockieren) | `abgewiesen=0`, `blockiert=5` (der Überläufer hängt mit), `angenommen=5` gegen `bearbeitet=4` — ein Auftrag lautlos weg | `verif` — **genau eins** |
+
+Die zweite Gegenprobe reproduziert das D11-Bild in einem Satz: ein Thread wartet für immer, die
+Schlange ist leer, kein Zähler klagt.
+
+### Drei Befunde, die nicht im Auftrag standen
+
+1. **Die Platzierungspolitik wäre stillschweigend mitgewandert.** `load_into_pd_mit` legt einen
+   Thread ohne Manifest-Affinität auf `hal::cpu::core_id()` — bis C8 war das der **Aufrufer**,
+   danach wäre es der Verifizierer gewesen. Jedes ohne Affinität geladene Programm hätte seinen Kern
+   gewechselt, als Nebenwirkung einer Stack-Verschiebung. Der Auftrag trägt den Heimatkern deshalb
+   mit (`load_by_index(.., heimatkern)`, `ladepolitik_auf`).
+2. **Die abgeleiteten Endowment-Caps lecken auf den neuen Abweispfaden.** Auf dem angenommenen Weg
+   räumt `load_by_index` sie bei Misserfolg auf; bei `Ausgelastet`/`KeinVerifizierer` kommt der
+   Loader gar nicht erst dran. Ohne die Löschung im Dispatch blieben sie als verwaiste CDT-Kinder
+   liegen und blockierten sogar das `delete` des Eltern-Caps — dieselbe Falle, die der Abweispfad im
+   Loader schon einmal bezahlt hat, an einer Stelle, die es vor C8 nicht gab.
+3. **Eine Marke auf Bit 63 kollidiert mit dem obersten Zahlenfeld.** Die erste Fassung packte
+   „gemessen" auf Bit 63 des Ergebniswortes; dort liegt `verloren` (Bits 56..64). Die Marke las sich
+   beim Auspacken als `verloren = 128`, das Urteil fiel durch, und der Lauf ging in den Watchdog —
+   bei **jedem einzelnen grünen Feld** in der Zeile darüber. Ein Bild, das wie ein echter Befund
+   aussieht und eine Bitmaske ist.
+4. **Der eigene Entwurf war eine Zeile lang das, was er verwerfen wollte.** Der Thread-Rumpf hiess
+   zuerst `while let Some(a) = SCHLANGE.lock().entnehmen() { … laden(&a) … }`. Der Guard eines
+   `while let`-Scrutinees lebt bis zum **Ende des Rumpfes**, und `SpinLock::lock` maskiert die IRQs
+   des eigenen Kerns — die gesamte Ed25519-/SHA-2-Prüfung wäre also **mit gesperrten Interrupts**
+   gelaufen, also genau die Fassung „Präemption für die Dauer aus", die C8 in seiner Tabelle
+   ausdrücklich verwirft. Hereingeholt nicht durch eine Entscheidung, sondern durch eine
+   Temporaries-Lebensdauer, und von **keiner** Prüfzeile zu sehen: die Suite war grün, die Messwerte
+   stimmten, das Latenzloch war unsichtbar. Belegt mit einem `Drop`-Zeugen statt erschlossen (im
+   `while let` fällt der Guard nach dem Rumpf, in `let v = { … };` davor). Behoben durch eine
+   **Funktionsgrenze** (`naechster()`), nicht durch einen Kommentar. Dieselbe Wurzel wie der
+   `match lock() { … None => lock() }`-Selbst-Deadlock aus der Fallenliste — anderer Schaden, gleiche
+   Ursache.
+
+---
+
 ## D14. Eine BERICHTSZEILE MEHR kippt die Z4f-Pruefung — **BEHOBEN, und es war nicht die Wanduhr**
 
 **Klasse:** Prueferform · **Stand:** **Ursache benannt und behoben (2026-08-11, abends).** Der

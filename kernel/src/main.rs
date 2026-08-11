@@ -62,6 +62,9 @@ mod threads;
 /// Read-only TrustedSAS-Root-Key-DB (ext-28, ADR 0014) — autogeneriert von `tools/gen_trusted_key.py`,
 /// in den Kernel kompiliert, nur per Firmware-/Kernel-Update änderbar (nicht per Syscall).
 mod trusted_keys;
+/// C8: der **Verifiziererthread** — `SYS_LOAD` verifiziert nicht mehr auf dem 16-KiB-Stack des
+/// Aufrufers, sondern auf seinem eigenen. Arch-neutral; gestartet aus beiden Hochlaufwegen.
+mod verifizierer;
 
 #[cfg(target_arch = "aarch64")]
 use caprock_hal::{self as hal, println};
@@ -232,6 +235,12 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // ungeprueft mit. Ohne sie waere „root : ALL PASS" die einzige Aussage ueber ein Dokument, an
     // dem die gesamte Anfangsverteilung von Autoritaet haengt.
     loader::manifest_report();
+    // **C8: der Verifizierer MUSS vor dem Root-Task stehen** -- er ist der erste, der `SYS_LOAD`
+    // benutzt. Ohne ihn bekaeme sein erster Ladeversuch `ERR_SERVER_GONE`, und das saehe wie ein
+    // Cap-Problem aus statt wie ein fehlender Thread.
+    if !verifizierer::starten() {
+        println!("verif   : FAILURES (Verifiziererthread liess sich nicht starten -- SYS_LOAD ist damit tot)");
+    }
     let _root_ok = loader::start_root_task_reported();
 
     // Sekundärkerne via PSCI starten.

@@ -261,4 +261,22 @@ pub mod result {
     /// **Entscheidung** vor, die jemand zurücknehmen muss. Ein Aufrufer, der die beiden nicht
     /// unterscheiden kann, wiederholt in einem Fall sinnvoll und im anderen für immer.
     pub const ERR_HANDLER_BUSY: u64 = 12;
+    /// **Die Auftragsschlange des Verifiziererthreads ist voll** (C8).
+    ///
+    /// Seit C8 läuft die Signaturprüfung eines [`super::sys::LOAD`] nicht mehr auf dem
+    /// 16-KiB-Kernel-Stack des *aufrufenden* Threads, sondern auf dem eigenen Stack eines
+    /// dedizierten Verifiziererthreads. Das serialisiert Ladevorgänge — und Serialisierung ist ein
+    /// **Kanal**: eine PD, die `SYS_LOAD` spammt, verzögert fremde Ladevorgänge.
+    ///
+    /// Deshalb hat die Schlange eine Schranke, **und die Schranke hat einen Namen**. Genau die
+    /// Lehre aus [`ERR_EP_FULL`]: wer eine Kapazität einführt und den Überlauf nicht benennt, hat
+    /// keinen Schutz gebaut, sondern ein Loch — der Überzählige wurde dort blockiert, stand in
+    /// keiner Struktur und wurde nie geweckt.
+    ///
+    /// **Der Überläufer bleibt lauffähig.** Er wird *nicht* blockiert; er bekommt diesen Code und
+    /// kehrt aus dem Syscall zurück. Wie [`ERR_EP_FULL`] ist das eine **Lastaussage**: sie hängt am
+    /// Verhalten anderer, kann sofort wieder gelten, und ein Client, der stumpf wiederholt,
+    /// verschärft sie. Nicht zu verwechseln mit [`ERR_SERVER_GONE`] — das sagt der Kernel, wenn es
+    /// den Verifizierer gar nicht gibt, und das ist keine Frage der Last, sondern des Aufbaus.
+    pub const ERR_LOAD_BUSY: u64 = 13;
 }

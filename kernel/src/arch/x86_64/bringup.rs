@@ -4186,6 +4186,13 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             // Hoechstzahl der Manifest-Eintraege, also hergeleitet -- damit ist der Fall heute
             // unerreichbar. Das Konjunkt ist die Ratsche dagegen, dass jemand die Schranke senkt.
             ("clientntfn", crate::loader::client_notification_stats().1 == 0),
+            // **C8: der Verifiziererthread und seine benannte Absage.** Gattert von Anfang an, und
+            // das Kriterium ist gegen die WIRKUNG formuliert: der Ueberlauf wird GEFAHREN (die
+            // Schranke muss ihren Hoechststand wirklich erreicht haben), der Ueberlaeufer bekommt
+            // `ERR_LOAD_BUSY`, ist NICHT blockiert und laeuft nachweislich weiter, waehrend die
+            // Bedienten wegen `LOAD` warten. Ohne Messung ist das Urteil `false` -- eine nie
+            // gefahrene Absage darf nicht wie eine bestandene aussehen.
+            ("verif", crate::verifizierer::urteil()),
     ];
     if let Some(w) = warum {
         *w = flags;
@@ -4195,7 +4202,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 35;
+const DONE_FLAGS: usize = 36;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]
@@ -4488,6 +4495,12 @@ fn report_and_off(watchdog: bool) -> ! {
     // der allgemeine Rotzeilen-Scanner der Suite.
     {
         let (gefegt, tiefster) = system::kstack_marke_fegen();
+        // **C8: der Verifiziererstack gehoert in DIESE Messung, nicht in eine eigene Zahl.**
+        // Er ist ein Kernel-Thread, der nie stirbt -- der Reap-Pfad misst ihn also nie, und
+        // `kstack_marke_fegen` fegt ueber die EL0-Klasse. Ohne diese Zeile waere seine Groesse
+        // GEWAEHLT statt gemessen, und C8 (b) verlangt das Gegenteil. Sie steht VOR dem Lesen der
+        // Marke, damit sie in denselben Hoechststand einfliesst.
+        let (v_benutzt, v_frei, v_groesse) = crate::verifizierer::stack_messen();
         let e = crate::kstackmark::marke(crate::kstackmark::KL_EL0);
         let k = crate::kstackmark::marke(crate::kstackmark::KL_KERN);
         let anteil = |m: &crate::kstackmark::Marke| -> u64 {
@@ -4528,11 +4541,14 @@ fn report_and_off(watchdog: bool) -> ! {
              und dann muss die Reserve zusaetzlich einen NMI-Frame samt Handler tragen -- oder NMI \
              bekommt seinen eigenen IST-Stack. Der Hoechststand hier ist also eine Aussage ueber \
              das MESSUMFELD, nicht ueber die Maschine, auf der die Reserve gelten muss. \
-             Der tiefste bekannte Pfad ist SYS_LOAD: `load_by_index` \
-             verifiziert eine Ed25519-Signatur und einen SHA-2-Hash IM KERNEL, also auf dem \
-             16-KiB-Stack des aufrufenden EL0-Threads (groesste Rahmen des Abbilds: \
-             vartime_double_scalar_mul_basepoint 3528 B, NafLookupTable::from 1928 B). \
-             Eine Guard-Page gibt es dort NICHT -- ein Ueberlauf schriebe still in den Nachbarn",
+             **ACHTUNG, DIESE ZAHL HAT SEIT C8 EINE ANDERE BEDEUTUNG (2026-08-11).** Bis dahin \
+             mass sie den Ladepfad: `SYS_LOAD` verifizierte eine Ed25519-Signatur und einen \
+             SHA-2-Hash IM KERNEL, also auf dem 16-KiB-Stack des aufrufenden EL0-Threads, und der \
+             Hoechststand lag bei 11992 B (73,1 %) in der Lade-Suite. Seit C8 laeuft genau dieser \
+             Pfad auf dem eigenen 64-KiB-Stack des VERIFIZIERERTHREADS (Zeile darunter); was diese \
+             Zeile misst, ist der RESTPFAD -- der tiefste verbliebene Syscall. Wer die Zahl von \
+             heute mit einer von vor dem 2026-08-11 vergleicht, vergleicht ZWEI VERSCHIEDENE \
+             GROESSEN. Die Guard-Page unter dem Kstack gibt es inzwischen (`USER_KSTACK_ALLOC`)",
             e.tiefe_tod,
             e.gemessen_tod,
             e.tiefe_lebend,
@@ -4555,6 +4571,19 @@ fn report_and_off(watchdog: bool) -> ! {
             k.gefuellt,
             k.gemessen,
         );
+        // **C8 (b): die Stackgroesse des Verifizierers ist GEMESSEN, nicht gewaehlt.**
+        //
+        // Er ist der Traeger des tiefsten Kernelpfads dieses Systems -- Ed25519 + SHA-2. Solange
+        // niemand seinen Wasserstand liest, waeren die 64 KiB eine Zahl mit derselben Berechtigung
+        // wie die 16 KiB vorher: keine. `0 / 0` heisst hier „nicht messbar" (kein Verifizierer),
+        // NICHT „viel Luft" -- dieselbe Unterscheidung, an der `Urteil::gemessen` haengt.
+        println!(
+            "kstack  : Wasserstand VERIFIZIERER (C8) -- benutzt {v_benutzt} von {v_groesse} B, \
+             Reserve {v_frei} B. HIER liegt seit dem 2026-08-11 die Krypto: `SYS_LOAD` -> \
+             verify_image -> Ed25519 + SHA-2. Vorher lief sie auf dem 16-KiB-Kstack des \
+             AUFRUFERS und fuellte ihn zu 73,1 % -- also zahlte JEDER Thread 16 KiB fuer EINEN \
+             Pfad. 0 von 0 heisst 'nicht messbar' (kein Verifiziererthread), nicht 'viel Luft'"
+        );
         println!(
             "kstack  : {} (C4: geforderte Mindestreserve {} B = 1/{} des Stacks, Eichung \
              {:#06b}/{:#06b}, mindestens {} Messungen vor dem Gatter. Die Schwelle ist die \
@@ -4574,6 +4603,64 @@ fn report_and_off(watchdog: bool) -> ! {
     // wieviel Luft ein Kernel-Stack noch hat, die andere sorgt dafuer, dass sein Ueberlauf
     // ueberhaupt jemand melden kann.
     super::ist::bericht();
+
+    // --- C8: der VERIFIZIERERTHREAD und seine benannte Absage -----------------------------------
+    //
+    // Steht direkt hinter `kstack`, weil die beiden Zeilen dieselbe Groesse von zwei Seiten
+    // beschreiben: die eine misst, was auf den Stacks noch passiert, die andere sagt, wohin der
+    // tiefste Pfad gewandert ist.
+    {
+        let s = crate::verifizierer::stand();
+        println!(
+            "verif   : Verifiziererthread laeuft={} · angenommen={} bearbeitet={} \
+             abgewiesen(ERR_LOAD_BUSY)={} ohne-Thread(ERR_SERVER_GONE)={} \
+             Antwort-ins-Leere={} Hoechststand={}/{} wartend={} verloren={} (muss 0 sein)",
+            s.laeuft,
+            s.angenommen,
+            s.bearbeitet,
+            s.abgewiesen,
+            s.ohne_thread,
+            s.antwort_ins_leere,
+            s.hoechststand,
+            crate::verifizierer::AUFTRAEGE_MAX,
+            s.wartend,
+            s.verloren,
+        );
+        match crate::verifizierer::sondenbild() {
+            None => println!(
+                "verif   : FAILURES (die Absage wurde NICHT gefahren -- eine Schranke, die nie \
+                 erreicht wurde, ist von einer fehlenden nicht zu unterscheiden; genau das war D11)"
+            ),
+            Some(b) => {
+                println!(
+                    "verif   : Absage gefahren -- {} Sonden gegen eine Schranke von {}: \
+                     abgewiesen={} bedient={} · beim Beobachten wegen LOAD blockiert={} \
+                     (Positivkontrolle: ohne einen einzigen Wartenden waere 'der Ueberlaeufer \
+                     wartet nicht' trivial wahr) · Ueberlaeufer NICHT blockiert={} und danach \
+                     WEITERGELAUFEN={} (am Rundenzaehler gemessen, nicht an einem Zustandsbit) · \
+                     Fuellstand erreichte {}/{}",
+                    b.gestartet,
+                    crate::verifizierer::AUFTRAEGE_MAX,
+                    b.abgewiesen,
+                    b.bedient,
+                    b.blockiert,
+                    b.ueberlaeufer_frei,
+                    b.ueberlaeufer_laeuft,
+                    b.hoechststand,
+                    crate::verifizierer::AUFTRAEGE_MAX,
+                );
+                println!(
+                    "verif   : {} (C8: `SYS_LOAD` verifiziert nicht mehr auf dem 16-KiB-Stack des \
+                     Aufrufers, sondern auf dem eigenen des Verifizierers. Der Aufrufer blockiert \
+                     mit dem EIGENEN Grund LOAD in der Grund-Menge (Z24) -- kein `resume`, kein \
+                     `unpark`, kein fremdes `reply` weckt ihn, nur die Fertigmeldung. Die \
+                     Serialisierung ist ein DoS-Kanal und hat deshalb eine Schranke MIT NAMEN; der \
+                     Ueberlaeufer bleibt lauffaehig statt blockiert liegenzubleiben)",
+                    if b.ok() { "ALL PASS" } else { "FAILURES" },
+                );
+            }
+        }
+    }
 
     let ticks = hal::timer::ticks(0);
     let mut all_tick = true;
@@ -6055,6 +6142,14 @@ pub fn run(multiboot_info: u64) -> ! {
     // Bericht an dieser Stelle haette 0 Zuteilungen gesehen und sie fuer einen Fehlschlag gehalten
     // -- gemessen, nicht vermutet: genau das tat der erste Entwurf.
     ANGEBOTEN_VORHER.store(system::offered_device_count(), Ordering::Release);
+    // **C8: der Verifizierer MUSS vor dem Root-Task stehen** -- er ist der erste, der `SYS_LOAD`
+    // benutzt. Ohne ihn bekaeme sein erster Ladeversuch `ERR_SERVER_GONE`, und das saehe wie ein
+    // Cap-Problem aus statt wie ein fehlender Thread.
+    if !crate::verifizierer::starten() {
+        println!(
+            "verif   : FAILURES (Verifiziererthread liess sich nicht starten -- SYS_LOAD ist damit tot)"
+        );
+    }
     let root_ok = crate::loader::start_root_task_reported();
     let _ = root_ok;
 
@@ -6186,7 +6281,25 @@ pub fn run(multiboot_info: u64) -> ! {
             // Aufruf, und der zweite entsteht nur, wenn ohnehin alles andere steht.
             let mut offen = [("", true); DONE_FLAGS];
             let _ = all_done(archive, Some(&mut offen));
-            if offen.iter().all(|&(name, ok)| ok || name == "sweep") {
+            // C8. **An eine BEDINGUNG gebunden, nicht an eine Zeile** -- aus demselben Grund wie
+            // der Sweep darunter: die Messung haelt den Verifizierer an und legt SONDEN PDs an.
+            // Liefe sie in der ersten Umdrehung, stuende sie mitten in den Ladevorgaengen der
+            // Suite, und der Ladepfad braeuchte genau den Thread, den sie pausiert.
+            if offen
+                .iter()
+                .all(|&(name, ok)| ok || name == "verif" || name == "sweep")
+            {
+                crate::verifizierer::messen();
+            }
+            // `verif` steht in dieser Bedingung neben `sweep`, und das ist eine Aussage ueber
+            // GEGENPROBEN: faellt die C8-Messung, soll der Watchdog **sie** nennen und nicht
+            // zusaetzlich einen Sweep, der nur deshalb offen ist, weil er hinter ihr steht. Ein
+            // Ausfall, der zwei Zeilen faerbt, laesst nicht mehr erkennen, welche die Ursache war.
+            // Die Reihenfolge bleibt gewahrt: `messen()` steht oben in derselben Umdrehung.
+            if offen
+                .iter()
+                .all(|&(name, ok)| ok || name == "sweep" || name == "verif")
+            {
                 let _ = sweep_messen();
                 if all_done(archive, None) {
                     report_and_off(false);

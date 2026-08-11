@@ -395,6 +395,27 @@ check "ladepol : ALL PASS" \
 check "kstack  : ALL PASS" \
     "C4: die Stack-Wasserstandsmarke -- gemessen wird nicht, wie GROSS die Kernel-Stacks sind, sondern wieviel davon je BENUTZT wurde (Muster beim Anlegen, Abzaehlen beim Tod des Threads und am Ende des Laufs). Faellt die Fuellung aus, meldet die Messung die VOLLE Groesse als benutzt und die Zeile faellt durch"
 # ------------------------------------------------------------------------------------------------
+# C8: der VERIFIZIERERTHREAD -- und warum DIESE Suite die interessantere ist
+# ------------------------------------------------------------------------------------------------
+#
+# **Die Umdefinition gehoert ins Protokoll, nicht nur in den Kopf.** Bis zum 2026-08-11 mass die
+# `kstack`-Zeile dieser Suite den LADEPFAD: Ed25519 + SHA-2 liefen auf dem 16-KiB-Kstack des
+# aufrufenden EL0-Threads, Hoechststand 11992 B (73,1 %), Reserve 4392 B. Seit C8 laeuft genau
+# dieser Pfad auf dem 64-KiB-Stack des Verifizierers; die `kstack`-Zeile misst hier den RESTPFAD
+# (gemessen 1312 B / 8,0 %). Wer die beiden Zahlen ueber diesen Bedeutungswechsel hinweg
+# vergleicht, vergleicht zwei verschiedene Groessen -- daran ist in diesem Projekt schon eine Zahl
+# wertlos geworden. Die Zeile sagt es deshalb selbst.
+#
+# Nur diese Suite hat ein Archiv, also laeuft nur hier ECHTE Krypto durch den Verifizierer -- die
+# Hauptsuite provoziert ihn mit einem ungueltigen Index. Der Wasserstand hier ist die belastbare
+# Zahl.
+check "verif   : ALL PASS" \
+    "C8: der Verifiziererthread traegt den tiefsten Kernelpfad, und der Aufrufer wartet mit dem EIGENEN Grund LOAD (Z24). Hier laeuft echte Ed25519-/SHA-2-Verifikation darueber -- die Hauptsuite kann das bauartbedingt nicht"
+check "verif   : Absage gefahren -- 5 Sonden gegen eine Schranke von 4: abgewiesen=1 bedient=4" \
+    "C8 (a): die Schranke ist GEFAHREN, mit benanntem Code (ERR_LOAD_BUSY), und der Ueberlaeufer bleibt lauffaehig statt blockiert liegenzubleiben -- D11 in beide Richtungen"
+check "kstack  : Wasserstand VERIFIZIERER" \
+    "C8 (b): die Stackgroesse des Verifizierers ist GEMESSEN. Er stirbt nie, wird vom Reap-Pfad also nie erfasst; ohne diese Zeile waeren 64 KiB eine Zahl mit derselben Berechtigung wie vorher die 16 KiB -- keiner"
+# ------------------------------------------------------------------------------------------------
 # C7: der MANGEL-SWEEP auf dem LADEPFAD -- und warum er ausgerechnet hier geprueft wird
 # ------------------------------------------------------------------------------------------------
 #

@@ -16,6 +16,7 @@ der Azyklizität dieser totalen Ordnung.
 |---|---|---|---|
 | R0 | `CAPS` | `RwSpinLock<Caps>` | Capability-Space + PDs (Autorität) |
 | R1 | `EPS[]`, `NTFNS[]`, `VSPACES`, `DMA_CTX` | `SpinLock` | Ressourcentabellen (je Objekt/global) |
+| R1.5 | `verifizierer::SCHLANGE` | `SpinLock<Schlange>` | C8: Auftragsschlange des Verifiziererthreads |
 | R2 | `SCHEDS[core]` | `SpinLock<Scheduler>` | Per-Kern-Runqueue |
 | R2.5 | `FP_STATES` | `SpinLock<[FpState; N]>` | Lazy-FP-Kontexte — **stets UNTER `SCHEDS` genommen** (nie davor), hält selbst nichts weiter |
 | R3 | `Heap.inner` | `SpinLock<HeapInner>` | prozess-lokaler Allokator (nur Region-Runtime) |
@@ -46,6 +47,19 @@ gleichzeitig halten, wenn ein Kopieren-und-Freigeben es vermeidet.*
   R0 vor R1
 - `fp_trap` / `fp_reset_slot` (Lazy-FP): `SCHEDS[core]` → `FP_STATES`.  R2 → R2.5 (FP_STATES wird
   **immer** unter dem gehaltenen `SCHEDS` genommen, nie davor; danach nur Atomics `FP_OWNER`/`VSPACE_OF`).
+- `verifizierer::uebergeben` (C8, `SYS_LOAD`): `SCHLANGE` → `SCHEDS[core]`.  R1.5 → R2.
+
+**Ergänzung C8 (Verifiziererthread):** `SCHLANGE` wird über den Blockiervorgang des Aufrufers
+**gehalten**, und das ist keine Bequemlichkeit, sondern die Bedingung, unter der es kein verlorenes
+Wecken gibt. Der Aufrufer muss blockiert sein (`BlockReasons::LOAD`, sein Frame gesichert), **bevor**
+sein Auftrag für den Verifizierer sichtbar wird; sonst könnte dieser auf einem anderen Kern schon
+geantwortet haben, wenn der Aufrufer den Grund erst setzt — und `load_reply` entfernt einen Grund,
+den es zu diesem Zeitpunkt noch nicht gibt. `PARK` fängt genau das mit einer Weckmarke ab; für
+`LOAD` tut es diese Sperrung.
+
+Der Verifizierer selbst hält **nie beide**: er entnimmt unter `SCHLANGE`, gibt frei, lädt (dabei
+nimmt `load_by_index` `CAPS`/`MEM`/`SCHEDS` — alle mit freigegebener `SCHLANGE`) und antwortet dann
+über `SCHEDS`. Kein Pfad nimmt `SCHEDS` vor `SCHLANGE`; die Ordnung bleibt azyklisch.
 
 **Leaf-Locks** (halten nie einen weiteren Lock; daher deadlock-sicher unabhängig vom Aufrufkontext):
 `KSTACKS`, `VIRTIO_PCI`, `LOADED_IMAGES`, `CS_STATE_REGION`/`RELOAD_INFO`, `hal::console::CONSOLE`.

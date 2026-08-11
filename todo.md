@@ -2902,6 +2902,55 @@ der Audit-Berichtigung
       Ausweg — damit ließe sich das Feld in `admit` nicht mehr herausbewegen, und der Typ verlöre
       genau die Eigenschaft, um die es geht.
 
+## C8. Der VERIFIZIERERTHREAD — die Krypto vom Thread-Stack holen (entschieden 2026-08-11)
+
+**Klasse:** Kapazität / Sicherheit · **Stand:** entschieden, nicht begonnen
+
+**Der Befund, aus dem das folgt** (s. [done.md](done.md), Stack-Wasserstandsmarke): der tiefste
+Kernelpfad ist `SYS_LOAD` → `verify_image` → **Ed25519 + SHA-2 im Kernel**, auf dem 16-KiB-EL1-Stack
+des *aufrufenden EL0-Threads*. Höchststand **12 008 von 16 384 B (73,2 %)**, Reserve 4376 B. Die
+grössten Rahmen des Abbilds liegen genau dort (`vartime_double_scalar_mul_basepoint` 3528 B,
+`NafLookupTable::from` 1928 B).
+
+**Damit dreht sich C4 um:** die 160 MiB für 10 000 Threads zahlt *jeder* Thread für *einen* Pfad.
+Wandert die Verifikation auf einen eigenen Stack, sind 4 KiB je Thread plausibel — **40 MiB statt
+160**. Das ist der Hebel, nicht „lazy".
+
+**Entschieden ist die dritte von drei Fassungen**, und der Grund ist die Fehlerklasse, die man
+sich einbaut:
+
+| Fassung | was sie kostet |
+|---|---|
+| Präemption für die Dauer aus | Latenzloch im Millisekundenbereich — für einen Mikrokern peinlich |
+| Ein Arbeitsstack **je Kern** + Belegt-Bit | braucht einen **neuen Wartegrund** und eine Blockiernaht, die es sonst nicht gäbe |
+| **Ein dedizierter Verifiziererthread** ✔ | serialisiert Ladevorgänge (bei ihrer Frequenz egal), nutzt die **vorhandene** Blockiermaschinerie, keine Präemptionsakrobatik |
+
+`SYS_LOAD` reicht den Auftrag hinüber und blockiert regulär. Die 40-MiB-Rechnung gilt in allen
+drei Fassungen — die Wahl entscheidet nur, welche Fehlerklasse man erbt.
+
+### Die drei Randbedingungen, ohne die die Entscheidung unvollständig ist
+
+- [ ] **(a) Serialisierung ist ein BENANNTER DoS-Kanal.** Eine PD, die `SYS_LOAD` spammt,
+      verzögert fremde Ladevorgänge. Die Warteschlange braucht eine **Schranke mit benannter
+      Absage** (`ERR_LOAD_BUSY` oder ein Budget je PD) — sonst ist der Wartegrund zwar in der
+      Grund-Menge, die **Fairness** aber ungeregelt. Dieselbe Lehre wie D11: wer eine Kapazität
+      einführt, muss den Überlauf benennen, sonst ist die Schranke kein Schutz, sondern ein Loch.
+
+- [ ] **(b) Der Verifiziererthread erbt die Wasserzeichen-Pflicht — und die `kstack`-Zeile
+      ÄNDERT IHRE BEDEUTUNG.** Seine Stackgrösse ist zu **messen**, nicht zu wählen (die 12 008 B
+      kamen von genau diesem Pfad). Und nach dem Umzug misst die `kstack`-Zeile der Lade-Suite
+      etwas anderes als vorher: der EL0-Höchststand fällt, die Zeile misst dann den **Restpfad**.
+      **Die Umdefinition gehört ins Protokoll**, sonst vergleicht die nächste Messung über einen
+      Bedeutungswechsel hinweg — die 399er-Lehre.
+
+- [ ] **(c) Die „Krypto raus aus dem Kernel"-Frage ist ein EIGENER Entwurf, kein Nebensatz.**
+      Die Signaturprüfung ist **Wurzelvertrauen**. Sie kann in eine PD wandern — aber dann ist
+      *diese PD* TCB, und der Gewinn ist nur echt, wenn der Kernel dem **Ergebnis** über einen
+      **schmaleren Kanal** traut als dem Code selbst (etwa: der Kernel prüft nur noch einen Hash
+      gegen eine vom Verifizierer signierte Freigabe). Für jetzt reicht der kernlokale Thread;
+      die PD-Fassung steht hier als **benannte Option**, damit sie nicht als „haben wir mal
+      erwogen" verschwindet.
+
 ## D14. Eine BERICHTSZEILE MEHR kippt die Z4f-Pruefung (gemessen 2026-08-11)
 
 **Klasse:** Prueferform / Wanduhrzeit · **Stand:** offen, umgangen, Ursache NICHT benannt

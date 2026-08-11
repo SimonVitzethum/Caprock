@@ -713,6 +713,42 @@ fn fatal(frame: *mut TrapFrame) -> ! {
 /// also exakt das Bild, gegen das diese Funktion gebaut ist. Der Thread wird deshalb über seinen
 /// **Stack** identifiziert (lock-frei aus `RSP0`) und nicht über seine Slot-Nummer. Die offene
 /// Lücke steht ausdrücklich in der Ausgabe.
+/// **Was `CR2` in einem `#DF`-Bericht ueberhaupt bedeutet -- und wann NICHT.**
+///
+/// `CR2` traegt die Adresse des letzten `#PF`. Bei einem Stackueberlauf ist das genau die
+/// Guard-Page, und die Zeile ist die wertvollste des Berichts. **Ein `#DF` entsteht aber auch
+/// anders** -- etwa aus einem `#GP` bei der Zustellung einer Ausnahme, oder aus einem Fehler beim
+/// Zugriff auf die IDT selbst. Dann steht in `CR2` irgendein alter Wert, und die Beschriftung
+/// „hier scheiterte der urspruengliche Fault" schickt den Leser an eine Adresse, die mit dem
+/// Vorfall nichts zu tun hat. Die Architektur sagt uns den Vektor des Erstfaults nicht.
+///
+/// **Der naheliegende Weg traegt nicht:** ein „`#PF` gerade in Arbeit"-Bit im `#PF`-Handler waere
+/// fuer genau unseren Fall FALSCH -- beim Stackueberlauf scheitert die CPU schon beim Ablegen des
+/// `#PF`-Frames, der Handler wird nie betreten. Also wird nicht behauptet, sondern **geprueft**:
+/// liegt `CR2` auf der Seite unmittelbar unterhalb des EL1-Stacks, den dieser Kern zuletzt scharf
+/// gemacht hat, dann ist es die Wache dieses Stacks -- eine nachrechenbare Aussage. Sonst sagt die
+/// Zeile ausdruecklich, dass der Wert veraltet sein kann.
+fn cr2_deutung(kern: Option<usize>, cr2: u64) -> &'static str {
+    // **Zuerst die allgemeine, gelesene Antwort.** Liegt `CR2` auf einer stehenden Wache, war der
+    // Erstfault ein Stackueberlauf -- gleichgueltig, zu welchem Thread der Stack gehoert.
+    if super::mmu::ist_wache(cr2 & !0xFFF) {
+        // Und dann die schaerfere, falls sie zutrifft: gehoert die Wache zu dem Stack, den DIESER
+        // Kern zuletzt scharf gemacht hat? Nicht immer -- `TSS.rsp0` kann auf einen toten Stack
+        // zeigen (gemessen 2026-08-11).
+        if let Some(c) = kern {
+            if let Some((kb, _)) = super::gdt::kstack_basis_von_rsp0(super::gdt::tss_rsp0(c)) {
+                if kb >= 4096 && cr2 & !0xFFF == kb - 4096 {
+                    return "<- die GUARD-PAGE des EL1-Stacks DIESES Kerns: Stackueberlauf, CR2 gueltig";
+                }
+            }
+        }
+        return "<- eine stehende GUARD-PAGE (nicht die aus TSS.rsp0 dieses Kerns -- rsp0 kann \
+                auf einen toten Stack zeigen): Stackueberlauf, CR2 gueltig";
+    }
+    "<- nur gueltig, WENN der Erstfault ein #PF war; die Adresse liegt auf KEINER stehenden \
+     Wache, kann also ein alter Wert sein"
+}
+
 fn df_fatal(frame: *mut TrapFrame) -> ! {
     // SAFETY: gültiger, vom Stub angelegter Frame.
     let f = unsafe { &*frame };
@@ -725,7 +761,7 @@ fn df_fatal(frame: *mut TrapFrame) -> ! {
         "  kern={} (TR-Selektor {:#06x})\n  \
          rip={:#018x} cs={:#06x} ({})\n  \
          rsp={:#018x} rflags={:#010x} error={:#x}\n  \
-         cr2={:#018x}  <- hier scheiterte der URSPRUENGLICHE Fault\n",
+         cr2={:#018x}  {}\n",
         match kern {
             Some(c) => c as i64,
             None => -1,
@@ -738,6 +774,7 @@ fn df_fatal(frame: *mut TrapFrame) -> ! {
         rflags,
         error,
         cr2,
+        cr2_deutung(kern, cr2),
     ));
 
     if let Some(c) = kern {

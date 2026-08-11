@@ -5796,9 +5796,17 @@ pub fn run(multiboot_info: u64) -> ! {
             // EL0-Kernel-Stack -- und nur dann kann der #DF-Bericht auch den WASSERSTAND DES
             // BETROFFENEN STACKS zeigen. Vor dem ersten Ring-3-Wechsel waere `rsp0` null und die
             // Sonde belegte die halbe Aussage.
-            #[cfg(feature = "dfprobe")]
+            #[cfg(all(feature = "dfprobe", not(feature = "dfprobe-wache")))]
             if hal::timer::ticks(0) >= 200 {
                 super::ist::df_sonde_ausloesen();
+            }
+            // Dieselbe Stelle, dieselbe Begruendung -- aber ueber die ECHTE Guard-Page. Sie
+            // schliesst sich gegenseitig mit der obigen aus: zwei Sonden in einem Lauf hiesse,
+            // dass die zweite nie drankommt (die erste kehrt nicht zurueck), und ein Zweig, der
+            // strukturell nie laeuft, ist genau das, was hier belegt werden soll.
+            #[cfg(feature = "dfprobe-wache")]
+            if hal::timer::ticks(0) >= 200 {
+                super::ist::df_wache_ausloesen();
             }
             if sekunden > 60 || spins > 5_000_000_000 {
                 let mut w = [("", true); DONE_FLAGS];

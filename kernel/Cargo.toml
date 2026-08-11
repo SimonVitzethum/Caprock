@@ -60,6 +60,10 @@ soak = []
 # Gefahren wird sie von `tools/df-sonde.sh` in einem eigenen QEMU-Aufruf; dieselbe Datei faehrt die
 # Gegenprobe `dfprobe,dfprobe-kein-ist`.
 dfprobe = []
+# Die STAERKERE Sonde: der Ueberlauf laeuft ueber die echte Guard-Page eines EL1-Stacks statt
+# ueber eine beliebige unabgebildete Adresse. Damit wird der Zweig von `cr2_deutung` betreten,
+# der die Wache NACHRECHNET -- ohne diesen Lauf waere er eine Behauptung. Setzt `dfprobe` voraus.
+dfprobe-wache = ["dfprobe"]
 # **Die Gegenprobe zur #DF-Sonde**: nimmt dem #DF-Gate seinen IST-Eintrag. Damit MUSS derselbe Lauf
 # in einen Triple Fault ohne jede Ausgabe laufen -- und genau das belegt, dass die Meldung im
 # Positivfall am IST-Stack haengt und nicht daran, dass ein #DF ohnehin irgendwie spricht.

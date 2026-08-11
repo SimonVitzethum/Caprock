@@ -49,6 +49,10 @@ fahren() {  # $1 = Ausgabedatei
 
 POS=build/diag/df-sonde-positiv.log
 NEG=build/diag/df-sonde-gegenprobe.log
+# Der DRITTE Lauf: der Ueberlauf ueber eine ECHTE Wache (`dfprobe-wache`). Er belegt die KETTE,
+# die die beiden anderen nicht belegen -- Wache -> #PF -> #DF -> IST -> und ein `CR2`, das der
+# Bericht NACHRECHNET statt es zu behaupten.
+WACHE=build/diag/df-sonde-wache.log
 
 # ------------------------------------------------------------------------------------------------
 # 1. POSITIV: mit IST am #DF-Gate
@@ -169,6 +173,41 @@ echo
 bauen "selftest" >/dev/null || echo "  WARNUNG: Rueckbau auf 'selftest' fehlgeschlagen"
 
 echo
+# ================================================================================================
+# 4. DIE KETTE: Ueberlauf ueber eine ECHTE Wache
+# ================================================================================================
+#
+# Die Sonde oben belegt den MECHANISMUS (#PF beim Frame-Ablegen -> #DF -> IST) an einer beliebigen
+# unabgebildeten Adresse. Sie belegt NICHT, dass eine Guard-Page eines echten EL1-Stacks getroffen
+# wird und dass `cr2_deutung` das erkennt -- ein Zweig, den nie ein Lauf betritt, ist eine
+# Behauptung.
+#
+# **Die Wache wird GELESEN, nicht gerechnet.** Der erste Anlauf rechnete sie aus `TSS.rsp0` aus und
+# traf einen Stack, dessen Thread laengst tot und dessen Wache wieder eingehaengt war: beide `push`
+# gingen durch, der Kernel lief in ein `#UD`. Ohne diese Zeile haette die Sonde „kein #DF" als
+# „die Kette traegt nicht" gemeldet -- ein erfundener Misserfolg.
+echo
+echo "== Kette: Ueberlauf ueber eine ECHTE Guard-Page =="
+if ! bauen "selftest,dfprobe-wache"; then
+    echo "  FAIL: Bau mit dfprobe-wache scheiterte"
+    exit 1
+fi
+fahren "$WACHE"
+if ! grep -q "DOUBLE FAULT" "$WACHE"; then
+    echo "  FAIL: kein #DF -- die Kette Wache -> #PF -> #DF hat NICHT getragen"
+    grep -E "dfsonde|EXCEPTION|vector=" "$WACHE" | tail -5 | sed "s/^/    /"
+    exit 1
+fi
+if grep -q "Stackueberlauf, CR2 gueltig" "$WACHE"; then
+    echo "  PASS: der Bericht ERKENNT die Wache -- CR2 ist als gueltig ausgewiesen, nicht behauptet"
+    grep -m1 "cr2=" "$WACHE" | sed "s/^/    /"
+else
+    echo "  FAIL: der #DF kam, aber der Bericht hat die Wache NICHT erkannt --"
+    echo "        genau der Zweig, der belegt werden soll, ist nicht gelaufen"
+    grep -m1 "cr2=" "$WACHE" | sed "s/^/    /"
+    exit 1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "== DF-SONDE: ALL PASS =="
 else

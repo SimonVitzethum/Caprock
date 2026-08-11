@@ -344,3 +344,50 @@ pub fn df_sonde_ausloesen() -> ! {
 /// Kanonisch, 16-Byte-ausgerichtet, weit oberhalb jedes vom Speicherplan gedeckten RAM.
 #[cfg(feature = "dfprobe")]
 const DF_SONDE_RSP: u64 = 0x0000_3000_0000_0000;
+
+/// **Die stärkere Sonde: ein Überlauf über die ECHTE Guard-Page**, nicht über irgendeine
+/// unabgebildete Adresse.
+///
+/// [`df_sonde_ausloesen`] belegt den Mechanismus (`#PF` beim Frame-Ablegen → `#DF` → IST). Sie
+/// belegt aber **nicht die Kette**, um die es geht: dass die Wache eines echten EL1-Stacks
+/// getroffen wird, dass `CR2` dann auf genau diese Wache zeigt, und dass der Bericht das
+/// **nachrechnet** statt es zu behaupten. Genau diese Nachrechnung ist seit heute im Bericht
+/// (`cr2_deutung`), und ein Zweig, den nie ein Lauf betritt, ist eine Behauptung.
+///
+/// Der Weg: `RSP` auf den Fuss des EL1-Stacks setzen, den dieser Kern zuletzt scharf gemacht hat,
+/// und zweimal ablegen. Das erste `push` schreibt noch in den Stack, das zweite eine Seite
+/// darunter — in die Wache.
+///
+/// **Fail-closed:** ist kein Stack ermittelbar, wird das gesagt und die Sonde bricht ab, statt
+/// auf eine erratene Adresse zu schreiben. Eine Sonde, die im Zweifel irgendwohin greift, belegt
+/// im Erfolgsfall nicht, was sie zu belegen vorgibt.
+#[cfg(feature = "dfprobe-wache")]
+pub fn df_wache_ausloesen() -> ! {
+    // **Die Wache wird GELESEN, nicht aus `TSS.rsp0` gerechnet.** Die erste Fassung tat das --
+    // und traf einen Stack, dessen Thread laengst tot und dessen Wache damit wieder eingehaengt
+    // war: beide `push` gingen durch, der Kernel lief in ein `#UD` statt in einen `#DF`. Ein
+    // gerechneter Aufbau ist dieselbe Falle wie ein Pruefer, der die gepruefte Groesse
+    // nachrechnet. Nebenbefund, der bleibt: `TSS.rsp0` kann auf einen TOTEN Stack zeigen.
+    let Some(wache) = hal::mmu::erste_lebende_wache() else {
+        println!(
+            "dfsonde : KEINE stehende Wache gefunden -- Sonde bricht ab. Das ist ein \
+             Aufbaufehler und kein Messergebnis: ohne Wache kann diese Sonde nichts belegen."
+        );
+        crate::arch::x86_64::system_off();
+    };
+    let kb = wache + 4096; // der Stackfuss liegt eine Seite ueber seiner Wache
+    println!(
+        "dfsonde : Ueberlauf ueber eine NACHWEISLICH stehende Wache bei {wache:#x} \
+         (Stackfuss {kb:#x}). RSP auf den Stackfuss, zweimal ablegen -- das zweite trifft sie."
+    );
+    // SAFETY(-Absicht): das zweite `push` SOLL fehlschlagen. Ab hier keine Rueckkehr.
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, {0}",
+            "push rax",
+            "push rax",
+            in(reg) kb + 8,
+            options(noreturn),
+        )
+    }
+}

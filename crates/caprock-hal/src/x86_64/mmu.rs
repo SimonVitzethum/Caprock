@@ -657,6 +657,54 @@ static GUARDS_TOTAL: AtomicUsize = AtomicUsize::new(0);
 /// Wie oft eine Wache **nicht** gesetzt werden konnte (Vorrat erschoepft).
 static GUARDS_DENIED: AtomicUsize = AtomicUsize::new(0);
 
+/// **Die Adresse EINER zurzeit stehenden Wache** -- oder `None`, wenn keine steht.
+///
+/// Gebraucht von der `#DF`-Sonde: sie muss auf eine Seite schreiben, die **nachweislich** nicht
+/// abgebildet ist. Am 2026-08-11 hat sie stattdessen `TSS.rsp0` benutzt und daraus den Stackfuss
+/// gerechnet -- und traf einen Stack, dessen Thread laengst tot und dessen Wache damit wieder
+/// eingehaengt war. Beide `push` gingen durch, der Kernel lief in ein `#UD`, und die Sonde haette
+/// bei einer schwaecheren Auswertung „kein #DF" als „die Kette traegt nicht" gemeldet.
+///
+/// Der Umweg ueber eine gerechnete Adresse ist damit dieselbe Falle wie ein Pruefer, der die
+/// gepruefte Groesse nachrechnet statt sie zu lesen: hier wird die Wache **gelesen**.
+pub fn erste_lebende_wache() -> Option<u64> {
+    for (k, b) in GUARD_BLOCK_OF.iter().enumerate() {
+        let blk = b.load(Ordering::Relaxed);
+        if blk == usize::MAX {
+            continue;
+        }
+        // SAFETY: statische Tabelle, Platz `k` ist belegt (eben gelesen); nur Lesen.
+        let pt = unsafe { &*core::ptr::addr_of!(GUARD_PT) };
+        for (i, e) in pt[k].0.iter().enumerate() {
+            if *e & P == 0 {
+                return Some((blk as u64) * TWO_MIB + (i as u64) * PAGE);
+            }
+        }
+    }
+    None
+}
+
+/// **Ist `pa` zurzeit eine stehende Wache?** -- gelesen, nicht gerechnet.
+///
+/// Dafuer gebaut, dass der `#DF`-Bericht `CR2` deuten kann: liegt die Adresse auf einer Wache,
+/// war der Erstfault ein Stackueberlauf und `CR2` ist gueltig. Der erste Anlauf verglich `CR2`
+/// gegen eine aus `TSS.rsp0` **gerechnete** Wachenadresse -- und meldete „passt nicht", obwohl
+/// der Ueberlauf gerade ueber eine echte Wache gelaufen war: `rsp0` zeigte auf den Stack eines
+/// laengst toten Threads. Zweimal am selben Tag dieselbe Lehre: **lesen statt nachrechnen.**
+pub fn ist_wache(pa: u64) -> bool {
+    let blk = (pa / TWO_MIB) as usize;
+    let Some(k) = GUARD_BLOCK_OF
+        .iter()
+        .position(|b| b.load(Ordering::Relaxed) == blk)
+    else {
+        return false;
+    };
+    let idx = ((pa % TWO_MIB) / PAGE) as usize;
+    // SAFETY: statische Tabelle, Block belegt, Index aus dem Offset -- nur Lesen.
+    let pt = unsafe { &*core::ptr::addr_of!(GUARD_PT) };
+    pt[k].0[idx] & P == 0
+}
+
 /// `(stehende Wachen, insgesamt gesetzte, abgewiesene, belegte Bloecke, Blockvorrat)`.
 pub fn guard_stats() -> (usize, usize, usize, usize, usize) {
     let belegt = GUARD_BLOCK_OF

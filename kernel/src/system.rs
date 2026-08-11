@@ -55,6 +55,12 @@ pub fn num_cores() -> usize {
     NUM_CORES.load(Ordering::Relaxed)
 }
 
+/// Der Kern, auf dem der Aufrufer gerade läuft. Für die Ladepfade, die den Heimatkern seit C8
+/// ausdrücklich nennen müssen (s. `loader::ladepolitik_auf`) und ihn beim Boot noch selbst sind.
+pub fn eigener_kern() -> usize {
+    hal::cpu::core_id()
+}
+
 const STACK_SIZE: u64 = 64 * 1024;
 /// Standardpriorität für Idle und gewöhnliche Demo-Threads (Round-Robin).
 pub const IDLE_PRIO: u8 = 1;
@@ -524,12 +530,6 @@ fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
 /// rückgabe und Abbruch finalisierter Reply-Calls). Wird **ohne** gehaltene Dispatch-Locks
 /// gerufen (der Dispatch gibt CAPS/EPS vorher frei); `cap_delete` sperrt selbst CAPS+MEM
 /// in der richtigen Ordnung. Ein Fehlschlag (Cap bereits weg) ist unkritisch.
-/// SYS_LOAD-Callback in den Binary-Loader (A-1.5). Seit A-1.1 gibt es das Boot-Archiv auf
-/// **beiden** Architekturen: auf ARM in einem reservierten RAM-Fenster, auf x86 als
-/// Multiboot-Modul. Wo keines vorliegt, schlägt der Aufruf sauber fehl (der Loader liefert
-/// `None`), statt etwas Halbes zu laden.
-use crate::loader::load_by_index;
-
 fn dispatch_delete_cap(cap: caprock_cap::CapPtr) -> bool {
     cap_delete(cap).is_ok()
 }
@@ -551,7 +551,10 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
         &CAPS,
         eps(),
         ntfns(),
-        load_by_index, // ext-26: SYS_LOAD-Callback (cap-gegatet im Dispatch); A-5.1: mit Aufrufer-PD
+        // ext-26: SYS_LOAD-Callback (cap-gegatet im Dispatch); A-5.1: mit Aufrufer-PD.
+        // **Seit C8 eine Uebergabe an den Verifiziererthread**, kein synchrones Laden mehr --
+        // die Krypto gehoert nicht auf den 16-KiB-Stack des Aufrufers.
+        sys_load_uebergeben,
         dispatch_delete_cap,          // beim Grant verdrängte Cap freigeben (kein Slot-Leck)
     );
     // Der Syscall kann den laufenden Thread gewechselt haben (block/exit) -> FP-Trap
@@ -2374,6 +2377,25 @@ pub fn spawn_balanced(entry: usize, arg: usize, prio: u8) -> Option<ThreadId> {
 /// um Arbeit über die Kerne zu verteilen). Der Zielkern muss vorab via
 /// [`bind_cores`] gebunden sein. Lock-Ordnung RES vor SCHEDS[core].
 pub fn spawn_on_core_parked(core: usize, entry: usize, arg: usize, prio: u8) -> Option<Parked> {
+    spawn_on_core_parked_mit_stack(core, entry, arg, prio).map(|(p, _, _)| p)
+}
+
+/// Wie [`spawn_on_core_parked`], aber **nennt den Stack**, den der Thread bekommen hat.
+///
+/// Gebraucht von genau einer Stelle (dem Verifiziererthread, C8) und aus einem benannten Grund:
+/// seine Stackgrösse ist zu **messen**, nicht zu wählen. Ein Kernel-Thread, der nie stirbt, wird
+/// vom Reap-Pfad nie gemessen; ohne seine Basis gäbe es keinen Wasserstand, und „64 KiB reichen"
+/// wäre wieder eine Behauptung statt einer Zahl.
+///
+/// Der Weg über den Scheduler wäre die Alternative gewesen (`Tcb::stack_base` lesen). Er ist
+/// bewusst nicht gewählt: der Scheduler hätte einen weiteren Auskunftspfad bekommen, und das Wissen
+/// entsteht ohnehin **hier**, wo der Stack alloziert wird.
+pub fn spawn_on_core_parked_mit_stack(
+    core: usize,
+    entry: usize,
+    arg: usize,
+    prio: u8,
+) -> Option<(Parked, usize, usize)> {
     mangel_zuruecksetzen();
     let (base, len) = {
         let stack = benannt_alloc(MANGEL_KERNEL_THREAD_STACK, STACK_SIZE, |n| {
@@ -2400,7 +2422,7 @@ pub fn spawn_on_core_parked(core: usize, entry: usize, arg: usize, prio: u8) -> 
         MEM.lock().free_region(PhysRegion::new(base as u64, len as u64));
         return None;
     };
-    Some(Parked(tid))
+    Some((Parked(tid), base, len))
 }
 
 /// **Einen Thread erzeugen, der seine PD schon hat, bevor er das erste Mal laufen darf** (D0).
@@ -8485,6 +8507,79 @@ pub fn unpark_thread(tid: ThreadId) -> bool {
         return true;
     }
     false
+}
+
+/// **Dem Aufrufer eines `SYS_LOAD` antworten** (C8) — Ergebnis in den Frame, dann `LOAD` weg.
+///
+/// Die Reihenfolge ist die Aussage: **erst schreiben, dann wecken.** Umgekehrt liefe der Aufrufer
+/// mit einem Ergebnisregister los, das noch niemand gesetzt hat. Beides passiert unter *einer*
+/// Sperrung seiner Scheduler-Instanz — der Frame gehört einem blockierten Thread, und blockiert
+/// bleibt er, bis `load_reply` in derselben Sperrung den Grund entfernt.
+///
+/// Dieselbe Bauform wie [`unblock_with_error`], nur mit dem Grund, der hierher gehört: `unblock`
+/// entfernte `IPC`, und ein Aufrufer, der nie in IPC war, hätte davon nichts gemerkt — er wäre
+/// blockiert liegen geblieben.
+///
+/// Rückgabe: ob der Aufrufer noch auflösbar war. `false` heisst „tot" und ist kein Fehler, aber
+/// auch nicht nichts (der Verifizierer zählt es).
+pub fn lade_antwort(caller: ThreadId, pd: Option<usize>) -> bool {
+    let done = with_owner(caller, |sched, _| {
+        let frame = sched.frame_of(caller)?; // fremder Kern/tot -> ggf. wiederholen
+        match pd {
+            Some(p) => {
+                hal::exception::frame_set_reg(
+                    frame,
+                    caprock_abi::reg::SYSNO_RESULT,
+                    caprock_abi::result::OK,
+                );
+                hal::exception::frame_set_reg(frame, caprock_abi::reg::EP_BADGE, p as u64);
+            }
+            // Wie bisher: ein fehlgeschlagener Ladevorgang ist `ERR_BADCAP` (Archiv/ELF/
+            // Ressourcen). Der GRUND steht im Protokoll, den `loader::load_by_index` druckt.
+            None => hal::exception::frame_set_reg(
+                frame,
+                caprock_abi::reg::SYSNO_RESULT,
+                caprock_abi::result::ERR_BADCAP,
+            ),
+        }
+        sched.load_reply(caller);
+        Some(())
+    });
+    match done {
+        Some((_, c)) => {
+            kick(c);
+            true
+        }
+        None => false,
+    }
+}
+
+/// **Einen `SYS_LOAD` an den Verifizierer übergeben** (C8) — der Callback des Dispatch.
+///
+/// Blockiert den laufenden Thread mit [`BlockReasons::LOAD`](caprock_sched::BlockReasons::LOAD)
+/// und reicht den Auftrag hinüber; die Reihenfolge (blockieren, *dann* veröffentlichen) liegt in
+/// [`crate::verifizierer::uebergeben`] und ist dort begründet.
+fn sys_load_uebergeben(
+    index: u32,
+    caller_pd: usize,
+    endow: &[(usize, CapPtr)],
+    core: usize,
+    frame: usize,
+) -> crate::verifizierer::Uebergabe {
+    let caller = SCHEDS[core].lock().current_id(core);
+    crate::verifizierer::uebergeben(index, caller_pd, endow, caller, core, || {
+        // Genau der Pfad, den die Tick-Rechnung sonst nicht sieht (B-5.1): wer blockiert, hat
+        // gerechnet. `charged` stempelt die verbrauchten Zyklen, bevor gewechselt wird.
+        charged(core, &mut SCHEDS[core].lock(), |s| {
+            s.block_for_load(core, frame)
+        })
+    })
+}
+
+/// Wartet dieser Thread auf den Verifizierer? (C8, nur Prüfung — die `verif`-Zeile braucht die
+/// Aussage in **beide** Richtungen: die Bedienten warten, der Überläufer nicht.)
+pub fn is_load_blocked(tid: ThreadId) -> bool {
+    with_owner(tid, |s, _| s.is_load_blocked(tid).then_some(())).is_some()
 }
 
 /// Ist dieser Thread blockiert, **gleich aus welchem Grund**? Die Größe, an der sich zeigt, ob

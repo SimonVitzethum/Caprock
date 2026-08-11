@@ -514,6 +514,25 @@ check "sweep   : Bilanz .* VSpaces=0 · PD-Slots=0 · Thread-Slots=0 · Seitenta
     "C7: nach dem Sweep bleibt nichts liegen -- vier exakt nachgezaehlte Groessen, nicht die Zusage einer Aufraeumroutine"
 check "kstack  : Eichung 0b1111" "C4: das Messgeraet selbst trennt -- ungefuelltes Feld meldet 0, gefuelltes die volle Laenge, ein bis zu BEKANNTER Tiefe beruehrtes genau diese Tiefe. Ohne den dritten Punkt bestuende die Zeile auch eine Funktion, die nur zwei Zahlen kennt"
 # ------------------------------------------------------------------------------------------------
+# C8: der VERIFIZIERERTHREAD -- die Krypto ist vom Stack des Aufrufers herunter
+# ------------------------------------------------------------------------------------------------
+#
+# **Positiv geprueft und nicht bloss 'nicht rot'**, aus demselben Grund wie bei `kstack`: eine
+# Zeile, die GAR NICHT kommt, faengt kein Rotzeilen-Scanner -- und genau so saehe es aus, wenn
+# jemand die Messung aushaengt.
+#
+# Die zweite Zeile ist die eigentliche: sie belegt, dass die Schranke **gefahren** wurde. Eine
+# Kapazitaet, die nie erreicht wurde, ist von einer fehlenden nicht zu unterscheiden (D11), und
+# ein Kommentar ist kein Beleg.
+check "verif   : ALL PASS" \
+    "C8: SYS_LOAD verifiziert (Ed25519 + SHA-2) nicht mehr auf dem 16-KiB-Kernel-Stack des AUFRUFERS, sondern auf dem eigenen Stack eines dedizierten Verifiziererthreads. Der Aufrufer blockiert regulaer mit dem EIGENEN Grund LOAD in der Grund-Menge (Z24) -- kein resume/unpark/reply weckt ihn, nur die Fertigmeldung"
+check "verif   : Absage gefahren -- 5 Sonden gegen eine Schranke von 4: abgewiesen=1 bedient=4" \
+    "C8 (a): die Serialisierung ist ein DoS-Kanal und hat deshalb eine SCHRANKE MIT NAMEN. Gefahren, nicht behauptet: fuenf Aufrufer gegen vier Plaetze, der fuenfte bekommt ERR_LOAD_BUSY -- und er bleibt NICHT blockiert zurueck. Das ist D11 in beide Richtungen"
+check "Fuellstand erreichte 4/4" \
+    "C8 (a): die Schranke wurde WIRKLICH erreicht. Ohne diese Zahl waere jede Aussage ueber den Ueberlauf eine Aussage ueber einen Fall, der nie eingetreten ist"
+check "kstack  : Wasserstand VERIFIZIERER" \
+    "C8 (b): die Stackgroesse des Verifizierers ist GEMESSEN, nicht gewaehlt -- er ist der Traeger des tiefsten Kernelpfads und stirbt nie, wird vom Reap-Pfad also nie erfasst"
+# ------------------------------------------------------------------------------------------------
 # Per-Kern-TSS + IST-Stacks: der Unterbau unter der Guard-Page
 # ------------------------------------------------------------------------------------------------
 #

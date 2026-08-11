@@ -359,6 +359,22 @@ CODE_AUSSERHALB = {
     'handler_reply':        'Z26/A3: der EINZIGE Wecker des HANDLER-Grundes; entfernt ihn und '
                             'reiht bei leerer Menge ein. Dito -- und die Aussage „nur dieser eine '
                             'Wecker" ist genau die, die das Modell nicht ausdruecken kann',
+    # C8, 2026-08-11. Wortgleiche Begruendung wie bei `handler_reply` daneben, und das ist kein
+    # Abschreiben, sondern der Befund: es ist die SECHSTE Instanz derselben Klasse. `block_for_load`
+    # steht hier NICHT -- es ist eine duenne Huelle um `block_current_mit` und schreibt selbst
+    # nichts (dieselbe Ueberlegung wie bei `block_current`; ein Eintrag „vorsichtshalber" waere der
+    # veraltete Registereintrag, den dieser Waechter schon zweimal an sich selbst gemeldet hat).
+    #
+    # Das Modell koennte hier `blocked := false` hinschreiben -- und waere damit WENIGER wahr als
+    # der Code. Die tragende Aussage von C8 ist ja gerade, dass die Blockade NICHT von einem
+    # beliebigen Wecker faellt, sondern nur von der Fertigmeldung des Verifizierers. Ein Modell
+    # ohne Gruende kann das nicht ausdruecken; ein Beweis, der es trotzdem behauptete, waere ein
+    # Beweis der Wunschform. Die Eigenschaft ist GEMESSEN (Pruefzeile `verif`, mit isolierender
+    # Gegenprobe: `load_reply` ohne das `remove` laesst genau die Bedienten haengen), nicht bewiesen.
+    'load_reply':           'C8: der EINZIGE Wecker des LOAD-Grundes (SYS_LOAD wartet auf den '
+                            'Verifiziererthread); entfernt ihn und reiht bei leerer Menge ein. '
+                            'Das Modell kennt keine Gruende, nur EIN `blocked` -- also kein '
+                            'Uebergang, den man nachtragen koennte',
 }
 
 # [3] Die Paare Modell <-> Code samt eingefrorener Uebertragungsluecke.

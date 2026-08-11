@@ -255,6 +255,28 @@ impl BlockReasons {
     /// entfernt `PARK`, `unblock` entfernt `IPC` — keiner von ihnen entfernt `HANDLER`, und
     /// eingereiht wird nur bei leerer Menge.
     pub const HANDLER: u8 = 1 << 4;
+    /// **Der `SYS_LOAD` dieses Threads liegt beim Verifiziererthread** (C8).
+    /// Wecker: [`Scheduler::load_reply`] — und **nur** der.
+    ///
+    /// ## Warum ein eigener Grund und kein Bit daneben
+    ///
+    /// Es ist die **sechste** Instanz derselben Klasse, und wie bei [`Self::HANDLER`] ist sie
+    /// diesmal vorhergesagt statt gefunden. Läge sie als eigenes Bit neben der Menge, wiederholte
+    /// sich die Park-Naht wörtlich: ein `resume` des Debuggers oder das `unblock` eines fremden
+    /// IPC-Partners liesse den Aufrufer weiterlaufen, **bevor der Verifizierer sein Urteil in den
+    /// Frame geschrieben hat** — er läse ein Ergebnisregister, das noch niemand gesetzt hat.
+    ///
+    /// In der Menge ist genau das unformulierbar: `resume` entfernt `PAUSE`, `unpark` entfernt
+    /// `PARK`, `unblock` entfernt `IPC`, `handler_reply` entfernt `HANDLER` — keiner von ihnen
+    /// entfernt `LOAD`, und eingereiht wird **nur bei leerer Menge**.
+    ///
+    /// ## Und warum NICHT `IPC`
+    ///
+    /// Der bequeme Weg wäre gewesen, den Auftrag über einen Endpoint zu schicken und den Aufrufer
+    /// mit `IPC` blockieren zu lassen. Dann aber weckte ihn jedes `reply` **irgendeines** Servers,
+    /// an dem er zufällig hängt, und `purge_ipc_queues` sähe eine Wartebeziehung, die es nicht
+    /// gibt. Ein Grund, der zwei Lagen trägt, macht den Wecker unbestimmbar — das ist D9.
+    pub const LOAD: u8 = 1 << 5;
 
     /// Leere Menge = lauffähig.
     pub const NONE: Self = Self(0);
@@ -1166,6 +1188,44 @@ impl Scheduler {
     pub fn is_handler_blocked(&self, tid: ThreadId) -> bool {
         self.resolve(tid)
             .is_some_and(|s| self.tcbs[s].reasons.has(BlockReasons::HANDLER))
+    }
+
+    /// **Den laufenden Thread blockieren, weil sein `SYS_LOAD` beim Verifizierer liegt** (C8).
+    ///
+    /// Geht durch [`block_current_mit`](Self::block_current_mit) — es ist keine neue Blockade-Art,
+    /// sondern ein neuer **Grund** in derselben Menge.
+    ///
+    /// **Der Aufrufer MUSS das tun, bevor der Auftrag für den Verifizierer sichtbar wird.**
+    /// Andernfalls kann der Verifizierer (auf einem anderen Kern) fertig sein, bevor der Aufrufer
+    /// blockiert ist; sein [`load_reply`](Self::load_reply) liefe dann ins Leere, und der Aufrufer
+    /// setzte danach einen Grund, den niemand mehr entfernt. Das ist ein verlorenes Wecken, und es
+    /// gibt hier **keine** Weckmarke, die es auffinge — der Kernel hält die Auftragsschlange
+    /// deshalb über beide Schritte gesperrt (s. `verifizierer::uebergeben`).
+    pub fn block_for_load(&mut self, core: usize, frame: usize) -> usize {
+        self.block_current_mit(core, frame, BlockReasons::LOAD)
+    }
+
+    /// **Der EINZIGE Wecker des Lade-Grundes** (C8).
+    ///
+    /// Entfernt `LOAD` und **nur** das. Ein Aufrufer, der zusätzlich pausiert wurde oder auf einem
+    /// leeren Konto sitzt, bleibt liegen — sein Ergebnis steht im Frame, seine Zulassung nicht.
+    ///
+    /// Rückgabe wie [`unblock`](Self::unblock): auf **diesem** Kern auflösbar?
+    pub fn load_reply(&mut self, tid: ThreadId) -> bool {
+        let Some(s) = self.resolve(tid) else {
+            return false;
+        };
+        self.tcbs[s].reasons.remove(BlockReasons::LOAD);
+        self.wecke_falls_lauffaehig(s);
+        true
+    }
+
+    /// Wartet dieser Thread auf den Verifizierer? (Nur Telemetrie/Prüfung — die C8-Zeile braucht
+    /// die Unterscheidung zu einer IPC-Blockade, und zwar in **beide** Richtungen: der Überläufer
+    /// darf sie NICHT haben.)
+    pub fn is_load_blocked(&self, tid: ThreadId) -> bool {
+        self.resolve(tid)
+            .is_some_and(|s| self.tcbs[s].reasons.has(BlockReasons::LOAD))
     }
 
     /// Wie viele Threads dieses Kerns sind **gebunden**? (Sprechprobe: ein Prüfer, der über

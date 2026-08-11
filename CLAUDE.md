@@ -158,6 +158,43 @@ falsch.
   **ein** Fehlschlag unter dreifacher paralleler QEMU-Last. Passt zum offenen Haenger aus D6 und
   trat auch vor diesen Aenderungen auf -- auseinandergehalten habe ich es nicht.
 
+## Was am 2026-08-11 dazukam (C8: der Verifiziererthread)
+
+* **Die Krypto steht nicht mehr auf dem Stack des Aufrufers — und die Zahl ist gemessen.**
+  `SYS_LOAD` → `verify_image` → Ed25519 + SHA-2 lief auf dem 16-KiB-EL1-Stack des *aufrufenden*
+  EL0-Threads und fuellte ihn zu **73,1 %** (11 992 von 16 384 B). Seit C8 laeuft der Pfad auf dem
+  64-KiB-Stack eines dedizierten Verifiziererthreads. Lade-Suite, 512M:
+  **EL0-Kstack 11 992 → 1 312 B (73,1 % → 8,0 %)**, Verifiziererstack **12 328 / 65 536 B (18,8 %)**.
+  Die Hauptsuite bleibt bei 824 B — **das ist die Kontrolle**, sie hat kein Archiv und fuhr nie
+  Krypto ueber `SYS_LOAD`.
+* **Die `kstack`-Zeile misst seither etwas ANDERES**, und sie sagt es selbst. Vorher war sie eine
+  Messung des Ladepfads, jetzt eine des **Restpfads**. Wer 1312 gegen 11 992 haelt, vergleicht ueber
+  einen Bedeutungswechsel hinweg — die Umdefinition steht in der Zeile, in beiden Suiten-Skripten
+  und in `done.md`.
+* **Der Wartegrund ist ein GRUND, kein viertes Bit** (`BlockReasons::LOAD`, Z24, sechste Instanz
+  derselben Klasse). Wecker ist ausschliesslich `load_reply`; `resume`/`unpark`/`unblock`/
+  `handler_reply` entfernen ihn nicht, und eingereiht wird nur bei leerer Menge.
+* **Die Serialisierung ist ein BENANNTER DoS-Kanal:** `AUFTRAEGE_MAX = 4`, Ueberlauf
+  `ERR_LOAD_BUSY = 13`, und der Ueberlaeufer wird **gar nicht erst blockiert** — D11 woertlich.
+  Gefahren, nicht behauptet: Pruefzeile `verif`, 5 Sonden gegen 4 Plaetze, `Fuellstand erreichte
+  4/4`, Ueberlaeufer nicht blockiert und am Rundenzaehler nachweislich weitergelaufen. Zwei
+  Gegenproben, beide mit **genau einem** offenen Konjunkt (`offen waren: verif`).
+* **Kein verlorenes Wecken, und zwar ohne zweiten Zustand.** Der Aufrufer wird blockiert, **bevor**
+  sein Auftrag sichtbar wird — beides unter EINER Sperrung der Auftragsschlange. Andersherum haette
+  ein Verifizierer auf einem anderen Kern antworten koennen, bevor der Grund gesetzt ist. Fuer
+  `PARK` faengt das eine Weckmarke ab; hier tut es die Sperrung (`SCHLANGE` R1.5 → `SCHEDS` R2,
+  `docs/invariants.md` §1).
+* **Drei Befunde, die nicht im Auftrag standen:** die **Platzierungspolitik** waere still
+  mitgewandert (ein Programm ohne Manifest-Affinitaet landet auf `hal::cpu::core_id()` — bis C8 der
+  Aufrufer, danach der Verifizierer); die abgeleiteten **Endowment-Caps lecken** auf den zwei neuen
+  Abweispfaden, weil dort der Loader gar nicht erst drankommt; und eine **Marke auf Bit 63**
+  kollidierte mit dem obersten Zahlenfeld des Ergebniswortes (`verloren` las sich als 128, Urteil
+  fiel durch, Watchdog — bei jedem einzelnen gruenen Feld darueber).
+* **Vorbestehend, nicht von mir:** der **aarch64-Kernel baut auf diesem Zweig nicht** (drei
+  `E0425`: `hal::mmu::guard_unmap`/`guard_remap` gibt es nur in der x86-HAL, seit der Guard-Page-
+  Arbeit vom 2026-08-10). Die aarch64-Seite von C8 (`verifizierer::starten()` in `main.rs`) ist
+  damit **ungeprueft**.
+
 ## Was am 2026-08-07 dazukam (zweiter Teil: A1 + Z11c)
 
 * **A1 wirkt jetzt auf dem REGULAEREN Weg — und die Entscheidung steht im Manifest.** Ein Programm
@@ -947,6 +984,37 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   gegen 32, im Bericht, unbemerkt. Prosa hat kein Gatter. Die Summanden stehen jetzt als
   Konstanten mit `const _: () = assert!(… == MELDESTELLEN)` — wer eine Meldestelle hinzufügt,
   bricht den Bau, bis er sie eingeordnet hat.
+* **Der Guard eines `while let`-Scrutinees lebt ueber den RUMPF — und `SpinLock::lock` maskiert
+  IRQs.** `while let Some(a) = SCHLANGE.lock().entnehmen() { laden(&a) }` sieht aus wie „entnehmen,
+  freigeben, arbeiten" und ist „arbeiten unter der Sperre, mit gesperrten Interrupts". Im
+  C8-Verifizierer haette das die gesamte Ed25519-/SHA-2-Pruefung mit maskierten IRQs gefahren —
+  **also genau die Fassung „Praemption fuer die Dauer aus", die C8 ausdruecklich verworfen hat**,
+  hereingeholt durch eine Temporaries-Lebensdauer statt durch eine Entscheidung. Gemessen mit einem
+  `Drop`-Zeugen, nicht erschlossen: im `while let` faellt der Guard NACH dem Rumpf, in
+  `let v = { l.lock().entnehmen() };` davor. Dieselbe Wurzel wie der `match lock() { .. }`-
+  Selbst-Deadlock weiter oben, aber mit einem anderen Schaden: kein Haenger, sondern ein
+  Latenzloch, das keine Pruefzeile ansieht. Abhilfe ist die **Funktionsgrenze**
+  (`fn naechster() -> Option<Auftrag>`), nicht ein Kommentar.
+* **Eine Statusmarke im obersten Bit kollidiert mit dem obersten ZAHLENFELD.** Das Ergebniswort der
+  C8-Sonde packt Aussagen in die unteren und Zahlen in die oberen Bits; „gemessen" stand auf Bit 63,
+  und dort liegt schon `verloren` (Bits 56..64). Beim Auspacken las sich die Marke als
+  `verloren = 128`, das Urteil fiel durch, der Lauf ging in den Watchdog — **waehrend jedes einzelne
+  Feld der Zeile darueber gruen war**. Das Bild ist von einem echten Befund nicht zu unterscheiden,
+  und die Ursache ist eine Bitmaske. Wer Zahlen und Marken in ein Wort packt, muss die Belegung
+  ausschreiben, nicht abzaehlen.
+* **Wer einen tiefen Pfad VERSCHIEBT, verschiebt auch alles, was an „wo laufe ich" haengt.**
+  `load_into_pd_mit` legt einen Thread ohne Manifest-Affinitaet auf `hal::cpu::core_id()`. Solange
+  der Ladepfad im Aufrufer lief, war das der Kern des Aufrufers; mit dem Verifiziererthread waere es
+  seiner geworden — jedes ohne Affinitaet geladene Programm haette den Kern gewechselt, als
+  **Nebenwirkung einer Stack-Verschiebung**, ohne dass eine Zeile davon spricht. Der Auftrag traegt
+  den Heimatkern deshalb mit. Dieselbe Klasse wie „ein Parameter, der zwei Bedeutungen traegt": eine
+  Umgebungsgroesse wird zum Argument, sobald die Umgebung wechselt.
+* **Ein neuer Abweispfad erbt die Aufraeumpflicht des alten NICHT.** Der Dispatch leitet fuer
+  `SYS_LOAD` Endowment-Caps ab; auf dem angenommenen Weg raeumt `load_by_index` sie bei Misserfolg
+  auf. Die zwei neuen Ausgaenge (`Ausgelastet`, `KeinVerifizierer`) kommen dort gar nicht mehr hin —
+  ohne eigene Loeschung blieben sie als verwaiste CDT-Kinder liegen und blockierten sogar das
+  `delete` des Eltern-Caps. Wer eine Funktion in „uebergeben" und „ausfuehren" zerlegt, muss jede
+  Aufraeumzusage der alten Funktion einzeln neu unterbringen.
 * **Wer nach ERREICHBARKEIT priorisiert statt nach VORGESCHICHTE, hat das Werkzeug am Ende genau
   dort nicht, wo der letzte Fall lag.** Die zehn ungemessenen Mangel-Meldestellen des Ladepfads
   standen ein Jahr mit der Begründung „braucht ein Boot-Archiv, das die Hauptsuite bauartbedingt

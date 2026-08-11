@@ -2920,46 +2920,16 @@ der Audit-Berichtigung
       Ausweg — damit ließe sich das Feld in `admit` nicht mehr herausbewegen, und der Typ verlöre
       genau die Eigenschaft, um die es geht.
 
-## C8. Der VERIFIZIERERTHREAD — die Krypto vom Thread-Stack holen (entschieden 2026-08-11)
+## C8. Der VERIFIZIERERTHREAD — **gebaut** (2026-08-11); offen ist nur noch (c)
 
-**Klasse:** Kapazität / Sicherheit · **Stand:** entschieden, nicht begonnen
+**Klasse:** Kapazität / Sicherheit · **Stand:** (a) und (b) sind **gebaut und gemessen**, die
+Herleitung samt Gegenproben steht in [done.md](done.md). Hier bleibt, was offen ist.
 
-**Der Befund, aus dem das folgt** (s. [done.md](done.md), Stack-Wasserstandsmarke): der tiefste
-Kernelpfad ist `SYS_LOAD` → `verify_image` → **Ed25519 + SHA-2 im Kernel**, auf dem 16-KiB-EL1-Stack
-des *aufrufenden EL0-Threads*. Höchststand **12 008 von 16 384 B (73,2 %)**, Reserve 4376 B. Die
-grössten Rahmen des Abbilds liegen genau dort (`vartime_double_scalar_mul_basepoint` 3528 B,
-`NafLookupTable::from` 1928 B).
-
-**Damit dreht sich C4 um:** die 160 MiB für 10 000 Threads zahlt *jeder* Thread für *einen* Pfad.
-Wandert die Verifikation auf einen eigenen Stack, sind 4 KiB je Thread plausibel — **40 MiB statt
-160**. Das ist der Hebel, nicht „lazy".
-
-**Entschieden ist die dritte von drei Fassungen**, und der Grund ist die Fehlerklasse, die man
-sich einbaut:
-
-| Fassung | was sie kostet |
-|---|---|
-| Präemption für die Dauer aus | Latenzloch im Millisekundenbereich — für einen Mikrokern peinlich |
-| Ein Arbeitsstack **je Kern** + Belegt-Bit | braucht einen **neuen Wartegrund** und eine Blockiernaht, die es sonst nicht gäbe |
-| **Ein dedizierter Verifiziererthread** ✔ | serialisiert Ladevorgänge (bei ihrer Frequenz egal), nutzt die **vorhandene** Blockiermaschinerie, keine Präemptionsakrobatik |
-
-`SYS_LOAD` reicht den Auftrag hinüber und blockiert regulär. Die 40-MiB-Rechnung gilt in allen
-drei Fassungen — die Wahl entscheidet nur, welche Fehlerklasse man erbt.
-
-### Die drei Randbedingungen, ohne die die Entscheidung unvollständig ist
-
-- [ ] **(a) Serialisierung ist ein BENANNTER DoS-Kanal.** Eine PD, die `SYS_LOAD` spammt,
-      verzögert fremde Ladevorgänge. Die Warteschlange braucht eine **Schranke mit benannter
-      Absage** (`ERR_LOAD_BUSY` oder ein Budget je PD) — sonst ist der Wartegrund zwar in der
-      Grund-Menge, die **Fairness** aber ungeregelt. Dieselbe Lehre wie D11: wer eine Kapazität
-      einführt, muss den Überlauf benennen, sonst ist die Schranke kein Schutz, sondern ein Loch.
-
-- [ ] **(b) Der Verifiziererthread erbt die Wasserzeichen-Pflicht — und die `kstack`-Zeile
-      ÄNDERT IHRE BEDEUTUNG.** Seine Stackgrösse ist zu **messen**, nicht zu wählen (die 12 008 B
-      kamen von genau diesem Pfad). Und nach dem Umzug misst die `kstack`-Zeile der Lade-Suite
-      etwas anderes als vorher: der EL0-Höchststand fällt, die Zeile misst dann den **Restpfad**.
-      **Die Umdefinition gehört ins Protokoll**, sonst vergleicht die nächste Messung über einen
-      Bedeutungswechsel hinweg — die 399er-Lehre.
+**Was erledigt ist, in einer Zeile:** `SYS_LOAD` verifiziert nicht mehr auf dem 16-KiB-Kstack des
+Aufrufers, sondern auf dem 64-KiB-Stack eines dedizierten Verifiziererthreads. Der Aufrufer
+blockiert regulär mit dem eigenen Grund `BlockReasons::LOAD` (Z24); der Überlauf der Auftragsschlange
+heisst `ERR_LOAD_BUSY` und lässt den Überläufer **lauffähig**. Gemessen (Lade-Suite, 512M):
+EL0-Kstack **11 992 → 1 312 B**, Verifiziererstack **12 328 / 65 536 B**.
 
 - [ ] **(c) Die „Krypto raus aus dem Kernel"-Frage ist ein EIGENER Entwurf, kein Nebensatz.**
       Die Signaturprüfung ist **Wurzelvertrauen**. Sie kann in eine PD wandern — aber dann ist
@@ -2968,6 +2938,49 @@ drei Fassungen — die Wahl entscheidet nur, welche Fehlerklasse man erbt.
       gegen eine vom Verifizierer signierte Freigabe). Für jetzt reicht der kernlokale Thread;
       die PD-Fassung steht hier als **benannte Option**, damit sie nicht als „haben wir mal
       erwogen" verschwindet.
+
+- [ ] **Aus dem Bau übrig geblieben: `AUFTRAEGE_MAX = 4` ist eine gewählte Zahl, keine
+      hergeleitete.** Sie steht an einer Stelle und im Bericht, aber sie ist Politik: sie sagt, wie
+      lang der DoS-Kanal werden darf, bevor abgewiesen wird. Was fehlt, ist ein **Budget je PD** —
+      heute kann eine einzelne PD alle vier Plätze belegen und fremde Ladevorgänge um genau so viel
+      verzögern, wie ein Ladevorgang dauert. Die Absage ist damit benannt, die **Fairness** ist es
+      nicht.
+
+- [ ] **Und: `heimatkern` ist eine Angabe, kein Beleg.** Der Auftrag trägt den Kern des Aufrufers
+      mit, damit die Platzierung nach dem Umzug dieselbe bleibt — geprüft ist das nur mittelbar
+      (`ladepol` liest Affinität aus dem TCB zurück, aber nur für Programme, die eine im Manifest
+      *haben*). Ein Programm **ohne** Affinität hat heute keine Zeile, die seinen Kern nachliest.
+
+- [ ] **NEU und ernst: `caller_pd` ist seit C8 eine ZAHL AUS DER VERGANGENHEIT.**
+      Vor C8 lief `load_by_index` synchron im Syscall des Aufrufers — die Aufrufer-PD war
+      per Konstruktion am Leben. Jetzt liegt zwischen der Übergabe und der Ausführung ein
+      Scheduling-Fenster, und `caller_pd` ist ein **Index**. Stirbt der Aufrufer in diesem Fenster
+      und wird sein PD-Slot neu vergeben, bindet `create_hardware_backend(caller_pd, ..)` das
+      Treiber-Backend an den **falschen Partner** — und die Cap-Prüfung liefe dabei korrekt durch,
+      genau wie beim Geräte-Fenster in den geteilten Seitenverzeichnissen.
+      **Heute nicht ausgelöst** (der einzige `SYS_LOAD`-Aufrufer der Suiten ist der Root-Task, und
+      der stirbt nicht), aber das ist eine Aussage über die Testfälle, nicht über den Code.
+      Die strukturelle Fassung ist dieselbe wie bei `ThreadId`: der Auftrag müsste eine
+      **generationsbehaftete** PD-Referenz tragen statt eines Index, oder die Ausführung müsste die
+      Identität des Aufrufers vor der Benutzung nachprüfen. Ein Halbfix („ist der Aufrufer noch am
+      Leben?" unmittelbar vor dem Laden) verschiebt das Fenster nur und sieht wie eine Behebung aus.
+
+- [ ] **Die Sprechprobe `laeuft` heisst „wurde gestartet", nicht „lebt".** Sie liest
+      `verifizierer::thread_id().is_some()`, also ein Feld, das `starten()` einmal setzt — nicht das
+      Thread-Directory. Heute ist beides deckungsgleich, und zwar aus einem benennbaren Grund: der
+      Verifizierer hat **keine PD** und es gibt **keine Tcb-Cap** auf ihn, er ist aus Ring 3 also
+      nicht tötbar. Entsteht je ein Weg, ihn zu beenden, wird die Zeile **still falsch** — sie
+      meldete „laeuft", während `uebergeben` Aufträge in eine Schlange legt, die niemand mehr leert
+      (bis `ERR_LOAD_BUSY`). Die Behebung ist eine Zeile (`caprock_sched::is_live`); sie steht hier
+      und nicht im Code, weil sie heute **nicht falsifizierbar** ist — ein Wächter, den keine
+      Gegenprobe erreichen kann, ist eine Behauptung.
+
+- [ ] **Kleiner, aber aus derselben Wurzel: ein Ladeergebnis kann ins Leere gehen.** Stirbt der
+      Aufrufer, während sein Auftrag wartet, wird die PD trotzdem geladen und ihre Id erfährt
+      niemand. Gezählt wird das (`Antwort-ins-Leere` in der `verif`-Zeile, heute 0), aufgeräumt
+      nicht. Zu entscheiden ist, ob ein solcher Auftrag beim Tod des Aufrufers **verworfen** gehört
+      — dann braucht der Sterbepfad einen Griff in die Auftragsschlange, und der ist die Stelle, an
+      der die Sperrordnung noch einmal geprüft werden muss.
 
 ## D13. Die Suite hat Prüfungen, die in WANDUHRZEIT messen — und der Messstand ist überbucht
 **Klasse:** Messstand · **Aufwand:** klein, aber die Abgrenzung ist die eigentliche Arbeit

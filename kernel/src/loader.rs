@@ -1301,12 +1301,24 @@ fn manifest_zahlen_of(program_id: u32) -> Option<(u32, u32, u32, u32)> {
 /// Kernel nicht einhalten kann, hat `policy_gate`/`zahlenpolitik_gate` bereits abgewiesen -- diese
 /// Funktion darf deshalb annehmen, dass jeder Wert gilt. Steht kein Eintrag im Manifest, gilt die
 /// Vorgabe, und die ist bitgleich das Verhalten vor Z11c.
-fn ladepolitik(program_id: u32) -> crate::system::LadePolitik {
+/// **Der Heimatkern ist ab C8 ein Argument, keine Umgebungsgroesse.**
+///
+/// Vorher stand in `LadePolitik.core` ein `None`, und `load_into_pd_mit` las daraufhin
+/// `hal::cpu::core_id()` -- also den Kern dessen, der gerade laed. Bis C8 war das der **Aufrufer**;
+/// seither ist es der Verifiziererthread, und jedes ohne Affinitaet geladene Programm waere
+/// stillschweigend auf dessen Kern gewandert. Eine Platzierungspolitik, die sich als Nebenwirkung
+/// einer Stack-Verschiebung aendert, ist genau die Sorte stiller Aenderung, die dieses Projekt
+/// mehrfach bezahlt hat -- deshalb traegt der Auftrag den Kern des Aufrufers mit.
+fn ladepolitik_auf(program_id: u32, heimatkern: usize) -> crate::system::LadePolitik {
     use crate::system::LadePolitik;
     let farbig = manifest_entry_of(program_id)
         .is_some_and(|(_, f)| f & caprock_loader::manifest::POLICY_EXCLUSIVE_STRIPE != 0);
     let Some((_numa, affin, prio, _budget)) = manifest_zahlen_of(program_id) else {
-        return LadePolitik { farbig, ..LadePolitik::VORGABE };
+        return LadePolitik {
+            farbig,
+            core: Some(heimatkern),
+            ..LadePolitik::VORGABE
+        };
     };
     LadePolitik {
         farbig,
@@ -1315,7 +1327,12 @@ fn ladepolitik(program_id: u32) -> crate::system::LadePolitik {
         // und nicht die niedrigste. Wer wirklich 0 will, sagt es heute nicht unterscheidbar; das
         // ist eine Formatgrenze und steht als solche in `todo.md`.
         prio: if prio == 0 { LadePolitik::VORGABE.prio } else { prio as u8 },
-        core: (affin != caprock_loader::manifest::ANY_CORE).then_some(affin as usize),
+        // Sagt das Manifest nichts, gilt der Kern des AUFRUFERS -- nicht der des Laders (C8).
+        core: Some(if affin != caprock_loader::manifest::ANY_CORE {
+            affin as usize
+        } else {
+            heimatkern
+        }),
         budget_us: 0, // abgewiesen, s. `zahlenpolitik_gate`
     }
 }
@@ -1503,6 +1520,16 @@ pub fn load_image(
     endow: &[(usize, CapPtr)],
     boot_arg: usize,
 ) -> Result<(ThreadId, usize), LoaderError> {
+    load_image_auf(prog, endow, boot_arg, crate::system::eigener_kern())
+}
+
+/// Wie [`load_image`], aber mit **ausdruecklich genanntem Heimatkern** (C8) — s. `load_by_index`.
+pub fn load_image_auf(
+    prog: &Program,
+    endow: &[(usize, CapPtr)],
+    boot_arg: usize,
+    heimatkern: usize,
+) -> Result<(ThreadId, usize), LoaderError> {
     if !verify_image(prog) {
         return Err(LoaderError::Unverified);
     }
@@ -1524,8 +1551,14 @@ pub fn load_image(
     // ist der Grund, warum es aufgefallen ist.
     // Zuordnung Thread -> Programm auf BEIDEN Ladepfaden eintragen, aus demselben Grund wie das
     // A-4.4-Gate und die Ladepolitik daneben: was nur an einem Weg haengt, ist am anderen weg.
-    let r = crate::system::load_elf_mit(&img, domain, endow, boot_arg, ladepolitik(prog.program_id))
-        .ok_or(LoaderError::NoResources)?;
+    let r = crate::system::load_elf_mit(
+        &img,
+        domain,
+        endow,
+        boot_arg,
+        ladepolitik_auf(prog.program_id, heimatkern),
+    )
+    .ok_or(LoaderError::NoResources)?;
     record_program_thread(prog.program_id, r.0);
     Ok(r)
 }
@@ -1540,13 +1573,30 @@ pub fn load_program_into_pd(
     endow: &[(usize, CapPtr)],
     boot_arg: usize,
 ) -> Result<ThreadId, LoaderError> {
+    load_program_into_pd_auf(prog, pd, endow, boot_arg, crate::system::eigener_kern())
+}
+
+/// Wie [`load_program_into_pd`], aber mit **genanntem Heimatkern** (C8) — s. `load_by_index`.
+pub fn load_program_into_pd_auf(
+    prog: &Program,
+    pd: usize,
+    endow: &[(usize, CapPtr)],
+    boot_arg: usize,
+    heimatkern: usize,
+) -> Result<ThreadId, LoaderError> {
     if !verify_image(prog) {
         return Err(LoaderError::Unverified);
     }
     iface_gate(prog.program_id)?; // A-4.4 -- gilt auf BEIDEN Ladepfaden, sonst ist er umgehbar
     let img = ElfImage::parse(prog.elf)?;
-    let tid = crate::system::load_into_pd_mit(&img, pd, endow, boot_arg, ladepolitik(prog.program_id))
-        .ok_or(LoaderError::NoResources)?;
+    let tid = crate::system::load_into_pd_mit(
+        &img,
+        pd,
+        endow,
+        boot_arg,
+        ladepolitik_auf(prog.program_id, heimatkern),
+    )
+    .ok_or(LoaderError::NoResources)?;
     record_program_thread(prog.program_id, tid);
     Ok(tid)
 }
@@ -1697,7 +1747,17 @@ pub fn trust_audit() -> u32 {
 /// `SYS_LOAD`-Callback (ext-26, L2): das Programm mit Index `index` aus dem Boot-Archiv laden +
 /// die `endow`-Caps (vom Dispatch aus dem Aufrufer-Cspace delegiert) in die neue PD endowen. Gibt
 /// die neue PD-Id. Der Dispatch hat die `Loader`-Cap-Autoritaet bereits geprueft.
-pub fn load_by_index(index: u32, caller_pd: usize, endow: &[(usize, CapPtr)]) -> Option<usize> {
+/// **`heimatkern` ist der Kern des AUFRUFERS, nicht der des Ausfuehrenden** (C8). Seit der
+/// Verifiziererthread diese Funktion faehrt, sind die beiden verschieden. `load_into_pd_mit` legt
+/// einen ohne Affinitaet geladenen Thread auf `hal::cpu::core_id()` -- liefe das ueber den
+/// Verifizierer, waere die Platzierungspolitik als Nebenwirkung einer Stack-Verschiebung
+/// stillschweigend eine andere geworden. Ein Manifest-Eintrag mit `core_affinity` sticht weiterhin.
+pub fn load_by_index(
+    index: u32,
+    caller_pd: usize,
+    endow: &[(usize, CapPtr)],
+    heimatkern: usize,
+) -> Option<usize> {
     // **Das Manifest gilt auch hier** (A-5.1 / Z11b). Bis dahin bekamen nur der Root-Task seine
     // Anfangs-Caps aus dem Manifest; alles Weitere lebte von dem, was der Lader delegierte. Damit
     // war das Manifest für alle außer einem Programm ein Wunschzettel: es stand darin, was eine
@@ -1768,7 +1828,7 @@ pub fn load_by_index(index: u32, caller_pd: usize, endow: &[(usize, CapPtr)]) ->
             read_manifest().map(|m| m.count()).unwrap_or_else(|| archive.count()),
         );
         if let Some((hpd, ep, ntfn)) = hardware_backend {
-            let tid = load_program_into_pd(&prog, hpd, endow, arg).ok()?;
+            let tid = load_program_into_pd_auf(&prog, hpd, endow, arg, heimatkern).ok()?;
             // Festhalten, WAS da laeuft -- nicht, was es tut. Ohne diese vier Zahlen liesse sich
             // ein Dienst nicht austauschen, ohne ihn zu kennen.
             set_driver_service(DriverService { ep, ntfn, pd: hpd, tid, index, program_id: prog.program_id });
@@ -1779,7 +1839,7 @@ pub fn load_by_index(index: u32, caller_pd: usize, endow: &[(usize, CapPtr)]) ->
         // was wirklich schiefging (Hash? Zertifikat? Ressourcen? Politik?) stand nirgends. Genau
         // die Form, die dieses Projekt beim Manifest-Format gerade erst behoben hat -- abgewiesen
         // wird richtig, gesagt wird nichts.
-        match load_image(&prog, endow, arg) {
+        match load_image_auf(&prog, endow, arg, heimatkern) {
             Ok((_, pd)) => Some(pd),
             Err(e) => {
                 // **`NoResources` benennt jetzt die Ressource.** Ein Sammelbegriff im Fehlerwert

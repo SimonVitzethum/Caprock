@@ -848,6 +848,20 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   laufen, und ein Cross-Core-Test weckte einen *geparkten* Thread mit dem Wecker für IPC.
   Merkmal der Klasse: Sie fallen nicht beim Gegenlesen auf, sondern in der Suite der Architektur,
   auf der der Zustand oft vorkommt.
+* **Wer zwei Grössen zugleich ändert, darf nicht der bequemeren die Schuld geben.** Eine
+  zusätzliche `println!`-Zeile kippte den Z4f-Checkpoint-Test — reproduzierbar, beim Zurücknehmen
+  weg. Ich schrieb es der **Ausgabelänge** zu (also Wanduhrzeit, passend zu D13) und trug es so
+  ins Register. Falsch: eine Zeile ändert **Ausgabelänge UND Binary**, und die Prüfung las
+  `d[16] != 0`, also das **erste Byte des Kernel-Hashes** — die Zeile testete einen Hashwert.
+  Falsch-Alarm bei 1 von 256 Bauten, blind bei **255 von 256** echten Überschreibungen. Die
+  Zuordnung „reproduziert je Binary" hätte die Zeitthese sofort ausgeschlossen; ich hatte die
+  passende Vorgeschichte und habe die unpassende Beobachtung nicht dagegen gehalten. **Zwei
+  gleichzeitig veränderte Grössen sind zwei Hypothesen, nicht eine.**
+* **Ein Prüfer, der ein einzelnes BYTE liest, prüft ein Byte — nicht die Eigenschaft.** Verglichen
+  werden jetzt die 512 Byte selbst (SHA-256 vor und nach dem Boot): Erkennung **1 von 256** auf
+  **256 von 256**. Und die Bilanzfolge gehört dazu: jedes bisherige PASS dieser Zeile war eine
+  Aussage über ein Hash-Byte — ob der Kernel den Sektor je überschrieben hat, ist für die
+  Vergangenheit **unbeantwortet**, nicht „nein".
 * **WER MISST, SETZT DIE MARKE — der gemessene Pfad darf sie weder setzen noch löschen.** Das ist
   die gemeinsame Wurzel zweier Fehler desselben Tages: die vergiftete Mangel-Marke war **tot**,
   weil jeder `spawn_*`-Pfad sie in seiner ersten Anweisung löschte (zwischen Vergiften und erster

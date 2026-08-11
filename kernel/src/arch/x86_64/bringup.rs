@@ -1881,7 +1881,10 @@ fn sweep_messen_inner() -> bool {
     for pfad in 0..SWEEP_KMAX.len() {
         let mut gefahren = false;
         for k in 0..SWEEP_KMAX[pfad] {
+            // **Der Messende liest die Generation, nicht der gemessene Pfad.**
+            let gen_vor = system::mangel_generation();
             let (gelungen, gefeuert, menge, code, bytes) = sweep_versuch(pfad, k);
+            let gen_nach = system::mangel_generation();
             if !gefeuert {
                 // Der Pfad braucht hoechstens `k` Anforderungen -- er ist zu Ende gefahren.
                 zuende |= 1 << pfad;
@@ -1895,7 +1898,19 @@ fn sweep_messen_inner() -> bool {
                 continue;
             }
             punkte += 1;
-            if code == system::MANGEL_VERGIFTET {
+            // **Geschwiegen wird an der GENERATION gemessen, nicht an der Marke.**
+            //
+            // Die vergiftete Marke war bis zum 2026-08-11 der Melder dafuer -- und sie hing daran,
+            // dass der gemessene Pfad sie nicht loescht. Genau das tat er (erste Anweisung), und
+            // der Ausgang war strukturell unerreichbar. Behoben wurde damals die Loeschung; die
+            // Regel dahinter ist groesser: **wer misst, setzt die Marke -- der gemessene Pfad darf
+            // sie weder setzen noch loeschen.**
+            //
+            // `MANGEL_GEN` waechst nur und wird von niemandem zurueckgesetzt. Der Messende liest
+            // vorher und nachher; `nachher == vorher` heisst geschwiegen, und keine Aenderung am
+            // Pfad kann das entwerten. Die Marke bleibt als zweiter, unabhaengiger Melder stehen
+            // -- zwei Wege zur selben Aussage sind hier billig und decken einander ab.
+            if gen_nach == gen_vor || code == system::MANGEL_VERGIFTET {
                 stumm += 1;
             } else if code == system::MANGEL_KEINER {
                 keiner += 1;

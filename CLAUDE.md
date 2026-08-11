@@ -848,6 +848,22 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   laufen, und ein Cross-Core-Test weckte einen *geparkten* Thread mit dem Wecker für IPC.
   Merkmal der Klasse: Sie fallen nicht beim Gegenlesen auf, sondern in der Suite der Architektur,
   auf der der Zustand oft vorkommt.
+* **WER MISST, SETZT DIE MARKE — der gemessene Pfad darf sie weder setzen noch löschen.** Das ist
+  die gemeinsame Wurzel zweier Fehler desselben Tages: die vergiftete Mangel-Marke war **tot**,
+  weil jeder `spawn_*`-Pfad sie in seiner ersten Anweisung löschte (zwischen Vergiften und erster
+  Anforderung) — „der Pfad hat geschwiegen" war strukturell unerreichbar, während die Zeile es
+  wörtlich versprach; und die `park`-Zeile las eine Grösse, die der gemessene Pfad selbst schrieb.
+  Beide standen auf ALL PASS. **Die strukturelle Fassung ist ein Zähler, der nur wächst**
+  (`MANGEL_GEN`): der Messende liest vorher und nachher, die Differenz ist die Aussage, und keine
+  Refaktorierung des Pfades kann sie entwerten. Ein Rücksetzen im gemessenen Pfad ist immer ein
+  Verdacht.
+* **Eine Zahl, die ein Mensch parallel zur Wahrheit führt, ist dieselbe Klasse wie ein Prüfer, der
+  seine Grösse nachrechnet — auch mit Ratsche.** `MELDESTELLEN` wurde von Hand gepflegt und von
+  einem Wächter gehalten; die Ratsche hat einen Merge-Fehler gefangen (31 gegen 32, weil zwei
+  Zweige unabhängig zählten) und war trotzdem **zwei Gedächtnisse für eine Tatsache**. Seit
+  2026-08-11 leitet `kernel/build.rs` die Zahl aus **einem** Zähler ab; nach einem Merge kann sie
+  nicht mehr falsch sein. Der Wächter wacht seither über die **Ableitung** — dass sie verdrahtet
+  bleibt —, nicht über eine zweite Zahl. Fail-closed: lässt sich nicht zählen, bricht der Bau ab.
 * **Cargo mischt `.cargo/config.toml` aus JEDEM Vorfahrenverzeichnis — und HÄNGT Arrays an.**
   Ein Arbeitsbaum unterhalb eines anderen Checkouts (`<repo>/.claude/worktrees/<id>`) erbt die
   Konfiguration ein zweites Mal; `-Tkernel/x86_64-link.ld` steht dann **zweimal** auf der

@@ -128,6 +128,42 @@ fn main() {
         h ^= byte as u64;
         h = h.wrapping_mul(0x1000_0000_01b3);
     }
+    // ---- 5. Der Meldestellen-Nenner wird ABGELEITET, nicht gefuehrt --------------------------
+    //
+    // `system::MELDESTELLEN` war eine handgepflegte Zahl neben der Wahrheit, gehalten von einer
+    // Ratsche. Die hat am 2026-08-11 einen Merge-Fehler gefangen (31 gegen 32, weil zwei Zweige
+    // unabhaengig zaehlten) -- und war doch dieselbe Klasse wie eine nachgerechnete
+    // Sektion-Segment-Zuordnung: **zwei Gedaechtnisse fuer eine Tatsache**. Jetzt zaehlt genau
+    // EIN Werkzeug (`tools/mangel-zaehlen.py`), und die Zahl kommt hier ins Abbild. Nach einem
+    // Merge kann sie nicht mehr falsch sein.
+    //
+    // **Fail-closed:** laesst sich nicht zaehlen, bricht der Bau ab. Eine Vorgabezahl waere die
+    // Untergrenze, die einspringt, wenn die Messung nichts sieht -- genau die Falle, die der
+    // D0-Speicherregler dieses Projekt schon gekostet hat.
+    println!("cargo:rerun-if-changed=src/system.rs");
+    println!("cargo:rerun-if-changed=../tools/mangel-zaehlen.py");
+    let zaehl = std::process::Command::new("python3")
+        .arg(format!("{manifest}/../tools/mangel-zaehlen.py"))
+        .arg(format!("{manifest}/src/system.rs"))
+        .arg("--nur-zahl")
+        .output();
+    let n: u32 = match &zaehl {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0),
+        _ => 0,
+    };
+    if n == 0 {
+        panic!(
+            "MELDESTELLEN nicht zaehlbar (tools/mangel-zaehlen.py). Der Bau bricht ab, statt eine \n\
+             Vorgabezahl einzusetzen: ein Nenner, der einspringt, wenn die Messung ausfaellt, \n\
+             macht ihren Ausfall unsichtbar -- und die Abdeckungsangabe der `sweep`-Zeile waere \n\
+             dann eine Behauptung."
+        );
+    }
+    println!("cargo:rustc-env=CAPROCK_MELDESTELLEN={n}");
+
     println!("cargo:rustc-env=CAPROCK_FLAGS_FP={h:016x}");
     println!("cargo:rustc-env=CAPROCK_FLAGS_N={}", flags.len());
 }

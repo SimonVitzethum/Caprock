@@ -3913,7 +3913,43 @@ pub const MANGEL_VERGIFTET: u32 = 255;
 /// der Sweep parallel gegen 31 gezaehlt hatte. Beide Aenderungen waren fuer sich richtig, der
 /// Nenner war es nach dem Merge nicht mehr -- und ein falscher Nenner macht aus einer Abdeckung
 /// eine Behauptung. Aufgefallen ist es nicht beim Gegenlesen, sondern in `tools/abnahme.sh`.
-pub const MELDESTELLEN: usize = 32;
+pub const MELDESTELLEN: usize = {
+    // **ABGELEITET, nicht gefuehrt** (2026-08-11). `kernel/build.rs` ruft `tools/mangel-zaehlen.py`
+    // und legt das Ergebnis als `CAPROCK_MELDESTELLEN` ins Abbild. Vorher stand hier eine Zahl,
+    // die ein Mensch parallel zur Wahrheit fuehrte, gehalten von einer Ratsche -- die hat den
+    // Merge-Fehler gefangen (31 gegen 32) und war doch zwei Gedaechtnisse fuer eine Tatsache.
+    // Jetzt wird gelesen. Die Ratsche wacht seither ueber die ABLEITUNG.
+    let b = env!("CAPROCK_MELDESTELLEN").as_bytes();
+    let mut n = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        n = n * 10 + (b[i] - b'0') as usize;
+        i += 1;
+    }
+    n
+};
+
+/// **Wie oft ueberhaupt ein Mangel gemeldet wurde** — die Groesse, an der „der Pfad hat
+/// geschwiegen" haengt, ohne dass jemand eine Marke pflegen muss.
+///
+/// ## Die Regel dahinter: WER MISST, SETZT DIE MARKE
+///
+/// Am 2026-08-11 stand hier eine vergiftete Marke, die der gemessene Pfad in seiner **ersten
+/// Anweisung** loeschte (`mangel_zuruecksetzen()`). Damit war der Ausgang, den sie benennen
+/// sollte, strukturell unerreichbar — und die Berichtszeile versprach ihn woertlich. Dieselbe
+/// Form hatte am selben Tag die `park`-Zeile: sie las eine Groesse, die der gemessene Pfad
+/// selbst schrieb.
+///
+/// **Die gemeinsame Wurzel: der gemessene Pfad durfte die Messgroesse anfassen.** Ein
+/// Zaehler, der nur WAECHST, kann von niemandem zurueckgesetzt werden — der Messende liest ihn
+/// vorher und nachher, und die Differenz ist die Aussage. Keine Refaktorierung des Pfades kann
+/// die Messung mehr entwerten, ohne dass die Differenz sich aendert.
+static MANGEL_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Der Stand des Meldezaehlers. Zweimal lesen, Differenz bilden: `0` heisst **geschwiegen**.
+pub fn mangel_generation() -> u64 {
+    MANGEL_GEN.load(Ordering::Relaxed)
+}
 
 /// `code << 32 | angeforderte_bytes`
 static LADE_MANGEL: AtomicU64 = AtomicU64::new(0);
@@ -3990,6 +4026,10 @@ fn sperre_greift(size: u64) -> bool {
 
 fn mangel(code: u32, bytes: u64) {
     LADE_MANGEL.store((u64::from(code) << 32) | (bytes & 0xffff_ffff), Ordering::Relaxed);
+    // **Der Zaehler zuerst gedacht, dann geschrieben:** er waechst nur und wird von niemandem
+    // zurueckgesetzt -- deshalb kann kein gemessener Pfad die Messung entwerten. `Release`, damit
+    // ein Leser, der die Differenz sieht, auch den Code darunter sieht.
+    MANGEL_GEN.fetch_add(1, Ordering::Release);
 }
 
 /// **Beim EINTRITT in einen Pfad loeschen, der einen Mangel melden koennte.**

@@ -204,6 +204,561 @@ const _: () = assert!(
      `irq_save_disable`/`irq_restore` fuer diese Architektur implementieren."
 );
 
+// --- Die SPERRHALTEDAUER als Zahl mit Schwelle (C9) --------------------------------------------
+//
+// **Warum das Modul HIER steht und nicht in einer eigenen Datei.** `tools/loom-verify.sh` kopiert
+// genau EINE Datei (`crates/caprock-sync/src/lib.rs`) in ein eigenstaendiges Crate; ein zweites
+// Modul waere dort nicht vorhanden, und der Loom-Beweis liesse sich nicht mehr uebersetzen. Die
+// Dateigrenze ist damit keine Stilfrage, sondern eine Bedingung des Tier-2-Gates.
+//
+// **Warum die Messung nicht aus `caprock-hal` kommt** (obwohl es dort `timer::cycles()` gibt, und
+// zwar mit zwischengespeicherter Merkmalserkennung): `caprock-sync` ist ABHAENGIGKEITSFREI, und
+// beide Beweis-Gates haengen genau daran. `tools/kani-verify.sh` baut die Crate mit einem
+// erzeugten Manifest ohne `[dependencies]`, `tools/loom-verify.sh` ebenso. Eine Kante
+// `caprock-sync -> caprock-hal` risse **beide** Gates, und zwar mit einem Uebersetzungsfehler in
+// $TMPDIR, den niemand mit dieser Zeile in Verbindung braechte.
+//
+// Der Grund hinter dem Auftrag bleibt trotzdem gewahrt, und er heisst nicht „nimm die HAL",
+// sondern **„kein `cpuid` im heissen Pfad"**: `zyklen()` unten fuehrt ueberhaupt keine
+// Merkmalserkennung durch. Es liest den Zaehler, den die HAL auf derselben Architektur liest
+// (x86: TSC, aarch64: `CNTPCT_EL0`) -- nur ohne die serialisierende Klammer. S. dort.
+pub mod sperrwacht {
+    //! **Wie lange war der Kern am Stueck mit maskierten Interrupts unterbrechbarkeitsfrei?**
+    //!
+    //! # Warum es das gibt
+    //!
+    //! [`SpinLock::lock`](super::SpinLock::lock) maskiert die IRQs des eigenen Kerns (s.
+    //! Modulanfang) und der Guard gibt sie beim `Drop` wieder frei. Zwischen diesen beiden Punkten
+    //! kann dieser Kern **nicht praemptiert werden** -- kein Timer-Tick, keine Umplanung, keine
+    //! Zustellung. Diese Dauer ist die Latenzzusage eines Mikrokerns, und sie war bis hierher eine
+    //! **unsichtbare Groesse**: kein Zaehler, keine Schwelle, keine Pruefzeile.
+    //!
+    //! Der Anlass ist gemessen und steht in `CLAUDE.md`: im C8-Verifizierer haette
+    //! `while let Some(a) = SCHLANGE.lock().entnehmen() { laden(&a) }` die gesamte
+    //! Ed25519-/SHA-2-Pruefung unter der Sperre gefahren, weil der Guard eines
+    //! `while let`-Scrutinees bis zum ENDE DES RUMPFES lebt. Die Suite war gruen, jeder Messwert
+    //! stimmte, und das Latenzloch sah **keine** Pruefzeile an. Gefunden wurde es mit einem
+    //! `Drop`-Zeugen von Hand -- also durch Glueck, nicht durch einen Mechanismus.
+    //!
+    //! # Was gemessen wird
+    //!
+    //! Das **Maximum** ueber alle Sperrhaltungen, mit der **Stelle**, an der es entstand
+    //! (`#[track_caller]` -> Datei + Zeile des `lock()`-Aufrufs). Eine Zahl ohne Ort waere ein
+    //! Alarm ohne Adresse -- genau die Form, an der dieses Projekt bei „Hoechststand 12008 B"
+    //! schon einmal gelernt hat, dass ein Rekord ohne Subjekt unauffindbar bleibt.
+    //!
+    //! Das Fenster ist **`irq_save_disable()` bis kurz vor `irq_restore()`**, also die wirklich
+    //! maskierte Zeit einschliesslich des Wartens auf das Ticket. Das ist Absicht: wer 200 000
+    //! Zyklen auf einen fremden Halter wartet, ist genauso lange nicht praemptierbar wie der
+    //! Halter selbst.
+    //!
+    //! **Verschachtelte Guards messen jeder ihr eigenes Fenster.** Der aeussere schliesst den
+    //! inneren ein und ist damit die wahre maskierte Dauer -- er gewinnt das Maximum, und das ist
+    //! richtig so.
+    //!
+    //! # Was es NICHT sieht (und das gehoert in die Zeile, nicht in eine Fussnote)
+    //!
+    //! * **Maskierung ohne Sperre.** `local_irq_disable()` von Hand, Trap-Kontext, der Panikpfad
+    //!   -- dort ist ebenfalls nicht praemptierbar, und diese Marke schweigt dazu. Sie misst
+    //!   Sperrhaltedauer, nicht Maskierungsdauer.
+    //! * **Den zweitlaengsten Halter.** Gehalten wird EIN Maximum je Lauf, nicht eine Verteilung.
+    //! * **Die Zeit zwischen zwei Messungen.** Ein Kern, der lange gar keine Sperre nimmt, faellt
+    //!   hier nicht auf.
+    //!
+    //! # Fail-closed
+    //!
+    //! Faellt die Messung aus, ist der Hoechststand `0` -- und `0` ist von „alles kurz" nicht zu
+    //! unterscheiden. Dagegen stehen drei Dinge: [`MESSUNG_VORHANDEN`] (die Architektur hat
+    //! ueberhaupt einen Zaehler), [`Stand::gesehen`] (es wurde ueberhaupt eine Sperrhaltung
+    //! gemessen) und die Eichung im Kernel (das Messgeraet trennt bekannte Dauern). Erst die drei
+    //! zusammen unterscheiden ein arbeitendes Messgeraet von einem stummen.
+
+    #[cfg(feature = "sperrwacht")]
+    use core::panic::Location;
+    #[cfg(feature = "sperrwacht")]
+    use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+
+    // ------------------------------------------------------------------------------------------
+    // DER ZEITSTEMPEL -- ohne `cpuid`, ohne Merkmalserkennung, ohne Abhaengigkeit
+    // ------------------------------------------------------------------------------------------
+
+    /// Traegt diese Uebersetzung ueberhaupt einen Zaehler? `false` heisst **nicht gemessen** und
+    /// muss im Urteil als solches ausscheiden -- niemals als „alles kurz".
+    #[cfg(all(feature = "sperrwacht", target_arch = "x86_64", target_os = "none"))]
+    pub const MESSUNG_VORHANDEN: bool = true;
+    #[cfg(all(feature = "sperrwacht", target_arch = "aarch64"))]
+    pub const MESSUNG_VORHANDEN: bool = true;
+    #[cfg(any(
+        not(feature = "sperrwacht"),
+        not(any(all(target_arch = "x86_64", target_os = "none"), target_arch = "aarch64"))
+    ))]
+    pub const MESSUNG_VORHANDEN: bool = false;
+
+    /// Ein Zyklenstempel des **heissen Pfads**.
+    ///
+    /// **Bewusst NICHT die serialisierende Fassung aus `caprock_hal::timer::cycles()`.** Die
+    /// klammert mit `rdtscp`/`lfence` (x86) bzw. `isb` (aarch64), weil sie fuer *kurze* Sektionen
+    /// gebaut ist, deren Grenzen sonst verrutschen. Hier ist die Lage umgekehrt:
+    ///
+    /// * Gemessen wird gegen eine Schwelle von **einem Timer-Tick** (10 ms, also zweistellige
+    ///   Millionen Zyklen). Ein paar Dutzend Zyklen Verschiebung an den Raendern aendern an dem
+    ///   Urteil nichts -- die Klammer kostete Genauigkeit, die niemand liest.
+    /// * Dieser Pfad laeuft in **jedem** Syscall. `lfence` und `isb` sind genau dort teuer.
+    ///
+    /// Was hier ausdruecklich NICHT passiert, ist `cpuid`: unter KVM ist das ein bedingungsloser
+    /// VM-Exit (gemessen: 3556 statt 51 Zyklen), und deshalb faellt auch die
+    /// `rdtscp`-Verfuegbarkeitsfrage weg -- `rdtsc` gibt es seit dem Pentium.
+    #[cfg(all(feature = "sperrwacht", target_arch = "x86_64", target_os = "none"))]
+    #[inline(always)]
+    pub fn zyklen() -> u64 {
+        // SAFETY: `rdtsc` ist ein reiner Lesebefehl ohne Speicherwirkung; er ist auf jedem
+        // 64-Bit-x86 vorhanden und in Ring 0 nie gesperrt (CR4.TSD betrifft nur Ring > 0).
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+
+    /// aarch64: derselbe Zaehler, den `caprock_hal::aarch64::timer::cycles()` liest -- damit passt
+    /// die Schwelle (aus `cycles_per_sec()`) zur Messung. Ohne das `isb`, s. x86-Fassung.
+    #[cfg(all(feature = "sperrwacht", target_arch = "aarch64"))]
+    #[inline(always)]
+    pub fn zyklen() -> u64 {
+        let v: u64;
+        // SAFETY: `CNTPCT_EL0` ist ein architektonisch definiertes, nur lesbares Systemregister.
+        unsafe {
+            core::arch::asm!("mrs {v}, cntpct_el0", v = out(reg) v, options(nomem, nostack));
+        }
+        v
+    }
+
+    /// Host-/Loom-/Kani-Ziele: kein Zaehler. Gibt `0`, und [`MESSUNG_VORHANDEN`] ist dort `false`
+    /// -- das Urteil im Kernel scheidet diesen Fall ausdruecklich aus.
+    #[cfg(all(
+        feature = "sperrwacht",
+        not(any(all(target_arch = "x86_64", target_os = "none"), target_arch = "aarch64"))
+    ))]
+    #[inline(always)]
+    pub fn zyklen() -> u64 {
+        0
+    }
+
+    /// **Ohne das Feature gibt es die Funktion trotzdem** -- sie gibt `0`.
+    ///
+    /// Das ist keine Bequemlichkeit, sondern die Bedingung fuer das A/B: die Aufschlagsmessung im
+    /// Kernel muss in **beiden** Bauten uebersetzen, sonst gibt es keine Vergleichszahl. Eine
+    /// Messung, die nur im gemessenen Zustand laeuft, kann den Aufschlag nicht kennen.
+    #[cfg(not(feature = "sperrwacht"))]
+    #[inline(always)]
+    pub fn zyklen() -> u64 {
+        0
+    }
+
+    // **Waechter der Auswahl, dieselbe Bauform wie `IRQ_MASKING_IMPLEMENTED` oben.** Wer die
+    // Wacht auf einem Bare-Metal-Ziel einschaltet, fuer das es keinen Zaehler gibt, bekommt einen
+    // Uebersetzungsfehler statt einer Zeile, die dauerhaft `0` meldet. Eine ausgefallene Messung
+    // sieht sonst genau wie ein gesundes System aus.
+    #[cfg(all(feature = "sperrwacht", target_os = "none"))]
+    const _: () = assert!(
+        MESSUNG_VORHANDEN,
+        "sperrwacht auf einem Bare-Metal-Ziel ohne Zyklenzaehler: die Marke meldete dauerhaft 0, \
+         und 0 ist von 'alles kurz' nicht zu unterscheiden. `zyklen()` fuer diese Architektur \
+         implementieren oder das Feature dort nicht setzen."
+    );
+
+    // ------------------------------------------------------------------------------------------
+    // DAS WASSERZEICHEN
+    // ------------------------------------------------------------------------------------------
+
+    /// Wieviele Sperrhaltungen wurden ueberhaupt gemessen (seit Beginn, ueber alle Kerne).
+    #[cfg(feature = "sperrwacht")]
+    static GESEHEN: AtomicU64 = AtomicU64::new(0);
+    /// Stand von [`GESEHEN`] bei der letzten Ruecksetzung -- `gesehen_seit` ist die Differenz.
+    #[cfg(feature = "sperrwacht")]
+    static GESEHEN_BASIS: AtomicU64 = AtomicU64::new(0);
+    /// Laengste gemessene Sperrhaltung **seit der Ruecksetzung**, in Zyklen.
+    #[cfg(feature = "sperrwacht")]
+    static MAX: AtomicU64 = AtomicU64::new(0);
+    /// Die Stelle dazu (`lock()`-Aufrufer). Nullzeiger = keine.
+    #[cfg(feature = "sperrwacht")]
+    static STELLE: AtomicPtr<Location<'static>> = AtomicPtr::new(core::ptr::null_mut());
+    /// Laengste Sperrhaltung **ohne die erklaerten Schuldner** (s. [`schulden_setzen`]).
+    ///
+    /// **Warum es diesen zweiten Kanal gibt.** Es gibt genau EIN Maximum. Ein bekannter,
+    /// erklaerter Langhalter belegt es dauerhaft und **verdeckt damit alles darunter** -- eine
+    /// neue, kuerzere, aber trotzdem verbotene Haltung waere unsichtbar, und die Zeile bliebe
+    /// stumm, obwohl sie spricht. Das ist dieselbe Form wie „eine rote Zeile faerbt die Suite und
+    /// macht sie fuer alles andere unbrauchbar", nur andersherum.
+    ///
+    /// Dieser Kanal laesst die erklaerten Stellen aus. Gegen ihn laeuft die eigentliche Schwelle;
+    /// die Schuldner werden getrennt gegen ihren eigenen Deckel geprueft.
+    #[cfg(feature = "sperrwacht")]
+    static MAX_BEREINIGT: AtomicU64 = AtomicU64::new(0);
+    /// Die Stelle dazu.
+    #[cfg(feature = "sperrwacht")]
+    static STELLE_BEREINIGT: AtomicPtr<Location<'static>> = AtomicPtr::new(core::ptr::null_mut());
+    /// Laengste Sperrhaltung **vor** der Ruecksetzung (Hochlauf) -- gerettet, nicht verworfen.
+    #[cfg(feature = "sperrwacht")]
+    static MAX_HOCHLAUF: AtomicU64 = AtomicU64::new(0);
+    /// Die Stelle dazu.
+    #[cfg(feature = "sperrwacht")]
+    static STELLE_HOCHLAUF: AtomicPtr<Location<'static>> = AtomicPtr::new(core::ptr::null_mut());
+    /// Wie oft wurde der Hochlauf abgeschlossen. **Eine Ratsche:** das Urteil verlangt genau `1`
+    /// (die Eichung). Wer eine rote Zeile durch ein zweites Leerraeumen gruen macht, faellt auf.
+    #[cfg(feature = "sperrwacht")]
+    static HOCHLAUF_ABSCHLUESSE: AtomicU64 = AtomicU64::new(0);
+    /// Wie oft wurde ein Eich-Artefakt verworfen. Dieselbe Ratsche fuer den zweiten Weg.
+    #[cfg(feature = "sperrwacht")]
+    static EICH_VERWERFUNGEN: AtomicU64 = AtomicU64::new(0);
+    /// Wie oft lief der Zaehler **rueckwaerts** (Zeitstempel des Endes kleiner als der des
+    /// Anfangs). Das darf auf einem Kern nicht vorkommen; `> 0` ist ein Befund ueber den
+    /// Zeitgeber (Migration mitten in der Sektion ist ausgeschlossen -- IRQs sind maskiert).
+    ///
+    /// **Kein `wrapping_sub`.** Ein um 100 Zyklen zurueckspringender Zaehler ergaebe rund `2^64`,
+    /// und diese Zahl risse jede Schwelle -- „rueckwaerts" heisst **verworfen und gezaehlt**.
+    #[cfg(feature = "sperrwacht")]
+    static RUECKWAERTS: AtomicU64 = AtomicU64::new(0);
+
+    /// Ein **erklaerter Langhalter**: eine Datei, ein Grund, ein eigener Deckel.
+    ///
+    /// **Je Posten ein eigener Deckel, und das ist keine Kosmetik.** Ein gemeinsamer Deckel waere
+    /// eine Zahl fuer zwei Tatsachen: der grosszuegigste Posten deckte alle anderen mit ab, und
+    /// ein Schuldner koennte um das Sechzigfache wachsen, ohne dass eine Zeile spricht. Dieselbe
+    /// Form wie ein Bit, das zwei Gruende traegt.
+    pub struct Schuldposten {
+        /// Die Datei, deren `lock()`-Aufrufe ausgenommen sind.
+        pub datei: &'static str,
+        /// Hoechstwert, den dieser Posten haben darf, in Zyklen. **Ratsche: darf nur fallen.**
+        pub deckel: u64,
+        /// Warum das hier steht — im Bericht sichtbar, nicht in einem Kommentar versteckt.
+        pub grund: &'static str,
+    }
+
+    /// Die **erklaerten Langhalter** — eine Menge von NAMEN, keine Zahl.
+    ///
+    /// Eine Kardinalzahl waere hier eine Ratsche mit einem Loch: sie griffe gegen Zuwachs, nicht
+    /// gegen **Austausch** — und Austausch fuehlt sich beim Umbauen wie Fortschritt an. Dieselbe
+    /// Lehre wie bei `IDENTITY_DEBTS`.
+    pub struct Schuldliste {
+        /// Die Posten, in der Reihenfolge ihrer Messplaetze.
+        pub posten: &'static [Schuldposten],
+    }
+
+    /// Wieviele Schuldposten je einen eigenen Messplatz bekommen. Mehr Posten sind erlaubt, aber
+    /// ohne eigenen Hoechststand — deshalb prueft [`schulden_setzen`] die Laenge (s. dort).
+    pub const SCHULD_PLAETZE: usize = 8;
+
+    /// Die gesetzte Liste (Nullzeiger = keine; dann sind beide Kanaele identisch).
+    #[cfg(feature = "sperrwacht")]
+    static SCHULDEN: AtomicPtr<Schuldliste> = AtomicPtr::new(core::ptr::null_mut());
+
+    /// Hoechststand **je Schuldposten** — der Deckel wird gegen diese Zahl geprueft.
+    #[cfg(feature = "sperrwacht")]
+    static SCHULD_MAX: [AtomicU64; SCHULD_PLAETZE] =
+        [const { AtomicU64::new(0) }; SCHULD_PLAETZE];
+
+    /// Die erklaerten Langhalter hinterlegen. **Einmal beim Hochlauf**, vor SMP.
+    ///
+    /// Was hier steht, ist eine **benannte, datierte Schuld** und keine stille Ausnahme: der
+    /// Bericht druckt Liste, Gruende und Deckel, und das Urteil laesst keinen Posten wachsen.
+    ///
+    /// Gibt `false`, wenn die Liste mehr Posten hat als es Messplaetze gibt — dann bekaemen die
+    /// ueberzaehligen keinen eigenen Hoechststand und waeren **ausgenommen, ohne geprueft zu
+    /// werden**. Das ist genau die Sorte stiller Freibrief, gegen die die Liste angetreten ist;
+    /// der Aufrufer laesst sein Urteil daran scheitern.
+    #[cfg(feature = "sperrwacht")]
+    #[must_use]
+    pub fn schulden_setzen(l: &'static Schuldliste) -> bool {
+        if l.posten.len() > SCHULD_PLAETZE {
+            return false;
+        }
+        SCHULDEN.store(l as *const _ as *mut _, Ordering::Release);
+        true
+    }
+
+    #[cfg(not(feature = "sperrwacht"))]
+    #[must_use]
+    pub fn schulden_setzen(l: &'static Schuldliste) -> bool {
+        l.posten.len() <= SCHULD_PLAETZE
+    }
+
+    /// Auf welchem Messplatz steht diese Stelle (`None` = kein Schuldner)?
+    ///
+    /// Laeuft **nur im seltenen Zweig** (wenn ein neuer bereinigter Hoechststand anstuende), nicht
+    /// bei jeder Freigabe -- der Zeichenkettenvergleich kostet den heissen Pfad damit nichts.
+    #[cfg(feature = "sperrwacht")]
+    fn schuldplatz(stelle: &'static Location<'static>) -> Option<usize> {
+        let raw = SCHULDEN.load(Ordering::Acquire);
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: in `SCHULDEN` landet ausschliesslich ein `&'static Schuldliste` aus
+        // `schulden_setzen`; der Zeiger wird als Ganzes atomar geschrieben und gelesen.
+        let l: &'static Schuldliste = unsafe { &*(raw as *const Schuldliste) };
+        l.posten.iter().position(|p| p.datei == stelle.file())
+    }
+
+    /// Hoechststand eines Schuldpostens (nach Messplatz).
+    ///
+    /// **Was diese Zahl ist und was nicht:** sie wird nur fortgeschrieben, wenn die Haltung
+    /// groesser war als der bereinigte Hoechststand — sie ist also eine **Untergrenze**. Fuer den
+    /// Zweck reicht das genau: ueberschreitet ein Schuldner die Schwelle, liegt er zwangslaeufig
+    /// ueber dem bereinigten Hoechststand (der in einem gesunden Lauf darunter bleibt) und wird
+    /// damit erfasst. Ein Schuldner unterhalb des bereinigten Hoechststands ist erst recht
+    /// unterhalb der Schwelle.
+    #[cfg(feature = "sperrwacht")]
+    pub fn schuld_hoechststand(platz: usize) -> u64 {
+        SCHULD_MAX
+            .get(platz)
+            .map_or(0, |a| a.load(Ordering::Relaxed))
+    }
+
+    #[cfg(not(feature = "sperrwacht"))]
+    pub fn schuld_hoechststand(_platz: usize) -> u64 {
+        0
+    }
+
+    /// Was der Anfang einer Sperrhaltung festhaelt. Liegt im Guard, nicht in einem `static` --
+    /// eine per-Kern-Ablage waere hier falsch, weil Guards **verschachteln**.
+    #[cfg(feature = "sperrwacht")]
+    #[derive(Clone, Copy)]
+    pub struct Wacht {
+        t0: u64,
+        stelle: &'static Location<'static>,
+    }
+
+    /// Ohne Feature ein ZST: der Guard waechst nicht, der Code verschwindet.
+    #[cfg(not(feature = "sperrwacht"))]
+    #[derive(Clone, Copy)]
+    pub struct Wacht;
+
+    /// Anfang einer Sperrhaltung -- **unmittelbar nach** dem Maskieren zu rufen.
+    ///
+    /// `#[track_caller]` reicht die Stelle des `lock()`-**Aufrufers** durch (die Attribute
+    /// propagieren ueber `lock()` hinweg). Der Preis ist ein impliziter Zeiger je Aufruf, kein
+    /// Laufzeitcode: `Location::caller()` liest eine statische Struktur.
+    #[cfg(feature = "sperrwacht")]
+    #[track_caller]
+    #[inline(always)]
+    pub fn beginn() -> Wacht {
+        Wacht {
+            t0: zyklen(),
+            stelle: Location::caller(),
+        }
+    }
+
+    #[cfg(not(feature = "sperrwacht"))]
+    #[inline(always)]
+    pub fn beginn() -> Wacht {
+        Wacht
+    }
+
+    /// Ende einer Sperrhaltung -- **unmittelbar vor** dem Wiederherstellen der IRQ-Maske.
+    ///
+    /// Was hinter diesem Punkt noch maskiert laeuft (dieser Funktionsrumpf und `irq_restore`),
+    /// geht in die Zahl nicht ein. Die Marke unterschaetzt damit um eine Handvoll Zyklen; sie
+    /// **ueberschaetzt nie**, und das ist die Richtung, die zu einer Schwelle passt.
+    #[cfg(feature = "sperrwacht")]
+    #[inline(always)]
+    pub fn ende(w: Wacht) {
+        let t1 = zyklen();
+        if t1 < w.t0 {
+            RUECKWAERTS.fetch_add(1, Ordering::Relaxed);
+            return; // verworfen, nicht „fast einmal herum"
+        }
+        let dauer = t1 - w.t0;
+        GESEHEN.fetch_add(1, Ordering::Relaxed);
+        // **Der Vergleich VOR dem Schreiben ist der Grund, warum das im heissen Pfad tragbar ist.**
+        // Ein `fetch_max` je Freigabe waere ein Schreibzugriff auf eine geteilte Cachezeile aus
+        // jedem Kern; der `load` hier laesst die Zeile geteilt (`Relaxed`, also ein L1-Treffer),
+        // und geschrieben wird nur bei einem echten neuen Hoechststand -- logarithmisch selten.
+        if dauer > MAX.load(Ordering::Relaxed) {
+            // Das Rennen zweier Kerne um denselben neuen Hoechststand ist bekannt und
+            // hingenommen: `fetch_max` haelt die ZAHL korrekt, die Stelle kann in diesem Fall vom
+            // Verlierer stammen. Fuer eine Diagnose reicht das -- ein Lock an dieser Stelle waere
+            // eine Sperre im Freigabepfad jeder Sperre.
+            if MAX.fetch_max(dauer, Ordering::Relaxed) < dauer {
+                STELLE.store(w.stelle as *const _ as *mut _, Ordering::Relaxed);
+            }
+        }
+        // Der bereinigte Kanal: derselbe Vergleich, aber die erklaerten Schuldner bleiben draussen
+        // und landen stattdessen auf ihrem eigenen Messplatz. `schuldplatz` laeuft erst hinter dem
+        // `load` -- also nur, wenn ohnehin ein neuer Hoechststand anstuende, und das ist
+        // logarithmisch selten. Der Zeichenkettenvergleich kostet den heissen Pfad damit nichts.
+        if dauer > MAX_BEREINIGT.load(Ordering::Relaxed) {
+            match schuldplatz(w.stelle) {
+                Some(i) => {
+                    SCHULD_MAX[i].fetch_max(dauer, Ordering::Relaxed);
+                }
+                None => {
+                    if MAX_BEREINIGT.fetch_max(dauer, Ordering::Relaxed) < dauer {
+                        STELLE_BEREINIGT.store(w.stelle as *const _ as *mut _, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "sperrwacht"))]
+    #[inline(always)]
+    pub fn ende(_w: Wacht) {}
+
+    /// Der Messstand.
+    #[derive(Clone, Copy)]
+    pub struct Stand {
+        /// Gemessene Sperrhaltungen **seit der Ruecksetzung**. `0` heisst „nichts gemessen" und
+        /// darf nie wie „alles kurz" gelesen werden.
+        pub gesehen: u64,
+        /// Gemessene Sperrhaltungen insgesamt (einschliesslich vor der Ruecksetzung).
+        pub gesehen_gesamt: u64,
+        /// Laengste Sperrhaltung seit der Ruecksetzung, in Zyklen.
+        pub max: u64,
+        /// Datei der laengsten Sperrhaltung (`""` = keine).
+        pub datei: &'static str,
+        /// Zeile dazu (`0` = keine).
+        pub zeile: u32,
+        /// Laengste Sperrhaltung **ohne die erklaerten Schuldner** — gegen DIESE Zahl laeuft die
+        /// Schwelle, damit ein bekannter Langhalter nicht alles darunter verdeckt.
+        pub max_bereinigt: u64,
+        /// Datei dazu (`""` = keine).
+        pub datei_bereinigt: &'static str,
+        /// Zeile dazu (`0` = keine).
+        pub zeile_bereinigt: u32,
+        /// Laengste Sperrhaltung **vor** der Ruecksetzung (Hochlauf).
+        pub max_hochlauf: u64,
+        /// Datei dazu.
+        pub datei_hochlauf: &'static str,
+        /// Zeile dazu.
+        pub zeile_hochlauf: u32,
+        /// Wie oft wurde der Hochlauf abgeschlossen (muss genau `1` sein: die Eichung).
+        pub hochlauf_abschluesse: u64,
+        /// Wie oft wurde ein Eich-Artefakt verworfen (muss genau `1` sein: die Eichung).
+        pub eich_verwerfungen: u64,
+        /// Wie oft lief der Zaehler rueckwaerts (muss `0` sein).
+        pub rueckwaerts: u64,
+    }
+
+    /// Einen Zeigerplatz in Datei/Zeile aufloesen.
+    #[cfg(feature = "sperrwacht")]
+    fn ort(p: &AtomicPtr<Location<'static>>) -> (&'static str, u32) {
+        let raw = p.load(Ordering::Relaxed);
+        if raw.is_null() {
+            return ("", 0);
+        }
+        // SAFETY: in `STELLE`/`STELLE_HOCHLAUF` landet ausschliesslich ein `&'static
+        // Location<'static>` aus `Location::caller()` -- ein Zeiger auf statische Daten, der die
+        // ganze Laufzeit gueltig bleibt. Der Zeiger wird als GANZES atomar geschrieben und
+        // gelesen; es gibt kein Paar, das zerreissen koennte (genau deshalb ein `AtomicPtr` und
+        // nicht ein `str`-Zeiger nebst Laenge in zwei Zellen).
+        let l: &'static Location<'static> = unsafe { &*(raw as *const Location<'static>) };
+        (l.file(), l.line())
+    }
+
+    /// Den Messstand lesen.
+    #[cfg(feature = "sperrwacht")]
+    pub fn stand() -> Stand {
+        let (datei, zeile) = ort(&STELLE);
+        let (datei_bereinigt, zeile_bereinigt) = ort(&STELLE_BEREINIGT);
+        let (datei_hochlauf, zeile_hochlauf) = ort(&STELLE_HOCHLAUF);
+        let gesamt = GESEHEN.load(Ordering::Relaxed);
+        Stand {
+            gesehen: gesamt.saturating_sub(GESEHEN_BASIS.load(Ordering::Relaxed)),
+            gesehen_gesamt: gesamt,
+            max: MAX.load(Ordering::Relaxed),
+            datei,
+            zeile,
+            max_bereinigt: MAX_BEREINIGT.load(Ordering::Relaxed),
+            datei_bereinigt,
+            zeile_bereinigt,
+            max_hochlauf: MAX_HOCHLAUF.load(Ordering::Relaxed),
+            datei_hochlauf,
+            zeile_hochlauf,
+            hochlauf_abschluesse: HOCHLAUF_ABSCHLUESSE.load(Ordering::Relaxed),
+            eich_verwerfungen: EICH_VERWERFUNGEN.load(Ordering::Relaxed),
+            rueckwaerts: RUECKWAERTS.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Ohne Feature: alles `0`/leer. Das Urteil im Kernel faellt darueber durch
+    /// ([`MESSUNG_VORHANDEN`] ist `false`), statt „alles kurz" zu melden.
+    #[cfg(not(feature = "sperrwacht"))]
+    pub fn stand() -> Stand {
+        Stand {
+            gesehen: 0,
+            gesehen_gesamt: 0,
+            max: 0,
+            datei: "",
+            zeile: 0,
+            max_bereinigt: 0,
+            datei_bereinigt: "",
+            zeile_bereinigt: 0,
+            max_hochlauf: 0,
+            datei_hochlauf: "",
+            zeile_hochlauf: 0,
+            hochlauf_abschluesse: 0,
+            eich_verwerfungen: 0,
+            rueckwaerts: 0,
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // DIE ZWEI SCHNITTE -- beide vom MESSENDEN, beide gezaehlt, beide mit eigenem Namen
+    // ------------------------------------------------------------------------------------------
+    //
+    // **Warum zwei Funktionen und nicht eine mit einem Schalter.** `zuruecksetzen(retten: bool)`
+    // waere ein waehlbares Argument an einer Stelle, an der die Wahl die Bedeutung traegt -- genau
+    // die Form, die `Va::identity(reason, pa)` gekostet hat. Zwei Namen sind nicht verwechselbar.
+    //
+    // **Warum das kein „Marke im gemessenen Pfad loeschen" ist:** geschnitten wird vom MESSENDEN
+    // (der Eichung), nicht vom gemessenen Pfad -- genau die Trennung, an der `MANGEL_VERGIFTET`
+    // gescheitert ist. Beide Schnitte tragen eine Ratsche; das Urteil im Kernel verlangt von
+    // jedem exakt `1`.
+
+    /// **Den Hochlauf abschliessen** -- der bisherige Hoechststand wird nach `MAX_HOCHLAUF`
+    /// **gerettet, nicht verworfen**, und der Live-Kanal faengt sauber an.
+    ///
+    /// Ohne diesen Schnitt muesste die Eichung ihre kuenstliche Haltung gegen einen unbekannten
+    /// Vorstand messen; mit ihm ist der Vorstand `0` und die Aussage „genau diese Dauer wurde
+    /// gemeldet" ueberhaupt formulierbar. Was der Hochlauf gehalten hat, bleibt im Bericht
+    /// sichtbar und geht in das Urteil ein -- es ist der Abschnitt mit den laengsten Sperren.
+    #[cfg(feature = "sperrwacht")]
+    pub fn hochlauf_abschliessen() {
+        MAX_HOCHLAUF.store(MAX.load(Ordering::Relaxed), Ordering::Relaxed);
+        STELLE_HOCHLAUF.store(STELLE.load(Ordering::Relaxed), Ordering::Relaxed);
+        MAX.store(0, Ordering::Relaxed);
+        STELLE.store(core::ptr::null_mut(), Ordering::Relaxed);
+        MAX_BEREINIGT.store(0, Ordering::Relaxed);
+        STELLE_BEREINIGT.store(core::ptr::null_mut(), Ordering::Relaxed);
+        GESEHEN_BASIS.store(GESEHEN.load(Ordering::Relaxed), Ordering::Relaxed);
+        HOCHLAUF_ABSCHLUESSE.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(not(feature = "sperrwacht"))]
+    pub fn hochlauf_abschliessen() {}
+
+    /// **Das Artefakt der Eichung verwerfen** und seinen Wert zurueckgeben.
+    ///
+    /// Die Eichung haelt eine Sperre fuer eine bekannte, absichtlich lange Dauer. Bliebe sie
+    /// stehen, nennte die Berichtszeile auf Dauer die Eichung selbst als laengsten Halter -- eine
+    /// Adresse, die niemandem hilft, und eine Zahl, die kein Befund ist.
+    ///
+    /// Verworfen wird **nicht stillschweigend**: der Rueckgabewert steht im Bericht, damit
+    /// nachlesbar bleibt, was das Messgeraet an sich selbst gemessen hat.
+    #[cfg(feature = "sperrwacht")]
+    pub fn eichung_verwerfen() -> u64 {
+        let v = MAX.load(Ordering::Relaxed);
+        MAX.store(0, Ordering::Relaxed);
+        STELLE.store(core::ptr::null_mut(), Ordering::Relaxed);
+        MAX_BEREINIGT.store(0, Ordering::Relaxed);
+        STELLE_BEREINIGT.store(core::ptr::null_mut(), Ordering::Relaxed);
+        GESEHEN_BASIS.store(GESEHEN.load(Ordering::Relaxed), Ordering::Relaxed);
+        EICH_VERWERFUNGEN.fetch_add(1, Ordering::Relaxed);
+        v
+    }
+
+    #[cfg(not(feature = "sperrwacht"))]
+    pub fn eichung_verwerfen() -> u64 {
+        0
+    }
+}
+
 /// Fairer Ticket-Spinlock.
 ///
 /// Wer zuerst zieht, kommt zuerst dran (FIFO) — das ist deterministischer als
@@ -251,10 +806,17 @@ impl<T> SpinLock<T> {
 impl<T: ?Sized> SpinLock<T> {
     /// Sperrt und gibt einen Guard zurück, der beim Verlassen automatisch
     /// freigibt.
+    ///
+    /// `#[track_caller]` (nur mit `sperrwacht`) reicht die **Stelle** dieses Aufrufs an die
+    /// Sperrhaltedauer-Marke durch — ohne sie waere ihr Hoechststand eine Zahl ohne Adresse.
+    #[cfg_attr(feature = "sperrwacht", track_caller)]
     pub fn lock(&self) -> SpinGuard<'_, T> {
         // IRQ-sicher: IRQs am eigenen Kern maskieren, BEVOR ein Ticket gezogen wird (sonst kann der
         // Timer-Tick/Reschedule denselben Lock reentrant ziehen -> Ticket-Deadlock; s. o.).
         let daif = irq_save_disable();
+        // Die Uhr laeuft ab HIER, also einschliesslich der Wartezeit auf das Ticket: wer auf einen
+        // fremden Halter wartet, ist genauso lange nicht praemptierbar wie der Halter selbst.
+        let wacht = sperrwacht::beginn();
         let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
         while self.now_serving.load(Ordering::Acquire) != ticket {
             spin_hint();
@@ -262,6 +824,7 @@ impl<T: ?Sized> SpinLock<T> {
         SpinGuard {
             lock: self,
             daif,
+            wacht,
             #[cfg(loom)]
             ptr: Some(self.data.get_mut()),
         }
@@ -273,6 +836,8 @@ pub struct SpinGuard<'a, T: ?Sized> {
     lock: &'a SpinLock<T>,
     /// DAIF-Zustand vor dem Locken (beim `Drop` wiederhergestellt).
     daif: u64,
+    /// Anfangsstempel + Stelle der Sperrhaltedauer-Marke. Ohne `sperrwacht` ein ZST.
+    wacht: sperrwacht::Wacht,
     /// Nur unter Loom: der verfolgte Zeigergriff auf die Nutzlast. Seine Lebensdauer IST das
     /// Zugriffsfenster, das der Modellprüfer gegen die Atomics ordnet.
     /// **`Option`, damit das Zugriffsfenster VOR der Freigabe geschlossen werden kann.** Felder
@@ -315,6 +880,8 @@ impl<T: ?Sized> Drop for SpinGuard<'_, T> {
         // Nächstes Ticket bedienen; `Release` veröffentlicht alle Schreibzugriffe
         // unter dem Lock an den nächsten Halter. DANACH den IRQ-Zustand wiederherstellen.
         self.lock.now_serving.fetch_add(1, Ordering::Release);
+        // Die Uhr endet VOR `irq_restore` — gemessen wird die maskierte Zeit, nicht die Haltezeit.
+        sperrwacht::ende(self.wacht);
         irq_restore(self.daif);
     }
 }
@@ -372,10 +939,12 @@ impl<T> RwSpinLock<T> {
 impl<T: ?Sized> RwSpinLock<T> {
     /// Geteilt (lesend) sperren. Blockiert nur, solange ein Schreiber hält oder
     /// angemeldet ist. IRQ-sicher: maskiert IRQs am eigenen Kern für die Dauer des Guards.
+    #[cfg_attr(feature = "sperrwacht", track_caller)]
     pub fn read(&self) -> RwReadGuard<'_, T> {
         // IRQs VOR der Anmeldung maskieren (s. Typ-Doku): ein Halter darf nicht verdrängt
         // werden, sonst spinnt ein Syscall auf demselben Kern für immer.
         let daif = irq_save_disable();
+        let wacht = sperrwacht::beginn();
         loop {
             // Angemeldeten Schreibern den Vortritt lassen (kein Writer-Starving).
             while self.writers_waiting.load(Ordering::Acquire) != 0 {
@@ -387,6 +956,7 @@ impl<T: ?Sized> RwSpinLock<T> {
                 return RwReadGuard {
                     lock: self,
                     daif,
+                    wacht,
                     #[cfg(loom)]
                     ptr: Some(self.data.get()),
                 };
@@ -397,8 +967,10 @@ impl<T: ?Sized> RwSpinLock<T> {
     }
 
     /// Exklusiv (schreibend) sperren. IRQ-sicher wie [`read`](Self::read).
+    #[cfg_attr(feature = "sperrwacht", track_caller)]
     pub fn write(&self) -> RwWriteGuard<'_, T> {
         let daif = irq_save_disable();
+        let wacht = sperrwacht::beginn();
         self.writers_waiting.fetch_add(1, Ordering::Acquire); // Intent -> Leser warten
         loop {
             // WRITER nur setzen, wenn weder Leser noch ein anderer Schreiber aktiv ist.
@@ -410,6 +982,7 @@ impl<T: ?Sized> RwSpinLock<T> {
                 return RwWriteGuard {
                     lock: self,
                     daif,
+                    wacht,
                     #[cfg(loom)]
                     ptr: Some(self.data.get_mut()),
                 };
@@ -424,6 +997,8 @@ pub struct RwReadGuard<'a, T: ?Sized> {
     lock: &'a RwSpinLock<T>,
     /// DAIF-Zustand vor dem Locken (beim `Drop` wiederhergestellt).
     daif: u64,
+    /// Anfangsstempel + Stelle der Sperrhaltedauer-Marke. Ohne `sperrwacht` ein ZST.
+    wacht: sperrwacht::Wacht,
     /// Nur unter Loom: **lesender** Zeigergriff — mehrere davon dürfen gleichzeitig bestehen,
     /// genau das ist die geteilte Leserphase.
     /// **`Option`, damit das Zugriffsfenster VOR der Freigabe geschlossen werden kann.** Felder
@@ -453,6 +1028,7 @@ impl<T: ?Sized> Drop for RwReadGuard<'_, T> {
         #[cfg(loom)]
         drop(self.ptr.take());
         self.lock.state.fetch_sub(1, Ordering::Release);
+        sperrwacht::ende(self.wacht); // s. `SpinGuard::drop`
         irq_restore(self.daif); // erst freigeben, DANN den IRQ-Zustand zurück
     }
 }
@@ -462,6 +1038,8 @@ pub struct RwWriteGuard<'a, T: ?Sized> {
     lock: &'a RwSpinLock<T>,
     /// DAIF-Zustand vor dem Locken (beim `Drop` wiederhergestellt).
     daif: u64,
+    /// Anfangsstempel + Stelle der Sperrhaltedauer-Marke. Ohne `sperrwacht` ein ZST.
+    wacht: sperrwacht::Wacht,
     /// Nur unter Loom: **schreibender** Zeigergriff — er darf mit keinem anderen Griff
     /// überlappen, sonst meldet der Modellprüfer ein Datenrennen.
     /// **`Option`, damit das Zugriffsfenster VOR der Freigabe geschlossen werden kann.** Felder
@@ -504,6 +1082,7 @@ impl<T: ?Sized> Drop for RwWriteGuard<'_, T> {
         // bewahrt eine solche Leserzahl -> kein Unterlauf.
         self.lock.state.fetch_and(!RW_WRITER, Ordering::Release);
         self.lock.writers_waiting.fetch_sub(1, Ordering::Release);
+        sperrwacht::ende(self.wacht); // s. `SpinGuard::drop`
         irq_restore(self.daif); // erst freigeben, DANN den IRQ-Zustand zurück
     }
 }

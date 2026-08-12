@@ -44,7 +44,15 @@ path = "src/main.rs"
 default = []
 # Zieht die Pruefinfrastruktur der HAL mit: der IRTE-Vergabe-Selbsttest (Z22 P1) muss in dem
 # Augenblick laufen, in dem Interrupt Remapping aufgesetzt wird -- den gibt es nur in `vtd::init`.
-selftest = ["caprock-hal/selftest"]
+#
+# C9: zieht ausserdem die **Sperrhaltedauer-Marke** mit. Sie sitzt in `caprock-sync`, also in
+# JEDEM `lock()`, und kostet **gemessen 39,3 -> 162,3 Zyklen je unbestrittener Sperrhaltung**
+# (+123 Zyklen, Faktor 4,1; A/B ueber zwei Bauten, 20 000 Runden je Seite). Das ist der Preis
+# einer Messung, nicht der eines Mechanismus -- er gehoert in den Pruefbau und nicht in den
+# Produktivkernel. Dieselbe Einordnung wie `kstackmark`.
+# Fehlt sie, meldet die `sperre`-Zeile „NICHT GEMESSEN" und faellt durch, statt „alles kurz" zu
+# behaupten.
+selftest = ["caprock-hal/selftest", "caprock-sync/sperrwacht"]
 kernel-fuzz = []
 # Continuous-Soak-Treiber (Burn-in #2): nach dem Selbsttest faehrt der Idle-Manager statt
 # `system_off` eine Endlos-Epochenschleife (Dauerbetrieb EINER Instanz). NUR Harness/Testcode; der
@@ -68,6 +76,15 @@ dfprobe-wache = ["dfprobe"]
 # in einen Triple Fault ohne jede Ausgabe laufen -- und genau das belegt, dass die Meldung im
 # Positivfall am IST-Stack haengt und nicht daran, dass ein #DF ohnehin irgendwie spricht.
 dfprobe-kein-ist = ["caprock-hal/kein-df-ist"]
+# **Die Gegenprobe zur Sperrhaltedauer-Marke** (C9). Baut in `sperrmark::probe` die C8-Falle
+# woertlich wieder ein: `while let Some(x) = PROBE.lock().entnehmen() { arbeit(x) }`. Beide Zweige
+# tun exakt dasselbe -- dieselbe Schlange, dieselbe Sperre, dieselbe Arbeit, dieselbe Anzahl
+# Durchlaeufe; der EINZIGE Unterschied ist die Lebensdauer des Guards. Damit isoliert die
+# Gegenprobe genau eine Eigenschaft.
+#
+# Erwartung: `sperre : FAILURES` mit einem Hoechststand von rund 1,5 Ticks und der Zeile des
+# `while let` als Ort. Setzt `selftest` voraus.
+sperrmark-gegenprobe = []
 
 # Der Kernel-Kern + die aarch64-HAL: derzeit aarch64-spezifisch. Auf dem x86_64-Branch (Stufe 0:
 # nur Boot+Serial) werden sie NICHT kompiliert; Stufe fuer Stufe werden die arch-agnostischen Crates

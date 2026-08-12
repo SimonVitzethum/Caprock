@@ -72,7 +72,11 @@ setup_region() {
 # --- Ziel: sync (abhängigkeitsfrei) ---
 setup_sync() {
     local SA="$TMP/kani_sync"; rm -rf "$SA"; copy_src caprock-sync "$SA"
-    manifest "$SA" caprock-sync "[workspace]"
+    # C9: `sperrwacht` wird DEKLARIERT, aber nicht gesetzt. Ohne die Deklaration meldet
+    # `unexpected_cfgs` eine Warnung je `#[cfg(feature = ...)]` (44 Stueck) und ertraenkt die
+    # Beweisausgabe. Gesetzt gehoert es nicht: die Marke liest einen Zyklenzaehler, den es auf dem
+    # Kani-Host-Target nicht gibt -- bewiesen wuerde dann der No-Op-Zweig.
+    manifest "$SA" caprock-sync $'[workspace]\n[features]\nsperrwacht = []'
     echo "$SA"
 }
 

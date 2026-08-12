@@ -27,6 +27,62 @@ pub fn run() {
     dmaaligntest();
     grossdmatest();
     kstackeichung();
+    sperreichung();
+}
+
+/// **C9: die Eichung der Sperrhaltedauer-Marke** — die Sprechprobe des MESSGERAETS, und
+/// unmittelbar danach die Probe, die die Falle faehrt.
+///
+/// Steht hier aus denselben zwei Gruenden wie [`kstackeichung`]: *hier*, weil das Urteil der
+/// `sperre`-Zeile sie als Konjunkt liest und `all_done()` gepollt wird — eine Messung, die erst
+/// im Bericht entsteht, kann den Bericht nicht ausloesen. *Vor SMP*, weil die Eichung eine
+/// Sperre absichtlich fuer Hunderte von Mikrosekunden haelt und der Hochlauf-Abschluss ein
+/// Schnitt durch eine geteilte Groesse ist.
+///
+/// Geprueft werden die Faelle, die ein Wasserzeichen unbrauchbar machen: **der Zeitgeber laeuft
+/// gar nicht**, **der Kanal ist nach dem Schnitt nicht leer**, **eine bekannte Dauer wird nicht
+/// gemeldet**, **sie wird masslos ueberschaetzt** (Zeitgeber und Schwelle in verschiedenen
+/// Einheiten) und — der Punkt, ohne den die Zeile auch eine feste Adresse bestuende — **die
+/// gemeldete Stelle folgt dem Aufrufer nicht**.
+fn sperreichung() {
+    let p = "sperre";
+    let bits = crate::sperrmark::eichung();
+    let mut fail = false;
+    let f = |b: usize| bits & b != 0;
+    check(p, f(crate::sperrmark::EICH_ZEIT), "der Zyklenzaehler laeuft ueberhaupt", &mut fail);
+    check(
+        p,
+        f(crate::sperrmark::EICH_LEER),
+        "nach dem Hochlauf-Abschluss ist der Live-Kanal leer (Hoechststand gerettet, nicht verworfen)",
+        &mut fail,
+    );
+    check(
+        p,
+        f(crate::sperrmark::EICH_MISST),
+        "eine Haltung BEKANNTER Dauer wird mit mindestens dieser Dauer gemeldet",
+        &mut fail,
+    );
+    check(
+        p,
+        f(crate::sperrmark::EICH_BAND),
+        "sie wird nicht masslos ueberschaetzt (Zeitgeber und Schwelle in DERSELBEN Einheit)",
+        &mut fail,
+    );
+    check(
+        p,
+        f(crate::sperrmark::EICH_STELLE),
+        "die gemeldete STELLE folgt dem Aufrufer (zwei Zeilen -> zwei verschiedene Angaben)",
+        &mut fail,
+    );
+    println!(
+        "sperre  : Eichung {:#08b} von {:#08b} -- {}",
+        bits,
+        crate::sperrmark::EICH_ALLE,
+        if fail { "FAILURES" } else { "das Messgeraet trennt" }
+    );
+    // Und jetzt die Falle selbst. Ohne `sperrmark-gegenprobe` laeuft dieselbe Schleife mit
+    // Funktionsgrenze -- gleiche Arbeit, gleiche Sperre, nur der Guard stirbt frueher.
+    crate::sperrmark::probe();
 }
 
 /// **C4: die Eichung der Stack-Wasserstandsmarke** — die Sprechprobe des MESSGERAETS.

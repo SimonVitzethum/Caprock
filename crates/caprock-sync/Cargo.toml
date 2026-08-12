@@ -8,6 +8,31 @@ authors.workspace = true
 
 [dependencies]
 
+[features]
+# **Die Sperrhaltedauer-Marke** (C9). Misst je Sperrhaltung die Dauer der IRQ-Maskierung und
+# haelt das Maximum mit der STELLE (`#[track_caller]`).
+#
+# Nicht in `default`, und der Grund ist gemessen und nicht gefuehlt: `SpinLock::lock` laeuft in
+# JEDEM Syscall, und die Marke kostet dort zwei Zeitstempel, einen `fetch_add` und zwei Vergleiche.
+# Gemessen im A/B ueber zwei Bauten (20 000 unbestrittene Runden je Seite, x86 unter KVM):
+#
+#     ohne Feature   39,3 Zyklen je lock()+drop
+#     mit  Feature  162,3 Zyklen je lock()+drop      -> +123 Zyklen, Faktor 4,1
+#
+# Das ist der Preis einer Messung, nicht der eines Mechanismus; er gehoert in den Pruefbau und
+# nicht in den Produktivkernel. Dieselbe Einordnung wie `kstackmark` hinter `selftest`.
+#
+# **Die Zahl im Bau selbst ist kleiner und darf nicht mit dem Aufschlag verwechselt werden:** die
+# Zeile misst zusaetzlich ein Zeitstempelpaar allein (rund 48 Zyklen). Das ist eine UNTERGRENZE --
+# im echten Pfad liegen die beiden Stempel um den ganzen kritischen Abschnitt auseinander, dazu
+# kommen der Zaehler, die beiden Wasserstandsvergleiche und der breitere Guard.
+#
+# **Die Berichtszeile sagt das ausdruecklich**: ohne dieses Feature meldet sie „NICHT GEMESSEN"
+# und ihr Urteil ist `false` -- ein Vorgabebau darf nicht wie ein gemessener aussehen.
+#
+# Der Kernel zieht es ueber `selftest` mit (s. `kernel/Cargo.toml`).
+sperrwacht = []
+
 # `kani` und `loom` sind externe cfgs (Tier-1- bzw. Tier-2-Verifikation; nur unter `cargo kani`
 # bzw. `RUSTFLAGS="--cfg loom"` gesetzt, im Normalbuild inert). Als erwartete cfgs deklarieren
 # -> kein `unexpected_cfgs`-Warning (Rust >= 1.80).

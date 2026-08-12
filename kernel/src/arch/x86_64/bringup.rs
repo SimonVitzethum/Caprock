@@ -4169,6 +4169,17 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             // die Messung die volle Stackgroesse als benutzt. Ein Wasserzeichen, das immer „viel
             // Luft" sagt, ist damit strukturell ausgeschlossen und nicht bloss unwahrscheinlich.
             ("kstack", crate::kstackmark::urteil()),
+            // C9: die **Sperrhaltedauer-Marke**. Gattert von Anfang an, und ihr Kriterium ist
+            // gegen die WIRKUNG formuliert (gemessene maskierte Dauer gegen einen Timer-Tick),
+            // nicht gegen einen Zustand. Erreichbar ist es gemessen und nicht gehofft: der
+            // bereinigte Hoechststand lag bei der Einfuehrung bei 269..372 Promille eines Ticks
+            // (fuenf Laeufe), die Schwelle bei 1000 -- Abstand Faktor 2,7 bis 3,7.
+            //
+            // **Faellt die Messung aus, faellt dieses Konjunkt**: ohne Zaehler ist der
+            // Hoechststand `0`, und `0` waere von „alles kurz" nicht zu unterscheiden. Deshalb
+            // verlangt das Urteil ausdruecklich `MESSUNG_VORHANDEN`, eine vollstaendige Eichung
+            // und eine Mindestzahl gemessener Haltungen.
+            ("sperre", crate::sperrmark::urteil()),
             // **Die Wache unter der Guard-Page** (2026-08-10). Gattert von Anfang an, und ihr
             // Kriterium ist gegen die WIRKUNG formuliert: der Vektor wird ausgeloest, und die
             // Frame-Adresse muss in der Region liegen, die fuer genau ihn gedacht ist. Ein
@@ -4202,7 +4213,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 36;
+const DONE_FLAGS: usize = 37;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]
@@ -4597,6 +4608,14 @@ fn report_and_off(watchdog: bool) -> ! {
             crate::kstackmark::MIND_MESSUNGEN,
         );
     }
+
+    // --- C9: DIE SPERRHALTEDAUER ----------------------------------------------------------------
+    //
+    // Steht direkt hinter `kstack`, weil beide dieselbe Bauform haben und dieselbe Klasse Fehler
+    // fangen: eine Groesse, die keine Pruefzeile ansieht, bis sie jemand zu einer Zahl macht. Die
+    // eine misst, wieviel Stack ein tiefer Pfad verbraucht; diese, wie lange er die Praemption
+    // aufhaelt.
+    crate::sperrmark::bericht();
 
     // **Der Unterbau unter der Guard-Page**: per-Kern-TSS + IST-Stacks fuer #DF/NMI/#MC.
     // Steht direkt hinter `kstack`, weil beide Zeilen dieselbe Gefahr behandeln -- die eine misst,
@@ -5318,6 +5337,11 @@ pub fn run(multiboot_info: u64) -> ! {
     hal::intc::init_dist(); // 8259-PIC stilllegen
     hal::intc::init_cpu(); // LAPIC aktivieren
     hal::timer::init(TICK_HZ);
+    // C9: die Schwelle der Sperrhaltedauer-Marke ist EIN Tick. Sie wird hier hinterlegt, direkt
+    // neben dem Aufruf, der den Timer wirklich programmiert -- eine `100` in `sperrmark.rs` waere
+    // ein zweites Gedaechtnis fuer dieselbe Tatsache.
+    #[cfg(feature = "selftest")]
+    crate::sperrmark::tickrate_setzen(TICK_HZ);
     // Z19/A4: SSE auf dem BSP freischalten -- dieselbe Funktion wie im AP-Pfad.
     if hal::fp::enable_sse() {
         SSE_CORES.fetch_add(1, Ordering::Relaxed);

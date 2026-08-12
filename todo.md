@@ -11,6 +11,62 @@ ihrer Begründungen — die sind der Wert, nicht die Häkchen. Danach steht hier
 
 ---
 
+## C9. Sperrhaltedauer — die Marke steht, die drei Befunde sind offen (2026-08-12)
+
+Die **Sperrhaltedauer-Marke** misst seit dem 2026-08-12, wie lange der Kern am Stück mit
+maskierten Interrupts läuft (`crates/caprock-sync`, `kernel/src/sperrmark.rs`, Prüfzeile
+`sperre`). Die Schwelle ist hergeleitet und nicht gefühlt: **ein Timer-Tick** — länger maskiert
+heisst nachweisbar verlorene Präemption. Gegenprobe: `tools/sperr-gegenprobe.sh`.
+
+**Der erste Lauf hat drei Stellen gefunden, die vorher nirgends eine Zahl waren.** Alle drei
+stehen als *benannte, gedeckelte* Schuld in `sperrmark::SCHULDEN` (Ratsche je Posten, darf nur
+fallen) — sie sind damit sichtbar, aber nicht behoben. Die Reihenfolge ist der Punkt: **jede
+wurde erst sichtbar, als die davor benannt war** — ein Maximum verdeckt, was kleiner ist.
+
+* [ ] **C9a — `kernel/src/colors.rs:982`: 1,19 Mrd. Zyklen (rund 420 ms, 42 Ticks).**
+  `run_prime_probe` (B-4.5) nimmt `PP_ARENA.lock()` und gibt es 162 Zeilen später frei;
+  dazwischen liegt die *ganze* Messung — `system::alloc` (also die MEM-Sperre **unter** der
+  Arena-Sperre), das Suchen farbreiner Läufe, Tausende Zeigerkettenläufe, die Rückgabe. Dieselbe
+  Form wie der C8-Befund, nur ohne `while let`: nicht die Sperre ist zu lang, die **Arbeit liegt
+  darunter**. Prüfcode, kein Produktivpfad — deshalb (a) und nicht (c).
+  *Weg:* die Arena braucht Exklusivität, nicht IRQ-Maskierung. Entweder die Messung aus dem
+  kritischen Abschnitt heben oder ein Primitiv ohne Maskierung. Braucht eine eigene Gegenprobe.
+* [ ] **C9b — `crates/caprock-hal/src/x86_64/console.rs:87`: 64,9 Mio. Zyklen (23 ms, 2,3 Ticks).**
+  `_print` hält `CONSOLE` über das ganze `write_fmt`, und der 16550 wird **pollend** bedient.
+  Damit maskiert **jedes `println!`** die Interrupts so lange, wie die Zeile zum UART braucht —
+  und die Berichtszeilen dieses Kernels sind vierstellig lang. Das ist die unangenehmste der drei:
+  `_print` steht im **Produktivkernel**, im Hochlauf, im Panikpfad und in jedem Bericht.
+  *Abwägung, die dazugehört:* eine gepufferte Konsole verliert im Panikfall die letzten Zeilen —
+  und genau die braucht man dort. Also kein reines „Puffer davor", sondern eine Entscheidung.
+  *Nebenwirkung, schon sichtbar:* `loader.rs:1392` (`iface_record_or_check`) misst 7,6 Mio., weil
+  dort ein `println!` **unter** `IFACE_SEEN` steht — C9b schlägt durch jede Verschachtelung durch.
+* [ ] **C9c — `kernel/src/system.rs:9198`: 20,4 Mio. Zyklen (7,3 ms, 0,73 Ticks).**
+  `purge_ipc_for_thread` hält `IPC_ORPHANS` als **äusseren** Lock über einen Sweep von
+  O(Endpoints + Notifications) = 20 128 Einzelsperrungen — **je Thread-Tod**. Die
+  *Iterationszahl* stand dort seit C4/D10 im Kommentar; was nirgends stand, ist die daraus
+  folgende **Latenz**. Reiner Produktivpfad, und schon heute bei drei Vierteln der Schwelle
+  (gemessen 494…748 Promille über fünf Läufe). Deckel deshalb **enger als die Schwelle**
+  (856 statt 1000 Promille) — er ist eine Fessel, kein Freibrief.
+
+* [ ] **C9d — die Marke gattert nur auf x86.** Die Eichung läuft auf beiden Architekturen (und
+  besteht dort auch, `0b111111`), die **Berichtszeile und das Gatter** stehen nur im
+  x86-Hochlaufweg — dieselbe Einordnung wie `kstackmark`. Zwei Gründe, beide benennbar: die
+  Schuldliste enthält mit `console.rs` einen **x86-Pfad** (aarch64 hat einen anderen Konsolen-
+  treiber, dessen Zahl niemand gemessen hat), und die aarch64-Suite ist auf diesem Zweig
+  **vorbestehend rot** (s. C9e) — ein Gatter dort wäre nicht abnehmbar.
+
+* [ ] **C9e — VORBESTEHEND, nicht von mir: die aarch64-Suite ist auf `arch/x86_64` rot.**
+  `color : FAILURES` mit **lauter Nullen** (`in_mask=0 kernelseite=0 disjunkt=0 bilanz=0`),
+  danach Watchdog mit `offen: color`. **Gemessen, nicht vermutet:** 3 von 3 Läufen auf dem
+  *unveränderten* Baum (Dateien beiseitegelegt, `git checkout --`, gemessen, zurückgelegt), und
+  ebenso 3 von 3 mit meiner Marke — die Ausgabe ist in allen sechs Läufen zeichengleich.
+  Damit ist es **deterministisch und unabhängig von C9**, und es ist auch **nicht D13**: dort
+  waren die Farbzeilen byte-identisch zur *Referenz*, hier sind sie identisch **null**.
+  `CLAUDE.md` führt aarch64 weiter mit „`RUNS=6` → 6 von 6, `== ALL PASS ==`" vom 2026-08-02 —
+  diese Zahl ist überholt und sollte nicht als Stand gelesen werden.
+
+---
+
 ## LESEHILFE: was welche Kennung bedeutet — und der Stand der vier Z26-Nachträge
 
 **Eine Kennung, zwei Bedeutungen** (bemerkt 2026-08-10, bevor sie zur Fussnote wurde):

@@ -48,6 +48,12 @@ cp "$ROOT/Verification/concurrency/loom/Cargo.toml" "$SA/Cargo.toml"
 # `loom` ist ein externes cfg -> als erwartet deklarieren, sonst rauscht `unexpected_cfgs` ueber
 # jede Zeile. Dieselbe Deklaration steht in crates/caprock-sync/Cargo.toml fuer den Workspace.
 printf "\n[lints.rust]\nunexpected_cfgs = { level = \"warn\", check-cfg = ['cfg(kani)', 'cfg(loom)'] }\n" >> "$SA/Cargo.toml"
+# C9: das Feature der Sperrhaltedauer-Marke MUSS hier deklariert sein, auch wenn es AUS bleibt --
+# sonst meldet `unexpected_cfgs` 44 Warnungen (eine je `#[cfg(feature = "sperrwacht")]`) und
+# ertraenkt die Ausgabe, in der man die Beweise lesen will. Deklariert, nicht gesetzt: die Marke
+# benutzt `core`-Atomics, die Loom NICHT verfolgt -- sie gehoert nicht in dieses Modell, und
+# eingeschaltet waere sie ein Stueck unbeobachteter Zustand mitten im geprueften Lock.
+printf "\n[features]\nsperrwacht = []\n" >> "$SA/Cargo.toml"
 
 # ---- Der ECHTE Quelltext, unveraendert uebernommen --------------------------------------------
 SRC="$ROOT/crates/caprock-sync/src/lib.rs"

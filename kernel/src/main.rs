@@ -56,6 +56,11 @@ mod loader;
 mod manifest_keys;
 #[cfg(feature = "selftest")]
 mod selftest;
+/// C9: die **Sperrhaltedauer-Marke** — wie lange war der Kern am Stueck nicht praemptierbar?
+/// Die Messung selbst sitzt in `caprock-sync` (in jedem `lock()`), hier stehen die aus der
+/// Tickrate hergeleitete Schwelle, die Eichung, die Gegenprobe und das Urteil. Arch-neutral.
+#[cfg(feature = "selftest")]
+mod sperrmark;
 mod system;
 #[cfg(all(target_arch = "aarch64", feature = "selftest"))]
 mod threads;
@@ -115,6 +120,10 @@ fn secondary_stack_top(core: usize) -> u64 {
 fn init_core_irqs() {
     hal::intc::init_cpu(); // GIC-CPU-Interface (pro Kern)
     hal::timer::init(TICK_HZ); // Timer-PPI armieren (pro Kern)
+                               // C9: die Schwelle der Sperrhaltedauer-Marke ist EIN Tick — hinterlegt neben dem Aufruf, der
+                               // den Timer wirklich programmiert (eine `100` in `sperrmark.rs` waere ein zweites Gedaechtnis).
+    #[cfg(feature = "selftest")]
+    crate::sperrmark::tickrate_setzen(TICK_HZ);
 }
 
 /// Kernel-Eintritt des Primärkerns, gerufen vom Boot-Trampolin.

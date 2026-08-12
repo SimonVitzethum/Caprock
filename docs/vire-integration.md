@@ -36,6 +36,29 @@ Sprachkern-Umbau, keine Runtime-Neuschreibung.
 Die Runtime baut `#![no_std]`-artig ohne libc; Caprock stellt diese ~5 Funktionen
 als `extern "C"` (Rust) bereit. Das ist der gesamte Pflicht-Teil von Phase A.
 
+## BERICHTIGUNG nach einem Blick in das Vire-Repo (2026-08-12)
+
+Drei Angaben unten stimmen so nicht. Gemessen an `/home/simon/Schreibtisch/FastLLVM`
+(`crates/driver/src/main.rs`, `crates/driver/src/runtime.c`, `sel4/README.md`):
+
+1. **Es gibt kein `--target`-Flag.** Der Treiber kennt `-o`, `--main`, `--emit-ir`,
+   `--emit-llvm`, `--stats`, `--no-solver`, `--freestanding` — und nimmt `.class`/`.jar`
+   als Eingabe. Die Zielarchitektur kommt aus dem `clang`-Aufruf, nicht aus einem
+   Sprachflag. „Das Flag existiert" war eine Annahme, und ein Grund, der nicht stimmt,
+   macht den Punkt unbehebbar, statt ihn zu lösen.
+2. **`--freestanding` liefert ein RELOKATIERBARES OBJEKT** (`clang -r`), kein ladbares
+   ELF. Caprocks Loader nimmt `ET_EXEC`-ELF64 mit seitenausgerichteten `PT_LOAD`-Segmenten
+   (s. `programs/user-x86.ld`, und am 2026-08-10 hat genau die Ausrichtung `wasmhost`
+   gekostet). Zwischen Vire-Ausgabe und Loader fehlt also ein **Linkschritt mit
+   Caprock-Linkerskript** — er ist klein, aber er ist nicht null.
+3. **Die freestanding-Vorgabe ist ein statischer 16-MiB-Heap in `.bss`** (`plat_heap`,
+   First-Fit-Freiliste, kein `brk`/`mmap`; über `-DFASTLLVM_HEAP_SIZE` änderbar). Das ist
+   die wichtigste Zahl für Caprock: die private Region einer isolierten PD ist heute
+   **2 MiB**, und die Mandantendichte hängt genau daran (`RAM / 2 MiB`, s. `todo.md` C7).
+   Eine Vire-Komponente mit Vorgabeheap kostete **das Achtfache**. Der Ausweg steht
+   unten schon richtig — `plat_*` auf `caprock-region` legen —, aber er ist damit nicht
+   „gut zu haben", sondern **Pflicht**, bevor eine Zahl über Dichte wieder gilt.
+
 ## Was nötig ist (Pflicht, Phase A — bootende Komponente)
 1. **Target:** Vire baut `vire build --target aarch64-unknown-none <prog>.vr`
    (das `--target`-Flag existiert). Ergebnis: ein natives Objekt/ELF ohne libc.

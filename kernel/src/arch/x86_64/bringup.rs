@@ -4584,6 +4584,21 @@ fn report_and_off(watchdog: bool) -> ! {
              AUFRUFERS und fuellte ihn zu 73,1 % -- also zahlte JEDER Thread 16 KiB fuer EINEN \
              Pfad. 0 von 0 heisst 'nicht messbar' (kein Verifiziererthread), nicht 'viel Luft'"
         );
+        // **Die Summe steht als eigene Zeile, weil sie die eigentliche Aussage traegt.**
+        let (s_pfad, s_irq, s_res, s_gr, s_n) = crate::kstackmark::summe();
+        println!(
+            "kstack  : SUMME (C4, strukturell statt statistisch) -- tiefster Pfad {s_pfad} B + \
+             tiefster IRQ-Handler {s_irq} B ({s_n} Messungen) + geforderte Reserve {s_res} B = \
+             {} B von {s_gr} B. Addiert wird, weil ein Interrupt genau am Scheitelpunkt der \
+             tiefsten Kette eintreffen kann und dann auf DEMSELBEN Stack landet -- ob das \
+             Messumfeld diese Koinzidenz je gewuerfelt hat, weiss niemand. #DF/NMI/#MC zaehlen \
+             NICHT mit: sie laufen auf eigenen IST-Staecken, und genau das haben die gekauft. \
+             VORBEHALT zum zweiten Summanden: gemessen wird an der tiefsten Stelle, die OHNE \
+             Instrumentierung jedes Aufgerufenen erreichbar ist (`reschedule`) -- der Scheduler \
+             darunter geht weiter, die Zahl ist also eine UNTERGRENZE. Im Einsprung der HAL waren \
+             es 24 B, hier 144 B; der Abstand zur Stackgroesse traegt auch ein Vielfaches davon",
+            s_pfad + s_irq + s_res
+        );
         println!(
             "kstack  : {} (C4: geforderte Mindestreserve {} B = 1/{} des Stacks, Eichung \
              {:#06b}/{:#06b}, mindestens {} Messungen vor dem Gatter. Die Schwelle ist die \

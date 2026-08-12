@@ -601,6 +601,37 @@ fn resume(frame: *mut TrapFrame) -> *mut TrapFrame {
 /// Per-Kern-Atomics an — kein `println!` mit Formatierung ueber fremde Strukturen, keine Sperre,
 /// kein Zugriff auf Speicher, der unabgebildet sein koennte. Solange der Handler so klein bleibt,
 /// traegt der Vertrag durch Gegenlesen; waechst er, gehoert ein Symbol-Waechter dazu.
+/// **Wie tief ein Interrupt-Handler auf dem unterbrochenen Stack geht** — der zweite Summand der
+/// Stackrechnung aus C4, und das Paar dazu.
+///
+/// `IRQ_TIEFE_N` ist die Sprechprobe: `MAX == 0` allein waere von „es kam nie ein Interrupt" nicht
+/// zu unterscheiden — und eine Summe, deren zweiter Summand nie gemessen wurde, ist eine Summe
+/// mit einer erfundenen Null.
+static IRQ_TIEFE_MAX: AtomicU64 = AtomicU64::new(0);
+static IRQ_TIEFE_N: AtomicU64 = AtomicU64::new(0);
+
+/// **Den IRQ-Verbrauch MELDEN — gerufen aus der Tiefe, nicht am Einsprung.**
+///
+/// Die erste Fassung mass `frame - &local` im Einsprung von `handle_exception` und kam auf
+/// **24 Byte**. Das war der Verbrauch *bis dorthin* und nicht der des Handlers: die Tiefe entsteht
+/// erst im Reschedule-Pfad darunter. Eine Summe mit einem systematisch zu kleinen Summanden ist
+/// schlimmer als keine — sie sieht aus wie eine Rechnung.
+///
+/// Deshalb ruft der Kernel diese Funktion **an seiner tiefsten Stelle** im IRQ-Kontext und reicht
+/// beide Adressen herein; die HAL kennt den Scheduler nicht (Kerngrenze).
+pub fn irq_tiefe_melden(frame: u64, tiefste_sp: u64) {
+    IRQ_TIEFE_MAX.fetch_max(frame.saturating_sub(tiefste_sp), Ordering::Relaxed);
+    IRQ_TIEFE_N.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `(tiefster gemessener IRQ-Verbrauch in Byte, Anzahl der Messungen)`.
+pub fn irq_tiefe() -> (u64, u64) {
+    (
+        IRQ_TIEFE_MAX.load(Ordering::Relaxed),
+        IRQ_TIEFE_N.load(Ordering::Relaxed),
+    )
+}
+
 static NMI_AKTIV: [core::sync::atomic::AtomicBool; MAX_KERNE] =
     [const { core::sync::atomic::AtomicBool::new(false) }; MAX_KERNE];
 static NMI_FENSTER: [AtomicU64; MAX_KERNE] = [const { AtomicU64::new(0) }; MAX_KERNE];

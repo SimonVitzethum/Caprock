@@ -534,6 +534,13 @@ fn charged<R>(core: usize, sched: &mut Scheduler, f: impl FnOnce(&mut Scheduler)
 }
 
 fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
+    // **Der zweite Summand der Stackrechnung (C4), gemessen an der TIEFSTEN Stelle des
+    // IRQ-Pfads** -- hier und nicht im Einsprung der HAL: dort kam die erste Fassung auf 24 Byte,
+    // also auf den Verbrauch BIS dorthin. Die Tiefe entsteht darunter, im Reschedule.
+    // `&hier` liegt im Rahmen dieser Funktion; die Differenz zum abgelegten Frame ist Frame +
+    // Handlerkette bis hierher.
+    let hier: u64 = 0;
+    hal::exception::irq_tiefe_melden(frame as u64, core::ptr::addr_of!(hier) as u64);
     let core = hal::cpu::core_id();
     // Deferred-IRQ-Zustellung (ext-22, P5): pending Geräte-IRQs als Notification signalisieren
     // — VOR dem SCHEDS-Lock (signal nimmt NTFNS<SCHEDS; kein verschachtelter SCHEDS). Fast-

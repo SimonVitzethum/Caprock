@@ -444,10 +444,38 @@ pub const MIND_MESSUNGEN: usize = 2;
 /// Bedingung zu stellen, die zum Zeitpunkt ihrer Pruefung strukturell nicht erfuellbar ist.
 pub fn urteil() -> bool {
     let m = marke(KL_EL0);
+    let (irq_max, irq_n) = caprock_hal::exception::irq_tiefe();
     eichstand() == EICH_ALLE
         && m.gemessen_tod >= MIND_MESSUNGEN
         && m.groesse > 0
         && m.frei_min >= mindestreserve(m.groesse)
+        // **DIE SUMMENBEDINGUNG -- der Unterschied zwischen statistisch und strukturell.**
+        //
+        // `frei_min >= reserve` sagt: die Hoechststaende, die VORKAMEN, liessen genug uebrig.
+        // Der schlimmste Fall ist aber tiefste Aufrufkette PLUS tiefster Interrupt-Handler, der
+        // genau am Scheitelpunkt eintrifft -- gewoehnlicher Kernelcode laeuft mit `IF=1`, beide
+        // landen auf DEMSELBEN Stack. Ob QEMU diese Koinzidenz je gewuerfelt hat, weiss niemand.
+        // Also werden die Summanden GETRENNT gemessen und addiert, statt auf den Wuerfel zu
+        // hoffen -- dieselbe Lehre wie beim NMI.
+        //
+        // `irq_n > 0` ist die Sprechprobe: ohne sie waere ein nie gemessener zweiter Summand
+        // eine erfundene Null, und die Summe eine Rechnung mit einer Zahl, die niemand erhoben
+        // hat. `#DF`/`NMI`/`#MC` kommen NICHT dazu -- sie laufen auf eigenen IST-Staecken, und
+        // genau das haben die gekauft.
+        && irq_n > 0
+        && (m.groesse as u64).saturating_sub(m.frei_min as u64) + irq_max
+            + mindestreserve(m.groesse) as u64
+            <= m.groesse as u64
+}
+
+/// Die drei Summanden der Stackrechnung: `(tiefster Pfad, tiefster IRQ-Handler, geforderte Reserve)`
+/// — und wieviel davon die aktuelle Groesse noch traegt.
+pub fn summe() -> (u64, u64, u64, u64, u64) {
+    let m = marke(KL_EL0);
+    let (irq_max, irq_n) = caprock_hal::exception::irq_tiefe();
+    let pfad = (m.groesse as u64).saturating_sub(m.frei_min as u64);
+    let res = mindestreserve(m.groesse) as u64;
+    (pfad, irq_max, res, m.groesse as u64, irq_n)
 }
 
 /// Die geforderte Mindestreserve fuer eine Stackgroesse.

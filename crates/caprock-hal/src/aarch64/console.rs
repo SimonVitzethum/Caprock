@@ -9,8 +9,8 @@
 //! * [`_print`] (über `println!`) — durch einen Spinlock SMP-serialisiert; erst
 //!   nach MMU-Aktivierung benutzen.
 
+use crate::konsole::{self, Schreibordnung};
 use core::fmt::{self, Write};
-use caprock_sync::SpinLock;
 
 /// MMIO-Basis der PL011-UART auf QEMU `virt`.
 pub const PL011_BASE: usize = 0x0900_0000;
@@ -34,13 +34,20 @@ impl Pl011 {
         }
     }
 
-    fn write_str_raw(s: &str) {
-        for b in s.bytes() {
-            if b == b'\n' {
-                Self::put_byte(b'\r');
-            }
-            Self::put_byte(b);
+    /// Nimmt der Port jetzt ein Byte an? (`!FR.TXFF`.)
+    ///
+    /// **Getrennt von [`Self::put_byte`], weil das Warten OHNE Maske laufen muss** (C9b).
+    fn bereit() -> bool {
+        // SAFETY: feste MMIO-Adresse der QEMU-`virt`-UART, nur lesend (s. `put_byte`).
+        unsafe {
+            let fr = (PL011_BASE + UART_FR) as *const u32;
+            core::ptr::read_volatile(fr) & UART_FR_TXFF == 0
         }
+    }
+
+    /// Die CR/LF-Regel steht arch-neutral in [`crate::konsole`] — hier nur der Treiber.
+    fn write_str_raw(s: &str) {
+        konsole::roh(TREIBER, s);
     }
 }
 
@@ -51,9 +58,19 @@ impl Write for Pl011 {
     }
 }
 
-/// Lock, der den UART-Zugriff zwischen Kernen serialisiert. Der UART selbst ist
-/// zustandslos; der Lock schützt nur die Ausgabe-Atomarität.
-static CONSOLE: SpinLock<()> = SpinLock::new(());
+/// Die Schreibordnung dieser Konsole (C9b): Besitzrecht ueber die Nachricht, Portsperre je
+/// Block. Begruendung und Messung in [`crate::konsole`].
+///
+/// **Mitgenommen, nicht mitgemessen.** Die Zahl, die den Umbau ausgeloest hat, stammt aus der
+/// x86-Konsole; die Sperrhaltedauer-Marke gattert auf aarch64 nicht (todo C9d), und niemand hat
+/// die PL011 gemessen. Die FORM des Fehlers war hier aber woertlich dieselbe — eine Haltung ueber
+/// das ganze `write_fmt` bei pollend bedientem UART —, und eine Architektur, die man beim
+/// Beheben auslaesst, laesst man verrotten (dieselbe Einordnung wie der aarch64-Bau in der
+/// Abnahme-Reihe).
+/// Der Treiber als Wertepaar: warten und schreiben sind getrennt (s. `konsole::Treiber`).
+static TREIBER: konsole::Treiber = konsole::Treiber { bereit: Pl011::bereit, senden: Pl011::put_byte };
+
+static ORDNUNG: Schreibordnung = Schreibordnung::neu();
 
 /// Lock-freie Direktausgabe. Nur für Pre-MMU-Bring-up und den Panic-Handler.
 pub fn emit_raw(s: &str) {
@@ -68,7 +85,17 @@ pub fn emit_fmt(args: fmt::Arguments) {
 
 /// Backing für [`crate::print!`] / [`crate::println!`] (SMP-serialisiert).
 #[doc(hidden)]
+#[track_caller]
 pub fn _print(args: fmt::Arguments) {
-    let _guard = CONSOLE.lock();
-    let _ = Pl011.write_fmt(args);
+    ORDNUNG.drucken(
+        super::cpu::core_id(),
+        super::cpu::irqs_freigegeben(),
+        TREIBER,
+        args,
+    );
+}
+
+/// Was die Schreibordnung gesehen hat — fuer die `konsole`-Berichtszeile.
+pub fn schreibstand() -> konsole::Stand {
+    ORDNUNG.stand()
 }

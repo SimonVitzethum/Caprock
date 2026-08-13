@@ -34,6 +34,15 @@
 //! Subsysteme.
 
 pub(crate) mod hook;
+/// Die **Schreibordnung der Debug-Konsole** (C9b) — arch-neutral, weil die Regel es ist: die
+/// Portsperre blockweise, das Besitzrecht ueber die ganze Nachricht, und die CR/LF-Regel an
+/// **einer** Stelle. Zwei Architekturen, die dieselbe Ordnung getrennt hinschreiben, sind der
+/// Riss, durch den eine von beiden zurueckfaellt.
+pub(crate) mod konsole;
+pub use konsole::Stand as Konsolenstand;
+/// Wieviele ausgegebene Bytes die Konsole am Stueck unter der Portsperre haelt — **eine Zahl,
+/// eine Quelle**: der Bericht liest sie hier und rechnet sie nicht nach.
+pub const KONSOLENBLOCK: usize = konsole::BLOCK;
 
 // --- Architekturauswahl -------------------------------------------------------------------
 

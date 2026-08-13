@@ -4180,6 +4180,16 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             // verlangt das Urteil ausdruecklich `MESSUNG_VORHANDEN`, eine vollstaendige Eichung
             // und eine Mindestzahl gemessener Haltungen.
             ("sperre", crate::sperrmark::urteil()),
+            // **C9b: die Schreibordnung der Konsole.** Gattert von Anfang an, und ihr Kriterium
+            // ist gegen die WIRKUNG formuliert: nicht „ist der Umbau da", sondern „ist ein Byte
+            // an der Ordnung vorbeigegangen". Genau das ist die einzige Richtung, in der der
+            // Umbau schaden koennte -- verschlucken kann er strukturell nichts, weil es keinen
+            // Puffer gibt.
+            //
+            // **Faellt die Ausgabe aus, faellt dieses Konjunkt**: ohne Bloecke ist `rueckritt`
+            // trivialerweise 0, und das waere von „alles sauber" nicht zu unterscheiden. Deshalb
+            // steht die Sprechprobe `bloecke >= MIND_BLOECKE` mit im Urteil.
+            ("konsole", crate::sperrmark::konsole_urteil()),
             // **Die Wache unter der Guard-Page** (2026-08-10). Gattert von Anfang an, und ihr
             // Kriterium ist gegen die WIRKUNG formuliert: der Vektor wird ausgeloest, und die
             // Frame-Adresse muss in der Region liegen, die fuer genau ihn gedacht ist. Ein
@@ -4213,7 +4223,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 37;
+const DONE_FLAGS: usize = 38;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]
@@ -4631,6 +4641,12 @@ fn report_and_off(watchdog: bool) -> ! {
     // eine misst, wieviel Stack ein tiefer Pfad verbraucht; diese, wie lange er die Praemption
     // aufhaelt.
     crate::sperrmark::bericht();
+
+    // **C9b: die Schreibordnung der Konsole** -- die Behebung des groessten der drei Befunde, und
+    // die Zahl, an der ihr eigenes Risiko haengt. Steht direkt hinter `sperre`, weil sie dessen
+    // dritten Schuldposten ersetzt: dort stand die Zahl, hier steht, was an ihre Stelle getreten
+    // ist.
+    crate::sperrmark::konsole_bericht();
 
     // **Der Unterbau unter der Guard-Page**: per-Kern-TSS + IST-Stacks fuer #DF/NMI/#MC.
     // Steht direkt hinter `kstack`, weil beide Zeilen dieselbe Gefahr behandeln -- die eine misst,

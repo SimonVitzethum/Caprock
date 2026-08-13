@@ -71,12 +71,15 @@
 //! aarch64 besteht die Eichung ebenfalls vollstaendig). [`bericht`] und der `sperre`-Eintrag in
 //! `all_done()` stehen dagegen nur im x86-Hochlaufweg -- dieselbe Einordnung wie `kstackmark`.
 //!
-//! **Zwei Gruende, beide benennbar** (todo C9d): die Schuldliste unten enthaelt mit
-//! `console.rs` einen **x86-Pfad** -- aarch64 hat einen anderen Konsolentreiber, dessen Zahl
-//! niemand gemessen hat, und eine Schuld zu uebernehmen, die man nicht gemessen hat, waere ein
-//! Freibrief. Und die aarch64-Suite ist auf diesem Zweig **vorbestehend rot** (`color : FAILURES`
-//! mit lauter Nullen, 3 von 3 auch auf dem unveraenderten Baum, todo C9e) -- ein Gatter dort waere
-//! nicht abnehmbar, und ein nicht abnehmbares Gatter faerbt die Suite, statt sie zu schaerfen.
+//! **Von den zwei Gruenden dafuer (todo C9d) ist am 2026-08-13 EINER weggefallen.** Der erste
+//! war, dass die Schuldliste unten mit `console.rs` einen **x86-Pfad** enthielt -- eine Schuld,
+//! die auf aarch64 niemand gemessen hatte. Mit der Behebung von C9b ist dieser Posten weg, und
+//! die Schreibordnung der Konsole ist auf beiden Architekturen dieselbe (`crate::konsole`). Der
+//! zweite Grund steht: die aarch64-Suite ist auf diesem Zweig **vorbestehend rot**
+//! (`color : FAILURES` mit lauter Nullen, 3 von 3 auch auf dem unveraenderten Baum, todo C9e) --
+//! ein Gatter dort waere nicht abnehmbar, und ein nicht abnehmbares Gatter faerbt die Suite,
+//! statt sie zu schaerfen. **C9d haengt damit nur noch an C9e**, und das ist eine kleinere
+//! Aussage als vorher.
 //!
 //! # Die Gegenprobe ist der eigentliche Beleg
 //!
@@ -132,9 +135,15 @@ pub fn schwelle() -> u64 {
 // **Und die Reihenfolge ist der Punkt:** (2) wurde erst sichtbar, als (1) benannt war, und (3)
 // erst, als (2) es war. Ein Maximum verdeckt, was kleiner ist -- deshalb hat die Marke einen
 // zweiten, BEREINIGTEN Kanal. Die Aufzaehlung terminiert auch: unterhalb der drei liegt der
-// naechste Halter bei 270 Promille eines Ticks (`loader.rs:1392`, und das ist ein `println!`
+// naechste Halter bei 269..289 Promille eines Ticks (`loader.rs:1392`, und das ist ein `println!`
 // unter `IFACE_SEEN` -- also (2) durch eine Verschachtelung hindurch). Ab dort ist der Abstand
-// zur Schwelle Faktor 3,7, und die Liste kann aufhoeren.
+// zur Schwelle Faktor 3,5, und die Liste kann aufhoeren.
+//
+// **Seit der Behebung von (2) ist `loader.rs:1392` der Spitzenreiter des bereinigten Kanals** --
+// und das ist kein Zufall, sondern derselbe Befund eine Ebene hoeher: ein `println!` UNTER einer
+// fremden Sperre laeuft weiter unter deren Maske, die Blockaufteilung der Konsole hilft dort
+// nicht. Gemessen ist die Zahl vor und nach dem Umbau praktisch gleich (7 970 405 -> 7 966 629
+// im selben Aufbau). Wer C9b fuer erledigt haelt, muss diese Stelle mitlesen.
 //
 // **(1) `kernel/src/colors.rs:982` -- 1,17 Mrd. Zyklen, rund 420 ms, 42 Timer-Ticks.**
 // `run_prime_probe` (B-4.5) nimmt dort `PP_ARENA.lock()` und gibt es erst 162 Zeilen spaeter
@@ -150,20 +159,32 @@ pub fn schwelle() -> u64 {
 // folgende **Latenz**. Dieser Posten ist der unangenehmste der drei, weil er als einziger auf
 // einem reinen Produktivpfad liegt und schon heute bei drei Vierteln der Schwelle steht.
 //
-// **(2) `crates/caprock-hal/src/x86_64/console.rs:87` -- 64 Mio. Zyklen, rund 23 ms, 2,3 Ticks.**
-// `_print` haelt `CONSOLE` ueber das gesamte `write_fmt`, und der 16550 wird **pollend** bedient
-// (Warten auf THR-empty je Byte). Damit maskiert **jedes `println!`** die Interrupts so lange, wie
-// die Zeile zum UART braucht -- und die Berichtszeilen dieses Kernels sind vierstellig lang. Das
-// ist die unangenehmere der beiden Zahlen: `colors.rs` ist Pruefcode, `_print` steht im
-// Produktivkernel und wird aus dem Panikpfad, dem Hochlauf und jedem Bericht gerufen.
+// **(2) `crates/caprock-hal/src/x86_64/console.rs:87` -- 69,1 Mio. Zyklen, 24,6 ms, 2,46 Ticks.
+// BEHOBEN am 2026-08-13 (C9b); der Posten ist ersatzlos weg.** `_print` hielt `CONSOLE` ueber das
+// gesamte `write_fmt`, und der 16550 wird **pollend** bedient -- jedes `println!` maskierte die
+// Interrupts fuer die Dauer der ganzen Zeile.
 //
-// **Warum beide als Schuld stehen und nicht als Behebung.** (1) traegt echte Exklusivitaet (der
-// Rueckspeicher ist ein grosser `static`), und den Abschnitt aufzutrennen heisst, eine
-// 160-Zeilen-Funktion mit sorgfaeltig begruendeter Semantik umzubauen. (2) ist ein Entwurfspunkt
-// mit eigener Abwaegung: eine gepufferte Konsole verliert im Panikfall die letzten Zeilen, und
-// genau die braucht man dort. Beides sind eigene Arbeiten mit eigener Gegenprobe, keine
-// Nebenwirkung dieser. Als Schuld sind sie **benannt, datiert, gedeckelt und im Bericht sichtbar**;
-// als stille Ausnahme waeren sie unauffindbar. Sie stehen als C9a/C9b in `todo.md`.
+// Die Behebung ist eine andere geworden, als der Eintrag vorschlug, **und eine Messung hat das
+// entschieden**: die Formatierung kostet **1,2 Zyklen je Byte**, ein ausgegebenes Byte **40 754**
+// (zwei VM-Exits). „Die Formatierung aus der Sperre heben" haette 0,003 % der Haltung entfernt.
+// Getrennt sind stattdessen **Unteilbarkeit** (ein Besitzrecht ohne Maskierung ueber die ganze
+// Nachricht) und **Portzugriff** (die Sperre je 16 Bytes = eine FIFO-Fuellung). Damit blieb auch
+// die Abwaegung aus dem alten Eintrag gegenstandslos: der gewoehnliche Weg hat **keinen Puffer**,
+// also auch keine im Panikfall verlorenen Zeilen.
+//
+// **Der Posten ist damit NICHT weggefallen, sondern ein anderer geworden** -- und das ist die
+// ehrlichere Buchung. Uebrig bleibt EIN `outb`, und der kann vom Wirt gestallt werden: gemessen
+// 58..63 Mio. Zyklen, und zwar unabhaengig von der Blockgroesse (16/4/1 Byte) und davon, ob das
+// Warten auf THRE unter der Maske liegt. Wer eine Zahl nicht durch eine Aenderung bewegen kann,
+// die sie erzeugen muesste, misst nicht die Sache. Der Deckel faellt von 80 auf 70 Mio.
+// Einzelheiten in `crates/caprock-hal/src/konsole.rs`.
+//
+// **Warum (1) und (3) weiter als Schuld stehen und nicht als Behebung.** (1) traegt echte
+// Exklusivitaet (der Rueckspeicher ist ein grosser `static`), und den Abschnitt aufzutrennen
+// heisst, eine 160-Zeilen-Funktion mit sorgfaeltig begruendeter Semantik umzubauen. Das ist eine
+// eigene Arbeit mit eigener Gegenprobe, keine Nebenwirkung dieser. Als Schuld sind sie **benannt,
+// datiert, gedeckelt und im Bericht sichtbar**; als stille Ausnahme waeren sie unauffindbar. Sie
+// stehen als C9a/C9c in `todo.md`.
 //
 // **Jeder Posten hat seinen EIGENEN Deckel, und jeder ist eine Ratsche.** Ein gemeinsamer Deckel
 // waere eine Zahl fuer zwei Tatsachen -- der grosszuegigere deckte den anderen mit ab, und die
@@ -200,12 +221,12 @@ static SCHULDEN: sperrwacht::Schuldliste = sperrwacht::Schuldliste {
                     todo C9c",
         },
         sperrwacht::Schuldposten {
-            datei: "crates/caprock-hal/src/x86_64/console.rs",
-            // Gemessen 64,2 Mio.; Faktor 1,25. Die Zahl haengt an der LAENGE der laengsten
-            // Berichtszeile, nicht an einer Struktur -- wer eine lange Zeile hinzufuegt, hebt sie.
-            deckel: 80_000_000,
-            grund: "_print haelt CONSOLE ueber das ganze write_fmt, und der 16550 wird pollend \
-                    bedient: jedes println! maskiert IRQs fuer die Dauer der Zeile -- todo C9b",
+            datei: "crates/caprock-hal/src/konsole.rs",
+            // **Der Deckel FAELLT von 80 auf 70 Mio.** -- die Ratsche haelt. Gemessen 58,1 / 58,4 /
+            // 60,5 / 63,1 Mio. ueber vier Laeufe, alle in WATCHDOG-Laeufen mit vierzigfacher
+            // Ausgabemenge unter fremder Wirtslast.
+            deckel: 70_000_000,
+            grund: "C9b ist BEHOBEN, dieser Posten ist ein anderer: die Haltung je Nachricht ist                     von 69,1 Mio. auf rund 684 000 Zyklen gefallen (2464 -> 24 Promille, s. die                     `konsole`-Zeile). Was bleibt, ist EIN `outb` -- und der kann vom Wirt                     gestallt werden. Gemessen: die Zahl haengt WEDER an der Blockgroesse (16/4/1                     Byte ergeben dasselbe) NOCH daran, ob das Warten auf THRE unter der Maske                     liegt. Damit ist sie keine Kernel-Groesse, sondern D13",
         },
     ],
 };
@@ -565,6 +586,121 @@ pub fn aufschlag() -> (u64, u64) {
         AUFSCHLAG[0].load(Ordering::Relaxed),
         AUFSCHLAG[1].load(Ordering::Relaxed),
     )
+}
+
+// ----------------------------------------------------------------------------------------------
+// DIE KONSOLE — die Behebung von C9b, und die EINE Zahl, an der ihr Risiko haengt
+// ----------------------------------------------------------------------------------------------
+//
+// Seit dem 2026-08-13 haelt `_print` die Portsperre nur noch je 16 ausgegebener Bytes; die
+// Unteilbarkeit einer Nachricht traegt ein Besitzrecht **ohne** IRQ-Maskierung. Der Umbau steht
+// in `crates/caprock-hal/src/konsole.rs`, mitsamt der Messung, die den naheliegenden Weg
+// ausgeschlossen hat (Formatierung 1,2 Zyklen je Byte gegen 40 754 fuer die Ausgabe).
+//
+// **Was der Umbau riskiert, und wo dieses Risiko als Zahl steht.** Ein Puffer gibt es nicht --
+// „verschluckte Ausgabe" ist damit strukturell ausgeschlossen und braucht keinen Waechter. Bleibt
+// die andere Richtung: **verwuerfelte** Ausgabe. Sie kann an genau EINER Stelle entstehen, dem
+// Rueckritt auf die rohe Ausgabe, und der wird gezaehlt. `rueckritt == 0` heisst deshalb nicht
+// „vermutlich in Ordnung", sondern: **kein Byte ist an der Ordnung vorbeigegangen.**
+//
+// Die Zeile gattert, und sie gattert scharf. Ein Rueckritt heisst, dass zwei Ausgaben ineinander
+// geraten sein KOENNEN -- und ein Protokoll, dessen Zeilen man nicht mehr trauen kann, macht
+// jede andere gruene Zeile darin wertlos. Genau die Sorte Schaden, gegen die dieses Projekt den
+// `grep`-Pipe-Fehler aufgeschrieben hat: erfundene Misserfolge ertraenken das Fehlerbild.
+
+/// Mindestzahl ausgegebener Bloecke, damit die `konsole`-Zeile ueberhaupt spricht.
+///
+/// Reine **Sprechprobe** gegen „gar nicht gelaufen": 256 Bloecke sind 4 KiB Ausgabe, und jeder
+/// Lauf, der bis zum Bericht kommt, hat ein Vielfaches davon gedruckt (gemessen rund 3200). Die
+/// Zahl liegt bewusst weit darunter, damit sie nicht eines Tages zur unerfuellbaren Bedingung
+/// wird -- die Falle, die die FP-Sonde gekostet hat.
+pub const MIND_BLOECKE: u64 = 256;
+
+/// Das Urteil der `konsole`-Zeile. Sechs Konjunkte, jedes einzeln falsifizierbar:
+///
+/// 1. **Die Ordnung ist ueberhaupt gelaufen** (Sprechprobe) — `0` Bloecke hiesse, dass jede
+///    Zahl darunter nichts bedeutet.
+/// 2. **Die Schwelle ist bestimmbar** (`> 0`) — ein einseitiger Vergleich gegen `0` waere
+///    gruen, sobald die Kalibrierung ausfaellt (die `NOSEL_TEXT`-Falle).
+/// 3. **Es wurde wirklich gemessen** (`block_max > 0`) — ohne Uhr waere `0` von „alles kurz"
+///    nicht zu unterscheiden. Bei zaehlbaren Bloecken ist `0` unmoeglich, also faengt dieses
+///    Konjunkt genau den Ausfall der Uhr.
+/// 4. **Die Blockhaltung ist gemessen und steht im Bericht** — aber sie GATTERT hier nicht,
+///    und das ist eine Entscheidung mit zwei Gruenden.
+///    *Erstens:* die Schwelle gattert bereits in der `sperre`-Zeile, und zwar fuer die Konsole
+///    mit, seit sie kein erklaerter Schuldner mehr ist (sie taucht dort im bereinigten Kanal auf,
+///    gemessen `crates/caprock-hal/src/konsole.rs` als Spitzenreiter). Dieselbe Tatsache zweimal
+///    zu gattern waere ein zweites Gedaechtnis fuer eine Wahrheit — die Klasse, die diesem
+///    Projekt `MELDESTELLEN` gekostet hat.
+///    *Zweitens, und schwerer:* **die beiden Zahlen gehen gelegentlich auseinander, und ich kann
+///    es nicht erklaeren.** In einem Lauf mass diese Zeile 58 386 592 Zyklen fuer EINEN Block,
+///    waehrend `sperrwacht` im selben Lauf nirgends mehr als 8 241 958 sah — obwohl ihr Fenster
+///    innerhalb dieses hier liegt. Der Wert haengt zudem **nicht** an [`caprock_hal::KONSOLENBLOCK`]
+///    (bei 16 Byte wie bei 4 Byte rund 58 Mio.), ist also keine Bytekosten-Groesse. Ein Gatter auf
+///    eine unerklaerte Zahl waere eine Zeile, die rot wird, ohne dass jemand weiss wofuer. Steht
+///    als offener Punkt in `todo.md`.
+/// 5. **KEINE RISSE** — die Aussage „nichts verwuerfelt". Ein Riss ist eine zerrissene Zeile,
+///    und das ist kein theoretischer Schaden: die erste Fassung dieses Umbaus gab eine
+///    Nachricht aus dem Trap-Kontext einfach roh aus, und in 8 Suitenlaeufen traf einer der
+///    beiden Risse das **Ergebniswort** einer Pruefzeile (`isohigh : ` ohne `SKIP`). Die Zeile
+///    fiel aus der Ergebnissignatur, der Lauf wich ab — ein verlorener Beleg, nicht ein
+///    sichtbarer Fehler. Seither wird nachgetragen statt dazwischengeschrieben, und `risse`
+///    zaehlt nur noch den Ueberlauf des Nachtragspuffers.
+/// 6. **Die Notbremse hat nie gegriffen** — sie ist der Ausgang gegen einen Haenger in der
+///    Konsole; dass es sie gibt, darf nicht heissen, dass sie benutzt wird.
+///
+/// **Was ausdruecklich NICHT gattert: `rueckritt`.** Er zaehlt, wie oft eine Nachricht
+/// nachgetragen werden musste (gemessen ausschliesslich `el0-trap`,
+/// `kernel/src/system.rs:1132`, ein `println!` unter der SCHEDS-Sperre). Das ist ein **Vorgang**,
+/// kein Schaden — beide Zeilen bleiben ganz, nur ihre Reihenfolge tauscht. Ihn zu gattern waere
+/// dieselbe Verwechslung wie „`rx_used` heisst, Daten sind angekommen": eine Zahl, die einen
+/// Vorgang zaehlt, beantwortet die Frage nach der Wirkung nicht.
+pub fn konsole_urteil() -> bool {
+    let s = caprock_hal::console::schreibstand();
+    let schw = schwelle();
+    let _ = schw;
+    s.bloecke >= MIND_BLOECKE
+        && schw > 0
+        && s.block_max > 0
+        && s.risse == 0
+        && s.notbremse == 0
+}
+
+/// **Die Berichtszeile der Konsolen-Schreibordnung.**
+pub fn konsole_bericht() {
+    let s = caprock_hal::console::schreibstand();
+    println!(
+        "konsole : {} (C9b: laengste IRQ-maskierte Blockhaltung {} Zyklen = {} Promille eines \
+         Ticks, gemessen an der Quelle; GEGATTERT wird sie in der `sperre`-Zeile, wo die Konsole \
+         seit dieser Behebung im bereinigten Kanal steht -- **vorher hielt `_print` EINE Sperre \
+         ueber das ganze write_fmt: 69 100 174 Zyklen = 2464 Promille, also das 2,5-Fache der \
+         Schwelle**. Die \
+         Portsperre wird jetzt je {} ausgegebenes Byte genommen, das Warten auf THRE liegt \
+         VOR der Maske, und das \
+         Besitzrecht ueber die ganze Nachricht und OHNE Maskierung. Bloecke {} (mind. {}) · \
+         Kanal besetzt angetroffen {}x -- das ist die GELEGENHEIT, in jedem Lauf zaehlbar, nicht \
+         das seltene Unglueck · nachgetragen statt dazwischengeschrieben {}x (erste Stelle \
+         {}:{}), davon Notbremse {}x · **RISSE {} -- das ist die Zahl, um die es bei \
+         'verwuerfelt' geht, und sie MUSS 0 sein: ein Riss ist eine zerrissene Zeile, und einer \
+         von ihnen hat gemessen das Ergebniswort einer Pruefzeile getroffen (`isohigh : ` ohne \
+         `SKIP`) -- die Zeile fiel aus der Ergebnissignatur**. Verschluckt \
+         werden kann nichts: der gewoehnliche Weg hat keinen Puffer, und der Nachtrag gibt roh \
+         aus statt zu verwerfen, wenn er voll ist. NICHT behoben ist die Verschachtelung -- ein \
+         `println!` UNTER einer fremden Sperre laeuft weiter unter deren Maske, s. \
+         `loader.rs:1392` in der `sperre`-Zeile)",
+        if konsole_urteil() { "ALL PASS" } else { "FAILURES" },
+        s.block_max,
+        promille_eines_ticks(s.block_max),
+        caprock_hal::KONSOLENBLOCK,
+        s.bloecke,
+        MIND_BLOECKE,
+        s.besetzt,
+        s.rueckritt,
+        if s.rueckritt_stelle.0.is_empty() { "-" } else { s.rueckritt_stelle.0 },
+        s.rueckritt_stelle.1,
+        s.notbremse,
+        s.risse,
+    );
 }
 
 // ----------------------------------------------------------------------------------------------

@@ -30,6 +30,13 @@ declare -A ERLAUBT=(
   [gdt]="Segmentierung (x86); Ring-Wechsel"
   [syscall]="Syscall-Eintritt"
   [console]="frueher Debug-Ausgang, vor jeder PD"
+  # Kein Treiber, sondern die SCHREIBORDNUNG ueber den beiden Konsolentreibern (C9b): wer haelt
+  # den Port, wie lange am Stueck, und was geschieht mit einer Ausgabe aus dem Trap-Kontext. Sie
+  # liegt hier und nicht in einer PD aus demselben Grund wie `console` selbst -- sie muss vor
+  # jeder PD sprechen koennen, auch im Panikpfad. Und sie liegt arch-NEUTRAL, weil die Regel es
+  # ist: zwei Architekturen, die dieselbe Ordnung getrennt hinschreiben, sind der Riss, durch den
+  # eine von beiden zurueckfaellt.
+  [konsole]="Schreibordnung der Debug-Konsole (C9b) -- Politik, kein Geraet"
   [power]="system_off/Reset -- Kernaufgabe"
   [psci]="dito (aarch64)"
   [cache]="Cache-Geometrie fuer die Farbzuteilung (A1)"

@@ -7,8 +7,8 @@
 //! Userland-Dienst (ADR 0006).
 
 use super::cpu::{inb, outb};
+use crate::konsole::{self, Schreibordnung};
 use core::fmt::{self, Write};
-use caprock_sync::SpinLock;
 
 /// I/O-Port-Basis der ersten seriellen Schnittstelle (COM1).
 pub const COM1: u16 = 0x3F8;
@@ -37,13 +37,19 @@ impl Uart16550 {
         }
     }
 
+    /// Nimmt der Port jetzt ein Byte an? (`LSR.THRE`.)
+    ///
+    /// **Getrennt von [`Self::put_byte`], weil das Warten OHNE Maske laufen muss** (C9b): steht
+    /// der Sende-FIFO voll oder haengt das Backend, dauert es Millisekunden -- unter einer Sperre
+    /// waere das genau der Praemptionsverlust, um den es geht.
+    fn bereit() -> bool {
+        // SAFETY: Port-I/O auf die feste COM1-Registerdatei (s. `put_byte`).
+        unsafe { inb(COM1 + REG_LSR) & LSR_THRE != 0 }
+    }
+
+    /// Die CR/LF-Regel steht arch-neutral in [`crate::konsole`] — hier nur der Treiber.
     fn write_str_raw(s: &str) {
-        for b in s.bytes() {
-            if b == b'\n' {
-                Self::put_byte(b'\r');
-            }
-            Self::put_byte(b);
-        }
+        konsole::roh(TREIBER, s);
     }
 }
 
@@ -78,12 +84,28 @@ pub fn emit_fmt(args: fmt::Arguments) {
     let _ = Uart16550.write_fmt(args);
 }
 
-/// Lock, der die Ausgabe zwischen Kernen serialisiert (der UART selbst ist zustandslos).
-static CONSOLE: SpinLock<()> = SpinLock::new(());
+/// Die Schreibordnung dieser Konsole (C9b): Besitzrecht ueber die Nachricht, Portsperre je
+/// Block. Warum so und nicht als **eine** Haltung ueber das ganze `write_fmt` — mit den Zahlen,
+/// die den naheliegenden Weg ausgeschlossen haben — steht in [`crate::konsole`].
+/// Der Treiber als Wertepaar: warten und schreiben sind getrennt (s. `konsole::Treiber`).
+static TREIBER: konsole::Treiber = konsole::Treiber { bereit: Uart16550::bereit, senden: Uart16550::put_byte };
+
+static ORDNUNG: Schreibordnung = Schreibordnung::neu();
 
 /// Backing für [`crate::print!`] / [`crate::println!`] (SMP-serialisiert).
+///
+/// **Die Kernnummer kommt aus `TR` und nicht aus `cpuid`**: `cpuid` ist unter KVM ein
+/// bedingungsloser VM-Exit (Fallenliste; in `cycles()` hat er einmal 3556 statt 51 Zyklen
+/// gekostet). Vor dem ersten `ltr` gibt es sie noch nicht — dann laeuft aber auch nur der
+/// Startkern, und `0` ist die Wahrheit und keine Notloesung.
 #[doc(hidden)]
+#[track_caller]
 pub fn _print(args: fmt::Arguments) {
-    let _guard = CONSOLE.lock();
-    let _ = Uart16550.write_fmt(args);
+    let kern = super::gdt::core_from_tr().unwrap_or(0);
+    ORDNUNG.drucken(kern, super::cpu::irqs_freigegeben(), TREIBER, args);
+}
+
+/// Was die Schreibordnung gesehen hat — fuer die `konsole`-Berichtszeile.
+pub fn schreibstand() -> konsole::Stand {
+    ORDNUNG.stand()
 }

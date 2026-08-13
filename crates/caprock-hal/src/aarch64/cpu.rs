@@ -49,6 +49,21 @@ pub fn local_irq_save() -> u64 {
     daif
 }
 
+/// Sind die IRQs am eigenen Kern gerade **freigegeben** (DAIF.I geloescht)?
+///
+/// Gegenstueck zu `x86_64::cpu::irqs_freigegeben`; wofuer es gebraucht wird, steht dort und in
+/// `crate::konsole` (C9b).
+#[inline(always)]
+pub fn irqs_freigegeben() -> bool {
+    let daif: u64;
+    // SAFETY: reines Lesen des DAIF-Systemregisters, ohne Seiteneffekte.
+    unsafe {
+        asm!("mrs {0}, DAIF", out(reg) daif, options(nomem, nostack, preserves_flags));
+    }
+    // DAIF beim Lesen: D=Bit 9, A=Bit 8, **I=Bit 7**, F=Bit 6. Gesetzt heisst maskiert.
+    daif & (1 << 7) == 0
+}
+
 /// Den von [`local_irq_save`] gesicherten DAIF-Zustand wiederherstellen.
 pub fn local_irq_restore(daif: u64) {
     // SAFETY: schreibt nur den zuvor gelesenen DAIF-Zustand zurück.

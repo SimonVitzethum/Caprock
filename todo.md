@@ -11,46 +11,113 @@ ihrer Begründungen — die sind der Wert, nicht die Häkchen. Danach steht hier
 
 ---
 
-## C7b. Woraus die 2 MiB je isolierter PD bestehen — aufgeschlüsselt 2026-08-13
+## C7b. Die 2 MiB je isolierter PD sind gemessen und gesenkt — und der Hebel war der falsche
 
-**Klasse:** Kapazität / Produktziel · **Stand:** aufgeschlüsselt; die eine fehlende Messung ist
-benannt, der Hebel steht mit Zahlen
+**Klasse:** Kapazität / Produktziel · **Stand:** die Messung steht, die Grösse ist gesenkt
+(2 MiB → **64 KiB**), die Kurve ist **nachgemessen** — und sie widerlegt den „Faktor 22".
+Offen ist der Vorrat, der jetzt bindet (s. C7c).
 
 Die Mandantendichte hängt an dieser Zahl (`RAM / Regionsgrösse`, s. C7), und sie war bisher eine
 Summe ohne Summanden. Gelesen im Quelltext, nicht geschätzt:
 
-| Posten | Grösse | was es ist |
+| Posten | vorher | **jetzt** | was es ist |
+|---|---|---|---|
+| **private Region** | **2048 KiB** | **64 KiB** | **der EL0-Stack EINES Threads**, `mem_alloc_anywhere`, mit `zero_phys` genullt, abgebildet nach `SLOT_DATA` |
+| Seitentabellen | 20 KiB | 24 KiB | +1 Rahmen: ohne den 2-MiB-Block braucht das User-Fenster eine Tabelle |
+| EL1-Kernel-Stack | 4 KiB | 4 KiB | seit dem 2026-08-12; vorher 16 |
+| Guard-Page | 4 KiB | 4 KiB | seit dem 2026-08-10 |
+| | **≈ 2076 KiB** | **≈ 96 KiB** | **gemessen** in der Kurve („Je Prozess kostete es 96 KiB"), nicht gerechnet |
+
+**Der Befund war richtig: die 2 MiB waren GRANULARITÄT, nicht Bedarf.** `vspace_map_user_window`
+hat zwei Zweige — `len == TWO_MIB && phys % TWO_MIB == 0` bildet **einen 2-MiB-Block** ab (kein
+Seitentabellenrahmen), alles andere seitenweise **mit** einer Tabelle.
+
+**Die Messung, die gefehlt hat** (2026-08-13, x86, Prüfzeile `ustack`, gattert):
+
+| Suite | tiefster gemessener EL0-Pfad | Region |
 |---|---|---|
-| **private Region** | **2048 KiB** | **der EL0-Stack EINES Threads**, `mem_alloc_anywhere(2 MiB, 2 MiB)`, mit `zero_phys` genullt, abgebildet nach `SLOT_DATA` |
-| Seitentabellen | 20 KiB | 5 Rahmen, gemessen (C7) |
-| EL1-Kernel-Stack | 4 KiB | seit dem 2026-08-12; vorher 16 |
-| Guard-Page | 4 KiB | seit dem 2026-08-10 |
-| | **≈ 2076 KiB** | |
+| `test-qemu-x86.sh` | 6168 B — und das ist die **Tiefensonde selbst**; die Arbeiter dieser Suite fassen ihren Stack nicht an (15 von 17 Messungen: Tiefe 0) | 2 MiB |
+| `test-qemu-x86-load.sh` | **7400 B von 16384 B (45,1 %)** — ein echtes geladenes Programm | 16 KiB |
 
-**Der Befund: die 2 MiB sind GRANULARITÄT, nicht Bedarf.** `vspace_map_user_window` hat zwei
-Zweige — `len == TWO_MIB && phys % TWO_MIB == 0` bildet **einen 2-MiB-Block** ab (kein
-Seitentabellenrahmen), alles andere seitenweise **mit** einer Tabelle. Die Regionsgrösse ist also
-so gewählt, dass die Abbildung ein einziges Blatt ist und **4 KiB Seitentabelle spart**.
+Summenbedingung, wie bei C4 und nicht am Höchststand: `7400 B + 8192 B Reserve = 15 592 B ≤
+65 536 B`, Abstand Faktor 4,2. **Der zweite Summand ist auf EL0 nachweislich NULL** — ein Trap aus
+Ring 3 wechselt immer den Stack (x86 `RSP0` aus der TSS, aarch64 `SP_EL1`); das Gegenstück zum
+Interrupt-Handler auf demselben EL1-Stack existiert hier nicht, und Signal-Handler auf dem
+User-Stack gibt es in diesem System nicht.
 
-**Die Rechnung dieses Tauschs ist eindeutig:** eine Region von 64 KiB kostet **+4 KiB** (eine
-Tabelle) und spart **1984 KiB**. Je PD stünde dann ≈ **92 KiB** statt 2076 — **Faktor 22 auf die
-Mandantendichte**. Auf 64 GiB RAM sind das rund **700 000** statt 32 000 isolierte PDs; die
-Schranke wäre dann wieder `NPDS = 10 000`, also eine Tabelle und kein Speicher.
+**UND JETZT DAS ERGEBNIS, DAS DEN EINTRAG UMDREHT.** Die Kurve wurde nachgemessen — beide Stände
+mit **demselben** Kernel, nur die Konstante getauscht:
 
-- [ ] **Die eine fehlende Messung: wie tief ist der EL0-Stack wirklich?** Ohne sie ist jede
-      kleinere Zahl geraten — dieselbe Lage wie beim EL1-Stack vor der Wasserstandsmarke.
-      **Und sie ist umsonst zu haben:** die Region wird bei der Zuteilung mit `zero_phys`
-      **genullt**, ein Füllmuster braucht es also gar nicht — das **höchste von Null verschiedene
-      Byte** ist der Wasserstand. Gemessen wird beim Teardown (dort steht die Region noch) und am
-      Schluss über die lebenden, genau wie `kstackmark` es für EL1 tut.
-- [ ] **Danach erst die Grösse senken**, und dann mit derselben Summenbedingung wie bei C4:
-      tiefster Pfad + Reserve ≤ Regionsgrösse. Eine Regionsgrösse, die nur den beobachteten
-      Höchststand trägt, ist statistisch und nicht strukturell.
-- [ ] **Der zweite Weg bleibt daneben stehen und ist der bessere, aber teurere:** die VA bei
-      2 MiB lassen und **lazy** unterlegen (Speicher-Server, [Z16](#z16) Stufe 1). Dann kostet
-      eine PD nur, was sie anfasst — und die Zahl hängt nicht mehr an einer Wahl, sondern am
-      Verhalten. Das ist derselbe Hebel, der in C7 schon als Prioritätsargument für den
-      Speicher-Server steht.
+| RAM | vorher (2 MiB) | Grund | **nachher (64 KiB)** | Grund |
+|---|---|---|---|---|
+| 512M | 220 | **RAM** (1 MiB frei) | **321** (+46 %) | **Guard-Tabellen-Topf**, 419 MiB frei |
+| 3G | 1119 | **Guard-Tabellen-Topf**, 739 MiB frei | **979** (−12,5 %) | **Guard-Tabellen-Topf**, 2918 MiB frei |
+
+**„Faktor 22 auf die Mandantendichte" war falsch, und zwar aus einem Grund, den die Rechnung nicht
+sehen konnte:** sie hat `RAM / Regionsgrösse` gerechnet und damit vorausgesetzt, dass RAM bindet.
+Bei 3 GiB tat er das **schon vorher nicht** — dort war bereits mit 2-MiB-Regionen der feste
+Vorrat aufgeteilter Guard-Seitentabellen die Schranke (1119 PDs bei 739 MiB freiem RAM). Die
+**Kosten** je PD sind wirklich um Faktor 21,7 gefallen (2076 → 96 KiB, gemessen); die **Dichte**
+ist ihnen nicht gefolgt, weil der nächste Topf fest ist. Der Zugewinn steht dort, wo RAM wirklich
+band: bei 512 MiB, +46 %.
+
+Dass die Zahl bei 3G sogar **fällt** (1119 → 979), ist kein Widerspruch, sondern dieselbe Ursache:
+der Topf bindet an der Zahl **verschiedener 2-MiB-Blöcke**, über die die Kernel-Stacks streuen,
+und die hängt an der Schrittweite je PD. Wer die Regionsgrösse ändert, ändert die Streuung.
+
+- [x] **Die Messung: wie tief ist der EL0-Stack wirklich?** Steht als `kernel/src/userstackmark.rs`
+      (Nullung statt Füllmuster — die Region wird ohnehin genullt, das höchste von Null
+      verschiedene Byte IST der Wasserstand), mit Eichung (drei Fälle) **und** einer Tiefensonde
+      auf dem echten Pfad. Die Sonde prüft, was die Eichung strukturell nicht kann: dass die
+      Buchführung Thread-Slot → Region auf die **richtige** Region zeigt. Ein Eintrag, der auf
+      irgendeine andere genullte Region zeigt, meldet „viel Luft" und bestünde jede Eichung.
+- [x] **Die Grösse senken**, mit der Summenbedingung. `hal::mmu::PRIV_REGION_SIZE = 64 KiB`.
+- [ ] **Der zweite Weg bleibt daneben stehen und ist jetzt der EINZIGE, der noch etwas bewegt:**
+      die VA bei 2 MiB lassen und **lazy** unterlegen (Speicher-Server, [Z16](#z16) Stufe 1).
+      Dann kostet eine PD nur, was sie anfasst. **Aber:** solange C7c bindet, ändert auch das die
+      Dichte nicht — die Reihenfolge ist damit umgedreht, C7c kommt zuerst.
+- [ ] **Was die Messung NICHT sieht, und es gehört in jede Folgeentscheidung:** ein mit **Null**
+      beschriebenes Stackwort ist unsichtbar (das Muster-Verfahren von `kstackmark` erkennt jeden
+      Schreibzugriff, das Null-Verfahren nur solche mit Wert ≠ 0). Der Messwert ist eine
+      **Untergrenze**; der Abstand Faktor 4,2 zur Regionsgrösse ist die Antwort darauf. Wer die
+      Grösse weiter senken will, braucht zuerst ein Verfahren ohne diesen blinden Fleck — etwa
+      den gesicherten User-`RSP` im Trapframe als zweiten, inhaltsunabhängigen Schätzer.
+- [ ] **Der `ustack`-Bericht steht nur im x86-Hochlaufweg**, die Zähler laufen arch-neutral mit.
+      Dieselbe Einordnung (und dieselbe Lücke) wie bei `kstack` und `sperre` — s. C9d.
+
+## C7c. Der Vorrat, der JETZT bindet: 16 aufgeteilte Guard-Blöcke (gemessen 2026-08-13)
+
+**Klasse:** Kapazität / Produktziel · **Stand:** gemessen und benannt, nicht behoben.
+**Er ist seit C7b die Schranke der Mandantendichte** — auf jeder RAM-Grösse, die geprüft wurde.
+
+`hal::mmu::GUARD_BLOCKS = 16`. Ein Kernel-Stack liegt oberhalb 16 MiB, wo die Identitätskarte in
+2-MiB-Blöcken steht; eine 4-KiB-Wache verlangt, den Block in eine Seitentabelle aufzuteilen, und
+die HAL hat keinen Allokator (Kerngrenze) — der Vorrat ist statisch. Reicht er nicht, wird die
+Stack-Anforderung **benannt abgewiesen** (`MANGEL_GUARD_TABELLE`) statt unbewacht bedient. Das ist
+richtig so; die Schranke ist fail-closed und keine Korrektheitslücke.
+
+**Die Herleitung der 16 stimmt nicht mehr — und sie hat nie das Richtige gerechnet.** Im Quelltext
+steht: „ein 16-KiB-Stack mit Wache belegt 20 KiB, in einen 2-MiB-Block passen also gut 100 davon,
+16 Blöcke tragen rund 1600 bewachte Stacks — mehr als die 224..1477 einer isolierten
+Kapazitätskurve". Zwei Fehler darin:
+
+1. Der EL1-Stack ist **seit dem 2026-08-12 4 KiB**, mit Wache also 8 KiB — 256 je Block, 4096
+   insgesamt. Die Zahl im Kommentar ist überholt.
+2. Wichtiger: die Rechnung misst die **Packungsdichte innerhalb** eines Blocks. Gebunden ist aber
+   die Zahl **verschiedener** Blöcke, über die die Stacks streuen — und die hängt daran, was
+   zwischen zwei Stacks sonst alloziert wird. Gemessen bei 512M/64 KiB: **321 bewachte Stacks über
+   16 Blöcke = rund 20 je Block**, also **7,8 % der 4096, die hineinpassten**.
+
+**Die strukturelle Antwort steht schon im Quelltext und ist jetzt bezifferbar:** eine
+**Stack-Arena** — ein zusammenhängender Bereich, dessen Blöcke einmal aufgeteilt werden. Sie hebt
+die Dichte um den Faktor, der oben als Verschnitt steht (rund 12), ohne eine einzige statische
+Tabelle mehr.
+
+- [ ] **Stack-Arena statt gestreuter Kernel-Stacks.** Umbau der Stack-Zuteilung, nicht eine
+      grössere Konstante. `GUARD_BLOCKS` zu erhöhen kauft lineare Zahlen mit linearem BSS und
+      lässt den Verschnitt von 92 % stehen.
+- [ ] **Bis dahin gehört die Zahl in die Produktaussage**, nicht die Rechnung `RAM / 96 KiB`:
+      gemessen sind **321 (512M)** und **979 (3G)** isolierte, **lebende** Mandanten.
 
 ## C9. Sperrhaltedauer — die Marke steht, die drei Befunde sind offen (2026-08-12)
 
@@ -2682,7 +2749,9 @@ eine Messung, die tausende PDs belegt, kippt sonst jede baseline-empfindliche Ze
 | SAS-PD, **kernlokaler** Spawn | 4987 | — | **4987** | **Hosting-Kapazität EINES Kerns** = `je_kern × MIGRATION_HEADROOM` = 2500 × 2 = 5000. **Nicht RAM**: bei 6 GiB blieben 5771 MiB frei |
 | SAS-PD, **lastverteilter** Spawn | 7212 | **9984** | **9984** | 512M: **RAM** (freies RAM auf 0, 64 KiB je Prozess). 3G/6G: **Thread-Slots** — 9984 + 16 schon lebende = **10 000 = `TARGET_THREADS`**, exakt die Zusage |
 | **Isolierte** PD *(überholt, s. u.)* | 224 | 1504 | 3040 | **RAM**, und zwar **2 MiB je Prozess** (private Region). Linear in der RAM-Grösse; freie VSpaces bei n=1000 noch 4087, also **nicht** VSpace/ASID |
-| **Isolierte** PD, Arbeiter in `.user_text` | **220** | **1477** | — | **RAM**, 2084 KiB je Prozess (2 MiB Region + **20 KiB Seitentabellen**). Diese Zeile misst PDs, deren Thread **lebt** — die darüber tat es nicht |
+| **Isolierte** PD, Arbeiter in `.user_text` *(2026-08-10; die 3G-Zahl hat später nicht mehr gehalten, s. u.)* | **220** | **1477** | — | **RAM**, 2084 KiB je Prozess (2 MiB Region + **20 KiB Seitentabellen**). Diese Zeile misst PDs, deren Thread **lebt** — die darüber tat es nicht |
+| **Isolierte** PD, 2-MiB-Region, Stand 2026-08-13 | **220** | **1119** | — | 512M: **RAM**. 3G: **NICHT RAM**, sondern der feste Vorrat aufgeteilter Guard-Seitentabellen (739 MiB frei) — s. [C7c](#c7c-der-vorrat-der-jetzt-bindet-16-aufgeteilte-guard-bloecke-gemessen-2026-08-13) |
+| **Isolierte** PD, **64-KiB-Region** (C7b, 2026-08-13) | **321** | **979** | — | **beide Male der Guard-Tabellen-Topf** (419 bzw. 2918 MiB frei), **96 KiB je Prozess**. Und die Threads leben nachweislich: die Kurve zählt die Regionen mit einer **Spur** ihres Threads, nicht die Tabelleneinträge |
 
 **Die drei Aussagen, die daraus folgen:**
 
@@ -2707,22 +2776,31 @@ belegt die **Kernel-Datenstrukturen**; für eine PaaS zählt die **dritte**.
 > aus einer entwerteten Zeile eine Produktzusage ableitet, hat Glück gehabt, nicht recht behalten.
 > Die Zahlen unten sind die der berichtigten Reihe.
 
-Dort ist die Schranke RAM bei **2084 KiB je PD** (2 MiB private Region **+ 20 KiB
-Seitentabellen**, jetzt getrennt gemessen), also ≈ `RAM / 2 MiB` Mandanten — auf einer 64-GiB-Maschine rund **32 000**,
+Dort war die Schranke RAM bei **2084 KiB je PD** (2 MiB private Region **+ 20 KiB
+Seitentabellen**, getrennt gemessen), also ≈ `RAM / 2 MiB` Mandanten — auf einer 64-GiB-Maschine rund **32 000**,
 auf der Messmaschine dreistellig. **„10 000 Prozesse" ist als Zusage nur in der Fassung wahr, die
 kein Mandantenmodell ist.** So gehört es gesagt, und nicht weicher.
 
-**Damit sind die 2 MiB der Hebel Nummer eins — und die Frage ist, woraus sie bestehen.** Stecken
-darin vorab belegte private Regionen oder eine eifrig gefüllte BSS, sind die klassischen Antworten
-**Lazy-Zuteilung** und eine **geteilte Nullseite mit COW**. Beides ist Territorium des
-**Speicher-Servers** ([Z16](#z16) Stufe 1) — der damit aufhört, nur „Grundlage für musl" zu sein,
-und zusätzlich **der Hebel für Mandantendichte** wird. Das ist ein Prioritätsargument, kein
-Nebensatz: Z16 Stufe 1 steht damit vor Arbeiten, die nur eine Zusage schärfen, ohne die Dichte zu
-ändern.
+> **Zweite Berichtigung, 2026-08-13 (C7b).** Der Absatz darüber rechnet `RAM / Regionsgrösse` —
+> und setzt damit voraus, dass **RAM** bindet. Nachgemessen gilt das nur bei 512 MiB. Schon bei
+> 3 GiB endete die Reihe **vor** dem RAM, nämlich am festen Vorrat aufgeteilter
+> Guard-Seitentabellen (1119 PDs bei **739 MiB freiem RAM**). Die Regionsgrösse ist seither
+> gesenkt (2 MiB → 64 KiB, **96 KiB je PD gemessen**), und die Dichte ist ihr **nicht** gefolgt:
+> 512M 220 → **321**, 3G 1119 → **979**. Wer aus einer Kostensenkung eine Dichtezusage ableitet,
+> hat den nächsten Topf nicht gefragt. Die Zahl, die heute gilt, steht in
+> [C7c](#c7c-der-vorrat-der-jetzt-bindet-16-aufgeteilte-guard-bloecke-gemessen-2026-08-13).
 
-- [ ] **Woraus bestehen die 2 MiB?** Aufschlüsseln (private Region, Seitentabellen, Stack,
-      Endowment), dann entscheiden, was davon lazy werden kann. **Vor** dem Umbau messen, sonst
-      ist hinterher nicht zu sagen, was die Verbesserung gebracht hat.
+**Die 2 MiB WAREN der Hebel Nummer eins — sie sind es nicht mehr, und das ist gemessen.** Die
+klassischen Antworten (**Lazy-Zuteilung**, **geteilte Nullseite mit COW**) bleiben richtig und
+bleiben Territorium des **Speicher-Servers** ([Z16](#z16) Stufe 1); sie bewegen die Dichte aber
+erst, wenn [C7c](#c7c-der-vorrat-der-jetzt-bindet-16-aufgeteilte-guard-bloecke-gemessen-2026-08-13)
+behoben ist. Die Priorität dreht sich damit um: **C7c vor Z16 Stufe 1.**
+
+- [x] **Woraus bestehen die 2 MiB?** Aufgeschlüsselt und gemessen — s.
+      [C7b](#c7b-die-2-mib-je-isolierter-pd-sind-gemessen-und-gesenkt--und-der-hebel-war-der-falsche).
+      **Vor** dem Umbau gemessen und **danach** noch einmal, mit derselben Kernelfassung und nur
+      getauschter Konstante; ohne die Vorher-Messung am selben Stand wäre die Differenz einem
+      halben Dutzend Änderungen seit dem 2026-08-10 zuzuschreiben gewesen.
 
 - [~] **Die nicht provozierten Meldestellen** (Rest des obigen Punktes). **Am 2026-08-11 von 21
       auf 16 gesunken: der Sweep fährt jetzt den echten LADEPFAD.** Stand (die Summanden gehen

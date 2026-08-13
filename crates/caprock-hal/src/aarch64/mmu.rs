@@ -339,8 +339,26 @@ pub const GIB1_END: u64 = RAM_BASE + ONE_GIB;
 /// steht weiterhin bei ihren Aufrufern (`system::gib0_zone`), auf beiden Architekturen gleich.
 pub const LOW_MAPPED_END: u64 = u64::MAX;
 
-/// Größe der privaten User-Region je isolierter PD (ein L2-Block).
+/// **Die Blockgranularität der Identitätskarte** (2 MiB) — ein L2-Blockdeskriptor.
+///
+/// Begründung wortgleich zur x86-Seite: die Konstante trug bis C7b zwei Bedeutungen (Blockgrösse
+/// **und** private Regionsgrösse), die nur solange dieselbe Zahl waren, wie die Region genau ein
+/// Block war. Die private Region steht seither als [`PRIV_REGION_SIZE`] daneben.
 pub const ISO_REGION_SIZE: u64 = TWO_MIB;
+
+/// **Die private Region einer isolierten PD** — der EL0-Stack EINES Threads (C7b).
+///
+/// Die Zahl ist gemessen (`kernel/src/userstackmark.rs`, Prüfzeile `ustack`) und folgt der
+/// Summenbedingung „tiefster gemessener Pfad + geforderte Reserve ≤ Regionsgrösse"; die volle
+/// Begründung steht bei der x86-Fassung dieser Konstante.
+///
+/// **Was auf dieser Architektur NICHT gemessen ist, und das gehört dazu:** die Berichtszeile
+/// `ustack` steht heute nur im x86-Hochlaufweg (dieselbe Einordnung wie `kstack` und `sperre`).
+/// Die Zähler laufen hier mit, aber es gibt niemanden, der sie druckt oder gattert. Die Zahl
+/// stammt also aus einer Messung auf x86 — und sie ist auf aarch64 **konservativer**, nicht
+/// knapper: der User-Stack eines geladenen Programms ist dort dieselben 16 KiB, und die gefärbte
+/// Region ist mit 16 KiB (16 Farben / 4 Partitionen) sogar kleiner als diese 64 KiB.
+pub const PRIV_REGION_SIZE: u64 = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // Per-Prozess-VSpaces (Weg C, Hybrid): die SAS-Map bleibt für vertrauenswürdige

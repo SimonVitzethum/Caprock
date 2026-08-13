@@ -110,12 +110,33 @@ struct KstackPool {
     /// dimensioniert (Thread-Kapazität), s. [`configure`].
     base_of: Slab<u64>,
     live: usize,
+    /// **C7b: die EL0-USER-Stackregion je Thread-Slot** — physische Basis und Länge (`0` =
+    /// keine). Das ist die *andere* Seite desselben Threads: `base_of` hält seinen 16-KiB-EL1-
+    /// Stack, `ubase_of` die Region, auf der sein Ring-3-Code rechnet.
+    ///
+    /// **Warum eine Buchführung und kein Erkennen am Inhalt.** Im Zombie-Ring des Schedulers
+    /// liegen Kernel-Thread-Stacks und EL0-User-Regionen nebeneinander. `kstackmark` unter-
+    /// scheidet sie am Füllmuster — die EL0-Region trägt aber keines (sie ist **genullt**, s.
+    /// `userstackmark`), und „Fuss ist null" gilt genauso für einen restlos aufgebrauchten
+    /// Kernel-Stack. Eine Unterscheidung am Inhalt wäre also genau die Sorte Erkenner, der den
+    /// schlimmsten Fall nicht sieht. Hier steht stattdessen eine **positive** Zuordnung: der
+    /// Spawn-Pfad sagt, welche Region die EL0-Region dieses Slots ist, und `reap_core` prüft die
+    /// Übereinstimmung mit dem Zombie.
+    ///
+    /// Sie liegt aus zwei Gründen in **diesem** Lock und nicht in einem eigenen: sie wird in
+    /// genau denselben kritischen Abschnitten geschrieben wie `base_of` (s.
+    /// [`record_user_kstack`]), und ein weiteres Blattlock wäre eine weitere Kante in der
+    /// Sperrordnung, die niemand prüft.
+    ubase_of: Slab<u64>,
+    ulen_of: Slab<u64>,
 }
 /// Pool-Lock (nur `base_of`/`live`); NIE verschachtelt mit `MEM` gehalten (claim/reclaim nehmen die
 /// Locks sequenziell) -> keine Sperrordnungsverletzung; `MEM` ist ohnehin innerster Rang.
 static KSTACKS: SpinLock<KstackPool> = SpinLock::new(KstackPool {
     base_of: Slab::empty(),
     live: 0,
+    ubase_of: Slab::empty(),
+    ulen_of: Slab::empty(),
 });
 
 /// Einen EL0-Kernel-Stack (16 KiB, ausgerichtet) aus `MEM` allozieren. Gibt die **physische Basis**
@@ -238,6 +259,32 @@ fn release_user_kstack(base: usize) {
 fn record_user_kstack(thread_slot: usize, base: usize) {
     KSTACKS.lock().base_of[thread_slot] = base as u64;
 }
+
+/// **C7b: die EL0-USER-Stackregion dieses Threads buchen.** Steht neben [`record_user_kstack`]
+/// und wird im selben kritischen Abschnitt gerufen — aus demselben Grund: was hinter der Freigabe
+/// von `SCHEDS` gebucht wird, kann der Thread bereits überholt haben.
+///
+/// `(0, 0)` heisst „dieser Thread hat keine EL0-Region, die ihm gehört". Das ist kein Ausfall,
+/// sondern eine benannte Lage: bei einem **gefärbt geladenen** Programm liegt der Stack in
+/// mehreren Stücken in der `seglist` der PD und gehört nicht dem Thread (er überlebt dessen Tod
+/// bis zum PD-Abbau). Eine Buchführung, die dort eine Region behauptete, zeigte auf Speicher, den
+/// ein anderer freigibt.
+fn record_user_region(thread_slot: usize, base: u64, len: u64) {
+    if base == 0 || len == 0 {
+        return;
+    }
+    {
+        let mut p = KSTACKS.lock();
+        // Ohne `selftest` sind die Tabellen gar nicht angehaengt (s. `configure`) -- dann ist die
+        // Laenge 0, und die Buchung entfaellt, statt daneben zu greifen.
+        if thread_slot >= p.ubase_of.len() {
+            return;
+        }
+        p.ubase_of[thread_slot] = base;
+        p.ulen_of[thread_slot] = len;
+    }
+    crate::userstackmark::registriert();
+}
 /// Beim Thread-Ende: den ggf. zugeordneten Kstack an `MEM` zurückgeben. No-Op für EL1-Threads.
 fn reclaim_user_kstack(thread_slot: usize) {
     let base = {
@@ -323,6 +370,104 @@ pub fn kstack_marke_fegen() -> (usize, usize) {
         }
     }
     (gefegt, tiefster)
+}
+
+/// **C7b: über alle noch LEBENDEN EL0-User-Regionen fegen** und ihren Wasserstand einrechnen.
+/// Gibt `(gefegt, tiefster_slot)`.
+///
+/// Gegenstück zu [`kstack_marke_fegen`] und aus demselben Grund nötig: der Sterbepfad misst nur
+/// die Regionen sterbender Threads. Die langlebigen (Root-Task, Treiber-PDs, IPC-Server) sterben
+/// in einem grünen Lauf nie — und gerade sie fahren die tiefsten Userland-Pfade.
+pub fn userstack_marke_fegen() -> (usize, usize) {
+    let mut gefegt = 0usize;
+    let mut tiefster = usize::MAX;
+    let mut tiefe = 0usize;
+    // Wie beim Kstack-Fegen: gemessen wird UNTER dem Blattlock (kein Zwischenpuffer, der die
+    // Liste stillschweigend abschneiden könnte), am Schluss des Laufs, wo Wandzeit nichts kippt.
+    let p = KSTACKS.lock();
+    for slot in 0..p.ubase_of.len() {
+        let (b, l) = (p.ubase_of[slot], p.ulen_of[slot]);
+        if b == 0 || l == 0 {
+            continue;
+        }
+        // SAFETY: die Region ist identity-gemappt und gehört diesem (lebenden) Thread; gelesen
+        // wird nur, und ein gleichzeitig tiefer werdender Stack macht den Messwert nur kleiner.
+        let (benutzt, _) = unsafe {
+            crate::userstackmark::messen(
+                b as usize,
+                l as usize,
+                crate::userstackmark::Anlass::Lebend(slot),
+            )
+        };
+        gefegt += 1;
+        if benutzt > tiefe {
+            tiefe = benutzt;
+            tiefster = slot;
+        }
+    }
+    (gefegt, tiefster)
+}
+
+/// **C7b/C7: die LEBENDIGKEIT der gezählten Prozesse** — `(lebende EL0-Regionen, davon benutzt)`.
+///
+/// **Warum diese Zeile existiert.** Die isolierte Kapazitätskurve hat schon einmal Leichen
+/// gezählt: `kurven_arbeiter` lag in `.text`, jeder Thread faultete an seiner Einsprungadresse,
+/// und „3040 isolierte Prozesse" hiess in Wahrheit „3040 mal eine PD angelegt, deren Thread sofort
+/// starb". Aufgefallen ist es an einer Nebenbeobachtung (228 `el0-trap`-Zeilen), nicht an einer
+/// Prüfung.
+///
+/// Hier ist es eine Prüfung, und sie hängt nicht an einer Fehlermeldung: der Arbeiter der Kurve
+/// legt vor dem Parken ein von Null verschiedenes Wort auf **seinen** Stack. Eine Region mit Tiefe
+/// `0` gehört damit zu einem Thread, der nie eine Instruktion ausgeführt hat. Gezählt wird also
+/// die WIRKUNG (er hat gerechnet), nicht ein Zustand (er ist eingetragen).
+pub fn userstack_lebendig_zaehlen() -> (usize, usize) {
+    let mut lebend = 0usize;
+    let mut benutzt = 0usize;
+    let p = KSTACKS.lock();
+    for slot in 0..p.ubase_of.len() {
+        let (b, l) = (p.ubase_of[slot], p.ulen_of[slot]);
+        if b == 0 || l == 0 {
+            continue;
+        }
+        lebend += 1;
+        // SAFETY: identity-gemappte Region eines lebenden Threads; gelesen wird nur.
+        if unsafe { crate::userstackmark::unberuehrt(b as usize, l as usize) } < l as usize {
+            benutzt += 1;
+        }
+    }
+    (lebend, benutzt)
+}
+
+/// **C7b: die Tiefensonde nachmessen** — die Sprechprobe des GEMESSENEN PFADES.
+///
+/// Misst die EL0-Region **dieses** Threads, während er lebt, und legt das Ergebnis in
+/// `userstackmark::sonde_melden` ab. Gibt die gemessene Tiefe zurück (`0` = keine Region gebucht).
+///
+/// Warum das nicht erst im Bericht passiert: das Urteil der `ustack`-Zeile liest die Sonde als
+/// Konjunkt, und `all_done()` wird **gepollt** — was im Bericht entsteht, kann den Bericht nicht
+/// auslösen. Deshalb ruft der Hochlauf diese Funktion, sobald die Sonde gemeldet hat, dass sie
+/// fertig berührt hat.
+pub fn userstack_sonde_pruefen(tid: ThreadId) -> usize {
+    let (b, l) = {
+        let p = KSTACKS.lock();
+        if tid.slot() >= p.ubase_of.len() {
+            return 0;
+        }
+        (p.ubase_of[tid.slot()], p.ulen_of[tid.slot()])
+    };
+    if b == 0 || l == 0 {
+        return 0;
+    }
+    // SAFETY: wie beim Fegen — identity-gemappte Region eines lebenden Threads, nur gelesen.
+    let (benutzt, _) = unsafe {
+        crate::userstackmark::messen(
+            b as usize,
+            l as usize,
+            crate::userstackmark::Anlass::Lebend(tid.slot()),
+        )
+    };
+    crate::userstackmark::sonde_melden(benutzt);
+    benutzt
 }
 
 /// Virtuelle „freie Kstack-Kapazität" (jetzt RAM-begrenzt): `MAX_THREADS - live`. Für den
@@ -1366,6 +1511,31 @@ pub fn configure(cores: usize) -> (usize, usize, usize, u64) {
             .base_of
             .attach(ks as *mut u64, total, |_| 0u64)
     };
+    // **C7b: die EL0-USER-Regionen je Thread-Slot** (Basis + Laenge). Zwei weitere Tabellen
+    // derselben Dimension; sie kosten `2 * 8 * total` Byte und stehen im Boot-Report (`bytes`),
+    // damit auch diese Entscheidung an einer gemessenen Groesse haengt.
+    //
+    // **Nur unter `selftest`** -- die Marke ist Messmaschinerie und gehoert nicht in den schlanken
+    // Kernel (dieselbe Haltung wie `kstackmark::fuellen`, das dort ein No-Op ist). Ohne die
+    // Tabellen bleiben die Slabs LEER, und jeder Zugriff darauf prueft das; ein `record` in einen
+    // leeren Slab waere ein Fehlgriff, kein Messausfall.
+    #[cfg(feature = "selftest")]
+    {
+        let ub = table(
+            total * core::mem::size_of::<u64>(),
+            core::mem::align_of::<u64>().max(4096),
+        );
+        let ul = table(
+            total * core::mem::size_of::<u64>(),
+            core::mem::align_of::<u64>().max(4096),
+        );
+        // SAFETY: wie oben (exklusiv, ausgerichtet, dauerhaft, einmalig).
+        unsafe {
+            let mut p = KSTACKS.lock();
+            p.ubase_of.attach(ub as *mut u64, total, |_| 0u64);
+            p.ulen_of.attach(ul as *mut u64, total, |_| 0u64);
+        };
+    }
 
     // **Rueckwaerts-Index Thread-Slot -> PD** (Z22 P2 / C4). Die vierte per-Thread-Tabelle, und
     // sie wird HIER angehaengt und nicht in `configure_caps`: dort ist die Thread-Kapazitaet
@@ -2602,6 +2772,8 @@ pub fn spawn_user_parked(entry: usize, arg: usize, prio: u8) -> Option<Parked> {
             fp_reset_slot(t.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
             // Buchfuehrung NOCH UNTER SCHEDS -- s. Kommentar an `record_user_kstack`.
             record_user_kstack(t.slot(), kbase); // Kstack dem Thread zuordnen
+            // C7b: SAS-User-Stack (`STACK_SIZE`) -- dieselbe Klasse, andere Groesse.
+            record_user_region(t.slot(), user_base as u64, user_len as u64);
         }
         r
     }; // SCHEDS freigegeben
@@ -3266,7 +3438,11 @@ pub fn spawn_isolated_parked(entry: usize, arg: usize, prio: u8) -> Option<(Park
     // identisch abgebildet, sondern in das private User-Fenster dieser PD
     // (`hal::mmu::ISO_USER_VA`, ausserhalb der Identitaetskarte). Damit ist die PHYSADRESSE frei,
     // und der GiB-0-Deckel von gemessenen 504 gleichzeitigen isolierten PDs faellt.
-    let region_sz = hal::mmu::ISO_REGION_SIZE;
+    // **`PRIV_REGION_SIZE` und nicht `ISO_REGION_SIZE`** (C7b): die eine Konstante trug beide
+    // Bedeutungen, und sie waren nur solange dieselbe Zahl, wie die Region genau ein
+    // 2-MiB-Blockdeskriptor war. Hier ist die Groesse eines STACKS gemeint, nicht die eines
+    // Blocks.
+    let region_sz = hal::mmu::PRIV_REGION_SIZE;
     let (rbase, rlen) = match benannt_alloc(MANGEL_PRIVATREGION, region_sz, |n| {
         mem_alloc_anywhere(n, n)
     }) {
@@ -3315,6 +3491,9 @@ pub fn spawn_isolated_parked(entry: usize, arg: usize, prio: u8) -> Option<(Park
             fp_reset_slot(t.slot()); // FP + VSPACE_OF[slot]=0 (global) zurücksetzen
             // Buchfuehrung NOCH UNTER SCHEDS -- s. Kommentar an `record_user_kstack`.
             record_user_kstack(t.slot(), kbase); // Kstack dem Thread zuordnen (reclaim!)
+            // C7b: DIE private Region -- der EL0-Stack dieses Threads und der groesste
+            // Einzelposten je Mandant.
+            record_user_region(t.slot(), rbase, rlen);
             set_vspace_of(t.slot(), packed); // ab jetzt isoliert (nach fp_reset_slot!)
         }
         r
@@ -3480,6 +3659,8 @@ fn spawn_isolated_colored_inner(
             fp_reset_slot(t.slot());
             // Buchfuehrung NOCH UNTER SCHEDS -- s. Kommentar an `record_user_kstack`.
             record_user_kstack(t.slot(), kbase);
+            // C7b: die gefaerbte private Region (`colors::region_bytes()`).
+            record_user_region(t.slot(), rbase, rlen);
             set_vspace_of(t.slot(), packed); // nach fp_reset_slot!
         }
         r
@@ -3556,7 +3737,9 @@ pub fn spawn_isolated_native_parked(code: *const u8, code_len: usize, prio: u8) 
     let core = hal::cpu::core_id();
     mangel_zuruecksetzen();
     let kbase = claim_user_kstack()?; // EL0-Kernel-Stack aus MEM (16 KiB, ausgerichtet)
-    let sz = hal::mmu::ISO_REGION_SIZE;
+    // C7b: Code- **und** Stack-Frame nehmen die Groesse der privaten Region. Fuer den Code ist
+    // das eine Obergrenze fuer `code_len` (unten geprueft), fuer den Stack die gemessene Groesse.
+    let sz = hal::mmu::PRIV_REGION_SIZE;
 
     // Code-Frame + Stack-Frame. **Seit dem VA==PA-Durchgang ohne Zonenbindung:** beide gehen
     // in das private User-Fenster (Plaetze `SLOT_CODE`/`SLOT_DATA`), nicht mehr identisch in
@@ -3641,6 +3824,8 @@ pub fn spawn_isolated_native_parked(code: *const u8, code_len: usize, prio: u8) 
             fp_reset_slot(t.slot());
             // Buchfuehrung NOCH UNTER SCHEDS -- s. Kommentar an `record_user_kstack`.
             record_user_kstack(t.slot(), kbase); // Kstack dem Thread zuordnen (reclaim!)
+            // C7b: der Stack-Frame der nativ geladenen PD (der Code-Frame ist keiner).
+            record_user_region(t.slot(), sbase, slen);
             set_vspace_of(t.slot(), packed); // nach fp_reset_slot!
         }
         r
@@ -4527,6 +4712,11 @@ pub fn load_into_pd_mit(
             // sie auch danach sicher (`local_irq_save` oben), aber die Form bleibt ueberall gleich:
             // eine Ausnahme, die nur unter einer Zusatzbedingung stimmt, ist eine kuenftige Falle.
             record_user_kstack(t.slot(), kbase);
+            // C7b: der User-Stack eines GELADENEN Programms (`LOADED_STACK_BYTES`, 16 KiB).
+            // **Gefaerbt geladen ist er hier `(0, 0)`** -- dann liegt er in Stuecken in der
+            // `seglist` der PD und gehoert nicht dem Thread. Eine Buchfuehrung, die dort eine
+            // Region behauptete, zeigte auf Speicher, den der PD-Abbau freigibt.
+            record_user_region(t.slot(), stack_pa, stack_reap_len);
             set_vspace_of(t.slot(), ((asid as u64) << 48) | l1); // isoliert (nach fp_reset_slot!)
         }
         r
@@ -7927,6 +8117,49 @@ pub fn kill_local(tid: ThreadId) -> bool {
     ok
 }
 
+/// **C7b: die EL0-Region eines sterbenden Threads messen und austragen.**
+///
+/// Wird aus [`reap_core`] gerufen, **vor** der Rückgabe an `MEM`. Misst nur, wenn die Buchführung
+/// für `slot` auf genau diese Region zeigt — der Zombie-Ring führt Kernel-Thread-Stacks und
+/// EL0-Regionen in derselben Liste, und ihre Unterscheidung darf nicht am Inhalt hängen.
+///
+/// Der Eintrag wird in **jedem** Fall geleert, sobald er auf diesen Slot passt: die `gid` geht
+/// gleich zurück in die Freiliste, und ein stehengebliebener Eintrag zeigte danach auf die Region
+/// eines fremden Threads — genau die Form, vor der der C4-Eintrag bei den Wartelisten warnt.
+fn userstack_beim_tod_messen(slot: usize, base: u64, len: u64) {
+    let treffer = {
+        let mut p = KSTACKS.lock();
+        if slot >= p.ubase_of.len() {
+            false
+        } else if p.ubase_of[slot] == base && p.ulen_of[slot] == len && base != 0 && len != 0 {
+            p.ubase_of[slot] = 0;
+            p.ulen_of[slot] = 0;
+            true
+        } else {
+            // Kein Treffer: entweder ein Kernel-Thread-Stack (dann steht dort ohnehin nichts),
+            // oder eine gefaerbt geladene PD, deren Stackstuecke der PD gehoeren. Der Eintrag
+            // dieses Slots wird trotzdem geraeumt, wenn es einen gibt -- die `gid` wird gleich
+            // neu vergeben.
+            if slot < p.ubase_of.len() {
+                p.ubase_of[slot] = 0;
+                p.ulen_of[slot] = 0;
+            }
+            false
+        }
+    };
+    if treffer {
+        // SAFETY: der Zombie ist eingesammelt; die Region gehoert bis zum `free_region` des
+        // Aufrufers niemandem sonst.
+        unsafe {
+            crate::userstackmark::messen(
+                base as usize,
+                len as usize,
+                crate::userstackmark::Anlass::Tod(slot),
+            )
+        };
+    }
+}
+
 /// Beendete Threads **dieses Kerns** einsammeln: TCB-Slots freigeben und Stacks an
 /// den Allokator zurückgeben (aus dem Idle-Thread). Erst die Zombies unter
 /// `SCHEDS[core]` einsammeln, dann den Lock **freigeben** und unter `MEM` freigeben
@@ -7962,10 +8195,20 @@ pub fn reap_core(core: usize) -> usize {
         // Stacks und EL0-**User**-Stacks nebeneinander, beide `STACK_SIZE` gross; unterscheidbar
         // sind sie nur am Muster, das nur die Kernel-Stacks tragen. Eine Region ohne Muster kostet
         // dabei genau EINEN Lesezugriff.
-        for &(base, len, _) in &zombies[..n] {
+        for &(base, len, gid) in &zombies[..n] {
             // SAFETY: der Zombie ist eingesammelt, die Region gehoert bis zum `free_region` unten
             // niemandem sonst.
             unsafe { crate::kstackmark::messen_wenn_gefuellt(crate::kstackmark::KL_KERN, base, len) };
+            // **C7b: und wenn es eine EL0-USER-Region ist, ihr Wasserstand -- HIER und nicht
+            // spaeter.** Nach dem `free_region` unten gehoert sie dem naechsten Anforderer; beim
+            // Tod des Threads steht sein tiefster Pfad noch darin.
+            //
+            // Erkannt wird sie NICHT am Inhalt (eine genullte Region ist von einem restlos
+            // aufgebrauchten Kernel-Stack nicht zu unterscheiden), sondern an der Buchfuehrung:
+            // `gid` IST der globale Thread-Slot, und der Eintrag muss auf genau diese Region
+            // zeigen. Stimmt er nicht ueberein, wird NICHT gemessen -- lieber eine Messung
+            // weniger als eine ueber fremdem Speicher.
+            userstack_beim_tod_messen(gid as usize, base as u64, len as u64);
         }
         {
             let mut mem = MEM.lock();

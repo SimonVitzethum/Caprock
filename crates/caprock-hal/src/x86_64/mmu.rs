@@ -88,8 +88,56 @@ pub const LOW_MAPPED_END: u64 = (LOW_GIB as u64) * ONE_GIB;
 pub const USER_RAM_MIN: u64 = 16 * 1024 * 1024;
 /// Ende des ersten GiB (Grenze für isolierte Regionen — wie auf aarch64).
 pub const GIB1_END: u64 = ONE_GIB;
-/// Größe der Region einer isolierten PD.
+/// **Die Blockgranularität der Identitätskarte** (2 MiB) — ein L2/PD-Blockdeskriptor.
+///
+/// **Diese Konstante trug bis C7b ZWEI Bedeutungen**, und beide standen unter demselben Namen:
+/// „so gross ist ein Block, den `vspace_map_block` in einem Deskriptor abbildet" und „so gross ist
+/// die private Region einer isolierten PD". Solange die private Region genau ein Block war, war
+/// das dieselbe Zahl — und genau deshalb ist es dieselbe Klasse Falle wie `Scheduler::spawn_user`
+/// (ein Wert für EL0-SP **und** Reap-Region): harmlos, solange die beiden zufällig gleich sind.
+///
+/// Seit C7b ist die private Region **gemessen** und kleiner. Wer hier eine kleinere Zahl einsetzt,
+/// bekäme `vspace_map_block` mit einer Länge, die kein Block ist. Die private Region steht deshalb
+/// als [`PRIV_REGION_SIZE`] daneben.
 pub const ISO_REGION_SIZE: u64 = TWO_MIB;
+
+/// **Die private Region einer isolierten PD** — der EL0-Stack EINES Threads (C7b).
+///
+/// **Die Zahl ist gemessen, nicht gewählt.** Bis zum 2026-08-13 stand hier 2 MiB, und das war
+/// **Granularität, nicht Bedarf**: [`vspace_map_user_window`] bildet eine 2-MiB-ausgerichtete
+/// 2-MiB-Region in EINEM Blockdeskriptor ab und spart damit den 4-KiB-Rahmen einer Seitentabelle.
+/// Eine PD kostete dadurch rund 2076 KiB, davon 2048 KiB für einen Stack, dessen tatsächliche
+/// Tiefe niemand gemessen hatte.
+///
+/// Die Wasserstandsmarke (`kernel/src/userstackmark.rs`, Prüfzeile `ustack`) misst sie seither.
+/// Die Grösse folgt der **Summenbedingung** und nicht dem beobachteten Höchststand: tiefster
+/// gemessener Pfad + geforderte Reserve ≤ Regionsgrösse. Der Tausch ist eindeutig — eine Tabelle
+/// (+4 KiB) gegen 1984 KiB gespartem Stack.
+///
+/// **Die Messung, aus der die 64 KiB folgen** (2026-08-13, x86, `-m 512M`):
+///
+/// | Suite | tiefster gemessener EL0-Pfad | Region, in der er auftrat |
+/// |---|---|---|
+/// | `test-qemu-x86.sh` (ohne Archiv) | 6168 B — und das ist die **Tiefensonde selbst** | 2 MiB |
+/// | `test-qemu-x86-load.sh` (mit Archiv) | **7400 B** (ein echtes geladenes Programm) | 16 KiB |
+///
+/// Summenbedingung: `7400 B + 8192 B Reserve = 15 592 B ≤ 65 536 B` — Abstand Faktor 4,2. Gegen
+/// den 2-MiB-Stand ist das **Faktor 32 weniger Speicher** je Mandant.
+///
+/// **Warum nicht kleiner, obwohl auch 16 KiB die Bedingung erfüllten** (`7400 + 2048 ≤ 16384`):
+/// weil der gemessene Wasserstand über die **Nullung** erhoben ist und damit eine **Untergrenze**
+/// bleibt — ein mit Null beschriebenes Stackwort ist unsichtbar. Der Abstand zwischen Messwert und
+/// Grösse ist die Antwort darauf und keine Bequemlichkeit. Dazu kommt, dass 64 KiB die Grösse ist,
+/// die die **gefärbte** Region auf x86 ohnehin hat (`colors::region_bytes()`): zwei Wege zur
+/// selben PD-Sorte mit **einer** Zahl statt mit zweien.
+///
+/// **Was das Senken NEBENBEI bringt, und es ist kein Nebensatz:** die private Region liegt am
+/// Anfang eines 2-MiB-VA-Fensterplatzes ([`vspace_map_user_window`]), und abgebildet wird nur,
+/// was sie belegt. Mit 2 MiB war der Platz **voll** — ein Stacküberlauf lief in die eigene Region
+/// weiter. Mit 64 KiB liegen darunter 1984 KiB **ungemappte** VA: ein Überlauf faultet, statt
+/// still zu schreiben. Das ist dieselbe Eigenschaft, die der EL1-Stack seit dem 2026-08-10 als
+/// Guard-Page hat — hier fällt sie ohne eine einzige zusätzliche Seite an.
+pub const PRIV_REGION_SIZE: u64 = 64 * 1024;
 
 /// Rechte einer Kernel-Abbildung (wie aarch64 `Perm`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

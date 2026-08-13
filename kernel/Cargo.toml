@@ -85,6 +85,18 @@ dfprobe-kein-ist = ["caprock-hal/kein-df-ist"]
 # Erwartung: `sperre : FAILURES` mit einem Hoechststand von rund 1,5 Ticks und der Zeile des
 # `while let` als Ort. Setzt `selftest` voraus.
 sperrmark-gegenprobe = []
+# **Die Gegenprobe zur EL0-Wasserstandsmarke** (C7b). Die Tiefensonde meldet sich fertig, ohne
+# ihren Stack berührt zu haben — sonst bleibt ALLES gleich (derselbe Thread, dieselbe PD, dieselbe
+# Meldung, dieselbe Messung). Damit fällt genau EIN Konjunkt der `ustack`-Zeile: `getroffen`.
+#
+# Sie isoliert damit die eine Aussage, die die Eichung strukturell nicht prüfen kann — dass die
+# Marke die Tiefe eines ECHTEN EL0-Stacks findet und nicht bloss eine genullte Region anschaut.
+# Eine Mutation, die zwei Dinge zugleich kaputtmacht, misst die Reihenfolge der Prüfungen und
+# nicht die Eigenschaft (D9, erste Fassung).
+#
+# Erwartung: `ustack : FAILURES` mit `gemessen=true getroffen=false`, gemeldete Tiefe nahe 0, und
+# der Lauf endet im Watchdog mit `offen waren: ustack`. Setzt `selftest` voraus.
+ustack-gegenprobe = []
 
 # Der Kernel-Kern + die aarch64-HAL: derzeit aarch64-spezifisch. Auf dem x86_64-Branch (Stufe 0:
 # nur Boot+Serial) werden sie NICHT kompiliert; Stufe fuer Stufe werden die arch-agnostischen Crates

@@ -5689,6 +5689,20 @@ fn report() {
         if churn { "ALL PASS" } else { "FAILURES" }
     );
 
+    // D15-Melder: die GELEGENHEIT, nicht der Treffer. Gezaehlt wird der ZUSTAND beim spaeten
+    // Aufraeumen eines Kernel-Stacks, und der ist in JEDEM Lauf pruefbar -- bei 0,225 % waere ein
+    // Melder, der nur beim Unglueck spricht, in 443 von 444 Laeufen stumm.
+    let (spaet, fremd, fuesse, rec_ges, rec_stack) = system::kstack_spaet_stats();
+    let (zomb_ges, zomb_fuss) = caprock_sched::zombie_fuss_stats();
+    println!(
+        "kstackid: spaet-am-wiedervergebenen-Slot={spaet} fremder-Kstack-freigegeben={fremd} \
+         (von {rec_ges} Aufraeumungen, {rec_stack} mit Stack)"
+    );
+    println!(
+        "kstackid: EL0-Kstack unter den eigenen Fuessen freigegeben={fuesse}; \
+         Zombie-Region unter den eigenen Fuessen eingereiht={zomb_fuss} von {zomb_ges}"
+    );
+
     // MCS Scheduling Contexts: budgetierter vs. unbeschränkter Thread auf MCS_CORE.
     let (depl, refl) = system::budget_stats(MCS_CORE);
     let bg = MCS_BUDGETED_COUNT.load(Ordering::Relaxed);

@@ -58,11 +58,16 @@
 //! ## Was dieses Primitiv NICHT vergibt — ausdrücklich
 //!
 //! Z26/Nachtrag 2 zählt vier Autoritäten auf, die eine Linux-Persönlichkeit braucht. Dieses
-//! Primitiv liefert **eine und eine halbe**:
+//! Primitiv liefert **eine und eine halbe** — und die Zeile „Frame“ ist seit dem 2026-08-13 in
+//! zwei geteilt, weil **Lesen und Schreiben nicht dieselbe Autorität sind**: der ganze Frame
+//! enthält `cs`/`ss` bzw. `spsr`, also den RING. Wer sie zurückschreiben darf, befördert seinen
+//! Gast — das wäre genau die Rechteausweitung, gegen die die Weiche unten steht, nur von der
+//! anderen Seite:
 //!
 //! | Autorität | hier | Folge, wenn sie fehlt |
 //! |---|---|---|
-//! | Frame **lesen und schreiben** | **ja**, über das Sidecar (ganzer Frame) | — `rt_sigreturn` und `clone` sind damit möglich |
+//! | Frame **lesen** | **ja**, ganzer Frame über das Sidecar | die Persönlichkeit sieht Nummer, Argumente und Zustand |
+//! | Frame **schreiben** | **halb** — nur die Allzweckregister (s. [`uebernehmbar`]) | ein registerbasierter Syscall ist vollständig; `rt_sigreturn` braucht zusätzlich `rip`/`rsp` bzw. `elr`/`sp_el0`, und die sind **noch nicht** übernehmbar |
 //! | Gast-**Speicher** lesen/schreiben (Zeigerargumente) | **nein** | jeder Syscall mit Zeiger (`read`, `write`, `openat`, `ioctl`) ist **nicht implementierbar**, solange die Gast-Region nicht getrennt in die Handler-PD gemappt ist |
 //! | **Vspace** des Gastes manipulieren | **nein** | `mmap`/`mprotect`/Demand-Paging sind **nicht implementierbar** |
 //! | Faults **sehen** | **ja**, getrennte Cap ([`Anlass::Fault`]) | — |
@@ -131,6 +136,219 @@ pub const fn slot_gueltig(slot: u16, slots: u16) -> bool {
     slot < slots
 }
 
+// ---------------------------------------------------------------------------------------
+// DAS SLOT-FORMAT — die Nutzlast (2026-08-13)
+// ---------------------------------------------------------------------------------------
+//
+// Bis zum 2026-08-13 stellte `zustellen()` die **Nachricht** zu (welcher Gast, welcher Slot,
+// welcher Anlass) und sonst nichts: der Handler erfuhr *dass* und *wer*, aber nicht *was*. Ein
+// Primitiv, das den Frame nicht überträgt, ist richtig und nicht benutzbar.
+//
+// ## Warum es einen KOPF gibt und nicht nur den Frame
+//
+// Drei Gründe, und jeder einzelne würde reichen:
+//
+//  1. **Ein leerer Slot sieht aus wie ein Frame.** Ohne Kennung ist „der Kernel hat hier nichts
+//     hingeschrieben" von „der Gast hatte lauter Nullen in den Registern" nicht zu unterscheiden.
+//     Das ist wörtlich die leere Event-Queue ohne `CD.R`: eine Aussage sieht wahr aus, weil der
+//     Fall, der sie widerlegen könnte, nicht sichtbar wird. Deshalb [`MAGIE`].
+//  2. **Ein WIEDERHOLTER Frame sieht aus wie ein neuer.** Ein Slot wird über die Lebensdauer
+//     eines Gastes hunderttausendfach beschrieben; der Handler muss „das ist die Zustellung, auf
+//     die ich gerade warte" von „das steht hier noch von vorhin" unterscheiden können. Deshalb
+//     [`KOPF_GEN`], monoton und nur vom Kernel geschrieben — dieselbe Konstruktion wie die
+//     wachsende Kette bei Z4 Stufe 2 (ein reproduzierbarer Wert kann nicht belegen, dass er
+//     geerbt wurde).
+//  3. **Der Frame ist ARCHITEKTURABHÄNGIG, die Persönlichkeit soll es nicht sein.** Wo x0 liegt,
+//     weiss der Kernel; der Handler soll es nicht nachrechnen müssen (ein Prüfer, der die
+//     geprüfte Grösse nachrechnet, prüft eine zweite Wirklichkeit). Deshalb die Indextabelle
+//     [`KOPF_ABI`].
+//
+// ## Lesen und Schreiben sind NICHT dieselbe Autorität
+//
+// Der Kopf trennt sie: [`KOPF_NGESAMT`] Wörter werden **hingeschrieben**, aber nur die ersten
+// [`KOPF_NGPR`] dürfen **zurück** (s. [`uebernehmbar`]). Der Grund steht dort.
+
+/// **Kennung im ersten Wort eines beschriebenen Slots.** „Der Kernel hat hier einen Frame
+/// abgelegt" — die Aussage, ohne die ein leerer Slot von einem Frame aus Nullen nicht zu
+/// unterscheiden wäre.
+pub const MAGIE: u64 = 0x4350_524B_5F46_524D; // "CPRK_FRM"
+
+/// **Formatversion des Slots.** Steht im zweiten Wort und wird bei jedem Lesen geprüft.
+///
+/// Die Vorlage ist A-4.3 (Zustandsübergabe beim Hot-Reload): dort trägt die Region einen
+/// versionierten Kopf, und ein abweichendes Layout wird **abgewiesen**, statt die Bytes im
+/// eigenen Sinn zu lesen. Dieselbe Regel wie bei `entry_len` im Manifest — und dieselbe
+/// Begründung: das Sidecar ist die **Vertragsfläche** zwischen Kernel und Persönlichkeit, und
+/// eine Persönlichkeit ist per Entwurf nicht dieselbe Fassung wie der Kernel. Ein implizites
+/// Registerabbild hiesse: jede Änderung am Frame bricht jede Persönlichkeit **still**.
+pub const FORMAT_VERSION: u64 = 1;
+
+/// Wort 0: [`MAGIE`].
+pub const KOPF_MAGIE: usize = 0;
+/// Wort 1: [`FORMAT_VERSION`].
+pub const KOPF_VERSION: usize = 1;
+/// Wort 2: **Zustellungszähler**, monoton, beginnt bei 1.
+///
+/// Nur der Kernel schreibt ihn. Der Handler merkt sich den zuletzt gesehenen Stand; ein Frame mit
+/// gleichem oder kleinerem Zähler ist ein **alter** Frame, kein neuer. Ohne diese Zahl könnte er
+/// eine ausgebliebene Zustellung nicht von einer wiederholten unterscheiden — genau die
+/// Verwechslung `rx_used` gegen „Daten sind angekommen".
+pub const KOPF_GEN: usize = 2;
+/// Wort 3: [`Anlass`] als Zahl.
+pub const KOPF_ANLASS: usize = 3;
+/// Wort 4: architekturabhängiger Anlasscode (x86: Vektor · aarch64: `ESR_EL1.EC`), `0` bei einem
+/// Syscall.
+pub const KOPF_CODE: usize = 4;
+/// Wort 5: wie viele Frame-Wörter **zurückgeschrieben** werden dürfen (s. [`uebernehmbar`]).
+pub const KOPF_NGPR: usize = 5;
+/// Wort 6: wie viele Frame-Wörter überhaupt abgelegt sind — die **Länge** des Kopfes im Sinne von
+/// A-4.3.
+pub const KOPF_NGESAMT: usize = 6;
+/// Wort 7: Architekturkennung ([`ARCH_X86_64`] / [`ARCH_AARCH64`]).
+///
+/// Sie ist **nicht** bloss Auskunft: der Kernel weist beim Zurückschreiben einen Slot ab, dessen
+/// Architektur nicht die eigene ist. Ohne diese Prüfung läse er die Wörter einer fremden
+/// Registerlage als seine eigenen GPR.
+pub const KOPF_ARCH: usize = 7;
+/// Wort 8: **Handler-GRUPPE** — reserviert, heute immer `0`.
+///
+/// Die Zielarchitektur sieht eine kleine, feste Zahl von Gruppen vor, in die Handler eingehängt
+/// werden (Dateisystem, Speicher, Prozess, Netz, Geräte). Der Schnitt folgt dem **geteilten
+/// Zustand** (fd-Tabelle, Speicherkarte, TCB-Zustand, Sockets, Geräte-Caps) und nicht der
+/// Syscall-Nummer — deshalb steht das Feld hier und wird später nicht aus der Nummer *erraten*.
+///
+/// **Gebaut ist der Mechanismus NICHT**, nur das Feld. Und es gilt die Regel der reservierten
+/// Manifest-Bytes: **`0` heisst „keine Angabe", nicht „passt auf alles"**. Ein Slot, der mit einer
+/// Gruppe zurückkommt, wird deshalb **abgewiesen** ([`KopfUrteil::Reserviert`]) und nicht
+/// ignoriert — sonst wäre der Tag der Einlösung der Tag, an dem alle bis dahin angesammelten
+/// Werte falsch sind (Z11c, die Prioritäten im Test-Manifest).
+pub const KOPF_GRUPPE: usize = 8;
+/// Wörter 9..16: reserviert, **geprüft genullt**. Ein reserviertes Feld, das niemand prüft, ist
+/// ein Feld, das still zu Müll wird.
+pub const KOPF_RESERVIERT: usize = 9;
+/// Wie viele reservierte Wörter.
+pub const KOPF_RESERVIERT_N: usize = 7;
+/// Erstes Wort der **ABI-Indextabelle**: `slot[KOPF_ABI + n]` ist der Frame-Wort-Index des
+/// ABI-Registers `xn`. Damit findet eine Persönlichkeit ihre Argumente, ohne die Registerlage der
+/// Architektur nachzubilden — ein Leser, der die geprüfte Grösse nachrechnet, prüft eine zweite
+/// Wirklichkeit.
+pub const KOPF_ABI: usize = 16;
+/// Wie viele ABI-Register die Tabelle führt (`x0..x6`).
+pub const KOPF_ABI_N: usize = 7;
+/// Erstes Wort des **Frames**.
+pub const FRAME_WORT: usize = 24;
+
+/// Architekturkennung für [`KOPF_ARCH`].
+pub const ARCH_X86_64: u64 = 0;
+/// Architekturkennung für [`KOPF_ARCH`].
+pub const ARCH_AARCH64: u64 = 1;
+
+/// Wörter je Slot.
+pub const SLOT_WOERTER: usize = SLOT_BYTES / 8;
+/// Wie viele Frame-Wörter hinter dem Kopf noch Platz haben.
+pub const FRAME_WOERTER_MAX: usize = SLOT_WOERTER - FRAME_WORT;
+
+/// Wort-Index des `i`-ten Frame-Wortes im Slot.
+#[inline]
+pub const fn frame_wort(i: usize) -> usize {
+    FRAME_WORT + i
+}
+
+/// Passt ein Frame mit `n` Wörtern hinter den Kopf?
+///
+/// Steht getrennt von [`fenster_deckt`], weil es eine andere Frage ist: dort geht es um das
+/// Fenster gegen die Slots, hier um den **Kopf** gegen den Frame. Ein Slot, der den Frame nur
+/// deshalb fasst, weil niemand den Kopf mitgerechnet hat, überschriebe seinen eigenen Anfang.
+#[inline]
+pub const fn frame_passt(n: usize) -> bool {
+    n <= FRAME_WOERTER_MAX
+}
+
+/// **Urteil über den Kopf eines Slots** — jede Absage mit eigenem Namen.
+///
+/// Die Vorlage ist wörtlich A-4.3: „was drüben nicht dasselbe bezeichnen kann, wird abgewiesen,
+/// nicht ausgelegt". Ein Leser, der bei unbekannter Version einfach weiterliest, interpretiert
+/// fremde Bytes im eigenen Sinn — und das ist beim Sidecar nicht ein Formatfehler, sondern ein
+/// **Registerinhalt**, den der Kernel in einen laufenden Thread schreibt.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KopfUrteil {
+    /// Der Kopf ist lesbar und gehört zu dieser Fassung.
+    Ok,
+    /// [`MAGIE`] fehlt: hier hat **nie** jemand einen Frame abgelegt. Unterschieden von einer
+    /// fremden Version, weil es eine andere Diagnose ist — „leer" heisst „die Zustellung ist
+    /// ausgeblieben", „fremd" heisst „zwei Fassungen reden miteinander".
+    KeinFrame,
+    /// Die Formatversion ist nicht [`FORMAT_VERSION`]. **Benannt abgewiesen**, nicht ausgelegt.
+    FremdeVersion(u64),
+    /// Die Architekturkennung ist nicht die eigene: die Frame-Wörter hätten eine andere Bedeutung.
+    FremdeArchitektur(u64),
+    /// Die Wortzahlen passen nicht zu dieser Architektur (`n_gpr`/`n_gesamt`).
+    FremdeBreite(u64, u64),
+    /// Ein **reserviertes** Feld ist nicht null — dazu zählt die Gruppenkennung. `0` heisst
+    /// „keine Angabe"; ein Wert heisst „ich verlange etwas, wofür es keinen Mechanismus gibt",
+    /// und das wird abgewiesen statt still ignoriert.
+    Reserviert,
+}
+
+/// **Den Kopf eines Slots prüfen**, bevor irgendein Frame-Wort gelesen wird.
+///
+/// `slot` ist der ganze Slot als Wortfeld; `arch`/`n_gpr`/`n_ges` sind die Erwartungen des
+/// **Lesers**. Die Funktion entscheidet nichts über den Inhalt — sie sagt nur, ob der Inhalt
+/// überhaupt in dieser Fassung gemeint war.
+pub fn kopf_pruefen(slot: &[u64], arch: u64, n_gpr: u64, n_ges: u64) -> KopfUrteil {
+    if slot.len() < FRAME_WORT {
+        return KopfUrteil::KeinFrame;
+    }
+    if slot[KOPF_MAGIE] != MAGIE {
+        return KopfUrteil::KeinFrame;
+    }
+    // **Die Version zuerst.** Danach erst darf irgendein anderes Feld gelesen werden: bei einer
+    // fremden Version bedeutet auch „Wort 7 ist die Architektur" nichts mehr.
+    if slot[KOPF_VERSION] != FORMAT_VERSION {
+        return KopfUrteil::FremdeVersion(slot[KOPF_VERSION]);
+    }
+    if slot[KOPF_ARCH] != arch {
+        return KopfUrteil::FremdeArchitektur(slot[KOPF_ARCH]);
+    }
+    if slot[KOPF_NGPR] != n_gpr || slot[KOPF_NGESAMT] != n_ges {
+        return KopfUrteil::FremdeBreite(slot[KOPF_NGPR], slot[KOPF_NGESAMT]);
+    }
+    if slot[KOPF_GRUPPE] != 0 {
+        return KopfUrteil::Reserviert;
+    }
+    let mut i = 0;
+    while i < KOPF_RESERVIERT_N {
+        if slot[KOPF_RESERVIERT + i] != 0 {
+            return KopfUrteil::Reserviert;
+        }
+        i += 1;
+    }
+    KopfUrteil::Ok
+}
+
+/// **Darf Frame-Wort `i` aus dem Sidecar in den Frame des Gastes ZURÜCK?**
+///
+/// Nur die ersten `n_gpr` Wörter — die **Allzweckregister**. Alles dahinter ist Zustand, den der
+/// Kernel führt und der die AUSFÜHRUNGSART bestimmt, nicht den Inhalt:
+///
+/// | Architektur | zurück | **nicht** zurück | warum nicht |
+/// |---|---|---|---|
+/// | x86_64 | `gpr[0..15]` | `vector`, `error`, `rip`, `cs`, `rflags`, `rsp`, `ss` | `cs`/`ss` tragen den **Ring**: ein Handler, der `cs` schreiben darf, setzt seinen Gast nach Ring 0. `rflags` trägt `IOPL` und `IF`. `rip`/`rsp` sind harmlos*er*, aber ein nicht-kanonischer `rip` schlägt beim `iretq` **im Kernel** auf |
+/// | aarch64 | `gpr[0..31]` | `elr`, `spsr`, `sp_el0` | `spsr` trägt das **Exception-Level** und die Maskenbits — dasselbe Argument wie `cs` |
+///
+/// **Das ist eine Einschränkung gegenüber dem Entwurfstext von Z26/A3**, und sie steht hier statt
+/// in einer Fussnote: dort heisst es „Frame lesen **und schreiben** — ja, ganzer Frame über das
+/// Sidecar → `rt_sigreturn`, `clone` sind damit möglich". Der ganze Frame wird **gelesen**; der
+/// ganze Frame **zurückzuschreiben** ist eine andere und grössere Autorität, denn er enthält
+/// Felder, mit denen eine Persönlichkeits-PD sich selbst befördern würde. `rt_sigreturn` braucht
+/// zusätzlich `rip`/`rsp` (bzw. `elr`/`sp_el0`); die sind **absichtlich** noch nicht dabei —
+/// jedes von ihnen braucht eine eigene Gültigkeitsprüfung (Kanonizität, Ausrichtung), und drei
+/// Entscheidungen in einer Zeile zu treffen ist die Form, die dieses Projekt schon bezahlt hat.
+#[inline]
+pub const fn uebernehmbar(i: usize, n_gpr: usize) -> bool {
+    i < n_gpr
+}
+
 /// Wie viele Slots passen in ein Fenster von `len` Bytes? (Abgerundet.)
 #[inline]
 pub const fn slots_in(len: u64) -> u16 {
@@ -173,6 +391,16 @@ pub struct Bindung {
     pub handler_pd: u16,
     /// Sidecar-Slot **dieses** Gastes. Genau einer, und nur der Kernel schreibt hinein.
     pub slot: u16,
+    /// **Physische Basis des Sidecar-Fensters** der Handler-PD (0 = keins).
+    ///
+    /// Sie steht hier und nicht in der Cap, obwohl sie aus der Cap kommt: der Syscall-Pfad hat den
+    /// Gast, nicht die Handler-Cap — die liegt im Cspace des Handlers, nicht in seinem. Ein
+    /// Cap-Lookup je umgeleitetem Syscall wäre der Preis dafür, dieselbe Zahl zweimal zu führen;
+    /// abgeschrieben wird sie **einmal**, bei der Bindung, und mit der Bindung fällt sie wieder
+    /// weg. (Was daran offen bleibt, steht bei [`crate::Scheduler::handler_of`]: eine gelöschte
+    /// Handler-**Cap** bei lebender Handler-**PD** lässt diese Zahl stehen — das ist derselbe
+    /// benannte Riss wie `handler_lebt`, nicht ein zweiter.)
+    pub sidecar: u64,
 }
 
 /// „Kein Endpoint" — ein Wert, den die Endpoint-Tabelle nie vergibt.
@@ -222,8 +450,14 @@ pub enum Weiche {
     /// Gast spräche plötzlich direkt mit dem Kernel, mit der vollen nativen ABI, die ihm die
     /// Bindung gerade genommen hatte.
     Kernel,
-    /// Zustellen an diesen Endpoint, mit diesem Sidecar-Slot.
-    Handler { ep: u32, slot: u16 },
+    /// Zustellen an diesen Endpoint, mit diesem Sidecar-Slot in diesem Fenster.
+    ///
+    /// `sidecar` ist die **physische Basis** des Fensters. Sie steht in der Weiche und nicht erst
+    /// im Zusteller, damit „wohin wird zugestellt" und „wohin wird kopiert" **eine** Entscheidung
+    /// sind: zwei getrennte Auflösungen wären zwei Wahrheiten über dieselbe Bindung, und die
+    /// stumme Fehlerform dieses Primitivs ist genau die, dass ein Gast in das Fenster eines
+    /// anderen schreibt.
+    Handler { ep: u32, slot: u16, sidecar: u64 },
     /// Die Bindung besteht, der Handler ist weg → der Gast **faultet**, mit benanntem Code.
     /// Nie still: eine Absage ohne Namen ist von einem Hänger nicht zu unterscheiden.
     Fault(u64),
@@ -233,6 +467,14 @@ pub enum Weiche {
 /// Spiegelt `caprock_abi::result::ERR_HANDLER_GONE` — die Zahl steht hier noch einmal, weil diese
 /// Datei abhängigkeitsfrei sein muss; `abi_codes_stimmen_ueberein` im Kernel hält beide zusammen.
 pub const ERR_HANDLER_GONE: u64 = 11;
+
+/// ABI-Code, mit dem ein Gast zurückkehrt, dessen Sidecar-Kopf **nicht lesbar** war (fremde
+/// Version, fremde Architektur, gesetzte reservierte Felder). Spiegelt
+/// `caprock_abi::result::ERR_HANDLER_ABI`; die Klammer zieht `abi_codes_stimmen_ueberein`.
+///
+/// Getrennt von [`ERR_HANDLER_GONE`], weil es eine andere Diagnose ist: „niemand da" gegen „jemand
+/// da, andere Fassung".
+pub const ERR_HANDLER_ABI: u64 = 14;
 
 /// **Die Weiche für einen SYSCALL.**
 ///
@@ -255,6 +497,7 @@ pub fn weiche_syscall(bindung: Option<Bindung>, handler_lebt: bool) -> Weiche {
         Some(b) => Weiche::Handler {
             ep: b.sys_ep,
             slot: b.slot,
+            sidecar: b.sidecar,
         },
     }
 }
@@ -279,6 +522,7 @@ pub fn weiche_fault(bindung: Option<Bindung>, handler_lebt: bool) -> Weiche {
         Some(b) => Weiche::Handler {
             ep: b.fault_ep,
             slot: b.slot,
+            sidecar: b.sidecar,
         },
     }
 }
@@ -405,8 +649,16 @@ mod tests {
             fault_ep: fault,
             handler_pd: hpd,
             slot,
+            sidecar: 0x20_0000,
         }
     }
+
+    /// Wortzahlen der beiden echten Trap-Frames. Sie stehen hier als Literale, weil diese Datei
+    /// abhaengigkeitsfrei ist; `abi_codes_stimmen_ueberein` im Kernel haelt sie gegen die HAL.
+    const X86_GPR: usize = 15;
+    const X86_GESAMT: usize = 22;
+    const ARM_GPR: usize = 31;
+    const ARM_GESAMT: usize = 34;
 
     // --- Sidecar ---------------------------------------------------------------------------
 
@@ -465,6 +717,229 @@ mod tests {
         assert_eq!(slots_in(0), 0);
     }
 
+    // --- Das Slot-Format (die Nutzlast) ------------------------------------------------------
+
+    /// Ein gültiger Kopf für die Erwartungen `(arch, n_gpr, n_ges)`.
+    fn kopf(arch: u64, n_gpr: u64, n_ges: u64) -> [u64; SLOT_WOERTER] {
+        let mut s = [0u64; SLOT_WOERTER];
+        s[KOPF_MAGIE] = MAGIE;
+        s[KOPF_VERSION] = FORMAT_VERSION;
+        s[KOPF_GEN] = 1;
+        s[KOPF_NGPR] = n_gpr;
+        s[KOPF_NGESAMT] = n_ges;
+        s[KOPF_ARCH] = arch;
+        s
+    }
+
+    #[test]
+    fn gueltiger_kopf_wird_angenommen() {
+        let s = kopf(ARCH_X86_64, X86_GPR as u64, X86_GESAMT as u64);
+        assert_eq!(
+            kopf_pruefen(&s, ARCH_X86_64, X86_GPR as u64, X86_GESAMT as u64),
+            KopfUrteil::Ok
+        );
+        let a = kopf(ARCH_AARCH64, ARM_GPR as u64, ARM_GESAMT as u64);
+        assert_eq!(
+            kopf_pruefen(&a, ARCH_AARCH64, ARM_GPR as u64, ARM_GESAMT as u64),
+            KopfUrteil::Ok
+        );
+    }
+
+    #[test]
+    fn fremde_version_wird_benannt_abgewiesen() {
+        // **Die Aussage von A-4.3, hier noch einmal.** Ein Leser, der bei unbekannter Version
+        // weiterliest, legt fremde Bytes im eigenen Sinn aus -- und beim Sidecar sind das
+        // Registerinhalte, die der Kernel in einen laufenden Thread schreibt.
+        let mut s = kopf(ARCH_X86_64, X86_GPR as u64, X86_GESAMT as u64);
+        s[KOPF_VERSION] = FORMAT_VERSION + 1;
+        assert_eq!(
+            kopf_pruefen(&s, ARCH_X86_64, X86_GPR as u64, X86_GESAMT as u64),
+            KopfUrteil::FremdeVersion(FORMAT_VERSION + 1)
+        );
+        // Und die Absage ist NICHT dieselbe wie „hier steht nichts": die beiden brauchen
+        // verschiedene Antworten (warten gegen Fassungen abgleichen).
+        assert_ne!(
+            kopf_pruefen(&s, ARCH_X86_64, X86_GPR as u64, X86_GESAMT as u64),
+            KopfUrteil::KeinFrame
+        );
+    }
+
+    #[test]
+    fn die_version_wird_vor_allem_anderen_geprueft() {
+        // Bei fremder Version bedeutet auch „Wort 7 ist die Architektur" nichts mehr. Ein Pruefer,
+        // der zuerst die Architektur liest, meldete `FremdeArchitektur` fuer einen Kopf, dessen
+        // eigentliches Problem die Fassung ist -- eine Diagnose, die in die falsche Richtung zeigt.
+        let mut s = kopf(ARCH_X86_64, X86_GPR as u64, X86_GESAMT as u64);
+        s[KOPF_VERSION] = 99;
+        s[KOPF_ARCH] = 42;
+        s[KOPF_NGPR] = 7;
+        assert_eq!(
+            kopf_pruefen(&s, ARCH_X86_64, X86_GPR as u64, X86_GESAMT as u64),
+            KopfUrteil::FremdeVersion(99)
+        );
+    }
+
+    #[test]
+    fn fremde_architektur_und_breite_haben_eigene_namen() {
+        let mut s = kopf(ARCH_AARCH64, ARM_GPR as u64, ARM_GESAMT as u64);
+        assert_eq!(
+            kopf_pruefen(&s, ARCH_X86_64, X86_GPR as u64, X86_GESAMT as u64),
+            KopfUrteil::FremdeArchitektur(ARCH_AARCH64)
+        );
+        s[KOPF_ARCH] = ARCH_X86_64;
+        assert_eq!(
+            kopf_pruefen(&s, ARCH_X86_64, X86_GPR as u64, X86_GESAMT as u64),
+            KopfUrteil::FremdeBreite(ARM_GPR as u64, ARM_GESAMT as u64)
+        );
+    }
+
+    #[test]
+    fn eine_gruppe_wird_abgewiesen_und_nicht_ignoriert() {
+        // **Nullen heissen „keine Angabe", nicht „passt auf alles".** Der Gruppenmechanismus ist
+        // nicht gebaut; ein Slot, der eine Gruppe verlangt, verlangt etwas, das niemand einloest.
+        // Ihn durchzulassen hiesse, ungeprueft Werte anzusammeln -- und der Tag der Einloesung
+        // waere der Tag, an dem sie alle falsch sind (Z11c, die Prioritaeten im Test-Manifest).
+        let mut s = kopf(ARCH_X86_64, X86_GPR as u64, X86_GESAMT as u64);
+        s[KOPF_GRUPPE] = 3;
+        assert_eq!(
+            kopf_pruefen(&s, ARCH_X86_64, X86_GPR as u64, X86_GESAMT as u64),
+            KopfUrteil::Reserviert
+        );
+    }
+
+    #[test]
+    fn reservierte_woerter_muessen_null_sein() {
+        for i in 0..KOPF_RESERVIERT_N {
+            let mut s = kopf(ARCH_X86_64, X86_GPR as u64, X86_GESAMT as u64);
+            s[KOPF_RESERVIERT + i] = 1;
+            assert_eq!(
+                kopf_pruefen(&s, ARCH_X86_64, X86_GPR as u64, X86_GESAMT as u64),
+                KopfUrteil::Reserviert,
+                "reserviertes Wort {i} wird nicht geprueft"
+            );
+        }
+    }
+
+    #[test]
+    fn ein_leerer_slot_ist_kein_frame() {
+        let s = [0u64; SLOT_WOERTER];
+        assert_eq!(
+            kopf_pruefen(&s, ARCH_X86_64, X86_GPR as u64, X86_GESAMT as u64),
+            KopfUrteil::KeinFrame
+        );
+        // Und ein zu kurzes Feld ebenso -- ohne diese Zeile liefe die Pruefung ueber die Kante.
+        assert_eq!(
+            kopf_pruefen(&s[..FRAME_WORT - 1], ARCH_X86_64, 0, 0),
+            KopfUrteil::KeinFrame
+        );
+    }
+
+    #[test]
+    fn jede_kopf_absage_hat_einen_eigenen_namen() {
+        let alle = [
+            KopfUrteil::Ok,
+            KopfUrteil::KeinFrame,
+            KopfUrteil::FremdeVersion(2),
+            KopfUrteil::FremdeArchitektur(1),
+            KopfUrteil::FremdeBreite(1, 2),
+            KopfUrteil::Reserviert,
+        ];
+        for i in 0..alle.len() {
+            for j in (i + 1)..alle.len() {
+                assert_ne!(alle[i], alle[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn kopf_und_frame_ueberlappen_nicht() {
+        // Jedes Kopffeld liegt VOR dem Frame, und die ABI-Tabelle passt zwischen beide. Ohne
+        // diese Zeile waere ein hinzugefuegtes Kopffeld ein Feld, das den ersten Frame-Wort
+        // ueberschreibt -- und das saehe nach einem kaputten Gastregister aus, nicht nach einem
+        // Formatfehler.
+        for k in [
+            KOPF_MAGIE,
+            KOPF_VERSION,
+            KOPF_GEN,
+            KOPF_ANLASS,
+            KOPF_CODE,
+            KOPF_NGPR,
+            KOPF_NGESAMT,
+            KOPF_ARCH,
+            KOPF_GRUPPE,
+        ] {
+            assert!(k < KOPF_ABI, "Kopffeld {k} liegt in der ABI-Tabelle");
+        }
+        assert!(KOPF_RESERVIERT + KOPF_RESERVIERT_N <= KOPF_ABI, "reservierter Block ragt in die ABI-Tabelle");
+        assert!(KOPF_ABI + KOPF_ABI_N <= FRAME_WORT, "ABI-Tabelle ragt in den Frame");
+        assert_eq!(frame_wort(0), FRAME_WORT);
+        assert_eq!(SLOT_WOERTER, 64);
+        assert_eq!(FRAME_WOERTER_MAX, 40);
+    }
+
+    #[test]
+    fn slot_traegt_beide_frames_mit_kopf() {
+        // Die Behauptung „512 reicht" gilt erst MIT dem Kopf. `slot_fasst_beide_frames` prueft
+        // 272 <= 512 -- das ist die Aussage ohne Kopf und war bis zum 2026-08-13 die ganze
+        // Pruefung. Ein Kopf von 16 Woertern haette sie nicht gestoert und trotzdem den Frame
+        // ueber die Slotkante geschoben.
+        assert!(frame_passt(X86_GESAMT));
+        assert!(frame_passt(ARM_GESAMT));
+        assert!(frame_wort(ARM_GESAMT) <= SLOT_WOERTER);
+        // Und die Kante ist scharf: ein Wort mehr als Platz ist, passt nicht.
+        assert!(frame_passt(FRAME_WOERTER_MAX));
+        assert!(!frame_passt(FRAME_WOERTER_MAX + 1));
+    }
+
+    #[test]
+    fn nur_die_allzweckregister_kommen_zurueck() {
+        // **Die Aussage, die diesen Handler von einem Kernel unterscheidet.** Lesen darf er den
+        // ganzen Frame; zurueckschreiben nur die GPR. Die Woerter dahinter tragen den RING
+        // (`cs`/`ss`, `spsr`) -- wer sie schreiben darf, befoerdert seinen Gast.
+        for i in 0..X86_GPR {
+            assert!(uebernehmbar(i, X86_GPR), "x86-GPR {i} muss zurueck duerfen");
+        }
+        for i in X86_GPR..X86_GESAMT {
+            assert!(
+                !uebernehmbar(i, X86_GPR),
+                "x86-Wort {i} (vector/error/rip/cs/rflags/rsp/ss) darf NICHT zurueck"
+            );
+        }
+        for i in 0..ARM_GPR {
+            assert!(uebernehmbar(i, ARM_GPR));
+        }
+        for i in ARM_GPR..ARM_GESAMT {
+            assert!(
+                !uebernehmbar(i, ARM_GPR),
+                "aarch64-Wort {i} (elr/spsr/sp_el0) darf NICHT zurueck"
+            );
+        }
+    }
+
+    #[test]
+    fn das_ring_wort_ist_namentlich_gesperrt() {
+        // Dieselbe Aussage noch einmal, aber an der Stelle, um die es geht -- nicht ueber einen
+        // Bereich, sondern ueber DAS Wort. Ein Bereichstest bleibt gruen, wenn jemand die
+        // Reihenfolge der Frame-Felder aendert; dieser faellt.
+        //
+        // x86_64-Framefolge: gpr[0..15] · vector · error · rip · cs · rflags · rsp · ss
+        let (cs, ss, rflags) = (15 + 3, 15 + 6, 15 + 4);
+        assert!(!uebernehmbar(cs, X86_GPR), "cs traegt den Ring");
+        assert!(!uebernehmbar(ss, X86_GPR), "ss traegt den Ring");
+        assert!(!uebernehmbar(rflags, X86_GPR), "rflags traegt IOPL und IF");
+        // aarch64-Framefolge: gpr[0..31] · elr · spsr · sp_el0
+        assert!(!uebernehmbar(31 + 1, ARM_GPR), "spsr traegt das Exception-Level");
+    }
+
+    #[test]
+    fn die_magie_ist_kein_gueltiger_registerwert_aus_versehen() {
+        // Sie muss von 0 verschieden sein -- sonst waere „nichts geschrieben" von „geschrieben"
+        // nicht zu unterscheiden, und genau dafuer ist sie da.
+        assert_ne!(MAGIE, 0);
+        assert_ne!(MAGIE, u64::MAX);
+        assert_ne!(ARCH_X86_64, ARCH_AARCH64);
+    }
+
     // --- Die Weiche ------------------------------------------------------------------------
 
     #[test]
@@ -477,8 +952,12 @@ mod tests {
     #[test]
     fn mit_lebendem_handler_wird_umgeleitet() {
         let x = b(7, 9, 3, 2);
-        assert_eq!(weiche_syscall(Some(x), true), Weiche::Handler { ep: 7, slot: 2 });
-        assert_eq!(weiche_fault(Some(x), true), Weiche::Handler { ep: 9, slot: 2 });
+        let w = |ep, slot| Weiche::Handler { ep, slot, sidecar: 0x20_0000 };
+        assert_eq!(weiche_syscall(Some(x), true), w(7, 2));
+        assert_eq!(weiche_fault(Some(x), true), w(9, 2));
+        // Das FENSTER wandert mit -- eine Weiche, die den Slot nennt und das Fenster nicht,
+        // liesse den Zusteller die Basis ein zweites Mal aufloesen.
+        assert!(matches!(weiche_syscall(Some(x), true), Weiche::Handler { sidecar, .. } if sidecar == x.sidecar));
     }
 
     #[test]
@@ -515,14 +994,15 @@ mod tests {
         // Nur Syscall-Handler: Faults bleiben beim Kernel (der Gast stirbt nativ) -- und das ist
         // KEINE Ausweitung, denn der native Fault-Pfad gewaehrt nichts.
         let nur_sys = b(7, KEIN_EP, 3, 0);
-        assert_eq!(weiche_syscall(Some(nur_sys), true), Weiche::Handler { ep: 7, slot: 0 });
+        let w = |ep, slot| Weiche::Handler { ep, slot, sidecar: 0x20_0000 };
+        assert_eq!(weiche_syscall(Some(nur_sys), true), w(7, 0));
         assert_eq!(weiche_fault(Some(nur_sys), true), Weiche::Kernel);
         assert_eq!(weiche_fault(Some(nur_sys), false), Weiche::Kernel);
         // Nur Fault-Handler: Syscalls bleiben nativ. Das ist die Form, in der ein Debugger oder
         // ein Speicherserver arbeitet, ohne Persoenlichkeit zu sein.
         let nur_flt = b(KEIN_EP, 9, 3, 0);
         assert_eq!(weiche_syscall(Some(nur_flt), true), Weiche::Kernel);
-        assert_eq!(weiche_fault(Some(nur_flt), true), Weiche::Handler { ep: 9, slot: 0 });
+        assert_eq!(weiche_fault(Some(nur_flt), true), w(9, 0));
     }
 
     #[test]

@@ -9,6 +9,104 @@ schon einmal nicht getragen hat.
 
 ---
 
+## Z26/A3 — die NUTZLAST: ein Gast macht einen umgeleiteten Syscall und SIEHT das Ergebnis (2026-08-13)
+
+**Klasse:** Kernel-Primitiv · **Stand:** die vier ursprünglich offenen Punkte „Kopieren Frame ↔
+Sidecar", „Fenster anlegen + Handler-Cap prägen", „eigener `LocalReason`" und „Prüfzeile `handler`
+einhängen" sind zu. Was offen bleibt, steht in [todo.md](todo.md) — und es ist **mehr** als vorher,
+weil beim Bauen zwei Dinge sichtbar wurden, die vorher niemand aufgeschrieben hatte.
+
+### Was jetzt gemessen ist
+
+`redirect : ALL PASS` in `test-qemu-x86.sh`, gegattert in `all_done` (`DONE_FLAGS` 38 → 40):
+
+> Ein Gast setzt Syscall **39** ab — `getpid` in der Linux-ABI, eine Nummer, die der
+> Caprock-Kernel **nicht kennt** (nativ ergäbe sie `ERR_BADCAP`). Der Kernel leitet um, ein
+> Handler-Thread in einer **eigenen PD** liest den Trap-Frame aus dem Sidecar, und der Gast bekommt
+> `0xc0ffef` zurück.
+
+Drei Vorkehrungen, damit die Zeile nicht das Falsche misst:
+
+1. **Die Antwort ist BERECHNET, nicht konstant** (`Argument + 1`). Eine feste Zahl könnte der
+   Handler auch melden, ohne den Frame gelesen zu haben — dann bewiese die Zeile nur, dass jemand
+   geantwortet hat. Dieselbe Unterscheidung wie `rx_used` gegen „Daten sind angekommen".
+2. **Ein KÖDER in der Antwortnachricht.** `Endpoint::reply` setzt `x0` des Aufrufers ohnehin auf
+   `OK`; ohne Köder wäre „der Gast sieht ein Ergebnis" auch dann wahr, wenn das Sidecar gar nicht
+   benutzt würde. Der Handler legt `0xbadbad` in sein Nachrichtenwort — der Gast findet dort seinen
+   **eigenen** Wert wieder, weil der Rückschrieb aus dem Sidecar den IPC-Transport überschreibt.
+3. **Fail-closed an derselben Zeile.** Nach dem Stilllegen der Handler-PD bleibt der Gast bei
+   seinem nächsten Syscall blockiert, statt auf die native ABI zurückzufallen — mit
+   Positivkontrolle davor.
+
+### Die drei Gegenproben
+
+| Gegenprobe | gemessen |
+|---|---|
+| (a) der Frame wird **nicht** ins Sidecar kopiert | `handler-sah-frame=false` (alle fünf Bits 0), `x0=0x0`, **`x2=0xbadbad` — der Köder kam durch** |
+| (b) das Ergebnis wird **nicht** zurückgeschrieben | **isoliert:** `handler-sah-frame=true` bleibt grün, nur `gast-sieht-ergebnis` und `register-aus-sidecar` fallen |
+| (c) **Sprechprobe:** es wird gar nicht umgeleitet | `x0=0x1` = `ERR_BADCAP`, `0 Zustellungen`, und **`kein-rueckfall-auf-die-native-ABI=false`** — die Rechteausweitung wird sichtbar |
+
+Bei (a) fallen zwei Felder, und das ist **keine fehlende Isolation**: die Antwort ist aus dem
+gelesenen Argument gerechnet; wer den Frame nicht sieht, kann sie nicht liefern. Ein Konjunkt mit
+zwei Beobachtern — dieselbe Form wie M1 in `tools/redirect-negativ.sh`.
+
+### Der Befund, der grösser ist als der Eintrag: die Sidecar-Arithmetik war TOTER CODE
+
+`slot_offset`, `slot_gueltig`, `slots_in`, `fenster_deckt` und `FRAME_MAX_BYTES` hatten im
+**ganzen Baum** keinen Aufrufer ausserhalb ihres eigenen Testmoduls — mit `grep` gemessen, nicht
+vermutet. Die Mutationen M5/M6 in `tools/redirect-negativ.sh` belegen seit dem 2026-08-10, dass die
+**Funktionen** richtig sind. Dass sie **gerufen** werden, belegte nichts. Das ist „eine grüne Zeile,
+die nichts gattert", eine Ebene tiefer: ein Negativtest, der eine Eigenschaft absichert, die
+niemand benutzt.
+
+**Und dabei fiel eine echte Lücke auf:** `SIDECAR_SLOTS = 64` (die Breite der Belegungsmaske) und
+das `len` der Handler-Cap waren **zwei unabhängige Zahlen**. Eine Cap mit einem 4-KiB-Fenster hätte
+64 Slots vergeben, und der Kernel hätte bis Offset 32 KiB geschrieben — über die Region hinaus, in
+fremden Speicher. Jetzt weist `install_*_handler_cap` das ab (`CapError::ZuKlein`, eigener Name:
+„falsch ausgerichtet" heisst „verschiebe sie", „zu klein" heisst „nimm mehr Speicher") und
+`SYS_SETHANDLER` noch einmal.
+
+### Lesen und Schreiben sind NICHT dieselbe Autorität
+
+Die Autoritätstabelle von Z26/A3 führte eine Zeile „Frame lesen **und schreiben** — ja, ganzer
+Frame → `rt_sigreturn`, `clone` sind damit möglich". Sie ist seit dem 2026-08-13 in **zwei**
+geteilt, und zwar aus einem Sicherheitsgrund: der Frame enthält `cs`/`ss` (x86_64) bzw. `spsr`
+(aarch64), also den **Ring**. Ein Handler, der sie zurückschreiben dürfte, beförderte seinen Gast —
+das wäre die Rechteausweitung, gegen die die Weiche steht, nur von der anderen Seite. Gelesen wird
+deshalb der ganze Frame, **zurückgeschrieben nur die Allzweckregister**
+(`redirect::uebernehmbar`, mit einem Host-Test, der die Ring-Wörter **namentlich** sperrt).
+`rt_sigreturn` ist damit weiterhin nicht implementierbar — es braucht `rip`/`rsp`, und jedes davon
+braucht eine eigene Gültigkeitsprüfung (ein nicht-kanonischer `rip` schlägt beim `iretq` **im
+Kernel** auf).
+
+### Das Slot-Format ist eine VERTRAGSFLÄCHE, kein Registerabbild
+
+Nach dem Vorbild von A-4.3 (Zustandsübergabe): ein versionierter Kopf, und bei unbekannter Version
+eine **benannte Absage** statt eines Leseversuchs (`KopfUrteil::FremdeVersion`, ABI-Code
+`ERR_HANDLER_ABI = 14` — getrennt von `ERR_HANDLER_GONE`, denn „niemand da" und „jemand da, andere
+Fassung" sind zwei Diagnosen). Dazu Architekturkennung, Wortzahlen, eine **ABI-Indextabelle**
+(damit eine Persönlichkeit ihre Argumente findet, ohne die Registerlage nachzubilden), ein
+monotoner **Zustellungszähler** (ohne ihn ist eine ausgebliebene Zustellung von einer wiederholten
+nicht zu unterscheiden) und ein reserviertes **Gruppenfeld** für den späteren Handler-Schnitt —
+mit der Regel der reservierten Manifest-Bytes: **`0` heisst „keine Angabe", nicht „passt auf
+alles"**, ein gesetzter Wert wird **abgewiesen** statt ignoriert.
+
+Gemessen: `redirect` **35** Host-Tests (vorher 22), `tools/redirect-negativ.sh` **11** Mutationen
+(vorher 7) + Quelltext-Wächter, `tools/abnahme.sh` 13 Punkte grün.
+
+### Nebenbefund: zwei Suiten, die denselben SCHLÜSSEL verschieden aufsetzen
+
+`test-qemu-x86-load.sh` prüft seit dem 2026-08-01 die **Übereinstimmung** zwischen dem privaten
+TrustedSAS-Schlüssel und dem in den Kernel kompilierten öffentlichen (`tools/check_trusted_key.py`)
+— mit einer ausführlichen Begründung im Skript. `test-qemu.sh` (aarch64) behielt die alte Prüfung
+auf **Existenz**. Ein `git checkout kernel/src/trusted_keys.rs` — also genau das Aufräumen, das
+`AGENTS.md` am Sitzungsende verlangt — lässt die aarch64-Suite danach mit
+`root : FAILURES (Rejected(Unverified))` plus drei Folgezeilen scheitern: sieht wie ein
+Kernelbefund aus, ist ein Aufbauproblem. Am 2026-08-13 genau so eingetreten und behoben; beide
+Suiten fahren jetzt denselben Prüfer.
+
+---
+
 ## C8. Der VERIFIZIERERTHREAD — die Krypto ist vom Aufrufer-Stack herunter (2026-08-11)
 
 **Klasse:** Kapazität / Sicherheit · **Stand:** (a) und (b) **gebaut und gemessen**; (c) bleibt

@@ -61,6 +61,10 @@ mod selftest;
 /// Tickrate hergeleitete Schwelle, die Eichung, die Gegenprobe und das Urteil. Arch-neutral.
 #[cfg(feature = "selftest")]
 mod sperrmark;
+/// Z26/A3: das Kopieren Frame ↔ Sidecar — die **Nutzlast** des Umleitungsprimitivs. Arch-neutral;
+/// den Frame zerlegt `caprock_hal::exception`, das Slot-Format steht abhängigkeitsfrei in
+/// `caprock_sched::redirect`.
+mod sidecarkopie;
 mod system;
 #[cfg(all(target_arch = "aarch64", feature = "selftest"))]
 mod threads;

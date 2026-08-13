@@ -946,6 +946,38 @@ fn with_owner<R>(
     None
 }
 
+/// **Das Ergebnis aus dem Sidecar in den Frame des Gastes — und ERST DANN der Wecker** (Z26/A3).
+///
+/// Läuft unter der Sperre des besitzenden Kerns (`with_owner`), also in demselben kritischen
+/// Abschnitt wie das Entfernen des Grundes. **Die Reihenfolge ist die Zusicherung:** wer zuerst
+/// weckt, gibt den Gast frei, bevor sein Frame steht — auf einem anderen Kern liefe er dann mit
+/// halbem Syscall los. Genau die Wirkung, die Z26/Nachtrag 3 vorhersagt, und genau der Grund, aus
+/// dem `HANDLER` überhaupt ein eigener Grund ist.
+///
+/// Ein Thread **ohne** Bindung (der Kernel-Prüfpfad in `handlermess.rs`) überspringt das Kopieren
+/// und wird nur geweckt: „kein Fenster" ist hier eine Antwort und kein Fehlschlag.
+fn handler_reply_mit_frame(s: &mut Scheduler, tid: ThreadId) -> Option<()> {
+    if let (Some(b), Some(frame)) = (s.handler_of(tid), s.frame_of(tid)) {
+        if b.sidecar != 0 {
+            // **Ein fremder Kopf wird BENANNT abgewiesen, nicht ausgelegt** (A-4.3-Regel). Der
+            // Gast läuft weiter -- er muss, sonst hinge er an einem Formatstreit --, aber mit
+            // einem Code, der sagt, was los war. `KeinFrame` bekommt ausdrücklich KEINEN Code:
+            // dort ist der Frame unverändert, und der Gast sieht, was der IPC-Transport
+            // hinterlassen hat. Genau daran ist die Gegenprobe ablesbar.
+            if let crate::sidecarkopie::Uebernahme::FremderKopf(_) =
+                crate::sidecarkopie::uebernehmen(frame, b.sidecar, b.slot)
+            {
+                hal::exception::frame_set_reg(
+                    frame,
+                    caprock_abi::reg::SYSNO_RESULT,
+                    caprock_abi::result::ERR_HANDLER_ABI,
+                );
+            }
+        }
+    }
+    s.handler_reply(tid).then_some(())
+}
+
 /// Besitzender Kern eines Threads (lock-frei; kann beim Sperren bereits veraltet sein).
 pub fn owner_core_of(tid: ThreadId) -> Option<usize> {
     caprock_sched::owner_core(tid)
@@ -1023,9 +1055,19 @@ impl SchedOps for KernelSched {
         // reine Last. Geweckt wird bei `handler_reply`.
         let _ = with_owner(tid, |s, _| s.mark_handler_wait(tid).then_some(()));
     }
+    fn sidecar_ablegen(
+        &mut self,
+        frame: usize,
+        sidecar: u64,
+        slot: u16,
+        anlass: u64,
+        code: u64,
+    ) -> bool {
+        crate::sidecarkopie::ablegen(frame, sidecar, slot, anlass, code)
+    }
     fn handler_reply(&mut self, tid: ThreadId) {
         // Dieselbe Migrationsschleife wie `unblock`/`unpark`, und aus demselben Grund.
-        if let Some((_, c)) = with_owner(tid, |s, _| s.handler_reply(tid).then_some(())) {
+        if let Some((_, c)) = with_owner(tid, |s, _| handler_reply_mit_frame(s, tid)) {
             kick(c);
         }
     }
@@ -9135,8 +9177,12 @@ pub fn mark_handler_wait(tid: ThreadId) -> bool {
 }
 
 /// **Der einzige Wecker des Handler-Grundes**, auch für den Prüfpfad.
+///
+/// Geht durch **denselben** [`handler_reply_mit_frame`] wie der Betriebspfad — und das ist keine
+/// Bequemlichkeit: ein Prüfpfad, der das Zurückschreiben auslässt, prüfte einen Ablauf, den es im
+/// Betrieb nicht gibt, und die Reihenfolge „erst Frame, dann Wecker" stünde an zwei Stellen.
 pub fn handler_reply(tid: ThreadId) -> bool {
-    if let Some((_, c)) = with_owner(tid, |s, _| s.handler_reply(tid).then_some(())) {
+    if let Some((_, c)) = with_owner(tid, |s, _| handler_reply_mit_frame(s, tid)) {
         kick(c);
         return true;
     }
@@ -9201,6 +9247,63 @@ pub fn pruefe_bindung(
         n,
         frei,
     )
+}
+
+/// **Ein Sidecar-Fenster anlegen und eine `SyscallHandler`-Cap darauf prägen** (Z26/A3).
+///
+/// Bis zum 2026-08-13 gab es **keinen** Pfad, der eine Handler-Cap prägt — `SYS_SETHANDLER` konnte
+/// damit nie erfolgreich sein, und die Prüfzeile `handler` mass das Primitiv über den
+/// Kernel-Prüfpfad statt über einen echten Gast.
+///
+/// **Das Fenster muss ALLE Slots decken**, die die Belegungsmaske vergeben kann
+/// (`caprock_microkit::SIDECAR_SLOTS` × `SLOT_BYTES` = 32 KiB). Die Prüfung steht hier und noch
+/// einmal an der Bindung, und das ist Absicht: die Maskenbreite und die Fensterlänge waren bis
+/// heute **zwei unabhängige Zahlen**, und `redirect::fenster_deckt` — die Funktion, die genau
+/// diesen Off-by-one abfängt und dafür einen Host-Test und eine Mutation hat — hatte im ganzen
+/// Baum **keinen Aufrufer**.
+///
+/// Die Handler-Cap selbst hält **keinen** Allokator-Eintrag: das Fenster wird über eine getrennte
+/// `Memory`-Cap vergeben, und genau das ist die Begründung der Sidecar-Form — die Autorität über
+/// den Registerzustand fremder Threads steht in der **Speicherbuchhaltung** und nicht nur im
+/// Cap-Audit.
+///
+/// Diese Funktion liefert die **nötige Fenstergrösse**; das Anlegen macht der Aufrufer.
+pub fn sidecar_fenster_bytes() -> u64 {
+    caprock_microkit::SIDECAR_SLOTS as u64 * caprock_sched::redirect::SLOT_BYTES as u64
+}
+
+/// Eine `SyscallHandler`-Cap auf ein bestehendes Fenster prägen.
+pub fn install_syscall_handler_cap(
+    ep: u32,
+    pd: u16,
+    sidecar: u64,
+    len: u64,
+    rights: Rights,
+) -> Result<CapPtr, CapError> {
+    if sidecar == 0 || !caprock_sched::redirect::fenster_deckt(caprock_microkit::SIDECAR_SLOTS, len)
+    {
+        return Err(CapError::ZuKlein);
+    }
+    CAPS.write()
+        .cspace
+        .install_syscall_handler(ep, pd, sidecar, len, rights)
+}
+
+/// Eine `FaultHandler`-Cap auf ein bestehendes Fenster prägen.
+pub fn install_fault_handler_cap(
+    ep: u32,
+    pd: u16,
+    sidecar: u64,
+    len: u64,
+    rights: Rights,
+) -> Result<CapPtr, CapError> {
+    if sidecar == 0 || !caprock_sched::redirect::fenster_deckt(caprock_microkit::SIDECAR_SLOTS, len)
+    {
+        return Err(CapError::ZuKlein);
+    }
+    CAPS.write()
+        .cspace
+        .install_fault_handler(ep, pd, sidecar, len, rights)
 }
 
 /// Freie Sidecar-Slots bei einer Handler-PD.

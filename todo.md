@@ -227,9 +227,12 @@ glibc-Symbolfläche, nicht Signale/`futex`/`mmap`.
 | 3 | Die **Blockiernaht** (Zyklusverbot **im Kernel**, Wartegrund in der Grund-Menge) | **erledigt, beide Hälften** — `pruefe_bindung` geht den Graphen (nicht nur den direkten Partner), Wartegrund von Tag eins in `BlockReasons` |
 | 4 | **Messmatrix mit vorab fixierter Schwelle** | **halb** — die Schwelle steht (umgeleiteter `getpid` ≤ 2000 Zyklen, verankert an Z18 (2)), **gemessen ist nichts**. Für `read` 4/64 KiB ist keine Schwelle festlegbar, weil der Pfad nicht existiert (Gast-Speicher-Autorität fehlt, s. Nachtrag 2) |
 
-**Dazu die grösste offene Lücke des Primitivs, aus seinem eigenen Bericht:** die **Nutzlast**
-fehlt — Frame ↔ Sidecar wird nicht kopiert, und kein Pfad prägt eine Handler-Cap. Das Primitiv ist
-damit richtig, aber **nicht benutzbar**, und `SYS_SETHANDLER` kann heute nie erfolgreich sein.
+**Die grösste Lücke des Primitivs ist am 2026-08-13 geschlossen:** die **Nutzlast** steht. Der
+Frame wird ins Sidecar kopiert und das Ergebnis zurückgeschrieben, ein Pfad prägt Handler-Caps, und
+`SYS_SETHANDLER` ist erfolgreich gewesen — belegt als `redirect : ALL PASS` an einem echten Gast,
+der einen umgeleiteten Syscall macht und **das Ergebnis sieht**. Details, Gegenproben und die
+**neuen** offenen Punkte (isolierter Handler / EL0-Gast, `rip`/`rsp` im Rückschrieb) unten bei
+[A3](#a3--das-kernel-primitiv-ist-gebaut-2026-08-10-was-steht-was-offen-ist-und-die-schwelle).
 
 ## Was der Durchgang durch die einseitigen Vergleiche NICHT abgedeckt hat
 
@@ -1150,10 +1153,37 @@ zweite Hälfte der Rechnung.
 
 #### A3 — DAS KERNEL-PRIMITIV IST GEBAUT (2026-08-10). Was steht, was offen ist, und die Schwelle
 
-**Stand:** das Primitiv trägt; die **Nutzlast** fehlt. Gemessen: `redirect` 22/22 Host-Tests,
-`tools/redirect-negativ.sh` 7 Mutationen + 1 Quelltext-Wächter mit Sprechprobe **ALL PASS**,
-`== HOST-TESTS: ALL PASS ==`, Scheduler-Modelltreue **29 Selbsttestfälle** grün, Kerngrenze,
-Identität, Zulassung grün, Kernel baut (`x86_64-unknown-none`, `--features selftest`).
+**Stand (2026-08-13): die NUTZLAST steht — ein Gast macht einen umgeleiteten Syscall und SIEHT
+das Ergebnis.** Gemessen in QEMU als Prüfzeile `redirect : ALL PASS`: ein Gast setzt Syscall **39**
+ab (`getpid` in der Linux-ABI, eine Nummer, die der Caprock-Kernel **nicht kennt** — nativ wäre das
+`ERR_BADCAP`), der Kernel leitet um, ein Handler-Thread in einer **eigenen PD** liest den
+Trap-Frame aus dem Sidecar und schreibt die Antwort zurück, der Gast bekommt `0xc0ffef` = sein
+eigenes Argument + 1. Die Antwort ist **berechnet**, nicht konstant: eine feste Zahl könnte der
+Handler auch melden, ohne den Frame gelesen zu haben. Und ein **Köder** in der Antwortnachricht
+belegt, dass der Wert nicht über den IPC-Transport kam (der Gast findet in `x2` seinen eigenen Wert
+wieder, nicht den Köder).
+
+Gemessen: `redirect` **35/35** Host-Tests, `tools/redirect-negativ.sh` **11 Mutationen** + 1
+Quelltext-Wächter mit Sprechprobe **ALL PASS**, `== HOST-TESTS: ALL PASS ==`,
+Scheduler-Modelltreue **29 Selbsttestfälle** grün, Kerngrenze, Zulassung grün,
+`tools/abnahme.sh` 13 Punkte grün (beide Architekturen gebaut, RAM-Reihe 512M · 2560M · 3G · 4G ·
+6G, Lade-Suite 512M · 3G · 6G, aarch64-Suite).
+
+**Drei Gegenproben, gefahren und protokolliert** (jeweils Mutation → Suite → zurückgenommen):
+
+| Gegenprobe | erwartet | gemessen |
+|---|---|---|
+| (a) der Frame wird **nicht** ins Sidecar kopiert | der Handler sieht Müll | `handler-sah-frame=false` (alle fünf Bits 0), `x0=0x0`, **`x2=0xbadbad` — der Köder kam durch** |
+| (b) das Ergebnis wird **nicht** zurückgeschrieben | der Gast sieht seinen alten Registerwert | **isoliert:** `handler-sah-frame=true` (0b11111) bleibt grün, nur `gast-sieht-ergebnis=false` (`x0=0x0`) und `register-aus-sidecar=false` fallen |
+| (c) **Sprechprobe:** es wird gar nicht umgeleitet | darf nicht wie ein bestandener Lauf aussehen | `x0=0x1` = `ERR_BADCAP` (die native Antwort), `bedient=0`, `0 Zustellungen`, und **`kein-rueckfall-auf-die-native-ABI=false`** — die Rechteausweitung wird sichtbar |
+
+Bei (a) fallen zwei Felder, und das ist **keine fehlende Isolation**: die Antwort ist aus dem
+gelesenen Argument gerechnet, wer den Frame nicht sieht, kann sie nicht liefern. Ein Konjunkt mit
+zwei Beobachtern — dieselbe Form wie M1 in `tools/redirect-negativ.sh`.
+
+**Fail-closed ist mitgemessen**, an derselben Zeile: nach dem Stilllegen der Handler-PD bleibt der
+Gast bei seinem nächsten Syscall **blockiert** (`handler-blockiert=true`, Rundenzähler steht), statt
+auf die native ABI zurückzufallen — mit Positivkontrolle davor (`laeuft-vorher=true`).
 
 ##### Was steht
 
@@ -1234,17 +1264,26 @@ feststehen müssen.
 
 ##### WAS OFFEN IST — und das ist mehr, als oben steht
 
-- [ ] **Die Nutzlast: das Kopieren Frame ↔ Sidecar fehlt.** `zustellen()` stellt die **Nachricht**
-      zu (welcher Gast, welcher Slot, welcher Anlass) und blockiert den Gast korrekt. Der Handler
-      erfährt *dass* und *wer*, aber **nicht *was***. Es fehlt die Physadresse des Fensters im
-      Kernel und ein architekturabhängiger Frame-Serialisierer. **Ohne das ist das Primitiv nicht
-      benutzbar**, nur richtig.
+- [ ] **NEU (2026-08-13): die Messung fährt keinen ISOLIERTEN Handler und keinen EL0-Gast.**
+      Beide sind Kernel-Threads in eigenen PDs; der Trap-Pfad ist derselbe (`int 0x80` legt
+      denselben Frame an, `iretq` stellt ihn her) und die zurückgeschriebenen Wörter sind
+      dieselben — aber „ein EL0-Gast wird umgeleitet" und „das Fenster liegt in der VSpace einer
+      isolierten Handler-PD" sind damit **erschlossen, nicht gemessen**. Ein erschlossener Fall
+      war in diesem Projekt schon dreimal ein ungeprüfter. Für den isolierten Handler ist der Weg
+      klar (`spawn_isolated_parked` + `SYS_MAP` auf der Fenster-Cap); er verlangt Handler- und
+      Gastcode in `.user_text` und ist deshalb eine eigene Runde.
 
-- [ ] **Das Sidecar-Fenster wird nirgends ANGELEGT und in die Handler-PD gemappt.** Die Cap trägt
-      `sidecar`/`len`, aber es gibt keinen Pfad, der eine Handler-Cap prägt. Solange der fehlt,
-      kann `SYS_SETHANDLER` nie erfolgreich sein — es gibt keine Cap der neuen Arten.
-      **Das ist der Grund, warum die Prüfzeile `handler` das Primitiv über den Kernel-Prüfpfad
-      misst und nicht über einen echten Gast.**
+- [ ] **NEU (2026-08-13): der Rückschrieb umfasst nur die ALLZWECKREGISTER.** `rip`/`rsp`
+      (x86_64) bzw. `elr`/`sp_el0` (aarch64) kommen **nicht** zurück — und damit ist
+      `rt_sigreturn` weiterhin **nicht** implementierbar, obwohl die Autoritätstabelle oben das
+      Gegenteil sagt („Frame lesen **und schreiben** — ja, ganzer Frame → `rt_sigreturn`, `clone`
+      sind damit möglich"). Der Grund ist kein Versehen: **Lesen und Schreiben sind nicht dieselbe
+      Autorität.** Der Frame enthält `cs`/`ss` bzw. `spsr`, also den **Ring** — ein Handler, der
+      sie zurückschreiben dürfte, beförderte seinen Gast, und das wäre die Rechteausweitung, gegen
+      die die Weiche steht, nur von der anderen Seite. `rip`/`rsp` sind weniger gefährlich, aber
+      jedes von ihnen braucht eine eigene Gültigkeitsprüfung (Kanonizität — ein nicht-kanonischer
+      `rip` schlägt beim `iretq` **im Kernel** auf, Ausrichtung). Die Zeile in der Tabelle ist
+      seit dem 2026-08-13 in **zwei** geteilt.
 
 - [ ] **`handler_lebt` liest die falsche Größe — benannt, nicht versteckt.** Geprüft wird, ob die
       Handler-**PD** existiert und nicht stillgelegt ist. **Nicht** geprüft: ob die Handler-*Cap*
@@ -1265,27 +1304,29 @@ feststehen müssen.
       `quiescing`-PDs bereits als tot aus (der Gast faultet also statt zu hängen) — aber die
       **Freeze-Absage** nennt den Handler-Wartefall nicht, und das gehört zusammen entschieden.
 
-- [ ] **Der eigene `LocalReason` für Handler-Caps fehlt.** `classify` verweigert sie korrekt, aber
-      mit dem Grund `PendingReply` — eine **benannte Ungenauigkeit**: der Refusal-Grund stimmt
-      („konkrete blockierte Aufrufer bleiben hier"), die Cap-Art nicht. Ein eigener
-      `LocalReason::HandlerBinding` braucht **eine Zeile** in `ckpt_reason`
-      (`kernel/src/arch/x86_64/bringup.rs`): `L::HandlerBinding => 9,`. Der Host-Test
-      `handler_caps_wandern_nicht` pinnt das heutige Verhalten fest und **fällt**, sobald die
-      Umstellung kommt — das ist seine Aufgabe.
+- [ ] **NEU (2026-08-13), und es ist der unangenehmste Befund dieser Runde: die ganze
+      Sidecar-Arithmetik war TOTER CODE.** `slot_offset`, `slot_gueltig`, `slots_in`,
+      `fenster_deckt` und `FRAME_MAX_BYTES` hatten im **ganzen Baum** keinen Aufrufer ausserhalb
+      ihres eigenen Testmoduls — gemessen mit `grep`, nicht vermutet. Die Mutationen M5 und M6 in
+      `tools/redirect-negativ.sh` belegen seit dem 2026-08-10, dass die **Funktionen** richtig
+      sind; dass sie **gerufen** werden, belegte nichts. Das ist die Form „eine grüne Zeile, die
+      nichts gattert", eine Ebene tiefer: ein Negativtest, der eine Eigenschaft absichert, die
+      niemand benutzt.
+      Seit der Nutzlast sind alle fünf tragend (`slot_gueltig` in `sidecarkopie::slot_adresse`,
+      `fenster_deckt` beim Prägen der Cap **und** an der Bindung, `slot_offset` im Zusteller).
+      **Und dabei fiel eine echte Lücke auf:** `SIDECAR_SLOTS = 64` und das `len` der Cap waren
+      **zwei unabhängige Zahlen**. Eine Handler-Cap mit einem 4-KiB-Fenster hätte 64 Slots
+      vergeben und der Kernel bis Offset 32 KiB geschrieben — über die Region hinaus, in fremden
+      Speicher. Jetzt weist `install_*_handler_cap` das ab (`CapError::ZuKlein`) und
+      `SYS_SETHANDLER` noch einmal (`ERR_NOSPACE`).
 
-- [ ] **Die Prüfzeile `handler` ist geschrieben, aber nicht eingehängt.** `kernel/src/handlermess.rs`
-      (über `system.rs` per `#[path]` eingebunden, damit `main.rs` unberührt bleibt) misst drei
-      Dinge: die ABI-Konstanten-Klammer, das Zyklusverbot **gegen die echte PD-Tabelle**, die
-      Sidecar-Slot-Buchhaltung, und als Hauptaussage, dass **kein fremder Wecker** den
-      Handler-Grund aufhebt (`unpark`, `resume`, `pause`+`resume`) — gemessen an der **Wirkung**
-      (Rundenzähler einer Sonde), mit Positivkontrolle davor und Sprechprobe danach
-      (`laeuft-nach-reply`).
-      Einzuhängen sind **drei** Zeilen in `bringup.rs` (s. Abschlussbericht des Strangs); solange
-      sie fehlen, ist die Aussage **ungemessen**, und die betreffenden Funktionen stehen als
-      „never used" im Bau.
-
-- [ ] **Nicht gemessen: die Kosten.** Kein Zyklenwert, weder für die Weiche noch für den Umlauf.
-      Der Umlauf braucht die Nutzlast (s. o.); die Weiche kostet auf dem unbelasteten Pfad ein
+- [ ] **Nicht gemessen: die Kosten — und seit dem 2026-08-13 ist das keine Frage der Bausteine
+      mehr, sondern der Maschine.** Kein Zyklenwert, weder für die Weiche noch für den Umlauf.
+      Der Umlauf war bis heute **nicht messbar**, weil die Nutzlast fehlte; jetzt läuft er, und die
+      Schwelle (umgeleiteter `getpid` ≤ 2000 Zyklen Median) ist einlösbar. **Gemessen wird sie auf
+      einer RUHIGEN Maschine**: dieser Messstand ist mit 3,2-facher vCPU-Überbuchung schon einmal
+      in die Irre geführt worden (D13), und eine Zahl von dort stünde danach im Register. Die
+      Weiche kostet auf dem unbelasteten Pfad ein
       `Option`-Lesen am laufenden TCB je Syscall (eine Sperrung, ein Vergleich, kein Cap-Lookup) —
       **auch das ist eine Behauptung über den Code, keine Messung.** Sie gehört an
       [Z18](#z18-hohe-leistung-für-übersetzten-fremdcode--vermessen-2026-08-09) (2), das ohnehin

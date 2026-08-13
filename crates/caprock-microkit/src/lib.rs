@@ -1280,8 +1280,8 @@ pub fn dispatch(
                 frame_set_reg(frame, reg::SYSNO_RESULT, code);
                 ops.block_for_handler(core, frame)
             }
-            redirect::Weiche::Handler { ep, slot } => zustellen(
-                frame, core, ops, eps, ep, slot, redirect::Anlass::Syscall, 0,
+            redirect::Weiche::Handler { ep, slot, sidecar } => zustellen(
+                frame, core, ops, eps, ep, slot, sidecar, redirect::Anlass::Syscall, 0,
             ),
         };
     }
@@ -1326,9 +1326,17 @@ pub fn fault_dispatch(
             frame_set_reg(frame, reg::SYSNO_RESULT, code);
             ops.block_for_handler(core, frame)
         }
-        redirect::Weiche::Handler { ep, slot } => {
-            zustellen(frame, core, ops, eps, ep, slot, redirect::Anlass::Fault, ec)
-        }
+        redirect::Weiche::Handler { ep, slot, sidecar } => zustellen(
+            frame,
+            core,
+            ops,
+            eps,
+            ep,
+            slot,
+            sidecar,
+            redirect::Anlass::Fault,
+            ec,
+        ),
     })
 }
 
@@ -1339,11 +1347,19 @@ pub fn fault_dispatch(
 /// ein Trap-Frame hat 22 (x86_64) bzw. 34 (aarch64) Wörter — `rt_sigreturn` (ersetzt den ganzen
 /// Frame) und `clone` (braucht einen zweiten) sind über vier Wörter strukturell unmöglich.
 ///
-/// **NOCH NICHT GEBAUT und ausdrücklich benannt:** das Kopieren Frame ↔ Sidecar. Es braucht die
-/// physische Adresse des Fensters und einen architekturabhängigen Frame-Serialisierer; beides
-/// liegt im Kernel, nicht hier. Solange es fehlt, stellt diese Funktion die **Nachricht** zu und
-/// blockiert den Gast korrekt — der Handler erfährt also *dass* und *wer*, aber nicht *was*.
-/// Der Zustand ist damit ehrlich unvollständig statt scheinbar fertig; s. `todo.md` Z26/A3.
+/// **Die Nutzlast steht seit dem 2026-08-13 im Sidecar** (vorher fehlte sie, s. unten). Der ganze
+/// Trap-Frame wird über [`SchedOps::sidecar_ablegen`] in den Slot des Gastes gelegt, **bevor** die
+/// Nachricht rausgeht — nachher wäre es ein Rennen: der Handler kann auf einem anderen Kern
+/// losgelaufen sein und den Slot bereits gelesen haben.
+///
+/// Bis dahin stellte diese Funktion nur die **Nachricht** zu; der Handler erfuhr *dass* und *wer*,
+/// aber nicht *was*. Das war ehrlich benannt und machte das Primitiv unbenutzbar.
+///
+/// **Schlägt das Ablegen fehl, wird nicht zugestellt.** Fail-closed, mit demselben Code wie ein
+/// toter Handler: ein Gast, dessen Frame nicht im Fenster steht, bekäme sonst eine Antwort auf
+/// einen Syscall, den niemand lesen konnte — und der Handler antwortete auf den Frame des
+/// **vorigen** Aufrufs, der noch im Slot liegt. Weiterlaufen darf er dabei nicht (das wäre die
+/// Beförderung auf die native ABI), also bleibt er blockiert.
 #[allow(clippy::too_many_arguments)]
 fn zustellen(
     frame: usize,
@@ -1352,6 +1368,7 @@ fn zustellen(
     eps: &[SpinLock<Endpoint>],
     ep: u32,
     slot: u16,
+    sidecar: u64,
     anlass: redirect::Anlass,
     code: u64,
 ) -> usize {
@@ -1359,6 +1376,14 @@ fn zustellen(
     if ep_i >= eps.len() {
         // Der Endpoint ist weg -> derselbe Fall wie ein toter Handler, und **dieselbe** Antwort.
         // Nicht `ERR_BADCAP`: der Gast hat keine Cap benutzt, er hat einen Syscall gemacht.
+        frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_HANDLER_GONE);
+        return ops.block_for_handler(core, frame);
+    }
+    // **Zuerst der Frame, dann die Nachricht** — und zwar bevor die Registerfelder unten mit der
+    // Umleitungsnachricht überschrieben werden. Andersherum läge im Sidecar nicht der Frame des
+    // Gastes, sondern die Nachricht an den Handler: der Gast sähe seine eigenen Argumente nie
+    // wieder, und `x1`..`x5` kämen beim Zurückschreiben als Müll bei ihm an.
+    if !ops.sidecar_ablegen(frame, sidecar, slot, anlass as u64, code) {
         frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_HANDLER_GONE);
         return ops.block_for_handler(core, frame);
     }
@@ -1805,11 +1830,16 @@ fn dispatch_nativ(
             }
 
             // --- Binden ----------------------------------------------------------------------
-            let (sys_ep, flt_ep, handler_pd) = {
+            let (sys_ep, flt_ep, handler_pd, sidecar) = {
                 let g = caps.read();
                 let mut sys_ep = redirect::KEIN_EP;
                 let mut flt_ep = redirect::KEIN_EP;
                 let mut hpd: Option<u16> = None;
+                // **Das Fenster wird MITGENOMMEN, nicht nachgeschlagen** (2026-08-13). Der
+                // Syscall-Pfad hat später den Gast, nicht die Handler-Cap — die liegt im Cspace
+                // des Handlers. Ein Cap-Lookup je umgeleitetem Syscall wäre der Preis dafür,
+                // dieselbe Zahl zweimal zu führen; abgeschrieben wird sie **einmal**, hier.
+                let mut fenster: Option<(u64, u64)> = None;
                 // Beide Caps müssen auf **dieselbe** Handler-PD zeigen. Zwei PDs, von denen die
                 // eine die Syscalls und die andere die Faults eines Gastes sieht, wären zwei
                 // Kernel über einem Adressraum — und im Zyklus-Graphen zwei Kanten von einem
@@ -1827,9 +1857,25 @@ fn dispatch_nativ(
                     if !r.contains(Rights::WRITE) {
                         return deny(result::ERR_RIGHTS);
                     }
-                    let (ep, hp) = match (k, ist_sys) {
-                        (ObjectKind::SyscallHandler { ep, pd, .. }, true) => (ep, pd),
-                        (ObjectKind::FaultHandler { ep, pd, .. }, false) => (ep, pd),
+                    let (ep, hp, sc, ln) = match (k, ist_sys) {
+                        (
+                            ObjectKind::SyscallHandler {
+                                ep,
+                                pd,
+                                sidecar,
+                                len,
+                            },
+                            true,
+                        ) => (ep, pd, sidecar, len),
+                        (
+                            ObjectKind::FaultHandler {
+                                ep,
+                                pd,
+                                sidecar,
+                                len,
+                            },
+                            false,
+                        ) => (ep, pd, sidecar, len),
                         // **Ein gewöhnlicher Endpoint wird hier ABGEWIESEN** — das ist der Grund
                         // für die eigenen Cap-Arten. Eine PD kann ihren Dienst-Endpoint nicht
                         // versehentlich als Persönlichkeit binden, und ein `SyscallHandler` im
@@ -1841,6 +1887,21 @@ fn dispatch_nativ(
                         Some(x) if x != hp => return deny(result::ERR_HANDLER_BUSY),
                         _ => {}
                     }
+                    // **Und dasselbe FENSTER**, nicht nur dieselbe PD. Zwei Caps auf eine PD mit
+                    // verschiedenen Fenstern hiessen: der Syscall-Frame landet woanders als der
+                    // Fault-Frame, während beide denselben Slot-Index tragen — zwei Wahrheiten
+                    // über einen Gast, und die Slot-Buchhaltung führte nur eine davon.
+                    match fenster {
+                        None => fenster = Some((sc, ln)),
+                        Some(x) if x != (sc, ln) => return deny(result::ERR_HANDLER_BUSY),
+                        _ => {}
+                    }
+                    // Das Fenster muss ALLE Slots decken, die die Maske vergeben kann. Die
+                    // Prüfung steht **an der Bindung** und nicht am Zugriff: eine Schranke, die
+                    // erst beim Schreiben zuschlägt, hat den Gast schon angenommen.
+                    if !redirect::fenster_deckt(SIDECAR_SLOTS, ln) || sc == 0 {
+                        return deny(result::ERR_NOSPACE);
+                    }
                     if ist_sys {
                         sys_ep = ep;
                     } else {
@@ -1850,7 +1911,10 @@ fn dispatch_nativ(
                 let Some(hpd) = hpd else {
                     return deny(result::ERR_BADCAP);
                 };
-                (sys_ep, flt_ep, hpd)
+                let Some((sc, _)) = fenster else {
+                    return deny(result::ERR_BADCAP);
+                };
+                (sys_ep, flt_ep, hpd, sc)
             }; // CAPS-Read freigegeben
 
             // --- Das Zyklusverbot, IM KERNEL (Z26/Nachtrag 3) ---------------------------------
@@ -1898,6 +1962,7 @@ fn dispatch_nativ(
                 fault_ep: flt_ep,
                 handler_pd,
                 slot,
+                sidecar,
             };
             g.pds.handler_kante_setzen(gast_pd, handler_pd);
             drop(g);

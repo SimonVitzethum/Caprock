@@ -310,6 +310,48 @@ pub fn frame_from_el0(frame: usize) -> bool {
     frame_spsr(frame) & 0xf == 0
 }
 
+// --- Frame-SERIALISIERUNG (Z26/A3, die Nutzlast) ----------------------------------------------
+//
+// Gegenstück zur x86-Fassung; die Begründung für die feldweise Schreibweise steht dort.
+
+/// Wörter eines serialisierten aarch64-Frames: `x0..x30`, `elr`, `spsr`, `sp_el0`.
+pub const FRAME_WOERTER: usize = 34;
+
+/// Davon **übernehmbar** (die Allzweckregister). `elr`/`spsr`/`sp_el0` werden aus dem Sidecar
+/// **nie** zurückgeschrieben — `spsr` trägt das Exception-Level, also den Ring.
+pub const FRAME_GPR: usize = 31;
+
+/// Architekturkennung im Sidecar-Kopf (`caprock_sched::redirect::ARCH_AARCH64`).
+pub const FRAME_ARCH: u64 = 1;
+
+/// Frame-Wort-Index der ABI-Register `x0..x6`. Auf aarch64 ist die Abbildung die Identität —
+/// die Tabelle steht trotzdem da, weil der **Handler** nicht wissen soll, auf welcher
+/// Architektur er läuft.
+pub const FRAME_ABI_WORT: [u64; 7] = [0, 1, 2, 3, 4, 5, 6];
+
+/// Den gesicherten Frame als Wortfolge ablegen (s. x86-Fassung).
+pub fn frame_woerter(frame: usize, out: &mut [u64]) -> usize {
+    if out.len() < FRAME_WOERTER {
+        return 0;
+    }
+    // SAFETY: wie `frame_reg` -- gültiger, vom Trap-Pfad angelegter TrapFrame-Zeiger.
+    let f = unsafe { &*(frame as *const TrapFrame) };
+    out[..FRAME_GPR].copy_from_slice(&f.gpr);
+    out[31] = f.elr;
+    out[32] = f.spsr;
+    out[33] = f.sp_el0;
+    FRAME_WOERTER
+}
+
+/// **Nur die Allzweckregister** aus einer Wortfolge in den Frame übernehmen (s. x86-Fassung).
+pub fn frame_gpr_uebernehmen(frame: usize, w: &[u64]) -> usize {
+    let n = FRAME_GPR.min(w.len());
+    // SAFETY: wie `frame_set_reg` -- schreibender Zugriff auf den gesicherten Kontext.
+    let f = unsafe { &mut *(frame as *mut TrapFrame) };
+    f.gpr[..n].copy_from_slice(&w[..n]);
+    n
+}
+
 /// Einen initialen TrapFrame anlegen, sodass der Trap-Restore-Epilog per `eret`
 /// in `entry(arg)` springt. `stack_top` ist der (Kernel-)Stack, auf dem der Frame
 /// liegt; bei einem EL0-Thread (`el0 = true`) läuft der Thread auf dem separaten

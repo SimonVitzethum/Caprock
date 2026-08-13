@@ -81,23 +81,23 @@ pub enum LocalReason {
     /// hieße, die Isolationszusage aus A-5.4 an der Maschinengrenze fallen zu lassen.
     DmaRegion,
     /// Eine Reply-Cap bezeichnet **einen konkreten blockierten Aufrufer**. Er bleibt hier.
-    ///
-    /// **Z26/A3, 2026-08-10: hier landen auch `SyscallHandler`/`FaultHandler`** — und das ist eine
-    /// benannte Ungenauigkeit, keine Gleichsetzung. Der Refusal-Grund ist derselbe (im Sidecar
-    /// stehen die Trap-Frames konkreter blockierter Gäste, und die bleiben hier), die Cap-Art ist
-    /// es nicht. Gewählt wurde dieser Grund, weil er als einziger **nicht** zur falschen Behebung
-    /// führt: `PeerNotInScope`/`ThreadNotInScope`/`PdNotInScope` lesen sich alle als „nimm es in
-    /// den Umfang auf", und genau das hilft hier nichts — ein halber Syscall ist auf der
-    /// Zielmaschine kein halber Syscall, sondern Datenmüll in Registerform (der Frame ist
-    /// architekturspezifisch: x86_64 22 Wörter, aarch64 34).
-    ///
-    /// **Warum kein eigener Grund:** ein neuer `LocalReason` bricht den *erschöpfenden* `match` in
-    /// `ckpt_reason` (`kernel/src/arch/x86_64/bringup.rs`) — genau das ist der Sinn eines
-    /// erschöpfenden `match`, und hier ist es die richtige Wirkung. Die Zeile
-    /// `L::HandlerBinding => 9,` steht als offener Punkt in `todo.md` Z26/A3; solange sie fehlt,
-    /// pinnt `handler_caps_wandern_nicht` das heutige Verhalten fest, damit die Umstellung
-    /// **sichtbar** wird statt still.
     PendingReply,
+    /// Eine **Handler-Bindung** (`SyscallHandler`/`FaultHandler`, Z26/A3): das Sidecar-Fenster
+    /// hinter ihr trägt die halben Trap-Frames konkreter blockierter Gäste — und ein halber
+    /// Syscall ist auf der Zielmaschine kein halber Syscall, sondern **Datenmüll in
+    /// Registerform** (der Frame ist architekturspezifisch: x86_64 22 Wörter, aarch64 34).
+    ///
+    /// **Bis zum 2026-08-13 trug dieser Fall den Grund [`Self::PendingReply`]** — eine benannte
+    /// Ungenauigkeit: der Refusal-*Grund* stimmte, die *Cap-Art* nicht. Sie stand deshalb, weil
+    /// ein neuer `LocalReason` den erschöpfenden `match` in `ckpt_reason`
+    /// (`kernel/src/arch/x86_64/bringup.rs`) bricht — genau das ist der Sinn eines erschöpfenden
+    /// `match`, und er hat gewirkt: die Zeile dort ist jetzt nachgetragen.
+    ///
+    /// Der eigene Name ist keine Kosmetik: die Verweigerung ist **nicht behebbar**, und
+    /// `PendingReply` liest sich als „lass den Aufrufer antworten, dann geht es". Bei einer
+    /// Handler-Bindung hilft das nichts — sie bleibt auch dann verweigert, wenn Endpoint und
+    /// Gäste vollständig im Umfang liegen.
+    HandlerBinding,
     /// Der Partner (Endpoint/Notification) ist **nicht** Teil des Checkpoints — die Cap zeigte
     /// nach dem Transfer ins Leere. Behebbar: den Partner in den Umfang aufnehmen.
     PeerNotInScope,
@@ -225,11 +225,11 @@ pub fn classify(kind: &ObjectKind, scope: &Scope) -> Transfer {
         // erst befragt — anders als bei `PdControl`, wo er geprüft wird, damit der GRUND stimmt;
         // hier wäre auch der geprüfte Grund der falsche.
         //
-        // `PendingReply` ist eine **benannte Ungenauigkeit** (s. dort): der Refusal-GRUND stimmt
-        // („konkrete blockierte Aufrufer bleiben hier"), die Cap-Art nicht. Ein eigener Grund
-        // bräuchte eine Zeile in `ckpt_reason` (bringup.rs) — offener Punkt in todo.md Z26/A3.
+        // Seit 2026-08-13 mit **eigenem** Grund. Vorher stand hier `PendingReply` — der
+        // Refusal-GRUND stimmte, die Cap-Art nicht; und der falsche Name führt zur falschen
+        // Behebung („lass den Aufrufer antworten"), die es hier nicht gibt.
         ObjectKind::SyscallHandler { .. } | ObjectKind::FaultHandler { .. } => {
-            Transfer::Refused(LocalReason::PendingReply)
+            Transfer::Refused(LocalReason::HandlerBinding)
         }
     }
 }
@@ -637,11 +637,10 @@ mod tests {
     /// auf x86_64, 34 auf aarch64, mit verschiedener Bedeutung —, und die andere Hälfte des
     /// Syscalls ist ein Thread, der hier blockiert bleibt.
     ///
-    /// **Der Test pinnt zugleich eine benannte Ungenauigkeit fest:** der Grund ist heute
-    /// `PendingReply` und nicht ein eigener `HandlerBinding`, weil ein neuer `LocalReason` den
-    /// erschöpfenden `match` in `ckpt_reason` (bringup.rs) bricht — s. `todo.md` Z26/A3. Wird die
-    /// Zeile dort nachgetragen, **fällt dieser Test**, und das ist seine Aufgabe: die Umstellung
-    /// soll sichtbar sein statt still.
+    /// **Und der Grund hat seit dem 2026-08-13 einen eigenen Namen** ([`LocalReason::HandlerBinding`]).
+    /// Bis dahin stand hier `PendingReply` — der Test pinnte die Ungenauigkeit fest, damit die
+    /// Umstellung sichtbar wird statt still. Sie ist gekommen, und er ist mitgewandert; die
+    /// zusätzliche Zeile unten hält die beiden Gründe auseinander, denn genau darum ging es.
     #[test]
     fn handler_caps_wandern_nicht() {
         // Voller Umfang: Endpoint 7 IST im Umfang -- eine gewoehnliche Endpoint-Cap darauf waere
@@ -651,10 +650,19 @@ mod tests {
         assert!(classify(&ObjectKind::Endpoint(7), &voll).is_portable());
         let sys = ObjectKind::SyscallHandler { ep: 7, pd: 3, sidecar: 0x20_0000, len: 0x1000 };
         let flt = ObjectKind::FaultHandler { ep: 7, pd: 3, sidecar: 0x20_0000, len: 0x1000 };
-        assert_eq!(classify(&sys, &voll), Transfer::Refused(LocalReason::PendingReply));
-        assert_eq!(classify(&flt, &voll), Transfer::Refused(LocalReason::PendingReply));
+        assert_eq!(classify(&sys, &voll), Transfer::Refused(LocalReason::HandlerBinding));
+        assert_eq!(classify(&flt, &voll), Transfer::Refused(LocalReason::HandlerBinding));
         assert!(!classify(&sys, &voll).is_portable());
         assert!(!classify(&flt, &voll).is_portable());
+        // **Die beiden Gruende sind unterscheidbar** -- das ist der ganze Grund fuer den eigenen
+        // Namen. Eine Reply-Cap ist verweigert, weil ein konkreter Aufrufer hier blockiert;
+        // eine Handler-Cap, weil ihr Fenster halbe Frames traegt. Wer beides zusammenwirft,
+        // schickt den Betreiber in die falsche Behebung.
+        assert_ne!(LocalReason::HandlerBinding, LocalReason::PendingReply);
+        assert_eq!(
+            classify(&ObjectKind::Reply { ep: 7, caller: 1 }, &voll),
+            Transfer::Refused(LocalReason::PendingReply)
+        );
     }
 
     /// **Dieselbe Cap, zwei Antworten** — je nach Umfang. Genau deshalb nimmt `classify` ihn.

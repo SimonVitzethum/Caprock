@@ -1049,6 +1049,34 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   ohne eigene Loeschung blieben sie als verwaiste CDT-Kinder liegen und blockierten sogar das
   `delete` des Eltern-Caps. Wer eine Funktion in „uebergeben" und „ausfuehren" zerlegt, muss jede
   Aufraeumzusage der alten Funktion einzeln neu unterbringen.
+* **Ein Negativtest kann eine Eigenschaft absichern, die NIEMAND BENUTZT.** Die ganze
+  Sidecar-Arithmetik von Z26/A3 (`slot_offset`, `slot_gueltig`, `slots_in`, `fenster_deckt`,
+  `FRAME_MAX_BYTES`) hatte drei Tage lang im **ganzen Baum** keinen Aufrufer ausserhalb ihres
+  eigenen Testmoduls — und zwei Mutationen in `tools/redirect-negativ.sh` (M5: Off-by-one an der
+  Slot-Schranke, M6: Fenster nur am Slot-Anfang geprueft) belegten brav, dass die **Funktionen**
+  richtig sind. Dass sie **gerufen** werden, belegte nichts. Das ist „eine gruene Zeile, die nichts
+  gattert" eine Ebene tiefer, und es faellt schwerer auf: ein Negativtest sieht aus wie der
+  strengste Pruefer im Haus. Dabei lag daneben eine echte Luecke: die Maskenbreite (64 Slots) und
+  die Fensterlaenge in der Cap waren **zwei unabhaengige Zahlen** — eine 4-KiB-Cap haette 64 Slots
+  vergeben und der Kernel bis 32 KiB geschrieben. `grep` nach den Aufrufern ist billiger als jede
+  Mutation.
+* **Lesen und Schreiben sind NICHT dieselbe Autoritaet — auch wenn dieselbe Region beides traegt.**
+  Die Autoritaetstabelle von Z26/A3 fuehrte eine Zeile „Frame lesen **und** schreiben — ja, ganzer
+  Frame". Der ganze Frame enthaelt aber `cs`/`ss` (x86) bzw. `spsr` (aarch64), also den **Ring**:
+  ein Handler, der sie zurueckschreiben duerfte, befoerderte seinen Gast — die Rechteausweitung,
+  gegen die die Weiche steht, nur von der anderen Seite. Gelesen wird deshalb der ganze Frame,
+  zurueckgeschrieben nur die Allzweckregister. Wo eine Tabelle zwei Richtungen in einer Zeile
+  fuehrt, steht dort vermutlich die schwaechere Haelfte einer staerkeren Vergabe.
+* **Zwei Suiten, die denselben SCHLUESSEL verschieden aufsetzen** — dieselbe Rissform wie bei
+  `iommu_platform=on`, nur teurer. `test-qemu-x86-load.sh` prueft seit dem 2026-08-01 die
+  **Uebereinstimmung** von privatem und einkompiliertem oeffentlichem TrustedSAS-Schluessel
+  (`tools/check_trusted_key.py`), mit einer ausfuehrlichen Begruendung im Skript;
+  `test-qemu.sh` (aarch64) prueft bis 2026-08-13 nur die **Existenz** der privaten Datei. Ein
+  `git checkout kernel/src/trusted_keys.rs` — also genau das Aufraeumen, das `AGENTS.md` am
+  Sitzungsende verlangt — laesst die aarch64-Suite danach mit
+  `root : FAILURES (Rejected(Unverified))` plus drei Folgezeilen scheitern. Das sieht wie ein
+  Kernelbefund aus und ist ein Aufbauproblem. **Wer eine Pruefung in einer Suite verschaerft, muss
+  die andere mitnehmen** — sonst faellt der Fall genau dort an, wo niemand ihn erwartet.
 * **Wer nach ERREICHBARKEIT priorisiert statt nach VORGESCHICHTE, hat das Werkzeug am Ende genau
   dort nicht, wo der letzte Fall lag.** Die zehn ungemessenen Mangel-Meldestellen des Ladepfads
   standen ein Jahr mit der Begründung „braucht ein Boot-Archiv, das die Hauptsuite bauartbedingt

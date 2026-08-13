@@ -870,6 +870,20 @@ fn spawn_demo() -> bool {
         }
     }
 
+    // --- Z26/A3: EIN ECHTER UMGELEITETER SYSCALL --------------------------------------------
+    //
+    // Gast, Handler-PD und Binder werden hier aufgesetzt; gemessen wird unten in der Schleife.
+    // Der Aufbau steht **hinter** den PD-Tests, damit er ihre Baseline nicht verschiebt, und
+    // **vor** dem ersten `all_done` -- der Gast braucht Zeit fuer seinen Umlauf.
+    #[cfg(feature = "selftest")]
+    {
+        system::handlermess::redirect_aufbau();
+        // Die Sonde der `handler`-Zeile (der Kernel-Pruefpfad). Sie misst eine ANDERE Aussage als
+        // `redirect` -- dass kein fremder Wecker den Handler-Grund aufhebt -- und braucht deshalb
+        // einen eigenen Thread.
+        system::handlermess::sonde_starten();
+    }
+
     // Isolierter Adressraum vs. SAS: beide lesen dieselbe fremde Adresse.
     let Some(probe) = system::alloc(4096, 4096) else {
         return false;
@@ -3650,6 +3664,11 @@ fn ckpt_reason(r: caprock_cap::checkpoint::LocalReason) -> u32 {
         L::ThreadNotInScope => 6,
         L::PdNotInScope => 7,
         L::LoaderSource => 8,
+        // Z26/A3, 2026-08-13: eigener Code fuer die Handler-Bindung. Bis dahin trug sie den Code
+        // von `PendingReply` -- der Refusal-Grund stimmte, die Cap-Art nicht, und ein falscher
+        // Name fuehrt zur falschen Behebung. Dass die Umstellung hier eine Zeile KOSTET, ist die
+        // Wirkung des erschoepfenden `match` und nicht sein Preis.
+        L::HandlerBinding => 9,
     }
 }
 
@@ -4214,6 +4233,19 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             // Bedienten wegen `LOAD` warten. Ohne Messung ist das Urteil `false` -- eine nie
             // gefahrene Absage darf nicht wie eine bestandene aussehen.
             ("verif", crate::verifizierer::urteil()),
+            // **Z26/A3, die Nutzlast.** Gattert von Anfang an, und das Kriterium ist gegen die
+            // WIRKUNG formuliert: der Gast bekommt einen Wert zurueck, den nur jemand liefern
+            // kann, der seinen Frame im Sidecar GELESEN hat (Antwort = Argument + 1), und ein
+            // Koeder in der Antwortnachricht belegt, dass der Wert NICHT ueber den IPC-Transport
+            // kam. Dazu die Fail-closed-Haelfte an derselben Zeile.
+            //
+            // **Ohne Messung ist das Urteil `false`** -- ein nie gefahrener Umlauf darf nicht wie
+            // ein bestandener aussehen (dieselbe Regel wie bei `verif`).
+            ("redirect", system::handlermess::redirect_urteil()),
+            // Z26/A3, der Kernel-Pruefpfad: kein fremder Wecker hebt den Handler-Grund auf. Eine
+            // ANDERE Aussage als `redirect` -- sie laesst sich nur ohne echten Gast messen, weil
+            // sie von der Abwesenheit einer Wirkung handelt.
+            ("handler", system::handlermess::urteil()),
     ];
     if let Some(w) = warum {
         *w = flags;
@@ -4223,7 +4255,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 38;
+const DONE_FLAGS: usize = 40;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]
@@ -6311,6 +6343,10 @@ pub fn run(multiboot_info: u64) -> ! {
             park_messen(); // laeuft genau einmal; das Urteil steht danach in `all_done()`
             let _ = quiesce_messen(); // Z23 S1, ebenso einmalig
             let _ = pd_threads_messen(); // Z22 P2 + die Z23-S1-REPLY-Messung, ebenso einmalig
+            // Z26/A3, beide einmalig: `handler` misst den Kernel-Pruefpfad (kein fremder Wecker
+            // hebt den Handler-Grund auf), `redirect` den ECHTEN Umlauf ueber einen Gast.
+            system::handlermess::messen_einmal();
+            system::handlermess::redirect_messen();
             // C7. **Nicht in `all_done`**, obwohl beide dort gattern: `used_vspaces()` sperrt eine
             // Tabelle mit 4096 Eintraegen, und die Mangel-Sprechprobe fragt den Allokator. Beides
             // je Umdrehung waere ein Pruefer, der die Sache aushungert, die er beobachtet.

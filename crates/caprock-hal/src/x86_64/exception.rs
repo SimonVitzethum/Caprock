@@ -511,6 +511,71 @@ pub fn frame_from_el0(frame: usize) -> bool {
     unsafe { (*(frame as *const TrapFrame)).cs & 3 == 3 }
 }
 
+// --- Frame-SERIALISIERUNG (Z26/A3, die Nutzlast) ----------------------------------------------
+//
+// Der Sidecar überträgt den Frame als Folge von `u64`. Die Reihenfolge ist **hier** festgelegt
+// und nicht aus `#[repr(C)]` abgeleitet: eine Struktur, die man als Wortfeld liest, ändert ihre
+// Bedeutung, sobald jemand ein Feld einschiebt — und das fiele nirgends auf, weil beide Seiten
+// dieselbe Struktur benutzen. Feldweise geschrieben bricht ein neues Feld den Bau (die Zahl
+// `FRAME_WOERTER` stimmt nicht mehr), statt still eine andere Bedeutung zu bekommen.
+
+/// Wörter eines serialisierten x86_64-Frames: `gpr[0..15]`, `vector`, `error`, `rip`, `cs`,
+/// `rflags`, `rsp`, `ss`.
+pub const FRAME_WOERTER: usize = 22;
+
+/// Davon **übernehmbar** (die Allzweckregister). Alles dahinter trägt Ring bzw. Flags und wird
+/// aus dem Sidecar **nie** zurückgeschrieben — s. `caprock_sched::redirect::uebernehmbar`.
+pub const FRAME_GPR: usize = 15;
+
+/// Architekturkennung im Sidecar-Kopf (`caprock_sched::redirect::ARCH_X86_64`).
+pub const FRAME_ARCH: u64 = 0;
+
+/// Frame-Wort-Index der ABI-Register `x0..x6`. Der Handler findet damit „das Ergebnisregister",
+/// ohne die x86-Registerlage nachzubilden.
+pub const FRAME_ABI_WORT: [u64; 7] = [
+    ABI_TO_GPR[0] as u64,
+    ABI_TO_GPR[1] as u64,
+    ABI_TO_GPR[2] as u64,
+    ABI_TO_GPR[3] as u64,
+    ABI_TO_GPR[4] as u64,
+    ABI_TO_GPR[5] as u64,
+    ABI_TO_GPR[6] as u64,
+];
+
+/// Den gesicherten Frame als Wortfolge ablegen. Gibt die Zahl der geschriebenen Wörter zurück,
+/// `0`, wenn `out` zu klein ist (**kein** Teilergebnis: ein halber Frame im Sidecar sähe für den
+/// Handler wie ein ganzer aus).
+pub fn frame_woerter(frame: usize, out: &mut [u64]) -> usize {
+    if out.len() < FRAME_WOERTER {
+        return 0;
+    }
+    // SAFETY: wie `frame_reg` -- gültiger, vom Trap-Pfad angelegter TrapFrame-Zeiger.
+    let f = unsafe { &*(frame as *const TrapFrame) };
+    out[..FRAME_GPR].copy_from_slice(&f.gpr);
+    out[15] = f.vector;
+    out[16] = f.error;
+    out[17] = f.rip;
+    out[18] = f.cs;
+    out[19] = f.rflags;
+    out[20] = f.rsp;
+    out[21] = f.ss;
+    FRAME_WOERTER
+}
+
+/// **Nur die Allzweckregister** aus einer Wortfolge in den Frame übernehmen. Gibt die Zahl der
+/// übernommenen Wörter zurück.
+///
+/// `cs`/`ss`/`rflags`/`rip`/`rsp` bleiben unberührt, und das ist die ganze Funktion: die Quelle
+/// ist Speicher einer **Persönlichkeits-PD**, also nicht des Kernels. Ein Handler, der `cs`
+/// schreiben dürfte, setzte seinen Gast nach Ring 0 — aus einer Umleitung würde eine Befreiung.
+pub fn frame_gpr_uebernehmen(frame: usize, w: &[u64]) -> usize {
+    let n = FRAME_GPR.min(w.len());
+    // SAFETY: wie `frame_set_reg` -- schreibender Zugriff auf den gesicherten Kontext.
+    let f = unsafe { &mut *(frame as *mut TrapFrame) };
+    f.gpr[..n].copy_from_slice(&w[..n]);
+    n
+}
+
 /// Initialen Kontext eines neuen Threads am Stack-Top anlegen; gibt den zu sichernden
 /// Stackzeiger (= Frame-Adresse) zurück.
 ///

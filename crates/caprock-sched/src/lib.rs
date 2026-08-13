@@ -2028,7 +2028,29 @@ pub trait SchedOps {
     /// danach nicht mehr `current`. Der zweite Grund muss also an einen **benannten** Thread,
     /// nicht an „den laufenden".
     fn mark_handler_wait(&mut self, tid: ThreadId);
+    /// **Den Trap-Frame des Gastes in seinen Sidecar-Slot legen** (Z26/A3, die Nutzlast).
+    ///
+    /// `false` = nicht abgelegt; dann ist der Slot **unverändert**, und der Aufrufer muss den
+    /// Gast fail-closed behandeln statt ihn mit einer leeren Nachricht loszuschicken.
+    ///
+    /// **Warum das durch den Trait geht und nicht in `caprock-microkit` steht:** das Fenster ist
+    /// eine **Phys**adresse, und nur der Kernel hat die Sicht darauf (Identitätskarte). Der
+    /// Dispatch kennt Caps, Endpoints und Threads — keine Speicherkarte. Dieselbe Trennung wie
+    /// bei [`Self::map_frame`].
+    fn sidecar_ablegen(
+        &mut self,
+        frame: usize,
+        sidecar: u64,
+        slot: u16,
+        anlass: u64,
+        code: u64,
+    ) -> bool;
     /// **Der einzige Wecker des Handler-Grundes.** Entfernt `HANDLER` und nur das.
+    ///
+    /// **Und er schreibt das Ergebnis zurück** (seit 2026-08-13): unmittelbar davor holt der
+    /// Kernel die Allzweckregister aus dem Sidecar-Slot des Gastes in dessen gesicherten Frame.
+    /// Die Reihenfolge ist die Zusicherung — wer den Grund zuerst fallen liesse, gäbe den Gast
+    /// frei, bevor sein Frame steht. Genau die halbe Ausführung, die Z26/Nachtrag 3 vorhersagt.
     fn handler_reply(&mut self, tid: ThreadId);
     /// Eine **Pause** aufheben (`SYS_PDCTL` RESUME/START).
     ///

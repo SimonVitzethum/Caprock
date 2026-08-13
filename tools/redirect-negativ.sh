@@ -186,6 +186,58 @@ mutation zweiter_handler zweiter_handler_fuer_dieselbe_pd_wird_abgewiesen \
   's = s.replace("    if let Some(vorhanden) = kante(gast_pd) {\n        if vorhanden != handler_pd {\n            return BindUrteil::FremderHandler;\n        }\n    }", "", 1)' \
   "eine zweite, fremde Handler-Bindung wird durchgelassen"
 
+# ================================================================================================
+# DIE NUTZLAST (2026-08-13): das SLOT-FORMAT
+# ================================================================================================
+#
+# Bis heute trug `redirect.rs` nur die Weiche, das Zyklusverbot und die Slot-Arithmetik. Mit der
+# Nutzlast kommt die **Vertragsflaeche** dazu: ein versionierter Kopf, eine Architekturkennung,
+# reservierte Felder und -- die schaerfste Aussage -- welche Frame-Woerter aus dem Sidecar
+# ZURUECK duerfen. Sie sind hier, weil eine Mutation billiger ist als ein QEMU-Lauf und weil sie
+# alle mit Literalen ausloesbar sind.
+
+# --- M8: der Rueckschreibe-Filter um EINS zu weit -----------------------------------------------
+#
+# **Die schaerfste Mutation der Reihe.** Die Quelle ist Speicher einer Persoenlichkeits-PD; was
+# von dort zurueckdarf, entscheidet, ob eine Umleitung eine Umleitung bleibt oder eine
+# BEFOERDERUNG wird. Ein Wort zu weit ist auf x86 noch `vector` (harmlos aussehend) -- drei weiter
+# waere `cs`, und dann setzt ein Handler seinen Gast nach Ring 0. Die Mutation nimmt bewusst den
+# harmlos aussehenden Schritt: eine Schranke, die um eins verrutscht, faellt beim Gegenlesen nicht
+# auf.
+mutation filter_zu_weit nur_die_allzweckregister_kommen_zurueck \
+  's = s.replace("pub const fn uebernehmbar(i: usize, n_gpr: usize) -> bool {\n    i < n_gpr\n}", "pub const fn uebernehmbar(i: usize, n_gpr: usize) -> bool {\n    i < n_gpr + 1\n}", 1)' \
+  "der Rueckschreibe-Filter laesst ein Wort hinter den GPR zu"
+
+# --- M9: die Versionspruefung weg ---------------------------------------------------------------
+#
+# Das Sidecar ist die Vertragsflaeche zwischen Kernel und Persoenlichkeit, und die beiden sind per
+# Entwurf nicht dieselbe Fassung. Ohne Versionspruefung liest der Kernel die Woerter einer fremden
+# Fassung als seine eigenen GPR -- und schreibt sie als REGISTERINHALT in einen laufenden Thread.
+# Dieselbe Regel wie bei der Zustandsuebergabe (A-4.3): abweisen, nicht auslegen.
+#
+# **Warum hier ZWEI Tests fallen und das keine fehlende Isolation ist:** die beiden sind dieselbe
+# Aussage in zwei Koernungen -- „eine fremde Version wird benannt abgewiesen" und „die Version
+# wird VOR allem anderen geprueft". Ohne die Pruefung gibt es weder das eine noch das andere.
+# Dieselbe Form wie bei M1.
+mutation keine_version fremde_version_wird_benannt_abgewiesen \
+  's = s.replace("    if slot[KOPF_VERSION] != FORMAT_VERSION {\n        return KopfUrteil::FremdeVersion(slot[KOPF_VERSION]);\n    }", "", 1)' \
+  "unbekannte Formatversion wird ausgelegt statt abgewiesen" 2
+
+# --- M10: die Gruppenkennung wird ignoriert -----------------------------------------------------
+#
+# Das Feld ist reserviert und der Mechanismus nicht gebaut. **Nullen heissen „keine Angabe", nicht
+# „passt auf alles"** -- dieselbe Regel wie bei den reservierten Manifest-Bytes. Ein Slot, der eine
+# Gruppe verlangt, verlangt etwas, das niemand einloest; ihn durchzulassen hiesse, ungeprueft
+# Werte anzusammeln, und der Tag der Einloesung waere der Tag, an dem sie alle falsch sind (Z11c).
+mutation gruppe_ignoriert eine_gruppe_wird_abgewiesen_und_nicht_ignoriert \
+  's = s.replace("    if slot[KOPF_GRUPPE] != 0 {\n        return KopfUrteil::Reserviert;\n    }", "", 1)' \
+  "eine gesetzte Gruppenkennung wird still ignoriert"
+
+# --- M11: die reservierten Woerter werden nicht geprueft ----------------------------------------
+mutation reserviert_ungeprueft reservierte_woerter_muessen_null_sein \
+  's = s.replace("    while i < KOPF_RESERVIERT_N {", "    while i < 0 {", 1)' \
+  "reservierte Kopfwoerter werden nicht auf null geprueft"
+
 # ------------------------------------------------------------------------------------------------
 # Q1: DER QUELLTEXT-WAECHTER -- „nur EIN Wecker fuer den Handler-Grund"
 # ------------------------------------------------------------------------------------------------

@@ -26,6 +26,13 @@ pub enum CapError {
     /// DMA-Puffer muss auf dem Cache-Writeback-Granule liegen, sonst zerstört die
     /// Cache-Wartung fremde Daten in einer angebrochenen Zeile).
     Unaligned,
+    /// Die **Region ist zu klein für die Zusicherung, die die Cap trägt** (Z26/A3): ein
+    /// Sidecar-Fenster muss **alle** Slots decken, die die Belegungsmaske vergeben kann.
+    ///
+    /// Eigener Name und nicht [`Self::Unaligned`], weil es eine andere Diagnose ist: „falsch
+    /// ausgerichtet" heisst „verschiebe sie", „zu klein" heisst „nimm mehr Speicher". Eine
+    /// Absage, die zwei Ursachen unter einem Namen führt, macht die Behebung zum Raten.
+    ZuKlein,
 }
 
 /// Ableitungs-Metadaten eines Slots (MDB-Knoten / CDT-Verkettung).
@@ -392,6 +399,59 @@ impl CapSpace {
     /// RAM-Allokator-Eintrag (Geräte-Bereich) -> keine Finalisierung. Nur kernelseitig.
     pub fn install_mmio(&mut self, phys: u64, len: u64, rights: Rights) -> Result<CapPtr, CapError> {
         self.install(ObjectKind::Mmio { phys, len }, rights)
+    }
+
+    /// Eine **Syscall-Handler-Capability** (Z26/A3) einbringen: die Autorität, die Syscalls der
+    /// an sie gebundenen Threads zu **beantworten**.
+    ///
+    /// `sidecar`/`len` beschreiben das geteilte Fenster, in dem die Trap-Frames der Gäste liegen.
+    /// Die Cap hält **keinen** Allokator-Eintrag: das Fenster wird über eine getrennte
+    /// `Memory`-Cap vergeben, und das ist der Punkt der Sidecar-Form — die Autorität über den
+    /// Registerzustand fremder Threads ist eine **Region in der Speicherbuchhaltung** und nicht
+    /// eine Fähigkeit, die nur im Cap-Audit auftaucht.
+    ///
+    /// Nur kernelseitig: kein User-Syscall erzeugt beliebige Handler-Caps.
+    pub fn install_syscall_handler(
+        &mut self,
+        ep: u32,
+        pd: u16,
+        sidecar: u64,
+        len: u64,
+        rights: Rights,
+    ) -> Result<CapPtr, CapError> {
+        self.install(
+            ObjectKind::SyscallHandler {
+                ep,
+                pd,
+                sidecar,
+                len,
+            },
+            rights,
+        )
+    }
+
+    /// Eine **Fault-Handler-Capability** (Z26/A3) einbringen: die Autorität, die Seitenfehler der
+    /// an sie gebundenen Threads zu **sehen**.
+    ///
+    /// Getrennt von [`Self::install_syscall_handler`], weil es eine andere Autorität ist — s.
+    /// [`ObjectKind::FaultHandler`].
+    pub fn install_fault_handler(
+        &mut self,
+        ep: u32,
+        pd: u16,
+        sidecar: u64,
+        len: u64,
+        rights: Rights,
+    ) -> Result<CapPtr, CapError> {
+        self.install(
+            ObjectKind::FaultHandler {
+                ep,
+                pd,
+                sidecar,
+                len,
+            },
+            rights,
+        )
     }
 
     /// Eine **IRQ-Capability** (ext-22, HardwareLand) einbringen: die Autorität, den Geräte-

@@ -279,4 +279,17 @@ pub mod result {
     /// verschärft sie. Nicht zu verwechseln mit [`ERR_SERVER_GONE`] — das sagt der Kernel, wenn es
     /// den Verifizierer gar nicht gibt, und das ist keine Frage der Last, sondern des Aufbaus.
     pub const ERR_LOAD_BUSY: u64 = 13;
+    /// **Das Sidecar trägt ein Format, das dieser Kernel nicht lesen darf** (Z26/A3).
+    ///
+    /// Der Slot hat einen **versionierten Kopf** (Magie, Formatversion, Architektur, Wortzahlen,
+    /// reservierte Felder). Passt er nicht, wird **nichts** in den Frame des Gastes übernommen und
+    /// er bekommt diesen Code — statt dass der Kernel fremde Bytes im eigenen Sinn ausliest und
+    /// als **Registerinhalt** in einen laufenden Thread schreibt.
+    ///
+    /// Das ist wörtlich die Regel aus A-4.3 (Zustandsübergabe): was drüben nicht dasselbe
+    /// bezeichnen kann, wird abgewiesen, nicht ausgelegt. Und es ist ein **anderer** Fall als
+    /// [`ERR_HANDLER_GONE`]: dort ist niemand da, hier ist jemand da und redet eine andere
+    /// Fassung. Ein gemeinsamer Code zwänge den Betreiber zu raten, ob er auf jemanden wartet
+    /// oder Fassungen abgleichen muss.
+    pub const ERR_HANDLER_ABI: u64 = 14;
 }

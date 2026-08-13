@@ -107,6 +107,125 @@ Suiten fahren jetzt denselben Prüfer.
 
 ---
 
+## Z28 (erster Schritt). Der EINGESCHLOSSENHEITS-WÄCHTER (2026-08-13)
+
+**Klasse:** Werkzeug / Architektur · **Stand:** gebaut, in `tools/abnahme.sh`, 0,49 s gemessen —
+gegen **1181 s** für die volle Reihe (14 Punkte, `== ABNAHME: ALL PASS ==`, 2026-08-13).
+
+Z28 entscheidet: die Eintrittskarte für ein Syscall-Handler-Modul ist nicht „bewiesen richtig",
+sondern **„kann nicht ausbrechen"**. `tools/eingeschlossenheit.py` hält das mechanisch fest —
+**bevor** es Handler-Module gibt, weil jedes vorher entstandene nachträglich eingesammelt werden
+müsste, und „nachträglich einsammeln" heißt in diesem Projekt regelmäßig „gar nicht".
+
+### Der Mechanismus, und warum ausgerechnet dieser
+
+Die Zusage steht **im Manifest der Crate**:
+
+```toml
+[package.metadata.caprock]
+einschluss = "streng"
+```
+
+Drei Formen standen zur Wahl. Eine **Liste im Wächter** wäre eine Textfläche — der
+Identitäts-Wächter hatte genau das einen Tag lang, und `vspace_map_dma` fehlte darin. Ein
+**Verzeichnis** entschiede nach dem Ort; Handler-Module liegen aber an mindestens zwei Orten
+(Bibliotheken unter `crates/`, Persönlichkeits-PDs unter `programs/`, und `programs/` ist ein
+eigener Workspace). Das **Manifest** wandert mit: Verschieben oder Umbenennen kann die Zusage nicht
+vom Code trennen, und `cargo metadata` gibt sie wörtlich heraus — dieselbe Zusage ist damit auch
+für das Zertifikatswerkzeug und für eine spätere Registertabelle lesbar.
+
+Die Wertemenge ist **geschlossen** (`{"streng"}`). Ein zweiter, weicherer Wert wäre die
+Auffanggruppe, die Z28 ausdrücklich verbietet.
+
+**Kein `rolle`-Feld** — und das ist eine Entscheidung, keine Auslassung. Es wäre die naheliegende
+Erweiterung (`grenzparser`, `syscall-handler`) und hätte heute keine Wirkung; ein Feld, das nie
+eingelöst wird, sammelt ungeprüfte Werte an, und der Tag der Einlösung ist der Tag, an dem sie alle
+falsch sind. Genau das ist mit den Manifest-Prioritäten (3/1/2/2/2) passiert.
+
+### Was er prüft — und die Ratschen
+
+Fünf Bedingungen je Modul: `#![forbid(unsafe_code)]` im **Wurzelmodul** (nicht `deny`, nicht in
+einem Kommentar), 0 `unsafe` im Quelltext, **kein Bauskript**, kein `[lints]`, das `unsafe_code`
+aufweicht, und nur Abhängigkeiten, die **selbst eingeschlossen** oder namentlich zugelassen sind —
+und zwar **als Pfad-Abhängigkeit**: `caprock-part = "1.0"` aus einer Registry trägt denselben Namen
+und wäre über den Namen allein nicht zu unterscheiden (Namensverwechslung in der Lieferkette).
+Dazu eine sechste, die keine Eigenschaft des Codes ist: die Crate muss **in einem Workspace stehen**
+— eine Crate, die nie übersetzt wird, hat kein `forbid`, sie hat eine Behauptung.
+
+Zwei Ratschen, beide als **Menge von Namen** und beide gegen die Wirklichkeit gehalten (ein Name
+ohne Anker ist ein Befund — sonst bleibt ein totes Zugeständnis stehen, gegen das sich später
+lautlos etwas anderes eintauschen lässt):
+
+| Ratsche | heute | Grund |
+|---|---|---|
+| `ERLAUBTE_ABHAENGIGKEITEN` | `{libcaprock}` | die auditierte Syscall-ABI; ein Syscall ist eine Instruktion, kein Funktionsaufruf |
+| `AUSDRUECKLICH_NICHT` | `{caprock-cap}` | trägt `forbid` **und** linkt `caprock-slab` (15 `unsafe`) |
+
+Stand: **9 deklarierte Module** (`caprock-part`, `caprock-fat`, `caprock-dma`, `caprock-wait`,
+`caprock-loader`, `fs`, `init`, `svc-demo`, `aggressor-t`), 34 Crates im Baum, 58 Prüfungen,
+**15 Sprechproben** in beide Richtungen an einer Kopie, **0,49 s**.
+
+### Die Umkehrung — gegen die Opt-in-Lücke
+
+Eine Zusage, die man weglassen kann, lässt sich weglassen. Dagegen steht:
+
+> Wer `#![forbid(unsafe_code)]` schreibt, macht eine Aussage. Sie ist entweder eine Eintrittskarte
+> — dann ist sie deklariert und wird **transitiv** geprüft — oder sie ist ausdrücklich **keine**;
+> dann steht sie mit Grund in `AUSDRUECKLICH_NICHT`. Ein Drittes gibt es nicht.
+
+Das ist Z28s „keine Auffanggruppe, sondern eine benannte Absage", eine Ebene tiefer. Es schließt
+die Lücke nicht ganz — eine nagelneue Crate mit `unsafe` und ohne Marke fällt durch beide Raster —,
+aber es macht den lautlosen Fall unmöglich. Der Rest hängt an einer Registertabelle, die es noch
+nicht gibt; sie steht als offener Punkt in [todo.md](todo.md) Z28.
+
+### **0 Kandidaten ist Rückgabecode 3, nicht Erfolg**
+
+Der Wächter hätte zum Zeitpunkt seiner Entstehung über **null** Crates urteilen können — genau die
+Form, in der ein Prüfer Entwarnung über nichts gibt. Er bricht deshalb mit eigenem Code ab, und
+der Selbsttest misst dafür den **Rückgabecode**, nicht die interne Kandidatenzahl: `abnahme.sh`
+liest `$?` und nichts sonst.
+
+### Fünf Befunde, die nicht im Auftrag standen
+
+1. **Diese Regel gibt es schon — an einer Stelle, an der sie fast nie läuft.** ADR 0014
+   (TrustedSAS-Zertifikate) enthält denselben Unsafe-Audit, samt Allowlist `{libcaprock}`, in
+   `tools/sign_trusted.py`; der Kernel erzwingt `unsafe_status == UNSAFE_ALL_PASS` beim Laden. Er
+   läuft aber **nur beim Signieren, nur für TrustedSAS-Programme und nur, wenn jemand das Werkzeug
+   aufruft**. Zwei Definitionen derselben Regel sind ein Riss (dieselbe Klasse wie die zwei Suiten,
+   die dasselbe Gerät verschieden aufsetzten). Der Wächter hält die beiden Allowlists deshalb
+   **gegeneinander** — mit Ankertest: fehlt die Zeile `ALLOWLIST = {...}` dort, ist **das** der
+   Befund, nicht Schweigen.
+2. **`has_forbid` in `sign_trusted.py` nimmt das Attribut aus einem KOMMENTAR an.** Es sucht mit
+   einem freien `re.search` über den rohen Dateiinhalt; die bloße Erwähnung
+   `` `#![forbid(unsafe_code)]` `` in einem Doku-Kommentar erfüllt die Bedingung. In
+   `crates/caprock-loader/src/lib.rs` Zeile 3 steht genau so eine Erwähnung — dort zufällig
+   *zusätzlich* zum echten Attribut, also heute ohne Wirkung. Die Regel ist trotzdem kaputt: ein
+   signiertes `UNSAFE_PROGRAM_FORBID` lässt sich mit Prosa verdienen. Der neue Wächter verankert
+   zeilenanfangs und entfernt vorher Kommentare.
+3. **`unsafe{` ohne Leerzeichen rutscht durch den Zähler.** `RX_UNSAFE = \bunsafe\s+(fn|impl|…|\{)`
+   verlangt Zwischenraum; `unsafe{ … }` ist gültiges Rust. Gemessen: **0 Vorkommen im ganzen Baum**
+   — das Loch ist heute unbenutzt, nicht abwesend. Der neue Wächter benutzt `\bunsafe\b\s*`, und
+   genau diese Schreibweise ist eine seiner Sprechproben.
+4. **Die einzige Crate der Allowlist hat ein Bauskript.** `programs/libcaprock/build.rs` läuft zur
+   Bauzeit auf dem Wirt mit voller Autorität — `forbid(unsafe_code)` berührt es nicht, und der
+   ADR-0014-Audit sieht nur `src/`. Es ist heute harmlos (es prüft `RUSTFLAGS` auf doppelte
+   Linkerskripte), aber es sitzt in der Vertrauenskette **jedes** TrustedSAS-Programms. Deshalb ist
+   „kein Bauskript" eine eigene Bedingung des Wächters, und deshalb ist der Allowlist-Eintrag als
+   **Schuld** beschrieben und nicht als Entwurf.
+5. **`forbid(unsafe_code)` ist eine Eigenschaft EINER Crate, Eingeschlossenheit eine des
+   transitiven Schlusses.** `caprock-cap` ist der lebende Beleg und steht deshalb als erster
+   Eintrag der Absage. Ohne die Transitivitätsprüfung wäre die Marke ein Aufkleber.
+
+### Ein eigener Fehler, gefangen vom Nachbarfall
+
+Die erste Fassung des Selbsttests schrieb `open(p, "w").write(RX.sub(…, open(p).read()))`. Python
+wertet das Objekt vor dem Argument aus: das `open(p, "w")` **trunkiert** die Datei, gelesen wurde
+eine leere. Fall 1 („`forbid` entfernt → muss durchfallen") meldete trotzdem grün — eine leere
+Datei trägt nämlich auch kein `forbid`. Ein Selbsttest, der aus dem falschen Grund besteht, ist
+genau die Form, gegen die er geschrieben ist. Gefunden hat es **nicht** das Gegenlesen, sondern der
+Nachbarfall (`deny` statt `forbid`), der dann den falschen Code meldete — dieselbe Lehre wie bei
+der `park`-Zeile: eine Sprechprobe muss den Fall **unterscheiden**, nicht nur rot werden.
+
 ## C8. Der VERIFIZIERERTHREAD — die Krypto ist vom Aufrufer-Stack herunter (2026-08-11)
 
 **Klasse:** Kapazität / Sicherheit · **Stand:** (a) und (b) **gebaut und gemessen**; (c) bleibt

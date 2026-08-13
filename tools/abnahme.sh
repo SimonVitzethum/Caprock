@@ -81,6 +81,15 @@ PUNKTE+=("aarch64-bau|./build.sh")
 # steht die Pruefzeile selbst auf ALL PASS).
 PUNKTE+=("aarch64-suite|./test-qemu.sh")
 PUNKTE+=("kernel-grenze|./tools/kernel-grenze.sh")
+# **Eingeschlossenheit (Z28) -- 0,49 s gemessen, und die Zahl gehoert in die Zeile.** Ohne
+# Kostenangabe ist „fahr halt den Waechter" ein Ratschlag, den niemand einhaelt; dieser hier kostet
+# rund ein Zweitausendstel der Reihe (0,49 s gegen 1181 s fuer die volle Reihe am 2026-08-13; in
+# der Bilanz oben erscheint er als 1 s, das ist die Rundung samt `sammellauf`). Er haelt fest, dass jedes als
+# eingeschlossen deklarierte Modul `forbid(unsafe_code)` traegt, kein Bauskript hat und nur von
+# benannten Crates abhaengt -- die Eintrittskarte fuer ein Syscall-Handler-Modul. Er faellt
+# ausserdem mit **eigenem Code 3** durch, wenn er GAR KEINE Kandidaten findet: ein Waechter ueber
+# null Crates gibt Entwarnung ueber nichts.
+PUNKTE+=("einschluss|./tools/eingeschlossenheit.py")
 PUNKTE+=("host-tests|./tools/host-tests.sh")
 PUNKTE+=("mangel-stellen|./tools/mangel-stellen.sh")
 if [ "$SCHNELL" = 1 ]; then

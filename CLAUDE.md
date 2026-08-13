@@ -1104,6 +1104,7 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
 | `kernel/src/colors.rs` | Farbzuteilung, `run_color`, Prime+Probe (B-4.5) — arch-neutral |
 | `crates/caprock-sched/src/cycles.rs` | Zyklenabrechnung (B-5.1) — **ohne jede Abhaengigkeit**, damit die Fallen mit Literalen statt mit einer Maschine ausloesbar sind |
 | `tools/kernel-grenze.sh` | prueft, dass keine Treiber in die HAL wandern; mit Selbsttest |
+| `tools/eingeschlossenheit.py` | **die Eintrittskarte fuer ein Handler-Modul (Z28)**: wer `[package.metadata.caprock] einschluss = "streng"` traegt, hat `forbid(unsafe_code)`, kein Bauskript und nur benannte Abhaengigkeiten. Zwei Ratschen als Mengen von Namen, 15 Sprechproben, **0 Kandidaten = Rueckgabecode 3** |
 | `tools/host-tests.sh` | die Host-Tests der reinen Crates an **einem** Ort (`caprock-cap` lief vorher nirgends) |
 | `tools/handover/` | Linux-Kernelmodul fuer die Kern-Uebergabe (Variante B) |
 

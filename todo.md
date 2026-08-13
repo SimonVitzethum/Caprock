@@ -337,12 +337,20 @@ Die Eigenschaft zerfällt in vier, drei davon fast gratis:
       Fail-closed-Regel mit einer Uhr — und sie deckt zusätzlich den Fall ab, den kein Beweis
       abdeckt: ein Handler, der auf etwas *anderes* wartet.
 
-- [ ] **Der Wächter ist der ERSTE Schritt, nicht das erste Modul.** Jedes registrierte
-      Handler-Modul muss `forbid(unsafe_code)` tragen und darf nur aus einer benannten Liste
-      abhängen — mechanisch prüfbar, mit Sprechprobe in **beide** Richtungen und als **Ratsche,
-      die nur fallen darf** (wie `IDENTITY_DEBTS`). Vorbild: `tools/kernel-grenze.sh`, das gerade
-      erst zwei neue Module namentlich gefangen hat. Kostet einen Nachmittag und gilt ab dann für
-      alles, was folgt.
+> **Der Wächter STEHT** (`tools/eingeschlossenheit.py`, 2026-08-13, in `tools/abnahme.sh`, 0,49 s):
+> ein Modul mit `[package.metadata.caprock] einschluss = "streng"` trägt `forbid(unsafe_code)`,
+> hat kein Bauskript und hängt nur von benannten Crates ab; 9 Module deklariert, 15 Sprechproben
+> in beide Richtungen, 0 Kandidaten = Rückgabecode 3. Details und die fünf Befunde, die er dabei
+> aufgedeckt hat, in [done.md](done.md) — drei davon im **signierten** Unsafe-Audit von ADR 0014
+> und deshalb als eigener offener Punkt weiter unten. **Diese Zeile steht hier, weil die folgenden
+> Punkte an ihm hängen** — nicht als Erfolgsregister.
+
+- [ ] **Was der Wächter NICHT weiß: welche Module das Primitiv registriert.** Er prüft, was sich
+      *deklariert*; eine Registertabelle gibt es nicht, also ist die Frage „ist jedes registrierte
+      Modul auch deklariert?" heute strukturell unbeantwortbar. Sobald die Tabelle aus der
+      Nutzlast von [Z26/A3](#a3--das-kernel-primitiv-ist-gebaut-2026-08-10-was-steht-was-offen-ist-und-die-schwelle)
+      existiert, gehört sie als **zweite Quelle** in den Wächter — sonst ist die Zugehörigkeit
+      genau so lange freiwillig, wie es niemandem auffällt.
 
 - [ ] **Die Marshalling-Naht braucht echte Aufmerksamkeit — sie ist die eine Tür.** Dort treffen
       gastkontrollierte Bytes auf Handlercode. `forbid(unsafe_code)` **und** Prüfung des
@@ -383,6 +391,50 @@ Die Schwelle steht seit dem 2026-08-10 fest: **umgeleiteter `getpid` ≤ 2000 Zy
       **gegen** Handler in `TrustedSas`; die Differenz *ist* der Preis der Isolation. Dazu der
       nackte IPC-Umlauf als Sockel. Nicht unter paralleler Last: dieser Messstand hat das Projekt
       schon einmal mit 3,2-facher Überbuchung in die Irre geführt (D13).
+
+## Der Unsafe-Audit von ADR 0014 hat drei Löcher — gefunden beim Bau des Z28-Wächters (2026-08-13)
+
+**Klasse:** Prüferform / Vertrauenskette · **Stand:** offen. Keins der drei ist heute **wirksam**;
+alle drei sind gemessen, nicht vermutet.
+
+Das Zertifikat einer TrustedSAS-PD trägt `unsafe_status`, der Kernel erzwingt beim Laden
+`== UNSAFE_ALL_PASS` (ADR 0014 §6, `crates/caprock-loader/src/cert.rs`). Die Bits berechnet
+`tools/sign_trusted.py`. Die Aussage ist also **signiert** — und damit ist ein Loch in ihrer
+Berechnung schlimmer als eins in einem gewöhnlichen Prüfer: es wird kryptographisch beglaubigt.
+
+- [ ] **`has_forbid` nimmt das Attribut aus einem KOMMENTAR an.** Freies `re.search` über den
+      rohen Dateiinhalt; die bloße Erwähnung `` `#![forbid(unsafe_code)]` `` in einem
+      Doku-Kommentar genügt. In `crates/caprock-loader/src/lib.rs` Zeile 3 steht eine solche
+      Erwähnung (dort zusätzlich zum echten Attribut, also ohne Wirkung). `UNSAFE_PROGRAM_FORBID`
+      lässt sich damit **mit Prosa verdienen**. Abhilfe steht daneben:
+      `tools/eingeschlossenheit.py` entfernt Kommentare und verankert zeilenanfangs.
+- [ ] **`unsafe{` ohne Leerzeichen zählt nicht mit.** `RX_UNSAFE` verlangt `\s+`; `unsafe{ … }`
+      ist gültiges Rust. **Gemessen: 0 Vorkommen im ganzen Baum** — das Loch ist unbenutzt, nicht
+      abwesend. Der Einzeiler ist `\bunsafe\b\s*`; die Verschärfung kann nur mehr finden, nie
+      weniger.
+- [ ] **Die einzige Crate der Allowlist hat ein Bauskript.** `programs/libcaprock/build.rs` läuft
+      zur Bauzeit auf dem **Wirt** mit voller Autorität; `forbid(unsafe_code)` berührt es nicht,
+      und der Audit sieht nur `src/`. Heute harmlos (RUSTFLAGS-Prüfung), aber es sitzt in der
+      Vertrauenskette **jedes** TrustedSAS-Programms. Entweder in den Audit aufnehmen oder
+      ausdrücklich als Schuld führen — stillschweigend außerhalb ist die dritte Möglichkeit, die
+      es nicht geben darf.
+- [ ] **Zwei Parser für dieselbe Bedingung wären der nächste Riss.** Der Z28-Wächter hält seine
+      Menge heute gegen `ALLOWLIST` in `sign_trusted.py` (mit Ankertest). Richtiger wäre **eine**
+      Zählung mit zwei Verbrauchern — dasselbe Muster wie `tools/mangel-zaehlen.py`, das
+      `kernel/build.rs` und `tools/mangel-stellen.sh` gemeinsam benutzen.
+
+## Zwei Fremdbyte-Parser sind eingeschlossen in der SACHE, nicht im TYP (2026-08-13)
+
+**Klasse:** Härtung · **Stand:** offen, gemessen mit `tools/eingeschlossenheit.py --liste`.
+
+`caprock-dtb` (Device-Tree-Parser) und `caprock-abi` haben **0 `unsafe` und keine
+Abhängigkeiten**, tragen aber kein `#![forbid(unsafe_code)]`. Bei `caprock-dtb` ist das genau die
+Klasse von `caprock-part`/`caprock-fat`: **fremde Bytes**, die im Hochlauf gelesen werden. „Heute
+kein `unsafe`" ist eine Momentaufnahme; `forbid` ist eine Bedingung.
+
+- [ ] Beiden `#![forbid(unsafe_code)]` geben und sie deklarieren — oder in
+      `AUSDRUECKLICH_NICHT` absagen, mit Grund. Zwei Zeilen je Crate; der Wächter zieht die
+      Konsequenz von selbst nach (er prüft dann transitiv mit).
 
 ## Z. Zielarchitektur (Stand 2026-07-29) — woran alles andere zu messen ist
 

@@ -251,6 +251,72 @@ Nullaussage:
 - [ ] **Vergleiche innerhalb der Verus-Modelle.** Dort gelten dieselben Formen, aber die
       Suchmuster des Durchgangs (Shell-Vergleiche, Rust-Urteilszeilen) greifen nicht.
 
+## S1. Das SPARK-Experiment hat zwei echte Fehler gefunden (2026-08-13, Zweig `spark-experiment`)
+
+**Klasse:** Verifikation / Sicherheit · **Stand:** Experiment beantwortet, **zwei Befunde im
+Rust-Code offen**
+
+Die Frage lautete: *findet GNATprove auf Silver Level am Cap-Space etwas, das das Verus-Modell
+nicht sieht?* **Antwort: ja, 15 Stellen.** Die Kennzahl, die darüber entscheidet, ob das etwas
+wiegt: **34 von 34 Unterprogrammen unter `SPARK_Mode => On`, kein einziges `Off`** — 294
+Prüfungen, 279 bewiesen, 15 offen (5 %). Der erste Lauf hatte 39; die 24 Differenz waren fehlende
+Schleifeninvarianten meiner Portierung, beseitigt durch Zusicherungen, die GNATprove **selbst
+nachweist**.
+
+- [ ] **S1a — `audit_cdt` kann den Knoten mitnehmen, statt die Anomalie zu melden.**
+      NACHGEPRÜFT im echten Quelltext (`crates/caprock-cap/src/space.rs`, Geschwisterlauf): `p`
+      wird gegen `nslots` geprüft, **`first_child` und `next_sibling` nicht** —
+      `self.slots[ci]` indiziert ungeprüft. Die Schrittgrenze (B-5.5) schützt gegen **Zyklen**,
+      nicht gegen einen Index **ausserhalb der Tabelle**.
+      In Rust ist das ein Panic, und `panic = "abort"` steht in **beiden** Profilen: **der Prüfer,
+      der die Anomalie melden soll, reisst den Knoten mit.** Dieselbe Form wie B-6.2, nur im
+      Audit-Pfad.
+      Die Gegenprobe isoliert die **Position**, nicht die Verfälschung — derselbe kaputte Wert,
+      nur der Slot wandert: sauber → `audit_cdt = 0`; kaputt bei Slot 0 → `6`; kaputt bei Slot 1 →
+      **`CONSTRAINT_ERROR`, kein Urteil**. Die Prüfung für `p` steht in dessen *eigener* Iteration;
+      ist `p > s`, hat sie noch nicht stattgefunden.
+
+- [ ] **S1b — `refcount -= 1` in `delete_leaf` ohne Bedingung, und `overflow-checks` ist im
+      Release NICHT gesetzt.** Also kein Panic, sondern **stiller Umlauf auf `0xFFFF_FFFF`**:
+      Objekt nie finalisiert, Region nie freigegeben, Reply nie abgebrochen. Dieselbe Form wie
+      D11 — eine Schranke, die niemand benennt, ist ein Loch statt eines Schutzes.
+
+### Warum Verus keine einzige davon sehen kann — gezählt, nicht behauptet
+
+`refcount` steht nur in `cap_cdt_refcount.rs` (21×, als **`nat`** — über `refcount -= 1` kann ein
+`nat`-Modell nicht einmal die Frage stellen), `parent` nur in den Strukturdateien. **Keine Datei
+führt beides im selben Zustand.** `gen`, `Finalized`, `rights`, `badge`, `move_cap` kommen im
+ganzen Modell **gar nicht** vor. `delete_leaf` senkt den Refcount **und** hängt aus — diese
+zusammengesetzte Operation ist nirgends bewiesen.
+
+**Das reiht sich in die Registerkorrekturen ein:** „16 Beweisdateien, 0 errors" sagt, dass die
+vorhandenen Beweise halten — über die **Reichweite** sagt es nichts, und hier ist sie gemessen.
+
+### Vier ungeschriebene Zusicherungen, die die Portierung ans Licht zwang
+
+**I5** Länge der Geschwisterkette (Verus hat dafür *keine* Längen- oder Terminierungsaussage) ·
+**I6** die Kapazitätszusage von `Finalized` · **I7** der **absichtliche** Umlauf der Generationen —
+darauf ruht `resolve` und damit die **gesamte** Handle-Sicherheit, und Generationen kommen im
+Modell nicht vor · **I9** ein Fenster im `install`-Rollback (`used = false` bei `refcount = 1`),
+das `audit_cdt` strukturell **nicht** meldet: Code 3 vergleicht für unbelegte Objekte nur `refs`,
+nicht `refcount`. Harmlos, weil `alloc_object_inner` überschreibt — **Zufall der Reihenfolge,
+kein Entwurf.**
+
+### Was das über SPARK sagt — und was nicht
+
+Der Gewinn kam **nicht** aus „Ada ist sicherer", sondern daraus, dass GNATprove **jede**
+Indizierung und **jede** Arithmetik als Beweispflicht behandelt, während Verus nur beweist, was
+jemand modelliert hat. Das ist ein Argument für **mehr Beweisfläche**, nicht zwingend für einen
+Sprachwechsel: dieselben 15 Stellen wären mit Verus *am echten Code* (statt am Modell) erreichbar.
+
+- [ ] **Die billigere Fassung derselben Wirkung:** das Verus-Modell des Cap-Space auf den echten
+      Code ziehen, statt ein Modell danebenzustellen — und die vier Zusicherungen oben aufnehmen.
+
+**Werkzeugkette:** `alr install gnatprove` + `gnat_native`, vollständig unter `~/.alire`, ohne
+root. `tools/spark-beweis.sh` ist ein **Gatter** (Ratsche in beide Richtungen, Abdeckungsprüfung
+gegen heimliches `SPARK_Mode => Off`, zu wenige Prüfungen gelten als **ausgefallener** Lauf) und
+hat beim ersten Lauf einen eigenen Fehler gefangen.
+
 ## Z28. Syscall-ABIs als PLUGGABLE Module — entschieden 2026-08-13
 
 **Klasse:** Architektur · **Stand:** entschieden, nicht begonnen. Setzt die Nutzlast von

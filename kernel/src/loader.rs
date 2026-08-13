@@ -1389,29 +1389,59 @@ fn iface_bekannt(program_id: u32) -> bool {
 /// nicht. Bis dahin waere der Zweig ungeprueft, und ungeprueft heisst hier: vermutlich kaputt,
 /// wenn er zum ersten Mal gebraucht wird. Der Selbsttest fuettert deshalb diese Funktion direkt.
 fn iface_record_or_check(program_id: u32, jetzt: u32) -> Result<(), LoaderError> {
-    let mut g = IFACE_SEEN.lock();
-    let (tab, used) = &mut *g;
-    if let Some(&(_, zuerst)) = tab[..*used].iter().find(|&&(id, _)| id == program_id) {
-        if zuerst != jetzt {
+    // **Unter der Sperre wird ENTSCHIEDEN, gedruckt wird danach.**
+    //
+    // Bis zum 2026-08-13 stand hier ein `println!` **im** kritischen Abschnitt, und seit C9b ist
+    // das die groesste IRQ-maskierte Sperrhaltung des Systems (269-390 Promille eines Ticks).
+    // C9b wirkt hier strukturell nicht: die Konsole maskiert seither nur noch je Byte, aber
+    // **wer maskiert hereinkommt, bleibt maskiert** -- `SpinLock::lock` hat die IRQs schon
+    // gesperrt, bevor die Konsole ueberhaupt gerufen wird.
+    //
+    // Die Form ist dieselbe wie beim Verifiziererthread (`while let Some(a) = SCHLANGE.lock()..`)
+    // und wie E-Rest 3b (`match lock() { .. None => lock() }`): **die Lebensdauer des Guards ist
+    // laenger als die Arbeit, die ihn braucht.** Hier ist die Arbeit ein Tabellenblick; das
+    // Drucken gehoert nicht dazu.
+    enum Urteil {
+        Ok,
+        Geaendert(u32),
+        Voll,
+    }
+    let urteil = {
+        let mut g = IFACE_SEEN.lock();
+        let (tab, used) = &mut *g;
+        if let Some(&(_, zuerst)) = tab[..*used].iter().find(|&&(id, _)| id == program_id) {
+            if zuerst != jetzt {
+                Urteil::Geaendert(zuerst)
+            } else {
+                Urteil::Ok
+            }
+        } else if *used >= MAX_IFACE_TRACKED {
+            Urteil::Voll
+        } else {
+            tab[*used] = (program_id, jetzt);
+            *used += 1;
+            Urteil::Ok
+        }
+    }; // <- der Guard faellt HIER, vor jeder Ausgabe
+
+    match urteil {
+        Urteil::Ok => Ok(()),
+        Urteil::Geaendert(zuerst) => {
             println!(
                 "loader  : A-4.4 ABGEWIESEN -- program_id {program_id} wurde mit iface_version \
                  {zuerst} geladen, das Archiv bietet {jetzt}. Ein Austausch ueber dieselbe \
                  Endpoint-Cap darf die Schnittstelle nicht aendern."
             );
-            return Err(LoaderError::IfaceVersionChanged);
+            Err(LoaderError::IfaceVersionChanged)
         }
-        return Ok(());
+        Urteil::Voll => {
+            println!(
+                "loader  : A-4.4 ABGEWIESEN -- Versionsbuchhaltung voll ({MAX_IFACE_TRACKED} IDs). \
+                 Lieber abweisen als ungeprueft laden."
+            );
+            Err(LoaderError::IfaceTableFull)
+        }
     }
-    if *used >= MAX_IFACE_TRACKED {
-        println!(
-            "loader  : A-4.4 ABGEWIESEN -- Versionsbuchhaltung voll ({MAX_IFACE_TRACKED} IDs). \
-             Lieber abweisen als ungeprueft laden."
-        );
-        return Err(LoaderError::IfaceTableFull);
-    }
-    tab[*used] = (program_id, jetzt);
-    *used += 1;
-    Ok(())
 }
 
 

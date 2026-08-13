@@ -307,7 +307,18 @@ class Befund:
 def crates_finden(wurzel):
     gefunden = []
     for r, verz, dateien in os.walk(wurzel):
-        verz[:] = [d for d in verz if d not in ("target", ".git", "build", "node_modules")]
+        # **`.claude` gehoert dazu, und der Grund ist gemessen.** Dort liegen die Arbeitsbaeume
+        # der Agenten -- eigenstaendige Checkouts, oft auf ALTEN Commits. Beim ersten Lauf hat der
+        # Selbsttest deshalb `sel4lake-cap` und `sel4lake-loader` gefunden: Crates aus der Zeit vor
+        # der Umbenennung nach Caprock, in einem Baum, der gar nicht dieser Baum ist. Ein Waechter,
+        # der in fremde Checkouts hineinsieht, urteilt ueber einen anderen Stand als den, der
+        # gebaut wird -- dieselbe Klasse wie eine Messung, die nicht weiss, welches Artefakt sie
+        # gemessen hat.
+        verz[:] = [
+            d
+            for d in verz
+            if d not in ("target", ".git", "build", "node_modules", ".claude")
+        ]
         if "Cargo.toml" in dateien:
             pfad = os.path.join(r, "Cargo.toml")
             try:

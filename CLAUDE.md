@@ -28,7 +28,7 @@ Zweig `arch/x86_64` (2026-08-03).
 | x86_64 | **49 996 von 50 000** nach der D0-Behebung (2026-08-07 abends, `tools/d0-messen.sh`, 16 parallele Stroeme gegen EINE Referenz). **0 D0-Treffer** — davor 9 in 50 000. Die 4 Abweichungen sind Lastartefakte des Messstands (3,2-fache vCPU-Ueberbuchung), s. todo D13 |
 | x86_64 RAM-Reihe | `== ALL PASS ==` bei **512M · 2560M · 3G · 6G**, Haupt- **und** Lade-Suite (2026-08-04). Vor E-Rest 3 starb ab 3G der Boot mit `#PF cr2=0x70_0000_0014` — der Zweig „RAM oberhalb 4 GiB" war nie gelaufen |
 | x86_64 Lade-Suite | `== ALL PASS ==` (2026-08-03: 39 Pruefungen — 5 Module, **zwei** Treiber-PDs, Austausch, A-5.3/A-5.4, dazu **drei** verkettete Boots fuer Z4 Stufe 2, inkl. sieben Negativfaellen) |
-| aarch64 | **ROT — `color : FAILURES` mit lauter Nullen, 3 von 3 (2026-08-12, gemessen auf dem unveränderten Baum).** Die alte Zeile („6 von 6 ALL PASS“, 2026-08-02) galt zehn Tage weiter, weil die Abnahme-Reihe aarch64 nur **baut** und nie **bootet** — genau die Drift, gegen die diese Datei geschrieben ist: eine Zahl ohne Nachmessung wird stillschweigend falsch. Als **C9e** im Register; der Bau steht seit 2026-08-12 in `tools/abnahme.sh`, die Suite noch nicht |
+| aarch64 | **`RUNS=6` → 6 von 6 mit identischer Signatur, `== ALL PASS ==`** (2026-08-13, nach der C9e-Behebung). Über **12** Läufe desselben Standes: **11 sauber, 1 D13** — die Rate gehört zur Zahl, und D13 ist hier unterscheidbar, weil die Farbzeile selbst auf `ALL PASS` steht und nur der `COLOR_DONE`-Store zu spät kommt. Davor **zehn Tage rot** (`color : FAILURES` mit lauter Nullen, 3 von 3), ohne dass es jemand sah: die Abnahme-Reihe **baute** aarch64 und **bootete** ihn nie. Seit dem 2026-08-13 fährt `tools/abnahme.sh` die Suite mit — **62 s je Lauf**, gemessen, gegen rund 950 s für die übrige Reihe |
 | Host-Tests | `mem · part · fat · cycles · loader · cap · virtio · typestate · ipctreue` → `== HOST-TESTS: ALL PASS ==` (`tools/host-tests.sh`, 2026-08-03) |
 | Verus | **16 Beweisdateien, 0 errors** — dazu **drei** Modell-Treue-Waechter (cap_space, IPC, Scheduler) mit 28 · 28 · 30 Selbsttestfaellen (2026-08-03) |
 | Scheduler-Messung | `tools/sched-erschoepfung-messen.sh`: 208 Messwerte, Positivkontrolle bestanden, vier Fassungen (echt/V0/H-a/H-b) — belegt D8, D9 und D10 |
@@ -936,6 +936,40 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   die F1-Zeile meldete `PASS` für „0 < 0x62000". Dieselbe Form wie ein nie gesetztes Bit, das als
   „kein Fehler" gelesen wird. Jede gemessene Grösse mit nur **einer** Schranke braucht eine
   Plausibilitätsuntergrenze — oder Null muss ausdrücklich als „nicht gemessen" ausscheiden.
+* **Eine Seite, die NICHTS tut, kann eine Zusicherung unerfüllbar machen — wenn sie an einer
+  Größenrelation liegt.** Die Wachseite (`USER_KSTACK_ALLOC = USER_KSTACK_SIZE + PAGE`, seit
+  2026-08-10) hat auf aarch64 **jede gefärbte Kernel-Stack-Anforderung strukturell unmöglich**
+  gemacht: 16 Farben, 4 Partitionen → ein Streifen ist **4** Farben breit, ein EL0-Kernel-Stack
+  ist dort 16 KiB = **4** Seiten. Er passte *genau* — die Eigenschaft folgte aus
+  `Stackseiten == Streifenbreite`, nicht aus der Struktur. Mit der Wache sind es **5**
+  aufeinanderfolgende Seiten, also fünf **verschiedene** Farben; die passen in einen
+  4-Farben-Streifen an keiner Adresse und bei keinem Füllstand. `alloc_colored` gab immer `None`,
+  `spawn_isolated_colored` ebenso, der A1-Farbtest meldete lauter Nullen — **zehn Tage lang**
+  (C9e). Die Pointe: auf aarch64 gibt es die Wache **gar nicht**
+  (`hal::mmu::guard_unterstuetzt() == false`, `guard_unmap` ist ein Zähler). Eine Seite, die auf
+  dieser Architektur nachweislich nichts bewirkt, hat den Farbtest der Architektur gekippt.
+  Dieselbe Klasse wie „unten zuerst war ein Zufall der Größenrelation". Seither steht die Wache
+  unter **keiner** Farbbedingung (`alloc_colored_vorspann_in`) — sie trägt keine Daten und belegt
+  kein Cache-Set, die Zusicherung sagt über sie nichts aus.
+* **Ein `None` aus einem Allokator heisst „kein Platz" — auch wenn es „geht prinzipiell nicht"
+  heisst.** Genau daran hing die C9e-Suche: das Fehlerbild sah nach Speichermangel unter Last aus
+  und war eine Unmöglichkeit, die bei leerem RAM genauso eintritt. Eine Anforderung, die
+  **breiter als der Streifen** ist, ist kein Mangel; sie braucht einen eigenen Grund.
+* **Ein Fehlschlag VOR dem `if let` färbt genau die Felder null, die dahinter entstehen — und
+  das ist die Diagnose.** In der `color`-Zeile stand `uebergross_abgewiesen=1` inmitten lauter
+  Nullen. Diese eine Eins hat die Frage entschieden: der Test war *sprechfähig* und lief bis zum
+  Spawn; alles danach fand nicht statt. Wer eine Zeile aus lauter Nullen sieht, muss zuerst
+  fragen, welche Felder **vor** und welche **nach** dem Abbruchpunkt gesetzt werden.
+* **Dieselbe Klasse zweimal an einem Tag: arch-neutraler Kernelcode ruft eine HAL-Funktion, die
+  es nur auf x86 gibt.** Am 2026-08-12 um 00:48 wurde `hal::mmu::guard_*` behoben und die
+  Abnahme um `aarch64-bau` erweitert — „die Abnahme fängt die Klasse jetzt". Um 10:24 landete
+  `irq_tiefe`/`irq_tiefe_melden` (C4, zweiter Summand der Stackrechnung) wieder **nur** in der
+  x86-HAL, gerufen aus `kernel/src/kstackmark.rs` und `kernel/src/system.rs`: drei `E0425`, der
+  aarch64-Bau kaputt. **Ein Gatter, das existiert und nicht gefahren wird, ist keins** — die
+  Ratsche greift erst, wenn sie zwischen Commit und Merge liegt. Und die naheliegende Behebung
+  (eine zweite Kopie in der aarch64-HAL) wäre die falsche gewesen: der Inhalt sind **zwei
+  Atomics**, also arch-neutral. Er steht jetzt einmal in `caprock_hal::irqtiefe`, beide
+  `exception`-Module reichen ihn weiter.
 * **Ein Kriterium, das die geprüfte Sache nicht erreichen KANN, ist kein strenges Kriterium,
   sondern gar keins.** Die FP-Sonde musste „alle 64 Abgaben überstehen"; erreichbar waren 3, weil
   sie je Rundlauf-Runde eine Iteration vorankommt und eine Runde durch den **Tick** begrenzt ist,

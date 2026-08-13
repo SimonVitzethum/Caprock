@@ -55,9 +55,31 @@ PUNKTE=()
 # gab es dort nicht --, und niemand hat es gesehen, weil diese Reihe nur x86 faehrt. Gefunden hat
 # es zwei Tage spaeter ein Agent nebenbei. **Eine Abnahme, die eine Architektur auslaesst, laesst
 # sie verrotten**; der Bau ist der billigste Teil davon (rund 30 s) und faengt genau diese Klasse.
-# Die aarch64-SUITE laeuft hier nicht mit: sie braucht QEMU-aarch64 und ein Vielfaches der Zeit --
-# das ist eine benannte Luecke und keine Vollstaendigkeit.
 PUNKTE+=("aarch64-bau|./build.sh")
+# **Und der BOOT gehoert genauso hinein — der Bau allein prueft die Haelfte.** Hier stand bis zum
+# 2026-08-13 der Satz „die aarch64-SUITE laeuft hier nicht mit: sie braucht ein Vielfaches der
+# Zeit". Das war zweimal falsch, und beide Male hat es etwas gekostet:
+#
+#   * **Die Zeit stimmte nicht.** Gemessen am 2026-08-13 auf diesem Rechner: **62 s** fuer einen
+#     Lauf (`RUNS=1`) gegen rund 950 s fuer die uebrige Reihe -- **6,5 %** Aufschlag, nicht ein
+#     Vielfaches. Die Zahl war nie erhoben worden; „ein Vielfaches" war eine Schaetzung, die als
+#     Begruendung auftrat.
+#   * **Die Luecke war nicht bloss benannt, sie war belegt.** Genau in ihr lag C9e: die
+#     aarch64-Suite war seit dem 2026-08-10 rot (`color : FAILURES` mit lauter Nullen, weil die
+#     Wachseite die gefaerbte Stack-Anforderung ueber die Streifenbreite schob) -- und
+#     `CLAUDE.md` fuehrte aarch64 zehn Tage lang weiter mit „6 von 6 ALL PASS". Eine Abnahme, die
+#     eine Architektur BAUT aber nie BOOTET, haelt genau diese Sorte Zahl am Leben. Dieselbe
+#     Klasse wie „`cargo build` laeuft durch ist kein Beleg", eine Ebene hoeher.
+#
+# `RUNS=1`, nicht `RUNS=6`: die Abnahme fragt „faehrt diese Architektur ueberhaupt", nicht „wie
+# gross ist ihre Streuung". Die Wiederholungsmessung ist D6/D13-Arbeit und kostet das Sechsfache
+# (gemessen 356 s) -- sie gehoert an den Messstand, nicht in ein Gatter, das vor jedem Merge
+# laeuft. **Was dieser Punkt deshalb NICHT abdeckt, steht hier, damit es niemand hineinliest:**
+# ein Lauf faengt keine Rate. D13 (Watchdog zwischen Druck und `COLOR_DONE`-Store) traf am
+# 2026-08-13 **1 von 6** Laeufen und wird diesen Punkt also gelegentlich rot melden, ohne dass
+# etwas kaputt ist -- das Protokoll unter `build/diag/` unterscheidet die beiden Faelle (bei D13
+# steht die Pruefzeile selbst auf ALL PASS).
+PUNKTE+=("aarch64-suite|./test-qemu.sh")
 PUNKTE+=("kernel-grenze|./tools/kernel-grenze.sh")
 PUNKTE+=("host-tests|./tools/host-tests.sh")
 PUNKTE+=("mangel-stellen|./tools/mangel-stellen.sh")

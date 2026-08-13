@@ -154,10 +154,31 @@ fn claim_user_kstack_masked(mask: Option<caprock_mem::ColorMask>) -> Option<usiz
     // 16 Byte); die Wache dagegen muss seitenausgerichtet sein. Also: Seitenausrichtung, eine
     // Seite Aufschlag, Wache ganz unten.
     let _ = al;
+    // **Die Wache steht UNTER keiner Farbbedingung** — und ohne diesen Halbsatz ist die gefaerbte
+    // Anforderung auf aarch64 strukturell unerfuellbar (C9e, 2026-08-13).
+    //
+    // Die Rechnung: 16 Farben, 4 Partitionen -> ein Streifen ist **4** Farben breit, und ein
+    // EL0-Kernel-Stack ist dort 16 KiB = **4** Seiten. Er passte also GENAU, solange er allein
+    // angefordert wurde. Mit der Wache sind es **5** aufeinanderfolgende Seiten, und fuenf
+    // aufeinanderfolgende Seiten tragen fuenf VERSCHIEDENE Farben — in einen 4-Farben-Streifen
+    // passen sie nie, an keiner Adresse, bei keinem Fuellstand. `alloc_colored` gab damit immer
+    // `None`, `spawn_isolated_colored` ebenso, und der A1-Farbtest meldete lauter Nullen.
+    //
+    // Warum es die Wache nicht kostet: sie traegt keine Daten. Auf x86 ist sie unabgebildet, auf
+    // aarch64 gibt es sie gar nicht (`guard_unterstuetzt() == false`, `guard_unmap` zaehlt nur).
+    // Eine Seite, die nie gelesen und nie geschrieben wird, belegt kein Cache-Set — die
+    // Farbzusicherung sagt nichts ueber sie aus, und sie in den Streifen zu zwingen war keine
+    // schaerfere Zusicherung, sondern eine Seite ueber der Streifenbreite.
+    //
+    // **Ausrichtung `PAGE`, nicht `al`.** Ausgerichtet werden musste hier ohnehin nie der Block,
+    // sondern die Wache (seitenausgerichtet) — das stand schon oben. Mit `al` waere `roh`
+    // 16-KiB-ausgerichtet und damit der STACK bei `roh + PAGE` gerade NICHT streifenausgerichtet;
+    // die Farbbedingung des gefaerbten Teils waere wieder unerfuellbar. Der Stack braucht die
+    // 16-KiB-Ausrichtung nicht (die CPU verlangt fuer `rsp0` 16 Byte).
     let roh = benannt_alloc(MANGEL_KERNEL_STACK, USER_KSTACK_ALLOC, |n| match mask {
         // Ueber die Politik aus `mem_alloc`/`alloc_colored` (unten zuerst), nicht daran vorbei:
         // eine Vorgabe, an der eine einzige Stelle vorbeigreift, ist keine Vorgabe (E-Rest 3b).
-        Some(m) => alloc_colored(n, al, m),
+        Some(m) => alloc_colored_vorspann(1, n, caprock_mem::PAGE, m),
         None => mem_alloc(n, al),
     })?
     .base();
@@ -1794,7 +1815,22 @@ pub fn alloc_anywhere(size: u64, align: u64) -> Option<MemoryCap> {
 /// Wie [`alloc`], aber jede Seite trägt eine Farbe aus `mask` (todo A1). Genullt wie jede
 /// Region, die an ein Subjekt gehen kann.
 pub fn alloc_colored(size: u64, align: u64, mask: caprock_mem::ColorMask) -> Option<MemoryCap> {
-    zoned_alloc_colored(size, align, mask, Zone::IdentityMapped)
+    zoned_alloc_colored(0, size, align, mask, Zone::IdentityMapped)
+}
+
+/// Wie [`alloc_colored`], aber die ersten `vorspann` Seiten stehen unter **keiner**
+/// Farbbedingung — fuer eine Wachseite, die keine Daten traegt und deshalb kein Cache-Set belegt.
+///
+/// Der Grund und die Rechnung stehen bei `caprock_mem::Allocator::alloc_colored_vorspann_in`.
+/// Kurz: eine Wachseite in den Streifen zu zwingen, hat auf aarch64 jede gefaerbte
+/// Stack-Anforderung strukturell unerfuellbar gemacht (5 Seiten Lauf, 4 Farben Streifen).
+fn alloc_colored_vorspann(
+    vorspann: u64,
+    size: u64,
+    align: u64,
+    mask: caprock_mem::ColorMask,
+) -> Option<MemoryCap> {
+    zoned_alloc_colored(vorspann, size, align, mask, Zone::IdentityMapped)
 }
 
 /// Wie [`alloc_colored`], aber ohne Identitaetsbindung (E-Rest 3d) — bevorzugt oberhalb 4 GiB.
@@ -1805,7 +1841,7 @@ fn alloc_colored_anywhere(
     align: u64,
     mask: caprock_mem::ColorMask,
 ) -> Option<MemoryCap> {
-    zoned_alloc_colored(size, align, mask, Zone::Anywhere)
+    zoned_alloc_colored(0, size, align, mask, Zone::Anywhere)
 }
 
 /// [`mem_alloc_anywhere`] oder [`alloc_colored_anywhere`], je nachdem ob ein Farbsatz vorliegt.
@@ -1826,6 +1862,7 @@ fn mem_alloc_masked_anywhere(
 
 /// Die gemeinsame Mechanik — dieselbe Zonenwahl und derselbe EINE Lock wie in [`zoned_alloc`].
 fn zoned_alloc_colored(
+    vorspann: u64,
     size: u64,
     align: u64,
     mask: caprock_mem::ColorMask,
@@ -1848,10 +1885,12 @@ fn zoned_alloc_colored(
     };
     let cap = {
         let mut mem = MEM.lock();
-        match mem.alloc_colored_in(size, align, colors, mask, lo, hi) {
+        match mem.alloc_colored_vorspann_in(vorspann, size, align, colors, mask, lo, hi) {
             Some(c) => Some(c),
             // Gezaehlt wird nur, was in der anderen Zone auch WIRKLICH genommen wurde.
-            None => match mem.alloc_colored(size, align, colors, mask) {
+            None => match mem
+                .alloc_colored_vorspann_in(vorspann, size, align, colors, mask, 0, u64::MAX)
+            {
                 Some(c) => {
                     let ausgewichen = match zone {
                         Zone::IdentityMapped => c.base() >= grenze,

@@ -9,6 +9,14 @@ use super::cpu;
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+/// Der zweite Summand der C4-Stackrechnung. **Eine** Definition (`crate::irqtiefe`), hier nur
+/// unter dem gewohnten Namen weitergereicht — damit `hal::exception::irq_tiefe()` auf beiden
+/// Architekturen existiert und die Aufrufstellen im Kernel arch-neutral bleiben duerfen.
+///
+/// Bis zum 2026-08-13 gab es diese Funktionen **nur** auf x86, waehrend der arch-neutrale Kernel
+/// sie rief: drei `E0425`, der aarch64-Bau kaputt seit dem 2026-08-12.
+pub use crate::irqtiefe::{irq_tiefe, irq_tiefe_melden};
+
 /// Auf dem Stack gesicherter Registerkontext einer Exception.
 ///
 /// Das Layout entspricht exakt der Speichersequenz im Vektor-Assembler. Der

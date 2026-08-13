@@ -35,6 +35,11 @@ declare -A ERLAUBT=(
   [cache]="Cache-Geometrie fuer die Farbzuteilung (A1)"
   [cache_decode]="reine Feldzerlegung dazu, host-getestet"
   [fault]="Fault-Weiterreichung an PDs"
+  # C4. Zwei Atomics; die HAL kennt den Scheduler nicht, also reicht der Kern die beiden Adressen
+  # herein und die HAL nur die Zahl heraus. Der Modulname steht hier und nicht bei `exception`,
+  # weil der Inhalt arch-neutral ist: er lag bis 2026-08-13 NUR in der x86-HAL und hat den
+  # aarch64-Bau gerissen. Kein Geraet, keine Hardware -- eine Messgroesse des Trap-Eintritts.
+  [irqtiefe]="Stackverbrauch des IRQ-Pfads (C4): zweiter Summand der Stackrechnung"
   [hook]="typisierter atomarer Trap-Hook-Slot -- Mechanik des Trap-Eintritts, kein Geraet"
   [iommu]="DMA-Eindaemmung -- Isolation gegenueber Geraeten"
   [smmu]="IOMMU (aarch64)"

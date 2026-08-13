@@ -205,6 +205,48 @@ impl PhysAllocator {
         lo: u64,
         hi: u64,
     ) -> Option<MemoryCap> {
+        self.alloc_colored_vorspann_in(0, size, align, colors, mask, lo, hi)
+    }
+
+    /// **Gefärbte Region mit einem farblich UNGEBUNDENEN Vorspann.**
+    ///
+    /// Die ersten `vorspann` Seiten der gelieferten Region dürfen jede Farbe tragen; erst der
+    /// Rest muss in `mask` liegen. Es gibt genau einen Grund dafür, und er ist eine bezahlte
+    /// Rechnung, keine Bequemlichkeit:
+    ///
+    /// **Eine Wachseite trägt keine Daten.** Sie ist unabgebildet (x86) bzw. auf dieser
+    /// Architektur überhaupt nicht vorhanden (aarch64, `guard_unterstuetzt() == false`) — sie
+    /// belegt kein einziges Cache-Set. Die Farbzusicherung ist eine Aussage darüber, welche
+    /// Cache-Sets eine PD **benutzt**; eine Seite, die nie gelesen und nie geschrieben wird,
+    /// gehört nicht dazu. Sie trotzdem in den Streifen zu zwingen, ist keine schärfere
+    /// Zusicherung, sondern eine, die den Anforderer um eine Seite über die Streifenbreite
+    /// hinausschiebt.
+    ///
+    /// **Was das kostete** (2026-08-13, C9e): auf aarch64 hat die Maschine 16 Farben, ein
+    /// Streifen also 4. Ein EL0-Kernel-Stack ist dort 16 KiB = 4 Seiten — **genau** ein
+    /// Streifen. Seit dem 2026-08-10 fordert `claim_user_kstack_masked` eine Seite mehr an (die
+    /// Wache), also **5** aufeinanderfolgende Seiten. Fünf aufeinanderfolgende Seiten tragen
+    /// fünf **verschiedene** Farben; in einen 4-Farben-Streifen passen sie nie. Damit war die
+    /// gefärbte Stack-Anforderung **strukturell unerfüllbar**, `spawn_isolated_colored` gab
+    /// immer `None`, und der ganze A1-Farbtest meldete lauter Nullen. Auf x86 fiel es nicht
+    /// auf: dort ist ein Streifen 16 lebendige Maskenbits breit und der Stack seit C4 2 Seiten.
+    ///
+    /// Das ist dieselbe Klasse wie „unten zuerst war ein Zufall der Größenrelation": die
+    /// Eigenschaft „der Stack passt in seinen Streifen" folgte aus `Stackseiten == Streifenbreite`
+    /// und nicht aus der Struktur — und verschwand beim nächsten Messwert.
+    ///
+    /// `vorspann >= size / PAGE` wäre eine Anforderung ohne jede Farbbedingung und wird
+    /// abgewiesen: wer keine Farbe braucht, nimmt [`alloc_in`](Self::alloc_in) und sagt es damit.
+    pub fn alloc_colored_vorspann_in(
+        &mut self,
+        vorspann: u64,
+        size: u64,
+        align: u64,
+        colors: u32,
+        mask: ColorMask,
+        lo: u64,
+        hi: u64,
+    ) -> Option<MemoryCap> {
         if mask.is_empty() {
             return None;
         }
@@ -214,9 +256,17 @@ impl PhysAllocator {
         let align = align.max(PAGE);
         let size = align_up(size.max(1), PAGE);
         let npages = size / PAGE;
+        // Ein Vorspann, der die ganze Region verschlingt, ist keine gefaerbte Anforderung mehr.
+        // Fail-closed statt stillschweigend die Zusicherung fallen zu lassen.
+        if vorspann >= npages {
+            return None;
+        }
+        let gefaerbt = npages - vorspann;
         // Mehr Seiten als Maskenbits ginge nur mit lückenloser Maske — die ist oben schon
         // abgefangen. Ohne diese Zeile liefe die Suche über alle Fragmente ins Leere.
-        if npages > MASK_BITS as u64 {
+        // **Gezaehlt wird der gefaerbte Teil**, nicht die Gesamtgroesse: der Vorspann steht
+        // unter keiner Farbbedingung und kann sie deshalb auch nicht sprengen.
+        if gefaerbt > MASK_BITS as u64 {
             return None;
         }
         let step = align;
@@ -242,7 +292,7 @@ impl PhysAllocator {
                 if end > zone_end {
                     break;
                 }
-                if run_is_colored(start, npages, colors, mask) {
+                if run_is_colored(start + vorspann * PAGE, gefaerbt, colors, mask) {
                     let two_sided = start > r.base && end < r.end();
                     if !(two_sided && self.len >= MAX_FRAGMENTS) {
                         // Best-Fit wie in `alloc_below`: kleinster **nutzbarer** Teil zuerst.
@@ -494,6 +544,71 @@ mod tests {
         assert!(a.overlaps_free(b, l), "Rest ist noch frei -> Ueberlappung besteht");
         assert!(!a.fully_free(b, l), "teilweise belegte Region gilt als vollstaendig frei");
         assert!(a.free(half));
+    }
+
+    /// **C9e, die Geometrie, an der die aarch64-Suite hing — ohne QEMU entscheidbar.**
+    ///
+    /// aarch64 hat 16 Farben; bei 4 Partitionen ist ein Streifen **4** Farben breit. Ein
+    /// EL0-Kernel-Stack ist dort 16 KiB = **4** Seiten und passte damit GENAU. Seit der
+    /// Wachseite (2026-08-10) wird eine Seite mehr angefordert: **5** aufeinanderfolgende
+    /// Seiten tragen **5 verschiedene** Farben, und die passen in einen 4-Farben-Streifen an
+    /// keiner Adresse und bei keinem Fuellstand.
+    ///
+    /// Der Test steht bewusst mit `COLORS_ARM = 16` da und nicht mit den 256 des uebrigen
+    /// Moduls: bei 256 Farben ist ein Streifen 16 lebendige Maskenbits breit, und **genau
+    /// deshalb** hat x86 nie etwas gemerkt. Ein Host-Test mit der Geometrie der einen
+    /// Architektur prueft die andere nicht.
+    #[test]
+    fn wachseite_sprengt_den_streifen_bei_16_farben() {
+        const COLORS_ARM: u32 = 16;
+        let mut a = with_ram(0x4000_0000, 64 * 1024 * 1024);
+        let m = stripe(0, 4, COLORS_ARM).unwrap();
+        // **`m.len()` ist hier die falsche Groesse und meldet 16.** `stripe` wiederholt das
+        // Muster mit der Periode `live` ueber alle 64 Bits (damit „Vereinigung aller Streifen
+        // ist lueckenlos" gilt); gezaehlt werden muss der LEBENDIGE Farbraum, also `0..colors`.
+        // Genau diese Verwechslung — Maskenbits gegen Farbanzahl — ist der `MASK_BITS`-Fehler
+        // aus der Fallenliste, und sie ist mir beim Schreiben dieses Tests noch einmal passiert.
+        let lebendig = (0..COLORS_ARM).filter(|c| m.contains(*c)).count();
+        assert_eq!(lebendig, 4, "Streifen muss 4 der 16 Farben halten");
+
+        // Der Stack ALLEIN passt — genau, nicht mit Luft.
+        let nur_stack = a.alloc_colored(4 * PAGE, PAGE, COLORS_ARM, m);
+        assert!(nur_stack.is_some(), "4 Seiten sind genau ein Streifen");
+        a.free(nur_stack.unwrap());
+
+        // Stack + Wache in EINER gefaerbten Anforderung: strukturell unerfuellbar.
+        assert!(
+            a.alloc_colored(5 * PAGE, PAGE, COLORS_ARM, m).is_none(),
+            "5 aufeinanderfolgende Seiten tragen 5 Farben -- ein 4-Farben-Streifen fasst sie nie"
+        );
+
+        // Und die Behebung: die Wache steht unter keiner Farbbedingung.
+        let cap = a
+            .alloc_colored_vorspann_in(1, 5 * PAGE, PAGE, COLORS_ARM, m, 0, u64::MAX)
+            .expect("mit ungebundenem Vorspann ist die Anforderung erfuellbar");
+        assert_eq!(cap.len(), 5 * PAGE);
+        // Die Aussage ist NICHT „irgendetwas kam zurueck", sondern: jede Seite AB der Wache
+        // liegt im Streifen. Ohne dieses Konjunkt wuerde der Test auch einen Allokator
+        // bestehen, der die Farbbedingung einfach fallen laesst.
+        for j in 1..5 {
+            let c = color_of(cap.base() + j * PAGE, COLORS_ARM);
+            assert!(m.contains(c), "Stackseite {j} traegt Fremdfarbe {c}");
+        }
+        assert!(a.free(cap));
+    }
+
+    /// Ein Vorspann, der die ganze Anforderung verschlingt, ist keine gefaerbte Anforderung
+    /// mehr — und wird abgewiesen statt die Zusicherung still fallen zu lassen.
+    #[test]
+    fn vorspann_ueber_alles_wird_abgewiesen() {
+        let mut a = with_ram(0x4000_0000, 16 * 1024 * 1024);
+        let m = stripe(0, 4, COLORS).unwrap();
+        assert!(a.alloc_colored_vorspann_in(4, 4 * PAGE, PAGE, COLORS, m, 0, u64::MAX).is_none());
+        assert!(a.alloc_colored_vorspann_in(9, 4 * PAGE, PAGE, COLORS, m, 0, u64::MAX).is_none());
+        // Eine Seite weniger Vorspann, und es geht wieder.
+        let cap = a.alloc_colored_vorspann_in(3, 4 * PAGE, PAGE, COLORS, m, 0, u64::MAX);
+        assert!(cap.is_some(), "Vorspann < Seitenzahl ist eine gueltige Anforderung");
+        a.free(cap.unwrap());
     }
 
     #[test]

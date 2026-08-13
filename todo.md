@@ -251,6 +251,68 @@ Nullaussage:
 - [ ] **Vergleiche innerhalb der Verus-Modelle.** Dort gelten dieselben Formen, aber die
       Suchmuster des Durchgangs (Shell-Vergleiche, Rust-Urteilszeilen) greifen nicht.
 
+## S2. Der zweite SPARK-Datenpunkt: der Scheduler — und es bricht NICHT
+
+**Klasse:** Verifikation / Sicherheit · **Stand:** Frage beantwortet, **fünf Befunde im Rust-Code
+offen**
+
+Die Entscheidungsfrage war: *wieviel Prozent des Scheduler-Kerns kommen unter `SPARK_Mode => On`?*
+Der Cap-Space kam mit 34/34. Der Scheduler hat, was jener nicht hatte: **Nebenläufigkeit, Zeit und
+den `Parked`-Typ**.
+
+**Antwort: 65 von 68 Unterprogrammen analysiert. Übersprungen genau drei — und alle drei sind
+Rümpfe, die in dieser Quelle gar nicht stehen** (importierte Fremdcrate-Funktion, eine
+`black_box`-Stackadresse, die in *keiner* Sprache beweisbar ist, und ein Laufzeit-Rumpf).
+**Kein Stück Scheduler-Logik unter `Off`** — Ready-Queue, Grund-Menge, Budget/Refill,
+`spawn_parked`/`admit`, Zombie-Buchführung, Migration, Audit: alles drin.
+
+**Es bricht also nicht bei 60 %, und an der Sprache liegt es nicht.**
+
+**Die Beweisquote ist trotzdem deutlich schlechter als beim Cap-Space: 38 % offen gegen 15 %.**
+Und der Grund ist Entwurf, nicht Sprache — **rohe Maschinenindizes an jeder Naht**. Das ist die
+eigentliche Aussage dieses Datenpunkts.
+
+### Die drei Fragen
+
+**Nebenläufigkeit trägt** — 63/63 Datenabhängigkeiten bewiesen: der Rust-Code liest überall genau
+einmal in eine Kopie, und das ist jetzt **bewiesen statt gelesen**. Was *nicht* geht: „der Aufrufer
+hält den Spinlock" hat in SPARK **keine Ausdrucksform** — bleibt in beiden Sprachen ein Kommentar.
+
+**Zeit ist die schwächste Klasse** — `now += 1` formal offen (bei 100 Hz nach 5,8 Mrd. Jahren).
+
+**`Parked`: SPARK kann es besser — Fehler statt Warnung.** Gemessen an zwei Unterprogrammen, die
+sich in *einer* Zeile unterscheiden: mit `Admit` → „absence of resource or memory leak **proved**",
+ohne → „leak might occur". Rusts `#[must_use]` ist eine **abschaltbare Warnung**.
+**Der Preis, und er wiegt hier:** SPARKs Linearität hängt an einer **Allokation**, Rusts `Parked`
+ist ein **Stackwert** — für einen Kernel ohne Halde ein echter Einwand.
+
+### Fünf Befunde im Rust-Code
+
+- [ ] **S2a — `migration_candidate` läuft die Ready-Kette OHNE Schrittgrenze.** Nachgeprüft
+      (`crates/caprock-sched/src/lib.rs`): `while i != NIL { … i = t.qnext … }`, während `audit`
+      über **derselben** Kette `if n > q.count { return 5 }` führt. Läuft im **Lastausgleich unter
+      dem Kern-Lock**: ein Zyklus dort ist ein stehender Kern. Dieselbe Form wie B-5.5, nur
+      umgekehrt — dort war der *Prüfer* begrenzt und der Pfad nicht.
+- [ ] **S2b — `depleted_count` hat keine Audit-Nachzählung.** Code 10 gibt es nur für
+      `budget_blocked_count`. Und es ist **genau der Zähler, der in D8/M5 gelogen hat** — vier
+      Senkungen, zwei Erhöhungen, alle ohne Helfer.
+- [ ] **S2c — `debug_assert_eq!(core, self.core)` steht 15× in `lib.rs` und 0× im Release.**
+      Alle acht offenen Zusicherungen sind diese Form: eine Zusage, die im ausgelieferten Kernel
+      nicht existiert.
+- [ ] **S2d — `priority: u8` indiziert `[ListHead; 8]` roh**, und `NPRIO` kommt ausserhalb der
+      Crate an **genau einer** Stelle vor. Ausführbare Gegenprobe: prio 0 ✓, prio 7 ✓,
+      **prio 8 → `CONSTRAINT_ERROR`**. In Rust ein Panic mit `panic = "abort"`.
+- [ ] **S2e — das Verus-Scheduler-Modell führt `blocked: bool`, den Zustand, den [Z24](#z24)
+      ABGESCHAFFT hat.** 7 modellierte Felder gegen 23, Arithmetik nur `nat`/`int`. Der
+      Modell-Treue-Wächter prüft die *Abbildung*, nicht die *Reichweite* — dieselbe Lücke wie bei
+      S1.
+
+### Eine Falle am eigenen Werkzeug
+
+**gnatprove sammelt je Objektverzeichnis auf.** Nach dem Projekt-Split meldete der S1-Lauf
+**232 statt 99** Prüfungen. Die Ratsche riss — **in der Gegenrichtung hätte sie geschwiegen**.
+Behoben (Leeren + Einheitsprüfung); als Falle in `CLAUDE.md`.
+
 ## S1. Das SPARK-Experiment hat zwei echte Fehler gefunden (2026-08-13, Zweig `spark-experiment`)
 
 **Klasse:** Verifikation / Sicherheit · **Stand:** Experiment beantwortet, **zwei Befunde im

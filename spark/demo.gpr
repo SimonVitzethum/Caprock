@@ -1,10 +1,10 @@
---  Ausfuehrbare Gegenprobe zu Fund [F13]. Getrennt von caprock.gpr, damit der
---  Beweislauf nur den portierten Code sieht.
+--  Ausfuehrbare Gegenproben zu [F13] (Cap-Space, S1) und [S2-F1]/[S2-F8] (Scheduler, S2).
+--  Getrennt von `caprock.gpr`, damit der Beweislauf nur den portierten Code sieht.
 project Demo is
    for Source_Dirs use ("src", "demo");
    for Object_Dir use "obj-demo";
    for Exec_Dir use "obj-demo";
-   for Main use ("f13_gegenprobe.adb");
+   for Main use ("f13_gegenprobe.adb", "s2_prio_gegenprobe.adb");
 
    package Compiler is
       --  Laufzeitpruefungen ausdruecklich AN -- sonst misst die Gegenprobe nichts.

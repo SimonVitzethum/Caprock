@@ -1,0 +1,14 @@
+--  Projektdatei fuer den SPARK-Portierungsversuch des SCHEDULERS (Experiment S2).
+--  Lauf:  tools/spark-beweis.sh
+--
+--  Eigene Bilanz, eigene Ratsche -- s. die Begruendung in `caprock.gpr`.
+project Caprock_Sched is
+   for Source_Dirs use ("src");
+   for Source_Files use ("caprock_sched.ads", "caprock_sched.adb");
+   for Object_Dir use "obj-sched";
+   for Main use ();
+
+   package Compiler is
+      for Default_Switches ("Ada") use ("-gnat2022", "-gnatwa");
+   end Compiler;
+end Caprock_Sched;

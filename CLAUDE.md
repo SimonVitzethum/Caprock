@@ -1077,6 +1077,17 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   `root : FAILURES (Rejected(Unverified))` plus drei Folgezeilen scheitern. Das sieht wie ein
   Kernelbefund aus und ist ein Aufbauproblem. **Wer eine Pruefung in einer Suite verschaerft, muss
   die andere mitnehmen** — sonst faellt der Fall genau dort an, wo niemand ihn erwartet.
+* **Ein Beweiswerkzeug sammelt in seiner Sitzungsablage AUF — eine Bilanz gehoert damit nicht
+  automatisch zu den Quellen, die sie zu beschreiben behauptet.** `gnatprove` schreibt seine
+  Ergebnisse je Objektverzeichnis fort. Beim Aufteilen von `spark/caprock.gpr` in zwei Projekte
+  (Cap-Space und Scheduler) blieben die alten Ergebnisse stehen, und `gnatprove.out` meldete fuer
+  S1 **232 Laufzeitpruefungen statt 99** — die Summe beider Module. Diesmal fiel es auf, weil die
+  Ratsche riss (71 gegen 15 erwartete). **Die andere Richtung ist die gefaehrliche:** faellt eine
+  Quelldatei weg, meldet dieselbe Mechanik still MEHR bewiesen, als gerechnet wurde, und die
+  Ratsche schweigt. Seit 2026-08-13 leert `tools/spark-beweis.sh` das Objektverzeichnis je Lauf
+  **und** prueft, dass die Bilanz genau EINE Einheit nennt, und zwar die erwartete. Dieselbe Form
+  wie „zwei Suiten, die dasselbe Geraet verschieden aufsetzen": das Urteil hing an einem Zustand,
+  der nicht im Diff steht.
 * **Wer nach ERREICHBARKEIT priorisiert statt nach VORGESCHICHTE, hat das Werkzeug am Ende genau
   dort nicht, wo der letzte Fall lag.** Die zehn ungemessenen Mangel-Meldestellen des Ladepfads
   standen ein Jahr mit der Begründung „braucht ein Boot-Archiv, das die Hauptsuite bauartbedingt
@@ -1105,6 +1116,7 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
 | `crates/caprock-sched/src/cycles.rs` | Zyklenabrechnung (B-5.1) — **ohne jede Abhaengigkeit**, damit die Fallen mit Literalen statt mit einer Maschine ausloesbar sind |
 | `tools/kernel-grenze.sh` | prueft, dass keine Treiber in die HAL wandern; mit Selbsttest |
 | `tools/eingeschlossenheit.py` | **die Eintrittskarte fuer ein Handler-Modul (Z28)**: wer `[package.metadata.caprock] einschluss = "streng"` traegt, hat `forbid(unsafe_code)`, kein Bauskript und nur benannte Abhaengigkeiten. Zwei Ratschen als Mengen von Namen, 15 Sprechproben, **0 Kandidaten = Rueckgabecode 3** |
+| `tools/spark-beweis.sh` | **das SPARK-Experiment (Zweig `spark-experiment`)**: GNATprove ueber Portierungen von `caprock-cap` (S1) und `caprock-sched` (S2). Zwei **getrennte** Ratschen, drei Gegenproben, uebersprungene Ruempfe als **Menge von Namen**. Bericht: `spark/README.md`, Befunde am Rust-Code: `todo.md` S2 |
 | `tools/host-tests.sh` | die Host-Tests der reinen Crates an **einem** Ort (`caprock-cap` lief vorher nirgends) |
 | `tools/handover/` | Linux-Kernelmodul fuer die Kern-Uebergabe (Variante B) |
 

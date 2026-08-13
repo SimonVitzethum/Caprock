@@ -3947,3 +3947,83 @@ der virtio-Demo).
   (safe Rust kann keinen Zeiger auf fremden Speicher erzeugen); das Zertifikats-Gate erzwingt die
   Voraussetzung (`unsafe_status == ALL_PASS`).
 - Tier 3 der Verifikation (funktionale Vollkorrektheit, Info-Flow, HW-Modell) ist Forschungsklasse.
+
+---
+
+## S2. Vier Befunde im Scheduler, gefunden von GNATprove (2026-08-13)
+
+**Klasse:** Verlässlichkeit / Kernlogik · **Stand:** gefunden und belegt, **keiner behoben**
+· **Herkunft:** SPARK-Portierung von `crates/caprock-sched/src/lib.rs`, Bericht und Zahlen in
+[spark/README.md](spark/README.md), Gatter `tools/spark-beweis.sh`
+
+Die vier stehen hier, weil sie **Befunde am Rust-Code** sind, nicht an der Portierung. Alle vier
+sind am Original gegengeprüft; die Ada-Zeile trägt jeweils einen Marker `[S2-Fn]`/`[S2-T1]`.
+
+- [ ] **S2a — `migration_candidate` läuft die Ready-Kette OHNE Schrittgrenze, `audit` daneben
+  nicht.** `lib.rs:1416`: `while i != NIL { .. i = t.qnext; }`. Dieselbe Verkettung in
+  `audit`:1743 trägt `if n > q.count { return 5 }`. Zwei Funktionen, eine Datei, eine
+  Datenstruktur — **eine** hält einen Zyklus für meldenswert, die andere nicht.
+  `migration_candidate` läuft im **Lastausgleich unter dem Kern-Lock**: ein Zyklus dort ist kein
+  Fehlerbericht, sondern ein stehender Kern.
+  **Gemessen:** einzige unbewiesene Terminierung, 1 von 64 (`[S2-T1]`).
+  **Einwand, der nicht trägt:** „`enqueue_ready` wehrt Doppeleinträge ab, ein Zyklus braucht
+  also einen Fehler" — das gilt für `audit` genauso, und dort steht die Schranke trotzdem.
+  Dieselbe Form wie B-5.5, nur andersherum: dort war der **Prüfer** begrenzt und der Pfad nicht.
+
+- [ ] **S2b — `depleted_count` hat keine Nachzählung, und es ist genau der Zähler, der in D8/M5
+  gelogen hat.** `audit` führt seit D10 Code **10** für `budget_blocked_count`; für
+  `depleted_count` gibt es **keinen Code 11** (gemessen: null Vorkommen in `audit`). Der Zähler
+  wird an **vier** Stellen gesenkt (`record_zombie`:1961, `refill_depleted`:1517,
+  `set_budget`:1585, `detach_for_migration`:1356) und an **zwei** erhöht
+  (`attach_migrated`:1386, `on_tick`:1479) — alle **sechs** **ohne Helfer**, während
+  `budget_blocked_count` seit D10 genau **eine** Schreibstelle hat.
+  Er entscheidet in `on_tick`, ob der Refill-Scan überhaupt läuft: lügt er nach oben, läuft ein
+  voller Tabellendurchlauf in **jedem** Tick (die D8/M5-Form); lügt er nach unten, bleibt ein
+  erschöpftes Konto liegen (die D5-Form).
+  **Der Befund ist die Asymmetrie, nicht der Unterlauf:** der Kommentar, der D8/M5 erklärt, steht
+  über dem Zähler, der die Behebung bekommen hat — nicht über dem, der den Fehler hatte.
+  **Vorschlag:** ein `set_depleted`-Helfer wie `set_budget_blocked` **und** Audit-Code 11. Beides,
+  nicht eines: der Helfer verhindert, der Code beobachtet.
+
+- [ ] **S2c — `debug_assert_eq!(core, self.core)` steht 15-mal in `lib.rs` und **null**-mal im
+  Release-Kernel.** `debug_assert!` wird im Release-Profil wegkompiliert. Damit ist die Bindung
+  zwischen dem Parameter `core` und der Instanz `self.core` im ausgelieferten Kernel durch
+  **nichts** gedeckt — nicht durch den Typ, nicht durch eine Prüfung, nicht durch einen Beweis.
+  Sie hält, weil der Kernel `SCHEDS[core].lock().on_tick(core, ..)` schreibt: **eine Zahl,
+  zweimal hingeschrieben.** Dieselbe Klasse wie „zwei Zahlen aus derselben Hand sind keine zwei
+  Quellen" (`boot_arg`, D5).
+  **Gemessen:** alle 8 unbewiesenen Zusicherungen der Portierung sind diese eine Form.
+  **Behebbar ohne Beweiser:** `SCHEDS[core]` gibt einen Zugriff, der die Kern-Nummer schon
+  **trägt**, statt sie ein zweites Mal zu verlangen — dann ist der Parameter weg statt geprüft.
+
+- [ ] **S2d — `priority` ist ein `u8`, `queues` hat 8 Fächer, und geklemmt wird an genau EINER
+  von rund 40 Aufrufstellen.** `Tcb::priority: u8` (0..255) indiziert `[ListHead; NPRIO]` mit
+  NPRIO = 8, roh, in `enqueue_ready`:1878, `remove_from_ready`:1901 und `dequeue_highest`:1997.
+  Die Klemme steht in `kernel/src/loader.rs:1254` — dem **Manifestpfad**, und dort korrekt (vor
+  dem `as u8`). Gemessen im Baum: **`NPRIO` kommt ausserhalb von `caprock-sched` an genau dieser
+  einen Stelle vor**; jeder andere `spawn*`-Pfad reicht die Zahl durch, und der Scheduler selbst
+  prüft nichts.
+  **Ausführbare Gegenprobe** (`spark/demo/s2_prio_gegenprobe.adb`, im Gatter):
+  prio 0 → zugelassen, prio 7 → zugelassen, **prio 8 → `CONSTRAINT_ERROR`**. Zwischen den letzten
+  beiden wandert nur die Priorität. In Rust ist das ein `panic!("index out of bounds")`, und
+  `panic = "abort"` steht in **beiden** Profilen — der Knoten stirbt.
+  Dass es heute kein Aufrufer tut, ist kein Schutz, sondern ein Zufall der Aufrufliste:
+  *„Eine Gefahr, die an einer Stelle per Hand abgewehrt wird und an 52 nicht, ist ein fehlender
+  Mechanismus, keine Sorgfaltsfrage."*
+  **Vorschlag:** `priority: u8` durch einen Typ ersetzen, der nur 0..NPRIO-1 herstellbar macht —
+  dann ist die Klemme im Typ statt in einer Aufrufstelle. Dieselbe Lösung wie `addr::Va`.
+
+- [ ] **S2e — das Verus-Scheduler-Modell beweist den Zustand VOR Z24.**
+  `Verification/scheduler/proofs/runqueue.rs` führt `blocked: bool` mit dem Kommentar
+  „blockiert (IPC-Wait/pause)" — ein Bit für zwei Lagen, also wörtlich der Fehler, gegen den die
+  Grund-Menge gebaut wurde. Die sechs Gründe (`IPC`/`BUDGET`/`PAUSE`/`PARK`/`HANDLER`/`LOAD`) und
+  der zweite Halbsatz („eingereiht wird **nur bei leerer Menge**") kommen im Modell nicht vor.
+  Dazu: 7 modellierte Felder gegen **23** im echten `Tcb`; Arithmetik ausschliesslich `nat`/`int`
+  (0 Vorkommen von `u8`/`u32`/`u64`/`usize`); `prio` unbeschränkt, `NPRIO` nur im Kommentar;
+  die Ready-Queue ein **Mitgliedschafts-Flag**, womit Listenkorruption per Modellierung
+  ausgeschlossen ist.
+  **Fair bleibt:** das Modell benennt fünf nicht modellierte Übergangsklassen selbst (Befunde B4
+  und B5 in seinem Kopf). Was es **nicht** benennt, ist genau dieser Punkt — dass sein
+  Zustandsraum dem Code seit Z24 nicht mehr entspricht.
+  **Die Lehre ist die aus D11:** ein Beweis, der dem Code treu war und dann nicht nachgezogen
+  wurde, beweist weiter — nur eben etwas anderes.

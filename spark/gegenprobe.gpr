@@ -1,0 +1,14 @@
+--  Gegenproben, die GNATprove selbst faellen muss (kein ausfuehrbarer Test).
+--
+--  Getrennt von `caprock.gpr`, damit die ABSICHTLICHEN Funde nicht in die Bilanz des
+--  portierten Moduls zaehlen -- sonst waere die Ratsche dort um genau die Zahl zu hoch,
+--  die sie beweisen soll.
+project Gegenprobe is
+   for Source_Dirs use ("src", "gegenprobe");
+   for Object_Dir use "obj-gegenprobe";
+   for Main use ();
+
+   package Compiler is
+      for Default_Switches ("Ada") use ("-gnat2022", "-gnatwa");
+   end Compiler;
+end Gegenprobe;

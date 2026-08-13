@@ -1,7 +1,14 @@
---  Projektdatei fuer den SPARK-Portierungsversuch des Cap-Space (Experiment).
+--  Projektdatei fuer den SPARK-Portierungsversuch des Cap-Space (Experiment S1).
 --  Lauf:  tools/spark-beweis.sh
+--
+--  **`Source_Files` steht hier ausdruecklich.** Mit dem Scheduler (S2) liegt eine zweite
+--  Portierung im selben Verzeichnis; ohne diese Zeile addierte `gnatprove.out` beide
+--  Bilanzen zu einer, und die Ratsche des einen Moduls waere die Summe zweier Module --
+--  eine Zahl, die bei jeder Aenderung am anderen Modul kippt, ohne dass jemand etwas am
+--  eigenen getan haette.
 project Caprock is
    for Source_Dirs use ("src");
+   for Source_Files use ("caprock_cap.ads", "caprock_cap.adb");
    for Object_Dir use "obj";
    for Main use ();
 

@@ -716,6 +716,101 @@ extern "C" fn sas_probe(_arg: usize) -> ! {
     }
 }
 
+// --- C7b: DIE TIEFENSONDE -------------------------------------------------------------------
+//
+// **Was sie prueft, und warum die Eichung es nicht kann.** Die Eichung von `userstackmark` prueft
+// das MESSGERAET an einem Feld im BSS. Sie kann strukturell nicht pruefen, ob die Buchfuehrung
+// (Thread-Slot -> Basis/Laenge der EL0-Region) auf die RICHTIGE Region zeigt: ein Eintrag, der
+// auf irgendeine andere, genullte Region verweist, meldet brav „viel Luft" und besteht jede
+// Eichung. Genau diese Verwechslung hat die alte Kapazitaetszeile entwertet (`kurven_arbeiter`
+// in `.text`: 3040 PDs gezaehlt, deren Thread sofort starb).
+//
+// Die Sonde beruehrt deshalb ihren ECHTEN EL0-Stack bis zu einer BEKANNTEN krummen Tiefe, und
+// der Kernel muss sie mit genau dieser Tiefe wiederfinden -- nach oben UND nach unten begrenzt.
+// Die untere Schranke faengt „die Messung bleibt bei 0"; die obere faengt „die Messung meldet
+// einfach die ganze Region".
+//
+// **Warum das Schreiben unterhalb von `RSP` hier gefahrlos ist** (und nicht etwa nur meistens):
+// ein Interrupt oder eine Exception aus Ring 3 wechselt auf x86-64 IMMER den Stack -- die CPU
+// laedt `RSP0` aus der TSS. Unterhalb des User-`RSP` legt niemand etwas ab; es gibt in diesem
+// System auch keine Signal-Zustellung, die es taete. Dieselbe Aussage traegt den zweiten
+// Summanden der EL0-Rechnung (s. `userstackmark::summe`).
+/// Bit 0 = die Sonde hat fertig beruehrt. In `.user_data`, weil Ring 3 schreibt.
+#[link_section = ".user_data"]
+#[cfg(feature = "selftest")]
+static TIEFENSONDE_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// Der Wert, mit dem die Sonde ihren Stack beruehrt. **Nicht null** ist die einzige Anforderung
+/// (die Marke zaehlt Nullbytes); auffaellig ist er, damit er in einem Speicherauszug erkennbar ist.
+#[cfg(feature = "selftest")]
+const TIEFENSONDE_WERT: u64 = 0x7EF7_0000_5041_0DE7;
+
+#[link_section = ".user_text"]
+#[cfg(feature = "selftest")]
+extern "C" fn ring3_tiefensonde(_arg: usize) -> ! {
+    // SAFETY: reiner Ring-3-Code. Beschrieben wird ausschliesslich der eigene EL0-Stack, und zwar
+    // `SONDE_TIEFE` Bytes UNTERHALB des aktuellen `RSP` -- ein Bereich, den auf x86-64 kein
+    // Interrupt und keine Exception benutzt (Stackwechsel ueber `RSP0`). Die private Region der
+    // PD ist um Groessenordnungen groesser als die Sondentiefe; darunter liegt ungemappte VA,
+    // ein Fehler um eine Zehnerpotenz faultet also, statt fremden Speicher zu treffen.
+    #[cfg(not(feature = "ustack-gegenprobe"))]
+    unsafe {
+        core::arch::asm!(
+            "mov rax, rsp",
+            "2:",
+            "sub rax, 8",
+            "mov qword ptr [rax], rdx",
+            "sub rcx, 1",
+            "jnz 2b",
+            in("rcx") (crate::userstackmark::SONDE_TIEFE / 8) as u64,
+            in("rdx") TIEFENSONDE_WERT,
+            lateout("rax") _,
+            lateout("rcx") _,
+        );
+    }
+    // **Die Gegenprobe isoliert GENAU EIN Konjunkt** (`ustack-gegenprobe`): die Sonde meldet sich
+    // fertig, ohne ihren Stack berührt zu haben. Damit bleibt `gemessen=true` und nur
+    // `getroffen` fällt — jede andere Aussage der Zeile ist unberührt. Eine Mutation, die zwei
+    // Dinge zugleich kaputtmacht, misst die Reihenfolge der Prüfungen und nicht die Eigenschaft
+    // (D9, erste Fassung).
+    TIEFENSONDE_BITS.fetch_or(1, Ordering::Release);
+    loop {
+        // Weiterlaufen statt sterben: gemessen wird sie am LEBENDEN Thread, damit die Messung
+        // nicht davon abhaengt, wann der Idle-Thread das naechste Mal reapt. Der `int 0x80`
+        // (YIELD) haelt sie praemptierbar und traegt nichts Tiefes bei -- er wechselt den Stack.
+        // SAFETY: freigegebener Syscall-Vektor (s. `ring3_worker`).
+        unsafe {
+            core::arch::asm!("int 0x80", in("rax") 0u64, in("rdi") 0u64,
+                             lateout("rax") _, lateout("rdi") _, clobber_abi("sysv64"));
+        }
+    }
+}
+
+/// ThreadId der Tiefensonde (`0` = keine).
+#[cfg(feature = "selftest")]
+static TIEFENSONDE_TID: AtomicU64 = AtomicU64::new(0);
+
+/// **Die Sonde nachmessen, sobald sie fertig beruehrt hat** — aus der Hauptschleife, also VOR dem
+/// Bericht. Eine Messung, die erst im Bericht entsteht, kann den Bericht nicht ausloesen.
+///
+/// Gepollt statt gewartet: „ist sie schon fertig" ist in jedem Durchlauf beantwortbar, und wenn
+/// sie es nie wird, bleibt das Konjunkt falsch und der Lauf faellt sichtbar durch (`offen:
+/// ustack`) — statt einen Erfolg zu erfinden.
+#[cfg(feature = "selftest")]
+fn tiefensonde_messen() {
+    if crate::userstackmark::sonde_stand().0 {
+        return; // schon gemessen
+    }
+    if TIEFENSONDE_BITS.load(Ordering::Acquire) & 1 == 0 {
+        return; // sie beruehrt noch
+    }
+    let raw = TIEFENSONDE_TID.load(Ordering::Acquire);
+    if raw == 0 {
+        return;
+    }
+    system::userstack_sonde_pruefen(caprock_sched::ThreadId::from_raw(raw));
+}
+
 /// Isolierter Ring-3-Thread: liest **dieselbe** Adresse. In seinem eigenen Adressraum ist sie
 /// nicht user-gemappt -> #PF -> der Kernel beendet ihn.
 #[link_section = ".user_text"]
@@ -804,6 +899,19 @@ fn spawn_demo() -> bool {
     // eine neue Kernel-Schnittstelle, die den Zeugen aufweichen wuerde.
     match system::spawn_user(ring3_park_probe as *const () as usize, 0, system::IDLE_PRIO) {
         Some(t) => PARK_PROBE_TID.store(t.to_raw(), Ordering::Release),
+        None => return false,
+    }
+
+    // C7b: die Tiefensonde. **Isoliert** und nicht SAS -- gemessen werden soll genau die Sorte
+    // Region, um die es geht (die private Region einer isolierten PD), und nicht der 64-KiB-
+    // Stack eines SAS-Threads. Ihre ThreadId wird vor der Zulassung veroeffentlicht, damit die
+    // Hauptschleife sie nachmessen kann, sobald die Sonde meldet.
+    match system::spawn_isolated_parked(ring3_tiefensonde as *const () as usize, 0, system::IDLE_PRIO)
+    {
+        Some((p, _region)) => match system::admit(p) {
+            Some(t) => TIEFENSONDE_TID.store(t.to_raw(), Ordering::Release),
+            None => return false,
+        },
         None => return false,
     }
 
@@ -1537,6 +1645,35 @@ fn kapazitaet_kurve() {
         if n > 0 { (pt_gehalten * 4096) / (n as u64) } else { 0 },
         system::used_vspaces()
     );
+    // **C7b: die LEBENDIGKEIT -- und sie ist der Grund, warum diese Zeile ueberhaupt existiert.**
+    //
+    // Diese Reihe hat am 2026-08-10 Leichen gezaehlt: `kurven_arbeiter` lag in `.text`, jeder
+    // Thread faultete an seiner Einsprungadresse, und „3040 isolierte Prozesse" hiess „3040 mal
+    // eine PD angelegt, deren Thread sofort starb". Der Einsprung ist seither richtig -- aber die
+    // KURVE hatte danach immer noch keine Zahl, die das BELEGT. Sie stand nur nicht mehr im
+    // Verdacht.
+    //
+    // Jetzt steht sie hier, und sie misst die WIRKUNG: jeder Arbeiter legt vor dem Parken ein von
+    // Null verschiedenes Wort auf seinen (genullt ausgegebenen) EL0-Stack. `benutzt` zaehlt die
+    // Regionen, in denen das angekommen ist.
+    //
+    // **Und der Sprechprobe-Vorbehalt gehoert dazu**: bei der SAS-Reihe ist `lebend` strukturell
+    // 0 -- ein Kernel-Thread hat keine EL0-Region. Die Zeile sagt das selbst, statt eine Null zu
+    // drucken, die wie ein Befund aussieht.
+    let (leb, ben) = system::userstack_lebendig_zaehlen();
+    println!(
+        "kurve   : LEBENDIGKEIT -- {leb} lebende EL0-Regionen registriert, davon {ben} mit einer \
+         Spur ihres Threads (er legt vor dem Parken ein von Null verschiedenes Wort auf den \
+         genullt ausgegebenen Stack). Bei n={n} muessen beide Zahlen zu n passen; {} \
+         **Gemessen wird die WIRKUNG, nicht ein Tabelleneintrag** -- genau daran ist die alte \
+         Fassung dieser Reihe gescheitert (Arbeiter in `.text`, jeder Thread tot, Kurve gruen)",
+        if SCALE_ISOLIERT {
+            "eine Luecke zwischen leb und ben heisst: Threads, die nie gerechnet haben."
+        } else {
+            "In DIESER Reihe (SAS) ist 0/0 der erwartete Wert: ein Kernel-Thread hat keine \
+             EL0-Region, es ist also nichts zu belegen und nichts behauptet."
+        }
+    );
 }
 
 /// Arbeiter der Kapazitätskurve **für die SAS-Reihe**: ein KERNEL-Thread (Ring 0), der sofort
@@ -1567,9 +1704,27 @@ extern "C" fn kurven_arbeiter(_arg: usize) -> ! {
 ///
 /// Der `int 0x80` steht direkt hier: eine Ring-3-Funktion darf keine Kernel-Funktion aufrufen
 /// (`invoke` liegt in `.text`), sonst wandert der Fault nur eine Ebene tiefer.
+/// Die Spur, die ein Kurvenarbeiter auf seinem EL0-Stack hinterlässt. Nur „nicht null" ist
+/// gefordert (die Marke zählt Nullbytes); auffällig, damit sie in einem Auszug erkennbar ist.
+#[cfg(feature = "selftest")]
+const KURVE_LEBENSSPUR: u64 = 0x1EBE_4D16_0000_0001;
+
 #[link_section = ".user_text"]
 #[cfg(feature = "selftest")]
 extern "C" fn kurven_arbeiter_el0(_arg: usize) -> ! {
+    // **Eine SPUR auf dem eigenen Stack, und sie ist der Lebendigkeitsbeleg der Kurve** (C7b).
+    //
+    // Die private Region wird genullt ausgegeben; ein von Null verschiedenes Wort darin kann nur
+    // von diesem Thread stammen. `system::userstack_lebendig_zaehlen()` zählt am Ende der Kurve
+    // genau das — und beantwortet damit die Frage, an der diese Reihe schon einmal gescheitert
+    // ist („3040 Prozesse", deren Threads alle sofort starben), mit einer WIRKUNG statt mit einem
+    // Eintrag in einer Tabelle.
+    //
+    // SAFETY: geschrieben wird 8 Byte unterhalb des eigenen `RSP`, also in den eigenen EL0-Stack.
+    // Auf x86-64 legt dort niemand etwas ab: ein Trap aus Ring 3 wechselt über `RSP0` den Stack.
+    unsafe {
+        core::arch::asm!("mov qword ptr [rsp - 8], rax", in("rax") KURVE_LEBENSSPUR);
+    }
     // SAFETY: `int 0x80` ist der für Ring 3 freigegebene Syscall-Vektor (s. `ring3_worker`).
     // `PARK` braucht KEINE Cap und keine PD — der Dispatch kehrt vor der Cap-Auflösung zurück.
     unsafe {
@@ -4169,6 +4324,15 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             // die Messung die volle Stackgroesse als benutzt. Ein Wasserzeichen, das immer „viel
             // Luft" sagt, ist damit strukturell ausgeschlossen und nicht bloss unwahrscheinlich.
             ("kstack", crate::kstackmark::urteil()),
+            // C7b: die **EL0-Wasserstandsmarke**. Sie gattert aus demselben Grund wie `kstack`,
+            // und ihr Kriterium ist gegen die WIRKUNG formuliert (benutzte Tiefe gegen die
+            // kleinste Region der Klasse). Erreichbar ist es gemessen und nicht gehofft.
+            //
+            // **Drei Wege, auf denen sie still gruen werden koennte, sind einzeln verstellt**:
+            // faellt die Nullung aus, ist der Fuss nicht null und `erschoepft > 0`; misst niemand,
+            // faellt `gemessen_tod`; und zeigt die Buchfuehrung auf eine FREMDE (genullte) Region,
+            // faellt die Tiefensonde -- den letzten Fall kann die Eichung strukturell nicht sehen.
+            ("ustack", crate::userstackmark::urteil()),
             // C9: die **Sperrhaltedauer-Marke**. Gattert von Anfang an, und ihr Kriterium ist
             // gegen die WIRKUNG formuliert (gemessene maskierte Dauer gegen einen Timer-Tick),
             // nicht gegen einen Zustand. Erreichbar ist es gemessen und nicht gehofft: der
@@ -4223,7 +4387,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 38;
+const DONE_FLAGS: usize = 39;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]
@@ -4648,6 +4812,115 @@ fn report_and_off(watchdog: bool) -> ! {
         println!(
             "kstackid: EL0-Kstack unter den eigenen Fuessen freigegeben={fuesse}; \
              Zombie-Region unter den eigenen Fuessen eingereiht={zomb_fuss} von {zomb_ges}"
+        );
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // C7b: DIE EL0-WASSERSTANDSMARKE -- wie tief ist der USER-Stack wirklich?
+    // ------------------------------------------------------------------------------------------
+    //
+    // Die Zeile darueber misst den EL1-Stack eines EL0-Threads. Diese misst die andere Seite
+    // desselben Threads: seine **private Region**, den EL0-Stack -- und die ist mit 2 MiB der
+    // groesste Einzelposten je Mandant (C7b: 2048 von rund 2076 KiB). Solange diese Zahl nicht
+    // gemessen ist, ist jede kleinere Regionsgroesse geraten.
+    //
+    // **Zuerst fegen, dann urteilen** -- aus demselben Grund wie oben: der Sterbepfad misst nur
+    // die Regionen sterbender Threads, die tiefsten Userland-Pfade fahren aber die langlebigen
+    // (Root-Task, Treiber-PDs). Und wie oben kann das Fegen das Urteil nur VERSCHLECHTERN, nie
+    // verbessern: es hebt den Hoechststand. Der Unterschied zwischen dem Gatter (das ohne den
+    // Fegelauf entscheidet) und dieser Zeile faellt damit fail-closed aus.
+    {
+        let (gefegt, tiefster) = system::userstack_marke_fegen();
+        let u = crate::userstackmark::marke();
+        let (s_gemessen, s_ok, s_tiefe) = crate::userstackmark::sonde_stand();
+        // **Zwei Groessen, zwei Zahlen** -- und sie werden getrennt gedruckt, weil sie aus
+        // verschiedenen Regionen stammen duerfen: der TIEFSTE Pfad in Bytes (er traegt die
+        // Summenbedingung) und der hoechste FUELLGRAD (er sagt, wie knapp es irgendwo wurde). In
+        // einer Klasse mit vier Regionsgroessen ist „45 %" ohne seine Region keine Aussage.
+        let tiefe_promille = if u.tiefste_groesse == 0 {
+            0
+        } else {
+            u.tiefe_max * 1000 / u.tiefste_groesse
+        };
+        println!(
+            "ustack  : Wasserstand EL0-USER-Stack -- Hoechststand {} von {} B ({}.{} % SEINER \
+             Region; hoechster Fuellgrad ueberhaupt {}.{} %, moeglicherweise in einer anderen) · \
+             {} registriert / {} gemessen ({} davon im \
+             Sterbepfad -- DIESE sieht das Gatter, {gefegt} am Schluss ueber LEBENDE Regionen \
+             gefegt) · Rekordhalter Thread-Slot {} · Regionsgroessen {}..{} B · Fuss nicht genullt: \
+             {} (muss 0 sein -- das heisst 'aufgebraucht ODER nie genullt', beide sollen dasselbe \
+             Urteil ausloesen) · nie benutzt: {} (Threads, die kein von Null verschiedenes Byte \
+             hinterlassen haben -- KEIN Messfehler, aber auch kein Beleg fuer Luft) · tiefster \
+             lebender Slot {}",
+            u.tiefe_max,
+            u.tiefste_groesse,
+            tiefe_promille / 10,
+            tiefe_promille % 10,
+            u.fuell_max_promille / 10,
+            u.fuell_max_promille % 10,
+            u.registriert,
+            u.gemessen,
+            u.gemessen_tod,
+            if u.tiefster_slot == usize::MAX { u64::MAX } else { u.tiefster_slot as u64 },
+            if u.groesse_min == usize::MAX { 0 } else { u.groesse_min },
+            u.groesse_max,
+            u.erschoepft,
+            u.nie_benutzt,
+            if tiefster == usize::MAX { u64::MAX } else { tiefster as u64 },
+        );
+        println!(
+            "ustack  : Herkunft -- sterbende Threads {} B, lebende {} B. **Die Klasse fasst VIER \
+             Groessen**: die private Region einer isolierten PD ({} B), die gefaerbte Region \
+             ({} B = colors::region_bytes), der User-Stack eines GELADENEN Programms (16384 B) \
+             und der SAS-Stack (65536 B). Deshalb traegt die Summenbedingung unten die KLEINSTE \
+             gemessene Region und nicht 'die' Groesse -- eine Klasse aus mehreren Groessen ist so \
+             tragfaehig wie ihr kleinstes Mitglied. **NICHT erfasst**: der Stack einer GEFAERBT \
+             geladenen PD (er liegt in Stuecken in der seglist der PD und gehoert nicht dem \
+             Thread) und die Userland-Tiefe zwischen zwei Messungen",
+            u.tiefe_tod,
+            u.tiefe_lebend,
+            hal::mmu::PRIV_REGION_SIZE,
+            crate::colors::region_bytes(),
+        );
+        println!(
+            "ustack  : Tiefensonde (Sprechprobe des GEMESSENEN PFADES) -- gemessen={s_gemessen} \
+             getroffen={s_ok} gemeldete Tiefe={s_tiefe} B gegen beruehrte {} B (+{} B Schlupf fuer \
+             ihren eigenen Rahmen). Sie prueft, was die Eichung strukturell NICHT kann: dass die \
+             Buchfuehrung Thread-Slot -> Region auf die RICHTIGE Region zeigt. Ein Eintrag, der \
+             auf irgendeine andere genullte Region zeigt, meldet 'viel Luft' und bestuende jede \
+             Eichung -- genau die Verwechslung, die die alte Kapazitaetszeile entwertet hat",
+            crate::userstackmark::SONDE_TIEFE,
+            crate::userstackmark::SONDE_SCHLUPF,
+        );
+        let (s_pfad, s_zweit, s_res, s_gr) = crate::userstackmark::summe();
+        println!(
+            "ustack  : SUMME (C7b, strukturell statt statistisch) -- tiefster Pfad {s_pfad} B + \
+             zweiter Summand {s_zweit} B + geforderte Reserve {s_res} B = {} B von {s_gr} B \
+             (kleinste Region). **Der zweite Summand ist auf EL0 NULL, und das ist eine Aussage \
+             ueber die Architektur, keine Bequemlichkeit**: ein Interrupt oder eine Exception aus \
+             Ring 3 wechselt IMMER den Stack (x86-64 laedt RSP0 aus der TSS, aarch64 laeuft auf \
+             SP_EL1) -- unterhalb des User-RSP legt niemand etwas ab. Das Gegenstueck des \
+             EL1-Stacks (Handler auf DEMSELBEN Stack) existiert hier nicht. Der einzige \
+             Mechanismus, der das aendern wuerde, sind Signal-Handler auf dem User-Stack; die gibt \
+             es in diesem System nicht. **VORBEHALT zum ERSTEN Summanden**: gemessen wird ueber \
+             die Nullung, ein mit NULL beschriebenes Stackwort ist also unsichtbar -- die Zahl ist \
+             eine UNTERGRENZE, und deshalb liegt die Regionsgroesse ein Vielfaches darueber und \
+             nicht knapp daneben",
+            s_pfad + s_zweit + s_res
+        );
+        println!(
+            "ustack  : {} (C7b: geforderte Mindestreserve {} B = 1/{} der kleinsten Region, \
+             Eichung {:#06b}/{:#06b}, mindestens {} Messungen vor dem Gatter)",
+            if crate::userstackmark::urteil() { "ALL PASS" } else { "FAILURES" },
+            crate::userstackmark::mindestreserve(if u.groesse_min == usize::MAX {
+                0
+            } else {
+                u.groesse_min
+            }),
+            crate::userstackmark::MIND_RESERVE_NENNER,
+            crate::userstackmark::eichstand(),
+            crate::userstackmark::EICH_ALLE,
+            crate::userstackmark::MIND_MESSUNGEN,
         );
     }
 
@@ -6326,6 +6599,7 @@ pub fn run(multiboot_info: u64) -> ! {
             system::reap();
             drv_service_step(archive);
             park_messen(); // laeuft genau einmal; das Urteil steht danach in `all_done()`
+            tiefensonde_messen(); // C7b, ebenso einmalig (Sprechprobe des gemessenen Pfades)
             let _ = quiesce_messen(); // Z23 S1, ebenso einmalig
             let _ = pd_threads_messen(); // Z22 P2 + die Z23-S1-REPLY-Messung, ebenso einmalig
             // C7. **Nicht in `all_done`**, obwohl beide dort gattern: `used_vspaces()` sperrt eine

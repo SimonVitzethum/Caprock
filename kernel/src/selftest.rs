@@ -27,7 +27,48 @@ pub fn run() {
     dmaaligntest();
     grossdmatest();
     kstackeichung();
+    userstackeichung();
     sperreichung();
+}
+
+/// **C7b: die Eichung der EL0-Wasserstandsmarke** — dieselbe Bauform wie [`kstackeichung`], und
+/// aus denselben zwei Gründen an dieser Stelle (das Urteil steht in `all_done()`, und das Eichfeld
+/// darf nur von einem Faden benutzt werden).
+///
+/// Der Unterschied zur EL1-Marke ist das Füllmittel: dort ein Muster, hier die **Nullung**, die
+/// der Allokator ohnehin macht (Datenremanenz). Geprüft werden deshalb dieselben drei Fälle mit
+/// vertauschten Rollen: **nicht genullt meldet 0** (der fail-closed-Fall — eine ausgefallene
+/// Nullung muss wie der schlimmste Messwert aussehen), **genullt und unberührt meldet die volle
+/// Länge**, und **bis zu einer bekannten Tiefe berührt meldet genau diese Tiefe**. Ohne den
+/// dritten Punkt bestünde die Zeile auch eine Funktion, die nur zwei Zahlen kennt.
+fn userstackeichung() {
+    let p = "ustack";
+    let bits = crate::userstackmark::eichung();
+    let mut fail = false;
+    check(
+        p,
+        bits & crate::userstackmark::EICH_SCHMUTZ != 0,
+        "NICHT genulltes Feld meldet 0 unberuehrte Bytes (Ausfall der Nullung = schlechtester Messwert)",
+        &mut fail,
+    );
+    check(
+        p,
+        bits & crate::userstackmark::EICH_VOLL != 0,
+        "genulltes, unberuehrtes Feld meldet die VOLLE Laenge",
+        &mut fail,
+    );
+    check(
+        p,
+        bits & crate::userstackmark::EICH_TIEFE != 0,
+        "bis zu bekannter Tiefe beruehrtes Feld meldet GENAU diese Tiefe",
+        &mut fail,
+    );
+    println!(
+        "ustack  : Eichung {:#06b} von {:#06b} -- {}",
+        bits,
+        crate::userstackmark::EICH_ALLE,
+        if fail { "FAILURES" } else { "das Messgeraet trennt" }
+    );
 }
 
 /// **C9: die Eichung der Sperrhaltedauer-Marke** — die Sprechprobe des MESSGERAETS, und

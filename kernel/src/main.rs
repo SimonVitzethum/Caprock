@@ -67,6 +67,11 @@ mod threads;
 /// Read-only TrustedSAS-Root-Key-DB (ext-28, ADR 0014) — autogeneriert von `tools/gen_trusted_key.py`,
 /// in den Kernel kompiliert, nur per Firmware-/Kernel-Update änderbar (nicht per Syscall).
 mod trusted_keys;
+/// C7b: die **EL0-Wasserstandsmarke** — wie tief ist der USER-Stack wirklich? Sie misst die
+/// private Region einer isolierten PD, also den grössten Einzelposten je Mandant. Arch-neutral;
+/// die Zähler laufen auf beiden Architekturen mit, die Berichtszeile steht heute nur auf x86
+/// (dieselbe Einordnung wie [`kstackmark`]).
+mod userstackmark;
 /// C8: der **Verifiziererthread** — `SYS_LOAD` verifiziert nicht mehr auf dem 16-KiB-Stack des
 /// Aufrufers, sondern auf seinem eigenen. Arch-neutral; gestartet aus beiden Hochlaufwegen.
 mod verifizierer;

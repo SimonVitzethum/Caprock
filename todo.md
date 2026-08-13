@@ -278,6 +278,22 @@ eigentliche Aussage dieses Datenpunkts.
 einmal in eine Kopie, und das ist jetzt **bewiesen statt gelesen**. Was *nicht* geht: „der Aufrufer
 hält den Spinlock" hat in SPARK **keine Ausdrucksform** — bleibt in beiden Sprachen ein Kommentar.
 
+**NACHGEMESSEN 2026-08-13: in VERUS hat er eine.** Nachgebaut an `kernel/src/system.rs:310`
+(`record_user_kstack`, heute ein Kommentar): ein `tracked struct SchedsGuard` mit privatem Feld,
+`lock()` als einzige Quelle, `requires` an der Engstelle. Drei Aufrufer, drei **verschiedene**
+Ausgänge — richtiger Kern `verified`; **fremder** Kern `precondition not satisfied`; selbstgebauter
+Beleg `constructor for an opaque datatype`. Unter `#![no_std]`, und `tracked`/`ghost` wird vor der
+Codeerzeugung gelöscht: **kein Byte, keine Halde.** Kosten: 9 Zeilen Zeugentyp, 8 Zeilen
+Sperrverträge, 1 `requires`, 1 Argument je Aufrufstelle.
+
+**Und `Parked`: JEIN.** `tracked` ist **affin, nicht linear** — eine Funktion, die den Zeugen
+fallenlässt, geht durch (2 verified, 0 errors). Eine automatische Leckprüfung wie SPARKs „leak
+proved" gibt es **nicht**. Mit einer Ghost-Bilanz geht es doch und ohne Halde (`spawn_parked` erhöht
+`offen`, `admit` senkt sie; `vergessen()` → `postcondition not satisfied`, `ordentlich()` →
+verified) — aber das ist eine Pflicht, die man **hinschreiben** muss, durch jede Signatur.
+**Das bleibt SPARKs einziger echter Vorsprung**, und er kostet in Verus eine Bilanz statt eines
+Schalters.
+
 **Zeit ist die schwächste Klasse** — `now += 1` formal offen (bei 100 Hz nach 5,8 Mrd. Jahren).
 
 **`Parked`: SPARK kann es besser — Fehler statt Warnung.** Gemessen an zwei Unterprogrammen, die
@@ -369,10 +385,55 @@ kein Entwurf.**
 Der Gewinn kam **nicht** aus „Ada ist sicherer", sondern daraus, dass GNATprove **jede**
 Indizierung und **jede** Arithmetik als Beweispflicht behandelt, während Verus nur beweist, was
 jemand modelliert hat. Das ist ein Argument für **mehr Beweisfläche**, nicht zwingend für einen
-Sprachwechsel: dieselben 15 Stellen wären mit Verus *am echten Code* (statt am Modell) erreichbar.
+Sprachwechsel.
 
-- [ ] **Die billigere Fassung derselben Wirkung:** das Verus-Modell des Cap-Space auf den echten
-      Code ziehen, statt ein Modell danebenzustellen — und die vier Zusicherungen oben aufnehmen.
+### NACHGEMESSEN 2026-08-13: Verus findet S1a UND S1b am echten Code — die Vermutung hält
+
+Die Gegenthese ist **bestätigt: es war die VOREINSTELLUNG, nicht die Sprache.** Mit
+`#[verifier::verify]` auf der `mod`-Zeile (bzw. `--no-external-by-default`) ist jede Indizierung und
+jede Arithmetik in gewöhnlichem Rust eine Beweispflicht, wie bei GNATprove.
+
+| | Meldung |
+|---|---|
+| **S1b** `space.rs:1067  refcount -= 1` | `possible arithmetic underflow/overflow` **und** `precondition not satisfied` — Rumpf unverändert |
+| **S1a** `space.rs:844  self.slots[ci]` | `precondition not satisfied`; das `self.slots[p]` eine Zeile darüber wird **entlastet** — der Melder ist trennscharf, nicht pauschal |
+
+**Die Zahl, an der der Vergleich hängt, sind zwei verschiedene Grössen** — die Verwechslung wäre der
+Fehler:
+
+* **Pflichten AUFWERFEN: 0 Zeilen je Zeile Code.** Ein Schalter. Delta zum Produktionstext über die
+  ganze Datei: **24 Zeilen, davon 21 Attributzeilen und 3 `derive` — kein einziger Funktionsrumpf.**
+* **Pflichten ENTLASTEN, an `delete_leaf` gemessen: 12 Zeilen Spezifikation auf 19 Zeilen Code
+  (0,63).** Danach bleibt **genau eine** Pflicht offen — S1b. Untergrenze: zwei Aufrufer-Verträge
+  sind `external_body`, also angenommen statt bewiesen.
+
+Lauf A (ganze Datei ohne `audit_cdt`): 48 von 67 Funktionen ohne offene Pflicht, 60 offene Pflichten
+(54 Indexgrenzen, 6 Arithmetik). Lauf B (+ `audit_cdt`): 90 — die 33 Zusatzzeilen dort sind
+**ausschliesslich Schleifenform** (`for` → `while`), keine Bedingung und kein Index geändert.
+
+- [ ] **S1c — das Überlauf-Gegenstück zu S1b, das SPARK NICHT nannte:**
+      `crates/caprock-cap/src/space.rs:543  self.objects[obj].refcount += 1;` in `copy`. Dieselbe
+      fehlende Schranke in der anderen Richtung. Praktisch gedeckt, weil der Refcount durch die
+      boot-dimensionierte Slot-Tabelle weit unter 2³² bleibt — **aber S1b war auch „praktisch"
+      gedeckt, bis es das nicht war.** Eine Schranke, die aus einer Grössenrelation folgt statt aus
+      der Struktur, verschwindet beim nächsten Messwert.
+- [ ] **`space.rs:170  &self.dma[..self.dn]`** in `Finalized::dma_regions` — hält, weil `push_dma`
+      `dn <= len` mitführt. **Das steht nirgends.** Eine Zusicherung, die niemand aufschreibt, ist
+      beim nächsten Umbau weg.
+- [ ] **I5 ist eine Lücke des MODELLS, nicht des Werkzeugs.** Verus verlangt `decreases` für **jede**
+      Schleife — strikt stärker als SPARK Silver, das Terminierung gar nicht fordert. Die
+      Terminierungsaussage über die Geschwisterkette fehlte also nicht, weil Verus sie nicht kann,
+      sondern weil das Modell sie nicht benutzt hat. Dieselbe Form wie „16 Beweisdateien, 0 errors"
+      sagt nichts über die neue Eigenschaft.
+- [ ] **Was der Umstellung im Weg steht, ist WERKZEUGREIFE, nicht Ausdruckskraft** — und das ist
+      der Posten, der zu beziffern wäre, bevor jemand `space.rs` dauerhaft unter Verus stellt:
+      vier reproduzierte Abstürze in Verus `0.2026.06.20` (der schwerste: `for i in 0..n { c[i] }`
+      **ausserhalb** eines `verus!`-Blocks, also genau auf dem Weg, der die GNATprove-Haltung gibt);
+      `IndexSetTrustedSpec` in vstd versiegelt, weshalb ein **eigener** Container `x[i] = v` keine
+      Vorbedingung geben kann (umgangen über einen `Deref`-Neutyp auf `Vec`); keine
+      vstd-Spezifikationen für Iterator-Adapter (`position`, `filter`, `count`, `copied`,
+      `enumerate`) — allein deswegen sind **6** Funktionen von `space.rs` unerreichbar;
+      `#[derive(Debug)]` unverifizierbar und `#[derive(PartialEq)]` **fällt durch**.
 
 **Werkzeugkette:** `alr install gnatprove` + `gnat_native`, vollständig unter `~/.alire`, ohne
 root. `tools/spark-beweis.sh` ist ein **Gatter** (Ratsche in beide Richtungen, Abdeckungsprüfung

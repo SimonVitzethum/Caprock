@@ -48,6 +48,10 @@ mod imp;
 // Gemeinsame API-Fläche beider Architekturen.
 pub mod cache_decode;
 pub mod fault;
+// Der zweite Summand der C4-Stackrechnung. Arch-neutral, weil er es INHALTLICH ist (zwei
+// Atomics); beide `exception`-Module reichen ihn weiter. Siehe Modul-Doku — eine zweite Kopie
+// je Architektur war genau der Fehler, der den aarch64-Bau gerissen hat.
+pub mod irqtiefe;
 // virtio-pci ist ein PCI-Standard und liegt deshalb arch-neutral (A-5.2); es braucht nur `cpu`
 // und `pcie`, die es auf beiden Zweigen gibt.
 pub mod virtio;

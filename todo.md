@@ -52,18 +52,51 @@ wurde erst sichtbar, als die davor benannt war** — ein Maximum verdeckt, was k
   besteht dort auch, `0b111111`), die **Berichtszeile und das Gatter** stehen nur im
   x86-Hochlaufweg — dieselbe Einordnung wie `kstackmark`. Zwei Gründe, beide benennbar: die
   Schuldliste enthält mit `console.rs` einen **x86-Pfad** (aarch64 hat einen anderen Konsolen-
-  treiber, dessen Zahl niemand gemessen hat), und die aarch64-Suite ist auf diesem Zweig
-  **vorbestehend rot** (s. C9e) — ein Gatter dort wäre nicht abnehmbar.
+  treiber, dessen Zahl niemand gemessen hat). Der **zweite** Grund ist seit dem 2026-08-13
+  weggefallen: die aarch64-Suite ist wieder grün (s. C9e). Ein Gatter dort ist damit abnehmbar,
+  und was noch fehlt, ist nur die aarch64-Konsolenzahl.
 
-* [ ] **C9e — VORBESTEHEND, nicht von mir: die aarch64-Suite ist auf `arch/x86_64` rot.**
-  `color : FAILURES` mit **lauter Nullen** (`in_mask=0 kernelseite=0 disjunkt=0 bilanz=0`),
-  danach Watchdog mit `offen: color`. **Gemessen, nicht vermutet:** 3 von 3 Läufen auf dem
-  *unveränderten* Baum (Dateien beiseitegelegt, `git checkout --`, gemessen, zurückgelegt), und
-  ebenso 3 von 3 mit meiner Marke — die Ausgabe ist in allen sechs Läufen zeichengleich.
-  Damit ist es **deterministisch und unabhängig von C9**, und es ist auch **nicht D13**: dort
-  waren die Farbzeilen byte-identisch zur *Referenz*, hier sind sie identisch **null**.
-  `CLAUDE.md` führt aarch64 weiter mit „`RUNS=6` → 6 von 6, `== ALL PASS ==`" vom 2026-08-02 —
-  diese Zahl ist überholt und sollte nicht als Stand gelesen werden.
+* [~] **C9e — BEHOBEN am 2026-08-13; was offen bleibt, ist die Klasse, nicht der Fall.**
+  Das Bild war `color : FAILURES` mit **lauter Nullen** (`in_mask=0 kernelseite=0 disjunkt=0
+  bilanz=0`, dabei `uebergross_abgewiesen=1`), danach Watchdog mit `offen: color` — 3 von 3
+  Läufen zeichengleich, also deterministisch und nicht D13.
+
+  **Die Ursache war eine Größenrelation, keine Nebenläufigkeit.** aarch64 hat 16 Farben, bei
+  `PARTITIONS = 4` ist ein Streifen also **4** Farben breit; ein EL0-Kernel-Stack ist dort
+  16 KiB = **4** Seiten und passte damit *genau* — die Eigenschaft „der Stack passt in seinen
+  Streifen" folgte aus `Stackseiten == Streifenbreite` und nicht aus der Struktur. Seit der
+  Wachseite (2026-08-10, `USER_KSTACK_ALLOC = USER_KSTACK_SIZE + PAGE`) fordert
+  `claim_user_kstack_masked` **5** aufeinanderfolgende Seiten an. Fünf aufeinanderfolgende
+  Seiten tragen fünf **verschiedene** Farben; in einen 4-Farben-Streifen passen sie an keiner
+  Adresse und bei keinem Füllstand. `alloc_colored` gab also **immer** `None`,
+  `spawn_isolated_colored` ebenso, und `run_color` fiel vor dem `if let` heraus — daher genau
+  die Felder null, die hinter dem `if let` entstehen, und `uebergross_abgewiesen` als einziges
+  auf 1.
+
+  Zwei Umstände, die es unsichtbar hielten: auf **x86** ist ein Streifen 16 lebendige Maskenbits
+  breit und der Stack seit C4 zwei Seiten — dort ist reichlich Luft. Und auf **aarch64 gibt es
+  die Wache gar nicht** (`hal::mmu::guard_unterstuetzt() == false`, `guard_unmap` ist ein
+  Zähler): die Seite, die jede gefärbte Stack-Anforderung unmöglich machte, tut auf dieser
+  Architektur nachweislich **nichts**.
+
+  **Behoben** durch `Allocator::alloc_colored_vorspann_in`: die ersten `n` Seiten einer
+  gefärbten Anforderung stehen unter keiner Farbbedingung. Das ist keine Aufweichung — eine
+  Wachseite trägt keine Daten und belegt kein Cache-Set; die Farbzusicherung sagt über sie
+  nichts aus. Dazu die Ausrichtung von `al` (16 KiB) auf `PAGE` gesenkt: mit 16-KiB-Ausrichtung
+  des **Blocks** wäre der Stack bei `roh + PAGE` gerade *nicht* streifenausgerichtet gewesen.
+  Belegt ohne QEMU (`caprock-mem`, `wachseite_sprengt_den_streifen_bei_16_farben`: 4 Seiten
+  passen, 5 nie, mit Vorspann wieder — und jede Stackseite im Streifen), Gegenprobe im Kernel
+  isoliert auf **einen** Parameter (`vorspann` 1 → 0 stellt das Bild zeichengleich wieder her,
+  jede andere Zeile bleibt grün).
+
+  **Was offen bleibt:**
+  - [ ] Eine gefärbte Anforderung, die **breiter ist als der Streifen**, ist strukturell
+        unerfüllbar und kommt trotzdem als `None` zurück — ununterscheidbar von „Speicher
+        alle". Genau daran hat diese Suche gehangen: das Fehlerbild sah nach Mangel aus.
+        Gefragt ist ein eigener Grund (`MANGEL_*` reicht nicht: es ist kein Mangel).
+  - [ ] `colors::region_bytes()` kennt die Schranke bereits (`Streifenbreite * PAGE`) —
+        `USER_KSTACK_ALLOC` prüft sie nirgends gegen. Zwei Größen, die zueinander passen
+        müssen, und keine Zeile, die es sagt.
 
 ---
 

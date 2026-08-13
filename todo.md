@@ -72,15 +72,6 @@ wurde erst sichtbar, als die davor benannt war** — ein Maximum verdeckt, was k
   darunter**. Prüfcode, kein Produktivpfad — deshalb (a) und nicht (c).
   *Weg:* die Arena braucht Exklusivität, nicht IRQ-Maskierung. Entweder die Messung aus dem
   kritischen Abschnitt heben oder ein Primitiv ohne Maskierung. Braucht eine eigene Gegenprobe.
-* [ ] **C9b — `crates/caprock-hal/src/x86_64/console.rs:87`: 64,9 Mio. Zyklen (23 ms, 2,3 Ticks).**
-  `_print` hält `CONSOLE` über das ganze `write_fmt`, und der 16550 wird **pollend** bedient.
-  Damit maskiert **jedes `println!`** die Interrupts so lange, wie die Zeile zum UART braucht —
-  und die Berichtszeilen dieses Kernels sind vierstellig lang. Das ist die unangenehmste der drei:
-  `_print` steht im **Produktivkernel**, im Hochlauf, im Panikpfad und in jedem Bericht.
-  *Abwägung, die dazugehört:* eine gepufferte Konsole verliert im Panikfall die letzten Zeilen —
-  und genau die braucht man dort. Also kein reines „Puffer davor", sondern eine Entscheidung.
-  *Nebenwirkung, schon sichtbar:* `loader.rs:1392` (`iface_record_or_check`) misst 7,6 Mio., weil
-  dort ein `println!` **unter** `IFACE_SEEN` steht — C9b schlägt durch jede Verschachtelung durch.
 * [ ] **C9c — `kernel/src/system.rs:9198`: 20,4 Mio. Zyklen (7,3 ms, 0,73 Ticks).**
   `purge_ipc_for_thread` hält `IPC_ORPHANS` als **äusseren** Lock über einen Sweep von
   O(Endpoints + Notifications) = 20 128 Einzelsperrungen — **je Thread-Tod**. Die

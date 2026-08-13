@@ -5281,3 +5281,22 @@ Pfad. Beim dritten Mal ist das Muster kein Zufall.
       Ein Programm, das gar nicht erst geladen wird, sieht von aussen aus wie eines, dessen
       Signal nicht ankommt.
 
+#### aus: C9. Sperrhaltedauer — die Marke steht, die drei Befunde sind offen (2026-08-12) (2026-08-13)
+* [x] **C9b — BEHOBEN (2026-08-13).** 69 100 174 Zyklen (2,46 Ticks) → **431 580–1 154 404
+  (15–41 Promille)**, Faktor rund 100, und die Haltung hängt nicht mehr an der Zeilenlänge.
+  **Beide naheliegenden Wege waren falsch, mit Zahlen ausgeschlossen:** je Byte kostet die
+  Formatierung 1,2 Zyklen, ein ausgegebenes Byte **40 754** (zwei VM-Exits) — „Formatierung aus
+  der Sperre heben" hätte 0,003 % entfernt; „Sperre je Zeile" war schon der Ist-Zustand. Und es
+  ist keine QEMU-Eigenschaft: auf Blech kostet dieselbe 1623-Zeichen-Zeile bei 115 200 Baud
+  141 ms = **14 Ticks**. Gebaut ist die Trennung der zwei Eigenschaften (`crates/caprock-hal/src/konsole.rs`):
+  **Unteilbarkeit** über ein Besitzrecht **ohne** Maskierung, **maskiert** nur noch ein einzelnes
+  `outb`, das `THRE`-Warten davor. Der Panikpfad blieb sperr- und atomicfrei.
+  **Die erste Fassung erzeugte genau die Falle, gegen die der Auftrag gewarnt hatte:** roh aus dem
+  Trap-Kontext gedruckt → in 8 Läufen **zwei zerrissene Zeilen, eine traf das Ergebniswort**
+  (`isohigh : ` ohne `SKIP`), die Zeile fiel aus der Signatur. Gefunden hat es ein **Zähler**
+  (`risse`, gattert), nicht das Gegenlesen.
+  Der Schuldposten für `konsole.rs` bleibt — mit **anderem Grund**: Blockgrössen 16/4/1 ergaben
+  denselben Ausreisser, die Zahl misst also einen **gestallten `outb`** (D13-Klasse) und nicht die
+  Sperrhaltung. *Eine Zahl, die sich durch die Änderung, die sie erzeugen müsste, nicht bewegt,
+  misst nicht die Sache.*
+

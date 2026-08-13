@@ -248,6 +248,139 @@ Nullaussage:
 - [ ] **Vergleiche innerhalb der Verus-Modelle.** Dort gelten dieselben Formen, aber die
       Suchmuster des Durchgangs (Shell-Vergleiche, Rust-Urteilszeilen) greifen nicht.
 
+## Z28. Syscall-ABIs als PLUGGABLE Module — entschieden 2026-08-13
+
+**Klasse:** Architektur · **Stand:** entschieden, nicht begonnen. Setzt die Nutzlast von
+[Z26/A3](#a3--das-kernel-primitiv-ist-gebaut-2026-08-10-was-steht-was-offen-ist-und-die-schwelle)
+voraus.
+
+Der Kernel kennt nur `(Gast, Slot, Anlass)` und **keine Semantik** — das ist gebaut. Daraus folgt
+eine Architektur, die bisher nur implizit da war: **das Syscall-ABI ist ein Userland-Begriff.**
+Prozess A → Linux, B → WASI, C → nativ ist ein Tabellenblick, kein Kernel-Umbau.
+
+### Die Gruppen — der Schnitt folgt dem GETEILTEN ZUSTAND, nicht der Syscall-Nummer
+
+Eine Zerlegung „je Syscall" wäre nominell: 350 Handler in **einer** PD teilen einen Adressraum,
+also erreicht jeder den Speicher jedes anderen — die Cap regelt, wer *gerufen* wird, nicht, wer
+*lesen* kann. Der tragende Schnitt ist der entlang der geteilten Datenstruktur:
+
+| Gruppe | teilt | Grösse |
+|---|---|---|
+| Prozess/Thread | TCB-Zustand, Scheduling | klein |
+| Zeit | Uhr, Timer | winzig |
+| Zufall | Entropiequelle | winzig |
+| Identität | uid/gid/Credentials | winzig |
+| Synchronisation | `futex`, Warteschlangen | klein |
+| Speicher | Speicherkarte | mittel |
+| fd/Dateien | fd-Tabelle, VFS | **gross** |
+| Netz | Sockets | **gross** |
+| Geräte | Geräte-Caps, DMA-Fenster | mittel |
+| Native Dienste | Caprock-Caps direkt | klein |
+
+**Die Verteilung der Grössen ist der eigentliche Befund: sechs sind winzig, zwei sind gross.**
+Genau das macht die Beweisstufe unten möglich — *man verifiziert, was klein ist, und **isoliert**,
+was gross ist.*
+
+**Die Gruppen tragen ABGESTUFTE AUTORITÄT, und das ist ihr Zweck.** Der Kernel lernt damit keine
+Syscall-Semantik, sondern **Autoritätsklassen**: eine Cap der Klasse „fs" darf Gast-Speicher
+berühren, eine der Klasse „Netz" keinen Vspace anfassen. Fünf bis zehn benannte Klassen sind
+**auditierbar**; eine freie Autoritätsmaske ist es nicht — dieselbe Entscheidung wie bei
+`IdentityReason` (geschlossenes Enum statt wählbarem Argument).
+
+- [ ] **Keine Auffanggruppe.** „Passt in keine Gruppe" braucht eine **benannte Absage**. Ein
+      „Sonstiges" würde zur Halde und erbte die **Vereinigung aller Autoritäten** — dann ist die
+      Klassifikation weg, und niemand merkt es.
+- [ ] **Routing je BEREICH, nicht nur je Gast.** Heute: ein Handler je Gast. Eine gemischte
+      Laufzeit braucht „0…350 an Linux, 400…750 an nativ". Der Schritt ist klein, solange die
+      Tabelle neu ist.
+- [ ] **Kein implizites Weiterreichen.** „Handler kennt N nicht → fällt an Linux durch" gäbe einem
+      Handler Autorität über einen Gast, der ihn **nie gewählt hat**. Nicht abgedeckt heisst
+      **faulten**; wer eine Rückfallebene will, trägt sie ausdrücklich ein.
+- [ ] **Gruppenübergreifende Syscalls kosten mehrere Umläufe.** `mmap` einer Datei berührt Speicher
+      *und* fs. Die Gruppen partitionieren den **Einstieg**, nicht die Arbeit. Wie teuer das ist,
+      hängt an der Zahl, die es im ganzen Baum nicht gibt (s. unten).
+
+### DMA erreicht den Kernel nicht — und das steht schon
+
+Die Forderung ist **strukturell erfüllt**, nicht durch Sorgfalt: `addr::Pa` und `addr::Iova` sind
+getrennte Typen, `DmaRegion::identity` wurde **absichtlich gelöscht**, IOVA-Fenster liegen
+**oberhalb `RAM_TOP`** mit Schutzbändern und ohne Wiederverwendung — oberhalb `RAM_TOP` kann eine
+IOVA nie zufällig eine gültige PA sein. Durchgesetzt wird es von der IOMMU, nicht vom Treiber.
+Ein Handler der Geräte-Gruppe **kann** also keine IOVA konstruieren, die Kernelspeicher benennt.
+
+- [ ] **Als Eigenschaft der GRUPPE festschreiben, nicht ihres Codes:** die Geräte-Gruppe ist die
+      einzige, die DMA-fähige Caps weitergibt. Heute folgt das aus dem Code; es gehört in die
+      Autoritätsklasse.
+
+### Die Beweisstufe: EINGESCHLOSSENHEIT statt Korrektheit
+
+**Die Eintrittskarte für ein Modul ist nicht „bewiesen richtig", sondern „kann nicht ausbrechen".**
+Das ist um Grössenordnungen billiger und im Projekt bereits das Muster: `caprock-part` und
+`caprock-fat` sind abhängigkeitsfrei und `forbid(unsafe_code)`, mit genau dieser Begründung —
+*fremde Plattenbytes werden nirgends mit Kernprivileg interpretiert.* Ein falsch gelesener
+FAT-Eintrag liefert Unsinn; er wird nicht zu Codeausführung.
+
+Die Eigenschaft zerfällt in vier, drei davon fast gratis:
+
+| Teil | wie |
+|---|---|
+| **keine fremde Logik ausführen** | in sicherem Rust gibt es keinen Weg von Bytes zu einem Funktionszeiger — dafür braucht es `transmute`. **`forbid(unsafe_code)` deckt es mechanisch ab** |
+| **keine Autorität ausserhalb der Gruppe** | die Cap — also ohnehin der Entwurf |
+| **Speichersicherheit** | fällt mit `forbid(unsafe_code)` ab |
+| **Termination** | **NICHT gratis.** Sicheres Rust darf ewig schleifen, und ein hängender Handler ist ein DoS für seinen Gast |
+
+- [ ] **Termination kernelseitig lösen, nicht durch Beweis:** eine **Frist** je umgeleitetem
+      Syscall, danach faultet der Gast mit benanntem Grund. Das ist die vorhandene
+      Fail-closed-Regel mit einer Uhr — und sie deckt zusätzlich den Fall ab, den kein Beweis
+      abdeckt: ein Handler, der auf etwas *anderes* wartet.
+
+- [ ] **Der Wächter ist der ERSTE Schritt, nicht das erste Modul.** Jedes registrierte
+      Handler-Modul muss `forbid(unsafe_code)` tragen und darf nur aus einer benannten Liste
+      abhängen — mechanisch prüfbar, mit Sprechprobe in **beide** Richtungen und als **Ratsche,
+      die nur fallen darf** (wie `IDENTITY_DEBTS`). Vorbild: `tools/kernel-grenze.sh`, das gerade
+      erst zwei neue Module namentlich gefangen hat. Kostet einen Nachmittag und gilt ab dann für
+      alles, was folgt.
+
+- [ ] **Die Marshalling-Naht braucht echte Aufmerksamkeit — sie ist die eine Tür.** Dort treffen
+      gastkontrollierte Bytes auf Handlercode. `forbid(unsafe_code)` **und** Prüfung des
+      Versionskopfs statt Interpretation. Ist sie nicht sauber, nützt die Sauberkeit aller 350
+      Module nichts, weil alle durch dieselbe Tür kommen.
+
+**Was bleibt und benannt gehört:** ein eingeschlossenes Modul kann weiterhin **falsch** sein. Das
+ist genau dann tragbar, wenn die Zerlegung hält — **ein Gast, eine Gruppe** —, denn dann ist ein
+falscher Handler das Problem *seines* Gastes und nicht des Systems. Diese Aussage ist der ganze
+Gewinn, und sie hängt an der Cap-Grenze, nicht am Code.
+
+### Volle Verifikation: wo sie trägt, und wo sie eine Wunschform bewiese
+
+- [ ] **Für ein NATIVES Caprock-ABI ist der Beweis von Ende zu Ende sinnvoll** — die Spezifikation
+      ist unsere. Hier zuerst anfangen, mit der kleinsten Gruppe (Zeit oder Identität).
+- [ ] **Für Linux nicht.** „Was Linux tut" existiert **nirgends formal**; man verifiziert gegen
+      *seine eigene* Spezifikation, und ob die Linux entspricht, ist unbewiesen — genau dort
+      wohnen die Kompatibilitätsfehler. Das ist wörtlich die Falle „ein Beweis, der die Wunschform
+      beweist, ist schlechter als keiner" (`send_no_loss` galt am echten Endpoint nicht), und es
+      deckt sich mit dem Registerbefund zu [Z16](#z16): **WSL1 scheiterte an der Verhaltenstreue**,
+      nicht an Speicherfehlern. Verifikation kauft Speichersicherheit und innere Konsistenz —
+      Verhaltenstreue kauft sie nicht. Ein verifizierter Linux-Handler ist deshalb **„bewiesen
+      gegen unser Modell"** zu beschriften, nicht „bewiesen".
+- [ ] **Modell-Treue-Wächter von Anfang an**, nicht nachträglich. Ohne ihn läuft das Modell vom
+      Code weg; dieses Projekt hat drei davon gebaut, weil genau das dreimal passiert ist.
+- [ ] **Beweisstufe als Zahl führen:** wie viele Module mit Beweis registriert sind und wie viele
+      ohne — als Ratsche, die nur fallen darf.
+
+### Die Zahl, an der das alles hängt
+
+**Es gibt im ganzen Baum keine Zyklenmessung eines IPC-Umlaufs.** Sie entscheidet, wie fein die
+Zerlegung sein darf (jede Gruppengrenze in einer Kette kostet einen weiteren Umlauf), ob ein
+Handler-Thread je Gast oder ein migrierender Thread nötig ist ([B](#b-thread-migration--rest)) —
+und ob der Kernel unter Druck doch ABI-Wissen bekommt, was die ganze Pluggability beendete.
+Die Schwelle steht seit dem 2026-08-10 fest: **umgeleiteter `getpid` ≤ 2000 Zyklen Median**.
+
+- [ ] **Messen, sobald die Nutzlast steht und die Maschine ruhig ist** — Handler in isolierter PD
+      **gegen** Handler in `TrustedSas`; die Differenz *ist* der Preis der Isolation. Dazu der
+      nackte IPC-Umlauf als Sockel. Nicht unter paralleler Last: dieser Messstand hat das Projekt
+      schon einmal mit 3,2-facher Überbuchung in die Irre geführt (D13).
+
 ## Z. Zielarchitektur (Stand 2026-07-29) — woran alles andere zu messen ist
 
 > **Reihenfolge und Begründung:** [docs/plan-betriebsbereit.md](docs/plan-betriebsbereit.md).

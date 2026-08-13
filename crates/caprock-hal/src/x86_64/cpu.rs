@@ -143,6 +143,18 @@ pub fn local_irq_save() -> u64 {
     f & RFLAGS_IF
 }
 
+/// Sind die Interrupts am eigenen Kern gerade **freigegeben** (RFLAGS.IF)?
+///
+/// **Wofuer das gebraucht wird** (C9b): wer mit maskierten IRQs hereinkommt, darf nicht darauf
+/// warten, dass ein Halter auf DEMSELBEN Kern fertig wird — der laeuft erst weiter, wenn wir
+/// zurueckkehren. Genau der reentrante Ticket-Deadlock, gegen den [`local_irq_save`] in
+/// `SpinLock::lock` steht. Wer die Frage nicht stellen kann, muss unbedingt maskieren; wer sie
+/// stellen kann, darf im harmlosen Fall warten statt Ausgabe zu verwuerfeln.
+#[inline(always)]
+pub fn irqs_freigegeben() -> bool {
+    read_rflags() & RFLAGS_IF != 0
+}
+
 /// Den von [`local_irq_save`] gesicherten Zustand wiederherstellen.
 pub fn local_irq_restore(state: u64) {
     if state & RFLAGS_IF != 0 {

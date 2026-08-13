@@ -11,6 +11,47 @@ ihrer Begründungen — die sind der Wert, nicht die Häkchen. Danach steht hier
 
 ---
 
+## C7b. Woraus die 2 MiB je isolierter PD bestehen — aufgeschlüsselt 2026-08-13
+
+**Klasse:** Kapazität / Produktziel · **Stand:** aufgeschlüsselt; die eine fehlende Messung ist
+benannt, der Hebel steht mit Zahlen
+
+Die Mandantendichte hängt an dieser Zahl (`RAM / Regionsgrösse`, s. C7), und sie war bisher eine
+Summe ohne Summanden. Gelesen im Quelltext, nicht geschätzt:
+
+| Posten | Grösse | was es ist |
+|---|---|---|
+| **private Region** | **2048 KiB** | **der EL0-Stack EINES Threads**, `mem_alloc_anywhere(2 MiB, 2 MiB)`, mit `zero_phys` genullt, abgebildet nach `SLOT_DATA` |
+| Seitentabellen | 20 KiB | 5 Rahmen, gemessen (C7) |
+| EL1-Kernel-Stack | 4 KiB | seit dem 2026-08-12; vorher 16 |
+| Guard-Page | 4 KiB | seit dem 2026-08-10 |
+| | **≈ 2076 KiB** | |
+
+**Der Befund: die 2 MiB sind GRANULARITÄT, nicht Bedarf.** `vspace_map_user_window` hat zwei
+Zweige — `len == TWO_MIB && phys % TWO_MIB == 0` bildet **einen 2-MiB-Block** ab (kein
+Seitentabellenrahmen), alles andere seitenweise **mit** einer Tabelle. Die Regionsgrösse ist also
+so gewählt, dass die Abbildung ein einziges Blatt ist und **4 KiB Seitentabelle spart**.
+
+**Die Rechnung dieses Tauschs ist eindeutig:** eine Region von 64 KiB kostet **+4 KiB** (eine
+Tabelle) und spart **1984 KiB**. Je PD stünde dann ≈ **92 KiB** statt 2076 — **Faktor 22 auf die
+Mandantendichte**. Auf 64 GiB RAM sind das rund **700 000** statt 32 000 isolierte PDs; die
+Schranke wäre dann wieder `NPDS = 10 000`, also eine Tabelle und kein Speicher.
+
+- [ ] **Die eine fehlende Messung: wie tief ist der EL0-Stack wirklich?** Ohne sie ist jede
+      kleinere Zahl geraten — dieselbe Lage wie beim EL1-Stack vor der Wasserstandsmarke.
+      **Und sie ist umsonst zu haben:** die Region wird bei der Zuteilung mit `zero_phys`
+      **genullt**, ein Füllmuster braucht es also gar nicht — das **höchste von Null verschiedene
+      Byte** ist der Wasserstand. Gemessen wird beim Teardown (dort steht die Region noch) und am
+      Schluss über die lebenden, genau wie `kstackmark` es für EL1 tut.
+- [ ] **Danach erst die Grösse senken**, und dann mit derselben Summenbedingung wie bei C4:
+      tiefster Pfad + Reserve ≤ Regionsgrösse. Eine Regionsgrösse, die nur den beobachteten
+      Höchststand trägt, ist statistisch und nicht strukturell.
+- [ ] **Der zweite Weg bleibt daneben stehen und ist der bessere, aber teurere:** die VA bei
+      2 MiB lassen und **lazy** unterlegen (Speicher-Server, [Z16](#z16) Stufe 1). Dann kostet
+      eine PD nur, was sie anfasst — und die Zahl hängt nicht mehr an einer Wahl, sondern am
+      Verhalten. Das ist derselbe Hebel, der in C7 schon als Prioritätsargument für den
+      Speicher-Server steht.
+
 ## C9. Sperrhaltedauer — die Marke steht, die drei Befunde sind offen (2026-08-12)
 
 Die **Sperrhaltedauer-Marke** misst seit dem 2026-08-12, wie lange der Kern am Stück mit

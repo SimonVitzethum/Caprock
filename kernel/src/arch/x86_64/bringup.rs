@@ -4634,6 +4634,23 @@ fn report_and_off(watchdog: bool) -> ! {
         );
     }
 
+    // **D15-Melder, arch-neutral gezaehlt und hier GEDRUCKT.** Ohne diese Zeile waere die
+    // Frage „gilt das auch auf x86?" nur zu beantworten, indem jemand denselben Melder ein zweites
+    // Mal baut -- und zwei Fassungen derselben Messung laufen auseinander. Gezaehlt wird der
+    // ZUSTAND (Identitaet des Kstack-Eigentuemers, Freigabe des eigenen Stacks), nicht der Ausgang.
+    {
+        let (spaet, fremd, fuesse, rec_ges, rec_stack) = crate::system::kstack_spaet_stats();
+        let (zomb_ges, zomb_fuss) = caprock_sched::zombie_fuss_stats();
+        println!(
+            "kstackid: spaet-am-wiedervergebenen-Slot={spaet} fremder-Kstack-freigegeben={fremd} \
+             (von {rec_ges} Aufraeumungen, {rec_stack} mit Stack)"
+        );
+        println!(
+            "kstackid: EL0-Kstack unter den eigenen Fuessen freigegeben={fuesse}; \
+             Zombie-Region unter den eigenen Fuessen eingereiht={zomb_fuss} von {zomb_ges}"
+        );
+    }
+
     // --- C9: DIE SPERRHALTEDAUER ----------------------------------------------------------------
     //
     // Steht direkt hinter `kstack`, weil beide dieselbe Bauform haben und dieselbe Klasse Fehler

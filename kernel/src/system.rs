@@ -109,12 +109,78 @@ struct KstackPool {
     /// Physische Basis des Kstacks je globalem Thread-Slot (`0` = keiner). Zur Boot-Zeit
     /// dimensioniert (Thread-Kapazität), s. [`configure`].
     base_of: Slab<u64>,
+    /// **Die GENERATION des Threads, dem dieser Kstack gehoert** (D15, 2026-08-13).
+    ///
+    /// `base_of` ist ueber den **Slot** indiziert, und ein Slot ist keine Identitaet: er wird nach
+    /// dem Thread-Tod wieder vergeben (`release_gid`, LIFO — der zuletzt freigegebene ist der
+    /// naechste ausgegebene). Eine Aufraeumung, die erst NACH der Freigabe der `gid` laeuft und
+    /// nur den Slot in der Hand haelt, gibt dann den Kernel-Stack seines **Nachfolgers** an den
+    /// Allokator zurueck. Mit der Generation daneben ist der Unterschied entscheidbar.
+    gen_of: Slab<u32>,
     live: usize,
+}
+
+// --- D15-Melder: die GELEGENHEIT, nicht der Treffer ------------------------------------------
+//
+// D15 ist ein Bild, kein Ereignis: ein EL0-Thread mit PC=0 (`EC=0x20 FAR=0`), danach der Kernel
+// selbst nach 0 (`EC=0x21 ELR=0`). Rate 0,225 % ueber 4000 aarch64-Laeufe — ein Melder, der nur
+// beim Unglueck spricht, ist in 443 von 444 Laeufen stumm. Diese drei Zaehler sprechen dagegen in
+// JEDEM Lauf, weil sie den ZUSTAND pruefen und nicht den Ausgang.
+
+/// Wie oft traf eine spaete Kstack-Aufraeumung einen Slot, der **schon wieder belegt** war.
+/// Das ist die Gelegenheit: ab hier bezeichnet die `gid` einen fremden, lebenden Thread.
+static KSTACK_SPAET_SLOT: AtomicU64 = AtomicU64::new(0);
+/// Wie oft haette diese Aufraeumung den Kstack eines **fremden** Threads freigegeben
+/// (`base_of` steht, aber die eingetragene Generation ist eine andere). Das ist der Treffer.
+static KSTACK_FREMD: AtomicU64 = AtomicU64::new(0);
+/// Wie oft gab der Kernel den Kernel-Stack frei, auf dem er **in diesem Moment selbst steht**.
+/// Deterministisch, kein Rennen — der Schaden entsteht erst, wenn ein anderer Kern die Region in
+/// diesem Fenster holt und nullt (jede Vergabe geht durch `zero_phys`).
+static KSTACK_UNTER_FUESSEN: AtomicU64 = AtomicU64::new(0);
+/// **Der Nenner.** Wie oft lief die spaete Aufraeumung ueberhaupt, und wie oft mit einem Stack in
+/// der Hand. Ohne ihn ist eine `0` oben nicht von „der Pfad lief nie" zu unterscheiden — ein leerer
+/// Lauf ist kein Testergebnis.
+static KSTACK_RECLAIM_GESAMT: AtomicU64 = AtomicU64::new(0);
+static KSTACK_RECLAIM_MIT_STACK: AtomicU64 = AtomicU64::new(0);
+
+// **Was hier NICHT mehr steht, und was die Messung dazu ergeben hat.** Am 2026-08-13 lief hier
+// zusaetzlich ein Kanarienvogel: nach dem `free_region` bekam die Wache der Region ein Magiewort,
+// und am spaetestmoeglichen Punkt (unmittelbar vor `mov sp, x0`) wurde nachgesehen, ob es noch
+// steht. Ergebnis ueber **4295 Fenster** (108 Laeufe): **0 fremde Vergaben, 0 tote Kanarienvoegel**
+// — das Fenster ist strukturell offen und wird unter dieser Last **nicht** genommen.
+//
+// Der Melder ist wieder ausgebaut, weil er in eine freigegebene Region SCHREIBT: er ist ein
+// Messwerkzeug und kein Kernelbestandteil. Die Zahl bleibt, der Schreibzugriff nicht. Was bleibt,
+// ist [`KSTACK_UNTER_FUESSEN`] — es zaehlt die Gelegenheit ohne einen einzigen Schreibzugriff.
+
+/// Zählerstände der D15-Melder:
+/// `(spaet_slot, fremd, unter_fuessen, reclaim_gesamt, reclaim_mit_stack)`.
+pub fn kstack_spaet_stats() -> (u64, u64, u64, u64, u64) {
+    (
+        KSTACK_SPAET_SLOT.load(Ordering::Relaxed),
+        KSTACK_FREMD.load(Ordering::Relaxed),
+        KSTACK_UNTER_FUESSEN.load(Ordering::Relaxed),
+        KSTACK_RECLAIM_GESAMT.load(Ordering::Relaxed),
+        KSTACK_RECLAIM_MIT_STACK.load(Ordering::Relaxed),
+    )
+}
+
+/// Eine Adresse auf dem **gerade benutzten** Kernel-Stack.
+///
+/// `#[inline(never)]` und `black_box`, damit der Anker wirklich einen Rahmen bekommt und nicht
+/// wegoptimiert wird. Gebraucht wird keine exakte SP-Ablesung, sondern die Antwort auf „liege ich
+/// in dieser Region" — dafuer genuegt irgendeine Adresse im aktuellen Rahmen, und die ist
+/// arch-neutral zu bekommen (kein `asm!`, also auch auf x86 dieselbe Zeile).
+#[inline(never)]
+fn stapeladresse() -> usize {
+    let anker = 0u8;
+    core::hint::black_box(&anker) as *const u8 as usize
 }
 /// Pool-Lock (nur `base_of`/`live`); NIE verschachtelt mit `MEM` gehalten (claim/reclaim nehmen die
 /// Locks sequenziell) -> keine Sperrordnungsverletzung; `MEM` ist ohnehin innerster Rang.
 static KSTACKS: SpinLock<KstackPool> = SpinLock::new(KstackPool {
     base_of: Slab::empty(),
+    gen_of: Slab::empty(),
     live: 0,
 });
 
@@ -235,21 +301,79 @@ fn release_user_kstack(base: usize) {
 /// Sperrordnung: `KSTACKS` ist ein Blatt (wie `FP_STATES`) und wird nirgends *ausserhalb* von
 /// `SCHEDS` gehalten, waehrend `SCHEDS` genommen wird — jeder Reclaim-Pfad gibt `SCHEDS` vorher
 /// frei (s. die Kommentare „KSTACKS allein"). Die Kante `SCHEDS -> KSTACKS` ist damit zyklusfrei.
-fn record_user_kstack(thread_slot: usize, base: usize) {
-    KSTACKS.lock().base_of[thread_slot] = base as u64;
+fn record_user_kstack(tid: ThreadId, base: usize) {
+    let mut p = KSTACKS.lock();
+    p.base_of[tid.slot()] = base as u64;
+    // D15: **die Identitaet, nicht nur der Index.** Wer den Stack zurueckgibt, muss belegen
+    // koennen, dass er derselbe Thread ist, der ihn genommen hat.
+    p.gen_of[tid.slot()] = tid.gen();
 }
 /// Beim Thread-Ende: den ggf. zugeordneten Kstack an `MEM` zurückgeben. No-Op für EL1-Threads.
-fn reclaim_user_kstack(thread_slot: usize) {
+fn reclaim_user_kstack(tid: ThreadId, anlass: &'static str) {
+    let thread_slot = tid.slot();
+    KSTACK_RECLAIM_GESAMT.fetch_add(1, Ordering::Relaxed);
+    // **D15-Melder 1 (Gelegenheit).** Ist der Slot in diesem Moment schon wieder belegt, bezeichnet
+    // die `gid` einen FREMDEN, lebenden Thread — jede Aufraeumung, die nur den Slot in der Hand
+    // hat, trifft ab hier ihn. Gezaehlt wird das unabhaengig davon, ob es diesmal schadet.
+    if caprock_sched::slot_in_use(thread_slot) {
+        KSTACK_SPAET_SLOT.fetch_add(1, Ordering::Relaxed);
+        println!(
+            "kstackid: SPAET via {anlass} -- Slot {thread_slot} ist bereits wieder belegt \
+             (aufgeraeumt wird fuer Generation {})",
+            tid.gen()
+        );
+    }
     let base = {
         let mut p = KSTACKS.lock();
         let b = p.base_of[thread_slot];
-        if b != 0 {
+        // **D15-Melder 2 (Treffer).** Steht ein Stack im Slot, dessen eingetragene Generation eine
+        // andere ist als die des Sterbenden, dann gehoert er dem NACHFOLGER. Ihn freizugeben hiesse,
+        // einem lebenden Thread den Kernel-Stack unter dem Frame wegzuziehen — und weil jede Vergabe
+        // durch `zero_phys` geht, waere sein gesicherter TrapFrame danach genullt: `elr=0`,
+        // `spsr=0` (= EL0t). Genau das Bild von D15.
+        let fremd = b != 0 && p.gen_of[thread_slot] != tid.gen();
+        if fremd {
+            KSTACK_FREMD.fetch_add(1, Ordering::Relaxed);
+            // **Laut, nicht nur gezaehlt.** Der Zaehler steht am Ende des Laufs; ein Lauf, der
+            // vorher stirbt, verliert ihn -- und genau die sterben interessieren. Die Zeile nennt
+            // Opfer und Region, damit ein spaeterer Sprung nach 0 zuzuordnen ist.
+            println!(
+                "kstackid: FREMD via {anlass} -- Slot {thread_slot} traegt Kstack {b:#x} der \
+                 Generation {}, aufgeraeumt wird aber fuer Generation {} \
+                 (Leck statt UAF: nicht freigegeben)",
+                p.gen_of[thread_slot],
+                tid.gen()
+            );
+        }
+        // **LECK STATT UAF** -- dieselbe Entscheidung wie beim Teardown-Token (ext-37). Der eigene
+        // Stack dieses Threads ist in diesem Fall ohnehin schon verloren: der Nachfolger hat den
+        // Eintrag beim `record_user_kstack` ueberschrieben, und eine Tabelle ueber dem SLOT hat
+        // dafuer keinen zweiten Platz. Ihn *ersatzweise* freizugeben heisst, den Stack eines
+        // LEBENDEN Threads herzugeben -- der Schaden ist dann nicht ein verlorenes Fragment,
+        // sondern ein genullter TrapFrame und ein Sprung nach 0.
+        if b != 0 && !fremd {
             p.base_of[thread_slot] = 0;
+            p.gen_of[thread_slot] = 0;
             p.live = p.live.saturating_sub(1);
         }
-        b
+        if fremd {
+            0
+        } else {
+            b
+        }
     };
     if base != 0 {
+        KSTACK_RECLAIM_MIT_STACK.fetch_add(1, Ordering::Relaxed);
+        // **D15-Melder 3 (deterministisch, kein Rennen).** Der haeufigste Aufrufweg ist
+        // `exit_current`/`el0_fault` — also der sterbende Thread SELBST, und auf aarch64 laeuft der
+        // Trap-Handler auf SP_EL1, also auf genau diesem Stack (die Vektortabelle hat keinen
+        // eigenen Exception-Stack). Die Region geht hier an den Allokator zurueck, waehrend der
+        // Kernel noch darauf rechnet; ein anderer Kern darf sie ab diesem Befehl holen und nullen.
+        let hier = stapeladresse() as u64;
+        let roh_u = base - caprock_mem::PAGE;
+        if hier >= roh_u && hier < roh_u + USER_KSTACK_ALLOC {
+            KSTACK_UNTER_FUESSEN.fetch_add(1, Ordering::Relaxed);
+        }
         // C4: **hier** wird der Wasserstand abgelesen, nicht im Bericht — beim Tod des Threads
         // steht sein tiefster Pfad noch im Speicher, nach der Freigabe gehoert die Region dem
         // naechsten Anforderer. Der haeufigste Aufrufweg ist `exit_current`, also der sterbende
@@ -794,14 +918,14 @@ impl SchedOps for KernelSched {
         // einzige Probe darauf, ob die Achse lückenlos ist.
         let next = charged(core, &mut SCHEDS[core].lock(), |s| s.exit_current(core, frame));
         purge_ipc_queues(tid); // eager: aus allen IPC-Queues entfernen (keine SCHEDS gehalten)
-        reclaim_user_kstack(tid.slot()); // EL0-Kernel-Stack-Pool-Slot zurückgeben (KSTACKS allein)
+        reclaim_user_kstack(tid, "exit_current"); // EL0-Kernel-Stack-Pool-Slot zurückgeben (KSTACKS allein)
         next
     }
     fn kill(&mut self, tid: ThreadId, core: usize) -> bool {
         let ok = SCHEDS[core].lock().kill(tid, core);
         if ok {
             purge_ipc_queues(tid); // eager: tote IPC-Queue-Einträge vermeiden
-            reclaim_user_kstack(tid.slot()); // getöteter EL0-Thread: Pool-Slot zurück
+            reclaim_user_kstack(tid, "SchedOps::kill"); // getöteter EL0-Thread: Pool-Slot zurück
         }
         ok
     }
@@ -1162,7 +1286,7 @@ fn el0_fault(frame: *mut TrapFrame, esr: u64, far: u64) -> *mut TrapFrame {
         (next, tid)
     }; // SCHEDS freigegeben
     purge_ipc_queues(tid); // eager: faultenden Thread aus allen IPC-Queues entfernen
-    reclaim_user_kstack(tid.slot()); // EL0-Kernel-Stack-Pool-Slot zurückgeben (KSTACKS allein)
+    reclaim_user_kstack(tid, "el0_fault"); // EL0-Kernel-Stack-Pool-Slot zurückgeben (KSTACKS allein)
     // War es eine isolierte PD, ihre VSpace abbauen. Sicher: `sync_vspace` oben hat
     // TTBR0 bereits auf den nächsten Thread umgeschaltet (nicht mehr die tote VSpace).
     let packed = vspace_of(tid.slot());
@@ -1170,6 +1294,10 @@ fn el0_fault(frame: *mut TrapFrame, esr: u64, far: u64) -> *mut TrapFrame {
         vspace_teardown((packed >> 48) as u16);
         set_vspace_of(tid.slot(), 0);
     }
+    // **Alles ab `reclaim_user_kstack` lief auf einer bereits freigegebenen Region** — auf aarch64
+    // benutzt der Trap-Pfad SP_EL1, und das ist der Kernel-Stack genau dieses Threads; erst der
+    // Vektor-Epilog (`mov sp, x0`) schaltet um. Gemessen als `KSTACK_UNTER_FUESSEN` (32,8 je Lauf);
+    // gemessen ist aber auch, dass das Fenster unter dieser Last nicht genommen wird (0 von 4295).
     next as *mut TrapFrame
 }
 
@@ -1365,6 +1493,21 @@ pub fn configure(cores: usize) -> (usize, usize, usize, u64) {
             .lock()
             .base_of
             .attach(ks as *mut u64, total, |_| 0u64)
+    };
+    // D15: die Generation neben der Basis. Eigene Tabelle statt Bits im `u64`: eine Generation in
+    // den unteren 12 Bits der (seitenausgerichteten) Basis waere nach 4096 Wiederverwendungen
+    // desselben Slots mehrdeutig — und der Churn-Test allein faehrt 2000 Zyklen ueber denselben
+    // LIFO-Kopf. Eine Ratsche mit Ueberlauf ist keine.
+    let ksg = table(
+        total * core::mem::size_of::<u32>(),
+        core::mem::align_of::<u32>().max(4096),
+    );
+    // SAFETY: wie oben.
+    unsafe {
+        KSTACKS
+            .lock()
+            .gen_of
+            .attach(ksg as *mut u32, total, |_| 0u32)
     };
 
     // **Rueckwaerts-Index Thread-Slot -> PD** (Z22 P2 / C4). Die vierte per-Thread-Tabelle, und
@@ -2601,7 +2744,7 @@ pub fn spawn_user_parked(entry: usize, arg: usize, prio: u8) -> Option<Parked> {
         if let Some(t) = r {
             fp_reset_slot(t.slot()); // frischer FP-Kontext, bevor der Thread laufen kann
             // Buchfuehrung NOCH UNTER SCHEDS -- s. Kommentar an `record_user_kstack`.
-            record_user_kstack(t.slot(), kbase); // Kstack dem Thread zuordnen
+            record_user_kstack(t, kbase); // Kstack dem Thread zuordnen
         }
         r
     }; // SCHEDS freigegeben
@@ -3314,7 +3457,7 @@ pub fn spawn_isolated_parked(entry: usize, arg: usize, prio: u8) -> Option<(Park
         if let Some(t) = r {
             fp_reset_slot(t.slot()); // FP + VSPACE_OF[slot]=0 (global) zurücksetzen
             // Buchfuehrung NOCH UNTER SCHEDS -- s. Kommentar an `record_user_kstack`.
-            record_user_kstack(t.slot(), kbase); // Kstack dem Thread zuordnen (reclaim!)
+            record_user_kstack(t, kbase); // Kstack dem Thread zuordnen (reclaim!)
             set_vspace_of(t.slot(), packed); // ab jetzt isoliert (nach fp_reset_slot!)
         }
         r
@@ -3479,7 +3622,7 @@ fn spawn_isolated_colored_inner(
         if let Some(t) = r {
             fp_reset_slot(t.slot());
             // Buchfuehrung NOCH UNTER SCHEDS -- s. Kommentar an `record_user_kstack`.
-            record_user_kstack(t.slot(), kbase);
+            record_user_kstack(t, kbase);
             set_vspace_of(t.slot(), packed); // nach fp_reset_slot!
         }
         r
@@ -3506,12 +3649,19 @@ pub fn destroy_isolated(tid: ThreadId) {
     let asid = (vspace_of(tid.slot()) >> 48) as u16;
     SCHEDS[core].lock().kill(tid, core); // ready -> Zombie (TCB-Slot frei, Stack vorgemerkt)
     purge_ipc_queues(tid); // eager: tote IPC-Queue-Einträge vermeiden
-    reap(); // Stack-Zombie an MEM zurueck (korrekte Lock-Ordnung: SCHEDS frei, dann MEM)
+    // **Erst alles erledigen, was `tid.slot()` braucht, DANN reapen** (D15, 2026-08-13).
+    //
+    // `reap()` ruft `release_gid` -- ab diesem Befehl darf die `gid` an einen anderen Thread gehen,
+    // und die Freiliste ist LIFO: der eben freigegebene Slot ist der **naechste ausgegebene**. Die
+    // beiden Zeilen darunter halten aber nur den Slot in der Hand, nicht die Identitaet; sie
+    // traefen dann den Nachfolger. `vspace_teardown` dazwischen ist obendrein der teuerste Schritt
+    // des ganzen Abbaus -- das Fenster war also nicht schmal, sondern das breiteste im Pfad.
     if asid != 0 {
         vspace_teardown(asid); // L1/L2/L3 + geladene Segmente an MEM, ASID-Slot frei, TLB-Flush
         set_vspace_of(tid.slot(), 0);
     }
-    reclaim_user_kstack(tid.slot());
+    reclaim_user_kstack(tid, "destroy_isolated");
+    reap(); // Stack-Zombie an MEM zurueck (korrekte Lock-Ordnung: SCHEDS frei, dann MEM)
 }
 
 /// Einen **geladenen Prozess vollständig abbauen** (ext-26, L4): die im Cspace seiner PD
@@ -3640,7 +3790,7 @@ pub fn spawn_isolated_native_parked(code: *const u8, code_len: usize, prio: u8) 
         if let Some(t) = r {
             fp_reset_slot(t.slot());
             // Buchfuehrung NOCH UNTER SCHEDS -- s. Kommentar an `record_user_kstack`.
-            record_user_kstack(t.slot(), kbase); // Kstack dem Thread zuordnen (reclaim!)
+            record_user_kstack(t, kbase); // Kstack dem Thread zuordnen (reclaim!)
             set_vspace_of(t.slot(), packed); // nach fp_reset_slot!
         }
         r
@@ -4526,7 +4676,7 @@ pub fn load_into_pd_mit(
             // Buchfuehrung NOCH UNTER SCHEDS -- s. Kommentar an `record_user_kstack`. Hier waere
             // sie auch danach sicher (`local_irq_save` oben), aber die Form bleibt ueberall gleich:
             // eine Ausnahme, die nur unter einer Zusatzbedingung stimmt, ist eine kuenftige Falle.
-            record_user_kstack(t.slot(), kbase);
+            record_user_kstack(t, kbase);
             set_vspace_of(t.slot(), ((asid as u64) << 48) | l1); // isoliert (nach fp_reset_slot!)
         }
         r
@@ -7687,6 +7837,19 @@ pub(crate) mod testsupport {
         super::KSTACKS.lock().base_of[thread_slot]
     }
 
+    // **Die D15-Gegenprobe stand hier und ist wieder ausgebaut** (2026-08-13). Sie nullte den
+    // Kernel-Stack eines LEBENDEN, noch geparkten EL0-Threads -- woertlich das, was der naechste
+    // Anforderer der Region taete (`mem_alloc` -> `zero_phys`) -- und liess ihn dann zu.
+    //
+    // Ergebnis, zeichengleich mit dem D15-Protokoll:
+    //   `el0-trap: User-Thread 0x7d100000020 faultete (EC=0x20 FAR=0x0000000000000000)`
+    // Der Grund steht in `init_thread_frame`: dort ist `elr=entry` und `spsr=0` (EL0t). Genullt
+    // ergibt das `elr=0, spsr=0` -> `eret` nach EL0 mit PC 0.
+    //
+    // Die zweite Haelfte des Bildes (`EC=0x21 ELR=0` im Kernel) kam aus der Gegenprobe im
+    // Freigabepfad selbst; beide sind in `docs/befunde/d15/` beschrieben. Der Code bleibt draussen:
+    // er reisst den Lauf absichtlich und hat in einem gruenen Kernel nichts zu suchen.
+
     /// Die beiden obersten Seitentabellen der VSpace `asid` (`(l1, l2)`), oder `(0, 0)`.
     pub fn vspace_tables_of(asid: u16) -> (u64, u64) {
         if asid == 0 || asid as usize > super::MAX_VSPACES {
@@ -7922,7 +8085,7 @@ pub fn kill_local(tid: ThreadId) -> bool {
     let ok = SCHEDS[core].lock().kill(tid, core);
     if ok {
         purge_ipc_queues(tid); // eager: tote IPC-Queue-Einträge vermeiden
-        reclaim_user_kstack(tid.slot()); // falls EL0-Thread: Pool-Slot zurück
+        reclaim_user_kstack(tid, "kill_local"); // falls EL0-Thread: Pool-Slot zurück
     }
     ok
 }
@@ -7995,7 +8158,7 @@ pub fn kill_remote(tid: ThreadId) -> bool {
     let ok = with_owner(tid, |s, c| s.kill(tid, c).then_some(())).is_some();
     if ok {
         purge_ipc_queues(tid);
-        reclaim_user_kstack(tid.slot());
+        reclaim_user_kstack(tid, "kill_remote");
         // Der Zielkern soll bald reapen; er kann inzwischen ein anderer sein — der IPI geht
         // an den Kern, auf dem der Kill tatsächlich stattfand.
         if let Some(c) = caprock_sched::owner_core(tid) {

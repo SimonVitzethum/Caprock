@@ -166,6 +166,54 @@ pub fn release_gid(gid: u32) {
     GID_FREE.lock().free(gid as usize);
 }
 
+/// **Ist dieser globale Thread-Slot GERADE belegt — gleich von wem?** (D15-Melder)
+///
+/// [`is_live`] beantwortet eine andere Frage: „lebt *dieser* Thread noch" — es prueft `gid` **und**
+/// Generation und meldet deshalb `false`, sobald der Slot an einen ANDEREN Thread weitergegangen
+/// ist. Genau dieser Fall ist aber der gefaehrliche: eine spaete Aufraeumung, die nur die `gid`
+/// (nicht die Identitaet) in der Hand haelt, trifft dann einen **fremden, lebenden** Thread.
+///
+/// Der Unterschied zaehlt in JEDEM Lauf, auch ohne Unglueck — er ist die **Gelegenheit**, nicht der
+/// Treffer. Bei einer Trefferquote um 0,2 % ist ein Melder, der nur beim Unglueck spricht, in 443
+/// von 444 Laeufen stumm.
+pub fn slot_in_use(gid: usize) -> bool {
+    dir_load(gid).map(|e| e & D_USED != 0).unwrap_or(false)
+}
+
+// --- D15-Melder: Zombie-Region unter den eigenen Fuessen -------------------------------------
+//
+// `record_zombie` legt die Stack-Region des Sterbenden in den Zombie-Ring; von dort gibt SIE JEDER
+// Kern per `reap_core` an den Allokator zurueck (die Funktion ist ausdruecklich kern-uebergreifend).
+// Beim Selbst-Ende (`exit_current`) ist das aber genau die Region, auf der der Kernel in diesem
+// Moment noch rechnet: der Trap-Handler laeuft auf SP_EL1, und das ist bei einem EL1-Thread SEIN
+// Stack. Zwischen `record_zombie` und dem `mov sp, x0` des Vektor-Epilogs darf ein fremder Kern die
+// Region also holen — und jede Vergabe des Kernels nullt.
+//
+// Gezaehlt wird die **Gelegenheit** (liegt der eigene Rahmen in der Region, die gerade zum Abholen
+// freigegeben wird?), nicht der Ausgang. Das ist in jedem Lauf pruefbar.
+static ZOMBIE_GESAMT: AtomicU64 = AtomicU64::new(0);
+static ZOMBIE_UNTER_FUESSEN: AtomicU64 = AtomicU64::new(0);
+
+/// `(aufgezeichnete Zombies mit Region, davon unter den eigenen Fuessen)`.
+pub fn zombie_fuss_stats() -> (u64, u64) {
+    (
+        ZOMBIE_GESAMT.load(Ordering::Relaxed),
+        ZOMBIE_UNTER_FUESSEN.load(Ordering::Relaxed),
+    )
+}
+
+/// Eine Adresse im **aktuellen** Stack-Rahmen (arch-neutral, ohne `asm!`).
+#[inline(never)]
+fn stapeladresse() -> usize {
+    let anker = 0u8;
+    core::hint::black_box(&anker) as *const u8 as usize
+}
+
+// Hier stand am 2026-08-13 zusaetzlich ein Kanarienvogel am Boden der Region, den der Kernel am
+// spaetestmoeglichen Punkt gegenlas. Ergebnis ueber 4295 Fenster (108 Laeufe): **0 Diebstaehle**.
+// Ausgebaut, weil er in eine zur Abholung freigegebene Region schreibt — ein Messwerkzeug, kein
+// Kernelbestandteil. Die Gelegenheit zaehlt der Zaehler oben weiter, ohne einen Schreibzugriff.
+
 // ---------------------------------------------------------------------------------------
 // ThreadId
 // ---------------------------------------------------------------------------------------
@@ -193,6 +241,14 @@ impl ThreadId {
     /// **Überlebt eine Migration** (anders als früher kodiert er den Kern NICHT mehr).
     pub fn slot(self) -> usize {
         self.slot
+    }
+    /// **Die Generation** — der Teil der Identitaet, den [`ThreadId::slot`] gerade NICHT traegt.
+    ///
+    /// Wer eine per-Thread-Tabelle ueber `slot()` indiziert, hat den Slot und nicht den Thread. Die
+    /// Generation daneben zu legen macht aus einem Index wieder eine Identitaet — und genau das
+    /// unterscheidet „ich raeume meinen Kstack auf" von „ich raeume den seines Nachfolgers auf".
+    pub fn gen(self) -> u32 {
+        self.gen
     }
 }
 
@@ -1914,6 +1970,15 @@ impl Scheduler {
         self.free.free(local);
         self.used -= 1;
         CORE_LOAD[self.core].store(self.used, Ordering::Relaxed);
+        // D15-Melder: siehe `zombie_fuss_stats`. Ab dem Einreihen darf JEDER Kern die Region
+        // abholen und freigeben — auch die, auf der dieser Aufruf gerade steht.
+        if len != 0 {
+            ZOMBIE_GESAMT.fetch_add(1, Ordering::Relaxed);
+            let hier = stapeladresse();
+            if hier >= base && hier < base + len {
+                ZOMBIE_UNTER_FUESSEN.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         // Zombie IMMER aufzeichnen (auch ohne Stack): die `gid` muss zurück in die
         // Thread-Freiliste, und das darf nur außerhalb des Scheduler-Locks passieren.
         if self.zcount < self.zombies.len() {

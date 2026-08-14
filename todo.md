@@ -440,6 +440,32 @@ root. `tools/spark-beweis.sh` ist ein **Gatter** (Ratsche in beide Richtungen, A
 gegen heimliches `SPARK_Mode => Off`, zu wenige Prüfungen gelten als **ausgefallener** Lauf) und
 hat beim ersten Lauf einen eigenen Fehler gefangen.
 
+## S3. Ungeschützte Subtraktionen — 18 Fundstellen, gefunden beim Gabbro-Papiertest (2026-08-14)
+
+`[profile.release]` in `Cargo.toml` setzt **kein** `overflow-checks` — im Release ist ein Unterlauf
+also **still**, kein Absturz. Ein Papiertest für Gabbros Bereichstypen hat den Baum daraufhin
+abgesucht und **18 ungedeckte Subtraktionen** gefunden. **Nachgeprüft habe ich zwei; beide
+existieren.**
+
+- [ ] **S3a — `kernel/src/system.rs:4092`: `total - src.len()` als Länge eines `write_bytes` in
+      `unsafe`.** Der SAFETY-Kommentar *behauptet* `total >= src.len()` („auf Seiten aufgerundet"),
+      **erzwungen wird es nicht**. Bei `total < src.len()` entsteht eine riesige Länge und
+      `write_bytes` läuft über den Frame hinaus — im Release ohne Vorwarnung.
+      **Das ist die schwerste der 18.** Eine Zusicherung, die nur im Kommentar steht, ist die
+      Klasse „ein Wächter prüft die EXISTENZ eines Grundes, nie seine WAHRHEIT".
+- [ ] **S3b — `kernel/src/system.rs:4405`: `(b[i] - b'0')` ohne Ziffernprüfung** über
+      `env!("CAPROCK_MELDESTELLEN")`. **Milder als gemeldet:** es steht in einem `const`-Initialisierer,
+      und dort fängt rustc den Unterlauf zur Übersetzungszeit. Bleibt: die Ableitung nimmt
+      stillschweigend an, dass `build.rs` nur Ziffern liefert — **eine Annahme ohne Prüfung an einer
+      Stelle, die eine Ratsche trägt.**
+- [ ] **Die übrigen 16 sind nicht einzeln nachgeprüft.** Bemerkenswert am Befund: **an dreien
+      existiert dieselbe Rechnung anderswo im Baum MIT Schutz** — es ist also keine Entwurfshaltung,
+      sondern eine ungleichmässig durchgehaltene.
+
+**Warum es hier steht und nicht im Gabbro-Ordner:** das sind Fundstellen in Caprock, unabhängig
+davon, ob Gabbro je entsteht. Ein Bereichstyp hätte alle 18 zur Übersetzungszeit gefangen — das ist
+der Nebenertrag, nicht der Punkt.
+
 ## Z28. Syscall-ABIs als PLUGGABLE Module — entschieden 2026-08-13
 
 **Klasse:** Architektur · **Stand:** entschieden, nicht begonnen. Setzt die Nutzlast von

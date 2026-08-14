@@ -440,6 +440,30 @@ root. `tools/spark-beweis.sh` ist ein **Gatter** (Ratsche in beide Richtungen, A
 gegen heimliches `SPARK_Mode => Off`, zu wenige Prüfungen gelten als **ausgefallener** Lauf) und
 hat beim ersten Lauf einen eigenen Fehler gefangen.
 
+## S4. `kstack` — das Gatter urteilt FRÜHER als der Bericht (2026-08-14)
+
+`crate::kstackmark::urteil()` wird **zweimal** gerufen: `bringup.rs:4345` im **Gatter** (die Liste,
+die `== ALL PASS ==` entscheidet) und `bringup.rs:4824` in der **Berichtszeile**. Dazwischen liegen
+rund 480 Zeilen Bericht — und die gemessenen Größen `TIEFE_MAX`/`FREI_MIN` sind `fetch_max`/
+`fetch_min`, also **monoton**: jede weitere Stacknutzung kann sie nur verschlechtern.
+
+**Damit ist ein Lauf möglich, der `kstack : FAILURES` druckt und trotzdem `== ALL PASS ==` meldet.**
+Die Gegenrichtung ist strukturell ausgeschlossen (die Marken werden nie besser), also ist es genau
+die gefährliche Hälfte: **das Urteil ist milder als die Messung.**
+
+Dieselbe Klasse wie zwei bereits bezahlte Fallen, nur seitenverkehrt: „ein Urteil, das in
+`all_done()` steht, darf nicht erst im Bericht entstehen" — hier entsteht die **Messung** nach dem
+Urteil. Und „**WER MISST, SETZT DIE MARKE** — der gemessene Pfad darf sie weder setzen noch
+löschen": der Berichtspfad benutzt denselben Stack, den er misst.
+
+- [ ] **Aus dem Quelltext gelesen, NICHT gefahren.** Ob die Differenz je auftritt, ist offen — die
+      Reserve ist großzügig. **Das ändert nichts an der Form:** ein Gatter, das früher urteilt als
+      seine Messung, ist kein Gatter, sondern eine Momentaufnahme.
+- [ ] **Prüfen, ob `ustack` dieselbe Form hat** (der Befund nennt beide).
+- [ ] Die naheliegende Behebung — **einmal** messen, den Wert festhalten, Gatter und Bericht aus
+      **derselben** Ablesung speisen — ist dieselbe wie bei `drv : ALL PASS` („ein Wert wird dort
+      erfasst, wo die Aussage gilt, nicht dort, wo sie gedruckt wird").
+
 ## S3. Ungeschützte Subtraktionen — 18 Fundstellen, gefunden beim Gabbro-Papiertest (2026-08-14)
 
 `[profile.release]` in `Cargo.toml` setzt **kein** `overflow-checks` — im Release ist ein Unterlauf

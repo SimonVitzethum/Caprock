@@ -618,7 +618,7 @@ pub fn handler_fault_count() -> usize {
     HANDLER_FAULTS.load(Ordering::Relaxed)
 }
 
-// --- Lazy-FP-Zustand ---
+// --- FP-Zustand: EAGER auf x86_64, lazy auf aarch64 ---
 //
 // Pro Kern besitzt höchstens ein Thread die FP/SIMD-Register (der „FP-Owner").
 // FP wird beim Kontextwechsel NICHT gesichert; erst ein FP-Trap (EC 0x07) eines
@@ -660,7 +660,14 @@ static NM_TRAPS: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORE
 /// (fp_trap hält SCHED; spawn ebenfalls) -> für gleiche Slots serialisiert,
 /// verschiedene Slots sind disjunkt. Lock-Ordnung: …->SCHED->FP_STATES (innerste).
 static FP_STATES: SpinLock<Slab<FpState>> = SpinLock::new(Slab::empty());
-/// Zähler abgeschlossener Lazy-FP-Owner-Wechsel (Save+Restore), für den Test.
+/// Zähler abgeschlossener FP-Owner-Wechsel (Save+Restore), für den Test.
+///
+/// **Berichtigt 2026-08-14: hier stand „Lazy-FP-Owner-Wechsel".** Auf **x86_64 ist das Schema
+/// EAGER** (s. `sync_fp_trap`: „Der Auslöser des Wechsels ist der WECHSEL, nicht der erste
+/// Zugriff", `CR0.TS` bleibt aus, ein `#NM` ist per Definition ein Kernelfehler). Lazy ist der
+/// **aarch64**-Pfad. Ein Papiertest hat aus genau diesem Kommentar auf den Mechanismus
+/// geschlossen und ihn falsch berichtet — **einen Namen gelesen statt die Sache**, und der Name
+/// war seit der Eager-Umstellung veraltet.
 static FP_SWITCHES: AtomicUsize = AtomicUsize::new(0);
 /// **Die Sprechprobe der FP-Sonde: wie oft wurde der Zustand DIESES Threads restauriert.**
 ///

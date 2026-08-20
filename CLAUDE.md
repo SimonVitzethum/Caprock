@@ -3,6 +3,76 @@
 Faehigkeitsbasierter Mikrokern in Rust, von Grund auf geschrieben — kein seL4-Fork.
 Stand dieser Notiz: 2026-08-03. Nur Geprueftes.
 
+## Das Ziel (festgehalten 2026-08-17)
+
+**Caprock OS wird am Ende vollstaendig in Gabbro geschrieben — Kern, Treiber, Desktop — und
+formal verifiziert. Fuer Nutzbarkeit laeuft daneben Unverifiziertes: Linux-Treiber und
+Binaerkompatibilitaet.**
+
+Die Aufteilung, die das Ziel tragfaehig macht — und sie ist **je Eigenschaft**, nicht global:
+
+| | in Gabbro, verifiziert | unverifiziert, eingeschlossen |
+|---|---|---|
+| **was** | Kern, Isolationsmechanik, Compositor-Kern, eigene Treiber | Linux-Treiber in PDs, Linux-Binaries ueber die Persoenlichkeit, fremde Anwendungen |
+| **Zusage** | bewiesen gegen eine Spezifikation, unter benannten Annahmen | **kann nicht ausbrechen** — IOMMU, Caps, PD-Grenze |
+
+**Die belastbare Fassung der Zusage lautet nicht „alles ist bewiesen, also sicher", sondern:
+„das Unbewiesene kann nicht ausbrechen".** Das ist praezise das, was seL4 beweist, es ist
+pruefbar, und es ist die staerkere Aussage — denn „vollstaendig sicher" waere selbst mit einem
+vollstaendigen Beweis falsch: ein Beweis gilt gegen eine **Spezifikation**, unter Annahmen ueber
+Uebersetzer, Hardware, DMA und Initialisierung. Eine falsche Spezifikation beweist man mit.
+
+Daraus folgt die Reihenfolge, die alles andere ordnet: **erst die Einschliessung, dann der
+Beweis.** Ein Linux-Treiber in einer IOMMU-begrenzten PD traegt die Zusage schon heute; ein
+Beweis ueber ihn wird es nie geben.
+
+Die Ausarbeitung mit Messwerten liegt in `TODO0.md` (Strangplan Grafik/Userland) und in
+`~/Dokumente/Caprock OS/` (Messreihe vom 2026-08-17).
+
+## LANGUAGE RULE — everything new is English (decided 2026-08-17)
+
+**All new content is written in English. This applies even when the surrounding file is German.**
+A new section inside `todo.md` is English. A new comment in a German-commented module is English.
+The repository becomes bilingual **by date**, which it already is through its commit history —
+that is the intended outcome, not an accident.
+
+Scope, so nobody has to guess:
+
+| new | language |
+|---|---|
+| identifiers (`fn`, `struct`, `const`, `static`, test names) | **English** |
+| comments and doc-comments | **English** |
+| report lines, log output, error strings | **English** |
+| shell/Python scripts: comments and output | **English** |
+| new documents, and **new sections inside existing German documents** | **English** |
+| commit messages | **English** |
+
+### THE ONE EXCEPTION — and it is a safety rule, not a style rule
+
+**Never rename an existing German identifier as a drive-by.** Measured 2026-08-17: the tree holds
+**286** German declarations with **1 879** occurrences, and **40 of them are grepped by name from
+`tools/*.sh` and `tools/*.py`** — among them `MELDESTELLEN`, `ERLAUBTE_SPAETBINDUNGEN`,
+`MANGEL_VERGIFTET`, `SpaetbindungsGrund`, `bindung_vorhanden_heisst_niemals_kernel`.
+
+> **A renamed identifier whose guard does not move with it finds nothing — and a guard that finds
+> nothing looks exactly like a passing test.** This repository has already paid for that failure
+> mode (`pdbind : FAILURES` while the suite reported `== ALL PASS ==`).
+
+So: **new declarations are English; references to existing German declarations stay German.**
+A deliberate rename is allowed only as its own atomic change — identifier and guard together —
+followed by **the counter-proofs, not the suite**: every mutation that failed before must fail
+again afterwards. If one suddenly passes, its guard went blind during the rename.
+
+### What is NOT being done
+
+The existing **35 913 German lines** of comments and documentation are **not** retranslated.
+`done.md`, `todo.md` and the trap register in this file are the project's memory; their precision
+is their value, and a machine translation yields usable English and a **blunter claim**. Full
+back-translation is only worth it if the goal becomes public contribution — that decision has not
+been made.
+
+**Gabbro is unaffected:** decision E1 stands — English keywords, German prose.
+
 ## Wo die Wahrheit steht
 
 Diese Datei ist eine Einstiegshilfe, keine Quelle. Fuer alles Inhaltliche gilt:

@@ -425,6 +425,46 @@ pub fn fault_overflow() -> bool {
 /// `FSTS.PPF` — mindestens ein Fault-Recording-Register ist besetzt.
 const FSTS_PPF: u32 = 1 << 1;
 
+/// Die Bits, mit denen die Einheit sich ueber **uns** beschwert — im Gegensatz zu `PPF`, das ein
+/// gewoehnlicher Befund ueber ein *Geraet* ist.
+///
+/// | Bit | | Bedeutung |
+/// |---|---|---|
+/// | 0 | `PFO` | Fault-Aufzeichnung uebergelaufen |
+/// | 2 | `AFO` | Advanced-Fault-Log uebergelaufen |
+/// | 3 | `APF` | Advanced Pending Fault |
+/// | 4 | `IQE` | **Invalidation Queue Error** — ein Deskriptor war fehlerhaft |
+/// | 5 | `ICE` | **Invalidation Completion Error** |
+/// | 6 | `ITE` | **Invalidation Time-out Error** |
+/// | 7 | `PRO` | Page-Request-Queue uebergelaufen |
+///
+/// **Befund vom 2026-08-17: `IQE`/`ICE`/`ITE` hat bis heute NIEMAND gelesen.** `REG_FSTS` kam im
+/// ganzen Modul nur mit `PFO` und `PPF` vor. Das ist teuer, und zwar aus einem Grund, den man dem
+/// Code nicht ansieht: **die drei Bits sind sticky (RW1C), und solange `IQE` steht, verarbeitet
+/// die Einheit die Invalidierungs-Warteschlange NICHT weiter** (VT-d 6.5.2.9) — `IQH` bleibt
+/// stehen. Danach laeuft *jedes* [`qi_submit`] in seine Poll-Schranke und gibt `false` zurueck.
+///
+/// Das Fehlerbild ist damit „die Invalidierung schlaegt fehl", die Ursache ein einzelnes gesetztes
+/// Bit von vorhin, und **nichts im Baum nennt sie**. Genau die Form aus der Fallenliste: ein
+/// Zustand, nach dem jede weitere Beobachtung bedeutungslos ist, ohne dass ein Pruefer ihn liest —
+/// wie die leere Event-Queue ohne `CD.R`, nur auf der x86-Seite.
+const FSTS_UNIT_ERRORS: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7);
+
+/// Die Fehlerbits der Einheit selbst, ODER-verknuepft ueber **alle** Einheiten.
+///
+/// Das x86-Gegenstueck zu `GERROR` auf aarch64. `0` heisst „die Einheit beschwert sich nicht";
+/// alles andere ist nie hinnehmbar, und die Bittabelle steht bei [`FSTS_UNIT_ERRORS`].
+///
+/// `PPF` ist ausdruecklich **nicht** enthalten: ein aufgezeichneter Fault ist eine Aussage ueber
+/// ein Geraet und wird von [`faults_empty`] getragen. Beides in eine Zahl zu werfen hiesse, einen
+/// erwarteten Negativtest-Treffer von einem Defekt der Einheit nicht mehr unterscheiden zu koennen.
+pub fn fault_status() -> u32 {
+    if !present() {
+        return 0;
+    }
+    (0..unit_count()).fold(0, |acc, u| acc | (ru32(u, REG_FSTS) & FSTS_UNIT_ERRORS))
+}
+
 /// Beobachtungsunabhängiger Zähler: Konfigurationsfehler **und** Aufzeichnungs-Überläufe, über
 /// **alle** Einheiten.
 static CFG_ERRORS: AtomicU32 = AtomicU32::new(0);

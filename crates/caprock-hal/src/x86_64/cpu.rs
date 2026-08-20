@@ -120,6 +120,46 @@ pub fn mpidr_affinity() -> u64 {
     core_id() as u64
 }
 
+/// **Read the SMT topology** (Z6 stage 0) from `CPUID.1Fh`, falling back to `CPUID.0Bh`.
+///
+/// `1Fh` first because it is the V2 enumeration and supersedes `0Bh` where both exist (it adds
+/// die/module levels); the SMT level itself is identical in both, so the fallback is exact rather
+/// than approximate.
+///
+/// **Not `CPUID.4:EAX[25:14]`**, although that value is already sitting in a register inside
+/// `cache::for_each_level` and would have been free: leaf 4 is Intel's *deterministic cache
+/// parameters* leaf, and AMD carries topology in an entirely different place. `0Bh`/`1Fh` is
+/// architectural on both vendors — and the likely deployment target is EPYC, i.e. the vendor where
+/// the cheap route is the wrong one.
+///
+/// Anything unreadable ends as `Unknown`, never as `Single`. The caller treats that as worst case.
+pub fn smt_topology() -> crate::smt::SmtTopology {
+    // Acht Unterblaetter sind mehr als jede real gemeldete Topologie (SMT/Core/Module/Tile/Die);
+    // der Abbruch bei Ebenentyp 0 ist der eigentliche Terminator, die Schranke nur das Netz.
+    const MAX_SUB: usize = 8;
+    let max_leaf = cpuid(0).0;
+    for leaf in [0x1F_u32, 0x0B_u32] {
+        if max_leaf < leaf {
+            continue;
+        }
+        let mut subs = [(0u32, 0u32, 0u32, 0u32); MAX_SUB];
+        let mut n = 0usize;
+        while n < MAX_SUB {
+            let r = cpuid_count(leaf, n as u32);
+            subs[n] = r;
+            n += 1;
+            if (r.2 >> 8) & 0xFF == 0 {
+                break; // Ebenentyp 0 -> Ende der Aufzaehlung
+            }
+        }
+        let t = crate::smt::decode_topology_leaf(&subs[..n]);
+        if t != crate::smt::SmtTopology::Unknown {
+            return t;
+        }
+    }
+    crate::smt::SmtTopology::Unknown
+}
+
 // --- Interrupt-Maske ------------------------------------------------------------------------
 
 /// RFLAGS lesen.

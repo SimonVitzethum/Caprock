@@ -176,6 +176,25 @@ pub fn dmar_table() -> Option<&'static [u8]> {
     find_table(b"DMAR")
 }
 
+/// The **SRAT** (Static Resource Affinity Table) — which memory range and which CPU sit on which
+/// proximity domain (Z8/N0).
+///
+/// Like [`dmar_table`], this hands out **bytes** and does not interpret them: the decode lives in
+/// `caprock_hal::numa` as a pure function so it can be tested against an *injected* table. The
+/// reason is stronger here than for DMAR — this development machine has exactly **one** node, so a
+/// test against the real SRAT could never see a second one.
+pub fn srat_table() -> Option<&'static [u8]> {
+    find_table(b"SRAT")
+}
+
+/// The **SLIT** (System Locality Distance Information Table) — the node distance matrix.
+///
+/// `None` is a normal outcome: a machine may report an SRAT without a SLIT, and then there are no
+/// distances rather than distances of `10`.
+pub fn slit_table() -> Option<&'static [u8]> {
+    find_table(b"SLIT")
+}
+
 /// Registerbasis der ersten **DMA-Remapping-Einheit** aus der ACPI-**DMAR** (VT-d).
 ///
 /// Aufbau: Header(36) + HostAddressWidth(1) + Flags(1) + reserviert(10), dann Remapping-

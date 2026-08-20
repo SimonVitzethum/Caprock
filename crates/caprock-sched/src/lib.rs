@@ -284,18 +284,18 @@ impl ThreadId {
 /// du schliefst"), kein Blockadegrund — es in die Menge zu ziehen wäre dieselbe Verwechslung noch
 /// einmal, nur mit einem hübscheren Typ.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub struct BlockReasons(u8);
+pub struct BlockReasons(u16);
 
 impl BlockReasons {
     /// Wartet auf ein IPC-Rendezvous. Wecker: `unblock` (aus `send`/`reply`).
-    pub const IPC: u8 = 1 << 0;
+    pub const IPC: u16 = 1 << 0;
     /// Das belastete Konto ist leer. Wecker: `refill_depleted` — und **nur** der.
-    pub const BUDGET: u8 = 1 << 1;
+    pub const BUDGET: u16 = 1 << 1;
     /// Eine **Autoritätsentscheidung** (`SYS_PDCTL` PAUSE, später der Gruppenschnitt aus Z23).
     /// Wecker: `resume`/`thaw`.
-    pub const PAUSE: u8 = 1 << 2;
+    pub const PAUSE: u16 = 1 << 2;
     /// Der Thread hat `SYS_PARK` gerufen. Wecker: `unpark` — und **nur** der.
-    pub const PARK: u8 = 1 << 3;
+    pub const PARK: u16 = 1 << 3;
     /// **Der Syscall (oder Fault) dieses Threads liegt bei seiner Persönlichkeits-PD** (Z26/A3).
     /// Wecker: [`Scheduler::handler_reply`] — und **nur** der.
     ///
@@ -310,7 +310,7 @@ impl BlockReasons {
     /// In der Menge ist genau das **unformulierbar**: `resume` entfernt `PAUSE`, `unpark`
     /// entfernt `PARK`, `unblock` entfernt `IPC` — keiner von ihnen entfernt `HANDLER`, und
     /// eingereiht wird nur bei leerer Menge.
-    pub const HANDLER: u8 = 1 << 4;
+    pub const HANDLER: u16 = 1 << 4;
     /// **Der `SYS_LOAD` dieses Threads liegt beim Verifiziererthread** (C8).
     /// Wecker: [`Scheduler::load_reply`] — und **nur** der.
     ///
@@ -332,7 +332,31 @@ impl BlockReasons {
     /// mit `IPC` blockieren zu lassen. Dann aber weckte ihn jedes `reply` **irgendeines** Servers,
     /// an dem er zufällig hängt, und `purge_ipc_queues` sähe eine Wartebeziehung, die es nicht
     /// gibt. Ein Grund, der zwei Lagen trägt, macht den Wecker unbestimmbar — das ist D9.
-    pub const LOAD: u8 = 1 << 5;
+    pub const LOAD: u16 = 1 << 5;
+    /// **Ein Debugger hat diesen Thread angehalten** (Z6b).
+    /// Wecker: [`Scheduler::debug_continue`] und die Cap-Finalisierung — und **nur** die.
+    ///
+    /// ## Die siebte Instanz derselben Klasse, und die dritte vorhergesagte
+    ///
+    /// Laege sie als eigenes Bit neben der Menge, wiederholte sich die Park-Naht woertlich: das
+    /// `resume` eines Aufsehers oder das `unblock` eines fremden IPC-Partners liesse den Thread
+    /// weiterlaufen, **waehrend der Debugger seinen Frame liest** — er saehe einen Zustand, den es
+    /// im selben Augenblick nicht mehr gibt, und wuesste es nicht.
+    ///
+    /// In der Menge ist genau das unformulierbar: `resume` entfernt `PAUSE`, `unpark` entfernt
+    /// `PARK`, `unblock` entfernt `IPC`, `handler_reply` entfernt `HANDLER`, `load_reply` entfernt
+    /// `LOAD` — keiner von ihnen entfernt `DEBUG`, und eingereiht wird **nur bei leerer Menge**.
+    ///
+    /// ## Und warum der Typ mit diesem Bit auf `u16` waechst
+    ///
+    /// Er war ein `u8`; nach `DEBUG` bliebe **ein** Bit. Die Verbreiterung ist mechanisch, solange
+    /// ein Verbraucher danebensteht und die Gegenproben ohnehin gefahren werden — bei Bit 8, unter
+    /// Termindruck, ist sie es nicht, und die sechs urteilenden Stellen muessten ein zweites Mal
+    /// nachgeprueft werden. Geprueft wurde vorher, ob die Menge im Checkpoint-Format vorkommt:
+    /// **sie tut es nicht** (`caprock_cap::checkpoint` kennt *Grund* nur als `Refusal`). Waere sie
+    /// serialisiert, waere dies keine Verbreiterung, sondern eine Formataenderung mit eigener
+    /// Version und eigenem Release.
+    pub const DEBUG: u16 = 1 << 6;
 
     /// Leere Menge = lauffähig.
     pub const NONE: Self = Self(0);
@@ -341,19 +365,19 @@ impl BlockReasons {
         self.0 == 0
     }
     /// Ist dieser Grund gesetzt?
-    pub fn has(self, grund: u8) -> bool {
+    pub fn has(self, grund: u16) -> bool {
         self.0 & grund != 0
     }
     /// Grund hinzufügen (idempotent).
-    pub fn insert(&mut self, grund: u8) {
+    pub fn insert(&mut self, grund: u16) {
         self.0 |= grund;
     }
     /// **Einen** Grund entfernen — nie „alle".
-    pub fn remove(&mut self, grund: u8) {
+    pub fn remove(&mut self, grund: u16) {
         self.0 &= !grund;
     }
     /// Rohbits, nur für Bericht und Modelltreue-Wächter.
-    pub fn bits(self) -> u8 {
+    pub fn bits(self) -> u16 {
         self.0
     }
 }
@@ -529,6 +553,42 @@ pub fn core_load(core: usize) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+/// Which cores have actually run [`Scheduler::init_core`] — i.e. have an idle thread and can
+/// therefore *run* something (2026-08-17).
+///
+/// **This is not the same question as "how many cores does the machine have", and conflating the
+/// two is what Z6 stage 1 broke.** `CORE_LOAD` for a core that never booted stays at `0`, so a
+/// never-started core looks like the *least loaded* one and wins every placement decision. Before
+/// sibling suppression that was a benign race — the core would boot a moment later and run the
+/// thread. With a core that is suppressed **on purpose** it is a panic: placement succeeds, the
+/// thread is enqueued, and the first query for that core's running thread finds none.
+///
+/// A load counter that also means "offline" would be *ein Parameter, der zwei Bedeutungen traegt*
+/// — the class this kernel has already paid for at `blocked` (D9) and at `Scheduler::spawn_user`.
+/// So the fact gets its own name.
+///
+/// **Set by [`Scheduler::init_core`] itself**, i.e. produced by the very thing it describes, on
+/// the core it describes. A separate "the BSP declares which cores are up" list would be a second
+/// memory for one fact, and it would be wrong exactly when a core fails to start.
+static CORE_ONLINE: [core::sync::atomic::AtomicBool; MAX_CORES] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_CORES];
+
+/// Has `core` initialised itself and can it run threads? Lock-free.
+///
+/// `false` for an out-of-range index — the fail-closed direction: an index we cannot check is not
+/// a core we may place work on.
+pub fn core_online(core: usize) -> bool {
+    CORE_ONLINE
+        .get(core)
+        .map(|c| c.load(Ordering::Acquire))
+        .unwrap_or(false)
+}
+
+/// How many cores have reported themselves live.
+pub fn cores_online() -> usize {
+    CORE_ONLINE.iter().filter(|c| c.load(Ordering::Acquire)).count()
+}
+
 // ---------------------------------------------------------------------------------------
 // Scheduler
 // ---------------------------------------------------------------------------------------
@@ -671,6 +731,12 @@ impl Scheduler {
         debug_assert_eq!(core, self.core);
         let idle = self.alloc_tcb(0, priority)?;
         self.current = Some(idle);
+        // **Erst jetzt ist dieser Kern lauffaehig** -- `current` ist gesetzt, es gibt einen
+        // Idle-Thread. Die Marke steht hier und nicht beim Aufrufer, damit sie nicht gesetzt
+        // werden kann, ohne dass die Sache eingetreten ist (s. `CORE_ONLINE`).
+        if let Some(c) = CORE_ONLINE.get(core) {
+            c.store(true, Ordering::Release);
+        }
         Some(self.id(idle))
     }
 
@@ -909,7 +975,7 @@ impl Scheduler {
     }
 
     /// Wie [`block_current`](Self::block_current), aber mit **benanntem** Grund.
-    pub fn block_current_mit(&mut self, core: usize, frame: usize, grund: u8) -> usize {
+    pub fn block_current_mit(&mut self, core: usize, frame: usize, grund: u16) -> usize {
         debug_assert_eq!(core, self.core);
         let cur = self.current.expect("kein laufender Thread");
         self.tcbs[cur].sp = frame;
@@ -1284,6 +1350,98 @@ impl Scheduler {
             .is_some_and(|s| self.tcbs[s].reasons.has(BlockReasons::LOAD))
     }
 
+    // --- Z6b: der Debugger ------------------------------------------------------------------
+
+    /// **Einen Thread fuer einen Debugger anhalten.**
+    ///
+    /// Setzt `DEBUG` und nimmt ihn aus der Ready-Queue. Gibt `false` zurueck, wenn der Thread hier
+    /// nicht aufloesbar ist (tot oder auf einem anderen Kern) **oder bereits fuer einen Debugger
+    /// steht** — „schon angehalten" ist eine eigene Lage und keine Wiederholungsbedingung.
+    ///
+    /// ## Warum das nicht `pause` ist
+    ///
+    /// `pause` setzt `PAUSE`, und `PAUSE` entfernt jeder `resume`/`thaw`. Ein Debugger, der seinen
+    /// Zielthread ueber `PAUSE` haelt, verliert ihn an den naechsten Aufseher, der aus einem
+    /// voellig anderen Grund fortsetzt — und liest danach einen Frame, den es nicht mehr gibt,
+    /// ohne es zu merken. Das ist woertlich die Naht, fuer die Z24 gebaut wurde.
+    ///
+    /// **`false` bei bereits gesetztem Grund ist die Ueberlaufmeldung einer Kapazitaet von eins**
+    /// (D11): der Halt hat genau einen Eigentuemer, weil ein Grund**bit** keinen Referenzzaehler
+    /// hat. Der Aufrufer macht daraus `ERR_DEBUG_BUSY`.
+    pub fn debug_stop(&mut self, tid: ThreadId) -> bool {
+        let Some(s) = self.resolve(tid) else {
+            return false;
+        };
+        if self.tcbs[s].reasons.has(BlockReasons::DEBUG) {
+            return false;
+        }
+        self.tcbs[s].reasons.insert(BlockReasons::DEBUG);
+        self.remove_from_ready(s);
+        true
+    }
+
+    /// **Der EINZIGE Wecker des Debug-Grundes**, neben der Cap-Finalisierung.
+    ///
+    /// Entfernt `DEBUG` und **nur** das. Ein Thread, der zusaetzlich pausiert wurde, in IPC wartet
+    /// oder auf leerem Konto sitzt, bleibt liegen.
+    ///
+    /// Rueckgabe: war der Grund ueberhaupt gesetzt? Das ist **nicht** dasselbe wie „aufloesbar",
+    /// und die Unterscheidung traegt die Freigabe: die Finalisierung ruft blind fuer jeden Thread
+    /// der PD, und nur die tatsaechlich Angehaltenen sind ein Ereignis.
+    pub fn debug_continue(&mut self, tid: ThreadId) -> bool {
+        let Some(s) = self.resolve(tid) else {
+            return false;
+        };
+        if !self.tcbs[s].reasons.has(BlockReasons::DEBUG) {
+            return false;
+        }
+        self.tcbs[s].reasons.remove(BlockReasons::DEBUG);
+        self.wecke_falls_lauffaehig(s);
+        true
+    }
+
+    /// Steht dieser Thread fuer einen Debugger? (Telemetrie, Pruefpfade, und die sechs urteilenden
+    /// Stellen.)
+    pub fn is_debug_stopped(&self, tid: ThreadId) -> bool {
+        self.resolve(tid)
+            .is_some_and(|s| self.tcbs[s].reasons.has(BlockReasons::DEBUG))
+    }
+
+    /// **Alle fuer einen Debugger angehaltenen Threads dieses Kerns freigeben** — die Freigabe der
+    /// Cap-Finalisierung (Z6b §6).
+    ///
+    /// Gerufen fuer eine PD, deren letzte `DebugControl` gerade verschwunden ist. Ohne diese
+    /// Freigabe traegt der Zielthread einen Grund, den **niemand** mehr entfernen darf: er laeuft
+    /// nie wieder. Ein Revoke, der sein Ziel unbrauchbar macht, ist schlimmer als kein Revoke, und
+    /// es ist dieselbe Klasse wie die vier D9-Befunde — ein Wecker, dessen Weckender wegging.
+    ///
+    /// `pd_of` beantwortet „gehoert dieser Thread zu der PD?"; der Scheduler kennt keine PDs.
+    /// Rueckgabe: wie viele Threads tatsaechlich freigegeben wurden — **nach Wirkung gezaehlt**,
+    /// nicht nach Versuch.
+    pub fn debug_release_pd(&mut self, pd_of: &dyn Fn(ThreadId) -> Option<u32>, pd: u32) -> usize {
+        let mut n = 0;
+        for s in 0..self.tcbs.len() {
+            if !self.tcbs[s].used || !self.tcbs[s].reasons.has(BlockReasons::DEBUG) {
+                continue;
+            }
+            let tid = self.id(s);
+            if pd_of(tid) != Some(pd) {
+                continue;
+            }
+            self.tcbs[s].reasons.remove(BlockReasons::DEBUG);
+            self.wecke_falls_lauffaehig(s);
+            n += 1;
+        }
+        n
+    }
+
+    /// Wie viele Threads dieses Kerns stehen fuer einen Debugger? (Sprechprobe der `dbg`-Zeile.)
+    pub fn debug_stopped_count(&self) -> usize {
+        (0..self.tcbs.len())
+            .filter(|&s| self.tcbs[s].used && self.tcbs[s].reasons.has(BlockReasons::DEBUG))
+            .count()
+    }
+
     /// Wie viele Threads dieses Kerns sind **gebunden**? (Sprechprobe: ein Prüfer, der über
     /// Abwesenheit einer Umleitung urteilt, muss belegen können, dass überhaupt gebunden wurde.)
     pub fn handler_bound_count(&self) -> usize {
@@ -1336,6 +1494,26 @@ impl Scheduler {
             return None;
         }
         if self.tcbs[s].sc_donor.is_some() || self.tcbs[s].sc_donee.is_some() {
+            return None;
+        }
+        // **Ein fuer einen Debugger angehaltener Thread wechselt den Kern nicht** (Z6b).
+        //
+        // Gemessen am 2026-08-20 konnte das ohnehin nicht vorkommen: `migration_candidate` laeuft
+        // nur die Ready-Queues, und ein Thread mit nicht-leerer Grundmenge steht dort nicht. Aber
+        // **beilaeufig, nicht strukturell** — `migrate_to(tid, dst)` nimmt eine beliebige `tid` und
+        // prueft den Zustand nicht; die Eigenschaft haengt damit an der Disziplin jedes Aufrufers,
+        // und genau diese Form bezahlt dieses Projekt regelmaessig.
+        //
+        // Warum sie gebraucht wird: `debug_release_pd` laeuft die TCB-Tabelle **je Kern** unter
+        // dessen Sperre. Ein Thread, der waehrend des Durchlaufs von einem bereits besuchten Kern
+        // auf einen noch nicht besuchten wandert, wird von **keinem** der beiden gesehen — und
+        // bliebe mit einem Grund liegen, den niemand mehr entfernen darf.
+        //
+        // **Eng und nicht breit**, und das ist eine Entscheidung: die naheliegende Fassung („nur
+        // Threads aus einer Ready-Queue") verboete auch die Migration IPC-wartender Threads und
+        // aenderte damit den Lastausgleich in einer Weise, die hier niemand gemessen hat. D8 ist
+        // der Beleg, dass die breitere Behebung die schlechtere sein kann.
+        if self.tcbs[s].reasons.has(BlockReasons::DEBUG) {
             return None;
         }
         let was_ready = self.tcbs[s].queued != NOT_QUEUED;

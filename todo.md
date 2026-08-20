@@ -3,6 +3,12 @@
 Nur **noch nicht Erledigtes**. Was fertig ist, steht mitsamt Begründung in [done.md](done.md).
 Reihenfolge innerhalb eines Abschnitts = Priorität. `[~]` = teilweise erledigt, Rest benannt.
 
+**Ein Strangplan liegt daneben:** [TODO0.md](TODO0.md) (Linux-Userland und lokale Grafik,
+2026-08-17). Er ist ein **Plan, kein zweites Register** — er kopiert von hier nichts, sondern
+verzeigert (Z14, Z16, Z19, Z20, Z26/A3, Z27, Z28) und führt eigene Punkte nur für das, was hier
+noch nicht steht. Wird einer davon begonnen, wandert er **hierher**. Wo beide etwas sagen, gilt
+diese Datei.
+
 **Aufgeräumt am 2026-08-11:** 6 vollständig erledigte Einträge und 54 einzelne `[x]`-Punkte sind
 **wörtlich** nach [done.md](done.md) gewandert (Abschnitt „Aus `todo.md` herübergeräumt"), samt
 ihrer Begründungen — die sind der Wert, nicht die Häkchen. Danach steht hier **kein einziges
@@ -2876,18 +2882,205 @@ fehlt.
       Interrupt-Zustellung außer ihren eigenen.
 
 ### Z6. SMT — die Lücke, die Cache-Coloring NICHT schließt
-**Klasse:** Seitenkanal · **Aufwand:** Scheduler-Politik, klein bis mittel
+**Klasse:** Seitenkanal · **Aufwand:** Stufen 0+1 erledigt; Stufe 2/3 offen
 
-- [ ] [A1](#a1-cache--timing-seitenkanäle-zwischen-pds) partitioniert den **LLC**. Zwei
-      Hyperthreads auf demselben physischen Kern teilen sich aber L1, L2, TLB, Store-Buffer und
-      Branch-Predictor — dagegen hilft keine Farbe, und zwar prinzipiell nicht. Solange SMT an ist
-      und der Scheduler Geschwister-Threads beliebig belegt, ist die A1-Zusicherung auf einer
-      SMT-Maschine deutlich schwächer, als sie klingt. Zwei gangbare Wege: SMT abschalten (kostet
-      Durchsatz, ist ehrlich) oder **Gang-Scheduling der Geschwister** — ein physischer Kern
-      gehört zu jedem Zeitpunkt genau einem Tenant. Der zweite Weg braucht die
-      Topologie (`CPUID.1F`/`0B` bzw. MPIDR) im Scheduler; die liest heute niemand.
-- [ ] Solange das offen ist, gehört es in die Zusicherung: `docs/invariants.md` muss sagen, dass
-      A1 den LLC trennt **und die kernlokalen Strukturen nicht**.
+#### The road to SMT — five rungs, and which one blocks which
+
+| # | What | State | What holds it |
+|---|---|---|---|
+| **0** | Read and report the topology | **done 2026-08-17** | `smt` line on both branches, 18 host tests |
+| **1** | One physical core carries at most one logical CPU, fail-closed | **done 2026-08-17** | gates in `all_done()`; that it *bites* is measured by `tools/smt-messen.sh` |
+| **1b** | The selftest image survives a machine with SMT | **open** | four conjuncts assume every configured core ticks |
+| **2** | Name the trust domain | **open, blocked** | the decision in `docs/invariants.md` §12a |
+| **3** | Gang-schedule siblings of one domain | **open, blocked** | needs rung 2 **and** a load model |
+
+Rungs 0+1 give up **all** SMT throughput and buy the property outright. Rung 3 buys the throughput
+back and **loses tenant-against-kernel** — that is the whole content of the §12a decision, and it is
+why rung 2 cannot be written first. Rung 1b is independent of both and is pure test-image work.
+
+**Priority against NUMA, decided 2026-08-17: rungs 2+3 come AFTER [Z8](#z8-numa).** Rung 1 already
+bought the *security* property, so everything left of SMT is throughput work — and it then loses to
+NUMA on three counts: SMT has a safe default and it is now installed, NUMA has none; SMT's cost is
+bounded, known and chosen (×1.36…×1.89 forgone), NUMA's is unbounded and invisible; and rungs 2/3
+are blocked on a decision and a load model while NUMA is blocked on nothing.
+
+**Rung 1b is NOT deprioritised** — it is the one piece that gates everything else. Every server CPU
+has SMT, so with stage 1 active the selftest cannot complete on real hardware at all. Cheap, and it
+must come before any measurement on a real machine.
+
+**Stages 0 and 1 are done (2026-08-17).** The topology is read (`CPUID.1Fh`/`0Bh` on x86,
+`MPIDR_EL1.MT` on aarch64, decoded host-testably in `caprock_hal::smt`, 18 tests), and the
+bring-up admits **at most one logical CPU per physical core**. Fail-closed: an unreadable
+topology admits only the boot CPU, and `Unknown` is deliberately not `Single`. The `smt` line
+gates in `all_done()` on both branches; the verdict is recomputed from the IDs that came online
+rather than read back from the policy's own map. Normative text in `docs/invariants.md` §12a.
+
+Measured, not assumed: `tools/smt-messen.sh` boots `-smp cores=2,threads=2` and gets
+`topology=Multi{width:2,shift:1} logical=4 online=2 suppressed=2`, plus the counter-check that the
+same kernel reads `Single`/`suppressed=0` under `threads=1`. In `tools/abnahme.sh` as `smt-politik`.
+
+**The price, measured on 2026-08-17** (i7-13650HX, 3 runs each, throughput vs. one thread): a
+sibling is worth **×1.36** on issue-bound work and **×1.89** on latency-bound work — the latter is
+almost a second physical core, and it is where JIT'd/allocation-heavy target workloads sit. Stage 1
+gives all of that up. That is the deliberate trade: *erst die Einschliessung, dann der Durchsatz.*
+
+- [ ] **Stage 2 — name the trust domain.** Gang scheduling needs a unit, and the kernel knows PDs,
+      not tenants (an app PD, its driver PD and the fs PD belong together). This must exist before
+      the scheduler work, or the granularity is cast in concrete.
+      **Blocked on the decision in `docs/invariants.md` §12a**: whether kernel entry joins the gang
+      semantics (stun the sibling — expensive in an IPC-heavy microkernel) or the claim is narrowed
+      to tenant-against-tenant in writing. That decision defines what a trust domain must mean.
+- [ ] **Stage 3 — gang-schedule siblings of one domain.** As a **named reason** in `BlockReasons`
+      (Z24), never a fourth bit and never a silent skip: a thread that is runnable and may not run
+      is literally `sched_audit` code 7, the regression the D0 rebuild produced. The checker must
+      count the **opportunity** (at every switch-in: does the sibling belong to the same domain or
+      to nobody?), not the hit — at a rare event a hit-counting checker is silent in almost every
+      run (the `pdbind` lesson).
+      **Not before a load model exists.** The realisable share of the ×1.36…×1.89 depends entirely
+      on the tenant mix: a domain with only one runnable thread forces its sibling idle and gets
+      ×1.0 while still paying for the hardware. Building a mechanism whose value lies somewhere
+      between 0 % and 90 % without knowing where is not engineering.
+- [ ] **The selftest image assumes every configured core comes up.** With stage 1 active under
+      `-smp cores=2,threads=2` the run ends in the watchdog with
+      `offen waren: cores sweep ist verif` (`sched : core 1 ticks=0`). That is an assumption of the
+      *test image*, not a kernel defect — but it means the suite cannot currently be run end-to-end
+      on a machine with SMT. Either those four conjuncts derive their expectation from
+      `caprock_sched::cores_online()` instead of the configured count, or the suite pins
+      `threads=1` explicitly.
+- [ ] **`iommu` and `iohealth` do not gate in `all_done()` on x86** (they do on aarch64; both are
+      checked by name from `test-qemu-x86.sh`, so a red line does fail the run). Closing it needs a
+      decision first: both lines may legitimately print `SKIP` on a platform without an IOMMU, and
+      a conjunct that treats `SKIP` as `PASS` would be the absence-reads-as-success trap. Found
+      2026-08-17 while wiring `smt`.
+
+### Z6b. Debugger — capability-based, planned 2026-08-20
+**Klasse:** Werkzeug/Isolation · **Aufwand:** v1 klein-mittel (kernseitig kleiner als Z6 oder Z8),
+v2 gross
+
+**v1 ist gebaut und gemessen (2026-08-20): `test-qemu-x86.sh` und `test-qemu.sh` beide
+`== ALL PASS ==`, sieben `dbg`-Checks gruen.** Offen ist, was unten unter „Was NICHT gebaut ist"
+steht. Die sechs Korrekturen, die die Messung am Plan erzwungen hat, stehen in
+`docs/plan-debugger.md` unter „Implementation status".
+
+- [x] **v1: der Mechanismus.** `BlockReasons::DEBUG` (Bit 6, Typ auf `u16` verbreitert),
+      `debug_stop`/`debug_continue`/`is_debug_stopped`/`debug_release_pd`/`debug_stopped_count`;
+      `ObjectKind::Debuggable` mit **rechte**-basierter Ableitung; dritte Liste in `Finalized` +
+      `release_finalized_debug`; fuenf Syscalls (21..25), `ERR_DEBUG_BUSY`/`ERR_NOT_DEBUGGABLE`;
+      `POLICY_DEBUGGABLE` im signierten Manifest mit **einer** Praegestelle; die dritte
+      Schreibstufe (`writeback_erlaubt` + `frame_wort_setzen` auf **beiden** Architekturen);
+      `vspace_resolve` auf beiden; `Freeze::Debugged`; Migrationssperre; `dbg`-Zeile + 7 Checks.
+
+- [x] **Die Speicher-Sonde, arch-neutral** (`kernel/src/dbgmem.rs`, `dbgmem`-Zeile). Sie schliesst
+      das eine Loch, das das x86-Gruen NICHT mittraegt: `vspace_resolve` ist die einzige Stelle in
+      v1, an der sich die Architekturen wirklich unterscheiden. **Sie hat sofort eine
+      Rechteausweitung gefunden** -- ohne `US`/`AP[1]`-Pruefung loeste ein Debugger mit blossem
+      `DebugRead` auch die geteilten KERNEL-Eintraege der isolierten VSpace auf und laese
+      Kernelspeicher. Von aussen sieht das wie ein funktionierender Debugger aus.
+
+- [x] **Die Gegenproben** (`tools/dbg-negativ.sh`, sieben Mutationen). Jede prueft drei Dinge: dass
+      die Mutation GRIFF, dass das GEMEINTE Konjunkt fiel, und bei M3 zusaetzlich, dass das andere
+      gruen BLIEB -- die Asymmetrie ist die Aussage. Zwei Fassungen waren beim ersten Versuch falsch,
+      und beide Fehler stehen im Plan: M1 verfehlte den gepruefte Pfad (die Ziel-PD geht nie durch
+      den Lader), und M5 blieb gruen, **weil das Ringwort zweifach gegattert ist** -- daraus wurden
+      M5a (Tiefe belegen) und M5b (ueberhaupt gattern).
+
+- [ ] **Was NICHT gebaut ist:**
+      * die **gdbserver-PD** (RSP) -- und die Reihenfolge steht fest: sie stuetzt sich staerker auf
+        `DEBUG_READ_MEM` als auf alles andere. Erst als der Pfad ungemessen war, waere jeder erste
+        Fehler mehrdeutig gewesen (Debugger oder Kernel-Pfad). Jetzt ist er gemessen.
+      * v2: Hardware-Haltepunkte, Einzelschritt, `hal::debug` -- **keine Debug-Flaeche in der HAL**,
+        auf beiden Architekturen gegrept.
+      * **Der SCHLECHTE Fall der Stopp-Latenz.** Der gute ist gemessen (128/128 gueltige Proben,
+        p50 ~6800, p99 ~13900 Zyklen, Ziel auf einem fremden Kern) -- das sind rund 5 us, drei
+        Groessenordnungen unter der Zusage. Aber die Schranke `<= 10 ms` gilt einem Zielkern, der
+        maskiert hat oder in einem langen kritischen Abschnitt steht, und **den erreicht diese Reihe
+        nicht**: ein spinnender Thread nimmt den IPI jederzeit an. Die Schranke bleibt aus dem Tick
+        HERGELEITET; die Zeile sagt das selbst.
+- [x] **Alle drei benannten Luecken sind zu** (2026-08-20). Der User-Fenster-Zweig von
+      `vspace_resolve` wird mitgemessen (2-MiB-BLOCK: `PS` auf x86, `BLOCK_DESC` auf aarch64 -- die
+      Rechtepruefung sitzt dort an einer ANDEREN Stelle als beim Blatt, und genau in dieser Haelfte
+      lag die gefundene Rechteausweitung). Die `dbg`-Sonde liegt arch-neutral in
+      `kernel/src/dbgprobe.rs` und bringt ihr eigenes Ziel mit -- damit ist der Fortschritt eine
+      **Wirkung des Ziels** statt eines Wertes, den der gemessene Pfad selbst setzt. Und der
+      Schlimmstfall der Stopp-Latenz wird **zusammengesetzt statt zweitgemessen**:
+      `laengste IRQ-maskierte Strecke (C9) + p99 <= ein Tick`, auf x86 gemessene 71 Promille.
+
+      **Drei Befunde beim arch-neutralen Umzug, alle vom Umzug selbst ausgeloest:** die Sonde
+      bildete eine Registerlage NACH (hartkodiert Wort 18 -- auf aarch64 ein Allzweckregister);
+      sie erbte auf aarch64 eine ungeprüffte Zahl (s. u.); und die `dbg`-Zeile wurde auf aarch64
+      gedruckt, ohne dass sie jemand las -- woertlich die `pdbind`-Form. Der Waechter
+      `tools/berichtsgatter.sh` fragt seither fuer arch-neutrale Module **je Architektur** und hat
+      damit sofort eine zweite Instanz gefunden (`dbgmem`, ungegattert auf x86).
+
+- [ ] **NEU und nicht vom Debugger: `sperre`/C9 laeuft auf aarch64 NICHT.**
+      `hoechststand_bereinigt()` liefert dort trotzdem eine Zahl (gemessen 5 446 459 Zyklen = 8720
+      Promille eines Ticks), und die erste Fassung des Schlimmstfalls hat sie genommen -- rot, und
+      es sah nach einem ernsten Debugger-Befund aus. **Eine Schranke aus einem Summanden, den auf
+      dieser Architektur niemand prueft, ist keine Schranke, egal in welche Richtung sie
+      ausfaellt.** Die Zeile meldet dort jetzt SKIP mit Grund. Solange C9 auf aarch64 fehlt, ist die
+      Latenzzusage dort HERGELEITET und nicht gemessen.
+
+- [ ] **Der Plan ist `docs/plan-debugger.md`** (2026-08-20). Lesen statt diesen Eintrag;
+      was folgt, ist die Zusammenfassung und die Entscheidungen, die nicht verlorengehen duerfen.
+
+      **The claim:** *debug authority is a capability over exactly one PD — delegable, revocable,
+      auditable; a PD over which none was ever minted cannot be debugged, and that is checkable.*
+      `ptrace` cannot express it.
+
+      **v1 scope, kernel-side:** 3 new cap types (`Debuggable` / `DebugRead` / `DebugControl`) plus
+      one that **already exists** (`ObjectKind::FaultHandler`, whose own doc names a debugger as a
+      consumer) · 5 syscalls (21..25) · `ERR_DEBUG_BUSY = 19`, `ERR_NOT_DEBUGGABLE = 20` ·
+      `BlockReasons::DEBUG` on bit 6 with the type widened to `u16` **in the same change** · an
+      extended write mask · a third list in `Finalized` · **6 judging places** · one object
+      generation · one `dbg` line. ~750 lines kernel-side, ~1500 in an unprivileged PD speaking
+      GDB's RSP. Estimated, and marked as such in the plan.
+
+      **The three things that bite:**
+
+      1. **The mint policy IS the claim.** Minting `Debuggable` by default makes the claim vacuous
+         — no such PD would exist. So *not* minting is the default, and the place for the decision
+         is `POLICY_DEBUGGABLE = 1 << 4` in the **Ed25519-signed, kernel-hash-bound** manifest,
+         enforced in `loader.rs:1196 policy_gate`. That makes "who may be debugged" attested and
+         anti-downgrade-protected, not a runtime switch. **Custody is the other half:** the window
+         ends by revoking `Debuggable` itself — time-limiting a derived cap does not close it.
+      2. **`revoke` must not brick the target.** A DEBUG-stopped thread whose debugger dies keeps a
+         reason bit nobody may clear. **The mechanism already exists and is not the one the first
+         draft invented:** `cap_delete` (`system.rs:2519`) and `cap_revoke` (`:2536`) are
+         structurally identical and both call `abort_finalized_replies` (`:2554`) with **no lock
+         held** — which is this exact problem, already solved, for `CALL`-blocked callers whose
+         Reply cap was finalised. The release is a **third list in `Finalized`**, drained beside it.
+         One copy, both paths, existing lock order, and `note_finalize_overflow` already shouts when
+         the capacity is exceeded.
+      3. **The debugger needs a *third* write authority** — GPR **+ PC + SP + masked flags**. And
+         measured 2026-08-20: the limit must come from the **capability**, never from `KOPF_NGPR` in
+         the handler-writable sidecar page; `kopf_pruefen` compares that word against the reader's
+         own number and rejects on mismatch, so a debugger's wider mask cannot ride on it.
+
+      **Two things the plan found already built**, which is why v1 shrank: `KOPF_GEN` (the stop
+      generation asked for) and `FaultHandler` (crash catching). **One thing that does not exist at
+      all:** any debug surface in the HAL — grepped 2026-08-20 for `MDSCR`, `DR7`, `debugctl`,
+      `PSTATE.SS`, zero hits on either architecture. That is v2's largest item.
+
+      **Prerequisite that lands alone, before v1:** `detach_for_migration` must refuse a thread not
+      in a ready queue. A DEBUG-stopped thread cannot migrate today, but only **incidentally** —
+      `migrate_to(tid, dst)` checks no state, and the property rests on caller discipline.
+
+      **Deferred, and coupled to a product decision:** software breakpoints patch program text, and
+      W^X here is not merely a report line but a **Verus proof** (`verus/wx_invariant.rs`). Route 1
+      (hardware breakpoints only) carries v1 and v2; the customer-debugging path (Velve ch. 16,
+      ~50 breakpoints per session) needs route 2 — a distinct text-write capability with open
+      windows counted in the `wx` line — and route 2 now carries a **proof** obligation, not just a
+      measurement one.
+
+      **Corrections recorded in the plan's appendix A** rather than dropped, including: „zwei
+      `SCHEDS` werden nie gleichzeitig gehalten" was **wrong** (`migrate_to` holds two, already in
+      ascending-index order; the two comments are scoped to `KernelSched` `:924` and
+      `least_loaded_core` `:2720`), and the first draft's "kick the target core" release is
+      superseded by the `Finalized` path above.
+
+      The ordering rule behind all of this is `docs/invariants.md` **§1b** — three instances
+      (D0, C8, debugger) make it a rule, with a named requirement for Gabbro: a pairing that makes
+      the wrong order **unspellable**, not a lint that finds it.
 
 ### Z7. Attestierung und messbarer Boot
 **Klasse:** Vertrauen · **Aufwand:** mittel-groß
@@ -2900,6 +3093,172 @@ fehlt.
 
 ### Z8. NUMA
 **Klasse:** Speicher/Skalierung · **Aufwand:** mittel, greift in den Allokator
+
+**Measured state, 2026-08-17 (grepped, not remembered).** One thing exists, everything else does
+not:
+
+| Piece | State |
+|---|---|
+| ACPI **SRAT / SLIT / HMAT** | **read nowhere.** The tables actually parsed are `APIC`, `DMAR`, `MCFG` — that is the complete list in `x86_64/acpi.rs` |
+| aarch64 device tree `numa-node-id` | not read either |
+| `PhysAllocator` free list | flat, **no node concept** |
+| Scheduler | no notion of which node a core belongs to |
+| Manifest field `numa_node:u32` (offset 68) | **exists, and is fail-closed** |
+
+So the honest summary is: **the format carries the field, the kernel refuses it, and nothing else
+is built.** `loader.rs` rejects any entry with `numa_node != 0` and prints why, rather than
+silently placing the program anywhere — checked as `ladepol`. That refusal is the *only* NUMA work
+that is done, and it is the right one to have done first: a field that is never honoured collects
+unchecked values, and the day it is honoured is the day they are all wrong (measured at A1, where
+priorities had sat unfulfilled in the test manifest for a year).
+
+**Two things that are already in the right shape for it**, so this is less green-field than it
+looks: `alloc_colored_below` decides colour **and** zone in *one* call and its doc comment already
+names this entry as the reason; and `enum Zone` (`kernel/src/system.rs`) is the single place where
+placement classification lives. A node is a third axis on an existing decision, not a new layer.
+
+**And unlike CAT/MPAM, it is testable.** The development machine has exactly one node, so the case
+cannot arise there — but QEMU presents a full topology (`-numa node,nodeid=…,cpus=…,memdev=…` plus
+`-numa dist,src=,dst=,val=`, verified 2026-08-17). The CAT entry was deferred because it was
+*buildable but not verifiable*; that argument does not apply here.
+
+#### The road to NUMA — five rungs
+
+Same shape as the SMT ladder above, and deliberately so: what made that one work was that each rung
+carried its own falsifiable line rather than a promise about the next one.
+
+| # | What | State | Blocks |
+|---|---|---|---|
+| **N0** | Read the topology (SRAT/SLIT, DT `numa-node-id`) | **done 2026-08-17** (x86 measured; aarch64 built but unexercised — see below) | N1 |
+| **N1** | Classify every RAM range to a node, fail-closed; report line `numa` | **done 2026-08-17**, gates on both branches | N2 |
+| **N2** | Node as a constraint on the **one** placement decision | **partly done** — node+zone yes, colour axis open | N3, N4 |
+| **N3** | Scheduler: a thread runs on a core of the node that holds its memory | **open** | N4 |
+| **N4** | Honour `numa_node` from the manifest instead of refusing it | **open** | — |
+
+##### What landed on 2026-08-17, and what it measured
+
+`caprock_hal::numa` decodes SRAT (all four affinity subtable types, including the **split**
+proximity domain of the legacy APIC entry) and SLIT, plus a `numa-node-id`/`reg` walker in
+`caprock-dtb` that reports through callbacks so both architectures share one set of truncation
+rules. **15 host tests.** `kernel/src/numa.rs` holds the one topology, prints the `numa` line and
+answers "which node"; the line gates in `all_done()` on both branches and both suites check it.
+
+Measured by `tools/numa-messen.sh` (in `tools/abnahme.sh` as `numa-topologie`):
+
+```
+-numa 2 Knoten:  nodes=2 ranges=3 cpus=4 distances=true trustworthy=true covered=2047 MiB
+                 distance(0,0)=Some(10) distance(0,1)=Some(21)   <- der Wert aus -numa dist,val=21
+                 placed exact=3 off_node=0 refused=0 speaking=true
+ohne -numa:      readable=false nodes=0  -> und trotzdem ALL PASS
+```
+
+The counter-check is the second line: a decoder that always claimed two nodes would pass the first
+run and fail this one.
+
+**N2 has a real caller, on purpose.** The AP stacks are allocated through the ladder
+(`numa::alloc_on_node`), which is why `speaking=true` above is not a promise. Arithmetic with no
+caller is the trap the Z26/A3 sidecar work already paid for: two mutations proved the *functions*
+were right while nothing called them.
+
+##### Three limitations of what landed — named, not glossed
+
+- [ ] **The colour axis is not in the ladder yet.** `off_node_uncolored` is structurally `0`
+      because the coloured path (`alloc_colored_in`) has not been given a node. So the yield order
+      is today *node → (nothing)*, not *node → colour*. Until that is wired, "colour yields last"
+      is a decision on paper.
+- [ ] **On aarch64 the reader cannot see a runtime topology at all.** `kernel_main(dtb_addr)`
+      **prints** the pointer QEMU passes and parses the **build-time embedded** `virt.dtb`
+      (`include_bytes!`). That is pre-existing and affects `cpu_count`/`memory` too — but it means
+      the DT NUMA walker is *built and unexercised*, and no `-numa` run could exercise it. Either
+      the kernel starts parsing the DTB it is handed, or the aarch64 half of N0 is honestly marked
+      untested. **Do not read the green aarch64 `numa` line as evidence for the walker**; it only
+      shows the reading happened and correctly reported "no topology".
+- [ ] **N4's positive path is not driven by the load suite.** `boot()` in
+      `test-qemu-x86-load.sh` hardwires `-m "$RAM" -smp 4` *before* any extra arguments, and a
+      `-numa` topology needs `-smp sockets=…` plus matching `memory-backend` sizes at exactly those
+      places; a second `-m`/`-smp` afterwards collides. Measured 2026-08-17: QEMU starts, the guest
+      gets **no SRAT** (`numa : readable=false`), and the resulting line reads like a kernel finding.
+      `boot()` sends every QEMU message to `/dev/null`, which is what makes the confusion possible —
+      the same shape as the `iommu_platform=on` split. What *is* driven: the negative case (a node
+      wish on a machine without a topology gets its own reason), and the whole positive read/place
+      path via `tools/numa-messen.sh`.
+- [ ] **`Topology` is copied out under a lock on every query** (`node_of_pa`, `node_of_core`). Fine
+      at bring-up rates, wrong for a hot path — N3 puts it on the placement path, and then it needs
+      a lock-free snapshot or the C9 lock-hold mark will find it.
+
+**Testability is settled, and it was measured before planning** (2026-08-17): `qemu-system-x86_64
+-machine q35 -numa node,… -numa dist,…` emits **SRAT and SLIT** into guest memory (dumped and
+grepped, 1 each, alongside the `APIC`/`MCFG` this kernel already parses), and `qemu-system-aarch64
+-machine virt` emits `numa-node-id`, `distance-map`, `distance-matrix` into the device tree
+(`dumpdtb`). The development machine has exactly **one** node, so the case cannot arise there — the
+emulation is the only way to see it at all, which is precisely why the decoders must be pure
+functions over **injected** bytes (the DMAR rule: a test against the real table is an oracle that
+holds because its antecedent is false).
+
+**What the suites can NEVER show: the benefit.** QEMU hands out topology, not latency — a guest's
+"remote" node is ordinary host memory at ordinary host speed. Verifiable is **where a page came
+from and where a thread runs**; the speedup is not, and no green line here may be read as one.
+Exactly the SMMU-under-QEMU distinction (§6) and the SMT one (§12a). Measuring the benefit needs a
+real multi-socket box — a rented dual-socket EPYC for one afternoon would settle it, and until then
+the honest claim is *placement is correct*, never *it is faster*.
+
+##### N1: what "fail-closed" has to mean here
+
+SRAT need not cover all of RAM (firmware routinely leaves ranges out). The bequeme Fassung assigns
+those to node 0 — and that is `Unknown`-as-`Single` all over again: a range nobody classified would
+be indistinguishable from a range classified as local. So unaffiliated memory gets its **own**
+value (`NodeId::Unaffiliated`), the report line prints its size in bytes, and it is allocated from
+**last**. A machine where that number is large is a machine whose topology we do not actually know,
+and the line must say so rather than average it away.
+
+##### N2 is the hard rung, and the risk is a THIRD axis on one address
+
+Colour (cache sets), zone (below/above 4 GiB) and node all constrain the **same** physical address,
+so they must be decided in **one** call — `alloc_colored_below` already fuses the first two and its
+doc comment already names this entry as the reason. Adding a node makes the constraint set small
+enough that it will regularly be unsatisfiable, and then **the yield order decides everything**. It
+must be named, not emergent:
+
+1. **Zone never yields** — it is correctness, not preference (`vspace_map_page_at` refuses
+   `va >= GIB1_END`).
+2. **Node yields first** — it is performance.
+3. **Colour yields last** — it is the A1 isolation claim. A silent colour yield would be the
+   `MASK_BITS` failure again: green because nothing was separated.
+
+And every yield is counted **by effect, not by attempt**. The E-Rest 3b fallback counter reported
+`1x` on a 512 MiB machine that had no high memory at all — it had counted an oversized request that
+fitted nowhere. "There was no room on the node" and "it was taken from another node" are two
+statements.
+
+*Warning from the same family:* "unten zuerst" was for years an accident of the size relation
+rather than a design. A three-axis best-fit will produce exactly that kind of property — one that
+holds until the fragment sizes change. Whatever N2 guarantees must follow from the structure, and
+the report line must carry the number that would show it slipping (pages allocated off-node).
+
+##### N4 is the day the field's values are all wrong
+
+`numa_node` has sat in the manifest format collecting unchecked values since it was defined, and is
+today **refused** whenever it is non-zero (`loader.rs`, checked as `ladepol`). That refusal is why
+this is currently safe. When N4 honours it, every existing entry must be re-examined, and the test
+manifest must carry a non-zero value that is actually **satisfied** — not merely accepted. This is
+the A1 finding verbatim: the priorities sat unfulfilled in the test manifest for a year, and the day
+they were honoured the same allocation tore the load suite apart.
+
+##### Where it collides with work that already exists
+
+* `least_loaded_core()` minimises TCB slots and now also skips offline cores (Z6 stage 1). N3 adds a
+  third criterion, and the same care applies: `core_node(c)` must be its own named quantity, not a
+  meaning smuggled into the load counter — *ein Parameter, der zwei Bedeutungen traegt* (D9,
+  `spawn_user`).
+* `balance_once()` migrates on a difference of `IMBALANCE_THRESHOLD = 2`. A **cross-node** migration
+  costs more than that imbalance saves; it needs its own, higher threshold, or it must not happen at
+  all.
+* `enum Zone` (`kernel/src/system.rs`) is the single place where placement classification lives. A
+  node is a third axis there, not a new layer.
+
+**Priority: ahead of [Z6](#z6-smt--die-lücke-die-cache-coloring-nicht-schließt) rungs 2+3**
+(decided 2026-08-17) — see the reasoning recorded there. In one line: SMT already has its safe
+default installed, NUMA has no safe default at all.
 
 - [ ] Der `PhysAllocator` hat **eine flache Freiliste ohne Knotenbegriff**. Beim Zielbild
       Dual-EPYC ist das kein Detail: Speicher am falschen Knoten kostet grob Faktor zwei an
@@ -3333,6 +3692,66 @@ dasselbe cap-gesicherte IPC — ohne ein einziges `cfg(target_arch)` im Kern. De
       Leaf-Rücklesen; die Kohärenz-Teilprüfung existiert auf x86 gar nicht — legitimer SKIP) und
       der virtio-Negativtest (hängt am ARM-virtio-Treiber). Hängt mit [F1](#f-debug-testcode-aus-dem-release-build-nehmen)
       zusammen: dasselbe Modul, zwei Gründe es aufzuteilen.
+
+---
+
+## E0. Der x86-DMA-Kern ist gebaut — und die Gegenprobe fand zwei Löcher (2026-08-17)
+
+**Klasse:** Erledigt mit Resten · **Stand:** `iohealth` grün auf **beiden** Suiten, Host-Tests grün
+
+**Was gebaut wurde: EINE Aussage statt zweier Formulierungen.** Bis hierher berichtete jede
+Architektur die Gesundheit ihrer IOMMU in eigenen Worten — aarch64 als `smmu` (IDR0, SIDSIZE,
+SMMUEN, CMD_SYNC-Round-Trip, Event-Queue, GERROR), x86 als `iommu`/`vtdcaps`/`qi`/`ir`. Beide
+Implementierungen waren vollständig; **es gab nur keinen Satz, der auf beiden Seiten dasselbe
+bedeutet** — genau das Warnsignal, das der VT-d-Eintrag unten vorab benannt hat
+(*„ein separater `vtdtest` hiesse, dass die Eigenschaften auf x86 anders formuliert sind"*).
+
+Neu: `crates/caprock-hal/src/iommu_health.rs` — **reiner Typ über eingespeisten Werten**, ohne
+Registerzugriff, deshalb als Datei host-testbar (Muster `dmar.rs`/`irte.rs`), 9 Tests, im Ziel
+`iohealth` von `tools/host-tests.sh`. Beide Fassaden liefern `health(round_trip)`, beide
+Hochlaufwege drucken dieselbe Zeile, beide Suiten prüfen sie **namentlich**.
+
+**Die tragende Regel steht im Typ, nicht im Kommentar:** `faults_empty` wird erst gewogen, wenn
+`invalidation_round_trip` belegt ist. Eine tote Einheit meldet ebenfalls eine leere Warteschlange —
+dieselbe Form wie die leere Event-Queue ohne `CD.R`. Ein Host-Test prüft genau diese Reihenfolge
+(`the_undermining_reason_wins`).
+
+- [ ] **BEFUND 1, und er ist der eigentliche Ertrag: `FSTS.IQE`/`ICE`/`ITE` hat NIEMAND gelesen.**
+      `REG_FSTS` kam im ganzen x86-Baum nur mit `PFO` (Bit 0) und `PPF` (Bit 1) vor. Die drei
+      Invalidierungs-Fehlerbits sind **sticky (RW1C)**, und solange `IQE` steht, **verarbeitet die
+      Einheit die Invalidierungs-Warteschlange nicht weiter** (VT-d 6.5.2.9) — `IQH` bleibt stehen.
+      Danach läuft *jedes* `qi_submit` in seine Poll-Schranke und gibt `false` zurück.
+      **Fehlerbild: „die Invalidierung schlägt fehl". Ursache: ein Bit von vorhin. Nichts im Baum
+      nannte es.** Jetzt gelesen von `vtd::fault_status()` und im `hw_error`-Feld gegattert.
+      **Offen:** sie werden gelesen, aber **nirgends gelöscht**. Eine Einheit, die einmal `IQE`
+      gesetzt hat, bleibt für den Rest des Laufs verklemmt — die Zeile sagt es jetzt, behebt es
+      aber nicht. Das ist die nächste Arbeit hier.
+
+- [ ] **BEFUND 2: die aarch64-Suite las die neue Zeile nicht — gefunden durch die Gegenprobe.**
+      Unter der Mutation gatterte der Kernel korrekt (`bringup : offen: iohealth`, Watchdog
+      gefeuert, **genau ein** offenes Konjunkt) — und `test-qemu.sh` meldete trotzdem
+      `== ALL PASS ==`. Die x86-Suite fing es über ihre generische NEU-ROT-Erkennung, die
+      aarch64-Suite hat keine. **Eine Zeile, die keine Suite liest, gattert nichts** — dieselbe
+      Form wie `root` vor D5. Behoben: beide Suiten prüfen `iohealth` jetzt **namentlich**, und
+      namentlich statt generisch, weil eine NEU-ROT-Erkennung eine rote Zeile fängt, aber nicht
+      ihr **Verschwinden**.
+
+- [ ] **Zwei eigene Fehler beim Bau, beide aus der Fallenliste.**
+      **(a)** Die erste Fassung von `health()` rief `invalidate_context_cache()` **inline** — eine
+      Gesundheitsabfrage hätte bei jedem Aufruf eine echte globale Invalidierung ausgelöst.
+      *Ein Lesen, das seinen Gegenstand verändert, ist keine Beobachtung.* Der Round-Trip wird
+      jetzt hereingereicht, auf beiden Architekturen mit derselben Signatur.
+      **(b)** „Beide Ziele bauen" war auf der **falschen Konfiguration** gemessen: `threads/mod.rs`
+      liegt hinter `--features selftest`, mein Bau lief ohne. Der Fehler (`DONE_FLAGS_ARM` 57 → 58)
+      erschien erst, als die Suite baute. *„`cargo build` läuft durch" ist kein Beleg, solange
+      niemand die Konfiguration bindet.*
+
+- [ ] **Was `todo.md` an dieser Stelle veraltet führte** (nachgesehen statt erinnert): Schritt 3b
+      („Queued Invalidation ist Vorbedingung von 6.4") und Schritt 4 (Interrupt Remapping) stehen
+      unten als `[ ]` — beide sind **gebaut**: `GCMD_QIE`, `QI_IEC_INV`, `qi_submit` mit
+      Wait-Deskriptor, `GCMD_IRE`, `cfi_blocked()`, und die Suite prüft `qi` und `ir` namentlich.
+      Die Einträge gehören nach `done.md`. *Ein Register, das Erledigtes führt, macht die Frage
+      „was ist offen" unbeantwortbar.*
 
 ---
 

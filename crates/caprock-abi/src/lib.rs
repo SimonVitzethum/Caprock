@@ -111,6 +111,150 @@ pub mod sys {
     /// Rückgabe in `x0`: [`result::OK`], [`result::ERR_BADCAP`], [`result::ERR_RIGHTS`],
     /// [`result::ERR_HANDLER_CYCLE`], [`result::ERR_HANDLER_BUSY`], [`result::ERR_NOSPACE`].
     pub const SETHANDLER: u64 = 19;
+
+    /// **Create a second thread inside the caller's own PD** (K1a, 2026-08-17).
+    ///
+    /// The kernel half of "several threads per PD" has existed since 2026-08-10 (Z22 P2): the PD
+    /// table carries `nthreads`, a reverse index and `any_thread`, and the `pdthrd` line measures
+    /// two threads in one PD every run. What was missing was **a way for userspace to ask** —
+    /// without it there is no `pthread_create`, and therefore no Mesa, no smithay, no JVM.
+    ///
+    /// ## The stack comes from a Cap of the CALLER — decided, not defaulted
+    ///
+    /// `MSG0` names a slot in the caller's own Cspace holding an `ObjectKind::Memory` region; it
+    /// becomes the new thread's stack. **The kernel allocates nothing.** Three reasons, each of
+    /// which this project has already paid for separately:
+    ///
+    /// * a kernel-side stack would be **a second memory policy in the kernel** (the `system::alloc`
+    ///   lesson — a classification checked against only one suite);
+    /// * it would break **attribution**: the caller carries the cost out of its own Cap, the same
+    ///   logic as `consumed_cycles` per TCB;
+    /// * **the kernel manages authority, not supply.** seL4 answers the same question the same way
+    ///   for the same reason.
+    ///
+    /// ## What this couples — and the honest price of the decision
+    ///
+    /// A TCB whose stack comes from a Cap couples **CapSpace and Scheduler**: what happens on
+    /// `revoke`/`delete` of that Cap while the thread runs? Two honest outcomes existed; this ABI
+    /// takes the second, and says so:
+    ///
+    /// > **Deleting a bound stack Cap is REFUSED while the thread lives** ([`result::ERR_INUSE`]).
+    ///
+    /// Not because it is nicer, but because it is *countable*: the TCB holds a reference the K1
+    /// class can count, and the alternative ("deletion kills the thread with it") would be a group
+    /// operation across `CAPS` **and** `SCHEDS[core]` — the V4 class with two locks and an
+    /// ordering. It is also fail-closed, and it has an idiom in this tree already
+    /// ([`result::ERR_HASCHILDREN`]). A thread that must go is killed explicitly with
+    /// [`KILL`]; afterwards the Cap deletes normally.
+    ///
+    /// ## The checks at the edge, each with its OWN code — never a blanket refusal
+    ///
+    /// | condition | code |
+    /// |---|---|
+    /// | slot empty / not a memory Cap | [`result::ERR_BADCAP`] |
+    /// | Cap lacks `rw`, or is not in the `normal` address space | [`result::ERR_RIGHTS`] |
+    /// | region is **reachable by a device** (DMA window) | [`result::ERR_DMA_REACHABLE`] |
+    /// | too small, or not aligned | [`result::ERR_BADSTACK`] |
+    /// | overlaps an existing mapping of the target VSpace | [`result::ERR_NOSPACE`] |
+    /// | PD is already at its thread limit | [`result::ERR_THREAD_LIMIT`] |
+    ///
+    /// **`ERR_DMA_REACHABLE` is not paranoia**: a stack a device can write is the `by ops`
+    /// placement rule turned into an attack — the return address is data, and a device that
+    /// reaches it chooses where the thread goes next.
+    ///
+    /// ## Admission order is D0, literally
+    ///
+    /// `spawn_parked` → stack and TLS base set → `bind_pd` → `admit`. A thread that becomes
+    /// runnable before it holds its authority makes its first syscall with an empty Cspace; that
+    /// was D0, it cost ten days, and its rate was 0,018 %.
+    ///
+    /// ## What is NAMED here and deliberately not decided
+    ///
+    /// After binding, the stack Cap **stays writable by the caller**. Within one PD that is the
+    /// same trust zone and therefore fine — a spawner can already write its own memory. **Should
+    /// `SPAWN` ever cross a PD boundary, this stops being harmless**: the spawner could corrupt
+    /// the spawnee's stack at any moment, and the Cap would have to be transferred exclusively
+    /// instead of shared. One sentence today, so that it is a decision later and not a discovery.
+    ///
+    /// `MSG0` stack Cap slot · `MSG1` entry point · `MSG2` argument · `MSG3` priority.
+    /// Returns the new `ThreadId` in [`reg::MSG0`] on [`result::OK`].
+    pub const SPAWN: u64 = 20;
+
+    // --- Z6b: the debugger -----------------------------------------------------------------
+    //
+    // **Debug authority is a capability over exactly one PD**, and these five operations are the
+    // whole kernel surface of it. Everything else a debugger does — DWARF, disassembly, expression
+    // evaluation, the GDB remote protocol — runs unprivileged, outside, or on the developer's host.
+    //
+    // Why each of these is in the kernel and not outside it:
+    //
+    // | operation | in the kernel because |
+    // |---|---|
+    // | `DEBUG_STOP`/`DEBUG_CONTINUE` | scheduler state — no userspace path sets a `BlockReasons` bit |
+    // | `DEBUG_WRITE_REGS` | **the mask is the entire security statement** |
+    // | `DEBUG_READ_MEM` | it walks the **target's** page tables, not the caller's |
+    // | `DEBUG_ATTACH` | it derives a CDT child, which is a `CAPS.write()` |
+    //
+    // Frame *reading* deliberately has no syscall: the Z26/A3 sidecar is mapped read-only into the
+    // debugger, so reading registers costs no kernel entry at all.
+
+    /// **Derive a debug capability from a `Debuggable`.**
+    ///
+    /// `MSG0` slot of the `Debuggable` Cap · `MSG1` requested rights
+    /// ([`debug::RIGHT_READ`] / [`debug::RIGHT_CONTROL`]) · `MSG2` destination slot.
+    ///
+    /// Refused with [`result::ERR_NOT_DEBUGGABLE`] when the target PD never had a `Debuggable`
+    /// minted — which is a **different statement** from [`result::ERR_BADCAP`] ("you do not hold
+    /// one"), and the difference is the whole claim.
+    pub const DEBUG_ATTACH: u64 = 21;
+
+    /// **Stop a thread of the target PD.** `MSG0` Cap slot (`DebugControl`) · `MSG1` raw ThreadId.
+    ///
+    /// The target stops at its **next kernel entry**, not mid-instruction — at 100 Hz that is
+    /// ≤ 10 ms, and that bound is part of the promise rather than an implementation detail.
+    ///
+    /// A second holder attempting to stop an already-stopped target gets
+    /// [`result::ERR_DEBUG_BUSY`]: the stop has exactly one owner, because a reason **bit** has no
+    /// refcount. *Wer eine Kapazitaet einfuehrt, muss den Ueberlauf benennen* — and "one" is a
+    /// capacity.
+    pub const DEBUG_STOP: u64 = 22;
+
+    /// **Let a stopped thread run again.** `MSG0` Cap slot (`DebugControl`) · `MSG1` raw ThreadId.
+    pub const DEBUG_CONTINUE: u64 = 23;
+
+    /// **Read the target's memory.** `MSG0` Cap slot (`DebugRead` or `DebugControl`) ·
+    /// `MSG1` target VA · `MSG2` length · `MSG3` VA of the caller's own buffer.
+    ///
+    /// Returns bytes transferred in [`reg::MSG0`]. Allowed **while the target runs**: a byte range
+    /// has no internal consistency condition, and a continuous observer needs exactly this. The
+    /// register frame is the opposite case and needs the sidecar generation.
+    pub const DEBUG_READ_MEM: u64 = 24;
+
+    /// **Write registers back.** `MSG0` Cap slot (`DebugControl`) · `MSG1` raw ThreadId ·
+    /// `MSG2` frame word index · `MSG3` value.
+    ///
+    /// A debugger may write GPRs **plus PC, SP and masked flags** — a third authority level above
+    /// the redirect handler, which may write GPRs only. Neither may ever write `cs`/`ss` (x86) or
+    /// the EL bits of `spsr` (aarch64): those carry the **ring**, and whoever writes them promotes
+    /// their target.
+    pub const DEBUG_WRITE_REGS: u64 = 25;
+}
+
+/// Rights and frame-word names for the debug syscalls (Z6b).
+pub mod debug {
+    /// Read the frame and the target's memory. Never stops anything.
+    pub const RIGHT_READ: u64 = 1 << 0;
+    /// Stop, continue, write registers.
+    pub const RIGHT_CONTROL: u64 = 1 << 1;
+    /// Both — the ordinary interactive session.
+    pub const RIGHT_BOTH: u64 = RIGHT_READ | RIGHT_CONTROL;
+
+    /// How many bytes one [`super::sys::DEBUG_READ_MEM`] transfers at most.
+    ///
+    /// A **named** capacity rather than an unbounded loop in the kernel: the read walks the
+    /// target's page tables under a lock, and an unbounded caller-chosen length is a latency hole
+    /// nobody sees until it is a hang. The caller loops instead, and its loop is preemptible.
+    pub const READ_MAX: u64 = 512;
 }
 
 /// **Das Register-Layout der Umleitungsnachricht** (Z26/A3) — was der Handler in seinem `RECV`
@@ -292,4 +436,53 @@ pub mod result {
     /// Fassung. Ein gemeinsamer Code zwänge den Betreiber zu raten, ob er auf jemanden wartet
     /// oder Fassungen abgleichen muss.
     pub const ERR_HANDLER_ABI: u64 = 14;
+
+    // --- K1a (`SYS_SPAWN`), 2026-08-17 --------------------------------------------------------
+    //
+    // Four codes, not one. *Whoever introduces a capacity must NAME the overflow* (D11): a
+    // blanket refusal makes "your stack is too small" and "a device can reach your stack"
+    // indistinguishable, and the second is an attack while the first is a typo.
+
+    /// The PD is already at its thread limit. **The caller is NOT blocked** — it gets this code
+    /// and keeps running. That is D11 literally: the 33rd sender that was blocked without a code,
+    /// stood in no structure and was reported as *quiescent* is the failure mode this avoids.
+    pub const ERR_THREAD_LIMIT: u64 = 15;
+
+    /// The proposed stack region is **reachable by a device** (it lies in a DMA window).
+    ///
+    /// A stack a device can write is the `by ops` placement rule as an attack: the return address
+    /// is data, and whoever can write it chooses where the thread goes next. Refused at the edge,
+    /// not audited afterwards.
+    pub const ERR_DMA_REACHABLE: u64 = 16;
+
+    /// The stack region is too small or badly aligned. Its own code, because it is a **caller
+    /// mistake** and must be distinguishable from the two above at a glance.
+    pub const ERR_BADSTACK: u64 = 17;
+
+    /// The Cap is bound as a live thread's stack and therefore cannot be deleted.
+    ///
+    /// The named price of taking the stack from a Cap of the caller (see [`super::sys::SPAWN`]):
+    /// the TCB holds a reference, and a reference that blocks deletion is **countable**, whereas
+    /// "deletion kills the thread with it" would be a group operation across `CAPS` and
+    /// `SCHEDS[core]`. Kill the thread first, then the Cap deletes normally.
+    pub const ERR_INUSE: u64 = 18;
+
+    /// **The target is already stopped by another `DebugControl` holder** (Z6b).
+    ///
+    /// The named overflow of a capacity of exactly one. `DEBUG` is a bit in `BlockReasons` and a
+    /// bit has no refcount, so the stop has one owner — and the second asker is **refused**, not
+    /// queued and not silently accepted. Silently accepting would give two debuggers each the
+    /// belief that their `DEBUG_CONTINUE` releases the target; the first one to call it would
+    /// release it under the other.
+    pub const ERR_DEBUG_BUSY: u64 = 19;
+
+    /// **No `Debuggable` was ever minted for this PD** (Z6b).
+    ///
+    /// Deliberately **distinct from [`ERR_BADCAP`]**, and the distinction is the product claim:
+    /// `ERR_BADCAP` says *you* do not hold the authority, this says the authority **does not exist
+    /// and cannot be obtained** — not by the caller, not by the operator, not by anyone holding
+    /// every other capability in the system. A single code for both would make the two
+    /// indistinguishable from outside, and then „diese PD ist nicht debuggbar" would be a claim
+    /// about the caller instead of about the system.
+    pub const ERR_NOT_DEBUGGABLE: u64 = 20;
 }

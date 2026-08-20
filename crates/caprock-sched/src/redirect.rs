@@ -349,6 +349,171 @@ pub const fn uebernehmbar(i: usize, n_gpr: usize) -> bool {
     i < n_gpr
 }
 
+// ---------------------------------------------------------------------------------------
+// Z6b: die dritte Autoritaetsstufe
+// ---------------------------------------------------------------------------------------
+
+/// **Wieviel vom Frame ein Aufrufer zurueckschreiben darf.**
+///
+/// Drei Stufen, und die mittlere ist neu:
+///
+/// | Rolle | darf schreiben |
+/// |---|---|
+/// | Umleitungshandler ([`uebernehmbar`]) | Allzweckregister |
+/// | **Debugger** | **GPR + PC + SP + maskierte Flags** |
+/// | niemand, nie | `cs`/`ss` (x86), `spsr` (aarch64) — das ist der **Ring** |
+///
+/// Ohne `PC` gibt es kein `jump`, kein `return` und keine Fortsetzung nach einem Haltepunkt; ohne
+/// `SP` keine Stackmanipulation. Beide koennen den Ring nicht aendern — aber sie sind nicht
+/// umsonst: ein nicht-kanonischer `rip` schlaegt beim `iretq` **im Kernel** auf, nicht im Ziel.
+/// Deshalb traegt jeder eine eigene Gueltigkeitspruefung, und `rflags` bekommt eine **Maske**
+/// statt eines Ja/Nein: `TF` schaltet Einzelschritt ein (eine v2-Eigenschaft durch die Hintertuer)
+/// und `IOPL` gibt Portzugriff.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SchreibStufe {
+    /// Der Umleitungshandler von Z26/A3.
+    Handler,
+    /// Ein Debugger mit `DebugControl` (Z6b).
+    Debugger,
+}
+
+/// Wie ein Schreibversuch ausging. **Jede Absage mit eigenem Namen** — „abgewiesen" allein ist als
+/// Diagnose wertlos, und die drei Lagen verlangen drei verschiedene Reaktionen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SchreibUrteil {
+    Ok,
+    /// Das Wort traegt den **Ring**. Auf jeder Stufe abgewiesen, fuer jeden, immer.
+    RingWort(usize),
+    /// Das Wort liegt ueber der Autoritaet dieses Aufrufers.
+    UeberDerStufe(usize),
+    /// `rip`/`elr` ist nicht kanonisch — der Fehler traefe den **Kernel**, nicht das Ziel.
+    NichtKanonisch(u64),
+    /// `rsp`/`sp_el0` ist nicht 8-Byte-ausgerichtet.
+    Schief(u64),
+    /// Ein verbotenes Flagbit war gesetzt.
+    VerbotenesFlag(u64),
+}
+
+/// x86: `TF` (Einzelschritt).
+pub const RFLAGS_TF: u64 = 1 << 8;
+/// x86: `IOPL` (Portzugriff).
+pub const RFLAGS_IOPL: u64 = 3 << 12;
+/// x86: was ein Debugger in `rflags` **nicht** setzen darf.
+pub const RFLAGS_VERBOTEN: u64 = RFLAGS_TF | RFLAGS_IOPL;
+
+/// Frame-Wort-Indizes je Architektur — **hier, weil die Regel hier steht.**
+///
+/// Ein Pruefer, der die gepruefte Groesse nachrechnet, prueft eine zweite Wirklichkeit. Die Zahlen
+/// stammen aus `hal::exception::frame_woerter` beider Architekturen und werden von
+/// [`indizes_stimmen`] gegen die vom Kernel gemeldete Frame-Breite gehalten.
+pub struct FrameIndizes {
+    pub n_gpr: usize,
+    pub pc: usize,
+    pub sp: usize,
+    /// `None` auf aarch64: dort steckt der Flagteil in `spsr`, und `spsr` traegt das
+    /// Exception-Level — es ist damit ein **Ringwort** und nicht maskierbar.
+    pub flags: Option<usize>,
+    pub ring: &'static [usize],
+    pub n_gesamt: usize,
+}
+
+/// x86_64: `gpr[0..15]`, 15 = Vektor, 16 = Fehlercode, 17 = `rip`, 18 = `cs`, 19 = `rflags`,
+/// 20 = `rsp`, 21 = `ss`.
+pub const INDIZES_X86_64: FrameIndizes = FrameIndizes {
+    n_gpr: 15,
+    pc: 17,
+    sp: 20,
+    flags: Some(19),
+    // `vector`/`error` stehen mit in der Ringliste: sie tragen zwar keinen Ring, aber sie sind
+    // **Kernel-Buchfuehrung** ueber die Ursache des Eintritts. Wer sie schreibt, belaegt den
+    // Kernel ueber seinen eigenen Grund, hier zu sein.
+    ring: &[15, 16, 18, 21],
+    n_gesamt: 22,
+};
+
+/// aarch64: `gpr[0..31]`, 31 = `elr`, 32 = `spsr`, 33 = `sp_el0`.
+pub const INDIZES_AARCH64: FrameIndizes = FrameIndizes {
+    n_gpr: 31,
+    pc: 31,
+    sp: 33,
+    flags: None,
+    ring: &[32],
+    n_gesamt: 34,
+};
+
+/// Die Indizes zu einer Architekturkennung ([`ARCH_X86_64`] / [`ARCH_AARCH64`]).
+pub fn indizes(arch: u64) -> Option<&'static FrameIndizes> {
+    match arch {
+        ARCH_X86_64 => Some(&INDIZES_X86_64),
+        ARCH_AARCH64 => Some(&INDIZES_AARCH64),
+        _ => None,
+    }
+}
+
+/// **Sprechprobe der Tabelle:** stimmen die hier hinterlegten Zahlen mit dem ueberein, was der
+/// Kernel tatsaechlich ablegt?
+///
+/// Ohne sie waere diese Tabelle eine zweite Wirklichkeit — und der Tag, an dem jemand ein Wort in
+/// den Frame einfuegt, waere der Tag, an dem der Debugger `rflags` fuer `rsp` haelt und das
+/// Ringwort daneben freigibt.
+pub fn indizes_stimmen(arch: u64, n_gpr: usize, n_gesamt: usize) -> bool {
+    matches!(indizes(arch), Some(i) if i.n_gpr == n_gpr && i.n_gesamt == n_gesamt)
+}
+
+/// **Darf `value` in Frame-Wort `i` geschrieben werden, auf Stufe `stufe`?**
+///
+/// Eine Funktion, nicht zwei. Zwei Kopien einer Regel sind der Riss, den dieses Projekt bei der
+/// Farbarithmetik (`MASK_BITS` / `stripe`) schon einmal bezahlt hat: die eine wird nachgezogen,
+/// die andere nicht, und die Abweichung ist eine Rechteausweitung.
+pub fn writeback_erlaubt(arch: u64, i: usize, value: u64, stufe: SchreibStufe) -> SchreibUrteil {
+    let Some(ix) = indizes(arch) else {
+        // Unbekannte Architektur: **abweisen, nicht auslegen**. Die Woerter haetten eine andere
+        // Bedeutung, und „vermutlich ein GPR" ist keine Sicherheitsaussage.
+        return SchreibUrteil::UeberDerStufe(i);
+    };
+    // Der Ring zuerst, und unbedingt. Es gibt keine Stufe, auf der das erlaubt ist.
+    if ix.ring.contains(&i) {
+        return SchreibUrteil::RingWort(i);
+    }
+    if i >= ix.n_gesamt {
+        return SchreibUrteil::UeberDerStufe(i);
+    }
+    if i < ix.n_gpr {
+        return SchreibUrteil::Ok;
+    }
+    if stufe == SchreibStufe::Handler {
+        return SchreibUrteil::UeberDerStufe(i);
+    }
+    if i == ix.pc {
+        return if kanonisch(value) {
+            SchreibUrteil::Ok
+        } else {
+            SchreibUrteil::NichtKanonisch(value)
+        };
+    }
+    if i == ix.sp {
+        return if value % 8 == 0 {
+            SchreibUrteil::Ok
+        } else {
+            SchreibUrteil::Schief(value)
+        };
+    }
+    if Some(i) == ix.flags {
+        return if value & RFLAGS_VERBOTEN != 0 {
+            SchreibUrteil::VerbotenesFlag(value & RFLAGS_VERBOTEN)
+        } else {
+            SchreibUrteil::Ok
+        };
+    }
+    SchreibUrteil::UeberDerStufe(i)
+}
+
+/// Kanonische Form (x86-64 und aarch64 mit 48-Bit-VA): Bits 63..47 alle gleich.
+pub fn kanonisch(va: u64) -> bool {
+    let top = va >> 47;
+    top == 0 || top == 0x1_ffff
+}
+
 /// Wie viele Slots passen in ein Fenster von `len` Bytes? (Abgerundet.)
 #[inline]
 pub const fn slots_in(len: u64) -> u16 {

@@ -136,9 +136,25 @@ pub const POLICY_ROOT_TASK: u32 = 1 << 1;
 pub const POLICY_PINNED: u32 = 1 << 2;
 /// Diese Komponente ist **nicht** im Betrieb austauschbar (A-4.5, Negativliste).
 pub const POLICY_NO_HOTRELOAD: u32 = 1 << 3;
+/// **Ueber diese Komponente darf eine `Debuggable`-Cap gepraegt werden** (Z6b).
+///
+/// ## Warum die Entscheidung im MANIFEST steht und nicht in einem Laufzeitschalter
+///
+/// Die Zusage lautet: *eine PD, ueber die nie eine `Debuggable` gepraegt wurde, kann nicht debuggt
+/// werden — auch nicht vom Betreiber.* Das Manifest ist Ed25519-**signiert** und ueber
+/// `kernel_hash` an genau diesen Kernel gebunden, und `manifest_version` ist monoton
+/// (Anti-Downgrade). Damit ist „wer debuggt werden darf" eine **attestierte** Entscheidung, die
+/// niemand mit einer Shell umlegt — der Unterschied zwischen einer Politik und einer Zusicherung.
+///
+/// **Fehlt das Bit, fehlt die Cap.** Kein Nachreichen, kein „spaeter gewaehren": ein spaeterer Weg
+/// ist genau der Weg, auf dem eine Vorgabe hereinkommt.
+pub const POLICY_DEBUGGABLE: u32 = 1 << 4;
 /// Alle heute definierten Bits.
-pub const POLICY_KNOWN: u32 =
-    POLICY_EXCLUSIVE_STRIPE | POLICY_ROOT_TASK | POLICY_PINNED | POLICY_NO_HOTRELOAD;
+pub const POLICY_KNOWN: u32 = POLICY_EXCLUSIVE_STRIPE
+    | POLICY_ROOT_TASK
+    | POLICY_PINNED
+    | POLICY_NO_HOTRELOAD
+    | POLICY_DEBUGGABLE;
 
 /// „Kern egal" in `core_affinity`.
 pub const ANY_CORE: u32 = u32::MAX;

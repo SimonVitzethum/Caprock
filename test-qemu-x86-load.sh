@@ -208,8 +208,12 @@ build_archive build/boot-archive-x86.bin "$KELF" 1 || { echo "  FEHLER: Archiv/M
 boot() {
     local extra=()
     [ -n "$1" ] && extra=(-initrd "$1")
+    # **`$BOOT_EXTRA` ist die NUMA-Tuer** (Z8/N4): eine Topologie laesst sich nur beim Start
+    # setzen, und die Manifest-Politik ist ohne sie nicht pruefbar. Vorgabe leer -- jeder
+    # vorhandene Aufruf verhaelt sich unveraendert.
+    local nx=(); [ -n "${BOOT_EXTRA:-}" ] && read -r -a nx <<<"$BOOT_EXTRA"
     timeout "${3:-$SECONDS_RUN}" qemu-system-x86_64 \
-        -kernel "$KELF.mb32" -m "$RAM" -smp 4 "${ACCEL[@]}" \
+        -kernel "$KELF.mb32" -m "$RAM" -smp 4 "${ACCEL[@]}" "${nx[@]}" \
         -machine q35,kernel-irqchip=split -device intel-iommu,caching-mode=on \
         -device virtio-rng-pci,disable-legacy=on,iommu_platform=on \
         -drive if=none,id=blk0,format=raw,file="$BLK_IMG" \
@@ -840,6 +844,37 @@ if grep -q "root    : FAILURES (HashMismatch)" "$LOG"; then
     echo "  PASS: A-1.2 -- der erwartete SHA-256 aus dem Manifest wird durchgesetzt, nicht bloss mitgefuehrt"
 else
     echo "  FAIL: A-1.2 -- abweichender Modul-Hash wurde nicht bemerkt"; fail=1
+fi
+
+# --- Z8/N4: der Knotenwunsch des Manifests -------------------------------------------------
+#
+# **Nur der negative Fall steht hier, und das ist eine Einschraenkung des AUFBAUS, keine Wahl.**
+#
+# Gefahren wird: `numa_node=1` auf einer Maschine ohne Topologie -> eine Absage mit dem Grund
+# "die Maschine kann es nicht", unterscheidbar von "das Dokument ist falsch". Bis heute waren
+# beide Faelle ein Text, und "fehlend" sah aus wie "falsch".
+#
+# NICHT gefahren wird der positive Fall (`numa_node=1` auf einer Zwei-Knoten-Maschine). Der
+# Grund steht in `boot()`: `-m "$RAM" -smp 4` sind dort fest vor den Extras verdrahtet, und eine
+# `-numa`-Topologie braucht `-smp sockets=…` und passende `memory-backend`-Groessen an genau
+# diesen Stellen. Ein zweites `-m`/`-smp` dahinter kollidiert -- gemessen 2026-08-17: QEMU startet,
+# der Gast bekommt aber KEINE SRAT (`numa : readable=false`), und die Zeile las sich wie ein
+# Kernelbefund. **`boot()` verschluckt jede QEMU-Meldung nach /dev/null**, was genau diese
+# Verwechslung erzeugt -- dieselbe Form wie `iommu_platform=on` seinerzeit.
+#
+# Steht in `todo.md` Z8 als offener Punkt. Der positive Pfad IST gefahren, nur woanders:
+# `tools/numa-messen.sh` belegt Lesen und Platzierung auf einer echten Zwei-Knoten-Maschine.
+echo "== Z8/N4: numa_node=1 ohne Topologie -> die MASCHINE kann es nicht (eigener Grund) =="
+python3 tools/sign_manifest.py --kernel "$KELF" --key "$MANKEY" --manifest-version 1 \
+    --out build/system.manifest \
+    --entry "1:init:0:1:$PROG/init.elf:loader,ntfn:root:3:1:any:0" >/dev/null 2>&1
+python3 tools/mkarchive.py build/boot-archive-numa1.bin --system-manifest build/system.manifest \
+    "1:init:0:1:$PROG/init.elf::certs/init-x86.cert" >/dev/null 2>&1
+boot build/boot-archive-numa1.bin "$LOG" 40
+if grep -q "keine tragfaehige Topologie" "$LOG"; then
+    echo "  PASS: N4 -- OHNE Topologie ein UNTERSCHEIDBARER Grund (fehlend != falsch)"
+else
+    echo "  FAIL: N4 -- erwartet 'keine tragfaehige Topologie': $(grep -m1 'POLICY ABGEWIESEN' "$LOG" || echo 'keine Absage')"; fail=1
 fi
 
 echo "== Negativfall 3b: Manifest in einem FORMAT, das dieser Kernel nicht kennt =="

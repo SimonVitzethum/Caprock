@@ -92,6 +92,16 @@ PUNKTE+=("kernel-grenze|./tools/kernel-grenze.sh")
 PUNKTE+=("einschluss|./tools/eingeschlossenheit.py")
 PUNKTE+=("host-tests|./tools/host-tests.sh")
 PUNKTE+=("mangel-stellen|./tools/mangel-stellen.sh")
+# **Z6 Stufe 1 beisst nur unter Geschwistern -- und die hat die Hauptsuite nicht.** `-smp 4` ist
+# QEMU-Kurzschrift fuer `cores=4,threads=1`; die `smt`-Zeile ist dort VAKUOeS wahr (kein Geschwister,
+# also auch keins zu unterdruecken). Genau die Form von RMRR auf q35: was in der Emulation nicht
+# vorkommt, ist nicht abwesend, sondern ungeprueft. Dieser Punkt faehrt den Fall, in dem die Politik
+# etwas zu tun hat -- mit Gegenprobe (derselbe Kernel ohne Geschwister muss `Single` lesen).
+PUNKTE+=("smt-politik|./tools/smt-messen.sh")
+# Dieselbe Begruendung eine Ebene weiter: die Suiten booten ohne `-numa`, also ist die `numa`-Zeile
+# dort vakuoes wahr (ein Knoten, nichts zu platzieren). Dieser Punkt faehrt die Zwei-Knoten-Maschine
+# -- mit Gegenprobe, denn ein Dekoder, der IMMER zwei Knoten meldet, bestuende den ersten Fall.
+PUNKTE+=("numa-topologie|./tools/numa-messen.sh")
 if [ "$SCHNELL" = 1 ]; then
     PUNKTE+=("haupt-512M|./test-qemu-x86.sh $SEK 512M")
     PUNKTE+=("lade-512M|./test-qemu-x86-load.sh $SEK 512M")

@@ -1045,6 +1045,26 @@ impl PdTable {
             .any(|e| e.pd1 == pd1 && e.epoch == epoch && praedikat(ThreadId::from_raw(e.tid)))
     }
 
+    /// **Irgendein lebender Thread dieser PD** (Z6b) — fuer die VSpace-Aufloesung.
+    ///
+    /// „Irgendeiner" ist hier ausreichend und die Begruendung gehoert dazu: alle Threads einer PD
+    /// teilen ihre VSpace, das ist die **Definition** einer PD. Waere das je nicht mehr so, waere
+    /// diese Funktion die erste, die falsch wird — deshalb steht die Herleitung hier und nicht in
+    /// drei Aufrufern.
+    pub fn any_thread_of(&self, pd: usize) -> Option<ThreadId> {
+        if pd >= self.pds.len() || !self.pds[pd].used {
+            return None;
+        }
+        if self.owner.is_empty() {
+            return self.pds[pd].thread;
+        }
+        let (pd1, epoch) = ((pd + 1) as u32, self.pds[pd].epoch);
+        self.owner
+            .iter()
+            .find(|e| e.pd1 == pd1 && e.epoch == epoch)
+            .map(|e| ThreadId::from_raw(e.tid))
+    }
+
     /// Wie viele Threads an dieser PD hängen (Z22 P2). `0` für eine unbekannte/freie PD.
     pub fn thread_count(&self, pd: usize) -> u32 {
         if pd < self.pds.len() && self.pds[pd].used {
@@ -1161,6 +1181,30 @@ impl PdTable {
         }
     }
 
+    /// **Wie [`PdTable::cap_at`], aber von aussen** (Z6b).
+    ///
+    /// Der Kernel braucht die Aufloesung `Slot -> Cap` fuer die Debug-Syscalls, und zwar in
+    /// **derselben** kritischen Sektion, in der er danach `SCHEDS` nimmt (`CAPS` ist R0,
+    /// `SCHEDS` ist R2 — die Schachtelung ist aufsteigend und damit erlaubt). Die private
+    /// Fassung liegt in dieser Crate; sie hier nochmals hinzuschreiben waere eine zweite
+    /// Spectre-Haertung, die beim naechsten Mal nur an einer der beiden Stellen nachgezogen wird.
+    pub fn cap_ptr_at(&self, pd: usize, slot: usize) -> Option<CapPtr> {
+        self.cap_at(pd, slot)
+    }
+
+    /// Der erste freie Cap-Slot einer PD, oder `None` (Z6b — `DEBUG_ATTACH` legt die abgeleitete
+    /// Cap ab). **`None` heisst „kein Platz" und wird als solches gemeldet**, nicht durch
+    /// Ueberschreiben eines belegten Slots aufgeloest: das waere ein Cap-Verlust, den der
+    /// Aufrufer nicht angeordnet hat (dieselbe Regel wie bei `CMOVE`).
+    pub fn free_cap_slot(&self, pd: usize) -> Option<usize> {
+        (0..NCAPS).find(|&s| self.cap_at(pd, s).is_none())
+    }
+
+    /// Die PD eines Threads — von aussen (Z6b).
+    pub fn pd_of_thread_pub(&self, thread: ThreadId) -> Option<usize> {
+        self.pd_of(thread)
+    }
+
     fn cap_at(&self, pd: usize, slot: usize) -> Option<CapPtr> {
         if slot < NCAPS {
             // Spectre-v1-Härtung: `slot` stammt bei jedem Syscall aus einem EL0-Register.
@@ -1245,7 +1289,25 @@ pub fn dispatch(
     // und für `SYS_CDELETE`. **Rückgabe:** ob gelöscht wurde — `false` heißt, dass noch abgeleitete
     // Caps (CDT-Kinder) daran hängen. Für den Grant-Pfad ist das nur Telemetrie, für `CDELETE` die
     // Bedingung, unter der der Slot überhaupt geräumt werden darf.
-    delete_cap: fn(CapPtr) -> bool,
+    // K1a: der Rueckruf traegt seit 2026-08-17 den GRUND -- `ERR_HASCHILDREN` (abgeleitete Caps)
+    // und `ERR_INUSE` (Stack eines lebenden Threads) sind zwei verschiedene Lagen, und ein
+    // Aufrufer, der sie nicht unterscheiden kann, weiss nicht, ob Warten hilft.
+    delete_cap: fn(CapPtr) -> Result<(), u64>,
+    // K1a (2026-08-17): `SYS_SPAWN`. `(PD, Stack-Cap, Einsprung, Argument, Prioritaet)` ->
+    // `Ok(ThreadId-Raw)` oder `Err(ABI-Code)`. Wie der `load`-Rueckruf ein **Kernel**-Aufruf:
+    // die Entscheidung `check_stack` braucht Geraeteerreichbarkeit und Ueberlappung, und beides
+    // weiss nur der Kernel. Der Rueckruf laeuft OHNE gehaltenes `CAPS`.
+    spawn: fn(usize, CapPtr, usize, usize, u8) -> Result<u64, u64>,
+    // Z6b: die fuenf Debug-Syscalls. `(Nummer, Aufrufer-PD, Cap-Slot, a1, a2, a3)`.
+    //
+    // **Ein Rueckruf fuer alle fuenf, und die Cap-Aufloesung liegt drin** — anders als bei `spawn`,
+    // wo der Dispatch die Cap aufloest und weiterreicht. Der Grund ist die Sperrung: `DEBUG_STOP`
+    // muss die Cap pruefen und den Grund setzen in **derselben** kritischen Sektion, sonst passt
+    // ein `revoke` dazwischen und der Zielthread traegt danach einen Grund, den niemand mehr
+    // entfernen darf. Loeste der Dispatch hier auf und gaebe `CAPS` frei, waere genau dieses
+    // Fenster wieder offen -- und es ist der Fehler, den man nicht sieht, weil er im Normalbetrieb
+    // nie auftritt.
+    debug: fn(u64, usize, usize, u64, u64, u64) -> Result<u64, u64>,
 ) -> usize {
     let nr = frame_reg(frame, reg::SYSNO_RESULT);
 
@@ -1271,7 +1333,7 @@ pub fn dispatch(
             // Syscall-Handler (nur Fault) landet hier und wird regulär bearbeitet -- das ist die
             // halbe Bindung, und sie ist gewollt (Debugger/Speicherserver ohne Persönlichkeit).
             redirect::Weiche::Kernel => dispatch_nativ(
-                frame, core, ops, caps, eps, ntfns, load, delete_cap, nr,
+                frame, core, ops, caps, eps, ntfns, load, delete_cap, spawn, debug, nr,
             ),
             redirect::Weiche::Fault(code) => {
                 // **Kein Rückfall auf die native ABI.** Aus dem Entzug einer Cap darf keine
@@ -1285,7 +1347,7 @@ pub fn dispatch(
             ),
         };
     }
-    dispatch_nativ(frame, core, ops, caps, eps, ntfns, load, delete_cap, nr)
+    dispatch_nativ(frame, core, ops, caps, eps, ntfns, load, delete_cap, spawn, debug, nr)
 }
 
 /// **Lebt die Handler-PD?** — die Größe, die die Weiche als `handler_lebt` liest.
@@ -1435,7 +1497,11 @@ fn dispatch_nativ(
     eps: &[SpinLock<Endpoint>],
     ntfns: &[SpinLock<Notification>],
     load: fn(u32, usize, &[(usize, CapPtr)], usize, usize) -> LadeUebergabe,
-    delete_cap: fn(CapPtr) -> bool,
+    delete_cap: fn(CapPtr) -> Result<(), u64>,
+    // K1a: durchgereicht von `dispatch` -- der `SPAWN`-Zweig liegt hier, nicht dort.
+    spawn: fn(usize, CapPtr, usize, usize, u8) -> Result<u64, u64>,
+    // Z6b: dito -- die fuenf Debug-Zweige liegen hier.
+    debug: fn(u64, usize, usize, u64, u64, u64) -> Result<u64, u64>,
     nr: u64,
 ) -> usize {
     if nr == sys::YIELD {
@@ -1521,15 +1587,80 @@ fn dispatch_nativ(
             (pd, cap)
         }; // CAPS freigegeben — `delete_cap` sperrt CAPS/MEM/SCHEDS selbst
         let (pd, cap) = removed;
-        if !delete_cap(cap) {
+        if let Err(code) = delete_cap(cap) {
             // Abgeleitete Caps hängen noch daran: unverändert zurücklegen. Ein „halb gelöschter"
             // Cap (aus dem Cspace entfernt, im CapSpace noch da) wäre für den Aufrufer unerreichbar
             // und für den Kernel weiterhin belegt — genau das Leck, gegen das CDELETE antritt.
             caps.write().pds.install_cap(pd, slot, cap);
-            return deny(result::ERR_HASCHILDREN);
+            return deny(code);
         }
         frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
         return frame;
+    }
+
+    // `SPAWN` (K1a, 2026-08-17): ein zweiter Thread in der EIGENEN PD, mit einem Stack aus einer
+    // Cap des Aufrufers.
+    //
+    // **Warum hier fast nichts steht.** Die Entscheidung („darf diese Region ein Stack sein?")
+    // fällt in *einer* Funktion (`spawncheck::check_stack`), und die braucht Wissen, das nur der
+    // Kernel hat — ob ein Gerät die Region erreicht, und ob sie eine bestehende Abbildung
+    // überlappt. Dieser Zweig löst deshalb nur Slot → Cap → PD auf und übergibt; **eine Prüfung,
+    // die an zwei Stellen halb passiert, ist zwei Prüfungen**, und die zweite altert.
+    //
+    // Der Aufrufer bleibt **unblockiert**: jede Absage kommt als Code zurück, keine wartet. Das
+    // ist D11 wörtlich — der 33. Sender, der blockiert wurde, keinen Code bekam und als *ruhig*
+    // gemeldet wurde, ist genau die Form, die hier nicht entstehen darf.
+    if nr == sys::SPAWN {
+        let thread = ops.current_id(core);
+        let slot = frame_reg(frame, reg::MSG0) as usize;
+        let entry = frame_reg(frame, reg::MSG0 + 1) as usize;
+        let arg = frame_reg(frame, reg::MSG0 + 2) as usize;
+        let prio = frame_reg(frame, reg::MSG0 + 3) as u8;
+        let (pd, cap) = {
+            let g = caps.read();
+            let Some(pd) = g.pds.pd_of(thread) else {
+                return deny(result::ERR_NOPD);
+            };
+            let Some(cap) = g.pds.cap_at(pd, slot) else {
+                return deny(result::ERR_BADCAP);
+            };
+            (pd, cap)
+        }; // CAPS freigegeben -- `spawn` nimmt CAPS/MEM/SCHEDS selbst (Ordnung MEM < SCHEDS)
+        match spawn(pd, cap, entry, arg, prio) {
+            Ok(tid_raw) => {
+                frame_set_reg(frame, reg::MSG0, tid_raw);
+                frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
+                return frame;
+            }
+            Err(code) => return deny(code),
+        }
+    }
+
+    // Z6b: die Debug-Syscalls. **Vor** der generischen Cap-Aufloesung, aus demselben Grund wie
+    // `SPAWN`: die Entscheidung faellt in EINER Kernelfunktion, nicht halb hier und halb dort.
+    // *Eine Pruefung, die an zwei Stellen halb passiert, ist zwei Pruefungen, und die zweite
+    // altert* (K1a).
+    if nr >= sys::DEBUG_ATTACH && nr <= sys::DEBUG_WRITE_REGS {
+        let thread = ops.current_id(core);
+        let slot = frame_reg(frame, reg::MSG0) as usize;
+        let a1 = frame_reg(frame, reg::MSG0 + 1);
+        let a2 = frame_reg(frame, reg::MSG0 + 2);
+        let a3 = frame_reg(frame, reg::MSG0 + 3);
+        let pd = {
+            let g = caps.read();
+            match g.pds.pd_of(thread) {
+                Some(pd) => pd,
+                None => return deny(result::ERR_NOPD),
+            }
+        }; // CAPS freigegeben -- der Rueckruf nimmt es selbst und HAELT es ueber den Vorgang.
+        return match debug(nr, pd, slot, a1, a2, a3) {
+            Ok(v) => {
+                frame_set_reg(frame, reg::MSG0, v);
+                frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
+                frame
+            }
+            Err(code) => deny(code),
+        };
     }
 
     // `CCOPY`/`CMOVE`/`SETRECV` (A-3.2) — wie `CDELETE` vor der generischen Auflösung: sie

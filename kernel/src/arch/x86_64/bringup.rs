@@ -3526,6 +3526,16 @@ static NET_VICTIM: [core::sync::atomic::AtomicU64; 2] =
     [const { core::sync::atomic::AtomicU64::new(0) }; 2];
 static NET_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static DMAISO_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// **Z6 stage 1 verdict** — set once at bring-up, after the AP loop.
+///
+/// Default `false`, because the line has to be *reached* to be green: a run that dies before the
+/// AP loop must not gate through on a flag that was never written. The same reason `IOHEALTH_OK`
+/// below starts `false`.
+static SMT_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// **Z8/N1 verdict** — set once after the AP loop, for the same reason as [`SMT_OK`].
+static NUMA_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// Wie das Ergebnis zu lesen ist: 0 = nicht gelaufen, 1 = **nicht messbar** (die Positivkontrolle
 /// trug nicht), 2 = geurteilt.
 ///
@@ -3824,6 +3834,11 @@ fn ckpt_reason(r: caprock_cap::checkpoint::LocalReason) -> u32 {
         // Name fuehrt zur falschen Behebung. Dass die Umstellung hier eine Zeile KOSTET, ist die
         // Wirkung des erschoepfenden `match` und nicht sein Preis.
         L::HandlerBinding => 9,
+        // Z6b: eigener Code aus demselben Grund wie 9. Debug-Autoritaet wandert nicht mit -- nicht,
+        // weil die PD ausserhalb des Umfangs laege (das waere Code 7 und legte die falsche Behebung
+        // nahe, „nimm sie in den Umfang auf"), sondern weil die Praegung eine benannte Handlung auf
+        // DIESER Maschine war.
+        L::DebugAuthority => 10,
     }
 }
 
@@ -4410,6 +4425,23 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             // ANDERE Aussage als `redirect` -- sie laesst sich nur ohne echten Gast messen, weil
             // sie von der Abwesenheit einer Wirkung handelt.
             ("handler", system::handlermess::urteil()),
+            // **Z6 stage 1: gates from the first day.** Its criterion is formulated against the
+            // EFFECT (no two online logical CPUs share a physical core), recomputed from the IDs
+            // that actually came up — not against the policy's own bookkeeping, which would hold
+            // by construction.
+            //
+            // Reachable, and measured rather than hoped: under `-smp 4` (QEMU default
+            // `threads=1`) the topology reads `Single`, nothing is suppressed and the clause is
+            // trivially true. **That is exactly why the suite also runs a `threads=2` pass** — a
+            // conjunct whose antecedent never occurs is the RMRR-on-q35 trap, and it would sit
+            // here looking green forever. See `tools/smt-messen.sh`.
+            ("smt", SMT_OK.load(Ordering::Acquire)),
+            // Z8/N1: gates from the first day. Its criterion is formulated against the EFFECT
+            // (was the topology read, is it whole, does the placement bookkeeping rest on a
+            // trustworthy picture) and it is reachable: a machine without an SRAT reads
+            // `readable=false`, which is allowed, while a TRUNCATED table fails -- "no statement"
+            // and "a wrong statement" are different outcomes.
+            ("numa", NUMA_OK.load(Ordering::Acquire)),
     ];
     if let Some(w) = warum {
         *w = flags;
@@ -4418,8 +4450,10 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
 }
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
+///
+/// 2026-08-17: 41 -> 42 durch `smt` (Z6 Stufe 1), 42 -> 43 durch `numa` (Z8 N1).
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 41;
+const DONE_FLAGS: usize = 43;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]
@@ -5571,6 +5605,19 @@ fn report_and_off(watchdog: bool) -> ! {
 
     freeze_bericht();
 
+    // Z6b **nach** `freeze_bericht`: beide halten denselben Worker an, und der Debugger benutzt
+    // dafuer einen anderen Grund (`DEBUG` statt `PAUSE`). Liefe die Debug-Sonde zuerst und liesse
+    // -- durch einen Fehler -- den Grund stehen, meldete `freeze` einen `Debugged` und die
+    // Diagnose zeigte auf die falsche Zeile.
+    // Z6b: die Debugger-Sonde. **Arch-neutral und von BEIDEN Zweigen gefahren**, seit sie ihr
+    // eigenes Ziel mitbringt statt am hiesigen Worker zu messen.
+    crate::dbgprobe::messen(system::IDLE_PRIO);
+
+    // Z6b: die Speicher-Sonde. **Arch-neutral und von BEIDEN Zweigen gefahren** -- sie prueft die
+    // eine Stelle (`vspace_resolve`), an der x86 und aarch64 sich wirklich unterscheiden.
+    crate::dbgmem::messen(system::IDLE_PRIO);
+    crate::dbgmem::bericht();
+
     // A-5.3 -- hier, nicht beim Start des Root-Tasks: die Treiber-PD entsteht erst, wenn `init`
     // laeuft und `SYS_LOAD` ruft.
     devsel_bericht();
@@ -6236,10 +6283,42 @@ pub fn run(multiboot_info: u64) -> ! {
              gar nicht ansieht)",
             if ir && cfi { "ALL PASS" } else { "FAILURES" }
         );
+        // --- Die ARCH-NEUTRALE Gesundheitsaussage (2026-08-17) -------------------------------
+        //
+        // Bis hierher hat jede Architektur in ihren eigenen Worten berichtet: aarch64 als `smmu`
+        // (IDR0, SIDSIZE, SMMUEN, CMD_SYNC-Round-Trip, Event-Queue, GERROR), x86 als
+        // `iommu`/`vtdcaps`/`qi`/`ir`. Beide Fassungen sind vollstaendig -- aber es gab KEINEN
+        // Satz, der auf beiden Seiten dasselbe bedeutet, und genau das hatte `todo.md` vorab als
+        // Warnsignal benannt: zwei Formulierungen sind zwei Entwuerfe.
+        //
+        // `inv` wird HEREINGEREICHT statt hier neu erhoben: eine Gesundheitsabfrage darf keine
+        // Invalidierung ausloesen. Ein Lesen, das seinen Gegenstand veraendert, ist keine
+        // Beobachtung.
+        let hl = hal::iommu::health(inv);
+        println!(
+            "iohealth: present={} translation={} units={}/{} round_trip={} faults_empty={} \
+             config_errors={} hw_error={:#x}",
+            hl.present, hl.translation_enabled, hl.units_speaking, hl.units,
+            hl.invalidation_round_trip, hl.faults_empty, hl.config_errors, hl.hw_error
+        );
+        println!(
+            "iohealth: speaking={} verdict={:?} -- `faults_empty` zaehlt NUR mit round_trip: eine \
+             tote Einheit meldet ebenfalls eine leere Warteschlange (dieselbe Form wie die leere \
+             Event-Queue ohne `CD.R`)",
+            hl.speaking(), hl.verdict()
+        );
+        println!("iohealth: {}", if hl.ok() { "ALL PASS" } else { "FAILURES" });
+
         up && system::dma_enforcer().is_active() && inv && qi && iec && ir && cfi
             && system::dma_enforcer().audit() == 0
+            && hl.ok()
     } else {
         println!("iommu   : keine ACPI-DMAR -> Plattform ohne IOMMU");
+        // Auch der Abwesenheitsfall bekommt die Zeile -- sonst waere sie auf einer Plattform ohne
+        // IOMMU schlicht nicht da, und „fehlt" ist von „bestanden" nicht zu unterscheiden.
+        let hl = hal::iommu::health(false);
+        println!("iohealth: {:?} (Plattform ohne IOMMU)", hl.verdict());
+        println!("iohealth: SKIP");
         false
     };
     println!("iommu   : {}", if iommu_ok { "ALL PASS" } else { "SKIP/FAILURES" });
@@ -6531,21 +6610,57 @@ pub fn run(multiboot_info: u64) -> ! {
     let _ = root_ok;
 
     // --- Sekundärkerne starten (INIT-SIPI-SIPI, s. `hal::power`) ---
+    //
+    // **Z6 stage 1 sits here, and nowhere else.** The property "a physical core belongs to at most
+    // one trust domain" cannot be established later by the scheduler: once a sibling is online it
+    // is a core the balancer may place anything on. The only place the question is still open is
+    // the moment before `cpu_on`.
+    // **Z8/N0+N1: die Topologie VOR dem AP-Hochlauf lesen** -- die AP-Stacks sollen gleich
+    // knotenlokal belegt werden, und danach waere die Frage schon entschieden.
+    crate::numa::init();
+    let topo = hal::cpu::smt_topology();
+    let mut occ = caprock_hal::smt::CoreOccupancy::new();
+    let boot_id = hal::cpu::core_id() as u8;
+    // Der Bootkern belegt seinen physischen Kern ZUERST -- sonst waere ausgerechnet sein
+    // Geschwister das eine Paar, das die Politik durchliesse.
+    let boot_claim = occ.claim(&topo, boot_id as u32);
+    let mut online_ids = [0u32; caprock_hal::MAX_CPUS];
     let mut online = 1usize;
+    online_ids[0] = boot_id as u32;
+    let mut suppressed = 0usize;
     if let Some(list) = cpus.as_ref() {
-        let boot_id = hal::cpu::core_id() as u8;
         for i in 0..list.count() {
             let Some(id) = list.id(i) else { continue };
             if id == boot_id {
                 continue;
             }
-            let Some(stack) = system::alloc_anywhere(AP_STACK_BYTES, 4096) else {
+            // **Vor der Stackbelegung**, nicht danach: ein unterdruecktes Geschwister soll auch
+            // keine 16 KiB kosten. (Und die Reihenfolge ist die von D0: erst entscheiden, dann
+            // Zustand anlegen.)
+            match occ.claim(&topo, id as u32) {
+                caprock_hal::smt::Claim::Admit => {}
+                other => {
+                    suppressed += 1;
+                    println!("smp     : CPU {id} nicht zugelassen ({other:?}) -- Z6 Stufe 1");
+                    continue;
+                }
+            }
+            // **Z8/N2: der erste echte Aufrufer der Platzierungsleiter.** Der Stack eines
+            // Sekundaerkerns ist die kernlokalste Struktur, die es gibt -- er wird von genau
+            // diesem Kern benutzt und von keinem anderen. Ohne einen Aufrufer waere die Leiter
+            // die Falle „ein Negativtest, der eine Eigenschaft absichert, die NIEMAND benutzt".
+            let Some(stack) =
+                crate::numa::alloc_on_node(AP_STACK_BYTES, 4096, crate::numa::node_of_cpu(id as u32))
+            else {
                 break;
             };
             let top = stack.base() + stack.len();
             if hal::power::cpu_on(id as u64, ap_entry as *const () as u64, top)
                 == hal::power::SUCCESS
             {
+                if online < online_ids.len() {
+                    online_ids[online] = id as u32;
+                }
                 online += 1;
             } else {
                 println!("smp     : CPU {id} hat sich nicht gemeldet");
@@ -6553,6 +6668,37 @@ pub fn run(multiboot_info: u64) -> ! {
         }
     }
     println!("smp     : {online} von {nc} Kern(en) online");
+
+    // --- Z6 Stufe 0: die Topologie MELDEN, Stufe 1: das Urteil darueber ---
+    //
+    // Das Urteil rechnet aus `online_ids` nach und fragt `occ` NICHT: ein Pruefer, der die
+    // Buchfuehrung der Politik befragt, bestaetigt die Politik mit sich selbst.
+    let verdict = caprock_hal::smt::judge(&topo, &online_ids[..online.min(online_ids.len())]);
+    println!(
+        "smt     : topology={topo:?} width={:?} logical={} online={} suppressed={} boot_claim={boot_claim:?}",
+        topo.width(),
+        cpus.as_ref().map(|c| c.count()).unwrap_or(1),
+        online,
+        suppressed
+    );
+    println!(
+        "smt     : readable={} no_shared_core={:?} contained={} -- policy=one-thread-per-physical-core \
+         (Z6 stage 1). `no_shared_core=None` heisst UNENTSCHEIDBAR, nicht bestanden.",
+        verdict.readable, verdict.no_shared_core, verdict.contained
+    );
+    // **Was diese Zeile NICHT belegt** (und das gehoert an die Zeile, nicht in eine Fussnote):
+    // unter QEMU ist die Geschwister-Beziehung EMULIERT -- `-smp cores=n,threads=2` gibt dem Gast
+    // die Sicht ueber CPUID, aber die vCPUs sind gewoehnliche Wirtsthreads ohne geteilte
+    // Ausfuehrungseinheiten. Geprueft ist damit die POLITIK (wird ein Geschwister erkannt,
+    // unterdrueckt, gezaehlt), nie der KANAL. Dieselbe Unterscheidung wie beim SMMU-Befund in
+    // ADR 0008 (`docs/invariants.md` §6).
+    println!("smt     : {}", if verdict.ok() { "ALL PASS" } else { "FAILURES" });
+    SMT_OK.store(verdict.ok(), Ordering::Release);
+
+    // --- Z8/N1: die Topologie melden. NACH dem Hochlauf, damit die Platzierungszahlen der
+    // AP-Stacks schon drinstehen -- eine Zeile mit `speaking=false` sagt ueber Platzierung nichts.
+    crate::numa::bericht();
+    NUMA_OK.store(crate::numa::urteil(), Ordering::Release);
 
     // **Die IST-Messung des BSP** — hier und nicht früher, weil `num_cores()` erst jetzt steht
     // und die Zeile sonst gegen eine Kernzahl urteilte, die sich noch ändert. Die Sekundärkerne

@@ -352,6 +352,34 @@ pub fn frame_gpr_uebernehmen(frame: usize, w: &[u64]) -> usize {
     n
 }
 
+/// **Ein einzelnes Frame-Wort schreiben** (Z6b) — s. die x86-Fassung fuer die Begruendung, warum
+/// hier ein zweites Gatter steht und warum das keine Doppelung ist.
+///
+/// `spsr` ist auf dieser Architektur das Ringwort: es traegt das **Exception-Level** und die
+/// Maskenbits. Anders als auf x86 gibt es damit **kein maskierbares Flagregister** — der Flagteil
+/// steckt im selben Wort wie das EL, und ein Wort, das man nur halb schreiben darf, wird hier gar
+/// nicht geschrieben.
+pub fn frame_wort_setzen(frame: usize, i: usize, v: u64) -> bool {
+    // SAFETY: wie `frame_set_reg`.
+    let f = unsafe { &mut *(frame as *mut TrapFrame) };
+    match i {
+        0..=30 => {
+            f.gpr[i] = v;
+            true
+        }
+        31 => {
+            f.elr = v;
+            true
+        }
+        32 => false, // `spsr` -- Exception-Level + Masken
+        33 => {
+            f.sp_el0 = v;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Einen initialen TrapFrame anlegen, sodass der Trap-Restore-Epilog per `eret`
 /// in `entry(arg)` springt. `stack_top` ist der (Kernel-)Stack, auf dem der Frame
 /// liegt; bei einem EL0-Thread (`el0 = true`) läuft der Thread auf dem separaten

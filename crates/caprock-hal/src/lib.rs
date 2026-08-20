@@ -57,10 +57,27 @@ mod imp;
 // Gemeinsame API-Fläche beider Architekturen.
 pub mod cache_decode;
 pub mod fault;
+// **Die IOMMU-Gesundheit als EINE Aussage** — arch-neutral, weil sie es inhaltlich ist. Bis dahin
+// berichtete jede Architektur in ihren eigenen Worten (`smmu` gegen `iommu`/`vtdcaps`), und genau
+// das hatte `todo.md` vorab als Warnsignal benannt: zwei Formulierungen sind zwei Entwuerfe.
+// Reiner Typ ueber eingespeisten Werten, deshalb einzeln host-testbar (Muster von `dmar.rs`).
+pub mod iommu_health;
 // Der zweite Summand der C4-Stackrechnung. Arch-neutral, weil er es INHALTLICH ist (zwei
 // Atomics); beide `exception`-Module reichen ihn weiter. Siehe Modul-Doku — eine zweite Kopie
 // je Architektur war genau der Fehler, der den aarch64-Bau gerissen hat.
 pub mod irqtiefe;
+// **NUMA topology + the placement ladder** (Z8, N0-N2). Pure over injected firmware bytes for a
+// sharper reason than usual: the development machine has ONE node, so the interesting cases cannot
+// arise on it -- a test against the real table would be an oracle that holds because its antecedent
+// is false.
+pub mod bootparams;
+pub mod fbtext;
+pub mod numa;
+// **SMT topology + the one-thread-per-physical-core admission policy** (Z6 stages 0+1). Arch-
+// neutral because the *decision* is: the decode differs per architecture (`CPUID.0Bh` against
+// `MPIDR_EL1.MT`), the classification and the policy do not. Pure over injected register values,
+// so it is host-testable — the `dmar.rs`/`iommu_health.rs` shape.
+pub mod smt;
 // virtio-pci ist ein PCI-Standard und liegt deshalb arch-neutral (A-5.2); es braucht nur `cpu`
 // und `pcie`, die es auf beiden Zweigen gibt.
 pub mod virtio;
@@ -73,6 +90,13 @@ pub use imp::{gic, iommu, pcie, psci, smmu};
 // x86-spezifisch: Segmentierung existiert auf ARM nicht (dort gibt es keine GDT/TSS).
 #[cfg(target_arch = "x86_64")]
 pub use imp::{acpi, dmar, gdt, iommu, pcie, vtd};
+
+// The cap the MADT reader enforces (`acpi::cpus`). Exported because a caller that wants to hold
+// one entry per enumerated CPU must size its array by **the same constant the producer stops at**
+// — otherwise the two numbers drift and the difference is a silent truncation, which reads exactly
+// like "everything was covered".
+#[cfg(target_arch = "x86_64")]
+pub use imp::MAX_CPUS;
 
 /// Formatierte Ausgabe auf der Debug-Konsole (gesperrt, SMP-sicher).
 #[macro_export]

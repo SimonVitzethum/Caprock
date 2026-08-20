@@ -108,6 +108,18 @@ pub enum LocalReason {
     /// Eine Loader-Cap zeigt auf die Startmenge **dieser** Maschine. Dieselbe Quellennummer
     /// bezeichnet dort ein anderes Archiv — und damit andere Programme.
     LoaderSource,
+    /// **Debug-Autoritaet wandert nicht mit** (Z6b).
+    ///
+    /// Eigener Grund und nicht `PdNotInScope`, obwohl beides PDs bezeichnet: „nimm die PD in den
+    /// Umfang auf" waere hier die **falsche Behebung**. Die Verweigerung haengt nicht am Umfang,
+    /// sondern daran, dass die Praegung eine benannte, protokollierte, beim Mandanten sichtbare
+    /// Handlung auf **dieser** Maschine war. Sie ueber eine Maschinengrenze zu tragen hiesse, dass
+    /// drueben jemand Debug-Autoritaet ueber eine PD haelt, ohne dass sie dort je gepraegt wurde —
+    /// womit die Zusage aus Z6b §0 auf der Zielmaschine schlicht nicht mehr gilt.
+    ///
+    /// Der Umfang wird deshalb gar nicht erst befragt, wie bei `HandlerBinding` und anders als bei
+    /// `PdControl`: hier waere auch der geprüfte Grund der falsche.
+    DebugAuthority,
 }
 
 /// Eine Vorbedingung, die auf der **Zielmaschine** gelten muss (Z4f).
@@ -231,6 +243,8 @@ pub fn classify(kind: &ObjectKind, scope: &Scope) -> Transfer {
         ObjectKind::SyscallHandler { .. } | ObjectKind::FaultHandler { .. } => {
             Transfer::Refused(LocalReason::HandlerBinding)
         }
+        // Z6b. Fail-closed, mit eigenem Grund — s. `LocalReason::DebugAuthority`.
+        ObjectKind::Debuggable { .. } => Transfer::Refused(LocalReason::DebugAuthority),
     }
 }
 

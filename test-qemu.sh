@@ -276,6 +276,13 @@ check() { if grep -q "$1" <<<"$OUT"; then echo "  PASS: $2"; else echo "  FAIL: 
 # Zeile -> nicht als Fehler werten, sondern als bewusst uebersprungen melden).
 fcheck() { if [ -n "${KERNEL_FUZZ:-}" ]; then check "$1" "$2"; else echo "  SKIP (release ohne Fuzzer): $2"; fi; }
 
+check "dbg     : ALL PASS" "Z6b: Debug-Autoritaet ist eine Capability ueber GENAU EINE PD. Seit die Sonde arch-neutral ist und ihr eigenes Ziel mitbringt, faehrt sie hier genauso -- und **eine gedruckte Zeile, die niemand liest, ist die pdbind-Form**: `dbg : FAILURES` bei `== ALL PASS ==`, genau einmal so passiert, am 2026-08-20 auf diesem Zweig"
+check "vorher-undebuggbar=true" "Z6b §0 -- die tragende Zeile, auch hier: eine Sonde mit JEDER anderen Cap des Systems faehrt alle Cap-Slots der Wurzel-PD durch und wird jedes Mal abgewiesen"
+check "Indizes-stimmen=true" "Z6b §3b: die Frame-Indizes kommen aus redirect::indizes, nicht aus dem Kopf -- die erste arch-neutrale Fassung schrieb hartkodiert auf Wort 18, was auf aarch64 ein ALLZWECKregister ist. Die Sprechprobe haelt die Tabelle gegen die Frame-Breite, die der Kernel wirklich ablegt"
+check "revoke-bricht-nicht=true" "Z6b §6: ein Revoke waehrend das Ziel angehalten ist darf es nicht unbrauchbar machen -- gemessen an der Wirkung, auch auf dieser Architektur"
+check "dbgmem  : ALL PASS" "Z6b: DEBUG_READ_MEM laeuft ueber die Seitentabellen des ZIELS. Das ist die EINZIGE Stelle in v1, an der x86_64 und aarch64 sich wirklich unterscheiden -- der Rest ist arch-neutral, dort traegt ein gruener x86-Lauf diese Seite mit, hier nicht"
+check "luecke-abgewiesen=true" "Z6b: eine Adresse, die das Ziel nicht FUER SICH gemappt hat, loest nicht auf. Die erste Fassung prueft die Rechte nicht und loeste damit auch die geteilten KERNEL-Eintraege der isolierten VSpace auf -- ein Debugger mit blossem DebugRead haette Kernelspeicher gelesen. Gefunden hat es diese Sonde, nicht das Gegenlesen"
+check "ohne-Leserecht-abgewiesen=true" "Z6b: die Debuggable-WURZEL gewaehrt selbst nichts -- sie ist das Recht abzuleiten. Ohne diese Zeile waere 'gewaehrt selbst nichts' Prosa ohne Gatter"
 check "M=1 C=1 I=1" "MMU + Caches aktiv"
 check "dtb     : ALL PASS" "DTB-Parsing (RAM-Größe aus dem Device Tree)"
 check "archive : 11 Modul" "ext-26 L0: Boot-Archiv extern geladen + vom Kernel-Parser gelesen (reserviertes RAM-Fenster, caprock-loader)"
@@ -334,6 +341,14 @@ check "dma     : ALL PASS" "DMA-Capability: DmaCap hinter DmaEnforcer-Abstraktio
 check "pcie    : ALL PASS" "PCIe-ECAM-Enumeration: virtio-rng-pci gefunden, BAR-Zuweisung + Bus-Master-Enable, RID == SMMU-StreamID"
 check "smmu    : ALL PASS" "SMMUv3-Bring-up hinter DmaEnforcer: Command-/Event-Queue + Stream-Tabelle, Default-Abort, CR0-Enable, CMD_SYNC-Round-Trip"
 check "smmubind: ALL PASS" "SMMU-Bindung: enable_dma/disable_dma installiert STE->CD->Stage-1 (nur die DMA-Region), Revoke gibt Tabellen frei (balanciert)"
+# 2026-08-17: die ARCH-NEUTRALE Gesundheitsaussage -- dieselbe Zeile faehrt die x86-Suite.
+# **Gefunden durch die Gegenprobe zu genau dieser Zeile:** der Kernel gatterte korrekt
+# (`bringup : offen: iohealth`, Watchdog gefeuert), und diese Suite meldete trotzdem
+# `== ALL PASS ==` -- sie sah sich die neue Zeile nicht an. Dieselbe Form wie bei `root` eine
+# Zeile weiter oben, und derselbe Grund: eine Zeile, die keine Suite liest, gattert nichts.
+check "iohealth: ALL PASS" "Arch-neutrale IOMMU-Gesundheit: faults_empty zaehlt NUR mit belegtem Invalidierungs-Round-Trip -- eine tote Einheit meldet ebenfalls eine leere Warteschlange (dieselbe Form wie die leere Event-Queue ohne CD.R)"
+check "smt     : ALL PASS" "Z6 Stufe 1: ein physischer Kern traegt hoechstens EINE logische CPU. Fail-closed -- eine unlesbare Topologie laesst nur den Bootkern zu (Unknown ist NICHT Single). ACHTUNG: unter QEMU ist die Geschwisterbeziehung EMULIERT (-smp cores=n,threads=2 gibt die CPUID-Sicht, die vCPUs sind gewoehnliche Wirtsthreads ohne geteilte Ausfuehrungseinheiten) -- geprueft ist die POLITIK, nie der KANAL, dieselbe Einschraenkung wie beim SMMU-Befund in ADR 0008. Hier ausserdem VAKUOeS: -smp 4 heisst threads=1, es gibt gar keine Geschwister. Dass die Politik BEISST, misst tools/smt-messen.sh mit cores=2,threads=2."
+check "numa    : ALL PASS" "Z8/N1: NUMA-Topologie gelesen und vollstaendig. init=false heisst NIE nachgesehen (nicht flach), truncated=true heisst eine Tabelle mit Loechern, die vollstaendig AUSSIEHT -- das faellt durch, waehrend readable=false erlaubt ist (die meisten Maschinen haben keine SRAT: keine Aussage ist etwas anderes als eine falsche). ACHTUNG: QEMU emuliert die TOPOLOGIE, nicht die LATENZ -- geprueft ist WOHER eine Seite kam, nie ob es schneller ist. Hier ausserdem VAKUOeS: ohne -numa gibt es nur einen Knoten. Dass ein zweiter gelesen und benutzt wird, misst tools/numa-messen.sh."
 check "virtiorng: ALL PASS" "virtio-rng-DMA: Geraet DMAt echte Zufallsbytes in die DmaCap-Region; zweistufig: Level-1-Software-Bounds weist Out-of-Window demonstrierbar ab, Level-2-SMMU als HW-Backstop (QEMU emuliert-Geraet-Bypass)"
 check "dmatok  : ALL PASS" "Teardown-Token (ext-37): cap_delete allein legt still, unmappt und synchronisiert vor der Freigabe; unbestaetigte Stilllegung -> Region bleibt dauerhaft pending (Leck statt UAF), Audit-Code 7"
 check "dmawin  : ALL PASS" "IOVA-Fenstergrenzen (ext-36b): 32-Bit-Geraet + erschoepftes Fenster werden laut abgewiesen (kein stilles Abschneiden, kein halb aufgebauter Kontext)"
@@ -419,8 +434,17 @@ else
     echo "  FAIL: B-4.5: keine pprobe-Zeile im Protokoll -- die Testkette ist vor dem Prime+Probe stehengeblieben"
     fail=1
 fi
-online=$(echo "$OUT" | grep -c "online")
-[ "$online" -eq "$CORES" ] && echo "  PASS: alle $CORES Kerne online" || { echo "  FAIL: nur $online/$CORES Kerne online"; fail=1; }
+# **Die MELDUNGEN der Kerne zaehlen, nicht das Wort.** Bis 2026-08-17 stand hier
+# `grep -c "online"` ueber das ganze Protokoll -- also jede Zeile, in der das Teilwort irgendwo
+# vorkommt. Die neue `smt`-Zeile enthaelt `online=8`, und die Zaehlung sprang auf 9/8: ein
+# FEHLSCHLAG, ohne dass ein Kern gefehlt haette. Dieselbe Klasse wie „ein Sammler darf nur `$?`
+# lesen": wer eine Tatsache aus freiem Text erschliesst, baut eine Formel, und jede Formel ist ein
+# Loch. Gezaehlt wird jetzt das Muster, mit dem sich ein Kern tatsaechlich meldet.
+#
+# `<<<` statt `echo | grep`: eine Pipeline unter `set -o pipefail` meldet bei grosser Ausgabe
+# SIGPIPE durch (Fallenliste, gemessen zwischen 66 und 70 KiB).
+online=$(grep -cE "^core [0-9]+ +: online" <<<"$OUT")
+[ "$online" -eq "$CORES" ] && echo "  PASS: alle $CORES Kerne online" || { echo "  FAIL: nur $online/$CORES Kerne (Muster '^core N : online') gemeldet"; fail=1; }
 
 # Das Zeitlimit als zweiter, unabhaengiger Melder (s. boot_once).
 if [ "$BOOT_TIMEOUTS" -gt 0 ]; then

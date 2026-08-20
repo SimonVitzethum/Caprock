@@ -112,6 +112,89 @@ Setup-Sequenzen.
 cross-core killt); er wurde fälschlich als „Host-Last-Flakiness" abgetan. Nach dem Fix: 30/30 Läufe
 deadlock-frei (vorher 4/15).
 
+## 1b. Observability ordering — three instances, therefore a rule (2026-08-20)
+
+> **Nothing may become observable before the condition holds under which it may be observed.**
+>
+> In its two concrete forms:
+> * a thread must not become **runnable** before it holds the authority its first syscall needs;
+> * a **kick** that reacts to a state must not become visible before that state does.
+
+Three instances have been paid for separately, and at the third it stops being a coincidence:
+
+| | What became observable too early | Cost |
+|---|---|---|
+| **D0** | `spawn()` made a thread runnable before `bind_pd()` — it made its first `RECV` with an **empty** cspace | ten days, four measurement runs, 0.018 % (one in 5556) |
+| **C8** | the caller must be blocked **before** its job becomes visible, or a verifier on another core answers before the reason is set | caught in review; both now under one lock on the job queue |
+| **Debugger (§2d)** | the revocation must be visible **before** the IPI goes out, else the target core re-checks, still sees the authority, does nothing — and the kick is spent | named in advance, 2026-08-20 |
+
+The D0 entry is the "make observable" direction, the other two are the "kick" direction; the
+condition is the same one.
+
+**Why this is written as a rule rather than three notes.** Each instance was found by a different
+route — a 50 000-run measurement, a code review, a plan review — and none of the three would have
+found the others. A rule can be checked against a **new** design before it is built, which is what
+happened at the third.
+
+### The open question this poses to Gabbro
+
+Every instance is two operations that must not be reordered, with nothing in the type system saying
+so. The obvious remedy is a construct that carries *"set the state"* and *"send the kick"* as **one
+unit with an enforced order** — then the fourth instance cannot be written down.
+
+That is exactly the class of rule a language is for, and it is a concrete requirement for Gabbro
+rather than a wish: **not a lint that finds the pattern, but a pairing that makes the wrong order
+unspellable.** Recorded here so the requirement exists before the language work reaches it.
+
+## 1c. Urteilende Stellen fragen die LEERE der Grundmenge, nie einzelne Bits (2026-08-20)
+
+> **Wer über „darf dieser Thread laufen?" urteilt, fragt `reasons.is_empty()`. Wer einzelne Gründe
+> aufzählt, urteilt über die Gründe von gestern.**
+
+### Warum das eine Regel ist und keine Stilnotiz
+
+Z24 hat die drei Bits `blocked`/`budget_blocked`/`parked` durch **eine Menge** ersetzt, weil jede
+Abspaltung die letzte Kollision reparierte und die nächste aufstellte. Der Gewinn ist nicht die
+Menge, sondern was aus ihr folgt: **ein neuer Grund ist überall gedeckt, wo die Leere gefragt wird.**
+
+Gemessen am 2026-08-20 an `BlockReasons::DEBUG` (siebter Grund, dritter vorhergesagter): von den
+**sechs** Stellen, die über Thread-Zustände urteilen, brauchten **fünf keinerlei Änderung** —
+`Scheduler::audit` Code 2 („blockierter Thread in einer Ready-Liste") und Code 7 („lauffähig, in
+keiner Liste") lesen beide `reasons.is_empty()`, und die IPC-Audits fragen eine andere Frage
+(lebt/doppelt), auf die ein Grund keinen Einfluss hat.
+
+### Und warum die Ersparnis ohne diese Zeile ZUFÄLLIG wäre
+
+Die Deckung hält, **solange** die urteilenden Stellen die Leere fragen. Die siebte Stelle, die
+stattdessen `has(IPC) || has(BUDGET) || has(PAUSE) || …` schreibt, bricht sie **still** — und sie
+findet es nicht, denn beim achten Grund sind fünf Stellen ja nachweislich unverändert
+durchgekommen. Genau die Beweisführung, die diesmal richtig war, wäre dann die falsche.
+
+Deshalb gilt:
+
+| erlaubt | verboten |
+|---|---|
+| `reasons.is_empty()` — „darf er laufen?" | eine Aufzählung von Bits als Ersatz dafür |
+| `reasons.has(X)` — „wartet er auf **X**?", von genau dem Wecker, der X entfernt | `has(X) \|\| has(Y) \|\| …` als Lauffähigkeitsurteil |
+| `remove(X)` durch **den einen** zuständigen Wecker | `reasons = NONE` oder das Entfernen fremder Gründe |
+
+### Die zweite Hälfte, ohne die die Menge nur eine andere Schreibweise ist
+
+**Eingereiht wird nur bei leerer Menge.** Ohne diesen Halbsatz sind die Bits wieder Bits; mit ihm
+ist die Park-Naht *unformulierbar* statt behoben. Beide Hälften gehören zusammen, und die zweite ist
+die, die beim Nachbauen vergessen wird.
+
+### Ein Literal, das die Verbreiterung überlebt, ist noch nicht richtig
+
+`BlockReasons` ist am 2026-08-20 von `u8` auf `u16` gewachsen. Ein `0xff` als Platzhalter für „nicht
+auflösbar" **kompiliert danach fehlerfrei** und wird an dem Tag falsch, an dem Bit 8 vergeben wird:
+dann ist `0xff` eine gewöhnliche, erreichbare Menge. Eine solche Stelle stand in
+`kernel/src/handlermess.rs` und ist auf `u16::MAX` berichtigt. **Ein Platzhalter, der außerhalb des
+Wertebereichs liegen soll, wird aus dem Typ abgeleitet, nicht hingeschrieben** — dieselbe Klasse wie
+`MASK_BITS` gegen die Farbanzahl.
+
+---
+
 ## 2. DMA-Revoke-Reihenfolge (DMA-use-after-free-Sicherheit)
 
 Eine DMA-Region wird **immer** in dieser Reihenfolge abgebaut (`revoke_dma` + `vspace_teardown`):
@@ -638,6 +721,24 @@ Details + Herleitung: `docs/phase-reports/ext-30-migration-und-kapazitaet.md`.
 - Der **laufende** Thread (Zustand im aktiven Trap-Frame), ein Thread mit aktiver
   **Budget-Donation** (die Links sind lokale Slots → Donation ist intra-core), und der
   **Idle**-Thread. Strukturell erzwungen in `Scheduler::detach_for_migration`.
+- **Ein für einen Debugger angehaltener Thread** (`BlockReasons::DEBUG`, Z6b). Ebenfalls
+  strukturell in `detach_for_migration` erzwungen — und das ist eine **Invariante, keine
+  Beobachtung**: gemessen am 2026-08-20 konnte es ohnehin nicht vorkommen, weil
+  `migration_candidate` nur die Ready-Queues läuft und ein Thread mit nicht-leerer Grundmenge dort
+  nicht steht. Aber `migrate_to(tid, dst)` nimmt eine **beliebige** `tid` und prüft den Zustand
+  nicht; die Eigenschaft hinge damit an der Disziplin jedes künftigen Aufrufers.
+
+  **Warum sie gebraucht wird:** `Scheduler::debug_release_pd` läuft die TCB-Tabelle **je Kern**
+  unter dessen Sperre. Ein Thread, der während des Durchlaufs von einem bereits besuchten Kern auf
+  einen noch nicht besuchten wandert, wird von **keinem** der beiden gesehen — und bliebe mit einem
+  Grund liegen, den niemand mehr entfernen darf. Ohne die Invariante bräuchte die Freigabe einen
+  Wiederholungslauf, und ein Wiederholungslauf über Kerngrenzen ist genau die Sorte Schleife, die
+  hier niemand messen kann.
+
+  **Eng und nicht breit, und das ist eine Entscheidung.** Die naheliegende Fassung („nur Threads
+  aus einer Ready-Queue") verböte auch die Migration IPC-wartender Threads und änderte den
+  Lastausgleich in einer Weise, die hier niemand gemessen hat. D8 ist der Beleg, dass die breitere
+  Behebung die schlechtere sein kann.
 - **Push statt Pull:** die Migration läuft immer auf dem **abgebenden** Kern, weil nur er den
   Lazy-FP-Kontext des Migranten aus seinen eigenen FP-Registern sichern kann.
 - **Kein Thread-Verlust:** scheitert die Aufnahme (Zielkern voll), wird der Migrant beim
@@ -683,10 +784,68 @@ kennt, wird im Betrieb überdehnt.
 * **Kernlokale Strukturen.** L1, L2, TLB, Store-Buffer und Branch-Predictor werden von
   Geschwister-Hyperthreads desselben physischen Kerns geteilt. **Dagegen hilft keine Farbe, und
   zwar prinzipiell nicht** — die Farbe wirkt über den Set-Index des LLC, nicht über die
-  kernlokalen Strukturen. Solange SMT aktiv ist und der Scheduler Geschwister beliebig belegt, ist
-  diese Invariante auf einer SMT-Maschine **deutlich schwächer, als sie klingt**. Abhilfe wäre SMT
-  abschalten oder Gang-Scheduling der Geschwister (`todo.md` Z6); beides steht aus, und der
-  Scheduler liest die CPU-Topologie heute nicht.
+  kernlokalen Strukturen.
+
+  **Seit 2026-08-17 ist das nicht mehr nur beschrieben, sondern erzwungen** — siehe §12a.
+
+### 12a. SMT: a physical core carries at most one logical CPU (Z6 stage 1)
+
+**The claim.** At most one logical CPU per physical core is ever admitted. Sibling hyperthreads of
+an admitted CPU are not brought up at all, so no two subjects — of any kind — are ever co-resident
+on one physical core.
+
+**Why nothing weaker would do.** Every other mitigation this kernel owns is *switch-shaped*:
+colouring picks cache sets, scrubbing happens at a context switch. Both need a moment at which one
+subject stops and another starts. SMT has no such moment — the sibling runs *simultaneously*. This
+is the same reason the vendors' own MDS mitigation (clearing buffers on kernel exit) does not cover
+the cross-sibling direction: there is nothing "in between" to clear. Exactly one measure works, and
+it is scheduling.
+
+**How it is established.** `caprock_hal::smt` reads `CPUID.1Fh`/`0Bh` on x86 and `MPIDR_EL1.MT` on
+aarch64, and the bring-up loop claims one logical CPU per physical core before `cpu_on`. It is
+established *there* because that is the last moment the question is open: once a sibling is online
+it is a core the balancer may place anything on.
+
+**Fail-closed, and `Unknown` is not `Single`.** A topology that cannot be read admits **only the
+boot CPU**. A decode that fails must not look like a decode that found one thread per core — that
+is the `NOSEL_TEXT` failure (a measurement that did not happen reading as one that passed).
+
+**What is checked, and what is not.** The report line `smt` gates in `all_done()` on both
+architectures; the verdict is recomputed from the IDs that actually came online rather than read
+back from the policy's own bookkeeping. But under QEMU the sibling relationship is **emulated**:
+`-smp cores=n,threads=2` hands the guest the CPUID enumeration, while the vCPUs are ordinary host
+threads with no shared execution units. **Verified is the policy, never the channel** — the same
+honest limitation as the SMMU-under-QEMU finding in §6 (ADR 0008). And in the main suites the line
+is additionally *vacuous* (`-smp 4` means `threads=1`, so there is no sibling to suppress); that the
+policy bites is measured separately by `tools/smt-messen.sh`.
+
+#### The decision that stage 3 will have to make — recorded before it is needed
+
+Stage 1 is crude and therefore complete: with siblings never co-resident, it covers
+tenant-against-tenant **and** tenant-against-kernel. It also costs the entire SMT throughput —
+measured on a 13th-gen Intel part on 2026-08-17, a sibling is worth **×1.36** on issue-bound work
+and **×1.89** on latency-bound work, i.e. close to a second physical core exactly where the target
+workloads sit.
+
+Stage 3 (gang-scheduling siblings of one trust domain) buys that back, and it **does not** cover
+tenant-against-kernel: once two siblings of one domain run together, a syscall or interrupt taken
+on one runs **kernel** code alongside **user** code of the other — and the kernel holds secrets of
+other tenants (the trusted-key store, foreign frames on the sidecar path). Linux's core scheduling
+has exactly this hole; the sibling-stunning half that would close it was the expensive part and
+never landed. For an IPC-heavy microkernel it is more expensive still, because kernel entry is the
+common case rather than the rare one.
+
+**So stage 3 must choose, explicitly, one of:**
+
+1. **Kernel entry joins the gang semantics** — stun the sibling while one thread is in the kernel.
+   Correct, and it taxes the operation this kernel does most.
+2. **The claim is narrowed to tenant-against-tenant**, in writing, here — and then the kernel's own
+   secrets need a different answer (per-tenant key material, no foreign frames resident during
+   user execution).
+
+**This decision must fall before the trust-domain concept is written**, because it determines what
+a trust domain has to mean for the scheduler. Recording it after the fact would repeat exactly the
+form this section exists to prevent: *a claim that sounds broader than it is.*
 * **Der reguläre Weg — seit 2026-08-07 gefärbt, und zwar über das Manifest.** Ein Programm, dessen
   Manifest-Eintrag `POLICY_EXCLUSIVE_STRIPE` trägt, wird **stückweise aus einem Streifen** geladen:
   PT_LOAD-Segmente, User-Stack, Seitentabellen und EL0-Kernel-Stack. Fail-closed — ist kein

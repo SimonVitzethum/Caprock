@@ -14,6 +14,13 @@ Zielarchitektur: [todo.md](todo.md) Abschnitt Z. Reihenfolge und Begründung:
 
 ---
 
+> **Sprachregel seit 2026-08-17: alles Neue ist Englisch** — auch in einer deutschen Datei, auch
+> als neuer Abschnitt in `todo.md`. **Bestehende deutsche Bezeichner werden dabei NICHT
+> umbenannt** (40 von ihnen werden namentlich aus `tools/*.sh|py` gegrept; eine Umbenennung ohne
+> den Wächter macht ihn blind, und ein blinder Wächter sieht aus wie ein bestandener Test).
+> Wortlaut, Umfang und die Ausnahme stehen in `CLAUDE.md` → **LANGUAGE RULE**. Hier bewusst nur
+> ein Zeiger: zwei Fassungen derselben Regel driften.
+
 ## Die fünf Regeln
 
 **1. Committe deine Arbeit früh und oft.** Das ist die wichtigste Regel, und sie ist nicht

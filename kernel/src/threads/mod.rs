@@ -411,6 +411,20 @@ static SMMU_IDR0: AtomicU32 = AtomicU32::new(0);
 static SMMU_SID: AtomicU32 = AtomicU32::new(0);
 static SMMU_GERR: AtomicU32 = AtomicU32::new(u32::MAX);
 static SMMU_SYNC: AtomicBool = AtomicBool::new(false); // CMD_SYNC-Round-Trip gelang
+
+// --- Die arch-neutrale IOMMU-Gesundheit (2026-08-17) -----------------------------------------
+// Beim Bring-up erfasst, im Bericht gedruckt UND im Gatter gelesen -- aus DENSELBEN Zellen.
+// Ein Urteil, das im Bericht neu entsteht, kann den Bericht nicht ausloesen (Fallenliste).
+// Vorbelegung `false`/`u32::MAX`: nie gesetzt darf nicht wie bestanden aussehen.
+static IOHEALTH_OK: AtomicBool = AtomicBool::new(false);
+static IOHEALTH_SPEAKING: AtomicBool = AtomicBool::new(false);
+static IOHEALTH_PRESENT: AtomicBool = AtomicBool::new(false);
+static IOHEALTH_XLAT: AtomicBool = AtomicBool::new(false);
+static IOHEALTH_FAULTS_EMPTY: AtomicBool = AtomicBool::new(false);
+static IOHEALTH_UNITS: AtomicU32 = AtomicU32::new(0);
+static IOHEALTH_SPEAK_N: AtomicU32 = AtomicU32::new(0);
+static IOHEALTH_HWERR: AtomicU32 = AtomicU32::new(u32::MAX);
+static IOHEALTH_CFGERR: AtomicU32 = AtomicU32::new(u32::MAX);
 static SMMU_EN: AtomicBool = AtomicBool::new(false); // CR0ACK.SMMUEN
 static SMMU_EVTQ: AtomicBool = AtomicBool::new(false); // Event-Queue leer
 static SMMU_DONE: AtomicBool = AtomicBool::new(false);
@@ -2144,6 +2158,9 @@ const _: () = assert!(
         && sys::PARK == 5
         && sys::MAP == 10
         && sys::UNMAP == 11
+        // K1a (2026-08-17): eine neue Nummer gehoert in denselben Anker wie die uebrigen --
+        // sonst driftet sie beim naechsten Einschub, und EL0-Programme kodieren sie als Immediate.
+        && sys::SPAWN == 20
 );
 
 /// **EL0-Exiter** (Sektion `.user_text`, EL0-ausführbar): beendet sich sofort per
@@ -4604,6 +4621,19 @@ pub fn demo_report_then_idle() -> ! {
             SMMU_EN.store(system::testsupport::smmu_enabled(), Ordering::Relaxed);
             SMMU_EVTQ.store(system::testsupport::smmu_eventq_empty(), Ordering::Relaxed);
             SMMU_GERR.store(system::testsupport::smmu_gerror(), Ordering::Relaxed);
+            // Die arch-neutrale Gesundheit HIER erfassen, nicht im Bericht: ein Wert wird dort
+            // festgestellt, wo die Aussage gilt. Im Bericht darf die Einheit sich laengst anders
+            // verhalten -- dieselbe Lehre wie beim Treiberpuffer, der dem LETZTEN Client gehoert.
+            let hl = hal::iommu::health(SMMU_SYNC.load(Ordering::Relaxed));
+            IOHEALTH_OK.store(hl.ok(), Ordering::Relaxed);
+            IOHEALTH_SPEAKING.store(hl.speaking(), Ordering::Relaxed);
+            IOHEALTH_UNITS.store(hl.units, Ordering::Relaxed);
+            IOHEALTH_SPEAK_N.store(hl.units_speaking, Ordering::Relaxed);
+            IOHEALTH_HWERR.store(hl.hw_error, Ordering::Relaxed);
+            IOHEALTH_CFGERR.store(hl.config_errors, Ordering::Relaxed);
+            IOHEALTH_XLAT.store(hl.translation_enabled, Ordering::Relaxed);
+            IOHEALTH_FAULTS_EMPTY.store(hl.faults_empty, Ordering::Relaxed);
+            IOHEALTH_PRESENT.store(hl.present, Ordering::Relaxed);
             let ok = system::testsupport::smmu_present()
                 && ok_init
                 && SMMU_EN.load(Ordering::Relaxed)
@@ -5098,7 +5128,15 @@ pub fn demo_report_then_idle() -> ! {
 }
 
 /// Die Zahl der benannten Abschlussaussagen (aarch64).
-const DONE_FLAGS_ARM: usize = 57;
+///
+/// 2026-08-17: 59 -> 60 durch `numa` (Z8 N1).
+/// 2026-08-17: 58 -> 59 durch `smt` (Z6 Stufe 1).
+/// 2026-08-17: 57 -> 58 durch `iohealth`, die arch-neutrale IOMMU-Gesundheit. Dass diese Zahl von
+/// Hand gefuehrt wird, ist genau die Form, die `system::MELDESTELLEN` am 2026-08-11 losgeworden
+/// ist (abgeleitet statt gezaehlt) -- hier faengt der Typ es wenigstens beim Bau ab, weil die
+/// Liste ein Array fester Laenge ist. **Der Bau hat es auch getan**, und zwar nur unter
+/// `--features selftest`: ein Bau ohne das Merkmal enthaelt diese Datei gar nicht.
+const DONE_FLAGS_ARM: usize = 60;
 
 fn all_done(warum: Option<&mut [(&'static str, bool); DONE_FLAGS_ARM]>) -> bool {
     let workers = (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD);
@@ -5265,6 +5303,20 @@ fn all_done(warum: Option<&mut [(&'static str, bool); DONE_FLAGS_ARM]>) -> bool 
         ("dma", dma),
         ("pcie", pcie),
         ("smmu", smmu),
+        // Die arch-neutrale Aussage gattert MIT -- eine Zeile, die nur druckt, ist keine Pruefung.
+        ("iohealth", IOHEALTH_OK.load(Ordering::Acquire)),
+        // **Z6 stage 1: gates from the first day.** Criterion formulated against the EFFECT (no
+        // two online logical CPUs share a physical core), recomputed from the IDs that came up.
+        //
+        // Under QEMU `virt`/`cortex-a72` there is no SMT at all, so this clause is trivially true
+        // here — that is a correct reading, not a passing test of the policy. The policy itself is
+        // exercised on x86 with `-smp cores=2,threads=2` (`tools/smt-messen.sh`); this line's job
+        // on aarch64 is to make sure the reading happens and reports `Single` rather than being
+        // absent. A line that exists on one architecture only is how `color` stood hard-wired to
+        // `true` here for months.
+        ("smt", crate::SMT_OK.load(Ordering::Acquire)),
+        // Z8/N1: gates from the first day, same criterion as on x86.
+        ("numa", crate::NUMA_OK.load(Ordering::Acquire)),
         ("smmubind", smmubind),
         ("virtiorng", virtiorng),
         ("dmagen", dmagen),
@@ -5340,6 +5392,18 @@ fn pdbind_bericht() {
 
 fn report() {
     pdbind_bericht();
+
+    // **Z6b: die Speicher-Sonde, auf DIESEM Zweig gefahren.**
+    //
+    // Der ganze uebrige Debugger ist arch-neutral -- dort traegt ein gruener x86-Lauf diese Seite
+    // mit. `vspace_resolve` nicht: vierstufiges Paging mit `P`/`PS`/`US` gegen Deskriptorbits
+    // `0b01`/`0b11` und `AP[1]`, andere Masken, andere Blockgroessen. Eine Sonde, die nur ein Zweig
+    // faehrt, laesst die andere ungeprueft -- und „ungeprueft" ist nicht „vermutlich gruen".
+    crate::dbgmem::messen(system::IDLE_PRIO);
+    crate::dbgmem::bericht();
+
+    // Z6b: die Debugger-Sonde -- seit sie ihr eigenes Ziel mitbringt, faehrt sie hier genauso.
+    crate::dbgprobe::messen(system::IDLE_PRIO);
     let mut sched_ok = true;
     for c in 0..system::num_cores() {
         let t = hal::timer::ticks(c);
@@ -5869,6 +5933,34 @@ fn report() {
     println!(
         "smmu    : {} (SMMUv3-Bring-up hinter DmaEnforcer: Command-/Event-Queue + lineare Stream-Tabelle, Default-Abort, CR0)",
         if smmu { "ALL PASS" } else { "FAILURES" }
+    );
+
+    // --- Die ARCH-NEUTRALE Gesundheitsaussage (2026-08-17) -----------------------------------
+    //
+    // Dieselbe Zeile druckt der x86-Hochlauf. Bis hierher berichtete jede Architektur in ihren
+    // eigenen Worten (`smmu` gegen `iommu`/`vtdcaps`), und zwei Formulierungen derselben
+    // Eigenschaft sind zwei Entwuerfe -- `todo.md` hatte genau das vorab als Warnsignal benannt.
+    //
+    // Der Round-Trip wird HEREINGEREICHT: `CMD_SYNC` braucht die Physadresse der Command-Queue
+    // und den Producer-Index, und die gehoeren dem `DmaEnforcer`, nicht der HAL. Es gibt genau
+    // einen Round-Trip je Boot, und berichtet wird DIESER -- nicht ein zweiter, nachgerechneter.
+    println!(
+        "iohealth: present={} translation={} units={}/{} round_trip={} faults_empty={} \
+         config_errors={} hw_error={:#x}",
+        IOHEALTH_PRESENT.load(Ordering::Acquire), IOHEALTH_XLAT.load(Ordering::Acquire),
+        IOHEALTH_SPEAK_N.load(Ordering::Acquire), IOHEALTH_UNITS.load(Ordering::Acquire),
+        SMMU_SYNC.load(Ordering::Acquire), IOHEALTH_FAULTS_EMPTY.load(Ordering::Acquire),
+        IOHEALTH_CFGERR.load(Ordering::Acquire), IOHEALTH_HWERR.load(Ordering::Acquire)
+    );
+    println!(
+        "iohealth: speaking={} -- `faults_empty` zaehlt NUR mit round_trip: eine tote Einheit \
+         meldet ebenfalls eine leere Warteschlange (dieselbe Form wie die leere Event-Queue ohne \
+         `CD.R`)",
+        IOHEALTH_SPEAKING.load(Ordering::Acquire)
+    );
+    println!(
+        "iohealth: {}",
+        if IOHEALTH_OK.load(Ordering::Acquire) { "ALL PASS" } else { "FAILURES" }
     );
 
     // SMMU-Bindung (ext-23, D3): STE/CD/Stage-1 installieren+entziehen, balanciert.

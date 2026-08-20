@@ -38,6 +38,20 @@ mod panic;
 mod colors;
 // Der Kernel-Kern (arch-agnostisch, nutzt aber die aarch64-HAL) ist auf dem x86_64-Branch in Stufe 0
 // noch nicht aktiv — er wird Stufe fuer Stufe fuer x86_64 eingeschaltet (s. README-X86.md).
+// **Z6b: die Speicher-Sonde des Debuggers.** Arch-neutral aus demselben Grund wie `dmatests`:
+// sie prueft die EINE Stelle, an der sich die beiden Architekturen wirklich unterscheiden
+// (`vspace_resolve`), und eine Sonde, die nur ein Zweig faehrt, laesst die andere ungeprueft --
+// nicht „vermutlich gruen".
+//
+// **Eigenes `cfg` je Modul, nicht ein geteiltes.** Beim Einfuegen ist das Attribut von `dmatests`
+// auf `dbgmem` gerutscht -- `dmatests` wurde damit bedingungslos gebaut und riss den Bau ohne
+// Feature (`system::testsupport` gibt es dort nicht). Ein Attribut bindet an das NAECHSTE Item,
+// und ein Kommentar dazwischen aendert daran nichts.
+#[cfg(feature = "selftest")]
+mod dbgmem;
+// Z6b: die Debugger-Sonde selbst -- ebenfalls arch-neutral, s. Moduldoku.
+#[cfg(feature = "selftest")]
+mod dbgprobe;
 #[cfg(feature = "selftest")]
 mod dmatests;
 /// Z26, Vorbedingung 2: grosse, zusammenhaengende DMA mit Geraetesicht — und eine **benannte**
@@ -54,6 +68,10 @@ mod loader;
 /// `tools/gen_manifest_key.py`. Getrennt von [`trusted_keys`]: ein Zertifikat bezeugt die Herkunft
 /// eines Binaries, ein Manifest die Zuteilung der ganzen Maschine.
 mod manifest_keys;
+/// Z8/N0-N4: NUMA — Topologie lesen, melden, und danach platzieren. Arch-neutral; die Dekoder
+/// liegen abhaengigkeitsfrei in `caprock_hal::numa`, die Quellen sind ACPI (x86) bzw. der Device
+/// Tree (aarch64).
+mod numa;
 #[cfg(feature = "selftest")]
 mod selftest;
 /// C9: die **Sperrhaltedauer-Marke** — wie lange war der Kern am Stueck nicht praemptierbar?
@@ -117,6 +135,17 @@ extern "C" {
 /// steht erst zur Laufzeit fest).
 #[cfg(target_arch = "aarch64")]
 static SEC_STACKS_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// **Z6 stage 1 verdict** (aarch64) — written once after the PSCI bring-up loop, read by the
+/// report gate in `threads/mod.rs`.
+///
+/// Default `false`: a run that dies before the loop must not gate through on a flag nobody wrote.
+#[cfg(target_arch = "aarch64")]
+pub static SMT_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// **Z8/N1 verdict** (aarch64) — same shape and same reason as [`SMT_OK`].
+#[cfg(target_arch = "aarch64")]
+pub static NUMA_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Stack-Spitze für Kern `core` (Slot `core` im belegten Block).
 #[cfg(target_arch = "aarch64")]
@@ -269,13 +298,63 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         .expect("Sekundaer-Stacks: RAM erschoepft");
     SEC_STACKS_BASE.store(stacks.base(), core::sync::atomic::Ordering::Relaxed);
     let entry = _start_secondary as *const () as u64;
+    // **Z6 stage 1 — the same policy as on x86, and it must exist here even though it is a no-op
+    // under QEMU `virt`.** `MPIDR_EL1.MT` is clear on `cortex-a72`, so the topology reads `Single`
+    // and nothing is suppressed. A line that exists on one architecture only is how `color` stood
+    // hard-wired to `true` on aarch64 for months: the absence was not merely unproven, it was
+    // invisible.
+    // Z8/N0+N1: Topologie aus dem Device Tree, VOR dem Hochlauf der Sekundaerkerne.
+    crate::numa::init(DTB_BYTES);
+    let topo = hal::cpu::smt_topology();
+    let mut occ = caprock_hal::smt::CoreOccupancy::new();
+    let boot_id = hal::cpu::core_id() as u32;
+    let boot_claim = occ.claim(&topo, boot_id);
+    let mut online_ids = [0u32; caprock_sched::MAX_CORES];
+    let mut online = 1usize;
+    online_ids[0] = boot_id;
+    let mut suppressed = 0usize;
     for core in 1..cores {
         let target = core as u64; // MPIDR Aff0 = Kernindex (QEMU virt, ein Cluster)
+        match occ.claim(&topo, core as u32) {
+            caprock_hal::smt::Claim::Admit => {}
+            other => {
+                suppressed += 1;
+                println!("smp     : Kern {core} nicht zugelassen ({other:?}) -- Z6 Stufe 1");
+                continue;
+            }
+        }
         let r = hal::power::cpu_on(target, entry, secondary_stack_top(core));
         if r != hal::power::SUCCESS {
             println!("smp     : CPU_ON für Kern {core} fehlgeschlagen (status {r})");
+        } else {
+            if online < online_ids.len() {
+                online_ids[online] = core as u32;
+            }
+            online += 1;
         }
     }
+    // Das Urteil rechnet aus den ONLINE-IDs nach und fragt `occ` NICHT.
+    let verdict = caprock_hal::smt::judge(&topo, &online_ids[..online.min(online_ids.len())]);
+    println!(
+        "smt     : topology={topo:?} width={:?} logical={cores} online={online} \
+         suppressed={suppressed} boot_claim={boot_claim:?}",
+        topo.width()
+    );
+    println!(
+        "smt     : readable={} no_shared_core={:?} contained={} -- policy=one-thread-per-physical-core \
+         (Z6 stage 1). `no_shared_core=None` heisst UNENTSCHEIDBAR, nicht bestanden.",
+        verdict.readable, verdict.no_shared_core, verdict.contained
+    );
+    // Was diese Zeile NICHT belegt: unter QEMU ist die Geschwisterbeziehung EMULIERT. Geprueft ist
+    // die POLITIK, nie der KANAL -- dieselbe Unterscheidung wie beim SMMU-Befund (ADR 0008).
+    // Auf `virt`/`cortex-a72` gibt es ueberdies gar kein SMT, die Zeile belegt hier also nur, dass
+    // die Lesung `Single` ergibt und die Politik niemanden faelschlich unterdrueckt.
+    println!("smt     : {}", if verdict.ok() { "ALL PASS" } else { "FAILURES" });
+    SMT_OK.store(verdict.ok(), core::sync::atomic::Ordering::Release);
+
+    // Z8/N1: melden, nachdem die Kerne stehen.
+    crate::numa::bericht();
+    NUMA_OK.store(crate::numa::urteil(), core::sync::atomic::Ordering::Release);
 
     // Alle Kerne haben ihren `CTR_EL0.CWG` gemeldet -> die DMA-Granularität steht fest. Bis
     // hierher galt die architektonische Obergrenze (s. `mmu::seal_cache_granule`).

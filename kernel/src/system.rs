@@ -867,8 +867,46 @@ fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
 /// rückgabe und Abbruch finalisierter Reply-Calls). Wird **ohne** gehaltene Dispatch-Locks
 /// gerufen (der Dispatch gibt CAPS/EPS vorher frei); `cap_delete` sperrt selbst CAPS+MEM
 /// in der richtigen Ordnung. Ein Fehlschlag (Cap bereits weg) ist unkritisch.
-fn dispatch_delete_cap(cap: caprock_cap::CapPtr) -> bool {
-    cap_delete(cap).is_ok()
+fn dispatch_delete_cap(cap: caprock_cap::CapPtr) -> Result<(), u64> {
+    // **K1a: die Kopplung, die `SYS_SPAWN` erzeugt** (2026-08-17).
+    //
+    // Ein Stack, der aus einer Cap des Aufrufers kommt, koppelt CapSpace und Scheduler. Von den
+    // zwei ehrlichen Ausgaengen faehrt dieser Kernel den zweiten: **die Loeschung wird
+    // abgewiesen, solange der Thread lebt.** Nicht weil es netter ist, sondern weil der Verweis
+    // damit ZAEHLBAR ist -- „Loeschung toetet den Thread mit" waere eine Gruppenoperation ueber
+    // `CAPS` und `SCHEDS[core]`, also die V4-Klasse mit zwei Sperren und einer Ordnung.
+    //
+    // Die Pruefung steht **vor** `cap_delete`: die Finalisierung gibt die Region an den Allokator
+    // zurueck, und ein Stapel, unter dem das geschieht, waere ein Use-after-free mit dem
+    // Rueckgabezeiger als Nutzlast.
+    if stack_cap_in_use(cap) {
+        return Err(caprock_abi::result::ERR_INUSE);
+    }
+    cap_delete(cap)
+        .map(|_| ())
+        .map_err(|_| caprock_abi::result::ERR_HASCHILDREN)
+}
+
+/// **Die fuenf Debug-Syscalls, an einer Stelle** (Z6b).
+///
+/// Der Rueckruf des Dispatch. Er loest die Cap **selbst** auf und haelt `CAPS` ueber den ganzen
+/// Vorgang -- s. die Doku an [`debug_stop`] fuer den Grund.
+fn dispatch_debug(
+    nr: u64,
+    pd: usize,
+    slot: usize,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+) -> Result<u64, u64> {
+    match nr {
+        caprock_abi::sys::DEBUG_ATTACH => debug_attach(pd, slot, a1),
+        caprock_abi::sys::DEBUG_STOP => debug_stop(pd, slot, a1),
+        caprock_abi::sys::DEBUG_CONTINUE => debug_continue(pd, slot, a1),
+        caprock_abi::sys::DEBUG_READ_MEM => debug_read_mem(pd, slot, a1, a2, a3),
+        caprock_abi::sys::DEBUG_WRITE_REGS => debug_write_reg(pd, slot, a1, a2, a3),
+        _ => Err(caprock_abi::result::ERR_BADSYS),
+    }
 }
 
 fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
@@ -893,6 +931,8 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
         // die Krypto gehoert nicht auf den 16-KiB-Stack des Aufrufers.
         sys_load_uebergeben,
         dispatch_delete_cap,          // beim Grant verdrängte Cap freigeben (kein Slot-Leck)
+        dispatch_spawn,               // K1a: zweiter Thread in derselben PD, Stack aus einer Cap
+        dispatch_debug,               // Z6b: die fuenf Debug-Syscalls
     );
     // Der Syscall kann den laufenden Thread gewechselt haben (block/exit) -> FP-Trap
     // + VSpace passend zum neuen aktuellen Thread setzen.
@@ -1838,6 +1878,7 @@ pub fn configure_caps() -> u64 {
     let dma = table(n * core::mem::size_of::<(u64, u64)>(), 4096);
     let ok = table(n, 4096);
     let ctx = table(n * core::mem::size_of::<usize>(), 4096);
+    let dbg = table(n * core::mem::size_of::<u16>(), 4096);
     {
         let mut b = FINALIZE.lock();
         // SAFETY: wie oben; jede Tabelle bekommt ihren **eigenen** Block (exklusiv).
@@ -1846,6 +1887,7 @@ pub fn configure_caps() -> u64 {
             b.dma.attach(dma as *mut (u64, u64), n, |_| (0, 0));
             b.ok.attach(ok as *mut bool, n, |_| false);
             b.ctx_of.attach(ctx as *mut usize, n, |_| usize::MAX);
+            b.debug.attach(dbg as *mut u16, n, |_| 0u16);
         }
     }
 
@@ -2172,6 +2214,21 @@ pub fn alloc(size: u64, align: u64) -> Option<MemoryCap> {
 /// einem Geraet gezeigt wird (E-Rest 3d) — er liegt bevorzugt oberhalb 4 GiB und laesst GiB 0
 /// denen, die es brauchen. Wer sich nicht sicher ist, nimmt [`alloc`]: die Vorgabe ist die
 /// vorsichtige.
+/// **Allocate strictly inside `[lo, hi)`** — the window form the NUMA placement ladder needs (N2).
+///
+/// A node is a *set of address ranges*, and the allocator already takes a window
+/// (`PhysAllocator::alloc_in`). So "allocate on node n" needs no second allocator and no second
+/// free list: it is the existing best-fit search restricted to that node's ranges, which keeps
+/// colour, zone and node in **one** decision instead of three layers arguing with each other.
+///
+/// Unlike [`alloc_anywhere`] this is a **condition, not a preference**: it returns `None` rather
+/// than something outside the window. The caller decides whether to descend the ladder.
+pub fn alloc_in_window(size: u64, align: u64, lo: u64, hi: u64) -> Option<MemoryCap> {
+    let cap = { MEM.lock().alloc_in(size, align, lo, hi) }?;
+    zero_phys(cap.base(), cap.len());
+    Some(cap)
+}
+
 pub fn alloc_anywhere(size: u64, align: u64) -> Option<MemoryCap> {
     mem_alloc_anywhere(size, align)
 }
@@ -2415,6 +2472,8 @@ struct FinalizeBuf {
     /// Kratzfläche der Enforcer: je Region der Index des betroffenen Übersetzungskontexts.
     /// Lag bis A-3.3 in **jeder** `finalize`-Implementierung nochmals auf dem Stack.
     ctx_of: Slab<usize>,
+    /// **PDs, deren Debug-Halt freizugeben ist** (Z6b). Dieselbe Schranke, derselbe Grund.
+    debug: Slab<u16>,
 }
 
 /// **Sperrordnung: `FINALIZE` ist die äußerste.** Sie wird vor `CAPS` genommen und erst nach
@@ -2431,6 +2490,7 @@ static FINALIZE: SpinLock<FinalizeBuf> = SpinLock::new(FinalizeBuf {
     dma: Slab::empty(),
     ok: Slab::empty(),
     ctx_of: Slab::empty(),
+    debug: Slab::empty(),
 });
 
 /// **Zählfläche des CDT-Audits** (A-3.4) — ein `u32` je Objekt-Eintrag.
@@ -2490,13 +2550,18 @@ pub fn cap_delete(ptr: CapPtr) -> Result<(), CapError> {
     // Freigeben von CAPS/MEM, da das Entblocken EPS<SCHEDS sperrt -> CAPS < EPS).
     let mut buf = FINALIZE.lock();
     let b = &mut *buf;
-    let mut rf = caprock_cap::Finalized::new(b.items.as_mut_slice(), b.dma.as_mut_slice());
+    let mut rf = caprock_cap::Finalized::mit_debug(
+        b.items.as_mut_slice(),
+        b.dma.as_mut_slice(),
+        b.debug.as_mut_slice(),
+    );
     let r = {
         let mut caps = CAPS.write();
         let mut mem = MEM.lock();
         caps.cspace.delete(&mut mem, ptr, &mut rf)
     };
     abort_finalized_replies(&rf);
+    release_finalized_debug(&rf);
     dma_finalize(&rf, b.ok.as_mut_slice(), b.ctx_of.as_mut_slice());
     note_finalize_overflow(&rf);
     r
@@ -2504,16 +2569,77 @@ pub fn cap_delete(ptr: CapPtr) -> Result<(), CapError> {
 pub fn cap_revoke(ptr: CapPtr) -> Result<(), CapError> {
     let mut buf = FINALIZE.lock();
     let b = &mut *buf;
-    let mut rf = caprock_cap::Finalized::new(b.items.as_mut_slice(), b.dma.as_mut_slice());
+    let mut rf = caprock_cap::Finalized::mit_debug(
+        b.items.as_mut_slice(),
+        b.dma.as_mut_slice(),
+        b.debug.as_mut_slice(),
+    );
     let r = {
         let mut caps = CAPS.write();
         let mut mem = MEM.lock();
         caps.cspace.revoke(&mut mem, ptr, &mut rf)
     };
     abort_finalized_replies(&rf);
+    release_finalized_debug(&rf);
     dma_finalize(&rf, b.ok.as_mut_slice(), b.ctx_of.as_mut_slice());
     note_finalize_overflow(&rf);
     r
+}
+
+/// **Z6b: den Debug-Halt jeder PD freigeben, deren letzte `DebugControl` gerade verschwunden ist.**
+///
+/// ## Warum das hier steht und nicht in `cap_revoke`
+///
+/// Nur der Debugger entfernt [`BlockReasons::DEBUG`](caprock_sched::BlockReasons::DEBUG). Faellt
+/// seine Autoritaet weg — durch `revoke`, oder weil seine PD stirbt —, traegt ein angehaltener
+/// Thread einen Grund, den **niemand** mehr entfernen darf: er laeuft nie wieder. *Ein Revoke, das
+/// sein Ziel unbrauchbar macht, ist schlimmer als kein Revoke*, und es ist dieselbe Klasse wie die
+/// vier D9-Befunde — ein Wecker, dessen Weckender wegging.
+///
+/// Die naheliegende Fassung waere, den Grund **in** `cap_revoke` zu entfernen. Sie traegt nicht:
+/// `CAPS` laege dabei fuer eine datenabhaengige, unbegrenzte Dauer, und die Kante
+/// `CAPS -> SCHEDS[core]` waere neu und muesste gegen jeden Pfad geprueft werden, der andersherum
+/// laeuft. Der Platz hier hat beides nicht — `CAPS` ist freigegeben, die Ordnung ist
+/// `CAPS < EPS < SCHEDS` wie bei [`abort_finalized_replies`], neben dem diese Funktion **absichtlich
+/// steht**: sie ist derselbe Fall, nur mit einem anderen Grundbit.
+///
+/// ## Und warum NICHT zweimal hingeschrieben
+///
+/// `cap_delete` und `cap_revoke` sind strukturgleich und rufen beide hierher. Eine sterbende
+/// Debugger-PD nimmt den **`cap_delete`**-Weg (je Cap einzeln, s. `pd_teardown`), nicht den
+/// Revoke-Weg. Stuende die Regel an beiden Stellen, altert die `cap_delete`-Kopie: der ausdrueckliche
+/// Revoke ist der Fall, an den beim Testen jeder zuerst denkt (K1a).
+///
+/// Gezaehlt wird **nach Wirkung**: `DEBUG_RELEASED` waechst um die Zahl tatsaechlich freigegebener
+/// Threads, nicht um die Zahl der Meldungen. „Es gab eine Meldung" und „ein Thread lief wieder los"
+/// sind zwei Aussagen — dieselbe Unterscheidung wie `rx_used` gegen „Daten sind angekommen".
+fn release_finalized_debug(rf: &caprock_cap::Finalized<'_>) {
+    for pd in rf.iter_debug() {
+        // **Erst fragen, dann freigeben.** Der Sammler meldet JEDES geloeschte Steuerrecht; ob
+        // damit das LETZTE ging, weiss nur ein Blick auf den ganzen Cspace — und den gibt es erst
+        // hier, nachdem `CAPS` freigegeben und wieder lesend genommen werden kann. Ohne diese
+        // Frage gaebe der Wegfall EINES von zwei Steuerrechten das Ziel frei, waehrend das andere
+        // es angehalten haelt: der zweite Debugger laese danach den Frame eines LAUFENDEN Threads
+        // und wuesste es nicht.
+        if CAPS.read().cspace.any_debug_control_over(pd) {
+            continue;
+        }
+        let pd_of = |tid: ThreadId| pd_of_thread(tid).map(|p| p as u32);
+        let mut n = 0usize;
+        // Jeder Kern einzeln, je unter seiner eigenen Sperre. Dass dabei kein Thread zwischen zwei
+        // besuchten Kernen entwischt, ist **erzwungen** und nicht beobachtet: `detach_for_migration`
+        // weist einen Thread mit gesetztem `DEBUG` ab.
+        for c in 0..num_cores() {
+            if !caprock_sched::core_online(c) {
+                continue;
+            }
+            n += SCHEDS[c].lock().debug_release_pd(&pd_of, pd as u32);
+        }
+        if n > 0 {
+            DEBUG_RELEASED.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        DEBUG_RELEASE_EVENTS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Für jede beim Löschen/Revoke finalisierte Reply-Cap den ausstehenden Call abbrechen:
@@ -2690,16 +2816,66 @@ pub fn least_loaded_core() -> usize {
     // **Lock-frei** (ext-30): die Last jedes Kerns steht in einem Atomic, das der jeweilige
     // Scheduler pflegt. Vorher sperrte diese Funktion JEDEN Kern-Scheduler nacheinander —
     // bei 256 Kernen 256 Lock-Zyklen je Spawn, und dabei stand die Einplanung aller Kerne.
-    let mut best = 0usize;
+    // **Nur Kerne, die sich gemeldet haben** (2026-08-17, Z6 Stufe 1). `num_cores()` ist die
+    // dimensionierte Kernzahl, nicht die laufende: ein unterdruecktes Geschwister hat einen
+    // Scheduler-Slot, aber keinen Idle-Thread. Sein `CORE_LOAD` steht bei 0 und gewann damit
+    // JEDE Platzierung -- gemessen als Kernel-Panic „kein laufender Thread (gefragter Kern 1)"
+    // unter `-smp cores=2,threads=2`.
+    let mut best = hal::cpu::core_id();
     let mut best_load = usize::MAX;
     for c in 0..num_cores() {
+        if !caprock_sched::core_online(c) {
+            continue;
+        }
         let load = caprock_sched::core_load(c);
         if load < best_load {
             best_load = load;
             best = c;
         }
     }
+    // Der Rueckfall ist der EIGENE Kern, nicht Kern 0: der Aufrufer laeuft nachweislich, Kern 0
+    // muss es nicht. Erreichbar ist der Zweig nur, bevor der erste Kern `init_core` durchlaufen
+    // hat -- dann ist „hier" die einzige belegbare Antwort.
     best
+}
+
+/// **N3: den am wenigsten belasteten Kern DES KNOTENS `node`.**
+///
+/// Falls dieser Knoten keinen laufenden Kern hat, faellt es auf [`least_loaded_core`] zurueck —
+/// und **genau dieser Fall wird gezaehlt**, nicht der Versuch. „Auf dem Knoten war kein Kern" und
+/// „der Thread landete auf einem fremden Knoten" sind zwei Aussagen; nur die zweite ist eine
+/// Tatsache ueber die Platzierung (E-Rest 3b, wortwoertlich).
+///
+/// Der Knoten ist eine **eigene benannte Groesse** und wird nicht in den Lastzaehler geschmuggelt.
+/// Diese Woche hat genau die Verwechslung schon einmal gekostet: `CORE_LOAD` bedeutete nebenbei
+/// „lebt dieser Kern", und ein nie gestarteter Kern gewann damit jede Platzierung.
+pub fn least_loaded_core_on(node: caprock_hal::numa::Node) -> usize {
+    let caprock_hal::numa::Node::At(n) = node else {
+        return least_loaded_core();
+    };
+    let mut best: Option<(usize, usize)> = None;
+    for c in 0..num_cores() {
+        if !caprock_sched::core_online(c) {
+            continue;
+        }
+        if crate::numa::node_of_core(c) != caprock_hal::numa::Node::At(n) {
+            continue;
+        }
+        let load = caprock_sched::core_load(c);
+        if best.map_or(true, |(_, bl)| load < bl) {
+            best = Some((c, load));
+        }
+    }
+    match best {
+        Some((c, _)) => {
+            crate::numa::note_core_placement(true);
+            c
+        }
+        None => {
+            crate::numa::note_core_placement(false);
+            least_loaded_core()
+        }
+    }
 }
 
 // --- Thread-Migration (ext-30) -----------------------------------------------------------
@@ -2930,6 +3106,244 @@ pub fn spawn_in_pd(pd: usize, entry: usize, arg: usize, prio: u8) -> Option<Thre
 /// Einen **EL0-User-Thread** erzeugen: Kernel-Stack aus dem EL1-only Pool (per
 /// Free-List, beim Thread-Ende zurückgegeben), User-Stack aus dem EL0-zugänglichen
 /// RAM. Der Thread läuft auf EL0 und kann nur per Syscall mit dem Kernel interagieren.
+/// **Erreicht ein Gerät diese Region?** (K1a)
+///
+/// Eine `ObjectKind::Memory`-Cap ist per Variante keine DMA-Region — aber sie kann eine
+/// **physisch überlappen**, und dann schreibt das Gerät trotzdem hinein. Geprüft wird deshalb die
+/// Lage, nicht der Typ.
+///
+/// Läuft über `for_each_dma` (denselben Weg, den der DMA-Audit nimmt) — *ein Prüfer, der die
+/// Grösse nachrechnet statt sie zu lesen, prüft eine zweite Wirklichkeit.*
+fn dma_region_overlaps(base: u64, len: u64) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let end = base.saturating_add(len);
+    let mut treffer = false;
+    CAPS.read().cspace.for_each_dma(&mut |b, l| {
+        if base < b.saturating_add(l) && b < end {
+            treffer = true;
+        }
+    });
+    treffer
+}
+
+/// **Überlappt die Region eine bestehende EL0-Abbildung dieser PD?** (K1a)
+///
+/// **Bewusst konservativ, und das steht hier statt in einem Commit-Text:** geprüft werden die
+/// beim Kernel gebuchten User-Regionen der Threads dieser PD (`KSTACKS.ubase_of`/`ulen_of`) —
+/// also genau die Stapel, die ein zweiter `SPAWN` treffen könnte. **Nicht** geprüft wird die
+/// vollständige VSpace der PD (Segmente eines geladenen Programms, `SYS_MAP`-Abbildungen); dafür
+/// bräuchte es einen Seitentabellenlauf.
+///
+/// Die Richtung des Irrtums ist die verzeihliche: eine Überlappung mit einem **fremden Segment**
+/// bliebe unerkannt. Das ist innerhalb *einer* PD dieselbe Vertrauenszone (der Aufrufer könnte
+/// dort ohnehin hineinschreiben) — es wird zum Loch, sobald `SPAWN` je eine PD-Grenze
+/// überschreitet, und dann gehört hier ein VSpace-Lauf hin.
+fn pd_mapping_overlaps(pd: usize, base: u64, len: u64) -> bool {
+    if len == 0 {
+        return true; // eine leere Region „passt überall" -- fail-closed statt fail-open
+    }
+    let end = base.saturating_add(len);
+    let p = KSTACKS.lock();
+    let g = CAPS.read();
+    (0..p.ubase_of.len()).any(|slot| {
+        let (b, l) = (p.ubase_of[slot], p.ulen_of[slot]);
+        if b == 0 || l == 0 {
+            return false;
+        }
+        // Nur Threads DIESER PD: die Region eines fremden Adressraums kollidiert nicht.
+        let gehoert_pd = g
+            .pds
+            .pd_of_thread(caprock_sched::ThreadId::from_raw(slot as u64))
+            == Some(pd);
+        gehoert_pd && base < b.saturating_add(l) && b < end
+    })
+}
+
+/// **Die Stack-Cap eines Threads** (K1a) — der Verweis, der `CDELETE` blockiert.
+///
+/// Der benannte Preis dafür, dass der Stack aus einer Cap des Aufrufers kommt: TCB und CapSpace
+/// sind gekoppelt. Ein Verweis, der die Löschung **abweist**, ist zählbar; die Alternative
+/// („Löschung tötet den Thread mit") wäre eine Gruppenoperation über `CAPS` **und**
+/// `SCHEDS[core]`, also die V4-Klasse mit zwei Sperren und einer Ordnung.
+/// Plaetze der Stack-Cap-Tabelle.
+///
+/// **Eine eigene Zahl, und sie ist fail-closed benannt:** die Thread-Tabellen des Kernels sind
+/// `Slab`s und damit erst zur Laufzeit gross; eine statische Tabelle braucht eine Schranke. 1024
+/// deckt den `scale`-Test (1024 Threads). Ein Slot darueber bekommt **keinen** Eintrag -- und
+/// weil `stack_cap_in_use` dann nichts findet, waere seine Cap loeschbar. Deshalb weist
+/// `dispatch_spawn` einen solchen Thread ab, statt ihn ungeschuetzt laufen zu lassen.
+const STACK_CAP_SLOTS: usize = 1024;
+
+static STACK_CAP_OF: SpinLock<[Option<(u64, caprock_cap::CapPtr)>; STACK_CAP_SLOTS]> =
+    SpinLock::new([None; STACK_CAP_SLOTS]);
+
+fn record_stack_cap(tid: ThreadId, cap: caprock_cap::CapPtr) -> bool {
+    let slot = tid.slot();
+    if slot >= STACK_CAP_SLOTS {
+        return false;
+    }
+    STACK_CAP_OF.lock()[slot] = Some((tid.to_raw(), cap));
+    true
+}
+
+/// Ist diese Cap der Stack eines **lebenden** Threads?
+///
+/// Die `ThreadId` wird mitgeprüft, nicht nur der Slot: ein wiederverwendeter Slot mit neuer
+/// Generation ist ein **anderer** Thread, und seine Cap dürfte nicht am alten Eintrag hängen
+/// bleiben. Das ist dieselbe Falle wie bei den wiederverwendeten Slots in D15.
+fn stack_cap_in_use(cap: caprock_cap::CapPtr) -> bool {
+    let t = STACK_CAP_OF.lock();
+    t.iter().any(|e| match e {
+        Some((raw, c)) => {
+            *c == cap && thread_alive(caprock_sched::ThreadId::from_raw(*raw))
+        }
+        None => false,
+    })
+}
+
+/// **Der Rückruf hinter `SYS_SPAWN`** (K1a, 2026-08-17) — die einzige Stelle, an der über einen
+/// vorgeschlagenen Stack geurteilt wird.
+///
+/// Er läuft **ohne gehaltenes `CAPS`** (der Dispatch gibt es vorher frei) und nimmt es selbst,
+/// damit die Ordnung `MEM < SCHEDS` erhalten bleibt.
+///
+/// Die sechs Absagen kommen aus [`caprock_cap::spawncheck::check_stack`] und werden hier **nur
+/// übersetzt**, nicht neu entschieden. Jede hat ihren eigenen ABI-Code: eine Sammelabsage machte
+/// „Stack zu klein" und „ein Gerät kann den Stack schreiben" ununterscheidbar, und das zweite ist
+/// ein Angriff.
+fn dispatch_spawn(
+    pd: usize,
+    cap: caprock_cap::CapPtr,
+    entry: usize,
+    arg: usize,
+    prio: u8,
+) -> Result<u64, u64> {
+    use caprock_cap::spawncheck::{check_stack, StackProposal, StackRefusal};
+    // Alles, was aus der Cap und der PD-Tabelle kommt, unter EINEM Lesezugriff -- sonst könnte
+    // sich die Zahl zwischen zwei Blicken ändern, und die Schranke wäre eine über einem
+    // veralteten Stand.
+    let (is_memory, writable, base, len, threads_now) = {
+        let g = CAPS.read();
+        let threads_now = g.pds.thread_count(pd);
+        match g.cspace.lookup(cap) {
+            Some((caprock_cap::ObjectKind::Memory(r), rights, _)) => (
+                true,
+                rights.contains(caprock_mem::Rights::RW),
+                r.base,
+                r.len,
+                threads_now,
+            ),
+            _ => (false, false, 0, 0, threads_now),
+        }
+    };
+    let p = StackProposal {
+        is_memory,
+        writable,
+        // Eine `ObjectKind::Memory`-Cap IST der normale Raum: Geräte- und DMA-Regionen sind
+        // eigene Varianten (`Mmio`, `Dma`) und wären oben schon durchgefallen. Der Wert steht
+        // trotzdem im Vorschlag, damit die Prüfung vollständig **lesbar** ist und nicht davon
+        // abhängt, dass jemand die Variantenliste im Kopf hat.
+        normal_space: is_memory,
+        base,
+        len,
+        // **Die Frage, die nur der Kernel beantworten kann.** Ein Stack, den ein Gerät schreiben
+        // kann, ist die `by ops`-Platzierungsregel als Angriff -- die Rücksprungadresse ist Daten.
+        device_reachable: dma_region_overlaps(base, len),
+        // Ebenso: nur der Kernel kennt die Abbildungen der Ziel-VSpace.
+        overlaps_existing: pd_mapping_overlaps(pd, base, len),
+        threads_now,
+    };
+    let stack_top = check_stack(&p).map_err(|r| match r {
+        StackRefusal::NotMemory => caprock_abi::result::ERR_BADCAP,
+        StackRefusal::NotWritable | StackRefusal::WrongSpace => caprock_abi::result::ERR_RIGHTS,
+        StackRefusal::DeviceReachable => caprock_abi::result::ERR_DMA_REACHABLE,
+        StackRefusal::BadGeometry => caprock_abi::result::ERR_BADSTACK,
+        StackRefusal::Overlaps => caprock_abi::result::ERR_NOSPACE,
+        StackRefusal::ThreadLimit => caprock_abi::result::ERR_THREAD_LIMIT,
+    })?;
+    // **D0 wörtlich: parken -- binden -- zulassen.** Ein Thread, der lauffähig ist, bevor er seine
+    // PD hat, macht seinen ersten Syscall mit LEEREM Cspace. Das hat zehn Tage gekostet, und die
+    // Rate war 0,018 %.
+    let parked = spawn_with_stack_parked(entry, arg, base, stack_top, prio)
+        .ok_or(caprock_abi::result::ERR_NOSPACE)?;
+    bind_pd_parked(&parked, pd);
+    // Die Stack-Cap am TCB vermerken, BEVOR der Thread laufen darf: danach ist sie gegen
+    // `CDELETE` gesperrt (`ERR_INUSE`). Andersherum gäbe es ein Fenster, in dem der Thread läuft
+    // und seine Cap löschbar wäre -- und ihre Finalisierung gibt den Speicher an den Allokator
+    // zurück, unter den Füßen eines laufenden Stapels.
+    let tid = admit(parked).ok_or(caprock_abi::result::ERR_NOSPACE)?;
+    if !record_stack_cap(tid, cap) {
+        // **Fail-closed.** Ohne Eintrag ist die Stack-Cap loeschbar, waehrend der Thread auf ihr
+        // laeuft -- die Finalisierung gaebe den Speicher an den Allokator zurueck, unter den
+        // Fuessen eines laufenden Stapels. Lieber kein Thread als ein ungeschuetzter.
+        kill_local(tid);
+        return Err(caprock_abi::result::ERR_NOSPACE);
+    }
+    Ok(tid.to_raw())
+}
+
+/// **`SYS_SPAWN`: a thread whose stack the CALLER brought** (K1a, 2026-08-17).
+///
+/// The difference to [`spawn_user_parked`] is one line long and it is the whole point: that
+/// function calls `mem_alloc`, this one does not. **The kernel manages authority, not supply** —
+/// the region comes out of a Cap the caller already holds, so the caller carries the cost and the
+/// memory policy stays in userspace where it is revisable.
+///
+/// `stack_base`/`stack_len` have already passed [`caprock_cap::spawncheck::check_stack`]: memory
+/// Cap, `rw`, `normal` space, **not device-reachable**, aligned, big enough, non-overlapping.
+/// This function does not re-derive any of that — *a checker that recomputes the quantity it
+/// checks is checking a second reality.*
+///
+/// **What is deliberately NOT done here: `record_user_region`.** That call marks a region as
+/// kernel-owned so the reap path frees it on thread death. This stack is **not** the kernel's; it
+/// belongs to the Cap, and freeing it would be a double free the moment the caller deletes the
+/// Cap. The Cap's own finalisation returns the memory — which is exactly why deleting it while
+/// the thread lives is refused (`ERR_INUSE`).
+pub fn spawn_with_stack_parked(
+    entry: usize,
+    arg: usize,
+    stack_base: u64,
+    stack_top: u64,
+    prio: u8,
+) -> Option<Parked> {
+    let core = hal::cpu::core_id();
+    mangel_zuruecksetzen();
+    // Der EL1-Kernel-Stack bleibt Kernelsache: er traegt Kernelzustand, nie Userdaten, und ein
+    // Aufrufer duerfte ihn nicht stellen (er koennte hineinschreiben, waehrend der Kernel darauf
+    // laeuft). Nur der EL0-Stack kommt aus der Cap.
+    let kbase = claim_user_kstack()?;
+    let tid = {
+        let mut sched = SCHEDS[core].lock();
+        let r = sched.spawn_user_at_parked(
+            core,
+            entry,
+            arg,
+            kbase,
+            USER_KSTACK_SIZE,
+            stack_top as usize, // EL0-SP: Stapel wachsen nach unten, also das ENDE
+            // Reap-Region **leer**: die Region gehoert der Cap, nicht dem Kernel. Ein `0`-Laenge
+            // heisst „beim Thread-Tod nichts freigeben" -- s. Doku oben.
+            stack_base as usize,
+            0,
+            prio,
+        );
+        if let Some(t) = r {
+            fp_reset_slot(t.slot());
+            record_user_kstack(t, kbase);
+        }
+        r
+    };
+    match tid {
+        Some(t) => Some(Parked(t)),
+        None => {
+            release_user_kstack(kbase);
+            None
+        }
+    }
+}
+
 pub fn spawn_user_parked(entry: usize, arg: usize, prio: u8) -> Option<Parked> {
     let core = hal::cpu::core_id();
     mangel_zuruecksetzen();
@@ -8950,6 +9364,499 @@ pub fn thread_quiescence(tid: ThreadId) -> Quiescence {
 }
 
 
+// ================================================================================================
+// Z6b: der Debugger
+// ================================================================================================
+//
+// **Die Zusage, die dieser Abschnitt traegt:** Debug-Autoritaet ist eine Capability ueber genau
+// EINE PD — delegierbar, widerrufbar, pruefbar. Eine PD, ueber die nie eine gepraegt wurde, kann
+// nicht debuggt werden, und das ist eine Eigenschaft des Systems, keine Zusage.
+//
+// Was `ptrace` daran nicht kann: es ist PID-gebundene, allgegenwaertige Autoritaet, gegen eine UID
+// geprueft; `root` haengt sich an alles, und die Gegenmassnahmen (`yama`) sind nachtraeglich
+// aufgeschraubte Politik. Hier IST die Autoritaet ein Objekt im CDT — Widerruf, Delegation und
+// Audit kommen aus Maschinerie, die es schon gibt und die schon gemessen ist.
+
+/// Wie viele Threads angehalten wurden (nach Wirkung).
+pub static DEBUG_STOPS: AtomicU64 = AtomicU64::new(0);
+/// Wie viele mit `ERR_DEBUG_BUSY` abgewiesen wurden -- der benannte Ueberlauf einer Kapazitaet
+/// von eins.
+pub static DEBUG_BUSY: AtomicU64 = AtomicU64::new(0);
+/// Wie viele Threads durch `DEBUG_CONTINUE` weiterliefen.
+pub static DEBUG_CONTINUES: AtomicU64 = AtomicU64::new(0);
+/// Wie viele Threads die **Cap-Finalisierung** freigegeben hat (Revoke ODER Teardown).
+pub static DEBUG_RELEASED: AtomicU64 = AtomicU64::new(0);
+/// Wie oft die Finalisierung ueberhaupt eine Meldung hatte. **Getrennt von `DEBUG_RELEASED`**,
+/// weil es zwei Aussagen sind: „die Autoritaet ging weg" und „ein Thread lief wieder los". Dieselbe
+/// Unterscheidung wie `rx_used` gegen „Daten sind angekommen".
+pub static DEBUG_RELEASE_EVENTS: AtomicU64 = AtomicU64::new(0);
+/// Abweisungen mit `ERR_NOT_DEBUGGABLE` -- die Zahl, an der die Zusage aus §0 haengt.
+pub static DEBUG_NOT_DEBUGGABLE: AtomicU64 = AtomicU64::new(0);
+/// Erfolgreiche Ableitungen (`DEBUG_ATTACH`).
+pub static DEBUG_ATTACHES: AtomicU64 = AtomicU64::new(0);
+/// Abgewiesene Registerschreibvorgaenge, aufgeschluesselt: Ring-Wort · ueber der Stufe · ungueltiger
+/// Wert. **Drei Zahlen, weil es drei verschiedene Lagen sind** -- „abgewiesen" allein ist als
+/// Diagnose wertlos.
+pub static DEBUG_WR_RING: AtomicU64 = AtomicU64::new(0);
+pub static DEBUG_WR_LEVEL: AtomicU64 = AtomicU64::new(0);
+pub static DEBUG_WR_VALUE: AtomicU64 = AtomicU64::new(0);
+/// Angenommene Registerschreibvorgaenge.
+pub static DEBUG_WR_OK: AtomicU64 = AtomicU64::new(0);
+
+/// **Eine `Debuggable`-Cap fuer `pd` praegen** -- gerufen aus `loader::debuggable_praegen` und
+/// sonst nirgends.
+///
+/// Die Cap landet im Cspace der **Root-PD** (PD 0), nicht in der der Ziel-PD: eine PD, die ihre
+/// eigene Debug-Wurzel haelt, kann sich selbst debuggen und die Autoritaet weiterreichen — die
+/// Zusage waere dann eine ueber die Gutwilligkeit des Ziels.
+pub fn mint_debuggable(pd: usize) -> Option<usize> {
+    let mut g = CAPS.write();
+    let cap = g.cspace.install_debuggable(pd as u16, Rights::RW).ok()?;
+    let slot = g.pds.free_cap_slot(0)?;
+    if g.install_cap_checked(0, slot, cap) {
+        Some(slot)
+    } else {
+        None
+    }
+}
+
+/// **Haelt IRGENDJEMAND im ganzen System Debug-Autoritaet ueber `pd`?**
+///
+/// Die Frage, auf der die Zusage ruht — und sie wird **beantwortet, nicht behauptet**: ein Durchlauf
+/// der Objekttabelle, nicht das Lesen eines Flags, das jemand gesetzt haben koennte.
+pub fn any_debug_authority_over(pd: usize) -> bool {
+    CAPS.read().cspace.any_debug_authority_over(pd as u16)
+}
+
+/// Welche PD bezeichnet diese Cap, und mit welchem Recht? `None` = keine Debug-Cap.
+///
+/// **Die Rechte unterscheiden, nicht die Objektart** — s. `ObjectKind::Debuggable`. Ein Kind mit
+/// `READ` liest und haelt nie etwas an; eines mit `WRITE` steuert. Die Wurzel traegt `RW` und ist
+/// damit Steuerrecht, weil sie jederzeit eines praegen kann.
+fn debug_cap_kind(g: &Caps, cap: CapPtr) -> Option<(u16, bool, bool)> {
+    let info = g.cspace.inspect(cap)?;
+    let ObjectKind::Debuggable { pd } = info.kind else {
+        return None;
+    };
+    // **Die Wurzel gewaehrt selbst NICHTS** -- weder Lesen noch Anhalten. Sie ist das Recht,
+    // abzuleiten, und der Knoten, an dem `revoke` ansetzt. Ohne diese Zeile waere „gewaehrt selbst
+    // nichts" eine Prosa-Aussage ohne Gatter, und ein Revoke liesse ein lebendes Steuerrecht
+    // stehen -- gemessen am 2026-08-20 als `revoke-bricht-nicht=false`.
+    if info.is_root {
+        return Some((pd, false, false));
+    }
+    Some((
+        pd,
+        info.rights.contains(Rights::READ),
+        info.rights.contains(Rights::WRITE),
+    ))
+}
+
+/// **`SYS_DEBUG_ATTACH`** -- aus einer `Debuggable` ein Lese- und/oder Steuerrecht ableiten.
+///
+/// ## Abgeleitet wird ueber `mint`, und das ist die ganze Zusage
+///
+/// `mint` haengt das neue Cap als **CDT-Kind** unter das vorgelegte. Damit nimmt ein `revoke` an
+/// der Wurzel jedes abgeleitete Recht mit — auch weiterverschenkte —, und „wer haelt Debug-
+/// Autoritaet ueber diese PD?" ist ein Baumlauf statt einer Behauptung. Beides faellt aus der
+/// Ableitung heraus, keines ist gebaut.
+///
+/// **Der erste Entwurf hat hier ein neues Wurzel-Cap angelegt.** Es sah aus wie eine Ableitung und
+/// war keine: `revoke` an der Wurzel liess die „Kinder" stehen. Gefunden hat es nicht das
+/// Gegenlesen, sondern die Messung — `revoke-bricht-nicht=false` in der `dbg`-Zeile.
+pub fn debug_attach(caller_pd: usize, slot: usize, rights: u64) -> Result<u64, u64> {
+    use caprock_abi::{debug as dbgr, result};
+    if rights & !dbgr::RIGHT_BOTH != 0 || rights == 0 {
+        // Ein unbekanntes Rechtebit heisst „ich verlange etwas, wofuer es keinen Mechanismus gibt".
+        // Abweisen, nicht maskieren — dieselbe Regel wie bei den reservierten Manifest-Bytes.
+        return Err(result::ERR_RIGHTS);
+    }
+    let mut g = CAPS.write();
+    let Some(cap) = g.pds.cap_ptr_at(caller_pd, slot) else {
+        return Err(result::ERR_BADCAP);
+    };
+    let Some(info) = g.cspace.inspect(cap) else {
+        return Err(result::ERR_BADCAP);
+    };
+    let ObjectKind::Debuggable { pd } = info.kind else {
+        return Err(result::ERR_BADCAP);
+    };
+    let mut vergeben = 0u64;
+    if rights & dbgr::RIGHT_READ != 0 {
+        let c = g
+            .cspace
+            .mint(cap, Rights::READ, pd as u64)
+            .map_err(|_| result::ERR_NOSPACE)?;
+        let sl = g.pds.free_cap_slot(caller_pd).ok_or(result::ERR_NOSPACE)?;
+        if !g.install_cap_checked(caller_pd, sl, c) {
+            return Err(result::ERR_NOSPACE);
+        }
+        vergeben |= (sl as u64) << 32;
+    }
+    if rights & dbgr::RIGHT_CONTROL != 0 {
+        let c = g
+            .cspace
+            .mint(cap, Rights::RW, pd as u64)
+            .map_err(|_| result::ERR_NOSPACE)?;
+        let sl = g.pds.free_cap_slot(caller_pd).ok_or(result::ERR_NOSPACE)?;
+        if !g.install_cap_checked(caller_pd, sl, c) {
+            return Err(result::ERR_NOSPACE);
+        }
+        vergeben |= sl as u64;
+    }
+    DEBUG_ATTACHES.fetch_add(1, Ordering::Relaxed);
+    Ok(vergeben)
+}
+
+/// **`SYS_DEBUG_STOP`.**
+///
+/// ## Warum `CAPS.read()` ueber den ganzen Vorgang gehalten wird
+///
+/// Eine Cap-Pruefung beim Eintritt und ein Setzen des Grundes danach waeren **zwei** kritische
+/// Sektionen, und dazwischen passt ein `revoke`: der Thread bekaeme `DEBUG` gesetzt, nachdem die
+/// Freigabe schon gelaufen ist, und traege danach einen Grund, den niemand mehr entfernen darf.
+/// Das ist genau der Fehler, den niemand sieht, weil er im Normalbetrieb nie auftritt.
+///
+/// Die Schachtelung ist erlaubt und nicht neu: `CAPS` ist **R0**, `SCHEDS[core]` ist **R2**
+/// (`docs/invariants.md` §1), und Schachteln darf nur aufsteigend. `bind_sched_context` gibt
+/// `CAPS` vorher frei — aus Kontentionsgruenden, nicht aus Ordnungsgruenden.
+///
+/// **Der urspruengliche Plan sah hier eine Objekt-Generation vor.** Sie wird nicht gebraucht: die
+/// gemeinsame Lesesperre leistet dasselbe, ohne eine zweite Zahl, die jemand pflegen muss.
+pub fn debug_stop(caller_pd: usize, slot: usize, tid_raw: u64) -> Result<u64, u64> {
+    use caprock_abi::result;
+    let tid = ThreadId::from_raw(tid_raw);
+    let g = CAPS.read(); // R0 -- gehalten, s. Doku
+    let Some(cap) = g.pds.cap_ptr_at(caller_pd, slot) else {
+        return Err(result::ERR_BADCAP);
+    };
+    let Some((pd, _, control)) = debug_cap_kind(&g, cap) else {
+        return Err(result::ERR_BADCAP);
+    };
+    if !control {
+        return Err(result::ERR_RIGHTS);
+    }
+    // **Die Cap benennt EINE PD.** Ein Thread einer anderen ist kein Grenzfall, sondern der
+    // Versuch, die Grenze zu ueberschreiten -- und `ERR_BADCAP` ist dafuer die richtige Antwort:
+    // fuer DIESEN Thread haelt der Aufrufer keine Cap.
+    if g.pds.pd_of_thread_pub(tid) != Some(pd as usize) {
+        return Err(result::ERR_BADCAP);
+    }
+    let ok = with_owner(tid, |s, _| s.debug_stop(tid).then_some(())).is_some();
+    drop(g);
+    if ok {
+        DEBUG_STOPS.fetch_add(1, Ordering::Relaxed);
+        // Laeuft er auf einem anderen Kern, haelt ihn erst der naechste Kerneleintritt an --
+        // der IPI beschleunigt genau das. **Mitten in einer Instruktion haelt hier nichts an**,
+        // und das gehoert in die Zusage: bei 100 Hz sind das <= 10 ms.
+        if let Some(c) = owner_core_of(tid) {
+            kick(c);
+        }
+        Ok(0)
+    } else {
+        DEBUG_BUSY.fetch_add(1, Ordering::Relaxed);
+        Err(result::ERR_DEBUG_BUSY)
+    }
+}
+
+/// **`SYS_DEBUG_CONTINUE`** -- entfernt `DEBUG` und **nur** das.
+pub fn debug_continue(caller_pd: usize, slot: usize, tid_raw: u64) -> Result<u64, u64> {
+    use caprock_abi::result;
+    let tid = ThreadId::from_raw(tid_raw);
+    let g = CAPS.read();
+    let Some(cap) = g.pds.cap_ptr_at(caller_pd, slot) else {
+        return Err(result::ERR_BADCAP);
+    };
+    let Some((pd, _, control)) = debug_cap_kind(&g, cap) else {
+        return Err(result::ERR_BADCAP);
+    };
+    if !control {
+        return Err(result::ERR_RIGHTS);
+    }
+    if g.pds.pd_of_thread_pub(tid) != Some(pd as usize) {
+        return Err(result::ERR_BADCAP);
+    }
+    let (ok, core) = match with_owner(tid, |s, _| s.debug_continue(tid).then_some(())) {
+        Some((_, c)) => (true, Some(c)),
+        None => (false, None),
+    };
+    drop(g);
+    if ok {
+        DEBUG_CONTINUES.fetch_add(1, Ordering::Relaxed);
+        if let Some(c) = core {
+            kick(c);
+        }
+        Ok(0)
+    } else {
+        // Nicht angehalten (oder tot). **Kein Fehler mit eigenem Code**, sondern `OK` mit der
+        // Zahl 0: „fortsetzen, was nicht steht" ist idempotent, und ein Debugger, der nach einem
+        // Revoke aufraeumt, soll daran nicht scheitern.
+        Ok(1)
+    }
+}
+
+/// **Eine Cap ueber ihren Slot in einer PD widerrufen** (Z6b, Pruefpfad).
+///
+/// Steht hier statt im Pruefer, weil der Pruefer sonst die Aufloesung `Slot -> Cap` nachrechnete —
+/// *ein Pruefer, der die gepruefte Groesse NACHRECHNET statt sie zu lesen, prueft eine zweite
+/// Wirklichkeit*.
+pub fn revoke_slot(pd: usize, slot: usize) -> bool {
+    let Some(cap) = CAPS.read().pds.cap_ptr_at(pd, slot) else {
+        return false;
+    };
+    cap_revoke(cap).is_ok()
+}
+
+/// **Ein Steuerrecht in eine FREMDE PD ableiten** (Z6b, Pruefpfad).
+///
+/// Damit der Absturz einer Debugger-PD messbar wird und nicht nur gelesen: die Sonde legt eine
+/// Wegwerf-PD an, gibt ihr das Steuerrecht, laesst sie das Ziel anhalten und **zerstoert sie**.
+/// `destroy_pd` loescht jeden Cap ueber `cap_delete` — also ueber denselben Sammler wie
+/// `cap_revoke`, aber ueber den ANDEREN Pfad. Genau das ist die Stelle, an der eine Regel, die
+/// zweimal hingeschrieben wird, zum zweiten Mal altert.
+pub fn debug_attach_to(caller_pd: usize, slot: usize, ziel_pd: usize) -> Option<usize> {
+    let mut g = CAPS.write();
+    let cap = g.pds.cap_ptr_at(caller_pd, slot)?;
+    let info = g.cspace.inspect(cap)?;
+    let ObjectKind::Debuggable { pd } = info.kind else {
+        return None;
+    };
+    let c = g.cspace.mint(cap, Rights::RW, pd as u64).ok()?;
+    let sl = g.pds.free_cap_slot(ziel_pd)?;
+    g.install_cap_checked(ziel_pd, sl, c).then_some(sl)
+}
+
+/// **Ein LESERECHT in eine fremde PD ableiten** (Z6b, Pruefpfad der Speicher-Sonde).
+///
+/// Getrennt von [`debug_attach_to`], weil es ein anderes Recht ist: `READ` liest und haelt nie
+/// etwas an. Die Sonde braucht genau diese Trennung — sie belegt, dass ein Leser **ohne**
+/// Steuerrecht auskommt, und das ist die halbe Begruendung der Rechteaufteilung.
+pub fn debug_attach_read_to(caller_pd: usize, slot: usize, ziel_pd: usize) -> Option<usize> {
+    let mut g = CAPS.write();
+    let cap = g.pds.cap_ptr_at(caller_pd, slot)?;
+    let info = g.cspace.inspect(cap)?;
+    let ObjectKind::Debuggable { pd } = info.kind else {
+        return None;
+    };
+    let c = g.cspace.mint(cap, Rights::READ, pd as u64).ok()?;
+    let sl = g.pds.free_cap_slot(ziel_pd)?;
+    g.install_cap_checked(ziel_pd, sl, c).then_some(sl)
+}
+
+/// **Laeuft dieser Thread gerade auf irgendeinem Kern?** (Z6b, Latenzmessung.)
+///
+/// Steht hier und nicht im Pruefer, weil `SCHEDS` privat ist -- und weil ein Pruefer, der die
+/// Bedingung nachrechnet statt sie zu lesen, eine zweite Wirklichkeit prueft. `freeze_thread`
+/// stellt dieselbe Frage und muss dieselbe Antwort bekommen.
+///
+/// `core_online` und nicht nur `num_cores()`: ein unterdruecktes SMT-Geschwister hat Tabellen,
+/// aber kein `current` (Z6 Stufe 1, gemessen unter `-smp cores=2,threads=2`).
+pub fn thread_is_current(tid: ThreadId) -> bool {
+    for c in 0..num_cores() {
+        if !caprock_sched::core_online(c) {
+            continue;
+        }
+        if SCHEDS[c].lock().current_id(c) == tid {
+            return true;
+        }
+    }
+    false
+}
+
+/// **Die Fenster-VA der privaten Region einer isolierten PD** (Z6b, Speicher-Sonde).
+///
+/// `spawn_isolated_parked` gibt die **Phys**basis zurueck; die Sonde braucht die **User**-VA, unter
+/// der dieselbe Region im Adressraum des Ziels erscheint. Die Rechnung steht hier und nicht im
+/// Pruefer: *ein Pruefer, der die gepruefte Groesse nachrechnet, prueft eine zweite Wirklichkeit* —
+/// und `SLOT_DATA` ist privat, was genau der richtige Grund ist, die Zahl hier zu bilden.
+///
+/// **Warum das ein eigener Messpunkt ist:** diese Region wird als **2-MiB-Block** gemappt
+/// (`vspace_map_user_region` mit `rlen == TWO_MIB`), nicht ueber eine L3-Tabelle. In
+/// `vspace_resolve` ist das der andere Zweig — `PS` auf x86, `BLOCK_DESC` auf aarch64 — und dort
+/// steht die Rechtepruefung an einer anderen Stelle als beim Blatt. Wer nur den Seitenzweig misst,
+/// hat die Haelfte der Aufloesung ungeprueft.
+pub fn iso_user_data_va() -> u64 {
+    hal::mmu::ISO_USER_VA + (SLOT_DATA as u64) * 2 * 1024 * 1024
+}
+
+/// **Lebt ueber `pd` noch ein Steuerrecht?** (Z6b) — s. `CapSpace::any_debug_control_over` fuer
+/// die Abgrenzung gegen [`any_debug_authority_over`].
+pub fn any_debug_control_over(pd: usize) -> bool {
+    CAPS.read().cspace.any_debug_control_over(pd as u16)
+}
+
+/// **Eine Cap ueber ihren Slot loeschen** (Z6b, Pruefpfad) — der `cap_delete`-Weg, den eine
+/// sterbende PD nimmt, im Unterschied zu [`revoke_slot`].
+pub fn delete_slot(pd: usize, slot: usize) -> bool {
+    let Some(cap) = CAPS.read().pds.cap_ptr_at(pd, slot) else {
+        return false;
+    };
+    cap_delete(cap).is_ok()
+}
+
+/// **`SYS_DEBUG_READ_MEM`** -- Speicher der Ziel-PD lesen und in den Puffer des Aufrufers legen.
+///
+/// ## Warum das ein Syscall ist und keine Bibliotheksfunktion
+///
+/// Weil die **Seitentabellen des Ziels** gelaufen werden muessen, nicht die des Aufrufers. Genau
+/// diese Verwechslung waere von aussen nicht zu sehen: der Debugger bekaeme Bytes, sie waeren
+/// plausibel, und sie waeren seine eigenen. Deshalb ist es auch die Gegenprobe der `dbg`-Zeile --
+/// die Karte des Debuggers statt der des Ziels laufen zu lassen muss die Zeile rot machen.
+///
+/// ## Erlaubt, WAEHREND das Ziel laeuft -- und das ist eine Entscheidung
+///
+/// Ein Bytebereich hat keine innere Konsistenzbedingung; zerrissen ist der ehrliche, erwartete
+/// Zustand, und ein durchgehend beobachtendes Werkzeug braucht genau das. Der **Registerframe** ist
+/// der umgekehrte Fall (er ist nur als Ganzes wahr) und haengt deshalb an der Sidecar-Generation.
+/// Zwei Objekte, zwei Regeln -- keine Wahlmoeglichkeit.
+///
+/// ## Die Laenge ist gedeckelt, und der Deckel ist benannt
+///
+/// [`caprock_abi::debug::READ_MAX`]. Ein vom Aufrufer gewaehlter, unbegrenzter Lauf unter einer
+/// Sperre ist ein Latenzloch, das niemand sieht, bis es ein Haenger ist. Der Aufrufer schleift --
+/// und **seine** Schleife ist unterbrechbar.
+pub fn debug_read_mem(
+    caller_pd: usize,
+    slot: usize,
+    va: u64,
+    len: u64,
+    dst: u64,
+) -> Result<u64, u64> {
+    use caprock_abi::{debug as dbgr, result};
+    if len == 0 || len > dbgr::READ_MAX {
+        return Err(result::ERR_RIGHTS);
+    }
+    let g = CAPS.read();
+    let Some(cap) = g.pds.cap_ptr_at(caller_pd, slot) else {
+        return Err(result::ERR_BADCAP);
+    };
+    let Some((pd, read, _)) = debug_cap_kind(&g, cap) else {
+        return Err(result::ERR_BADCAP);
+    };
+    if !read {
+        // Eine blosse `Debuggable` liest nicht. Sie ist das Recht, ein Leserecht ABZULEITEN --
+        // die Unterscheidung ist der Grund, warum es drei Cap-Arten gibt und nicht eine.
+        return Err(result::ERR_RIGHTS);
+    }
+    drop(g);
+
+    // Die Tabellen beider Seiten. **Getrennt geholt und getrennt benannt** -- ein Parameter, der
+    // beide Bedeutungen traegt, ist die Form, die dieses Projekt bei `spawn_user` bezahlt hat.
+    let (ziel_l1, ziel_l2) = pd_tables(pd as usize).ok_or(result::ERR_NOPD)?;
+    let (mein_l1, mein_l2) = pd_tables(caller_pd).ok_or(result::ERR_NOPD)?;
+
+    let mut n = 0u64;
+    while n < len {
+        let Some(src_pa) = hal::mmu::vspace_resolve(ziel_l1, ziel_l2, va + n) else {
+            break; // Luecke im Ziel -- ein Debugger soll eine Luecke SEHEN, nicht raten
+        };
+        let Some(dst_pa) = hal::mmu::vspace_resolve(mein_l1, mein_l2, dst + n) else {
+            return Err(result::ERR_BADSTACK); // der Aufrufer hat einen Puffer benannt, den er nicht hat
+        };
+        // SAFETY: beide Physadressen stammen aus einer Tabellenaufloesung dieses Kernels und
+        // liegen damit in gemapptem RAM; der Kernel erreicht sie ueber die Identitaetskarte.
+        // Byteweise, weil die beiden Seiten verschiedene Ausrichtungen haben koennen.
+        unsafe {
+            core::ptr::write_volatile(dst_pa as *mut u8, core::ptr::read_volatile(src_pa as *const u8));
+        }
+        n += 1;
+    }
+    DEBUG_READ_BYTES.fetch_add(n, Ordering::Relaxed);
+    Ok(n)
+}
+
+/// Wie viele Bytes ueber `DEBUG_READ_MEM` gelesen wurden (Sprechprobe der `dbg`-Zeile).
+pub static DEBUG_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Die beiden obersten Seitentabellen der PD `pd`.
+///
+/// Ueber einen ihrer Threads, weil die ASID am Thread-Slot haengt und nicht an der PD -- eine
+/// Herleitung, die stimmt, solange alle Threads einer PD dieselbe VSpace teilen, und das ist die
+/// Definition einer PD. Steht als **eine** Funktion da, damit die Herleitung nicht an drei Stellen
+/// nachgerechnet wird.
+fn pd_tables(pd: usize) -> Option<(u64, u64)> {
+    let tid = CAPS.read().pds.any_thread_of(pd)?;
+    let asid = (vspace_of(tid.slot()) >> 48) as u16;
+    if asid == 0 {
+        return None;
+    }
+    let v = VSPACES.lock()[asid as usize - 1];
+    if v.used {
+        Some((v.l1, v.l2))
+    } else {
+        None
+    }
+}
+
+/// **`SYS_DEBUG_WRITE_REGS`** -- ein Frame-Wort des Ziels schreiben, gegen die Maske.
+///
+/// Die Maske ist die ganze Sicherheitsaussage, und sie steht an **einer** Stelle
+/// (`caprock_sched::redirect::writeback_erlaubt`). Zwei Kopien einer Regel sind der Riss, den
+/// dieses Projekt bei der Farbarithmetik schon einmal bezahlt hat.
+pub fn debug_write_reg(
+    caller_pd: usize,
+    slot: usize,
+    tid_raw: u64,
+    idx: u64,
+    value: u64,
+) -> Result<u64, u64> {
+    use caprock_abi::result;
+    use caprock_sched::redirect::{writeback_erlaubt, SchreibStufe, SchreibUrteil};
+    let tid = ThreadId::from_raw(tid_raw);
+    let g = CAPS.read();
+    let Some(cap) = g.pds.cap_ptr_at(caller_pd, slot) else {
+        return Err(result::ERR_BADCAP);
+    };
+    let Some((pd, _, control)) = debug_cap_kind(&g, cap) else {
+        return Err(result::ERR_BADCAP);
+    };
+    if !control {
+        return Err(result::ERR_RIGHTS);
+    }
+    if g.pds.pd_of_thread_pub(tid) != Some(pd as usize) {
+        return Err(result::ERR_BADCAP);
+    }
+    // **Nur an einem ANGEHALTENEN Thread.** Ein laufender Thread schreibt seinen eigenen Frame; wer
+    // ihm dabei hineinschreibt, erzeugt einen Zustand, den es nie gab. Dass er steht, ist hier eine
+    // Bedingung und keine Hoffnung.
+    if !with_owner(tid, |s, _| s.is_debug_stopped(tid).then_some(())).is_some() {
+        return Err(result::ERR_DEBUG_BUSY);
+    }
+    let urteil = writeback_erlaubt(
+        hal::exception::FRAME_ARCH,
+        idx as usize,
+        value,
+        SchreibStufe::Debugger,
+    );
+    match urteil {
+        SchreibUrteil::Ok => {}
+        SchreibUrteil::RingWort(_) => {
+            DEBUG_WR_RING.fetch_add(1, Ordering::Relaxed);
+            return Err(result::ERR_RIGHTS);
+        }
+        SchreibUrteil::UeberDerStufe(_) => {
+            DEBUG_WR_LEVEL.fetch_add(1, Ordering::Relaxed);
+            return Err(result::ERR_RIGHTS);
+        }
+        _ => {
+            DEBUG_WR_VALUE.fetch_add(1, Ordering::Relaxed);
+            return Err(result::ERR_RIGHTS);
+        }
+    }
+    let done = with_owner(tid, |s, _| {
+        let frame = s.frame_of(tid)?;
+        hal::exception::frame_wort_setzen(frame, idx as usize, value).then_some(())
+    })
+    .is_some();
+    drop(g);
+    if done {
+        DEBUG_WR_OK.fetch_add(1, Ordering::Relaxed);
+        Ok(0)
+    } else {
+        Err(result::ERR_BADCAP)
+    }
+}
+
 // --- Z4a: der Haltepunkt ------------------------------------------------------------------------
 
 /// Wie ein Einfrierversuch ausging (Z4a). Bewusst **unterscheidbar**: „geht nicht" ist als
@@ -8969,6 +9876,21 @@ pub enum Freeze {
     Busy(Quiescence),
     /// Kein solcher Thread.
     NoThread,
+    /// **Ein Debugger haelt ihn** (Z6b).
+    ///
+    /// Eigene Variante und nicht `Frozen`, obwohl der Thread nachweislich steht — und nicht
+    /// `Busy`, obwohl es eine Absage ist. Drei Gruende, jeder fuer sich hinreichend:
+    ///
+    /// 1. **`Frozen` waere eine LUEGE mit Folgen.** Der Aufrufer schliesst daraus „ich habe ihn
+    ///    angehalten" und ruft spaeter [`thaw_thread`], das `PAUSE` entfernt — `DEBUG` bleibt, der
+    ///    Thread laeuft nicht los, und das Paar friere/taue wird still asymmetrisch.
+    /// 2. **Der Frame gehoert gerade jemand anderem.** Z4a existiert, damit ein Checkpoint einen
+    ///    vollstaendigen Trap-Frame vorfindet; ein Debugger mit `DebugControl` darf hineinschreiben.
+    ///    Beides gleichzeitig ist kein Grenzfall, sondern zwei Schreiber.
+    /// 3. **`Busy` heisst „offene IPC-Beziehung"** und legt die falsche Behebung nahe („warte, bis
+    ///    die Transaktion durch ist"). Hier hilft nur: den Debugger fragen. Genau die
+    ///    Unterscheidung, fuer die `HandlerBinding` sich 2026-08-13 von `PendingReply` getrennt hat.
+    Debugged,
 }
 
 /// **Einen Thread an einer benennbaren Grenze anhalten** (Z4a).
@@ -9002,6 +9924,15 @@ pub fn freeze_thread(tid: ThreadId) -> Freeze {
     }
     // Zuerst deplanen. `pause` schickt bei Bedarf einen Reschedule-IPI -- der wirkt nicht sofort,
     // und genau deshalb gibt es `StillRunning`.
+    // **Z6b, und die Reihenfolge ist die Aussage: VOR dem `pause`.**
+    //
+    // Ein Debugger, der den Thread haelt, ist keine Lage, die ein zusaetzliches `PAUSE` verbessert
+    // -- es waere ein zweiter Grund an einem Thread, den der Aufrufer gleich wieder aufgibt, und
+    // der bliebe stehen. Erst pausieren und dann absagen hiesse, den Zustand zu veraendern, ueber
+    // den man gerade urteilt.
+    if with_owner(tid, |s, _| s.is_debug_stopped(tid).then_some(())).is_some() {
+        return Freeze::Debugged;
+    }
     KernelSched.pause(tid);
     let q = thread_quiescence(tid);
     if !q.is_quiescent() {
@@ -9014,6 +9945,15 @@ pub fn freeze_thread(tid: ThreadId) -> Freeze {
     // -- `current_id` auf einer Scheduler-Instanz ohne Tabellen ist kein Grenzfall, sondern ein
     // Programmfehler, und sie sagt das auch so ("TCB-Kapazitaet 0"). Gemessen, nicht ueberlegt.
     for c in 0..num_cores() {
+        // **Und `core_online` und nicht nur `num_cores()`** (2026-08-17, Z6 Stufe 1). Der Kommentar
+        // darueber beschreibt dieselbe Klasse ein Jahr frueher: damals war die Unterscheidung
+        // *konfiguriert* gegen *vorhanden*, jetzt ist sie *konfiguriert* gegen *laufend*. Ein
+        // unterdruecktes Geschwister hat Tabellen (`configure` haengt sie an alle konfigurierten
+        // Kerne), aber kein `current` -- und `current_id` sagt dazu voellig zu Recht "Programm-
+        // fehler". Gemessen unter `-smp cores=2,threads=2`, nicht ueberlegt.
+        if !caprock_sched::core_online(c) {
+            continue;
+        }
         if SCHEDS[c].lock().current_id(c) == tid {
             return Freeze::StillRunning;
         }
@@ -9126,7 +10066,7 @@ pub fn is_load_blocked(tid: ThreadId) -> bool {
 /// grundverschiedene Lagen zu: *läuft nie an* (Lader/Scheduler) gegen *läuft, und das Signal
 /// versandet* (Cap-Pfad). Jede Meldung über eine Cap kann diese Frage nicht beantworten — sie
 /// benutzt genau den Pfad, der in Frage steht.
-pub fn thread_lage(tid: ThreadId) -> (bool, bool, u8) {
+pub fn thread_lage(tid: ThreadId) -> (bool, bool, u16) {
     match with_owner(tid, |s, _| {
         Some((
             s.admitted_of(tid).unwrap_or(false),
@@ -9174,7 +10114,7 @@ pub fn is_handler_blocked(tid: ThreadId) -> bool {
 }
 
 /// Die rohe Grund-Menge eines Threads (Z24) — für den Bericht, nicht für Entscheidungen.
-pub fn reasons_bits(tid: ThreadId) -> Option<u8> {
+pub fn reasons_bits(tid: ThreadId) -> Option<u16> {
     with_owner(tid, |s, _| Some(s.reasons_of(tid))).and_then(|(r, _)| r.map(|x| x.bits()))
 }
 

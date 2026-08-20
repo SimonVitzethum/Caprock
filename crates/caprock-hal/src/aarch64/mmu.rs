@@ -458,6 +458,65 @@ pub fn vspace_wx_ok(l2_phys: u64) -> u32 {
     0
 }
 
+/// **Eine User-VA eines fremden Adressraums nach PA aufloesen** (Z6b) — s. die x86-Fassung fuer
+/// die Begruendung, warum das im Kernel liegt und nicht im Debugger.
+///
+/// Auf aarch64 traegt `l2_phys` GiB 1 (dort liegen die identisch abgebildeten User-Frames), und
+/// das User-Fenster haengt an `L1[9]` ([`ISO_USER_VA`]).
+///
+/// **Diese Funktion existiert von Tag eins auf BEIDEN Architekturen**, und das ist keine
+/// Gruendlichkeit, sondern eine bezahlte Lehre: zweimal hat eine nur auf x86 vorhandene
+/// HAL-Funktion in arch-neutralem Kernelcode den aarch64-Bau gerissen (`guard_unmap`,
+/// `irq_tiefe`) — beim zweiten Mal, **nachdem** die Abnahme gegen genau diese Klasse gehaertet
+/// worden war.
+pub fn vspace_resolve(l1_phys: u64, l2_phys: u64, va: u64) -> Option<u64> {
+    /// **Ist dieser Deskriptor fuer EL0 lesbar?** `AP[1]` (Bit 6) unterscheidet EL1-only von
+    /// EL0+EL1. Ohne diese Frage loeste ein Debugger auch die **geteilten Kernel-Eintraege** der
+    /// isolierten VSpace auf und laese Kernelspeicher — s. die x86-Fassung, wo dieselbe Luecke
+    /// am 2026-08-20 gemessen wurde (`luecke-abgewiesen=false`).
+    #[inline]
+    fn el0_lesbar(desc: u64) -> bool {
+        desc & (1 << 6) != 0
+    }
+    let gib1 = ONE_GIB;
+    // SAFETY: gueltige, identity-gemappte Tabellen dieses Adressraums.
+    unsafe {
+        let (tbl, off) = if va >= gib1 && va < 2 * gib1 {
+            (l2_phys, va - gib1)
+        } else if va >= ISO_USER_VA && va < ISO_USER_VA + 512 * TWO_MIB {
+            let l1 = core::slice::from_raw_parts(l1_phys as *const u64, 512);
+            let e = l1[ISO_USER_L1];
+            if e & 0b11 != TABLE_DESC {
+                return None;
+            }
+            (e & ADDR_MASK, va - ISO_USER_VA)
+        } else {
+            // Abgewiesen, nicht geraten.
+            return None;
+        };
+        let l2 = core::slice::from_raw_parts(tbl as *const u64, 512);
+        let e = l2[(off >> 21) as usize];
+        match e & 0b11 {
+            // **Ein Block traegt seine Rechte selbst.** Ein Tabellen-Deskriptor auf L2 traegt
+            // keine AP-Bits (die stehen im Blatt), deshalb wird dort NICHT geprueft, sondern eine
+            // Ebene tiefer -- die Pruefung an der falschen Ebene waere schlimmer als keine, weil
+            // sie wie eine Pruefung aussieht.
+            BLOCK_DESC if el0_lesbar(e) => {
+                Some((e & ADDR_MASK & !(TWO_MIB - 1)) | (va & (TWO_MIB - 1)))
+            }
+            TABLE_DESC => {
+                let l3 = core::slice::from_raw_parts((e & ADDR_MASK) as *const u64, 512);
+                let q = l3[((off >> 12) & 0x1ff) as usize];
+                if q & 0b11 != PAGE_DESC || !el0_lesbar(q) {
+                    return None;
+                }
+                Some((q & ADDR_MASK) | (va & (PAGE - 1)))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Die **Basis** einer isolierten VSpace in zwei frische 4-KiB-Frames bauen
 /// (`l1_phys` = Wurzel, `l2_phys` = L2 für GiB 1): Device (EL1-only), das Kernelimage
 /// über die **geteilte** Kernel-L3 (inkl. `.user_text` EL0-RX) und alles RAM

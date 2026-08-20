@@ -223,7 +223,16 @@ fn messen_inner() -> bool {
     let geantwortet = system::handler_reply(tid);
     let laeuft_nach_reply = bewegt_sich();
 
-    let bits = system::reasons_bits(tid).unwrap_or(0xff);
+    // **`u16::MAX`, nicht `0xff`** (Z6b, 2026-08-20). Der Wert ist ein Platzhalter fuer „Thread
+    // nicht mehr aufloesbar" und muss deshalb ausserhalb jeder gueltigen Grundmenge liegen.
+    // Solange `BlockReasons` ein `u8` war, war `0xff` genau das. Nach der Verbreiterung auf `u16`
+    // ueberlebt das Literal **fehlerfrei** — und wird an dem Tag falsch, an dem Bit 8 vergeben
+    // wird: dann ist `0xff` eine gewoehnliche, erreichbare Menge, und „tot" ist von „acht Gruende
+    // gleichzeitig" nicht mehr zu unterscheiden. Der Bau haette nie gewarnt.
+    //
+    // Dieselbe Klasse wie `MASK_BITS` gegen die Farbanzahl: ein Literal, das zufaellig richtig ist,
+    // solange eine Groessenrelation gilt.
+    let bits = system::reasons_bits(tid).unwrap_or(u16::MAX);
     let gebunden = system::handler_bound_count(hal::cpu::core_id());
 
     let alles = abi_stimmt

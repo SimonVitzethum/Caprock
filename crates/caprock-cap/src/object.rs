@@ -164,6 +164,53 @@ pub enum ObjectKind {
         sidecar: u64,
         len: u64,
     },
+    /// **Die Wurzel der Debug-Autoritaet ueber genau eine PD** (Z6b).
+    ///
+    /// Sie gewaehrt selbst **nichts** — weder Lesen noch Anhalten. Sie ist das Recht, die beiden
+    /// abgeleiteten Rechte darunter zu praegen, und damit der Knoten, an dem `revoke` ansetzt.
+    ///
+    /// ## Warum die Praegung selbst die Zusage IST
+    ///
+    /// Die Zusage lautet: *eine PD, ueber die nie eine solche Cap gepraegt wurde, kann nicht
+    /// debuggt werden.* Wuerde jede PD eine bekommen, beschriebe dieser Satz **keine einzige PD** —
+    /// dieselbe Form wie ein RMRR-Test auf q35 oder die `smt`-Zeile unter `threads=1`: wahr, weil
+    /// der Vordersatz leer ist. Deshalb ist **Nicht-Praegen die Vorgabe**, und die Entscheidung
+    /// steht im **signierten** Manifest (`POLICY_DEBUGGABLE`), nicht in einem Laufzeitschalter.
+    ///
+    /// ## Und warum das Zurueckziehen an dieser Cap haengt und nicht an den Kindern
+    ///
+    /// Wer sie haelt, kann jederzeit ein neues `DebugControl` ableiten. Ein Freigabefenster, das
+    /// ueber die Lebensdauer eines *abgeleiteten* Caps begrenzt wird, schliesst deshalb nicht — die
+    /// **Wiederbeschaffbarkeit** der Autoritaet ueberlebt es. Das Fenster endet mit dem Revoke
+    /// dieser Cap.
+    ///
+    /// ## Die Ableitung laeuft ueber RECHTE, nicht ueber eine zweite Objektart
+    ///
+    /// Der erste Entwurf sah drei Cap-Arten vor (`Debuggable`/`DebugRead`/`DebugControl`).
+    /// **Gemessen am 2026-08-20 traegt das nicht:** dieses CDT leitet ueber `copy`/`mint` ab, und
+    /// ein Kind zeigt auf **dasselbe Objekt** wie sein Elter — eine zweite Art waere gar kein Kind,
+    /// sondern eine unabhaengige Wurzel. Der Fehler war nicht theoretisch: die `dbg`-Zeile meldete
+    /// `revoke-bricht-nicht=false` und `nachher-undebuggbar=false`, weil `revoke` an der Wurzel die
+    /// „abgeleiteten" Caps gar nicht sah.
+    ///
+    /// Also: **eine Art, und die Rechte unterscheiden.**
+    ///
+    /// | Recht | darf |
+    /// |---|---|
+    /// | `READ` | Frame und Speicher lesen — haelt **nie** etwas an |
+    /// | `WRITE` | anhalten, fortsetzen, Register schreiben |
+    ///
+    /// Damit sind beliebig viele Leser trivial richtig (ein Grund**bit** hat keinen Referenzzaehler,
+    /// also schrumpft die Eigentumsfrage auf das Anhalten), und `revoke` an der Wurzel nimmt jedes
+    /// Kind mit — was die eigentliche Zusage ist.
+    ///
+    /// **Die Wurzel zaehlt selbst als Steuerrecht**, und das ist keine Nachlaessigkeit: wer sie
+    /// haelt, praegt jederzeit ein Kind mit `WRITE`. Sie fuer sich als „gewaehrt nichts" zu fuehren
+    /// waere eine Unterscheidung ohne Unterschied — und genau die Sorte, die ein Freigabefenster
+    /// scheinbar schliesst, waehrend die Wiederbeschaffbarkeit weiterlaeuft.
+    ///
+    /// Haelt keinen Allokator-Speicher -> keine Finalisierung.
+    Debuggable { pd: u16 },
 }
 
 /// Eintrag der Objekt-Tabelle.

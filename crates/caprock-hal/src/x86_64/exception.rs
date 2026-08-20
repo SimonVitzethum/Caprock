@@ -576,6 +576,49 @@ pub fn frame_gpr_uebernehmen(frame: usize, w: &[u64]) -> usize {
     n
 }
 
+/// **Ein einzelnes Frame-Wort schreiben** (Z6b) — die *Mechanik*; die *Politik* steht in
+/// [`caprock_sched::redirect::writeback_erlaubt`].
+///
+/// ## Warum trotzdem hier eine Absage steht, und warum das keine Doppelung ist
+///
+/// Die beiden gattern **Verschiedenes**. Dort: „diese Stufe darf nicht so weit". Hier: „dieses Wort
+/// ist von ausserhalb des Kernels ueberhaupt nie schreibbar". Die zweite Aussage haengt an der
+/// Architektur und nicht an einer Autoritaet — sie muss auch dann noch gelten, wenn jemand eine
+/// vierte Stufe einfuehrt und die Tabelle dort vergisst. Eine Regel, deren Bruch eine
+/// Rechteausweitung IST, bekommt zwei unabhaengige Gatter; das ist Tiefe, keine Kopie.
+///
+/// `false` heisst „nicht geschrieben" — der Aufrufer darf daraus nie „geschrieben, aber egal"
+/// machen.
+pub fn frame_wort_setzen(frame: usize, i: usize, v: u64) -> bool {
+    // SAFETY: wie `frame_set_reg` -- schreibender Zugriff auf den gesicherten Kontext eines
+    // NICHT laufenden Threads (der Aufrufer haelt dessen Scheduler-Sperre und hat geprueft, dass
+    // er angehalten ist).
+    let f = unsafe { &mut *(frame as *mut TrapFrame) };
+    match i {
+        // Allzweckregister.
+        0..=14 => {
+            f.gpr[i] = v;
+            true
+        }
+        // 15 = Vektor, 16 = Fehlercode: **Kernel-Buchfuehrung ueber den Grund des Eintritts.**
+        // 18 = `cs`, 21 = `ss`: der **Ring**.
+        15 | 16 | 18 | 21 => false,
+        17 => {
+            f.rip = v;
+            true
+        }
+        19 => {
+            f.rflags = v;
+            true
+        }
+        20 => {
+            f.rsp = v;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Initialen Kontext eines neuen Threads am Stack-Top anlegen; gibt den zu sichernden
 /// Stackzeiger (= Frame-Adresse) zurück.
 ///

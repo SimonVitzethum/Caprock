@@ -77,7 +77,7 @@ mit_deps() { # $1 = Name, $2 = Crate-Verzeichnis, $3.. = Abhaengigkeiten (Verzei
     rm -rf "$SA"
 }
 
-ZIELE="${*:-mem part fat cycles loader cap virtio dma wait irte irteneg grossdmaneg dmar dmarneg redirect redirectneg typestate ipctreue}"
+ZIELE="${*:-mem part fat cycles loader cap virtio dma wait irte irteneg grossdmaneg dmar dmarneg iohealth smt numa bootparams fbtext redirect redirectneg typestate ipctreue}"
 for z in $ZIELE; do
     case "$z" in
         mem)  einzeln mem  "$ROOT/crates/caprock-mem/src/lib.rs" ;;
@@ -153,6 +153,18 @@ for z in $ZIELE; do
                 bash "$ROOT/tools/grossdma-negativ.sh" || fail=1
             fi ;;
         dmar) einzeln dmar "$ROOT/crates/caprock-hal/src/x86_64/dmar.rs" ;;
+        # Die arch-neutrale IOMMU-Gesundheit (2026-08-17). Dieselbe Begruendung wie `dmar`/`irte`:
+        # ein reiner Typ ueber eingespeisten Werten, ohne eine `use`-Zeile ausser `super::*` --
+        # also als DATEI pruefbar, waehrend `caprock-hal` als Ganzes auf dem Host nie baut.
+        # Geprueft wird die Reihenfolge des Urteils, und die IST der Inhalt: `faults_empty` zaehlt
+        # erst, wenn der Round-Trip belegt ist. Eine tote Einheit meldet ebenfalls eine leere
+        # Warteschlange -- in QEMU waere genau dieser Fall nicht herstellbar, ohne die Einheit
+        # kaputtzumachen.
+        iohealth) einzeln iohealth "$ROOT/crates/caprock-hal/src/iommu_health.rs" ;;
+        smt)  einzeln smt "$ROOT/crates/caprock-hal/src/smt.rs" ;;
+        numa) einzeln numa "$ROOT/crates/caprock-hal/src/numa.rs" ;;
+        bootparams) einzeln bootparams "$ROOT/crates/caprock-hal/src/bootparams.rs" ;;
+        fbtext) einzeln fbtext "$ROOT/crates/caprock-hal/src/fbtext.rs" ;;
         # ... und die Gegenprobe dazu: die Tests oben sehen nur den BEHOBENEN Zustand. Vier
         # Mutationen bauen den Fehler einzeln wieder ein, jede mit dem NAMEN des Tests, der fallen
         # muss (sonst waere „irgendetwas ist rot" schon ein Beleg).
@@ -200,7 +212,7 @@ for z in $ZIELE; do
             else
                 bash "$ROOT/tools/verus-modelltreue-ipc.sh" || fail=1
             fi ;;
-        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio dma wait irte irteneg grossdmaneg dmar dmarneg redirect redirectneg typestate ipctreue)"; fail=1 ;;
+        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio dma wait irte irteneg grossdmaneg dmar dmarneg iohealth smt numa bootparams fbtext redirect redirectneg typestate ipctreue)"; fail=1 ;;
     esac
 done
 

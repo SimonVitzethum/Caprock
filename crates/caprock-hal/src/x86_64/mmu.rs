@@ -1307,6 +1307,89 @@ pub fn vspace_wx_ok(l2_phys: u64) -> u32 {
     bad
 }
 
+/// **Eine User-VA eines fremden Adressraums nach PA aufloesen** (Z6b).
+///
+/// Der Debugger liest den Speicher seines Ziels; dafuer muss der Kernel dessen Seitentabellen
+/// laufen — **nicht seine eigenen**. Genau diese Verwechslung ist der Grund, warum
+/// `DEBUG_READ_MEM` ein Syscall ist und keine Bibliotheksfunktion: waere sie im Debugger, laese
+/// sie dessen Karte und lieferte dessen Speicher, und das saehe von aussen wie ein Erfolg aus.
+///
+/// Beide Fenster, in denen User-Speicher liegen kann:
+///
+/// * **GiB 0** ueber das Seitenverzeichnis `l2` (2-MiB-Bloecke oder feine Tabellen),
+/// * das **User-Fenster** bei [`ISO_USER_VA`] ueber `PML4[1] -> PDPT[0] -> PD[slot]`.
+///
+/// Alles andere gibt `None` — **abgewiesen, nicht geraten**. Eine Adresse ausserhalb dieser beiden
+/// Bereiche ist im Adressraum einer PD nicht gemappt; „vermutlich identisch" waere hier die
+/// flaechige Identitaetskarte durch die Hintertuer.
+///
+/// `None` heisst „nicht gemappt" und ist eine **Antwort**, kein Fehler: ein Debugger, der eine
+/// Luecke liest, soll eine Luecke sehen.
+///
+/// ## Aufgeloest wird NUR, was der Gast selbst erreichen kann (`US` auf JEDER Ebene)
+///
+/// Das ist keine Vorsicht, sondern eine am 2026-08-20 **gemessene Behebung**. Die erste Fassung
+/// lief die Tabellen ohne Rechtepruefung — und in einer isolierten VSpace stehen ausser den
+/// User-Seiten auch die **geteilten Kernel-Eintraege** (RAM EL1-only, `vspace_create_base`). Ein
+/// Debugger mit blossem `DebugRead` haette damit **Kernelspeicher** lesen koennen: eine
+/// Rechteausweitung, die von aussen wie ein funktionierender Debugger aussieht.
+///
+/// Gefunden hat es nicht das Gegenlesen, sondern die Sonde: `luecke-abgewiesen=false` in der
+/// `dbgmem`-Zeile — eine Adresse 16 MiB hinter dem Ziel loeste auf, obwohl das Ziel dort nichts
+/// hat. „Nicht gemappt" und „nicht FUER DEN GAST gemappt" sind zwei Aussagen, und die zweite ist
+/// die, die die Zusage traegt.
+///
+/// `US` muss auf **jeder** Ebene stehen: x86 verundet die Rechte den Pfad entlang, und eine
+/// Pruefung nur am Blatt liesse eine Seite durch, die der Gast wegen einer EL1-only-Tabelle
+/// darueber gar nicht erreicht.
+pub fn vspace_resolve(l1_phys: u64, l2_phys: u64, va: u64) -> Option<u64> {
+    // SAFETY: gueltige, in der globalen Map lesbare Tabellen dieses Adressraums.
+    unsafe {
+        if va < ONE_GIB {
+            let pd = table_mut(l2_phys);
+            let e = pd[(va >> 21) as usize];
+            if e & P == 0 || e & US == 0 {
+                return None;
+            }
+            if e & PS != 0 {
+                return Some((e & 0x000f_ffff_ffe0_0000) | (va & (TWO_MIB - 1)));
+            }
+            let pt = table_mut(e & 0x000f_ffff_ffff_f000);
+            let q = pt[((va >> 12) & 0x1ff) as usize];
+            if q & P == 0 || q & US == 0 {
+                return None;
+            }
+            return Some((q & 0x000f_ffff_ffff_f000) | (va & (PAGE - 1)));
+        }
+        if va >= ISO_USER_VA && va < ISO_USER_VA + 512 * TWO_MIB {
+            let off = va - ISO_USER_VA;
+            let pml4 = table_mut(l1_phys);
+            if pml4[1] & P == 0 || pml4[1] & US == 0 {
+                return None;
+            }
+            let pdpt = table_mut(pml4[1] & 0x000f_ffff_ffff_f000);
+            if pdpt[0] & P == 0 || pdpt[0] & US == 0 {
+                return None;
+            }
+            let pd = table_mut(pdpt[0] & 0x000f_ffff_ffff_f000);
+            let e = pd[(off >> 21) as usize];
+            if e & P == 0 || e & US == 0 {
+                return None;
+            }
+            if e & PS != 0 {
+                return Some((e & 0x000f_ffff_ffe0_0000) | (va & (TWO_MIB - 1)));
+            }
+            let pt = table_mut(e & 0x000f_ffff_ffff_f000);
+            let q = pt[((off >> 12) & 0x1ff) as usize];
+            if q & P == 0 || q & US == 0 {
+                return None;
+            }
+            return Some((q & 0x000f_ffff_ffff_f000) | (va & (PAGE - 1)));
+        }
+        None
+    }
+}
+
 /// Die **selbst angelegten** Seitentabellen eines Adressraums einsammeln (Teardown).
 /// Die geteilten Kernel-PTs der ersten 16 MiB bleiben unangetastet.
 pub fn vspace_collect_l3s(l2_phys: u64, free_l3: &mut dyn FnMut(u64)) {

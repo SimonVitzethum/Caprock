@@ -27,6 +27,11 @@
 //! die fertigen [`Slab`](caprock_slab::Slab)-Handles an. [`CapSlot`] und [`Object`] sind deshalb
 //! öffentlich — als undurchsichtige Platzhalter mit `EMPTY`, ohne zugängliche Felder.
 
+/// **Die Randpruefungen von `SYS_SPAWN`** (K1a) -- reine Funktion ueber eingespeisten Werten,
+/// deshalb einzeln host-testbar (Muster `dmar.rs`, `iommu_health.rs`). Sechs Absagen mit je
+/// eigenem Namen: eine Sammelabsage machte „Stack zu klein" und „ein Geraet kann den Stack
+/// schreiben" ununterscheidbar, und das zweite ist ein Angriff.
+pub mod spawncheck;
 pub mod checkpoint;
 mod object;
 mod space;

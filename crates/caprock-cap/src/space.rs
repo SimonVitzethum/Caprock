@@ -120,6 +120,15 @@ pub struct Finalized<'a> {
     /// still verworfene Region wäre ein Leck **und** eine stehende Übersetzung.
     dma: &'a mut [(u64, u64)],
     dn: usize,
+    /// **PDs, deren letzte `DebugControl` gerade verschwunden ist** (Z6b).
+    ///
+    /// Dieselbe Schranke aus demselben Grund wie oben, und der Schaden ist von derselben Art: eine
+    /// still verworfene Meldung ist ein Thread, der `BlockReasons::DEBUG` traegt und den **niemand**
+    /// mehr entfernen darf. Er laeuft nie wieder — und von aussen ist das von einem Deadlock nicht
+    /// zu unterscheiden. Wortgleich zum Kommentar ueber `items`: „man sieht nur einen Thread, der
+    /// steht".
+    debug: &'a mut [u16],
+    gn: usize,
     /// Wurde eine Meldung verworfen, weil die Kapazität nicht reichte? Das darf nach der
     /// `NOBJECTS`-Schranke nicht vorkommen; steht hier, damit „kann nicht vorkommen" prüfbar
     /// ist statt behauptet.
@@ -137,7 +146,21 @@ impl<'a> Finalized<'a> {
     /// [`CapSpace::finalize_capacity`] Einträge fassen; sind sie kürzer, geht keine Meldung
     /// *unbemerkt* verloren — [`Finalized::overflowed`] wird gesetzt.
     pub fn new(items: &'a mut [(u32, u64)], dma: &'a mut [(u64, u64)]) -> Self {
-        Self { items, n: 0, dma, dn: 0, overflow: false }
+        Self::mit_debug(items, dma, &mut [])
+    }
+    /// Wie [`Finalized::new`], zusaetzlich mit der Ablage fuer freizugebende Debug-Ziele (Z6b).
+    ///
+    /// **Getrennter Konstruktor statt eines vierten Arguments an `new`**, damit die vorhandenen
+    /// Aufrufer unveraendert bleiben und der Unterschied SICHTBAR ist: wer `new` benutzt, bekommt
+    /// eine Ablage der Laenge 0 und damit bei der ersten Debug-Meldung ein `overflowed()` — also
+    /// eine **laute** Absage statt einer stillen. Ein Vorgabewert, der schweigt, waere hier die
+    /// falsche Bequemlichkeit.
+    pub fn mit_debug(
+        items: &'a mut [(u32, u64)],
+        dma: &'a mut [(u64, u64)],
+        debug: &'a mut [u16],
+    ) -> Self {
+        Self { items, n: 0, dma, dn: 0, debug, gn: 0, overflow: false }
     }
     fn push(&mut self, ep: u32, caller: u64) {
         if self.n < self.items.len() {
@@ -154,6 +177,19 @@ impl<'a> Finalized<'a> {
         } else {
             self.overflow = true;
         }
+    }
+    fn push_debug(&mut self, pd: u16) {
+        if self.gn < self.debug.len() {
+            self.debug[self.gn] = pd;
+            self.gn += 1;
+        } else {
+            self.overflow = true;
+        }
+    }
+    /// Die PDs, deren Debug-Halt freizugeben ist (Z6b). Vom Kernel **nach** dem Freigeben von
+    /// `CAPS` abgearbeitet — dieselbe Ordnung wie [`Finalized::iter`].
+    pub fn iter_debug(&self) -> impl Iterator<Item = u16> + '_ {
+        self.debug[..self.gn].iter().copied()
     }
     /// Die finalisierten `(ep, caller)`-Paare (für den Kernel zum Abbrechen der Calls).
     pub fn iter(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
@@ -249,6 +285,12 @@ pub struct CapInfo {
     pub badge: u64,
     pub refcount: u32,
     pub child_count: usize,
+    /// **Ist dies die WURZEL des CDT-Teilbaums** (kein Elter)?
+    ///
+    /// Fuer Z6b eine Autoritaetsfrage und keine Auskunft: die `Debuggable`-Wurzel darf **ableiten**
+    /// und sonst nichts — weder lesen noch anhalten. Ohne diese Unterscheidung waere „gewaehrt
+    /// selbst nichts" nicht formulierbar, denn Rechte allein koennen Wurzel und Kind nicht trennen.
+    pub is_root: bool,
 }
 
 /// Ein Capability-Space: Slot-Tabelle + Objekt-Tabelle.
@@ -392,6 +434,50 @@ impl CapSpace {
     /// keinen Allokator-Speicher -> keine Finalisierung.
     pub fn install_loader(&mut self, source: u32, rights: Rights) -> Result<CapPtr, CapError> {
         self.install(ObjectKind::Loader { source }, rights)
+    }
+
+    /// **Die Debug-Wurzel einer PD einbringen** (Z6b) — `Debuggable`.
+    ///
+    /// **Nur kernelseitig, und nur an EINER Stelle gerufen** (`loader::mint_debuggable_if_asked`).
+    /// Es gibt bewusst keinen Syscall, der eine `Debuggable` erzeugt: gaebe es einen, waere die
+    /// Vorgabe „nicht gepraegt" eine Bitte statt einer Eigenschaft, und die Zusage aus Z6b §0
+    /// beschriebe keine PD mehr.
+    pub fn install_debuggable(&mut self, pd: u16, rights: Rights) -> Result<CapPtr, CapError> {
+        self.install(ObjectKind::Debuggable { pd }, rights)
+    }
+
+    /// **Gibt es im ganzen Cspace IRGENDEINE Debug-Autoritaet ueber `pd`?** (Z6b)
+    ///
+    /// Das ist die Frage, auf der die Zusage aus §0 ruht, und sie ist ein **Durchlauf**, keine
+    /// Behauptung: „ueber diese PD kann niemand Debug-Autoritaet erlangen" wird beantwortet, indem
+    /// nachgesehen wird — nicht, indem ein Flag gelesen wird, das jemand gesetzt haben koennte.
+    ///
+    /// Gezaehlt wird die **Wurzel** mit: eine `Debuggable` ist selbst kein Zugriff, aber wer sie
+    /// haelt, leitet jederzeit einen ab. Wer die Wiederbeschaffbarkeit nicht mitzaehlt, misst ein
+    /// Fenster, das nicht geschlossen ist.
+    /// **Lebt noch ein STEUERRECHT ueber `pd`?** (Z6b)
+    ///
+    /// Getrennt von [`any_debug_authority_over`](Self::any_debug_authority_over), weil es eine
+    /// andere Frage ist: dort geht es um „kann jemand hier je debuggen" (Wurzel eingeschlossen,
+    /// denn sie leitet ab), hier um „kann jemand einen laufenden Halt aufheben" (Wurzel
+    /// ausgeschlossen, denn sie kann es nicht ohne vorher abzuleiten). Zwei Fragen, zwei
+    /// Funktionen — eine gemeinsame waere ein Praedikat mit zwei Bedeutungen.
+    pub fn any_debug_control_over(&self, pd: u16) -> bool {
+        self.slots.iter().enumerate().any(|(i, sl)| {
+            sl.used
+                && sl.rights.contains(Rights::WRITE)
+                && sl.mdb.parent.is_some()
+                && matches!(self.objects[sl.object].kind, ObjectKind::Debuggable { pd: q } if q == pd)
+                && { let _ = i; true }
+        })
+    }
+
+    pub fn any_debug_authority_over(&self, pd: u16) -> bool {
+        self.objects.iter().any(|o| {
+            o.used
+                && o.refcount > 0
+                && matches!(o.kind, ObjectKind::Debuggable { pd: q } if q == pd)
+        })
     }
 
     /// Eine **MMIO-Capability** (ext-22, HardwareLand) einbringen: die Autorität, die
@@ -922,6 +1008,7 @@ impl CapSpace {
             badge: self.slots[slot].badge,
             refcount: self.objects[obj].refcount,
             child_count,
+            is_root: self.slots[slot].mdb.parent.is_none(),
         })
     }
 
@@ -1061,6 +1148,28 @@ impl CapSpace {
     /// ggf. Objekt finalisieren (Speicher zurückgeben), Slot freigeben.
     fn delete_leaf(&mut self, alloc: &mut PhysAllocator, slot: usize, rf: &mut Finalized<'_>) {
         let obj = self.slots[slot].object;
+        // **Z6b: JEDES geloeschte Steuerrecht wird gemeldet, nicht erst das letzte.**
+        //
+        // Die naheliegende Fassung haengt die Meldung an die Objekt-Finalisierung unten
+        // (`refcount == 0`). Gemessen am 2026-08-20 traegt das nicht: `revoke` loescht den
+        // **Teilbaum**, nicht die Wurzel — das Objekt behaelt also mindestens eine Referenz, die
+        // Finalisierung laeuft nie, und die `dbg`-Zeile meldete `revoke-bricht-nicht=false`.
+        //
+        // Gemeldet wird deshalb hier, je Cap; **ob** freigegeben wird, entscheidet der Kernel nach
+        // dem Freigeben von `CAPS` (`release_finalized_debug`), indem er nachsieht, ob noch ein
+        // Steuerrecht lebt. Sammler und Urteil sind getrennt, weil das Urteil einen Blick auf den
+        // ganzen Cspace braucht und der hier gerade halb abgebaut ist.
+        //
+        // **Die Wurzel zaehlt nicht als Steuerrecht** (`is_root`): sie darf ableiten und sonst
+        // nichts. Zaehlte sie mit, bliebe nach jedem Revoke ein „lebendes" Steuerrecht stehen, und
+        // die Freigabe liefe nie.
+        if let ObjectKind::Debuggable { pd } = self.objects[obj].kind {
+            if self.slots[slot].rights.contains(Rights::WRITE)
+                && self.slots[slot].mdb.parent.is_some()
+            {
+                rf.push_debug(pd);
+            }
+        }
         self.unlink(slot);
         self.release_slot(slot);
 
@@ -1086,6 +1195,15 @@ impl CapSpace {
                 // — genau die Reihenfolge, die den geräteseitigen Use-after-free ausmacht.
                 ObjectKind::Dma { phys, len, .. } => rf.push_dma(phys, len),
                 ObjectKind::Reply { ep, caller } => rf.push(ep, caller),
+                // **Z6b: die LETZTE Debug-Cap ueber dieser PD geht.** Nur der Debugger entfernt
+                // `BlockReasons::DEBUG`; ohne diese Meldung traegt ein angehaltener Thread einen
+                // Grund, den niemand mehr entfernen darf.
+                //
+                // Dass „die letzte" hier keine Suche kostet, ist die Wirkung der Rechte-Ableitung:
+                // alle Debug-Caps ueber `pd` teilen **ein** Objekt, und dieser Zweig laeuft erst
+                // bei `refcount == 0`. Mit drei getrennten Objektarten haette hier ein Durchlauf
+                // der Objekttabelle stehen muessen — und `revoke` an der Wurzel haette die anderen
+                // beiden ueberhaupt nicht erreicht.
                 _ => {}
             }
             let gen = self.objects[obj].gen.wrapping_add(1);

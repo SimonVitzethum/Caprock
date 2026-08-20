@@ -1233,12 +1233,44 @@ fn zahlenpolitik_gate(program_id: u32) -> Result<(), LoaderError> {
     // Knotenbegriff. Ein Manifest, das Knoten 1 verlangt, bekaeme heute Knoten 0 und niemand
     // erfuehre es. Knoten 0 ist die einzige einhaltbare Angabe -- und auch nur, weil es genau
     // einen gibt.
+    // **N4 (2026-08-17): der Wunsch wird EINGELOEST, wenn es den Knoten gibt** -- und sonst mit
+    // einem UNTERSCHEIDBAREN Grund abgewiesen.
+    //
+    // Bis heute war jede Angabe ausser 0 pauschal abgelehnt, weil der Allokator keine Knoten
+    // kannte. Das war richtig, solange es stimmte. Jetzt gibt es zwei verschiedene Absagen, und
+    // der Unterschied ist die halbe Diagnose:
+    //
+    //   * die Maschine hat KEINE lesbare Topologie -> das Dokument ist nicht einloesbar,
+    //   * die Topologie ist lesbar und kennt diesen Knoten NICHT -> das Dokument ist falsch.
+    //
+    // Ein gemeinsamer Text haette beide Faelle gleich aussehen lassen, und das ist die Form, an
+    // der dieses Projekt schon mehrfach Stunden verloren hat („fehlend und kaputt duerfen nicht
+    // gleich aussehen").
+    //
+    // **`numa_node = 0` bleibt die Vorgabe und wird NICHT als Wunsch gewertet.** Das Format kann
+    // "nichts gesagt" nicht von "Knoten 0" unterscheiden (dieselbe Formatgrenze wie bei
+    // `priority = 0`), und aus einem schweigenden Dokument einen Knotenwunsch zu erfinden waere
+    // die A1-Lehre andersherum.
     if numa != 0 {
-        println!(
-            "loader  : POLICY ABGEWIESEN -- program_id {program_id} verlangt numa_node={numa}. \
-             Der Allokator hat keine Knoten (todo Z8); jede Angabe ausser 0 waere still falsch."
-        );
-        return Err(LoaderError::UnsupportedPolicy);
+        let topo = crate::numa::topology();
+        if !topo.trustworthy() {
+            println!(
+                "loader  : POLICY ABGEWIESEN -- program_id {program_id} verlangt numa_node={numa}, \
+                 die Maschine hat keine tragfaehige Topologie (readable={} truncated={}). Ein \
+                 Wunsch, den niemand pruefen kann, wird nicht still erfuellt.",
+                topo.readable, topo.truncated
+            );
+            return Err(LoaderError::UnsupportedPolicy);
+        }
+        if numa as usize >= topo.node_count() {
+            println!(
+                "loader  : POLICY ABGEWIESEN -- program_id {program_id} verlangt numa_node={numa}, \
+                 die Maschine hat {} Knoten (0..{}).",
+                topo.node_count(),
+                topo.node_count().saturating_sub(1)
+            );
+            return Err(LoaderError::UnsupportedPolicy);
+        }
     }
     // Affinitaet, Prioritaet und Budget werden EINGEHALTEN -- s. `endow_and_load`. Hier steht nur
     // die Schranke: eine Kernnummer, die es nicht gibt, ist ein Fehler im Dokument.
@@ -1313,7 +1345,7 @@ fn ladepolitik_auf(program_id: u32, heimatkern: usize) -> crate::system::LadePol
     use crate::system::LadePolitik;
     let farbig = manifest_entry_of(program_id)
         .is_some_and(|(_, f)| f & caprock_loader::manifest::POLICY_EXCLUSIVE_STRIPE != 0);
-    let Some((_numa, affin, prio, _budget)) = manifest_zahlen_of(program_id) else {
+    let Some((numa, affin, prio, _budget)) = manifest_zahlen_of(program_id) else {
         return LadePolitik {
             farbig,
             core: Some(heimatkern),
@@ -1327,9 +1359,18 @@ fn ladepolitik_auf(program_id: u32, heimatkern: usize) -> crate::system::LadePol
         // und nicht die niedrigste. Wer wirklich 0 will, sagt es heute nicht unterscheidbar; das
         // ist eine Formatgrenze und steht als solche in `todo.md`.
         prio: if prio == 0 { LadePolitik::VORGABE.prio } else { prio as u8 },
-        // Sagt das Manifest nichts, gilt der Kern des AUFRUFERS -- nicht der des Laders (C8).
+        // **Die Rangfolge steht hier und nur hier** (N4): eine ausdrueckliche `core_affinity`
+        // sticht -- sie benennt EINEN Kern und ist damit praeziser als ein Knoten. Sagt das
+        // Dokument nur einen Knoten, waehlt N3 den am wenigsten belasteten Kern DIESES Knotens.
+        // Schweigt es zu beidem, gilt weiterhin der Kern des Aufrufers (C8).
+        //
+        // Dass der Knoten hier ueberhaupt einloesbar ist, hat `zahlenpolitik_gate` bereits
+        // geprueft; kaeme ein unbekannter Knoten bis hierher, faende `least_loaded_core_on`
+        // keinen Kern und faellt auf die globale Wahl zurueck -- gezaehlt als `remote`.
         core: Some(if affin != caprock_loader::manifest::ANY_CORE {
             affin as usize
+        } else if numa != 0 {
+            crate::system::least_loaded_core_on(caprock_hal::numa::Node::At(numa as u8))
         } else {
             heimatkern
         }),
@@ -1628,8 +1669,61 @@ pub fn load_program_into_pd_auf(
     )
     .ok_or(LoaderError::NoResources)?;
     record_program_thread(prog.program_id, tid);
+    debuggable_praegen(prog.program_id, pd);
     Ok(tid)
 }
+
+/// **Die einzige Stelle, an der eine `Debuggable`-Cap entsteht** (Z6b).
+///
+/// ## Warum sie eine eigene Funktion ist und keine Zeile im Ladepfad
+///
+/// Weil sie die Zusage IST. „Eine PD, ueber die nie eine `Debuggable` gepraegt wurde, kann nicht
+/// debuggt werden" haelt nur, solange es **genau einen** Weg zu einer solchen Cap gibt und dieser
+/// eine ausdrueckliche Angabe verlangt. Ein zweiter Weg — ein Syscall, ein Nachreichen, ein
+/// Vorgabewert — macht den Satz zu einer Bitte. Deshalb: eine Funktion, ein Aufrufer, kein
+/// Vorgabe-Ja.
+///
+/// ## Warum sie LAUT ist
+///
+/// Die Praegung ist eine benannte, protokollierte Handlung; bei Mandantenlasten eine, die der
+/// Kunde sehen koennen muss. Eine stille Praegung waere allgegenwaertige Autoritaet mit
+/// Zwischenschritten.
+///
+/// ## Und warum das Schweigen ebenfalls eine Zeile bekommt
+///
+/// Ein Pruefer, der ueber Abwesenheit urteilt, muss belegen koennen, dass er sprechfaehig ist. Ohne
+/// die zweite Zeile waere „keine Praegung" von „diese Funktion wurde nie gerufen" nicht zu
+/// unterscheiden — und ein leerer Lauf ist kein Testergebnis.
+fn debuggable_praegen(program_id: u32, pd: usize) {
+    let gewuenscht = manifest_entry_of(program_id)
+        .is_some_and(|(_, f)| f & caprock_loader::manifest::POLICY_DEBUGGABLE != 0);
+    if !gewuenscht {
+        DEBUGGABLE_NICHT_GEPRAEGT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        println!(
+            "loader  : pd {pd} (program_id {program_id}) OHNE Debuggable -- kein Debugger kann sie              anfassen, auch keiner mit jeder anderen Cap des Systems"
+        );
+        return;
+    }
+    match crate::system::mint_debuggable(pd) {
+        Some(_) => {
+            DEBUGGABLE_GEPRAEGT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            println!(
+                "loader  : AUDIT Debuggable GEPRAEGT fuer pd {pd} (program_id {program_id}) --                  diese PD ist ab jetzt debuggbar; das Fenster endet mit dem Revoke DIESER Cap,                  nicht mit dem Ablauf eines abgeleiteten Rechts"
+            );
+        }
+        None => println!(
+            "loader  : Debuggable fuer pd {pd} NICHT praegbar (kein Slot) -- die PD laeuft, ist              aber nicht debuggbar. Fail-closed: das ist die sichere Richtung"
+        ),
+    }
+}
+
+/// Wie oft eine `Debuggable` gepraegt wurde -- und wie oft ausdruecklich nicht (Z6b).
+/// **Zwei Zaehler, weil es zwei Aussagen sind:** `0/0` heisst „nichts geladen", nicht „nichts
+/// gepraegt".
+pub static DEBUGGABLE_GEPRAEGT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static DEBUGGABLE_NICHT_GEPRAEGT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// **Integritaets-/Trust-Gate** (ADR 0011 §7 + ADR 0014, ext-28): darf dieses Image geladen werden?
 ///

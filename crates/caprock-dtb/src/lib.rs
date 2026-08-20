@@ -110,6 +110,100 @@ impl<'a> Dtb<'a> {
         }
     }
 
+    /// **NUMA affinities from the device tree** (Z8/N0) — the aarch64 counterpart to ACPI SRAT.
+    ///
+    /// Calls `mem(base, size, node)` for every `memory@…` node that carries a `numa-node-id`, and
+    /// `cpu(index, node)` for every `cpu@…` node under `/cpus` that does. Returns the number of
+    /// affinities reported, or `None` if the tree is unreadable.
+    ///
+    /// **Callbacks rather than a returned structure, on purpose.** This crate is dependency-free
+    /// and stays that way; the classification (what an unaffiliated range means, what happens when
+    /// storage runs out) belongs in one place for both architectures, and that place is
+    /// `caprock_hal::numa`. Two crates deciding independently what a node is would be two designs.
+    ///
+    /// The CPU index is the **ordinal** of the `cpu@` node under `/cpus`, which is what
+    /// `MPIDR_EL1.Aff0` reports on QEMU `virt` — the same identity `hal::cpu::core_id` uses. On a
+    /// machine where those differ this needs the `reg` property instead, and it would be wrong
+    /// silently; that is why the report line prints how many CPU affinities were matched.
+    pub fn numa(
+        &self,
+        mut mem: impl FnMut(u64, u64, u32),
+        mut cpu: impl FnMut(u32, u32),
+    ) -> Option<usize> {
+        let mut pos = self.off_struct;
+        let mut depth = 0usize;
+        let mut in_cpus_at = usize::MAX;
+        // Zustand des GERADE offenen Knotens: `reg` und `numa-node-id` koennen in beliebiger
+        // Reihenfolge kommen, also erst am `FDT_END_NODE` auswerten.
+        let mut is_mem = false;
+        let mut is_cpu = false;
+        let mut cpu_ord = 0u32;
+        let mut this_cpu_ord = 0u32;
+        let mut reg: Option<(u64, u64)> = None;
+        let mut node_id: Option<u32> = None;
+        let mut n = 0usize;
+        loop {
+            let tok = be32(self.data, pos)?;
+            pos += 4;
+            match tok {
+                FDT_BEGIN_NODE => {
+                    let name = cstr(self.data, pos);
+                    pos += align4(name.len() + 1);
+                    depth += 1;
+                    if depth == 2 && name == b"cpus" {
+                        in_cpus_at = depth;
+                    }
+                    is_mem = name.starts_with(b"memory");
+                    is_cpu = in_cpus_at != usize::MAX
+                        && depth == in_cpus_at + 1
+                        && name.starts_with(b"cpu@");
+                    if is_cpu {
+                        this_cpu_ord = cpu_ord;
+                        cpu_ord += 1;
+                    }
+                    reg = None;
+                    node_id = None;
+                }
+                FDT_END_NODE => {
+                    if let Some(nd) = node_id {
+                        if is_mem {
+                            if let Some((b, l)) = reg {
+                                mem(b, l, nd);
+                                n += 1;
+                            }
+                        } else if is_cpu {
+                            cpu(this_cpu_ord, nd);
+                            n += 1;
+                        }
+                    }
+                    if depth == in_cpus_at {
+                        in_cpus_at = usize::MAX;
+                    }
+                    depth = depth.saturating_sub(1);
+                    is_mem = false;
+                    is_cpu = false;
+                    reg = None;
+                    node_id = None;
+                }
+                FDT_PROP => {
+                    let len = be32(self.data, pos)? as usize;
+                    let nameoff = be32(self.data, pos + 4)? as usize;
+                    let val = pos + 8;
+                    pos = val + align4(len);
+                    let pname = cstr(self.data, self.off_strings + nameoff);
+                    if pname == b"numa-node-id" && len >= 4 {
+                        node_id = Some(be32(self.data, val)?);
+                    } else if pname == b"reg" && is_mem && len >= 16 {
+                        reg = Some((be64(self.data, val)?, be64(self.data, val + 8)?));
+                    }
+                }
+                FDT_NOP => {}
+                FDT_END => return Some(n),
+                _ => return None,
+            }
+        }
+    }
+
     /// Die erste RAM-Region aus dem `/memory`-Knoten: `(base, size)`.
     /// Annahme: `#address-cells = #size-cells = 2` (Standard für QEMU `virt`).
     pub fn memory(&self) -> Option<(u64, u64)> {

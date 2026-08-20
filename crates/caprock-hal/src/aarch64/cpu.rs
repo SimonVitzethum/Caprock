@@ -25,6 +25,27 @@ pub fn core_id() -> usize {
     (mpidr & 0xff) as usize
 }
 
+/// **Read the SMT topology** (Z6 stage 0) — same signature as the x86 side, because the kernel's
+/// admission policy is architecture-neutral and must not grow two spellings.
+///
+/// On aarch64 the only architectural source in a system register is `MPIDR_EL1.MT`. It answers
+/// "are the lowest-affinity PEs multithreaded", and nothing else: the thread *count* lives in the
+/// ACPI PPTT / device tree, which this kernel does not read. `MT == 1` therefore decodes to
+/// `Unknown` — see `smt::decode_mpidr`, which also records the second reason (with `MT == 1`,
+/// [`core_id`] itself collides across cores).
+///
+/// Under QEMU `virt` with `cortex-a72` the bit is clear, so this reads `Single` and the policy is
+/// a no-op there. That is a correct reading, not an absent one — and the difference is exactly
+/// what the report line has to make visible.
+pub fn smt_topology() -> crate::smt::SmtTopology {
+    let mpidr: u64;
+    // SAFETY: `MPIDR_EL1` ist read-only und ohne Seiteneffekte.
+    unsafe {
+        asm!("mrs {}, MPIDR_EL1", out(reg) mpidr, options(nomem, nostack, preserves_flags));
+    }
+    crate::smt::decode_mpidr(mpidr)
+}
+
 /// Vollständige MPIDR-Affinität (Aff0..Aff3), wie sie PSCI als Ziel-CPU erwartet.
 pub fn mpidr_affinity() -> u64 {
     let mpidr: u64;

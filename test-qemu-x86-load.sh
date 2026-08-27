@@ -160,6 +160,25 @@ python3 tools/mkgpt.py "$BLK_IMG" --sectors "$BLK_SECTORS" \
 #
 # HardwareLand braucht KEIN Zertifikat: das Gate (ADR 0014) gilt fuer TrustedSAS, weil dort
 # Vertrauen die Autoritaet traegt. Hier traegt sie die Cap.
+#
+# Entry 7 = netstack (UserLand, domain 2) -- the TCP/IP stack as an ordinary PD, and a CLIENT of
+# the network driver rather than a driver itself. That is the whole point of its cap set: `ntfn,ep`
+# and nothing else. It holds no `mmio` and no `dma`, so it never touches a register window or a
+# bus-master region; the only authority it has over the wire is an endpoint. WHICH endpoint is not
+# left to load order -- the trailing `5` is `service_id`, the program_id of virtio-net, and
+# `kernel/src/loader.rs` reads it to wire slot 2 to that driver's channel and slot 6 to its shared
+# area. Without the `5` the loader would face two drivers and, by design, hand out nothing rather
+# than guess (A-5.4/Z11b) -- the stack would come up holding an endpoint nobody answers.
+#
+# Priority 1, like every other entry, and deliberately not "one above its client": the priorities
+# in this manifest sat unread for a year, and the day `ladepol` started HONOURING them a polling
+# driver above its client starved the client. A number that is now applied is not a number to
+# invent a new value for in passing.
+#
+# The entry appears in BOTH lists below, and they are two statements, not one: `sign_manifest`
+# says what authority this program is allowed to hold, `mkarchive` puts the bytes in the image. A
+# manifest entry without an archive entry names a module that is not there -- the run would fail
+# at the module hash, pointing at the loader, for a packaging mistake.
 build_archive() {   # $1 = Ausgabedatei, $2 = Kernel-ELF, $3 = manifest-version, $4 = Geraete-Selektor
     # $4 ist der A-5.3-Selektor der Treiber-PD. Vorgabe: das Blockgeraet. Die Negativfaelle unten
     # setzen ihn auf etwas Unerfuellbares bzw. auf die Netzkarte -- und brauchen dafuer das VOLLE
@@ -173,6 +192,7 @@ build_archive() {   # $1 = Ausgabedatei, $2 = Kernel-ELF, $3 = manifest-version,
         --entry "4:fs:0:1:$PROG/fs.elf:ntfn,ep::1::any:0::3" \
         --entry "5:virtio-net:1:1:$PROG/virtio-net.elf:mmio,dma,ntfn,ep::1::any:0:vendor=1af4,device=1041" \
         --entry "6:wasmhost:2:1:$PROG/wasmhost.elf:ntfn::1::any:0" \
+        --entry "7:netstack:2:1:$PROG/netstack.elf:ntfn,ep::1::any:0::5" \
         >/dev/null 2>&1 || return 1
     python3 tools/mkarchive.py "$1" --system-manifest build/system.manifest \
         "1:init:0:1:$PROG/init.elf::certs/init-x86.cert" \
@@ -180,11 +200,42 @@ build_archive() {   # $1 = Ausgabedatei, $2 = Kernel-ELF, $3 = manifest-version,
         "3:virtio-blk:1:1:$PROG/virtio-blk.elf" \
         "4:fs:0:1:$PROG/fs.elf::certs/fs-x86.cert" \
         "5:virtio-net:1:1:$PROG/virtio-net.elf" \
-        "6:wasmhost:2:1:$PROG/wasmhost.elf" >/dev/null 2>&1
+        "6:wasmhost:2:1:$PROG/wasmhost.elf" \
+        "7:netstack:2:1:$PROG/netstack.elf" >/dev/null 2>&1
 }
 
 echo "== Boot-Archiv bauen =="
 build_archive build/boot-archive-x86.bin "$KELF" 1 || { echo "  FEHLER: Archiv/Manifest"; exit 2; }
+
+# ================================================================================================
+# THE WITNESS PROVES ITSELF FIRST -- `tools/checknet.py --selftest`
+# ================================================================================================
+#
+# Same rule as `pruefer_selbsttest` further down, applied to the other judge in this run. The
+# verdict on the TCP path is made by `tools/checknet.py`, and most of that verdict rests on a pcap
+# parser and a connection-identity check written out inside that file. It carries 33 cases in both
+# directions -- the property present must be FOUND, the property removed must be MISSED at exactly
+# that property -- and until now nothing in this repository ran a single one of them. An unguarded
+# parser is not a small gap here: this parser's job is to decide that something did NOT happen, and
+# a parser that reads nothing produces the same silence as an empty capture.
+#
+# It stands BEFORE the boot on purpose. It needs no QEMU and costs seconds; learning that the judge
+# is broken after 120 s of booting would be the most expensive possible ordering. And it exits 2,
+# not 1: a judge that cannot judge has produced no test result at all, only a setup problem -- the
+# same distinction `check_trusted_key.py` above draws.
+echo "== Selbsttest des Netz-Zeugen (tools/checknet.py --selftest) =="
+NET_SELFTEST_LOG="$(mktemp)"
+if python3 tools/checknet.py --selftest > "$NET_SELFTEST_LOG" 2>&1; then
+    grep -m1 "SELFTEST ALL PASS" "$NET_SELFTEST_LOG" | sed 's/^/  /'
+    rm -f "$NET_SELFTEST_LOG"
+else
+    echo "  FEHLER: the outside witness fails its OWN selftest. That is NOT a test result about"
+    echo "          the kernel -- it means the verdict on the TCP path below would rest on a"
+    echo "          parser that has just been shown not to work."
+    sed 's/^/          /' "$NET_SELFTEST_LOG"
+    rm -f "$NET_SELFTEST_LOG" "$BLK_IMG"
+    exit 2
+fi
 
 # $1 = Archiv (leer = keines), $2 = Logdatei, $3 = Zeitlimit (Vorgabe: $SECONDS_RUN)
 #
@@ -205,9 +256,54 @@ build_archive build/boot-archive-x86.bin "$KELF" 1 || { echo "  FEHLER: Archiv/M
 # Die Zeile stammt aus der Zeit vor der `virtio`-Pruefung (2026-08-01); `test-qemu-x86.sh` bekam
 # die Schalter damals, diese Suite nicht. Zwei Suiten, die dasselbe Geraet verschieden aufsetzen,
 # sind ein Riss, durch den genau so etwas faellt.
+
+# ================================================================================================
+# THE LINK THE OUTSIDE WITNESS SPEAKS THROUGH
+# ================================================================================================
+#
+# The direction is decided by `restrict=on`, and it is the opposite of the obvious one:
+#
+#     the stack LISTENS on 10.0.2.15:7777   <-- hostfwd --   the host DIALS 127.0.0.1:17777
+#
+# `restrict=on` isolates the guest from everything the host can reach, so the guest cannot dial
+# out. It leaves EXPLICIT forwarding rules untouched, so the host can dial in. The flag therefore
+# stays exactly where it is: every other measurement in this suite runs against a guest that
+# cannot reach the outside, and quietly widening that would change what they mean without changing
+# a single one of their lines.
+#
+# The three numbers live here, in one place, because they appear in two: the QEMU forwarding rule
+# builds one end of the connection and `tools/checknet.py` dials the other. Two literals would be
+# two places to change and one place to forget -- and a forgotten one does not fail loudly, it
+# fails as "the guest never answered".
+NET_GUEST_IP=10.0.2.15
+NET_GUEST_PORT=7777
+NET_HOST_PORT=17777
+
+# **ONE switch for BOTH halves of the witness**, and that is the whole reason it is one variable
+# and not two. `hostfwd` is what lets a host process reach the guest at all; `filter-dump` is what
+# records the frames the second source reads. A run that got the rule but not the capture would
+# still connect, still exchange the pattern, and `checknet` would then print `SINGLE-SOURCE PASS`
+# -- a line that reads like an acceptance and is half a witness. Tying both to the same variable
+# makes that state unreachable from here.
+#
+# Empty for every boot except the main one, and that is the scoping decision: this suite calls
+# `boot()` eleven times, and the other ten -- the two further Z4 links, the Z4f run and the seven
+# negative cases -- then build a byte-identical QEMU command line to the one they built before
+# this change, so nothing they measure can have moved. A filter-dump on every boot would also mean
+# eleven captures of which ten are read by nobody, with the last one -- a negative case -- writing
+# over the only one that is ever judged.
+NET_WITNESS_PCAP=""
+
 boot() {
     local extra=()
     [ -n "$1" ] && extra=(-initrd "$1")
+    # See `$NET_WITNESS_PCAP` above: set -> forwarding rule AND capture, empty -> neither.
+    local netdev="user,id=n0,restrict=on"
+    local dump=()
+    if [ -n "${NET_WITNESS_PCAP:-}" ]; then
+        netdev="$netdev,hostfwd=tcp:127.0.0.1:$NET_HOST_PORT-$NET_GUEST_IP:$NET_GUEST_PORT"
+        dump=(-object "filter-dump,id=nd0,netdev=n0,file=$NET_WITNESS_PCAP")
+    fi
     # **`$BOOT_EXTRA` ist die NUMA-Tuer** (Z8/N4): eine Topologie laesst sich nur beim Start
     # setzen, und die Manifest-Politik ist ohne sie nicht pruefbar. Vorgabe leer -- jeder
     # vorhandene Aufruf verhaelt sich unveraendert.
@@ -219,27 +315,91 @@ boot() {
         -drive if=none,id=blk0,format=raw,file="$BLK_IMG" \
         -device virtio-blk-pci,drive=blk0,disable-legacy=on,iommu_platform=on \
         -device virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on \
-        -netdev user,id=n0,restrict=on "${extra[@]}" \
+        -netdev "$netdev" "${dump[@]}" "${extra[@]}" \
         -nographic -serial file:"$2" -no-reboot \
         </dev/null >/dev/null 2>&1 || true
 }
 
 LOG="$(mktemp)"
-echo "== boot ($SECONDS_RUN s) =="
+
+# ================================================================================================
+# THE WITNESS RUNS **WHILE** QEMU RUNS -- it cannot run after
+# ================================================================================================
+#
+# `boot()` is synchronous: it returns when the guest is already gone. The stack only listens while
+# the guest is up, so a witness started after `boot()` would find a closed port every time and
+# report a broken stack for a run that may have been perfect. It therefore goes to the background
+# BEFORE the boot and its verdict is collected after.
+#
+# What the retry loop inside `checknet` does and does not cover, written down so the line below is
+# not read as more than it is: it retries `connect` for `--deadline` seconds, which covers "QEMU
+# has not bound the host port yet" -- the first attempts are refused and it tries again. It does
+# NOT cover "the guest is up but has not called listen yet": slirp accepts on the host side
+# immediately and only then sends a SYN into the guest, so the host-side connect succeeds early
+# regardless. What carries that gap is slirp's own SYN retransmission, inside the 10 s the peer
+# waits for the first byte. If this ever turns flaky, that is the place to look, and the pcap kept
+# on failure below is what shows it.
+#
+# `--deadline "$SECONDS_RUN"` is derived, not chosen: the witness must not be able to outlive the
+# boot budget it is watching. `--not-before` is deliberately NOT passed -- the peer half runs here,
+# so `checknet` binds the capture to its own clock, which is a tighter bound than anything this
+# script could hand it.
+NET_PCAP="build/diag/load-netwitness.pcap"
+NET_LOG="$(mktemp)"
+mkdir -p build/diag
+# A stale capture from an earlier run must not be able to stand in for this one's. `checknet` also
+# binds the capture by client port and timestamp, but a file that is not there cannot be misread
+# at all, and "no capture" is a named failure inside it rather than a quiet single source.
+rm -f "$NET_PCAP"
+# **The host port is a capacity of exactly one, so it gets NAMED before it can be missed.** A
+# hostfwd rule for a port something else already holds makes QEMU refuse to start; `boot()` sends
+# every QEMU message to /dev/null, so the suite would show "KEIN OUTPUT -- Aufbauproblem" and no
+# hint which one. Two runs of this suite at the same time is the ordinary way to hit it. Binding
+# is done WITHOUT SO_REUSEADDR on purpose: with it, an active listener would not be noticed.
+# There is a moment between this close and QEMU's bind in which somebody else could take the port;
+# that window is not closable from here, and losing it lands in the "KEIN OUTPUT" path as before.
+if ! python3 - "$NET_HOST_PORT" <<'PYEOF'
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError as e:
+    sys.exit(f"{e}")
+finally:
+    s.close()
+PYEOF
+then
+    echo "== BELEGT: host port $NET_HOST_PORT is already in use -- the forwarding rule the outside"
+    echo "   witness dials through cannot be installed, and QEMU would refuse to start with its"
+    echo "   message swallowed. This is a setup problem, not a test result. =="
+    rm -f "$LOG" "$NET_LOG" "$BLK_IMG"; exit 2
+fi
+echo "== boot ($SECONDS_RUN s) + Zeuge von aussen (127.0.0.1:$NET_HOST_PORT -> $NET_GUEST_IP:$NET_GUEST_PORT) =="
+python3 tools/checknet.py --port "$NET_HOST_PORT" --guest-port "$NET_GUEST_PORT" \
+    --pcap "$NET_PCAP" --deadline "$SECONDS_RUN" > "$NET_LOG" 2>&1 &
+NET_PID=$!
+NET_WITNESS_PCAP="$NET_PCAP"
 boot build/boot-archive-x86.bin "$LOG"
+NET_WITNESS_PCAP=""
+wait "$NET_PID"; NET_RC=$?
 OUT="$(grep -vE "SeaBIOS|iPXE|Press Ctrl|Booting from|C900|PMM|PnP" "$LOG" 2>/dev/null)"
 # **Die neuen Urteilszeilen immer zeigen** -- sie sind das Ergebnis, nicht Diagnose. Eine Zeile,
 # die man nur im Fehlerfall zu sehen bekommt, laesst sich nicht gegenlesen.
 echo "$OUT" | grep -E "^(pdcolor|ladepol)" || true
 if [ -z "$OUT" ]; then
     echo "== KEIN OUTPUT -- das ist KEIN Testergebnis, sondern ein Aufbauproblem (QEMU? Zeitlimit?) =="
-    rm -f "$LOG" "$BLK_IMG"; exit 2
+    # The witness saw the same setup problem from the other side; its one line names it (usually
+    # "never reachable"), and it costs nothing to say so instead of exiting into silence. The
+    # capture under build/diag is deliberately NOT removed here: if QEMU came up far enough to
+    # open the netdev, it is the only thing left to look at.
+    grep -m1 "^checknet:" "$NET_LOG" | sed 's/^/   /'
+    rm -f "$LOG" "$NET_LOG" "$BLK_IMG"; exit 2
 fi
 # `wasm` und `clientn` gehoeren hierher: sie sind ERGEBNISzeilen. Eine Zeile, die man nur im
 # abgelegten Fehlerprotokoll zu sehen bekommt, laesst sich nicht gegenlesen -- und das abgelegte
 # Protokoll ist der LETZTE Boot (ein Negativfall), nicht der Hauptlauf. Genau daran habe ich am
 # 2026-08-10 eine Diagnose aus dem falschen Boot gelesen.
-echo "$OUT" | grep -E "^(mbi|mbmod|archive|manifest|clientn|root|devassign|devsel|dmaiso|drv|blkdev|part|fs|wasm|bootckpt) *:" || true
+echo "$OUT" | grep -E "^(mbi|mbmod|archive|manifest|clientn|root|devassign|devsel|dmaiso|drv|blkdev|part|fs|wasm|netcon|bootckpt) *:" || true
 
 echo "== checks =="
 # ================================================================================================
@@ -381,7 +541,13 @@ check "mbmod   : ALL PASS" \
 # Die ZAHL steht hier, nicht bloss "das Archiv parst": ein Archiv, aus dem beim Bauen still ein
 # Modul herausfiel, parst genauso gut -- und der Treiber-Test darunter saehe dann aus wie ein
 # Treiberfehler statt wie ein fehlendes Modul.
-check "archive : 6 Modul(e)" \
+# 6 -> 7 with the `netstack` entry above. The number is the measurement, so it MOVES with the
+# archive instead of being loosened to a pattern: `netstack` is the seventh module, and an archive
+# that lost one during packaging must still be a failure here rather than a driver-shaped puzzle
+# three checks further down. This is the only existing check line this change touches, and it had
+# to be touched -- leaving `6` would not have kept an old measurement, it would have made the
+# suite assert something this archive is no longer.
+check "archive : 7 Modul(e)" \
     "A-1.1/A-1.5: das Archiv liegt an der vom Bootloader gemeldeten Adresse und parst (init + hello + virtio-blk + fs)"
 # A1 / Z11c (2026-08-07). **Auf `ALL PASS` geprueft, nicht auf die Zeile** -- die Zeile gibt es
 # auch als SKIP („kein Programm mit EXCLUSIVE_STRIPE geladen"), und genau der Fall ist beim Bau
@@ -573,6 +739,58 @@ else
     fail=1
 fi
 rm -f "$LOG.fat"
+
+# ================================================================================================
+# THE TCP PATH: the guest's OWN claim, and the judgement made from outside
+# ================================================================================================
+#
+# Exactly the shape of A-6.4 three lines above, and for the same reason. The two lines below are
+# two different statements and both are gated:
+#
+#   `netcon`  -- what the guest believes happened. It is the only source that can say WHERE inside
+#                the stack something went wrong, and it is the source with every reason to be
+#                wrong: a stack broken in an interesting way claims success just as loudly as one
+#                that works.
+#   checknet  -- what happened. A host process completed a three-way handshake through a kernel
+#                nobody in this repository wrote, and a second reader parsed the frames that
+#                actually crossed the link. Neither of those can be produced by a guest that only
+#                believes it is serving.
+#
+# A missing line FAILS in both blocks. Silence is not a pass, and it is the one outcome the
+# known-red scanner at the end cannot catch: that scanner looks for RED lines, and a line that
+# never appeared is not red. Same tri-state as `hiiso` above.
+if grep -q "^netcon  : FAILURES" <<<"$OUT"; then
+    echo "  FAIL: the stack PD reports a finding of its own: $(grep -m1 '^netcon  :' <<<"$OUT")"
+    fail=1
+elif grep -q "^netcon  : ALL PASS" <<<"$OUT"; then
+    echo "  PASS: the stack PD's own report on the TCP path is green. This is the guest's CLAIM"
+    echo "        about itself and is gated as such -- what decides whether to believe it is the"
+    echo "        line below, which was produced outside the VM"
+else
+    echo "  FAIL: no 'netcon' line in the log at all. That is not a pass and it is not a skip:"
+    echo "        the stack PD either never ran or never got as far as reporting, and either way"
+    echo "        nothing below it was measured"
+    fail=1
+fi
+# **Gated on the TWO-SOURCE string, not on `ALL PASS`.** `checknet` spells the one-source case
+# `SINGLE-SOURCE PASS` precisely so that a grep for the acceptance cannot be satisfied by half a
+# witness -- and half a witness is not a hypothetical: a `-object filter-dump` that fails to
+# attach leaves the peer half running happily and the wire unread. Two facts, two conditions: the
+# exit status says the thresholds were met, the string says how many independent sources stood
+# behind them.
+if [ "$NET_RC" = 0 ] && grep -q "checknet: ALL PASS (two independent sources" "$NET_LOG"; then
+    echo "  PASS: $(grep -m1 'checknet: ALL PASS' "$NET_LOG")"
+    echo "        -- judged from OUTSIDE the VM, while it ran: a real TCP peer on the host and an"
+    echo "        independent read of the captured link. The guest's claim above is now backed by"
+    echo "        two sources that do not run inside it"
+else
+    echo "  FAIL: the outside witness did not accept the TCP path (rc=$NET_RC). A verdict that is"
+    echo "        missing, red, or single-source is a FAIL here -- 'SINGLE-SOURCE PASS' contains no"
+    echo "        acceptance string on purpose:"
+    sed 's/^/          /' "$NET_LOG"
+    fail=1
+fi
+
 check "SELFTEST COMPLETE" "sauberes system_off statt Timeout"
 
 # --- Z4 Stufe 2: ein Thread ueber die BOOTGRENZE -------------------------------------------------
@@ -966,7 +1184,7 @@ fi
 # Bei einer Rate um 1/20 kostet jeder verlorene Fehlschlag Stunden. Ein Testaufbau, der seinen
 # eigenen Befund wegwirft, misst zwar -- aber er laesst nichts zurueck, woran man arbeiten kann.
 if [ "$fail" = 0 ]; then
-    rm -f "$LOG"
+    rm -f "$LOG" "$NET_LOG" "$NET_PCAP"
 else
     mkdir -p build/diag
     STEMPEL="$(date +%Y%m%d-%H%M%S)"
@@ -979,7 +1197,17 @@ else
     # schlimmer als keins: es sieht aus wie eine Antwort.
     HAUPT="build/diag/load-hauptboot-$STEMPEL-${RAM}.log"
     printf '%s\n' "$OUT" > "$HAUPT" && echo "  (Log des HAUPTboots:      $HAUPT)"
-    rm -f "$LOG"
+    # **And the wire, for the same reason as D12 above.** The capture is the only artefact that
+    # survives the run and says what actually crossed the link; the next run deletes it before its
+    # own boot, so a failure investigated tomorrow would be investigated without it. It is copied
+    # out whenever the run is red, not only when a network check is what failed -- a suite that
+    # discards evidence because the failure "looked unrelated" is guessing about which evidence it
+    # will need.
+    NETZIEL="build/diag/load-netwitness-$STEMPEL-${RAM}.pcap"
+    cp -f "$NET_PCAP" "$NETZIEL" 2>/dev/null && echo "  (Mitschnitt der Netzstrecke: $NETZIEL)"
+    NETURTEIL="build/diag/load-netwitness-$STEMPEL-${RAM}.log"
+    cp -f "$NET_LOG" "$NETURTEIL" 2>/dev/null && echo "  (Urteil des Netz-Zeugen:  $NETURTEIL)"
+    rm -f "$LOG" "$NET_LOG" "$NET_PCAP"
 fi
 rm -f "$BLK_IMG"
 echo "fingerprint: $(fingerprint "$KELF") (Kernel-Binary, das GERADE geprueft wurde -- schliesst"

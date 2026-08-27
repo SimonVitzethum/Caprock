@@ -198,8 +198,100 @@ const _: () = assert!(shared_bytes_needed() <= SHARED_BYTES);
 ///
 /// A function and not a literal, so the answer moves with the constants instead of next to them.
 pub const fn shared_bytes_needed() -> usize {
-    OFF_RX_DATA + FRAME_MAX as usize
+    OFF_RESULT + RESULT_BYTES
 }
+
+// ------------------------------------------------------------------------------------------------
+// The result block -- how the stack PD tells the KERNEL what happened
+//
+// The kernel cannot ask the stack. `SYS_SIGNAL` ORs the badge of the CAP into `pending` and the
+// message word plays no role, so a notification carries "I ran" and nothing else. Numbers therefore
+// travel the same way the file system PD's do: written into the shared area, read out of it by the
+// kernel through `driver_shared_region` (`kernel/src/arch/x86_64/bringup.rs` does exactly this for
+// `fs` at offset 4096 of the block service's area).
+//
+// **It sits above both frame slots, not at 4096.** `fs` uses 4096 because its area carries no frame
+// slots; here 4096 is inside TX payload. The layout assert below is what keeps that from being a
+// thing someone has to remember.
+//
+// **Why the kernel's reading of this is NOT the acceptance.** These are the stack's own numbers --
+// a writer confirming its own result. They go into the report so a failure can be read at all
+// (a run that says "0 bytes, state=listening" points somewhere completely different from one that
+// says "48 bytes, state=closed"), and the judgement is made by `tools/checknet.py` on the host,
+// against the frames that actually crossed the link. Both must agree; where they disagree, the
+// wire wins and the disagreement is the finding.
+// ------------------------------------------------------------------------------------------------
+
+/// Offset of the result block. Above both frame slots -- see the module note.
+pub const OFF_RESULT: usize = 0x1800;
+/// Bytes of the result block: [`RESULT_WORDS`] little-endian `u64`.
+pub const RESULT_BYTES: usize = RESULT_WORDS * 8;
+/// How many `u64` the result block carries.
+pub const RESULT_WORDS: usize = 16;
+/// Magic of the result block ("NETR"), distinct from [`MAGIC`].
+///
+/// A block that does not carry it has **not been written by a stack that speaks this version** --
+/// and, more importantly on the very first boot, has not been written at all. Zeroed memory would
+/// otherwise decode as a perfectly well-formed result reporting that nothing happened, which is
+/// indistinguishable from a stack that ran and achieved nothing. The kernel must be able to tell
+/// "no stack" from "a stack that failed"; those point at different files.
+pub const RESULT_MAGIC: u64 = 0x4E45_5452;
+
+/// Word indices in the result block. `W_MAGIC` is word 0 and is written **last**.
+pub mod result_word {
+    /// [`super::RESULT_MAGIC`] -- written last, so a half-written block never decodes.
+    pub const MAGIC: usize = 0;
+    /// Connection state: see [`state`](super::state).
+    pub const STATE: usize = 1;
+    /// Bytes the stack received from its peer.
+    pub const RX_BYTES: usize = 2;
+    /// Bytes the stack sent to its peer.
+    pub const TX_BYTES: usize = 3;
+    /// `1` if the received bytes matched the expected pattern, else `0`.
+    pub const PATTERN_OK: usize = 4;
+    /// Poll cycles executed. **A stack that "initialised" is not a stack that works** -- this is a
+    /// number only a running poll loop can produce.
+    pub const POLLS: usize = 5;
+    /// Frames handed to the driver.
+    pub const FRAMES_TX: usize = 6;
+    /// Frames taken from the driver.
+    pub const FRAMES_RX: usize = 7;
+    /// Last non-OK status the driver replied, or `0`.
+    pub const LAST_DRIVER_STATUS: usize = 8;
+    /// Last refusal reason the driver replied, or `0`.
+    pub const LAST_DRIVER_REASON: usize = 9;
+    /// `1` once the stack has the driver's MAC.
+    pub const HAVE_MAC: usize = 10;
+}
+
+/// Values for [`result_word::STATE`].
+pub mod state {
+    /// The stack has not reached its listen call.
+    pub const INIT: u64 = 0;
+    /// Listening, no peer yet.
+    pub const LISTENING: u64 = 1;
+    /// A connection is open.
+    pub const ESTABLISHED: u64 = 2;
+    /// Closed in an orderly way -- both sides said so.
+    pub const CLOSED: u64 = 3;
+    /// The connection ended without an orderly close.
+    pub const ABORTED: u64 = 4;
+}
+
+/// `(offset, end)` of the result block, or `None` if `area` cannot hold it.
+pub const fn result_range(area_len: usize) -> Option<(usize, usize)> {
+    if area_len < OFF_RESULT + RESULT_BYTES {
+        None
+    } else {
+        Some((OFF_RESULT, OFF_RESULT + RESULT_BYTES))
+    }
+}
+
+// The result block must not overlap either frame slot, and the whole thing must fit what the kernel
+// hands out. Prose would drift; these do not.
+const _: () = assert!(OFF_RX_DATA + FRAME_MAX as usize <= OFF_RESULT);
+const _: () = assert!(OFF_RESULT + RESULT_BYTES <= SHARED_BYTES);
+const _: () = assert!(RESULT_MAGIC != MAGIC as u64);
 
 // ------------------------------------------------------------------------------------------------
 // The header.
@@ -466,15 +558,82 @@ mod tests {
     }
 
     #[test]
-    fn both_slots_fit_inside_the_shared_area() {
-        assert_eq!(shared_bytes_needed(), 4128);
-        assert!(shared_bytes_needed() <= 8192);
+    fn both_slots_and_the_result_block_fit_inside_the_shared_area() {
+        // 0x1800 + 16 * 8. The literal is here on purpose: `shared_bytes_needed()` is what a PD
+        // refuses to start on, so a change to it must be a change someone made, not one that
+        // followed from moving a constant.
+        assert_eq!(shared_bytes_needed(), 6272);
         assert!(shared_bytes_needed() <= SHARED_BYTES);
-        // The bound that actually matters is the largest range either helper can hand out.
+        // The bound that actually matters is the largest range any helper can hand out.
         let (_, tx_end) = tx_data_range(FRAME_MAX).unwrap();
         let (_, rx_end) = rx_data_range(FRAME_MAX).unwrap();
-        assert!(tx_end <= SHARED_BYTES && rx_end <= SHARED_BYTES);
-        assert_eq!(rx_end, shared_bytes_needed());
+        let (res_start, res_end) = result_range(SHARED_BYTES).unwrap();
+        assert!(tx_end <= SHARED_BYTES && rx_end <= SHARED_BYTES && res_end <= SHARED_BYTES);
+        // The result block sits ABOVE both frame slots. `fs` puts its result at 4096 because its
+        // area carries no frame slots; here 4096 is inside the RX payload, and a result written
+        // there would be overwritten by the next frame the driver stages. Asserted rather than
+        // asserted-in-prose: the first version of this comment said TX, which is off by one slot
+        // and would have sent the next reader to the wrong place.
+        assert!(rx_end <= res_start);
+        assert!(
+            (OFF_RX_DATA..rx_end).contains(&4096),
+            "4096 really is inside the RX slot -- that is why 0x1800 is used"
+        );
+        assert_eq!(res_end, shared_bytes_needed());
+    }
+
+    #[test]
+    fn the_result_block_is_refused_when_the_area_cannot_hold_it() {
+        assert!(result_range(SHARED_BYTES).is_some());
+        assert!(result_range(OFF_RESULT + RESULT_BYTES).is_some());
+        // One byte short is a refusal, not a shortened block: a caller that wrote a truncated
+        // result would have the kernel read the tail out of whatever came after it.
+        assert!(result_range(OFF_RESULT + RESULT_BYTES - 1).is_none());
+        assert!(result_range(0).is_none());
+    }
+
+    #[test]
+    fn a_zeroed_area_does_not_decode_as_a_result() {
+        // The case that matters on the first boot: an area nobody has written yet. Without a magic
+        // it would decode as a well-formed result saying nothing happened -- indistinguishable
+        // from a stack that ran and achieved nothing, and those point at different files.
+        let zeroed = [0u64; RESULT_WORDS];
+        assert_ne!(zeroed[result_word::MAGIC], RESULT_MAGIC);
+        assert_ne!(RESULT_MAGIC, 0);
+        // And the two magics must not be confusable with each other.
+        assert_ne!(RESULT_MAGIC, MAGIC as u64);
+    }
+
+    #[test]
+    fn the_result_word_indices_are_distinct_and_inside_the_block() {
+        use result_word::*;
+        let all = [
+            MAGIC, STATE, RX_BYTES, TX_BYTES, PATTERN_OK, POLLS, FRAMES_TX, FRAMES_RX,
+            LAST_DRIVER_STATUS, LAST_DRIVER_REASON, HAVE_MAC,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            assert!(*a < RESULT_WORDS, "word index {a} is outside the block");
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "two fields share word index {a}");
+            }
+        }
+        // Word 0 is the magic, because it is written last: a block whose magic is present is a
+        // block whose other words are already there.
+        assert_eq!(MAGIC, 0);
+    }
+
+    #[test]
+    fn the_states_are_distinct_and_init_is_zero() {
+        use state::*;
+        let all = [INIT, LISTENING, ESTABLISHED, CLOSED, ABORTED];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        // A block that was allocated and never filled reads INIT. That is the honest default:
+        // "did not get there" rather than any outcome that could be mistaken for progress.
+        assert_eq!(INIT, 0);
     }
 
     #[test]

@@ -17,6 +17,10 @@ name = "caprock-fat"
 version = "0.0.1"
 
 [[package]]
+name = "caprock-net"
+version = "0.0.1"
+
+[[package]]
 name = "caprock-part"
 version = "0.0.1"
 
@@ -117,6 +121,7 @@ dependencies = [
 name = "virtio-net"
 version = "0.0.1"
 dependencies = [
+ "caprock-net",
  "caprock-virtio",
  "libcaprock",
 ]

@@ -21,3 +21,4 @@ path = "src/main.rs"
 [dependencies]
 libcaprock = { path = "../../libcaprock" }
 caprock-virtio = { path = "../../../crates/caprock-virtio" }
+caprock-net = { path = "../../../crates/caprock-net" }

@@ -1,0 +1,34 @@
+# `netstack` — the TCP/IP stack as a protection domain of its own.
+#
+# **The TCB grows by zero.** smoltcp is a third-party `no_std` crate that parses bytes an
+# attacker chooses; it lives here, in a UserLand PD, and not in the kernel. That is the same
+# argument `wasmhost` makes for its engine, and it is the only argument that matters: a mandant
+# who does not speak TCP carries none of this.
+#
+# **It holds no DMA and no MMIO, and that is the architecture, not an omission.** See the module
+# documentation of `src/main.rs` — `cap_allowed` forbids a PD holding a DMA cap from holding any
+# foreign endpoint, so a stack that owned packet buffers could not talk to anyone.
+[package]
+name = "netstack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "netstack"
+path = "src/main.rs"
+
+[dependencies]
+libcaprock = { path = "../../libcaprock" }
+caprock-net = { path = "../../../crates/caprock-net" }
+
+# **The feature set is measured, not guessed.** Exactly these three features compile for
+# `x86_64-caprock-user.json` with `build-std = ["core", "compiler_builtins"]` and need **no**
+# allocator — the programs workspace does not build `alloc`, and adding it would be a change to
+# `programs/.cargo/config.toml`. `default-features = false` is therefore not a saving, it is the
+# condition: with `std` this crate pulls a standard library that does not exist on this target.
+smoltcp = { version = "0.14", default-features = false, features = [
+  "medium-ethernet",
+  "proto-ipv4",
+  "socket-tcp",
+] }

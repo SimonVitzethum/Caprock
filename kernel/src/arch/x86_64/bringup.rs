@@ -3554,6 +3554,188 @@ static NUMA_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool:
 /// Aufbau; als ALL PASS zu melden waere schlimmer. Also ein eigener Ausgang.
 static DMAISO_STATE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+// --- `netcon`: what the TCP/IP stack PD says about its own run --------------------------------
+//
+// `dmaiso` above measures the DRIVER, from inside the kernel. This is the other end of the same
+// channel: a stack PD that owns no device, holds neither MMIO nor DMA authority, and reaches the
+// wire only by speaking `caprock-net` to the driver PD through the shared area.
+//
+// The kernel cannot ask it anything. `SYS_SIGNAL` ORs the badge of a cap into `pending` and the
+// message word plays no part, so a notification carries "I ran" and nothing else. Its numbers
+// therefore travel the way the file system PD's do: written into the shared area, read back out of
+// it with `driver_shared_region` + `read_volatile` — exactly what the `fs` block further down does
+// at offset 4096 of the BLOCK service's area. The offset differs (4096 is inside TX payload here),
+// the mechanism does not.
+//
+// **What this reading is, and what it is not.** These are the stack's own numbers — a writer
+// confirming its own result, the same class of statement as the attacker's "I got nothing" that
+// A-5.4 above deliberately refuses to accept on its own. They are here so that a failure can be
+// read at all: `state=1, rx=0` and `state=3, rx=48` point at completely different files, and a
+// single collected bool would destroy that distinction before anyone saw it. What actually crossed
+// the link is judged on the host, against the frames.
+// How far the `netcon` measurement got. **Three final outcomes and two in-progress ones, not a
+// bool**: "no stack was in the start set", "the area cannot hold the block" and "a stack ran"
+// point at three different files, and a single flag that answers all of them answers none. The
+// two transient phases exist so that "not yet" never has to be spelled as one of the three.
+/// The measurement has not asked yet. `netcon_measure` leaves this state on its first call.
+#[cfg(feature = "selftest")]
+const NETCON_UNRESOLVED: u32 = 0;
+/// No client of the net service in the start set — nothing could have written a block. **Not
+/// applicable, NOT passed.**
+#[cfg(feature = "selftest")]
+const NETCON_NO_CLIENT: u32 = 1;
+/// A client is in the start set; its block has not appeared yet. "Not yet" is not "never".
+#[cfg(feature = "selftest")]
+const NETCON_WAITING: u32 = 2;
+/// The magic was there, the words are copied, the verdict stands in [`NETCON_OK`].
+#[cfg(feature = "selftest")]
+const NETCON_MEASURED: u32 = 3;
+/// The shared area is shorter than the block the protocol puts at `OFF_RESULT` — a kernel-side
+/// layout fault, and nothing was read out of it.
+#[cfg(feature = "selftest")]
+const NETCON_AREA_SMALL: u32 = 4;
+
+/// Floor under `RX_BYTES`/`TX_BYTES`. **A floor, never a ceiling**: `>= 16` is false at zero
+/// bytes, which is the value a stack that never ran leaves behind. A criterion written the other
+/// way round (`<= N`) would turn green the moment the measurement stopped working.
+#[cfg(feature = "selftest")]
+const NETCON_MIN_BYTES: u64 = 16;
+
+/// Where the `netcon` measurement stands (`NETCON_*`). Written **after** [`NETCON_WORDS`] and
+/// [`NETCON_OK`], for the same reason the stack writes its magic last: this word is what makes the
+/// snapshot readable.
+#[cfg(feature = "selftest")]
+static NETCON_PHASE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(NETCON_UNRESOLVED);
+/// The snapshot of the result block that the verdict was formed from — and the one the report
+/// prints. Judging a second read would let the line print one set of numbers and gate on another.
+#[cfg(feature = "selftest")]
+static NETCON_WORDS: [AtomicU64; caprock_net::RESULT_WORDS] =
+    [const { AtomicU64::new(0) }; caprock_net::RESULT_WORDS];
+/// The verdict. Formed in [`netcon_measure`], **not** in the report — it stands in `all_done()`,
+/// and what the report sets cannot trigger the report.
+#[cfg(feature = "selftest")]
+static NETCON_OK: AtomicBool = AtomicBool::new(false);
+/// The shared area of the net service once it exists (`0` = not yet). `driver_shared_region` only
+/// ever returns a region with `shared_phys != 0`, so `0` is a sentinel and not an address.
+///
+/// Cached because the address does not change once it exists, while this loop turns millions of
+/// times between the driver's assignment and the stack's last write. Taking the assignment table's
+/// lock every one of those turns, for a value already known, would be a checker competing with the
+/// thing it is waiting for — the consideration that keeps `used_vspaces()` out of `all_done()`.
+#[cfg(feature = "selftest")]
+static NETCON_AREA: AtomicU64 = AtomicU64::new(0);
+
+/// **Read the stack PD's result block — from the main loop, and therefore BEFORE the report.**
+///
+/// A judgement that stands in a completion condition must not first come into being in the report:
+/// it could then never trigger the report, and the run would end in the watchdog while printing
+/// its result anyway. In a log that reads as "green, but hung". This file has paid for that twice
+/// in one day (A-6.1), and `DMAISO_OK` two screens up says the same sentence.
+///
+/// Cheap on the turns that find nothing: one atomic load once the outcome is settled, one volatile
+/// word while waiting.
+#[cfg(feature = "selftest")]
+fn netcon_measure() {
+    let phase = NETCON_PHASE.load(Ordering::Acquire);
+    if phase != NETCON_UNRESOLVED && phase != NETCON_WAITING {
+        return; // NO_CLIENT, MEASURED and AREA_SMALL are final
+    }
+    if phase == NETCON_UNRESOLVED {
+        // **Is a stack PD in the start set at all?** Asked of the manifest, and asked ONCE:
+        // `read_manifest()` verifies an Ed25519 signature over the whole document, and this loop
+        // turns millions of times.
+        //
+        // The question is put to `service_id` rather than to a name or a program id, because
+        // `service_id` is the field the LOADER acts on: a client entry naming the net service is
+        // handed that service's endpoint AND its shared area (`loader.rs`, `driver_shared_cap(
+        // e.service_id)`). A stack that could have written the block therefore names it by
+        // construction — with `0` it would get neither the channel (two driver services exist, and
+        // `driver_service()` returns `None` rather than guess between them) nor the area the block
+        // lives in. Reading a program id out of a constant here would have been a second, private
+        // description of the start set, and the first one is the manifest.
+        let named = crate::loader::read_manifest().is_some_and(|man| {
+            (0..man.count()).filter_map(|i| man.entry(i)).any(|e| {
+                // Not the provider itself: an entry that named its own service would otherwise
+                // count as a client of it.
+                e.service_id == TEST_NET_SERVICE_ID && e.program_id != TEST_NET_SERVICE_ID
+            })
+        });
+        if !named {
+            // **Not applicable — which is not the same as passed**, and the separate outcome is
+            // the whole point. `vnet` (further down in this file) is what it looks like when that
+            // distinction is dropped: it stores `true` when the CARD IS ABSENT, so the only
+            // network evidence in the system reports pass on a machine with no network. The
+            // applicability decision belongs where the environment is known, and that is the
+            // suite: it knows which run was supposed to supply a stack PD, and the kernel cannot.
+            NETCON_OK.store(true, Ordering::Release);
+            NETCON_PHASE.store(NETCON_NO_CLIENT, Ordering::Release);
+            return;
+        }
+        NETCON_PHASE.store(NETCON_WAITING, Ordering::Release);
+    }
+    let mut phys = NETCON_AREA.load(Ordering::Acquire);
+    if phys == 0 {
+        let Some((p, len)) = system::driver_shared_region(TEST_NET_SERVICE_ID) else {
+            // The driver PD may not have its device yet — the loading sequence runs in this same
+            // loop. **Not an outcome**: settling here would turn a loading order into a verdict.
+            return;
+        };
+        // The one thing about this layout the kernel can still get wrong. `caprock-net` asserts at
+        // compile time that the block fits the area — but against ITS OWN copy of the size, and
+        // `system::SHARED_BYTES` is private, so the two numbers cannot be tied together in a
+        // `const _` from here. Checked at runtime instead, and given its own outcome: an area too
+        // short for the block is a kernel-side fault, and reading it anyway would return whatever
+        // follows the region as a plausible-looking result.
+        if caprock_net::result_range(len as usize).is_none() {
+            NETCON_OK.store(false, Ordering::Release);
+            NETCON_PHASE.store(NETCON_AREA_SMALL, Ordering::Release);
+            return;
+        }
+        NETCON_AREA.store(p, Ordering::Release);
+        phys = p;
+    }
+    // SAFETY: `phys` is the base of the region the kernel carved out and mapped identity for this
+    // very service, and it was checked above to be at least `OFF_RESULT + RESULT_BYTES` long, so
+    // every index `0..RESULT_WORDS` lands inside it. Alignment holds by three multiples of 8: the
+    // base is page-aligned, `OFF_RESULT` is `0x1800`, and the stride is 8. Read only, never
+    // written. The stack PD writes the same bytes concurrently, which is why every access is
+    // `read_volatile` — the compiler may not fold, hoist or elide a load of memory another PD is
+    // publishing into.
+    let raw = |i: usize| unsafe {
+        core::ptr::read_volatile(
+            (phys + caprock_net::OFF_RESULT as u64 + i as u64 * 8) as *const u64,
+        )
+    };
+    // **The magic is read first, and that is the entire synchronisation.** The writer publishes it
+    // LAST, so a visible magic means the other words were stored before it; x86 keeps stores in
+    // order and does not reorder loads with loads, so reading the magic first cannot pick up a
+    // word from before the publish afterwards. Without the magic a zeroed area would decode as a
+    // perfectly well-formed result reporting that nothing happened — indistinguishable from a
+    // stack that ran and achieved nothing.
+    if raw(caprock_net::result_word::MAGIC) != caprock_net::RESULT_MAGIC {
+        return; // nothing published yet — ask again next turn
+    }
+    for (i, slot) in NETCON_WORDS.iter().enumerate() {
+        slot.store(raw(i), Ordering::Relaxed);
+    }
+    // Judged from the SNAPSHOT the report will print, not from a second look at the area: the
+    // stack may still be running, and a verdict formed from words the line does not show is a
+    // verdict nobody can check against the line.
+    let w = |i: usize| NETCON_WORDS[i].load(Ordering::Relaxed);
+    use caprock_net::result_word as rw;
+    let ok = w(rw::STATE) == caprock_net::state::CLOSED
+        && w(rw::RX_BYTES) >= NETCON_MIN_BYTES
+        && w(rw::TX_BYTES) >= NETCON_MIN_BYTES
+        && w(rw::PATTERN_OK) == 1
+        // `polls` is the one number only a RUNNING poll loop can produce. Without it a stack that
+        // constructs itself and dies satisfies a criterion built from counts of things it created.
+        && w(rw::POLLS) > 0;
+    NETCON_OK.store(ok, Ordering::Release);
+    // The phase last — see [`NETCON_PHASE`]. Same discipline as the block's own magic.
+    NETCON_PHASE.store(NETCON_MEASURED, Ordering::Release);
+}
+
 /// Client-Thread der Netz-PD: Positivkontrolle, dann der Fremdversuch.
 #[cfg(feature = "selftest")]
 extern "C" fn net_client(_arg: usize) -> ! {
@@ -4048,6 +4230,21 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
         || CKPT_DONE.load(Ordering::Acquire);
     let blkdev = BLKDEV_OK.load(Ordering::Acquire);
     let part = PART_OK.load(Ordering::Acquire);
+    // **The stack PD's own result — archive-conditional, the same shape as `root` above and for
+    // the reason recorded there.** `test-qemu-x86.sh` boots with NO archive: no start set, no
+    // stack PD, no result block that could ever appear. An unconditional conjunct would make that
+    // suite's completion condition permanently unsatisfiable, every run would fall out of the
+    // watchdog below and print its results anyway, and in the log that reads as "green, but hung".
+    //
+    // The `!archive` is a STRUCTURAL guarantee, not a second opinion about the same fact.
+    // `netcon_measure()` also answers "no client in the manifest" with `true`, but that answer
+    // depends on the measurement having run; this one does not depend on anything. A conjunct
+    // whose satisfiability rests on another measurement is the dependency `DRIVER_OK` cost this
+    // file a round over.
+    //
+    // With an archive it gates fully — including the case that a stack PD IS in the start set and
+    // publishes nothing. That is a finding, not an exemption, and the watchdog names `netcon`.
+    let netcon = !archive || NETCON_OK.load(Ordering::Acquire);
     // ------------------------------------------------------------------------------------------
     // Z25: EAGER-FP + das VEKTOR-INVENTAR
     // ------------------------------------------------------------------------------------------
@@ -4316,6 +4513,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             ("bootckpt", ckpt_seq),
             ("blkdev", blkdev),
             ("dmaiso", DMAISO_OK.load(Ordering::Acquire)),
+            ("netcon", netcon),
             ("part", part),
             ("iface", iface),
             ("pdcolor", pdcolor),
@@ -4461,8 +4659,14 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 ///
 /// 2026-08-17: 41 -> 42 durch `smt` (Z6 Stufe 1), 42 -> 43 durch `numa` (Z8 N1).
+///
+/// 2026-08-27: 43 -> 44 through `netcon` (the stack PD's result block). This number and the array
+/// in `all_done` are two spellings of one fact — the array is `[_; DONE_FLAGS]`, so adding a
+/// conjunct without touching this line does not compile. That is deliberate: a witness list one
+/// entry short of the condition it explains is how three conjuncts once ended up in the report
+/// while gating nothing.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 43;
+const DONE_FLAGS: usize = 44;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]
@@ -5572,6 +5776,116 @@ fn report_and_off(watchdog: bool) -> ! {
                  laeuft. Und dass beim Opfer nichts ankam, prueft der Kernel selbst nach; die \
                  Meldung des Angreifers ist eine Aussage ueber ihn)",
                 if ok { "ALL PASS" } else { "FAILURES" }
+            );
+        }
+    }
+
+    // --- `netcon`: the TCP/IP stack PD's own numbers ------------------------------------------
+    //
+    // **Printed here, decided in `netcon_measure()`** — the verdict stands in `all_done()`, so it
+    // has to exist before the report, not because of it.
+    //
+    // Every number gets its own field. A collected bool would make "sent, and nothing came back"
+    // and "never sent" the same line, and only the first of them points at the stack: the second
+    // points at the driver, the device, or the peer. That is why `tx` and `rx` are separate, why
+    // `frames` are separate from `bytes`, and why the driver's last status and its refusal reason
+    // stand next to each other instead of being folded into one word.
+    {
+        use caprock_net::result_word as rw;
+        let w = |i: usize| NETCON_WORDS[i].load(Ordering::Relaxed);
+        let phase = NETCON_PHASE.load(Ordering::Acquire);
+        if phase == NETCON_NO_CLIENT {
+            println!(
+                "netcon  : SKIP (no network stack in the start set -- no manifest entry names the \
+                 net service, service_id={TEST_NET_SERVICE_ID}, as its provider, so no PD can have \
+                 written a result block. This is 'nobody ran', NOT 'a stack ran and failed'; the \
+                 two point at different files, and zeroed memory decodes as a well-formed result \
+                 saying nothing happened. Whether a SKIP is acceptable is the SUITE's decision -- \
+                 it knows which run was supposed to supply the PD, and the kernel does not. \
+                 The `vnet` line is what the other choice looks like)"
+            );
+        } else if phase == NETCON_AREA_SMALL {
+            println!(
+                "netcon  : FAILURES (the shared area of service {TEST_NET_SERVICE_ID} is shorter \
+                 than the result block the protocol puts at {:#x}. Nothing was read out of it: a \
+                 short area is a kernel-side layout fault, and reading it anyway would hand back \
+                 whatever follows the region as a plausible-looking result. `caprock-net` asserts \
+                 the fit against its OWN copy of the area size; `system::SHARED_BYTES` is private, \
+                 so the two numbers can only meet here, at runtime)",
+                caprock_net::OFF_RESULT
+            );
+        } else if phase != NETCON_MEASURED {
+            // Reached only through the watchdog -- the conjunct is false in this state, so a run
+            // that gets here did not complete. Two different facts, two different sentences.
+            if NETCON_AREA.load(Ordering::Acquire) == 0 {
+                println!(
+                    "netcon  : NO RESULT (a client of the net service is in the start set, but the \
+                     service never got a shared area -- no device was assigned to the driver PD, \
+                     so the stack had nothing to speak through. NOT 'the stack ran and failed': \
+                     see `devsel` and `drv` for who did not get what)"
+                );
+            } else {
+                println!(
+                    "netcon  : NO RESULT (a client of the net service is in the start set and its \
+                     shared area stands at {:#x}, but word {} of the block at {:#x} never carried \
+                     RESULT_MAGIC {:#x}. NOT 'the stack ran and failed' -- the block would decode \
+                     without the magic, and it would decode as a stack that ran and achieved \
+                     nothing. That is what the magic is for, and why the stack writes it last)",
+                    NETCON_AREA.load(Ordering::Acquire),
+                    rw::MAGIC,
+                    caprock_net::OFF_RESULT,
+                    caprock_net::RESULT_MAGIC
+                );
+            }
+        } else {
+            println!(
+                "netcon  : state={} ({}=init {}=listening {}=established {}=closed {}=aborted) \
+                 · rx={} bytes · tx={} bytes · pattern_ok={} · polls={} · frames tx={} rx={} \
+                 · have_mac={}",
+                w(rw::STATE),
+                caprock_net::state::INIT,
+                caprock_net::state::LISTENING,
+                caprock_net::state::ESTABLISHED,
+                caprock_net::state::CLOSED,
+                caprock_net::state::ABORTED,
+                w(rw::RX_BYTES),
+                w(rw::TX_BYTES),
+                w(rw::PATTERN_OK),
+                w(rw::POLLS),
+                w(rw::FRAMES_TX),
+                w(rw::FRAMES_RX),
+                w(rw::HAVE_MAC)
+            );
+            println!(
+                "netcon  : last driver status={} ({}=ok {}=badop {}=toobig {}=nodev {}=empty; \
+                 anything else is a code this kernel does not know, and an unknown status from \
+                 another PD is DATA, not a fault) · refusal reason={} (printed raw: the RSN_* \
+                 vocabulary is defined in the driver PD, programs/hardware/virtio-net/src/main.rs, \
+                 and a second spelling of it here would drift from the only place it is written)",
+                w(rw::LAST_DRIVER_STATUS),
+                caprock_net::ST_OK,
+                caprock_net::ST_BADOP,
+                caprock_net::ST_TOOBIG,
+                caprock_net::ST_NODEV,
+                caprock_net::ST_EMPTY,
+                w(rw::LAST_DRIVER_REASON)
+            );
+            println!(
+                "netcon  : {} (a TCP/IP stack as its OWN PD: no device, no MMIO cap, no DMA cap -- \
+                 it reaches the wire only through the driver PD's channel and the shared area. SIX \
+                 criteria, and not one of them is satisfied by a measurement that stopped working: \
+                 the block carries its magic, state=closed (zeroed memory reads as init), \
+                 rx>={NETCON_MIN_BYTES} bytes, tx>={NETCON_MIN_BYTES} bytes, pattern_ok=1, \
+                 polls>0. \
+                 `polls` is in there because it is the one number only a RUNNING poll loop can \
+                 produce -- a stack that constructs itself and dies raises every count of things \
+                 it created just as nicely. The frame counts, have_mac and the driver's last \
+                 status \
+                 are information, not condition: rx>={NETCON_MIN_BYTES} bytes already implies a \
+                 frame arrived, and a second conjunct saying the same thing adds no \
+                 discrimination. And these are the STACK's numbers about itself -- what crossed \
+                 the link is judged on the host, against the frames)",
+                if NETCON_OK.load(Ordering::Acquire) { "ALL PASS" } else { "FAILURES" }
             );
         }
     }
@@ -6785,6 +7099,10 @@ pub fn run(multiboot_info: u64) -> ! {
             }
             system::reap();
             drv_service_step(archive);
+            // Polls the stack PD's result block until it is published, then settles. **Here and
+            // not in the report**: the verdict stands in `all_done()`, and what the report sets
+            // cannot trigger the report.
+            netcon_measure();
             park_messen(); // laeuft genau einmal; das Urteil steht danach in `all_done()`
             tiefensonde_messen(); // C7b, ebenso einmalig (Sprechprobe des gemessenen Pfades)
             let _ = quiesce_messen(); // Z23 S1, ebenso einmalig

@@ -15,6 +15,7 @@ members = [
     "crates/caprock-virtio",
     "crates/caprock-part",
     "crates/caprock-fat",
+    "crates/caprock-net",
     "crates/caprock-mem",
     "crates/caprock-region",
     "crates/caprock-loader",

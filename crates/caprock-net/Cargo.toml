@@ -1,0 +1,27 @@
+# `caprock-net` — the wire protocol between the network stack and the virtio-net driver.
+#
+# **No dependencies**, and that is the purpose: the driver PD, the stack PD and the kernel-side
+# probe all link this crate, so none of them can hold a private opinion about where a frame starts
+# or what a status word means. It holds the vocabulary and nothing else — no device access, no
+# syscalls, no I/O.
+#
+# `forbid(unsafe_code)` and pure byte arithmetic -> checkable on the HOST, in seconds:
+#   rustc --test --edition 2021 -O crates/caprock-net/src/lib.rs -o /tmp/t && /tmp/t
+[package]
+name = "caprock-net"
+version.workspace = true
+edition.workspace = true
+# **BOUNDARY CRATE: permissive, and that is load-bearing** (docs/grenze.md). Every PD links this --
+# under AGPL every program would be linked with AGPL code and the ABI exception would be moot.
+# The same boundary Linux has its UAPI header exception for.
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+# **Enclosure is the entry ticket** (Z28) -- held by `tools/eingeschlossenheit.py`:
+# `#![forbid(unsafe_code)]` in the root module, no build script, and only dependencies that are
+# themselves enclosed or named explicitly. The mark lives IN THE MANIFEST and not in a list inside
+# the guard, so moving or renaming cannot separate it from the code -- and because `cargo metadata`
+# hands it out verbatim, other tools can read the same promise.
+[package.metadata.caprock]
+einschluss = "streng"

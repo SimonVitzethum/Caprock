@@ -77,12 +77,24 @@ mit_deps() { # $1 = Name, $2 = Crate-Verzeichnis, $3.. = Abhaengigkeiten (Verzei
     rm -rf "$SA"
 }
 
-ZIELE="${*:-mem part fat cycles loader cap virtio dma wait irte irteneg grossdmaneg dmar dmarneg iohealth smt numa bootparams fbtext redirect redirectneg typestate ipctreue}"
+# ONE list, used twice. It was two: the default target set here and a hand-kept copy in the
+# "unknown target" message below. They had already drifted -- `net` was added here and the message
+# still said it was not a known target, so a typo got told the truth about the wrong list. That is
+# the same class as a count a human keeps beside the thing it counts; the fix is the same, derive
+# instead of repeat.
+ALLE_ZIELE="mem part fat net cycles loader cap virtio dma wait irte irteneg grossdmaneg dmar dmarneg iohealth smt numa bootparams fbtext redirect redirectneg typestate ipctreue"
+ZIELE="${*:-$ALLE_ZIELE}"
 for z in $ZIELE; do
     case "$z" in
         mem)  einzeln mem  "$ROOT/crates/caprock-mem/src/lib.rs" ;;
         part) einzeln part "$ROOT/crates/caprock-part/src/lib.rs" ;;
         fat)  einzeln fat  "$ROOT/crates/caprock-fat/src/lib.rs" ;;
+        # `caprock-net` is the WIRE PROTOCOL between the driver PD and the network-stack PD:
+        # slot header, payload bounds, MAC packing. Dependency-free and `forbid(unsafe_code)`, so
+        # it is pure arithmetic over byte slices -- the traps are a length the slot cannot hold and
+        # an endianness two ends must agree on. Both are reachable with LITERALS and need neither a
+        # device nor a machine.
+        net)  einzeln net  "$ROOT/crates/caprock-net/src/lib.rs" ;;
         # `caprock-sched` als Ganzes haengt an `caprock-hal` (arch-Asm) und wird auf dem Host nie
         # bauen. Die Zyklenarithmetik (B-5.1) liegt deshalb abhaengigkeitsfrei in einem eigenen
         # Modul und wird als **Datei** geprueft -- die Fallen dort sind reine u64-Rechnung und
@@ -212,7 +224,7 @@ for z in $ZIELE; do
             else
                 bash "$ROOT/tools/verus-modelltreue-ipc.sh" || fail=1
             fi ;;
-        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio dma wait irte irteneg grossdmaneg dmar dmarneg iohealth smt numa bootparams fbtext redirect redirectneg typestate ipctreue)"; fail=1 ;;
+        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: $ALLE_ZIELE)"; fail=1 ;;
     esac
 done
 

@@ -66,6 +66,7 @@ dependencies = [
  "caprock-loader",
  "caprock-mem",
  "caprock-microkit",
+ "caprock-net",
  "caprock-region",
  "caprock-sched",
  "caprock-slab",
@@ -94,6 +95,10 @@ dependencies = [
  "caprock-slab",
  "caprock-sync",
 ]
+
+[[package]]
+name = "caprock-net"
+version = "0.0.1"
 
 [[package]]
 name = "caprock-part"

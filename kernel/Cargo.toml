@@ -112,6 +112,13 @@ caprock-mem = { path = "../crates/caprock-mem" }
 # Treiber-PD. Abhaengigkeitsfrei und `forbid(unsafe_code)`; der Kernel benutzt daraus nur die
 # Klassifikation -- sie liegt dort, weil sie sich mit Literalen host-pruefen laesst.
 caprock-dma = { path = "../crates/caprock-dma" }
+# The wire protocol of the network path. The kernel-side probe that drives the net driver PD
+# (`net_client`) held its own private copies of the op numbers -- a THIRD spelling beside the
+# driver's and the stack's, pinned by nothing. Two of the three are already tied together by an
+# anchor assert in the driver; this makes it three. The crate is const-only, dependency-free and
+# `forbid(unsafe_code)`: it costs the image nothing and removes a drift that would read as a
+# broken network rather than as a renumbered constant.
+caprock-net = { path = "../crates/caprock-net" }
 caprock-region = { path = "../crates/caprock-region" }
 caprock-loader = { path = "../crates/caprock-loader" }
 caprock-trust = { path = "../crates/caprock-trust" }

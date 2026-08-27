@@ -3509,6 +3509,15 @@ fn drv_service_step(archive: bool) {
 // Messung. Ein Angreifer, der die Adresse raten muesste, bewiese nur, dass Raten schwer ist.
 const OP_NET_SELF: u64 = 1;
 const OP_NET_FOREIGN: u64 = 2;
+// **Three spellings of the same two numbers, and now they are tied together.** The driver PD, the
+// stack PD and this probe each name these ops; `caprock-net` is where they are decided. The values
+// stay literal here because `dmaiso` measures them BY VALUE and a literal is what a reader of this
+// probe expects to see -- the assert is what stops the two from drifting apart silently. Without
+// it a renumbered op would come back as a plausible reply from a different operation, and the
+// report would read `dmaiso : SKIP -- kein Gegenueber, das auf ARP antwortet`: a renamed constant
+// wearing the face of a broken network.
+const _: () = assert!(OP_NET_SELF == caprock_net::OP_SELF);
+const _: () = assert!(OP_NET_FOREIGN == caprock_net::OP_FOREIGN);
 /// `program_id` der Netz-PD im Manifest der Lade-Suite (s. `TEST_BLK_SERVICE_ID`).
 const TEST_NET_SERVICE_ID: u32 = 5;
 /// Ergebnisse: `[features_ok, tx_used, rx_used, arp_reply]` je Anfrage.

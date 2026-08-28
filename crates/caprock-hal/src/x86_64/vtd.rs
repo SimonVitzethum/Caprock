@@ -1188,6 +1188,63 @@ pub fn irte_vergib(
     super::irte::vergib(&mut hw, &mut a, aktiv, &w)
 }
 
+/// **Einen Eintrag ZURUECKLESEN** — `(lo, hi)` roh, so wie er in der Tabelle steht.
+///
+/// Fuer den Pruefer, und die Betonung liegt auf *zurueck*: *ein Pruefer, der die gepruefte Groesse
+/// NACHRECHNET statt sie zu lesen, prueft eine zweite Wirklichkeit* (`iova_window_clear_of_msi`).
+/// Wer belegen will, dass `SVT/SID` gesetzt ist, muss die Bytes lesen, die die Einheit liest — die
+/// Kodierungsfunktion noch einmal aufzurufen belegte nur, dass sie deterministisch ist.
+///
+/// `None` = es gibt gar keine Tabelle (Remapping nicht scharf). Das ist von „Eintrag steht auf
+/// nicht vorhanden" zu unterscheiden, und deshalb ein `Option` und kein Nullpaar.
+pub fn irte_lesen(index: u16) -> Option<(u64, u64)> {
+    let tabelle = IRT[0].load(Ordering::Acquire);
+    if tabelle == 0 {
+        return None;
+    }
+    use super::irte::IrtZugriff;
+    Some(IrtHardware { tabelle }.lies(index))
+}
+
+/// **Was in einem Eintrag WIRKLICH steht** — das Ergebnis von [`irte_lesen`], entschluesselt.
+///
+/// Die Entschluesselung liegt hier und nicht beim Aufrufer: die Bitlage steht in `irte_build`, und
+/// ein Pruefer, der sie ein zweites Mal hinschreibt, prueft seine eigene Kopie. Wandert ein Feld,
+/// wandert diese Funktion mit — der Kernel sieht Konjunkte, keine Schiebeoperationen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct IrteBefund {
+    /// Gibt es ueberhaupt eine Tabelle? (`false` = Remapping nicht scharf — nicht dasselbe wie
+    /// „Eintrag nicht vorhanden", und der Unterschied ist die halbe Diagnose.)
+    pub tabelle_da: bool,
+    /// `P` — der Eintrag ist vorhanden.
+    pub praesent: bool,
+    /// Der eingetragene CPU-Vektor ist der erwartete.
+    pub vektor_passt: bool,
+    /// `SVT == 01` — **die Sicherheitsaussage**: die Einheit prueft die Quelle ueberhaupt.
+    pub svt_gesetzt: bool,
+    /// Die eingetragene `SID` ist die dieses Geraets — sie prueft die **richtige** Quelle.
+    pub sid_passt: bool,
+}
+
+/// **Einen Eintrag gegen die Erwartung pruefen** — gelesen, nicht nachgerechnet.
+///
+/// `rid` ist die Requester-ID des Geraets; die `SID` wird daraus **mit derselben Regel** abgeleitet
+/// wie in [`irte_vergib`] (untere 16 Bit). Das ist Absicht und nicht der `iova_window_clear_of_msi`
+/// -Fehler: Zuteiler und Pruefer brauchen EINE Quelle fuer die Ableitung — was der Pruefer
+/// unabhaengig beibringt, ist der **Tabelleninhalt**, und der ist die Groesse, um die es geht.
+pub fn irte_pruefen(index: u16, erwarteter_vektor: u8, rid: u32) -> IrteBefund {
+    let Some((lo, hi)) = irte_lesen(index) else {
+        return IrteBefund::default();
+    };
+    IrteBefund {
+        tabelle_da: true,
+        praesent: lo & 1 == 1,
+        vektor_passt: ((lo >> 16) & 0xFF) as u8 == erwarteter_vektor,
+        svt_gesetzt: (hi >> 18) & 0b11 == super::irte::SVT_SID,
+        sid_passt: hi & 0xFFFF == (rid & 0xFFFF) as u64,
+    }
+}
+
 /// Einen vergebenen Block wieder einziehen (Teardown, Hot-Reload).
 pub fn irte_zieh_ein(ziel: &super::irte::MsiZiel) -> Result<(), super::irte::VergabeFehler> {
     let tabelle = IRT[0].load(Ordering::Acquire);
@@ -1217,6 +1274,17 @@ pub fn irte_belegung() -> (usize, usize, usize) {
 /// Der Bericht — der Typ liegt bei der Logik.
 #[cfg(feature = "selftest")]
 pub use super::irte::VergabeBericht as IrteVergabeBericht;
+/// Die Vektorform, die [`irte_vergib`] als Argument nimmt — **hier weitergereicht, damit der
+/// Kernel mit der IOMMU-Fassade spricht und nicht mit dem Kodierungsmodul.** `irte` ist am
+/// Crate-Kopf nicht exportiert, und das soll so bleiben: wer die Kodierung braucht, arbeitet an
+/// der HAL, nicht am Kernel.
+pub use super::irte::Vektorform;
+/// Das Ticket, das [`irte_vergib`] zurueckgibt und [`irte_zieh_ein`] als einziges annimmt —
+/// **aus demselben Grund hier weitergereicht wie [`Vektorform`]**: wer die Vergabe zuruecknehmen
+/// koennen will, muss das Ticket AUFBEWAHREN, und dazu muss er seinen Typ nennen koennen. Nur den
+/// Handle zu behalten liesse den Eintrag praesent stehen, ohne dass ihn noch jemand einziehen
+/// kann -- genau das, wogegen das `#[must_use]` am Typ steht.
+pub use super::irte::MsiZiel;
 
 /// **Der Selbsttest der IRTE-Vergabe** — laeuft in [`init`], unmittelbar nachdem Interrupt
 /// Remapping aufgesetzt ist.

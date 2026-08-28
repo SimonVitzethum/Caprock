@@ -622,6 +622,7 @@ mod treue {
     use crate::caprock_sched::{owner_core, setze_kern, SchedOps, ThreadId};
     use crate::{Endpoint, QUEUE_CAP};
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicU64, Ordering as AtomOrd};
 
     /// Ein Wert, den weder ABI noch Code je schreiben. Steht er nach der Operation noch im
     /// Ergebnisregister, hat sie dem Aufrufer KEINEN Code gegeben -- sie hat ihn also nicht
@@ -657,6 +658,21 @@ mod treue {
         nachher: modell::Endpoint,
         code: u64,
     }
+
+    /// **Das Badge dieses Absenders.** Je Faden verschieden und von Null verschieden -- ein
+    /// konstantes Badge liesse „richtig zugestellt" von „irgendein Wert steht da" nicht
+    /// unterscheiden, und `0` ist genau der Wert, den der Pfad vor dem Umbau geschrieben hat.
+    fn badge_von(t: u64) -> u64 {
+        0xBADE_0000_0000_0000 | (t + 1)
+    }
+
+    /// **Die Badge-Bilanz ist LAUFWEIT, nicht je `Welt`.** Jeder Fall baut sich seine eigene Welt;
+    /// eine Bilanz je Welt waere eine Stichprobe der Groesse eines Falles, und die Frage lautet,
+    /// ob der Wert auf JEDEM zugestellten Weg stimmt. Gezaehlt wird bei der ZUSTELLUNG -- „ich
+    /// habe ein Badge uebergeben" ist eine Absicht, „im Frame des Empfaengers steht das Badge
+    /// SEINES Absenders" ist die Wirkung.
+    pub static BADGE_GEPRUEFT: AtomicU64 = AtomicU64::new(0);
+    pub static BADGE_FALSCH: AtomicU64 = AtomicU64::new(0);
 
     /// Die Welt um den Endpoint: Faeden mit Frames und Heimatkernen, dazu die **effektbasierte**
     /// Buchhaltung ueber angekommene Nachrichten und ueber gestrandete Faeden.
@@ -785,6 +801,13 @@ mod treue {
                 if let Some(absender) = self.offen.get(&m).copied() {
                     if absender != tid && self.angekommen.insert(m) {
                         self.zugestellt += 1;
+                        // Das Badge gehoert dem ABSENDER, nicht der Nachricht: geprueft wird
+                        // deshalb gegen den Faden, dessen Wort hier angekommen ist -- „ein Badge
+                        // war da" waere von „das richtige Badge war da" nicht zu unterscheiden.
+                        BADGE_GEPRUEFT.fetch_add(1, AtomOrd::Relaxed);
+                        if frame_reg(f, reg::EP_BADGE) != badge_von(absender) {
+                            BADGE_FALSCH.fetch_add(1, AtomOrd::Relaxed);
+                        }
                     }
                 }
             }
@@ -816,6 +839,8 @@ mod treue {
             &self.gestrandete
         }
 
+
+
         /// Ein echter `call` -- mit dem Modellschritt, den er unter `alpha` bewirken muss.
         pub fn tue_call(&mut self, ep: &mut Endpoint, c: ThreadId, kern: usize) -> Schritt {
             let msg = self.naechste_msg;
@@ -828,7 +853,7 @@ mod treue {
             self.offen.insert(msg, c.to_raw());
             self.laufend.insert(kern, c);
             let b0 = self.blockiert.len();
-            ep.call(&mut *self, kern, f);
+            ep.call(&mut *self, kern, f, badge_von(c.to_raw()));
             let blockiert = self.blockiert[b0..].contains(&c.to_raw());
             let code = modellcode(frame_reg(f, reg::SYSNO_RESULT));
             // **Abgewiesen heisst: Code 3 UND nicht blockiert.** Beide Haelften gehoeren dazu --
@@ -1656,6 +1681,27 @@ mod treue {
                     caller_vorher.is_some() && ep_s.caller() == caller_vorher);
         }
 
+        // -- Das Badge: die Sprechprobe des Wertes, den seit 2026-08-25 jeder CALL traegt -------
+        //
+        // `Endpoint::call` nahm bis dahin kein Badge, und der Empfaenger bekam an dieser Stelle
+        // hart eine `0`. Seit der Mehrfachdelegation steht dort der Wert der benutzten Cap -- und
+        // bis zu dieser Probe hat ihn NIEMAND nachgelesen. Gezaehlt wird ueber ALLE Faelle dieses
+        // Laufs, denn ueber jeden von ihnen laeuft die Zustellung.
+        //
+        // Die zweite Haelfte ist die wichtigere: **null geprueft ist ein Befund.** Ohne sie waere
+        // „keine falsche Zustellung" auch dann wahr, wenn gar nichts zugestellt wurde -- dieselbe
+        // Form wie die leere Ereigniswarteschlange ohne `CD.R`.
+        {
+            let geprueft = BADGE_GEPRUEFT.load(AtomOrd::Relaxed);
+            let falsch = BADGE_FALSCH.load(AtomOrd::Relaxed);
+            b.probe("Badge: in JEDEM zugestellten Frame steht das Badge SEINES Absenders \
+                     (nicht bloss irgendein Wert, und nicht die alte harte 0)",
+                    falsch == 0);
+            b.probe("Badge-Sprechprobe: es wurde ueberhaupt zugestellt -- eine Bilanz ohne \
+                     Zustellung koennte gar nicht falsch werden",
+                    geprueft > 0);
+        }
+
         println!("-- {} Faelle geprueft, {} Abweichung(en) --", b.n, b.fehler);
         if b.fehler > 0 {
             1
@@ -1885,12 +1931,29 @@ PY
     erwarte kracht "Code: enqueue LUEGT beim Ueberlauf (meldet Erfolg, ohne einzureihen) -- die \
 Wurzel aller vier Faelle"
 
-    mutieren code 's = s.replace("    pub fn call(&mut self, ops: &mut dyn SchedOps",
-                                 "    pub fn call_umbenannt(&mut self, ops: &mut dyn SchedOps", 1)'
+    # Der Anker ist seit 2026-08-25 die ZEILE, nicht die volle Signatur: `call` nimmt seither ein
+    # Badge und steht mehrzeilig. Ein Anker, der die Formatierung mitliest, prueft den Stil.
+    mutieren code 's = s.replace("\n    pub fn call(\n",
+                                 "\n    pub fn call_umbenannt(\n", 1)'
     erwarte kracht "Code: die Methode call gibt es nicht mehr (der Waechter liest nicht ins Leere)"
 
     mutieren code 's = s.replace("    senders: TidQueue,", "    sender_schlange: TidQueue,", 1)'
     erwarte kracht "Code: das Feld senders heisst anders (die Abbildung haengt daran)"
+
+    # -- Die Positivkontrollen zur Badge-Probe ----------------------------------------------------
+    #
+    # Ohne sie waere „falsch == 0" eine Zeile, von der niemand weiss, ob sie fallen KANN. Beide
+    # stellen genau den Zustand von vor dem 2026-08-25 wieder her: der Empfaenger bekam eine harte
+    # `0`. Je Zustellweg eine -- das Rendezvous (ein wartender Empfaenger nimmt den Ruf sofort) und
+    # der Weg ueber die Warteschlange (RECV holt einen bereits eingereihten Sender) sind ZWEI
+    # Stellen, und eine Mutation, die nur eine trifft, belegt nur eine.
+    mutieren code 's = s.replace("            frame_set_reg(sframe, reg::EP_BADGE, badge);",
+                                 "            frame_set_reg(sframe, reg::EP_BADGE, 0);", 1)'
+    erwarte kracht "Code: das Badge beim Rendezvous ist wieder hart 0"
+
+    mutieren code 's = s.replace("            frame_set_reg(frame, reg::EP_BADGE, frame_reg(cframe, reg::EP_BADGE));",
+                                 "            frame_set_reg(frame, reg::EP_BADGE, 0);", 1)'
+    erwarte kracht "Code: das Badge aus der Warteschlange ist wieder hart 0"
 
     # -- Mutationen am ECHTEN Code: die Kapazitaetsschranke ---------------------------------------
     mutieren code 's = s.replace("pub const QUEUE_CAP: usize = 32;", "pub const QUEUE_CAP: usize = 16;", 1)'

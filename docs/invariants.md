@@ -195,6 +195,113 @@ Wertebereichs liegen soll, wird aus dem Typ abgeleitet, nicht hingeschrieben** �
 
 ---
 
+## 1d. The group cut: a relation with both ends inside the cut is not an open relation (2026-08-21)
+
+> **A process freeze is possible exactly where a thread freeze is not — and the reason is a change
+> of question, not a change of mechanism.**
+
+### The rule
+
+`freeze_thread` refuses a thread that holds *any* open IPC relation, because freezing it would
+strand a partner. `freeze_pd` asks the narrower question: **does the relation cross the boundary of
+the cut?** Two threads of the same PD that call each other are both refused individually and both
+frozen together — the reply token stays untouched inside the frozen set, and after the thaw the
+transaction continues as if nothing had happened.
+
+Without that distinction a process freeze is not merely unimplemented but **structurally
+impossible**: for a mutually calling pair `freeze_thread` answers `Busy` for both, and no ordering
+resolves it.
+
+### The two gates, and why there are two
+
+| gate | where it sits | what it stops |
+|---|---|---|
+| **subject gate** (S1) — `Pd::quiescing` | the PD | what the PD *starts*: `CALL`/`RECV` → `ERR_QUIESCING`, `REPLY` stays allowed |
+| **object gate** (S1b) — `Endpoint::begin_quiesce` | an endpoint **the frozen PD serves alone** | what *others* start towards it |
+
+The subject gate makes the set of open transactions **shrink-only** — without it every quiescence
+answer is stale the moment it returns.
+
+**The object gate is set only where the frozen PD is the sole receiver.** A bolt on a shared
+endpoint would freeze in third parties who have nothing to do with the freeze; and where a foreign
+server also serves, foreign callers keep being served, so no bolt is needed. This is the decision
+S1b left open, taken with its cost stated: **a client calling into a frozen PD's exclusive channel
+gets `ERR_QUIESCING` and must retry.** The two rejected alternatives were bounded queueing (nobody
+pays for the buffer, and the overflow is another D11 case) and unbounded blocking (honest for a
+PaaS, but it hands the deadlock to an uninvolved third party).
+
+### What the cut must undo, and in which order
+
+Thawing is **not** the inverse read backwards. Receivers are re-enqueued **before** any channel
+re-opens: the other way round a caller could hit the channel while the server is not yet in the
+queue and land in the sender queue instead of being served.
+
+### The freeze is its own block reason
+
+`BlockReasons::FREEZE` (bit 7, the eighth instance) and **not** `PAUSE`, although `PAUSE`'s own doc
+named the group cut as a future user. With `PAUSE` a single `SYS_PDCTL RESUME` on one member would
+lift one participant out of the set: the PD would be **half** frozen, its open transactions growing
+again, and every checker would report order — the D11 form. Measured by the conjunct
+`resume-wirkt-nicht` in the `pdfreeze` line, and by counter-proof M1.
+
+### Named refusals, all of them fail-closed
+
+`HasDma` (S5, first version: a PD holding a DMA capability is not frozen at all — its device keeps
+writing, so the promise would not hold), `TooManyThreads`, `MultiReceiver`, `SenderQueued`,
+`Debugged`, `AlreadyQuiescing`, `Empty`, and `Deadline { tid, partner }`. **Every outcome other than
+`Frozen` leaves the state it found** — gates open, receivers enqueued, no reason bit set.
+
+`SenderQueued` is a speaking probe, not information: the load-bearing invariant is *where a receiver
+waits, the sender queue is empty* (they meet immediately). The cut asks instead of believing; if the
+invariant ever fails it must **show**, not be built upon.
+
+### 1d.1 Time does not pause — the duration is reported instead (2026-08-21)
+
+> **A thawed thread sees the clock jump. The kernel does not hide that; it reports how long the PD
+> stood, to whoever holds the freeze authority.**
+
+The obvious alternative — a per-PD clock that pauses with the freeze — is **rejected**, for three
+reasons, and the third one alone settles it:
+
+1. It would be a **second memory for one fact**. MCS budgets, periods and cycle stamps all run on
+   the global clock; a second clock beside it will diverge.
+2. A timestamp received by IPC from a PD that was *not* frozen would then lie in the future of the
+   receiver's own clock. „The clock jumps" becomes „foreign timestamps are unusable" — a worse
+   trade.
+3. **EL0 reads the clock directly** (`rdtsc` / `CNTVCT_EL0`). A kernel clock that pauses would not
+   cover the hardware clock the thread actually reads — the kernel cannot keep that promise at all.
+
+`thaw_pd` therefore returns `Thawed { threads, ticks }`. The duration goes to the holder of the
+freeze authority, the same rule as the partner name in `Freeze::BusyOn`.
+
+**Named gap, and it is not a side effect:** the frozen PD itself cannot learn the duration — that
+needs a self-query syscall. A thread that computed a deadline from `rdtsc` before the freeze
+therefore **cannot correct it**.
+
+### 1d.2 An image carrying register state is confidential (2026-08-21)
+
+> **Image contains register state ⇒ confidential. The storage and transport rule stands before the
+> migration code is written, not implicitly inside it.**
+
+An `Image` with `progress` and capability classes was a **metadatum**. One with registers, stack and
+memory contents is a **data carrier** — key material, and after the eager-FP conversion expressly
+**including the XMM registers**, i.e. exactly the material for whose sake eager was chosen. Under
+migration the image **leaves the machine**; who may read it, where it rests, whether it is encrypted
+at rest, is the same kind of decision as `SVT`/`SID` on the IRTE: authority, to be specified up
+front.
+
+Machine-readable in `checkpoint::image_is_confidential`; a rule in prose has no gate. Measured
+consequence: **every complete image is confidential** — there is no migration case in which the rule
+lapses (`die_volle_liste_ist_vertraulich`).
+
+The rest of S4 is the existing rule one level down: *what cannot denote the same thing over there
+does not travel, and is refused **by name*** — `classify_thread_part` alongside `classify`, with
+`LocalReason::MachineLocalNumber` as its own reason. A core affinity is not a device window: the
+window is **not constructible** over there, the affinity **arises anew** over there. Same code for
+both would send someone looking for a device where an assignment is missing.
+
+---
+
 ## 2. DMA-Revoke-Reihenfolge (DMA-use-after-free-Sicherheit)
 
 Eine DMA-Region wird **immer** in dieser Reihenfolge abgebaut (`revoke_dma` + `vspace_teardown`):
@@ -739,6 +846,13 @@ Details + Herleitung: `docs/phase-reports/ext-30-migration-und-kapazitaet.md`.
   aus einer Ready-Queue") verböte auch die Migration IPC-wartender Threads und änderte den
   Lastausgleich in einer Weise, die hier niemand gemessen hat. D8 ist der Beleg, dass die breitere
   Behebung die schlechtere sein kann.
+- **Ein Thread im Gruppenschnitt** (`BlockReasons::FREEZE`, Z23/S3, 2026-08-21). Derselbe
+  Mechanismus, dieselbe Stelle — aber die Folge ist schärfer. `freeze_pd` läuft die TCB-Tabelle
+  ebenfalls **je Kern** und prüft danach, ob noch ein Teilnehmer auf einem Kern steht. Ein
+  Teilnehmer, der während des Durchlaufs von einem besuchten auf einen unbesuchten Kern wandert,
+  wird von keinem der beiden gesehen: die Gruppe wäre **halb** eingefroren — und genau die Aussage
+  des Schnitts ist, dass es diesen Zustand nicht gibt (§1d). Bei `DEBUG` bliebe ein Thread liegen;
+  hier bricht eine Zusicherung über eine **Menge**.
 - **Push statt Pull:** die Migration läuft immer auf dem **abgebenden** Kern, weil nur er den
   Lazy-FP-Kontext des Migranten aus seinen eigenen FP-Registern sichern kann.
 - **Kein Thread-Verlust:** scheitert die Aufnahme (Zielkern voll), wird der Migrant beim

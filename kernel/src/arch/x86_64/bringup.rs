@@ -29,7 +29,9 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 const RAM_END_FALLBACK: u64 = 128 * 1024 * 1024;
 
 /// Zeitscheibe (Hz) — wie auf aarch64.
-const TICK_HZ: u64 = 100;
+// **Eine Zahl, eine Stelle** (2026-08-27): die Tick-Rate steht in `main.rs` und wird hier nur noch
+// benutzt. Vorher stand dieselbe 100 zweimal im Baum -- todo D16.
+use crate::TICK_HZ;
 
 // --- Telemetrie der Demo-Threads ------------------------------------------------------------
 
@@ -1180,6 +1182,19 @@ const CDELETE_GONE_BADGE: u64 = 1 << 33;
 /// A-3.1: ein Cap mit abgeleiteten Kopien wird abgewiesen und bleibt benutzbar.
 #[cfg(feature = "selftest")]
 const CDELETE_CHILDREN_BADGE: u64 = 1 << 34;
+/// C2: ein DMA-Pool ueber `DRIVER_DMA_MAX_PAGES` wurde aus Ring 3 mit EIGENEM Code abgewiesen
+/// (`programs/trusted/init`, `POOL_REFUSED_BADGE`).
+#[cfg(feature = "selftest")]
+const POOL_REFUSED_BADGE: u64 = 1 << 35;
+/// B3: `BIND_IRQ` **ohne** `Irq`-Cap wurde aus Ring 3 mit `ERR_BADCAP` abgewiesen
+/// (`programs/trusted/init`, `IRQ_UNAUTHORIZED_BADGE`).
+///
+/// Die Zahl steht hier ein zweites Mal, weil Kernel und `init` getrennt gebaut werden und kein
+/// gemeinsames Modul haben — dieselbe Lage wie bei den vier Badges darueber. Wer sie verschiebt,
+/// verschiebt sie an **beiden** Stellen; laeuft es auseinander, meldet die Zeile
+/// `bind-ohne-cap-abgewiesen=false` bei korrekt gefahrener Absage.
+#[cfg(feature = "selftest")]
+const IRQ_UNAUTHORIZED_BADGE: u64 = 1 << 36;
 
 /// A-4.4: hat die Versionssperre die geaenderte Schnittstellenversion abgewiesen?
 #[cfg(feature = "selftest")]
@@ -1200,7 +1215,18 @@ static VBLK_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool:
 /// A-5.2, virtio-blk Teil 1: kam der Sektor an, solange die IOMMU noch nicht sperrte?
 static VBLK_READ_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 /// A-5.2: virtio-net (ARP-Anfrage raus, ARP-Antwort rein).
-static VNET_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// **Der Ausgang der `vnet`-Sonde -- dreiwertig** (2026-08-25, s. `crate::befund`).
+///
+/// Vorher ein `AtomicBool`, und der SKIP-Zweig setzte ihn auf `true`. Ein `AtomicU8` statt eines
+/// `Atomic<Befund>`, weil `Befund` kein `AtomicX`-Typ ist; die drei Werte stehen als Konstanten
+/// daneben und `vnet_befund()` uebersetzt zurueck -- die Umwandlung an EINER Stelle.
+static VNET_BEFUND: crate::befund::AtomicBefund = crate::befund::AtomicBefund::neu();
+
+/// Der Ausgang der `vnet`-Sonde.
+#[cfg(feature = "selftest")]
+fn vnet_befund() -> crate::befund::Befund {
+    VNET_BEFUND.lesen()
+}
 /// A-5.1: hat eine geladene Treiber-PD ihr Geraet bedient?
 /// **Welchen Dienst der KERNEL-Testclient anspricht** (A-5.4) — die `program_id` des Blockdienstes
 /// aus dem Manifest der Lade-Suite.
@@ -1214,6 +1240,12 @@ static VNET_OK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool:
 /// Der Kernel-**Lader** kennt diese Zahl nicht; sie steht in einem Testpfad, nicht in
 /// `loader::reload_driver`.
 const TEST_BLK_SERVICE_ID: u32 = 3;
+/// **Der geraetelose Dienst der Lade-Suite** (2026-08-25): `hello` traegt seit heute
+/// `POLICY_PROVIDES_SERVICE`. Bewusst ein Programm mit KLEINEREM Index als sein Client -- `init`
+/// laedt die Startmenge in Index-Ordnung, und ein Client vor seinem Dienst kann ihn nicht finden.
+const DIENST_PROG_ID: u32 = 2;
+/// Sein Client: `wasmhost` nennt `service_id = 2`.
+const DIENST_CLIENT_PROG_ID: u32 = 6;
 /// Die Treiber-PD, deren Zuteilung der Test misst — dieselbe Komponente.
 const TEST_BLK_PROGRAM_ID: u32 = 3;
 /// `program_id` der **Dateisystem**-PD im Manifest der Lade-Suite.
@@ -2042,11 +2074,13 @@ const SWEEP_KMAX: [u32; SWEEP_PFADE] = [12, 12, 4, 6, 4, 6, 3, 24];
 //     3293/4171 Farbstreifen · 4516 PD-Slot. Die Sperre sitzt im SPEICHER-Allokator; diese Toepfe
 //     vergeben keine Bytes. Sie zu leeren heisst tausende Threads/PDs anzulegen -- das ist die
 //     Kapazitaetskurve, und die kippt jede baseline-empfindliche Zeile vor ihr.
-//  4. **DER ALLOKATOR WURDE NICHT GEFRAGT** (3): 2998/4317/4380 `MANGEL_MAPPING_ABGEWIESEN`.
-//     Sie melden genau den Fall „es lag NICHT am Speicher" (krumme VA/PA, ausserhalb des
-//     Fensters) -- eine Sperre im Allokator kann sie strukturell nicht ausloesen. Erreichbar sind
-//     sie ueber ein Image mit krummer Segment-VA; genau so ist der `wasm`-Ladefehler vom
-//     2026-08-10 entstanden, sie sind also keine tote Gegend.
+//  4. **DER ALLOKATOR WURDE NICHT GEFRAGT** (4): 2998/4317/4380 `MANGEL_MAPPING_ABGEWIESEN`
+//     und `MANGEL_ENDOWMENT`. Sie melden genau den Fall „es lag NICHT am Speicher" (krumme
+//     VA/PA, ausserhalb des Fensters; bzw. eine Zusage des Manifests, die die Domaenenpolitik
+//     oder das Cap-Budget nicht traegt) -- eine Sperre im Allokator kann sie strukturell nicht
+//     ausloesen. Erreichbar sind sie ueber ein Image mit krummer Segment-VA (genau so ist der
+//     `wasm`-Ladefehler vom 2026-08-10 entstanden) bzw. ueber ein Manifest, das mehr Caps
+//     zusagt, als `CAP_BUDGET_PER_PD` traegt. Keine tote Gegend.
 //  5. **KEIN ALLOKATOR-TOPF, sondern ein fester Vorrat** (1): 139 `MANGEL_GUARD_TABELLE`. Der
 //     Vorrat aufgeteilter Seitentabellen liegt in der HAL, die keinen Allokator hat.
 //  6. **STRUKTURELL NICHT AUSLOESBAR** (2), und das ist ein Befund ueber die Stellen selbst:
@@ -2063,7 +2097,7 @@ const SWEEP_K2_PROVOZIERT_MIT_ARCHIV: usize = 4;
 #[cfg(feature = "selftest")]
 const SWEEP_K3_PLATZ: usize = 10;
 #[cfg(feature = "selftest")]
-const SWEEP_K4_NICHT_GEFRAGT: usize = 3;
+const SWEEP_K4_NICHT_GEFRAGT: usize = 4;
 #[cfg(feature = "selftest")]
 const SWEEP_K5_HAL_VORRAT: usize = 1;
 #[cfg(feature = "selftest")]
@@ -2728,7 +2762,8 @@ fn ckpt_bericht() {
     println!(
         "bootckpt: Verweigerung: die Treiber-PD ist NICHT speicherbar -- Slot {rslot}, Grund \
          {rgrund} (1=Geraetefenster 2=Interrupt 3=DMA-Region 4=offene Antwort 5=Partner nicht im \
-         Umfang 6=fremder Thread 7=fremde PD 8=Loader-Quelle; 0=nichts sprach dagegen, also \
+         Umfang 6=fremder Thread 7=fremde PD 8=Loader-Quelle; 20/21=Schnittkante, s. \
+         ckpt_cut_reason; 0=nichts sprach dagegen, also \
          NICHTS gemessen). Ihr Kanal liegt IM Umfang -- was uebrigbleibt, ist Geraete-Autoritaet, \
          und die laesst sich durch keinen groesseren Umfang beheben"
     );
@@ -2758,11 +2793,13 @@ fn ckpt_bericht() {
             println!(
                 "bootckpt: gespeichert Sektor={CKPT_SECTOR} Fortschritt={sp} Nonce={snonce:#018x} \
                  Epoche={sepoche} Caps={caps} Vorbedingung={pre} Bytes={} Lesen={} Schreiben={} \
-                 Flush={} eingefroren={} Zuwachs-erreicht={} Zaehler-jetzt={jetzt}",
+                 Flush={} eingefroren={} Zuwachs-erreicht={} Zaehler-jetzt={jetzt} \
+                 Schnittkanten={}",
                 CKPT_BYTES.load(Ordering::Acquire),
                 io(0), io(1), io(2),
                 CKPT_FROZEN.load(Ordering::Acquire) as u8,
-                CKPT_DELTA_OK.load(Ordering::Acquire) as u8
+                CKPT_DELTA_OK.load(Ordering::Acquire) as u8,
+                CKPT_CUT_EDGES.load(Ordering::Acquire)
             );
             io(0) == 0 && sepoche == 1 && speichern_ok()
         }
@@ -2776,11 +2813,13 @@ fn ckpt_bericht() {
             println!(
                 "bootckpt: gespeichert Sektor={CKPT_SECTOR} Fortschritt={sp} Nonce={snonce:#018x} \
                  Epoche={sepoche} Caps={caps} Vorbedingung={pre} Bytes={} Lesen={} Schreiben={} \
-                 Flush={} eingefroren={} Zuwachs-erreicht={} Zaehler-jetzt={jetzt}",
+                 Flush={} eingefroren={} Zuwachs-erreicht={} Zaehler-jetzt={jetzt} \
+                 Schnittkanten={}",
                 CKPT_BYTES.load(Ordering::Acquire),
                 io(0), io(1), io(2),
                 CKPT_FROZEN.load(Ordering::Acquire) as u8,
-                CKPT_DELTA_OK.load(Ordering::Acquire) as u8
+                CKPT_DELTA_OK.load(Ordering::Acquire) as u8,
+                CKPT_CUT_EDGES.load(Ordering::Acquire)
             );
             io(0) == 0
                 && p > 0
@@ -2842,6 +2881,402 @@ fn ckpt_bericht() {
 ///    aus dem Autoritaetsdokument gegen die tatsaechlich vergebene Instanz.
 /// 3. **Das nicht gewaehlte Geraet ist noch frei.** Erst das macht aus „es passte" ein „es wurde
 ///    ausgewaehlt": es belegt, dass eine Alternative dastand und liegen blieb.
+/// **C2: die DMA-Pools sind ein Argument des Ladens** — der Bericht.
+///
+/// Vier Aussagen, und keine davon ist „ein Pool ist da":
+///
+/// * **`eingeloest`** — jede Zuteilung hat genau bekommen, was der Ladeaufruf angefordert hat
+///   (oder die Vorgabe bei `0`). Das trennt „so gewollt" von „stillschweigend gekuerzt", und die
+///   Kuerzung ist der Fehler, um den es geht: eine halbierte DMA-Region ist ein Geraet, das ueber
+///   ihr Ende hinausschreibt.
+/// * **`verschieden`** — mindestens zwei Zuteilungen haben verschiedene Groessen. Ohne das waere
+///   „eingeloest" auch dann wahr, wenn alle die Vorgabe bekommen und der Parameter nie gelesen
+///   wird.
+/// * **`disjunkt`** — die IOVA-Fenster ueberschneiden sich paarweise nicht. A-5.4 ist bei EINER
+///   Groesse gemessen worden; bei geaenderten Groessen gilt es nicht weiter, sondern wird neu
+///   gefahren.
+/// * **`zu-gross-abgewiesen`** — der Ring-3-Negativfall aus `init`. Ohne ihn waere die Obergrenze
+///   eine Zahl, von der niemand weiss, ob sie beisst.
+#[cfg(feature = "selftest")]
+fn dmapool_bericht() {
+    let mut p = [(0u32, 0u32, 0u64, 0u64); system::MAX_OFFERED_DEVICES];
+    let n = system::driver_dma_pools(&mut p);
+    if n < 2 {
+        println!(
+            "dmapool : SKIP ({n} Zuteilung(en) -- unter zweien gibt es keine zwei Groessen zu \
+             vergleichen und keine zwei Fenster, die disjunkt sein koennten)"
+        );
+        DMAPOOL_BEFUND.uebersprungen();
+        return;
+    }
+    let vorgabe = system::driver_dma_default_bytes();
+    let mut eingeloest = true;
+    let mut verschieden = false;
+    let mut disjunkt = true;
+    for i in 0..n {
+        let (pid, gewuenscht, gewaehrt, iova) = p[i];
+        let soll = if gewuenscht == 0 {
+            vorgabe
+        } else {
+            gewuenscht as u64 * 4096
+        };
+        if gewaehrt != soll {
+            eingeloest = false;
+        }
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            if p[i].2 != p[j].2 {
+                verschieden = true;
+            }
+            // Fenster: [iova, iova+len). Ueberschneidung ist der Fehler, den A-5.4 auf der
+            // Adressachse ausschliesst -- bei geaenderten Groessen neu zu pruefen und nicht als
+            // weitergeltend anzunehmen.
+            let (a0, a1) = (iova, iova.saturating_add(gewaehrt));
+            let (b0, b1) = (p[j].3, p[j].3.saturating_add(p[j].2));
+            if a0 < b1 && b0 < a1 {
+                disjunkt = false;
+            }
+        }
+        println!(
+            "dmapool : Eintrag {pid} wuenschte {gewuenscht} Seiten, bekam {gewaehrt} B bei IOVA {iova:#x}"
+        );
+    }
+    let abgewiesen = root_badge() & POOL_REFUSED_BADGE != 0;
+    // **Eine Zahl mit ERWARTUNG, und die Erwartung ist eine SCHULD** (2026-08-26).
+    //
+    // Erst stand hier `audit == 0` -- rot aus einem Grund, der mit C2 nichts zu tun hat. Dann
+    // stand die Zahl nur im Text -- und eine Zahl, deren erwarteter Wert 2 ist, wird nicht
+    // geprueft: wuerde sie aus einem ECHTEN Grund 3, feuerte nichts. Beide Fassungen waren falsch.
+    //
+    // Jetzt ist die Gleichheit das Konjunkt. `2` ist dabei **kein Freibrief**: `for_each_dma`
+    // laeuft objekt- und nicht cap-granular, ausdruecklich damit Kopien nicht doppelt zaehlen --
+    // `reassign_driver_device` praegt beim Hot-Reload aber ein ZWEITES Dma-OBJEKT ueber dieselbe
+    // Region statt den Cap zu kopieren. Der Wert sagt also die Wahrheit, und die Wahrheit ist eine
+    // offene Schuld (todo A3d). Er geht auf 0, sobald der Reload kopiert statt praegt; bis dahin
+    // faengt diese Zeile jede DRIFT.
+    let audit = system::dma_audit();
+    let audit_wie_erwartet = audit == DMA_AUDIT_SCHULD;
+    let ok = eingeloest && verschieden && disjunkt && abgewiesen && audit_wie_erwartet;
+    println!(
+        "dmapool : {} (eingeloest={eingeloest} verschieden={verschieden} disjunkt={disjunkt} \
+         zu-gross-abgewiesen={abgewiesen} zuteilungen={n} vorgabe={vorgabe} B \
+         dma_audit={audit} erwartet={DMA_AUDIT_SCHULD} wie-erwartet={audit_wie_erwartet} \
+         -- die Erwartung ist eine SCHULD, kein Freibrief: reassign_driver_device praegt beim \
+         Hot-Reload ein ZWEITES Dma-Objekt ueber dieselbe Region, statt den Cap zu kopieren. \
+         Sie geht auf 0, sobald das behoben ist -- s. todo A3d)",
+        if ok { "ALL PASS" } else { "FAILURES" }
+    );
+    DMAPOOL_BEFUND.gemessen(ok);
+}
+
+/// **Die `irqmsi`-Zeile** (Stufe B, B1+B2+B3) — was von der Interrupt-Vergabe belegbar ist,
+/// **bevor** der Treiber wartet statt zu pollen.
+///
+/// Die Konjunkte, und warum jedes einzelne dasteht:
+///
+/// * **`angeboten`/`da` gedruckt** — der Wunsch neben der Gewährung, wie `dma_gewuenscht` neben
+///   `dma_len`. Ohne beide Zahlen sind „das Gerät hat kein MSI-X" (Pollen ist zulässig) und „die
+///   Vergabe ist gescheitert" dieselbe Zeile, und die harmlose Lesart verdeckt die ernste.
+/// * **`angeboten-dann-da`** (`angeboten ⟹ da`) — genau diese Trennung als Urteil. Ein Gerät mit
+///   MSI-X ohne Vektor ist eine **gescheiterte Vergabe**.
+///
+///   **Der Name trägt kein `=`**, und das ist keine Kosmetik: die Berichtszeilen dieses Baums sind
+///   `name=wert`-Paare, und jeder Leser, der auf `=` trennt, liest bei `angeboten=>da=false` den
+///   Wert `>da`. Genau daran ist die erste Fassung der Gegenprobe gescheitert — sie meldete
+///   `FAIL … ist '>da'` für ein Konjunkt, das korrekt gefallen war.
+/// * **`praesent`, `vektor-passt`, `svt`, `sid`** — aus der **Tabelle zurückgelesen**
+///   (`irte_pruefen`), nicht nachgerechnet. `svt` ist die Sicherheitsaussage: ohne `SVT=01` nähme
+///   der Eintrag eine MSI von JEDEM Gerät an, und die Interruptzustellung wäre genau der Kanal,
+///   den A-5.4 auf der DMA-Achse geschlossen hat. `sid` sagt, dass er die **richtige** Quelle
+///   prüft — ohne dieses zweite Konjunkt wäre `svt` mit jeder beliebigen BDF wahr.
+/// * **`cap-in-slot7`** — die Treiber-PD hält die `Irq`-Cap wirklich (B2). Sie zu prägen und
+///   nirgends zu installieren wäre der `SYS_SPAWN`-Zustand: gebaut, ohne Halter.
+/// * **`cap-nennt-vektor`** — und es ist **sein** Vektor. Eine `Irq`-Cap auf einen fremden Vektor
+///   wäre gültig, prüfbar und falsch.
+/// * **`bind-ohne-cap-abgewiesen`** — der Ring-3-Negativfall aus `init` (B3). Ohne ihn wäre der
+///   Cap-Riegel eine Behauptung; mit ihm ist er gefahren. Er prüft auf `ERR_BADCAP` und nicht auf
+///   „ungleich OK": ein nicht existierender Syscall gäbe `ERR_BADSYS`, und der Negativfall wäre
+///   grün, **weil nichts gebaut ist**.
+///
+/// **Was hier NOCH NICHT steht**, und zwar benannt: `poll-runden == 0`, `zugestellt > 0`,
+/// `badge == erwartet`, `kein-retrigger`, `zweite-PD-unberuehrt`. Alle fünf brauchen B4 — der
+/// Treiber pollt noch. Sie fehlen hier als **Lücke mit Namen** statt als stillschweigend kürzere
+/// Liste; s. `docs/plan-cap-irq.md` §3.
+#[cfg(feature = "selftest")]
+fn irqmsi_bericht() {
+    let mut m = [system::DriverMsi::default(); system::MAX_OFFERED_DEVICES];
+    let n = system::driver_msi(&mut m);
+    if n == 0 {
+        println!("irqmsi  : SKIP (keine Geraetezuteilung -- es gibt nichts zu vergeben)");
+        IRQMSI_BEFUND.uebersprungen();
+        return;
+    }
+    let mut angeboten_impl_da = true;
+    let mut praesent = true;
+    let mut vektor_passt = true;
+    let mut svt = true;
+    let mut sid = true;
+    let mut cap_in_slot7 = true;
+    let mut cap_nennt_vektor = true;
+    let mut mit_vektor = 0usize;
+    for e in m.iter().take(n) {
+        if e.angeboten && !e.da {
+            angeboten_impl_da = false;
+        }
+        if !e.da {
+            println!(
+                "irqmsi  : Eintrag {} (RID {:#06x}) OHNE Vektor -- angeboten={}                  (angeboten=false heisst: das Geraet hat kein MSI-X, Pollen ist zulaessig;                  angeboten=true heisst: die Vergabe ist GESCHEITERT)",
+                e.program_id, e.rid, e.angeboten
+            );
+            continue;
+        }
+        mit_vektor += 1;
+        let b = hal::vtd::irte_pruefen(e.handle, e.vektor, e.rid);
+        if !b.praesent {
+            praesent = false;
+        }
+        if !b.vektor_passt {
+            vektor_passt = false;
+        }
+        if !b.svt_gesetzt {
+            svt = false;
+        }
+        if !b.sid_passt {
+            sid = false;
+        }
+        // B2: haelt die PD, die den Treiber faehrt, die Cap wirklich -- und nennt sie SEINEN
+        // Vektor? Der Dienst wird ueber die `program_id` gesucht und nicht als „der erste": bei
+        // zwei Treibern waere „der erste" eine stille Fehlwahl (A-5.4).
+        match crate::loader::driver_service_of(e.program_id) {
+            Some(sv) => match system::pd_irq_cap_intid(sv.pd, 7) {
+                Some(intid) => {
+                    if intid != e.vektor as u32 {
+                        cap_nennt_vektor = false;
+                    }
+                }
+                None => cap_in_slot7 = false,
+            },
+            // Kein laufender Dienst zu dieser Zuteilung -> ueber den Slot ist nichts auszusagen.
+            // **Nicht als Erfolg buchen**: eine PD, die es nicht gibt, haelt auch keine Cap.
+            None => cap_in_slot7 = false,
+        }
+        println!(
+            "irqmsi  : Eintrag {} (RID {:#06x}) Vektor {:#04x} Handle {} --              tabelle={} praesent={} vektor-passt={} svt={} sid={}",
+            e.program_id,
+            e.rid,
+            e.vektor,
+            e.handle,
+            b.tabelle_da,
+            b.praesent,
+            b.vektor_passt,
+            b.svt_gesetzt,
+            b.sid_passt
+        );
+    }
+    // --- B4: hat ein Treiber wirklich GEWARTET statt zu pollen? --------------------------------
+    //
+    // Gelesen wird, was der Treiber in seine Region gelegt hat -- geurteilt wird hier. Ein
+    // Treiber, der sein eigenes Ergebnis bestaetigt, bestaetigt nichts; er liefert Zahlen.
+    //
+    // **Es reicht EIN Treiber, und das ist der Umfang der Stufe, keine Nachlaessigkeit.** Von den
+    // beiden Zuteilungen faehrt nur `virtio-blk` diesen Weg; `virtio-net` ist ein anderes Programm
+    // und pollt weiter. Die Zeile sagt das als `wartende=N/M`, statt es zu verschweigen -- eine
+    // Aussage ueber „alle", die nur fuer einen gilt, waere die teurere Luege.
+    let mut wartende = 0usize;
+    let mut melder = 0usize;
+    let mut zeile_weg = false;
+    let mut b4_aktiv = false;
+    let mut badge_falsch = false;
+    let mut gepollt_trotz_vektor = false;
+    for e in m.iter().take(n).filter(|e| e.da) {
+        // **Erst die Marke.** Ohne sie las diese Schleife die vier Offsets aus JEDER Region --
+        // auch aus der von `virtio-net`, wo dort Virtqueue-Bytes liegen. Die Zahlen sahen aus wie
+        // Messwerte (`weckrufe=9223372037261623427`) und waren Ringdaten; eine davon machte
+        // `wartende` wahr. Ein Wert wird dort gelesen, wo ihn jemand hingeschrieben hat, und nicht
+        // dort, wo er stehen koennte.
+        // SAFETY: identity-gemappte DMA-Region dieser Zuteilung, ein Wort.
+        // **Steht die MSI-X-Zeile ueberhaupt noch im Geraet?** Gelesen, nicht nachgerechnet.
+        // Ein Geraetereset setzt sie zurueck (QEMUs `virtio_pci_reset` ruft `msix_reset`), und der
+        // Treiber setzt sein Geraet bei JEDER Anfrage zurueck. Ohne dieses Konjunkt saehe „der
+        // Interrupt kam nicht" genauso aus wie „die Zeile ist weg".
+        let (za, _zh, zd, zc) = unsafe { hal::pcie::msix_read_entry(e.msix_table, 0) };
+        let zeile_steht = za != 0 && zc & 1 == 0;
+        // **Die Funktionsmaske (Bit 14) und der used-Ring** -- die beiden Groessen, die „das
+        // Geraet sendet nicht" von „es sendet und wird verschluckt" trennen.
+        //
+        // `msix_enable_by_rid` loescht Bit 14 und liest **Bit 15** zurueck; ueber Bit 14 sagte die
+        // Ruecklesung bisher nichts, und eine gesetzte Funktionsmaske unterdrueckt JEDEN Vektor,
+        // unabhaengig von `vctrl`.
+        //
+        // `used.idx` ist die andere Haelfte: steht er ueber 0, hat das Geraet die Arbeit **getan**
+        // und nur nicht gemeldet -- dann ist es kein Interruptproblem, sondern ein Meldeproblem.
+        // Steht er auf 0, gab es nichts zu melden, und die Interruptfrage stellt sich nicht.
+        let ctrl = hal::pcie::msix_ctrl_lesen(e.rid, e.msix_cap);
+        // SAFETY: identity-gemappte DMA-Region; `used.idx` liegt bei Queue-Offset 0x200 + 2.
+        let used_idx = unsafe {
+            core::ptr::read_volatile((e.dma_phys + 0x200 + 2) as *const u16)
+        };
+        // **Haelt die Queue ihren Vektor?** Der Treiber liest ihn beim Schreiben zurueck, aber
+        // sein Ergebnis erreicht den Bericht nur nach einer FERTIGEN Anfrage -- blockiert er, ist
+        // die Zahl nie zu sehen. Der Kernel loest den Transport dafuer selbst auf; er darf das,
+        // die Konfigurationsseite gehoert ihm.
+        // SAFETY: `cfg_page` ist die identity-gemappte Konfigurationsseite genau dieser Funktion.
+        let qvec = unsafe {
+            hal::virtio::probe_ecam(e.cfg_page, || {})
+                .map(|t| t.queue_msix_lesen(0))
+                .unwrap_or(0xfffe)
+        };
+        println!(
+            "irqmsi  : Eintrag {} Geraet: msix-ctrl={ctrl:#06x} (Bit15=Enable Bit14=FunctionMask) used.idx={used_idx} queue0-msix-vektor={qvec:#06x} (0xffff = KEINE -- dann sendet das Geraet fuer diese Queue nichts)",
+            e.program_id
+        );
+        if !zeile_steht {
+            zeile_weg = true;
+        }
+        println!(
+            "irqmsi  : Eintrag {} MSI-X-Zeile 0: addr={za:#x} data={zd:#x} vctrl={zc:#x} (Bit 0 = maskiert) steht={zeile_steht}",
+            e.program_id
+        );
+        let marke = unsafe { core::ptr::read_volatile((e.dma_phys + B4_OFF_MAGIC) as *const u64) };
+        if marke != B4_MAGIC {
+            println!(
+                "irqmsi  : Eintrag {} B4: kein Melder (Marke {marke:#x}) -- dieses Programm faehrt den Warteweg nicht; virtio-net ist so eines",
+                e.program_id
+            );
+            continue;
+        }
+        melder += 1;
+        // SAFETY: wie oben.
+        let aktiv = unsafe { core::ptr::read_volatile((e.dma_phys + B4_OFF_AKTIV) as *const u64) };
+        if aktiv != 0 {
+            b4_aktiv = true;
+        }
+        // SAFETY: `dma_phys` ist die vom Kernel ausgeschnittene, identity-gemappte DMA-Region
+        // dieser Zuteilung; die vier Offsets liegen darin und ausserhalb von Queue, Kopf und
+        // Datenpuffer (s. `virtio-blk`, OFF_POLLED..OFF_MSIX_OK).
+        let (gepollt, weckrufe, badge, msix_ok) = unsafe {
+            (
+                core::ptr::read_volatile((e.dma_phys + B4_OFF_POLLED) as *const u64),
+                core::ptr::read_volatile((e.dma_phys + B4_OFF_WAKEUPS) as *const u64),
+                core::ptr::read_volatile((e.dma_phys + B4_OFF_BADGE) as *const u64),
+                core::ptr::read_volatile((e.dma_phys + B4_OFF_MSIX_OK) as *const u64),
+            )
+        };
+        println!(
+            "irqmsi  : Eintrag {} B4: gepollt={gepollt} weckrufe={weckrufe} badge={badge:#x} msix-ok={msix_ok}",
+            e.program_id
+        );
+        if weckrufe > 0 {
+            wartende += 1;
+            // Badge und Poll-Weg zaehlen nur, wo ueberhaupt geweckt wurde -- sonst waere `0` ein
+            // Fehler, obwohl nichts schiefgegangen ist.
+            if badge != B4_ERWARTETES_BADGE {
+                badge_falsch = true;
+            }
+            if gepollt != 0 {
+                gepollt_trotz_vektor = true;
+            }
+        }
+    }
+    // --- Die Halbierung: eine MSI vom KERN aus ------------------------------------------------
+    //
+    // Sie steht VOR dem Urteil und nicht daneben, weil sie die Frage entscheidet, die alle anderen
+    // Konjunkte offenlassen: bis heute war der Zustellpfad **nie gefahren** -- der IRTE-Selbsttest
+    // liest nur den Tabelleninhalt zurueck. Jede gruene Zeile darueber war damit eine Aussage
+    // ueber Zustand, keine ueber Wirkung.
+    let zp = system::msi_zustellprobe();
+    println!(
+        "irqmsi  : Zustellprobe (Store vom KERN, kein Geraet): sprechfaehig={} addr={:#x} data={:#x} | remappable: angekommen={} zugestellt={} badge={} | KOMPAT: angekommen={} zugestellt={} | letzter-vektor={:#x} iommu-faults-leer={} -- ANGEKOMMEN zaehlt irq_hook (der Prozessor hat ihn gesehen), ZUGESTELLT den Drain (er kam bis zur Notification). Zwei Zahlen, weil drei Lagen sonst ununterscheidbar sind: nie angekommen / angekommen und Vektor unbekannt / angekommen und nie gedrained. Die remappable Haelfte ist unter QEMU NICHT aussagekraeftig (die IR-Region liegt im GERAETE-Adressraum; ein CPU-Store geht daran vorbei)",
+        zp.sprechfaehig, zp.addr, zp.data, zp.remap_angekommen, zp.zugestellt, zp.badge_stimmt, zp.kompat_angekommen, zp.kompat_zugestellt, zp.letzter_vektor, zp.faults_leer
+    );
+    let zugestellt = system::irqs_delivered();
+    let bind_abgewiesen = root_badge() & IRQ_UNAUTHORIZED_BADGE != 0;
+    // **Sprechprobe:** ohne einen einzigen vergebenen Vektor sagen `praesent`/`svt`/`sid` nichts --
+    // sie sind dann wahr, weil die Schleife nicht lief. Ein leerer Lauf ist kein Testergebnis.
+    let sprechfaehig = mit_vektor > 0;
+    let ok = sprechfaehig
+        && angeboten_impl_da
+        && praesent
+        && vektor_passt
+        && svt
+        && sid
+        && cap_in_slot7
+        && cap_nennt_vektor
+        && bind_abgewiesen
+        // **Die Zeile steht im GERAET** -- zurueckgelesen, nicht nachgerechnet. Sie gattert auch
+        // ohne B4: ohne sie ist eine geschriebene Zeile von einer weggeräumten nicht zu trennen.
+        && !zeile_weg
+        // **Die B4-Haelfte ist BEDINGT** (`b4-aktiv`), und das ist dieselbe Disziplin wie
+        // `angeboten-dann-da`: solange der Treiber den Warteweg nicht faehrt, sagen `wartende`,
+        // `nicht-gepollt`, `badge-stimmt` und `zugestellt` NICHTS -- sie waeren wahr, weil nichts
+        // lief. Eine unbedingte Fassung haette genau zwei Enden: rot aus einem benannten Grund
+        // (und jemand entfernt die Zeile), oder abgeschaltet (und sie misst nie wieder).
+        //
+        // `melder > 0` bleibt unbedingt: dass der Treiber ueberhaupt MELDET, ist die Sprechprobe.
+        && melder > 0
+        && (!b4_aktiv
+            || (wartende > 0 && !gepollt_trotz_vektor && !badge_falsch && zugestellt > 0));
+    println!(
+        "irqmsi  : {} (zuteilungen={n} mit-vektor={mit_vektor} angeboten-dann-da={angeboten_impl_da} praesent={praesent} vektor-passt={vektor_passt} svt={svt} sid={sid} cap-in-slot7={cap_in_slot7} cap-nennt-vektor={cap_nennt_vektor} bind-ohne-cap-abgewiesen={bind_abgewiesen} melder={melder} zeile-steht={} b4-aktiv={b4_aktiv} wartende={wartende}/{melder} nicht-gepollt={} badge-stimmt={} zugestellt={zugestellt} -- B1..B3 gemessen. B4 haengt an b4-aktiv: der Treiber BINDET (ueber die ABI, aus einer echten Treiber-PD), WARTET aber noch nicht -- IRTE praesent mit SVT/SID, MSI-X-Zeile im Geraet zurueckgelesen und unmaskiert, queue_msix_vector angenommen, und IRQ_DELIVERED bleibt 0. Offen. Ebenfalls offen und benannt: kein-retrigger, zweite-PD-unberuehrt)",
+        if ok { "ALL PASS" } else { "FAILURES" },
+        !zeile_weg,
+        !gepollt_trotz_vektor,
+        !badge_falsch
+    );
+    IRQMSI_BEFUND.gemessen(ok);
+}
+
+/// Offsets der B4-Zahlen in der DMA-Region einer Treiber-PD — **Spiegel** von
+/// `programs/hardware/virtio-blk` (`OFF_POLLED` … `OFF_MSIX_OK`).
+///
+/// Sie stehen hier ein zweites Mal, weil Kernel und Treiber getrennt gebaut werden und kein
+/// gemeinsames Modul haben — dieselbe Lage wie bei den Badges. Laufen sie auseinander, liest diese
+/// Zeile Nullen, und die Konjunkte fallen. Ein **stiller Erfolg** ist dabei nicht moeglich, und
+/// das ist die Bedingung, unter der eine doppelt gefuehrte Zahl tragbar ist: `0` ist bei
+/// `weckrufe` und `msix-ok` die schlechte Richtung.
+#[cfg(feature = "selftest")]
+const B4_OFF_POLLED: u64 = 0x608;
+#[cfg(feature = "selftest")]
+const B4_OFF_WAKEUPS: u64 = 0x610;
+#[cfg(feature = "selftest")]
+const B4_OFF_BADGE: u64 = 0x618;
+#[cfg(feature = "selftest")]
+const B4_OFF_MSIX_OK: u64 = 0x620;
+/// Marke des Melders — ohne sie sind die vier Zahlen darueber **fremde Bytes**.
+#[cfg(feature = "selftest")]
+const B4_OFF_MAGIC: u64 = 0x628;
+#[cfg(feature = "selftest")]
+const B4_MAGIC: u64 = 0x4234_4D45_4C44_4552;
+/// Faehrt der Treiber den Warteweg? — Spiegel von `virtio-blk`s `B4_WARTEN`.
+#[cfg(feature = "selftest")]
+const B4_OFF_AKTIV: u64 = 0x630;
+/// Das Etikett, das `virtio-blk` beim Binden waehlt (`IRQ_BADGE` dort).
+#[cfg(feature = "selftest")]
+const B4_ERWARTETES_BADGE: u64 = 0x1;
+
+/// Urteil der `irqmsi`-Zeile (Stufe B).
+#[cfg(feature = "selftest")]
+static IRQMSI_BEFUND: crate::befund::AtomicBefund = crate::befund::AtomicBefund::neu();
+
+/// Urteil der `dmapool`-Zeile (C2).
+#[cfg(feature = "selftest")]
+static DMAPOOL_BEFUND: crate::befund::AtomicBefund = crate::befund::AtomicBefund::neu();
+
+/// **Der erwartete `dma_audit`-Wert am Ende eines Laufs mit Hot-Reload -- eine RATSCHE nach unten.**
+///
+/// `2` heisst „zwei DMA-Objekte auf einer Region", und das ist keine Eigenheit des Pruefers:
+/// `for_each_dma` zaehlt **Objekte** und nicht Caps, gerade damit Kopien nicht doppelt zaehlen.
+/// `reassign_driver_device` praegt beim Austausch ein zweites Objekt, statt den vorhandenen Cap zu
+/// kopieren -- die Zahl sagt also die Wahrheit ueber eine offene Schuld (todo A3d).
+///
+/// Sie steht hier als Konstante und nicht als Literal in der Bedingung, damit die Behebung EINE
+/// Zeile ist: `2` -> `0`. Und sie darf **nur fallen**; wer sie erhoeht, deckt eine neue Ueberlappung
+/// zu.
+#[cfg(feature = "selftest")]
+const DMA_AUDIT_SCHULD: u32 = 2;
+
 fn devsel_bericht() {
     let angeboten_vorher = ANGEBOTEN_VORHER.load(Ordering::Acquire);
     let mut zu = [(0u32, 0u32, 0u16, 0u16); system::MAX_OFFERED_DEVICES];
@@ -3333,9 +3768,46 @@ fn drv_service_step(archive: bool) {
             } else {
                 system::pd_object_kinds(pd as usize - 1, &mut kinds)
             };
-            let scope = caprock_cap::checkpoint::Scope::EMPTY;
-            match caprock_cap::checkpoint::Image::build(kh, p, nonce, epoche, &kinds[..n], &scope)
-            {
+            // **Der Umfang nennt sein Subjekt** (Z4d Stufe 1). Bis 2026-08-25 stand hier ein
+            // reines `Scope::EMPTY` und das wandernde Subjekt war ein **stillschweigendes**
+            // Mitglied ("nichts wandert mit ausser dem Thread selbst") -- ein implizites Mitglied
+            // laesst die Schnittregel gar nicht erst formulieren, denn sie ist eine Aequivalenz
+            // ueber "wandert mit".
+            let subject = tid.to_raw();
+            let scope = caprock_cap::checkpoint::Scope {
+                threads: core::slice::from_ref(&subject),
+                ..caprock_cap::checkpoint::Scope::EMPTY
+            };
+            // **Die Kanten werden ERHOBEN, nicht behauptet.** Ein leerer Schnitt und ein
+            // ungemessener Schnitt sehen im Urteil gleich aus; die Zahl steht deshalb in der
+            // Berichtszeile, und der `ckptcut`-Pruefer weist an einer bekannten Beziehung nach,
+            // dass dieser Sammler ueberhaupt etwas findet.
+            let mut kanten = [caprock_cap::checkpoint::Edge {
+                channel: caprock_cap::checkpoint::Channel::Endpoint(0),
+                thread: 0,
+                role: caprock_cap::checkpoint::EdgeRole::Sender,
+            }; system::CUT_EDGES_MAX];
+            let kn = match system::cut_edges(tid, &scope, &mut kanten) {
+                Ok(k) => k,
+                // Mehr offene Beziehungen, als der Befund fasst. **Kein gekuerzter Schnitt** --
+                // eine gekuerzte Kantenliste IST ein zurueckgelassener Partner.
+                Err(gebraucht) => {
+                    CKPT_CUT_EDGES.store(gebraucht as u32, Ordering::Release);
+                    abbruch(tid, true);
+                    return;
+                }
+            };
+            CKPT_CUT_EDGES.store(kn as u32, Ordering::Release);
+            match caprock_cap::checkpoint::Image::build(
+                kh,
+                p,
+                nonce,
+                epoche,
+                &kinds[..n],
+                &scope,
+                subject,
+                &kanten[..kn],
+            ) {
                 Ok(img) => {
                     let Some((shared, _)) = system::driver_shared_region(TEST_BLK_SERVICE_ID)
                     else {
@@ -3357,11 +3829,21 @@ fn drv_service_step(archive: bool) {
                     CKPT_REQ.store(2, Ordering::Release);
                     DRV_STEP.store(12, Ordering::Release);
                 }
-                Err((slot, r)) => {
+                Err(refusal) => {
                     // Das Subjekt selbst haelt etwas, das nicht mitwandern darf -> kein
                     // Checkpoint. Der Slot kommt mit; „irgendeine Cap" ist als Diagnose wertlos.
-                    CKPT_REFUSED[0].store(slot as u32, Ordering::Release);
-                    CKPT_REFUSED[1].store(ckpt_reason(r), Ordering::Release);
+                    //
+                    // **Cap-Grund und Schnitt-Grund bleiben getrennt** (Z4d Stufe 1): der erste
+                    // wird durch Warten nie besser, der zweite kann sich in einem Tick von selbst
+                    // aufloesen. Zusammengelegt hiesse das, jemanden auf etwas warten zu lassen,
+                    // das sich nicht bewegt.
+                    use caprock_cap::checkpoint::BuildRefusal as B;
+                    let (wo, code) = match refusal {
+                        B::Cap(slot, r) => (slot as u32, ckpt_reason(r)),
+                        B::Cut(i, r) => (i as u32, ckpt_cut_reason(r)),
+                    };
+                    CKPT_REFUSED[0].store(wo, Ordering::Release);
+                    CKPT_REFUSED[1].store(code, Ordering::Release);
                     CKPT_STATE.store(CKPT_REJECTED, Ordering::Release);
                     let _ = system::thaw_thread(tid);
                     CKPT_REQ.store(3, Ordering::Release);
@@ -3747,6 +4229,16 @@ static CKPT_BYTES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32
 #[cfg(feature = "selftest")]
 static CKPT_REFUSED: [core::sync::atomic::AtomicU32; 2] =
     [const { core::sync::atomic::AtomicU32::new(u32::MAX) }; 2];
+/// **Wie viele IPC-Kanten der Schnitt gesehen hat** (Z4d Stufe 1) — `u32::MAX` = nicht erhoben.
+///
+/// Die Zahl steht in der Berichtszeile, weil ein sauberer Schnitt und ein **ungemessener** Schnitt
+/// dasselbe Urteil ergeben. Sie ist hier bauartbedingt 0 (das Subjekt ist ein reiner Rechenthread
+/// ohne jede IPC-Rolle) — und genau deshalb hat `bootckpt` von dieser Regel keine Trennschaerfe:
+/// dass der Sammler ueberhaupt etwas findet, weist die `ckptcut`-Zeile an einer bekannten
+/// Beziehung nach, nicht diese hier.
+#[cfg(feature = "selftest")]
+static CKPT_CUT_EDGES: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
 /// Wurde das Subjekt wirklich eingefroren, bevor sein Zustand angefasst wurde?
 #[cfg(feature = "selftest")]
 static CKPT_FROZEN: AtomicBool = AtomicBool::new(false);
@@ -3839,6 +4331,25 @@ fn ckpt_reason(r: caprock_cap::checkpoint::LocalReason) -> u32 {
         // nahe, „nimm sie in den Umfang auf"), sondern weil die Praegung eine benannte Handlung auf
         // DIESER Maschine war.
         L::DebugAuthority => 10,
+        // Z23/S4, 2026-08-21: eigener Code, und die Begruendung ist woertlich die von 9 und 10.
+        // „Eine Zahl DIESER Maschine" ist nicht `DeviceWindow`: ein Geraetefenster ist drueben
+        // **nicht herstellbar**, eine Kernaffinitaet **entsteht drueben neu**. Derselbe Code liesse
+        // jemanden nach einem Geraet suchen, wo eine Zuteilung fehlt.
+        L::MachineLocalNumber => 11,
+    }
+}
+
+/// Codes for the **cut** refusals (Z4d stage 1) — a range of their own, starting at 20.
+///
+/// Deliberately disjoint from [`ckpt_reason`]'s numbers rather than continuing them: a cap refusal
+/// and a cut refusal are answered differently (the first never improves by waiting, the second may
+/// dissolve on its own within a tick), and a reader who has to remember where one range ends and
+/// the next begins will eventually treat them alike.
+fn ckpt_cut_reason(r: caprock_cap::checkpoint::CutRefusal) -> u32 {
+    use caprock_cap::checkpoint::CutRefusal as C;
+    match r {
+        C::ChannelNotInScope => 20,
+        C::PeerNotInScope => 21,
     }
 }
 
@@ -4008,7 +4519,10 @@ fn cdelete_done() -> bool {
 /// (`root : FAILURES (NoArchive)`); die Suite nimmt genau das seit B-1.5 ausdrücklich ab. Was
 /// hier NICHT passiert: die Anforderung abschwächen, wenn ein Archiv da ist. Dann gilt sie voll.
 #[cfg(feature = "selftest")]
-fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]>) -> bool {
+fn all_done(
+    archive: bool,
+    warum: Option<&mut [(&'static str, crate::befund::Befund); DONE_FLAGS]>,
+) -> bool {
     let workers = (0..NWORKERS).all(|i| WORKER_ROUNDS[i].load(Ordering::Relaxed) >= WORK_TARGET);
     let cores = (0..system::num_cores()).all(|c| hal::timer::ticks(c) > 0);
     let ring3 = USER_SYSCALLS.load(Ordering::Relaxed) > 0 && system::el0_fault_count() > 0;
@@ -4024,7 +4538,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
     // duerfen dabei SKIPpen (kein Geraet am Bus -> `true`); was sie nicht duerfen, ist
     // durchfallen, ohne dass der Lauf davon abhaengt.
     let vblk = VBLK_OK.load(Ordering::Acquire);
-    let vnet = VNET_OK.load(Ordering::Acquire);
+    let vnet = vnet_befund();
     // A-5.1: die Dienst-/Austausch-Abfolge muss DURCH sein, bevor berichtet wird. `DRIVER_OK`
     // taugt dafuer nicht -- es wird IM Bericht gesetzt und koennte ihn deshalb nicht ausloesen.
     // Ohne diese Zeile kam der Bericht, bevor der Austausch ueberhaupt anlief, und meldete
@@ -4291,27 +4805,27 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
     // `pdbind` standen im Bericht und gatterten NICHTS. Gefunden hat das eine Gegenprobe:
     // eine Mutation, die zuerst zulaesst und dann bindet, ergab `pdbind : FAILURES`, und die
     // Suite meldete `== ALL PASS ==`.
-    let flags: [(&'static str, bool); DONE_FLAGS] = [
-            ("workers", workers),
-            ("ipc", IPC_DONE.load(Ordering::Acquire)),
-            ("cores", cores),
-            ("ring3", ring3),
-            ("iso", iso),
-            ("root", root),
-            ("stripes", stripes),
-            ("pprobe", pprobe),
-            ("virtio", virtio),
-            ("vblk", vblk),
+    let flags: [(&'static str, crate::befund::Befund); DONE_FLAGS] = [
+            ("workers", crate::befund::Befund::from(workers)),
+            ("ipc", crate::befund::Befund::from(IPC_DONE.load(Ordering::Acquire))),
+            ("cores", crate::befund::Befund::from(cores)),
+            ("ring3", crate::befund::Befund::from(ring3)),
+            ("iso", crate::befund::Befund::from(iso)),
+            ("root", crate::befund::Befund::from(root)),
+            ("stripes", crate::befund::Befund::from(stripes)),
+            ("pprobe", crate::befund::Befund::from(pprobe)),
+            ("virtio", crate::befund::Befund::from(virtio)),
+            ("vblk", crate::befund::Befund::from(vblk)),
             ("vnet", vnet),
-            ("drv", drv_seq),
-            ("bootckpt", ckpt_seq),
-            ("blkdev", blkdev),
-            ("dmaiso", DMAISO_OK.load(Ordering::Acquire)),
-            ("part", part),
-            ("iface", iface),
-            ("pdcolor", pdcolor),
-            ("ladepol", ladepol),
-            ("pdbind", pdbind),
+            ("drv", crate::befund::Befund::from(drv_seq)),
+            ("bootckpt", crate::befund::Befund::from(ckpt_seq)),
+            ("blkdev", crate::befund::Befund::from(blkdev)),
+            ("dmaiso", crate::befund::Befund::from(DMAISO_OK.load(Ordering::Acquire))),
+            ("part", crate::befund::Befund::from(part)),
+            ("iface", crate::befund::Befund::from(iface)),
+            ("pdcolor", crate::befund::Befund::from(pdcolor)),
+            ("ladepol", crate::befund::Befund::from(ladepol)),
+            ("pdbind", crate::befund::Befund::from(pdbind)),
             // **`wasm` gattert bewusst NICHT** (2026-08-10) -- eine benannte Auslassung, kein
             // Uebersehen, und sie steht mit Datum in `BEKANNT_ROT` der Lade-Suite.
             //
@@ -4322,32 +4836,32 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             // jeden Lauf in den Watchdog schickt, macht die Suite fuer alles andere unbrauchbar.
             // Dieselbe Abwaegung wie bei `fp` bis zum 2026-08-09: erst die Ursache, dann das
             // Gatter.
-            ("quiesce", quiesce),
-            ("rebind", rebind),
-            ("epfull", epfull),
-            ("state", state),
-            ("park", PARK_MESS.load(Ordering::Acquire) & 1 != 0),
+            ("quiesce", crate::befund::Befund::from(quiesce)),
+            ("rebind", crate::befund::Befund::from(rebind)),
+            ("epfull", crate::befund::Befund::from(epfull)),
+            ("state", crate::befund::Befund::from(state)),
+            ("park", crate::befund::Befund::from(PARK_MESS.load(Ordering::Acquire) & 1 != 0)),
             // Z23 S1: gattert von Anfang an. Anders als bei `fp`/`wasm` ist das Kriterium hier
             // erreichbar -- es wurde gegen die WIRKUNG formuliert (blockiert statt abgewiesen),
             // nicht gegen eine Zahl, die vom Zeitpunkt abhaengt.
-            ("qgate", Q_MESS.load(Ordering::Acquire) & 1 != 0),
+            ("qgate", crate::befund::Befund::from(Q_MESS.load(Ordering::Acquire) & 1 != 0)),
             // Z22 P2: gattert aus demselben Grund wie `qgate` -- das Kriterium ist gegen die
             // WIRKUNG formuliert (Rundenzaehler, Ergebniscodes), nicht gegen einen Zustand.
-            ("pdthrd", PT_MESS.load(Ordering::Acquire) & 1 != 0),
+            ("pdthrd", crate::befund::Befund::from(PT_MESS.load(Ordering::Acquire) & 1 != 0)),
             // C4/A3: die Fuellstands- und O(n)-Zeile gattert ebenfalls -- sonst waere sie genau
             // die Sorte Zeile, die niemand liest (dieselbe Begruendung wie bei B-4.2).
-            ("vorrat", vorrat_urteil()),
+            ("vorrat", crate::befund::Befund::from(vorrat_urteil())),
             // C7: beide gattern von Anfang an. Ihre Kriterien sind erreichbar und gegen die
             // WIRKUNG formuliert (gezaehlte Rahmen; eine provozierte, wirklich abgewiesene
             // Anforderung) -- nicht gegen eine Zahl, die vom Zeitpunkt abhaengt. Eine gruene
             // Zeile, die nichts gattert, waere der `pdbind`-Fehler von neuem.
-            ("ptab", PTAB_MESS.load(Ordering::Acquire) & 1 != 0),
-            ("mangel", MANGEL_MESS.load(Ordering::Acquire) & 1 != 0),
+            ("ptab", crate::befund::Befund::from(PTAB_MESS.load(Ordering::Acquire) & 1 != 0)),
+            ("mangel", crate::befund::Befund::from(MANGEL_MESS.load(Ordering::Acquire) & 1 != 0)),
             // C7: der Sweep gattert aus demselben Grund. Sein Kriterium ist gegen die WIRKUNG
             // formuliert (gefahrene Abweisungen, geschwiegene Pfade) und traegt seine eigene
             // Sprechprobe (`punkte >= 12`, `pfade >= 5`) -- ein Sweep, der nichts provoziert hat,
             // faellt durch, statt gruen zu schweigen.
-            ("sweep", SWEEP_MESS.load(Ordering::Acquire) & 1 != 0),
+            ("sweep", crate::befund::Befund::from(SWEEP_MESS.load(Ordering::Acquire) & 1 != 0)),
             // C4: die **Stack-Wasserstandsmarke**. Sie gattert aus demselben Grund wie `vorrat`,
             // und ihr Kriterium ist gegen die WIRKUNG formuliert (benutzte Tiefe), nicht gegen
             // eine Zahl, die vom Zeitpunkt abhaengt. Erreichbar ist es gemessen und nicht
@@ -4357,7 +4871,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             // **Faellt die Fuellung aus, faellt dieses Konjunkt** -- ohne Muster am Fuss meldet
             // die Messung die volle Stackgroesse als benutzt. Ein Wasserzeichen, das immer „viel
             // Luft" sagt, ist damit strukturell ausgeschlossen und nicht bloss unwahrscheinlich.
-            ("kstack", crate::kstackmark::urteil()),
+            ("kstack", crate::befund::Befund::from(crate::kstackmark::urteil())),
             // C7b: die **EL0-Wasserstandsmarke**. Sie gattert aus demselben Grund wie `kstack`,
             // und ihr Kriterium ist gegen die WIRKUNG formuliert (benutzte Tiefe gegen die
             // kleinste Region der Klasse). Erreichbar ist es gemessen und nicht gehofft.
@@ -4366,7 +4880,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             // faellt die Nullung aus, ist der Fuss nicht null und `erschoepft > 0`; misst niemand,
             // faellt `gemessen_tod`; und zeigt die Buchfuehrung auf eine FREMDE (genullte) Region,
             // faellt die Tiefensonde -- den letzten Fall kann die Eichung strukturell nicht sehen.
-            ("ustack", crate::userstackmark::urteil()),
+            ("ustack", crate::befund::Befund::from(crate::userstackmark::urteil())),
             // C9: die **Sperrhaltedauer-Marke**. Gattert von Anfang an, und ihr Kriterium ist
             // gegen die WIRKUNG formuliert (gemessene maskierte Dauer gegen einen Timer-Tick),
             // nicht gegen einen Zustand. Erreichbar ist es gemessen und nicht gehofft: der
@@ -4377,7 +4891,7 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             // Hoechststand `0`, und `0` waere von „alles kurz" nicht zu unterscheiden. Deshalb
             // verlangt das Urteil ausdruecklich `MESSUNG_VORHANDEN`, eine vollstaendige Eichung
             // und eine Mindestzahl gemessener Haltungen.
-            ("sperre", crate::sperrmark::urteil()),
+            ("sperre", crate::befund::Befund::from(crate::sperrmark::urteil())),
             // **C9b: die Schreibordnung der Konsole.** Gattert von Anfang an, und ihr Kriterium
             // ist gegen die WIRKUNG formuliert: nicht „ist der Umbau da", sondern „ist ein Byte
             // an der Ordnung vorbeigegangen". Genau das ist die einzige Richtung, in der der
@@ -4387,31 +4901,31 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             // **Faellt die Ausgabe aus, faellt dieses Konjunkt**: ohne Bloecke ist `rueckritt`
             // trivialerweise 0, und das waere von „alles sauber" nicht zu unterscheiden. Deshalb
             // steht die Sprechprobe `bloecke >= MIND_BLOECKE` mit im Urteil.
-            ("konsole", crate::sperrmark::konsole_urteil()),
+            ("konsole", crate::befund::Befund::from(crate::sperrmark::konsole_urteil())),
             // **Die Wache unter der Guard-Page** (2026-08-10). Gattert von Anfang an, und ihr
             // Kriterium ist gegen die WIRKUNG formuliert: der Vektor wird ausgeloest, und die
             // Frame-Adresse muss in der Region liegen, die fuer genau ihn gedacht ist. Ein
             // IST-Eintrag, der nie benutzt wurde, ist von einem falsch aufgesetzten nicht zu
             // unterscheiden -- eine Zeile, die nur die Konfiguration LIEST, waere deshalb genau
             // die Sorte gruene Zeile, die nichts gattert.
-            ("ist", super::ist::urteil()),
+            ("ist", crate::befund::Befund::from(super::ist::urteil())),
             // **Seit dem 2026-08-09 gattert `fp` wirklich.** Vorher stand die Zeile bewusst
             // draussen, weil ihr Kriterium („alle 64 Abgaben") unerreichbar war und die Suite
             // dauerhaft rot gefaerbt haette. Mit einem erreichbaren Kriterium waere ein
             // Draussenbleiben das Gegenteil: eine gruene Zeile, die nichts gattert -- genau der
             // `pdbind`-Fehler drei Zeilen weiter oben.
-            ("fp", fp_urteil()),
+            ("fp", crate::befund::Befund::from(fp_urteil())),
             // **Der Ueberlauf ist BENANNT, nicht bloss verhindert** (D11). Die Schranke ist die
             // Hoechstzahl der Manifest-Eintraege, also hergeleitet -- damit ist der Fall heute
             // unerreichbar. Das Konjunkt ist die Ratsche dagegen, dass jemand die Schranke senkt.
-            ("clientntfn", crate::loader::client_notification_stats().1 == 0),
+            ("clientntfn", crate::befund::Befund::from(crate::loader::client_notification_stats().1 == 0)),
             // **C8: der Verifiziererthread und seine benannte Absage.** Gattert von Anfang an, und
             // das Kriterium ist gegen die WIRKUNG formuliert: der Ueberlauf wird GEFAHREN (die
             // Schranke muss ihren Hoechststand wirklich erreicht haben), der Ueberlaeufer bekommt
             // `ERR_LOAD_BUSY`, ist NICHT blockiert und laeuft nachweislich weiter, waehrend die
             // Bedienten wegen `LOAD` warten. Ohne Messung ist das Urteil `false` -- eine nie
             // gefahrene Absage darf nicht wie eine bestandene aussehen.
-            ("verif", crate::verifizierer::urteil()),
+            ("verif", crate::befund::Befund::from(crate::verifizierer::urteil())),
             // **Z26/A3, die Nutzlast.** Gattert von Anfang an, und das Kriterium ist gegen die
             // WIRKUNG formuliert: der Gast bekommt einen Wert zurueck, den nur jemand liefern
             // kann, der seinen Frame im Sidecar GELESEN hat (Antwort = Argument + 1), und ein
@@ -4420,11 +4934,11 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             //
             // **Ohne Messung ist das Urteil `false`** -- ein nie gefahrener Umlauf darf nicht wie
             // ein bestandener aussehen (dieselbe Regel wie bei `verif`).
-            ("redirect", system::handlermess::redirect_urteil()),
+            ("redirect", crate::befund::Befund::from(system::handlermess::redirect_urteil())),
             // Z26/A3, der Kernel-Pruefpfad: kein fremder Wecker hebt den Handler-Grund auf. Eine
             // ANDERE Aussage als `redirect` -- sie laesst sich nur ohne echten Gast messen, weil
             // sie von der Abwesenheit einer Wirkung handelt.
-            ("handler", system::handlermess::urteil()),
+            ("handler", crate::befund::Befund::from(system::handlermess::urteil())),
             // **Z6 stage 1: gates from the first day.** Its criterion is formulated against the
             // EFFECT (no two online logical CPUs share a physical core), recomputed from the IDs
             // that actually came up — not against the policy's own bookkeeping, which would hold
@@ -4435,25 +4949,66 @@ fn all_done(archive: bool, warum: Option<&mut [(&'static str, bool); DONE_FLAGS]
             // trivially true. **That is exactly why the suite also runs a `threads=2` pass** — a
             // conjunct whose antecedent never occurs is the RMRR-on-q35 trap, and it would sit
             // here looking green forever. See `tools/smt-messen.sh`.
-            ("smt", SMT_OK.load(Ordering::Acquire)),
+            ("smt", crate::befund::Befund::from(SMT_OK.load(Ordering::Acquire))),
             // Z8/N1: gates from the first day. Its criterion is formulated against the EFFECT
             // (was the topology read, is it whole, does the placement bookkeeping rest on a
             // trustworthy picture) and it is reachable: a machine without an SRAT reads
             // `readable=false`, which is allowed, while a TRUNCATED table fails -- "no statement"
             // and "a wrong statement" are different outcomes.
-            ("numa", NUMA_OK.load(Ordering::Acquire)),
+            ("numa", crate::befund::Befund::from(NUMA_OK.load(Ordering::Acquire))),
+            // **Drei Sonden, die bis 2026-08-25 gar nicht gatterten.** Ihre `urteil()` waren
+            // allesamt tot (`never used`) -- die gedruckte Zeile las nur `grep` in der Suite, im
+            // Kernel hing an ihr nichts. Das ging nicht anders, solange der Ausgang ein `bool`
+            // war: ein Ressourcen-SKIP haette den Lauf in den Watchdog geschickt. Mit dem dritten
+            // Wert haengen sie hier, und ein SKIP steht im Bericht statt ihn aufzuhalten.
+            ("dbg", crate::dbgprobe::urteil()),
+            ("pdfreeze", crate::pdfreeze::urteil()),
+            ("ckptcut", crate::ckptcut::urteil()),
+            ("arena", crate::spawnarena::urteil()),
+            ("dmapool", DMAPOOL_BEFUND.lesen()),
+            ("irqmsi", IRQMSI_BEFUND.lesen()),
+            // **BERICHTIGT 2026-08-26 -- was diese letzten fuenf Eintraege WIRKLICH tun.**
+            //
+            // Hier stand an `arena` „haengt vom ersten Tag an -- eine Zeile, die nur `grep` in der
+            // Suite liest, gattert nichts". Der zweite Halbsatz stimmt, der erste nicht: `dbg`,
+            // `pdfreeze`, `ckptcut`, `arena` und `dmapool` werden alle in **`report_and_off`**
+            // gemessen, also NACHDEM `all_done()` entschieden hat. Gemessen statt erschlossen: ein
+            // Lauf mit `arena : FAILURES` endete mit `SELFTEST COMPLETE` und OHNE Watchdog.
+            //
+            // Was der Eintrag hier bewirkt, ist deshalb genau eines: die Zeile erscheint in der
+            // `offen waren:`-Aufzaehlung des Berichts. **Gegattert wird von der Suite** (`check`,
+            // Rueckgabecode 1) -- und das ist auch der Grund, warum diese Sonden ueberhaupt hier
+            // unten stehen duerfen: sie belegen PDs, Threads und Speicher, und ein Test, der
+            // Speicher belegt, kippt baseline-empfindliche Tests weiter oben.
+            //
+            // *Ein Urteil, das in `all_done()` steht, darf nicht erst im Bericht entstehen* -- die
+            // Regel gilt weiter. Diese fuenf sind die benannte Ausnahme: ihr Gatter ist die Suite,
+            // und dieser Absatz ist die Stelle, an der das steht statt in einem Commit-Text.
     ];
     if let Some(w) = warum {
         *w = flags;
     }
-    flags.iter().all(|&(_, v)| v)
+    // **Nur `Durchgefallen` gattert** (2026-08-25). Ein `NichtGefahren` haelt den Bericht nicht
+    // auf -- es steht IN ihm. Ob ein SKIP an dieser Stelle hinnehmbar ist, entscheidet die Suite
+    // und nicht der Kernel: die Hauptsuite darf `vnet` ueberspringen (keine Karte), die
+    // Lade-Suite nicht (sie bringt eine). Genau diese Aufteilung faehrt die `endow`-Zeile schon.
+    !flags.iter().any(|&(_, v)| v.gattert())
 }
 
 /// Wie viele Einzelaussagen [`all_done`] prueft.
 ///
 /// 2026-08-17: 41 -> 42 durch `smt` (Z6 Stufe 1), 42 -> 43 durch `numa` (Z8 N1).
+/// 2026-08-25: 43 -> 46 durch `dbg`, `pdfreeze`, `ckptcut` -- drei Sonden, deren Urteil bis dahin
+/// **nirgends gelesen** wurde (ihre `urteil()` meldete rustc als `never used`).
+/// 2026-08-26: 48 -> 49 durch `irqmsi` (Stufe B, B1+B2+B3).
+///
+/// **Der Eintrag gattert hier NICHT**, und das ist wichtig genug fuer eine eigene Zeile: `irqmsi`
+/// wird -- wie `dmapool`, `arena`, `ckptcut`, `pdfreeze`, `dbg` -- in `report_and_off` gemessen,
+/// also **nachdem** `all_done()` entschieden hat. Was gattert, ist die **Suite** (`check`,
+/// Rueckgabecode 1). Der Eintrag bewirkt genau eines: die Zeile erscheint in der
+/// `offen waren:`-Aufzaehlung. Gemessen, nicht erschlossen -- s. das Register in `CLAUDE.md`.
 #[cfg(feature = "selftest")]
-const DONE_FLAGS: usize = 43;
+const DONE_FLAGS: usize = 49;
 
 /// A1 auf dem regulaeren Weg -- Ergebnis der EINMALIGEN Messung (s. Schritt 2 der Ladefolge).
 #[cfg(feature = "selftest")]
@@ -5618,9 +6173,37 @@ fn report_and_off(watchdog: bool) -> ! {
     crate::dbgmem::messen(system::IDLE_PRIO);
     crate::dbgmem::bericht();
 
+    // Z23/S3: der Gruppenschnitt. **Arch-neutral und von BEIDEN Zweigen gefahren** -- die geprueften
+    // Stellen (Scheduler-Grundmenge, Endpoint-Rollen, PD-Tabelle) sind es auch. Sie laeuft NACH der
+    // Debugger-Sonde, weil sie drei PDs und fuenf Threads belegt und ein Test, der Speicher belegt,
+    // baseline-empfindliche Tests kippt (Fallenliste).
+    crate::pdfreeze::messen(system::IDLE_PRIO);
+
+    // Z4d stage 1: the checkpoint cut. **Arch-neutral and run by BOTH paths**, and deliberately
+    // right behind the group cut: it asks the same question one level up (a relationship whose
+    // both ends lie inside the cut is not an open relationship of the cut) but about a
+    // CHECKPOINT's scope instead of a PD's threads. Two PDs and four threads, so it sits late for
+    // the same reason `pdfreeze` does -- a test that allocates memory tips baseline-sensitive
+    // tests (Fallenliste).
+    crate::ckptcut::messen(system::IDLE_PRIO);
+
+    // K1b: mehrere Thread-Stapel aus EINER Memory-Cap. **Arch-neutral, von BEIDEN Wegen gefahren**,
+    // und aus demselben Grund spaet wie `ckptcut`: eine PD, sechs Threads und zwei Regionen -- ein
+    // Test, der Speicher belegt, kippt baseline-empfindliche Tests (Fallenliste).
+    //
+    // Er ist zugleich der ERSTE Lauf von `SYS_SPAWN` ueberhaupt: der Syscall steht seit dem
+    // 2026-08-17 in der ABI und hatte bis heute keinen Aufrufer und kein Gatter.
+    crate::spawnarena::messen();
+    crate::tlsprobe::messen();
+    crate::uhr::messen();
+
     // A-5.3 -- hier, nicht beim Start des Root-Tasks: die Treiber-PD entsteht erst, wenn `init`
     // laeuft und `SYS_LOAD` ruft.
     devsel_bericht();
+    // C2: die Pools stehen direkt daneben -- dieselbe Quelle (`DRIVER_ASSIGN`), andere Frage.
+    #[cfg(feature = "selftest")]
+    dmapool_bericht();
+    irqmsi_bericht();
 
     let sa = system::sched_audit_all();
     let cdt = system::cap_audit_cdt();
@@ -5636,6 +6219,83 @@ fn report_and_off(watchdog: bool) -> ! {
         "audit   : {}",
         if sa == 0 && cdt == 0 { "ALL PASS" } else { "FAILURES" }
     );
+
+    // --- Das Endowment wird VERBUCHT (2026-08-25) -----------------------------------------------
+    //
+    // Die Zeile hat drei Ausgaenge und nicht zwei, und der dritte ist der Grund, warum sie etwas
+    // sagt: diese Suite bootet **ohne Boot-Archiv**, laedt also kein Programm, und dann ist
+    // „keine Zusage gebrochen" von „nichts gemessen" nicht zu unterscheiden. Entschieden wird
+    // deshalb an `geprueft`, nicht an den beiden Zahlen darunter.
+    //
+    // `angebote` ist kein Fehler: `init` bietet jedem Kind seine Notification an und kann dessen
+    // Domaene nicht kennen; jede HardwareLand-PD lehnt sie ab (`cap_allowed`). Bis heute geschah
+    // das **still** -- und genau deshalb behauptet die Doku-Tabelle in `virtio-blk` bis heute,
+    // in Slot 0 laege eine Notification.
+    {
+        let (geprueft, gebrochen, angebote) = system::endowment_bilanz();
+        if geprueft == 0 {
+            println!(
+                "endow   : SKIP (kein Programm geladen -- diese Suite hat kein Boot-Archiv, der Ladepfad wurde also nicht gefahren. Die Zahlen stuenden auf 0, ohne dass etwas gemessen waere)"
+            );
+        } else {
+            println!(
+                "endow   : {} (geprueft={geprueft} Zusagen-gebrochen={gebrochen} Angebote-abgelehnt={angebote}) -- eine Zusage des signierten Manifests, die sich nicht installieren laesst, weist den Ladevorgang ab, BEVOR etwas alloziert ist; ein Angebot des Aufrufers darf eine Zieldomaene ablehnen und wird gezaehlt",
+                if gebrochen == 0 { "ALL PASS" } else { "FAILURES" }
+            );
+        }
+    }
+
+    // --- Ein Dienst OHNE Geraet ist auffindbar (2026-08-25) -------------------------------------
+    //
+    // Die Aussage, um die es geht: **der Client bekommt den Endpoint DES DIENSTES, nicht einen
+    // frischen.** Genau das ging bis heute nicht -- `set_driver_service` lief nur auf dem
+    // HardwareLand-Zweig, ein Client mit `service_id` auf eine geraetelose PD bekam `None` und
+    // danach einen unverbundenen Endpoint. Beide Seiten haetten einen Kanal gehabt und keinen
+    // gemeinsamen.
+    //
+    // Gemessen wird eine **Gleichheit** und eine **Ungleichheit**, nicht ein Rueckgabewert:
+    // die Endpoint-ID in Slot 2 des Clients muss die des Dienstes sein UND darf nicht die eines
+    // anderen Dienstes sein. Ohne die zweite Haelfte belegte die erste nur, dass irgendein
+    // Endpoint dort steht.
+    {
+        // **Gelesen wird die ERFASSUNG aus dem Endowment**, nicht der Cap-Slot der PD. Der erste
+        // Anlauf tat das Zweite und meldete `client-trifft-dienst=false` -- richtig gemessen, nur
+        // an der falschen Stelle: `wasmhost` ist zu diesem Zeitpunkt fertig und **tot**
+        // (`Thread existiert=false, im-Register=true`), seine PD abgebaut, der Slot weg.
+        let ep_in_slot2 =
+            |program_id: u32| -> Option<u32> { crate::loader::client_ep_of(program_id).map(|e| e as u32) };
+        let dienst = crate::loader::driver_service_of(DIENST_PROG_ID);
+        let blk = crate::loader::driver_service_of(TEST_BLK_SERVICE_ID);
+        let registriert = dienst.is_some();
+        let client_ep = ep_in_slot2(DIENST_CLIENT_PROG_ID);
+        let dienst_ep = dienst.map(|s| s.ep as u32);
+        let client_trifft = client_ep.is_some() && client_ep == dienst_ep;
+        // Die Gegenprobe: es ist NICHT der Kanal des Blockdienstes. Ohne sie waere „der Client hat
+        // einen Endpoint" von „der Client hat den RICHTIGEN Endpoint" nicht zu unterscheiden.
+        let nicht_fremd = match (client_ep, blk.map(|s| s.ep as u32)) {
+            (Some(c), Some(b)) => c != b,
+            // Kein Blockdienst -> die Unterscheidung ist hier nicht entscheidbar, und das ist
+            // etwas anderes als bestanden.
+            _ => false,
+        };
+        if crate::loader::thread_of_program(DIENST_PROG_ID).is_none() {
+            println!(
+                "dienst  : SKIP (Programm {DIENST_PROG_ID} nicht geladen -- diese Suite hat keine \
+                 Startmenge mit einem geraetelosen Dienst)"
+            );
+        } else {
+            let ok = registriert && client_trifft && nicht_fremd;
+            println!(
+                "dienst  : {} (registriert={registriert} client-trifft-dienst={client_trifft} \
+                 nicht-fremder-kanal={nicht_fremd} dienst-ep={:?} client-ep={:?}) -- eine PD OHNE \
+                 Geraet wird unter ihrer program_id registriert, und ein Client, der sie mit \
+                 service_id benennt, bekommt IHREN Endpoint statt eines frischen",
+                if ok { "ALL PASS" } else { "FAILURES" },
+                dienst_ep,
+                client_ep
+            );
+        }
+    }
 
     // --- B-5.1: wird der Verbrauch gestempelt oder getickt? -------------------------------------
     //
@@ -6184,14 +6844,19 @@ pub fn run(multiboot_info: u64) -> ! {
                         "FAILURES"
                     }
                 );
-                VNET_OK.store(
-                    r.features_ok && r.tx_used && r.rx_used && r.arp_reply,
-                    Ordering::Release,
-                );
+                VNET_BEFUND
+                    .gemessen(r.features_ok && r.tx_used && r.rx_used && r.arp_reply);
             }
             None => {
-                println!("vnet    : SKIP (keine virtio-net-Karte am Bus)");
-                VNET_OK.store(true, Ordering::Release); // nicht anwendbar, s. `vblk` daneben
+                println!(
+                    "vnet    : SKIP (keine virtio-net-Karte am Bus -- die Frage ist hier nicht \
+                     entscheidbar, und das ist weder bestanden noch durchgefallen)"
+                );
+                // **Bis 2026-08-25 stand hier `store(true)`** -- der einzige Netzbeleg des
+                // Systems meldete sich als BESTANDEN, wenn das Geraet fehlt. Seither sagt die
+                // Sonde `NichtGefahren`, `all_done()` laesst sie durch (ein SKIP darf den Bericht
+                // nicht aufhalten), und ob ein SKIP hier hinnehmbar ist, entscheidet die SUITE.
+                VNET_BEFUND.uebersprungen();
             }
         }
     }
@@ -6432,6 +7097,7 @@ pub fn run(multiboot_info: u64) -> ! {
         let common = t.common_addr();
         let mut bar = 0u64;
         let mut bar_len = 0u64;
+        let mut bar_index = usize::MAX;
         for i in 0..6 {
             let b = d.bars[i];
             if b == 0 {
@@ -6441,17 +7107,61 @@ pub fn run(multiboot_info: u64) -> ! {
             if len != 0 && common >= b && common < b + len {
                 bar = b;
                 bar_len = (len + 0xfff) & !0xfff;
+                bar_index = i; // E11: die MSI-X-Pruefung fragt nach dem INDEX, nicht der Adresse
                 break;
             }
         }
         if bar == 0 {
             return;
         }
+        // --- Stufe B / E11: die MSI-X-Tabelle, und die Bedingung, unter der das Geraet ueberhaupt
+        // vergeben wird ---------------------------------------------------------------------
+        //
+        // **Liegt die Tabelle in der BAR, die der Treiber bekommt, wird das Geraet NICHT
+        // angeboten.** Er koennte sonst Adresse und Datenwort selbst schreiben und damit waehlen,
+        // wo sein Interrupt landet -- SVT/SID faengt die Zustellung, aber es gibt keinen Grund,
+        // sich auf die zweite Linie zu verlassen, wenn die erste umsonst ist.
+        //
+        // Dass es heute nie zutrifft (virtio-pci legt die Tabelle in eine andere BAR als die
+        // Common-Config), ist genau der Grund, warum die Bedingung hier steht: *eine Eigenschaft,
+        // die aus einer Groessenrelation folgt statt aus der Struktur, verschwindet beim naechsten
+        // Messwert.* Aussparen waere die Alternative und ist schlechter -- seitengranulare Loecher
+        // in einer Region, die der Treiber sonst ganz besitzt.
+        let msix = hal::pcie::msix_find(d);
+        let (msix_cap, msix_table, msix_eintraege) = match msix {
+            Some(m) => {
+                if hal::pcie::msix_in_bar(&m, bar_index) {
+                    println!(
+                        "devassign: RID {:#06x} NICHT angeboten -- die MSI-X-Tabelle liegt in der \
+                         BAR {bar_index}, die der Treiber bekaeme (E11: der Vektor ist keine \
+                         Autoritaet des Treibers)",
+                        d.rid()
+                    );
+                    return;
+                }
+                let basis = d.bars[m.bar as usize];
+                if basis == 0 {
+                    // BAR not assigned -> no interrupt, but the device is still usable.
+                    // **`m.cap` is kept anyway**, and that is the point: it is the only thing that
+                    // tells "this device has no MSI-X at all" (lawful polling) apart from "it
+                    // offers MSI-X and did not get a vector" (a failed grant). Answering `(0,0,0)`
+                    // here made the two indistinguishable downstream -- the same shape as C2's
+                    // requested-beside-granted.
+                    (m.cap, 0, 0)
+                } else {
+                    (m.cap, basis + m.offset as u64, m.eintraege)
+                }
+            }
+            None => (0, 0, 0),
+        };
         let ok = system::offer_driver_device(system::DriverDevice {
             rid: d.rid(),
             cfg_page: hal::pcie::cfg_page(d),
             bar,
             bar_len,
+            msix_cap,
+            msix_table,
+            msix_eintraege,
             vendor: d.vendor,
             device: d.device,
             class: d.class,
@@ -6606,6 +7316,19 @@ pub fn run(multiboot_info: u64) -> ! {
             "verif   : FAILURES (Verifiziererthread liess sich nicht starten -- SYS_LOAD ist damit tot)"
         );
     }
+    // **Z8/N1: die Topologie MUSS vor dem Lader gelesen sein** (gemessen 2026-08-20).
+    //
+    // Sie stand bis heute elf Zeilen weiter unten -- also NACH `start_root_task_reported`. Der
+    // Knoten-Gatter des Laders (`zahlenpolitik_gate`) fragte damit eine leere Topologie und wies
+    // jeden `numa_node`-Wunsch mit „die Maschine hat keine tragfaehige Topologie" ab, **auf einer
+    // Maschine mit zwei Knoten**. Die Zeile war nicht falsch, sie war zu frueh gefragt.
+    //
+    // Gefunden hat es der neue Positivfall der Lade-Suite: `numa : readable=true nodes=2` in
+    // derselben Ausgabe wie `loader : ... readable=false`. Zwei Aussagen ueber dieselbe Groesse in
+    // einem Lauf -- die Sorte Widerspruch, die ein Negativtest allein nie zeigt, weil dort BEIDE
+    // Zeilen „nein" sagen und man den Grund nicht sieht.
+    crate::numa::init();
+
     let root_ok = crate::loader::start_root_task_reported();
     let _ = root_ok;
 
@@ -6617,7 +7340,6 @@ pub fn run(multiboot_info: u64) -> ! {
     // the moment before `cpu_on`.
     // **Z8/N0+N1: die Topologie VOR dem AP-Hochlauf lesen** -- die AP-Stacks sollen gleich
     // knotenlokal belegt werden, und danach waere die Frage schon entschieden.
-    crate::numa::init();
     let topo = hal::cpu::smt_topology();
     let mut occ = caprock_hal::smt::CoreOccupancy::new();
     let boot_id = hal::cpu::core_id() as u8;
@@ -6760,14 +7482,17 @@ pub fn run(multiboot_info: u64) -> ! {
                 super::ist::df_wache_ausloesen();
             }
             if sekunden > 60 || spins > 5_000_000_000 {
-                let mut w = [("", true); DONE_FLAGS];
+                let mut w = [("", crate::befund::Befund::Bestanden); DONE_FLAGS];
                 let _ = all_done(archive, Some(&mut w));
                 println!(
                     "bringup : WATCHDOG — nicht alle Aussagen belegt (nach {sekunden}s, {spins} Umdrehungen)"
                 );
                 print!("bringup : offen waren:");
-                for (name, ok) in w.iter() {
-                    if !ok {
+                for (name, b) in w.iter() {
+                    // **Nur das Offene nennen, und SKIP ist nicht offen.** Ein uebersprungener
+                    // Punkt hat den Watchdog nicht verursacht -- ihn hier mitzudrucken schickte
+                    // den naechsten Leser an die falsche Stelle.
+                    if b.gattert() {
                         print!(" {name}");
                     }
                 }
@@ -6807,7 +7532,7 @@ pub fn run(multiboot_info: u64) -> ! {
             //
             // Genau EIN `all_done` je Umdrehung wie bisher: die Zeugenliste ersetzt den alten
             // Aufruf, und der zweite entsteht nur, wenn ohnehin alles andere steht.
-            let mut offen = [("", true); DONE_FLAGS];
+            let mut offen = [("", crate::befund::Befund::Bestanden); DONE_FLAGS];
             let _ = all_done(archive, Some(&mut offen));
             // C8. **An eine BEDINGUNG gebunden, nicht an eine Zeile** -- aus demselben Grund wie
             // der Sweep darunter: die Messung haelt den Verifizierer an und legt SONDEN PDs an.
@@ -6815,7 +7540,7 @@ pub fn run(multiboot_info: u64) -> ! {
             // Suite, und der Ladepfad braeuchte genau den Thread, den sie pausiert.
             if offen
                 .iter()
-                .all(|&(name, ok)| ok || name == "verif" || name == "sweep")
+                .all(|&(name, b)| !b.gattert() || name == "verif" || name == "sweep")
             {
                 crate::verifizierer::messen();
             }
@@ -6826,7 +7551,7 @@ pub fn run(multiboot_info: u64) -> ! {
             // Die Reihenfolge bleibt gewahrt: `messen()` steht oben in derselben Umdrehung.
             if offen
                 .iter()
-                .all(|&(name, ok)| ok || name == "sweep" || name == "verif")
+                .all(|&(name, b)| !b.gattert() || name == "sweep" || name == "verif")
             {
                 let _ = sweep_messen();
                 if all_done(archive, None) {

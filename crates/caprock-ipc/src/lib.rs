@@ -217,6 +217,27 @@ impl Quiescence {
     }
 }
 
+/// **One of the four roles**, singular — the counterpart to [`Quiescence`], which answers "which
+/// roles does *this* thread hold" for one thread at a time.
+///
+/// The two are not redundant. `Quiescence` is asked **per thread** and is the right shape for "may
+/// this thread be frozen"; `Role` comes back from [`Endpoint::occupants`], which asks the opposite
+/// question — **who is here at all** — and that one cannot be answered by asking about a thread you
+/// would have to name first. Z4d stage 1 needs exactly that direction: an endpoint that migrates
+/// must not leave a participant behind, and the participant is by definition someone the checkpoint
+/// never listed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Role {
+    /// Blocked sender: `CALL` issued, no server has taken it.
+    Sender,
+    /// Blocked receiver: waiting in `RECV` — or, at a notification, in `WAIT`.
+    Receiver,
+    /// Waiting as a caller for a reply; the reply token points at him.
+    Caller,
+    /// Owes a reply as a server.
+    ReplyOwner,
+}
+
 /// **Warum ein Umbinden nicht stattfinden konnte** (A-4.1) — aufgeschlüsselt, nicht zu
 /// einem Bit vermengt. [`Endpoint::is_idle`] beantwortet „ruht der Endpoint?" mit ja/nein;
 /// für einen abgewiesenen Austausch ist das zu wenig, weil die drei Fälle **verschieden**
@@ -336,6 +357,40 @@ impl Endpoint {
         self.caller
     }
 
+    /// **Der PARTNER eines Threads an diesem Endpoint** (Z23/S2) — wer haelt ihn fest?
+    ///
+    /// `Quiescence` sagt, in welcher der vier Rollen ein Thread steht; es sagt **nicht, mit wem**.
+    /// Fuer einen Prozess-Freeze ist genau das die Auskunft, die zaehlt: „nicht einfrierbar" ist
+    /// als Diagnose wertlos, „nicht einfrierbar, weil Thread X auf Server Y wartet" ist eine
+    /// Handlungsanweisung.
+    ///
+    /// | Rolle von `tid` | Partner |
+    /// |---|---|
+    /// | wartet als Aufrufer auf eine Antwort | der **Reply-Owner** — der Server, der schuldet |
+    /// | schuldet als Server eine Antwort | der **Aufrufer**, der wartet |
+    /// | steht in `RECV` / in der Senderschlange | **keiner** — es gibt noch kein Gegenüber |
+    ///
+    /// Die letzte Zeile ist der Punkt, an dem eine bequeme Fassung falsch wuerde: ein wartender
+    /// Empfaenger hat **keinen** Partner, und einen zu erfinden waere schlimmer als keiner zu
+    /// nennen — man zoege den Falschen zur Rechenschaft.
+    ///
+    /// **An WEN diese Auskunft gehen darf, entscheidet der Aufrufer, nicht diese Funktion**, und
+    /// die Regel steht in `todo.md` Z23/S2: an den Halter der Freeze-Autoritaet, **nie** an die
+    /// eingefrorene PD. Eine Fehlermeldung mit einem fremden Threadnamen darin ist ein Kanal, mit
+    /// dem sich die IPC-Topologie anderer PDs ausforschen laesst.
+    pub fn partner_of(&self, tid: ThreadId) -> Option<ThreadId> {
+        if !self.used {
+            return None;
+        }
+        if self.caller == Some(tid) {
+            return self.reply_owner;
+        }
+        if self.reply_owner == Some(tid) {
+            return self.caller;
+        }
+        None
+    }
+
     /// Einen blockierten Empfänger zurückziehen (Hot-Reload). Der Thread bleibt
     /// danach blockiert (geparkt). Gibt `true`, falls er Empfänger war.
     pub fn retire_receiver(&mut self, tid: ThreadId) -> bool {
@@ -370,6 +425,35 @@ impl Endpoint {
         self.quiescing
     }
 
+    /// **Wie viele Empfaenger warten hier?** (Z23/S3)
+    ///
+    /// Der Gruppenschnitt braucht die Unterscheidung „ich bin der EINZIGE Server an diesem Kanal"
+    /// von „hier bedient auch jemand anderes". Nur im ersten Fall darf er den Kanal nach innen
+    /// zusperren: ein Riegel an einem geteilten Endpoint fröre **Dritte** mit ein, die mit dem
+    /// Freeze nichts zu tun haben — genau der Einwand, an dem S1 sich fuer das Subjekt-Gating
+    /// entschieden hat.
+    pub fn receiver_count(&self) -> usize {
+        if self.used {
+            self.receivers.count
+        } else {
+            0
+        }
+    }
+
+    /// **Wie viele Sender stehen an?** (Z23/S3 — und das ist eine Sprechprobe, keine Auskunft.)
+    ///
+    /// Die tragende Invariante des Schnitts lautet: *wartet hier ein Empfaenger, ist die
+    /// Senderschlange leer* — denn ein Sender und ein Empfaenger treffen sich sofort. Der Schnitt
+    /// **fragt das nach**, statt es zu glauben; findet er beides zugleich, weist er ab, statt auf
+    /// einer Annahme weiterzubauen, die gerade nachweislich nicht gilt.
+    pub fn sender_count(&self) -> usize {
+        if self.used {
+            self.senders.count
+        } else {
+            0
+        }
+    }
+
     /// **Ruhepunkt-Befund für einen Thread** an diesem Endpoint: in welchen der vier Rollen
     /// steht er noch? Siehe [`Quiescence`].
     ///
@@ -387,6 +471,51 @@ impl Endpoint {
             as_caller: self.caller == Some(tid),
             as_reply_owner: self.reply_owner == Some(tid),
         }
+    }
+
+    /// **Who stands at this endpoint, and in which role?** (Z4d stage 1)
+    ///
+    /// The inverse of [`quiescence_of`](Self::quiescence_of), and the direction that could not be
+    /// expressed before: that one answers for a thread you can already name — this one enumerates. A
+    /// checkpoint that takes an endpoint along has to know **every** participant, and the dangerous
+    /// participant is precisely the one nobody wrote down.
+    ///
+    /// **One entry per role, not per thread.** A thread can hold two roles here at once (a server
+    /// that owes a reply and is queued as a sender for its next call); merging them would need a
+    /// deduplicating pass, and the needed capacity a full buffer reports would then be a guess.
+    /// One entry per role keeps `Err(needed)` **exact**, and it is the shape the caller wants
+    /// anyway: a refusal names the role, not just the thread.
+    ///
+    /// **The overflow is named** (D11): `Err(needed)` and not a truncated list. A silently
+    /// shortened list of participants is the worst possible outcome here — it is exactly a
+    /// participant left behind, which is the thing this call exists to prevent.
+    pub fn occupants(&self, out: &mut [(ThreadId, Role)]) -> Result<usize, usize> {
+        if !self.used {
+            return Ok(0);
+        }
+        let mut n = 0usize;
+        let mut need = 0usize;
+        {
+            let mut push = |t: ThreadId, r: Role| {
+                need += 1;
+                if n < out.len() {
+                    out[n] = (t, r);
+                    n += 1;
+                }
+            };
+            self.senders.for_each(|t| push(t, Role::Sender));
+            self.receivers.for_each(|t| push(t, Role::Receiver));
+            if let Some(c) = self.caller {
+                push(c, Role::Caller);
+            }
+            if let Some(o) = self.reply_owner {
+                push(o, Role::ReplyOwner);
+            }
+        }
+        if need > out.len() {
+            return Err(need);
+        }
+        Ok(n)
     }
 
     /// **Die Torentscheidung für eine NEUE Transaktion** (`CALL`/`RECV`), als reine Funktion:
@@ -608,7 +737,13 @@ impl Endpoint {
     /// Nachricht in seinen (blockierten) Frame übertragen und er per `unblock`
     /// (+IPI) geweckt; der Aufrufer blockiert auf seinem Kern. Auf demselben Kern:
     /// Rendezvous-Fastpath (`switch_to`).
-    pub fn call(&mut self, ops: &mut dyn SchedOps, core: usize, frame: usize) -> usize {
+    pub fn call(
+        &mut self,
+        ops: &mut dyn SchedOps,
+        core: usize,
+        frame: usize,
+        badge: u64,
+    ) -> usize {
         // A-4.2: stillgelegt -> keine NEUE Transaktion. Der Aufrufer bekommt sofort einen
         // benennbaren Fehler, statt als Sender einzureihen und auf einen Server zu warten,
         // der gerade ausgetauscht wird. Auch ein wartender Empfänger wird dann bewusst NICHT
@@ -618,6 +753,20 @@ impl Endpoint {
             return frame;
         }
         let caller = ops.current_id(core);
+        // **Das Badge des Aufrufers, abgelegt in SEINEM Frame** (2026-08-25).
+        //
+        // Hier und nicht in der Warteschlange, und das ist die ganze Entwurfsentscheidung. Beim
+        // `RECV` ist der Server am Zug; der Dispatch loest **dessen** Badge auf, nicht das des
+        // Wartenden. Die naheliegende Fassung -- ein Badge je Warteschlangeneintrag -- kostet
+        // `2 * QUEUE_CAP * 8` Byte **je Endpoint**, bei `ENDPOINTS_FOR_ALL_PDS = 10 000` also
+        // rund 5 MiB, fuer ein Wort, das schon irgendwo liegt: der Aufrufer blockiert gleich,
+        // und sein Frame bleibt bis zum Rendezvous unberuehrt (`reply` schreibt `SYSNO_RESULT`
+        // und die Nachrichtenwoerter, nicht dieses Register).
+        //
+        // **Faelschungssicher**, weil der KERNEL schreibt und der Aufrufer zwischen diesem
+        // Schreiben und dem Rendezvous nicht laeuft. Was er vorher selbst in `x1` stehen hatte,
+        // war die Endpoint-/Cap-Nummer -- die ist zu diesem Zeitpunkt laengst aufgeloest.
+        frame_set_reg(frame, reg::EP_BADGE, badge);
         // Einen *lebenden* wartenden Empfänger suchen. Ein zwischenzeitlich
         // gekillter/beendeter Empfänger hat keinen Frame mehr (`frame_of` == None)
         // und bleibt als toter Eintrag in der Queue zurück; solche Leichen werden
@@ -628,7 +777,14 @@ impl Endpoint {
             };
             transfer(frame, sframe);
             frame_set_reg(sframe, reg::SYSNO_RESULT, result::OK);
-            frame_set_reg(sframe, reg::EP_BADGE, 0);
+            // **Der Server erfaehrt, WELCHES Badge der Aufrufer haelt** (2026-08-25).
+            //
+            // Bis dahin stand hier `0`, und `reg::EP_BADGE` versprach in der ABI seit jeher
+            // „Austritt: Badge des Senders". Ein Server konnte seine Aufrufer damit nicht
+            // auseinanderhalten -- wer zwei Clients unterscheiden wollte, brauchte zwei
+            // Endpoints. Genau das deckt die Dimensionierung nicht ab
+            // (`ENDPOINTS_FOR_ALL_PDS = NPDS`, „ein Endpoint je PD ist die UNTERE Schranke").
+            frame_set_reg(sframe, reg::EP_BADGE, badge);
             self.caller = Some(caller);
             self.reply_owner = Some(server); // dieser Server schuldet die Antwort
             // Fastpath nur, wenn der Server **auf diesem Kern** lebt. Seit ext-30 kann er
@@ -680,7 +836,12 @@ impl Endpoint {
             };
             transfer(cframe, frame);
             frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
-            frame_set_reg(frame, reg::EP_BADGE, 0);
+            // Dieselbe Aussage von der anderen Seite: der Wartende hat sein Badge bei `call` in
+            // den eigenen Frame gelegt, und dort steht es noch. **Beide Schreiber der
+            // Senderschlange sind `call`-Pfade** -- `call` selbst und `migrate_owner`, das einen
+            // Aufrufer nach einem Serverwechsel erneut einreiht; in beiden Faellen hat der Kernel
+            // das Wort geschrieben. Gaebe es einen dritten, stuende dort ein Rest.
+            frame_set_reg(frame, reg::EP_BADGE, frame_reg(cframe, reg::EP_BADGE));
             self.caller = Some(sender);
             self.reply_owner = Some(server); // dieser Server schuldet die Antwort
             return frame; // Server läuft sofort weiter (kein Wechsel)
@@ -793,6 +954,24 @@ impl Notification {
         Quiescence {
             as_receiver: self.used && self.waiter == Some(tid),
             ..Quiescence::default()
+        }
+    }
+
+    /// **Who waits here?** (Z4d stage 1) — the notification's [`Endpoint::occupants`].
+    ///
+    /// At most one, because `waiter` is a single slot (a capacity of one, whose overflow D11 named
+    /// as `ERR_EP_FULL`). The signature carries the same `Err(needed)` anyway: a caller that sizes
+    /// its buffer from the endpoint case must not silently succeed here on a buffer of zero.
+    pub fn occupants(&self, out: &mut [(ThreadId, Role)]) -> Result<usize, usize> {
+        match self.waiter {
+            Some(w) if self.used => {
+                if out.is_empty() {
+                    return Err(1);
+                }
+                out[0] = (w, Role::Receiver);
+                Ok(1)
+            }
+            _ => Ok(0),
         }
     }
 

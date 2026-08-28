@@ -54,7 +54,53 @@ const NCAPS: usize = 16;
 /// Es ist bewusst deutlich kleiner als `NCAPS`: die vorhandenen PDs nutzen 1–4 Slots, und so
 /// bleibt selbst bei vielen gleichzeitig geladenen PDs Tabellenkapazität für alle übrig.
 /// Überschreitung wird **abgewiesen** (kein Eintrag, keine Ableitung), nie still verworfen.
-pub const CAP_BUDGET_PER_PD: usize = 8;
+///
+/// **8 -> 10 am 2026-08-26 (Stufe B).** Eine Treiber-PD haelt seither neun Caps: das Angebot des
+/// Aufrufers in Slot 0 und die acht des Manifests (Notification, Endpoint, Konfigurationsseite,
+/// BAR, DMA, Uebertragungsflaeche, `Irq`, Interrupt-Notification). Mit 8 war die Zusage des Laders
+/// **unerfuellbar** -- und die Absage kam nicht als „Budget", sondern als eine PD, die laedt und
+/// deren Cap-Slot leer bleibt. *Ein Deckel oberhalb der Struktur ist kein grosszuegiger Deckel*;
+/// hier war es einer **unterhalb**, und das ist dieselbe Klasse.
+///
+/// Die Relation wird seither vom Uebersetzer gehalten: `kernel::loader::LOAD_CAPS_MAX` traegt ein
+/// `const assert` dagegen. Wer einen Slot hinzufuegt, bricht den Bau, statt eine PD lautlos halb
+/// auszustatten.
+pub const CAP_BUDGET_PER_PD: usize = 10;
+
+/// **Obergrenze fuer ein einzelnes PD-Budget** (2026-08-26) — **`NCAPS`, und das ist ein Befund.**
+///
+/// Ohne Deckel koennte eine PD den Vorrat aller anderen aufbrauchen -- dieselbe Cross-PD-DoS-Form,
+/// gegen die [`CAP_BUDGET_PER_PD`] ueberhaupt eingefuehrt wurde, nur eine Ebene hoeher. Der Deckel
+/// steht **neben** dem Vorrat und ersetzt ihn nicht: er begrenzt den Einzelnen, der Vorrat die
+/// Summe. Wer nur eines von beidem hat, hat keine Zusage.
+///
+/// ## Warum er `NCAPS` ist und nicht 64
+///
+/// Hier stand zuerst `64`. Der Selbsttest hat es am selben Tag widerlegt: der **lokale Cspace
+/// einer PD ist ein Array von [`NCAPS`] Slots** (`Pd::cspace`), und `install_cap` weist jeden Slot
+/// `>= NCAPS` ab -- ohne dass das Budget je gefragt wuerde. Ein Budget von 20 ist also kein
+/// grosszuegiges Budget, sondern eine **unerreichbare Zusage**: die Installation scheitert bei 16
+/// an der Struktur, und die Absage traegt nicht einmal den Grund „Budget".
+///
+/// *Ein Kriterium, das die gepruefte Sache nicht erreichen KANN, ist kein strenges Kriterium,
+/// sondern gar keins* -- und ein Deckel ueber der Struktur ist dieselbe Form.
+///
+/// **Damit ist `NCAPS` der eigentliche Blocker fuer eine Treiberumgebung**, nicht das Budget: 16
+/// Slots je PD sind hart, gleich was jemand anfordert. Das Konto hebt die erreichbare Zahl von 8
+/// auf 16 und kostet die anderen zehntausend PDs nichts; darueber hinaus braucht es einen
+/// **variablen** Cspace, und das ist eine eigene Aenderung (s. `todo.md`).
+pub const CAP_BUDGET_MAX: usize = NCAPS;
+
+// Ein Deckel oberhalb des Slot-Arrays waere eine Zusage, die die Struktur nicht halten kann --
+// und sie fiele erst der PD auf, die sie einloest. Fail-closed zur Bauzeit.
+const _: () = assert!(
+    CAP_BUDGET_MAX <= NCAPS,
+    "CAP_BUDGET_MAX ueber NCAPS: der lokale Cspace hat nur NCAPS Slots, das Budget waere unerfuellbar"
+);
+const _: () = assert!(
+    CAP_BUDGET_PER_PD <= CAP_BUDGET_MAX,
+    "die Vorgabe liegt ueber dem Deckel"
+);
 
 /// **Wie viele globale Cap-Slots die Summe aller PD-Budgets braucht** (A-3.4).
 ///
@@ -158,14 +204,73 @@ impl Caps {
         true
     }
 
-    /// Darf PD `pd` den Slot `slot` (neu) belegen, ohne ihr [`CAP_BUDGET_PER_PD`] zu
-    /// überschreiten? Ein **Überschreiben** eines bereits belegten Slots erhöht den
-    /// Verbrauch nicht und ist immer erlaubt.
+    /// Darf PD `pd` den Slot `slot` (neu) belegen, ohne **ihr eigenes** Budget zu überschreiten?
+    /// Ein **Überschreiben** eines bereits belegten Slots erhöht den Verbrauch nicht und ist immer
+    /// erlaubt.
+    ///
+    /// **Seit 2026-08-26 die Zahl der PD, nicht die Konstante.** Sie ist bei der Erzeugung gebucht
+    /// worden (s. [`PdTable::create_mit_budget`]) und steht mit [`CAP_BUDGET_PER_PD`] als Vorgabe
+    /// da, wo niemand mehr wollte. Der Unterschied ist nicht Bequemlichkeit: eine Konstante
+    /// anzuheben kostet den Bedarf **einer** PD mal `NPDS` — rund 7,7 MB je acht Slots.
     pub fn budget_allows(&self, pd: usize, slot: usize) -> bool {
         if self.pds.cap_at(pd, slot).is_some() {
             return true; // Ersetzen, kein zusätzlicher Slot
         }
-        self.pds.cap_count(pd) < CAP_BUDGET_PER_PD
+        self.pds.cap_count(pd) < self.pds.budget_of(pd)
+    }
+
+    /// **Passt ein ganzes Endowment -- ohne etwas zu installieren?** (2026-08-25)
+    ///
+    /// `Ok(n)` = es passt, dabei wurden `n` **Angebote** abgelehnt. `Err(slot)` = eine **Zusage**
+    /// haelt nicht, und zwar an diesem Slot.
+    ///
+    /// ## Warum die Frage hierher gehoert und nicht in den Ladepfad
+    ///
+    /// Weil die Budgetregel hier steht. Ein Vorablauf, der sie im Kernel nachbaut, ist die zweite
+    /// Wirklichkeit aus der Fallenliste — „Zuteiler und Pruefer brauchen EINE Quelle". Und der
+    /// Nachbau waere auch inhaltlich falsch geworden: [`budget_allows`](Self::budget_allows)
+    /// vergleicht gegen den **aktuellen** Verbrauch, also saehe eine Schleife, die jeden Cap
+    /// einzeln fragt, den Zuwachs der vorigen nicht — vier Caps waeren einzeln zulaessig und
+    /// zusammen ueber der Schranke. Hier wird der Zuwachs deshalb **mitgezaehlt**.
+    ///
+    /// ## Angebot gegen Zusage
+    ///
+    /// `angebote` ist eine **Bitmaske der Ziel-Slots**, in denen vom Aufrufer **angebotene** Caps
+    /// liegen (`SYS_LOAD`). Ein Angebot darf eine Zieldomaene ablehnen — `init` bietet jedem Kind
+    /// seine Notification an und kann dessen Domaene gar nicht kennen. Eine Zusage des signierten
+    /// Manifests darf sie nicht ablehnen: dann ist das Programm nicht das, als das es zugelassen
+    /// wurde.
+    ///
+    /// **Eine Maske und nicht ein Slot** (2026-08-25, mit der Mehrfachdelegation): solange
+    /// `SYS_LOAD` genau einen Cap uebergab, war „der angebotene Slot" eindeutig. Mit acht waere
+    /// ein einzelner Wert die erste Delegation — und die uebrigen sieben zaehlten als **Zusagen
+    /// des Manifests**, deren Ablehnung den Ladevorgang abweist. Ein Kardinalwert, wo eine Menge
+    /// gemeint ist, ist genau die Falle, die dieses Projekt bei `IDENTITY_DEBTS` schon bezahlt hat.
+    pub fn endowment_fits(
+        &self,
+        pd: usize,
+        endow: &[(usize, CapPtr)],
+        angebote: u16,
+    ) -> Result<usize, usize> {
+        let mut abgelehnte_angebote = 0usize;
+        let mut neue_slots = 0usize;
+        for &(slot, cap) in endow {
+            // Ein belegter Slot wird ERSETZT und kostet kein Budget — dieselbe Regel wie in
+            // `budget_allows`, und sie steht deshalb auch nur dort.
+            let ist_neu = self.pds.cap_at(pd, slot).is_none();
+            let passt = self.cap_allowed(pd, cap)
+                && (!ist_neu || self.pds.cap_count(pd) + neue_slots < self.pds.budget_of(pd));
+            if passt {
+                neue_slots += usize::from(ist_neu);
+                continue;
+            }
+            if slot < 16 && angebote & (1u16 << slot) != 0 {
+                abgelehnte_angebote += 1;
+                continue;
+            }
+            return Err(slot);
+        }
+        Ok(abgelehnte_angebote)
     }
 
     /// **Die Summenprüfung** (A-3.4, Abschluss): wie viele globale Slots gehen auf **kein**
@@ -231,9 +336,12 @@ impl Caps {
         // anderem als seinem Partner-Kanal erhalten.
         if domain == Domain::HardwareLand {
             let (cep, cntfn) = self.pds.chan_of(pd);
+            let irq = self.pds.irq_ntfn_of(pd);
             match kind {
                 ObjectKind::Endpoint(id) if id != cep => return false,
-                ObjectKind::Notification(id) if id != cntfn => return false,
+                // Kanal-Notification ODER die eigene Interrupt-Notification (B4) -- beide vom
+                // Kernel gewaehlt, beide fuehren zu niemandem sonst.
+                ObjectKind::Notification(id) if id != cntfn && id != irq => return false,
                 _ => {}
             }
         }
@@ -438,6 +546,19 @@ pub struct Pd {
     epoch: u32,
     /// Lokaler Cap-Index -> globaler CapPtr.
     cspace: [Option<CapPtr>; NCAPS],
+    /// **Wie viele Slots diese PD gleichzeitig belegen darf** (2026-08-26).
+    ///
+    /// Bis dahin eine Konstante fuer alle. Das war tragfaehig, solange jede PD 1--4 Slots
+    /// brauchte; mit einer Treiberumgebung braucht **eine** PD dreissig und zehntausend andere
+    /// weiterhin vier. Eine Konstante anzuheben kostet den Bedarf der einen PD **mal `NPDS`** --
+    /// gemessen rund 7,7 MB je zusaetzlichen acht Slots, fuer einen Bedarf, den eine einzige PD
+    /// hat.
+    ///
+    /// Deshalb eine Zahl je PD, gedeckelt durch [`CAP_BUDGET_MAX`] und gedeckt durch den
+    /// **Vorrat** [`PdTable::budget_vorrat`]. Dieselbe Bewegung wie bei `MELDESTELLEN` (von Hand
+    /// gefuehrt -> abgeleitet) und `IDENTITY_DEBTS` (Zahl -> Menge): wo eine Konstante eine
+    /// Buchhaltung vertritt, wird sie irgendwann falsch.
+    cap_budget: u16,
     /// Sicherheitsdomäne — **unveränderlich** nach der Erzeugung (Policy: bestimmt die
     /// erlaubten Cap-Typen + Kommunikationsbeziehungen). Migration = neue PD, nicht umschalten.
     domain: Domain,
@@ -467,6 +588,18 @@ pub struct Pd {
     /// Das Backend darf NUR über diesen Kanal kommunizieren. `u32::MAX` = keiner.
     chan_ep: u32,
     chan_ntfn: u32,
+    /// **Die zweite erlaubte Notification einer HardwareLand-PD** (Stufe B, B4): die, auf der ihr
+    /// Geraeteinterrupt ankommt. `u32::MAX` = keine.
+    ///
+    /// Die Regel darunter -- *ein Backend bekommt Kommunikations-Caps nur fuer seinen eigenen
+    /// Kanal* -- bleibt unveraendert und richtig; sie hat den ersten Anlauf von B4 zu Recht
+    /// abgewiesen. Aufgeweicht wird sie nicht, sondern **erweitert um genau ein Objekt, das der
+    /// Kernel selbst fuer diese PD gepraegt hat**: es verbindet sie mit niemandem. Ein Backend, das
+    /// darauf `signal` ruft, weckt sich selbst.
+    ///
+    /// Eine allgemeine Ausnahme („Notifications sind erlaubt") waere die bequeme Fassung und genau
+    /// der Kanal zu einem Dritten, den die Regel ausschliesst.
+    irq_ntfn: u32,
     /// **Empfangs-Slot für per IPC übertragene Caps** (A-3.2). Der Empfänger legt fest, wo eine
     /// gegrantete Cap landet — nicht der Sender. Voreinstellung ist der frühere feste Slot
     /// ([`caprock_abi::GRANT_RECV_SLOT`]), damit bestehende Programme unverändert laufen.
@@ -556,12 +689,14 @@ impl Pd {
         nthreads: 0,
         epoch: 0,
         cspace: [None; NCAPS],
+        cap_budget: CAP_BUDGET_PER_PD as u16,
         domain: Domain::TrustedSas, // Default: alle Altbestand-PDs sind Trusted-SAS
         quiescing: false,
         partner: None,
         backend_id: 0,
         chan_ep: u32::MAX,
         chan_ntfn: u32::MAX,
+        irq_ntfn: u32::MAX,
         recv_slot: caprock_abi::GRANT_RECV_SLOT,
         handler_pd: KEIN_HANDLER_PD,
         handler_bound: 0,
@@ -644,6 +779,17 @@ pub struct PdTable {
     pds: Slab<Pd>,
     /// Rückwärts-Index Thread-Slot → PD (Z22 P2 / C4). Länge = Thread-Kapazität des Systems.
     owner: Slab<ThreadOwner>,
+    /// **Der noch nicht vergebene Rest des Slot-Vorrats** (2026-08-26).
+    ///
+    /// `CAP_SLOTS_FOR_ALL_PDS` war die **Summe aller Budgets**, solange jedes Budget gleich war.
+    /// Mit Budgets je PD ist dieselbe Zahl ein **Vorrat**, aus dem vergeben wird -- und die
+    /// Zusage „jede PD bekommt ihr Budget" haelt nur, wenn die Vergabe gegen ihn bucht. Ohne
+    /// diesen Zaehler waere sie wieder eine Annahme ueber das Verhalten der PDs, genau wie vor
+    /// A-3.4 (256 vorhandene Slots gegen 2048 zugesagte, und niemand rechnete nach).
+    budget_vorrat: usize,
+    /// Wie oft eine Erzeugung am **Vorrat** gescheitert ist (nicht an einem freien PD-Slot).
+    /// Getrennt gezaehlt, weil die beiden verschiedene Behebungen haben.
+    budget_abgewiesen: u64,
 }
 
 impl Default for PdTable {
@@ -657,6 +803,8 @@ impl PdTable {
         Self {
             pds: Slab::empty(),
             owner: Slab::empty(),
+            budget_vorrat: CAP_SLOTS_FOR_ALL_PDS,
+            budget_abgewiesen: 0,
         }
     }
 
@@ -666,18 +814,75 @@ impl PdTable {
         self.create_in_domain(Domain::TrustedSas)
     }
 
-    /// Eine neue PD in einer bestimmten **Sicherheitsdomäne** anlegen. Die Domäne ist
-    /// danach **unveränderlich** (es gibt bewusst keinen Setter).
+    /// Eine neue PD in einer bestimmten **Sicherheitsdomäne** anlegen, mit dem Vorgabebudget.
+    /// Die Domäne ist danach **unveränderlich** (es gibt bewusst keinen Setter).
     pub fn create_in_domain(&mut self, domain: Domain) -> Option<usize> {
+        self.create_mit_budget(domain, 0)
+    }
+
+    /// **Eine PD mit einem eigenen Cap-Budget anlegen** (2026-08-26).
+    ///
+    /// `budget == 0` heisst „die Vorgabe" ([`CAP_BUDGET_PER_PD`]) — damit ist jeder vorhandene
+    /// Aufrufer bitgleich, und die Vertraeglichkeit steckt in der Kodierung statt in einem Zweig,
+    /// den jemand im Kopf behalten muss.
+    ///
+    /// Zwei Absagen, und sie sind **getrennt gezaehlt**:
+    ///
+    /// * mehr als [`CAP_BUDGET_MAX`] -> abgewiesen, **nicht** stillschweigend gedeckelt. Eine
+    ///   Schranke, die klammheimlich kuerzt, gibt dem Aufrufer eine PD, die weniger kann, als er
+    ///   angefordert hat, und laesst ihn das erst beim achten Cap merken.
+    /// * mehr als der **Vorrat** hergibt -> abgewiesen und in [`Self::budget_abgewiesen`]
+    ///   verbucht. Das ist eine andere Lage als „kein freier PD-Slot", sie hat eine andere
+    ///   Behebung, und ein gemeinsamer Zaehler machte den Bericht unfaehig zu sagen, welche
+    ///   von beiden eingetreten ist.
+    ///
+    /// **Der Vorrat wird gebucht, nicht geschaetzt.** `CAP_SLOTS_FOR_ALL_PDS` war die Summe aller
+    /// Budgets, solange jedes Budget gleich war; mit Budgets je PD ist dieselbe Zahl ein Vorrat,
+    /// und die Zusage „jede PD bekommt ihr Budget" haelt nur, wenn die Vergabe gegen ihn bucht.
+    pub fn create_mit_budget(&mut self, domain: Domain, budget: u16) -> Option<usize> {
+        let b = if budget == 0 {
+            CAP_BUDGET_PER_PD as u16
+        } else {
+            budget
+        };
+        if b as usize > CAP_BUDGET_MAX {
+            return None;
+        }
+        if b as usize > self.budget_vorrat {
+            self.budget_abgewiesen = self.budget_abgewiesen.saturating_add(1);
+            return None;
+        }
         let i = self.freien_slot_suchen()?;
         let epoch = self.pds[i].epoch;
         self.pds[i] = Pd {
             used: true,
             domain,
             epoch,
+            cap_budget: b,
             ..Pd::EMPTY
         };
+        self.budget_vorrat -= b as usize;
         Some(i)
+    }
+
+    /// Das Cap-Budget dieser PD. Ein freier oder nicht existierender Slot hat **null** — nicht die
+    /// Vorgabe: `budget_allows` faellt damit fail-closed aus, statt einer PD, die es gar nicht
+    /// gibt, acht Slots zuzugestehen.
+    pub fn budget_of(&self, pd: usize) -> usize {
+        if pd < self.pds.len() && self.pds[pd].used {
+            self.pds[pd].cap_budget as usize
+        } else {
+            0
+        }
+    }
+
+    /// `(freier Vorrat, am Vorrat gescheiterte Erzeugungen)` — fuer den Bericht.
+    ///
+    /// **Beide Zahlen zusammen**, weil die eine ohne die andere nicht urteilsfaehig ist: ein
+    /// Vorrat, der nur faellt, sieht aus wie einer unter Last, und eine Abweisungszahl ohne
+    /// Fuellstand sagt nicht, ob es knapp war.
+    pub fn budget_bilanz(&self) -> (usize, u64) {
+        (self.budget_vorrat, self.budget_abgewiesen)
     }
 
     /// Der lineare Scan nach einem freien PD-Slot — **gezählt** (C4).
@@ -705,6 +910,14 @@ impl PdTable {
             // ohne die Thread-Tabelle abzulaufen (das wäre ein neuer O(n)-Pfad im Teardown,
             // also genau die Sorte, die C4 beseitigen will).
             let e = self.pds[pd].epoch.wrapping_add(1);
+            // **Die Haelfte, die entscheidet, ob das Konto ein Konto ist.** Ein Vorrat, der nur
+            // schrumpft, ist von einem unter Last nicht zu unterscheiden -- und nach genug PDs
+            // waere die Zusage „jede PD bekommt ihr Budget" nicht mehr einloesbar, ohne dass ein
+            // einziger Zaehler es gesagt haette. `saturating_add` mit Deckel, weil ein doppeltes
+            // `free` sonst Vorrat aus dem Nichts schuefe.
+            self.budget_vorrat = self.budget_vorrat
+                .saturating_add(self.pds[pd].cap_budget as usize)
+                .min(CAP_SLOTS_FOR_ALL_PDS);
             self.pds[pd] = Pd::EMPTY;
             self.pds[pd].epoch = e;
             true
@@ -913,6 +1126,30 @@ impl PdTable {
             self.pds[pd].backend_id
         } else {
             0
+        }
+    }
+
+    /// Die Interrupt-Notification einer HardwareLand-PD (`u32::MAX` = keine).
+    pub fn irq_ntfn_of(&self, pd: usize) -> u32 {
+        if pd < self.pds.len() {
+            self.pds[pd].irq_ntfn
+        } else {
+            u32::MAX
+        }
+    }
+
+    /// **Die Interrupt-Notification einer PD eintragen** (B4) — nur der Kernel ruft das, und nur
+    /// mit einem Objekt, das er selbst fuer diese PD gepraegt hat.
+    ///
+    /// Gibt `false`, wenn die PD nicht existiert. **Ueberschreiben ist zulaessig**: beim
+    /// Hot-Reload bekommt die Nachfolgefassung dieselbe Id, und eine Regel, die das verboete,
+    /// machte den Austausch unmoeglich.
+    pub fn set_irq_ntfn(&mut self, pd: usize, id: u32) -> bool {
+        if pd < self.pds.len() && self.pds[pd].used {
+            self.pds[pd].irq_ntfn = id;
+            true
+        } else {
+            false
         }
     }
 
@@ -1282,7 +1519,7 @@ pub fn dispatch(
     // Der Grund ist gemessen: die Ed25519-/SHA-2-Verifikation lief auf dem 16-KiB-Kernel-Stack des
     // aufrufenden EL0-Threads und füllte ihn zu 73 % — jeder Thread zahlte 16 KiB für diesen einen
     // Pfad.
-    load: fn(u32, usize, &[(usize, CapPtr)], usize, usize) -> LadeUebergabe,
+    load: fn(u32, usize, &[(usize, CapPtr)], usize, usize, u16, u32) -> LadeUebergabe,
     // Cap löschen (Finalisierung inkl. Speicherfreigabe/Call-Abbruch) — der Kernel sperrt darin
     // selbst `CAPS`+`MEM` und bricht finalisierte Reply-Calls ab. Nur zu rufen, wenn hier KEIN
     // Lock mehr gehalten wird. Wird für die beim Grant verdrängte Cap gebraucht (s. `grant_cap`)
@@ -1297,7 +1534,7 @@ pub fn dispatch(
     // `Ok(ThreadId-Raw)` oder `Err(ABI-Code)`. Wie der `load`-Rueckruf ein **Kernel**-Aufruf:
     // die Entscheidung `check_stack` braucht Geraeteerreichbarkeit und Ueberlappung, und beides
     // weiss nur der Kernel. Der Rueckruf laeuft OHNE gehaltenes `CAPS`.
-    spawn: fn(usize, CapPtr, usize, usize, u8) -> Result<u64, u64>,
+    spawn: fn(usize, CapPtr, usize, usize, u8, u64) -> Result<u64, u64>,
     // Z6b: die fuenf Debug-Syscalls. `(Nummer, Aufrufer-PD, Cap-Slot, a1, a2, a3)`.
     //
     // **Ein Rueckruf fuer alle fuenf, und die Cap-Aufloesung liegt drin** — anders als bei `spawn`,
@@ -1308,6 +1545,13 @@ pub fn dispatch(
     // Fenster wieder offen -- und es ist der Fehler, den man nicht sieht, weil er im Normalbetrieb
     // nie auftritt.
     debug: fn(u64, usize, usize, u64, u64, u64) -> Result<u64, u64>,
+    // Stufe B / B3: die Interrupt-Bindung. `(intid, Notification-Id, Badge, Kern)`.
+    //
+    // **Ein Rueckruf, weil die Tabelle im Kernel liegt** -- `irq_hook` laeuft im IRQ-Kontext und
+    // durchsucht sie lock-frei; sie hier zu fuehren hiesse, den heissesten Pfad des Systems an eine
+    // Crate zu binden, die ihn nicht kennt. Der Dispatch loest auf und prueft die Rechte, der
+    // Kernel bindet -- dieselbe Aufteilung wie bei `spawn`.
+    bind_irq: fn(u32, usize, u64, usize) -> Result<(), u64>,
 ) -> usize {
     let nr = frame_reg(frame, reg::SYSNO_RESULT);
 
@@ -1333,7 +1577,7 @@ pub fn dispatch(
             // Syscall-Handler (nur Fault) landet hier und wird regulär bearbeitet -- das ist die
             // halbe Bindung, und sie ist gewollt (Debugger/Speicherserver ohne Persönlichkeit).
             redirect::Weiche::Kernel => dispatch_nativ(
-                frame, core, ops, caps, eps, ntfns, load, delete_cap, spawn, debug, nr,
+                frame, core, ops, caps, eps, ntfns, load, delete_cap, spawn, debug, bind_irq, nr,
             ),
             redirect::Weiche::Fault(code) => {
                 // **Kein Rückfall auf die native ABI.** Aus dem Entzug einer Cap darf keine
@@ -1347,7 +1591,7 @@ pub fn dispatch(
             ),
         };
     }
-    dispatch_nativ(frame, core, ops, caps, eps, ntfns, load, delete_cap, spawn, debug, nr)
+    dispatch_nativ(frame, core, ops, caps, eps, ntfns, load, delete_cap, spawn, debug, bind_irq, nr)
 }
 
 /// **Lebt die Handler-PD?** — die Größe, die die Weiche als `handler_lebt` liest.
@@ -1472,9 +1716,15 @@ fn zustellen(
     ops.mark_handler_wait(guest);
     // Über den **vorhandenen** Endpoint-Transport. Der Endpoint bleibt unverändert — A-5.1 hat
     // gezeigt, dass ein Transport, der von seinem Inhalt nichts weiss, der billigere ist.
+    //
+    // **Badge `0`, und das ist eine Aussage** (2026-08-25): ein umgeleiteter Gast hat keine
+    // Endpoint-Cap vorgezeigt -- der Kernel ruft fuer ihn, ueber den Endpoint der HANDLER-Cap.
+    // Es gibt also kein Absender-Badge, und eines zu erfinden waere schlimmer als keines: der
+    // Handler unterscheidet seine Gaeste am Sidecar-Slot, nicht an einer Zahl im Register.
+    // Dieselbe Ueberlegung wie bei `partner_of`, das fuer einen wartenden Empfaenger `None` gibt.
     let next = eps[array_index_nospec(ep_i, eps.len())]
         .lock()
-        .call(ops, core, frame);
+        .call(ops, core, frame, 0);
     if next == frame {
         // **`call` hat NICHT blockiert** — Endpoint stillgelegt (`ERR_QUIESCING`) oder
         // Warteschlange voll (`ERR_EP_FULL`); der Code steht in `x0`. Ein gewöhnlicher Client
@@ -1496,16 +1746,59 @@ fn dispatch_nativ(
     caps: &RwSpinLock<Caps>,
     eps: &[SpinLock<Endpoint>],
     ntfns: &[SpinLock<Notification>],
-    load: fn(u32, usize, &[(usize, CapPtr)], usize, usize) -> LadeUebergabe,
+    load: fn(u32, usize, &[(usize, CapPtr)], usize, usize, u16, u32) -> LadeUebergabe,
     delete_cap: fn(CapPtr) -> Result<(), u64>,
     // K1a: durchgereicht von `dispatch` -- der `SPAWN`-Zweig liegt hier, nicht dort.
-    spawn: fn(usize, CapPtr, usize, usize, u8) -> Result<u64, u64>,
+    spawn: fn(usize, CapPtr, usize, usize, u8, u64) -> Result<u64, u64>,
     // Z6b: dito -- die fuenf Debug-Zweige liegen hier.
     debug: fn(u64, usize, usize, u64, u64, u64) -> Result<u64, u64>,
+    // Stufe B / B3: dito.
+    bind_irq: fn(u32, usize, u64, usize) -> Result<(), u64>,
     nr: u64,
 ) -> usize {
     if nr == sys::YIELD {
         return ops.on_tick(core, frame);
+    }
+    // **`SETTLS` braucht keine Cap** und steht deshalb hier, vor der generischen Aufloesung: die
+    // wuerde `x1` als Cap-Slot lesen und mit `ERR_BADCAP` abweisen. Dieselbe Lage wie `YIELD` und
+    // `PARK` -- der Syscall wirkt nur auf den Aufrufer.
+    // **`CLOCK` braucht keine Cap** und steht deshalb hier, vor der generischen Aufloesung -- die
+    // wuerde `x1` als Cap-Slot lesen und mit `ERR_BADCAP` abweisen. Zeit zu lesen gewaehrt nichts.
+    //
+    // Die Werte kommen aus der **HAL**, nicht aus dem Scheduler: `cycles_per_sec` ist gegen die
+    // Plattformuhr geeicht, und diese Crate hat davon keine Kenntnis -- sie reicht durch.
+    if nr == sys::CLOCK {
+        frame_set_reg(frame, reg::MSG0, ops.clock_hz());
+        frame_set_reg(frame, reg::MSG1, ops.clock_now());
+        frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
+        return frame;
+    }
+    if nr == sys::SETTLS {
+        let va = frame_reg(frame, reg::EP_BADGE);
+        // **Die Schranke schuetzt den KERNEL, nicht den Aufrufer.** Ein `WRMSR` auf
+        // `IA32_FS_BASE` mit nicht-kanonischem Wert faultet in **Ring 0**, an der Schreibstelle --
+        // eine PD ohne jede Cap koennte den Kern damit umlegen. Das Autoritaetsargument („er
+        // erreicht nichts, was er nicht schon hatte") gilt fuer das, was er ERREICHT; ueber das,
+        // was er den Kernel TUN laesst, sagt es nichts. Zwei Fragen, und nur die erste beantwortet
+        // „keine Cap noetig".
+        //
+        // Geprueft wird die **untere Adresshaelfte**, nicht bloss „kanonisch": strenger, und sie
+        // bedeutet etwas. Ein Thread-Pointer in der oberen Haelfte ist ohnehin sinnlos.
+        //
+        // `0` bleibt erlaubt -- das ist das Abschalten.
+        if va >= caprock_abi::USER_VA_TOP {
+            frame_set_reg(frame, reg::SYSNO_RESULT, result::ERR_BADTLS);
+            return frame;
+        }
+        let tid = ops.current_id(core);
+        let ok = ops.set_tls(tid, va as usize);
+        // Zwei Gruende, zwei Codes: „Adresse unzulaessig" oben, „dich gibt es nicht" hier.
+        frame_set_reg(
+            frame,
+            reg::SYSNO_RESULT,
+            if ok { result::OK } else { result::ERR_BADCAP },
+        );
+        return frame;
     }
     if nr == sys::PARK {
         // Selbst-Park: Aufrufer schlafen legen; kein Capability nötig (wirkt nur auf ihn selbst).
@@ -1616,6 +1909,15 @@ fn dispatch_nativ(
         let entry = frame_reg(frame, reg::MSG0 + 1) as usize;
         let arg = frame_reg(frame, reg::MSG0 + 2) as usize;
         let prio = frame_reg(frame, reg::MSG0 + 3) as u8;
+        // K1b: die **Teilregion** der Stack-Cap, roh weitergereicht. Ausgepackt wird sie in
+        // `spawncheck::sub_region` -- hier stehen keine 32 und keine Schiebeoperation, damit es
+        // nicht zwei Stellen gibt, die das Wort verstehen (dieselbe Begruendung wie fuer den
+        // ganzen Zweig: eine Pruefung, die an zwei Stellen halb passiert, ist zwei Pruefungen).
+        //
+        // `reg::EP_BADGE` (x1) ist das einzige freie Register: alle vier Nachrichtenworte sind
+        // vergeben, und `SPAWN` wird **vor** der generischen Cap-Aufloesung abgefertigt, also
+        // traegt x1 hier keine Endpoint-ID.
+        let sub = frame_reg(frame, reg::EP_BADGE);
         let (pd, cap) = {
             let g = caps.read();
             let Some(pd) = g.pds.pd_of(thread) else {
@@ -1626,7 +1928,7 @@ fn dispatch_nativ(
             };
             (pd, cap)
         }; // CAPS freigegeben -- `spawn` nimmt CAPS/MEM/SCHEDS selbst (Ordnung MEM < SCHEDS)
-        match spawn(pd, cap, entry, arg, prio) {
+        match spawn(pd, cap, entry, arg, prio, sub) {
             Ok(tid_raw) => {
                 frame_set_reg(frame, reg::MSG0, tid_raw);
                 frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
@@ -1835,7 +2137,9 @@ fn dispatch_nativ(
                 return deny(result::ERR_BADCAP);
             }
             match nr {
-                sys::CALL => eps[ep].lock().call(ops, core, frame),
+                // Das Badge ist oben bei der Cap-Aufloesung schon da (`lookup`); bis 2026-08-25
+                // ging es nur an `signal` und wurde hier fallengelassen.
+                sys::CALL => eps[ep].lock().call(ops, core, frame, badge),
                 sys::RECV => eps[ep].lock().recv(ops, core, frame),
                 _ => {
                     // REPLY: ggf. Cap-Transfer (grant). Der Transfer MUTIERT den CapSpace,
@@ -1900,8 +2204,75 @@ fn dispatch_nativ(
             if nr == sys::SIGNAL {
                 ntfns[n].lock().signal(ops, badge, frame)
             } else {
+                // --- Stufe A / A2: `WAIT` mit Frist -------------------------------------------
+                //
+                // `MSG0` = Frist in Ticks, `0` = keine. **Rueckwaertskompatibel**: jeder vor A2
+                // geschriebene Aufruf legt dort eine Null hin, und eine Null heisst „warte wie
+                // bisher" -- bitgleich zum alten Verhalten.
+                //
+                // **Scharfgestellt VOR dem Blockieren.** Andersherum gaebe es ein Fenster, in dem
+                // der Thread schon wartet und seine Frist noch nicht steht; ein Tick darin ginge
+                // verloren. Dieselbe Ordnung wie bei C8, und aus demselben Grund.
+                let ticks = frame_reg(frame, reg::MSG0);
+                if ticks != 0 {
+                    ops.frist_setzen(core, ticks, caprock_sched::BlockReasons::IPC);
+                }
                 ntfns[n].lock().wait(ops, core, frame)
             }
+        }
+        // --- Stufe B / B3: SYS_BIND_IRQ ------------------------------------------------------
+        //
+        // **Der Aufrufer nennt keinen Vektor, er nennt eine Cap.** Das ist der ganze Zweck des
+        // Syscalls: `intid` kommt aus dem `Irq`-Objekt, nicht aus einem Register. Der Unterschied
+        // ist nicht kosmetisch -- die in-Kernel-Fassung `bind_irq(intid, ntfn, badge, core)` nahm
+        // rohe Zahlen und behauptete in ihrem eigenen Doku-Kommentar, "ueber die IRQ-Cap
+        // autorisiert" zu sein. Eine Signatur kann das nicht tragen, und ein Waechter prueft die
+        // EXISTENZ eines Grundes, nie seine WAHRHEIT.
+        //
+        // Beide Caps liegen im Cspace des **Aufrufers**, und beide werden gebraucht: die `Irq`-Cap
+        // sagt *welcher Interrupt*, die Notification sagt *wohin*. Ohne die zweite koennte eine PD
+        // den Interrupt ihres Geraets an ein fremdes Objekt zustellen lassen.
+        sys::BIND_IRQ => {
+            let ObjectKind::Irq { intid } = kind else {
+                return deny(result::ERR_BADCAP);
+            };
+            // **READ, nicht WRITE.** Binden greift in keinen fremden Thread ein -- es sagt, wohin
+            // *dieser* Interrupt geht, und wer die Cap haelt, haelt genau diese Autoritaet.
+            if !rights.contains(Rights::READ) {
+                return deny(result::ERR_RIGHTS);
+            }
+            let ntfn_slot = frame_reg(frame, reg::MSG0) as usize;
+            let badge = frame_reg(frame, reg::MSG1);
+            let ntfn_id = {
+                let g = caps.read();
+                let Some(cap) = g.pds.cap_at(pd, ntfn_slot) else {
+                    return deny(result::ERR_BADCAP);
+                };
+                let Some((k, r, _)) = g.cspace.lookup(cap) else {
+                    return deny(result::ERR_BADCAP);
+                };
+                let ObjectKind::Notification(id) = k else {
+                    return deny(result::ERR_BADCAP);
+                };
+                // **WRITE auf der Notification** -- der Kernel wird sie signalisieren, und
+                // signalisieren ist ein Schreibzugriff. `SYS_SIGNAL` verlangt hier dasselbe; wer
+                // ueber den Umweg des Interrupts mit READ signalisieren koennte, haette die
+                // Rechtepruefung des direkten Weges umgangen.
+                if !r.contains(Rights::WRITE) {
+                    return deny(result::ERR_RIGHTS);
+                }
+                if id as usize >= ntfns.len() {
+                    return deny(result::ERR_BADCAP);
+                }
+                id as usize
+            }; // CAPS freigegeben -- der Kernel nimmt seine eigene Tabelle
+            let code = match bind_irq(intid, ntfn_id, badge, core) {
+                Ok(()) => result::OK,
+                Err(e) => e,
+            };
+            // **Der Aufrufer wird nicht blockiert** -- jede Absage ist ein Code. D11 woertlich.
+            frame_set_reg(frame, reg::SYSNO_RESULT, code);
+            frame
         }
         sys::KILL => {
             let ObjectKind::Tcb(raw) = kind else {
@@ -2247,8 +2618,28 @@ fn dispatch_nativ(
                 return deny(result::ERR_RIGHTS);
             }
             let index = frame_reg(frame, reg::MSG0) as u32; // x2: Archiv-Programm-Index
-            let delegate = frame_reg(frame, reg::MSG0 + 1); // x3: lokaler Cap-Index (u64::MAX=keiner)
-            let badge = frame_reg(frame, reg::MSG0 + 2); // x4: Badge fuer die delegierte Cap (0=erben)
+            let liste = frame_reg(frame, reg::MSG0 + 1); // x3: gepackte (src,dst)-Paare
+            let anzahl = frame_reg(frame, reg::MSG0 + 2) as usize; // x4: wie viele davon gelten
+            // x5: der **Ressourcenwunsch** der neuen PD -- DMA-Seiten und Cap-Budget in einem
+            // Wort, Belegung ausgeschrieben in `caprock_abi::load_extras`. Beide `0` = Vorgabe.
+            //
+            // Sie stehen hier und nicht im Manifest, und das ist eine Entscheidung: das Manifest
+            // beschreibt das Startverhalten und wird signiert; eine Treiberumgebung, die dreissig
+            // Slots und einen grossen Pool braucht, wird nicht gebootet, sondern geladen. Ueber
+            // ihre jeweilige Schranke hinaus wird **abgewiesen und nicht gedeckelt** -- eine
+            // Schranke, die klammheimlich kuerzt, laesst den Aufrufer erst beim achten Cap merken,
+            // dass er etwas anderes bekommen hat, als er angefordert hat; bei DMA merkt es
+            // niemand, sondern das Geraet schreibt ueber das Ende hinaus.
+            let (dma_pages, cap_budget) =
+                caprock_abi::load_extras_unpack(frame_reg(frame, reg::MSG0 + 3));
+            // **Die DMA-Absage steht VOR jeder Ableitung** (C2/D11). Danach haengen abgeleitete
+            // Endowment-Caps in der Tabelle, die ein Abweispfad einzeln wieder loeschen muesste --
+            // genau die Aufraeumpflicht, die die zwei C8-Ausgaenge schon einmal geerbt haben, ohne
+            // sie zu erfuellen. Hier ist noch nichts alloziert, also kostet die Absage nichts.
+            // Und der Aufrufer wird **nicht** blockiert: D11 woertlich.
+            if dma_pages > caprock_abi::DRIVER_DMA_MAX_PAGES {
+                return deny(result::ERR_DMA_TOO_LARGE);
+            }
             // Den zu delegierenden Caller-Cap (x3) aufloesen + ableiten (CDT-Kind, gleiche Rechte)
             // unter CAPS.write; danach CAPS freigeben -- der Loader re-lockt CAPS/MEM/SCHEDS selbst.
             //
@@ -2258,32 +2649,78 @@ fn dispatch_nativ(
             // sind die Signale zweier Kinder ununterscheidbar. Erlaubt ist es, weil der Aufrufer das
             // Objekt bereits besitzt: er vergibt ein Etikett auf seiner eigenen Autorität, er
             // erwirbt keine neue. `0` = Badge des Originals erben (bisheriges Verhalten).
-            let endowed = if delegate != u64::MAX {
-                let mut g = caps.write();
-                let Some(c) = g.pds.cap_at(pd, delegate as usize) else {
-                    return deny(result::ERR_BADCAP);
-                };
-                let Some((_, r, _)) = g.cspace.lookup(c) else {
-                    return deny(result::ERR_BADCAP);
-                };
-                let derived = if badge != 0 {
-                    g.cspace.mint(c, r, badge)
-                } else {
-                    g.cspace.copy(c, r)
-                };
-                match derived {
-                    Ok(copy) => Some(copy),
-                    Err(_) => return deny(result::ERR_BADCAP),
+            // **Mehr als eine Delegation** (2026-08-25). Bis dahin genau eine, nach Slot 0.
+            //
+            // Fail-closed an drei Stellen, und jede hat einen eigenen Grund:
+            //   * mehr Paare als [`LOAD_MAX_DELEGATES`] -> die Liste kann gar nicht so lang sein,
+            //     das ist ein Aufruffehler und kein Ressourcenmangel;
+            //   * ein Quell-Slot, den der Aufrufer nicht haelt -> er delegiert, was er nicht hat;
+            //   * **zwei Paare auf denselben Ziel-Slot** -> welcher der beiden dort landet, kann
+            //     niemand sagen. Genau die Sorte stiller Wahl, gegen die A-5.4 den `service_id`
+            //     eingefuehrt hat.
+            //
+            // **Und die Rueckabwicklung ist vollstaendig**: schlaegt Paar `k` fehl, werden die
+            // Kopien 0..k geloescht. Ein halb abgebrochenes `LOAD` liesse abgeleitete Caps in der
+            // geteilten Tabelle liegen, die niemand mehr findet — und die das `delete` ihres
+            // Eltern-Caps blockieren.
+            if anzahl > caprock_abi::LOAD_MAX_DELEGATES {
+                return deny(result::ERR_BADCAP);
+            }
+            let mut gesammelt: [Option<(usize, CapPtr)>; caprock_abi::LOAD_MAX_DELEGATES] =
+                [None; caprock_abi::LOAD_MAX_DELEGATES];
+            // **Die Ruecknahme steht VOR der Sperre**, und das ist kein Stil: `delete_cap`
+            // finalisiert (Speicher zurueck, DMA abhaengen) und nimmt `CAPS` dafuer selbst. Sie
+            // unter gehaltener Schreibsperre zu rufen waere ein Selbst-Deadlock -- dieselbe Form
+            // wie `match lock() { .. None => lock() }` aus der Fallenliste.
+            let zurueck = |bisher: &[Option<(usize, CapPtr)>], bis: usize| {
+                for e in bisher.iter().take(bis).flatten() {
+                    let _ = delete_cap(e.1);
                 }
-            } else {
-                None
-            }; // CAPS hier freigegeben
-            let arr;
-            let endow: &[(usize, CapPtr)] = if let Some(c) = endowed {
-                arr = [(0usize, c)]; // Konvention L2: delegierter Cap -> Slot 0 der neuen PD
-                &arr
-            } else {
-                &[]
+            };
+            for k in 0..anzahl {
+                let (src, dst) = caprock_abi::delegate_unpack(((liste >> (8 * k)) & 0xff) as u8);
+                // Zwei Paare auf denselben Ziel-Slot: welcher dort landet, koennte niemand sagen.
+                if gesammelt.iter().flatten().any(|&(z, _)| z == dst) {
+                    zurueck(&gesammelt, k);
+                    return deny(result::ERR_BADCAP);
+                }
+                let abgeleitet = {
+                    let mut g = caps.write();
+                    let Some(c) = g.pds.cap_at(pd, src) else {
+                        drop(g);
+                        zurueck(&gesammelt, k);
+                        return deny(result::ERR_BADCAP);
+                    };
+                    let Some((_, r, _)) = g.cspace.lookup(c) else {
+                        drop(g);
+                        zurueck(&gesammelt, k);
+                        return deny(result::ERR_BADCAP);
+                    };
+                    g.cspace.copy(c, r)
+                }; // CAPS je Paar kurz gehalten, nie ueber die Ruecknahme
+                match abgeleitet {
+                    Ok(copy) => gesammelt[k] = Some((dst, copy)),
+                    Err(_) => {
+                        zurueck(&gesammelt, k);
+                        return deny(result::ERR_BADCAP);
+                    }
+                }
+            }
+            // `CapPtr` hat bewusst keinen oeffentlichen Konstruktor -- erst als `Option` sammeln,
+            // dann mit dem ersten echten Cap als Fuellwert verdichten. Derselbe Weg wie in
+            // `start_root_task` und `load_by_index`.
+            let mut dicht: [(usize, CapPtr); caprock_abi::LOAD_MAX_DELEGATES];
+            let endow: &[(usize, CapPtr)] = match gesammelt.iter().flatten().next() {
+                None => &[],
+                Some(&fuell) => {
+                    dicht = [fuell; caprock_abi::LOAD_MAX_DELEGATES];
+                    let mut n = 0;
+                    for e in gesammelt.iter().flatten() {
+                        dicht[n] = *e;
+                        n += 1;
+                    }
+                    &dicht[..n]
+                }
             };
             // **C8: der Auftrag wandert, der Aufrufer wartet.**
             //
@@ -2295,7 +2732,7 @@ fn dispatch_nativ(
             //
             // Die drei Ausgaenge sind unterscheidbar, und das ist keine Kosmetik: „gerade voll"
             // wiederholt man, „gibt es nicht" nicht.
-            match load(index, pd, endow, core, frame) {
+            match load(index, pd, endow, core, frame, cap_budget, dma_pages as u32) {
                 LadeUebergabe::Uebergeben(next) => next,
                 // **Die abgeleiteten Caps muessen zurueck, wenn der Auftrag nicht angenommen
                 // wird.** Auf dem angenommenen Weg raeumt `load_by_index` sie bei Misserfolg auf;
@@ -2304,14 +2741,14 @@ fn dispatch_nativ(
                 // dieselbe Falle, die der Abweispfad im Loader schon einmal bezahlt hat, nur an
                 // einer Stelle, die es vor C8 nicht gab.
                 LadeUebergabe::Ausgelastet => {
-                    if let Some(c) = endowed {
-                        let _ = delete_cap(c);
+                    for e in gesammelt.iter().flatten() {
+                        let _ = delete_cap(e.1);
                     }
                     deny(result::ERR_LOAD_BUSY)
                 }
                 LadeUebergabe::KeinVerifizierer => {
-                    if let Some(c) = endowed {
-                        let _ = delete_cap(c);
+                    for e in gesammelt.iter().flatten() {
+                        let _ = delete_cap(e.1);
                     }
                     deny(result::ERR_SERVER_GONE)
                 }

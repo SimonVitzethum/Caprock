@@ -168,11 +168,11 @@ build_archive() {   # $1 = Ausgabedatei, $2 = Kernel-ELF, $3 = manifest-version,
     python3 tools/sign_manifest.py --kernel "$2" --key "$MANKEY" --manifest-version "$3" \
         --out build/system.manifest \
         --entry "1:init:0:1:$PROG/init.elf:loader,ntfn:root:1::any:0" \
-        --entry "2:hello:2:1:$PROG/hello.elf:ntfn:stripe:2::any:0" \
+        --entry "2:hello:2:1:$PROG/hello.elf:ntfn,ep:stripe,service:2::any:0" \
         --entry "3:virtio-blk:1:1:$PROG/virtio-blk.elf:mmio,dma,ntfn,ep::1::any:0:$sel" \
-        --entry "4:fs:0:1:$PROG/fs.elf:ntfn,ep::1::any:0::3" \
+        --entry "4:fs:0:1:$PROG/fs.elf:ntfn,ep,shared::1::any:0::3" \
         --entry "5:virtio-net:1:1:$PROG/virtio-net.elf:mmio,dma,ntfn,ep::1::any:0:vendor=1af4,device=1041" \
-        --entry "6:wasmhost:2:1:$PROG/wasmhost.elf:ntfn::1::any:0" \
+        --entry "6:wasmhost:2:1:$PROG/wasmhost.elf:ntfn,ep::1::any:0::2" \
         >/dev/null 2>&1 || return 1
     python3 tools/mkarchive.py "$1" --system-manifest build/system.manifest \
         "1:init:0:1:$PROG/init.elf::certs/init-x86.cert" \
@@ -212,16 +212,40 @@ boot() {
     # setzen, und die Manifest-Politik ist ohne sie nicht pruefbar. Vorgabe leer -- jeder
     # vorhandene Aufruf verhaelt sich unveraendert.
     local nx=(); [ -n "${BOOT_EXTRA:-}" ] && read -r -a nx <<<"$BOOT_EXTRA"
+    # **`-m`/`-smp` sind ueberschreibbar, und das war ein BEFUND** (Z8/N4, 2026-08-17).
+    #
+    # Sie standen hier fest verdrahtet, VOR den Zusatzargumenten. Eine `-numa`-Topologie braucht
+    # aber `-smp sockets=…` und `memory-backend`-Groessen, die zu `-m` passen -- ein zweites
+    # `-m`/`-smp` dahinter kollidiert. Gemessen: QEMU startet, der Gast bekommt **kein SRAT**, und
+    # die Kernelzeile liest sich danach wie ein Befund (`numa : readable=false`). Dieselbe Rissform
+    # wie `iommu_platform=on`: zwei Suiten (hier: zwei Aufrufwege) setzen dasselbe Geraet
+    # verschieden auf, und der Ausfall zeigt auf den Kernel statt auf den Aufbau.
+    local mem=(-m "$RAM"); [ -n "${MEM_ARGS:-}" ] && read -r -a mem <<<"$MEM_ARGS"
+    local smp=(-smp 4);    [ -n "${SMP_ARGS:-}" ] && read -r -a smp <<<"$SMP_ARGS"
+    # **Und QEMUs eigene Meldungen gehen NICHT mehr nach /dev/null.** Genau das hat die Verwirrung
+    # oben moeglich gemacht: eine abgewiesene Kommandozeile sah aus wie ein stummer Kernel. Sie
+    # landen in einer Datei, die der Aufrufer bei leerer Ausgabe zeigt.
+    QEMU_ERR="${QEMU_ERR:-$(mktemp)}"
+    # **`intremap=on` seit 2026-08-26 (Stufe B).** Bis dahin stand es NUR in der Hauptsuite --
+    # also ausgerechnet in der Suite OHNE Geraete. `irte_vergabe_moeglich()` verlangt
+    # `ir_active()`; ohne diese Option meldet `irtevgb` hier SKIP, und die IRTE-Vergabe, an der
+    # die MSI-Zustellung haengt, war in der einzigen Suite mit Treibern nicht scharf. Dieselbe
+    # Rissform wie `iommu_platform=on`.
+    #
+    # **Der Kommentar steht HIER und nicht in der Befehlszeile**: ein `#` innerhalb einer
+    # Backslash-Fortsetzung bricht sie auf, und `-machine ...` wird zu einem eigenen Befehl
+    # ("Kommando nicht gefunden"). Gemessen, nicht erschlossen -- genau das ist beim ersten
+    # Anlauf passiert.
     timeout "${3:-$SECONDS_RUN}" qemu-system-x86_64 \
-        -kernel "$KELF.mb32" -m "$RAM" -smp 4 "${ACCEL[@]}" "${nx[@]}" \
-        -machine q35,kernel-irqchip=split -device intel-iommu,caching-mode=on \
+        -kernel "$KELF.mb32" "${mem[@]}" "${smp[@]}" "${ACCEL[@]}" "${nx[@]}" \
+        -machine q35,kernel-irqchip=split -device intel-iommu,caching-mode=on,intremap=on \
         -device virtio-rng-pci,disable-legacy=on,iommu_platform=on \
         -drive if=none,id=blk0,format=raw,file="$BLK_IMG" \
         -device virtio-blk-pci,drive=blk0,disable-legacy=on,iommu_platform=on \
         -device virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on \
         -netdev user,id=n0,restrict=on "${extra[@]}" \
         -nographic -serial file:"$2" -no-reboot \
-        </dev/null >/dev/null 2>&1 || true
+        </dev/null >/dev/null 2>"$QEMU_ERR" || true
 }
 
 LOG="$(mktemp)"
@@ -233,13 +257,24 @@ OUT="$(grep -vE "SeaBIOS|iPXE|Press Ctrl|Booting from|C900|PMM|PnP" "$LOG" 2>/de
 echo "$OUT" | grep -E "^(pdcolor|ladepol)" || true
 if [ -z "$OUT" ]; then
     echo "== KEIN OUTPUT -- das ist KEIN Testergebnis, sondern ein Aufbauproblem (QEMU? Zeitlimit?) =="
-    rm -f "$LOG" "$BLK_IMG"; exit 2
+    # **QEMUs eigene Worte, statt Raten.** Eine abgewiesene Kommandozeile (falsches `-numa`, ein
+    # zweites `-m`) sieht ohne diese Zeilen aus wie ein stummer Kernel.
+    if [ -s "${QEMU_ERR:-/dev/null}" ]; then
+        echo "-- QEMU sagt dazu: --"; sed -n '1,20p' "$QEMU_ERR"
+    else
+        echo "-- QEMU hat nichts gesagt (also kein Aufrufproblem; eher Zeitlimit oder Haenger) --"
+    fi
+    rm -f "$LOG" "$BLK_IMG" "${QEMU_ERR:-}"; exit 2
 fi
 # `wasm` und `clientn` gehoeren hierher: sie sind ERGEBNISzeilen. Eine Zeile, die man nur im
 # abgelegten Fehlerprotokoll zu sehen bekommt, laesst sich nicht gegenlesen -- und das abgelegte
 # Protokoll ist der LETZTE Boot (ein Negativfall), nicht der Hauptlauf. Genau daran habe ich am
 # 2026-08-10 eine Diagnose aus dem falschen Boot gelesen.
-echo "$OUT" | grep -E "^(mbi|mbmod|archive|manifest|clientn|root|devassign|devsel|dmaiso|drv|blkdev|part|fs|wasm|bootckpt) *:" || true
+echo "$OUT" | grep -E "^(mbi|mbmod|archive|manifest|clientn|root|devassign|devsel|dmaiso|drv|blkdev|part|fs|wasm|bootckpt|irqmsi|tls) *:" || true
+# **`el0-trap` gehoert IMMER ins Protokoll** (todo D17): ein Fault, den die Positivliste
+# verschweigt, macht "das Programm laeuft nicht" von "das Programm ist gestorben"
+# ununterscheidbar -- und genau daran ist die T5-Suche haengengeblieben.
+echo "$OUT" | grep -E "^el0-trap" || true
 
 echo "== checks =="
 # ================================================================================================
@@ -573,6 +608,22 @@ else
     fail=1
 fi
 rm -f "$LOG.fat"
+# --- Zwei Zeilen, die bis 2026-08-26 NUR in der Hauptsuite gatterten -----------------------------
+#
+# Beide Sonden sind arch-neutral und laufen in JEDEM Lauf; gegattert wurden sie nur dort. Das ist
+# woertlich die Rissform von `iommu_platform=on`: zwei Suiten, die dieselbe Sache verschieden
+# behandeln, und der Fall faellt genau dort an, wo niemand hinsieht. Hier ist der Unterschied
+# ausserdem nicht kosmetisch -- diese Suite hat ein Boot-Archiv, also mehr PDs, mehr Threads und
+# einen anderen Speicherdruck, und `arena` weist bei knappem Speicher mit SKIP ab.
+check "ckptcut : ALL PASS" \
+    "Z4d Stufe 1: eine offene Transaktion darf den Schnitt nicht kreuzen -- hier unter Last MIT Boot-Archiv"
+check "arena  : ALL PASS" \
+    "K1b: vier Thread-Stapel aus EINER Memory-Cap, unter Last MIT Boot-Archiv. Der Lauf hat hier mehr PDs und mehr Threads als die Hauptsuite; SYS_SPAWN wird also nicht nur einmal auf der ruhigen Maschine gefahren"
+check "dmapool : ALL PASS" \
+    "C2: die Groesse des DMA-Pools ist ein ARGUMENT des Ladens (SYS_LOAD x5), keine Kernelkonstante. Vier Aussagen, und keine davon ist 'ein Pool ist da': eingeloest -- jede Zuteilung bekam GENAU das Angeforderte (das trennt 'so gewollt' von 'stillschweigend gekuerzt', und eine halbierte DMA-Region ist ein Geraet, das ueber ihr Ende hinausschreibt); verschieden -- zwei Treiber-PDs mit VERSCHIEDEN grossen Pools, ohne das waere 'eingeloest' auch dann wahr, wenn alle die Vorgabe bekommen und der Parameter nie gelesen wird; disjunkt -- die IOVA-Fenster ueberschneiden sich nicht, A-5.4 also bei GEAENDERTEN Groessen neu gefahren statt als weitergeltend angenommen; zu-gross-abgewiesen -- der Ring-3-Negativfall aus init, ohne den die Obergrenze eine Zahl waere, von der niemand weiss, ob sie beisst. dma_audit steht als ZAHL daneben und ist bewusst KEIN Konjunkt: nach dem A-5.1-Hot-Reload halten zwei Caps dieselbe Region, s. todo"
+check "irqmsi  : ALL PASS" \
+    "Stufe B (B1+B2+B3): die Interrupt-Autoritaet einer Treiber-PD. Der IRTE steht und wird AUS DER TABELLE zurueckgelesen -- ein Pruefer, der die Kodierung nachrechnet, prueft seine eigene Kopie. svt+sid zusammen sind die Sicherheitsaussage: ohne SVT=01 naehme der Eintrag eine MSI von JEDEM Geraet an (die Interruptachse desselben Kanals, den A-5.4 auf der DMA-Achse geschlossen hat), und ohne den SID-Vergleich waere svt mit jeder beliebigen BDF wahr. angeboten-dann-da trennt 'das Geraet hat kein MSI-X' (Pollen ist zulaessig) von 'die Vergabe ist GESCHEITERT' -- ohne diese Bedingung sind beide dieselbe gruene Zeile. cap-in-slot7 belegt, dass die Cap einen HALTER hat und nicht nur existiert (SYS_SPAWN stand neun Tage ohne Aufrufer im Baum), cap-nennt-vektor, dass es SEINER ist. bind-ohne-cap-abgewiesen ist der Ring-3-Negativfall aus init: er prueft auf ERR_BADCAP und nicht auf 'ungleich OK', denn ein nicht gebauter Syscall gaebe ERR_BADSYS und der Negativfall waere gruen, WEIL nichts gebaut ist"
+
 check "SELFTEST COMPLETE" "sauberes system_off statt Timeout"
 
 # --- Z4 Stufe 2: ein Thread ueber die BOOTGRENZE -------------------------------------------------
@@ -862,8 +913,12 @@ fi
 # Kernelbefund. **`boot()` verschluckt jede QEMU-Meldung nach /dev/null**, was genau diese
 # Verwechslung erzeugt -- dieselbe Form wie `iommu_platform=on` seinerzeit.
 #
-# Steht in `todo.md` Z8 als offener Punkt. Der positive Pfad IST gefahren, nur woanders:
-# `tools/numa-messen.sh` belegt Lesen und Platzierung auf einer echten Zwei-Knoten-Maschine.
+# **Seit dem 2026-08-20 steht der positive Fall darunter.** `boot()` nimmt `-m`/`-smp` jetzt aus
+# `MEM_ARGS`/`SMP_ARGS`, und QEMUs Meldungen gehen nicht mehr nach /dev/null -- damit ist eine
+# abgewiesene Kommandozeile von einem stummen Kernel unterscheidbar. Beide Faelle laufen hier
+# nacheinander durch DIESELBE Suite, und das ist der Punkt: „fehlend" und „vorhanden" waren bis
+# dahin zwei verschiedene Werkzeuge (`tools/numa-messen.sh` fuer den einen, diese Suite fuer den
+# anderen), und zwei Werkzeuge fuer eine Eigenschaft driften.
 echo "== Z8/N4: numa_node=1 ohne Topologie -> die MASCHINE kann es nicht (eigener Grund) =="
 python3 tools/sign_manifest.py --kernel "$KELF" --key "$MANKEY" --manifest-version 1 \
     --out build/system.manifest \
@@ -875,6 +930,41 @@ if grep -q "keine tragfaehige Topologie" "$LOG"; then
     echo "  PASS: N4 -- OHNE Topologie ein UNTERSCHEIDBARER Grund (fehlend != falsch)"
 else
     echo "  FAIL: N4 -- erwartet 'keine tragfaehige Topologie': $(grep -m1 'POLICY ABGEWIESEN' "$LOG" || echo 'keine Absage')"; fail=1
+fi
+
+echo "== Z8/N4 POSITIV: numa_node=1 auf einer ZWEI-Knoten-Maschine -> eingeloest =="
+# **Der Gegenfall zum Test darueber, und er ist der wichtigere.** Eine Absage, die immer kommt, ist
+# von einer richtigen Absage nicht zu unterscheiden -- erst wenn dieselbe Manifestzeile auf einer
+# Maschine MIT Topologie durchgeht, sagt die Absage etwas ueber die Maschine statt ueber den Kernel.
+#
+# Die Topologie muss zu `-m` und `-smp` passen: zwei Knoten zu je der Haelfte des RAMs, zwei
+# Sockel. Deshalb sind es hier `MEM_ARGS`/`SMP_ARGS` und nicht `BOOT_EXTRA` -- ein zweites `-m`
+# hinter dem ersten kollidiert, und genau daran ist der Fall bis heute gescheitert.
+# **Die Form ist ABGESCHRIEBEN aus `tools/numa-messen.sh`, nicht neu erfunden** -- und der erste
+# Versuch hier war genau der Fehler, den dieses Projekt an anderer Stelle als „zwei Zahlen fuer eine
+# Tatsache" fuehrt: ich habe `-numa node,mem=2G` aus dem Kopf geschrieben, und QEMU antwortete
+# `Parameter -numa node,mem is not supported by this machine type -- Use -numa node,memdev instead`.
+# Gesehen habe ich das nur, weil `boot()` seit heute stderr nicht mehr verschluckt; vorher waere
+# daraus ein „der Kernel liest die SRAT nicht" geworden.
+NUMA_MEM="-m 2G"
+NUMA_SMP="-smp 4,sockets=2,cores=2"
+NUMA_TOPO="-object memory-backend-ram,id=m0,size=1G -object memory-backend-ram,id=m1,size=1G -numa node,nodeid=0,cpus=0-1,memdev=m0 -numa node,nodeid=1,cpus=2-3,memdev=m1 -numa dist,src=0,dst=1,val=21"
+MEM_ARGS="$NUMA_MEM" SMP_ARGS="$NUMA_SMP" BOOT_EXTRA="$NUMA_TOPO" \
+    boot build/boot-archive-numa1.bin "$LOG" 40
+# **Zuerst: kam die Topologie ueberhaupt an?** Ohne diese Zeile liest sich ein Aufbauproblem als
+# Kernelbefund -- genau die Verwechslung, wegen der dieser Fall ein Jahr lang nicht lief.
+if grep -qE "^numa    : init=true readable=true .* nodes=2" "$LOG"; then
+    echo "  PASS: N4 -- die Topologie ist im Gast angekommen (SRAT gelesen, 2 Knoten)"
+    if grep -q "keine tragfaehige Topologie" "$LOG"; then
+        echo "  FAIL: N4 -- MIT Topologie trotzdem abgewiesen: $(grep -m1 'POLICY ABGEWIESEN' "$LOG")"; fail=1
+    else
+        echo "  PASS: N4 -- derselbe Manifesteintrag wird MIT Topologie eingeloest statt abgewiesen. Die Absage oben sagt damit etwas ueber die MASCHINE, nicht ueber den Kernel"
+    fi
+else
+    echo "  FAIL: N4 positiv -- keine Topologie im Gast. Das ist ein AUFBAU-Problem, kein Kernelbefund:"
+    grep -m1 -E "^numa    : init" "$LOG" | sed 's/^/          /'
+    [ -s "${QEMU_ERR:-/dev/null}" ] && sed -n '1,5p' "$QEMU_ERR" | sed 's/^/          QEMU: /'
+    fail=1
 fi
 
 echo "== Negativfall 3b: Manifest in einem FORMAT, das dieser Kernel nicht kennt =="
@@ -985,5 +1075,35 @@ rm -f "$BLK_IMG"
 echo "fingerprint: $(fingerprint "$KELF") (Kernel-Binary, das GERADE geprueft wurde -- schliesst"
 echo "             'veralteter Build' als Erklaerung fuer eine Abweichung aus)"
 bekannt_rot_pruefen "$OUT" || fail=1
+
+# --- Ein Dienst OHNE Geraet ist auffindbar (2026-08-25) ----------------------------------------
+if grep -q "^dienst  : ALL PASS" <<<"$OUT"; then
+    echo "  PASS: Eine PD ohne Geraet wird unter ihrer program_id REGISTRIERT, und ein Client, der sie mit service_id benennt, bekommt IHREN Endpoint. Bis heute lief set_driver_service nur auf dem HardwareLand-Zweig: der Client bekam None und danach einen frischen, UNVERBUNDENEN Endpoint -- beide Seiten haetten einen Kanal gehabt und keinen gemeinsamen, mit gueltigen Caps und ohne eine einzige Fehlermeldung. Gemessen wird eine Gleichheit UND eine Ungleichheit: der Kanal des Clients ist der des Dienstes und NICHT der des Blockdienstes; ohne die zweite Haelfte belegte die erste nur, dass irgendein Endpoint dort steht. $(grep -m1 -oE 'dienst-ep=[^ ]+ client-ep=[^)]+' <<<"$OUT")"
+elif grep -q "^dienst  : SKIP" <<<"$OUT"; then
+    echo "  FAIL: dienst meldet SKIP -- diese Suite HAT einen geraetelosen Dienst in der Startmenge"
+    fail=1
+else
+    echo "  FAIL: Ein Dienst ohne Geraet ist nicht auffindbar: $(grep -m1 -oE '^dienst  : FAILURES [^-]*' <<<"$OUT")"
+    fail=1
+fi
+
+# --- Das Endowment wird verbucht (2026-08-25) --------------------------------------------------
+#
+# Drei Ausgaenge und nicht zwei. Die Hauptsuite laedt bauartbedingt kein Programm; dort ist SKIP
+# das RICHTIGE Ergebnis, und ein PASS waere die Luege ("nichts gebrochen" gegen "nichts
+# gemessen"). Die Lade-Suite hat das Archiv und muss deshalb ALL PASS liefern -- mit einer Zahl
+# groesser null bei `geprueft`, sonst hat der Ladepfad nicht stattgefunden.
+if grep -q "^endow   : FAILURES" <<<"$OUT"; then
+    echo "  FAIL: Eine Zusage des signierten Manifests liess sich nicht installieren -- ein Programm haette mit weniger Autoritaet angefangen, als das Dokument ihm zuspricht: $(grep -m1 -oE '^endow   : FAILURES [^-]*' <<<"$OUT")"
+    fail=1
+elif grep -q "^endow   : ALL PASS" <<<"$OUT"; then
+    echo "  PASS: Das Endowment wird VERBUCHT statt still gekuerzt: eine Zusage des Manifests, die sich nicht installieren laesst, weist den Ladevorgang ab -- und zwar BEVOR etwas alloziert ist, also ohne Teardown-Pfad. Ein Angebot des Aufrufers (SYS_LOAD, Slot 0) darf eine Zieldomaene ablehnen und wird GEZAEHLT statt verschwiegen; genau diese stille Ablehnung ist der Grund, warum die Doku-Tabelle in virtio-blk bis heute behauptet, in Slot 0 laege eine Notification. $(grep -m1 '^endow   :' <<<"$OUT" | grep -oE 'geprueft=[0-9]+ Zusagen-gebrochen=[0-9]+ Angebote-abgelehnt=[0-9]+')"
+elif grep -q "^endow   : SKIP" <<<"$OUT"; then
+    echo "  FAIL: endow meldet SKIP -- diese Suite HAT ein Boot-Archiv und laedt Programme. SKIP heisst hier, dass der Ladepfad gar nicht lief"
+    fail=1
+else
+    echo "  FAIL: die endow-Zeile fehlt ganz -- der Bericht kam nicht bis dorthin"
+    fail=1
+fi
 if [ "$fail" = 0 ]; then echo "== ALL PASS =="; else echo "== FAILURES =="; fi
 exit "$fail"

@@ -124,6 +124,22 @@ fn write_icr(dest: u32, low: u32) {
     wait_ipi_delivered();
 }
 
+/// **Einen Interrupt an sich selbst schicken** (Stufe B, Zustellprobe).
+///
+/// Der einzige Weg, auf dem ein Prozessor sich einen Vektor zustellen kann — ein Store in das
+/// eigene LAPIC-Fenster ist ein **Registerzugriff**, keine Nachricht (und unter x2APIC ist das
+/// Fenster ganz abgeschaltet). Genau daran ist der erste Anlauf dieser Probe gescheitert.
+///
+/// Gemessen wird damit die zweite Haelfte des Zustellpfads: APIC → IDT → Dispatch → `irq_hook`.
+/// Ueber Interrupt-Remapping und die Geraeteseite sagt sie **nichts** — und soll es auch nicht;
+/// der Wert der Probe ist gerade, dass sie die beiden Haelften trennt.
+///
+/// `0x4_0000` ist `Delivery Mode = Fixed`, `Level = Assert`; `0b01 << 18` ist der Shorthand
+/// „Self", der die Zieladressierung ganz umgeht.
+pub fn self_ipi(vector: u8) {
+    write_icr(0, (vector as u32) | (1 << 14) | (0b01 << 18));
+}
+
 /// **Globale** Interrupt-Controller-Initialisierung (aarch64: GIC-Distributor).
 ///
 /// Auf x86 heißt das: den alten 8259-PIC vollständig **maskieren**, damit er keine Vektoren

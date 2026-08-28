@@ -17,6 +17,211 @@ ihrer Begründungen — die sind der Wert, nicht die Häkchen. Danach steht hier
 
 ---
 
+## B4b. Der Geraeteinterrupt kommt nicht an — und der Kernel ist lueckenlos geprueft
+
+**Klasse:** Messstand / Stufe B · **Stand:** B1–B3 gemessen, B4 gebaut und **nicht wirksam**
+(`B4_WARTEN = false` in `programs/hardware/virtio-blk`).
+
+Der Treiber bindet seinen Interrupt ueber `SYS_BIND_IRQ` und wartet noch nicht. Der Grund ist eine
+Kette **zurueckgelesener** Groessen, keine Vermutung:
+
+| Glied | gemessen |
+|---|---|
+| Queue 0 → MSI-X-Zeile | `queue0-msix-vektor=0x0000` |
+| Zeile 0 im Geraet | `addr=0xfee00008`, `vctrl=0x0` (unmaskiert) |
+| Message Control | `0x8004` — Enable an, **Function Mask frei** |
+| IRTE Handle 0 | praesent, Vektor `0x60`, `SVT=01`, SID = RID `0x0018` |
+| IEC-Invalidierung | erfolgt |
+| Arbeit des Geraets | **`used.idx=1`** |
+| IOMMU-Faults | **leer** |
+| Zustellpfad dahinter | **bewiesen** (Self-IPI, Vektor `0x64` erreicht `irq_hook` und die Notification) |
+
+**Das Geraet erledigt die Anfrage und sendet nicht.** Was der Gast sehen kann, ist geprueft.
+
+**Was NICHT mehr zu messen ist — damit es niemand ein drittes Mal plant.** Die naheliegende
+Halbierung „einen Store auf `0xfee00008` vom Kern aus" ist **gefahren worden, zweimal, und kann
+nicht entscheiden**:
+
+* In **remappable** Form misst sie unter QEMU nichts: Interrupt-Remapping haengt dort als
+  Speicherregion im **Geraete**-Adressraum; ein CPU-Store geht daran vorbei.
+* Ueberhaupt ist ein Store dorthin kein Nachrichtenversand, sondern ein **Registerzugriff** auf die
+  eigene LAPIC-Seite — und unter x2APIC ist die Seite abgeschaltet. Ein Prozessor schickt sich einen
+  Vektor per **ICR**, nicht per Store.
+
+Was an ihre Stelle getreten ist und **traegt**, ist der **Self-IPI** (`msi_zustellprobe`): Vektor
+`0x64` erreicht `irq_hook`, wird gedrained und kommt an der Notification an. Damit ist die zweite
+Haelfte — APIC → IDT → Dispatch → `irq_hook` → Drain → Notification, samt Bindung und Badge —
+**bewiesen**, und die Halbierung ist nicht mehr offen: der Fehler liegt vor der IOMMU.
+
+**Die beiden geraeteseitigen Erstkandidaten sind ebenfalls schon ausgeschlossen:**
+`VRING_AVAIL_F_NO_INTERRUPT` ist **nicht** gesetzt (`queue_setup` nullt `avail.flags`, `publish`
+fasst sie nicht an), und Bus Master ist **an** — `used.idx=1` waere sonst unmoeglich, denn ohne BME
+haette das Geraet den Deskriptor nie gelesen.
+
+**Was zu tun ist, gehoert an den MESSSTAND:** drei Laeufe, die die Umgebung als Variable behandeln —
+ohne KVM (TCG), ohne `intremap`, mit `eim=on`. Erst wenn die Umgebung ausscheidet, ist der Kernel
+wieder Verdaechtiger.
+
+**Nicht zu tun:** ein Poll-Rueckfall im Treiber. Er unterliefe `poll-runden == 0`, also genau die
+Konjunkte, die B4 traegt — die Zeile bliebe gruen und maesse etwas anderes (Plan §4).
+
+**Der offene Rand, benannt:** `WAIT` hat keine Frist (Stufe A fehlt). Mit eingeschaltetem Warteweg
+blockiert der Treiber fuer immer und **nimmt die Suite mit** — das ist kein Prognosewert mehr,
+sondern ein Vorfall vom 2026-08-26. Die Zwischenfassung ist eine Frist des **Messenden** (Timeout
+im Testtreiber, nicht in der ABI); sie nimmt Stufe A nicht vorweg.
+
+---
+
+## D16. Feste Zahlen neben hergeleiteten Laengen — der vierte Anlass
+
+**Klasse:** Struktur · **Stand:** drei Einzelfixe, kein Durchgang.
+
+Dreimal dieselbe Form, jedes Mal teuer, jedes Mal jahrelang durch eine Groessenrelation gedeckt:
+
+* `dense = [first; 8]` in `loader.rs` neben einem hergeleiteten `slots` — mit dem neunten
+  Endowment-Slot schrieb es ueber sein Ende;
+* `STACK_CAP_SLOTS = 1024` neben einer zur Bootzeit dimensionierten Thread-Tabelle;
+* `CAP_BUDGET_PER_PD = 8` neben dem, was der Lader vergibt — die Zusage war unerfuellbar, und die
+  Absage trug den Grund nicht.
+
+Zwei davon liefen auf einer Architektur nur durch Glueck. Beim vierten Anlass ist ein
+**systematischer Durchgang** billiger als der naechste Einzelfix: Array-Literale und
+Kapazitaetskonstanten gegen die Laengen pruefen, aus denen sie folgen.
+
+Die Bauform steht schon da (`const _: () = assert!(LOAD_CAPS_MAX <= CAP_BUDGET_PER_PD, ..)`); offen
+ist nur, an wie vielen Stellen sie noch fehlt.
+
+---
+
+## E-T1. `FSGSBASE`: ein Gewinn, der eine Option verteuert
+
+**Klasse:** Entscheidung · **Stand:** offen, **bewusst nicht** als Optimierung durchgewinkt.
+
+`WRMSR` **serialisiert** (ueber hundert Zyklen), `WRFSBASE` sind ein paar. Bei einem Schreib je
+Kontextwechsel ist der Unterschied real; die Voraussetzung ist ein CPUID-Bit plus `CR4.FSGSBASE`.
+
+**Der Haken ist keine Umsetzungsfrage:** `CR4.FSGSBASE` gibt auch **`wrgsbase` aus Ring 3** frei.
+Solange `GS` ungenutzt ist, folgenlos -- und dass es ungenutzt **bleibt**, war der Nebenertrag der
+TLS-Entscheidung (`FS` und `GS` sind beide frei, gewaehlt wurde `FS`). Sobald `GS` die
+Per-CPU-Ablage werden soll, ist die GS-Basis beim Kerneleintritt ein **vom Benutzer gewaehlter**
+Wert, und der `swapgs`-Pfad muss das aushalten. Linux hat dafuer seinen Eintrittspfad umgebaut.
+
+Der Gewinn ist echt, der Preis ist eine Option, deren Wert heute niemand kennt. Deshalb steht das
+hier und nicht in einem Commit.
+
+---
+
+## A2. Fristen — der Rest (2026-08-28)
+
+**Klasse:** Kern-Primitiv · **Stand:** `[~]` — `WAIT` gemessen (s. `done.md`), vier Stuecke offen.
+**Vier getrennte Punkte, weil sie verschieden schwer sind.** Sie in einem zu fuehren, hiesse den
+teuersten hinter dem billigsten zu verstecken.
+
+**A2 (Rest). `CALL` und `PARK` tragen keine Frist.** Gebaut ist genau eine Aufrufstelle von
+`frist_setzen` -- die im `WAIT`-Arm. Der Fall, der A2 ueberhaupt begruendet (ein Treiber wartet auf
+ein Geraet, das nicht antwortet), laeuft ueber `WAIT`, deshalb steht es dort zuerst; `CALL` ist der
+naechste, weil ein Client an einem toten Server dieselbe Lage hat. **Vorsicht bei `CALL`:** dort
+haengt eine Antwortpflicht daran -- eine abgelaufene Frist darf den Server nicht mit einem
+Reply-Recht auf einen Thread zuruecklassen, der nicht mehr wartet. Genau die Form, die bei `WAIT`
+den `ERR_EP_FULL`-Befund erzeugt hat, nur mit einer zweiten Partei.
+
+**A2n. Die Gegenprobe fehlt — und damit sind die vier Konjunkte D18-verdaechtig.**
+Vorgeschrieben ist im Dokument die schaerfste Fassung: *der Timer entfernt alle Gruende statt des
+einen* -- ein danebenliegender, aus anderem Grund geparkter Thread muss losfallen, **und eine
+zweite Sonde muss das sehen**. Der zweite Halbsatz ist die eigentliche Arbeit: ohne einen zweiten
+Wartenden mit einem *anderen* Grund ist die Mutation folgenlos, und ein folgenloser Negativfall
+belegt nichts. Dazu die billigen drei: Wecker feuert nie (`frist-weckt` faellt), Wecker feuert
+sofort (`nicht-zu-frueh` faellt), Frist gewinnt gegen das Signal (`signal-gewinnt` faellt).
+Ziel: `tools/fristen-negativ.sh`.
+
+**A2c. Das Rennen ist entschieden, aber nicht getroffen.** Die Aufloesung steht (*das Signal
+gewinnt*) und ist implementiert; die Sonde signalisiert jedoch **vor** dem Warten, trifft das
+Fenster also nur in der einen, leichten Lage. Das Dokument verlangt ausdruecklich, es
+**absichtlich** zu treffen -- Signal und Timer im selben Tick. Ohne diese Messung ist „das Signal
+gewinnt" eine Aussage ueber den Quelltext, nicht ueber den Lauf.
+
+**A2v. Der Verus-Aufwand — die einzige unbepreiste Groesse des Plans.**
+Der Modell-Treue-Waechter hat die drei Stellen von selbst gemeldet; sie stehen als **ausserhalb
+mit Schuld** in `tools/verus-modelltreue-sched.sh`:
+
+```
+'frist':           'absolute Frist in Ticks -- das Modell kennt keine Zeit (A2, SCHULD: todo A2v)'
+'frist_grund':     'dito -- der Grund, den die Frist entfernen darf'
+'fristen_faellig': 'A2: Wecker mit Zeit-Ausloeser. Effekt = unpark, Ausloeser nicht modellierbar'
+```
+
+**Der Effekt ist modellierbar, der Ausloeser nicht.** `fristen_faellig` tut, was das Modell kennt:
+genau einen Grund entfernen, bei leerer Menge einreihen -- woertlich `unpark`. Was fehlt, ist die
+**Zeit**. Ihn als Partner von `unblock` einzutragen waere die bequeme Fassung und eine Behauptung:
+der Beweis koennte nicht pruefen, dass die Frist feuert, **wenn sie soll**, sondern nur, dass sie
+richtig weckt, **wenn sie feuert**. Damit blieben genau die zwei Fehlerbilder unbewiesen, die A2
+gefaehrlich machen -- eine Frist, die zu frueh feuert (der Korruptionspfad), und eine, die nie
+feuert (der Haenger, gegen den A2 gebaut ist).
+
+**Der ehrliche Zuschnitt ist deshalb, das Modell um eine Uhr zu erweitern**, nicht die Stelle
+einzutragen. Was das kostet, weiss dieser Eintrag nicht -- und genau das steht seit dem ersten
+Entwurf im Dokument: *„Der Verus-Aufwand ist die einzige unbepreiste Groesse."* Er ist nach A2
+unbepreist geblieben; neu ist nur, dass jetzt benannt ist, **wofuer**.
+
+---
+
+## D18. Pruefer, die nicht scheitern KOENNEN — die Klasse, die mit jedem Lauf glaubwuerdiger wird
+
+**Klasse:** Pruefwesen · **Stand:** fuenf Instanzen bekannt, kein Durchgang. **Nicht D16.**
+
+Der Unterschied im Fehlerbild entscheidet: eine falsche Zahl (D16) wird irgendwann rot. Ein Pruefer,
+der **nicht scheitern kann**, meldet dauerhaft gruen — und je laenger er das tut, desto mehr
+Vertrauen traegt er. Er wird nicht entdeckt, er wird zitiert.
+
+Fuenf Instanzen, alle belegt:
+
+| Fall | was aussah wie eine Pruefung |
+|---|---|
+| `ueberlappung-abgewiesen` | der Pruefer las `KSTACKS.ubase_of`, das der Spawn-Pfad mit Begruendung nie fuellt — **strukturell blind** |
+| `SYS_SPAWN` | vollstaendig gebaut, nie gefahren, im Register als *fehlend* gefuehrt |
+| `dma_audit = 2` | Zahl gedruckt, nie verglichen — auch eine 3 haette geschwiegen |
+| **M5** (2026-08-26) | das `sed`-Muster traf nach einem Umbau nichts mehr; der Negativfall war lautlos abgeschaltet |
+| **`b4-aktiv`** (verhindert) | eine Praemisse, die nie wahr wird, ist eine Konjunkte, die nie urteilt |
+| **`getrennt`** (2026-08-27) | verglich zwei Adressen, die der PRUEFER gewaehlt hatte -- schwieg ein Thread, stand dort `0`, und `0 != b0` las sich als „getrennt". **Wahr, weil nichts passiert ist** |
+| **`konjunkt()`** (2026-08-27) | der Extraktor der Gegenprobe las die **falsche Zeile** (`irtevgb` hat ein gleichnamiges `getrennt=true`, `head -1` nahm dessen Wert) -- zwei Laeufe lang ein Fehlalarm |
+| **M2, erste Fassung** (2026-08-27) | die Mutation zerstoerte etwas **Harmloses**; eine Gegenprobe, die nichts kaputtmacht, belegt nichts |
+
+**Das Gegenmittel ist in beiden Faellen dasselbe: die PRAEMISSE pruefen, nicht nur den Schluss.**
+Die Trefferzahl im Mutationswerkzeug und M8 sind zwei Instanzen davon — das eine prueft, dass die
+Mutation greift, das andere, dass die Bedingung ueberhaupt einmal wahr wird.
+
+**Der Extraktor gehoert dazu.** „Trifft genau einmal" schuetzt die MUTATION; dass die **Ablesung**
+auf der gemeinten Zeile sitzt, ist eine zweite Frage, und sie hat 2026-08-27 zwei Laeufe gekostet.
+Beide Negativskripte verankern seither auf ihrer eigenen Berichtszeile (`ZEILE=`).
+
+**Die offene Frage, und sie ist beantwortbar:** *welche Konjunkte im Baum haben keine Gegenprobe,
+die sie rot macht?* Bei `irqmsi` sind es nach dem 2026-08-26 acht von acht. Bei den aelteren Zeilen
+(`dmaiso`, `pdcolor`, `ladepol`, `cycacct`, `epfull`, `verif`, `arena`, `dmapool`, …) ist die Zahl
+**unbekannt** — und „unbekannt" ist hier nicht neutral, sondern die Vorstufe der fuenf Faelle oben.
+
+Ein Durchgang zaehlt zuerst und mutiert dann; die Zaehlung allein ist schon eine Aussage.
+
+**Ergaenzung zur Trefferpruefung:** „trifft genau einmal" schliesst nicht aus, dass der eine Treffer
+nach einem Umbau an der **falschen Stelle** sitzt. Dagegen schuetzt nur die Isolationsspalte — die
+uebrigen Konjunkte muessen gruen bleiben —, und sie muss **je Mutation** ausgewertet werden, nicht
+nur die gemeinte Zeile. In `tools/irqmsi-negativ.sh` ist das bei allen acht so.
+
+---
+
+## D17. Ein Kernel-Panic ist eine Messblindstelle
+
+**Klasse:** Diagnostik · **Stand:** offen, eigene Entscheidung.
+
+Am 2026-08-26 panikte `load_program_into_pd` in einem Array-Ueberlauf. Weil ein Panic den Knoten
+nicht mitreisst (B-6.2: der Panic-Pfad haelt den Kern **ohne** IRQ-Maskierung, der naechste Tick
+holt ihn zurueck), sah das von aussen so aus: **vier von sechs Programmen fehlten**, Threads
+erzeugt und nie zugelassen, kein Watchdog, keine Zeile. Das Bild war Stille.
+
+Ob B-6.2 so bleiben soll, ist eine eigene Frage. Dass ein Panic **irgendwo** sichtbar wird — ein
+Zaehler, eine Zeile im Bericht, ein Konjunkt — ist es nicht.
+
+---
+
 ## C7b. Die 2 MiB je isolierter PD sind gemessen und gesenkt — und der Hebel war der falsche
 
 **Klasse:** Kapazität / Produktziel · **Stand:** die Messung steht, die Grösse ist gesenkt
@@ -941,10 +1146,36 @@ Reihenfolge ist hier keine Geschmacksfrage — jede Stufe ist Vorbedingung der n
       sie null. Und ein Trap-Frame lässt sich erst dann sinnvoll mitnehmen, wenn der Stack
       mitkommt: `RSP` ohne Stackinhalt ist ein Zeiger ins Leere, und der Fehler tritt später und
       woanders auf.
-- [ ] **Z4d. IPC-Beziehungen.** Ein wandernder Thread mit offenem `CALL` hat einen wartenden
-      Server zurückgelassen. Entweder Migration nur ohne offene Transaktionen (einfach, ehrlich,
-      wahrscheinlich richtig für Stufe 1), oder Endpoint-Proxys über das Netz (ein eigenes
-      Projekt).
+- [~] **Z4d. IPC-Beziehungen — Stufe 1 steht** (2026-08-25, Prüfzeile `ckptcut`). Details in
+      [done.md](done.md#z4d-stufe-1-eine-offene-transaktion-kreuzt-den-schnitt-nicht). Gewählt ist
+      die erste Variante ("Migration nur ohne offene Transaktionen"), und sie ist jetzt eine
+      **Struktur** statt einer Aufrufdisziplin: `Image::build` nimmt das Subjekt und die
+      **beobachteten** IPC-Kanten und weist an der ersten ab, die den Schnitt kreuzt.
+
+      **Die Regel ist eine Äquivalenz:** *der Kanal wandert ⇔ der Thread, der dort eine Rolle hält,
+      wandert.* Beide Richtungen sind Absagen, und sie sind **verschiedene** Absagen — die eine
+      behebt man, indem man den Kanal in den Umfang nimmt, die andere, indem man den Partner
+      aufnimmt oder seine Transaktion abwartet.
+
+      **Der Befund, der größer ist als der Eintrag:** die zweite Richtung hatte niemand
+      aufgeschrieben. `Scope::endpoints` trug die Doku „Endpoints, deren **beide Seiten** Teil des
+      Checkpoints sind" — eine Liste, die der Aufrufer hinschreibt, und bis 2026-08-25 hat sie
+      niemand gegen den IPC-Zustand der Maschine gehalten. Ein genannter Endpoint war
+      **geglaubt**; ein an ihm blockierter Client, der zurückbleibt, kam nirgends vor. Dieselbe
+      Form wie `ep_inv` („hielt nicht der Typ, sondern die Aufrufdisziplin") und wie „ein Wächter
+      prüft die EXISTENZ eines Grundes, nie seine WAHRHEIT". `Scope::EMPTY` hat das Loch verdeckt
+      — mit leerem Umfang wird jede Beziehungs-Cap abgewiesen, das ungeprüfte Stück war von der
+      einzigen Aufrufstelle aus also unerreichbar. Ein unerreichbares Loch ist eines.
+
+      **Offen bleibt Stufe 2:** Endpoint-Proxys über das Netz, damit eine Beziehung die
+      Maschinengrenze *überleben* kann statt sie zu verbieten. Das ist ein eigenes Projekt und
+      hängt an [Z4e](#z4-checkpointrestore-eines-threads) (Transport) und [Z10](#z10-io-überhaupt)
+      (Netz).
+
+      **Und eine Schwäche, die zur Zeile gehört:** `ckptcut` gattert über den `check` der beiden
+      Suiten, **nicht** über `all_done()` — `ckptcut::urteil()` ist tot, genau wie
+      `pdfreeze::urteil()` und `dbgprobe::urteil()`. Steht als eigener Punkt unter
+      [Z23](#z23-prozess-freeze--der-gruppenschnitt-steht-2026-08-21).
 - [ ] **Z4e. Transport + Vertrauen.** Ein Checkpoint ist der vollständige Zustand eines Tenants.
       Er geht verschlüsselt und authentifiziert über das Netz, oder gar nicht. Hängt an
       [Z7](#z7-attestierung-und-messbarer-boot): die Zielmaschine muss nachweisen können, dass sie
@@ -1685,18 +1916,27 @@ auf x86, grosse DMA, Firmware aus einem Dateisystem) stehen ohnehin auf dem Weg 
 vierte — **das Kernel-Primitiv für umgeleitete Syscalls** — steht auf keinem anderen Weg und ist
 damit der ehrliche Preis dieser Entscheidung.
 
-### Z23. Prozess-Freeze — geplant 2026-08-09, NICHT begonnen
-**Klasse:** Nebenstrang · **Vorbedingung:** mehrere Threads je PD (Z22 P2, offen) — ohne die ist
-jeder Nachweis hier nur ein zweites Z4a
+### Z23. Prozess-Freeze — DER GRUPPENSCHNITT STEHT (2026-08-21)
+**Klasse:** Nebenstrang · **Vorbedingung:** mehrere Threads je PD (Z22 P2) — **erfüllt**, die Sonde
+faehrt drei Threads in einer PD
 
-**Der Ist-Stand, gemessen:** `freeze_thread` ist die **einzige** Freeze-Funktion im Baum. Es gibt
-keinen Prozess-Freeze, und die naheliegende Fassung („alle Threads der Reihe nach") ist nicht bloss
-unimplementiert, sondern **strukturell unmöglich**: treiben zwei Threads einer PD miteinander IPC,
-gibt `freeze_thread` für **beide** `Busy`, und es existiert keine Reihenfolge, die das auflöst.
-Die Bausteine sind da (`endpoint_quiesce`/`ERR_QUIESCING`, `thread_quiescence`, `Freeze`, `Parked`,
-`checkpoint::Scope`/`classify`); der Ablauf darüber ist nie gebaut worden.
+> **Registerkorrektur 2026-08-21, zweite Runde.** Der Eintrag sagte „S1 ist gebaut", und der
+> Ist-Stand darueber sagte „es gibt keinen Prozess-Freeze, und die naheliegende Fassung ist
+> **strukturell unmoeglich**". Beides stimmte am 2026-08-09. Gemessen am 2026-08-21: **S1b, S2, S3
+> und die Haelfte von S6 sind gebaut und gegattert** (`pdfreeze : ALL PASS`, **27** Konjunkte, sieben
+> Gegenproben). Was offen ist, steht ab **S4**.
 
-- [ ] **S1 (ursprünglicher Plan, zum Nachlesen).** Erst die **Tore schliessen**, dann einfrieren.
+**Was die Unmoeglichkeit aufgeloest hat, war keine Mechanik, sondern eine andere FRAGE.** `freeze_thread`
+fragt „haelt dieser Thread eine offene Beziehung?" und weist ein sich gegenseitig rufendes Paar
+derselben PD zweimal ab — es gibt keine Reihenfolge, die das aufloest. Der Schnitt fragt „**verlaesst
+die Beziehung den Schnitt?**". Liegen beide Enden drin, ist sie keine offene Beziehung des Schnitts;
+das Reply-Token bleibt unangetastet, und nach dem Auftauen laeuft die Transaktion weiter. Genau das
+ist der Fall, den Z4a nicht schon zeigt — und die Sonde belegt **beide** Haelften am selben Paar im
+selben Lauf: `einzeln-unfrierbar=true/true` (jeder nennt den anderen) neben `umfang=3`.
+
+Regel und Entscheidungen stehen normativ in `docs/invariants.md` §1d, die Migrationsfolge in §11.3.
+
+- [x] **S1 — gebaut.** Erst die **Tore schliessen**, dann einfrieren.
       Ein `PD_QUIESCING`-Bit je PD, geprüft im Syscall-Pfad: `CALL`/`RECV` **aus** der PD heraus
       scheitern mit `ERR_QUIESCING`, laufende Transaktionen dürfen **abschliessen** (`REPLY` bleibt
       erlaubt) — dieselbe Torlogik wie A-4.2, nur mit der PD als Umfang statt einem Endpoint.
@@ -1705,44 +1945,44 @@ Die Bausteine sind da (`endpoint_quiesce`/`ERR_QUIESCING`, `thread_quiescence`, 
       **Subjekt** hängen, nicht am Objekt.
       **TCB-Kosten, benannt:** ein Bit je PD und eine Prüfung in `CALL`/`RECV`. Mehr nicht.
 
-- [ ] **S1b — was ein FREMDER Aufrufer erlebt, ist offen — und das exportiert den Deadlock.**
-      Das Subjekt-Gating stoppt, was die PD selbst **anfängt**. Ihre Endpoints existieren aber
-      weiter: eine dritte PD, die während des Fensters oder nach dem Einfrieren **hineinruft**,
-      bekommt ohne definierte Antwort **unbegrenztes Blockieren** — der Freeze reicht genau den
-      Deadlock an Unbeteiligte weiter, den die Partner-Nennung auf der eigenen Seite vermeidet.
-      Drei ehrliche Optionen, und keine ist gratis:
-      * **`ERR_QUIESCING` auch an Aufrufer** — macht den Freeze für Clients sichtbar. Ehrlich,
-        aber **jeder** Client braucht Retry-Logik.
-      * **Begrenztes Anstellen** mit benannter Schranke — dann ist zu sagen, **wer den Pufferplatz
-        bezahlt** (und der Überlauf ist wieder ein D11-Fall).
-      * **Blockieren als dokumentierter Vertrag** („ein Call in eine eingefrorene PD wartet bis zum
-        Thaw"). Für eine PaaS mit Migration vertretbar — aber dann gehört die Aussage **in die
-        Zusicherung des Endpoints**, nicht ins Kleingedruckte.
+- [x] **S1b — entschieden und gemessen: `ERR_QUIESCING`, aber NUR am exklusiven Kanal.**
+      Der Schnitt sperrt einen Endpoint nach innen zu (`begin_quiesce`) **genau dann, wenn die
+      eingefrorene PD dort allein bedient**. Fremde Aufrufer bekommen damit „kommt gleich wieder"
+      statt unbegrenztem Blockieren; wo auch ein Fremder bedient, wird **nicht** zugesperrt — dort
+      fröre der Riegel Dritte mit ein, und der Fremde bedient die Aufrufer ohnehin weiter.
+      **Der Preis steht dabei:** ein Client an einem exklusiven Kanal braucht Retry-Logik.
+      Die beiden verworfenen Fassungen sind benannt (begrenztes Anstellen — niemand bezahlt den
+      Puffer, und der Ueberlauf ist wieder ein D11-Fall; unbegrenztes Blockieren — ehrlich fuer
+      eine PaaS, reicht den Deadlock aber an Unbeteiligte weiter).
+      Gemessen ueber `gate_new_transaction` — **dieselbe** Funktion, die `call`/`recv` ausfuehren,
+      keine Nachbildung, die auseinanderlaufen kann. Konjunkte `kanal-zu` und `empfaenger-gezogen`,
+      **getrennt**, weil es zwei Zusagen sind; Gegenproben M3 und M4 zeigen sie einzeln.
 
-- [ ] **S2 — die Absage muss den PARTNER nennen.** Ein Thread, der in einem `CALL` an einen
-      **fremden** Server hängt, der nie antwortet, macht die PD unfrierbar. Das ist kein
-      vorübergehender Zustand und darf kein Hänger sein: `Freeze::BusyOn { tid, partner }` statt
-      `Busy(Quiescence)`.
-      **An WEN der Name geht, ist Teil der Spezifikation:** an den **Halter der Freeze-Autorität**,
-      nicht an die eingefrorene PD. Sonst wird die Absage zum **Orakel**, mit dem eine PD die
-      IPC-Topologie fremder PDs ausforschen kann — eine Fehlermeldung mit Namen ist ein Kanal.
-      Dazu eine **Frist** mit benanntem Ausgang. „Wir warten, bis es ruhig ist" terminiert nicht
-      beweisbar, und eine Stilllegung ohne Frist ist von einem Deadlock nicht zu unterscheiden —
-      genau die Ununterscheidbarkeit, die `docs/fehlerdomaene.md` schon einmal gekostet hat.
+- [x] **S2 — die Absage nennt den PARTNER, und die Frist hat einen benannten Ausgang.**
+      `Freeze::BusyOn(Quiescence, ThreadId)` fuer den Einzelfall, `PdFreeze::Deadline { tid,
+      partner, q }` fuer den Schnitt. Ein wartender **Empfaenger** hat keinen Partner, und einen zu
+      erfinden waere schlimmer als keinen zu nennen — dann zoege man den Falschen zur Rechenschaft.
+      **An wen der Name geht, steht im Code:** an den Halter der Freeze-Autoritaet, ueber den
+      Kernelpfad, **nicht** ueber einen Syscall — eine Fehlermeldung mit fremdem Threadnamen ist ein
+      Orakel fuer die IPC-Topologie anderer PDs.
+      Gemessen als `frist-nennt-partner` an einer PD, die in eine dritte hineinruft, die nie
+      antwortet; dazu `frist-tore-auf` — **jeder** Ausgang ausser `Frozen` hinterlaesst den Zustand,
+      den er vorfand.
 
-- [ ] **S3 — der Freeze ist eine MENGE, kein Ablauf.** Entweder steht die ganze PD oder keiner
-      ihrer Threads. Ein Teilerfolg, der liegen bleibt, ist schlimmer als ein Fehlschlag: die PD
-      wäre halb tot und **jeder Prüfer meldete Ordnung** (D11-Form).
-      Also ein Zeuge `FrozenPd` nach dem Vorbild von [`Parked`](#z22): `#[must_use]`, **kein**
-      öffentlicher Weg an die ThreadIds, kein `Drop` (sonst liesse sich der Inhalt beim Auftauen
-      nicht herausbewegen) — und ein ausdrückliches `abort_freeze`, das die schon eingefrorenen
-      wieder auftaut. Bewacht wie `tools/zulassung.sh`, mit Selbsttest in beide Richtungen.
-      **`abort_freeze` ist der am wenigsten geübte und gefährlichste Pfad und braucht seine EIGENE
-      Gegenprobe:** Teilerfolg → Abbruch → alle Threads wieder lauffähig, **keine Weckmarke
-      verloren, kein Grund-Bit hängengeblieben**. Das ist schwerer als der Erfolgsfall, weil es
-      jeden Zwischenzustand rückwärts durchläuft — und mit der Grund-Menge aus **Z24** fast
-      geschenkt (den Freeze-Grund aus der Menge entfernen, fertig). **Noch ein Grund, Z24 VOR Z23
-      zu ziehen.**
+- [x] **S3 — der Freeze ist eine MENGE, kein Ablauf.**
+      `FrozenPd`: `#[must_use]`, **kein** `Drop` (sonst liesse sich der Inhalt beim Auftauen nicht
+      herausbewegen), **kein** oeffentlicher Weg an die `ThreadId`s — wer einzelne Teilnehmer
+      antasten koennte, koennte die Menge halbieren. `abort_freeze` neben `thaw_pd`, mit demselben
+      Rumpf und getrenntem Zaehler: die beiden **bedeuten** Verschiedenes.
+      **Dass der Weg zurueck derselbe ist, ist das Ergebnis von Z24** — mit `BlockReasons::FREEZE`
+      als eigenem Grund (Bit 7, achte Instanz) ist der Abbruch *ein* `remove` je Teilnehmer, ohne
+      Zwischenzustand und ohne fremde Weckmarke. Genau deshalb stand im Register „Z24 vor Z23".
+      **`PAUSE` waere die naheliegende und falsche Wahl gewesen** — dessen Doku nannte den
+      Gruppenschnitt sogar als kuenftigen Nutzer: ein einziges `RESUME` auf einen Teilnehmer loeste
+      ihn aus der Gruppe, die PD waere halb eingefroren, und jeder Pruefer meldete Ordnung.
+      Gemessen als `resume-wirkt-nicht`; Gegenprobe M1 stellt genau das wieder her.
+      **Alle Absagen sind benannt und fail-closed:** `HasDma`, `TooManyThreads`, `MultiReceiver`,
+      `SenderQueued`, `Debugged`, `AlreadyQuiescing`, `Empty`, `Deadline`.
 
 - [ ] **Was das NACH AUSSEN heisst, und es gehört in beide Protokolle.** „Der Checkpoint trägt
       keinen Thread" bedeutet: **Resume-Latenz und Live-Migration haben derzeit kein messbares
@@ -1757,82 +1997,97 @@ Die Bausteine sind da (`endpoint_quiesce`/`ERR_QUIESCING`, `thread_quiescence`, 
       (Dieselbe Ehrlichkeit wie „*ein Thread überlebt eine Bootgrenze* liest sich stärker, als die
       Sache ist". **Gehört auch ins Velve-Protokoll**, nicht nur hierher.)
 
-- [ ] **S4 — den Zustand aufzählen, der mitwandern MUSS.** Heute wandert **nichts**: `Image` trägt
-      `progress`, `nonce`, `epoch`, `caps` — eine Anwendungsgrösse und die Cap-Klassifikation. Kein
-      Trap-Frame, keine Register, kein Stack, kein Speicherinhalt.
-      Aufzuzählen ist mindestens: je Thread Registerzustand, Stackinhalt, `priority`/`budget`/
-      `period`/`remaining`, der **Blockadegrund**, und — als Schuld aus Z22 P4 — **`parked` und
-      `park_wake`**. Je PD: Adressraum (welche Seiten, welche Farben) und Cspace. Dazu die
-      schwebende IPC-Lage: Reply-Token und die `pending`-Badges der Notifications.
-      **Ausdrücklich dazu: der FP-Zustand.** Er liegt nach dem Eager-Umbau im `FP_STATES`-Slot,
-      **nicht** im Trap-Frame. Wird er nicht genannt, wandert ein Thread **ohne seine XMM** und
-      rechnet nach dem Thaw mit fremden oder genullten Registern weiter — der stille
-      Registerverlust, nur über die Bootgrenze.
-      **Und die Entscheidung, die JETZT zu treffen ist, nicht später implizit im Migrationscode:
-      ein Bild mit Threadzustand trägt GEHEIMNISSE.** Trap-Frame + Stack + Speicherinhalt heisst
-      Schlüsselmaterial im Bild — nach dem Eager-Umbau ausdrücklich **auch die XMM-Register**, also
-      genau das Material, dessentwegen eager beschlossen wurde. Ein `Image` mit `progress` und
-      Cap-Klassen war ein **Metadatum**; eines mit Registern und Speicher ist ein **Datenträger**.
-      Wer es lesen darf, wo es liegt, ob es ruhend verschlüsselt ist — bei Migration **verlässt das
-      Bild die Maschine**, das ist dieselbe Sorte Entscheidung wie `SVT`/`SID` bei der IRTE:
-      Autorität, vorab zu spezifizieren.
-      **Regel, ab sofort im Plan:** *Bild enthält Registerzustand ⇒ vertraulich; Ablage- und
-      Transportregel steht, bevor S4 gebaut wird.*
-      **Die Regel für den Rest steht schon:** was nicht übertragbar ist, wird **benannt abgewiesen** —
-      `classify` tut das für Caps. S4 heisst, `Scope`/`classify` von Caps auf **Threadzustand**
-      auszudehnen, nicht ein neues Verfahren zu erfinden.
+- [x] **S4 — der Zustand ist AUFGEZAEHLT, und die Vertraulichkeitsregel steht vorher.**
+      Kein neues Verfahren: dieselbe Regel eine Ebene tiefer. `checkpoint::classify_thread_part`
+      neben `classify`, `ThreadStatePart` als **geschlossene** Aufzaehlung — ein neues TCB-Feld,
+      das fehlt, faellt am `match` auf und nicht beim ersten Thaw mit falschen Registern.
+      Aufgezaehlt sind: Register (**mit dem Ring**), **FP-Zustand** (im `FP_STATES`-Slot, *nicht*
+      im Frame — ohne ihn wandert ein Thread ohne seine XMM), Stack, EL0-Kernel-Stack, Prioritaet,
+      MCS-Konto, Grund-Menge, **Park-Weckmarke** (die Schuld aus Z22 P4 — sie ist kein Grund,
+      sondern eine Marke, und faellt deshalb beim Aufzaehlen der Gruende durchs Raster),
+      Reply-Token, Notification-Badges, Handler-Bindung, Kernaffinitaet, Zyklenstempel.
+      **Benannt abgewiesen** statt stillschweigend weggelassen: `LocalReason::MachineLocalNumber`
+      als **eigener** Grund — ein Geraetefenster ist drueben *nicht herstellbar*, eine
+      Kernaffinitaet *entsteht drueben neu*; derselbe Code liesse jemanden nach einem Geraet suchen,
+      wo eine Zuteilung fehlt. Beziehungen (Reply-Token, Handler-Bindung) haengen am `Scope`,
+      woertlich wie bei den Caps.
+      **Die Vertraulichkeitsentscheidung ist getroffen, maschinenlesbar und gemessen:**
+      `image_is_confidential`. Ein `Image` mit `progress` war ein Metadatum; eines mit Registern und
+      Speicher ist ein **Datentraeger**. Gemessene Folge: **jedes vollstaendige Bild ist
+      vertraulich** — es gibt keinen Migrationsfall, in dem die Ablage- und Transportregel entfaellt.
+      6 neue Host-Tests (38 in `checkpoint`), jeder mit beiden Richtungen. Normativ in
+      `docs/invariants.md` §1d.2.
+      **Was das NICHT ist:** ein Serialisierer. `Image` traegt weiterhin keinen Threadzustand — die
+      Aufzaehlung ist die Voraussetzung dafuer, dass es einen geben kann, und die Ehrlichkeit dazu
+      steht unveraendert im naechsten Punkt.
 
-- [ ] **S5 — Gerät und DMA: hier gibt es heute NULL Zeilen.** Eine eingefrorene Treiber-PD, deren
-      Gerät gerade in ihre Region schreibt, ist **nicht** eingefroren — der Deskriptorring läuft
-      weiter, und mit MSI (Z22 P1) wird das mehr, nicht weniger.
-      Drei Wege, und der erste ist die richtige erste Fassung:
-      * **(a) fail-closed:** eine PD mit DMA-Cap wird **nicht** eingefroren. Billig, ehrlich,
-        sofort. Eine Absage, die stimmt, ist besser als eine Zusage, die nicht hält.
-      * **(b) das Gerät stilllegen** — treiberspezifisch, gehört also **in die PD**: ein
-        `PD_FREEZE_PREPARE`-Upcall, den der Treiber beantwortet („DMA steht"). Das ist ein
-        **Protokoll**, kein Kernelmechanismus, und damit TCB-neutral. Der richtige Endzustand.
-      * **(c) den IOMMU-Kontext abhängen** — generisch und kernelseitig, zerstört aber laufende
-        Anfragen. Nur als Notbremse.
-      **Berichtigt (Einwand vom 2026-08-09): der stärkere Mechanismus existiert schon — die IOMMU
-      selbst.** Ein Kanarienwort fängt nur das Gerät, das zufällig **dieses Wort** beschreibt; DMA
-      in alle übrigen Seiten bleibt unsichtbar, und die falsche Beruhigung überwiegt. Der Freeze
-      dreht stattdessen die **Domäne des Geräts auf non-present**: jede DMA während des
-      Eingefroren-Seins wird ein **IOMMU-Fault**, und der Fault-Weg ist bereits gebaut — laut,
-      gemessen, **flächendeckend statt wortgross**.
-      Das Kanarienwort bleibt trotzdem: als **Tripwire im Selbsttest**, der den **Prüfer** prüft.
-      Aber die Zusicherung „kein DMA während Freeze" gehört an die Hardware-Grenze, die sie
-      vollständig durchsetzen kann.
-      **Damit wird auch die erste Absage präziser:** nicht „eine PD mit DMA-Cap wird nicht
-      eingefroren", sondern „wird nicht eingefroren, **solange der Domänen-Schwenk nicht gebaut
-      ist**" — der Weg vom fail-closed zum Endzustand läuft über eine Zeile, die es schon gibt.
+- [ ] **S5 — Geraet und DMA: die erste Fassung steht, die richtige nicht.**
+      **Gebaut:** fail-closed — eine PD mit DMA-Cap wird **gar nicht** eingefroren (`PdFreeze::HasDma`,
+      vor jedem anderen Schritt geprueft, damit eine Treiber-PD nicht halb behandelt wird). Eine
+      Absage, die stimmt, ist besser als eine Zusage, die nicht haelt.
+      **Offen und ungemessen:** der Domaenen-Schwenk (die IOMMU-Domaene des Geraets auf non-present,
+      jede DMA waehrend des Freeze wird ein **Fault** — laut, gemessen, flaechendeckend statt
+      wortgross) und der `PD_FREEZE_PREPARE`-Upcall (treiberspezifisch, gehoert **in** die PD, damit
+      TCB-neutral). Der Weg vom fail-closed zum Endzustand laeuft ueber eine Zeile, die es schon
+      gibt.
+      **Das Kanarienwort bleibt — aber als Tripwire im Selbsttest, der den PRUEFER prueft, nicht als
+      Zusicherung.** Es faengt nur das Geraet, das zufaellig dieses eine Wort beschreibt; DMA in alle
+      uebrigen Seiten bliebe unsichtbar, und die falsche Beruhigung ueberwoege. „Kein DMA waehrend
+      Freeze" gehoert an die Hardware-Grenze, die es vollstaendig durchsetzen kann.
+      **Die Absage ist seit dem 2026-08-21 GEMESSEN — mit Positivkontrolle.** Dieselbe PD zweimal:
+      mit der DMA-Cap `HasDma`, nach `clear_cap` geht sie durch (`dma-abgewiesen`,
+      `dma-ohne-cap-geht`). Erst die zweite Haelfte macht aus dem Ergebnis eine Aussage ueber die
+      **Ursache** — eine Absage allein belegt nur, dass irgendetwas nicht ging.
 
-- [ ] **S6 — Auftauen ist nicht die Umkehrung.** Tore öffnen, wiederherstellen, fortsetzen — und
-      zwei Dinge, die heute schon falsch sind (s. den Befund unten): `thaw` muss den Park-Zustand
-      kennen, und ein Thread, der **mit** gesetzter Weckmarke eingefroren wurde, muss nach dem
-      Auftauen **sofort** weiterlaufen und darf nicht schlafen.
+- [x] **S6 — Auftauen ist nicht die Umkehrung, und beide Haelften stehen.**
+      Empfaenger werden **vor** dem Oeffnen der Kanaele wieder eingereiht (andersherum liefe ein
+      Aufrufer in die Senderschlange, statt bedient zu werden), und `thaw` entfernt `FREEZE` und
+      **nur** das (`klient-laeuft-nicht`, Gegenprobe M7).
+      **Die Park-Naht ist gemessen, in allen drei Richtungen:** ein `unpark` waehrend des Schnitts
+      laesst den Thread **nicht** loslaufen (`park-stumm-im-schnitt` — der Grund `FREEZE` steht
+      noch, und eingereiht wird nur bei leerer Menge); mit Marke laeuft er nach dem Thaw **sofort**
+      (`park-marke-ueberlebt`); ohne Marke bleibt er liegen (`park-ohne-marke-bleibt`). Ohne die
+      dritte belegte die zweite nichts.
+      **Der alte Befund darunter ist mit Z24 weggefallen, nicht behoben worden:** `thaw_thread` rief
+      `unblock` („hebe irgendeine Blockade auf"); seit der Grund-Menge ruft es `resume` und entfernt
+      `PAUSE` und nur das. Die beschriebene Kette (aufgetauter geparkter Thread laeuft mit
+      `parked == true` weiter, der naechste `unpark` verbraucht die Marke ins Leere) ist damit
+      **nicht mehr formulierbar**. Der Eintrag ganz unten steht noch — er beschreibt einen Zustand
+      von vor Z24 und gehoert nachgeprueft statt geglaubt.
 
-- [ ] **Benannte Auslassung: die ZEIT.** Ein aufgetauter Thread sieht die Uhr **springen**; jede
-      Frist, die er vor dem Freeze berechnet hat, ist danach Unsinn. Ob die Antwort „die monotone
-      Uhr pausiert mit" oder „Fristen werden beim Thaw neu gestellt" lautet, ist später
-      entscheidbar — **benannt** muss sie jetzt sein, sonst findet der erste Timeout-Test sie als
-      Heisenbug.
+- [x] **Die ZEIT — entschieden, gebaut, gemessen. Und die Luecke daran ist benannt.**
+      **Die monotone Uhr pausiert NICHT mit.** Drei Gruende, und der dritte allein entscheidet:
+      eine Uhr je PD waere ein zweites Gedaechtnis fuer eine Tatsache (MCS-Budget, Periode und
+      Zyklenstempel laufen auf der globalen); ein per IPC empfangener Zeitstempel einer **nicht**
+      eingefrorenen PD laege in der Zukunft der eigenen Uhr — aus „die Uhr springt" wuerde „fremde
+      Zeitstempel sind unbrauchbar"; und **EL0 liest die Uhr direkt** (`rdtsc`/`CNTVCT_EL0`), eine
+      pausierende Kernel-Uhr waere von der Hardware-Uhr gar nicht gedeckt. Der Kernel kann diese
+      Zusage nicht einloesen — also gibt er sie nicht.
+      **Stattdessen wird die Dauer BERICHTET:** `thaw_pd` gibt `Thawed { threads, ticks }`, an den
+      Halter der Freeze-Autoritaet — dieselbe Regel wie beim Partnernamen. Gemessen als
+      `standzeit-berichtet` gegen das Beobachtungsfenster des Schnitts (`standzeit=22` bei vier
+      Ticks Fenster); eine 0 waere von „nicht gemessen" nicht zu unterscheiden.
+      **Offen, und es ist keine Nebenwirkung:** die eingefrorene PD selbst erfaehrt die Dauer
+      nicht. Dafuer braucht es einen Selbstauskunfts-Syscall. Ein Thread, der vor dem Freeze eine
+      Frist aus `rdtsc` gerechnet hat, kann sie danach **nicht** berichtigen. Ein Zaehler ohne
+      Leser waere hier die schlechtere Loesung gewesen (tote Sidecar-Arithmetik) — deshalb erst der
+      Berichtsweg, den es schon gibt, und die ABI-Haelfte als eigener Punkt.
 
-- [ ] **Abnahme — und sie muss fehlschlagen können.** Vier Aussagen, von denen nur die dritte neu
-      ist; die ersten beiden sind die Z4a-Form (Positivkontrolle, Beobachtungsfenster **länger als
-      ein Tick** — die erste Z4a-Fassung mass mit einem kürzeren und meldete Stillstand für einen
-      Thread, der völlig in Ordnung war):
-      1. Die PD läuft nachweislich **vorher** (ein Zähler bewegt sich).
-      2. Eingefroren steht er über ein Fenster von mehreren Ticks, und **nach** dem Auftauen läuft
-         er wieder.
-      3. **Der Fall, den die Reihenfolge nicht kann:** zwei Threads derselben PD, die **miteinander
-         IPC treiben**, werden gemeinsam eingefroren. Ohne diesen Fall beweist der ganze Strang
-         nichts, was Z4a nicht schon zeigt.
-      4. Eine PD, die auf einen **fremden** Server wartet, bekommt eine Absage, die den **Partner
-         nennt** — kein Hänger, kein `false`.
-      5. **Eine DRITTE PD ruft während des Fensters hinein** — und das **definierte** Verhalten
-         wird **gemessen**, nicht angenommen (s. S1b). Ohne diesen Fall ist die Zusage über
-         Unbeteiligte unbelegt.
-      Dazu die Gegenprobe: eine Mutation, die die Tore **nicht** schliesst, muss Fall 3 reissen.
+- [x] **Abnahme — gefahren, und sie kann fehlschlagen.** `pdfreeze : ALL PASS`, 21 Konjunkte,
+      **beide** Architekturen. Die fuenf geforderten Aussagen sind einzeln ablesbar:
+      1. `laeuft-vorher` (Sprechprobe: ein Zaehler, der nie lief, steht auch),
+      2. `steht` ueber **vier Ticks** und `laeuft-danach`,
+      3. `einzeln-unfrierbar=true/true` neben `umfang=3` — **der Fall, den die Reihenfolge nicht
+         kann**,
+      4. `frist-nennt-partner` — Absage mit Namen statt Haenger,
+      5. `kanal-zu` + `empfaenger-gezogen` — das definierte Verhalten fuer Dritte, gemessen.
+      Dazu S5s Absage mit Positivkontrolle, S6s Park-Naht in drei Richtungen und die berichtete
+      Standzeit (s. dort).
+      Dazu `tools/pdfreeze-negativ.sh`: neun Mutationen, jede mit dem Namen des Konjunkts, das
+      fallen muss, und mit den Konjunkten, die **gruen bleiben** muessen.
+      **M5 isoliert NICHT, und das steht im Skript statt verschwiegen zu werden:** die
+      Partnerauskunft traegt zwei Aussagen zugleich (die Absage benennen **und** eine interne
+      Beziehung als intern erkennen), also reisst ihr Wegfall beides.
 
 - [ ] **Vorher zu beheben, weil Z23 sonst auf einem kaputten Fundament plant** (Befund vom
       2026-08-09, aus dem Code gelesen): `parked`/`park_wake` werden **ausserhalb des Schedulers
@@ -1850,6 +2105,94 @@ Die Bausteine sind da (`endpoint_quiesce`/`ERR_QUIESCING`, `thread_quiescence`, 
       `unpark` vermieden, an der anderen Seite stehengelassen. **Und es verschiebt den Status des
       Spurious-Wake-Vertrags:** das System erzeugt schon heute spurious wakeups, der Vertrag ist
       also keine Vorsorge, sondern die einzige Fassung, die stimmt.
+
+- [ ] **Drei Sonden dieses Strangs gattern nur über den Suiten-`check`, nicht über `all_done()`**
+      (Befund vom 2026-08-25, beim Anbau von `ckptcut` aus den Bau-Warnungen gelesen, nicht
+      vermutet): `dbgprobe::urteil()`, `pdfreeze::urteil()` und `ckptcut::urteil()` sind
+      **allesamt tot** — rustc meldet sie als `never used`. Die gedruckte Zeile wird also nur von
+      `grep` in `test-qemu-x86.sh`/`test-qemu.sh` gelesen; im Kernel selbst hängt an ihr nichts.
+      Das ist die schwächere der beiden Schichten, und die CLAUDE.md-Notiz vom 2026-08-07 hat
+      genau darüber entschieden („Jetzt ist die Liste das Urteil, auf beiden Zweigen").
+
+      **Warum es trotzdem nicht mit einer Zeile behoben ist, und das ist der eigentliche Punkt:**
+      alle drei Sonden haben SKIP-Ausgänge (keine PD frei, kein Endpoint, keine Seite). In
+      `all_done()` aufgenommen wird ein Ressourcen-SKIP zu einem **Watchdog** — der Lauf sieht
+      dann aus wie ein Hänger, und das ist genau die Ununterscheidbarkeit, die dieses Projekt
+      schon zweimal Tage gekostet hat. Gebraucht wird also ein dritter Wert („nicht gefahren")
+      neben wahr/falsch, oder ein SKIP, der `all_done()` passieren lässt und im Bericht trotzdem
+      als SKIP steht. Die Entscheidung gehört vor die Verdrahtung.
+
+- [ ] **REGEL-KANDIDAT: jede Zahl mit einer Zusage dahinter braucht ein KONJUNKT neben sich.**
+      Die dritte Form derselben Familie wie `all_done()` und die sprechende Zeile: wo ein Ergebnis
+      in eine **Zahl** muendet statt in ein **Praedikat**, kann es fallen, ohne dass etwas rot wird.
+      Gemessen am 2026-08-21: die `dbg`-Zeile stand auf lauter `true` und ihr Urteil war rot — der
+      gefallene Summand (`schlimmstfall_ok`) steckte in einer Zahl, das Konjunkt wurde nie gedruckt.
+      Betroffen sind mindestens: Latenz-p99, Schlimmstfall-Summe, Standzeit des Schnitts,
+      Zyklenbudgets, `NOSEL_TEXT`. **Die Zahl im Bericht ist Diagnose; das Praedikat ist die
+      Pruefung** — beide gehoeren gedruckt, sonst sucht der naechste an der falschen Stelle.
+      Naechster Schritt: `tools/berichtsgatter.sh` um genau diese Frage erweitern (druckt eine
+      Zeile eine Zahl mit Schwelle, ohne das zugehoerige Konjunkt zu drucken?).
+
+- [ ] **`CapSpace::inspect` rechnet `child_count` — ein CDT-Gang, und der Aufrufer weiss es nicht.**
+      `kind_of` hat den Freeze-Fall geloest; die strukturelle Frage ist groesser: **darf eine
+      Auskunftsfunktion nebenbei einen Gang machen?** Heute sind alle fuenf uebrigen Aufrufer
+      Einzelabfragen (`system.rs` 2493/9511/9552/9694/9711) — der naechste Schleifen-Aufrufer faellt
+      in dieselbe Falle. Zu entscheiden: `child_count` **aus** `inspect` herausnehmen und als eigene
+      Operation fuehren (dann kostet jede Stelle, die sie wirklich braucht, eine Zeile — die Wirkung
+      des erschoepfenden Umbaus, nicht sein Preis), oder `inspect` als „teuer" **benennen** und
+      einen Waechter gegen Aufrufe in Schleifen stellen. Die zweite Fassung ist die schwaechere:
+      ein Waechter, der Aufrufstellen zaehlt, prueft den Stil.
+
+- [ ] **S5-Schwenk: die Absage ist gemessen, der SCHWENK hat keine Positivkontrolle — gar keine.**
+      Bei `HasDma` steht sie (dieselbe PD mit und ohne Cap); beim Domaenen-Schwenk fehlt sie
+      vollstaendig, und der Text darf das nicht verwischen. **Und es braucht kein echtes Geraet:**
+      eine IOMMU-Domaene mit absichtlich ungueltiger Abbildung und irgendetwas, das darueber
+      schreibt (QEMU-`virtio` oder ein Dummy-BDF), genuegt, um zu sehen, dass der **Fault** kommt
+      statt des Schreibzugriffs. Damit ist der Schwenk messbar, bevor eine Treiber-PD ihn braucht.
+
+- [ ] **Nebenbefund 2026-08-21: `tools/kernel-grenze.sh` ist ROT — und es steht in `abnahme.sh`.**
+      Fuenf HAL-Module stehen weder auf der Erlaubnisliste noch als benannte Ausnahme:
+      `fbtext`, `iommu_health`, `numa`, `bootparams`, `smt` (41 HAL-Module geprueft). Alle fuenf
+      sind Arbeit der letzten Tage aus diesem Zweig; keines davon gehoert zum Gruppenschnitt.
+      **Nicht stillschweigend aufgenommen**, und das ist der Punkt: der Waechter verlangt eine
+      Begruendung, warum der KERN das Modul selbst braucht — und bei `fbtext` (Textausgabe auf einem
+      Framebuffer) ist die naheliegende Antwort „gehoert in eine Userland-Treiber-PD (A-5.1)", nicht
+      „auf die Liste". Genau dafuer gibt es die Liste; sie im Vorbeigehen zu fuellen macht aus ihr
+      dieselbe Textflaeche, die der Identitaets-Waechter in seiner ersten Fassung war.
+      Zu entscheiden sind fuenf Einzelfaelle: `numa`/`smt`/`bootparams` sind **Plattformauskunft**
+      (SRAT/SLIT, CPUID-Topologie, Boot-Parameter) und damit vermutlich Kern; `iommu_health`
+      gehoert zur Isolationsmechanik; `fbtext` ist ein Treiber.
+      **Und die Frage darueber ist dieselbe wie beim Modelltreue-Waechter:** ein Gatter, das in der
+      Abnahme steht und rot ist, war entweder seit Tagen nicht gefahren oder sein Ergebnis nicht
+      gelesen. Beides ist ein Befund ueber die Abnahme, nicht ueber die fuenf Module.
+
+- [ ] **Nebenbefund 2026-08-21, und er ist aelter als dieser Strang: der Modelltreue-Waechter des
+      Schedulers lief in KEINEM Gatter.** `tools/verus-modelltreue-sched.sh` haengt allein an
+      `tools/verus-verify.sh`; die Abnahme faehrt `host-tests.sh`, und dort lief nur der
+      IPC-Waechter. Gemessen an diesem Tag meldete er **drei** unbenannte Schreibstellen aus Z6b
+      (`debug_stop`, `debug_continue`, `debug_release_pd`) — seit zwei Tagen rot, ohne dass es
+      jemand sah. **Ein Gatter, das existiert und nicht gefahren wird, ist keins**; dieselbe Klasse
+      wie `.gitea/workflows` auf einem GitLab-Server und wie „aarch64 wurde gebaut und nie
+      gebootet".
+      **Behoben:** die drei sind eingetragen, `freeze_group`/`thaw_group` dazu, und `host-tests.sh`
+      ruft ihn als Ziel `schedtreue` mit (er braucht kein Verus, nur Python).
+      **Offen bleibt die Frage darueber:** welche der uebrigen Waechter haengen ebenfalls nur an
+      `verus-verify.sh`? Das ist eine Inventur, keine Vermutung — und sie gehoert gemacht, bevor der
+      naechste rote Waechter zwei Tage unbemerkt bleibt.
+
+- [ ] **Nebenbefund 2026-08-21: `release_finalized_debug` nimmt `CAPS` INNERHALB von `SCHEDS`.**
+      Die Funktionsdoku sagt ausdruecklich „`CAPS` ist freigegeben, die Ordnung ist
+      `CAPS < EPS < SCHEDS`" — und der `pd_of`-Abschluss, den sie an `debug_release_pd` reicht, ruft
+      `pd_of_thread`, also `CAPS.read()`, **waehrend `SCHEDS[c]` gehalten wird**. Das ist R0
+      innerhalb von R2, also die Umkehrung der Ordnung aus `docs/invariants.md` §1.
+      **Heute harmlos, und zwar aus einem Grund, der nirgends festgeschrieben ist:** kein Pfad
+      nimmt `SCHEDS` innerhalb von `CAPS` (nachgesehen an allen sieben langlebigen
+      `CAPS.write()`-Bindungen in `system.rs`). Genau die Form „eine Gefahr, die an einer Stelle per
+      Hand abgewehrt wird" — die Kante `CAPS -> SCHEDS` waere ein gewoehnlicher, plausibler Umbau,
+      und der Deadlock traefe dann eine Stelle, die seit Wochen gruen ist.
+      `freeze_pd` macht es deshalb andersherum (`live_thread_ids` sammelt unter `SCHEDS`, gefiltert
+      wird danach unter `CAPS`); `release_finalized_debug` gehoert nachgezogen — oder die Ordnung
+      gehoert ausdruecklich um eine erlaubte Ausnahme erweitert. Stillschweigend geht es nicht.
 
 ### Z22. Die vier harten Stellen aus Z21 — gebaut
 **Klasse:** Substrat · **Stand:** 2026-08-09 · Leitlinie: *so viel wie möglich in der PD, TCB so
@@ -3162,10 +3505,21 @@ were right while nothing called them.
 
 ##### Three limitations of what landed — named, not glossed
 
-- [ ] **The colour axis is not in the ladder yet.** `off_node_uncolored` is structurally `0`
-      because the coloured path (`alloc_colored_in`) has not been given a node. So the yield order
-      is today *node → (nothing)*, not *node → colour*. Until that is wired, "colour yields last"
-      is a decision on paper.
+- [ ] **Die Farbachse: die Leiter STEHT, der echte Aufrufer fehlt** (Stand 2026-08-20).
+      Gebaut sind `numa::alloc_on_node_colored` (drei Sprossen `Exact -> OffNode ->
+      OffNodeUncolored`, jede nach WIRKUNG gezaehlt), `system::alloc_colored_in_window` und
+      `mem_alloc_masked_auf` als die Stelle, an der Maske und Knoten zusammenkommen.
+      `off_node_uncolored` ist damit nicht mehr strukturell `0`.
+
+      **Was fehlt, ist genau ein Stueck Verdrahtung, und es ist benannt:** `LadePolitik` traegt
+      `farbig` und `core`, aber **keinen Knoten** -- `ladepolitik_auf` loest `numa_node` sofort in
+      einen Kern auf. Solange das so ist, ruft niemand `mem_alloc_masked_auf` mit einem echten
+      Knoten, und die Leiter ist Arithmetik ohne Anrufer -- **dieselbe Falle, die Z26/A3 bezahlt
+      hat** (zwei Mutationen belegten, dass die Funktionen richtig sind, waehrend sie niemand rief).
+      Deshalb steht hier weiterhin ein offener Haken und keine Erfolgsmeldung.
+
+      Der Schritt: `LadePolitik { node: Node }`, gesetzt aus dem Manifest, durchgereicht bis zu den
+      gefaerbten Allokationen des Ladepfads. Danach ist „Farbe gibt zuletzt nach" eine Messung.
 - [ ] **On aarch64 the reader cannot see a runtime topology at all.** `kernel_main(dtb_addr)`
       **prints** the pointer QEMU passes and parses the **build-time embedded** `virt.dtb`
       (`include_bytes!`). That is pre-existing and affects `cpu_count`/`memory` too — but it means
@@ -3173,7 +3527,24 @@ were right while nothing called them.
       the kernel starts parsing the DTB it is handed, or the aarch64 half of N0 is honestly marked
       untested. **Do not read the green aarch64 `numa` line as evidence for the walker**; it only
       shows the reading happened and correctly reported "no topology".
-- [ ] **N4's positive path is not driven by the load suite.** `boot()` in
+- [x] **N4's positiver Pfad wird jetzt von der Lade-Suite gefahren** (2026-08-20) -- und er hat
+      beim ersten Lauf einen Kernelbefund geliefert, den der Negativfall strukturell nicht zeigen
+      konnte: **`numa::init()` lief NACH dem Lader.** In derselben Ausgabe standen
+      `numa : readable=true nodes=2` und `loader : ... readable=false`; die Lader-Zeile war nicht
+      falsch, sie war zu frueh gefragt. Behoben durch die Reihenfolge **und** ein Gatter dagegen,
+      dass jemand sie zurueckdreht: der Lader unterscheidet jetzt DREI Lagen -- „noch nicht
+      gelesen" (Hochlauf-Fehler, laut), „keine Topologie" (die Maschine), „Knoten fehlt" (das
+      Dokument). Bis dahin fielen die ersten beiden zusammen.
+
+      Dazu zwei Aufbau-Behebungen: `boot()` nimmt `-m`/`-smp` aus `MEM_ARGS`/`SMP_ARGS` statt sie
+      fest zu verdrahten, und **QEMUs Meldungen gehen nicht mehr nach `/dev/null`**. Der Wert davon
+      war sofort messbar: mein erster `-numa`-Aufruf war falsch (`node,mem=` statt `node,memdev=`),
+      und ohne die stderr-Zeilen waere daraus „der Kernel liest die SRAT nicht" geworden -- also
+      genau die Verwechslung, wegen der der Fall ein Jahr offen stand. Die Aufrufform ist jetzt aus
+      `tools/numa-messen.sh` ABGESCHRIEBEN, nicht neu erfunden: zwei Aufrufformen fuer eine
+      Eigenschaft driften.
+
+- [ ] ~~N4's positive path is not driven by the load suite.~~ `boot()` in
       `test-qemu-x86-load.sh` hardwires `-m "$RAM" -smp 4` *before* any extra arguments, and a
       `-numa` topology needs `-smp sockets=…` plus matching `memory-backend` sizes at exactly those
       places; a second `-m`/`-smp` afterwards collides. Measured 2026-08-17: QEMU starts, the guest
@@ -3388,6 +3759,33 @@ HW (STM32MP257F-DK) umsetzbar/testbar. Boot-Report `spec :` zeigt bereits, was d
 bekommt ihren CNode aus dem **eigenen** Untyped-Budget). Solange die Tabelle geteilt ist, bleibt
 Kapazität eine globale Größe.
 
+**Teilweise erledigt am 2026-08-26: aus der Konstante ist ein KONTO geworden.** Jede PD trägt ihre
+eigene Zahl (`Pd::cap_budget`), die bei der Erzeugung gegen einen **Vorrat**
+(`PdTable::budget_vorrat`, anfangs `CAP_SLOTS_FOR_ALL_PDS`) gebucht und beim Abbau
+zurückgegeben wird; `SYS_LOAD` trägt die Anforderung in `MSG3` (`0` = Vorgabe). Gemessen als
+`budget` in jedem x86-Lauf: `Vorrat 80000 → 79992 → 79980 → 80000`. Die tragende Zeile ist die
+**Rückgabe** — ein Vorrat, der nur schrumpft, sieht aus wie einer unter Last.
+
+Der Grund für die Bewegung ist eine Zahl: eine Konstante anzuheben kostet den Bedarf **einer** PD
+mal `NPDS`, also rund 7,7 MB je acht Slots, für einen Bedarf, den eine einzige PD hat. Dieselbe
+Bewegung wie bei `MELDESTELLEN` (von Hand geführt → abgeleitet) und `IDENTITY_DEBTS` (Zahl → Menge).
+
+**Zwei Dinge bleiben offen, und das erste ist grösser als der Eintrag:**
+
+- [ ] **`NCAPS = 16` ist der echte Deckel je PD, nicht das Budget.** Der lokale Cspace ist ein
+      Array fester Länge; `install_cap` weist jeden Slot `>= NCAPS` ab, **ohne das Budget zu
+      fragen**. `CAP_BUDGET_MAX` stand auf 64 und war damit eine unerfüllbare Zusage — der
+      Selbsttest hat es am Tag der Einführung widerlegt (er füllte bis 16 und scheiterte an der
+      Slot-Schranke, nicht am Budget). Jetzt ist `CAP_BUDGET_MAX == NCAPS` mit `const assert`.
+      Für eine Treiberumgebung mit dreissig Caps braucht es einen **variablen** Cspace je PD —
+      s. TODO0 K1c.
+- [ ] **Die Absage bei ERSCHÖPFTEM Vorrat ist ungemessen.** Sie auszulösen hiesse rund 80 000
+      Slots zu vergeben, also tausende PDs — eine Messung, die die Baseline jedes anderen Tests
+      des Laufs verschöbe. Gemessen ist stattdessen, dass die **beiden Gründe unterscheidbar
+      gezählt** werden (`budget_abgewiesen` steigt bei „über `CAP_BUDGET_MAX`" nachweislich
+      nicht). Der Pfad selbst gehört in `tools/kapazitaet-messen.sh`, wo tausende PDs ohnehin
+      entstehen.
+
 **Gemessen dazu (2026-08-10, s. [C7](#c7-die-kapazitätskurve--wo-es-wirklich-bricht-gemessen-2026-08-10)):
 die geteilte Cap-Tabelle ist heute NICHT der Engpass — bei 9984 gleichzeitigen Prozessen stehen
 11 von 80 256 Slots.** Das entkräftet die Dringlichkeit, nicht das Argument: der Höchststand hängt
@@ -3405,6 +3803,117 @@ hochzuziehen koppelt damit nicht mehr an die Stackgrösse. Siehe auch
 
 *(Die frühere Angabe „aktuell 2 KiB" war veraltet: Kernel-Threads haben 64 KiB, EL0-Threads einen
 16-KiB-EL1-Stack. Der Punkt stand trotzdem — 6,2 KiB waren 38 % des kleineren der beiden.)*
+
+### A3c. Die Beschreibungstexte der Suiten werden AUSGEFÜHRT
+**Klasse:** Werkzeug · **Aufwand:** klein, aber 13 Stellen
+
+`check "$muster" "$beschreibung"` wird mit einem **doppelt gequoteten** String aufgerufen, und
+Backticks darin führt die Shell aus. Gemessen 2026-08-26: **13** Meldungen
+`./test-qemu.sh: Zeile NNN: dbg: Kommando nicht gefunden` je aarch64-Lauf — die Beschreibungen
+zitieren Prüfzeilen wie `` `dbg : FAILURES` `` und `` `== ALL PASS ==` ``, und die Shell versucht
+sie zu starten.
+
+Heute folgenlos (die Substitution liefert leeren Text, der Fehler geht nach stderr). Die Bedingung
+dahinter ist es nicht: **eine Beschreibung ist Text, kein Programm.** Wer künftig
+`` `git rev-parse HEAD` `` in eine Beschreibung schreibt, bekommt kommentarlos anderes Verhalten —
+und wer versehentlich etwas Zerstörerisches zitiert, bekommt es ausgeführt. Dass diese Zeilen
+Rauschen erzeugen, hat ausserdem 13 Zeilen Fehlermeldung in jedes Protokoll gestreut, in dem man
+nach echten Fehlern sucht.
+
+Behebung: Beschreibungen in **einfache** Anführungszeichen, oder die Backticks durch typografische
+Zeichen ersetzen. Nicht während einer laufenden Suite ändern (bash liest Skripte inkrementell).
+
+### A3d. `dma_audit` meldet nach einem Hot-Reload **2** — und die Ursache ist ungeklärt
+**Klasse:** DMA/Teardown · **Aufwand:** klein zu messen, unbekannt zu beheben
+
+Gemessen 2026-08-26 in der Lade-Suite, am Ende des Laufs: `dma_audit() == 2`, also
+„zwei DMA-Regionen überlappen physisch" (`dma_bounds_audit`, paarweise Disjunktheit).
+
+Die Ursache ist der A-5.1-Austausch: `reassign_driver_device` prägt der neuen Treiberfassung eine
+Cap über **dieselbe** Region — das ist Absicht, sie soll sie erben. Solange die alte Cap noch
+existiert, sieht der Prüfer zwei Objekte auf einem Bereich. Seine Regel („verschiedene Objekte
+dürfen sich nie überlappen") kennt die **Übergabe** nicht.
+
+**Die naheliegende Lesart „blinder Fleck des Wächters" ist WIDERLEGT** (2026-08-26, aus dem
+Quelltext, nicht vermutet):
+
+* `for_each_dma` läuft **objekt-** und nicht cap-granular, und der Kommentar dort sagt warum:
+  „damit Cap-Kopien dieselbe Region nicht mehrfach zählen (sonst falsch-positive
+  Selbstüberlappung)". Der Fall „eine Region, absichtlich zweimal gehalten" ist also **bereits
+  ausgenommen** — für Kopien.
+* `reassign_driver_device` macht aber keine Kopie: `install_dma_cap_ex` → `install` →
+  `alloc_object` legt ein **zweites Objekt** an. `2` heisst damit genau, was die Regel sagt.
+
+**Damit ist der Kern nicht die Cap, sondern die IOMMU-Eintragung.** Selbst bei korrektem Refcount
+über der Region gilt: solange das IOVA→PA-Mapping steht, schreibt das Gerät in die Seiten —
+unabhängig davon, wer sie inzwischen besitzt. Die Reihenfolge, die halten muss, ist
+**Gerät stilllegen → IOMMU-Unmap → Speicherfreigabe**; der `DmaRegion`-Teardown-Token (`dmatok`)
+ist genau dafür gebaut. `reassign_driver_device` ruft **kein `dma_attach`** — die IOMMU-Eintragung
+gehört weiterhin dem *ersten* Objekt, und bei dessen Finalisierung (`refcount == 0`) schiebt
+`space.rs` die Region über `push_dma(phys, len)` in den Freigabepfad, während das zweite Objekt und
+die Übersetzung noch stehen.
+
+**Zwei Behebungen, und die erste ist vermutlich die richtige:**
+
+1. `reassign_driver_device` **kopiert** den vorhandenen Cap (`cap_copy`), statt ein zweites Objekt
+   zu prägen. Dann geht der Refcount 1→2, die Überlappung verschwindet, und die Finalisierung
+   läuft genau einmal — beim letzten `delete`. `dma_audit` ginge damit auf 0.
+2. Falls Grund 1 nicht trägt (etwa weil die neue Fassung andere Rechte/Richtung braucht): der
+   Teardown-Token muss den Austausch durchlaufen, nicht umgehen.
+
+**Die Größenrelation ist ERZWINGBAR, statt auf sie zu warten** — dieselbe Methode wie beim
+`admit`-Fenster: nach dem Reload gezielt eine Anforderung stellen, die in den freigegebenen Bereich
+fällt, ein Magic-Muster hineinschreiben, das Gerät DMA fahren lassen, Muster prüfen. Ein Test, der
+die Bedingung **herstellt**, statt zu hoffen, dass der Allokator sie irgendwann trifft.
+
+**Solange es offen ist, führt `dmapool` die Zahl mit ERWARTUNG** (`dma_audit == DMA_AUDIT_SCHULD`,
+heute 2) — nicht als `== 0` (rot aus fremdem Grund) und nicht als blosse Zahl im Text (eine Zahl,
+deren erwarteter Wert 2 ist, wird nicht geprüft: würde sie aus einem echten Grund 3, feuerte
+nichts). Die Konstante ist eine **Ratsche nach unten**: sie geht auf 0, sobald die Behebung steht,
+und wer sie erhöht, deckt eine neue Überlappung zu.
+
+### A3e. Die drei Reste aus K1a/K1b sind SCHULDEN, keine Messlücken
+**Klasse:** Benennung · **Aufwand:** die ersten beiden klein, die dritte eigen
+
+Nach dem Abschluss von K1a/K1b blieben drei Punkte stehen. Sie waren als „nicht gemessen" notiert,
+und das ist die falsche Kategorie für zwei von ihnen — **eine Messlücke wird geschlossen, wenn
+jemand misst; eine Schuld gilt bis jemand baut.**
+
+1. **Das `admit`/`STACK_CAP_OF`-Fenster gehört zu M1, nicht zu „später".** Zwei Threads derselben
+   PD auf verschiedenen Kernen können beide prüfen, bevor der jeweils andere Eintrag steht — die
+   Überlappungsprüfung, die M1 der Gegenproben abschaltet, hat also **selbst** ein Loch, und zwar
+   genau in ihrem Gegenstand. `ueberlappung-abgewiesen=true` ist damit eine Aussage über den
+   sequentiellen Fall. Das gehört in die Zeile und in `spawnarena-negativ.sh`, nicht in einen
+   künftigen Eintrag. Schliessen hiesse: die Teilregion **vor** dem Spawn reservieren und bei
+   jedem Fehlschlag freigeben — eigene Buchhaltung mit eigenen Abbruchpfaden.
+2. **Wachseiten zwischen den Arena-Fenstern** — die Hälfte des Preises, die nicht bezahlt ist: die
+   Vergabe weist Überlappung ab, ein **überlaufender** Stapel wandert weiter still in den
+   Nachbarn. Eigene Messung, kein Nebeneffekt: auf aarch64 gibt es die Wache hardwareseitig nicht
+   (`guard_unterstuetzt() == false`), und eine Seite, die dort nichts bewirkt, hat schon einmal
+   eine Farbzusage strukturell unerfüllbar gemacht (C9e).
+3. **Der Erschöpfungspfad des Slot-Vorrats** ist wirklich nur eine Messlücke — er braucht tausende
+   PDs und gehört nach `tools/kapazitaet-messen.sh`, wo die ohnehin entstehen.
+
+### A3b. `tools/kernel-grenze.sh` ist ROT (Stand 2026-08-26)
+**Klasse:** Kerngrenze · **Aufwand:** klein je Modul, aber es sind fünf Entscheidungen
+
+Fünf Module liegen in der HAL und stehen weder auf der Erlaubnisliste noch als benannte Ausnahme:
+`fbtext`, `iommu_health`, `numa`, `bootparams`, `smt`. **Vorbestehend** — weder der Wächter noch die
+HAL sind seit dem letzten grünen Stand verändert worden; die Module sind einzeln dazugekommen, und
+niemand hat den Wächter dabei gefahren.
+
+> **Ein Gatter, das existiert und nicht gefahren wird, ist keins** — dieselbe Zeile wie bei
+> `hal::mmu::guard_*` am 2026-08-12. Die Abnahme (`tools/abnahme.sh`) fährt ihn; ein Zweig, der
+> ohne sie gemerged wird, kommt daran vorbei.
+
+Jedes der fünf braucht eine **eigene** Entscheidung — Userland-Treiber-PD (A-5.1) oder benannte
+Ausnahme **mit Begründung, warum der Kern es selbst braucht**. Eine Sammelaufnahme ist genau der
+Weg, auf dem aus einem Mikrokern ein Monolith wird; der Wächter sagt das in seiner eigenen
+Fehlermeldung.
+
+Erster Verdacht je Modul, nicht geprüft: `bootparams`/`smt`/`numa` sind Hochlauf-Auskunft (könnte
+tragen), `iommu_health` gehört zur IOMMU-Fassade (dito), `fbtext` ist ein **Ausgabetreiber** und
+damit der Kandidat, der wirklich hinausgehört.
 
 ### A4. Kein Syscall zum Löschen eigener Caps
 **Klasse:** ABI-Lücke · **Aufwand:** klein-mittel

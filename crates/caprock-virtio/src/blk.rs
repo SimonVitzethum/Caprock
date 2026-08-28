@@ -45,6 +45,13 @@ pub const S_OK: u8 = 0;
 /// Platte: `capacity` zaehlt 512-Byte-Einheiten (Spec 5.2.4). Wer hier die Geraeteblockgroesse
 /// einsetzt, rechnet die Kapazitaet um einen Faktor daneben.
 pub const SECTOR: u32 = 512;
+/// **Weckruf-Obergrenze einer Anfrage** (Stufe B).
+///
+/// Begrenzt die WECKRUFE, nicht die Zeit — ein Geraet, das signalisiert ohne fertig zu werden,
+/// soll nicht endlos kreisen. Grosszuegig, weil ein zusaetzlicher Weckruf hier kein Fehler ist:
+/// eine Notification traegt keine Nutzlast, ein zweites Signal zur selben Anfrage ist zulaessig.
+const MAX_WAKEUPS: u64 = 64;
+
 
 /// Kapazitaet in 512-Byte-Sektoren, Offset im geraetespezifischen Konfigurationsraum.
 const CFG_CAPACITY: u64 = 0x00;
@@ -97,6 +104,24 @@ pub struct BlkResult {
     /// die nach einem Geraetefehler aussieht, waehrend die Daten laengst auf der Platte stehen.
     /// Deshalb steht die Erwartung im Ergebnis, gebildet dort, wo die Richtung bekannt ist.
     pub expected_written: u32,
+    /// **Wurde der POLL-Weg benutzt?** (Stufe B, B4)
+    ///
+    /// Die Groesse, an der `poll-runden == 0` haengt. Sie steht hier und nicht als Zaehler von
+    /// Spin-Runden, weil die Frage nicht „wie oft" ist, sondern „ueberhaupt": ein Treiber, der
+    /// **einmal** pollt, hat die Zusage gebrochen, und eine Zahl daneben lade dazu ein, eine
+    /// kleine für „fast nicht" zu halten.
+    pub polled: bool,
+    /// Wie oft der Treiber **geweckt** wurde (`0`, wenn gepollt wurde).
+    ///
+    /// Das Gegenstueck zu `polled`: ohne diese Zahl waere „nicht gepollt" auch dann wahr, wenn
+    /// gar nichts passiert ist. Sie ist die treiberseitige Haelfte; die kernelseitige ist
+    /// `IRQ_DELIVERED`, und erst beide zusammen sind zwei Quellen statt einer.
+    pub wakeups: u64,
+    /// Hat das Geraet die MSI-X-Zuordnung der Queue **angenommen**? (zurueckgelesen)
+    ///
+    /// `false` bei `irq = Some(..)` heisst: der Interrupt kann gar nicht kommen — eine andere
+    /// Lage als „er kam nicht", und ohne dieses Feld waeren beide dasselbe Bild.
+    pub msix_ok: bool,
 }
 
 /// **virtio-blk**: Blockgeraet.
@@ -122,7 +147,7 @@ impl VirtioBlk {
         sector: u64,
         max_poll: u64,
     ) -> BlkResult {
-        self.request(cpu_base, dev_base, Op::Read, sector, 1, max_poll)
+        self.request(cpu_base, dev_base, Op::Read, sector, 1, max_poll, None)
     }
 
     /// Handshake + **eine Anfrage**: lesen, schreiben oder flushen.
@@ -150,6 +175,7 @@ impl VirtioBlk {
         sector: u64,
         count: u32,
         max_poll: u64,
+        irq: Option<&crate::IrqWarten>,
     ) -> BlkResult {
         let mut r = BlkResult::default();
         // Die Schranke steht **vor** dem Handshake: eine Anfrage, die den Puffer ueberliefe, darf
@@ -196,6 +222,20 @@ impl VirtioBlk {
         else {
             return r;
         };
+        // **Stufe B: die Queue bekommt ihre MSI-X-Zeile — nach JEDEM Reset neu.**
+        //
+        // `request` setzt das Geraet bei jedem Aufruf zurueck, und ein Reset stellt beide MSI-X-
+        // Register auf `NO_VECTOR`. Eine Zuordnung, die einmal beim Hochlauf geschrieben wuerde,
+        // waere ab der zweiten Anfrage weg — und das Fehlerbild waere „der erste Interrupt kam,
+        // die uebrigen nicht", also das teuerste, das es gibt.
+        if let Some(w) = irq {
+            if !self.t.queue_msix(0, w.msix_zeile) {
+                // **Abbrechen statt pollen.** Das Geraet hat die Zeile abgelehnt; wer jetzt in den
+                // Poll-Weg zurueckfiele, machte aus einer klaren Absage eine stille Zusage.
+                return r;
+            }
+            r.msix_ok = true;
+        }
         self.t.driver_ok();
 
         // **Die drei Puffer werden EINMAL herausgeschnitten** (todo E, Descriptor-Typestate).
@@ -254,7 +294,20 @@ impl VirtioBlk {
         q.publish(0, self.t.fence); // die hereingereichte Barriere, nicht irgendeine
         self.t.kick(notify_off, 0);
 
-        let done = q.poll_used(used0, max_poll);
+        // **Warten, wenn ein Warteweg da ist — sonst pollen.** Kein Rueckfall vom einen ins
+        // andere: ein Treiber, der nach vergeblichen Weckrufen doch pollte, machte `poll-runden`
+        // wertlos, und die Zeile bliebe gruen fuer etwas anderes.
+        let done = match irq {
+            Some(w) => {
+                let (d, n) = q.wait_used(used0, w, MAX_WAKEUPS);
+                r.wakeups = n;
+                d
+            }
+            None => {
+                r.polled = true;
+                q.poll_used(used0, max_poll)
+            }
+        };
         if let Some(c) = done.as_ref() {
             r.used_advanced = true;
             r.written = c.len();

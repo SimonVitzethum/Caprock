@@ -16,6 +16,20 @@ pub fn current_el() -> u8 {
 }
 
 /// Logische Kern-ID = MPIDR_EL1 Aff0 (auf QEMU `virt` 0..7, ein Cluster).
+/// **Den Thread-Pointer setzen** (TLS, T1).
+///
+/// `TPIDR_EL0` ist das ABI-Register fuer genau diesen Zweck und in diesem Kernel **frei**
+/// (gemessen: null Vorkommen). Es ist aus EL0 les- **und** schreibbar; der Kernel schreibt es
+/// trotzdem, weil es den Kontextwechsel ueberleben muss — und das ist das Einzige, was ein
+/// Programm fuer sich selbst nicht leisten kann.
+///
+/// **Ohne Autoritaet** — s. die x86-Entsprechung.
+pub fn set_thread_pointer(va: u64) {
+    // SAFETY: `TPIDR_EL0` traegt keinen Kernelzustand; sein Wert wirkt nur als Basis fuer die
+    // Thread-Pointer-Zugriffe des laufenden Threads.
+    unsafe { core::arch::asm!("msr tpidr_el0, {}", in(reg) va, options(nomem, nostack)) }
+}
+
 pub fn core_id() -> usize {
     let mpidr: u64;
     // SAFETY: `MPIDR_EL1` ist read-only und ohne Seiteneffekte.

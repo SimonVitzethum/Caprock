@@ -45,6 +45,52 @@ pub const CDELETE_CHILDREN_BADGE: u64 = 1 << 34;
 /// **init** geladenes Programm gelaufen ist -- nicht bloss init selbst.
 pub const CHILD_BADGE: u64 = 0x4845_4C4F; // "HELO"
 
+/// **C2: der DMA-Pool ist ein Argument des LADENS, keine Konstante im Kernel** (2026-08-26).
+///
+/// Der Kernel gab bis dahin jeder Treiber-PD dieselben 16 KiB. Die Groesse gehoert aber zum
+/// Geraet: ein Blockgeraet mit einer Queue braucht anderes als eine Netzkarte mit Ringen. Und sie
+/// gehoert **nicht ins Manifest** — das beschreibt den Bootzustand und wird signiert; wer zur
+/// Laufzeit einen Treiber startet, muss die Zahl nennen koennen, ohne ein Dokument neu zu
+/// unterschreiben.
+///
+/// Diese Tabelle ist die Politik **dieses** Boot-Taskmanagers. Ein Laufzeit-Treibermanager laese
+/// sie aus einer Konfiguration; hier steht sie im Programm, und der Archivindex ist die einzige
+/// Kennung, die ein Startprogramm ohne Manifestzugriff hat. Wer nicht darin steht, bekommt die
+/// Vorgabe (`0`).
+///
+/// **Die Indizes sind eine Eigenschaft des Testarchivs**, nicht des Systems: 2 = `virtio-blk`,
+/// 4 = `virtio-net` (s. `test-qemu-x86-load.sh`). Steht dort etwas anderes, bekommt es die
+/// genannte Groesse — schaden kann das nicht, denn der Wunsch wird nur auf dem Pfad einer
+/// Geraetezuteilung ueberhaupt gelesen.
+const POOL: [(u64, u32); 2] = [(2, 8), (4, 32)];
+
+/// Der DMA-Wunsch fuer den Archivindex `i`, in Seiten (`0` = Vorgabe).
+fn pool_fuer(i: u64) -> u32 {
+    let mut k = 0;
+    while k < POOL.len() {
+        if POOL[k].0 == i {
+            return POOL[k].1;
+        }
+        k += 1;
+    }
+    0
+}
+
+/// **C2-Negativfall aus Ring 3**: eine Anforderung ueber `DRIVER_DMA_MAX_PAGES` hinaus wird mit
+/// EIGENEM Code abgewiesen — und nicht gekuerzt. Eine stillschweigend halbierte DMA-Region ist ein
+/// Geraet, das ueber ihr Ende hinausschreibt; dieser Fehler ist still, deshalb ist die Absage die
+/// Aussage. Bit 35, neben den beiden `CDELETE`-Badges.
+pub const POOL_REFUSED_BADGE: u64 = 1 << 35;
+
+/// **B3-Negativfall aus Ring 3**: `BIND_IRQ` ohne `Irq`-Cap wird abgewiesen.
+///
+/// Das ist der Riegel selbst, nicht seine Beschreibung. Vor B3 nahm `bind_irq` rohe Zahlen und
+/// behauptete in seinem Doku-Kommentar, „ueber die IRQ-Cap autorisiert" zu sein — eine Signatur
+/// kann das nicht tragen, und *ein Waechter prueft die EXISTENZ eines Grundes, nie seine
+/// WAHRHEIT*. Diese PD haelt keine `Irq`-Cap; bekaeme sie `OK`, waere jede PD des Systems
+/// berechtigt, sich fremde Geraeteinterrupts zustellen zu lassen. Bit 36.
+pub const IRQ_UNAUTHORIZED_BADGE: u64 = 1 << 36;
+
 /// Cap-Slot der Loader-Cap (Slot-Konvention des Kernel-Glue, `kernel::loader::endow_from_manifest`).
 const LOADER_SLOT: u64 = 0;
 /// Cap-Slot der endowten Notification. Ihr Badge ist [`ROOT_BADGE`] -- gesetzt vom Kernel beim
@@ -54,6 +100,31 @@ const NTFN_SLOT: u64 = 1;
 /// Ohne die waeren alle Signale dieses Programms ununterscheidbar: das Badge steckt in der Cap.
 const NTFN_CHILDREN_SLOT: u64 = 3;
 const NTFN_GONE_SLOT: u64 = 4;
+/// **Die vorgebadgte Kopie, die an jedes Kind delegiert wird** (2026-08-25).
+///
+/// Bis dahin trug `SYS_LOAD` selbst ein Badge-Argument und praegte je Aufruf eine Ableitung. Mit
+/// der Mehrfachdelegation waere ein Badge fuer acht Caps ein Parameter mit acht Bedeutungen --
+/// also badgt dieses Programm **einmal** selbst (`CCOPY` ist genau dafuer da) und delegiert
+/// danach den Slot. Eine Kopie fuer alle Kinder reicht, weil [`CHILD_BADGE`] fuer alle dasselbe
+/// ist; wer je Kind ein eigenes Etikett will, badgt je Kind.
+const NTFN_CHILD_SLOT: u64 = 5;
+/// Eigene gebadgte Kopie fuer den C2-Negativfall (s. [`POOL_REFUSED_BADGE`]).
+///
+/// **Eine eigene Cap und kein Argument**: `SYS_SIGNAL` verodert das Badge der benutzten **Cap** in
+/// `pending`; das Wort im Aufruf spielt keine Rolle. Der erste Anlauf rief
+/// `signal(NTFN_SLOT, POOL_REFUSED_BADGE)` — angekommen ist damit `ROOT_BADGE`, und die Pruefzeile
+/// meldete `zu-gross-abgewiesen=false`, obwohl die Absage korrekt gekommen war. Genau die Falle,
+/// die im Register unter „das Badge steckt in der Cap" steht.
+const NTFN_POOL_SLOT: u64 = 6;
+/// Eigene gebadgte Kopie fuer den B3-Negativfall (s. [`IRQ_UNAUTHORIZED_BADGE`]).
+///
+/// **Slot 8 und nicht 7**: Slot 7 traegt seit B2 die `Irq`-Cap einer Treiber-PD. Diese PD ist
+/// keine, der Slot waere also frei — aber zwei Bedeutungen fuer eine Slotnummer sind genau die
+/// Form, an der die vier versteckten Politiken aus A-5.4 gehangen haben.
+const NTFN_IRQ_SLOT: u64 = 8;
+/// Der Slot, den dieser Negativfall als `Irq`-Cap ANBIETET — und der **leer** ist. Das ist die
+/// gepruefte Sache: nicht „eine falsche Cap", sondern **keine**.
+const KEINE_IRQ_CAP_SLOT: u64 = 9;
 /// Rechte-Bitmaske fuer die Kopien (R+W+X; wird ohnehin mit den Rechten des Originals geschnitten).
 const RWX: u64 = 7;
 
@@ -69,6 +140,11 @@ fn run(arg: usize) -> ! {
     // 2. Die uebrige Startmenge laden. Fehler werden NICHT stillschweigend uebergangen: was nicht
     //    laedt, meldet sich als gesetztes Bit im Badge -- sonst saehe ein leerer Lauf aus wie ein
     //    erfolgreicher.
+    // **Vor dem ersten Laden**: die Kopie, die delegiert wird. Schlaegt sie fehl, wird ohne
+    // Delegation geladen -- die Kinder laufen dann, koennen sich aber nicht melden, und genau das
+    // steht danach im `failed`-Wort statt in einem stillen Ausbleiben.
+    let child_ok = libcaprock::ccopy(NTFN_SLOT, NTFN_CHILD_SLOT, RWX, CHILD_BADGE)
+        == libcaprock::result::OK;
     let mut failed = 0u64;
     let mut i = 0u64;
     while i < count {
@@ -77,7 +153,18 @@ fn run(arg: usize) -> ! {
             // Die eigene Notification delegieren, aber mit EIGENEM Badge fuer das Kind -- sonst
             // signalisierten alle Kinder unter dem Badge des Root-Tasks und waeren nicht
             // auseinanderzuhalten (das Badge steckt in der Cap, nicht in der Nachricht).
-            if libcaprock::load(LOADER_SLOT, i, NTFN_SLOT, CHILD_BADGE) != libcaprock::result::OK {
+            // Slot 0 der neuen PD -- die Loader-ABI-Konvention L2, jetzt ausgeschrieben statt
+            // im Kernel verdrahtet.
+            let d: &[(u8, u8)] = if child_ok {
+                &[(NTFN_CHILD_SLOT as u8, 0)]
+            } else {
+                &[]
+            };
+            // `0` = Vorgabebudget (2026-08-26). Der Root-Task laedt die **Startmenge**, und die
+            // ist per Entwurf klein; wer zur Laufzeit eine Treiberumgebung startet, nennt hier
+            // seine Zahl. Eine Vorgabe, die `init` schon anhebt, waere ein Budget fuer alle --
+            // also wieder die Konstante, nur an einer anderen Stelle.
+            if libcaprock::load(LOADER_SLOT, i, d, 0, pool_fuer(i)) != libcaprock::result::OK {
                 failed |= 1 << (i.min(30) + 1);
             }
         }
@@ -92,6 +179,52 @@ fn run(arg: usize) -> ! {
     //    im Badge seiner endowten Cap steht. Mit ihnen wird jedes Teilergebnis unterscheidbar.
     let ok_children = libcaprock::ccopy(NTFN_SLOT, NTFN_CHILDREN_SLOT, RWX, CDELETE_CHILDREN_BADGE);
     let ok_gone = libcaprock::ccopy(NTFN_SLOT, NTFN_GONE_SLOT, RWX, CDELETE_GONE_BADGE);
+
+    // 3b. C2 aus Ring 3: ein DMA-Pool ueber der Obergrenze wird mit EIGENEM Code abgewiesen.
+    //
+    //     **Vor** dem Loeschen der Loader-Cap -- danach gaebe es `ERR_BADCAP`, und das waere
+    //     dieselbe Antwort fuer zwei verschiedene Lagen. Der Index ist gleichgueltig: die Absage
+    //     faellt am Rand des Dispatch, bevor das Archiv ueberhaupt angesehen wird.
+    if libcaprock::ccopy(NTFN_SLOT, NTFN_POOL_SLOT, RWX, POOL_REFUSED_BADGE)
+        == libcaprock::result::OK
+        && libcaprock::load(
+            LOADER_SLOT,
+            0,
+            &[],
+            0,
+            libcaprock::DRIVER_DMA_MAX_PAGES + 1,
+        ) == libcaprock::result::ERR_DMA_TOO_LARGE
+    {
+        libcaprock::signal(NTFN_POOL_SLOT, 0);
+    }
+
+    // 3c. B3 aus Ring 3: `BIND_IRQ` ohne `Irq`-Cap wird ABGEWIESEN.
+    //
+    //     **Vor** dem Loeschen der Loader-Cap, aus demselben Grund wie 3b -- und der Slot ist
+    //     LEER, nicht falsch belegt: geprueft wird, dass der Kernel eine Cap VERLANGT, nicht dass
+    //     er Typen unterscheidet. Das Typurteil faellt derselbe `let ObjectKind::Irq else`, aber
+    //     die interessante Lage ist die haeufige: eine PD, die einfach keine hat.
+    //
+    //     `ERR_BADCAP` und nicht bloss „ungleich OK": ein `ERR_BADSYS` saehe hier genauso aus und
+    //     hiesse, dass der Syscall gar nicht existiert -- der Negativfall waere dann gruen, weil
+    //     nichts gebaut ist. Genau die Form, gegen die die Sprechprobe steht.
+    //
+    //     **ZWEI Lagen, und die zweite ist die, die den Riegel wirklich trifft.** Ein LEERER Slot
+    //     wird schon von der generischen Cap-Aufloesung abgewiesen -- das belegt „man braucht
+    //     ueberhaupt eine Cap", aber nichts ueber `BIND_IRQ`. Erst eine Cap, die die PD wirklich
+    //     HAELT und die keine `Irq`-Cap ist, kommt bis in den Zweig und wird dort am Typ
+    //     abgewiesen. Nur die erste zu pruefen hiesse, ein Gatter zu messen, das woanders steht --
+    //     dieselbe Form wie eine Sprechprobe an einer Ausnahme statt am gepruefeten Pfad.
+    if libcaprock::ccopy(NTFN_SLOT, NTFN_IRQ_SLOT, RWX, IRQ_UNAUTHORIZED_BADGE)
+        == libcaprock::result::OK
+        // (a) gar keine Cap -- die generische Aufloesung weist ab
+        && libcaprock::bind_irq(KEINE_IRQ_CAP_SLOT, NTFN_SLOT, 0)
+            == libcaprock::result::ERR_BADCAP
+        // (b) eine gehaltene Cap vom FALSCHEN Typ -- der Zweig selbst weist ab
+        && libcaprock::bind_irq(NTFN_SLOT, NTFN_SLOT, 0) == libcaprock::result::ERR_BADCAP
+    {
+        libcaprock::signal(NTFN_IRQ_SLOT, 0);
+    }
 
     // 4. A-3.1 aus Ring 3 pruefen -- hier und nicht im Kernel, weil genau der Weg geprueft werden
     //    soll, den ein echter Dienst nimmt: ueber die ABI, aus einer isolierten PD heraus.
@@ -109,7 +242,7 @@ fn run(arg: usize) -> ! {
     //        die Aussage; ein geraeumter Slot allein waere Buchhaltung.
     if ok_gone == libcaprock::result::OK
         && libcaprock::cdelete(LOADER_SLOT) == libcaprock::result::OK
-        && libcaprock::load(LOADER_SLOT, 0, u64::MAX, 0) != libcaprock::result::OK
+        && libcaprock::load(LOADER_SLOT, 0, &[], 0, 0) != libcaprock::result::OK
     {
         libcaprock::signal(NTFN_GONE_SLOT, 0);
     }

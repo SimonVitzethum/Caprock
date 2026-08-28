@@ -79,15 +79,50 @@ pub const VIRTQ_DESC_F_NEXT: u16 = 1;
 /// virtq-Deskriptor-Flag: Gerät schreibt in den Puffer.
 pub const VIRTQ_DESC_F_WRITE: u16 = 2;
 
+/// **„Kein Vektor"** (`VIRTIO_MSI_NO_VECTOR`) — der Ruecksetzwert der beiden MSI-X-Register.
+///
+/// Er ist auch die **Absage** des Geraets: schreibt der Treiber eine Zeile und liest diesen Wert
+/// zurueck, hat das Geraet die Zuordnung nicht angenommen (es konnte intern nichts belegen). Die
+/// Spezifikation verlangt die Ruecklesung ausdruecklich, und sie ist hier aus demselben Grund
+/// verlangt wie ueberall sonst in diesem Baum: *ein Schreibzugriff, den niemand zurueckliest,
+/// sieht bei Erfolg und Misserfolg gleich aus.*
+pub const MSI_NO_VECTOR: u16 = 0xffff;
+
+/// **Wie ein Treiber auf sein Geraet wartet, statt zu pollen** (Stufe B, B4).
+///
+/// Ein Funktionszeiger und kein Trait-Objekt: diese Crate ist **abhaengigkeitsfrei** und soll es
+/// bleiben. Sie weiss nicht, was eine Notification ist, und sie soll es nicht wissen — der Treiber
+/// reicht das Warten herein, genau wie er die Speicherbarriere hereinreicht.
+///
+/// **`poll-runden == 0` ist die Aussage, die daran haengt**, und deshalb steht hier kein
+/// Rueckfall: ein Treiber, der nach N vergeblichen Weckrufen doch pollte, machte diese Zahl
+/// wertlos und die Zeile gruen fuer etwas anderes. Bleibt der Interrupt aus, blockiert er — das
+/// ist die benannte Schuld der Stufe B, und sie faellt erst mit den Fristen der Stufe A.
+#[derive(Clone, Copy)]
+pub struct IrqWarten {
+    /// Index der MSI-X-Tabellenzeile, die diese Queue bedienen soll. Die Zeile hat der **Kernel**
+    /// geschrieben (E11) — der Treiber waehlt nur, welche Queue sie bedient.
+    pub msix_zeile: u16,
+    /// Blockiert, bis das Geraet gemeldet hat. `false` = der Warteweg ist unbrauchbar geworden;
+    /// dann wird abgebrochen und **nicht** gepollt.
+    pub warte: fn() -> bool,
+}
+
 /// common_cfg-Register-Offsets (virtio_pci_common_cfg).
 mod cc {
     pub const DEVICE_FEATURE_SELECT: u64 = 0x00;
     pub const DEVICE_FEATURE: u64 = 0x04;
     pub const DRIVER_FEATURE_SELECT: u64 = 0x08;
     pub const DRIVER_FEATURE: u64 = 0x0c;
+    /// MSI-X-Tabellenzeile fuer **Konfigurationsaenderungen** (Stufe B). Bis heute fehlte sie
+    /// hier, und mit ihr die ganze Interruptseite: ohne einen eingetragenen Vektor schickt ein
+    /// virtio-Geraet im MSI-X-Betrieb **gar nichts**.
+    pub const CONFIG_MSIX_VECTOR: u64 = 0x10;
     pub const DEVICE_STATUS: u64 = 0x14;
     pub const QUEUE_SELECT: u64 = 0x16;
     pub const QUEUE_SIZE: u64 = 0x18;
+    /// MSI-X-Tabellenzeile fuer die **ausgewaehlte Queue** (`QUEUE_SELECT`).
+    pub const QUEUE_MSIX_VECTOR: u64 = 0x1a;
     pub const QUEUE_ENABLE: u64 = 0x1c;
     pub const QUEUE_NOTIFY_OFF: u64 = 0x1e;
     pub const QUEUE_DESC: u64 = 0x20;
@@ -369,6 +404,45 @@ impl Queue {
         }
         None
     }
+
+    /// **Auf den used-Ring WARTEN statt zu pollen** (Stufe B, B4). Gibt zusaetzlich die Zahl der
+    /// Weckrufe zurueck.
+    ///
+    /// Der Ablauf hat **keine Vorabpruefung**, und das ist der Punkt. Naheliegend waere
+    /// „erst nachsehen, dann warten"; das ist die uebliche Form gegen verlorene Weckrufe — hier
+    /// aber genau die Zeile, die die Messung entwertet: ein emuliertes Geraet ist schnell genug,
+    /// dass die Vorabpruefung fast immer trifft, und dann ist `poll-runden == 0` auch dann wahr,
+    /// wenn **nie ein Interrupt** zugestellt wurde. Die Zeile bliebe gruen und maesse etwas
+    /// anderes.
+    ///
+    /// Verloren gehen kann dabei nichts: eine Notification **rastet ein**. Meldet das Geraet,
+    /// bevor der Treiber wartet, steht das Signal als pending, und `warte` kehrt sofort zurueck.
+    /// Voraussetzung ist allein, dass die Bindung **vor** dem Anstossen steht.
+    ///
+    /// `max_wakeups` begrenzt die Weckrufe, nicht die Zeit: ein Geraet, das signalisiert ohne
+    /// fertig zu werden, soll nicht endlos kreisen. *Wer eine Kapazitaet einfuehrt, muss den
+    /// Ueberlauf benennen* — hier ist er `None` mit `runden > 0`.
+    ///
+    /// # Safety
+    /// wie [`Self::arm`].
+    pub unsafe fn wait_used(
+        &self,
+        from: u16,
+        w: &crate::IrqWarten,
+        max_wakeups: u64,
+    ) -> (Option<Completion>, u64) {
+        let mut runden = 0u64;
+        while runden < max_wakeups {
+            if !(w.warte)() {
+                return (None, runden);
+            }
+            runden += 1;
+            if self.used_idx() != from {
+                return (Some(self.used_entry(from)), runden);
+            }
+        }
+        (None, runden)
+    }
 }
 
 /// Der geraeteunabhaengige Teil von virtio-pci (modern).
@@ -523,6 +597,38 @@ impl Transport {
         let notify_off = rd16(self.common + cc::QUEUE_NOTIFY_OFF);
         wr16(self.common + cc::QUEUE_ENABLE, 1);
         Some((q, notify_off))
+    }
+
+    /// **Welche MSI-X-Zeile bedient Queue `idx`?** — nur lesen, fuer den Pruefer.
+    ///
+    /// [`MSI_NO_VECTOR`] heisst: die Queue hat keine, und das Geraet sendet fuer sie **nichts**.
+    /// Das ist die Groesse, die „das Geraet sendet nicht" von „es sendet und wird verschluckt"
+    /// trennt — und die einzige der Kette, die bis heute nur der Treiber gesehen hat.
+    ///
+    /// # Safety
+    /// wie [`Self::queue_setup`].
+    pub unsafe fn queue_msix_lesen(&self, idx: u16) -> u16 {
+        wr16(self.common + cc::QUEUE_SELECT, idx);
+        rd16(self.common + cc::QUEUE_MSIX_VECTOR)
+    }
+
+    /// **Der Queue eine MSI-X-Zeile zuordnen** — und die Zuordnung zurueckleseN.
+    ///
+    /// `true` = das Geraet hat sie angenommen. `false` = es hat [`MSI_NO_VECTOR`]
+    /// zurueckgeschrieben, also **abgelehnt**; die Spezifikation verlangt diese Ruecklesung, und
+    /// sie ist genau die Sprechprobe, ohne die ein ausbleibender Interrupt spaeter wie ein stummes
+    /// Geraet aussaehe statt wie eine nicht angenommene Zuordnung.
+    ///
+    /// **Muss nach JEDEM Reset neu geschrieben werden**: ein Geraetereset setzt beide MSI-X-
+    /// Register auf `NO_VECTOR` zurueck. Wer sie einmal beim Hochlauf schreibt und danach
+    /// zuruecksetzt, hat sie nicht geschrieben.
+    ///
+    /// # Safety
+    /// wie [`Self::queue_setup`]; `idx` muss dieselbe Queue meinen.
+    pub unsafe fn queue_msix(&self, idx: u16, zeile: u16) -> bool {
+        wr16(self.common + cc::QUEUE_SELECT, idx);
+        wr16(self.common + cc::QUEUE_MSIX_VECTOR, zeile);
+        rd16(self.common + cc::QUEUE_MSIX_VECTOR) == zeile
     }
 
     /// `DRIVER_OK` — ab hier darf das Geraet arbeiten.

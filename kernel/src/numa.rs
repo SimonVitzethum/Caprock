@@ -84,6 +84,17 @@ pub fn init(dtb: &[u8]) {
     INITIALISED.store(true, Ordering::Release);
 }
 
+/// **Ist [`init`] gelaufen?** — die Frage, die „noch nicht gelesen" von „die Maschine hat keine"
+/// trennt.
+///
+/// Sie ist oeffentlich, weil der Lader sie stellen muss: sein Knoten-Gatter fragte bis zum
+/// 2026-08-20 eine leere Topologie und wies deshalb auf einer Zwei-Knoten-Maschine ab. Ein
+/// Praedikat, das beide Lagen zusammenfasst, macht einen Hochlauf-Fehler zu einer Aussage ueber
+/// die Hardware — genau die Verwechslung, gegen die `Node::Unaffiliated` eine Ebene tiefer steht.
+pub fn gelesen() -> bool {
+    INITIALISED.load(Ordering::Acquire)
+}
+
 /// A copy of the topology (it is `Copy` and small enough that handing out a snapshot beats
 /// handing out the lock).
 pub fn topology() -> Topology {
@@ -157,6 +168,72 @@ pub fn alloc_on_node(size: u64, align: u64, want: Node) -> Option<caprock_mem::M
     }
 }
 
+/// **Die vollstaendige Leiter: Knoten, dann Farbe** (Z8/N2, 2026-08-20).
+///
+/// [`alloc_on_node`] kennt nur *Knoten* und *irgendwo*; die Farbachse fehlte, und damit war
+/// `off_node_uncolored` **strukturell `0`**. Ein Zaehler, der nie ueber null gehen kann, ist von
+/// einem, der nie ausloest, nicht zu unterscheiden — und „Farbe gibt zuletzt nach" war eine
+/// Entscheidung auf Papier statt eine im Code.
+///
+/// Die Reihenfolge ist [`YIELD_ORDER`], und sie ist eine POLITIK, keine Schleifenreihenfolge:
+///
+/// 1. **`Exact`** — gewuenschter Knoten UND gewuenschte Farbe.
+/// 2. **`OffNode`** — der Knoten gibt nach, die Farbe bleibt. Er ist Leistung, sie ist die
+///    A1-Isolationszusage.
+/// 3. **`OffNodeUncolored`** — auch die Farbe gibt nach. **Meldepflichtig**, denn hier schwaecht
+///    sich A1 selbst ab; ein stiller Farbverzicht waere der `MASK_BITS`-Fehler noch einmal (gruen,
+///    obwohl nichts getrennt war).
+///
+/// Die **Zone** kommt in dieser Leiter nicht vor, und das ist kein Vergessen: sie ist
+/// Richtigkeit, keine Vorliebe (`vspace_map_page_at` weist `va >= GIB1_END` ab), also gibt sie
+/// ueberhaupt nicht nach. Der harte Pfad ist `mem_alloc_below`.
+pub fn alloc_on_node_colored(
+    size: u64,
+    align: u64,
+    want: Node,
+    mask: caprock_mem::ColorMask,
+) -> Option<caprock_mem::MemoryCap> {
+    let t = topology();
+    // Sprosse 1: Knoten UND Farbe.
+    if let Node::At(n) = want {
+        if t.trustworthy() {
+            let mut i = 0usize;
+            while let Some((lo, hi)) = t.window_of(n, i) {
+                if let Some(c) = system::alloc_colored_in_window(size, align, mask, lo, hi) {
+                    EXACT.fetch_add(1, Ordering::Relaxed);
+                    return Some(c);
+                }
+                i += 1;
+            }
+        }
+    }
+    // Sprosse 2: der Knoten gibt nach, die Farbe bleibt.
+    if let Some(c) = system::alloc_colored(size, align, mask) {
+        // **Nach WIRKUNG gebucht.** Landete die Region doch auf dem gewuenschten Knoten, ist das
+        // kein Nachgeben — dieselbe Unterscheidung, an der der E-Rest-3b-Zaehler gescheitert ist.
+        match (want, t.node_of_pa(c.base())) {
+            (Node::At(n), Node::At(got)) if got == n => EXACT.fetch_add(1, Ordering::Relaxed),
+            _ => OFF_NODE.fetch_add(1, Ordering::Relaxed),
+        };
+        return Some(c);
+    }
+    // Sprosse 3: auch die Farbe gibt nach. **Gezaehlt und gemeldet**, nicht still.
+    match system::alloc_anywhere(size, align) {
+        Some(c) => {
+            OFF_NODE_UNCOLORED.fetch_add(1, Ordering::Relaxed);
+            Some(c)
+        }
+        None => {
+            REFUSED.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// Wie oft die **Farbe** nachgegeben hat (Sprosse 3). Eigener Zaehler, weil es die einzige
+/// Sprosse ist, die eine ZUSICHERUNG schwaecht statt nur Leistung zu kosten.
+static OFF_NODE_UNCOLORED: AtomicU64 = AtomicU64::new(0);
+
 /// N3 placement outcomes. Two counters, because "the node had no running core" and "the thread
 /// went to a foreign node" are two statements — and only the second is a fact about placement.
 static CORE_LOCAL: AtomicU64 = AtomicU64::new(0);
@@ -181,7 +258,7 @@ pub fn stats() -> PlacementStats {
     PlacementStats {
         exact: EXACT.load(Ordering::Relaxed),
         off_node: OFF_NODE.load(Ordering::Relaxed),
-        off_node_uncolored: 0,
+        off_node_uncolored: OFF_NODE_UNCOLORED.load(Ordering::Relaxed),
         refused: REFUSED.load(Ordering::Relaxed),
     }
 }

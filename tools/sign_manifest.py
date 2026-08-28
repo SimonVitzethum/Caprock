@@ -62,12 +62,22 @@ CAPS = {
     "mmio": 1 << 4,
     "irq": 1 << 5,
     "dma": 1 << 6,
+    # 2026-08-25: the transfer area is its own authority, not a side effect of "ep".
+    "shared": 1 << 7,
 }
 POLICIES = {
     "stripe": 1 << 0,
     "root": 1 << 1,
     "pinned": 1 << 2,
     "nohotreload": 1 << 3,
+    # **`debuggable` was missing here** and the kernel has carried POLICY_DEBUGGABLE since Z6b.
+    # A bit the signer cannot express is a bit no manifest can carry: the whole manifest route to
+    # debug authority was unreachable, and nothing said so -- the Z6b probes bring their own
+    # target PD and never needed it. A table that silently covers less than the format is the
+    # same shape as a guard that finds nothing.
+    "debuggable": 1 << 4,
+    # 2026-08-25: "this component PROVIDES a service" -- see POLICY_PROVIDES_SERVICE.
+    "service": 1 << 5,
 }
 
 

@@ -77,7 +77,7 @@ mit_deps() { # $1 = Name, $2 = Crate-Verzeichnis, $3.. = Abhaengigkeiten (Verzei
     rm -rf "$SA"
 }
 
-ZIELE="${*:-mem part fat cycles loader cap virtio dma wait irte irteneg grossdmaneg dmar dmarneg iohealth smt numa bootparams fbtext redirect redirectneg typestate ipctreue}"
+ZIELE="${*:-mem part fat cycles loader cap virtio dma wait irte irteneg grossdmaneg dmar dmarneg iohealth smt numa bootparams fbtext redirect redirectneg typestate ipctreue schedtreue}"
 for z in $ZIELE; do
     case "$z" in
         mem)  einzeln mem  "$ROOT/crates/caprock-mem/src/lib.rs" ;;
@@ -212,7 +212,22 @@ for z in $ZIELE; do
             else
                 bash "$ROOT/tools/verus-modelltreue-ipc.sh" || fail=1
             fi ;;
-        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio dma wait irte irteneg grossdmaneg dmar dmarneg iohealth smt numa bootparams fbtext redirect redirectneg typestate ipctreue)"; fail=1 ;;
+        # **Warum der Scheduler-Waechter seit dem 2026-08-21 HIER steht** (Befund, nicht Kosmetik):
+        # er hing allein an `tools/verus-verify.sh`, und das laeuft in keinem Gatter dieser Abnahme.
+        # Gemessen an diesem Tag: er meldete **drei** unbenannte Schreibstellen aus Z6b
+        # (`debug_stop`, `debug_continue`, `debug_release_pd`) -- seit zwei Tagen rot, ohne dass es
+        # jemand sah. Ein Gatter, das existiert und nicht gefahren wird, ist keins; dieselbe Klasse
+        # wie `.gitea/workflows` auf einem GitLab-Server. Er braucht kein Verus (nur Python) und
+        # gehoert damit genau dorthin, wo der IPC-Waechter schon steht.
+        schedtreue)
+            echo "== Host-Tests: schedtreue (Scheduler gegen das Verus-Modell) =="
+            if [ ! -f "$ROOT/tools/verus-modelltreue-sched.sh" ]; then
+                echo "  FEHLT: tools/verus-modelltreue-sched.sh ist nicht vorhanden -- Ziel nicht gelaufen"
+                fail=1
+            else
+                bash "$ROOT/tools/verus-modelltreue-sched.sh" || fail=1
+            fi ;;
+        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio dma wait irte irteneg grossdmaneg dmar dmarneg iohealth smt numa bootparams fbtext redirect redirectneg typestate ipctreue schedtreue)"; fail=1 ;;
     esac
 done
 

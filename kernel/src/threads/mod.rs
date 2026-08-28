@@ -714,8 +714,19 @@ fn run_sysload_start() -> usize {
 /// hellos Slot 0). `arg` = hello-Archiv-Index. Danach ein Negativaufruf ueber einen leeren Slot
 /// (keine Loader-Cap) -> ERR_BADCAP. Setzt die Telemetrie + parkt.
 extern "C" fn sysload_caller(arg: usize) -> ! {
-    // x1 = Loader-Cap-Slot 0; x2 = hello-Index; x3 = Delegations-Slot 1 (Notification-Cap).
-    let r = invoke(sys::LOAD, 0, [arg as u64, 1, 0, 0], 0);
+    // x1 = Loader-Cap-Slot 0 · x2 = hello-Index · x3 = **gepackte Delegationsliste** ·
+    // x4 = Anzahl gueltiger Paare · x5 = Cap-Budget (0 = Vorgabe).
+    //
+    // **Berichtigt 2026-08-26.** Hier stand `[arg, 1, 0, 0]` -- die ABI von VOR der
+    // Mehrfachdelegation (2026-08-25), in der x3 ein einzelner Slot war. Mit der neuen liest der
+    // Dispatch x4 als ANZAHL, bekam `0` und delegierte **nichts**: `hello` lief, hatte aber keine
+    // Notification und konnte sich nicht melden. `sysload` meldete `result=0` (der Ladevorgang
+    // gelang ja) und `hello-Signal=NEIN`, `all_done()` wurde nie wahr, Watchdog -- und **neun
+    // weitere Zeilen** meldeten FAILURES, weil sie nach dem Haenger gar nicht mehr liefen.
+    // Aufgefallen ist es erst beim ersten aarch64-Lauf nach jener Aenderung; x86 hat diesen
+    // in-Kernel-Aufrufer nicht.
+    let paar = caprock_abi::delegate_pair(1, 0) as u64;
+    let r = invoke(sys::LOAD, 0, [arg as u64, paar, 1, 0], 0);
     SYSLOAD_RESULT.store(r.result, Ordering::Relaxed);
     // Negativ: SYS_LOAD ueber Slot 5 (leer, keine Loader-Cap) -> ERR_BADCAP.
     let r2 = invoke(sys::LOAD, 5, [arg as u64, u64::MAX, 0, 0], 0);
@@ -2161,6 +2172,9 @@ const _: () = assert!(
         // K1a (2026-08-17): eine neue Nummer gehoert in denselben Anker wie die uebrigen --
         // sonst driftet sie beim naechsten Einschub, und EL0-Programme kodieren sie als Immediate.
         && sys::SPAWN == 20
+        // B3 (2026-08-26): dieselbe Begruendung wie fuer SPAWN -- eine neue Nummer gehoert in den
+        // Anker, sonst driftet sie beim naechsten Einschub.
+        && sys::BIND_IRQ == 26
 );
 
 /// **EL0-Exiter** (Sektion `.user_text`, EL0-ausführbar): beendet sich sofort per
@@ -5136,7 +5150,7 @@ pub fn demo_report_then_idle() -> ! {
 /// ist (abgeleitet statt gezaehlt) -- hier faengt der Typ es wenigstens beim Bau ab, weil die
 /// Liste ein Array fester Laenge ist. **Der Bau hat es auch getan**, und zwar nur unter
 /// `--features selftest`: ein Bau ohne das Merkmal enthaelt diese Datei gar nicht.
-const DONE_FLAGS_ARM: usize = 60;
+const DONE_FLAGS_ARM: usize = 61;
 
 fn all_done(warum: Option<&mut [(&'static str, bool); DONE_FLAGS_ARM]>) -> bool {
     let workers = (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD);
@@ -5337,6 +5351,15 @@ fn all_done(warum: Option<&mut [(&'static str, bool); DONE_FLAGS_ARM]>) -> bool 
         ("cross", cross),
         ("migrate", migrate),
         ("scale", scale),
+        // K1b: `SYS_SPAWN` mit Teilregion. **`!gattert()` und nicht `ist_bestanden()`**: ein SKIP
+        // (kein Speicher, keine PD) haelt den Lauf nicht auf -- es steht im Bericht.
+        //
+        // **Und wie auf x86 ist das KEIN Gatter** (berichtigt 2026-08-26): `spawnarena::messen()`
+        // laeuft in `report()`, also nachdem `all_done()` entschieden hat. Der Eintrag sorgt
+        // dafuer, dass die Zeile in der Aufzaehlung des Watchdogs auftaucht; gegattert wird von
+        // der Suite. Die Sonde steht dort unten, weil sie Speicher belegt und ein Test, der
+        // Speicher belegt, baseline-empfindliche Tests kippt.
+        ("arena", !crate::spawnarena::urteil().gattert()),
     ];
     if let Some(w) = warum {
         *w = flags;
@@ -5404,6 +5427,30 @@ fn report() {
 
     // Z6b: die Debugger-Sonde -- seit sie ihr eigenes Ziel mitbringt, faehrt sie hier genauso.
     crate::dbgprobe::messen(system::IDLE_PRIO);
+
+    // Z23/S3: der Gruppenschnitt. **Arch-neutral und von BEIDEN Zweigen gefahren** -- die geprueften
+    // Stellen (Scheduler-Grundmenge, Endpoint-Rollen, PD-Tabelle) sind es auch. Sie laeuft NACH der
+    // Debugger-Sonde, weil sie drei PDs und fuenf Threads belegt und ein Test, der Speicher belegt,
+    // baseline-empfindliche Tests kippt (Fallenliste).
+    crate::pdfreeze::messen(system::IDLE_PRIO);
+
+    // Z4d stage 1: the checkpoint cut. **Arch-neutral and run by BOTH paths**, and deliberately
+    // right behind the group cut: it asks the same question one level up (a relationship whose
+    // both ends lie inside the cut is not an open relationship of the cut) but about a
+    // CHECKPOINT's scope instead of a PD's threads. Two PDs and four threads, so it sits late for
+    // the same reason `pdfreeze` does -- a test that allocates memory tips baseline-sensitive
+    // tests (Fallenliste).
+    crate::ckptcut::messen(system::IDLE_PRIO);
+
+    // K1b: mehrere Thread-Stapel aus EINER Memory-Cap. **Arch-neutral, von BEIDEN Wegen gefahren**,
+    // und aus demselben Grund spaet wie `ckptcut`: eine PD, sechs Threads und zwei Regionen -- ein
+    // Test, der Speicher belegt, kippt baseline-empfindliche Tests (Fallenliste).
+    //
+    // Er ist zugleich der ERSTE Lauf von `SYS_SPAWN` ueberhaupt: der Syscall steht seit dem
+    // 2026-08-17 in der ABI und hatte bis heute keinen Aufrufer und kein Gatter.
+    crate::spawnarena::messen();
+    crate::tlsprobe::messen();
+    crate::uhr::messen();
     let mut sched_ok = true;
     for c in 0..system::num_cores() {
         let t = hal::timer::ticks(c);

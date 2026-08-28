@@ -20,11 +20,12 @@ use caprock_hal::println;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Urteil der `dbg`-Zeile.
-static DBG_OK: AtomicBool = AtomicBool::new(false);
+/// Der Ausgang dieser Sonde — **dreiwertig** (2026-08-25, s. `crate::befund`).
+static DBG_OK: crate::befund::AtomicBefund = crate::befund::AtomicBefund::neu();
 
 /// Das Urteil, fuer die Hochlaufwege.
-pub fn urteil() -> bool {
-    DBG_OK.load(Ordering::Acquire)
+pub fn urteil() -> crate::befund::Befund {
+    DBG_OK.lesen()
 }
 
 /// **Der Traeger des Ziels: ein EL0-Rundlauf, der einen Zaehler hochzaehlt.**
@@ -89,22 +90,26 @@ pub fn messen(prio: u8) {
     // Mangel-Marke und die `park`-Zeile gescheitert sind.
     let Some(baton) = system::alloc(4096, 4096).map(|c| c.region().base) else {
         println!("dbg     : SKIP (keine Seite fuer den Rundenzaehler)");
+        DBG_OK.uebersprungen();
         return;
     };
     poke(baton, 0);
     let Some(zielpd) = system::create_pd() else {
         println!("dbg     : SKIP (keine PD frei)");
+        DBG_OK.uebersprungen();
         return;
     };
     let Some((zp, _)) = system::spawn_isolated_parked(traeger as *const () as usize, baton as usize, prio)
     else {
         println!("dbg     : SKIP (kein Ziel-Thread)");
+        DBG_OK.uebersprungen();
         return;
     };
     system::bind_pd_parked(&zp, zielpd);
     system::map_into_parked(&zp, baton, 4096, 1); // RW -- der Traeger zaehlt hinein
     let Some(tid) = system::admit(zp) else {
         println!("dbg     : SKIP (Ziel nicht zulassbar)");
+        DBG_OK.uebersprungen();
         return;
     };
     let raw = tid.to_raw();
@@ -134,6 +139,7 @@ pub fn messen(prio: u8) {
     // --- 3. Praegen und ableiten --------------------------------------------------------------
     let Some(wurzelslot) = system::mint_debuggable(zielpd) else {
         println!("dbg     : SKIP (keine Debuggable praegbar -- kein Cap-Slot frei)");
+        DBG_OK.uebersprungen();
         return;
     };
     let attach = system::debug_attach(0, wurzelslot, caprock_abi::debug::RIGHT_BOTH);
@@ -521,5 +527,5 @@ pub fn messen(prio: u8) {
     // Gegattert wird die Zeile trotzdem, nur eine Ebene hoeher: `test-qemu-x86.sh` prueft sie mit
     // `check`. Eine Zeile, die niemand liest, ist die Form, die dieses Projekt bei `pdbind`
     // bezahlt hat (`pdbind : FAILURES` bei `== ALL PASS ==`).
-    DBG_OK.store(ok, Ordering::Release);
+    DBG_OK.gemessen(ok);
 }

@@ -20,6 +20,13 @@ use crate::pcie::{self, PciDevice};
 pub use caprock_virtio::{
     blk, blk::VirtioBlk, net, net::VirtioNet, Transport, VirtioRng, DATA_LEN_BYTES, DATA_OFFSET,
 };
+/// **Aus einer Konfigurationsraum-Seite einen Transport** — weitergereicht, damit der Kernel den
+/// Zustand eines vergebenen Geraets **zurueckleseN** kann, ohne `caprock-virtio` selbst zu linken.
+///
+/// Das ist ausdruecklich kein Ruecktritt hinter A-5.1: hier wird nichts **bedient**, sondern
+/// gemessen. Der Unterschied ist derselbe wie zwischen dem Lauf ueber alle Busse (Kernel) und dem
+/// Bedienen des einen Geraets (Treiber-PD).
+pub use caprock_virtio::probe_ecam;
 
 /// Die virtio-Capabilities des Geraets parsen und `common_cfg`, Notify und (falls vorhanden) den
 /// geraetespezifischen Konfigurationsraum lokalisieren. `None`, wenn die noetigen Caps fehlen oder

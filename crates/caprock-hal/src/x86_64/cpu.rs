@@ -50,12 +50,32 @@ pub unsafe fn rdmsr(msr: u32) -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
+/// `IA32_FS_BASE` — die Basis, gegen die `%fs:`-relative Zugriffe aufgeloest werden.
+const IA32_FS_BASE: u32 = 0xC000_0100;
+
+/// **Den Thread-Pointer setzen** (TLS, T1).
+///
+/// `FS` und nicht `GS`, und die Wahl ist gemessen: **beide** sind in diesem Kernel frei (kein
+/// `swapgs`, keine Per-CPU-Ablage). Der Uebersetzer adressiert local-exec-TLS `%fs:`-relativ, also
+/// faellt die Wahl auf `FS` — und `GS` bleibt frei fuer eine spaetere Per-CPU-Ablage. Das ist der
+/// Nebenertrag, nicht der Grund.
+///
+/// **Ohne Autoritaet:** die Adresse wird vom Code des Threads in dessen eigenem Adressraum
+/// dereferenziert; was dort lesbar ist, entscheidet die MMU. Dieses Register zu setzen gewinnt
+/// nichts, was der Thread nicht schon hatte.
+pub fn set_thread_pointer(va: u64) {
+    // SAFETY: `IA32_FS_BASE` ist architektonisch definiert; der geschriebene Wert wirkt
+    // ausschliesslich als Basis fuer `%fs:`-Zugriffe des aktuellen Kerns.
+    unsafe { wrmsr(IA32_FS_BASE, va) }
+}
+
 /// Model-Specific Register schreiben.
 ///
 /// # Safety
 /// Wie [`rdmsr`]; zusätzlich verändert ein MSR-Schreibzugriff CPU-Verhalten (Paging,
 /// Syscall-Einstiegspunkte, APIC).
 #[inline(always)]
+
 pub unsafe fn wrmsr(msr: u32, val: u64) {
     unsafe {
         asm!("wrmsr", in("ecx") msr, in("edx") (val >> 32) as u32, in("eax") val as u32,

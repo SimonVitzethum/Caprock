@@ -54,6 +54,25 @@ mod dbgmem;
 mod dbgprobe;
 #[cfg(feature = "selftest")]
 mod dmatests;
+// Z23/S3: die Sonde des Gruppenschnitts -- arch-neutral, s. Moduldoku. Das Attribut bindet an das
+// NAECHSTE Item; ein Kommentar dazwischen aendert daran nichts, ein weiteres `mod` dazwischen sehr
+// wohl (zweimal am 2026-08-19 passiert, beide Male vom F1-Bau gefangen).
+#[cfg(feature = "selftest")]
+mod pdfreeze;
+// Z4d stage 1: the cut probe -- arch-neutral, see the module doc. Same attribute caveat as above:
+// it binds to the NEXT item.
+#[cfg(feature = "selftest")]
+mod ckptcut;
+// K1b: mehrere Thread-Stapel aus EINER Memory-Cap -- arch-neutral, s. Moduldoku. Dieselbe
+// Attribut-Eigenheit wie oben: es bindet an das NAECHSTE Item.
+#[cfg(feature = "selftest")]
+mod spawnarena;
+mod tlsprobe;
+mod uhr;
+/// Der dreiwertige Sondenausgang (2026-08-25) -- s. Moduldoku. Nicht hinter `selftest`: der Typ
+/// ist die Sprache, in der Sonden reden, und ein Typ, den es nur im Testbau gibt, ist einer, den
+/// der schlanke Bau nicht pruefen kann.
+mod befund;
 /// Z26, Vorbedingung 2: grosse, zusammenhaengende DMA mit Geraetesicht — und eine **benannte**
 /// Absage statt `None`. Arch-neutral; die Klassifikation liegt host-getestet in `caprock-dma`.
 mod grossdma;
@@ -111,8 +130,13 @@ const FALLBACK_CORES: usize = 8;
 const SEC_STACK_SIZE: u64 = 0x10000;
 
 /// Periodische Tick-Rate des Timers (Hz). 100 Hz = 10-ms-Zeitscheiben.
-#[cfg(target_arch = "aarch64")]
-const TICK_HZ: u64 = 100;
+///
+/// **Arch-neutral seit 2026-08-27, und das ist eine Zusammenfuehrung, keine Verallgemeinerung.**
+/// Bis dahin stand dieselbe 100 zweimal im Baum -- hier unter `cfg(aarch64)` und noch einmal in
+/// `arch/x86_64/bringup.rs`. Zwei Gedaechtnisse fuer eine Tatsache, und die `uhr`-Sonde brauchte
+/// sie auf beiden Architekturen. Wer die Rate aendert, aendert sie jetzt an EINER Stelle (todo
+/// D16).
+pub const TICK_HZ: u64 = 100;
 
 /// RAM-Layout der Zielplattform (Fallback; tatsächlich aus dem DTB gelesen).
 #[cfg(target_arch = "aarch64")]

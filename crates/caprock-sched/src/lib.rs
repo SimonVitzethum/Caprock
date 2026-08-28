@@ -357,6 +357,31 @@ impl BlockReasons {
     /// serialisiert, waere dies keine Verbreiterung, sondern eine Formataenderung mit eigener
     /// Version und eigenem Release.
     pub const DEBUG: u16 = 1 << 6;
+    /// **Der Gruppenschnitt einer ganzen PD haelt diesen Thread** (Z23/S3).
+    /// Wecker: [`Scheduler::thaw_group`] — und **nur** der.
+    ///
+    /// ## Die achte Instanz, und die vierte vorhergesagte
+    ///
+    /// Der naheliegende Weg waere [`Self::PAUSE`] gewesen — dessen Doku nennt den Gruppenschnitt
+    /// sogar ausdruecklich als kuenftigen Nutzer. Er traegt nicht, und der Grund ist die Aussage
+    /// des Schnitts: **entweder steht die ganze PD oder keiner ihrer Threads.** Mit `PAUSE`
+    /// genuegte ein `SYS_PDCTL RESUME` auf **einen** Thread, um genau einen Teilnehmer aus einer
+    /// eingefrorenen Gruppe herauszuloesen — die PD waere halb eingefroren, ihre offenen
+    /// Transaktionen wieder wachsend, und **jeder Pruefer meldete Ordnung**. Das ist die D11-Form,
+    /// die der Eintrag zu S3 woertlich als das schlimmere Ergebnis benennt.
+    ///
+    /// In der Menge ist das unformulierbar: `resume` entfernt `PAUSE`, `unpark` entfernt `PARK`,
+    /// `unblock` entfernt `IPC`, `handler_reply` entfernt `HANDLER`, `load_reply` entfernt `LOAD`,
+    /// `debug_continue` entfernt `DEBUG` — keiner von ihnen entfernt `FREEZE`, und eingereiht wird
+    /// **nur bei leerer Menge**.
+    ///
+    /// ## Und warum das den Abbruch fast geschenkt macht
+    ///
+    /// `abort_freeze` ist der am wenigsten geuebte Pfad des ganzen Strangs. Mit einem eigenen
+    /// Grund ist er *ein* `remove` je schon eingefrorenem Thread: kein Zwischenzustand ist
+    /// rueckwaerts zu durchlaufen, keine fremde Weckmarke kann dabei verlorengehen, weil keine
+    /// angefasst wird. Genau der Vorteil, dessentwegen der Eintrag „Z24 VOR Z23" verlangt hat.
+    pub const FREEZE: u16 = 1 << 7;
 
     /// Leere Menge = lauffähig.
     pub const NONE: Self = Self(0);
@@ -369,6 +394,10 @@ impl BlockReasons {
         self.0 & grund != 0
     }
     /// Grund hinzufügen (idempotent).
+    /// Ist dieser Grund gesetzt?
+    pub fn enthaelt(&self, grund: u16) -> bool {
+        self.0 & grund != 0
+    }
     pub fn insert(&mut self, grund: u16) {
         self.0 |= grund;
     }
@@ -399,6 +428,28 @@ struct Tcb {
     /// Stack-Region des Threads (für die Rückgewinnung beim Beenden).
     stack_base: usize,
     stack_len: usize,
+    /// **Absolute Frist** in Ticks (`0` = keine). Stufe A / A2.
+    ///
+    /// **Die Frist ist kein Blockadegrund, sondern ein WECKER** -- und das ist die tragende
+    /// Entscheidung, nicht eine Formulierung. Ein sechster Grund neben `IPC`, `BUDGET`, `PAUSE`,
+    /// `PARK`, `HANDLER`, `LOAD`, `DEBUG`, `FREEZE` waere die Wiederholung des D9-Fehlers mit der
+    /// Uhr als Ausloeser: wer „die Frist ist abgelaufen" als Grund entfernt, hat den Thread nicht
+    /// geweckt, sondern nur eine Bedingung weggenommen, die niemanden gehalten hat.
+    frist: u64,
+    /// **Welchen Grund diese Frist entfernen darf** -- genau einen, naemlich den, fuer den sie
+    /// scharfgestellt wurde.
+    ///
+    /// `0` = keine Frist. Das ist die Halbierung, an der Z24 haengt: die Uhr weckt aus *dem*
+    /// Warten, das sie bewacht, und aus keinem anderen. Ein pausierter oder erschoepfter Thread,
+    /// der nebenbei eine Frist traegt, bleibt pausiert bzw. erschoepft.
+    frist_grund: u16,
+    /// **Thread-Pointer** (TLS, T1). `0` = keiner gesetzt.
+    ///
+    /// Der Kernel haelt hier **eine Zahl** und sonst nichts: was hinter der Adresse liegt, wie der
+    /// Block aufgeteilt ist und wo der Selbstzeiger steht, ist eine ABI der Werkzeugkette und geht
+    /// den Scheduler nichts an. Er sorgt allein dafuer, dass der Wert den Kontextwechsel
+    /// ueberlebt — genau das kann ein Programm fuer sich selbst nicht.
+    tls: usize,
     // --- intrusive Verkettung (ext-30) ---
     /// Priorität der Queue, in der der Thread hängt, oder [`NOT_QUEUED`].
     queued: u8,
@@ -463,6 +514,9 @@ impl Tcb {
         reasons: BlockReasons::NONE,
         stack_base: 0,
         stack_len: 0,
+        frist: 0,
+        frist_grund: 0,
+        tls: 0,
         queued: NOT_QUEUED,
         // **Ein Bit fuer „darf laufen"** (D0). Es traegt GENAU einen Grund -- der Scheduler kennt
         // schon ein `blocked`, das frueher drei Bedeutungen hatte (s. D9), und ein viertes waere
@@ -629,6 +683,17 @@ pub struct Scheduler {
     /// Anzahl aktuell **erschöpfter** MCS-Konten. Ist sie 0, entfällt der Refill-Scan
     /// vollständig — der Normalfall (kein Budget) kostet damit nichts je Tick.
     depleted_count: usize,
+    /// **Die frueheste bewaffnete Frist** (`u64::MAX` = keine).
+    ///
+    /// Nicht ein Zaehler, sondern ein **Minimum** -- und der Unterschied ist D10. Ein Zaehler
+    /// („gibt es ueberhaupt Fristen?") machte jeden Tick zu einem vollen Tabellendurchlauf,
+    /// sobald EIN Thread wartet; und ein wartender Treiber ist genau der Fall, fuer den A2
+    /// existiert. Mit dem Minimum kostet der Tick einen Vergleich, bis wirklich etwas faellig ist.
+    ///
+    /// **Beim Entwaffnen wird NICHT neu gerechnet**: der Wert darf zu frueh stehen, nie zu spaet.
+    /// Zu frueh kostet einen ueberfluessigen Durchlauf, zu spaet verloere eine Frist -- und von
+    /// den beiden Fehlern ist nur einer harmlos.
+    naechste_frist: u64,
     /// Anzahl Threads mit gesetztem [`Tcb::budget_blocked`] (D10). Ist sie 0, entfällt der
     /// **Weckelauf** in [`refill_depleted`](Self::refill_depleted) und
     /// [`set_budget`](Self::set_budget) — beide kosteten seit H-b einen vollen
@@ -694,6 +759,7 @@ impl Scheduler {
             cyc_core: CycleStats::EMPTY,
             used: 0,
             depleted_count: 0,
+            naechste_frist: u64::MAX,
             budget_blocked_count: 0,
             migrations_out: 0,
             migrations_in: 0,
@@ -989,6 +1055,26 @@ impl Scheduler {
 
     /// Den laufenden Thread blockieren und **direkt** zu `target` (zuvor blockiert,
     /// z. B. ein IPC-Partner auf demselben Kern) wechseln. Rendezvous-Fastpath.
+    /// **Den Thread-Pointer eines Threads setzen** (TLS, T1). `false` = Thread ungueltig.
+    ///
+    /// Wirkt erst beim naechsten Spiegeln an die CPU (`sync_tls` im Kernel) — und das ist richtig:
+    /// wer *jetzt* schreibt, schreibt auf dem Kern des Aufrufers, und der Zielthread laeuft
+    /// moeglicherweise auf einem anderen.
+    pub fn set_tls(&mut self, tid: ThreadId, va: usize) -> bool {
+        match self.resolve(tid) {
+            Some(t) => {
+                self.tcbs[t].tls = va;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Der Thread-Pointer eines Threads (`0` = keiner).
+    pub fn tls_of(&self, tid: ThreadId) -> usize {
+        self.resolve(tid).map_or(0, |t| self.tcbs[t].tls)
+    }
+
     pub fn switch_to(&mut self, core: usize, frame: usize, target: ThreadId) -> usize {
         debug_assert_eq!(core, self.core);
         let cur = self.current.expect("kein laufender Thread");
@@ -1108,6 +1194,103 @@ impl Scheduler {
     ///
     /// `None` heisst „nicht blockiert, die Marke war da und ist verbraucht" — der Aufrufer laeuft
     /// weiter. `Some(sp)` ist der Stackpointer des naechsten Threads.
+    /// **Eine Frist fuer den LAUFENDEN Thread scharfstellen** (A2), gemessen in Ticks ab jetzt.
+    ///
+    /// `grund` ist der Blockadegrund, den sie -- und nur sie -- entfernen darf. `ticks == 0`
+    /// entwaffnet.
+    ///
+    /// **Scharfgestellt wird VOR dem Blockieren**, und das ist kein Stil: andersherum gaebe es ein
+    /// Fenster, in dem der Thread schon wartet und niemand ihn wecken wuerde. Dieselbe Ordnung wie
+    /// bei C8 (`der Aufrufer wird blockiert, BEVOR sein Auftrag sichtbar wird`) und aus demselben
+    /// Grund.
+    pub fn frist_setzen(&mut self, core: usize, ticks: u64, grund: u16) {
+        debug_assert_eq!(core, self.core);
+        let cur = self.current.expect("kein laufender Thread");
+        if ticks == 0 {
+            self.tcbs[cur].frist = 0;
+            self.tcbs[cur].frist_grund = 0;
+            return;
+        }
+        let d = self.now.saturating_add(ticks);
+        self.tcbs[cur].frist = d;
+        self.tcbs[cur].frist_grund = grund;
+        if d < self.naechste_frist {
+            self.naechste_frist = d;
+        }
+    }
+
+    /// Die Frist eines Threads entwaffnen -- **fuer den regulaeren Wecker**.
+    ///
+    /// Wird ein Thread aus dem bewachten Grund geweckt (das Signal kam), darf die Frist ihn nicht
+    /// spaeter noch einmal treffen: sie gehoerte zu **diesem** Warten.
+    pub fn frist_loeschen(&mut self, tid: ThreadId) {
+        if let Some(t) = self.resolve(tid) {
+            self.tcbs[t].frist = 0;
+            self.tcbs[t].frist_grund = 0;
+        }
+    }
+
+    /// **Faellige Fristen abarbeiten** -- gibt die geweckten Threads zurueck.
+    ///
+    /// Der Aufrufer (Kernel) schreibt ihnen `ERR_TIMEOUT` in den Ergebnisframe; diese Crate kennt
+    /// die ABI nicht und soll sie nicht kennen.
+    ///
+    /// **Entfernt wird GENAU der bewachte Grund**, nie die ganze Menge. Ein Thread, der zusaetzlich
+    /// pausiert oder erschoepft ist, bleibt es -- sonst waere die Uhr ein Generalschluessel, und
+    /// das ist der D9-Fehler.
+    pub fn fristen_faellig(&mut self, out: &mut [ThreadId]) -> usize {
+        if self.now < self.naechste_frist {
+            return 0; // der Normalfall: ein Vergleich, kein Durchlauf (D10)
+        }
+        let mut n = 0;
+        let mut naechste = u64::MAX;
+        for i in 0..self.tcbs.len() {
+            let f = self.tcbs[i].frist;
+            if !self.tcbs[i].used || f == 0 {
+                continue;
+            }
+            if f > self.now {
+                if f < naechste {
+                    naechste = f;
+                }
+                continue;
+            }
+            let grund = self.tcbs[i].frist_grund;
+            self.tcbs[i].frist = 0;
+            self.tcbs[i].frist_grund = 0;
+            // **Das Rennen, und seine Aufloesung steht hier ausgeschrieben: das SIGNAL gewinnt.**
+            //
+            // Ist der bewachte Grund schon weg, war der Thread bereits geweckt -- die Frist gehoert
+            // zu einem Warten, das vorbei ist. Sie wird entwaffnet und **nichts** geschrieben.
+            //
+            // Das ist die teure Haelfte der Entscheidung: ein Treiber, der `ERR_TIMEOUT` als
+            // „Geraet tot" liest und zuruecksetzt, waehrend die Antwort gerade zugestellt wurde,
+            // ist ein **Korruptionspfad** und kein Haenger. Deshalb bekommt nur ein Thread den
+            // Code, den die Frist WIRKLICH freigegeben hat -- die Liste `out` traegt genau die.
+            if !self.tcbs[i].reasons.enthaelt(grund) {
+                continue;
+            }
+            // **Nur DIESEN Grund.** Steht danach noch einer, laeuft der Thread nicht -- und das
+            // ist richtig: die Frist sagt „warte nicht laenger auf X", nicht „laufe".
+            self.tcbs[i].reasons.remove(grund);
+            // **Eingereiht wird NUR bei leerer Menge** (Z24). Ohne diesen Halbsatz waere die
+            // Grund-Menge bloss eine andere Schreibweise fuer dieselben Bits.
+            if self.tcbs[i].reasons.is_empty() && self.tcbs[i].queued == NOT_QUEUED && n < out.len()
+            {
+                self.enqueue_ready(i);
+                out[n] = self.id(i);
+                n += 1;
+            }
+        }
+        self.naechste_frist = naechste;
+        n
+    }
+
+    /// Steht ueberhaupt eine Frist? (Bericht/Sonde)
+    pub fn frist_von(&self, tid: ThreadId) -> u64 {
+        self.resolve(tid).map_or(0, |t| self.tcbs[t].frist)
+    }
+
     pub fn park_current(&mut self, core: usize, frame: usize) -> Option<usize> {
         debug_assert_eq!(core, self.core);
         let cur = self.current.expect("kein laufender Thread");
@@ -1442,6 +1625,96 @@ impl Scheduler {
             .count()
     }
 
+    // -----------------------------------------------------------------------------------
+    // Z23/S3: der Gruppenschnitt — der Freeze ist eine MENGE, kein Ablauf
+    // -----------------------------------------------------------------------------------
+
+    /// **Einen Thread in den Gruppenschnitt aufnehmen** (Z23/S3).
+    ///
+    /// Setzt [`BlockReasons::FREEZE`] und nimmt ihn aus der Ready-Queue. Rueckgabe: **war er
+    /// vorher frei?** `false` heisst „hier nicht aufloesbar (tot/fremder Kern)" **oder** „stand
+    /// schon im Schnitt" — und anders als bei [`debug_stop`](Self::debug_stop) ist das zweite
+    /// hier kein Fehler, sondern der idempotente Fall. Der Aufrufer zaehlt nach **Wirkung**:
+    /// die Zahl der Threads, die durch *diesen* Aufruf stehengeblieben sind.
+    ///
+    /// **Deplant, aber nicht zwingend schon gestoppt.** Laeuft der Thread gerade auf einem
+    /// fremden Kern, wirkt die Aufnahme erst mit dem naechsten Reschedule. Genau deshalb hat
+    /// [`freeze_thread`](../../kernel/index.html) `StillRunning`, und genau deshalb prueft der
+    /// Gruppenschnitt nach dem Markieren ein zweites Mal, ob noch jemand auf einem Kern steht:
+    /// **erst markieren, dann warten, bis sie die Kerne verlassen haben.** Andersherum — warten
+    /// und dann markieren — terminiert nicht, weil in der Zwischenzeit einer zurueckkommt.
+    pub fn freeze_group(&mut self, tid: ThreadId) -> bool {
+        let Some(s) = self.resolve(tid) else {
+            return false;
+        };
+        if self.tcbs[s].reasons.has(BlockReasons::FREEZE) {
+            return false;
+        }
+        self.tcbs[s].reasons.insert(BlockReasons::FREEZE);
+        self.remove_from_ready(s);
+        true
+    }
+
+    /// **Der EINZIGE Wecker des Gruppengrundes** — Auftauen und Abbruch benutzen dieselbe Zeile.
+    ///
+    /// Entfernt `FREEZE` und **nur** das. Ein Thread, der zusaetzlich in IPC wartet, pausiert
+    /// wurde oder auf leerem Konto sitzt, bleibt liegen — sein Wecker ist ein anderer.
+    ///
+    /// Rueckgabe: **war der Grund gesetzt?** Nicht „aufloesbar" — dieselbe Unterscheidung wie bei
+    /// [`debug_continue`](Self::debug_continue), und sie traegt hier den Abbruch: `abort_freeze`
+    /// ruft blind fuer jeden Thread der PD, und nur die tatsaechlich Eingefrorenen sind ein
+    /// Ereignis.
+    pub fn thaw_group(&mut self, tid: ThreadId) -> bool {
+        let Some(s) = self.resolve(tid) else {
+            return false;
+        };
+        if !self.tcbs[s].reasons.has(BlockReasons::FREEZE) {
+            return false;
+        }
+        self.tcbs[s].reasons.remove(BlockReasons::FREEZE);
+        self.wecke_falls_lauffaehig(s);
+        true
+    }
+
+    /// Steht dieser Thread im Gruppenschnitt? (Urteilende Stellen, Telemetrie, Pruefpfade.)
+    pub fn is_group_frozen(&self, tid: ThreadId) -> bool {
+        self.resolve(tid)
+            .is_some_and(|s| self.tcbs[s].reasons.has(BlockReasons::FREEZE))
+    }
+
+    /// Wie viele Threads dieses Kerns stehen im Gruppenschnitt? (Sprechprobe der `pdfreeze`-Zeile:
+    /// ein Pruefer, der ueber die Wirkung eines Schnitts urteilt, muss belegen koennen, dass
+    /// ueberhaupt geschnitten wurde.)
+    pub fn group_frozen_count(&self) -> usize {
+        (0..self.tcbs.len())
+            .filter(|&s| self.tcbs[s].used && self.tcbs[s].reasons.has(BlockReasons::FREEZE))
+            .count()
+    }
+
+    /// **Alle lebenden Threads dieses Kerns aufzaehlen** — der Rohstoff der Gruppenbildung.
+    ///
+    /// Bewusst **ohne** PD-Filter: die Zuordnung Thread → PD steht in der PD-Tabelle unter `CAPS`,
+    /// und `CAPS` waehrend einer gehaltenen Scheduler-Sperre zu nehmen kehrt die Sperrordnung um
+    /// (R0 innerhalb von R2). Der Aufrufer sammelt hier, gibt die Sperre frei und filtert danach.
+    ///
+    /// **Der Ueberlauf ist BENANNT** (D11): passt die Menge nicht, gibt es `Err(gebraucht)` und
+    /// keine gekuerzte Liste. Eine stillschweigend abgeschnittene Gruppe waere ein halber Schnitt
+    /// — und ein halber Schnitt ist der Zustand, gegen den dieser ganze Strang gebaut ist.
+    pub fn live_thread_ids(&self, out: &mut [ThreadId]) -> Result<usize, usize> {
+        let gebraucht = (0..self.tcbs.len()).filter(|&s| self.tcbs[s].used).count();
+        if gebraucht > out.len() {
+            return Err(gebraucht);
+        }
+        let mut n = 0;
+        for s in 0..self.tcbs.len() {
+            if self.tcbs[s].used {
+                out[n] = self.id(s);
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// Wie viele Threads dieses Kerns sind **gebunden**? (Sprechprobe: ein Prüfer, der über
     /// Abwesenheit einer Umleitung urteilt, muss belegen können, dass überhaupt gebunden wurde.)
     pub fn handler_bound_count(&self) -> usize {
@@ -1514,6 +1787,15 @@ impl Scheduler {
         // aenderte damit den Lastausgleich in einer Weise, die hier niemand gemessen hat. D8 ist
         // der Beleg, dass die breitere Behebung die schlechtere sein kann.
         if self.tcbs[s].reasons.has(BlockReasons::DEBUG) {
+            return None;
+        }
+        // **Und ein Thread im Gruppenschnitt ebensowenig** (Z23/S3) — aus demselben Grund, nur mit
+        // schaerferer Folge. Der Schnitt laeuft die TCB-Tabelle **je Kern** unter dessen Sperre
+        // und prueft danach, ob noch jemand auf einem Kern steht. Ein Teilnehmer, der waehrend des
+        // Durchlaufs von einem besuchten auf einen unbesuchten Kern wandert, wuerde von keinem der
+        // beiden gesehen: die Gruppe waere **halb** eingefroren, und die Zusicherung des Schnitts
+        // ist genau, dass es diesen Zustand nicht gibt.
+        if self.tcbs[s].reasons.has(BlockReasons::FREEZE) {
             return None;
         }
         let was_ready = self.tcbs[s].queued != NOT_QUEUED;
@@ -2238,6 +2520,23 @@ impl Scheduler {
 /// Kernel schlägt den Besitzer im Directory nach und prüft nach dem Sperren erneut.
 pub trait SchedOps {
     fn current_id(&mut self, core: usize) -> ThreadId;
+
+    /// **Den Thread-Pointer eines Threads setzen** (TLS, T2). `false` = Thread ungueltig.
+    ///
+    /// Ueber die Fassade, weil der Zielthread auf einem **anderen Kern** liegen kann: der Dispatch
+    /// weiss nur, wer gerade laeuft, nicht, wessen Scheduler-Instanz zu sperren ist.
+    fn set_tls(&mut self, tid: ThreadId, va: usize) -> bool;
+
+    /// **Die Rate der monotonen Uhr** in Zaehlschritten je Sekunde (A1).
+    ///
+    /// Ueber die Fassade, weil `caprock-microkit` die Plattformuhr nicht kennt und nicht kennen
+    /// soll -- die Eichung passiert in der HAL, und eine zweite Quelle dafuer waere genau die
+    /// Klasse, gegen die `iova_window_clear_of_msi` steht.
+    /// **Eine Frist fuer den laufenden Thread scharfstellen** (A2) -- `ticks == 0` entwaffnet.
+    fn frist_setzen(&mut self, core: usize, ticks: u64, grund: u16);
+    fn clock_hz(&mut self) -> u64;
+    /// Der aktuelle Stand derselben Uhr.
+    fn clock_now(&mut self) -> u64;
     fn frame_of(&mut self, tid: ThreadId) -> Option<usize>;
     fn block_current(&mut self, core: usize, frame: usize) -> usize;
     fn switch_to(&mut self, core: usize, frame: usize, target: ThreadId) -> usize;

@@ -208,6 +208,30 @@ TCB_AUSSERHALB = {
     'sp':          'gesicherter Trap-Frame -- Kontextwechsel liegt im HAL-TCB',
     'stack_base':  'Rueckgewinnung beim Beenden (Zombie/Reap, nicht modelliert)',
     'stack_len':   'dito',
+    # TLS/T1, 2026-08-27. **Der Scheduler TRAEGT diese Zahl, er interpretiert sie nie.**
+    #
+    # Sie geht in kein Praedikat ein: nicht in `runnable`, nicht in die Ready-Queue, nicht in die
+    # Budgetrechnung. `set_tls` schreibt sie, `tls_of` liest sie, und `sync_tls` im Kernel spiegelt
+    # sie in ein Register -- alle drei ohne Bezug zu einer Einplanungsentscheidung. Ein Modellfeld
+    # daraus zu machen hiesse, dem Beweis etwas zu zeigen, worueber er nichts sagen kann.
+    #
+    # **Was das NICHT heisst:** dass der Wert unkritisch waere. Er erreicht ein `WRMSR`, und ein
+    # nicht-kanonischer Wert faultet dort in Ring 0. Diese Zusicherung traegt aber die
+    # ABI-Schranke (`caprock_abi::USER_VA_TOP`, geprueft im Dispatch), nicht der Scheduler-Beweis
+    # -- und sie ist gefahren (`tls`-Zeile, Konjunkt `schranke-beisst`, Gegenprobe M4).
+    'tls':         'Thread-Pointer -- vom Scheduler getragen, nie interpretiert (TLS/T1)',
+    # A2, 2026-08-27. **Ausserhalb, weil das Modell KEINE ZEIT kennt** -- und das ist eine
+    # Feststellung ueber das Modell, keine ueber die Harmlosigkeit dieser Felder.
+    #
+    # Anders als `tls` werden sie sehr wohl interpretiert: `fristen_faellig` entfernt anhand von
+    # `frist_grund` einen Blockadegrund. Der EFFEKT ist damit derselbe wie bei `unpark` oder
+    # `refill_depleted` -- was sich nicht abbilden laesst, ist der AUSLOESER, denn `now` ist im
+    # Modell kein Begriff.
+    #
+    # Das ist die unbepreiste Groesse aus `docs/linux-kompatibilitaet-caprock.md` §5, und sie steht
+    # hier als **Schuld** und nicht als Erledigung (todo A2v).
+    'frist':       'absolute Frist in Ticks -- das Modell kennt keine Zeit (A2, SCHULD: todo A2v)',
+    'frist_grund': 'dito -- der Grund, den die Frist entfernen darf',
     'qnext':       'intrusive Verkettung -- das Modell hat ein Flag statt einer Liste',
     'qprev':       'dito',
     'period':      'MCS-Periodenlaenge -- das Modell kennt keine Zeit',
@@ -300,6 +324,15 @@ CODE_PRIMITIV = {
 }
 CODE_AUSSERHALB = {
     'init_core':            'Idle-Thread beim Hochlauf -- kein Uebergang im Modell',
+    # A2, 2026-08-27. Der **Effekt** ist der eines Weckers, den das Modell kennt: genau einen Grund
+    # entfernen und bei leerer Menge einreihen -- woertlich `unpark`. Was fehlt, ist der Ausloeser:
+    # eine Frist ist eine Aussage ueber ZEIT, und die gibt es im Modell nicht.
+    #
+    # Als Partner von `unblock` einzutragen waere die bequeme Fassung und eine **Behauptung**: der
+    # Beweis kann nicht pruefen, dass die Frist genau dann feuert, wenn sie soll. Deshalb steht es
+    # ausserhalb -- **mit Schuld**, nicht als erledigt (todo A2v).
+    'fristen_faellig':      'A2: Wecker mit Zeit-Ausloeser. Effekt = unpark, Ausloeser nicht '
+                            'modellierbar (SCHULD: todo A2v)',
     # Z24: `block_current` steht hier NICHT -- es ist eine duenne Huelle um `block_current_mit`
     # und schreibt selbst nichts. Ein Eintrag „vorsichtshalber" waere genau der veraltete
     # Registereintrag, den dieser Waechter schon zweimal an sich selbst gemeldet hat (D0:
@@ -375,6 +408,29 @@ CODE_AUSSERHALB = {
                             'Verifiziererthread); entfernt ihn und reiht bei leerer Menge ein. '
                             'Das Modell kennt keine Gruende, nur EIN `blocked` -- also kein '
                             'Uebergang, den man nachtragen koennte',
+    # Z6b, 2026-08-19 -- NACHGETRAGEN am 2026-08-21, und das Nachtragen ist selbst der Befund:
+    # die drei standen seit dem Debugger-Umbau nicht hier, der Waechter meldete sie also seit
+    # zwei Tagen -- **und niemand sah es, weil ihn kein laufendes Gatter faehrt**. Er haengt
+    # allein an `tools/verus-verify.sh`; die Abnahme faehrt `host-tests.sh`, und dort laeuft nur
+    # der IPC-Waechter. Dieselbe Klasse wie `.gitea/workflows` auf einem GitLab-Server und wie
+    # „aarch64 wurde gebaut und nie gebootet": ein Gatter, das existiert und nicht gefahren wird,
+    # ist keins. Seit dem 2026-08-21 ruft `host-tests.sh` ihn mit.
+    'debug_stop':           'Z6b: setzt den DEBUG-Grund und reiht aus. Das Modell kennt keine '
+                            'Gruende, nur EIN `blocked` -- und die tragende Aussage ist gerade, '
+                            'dass diese Blockade NICHT von einem beliebigen Wecker faellt',
+    'debug_continue':       'Z6b: der EINE Wecker des DEBUG-Grundes neben der Cap-Finalisierung. '
+                            'Dito -- was das Modell hier gaebe, waere ein Beweis der Wunschform',
+    'debug_release_pd':     'Z6b: die Freigabe der Cap-Finalisierung, ueber alle Threads einer PD. '
+                            'Das Modell kennt weder PDs noch Caps -- kein Uebergang, den man '
+                            'nachtragen koennte',
+    # Z23/S3, 2026-08-21.
+    'freeze_group':         'Z23/S3: nimmt einen Thread in den Gruppenschnitt auf (FREEZE) und '
+                            'reiht ihn aus. Das Modell kennt keine Gruende und keine PDs -- und '
+                            'die Aussage des Schnitts („entweder alle oder keiner") ist eine ueber '
+                            'eine MENGE von Threads, die ein Einkern-Modell ohne PD-Begriff nicht '
+                            'formulieren kann',
+    'thaw_group':           'Z23/S3: der EINZIGE Wecker des FREEZE-Grundes -- Auftauen und Abbruch '
+                            'benutzen dieselbe Zeile. Dito',
 }
 
 # [3] Die Paare Modell <-> Code samt eingefrorener Uebertragungsluecke.

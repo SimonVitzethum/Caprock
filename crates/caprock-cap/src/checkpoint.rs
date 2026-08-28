@@ -41,8 +41,15 @@ use crate::object::ObjectKind;
 #[derive(Clone, Copy)]
 pub struct Scope<'a> {
     /// Endpoints, deren beide Seiten Teil des Checkpoints sind.
+    ///
+    /// **Bis 2026-08-25 war dieser Satz eine BEHAUPTUNG des Aufrufers** und wurde nie gegen den
+    /// IPC-Zustand der Maschine gehalten: [`classify`] hat die Zahl gelesen und die Cap
+    /// durchgelassen, und ein an diesem Endpoint blockierter Client, der zurueckbleibt, kam
+    /// nirgends vor. Seit Z4d Stufe 1 prueft [`classify_cut`] ihn — die Liste sagt weiterhin, was
+    /// mitwandern *soll*, und die beobachteten [`Edge`]s sagen, wer wirklich dort steht.
     pub endpoints: &'a [u32],
-    /// Notifications, deren Signalgeber und Empfänger mitwandern.
+    /// Notifications, deren Signalgeber und Empfänger mitwandern. Dieselbe Pruefung wie bei
+    /// [`Self::endpoints`], und **ein eigener Namensraum**: eine 3 hier deckt keine 3 dort.
     pub notifications: &'a [u32],
     /// Threads (gepacktes `ThreadId`-Raw), die mitwandern.
     pub threads: &'a [u64],
@@ -56,6 +63,15 @@ impl Scope<'_> {
     /// Das ist die Stufe-1-Wahl aus Z4d („Migration nur ohne offene Transaktionen — einfach,
     /// ehrlich, wahrscheinlich richtig") und zugleich die sicherste Vorgabe: mit leerem Umfang
     /// verweigert [`classify`] jede Beziehungs-Cap, statt sie ins Leere zeigen zu lassen.
+    ///
+    /// **Und genau das hat die halbe Regel jahrelang verdeckt.** Weil hier nichts drinsteht, war
+    /// „ein Endpoint im Umfang, dessen Partner draussen bleibt" von der einzigen Aufrufstelle aus
+    /// gar nicht erreichbar — der ungeprueft gebliebene Fall sah aus wie ein Fall, den es nicht
+    /// gibt. Er entsteht in dem Moment, in dem ein Umfang seinen ersten Endpoint nennt.
+    ///
+    /// **Das Subjekt steht NICHT in `threads`**, sondern wird [`classify_cut`] getrennt genannt.
+    /// Ein Aufrufer darf es trotzdem eintragen (die Aufrufstelle im Kernel tut es), damit die
+    /// Menge „wer wandert" an einer Stelle vollstaendig zu lesen ist.
     pub const EMPTY: Scope<'static> = Scope {
         endpoints: &[],
         notifications: &[],
@@ -120,6 +136,14 @@ pub enum LocalReason {
     /// Der Umfang wird deshalb gar nicht erst befragt, wie bei `HandlerBinding` und anders als bei
     /// `PdControl`: hier waere auch der geprüfte Grund der falsche.
     DebugAuthority,
+    /// **Eine Zahl DIESER Maschine** (Z23/S4): eine Kernnummer, ein Zyklenstempel.
+    ///
+    /// Sie zeigt drueben auf einen anderen Kern oder auf gar keinen, und ein Zyklenwert gehoert zu
+    /// **diesem** Zaehler. Eigener Grund und nicht `DeviceWindow`, obwohl beides „maschinenlokal"
+    /// heisst: ein Geraetefenster ist drueben **nicht herstellbar**, eine Kernaffinitaet dagegen
+    /// **entsteht drueben neu**. Wer die beiden gleich behandelt, sucht an der falschen Stelle —
+    /// dieselbe Begruendung, aus der `LocalReason` ueberhaupt aufgeschluesselt ist.
+    MachineLocalNumber,
 }
 
 /// Eine Vorbedingung, die auf der **Zielmaschine** gelten muss (Z4f).
@@ -264,6 +288,172 @@ pub fn classify_all(
         }
     }
     Ok(())
+}
+
+// ================================================================================================
+// Z4d stage 1: an open transaction must not cross the cut
+// ================================================================================================
+//
+// [`classify`] decides per CAP. For the question Z4d asks that is not enough, and the gap is not
+// academic. [`Scope::endpoints`] is documented as "endpoints whose BOTH sides are part of the
+// checkpoint" — but it is a list the caller wrote down, and until now nothing ever held it against
+// the IPC state the machine is actually in. A named endpoint was **believed**; a client blocked at
+// it who stays behind was never looked at.
+//
+// That is this repository's oldest failure shape in a new place: `ep_inv` "hielt nicht der Typ,
+// sondern die Aufrufdisziplin", and a guard "prueft die EXISTENZ eines Grundes, nie seine
+// WAHRHEIT". `Scope::EMPTY` hid it — with an empty scope every relationship cap is refused, so the
+// unchecked half was unreachable from the only call site. An unreachable hole is still a hole, and
+// the moment a scope names its first endpoint it becomes a reachable one.
+//
+// ## The rule, and it is an EQUIVALENCE
+//
+// For every role a thread actually holds at a channel:
+//
+// ```text
+//     the channel migrates   <=>   the thread holding that role migrates
+// ```
+//
+// Both directions are refusals, and they are **different** refusals — the same reason `LocalReason`
+// is broken up at all. "The participant migrates, his channel stays" is Z4d verbatim: a thread with
+// an open `CALL` leaves a waiting server behind. "The channel migrates, this participant stays" is
+// the other half, and it is the one nobody had written down: the endpoint travels, and the client
+// blocked at it waits forever on a rendezvous point that is no longer on this machine.
+//
+// **No role is exempt, and that is deliberate.** A thread waiting in `RECV` has no partner
+// ([`Endpoint::partner_of`](../../caprock_ipc/struct.Endpoint.html#method.partner_of) returns
+// `None` for it, and inventing one would be worse than naming none) — so the tempting reading is
+// that letting it travel harms nobody. It harms itself: after the move it waits on a channel it no
+// longer has, and no wakeup can ever reach it. Same for the mirror case. One rule, no exceptions,
+// no list of special cases to keep in step.
+//
+// ## Why the edges are a FINDING and not an argument
+//
+// An [`Edge`] is what the kernel **observed** at a channel, not what the caller intends. That
+// separation is the whole point: the scope is the claim, the edges are the measurement, and this
+// module holds one against the other. A caller who could pass the edges he wishes for would be
+// back at believing his own list.
+
+/// A channel of this machine — the two kinds a thread can block on.
+///
+/// The id is a **local** table index and never enters the external representation; like the lists
+/// in [`Scope`] it exists only to decide. What crosses the machine boundary is
+/// [`ExternKind::Endpoint`] with its `scope_index`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Channel {
+    /// An endpoint (synchronous rendezvous).
+    Endpoint(u32),
+    /// A notification (asynchronous badge).
+    Notification(u32),
+}
+
+/// The role a thread holds at a channel — the four of [`crate::checkpoint`]'s counterpart
+/// `Quiescence`, spelled out one per edge instead of merged into a bit set.
+///
+/// One edge per role, not one edge per thread: a refusal that says *which* role crosses the cut is
+/// a diagnosis, and one that says "something crosses" is not. The rule below does not read this
+/// field — it decides on the two memberships alone — but the refusal names the edge, and the edge
+/// names the role.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EdgeRole {
+    /// Blocked sender: has issued `CALL`, no server has taken it yet.
+    Sender,
+    /// Blocked receiver: waiting in `RECV` (or in `WAIT` at a notification).
+    Receiver,
+    /// Waiting as a caller for a reply — the reply token points at him.
+    Caller,
+    /// Owes a reply as a server.
+    ReplyOwner,
+}
+
+/// **One observed role at one channel.** The measurement the cut rule judges.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Edge {
+    /// Where the role is held.
+    pub channel: Channel,
+    /// Who holds it — a packed `ThreadId` raw value, the same encoding as [`Scope::threads`].
+    pub thread: u64,
+    /// Which of the four roles.
+    pub role: EdgeRole,
+}
+
+/// **Why an open relationship forbids this cut** (Z4d stage 1).
+///
+/// Two reasons and not one `false`, because they call for opposite fixes: the first is repaired by
+/// taking the channel into the scope, the second by taking the peer into it — or by waiting for his
+/// transaction to finish. A caller who treats them alike looks in the wrong place, which is exactly
+/// why [`LocalReason`] is broken up too.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CutRefusal {
+    /// **The participant migrates, his channel stays behind.** Z4d verbatim: a thread with an open
+    /// `CALL` leaves a waiting server, a thread in `RECV` leaves itself waiting on nothing.
+    ChannelNotInScope,
+    /// **The channel migrates, this participant stays behind.** The half that had no name: the
+    /// rendezvous point leaves the machine and whoever blocks at it never hears from it again.
+    PeerNotInScope,
+}
+
+/// Does this thread travel? The subject travels by definition — everything else must be listed.
+fn thread_in_scope(thread: u64, subject: u64, scope: &Scope) -> bool {
+    thread == subject || scope.threads.contains(&thread)
+}
+
+/// Does this channel travel?
+fn channel_in_scope(channel: Channel, scope: &Scope) -> bool {
+    match channel {
+        Channel::Endpoint(id) => scope.endpoints.contains(&id),
+        Channel::Notification(id) => scope.notifications.contains(&id),
+    }
+}
+
+/// **Does this one observed role survive the cut?** `None` means it does.
+///
+/// The fourth case — neither end travels — is **not** a refusal. Two strangers holding a
+/// transaction with each other are none of this checkpoint's business, and refusing them would make
+/// every checkpoint on a busy machine impossible. The kernel does not normally hand such edges in;
+/// the rule stays total anyway, because a rule with an unhandled case is decided by whoever calls
+/// it.
+pub fn classify_edge(edge: &Edge, subject: u64, scope: &Scope) -> Option<CutRefusal> {
+    match (
+        channel_in_scope(edge.channel, scope),
+        thread_in_scope(edge.thread, subject, scope),
+    ) {
+        (true, true) | (false, false) => None,
+        (false, true) => Some(CutRefusal::ChannelNotInScope),
+        (true, false) => Some(CutRefusal::PeerNotInScope),
+    }
+}
+
+/// **Is the cut clean?** `Ok(())`, or the first edge that crosses it and why.
+///
+/// The **index** comes back with the reason for the same reason [`classify_all`] returns the slot:
+/// "some relationship crosses the cut" is worthless as a diagnosis, and the index names channel,
+/// thread and role at once.
+pub fn classify_cut(
+    subject: u64,
+    edges: &[Edge],
+    scope: &Scope,
+) -> Result<(), (usize, CutRefusal)> {
+    for (i, e) in edges.iter().enumerate() {
+        if let Some(r) = classify_edge(e, subject, scope) {
+            return Err((i, r));
+        }
+    }
+    Ok(())
+}
+
+/// **Why no checkpoint was built.**
+///
+/// Two shapes and not one, because a cap refusal and a cut refusal are answered differently: the
+/// first is a property of the Cspace and does not change by waiting, the second may dissolve on its
+/// own as soon as the transaction completes. Flattening them would tell a caller to wait for
+/// something that never moves, or to give up on something that would have been ready in a tick.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BuildRefusal {
+    /// A cap of the Cspace must not travel — slot and reason (Z4b).
+    Cap(usize, LocalReason),
+    /// An open IPC relationship crosses the cut — edge index and reason (Z4d stage 1).
+    Cut(usize, CutRefusal),
 }
 
 // ================================================================================================
@@ -453,6 +643,22 @@ impl Image {
     /// Das ist die Richtung, die zählt: nicht „speichern und drüben sehen, was passt", sondern
     /// **die Absage vor dem Speichern**. Ein Checkpoint, der eine MMIO-Cap enthält, ist auf der
     /// Zielmaschine eine Rechteausweitung mit Reisepass.
+    ///
+    /// ## The second gate: `subject` and `edges` (Z4d stage 1)
+    ///
+    /// Caps are only half the question. The other half is the IPC state the machine is in, and it
+    /// belongs **here**, in the artifact — not in whoever calls this. Until 2026-08-25 the
+    /// stage-1 promise ("migration only without open transactions") rested entirely on the caller
+    /// having called `freeze_thread` first and honoured its answer: a property held by call
+    /// discipline, which is precisely how `ep_inv` once looked green while proving nothing. A
+    /// caller who forgets the freeze got a checkpoint, and the thread on the other end of his open
+    /// `CALL` was never mentioned.
+    ///
+    /// So `build` now asks for the **observed** edges as well and refuses on the first one that
+    /// crosses the cut ([`classify_cut`]). Passing an empty slice is not a way around it — it is a
+    /// claim that nothing was observed, and it is the caller's claim to make, and wrong on a
+    /// machine where something was. The kernel-side collector says how many edges it looked at, and
+    /// the check line prints that number: **an empty run is not a test result.**
     pub fn build(
         kernel_hash: [u8; 32],
         progress: u64,
@@ -460,8 +666,11 @@ impl Image {
         epoch: u64,
         kinds: &[Option<ObjectKind>],
         scope: &Scope,
-    ) -> Result<Image, (usize, LocalReason)> {
-        classify_all(kinds, scope)?;
+        subject: u64,
+        edges: &[Edge],
+    ) -> Result<Image, BuildRefusal> {
+        classify_all(kinds, scope).map_err(|(s, r)| BuildRefusal::Cap(s, r))?;
+        classify_cut(subject, edges, scope).map_err(|(i, r)| BuildRefusal::Cut(i, r))?;
         let mut img = Image {
             kernel_hash,
             progress,
@@ -480,7 +689,7 @@ impl Image {
                         // Checkpoint mit weniger Autorität als der Thread hatte, bricht drüben
                         // an einer Stelle, die niemand mit dem Speichern in Verbindung bringt.
                         // Derselbe Befund wie der fehlende Endowment-Slot beim Hot-Reload.
-                        return Err((slot, LocalReason::PeerNotInScope));
+                        return Err(BuildRefusal::Cap(slot, LocalReason::PeerNotInScope));
                     }
                     img.caps[img.cap_count] = Some(kind);
                     img.cap_count += 1;
@@ -491,7 +700,7 @@ impl Image {
                 // Kann nicht auftreten -- `classify_all` oben hat schon abgebrochen. Trotzdem
                 // behandelt: ein `unreachable!()` im Kern ist ein Panic, und ein Panic hier
                 // hinge an einer Eingabe von der Platte.
-                Transfer::Refused(r) => return Err((slot, r)),
+                Transfer::Refused(r) => return Err(BuildRefusal::Cap(slot, r)),
             }
         }
         Ok(img)
@@ -608,6 +817,171 @@ impl Image {
         Ok(img)
     }
 }
+
+
+// ================================================================================================
+// Z23/S4: derselbe Mechanismus, angewandt auf THREADZUSTAND
+// ================================================================================================
+//
+// Bis hierher klassifiziert dieses Modul **Caps**. S4 verlangt nichts Neues, sondern dieselbe Regel
+// eine Ebene tiefer: *was drueben nicht dasselbe bezeichnen kann, wandert nicht mit — und wird
+// **benannt** abgewiesen.* Ein neues Verfahren zu erfinden waere der Fehler; `classify` gibt es.
+//
+// **Warum das VOR dem Migrationscode steht.** Heute wandert nichts: `Image` traegt `progress`,
+// `nonce`, `epoch`, `caps` — eine Anwendungsgroesse und die Cap-Klassifikation. Kein Trap-Frame,
+// keine Register, kein Stack. „Resume-Latenz" und „Live-Migration" haben damit **kein messbares
+// Objekt**, und eine Zahl darauf misst etwas anderes, als „Resume" in einer PaaS-Zusage bedeutet.
+// Die Aufzaehlung hier ist die Voraussetzung dafuer, dass es eines geben kann.
+
+/// **Ein Stueck Threadzustand.** Geschlossene Aufzaehlung — und das ist der ganze Zweck: eine Liste,
+/// die man vergessen kann, ist keine. Ein neues Feld im TCB, das hier fehlt, faellt beim
+/// `match` auf, nicht beim ersten Thaw mit falschen Registern.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ThreadStatePart {
+    /// Trap-Frame: Allzweckregister, PC, SP, Flags — **und der Ring** (`cs`/`ss` bzw. `spsr`).
+    Registers,
+    /// **Der FP-Zustand** — und er liegt seit dem Eager-Umbau im `FP_STATES`-Slot, **nicht** im
+    /// Trap-Frame. Wird er nicht genannt, wandert ein Thread **ohne seine XMM** und rechnet nach
+    /// dem Thaw mit fremden oder genullten Registern weiter: der stille Registerverlust, nur ueber
+    /// die Bootgrenze.
+    FpState,
+    /// Der Stackinhalt.
+    Stack { len: u64 },
+    /// Prioritaet.
+    Priority,
+    /// MCS-Konto: Budget, Periode, Rest.
+    Account,
+    /// **Der Blockadegrund** (die Grund-Menge aus Z24). Ohne ihn liefe ein Thread drueben los, der
+    /// hier auf etwas wartet — oder bliebe liegen, ohne dass jemand seinen Wecker kennt.
+    BlockReasons,
+    /// **Die Park-Weckmarke** — die Schuld aus Z22 P4. Sie ist kein Grund, sondern eine Marke, und
+    /// genau deshalb faellt sie beim Aufzaehlen der Gruende durchs Raster.
+    ParkWake,
+    /// Ein offenes Reply-Token, ueber den Platz im Umfang bezeichnet.
+    ReplyToken { endpoint: u32 },
+    /// Anstehende Notification-Badges.
+    PendingBadges,
+    /// Die Bindung an eine Persoenlichkeits-PD (Z26/A3).
+    HandlerBinding { handler_pd: u32 },
+    /// Kernaffinitaet — eine **Nummer dieser Maschine**.
+    CoreAffinity,
+    /// Der offene Zyklenstempel (B-5.1) — eine Zahl **dieses** Zaehlers.
+    CycleStamp,
+    /// Der Kernel-Stack des EL0-Threads (C4/C8).
+    KernelStack,
+}
+
+/// Das Ergebnis der Zustands-Klassifikation.
+///
+/// **`secret` ist die Entscheidung, die JETZT faellt und nicht spaeter implizit im
+/// Migrationscode.** Ein `Image` mit `progress` und Cap-Klassen war ein **Metadatum**; eines mit
+/// Registern, Stack und Speicherinhalt ist ein **Datentraeger**. Bei Migration verlaesst das Bild
+/// die Maschine — wer es lesen darf, wo es liegt, ob es ruhend verschluesselt ist, ist dieselbe
+/// Sorte Entscheidung wie `SVT`/`SID` bei der IRTE: Autoritaet, vorab zu spezifizieren.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ThreadTransfer {
+    /// Wandert mit. `secret` heisst: dieses Stueck kann Schluesselmaterial enthalten.
+    Portable {
+        secret: bool,
+        precondition: Option<Precondition>,
+    },
+    /// Wandert **nicht** mit, mit Grund.
+    Refused(LocalReason),
+}
+
+impl ThreadTransfer {
+    pub fn is_portable(&self) -> bool {
+        matches!(self, ThreadTransfer::Portable { .. })
+    }
+    /// Traegt dieses Stueck Geheimnisse?
+    pub fn is_secret(&self) -> bool {
+        matches!(self, ThreadTransfer::Portable { secret: true, .. })
+    }
+}
+
+/// **Darf dieses Stueck Threadzustand mitwandern?**
+///
+/// **Fail-closed wie [`classify`]:** was hier nicht ausdruecklich als uebertragbar aufgefuehrt ist,
+/// wird verweigert. Weil die Aufzaehlung geschlossen ist, gibt es diesen Fall im `match` gar nicht
+/// — der Compiler erzwingt die Entscheidung beim naechsten neuen Feld.
+pub fn classify_thread_part(part: &ThreadStatePart, scope: &Scope) -> ThreadTransfer {
+    use ThreadStatePart as P;
+    match *part {
+        // **Register tragen Geheimnisse** — und der FP-Zustand ist genau das Material,
+        // dessentwegen der Eager-Umbau beschlossen wurde.
+        P::Registers | P::FpState => ThreadTransfer::Portable {
+            secret: true,
+            precondition: None,
+        },
+        P::Stack { .. } | P::KernelStack => ThreadTransfer::Portable {
+            secret: true,
+            precondition: None,
+        },
+        P::Priority | P::BlockReasons | P::ParkWake | P::PendingBadges => {
+            ThreadTransfer::Portable {
+                secret: false,
+                precondition: None,
+            }
+        }
+        // Dieselbe Vorbedingung wie bei der SchedContext-Cap, und aus demselben Grund: die Zahlen
+        // sind **Ticks**, und ein Tick bedeutet auf einer anderen Maschine etwas anderes.
+        P::Account => ThreadTransfer::Portable {
+            secret: false,
+            precondition: Some(Precondition::SameTickSemantics),
+        },
+        // Beziehungen: nur, wenn die Gegenseite im Umfang liegt -- woertlich die Regel aus
+        // `classify`. Ein Reply-Token ins Leere laesst drueben einen Aufrufer haengen.
+        P::ReplyToken { endpoint } => match position(scope.endpoints, endpoint) {
+            Some(_) => ThreadTransfer::Portable {
+                secret: false,
+                precondition: None,
+            },
+            None => ThreadTransfer::Refused(LocalReason::PeerNotInScope),
+        },
+        P::HandlerBinding { handler_pd } => match position(scope.pds, handler_pd) {
+            Some(_) => ThreadTransfer::Portable {
+                secret: false,
+                precondition: None,
+            },
+            None => ThreadTransfer::Refused(LocalReason::PdNotInScope),
+        },
+        // **Nummern dieser Maschine.** Eine Kernnummer bezeichnet drueben einen anderen Kern (oder
+        // keinen); ein Zyklenstempel gehoert zu diesem Zaehler. Beides ist kein Mangel, sondern
+        // etwas, das drueben **neu entsteht** -- und deshalb eine Absage mit Grund und kein
+        // stillschweigendes Weglassen.
+        P::CoreAffinity => ThreadTransfer::Refused(LocalReason::MachineLocalNumber),
+        P::CycleStamp => ThreadTransfer::Refused(LocalReason::MachineLocalNumber),
+    }
+}
+
+/// **Traegt ein Bild aus diesen Teilen Geheimnisse?**
+///
+/// Die Regel, die ab sofort im Plan steht: *Bild enthaelt Registerzustand ⇒ vertraulich; Ablage-
+/// und Transportregel steht, bevor gebaut wird.* Diese Funktion ist die maschinenlesbare Fassung —
+/// eine Regel in Prosa hat kein Gatter.
+pub fn image_is_confidential(parts: &[ThreadStatePart], scope: &Scope) -> bool {
+    parts
+        .iter()
+        .any(|p| classify_thread_part(p, scope).is_secret())
+}
+
+/// **Die vollstaendige Liste** dessen, was ein Bild mit Threadzustand tragen muss.
+///
+/// Sie steht hier und nicht im Migrationscode, damit die Frage „ist etwas vergessen worden?" **eine**
+/// Antwort hat. `ReplyToken` und `HandlerBinding` fehlen bewusst: sie tragen eine ID und lassen sich
+/// nicht ohne Kontext auffuehren -- der Aufrufer haengt sie an.
+pub const THREAD_STATE_PARTS: [ThreadStatePart; 10] = [
+    ThreadStatePart::Registers,
+    ThreadStatePart::FpState,
+    ThreadStatePart::Stack { len: 0 },
+    ThreadStatePart::KernelStack,
+    ThreadStatePart::Priority,
+    ThreadStatePart::Account,
+    ThreadStatePart::BlockReasons,
+    ThreadStatePart::ParkWake,
+    ThreadStatePart::PendingBadges,
+    ThreadStatePart::CoreAffinity,
+];
 
 #[cfg(test)]
 mod tests {
@@ -769,6 +1143,11 @@ mod tests {
     const K1: [u8; 32] = [0x11; 32];
     const K2: [u8; 32] = [0x22; 32];
 
+    /// The migrating thread of the format tests. They are about bytes, not about relationships —
+    /// so they hand in a subject and **no** edges, which is the honest claim "nothing was observed
+    /// here", not a way past the gate.
+    const SUBJ: u64 = 7;
+
     fn bau(progress: u64, nonce: u64) -> Image {
         Image::build(
             K1,
@@ -780,6 +1159,8 @@ mod tests {
                 Some(ObjectKind::SchedContext { budget: 4, period: 10 }),
             ],
             &Scope::EMPTY,
+            SUBJ,
+            &[],
         )
         .expect("beide Caps sind uebertragbar")
     }
@@ -902,12 +1283,12 @@ mod tests {
             }),
         ];
         assert_eq!(
-            Image::build(K1, 1, 2, 1, &kinds, &Scope::EMPTY),
-            Err((1, LocalReason::DmaRegion))
+            Image::build(K1, 1, 2, 1, &kinds, &Scope::EMPTY, SUBJ, &[]),
+            Err(BuildRefusal::Cap(1, LocalReason::DmaRegion))
         );
         // Und die Gegenprobe: ohne sie entsteht einer. Sonst belegte die Absage nur, dass
         // `build` ueberhaupt fehlschlagen kann.
-        assert!(Image::build(K1, 1, 2, 1, &kinds[..1], &Scope::EMPTY).is_ok());
+        assert!(Image::build(K1, 1, 2, 1, &kinds[..1], &Scope::EMPTY, SUBJ, &[]).is_ok());
     }
 
     /// Ein zu kleiner Zielpuffer ist ein eigener Ausgang — kein halb geschriebener Checkpoint.
@@ -926,5 +1307,265 @@ mod tests {
     fn crc32_ist_der_uebliche() {
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
         assert_eq!(crc32(b""), 0);
+    }
+
+    // -- Z23/S4: Threadzustand ------------------------------------------------------------------
+
+    #[test]
+    fn fp_zustand_ist_aufgezaehlt_und_geheim() {
+        // Die Zeile, um die es geht: der FP-Zustand liegt seit dem Eager-Umbau NICHT im
+        // Trap-Frame. Faellt er aus der Liste, wandert ein Thread ohne seine XMM.
+        assert!(THREAD_STATE_PARTS.contains(&ThreadStatePart::FpState));
+        assert!(classify_thread_part(&ThreadStatePart::FpState, &Scope::EMPTY).is_secret());
+    }
+
+    #[test]
+    fn park_marke_ist_aufgezaehlt() {
+        // Die Schuld aus Z22 P4: sie ist kein GRUND, sondern eine MARKE -- und faellt deshalb beim
+        // Aufzaehlen der Gruende durchs Raster.
+        assert!(THREAD_STATE_PARTS.contains(&ThreadStatePart::ParkWake));
+        assert!(THREAD_STATE_PARTS.contains(&ThreadStatePart::BlockReasons));
+    }
+
+    #[test]
+    fn ein_bild_mit_registern_ist_vertraulich() {
+        assert!(image_is_confidential(
+            &[ThreadStatePart::Priority, ThreadStatePart::Registers],
+            &Scope::EMPTY
+        ));
+        // ... und eines ohne nicht. **Beide Richtungen**, sonst prueft der Test eine Konstante.
+        assert!(!image_is_confidential(
+            &[ThreadStatePart::Priority, ThreadStatePart::Account],
+            &Scope::EMPTY
+        ));
+    }
+
+    #[test]
+    fn die_volle_liste_ist_vertraulich() {
+        // Die praktische Folge: **jedes** vollstaendige Bild traegt Geheimnisse. Es gibt keinen
+        // Migrationsfall, in dem die Ablage- und Transportregel entfaellt.
+        assert!(image_is_confidential(&THREAD_STATE_PARTS, &Scope::EMPTY));
+    }
+
+    #[test]
+    fn maschinenlokale_zahlen_werden_benannt_abgewiesen() {
+        for p in [ThreadStatePart::CoreAffinity, ThreadStatePart::CycleStamp] {
+            assert_eq!(
+                classify_thread_part(&p, &Scope::EMPTY),
+                ThreadTransfer::Refused(LocalReason::MachineLocalNumber),
+                "{p:?} muss mit GRUND abgewiesen werden, nicht stillschweigend fehlen"
+            );
+        }
+    }
+
+    #[test]
+    fn beziehungen_haengen_am_umfang_und_zwar_in_beide_richtungen() {
+        let tok = ThreadStatePart::ReplyToken { endpoint: 7 };
+        // ohne Umfang: Absage mit Grund
+        assert_eq!(
+            classify_thread_part(&tok, &Scope::EMPTY),
+            ThreadTransfer::Refused(LocalReason::PeerNotInScope)
+        );
+        // mit Umfang: geht -- **die Positivkontrolle**. Ohne sie belegt die Absage nur, dass
+        // irgendetwas nicht ging.
+        let scope = Scope {
+            endpoints: &[7],
+            ..Scope::EMPTY
+        };
+        assert!(classify_thread_part(&tok, &scope).is_portable());
+        // und ein ANDERER Endpoint bleibt abgewiesen -- sonst waere „Umfang" ein Freibrief.
+        assert!(!classify_thread_part(
+            &ThreadStatePart::ReplyToken { endpoint: 8 },
+            &scope
+        )
+        .is_portable());
+    }
+
+    #[test]
+    fn das_konto_traegt_dieselbe_vorbedingung_wie_seine_cap() {
+        // Zwei Stellen, eine Aussage: die Zahlen sind Ticks. Liefen sie auseinander, waere die
+        // Cap uebertragbar und der Zustand nicht -- oder umgekehrt.
+        assert_eq!(
+            classify_thread_part(&ThreadStatePart::Account, &Scope::EMPTY),
+            ThreadTransfer::Portable {
+                secret: false,
+                precondition: Some(Precondition::SameTickSemantics)
+            }
+        );
+        assert_eq!(
+            classify(
+                &ObjectKind::SchedContext {
+                    budget: 1,
+                    period: 2
+                },
+                &Scope::EMPTY
+            ),
+            Transfer::Portable {
+                kind: ExternKind::SchedContext {
+                    budget: 1,
+                    period: 2
+                },
+                precondition: Some(Precondition::SameTickSemantics)
+            }
+        );
+    }
+    // -- Z4d stage 1: the cut ------------------------------------------------------------------
+
+    /// The migrating thread of the cut tests, and a peer that stays behind.
+    const MIGRANT: u64 = 100;
+    const BLEIBT: u64 = 200;
+
+    fn kante(ch: Channel, thread: u64, role: EdgeRole) -> Edge {
+        Edge { channel: ch, thread, role }
+    }
+
+    /// **Z4d verbatim.** A thread with an open `CALL` at an endpoint that stays behind leaves a
+    /// waiting server — and there is no scope size that makes it right except taking the channel
+    /// along.
+    #[test]
+    fn offener_call_ohne_seinen_kanal_wird_abgewiesen() {
+        let e = kante(Channel::Endpoint(3), MIGRANT, EdgeRole::Caller);
+        assert_eq!(
+            classify_edge(&e, MIGRANT, &Scope::EMPTY),
+            Some(CutRefusal::ChannelNotInScope)
+        );
+        // The positive control, and without it the refusal only shows that something failed:
+        // with the channel in scope the very same edge passes.
+        let mit = Scope { endpoints: &[3], ..Scope::EMPTY };
+        assert_eq!(classify_edge(&e, MIGRANT, &mit), None);
+    }
+
+    /// **The half that had no name.** The endpoint travels, a client blocked at it does not — and
+    /// he waits forever on a rendezvous point that left the machine. This is the case
+    /// `Scope::endpoints` merely *asserted* away ("endpoints whose both sides are part of the
+    /// checkpoint") and nobody ever checked.
+    #[test]
+    fn ein_kanal_ohne_seinen_teilnehmer_wird_abgewiesen() {
+        let mit = Scope { endpoints: &[3], ..Scope::EMPTY };
+        let fremd = kante(Channel::Endpoint(3), BLEIBT, EdgeRole::Sender);
+        assert_eq!(
+            classify_edge(&fremd, MIGRANT, &mit),
+            Some(CutRefusal::PeerNotInScope)
+        );
+        // ... and it is repaired by taking the peer along, not by anything else. That is why the
+        // two reasons are separate values.
+        let beide = Scope { endpoints: &[3], threads: &[BLEIBT], ..Scope::EMPTY };
+        assert_eq!(classify_edge(&fremd, MIGRANT, &beide), None);
+    }
+
+    /// **Two strangers are none of our business.** Neither end travels, so the transaction is not
+    /// cut. Refusing it would make a checkpoint impossible on any machine that is doing something.
+    #[test]
+    fn fremde_beziehung_geht_den_schnitt_nichts_an() {
+        let e = kante(Channel::Endpoint(9), BLEIBT, EdgeRole::ReplyOwner);
+        assert_eq!(classify_edge(&e, MIGRANT, &Scope::EMPTY), None);
+    }
+
+    /// **No role is exempt** — including the one with no partner. A receiver waiting in `RECV`
+    /// leaves nobody hanging, and is still refused: after the move *he* waits on a channel he no
+    /// longer has. Same for a notification waiter, which is why `Channel` has two variants.
+    #[test]
+    fn keine_rolle_ist_ausgenommen() {
+        for r in [
+            EdgeRole::Sender,
+            EdgeRole::Receiver,
+            EdgeRole::Caller,
+            EdgeRole::ReplyOwner,
+        ] {
+            assert_eq!(
+                classify_edge(&kante(Channel::Endpoint(3), MIGRANT, r), MIGRANT, &Scope::EMPTY),
+                Some(CutRefusal::ChannelNotInScope),
+                "{r:?} must not travel without its channel"
+            );
+        }
+        let n = kante(Channel::Notification(3), MIGRANT, EdgeRole::Receiver);
+        assert_eq!(
+            classify_edge(&n, MIGRANT, &Scope::EMPTY),
+            Some(CutRefusal::ChannelNotInScope)
+        );
+        // An endpoint numbered 3 in the scope does **not** cover notification 3. Two namespaces,
+        // and conflating them would let a checkpoint travel on the strength of an unrelated id.
+        let eps_only = Scope { endpoints: &[3], ..Scope::EMPTY };
+        assert_eq!(
+            classify_edge(&n, MIGRANT, &eps_only),
+            Some(CutRefusal::ChannelNotInScope)
+        );
+    }
+
+    /// The whole edge list at once — and the **index** comes back, for the same reason
+    /// `classify_all` returns the slot.
+    #[test]
+    fn der_schnitt_nennt_die_kante() {
+        let scope = Scope { endpoints: &[3], threads: &[BLEIBT], ..Scope::EMPTY };
+        let edges = [
+            kante(Channel::Endpoint(3), MIGRANT, EdgeRole::Caller),
+            kante(Channel::Endpoint(3), BLEIBT, EdgeRole::ReplyOwner),
+            kante(Channel::Endpoint(4), MIGRANT, EdgeRole::Sender),
+        ];
+        assert_eq!(
+            classify_cut(MIGRANT, &edges, &scope),
+            Err((2, CutRefusal::ChannelNotInScope))
+        );
+        // The first two are the *contained* relationship: caller and reply owner both travel, and
+        // so does their endpoint. That is the group-cut rule of Z23/S3 in the checkpoint's words —
+        // a relationship with both ends inside the cut is not an open relationship of the cut.
+        assert_eq!(classify_cut(MIGRANT, &edges[..2], &scope), Ok(()));
+        // An empty list is a claim, not a proof. It passes — and the kernel-side collector prints
+        // how many edges it looked at, so that "nothing observed" cannot pass for "nothing there".
+        assert_eq!(classify_cut(MIGRANT, &[], &Scope::EMPTY), Ok(()));
+    }
+
+    /// **The gate sits in `build`, not in the caller.** That is the whole point of Z4d stage 1:
+    /// until 2026-08-25 the promise rested on whoever called `freeze_thread` first, which is call
+    /// discipline and not structure.
+    #[test]
+    fn build_verweigert_den_gekreuzten_schnitt() {
+        let kinds = [Some(region(0x1000))];
+        let edges = [kante(Channel::Endpoint(3), MIGRANT, EdgeRole::Caller)];
+        assert_eq!(
+            Image::build(K1, 1, 2, 1, &kinds, &Scope::EMPTY, MIGRANT, &edges),
+            Err(BuildRefusal::Cut(0, CutRefusal::ChannelNotInScope))
+        );
+        // The counter-proof: the same caps, the same subject, no crossing edge -> a checkpoint
+        // exists. Without it the refusal would only show that `build` can fail at all.
+        assert!(Image::build(K1, 1, 2, 1, &kinds, &Scope::EMPTY, MIGRANT, &[]).is_ok());
+    }
+
+    /// **A cap refusal and a cut refusal stay apart.** They are answered differently: a DMA cap
+    /// never becomes portable by waiting, an open transaction may end on its own in a tick.
+    #[test]
+    fn cap_grund_und_schnitt_grund_sind_unterscheidbar() {
+        let kinds = [Some(ObjectKind::Mmio { phys: 0xfe00_0000, len: 0x1000 })];
+        let edges = [kante(Channel::Endpoint(3), MIGRANT, EdgeRole::Caller)];
+        // Both are wrong at once — and the caps are judged first, because that is the refusal that
+        // does not dissolve on its own.
+        assert_eq!(
+            Image::build(K1, 1, 2, 1, &kinds, &Scope::EMPTY, MIGRANT, &edges),
+            Err(BuildRefusal::Cap(0, LocalReason::DeviceWindow))
+        );
+        assert_eq!(
+            Image::build(K1, 1, 2, 1, &[], &Scope::EMPTY, MIGRANT, &edges),
+            Err(BuildRefusal::Cut(0, CutRefusal::ChannelNotInScope))
+        );
+    }
+
+    /// The reply **token** in the thread state and the reply **edge** at the endpoint must agree.
+    /// They are two descriptions of one relationship; if they could disagree, one of them would be
+    /// decorative — and it would be the one nobody reads.
+    #[test]
+    fn reply_token_und_reply_kante_urteilen_gleich() {
+        for ep in [3u32, 4u32] {
+            let scope = Scope { endpoints: &[3], ..Scope::EMPTY };
+            let token_ok =
+                classify_thread_part(&ThreadStatePart::ReplyToken { endpoint: ep }, &scope)
+                    .is_portable();
+            let kante_ok = classify_edge(
+                &kante(Channel::Endpoint(ep), MIGRANT, EdgeRole::Caller),
+                MIGRANT,
+                &scope,
+            )
+            .is_none();
+            assert_eq!(token_ok, kante_ok, "endpoint {ep}: two verdicts on one relationship");
+        }
     }
 }

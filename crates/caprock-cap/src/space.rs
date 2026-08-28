@@ -995,6 +995,21 @@ impl CapSpace {
     /// nicht unsichtbar — dieselbe Struktur meldet [`audit_cdt`](Self::audit_cdt) mit Code 7,
     /// und jede *verändernde* Operation über denselben Pfad erhöht
     /// [`cdt_walk_overruns`](Self::cdt_walk_overruns).
+    /// **Nur die Objektart** — ohne CDT-Lauf.
+    ///
+    /// [`inspect`](Self::inspect) rechnet `child_count`, und das ist ein Gang durch die
+    /// Kinderliste mit einer Schranke von `slots.len()`. Wer nur die Art wissen will, bezahlt das
+    /// sonst je Slot — unter der gehaltenen `CAPS`-Sperre, und **`SpinLock` maskiert IRQs**.
+    /// Gemessen am 2026-08-21: `pd_haelt_dma` (Z23/S5) lief so ueber alle Cap-Slots mehrerer PDs
+    /// und hat die laengste maskierte Strecke auf aarch64 so weit hochgezogen, dass die
+    /// Stopp-Latenz-Zusage der Debugger-Sonde fiel — an einer Zeile, die mit dem Debugger nichts
+    /// zu tun hat. Dieselbe Klasse wie der `while let`-Guard im C8-Verifizierer: kein Haenger,
+    /// sondern ein Latenzloch, das keine Pruefzeile ansieht — nur diesmal HAT eine hingesehen.
+    pub fn kind_of(&self, ptr: CapPtr) -> Option<ObjectKind> {
+        let slot = self.resolve(ptr).ok()?;
+        Some(self.objects[self.slots[slot].object].kind)
+    }
+
     pub fn inspect(&self, ptr: CapPtr) -> Option<CapInfo> {
         let slot = self.resolve(ptr).ok()?;
         let obj = self.slots[slot].object;

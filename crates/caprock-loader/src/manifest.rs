@@ -122,9 +122,28 @@ pub const CAP_MMIO: u32 = 1 << 4;
 pub const CAP_IRQ: u32 = 1 << 5;
 /// Darf eine DMA-Region halten (Treiber).
 pub const CAP_DMA: u32 = 1 << 6;
+/// **Bekommt die geteilte Uebertragungsflaeche eines Dienstes** (2026-08-25).
+///
+/// ## Warum das ein eigenes Bit ist und kein Anhaengsel von [`CAP_ENDPOINT`]
+///
+/// Bis heute kam die Flaeche mit dem Endpoint -- aber **nur, wenn der benannte Dienst zufaellig
+/// ein Geraet hatte**: `driver_shared_cap` sucht in der Tabelle der Geraetezuteilungen und gibt
+/// fuer einen Dienst ohne Geraet `None`. Damit hing die Slot-Zahl eines Programms an einer
+/// Eigenschaft einer **anderen** PD und stand nicht in seinem eigenen Eintrag.
+///
+/// Eine feste Kopplung waere ablesbar gewesen; eine bedingte ist es nicht. Wer das Budget von
+/// acht Slots plant, muss den Verbrauch aus dem Autoritaetsdokument lesen koennen -- und nicht
+/// daraus, was ein fremder Dienst gerade ist.
+pub const CAP_SHARED: u32 = 1 << 7;
 /// Alle heute definierten Bits — was darüber hinaus gesetzt ist, versteht dieser Kernel nicht.
-pub const CAP_KNOWN: u32 =
-    CAP_LOADER | CAP_PD_CONTROL | CAP_NOTIFICATION | CAP_ENDPOINT | CAP_MMIO | CAP_IRQ | CAP_DMA;
+pub const CAP_KNOWN: u32 = CAP_LOADER
+    | CAP_PD_CONTROL
+    | CAP_NOTIFICATION
+    | CAP_ENDPOINT
+    | CAP_MMIO
+    | CAP_IRQ
+    | CAP_DMA
+    | CAP_SHARED;
 
 // --- Politikfelder (Bitmaske `policy_flags`) — Format hier, Bedeutung in Strang B -------------
 
@@ -149,12 +168,34 @@ pub const POLICY_NO_HOTRELOAD: u32 = 1 << 3;
 /// **Fehlt das Bit, fehlt die Cap.** Kein Nachreichen, kein „spaeter gewaehren": ein spaeterer Weg
 /// ist genau der Weg, auf dem eine Vorgabe hereinkommt.
 pub const POLICY_DEBUGGABLE: u32 = 1 << 4;
+/// **Diese Komponente BIETET einen Dienst an** (2026-08-25).
+///
+/// ## Warum es das braucht, obwohl `CAP_ENDPOINT` schon existiert
+///
+/// Weil dieselbe Zeile bis heute **zwei** Dinge heisst. `CAP_ENDPOINT` bedeutet „gib mir den
+/// Kanal des ueber `service_id` benannten Dienstes" *und* „gib mir einen eigenen Endpoint" --
+/// unterschieden allein dadurch, ob gerade ein Dienst existiert. Das ist die im Kernel
+/// versteckte Politik aus A-5.4, eine Ebene tiefer: der Ausgang haengt an der Ladereihenfolge.
+///
+/// Mit diesem Bit sagt der Eintrag es selbst. Eine Komponente, die es traegt, bekommt einen
+/// **frischen** Kanal und wird unter ihrer eigenen `program_id` **registriert** -- damit kann ein
+/// Client sie mit `service_id` benennen.
+///
+/// ## Und warum das nicht an einem Geraet haengen darf
+///
+/// Bis heute rief nur der HardwareLand-Zweig `set_driver_service`. Eine PD ohne Geraet wurde also
+/// nie registriert; ein Client, der sie benannte, bekam `None` und danach einen **frischen,
+/// unverbundenen** Endpoint. Beide Seiten haetten einen Kanal gehabt und keinen gemeinsamen --
+/// mit gueltigen Caps und ohne eine einzige Fehlermeldung.
+pub const POLICY_PROVIDES_SERVICE: u32 = 1 << 5;
+
 /// Alle heute definierten Bits.
 pub const POLICY_KNOWN: u32 = POLICY_EXCLUSIVE_STRIPE
     | POLICY_ROOT_TASK
     | POLICY_PINNED
     | POLICY_NO_HOTRELOAD
-    | POLICY_DEBUGGABLE;
+    | POLICY_DEBUGGABLE
+    | POLICY_PROVIDES_SERVICE;
 
 /// „Kern egal" in `core_affinity`.
 pub const ANY_CORE: u32 = u32::MAX;

@@ -95,6 +95,16 @@ struct Auftrag {
     /// `Option`, weil [`CapPtr`] bewusst keinen öffentlichen Konstruktor hat — ein fabrizierbarer
     /// Cap-Handle wäre eine Einladung. Ein Feld aus `None` braucht keinen.
     endow: [Option<(usize, CapPtr)>; ENDOW_MAX],
+    /// **Das angeforderte Cap-Budget der neuen PD** (2026-08-26, `SYS_LOAD` `MSG3`); `0` = Vorgabe.
+    ///
+    /// Es faehrt aus demselben Grund im Auftrag mit wie der Heimatkern eine Zeile darueber: es ist
+    /// eine Eigenschaft des AUFRUFS, und was nicht mitfaehrt, wird zur Eigenschaft dessen, der den
+    /// Auftrag ausfuehrt.
+    cap_budget: u16,
+    /// **Der angeforderte DMA-Pool in Seiten** (C2, 2026-08-26); `0` = Vorgabe. Die Obergrenze hat
+    /// der Dispatch bereits geprueft und benannt abgewiesen -- hier kommt nur noch eine Zahl an,
+    /// die durch `DRIVER_DMA_MAX_PAGES` gedeckt ist.
+    dma_pages: u32,
 }
 
 /// Die Warteschlange: ein Ring fester Grösse.
@@ -204,6 +214,8 @@ pub fn uebergeben(
     endow: &[(usize, CapPtr)],
     caller: ThreadId,
     heimatkern: usize,
+    cap_budget: u16,
+    dma_pages: u32,
     blockieren: impl FnOnce() -> usize,
 ) -> Uebergabe {
     let Some(v) = thread_id() else {
@@ -229,6 +241,8 @@ pub fn uebergeben(
                 caller_pd,
                 caller,
                 heimatkern,
+                cap_budget,
+                dma_pages,
                 endow: felder,
             },
         );
@@ -288,7 +302,7 @@ fn laden(a: &Auftrag) -> Option<usize> {
     // Verdichten mit dem ersten echten Cap als Füllwert; `CapPtr` hat keinen öffentlichen
     // Konstruktor (derselbe Weg wie in `load_by_index`).
     let Some(first) = a.endow.iter().flatten().next().copied() else {
-        return crate::loader::load_by_index(a.index, a.caller_pd, &[], a.heimatkern);
+        return crate::loader::load_by_index(a.index, a.caller_pd, &[], a.heimatkern, a.cap_budget, a.dma_pages);
     };
     let mut dense = [first; ENDOW_MAX];
     let mut n = 0usize;
@@ -296,7 +310,7 @@ fn laden(a: &Auftrag) -> Option<usize> {
         dense[n] = c;
         n += 1;
     }
-    crate::loader::load_by_index(a.index, a.caller_pd, &dense[..n], a.heimatkern)
+    crate::loader::load_by_index(a.index, a.caller_pd, &dense[..n], a.heimatkern, a.cap_budget, a.dma_pages)
 }
 
 /// **Den Verifizierer starten.** Aus beiden Hochlaufwegen zu rufen, **vor** dem Root-Task — der

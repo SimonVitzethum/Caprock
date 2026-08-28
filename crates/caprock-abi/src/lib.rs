@@ -41,10 +41,64 @@ pub mod sys {
     /// in `x3`..`x5`. Nur eine TrustedSas-PD darf eine UserLand-PD so steuern.
     pub const PDCTL: u64 = 12;
     /// **Binary-Loader laden** (ext-26): ein Programm aus dem Boot-Archiv zur Laufzeit laden +
-    /// starten, gated auf eine `Loader`-Cap (WRITE). `x1` = Loader-Cap-Index, `x2` = Archiv-
-    /// Programm-Index, `x3` = lokaler Cap-Index, der in **Slot 0** der neuen PD delegiert wird
-    /// (`u64::MAX` = keiner). Rückgabe: `x0` = result, `x1` = neue PD-Id (bei OK). Der geladene
+    /// starten, gated auf eine `Loader`-Cap (WRITE).
+    ///
+    /// `x1` = Loader-Cap-Index · `x2` = Archiv-Programm-Index · `x3` = **Delegationsliste**
+    /// (bis zu [`LOAD_MAX_DELEGATES`] Bytes, je `delegate_pair(src, dst)`) · `x4` = **Anzahl**
+    /// der gueltigen Paare · `x5` = **Ressourcenwunsch** der neuen PD (s. [`load_extras`]).
+    /// Rückgabe: `x0` = result, `x1` = neue PD-Id (bei OK). Der geladene
     /// Prozess erhält NUR die so explizit delegierten Caps (keine Sonderrechte über die Cap).
+    ///
+    /// ## `x5` traegt ZWEI Felder, und die Belegung steht ausgeschrieben (2026-08-26)
+    ///
+    /// ```text
+    /// x5 = (dma_pages << 16) | cap_budget
+    ///      dma_pages   : Seiten DMA-Pool fuer die Geraetezuteilung, 0 = Vorgabe
+    ///      cap_budget  : Cap-Slots der neuen PD, 0 = Vorgabe
+    /// ```
+    ///
+    /// Ausgeschrieben und nicht abgezaehlt: in C8 kollidierte eine Marke auf Bit 63 mit dem
+    /// obersten Zahlenfeld eines Ergebniswortes, das Urteil fiel durch, der Lauf ging in den
+    /// Watchdog — und jedes gedruckte Feld war gruen. `x5 == 0` heisst „beides Vorgabe" und ist
+    /// damit bitgleich zu jedem Aufruf, den es vor diesen Feldern gab.
+    ///
+    /// **Der DMA-Pool wird ueber [`DRIVER_DMA_MAX_PAGES`] hinaus ABGEWIESEN, nicht gekuerzt**
+    /// ([`result::ERR_DMA_TOO_LARGE`]). Eine stillschweigend halbierte DMA-Region ist ein Geraet,
+    /// das ueber ihr Ende hinausschreibt — die Kuerzung waere der Korruptionspfad, nicht der
+    /// Komfort. Geprueft wird am **Rand**, bevor irgendetwas alloziert ist, und der Aufrufer wird
+    /// dabei nicht blockiert (D11).
+    ///
+    /// ## Das Budget in `x5` (2026-08-26) — warum es hier steht und nicht im Manifest
+    ///
+    /// Bis dahin bekam **jede** PD dieselbe feste Zahl Cap-Slots. Das trug, solange eine PD 1–4
+    /// Slots brauchte; eine Treiberumgebung braucht dreissig, und zehntausend andere weiterhin
+    /// vier. Die Konstante anzuheben kostet den Bedarf **einer** PD mal `NPDS` — gemessen rund
+    /// 7,7 MB je acht Slots.
+    ///
+    /// Das Manifest kommt dafuer nicht in Frage: es beschreibt das **Startverhalten** (ein kleiner
+    /// Plattentreiber, ein Boot-Taskmanager) und wird signiert; was zur Laufzeit entsteht, steht
+    /// nicht darin. Also traegt der Ladeaufruf die Zahl.
+    ///
+    /// Zwei Absagen, beide ohne Deckelung: mehr als das Maximum je PD, oder mehr, als der
+    /// systemweite **Vorrat** noch hergibt. Stillschweigend zu kuerzen gaebe dem Aufrufer eine PD,
+    /// die weniger kann als angefordert — und er merkte es erst am achten Cap.
+    ///
+    /// ## Bis 2026-08-25 war es GENAU EINER, nach Slot 0
+    ///
+    /// `x3` war ein einzelner Slot, `x4` ein Badge, das Ziel die Konvention L2. Damit konnte ein
+    /// Lader einem Programm zur Laufzeit **eine** Autoritaet mitgeben — was reicht, solange alles
+    /// Weitere im Manifest steht. Sobald das Manifest nur noch den Bootzustand beschreibt, ist es
+    /// die Grenze des ganzen Systems: eine PD, die zur Laufzeit einen Dienst startet und ihm
+    /// Arena, Kanal und Puffer mitgeben will, kann das mit einem Cap nicht sagen.
+    ///
+    /// ## Warum das Badge WEGGEFALLEN ist und nicht mitgewachsen
+    ///
+    /// Ein Badge fuer acht Caps waere ein Parameter mit acht Bedeutungen. Es wird auch nicht
+    /// gebraucht: [`CCOPY`](Self::CCOPY) badgt eine Kopie im **eigenen** Cspace, und genau dafuer
+    /// ist es da („wer zwei unterscheidbare Kanaele auf dasselbe Objekt braucht, badgt zwei
+    /// Kopien"). Wer gebadgt delegieren will, badgt vorher und delegiert den Slot — das ist
+    /// **mehr** ausdrueckbar als vorher (ein Badge JE Cap statt eines fuer alle) und kostet den
+    /// Kernel eine Fallunterscheidung weniger.
     pub const LOAD: u64 = 13;
     /// **Einen Cap im eigenen Cspace löschen** (A-3.1). `x1` = lokaler Slot. Kein zusätzliches
     /// Cap nötig — die Autorität ist der eigene Cspace: Autorität *abzugeben* darf nie an einer
@@ -176,7 +230,41 @@ pub mod sys {
     /// the spawnee's stack at any moment, and the Cap would have to be transferred exclusively
     /// instead of shared. One sentence today, so that it is a decision later and not a discovery.
     ///
-    /// `MSG0` stack Cap slot · `MSG1` entry point · `MSG2` argument · `MSG3` priority.
+    /// ## One Cap, several stacks — the sub-region (K1b, 2026-08-26)
+    ///
+    /// Until this, one `Memory` Cap bought exactly **one** thread, and the Cap stayed pinned for
+    /// that thread's life ([`result::ERR_INUSE`]). "How many threads may a PD have" was therefore
+    /// really "how many Cap slots are left", which is the wrong question: threads of one PD share
+    /// the address space anyway, so a separate Cap per stack buys **no isolation** — see the note
+    /// on [`UNPARK`]. A driver PD that already spends 6 of its 8 slots on its endowment could
+    /// spawn at most two.
+    ///
+    /// So `x1` ([`reg::EP_BADGE`], the only register this syscall does not already use) names a
+    /// **sub-region** of the Cap:
+    ///
+    /// ```text
+    /// x1 = (offset_pages << 32) | length_pages     // a window inside the Cap
+    /// x1 == 0                                      // the WHOLE region — the old behaviour
+    /// ```
+    ///
+    /// Pages and not bytes, because both quantities are page-aligned by construction anyway and
+    /// 32 bits of pages is 16 TiB. **`0` is bit-identical to every call written before this
+    /// existed** — the compatibility is in the encoding, not in a branch somebody has to
+    /// remember.
+    ///
+    /// The layout is written out rather than counted: in C8 a marker on bit 63 collided with the
+    /// top number field of a result word, the judgement failed, and the run died in the watchdog
+    /// while every printed field was green.
+    ///
+    /// A window outside the Cap gets its **own** code ([`result::ERR_SUBREGION`]) — *you named a
+    /// region you do not hold* is a different statement from *that region is unusable as a stack*.
+    ///
+    /// **Sub-regions of one Cap must not overlap each other**, and that is checked
+    /// ([`result::ERR_NOSPACE`]): sibling stacks in one arena are exactly the case where an
+    /// off-by-one is a silent trampling rather than a fault.
+    ///
+    /// `MSG0` stack Cap slot · `MSG1` entry point · `MSG2` argument · `MSG3` priority ·
+    /// `x1` sub-region (`0` = whole).
     /// Returns the new `ThreadId` in [`reg::MSG0`] on [`result::OK`].
     pub const SPAWN: u64 = 20;
 
@@ -238,6 +326,78 @@ pub mod sys {
     /// the EL bits of `spsr` (aarch64): those carry the **ring**, and whoever writes them promotes
     /// their target.
     pub const DEBUG_WRITE_REGS: u64 = 25;
+
+    /// **Bind a device interrupt to a notification** (Stufe B, B3).
+    ///
+    /// `x1` slot of the `Irq` Cap · `MSG0` slot of the `Notification` Cap · `MSG1` badge.
+    ///
+    /// **The caller does not pass a vector — it passes a Cap.** That is the whole point of this
+    /// syscall existing, and it is why the number never appears in the argument list: the
+    /// interrupt this call may bind is the one the `Irq` Cap names, and the kernel reads it out of
+    /// the Cap rather than checking a number the caller supplied against a table. The in-kernel
+    /// `bind_irq` took raw ids and its own doc-comment claimed to be "authorised via the IRQ Cap";
+    /// a signature cannot support that claim, and *ein Waechter prueft die EXISTENZ eines Grundes,
+    /// nie seine WAHRHEIT.*
+    ///
+    /// Rights: `READ` on the `Irq` Cap (binding is not an intervention in another thread), `WRITE`
+    /// on the notification (the kernel will signal it).
+    ///
+    /// **Rebinding the same Cap replaces its entry** rather than consuming a second one —
+    /// otherwise a driver that reloads exhausts its own device. Refused with
+    /// [`result::ERR_IRQ_FULL`] when there is no room, and the caller is **not** blocked.
+    pub const BIND_IRQ: u64 = 26;
+
+    /// **Set the calling thread's thread pointer** (TLS, T2). `x1` = VA; `0` disables it.
+    ///
+    /// **No capability, and that is the whole argument.** This acts only on the caller — the same
+    /// class as [`YIELD`], [`PARK`] and [`EXIT`]. Whoever sets their own thread pointer gains
+    /// nothing: the address is dereferenced by *their* code in *their* address space, and what is
+    /// readable there was already decided by the MMU. A cap here would guard a door that opens
+    /// onto the room you are standing in.
+    ///
+    /// **The address IS checked — against [`super::USER_VA_TOP`] — and that check is not about
+    /// what the caller may reach.** It is about what the caller can make the *kernel* do.
+    ///
+    /// `WRMSR` to `IA32_FS_BASE` with a **non-canonical** value raises `#GP(0)` **in ring 0, at
+    /// the write**. Without a bound, `SETTLS(0x1234_5678_9ABC_DEF0)` from a PD holding **no
+    /// capability at all** takes the kernel down. The authority argument above is sound for what
+    /// the caller can *reach* — the MMU decides that — and says nothing about what it can make the
+    /// kernel *execute*. Two different questions, and only the first one is answered by "no cap
+    /// needed".
+    ///
+    /// The bound is the **user half**, not "canonical": stronger, and it means something. A thread
+    /// pointer in the upper half is useless anyway, and every user window this kernel maps lies far
+    /// below it. Refused with [`super::result::ERR_BADTLS`].
+    ///
+    /// What is deliberately **not** checked is whether the address is *mapped*: an unreadable one
+    /// faults on first use, in the caller, at the instruction that used it — a better place to
+    /// learn it than a return code, and it costs the kernel no knowledge of the layout.
+    ///
+    /// **aarch64 needs none of this**: `TPIDR_EL0` accepts any value. Same shape as E-B1 — one
+    /// architecture leans on a check the other structurally does not need, and if the reason is
+    /// not written at the site, it reads as a redundant line and gets removed.
+    ///
+    /// Setting the pointer of **another** thread is a different authority (the debugger's) and is
+    /// not offered.
+    pub const SETTLS: u64 = 27;
+
+    /// **Read the monotonic clock** (Stufe A, A1). No arguments.
+    ///
+    /// Returns the rate in [`reg::MSG0`] (ticks per second) and the current counter in
+    /// [`reg::MSG1`].
+    ///
+    /// **No capability**, same class as [`YIELD`] and [`SETTLS`]: reading time grants nothing and
+    /// reveals nothing the caller could not already observe by counting its own instructions.
+    ///
+    /// **Two numbers, and the rate is the one that was missing.** The counter itself is readable
+    /// from ring 3 on both architectures already (`rdtsc`; `CNTVCT_EL0`) — what a program cannot
+    /// know is what a tick is *worth*, and that is calibrated in the kernel. Returning the counter
+    /// too costs nothing and spares a caller that does not want to write architecture-specific
+    /// assembly.
+    ///
+    /// **What this is NOT:** wall-clock time, an absolute epoch, or a deadline. Deadlines are A2
+    /// and change the blocking invariants; this syscall changes nothing about them.
+    pub const CLOCK: u64 = 28;
 }
 
 /// Rights and frame-word names for the debug syscalls (Z6b).
@@ -309,6 +469,94 @@ pub const MSG_WORDS: usize = 4;
 pub const GRANT_FLAG: u64 = 1 << 63;
 /// Slot im Empfänger-Cspace, in dem eine per IPC übertragene Cap landet.
 pub const GRANT_RECV_SLOT: usize = 1;
+
+/// **Wie viele Caps ein [`sys::LOAD`] hoechstens delegieren kann** (2026-08-25).
+///
+/// Acht, und die Zahl ist **hergeleitet**, nicht gewaehlt: mehr als `CAP_BUDGET_PER_PD` kann eine
+/// PD ohnehin nicht halten. Eine Delegationsliste, die groesser sein darf als das Budget des
+/// Empfaengers, verspricht etwas, das die Installation gleich wieder abweist.
+///
+/// Genau acht Paare passen ausserdem in **ein** Nachrichtenwort (je 4 Bit fuer Quell- und
+/// Zielslot, `NCAPS = 16`) — die Liste braucht damit keinen Zeiger in den Aufrufer-Speicher, und
+/// der Kernel liest keine fremden Bytes.
+pub const LOAD_MAX_DELEGATES: usize = 8;
+
+/// Ein Paar (Quell-Slot im Aufrufer, Ziel-Slot in der neuen PD) in ein Byte packen.
+///
+/// **Der Ziel-Slot ist frei waehlbar und nicht die Identitaet**, und das ist eine Entscheidung:
+/// die Slot-Belegung der neuen PD ist ihre Loader-ABI (0 Loader, 1 Notification, 2 Endpoint,
+/// 3..6 Geraet). Ein Aufrufer, der nur aus seinem eigenen Slot heraus delegieren koennte, muesste
+/// seinen Cspace nach der Erwartung des Kindes ordnen — bei acht Slots je PD ist das keine
+/// Freiheit, sondern eine Kollision.
+pub const fn delegate_pair(src: u8, dst: u8) -> u8 {
+    ((src & 0x0f) << 4) | (dst & 0x0f)
+}
+
+/// Quell- und Ziel-Slot aus einem gepackten Byte lesen.
+pub const fn delegate_unpack(b: u8) -> (usize, usize) {
+    ((b >> 4) as usize, (b & 0x0f) as usize)
+}
+
+/// **Pack the `x1` word of [`sys::SPAWN`]** — a sub-region of the stack Cap, in pages (K1b).
+///
+/// `spawn_sub(0, 0)` is `0` and means *the whole region*, which is what every call written before
+/// the sub-region existed encodes. The compatibility lives in the encoding rather than in a branch
+/// somebody has to remember.
+pub const fn spawn_sub(offset_pages: u32, length_pages: u32) -> u64 {
+    ((offset_pages as u64) << 32) | (length_pages as u64)
+}
+
+/// **Obergrenze des DMA-Pools einer Geraetezuteilung, in Seiten** (C2, 2026-08-26).
+///
+/// Sie steht in der **ABI** und nicht nur im Kernel, weil eine Schnittstelle, die oberhalb von `N`
+/// abweist, `N` veroeffentlichen muss — sonst ist die Absage fuer den Aufrufer ein Ratespiel, und
+/// die naheliegende Reaktion (halbieren und nochmal) ist genau die Kuerzung, die hier vermieden
+/// wird.
+///
+/// **1024 Seiten = 4 MiB je Zuteilung.** Die Zahl ist nicht frei: der Kernel haelt hoechstens vier
+/// gleichzeitige Zuteilungen, alle vier muessen aus GiB 0 bedienbar bleiben (dort liegt der einzige
+/// Bereich, den `vspace_map_dma` abbilden kann), und auf der kleinsten gefahrenen Maschine
+/// (`-m 512M`) sind 4 x 4 MiB ein Anteil, den der Ladepfad daneben noch traegt.
+pub const DRIVER_DMA_MAX_PAGES: u64 = 1024;
+
+/// **Obergrenze der Adressen, die ein Programm nennen darf** — die untere Adresshaelfte.
+///
+/// `2^47`, und die Zahl ist mit Absicht **kleiner** als jede Architekturgrenze: auf x86-64 endet
+/// die kanonische untere Haelfte bei `2^47`, auf aarch64 spannt `TTBR0` bis `2^48`. Wer die
+/// kleinere nimmt, ist auf beiden richtig — und jedes User-Fenster dieses Kernels liegt weit
+/// darunter (`ISO_USER_VA` = 512 GiB auf x86, 9 GiB auf aarch64).
+///
+/// **Warum das eine ABI-Groesse ist und keine Kernel-Interna:** sie sagt, welche Adressen ein
+/// Programm dem Kernel gegenueber **nennen** darf. Ob dort etwas abgebildet ist, ist eine andere
+/// Frage und wird woanders beantwortet.
+pub const USER_VA_TOP: u64 = 1 << 47;
+
+/// **Das `x5`-Wort von [`sys::LOAD`] packen** — DMA-Seiten und Cap-Budget in EINEM Register.
+///
+/// `load_extras(0, 0) == 0` heisst „beides Vorgabe" und ist bitgleich zu jedem Aufruf, den es vor
+/// diesen Feldern gab. Die Vertraeglichkeit steckt in der Kodierung, nicht in einem Zweig, den
+/// jemand im Kopf behalten muss.
+pub const fn load_extras(dma_pages: u32, cap_budget: u16) -> u64 {
+    ((dma_pages as u64) << 16) | (cap_budget as u64)
+}
+
+/// `(dma_pages, cap_budget)` aus dem `x5`-Wort von [`sys::LOAD`] lesen.
+///
+/// `dma_pages` wird **ungekappt** zurueckgegeben: eine absurde Zahl soll die benannte Absage
+/// ausloesen und nicht durch eine Maske zu einer plausiblen werden. Genau das war der Fehler, den
+/// `spawn_sub` in seiner ersten Fassung fast gemacht haette.
+pub const fn load_extras_unpack(v: u64) -> (u64, u16) {
+    (v >> 16, (v & 0xffff) as u16)
+}
+
+/// Read `(offset_pages, length_pages)` back out of the `x1` word of [`sys::SPAWN`].
+///
+/// Returns `(0, 0)` for `0`, which the kernel reads as *the whole region* — the two halves are
+/// **never** interpreted separately, because a request naming a length of zero pages at a non-zero
+/// offset would otherwise silently become "the whole Cap from the base".
+pub const fn spawn_sub_unpack(v: u64) -> (u64, u64) {
+    (v >> 32, v & 0xffff_ffff)
+}
 
 /// Register-Indizes im TrapFrame (`gpr[i]` == `xi`).
 pub mod reg {
@@ -485,4 +733,57 @@ pub mod result {
     /// indistinguishable from outside, and then „diese PD ist nicht debuggbar" would be a claim
     /// about the caller instead of about the system.
     pub const ERR_NOT_DEBUGGABLE: u64 = 20;
+
+    /// **The named sub-region does not lie inside the stack Cap** (K1b, 2026-08-26).
+    ///
+    /// Deliberately **not** [`ERR_BADSTACK`]. That code says *the region you named is unusable as
+    /// a stack* (too small, misaligned); this one says *you named a region you do not hold*. The
+    /// two have different fixes, and the second is the shape an attacker produces: a Cap over
+    /// 64 KiB plus an offset of 4 GiB is a request for somebody else's memory, not a typo. A
+    /// shared code would put both in the same log line and make the interesting one invisible.
+    pub const ERR_SUBREGION: u64 = 21;
+
+    /// **Der angeforderte DMA-Pool ist groesser, als eine Geraetezuteilung traegt** (C2,
+    /// 2026-08-26) — s. [`super::DRIVER_DMA_MAX_PAGES`].
+    ///
+    /// Eigener Code, und das ist die ganze Aussage: die Alternative waere eine **gekuerzte**
+    /// Region, und eine stillschweigend halbierte DMA-Region ist ein Geraet, das ueber ihr Ende
+    /// hinausschreibt. *Wer eine Kapazitaet einfuehrt, muss den Ueberlauf benennen* (D11) — und
+    /// der Aufrufer bekommt den Code, ohne blockiert zu werden.
+    ///
+    /// Er ist **nicht** [`ERR_BADCAP`] (der Sammelcode eines fehlgeschlagenen Ladevorgangs): „du
+    /// hast mehr verlangt, als es gibt" ist wiederholbar mit einer kleineren Zahl, „das Archiv
+    /// oder das ELF taugt nicht" ist es nicht.
+    pub const ERR_DMA_TOO_LARGE: u64 = 22;
+
+    /// **Kein Platz mehr fuer eine Interrupt-Bindung** ([`super::sys::BIND_IRQ`], Stufe B).
+    ///
+    /// Die Aussage ist **lokal** und das ist die Entscheidung dahinter (E12): *dieses Geraet hat
+    /// keinen freien Vektor.* Die Bindung haengt an der Zuteilung und nicht an einem globalen
+    /// Konto — wer ein Geraet hat, hat genau dessen Bindungen, und kein Treiber-PD kann einem
+    /// anderen die Ressource wegnehmen, weil die Zuteilung schon die Vergabestelle ist.
+    ///
+    /// *Wer eine Kapazitaet einfuehrt, muss den Ueberlauf benennen* (D11): der Aufrufer bekommt
+    /// den Code und wird **nicht** blockiert — dieselbe Form wie [`ERR_EP_FULL`] und
+    /// [`ERR_LOAD_BUSY`].
+    pub const ERR_IRQ_FULL: u64 = 23;
+
+    /// **Der Thread-Pointer liegt nicht in der unteren Adresshaelfte** ([`super::sys::SETTLS`]).
+    ///
+    /// Eigener Code, weil die Absage einen eigenen Grund hat und kein Sammel-Nein ist: „diese
+    /// Adresse darf ich nicht schreiben" ist mit einer anderen Zahl wiederholbar, „dich gibt es
+    /// nicht" ([`ERR_BADCAP`]) nicht.
+    ///
+    /// Die Schranke schuetzt den **Kernel**, nicht den Aufrufer: ein `WRMSR` auf `IA32_FS_BASE`
+    /// mit nicht-kanonischem Wert faultet in Ring 0.
+    pub const ERR_BADTLS: u64 = 24;
+
+    /// **Die Frist ist abgelaufen** (Stufe A / A2).
+    ///
+    /// Der Aufrufer hat mit einer Frist gewartet und ist geweckt worden, **ohne** dass das
+    /// Ereignis eintrat. Ein eigener Code, weil „nichts kam" und „es kam etwas" fuer den Aufrufer
+    /// verschiedene Fortsetzungen haben — und weil ein Treiber, der `ERR_TIMEOUT` als
+    /// *„Geraet tot"* liest, waehrend die Antwort gerade zugestellt wurde, ein **Korruptionspfad**
+    /// ist und kein Haenger. Diese Kante ist benannt und noch nicht gemessen (todo A2c).
+    pub const ERR_TIMEOUT: u64 = 25;
 }

@@ -17,7 +17,8 @@
 
 use caprock_cap::{CapError, CapInfo, CapPtr, DmaCoherence, DmaDir, ObjectKind};
 use caprock_hal::{self as hal, exception::TrapFrame, fp::FpState, println};
-use caprock_ipc::{Endpoint, Notification, Quiescence, Rebind};
+use caprock_cap::checkpoint::{Channel, Edge, EdgeRole, Scope};
+use caprock_ipc::{Endpoint, Notification, Quiescence, Rebind, Role as IpcRole};
 use caprock_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
 use caprock_microkit::{Caps, Domain};
 use caprock_region::heap::RegionSource;
@@ -830,6 +831,17 @@ fn charged<R>(core: usize, sched: &mut Scheduler, f: impl FnOnce(&mut Scheduler)
     r
 }
 
+/// **Wie viele Fristen ein einzelner Tick abarbeitet.**
+///
+/// Eine benannte Kapazitaet, kein Zufall: der Puffer liegt auf dem **IRQ-Stack**, und ein Feld je
+/// Thread waere dort 10 000 Eintraege. Laufen mehr Fristen im selben Tick ab, kommen die uebrigen
+/// im naechsten -- `naechste_frist` bleibt dann auf dem kleinsten noch offenen Wert stehen, also
+/// **sofort wieder faellig**. Verloren geht keine; verzoegert werden sie um Ticks.
+///
+/// *Wer eine Kapazitaet einfuehrt, muss den Ueberlauf benennen* -- hier ist er Verzoegerung, nicht
+/// Verlust, und das ist der Grund, warum er ohne eigenen Fehlercode auskommt.
+const FRISTEN_JE_TICK: usize = 16;
+
 fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
     // **Der zweite Summand der Stackrechnung (C4), gemessen an der TIEFSTEN Stelle des
     // IRQ-Pfads** -- hier und nicht im Einsprung der HAL: dort kam die erste Fassung auf 24 Byte,
@@ -845,13 +857,67 @@ fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
     drain_pending_irqs();
     // Heißer Pfad: nur der Scheduler-Lock DIESES Kerns (parallel zu anderen Kernen).
     // Echter Zeitscheiben-Tick -> MCS-Budget des laufenden Threads belasten.
+    // **Wer aus einer Frist geweckt wird, muss beim OBJEKT abgemeldet werden** -- gesammelt hier,
+    // ausgefuehrt unter der SCHEDS-Sperre NICHT (Sperrordnung `EPS`/`NTFNS` < `SCHEDS`).
+    let mut frist_abmelden: Option<([ThreadId; FRISTEN_JE_TICK], usize)> = None;
     let next = {
         let mut sched = SCHEDS[core].lock();
         let next = charged(core, &mut sched, |s| s.on_tick(core, frame as usize, true));
-        sync_fp_trap(core, &sched);
-        sync_vspace(core, &sched);
+        // --- Stufe A / A2: faellige Fristen ---------------------------------------------------
+        //
+        // **Hier und nicht im Scheduler**, weil das Ergebnis `ERR_TIMEOUT` eine ABI-Groesse ist
+        // und `caprock-sched` die ABI nicht kennt (und nicht kennen soll). Der Scheduler weckt,
+        // der Kernel sagt WARUM.
+        //
+        // Im Normalfall kostet das **einen Vergleich**: `fristen_faellig` kehrt sofort um, solange
+        // die frueheste Frist in der Zukunft liegt. Das ist die D10-Bedingung -- ein Zaehler
+        // („gibt es Fristen?") machte jeden Tick zum Tabellendurchlauf, sobald ein einziger
+        // Treiber wartet, und genau dafuer gibt es A2.
+        let mut geweckt = [ThreadId::from_raw(0); FRISTEN_JE_TICK];
+        let n = sched.fristen_faellig(&mut geweckt);
+        for t in geweckt.iter().take(n) {
+            if let Some(f) = sched.frame_of(*t) {
+                hal::exception::frame_set_reg(
+                    f,
+                    caprock_abi::reg::SYSNO_RESULT,
+                    caprock_abi::result::ERR_TIMEOUT,
+                );
+            }
+        }
+        if n > 0 {
+            frist_abmelden = Some((geweckt, n));
+        }
+        sync_thread_state(core, &sched);
         next
     }; // SCHEDS freigegeben — der Lastausgleich sperrt selbst (zwei Kerne).
+    // **Die zweite Haelfte der Frist, und sie hat gefehlt.**
+    //
+    // Ein Thread, den die Frist aus einem IPC-Warten holt, steht danach **immer noch** im
+    // Wartefeld seines Objekts. Gemessen: der zweite `WAIT` desselben Threads bekam `ERR_EP_FULL`
+    // (Kapazitaet 1, D11) -- die Notification hielt ihn fuer den Wartenden, obwohl er laengst
+    // weitergelaufen war. Ein spaeteres Signal haette einen Thread geweckt, der nicht mehr wartet.
+    //
+    // Dieselbe Familie wie D11, nur andersherum: dort stand ein Wartender in KEINER Struktur,
+    // hier steht ein Nicht-mehr-Wartender in EINER. Beide Male meldet jeder Pruefer Ordnung.
+    //
+    // **Ausserhalb der SCHEDS-Sperre**, weil `purge_thread` die Objektsperren nimmt und die
+    // Ordnung `EPS`/`NTFNS` < `SCHEDS` lautet (`docs/invariants.md` §1).
+    if let Some((tids, n)) = frist_abmelden {
+        for t in tids.iter().take(n) {
+            for ep in eps().iter() {
+                let mut e = ep.lock();
+                if e.is_used() {
+                    e.purge_thread(*t);
+                }
+            }
+            for nt in ntfns().iter() {
+                let mut x = nt.lock();
+                if x.is_used() {
+                    x.purge_thread(*t);
+                }
+            }
+        }
+    }
     // Periodischer Lastausgleich (ext-30). Sicher an dieser Stelle: `balance_once` verschiebt
     // nie den **laufenden** Thread, der gerade gewählte `next`-Frame bleibt also gültig.
     if BALANCING.load(Ordering::Relaxed) {
@@ -933,13 +999,13 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
         dispatch_delete_cap,          // beim Grant verdrängte Cap freigeben (kein Slot-Leck)
         dispatch_spawn,               // K1a: zweiter Thread in derselben PD, Stack aus einer Cap
         dispatch_debug,               // Z6b: die fuenf Debug-Syscalls
+        dispatch_bind_irq,            // B3: SYS_BIND_IRQ, mit Cap-Riegel
     );
     // Der Syscall kann den laufenden Thread gewechselt haben (block/exit) -> FP-Trap
     // + VSpace passend zum neuen aktuellen Thread setzen.
     {
         let sched = SCHEDS[core].lock();
-        sync_fp_trap(core, &sched);
-        sync_vspace(core, &sched);
+        sync_thread_state(core, &sched);
     }
     next as *mut TrapFrame
 }
@@ -1040,6 +1106,25 @@ fn kick(core: usize) {
 impl SchedOps for KernelSched {
     fn current_id(&mut self, core: usize) -> ThreadId {
         SCHEDS[core].lock().current_id(core)
+    }
+    fn frist_setzen(&mut self, core: usize, ticks: u64, grund: u16) {
+        SCHEDS[core].lock().frist_setzen(core, ticks, grund);
+    }
+    fn clock_hz(&mut self) -> u64 {
+        hal::timer::cycles_per_sec()
+    }
+    fn clock_now(&mut self) -> u64 {
+        hal::timer::cycles()
+    }
+    fn set_tls(&mut self, tid: ThreadId, va: usize) -> bool {
+        // **Ueber `with_owner`**, nicht ueber den Kern des Aufrufers: der Zielthread kann auf einer
+        // anderen Scheduler-Instanz liegen. Heute ruft nur `SETTLS` das, und dort ist das Ziel der
+        // Aufrufer selbst -- aber eine Fassade, die das voraussetzt, ist beim ersten fremden
+        // Aufrufer still falsch.
+        //
+        // Die **Adressschranke** ist im Dispatch gefallen (`USER_VA_TOP`); hier steht sie nicht
+        // noch einmal, und der Grund dafuer steht bei `sync_tls`.
+        with_owner(tid, |s, _| s.set_tls(tid, va).then_some(())).is_some()
     }
     fn frame_of(&mut self, tid: ThreadId) -> Option<usize> {
         with_owner(tid, |s, _| s.frame_of(tid)).map(|(f, _)| f)
@@ -1252,6 +1337,24 @@ impl SchedOps for KernelSched {
 /// EL0 trappen, falls dieser Thread NICHT der FP-Owner des Kerns ist (so trappt
 /// sein erster FP-Zugriff und löst den Lazy-Owner-Wechsel aus); sonst FP freigeben.
 /// Am Ende jedes Hooks aufzurufen, der den laufenden Thread gewechselt haben kann.
+/// **Allen Zustand spiegeln, der JE THREAD gilt und in einem Register des Kerns steht.**
+///
+/// Es gab bis heute **vier** Stellen, an denen `sync_fp_trap` und `sync_vspace` als Paar
+/// nebeneinanderstanden — Syscall, Reschedule, Fault, Tick. Vier parallele Listen, gepflegt von
+/// Hand, und `sync_tls` landete bei seiner Einfuehrung prompt an **einer** davon: die Kinder der
+/// TLS-Sonde setzten ihren Zeiger, lasen ihn korrekt zurueck und verloren ihn beim ersten `YIELD`.
+///
+/// Das ist dieselbe Form wie *wer einen neuen Zustand einfuehrt, muss jede Stelle mitnehmen, die
+/// ueber Zustaende URTEILT* (D0-Regression, Audit-Code 7) — hier: jede Stelle, die ihn
+/// **spiegelt**. Die Behebung ist deshalb nicht die vierte Zeile, sondern **eine** Funktion: wer
+/// ein fuenftes Stueck Thread-Zustand einfuehrt, kann es nicht mehr an drei von vier Stellen
+/// vergessen.
+fn sync_thread_state(core: usize, sched: &Scheduler) {
+    sync_fp_trap(core, sched);
+    sync_vspace(core, sched);
+    sync_tls(core, sched);
+}
+
 fn sync_fp_trap(core: usize, sched: &Scheduler) {
     let cur_id = sched.current_id(core);
     let cur = cur_id.to_raw();
@@ -1318,6 +1421,43 @@ fn sync_vspace(core: usize, sched: &Scheduler) {
         CURRENT_VSPACE[core].store(want, Ordering::Relaxed);
     }
 }
+
+/// **Den Thread-Pointer des laufenden Threads an die CPU spiegeln** (TLS, T1).
+///
+/// Dieselbe Naht wie [`sync_vspace`] und aus demselben Grund: es ist Zustand, der **je Thread**
+/// gilt und in einem **Register des Kerns** steht. Wer ihn nicht bei jedem Wechsel spiegelt, hat
+/// TLS gesetzt und nicht gehalten — und das sind zwei verschiedene Aussagen, die die `tls`-Zeile
+/// als `tp-gesetzt` und `ueberlebt-wechsel` getrennt fuehrt.
+///
+/// **Nur bei Aenderung**, mit Kernpuffer: ein `wrmsr` je Wechsel waere sonst der Preis dafuer,
+/// dass die meisten Threads gar kein TLS haben.
+///
+/// # Warum hier NICHT noch einmal geprueft wird
+///
+/// Ein `WRMSR` auf `IA32_FS_BASE` mit nicht-kanonischem Wert faultet in **Ring 0** — die
+/// Schranke ist also lebenswichtig, und es gibt **zwei** Stellen, an denen der Wert den Kern
+/// erreicht: `SYS_SETTLS` und diese hier.
+///
+/// Gedeckt ist diese hier dadurch, dass der Wert **beim Speichern** gegen
+/// `caprock_abi::USER_VA_TOP` geprueft wurde: in `Tcb::tls` steht nie etwas, das den Dispatch
+/// nicht passiert hat, und `Tcb::EMPTY` traegt `0`. Der Satz steht hier ausgeschrieben, weil er
+/// sonst beim naechsten Umbau verlorengeht — wer je eine zweite Schreibstelle fuer `tls`
+/// einfuehrt, muss die Pruefung mitnehmen oder sie hierher holen.
+///
+/// **Auf aarch64 gibt es das Problem gar nicht**: `TPIDR_EL0` nimmt jeden Wert. Dieselbe Form wie
+/// E-B1 — eine Architektur stuetzt sich auf eine Pruefung, die die andere strukturell nicht
+/// braucht, und ohne den Grund an der Stelle sieht sie wie eine ueberfluessige Zeile aus.
+fn sync_tls(core: usize, sched: &Scheduler) {
+    let want = sched.tls_of(sched.current_id(core)) as u64;
+    if CURRENT_TLS[core].load(Ordering::Relaxed) != want {
+        hal::cpu::set_thread_pointer(want);
+        CURRENT_TLS[core].store(want, Ordering::Relaxed);
+    }
+}
+
+/// Zuletzt an den Kern geschriebener Thread-Pointer — der Puffer fuer [`sync_tls`].
+#[allow(clippy::declare_interior_mutable_const)]
+static CURRENT_TLS: [AtomicU64; MAX_CORES] = [const { AtomicU64::new(0) }; MAX_CORES];
 
 /// FP-Trap-Hook (Lazy-FP): Ein EL0-Thread hat FP/SIMD benutzt, ohne Owner zu sein.
 /// Alten Owner sichern, FP-Kontext dieses Threads laden, ihn zum Owner machen und
@@ -1486,8 +1626,7 @@ fn el0_fault(frame: *mut TrapFrame, esr: u64, far: u64) -> *mut TrapFrame {
         ) {
             HANDLER_FAULTS.fetch_add(1, Ordering::Relaxed);
             let sched = SCHEDS[core].lock();
-            sync_fp_trap(core, &sched);
-            sync_vspace(core, &sched);
+            sync_thread_state(core, &sched);
             return next as *mut TrapFrame;
         }
     }
@@ -1515,8 +1654,7 @@ fn el0_fault(frame: *mut TrapFrame, esr: u64, far: u64) -> *mut TrapFrame {
         }
         let next = charged(core, &mut sched, |s| s.exit_current(core, frame as usize));
         // Auf den nächsten Thread gewechselt -> FP-Trap + VSpace passend setzen.
-        sync_fp_trap(core, &sched);
-        sync_vspace(core, &sched);
+        sync_thread_state(core, &sched);
         (next, tid)
     }; // SCHEDS freigegeben
     purge_ipc_queues(tid); // eager: faultenden Thread aus allen IPC-Queues entfernen
@@ -1778,6 +1916,21 @@ pub fn configure(cores: usize) -> (usize, usize, usize, u64) {
     // Ohne sie loest `pd_of` linear ueber alle `NPDS` PDs auf, und das bei JEDEM Syscall. Was
     // sie kostet, steht im Boot-Report (`bytes`), damit die Entscheidung an einer gemessenen
     // Groesse haengt.
+    // **K1b: die Stack-Cap je Thread-Slot.** Sie traegt den `ERR_INUSE`-Schutz UND die
+    // Geschwister-Ueberlappung, haengt also unbedingt und nicht nur unter `selftest`. Dimensioniert
+    // mit demselben `total` wie die Tabellen darueber -- die vorige feste Schranke von 1024 hat
+    // auf aarch64 jeden `SYS_SPAWN` abgewiesen, weil die Slots dort weit darueber liegen.
+    let sc = table(
+        total * core::mem::size_of::<Option<StackEintrag>>(),
+        core::mem::align_of::<Option<StackEintrag>>().max(4096),
+    );
+    // SAFETY: wie oben (exklusiv, ausgerichtet, dauerhaft, einmalig).
+    unsafe {
+        STACK_CAP_OF
+            .lock()
+            .attach(sc as *mut Option<StackEintrag>, total, |_| None)
+    };
+
     let owner = table(
         total * core::mem::size_of::<caprock_microkit::ThreadOwner>(),
         core::mem::align_of::<caprock_microkit::ThreadOwner>().max(4096),
@@ -2201,9 +2354,34 @@ fn mem_alloc_masked(
     align: u64,
     mask: Option<caprock_mem::ColorMask>,
 ) -> Option<MemoryCap> {
-    match mask {
-        Some(m) => alloc_colored(size, align, m),
-        None => mem_alloc(size, align),
+    mem_alloc_masked_auf(size, align, mask, caprock_hal::numa::Node::Unaffiliated)
+}
+
+/// **Wie [`mem_alloc_masked`], aber mit KNOTENWUNSCH** (Z8/N2, 2026-08-20).
+///
+/// Der Weg, auf dem die Farbachse in die Platzierungsleiter kommt: mit Maske **und** Knoten laeuft
+/// die Anforderung durch `numa::alloc_on_node_colored` und damit durch die drei Sprossen
+/// `Exact -> OffNode -> OffNodeUncolored`. Ohne einen von beiden bleibt es beim alten Verhalten --
+/// bitgleich, denn `Node::Unaffiliated` nimmt die Leiter gar nicht erst.
+///
+/// **Der Grund, warum das ueberhaupt hier steht und nicht als freie Funktion daneben:** eine
+/// Leiter ohne Aufrufer ist die Falle, die Z26/A3 schon bezahlt hat -- zwei Mutationen belegten,
+/// dass die FUNKTIONEN richtig sind, waehrend sie niemand rief. `mem_alloc_masked` ist die Stelle,
+/// an der im Kernel „gefaerbt oder nicht" entschieden wird; wer den Knoten dazunimmt, nimmt ihn
+/// hier dazu.
+fn mem_alloc_masked_auf(
+    size: u64,
+    align: u64,
+    mask: Option<caprock_mem::ColorMask>,
+    node: caprock_hal::numa::Node,
+) -> Option<MemoryCap> {
+    match (mask, node) {
+        (Some(m), caprock_hal::numa::Node::At(_)) => {
+            crate::numa::alloc_on_node_colored(size, align, node, m)
+        }
+        (Some(m), _) => alloc_colored(size, align, m),
+        (None, caprock_hal::numa::Node::At(_)) => crate::numa::alloc_on_node(size, align, node),
+        (None, _) => mem_alloc(size, align),
     }
 }
 
@@ -2234,6 +2412,23 @@ pub fn alloc_anywhere(size: u64, align: u64) -> Option<MemoryCap> {
 }
 /// Wie [`alloc`], aber jede Seite trägt eine Farbe aus `mask` (todo A1). Genullt wie jede
 /// Region, die an ein Subjekt gehen kann.
+/// **Gefaerbt UND in einem Physfenster** (Z8/N2, die dritte Sprosse der Platzierungsleiter).
+///
+/// Die Farbachse fehlte der Leiter bis zum 2026-08-20: `alloc_on_node` kannte nur *Knoten* und
+/// *irgendwo*, `off_node_uncolored` war damit strukturell `0` — und „Farbe gibt zuletzt nach" eine
+/// Entscheidung auf Papier. **Ein Zaehler, der nie ueber 0 gehen kann, ist von einem, der nie
+/// ausloest, nicht zu unterscheiden.**
+pub fn alloc_colored_in_window(
+    size: u64,
+    align: u64,
+    mask: caprock_mem::ColorMask,
+    lo: u64,
+    hi: u64,
+) -> Option<MemoryCap> {
+    MEM.lock()
+        .alloc_colored_in(size, align, crate::colors::count(), mask, lo, hi)
+}
+
 pub fn alloc_colored(size: u64, align: u64, mask: caprock_mem::ColorMask) -> Option<MemoryCap> {
     zoned_alloc_colored(0, size, align, mask, Zone::IdentityMapped)
 }
@@ -3174,18 +3369,80 @@ fn pd_mapping_overlaps(pd: usize, base: u64, len: u64) -> bool {
 /// deckt den `scale`-Test (1024 Threads). Ein Slot darueber bekommt **keinen** Eintrag -- und
 /// weil `stack_cap_in_use` dann nichts findet, waere seine Cap loeschbar. Deshalb weist
 /// `dispatch_spawn` einen solchen Thread ab, statt ihn ungeschuetzt laufen zu lassen.
-const STACK_CAP_SLOTS: usize = 1024;
+/// Ein Eintrag: `(rohe ThreadId, Stack-Cap, Basis, Laenge der TEILREGION)`.
+///
+/// **Die Region steht seit K1b (2026-08-26) mit dabei, und sie ist nicht Zierrat.** Mit mehreren
+/// Stapeln in EINER Cap ist die Ueberlappung zwischen Geschwistern der gefaehrliche Fall, und die
+/// Cap allein sagt darueber nichts -- sie ist fuer alle vier dieselbe.
+type StackEintrag = (u64, caprock_cap::CapPtr, u64, u64);
 
-static STACK_CAP_OF: SpinLock<[Option<(u64, caprock_cap::CapPtr)>; STACK_CAP_SLOTS]> =
-    SpinLock::new([None; STACK_CAP_SLOTS]);
+/// **Eine per-Thread-Tabelle wie die anderen** (berichtigt 2026-08-26).
+///
+/// Hier stand `const STACK_CAP_SLOTS: usize = 1024;` mit der Begruendung „deckt den `scale`-Test
+/// (1024 Threads)". Sie war **fail-closed** -- ein Slot darueber bekam keinen Eintrag, und
+/// `dispatch_spawn` wies den Thread ab, statt ihn ungeschuetzt laufen zu lassen. Genau das ist
+/// eingetreten: auf aarch64 liegen die Thread-Slots weit ueber 1024 (Kapazitaet rund 10 000 bei
+/// acht Kernen), und **jeder** `SYS_SPAWN` der `arena`-Sonde bekam `ERR_NOSPACE` -- nachdem der
+/// Thread bereits zugelassen und sofort wieder getoetet worden war. Auf x86 lief es, weil die
+/// Slots dort zufaellig klein blieben: *eine Eigenschaft, die aus einer Groessenrelation folgt
+/// statt aus der Struktur, verschwindet beim naechsten Messwert.*
+///
+/// Deshalb keine zweite Zahl mehr: dimensioniert mit **demselben `total`** wie `KSTACKS.base_of`,
+/// `VSPACE_OF` und der Rueckwaerts-Index, Groesse im Boot-Report (`bytes`). Sie haengt
+/// **unbedingt** und nicht nur unter `selftest`: sie traegt den `ERR_INUSE`-Schutz und die
+/// Geschwister-Ueberlappung, also Sicherheitsaussagen und keine Messmaschinerie.
+static STACK_CAP_OF: SpinLock<Slab<Option<StackEintrag>>> = SpinLock::new(Slab::empty());
 
-fn record_stack_cap(tid: ThreadId, cap: caprock_cap::CapPtr) -> bool {
+fn record_stack_cap(
+    tid: ThreadId,
+    cap: caprock_cap::CapPtr,
+    base: u64,
+    len: u64,
+) -> bool {
     let slot = tid.slot();
-    if slot >= STACK_CAP_SLOTS {
-        return false;
+    let mut t = STACK_CAP_OF.lock();
+    if slot >= t.len() {
+        return false; // fail-closed: lieber kein Thread als ein ungeschuetzter
     }
-    STACK_CAP_OF.lock()[slot] = Some((tid.to_raw(), cap));
+    t[slot] = Some((tid.to_raw(), cap, base, len));
     true
+}
+
+/// **Ueberlappt die Teilregion den Stapel eines lebenden Geschwisterthreads?** (K1b)
+///
+/// Diese Frage gab es bis heute nicht, und sie fehlte an genau der Stelle, an der sie zaehlt:
+/// [`pd_mapping_overlaps`] liest `KSTACKS.ubase_of`, und `spawn_with_stack_parked` traegt dort
+/// **absichtlich nichts** ein (die Region gehoert der Cap, nicht dem Kernel). Damit war die
+/// `Overlaps`-Absage fuer genau die Threads, die `SYS_SPAWN` erzeugt, **strukturell
+/// unerreichbar** -- ein Pruefer, der den Fall, gegen den er gebaut ist, nicht sehen kann.
+/// Solange eine Cap genau einen Stapel trug, fiel es nicht auf; mit der Teilregion ist es der
+/// Hauptfall.
+///
+/// **Das Fenster, das offen bleibt, und es steht hier statt in einem Commit-Text:** der Eintrag
+/// entsteht in [`dispatch_spawn`] nach `admit`. Zwei Threads derselben PD, die auf verschiedenen
+/// Kernen gleichzeitig `SYS_SPAWN` rufen, koennen beide vor dem jeweils anderen Eintrag pruefen.
+/// Es ist dasselbe Fenster, das der `ERR_INUSE`-Schutz seit K1a hat, und es zu schliessen hiesse,
+/// die Region **vor** dem Spawn zu reservieren und bei jedem Fehlschlag wieder freizugeben --
+/// eine eigene Buchhaltung mit eigenen Abbruchpfaden. Innerhalb EINER PD ist das dieselbe
+/// Vertrauenszone (wer den Nachbarstapel ueberlappen darf, duerfte hineinschreiben); es wird zu
+/// einem Loch, sobald `SPAWN` je eine PD-Grenze ueberschreitet.
+fn stack_sibling_overlaps(pd: usize, base: u64, len: u64) -> bool {
+    if len == 0 {
+        return true; // eine leere Region „passt ueberall" -- fail-closed statt fail-open
+    }
+    let t = STACK_CAP_OF.lock();
+    let g = CAPS.read();
+    (0..t.len()).any(|i| match &t[i] {
+        Some((raw, _, b, l)) => {
+            let tid = caprock_sched::ThreadId::from_raw(*raw);
+            *l != 0
+                && thread_alive(tid)
+                && g.pds.pd_of_thread(tid) == Some(pd)
+                && base < b.saturating_add(*l)
+                && *b < base.saturating_add(len)
+        }
+        None => false,
+    })
 }
 
 /// Ist diese Cap der Stack eines **lebenden** Threads?
@@ -3195,8 +3452,8 @@ fn record_stack_cap(tid: ThreadId, cap: caprock_cap::CapPtr) -> bool {
 /// bleiben. Das ist dieselbe Falle wie bei den wiederverwendeten Slots in D15.
 fn stack_cap_in_use(cap: caprock_cap::CapPtr) -> bool {
     let t = STACK_CAP_OF.lock();
-    t.iter().any(|e| match e {
-        Some((raw, c)) => {
+    (0..t.len()).any(|i| match &t[i] {
+        Some((raw, c, _, _)) => {
             *c == cap && thread_alive(caprock_sched::ThreadId::from_raw(*raw))
         }
         None => false,
@@ -3219,8 +3476,9 @@ fn dispatch_spawn(
     entry: usize,
     arg: usize,
     prio: u8,
+    sub: u64,
 ) -> Result<u64, u64> {
-    use caprock_cap::spawncheck::{check_stack, StackProposal, StackRefusal};
+    use caprock_cap::spawncheck::{check_stack, sub_region, StackProposal, StackRefusal};
     // Alles, was aus der Cap und der PD-Tabelle kommt, unter EINEM Lesezugriff -- sonst könnte
     // sich die Zahl zwischen zwei Blicken ändern, und die Schranke wäre eine über einem
     // veralteten Stand.
@@ -3238,6 +3496,19 @@ fn dispatch_spawn(
             _ => (false, false, 0, 0, threads_now),
         }
     };
+    // **K1b: erst das Fenster, dann die Fragen.** Beide Kernelfragen unten (erreicht ein Geraet
+    // die Region? ueberlappt sie einen Nachbarstapel?) gelten der TEILREGION -- wer sie an der
+    // ganzen Cap stellte, bekaeme fuer vier Geschwister in einer Arena viermal dieselbe Antwort.
+    // `SubRegion` ist ausserhalb von `sub_region` nicht herstellbar, deshalb kann das Narrowing
+    // hier nicht uebersprungen werden.
+    let (off_pages, len_pages) = caprock_abi::spawn_sub_unpack(sub);
+    let region = match sub_region(base, len, off_pages, len_pages) {
+        Ok(r) => r,
+        // Der einzige Ausgang von `sub_region`, und er hat seinen eigenen ABI-Code: „du hast eine
+        // Region genannt, die du nicht haeltst" ist etwas anderes als „diese Region taugt nicht
+        // als Stapel".
+        Err(_) => return Err(caprock_abi::result::ERR_SUBREGION),
+    };
     let p = StackProposal {
         is_memory,
         writable,
@@ -3246,13 +3517,17 @@ fn dispatch_spawn(
         // trotzdem im Vorschlag, damit die Prüfung vollständig **lesbar** ist und nicht davon
         // abhängt, dass jemand die Variantenliste im Kopf hat.
         normal_space: is_memory,
-        base,
-        len,
+        region,
         // **Die Frage, die nur der Kernel beantworten kann.** Ein Stack, den ein Gerät schreiben
         // kann, ist die `by ops`-Platzierungsregel als Angriff -- die Rücksprungadresse ist Daten.
-        device_reachable: dma_region_overlaps(base, len),
-        // Ebenso: nur der Kernel kennt die Abbildungen der Ziel-VSpace.
-        overlaps_existing: pd_mapping_overlaps(pd, base, len),
+        device_reachable: dma_region_overlaps(region.base(), region.len()),
+        // Ebenso: nur der Kernel kennt die Abbildungen der Ziel-VSpace. **Zwei Quellen, ODER
+        // verknuepft** (K1b): `pd_mapping_overlaps` sieht die vom Kernel gebuchten User-Regionen,
+        // `stack_sibling_overlaps` die Stapel, die aus Caps kommen und dort absichtlich NICHT
+        // gebucht sind. Ohne die zweite waere die Absage fuer genau die Threads unerreichbar, die
+        // dieser Syscall erzeugt.
+        overlaps_existing: pd_mapping_overlaps(pd, region.base(), region.len())
+            || stack_sibling_overlaps(pd, region.base(), region.len()),
         threads_now,
     };
     let stack_top = check_stack(&p).map_err(|r| match r {
@@ -3262,11 +3537,12 @@ fn dispatch_spawn(
         StackRefusal::BadGeometry => caprock_abi::result::ERR_BADSTACK,
         StackRefusal::Overlaps => caprock_abi::result::ERR_NOSPACE,
         StackRefusal::ThreadLimit => caprock_abi::result::ERR_THREAD_LIMIT,
+        StackRefusal::OutsideCap => caprock_abi::result::ERR_SUBREGION,
     })?;
     // **D0 wörtlich: parken -- binden -- zulassen.** Ein Thread, der lauffähig ist, bevor er seine
     // PD hat, macht seinen ersten Syscall mit LEEREM Cspace. Das hat zehn Tage gekostet, und die
     // Rate war 0,018 %.
-    let parked = spawn_with_stack_parked(entry, arg, base, stack_top, prio)
+    let parked = spawn_with_stack_parked(entry, arg, region.base(), stack_top, prio)
         .ok_or(caprock_abi::result::ERR_NOSPACE)?;
     bind_pd_parked(&parked, pd);
     // Die Stack-Cap am TCB vermerken, BEVOR der Thread laufen darf: danach ist sie gegen
@@ -3274,7 +3550,7 @@ fn dispatch_spawn(
     // und seine Cap löschbar wäre -- und ihre Finalisierung gibt den Speicher an den Allokator
     // zurück, unter den Füßen eines laufenden Stapels.
     let tid = admit(parked).ok_or(caprock_abi::result::ERR_NOSPACE)?;
-    if !record_stack_cap(tid, cap) {
+    if !record_stack_cap(tid, cap, region.base(), region.len()) {
         // **Fail-closed.** Ohne Eintrag ist die Stack-Cap loeschbar, waehrend der Thread auf ihr
         // laeuft -- die Finalisierung gaebe den Speicher an den Allokator zurueck, unter den
         // Fuessen eines laufenden Stapels. Lieber kein Thread als ein ungeschuetzter.
@@ -4687,12 +4963,47 @@ pub struct LadePolitik {
     pub core: Option<usize>,
     /// MCS-Budget in Mikrosekunden; `0` = kein Budget (Round-Robin).
     pub budget_us: u32,
+    /// **Bitmaske der Ziel-Slots, in denen vom Aufrufer ANGEBOTENE Caps liegen** (`SYS_LOAD`)
+    /// -- `0`, wenn nichts angeboten wurde. Seit der Mehrfachdelegation eine Menge und keine
+    /// einzelne Zahl: mit acht moeglichen Angeboten waere ein Einzelwert die erste Delegation,
+    /// und die uebrigen zaehlten faelschlich als Zusagen des Manifests.
+    ///
+    /// ## Warum das ueberhaupt unterschieden werden muss
+    ///
+    /// Im `endow`-Slice liegen zwei verschiedene Dinge, und bis 2026-08-25 behandelte der
+    /// Ladepfad sie gleich:
+    ///
+    /// * eine **Zusage des signierten Manifests** -- was das Autoritaetsdokument dem Programm
+    ///   verspricht. Haelt sie nicht, ist das Programm nicht das, als das es zugelassen wurde.
+    /// * ein **Angebot des ladenden Aufrufers** -- eine Delegation, die eine Zieldomaene
+    ///   ablehnen DARF (`cap_allowed`: eine HardwareLand-PD haelt nur Caps ihres eigenen Kanals).
+    ///
+    /// Ohne die Unterscheidung gibt es nur zwei Fassungen, und beide sind falsch: alles
+    /// durchwinken laesst eine halb ausgestattete PD anlaufen, alles abweisen macht das Laden
+    /// jedes Treibers unmoeglich (`init` bietet jedem Kind seine Notification an und kann die
+    /// Domaene des Kindes gar nicht kennen).
+    pub angebotene_slots: u16,
+    /// **Das angeforderte Cap-Budget der neuen PD** (2026-08-26); `0` = Vorgabe
+    /// ([`caprock_microkit::CAP_BUDGET_PER_PD`]).
+    ///
+    /// Es steht hier und nicht im Manifest, und das ist eine Entscheidung: das Manifest
+    /// beschreibt das **Startverhalten** (ein kleiner Plattentreiber, ein Boot-Taskmanager) und
+    /// wird signiert; alles Weitere entsteht zur Laufzeit. Eine Treiberumgebung, die dreissig
+    /// Slots braucht, wird nicht gebootet, sondern geladen -- also traegt `SYS_LOAD` die Zahl
+    /// (`MSG3`) und nicht das Autoritaetsdokument.
+    pub cap_budget: u16,
 }
 
 impl LadePolitik {
     /// Was ohne Manifest-Angabe gilt -- **bitgleich das Verhalten vor Z11c**.
-    pub const VORGABE: LadePolitik =
-        LadePolitik { farbig: false, prio: IDLE_PRIO, core: None, budget_us: 0 };
+    pub const VORGABE: LadePolitik = LadePolitik {
+        farbig: false,
+        prio: IDLE_PRIO,
+        core: None,
+        budget_us: 0,
+        angebotene_slots: 0,
+        cap_budget: 0,
+    };
 }
 
 /// **Wie [`load_into_pd`], aber mit exklusivem Farbstreifen** (A1 / Z11c, 2026-08-07).
@@ -4787,6 +5098,12 @@ pub const MANGEL_PRIVATREGION: u32 = 12;
 /// Die gemeldete Menge ist eine SEITE und nicht der Stack -- der Speicher war da, die Wache
 /// nicht. Wer hier `USER_KSTACK_SIZE` meldete, schickte die Diagnose in Richtung RAM.
 pub const MANGEL_GUARD_TABELLE: u32 = 13;
+/// **Eine Zusage des Manifests liess sich nicht installieren** (2026-08-25).
+///
+/// Kein Mangel an einer Ressource im ueblichen Sinn, und trotzdem hier: die Meldestelle ist der
+/// einzige Weg, den GRUND eines abgewiesenen Ladevorgangs bis in den Bericht zu tragen. Der Wert
+/// ist der **Slot**, nicht die Anzahl -- „irgendeine Cap ging nicht" ist als Diagnose wertlos.
+pub const MANGEL_ENDOWMENT: u32 = 14;
 /// **Kein Mangel, sondern eine Marke fuer die Sprechprobe.** Keine Stelle des Kernels schreibt
 /// diesen Code; er wird ausschliesslich VOR einer absichtlich fehlschlagenden Anforderung gesetzt.
 /// Steht er hinterher noch da, hat der gepruefte Pfad **geschwiegen** — und das ist von „es lag
@@ -5049,6 +5366,60 @@ pub fn mangel_name(code: u32) -> &'static str {
     }
 }
 
+/// **Wie viele ANGEBOTE des Aufrufers eine Zieldomaene abgelehnt hat** (2026-08-25).
+///
+/// Erwartet > 0: `init` bietet jedem Kind seine Notification an, und jede HardwareLand-PD lehnt
+/// sie ab (`cap_allowed`: nur Caps des eigenen Kanals). Das ist kein Fehler -- aber es war bis
+/// heute **unsichtbar**, und genau deshalb behauptet die Doku-Tabelle in `virtio-blk` bis heute,
+/// in Slot 0 laege eine Notification. Eine Zahl im Bericht widerspricht ihr.
+pub static ENDOW_ANGEBOTE_ABGELEHNT: AtomicUsize = AtomicUsize::new(0);
+
+/// **Wie viele ZUSAGEN des Manifests sich nicht installieren liessen.**
+///
+/// Muss `0` bleiben. Jede andere Zahl heisst: ein Programm haette mit weniger Autoritaet
+/// angefangen, als das signierte Dokument ihm zuspricht -- und haette das niemandem gesagt.
+pub static ENDOW_ZUSAGEN_GEBROCHEN: AtomicUsize = AtomicUsize::new(0);
+
+/// **Wie viele Endowment-Caps ueberhaupt geprueft wurden.**
+///
+/// Die Sprechprobe der `endow`-Zeile, und sie ist noetig: die Hauptsuite bootet ohne Boot-Archiv
+/// und laedt deshalb **kein** Programm. Dort stuenden beide Zahlen darunter auf 0 -- und „nichts
+/// gebrochen" waere von „nichts gemessen" nicht zu unterscheiden. Null ist ein Befund, kein
+/// Messwert.
+pub static ENDOW_GEPRUEFT: AtomicUsize = AtomicUsize::new(0);
+
+/// Die drei Zahlen der `endow`-Zeile: `(geprueft, zusagen_gebrochen, angebote_abgelehnt)`.
+pub fn endowment_bilanz() -> (usize, usize, usize) {
+    (
+        ENDOW_GEPRUEFT.load(Ordering::Acquire),
+        ENDOW_ZUSAGEN_GEBROCHEN.load(Ordering::Acquire),
+        ENDOW_ANGEBOTE_ABGELEHNT.load(Ordering::Acquire),
+    )
+}
+
+/// **Passt dieses Endowment vollstaendig -- BEVOR irgendetwas alloziert ist?** (2026-08-25)
+///
+/// `Ok(n)` = es passt, `n` Angebote wurden dabei abgelehnt. `Err(slot)` = eine **Zusage** haelt
+/// nicht, und zwar diese.
+///
+/// ## Warum die Pruefung hier steht und nicht in der Installationsschleife
+///
+/// Weil an dieser Stelle noch nichts zurueckzunehmen ist. Die Schleife laeuft, nachdem Segmente,
+/// Stack, Seitentabellen und ein geparkter Thread existieren; ein Abbruch dort braucht einen
+/// Teardown-Pfad, den es fuer den Thread gar nicht gibt (der `admit`-Fehlschlag daneben laesst
+/// bis heute einen geparkten Thread liegen). Dieselbe Reihenfolge wie beim Farbstreifen weiter
+/// unten: *schlaegt er fehl, ist noch nichts alloziert, was zurueckmuesste.*
+///
+/// ## Die Regel steht NICHT hier
+///
+/// Entschieden wird in [`Caps::endowment_fits`](caprock_microkit::Caps::endowment_fits), also
+/// neben `budget_allows` und `cap_allowed`. Ein Nachbau an dieser Stelle waere die zweite
+/// Wirklichkeit aus der Fallenliste -- und er waere auch inhaltlich falsch geworden, weil das
+/// Budget den Zuwachs der vorigen Caps mitzaehlen muss.
+fn endowment_pruefen(pd: usize, endow: &[(usize, CapPtr)], angebote: u16) -> Result<usize, usize> {
+    CAPS.read().endowment_fits(pd, endow, angebote)
+}
+
 pub fn load_into_pd_mit(
     img: &ElfImage,
     pd: usize,
@@ -5056,6 +5427,24 @@ pub fn load_into_pd_mit(
     boot_arg: usize,
     pol: LadePolitik,
 ) -> Option<ThreadId> {
+    // **Das Endowment wird VERBUCHT, bevor irgendetwas alloziert ist** (2026-08-25).
+    //
+    // Bis heute lief die Installationsschleife weiter unten so: `if !install_pd_cap(..) {
+    // cap_delete(..) }` -- ohne Zaehler, ohne Meldung, ohne Abbruch. Der Kommentar zwei Zeilen
+    // dahinter behauptet „Endowment vollstaendig"; die Schleife konnte das nie einloesen. Ein
+    // Programm, dem eine Zusage des Manifests fehlt, lief damit an, und niemand erfuhr es --
+    // dieselbe Form wie der fehlende Endowment-Slot beim Hot-Reload, nur ohne die `NotReady`,
+    // die dort wenigstens etwas sagte.
+    ENDOW_GEPRUEFT.fetch_add(endow.len(), Ordering::Relaxed);
+    let abgelehnte_angebote = match endowment_pruefen(pd, endow, pol.angebotene_slots) {
+        Ok(n) => n,
+        Err(slot) => {
+            mangel(MANGEL_ENDOWMENT, slot as u64);
+            ENDOW_ZUSAGEN_GEBROCHEN.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+    ENDOW_ANGEBOTE_ABGELEHNT.fetch_add(abgelehnte_angebote, Ordering::Relaxed);
     // **Der Kern steht VOR jeder Allokation fest**, denn er bestimmt, welcher Scheduler den Thread
     // bekommt -- und `spawn_user_at_parked` prueft das per `debug_assert_eq!`. Eine Affinitaet, die
     // erst nach dem Anlegen wirkt, waere eine Migration und keine Zuteilung.
@@ -5378,8 +5767,16 @@ pub fn load_into_pd_mit(
         // sie NICHT installiert -> die vom Dispatch erzeugte Kopie loeschen, sonst leckt sie (frisches
         // CDT-Blatt, nicht letzte Referenz -> delete_leaf senkt nur den Refcount). Keine Locks gehalten;
         // unter `daif` bleiben die IRQ-safe Locks maskiert.
+        //
+        // **Ein Fehlschlag hier ist seit 2026-08-25 ein WIDERSPRUCH, keine geduldete Lage.**
+        // `endowment_pruefen` oben hat jeden dieser Caps schon gegen dieselben zwei Praedikate
+        // gehalten; faellt hier trotzdem einer durch, hat sich der Cspace dazwischen geaendert.
+        // Gezaehlt statt verschwiegen -- und die Zahl gattert (`endow`-Zeile).
         if !install_pd_cap(pd, slot, cap) {
             let _ = cap_delete(cap);
+            if slot >= 16 || pol.angebotene_slots & (1u16 << slot) == 0 {
+                ENDOW_ZUSAGEN_GEBROCHEN.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
     // **Jetzt erst darf er laufen** -- PD gebunden, Endowment vollstaendig. Das ist die Stelle,
@@ -5417,7 +5814,10 @@ pub fn load_elf_mit(
     // Loeschen stuende bei einem Fehlschlag der Grund des VORIGEN Ladevorgangs da -- ein
     // veralteter Grund ist schlimmer als keiner.
     mangel_zuruecksetzen();
-    let Some(pd) = create_pd_in_domain(domain) else {
+    // **Das Budget wird HIER gebucht, vor allem anderen.** Es hat zwei unterscheidbare Absagen
+    // (ueber `CAP_BUDGET_MAX` / Vorrat erschoepft); beide fuehren hier zu `MANGEL_PD_SLOT`, und
+    // welche es war, steht in `pd_budget_bilanz()`.
+    let Some(pd) = create_pd_mit_budget(domain, pol.cap_budget) else {
         mangel(MANGEL_PD_SLOT, 0);
         return None;
     };
@@ -5547,7 +5947,19 @@ pub fn map_region_into_thread(tid: ThreadId, phys: u64, len: u64, kind: MappingK
 // IRQ-Pfad ist **deadlock-frei** gehalten: `irq_hook` läuft im IRQ-Kontext und ist
 // LOCK-FREI (nur Atomics + GIC-Maskierung); die eigentliche Zustellung (`drain_pending_irqs`)
 // läuft im Reschedule-Pfad (IRQs im Trap maskiert -> kein Reentrancy) und nimmt NTFNS<SCHEDS.
-const NIRQ_BIND: usize = 4;
+/// Bindungsplätze der IRQ-Tabelle — **hergeleitet, nicht gewählt**.
+///
+/// Eine Bindung je Gerätezuteilung (Stufe B gibt jedem Gerät genau einen Vektor, mehr ist
+/// ausdrückliches Nichtziel), plus **eine** für den in-Kernel-Binder: den aarch64-RTC-Test, der
+/// zu keiner Zuteilung gehört. Eine feste 4 daneben wäre ein zweites Gedächtnis, und die Relation
+/// `NIRQ_BIND >= MAX_DRIVER_ASSIGN` galt bis heute nur zufällig — genau die Form, die
+/// `STACK_CAP_SLOTS = 1024` gekostet hat: eine Zahl, die neben ihren Nachbarn steht statt gegen
+/// sie geprüft zu werden.
+///
+/// **Die Folge ist die Aussage von `ERR_IRQ_FULL`** (E12): weil die Tabelle nie enger ist als die
+/// Menge der Zuteilungen, kann kein Treiber-PD einem anderen den Platz wegnehmen. Der Code meint
+/// damit etwas Lokales — *dieses Gerät hat keinen freien Vektor* — und nicht „das System ist voll".
+const NIRQ_BIND: usize = MAX_DRIVER_ASSIGN + 1;
 #[allow(clippy::declare_interior_mutable_const)]
 static IRQ_INTID: [AtomicU32; NIRQ_BIND] = [const { AtomicU32::new(u32::MAX) }; NIRQ_BIND];
 #[allow(clippy::declare_interior_mutable_const)]
@@ -5558,11 +5970,27 @@ static IRQ_BADGE: [AtomicU64; NIRQ_BIND] = [const { AtomicU64::new(0) }; NIRQ_BI
 static IRQ_PENDING: [AtomicBool; NIRQ_BIND] = [const { AtomicBool::new(false) }; NIRQ_BIND];
 static IRQ_ANY_PENDING: AtomicBool = AtomicBool::new(false);
 static IRQ_DELIVERED: AtomicU64 = AtomicU64::new(0); // Telemetrie: zugestellte Geräte-IRQs
+/// **Wie oft `irq_hook` ueberhaupt gerufen wurde** — die ANKUNFT, unabhaengig von Bindung und Drain.
+static IRQ_HOOK_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Der zuletzt gesehene Vektor. „Es kam etwas" und „es kam MEINER" sind zwei Aussagen.
+static IRQ_HOOK_LAST: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// **Geräte-IRQ-Hook** (aus `exception.rs`, IRQ-Kontext, **LOCK-FREI**): ist `intid`
 /// registriert, vermerken (pending) + am Distributor maskieren (kein Re-Trigger), `true`.
 /// Sonst `false`. Nimmt KEINEN Lock — die Zustellung erfolgt deferred im Reschedule-Pfad.
 fn irq_hook(intid: u32) -> bool {
+    // **Der rohe Zaehler: ANKUNFT, nicht Zustellung.**
+    //
+    // `IRQ_DELIVERED` waechst in `drain_pending_irqs`, also im Reschedule-Pfad -- es misst den
+    // **Drain**. Drei Lagen sind damit ununterscheidbar, und genau daran ist die B4-Suche
+    // haengengeblieben: der Interrupt kam nie an / er kam an und der Vektor war unbekannt / er kam
+    // an, wurde vermerkt und nie gedrained. Dieser Zaehler laeuft **vor** jeder Bedingung und
+    // zaehlt jeden Vektor, den der Dispatch hier hereingibt.
+    //
+    // Dieselbe Unterscheidung wie `rx_used` gegen „Daten sind angekommen" -- diesmal im eigenen
+    // Messwerkzeug.
+    IRQ_HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
+    IRQ_HOOK_LAST.store(intid, Ordering::Relaxed);
     for i in 0..NIRQ_BIND {
         if IRQ_INTID[i].load(Ordering::Acquire) == intid {
             hal::intc::mask_intid(intid); // level-getriggerten Geräte-IRQ bis zum Drain sperren
@@ -5597,13 +6025,55 @@ fn drain_pending_irqs() {
 
 /// Eine **IRQ-Capability** prägen (ext-22, P5) — nur kernelseitig; installiert wird sie
 /// cap-policy-geprüft nur in HardwareLand-PDs.
+pub fn signal_from_kernel_ntfn(ntfn: usize, badge: u64) {
+    // **Sperrordnung `NTFNS < SCHEDS`**, wie im Deferred-IRQ-Pfad: `signal_from_kernel` nimmt sich
+    // die Scheduler-Instanz selbst, es darf hier keine gehalten werden. Fuer Sonden (A2).
+    if ntfn < ntfns().len() {
+        let mut ops = KernelSched;
+        ntfns()[ntfn].lock().signal_from_kernel(&mut ops, badge);
+    }
+}
+
 pub fn install_irq_cap(intid: u32, rights: Rights) -> Result<CapPtr, CapError> {
     CAPS.write().cspace.install_irq(intid, rights)
 }
 
+/// **Der cap-geprüfte Einstieg für `SYS_BIND_IRQ`** (B3) — gerufen aus dem Dispatch, nachdem
+/// dieser `Irq`-Cap und Notification-Cap im Cspace des Aufrufers aufgelöst hat.
+///
+/// `intid` kommt hier aus dem **Cap-Objekt** und nicht aus einem Register des Aufrufers; das ist
+/// der Riegel, und er ist strukturell statt geprüft. [`bind_irq`] daneben bleibt der rohe
+/// in-Kernel-Weg (RTC-Test) und trägt deshalb weiter Zahlen.
+///
+/// **Erneutes Binden derselben Cap ersetzt den Eintrag**, statt einen zweiten zu verbrauchen —
+/// sonst erschöpfte ein Treiber, der sich neu lädt, sein eigenes Gerät. Die Ersetzung ist auch der
+/// Grund, warum hier nicht einfach `bind_irq` gerufen wird: das nimmt bedingungslos einen freien
+/// Platz.
+fn dispatch_bind_irq(intid: u32, ntfn: usize, badge: u64, core: usize) -> Result<(), u64> {
+    // Erst der eigene Eintrag. `compare_exchange` gegen `intid` selbst: findet er ihn, gehört der
+    // Platz schon diesem Interrupt, und das Neusetzen von Notification und Badge IST die Bindung.
+    for i in 0..NIRQ_BIND {
+        if IRQ_INTID[i].load(Ordering::Acquire) == intid {
+            IRQ_NTFN[i].store(ntfn as u32, Ordering::Release);
+            IRQ_BADGE[i].store(badge, Ordering::Release);
+            return Ok(());
+        }
+    }
+    if bind_irq(intid, ntfn, badge, core) {
+        Ok(())
+    } else {
+        Err(caprock_abi::result::ERR_IRQ_FULL)
+    }
+}
+
 /// Einen Geräte-IRQ `intid` an die Notification `ntfn` (mit `badge`) **binden**, an `core`
-/// routen und freigeben (ext-22, P5). Nutzt das HardwareLand-Backend (über die IRQ-Cap
-/// autorisiert). Gibt `false`, wenn kein Bindungs-Slot frei ist.
+/// routen und freigeben (ext-22, P5).
+///
+/// **Der rohe Weg, ohne Cap-Prüfung** — der einzige Aufrufer ist der in-Kernel-RTC-Test. Aus EL0
+/// führt [`dispatch_bind_irq`] hierher, und *der* prüft. Bis B3 behauptete der Kommentar an dieser
+/// Stelle, die Funktion sei „über die IRQ-Cap autorisiert"; ihre Signatur konnte das nie tragen.
+///
+/// Gibt `false`, wenn kein Bindungs-Slot frei ist.
 pub fn bind_irq(intid: u32, ntfn: usize, badge: u64, core: usize) -> bool {
     for i in 0..NIRQ_BIND {
         if IRQ_INTID[i]
@@ -5625,6 +6095,18 @@ pub fn bind_irq(intid: u32, ntfn: usize, badge: u64, core: usize) -> bool {
 /// Anzahl bisher zugestellter Geräte-IRQs (Telemetrie für den `irq`-Test).
 pub fn irqs_delivered() -> u64 {
     IRQ_DELIVERED.load(Ordering::Acquire)
+}
+
+/// **Angekommene Interrupts und der zuletzt gesehene Vektor** — `(Aufrufe, letzter)`.
+///
+/// Nicht dasselbe wie [`irqs_delivered`], und der Unterschied ist die ganze Diagnose: hier steht,
+/// was den Prozessor erreicht hat, dort, was bis zur Notification gekommen ist. Der Timer und der
+/// Resched-IPI kommen hier **nicht** vor -- der x86-Dispatch faengt sie vorher ab.
+pub fn irq_hook_stats() -> (u64, u32) {
+    (
+        IRQ_HOOK_CALLS.load(Ordering::Acquire),
+        IRQ_HOOK_LAST.load(Ordering::Acquire),
+    )
 }
 
 // --- DMA-Capabilities + DmaEnforcer-Abstraktion (ext-23) ---
@@ -7485,6 +7967,17 @@ pub struct DriverDevice {
     pub vendor: u16,
     /// PCI-Geräte-ID — dito.
     pub device: u16,
+    /// **MSI-X (Stufe B):** Offset der Capability im Konfigurationsraum; `0` = das Geraet hat
+    /// keine, und dann gibt es fuer diese Zuteilung keinen Interrupt.
+    pub msix_cap: u16,
+    /// Identity-Adresse der MSI-X-Tabelle (`0` = keine).
+    ///
+    /// **Sie liegt garantiert NICHT in der BAR, die der Treiber bekommt** -- ein Geraet, bei dem
+    /// sie das taete, wird gar nicht erst angeboten (E11). Sonst koennte der Treiber Adresse und
+    /// Datenwort selbst schreiben und damit waehlen, wo sein Interrupt landet.
+    pub msix_table: u64,
+    /// Zeilen der Tabelle (`Table Size` + 1).
+    pub msix_eintraege: u16,
     /// `class<<16 | subclass<<8 | prog_if` — dito.
     pub class: u32,
 }
@@ -7506,12 +7999,342 @@ pub const MAX_OFFERED_DEVICES: usize = 8;
 static DRIVER_DEVICES: SpinLock<[Option<DriverDevice>; MAX_OFFERED_DEVICES]> =
     SpinLock::new([None; MAX_OFFERED_DEVICES]);
 
-/// Wie viel DMA-Speicher eine Treiber-PD bekommt. Reicht für Ringe + Puffer eines einfachen
-/// Geräts; die Größe gehört perspektivisch ins Manifest (Z11c), nicht hierher.
+/// **Die VORGABE, wenn der Ladeaufruf keine Groesse nennt** (C2, 2026-08-26). Reicht fuer Ringe +
+/// Puffer eines einfachen Geraets.
+///
+/// Hier stand „die Groesse gehoert perspektivisch ins Manifest (Z11c)". Das ist **verworfen**: das
+/// Manifest beschreibt den Bootzustand und wird signiert; eine Treiberumgebung, die einen groesseren
+/// Pool braucht, wird zur Laufzeit geladen. Die Groesse ist deshalb **Argument der Zuteilung**
+/// (`SYS_LOAD` `x5`, s. `caprock_abi::load_extras`) und die Konstante nur noch die Vorgabe.
 const DRIVER_DMA_BYTES: u64 = 16 * 1024;
+
+/// Obergrenze je Zuteilung -- **dieselbe Zahl wie in der ABI**, nicht eine zweite daneben.
+///
+/// Ein Kernel, der oberhalb einer anderen Grenze abweist als die, die die Schnittstelle
+/// veroeffentlicht, macht die Absage fuer den Aufrufer unvorhersagbar. Der `const assert` haelt
+/// beide zusammen; wer eine aendert, bricht den Bau, bis er die andere mitnimmt.
+const DRIVER_DMA_MAX_BYTES: u64 = caprock_abi::DRIVER_DMA_MAX_PAGES * 4096;
+const _: () = assert!(
+    DRIVER_DMA_BYTES <= DRIVER_DMA_MAX_BYTES,
+    "die Vorgabe liegt ueber der Obergrenze"
+);
 
 /// Höchstzahl gleichzeitiger Gerätezuteilungen (heute: eine, s. [`DRIVER_DEVICE`]).
 const MAX_DRIVER_ASSIGN: usize = 4;
+
+// --- Stufe B: CPU-Vektoren fuer Geraete-MSI --------------------------------------------------
+//
+// **Ein Vektor je Zuteilung, und die Zahl ist hergeleitet, nicht gewaehlt:** Stufe B gibt jedem
+// Geraet genau einen Vektor (MSI-X mit mehreren Vektoren ist ausdruecklich Nichtziel), also braucht
+// es so viele wie es Zuteilungen gibt.
+//
+// `0x60` ist frei: 0..31 sind CPU-Ausnahmen, 32 der Timer, 33 der Resched-IPI, 0x70 der
+// IRTE-Selbsttest, 0x80 der Syscall. Der `const assert` haelt die Wahl gegen die belegten Zahlen,
+// damit eine Verschiebung den Bau bricht statt still zu kollidieren.
+//
+// **x86 only, by content and not merely by use:** every number in that list is an entry of the
+// x86 IDT. aarch64 delivers through GICv3/ITS and allocates no CPU vector at all (plan §5).
+#[cfg(target_arch = "x86_64")]
+const MSI_VEKTOR_BASIS: u8 = 0x60;
+/// **Der Vektor der ZUSTELLPROBE** — direkt hinter dem Block der Zuteilungen.
+///
+/// Er gehoert in denselben `const assert` wie die uebrigen: eine Probe, die sich mit einer echten
+/// Zuteilung ueberschneidet, misst deren Interrupt und meldet Erfolg.
+#[cfg(target_arch = "x86_64")]
+const MSI_TEST_VEKTOR: u8 = MSI_VEKTOR_BASIS + MAX_DRIVER_ASSIGN as u8;
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(
+    MSI_VEKTOR_BASIS as usize > 33
+        && (MSI_VEKTOR_BASIS as usize) + MAX_DRIVER_ASSIGN + 1 <= 0x70,
+    "MSI-Vektorblock (samt Zustellprobe) kollidiert mit Timer/IPI/IRTE-Selbsttest/Syscall"
+);
+
+/// Badge der Zustellprobe — eigenes Etikett, damit „es kam etwas an" von „es kam MEINES an"
+/// unterscheidbar bleibt.
+#[cfg(target_arch = "x86_64")]
+const MSI_PROBE_BADGE: u64 = 0x4d53_4950; // "MSIP"
+
+/// **Was die Zustellprobe ergeben hat** (Stufe B, der Schnitt zwischen Erzeugung und Zustellung).
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MsiZustellBefund {
+    /// Konnte die Probe ueberhaupt aufgebaut werden? (Remapping scharf, IRTE frei, Bindung frei)
+    pub sprechfaehig: bool,
+    /// Die Adresse, die geschrieben wurde — die **Erzeugerseite**, so wie ein Geraet sie schreibt.
+    pub addr: u32,
+    pub data: u32,
+    /// Ist die **remappable** Nachricht angekommen? — **unter QEMU nicht aussagekraeftig**, s.
+    /// [`msi_zustellprobe`].
+    pub zugestellt: bool,
+    /// Kam sie mit **diesem** Badge an? Ohne das waere ein fremder Interrupt ein Beleg.
+    pub badge_stimmt: bool,
+    /// Ist die **Kompatibilitaets**-Nachricht angekommen? Das ist die Haelfte, die traegt:
+    /// APIC → IDT → `irq_hook` → Drain → Notification, ohne Interrupt-Remapping.
+    pub kompat_zugestellt: bool,
+    /// **Ist der remappable Interrupt ueberhaupt am Prozessor ANGEKOMMEN?** (`irq_hook` gerufen)
+    pub remap_angekommen: bool,
+    /// dito fuer die Kompatibilitaetsform.
+    pub kompat_angekommen: bool,
+    /// Der zuletzt in `irq_hook` gesehene Vektor (`u32::MAX` = noch keiner).
+    pub letzter_vektor: u32,
+    /// Hat die IOMMU einen Fault aufgezeichnet? Eine abgewiesene Geraete-MSI **faultet**; bleibt
+    /// die Liste leer und kommt trotzdem nichts an, hat das Geraet nicht gesendet.
+    pub faults_leer: bool,
+}
+
+/// **Die Halbierung: eine MSI vom KERN aus erzeugen** — ein gewoehnlicher Store, kein Geraet.
+///
+/// Der ganze Zustellpfad (IRTE → Interrupt-Remapping → APIC → IDT → `irq_hook` → Drain →
+/// Notification) war bis heute **nie gefahren**: der IRTE-Selbsttest auf `0x70` liest ausschliesslich
+/// den Tabelleninhalt zurueck und stellt nichts zu. Damit war jede gruene Zeile auf der
+/// Zustellseite eine Aussage ueber Zustand, nicht ueber Wirkung — dieselbe Unterscheidung wie
+/// `rx_used` gegen „Daten sind angekommen", nur eine Ebene tiefer.
+///
+/// **Was der Ausgang entscheidet:**
+///
+/// * **kommt an** → der Pfad traegt, und ein ausbleibender Geraeteinterrupt liegt vollstaendig auf
+///   der **Erzeugerseite** (Geraet/virtio). `EIME`, `IRTA`, Vektorwahl, IDT sind damit erledigt.
+/// * **kommt nicht an** → die Geraeteseite ist irrelevant, es ist der **Remapping-Pfad**.
+///
+/// **Der Haken, und er ist gemessen worden, nicht erschlossen:** die *remappable* Haelfte dieser
+/// Probe ist **unter QEMU nicht aussagekraeftig**. Interrupt-Remapping haengt dort als
+/// Speicherregion im **Geraete**-Adressraum; ein CPU-Store nach `0xFEE0_0000` geht daran vorbei
+/// und wird vom lokalen APIC direkt dekodiert — also in **Kompatibilitaetsform**. `0xfee00048`
+/// heisst dann „Ziel 0", und das Datenwort `0` heisst **Vektor 0**: nichts kann ankommen, ganz
+/// gleich wie heil der Remapping-Pfad ist. Ein `zugestellt=false` belegt hier also **nichts** —
+/// und ein `true` waere ein Beleg fuer den falschen Pfad gewesen.
+///
+/// Deshalb steht daneben die **Kompatibilitaetsprobe**, und die traegt: sie misst
+/// APIC → IDT → `irq_hook` → Drain → Notification. Kommt sie an, ist die zweite Haelfte des
+/// Zustellpfads bewiesen und die offene Frage schrumpft auf die Uebersetzung selbst. Kommt sie
+/// nicht an, liegt der Fehler vor der IOMMU und die IRTE-Frage ist verfrueht.
+///
+/// **`rid = 0`** bleibt richtig fuer den Fall, dass die remappable Haelfte je aussagekraeftig wird:
+/// `SVT/SID` prueft die Quelle, und der Prozessor ist kein PCI-Geraet.
+#[cfg(target_arch = "x86_64")]
+pub fn msi_zustellprobe() -> MsiZustellBefund {
+    let mut b = MsiZustellBefund::default();
+    let Some(nid) = create_notification() else { return b };
+    if !bind_irq(MSI_TEST_VEKTOR as u32, nid, MSI_PROBE_BADGE, hal::cpu::core_id()) {
+        return b;
+    }
+    let Ok(ticket) = hal::vtd::irte_vergib(
+        0, // SID 0 -- s. Funktionsdoku
+        MSI_TEST_VEKTOR,
+        hal::intc::lapic_id(),
+        hal::vtd::Vektorform::MsiX,
+        1,
+    ) else {
+        return b;
+    };
+    let Some((addr, data, _)) = ticket.eintrag(0) else {
+        let _ = hal::vtd::irte_zieh_ein(&ticket);
+        return b;
+    };
+    b.sprechfaehig = true;
+    b.addr = addr;
+    b.data = data;
+    let vorher = irqs_delivered();
+    let (hook_vorher, _) = irq_hook_stats();
+    // **Der Store.** Genau das, was das Geraet tut, wenn es seine MSI-X-Zeile abschickt.
+    // SAFETY: `addr` liegt im Nachrichtenfenster (`0xFEE0_0000..`), identity-gemappt und
+    // uncacheable; ein 32-Bit-Store dorthin IST die Nachricht.
+    unsafe { core::ptr::write_volatile(addr as u64 as *mut u32, data) };
+    // Warten wie die uebrigen Sonden: auf die GROESSE, mit Frist -- eine Zaehlschleife maesse die
+    // Geschwindigkeit des Wartenden.
+    let t0 = hal::timer::ticks(0);
+    let mut wache = 0u64;
+    while hal::timer::ticks(0).wrapping_sub(t0) < 10 && wache < 200_000_000 {
+        if irqs_delivered() > vorher {
+            break;
+        }
+        core::hint::spin_loop();
+        wache += 1;
+    }
+    b.zugestellt = irqs_delivered() > vorher;
+    b.remap_angekommen = irq_hook_stats().0 > hook_vorher;
+    if b.zugestellt && nid < ntfns().len() {
+        b.badge_stimmt = ntfns()[nid].lock().pending_badge() & MSI_PROBE_BADGE != 0;
+    }
+
+    // --- Die Haelfte, die traegt: ein SELF-IPI, ohne Remapping ------------------------------
+    //
+    // **Nicht ein Store nach `0xFEE0_0000`** -- das ist die LAPIC-MMIO-Seite des eigenen Kerns,
+    // also ein Registerzugriff und keine Nachricht; unter x2APIC ist die Seite ueberdies
+    // abgeschaltet. Der erste Anlauf dieser Probe hat genau das gemessen und `false` gemeldet,
+    // ohne dass es etwas ueber den Zustellpfad ausgesagt haette.
+    //
+    // Der Self-IPI misst APIC → IDT → Dispatch → `irq_hook` → Drain → Notification und laesst
+    // Remapping und Geraeteseite ausdruecklich weg. Kommt er an, ist diese Haelfte bewiesen und
+    // die offene Frage schrumpft auf Erzeugung und Uebersetzung.
+    let vorher2 = irqs_delivered();
+    let (hook_vorher2, _) = irq_hook_stats();
+    let kompat_addr: u32 = 0; // kein Store mehr -- die Zahl bleibt im Bericht als 0 stehen
+    let _ = kompat_addr;
+    hal::intc::self_ipi(MSI_TEST_VEKTOR);
+    let t1 = hal::timer::ticks(0);
+    let mut w2 = 0u64;
+    while hal::timer::ticks(0).wrapping_sub(t1) < 10 && w2 < 200_000_000 {
+        if irqs_delivered() > vorher2 {
+            break;
+        }
+        core::hint::spin_loop();
+        w2 += 1;
+    }
+    b.kompat_zugestellt = irqs_delivered() > vorher2;
+    let (hook_nachher, letzter) = irq_hook_stats();
+    b.kompat_angekommen = hook_nachher > hook_vorher2;
+    b.letzter_vektor = letzter;
+    b.faults_leer = hal::vtd::faults_empty();
+
+    let _ = hal::vtd::irte_zieh_ein(&ticket);
+    b
+}
+
+/// Belegte MSI-Vektoren, indiziert relativ zu [`MSI_VEKTOR_BASIS`].
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::declare_interior_mutable_const)]
+static MSI_VEKTOR_BELEGT: [AtomicBool; MAX_DRIVER_ASSIGN] =
+    [const { AtomicBool::new(false) }; MAX_DRIVER_ASSIGN];
+
+/// Einen CPU-Vektor fuer ein Geraet reservieren. `None` = alle vergeben.
+#[cfg(target_arch = "x86_64")]
+fn msi_vektor_reservieren() -> Option<u8> {
+    for i in 0..MAX_DRIVER_ASSIGN {
+        if MSI_VEKTOR_BELEGT[i]
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Some(MSI_VEKTOR_BASIS + i as u8);
+        }
+    }
+    None
+}
+
+/// Einen Vektor zurueckgeben (Ruecknahme einer halben Zuteilung, Teardown).
+#[cfg(target_arch = "x86_64")]
+fn msi_vektor_freigeben(vektor: u8) {
+    let i = vektor.wrapping_sub(MSI_VEKTOR_BASIS) as usize;
+    if i < MAX_DRIVER_ASSIGN {
+        MSI_VEKTOR_BELEGT[i].store(false, Ordering::Release);
+    }
+}
+
+/// **What a granted device interrupt consists of.**
+///
+/// Three pieces and not two: `ticket` is the `#[must_use]` receipt `irte_vergib` hands out, and it
+/// is the **only** thing `irte_zieh_ein` accepts. Keeping just the handle would leave a present
+/// IRTE that nobody can withdraw any more — precisely what that `#[must_use]` exists to prevent.
+#[derive(Clone, Copy)]
+struct MsiGrant {
+    vector: u8,
+    handle: u16,
+    /// x86 only: on aarch64 there is no ticket, because there is no allocation (see
+    /// [`msi_grant`]). A field that only exists where it means something beats an `Option` that
+    /// is `None` on a whole architecture.
+    #[cfg(target_arch = "x86_64")]
+    ticket: hal::vtd::MsiZiel,
+}
+
+/// **Take an interrupt grant back — device first, translation second, vector last.**
+///
+/// The order is the assurance, not the tidiness. Reversed — withdraw the IRTE, then mask, then
+/// free — there is a window in which the device is still armed and its entry is already gone: an
+/// MSI arriving there hits a **not present** IRTE. That is fail-closed as delivery, but it is a
+/// VT-d fault with no owner, counted against nothing, and it happens on a perfectly ordinary
+/// abort path.
+///
+/// This is the same order the DMA teardown already runs — **source before translation** — and it
+/// is one place on purpose: every abort path in [`assign_driver_device`] goes through here, so the
+/// paths before and after `msix_enable` cannot drift apart.
+#[cfg(target_arch = "x86_64")]
+fn msi_revoke(dev: &DriverDevice, g: &MsiGrant) {
+    // 1. Still the device. Function Mask rather than `Enable = 0`, see `msix_quiesce_by_rid`.
+    let _ = hal::pcie::msix_quiesce_by_rid(dev.rid, dev.msix_cap);
+    if dev.msix_table != 0 {
+        // SAFETY: `msix_table` is this device's identity-mapped table base (determined from BAR
+        // index + offset when the device was offered), row 0 < the reported row count, and the
+        // device belongs to nobody else until it is released.
+        unsafe { hal::pcie::msix_mask_entry(dev.msix_table, 0) };
+    }
+    // 2. Only now the translation: nothing can be in flight towards it any more.
+    let _ = hal::vtd::irte_zieh_ein(&g.ticket);
+    // 3. And only then the vector, which is what a later grant would hand out again.
+    msi_vektor_freigeben(g.vector);
+}
+
+/// aarch64 has no MSI grant to take back — see [`msi_grant`].
+#[cfg(not(target_arch = "x86_64"))]
+fn msi_revoke(_dev: &DriverDevice, _g: &MsiGrant) {}
+
+/// **Allocate an IRTE, write the device's MSI-X row, arm it** (Stufe B, B1).
+///
+/// At the same place as the DMA attach and for the same reason: the assignment is the point at
+/// which a device is tied to a PD, and both authorities — *where may it write* and *where may it
+/// interrupt* — belong in the same decision. `SVT/SID` is set in the same step: an IRTE without a
+/// source check accepts an MSI from **any** device, and then interrupt delivery is exactly the
+/// channel A-5.4 closed on the DMA axis. Setting it afterwards would mean a window in which the
+/// entry exists and does not check.
+///
+/// **No interrupt is not a failure.** A device without MSI-X (or a unit without live remapping)
+/// gets an assignment without a vector — the driver then polls as before. Refusing the device
+/// instead would make Stufe B a *precondition* of A-5.1 rather than its extension. What that
+/// costs is a distinction the report has to carry: see `driver_msi`.
+#[cfg(target_arch = "x86_64")]
+fn msi_grant(dev: &DriverDevice) -> Option<MsiGrant> {
+    if dev.msix_table == 0 || dev.msix_eintraege == 0 {
+        return None;
+    }
+    let vector = msi_vektor_reservieren()?;
+    let ticket = match hal::vtd::irte_vergib(
+        dev.rid,
+        vector,
+        hal::intc::lapic_id(),
+        hal::vtd::Vektorform::MsiX,
+        1,
+    ) {
+        Ok(t) => t,
+        Err(_) => {
+            // Nothing is present and nothing was written to the device: the reserved vector is
+            // the only thing to give back, and `msi_revoke` has no ticket to take.
+            msi_vektor_freigeben(vector);
+            return None;
+        }
+    };
+    let handle = ticket.handle();
+    let Some((addr, data, _)) = ticket.eintrag(0) else {
+        msi_revoke(dev, &MsiGrant { vector, handle, ticket });
+        return None;
+    };
+    // SAFETY: see `msi_revoke`.
+    unsafe { hal::pcie::msix_write_entry(dev.msix_table, 0, addr, data) };
+    let ctrl = hal::pcie::msix_enable_by_rid(dev.rid, dev.msix_cap);
+    let g = MsiGrant { vector, handle, ticket };
+    // A spoken-for check, not a convenience: a configuration space that does not answer returns
+    // `0xffff`, and a write nobody reads back looks the same in both cases.
+    if hal::pcie::all_ones16(ctrl) || ctrl & hal::pcie::MSIX_CTRL_ENABLE == 0 {
+        msi_revoke(dev, &g);
+        return None;
+    }
+    Some(g)
+}
+
+/// **aarch64 grants no vector — and says so rather than pretending.**
+///
+/// GICv3/ITS is a different mechanism and is an explicit non-goal of Stufe B (plan §5); the
+/// existing `irq` line already covers the aarch64 delivery path with a real device (RTC). So the
+/// honest answer here is „no vector", which is exactly the state this architecture is in today:
+/// the driver polls.
+///
+/// **Not `unimplemented!()`** — this path is walked on every device assignment, and it is not a
+/// gap in the code, it is the scope of the stage. The seam sits here and not at the four call
+/// sites inside `assign_driver_device`, because those four called `hal::vtd` directly and broke
+/// the aarch64 build (E0433 × 4, E0425 × 4) — third instance of *arch-neutral kernel code calls a
+/// HAL function that only x86 has*.
+#[cfg(not(target_arch = "x86_64"))]
+fn msi_grant(_dev: &DriverDevice) -> Option<MsiGrant> {
+    None
+}
 
 /// Was einer Treiber-PD tatsächlich zugeteilt wurde — gebraucht, um die **Gerätesicht** ihrer
 /// DMA-Region wiederzufinden, wenn sie diese mappt.
@@ -7537,6 +8360,47 @@ struct DriverAssign {
     device: u16,
     dma_phys: u64,
     dma_len: u64,
+    /// **Was der Ladeaufruf angefordert hat**, in Seiten (`0` = Vorgabe) -- C2.
+    ///
+    /// Steht neben `dma_len` und nicht statt ihm: der Bericht prueft `dma_len == gewuenscht*4096`,
+    /// und dafuer braucht er beide Zahlen. Nur die gewaehrte zu fuehren hiesse, „gekuerzt" von
+    /// „so angefordert" nicht unterscheiden zu koennen -- genau die Aussage, um die es hier geht.
+    dma_gewuenscht: u32,
+    // --- Stufe B: Interrupt ----------------------------------------------------------------
+    //
+    // **Die Bindung haengt HIER und nicht an einer globalen Tabelle** (E12). Es gibt bereits eine
+    // natuerliche Obergrenze -- ein Vektor je Geraet --, also braucht es kein Konto: wer ein Geraet
+    // hat, hat genau dessen Bindungen, und kein Treiber-PD kann einem anderen die Ressource
+    // wegnehmen, weil die Zuteilung schon die Vergabestelle ist. `ERR_IRQ_FULL` meint damit etwas
+    // **Lokales**: dieses Geraet hat keinen freien Vektor.
+    //
+    // Dieselbe Zahl trug vorher `NIRQ_BIND = 4` global -- formgleich zu `CAP_BUDGET_PER_PD` vor
+    // der Kontoumstellung, nur dass hier die Obergrenze schon existierte.
+    /// CPU-Vektor dieses Geraets (`0` = keiner vergeben, das Geraet hat kein MSI-X).
+    msi_vektor: u8,
+    /// Der IRTE-Index, den die MSI-X-Zeile traegt. Nur fuer den Einzug beim Teardown.
+    msi_handle: u16,
+    /// Ist er vergeben? (`msi_vektor == 0` waere zweideutig -- 0 ist ein gueltiger Vektor.)
+    msi_da: bool,
+    /// Identity-Adresse der MSI-X-Tabelle (`0` = keine) — mitgefuehrt, damit der Bericht die Zeile
+    /// **zurueklesen** kann, statt zu glauben, dass sie noch steht.
+    msix_table: u64,
+    /// Offset der MSI-X-Capability im Konfigurationsraum (`0` = keine).
+    msix_cap: u16,
+    /// Die Notification, auf der der Treiber seinen Interrupt erwartet (B4). `u32::MAX` = keine.
+    ///
+    /// Die **Id**, nicht die Cap: der Bericht will wissen, ob DIESES Objekt signalisiert wurde,
+    /// und eine Cap sagt darueber nichts (der Treiber haelt eine Kopie, der Kernel das Original).
+    msi_ntfn: u32,
+    /// **Bietet das GERAET ueberhaupt MSI-X an?** — der Wunsch neben der Gewaehrung, wie
+    /// `dma_gewuenscht` neben `dma_len`.
+    ///
+    /// Ohne diese Zahl sind zwei Lagen ununterscheidbar, und die harmlose verdeckt die ernste:
+    /// „das Geraet hat kein MSI-X, der Treiber pollt zulaessig" und „das Geraet hat MSI-X und die
+    /// Vergabe ist gescheitert". Eine Pruefzeile, die nur `msi_da` liest, ist in beiden Faellen
+    /// gleich -- also gruen fuer einen stillschweigend ausgefallenen Interruptpfad. Dieselbe Form
+    /// wie „so gewollt" gegen „stillschweigend gekuerzt" bei C2.
+    msi_angeboten: bool,
     iova: u64,
     /// Die Fenster, damit eine **Nachfolgefassung** dieselbe Zuteilung bekommen kann, ohne dass
     /// das Gerät dafür losgelassen und neu gesucht würde (A-5.1, Hot-Reload).
@@ -7558,6 +8422,14 @@ impl DriverAssign {
         device: 0,
         dma_phys: 0,
         dma_len: 0,
+        dma_gewuenscht: 0,
+        msi_vektor: 0,
+        msi_handle: 0,
+        msi_da: false,
+        msix_table: 0,
+        msix_cap: 0,
+        msi_ntfn: u32::MAX,
+        msi_angeboten: false,
         iova: 0,
         cfg_page: 0,
         bar: 0,
@@ -7635,6 +8507,30 @@ pub struct DriverGrant {
     /// Slot 6: die geteilte Übertragungsfläche (A-6.3) — dieselbe Region, die ein Client des
     /// Blockdienstes bekommt. Der Treiber kopiert gelesene Sektoren dorthin.
     pub shared: CapPtr,
+    /// Slot 8: die **Notification**, auf der der Treiber seinen Interrupt erwartet (B4).
+    ///
+    /// **Ein eigenes Objekt und nicht die Kanal-Notification** (Slot 1), und der Grund ist ein
+    /// Messfehler, kein Geschmack: eine Notification **rastet ein**. Der Treiber signalisiert auf
+    /// seinem Kanal „ich bin bereit"; wartete er spaeter auf demselben Objekt, kaeme `WAIT` sofort
+    /// mit einem alten pending-Bit zurueck — und das saehe von einem zugestellten Interrupt in
+    /// nichts zu unterscheiden aus. `poll-runden == 0` waere gruen, ohne dass je ein Interrupt
+    /// gekommen ist. Dieselbe Familie wie „eine Ablage je ROLLE ist eine Ablage zu wenig".
+    ///
+    /// `None` genau dann, wenn auch [`Self::irq`] `None` ist — ohne Vektor gibt es nichts zu
+    /// erwarten.
+    pub irq_ntfn: Option<CapPtr>,
+    /// Die **Id** desselben Objekts. Die Cap allein reicht nicht: die HardwareLand-Cap-Politik
+    /// entscheidet ueber die **Id**, und sie muss vor dem Endowment in der PD stehen
+    /// ([`pd_set_irq_ntfn`]).
+    pub irq_ntfn_id: u32,
+    /// Slot 7: die **`Irq`-Cap** dieses Geräts (B2). `None` = das Gerät hat keinen Vektor
+    /// bekommen — entweder hat es kein MSI-X, oder die Vergabe ist gescheitert.
+    ///
+    /// **`Option` und nicht ein Platzhalter**, weil die Abwesenheit eine Aussage ist: ein Treiber,
+    /// dessen Slot 7 leer bleibt, pollt zulässig. Welcher der beiden Fälle vorliegt, sagt
+    /// `driver_msi` über `angeboten` — hier wäre die Unterscheidung nicht unterzubringen, ohne aus
+    /// einer Cap eine Statusmeldung zu machen.
+    pub irq: Option<CapPtr>,
 }
 
 /// Ein Gerät herausnehmen, das auf `sel` passt (A-5.3). Es ist danach **vergeben**.
@@ -7679,11 +8575,31 @@ fn put_back_device(d: DriverDevice) {
 /// Schlägt ein Schritt fehl, werden die vorher erzeugten Caps wieder abgeräumt und das Gerät
 /// bleibt vergebbar: eine halbe Zuteilung ist schlimmer als keine, weil der Treiber dann an einer
 /// Stelle scheitert, die niemand mit der Zuteilung in Verbindung bringt.
-pub fn assign_driver_device(sel: man::DeviceSelector, program_id: u32) -> Option<DriverGrant> {
+/// `dma_pages == 0` heisst **Vorgabe** ([`DRIVER_DMA_BYTES`]) -- bitgleich zu jedem Aufruf, den es
+/// vor C2 gab. Ueber [`DRIVER_DMA_MAX_BYTES`] hinaus wird **abgewiesen und nicht gekuerzt**; die
+/// Absage faellt schon im Dispatch mit eigenem Code (`ERR_DMA_TOO_LARGE`), damit sie den Aufrufer
+/// erreicht, bevor irgendetwas alloziert ist. Hier steht sie **trotzdem noch einmal**: dieser
+/// Einstieg ist auch aus dem Kernel erreichbar, und eine Schranke, die nur am Syscall-Rand haelt,
+/// ist keine Schranke der Funktion.
+pub fn assign_driver_device(
+    sel: man::DeviceSelector,
+    program_id: u32,
+    dma_pages: u32,
+) -> Option<DriverGrant> {
+    let dma_bytes = if dma_pages == 0 {
+        DRIVER_DMA_BYTES
+    } else {
+        (dma_pages as u64) * 4096
+    };
+    if dma_bytes > DRIVER_DMA_MAX_BYTES {
+        // **Nicht kuerzen.** Eine stillschweigend halbierte DMA-Region ist ein Geraet, das ueber
+        // ihr Ende hinausschreibt -- der Fehler waere still und traefe fremden Speicher.
+        return None;
+    }
     let dev = take_matching_device(sel)?;
     let give_back = || put_back_device(dev);
 
-    let Some(region) = alloc_dma_region(DRIVER_DMA_BYTES) else {
+    let Some(region) = alloc_dma_region(dma_bytes) else {
         give_back();
         return None;
     };
@@ -7713,9 +8629,20 @@ pub fn assign_driver_device(sel: man::DeviceSelector, program_id: u32) -> Option
         give_back();
         return None;
     };
+    // --- Stufe B: IRTE allocation + MSI-X row (B1) ----------------------------------------
+    //
+    // At the same place as the DMA attach and for the same reason; the whole argument, and the
+    // arch seam it sits behind, is at `msi_grant`.
+    let msi = msi_grant(&dev);
+    let msi_zurueck = || {
+        if let Some(g) = msi.as_ref() {
+            msi_revoke(&dev, g);
+        }
+    };
     let cfg = match install_mmio_cap(dev.cfg_page, 4096, Rights::RW) {
         Ok(c) => c,
         Err(_) => {
+            msi_zurueck();
             dma_detach(dev.rid, handle);
             let _ = cap_delete(dma);
             give_back();
@@ -7726,6 +8653,7 @@ pub fn assign_driver_device(sel: man::DeviceSelector, program_id: u32) -> Option
         Ok(c) => c,
         Err(_) => {
             let _ = cap_delete(cfg);
+            msi_zurueck();
             dma_detach(dev.rid, handle);
             let _ = cap_delete(dma);
             give_back();
@@ -7738,6 +8666,7 @@ pub fn assign_driver_device(sel: man::DeviceSelector, program_id: u32) -> Option
     let Some(shared_region) = alloc(SHARED_BYTES, 4096) else {
         let _ = cap_delete(bar);
         let _ = cap_delete(cfg);
+        msi_zurueck();
         dma_detach(dev.rid, handle);
         let _ = cap_delete(dma);
         give_back();
@@ -7747,6 +8676,7 @@ pub fn assign_driver_device(sel: man::DeviceSelector, program_id: u32) -> Option
     let Ok(shared_root) = cap_install(shared_region) else {
         let _ = cap_delete(bar);
         let _ = cap_delete(cfg);
+        msi_zurueck();
         dma_detach(dev.rid, handle);
         let _ = cap_delete(dma);
         give_back();
@@ -7755,18 +8685,78 @@ pub fn assign_driver_device(sel: man::DeviceSelector, program_id: u32) -> Option
     let Ok(shared) = cap_copy(shared_root, Rights::RW) else {
         let _ = cap_delete(bar);
         let _ = cap_delete(cfg);
+        msi_zurueck();
         dma_detach(dev.rid, handle);
         let _ = cap_delete(dma);
         give_back();
         return None;
     };
+    // --- B2: die `Irq`-Cap ---------------------------------------------------------------
+    //
+    // **Zuletzt geprägt, und das ist Absicht:** sie ist der einzige Schritt, dessen Misserfolg
+    // nichts anderes rückgängig machen muss als sich selbst, also steht sie dort, wo genau ein
+    // Abweispfad hinter ihr liegt. Andersherum trüge jeder der sechs Pfade darüber eine weitere
+    // Aufräumzeile — und *ein neuer Abweispfad erbt die Aufräumpflicht des alten NICHT*.
+    //
+    // Die Cap trägt den **CPU-Vektor** als `intid`. Auf x86 ruft der Dispatch `irq_hook` mit dem
+    // rohen Vektor, es gibt also keine zweite Nummer, die hier umgerechnet werden müsste — und
+    // damit auch keine, die auseinanderlaufen könnte.
+    //
+    // Kein Vektor, keine Cap: `None` heisst „dieses Gerät unterbricht nicht", und der Treiber
+    // pollt zulässig. Das Gerät deswegen abzuweisen machte Stufe B zur Vorbedingung von A-5.1.
+    let mut irq_ntfn_id = u32::MAX;
+    let irq_paar = match msi {
+        Some(ref g) => {
+            // **Beide oder keins.** Eine `Irq`-Cap ohne Notification ist eine Autoritaet ohne
+            // Ziel, eine Notification ohne Cap ein Objekt ohne Grund -- und der Treiber verlangt
+            // beim Binden beide. Ein halb ausgestattetes Geraet scheiterte erst im Treiber, an
+            // einer Stelle, die niemand mit der Zuteilung in Verbindung braechte.
+            let paar = create_notification().and_then(|nid| {
+                let ic = install_irq_cap(g.vector as u32, Rights::READ).ok()?;
+                match install_notification_cap(nid as u32, Rights::RWX) {
+                    Ok(nc) => {
+                        irq_ntfn_id = nid as u32;
+                        Some((ic, nc))
+                    }
+                    Err(_) => {
+                        let _ = cap_delete(ic);
+                        None
+                    }
+                }
+            });
+            match paar {
+                Some(p) => Some(p),
+                None => {
+                    let _ = cap_delete(shared);
+                    let _ = cap_delete(bar);
+                    let _ = cap_delete(cfg);
+                    msi_zurueck();
+                    dma_detach(dev.rid, handle);
+                    let _ = cap_delete(dma);
+                    give_back();
+                    return None;
+                }
+            }
+        }
+        None => None,
+    };
+    let irq = irq_paar.map(|(c, _)| c);
+    let irq_ntfn = irq_paar.map(|(_, n)| n);
+    let irq_ntfn_id = irq_ntfn_id; // Name fuer den Rueckgabewert festhalten
     {
         let mut t = DRIVER_ASSIGN.lock();
         let Some(slot) = t.iter().position(|a| !a.used) else {
             drop(t);
+            if let Some(c) = irq {
+                let _ = cap_delete(c);
+            }
+            if let Some(c) = irq_ntfn {
+                let _ = cap_delete(c);
+            }
             let _ = cap_delete(shared);
             let _ = cap_delete(bar);
             let _ = cap_delete(cfg);
+            msi_zurueck();
             dma_detach(dev.rid, handle);
             let _ = cap_delete(dma);
             give_back();
@@ -7780,6 +8770,16 @@ pub fn assign_driver_device(sel: man::DeviceSelector, program_id: u32) -> Option
             device: dev.device,
             dma_phys: region.base,
             dma_len: region.len,
+            dma_gewuenscht: dma_pages,
+            msi_vektor: msi.map_or(0, |g| g.vector),
+            msi_handle: msi.map_or(0, |g| g.handle),
+            msi_da: msi.is_some(),
+            msix_table: dev.msix_table,
+            msix_cap: dev.msix_cap,
+            msi_ntfn: irq_ntfn_id,
+            // Read from the OFFER, not from the grant: `msix_cap != 0` means the device carries an
+            // MSI-X capability, whatever became of it afterwards.
+            msi_angeboten: dev.msix_cap != 0,
             iova: handle.iova.raw(),
             cfg_page: dev.cfg_page,
             bar: dev.bar,
@@ -7788,7 +8788,7 @@ pub fn assign_driver_device(sel: man::DeviceSelector, program_id: u32) -> Option
             shared_phys,
         };
     }
-    Some(DriverGrant { cfg, bar, dma, shared })
+    Some(DriverGrant { cfg, bar, dma, shared, irq, irq_ntfn, irq_ntfn_id })
 }
 
 /// Eine **Kopie** der geteilten Uebertragungsflaeche fuer einen Client des Blockdienstes (A-6.3).
@@ -7836,6 +8836,96 @@ pub fn driver_assignments(out: &mut [(u32, u32, u16, u16)]) -> usize {
         n += 1;
     }
     n
+}
+
+/// **Der Interrupt-Zustand EINER Zuteilung** (Stufe B) — was der Bericht braucht, um zu urteilen.
+///
+/// Ein Typ und kein Tupel, seit es sechs Felder sind: `(u32, u32, u8, u16, bool, bool)` hat zwei
+/// Zahlenpaare, die sich vertauschen lassen, ohne dass der Übersetzer etwas merkt — dieselbe
+/// Begründung, mit der `Vektorwunsch` in `irte.rs` entstanden ist.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DriverMsi {
+    pub program_id: u32,
+    /// Die Requester-ID des Geräts — **die Größe, gegen die `SVT/SID` geprüft wird.**
+    pub rid: u32,
+    pub vektor: u8,
+    pub handle: u16,
+    /// Basis der DMA-Region — dort legt der Treiber seine B4-Zahlen ab.
+    pub dma_phys: u64,
+    /// Identity-Adresse der MSI-X-Tabelle des Geraets — fuer die Ruecklesung der Zeile.
+    pub msix_table: u64,
+    /// Offset der MSI-X-Capability — fuer die Ruecklesung des Kontrollregisters.
+    pub msix_cap: u16,
+    /// Die Konfigurationsraum-Seite — fuer die Ruecklesung von `queue_msix_vector`.
+    pub cfg_page: u64,
+    /// Ist ein Vektor vergeben?
+    pub da: bool,
+    /// **Bietet das Gerät überhaupt MSI-X an?** Der Wunsch neben der Gewährung.
+    pub angeboten: bool,
+}
+
+/// **Stufe B: der Interrupt-Zustand der Zuteilungen.**
+///
+/// **Fuenf Zahlen, und die fuenfte ist die, an der die Pruefzeile haengt.** `vergeben` allein
+/// trennt nicht, was getrennt werden muss: ein Geraet ohne MSI-X pollt zulaessig, ein Geraet MIT
+/// MSI-X und ohne Vektor ist eine **gescheiterte Vergabe** -- und beide melden `vergeben=false`.
+/// Erst `angeboten` macht daraus zwei Aussagen, und die tragende Bedingung der `irqmsi`-Zeile ist
+/// deshalb bedingt formuliert (s. `docs/plan-cap-irq.md` §3):
+///
+/// * `angeboten` ⟹ `vergeben` — sonst ist die Vergabe still ausgefallen,
+/// * `vergeben` ⟹ `poll-runden == 0` — sonst hat der Treiber trotz Vektor gepollt.
+///
+/// Ohne das erste Konjunkt haette die Zeile genau zwei Enden: fuer den vektorlosen Fall
+/// abgeschaltet (und damit blind gegen eine stillschweigend ausgefallene Vergabe), oder rot aus
+/// einem zulaessigen Grund -- und dann entfernt sie jemand.
+pub fn driver_msi(out: &mut [DriverMsi]) -> usize {
+    let g = DRIVER_ASSIGN.lock();
+    let mut n = 0;
+    for a in g.iter().filter(|a| a.used) {
+        if n == out.len() {
+            break;
+        }
+        out[n] = DriverMsi {
+            program_id: a.program_id,
+            rid: a.rid,
+            vektor: a.msi_vektor,
+            handle: a.msi_handle,
+            dma_phys: a.dma_phys,
+            msix_table: a.msix_table,
+            msix_cap: a.msix_cap,
+            cfg_page: a.cfg_page,
+            da: a.msi_da,
+            angeboten: a.msi_angeboten,
+        };
+        n += 1;
+    }
+    n
+}
+
+/// **C2: die DMA-Pools der Zuteilungen** — `(program_id, gewuenschte Seiten, gewaehrte Bytes, IOVA)`.
+///
+/// Vier Zahlen und nicht eine, weil die Aussage aus ihrem Verhaeltnis besteht: `gewaehrt ==
+/// gewuenscht * 4096` (oder die Vorgabe bei `0`) trennt „so angefordert" von „stillschweigend
+/// gekuerzt", und die IOVA daneben ist die Groesse, an der die Fenster zweier Treiber als disjunkt
+/// nachweisbar sind. Eine Zeile, die nur „Pool vorhanden" meldete, waere auch bei einer halbierten
+/// Region wahr — und eine halbierte DMA-Region ist ein Geraet, das ueber ihr Ende hinausschreibt.
+pub fn driver_dma_pools(out: &mut [(u32, u32, u64, u64)]) -> usize {
+    let g = DRIVER_ASSIGN.lock();
+    let mut n = 0;
+    for a in g.iter().filter(|a| a.used) {
+        if n == out.len() {
+            break;
+        }
+        out[n] = (a.program_id, a.dma_gewuenscht, a.dma_len, a.iova);
+        n += 1;
+    }
+    n
+}
+
+/// Die Vorgabegroesse eines DMA-Pools -- fuer den Bericht, damit er sie nicht nachrechnet.
+/// *Zuteiler und Pruefer brauchen EINE Quelle.*
+pub fn driver_dma_default_bytes() -> u64 {
+    DRIVER_DMA_BYTES
 }
 
 /// Lage der geteilten Uebertragungsflaeche — fuer den Bericht des Hochlaufs.
@@ -7893,7 +8983,43 @@ pub fn reassign_driver_device(program_id: u32) -> Option<DriverGrant> {
         let _ = cap_delete(dma);
         return None;
     };
-    Some(DriverGrant { cfg, bar, dma, shared })
+    // **B2 beim Hot-Reload: die Nachfolgefassung bekommt eine EIGENE Cap auf denselben Vektor.**
+    //
+    // Nicht die alte weitergereicht — die gehört dem Cspace der sterbenden PD und geht mit ihr.
+    // *Wer eine Fassung ersetzt, muss ihr ALLES geben, was die alte hatte*: fehlte Slot 7, bräche
+    // die neue Fassung an derselben Stelle ab wie damals ohne Slot 6, und der Austausch meldete
+    // `NotReady` — was nach einem Zeitproblem aussieht und ein fehlendes Cap ist.
+    //
+    // Der IRTE und die MSI-X-Zeile bleiben unangetastet: das Gerät wechselt nicht, nur sein
+    // Bediener. Genau deshalb ist das hier eine Cap-Prägung und keine zweite Vergabe.
+    let (irq, irq_ntfn) = if a.msi_da {
+        // **Dieselbe Notification, eine neue Cap darauf** -- nicht ein neues Objekt. Die Bindung
+        // im Kernel zeigt auf die alte Id; ein frisches Objekt hiesse, dass der Interrupt weiter
+        // an das Objekt der gestorbenen Fassung zugestellt wird und die neue ewig wartet. Genau
+        // die Falle, die A-5.1 mit der DMA-Region schon einmal hatte.
+        let paar = install_irq_cap(a.msi_vektor as u32, Rights::READ).ok().and_then(|ic| {
+            match install_notification_cap(a.msi_ntfn, Rights::RWX) {
+                Ok(nc) => Some((ic, nc)),
+                Err(_) => {
+                    let _ = cap_delete(ic);
+                    None
+                }
+            }
+        });
+        match paar {
+            Some((ic, nc)) => (Some(ic), Some(nc)),
+            None => {
+                let _ = cap_delete(shared);
+                let _ = cap_delete(bar);
+                let _ = cap_delete(cfg);
+                let _ = cap_delete(dma);
+                return None;
+            }
+        }
+    } else {
+        (None, None)
+    };
+    Some(DriverGrant { cfg, bar, dma, shared, irq, irq_ntfn, irq_ntfn_id: a.msi_ntfn })
 }
 
 /// Eine **weitere** HardwareLand-Backend-PD an einem **bestehenden** Kanal anlegen (A-5.1).
@@ -8889,10 +10015,44 @@ pub fn create_pd() -> Option<usize> {
 pub fn create_pd_in_domain(domain: Domain) -> Option<usize> {
     CAPS.write().pds.create_in_domain(domain)
 }
+/// **Eine PD mit eigenem Cap-Budget anlegen** (2026-08-26). `budget == 0` = Vorgabe.
+///
+/// Siehe [`caprock_microkit::PdTable::create_mit_budget`] fuer die zwei getrennten Absagen. Der
+/// Weg, auf dem eine Zahl von aussen hierher kommt, ist `SYS_LOAD` (`MSG3`).
+pub fn create_pd_mit_budget(domain: Domain, budget: u16) -> Option<usize> {
+    CAPS.write().pds.create_mit_budget(domain, budget)
+}
+/// `(freier Vorrat, am Vorrat gescheiterte Erzeugungen)` — s. `capbudget` im Bericht.
+pub fn pd_budget_bilanz() -> (usize, u64) {
+    CAPS.read().pds.budget_bilanz()
+}
+/// Das Cap-Budget dieser PD (0 = die PD gibt es nicht).
+pub fn pd_budget_of(pd: usize) -> usize {
+    CAPS.read().pds.budget_of(pd)
+}
 /// Die (unveränderliche) Domäne einer PD.
 pub fn pd_domain(pd: usize) -> Option<Domain> {
     CAPS.read().pds.domain_of(pd)
 }
+/// **Einen Dienstkanal ohne Geraet praegen** (2026-08-25) -- Endpoint + Notification, sonst nichts.
+///
+/// Das Gegenstueck zu [`create_hardware_backend`] fuer eine PD, die einen Dienst anbietet und
+/// **kein Geraet** hat. Es entsteht keine PD und keine Partner-Bindung: die PD kommt aus dem
+/// gewoehnlichen Ladepfad, und `cap_allowed` schraenkt Nicht-HardwareLand nicht auf einen Kanal
+/// ein -- der Riegel dort ist ausdruecklich `domain == Domain::HardwareLand`.
+///
+/// **Die Ruecknahme ist dieselbe wie nebenan**: schlaegt die Notification fehl, wird der frisch
+/// reservierte Endpoint-Slot zurueckgegeben. Ein halb gepraegter Kanal waere ein Objekt, das
+/// niemand mehr findet und niemand mehr freigibt.
+pub fn create_service_channel() -> Option<(usize, usize)> {
+    let ep = create_endpoint()?;
+    let Some(ntfn) = create_notification() else {
+        *eps()[ep].lock() = Endpoint::EMPTY;
+        return None;
+    };
+    Some((ep, ntfn))
+}
+
 /// Ein **HardwareLand-Backend** anlegen (ext-22, P3): erzeugt einen dedizierten Endpoint +
 /// eine Notification und eine HardwareLand-PD mit **unveränderlicher** Partner-Bindung an
 /// `trusted_pd` (TrustedSas) und genau diesem Kanal. Gibt `(backend_pd, ep, ntfn)` zurück;
@@ -9156,6 +10316,15 @@ pub fn pd_of_thread(tid: ThreadId) -> Option<usize> {
     CAPS.read().pds.pd_of_thread(tid)
 }
 
+/// **Wie viele Cap-Slots diese PD belegt** (K1b) — die Groesse, an der „vier Stapel aus EINER Cap"
+/// von „vier Caps" zu unterscheiden ist.
+///
+/// Ohne sie waere die Aussage der Teilregion unbelegbar: vier laufende Threads beweisen nur, dass
+/// vier Threads laufen. Der Punkt ist, was sie **gekostet** haben.
+pub fn pd_cap_count(pd: usize) -> usize {
+    CAPS.read().pds.cap_count(pd)
+}
+
 /// Wie viele Threads an dieser PD haengen (Z22 P2). Die Groesse, an der „mehrere Threads je PD"
 /// von „einer, wie immer" zu unterscheiden ist.
 pub fn pd_thread_count(pd: usize) -> u32 {
@@ -9326,6 +10495,38 @@ pub fn endpoint_is_quiescing(ep: usize) -> bool {
     ep < eps().len() && eps()[ep].lock().is_quiescing()
 }
 
+/// **Die Torentscheidung eines Endpoints, wie `call`/`recv` sie faellen** — `None` = zulassen.
+///
+/// Bewusst dieselbe Funktion und keine Nachbildung: eine Pruefzeile, die die Bedingung
+/// nachrechnet, prueft eine zweite Wirklichkeit (`iova_window_clear_of_msi` hat das einmal
+/// gekostet). A-4.2 hat `gate_new_transaction` genau dafuer als reine Funktion herausgezogen.
+pub fn endpoint_gate(ep: usize) -> Option<u64> {
+    if ep >= eps().len() {
+        return Some(caprock_abi::result::ERR_BADCAP);
+    }
+    eps()[ep].lock().gate_new_transaction()
+}
+
+/// Wie viele Empfaenger warten an diesem Endpoint? (Z23/S3: der Schnitt zieht sie zurueck, das
+/// Auftauen reiht sie wieder ein — beides ist an dieser Zahl ablesbar.)
+pub fn endpoint_receivers(ep: usize) -> usize {
+    if ep >= eps().len() {
+        return 0;
+    }
+    eps()[ep].lock().receiver_count()
+}
+
+/// Eine globale Cap in den Cspace einer PD legen (Pruefpfade und Aufbau).
+pub fn pd_install_cap(pd: usize, slot: usize, cap: CapPtr) {
+    CAPS.write().pds.install_cap(pd, slot, cap);
+}
+
+/// Einen Cap-Slot einer PD leeren (Pruefpfade: die **Positivkontrolle** einer Absage — dieselbe PD
+/// ohne die Cap muss durchgehen, sonst belegt die Absage nur, dass irgendetwas nicht ging).
+pub fn pd_clear_cap(pd: usize, slot: usize) {
+    CAPS.write().pds.clear_cap(pd, slot);
+}
+
 /// **Ruht der Endpoint als Ganzes?** Keine wartenden Sender/Empfänger, kein offenes
 /// Reply-Token — die Bedingung, unter der ein Austausch niemanden trifft.
 pub fn endpoint_is_idle(ep: usize) -> bool {
@@ -9363,6 +10564,204 @@ pub fn thread_quiescence(tid: ThreadId) -> Quiescence {
     q
 }
 
+// ------------------------------------------------------------------------------------------------
+// Z4d stage 1: the observed edges of a cut
+// ------------------------------------------------------------------------------------------------
+
+/// How many edges a survey can report.
+///
+/// **The overflow is named** ([`cut_edges`] returns `Err(needed)`) and the list is never shortened.
+/// A truncated edge list is not a smaller finding — it is *a participant left behind*, which is
+/// literally the thing the survey exists to detect. D11 verbatim, at the place where the silent
+/// version would be most expensive.
+pub const CUT_EDGES_MAX: usize = 96;
+
+/// Ein `Quiescence`-Befund traegt bis zu vier Rollen -- aufgeloest in einzelne Kanten, damit eine
+/// Absage die ROLLE nennen kann und nicht nur den Thread.
+fn quiescence_to_edges(
+    channel: Channel,
+    tid: ThreadId,
+    q: Quiescence,
+    out: &mut [Edge],
+    n: &mut usize,
+    need: &mut usize,
+) {
+    for (steht, role) in [
+        (q.as_sender, EdgeRole::Sender),
+        (q.as_receiver, EdgeRole::Receiver),
+        (q.as_caller, EdgeRole::Caller),
+        (q.as_reply_owner, EdgeRole::ReplyOwner),
+    ] {
+        if !steht {
+            continue;
+        }
+        *need += 1;
+        if *n < out.len() {
+            out[*n] = Edge {
+                channel,
+                thread: tid.to_raw(),
+                role,
+            };
+            *n += 1;
+        }
+    }
+}
+
+fn edge_role_of(r: IpcRole) -> EdgeRole {
+    match r {
+        IpcRole::Sender => EdgeRole::Sender,
+        IpcRole::Receiver => EdgeRole::Receiver,
+        IpcRole::Caller => EdgeRole::Caller,
+        IpcRole::ReplyOwner => EdgeRole::ReplyOwner,
+    }
+}
+
+/// **Every IPC role that touches this cut** (Z4d stage 1) — the measurement that
+/// [`caprock_cap::checkpoint::classify_cut`] judges.
+///
+/// ## It takes the SCOPE, not three lists
+///
+/// Survey and verdict read **one** source. The first version took the threads, the endpoints and
+/// the notifications as separate arguments, and a caller could survey one set and judge another:
+/// list a peer in the scope but not in the survey, and the rule passes on a measurement that never
+/// looked at him — a clean verdict over an incomplete finding. That is the `iova_window_clear_of_msi`
+/// shape ("Zuteiler und Pruefer brauchen EINE Quelle"), and the topology it hid behind held only by
+/// accident of the probe's own setup. With the `Scope` itself as the argument the mismatch is not
+/// expressible.
+///
+/// ## Two directions, two questions — and only one of them had an answer
+///
+/// A relationship straddles the cut in two ways, and each is found differently:
+///
+/// | direction | question | asked via |
+/// |---|---|---|
+/// | the participant migrates, his channel stays behind | *where does **this thread** hold a role?* | `quiescence_of` over every channel |
+/// | the channel migrates, this participant stays behind | *who holds a role **here**?* | `occupants` on the channels in scope |
+///
+/// The second question is the one that had no answer until 2026-08-25: `quiescence_of` needs a
+/// thread you can already name, and the dangerous participant is by construction one the checkpoint
+/// never listed. Asking only the first is how `Scope::endpoints` came to be believed instead of
+/// checked.
+///
+/// ## The lock discipline is part of the contract
+///
+/// One channel, one `lock()`, released before the next — never a lock across the loop, and no CDT
+/// walk inside it. `SpinLock` masks interrupts, and a survey that held them across 10064 objects
+/// would be the `pd_haelt_dma` finding of 2026-08-21 again: the longest masked stretch there rose
+/// to 3 701 562 cycles and turned the **debugger's** stop-latency line red — a line with no
+/// connection to the thing that broke it.
+///
+/// ## What this is NOT
+///
+/// A snapshot, unless the channels are quiesced — the same limit as [`thread_quiescence`] and the
+/// same reason. It does not weaken the gate: the checkpoint path freezes its subject first, so the
+/// subject's own edges cannot move under the survey. A **foreign** thread may still enter a
+/// relationship while we look; then the cut is refused on the next attempt rather than this one.
+/// Refusing late is safe, admitting wrongly is not.
+pub fn cut_edges(
+    subject: ThreadId,
+    scope: &Scope<'_>,
+    out: &mut [Edge],
+) -> Result<usize, usize> {
+    let mut n = 0usize;
+    let mut need = 0usize;
+    // Auf zwei volle Warteschlangen plus das Reply-Paar bemessen -- mehr Rollen kann EIN Endpoint
+    // strukturell nicht tragen.
+    let mut lokal = [(ThreadId::from_raw(0), IpcRole::Sender); caprock_ipc::QUEUE_CAP * 2 + 2];
+
+    // -- Pass 1: die Kanaele IM Umfang, vollstaendig aufgezaehlt --------------------------------
+    for (&id, ist_ep) in scope
+        .endpoints
+        .iter()
+        .map(|id| (id, true))
+        .chain(scope.notifications.iter().map(|id| (id, false)))
+    {
+        let i = id as usize;
+        let k = if ist_ep {
+            if i >= eps().len() {
+                continue;
+            }
+            eps()[i].lock().occupants(&mut lokal)
+        } else {
+            if i >= ntfns().len() {
+                continue;
+            }
+            ntfns()[i].lock().occupants(&mut lokal)
+        };
+        // Mehr Rollen, als der Zwischenpuffer fasst: strukturell unmoeglich -- und deshalb eine
+        // benannte Absage und kein Weiterlaufen. Faellt die Annahme, soll sie AUFFALLEN.
+        let k = match k {
+            Ok(k) => k,
+            Err(gebraucht) => return Err(need + gebraucht),
+        };
+        let channel = if ist_ep {
+            Channel::Endpoint(id)
+        } else {
+            Channel::Notification(id)
+        };
+        for &(t, r) in &lokal[..k] {
+            need += 1;
+            if n < out.len() {
+                out[n] = Edge {
+                    channel,
+                    thread: t.to_raw(),
+                    role: edge_role_of(r),
+                };
+                n += 1;
+            }
+        }
+    }
+
+    // -- Pass 2: die Kanaele AUSSERHALB, aber nur die Rollen der wandernden Threads --------------
+    //
+    // Hier wird gefragt statt aufgezaehlt: ein fremder Kanal interessiert nur, wenn einer der
+    // Wandernden dort steht. Das haelt den Durchgang ueber alle Objekte bei EINER Sperrung je
+    // Objekt und einer Handvoll Abfragen darin.
+    //
+    // **Das Subjekt kommt zusaetzlich zu `scope.threads`** -- es wandert per Definition mit,
+    // woertlich dieselbe Regel wie in `classify_cut`. Doppelt genannt schadet nicht: eine Kante
+    // zweimal zu erheben aendert am Urteil nichts, eine gar nicht zu erheben sehr wohl.
+    let wandernde = |f: &mut dyn FnMut(ThreadId)| {
+        f(subject);
+        for &raw in scope.threads {
+            let t = ThreadId::from_raw(raw);
+            if t != subject {
+                f(t);
+            }
+        }
+    };
+    for i in 0..eps().len() {
+        let id = i as u32;
+        if scope.endpoints.contains(&id) {
+            continue; // in Pass 1 vollstaendig erledigt
+        }
+        let ep = eps()[i].lock();
+        wandernde(&mut |t| {
+            let q = ep.quiescence_of(t);
+            if !q.is_quiescent() {
+                quiescence_to_edges(Channel::Endpoint(id), t, q, out, &mut n, &mut need);
+            }
+        });
+    }
+    for i in 0..ntfns().len() {
+        let id = i as u32;
+        if scope.notifications.contains(&id) {
+            continue;
+        }
+        let nt = ntfns()[i].lock();
+        wandernde(&mut |t| {
+            let q = nt.quiescence_of(t);
+            if !q.is_quiescent() {
+                quiescence_to_edges(Channel::Notification(id), t, q, out, &mut n, &mut need);
+            }
+        });
+    }
+
+    if need > out.len() {
+        return Err(need);
+    }
+    Ok(n)
+}
 
 // ================================================================================================
 // Z6b: der Debugger
@@ -9869,6 +11268,19 @@ pub enum Freeze {
     /// Er ist deplant, läuft aber **noch** auf einem Kern (der Reschedule-IPI ist unterwegs).
     /// Der Aufrufer wiederholt; der Zustand ist vorübergehend.
     StillRunning,
+    /// Wie [`Freeze::Busy`], aber **mit dem Partner** (Z23/S2) — der Thread haengt an einer
+    /// konkreten Gegenseite, und die wird genannt.
+    ///
+    /// „Nicht einfrierbar" ist als Diagnose wertlos; „nicht einfrierbar, weil er auf Thread Y
+    /// wartet" ist eine Handlungsanweisung. Ohne den Namen ist eine dauerhafte Absage von einem
+    /// Haenger nicht zu unterscheiden — genau die Ununterscheidbarkeit, die
+    /// `docs/fehlerdomaene.md` schon einmal gekostet hat.
+    ///
+    /// **Diese Auskunft geht an den Halter der Freeze-Autoritaet, NIE an die eingefrorene PD.**
+    /// Eine Fehlermeldung mit einem fremden Threadnamen darin ist ein Kanal, mit dem sich die
+    /// IPC-Topologie anderer PDs ausforschen laesst. Der Kernel gibt sie deshalb nur ueber
+    /// [`freeze_thread`] zurueck (Kernelpfad, Pruefpfade) und **nicht** ueber einen Syscall.
+    BusyOn(Quiescence, ThreadId),
     /// Er hat **offene IPC-Beziehungen** — er hängt in `CALL`, wartet in `RECV`, ist Ziel eines
     /// Reply-Tokens oder schuldet selbst eine Antwort. Das ist **kein** vorübergehender Zustand,
     /// sondern eine Absage: Z4d Stufe 1 lässt einen Thread nur ohne offene Transaktionen wandern.
@@ -9891,6 +11303,25 @@ pub enum Freeze {
     ///    die Transaktion durch ist"). Hier hilft nur: den Debugger fragen. Genau die
     ///    Unterscheidung, fuer die `HandlerBinding` sich 2026-08-13 von `PendingReply` getrennt hat.
     Debugged,
+}
+
+/// **Wer haelt diesen Thread fest?** (Z23/S2) — systemweit ueber alle Endpoints.
+///
+/// Dieselbe Grenze wie bei [`thread_quiescence`], und sie gilt hier genauso: die Objekte werden
+/// nacheinander gesperrt, die Auskunft ist also eine Momentaufnahme, solange nicht stillgelegt
+/// wurde. Fuer eine **Diagnose** reicht das; als Bedingung taugt sie nur nach der Stilllegung.
+///
+/// **Der erste Treffer gewinnt**, und das ist eine Entscheidung: ein Thread kann an mehreren
+/// Endpoints Rollen haben, aber die Absage nennt EINEN Grund. Mehrere zu sammeln hiesse, eine
+/// Liste zurueckzugeben, die der Aufrufer sortieren muss -- und die erste offene Beziehung reicht,
+/// um den Freeze zu verhindern.
+fn thread_partner(tid: ThreadId) -> Option<ThreadId> {
+    for i in 0..eps().len() {
+        if let Some(p) = eps()[i].lock().partner_of(tid) {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// **Einen Thread an einer benennbaren Grenze anhalten** (Z4a).
@@ -9936,7 +11367,13 @@ pub fn freeze_thread(tid: ThreadId) -> Freeze {
     KernelSched.pause(tid);
     let q = thread_quiescence(tid);
     if !q.is_quiescent() {
-        return Freeze::Busy(q);
+        // **Den Partner nennen, wenn es einen GIBT** (Z23/S2). Ein wartender Empfaenger hat
+        // keinen -- und einen zu erfinden waere schlimmer als keinen zu nennen, weil dann der
+        // Falsche zur Rechenschaft gezogen wird.
+        return match thread_partner(tid) {
+            Some(p) => Freeze::BusyOn(q, p),
+            None => Freeze::Busy(q),
+        };
     }
     // **Gefragt, nicht geglaubt:** laeuft er noch irgendwo?
     //
@@ -9972,6 +11409,629 @@ pub fn freeze_thread(tid: ThreadId) -> Freeze {
 pub fn thaw_thread(tid: ThreadId) -> bool {
     with_owner(tid, |s, _| s.resume(tid).then_some(())).is_some()
 }
+
+// --- Z23/S3: der Gruppenschnitt -- eine ganze PD, oder keiner ihrer Threads --------------------
+
+/// Wie viele Threads ein Gruppenschnitt fassen kann.
+///
+/// **Der Ueberlauf ist BENANNT** ([`PdFreeze::TooManyThreads`]) und nicht gekuerzt — D11 woertlich:
+/// wer eine Kapazitaet einfuehrt, muss den Ueberlauf benennen, sonst ist die Schranke kein Schutz,
+/// sondern ein Loch. Eine stillschweigend abgeschnittene Gruppe waere hier besonders teuer, weil
+/// das Ergebnis genau der halbe Schnitt ist, gegen den der ganze Strang gebaut ist.
+pub const FREEZE_MAX_THREADS: usize = 32;
+
+/// „kein Endpoint" in [`FrozenPd::recv_ep`]. Ein eigener Wert und kein `Option`, weil das Feld ein
+/// festes Feld in einem `Copy`-freien Zeugen ist und `u32::MAX` nie ein gueltiger Index ist.
+const KEIN_EP: u32 = u32::MAX;
+
+/// **Der Zeuge eines vollzogenen Gruppenschnitts** (Z23/S3), nach dem Vorbild von
+/// [`Parked`](crate::system::Parked).
+///
+/// ## Was er zusichert
+///
+/// Wer ihn haelt, haelt eine **Menge**: jeder Thread der PD steht, keiner laeuft, und die
+/// Rueckabwicklung ist vollstaendig moeglich. Ein Teilerfolg, der liegen bleibt, waere schlimmer
+/// als ein Fehlschlag — die PD waere halb tot, und **jeder Pruefer meldete Ordnung** (D11-Form).
+///
+/// ## Warum die Bauform genau so ist
+///
+/// * `#[must_use]` — ein weggeworfener Zeuge ist eine eingefrorene PD ohne Auftauer.
+/// * **kein `Drop`** — sonst liesse sich der Inhalt in [`thaw_pd`]/[`abort_freeze`] nicht
+///   herausbewegen; dieselbe Ueberlegung wie bei `Parked` und aus demselben Grund.
+/// * **kein oeffentlicher Weg an die `ThreadId`s.** Die Namen der Teilnehmer sind dieselbe Sorte
+///   Auskunft wie der Partner in [`Freeze::BusyOn`]: sie gehoeren dem Halter der Autoritaet und
+///   nicht der Welt. Wer einzelne Threads antasten koennte, koennte die Menge halbieren — und
+///   genau das soll der Typ unmoeglich machen.
+#[must_use = "ein Gruppenschnitt ohne Auftauer ist eine PD, die nie wieder laeuft"]
+pub struct FrozenPd {
+    pd: u16,
+    n: u8,
+    tids: [ThreadId; FREEZE_MAX_THREADS],
+    /// Je Teilnehmer: der Endpoint, aus dessen Empfaengerschlange er zurueckgezogen wurde, oder
+    /// [`KEIN_EP`]. Ohne diesen Eintrag waere das Auftauen keine Umkehrung — der Thread bliebe
+    /// IPC-blockiert an einem Kanal, an dem ihn niemand mehr findet (S6).
+    recv_ep: [u32; FREEZE_MAX_THREADS],
+    /// Je Teilnehmer: hat **dieser** Schnitt den Endpoint nach innen zugesperrt? Nur dann wird er
+    /// beim Auftauen wieder geoeffnet. Ein fremdes `begin_quiesce` (A-4.1, Hot-Reload) darf der
+    /// Freeze nicht mit aufheben — das waere der Wecker, der eine fremde Entscheidung mitnimmt.
+    ep_gesperrt: [bool; FREEZE_MAX_THREADS],
+    /// **Der Tick, zu dem der Schnitt vollzogen war** (Z23/die ZEIT). Zusammen mit dem Tick des
+    /// Auftauens ergibt er die Dauer, die diese PD stand — die einzige Groesse, mit der sich eine
+    /// vor dem Freeze berechnete Frist hinterher berichtigen laesst.
+    tick0: u64,
+    /// Der Kern, dessen Uhr `tick0` gelesen hat. Ticks sind je Kern gezaehlt; die Differenz ueber
+    /// zwei verschiedene Uhren zu bilden waere eine Zahl ohne Bedeutung.
+    tick_kern: usize,
+}
+
+impl FrozenPd {
+    /// Welche PD steht?
+    pub fn pd(&self) -> usize {
+        self.pd as usize
+    }
+    /// Wie viele Threads umfasst der Schnitt? (Sprechprobe: `0` gibt es nicht — [`freeze_pd`]
+    /// weist eine leere PD mit [`PdFreeze::Empty`] ab, weil ein leerer Schnitt kein Erfolg ist.)
+    pub fn len(&self) -> usize {
+        self.n as usize
+    }
+    /// Ist der Schnitt leer? (Kann nicht vorkommen; steht hier, weil `len` ohne `is_empty` ein
+    /// Clippy-Befund ist und eine `#[allow]`-Zeile schlechter waere als die Wahrheit.)
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+    /// Wie viele Teilnehmer wurden aus einer Empfaengerschlange gezogen? (Berichtszeile.)
+    pub fn zurueckgezogen(&self) -> usize {
+        (0..self.len()).filter(|&i| self.recv_ep[i] != KEIN_EP).count()
+    }
+    /// Wie viele Kanaele hat dieser Schnitt nach innen zugesperrt? (Berichtszeile — und die
+    /// Groesse, an der S1b gemessen wird.)
+    pub fn kanaele_zu(&self) -> usize {
+        (0..self.len()).filter(|&i| self.ep_gesperrt[i]).count()
+    }
+}
+
+/// Wie ein Gruppenschnitt ausging (Z23/S3). Wie bei [`Freeze`] bewusst **unterscheidbar**: „geht
+/// nicht" ist als Diagnose wertlos, und die Faelle verlangen verschiedene Reaktionen.
+pub enum PdFreeze {
+    /// Die ganze PD steht. Der Zeuge ist der einzige Weg zurueck.
+    Frozen(FrozenPd),
+    /// Diese PD gibt es nicht.
+    NoPd,
+    /// Sie hat keine Threads. **Kein Erfolg** — ein leerer Schnitt ist kein Schnitt, und ihn als
+    /// `Frozen` zu melden hiesse, einer PD Stillstand zu bescheinigen, die nie lief.
+    Empty,
+    /// Mehr Threads als der Zeuge fasst. Die Zahl ist die **gebrauchte**, nicht die vorhandene
+    /// Kapazitaet — wer die Schranke anheben will, soll den Wert ablesen koennen.
+    TooManyThreads(usize),
+    /// Ein Debugger haelt einen Teilnehmer (Z6b). Zwei Schreiber auf einem Frame sind kein
+    /// Grenzfall; die Absage nennt den Thread, damit klar ist, **wen** man fragen muss.
+    Debugged(ThreadId),
+    /// Ihre Tore waren schon zu. Entweder laeuft bereits ein Schnitt oder ein Hot-Reload — in
+    /// beiden Faellen darf dieser Aufrufer den Zustand nicht fuer seinen halten (dieselbe Regel
+    /// wie bei [`Endpoint::begin_quiesce`]).
+    AlreadyQuiescing,
+    /// Die PD haelt eine DMA-Cap (S5, erste Fassung: **fail-closed**).
+    ///
+    /// Eine eingefrorene Treiber-PD, deren Geraet gerade in ihre Region schreibt, ist **nicht**
+    /// eingefroren: der Deskriptorring laeuft weiter. Bis der Domaenen-Schwenk gebaut ist (S5c,
+    /// jede DMA waehrend des Freeze wird ein IOMMU-Fault), ist eine ehrliche Absage besser als
+    /// eine Zusage, die nicht haelt.
+    HasDma,
+    /// Ein Teilnehmer wartet als Empfaenger an **mehr als einem** Kanal. Strukturell unmoeglich
+    /// fuer einen in `RECV` blockierten Thread — und genau deshalb eine Absage und keine Schleife:
+    /// wenn die Annahme faellt, soll sie **auffallen**, nicht stillschweigend halb behandelt
+    /// werden.
+    MultiReceiver(ThreadId),
+    /// An einem Kanal, an dem ein Teilnehmer als Empfaenger wartet, stehen **Sender an**. Das
+    /// widerspricht der tragenden Invariante (Sender und Empfaenger treffen sich sofort). Absage
+    /// statt Weiterbau auf einer Annahme, die gerade nachweislich nicht gilt.
+    SenderQueued(ThreadId, usize),
+    /// **Die Frist ist abgelaufen** — und die Absage nennt, worauf gewartet wurde.
+    ///
+    /// „Wir warten, bis es ruhig ist" terminiert nicht beweisbar, und eine Stilllegung ohne Frist
+    /// ist von einem Deadlock nicht zu unterscheiden. `partner` ist der Thread ausserhalb der PD,
+    /// an dem der Schnitt haengt — `None`, wenn der Teilnehmer als **Sender** ansteht und noch gar
+    /// keine Gegenseite hat (einen zu erfinden waere schlimmer als keinen zu nennen).
+    Deadline {
+        tid: ThreadId,
+        partner: Option<ThreadId>,
+        q: Quiescence,
+    },
+}
+
+impl PdFreeze {
+    /// Ist der Schnitt vollzogen?
+    pub fn is_frozen(&self) -> bool {
+        matches!(self, PdFreeze::Frozen(_))
+    }
+    /// Ein kurzer, stabiler Code fuer die Berichtszeile. `0` = Erfolg.
+    pub fn code(&self) -> u8 {
+        match self {
+            PdFreeze::Frozen(_) => 0,
+            PdFreeze::NoPd => 1,
+            PdFreeze::Empty => 2,
+            PdFreeze::TooManyThreads(_) => 3,
+            PdFreeze::Debugged(_) => 4,
+            PdFreeze::AlreadyQuiescing => 5,
+            PdFreeze::HasDma => 6,
+            PdFreeze::MultiReceiver(_) => 7,
+            PdFreeze::SenderQueued(_, _) => 8,
+            PdFreeze::Deadline { .. } => 9,
+        }
+    }
+}
+
+/// Haelt diese PD eine DMA-Cap? (S5, fail-closed.)
+fn pd_haelt_dma(pd: usize) -> bool {
+    // **Erst die Slots kopieren, dann `CAPS` freigeben** -- und dann fragen. `caps_of` gibt ein
+    // Array by value; die Sperre wird also gar nicht fuer die Schleife gebraucht.
+    //
+    // **`kind_of` und nicht `inspect`:** `inspect` rechnet `child_count`, also einen CDT-Gang mit
+    // einer Schranke von `slots.len()` -- je Slot, unter gehaltener Sperre, und `SpinLock` maskiert
+    // IRQs. Gemessen: die erste Fassung hat die laengste maskierte Strecke auf aarch64 so weit
+    // hochgezogen, dass die STOPP-LATENZ-Zusage des Debuggers fiel. Eine Zeile ohne jeden Bezug
+    // zum Freeze, rot gemacht von einer bequemen Abfrage.
+    let slots = CAPS.read().pds.caps_of(pd);
+    slots.iter().flatten().any(|p| {
+        matches!(
+            CAPS.read().cspace.kind_of(*p),
+            Some(ObjectKind::Dma { .. })
+        )
+    })
+}
+
+/// **Die Interrupt-Notification einer PD eintragen** (B4) — muss VOR dem Endowment stehen, sonst
+/// weist die HardwareLand-Cap-Politik die Cap in Slot 8 ab.
+pub fn pd_set_irq_ntfn(pd: usize, id: u32) -> bool {
+    CAPS.write().pds.set_irq_ntfn(pd, id)
+}
+
+/// **Haelt PD `pd` in Slot `slot` eine `Irq`-Cap, und auf welchen Vektor?** (B2, fuer den Pruefer)
+///
+/// `kind_of` und nicht `inspect` — aus dem Grund, den [`pd_haelt_dma`] daneben ausschreibt: eine
+/// Auskunftsfunktion, die nebenbei einen CDT-Gang macht, ist an einer Engstelle kein Komfort,
+/// sondern ein Latenzloch, und `SpinLock` maskiert IRQs.
+pub fn pd_irq_cap_intid(pd: usize, slot: usize) -> Option<u32> {
+    // `caps_of` gibt ein Array **by value** -- die Sperre wird also gar nicht ueber die Abfrage
+    // gehalten (s. `pd_haelt_dma` daneben, wo genau das eine Latenzzusage gerissen hat).
+    let cap = (*CAPS.read().pds.caps_of(pd).get(slot)?)?;
+    match CAPS.read().cspace.kind_of(cap) {
+        Some(ObjectKind::Irq { intid }) => Some(intid),
+        _ => None,
+    }
+}
+
+/// **Alle Threads einer PD einsammeln** — der Rohstoff des Schnitts.
+///
+/// Die Reihenfolge der Sperren ist die Aussage: erst je Kern unter **dessen** Sperre die lebenden
+/// `ThreadId`s einsammeln, dann alle Sperren freigeben, **dann** unter `CAPS` nach PD filtern.
+/// Andersherum — `pd_of_thread` innerhalb der gehaltenen Scheduler-Sperre — waere `CAPS` (R0)
+/// **innerhalb** von `SCHEDS` (R2), also die Umkehrung der Ordnung aus `docs/invariants.md` §1.
+fn pd_threads(pd: usize, out: &mut [ThreadId]) -> Result<usize, usize> {
+    let mut alle = [ThreadId::from_raw(0); FREEZE_MAX_THREADS * 4];
+    let mut m = 0usize;
+    for c in 0..num_cores() {
+        if !caprock_sched::core_online(c) {
+            continue;
+        }
+        let rest = &mut alle[m..];
+        match SCHEDS[c].lock().live_thread_ids(rest) {
+            Ok(k) => m += k,
+            // Mehr lebende Threads auf einem Kern, als der Sammelpuffer noch fasst. Auch das ist
+            // ein **benannter** Ueberlauf und keine gekuerzte Liste.
+            Err(gebraucht) => return Err(m + gebraucht),
+        }
+    }
+    let mut n = 0usize;
+    for t in &alle[..m] {
+        if pd_of_thread(*t) != Some(pd) {
+            continue;
+        }
+        if n >= out.len() {
+            // Weiterzaehlen, damit die Absage die **gebrauchte** Groesse nennt.
+            n += 1;
+            continue;
+        }
+        out[n] = *t;
+        n += 1;
+    }
+    if n > out.len() {
+        return Err(n);
+    }
+    Ok(n)
+}
+
+/// An welchen Endpoints wartet dieser Thread als **Empfaenger**? Gibt `(erster, anzahl)`.
+fn recv_endpoints(tid: ThreadId) -> (u32, usize) {
+    let mut erster = KEIN_EP;
+    let mut n = 0usize;
+    for i in 0..eps().len() {
+        if eps()[i].lock().quiescence_of(tid).as_receiver {
+            if erster == KEIN_EP {
+                erster = i as u32;
+            }
+            n += 1;
+        }
+    }
+    (erster, n)
+}
+
+/// **Eine ganze PD einfrieren** (Z23/S3) — der Gruppenschnitt.
+///
+/// ## Warum das mehr ist als „alle Threads der Reihe nach"
+///
+/// Treiben zwei Threads derselben PD miteinander IPC, gibt [`freeze_thread`] fuer **beide** `Busy`,
+/// und es gibt keine Reihenfolge, die das aufloest. Der Schnitt loest es, weil er die Frage anders
+/// stellt: **eine Beziehung, deren beide Enden im Schnitt liegen, ist keine offene Beziehung des
+/// Schnitts.** Genau das macht einen Prozess-Freeze moeglich, wo ein Thread-Freeze strukturell
+/// scheitert — und es ist der einzige Fall, den dieser Strang zeigt und Z4a nicht schon zeigte.
+///
+/// ## Die Reihenfolge, und jeder Schritt hat einen Grund
+///
+/// 1. **Tore nach aussen zu** (S1, am Subjekt): die PD faengt nichts Neues an. Ab hier kann die
+///    Menge ihrer offenen Transaktionen nur noch **schrumpfen** — ohne diesen Schritt waere jede
+///    Ruhe-Auskunft in dem Moment veraltet, in dem sie zurueckkommt.
+/// 2. **Tore nach innen zu** (S1b, am Objekt, aber **nur** wo die PD allein bedient): an jedem
+///    Kanal, an dem ein Teilnehmer als einziger Empfaenger wartet, wird `begin_quiesce` gesetzt.
+///    Fremde Aufrufer bekommen damit `ERR_QUIESCING` — „kommt gleich wieder" — statt unbegrenzt zu
+///    blockieren. **Wo auch ein Fremder bedient, wird nicht zugesperrt**: dort fröre der Riegel
+///    Dritte mit ein, und der Fremde bedient die Aufrufer ohnehin weiter.
+/// 3. **Urteilen** — und zwar erst jetzt, nach beiden Toren, weil sich der Befund sonst unter der
+///    Hand aendern koennte.
+/// 4. **Vollziehen**: Empfaenger zurueckziehen, jeden Teilnehmer in den Schnitt aufnehmen.
+/// 5. **Nachsehen, nicht glauben**: markiert ist nicht gestoppt. Ein Teilnehmer auf einem fremden
+///    Kern laeuft, bis der Reschedule greift — also **erst markieren, dann warten, bis sie die
+///    Kerne verlassen haben**. Andersherum terminiert es nicht, weil in der Zwischenzeit einer
+///    zurueckkommt.
+///
+/// ## Die Frist
+///
+/// `frist_ticks` begrenzt Schritt 5 **und** das Zuwarten auf eine Gegenseite ausserhalb der PD.
+/// Laeuft sie ab, wird **alles zurueckgenommen** und die Absage nennt den Thread und seinen
+/// Partner. Ohne Frist waere eine Stilllegung von einem Deadlock nicht zu unterscheiden.
+///
+/// **Alles oder nichts:** jeder Ausgang ausser `Frozen` hinterlaesst den Zustand, den er vorfand —
+/// Tore offen, Empfaenger eingereiht, kein Grundbit gesetzt.
+pub fn freeze_pd(pd: usize, frist_ticks: u64) -> PdFreeze {
+    if !CAPS.read().pds.is_used(pd) {
+        return PdFreeze::NoPd;
+    }
+    // **S5, erste Fassung: fail-closed.** Vor jedem anderen Schritt, damit eine Treiber-PD gar
+    // nicht erst halb behandelt wird.
+    if pd_haelt_dma(pd) {
+        return PdFreeze::HasDma;
+    }
+    // Schritt 1 -- und der Rueckgabewert ist die Eigentumsfrage: `false` heisst „war schon zu",
+    // also laeuft hier bereits ein Schnitt oder ein Hot-Reload. Wer den Zustand nicht gesetzt hat,
+    // darf ihn nicht aufheben.
+    if !CAPS.write().pds.set_quiescing(pd, true) {
+        return PdFreeze::AlreadyQuiescing;
+    }
+    let ergebnis = freeze_pd_innen(pd, frist_ticks);
+    if !ergebnis.is_frozen() {
+        // **Vollstaendig zurueck.** Die Tore gehoerten diesem Aufruf; sie gehen mit ihm.
+        CAPS.write().pds.set_quiescing(pd, false);
+    }
+    ergebnis
+}
+
+/// Der Rumpf von [`freeze_pd`], hinter der Torentscheidung. Getrennt, damit es **einen** Ort gibt,
+/// an dem die Tore wieder aufgehen — eine Rueckgabe mitten im Rumpf, die das vergisst, waere genau
+/// der halbe Zustand, gegen den der Zeuge gebaut ist.
+fn freeze_pd_innen(pd: usize, frist_ticks: u64) -> PdFreeze {
+    let kern = hal::cpu::core_id();
+    let t0 = hal::timer::ticks(kern);
+    loop {
+        let mut tids = [ThreadId::from_raw(0); FREEZE_MAX_THREADS];
+        let n = match pd_threads(pd, &mut tids) {
+            Ok(0) => return PdFreeze::Empty,
+            Ok(k) => k,
+            Err(gebraucht) => return PdFreeze::TooManyThreads(gebraucht),
+        };
+
+        // -- Schritt 2: die Kanaele, an denen diese PD ALLEIN bedient, nach innen zusperren -----
+        let mut recv_ep = [KEIN_EP; FREEZE_MAX_THREADS];
+        let mut ep_gesperrt = [false; FREEZE_MAX_THREADS];
+        let mut abbruch: Option<PdFreeze> = None;
+        for i in 0..n {
+            let (ep, anzahl) = recv_endpoints(tids[i]);
+            if anzahl > 1 {
+                abbruch = Some(PdFreeze::MultiReceiver(tids[i]));
+                break;
+            }
+            recv_ep[i] = ep;
+            if ep == KEIN_EP {
+                continue;
+            }
+            let mut e = eps()[ep as usize].lock();
+            if e.sender_count() > 0 {
+                // Sprechprobe der tragenden Invariante -- gefragt, nicht geglaubt.
+                abbruch = Some(PdFreeze::SenderQueued(tids[i], e.sender_count()));
+                drop(e);
+                break;
+            }
+            if e.receiver_count() == 1 {
+                ep_gesperrt[i] = e.begin_quiesce();
+            }
+        }
+        if let Some(a) = abbruch {
+            tore_auf(&recv_ep, &ep_gesperrt, n);
+            return a;
+        }
+
+        // -- Schritt 3: urteilen, jetzt wo sich nichts mehr unter der Hand aendert --------------
+        let mut hindernis: Option<(ThreadId, Option<ThreadId>, Quiescence)> = None;
+        let mut debugged: Option<ThreadId> = None;
+        for i in 0..n {
+            let t = tids[i];
+            if with_owner(t, |s, _| s.is_debug_stopped(t).then_some(())).is_some() {
+                debugged = Some(t);
+                break;
+            }
+            let q = thread_quiescence(t);
+            if q.is_quiescent() {
+                continue;
+            }
+            // **Ein wartender Empfaenger haelt niemanden fest.** Er wartet auf Arbeit; er wird
+            // zurueckgezogen und beim Auftauen wieder eingereiht.
+            if q.as_receiver && !q.as_sender && !q.as_caller && !q.as_reply_owner {
+                continue;
+            }
+            match thread_partner(t) {
+                // **Die Kernaussage des Schnitts:** liegt die Gegenseite in derselben PD, verlaesst
+                // die Beziehung den Schnitt nicht. Beide werden gemeinsam eingefroren, das
+                // Reply-Token bleibt unangetastet, und nach dem Auftauen laeuft die Transaktion
+                // weiter, als waere nichts gewesen.
+                Some(p) if pd_of_thread(p) == Some(pd) => continue,
+                p => {
+                    hindernis = Some((t, p, q));
+                    break;
+                }
+            }
+        }
+        if let Some(t) = debugged {
+            tore_auf(&recv_ep, &ep_gesperrt, n);
+            return PdFreeze::Debugged(t);
+        }
+        if let Some((t, p, q)) = hindernis {
+            if hal::timer::ticks(kern).wrapping_sub(t0) >= frist_ticks {
+                tore_auf(&recv_ep, &ep_gesperrt, n);
+                return PdFreeze::Deadline {
+                    tid: t,
+                    partner: p,
+                    q,
+                };
+            }
+            // Noch Zeit: alles zurueck, was dieser Durchgang gesetzt hat, und neu ansetzen. Die
+            // Gegenseite darf ihre Transaktion abschliessen -- `REPLY` ist durch das Tor
+            // ausdruecklich nicht gesperrt.
+            tore_auf(&recv_ep, &ep_gesperrt, n);
+            warte_einen_tick(kern);
+            continue;
+        }
+
+        // -- Schritt 4: vollziehen ---------------------------------------------------------------
+        for i in 0..n {
+            if recv_ep[i] != KEIN_EP {
+                eps()[recv_ep[i] as usize].lock().retire_receiver(tids[i]);
+            }
+            with_owner(tids[i], |s, _| s.freeze_group(tids[i]).then_some(()));
+        }
+
+        // -- Schritt 5: nachsehen, nicht glauben -------------------------------------------------
+        //
+        // Markiert heisst deplant, nicht gestoppt. Ab hier kann kein Teilnehmer mehr zurueck in
+        // eine Ready-Queue (die Grund-Menge ist nicht leer) und keiner mehr den Kern wechseln
+        // (`detach_for_migration` weist `FREEZE` ab) -- die Schleife terminiert also, sobald die
+        // laufenden ihren naechsten Trap nehmen.
+        loop {
+            let mut laeuft = false;
+            for c in 0..num_cores() {
+                if !caprock_sched::core_online(c) {
+                    continue;
+                }
+                let cur = SCHEDS[c].lock().current_id(c);
+                if (0..n).any(|i| tids[i] == cur) {
+                    laeuft = true;
+                    break;
+                }
+            }
+            if !laeuft {
+                break;
+            }
+            if hal::timer::ticks(kern).wrapping_sub(t0) >= frist_ticks {
+                // Frist abgelaufen, waehrend noch jemand lief: **vollstaendig** zurueck.
+                let zeuge = FrozenPd {
+                    pd: pd as u16,
+                    n: n as u8,
+                    tids,
+                    recv_ep,
+                    ep_gesperrt,
+                    tick0: hal::timer::ticks(kern),
+                    tick_kern: kern,
+                };
+                abort_freeze_innen(&zeuge);
+                return PdFreeze::Deadline {
+                    tid: tids[0],
+                    partner: None,
+                    q: Quiescence::default(),
+                };
+            }
+            warte_einen_tick(kern);
+        }
+
+        FREEZE_PD_OK.fetch_add(1, Ordering::Relaxed);
+        FREEZE_PD_THREADS.fetch_add(n as u64, Ordering::Relaxed);
+        return PdFreeze::Frozen(FrozenPd {
+            pd: pd as u16,
+            n: n as u8,
+            tids,
+            recv_ep,
+            ep_gesperrt,
+            tick0: hal::timer::ticks(kern),
+            tick_kern: kern,
+        });
+    }
+}
+
+/// Die von **diesem** Durchgang gesperrten Kanaele wieder oeffnen. Nur die eigenen — ein fremdes
+/// `begin_quiesce` bleibt stehen.
+fn tore_auf(recv_ep: &[u32; FREEZE_MAX_THREADS], gesperrt: &[bool; FREEZE_MAX_THREADS], n: usize) {
+    for i in 0..n {
+        if gesperrt[i] && recv_ep[i] != KEIN_EP {
+            eps()[recv_ep[i] as usize].lock().end_quiesce();
+        }
+    }
+}
+
+/// Einen Tick verstreichen lassen, ohne eine Sperre zu halten.
+///
+/// **In Ticks und nicht in Runden**: eine Zaehlschleife misst die Geschwindigkeit des Wartenden,
+/// nicht den Fortschritt der anderen. Die Wache daneben ist kein Ersatz fuer die Frist, sondern
+/// der Schutz gegen eine stehende Uhr — ohne sie waere ein ausgefallener Timer ein Haenger statt
+/// eines Befundes.
+fn warte_einen_tick(kern: usize) {
+    let t = hal::timer::ticks(kern);
+    let mut wache: u64 = 0;
+    while hal::timer::ticks(kern) == t && wache < 200_000_000 {
+        core::hint::spin_loop();
+        wache += 1;
+    }
+}
+
+/// **Einen Gruppenschnitt auftauen** (Z23/S6) — die Umkehrung, und sie ist nicht bloss „Grund weg".
+///
+/// Drei Dinge in dieser Reihenfolge, und die Reihenfolge ist die Aussage:
+/// 1. **Empfaenger wieder einreihen**, bevor irgendein Kanal wieder aufgeht. Andersherum koennte
+///    ein Aufrufer den Kanal treffen, waehrend der Server noch nicht drinsteht — und in der
+///    Senderschlange landen, statt bedient zu werden.
+/// 2. **Kanaele oeffnen** — und nur die, die dieser Schnitt zugesperrt hat.
+/// 3. **Den Grund entfernen.** `FREEZE` und nur `FREEZE`: wer zusaetzlich in IPC wartet, pausiert
+///    wurde oder auf leerem Konto sitzt, bleibt liegen. Sein Wecker ist ein anderer.
+///
+/// Rueckgabe: wie viele Threads den Grund tatsaechlich verloren haben — **nach Wirkung gezaehlt**,
+/// nicht nach Versuch.
+pub fn thaw_pd(z: FrozenPd) -> Thawed {
+    let t = Thawed {
+        threads: auftauen(&z),
+        ticks: hal::timer::ticks(z.tick_kern).wrapping_sub(z.tick0),
+    };
+    CAPS.write().pds.set_quiescing(z.pd as usize, false);
+    THAW_PD_OK.fetch_add(1, Ordering::Relaxed);
+    FROZEN_TICKS_TOTAL.fetch_add(t.ticks, Ordering::Relaxed);
+    t
+}
+
+/// **Einen Gruppenschnitt abbrechen** (Z23/S3) — derselbe Weg zurueck wie [`thaw_pd`].
+///
+/// Eigene Funktion und nicht ein Alias, obwohl der Rumpf derselbe ist: die beiden bedeuten
+/// Verschiedenes (*„fertig, weiterlaufen"* gegen *„es hat nicht geklappt"*), und der Zaehler
+/// trennt sie. Dass der **Weg** derselbe ist, ist das Ergebnis der Grund-Menge aus Z24 — mit einem
+/// eigenen Grundbit ist der Abbruch ein `remove` je Teilnehmer, und es gibt keinen
+/// Zwischenzustand, der rueckwaerts zu durchlaufen waere. Genau deshalb stand im Register
+/// „Z24 vor Z23".
+pub fn abort_freeze(z: FrozenPd) -> usize {
+    let n = auftauen(&z);
+    FROZEN_TICKS_TOTAL.fetch_add(
+        hal::timer::ticks(z.tick_kern).wrapping_sub(z.tick0),
+        Ordering::Relaxed,
+    );
+    CAPS.write().pds.set_quiescing(z.pd as usize, false);
+    FREEZE_PD_ABORT.fetch_add(1, Ordering::Relaxed);
+    n
+}
+
+/// Der Abbruch **innerhalb** von [`freeze_pd_innen`], wo die Tore noch dem laufenden Aufruf
+/// gehoeren und von `freeze_pd` selbst geoeffnet werden.
+fn abort_freeze_innen(z: &FrozenPd) -> usize {
+    FREEZE_PD_ABORT.fetch_add(1, Ordering::Relaxed);
+    auftauen(z)
+}
+
+fn auftauen(z: &FrozenPd) -> usize {
+    let n = z.len();
+    for i in 0..n {
+        if z.recv_ep[i] != KEIN_EP {
+            eps()[z.recv_ep[i] as usize].lock().bind_receiver(z.tids[i]);
+        }
+    }
+    for i in 0..n {
+        if z.ep_gesperrt[i] && z.recv_ep[i] != KEIN_EP {
+            eps()[z.recv_ep[i] as usize].lock().end_quiesce();
+        }
+    }
+    let mut geweckt = 0usize;
+    for i in 0..n {
+        let t = z.tids[i];
+        if let Some((_, c)) = with_owner(t, |s, _| s.thaw_group(t).then_some(())) {
+            geweckt += 1;
+            kick(c);
+        }
+    }
+    geweckt
+}
+
+/// Wie viele Threads stehen **systemweit** im Gruppenschnitt? (Sprechprobe der `pdfreeze`-Zeile:
+/// ein Pruefer, der ueber die Wirkung eines Schnitts urteilt, muss belegen koennen, dass ueberhaupt
+/// geschnitten wurde.)
+pub fn group_frozen_total() -> usize {
+    (0..num_cores())
+        .filter(|&c| caprock_sched::core_online(c))
+        .map(|c| SCHEDS[c].lock().group_frozen_count())
+        .sum()
+}
+
+/// Steht dieser Thread im Gruppenschnitt?
+pub fn thread_is_group_frozen(tid: ThreadId) -> bool {
+    with_owner(tid, |s, _| s.is_group_frozen(tid).then_some(())).is_some()
+}
+
+/// **Was ein Auftauen ergeben hat** (Z23) — Wirkung **und** Dauer.
+///
+/// ## Die Entscheidung zur ZEIT, und sie faellt hier statt spaeter implizit
+///
+/// **Die monotone Uhr pausiert NICHT mit.** Ein aufgetauter Thread sieht sie springen, und jede
+/// Frist, die er vor dem Freeze berechnet hat, ist danach falsch. Die naheliegende Gegenmassnahme —
+/// eine Uhr je PD — ist verworfen, und zwar aus drei Gruenden:
+///
+/// 1. Sie waere ein **zweites Gedaechtnis fuer eine Tatsache**. Der Kernel rechnet MCS-Budgets,
+///    Perioden und Zyklenstempel auf der globalen Uhr; eine zweite daneben laufen zu lassen heisst,
+///    sie irgendwann auseinanderlaufen zu lassen.
+/// 2. Ein per IPC empfangener Zeitstempel einer **nicht** eingefrorenen PD laege dann in der
+///    Zukunft der eigenen Uhr. Aus „die Uhr springt" wuerde „fremde Zeitstempel sind unbrauchbar" —
+///    ein schlechterer Tausch.
+/// 3. EL0 liest die Uhr **direkt** (`rdtsc` / `CNTVCT_EL0`). Eine Kernel-Uhr, die pausiert, waere
+///    von der Hardware-Uhr, die der Thread tatsaechlich liest, ohnehin nicht gedeckt — der Kernel
+///    kann diese Zusage gar nicht einloesen.
+///
+/// **Also: die Uhr laeuft, und die Dauer wird BERICHTET.** Sie geht an den Halter der
+/// Freeze-Autoritaet — dieselbe Regel wie beim Partnernamen in [`Freeze::BusyOn`], und aus
+/// demselben Grund: wer eingefroren hat, weiss ohnehin, dass und wie lange.
+///
+/// **Was damit NICHT geloest ist, und es steht in `todo.md`:** die eingefrorene PD selbst erfaehrt
+/// die Dauer nicht — dafuer braeuchte es einen Selbstauskunfts-Syscall. Ein Thread, der vor dem
+/// Freeze eine Frist aus `rdtsc` gerechnet hat, kann sie danach also **nicht** berichtigen. Das ist
+/// eine benannte Luecke und kein Nebeneffekt.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Thawed {
+    /// Wie viele Threads den Grund tatsaechlich verloren haben — **nach Wirkung** gezaehlt.
+    pub threads: usize,
+    /// Wie lange die PD stand, in Ticks der Uhr, die auch den Schnitt gestempelt hat.
+    pub ticks: u64,
+}
+
+/// Summe aller Standzeiten (Bericht). `0` bei einem Lauf ohne Schnitt ist von „nie gemessen" nicht
+/// zu unterscheiden — deshalb steht [`FREEZE_PD_OK`] daneben.
+pub static FROZEN_TICKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Vollzogene Gruppenschnitte.
+pub static FREEZE_PD_OK: AtomicU64 = AtomicU64::new(0);
+/// Summe der dabei eingefrorenen Threads — **nach Wirkung**, nicht nach Versuch.
+pub static FREEZE_PD_THREADS: AtomicU64 = AtomicU64::new(0);
+/// Abgebrochene Schnitte (Frist abgelaufen, waehrend schon markiert war).
+pub static FREEZE_PD_ABORT: AtomicU64 = AtomicU64::new(0);
+/// Aufgetaute Schnitte.
+pub static THAW_PD_OK: AtomicU64 = AtomicU64::new(0);
 
 /// **Einen geparkten Thread vom Kernel aus wecken** (Z22, P4) — dieselbe Operation wie
 /// [`sys::UNPARK`](caprock_abi::sys::UNPARK), nur ohne die PD-Prüfung, die dort die Autorität
@@ -10040,9 +12100,11 @@ fn sys_load_uebergeben(
     endow: &[(usize, CapPtr)],
     core: usize,
     frame: usize,
+    cap_budget: u16,
+    dma_pages: u32,
 ) -> crate::verifizierer::Uebergabe {
     let caller = SCHEDS[core].lock().current_id(core);
-    crate::verifizierer::uebergeben(index, caller_pd, endow, caller, core, || {
+    crate::verifizierer::uebergeben(index, caller_pd, endow, caller, core, cap_budget, dma_pages, || {
         // Genau der Pfad, den die Tick-Rechnung sonst nicht sieht (B-5.1): wer blockiert, hat
         // gerechnet. `charged` stempelt die verbrauchten Zyklen, bevor gewechselt wird.
         charged(core, &mut SCHEDS[core].lock(), |s| {

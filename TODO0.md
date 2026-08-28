@@ -180,12 +180,135 @@ abzunehmen.
 
       **Was WIRKLICH fehlt — und es ist viel kleiner:**
 
-- [ ] **K1a. Ein ABI-Weg, mit dem eine PD sich selbst einen Thread erzeugt.**
-      ⬛ Die ABI hat **19 Syscalls** (`YIELD CALL RECV REPLY PARK EXIT KILL SIGNAL WAIT MAP UNMAP
-      PDCTL LOAD CDELETE CCOPY CMOVE SETRECV UNPARK SETHANDLER`) — **kein `SPAWN`/`CLONE`**. Die
-      zwei Threads von `pdthrd` legt der **Kernel** im Testaufbau an; ein Userland-Programm kann
-      es nicht. Für `pthread_create` — und damit für Mesa, Aquamarine, smithay und jede JVM — ist
-      genau das die Lücke.
+- [x] **K1a. Ein ABI-Weg, mit dem eine PD sich selbst einen Thread erzeugt — GEBAUT UND GEMESSEN
+      (2026-08-26). Dieser Eintrag war zuletzt in zwei Richtungen falsch.**
+
+      > **Berichtigt 2026-08-26.** Hier stand „die ABI hat 19 Syscalls, kein `SPAWN`". Der
+      > Syscall `sys::SPAWN = 20` steht seit dem **2026-08-17** in der ABI, mit
+      > `spawncheck::check_stack`, sechs benannten Absagen und `ERR_INUSE`. Die Zeile war seit
+      > neun Tagen ueberholt.
+      >
+      > **Und die andere Richtung war schlimmer:** `SYS_SPAWN` hatte bis zum 2026-08-26
+      > **keinen Aufrufer und kein Gatter** — 0 Treffer im ganzen Baum ausserhalb seiner
+      > Definition und eines Nummern-Ankers. Er war gebaut und **nie ausgefuehrt**. Ein Register,
+      > das „fehlt" sagt, wo „ungemessen" richtig waere, schickt den naechsten Plan an die
+      > falsche Stelle — dieselbe Form wie bei K1 selbst.
+
+      **Gemessen als `arena` in JEDEM Lauf beider x86-Suiten** (arch-neutral, aarch64 faehrt sie
+      mit):
+
+      ```
+      arena  : ALL PASS (fertig=true ganze-region=true vier-fenster=true disjunkt=true
+                lebendig=true threads=6 slots=2 ueberlappung-abgewiesen=true
+                ausserhalb-abgewiesen=true cap-gesperrt=true | maske=0xf magisch=4/4
+                korrupt=0 codes: ganz=0 ueber=7 aus=21 del=18)
+      ```
+
+      Die Abnahmebedingung aus diesem Eintrag ist eingeloest, nur mit einer anderen Groesse als
+      dem Staffelstab: jedes Kind legt ein aus **seiner** Fensterbasis abgeleitetes Wort ab und
+      liest es weiter nach — „`spawn` gab `Some`" zaehlt nicht, und vier Threads auf einer Arena
+      saehen ohne diese Zeile genauso aus, wenn sie einander zertrampeln. Der Ueberlauffall
+      (`ERR_THREAD_LIMIT`, nicht blockierend) steht in `spawncheck` mit Host-Test.
+
+- [x] **K1b. Mehrere Stapel aus EINER Cap — die Teilregion (2026-08-26).**
+      Bis dahin kaufte eine `Memory`-Cap genau **einen** Thread, und sie blieb fuer dessen Leben
+      gesperrt. „Wie viele Threads darf eine PD haben" war damit „wie viele Cap-Slots sind noch
+      frei" — die falsche Frage: Threads einer PD teilen sich den Adressraum ohnehin, eine eigene
+      Cap je Stapel kauft **keine Isolation**. Ein Treiber mit 6 von 8 belegten Slots kam auf
+      zwei Threads.
+
+      `x1` von `SYS_SPAWN` traegt jetzt `(offset_pages << 32) | length_pages`; `0` ist **die ganze
+      Region** und damit bitgleich zu jedem vorher geschriebenen Aufruf. Vier Absagen mit eigenen
+      Namen, darunter `ERR_SUBREGION` (ein Fenster ausserhalb der Cap ist etwas anderes als eine
+      Region, die als Stapel nicht taugt).
+
+      **Der Befund unterwegs, und er ist der wichtigere:** die `Overlaps`-Absage war fuer genau
+      die Threads, die `SYS_SPAWN` erzeugt, **strukturell unerreichbar**. `pd_mapping_overlaps`
+      liest `KSTACKS.ubase_of`, und `spawn_with_stack_parked` traegt dort **absichtlich** nichts
+      ein (die Region gehoert der Cap, nicht dem Kernel). Der Pruefer konnte den Fall, gegen den
+      er gebaut ist, nicht sehen — und mit mehreren Stapeln in einer Cap ist genau das der
+      Hauptfall. Seither gibt es `stack_sibling_overlaps` daneben. Gegenproben:
+      `tools/spawnarena-negativ.sh` (M1 ist woertlich der Baum von gestern).
+
+      **Offen geblieben:** das Fenster zwischen `admit` und dem Eintrag in `STACK_CAP_OF` — zwei
+      Threads derselben PD auf verschiedenen Kernen koennen beide vor dem jeweils anderen Eintrag
+      pruefen. Dasselbe Fenster, das der `ERR_INUSE`-Schutz seit K1a hat; innerhalb einer PD
+      dieselbe Vertrauenszone, ein Loch, sobald `SPAWN` je eine PD-Grenze ueberschreitet.
+
+- [ ] **KB. Stufe B (`CAP_IRQ`) — geplant 2026-08-26, `docs/plan-cap-irq.md`.**
+      ⬛ Der Eintrag „IRQ-Zustellung fehlt" war in **beide** Richtungen falsch, dieselbe Form wie
+      K1a: die Zustellmechanik ist gebaut und wird auf aarch64 in jedem Lauf als `irq : ALL PASS`
+      gemessen (RTC über GIC-SPI); die IRTE-Kodierung samt SVT/SID und Hardwarezugriff steht
+      ebenfalls. Was fehlt, ist schmaler: **MSI-X-Programmierung** (`pcie.rs` kennt kein MSI),
+      **ein Aufrufer** für `vtd::irte_vergib`, und ein **Cap-Riegel** an `bind_irq` — dessen
+      Doku-Kommentar „über die IRQ-Cap autorisiert" behauptet, was seine Signatur nicht kann.
+
+      Die tragende Entwurfsentscheidung steht im Plan: **der Treiber schreibt seine MSI-X-Tabelle
+      selbst** (er hält die BAR-Cap ohnehin), und die IRTE-Indirektion ist der Riegel — ein Handle,
+      den er nicht bekommen hat, trifft einen nicht-präsenten Eintrag oder eine fremde SID, und
+      VT-d weist ab. Ohne `SVT_SID` wäre die Interruptzustellung genau der Kanal, den A-5.4 auf der
+      DMA-Achse geschlossen hat.
+
+      **Entschieden 2026-08-26 (E10-E12), alle drei kleiner als sie aussahen:** der Re-Trigger-
+      Schutz ist eine **Zusicherung** statt einer gemeinsamen Implementierung (aarch64 maskiert,
+      MSI ist edge — geprüft wird auf beiden gleich: zweimal auslösen vor dem Drain, höchstens eine
+      Zustellung); der **Kernel** schreibt die MSI-X-Zeile und weist ein Gerät ab, dessen Tabelle in
+      der angebotenen BAR liegt (gemessen: der Treiber bekommt heute genau die BAR mit der
+      Common-Config, alles andere wäre ein Zufall der Auswahlregel); und die Bindung hängt an der
+      **Zuteilung** statt an `NIRQ_BIND` — ein Vektor je Gerät ist bereits die Obergrenze, ein Konto
+      braucht es nicht.
+
+      **Und die Reihenfolge A→B stimmt nur halb:** die positive Richtung („der Treiber kam ohne
+      eine einzige Poll-Runde voran") ist heute messbar; die Gegenprobe braucht eine Frist, aber
+      **die des Messenden, nicht die der ABI**. Stufe B ist damit vor Stufe A abnehmbar. Was A
+      wirklich braucht, ist das Produkt: ein Treiber muss sich von einem ausbleibenden Interrupt
+      **erholen** können, und das geht ohne `ERR_TIMEOUT` nicht. **Als Schuld benannt:** *vor Stufe A
+      hängt ein Treiber-PD, dessen Interrupt ausbleibt, unwiderruflich* — eine Eigenschaft des
+      ausgelieferten Zustands, kein latenter Mangel. Ein Poll-Fallback als Zwischenlösung ist
+      **verboten**: er unterliefe ausgerechnet `poll-runden == 0`, also das tragende Konjunkt von
+      `irqmsi`. Keine Zwischenlösung zwischen B und A.
+
+- [ ] **K1d. Das PD-lokale Präemptions-Gatter — die einzige Anforderung, die aus E3 folgt.**
+      Entschieden 2026-08-26, Begründung in `docs/linux-kompatibilitaet-caprock.md` §5.
+
+      Caprock ist **präemptiv, aber ohne Parallelität innerhalb einer PD** (`SYS_SPAWN` legt jeden
+      Thread auf den Kern des Aufrufers — gemessen, nicht angenommen). Das ist
+      `CONFIG_SMP=n` + `CONFIG_PREEMPT=y`, eine unterstützte Linux-Konfiguration, und ihre Antwort
+      steht in `include/linux/spinlock_up.h`: `spin_lock() → preempt_disable()`, kein Spinnen.
+      **Damit bleiben `spin_lock` und `rcu_read_lock` in Klasse A** — die A-Schicht braucht keine
+      echten Sperren.
+
+      **Der Zuschnitt ist die Entscheidung, nicht das Ob:**
+      * **kein globaler Scheduling-Override** — das wäre ein System-DoS aus einem Treiber-PD, also
+        genau die Autorität, die eine PD nicht haben darf;
+      * es bedeutet *nicht auf einen anderen Thread **derselben PD** umschalten*. Verdrängung durch
+        eine fremde PD ist unschädlich, weil kein Zustand geteilt wird;
+      * **gedeckelt durch das verbleibende SC-Budget**, sonst ist „gehalten" unbegrenzt und es
+        entsteht ein neues Fehlerbild statt eines benannten (D11-Form).
+
+      **Abnahme:** zwei Threads derselben PD, einer hält das Gatter und schreibt einen
+      Zwei-Wort-Zustand, der zwischendurch inkonsistent ist; der andere liest ihn in einer Schleife.
+      Ohne Gatter muss der Leser die Inkonsistenz **sehen** (Positivkontrolle — ein Test, der sie
+      nie sieht, misst nichts), mit Gatter nie. Dazu: ein Thread einer **fremden** PD verdrängt
+      weiterhin (sonst ist es doch ein globaler Override), und das Gatter fällt beim
+      Budget-Ende von selbst.
+
+      **Voraussetzung, die mit der Entscheidung steht und fällt:** sobald `SYS_SPAWN` eine Kernwahl
+      bekommt, gilt `CONFIG_SMP=y` und `spin_lock` verlässt Klasse A. Die Kernwahl gibt es heute
+      nicht — wer sie einführt, muss diesen Eintrag mit aufmachen.
+
+- [ ] **K1c. `NCAPS = 16` ist der ECHTE Deckel je PD — nicht das Budget.**
+      Am 2026-08-26 gefunden, und zwar vom Selbsttest, nicht beim Gegenlesen: `CAP_BUDGET_MAX`
+      stand auf 64, der **lokale Cspace einer PD ist aber ein Array von `NCAPS` = 16 Slots**
+      (`Pd::cspace`). `install_cap` weist jeden Slot `>= NCAPS` ab, **ohne das Budget je zu
+      fragen** — ein Budget von 20 war keine grosszuegige Zusage, sondern eine unerfuellbare.
+      `CAP_BUDGET_MAX` ist seither `NCAPS`, mit `const _: () = assert!` daneben.
+
+      Damit steht die Zahl, die eine Treiberumgebung wirklich begrenzt: **16 Slots je PD, hart.**
+      Das Budget-Konto (s. A3) hebt die erreichbare Zahl von 8 auf 16, ohne die anderen
+      zehntausend PDs etwas zu kosten; darueber hinaus braucht es einen **variablen** Cspace je
+      PD. Das ist eine eigene Aenderung und beruehrt `Pd`, `PdTable` und jede Stelle, die
+      `[Option<CapPtr>; NCAPS]` als Wert herumreicht (`caps_of`).
 
       **Vier Entscheidungen stehen davor, und keine ist beliebig:**
       1. **Woher der Stack?** Aus einer Cap des Aufrufers (dann trägt er die Kosten und die
@@ -706,3 +829,144 @@ test.)*
       already listed in §13a: A1 colouring on real caches (today the claim is entirely unverified),
       `pprobe` with real latencies instead of `SKIP`, the SMT *channel* rather than the policy, the
       IOMMU against real RMRRs (q35 has 0), and whether D13 is the measurement stand or the kernel.
+
+---
+
+## 14. Strand P — PostgreSQL on Caprock (measured 2026-08-21)
+
+**The measurement corrected the estimate, and it corrected it downwards where it counts.** Source
+clone at `~/Dokumente/Caprock OS/quellen/postgres` (PostgreSQL 20devel, built here against glibc so
+the inventory below is read rather than guessed).
+
+### 14.1 Postgres is the SMALL half — with numbers
+
+`fork()` is the one structural obstacle: Caprock has none (0 hits in the tree), and should not get
+one — it duplicates address space *and* cspace implicitly, which is the operation a capability
+system cannot name. seL4, Fuchsia and Capsicum all refuse it.
+
+**Postgres solved this itself.** `src/include/pg_config_manual.h:122`:
+
+> If EXEC_BACKEND is defined, the postmaster uses an alternative method for starting subprocesses:
+> Instead of simply using fork() … **This must be enabled on Windows (because there is no fork()).**
+
+And the seams are *named files*, not scattered logic:
+
+| seam | Unix | Windows |
+|---|---|---|
+| shared memory | `sysv_shmem.c` 993 | `win32_shmem.c` 650 |
+| semaphores | `posix_sema.c` 381 | `win32_sema.c` 234 |
+
+**All four together: 2258 lines.** `EXEC_BACKEND` touches 50 files, concentrated in
+`launch_backend.c` and `syslogger.c` (13 hits each). The platform header template is
+`win32_port.h` (589 lines) plus 16 `win32*.c` replacements in `src/port/` (63 files total).
+
+So a Caprock port is **a third entry beside `win32` and `sysv`**: an estimated 2500–4000 lines
+against 1 208 303 lines in `src/backend`+`src/common`+`src/port` — **0.3 %**. Weeks, not months.
+
+### 14.2 The libc surface is an INVENTORY, not an estimate
+
+`nm -D --undefined-only` over the built `postgres` + `initdb`: **277 symbols.**
+
+| group | n | note |
+|---|---|---|
+| file/syscall | **45** | the real item |
+| math | 28 | libm — portable or vendored |
+| string/mem | 25 | trivial |
+| process/signal | 22 | includes `fork`, which `EXEC_BACKEND` removes |
+| stdio | 20 | |
+| glibc internals `__*` | 18 | disappear with musl or an own libc |
+| network | 17 | milestone 3, not 1 |
+| time | 11 | |
+| locale | 9 | a **decision**, see 14.4 |
+| **pthread** | **5** | `sem_*` only — **not one `pthread_*`** |
+| dl | 4 | avoidable: build extensions statically |
+
+**Postgres brings its own concurrency entirely.** That was the number most likely to sink the
+port, and it is the smallest one.
+
+Nothing exotic in the remainder: `getopt_long`, `syslog`, `backtrace` (diagnostics, droppable),
+`getpwuid`/`getgrnam` (a stub on Caprock), `tcgetattr` (initdb's terminal only), `syncfs`.
+
+### 14.3 What Postgres needs from the filesystem
+
+`fd.c` + `md.c` measured 17 operations. That figure is a **floor, not a ceiling** — it is the
+storage-manager path, and `xlog.c`/`xlogrecovery.c` (WAL segments, `pg_control`), `initdb` (the
+directory tree), `postmaster.pid` with lock semantics, tablespaces (`symlink`), `pg_stat` files and
+the syslogger all go past it. The `nm` inventory above supersedes the grep: **45 file/syscall
+symbols** is the number to design the interface against.
+
+Caprock today has none of them: the fs PD does `INFO/READ/WRITE/FLUSH/SCAN` on **sectors**, and
+`caprock-fat` is read-only — no `mkdir`, no `rename`, no `create`.
+
+### 14.4 Two decisions that must fall BEFORE the first line of port code
+
+- **Collation.** Build against ICU or against C collation only, and write it down. Otherwise B-tree
+  ordering hangs on our `strcoll`, and a later fix there **silently invalidates existing indexes**.
+- **`wal_sync_method` is pinned, never auto-detected.** The eleven optional `HAVE_*` degrade
+  cleanly; the sync-method choice does not — it decides which path the durability measurement
+  actually exercises. An auto-detected value means the measurement and production may differ.
+
+### 14.5 Four items that are not in `fd.c` and are therefore easy to miss
+
+Measured present, with size:
+
+| item | where | size |
+|---|---|---|
+| abnormal backend exit → reset the **whole** shared memory | `CleanupBackend`/`HandleChildCrash` | 20 hits in `postmaster.c` |
+| postmaster-death detection in the backend | `PostmasterDeathWatchHandle`/`PostmasterIsAlive` | 7 files |
+| `statement_timeout` / `deadlock_timeout` | `timeout.c` | 830 lines |
+| shared-region placement | `win32_shmem.c` retry loop against ASLR | 12 hits |
+
+The last one is the instructive one: on Caprock placement **can** be deterministic — but that
+belongs in the region cap as a **requirement**, not as an accident of the allocator. Read the
+Windows retry loop before writing `caprock_shmem.c`.
+
+The second one has its template in the tree too: on Windows it is an event handle, which is what a
+notification-based version looks like.
+
+### 14.6 Milestone 0 is the crash probe — BEFORE libc and filesystem
+
+**Twenty lines of synthetic writer: `write` → `flush`, then a real power cut on target hardware with
+NVMe and the volatile write cache ENABLED.** Not QEMU-virtio, not a process kill — those exercise a
+different cache.
+
+If the chain does not hold, libc and filesystem are lost person-months, and we find out at the end
+instead of at the start. Same displacement as chapter 18.
+
+Postgres deliberately **PANICs** when `fsync` fails (`data_sync_retry` in `fd.c`), because a
+swallowed error means silent corruption — the fsyncgate aftermath. So the specification comes with
+it, and it is one line:
+
+> **An fsync error is STICKY.** Every subsequent call reports it again, until the file is closed and
+> reopened. That is what makes `data_sync_retry` and the PANIC path work — and it makes us better
+> than the original at exactly this point, where Linux dropped the error and lost the page.
+
+### 14.7 The named assumption — and it is not a footnote
+
+**`EXEC_BACKEND` has NO CI gate in this tree.** Measured: `.cirrus.yml` is gone (CI is
+`.github/workflows/pg-ci.yml`), and `EXEC_BACKEND` appears **zero** times in `meson.build`,
+`configure.ac` or `src/tools/ci/`. The only switch is `#if defined(WIN32)` in
+`pg_config_manual.h`, or a hand-passed `-DEXEC_BACKEND`.
+
+So: it **is** maintained — through the Windows build, and Windows is a supported platform. But the
+**Unix** variant of `EXEC_BACKEND`, which is the one a Caprock port resembles, has no automated
+coverage; the header calls it *"only useful for verifying those otherwise Windows-specific code
+paths"*.
+
+**We are therefore a co-maintainer of the half nobody builds.** That is not a veto, it is a priced
+assumption: if the Unix `EXEC_BACKEND` path breaks in a release, upstream will not notice, and the
+report comes from us. Budget for it, or carry a patch.
+
+### 14.8 Order
+
+| # | milestone | what it proves |
+|---|---|---|
+| **0** | crash probe on real NVMe, write cache on | the durability chain carries a database at all |
+| 1 | `initdb` + `postgres --single` (3594 lines, single process, no network) | libc subset + filesystem with the 45 operations + `fsync` |
+| 2 | `EXEC_BACKEND` with ONE backend | shared region via a cap, latches via notifications |
+| 3 | several backends + local client | the concurrency path |
+| 4 | power cut mid-commit, database consistent afterwards | the only line that says the stack can hold a database |
+
+Milestone 1 is roughly half the total effort — and almost all of it is libc and filesystem, **not
+Postgres**. Which makes Postgres a good acceptance criterion and a bad strand of its own: both
+pieces are needed for every other serious program anyway.

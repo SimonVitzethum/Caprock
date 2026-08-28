@@ -97,6 +97,8 @@ Zweig `arch/x86_64` (2026-08-03).
 |---|---|
 | x86_64 | **49 996 von 50 000** nach der D0-Behebung (2026-08-07 abends, `tools/d0-messen.sh`, 16 parallele Stroeme gegen EINE Referenz). **0 D0-Treffer** — davor 9 in 50 000. Die 4 Abweichungen sind Lastartefakte des Messstands (3,2-fache vCPU-Ueberbuchung), s. todo D13 |
 | x86_64 RAM-Reihe | `== ALL PASS ==` bei **512M · 2560M · 3G · 6G**, Haupt- **und** Lade-Suite (2026-08-04). Vor E-Rest 3 starb ab 3G der Boot mit `#PF cr2=0x70_0000_0014` — der Zweig „RAM oberhalb 4 GiB" war nie gelaufen |
+| K1a/K1b | **`arena : ALL PASS` auf beiden Architekturen und in beiden x86-Suiten** (2026-08-26). Der erste Lauf von `SYS_SPAWN` ueberhaupt: fuenf EL0-Kinder aus zwei Caps, vier davon in Fenstern EINER Arena, `threads=6 slots=2`. Gegenproben `tools/spawnarena-negativ.sh` |
+| Cap-Budget | **`budget : ALL PASS`, `Vorrat 80000 -> 79992 -> 79980 -> 80000`** (2026-08-26) — ein Konto je PD, mit Rueckgabe beim Abbau. Der ERSCHOEPFUNGSPFAD ist **nicht** gefahren (er braucht tausende PDs), s. todo A3 |
 | x86_64 Lade-Suite | `== ALL PASS ==` (2026-08-03: 39 Pruefungen — 5 Module, **zwei** Treiber-PDs, Austausch, A-5.3/A-5.4, dazu **drei** verkettete Boots fuer Z4 Stufe 2, inkl. sieben Negativfaellen) |
 | aarch64 | **`RUNS=6` → 6 von 6 mit identischer Signatur, `== ALL PASS ==`** (2026-08-13, nach der C9e-Behebung). Über **12** Läufe desselben Standes: **11 sauber, 1 D13** — die Rate gehört zur Zahl, und D13 ist hier unterscheidbar, weil die Farbzeile selbst auf `ALL PASS` steht und nur der `COLOR_DONE`-Store zu spät kommt. Davor **zehn Tage rot** (`color : FAILURES` mit lauter Nullen, 3 von 3), ohne dass es jemand sah: die Abnahme-Reihe **baute** aarch64 und **bootete** ihn nie. Seit dem 2026-08-13 fährt `tools/abnahme.sh` die Suite mit — **62 s je Lauf**, gemessen, gegen rund 950 s für die übrige Reihe |
 | Host-Tests | `mem · part · fat · cycles · loader · cap · virtio · typestate · ipctreue` → `== HOST-TESTS: ALL PASS ==` (`tools/host-tests.sh`, 2026-08-03) |
@@ -227,6 +229,54 @@ falsch.
   **aarch64 mit Vorbehalt:** 11 gruene Laeufe (`RUNS=6` identische Signatur + 5 Einzellaeufe),
   **ein** Fehlschlag unter dreifacher paralleler QEMU-Last. Passt zum offenen Haenger aus D6 und
   trat auch vor diesen Aenderungen auf -- auseinandergehalten habe ich es nicht.
+
+## Was am 2026-08-26 dazukam (K1a/K1b + das Budget als Konto)
+
+* **`SYS_SPAWN` ist zum ersten Mal GELAUFEN.** Der Syscall stand seit dem 2026-08-17 vollstaendig
+  in der ABI und hatte **keinen Aufrufer und kein Gatter** — null Treffer im ganzen Baum ausserhalb
+  seiner Definition. Seit heute misst ihn `arena` in jedem Lauf beider x86-Suiten und auf aarch64:
+  ein Elternthread in EL0 erzeugt fuenf Kinder ueber die ABI, eines mit der ganzen Cap und vier in
+  **Fenstern derselben Arena**. `arena : ALL PASS (… threads=6 slots=2 …)`.
+* **Die tragende Zahl ist `slots=2` neben `threads=6`.** Vier laufende Threads belegen nur, dass
+  vier Threads laufen; der Punkt ist, was sie gekostet haben. Bis dahin kaufte eine `Memory`-Cap
+  genau einen Thread — „wie viele Threads darf eine PD haben" war „wie viele Cap-Slots sind noch
+  frei", und ein Treiber mit 6 von 8 belegten Slots kam auf zwei. Dabei kauft eine Cap je Stapel
+  **keine Isolation**: Threads einer PD teilen sich den Adressraum ohnehin.
+* **Der Befund, der groesser ist als der Eintrag:** die `Overlaps`-Absage war fuer genau die
+  Threads, die `SYS_SPAWN` erzeugt, **strukturell unerreichbar**. `pd_mapping_overlaps` liest
+  `KSTACKS.ubase_of`, und der Spawn-Pfad traegt dort mit Begruendung nichts ein. Zwei richtige
+  Entscheidungen, zusammen ein Loch.
+* **Das Cap-Budget ist ein KONTO** (`Vorrat 80000 → 79992 → 79980 → 80000`), mit `SYS_LOAD` `MSG3`
+  als Quelle und der **Rueckgabe beim Abbau** als der Haelfte, die entscheidet, ob es eines ist.
+* **Und der echte Deckel ist `NCAPS = 16`, nicht das Budget.** `CAP_BUDGET_MAX` stand auf 64; der
+  lokale Cspace einer PD ist ein Array von 16 Slots, und `install_cap` weist darueber ab, **ohne
+  das Budget zu fragen**. Gefunden hat es der Selbsttest am Tag der Einfuehrung. Fuer eine
+  Treiberumgebung mit dreissig Caps braucht es einen variablen Cspace — TODO0 K1c.
+* **Der Badge hat seine Sprechprobe bekommen**, angestossen vom Modell-Treue-Waechter, der den
+  Umbau vom 2026-08-25 von selbst beanstandet hat (`E0061`). Bei **jeder** Zustellung wird jetzt
+  geprueft, dass im Frame des Empfaengers das Badge **seines** Absenders steht — mit zwei
+  Positivkontrollen, die je einen Zustellweg auf die alte harte `0` zuruecksetzen.
+* **Vier eigene Fehler, alle von einer Messung gefangen, keiner vom Gegenlesen:** der Elternthread
+  lag in `.text` und faultete an seiner eigenen Einsprungadresse (entschieden hat `nm`);
+  `user_syscall1` legte sein Argument nach `MSG0`, waehrend `CDELETE` den Slot aus `x1` liest; die
+  Sonde las die Fenster, bevor die Kinder eingeplant waren; und die Budget-Grundlinie wurde nach
+  dem ersten Verbrauch genommen.
+
+## Was am 2026-08-26 (zweiter Teil) dazukam: Stufe C
+
+* **Der DMA-Pool ist ein ARGUMENT des Ladens, keine Kernelkonstante** (`SYS_LOAD` `x5` =
+  `(dma_pages << 16) | cap_budget`, beide `0` = Vorgabe). Gemessen als `dmapool` in der Lade-Suite:
+  zwei Treiber-PDs mit 8 bzw. 32 Seiten, `eingeloest`/`verschieden`/`disjunkt`, dazu der
+  Ring-3-Negativfall aus `init`. Ueber `DRIVER_DMA_MAX_PAGES` hinaus kommt `ERR_DMA_TOO_LARGE` --
+  **abgewiesen, nicht gekuerzt**: eine halbierte DMA-Region ist ein Geraet, das ueber ihr Ende
+  hinausschreibt. Die Obergrenze steht in der **ABI**, nicht nur im Kernel.
+* **Zwei Befunde beim Messen.** Das Badge steckt in der **Cap** (mein `signal(NTFN_SLOT, BADGE)`
+  lieferte `ROOT_BADGE`, die Zeile meldete `zu-gross-abgewiesen=false` bei korrekter Absage) --
+  steht seit A-2.1 im Register. Und `dma_audit` meldet nach einem Hot-Reload `2`, weil zwei Caps
+  dieselbe Region halten; es steht deshalb als **Zahl** in der Zeile und die ernstere Frage als
+  `A3d` in `todo.md`.
+* **Berichtigt:** die fuenf spaeten Sonden in `all_done()` **gattern nicht** -- sie werden im
+  Bericht gemessen, das Gatter ist die Suite. Gemessen, nicht erschlossen.
 
 ## Was am 2026-08-11 dazukam (C8: der Verifiziererthread)
 
@@ -1147,11 +1197,160 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
   `root : FAILURES (Rejected(Unverified))` plus drei Folgezeilen scheitern. Das sieht wie ein
   Kernelbefund aus und ist ein Aufbauproblem. **Wer eine Pruefung in einer Suite verschaerft, muss
   die andere mitnehmen** — sonst faellt der Fall genau dort an, wo niemand ihn erwartet.
+* **Eine bequeme Abfrage unter einer Sperre ist ein Latenzloch — und es faellt an einer Zeile auf,
+  die mit der Sache nichts zu tun hat.** `pd_haelt_dma` (Z23/S5) fragte je Cap-Slot einer PD ueber
+  `CapSpace::inspect`, und `inspect` rechnet `child_count`, also einen CDT-Gang mit der Schranke
+  `slots.len()` — alles unter gehaltener `CAPS`-Sperre, und **`SpinLock` maskiert IRQs**. Gemessen
+  am 2026-08-21: die laengste maskierte Strecke auf aarch64 stieg auf **3 701 562** Zyklen, mit der
+  Behebung (`kind_of`, kein CDT-Gang; Sperre nur fuer die Slot-Kopie) **220 081** — Faktor 17. Rot
+  geworden ist dadurch die **Stopp-Latenz-Zusage des DEBUGGERS**, eine Zeile ohne jeden Bezug zum
+  Freeze, und ihr Bericht zeigte lauter `true`: der gefallene Summand steht in einer Zahl, nicht in
+  einem Konjunkt. Zwei Lehren, und die zweite ist die teurere: eine Auskunftsfunktion, die
+  **nebenbei** einen Gang macht, ist an einer Engstelle kein Komfort, sondern ein Fehler; und wer
+  eine zusammengesetzte Schranke prueft, muss den **Summanden** drucken, nicht nur das Urteil,
+  sonst sucht der naechste an der falschen Stelle. Dieselbe Klasse wie der `while let`-Guard im
+  C8-Verifizierer -- nur dass diesmal eine Pruefzeile hingesehen hat.
+* **Ein Umfang, den der Aufrufer hinschreibt, ist eine BEHAUPTUNG — und ein Waechter, der ihn
+  liest, prueft die Behauptung und nicht die Sache.** `Scope::endpoints` trug seit Z4b die Doku
+  „Endpoints, deren **beide Seiten** Teil des Checkpoints sind"; `classify` hat die Liste
+  **geglaubt**. Ein an einem genannten Endpoint blockierter Client, der zurueckbleibt, kam nirgends
+  vor — die Cap war „uebertragbar", der Endpoint wanderte, und der Wartende sass fuer immer an
+  einem Rendezvouspunkt, den es auf dieser Maschine nicht mehr gibt. **Verdeckt hat es
+  `Scope::EMPTY`:** mit leerem Umfang weist `classify` jede Beziehungs-Cap ohnehin ab, das
+  ungeprueft gebliebene Stueck war von der einzigen Aufrufstelle aus also unerreichbar — und ein
+  unerreichbares Loch ist eines, das beim ersten genannten Endpoint erreichbar wird. Seit Z4d
+  Stufe 1 nimmt `Image::build` die **beobachteten** Kanten und haelt sie gegen den Umfang: *der
+  Kanal wandert ⇔ der Thread, der dort eine Rolle haelt, wandert.* Dieselbe Familie wie „ein
+  Waechter prueft die EXISTENZ eines Grundes, nie seine WAHRHEIT" und wie `ep_inv`, das nicht der
+  Typ hielt, sondern die Aufrufdisziplin.
+* **Eine Frage, die nur „je Thread" gestellt werden kann, findet den Teilnehmer nicht, den niemand
+  aufgezaehlt hat.** `quiescence_of(tid)` beantwortet „in welchen Rollen steht DIESER Thread" — und
+  der gefaehrliche Teilnehmer eines Checkpoints ist per Konstruktion einer, den der Checkpoint nie
+  genannt hat. Die Gegenrichtung („wer steht HIER?") gab es bis 2026-08-25 gar nicht, und solange
+  sie fehlte, konnte die halbe Regel nicht einmal formuliert werden. Wer eine Zusicherung ueber
+  eine Menge macht, braucht eine **Aufzaehlung** und nicht nur eine Mitgliedschaftsfrage.
+* **Ein Negativfall braucht nicht nur „hat das Muster getroffen?", sondern „WIE OFT?".** Die
+  M7-Gegenprobe zu `ckptcut` ersetzte `for i in 0..ntfns().len() {` — und dieses Muster kommt in
+  `system.rs` **zweimal** vor, das zweite Mal in `thread_quiescence`, auf dem die Sprechproben der
+  Sonde selbst beruhen. Die Mutation blendete damit die Erhebung **und** ihren Pruefer: zwei Dinge
+  zugleich, und das beweist ueber keines etwas (die erste D9-Gegenprobe, woertlich). Am **Ergebnis**
+  war es nicht zu sehen — die geprueften Konjunkte fielen in beiden Fassungen gleich aus; gefunden
+  hat es erst ein `grep -c`. Ein `sed` mit zwei Treffern sieht in der Ergebniszeile aus wie eines
+  mit einem.
+* **Eine Mutation, die den BAU bricht, misst den Bau.** Die erste Fassung der M4-Gegenprobe zu
+  `ckptcut` ersetzte zwei Aufrufstellen durch `Ok(0)` und nahm damit dem `if`-Ausdruck die
+  Typinformation (`E0282`); der Lauf hatte gar keine Pruefzeile. Gefangen hat es die Frage „kommt
+  das Konjunkt ueberhaupt vor?" — ohne sie sind `false` und `nicht vorhanden` in einem
+  `grep`-Vergleich dasselbe, und die Datei haette einen bestandenen Negativfall gemeldet. Jeder
+  Negativfall braucht die Existenzpruefung neben der Wertpruefung.
 * **Wer nach ERREICHBARKEIT priorisiert statt nach VORGESCHICHTE, hat das Werkzeug am Ende genau
   dort nicht, wo der letzte Fall lag.** Die zehn ungemessenen Mangel-Meldestellen des Ladepfads
   standen ein Jahr mit der Begründung „braucht ein Boot-Archiv, das die Hauptsuite bauartbedingt
   nicht hat" — während die Lade-Suite das Archiv hatte. Der Ladepfad ist derjenige, auf dem
   `NoResources` sechs Wochen lang stumm war und an dem `wasmhost` gestorben ist.
+* **„Gebaut" und „gemessen" sind zwei Zustaende, und ein Register, das sie zusammenwirft, schickt
+  den naechsten Plan an die falsche Stelle.** `SYS_SPAWN` stand seit dem 2026-08-17 vollstaendig in
+  der ABI — sechs benannte Absagen, `ERR_INUSE`, D0-Zulassungsordnung — und hatte bis zum
+  2026-08-26 **keinen Aufrufer, keine Berichtszeile und kein Suitentor**: null Treffer im ganzen
+  Baum ausserhalb seiner Definition und eines Nummern-Ankers. `TODO0.md` fuehrte ihn derweil als
+  *fehlend* („die ABI hat kein `SPAWN`"), also als etwas anderes als *ungemessen*. Beide Fassungen
+  waren falsch, und die zweite ist die gefaehrlichere: gegen „fehlt" plant man den Bau, gegen
+  „ungemessen" die Messung. `grep` nach den Aufrufern ist billiger als jede Vermutung — dieselbe
+  Zeile wie bei der Sidecar-Arithmetik, die drei Tage lang keinen Aufrufer hatte.
+* **Ein Pruefer, der eine Tabelle liest, in die der gepruefte Pfad ABSICHTLICH nichts eintraegt,
+  kann seinen eigenen Fall strukturell nicht sehen.** `pd_mapping_overlaps` entscheidet die
+  `Overlaps`-Absage von `SYS_SPAWN` und liest dafuer `KSTACKS.ubase_of`; `spawn_with_stack_parked`
+  schreibt dort **mit Begruendung** nichts hinein (die Region gehoert der Cap, nicht dem Kernel).
+  Der Kommentar an der Funktion sagte woertlich „geprueft werden ... genau die Stapel, die ein
+  zweiter `SPAWN` treffen koennte" — und genau die sah sie nie. Solange eine Cap einen Stapel trug,
+  fiel es nicht auf; mit mehreren Stapeln in einer Cap ist es der Hauptfall. Dieselbe Familie wie
+  die leere Ereigniswarteschlange ohne `CD.R`, nur dass hier zwei *richtige* Entscheidungen
+  zusammen ein Loch ergeben.
+* **Ein Deckel oberhalb der Struktur ist kein grosszuegiger Deckel, sondern eine unerfuellbare
+  Zusage.** `CAP_BUDGET_MAX` stand auf 64; der lokale Cspace einer PD ist ein Array von
+  `NCAPS` = 16 Slots, und `install_cap` weist jeden Slot darueber ab, **ohne das Budget je zu
+  fragen**. Ein Budget von 20 scheiterte damit bei 16 — und die Absage trug nicht einmal den Grund
+  „Budget". Gefunden hat es der Selbsttest am Tag der Einfuehrung, nicht das Gegenlesen. Dieselbe
+  Form wie „ein Kriterium, das die gepruefte Sache nicht erreichen KANN, ist gar keins"; die
+  Behebung ist ein `const _: () = assert!` neben der Konstante, nicht ein Kommentar.
+* **Ein Konjunkt in `all_done()`, das erst im BERICHT gemessen wird, gattert nichts — es
+  beschriftet nur.** Am 2026-08-25/26 sind fuenf Sonden (`dbg`, `pdfreeze`, `ckptcut`, `arena`,
+  `dmapool`) in die Flagliste aufgenommen worden, in der Annahme, sie haengen damit am Urteil. Sie
+  werden aber alle in `report_and_off` gemessen, also **nachdem** `all_done()` entschieden hat.
+  Gemessen statt erschlossen: ein Lauf mit `arena : FAILURES` endete mit `SELFTEST COMPLETE` und
+  ohne Watchdog. Gegattert hat die **Suite** (`check`, Rueckgabecode 1). Der Eintrag bewirkt genau
+  eines: die Zeile erscheint in der `offen waren:`-Aufzaehlung.
+  Das ist dieselbe Falle wie „ein Urteil, das in `all_done()` steht, darf nicht erst im Bericht
+  entstehen" — nur ohne den Haenger, weil `NichtGefahren` nicht gattert. Deshalb faellt sie nicht
+  auf: der Lauf sieht gesund aus, und die Zeile scheint zu tragen. Hier ist die Position
+  ABSICHT (die Sonden belegen Speicher und wuerden weiter oben Baselines kippen); der Fehler war
+  die BEHAUPTUNG daneben. Wer eine Sonde einhaengt, pruefe zuerst, in welcher Funktion sie misst.
+* **Ein laufendes bash-Skript zu bearbeiten, veraendert es MITTEN IM LAUF.** Bash liest die Datei
+  inkrementell und merkt sich einen **Byte-Versatz**; eine Aenderung oberhalb davon verschiebt ihn,
+  und der Interpreter setzt mitten in einem Token fort. Gemessen am 2026-08-26 in
+  `tools/spawnarena-negativ.sh`: `Zeile 129: ppfehler.: Kommando nicht gefunden` und
+  `Zeile 164: M4:: Kommando nicht gefunden` -- Bruchstuecke aus Kommentartext, den es an diesen
+  Zeilen nie gab. Ein Block wurde doppelt ausgefuehrt, ein `sed` traf danach nichts mehr und
+  meldete eine „stillgelegte Gegenprobe", die in Wahrheit nur an der falschen Stelle stand. Der
+  Lauf ist damit **unbrauchbar, aber nicht offensichtlich rot** -- die uebrigen Pruefungen liefen
+  weiter und meldeten PASS. Dasselbe gilt fuer die Suiten-Skripte.
+* **Zwei Gegenproben-Laeufe gleichzeitig mutieren DIESELBEN Dateien.** Am 2026-08-26 startete ein
+  zweiter Lauf, waehrend der erste M3 angewandt hatte; seine Positivkontrolle sah `magisch=1/4` und
+  meldete „der Ausgangszustand ist schon rot". Dass sie das gemeldet hat, ist der Grund, warum es
+  aufgefallen ist -- ohne Positivkontrolle waeren fuenf Mutationen gegen einen bereits mutierten
+  Baum gelaufen und haetten wie Belege ausgesehen. Ein Werkzeug, das den Arbeitsbaum mutiert,
+  vertraegt genau eine Instanz.
+* **„Der Waechter kennt die Uebergabe nicht" war die BEQUEME Lesart — und sie war falsch.**
+  `dma_bounds_audit` meldet nach jedem A-5.1-Hot-Reload `2`, und der erste Gedanke war, seine Regel
+  („verschiedene Objekte duerfen sich nie ueberlappen") sei fuer eine absichtliche Uebergabe zu
+  streng. Der Quelltext sagt das Gegenteil: `for_each_dma` laeuft **objekt-** und nicht
+  cap-granular, ausdruecklich „damit Cap-Kopien dieselbe Region nicht mehrfach zaehlen" — der Fall
+  ist also bereits ausgenommen. `reassign_driver_device` **kopiert aber nicht**, es praegt ueber
+  `install_dma_cap_ex` ein zweites OBJEKT. Die 2 sagt die Wahrheit.
+  Und der Kern ist nicht der Refcount, sondern die **IOMMU-Eintragung**: solange das IOVA->PA-
+  Mapping steht, schreibt das Geraet in die Seiten, gleich wem sie inzwischen gehoeren. Die
+  Reihenfolge, die halten muss, ist Geraet stilllegen -> IOMMU-Unmap -> Freigabe; der
+  Teardown-Token ist dafuer gebaut, und der Reload laeuft nicht durch ihn (todo A3d).
+  **Zwei Lehren:** wer eine unerwartete Zahl sieht, pruefe zuerst, ob der Pruefer den Fall wirklich
+  nicht kennt — die Antwort steht im Quelltext und nicht in der Plausibilitaet. Und eine Zahl mit
+  erwartetem Wert gehoert als **Gleichheit** ins Konjunkt, nicht als Prosa daneben: eine Zahl,
+  deren Erwartung 2 ist, wird sonst nie geprueft und schweigt auch bei 3.
+* **Wer eine ABI aendert, muss jeden Aufrufer mitnehmen — auch den, den nur die ANDERE
+  Architektur hat.** `SYS_LOAD`s `x3`/`x4` wurden am 2026-08-25 umgewidmet (einzelner Slot + Badge
+  -> gepackte Liste + Anzahl). Der in-Kernel-Aufrufer `sysload_caller` gibt es **nur auf aarch64**,
+  er kodierte weiter die alte Fassung, und aarch64 lief erst am 2026-08-26 wieder. Der Dispatch las
+  `anzahl == 0`, delegierte **nichts**, `hello` lief ohne Notification — und meldete sich nie.
+  Das Fehlerbild ist die teure Sorte: `sysload` sagte `result=0` (das Laden gelang ja) und
+  `hello-Signal=NEIN`, `all_done()` wurde nie wahr, Watchdog, und **neun weitere Zeilen** standen
+  auf `FAILURES`, weil sie nach dem Haenger gar nicht mehr liefen. Neun rote Zeilen aus einem
+  einzigen falsch kodierten Nachrichtenwort. Dieselbe Familie wie „zwei Suiten, die dasselbe
+  Geraet verschieden aufsetzen" — nur dass hier die zweite Suite tagelang nicht gefahren wurde.
+* **Eine feste Schranke neben einer zur Bootzeit dimensionierten Tabelle ist ein zweites
+  Gedaechtnis — und sie faellt auf der Architektur auf, wo die Zahlen gross sind.**
+  `STACK_CAP_SLOTS = 1024` deckte laut Kommentar „den `scale`-Test (1024 Threads)"; die
+  Thread-Kapazitaet ist auf aarch64 mit acht Kernen aber rund **10 000**, und die Slots liegen
+  entsprechend hoch. Folge: **jeder** `SYS_SPAWN` bekam dort `ERR_NOSPACE` — und zwar *nachdem*
+  der Thread zugelassen und sofort wieder getoetet worden war. Auf x86 lief dasselbe gruen, weil
+  die Slots dort zufaellig klein blieben. Das ist woertlich „unten zuerst war ein Zufall der
+  Groessenrelation", nur mit einer Tabellenlaenge statt einem Speicherbereich. Die Behebung ist
+  **keine groessere Konstante**, sondern dasselbe `total`, mit dem die vier Nachbartabellen
+  dimensioniert werden. Gefunden hat es die aarch64-Suite, nicht das Gegenlesen — und nur, weil
+  die Sonde auf **beiden** Architekturen gattert.
+* **Ein fail-closed-Pfad verschweigt seine Ursache, wenn sein Fehlercode geteilt ist.** Derselbe
+  Fall: `record_stack_cap` gab `false`, `dispatch_spawn` toetete den Thread und meldete
+  `ERR_NOSPACE` — derselbe Code wie „Region ueberlappt" und „kein Speicher". Im Bericht stand
+  `codes: ganz=7 ueber=7 aus=21`, also **dreimal dieselbe 7 aus drei verschiedenen Gruenden**, und
+  die Zeile `ueberlappung-abgewiesen=true` war dabei *versehentlich* gruen: sie prueft auf 7, und
+  7 kam ohnehin. Ein Konjunkt, das aus dem falschen Grund gruen ist, ist von einem richtigen nicht
+  zu unterscheiden — was hier entschieden hat, waren `threads=7` neben `maske=0x0`: sieben Threads
+  in der PD, kein einziger erfolgreicher Spawn.
+* **Eine Grundlinie, die NACH dem ersten Verbrauch genommen wird, misst die Differenz zu sich
+  selbst.** Die erste Fassung der Budget-Zeile las den Vorrat, nachdem der Test schon eine PD
+  angelegt hatte, und verglich am Ende dagegen — sie meldete `FAILURES`, waehrend die gedruckten
+  Zahlen den Mechanismus exakt belegten (`80000 -> 79992 -> 79972 -> 80000`). Zwei Zeilen weiter
+  derselbe Fehler in anderer Gestalt: die Schranke wurde gefragt, **bevor** das Budget
+  ausgeschoepft war. Eine Schranke prueft man an der Schranke, und eine Baseline vor dem ersten
+  Verbrauch.
 
 ## Aufbau, grob
 
@@ -1173,7 +1372,8 @@ Alle behoben. Sie stehen hier, weil die Bedingung dahinter weiterhin gilt.
 | `tools/mkgpt.py` | baut die GPT-Testabbilder, auch **kaputte** (`--break`) — beide Suiten benutzen dasselbe Werkzeug |
 | `kernel/src/colors.rs` | Farbzuteilung, `run_color`, Prime+Probe (B-4.5) — arch-neutral |
 | `crates/caprock-sched/src/cycles.rs` | Zyklenabrechnung (B-5.1) — **ohne jede Abhaengigkeit**, damit die Fallen mit Literalen statt mit einer Maschine ausloesbar sind |
-| `tools/kernel-grenze.sh` | prueft, dass keine Treiber in die HAL wandern; mit Selbsttest |
+| `tools/kernel-grenze.sh` | prueft, dass keine Treiber in die HAL wandern; mit Selbsttest. **Stand 2026-08-26: ROT und vorbestehend** -- `fbtext`, `iommu_health`, `numa`, `bootparams`, `smt` liegen in der HAL und stehen weder auf der Erlaubnisliste noch als benannte Ausnahme. Weder Waechter noch HAL sind seit dem letzten gruenen Stand veraendert worden; die Module sind einzeln dazugekommen, und jedes braucht eine Entscheidung (Userland-PD oder benannte Ausnahme MIT Begruendung), keine Sammelaufnahme |
+| `kernel/src/spawnarena.rs` | **K1a/K1b: der erste Lauf von `SYS_SPAWN` ueberhaupt** -- fuenf EL0-Kinder aus zwei Caps, vier davon in Fenstern EINER Arena. Arch-neutral, von beiden Hochlaufwegen gefahren. Gegenproben in `tools/spawnarena-negativ.sh` |
 | `tools/eingeschlossenheit.py` | **die Eintrittskarte fuer ein Handler-Modul (Z28)**: wer `[package.metadata.caprock] einschluss = "streng"` traegt, hat `forbid(unsafe_code)`, kein Bauskript und nur benannte Abhaengigkeiten. Zwei Ratschen als Mengen von Namen, 15 Sprechproben, **0 Kandidaten = Rueckgabecode 3** |
 | `tools/host-tests.sh` | die Host-Tests der reinen Crates an **einem** Ort (`caprock-cap` lief vorher nirgends) |
 | `tools/handover/` | Linux-Kernelmodul fuer die Kern-Uebergabe (Variante B) |

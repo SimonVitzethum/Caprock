@@ -386,17 +386,83 @@ pub enum RootTaskError {
 /// Manifest-Bitmaske nennt die *Art* der Autorität ("darf ein MMIO-Fenster halten"), nicht die
 /// Anzahl der Fenster. Ein Treiber braucht zwei: seinen Konfigurationsraum (um sein Gerät
 /// aufzulösen) und sein Registerfenster (um es zu bedienen).
+/// **Woher der eigene Kanal einer PD kommt** (2026-08-25).
+///
+/// Beide Faelle belegen Slot 1 und 2 mit **ihren** Objekten statt mit frischen -- das war schon
+/// vorher so und ist der Grund, warum der Parameter existiert. Was sie unterscheidet, ist das
+/// **Badge** und die Ablage: zwei Melder mit demselben Etikett sind ein Melder, und ein Dienst
+/// ohne Geraet ist kein Treiber.
+#[derive(Clone, Copy)]
+pub enum Kanal {
+    /// HardwareLand-Backend: Endpoint und Notification sind ueber `cap_allowed` an die PD
+    /// gebunden -- eine fremde Cap wuerde ihr gar nicht erst installiert.
+    Geraet(usize, usize),
+    /// Ein Dienst **ohne Geraet**: frisch gepraegt, keine Partner-Bindung.
+    Dienst(usize, usize),
+}
+
+impl Kanal {
+    fn ep(self) -> usize {
+        match self {
+            Kanal::Geraet(ep, _) | Kanal::Dienst(ep, _) => ep,
+        }
+    }
+    fn ntfn(self) -> usize {
+        match self {
+            Kanal::Geraet(_, n) | Kanal::Dienst(_, n) => n,
+        }
+    }
+}
+
+/// **Wie viele Slots die Loader-ABI vergibt** — 0..=8, seit B2/B4 einschliesslich der `Irq`-Cap
+/// (7) und der Notification, auf der ihr Interrupt ankommt (8).
+///
+/// Als Konstante und nicht als Literal an vier Stellen: die Zahl steht sonst in der Rückgabeart,
+/// im Puffer, in der Aufräumschleife und in der Verdichtung, und beim nächsten Slot wandert sie an
+/// dreien mit. *Eine Zahl, die ein Mensch parallel zur Wahrheit führt*, ist genau die Form, die
+/// `MELDESTELLEN` gekostet hat.
+pub const ENDOW_SLOTS: usize = 9;
+
+/// **Wie viele Caps EIN Ladevorgang hoechstens vergibt** — alle Loader-Slots plus das eine Angebot
+/// des Aufrufers (Konvention L2: hoechstens ein Cap, in Slot 0).
+///
+/// Die Zahl steht an **einer** Stelle, und sie hat schon eine gekostet: daneben lag ein
+/// `let mut dense = [first; 8]` als Literal. Mit dem neunten Slot (B4) schrieb es ueber sein Ende,
+/// der Ladepfad **panikte** — und weil ein Kernel-Panic den Knoten nicht mitreisst (B-6.2, der
+/// Panic-Pfad haelt den Kern ohne IRQ-Maskierung und der naechste Tick holt ihn zurueck), sah das
+/// von aussen aus wie „das Programm laedt nicht": Thread erzeugt, nie zugelassen, **keine
+/// Fehlermeldung**. Vier der sechs Programme fielen aus, und die Ursache lag drei Ebenen weiter
+/// unten in einer Zahl, die niemand mehr las.
+///
+/// *Eine Zahl, die ein Mensch parallel zur Wahrheit fuehrt*, in ihrer teuersten Form.
+pub const LOAD_CAPS_MAX: usize = ENDOW_SLOTS + 1;
+
+/// **Der Lader darf nie mehr zusagen, als eine PD halten darf.**
+///
+/// Ohne diesen Assert war die Zusage still unerfuellbar: mit `CAP_BUDGET_PER_PD = 8` und neun
+/// vergebenen Slots blieb der letzte Cap einfach weg -- die PD lief, ihr Slot war leer, und die
+/// Absage trug den Grund nicht. Jetzt bricht der Bau.
+const _: () = assert!(
+    LOAD_CAPS_MAX <= caprock_microkit::CAP_BUDGET_PER_PD,
+    "ENDOW_SLOTS ueberschreitet CAP_BUDGET_PER_PD -- eine PD koennte ihre Ausstattung nicht halten"
+);
+
 fn endow_from_manifest(
     e: &ManifestEntry,
-    channel: Option<(usize, usize)>,
-) -> Result<[Option<(usize, CapPtr)>; 7], RootTaskError> {
-    let channel_ep = channel.map(|(ep, _)| ep);
-    let channel_ntfn = channel.map(|(_, ntfn)| ntfn);
+    channel: Option<Kanal>,
+    dma_pages: u32,
+    // **Wohin die Caps gehen** -- gebraucht fuer genau eine Eintragung: die Interrupt-Notification
+    // muss in der PD stehen, BEVOR ihre Cap installiert wird (B4). Die HardwareLand-Politik
+    // entscheidet ueber die Objekt-Id, nicht ueber die Cap, und sie prueft vor dem Einbau.
+    ziel_pd: Option<usize>,
+) -> Result<[Option<(usize, CapPtr)>; ENDOW_SLOTS], RootTaskError> {
+    let channel_ep = channel.map(Kanal::ep);
+    let channel_ntfn = channel.map(Kanal::ntfn);
     use caprock_loader::manifest as man;
-    let mut out: [Option<(usize, CapPtr)>; 7] = [None; 7];
+    let mut out: [Option<(usize, CapPtr)>; ENDOW_SLOTS] = [None; ENDOW_SLOTS];
     // Bis hierher erzeugte Caps wieder abräumen, wenn ein späterer Schritt scheitert — sie sind
     // dann nirgends installiert und würden sonst in der geteilten Tabelle belegt bleiben.
-    fn undo(out: &[Option<(usize, CapPtr)>; 7]) {
+    fn undo(out: &[Option<(usize, CapPtr)>; ENDOW_SLOTS]) {
         for &(_, cap) in out.iter().flatten() {
             let _ = crate::system::cap_delete(cap);
         }
@@ -415,8 +481,12 @@ fn endow_from_manifest(
     // IRTE-**Vergabe** gibt es nicht; sie gehört zu B-3 (Vergabe + Invalidierung über QI). Eine
     // IRQ-Cap zu erteilen, ohne sie binden zu können, wäre eine Autorität ohne Wirkung — und ein
     // Treiber, der auf einen Interrupt wartet, der strukturell nie kommt, hängt. Also abweisen.
-    const GRANTABLE: u32 =
-        man::CAP_LOADER | man::CAP_NOTIFICATION | man::CAP_ENDPOINT | man::CAP_MMIO | man::CAP_DMA;
+    const GRANTABLE: u32 = man::CAP_LOADER
+        | man::CAP_NOTIFICATION
+        | man::CAP_ENDPOINT
+        | man::CAP_MMIO
+        | man::CAP_DMA
+        | man::CAP_SHARED;
     if e.initial_caps & !GRANTABLE != 0 {
         return Err(RootTaskError::UnsupportedAuthority);
     }
@@ -444,11 +514,18 @@ fn endow_from_manifest(
         // Ablage der frueheren, und der Kernel wartete auf ein Signal am falschen Objekt. Genau
         // das ist beim Bau von A-6.3 passiert.
         let is_root = e.policy_flags & man::POLICY_ROOT_TASK != 0;
-        let is_driver = channel.is_some();
+        let is_driver = matches!(channel, Some(Kanal::Geraet(..)));
+        let is_dienst = matches!(channel, Some(Kanal::Dienst(..)));
+        // **Vier Rollen, vier Badges** (2026-08-25). Bis heute waren es drei, und `is_driver` war
+        // `channel.is_some()` -- ein Dienst ohne Geraet haette damit das Treiber-Badge getragen
+        // UND dessen Ablage ueberschrieben. Genau der Fehler, den A-6.3 schon einmal gekostet hat:
+        // der Kernel wartete auf ein Signal am falschen Objekt.
         let badge = if is_root {
             ROOT_NTFN_BADGE
         } else if is_driver {
             DRIVER_NTFN_BADGE
+        } else if is_dienst {
+            SERVICE_NTFN_BADGE
         } else {
             CLIENT_NTFN_BADGE
         };
@@ -467,6 +544,10 @@ fn endow_from_manifest(
                 ROOT_NTFN.store(ntfn as u64 + 1, Ordering::Relaxed);
             } else if is_driver {
                 DRIVER_NTFN.store(ntfn as u64 + 1, Ordering::Relaxed);
+            } else if is_dienst {
+                // Keine eigene Ablage: es gibt heute keinen Leser dafuer. Ein Zaehler ohne Leser
+                // waere tote Sidecar-Arithmetik (Z26/A3) -- die Ablage kommt mit dem ersten
+                // Pruefer, der sie braucht, und nicht auf Vorrat.
             } else {
                 client_ntfn_store(e.program_id, ntfn);
             }
@@ -493,6 +574,22 @@ fn endow_from_manifest(
         // irgendeinen" gewesen, und welchen, haette die Ladereihenfolge entschieden. Jetzt steht
         // die Antwort im Autoritaetsdokument -- und wo sie fehlt und mehrdeutig waere, liefert
         // `driver_service()` bewusst `None` statt zu raten.
+        // **Ein benannter Dienst, den es nicht gibt, ist eine ABSAGE** (2026-08-25).
+        //
+        // Bis heute fiel dieser Fall auf `create_endpoint` durch: der Client bekam einen frischen,
+        // **unverbundenen** Endpoint, der Dienst behielt seinen, und beide hatten einen Kanal
+        // ohne Gegenseite -- mit gueltigen Caps und ohne eine einzige Fehlermeldung. Genau das
+        // Bild, das der Netzstack-Entwurf beschreibt.
+        //
+        // Und es ist keine Randlage, sondern eine **Reihenfolgefrage**: `init` laedt die
+        // Startmenge in Index-Ordnung. Ein Client mit kleinerem Index als sein Dienst kommt hier
+        // zwangslaeufig zu frueh an. Fail-closed macht daraus einen benannten Ladefehler statt
+        // eines stillen Fehlkanals -- die Reihenfolge im Manifest wird damit zu einer Bedingung,
+        // die sich MELDET, wenn sie verletzt ist.
+        if channel_ep.is_none() && e.service_id != 0 && driver_service_of(e.service_id).is_none() {
+            undo(&out);
+            return Err(RootTaskError::NoResources);
+        }
         let ziel = channel_ep
             .or_else(|| {
                 (e.service_id != 0)
@@ -501,6 +598,16 @@ fn endow_from_manifest(
                     .map(|s| s.ep)
             })
             .or_else(|| (e.service_id == 0).then(driver_service).flatten().map(|s| s.ep));
+        // **Hier wird erfasst, nicht im Bericht** (2026-08-25). Die Aussage „der Client bekam den
+        // Endpoint SEINES Dienstes" gilt in diesem Augenblick; wer sie spaeter am Cap-Slot der PD
+        // nachliest, liest sie an einem Thread, der laengst fertig und gestorben sein darf --
+        // `wasmhost` tut genau das. Dieselbe Falle wie `drv : ALL PASS`, das den Puffer der
+        // Treiber-PD im BERICHT las und damit den Sektor des letzten Clients erwischte.
+        if let Some(ep) = ziel {
+            if e.service_id != 0 {
+                client_ep_merken(e.program_id, ep);
+            }
+        }
         let r = ziel.or_else(crate::system::create_endpoint).and_then(|ep| {
             crate::system::install_endpoint_cap(ep as u32, Rights::RWX).ok()
         });
@@ -519,32 +626,57 @@ fn endow_from_manifest(
     // A-5.3: **welches** Gerät, sagt jetzt der Eintrag. `DeviceSelector::ANY` (auch: ein vor A-5.3
     // erzeugtes Manifest) verhält sich wie bisher.
     if e.initial_caps & man::CAP_MMIO != 0 {
-        match crate::system::assign_driver_device(e.device, e.program_id) {
+        match crate::system::assign_driver_device(e.device, e.program_id, dma_pages) {
             Some(g) => {
                 out[3] = Some((3, g.cfg));
                 out[4] = Some((4, g.bar));
                 out[5] = Some((5, g.dma));
                 out[6] = Some((6, g.shared));
+                // B2: Slot 7 nur, wenn das Geraet wirklich einen Vektor bekommen hat. Ein leerer
+                // Slot ist hier die ehrliche Auskunft und kein Mangel -- ein Treiber ohne Vektor
+                // pollt zulaessig, und eine Platzhalter-Cap machte aus dieser Aussage eine Luege,
+                // die erst beim `BIND_IRQ` auffiele.
+                if let Some(irq) = g.irq {
+                    out[7] = Some((7, irq));
+                }
+                // Slot 8 kommt mit Slot 7 oder gar nicht -- s. `DriverGrant::irq_ntfn`.
+                if let Some(n) = g.irq_ntfn {
+                    // **Erst eintragen, dann einbauen.** Andersherum weist `cap_allowed` die Cap
+                    // ab: eine HardwareLand-PD darf Notification-Caps nur fuer Objekte halten, die
+                    // der Kernel ihr zugeordnet hat -- und das ist die Regel, nicht der Fehler.
+                    if let Some(pd) = ziel_pd {
+                        crate::system::pd_set_irq_ntfn(pd, g.irq_ntfn_id);
+                    }
+                    out[8] = Some((8, n));
+                }
             }
             None => {
                 undo(&out);
                 return Err(RootTaskError::NoDevice);
             }
         }
-    } else if channel.is_none() && e.initial_caps & man::CAP_ENDPOINT != 0 {
-        // **Ein Client des Blockdienstes** (A-6.3).
+    } else if e.initial_caps & man::CAP_SHARED != 0 {
+        // **Die geteilte Uebertragungsflaeche eines Dienstes** (A-6.3, seit 2026-08-25 an einem
+        // eigenen Bit).
         //
-        // Die Regel, und sie ist dieselbe wie bei MMIO/DMA: das Manifest nennt die **Art** der
-        // Autoritaet ("bekommt einen Endpoint"), die **Instanz** teilt der Kernel-Glue zu. Heute
-        // gibt es genau einen Dienst, also kann "gib mir einen Endpoint" nur dessen Kanal meinen.
-        // Dazu die geteilte Uebertragungsflaeche -- ohne sie haette der Client eine
-        // Dienstschnittstelle und keinen Weg, Daten zu sehen.
+        // Die Regel bleibt die von MMIO/DMA: das Dokument nennt die **Art** der Autoritaet, die
+        // **Instanz** teilt der Kernel-Glue zu -- hier ueber `service_id`.
         //
-        // **Das ist ausdruecklich eine Uebergangsregel.** Sobald es zwei Dienste gibt, muss das
-        // Manifest sie benennen koennen (Z11b/Z11c); bis dahin waere jede andere Auswahl eine im
-        // Kernel versteckte Politik, und eine versteckte ist schlimmer als eine einfache.
-        if let Some(shared) = crate::system::driver_shared_cap(e.service_id) {
-            out[6] = Some((6, shared));
+        // **Warum das nicht mehr an `CAP_ENDPOINT` haengt:** die Flaeche kam bis heute mit dem
+        // Endpoint, aber nur, wenn der benannte Dienst zufaellig ein Geraet hatte
+        // (`driver_shared_cap` sucht in den Geraetezuteilungen). Damit hing die Slot-Zahl eines
+        // Programms an einer Eigenschaft einer FREMDEN PD. Eine feste Kopplung waere ablesbar
+        // gewesen, eine bedingte ist es nicht -- und bei einem Budget von acht Slots ist
+        // Ablesbarkeit der ganze Zweck des Dokuments.
+        //
+        // **Fail-closed bleibt es trotzdem:** wer die Flaeche fordert und keinen Dienst mit einer
+        // bekommt, faellt hier durch -- statt still ohne sie zu starten.
+        match crate::system::driver_shared_cap(e.service_id) {
+            Some(shared) => out[6] = Some((6, shared)),
+            None => {
+                undo(&out);
+                return Err(RootTaskError::NoResources);
+            }
         }
     }
     Ok(out)
@@ -558,6 +690,43 @@ pub const ROOT_NTFN_BADGE: u64 = 1 << 32;
 /// Die Notification, die dem Root-Task endowt wurde (`0` = keine). Der Selbsttest liest daran ab,
 /// ob er wirklich gelaufen ist — der Kernel hat sonst kein Fenster in einen isolierten Prozess.
 static ROOT_NTFN: AtomicU64 = AtomicU64::new(0);
+
+/// **Welchen Endpoint ein Client mit benanntem Dienst bekommen hat** (2026-08-25).
+///
+/// `(program_id, ep + 1)`; `0` = kein Eintrag. Erfasst im Endowment, gelesen im Bericht -- die
+/// beiden Zeitpunkte sind verschieden, und genau deshalb steht der Wert hier und nicht im
+/// Cap-Slot der PD: der Client darf zwischendurch fertig werden und sterben.
+static CLIENT_EP_PID: [core::sync::atomic::AtomicU32; MAN_MAX_ENTRIES] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAN_MAX_ENTRIES];
+static CLIENT_EP_ID: [AtomicU64; MAN_MAX_ENTRIES] =
+    [const { AtomicU64::new(0) }; MAN_MAX_ENTRIES];
+
+fn client_ep_merken(program_id: u32, ep: usize) {
+    for (pid, id) in CLIENT_EP_PID.iter().zip(CLIENT_EP_ID.iter()) {
+        let cur = pid.load(Ordering::Relaxed);
+        if cur == program_id || cur == 0 {
+            pid.store(program_id, Ordering::Relaxed);
+            id.store(ep as u64 + 1, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// Den erfassten Endpoint eines Clients lesen (Bericht). `None` = dieser Client hat nie einen
+/// **benannten** Dienst aufgeloest.
+pub fn client_ep_of(program_id: u32) -> Option<usize> {
+    CLIENT_EP_PID
+        .iter()
+        .zip(CLIENT_EP_ID.iter())
+        .find(|(pid, _)| pid.load(Ordering::Relaxed) == program_id)
+        .map(|(_, id)| id.load(Ordering::Relaxed))
+        .filter(|&v| v != 0)
+        .map(|v| v as usize - 1)
+}
+
+/// **Badge eines Dienstes OHNE Geraet** (2026-08-25). Ein eigenes hohes Bit aus demselben Grund
+/// wie die drei daneben: ein akkumuliertes Badge soll die Melder getrennt lesbar lassen.
+pub const SERVICE_NTFN_BADGE: u64 = 1 << 48;
 
 /// **Badge einer Treiber-PD** (A-5.1). Wieder ein hohes Bit und ein anderes als
 /// [`ROOT_NTFN_BADGE`]: ein akkumuliertes Badge soll "der Root-Task lief" und "der Treiber lief"
@@ -856,15 +1025,39 @@ pub fn reload_driver(program_id: u32) -> ReloadOutcome {
     // sofort: der Treiber verlangt seine Uebertragungsflaeche und bricht ohne sie ab -- richtig
     // so. Der Austausch meldete dann `NotReady`, was nach einem Zeitproblem aussieht und ein
     // fehlendes Endowment war. Wer eine Fassung ersetzt, muss ihr ALLES geben, was die alte hatte.
-    let endow = [
+    let mut endow = [
         (1usize, ntfn_cap),
         (2, ep_cap),
         (3, g.cfg),
         (4, g.bar),
         (5, g.dma),
         (6, g.shared),
+        (7, g.shared), // Platzhalter, s. unten -- nur die ersten `n` werden uebergeben
+        (8, g.shared), // dito
     ];
-    let Ok(v2) = load_program_into_pd(&prog, v2_pd, &endow, boot_arg(old.index as usize, archive.count()))
+    // **Slot 7 gehoert seit B2 dazu** -- und wenn er fehlt, ist es derselbe Fehler wie damals bei
+    // Slot 6: die neue Fassung braeche ab, der Austausch meldete `NotReady`, und das sieht nach
+    // einem Zeitproblem aus statt nach einem fehlenden Cap.
+    //
+    // Der Platzhalter oben wird nur ueberschrieben, nie uebergeben: `&endow[..n]` schneidet ihn ab,
+    // wenn das Geraet keinen Vektor hat. Ein Array ohne Platzhalter waere hier ein `Option`-Array
+    // mit einer zweiten Verdichtung -- mehr Mechanik fuer denselben Schnitt.
+    let n = match (g.irq, g.irq_ntfn) {
+        (Some(irq), Some(nt)) => {
+            // **Erst die Erlaubnis, dann die Cap** -- dieselbe Reihenfolge wie beim Erstladen.
+            // Die HardwareLand-Politik entscheidet ueber die Objekt-Id, und die neue PD kennt sie
+            // noch nicht: ohne diese Zeile weist sie Slot 8 ab, der Austausch meldet `NotReady`,
+            // und das sieht nach einem Zeitproblem aus statt nach einer fehlenden Eintragung.
+            // *Wer eine Fassung ersetzt, muss ihr ALLES geben, was die alte hatte* -- und dazu
+            // gehoert nicht nur die Cap, sondern die Erlaubnis, sie zu halten.
+            crate::system::pd_set_irq_ntfn(v2_pd, g.irq_ntfn_id);
+            endow[6] = (7, irq);
+            endow[7] = (8, nt);
+            8
+        }
+        _ => 6,
+    };
+    let Ok(v2) = load_program_into_pd(&prog, v2_pd, &endow[..n], boot_arg(old.index as usize, archive.count()))
     else {
         return ReloadOutcome::NotLoaded;
     };
@@ -1061,7 +1254,7 @@ pub fn start_root_task() -> Result<(ThreadId, usize), RootTaskError> {
             return Err(RootTaskError::StartSetNotPrefix);
         }
     }
-    let caps = endow_from_manifest(&entry, None)?;
+    let caps = endow_from_manifest(&entry, None, 0, None)?; // Startmenge: Vorgabe-Pool
     let arg = boot_arg(index, n);
     // Die belegten Einträge zu einem dichten Slice verdichten. `CapPtr` hat bewusst keinen
     // öffentlichen Konstruktor (ein fabrizierbarer Cap-Handle wäre eine Einladung), also dient
@@ -1069,7 +1262,7 @@ pub fn start_root_task() -> Result<(ThreadId, usize), RootTaskError> {
     let Some(first) = caps.iter().flatten().next().copied() else {
         return load_image(&prog, &[], arg).map_err(RootTaskError::Rejected);
     };
-    let mut endow = [first; 7];
+    let mut endow = [first; ENDOW_SLOTS];
     let mut n = 0usize;
     for &c in caps.iter().flatten() {
         endow[n] = c;
@@ -1252,6 +1445,24 @@ fn zahlenpolitik_gate(program_id: u32) -> Result<(), LoaderError> {
     // `priority = 0`), und aus einem schweigenden Dokument einen Knotenwunsch zu erfinden waere
     // die A1-Lehre andersherum.
     if numa != 0 {
+        // **Erst fragen, ob ueberhaupt schon gelesen wurde** (2026-08-20). „Noch nicht gelesen"
+        // und „die Maschine hat keine" sind zwei Lagen, und sie verlangen entgegengesetzte
+        // Reaktionen: die eine ist ein Programmfehler im Hochlauf, die andere eine Eigenschaft der
+        // Maschine. Bis heute sahen sie gleich aus -- der Lader lief VOR `numa::init()` und wies
+        // auf einer Zwei-Knoten-Maschine mit „keine tragfaehige Topologie" ab.
+        //
+        // Die Behebung ist die Reihenfolge; diese Zeile ist das **Gatter dagegen, dass sie jemand
+        // zurueckdreht**. Ohne sie waere die Behebung eine Gewohnheit.
+        if !crate::numa::gelesen() {
+            println!(
+                "loader  : REIHENFOLGE-FEHLER -- program_id {program_id} verlangt numa_node={numa}, \
+                 aber `numa::init()` ist noch nicht gelaufen. Das ist KEINE Aussage ueber die \
+                 Maschine, sondern ueber den Hochlauf: das Gatter fragt eine Topologie, die es noch \
+                 nicht gibt. (Bis 2026-08-20 stand `numa::init()` NACH dem Lader, und der Wunsch \
+                 wurde auf einer Zwei-Knoten-Maschine abgewiesen.)"
+            );
+            return Err(LoaderError::UnsupportedPolicy);
+        }
         let topo = crate::numa::topology();
         if !topo.trustworthy() {
             println!(
@@ -1341,7 +1552,19 @@ fn manifest_zahlen_of(program_id: u32) -> Option<(u32, u32, u32, u32)> {
 /// stillschweigend auf dessen Kern gewandert. Eine Platzierungspolitik, die sich als Nebenwirkung
 /// einer Stack-Verschiebung aendert, ist genau die Sorte stiller Aenderung, die dieses Projekt
 /// mehrfach bezahlt hat -- deshalb traegt der Auftrag den Kern des Aufrufers mit.
-fn ladepolitik_auf(program_id: u32, heimatkern: usize) -> crate::system::LadePolitik {
+/// **Und der angebotene Slot ist aus demselben Grund ein Argument** (2026-08-25).
+///
+/// Woertlich dieselbe Ueberlegung wie beim Heimatkern eine Zeile darueber: welcher Slot ein
+/// **Angebot** des Aufrufers traegt, ist eine Eigenschaft des Ladevorgangs und nicht der
+/// Umgebung. Nur `load_by_index` weiss es -- dort ist `endow` die Delegation und `manifest_caps`
+/// die Zusage. Wer hier `None` uebergibt, sagt: „alles in diesem Endowment ist eine Zusage",
+/// und genau das gilt fuer den Root-Task und die In-Kernel-Pfade.
+fn ladepolitik_auf(
+    program_id: u32,
+    heimatkern: usize,
+    angebot: u16,
+    cap_budget: u16,
+) -> crate::system::LadePolitik {
     use crate::system::LadePolitik;
     let farbig = manifest_entry_of(program_id)
         .is_some_and(|(_, f)| f & caprock_loader::manifest::POLICY_EXCLUSIVE_STRIPE != 0);
@@ -1349,11 +1572,15 @@ fn ladepolitik_auf(program_id: u32, heimatkern: usize) -> crate::system::LadePol
         return LadePolitik {
             farbig,
             core: Some(heimatkern),
+            angebotene_slots: angebot,
+            cap_budget,
             ..LadePolitik::VORGABE
         };
     };
     LadePolitik {
         farbig,
+        angebotene_slots: angebot,
+        cap_budget,
         // `priority = 0` heisst im Manifest "nichts gesagt" -- 0 ist im Scheduler eine gueltige
         // (die niedrigste) Prioritaet, aber ein Dokument, das schweigt, soll die Vorgabe bekommen
         // und nicht die niedrigste. Wer wirklich 0 will, sagt es heute nicht unterscheidbar; das
@@ -1591,7 +1818,7 @@ pub fn load_image(
     endow: &[(usize, CapPtr)],
     boot_arg: usize,
 ) -> Result<(ThreadId, usize), LoaderError> {
-    load_image_auf(prog, endow, boot_arg, crate::system::eigener_kern())
+    load_image_auf(prog, endow, boot_arg, crate::system::eigener_kern(), 0, 0)
 }
 
 /// Wie [`load_image`], aber mit **ausdruecklich genanntem Heimatkern** (C8) — s. `load_by_index`.
@@ -1600,6 +1827,8 @@ pub fn load_image_auf(
     endow: &[(usize, CapPtr)],
     boot_arg: usize,
     heimatkern: usize,
+    angebot: u16,
+    cap_budget: u16,
 ) -> Result<(ThreadId, usize), LoaderError> {
     if !verify_image(prog) {
         return Err(LoaderError::Unverified);
@@ -1627,7 +1856,7 @@ pub fn load_image_auf(
         domain,
         endow,
         boot_arg,
-        ladepolitik_auf(prog.program_id, heimatkern),
+        ladepolitik_auf(prog.program_id, heimatkern, angebot, cap_budget),
     )
     .ok_or(LoaderError::NoResources)?;
     record_program_thread(prog.program_id, r.0);
@@ -1644,7 +1873,7 @@ pub fn load_program_into_pd(
     endow: &[(usize, CapPtr)],
     boot_arg: usize,
 ) -> Result<ThreadId, LoaderError> {
-    load_program_into_pd_auf(prog, pd, endow, boot_arg, crate::system::eigener_kern())
+    load_program_into_pd_auf(prog, pd, endow, boot_arg, crate::system::eigener_kern(), 0, 0)
 }
 
 /// Wie [`load_program_into_pd`], aber mit **genanntem Heimatkern** (C8) — s. `load_by_index`.
@@ -1654,6 +1883,8 @@ pub fn load_program_into_pd_auf(
     endow: &[(usize, CapPtr)],
     boot_arg: usize,
     heimatkern: usize,
+    angebot: u16,
+    cap_budget: u16,
 ) -> Result<ThreadId, LoaderError> {
     if !verify_image(prog) {
         return Err(LoaderError::Unverified);
@@ -1665,7 +1896,7 @@ pub fn load_program_into_pd_auf(
         pd,
         endow,
         boot_arg,
-        ladepolitik_auf(prog.program_id, heimatkern),
+        ladepolitik_auf(prog.program_id, heimatkern, angebot, cap_budget),
     )
     .ok_or(LoaderError::NoResources)?;
     record_program_thread(prog.program_id, tid);
@@ -1881,6 +2112,8 @@ pub fn load_by_index(
     caller_pd: usize,
     endow: &[(usize, CapPtr)],
     heimatkern: usize,
+    cap_budget: u16,
+    dma_pages: u32,
 ) -> Option<usize> {
     // **Das Manifest gilt auch hier** (A-5.1 / Z11b). Bis dahin bekamen nur der Root-Task seine
     // Anfangs-Caps aus dem Manifest; alles Weitere lebte von dem, was der Lader delegierte. Damit
@@ -1905,6 +2138,32 @@ pub fn load_by_index(
         }
         crate::system::create_hardware_backend(caller_pd, (prog.program_id & 0xffff) as u16)
     })();
+    // **Ein Dienst OHNE Geraet bekommt seinen Kanal genauso VORHER** (2026-08-25).
+    //
+    // Derselbe Grund wie beim Backend eine Zeile darueber: die Notification dieses Kanals IST die
+    // Cap, die das Manifest mit `ntfn` meint, und der Endpoint der, unter dem der Dienst
+    // registriert wird. Erst danach kann `endow_from_manifest` sie in Slot 1 und 2 legen -- eine
+    // frisch erzeugte waere eine andere, und der Dienst haette einen Kanal, den kein Client
+    // findet.
+    //
+    // **Und ohne dieses Bit gibt es keinen Kanal**: eine PD, die nichts anbietet, bekommt bei
+    // `CAP_ENDPOINT` weiterhin den Kanal des benannten Dienstes bzw. einen frischen. Genau diese
+    // Unterscheidung war bis heute nicht ausdrueckbar.
+    let dienst_kanal = (|| {
+        if hardware_backend.is_some() {
+            return None;
+        }
+        let archive = read_archive()?;
+        let prog = archive.program(index as usize)?;
+        let man = read_manifest()?;
+        let e = (0..man.count())
+            .filter_map(|i| man.entry(i))
+            .find(|e| e.program_id == prog.program_id)?;
+        if e.policy_flags & caprock_loader::manifest::POLICY_PROVIDES_SERVICE == 0 {
+            return None;
+        }
+        crate::system::create_service_channel()
+    })();
     let manifest_caps = (|| {
         let archive = read_archive()?;
         let prog = archive.program(index as usize)?;
@@ -1915,12 +2174,22 @@ pub fn load_by_index(
         if e.initial_caps == 0 {
             return None;
         }
-        endow_from_manifest(&e, hardware_backend.map(|(_, ep, ntfn)| (ep, ntfn))).ok()
+        let kanal = hardware_backend
+            .map(|(_, ep, ntfn)| Kanal::Geraet(ep, ntfn))
+            .or_else(|| dienst_kanal.map(|(ep, ntfn)| Kanal::Dienst(ep, ntfn)));
+        endow_from_manifest(&e, kanal, dma_pages, hardware_backend.map(|(pd, _, _)| pd)).ok()
     })();
     // `CapPtr` hat bewusst keinen öffentlichen Konstruktor (ein fabrizierbarer Cap-Handle wäre eine
     // Einladung), also erst als `Option` sammeln und dann mit dem ersten echten Cap als Füllwert
     // verdichten — derselbe Weg wie in `start_root_task`.
-    let mut slots: [Option<(usize, CapPtr)>; 8] = [None; 8];
+    //
+    // **Die Groesse ist hergeleitet:** alle Loader-Slots plus das eine Angebot des Aufrufers
+    // (Konvention L2: hoechstens ein Cap, in Slot 0). Vorher stand hier die 8 als Literal, und sie
+    // passte genau — weil ein Manifest, das Slot 0 selbst vergibt, mit dem Angebot des Aufrufers
+    // ohnehin kollidiert. Eine Eigenschaft, die aus einer Groessenrelation folgt statt aus der
+    // Struktur, verschwindet beim naechsten Slot: mit B2 waeren es 9 gewesen, und der Ueberlauf
+    // haette sich als `collision` gemeldet — also mit dem Grund eines ganz anderen Fehlers.
+    let mut slots: [Option<(usize, CapPtr)>; LOAD_CAPS_MAX] = [None; LOAD_CAPS_MAX];
     let mut n = 0usize;
     let mut collision = false;
     for &c in endow {
@@ -1940,6 +2209,13 @@ pub fn load_by_index(
             n += 1;
         }
     }
+    // **Hier und nur hier ist die Herkunft bekannt** (2026-08-25): `endow` IST das Angebot des
+    // Aufrufers (Konvention L2, hoechstens ein Cap in Slot 0), `manifest_caps` sind die Zusagen
+    // des signierten Dokuments. Eine Ebene tiefer sind beide dasselbe Tupel und nicht mehr
+    // auseinanderzuhalten -- deshalb wandert die Auskunft mit, statt dort erraten zu werden.
+    let angebot = endow
+        .iter()
+        .fold(0u16, |m, &(slot, _)| m | if slot < 16 { 1u16 << slot } else { 0 });
     let do_load = |endow: &[(usize, CapPtr)]| -> Option<usize> {
         let archive = read_archive()?;
         let prog = archive.program(index as usize)?;
@@ -1952,7 +2228,7 @@ pub fn load_by_index(
             read_manifest().map(|m| m.count()).unwrap_or_else(|| archive.count()),
         );
         if let Some((hpd, ep, ntfn)) = hardware_backend {
-            let tid = load_program_into_pd_auf(&prog, hpd, endow, arg, heimatkern).ok()?;
+            let tid = load_program_into_pd_auf(&prog, hpd, endow, arg, heimatkern, angebot, cap_budget).ok()?;
             // Festhalten, WAS da laeuft -- nicht, was es tut. Ohne diese vier Zahlen liesse sich
             // ein Dienst nicht austauschen, ohne ihn zu kennen.
             set_driver_service(DriverService { ep, ntfn, pd: hpd, tid, index, program_id: prog.program_id });
@@ -1963,8 +2239,26 @@ pub fn load_by_index(
         // was wirklich schiefging (Hash? Zertifikat? Ressourcen? Politik?) stand nirgends. Genau
         // die Form, die dieses Projekt beim Manifest-Format gerade erst behoben hat -- abgewiesen
         // wird richtig, gesagt wird nichts.
-        match load_image_auf(&prog, endow, arg, heimatkern) {
-            Ok((_, pd)) => Some(pd),
+        match load_image_auf(&prog, endow, arg, heimatkern, angebot, cap_budget) {
+            Ok((tid, pd)) => {
+                // **Erst hier wird ein Dienst ohne Geraet auffindbar** (2026-08-25). Bis heute
+                // rief nur der HardwareLand-Zweig `set_driver_service`; eine PD ohne Geraet stand
+                // in keiner Registrierung, und ein Client, der sie mit `service_id` benannte,
+                // bekam `None` -- und danach einen frischen, unverbundenen Endpoint. Beide Seiten
+                // haetten einen Kanal gehabt und keinen gemeinsamen, mit gueltigen Caps und ohne
+                // eine einzige Fehlermeldung.
+                if let Some((ep, ntfn)) = dienst_kanal {
+                    set_driver_service(DriverService {
+                        ep,
+                        ntfn,
+                        pd,
+                        tid,
+                        index,
+                        program_id: prog.program_id,
+                    });
+                }
+                Some(pd)
+            }
             Err(e) => {
                 // **`NoResources` benennt jetzt die Ressource.** Ein Sammelbegriff im Fehlerwert
                 // ist die Pruefer-Krankheit eine Ebene tiefer: ein Lader, der „NoResources" sagt,
@@ -1993,7 +2287,9 @@ pub fn load_by_index(
     let Some(first) = slots.iter().flatten().next().copied() else {
         return do_load(&[]);
     };
-    let mut dense = [first; 8];
+    // **Dieselbe Schranke wie `slots`**, und nicht noch einmal hingeschrieben: hier stand eine 8,
+    // waehrend `slots` hergeleitet war. Siehe [`LOAD_CAPS_MAX`] fuer den Preis.
+    let mut dense = [first; LOAD_CAPS_MAX];
     let mut dense_len = 0usize;
     for &c in slots[..n].iter().flatten() {
         dense[dense_len] = c;

@@ -333,6 +333,11 @@ fn budgettest() {
     const BUDGET: usize = caprock_microkit::CAP_BUDGET_PER_PD;
 
     let free_before = mm::total_free();
+    // **Die Grundlinie VOR der ersten PD** (2026-08-26). Der erste Anlauf las sie danach und
+    // verglich am Ende gegen einen Stand, in dem die Vorgabe-PD bereits gebucht war -- die Zeile
+    // fiel durch, obwohl das Konto exakt schloss (80000 -> 79992 -> 79972 -> 80000). Eine
+    // Baseline, die nach dem ersten Verbrauch genommen wird, misst die Differenz zu sich selbst.
+    let (vorrat_start, abgewiesen0) = mm::pd_budget_bilanz();
     let pd = mm::create_pd().expect("budget pd");
     let root = mm::cap_install(mm::alloc(PAGE, PAGE).expect("budget mem")).expect("budget root");
 
@@ -362,15 +367,113 @@ fn budgettest() {
         &mut fail,
     );
 
+    // --- Das Budget ist ein KONTO, keine Konstante (2026-08-26) --------------------------------
+    //
+    // Bis hierher prueft dieser Test genau eine Zahl fuer alle PDs. Der Rest prueft, dass eine PD
+    // ihre EIGENE bekommt -- und, das ist die entscheidende Haelfte, dass der Vorrat, aus dem
+    // vergeben wird, beim Abbau **zurueckkommt**. Ein Vorrat, der nur schrumpft, ist von einem
+    // unter Last nicht zu unterscheiden, und die Zusage „jede PD bekommt ihr Budget" waere nach
+    // genug PDs uneinloesbar, ohne dass ein Zaehler es gesagt haette.
+    // **12 und nicht 20**: der lokale Cspace einer PD hat `NCAPS` = 16 Slots, ein Budget darueber
+    // waere unerfuellbar (s. `CAP_BUDGET_MAX`). Der erste Anlauf nahm 20, fuellte bis 16 und
+    // scheiterte an der SLOT-Schranke -- die Zeile fiel durch und zeigte damit auf den echten
+    // Blocker: nicht das Budget, sondern das Slot-Array.
+    const GROSS: u16 = 12;
+    let (vorrat0, _) = mm::pd_budget_bilanz();
+    // Sprechprobe: der Vorrat muss ueberhaupt etwas hergeben. Sonst waeren alle Differenzen unten
+    // Aussagen ueber eine leere Menge.
+    check(p, vorrat0 > GROSS as usize, "der Slot-Vorrat ist nicht erschoepft", &mut fail);
+    // Und die Vorgabe-PD von oben hat gebucht -- die Sprechprobe fuer die Buchung selbst.
+    check(
+        p,
+        vorrat0 + BUDGET == vorrat_start,
+        "schon die Vorgabe-PD hat gegen den Vorrat gebucht",
+        &mut fail,
+    );
+
+    let gross_pd = mm::create_pd_mit_budget(caprock_microkit::Domain::TrustedSas, GROSS)
+        .expect("budget: PD mit erhoehtem Budget");
+    let (vorrat1, _) = mm::pd_budget_bilanz();
+    check(
+        p,
+        mm::pd_budget_of(gross_pd) == GROSS as usize,
+        "die PD traegt IHR Budget, nicht die Vorgabe",
+        &mut fail,
+    );
+    check(
+        p,
+        vorrat1 + GROSS as usize == vorrat0,
+        "die Vergabe bucht EXAKT gegen den Vorrat",
+        &mut fail,
+    );
+
+    // **Das erhoehte Budget WIRKT** -- gemessen an der Wirkung, nicht am Rueckgabewert von
+    // `create`. Zwoelf Slots liegen ueber der Vorgabe von acht; ohne die Aenderung waere hier
+    // beim neunten Schluss.
+    let mut gross_ok = true;
+    for slot in 0..GROSS as usize {
+        let c = mm::cap_copy(root, Rights::RW).expect("budget: Kopie fuer die grosse PD");
+        gross_ok &= mm::install_pd_cap(gross_pd, slot, c);
+    }
+    check(p, gross_ok, "eine PD mit erhoehtem Budget haelt 12 Caps (Vorgabe: 8)", &mut fail);
+    // **Erst bis an die Schranke fuellen, dann eins darueber.** Der erste Anlauf fragte den Slot
+    // `GROSS` nach nur zwoelf Installationen -- da war das Budget noch gar nicht ausgeschoepft,
+    // und die Zeile fiel durch, ohne dass etwas kaputt war. Eine Schranke prueft man an der
+    // Schranke.
+    let ueber_gross = mm::cap_copy(root, Rights::RW).expect("budget: Kopie ueber GROSS");
+    check(
+        p,
+        gross_ok && !mm::install_pd_cap(gross_pd, GROSS as usize, ueber_gross),
+        "auch das erhoehte Budget ist eine SCHRANKE und keine Aufhebung",
+        &mut fail,
+    );
+
+    // **Ueber dem Maximum wird ABGEWIESEN, nicht gedeckelt** -- und die Abweisung darf NICHT als
+    // Vorratsmangel gebucht werden. „Kein Slot mehr da" und „du hast zu viel verlangt" haben
+    // verschiedene Behebungen; ein gemeinsamer Zaehler machte den Bericht unfaehig zu sagen,
+    // welche von beiden eingetreten ist.
+    let zu_viel = mm::create_pd_mit_budget(
+        caprock_microkit::Domain::TrustedSas,
+        caprock_microkit::CAP_BUDGET_MAX as u16 + 1,
+    );
+    let (_, abgewiesen1) = mm::pd_budget_bilanz();
+    check(p, zu_viel.is_none(), "ueber CAP_BUDGET_MAX wird abgewiesen", &mut fail);
+    check(
+        p,
+        abgewiesen1 == abgewiesen0,
+        "und die Absage wird NICHT als Vorratsmangel gezaehlt (getrennte Gruende)",
+        &mut fail,
+    );
+
     // Teardown: PD abbauen, Wurzel löschen -> alles zurück auf die Baseline.
+    mm::destroy_pd(gross_pd);
+    let _ = mm::cap_delete(ueber_gross);
     mm::destroy_pd(pd);
+    let (vorrat2, _) = mm::pd_budget_bilanz();
+    // **Die Haelfte, die entscheidet, ob es ein Konto ist.** Verglichen wird gegen den Stand VOR
+    // der ersten PD -- beide sind abgebaut, also muss der Vorrat vollstaendig zurueck sein.
+    check(
+        p,
+        vorrat2 == vorrat_start,
+        "der Abbau gibt BEIDE Budgets zurueck -- das Konto schliesst",
+        &mut fail,
+    );
     let _ = mm::cap_delete(over);
     let _ = mm::cap_revoke(root);
     let _ = mm::cap_delete(root);
     check(p, mm::cap_audit_cdt() == 0, "CDT konsistent nach Teardown", &mut fail);
     check(p, mm::total_free() == free_before, "Speicher zurueckgegeben", &mut fail);
 
-    println!("budget  : {}", if fail { "FAILURES" } else { "ALL PASS" });
+    // **Was diese Zeile NICHT misst, und es steht hier statt in einem Commit-Text:** die Absage
+    // bei ERSCHOEPFTEM Vorrat. Sie auszuloesen hiesse rund 80 000 Slots zu vergeben, also
+    // tausende PDs -- eine Messung, die die Baseline jedes anderen Tests dieses Laufs verschoebe.
+    // Gemessen ist stattdessen, dass die beiden Gruende UNTERSCHEIDBAR gezaehlt werden; der
+    // Erschoepfungspfad selbst steht als offen in `todo.md`.
+    println!(
+        "budget  : {} (Vorrat {vorrat_start} -> {vorrat0} -> {vorrat1} -> {vorrat2}, Vorratsabsagen {abgewiesen1}; \
+         der ERSCHOEPFUNGSPFAD ist NICHT gefahren -- s. todo)",
+        if fail { "FAILURES" } else { "ALL PASS" }
+    );
 }
 
 /// Transfer-Demonstration: Cap per Move durchreichen (Ownership = Capability).

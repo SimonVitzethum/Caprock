@@ -9,6 +9,687 @@ schon einmal nicht getragen hat.
 
 ---
 
+## A2. Die Frist ist ein WECKER, kein Blockadegrund (2026-08-28)
+
+`ERR_TIMEOUT = 25`; `WAIT` nimmt die Frist in `MSG0`, `0` heisst „wie bisher" und ist damit
+bitgleich zu jedem vor A2 geschriebenen Aufrufer.
+
+**Der Entwurf haengt scharf an Z24, und der Satz ist die ganze Sache:** ein sechster Grund neben
+`IPC`/`BUDGET`/`PAUSE`/`PARK`/`HANDLER`/`LOAD`/`DEBUG`/`FREEZE` waere der D9-Fehler woertlich, mit
+der Uhr als Ausloeser. `Tcb.frist_grund` haelt deshalb **genau den einen** Grund, fuer den die
+Frist scharfgestellt wurde, und `fristen_faellig` entfernt nur diesen -- ein Thread, der zusaetzlich
+pausiert oder erschoepft ist, bleibt es. Eingereiht wird weiterhin **nur bei leerer Menge**.
+
+**Das Rennen ist ENTSCHIEDEN und steht ausgeschrieben: das Signal gewinnt.** Ist der bewachte Grund
+schon weg, wird die Frist entwaffnet und **nichts** geschrieben. Nur ein Thread, den die Frist
+wirklich freigegeben hat, bekommt `ERR_TIMEOUT` -- denn ein Treiber, der daraus „Geraet tot"
+ableitet, waehrend die Antwort gerade zugestellt wurde, ist ein **Korruptionspfad** und kein
+Haenger. Das Dokument verlangt, dieses Fenster **absichtlich zu treffen**; die Sonde signalisiert
+vor dem Warten, trifft es also nur in einer Lage (todo A2c).
+
+**D10 ist mitgedacht.** `Scheduler.naechste_frist` ist ein **Minimum**, kein Zaehler. Ein Zaehler
+(„gibt es Fristen?") machte jeden Tick zum Tabellendurchlauf, sobald *ein* Treiber wartet -- und
+ein wartender Treiber ist genau der Fall, fuer den A2 existiert. Beim Entwaffnen wird nicht neu
+gerechnet: der Wert darf zu frueh stehen, nie zu spaet. Gefeuert wird mit `FRISTEN_JE_TICK = 16`
+je Tick; Ueberlauf ist **Verzoegerung, nicht Verlust**.
+
+**Die Schichtgrenze:** `caprock-sched` kennt `ERR_TIMEOUT` nicht. Es liefert die Thread-Liste, der
+Kernel schreibt den ABI-Wert in den Ergebnisframe -- dieselbe Trennung wie ueberall sonst.
+
+**Gemessen** als zweite Haelfte der `uhr`-Zeile, auf beiden Architekturen:
+
+```
+A2: frist-weckt=true (code=25)  nicht-zu-frueh=true (672829938 >= 224270360 Zyklen)
+    signal-gewinnt=true (code=0)  signal-frueher=true
+```
+
+Vier Konjunkte, und **jedes einzelne** ist da, weil sein Nachbar allein nichts sagt:
+`frist-weckt` ist auch mit einem Wecker wahr, der **nie** feuert (ein nie geweckter Thread sieht
+genauso aus, solange niemand den Gegenfall faehrt); `nicht-zu-frueh` schliesst einen Wecker aus,
+der **sofort** feuert -- das waere kein Warten, sondern ein Rueckgabewert; `signal-gewinnt` ist die
+Positivkontrolle; und `signal-frueher` schliesst aus, dass in Wahrheit wieder die Frist gefeuert hat
+und nur der Code stimmte.
+
+### Der Befund, den die Positivkontrolle gefunden hat
+
+`signal-gewinnt=false (code=9)` -- **`ERR_EP_FULL`**. Ein Thread, den die Frist aus einem IPC-Warten
+holt, stand **weiterhin im Wartefeld seines Objekts**: die Notification hielt ihn fuer den
+Wartenden, obwohl er laengst weitergelaufen war. Sein zweiter `WAIT` prallte an der Kapazitaet ab,
+und ein spaeteres Signal haette einen Thread geweckt, der nicht mehr wartet.
+
+**Dieselbe Familie wie D11, nur andersherum:** dort stand ein Wartender in **keiner** Struktur,
+hier ein Nicht-mehr-Wartender in **einer**. Beide Male meldet jeder Pruefer Ordnung. Die Frist
+meldet ihn jetzt ab -- **ausserhalb** der `SCHEDS`-Sperre, weil die Ordnung `EPS`/`NTFNS < SCHEDS`
+lautet.
+
+Ohne die Positivkontrolle waere das nie aufgefallen: `frist-weckt=true` allein ist auch mit einem
+kaputten Abmeldepfad wahr. Das ist der Grund, warum das Dokument **beide Richtungen** vorschreibt.
+
+### Was NICHT gebaut ist -- und als Schuld gefuehrt wird
+
+* **Nur `WAIT` traegt eine Frist**, nicht `CALL` und nicht `PARK` (todo A2, Rest).
+* **Keine Gegenprobe.** Die vier Konjunkte haben keinen Negativfall -- nach D18 sind sie damit
+  „Pruefer, die nicht scheitern koennen", bis das Gegenteil gefahren ist. Vorgeschrieben ist im
+  Dokument die schaerfste: *der Timer entfernt alle Gruende statt des einen* (todo A2n).
+* **Der Verus-Aufwand ist offen, und zwar benannt.** Der Modell-Treue-Waechter hat `Tcb.frist`,
+  `Tcb.frist_grund` und `fristen_faellig` von selbst gemeldet; sie stehen als **ausserhalb mit
+  Schuld** in `tools/verus-modelltreue-sched.sh` (todo A2v). Der **Effekt** von `fristen_faellig`
+  ist der eines Weckers, den das Modell kennt -- genau einen Grund entfernen, bei leerer Menge
+  einreihen, woertlich `unpark`. Was fehlt, ist der **Ausloeser**: eine Frist ist eine Aussage
+  ueber Zeit, und die gibt es im Modell nicht. Als Partner von `unblock` einzutragen waere die
+  bequeme Fassung und eine Behauptung -- der Beweis koennte nicht pruefen, dass die Frist feuert,
+  wenn sie soll.
+
+---
+
+## A1. Die Uhr hat eine Bedeutung (2026-08-27)
+
+`SYS_CLOCK = 28`, kein Cap -- Zeit zu lesen gewaehrt nichts. Zwei Zahlen: **Rate** und Stand.
+
+**Die Rate ist das, was gefehlt hat.** Den Zaehler kann Ring 3 auf beiden Architekturen laengst
+selbst lesen (`rdtsc`, `CNTVCT_EL0`); was es nicht wissen kann, ist, was ein Schritt **wert** ist --
+und das ist gegen die Plattformuhr geeicht, also Kernelwissen. Ausdruecklich **nicht** dabei:
+Wanduhrzeit, Epoche, Fristen. Fristen sind A2 und fassen die Blockade-Invarianten an; dieser
+Syscall tut das nicht.
+
+**Die Messung ist bewusst NICHT zirkulaer.** Zu pruefen, ob der Syscall dieselbe Zahl liefert wie
+`cycles_per_sec()`, belegt, dass ein Wert durchgereicht wird -- und nichts ueber seine Richtigkeit;
+eine um den Faktor zehn falsche Eichung kaeme genauso durch. Verglichen werden zwei **Zeitspannen**
+gegen zwei unabhaengige Uhren: `(c1-c0)/hz` gegen `(t1-t0)/TICK_HZ`. Gemessen als `uhr` auf beiden
+Architekturen, **Abweichung 0 %** (x86: 299 987 gegen 300 000 us; aarch64: 261 214 gegen 260 000).
+
+**Die Toleranz musste von 12 % auf 8 %** -- sonst waere die vom Dokument vorgeschriebene
+10-%-Gegenprobe durchgegangen, und die Zeile haette nie belegt, dass sie eine falsche Eichung
+**sieht**. Die 8 % sind hergeleitet (bis zu 3,3 % Quantisierung der Tick-Uhr ueber das Fenster),
+nicht gewaehlt.
+
+**Drei Fehler auf dem Weg, alle vom Pruefer selbst gemeldet:**
+
+1. **`ticks(0)` statt des laufenden Kerns** -> `tick=0us`. Gefangen von der Untergrenze
+   `klein > 0`; ohne sie waere aus einer Division ein Befund ueber die Uhr geworden.
+2. **`timer::freq()` ist NICHT die Tick-Rate**, sondern die Zaehlfrequenz der Zeitbasis (x86: rund
+   1 GHz). `30 * 1e6 / 1e9` ist ganzzahlig **0** -- die Zeile haette die Uhr beschuldigt, waehrend
+   die Ticks sauber liefen (1823 -> 1853).
+3. **Der EL0-Thread hinkte 140 ms nach.** Er laeuft auf `IDLE_PRIO` und schreibt seinen Stand nur,
+   wenn er dran ist: gemessen wurde die **Einplanung**, nicht die Uhr. Jetzt klammert der Kernel
+   den Zaehler, die **Rate** kommt weiter ueber die ABI, und der EL0-Wert bleibt als eigenes
+   Konjunkt -- *er darf nachhinken, nicht ueberholen und nicht stehen*.
+
+**Nebenbei zusammengefuehrt:** `TICK_HZ` stand **zweimal** im Baum, je einmal pro Architektur,
+beide `100`. Die Sonde braucht die Zahl auf beiden Seiten -- statt einer dritten gibt es jetzt eine
+(todo D16).
+
+Gegenproben `tools/uhr-negativ.sh`: Rate 10 % zu hoch -> `passt-zum-tick` faellt; `0` Hz ->
+`rate-plausibel` faellt (*Null ist ein Befund*); stehender Zaehler -> `zaehler-waechst` faellt.
+
+---
+
+## TLS. Ein Treiber laeuft mit `#[thread_local]` (2026-08-27)
+
+**Der Schnitt ist die ganze Entscheidung: der Kernel haelt EIN Register, sonst nichts.**
+
+Das Register muss beim Kernel liegen, weil es den Kontextwechsel ueberleben muss -- genau das kann
+ein Programm fuer sich selbst nicht. Die **Aufteilung** darf nicht beim Kernel liegen, weil das
+TLS-Layout eine ABI der Werkzeugkette ist, und zwar **je Architektur eine andere**: x86-64 ist
+Variante 2 (`tp` ans Ende, negative Offsets, Selbstzeiger in `tp[0]`), aarch64 Variante 1 (`tp` an
+den Anfang, 16 B TCB, positive Offsets). Dass dieser Unterschied **ausschliesslich in
+`libcaprock`** lebt, ist die Probe auf den Schnitt.
+
+Gebaut: `Tcb.tls` + `sync_tls`, `SYS_SETTLS = 27`, `.tdata`/`.tbss` + `PT_TLS` in beiden
+Linkerskripten, `has-thread-local` in beiden Ziel-Beschreibungen, `libcaprock::tls_einrichten`,
+und `virtio-blk` mit einer echten thread-lokalen Variablen. Gemessen als `tls` auf **beiden**
+Architekturen, mit vier Gegenproben (`tools/tls-negativ.sh`).
+
+**Die Schranke ist keine Autoritaetsfrage, und das war der wichtigste Einwand.** `SETTLS` braucht
+keine Cap -- der Aufrufer erreicht nichts, was er nicht schon hatte. Das gilt fuer das, was er
+ERREICHT; ueber das, was er den **Kernel tun laesst**, sagt es nichts: ein `WRMSR` auf
+`IA32_FS_BASE` mit nicht-kanonischem Wert faultet in **Ring 0**. Eine PD ohne jede Cap haette den
+Kern umgelegt. Geprueft wird gegen die untere Adresshaelfte (`USER_VA_TOP`), mit eigenem Code
+`ERR_BADTLS`; die zweite Schreibstelle (`sync_tls`) ist dadurch gedeckt, dass der Wert **beim
+Speichern** geprueft wurde -- ausgeschrieben, weil der Satz sonst beim naechsten Umbau verlorengeht.
+Auf aarch64 gibt es das Problem nicht (`TPIDR_EL0` nimmt jeden Wert), und der Halbsatz steht an
+beiden Stellen -- sonst liest sich die Zeile als ueberfluessig.
+
+**Sieben Befunde, und kein einziger im gemessenen Gegenstand:**
+
+1. **`sync_tls` landete an EINER von VIER Spiegelstellen.** Die Kinder setzten korrekt und verloren
+   den Wert beim ersten `YIELD`; `tp-gesetzt` blieb dabei gruen. Behoben nicht durch die vierte
+   Zeile, sondern durch **`sync_thread_state`** -- eine Funktion statt vier handgepflegter Listen.
+   Dieselbe Klasse wie *wer einen neuen Zustand einfuehrt, muss jede Stelle mitnehmen, die ueber
+   ihn URTEILT*, hier: die ihn **spiegelt**.
+2. **`p_align` des `PT_TLS` ist 4096**, und der Uebersetzer rechnet die local-exec-Adresse gegen die
+   darauf **aufgerundete** Blockgroesse. Mit 16 reservierten Byte lag die Variable eine ganze Seite
+   unter ihrem Speicher (`FAR = 0x2000_2010` bei `tp = 0x2000_3010`). Kein Uebersetzungsfehler,
+   keine Meldung -- der Treiber starb still. `TLS_ALIGN` ist deshalb die **Seitengroesse**: die Zahl
+   kommt von der Werkzeugkette, und eine parallel gefuehrte waere D16.
+3. **`.tdata : ALIGN(16)` vor `.bss`** hat die Falle vom 2026-08-10 woertlich wiederholt (`.data`
+   ist leer, lld verwirft sie, `.tdata` wird erste Sektion des RW-Segments). `ALIGN(4096)` behob
+   das und erzeugte Befund 2. Richtig ist **hinter `.bss`**: die beiden Groessen -- Segmentanfang
+   und TLS-Ausrichtung -- waren nie dieselbe Frage, sie hingen nur am selben Feld.
+4. **Ein Versatz in Variante 2**: ausgerichtet gehoert `tp`, nicht der Datenanfang.
+5. **Mein Diagnose-`asm!` war nicht arch-gegattert** (`mov x8, fs:[0]` auf ARM) -- vierte Instanz
+   derselben Klasse in einer Sitzung, diesmal im Userland.
+6. **`getrennt` konnte wahr werden, WEIL NICHTS PASSIERT IST**: es verglich zwei Fensteradressen,
+   die der Pruefer selbst gewaehlt hatte; schwieg ein Kind, stand dort `0`, und `0 != b0` las sich
+   als „getrennt". Gefunden von der Gegenprobe, die die **Praemisse** prueft (D18, im eigenen
+   Werkzeug, am Tag des Eintrags).
+7. **Der Extraktor der Gegenprobe las die FALSCHE ZEILE**: `irtevgb` hat ein gleichnamiges
+   Konjunkt `getrennt=true`, und `head -1` nahm dessen Wert -- M3 war zwei Laeufe lang zu Unrecht
+   rot. Beide Negativskripte lesen seither nur auf ihrer eigenen Berichtszeile.
+
+**Dazu zwei Nebenwirkungen, die andere Zeilen gekippt haben.** Die Sonde liess ihre Kinder nach der
+Messung 16 384 `YIELD`-Runden weiterdrehen und hat damit auf aarch64 die **Stopp-Latenz-Zusage des
+Debuggers** (`dbg`) gerissen -- eine Zeile ohne jeden Bezug zu TLS. Und der **Modell-Treue-Waechter
+des Schedulers hat sich von selbst gemeldet**: `Tcb.tls` war weder zugeordnet noch als ausserhalb
+erklaert. Es ist jetzt ausserhalb eingetragen, mit Grund -- der Scheduler **traegt** die Zahl und
+interpretiert sie nie; was sie kritisch macht, traegt die ABI-Schranke, nicht der Beweis.
+
+**Offen:** `FSGSBASE` (E-T1 in `docs/plan-tls.md`) -- ein realer Gewinn (`WRMSR` serialisiert), der
+aber `wrgsbase` aus Ring 3 freigibt und damit die Option verteuert, `GS` spaeter als Per-CPU-Ablage
+zu nehmen. Als **Entscheidung** gefuehrt, nicht als Optimierung.
+
+---
+
+## B1–B3. `CAP_IRQ` auf x86: Vergabe, Cap und der Riegel (2026-08-26)
+
+**Der Ausgangsbefund:** `pcie.rs` kannte **kein MSI** und lief die Capability-Liste ueberhaupt
+nicht ab; die IRTE-Vergabe stand samt Hardwarezugriff und hatte **keinen Aufrufer**; `bind_irq`
+behauptete in seinem Doku-Kommentar, „ueber die IRQ-Cap autorisiert" zu sein, und nahm rohe
+Zahlen. Drei verschiedene Zustaende, im Register als einer gefuehrt.
+
+**Gebaut und gemessen** (Zeile `irqmsi`, Lade-Suite, x86):
+
+* **B1** — IRTE-Vergabe + MSI-X-Zeile bei der Zuteilung, `SVT/SID` im selben Schritt. Die
+  Ruecknahme hat eine **Ordnung**, und sie ist die Zusage: *Geraet stilllegen → IRTE einziehen →
+  Vektor freigeben.* Andersherum gibt es ein Fenster, in dem das Geraet scharf ist und sein Eintrag
+  weg — eine MSI dorthin ist ein VT-d-Fault **ohne Besitzer**, auf einem gewoehnlichen Abweispfad.
+  Stillgelegt wird mit der **Function Mask**, nicht mit `Enable = 0`: eine Funktion ohne MSI-X-Enable
+  faellt auf INTx zurueck (PCI 3.0 §6.8.2), und INTx routet hier niemand.
+* **B2** — die `Irq`-Cap in Slot 7, in **beiden** Wegen. Beim Hot-Reload bekommt die
+  Nachfolgefassung eine eigene Cap auf denselben Vektor **und die Erlaubnis dafuer**; ohne die
+  zweite Haelfte weist die HardwareLand-Politik den Slot ab und der Austausch meldet `NotReady` —
+  wieder das Bild „Zeitproblem" fuer ein fehlendes Endowment.
+* **B3** — `SYS_BIND_IRQ = 26`, `ERR_IRQ_FULL = 23`. **Der Aufrufer nennt keinen Vektor, sondern
+  eine Cap**; `intid` kommt aus dem Objekt. Der Ring-3-Negativfall faehrt **zwei** Lagen: ein
+  leerer Slot (den weist schon die generische Cap-Aufloesung ab — er sagt ueber `BIND_IRQ` nichts)
+  und eine **gehaltene** Cap vom falschen Typ, die erst der Zweig selbst abweist. Nur die erste zu
+  pruefen hiesse, ein Gatter zu messen, das woanders steht.
+
+**Vier Befunde unterwegs, alle gemessen:**
+
+1. **`let mut dense = [first; 8]`** in `loader.rs` neben einem hergeleiteten `slots`. Mit dem
+   neunten Slot schrieb es ueber sein Ende, der Ladepfad **panikte** — und weil ein Panic den
+   Knoten nicht mitreisst (B-6.2), fielen vier von sechs Programmen aus, **ohne eine einzige
+   Fehlermeldung**. Jetzt `LOAD_CAPS_MAX`, eine Zahl an einer Stelle. (s. todo D16, D17)
+2. **`CAP_BUDGET_PER_PD = 8` war die Zusage des Laders unterschreitend.** Mit B2 brauchte eine
+   Treiber-PD genau 8 Caps — exakte Passung, also der uebliche Zufall der Groessenrelation. Jetzt
+   10, gehalten von `const _: () = assert!(LOAD_CAPS_MAX <= CAP_BUDGET_PER_PD, ..)`: wer einen Slot
+   hinzufuegt, bricht den Bau.
+3. **Die HardwareLand-Regel hat B4 zu Recht abgewiesen.** Eine Backend-PD darf Kommunikations-Caps
+   nur fuer ihren **eigenen Kanal** halten; die dedizierte Interrupt-Notification fiel darunter.
+   Aufgeweicht wurde sie **nicht**, sondern um **genau ein vom Kernel fuer diese PD gepraegtes
+   Objekt** erweitert (`Pd::irq_ntfn`) — es verbindet sie mit niemandem. Eine allgemeine Ausnahme
+   („Notifications sind erlaubt") waere die bequeme Fassung und genau der Kanal zu einem Dritten,
+   den die Regel ausschliesst.
+4. **Zwei eigene Pruefer sind durchgefallen, bevor einer trug.** Ein Konjunkt namens
+   `angeboten=>da` ist in der `name=wert`-Konvention dieses Baums **unlesbar** (zwei `=`); und eine
+   Mutation, die den `Some`-Arm eines `match` bewacht, macht es nicht-erschoepfend, bricht den Bau
+   und laesst den Negativfall den **Bau** messen. Beide hat die Gegenprobe selbst gemeldet — der
+   erste, weil sie den Wert `>da` las, der zweite, weil neben der Wertpruefung eine
+   **Existenzpruefung** steht.
+
+**Der Interrupt-Selbsttest las nur Tabellenzustand.** `irte::selbsttest` prueft `eintrag_steht`,
+`quellpruefung`, `adresse_remappable` — und stellt **nie** zu. Der Zustellpfad war damit nie
+gefahren; jede gruene Zeile darueber war eine Aussage ueber Zustand, nicht ueber Wirkung. Sein
+Gegenstueck (`msi_zustellprobe`, Self-IPI) misst seit heute die Wirkung und hat den Pfad
+APIC → IDT → `irq_hook` → Drain → Notification **bewiesen**.
+
+Was daran offen bleibt, steht als **B4b** in `todo.md`: das Geraet erledigt die Anfrage
+(`used.idx=1`) und sendet nicht, bei lueckenlos zurueckgelesener Kette davor.
+
+---
+
+## K1a/K1b. `SYS_SPAWN` laeuft, und eine Cap traegt mehrere Stapel (2026-08-26)
+
+**Der Ausgangsbefund ist der wichtigste Satz dieses Eintrags: `SYS_SPAWN` war gebaut und ist nie
+gelaufen.** Der Syscall steht seit dem 2026-08-17 in der ABI, mit `spawncheck::check_stack`, sechs
+benannten Absagen, `ERR_INUSE` und der D0-Zulassungsordnung. Im ganzen Baum gab es dazu **null**
+Aufrufer, **null** Berichtszeilen und **null** Suitentore — nur einen Nummern-Anker in
+`threads/mod.rs`. `TODO0.md` fuehrte K1a derweil als „die ABI hat kein `SPAWN`", also als
+**fehlend** statt als **ungemessen**; das ist ein Unterschied, an dem sich ein Plan entscheidet.
+
+### Was jetzt gemessen wird
+
+`kernel/src/spawnarena.rs` (arch-neutral, von beiden Hochlaufwegen gefahren), Zeile `arena`, in der
+Hauptsuite, der Lade-Suite und auf aarch64:
+
+```
+arena  : ALL PASS (fertig=true ganze-region=true vier-fenster=true disjunkt=true lebendig=true
+          threads=6 slots=2 ueberlappung-abgewiesen=true ausserhalb-abgewiesen=true
+          cap-gesperrt=true | maske=0xf magisch=4/4 korrupt=0 codes: ganz=0 ueber=7 aus=21 del=18)
+```
+
+Ein Elternthread in EL0 erzeugt fuenf Kinder ueber die ABI: eines mit `x1 == 0` (die ganze Cap —
+die Form, die jeder vor der Teilregion geschriebene Aufruf kodiert) und vier in **Fenstern
+derselben** 68-KiB-Arena.
+
+**Die tragende Zahl ist `slots=2` neben `threads=6`.** Vier laufende Threads belegen nur, dass vier
+Threads laufen; der Punkt ist, was sie gekostet haben. Bis dahin kaufte eine `Memory`-Cap genau
+einen Thread und blieb fuer dessen Leben gesperrt — „wie viele Threads darf eine PD haben" war
+damit „wie viele Cap-Slots sind noch frei", und ein Treiber mit 6 von 8 belegten Slots kam auf
+zwei. Dabei kauft eine Cap je Stapel **keine Isolation**: Threads einer PD teilen sich den
+Adressraum ohnehin.
+
+**`disjunkt=true` ist die Eigenschaft, an der alles haengt.** Jedes Kind legt ein aus **seiner**
+Fensterbasis abgeleitetes Wort ab und liest es weiter nach; wird es ueberschrieben, meldet es das.
+Ohne diese Zeile saehen vier Threads auf einer Arena genauso aus, wenn sie einander zertrampeln.
+Die Kinder sind reines EL0-Assembler, und das ist nicht Stil: eine Rust-Fassung baute einen
+Stapelrahmen, und unter der Mutation „Versatz ignorieren" wuerden alle vier ihre Ruecksprung-
+adressen zerstoeren und sterben — mehrere Konjunkte fielen zugleich, und *eine Mutation, die zwei
+Dinge zugleich kaputtmacht, beweist nichts ueber das gemeinte*.
+
+### Der Befund, der groesser ist als der Eintrag
+
+**Die `Overlaps`-Absage war fuer genau die Threads, die `SYS_SPAWN` erzeugt, strukturell
+unerreichbar.** `pd_mapping_overlaps` liest `KSTACKS.ubase_of`; `spawn_with_stack_parked` traegt
+dort **absichtlich** nichts ein, weil die Region der Cap gehoert und nicht dem Kernel. Der
+Kommentar an der Funktion sagte woertlich „geprueft werden ... genau die Stapel, die ein zweiter
+`SPAWN` treffen koennte" — und der Eintrag dafuer entstand nie. Solange eine Cap einen Stapel trug,
+fiel es nicht auf; mit der Teilregion ist es der Hauptfall. Seither steht `stack_sibling_overlaps`
+daneben, ODER-verknuepft, mit `STACK_CAP_OF` als Quelle (dort liegt seit heute auch die Region).
+
+Dieselbe Familie wie die leere Ereigniswarteschlange ohne `CD.R`: eine Aussage sieht wahr aus, weil
+der Fall, der sie widerlegen koennte, nie laeuft.
+
+### Der Befund, den erst aarch64 hergab
+
+Die x86-Suiten standen gruen, aarch64 meldete `arena : FAILURES` mit `maske=0x0` — **kein einziger
+Spawn** — und daneben `threads=7`. Genau dieses Paar hat es entschieden: sieben Threads in der PD,
+und kein erfolgreicher Spawn heisst, dass die Kinder **zugelassen und sofort wieder getoetet**
+wurden.
+
+Der Grund war `STACK_CAP_SLOTS = 1024`, eine feste Schranke neben vier zur Bootzeit dimensionierten
+Nachbartabellen. Ihr Kommentar sagte „deckt den `scale`-Test (1024 Threads)"; die Thread-Kapazitaet
+ist auf aarch64 mit acht Kernen rund **10 000**, und die Slots liegen entsprechend hoch.
+`record_stack_cap` gab `false`, `dispatch_spawn` toetete den Thread fail-closed und meldete
+`ERR_NOSPACE`. Auf x86 lief es, weil die Slots dort **zufaellig** klein blieben — woertlich „unten
+zuerst war ein Zufall der Groessenrelation", nur mit einer Tabellenlaenge statt einem
+Speicherbereich.
+
+Die Behebung ist keine groessere Konstante, sondern dasselbe `total`, mit dem `KSTACKS.base_of`,
+`VSPACE_OF`, `ubase_of`/`ulen_of` und der Rueckwaerts-Index dimensioniert werden — die Groesse steht
+im Boot-Report. Und die Tabelle haengt **unbedingt**, nicht unter `selftest`: sie traegt den
+`ERR_INUSE`-Schutz und die Geschwister-Ueberlappung.
+
+**Ein Nebenbefund, der teurer haette werden koennen:** im Bericht stand `codes: ganz=7 ueber=7
+aus=21` — dreimal dieselbe 7 aus drei verschiedenen Gruenden, und `ueberlappung-abgewiesen=true`
+war dabei *versehentlich* gruen (die Zeile prueft auf 7, und 7 kam ohnehin). Ein Konjunkt, das aus
+dem falschen Grund gruen ist, ist von einem richtigen nicht zu unterscheiden.
+
+### Drei eigene Fehler, alle von der Messung gefangen
+
+* **Der Elternthread lag in `.text`** und faultete an seiner eigenen Einsprungadresse
+  (`el0-trap ... FAR=0x160f00`; `nm` sagte `0000000000160f00 t ...spawnarena5elter`). Die Kinder
+  hatten `.user_text`, er nicht. Entschieden hat `nm`, nicht das Nachdenken.
+* **`user_syscall1` legte sein Argument nach `MSG0`**, `CDELETE` liest den Slot aber aus `x1`. Der
+  Kernel las einen fremden Registerinhalt als Slot und meldete `ERR_BADCAP` — eine Absage, die wie
+  ein Befund ueber die Stack-Cap aussah und ein Registerfehler war.
+* **Die Sonde las die Fenster, bevor die Kinder eingeplant waren.** `P_FERTIG` sagt, dass der
+  Elternthread seine sieben Syscalls hinter sich hat; ueber die Kinder sagt es nichts. Sie meldete
+  `magisch=0/4` und haette ohne die Warteschleife „die Fenster tragen nicht" gemeldet, wo „noch
+  nicht gelaufen" stand.
+
+### Und ein Riss, den erst dieser aarch64-Lauf sichtbar gemacht hat
+
+Die Mehrfachdelegation vom 2026-08-25 hat `SYS_LOAD`s `x3`/`x4` umgewidmet (Slot/Badge ->
+gepackte Liste/Anzahl). Der **in-Kernel-Aufrufer** `sysload_caller` in `kernel/src/threads/mod.rs`
+kodierte weiter die alte Fassung — es gibt ihn nur auf aarch64, und aarch64 war seit jener
+Aenderung nicht gelaufen. Folge: `anzahl == 0`, also **keine** Delegation; `hello` lief, hatte
+keine Notification und konnte sich nicht melden.
+
+Das Fehlerbild ist die teure Sorte: `sysload` meldete `result=0` (der Ladevorgang gelang ja) und
+`hello-Signal=NEIN`, `all_done()` wurde nie wahr, Watchdog — und **neun weitere Zeilen** meldeten
+`FAILURES`, weil sie nach dem Haenger gar nicht mehr liefen. Neun rote Zeilen aus einem einzigen
+falsch kodierten Nachrichtenwort. *Wer eine ABI aendert, muss jeden Aufrufer mitnehmen — auch den,
+den nur die andere Architektur hat.*
+
+### Gegenproben
+
+`tools/spawnarena-negativ.sh`, fuenf Mutationen. **M1 ist woertlich der Baum von gestern** (die
+Geschwisterpruefung faellt weg); M3 trifft absichtlich die **Sonde** und beantwortet die Frage, ob
+`disjunkt` eine Kollision ueberhaupt bemerken wuerde. Wo eine Mutation mehr als ein Konjunkt kippt,
+steht die Folge **vor** dem Lauf in der Datei — eine Gegenprobe, die ihre Nebenwirkung hinterher
+entdeckt, ist eine an ihr Ergebnis angepasste Gegenprobe.
+
+`mutiere` zaehlt dabei die **geaenderten Zeilen** gegen die Sicherungskopie, nicht die Zahl der
+Musterstellen: „hat das Muster getroffen?" ist die halbe Frage, „wie oft?" die andere (M7 aus
+`ckptcut-negativ.sh`), und ein bereichsgebundenes `sed` laesst sich mit `grep -c` gar nicht ehrlich
+zaehlen. Bei M1 und M5 ist die erwartete Zahl **2** — sie ersetzen eine Zeile durch zwei —, und
+beide sind bereichsgebunden, weil `let t = STACK_CAP_OF.lock();` in **beiden** Funktionen steht:
+eine Mutation, die beide traefe, schaltete die Ueberlappungspruefung und den `ERR_INUSE`-Schutz
+zugleich ab.
+
+**Zwei eigene Werkzeugfehler beim Fahren dieser Datei, beide von der Positivkontrolle gefangen:**
+zwei Laeufe gleichzeitig (der zweite sah die M3-Mutation des ersten als Ausgangszustand und meldete
+„schon rot"), und die Datei wurde **waehrend** eines Laufs bearbeitet — bash liest Skripte
+inkrementell ueber einen Byte-Versatz, der Interpreter setzte mitten in einem Token fort und
+meldete `Zeile 129: ppfehler.: Kommando nicht gefunden`. Beide stehen in der Fallenliste.
+
+---
+
+## C2. Der DMA-Pool ist ein Argument des Ladens (2026-08-26)
+
+Der Kernel gab **jeder** Treiber-PD dieselben 16 KiB (`DRIVER_DMA_BYTES`), und der Kommentar daneben
+sagte, die Groesse gehoere „perspektivisch ins Manifest". Das ist verworfen: das Manifest beschreibt
+den **Bootzustand** und wird signiert; wer zur Laufzeit einen Treiber startet, muss seine Zahl
+nennen koennen, ohne ein Dokument neu zu unterschreiben. Die Groesse ist deshalb Argument der
+**Zuteilung** (`SYS_LOAD` `x5`), und die Konstante nur noch die Vorgabe.
+
+`x5` traegt zwei Felder, und die Belegung steht ausgeschrieben:
+
+```text
+x5 = (dma_pages << 16) | cap_budget      // beide 0 = Vorgabe, also bitgleich zu vorher
+```
+
+Gemessen als `dmapool` in der Lade-Suite:
+
+```
+dmapool : Eintrag 3 wuenschte 8 Seiten, bekam 32768 B bei IOVA 0x...
+dmapool : Eintrag 5 wuenschte 32 Seiten, bekam 131072 B bei IOVA 0x...
+dmapool : ALL PASS (eingeloest=true verschieden=true disjunkt=true zu-gross-abgewiesen=true
+          zuteilungen=2 vorgabe=16384 B | dma_audit=2 -- KEIN Konjunkt, s. todo)
+```
+
+Vier Aussagen, und keine davon ist „ein Pool ist da":
+
+* **`eingeloest`** — jede Zuteilung bekam **genau** das Angeforderte. Das trennt „so gewollt" von
+  „stillschweigend gekuerzt", und die Kuerzung ist der Fehler, um den es geht: eine halbierte
+  DMA-Region ist ein Geraet, das ueber ihr Ende hinausschreibt. Dafuer fuehrt `DriverAssign` den
+  **Wunsch neben der Gewaehrung**; nur die gewaehrte Zahl zu haben hiesse, die beiden nicht
+  unterscheiden zu koennen.
+* **`verschieden`** — zwei Treiber-PDs mit verschieden grossen Pools. Ohne diese Haelfte waere
+  `eingeloest` auch dann wahr, wenn alle die Vorgabe bekommen und der Parameter nie gelesen wird.
+* **`disjunkt`** — die IOVA-Fenster ueberschneiden sich nicht. A-5.4 ist bei EINER Groesse gemessen
+  worden; bei geaenderten Groessen wird es **neu gefahren** statt als weitergeltend angenommen.
+* **`zu-gross-abgewiesen`** — der Ring-3-Negativfall aus `init`: eine Anforderung ueber
+  `DRIVER_DMA_MAX_PAGES` bekommt `ERR_DMA_TOO_LARGE` (D11: eigener Code, **nicht** gekuerzt, und
+  der Aufrufer wird nicht blockiert). Ohne ihn waere die Obergrenze eine Zahl, von der niemand
+  weiss, ob sie beisst.
+
+Die Absage faellt **am Rand des Dispatch**, bevor Endowment-Caps abgeleitet sind — sonst haette der
+Abweispfad eine Aufraeumpflicht zu erben, und genau die haben die zwei C8-Ausgaenge schon einmal
+nicht erfuellt. Die Obergrenze steht in der **ABI** (`caprock_abi::DRIVER_DMA_MAX_PAGES`) und nicht
+nur im Kernel: eine Schnittstelle, die oberhalb von `N` abweist, muss `N` veroeffentlichen, sonst
+ist die naheliegende Reaktion des Aufrufers (halbieren und nochmal) genau die Kuerzung, die hier
+vermieden wird. Ein `const assert` haelt Kernel- und ABI-Zahl zusammen.
+
+`init` traegt die Politik: eine kleine Tabelle Archivindex -> Seiten. Das ist die richtige Stelle —
+er **ist** der Boot-Taskmanager; ein Laufzeit-Treibermanager laese dieselbe Tabelle aus einer
+Konfiguration.
+
+### Zwei Befunde beim Messen
+
+**Das Badge steckt in der CAP.** Der erste Anlauf rief `signal(NTFN_SLOT, POOL_REFUSED_BADGE)` —
+angekommen ist `ROOT_BADGE`, denn `SYS_SIGNAL` verodert das Badge der benutzten Cap und nicht das
+Nachrichtenwort. Die Zeile meldete `zu-gross-abgewiesen=false`, obwohl die Absage korrekt gekommen
+war. Steht seit A-2.1 so im Register; ich bin trotzdem hineingelaufen. Behebung: eine gebadgte
+Kopie (`ccopy`) und ueber die signalisieren — derselbe Weg, den `init` fuer die beiden
+`CDELETE`-Badges laengst geht.
+
+**`dma_audit` meldet am Ende des Laufs 2** („zwei DMA-Regionen ueberlappen physisch"). Ursache ist
+nicht C2, sondern der A-5.1-Austausch davor: `reassign_driver_device` praegt der neuen Fassung eine
+Cap ueber **dieselbe** Region — Absicht, sie soll sie erben —, und die Regel des Pruefers kennt die
+**Uebergabe** nicht. Es als Konjunkt zu fuehren machte `dmapool` aus einem fremden Grund rot; es
+wegzulassen waere die andere Haelfte desselben Fehlers. Es steht deshalb als **Zahl** in der Zeile,
+mit Verweis, und die ernstere Frage dahinter (was passiert beim Abbau der alten PD mit der Region,
+auf der die neue laeuft?) steht als `A3d` in `todo.md`.
+
+---
+
+## A3 (teilweise). Aus dem Cap-Budget wird ein Konto (2026-08-26)
+
+`CAP_BUDGET_PER_PD = 8` galt fuer jede PD. Das trug, solange eine PD 1–4 Slots brauchte; eine
+Treiberumgebung braucht dreissig. Eine Konstante anzuheben kostet den Bedarf **einer** PD mal
+`NPDS` — gemessen rund **7,7 MB je acht Slots** (`CapSlot` ~96 B, `CAP_SLOTS_TOTAL = 80 256`).
+
+Seither traegt jede PD ihre eigene Zahl, gebucht gegen einen Vorrat und beim Abbau
+**zurueckgegeben**. `SYS_LOAD` traegt die Anforderung in `MSG3` (`0` = Vorgabe, also bitgleich fuer
+jeden vorhandenen Aufrufer). Gemessen in der `budget`-Zeile:
+`Vorrat 80000 -> 79992 -> 79980 -> 80000`.
+
+**Die Rueckgabe ist die Haelfte, die entscheidet, ob es ein Konto ist.** Ein Vorrat, der nur
+schrumpft, ist von einem unter Last nicht zu unterscheiden — und nach genug PDs waere die Zusage
+„jede PD bekommt ihr Budget" uneinloesbar, ohne dass ein Zaehler es gesagt haette.
+
+Die zwei Absagen sind **getrennt gezaehlt**: „ueber `CAP_BUDGET_MAX`" und „Vorrat erschoepft" haben
+verschiedene Behebungen, und ein gemeinsamer Zaehler machte den Bericht unfaehig zu sagen, welche
+eingetreten ist. Gemessen ist, dass die erste die zweite **nicht** erhoeht.
+
+### Der Befund: `NCAPS = 16` ist der echte Deckel, nicht das Budget
+
+`CAP_BUDGET_MAX` stand auf 64. Der **lokale Cspace einer PD ist ein Array von `NCAPS` = 16 Slots**,
+und `install_cap` weist jeden Slot `>= NCAPS` ab, **ohne das Budget je zu fragen**. Ein Budget von
+20 war damit keine grosszuegige Zusage, sondern eine **unerfuellbare** — und die Absage traegt nicht
+einmal den Grund „Budget".
+
+Gefunden hat es der Selbsttest am Tag der Einfuehrung: die Zeile „auch das erhoehte Budget ist eine
+Schranke" fiel durch, weil das Auffuellen bei 16 an der **Slot**-Schranke scheiterte. *Ein
+Kriterium, das die gepruefte Sache nicht erreichen kann, ist kein strenges Kriterium, sondern gar
+keins* — und ein Deckel ueber der Struktur ist dieselbe Form. `CAP_BUDGET_MAX == NCAPS` mit
+`const _: () = assert!` daneben.
+
+Damit steht die Zahl, die eine Treiberumgebung wirklich begrenzt: **16 Slots je PD, hart.** Das
+Konto hebt die erreichbare Zahl von 8 auf 16 und kostet die anderen zehntausend PDs nichts;
+darueber hinaus braucht es einen variablen Cspace (TODO0 K1c).
+
+**Zwei eigene Messfehler, beide von der Zeile gefangen und beide dieselbe Klasse:** die Grundlinie
+wurde **nach** der ersten PD genommen (also die Differenz zu sich selbst gemessen), und die
+Schranke wurde gefragt, **bevor** das Budget ausgeschoepft war. Die Zahlen belegten den Mechanismus
+dabei bereits exakt — `80000 - 8 - 20` und nach dem Abbau wieder `80000`.
+
+---
+
+## Der Badge bekommt seine Sprechprobe (2026-08-26)
+
+Seit dem 2026-08-25 traegt `Endpoint::call` ein Badge; nachgelesen hat es **niemand**. Der
+Modell-Treue-Waechter fuer IPC hat den Umbau von selbst beanstandet (`E0061`, drei Argumente statt
+vier) — und bei der Gelegenheit steht dort jetzt die fehlende Aussage: bei **jeder** Zustellung
+wird geprueft, dass im Frame des Empfaengers das Badge **seines** Absenders steht, nicht bloss
+irgendein Wert. Dazu die Sprechprobe „es wurde ueberhaupt zugestellt" (null geprueft waere ein
+Befund) und zwei Positivkontrollen, die je einen der beiden Zustellwege auf die alte harte `0`
+zuruecksetzen. 101 Faelle, 37 Selbsttestfaelle.
+
+---
+
+## Z4d Stufe 1. Eine offene Transaktion kreuzt den Schnitt nicht (2026-08-25)
+
+Z4d liess die Wahl zwischen zwei Fassungen: „Migration nur ohne offene Transaktionen (einfach,
+ehrlich, wahrscheinlich richtig fuer Stufe 1)" oder „Endpoint-Proxys ueber das Netz (ein eigenes
+Projekt)". Gebaut ist die erste — aber nicht als Zusage, sondern als **Struktur**, und dabei ist
+die zweite Haelfte der Regel aufgefallen, die vorher niemand aufgeschrieben hatte.
+
+### Der Stand vorher war eine AUFRUFDISZIPLIN, kein Gatter
+
+`done.md` sagte zu Z4 Stufe 2 woertlich: *„Keine offenen IPC-Beziehungen (Z4d Stufe 1).
+`Scope::EMPTY`, und `freeze_thread` weist einen Thread mit offener Transaktion ohnehin ab."*
+
+Das **„ohnehin"** ist der ganze Befund. `Image::build` sah den IPC-Zustand nie. Die Stufe-1-Zusage
+hing daran, dass der Aufrufer vorher `freeze_thread` gerufen **und** seine Antwort beachtet hatte.
+Wer den Freeze vergisst, bekam einen Checkpoint — und der Thread am anderen Ende seines offenen
+`CALL` kam in keiner Zeile vor. Dieselbe Form wie `ep_inv`: *„hielt nicht der Typ, sondern die
+Aufrufdisziplin. Beides sah gruen aus."*
+
+### Die Regel ist eine AEQUIVALENZ, und die zweite Richtung hatte keinen Namen
+
+Fuer jede Rolle, die ein Thread an einem Kanal **wirklich** haelt:
+
+> **der Kanal wandert ⇔ der Thread, der dort die Rolle haelt, wandert**
+
+Beide Richtungen sind Absagen, und sie sind **verschiedene** Absagen — dieselbe Begruendung, aus
+der `LocalReason` ueberhaupt aufgeschluesselt ist:
+
+| Richtung | `CutRefusal` | behebbar durch |
+|---|---|---|
+| der Teilnehmer wandert, sein Kanal bleibt | `ChannelNotInScope` | den Kanal in den Umfang nehmen |
+| der Kanal wandert, dieser Teilnehmer bleibt | `PeerNotInScope` | den Partner aufnehmen — oder seine Transaktion abwarten |
+
+Die erste Zeile ist Z4d woertlich („ein wandernder Thread mit offenem `CALL` hat einen wartenden
+Server zurueckgelassen"). **Die zweite stand nirgends.** `Scope::endpoints` trug die Doku
+„Endpoints, deren **beide Seiten** Teil des Checkpoints sind" — eine Liste, die der Aufrufer
+hinschreibt, und niemand hat sie je gegen den IPC-Zustand der Maschine gehalten. Ein genannter
+Endpoint war **geglaubt**. Wandert er, waehrend ein Client an ihm blockiert zurueckbleibt, wartet
+der fuer immer auf einen Rendezvouspunkt, den es auf dieser Maschine nicht mehr gibt.
+
+**Warum das so lange unsichtbar blieb:** `Scope::EMPTY` hat es verdeckt. Mit leerem Umfang weist
+`classify` **jede** Beziehungs-Cap ab (`PeerNotInScope`), das ungeprueft gebliebene Stueck war von
+der einzigen Aufrufstelle aus also gar nicht erreichbar. Ein unerreichbares Loch ist eines — und
+es wird in dem Moment erreichbar, in dem ein Umfang seinen ersten Endpoint nennt. Genau dieselbe
+Klasse wie „ein Negativtest kann eine Eigenschaft absichern, die NIEMAND BENUTZT", nur andersherum.
+
+### Keine Rolle ist ausgenommen — auch die ohne Partner nicht
+
+Die bequeme Lesart waere: ein Thread in `RECV` hat **keinen** Partner (`partner_of` gibt fuer ihn
+`None`, und „einen zu erfinden waere schlimmer als keinen zu nennen"), also laesst er beim Umzug
+niemanden haengen. Er laesst **sich selbst** haengen: drueben wartet er auf einen Kanal, den er
+nicht mehr hat, und kein Wecken kann ihn je erreichen. Dieselbe Ueberlegung spiegelbildlich fuer
+den fremden Empfaenger an einem wandernden Kanal.
+
+Eine Regel, eine Aequivalenz, keine Ausnahmenliste, die mit den Rollen mitgepflegt werden muesste.
+Gemessen als `wartender-empfaenger-abgewiesen` **und** `lausch-mit-kanal-geht` — beide Richtungen,
+sonst prueft die Zeile eine Konstante.
+
+### Was gebaut ist
+
+| wo | was |
+|---|---|
+| `crates/caprock-cap/src/checkpoint.rs` | `Channel`, `EdgeRole`, `Edge`, `CutRefusal`, `classify_edge`, `classify_cut`, `BuildRefusal` — abhaengigkeitsfrei, ohne `unsafe`, host-getestet |
+| `crates/caprock-ipc/src/lib.rs` | `Role` und `Endpoint::occupants`/`Notification::occupants` — die **Aufzaehlung**, die es vorher nicht gab |
+| `kernel/src/system.rs` | `cut_edges` — die Erhebung ueber alle Kanaele, `CUT_EDGES_MAX` |
+| `kernel/src/ckptcut.rs` | die Sonde, arch-neutral, mit eigenen Traegern |
+| `tools/ckptcut-negativ.sh` | sieben Mutationen, jede an ihrem eigenen Konjunkt |
+
+**Das Gatter sitzt im ERZEUGNIS.** `Image::build` nimmt jetzt `subject` und `edges` und weist an
+der ersten kreuzenden Kante ab. Ein leerer Kantenschnipsel ist kein Schleichweg, sondern die
+Behauptung „nichts beobachtet" — und der Sammler nennt die Zahl, die er gesehen hat, damit
+„nichts gefunden" nicht als „nichts da" durchgeht.
+
+**Cap-Grund und Schnitt-Grund bleiben getrennt** (`BuildRefusal::Cap` gegen `::Cut`, Codes 20/21
+neben 0..11). Sie verlangen entgegengesetzte Reaktionen: eine MMIO-Cap wird durch Warten nie
+uebertragbar, eine offene Transaktion kann sich in einem Tick von selbst aufloesen. Zusammengelegt
+liesse die Absage jemanden auf etwas warten, das sich nicht bewegt.
+
+### Zwei Fragen, und nur eine hatte eine Antwort
+
+Der Sammler braucht **zwei Durchgaenge**, und das ist keine Bequemlichkeit:
+
+| Richtung | Frage | ueber |
+|---|---|---|
+| Teilnehmer wandert | *wo haelt **dieser Thread** eine Rolle?* | `quiescence_of` ueber alle Kanaele |
+| Kanal wandert | *wer haelt **hier** eine Rolle?* | `occupants` auf den Kanaelen im Umfang |
+
+Die zweite Frage war bis 2026-08-25 **nicht stellbar**: `quiescence_of` braucht einen Thread, den
+man schon benennen kann, und der gefaehrliche Teilnehmer ist per Konstruktion einer, den der
+Checkpoint nie aufgezaehlt hat. Nur die erste zu stellen ist genau der Weg, auf dem
+`Scope::endpoints` geglaubt statt geprueft wurde.
+
+**Die Sperrdisziplin gehoert zum Vertrag:** ein Kanal, ein `lock()`, vor dem naechsten
+freigegeben — nie eine Sperre ueber die Schleife, und kein CDT-Gang darin. `SpinLock` maskiert
+IRQs, und eine Erhebung, die sie ueber 10064 Objekte hielte, waere der `pd_haelt_dma`-Befund vom
+2026-08-21 noch einmal: dort stieg die laengste maskierte Strecke auf 3 701 562 Zyklen und machte
+die **Stopp-Latenz-Zusage des Debuggers** rot — eine Zeile ohne jeden Bezug zur Ursache.
+
+### Die Zeile, und warum `bootckpt` sie nicht ersetzen kann
+
+```
+ckptcut : ALL PASS (beziehung-steht=true lauscher-steht=true warter-steht=true
+          ruf-kante-gefunden=true offener-ruf-abgewiesen=true fremde-kante-gefunden=true
+          fremder-partner-abgewiesen=true geschlossene-beziehung-geht=true
+          lausch-kante-gefunden=true wartender-empfaenger-abgewiesen=true
+          lausch-mit-kanal-geht=true ntfn-kante-gefunden=true ntfn-abgewiesen=true
+          ntfn-mit-kanal-geht=true cap-grund-getrennt=true kanten=1/2/1/1)
+```
+
+`bootckpt` kann diese Aussage **strukturell nicht** treffen: sein Subjekt ist ein reiner
+Rechenthread ohne jede IPC-Rolle, sein Schnitt ist in jedem Lauf leer (`Schnittkanten=0` steht
+seit heute in der Zeile), und ein Gatter, das nie feuert, ist von einem fehlenden nicht zu
+unterscheiden. Die Sonde bringt deshalb ihre eigenen Traeger mit — zwei PDs, vier EL0-Threads, ein
+echter `CALL`, ein echtes `RECV`, ein echtes `WAIT` — und **wartet auf den Zustand**, statt ihn
+vorauszusetzen: ein `CALL`, dessen Server noch nicht in `RECV` steht, landet in der SENDER-Schlange
+und waere eine andere Beziehung als die beschriebene.
+
+Die drei tragenden Haelften stehen **nebeneinander in derselben Zeile, am selben Paar, im selben
+Lauf**: die Absage in die eine Richtung, die Absage in die andere, und die **Positivkontrolle**,
+dass eine ganz im Schnitt liegende Beziehung durchgeht. Ohne die dritte saehe „weist das Richtige
+ab" genau wie „weist ab" aus — und eine Regel, die jeden Checkpoint verbietet, waere nutzlos und
+in jeder Absage gruen.
+
+`kanten=1/2/1/1` ist die Sprechprobe, und sie ist gegen eine **bekannte** Kante geprueft, nicht
+gegen „mehr als null": die 2 in der Mitte sind Aufrufer **und** Antwortschuldner an demselben
+Endpoint — genau das Paar, ueber das die zweite Richtung urteilt.
+
+### Sensitivitaet
+
+Sieben Mutationen, jede an ihrem eigenen Konjunkt, jede mit einer gruen gebliebenen
+Isolationsaussage daneben (`tools/ckptcut-negativ.sh`):
+
+| Mutation | faellt | bleibt gruen |
+|---|---|---|
+| M1: die Regel ist blind fuer „Teilnehmer wandert, Kanal bleibt" | `offener-ruf-abgewiesen` | `fremder-partner-abgewiesen` |
+| M2: blind fuer „Kanal wandert, Partner bleibt" | `fremder-partner-abgewiesen` | `offener-ruf-abgewiesen` |
+| M3: `Image::build` prueft den Schnitt gar nicht | beide Absagen | `cap-grund-getrennt` |
+| M4: `Endpoint::occupants` meldet niemanden | `fremde-kante-gefunden` | `ruf-kante-gefunden`, `ntfn-kante-gefunden` |
+| M5: `occupants` meldet den Antwortschuldner nicht | `fremde-kante-gefunden` | `ruf-kante-gefunden` |
+| M6: die Regel weist **alles** ab | `geschlossene-beziehung-geht` | `offener-ruf-abgewiesen` |
+| M7: Notifications sind kein Kanal | `ntfn-kante-gefunden` | `ruf-kante-gefunden`, `warter-steht` |
+
+**M2 ist die wichtigste, und zwar aus einem Grund, der ueber diesen Eintrag hinausgeht: ein Lauf
+mit M2 ist woertlich der Stand des Baums von gestern.** Vor Z4d Stufe 1 gab es dort nichts
+abzuschalten. Bemerkenswert ist, welches Konjunkt dabei **gruen bleibt** — die alte Haelfte war
+die ganze Zeit da, und genau deshalb sah die Luecke geschlossen aus.
+
+**Und M4 hat im ersten Anlauf den BAU gebrochen statt die Eigenschaft.** Die naheliegende Fassung
+ersetzte die beiden `occupants`-**Aufrufstellen** in `cut_edges` durch `Ok(0)` — damit war der
+Fehlertyp des `if`-Ausdrucks von nichts mehr festgelegt (`E0282`), der Kernel uebersetzte nicht,
+und der Lauf hatte gar keine `ckptcut`-Zeile. Gesagt hat das die **dritte** Pruefung des Skripts
+(„kommt das Konjunkt ueberhaupt vor?"); ohne sie haette die Datei einen bestandenen Negativfall
+gemeldet, weil `false` und `nicht vorhanden` in einem `grep`-Vergleich gleich aussehen.
+Dieselbe Klasse wie „Null ist ein Befund, kein Messwert". Die Fassung, die zaehlt, sitzt jetzt in
+`Endpoint::occupants` selbst und uebersetzt.
+
+**Und M7 traf zwei Dinge statt eines.** Das Muster `for i in 0..ntfns().len() {` kommt in
+`system.rs` **zweimal** vor — das zweite Mal in `thread_quiescence`, auf dem die Sprechproben der
+Sonde selbst beruhen. Ungebunden blendete die Mutation also die Erhebung **und** den Pruefer, der
+sagt, dass die Erhebung etwas zu finden hat: zwei Dinge zugleich kaputt, und das beweist ueber
+keines etwas (die erste D9-Gegenprobe, woertlich). Aufgefallen ist es beim Nachzaehlen der
+Treffer, nicht am Ergebnis — die geprueften Konjunkte (`ntfn-kante-gefunden` faellt,
+`ruf-kante-gefunden` bleibt) waren in **beiden** Fassungen dieselben. Das `sed` ist jetzt an
+`cut_edges` gebunden, und `warter-steht` steht als gruenes Konjunkt daneben: genau die Groesse, die
+die unbegrenzte Fassung mitgerissen haette.
+
+**Die Lehre daraus ist die praktischere Haelfte des ganzen Eintrags:** ein Negativfall braucht
+nicht nur „hat das Muster getroffen?", sondern **„wie oft?"**. Ein `sed`, das zwei Stellen trifft,
+sieht in der Ergebniszeile genauso aus wie eines, das eine trifft.
+
+### Was NICHT gebaut ist
+
+* **Stufe 2** — Endpoint-Proxys ueber das Netz, damit eine Beziehung die Maschinengrenze
+  *ueberlebt*, statt verboten zu werden. Ein eigenes Projekt, und es haengt an Z4e (Transport) und
+  Z10 (Netz).
+* **Eine Zusage ueber die Zeit nach der Erhebung.** Die Kanten sind eine Momentaufnahme, solange
+  die Kanaele nicht stillgelegt sind — dieselbe Grenze wie bei `thread_quiescence`, und sie ist in
+  der Funktionsdoku ausgesprochen. Fuer das Subjekt traegt der Freeze; ein **fremder** Thread kann
+  waehrend der Erhebung eine Beziehung eingehen, dann wird der Schnitt beim naechsten Versuch
+  abgewiesen statt bei diesem. Spaeter abweisen ist sicher, faelschlich zulassen nicht.
+* **Der Umfang wird nicht ERZEUGT, nur geprueft.** Wer einen zusammenhaengenden Umfang haben will
+  („nimm den Partner mit"), muss ihn selbst hinschreiben; ein Huellen-Rechner, der die Beziehung
+  transitiv aufspannt, waere die naechste Stufe und ist bewusst nicht gebaut — er wuerde
+  entscheiden, was mitwandert, und das ist eine Autoritaetsfrage, keine Bequemlichkeit.
+* **`ckptcut` gattert nur ueber den Suiten-`check`.** `ckptcut::urteil()` ist tot — genau wie
+  `pdfreeze::urteil()` und `dbgprobe::urteil()`, was beim Anbau aus den Bau-Warnungen aufgefallen
+  ist. Steht als offener Punkt unter Z23.
+
+---
+
 ## Z26/A3 — die NUTZLAST: ein Gast macht einen umgeleiteten Syscall und SIEHT das Ergebnis (2026-08-13)
 
 **Klasse:** Kernel-Primitiv · **Stand:** die vier ursprünglich offenen Punkte „Kopieren Frame ↔

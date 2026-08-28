@@ -28,6 +28,14 @@ pub mod sys {
     pub const CCOPY: u64 = 15;
     pub const CMOVE: u64 = 16;
     pub const SETRECV: u64 = 17;
+    /// **Einen zweiten Thread in der EIGENEN PD erzeugen** (K1a/K1b) — s. [`super::spawn`].
+    pub const SPAWN: u64 = 20;
+    /// **Einen Geraeteinterrupt binden** (Stufe B, B3) — s. [`super::bind_irq`].
+    pub const BIND_IRQ: u64 = 26;
+    /// **Den eigenen Thread-Pointer setzen** (TLS) — s. [`super::set_tls`].
+    pub const SETTLS: u64 = 27;
+    /// **Die monotone Uhr lesen** (Stufe A) — s. [`super::clock`].
+    pub const CLOCK: u64 = 28;
 }
 
 /// Ergebniscodes (Register `x0` beim Austritt; Spiegel von `caprock_abi::result`).
@@ -45,9 +53,47 @@ pub mod result {
     pub const ERR_SERVER_GONE: u64 = 5;
     /// Am Cap hängen noch abgeleitete Kopien/Mints — er bleibt unverändert im Slot.
     pub const ERR_HASCHILDREN: u64 = 6;
-    /// Kein Platz: Ziel-Slot belegt oder Cap-Budget der PD erschöpft.
+    /// Kein Platz: Ziel-Slot belegt oder Cap-Budget der PD erschöpft. Bei [`super::spawn`]
+    /// zusaetzlich: die Teilregion ueberlappt den Stapel eines lebenden Geschwisterthreads.
     pub const ERR_NOSPACE: u64 = 7;
+    /// [`super::spawn`]: die PD haelt bereits so viele Threads, wie der Kernel zusagt.
+    pub const ERR_THREAD_LIMIT: u64 = 15;
+    /// [`super::spawn`]: die Region liegt in einem Fenster, das ein Geraet per DMA erreicht.
+    /// **Das ist ein Angriffsbild, kein Tippfehler** — die Ruecksprungadresse ist Daten.
+    pub const ERR_DMA_REACHABLE: u64 = 16;
+    /// [`super::spawn`]: die Region taugt nicht als Stapel (zu klein, schief ausgerichtet).
+    pub const ERR_BADSTACK: u64 = 17;
+    /// [`super::spawn`]/`cdelete`: die Cap ist der Stapel eines lebenden Threads.
+    pub const ERR_INUSE: u64 = 18;
+    /// [`super::spawn`]: die genannte **Teilregion** liegt nicht innerhalb der Cap. Absichtlich
+    /// von [`ERR_BADSTACK`] getrennt: „diese Region taugt nicht" und „du hast eine Region
+    /// genannt, die du nicht haeltst" haben verschiedene Behebungen.
+    pub const ERR_SUBREGION: u64 = 21;
+    /// [`super::load`]: der angeforderte DMA-Pool ist groesser, als eine Geraetezuteilung traegt.
+    /// **Abgewiesen, nicht gekuerzt** — s. [`super::DRIVER_DMA_MAX_PAGES`].
+    pub const ERR_DMA_TOO_LARGE: u64 = 22;
+    /// [`super::bind_irq`]: kein Platz mehr fuer eine Bindung. Die Aussage ist **lokal** —
+    /// *dieses Geraet hat keinen freien Vektor* —, und der Aufrufer wird nicht blockiert.
+    pub const ERR_IRQ_FULL: u64 = 23;
+    /// [`super::set_tls`]: der Zeiger liegt nicht in der unteren Adresshaelfte. Die Schranke
+    /// schuetzt den **Kernel** (ein `WRMSR` mit nicht-kanonischem Wert faultet in Ring 0), nicht
+    /// den Aufrufer.
+    pub const ERR_BADTLS: u64 = 24;
+    /// [`super::wait_frist`]: die Frist ist abgelaufen, **ohne** dass das Ereignis eintrat.
+    pub const ERR_TIMEOUT: u64 = 25;
 }
+
+/// **Wie viele Caps ein [`load`] hoechstens delegieren kann** — Spiegel von
+/// `caprock_abi::LOAD_MAX_DELEGATES`.
+///
+/// Gespiegelt und nicht importiert, aus demselben Grund wie alles andere in dieser Datei: diese
+/// Crate wird von **jeder** PD gelinkt und steht deshalb unter MIT/Apache. Eine Abhaengigkeit auf
+/// den AGPL-Workspace machte die ABI-Ausnahme gegenstandslos (`docs/grenze.md`).
+///
+/// **Der Preis ist zwei Gedaechtnisse fuer eine Zahl**, und er ist hier bewusst bezahlt. Laufen
+/// sie auseinander, meldet der Kernel `ERR_BADCAP` fuer eine Liste, die der Aufrufer fuer gueltig
+/// haelt — sichtbar, aber nicht selbsterklaerend.
+pub const LOAD_MAX_DELEGATES: usize = 8;
 
 /// Sub-Operationen für [`sys::PDCTL`] (Register `x2`; Spiegel von `caprock_abi::pdctl`).
 pub mod pdctl {
@@ -133,6 +179,19 @@ pub fn signal(cap: u64, badge: u64) {
 /// Auf eine Notification (Cap `cap`) warten; gibt das akkumulierte Badge zurück.
 pub fn wait(cap: u64) -> u64 {
     invoke(sys::WAIT, cap, [0; 4], 0).badge
+}
+/// **Warten mit FRIST** (Stufe A / A2) — `(Ergebniscode, Badge)`.
+///
+/// `ticks` in Timer-Ticks; `0` heisst „ohne Frist" und ist bitgleich zu [`wait`]. Laeuft die Frist
+/// ab, ohne dass signalisiert wurde, kommt [`result::ERR_TIMEOUT`] zurueck.
+///
+/// **`ERR_TIMEOUT` heisst „nichts kam", nicht „das Geraet ist tot".** Wer daraus einen Reset
+/// ableitet, waehrend die Antwort gerade zugestellt wurde, baut einen Korruptionspfad -- die
+/// Aufloesung des Rennens ist, dass das **Signal gewinnt**: ein Thread, den das Signal geweckt
+/// hat, bekommt nie `ERR_TIMEOUT`.
+pub fn wait_frist(cap: u64, ticks: u64) -> (u64, u64) {
+    let r = invoke(sys::WAIT, cap, [ticks, 0, 0, 0], 0);
+    (r.result, r.badge)
 }
 /// Synchroner Aufruf (Endpoint-Cap `cap`): senden + auf Antwort warten.
 pub fn call(cap: u64, msg: [u64; 4]) -> Ret {
@@ -288,14 +347,101 @@ pub fn unmap(cap: u64) -> u64 {
 pub fn pdctl(cap: u64, subop: u64) -> u64 {
     invoke(sys::PDCTL, cap, [subop, 0, 0, 0], 0).result
 }
-/// Programm `index` laden (Loader-Cap `cap`, delegierter Cap-Slot `delegate`, `u64::MAX`=keiner);
-/// gibt den Ergebniscode zurück.
+/// Programm `index` laden (Loader-Cap `cap`); gibt den Ergebniscode zurück.
 ///
-/// `badge` versieht die **delegierte Kopie** mit einem eigenen Etikett (`0` = Badge des Originals
-/// erben). Das ist der Weg, die Signale mehrerer Kinder auseinanderzuhalten — s. [`signal`].
-pub fn load(cap: u64, index: u64, delegate: u64, badge: u64) -> u64 {
-    invoke(sys::LOAD, cap, [index, delegate, badge, 0], 0).result
+/// `delegates` sind bis zu [`LOAD_MAX_DELEGATES`] Paare `(eigener Slot, Slot in der neuen PD)`.
+/// **Wer je Kind ein eigenes Etikett will, badgt vorher selbst** ([`ccopy`]) und delegiert die
+/// Kopie: ein Badge-Argument waere fuer acht Caps ein Parameter mit acht Bedeutungen.
+///
+/// `cap_budget` ist die Zahl der Cap-Slots, die die neue PD halten darf; `0` = Vorgabe. Ueber das
+/// Maximum oder den systemweiten Vorrat hinaus wird **abgewiesen, nicht gedeckelt** — eine
+/// stillschweigend gekuerzte PD merkt ihren Mangel erst beim ersten Cap, das nicht mehr passt.
+///
+/// `dma_pages` ist der DMA-Pool der Geraetezuteilung in Seiten; `0` = Vorgabe. Ueber
+/// [`DRIVER_DMA_MAX_PAGES`] hinaus kommt [`result::ERR_DMA_TOO_LARGE`] zurueck — **abgewiesen,
+/// nicht gekuerzt**: eine halbierte DMA-Region ist ein Geraet, das ueber ihr Ende hinausschreibt,
+/// und dieser Fehler ist still.
+pub fn load(
+    cap: u64,
+    index: u64,
+    delegates: &[(u8, u8)],
+    cap_budget: u16,
+    dma_pages: u32,
+) -> u64 {
+    if delegates.len() > LOAD_MAX_DELEGATES {
+        return result::ERR_BADCAP;
+    }
+    // Acht Paare, ein Wort. Byte `i` traegt `(Quell-Slot, Ziel-Slot)`; der Kernel liest nur die
+    // ersten `len` davon, der Rest bleibt 0 und wird nie angesehen.
+    let mut liste = 0u64;
+    let mut i = 0;
+    while i < delegates.len() {
+        let (src, dst) = delegates[i];
+        liste |= ((((src & 0x0f) << 4) | (dst & 0x0f)) as u64) << (8 * i);
+        i += 1;
+    }
+    // x5 traegt zwei Felder; die Belegung steht in `caprock_abi::load_extras` und ist hier von
+    // Hand gespiegelt (s. `LOAD_MAX_DELEGATES` fuer den Grund).
+    let extras = ((dma_pages as u64) << 16) | (cap_budget as u64);
+    invoke(sys::LOAD, cap, [index, liste, delegates.len() as u64, extras], 0).result
 }
+/// **Obergrenze des DMA-Pools einer Geraetezuteilung, in Seiten** — Spiegel von
+/// `caprock_abi::DRIVER_DMA_MAX_PAGES`. 1024 Seiten = 4 MiB. Darueber weist [`load`] mit
+/// [`result::ERR_DMA_TOO_LARGE`] ab, statt zu kuerzen.
+pub const DRIVER_DMA_MAX_PAGES: u32 = 1024;
+
+/// **Wie viele Seiten eine Teilregion hoechstens ueberspringen/umfassen kann** — die Felder des
+/// `x1`-Wortes von [`spawn`] sind je 32 Bit breit. Gespiegelt, nicht importiert (s.
+/// [`LOAD_MAX_DELEGATES`]).
+pub const SPAWN_SUB_MAX_PAGES: u64 = 0xffff_ffff;
+
+/// **Einen zweiten Thread in der EIGENEN PD erzeugen** (K1a/K1b).
+///
+/// `stack_slot` nennt eine `Memory`-Cap des Aufrufers; ihr **Ende** wird der Anfangs-Stackzeiger
+/// (Stapel wachsen nach unten). Zurueck kommt `Ok(ThreadId)` oder der Ergebniscode.
+///
+/// ## Die Teilregion — mehrere Stapel aus EINER Cap
+///
+/// `offset_pages`/`length_pages` schneiden ein Fenster aus der Cap. **`(0, 0)` heisst „die ganze
+/// Region"** und ist bitgleich zu einem Aufruf ohne Teilregion; wer vier Threads auf einer
+/// 64-KiB-Arena will, nimmt `(0,4) (4,4) (8,4) (12,4)`.
+///
+/// Der Grund, warum das nicht Bequemlichkeit ist: eine Cap je Stapel machte „wie viele Threads
+/// darf eine PD haben" zu „wie viele Cap-Slots sind noch frei" — und Threads einer PD teilen sich
+/// den Adressraum ohnehin, eine eigene Cap je Stapel kauft also **keine Isolation**.
+///
+/// Ueberlappende Fenster werden abgewiesen ([`result::ERR_NOSPACE`]); ein Fenster ausserhalb der
+/// Cap bekommt [`result::ERR_SUBREGION`].
+///
+/// Der Kernel weist die Loeschung der Stack-Cap ab, solange der Thread lebt
+/// ([`result::ERR_INUSE`]) — erst [`kill`](sys::KILL), dann [`cdelete`].
+pub fn spawn(
+    stack_slot: u64,
+    entry: usize,
+    arg: usize,
+    prio: u8,
+    offset_pages: u64,
+    length_pages: u64,
+) -> Result<u64, u64> {
+    if offset_pages > SPAWN_SUB_MAX_PAGES || length_pages > SPAWN_SUB_MAX_PAGES {
+        // Sonst schnitte das Packen die oberen Bits ab, und der Kernel bekaeme ein Fenster, das
+        // der Aufrufer nie gemeint hat -- eine Schranke, die still umlaeuft, ist keine.
+        return Err(result::ERR_SUBREGION);
+    }
+    let sub = (offset_pages << 32) | length_pages;
+    let r = invoke(
+        sys::SPAWN,
+        sub,
+        [stack_slot, entry as u64, arg as u64, prio as u64],
+        0,
+    );
+    if r.result == result::OK {
+        Ok(r.msg[0])
+    } else {
+        Err(r.result)
+    }
+}
+
 /// **Einen Cap im eigenen Cspace löschen** (Slot `slot`); gibt den Ergebniscode zurück.
 ///
 /// Braucht **kein** Cap: der eigene Cspace ist die Autorität. Ein langlebiger Dienst, der Caps per
@@ -327,6 +473,183 @@ pub fn setrecv(slot: u64) -> u64 {
 /// Thread (Tcb-Cap `cap`) beenden; gibt den Ergebniscode zurück.
 pub fn kill(cap: u64) -> u64 {
     invoke(sys::KILL, cap, [0; 4], 0).result
+}
+/// **Einen Geraeteinterrupt an eine Notification binden** (Stufe B, B3).
+///
+/// `irq` = Slot der `Irq`-Cap, `ntfn` = Slot der Notification, `badge` = das Etikett, mit dem der
+/// Kernel signalisiert. Ergebniscode; [`result::ERR_IRQ_FULL`], wenn kein Platz mehr ist — der
+/// Aufrufer wird dabei **nicht** blockiert.
+///
+/// **Es gibt kein Vektorargument, und das ist der Punkt.** Welcher Interrupt gebunden wird, sagt
+/// die Cap; eine Zahl daneben waere eine zweite Antwort auf dieselbe Frage.
+pub fn bind_irq(irq: u64, ntfn: u64, badge: u64) -> u64 {
+    invoke(sys::BIND_IRQ, irq, [ntfn, badge, 0, 0], 0).result
+}
+// ================================================================================================
+// TLS: den Block aufbauen (T4)
+// ================================================================================================
+//
+// **Hier und nur hier lebt der Unterschied zwischen Variante 1 und 2** — und dass er hier lebt und
+// nicht im Kernel, ist die Probe auf den Schnitt aus `docs/plan-tls.md`: der Kernel haelt eine
+// Zahl, das Layout ist eine ABI der Werkzeugkette.
+//
+// | | `tp` zeigt auf | Variablen | TCB |
+// |---|---|---|---|
+// | x86-64 (Variante 2) | **Ende** des Blocks | negative Offsets, `tp-size .. tp` | 8 B ab `tp`, `tp[0] = tp` |
+// | aarch64 (Variante 1) | **Anfang** | ab `tp + 16` | 16 B ab `tp`, **kein** Selbstzeiger |
+//
+// Der Selbstzeiger auf x86 ist keine Konvention um ihrer selbst willen: Ring 3 kann `FS_BASE`
+// ohne `CR4.FSGSBASE` **nicht lesen**, und `fs:[0]` ist der einzige Weg, an den eigenen
+// Thread-Pointer zu kommen. Auf aarch64 ist `TPIDR_EL0` aus EL0 direkt lesbar, deshalb gibt es
+// dort keinen.
+
+extern "C" {
+    /// Anfang des `.tdata`-Anfangsbildes (Linkerskript, T3).
+    static __tdata_start: u8;
+    /// Ende des Anfangsbildes.
+    static __tdata_end: u8;
+    /// Ende von `.tbss` — zusammen mit [`__tdata_start`] die **Gesamtgroesse** eines Blocks.
+    static __tbss_end: u8;
+}
+
+/// **Ausrichtung und Rundung des TLS-Blocks — eine Seite, und das ist gemessen.**
+///
+/// Der Uebersetzer adressiert eine thread-lokale Variable im local-exec-Modell als
+/// `tp - (aufgerundete Blockgroesse - Offset)`, und aufgerundet wird auf **`p_align` des
+/// `PT_TLS`** — eine Zahl, die die **Werkzeugkette** setzt und nicht dieses SDK. Gemessen an
+/// `virtio-blk`: `p_align = 0x1000`, auch nachdem `.tdata` im Linkerskript auf `ALIGN(16)` stand.
+///
+/// Mit 16 reservierten Byte lag die Variable deshalb **eine ganze Seite** unter ihrem Speicher:
+/// `FAR = 0x2000_2010` bei `tp = 0x2000_3010`. Kein Uebersetzungsfehler, keine Meldung -- der
+/// Treiber starb still, und sichtbar wurde es erst, als `el0-trap` ins Protokoll kam (todo D17).
+///
+/// **Reserviert wird deshalb die Seitengroesse, statt die Zahl parallel zur Wahrheit zu fuehren**
+/// (todo D16). Das kostet 4 KiB je Thread und ist der Preis dafuer, dass hier keine zweite Quelle
+/// fuer `p_align` entsteht. Verlangt eine Werkzeugkette je mehr, faultet es sichtbar -- nicht
+/// still.
+pub const TLS_ALIGN: usize = 4096;
+
+/// **Wie viele Bytes ein TLS-Puffer mindestens haben muss.**
+///
+/// Anfangsbild + `.tbss` + TCB + Spielraum fuer die Ausrichtung. Als Funktion und nicht als
+/// Konstante, weil die Groesse aus dem **gelinkten Programm** kommt und nicht aus diesem SDK.
+pub fn tls_bedarf() -> usize {
+    let anfang = core::ptr::addr_of!(__tdata_start) as usize;
+    let ende = core::ptr::addr_of!(__tbss_end) as usize;
+    // **Die AUFGERUNDETE Groesse, nicht die rohe** — der Uebersetzer rechnet gegen sie, s.
+    // [`TLS_ALIGN`]. Dazu einmal Ausrichtung (der Puffer faengt irgendwo an) und der TCB.
+    let gesamt = ende - anfang;
+    ((gesamt + TLS_ALIGN - 1) & !(TLS_ALIGN - 1)) + TLS_ALIGN + 16
+}
+
+/// **Einen TLS-Block in `puffer` aufbauen und scharfstellen.**
+///
+/// Gibt den gesetzten Thread-Pointer zurueck, oder `0`, wenn der Puffer zu klein ist oder der
+/// Kernel den Zeiger abweist ([`result::ERR_BADTLS`]).
+///
+/// **Der Puffer gehoert dem Aufrufer, und das ist der Entwurf**: ein Thread, ein Puffer. Wer zwei
+/// Threads mit demselben Puffer aufsetzt, hat kein TLS, sondern zwei Namen fuer eine Variable —
+/// und der Kernel kann das nicht bemerken, weil er das Layout nicht kennt. Genau dagegen steht die
+/// Gegenprobe M3 in `docs/plan-tls.md`.
+///
+/// # Safety
+/// `puffer` muss dem aufrufenden Thread allein gehoeren und ihn ueberleben (`static mut`, nicht
+/// Stack). Nach dem Aufruf darf niemand sonst hineinschreiben.
+pub unsafe fn tls_einrichten(puffer: *mut u8, len: usize) -> u64 {
+    let anfang = core::ptr::addr_of!(__tdata_start) as usize;
+    let bild_ende = core::ptr::addr_of!(__tdata_end) as usize;
+    let ende = core::ptr::addr_of!(__tbss_end) as usize;
+    let (bild, gesamt) = (bild_ende - anfang, ende - anfang);
+    if len < gesamt + TLS_ALIGN + 16 {
+        return 0;
+    }
+    // Ausgerichteter Anfang im Puffer.
+    let basis = ((puffer as usize) + TLS_ALIGN - 1) & !(TLS_ALIGN - 1);
+
+    #[cfg(target_arch = "x86_64")]
+    let (tp, daten) = {
+        // **Variante 2: die Daten enden GENAU bei `tp`.**
+        //
+        // Der Uebersetzer adressiert eine thread-lokale Variable als `tp - (Blockgroesse -
+        // Offset)`; bei einer einzigen `u64` also `tp - 8`. Die erste Fassung legte die Daten an
+        // `basis` und `tp` auf `basis + align_up(gesamt)` — bei `gesamt = 8` und Ausrichtung 16
+        // sind das **acht Byte Versatz**, und die Variable lag neben ihrem Speicher. Kein Absturz,
+        // keine Meldung: sie las eine genullte Stelle. Die teurere Sorte.
+        //
+        // Ausgerichtet wird deshalb `tp`, nicht der Datenanfang.
+        // **Der Block ist `align_up(gesamt, TLS_ALIGN)` gross, nicht `gesamt`** -- und das ist
+        // keine Vorsicht, sondern die Rechnung des Uebersetzers: er adressiert eine
+        // thread-lokale Variable als `tp - (aufgerundete Blockgroesse - Offset)`. Wer nur
+        // `gesamt` reserviert, laesst die Variable neben ihrem Speicher liegen; bei
+        // `p_align = 4096` faultete sie eine ganze Seite darunter (`FAR = tp - 0x1000`).
+        //
+        // [`TLS_ALIGN`] MUSS die Ausrichtung von `.tdata` im Linkerskript spiegeln. Zwei Zahlen
+        // fuer eine Tatsache -- der Kommentar dort sagt es von der anderen Seite.
+        let block = (gesamt + TLS_ALIGN - 1) & !(TLS_ALIGN - 1);
+        let tp = basis + block;
+        (tp, tp - block)
+    };
+    #[cfg(target_arch = "aarch64")]
+    let (tp, daten) = {
+        // **Variante 1: `tp` an den Anfang, 16 B TCB, Daten dahinter — AUSGERICHTET.**
+        //
+        // Das `align_up` ist kein Zierat: die Variablen liegen bei positiven Offsets ab dem
+        // ausgerichteten Blockanfang, nicht ab `tp + 16`. Mit `TLS_ALIGN` = eine Seite faellt
+        // beides auseinander, sobald jemand hier TLS benutzt -- und weil aarch64 heute keine
+        // thread-lokale Variable hat, wuerde es niemand bemerken. Genau die Sorte Fehler, die
+        // dieser Baum schon zweimal auf der jeweils ungefahrenen Architektur bezahlt hat.
+        let tp = basis;
+        (tp, (tp + 16 + TLS_ALIGN - 1) & !(TLS_ALIGN - 1))
+    };
+
+    // SAFETY: der Aufrufer sichert zu, dass `puffer[..len]` ihm allein gehoert; die Schranke oben
+    // stellt sicher, dass Bild, `.tbss` und TCB hineinpassen.
+    unsafe {
+        // **Erst den GANZEN Block nullen, dann das Bild hinein.** Andersherum bliebe der
+        // Aufrundungsrest (`block - gesamt`) uninitialisiert -- und genau dort liegen bei
+        // Variante 2 die Variablen mit den kleinsten Offsets.
+        let block = (gesamt + TLS_ALIGN - 1) & !(TLS_ALIGN - 1);
+        let _ = block;
+        #[cfg(target_arch = "x86_64")]
+        core::ptr::write_bytes(daten as *mut u8, 0, block);
+        #[cfg(target_arch = "aarch64")]
+        core::ptr::write_bytes(daten as *mut u8, 0, gesamt);
+        core::ptr::copy_nonoverlapping(anfang as *const u8, daten as *mut u8, bild);
+        #[cfg(target_arch = "x86_64")]
+        core::ptr::write_volatile(tp as *mut u64, tp as u64); // Selbstzeiger, s. o.
+        #[cfg(target_arch = "aarch64")]
+        core::ptr::write_bytes(tp as *mut u8, 0, 16); // TCB genullt
+    }
+    if set_tls(tp as u64) != result::OK {
+        return 0;
+    }
+    tp as u64
+}
+
+/// **Die monotone Uhr lesen** (Stufe A, A1) — `(Rate in Hz, aktueller Stand)`.
+///
+/// Kein Cap. **Keine Wanduhrzeit, keine Epoche, keine Frist** -- Fristen sind A2 und fassen die
+/// Blockade-Invarianten an; dieser Aufruf tut das nicht.
+///
+/// Die **Rate** ist das, was gefehlt hat: den Zaehler kann Ring 3 auf beiden Architekturen selbst
+/// lesen (`rdtsc`, `CNTVCT_EL0`) -- was es nicht wissen kann, ist, was ein Schritt wert ist.
+pub fn clock() -> (u64, u64) {
+    let r = invoke(sys::CLOCK, 0, [0; 4], 0);
+    (r.msg[0], r.msg[1])
+}
+
+/// **Den eigenen Thread-Pointer setzen** (TLS). `0` schaltet ihn ab.
+///
+/// Kein Cap: der Aufruf wirkt nur auf den aufrufenden Thread. Was hinter dem Zeiger liegt, geht
+/// den Kernel nichts an — er haelt die Zahl und sorgt dafuer, dass sie den Kontextwechsel
+/// ueberlebt.
+///
+/// **Die Aufteilung des Blocks ist ARCHITEKTURABHAENGIG** und Sache des Aufrufers:
+/// x86-64 ist Variante 2 (Zeiger ans **Ende**, Variablen bei negativen Offsets, Selbstzeiger in
+/// `tp[0]`), aarch64 ist Variante 1 (Zeiger an den **Anfang**, 16 Byte reservierter TCB,
+/// Variablen ab `tp+16`, **kein** Selbstzeiger).
+pub fn set_tls(ptr: u64) -> u64 {
+    invoke(sys::SETTLS, ptr, [0; 4], 0).result
 }
 /// Freiwilliger Zeitscheibenabtritt.
 pub fn yield_now() {

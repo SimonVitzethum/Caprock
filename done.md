@@ -39,8 +39,10 @@ Kernel schreibt den ABI-Wert in den Ergebnisframe -- dieselbe Trennung wie ueber
 **Gemessen** als zweite Haelfte der `uhr`-Zeile, auf beiden Architekturen:
 
 ```
-A2: frist-weckt=true (code=25)  nicht-zu-frueh=true (672829938 >= 224270360 Zyklen)
-    signal-gewinnt=true (code=0)  signal-frueher=true
+A2 : frist-weckt=true (code=25)   nicht-zu-frueh=true (42 >= 24 Ticks, kernelseitig)
+     signal-gewinnt=true (code=0) signal-frueher=true (504631794 < 672821426)
+A2n: zweitgrund-haelt=true (aufbau=true gefeuert=true nur-pause=true lief-nicht=true)
+     code-trotzdem=true (code=25)
 ```
 
 Vier Konjunkte, und **jedes einzelne** ist da, weil sein Nachbar allein nichts sagt:
@@ -65,12 +67,53 @@ lautet.
 Ohne die Positivkontrolle waere das nie aufgefallen: `frist-weckt=true` allein ist auch mit einem
 kaputten Abmeldepfad wahr. Das ist der Grund, warum das Dokument **beide Richtungen** vorschreibt.
 
+### A2n. Die Gegenprobe -- und sie hat zuerst die PRUEFER widerlegt (2026-08-28)
+
+`tools/fristen-negativ.sh`, vier Mutationen, alle isolierend. Die vom Dokument vorgeschriebene ist
+M1: *der Timer entfernt alle Gruende statt des einen.*
+
+**Der Aufbau ist die eigentliche Arbeit, nicht die Mutation.** An einem Thread mit **einem** Grund
+sind „entferne den einen" und „entferne alle" nicht zu unterscheiden -- die Mutation waere
+folgenlos, und ein folgenloser Negativfall belegt nichts. Die `uhr`-Zeile faehrt deshalb einen
+dritten Gang: der Kernel **pausiert** den Wartenden, waehrend er wartet. Dann stehen zwei Gruende,
+und erst dort wird der Unterschied sichtbar.
+
+**Zwei Loecher im Kern, gefunden beim BAU der Gegenprobe, nicht beim Fahren:**
+
+1. **Ein Thread mit zweitem Grund fiel durch beide Maschen.** `fristen_faellig` berichtete nur die
+   *lauffaehig* Gewordenen; wem die Frist den Grund nahm, der aber weiter pausiert war, bekam
+   **kein** `ERR_TIMEOUT` in den Frame und **keine** Abmeldung beim Objekt -- er kehrte spaeter mit
+   einem ungeschriebenen Ergebniswort aus `WAIT` zurueck. Woertlich derselbe Befund wie der der
+   Positivkontrolle, eine Lage tiefer. `out` heisst jetzt **freigegeben**, nicht *lauffaehig*;
+   eingereiht wird weiter nur bei leerer Menge (Z24). Bewacht von M4.
+2. **Der Deckel `FRISTEN_JE_TICK` stand HINTER der Wirkung.** `… && n < out.len()` war das dritte
+   Konjunkt des *Einreihens*: beim siebzehnten Wartenden eines Ticks wurde der Grund entfernt, der
+   Thread aber weder eingereiht noch berichtet -- **verloren**, nicht verzoegert. Der Kommentar
+   daneben versprach woertlich „Verloren geht keine". Der Deckel greift jetzt vor dem Entfernen.
+   *Eine benannte Kapazitaet ist erst dann eine, wenn ihr Ueberlauf gefahren oder wenigstens
+   gelesen ist.* **Nicht gefahren** -- er braucht siebzehn Threads, die Sonde hat einen.
+
+**Und zwei eigene Konjunkte, die NICHT scheitern konnten (D18, im eigenen Haus):**
+
+* `lief-nicht` blieb unter M1 **gruen**, obwohl die Mutation den Thread freigelassen hatte: fuenf
+  Ticks Zuschlag reichen einem `IDLE_PRIO`-Thread nicht, um ueberhaupt drankommen zu *koennen*.
+  Gemessen war die Einplanung. Jetzt wird auf das **Feuern** gewartet (nicht auf die Uhr) und
+  danach ein Fenster von 20 Ticks geoeffnet.
+* `nicht-zu-frueh` blieb unter M3 **gruen**, obwohl die Frist auf **einen** Tick verkuerzt war. Es
+  las die Spanne, die der EL0-Thread um sein `WAIT` gelegt hatte -- also Frist **plus Einplanung**,
+  und die Einplanung ist der groessere Summand: **240 ms fuer eine 100-ms-Frist**. „Zu frueh" war
+  strukturell unsichtbar. Der Grund stand die ganze Zeit dreissig Zeilen darueber in derselben
+  Datei: die A1-Haelfte fuehrt die 140 ms Nachhinken auf `IDLE_PRIO` als eigenen Befund.
+  Gemessen wird jetzt **kernelseitig in Ticks** (`42 >= 24`); die EL0-Zahl bleibt als *Zahl* in der
+  Zeile, weil sie die Einplanung sichtbar macht, und urteilt nicht mehr.
+
+**Nebenbefund im Werkzeug:** die Stelligkeitspruefung von `mutiere` zaehlt Zeilen, die `sed`
+**druckt** -- ein `\n` im Ersatz macht aus einem Treffer zwei und meldet „traf 2 Stellen".
+Mutationen bleiben deshalb einzeilig.
+
 ### Was NICHT gebaut ist -- und als Schuld gefuehrt wird
 
 * **Nur `WAIT` traegt eine Frist**, nicht `CALL` und nicht `PARK` (todo A2, Rest).
-* **Keine Gegenprobe.** Die vier Konjunkte haben keinen Negativfall -- nach D18 sind sie damit
-  „Pruefer, die nicht scheitern koennen", bis das Gegenteil gefahren ist. Vorgeschrieben ist im
-  Dokument die schaerfste: *der Timer entfernt alle Gruende statt des einen* (todo A2n).
 * **Der Verus-Aufwand ist offen, und zwar benannt.** Der Modell-Treue-Waechter hat `Tcb.frist`,
   `Tcb.frist_grund` und `fristen_faellig` von selbst gemeldet; sie stehen als **ausserhalb mit
   Schuld** in `tools/verus-modelltreue-sched.sh` (todo A2v). Der **Effekt** von `fristen_faellig`

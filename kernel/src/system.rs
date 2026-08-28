@@ -840,6 +840,13 @@ fn charged<R>(core: usize, sched: &mut Scheduler, f: impl FnOnce(&mut Scheduler)
 ///
 /// *Wer eine Kapazitaet einfuehrt, muss den Ueberlauf benennen* -- hier ist er Verzoegerung, nicht
 /// Verlust, und das ist der Grund, warum er ohne eigenen Fehlercode auskommt.
+///
+/// **Und dieser Satz war bis 2026-08-28 eine Behauptung.** Der Deckel stand in `fristen_faellig`
+/// hinter der Wirkung (`… && n < out.len()` als drittes Konjunkt des Einreihens): der Grund wurde
+/// entfernt, der Thread aber weder eingereiht noch berichtet -- der siebzehnte Wartende eines
+/// Ticks war **verloren**, nicht verzoegert. Der Deckel greift jetzt VOR dem Entfernen. Eine
+/// benannte Kapazitaet ist erst dann eine, wenn ihr Ueberlauf gefahren oder wenigstens gelesen
+/// worden ist.
 const FRISTEN_JE_TICK: usize = 16;
 
 fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
@@ -12205,6 +12212,24 @@ pub fn resume_thread(tid: ThreadId) -> bool {
         return true;
     }
     false
+}
+
+/// **Die Gruende, aus denen ein Thread blockiert ist** (Pruefpfad, A2n).
+///
+/// `None` heisst „nicht aufloesbar", `Some(leer)` heisst „laeuft" -- die Unterscheidung, die ein
+/// `bool` verliert. Die A2n-Sonde braucht genau sie: nach einer gefeuerten Frist muss `IPC` weg
+/// und ein danebenstehender Grund **stehen** sein, und „beide weg" von „nie gesetzt" zu trennen
+/// geht nur ueber die Menge.
+pub fn reasons_of(tid: ThreadId) -> Option<caprock_sched::BlockReasons> {
+    with_owner(tid, |s, _| s.reasons_of(tid)).map(|(r, _)| r)
+}
+
+/// **Steht an diesem Thread noch eine Frist?** (Pruefpfad, A2n.)
+///
+/// `0` heisst „keine". Ohne diese Groesse waere „der Thread lief nicht" auch dann wahr, wenn die
+/// Frist nie gefeuert haette -- ein Pruefer, der nicht scheitern kann (D18).
+pub fn frist_von(tid: ThreadId) -> u64 {
+    with_owner(tid, |s, _| Some(s.frist_von(tid))).map_or(0, |(f, _)| f)
 }
 
 /// Einen Thread pausieren (Prüfpfad).

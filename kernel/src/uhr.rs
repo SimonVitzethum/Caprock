@@ -21,11 +21,23 @@
 //! Weichen sie um mehr als die Toleranz ab, ist die Rate falsch — und zwar **egal, ob der Fehler
 //! im Syscall, in der Eichung oder im Zaehler steckt**. Genau das soll eine Messung koennen.
 //!
-//! ## Was diese Zeile NICHT sagt
+//! ## Und Stufe A / A2: die FRIST -- seit 2026-08-28 in derselben Zeile
 //!
-//! Nichts ueber **Fristen** (A2). `WAIT` hat weiterhin keine Deadline, und die Blockade-Invarianten
-//! sind unangetastet. Wer aus „die Uhr geht" auf „ein ausbleibender Interrupt ist erkennbar"
-//! schliesst, hat A1 mit A2 verwechselt.
+//! `WAIT` nimmt eine Deadline in `MSG0`. Die Frist ist ein **Wecker**, kein sechster
+//! Blockadegrund: sie entfernt genau den Grund, fuer den sie scharfgestellt wurde (Z24) -- ein
+//! sechster Grund waere D9 woertlich, mit der Uhr als Ausloeser.
+//!
+//! Gemessen wird in **drei** Gaengen, und keiner ist entbehrlich:
+//!
+//! | Gang | Aussage | ohne ihn waere … |
+//! |---|---|---|
+//! | ohne Signal | `ERR_TIMEOUT`, und nicht zu frueh | … ein Wecker, der NIE feuert, ununterscheidbar |
+//! | mit Signal | `OK`, und frueher | … „das Signal gewinnt" unbelegt |
+//! | mit zweitem Grund | `IPC` faellt, `PAUSE` bleibt, er laeuft nicht -- und bekommt den Code doch | … die vom Plan verlangte Gegenprobe folgenlos |
+//!
+//! Der dritte Gang ist der, den `docs/linux-kompatibilitaet-caprock.md` fordert: *der Timer
+//! entfernt alle Gruende statt des einen*. An einem Thread mit nur einem Grund ist diese Mutation
+//! **wirkungslos** -- deshalb pausiert der Kernel den Wartenden, waehrend er wartet.
 
 use crate::system;
 use caprock_hal::println;
@@ -56,11 +68,18 @@ const P_T_TICKS: u64 = 0x38; // wie lange es gedauert hat, in Zaehlschritten
 const P_S_CODE: u64 = 0x40; // Ergebnis des Wartens MIT Signal (erwartet: OK)
 const P_S_TICKS: u64 = 0x48; // dito
 const P_A2_FERTIG: u64 = 0x50;
+// --- A2n: der ZWEITE Grund ---------------------------------------------------------------------
+const P_P_START: u64 = 0x60; // der Thread geht gleich in das dritte Warten
+const P_P_CODE: u64 = 0x68; // dessen Ergebnis -- `0` heisst „er lief noch nicht"
 /// Der Kernel gibt das A1-Fenster frei -- **erst danach** darf der Thread in eine Frist gehen.
 const P_A1_ENDE: u64 = 0x58;
 /// Die Frist der Sonde, in Ticks. Kurz genug, dass der Lauf nicht haengt; lang genug, dass der
 /// Unterschied zwischen „Frist" und „Signal" in der Messung sichtbar wird.
 const FRIST_TICKS: u64 = 10;
+/// Die Frist des A2n-Ganges. **Laenger als [`FRIST_TICKS`]**, weil der Kernel dazwischen
+/// pausieren muss: feuerte sie, bevor die Pause steht, maesse die Zeile den Normalfall noch
+/// einmal statt des Falls mit zwei Gruenden.
+const FRIST_PAUSE_TICKS: u64 = 30;
 
 /// **Wie breit das Messfenster ist**, in Ticks des Kernels.
 ///
@@ -175,6 +194,18 @@ extern "C" fn messer(arg: usize) -> ! {
     schreib(P_S_CODE, code2);
     schreib(P_S_TICKS, b2 - a2);
     schreib(P_A2_FERTIG, 1);
+
+    // --- A2n: dritter Gang, mit einem ZWEITEN Grund -------------------------------------------
+    //
+    // Der Kernel pausiert diesen Thread, waehrend er hier wartet. Dann stehen zwei Gruende
+    // (`IPC` und `PAUSE`), und die Frist darf **nur ihren eigenen** nehmen. Laeuft er trotzdem
+    // los, schreibt er `P_P_CODE` waehrend der Pause -- und genau das sieht die Zeile.
+    //
+    // `0` heisst „noch nicht gelaufen": der Ergebniscode ist `ERR_TIMEOUT` = 25, nie 0.
+    schreib(P_P_START, 1);
+    // SAFETY: User-Kontext.
+    let code3 = unsafe { user_wait_frist(ntfn, FRIST_PAUSE_TICKS) };
+    schreib(P_P_CODE, code3);
 
     loop {
         // SAFETY: User-Kontext.
@@ -296,12 +327,12 @@ pub fn messen() {
         return;
     };
     system::bind_pd_parked(&p, pd);
-    if system::admit(p).is_none() {
+    let Some(tid) = system::admit(p) else {
         println!("uhr    : SKIP (Messthread nicht zulassbar)");
         UHR_OK.uebersprungen();
         let _ = system::free_pd_slot(pd);
         return;
-    }
+    };
 
     // Auf „er laeuft" warten -- die Sprechprobe VOR der Messung.
     let mut w = 0;
@@ -384,12 +415,87 @@ pub fn messen() {
     let t_dauer = lies(param, P_T_TICKS);
     let s_code = lies(param, P_S_CODE);
     let s_dauer = lies(param, P_S_TICKS);
-    let frist_zyklen = if hz > 0 { FRIST_TICKS * hz / crate::TICK_HZ } else { u64::MAX };
+
+    // --- A2n: die Frist nimmt GENAU ihren Grund ------------------------------------------------
+    //
+    // **Die vom Plan vorgeschriebene Gegenprobe braucht diesen Aufbau**, sonst ist sie folgenlos:
+    // ein Thread mit nur EINEM Grund sieht bei „entferne den einen" und „entferne alle" gleich
+    // aus. Gemessen wird deshalb an einem Thread mit ZWEI Gruenden -- `IPC` (sein Warten) und
+    // `PAUSE` (von aussen gesetzt, waehrend er wartet).
+    //
+    // Zwei Aussagen, und die zweite hat beim Bau dieser Zeile ein Loch aufgedeckt:
+    //   1. `zweitgrund-haelt` -- die Frist feuert, `IPC` faellt, `PAUSE` bleibt, er laeuft NICHT.
+    //   2. `code-trotzdem`    -- und er bekommt sein `ERR_TIMEOUT` **doch**. Bis 2026-08-28
+    //      berichtete `fristen_faellig` nur die lauffaehig Gewordenen; dieser Thread bekam also
+    //      weder einen Code in den Frame noch eine Abmeldung beim Objekt und kehrte spaeter mit
+    //      einem ungeschriebenen Ergebniswort aus `WAIT` zurueck.
+    let mut w = 0;
+    while w < 40 && lies(param, P_P_START) == 0 {
+        warte(1);
+        w += 1;
+    }
+    // **Erst pausieren, wenn er wirklich wartet.** Die stehende Frist ist dafuer die Anzeige: sie
+    // wird im `WAIT`-Arm gesetzt, existiert also genau dann, wenn er drin ist.
+    let mut w = 0;
+    while w < 40 && system::frist_von(tid) == 0 {
+        warte(1);
+        w += 1;
+    }
+    let t_arm = jetzt_ticks();
+    let a2n_aufbau = system::frist_von(tid) != 0 && system::pause_thread(tid);
+    // **Auf das Feuern warten, nicht auf die Uhr.** Ein festes `warte(Frist + 5)` maesse die
+    // Zeitspanne mit derselben Uhr, mit der die Frist gestellt wurde -- und liesse offen, ob sie
+    // ueberhaupt gefeuert hat oder das Fenster nur zu kurz war.
+    let mut w = 0;
+    while w < FRIST_PAUSE_TICKS * 3 && system::frist_von(tid) != 0 {
+        warte(1);
+        w += 1;
+    }
+    let frist_dauer = jetzt_ticks() - t_arm;
+    // **Und JETZT ein grosszuegiges Fenster**, in dem ein faelschlich freigegebener Thread liefe.
+    //
+    // Die erste Fassung nahm `warte(Frist + 5)` und las danach sofort: fuenf Ticks Zuschlag sind
+    // fuer einen Thread auf `IDLE_PRIO` zu wenig, und die M1-Gegenprobe hat es gefangen --
+    // `lief-nicht` blieb **true**, obwohl die Mutation ihn freigelassen hatte. Ein Konjunkt, das
+    // gruen bleibt, weil der Beobachtete noch nicht drankam, misst die Einplanung.
+    warte(20);
+    let gruende = system::reasons_of(tid);
+    let frist_gefeuert = system::frist_von(tid) == 0;
+    // **Die Menge, nicht ein Bit.** `enthaelt(PAUSE)` allein liesse offen, ob `IPC` noch steht;
+    // die Gleichheit sagt beides in einer Aussage: der eine Grund ist weg, der andere steht.
+    let nur_pause = gruende.map(|g| g.bits()) == Some(caprock_sched::BlockReasons::PAUSE);
+    let lief_nicht = lies(param, P_P_CODE) == 0;
+    let zweitgrund_haelt = a2n_aufbau && frist_gefeuert && nur_pause && lief_nicht;
+    // Jetzt die Pause aufheben -- und nachsehen, was aus dem Warten geworden ist.
+    system::resume_thread(tid);
+    let mut w = 0;
+    while w < 40 && lies(param, P_P_CODE) == 0 {
+        warte(1);
+        w += 1;
+    }
+    let p_code = lies(param, P_P_CODE);
+    let code_trotzdem = p_code == caprock_abi::result::ERR_TIMEOUT;
 
     let frist_weckt = t_code == caprock_abi::result::ERR_TIMEOUT;
-    // **Nicht frueher als die Frist.** Ein Wecker, der sofort feuert, saehe an `t_code` allein
-    // genauso aus -- und waere kein Warten, sondern ein Rueckgabewert.
-    let frist_nicht_zu_frueh = t_dauer >= frist_zyklen * 8 / 10;
+    // **Nicht frueher als die Frist -- und vom KERNEL gemessen, in Ticks.**
+    //
+    // Die erste Fassung nahm die Zeitspanne, die der EL0-Thread selbst um sein `WAIT` gelegt hat
+    // (`t_dauer >= frist_zyklen * 8 / 10`). Die M3-Gegenprobe hat sie widerlegt: eine auf **einen**
+    // Tick verkuerzte Frist liess das Konjunkt **gruen**. Der Grund steht schon in der A1-Haelfte
+    // dieser Datei -- der Thread laeuft auf `IDLE_PRIO` und hinkt rund 140 ms nach. Gemessen wurde
+    // also Frist **plus Einplanung**, und die Einplanung ist der groessere Summand: 240 ms fuer
+    // eine 100-ms-Frist. Damit konnte das Konjunkt „zu frueh" strukturell nicht sehen -- ein
+    // Pruefer, der nicht scheitern kann (D18), im eigenen Haus.
+    //
+    // Der Kernel dagegen sieht das Entwaffnen unmittelbar: `frist_von` wird beim Feuern genullt,
+    // und er pollt im Tick-Takt. `t_dauer` bleibt als **Zahl** in der Zeile, weil sie die
+    // Einplanung sichtbar macht -- aber sie urteilt nicht mehr.
+    //
+    // **Beidseitig, obwohl nur eine Schranke dasteht.** Die untere ist der Vergleich; die obere
+    // ist `frist_gefeuert` -- die Warteschleife oben laeuft hoechstens `FRIST_PAUSE_TICKS * 3`,
+    // eine Frist, die dreimal zu spaet feuert, kommt gar nicht erst hierher. Ein einseitiger
+    // Schwellenvergleich waere gruen, sobald die Messung ausfaellt.
+    let frist_nicht_zu_frueh = frist_gefeuert && frist_dauer >= FRIST_PAUSE_TICKS * 8 / 10;
     let signal_gewinnt = s_code == caprock_abi::result::OK;
     // **Und es war frueher.** Ohne diese Zahl waere „das Signal gewinnt" auch dann wahr, wenn in
     // Wahrheit wieder die Frist gefeuert haette und nur der Code stimmte.
@@ -402,16 +508,22 @@ pub fn messen() {
         && frist_weckt
         && frist_nicht_zu_frueh
         && signal_gewinnt
-        && signal_frueher;
+        && signal_frueher
+        && zweitgrund_haelt
+        && code_trotzdem;
     println!(
         "uhr    : {} (lief={lief} rate={hz} Hz rate-plausibel={rate_plausibel} \
          zaehler-waechst={zaehler_waechst} uhr={us_uhr}us tick={us_tick}us \
          abweichung={abweichung}% <= {TOLERANZ_PROZENT}% passt-zum-tick={passt_zum_tick} \
          el0-zaehler-delta={u_delta} (darf nachhinken, nicht ueberholen) \
          | A2: frist-weckt={frist_weckt} (code={t_code}, erwartet {}) \
-         nicht-zu-frueh={frist_nicht_zu_frueh} ({t_dauer} >= {} Zyklen) \
+         nicht-zu-frueh={frist_nicht_zu_frueh} ({frist_dauer} >= {} Ticks, kernelseitig; \
+         der EL0-Thread mass {t_dauer} Zyklen -- Frist PLUS Einplanung, urteilt nicht) \
          signal-gewinnt={signal_gewinnt} (code={s_code}) signal-frueher={signal_frueher} \
          ({s_dauer} < {t_dauer}) \
+         | A2n: zweitgrund-haelt={zweitgrund_haelt} (aufbau={a2n_aufbau} gefeuert={frist_gefeuert} \
+         nur-pause={nur_pause} lief-nicht={lief_nicht}) code-trotzdem={code_trotzdem} \
+         (code={p_code}) \
          -- A1: gemessen wird NICHT, ob der Syscall dieselbe Zahl liefert wie die HAL (das waere \
          zirkulaer und bei falscher Eichung genauso gruen), sondern ob die ueber die ABI gemeldete \
          Rate zur ZWEITEN Uhr des Systems passt. A2 misst BEIDE Richtungen: ohne Signal muss die \
@@ -419,7 +531,7 @@ pub fn messen() {
          kaputten Wecker wahr)",
         if ok { "ALL PASS" } else { "FAILURES" },
         caprock_abi::result::ERR_TIMEOUT,
-        frist_zyklen * 8 / 10
+        FRIST_PAUSE_TICKS * 8 / 10
     );
     UHR_OK.gemessen(ok);
 }

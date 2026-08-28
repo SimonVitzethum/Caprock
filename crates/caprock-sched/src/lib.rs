@@ -1230,10 +1230,12 @@ impl Scheduler {
         }
     }
 
-    /// **Faellige Fristen abarbeiten** -- gibt die geweckten Threads zurueck.
+    /// **Faellige Fristen abarbeiten** -- gibt die **freigegebenen** Threads zurueck.
     ///
-    /// Der Aufrufer (Kernel) schreibt ihnen `ERR_TIMEOUT` in den Ergebnisframe; diese Crate kennt
-    /// die ABI nicht und soll sie nicht kennen.
+    /// *Freigegeben*, nicht *lauffaehig*: berichtet wird jeder, dem die Frist ihren Grund
+    /// genommen hat, auch wenn danach noch einer steht und er deshalb nicht laeuft. Der Aufrufer
+    /// (Kernel) schreibt allen `ERR_TIMEOUT` in den Ergebnisframe und meldet sie beim Objekt ab;
+    /// diese Crate kennt die ABI nicht und soll sie nicht kennen.
     ///
     /// **Entfernt wird GENAU der bewachte Grund**, nie die ganze Menge. Ein Thread, der zusaetzlich
     /// pausiert oder erschoepft ist, bleibt es -- sonst waere die Uhr ein Generalschluessel, und
@@ -1255,6 +1257,18 @@ impl Scheduler {
                 }
                 continue;
             }
+            // **Der Deckel greift VOR der Wirkung, nicht danach.** Stand er hinter dem
+            // `remove`, waere der Grund entfernt, der Thread aber weder eingereiht noch
+            // berichtet -- er liefe nie wieder, und der Aufrufer schriebe ihm keinen Code.
+            // Das waere ein **verlorener** Thread und keine Verzoegerung; die Zusage lautet
+            // aber Verzoegerung. Hier bleibt `frist` stehen, `naechste` zieht den Wert mit,
+            // und der naechste Tick nimmt ihn erneut auf.
+            if n == out.len() {
+                if f < naechste {
+                    naechste = f;
+                }
+                continue;
+            }
             let grund = self.tcbs[i].frist_grund;
             self.tcbs[i].frist = 0;
             self.tcbs[i].frist_grund = 0;
@@ -1266,20 +1280,30 @@ impl Scheduler {
             // Das ist die teure Haelfte der Entscheidung: ein Treiber, der `ERR_TIMEOUT` als
             // „Geraet tot" liest und zuruecksetzt, waehrend die Antwort gerade zugestellt wurde,
             // ist ein **Korruptionspfad** und kein Haenger. Deshalb bekommt nur ein Thread den
-            // Code, den die Frist WIRKLICH freigegeben hat -- die Liste `out` traegt genau die.
+            // Code, den die Frist WIRKLICH freigegeben hat.
             if !self.tcbs[i].reasons.enthaelt(grund) {
                 continue;
             }
             // **Nur DIESEN Grund.** Steht danach noch einer, laeuft der Thread nicht -- und das
             // ist richtig: die Frist sagt „warte nicht laenger auf X", nicht „laufe".
             self.tcbs[i].reasons.remove(grund);
-            // **Eingereiht wird NUR bei leerer Menge** (Z24). Ohne diesen Halbsatz waere die
-            // Grund-Menge bloss eine andere Schreibweise fuer dieselben Bits.
-            if self.tcbs[i].reasons.is_empty() && self.tcbs[i].queued == NOT_QUEUED && n < out.len()
-            {
+            // **`out` heisst FREIGEGEBEN, nicht LAUFFAEHIG -- und das sind zwei Dinge.**
+            //
+            // Die erste Fassung berichtete nur, wen die Frist auch lauffaehig gemacht hat. Ein
+            // Thread, der zusaetzlich pausiert (oder erschoepft, eingefroren, angehalten) ist,
+            // fiel damit durch beide Maschen: er bekam **kein** `ERR_TIMEOUT` in den Frame und
+            // wurde **nicht** beim Objekt abgemeldet. Er kehrte spaeter aus `WAIT` mit einem
+            // Ergebniswort zurueck, das niemand geschrieben hat, und stand bis dahin weiter im
+            // Wartefeld seiner Notification.
+            //
+            // Das ist woertlich derselbe Befund, den die A2-Positivkontrolle gefunden hat --
+            // nur eine Lage tiefer: dort traf er den Normalfall, hier den Fall mit einem
+            // zweiten Grund. Die Bedingung fuer den **Bericht** ist deshalb das Entfernen des
+            // Grundes, die fuer das **Einreihen** die leere Menge (Z24).
+            out[n] = self.id(i);
+            n += 1;
+            if self.tcbs[i].reasons.is_empty() && self.tcbs[i].queued == NOT_QUEUED {
                 self.enqueue_ready(i);
-                out[n] = self.id(i);
-                n += 1;
             }
         }
         self.naechste_frist = naechste;

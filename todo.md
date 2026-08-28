@@ -113,9 +113,9 @@ hier und nicht in einem Commit.
 
 ## A2. Fristen — der Rest (2026-08-28)
 
-**Klasse:** Kern-Primitiv · **Stand:** `[~]` — `WAIT` gemessen (s. `done.md`), vier Stuecke offen.
-**Vier getrennte Punkte, weil sie verschieden schwer sind.** Sie in einem zu fuehren, hiesse den
-teuersten hinter dem billigsten zu verstecken.
+**Klasse:** Kern-Primitiv · **Stand:** `[~]` — `WAIT` gemessen und gegengeprueft (s. `done.md`),
+**drei** Stuecke offen (A2n ist seit dem 2026-08-28 zu). **Getrennt gefuehrt, weil sie verschieden
+schwer sind.** In einem Punkt zusammengefasst versteckte sich der teuerste hinter dem billigsten.
 
 **A2 (Rest). `CALL` und `PARK` tragen keine Frist.** Gebaut ist genau eine Aufrufstelle von
 `frist_setzen` -- die im `WAIT`-Arm. Der Fall, der A2 ueberhaupt begruendet (ein Treiber wartet auf
@@ -125,14 +125,11 @@ haengt eine Antwortpflicht daran -- eine abgelaufene Frist darf den Server nicht
 Reply-Recht auf einen Thread zuruecklassen, der nicht mehr wartet. Genau die Form, die bei `WAIT`
 den `ERR_EP_FULL`-Befund erzeugt hat, nur mit einer zweiten Partei.
 
-**A2n. Die Gegenprobe fehlt — und damit sind die vier Konjunkte D18-verdaechtig.**
-Vorgeschrieben ist im Dokument die schaerfste Fassung: *der Timer entfernt alle Gruende statt des
-einen* -- ein danebenliegender, aus anderem Grund geparkter Thread muss losfallen, **und eine
-zweite Sonde muss das sehen**. Der zweite Halbsatz ist die eigentliche Arbeit: ohne einen zweiten
-Wartenden mit einem *anderen* Grund ist die Mutation folgenlos, und ein folgenloser Negativfall
-belegt nichts. Dazu die billigen drei: Wecker feuert nie (`frist-weckt` faellt), Wecker feuert
-sofort (`nicht-zu-frueh` faellt), Frist gewinnt gegen das Signal (`signal-gewinnt` faellt).
-Ziel: `tools/fristen-negativ.sh`.
+**A2n ist ERLEDIGT** (2026-08-28, `tools/fristen-negativ.sh`, 4 von 4 isolierend) -- s. `done.md`.
+Was daran offen BLEIBT, ist eine Sache: **der Ueberlauf von `FRISTEN_JE_TICK` ist gelesen, nicht
+gefahren.** Er braucht siebzehn Threads mit Fristen im selben Tick; die Sonde hat einen. Der Fehler
+darin (Grund entfernt, Thread weder eingereiht noch berichtet -- also *verloren* statt *verzoegert*,
+gegen die Zusage im Kommentar daneben) ist behoben und **unbewacht**.
 
 **A2c. Das Rennen ist entschieden, aber nicht getroffen.** Die Aufloesung steht (*das Signal
 gewinnt*) und ist implementiert; die Sonde signalisiert jedoch **vor** dem Warten, trifft das
@@ -167,13 +164,13 @@ unbepreist geblieben; neu ist nur, dass jetzt benannt ist, **wofuer**.
 
 ## D18. Pruefer, die nicht scheitern KOENNEN — die Klasse, die mit jedem Lauf glaubwuerdiger wird
 
-**Klasse:** Pruefwesen · **Stand:** fuenf Instanzen bekannt, kein Durchgang. **Nicht D16.**
+**Klasse:** Pruefwesen · **Stand:** **zehn** Instanzen bekannt, kein Durchgang. **Nicht D16.**
 
 Der Unterschied im Fehlerbild entscheidet: eine falsche Zahl (D16) wird irgendwann rot. Ein Pruefer,
 der **nicht scheitern kann**, meldet dauerhaft gruen — und je laenger er das tut, desto mehr
 Vertrauen traegt er. Er wird nicht entdeckt, er wird zitiert.
 
-Fuenf Instanzen, alle belegt:
+Zehn Instanzen, alle belegt:
 
 | Fall | was aussah wie eine Pruefung |
 |---|---|
@@ -185,6 +182,16 @@ Fuenf Instanzen, alle belegt:
 | **`getrennt`** (2026-08-27) | verglich zwei Adressen, die der PRUEFER gewaehlt hatte -- schwieg ein Thread, stand dort `0`, und `0 != b0` las sich als „getrennt". **Wahr, weil nichts passiert ist** |
 | **`konjunkt()`** (2026-08-27) | der Extraktor der Gegenprobe las die **falsche Zeile** (`irtevgb` hat ein gleichnamiges `getrennt=true`, `head -1` nahm dessen Wert) -- zwei Laeufe lang ein Fehlalarm |
 | **M2, erste Fassung** (2026-08-27) | die Mutation zerstoerte etwas **Harmloses**; eine Gegenprobe, die nichts kaputtmacht, belegt nichts |
+| **`nicht-zu-frueh`** (2026-08-28) | las die Spanne, die der EL0-Thread um sein `WAIT` legte -- also Frist **plus Einplanung**, und auf `IDLE_PRIO` ist die Einplanung der groessere Summand (240 ms fuer eine 100-ms-Frist). Eine auf **einen** Tick verkuerzte Frist liess es gruen: „zu frueh" war strukturell unsichtbar |
+| **`lief-nicht`** (2026-08-28) | mass ein Fenster von fuenf Ticks, in dem ein `IDLE_PRIO`-Thread gar nicht drankommen KANN -- gruen, weil der Beobachtete noch nicht lief |
+
+**Die zwei vom 2026-08-28 sind die lehrreichsten, weil sie ZWEI TAGE nach diesem Eintrag entstanden
+sind** -- in der Sonde, deren Gegenprobe sie dann gefunden hat. Beide haben dieselbe Wurzel, und die
+ist in dieser Datei schon zweimal aufgeschrieben: **eine Groesse, die der gemessene Pfad
+mitbestimmt.** Der EL0-Thread laeuft auf `IDLE_PRIO`; jede Zeitspanne, die *er* um einen Vorgang
+legt, enthaelt seine eigene Einplanung, und die dominiert. Der Befund stand dreissig Zeilen weiter
+oben in derselben Datei -- die A1-Haelfte fuehrt die 140 ms Nachhinken ausdruecklich als Ergebnis.
+**Gemessen wird jetzt kernelseitig, in Ticks.**
 
 **Das Gegenmittel ist in beiden Faellen dasselbe: die PRAEMISSE pruefen, nicht nur den Schluss.**
 Die Trefferzahl im Mutationswerkzeug und M8 sind zwei Instanzen davon — das eine prueft, dass die

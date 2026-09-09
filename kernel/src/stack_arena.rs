@@ -58,6 +58,113 @@ pub const KERN_STACK: usize = 64 * 1024;
 /// Granularitaet der Identitaetskarte oberhalb 16 MiB (HAL: `TWO_MIB`).
 pub const BLOCK_2M: usize = 2 * 1024 * 1024;
 
+/// Private Region einer isolierten PD in Byte.
+///
+/// Spiegel von `hal::mmu::PRIV_REGION_SIZE` (dort 64 KiB auf beiden Architekturen) — wie
+/// `X86_KSTACK`/`AARCH64_KSTACK` ein Spiegel von `system::USER_KSTACK_SIZE`: dieses Modul ist
+/// absichtlich abhaengigkeitsfrei, damit die Vergabelogik per `rustc --test` auf dem Wirt
+/// pruefbar bleibt. Wer den HAL-Wert aendert, nimmt diesen hier mit (und umgekehrt).
+pub const PRIV_REGION: usize = 64 * 1024;
+
+/// Absolute Obergrenze der Arena-Plaetze — ein Deckel, kein Ziel.
+///
+/// Begrenzt die einzelne zusammenhaengende Frueh-Allokation (16 384 × 8 KiB = 128 MiB auf x86,
+/// 16 384 × 20 KiB = 320 MiB auf aarch64) und die Bitmap (256 Worte aus Boot-RAM statt BSS).
+/// Die Zahl liegt ueber der PD-Tabelle (`NPDS` = 10 000): wer sie reisst, hat mehr Faeden als
+/// das 1,6-fache an Adressraeumen — Faeden jenseits des Deckels laufen ueber den Streupfad
+/// (benannt abgewiesen, nicht still verloren).
+pub const ARENA_DECKEL_PLAETZE: usize = 16_384;
+
+/// Begrenzungsgruende der Platzableitung ([`arena_plaetze`]) — Telemetrie, keine Mangel-Codes.
+///
+/// Bewusst getrennt vom Mangel-Melder: der zaehlt seine Stellen zur Bauzeit ueber den Quelltext,
+/// und jede neue Stelle dort braeche eine fremde Zusicherung (`SWEEP_KMAX`-Summe in `bringup.rs`).
+/// Diese Gruende nennt der Plan, nicht der Fehlschlag.
+/// Die Thread-Slots waren das Minimum — keine Kappung, der schoenste Fall.
+pub const GRUND_THREADS: u32 = 0;
+/// Das freie Boot-RAM traegt nicht mehr volle PDs (s. [`volle_pd_kosten`]).
+pub const GRUND_RAM: u32 = 1;
+/// Die Guard-Splits tragen nicht mehr Slots (nur wo Wachen echt sind).
+pub const GRUND_GUARD: u32 = 2;
+/// Der absolute Deckel ([`ARENA_DECKEL_PLAETZE`]) hat gegriffen.
+pub const GRUND_DECKEL: u32 = 3;
+/// Die zusammenhaengende Spanne war nicht allozierbar (Plan stand, RAM reichte doch nicht).
+pub const GRUND_SPANNE: u32 = 4;
+/// Die Bitmap war nicht allozierbar.
+pub const GRUND_BITMAP: u32 = 5;
+/// Die Konstruktion traegt nicht (unreachable by construction — Basis/Ausrichtung/Laenge
+/// kommen aus einer einzigen Allokation; fail-closed statt Panik).
+pub const GRUND_GEOMETRIE: u32 = 6;
+
+/// Klartext zum Begrenzungsgrund — damit die Telemetrie keine Zahl bleibt.
+pub const fn grund_name(grund: u32) -> &'static str {
+    match grund {
+        GRUND_THREADS => "Thread-Slots (keine Kappung)",
+        GRUND_RAM => "Boot-RAM (nicht mehr volle PDs)",
+        GRUND_GUARD => "Guard-Splits (nicht mehr bewachbare Slots)",
+        GRUND_DECKEL => "absoluter Deckel",
+        GRUND_SPANNE => "Spanne nicht allozierbar",
+        GRUND_BITMAP => "Bitmap nicht allozierbar",
+        GRUND_GEOMETRIE => "Konstruktion traegt nicht",
+        _ => "unbekannt",
+    }
+}
+
+/// Volle Kosten EINER isolierten PD mit Faden in Byte: private Region + Kernel-Stack mit Wache
+/// (`schritt`) + drei Seitentabellen-Rahmen (L1, L2, x86-Rueckkanal).
+///
+/// aarch64 braucht nur zwei Rahmen — die Einheit nimmt drei, und die Richtung des Irrtums steht
+/// hier: die Arena wird eher kleiner, nie groesser als das RAM traegt.
+pub const fn volle_pd_kosten(schritt: usize) -> u64 {
+    (PRIV_REGION + schritt + 3 * SEITE) as u64
+}
+
+/// Arena-Plaetze aus (Faeden, RAM, Guard-Vorrat, Deckel) ableiten — statt einer Fixzahl.
+///
+/// * `threads`: Thread-Slots des Systems — mehr Plaetze als Faeden sind unbindbar.
+/// * `freie_bytes`/`kosten_je_pd`: das RAM traegt so viele VOLLE PDs (s. [`volle_pd_kosten`]) —
+///   die Arena haelt Kernel-Stacks fuer Faeden, und jeder Faden kostet im schlimmsten Fall
+///   (isolierte PD) eine volle PD. Wer mehr Stacks versprach, als PDs je entstehen koennen,
+///   legte RAM fuer Faeden zurueck, deren Adressraum nie existiert.
+/// * `guard_plaetze`: `Some(n)` wo Wachen echt sind (x86) — ein Slot ohne legbare Wache wird
+///   beim Bestuecken gesperrt und waere belegtes, nie nutzbares RAM. `None` wo `guard_unmap`
+///   nur zaehlt (aarch64) — dort begrenzt kein Split.
+/// * `deckel`: absolute Obergrenze (s. [`ARENA_DECKEL_PLAETZE`]).
+///
+/// Gibt `(plaetze, grund)`; `grund` nennt das Minimum. Bei Gleichstand gilt die Reihenfolge
+/// `THREADS` vor `GUARD` vor `RAM` vor `DECKEL` — der schoenste Fall zuerst, der Deckel zuletzt.
+pub const fn arena_plaetze(
+    threads: usize,
+    freie_bytes: u64,
+    kosten_je_pd: u64,
+    guard_plaetze: Option<usize>,
+    deckel: usize,
+) -> (usize, u32) {
+    let ram = if kosten_je_pd == 0 {
+        usize::MAX
+    } else {
+        let n = freie_bytes / kosten_je_pd;
+        if n > usize::MAX as u64 {
+            usize::MAX
+        } else {
+            n as usize
+        }
+    };
+    let guard = match guard_plaetze {
+        Some(n) => n,
+        None => usize::MAX,
+    };
+    if threads <= ram && threads <= guard && threads <= deckel {
+        (threads, GRUND_THREADS)
+    } else if guard <= ram && guard <= deckel {
+        (guard, GRUND_GUARD)
+    } else if ram <= deckel {
+        (ram, GRUND_RAM)
+    } else {
+        (deckel, GRUND_DECKEL)
+    }
+}
+
 /// Benannte Absage statt `None`/`bool`: der Aufrufer (`system.rs`) meldet sie als Mangel weiter.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ArenaFehler {
@@ -521,5 +628,73 @@ mod tests {
         let s3 = a.stapelbasis_von_slot(3).unwrap();
         assert!(a.freigeben(s3).is_ok());
         assert!(!a.ist_vergeben(s3));
+    }
+
+    #[test]
+    fn volle_pd_kosten_beider_architekturen() {
+        // x86: 64 KiB privat + 8 KiB Schritt + 3 × 4 KiB Tabellen = 84 KiB.
+        assert_eq!(volle_pd_kosten(SEITE + X86_KSTACK), 84 * 1024);
+        // aarch64: 64 KiB privat + 20 KiB Schritt + 3 × 4 KiB Tabellen = 96 KiB.
+        assert_eq!(volle_pd_kosten(SEITE + AARCH64_KSTACK), 96 * 1024);
+    }
+
+    #[test]
+    fn plaetze_threads_binden_ohne_kappung() {
+        // Genug von allem: die Faeden sind das Minimum, keine Kappung.
+        let (p, g) = arena_plaetze(100, u64::MAX, 84 * 1024, None, ARENA_DECKEL_PLAETZE);
+        assert_eq!((p, g), (100, GRUND_THREADS));
+        // Gleichstand: der schoenste Fall wird genannt.
+        let (p, g) = arena_plaetze(100, 100 * 84 * 1024, 84 * 1024, Some(100), 100);
+        assert_eq!((p, g), (100, GRUND_THREADS));
+    }
+
+    #[test]
+    fn plaetze_ram_kappt_volle_pds() {
+        // 512-MiB-Lage (x86): ~496 MiB frei, volle PD 84 KiB → ~6046 Plaetze.
+        let frei = 496 * 1024 * 1024u64;
+        let (p, g) = arena_plaetze(10_000, frei, volle_pd_kosten(SEITE + X86_KSTACK), None, ARENA_DECKEL_PLAETZE);
+        assert_eq!(p as u64, frei / (84 * 1024));
+        assert_eq!(g, GRUND_RAM);
+        assert!(p < 10_000, "bei 512M traegt das RAM keine 10 000 vollen PDs");
+    }
+
+    #[test]
+    fn plaetze_guard_kappt_auf_x86() {
+        // x86-Lage bei 6G: RAM reicht, 16 Splits × 256 Slots = 4096 Plaetze.
+        let frei = 6 * 1024 * 1024 * 1024u64;
+        let guard = 16 * slots_je_block(SEITE + X86_KSTACK);
+        assert_eq!(guard, 4096);
+        let (p, g) = arena_plaetze(10_000, frei, volle_pd_kosten(SEITE + X86_KSTACK), Some(guard), ARENA_DECKEL_PLAETZE);
+        assert_eq!((p, g), (4096, GRUND_GUARD));
+    }
+
+    #[test]
+    fn plaetze_deckel_faengt_riesenmaschinen() {
+        // 256 Kerne → 65 536 Faeden: der Deckel greift vor dem RAM.
+        let (p, g) = arena_plaetze(65_536, u64::MAX, 1, None, ARENA_DECKEL_PLAETZE);
+        assert_eq!((p, g), (ARENA_DECKEL_PLAETZE, GRUND_DECKEL));
+    }
+
+    #[test]
+    fn plaetze_null_ist_benannt() {
+        // Keine Faeden, kein RAM, keine Splits: 0 Plaetze mit dem Grund, der zuerst bindet.
+        assert_eq!(arena_plaetze(0, 0, 84 * 1024, Some(0), ARENA_DECKEL_PLAETZE).0, 0);
+        assert_eq!(arena_plaetze(0, 1 << 40, 1, None, ARENA_DECKEL_PLAETZE).1, GRUND_THREADS);
+        assert_eq!(arena_plaetze(10, 0, 84 * 1024, Some(100), ARENA_DECKEL_PLAETZE).1, GRUND_RAM);
+        assert_eq!(arena_plaetze(10, 1 << 40, 1, Some(0), ARENA_DECKEL_PLAETZE).1, GRUND_GUARD);
+        // Kosten 0 heisst „keine RAM-Schranke" (Division durch null faellt aus).
+        assert_eq!(arena_plaetze(7, 0, 0, None, ARENA_DECKEL_PLAETZE), (7, GRUND_THREADS));
+    }
+
+    #[test]
+    fn gruende_haben_namen() {
+        assert_eq!(grund_name(GRUND_THREADS), "Thread-Slots (keine Kappung)");
+        assert_eq!(grund_name(GRUND_RAM), "Boot-RAM (nicht mehr volle PDs)");
+        assert_eq!(grund_name(GRUND_GUARD), "Guard-Splits (nicht mehr bewachbare Slots)");
+        assert_eq!(grund_name(GRUND_DECKEL), "absoluter Deckel");
+        assert_eq!(grund_name(GRUND_SPANNE), "Spanne nicht allozierbar");
+        assert_eq!(grund_name(GRUND_BITMAP), "Bitmap nicht allozierbar");
+        assert_eq!(grund_name(GRUND_GEOMETRIE), "Konstruktion traegt nicht");
+        assert_eq!(grund_name(999), "unbekannt");
     }
 }

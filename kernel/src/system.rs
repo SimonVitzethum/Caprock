@@ -215,41 +215,95 @@ static KSTACKS: SpinLock<KstackPool> = SpinLock::new(KstackPool {
 /// die Locks sequenziell).
 static KSTACK_ARENA: SpinLock<Option<crate::stack_arena::StackArena<'static>>> =
     SpinLock::new(None);
-/// Bitmap-Rueckwand der Arena (BSS). Nach der Bestueckung nur noch durch die Arena selbst
-/// angefasst (s. SAFETY dort) — wer hier direkt schreibt, entwertet jede Vergabe.
-static mut ARENA_BITS: [u64; crate::stack_arena::woerter(ARENA_PLAETZE)] =
-    [0; crate::stack_arena::woerter(ARENA_PLAETZE)];
-/// C7c: Arena-Plaetze = 2048 EL0-Kernel-Stacks (x86: 16 MiB Spanne = 8 Bloecke statt
-/// hunderter gestreuter; aarch64: 40 MiB = 20 Bloecke).
-const ARENA_PLAETZE: usize = 2048;
+/// C7c/Dichte: der Arena-PLAN — `(gewollte Faeden, Plaetze, Grund, bestueckt)`.
+///
+/// `gewollt` ist die Thread-Kapazitaet aus [`configure`], `Plaetze` das abgeleitete Minimum
+/// (s. `stack_arena::arena_plaetze`), `Grund` nennt die bindende Schranke, `bestueckt` ob die
+/// Arena danach wirklich steht. Der Plan steht auch dann, wenn die Bestueckung scheiterte: was
+/// gewollt war und woran es lag, waere sonst nur aus der Spanne zu raten.
+static ARENA_PLAN: SpinLock<(usize, usize, u32, bool)> =
+    SpinLock::new((0, 0, crate::stack_arena::GRUND_THREADS, false));
 
-/// C7c: Arena bestuecken (einmalig in `configure`, vor dem ersten Thread).
-/// Gibt die belegte Spanne zurueck (fuer den Boot-Report), `0` = nicht bestueckt.
-fn kstack_arena_bestuecken() -> u64 {
-    use crate::stack_arena::{StackArena, BLOCK_2M};
+/// Der Arena-Plan fuer den Bericht: `(gewollte Faeden, Plaetze, Grund, bestueckt)`.
+/// Die Klartexte zu `Grund` liefert `stack_arena::grund_name`. `(0, .., false)` heisst
+/// „nicht bestueckt" — derselbe Stil wie `kstack_arena_stats`.
+pub fn kstack_arena_plan() -> (usize, usize, u32, bool) {
+    *ARENA_PLAN.lock()
+}
+
+/// C7c/Dichte: Arena-Plaetze ableiten statt Fixzahl (einmalig in `configure`, vor dem ersten
+/// Thread). Gibt die belegten Bytes zurueck (Spanne + Bitmap, fuer den Boot-Report),
+/// `0` = nicht bestueckt.
+fn kstack_arena_bestuecken(faeden: usize) -> u64 {
+    use crate::stack_arena::{
+        arena_plaetze, slots_je_block, volle_pd_kosten, StackArena, ARENA_DECKEL_PLAETZE,
+        BLOCK_2M, GRUND_BITMAP, GRUND_GEOMETRIE, GRUND_SPANNE,
+    };
+    use crate::stack_arena::woerter;
     let stapel = USER_KSTACK_SIZE;
     let schritt = caprock_mem::PAGE as usize + stapel;
-    let spanne = (ARENA_PLAETZE as u64) * (schritt as u64);
+    // Guard-Vorrat: freie Splits mal Dichte je Block — gelesen, nicht geraten. Die Streu-Stacks
+    // des Selbsttests haben zu diesem Zeitpunkt bereits Bloecke aufgeteilt; ein Slot ohne
+    // legbare Wache wuerde beim Bestuecken gesperrt und waere belegtes, nie nutzbares RAM.
+    // Nur wo Wachen echt sind — wo der Aufruf nur zaehlt, begrenzt kein Split.
+    let guard_plaetze = if hal::mmu::guard_unterstuetzt() {
+        let (_, _, _, belegt, vorrat) = hal::mmu::guard_stats();
+        Some(
+            vorrat
+                .saturating_sub(belegt)
+                .saturating_mul(slots_je_block(schritt)),
+        )
+    } else {
+        None
+    };
+    let frei = MEM.lock().total_free();
+    let (plaetze, grund) = arena_plaetze(
+        faeden,
+        frei,
+        volle_pd_kosten(schritt),
+        guard_plaetze,
+        ARENA_DECKEL_PLAETZE,
+    );
+    *ARENA_PLAN.lock() = (faeden, plaetze, grund, false);
+    if plaetze == 0 {
+        return 0;
+    }
     // Dieselbe Zone wie die Streu-Stacks heute (`IdentityMapped`, keine neue Annahme
     // ueber die Identitaetskarte), aber EIN zusammenhaengender Bereich, 2-MiB-ausgerichtet:
     // so fallen die Wachen in wenige Kartenbloecke statt in hunderte gestreute.
-    let Some(cap) = mem_alloc(spanne, BLOCK_2M as u64) else {
+    let Some(cap) = mem_alloc((plaetze as u64) * (schritt as u64), BLOCK_2M as u64) else {
+        *ARENA_PLAN.lock() = (faeden, plaetze, GRUND_SPANNE, false);
         return 0;
     };
     let basis = cap.base() as usize;
-    // Die Cap bewusst fallen lassen (Muster `table` in `configure`): die Arena lebt bis Reboot.
-    // SAFETY: einmaliger Aufruf beim Boot, bevor ein anderer Kern oder Thread laeuft;
-    // danach wird `ARENA_BITS` ausschliesslich durch die Arena unter `KSTACK_ARENA`
-    // angefasst, nie wieder direkt.
-    let bits: &'static mut [u64] = unsafe { &mut *core::ptr::addr_of_mut!(ARENA_BITS) };
-    let mut arena = match StackArena::neu(basis, stapel, ARENA_PLAETZE, bits) {
+    // Die Bitmap kommt aus Boot-RAM statt BSS (kein BSS-Sprengen): ein Wort je 64 Plaetze,
+    // reines Kernel-Wissen, also aus der oberen Zone wie die Tabellen in `configure`.
+    let w = woerter(plaetze);
+    let Some(bcap) = mem_alloc_anywhere((w as u64) * 8, 8) else {
+        MEM.lock().free_region(PhysRegion::new(cap.base(), cap.len()));
+        *ARENA_PLAN.lock() = (faeden, plaetze, GRUND_BITMAP, false);
+        return 0;
+    };
+    // Die Caps bewusst fallen lassen (Muster `table` in `configure`): Arena + Bitmap leben
+    // bis Reboot.
+    // SAFETY: einmaliger Aufruf beim Boot, bevor ein anderer Kern oder Thread laeuft; frisch
+    // allozierte, exklusive, u64-ausgerichtete Region von genau `w` Worten; danach wird sie
+    // ausschliesslich durch die Arena unter `KSTACK_ARENA` angefasst, nie wieder direkt.
+    let bits: &'static mut [u64] =
+        unsafe { core::slice::from_raw_parts_mut(bcap.base() as *mut u64, w) };
+    let mut arena = match StackArena::neu(basis, stapel, plaetze, bits) {
         Ok(a) => a,
-        Err(_) => return 0,
+        Err(_) => {
+            MEM.lock().free_region(PhysRegion::new(cap.base(), cap.len()));
+            MEM.lock().free_region(PhysRegion::new(bcap.base(), bcap.len()));
+            *ARENA_PLAN.lock() = (faeden, plaetze, GRUND_GEOMETRIE, false);
+            return 0;
+        }
     };
     // Wachen legen (x86: echte Splits, aarch64: nur gezaehlt). Schlaegt eine Wache fehl,
     // wird genau dieser Slot gesperrt statt die ganze Arena zu verwerfen — Dichte statt
     // Alles-oder-Nichts; gesperrte Slots zaehlen als vergeben, nie als frei.
-    for i in 0..ARENA_PLAETZE {
+    for i in 0..plaetze {
         let wache_ok = match arena.wache_von_slot(i) {
             Some(wache) => hal::mmu::guard_unmap(wache as u64),
             None => false,
@@ -259,7 +313,8 @@ fn kstack_arena_bestuecken() -> u64 {
         }
     }
     *KSTACK_ARENA.lock() = Some(arena);
-    spanne
+    *ARENA_PLAN.lock() = (faeden, plaetze, grund, true);
+    cap.len() + bcap.len()
 }
 
 /// C7c: Arena-Vergabe (nur ungefaerbter Pfad; `None` = Streupfad weiter).
@@ -2069,8 +2124,10 @@ pub fn configure(cores: usize) -> (usize, usize, usize, u64) {
 
     // C7c: Stack-Arena bestuecken — steht hier am Ende von `configure`, nicht bei den
     // KSTACKS-Tabellen oben, weil `table` dort `bytes` leiht: einmalig, vor dem ersten
-    // Thread, `0` = nicht bestueckt (Streupfad weiter). Die Spanne steht im Boot-Report.
-    bytes += kstack_arena_bestuecken();
+    // Thread, `0` = nicht bestueckt (Streupfad weiter). Die Plaetze leitet die Arena aus
+    // Thread-Zahl, Boot-RAM, Guard-Vorrat und Deckel ab (s. `kstack_arena_plan`); Spanne +
+    // Bitmap stehen im Boot-Report.
+    bytes += kstack_arena_bestuecken(total);
 
     (cores, total, per_core, bytes)
 }
@@ -2213,6 +2270,38 @@ pub fn configure_caps() -> u64 {
         CAPS.write().pds.attach_cspace_pool(
             cspace_mem as *mut Option<CapPtr>,
             caprock_microkit::NPDS * caprock_microkit::STANDARD_PLAETZE as usize,
+        )
+    };
+
+    // Dichte: die VSpace-Tabelle (eine VSpace je PD im Grenzfall) + die Teardown-Buchhaltung
+    // geladener Programme (ein Eintrag je PD im Grenzfall). Beide waren statische Reserven
+    // (4096 VSpaces, 16 Images) und damit die Stelle, an der „10 000 Tenants" endete — Threads
+    // (Teil 1), Caps (Teil 2) und PD-Slots (Teil 3) waren gedreht, die Adressraeume nicht.
+    // VOR der ersten PD/VSpace/dem ersten Laden (der Selbsttest gleich darunter legt bereits
+    // welche an): vorher haben die Tabellen Laenge 0, und jede Vergabe scheitert benannt aus
+    // dem leeren Vorrat statt daneben zu greifen.
+    let vspaces_mem = table(
+        caprock_microkit::NPDS * core::mem::size_of::<VSpaceEnt>(),
+        core::mem::align_of::<VSpaceEnt>().max(4096),
+    );
+    // SAFETY: wie oben (exklusiv, ausgerichtet, dauerhaft, einmalig).
+    unsafe {
+        VSPACES.lock().attach(
+            vspaces_mem as *mut VSpaceEnt,
+            caprock_microkit::NPDS,
+            |_| VSpaceEnt { used: false, l1: 0, l2: 0, stripe: None },
+        )
+    };
+    let loaded_mem = table(
+        caprock_microkit::NPDS * core::mem::size_of::<LoadedImage>(),
+        core::mem::align_of::<LoadedImage>().max(4096),
+    );
+    // SAFETY: wie oben.
+    unsafe {
+        LOADED_IMAGES.lock().attach(
+            loaded_mem as *mut LoadedImage,
+            caprock_microkit::NPDS,
+            |_| LoadedImage::EMPTY,
         )
     };
 
@@ -3816,12 +3905,18 @@ pub fn spawn_user_parked(entry: usize, arg: usize, prio: u8) -> Option<Parked> {
     }
 }
 
-/// Statische Reserve an isolierten-VSpace-Slots (BSS: `VSPACES` = MAX_VSPACES × ~24 B). Die
-/// **tatsächlich vergebene** Anzahl deckelt `create_vspace` auf `min(MAX_VSPACES, max_asid())`:
-/// die HW-ASID-Breite (`TCR.AS`; 255 bei 8-Bit, 65535 bei FEAT_ASID16) ist die harte Grenze —
-/// eine ASID darüber würde aliasen. Hoher Default, weil `create_vspace` ohnehin nur bis `usable`
-/// scannt (O(usable)) und die HW-Grenze schützt. 4096 = 96 KiB BSS.
-const MAX_VSPACES: usize = 4096;
+/// Isolierte-VSpace-Slots aus Boot-RAM (Dichte): eine VSpace je PD im Grenzfall.
+///
+/// Bis hierher eine statische Reserve (`[VSpaceEnt; 4096]` im BSS, rund 128 KiB): 10 000
+/// Threads waren darstellbar, aber nur solange sie sich Adressraeume teilen — als 10 000
+/// isolierte Tenants nicht, und genau das ist der Punkt des Systems. Die Tabelle wird jetzt
+/// beim Boot alloziert (s. `configure_caps`), die Zahl kostet RAM statt Struktur, und was sie
+/// kostet, steht im Boot-Report. Dimensioniert auf `NPDS`: im Grenzfall bekommt jede PD ihre
+/// eigene VSpace. Die **tatsaechlich vergebene** Anzahl deckelt `create_vspace` weiter auf
+/// `min(angehaengt, max_asid())`: die HW-ASID-Breite ist die harte Grenze — eine ASID darueber
+/// wuerde aliasen. Ein vergessener Anhang faellt als benannte Absage aus dem leeren Vorrat
+/// auf, nicht als Fehlzugriff: die Tabelle hat dann Laenge 0, und jede Vergabe meldet den
+/// ASID-Topf statt daneben zu greifen.
 
 /// Metadaten einer isolierten VSpace (für map/unmap + Teardown). Indiziert per
 /// `asid - 1`.
@@ -3838,8 +3933,22 @@ struct VSpaceEnt {
     /// an der VSpace hat er genau einen Anfang und genau ein Ende (`vspace_teardown`).
     stripe: Option<u32>,
 }
-static VSPACES: SpinLock<[VSpaceEnt; MAX_VSPACES]> =
-    SpinLock::new([VSpaceEnt { used: false, l1: 0, l2: 0, stripe: None }; MAX_VSPACES]);
+static VSPACES: SpinLock<Slab<VSpaceEnt>> = SpinLock::new(Slab::empty());
+
+/// Zahl der angehaengten VSpace-Slots (`0` = `configure_caps` vergessen oder zu spaet).
+fn vspace_slots() -> usize {
+    VSPACES.lock().len()
+}
+
+/// VSpace-Kapazitaet fuer den Bericht: `(angehaengt, nutzbar)`.
+///
+/// `nutzbar` ist durch die HW-ASID-Breite gedeckelt (x86: keine, aarch64: 255 ohne FEAT_ASID16)
+/// — angehaengt heisst nicht verwendbar, und die beiden Zahlen gehoeren auseinander, sonst
+/// liest sich ein voller Anhang wie volle Verfuegbarkeit.
+pub fn vspace_capacity() -> (usize, usize) {
+    let n = vspace_slots();
+    (n, n.min(hal::mmu::max_asid() as usize))
+}
 
 /// Eine **leere** isolierte VSpace anlegen (Kernel EL1-only, kein User-Frame). Gibt
 /// `(asid, l1_phys)` oder `None` (kein ASID/Speicher). Allokiert L1+L2 aus `MEM`
@@ -3861,9 +3970,9 @@ fn create_vspace_masked(mask: Option<caprock_mem::ColorMask>) -> Option<(u16, u6
     let asid = {
         // Nur die ersten `usable` Slots vergeben: ASID = Slot+1 darf die HW-ASID-Breite
         // (`max_asid()`, 255 oder 65535) NIE überschreiten, sonst aliast eine zu große ASID auf
-        // eine andere VSpace (Isolationsbruch). MAX_VSPACES darf also größer als die HW-Grenze sein
-        // (statische Reserve), genutzt wird aber nur bis `usable`.
-        let usable = MAX_VSPACES.min(hal::mmu::max_asid() as usize);
+        // eine andere VSpace (Isolationsbruch). Angehaengt sein darf mehr, als die HW-Grenze
+        // hergibt (Boot-RAM-Tabelle), genutzt wird aber nur bis `usable`.
+        let usable = vspace_slots().min(hal::mmu::max_asid() as usize);
         let mut t = VSPACES.lock();
         // **Zwei Toepfe in EINER Funktion, und sie muessen unterscheidbar bleiben.** Hier ist der
         // ASID-Vorrat leer -- eine Zahl fester Groesse. Zwei Zeilen weiter unten waere es
@@ -4096,8 +4205,8 @@ pub fn free_vspaces() -> usize {
 pub fn vspace_audit() -> u32 {
     // Unter dem `VSPACES`-Lock walken: `vspace_wx_ok`/`vspace_device_wx_ok` lesen nur die Tabellen
     // (nehmen KEINE Locks) -> kein Deadlock, und race-frei (kein Teardown während des Walks). Früher
-    // wurden die L1/L2-Adressen erst in `[u64; MAX_VSPACES]` auf dem Stack kopiert; das skaliert nicht
-    // auf große MAX_VSPACES (Stack-Overflow) und war unnötig, da der Walk lock-frei ist.
+    // wurden die L1/L2-Adressen erst in einem BSS-grossen Puffer auf dem Stack kopiert; das skaliert
+    // nicht auf zehntausend VSpaces (Stack-Overflow) und war unnötig, da der Walk lock-frei ist.
     let t = VSPACES.lock();
     for v in t.iter() {
         if !v.used {
@@ -4125,7 +4234,7 @@ pub fn used_tcbs(core: usize) -> usize {
 
 /// L2-Tabelle einer (gültigen) isolierten VSpace nachschlagen.
 fn vspace_l2(asid: u16) -> Option<u64> {
-    if asid == 0 || asid as usize > MAX_VSPACES {
+    if asid == 0 || asid as usize > vspace_slots() {
         return None;
     }
     let v = VSPACES.lock()[asid as usize - 1];
@@ -4138,7 +4247,7 @@ fn vspace_l2(asid: u16) -> Option<u64> {
 
 /// Die L1-Wurzel der VSpace `asid` (für Device-MMIO-Mapping in GiB 0).
 fn vspace_l1(asid: u16) -> Option<u64> {
-    if asid == 0 || asid as usize > MAX_VSPACES {
+    if asid == 0 || asid as usize > vspace_slots() {
         return None;
     }
     let v = VSPACES.lock()[asid as usize - 1];
@@ -4381,7 +4490,7 @@ pub fn unmap_into_thread(tid: ThreadId, base: u64, len: u64) -> bool {
 /// zurückgeben, Eintrag freigeben, TLB der ASID flushen. Beim Thread-Ende einer
 /// isolierten PD aufzurufen.
 fn vspace_teardown(asid: u16) {
-    if asid == 0 || asid as usize > MAX_VSPACES {
+    if asid == 0 || asid as usize > vspace_slots() {
         return;
     }
     loaded_free(asid); // ext-26 L4: geladene Programm-Segment-Frames freigeben (sonst Leck)
@@ -4443,7 +4552,7 @@ fn vspace_teardown(asid: u16) {
 /// Streifen für immer belegt: nach vier vergessenen PDs entsteht keine gefärbte mehr. Deshalb
 /// steht er unmittelbar neben dem `claim_stripe()` seines einzigen Aufrufers.
 fn vspace_bind_stripe(asid: u16, stripe: u32) {
-    if asid == 0 || asid as usize > MAX_VSPACES {
+    if asid == 0 || asid as usize > vspace_slots() {
         return;
     }
     VSPACES.lock()[asid as usize - 1].stripe = Some(stripe);
@@ -4942,7 +5051,6 @@ fn copy_segment(dst_phys: u64, src: &[u8], total: usize) {
 // cap-getrackt sind (der MemoryCap-Deskriptor wird in `load_into_pd` verworfen, da das Eigentum
 // an die geladene PD/VSpace uebergeht). Damit sie beim Teardown der VSpace NICHT lecken, werden
 // sie hier je `asid` registriert und von [`vspace_teardown`] mitfreigegeben.
-const NLOADED_IMG: usize = 16; //   gleichzeitig geladene Programme
 // **64 statt 8** (A1/Z11c, 2026-08-07). Eine gefaerbte geladene PD kann ihre Segmente nicht als
 // EINE zusammenhaengende Region nehmen: Farbe ist eine Funktion der Physadresse, und innerhalb
 // eines Streifens sind hoechstens `colors::region_bytes()` aufeinanderfolgende Bytes gleichfarbig
@@ -4958,8 +5066,20 @@ struct LoadedImage {
 impl LoadedImage {
     const EMPTY: LoadedImage = LoadedImage { asid: 0, nseg: 0, segs: [(0, 0); MAX_IMG_SEGS] };
 }
-static LOADED_IMAGES: SpinLock<[LoadedImage; NLOADED_IMG]> =
-    SpinLock::new([LoadedImage::EMPTY; NLOADED_IMG]);
+/// Teardown-Buchhaltung geladener Programme aus Boot-RAM (Dichte): ein Eintrag je PD.
+///
+/// Bis hierher eine statische Reserve von 16 Eintraegen (`[LoadedImage; 16]` im BSS): das 17.
+/// gleichzeitig geladene Programm bekam keinen Teardown-Eintrag, und der Ladevorgang schlug
+/// fehl — bei 10 000 PDs also an einer Zahl, die nie mitgewachsen ist. Dimensioniert auf
+/// `NPDS` (s. `configure_caps`), Kosten je Eintrag rund ein KiB aus Boot-RAM mit Abrechnung
+/// im Boot-Report. Ein vergessener Anhang faellt wie bei `VSPACES` auf: die Tabelle hat dann
+/// Laenge 0, und jede Registrierung meldet das Scheitern statt zu lecken.
+static LOADED_IMAGES: SpinLock<Slab<LoadedImage>> = SpinLock::new(Slab::empty());
+
+/// Kapazitaet der Teardown-Buchhaltung geladener Programme (angehaengt, nicht Konstante).
+pub fn loaded_capacity() -> usize {
+    LOADED_IMAGES.lock().len()
+}
 
 /// Die RAM-Frames `segs` eines geladenen Programms unter `asid` registrieren (für den Teardown).
 ///
@@ -9778,7 +9898,7 @@ pub(crate) mod testsupport {
 
     /// Die beiden obersten Seitentabellen der VSpace `asid` (`(l1, l2)`), oder `(0, 0)`.
     pub fn vspace_tables_of(asid: u16) -> (u64, u64) {
-        if asid == 0 || asid as usize > super::MAX_VSPACES {
+        if asid == 0 || asid as usize > super::vspace_slots() {
             return (0, 0);
         }
         let e = super::VSPACES.lock()[asid as usize - 1];
@@ -13092,27 +13212,31 @@ pub fn ipc_audit() -> u32 {
 /// **Loader-Property-Oracle** (ext-26, L5): `0` = konsistent, sonst Anomalie-Code:
 /// - `1` = ein aktuell in einer geladenen VSpace gemapptes Segment überlappt **freies** RAM (es
 ///   wurde freigegeben, während es noch gemappt ist → Use-after-free). Spiegelt `dma_audit` Code 4.
-/// Snapshot der registrierten Segmente ziehen (`LOADED_IMAGES` kurz sperren), dann gegen
-/// `MEM.overlaps_free` (Rangordnung: nie beide Locks gleichzeitig).
+/// Gestaffelt je Image (`LOADED_IMAGES` kurz sperren, dann gegen `MEM.overlaps_free`
+/// pruefen — Rangordnung: nie beide Locks gleichzeitig). Hoechstens `MAX_IMG_SEGS` Eintraege
+/// (1 KiB) liegen je auf dem Stapel: die vorige Fassung hielt alle Images als Ganzes, und das
+/// skaliert nicht auf zehntausend Images (zehn MiB Stapel).
 pub fn loader_audit() -> u32 {
-    let mut snap = [(0u64, 0u64); NLOADED_IMG * MAX_IMG_SEGS];
-    let mut n = 0;
-    {
-        let t = LOADED_IMAGES.lock();
-        for img in t.iter() {
-            if img.asid != 0 {
-                for &(b, l) in img.segs[..img.nseg].iter() {
-                    if l != 0 {
-                        snap[n] = (b, l);
-                        n += 1;
-                    }
-                }
+    let n = LOADED_IMAGES.lock().len();
+    let mut buf = [(0u64, 0u64); MAX_IMG_SEGS];
+    for i in 0..n {
+        let m = {
+            let t = LOADED_IMAGES.lock();
+            let img = t[i];
+            if img.asid == 0 {
+                continue;
             }
+            let m = img.nseg.min(MAX_IMG_SEGS);
+            buf[..m].copy_from_slice(&img.segs[..m]);
+            m
+        };
+        if m == 0 {
+            continue;
         }
-    } // LOADED_IMAGES freigegeben
-    let mem = MEM.lock();
-    if snap[..n].iter().any(|&(b, l)| mem.overlaps_free(b, l)) {
-        return 1;
+        let mem = MEM.lock();
+        if buf[..m].iter().any(|&(b, l)| l != 0 && mem.overlaps_free(b, l)) {
+            return 1;
+        }
     }
     0
 }

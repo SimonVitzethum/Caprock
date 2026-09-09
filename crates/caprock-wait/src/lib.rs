@@ -1445,3 +1445,224 @@ mod tests_e3_gatter {
         assert_eq!(k.stand(), 0);
     }
 }
+
+// ── Blockierendes Leerspülen (`flush_blockierend`, LogFlush-Strang) ─────────
+//
+// `flush` oben ist ein Nachweis („steht nichts mehr aus?"), keine Blockade: blockieren hiesse
+// parken, und parken ohne Weckruf hiesse hängen. Diese Funktion ist die blockierende Fassung —
+// und sie parkt trotzdem nur, wo ein Weckruf sicher kommt: sie reiht einen Drain-Marker ein
+// ([`FLUSH_MARKE`]), zieht die Liste selbst ab (jeder Job läuft vor der Rückkehr, in FIFO-Folge
+// wie bei [`Workqueue::run_ein_job`]) und wartet das Marker-Ende per [`Completion`] ab. Der
+// Marker wird dabei verbraucht — `fertig` steht danach genau einmal, und das fristlose `warten`
+// kehrt ohne ein einziges Parken zurück. Käme der Marker nie an (nur bei fremdem Ziehen mitten
+// im Flush möglich, was die `&mut`-Signatur bereits ausschliesst), parkte der Aufrufer — und
+// wachte per Marke wieder auf: Jobs terminieren per Vertrag, also braucht es hier keinen
+// Timeout-Spielraum (PARK ohne Frist ist ok).
+//
+// Der Preis steht in der Signatur: für den Marker braucht es EINEN freien Platz — ist die
+// Schlange voll, kommt die benannte Absage ([`LockError::KeinWarteplatz`]), statt dass ein
+// Auftrag still nie liefe. Wer mit voller Schlange spült, zieht erst (`run_ein_job`) oder
+// bemisst grösser.
+//
+// [`FLUSH_MARKE`] ist reserviert: was per [`Workqueue::queue`] eingereicht wird, ist nie
+// `u64::MAX` — sonst hielte der Flush einen echten Job für den Marker (er liefe nicht, und der
+// Abschluss käme zu früh). Die Marke verlässt diese Funktion nie: ein fremder Bearbeiter sieht
+// sie nicht, weil es keinen zweiten Bearbeiter geben kann (`&mut self`).
+
+/// Der Drain-Marker für [`Workqueue::flush_blockierend`] — reserviert, s. Abschnitts-Doku.
+pub const FLUSH_MARKE: JobId = u64::MAX;
+
+impl Workqueue {
+    /// Blockierend leerspülen: alle ausstehenden Jobs laufen vor der Rückkehr.
+    ///
+    /// * Leer → sofort `Ok(())`: keine Marke, kein Parken, kein Zählen.
+    /// * Voll (kein Platz für die Marke) → `Err(KeinWarteplatz)`: benannt statt still — und
+    ///   es wurde NICHTS gezogen (alles-oder-nichts, kein halb gespülter Stand).
+    /// * Sonst: Marker einreihen, alles ziehen (`tp` je Job, Marker → `complete`), dann das
+    ///   Ende per [`Completion`] abwarten — fristlos, weil Jobs per Vertrag terminieren.
+    ///
+    /// `p` ist der Park-Vertrag mit Frist-Option ([`timeout::TimeoutPark`]) — genutzt wird das
+    /// fristlose Parken; `_clk` steht für die Vertrags-Symmetrie mit `warten_timeout` dabei
+    /// (die Fristlage kennt der Aufrufer, diese Funktion braucht keine — wie `queue`/`run_ein_job`
+    /// ihr ungenutztes `p` mittragen); `tp` (task procedure) führt je gezogenen Job aus —
+    /// dieselbe Form wie das `f` von [`Self::run_ein_job`].
+    pub fn flush_blockierend(
+        &mut self,
+        p: &dyn crate::timeout::TimeoutPark,
+        _clk: &dyn crate::Clock,
+        tp: impl Fn(JobId),
+    ) -> Result<(), crate::LockError> {
+        let park: &dyn crate::Park = p;
+        if self.is_empty() {
+            return Ok(());
+        }
+        // Benannte Absage bei voller Schlange — der Flush trägt die Marke nicht ein, solange
+        // sie nicht passt; ein Auftrag, der nie liefe, während jeder Prüfer Ordnung meldet.
+        self.queue(park, FLUSH_MARKE)?;
+        let mut fertig = crate::Completion::new();
+        // Selbst abziehen, in FIFO-Folge wie `run_ein_job` — deshalb läuft jeder Job vor der
+        // Rückkehr, und die Marke kommt genau dann an, wenn alles davor lief.
+        while let Some(job) = self.q.pop() {
+            if job == FLUSH_MARKE {
+                fertig.complete(park);
+            } else {
+                tp(job);
+            }
+        }
+        // Warten per Completion, fristlos: die Marke ist verbraucht, der Zähler steht — kein
+        // Parken im Regelfall, und im Restfall ein Parken mit sicherem Weckruf.
+        fertig.warten(park)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests_flush_blockierend {
+    use super::*;
+    use crate::timeout::TimeoutPark;
+    use core::cell::{Cell, RefCell};
+
+    /// Stellvertreter mit Park-Marke (wie die Schwester-Module), Uhr und Frist-Parken in einem.
+    /// Der Flush parkt fristlos — `park_timeout` steht nur, weil die Signatur ihn verlangt, und
+    /// verhält sich wie ein abgelaufener Rest (zählt, weckt nicht).
+    struct Kern {
+        marken: RefCell<[u32; 8]>,
+        blockiert: Cell<u32>,
+        frist_parks: Cell<u32>,
+        jetzt: Cell<u64>,
+    }
+
+    impl Kern {
+        fn neu() -> Kern {
+            Kern {
+                marken: RefCell::new([0; 8]),
+                blockiert: Cell::new(0),
+                frist_parks: Cell::new(0),
+                jetzt: Cell::new(0),
+            }
+        }
+        fn sicht(&self, ich: Tid) -> Sicht<'_> {
+            Sicht { ich, k: self }
+        }
+        fn blockierte(&self) -> u32 {
+            self.blockiert.get()
+        }
+        fn frist_geparkt(&self) -> u32 {
+            self.frist_parks.get()
+        }
+    }
+
+    struct Sicht<'a> {
+        ich: Tid,
+        k: &'a Kern,
+    }
+
+    impl Park for Sicht<'_> {
+        fn me(&self) -> Tid {
+            self.ich
+        }
+        fn park(&self) {
+            let mut m = self.k.marken.borrow_mut();
+            let i = self.ich as usize;
+            if m[i] > 0 {
+                m[i] -= 1; // Marke verbraucht -> kein Blockieren
+            } else {
+                self.k.blockiert.set(self.k.blockiert.get() + 1);
+            }
+        }
+        fn unpark(&self, t: Tid) {
+            // **Immer** hinterlegen, auch wenn `t` wach ist -- das ist der Vertrag.
+            self.k.marken.borrow_mut()[t as usize] += 1;
+        }
+    }
+
+    impl Clock for Sicht<'_> {
+        fn hz(&self) -> u64 {
+            1000
+        }
+        fn now(&self) -> u64 {
+            self.k.jetzt.get()
+        }
+    }
+
+    impl TimeoutPark for Sicht<'_> {
+        fn park_timeout(&self, _ticks: u64) -> bool {
+            self.k.frist_parks.set(self.k.frist_parks.get() + 1);
+            false
+        }
+    }
+
+    #[test]
+    fn flush_leer_kehrt_sofort_zurueck() {
+        let k = Kern::neu();
+        let p = k.sicht(1);
+        let mut wq = Workqueue::new();
+        wq.flush_blockierend(&p, &p, |_: JobId| {
+            panic!("leerer Flush zieht nichts")
+        })
+        .unwrap();
+        assert_eq!(k.blockierte(), 0); // kein Parken auf leerer Liste
+        assert_eq!(k.frist_geparkt(), 0); // fristlos, wie dokumentiert
+    }
+
+    #[test]
+    fn flush_laesst_jobs_vor_rueckkehr_laufen() {
+        let k = Kern::neu();
+        let p = k.sicht(1);
+        let mut wq = Workqueue::new();
+        wq.queue(&p, 11).unwrap();
+        wq.queue(&p, 22).unwrap();
+        wq.queue(&p, 33).unwrap();
+        let gesehen = RefCell::new([0 as JobId; 4]);
+        let n = Cell::new(0usize);
+        wq.flush_blockierend(&p, &p, |job| {
+            let i = n.get();
+            gesehen.borrow_mut()[i] = job;
+            n.set(i + 1);
+        })
+        .unwrap();
+        assert_eq!(n.get(), 3);
+        let g = *gesehen.borrow();
+        // FIFO: wer zuerst eingereicht wurde, läuft zuerst — kein Auftrag verhungert.
+        assert_eq!([g[0], g[1], g[2]], [11, 22, 33]);
+        assert!(wq.is_empty());
+        // Die Marke ist verbraucht, der Abschluss stand schon: kein Parken nötig gewesen.
+        assert_eq!(k.blockierte(), 0);
+        assert_eq!(k.frist_geparkt(), 0);
+    }
+
+    #[test]
+    fn flush_voll_meldet_statt_zu_parken() {
+        let k = Kern::neu();
+        let p = k.sicht(1);
+        let mut wq = Workqueue::new();
+        for j in 0..WARTEPLAETZE as JobId {
+            wq.queue(&p, j).unwrap();
+        }
+        assert_eq!(
+            wq.flush_blockierend(&p, &p, |_: JobId| {
+                panic!("abgewiesener Flush zieht nichts")
+            }),
+            Err(LockError::KeinWarteplatz)
+        );
+        assert_eq!(wq.len(), WARTEPLAETZE); // nichts gezogen: alles-oder-nichts
+        assert_eq!(k.blockierte(), 0);
+        assert_eq!(wq.abgewiesen(), 1); // die Marke wurde gezählt abgewiesen
+    }
+
+    #[test]
+    fn flush_mit_genau_einem_freien_platz() {
+        // Der Grenzfall zum vorigen Test: die Marke passt gerade noch — dann läuft alles.
+        let k = Kern::neu();
+        let p = k.sicht(1);
+        let mut wq = Workqueue::new();
+        for j in 0..(WARTEPLAETZE as JobId - 1) {
+            wq.queue(&p, j).unwrap();
+        }
+        let n = Cell::new(0u32);
+        wq.flush_blockierend(&p, &p, |_| n.set(n.get() + 1)).unwrap();
+        assert_eq!(n.get(), WARTEPLAETZE as u32 - 1);
+        assert!(wq.is_empty());
+        assert_eq!(k.blockierte(), 0);
+    }
+}

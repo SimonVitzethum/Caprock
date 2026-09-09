@@ -1,0 +1,24 @@
+# `caprock-log` — Protokoll, das nie parkt (LogFlush-Strang).
+#
+# Bounded Ring-Buffer-Senke fuer `dev_err`/`printk`-Schemen: `push` verwirft das AELTESTE mit
+# Zaehler statt zu blockieren. **Keine Abhaengigkeiten**, `forbid(unsafe_code)`, reine
+# Reihenfolgen -> auf dem HOST pruefbar, gegen Literale statt gegen eine Maschine:
+#   rustc --test --edition 2021 -O crates/caprock-log/src/lib.rs -o /tmp/t && /tmp/t
+[package]
+name = "caprock-log"
+version.workspace = true
+edition.workspace = true
+# **GRENZ-CRATE: permissiv, und das ist tragend** (docs/grenze.md). Jede PD linkt das hier --
+# stuende es unter AGPL, waere jedes Programm mit AGPL-Code gelinkt und die ABI-Ausnahme
+# gegenstandslos. Dieselbe Grenze, fuer die Linux die UAPI-Header-Ausnahme hat.
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+# **Eingeschlossenheit ist die Eintrittskarte** (Z28) -- gehalten von `tools/eingeschlossenheit.py`:
+# `#![forbid(unsafe_code)]` im Wurzelmodul, kein Bauskript, und nur Abhaengigkeiten, die selbst
+# eingeschlossen oder namentlich zugelassen sind. Die Marke steht IM MANIFEST und nicht in einer
+# Liste im Waechter, damit Verschieben oder Umbenennen sie nicht vom Code trennen kann -- und weil
+# `cargo metadata` sie woertlich herausgibt, koennen andere Werkzeuge dieselbe Zusage lesen.
+[package.metadata.caprock]
+einschluss = "streng"

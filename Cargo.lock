@@ -78,6 +78,10 @@ name = "caprock-loader"
 version = "0.0.1"
 
 [[package]]
+name = "caprock-log"
+version = "0.0.1"
+
+[[package]]
 name = "caprock-mem"
 version = "0.0.1"
 

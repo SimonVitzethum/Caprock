@@ -67,6 +67,9 @@ mod ckptcut;
 // Attribut-Eigenheit wie oben: es bindet an das NAECHSTE Item.
 #[cfg(feature = "selftest")]
 mod spawnarena;
+/// C7c: Stack-Arena — einmal aufgeteilte zusammenhaengende Bloecke statt gestreuter
+/// Kernel-Stacks (Dichte-Ziel ~12x). Safe-only, abhaengigkeitsfrei, host-getestet.
+mod stack_arena;
 mod tlsprobe;
 mod uhr;
 /// Der dreiwertige Sondenausgang (2026-08-25) -- s. Moduldoku. Nicht hinter `selftest`: der Typ
@@ -204,14 +207,20 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // MMU + Caches zuerst: danach sind Atomics/der Konsolen-Lock wohldefiniert.
     hal::mmu::init_primary();
 
-    let (m, c, i) = hal::mmu::sctlr_flags();
+    // F3 (Hygiene): Bring-up-Meldung, kein Testbericht -- nur im Pruefbau sichtbar, sonst
+    // still. Es gibt kein eigenes `boot-verbose`-Feature (kernel/Cargo.toml ist fremder Besitz),
+    // also traegt `selftest` das Gatter. Keine Logikaenderung: reiner Register-Read + Ausgabe.
+    #[cfg(feature = "selftest")]
+    {
+        let (m, c, i) = hal::mmu::sctlr_flags();
+        println!("mmu     : identity-map, M={} C={} I={} (caches an)", m as u8, c as u8, i as u8);
+    }
     println!("========================================");
     println!(" Caprock — capability microkernel");
     println!(" phase 1: HAL bring-up");
     println!("========================================");
     println!("arch    : aarch64 (running at EL{})", hal::cpu::current_el());
     println!("boot-x0 : {dtb_addr:#018x} (DTB-Zeiger; bei QEMU-ELF 0 -> DTB eingebettet)");
-    println!("mmu     : identity-map, M={} C={} I={} (caches an)", m as u8, c as u8, i as u8);
 
     // Distributor global + Init des Primärkerns (core 0).
     hal::intc::init_dist();
@@ -265,6 +274,9 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     system::init_mem(free_base, alloc_end);
     // Cap-Tabellen VOR dem ersten Cap: der Selbsttest gleich darunter installiert bereits welche.
     let cap_bytes = system::configure_caps();
+    // F3 (Hygiene): Bring-up-Meldung, kein Testbericht -- nur im Pruefbau sichtbar, sonst
+    // still (dasselbe Gatter wie `mmu` oben; keine Logikaenderung, nur die Ausgabe faellt weg).
+    #[cfg(feature = "selftest")]
     println!("mem     : freies RAM [{free_base:#x}, {alloc_end:#x})  (Loader-Fenster [{:#x}, {ram_end:#x}) reserviert)", loader::MOD_BASE);
     let (cap_slots, cap_objs) = system::cap_capacity();
     println!(

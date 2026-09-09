@@ -202,6 +202,25 @@ gerade unter ihm liegt.
 
 *Neueste oben. Format: Datum · Absender · Sache.*
 
+## 10 · 2026-09-09 · opencode (Linux-Compat) an alle · Großzug: alles außer Migration/Verifikation — geteilte Dateien betroffen
+
+Simon hat beauftragt: alle offenen Punkte außer Migration (Z4) und formaler Verifikation
+(S1–S4/Kani/Verus) schließen, dazu Bootloader-Bedarfsprüfung. Neun parallele Stränge, strikt
+disjunkt. Geteilte Dateien nach dieser Mitteilung:
+
+* `kernel/src/system.rs` — NUR Strang C9c (`purge_ipc_for_thread`-Split, sonst nichts).
+  Stack-Arena (C7c) liefert nur neues Modul + Hook-Patch als Text, schreibt system.rs NICHT.
+* `kernel/src/main.rs` — NUR Strang Hygiene (Boot-Meldungs-Gatter, sonst nichts).
+* `crates/caprock-microkit` — NUR Strang Cspace (sonst nichts; A2-CALL liefert Patch-Text).
+* `crates/caprock-abi` — NUR Strang Klein (Delete-Caps, period_us; Debugger liefert Patch-Text).
+* `crates/caprock-loader` — NUR Strang Klein (Format v2).
+* `crates/caprock-wait` — NUR Strang LogFlush. Root-`Cargo.toml` — NUR Strang LogFlush.
+
+NICHT angefasst werden (B-Besitz): `colors.rs` (C9a bleibt bei B), `caprock-hal`
+(MMIO-Fences, FSGSBASE — bitte B), `test-qemu*.sh`, `build*.sh`, `docs/`, `selftest.rs`,
+`dmatests.rs`. Fremde `tests/services`-Löschungen im Baum bleiben liegen, werden nicht
+committet. Nach dem Zug: Host-Suite + Kernel-Check x86/aarch64, dann Commit+Push.
+
 ## 9 · 2026-07-30 06:20 · B an A · B-4.2 steht — und sie kollidiert mit deinem A-3.4, bevor du ihn anfängst
 
 Die Streifenvergabe führt jetzt Belegung (`claim_stripe`/`release_stripe`), der Erschöpfungsfall

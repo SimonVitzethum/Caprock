@@ -206,6 +206,93 @@ static KSTACKS: SpinLock<KstackPool> = SpinLock::new(KstackPool {
     ulen_of: Slab::empty(),
 });
 
+/// C7c: die Stack-Arena — ein zusammenhaengender Boot-RAM-Bereich, dessen 2-MiB-Bloecke
+/// EINMAL aufgeteilt werden, statt je gestreutem Stack einmal.
+///
+/// `None` heisst „nicht bestueckt" (zu wenig RAM, Guard-Vorrat erschoepft) — dann gilt der
+/// heutige Streupfad weiter, ohne dass ein Aufrufer es merkt. Sperrordnung: Blattlock wie
+/// `KSTACKS`, NIE verschachtelt mit `MEM` oder `SCHEDS` gehalten (Vergabe/Freigabe nehmen
+/// die Locks sequenziell).
+static KSTACK_ARENA: SpinLock<Option<crate::stack_arena::StackArena<'static>>> =
+    SpinLock::new(None);
+/// Bitmap-Rueckwand der Arena (BSS). Nach der Bestueckung nur noch durch die Arena selbst
+/// angefasst (s. SAFETY dort) — wer hier direkt schreibt, entwertet jede Vergabe.
+static mut ARENA_BITS: [u64; crate::stack_arena::woerter(ARENA_PLAETZE)] =
+    [0; crate::stack_arena::woerter(ARENA_PLAETZE)];
+/// C7c: Arena-Plaetze = 2048 EL0-Kernel-Stacks (x86: 16 MiB Spanne = 8 Bloecke statt
+/// hunderter gestreuter; aarch64: 40 MiB = 20 Bloecke).
+const ARENA_PLAETZE: usize = 2048;
+
+/// C7c: Arena bestuecken (einmalig in `configure`, vor dem ersten Thread).
+/// Gibt die belegte Spanne zurueck (fuer den Boot-Report), `0` = nicht bestueckt.
+fn kstack_arena_bestuecken() -> u64 {
+    use crate::stack_arena::{StackArena, BLOCK_2M};
+    let stapel = USER_KSTACK_SIZE;
+    let schritt = caprock_mem::PAGE as usize + stapel;
+    let spanne = (ARENA_PLAETZE as u64) * (schritt as u64);
+    // Dieselbe Zone wie die Streu-Stacks heute (`IdentityMapped`, keine neue Annahme
+    // ueber die Identitaetskarte), aber EIN zusammenhaengender Bereich, 2-MiB-ausgerichtet:
+    // so fallen die Wachen in wenige Kartenbloecke statt in hunderte gestreute.
+    let Some(cap) = mem_alloc(spanne, BLOCK_2M as u64) else {
+        return 0;
+    };
+    let basis = cap.base() as usize;
+    // Die Cap bewusst fallen lassen (Muster `table` in `configure`): die Arena lebt bis Reboot.
+    // SAFETY: einmaliger Aufruf beim Boot, bevor ein anderer Kern oder Thread laeuft;
+    // danach wird `ARENA_BITS` ausschliesslich durch die Arena unter `KSTACK_ARENA`
+    // angefasst, nie wieder direkt.
+    let bits: &'static mut [u64] = unsafe { &mut *core::ptr::addr_of_mut!(ARENA_BITS) };
+    let mut arena = match StackArena::neu(basis, stapel, ARENA_PLAETZE, bits) {
+        Ok(a) => a,
+        Err(_) => return 0,
+    };
+    // Wachen legen (x86: echte Splits, aarch64: nur gezaehlt). Schlaegt eine Wache fehl,
+    // wird genau dieser Slot gesperrt statt die ganze Arena zu verwerfen — Dichte statt
+    // Alles-oder-Nichts; gesperrte Slots zaehlen als vergeben, nie als frei.
+    for i in 0..ARENA_PLAETZE {
+        let wache_ok = match arena.wache_von_slot(i) {
+            Some(wache) => hal::mmu::guard_unmap(wache as u64),
+            None => false,
+        };
+        if !wache_ok {
+            arena.sperren(i);
+        }
+    }
+    *KSTACK_ARENA.lock() = Some(arena);
+    spanne
+}
+
+/// C7c: Arena-Vergabe (nur ungefaerbter Pfad; `None` = Streupfad weiter).
+fn kstack_arena_vergeben() -> Option<usize> {
+    KSTACK_ARENA.lock().as_mut()?.vergeben().ok()
+}
+
+/// C7c: Arena-Freigabe — `true` heisst „war ein Arena-Slot, ist gebucht".
+fn kstack_arena_freigeben(stapelbasis: usize) -> bool {
+    match KSTACK_ARENA.lock().as_mut() {
+        Some(a) => a.freigeben(stapelbasis).is_ok(),
+        None => false,
+    }
+}
+
+/// C7c: Arena-Telemetrie fuer den Bericht
+/// `(plaetze, vergeben, frei, hoechststand, abg_erschoepft, abg_ungueltig, promille)`.
+/// `(0, ..)` heisst „nicht bestueckt" — derselbe Stil wie `ZONE_MISSED` (0 = kam nicht vor).
+pub fn kstack_arena_stats() -> (usize, usize, usize, usize, u64, u64, usize) {
+    match KSTACK_ARENA.lock().as_ref() {
+        Some(a) => (
+            a.plaetze(),
+            a.vergeben_anzahl(),
+            a.frei(),
+            a.hoechststand(),
+            a.abgewiesen_erschoepft(),
+            a.abgewiesen_ungueltig(),
+            a.auslastung_promille(),
+        ),
+        None => (0, 0, 0, 0, 0, 0, 0),
+    }
+}
+
 /// Einen EL0-Kernel-Stack (16 KiB, ausgerichtet) aus `MEM` allozieren. Gibt die **physische Basis**
 /// zurück (identity-gemappt = EL1-SP-Region), oder `None` bei RAM-Erschöpfung.
 /// **Was fuer EINEN EL0-Kernel-Stack wirklich angefordert wird**: der Stack plus seine Wache.
@@ -263,6 +350,19 @@ fn claim_user_kstack_masked(mask: Option<caprock_mem::ColorMask>) -> Option<usiz
     // 16-KiB-ausgerichtet und damit der STACK bei `roh + PAGE` gerade NICHT streifenausgerichtet;
     // die Farbbedingung des gefaerbten Teils waere wieder unerfuellbar. Der Stack braucht die
     // 16-KiB-Ausrichtung nicht (die CPU verlangt fuer `rsp0` 16 Byte).
+    // C7c: Arena zuerst — ein zusammenhaengender Slot kostet keinen neuen Guard-Block
+    // (die Arena-Bloecke sind einmal aufgeteilt) und keinen MEM-Gang. Gefaerbte
+    // Anforderungen (`mask`) laufen weiter ueber den Streupfad: die Arena kennt keine
+    // Farben (Kopplung A-1.4/B-4). Arena voll oder nicht bestueckt: Streupfad unten
+    // (benennt den Mangel selbst).
+    if mask.is_none() {
+        if let Some(base) = kstack_arena_vergeben() {
+            // SAFETY: exklusiv vergebener Slot, identity-gemappt — wie Streupfad unten.
+            unsafe { crate::kstackmark::fuellen(crate::kstackmark::KL_EL0, base, sz as usize) };
+            KSTACKS.lock().live += 1;
+            return Some(base);
+        }
+    }
     let roh = benannt_alloc(MANGEL_KERNEL_STACK, USER_KSTACK_ALLOC, |n| match mask {
         // Ueber die Politik aus `mem_alloc`/`alloc_colored` (unten zuerst), nicht daran vorbei:
         // eine Vorgabe, an der eine einzige Stelle vorbeigreift, ist keine Vorgabe (E-Rest 3b).
@@ -297,6 +397,12 @@ fn claim_user_kstack_masked(mask: Option<caprock_mem::ColorMask>) -> Option<usiz
 }
 /// Einen (noch keinem Thread zugeordneten) Kstack wieder an `MEM` freigeben (Fehlerpfad vor `record`).
 fn release_user_kstack(base: usize) {
+    // C7c: Arena-Slot — keine `guard_remap`, keine MEM-Rueckgabe je Stack; nur Bit loeschen.
+    if kstack_arena_freigeben(base) {
+        let mut p = KSTACKS.lock();
+        p.live = p.live.saturating_sub(1);
+        return;
+    }
     // **Die Wache zuerst zurueck in die Karte** -- sonst gaebe der Allokator eine Seite heraus,
     // die niemand mehr erreichen kann, und der naechste Zugriff darauf waere ein #PF an einer
     // Adresse, die laut Freiliste in Ordnung ist.
@@ -445,9 +551,15 @@ fn reclaim_user_kstack(tid: ThreadId, anlass: &'static str) {
         // eigenen Stack. Sechs `el0-trap`-Zeilen, `ring3`/`iso`/`park` rot. **Wer eine
         // Anforderung vergroessert, muss JEDEN Freigabepfad mitnehmen, nicht den erstbesten.**
         let roh = base - caprock_mem::PAGE;
-        hal::mmu::guard_remap(roh);
-        MEM.lock()
-            .free_region(PhysRegion::new(roh, USER_KSTACK_SIZE as u64 + caprock_mem::PAGE));
+        // C7c: Arena-Slot oder Streu-Block — die Buchfuehrung oben (`base_of`/`live`) ist
+        // in beiden Faellen schon bereinigt; hier geht es nur um Karte + Allokator.
+        // Ein Arena-Slot braucht weder `guard_remap` (Wache liegt im Arena-Block) noch
+        // `free_region` (die Arena lebt bis Reboot); ein Streu-Block braucht beides.
+        if !kstack_arena_freigeben(base as usize) {
+            hal::mmu::guard_remap(roh);
+            MEM.lock()
+                .free_region(PhysRegion::new(roh, USER_KSTACK_SIZE as u64 + caprock_mem::PAGE));
+        }
     }
 }
 /// **C4: ueber alle NOCH LEBENDEN EL0-Kstacks fegen** und ihren Wasserstand einrechnen. Gibt
@@ -1148,6 +1260,11 @@ impl SchedOps for KernelSched {
         if let Some((_, c)) = with_owner(tid, |s, _| s.unblock(tid).then_some(())) {
             kick(c);
         }
+    }
+    fn wartet_auf_ipc(&mut self, tid: ThreadId) -> bool {
+        // A2-Rest, zweite Partei: reine Lesefrage an den besitzenden Scheduler (Muster
+        // `frame_of` darueber) — kein Lock, kein Kick, kein Eingriff.
+        with_owner(tid, |s, _| Some(s.wartet_auf_ipc(tid))).map(|(w, _)| w).unwrap_or(false)
     }
     fn park_current(&mut self, core: usize, frame: usize) -> Option<usize> {
         SCHEDS[core].lock().park_current(core, frame)
@@ -1950,6 +2067,11 @@ pub fn configure(cores: usize) -> (usize, usize, usize, u64) {
             .attach_owner(owner as *mut caprock_microkit::ThreadOwner, total)
     };
 
+    // C7c: Stack-Arena bestuecken — steht hier am Ende von `configure`, nicht bei den
+    // KSTACKS-Tabellen oben, weil `table` dort `bytes` leiht: einmalig, vor dem ersten
+    // Thread, `0` = nicht bestueckt (Streupfad weiter). Die Spanne steht im Boot-Report.
+    bytes += kstack_arena_bestuecken();
+
     (cores, total, per_core, bytes)
 }
 
@@ -2074,6 +2196,23 @@ pub fn configure_caps() -> u64 {
         CAPS.write().pds.attach(
             pds_mem as *mut caprock_microkit::Pd,
             caprock_microkit::NPDS,
+        )
+    };
+    // TODO0 K1c: der Pool der PD-Cspace-Laeufe. Richtgroesse `NPDS * STANDARD_PLAETZE` —
+    // genau das, was die alten Inline-Arrays kosteten; groessere PDs nehmen sich ihren
+    // Mehrbedarf aus demselben Topf. VOR der ersten PD, sonst ist jede Erzeugung eine
+    // benannte `PoolErschoepft`-Absage (fail-closed, kein Absturz).
+    let cspace_mem = table(
+        caprock_microkit::NPDS
+            * caprock_microkit::STANDARD_PLAETZE as usize
+            * core::mem::size_of::<Option<CapPtr>>(),
+        core::mem::align_of::<Option<CapPtr>>().max(4096),
+    );
+    // SAFETY: wie oben (exklusiv, ausgerichtet, dauerhaft, einmalig).
+    unsafe {
+        CAPS.write().pds.attach_cspace_pool(
+            cspace_mem as *mut Option<CapPtr>,
+            caprock_microkit::NPDS * caprock_microkit::STANDARD_PLAETZE as usize,
         )
     };
 
@@ -12748,6 +12887,19 @@ pub fn run_quiesce() -> bool {
     ok
 }
 
+/// **C9c — Raten-Grenze des Endpoint-Sweeps in [`purge_ipc_queues`].**
+///
+/// Eine Rate haelt `IPC_ORPHANS` als aeusseren Lock ueber hoechstens so viele
+/// Endpoint-Sperrungen plus das Entblocken ihrer eigenen Waisen; danach wird
+/// freigegeben (IRQs wieder an) und erst dann laeuft die naechste Rate. Bei
+/// `NEPS + NNTFNS = 20 128` sind das rund 40 Raten statt eines einzigen
+/// 7,3-ms-Blocks (gemessen 20,4 Mio. Zyklen je Thread-Tod). Die Zahl ist eine
+/// Latenz-Grenze, keine Kapazitaet: kleiner waere mehr Sperrwechsel je Tod,
+/// groesser waere naeher am alten Block. Der Notification-Sweep braucht keine
+/// eigene Grenze — er laeuft ohne aeusseren Lock, jede Iteration ist dort
+/// bereits ein eigener kurzer Abschnitt.
+const PURGE_EP_SCHRITT: usize = 512;
+
 /// **Eager-Cleanup beim Thread-Tod:** den (sterbenden) Thread `tid` aus ALLEN
 /// Endpoint-Queues (senders/receivers/caller) und Notification-Waitern entfernen.
 /// Verhindert tote TCBs in den festen Queues (Corpse-Fill -> verdrängte echte Sender)
@@ -12769,45 +12921,78 @@ pub fn purge_ipc_queues(tid: ThreadId) {
     // ein Stack-Overflow statt eines Liveness-Bugs. Dieselbe Falle, die A-3.3 fuer den
     // Finalisierungspuffer aufgeloest hat -- die Flaeche kommt jetzt aus dem Boot-RAM.
     //
-    // **Der Lock wird ueber die ganze Funktion gehalten**, und das ist Absicht: die Flaeche ist
-    // jetzt geteilt statt lokal. Wer sie zum Einsammeln sperrt, sie zum Entblocken freigibt und
-    // danach wieder liest, liest moeglicherweise die Waisen eines anderen Kerns -- ein zweiter
-    // sterbender Thread wuerde die Eintraege dazwischen ueberschreiben. Der Preis ist, dass
-    // Thread-Tode kernuebergreifend serialisieren; das ist ein seltener, kalter Pfad.
+    // **C9c — warum der Sweep in Raten laeuft statt in einem Block:** die Flaeche ist
+    // geteilt statt lokal. Hielte EIN aeusserer Lock ueber Sammeln UND Entblocken des
+    // ganzen Sweeps, serialisierten Thread-Tode kernuebergreifend und der Kern liefe
+    // O(Endpoints + Notifications) = 20 128 Einzelsperrungen je Thread-Tod mit
+    // maskierten Interrupts (gemessen 20,4 Mio. Zyklen / 7,3 ms). Darum gilt je Rate
+    // die Regel: **keine lebende Waise uebersteht das Freigeben.** Jede Rate sammelt
+    // ihre Waisen, entblockt sie noch unter derselben Haltung und gibt erst danach
+    // frei — was beim Freigeben in der Flaeche steht, ist restlos `None`. Ein zweiter
+    // sterbender Thread auf einem anderen Kern findet die Flaeche dadurch immer leer
+    // vor, egal wie sich die Raten verzahnen: keine Waise geht verloren, keine wird
+    // doppelt entblockt.
     //
-    // Sperrordnung: IPC_ORPHANS ist damit **aeusserer** Lock ->
-    // IPC_ORPHANS < EPS[i]/NTFNS[i] < SCHEDS. Kein anderer Pfad nimmt ihn, insbesondere keiner
+    // Sperrordnung je Rate: IPC_ORPHANS ist damit **aeusserer** Lock ->
+    // IPC_ORPHANS < EPS[i] < SCHEDS. Kein anderer Pfad nimmt ihn, insbesondere keiner
     // mit gehaltenem EPS oder SCHEDS -> kein Zyklus.
     // **C4: dieser Pfad ist O(Endpoints + Notifications) JE THREAD-TOD** -- und er sperrt jedes
     // Objekt einzeln. Gezaehlt, nicht gestoppt: eine Iterationszahl ist eine Eigenschaft des
     // Programms, eine Zeitmessung nicht (D10). Bei `NEPS + NNTFNS = 20 128` und 10 000
     // sterbenden Threads sind das 201 Millionen Sperroperationen -- das ist die Groesse, die
     // ein Teardown von zehntausend PDs kostet, und sie stand bisher nirgends.
+    //
+    // **Messlatte (wo die 20,4M-Zahl herkommt und wo der Effekt sichtbar wird):**
+    // die ITERATIONSZAHL zaehlen `PURGE_IPC_CALLS`/`PURGE_IPC_ITER` (Bericht
+    // `purge_ipc_queues:` in `kernel/src/arch/x86_64/bringup.rs`); die LATENZ misst
+    // die Sperrhaltedauer-Marke (`crates/caprock-sync`, Bericht `sperre`), deren
+    // Schuldposten `kernel/src/system.rs` mit Deckel 24 Mio. Zyklen (= 856 Promille
+    // eines Ticks) in `kernel/src/sperrmark.rs` steht. Diese Zeilen bleiben
+    // unveraendert — der Umbau aendert die Haltung, nicht die Zaehlung.
+    //
+    // **Bewusst aufgegeben:** die alte Gesamt-Reihenfolge „erst ALLES bereinigen,
+    // dann alle Waisen wecken". Die Waisen einer Rate werden geweckt, bevor die
+    // naechste Rate bereinigt ist — genau diese Ordnung war der 7ms-Block. Ein
+    // geweckter Aufrufer sieht nur `ERR_SERVER_GONE`; die Bereinigung selbst bleibt
+    // vollstaendig (jeder Endpoint, jede Notification, jede Waise genau einmal).
     PURGE_IPC_CALLS.fetch_add(1, Ordering::Relaxed);
     PURGE_IPC_ITER.fetch_add((eps().len() + ntfns().len()) as u64, Ordering::Relaxed);
-    let mut orphans = IPC_ORPHANS.lock();
-    let mut no = 0usize;
-    for ep in eps().iter() {
-        let mut e = ep.lock();
-        if e.is_used() {
-            e.purge_thread(tid);
-            if let Some(caller) = e.owner_died(tid) {
-                if no < orphans.len() {
-                    orphans[no] = Some(caller);
-                    no += 1;
+    let alle_eps = eps();
+    let mut start = 0usize;
+    while start < alle_eps.len() {
+        let ende = (start + PURGE_EP_SCHRITT).min(alle_eps.len());
+        // Sammeln UND Entblocken DIESER Rate unter einer Haltung (s. Regel oben).
+        let mut orphans = IPC_ORPHANS.lock();
+        let mut no = 0usize;
+        for ep in &alle_eps[start..ende] {
+            let mut e = ep.lock();
+            if e.is_used() {
+                e.purge_thread(tid);
+                if let Some(caller) = e.owner_died(tid) {
+                    if no < orphans.len() {
+                        orphans[no] = Some(caller);
+                        no += 1;
+                    }
                 }
             }
+        } // EPS-Locks dieser Rate sind hier alle wieder frei
+        for i in 0..no {
+            if let Some(caller) = orphans[i].take() {
+                unblock_with_error(caller, caprock_abi::result::ERR_SERVER_GONE);
+            }
         }
-    } // EPS-Locks sind hier alle wieder frei
+        // Flaeche dieser Rate restlos geraeumt -> Freigabe mit leeren Haenden;
+        // zwischen den Raten sind die IRQs wieder an (kein 7ms-Block mehr).
+        drop(orphans);
+        start = ende;
+    }
+    // Der Notification-Sweep erzeugt keine Waisen und braucht den aeusseren Lock
+    // gar nicht: jede Iteration sperrt genau ein Objekt und gibt es sofort wieder
+    // frei — von sich aus schon in Schritten, nicht in einem Block.
     for n in ntfns().iter() {
         let mut nt = n.lock();
         if nt.is_used() {
             nt.purge_thread(tid);
-        }
-    }
-    for i in 0..no {
-        if let Some(caller) = orphans[i].take() {
-            unblock_with_error(caller, caprock_abi::result::ERR_SERVER_GONE);
         }
     }
 }

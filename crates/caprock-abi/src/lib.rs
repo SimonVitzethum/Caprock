@@ -107,6 +107,22 @@ pub mod sys {
     /// Ohne das kann ein langlebiger Dienst, der Caps per IPC empfängt, seine Slots nicht
     /// freigeben und läuft gegen `CAP_BUDGET_PER_PD`. Mit dem Root-Task (A-2) wird aus dieser
     /// ABI-Lücke ein Betriebsproblem: er ist genau so ein Dienst.
+    ///
+    /// ## Das ist bereits der Selbst-Lösch-Syscall aus A4 — es gibt keinen zweiten
+    ///
+    /// A4 verlangte „mindestens `SYS_CDELETE` (eigener Slot)". Genau das steht hier: aufgelöst
+    /// wird `slot` in der PD **des Aufrufers** (`pd_of(thread)`), ein fremder Slot existiert in
+    /// diesem Cspace gar nicht. Wer einen fremden oder leeren Slot nennt, bekommt die benannte
+    /// Absage [`result::ERR_BADCAP`] — „fremd" und „leer" fallen zusammen, weil beides aus Sicht
+    /// des Aufrufers dasselbe ist: *dort liegt nichts, das dir gehört*. Daneben stehen drei
+    /// weitere benannte Ausgänge, jeder mit eigenem Grund: [`result::ERR_NOPD`] (der Aufrufer
+    /// gehört zu keiner PD), [`result::ERR_HASCHILDREN`] (noch abgeleitete Caps daran — der Cap
+    /// bleibt unverändert im Slot, ein halb entfernter Cap wäre schlimmer als gar keiner) und
+    /// [`result::ERR_INUSE`] (die Stack-Cap eines lebenden Threads — erst `KILL`, dann löschen).
+    /// Eine zweite Nummer für „dasselbe, aber wirklich nur eigene" könnte nichts anderes
+    /// auflösen und wäre ein toter Syscall; die Nummer `30` ist seit A2-Rest als
+    /// [`CALL_TIMEOUT`](Self::CALL_TIMEOUT) vergeben (Lücke `4` bleibt historische Lücke,
+    /// nie vergeben).
     pub const CDELETE: u64 = 14;
     /// **Einen Cap im eigenen Cspace kopieren** (A-3.2). `x1` = Quell-Slot, `x2` = Ziel-Slot
     /// (muss frei sein), `x3` = gewünschte Rechte-Bitmaske (1=R, 2=W, 4=X), `x4` = Badge für die
@@ -419,6 +435,51 @@ pub mod sys {
     /// `msleep` und `delayed_work` baut, ohne je ein Kernelobjekt anzulegen (Z22, P4): die
     /// Warteschlange bleibt eine Liste im Speicher der PD, die Frist liegt im Scheduler.
     pub const PARK_TIMEOUT: u64 = 29;
+
+    /// **Aufruf mit Frist** (A2-Rest): wie [`CALL`], aber mit Rueckkehr.
+    ///
+    /// `MSG0` = Frist in Ticks (`0` = keine, dann wie `CALL` mit 3-Wort-Nachricht).
+    /// Die Nachricht steht in `MSG1..MSG3` -- drei Worte statt vier: vier Worte plus Frist
+    /// passen nicht in `x2..x5`, und ein Flag in `TAG` waere ein zweiter Parameter, der zwei
+    /// Bedeutungen traegt. Der Dispatch schiebt vor dem Rendezvous nach unten (`MSG1->MSG0`,
+    /// ...), der Server sieht eine normale 3-Wort-Nachricht. Rueckgabe `OK` oder
+    /// [`result::ERR_TIMEOUT`]; die Antwort bleibt vier Worte.
+    ///
+    /// Der bewachte Grund ist `IPC` (nicht `PARK`): `unblock` (Antwort) und Timer entfernen
+    /// denselben Grund, das Rennen entscheidet `fristen_faellig` wie bei [`WAIT`]
+    /// (Signal gewinnt). Laeuft die Frist ab, schreibt der Timer `ERR_TIMEOUT` und weckt;
+    /// ein spaetes `reply` findet keinen Wartenden mehr und wird benannt abgewiesen
+    /// (kein Schreiben in fremde Frames).
+    pub const CALL_TIMEOUT: u64 = 30;
+
+    /// **Speicher der Ziel-PD schreiben** (Debugger v2, `M`-Paket der gdbserver-PD).
+    ///
+    /// `MSG0` Cap-Slot (`DebugControl`) · `MSG1` Ziel-VA · `MSG2` Laenge ·
+    /// `MSG3` VA des eigenen Puffers im Aufrufer. Gibt uebertragene Bytes in
+    /// [`reg::MSG0`] zurueck. Wie [`DEBUG_READ_MEM`](Self::DEBUG_READ_MEM) gegen eine
+    /// benannte Kapazitaet (`debug::WRITE_MAX`) gedeckelt — dieselbe Latenzform,
+    /// gespiegelt: der Aufrufer schleift, seine Schleife ist preemptibel.
+    ///
+    /// Nummer `33`: `30` ist `CALL_TIMEOUT`, `31`/`32` bleiben bewusst frei.
+    pub const DEBUG_WRITE_MEM: u64 = 33;
+
+    /// **Einen Thread genau einen Schritt tun lassen** (Debugger v2, `s`-Paket).
+    ///
+    /// `MSG0` Cap-Slot (`DebugControl`) · `MSG1` rohe ThreadId. Setzt keinen
+    /// `BlockReasons`-Zustand, sondern scharft den Einzelschritt der CPU (`TF` auf
+    /// x86, `MDSCR_EL1.SS` + `PSTATE.SS` auf aarch64, s. `hal::debug`) und laesst den
+    /// angehaltenen Thread genau einen Befehl ausfuehren. Abgewiesen mit
+    /// [`result::ERR_DEBUG_BUSY`], wenn das Ziel nicht gehalten ist.
+    pub const DEBUG_SINGLE_STEP: u64 = 34;
+
+    /// **Hardware-Breakpoint setzen/loeschen** (Debugger v2, `Z`/`z`-Pakete).
+    ///
+    /// `MSG0` Cap-Slot (`DebugControl`) · `MSG1` rohe ThreadId · `MSG2` Adresse ·
+    /// `MSG3` Art (`0` Software — abgewiesen, s. Plan §10d · `1` Hardware). Vier
+    /// Register je Kern sind eine benannte Kapazitaet wie der Halt selbst (§8a):
+    /// Erschoepfung wird abgewiesen, nicht still geteilt. Erfordert pro-Thread-Sichern
+    /// der Debugregister im Kontextwechsel (`hal::debug`).
+    pub const DEBUG_HWBREAK: u64 = 35;
 }
 
 /// Rights and frame-word names for the debug syscalls (Z6b).
@@ -436,6 +497,13 @@ pub mod debug {
     /// target's page tables under a lock, and an unbounded caller-chosen length is a latency hole
     /// nobody sees until it is a hang. The caller loops instead, and its loop is preemptible.
     pub const READ_MAX: u64 = 512;
+
+    /// How many bytes one [`super::sys::DEBUG_WRITE_MEM`] transfers at most.
+    ///
+    /// The mirror of [`READ_MAX`]: the write walks the **target's** page tables under
+    /// a lock, so the same latency hole applies in the other direction. Same value,
+    /// same reason — one capacity per direction, not one number with two meanings.
+    pub const WRITE_MAX: u64 = 512;
 }
 
 /// **Das Register-Layout der Umleitungsnachricht** (Z26/A3) — was der Handler in seinem `RECV`
@@ -828,6 +896,16 @@ mod nummern {
     }
 
     #[test]
+    fn debugger_v2_syscalls_liegen_hinter_call_timeout() {
+        // `CALL_TIMEOUT = 30`; `31`/`32` bleiben bewusst frei; v2 liegt dahinter.
+        assert_eq!(sys::CALL_TIMEOUT, 30);
+        assert_eq!(sys::DEBUG_WRITE_MEM, 33);
+        assert_eq!(sys::DEBUG_SINGLE_STEP, 34);
+        assert_eq!(sys::DEBUG_HWBREAK, 35);
+        assert_eq!(super::debug::WRITE_MAX, super::debug::READ_MAX);
+    }
+
+    #[test]
     fn jede_syscall_nummer_ist_einmalig() {
         let alle = [
             sys::YIELD,
@@ -855,10 +933,14 @@ mod nummern {
             sys::DEBUG_CONTINUE,
             sys::DEBUG_READ_MEM,
             sys::DEBUG_WRITE_REGS,
+            sys::DEBUG_WRITE_MEM,
+            sys::DEBUG_SINGLE_STEP,
+            sys::DEBUG_HWBREAK,
             sys::BIND_IRQ,
             sys::SETTLS,
             sys::CLOCK,
             sys::PARK_TIMEOUT,
+            sys::CALL_TIMEOUT,
         ];
         let mut sortiert = alle;
         sortiert.sort_unstable();
@@ -879,5 +961,23 @@ mod nummern {
         // `PARK_TIMEOUT` braucht genau diese beiden Ausgaenge, und beide muessen verschieden
         // sein — sonst kann der Aufrufer „geweckt" von „abgelaufen" nicht unterscheiden.
         assert_ne!(result::OK, result::ERR_TIMEOUT);
+    }
+
+    #[test]
+    fn selbst_loeschen_ist_benannt_abgesichert() {
+        // A4 ist durch `CDELETE = 14` geschlossen: eigener Slot im eigenen Cspace, kein Cap
+        // noetig, fremde/leere Slots → `ERR_BADCAP`. Die vier Absagen muessen vier verschiedene
+        // Codes sein — sonst koennte der Aufrufer „dort liegt nichts von dir" nicht von „du
+        // hast Kinder daraus abgeleitet" oder „der Thread lebt noch" unterscheiden.
+        assert_eq!(sys::CDELETE, 14);
+        assert_ne!(result::OK, result::ERR_BADCAP);
+        assert_ne!(result::ERR_BADCAP, result::ERR_NOPD);
+        assert_ne!(result::ERR_BADCAP, result::ERR_HASCHILDREN);
+        assert_ne!(result::ERR_BADCAP, result::ERR_INUSE);
+        assert_ne!(result::ERR_HASCHILDREN, result::ERR_INUSE);
+        // Geprueft am 2026-09-09: `30` ist seit A2-Rest als `CALL_TIMEOUT` vergeben
+        // (`4` ist eine historische Luecke, nie vergeben). Naechste freie Nummern: `31`, `32`.
+        assert_eq!(sys::PARK_TIMEOUT, 29);
+        assert_eq!(sys::CALL_TIMEOUT, 30);
     }
 }

@@ -77,7 +77,7 @@ mit_deps() { # $1 = Name, $2 = Crate-Verzeichnis, $3.. = Abhaengigkeiten (Verzei
     rm -rf "$SA"
 }
 
-ZIELE="${*:-mem part fat cycles loader cap virtio dma wait region irte irteneg grossdmaneg dmar dmarneg iohealth smt numa bootparams fbtext redirect redirectneg typestate ipctreue schedtreue}"
+ZIELE="${*:-mem part fat cycles loader cap virtio dma wait region irte irteneg grossdmaneg dmar dmarneg iohealth smt numa bootparams fbtext redirect cspace redirectneg typestate ipctreue schedtreue}"
 for z in $ZIELE; do
     case "$z" in
         mem)  einzeln mem  "$ROOT/crates/caprock-mem/src/lib.rs" ;;
@@ -94,6 +94,10 @@ for z in $ZIELE; do
         # Entzug einer Cap) und mit LITERALEN ausloesbar. Der Rest des Primitivs (Cap-Aufloesung,
         # Frame-Transport, Scheduler) haengt an `caprock-hal` und wird in QEMU geprueft.
         redirect) einzeln redirect "$ROOT/crates/caprock-sched/src/redirect.rs" ;;
+        # TODO0 K1c: die Vergabe-Logik des variablen PD-Cspace steht genau einmal in
+        # `cspace.rs` (nur `core`, kein `alloc`/`unsafe`) und wird hier als DATEI
+        # geprueft — der Kernel selbst haengt an `caprock-hal` und baut auf dem Host nie.
+        cspace) einzeln cspace "$ROOT/crates/caprock-microkit/src/cspace.rs" ;;
         # `caprock-loader` ist abhaengigkeitsfrei und traegt die Parser fuer Boot-Archiv, ELF64
         # und **System-Manifest**. Es gibt kein `.github/workflows/` in diesem Baum -- die Tests
         # liefen also nirgends, genau wie die von `caprock-cap` vor B-5.5. Kani prueft Beweise,
@@ -231,7 +235,7 @@ for z in $ZIELE; do
             else
                 bash "$ROOT/tools/verus-modelltreue-sched.sh" || fail=1
             fi ;;
-        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio dma wait region irte irteneg grossdmaneg dmar dmarneg iohealth smt numa bootparams fbtext redirect redirectneg typestate ipctreue schedtreue)"; fail=1 ;;
+        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio dma wait region irte irteneg grossdmaneg dmar dmarneg iohealth smt numa bootparams fbtext redirect cspace redirectneg typestate ipctreue schedtreue)"; fail=1 ;;
     esac
 done
 

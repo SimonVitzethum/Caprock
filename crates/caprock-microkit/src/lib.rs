@@ -26,6 +26,14 @@ use caprock_sched::{redirect, SchedOps, ThreadId};
 use caprock_slab::Slab;
 use caprock_sync::{RwSpinLock, SpinLock};
 
+/// Variabler PD-Cspace: Vergabe, Absagen, Freigabe (todo.md A3, TODO0 K1c).
+///
+/// Abhaengigkeitsfrei (`core` nur) und per `rustc --test` als Datei pruefbar — die
+/// Buchhaltung steht genau einmal dort, `PdTable` ruft sie auf, statt sie nachzubauen.
+mod cspace;
+pub use cspace::{CspaceAbweisung, STANDARD_PLAETZE};
+use cspace::{CspaceAnker, Vergabe};
+
 /// Größe des PD-Pools. **Öffentlich seit A-3.4**: wie viele Cap-Slots das System vorhalten muss,
 /// folgt aus `NPDS * CAP_BUDGET_PER_PD` — diese Rechnung gehört an *eine* Stelle
 /// ([`CAP_SLOTS_FOR_ALL_PDS`]) und nicht als abgeschriebene Zahl in den Boot-Code.
@@ -39,8 +47,15 @@ use caprock_sync::{RwSpinLock, SpinLock};
 /// Auf `TARGET_THREADS` abgestimmt: im Grenzfall bekommt jeder Thread seine eigene PD. Was das
 /// kostet, meldet der Boot-Report — die Entscheidung hängt an einer gemessenen Größe.
 pub const NPDS: usize = 10_000;
-/// Cap-Slots je PD-Cspace (Adressraum der lokalen Slot-Indizes).
-const NCAPS: usize = 16;
+/// Cap-Slots je PD-Cspace — die **Vorgabe**, keine Schranke mehr.
+///
+/// Bis TODO0 K1c war das die harte Array-Laenge (`Pd::cspace: [..; NCAPS]`): eine
+/// Treiber-PD mit dreissig Caps passte nicht, gleich was das Budget erlaubte. Jetzt ist
+/// es die Standardgroesse (`plaetze == 0` heisst „16"); groessere Laeufe vergibt
+/// [`PdTable`] aus dem beim Boot angehaengten Cspace-Pool
+/// ([`PdTable::attach_cspace_pool`], Vorbild A-3.4). Bestehende 16er-PDs verhalten sich
+/// bitgleich zu frueher.
+const NCAPS: usize = STANDARD_PLAETZE as usize;
 
 /// **Cap-Budget je PD** (Fairness-/DoS-Schranke).
 ///
@@ -67,36 +82,38 @@ const NCAPS: usize = 16;
 /// auszustatten.
 pub const CAP_BUDGET_PER_PD: usize = 10;
 
-/// **Obergrenze fuer ein einzelnes PD-Budget** (2026-08-26) — **`NCAPS`, und das ist ein Befund.**
+/// **Obergrenze fuer ein einzelnes PD-Budget** (2026-08-26) — die **Vorgabe des
+/// Deckels**, seit TODO0 K1c je Tabelle einstellbar ([`PdTable::set_budget_deckel`]).
 ///
 /// Ohne Deckel koennte eine PD den Vorrat aller anderen aufbrauchen -- dieselbe Cross-PD-DoS-Form,
 /// gegen die [`CAP_BUDGET_PER_PD`] ueberhaupt eingefuehrt wurde, nur eine Ebene hoeher. Der Deckel
 /// steht **neben** dem Vorrat und ersetzt ihn nicht: er begrenzt den Einzelnen, der Vorrat die
 /// Summe. Wer nur eines von beidem hat, hat keine Zusage.
 ///
-/// ## Warum er `NCAPS` ist und nicht 64
+/// ## Warum die Vorgabe `NCAPS` ist
 ///
 /// Hier stand zuerst `64`. Der Selbsttest hat es am selben Tag widerlegt: der **lokale Cspace
-/// einer PD ist ein Array von [`NCAPS`] Slots** (`Pd::cspace`), und `install_cap` weist jeden Slot
-/// `>= NCAPS` ab -- ohne dass das Budget je gefragt wuerde. Ein Budget von 20 ist also kein
-/// grosszuegiges Budget, sondern eine **unerreichbare Zusage**: die Installation scheitert bei 16
-/// an der Struktur, und die Absage traegt nicht einmal den Grund „Budget".
+/// einer PD war ein Array von [`NCAPS`] Slots** (`Pd::cspace`), und `install_cap` wies jeden Slot
+/// `>= NCAPS` ab -- ohne dass das Budget je gefragt wuerde. Ein Budget von 20 war also kein
+/// grosszuegiges Budget, sondern eine **unerreichbare Zusage**.
 ///
 /// *Ein Kriterium, das die gepruefte Sache nicht erreichen KANN, ist kein strenges Kriterium,
 /// sondern gar keins* -- und ein Deckel ueber der Struktur ist dieselbe Form.
 ///
-/// **Damit ist `NCAPS` der eigentliche Blocker fuer eine Treiberumgebung**, nicht das Budget: 16
-/// Slots je PD sind hart, gleich was jemand anfordert. Das Konto hebt die erreichbare Zahl von 8
-/// auf 16 und kostet die anderen zehntausend PDs nichts; darueber hinaus braucht es einen
-/// **variablen** Cspace, und das ist eine eigene Aenderung (s. `todo.md`).
+/// Seit TODO0 K1c ist der Cspace variabel, und die Schranke ist mitgewachsen: statt des
+/// entfernten `const assert!(CAP_BUDGET_MAX <= NCAPS)` prueft die Erzeugung jetzt
+/// **dynamisch**, ob das Budget in die Plaetze passt
+/// ([`CspaceAbweisung::BudgetPasstNicht`]). Ein Deckel ueber der Struktur waere wieder
+/// eine Zusage, die die Struktur nicht halten kann — und sie fiele erst der PD auf, die
+/// sie einloest. Fail-closed zur Laufzeit statt zur Bauzeit.
+///
+/// **Damit ist `NCAPS` nicht mehr der Blocker fuer eine Treiberumgebung**: wer dreissig
+/// Caps braucht, fordert Budget 30 mit 32 Plaetzen an und hebt den Deckel der Tabelle
+/// (`set_budget_deckel`) — die anderen zehntausend PDs kostet das nichts.
 pub const CAP_BUDGET_MAX: usize = NCAPS;
 
-// Ein Deckel oberhalb des Slot-Arrays waere eine Zusage, die die Struktur nicht halten kann --
-// und sie fiele erst der PD auf, die sie einloest. Fail-closed zur Bauzeit.
-const _: () = assert!(
-    CAP_BUDGET_MAX <= NCAPS,
-    "CAP_BUDGET_MAX ueber NCAPS: der lokale Cspace hat nur NCAPS Slots, das Budget waere unerfuellbar"
-);
+// Die Vorgabe liegt unter dem Deckel — was der Standard anfordert, muss der Deckel
+// hergeben, sonst waere jede Standard-Erzeugung eine benannte Absage.
 const _: () = assert!(
     CAP_BUDGET_PER_PD <= CAP_BUDGET_MAX,
     "die Vorgabe liegt ueber dem Deckel"
@@ -255,6 +272,12 @@ impl Caps {
         let mut abgelehnte_angebote = 0usize;
         let mut neue_slots = 0usize;
         for &(slot, cap) in endow {
+            // Jenseits des Laufs gibt es keinen Slot — auch nicht als Angebot: ein Angebot
+            // braucht einen Ziel-Slot, und was nicht adressierbar ist, ist eine Zusage,
+            // die nicht haelt (derselbe Fail-closed wie bei `install_cap`).
+            if slot >= self.pds.cspace_len_von(pd) {
+                return Err(slot);
+            }
             // Ein belegter Slot wird ERSETZT und kostet kein Budget — dieselbe Regel wie in
             // `budget_allows`, und sie steht deshalb auch nur dort.
             let ist_neu = self.pds.cap_at(pd, slot).is_none();
@@ -264,6 +287,9 @@ impl Caps {
                 neue_slots += usize::from(ist_neu);
                 continue;
             }
+            // Die Angebots-Maske ist ein `u16` aus der ABI (Slots 0..15) — Slots jenseits
+            // davon sind immer Zusagen des Manifests. Die ABI-Vorgabe steht in fremder
+            // Hand; was sie nicht ausdrueckt, drueckt Ablehnung aus, nicht Zustimmung.
             if slot < 16 && angebote & (1u16 << slot) != 0 {
                 abgelehnte_angebote += 1;
                 continue;
@@ -302,9 +328,16 @@ impl Caps {
             if !self.pds.is_used(pd) {
                 continue;
             }
-            for cap in self.pds.caps_of(pd).into_iter().flatten() {
-                // Ein nicht auflösbares Handle markiert nichts — es ist kein Verbrauch.
-                let _ = self.cspace.mark_slot(cap, seen);
+            // Ueber die Lauf-Laenge, nicht ueber das Legacy-Fenster: was jenseits von
+            // Slot 15 liegt, ist Verbrauch auf PD-Budget und darf nicht als
+            // Kernel-Reserve gezaehlt werden (falsche Richtung: die Pruefung ginge durch,
+            // obwohl sie es nicht sollte — dieselbe Form wie die Ueberzaehlung, vor der
+            // der Kommentar oben warnt).
+            for slot in 0..self.pds.cspace_len_von(pd) {
+                if let Some(cap) = self.pds.cap_at(pd, slot) {
+                    // Ein nicht auflösbares Handle markiert nichts — es ist kein Verbrauch.
+                    let _ = self.cspace.mark_slot(cap, seen);
+                }
             }
         }
         self.cspace.unmarked_used_slots(seen)
@@ -375,7 +408,7 @@ impl Caps {
                 None => continue,
             };
             // Cap-Typ-Policy: erlaubte Cap-Typen je Domäne.
-            for slot in 0..NCAPS {
+            for slot in 0..self.pds.cspace_len_von(pd) {
                 if let Some(cap) = self.pds.cap_at(pd, slot) {
                     if let Some((kind, _, _)) = self.cspace.lookup(cap) {
                         if kind_is_hardware(kind) && domain != Domain::HardwareLand {
@@ -409,7 +442,7 @@ impl Caps {
                 }
                 // Regel 5: ein Backend hält NUR Kommunikations-Caps für seinen eigenen Kanal.
                 let (cep, cntfn) = self.pds.chan_of(pd);
-                for slot in 0..NCAPS {
+                for slot in 0..self.pds.cspace_len_von(pd) {
                     if let Some(cap) = self.pds.cap_at(pd, slot) {
                         if let Some((kind, _, _)) = self.cspace.lookup(cap) {
                             match kind {
@@ -544,8 +577,26 @@ pub struct Pd {
     /// neue PD den Thread nicht in ihrem `thread`-Feld trug. Eine Beschleunigung, die eine
     /// Fremd-PD-Zuordnung erfindet, wäre schlimmer als der lineare Scan.
     epoch: u32,
-    /// Lokaler Cap-Index -> globaler CapPtr.
-    cspace: [Option<CapPtr>; NCAPS],
+    /// Lokaler Cspace dieser PD: Lauf `[cspace_start, cspace_start + cspace_len)` im
+    /// Cspace-Pool der Tabelle (TODO0 K1c).
+    ///
+    /// Bis dahin ein Inline-Array `[Option<CapPtr>; NCAPS]` fester Laenge — 16 Slots je
+    /// PD, hart, und 256 Byte je Eintrag auch fuer PDs, die vier Caps halten. Jetzt kostet
+    /// die Groesse Pool-Speicher statt Struktur: Standard-PDs bekommen 16 Plaetze
+    /// (bitgleich zu frueher), Treiber-PDs mehr. Die Aufloesung Slot -> Pool-Index steht
+    /// in [`PdTable::cap_at`]; der Lauf selbst wird bei der Erzeugung vergeben und bei
+    /// der Freigabe zurueckgegeben (s. `cspace::Vergabe`).
+    cspace_start: u32,
+    /// Laenge des Cspace-Laufs in Slots. `0` fuer freie Eintraege — ein belegter Eintrag
+    /// hat immer mindestens einen Platz (die Vergabe gibt keine leeren Laeufe an PDs).
+    cspace_len: u32,
+    /// Freilisten-Verkettung (Index + 1, `0` = Ende) — nur gueltig, solange der Eintrag
+    /// **frei** ist (s. `cspace::AnkerAblage`).
+    ///
+    /// Die zurueckgegebenen Laeufe brauchen eine Ablage, und ein zweiter Pool dafuer
+    /// waere eine zweite Boot-RAM-Forderung an den Kernel fuer dieselbe Sache: der
+    /// ungenutzte Eintrag selbst ist die Ablage. Kein Byte Mehr-RAM fuer die Freiliste.
+    freilauf_next: u32,
     /// **Wie viele Slots diese PD gleichzeitig belegen darf** (2026-08-26).
     ///
     /// Bis dahin eine Konstante fuer alle. Das war tragfaehig, solange jede PD 1--4 Slots
@@ -688,7 +739,9 @@ impl Pd {
         thread: None,
         nthreads: 0,
         epoch: 0,
-        cspace: [None; NCAPS],
+        cspace_start: 0,
+        cspace_len: 0,
+        freilauf_next: 0,
         cap_budget: CAP_BUDGET_PER_PD as u16,
         domain: Domain::TrustedSas, // Default: alle Altbestand-PDs sind Trusted-SAS
         quiescing: false,
@@ -790,11 +843,56 @@ pub struct PdTable {
     /// Wie oft eine Erzeugung am **Vorrat** gescheitert ist (nicht an einem freien PD-Slot).
     /// Getrennt gezaehlt, weil die beiden verschiedene Behebungen haben.
     budget_abgewiesen: u64,
+    /// Der Pool der PD-Cspace-Plaetze (TODO0 K1c): alle Laeufe aller PDs liegen hier.
+    /// Beim Boot aus Boot-RAM angehaengt ([`PdTable::attach_cspace_pool`], Vorbild A-3.4);
+    /// davor ist jede Erzeugung eine benannte Absage, kein Absturz.
+    cspace_pool: Slab<Option<CapPtr>>,
+    /// Vergabe-Zustand des Pools (Bump + Freiliste, s. `cspace::Vergabe`).
+    cspace_vergabe: Vergabe,
+    /// Der **eingestellte** Deckel fuer Einzel-Budgets — [`CAP_BUDGET_MAX`] als Vorgabe,
+    /// anhebbar fuer Treiber-PDs ([`PdTable::set_budget_deckel`]).
+    budget_deckel: u16,
+    /// Wie oft eine Erzeugung **ueber dem Deckel** abgewiesen wurde (nicht gedeckelt!).
+    /// Bis TODO0 K1c fiel diese Absage mit `None` ohne eigenen Zaehler — im Bericht war
+    /// sie von „nie versucht" nicht zu unterscheiden.
+    deckel_abgewiesen: u64,
+    /// Wie oft eine Erzeugung am **Pool** gescheitert ist (weder Freiliste noch frischer
+    /// Rest gaben die Plaetze her). Dritte Schranke, dritter Zaehler, dritte Behebung
+    /// (Pool vergroessern statt weniger anfordern).
+    cspace_abgewiesen: u64,
 }
 
 impl Default for PdTable {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Die PD-Eintraege als Anker-Ablage der Cspace-Vergabe (TODO0 K1c).
+///
+/// Ein Anker je Eintrag: vergeben beschreibt er den Lauf der PD, frei verketten
+/// `freilauf_next`-Felder die zurueckgegebenen Laeufe. Eigener Typ statt Generik —
+/// die Vergabe-Logik steht genau einmal in `cspace::Vergabe` und wird dort auch
+/// geprueft (als Datei, ohne Kernel).
+impl cspace::AnkerAblage for Slab<Pd> {
+    fn anzahl(&self) -> usize {
+        self.len()
+    }
+    fn lese(&self, i: usize) -> CspaceAnker {
+        // Fail-closed: eine Freikette, die ausserhalb der Tabelle zeigt, reisst den
+        // Knoten lieber mit, als einen fremden Lauf zweimal zu vergeben.
+        let p = &self[i];
+        CspaceAnker {
+            start: p.cspace_start,
+            len: p.cspace_len,
+            naechster: p.freilauf_next,
+        }
+    }
+    fn schreibe(&mut self, i: usize, a: CspaceAnker) {
+        let p = &mut self[i];
+        p.cspace_start = a.start;
+        p.cspace_len = a.len;
+        p.freilauf_next = a.naechster;
     }
 }
 
@@ -805,6 +903,11 @@ impl PdTable {
             owner: Slab::empty(),
             budget_vorrat: CAP_SLOTS_FOR_ALL_PDS,
             budget_abgewiesen: 0,
+            cspace_pool: Slab::empty(),
+            cspace_vergabe: Vergabe::neu(),
+            budget_deckel: CAP_BUDGET_MAX as u16,
+            deckel_abgewiesen: 0,
+            cspace_abgewiesen: 0,
         }
     }
 
@@ -824,45 +927,113 @@ impl PdTable {
     ///
     /// `budget == 0` heisst „die Vorgabe" ([`CAP_BUDGET_PER_PD`]) — damit ist jeder vorhandene
     /// Aufrufer bitgleich, und die Vertraeglichkeit steckt in der Kodierung statt in einem Zweig,
-    /// den jemand im Kopf behalten muss.
+    /// den jemand im Kopf behalten muss. Die Cspace-Groesse ist dabei die Vorgabe
+    /// ([`NCAPS`]); wer mehr Plaetze braucht (Treiber-PD), ruft
+    /// [`PdTable::create_mit_budget_und_cspace`] und bekommt die Absage **benannt**.
     ///
-    /// Zwei Absagen, und sie sind **getrennt gezaehlt**:
+    /// Jede Absage wird gezaehlt (s. [`PdTable::ablehnungs_bilanz`]); `None` heisst nur noch
+    /// „irgendeine Schranke", die genaue steht im Zaehler und — fuer neue Aufrufer — im
+    /// Rueckgabewert der grossen Schwester.
+    pub fn create_mit_budget(&mut self, domain: Domain, budget: u16) -> Option<usize> {
+        self.create_mit_budget_und_cspace(domain, budget, 0).ok()
+    }
+
+    /// **Eine PD mit eigenem Cap-Budget UND eigener Cspace-Groesse anlegen** (TODO0 K1c).
     ///
-    /// * mehr als [`CAP_BUDGET_MAX`] -> abgewiesen, **nicht** stillschweigend gedeckelt. Eine
-    ///   Schranke, die klammheimlich kuerzt, gibt dem Aufrufer eine PD, die weniger kann, als er
-    ///   angefordert hat, und laesst ihn das erst beim achten Cap merken.
-    /// * mehr als der **Vorrat** hergibt -> abgewiesen und in [`Self::budget_abgewiesen`]
-    ///   verbucht. Das ist eine andere Lage als „kein freier PD-Slot", sie hat eine andere
-    ///   Behebung, und ein gemeinsamer Zaehler machte den Bericht unfaehig zu sagen, welche
-    ///   von beiden eingetreten ist.
+    /// `budget == 0` heisst „die Vorgabe" ([`CAP_BUDGET_PER_PD`]), `plaetze == 0` heisst
+    /// „der Standard" ([`NCAPS`]) — bestehende 16er-PDs entstehen hier bitgleich zu frueher.
+    ///
+    /// Vier Absagen, jede mit eigenem Namen ([`CspaceAbweisung`]) und eigenem Zaehler —
+    /// D11-Form: benannt, gezaehlt, nie blockierend. Eine Schranke, die klammheimlich
+    /// kuerzt statt abzuweisen, gaebe dem Aufrufer eine PD, die weniger kann, als er
+    /// angefordert hat, und liesse ihn das erst beim dreissigsten Cap merken.
     ///
     /// **Der Vorrat wird gebucht, nicht geschaetzt.** `CAP_SLOTS_FOR_ALL_PDS` war die Summe aller
     /// Budgets, solange jedes Budget gleich war; mit Budgets je PD ist dieselbe Zahl ein Vorrat,
     /// und die Zusage „jede PD bekommt ihr Budget" haelt nur, wenn die Vergabe gegen ihn bucht.
-    pub fn create_mit_budget(&mut self, domain: Domain, budget: u16) -> Option<usize> {
-        let b = if budget == 0 {
-            CAP_BUDGET_PER_PD as u16
-        } else {
-            budget
+    pub fn create_mit_budget_und_cspace(
+        &mut self,
+        domain: Domain,
+        budget: u16,
+        plaetze: u32,
+    ) -> Result<usize, CspaceAbweisung> {
+        // 1. Policy, 2. Struktur — reine Funktion, eine Quelle (s. `cspace`).
+        let anf = match cspace::anforderung_aufloesen(
+            budget as u32,
+            plaetze,
+            self.budget_deckel as u32,
+            CAP_BUDGET_PER_PD as u32,
+        ) {
+            Ok(a) => a,
+            Err(CspaceAbweisung::DeckelUeberschritten { verlangt, deckel }) => {
+                self.deckel_abgewiesen = self.deckel_abgewiesen.saturating_add(1);
+                return Err(CspaceAbweisung::DeckelUeberschritten { verlangt, deckel });
+            }
+            Err(CspaceAbweisung::BudgetPasstNicht { budget, plaetze }) => {
+                self.deckel_abgewiesen = self.deckel_abgewiesen.saturating_add(1);
+                return Err(CspaceAbweisung::BudgetPasstNicht { budget, plaetze });
+            }
+            Err(e) => return Err(e),
         };
-        if b as usize > CAP_BUDGET_MAX {
-            return None;
-        }
-        if b as usize > self.budget_vorrat {
+        // 3. Der Vorrat — eigene Lage, eigener Zaehler, eigene Behebung.
+        if anf.budget as usize > self.budget_vorrat {
             self.budget_abgewiesen = self.budget_abgewiesen.saturating_add(1);
-            return None;
+            return Err(CspaceAbweisung::VorratErschoepft {
+                verlangt: anf.budget,
+                vorrat: self.budget_vorrat.min(u32::MAX as usize) as u32,
+            });
         }
-        let i = self.freien_slot_suchen()?;
+        let i = self.freien_slot_suchen().ok_or(CspaceAbweisung::KeinePdFrei)?;
+        // 4. Der Pool — die autoritative Stelle ist die Vergabe (sie kennt die Freiliste).
+        let pool_len = self.cspace_pool.len().min(u32::MAX as usize) as u32;
+        let (start, len) = match self.cspace_vergabe.belegen(&mut self.pds, pool_len, anf.plaetze)
+        {
+            Ok(lauf) => lauf,
+            Err(e) => {
+                self.cspace_abgewiesen = self.cspace_abgewiesen.saturating_add(1);
+                return Err(e);
+            }
+        };
         let epoch = self.pds[i].epoch;
         self.pds[i] = Pd {
             used: true,
             domain,
             epoch,
-            cap_budget: b,
+            cap_budget: anf.budget as u16,
+            cspace_start: start,
+            cspace_len: len,
+            freilauf_next: 0,
             ..Pd::EMPTY
         };
-        self.budget_vorrat -= b as usize;
-        Some(i)
+        self.budget_vorrat -= anf.budget as usize;
+        Ok(i)
+    }
+
+    /// Den Deckel fuer Einzel-Budgets einstellen (TODO0 K1c) — Vorgabe
+    /// [`CAP_BUDGET_MAX`].
+    ///
+    /// Wofuer: eine Treiber-PD braucht Budget 30, zehntausend andere weiterhin 10. Den
+    /// Deckel je Tabelle zu heben kostet die anderen nichts; eine Konstante anzuheben
+    /// kostete den Bedarf der einen PD mal `NPDS` (gemessen rund 7,7 MB je acht Slots).
+    /// Bestehende Budgets bleiben unberuehrt — der Deckel gilt der **Erzeugung**, nicht
+    /// dem Bestand. Wer ihn senkt, erzeugt kuenftig kleinere PDs, entzieht aber keiner
+    /// bestehenden etwas (das waere ein Entzug ohne Syscall).
+    pub fn set_budget_deckel(&mut self, deckel: u16) {
+        self.budget_deckel = deckel;
+    }
+
+    /// Der eingestellte Deckel (Vorgabe: [`CAP_BUDGET_MAX`]) — Auskunft fuer den Bericht.
+    pub fn budget_deckel(&self) -> u16 {
+        self.budget_deckel
+    }
+
+    /// `(Vorrat-Abweisungen, Deckel-Abweisungen, Pool-Abweisungen)` — fuer den Bericht.
+    ///
+    /// **Alle drei zusammen**, aus demselben Grund wie `budget_bilanz`: eine Zahl ohne die
+    /// anderen sagt nicht, welche Schranke bindet. `budget_bilanz` bleibt daneben stehen
+    /// (Fuellstand + Vorrat-Abweisungen) — bestehende Leser aendern sich nicht.
+    pub fn ablehnungs_bilanz(&self) -> (u64, u64, u64) {
+        (self.budget_abgewiesen, self.deckel_abgewiesen, self.cspace_abgewiesen)
     }
 
     /// Das Cap-Budget dieser PD. Ein freier oder nicht existierender Slot hat **null** — nicht die
@@ -918,6 +1089,17 @@ impl PdTable {
             self.budget_vorrat = self.budget_vorrat
                 .saturating_add(self.pds[pd].cap_budget as usize)
                 .min(CAP_SLOTS_FOR_ALL_PDS);
+            // **Erst die Slots nullen, dann den Lauf zurueckgeben** — in dieser Reihenfolge,
+            // und das ist kein Stil: wer den Lauf zurueckgaebe, ohne die Slots zu loeschen,
+            // veraeusserte die Caps der toten PD an die naechste. Die Iterator-Form
+            // (`skip`/`take`) statt Slice-Arithmetik, damit ein unmoeglicher Lauf (Ende
+            // jenseits des Pools) abbricht statt zu paniken — die Vergabe erzeugt nur
+            // gueltige Laeufe, und was nur die Vergabe erzeugt, prueft niemand zweimal.
+            let (start, len) = (self.pds[pd].cspace_start as usize, self.pds[pd].cspace_len as usize);
+            for s in self.cspace_pool.as_mut_slice().iter_mut().skip(start).take(len) {
+                *s = None;
+            }
+            self.cspace_vergabe.freigeben(&mut self.pds, pd);
             self.pds[pd] = Pd::EMPTY;
             self.pds[pd].epoch = e;
             true
@@ -1038,13 +1220,24 @@ impl PdTable {
     }
 
     /// Die lokalen Cap-Slots einer PD (für den Teardown: jeden installierten Cap löschen). Gibt
-    /// die belegten `(slot, CapPtr)` zurück.
+    /// die belegten `(slot, CapPtr)` der **ersten [`NCAPS`] Plaetze** zurück.
+    ///
+    /// Legacy-Fenster, und das steht hier statt in einem Aufrufer: die Signatur
+    /// `[Option<CapPtr>; NCAPS]` ist an Report- und Teardown-Stellen im Kernel
+    /// festverdrahtet. PDs mit mehr als 16 Plaetzen melden hier ihre ersten 16 — wer alle
+    /// braucht, laeuft ueber [`PdTable::cspace_len_von`] + [`PdTable::cap_ptr_at`]. Was
+    /// das Fenster verschweigt, verschweigt es laut: die Laenge steht daneben.
     pub fn caps_of(&self, pd: usize) -> [Option<CapPtr>; NCAPS] {
+        let mut o = [None; NCAPS];
         if pd < self.pds.len() && self.pds[pd].used {
-            self.pds[pd].cspace
-        } else {
-            [None; NCAPS]
+            let start = self.pds[pd].cspace_start as usize;
+            let pool = self.cspace_pool.as_slice();
+            let n = (self.pds[pd].cspace_len as usize).min(NCAPS);
+            for (dst, src) in o.iter_mut().zip(pool.iter().skip(start).take(n)) {
+                *dst = *src;
+            }
         }
+        o
     }
 
     /// Die (unveränderliche) Domäne einer PD.
@@ -1106,6 +1299,16 @@ impl PdTable {
             return None;
         }
         let i = self.freien_slot_suchen()?;
+        // Der Cspace-Lauf kommt aus dem Pool wie bei jeder anderen PD (Standardgroesse):
+        // ohne ihn haette das Backend null Plaetze und hielte keine einzige Cap. Der
+        // Budget-Vorrat wird dabei **nicht** gebucht — das ist die uebernommene Eigenheit
+        // dieses Pfades (er buchte nie), keine neue: wer sie behebt, verschiebt die
+        // Vorratszahlen im Bericht und fasst damit die Abnahme an.
+        let pool_len = self.cspace_pool.len().min(u32::MAX as usize) as u32;
+        let (start, len) = self
+            .cspace_vergabe
+            .belegen(&mut self.pds, pool_len, NCAPS as u32)
+            .ok()?;
         let epoch = self.pds[i].epoch;
         self.pds[i] = Pd {
             used: true,
@@ -1115,6 +1318,9 @@ impl PdTable {
             chan_ep: ep,
             chan_ntfn: ntfn,
             epoch,
+            cspace_start: start,
+            cspace_len: len,
+            freilauf_next: 0,
             ..Pd::EMPTY
         };
         Some(i)
@@ -1198,6 +1404,44 @@ impl PdTable {
     pub unsafe fn attach(&mut self, ptr: *mut Pd, len: usize) {
         // SAFETY: an den Aufrufer durchgereicht (s. Funktionsdoku).
         unsafe { self.pds.attach(ptr, len, |_| Pd::EMPTY) };
+    }
+
+    /// **Dem Cspace-Pool seinen Speicher geben** (TODO0 K1c) — einmalig beim Boot, vor der
+    /// ersten PD, aus Boot-RAM (Vorbild A-3.4: 80256 Slots aus Boot-RAM statt `.bss`).
+    ///
+    /// Richtgroesse: `NPDS * STANDARD_PLAETZE` Plaetze kosten genau das, was die alten
+    /// Inline-Arrays kosteten — jede groessere PD nimmt sich ihren Mehrbedarf aus
+    /// demselben Topf. Ohne diesen Aufruf ist jede Erzeugung eine benannte Absage
+    /// ([`CspaceAbweisung::PoolErschoepft`]), kein Absturz: ein vergessener Pool faellt
+    /// als sauberer Fehler auf, nicht als stiller Fehlzugriff.
+    ///
+    /// # Safety
+    /// Vertrag von [`Slab::attach`]: exklusiver, ausgerichteter, dauerhafter Speicher für
+    /// mindestens `len` Elemente, genau einmal.
+    pub unsafe fn attach_cspace_pool(&mut self, ptr: *mut Option<CapPtr>, len: usize) {
+        assert!(
+            self.cspace_pool.is_empty(),
+            "PdTable::attach_cspace_pool zweimal gerufen"
+        );
+        // SAFETY: an den Aufrufer durchgereicht (s. Funktionsdoku).
+        unsafe { self.cspace_pool.attach(ptr, len, |_| None) };
+    }
+
+    /// Cspace-Plaetze dieser PD — die **tatsaechliche** Lauf-Laenge, nicht die Vorgabe.
+    /// `0` fuer unbekannte/freie PDs (fail-closed: jede Installation weist die Schranke
+    /// ab, statt einer PD, die es nicht gibt, Plaetze zuzugestehen).
+    pub fn cspace_len_von(&self, pd: usize) -> usize {
+        if pd < self.pds.len() && self.pds[pd].used {
+            self.pds[pd].cspace_len as usize
+        } else {
+            0
+        }
+    }
+
+    /// Belegte Pool-Plaetze insgesamt — der Fuellstand des Cspace-Pools (fuer den Bericht:
+    /// ein Vorrat ohne Fuellstandsanzeige spricht erst, wenn es zu spaet ist).
+    pub fn cspace_pool_belegt(&self) -> usize {
+        self.cspace_pool.as_slice().iter().filter(|s| s.is_some()).count()
     }
 
     /// **Der Rückwärts-Tabelle ihren Speicher geben** (Z22 P2 / C4) — einmalig beim Boot,
@@ -1318,16 +1562,27 @@ impl PdTable {
     }
 
     /// Eine globale Capability in den Cspace einer PD an `slot` eintragen.
+    ///
+    /// Die Schranke ist die **Lauf-Laenge dieser PD**, nicht mehr die Konstante: Slots
+    /// jenseits des Laufs werden still nicht eingetragen (derselbe Vertrag wie frueher
+    /// fuer Slots `>= NCAPS`). Budget- und Policy-Pruefung stehen darüber in
+    /// [`Caps::install_cap_checked`]; wer direkt ruft (Rollback, `CMOVE`), hat sie selbst.
     pub fn install_cap(&mut self, pd: usize, slot: usize, cap: CapPtr) {
-        if pd < self.pds.len() && slot < NCAPS {
-            self.pds[pd].cspace[slot] = Some(cap);
+        if pd < self.pds.len() && slot < self.pds[pd].cspace_len as usize {
+            let idx = self.pds[pd].cspace_start as usize + slot;
+            if let Some(s) = self.cspace_pool.as_mut_slice().get_mut(idx) {
+                *s = Some(cap);
+            }
         }
     }
 
     /// Einen Cap-Slot einer PD leeren (Autorität entziehen — Hot-Reload).
     /// Den **Empfangs-Slot** einer PD setzen (A-3.2). `false`, wenn PD oder Slot ungültig sind.
+    ///
+    /// Die Slot-Schranke ist die Lauf-Laenge dieser PD: eine grosse PD darf ihren Empfang
+    /// auch jenseits von Slot 15 legen, eine kleine nicht jenseits ihres Laufs.
     pub fn set_recv_slot(&mut self, pd: usize, slot: usize) -> bool {
-        if pd < self.pds.len() && self.pds[pd].used && slot < NCAPS {
+        if pd < self.pds.len() && self.pds[pd].used && slot < self.pds[pd].cspace_len as usize {
             self.pds[pd].recv_slot = slot;
             true
         } else {
@@ -1345,13 +1600,22 @@ impl PdTable {
     }
 
     /// Anzahl der Cap-Slots je PD-Cspace (Adressraum der lokalen Slot-Indizes).
+    ///
+    /// Legacy-Vorgabe ([`NCAPS`]) fuer Stellen, die keine PD kennen (Dispatch-Grenzen,
+    /// bevor die PD aufgeloest ist). Sobald die PD bekannt ist, gilt ihre Lauf-Laenge
+    /// ([`PdTable::cspace_len_von`]) — eine Konstante, die neben der Tabelle her existiert,
+    /// laeuft beim naechsten Drehen still auseinander (dieselbe Begruendung wie
+    /// `eps.len()` statt `NENDPOINTS` in A-3.4 Teil 4).
     pub const fn caps_per_pd() -> usize {
         NCAPS
     }
 
     pub fn clear_cap(&mut self, pd: usize, slot: usize) {
-        if pd < self.pds.len() && slot < NCAPS {
-            self.pds[pd].cspace[slot] = None;
+        if pd < self.pds.len() && slot < self.pds[pd].cspace_len as usize {
+            let idx = self.pds[pd].cspace_start as usize + slot;
+            if let Some(s) = self.cspace_pool.as_mut_slice().get_mut(idx) {
+                *s = None;
+            }
         }
     }
 
@@ -1412,7 +1676,15 @@ impl PdTable {
     /// Anzahl der aktuell belegten Cap-Slots einer PD (Verbrauch gegen [`CAP_BUDGET_PER_PD`]).
     pub fn cap_count(&self, pd: usize) -> usize {
         if pd < self.pds.len() && self.pds[pd].used {
-            self.pds[pd].cspace.iter().filter(|c| c.is_some()).count()
+            let start = self.pds[pd].cspace_start as usize;
+            let len = self.pds[pd].cspace_len as usize;
+            self.cspace_pool
+                .as_slice()
+                .iter()
+                .skip(start)
+                .take(len)
+                .filter(|c| c.is_some())
+                .count()
         } else {
             0
         }
@@ -1433,8 +1705,11 @@ impl PdTable {
     /// Cap ab). **`None` heisst „kein Platz" und wird als solches gemeldet**, nicht durch
     /// Ueberschreiben eines belegten Slots aufgeloest: das waere ein Cap-Verlust, den der
     /// Aufrufer nicht angeordnet hat (dieselbe Regel wie bei `CMOVE`).
+    ///
+    /// Sucht ueber die Lauf-Laenge dieser PD — eine grosse PD findet freie Plaetze auch
+    /// jenseits von Slot 15.
     pub fn free_cap_slot(&self, pd: usize) -> Option<usize> {
-        (0..NCAPS).find(|&s| self.cap_at(pd, s).is_none())
+        (0..self.cspace_len_von(pd)).find(|&s| self.cap_at(pd, s).is_none())
     }
 
     /// Die PD eines Threads — von aussen (Z6b).
@@ -1443,13 +1718,19 @@ impl PdTable {
     }
 
     fn cap_at(&self, pd: usize, slot: usize) -> Option<CapPtr> {
-        if slot < NCAPS {
+        let len = self.cspace_len_von(pd);
+        if slot < len {
             // Spectre-v1-Härtung: `slot` stammt bei jedem Syscall aus einem EL0-Register.
             // Die Verzweigung oben schützt nur den architektonischen Pfad — eine falsch
             // vorhergesagte Verzweigung könnte den Zugriff spekulativ mit einem beliebigen
             // Index ausführen und den Treffer im Cache hinterlassen. Die Maske macht den
-            // Index zusätzlich datenabhängig gültig.
-            self.pds[pd].cspace[array_index_nospec(slot, NCAPS)]
+            // Index zusätzlich datenabhängig gültig. `len >= 1` folgt aus `slot < len`.
+            let start = self.pds[pd].cspace_start as usize;
+            self.cspace_pool
+                .as_slice()
+                .get(start + array_index_nospec(slot, len))
+                .copied()
+                .flatten()
         } else {
             None
         }
@@ -2024,7 +2305,7 @@ fn dispatch_nativ(
                     };
                     if src_slot == dst_slot {
                         result::OK // nichts zu tun; kein Sonderfall, der irgendwo aufschlägt
-                    } else if dst_slot >= PdTable::caps_per_pd() {
+                    } else if dst_slot >= g.pds.cspace_len_von(pd) {
                         result::ERR_BADCAP
                     } else if g.pds.cap_at(pd, dst_slot).is_some() {
                         // Ein belegtes Ziel wird NICHT stillschweigend überschrieben: das wäre ein
@@ -2046,7 +2327,7 @@ fn dispatch_nativ(
                     let Some((_, have, _)) = g.cspace.lookup(src) else {
                         return deny(result::ERR_BADCAP);
                     };
-                    if dst_slot >= PdTable::caps_per_pd() || g.pds.cap_at(pd, dst_slot).is_some() {
+                    if dst_slot >= g.pds.cspace_len_von(pd) || g.pds.cap_at(pd, dst_slot).is_some() {
                         result::ERR_NOSPACE
                     } else if !g.budget_allows(pd, dst_slot) {
                         result::ERR_NOSPACE
@@ -2104,7 +2385,7 @@ fn dispatch_nativ(
     }; // CAPS-Read-Lock hier freigegeben
 
     match nr {
-        sys::CALL | sys::RECV | sys::REPLY => {
+        sys::CALL | sys::CALL_TIMEOUT | sys::RECV | sys::REPLY => {
             // --- Z26/A3: eine Handler-Cap darf hier EMPFANGEN und ANTWORTEN, aber nicht rufen ---
             //
             // `RECV`/`REPLY` sind die Operationen, mit denen eine Persönlichkeits-PD ihre Gäste
@@ -2122,14 +2403,18 @@ fn dispatch_nativ(
             let ep_id = match kind {
                 ObjectKind::Endpoint(id) => id,
                 ObjectKind::SyscallHandler { ep, .. } | ObjectKind::FaultHandler { ep, .. } => {
-                    if nr == sys::CALL {
+                    if nr == sys::CALL || nr == sys::CALL_TIMEOUT {
                         return deny(result::ERR_BADCAP);
                     }
                     ep
                 }
                 _ => return deny(result::ERR_BADCAP),
             };
-            let need = if nr == sys::CALL { Rights::WRITE } else { Rights::READ };
+            let need = if nr == sys::CALL || nr == sys::CALL_TIMEOUT {
+                Rights::WRITE
+            } else {
+                Rights::READ
+            };
             if !rights.contains(need) {
                 return deny(result::ERR_RIGHTS);
             }
@@ -2168,6 +2453,24 @@ fn dispatch_nativ(
                 // Das Badge ist oben bei der Cap-Aufloesung schon da (`lookup`); bis 2026-08-25
                 // ging es nur an `signal` und wurde hier fallengelassen.
                 sys::CALL => eps[ep].lock().call(ops, core, frame, badge),
+                // A2-Rest: Frist VOR dem Blockieren scharfstellen -- dieselbe Ordnung wie bei
+                // WAIT (dort MSG0) und PARK_TIMEOUT. Der bewachte Grund ist IPC: unblock
+                // (Antwort) und Timer entfernen denselben Grund, das Rennen entscheidet
+                // fristen_faellig wie bei WAIT (Signal gewinnt).
+                sys::CALL_TIMEOUT => {
+                    // Eigener Name (`frist` statt `ticks`): M3 in tools/fristen-negativ.sh
+                    // verankert seine Mutation textuell am WAIT-Arm; zwei gleiche Zeilen
+                    // wuerden die Sonde zweideutig machen.
+                    let frist = frame_reg(frame, reg::MSG0);
+                    if frist != 0 {
+                        ops.frist_setzen(core, frist, caprock_sched::BlockReasons::IPC);
+                    }
+                    frame_set_reg(frame, reg::MSG0, frame_reg(frame, reg::MSG1));
+                    frame_set_reg(frame, reg::MSG1, frame_reg(frame, reg::MSG2));
+                    frame_set_reg(frame, reg::MSG2, frame_reg(frame, reg::MSG3));
+                    frame_set_reg(frame, reg::MSG3, 0);
+                    eps[ep].lock().call(ops, core, frame, badge)
+                },
                 sys::RECV => eps[ep].lock().recv(ops, core, frame),
                 _ => {
                     // REPLY: ggf. Cap-Transfer (grant). Der Transfer MUTIERT den CapSpace,

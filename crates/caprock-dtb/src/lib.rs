@@ -1,4 +1,5 @@
 #![no_std]
+#![forbid(unsafe_code)]
 //! Minimaler Parser für einen Flattened Device Tree (FDT/DTB).
 //!
 //! Liest die Plattformbeschreibung (hier: die RAM-Region aus dem `/memory`-

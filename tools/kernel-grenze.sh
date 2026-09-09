@@ -62,6 +62,25 @@ declare -A ERLAUBT=(
   [acpi]="Plattformentdeckung (Kerne, ECAM) beim Hochlauf"
   [pcie]="Bus-ENUMERATION + RID-Ermittlung fuer die IOMMU -- nicht Geraetetreiber"
   [virtio]="nur noch das AUFFINDEN der virtio-Strukturen im Konfigurationsraum (Enumeration, wie pcie). Die Treiberlogik liegt seit 2026-08-01 in crates/caprock-virtio -- ohne jede Abhaengigkeit, damit sie in eine Userland-PD kann (A-5.1)"
+  # T0/Blech-Arbeit (2026-08-17), Liste am 2026-09-09 nachgezogen -- bis dahin meldete der
+  # Waechter zu Recht 5 Verletzungen (fbtext, iommu_health, numa, bootparams, smt). Die Module
+  # kamen ohne Listeneintrag dazu; die Pruefung war richtig, die Liste veraltet.
+  # Z8/N0-N2: NUMA-Topologie lesen (SRAT/SLIT/DTB-Dekoder, reine Byte-Arithmetik, host-getestet
+  # wie dmar/irte) + Platzierungsregeln. Der Kern platziert danach Speicher UND Kerne -- ohne
+  # sie gibt es keine NUMA-Platzierung, nur Zufall.
+  [numa]="Topologie-Dekoder + Platzierung (Z8): wonach der Kern Speicher und Kerne platziert"
+  # Z6 Stufe 1: SMT-Topologie lesen + Zulassungspolitik (ein logischer Kern je physischem Kern).
+  # Einplanung selbst -- welcher Kern ueberhaupt online darf --, kein Geraet, keine Hardware
+  # (reine Arithmetik ueber injizierte Registerwerte, host-getestet wie dmar).
+  [smt]="SMT-Topologie + Zulassungspolitik (Z6): welche Kerne der Scheduler online nehmen darf"
+  # T0: was der kexec-Launcher dem Kern auf der Befehlszeile uebergibt (RSDP, Framebuffer-
+  # Geometrie). Reiner Parser, keine Hardware. Auf UEFI-Blech findet der Kern ohne ihn weder
+  # ACPI (kein Legacy-Scan) noch Anzeige -- Plattformentdeckung beim Hochlauf, wie acpi.
+  [bootparams]="Boot-Uebergabe vom Launcher (T0): RSDP + Framebuffer-Geometrie -- Plattformentdeckung"
+  # Arch-neutrales IOMMU-Urteil ueber beiden Fassaden (x86_64/iommu.rs, aarch64/iommu.rs reichen
+  # die Werte herein). Reine Typ-Arithmetik, kein Registerzugriff -- wie irte eine
+  # Autoritaetsaussage (DMA-Eindaemmung = Isolation gegenueber Geraeten), kein Geraet.
+  [iommu_health]="arch-neutrales IOMMU-Gesundheitsurteil (Aussage ueber die DMA-Eindaemmung)"
 )
 
 # Bekannte Ausnahmen: liegen im Kern, gehoeren dort NICHT hin, mit benanntem Ausgang.
@@ -69,7 +88,14 @@ declare -A ERLAUBT=(
 # lag. Es liegt jetzt in `crates/caprock-virtio` (keine Abhaengigkeiten); in der HAL blieb nur das
 # Auffinden der Strukturen, also Enumeration. Eine Ausnahme weniger, nicht eine Ausnahme
 # umgeschrieben.
-declare -A AUSNAHME=()
+declare -A AUSNAHME=(
+  # T0: Text in einen linearen Framebuffer -- reine Pixelarithmetik ueber einen injizierten
+  # Slice, kein Hardwarezugriff, host-getestet. Dem ZWECK nach wie `console` (frueher
+  # Debug-Ausgang auf UART-losen Maschinen, vor jeder PD), aber NOCH NICHT VERDRAHTET: kein
+  # Aufrufer im Kern, keine Anbindung an die Konsole. Ausgang: beim Blech-Bring-up anbinden
+  # oder entfernen -- bis dahin als Ausnahme benannt statt stillschweigend erlaubt.
+  [fbtext]="noch nicht an die Konsole angebunden (T0-Vorlauf); Ausgang: Blech-Bring-up oder entfernen"
+)
 
 NUR_PRUEFEN=0
 [ "${1:-}" = "--nur-pruefen" ] && NUR_PRUEFEN=1

@@ -58,6 +58,7 @@
 //! wertlos geworden. Die Umdefinition steht deshalb in der Berichtszeile selbst, nicht nur hier.
 
 use caprock_cap::CapPtr;
+use caprock_hal::println;
 use caprock_sched::ThreadId;
 use caprock_sync::SpinLock;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -74,11 +75,30 @@ pub const AUFTRAEGE_MAX: usize = 4;
 /// verdichtete Liste benutzt.
 pub const ENDOW_MAX: usize = 8;
 
+/// **Bildquelle eines `SYS_LOAD_IMAGE`-Auftrags** — die physische Lage des Aufrufer-Bilds.
+///
+/// `Copy`, damit [`Auftrag`] es bleibt: die Schlange hält Aufträge als Werte, und ein
+/// Auftrag, der nicht kopierbar wäre, bräuchte einen zweiten Ablageweg — genau die Sorte
+/// Extraspur, gegen die C8 die Schlange mit fester Grösse gebaut hat.
+#[derive(Clone, Copy)]
+struct Bildquelle {
+    /// Physische Basis des Bilds im Aufrufer-RAM (vom Dispatch gegen die Memory-Cap geprüft).
+    phys: u64,
+    /// Exakte Bildlänge in Bytes (`1..=LXPD_MAX_BILD`, vom Dispatch geprüft, hier erneut).
+    len: u64,
+    /// Programm-ID aus dem Boot-Manifest — der Join-Schlüssel (`sha256(staged) == e.sha256`).
+    pid: u32,
+}
+
 /// Ein wartender Ladeauftrag.
 #[derive(Clone, Copy)]
 struct Auftrag {
-    /// Index im Boot-Archiv.
+    /// Index im Boot-Archiv — NUR im Archiv-Pfad (`SYS_LOAD`) belegt. Im Bild-Pfad
+    /// (`SYS_LOAD_IMAGE`, `bild.is_some()`) steht hier `u32::MAX` als Platzhalter: der Bild-Pfad
+    /// kennt keinen Archiv-Index, sein Join-Schlüssel ist die `pid` in [`Bildquelle`].
     index: u32,
+    /// Bild aus Aufrufer-RAM statt Boot-Archiv (`SYS_LOAD_IMAGE`); `None` = Archiv-Pfad.
+    bild: Option<Bildquelle>,
     /// PD des Aufrufers (A-5.1: der Partner eines HardwareLand-Backends).
     caller_pd: usize,
     /// Wer wartet — und wem geantwortet wird.
@@ -200,11 +220,55 @@ pub fn thread_id() -> Option<ThreadId> {
     (raw != 0).then(|| ThreadId::from_raw(raw))
 }
 
+/// Die Delegationsliste des Aufrufs in das feste Auftragsfeld verdichten.
+///
+/// Steht genau einmal hier statt je einmal in `uebergeben`/`uebergeben_bild`: zwei Stellen, die
+/// dasselbe Feld füllen, altern auseinander — und `CapPtr` hat bewusst keinen öffentlichen
+/// Konstruktor, also braucht das leere Feld keinen Füllwert (s. `Auftrag.endow`).
+fn dichten(endow: &[(usize, CapPtr)]) -> [Option<(usize, CapPtr)>; ENDOW_MAX] {
+    let mut felder: [Option<(usize, CapPtr)>; ENDOW_MAX] = [None; ENDOW_MAX];
+    for (ziel, &c) in felder.iter_mut().zip(endow.iter()) {
+        *ziel = Some(c);
+    }
+    felder
+}
+
+/// Einen fertigen Auftrag einreihen — die EINE Stelle mit der Reihenfolge, an der alles hängt.
+///
+/// Der Aufrufer wird **blockiert, bevor sein Auftrag sichtbar wird** — beides unter *einer*
+/// Sperrung von [`SCHLANGE`] (s. Moduldoku). Wer hier einen zweiten Einreihungspfad daneben
+/// legte, müsste dieselbe Reihenfolge ein zweites Mal treffen — und ein Auftrag, der vor dem
+/// Blockieren sichtbar wird, verliert seine Antwort (D11-Form).
+fn einreihen(auftrag: Auftrag, blockieren: impl FnOnce() -> usize) -> Uebergabe {
+    let Some(v) = thread_id() else {
+        OHNE_THREAD.fetch_add(1, Ordering::Relaxed);
+        return Uebergabe::KeinVerifizierer;
+    };
+    let sp = {
+        let mut q = SCHLANGE.lock();
+        let Some(platz) = q.platz_nehmen() else {
+            ABGEWIESEN.fetch_add(1, Ordering::Relaxed);
+            return Uebergabe::Ausgelastet; // **nicht** blockiert
+        };
+        // Erst blockieren, dann veröffentlichen. Beides unter dieser Sperrung.
+        let sp = blockieren();
+        q.belegen(platz, auftrag);
+        ANGENOMMEN.fetch_add(1, Ordering::Relaxed);
+        HOECHSTSTAND.fetch_max(q.anzahl, Ordering::Relaxed);
+        sp
+    }; // SCHLANGE freigegeben
+    // Wecken **nach** dem Freigeben: `unpark` nimmt `SCHEDS`, und die Ordnung ist SCHLANGE →
+    // SCHEDS. Ein Wecken, das den Verifizierer trifft, bevor er schläft, hinterlässt seine Marke
+    // (Z22 P4) — genau dafür gibt es sie.
+    crate::system::unpark_thread(v);
+    Uebergabe::Uebergeben(sp)
+}
+
 /// **Einen `SYS_LOAD` an den Verifizierer übergeben.**
 ///
-/// `blockieren` blockiert den *laufenden* Thread mit [`BlockReasons::LOAD`] und liefert den
+/// `blockieren` blockiert den *laufenden* Thread mit [`BlockReasons::LOAD`](caprock_sched::BlockReasons::LOAD) und liefert den
 /// Stackpointer des nächsten Threads. Es wird **unter der Sperrung** gerufen und **vor** dem
-/// Veröffentlichen des Auftrags — s. Moduldoku.
+/// Veröffentlichen des Auftrags — s. [`einreihen`] und Moduldoku.
 ///
 /// Der Aufrufer dieser Funktion (der Syscall-Dispatch) hält keine Locks; `blockieren` nimmt
 /// `SCHEDS[core]` und gibt es sofort wieder frei.
@@ -218,43 +282,58 @@ pub fn uebergeben(
     dma_pages: u32,
     blockieren: impl FnOnce() -> usize,
 ) -> Uebergabe {
-    let Some(v) = thread_id() else {
-        OHNE_THREAD.fetch_add(1, Ordering::Relaxed);
-        return Uebergabe::KeinVerifizierer;
-    };
-    let mut felder: [Option<(usize, CapPtr)>; ENDOW_MAX] = [None; ENDOW_MAX];
-    for (ziel, &c) in felder.iter_mut().zip(endow.iter()) {
-        *ziel = Some(c);
-    }
-    let sp = {
-        let mut q = SCHLANGE.lock();
-        let Some(platz) = q.platz_nehmen() else {
-            ABGEWIESEN.fetch_add(1, Ordering::Relaxed);
-            return Uebergabe::Ausgelastet; // **nicht** blockiert
-        };
-        // Erst blockieren, dann veröffentlichen. Beides unter dieser Sperrung.
-        let sp = blockieren();
-        q.belegen(
-            platz,
-            Auftrag {
-                index,
-                caller_pd,
-                caller,
-                heimatkern,
-                cap_budget,
-                dma_pages,
-                endow: felder,
-            },
-        );
-        ANGENOMMEN.fetch_add(1, Ordering::Relaxed);
-        HOECHSTSTAND.fetch_max(q.anzahl, Ordering::Relaxed);
-        sp
-    }; // SCHLANGE freigegeben
-    // Wecken **nach** dem Freigeben: `unpark` nimmt `SCHEDS`, und die Ordnung ist SCHLANGE →
-    // SCHEDS. Ein Wecken, das den Verifizierer trifft, bevor er schläft, hinterlässt seine Marke
-    // (Z22 P4) — genau dafür gibt es sie.
-    crate::system::unpark_thread(v);
-    Uebergabe::Uebergeben(sp)
+    einreihen(
+        Auftrag {
+            index,
+            bild: None,
+            caller_pd,
+            caller,
+            heimatkern,
+            cap_budget,
+            dma_pages,
+            endow: dichten(endow),
+        },
+        blockieren,
+    )
+}
+
+/// **Einen `SYS_LOAD_IMAGE` an den Verifizierer übergeben** (LXPD-Laufzeit).
+///
+/// Spiegel von [`uebergeben`]: dieselbe Schlange, dieselbe Schranke ([`AUFTRAEGE_MAX`]),
+/// dieselbe Reihenfolge (blockieren, *dann* veröffentlichen — s. [`einreihen`]), dieselben
+/// drei Ausgänge. Der einzige Unterschied ist die Bildquelle: kein Archiv-Index (hier steht
+/// `u32::MAX` als Platzhalter, s. [`Auftrag::index`]), sondern die physische Lage des
+/// Aufrufer-Bilds plus `pid` in [`Bildquelle`]. Der Verifizierer kopiert daraus EINMAL nach
+/// Staging und traut danach nur der Kopie (s. [`laden_bild`]).
+pub fn uebergeben_bild(
+    bild_phys: u64,
+    bild_len: u64,
+    pid: u32,
+    caller_pd: usize,
+    endow: &[(usize, CapPtr)],
+    caller: ThreadId,
+    heimatkern: usize,
+    cap_budget: u16,
+    dma_pages: u32,
+    blockieren: impl FnOnce() -> usize,
+) -> Uebergabe {
+    einreihen(
+        Auftrag {
+            index: u32::MAX,
+            bild: Some(Bildquelle {
+                phys: bild_phys,
+                len: bild_len,
+                pid,
+            }),
+            caller_pd,
+            caller,
+            heimatkern,
+            cap_budget,
+            dma_pages,
+            endow: dichten(endow),
+        },
+        blockieren,
+    )
 }
 
 /// Der Rumpf des Verifizierers: entnehmen, laden, antworten, schlafen.
@@ -299,6 +378,9 @@ fn naechster() -> Option<Auftrag> {
 
 /// Den Auftrag ausführen — **auf DIESEM Stack**, und das ist der ganze Zweck.
 fn laden(a: &Auftrag) -> Option<usize> {
+    if let Some(b) = a.bild {
+        return laden_bild(a, b);
+    }
     // Verdichten mit dem ersten echten Cap als Füllwert; `CapPtr` hat keinen öffentlichen
     // Konstruktor (derselbe Weg wie in `load_by_index`).
     let Some(first) = a.endow.iter().flatten().next().copied() else {
@@ -311,6 +393,102 @@ fn laden(a: &Auftrag) -> Option<usize> {
         n += 1;
     }
     crate::loader::load_by_index(a.index, a.caller_pd, &dense[..n], a.heimatkern, a.cap_budget, a.dma_pages)
+}
+
+/// Einen `SYS_LOAD_IMAGE`-Auftrag ausführen — **auf DIESEM Stack** (C8), aus der STAGED
+/// Kopie, nie aus Aufrufer-RAM.
+///
+/// Ablauf: Schranke VOR jeder Kopie, EINMAL aus Caller-Phys nach Staging lesen, danach nur
+/// der Kopie trauen (Hash, Parse, Laden — s. TOCTOU unten), Staging danach freigeben. `None`
+/// heisst immer „benannt abgewiesen (Zeile oben), nichts angelegt" — der Aufrufer bekommt
+/// `ERR_BADCAP`, den Grund trägt das Protokoll.
+fn laden_bild(a: &Auftrag, b: Bildquelle) -> Option<usize> {
+    // **Die Schranke steht VOR jeder Kopie**, nicht dahinter: Was darüber liegt, wird gar nicht
+    // erst angefasst. Der Dispatch hat dasselbe bereits geprüft (gegen `LXPD_MAX_BILD`
+    // abgewiesen) — hier steht es ein zweites Mal, weil zwischen Prüfung und Kopie der
+    // Verifizierer, die Schlange und ein Kernwechsel liegen, und eine Schranke, die nur an einer
+    // Stelle steht, an jeder anderen umgehbar ist.
+    if b.len == 0 || b.len > caprock_abi::sys::LXPD_MAX_BILD {
+        println!(
+            "lxpdimg : Bild {len} B ausserhalb 1..=LXPD_MAX_BILD ({max}) -- ABGEWIESEN (BildZuGross) ohne Staging",
+            len = b.len,
+            max = caprock_abi::sys::LXPD_MAX_BILD,
+        );
+        return None;
+    }
+    // Staging aus MEM, kein BSS-Monster: bis zu 4 MiB stehen nicht im Image.
+    let len = b.len as usize; // passt: durch die Schranke oben gedeckt (4 MiB)
+    let Some((basis, slen)) = crate::system::staging_alloc(b.len) else {
+        println!(
+            "lxpdimg : Staging {len} B erschoepft (MEM) -- ABGEWIESEN (KeineRessourcen) ohne Kopie"
+        );
+        return None;
+    };
+    if slen < b.len {
+        // Der Allokator rundet auf, nie ab — traefe das doch zu, wäre die Kopie unten ein
+        // Überlauf. Fail-closed statt rechnen.
+        crate::system::staging_free(basis, slen);
+        println!(
+            "lxpdimg : Staging {slen} B kleiner als Bild {len} B -- ABGEWIESEN (KeineRessourcen) ohne Kopie"
+        );
+        return None;
+    }
+    // EINMAL aus Caller-Phys lesen — danach nur der Kopie trauen (TOCTOU):
+    //
+    // Der Aufrufer ist ab der Übergabe blockiert, aber seine PD lebt weiter: ein
+    // GESCHWISTER-Thread derselben PD läuft parallel und könnte die Quelle während oder nach
+    // der Kopie noch beschreiben. Deshalb wird hier EINMAL kopiert, und alles darunter (Hash,
+    // Parse, Laden) liest AUSSCHLIESSLICH die Kopie. Ein zerrissenes Bild scheitert am
+    // Manifest-Hash (fail-closed, benannte Absage); was den Hash besteht, ist per SHA-256 das
+    // gemeinte Bild — ein Wettlauf kann die Prüfung nicht bestehen, nur auslösen.
+    //
+    // SAFETY: Quelle `[phys, phys+len)` ist Aufrufer-RAM in plain-RAM — der Dispatch hat sie
+    // gegen die Aufrufer-Memory-Cap geprüft (Memory-Objekt, READ-Recht, Länge gedeckt),
+    // identity-gemappt wie das Boot-Archiv (`read_archive`-Vertrag). Ziel `[basis, basis+len)`
+    // ist frisches, exklusives Staging (`slen >= len` oben geprüft). Ein einziges
+    // `copy_nonoverlapping`, keine Überlappung möglich.
+    unsafe {
+        core::ptr::copy_nonoverlapping(b.phys as *const u8, basis as *mut u8, len);
+    }
+    // SAFETY: dieselbe exklusive, identity-gemappte Region wie oben; `len > 0` steht durch die
+    // Schranke, und der Verifizierer hält sie bis zum `staging_free` unten exklusiv — der
+    // Aufrufer kennt nur sein eigenes RAM, nie das Staging.
+    let staged: &[u8] = unsafe { core::slice::from_raw_parts(basis as *const u8, len) };
+    // Verdichten wie in `laden` (derselbe Weg wie in `load_by_index`): mit dem ersten echten
+    // Cap als Füllwert, weil `CapPtr` bewusst keinen öffentlichen Konstruktor hat.
+    let pd = match a.endow.iter().flatten().next().copied() {
+        None => crate::loader::load_verified_image(
+            staged,
+            b.pid,
+            a.caller_pd,
+            &[],
+            a.heimatkern,
+            a.cap_budget,
+            a.dma_pages,
+        ),
+        Some(first) => {
+            let mut dense = [first; ENDOW_MAX];
+            let mut n = 0usize;
+            for &c in a.endow.iter().flatten() {
+                dense[n] = c;
+                n += 1;
+            }
+            crate::loader::load_verified_image(
+                staged,
+                b.pid,
+                a.caller_pd,
+                &dense[..n],
+                a.heimatkern,
+                a.cap_budget,
+                a.dma_pages,
+            )
+        }
+    };
+    // Staging danach freigeben — geladen wurde aus der Kopie in PD-Speicher KOPIERT (Segmente,
+    // Stacks), nichts hält das Staging fest. Erfolgreich wie abgebrochen: pro Laufzeit-Treiber
+    // bis zu 4 MiB, und ein Leck wäre erst am zweiten Treiber sichtbar.
+    crate::system::staging_free(basis, slen);
+    pd
 }
 
 /// **Den Verifizierer starten.** Aus beiden Hochlaufwegen zu rufen, **vor** dem Root-Task — der

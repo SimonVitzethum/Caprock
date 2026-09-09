@@ -1766,6 +1766,74 @@ pub enum LadeUebergabe {
     KeinVerifizierer,
 }
 
+/// Delegationsliste einsammeln (`LOAD`/`LOAD_IMAGE`): `(src,dst)`-Paare ableiten, bei
+/// jedem Fehler die bereits abgeleiteten Kopien zuruecknehmen und den benannten Code liefern.
+///
+/// Steht genau einmal hier statt je einmal in beiden Armen: zwei Stellen, die dieselbe
+/// Rueckabwicklung implementieren, altern auseinander — und eine halb abgebrochene
+/// Delegation liesse abgeleitete Caps als verwaiste CDT-Kinder liegen (s. Kommentar im
+/// `LOAD`-Arm). `Err` heisst immer „nichts angelegt, alles zurueckgenommen".
+fn sammle_endow(
+    caps: &RwSpinLock<Caps>,
+    pd: usize,
+    liste: u64,
+    anzahl: usize,
+    delete_cap: fn(CapPtr) -> Result<(), u64>,
+) -> Result<[Option<(usize, CapPtr)>; caprock_abi::LOAD_MAX_DELEGATES], u64> {
+    // **Die Ruecknahme steht VOR der Sperre**, und das ist kein Stil: `delete_cap`
+    // finalisiert (Speicher zurueck, DMA abhaengen) und nimmt `CAPS` dafuer selbst. Sie
+    // unter gehaltener Schreibsperre zu rufen waere ein Selbst-Deadlock -- dieselbe Form
+    // wie `match lock() { .. None => lock() }` aus der Fallenliste.
+    let zurueck = |bisher: &[Option<(usize, CapPtr)>], bis: usize| {
+        for e in bisher.iter().take(bis).flatten() {
+            let _ = delete_cap(e.1);
+        }
+    };
+    // Fail-closed an drei Stellen, und jede hat einen eigenen Grund:
+    //   * mehr Paare als [`LOAD_MAX_DELEGATES`](caprock_abi::LOAD_MAX_DELEGATES) -> die
+    //     Liste kann gar nicht so lang sein, das ist ein Aufruffehler und kein
+    //     Ressourcenmangel;
+    //   * ein Quell-Slot, den der Aufrufer nicht haelt -> er delegiert, was er nicht hat;
+    //   * **zwei Paare auf denselben Ziel-Slot** -> welcher dort landet, koennte niemand
+    //     sagen. Genau die Sorte stiller Wahl, gegen die A-5.4 den `service_id`
+    //     eingefuehrt hat.
+    if anzahl > caprock_abi::LOAD_MAX_DELEGATES {
+        return Err(result::ERR_BADCAP);
+    }
+    let mut gesammelt: [Option<(usize, CapPtr)>; caprock_abi::LOAD_MAX_DELEGATES] =
+        [None; caprock_abi::LOAD_MAX_DELEGATES];
+    for k in 0..anzahl {
+        let (src, dst) = caprock_abi::delegate_unpack(((liste >> (8 * k)) & 0xff) as u8);
+        // Zwei Paare auf denselben Ziel-Slot: welcher dort landet, koennte niemand sagen.
+        if gesammelt.iter().flatten().any(|&(z, _)| z == dst) {
+            zurueck(&gesammelt, k);
+            return Err(result::ERR_BADCAP);
+        }
+        let abgeleitet = {
+            let mut g = caps.write();
+            let Some(c) = g.pds.cap_at(pd, src) else {
+                drop(g);
+                zurueck(&gesammelt, k);
+                return Err(result::ERR_BADCAP);
+            };
+            let Some((_, r, _)) = g.cspace.lookup(c) else {
+                drop(g);
+                zurueck(&gesammelt, k);
+                return Err(result::ERR_BADCAP);
+            };
+            g.cspace.copy(c, r)
+        }; // CAPS je Paar kurz gehalten, nie ueber die Ruecknahme
+        match abgeleitet {
+            Ok(copy) => gesammelt[k] = Some((dst, copy)),
+            Err(_) => {
+                zurueck(&gesammelt, k);
+                return Err(result::ERR_BADCAP);
+            }
+        }
+    }
+    Ok(gesammelt)
+}
+
 /// Cap-gesicherter Syscall-Dispatch.
 ///
 /// Liest Syscall-Nummer (`x0`) und *lokalen* Cap-Index (`x1`) aus dem Frame,
@@ -1840,6 +1908,11 @@ pub fn dispatch(
     // Crate zu binden, die ihn nicht kennt. Der Dispatch loest auf und prueft die Rechte, der
     // Kernel bindet -- dieselbe Aufteilung wie bei `spawn`.
     bind_irq: fn(u32, usize, u64, usize) -> Result<(), u64>,
+    // LXPD-Laufzeitpfad (`SYS_LOAD_IMAGE`): wie `load`, aber `(bild_phys, bild_len, pid,
+    // AUFRUFER-PD, Endowment) -> Uebergabe`. Bild-Geometrie hat der Dispatch bereits gegen
+    // die Aufrufer-Memory-Cap geprueft; der Kernel kopiert EINMAL in Staging und traut
+    // danach nur der Kopie.
+    load_image: fn(u64, u64, u32, usize, &[(usize, CapPtr)], usize, usize, u16, u32) -> LadeUebergabe,
 ) -> usize {
     let nr = frame_reg(frame, reg::SYSNO_RESULT);
 
@@ -1865,7 +1938,8 @@ pub fn dispatch(
             // Syscall-Handler (nur Fault) landet hier und wird regulär bearbeitet -- das ist die
             // halbe Bindung, und sie ist gewollt (Debugger/Speicherserver ohne Persönlichkeit).
             redirect::Weiche::Kernel => dispatch_nativ(
-                frame, core, ops, caps, eps, ntfns, load, delete_cap, spawn, debug, bind_irq, nr,
+                frame, core, ops, caps, eps, ntfns, load, delete_cap, spawn, debug, bind_irq,
+                load_image, nr,
             ),
             redirect::Weiche::Fault(code) => {
                 // **Kein Rückfall auf die native ABI.** Aus dem Entzug einer Cap darf keine
@@ -1879,7 +1953,10 @@ pub fn dispatch(
             ),
         };
     }
-    dispatch_nativ(frame, core, ops, caps, eps, ntfns, load, delete_cap, spawn, debug, bind_irq, nr)
+    dispatch_nativ(
+        frame, core, ops, caps, eps, ntfns, load, delete_cap, spawn, debug, bind_irq, load_image,
+        nr,
+    )
 }
 
 /// **Lebt die Handler-PD?** — die Größe, die die Weiche als `handler_lebt` liest.
@@ -2042,6 +2119,8 @@ fn dispatch_nativ(
     debug: fn(u64, usize, usize, u64, u64, u64) -> Result<u64, u64>,
     // Stufe B / B3: dito.
     bind_irq: fn(u32, usize, u64, usize) -> Result<(), u64>,
+    // LXPD-Laufzeitpfad: dito -- der Zweig liegt hier, nicht in `dispatch`.
+    load_image: fn(u64, u64, u32, usize, &[(usize, CapPtr)], usize, usize, u16, u32) -> LadeUebergabe,
     nr: u64,
 ) -> usize {
     if nr == sys::YIELD {
@@ -3001,49 +3080,11 @@ fn dispatch_nativ(
             // Kopien 0..k geloescht. Ein halb abgebrochenes `LOAD` liesse abgeleitete Caps in der
             // geteilten Tabelle liegen, die niemand mehr findet — und die das `delete` ihres
             // Eltern-Caps blockieren.
-            if anzahl > caprock_abi::LOAD_MAX_DELEGATES {
-                return deny(result::ERR_BADCAP);
-            }
-            let mut gesammelt: [Option<(usize, CapPtr)>; caprock_abi::LOAD_MAX_DELEGATES] =
-                [None; caprock_abi::LOAD_MAX_DELEGATES];
-            // **Die Ruecknahme steht VOR der Sperre**, und das ist kein Stil: `delete_cap`
-            // finalisiert (Speicher zurueck, DMA abhaengen) und nimmt `CAPS` dafuer selbst. Sie
-            // unter gehaltener Schreibsperre zu rufen waere ein Selbst-Deadlock -- dieselbe Form
-            // wie `match lock() { .. None => lock() }` aus der Fallenliste.
-            let zurueck = |bisher: &[Option<(usize, CapPtr)>], bis: usize| {
-                for e in bisher.iter().take(bis).flatten() {
-                    let _ = delete_cap(e.1);
-                }
+            // Delegation einsammeln (eine Stelle fuer beide Lade-Arme, s. `sammle_endow`).
+            let gesammelt = match sammle_endow(caps, pd, liste, anzahl, delete_cap) {
+                Ok(g) => g,
+                Err(code) => return deny(code),
             };
-            for k in 0..anzahl {
-                let (src, dst) = caprock_abi::delegate_unpack(((liste >> (8 * k)) & 0xff) as u8);
-                // Zwei Paare auf denselben Ziel-Slot: welcher dort landet, koennte niemand sagen.
-                if gesammelt.iter().flatten().any(|&(z, _)| z == dst) {
-                    zurueck(&gesammelt, k);
-                    return deny(result::ERR_BADCAP);
-                }
-                let abgeleitet = {
-                    let mut g = caps.write();
-                    let Some(c) = g.pds.cap_at(pd, src) else {
-                        drop(g);
-                        zurueck(&gesammelt, k);
-                        return deny(result::ERR_BADCAP);
-                    };
-                    let Some((_, r, _)) = g.cspace.lookup(c) else {
-                        drop(g);
-                        zurueck(&gesammelt, k);
-                        return deny(result::ERR_BADCAP);
-                    };
-                    g.cspace.copy(c, r)
-                }; // CAPS je Paar kurz gehalten, nie ueber die Ruecknahme
-                match abgeleitet {
-                    Ok(copy) => gesammelt[k] = Some((dst, copy)),
-                    Err(_) => {
-                        zurueck(&gesammelt, k);
-                        return deny(result::ERR_BADCAP);
-                    }
-                }
-            }
             // `CapPtr` hat bewusst keinen oeffentlichen Konstruktor -- erst als `Option` sammeln,
             // dann mit dem ersten echten Cap als Fuellwert verdichten. Derselbe Weg wie in
             // `start_root_task` und `load_by_index`.
@@ -3078,6 +3119,108 @@ fn dispatch_nativ(
                 // verwaiste CDT-Kinder und blockieren sogar das `delete` des Eltern-Caps --
                 // dieselbe Falle, die der Abweispfad im Loader schon einmal bezahlt hat, nur an
                 // einer Stelle, die es vor C8 nicht gab.
+                LadeUebergabe::Ausgelastet => {
+                    for e in gesammelt.iter().flatten() {
+                        let _ = delete_cap(e.1);
+                    }
+                    deny(result::ERR_LOAD_BUSY)
+                }
+                LadeUebergabe::KeinVerifizierer => {
+                    for e in gesammelt.iter().flatten() {
+                        let _ = delete_cap(e.1);
+                    }
+                    deny(result::ERR_SERVER_GONE)
+                }
+            }
+        }
+        // LXPD-Laufzeitpfad (`SYS_LOAD_IMAGE = 36`): Bild aus Aufrufer-RAM statt Archiv.
+        //
+        // Belegung wie `LOAD` (`MSG0` = Programm-ID aus dem Boot-Manifest, `MSG1` =
+        // Delegationsliste, `MSG2` = Anzahl, `MSG3` = Ressourcenwunsch), dazu `TAG`:
+        // Low-Byte = Slot der Memory-Cap mit dem Bild, Bits 8..40 = exakte Bildlaenge,
+        // Bits 40..64 muessen `0` sein. Manifest-Cap braucht es keine: Vertrauen kommt
+        // aus dem Boot-Manifest (Hash-Gleichheit), nicht aus mitgereichten Bytes.
+        sys::LOAD_IMAGE => {
+            let ObjectKind::Loader { .. } = kind else {
+                return deny(result::ERR_BADCAP);
+            };
+            if !rights.contains(Rights::WRITE) {
+                return deny(result::ERR_RIGHTS);
+            }
+            let tag = frame_reg(frame, reg::TAG);
+            let bild_slot = (tag & 0xff) as usize;
+            let bild_len = ((tag >> 8) & 0xffff_ffff) as u64;
+            // Stille Abschneidungen gibt es nicht: hohe Bits gesetzt heisst „falsches
+            // Format", nicht „langes Bild".
+            if tag >> 40 != 0 {
+                return deny(result::ERR_BADCAP);
+            }
+            if bild_len == 0 || bild_len > caprock_abi::sys::LXPD_MAX_BILD {
+                return deny(result::ERR_BADCAP);
+            }
+            let pid = frame_reg(frame, reg::MSG0) as u32;
+            let liste = frame_reg(frame, reg::MSG0 + 1);
+            let anzahl = frame_reg(frame, reg::MSG0 + 2) as usize;
+            let (dma_pages, cap_budget) =
+                caprock_abi::load_extras_unpack(frame_reg(frame, reg::MSG0 + 3));
+            // DMA-Schranke VOR jeder Ableitung (C2/D11) — dieselbe Ordnung wie bei `LOAD`.
+            if dma_pages > caprock_abi::DRIVER_DMA_MAX_PAGES {
+                return deny(result::ERR_DMA_TOO_LARGE);
+            }
+            // Bild-Geometrie gegen die Aufrufer-Memory-Cap: muss plain-RAM sein (kein
+            // Geraet — Geraeteregister sind keine ladbaren Images) und die Laenge tragen.
+            // Gelesen wird unter Aufrufer-Autoritaet, also braucht es READ.
+            let bild_phys = {
+                let g = caps.read();
+                let Some(c) = g.pds.cap_at(pd, bild_slot) else {
+                    return deny(result::ERR_BADCAP);
+                };
+                let Some((kind_b, rechte_b, _)) = g.cspace.lookup(c) else {
+                    return deny(result::ERR_BADCAP);
+                };
+                if !rechte_b.contains(Rights::READ) {
+                    return deny(result::ERR_RIGHTS);
+                }
+                let ObjectKind::Memory(r) = kind_b else {
+                    return deny(result::ERR_BADCAP);
+                };
+                if r.len < bild_len {
+                    return deny(result::ERR_BADCAP);
+                }
+                r.base
+            }; // CAPS freigegeben — der Kernel sperrt selbst
+            // Delegation wie `LOAD` (eine Stelle, s. `sammle_endow`).
+            let gesammelt = match sammle_endow(caps, pd, liste, anzahl, delete_cap) {
+                Ok(g) => g,
+                Err(code) => return deny(code),
+            };
+            let mut dicht: [(usize, CapPtr); caprock_abi::LOAD_MAX_DELEGATES];
+            let endow: &[(usize, CapPtr)] = match gesammelt.iter().flatten().next() {
+                None => &[],
+                Some(&fuell) => {
+                    dicht = [fuell; caprock_abi::LOAD_MAX_DELEGATES];
+                    let mut n = 0;
+                    for e in gesammelt.iter().flatten() {
+                        dicht[n] = *e;
+                        n += 1;
+                    }
+                    &dicht[..n]
+                }
+            };
+            // C8-Form wie `LOAD`: Auftrag an den Verifizierer, Aufrufer blockiert. Der
+            // Kernel kopiert EINMAL in Staging und traut danach nur der Kopie.
+            match load_image(
+                bild_phys,
+                bild_len,
+                pid,
+                pd,
+                endow,
+                core,
+                frame,
+                cap_budget,
+                dma_pages as u32,
+            ) {
+                LadeUebergabe::Uebergeben(next) => next,
                 LadeUebergabe::Ausgelastet => {
                     for e in gesammelt.iter().flatten() {
                         let _ = delete_cap(e.1);

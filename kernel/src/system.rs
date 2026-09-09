@@ -1174,6 +1174,10 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
         dispatch_spawn,               // K1a: zweiter Thread in derselben PD, Stack aus einer Cap
         dispatch_debug,               // Z6b: die fuenf Debug-Syscalls
         dispatch_bind_irq,            // B3: SYS_BIND_IRQ, mit Cap-Riegel
+        // LXPD-Laufzeit (`SYS_LOAD_IMAGE = 36`): wie `sys_load_uebergeben`, aber das Bild kommt
+        // aus Aufrufer-RAM statt aus dem Boot-Archiv — Geometrie hat der Dispatch bereits gegen
+        // die Aufrufer-Memory-Cap geprüft, der Verifizierer kopiert EINMAL nach Staging.
+        sys_load_image_uebergeben,
     );
     // Der Syscall kann den laufenden Thread gewechselt haben (block/exit) -> FP-Trap
     // + VSpace passend zum neuen aktuellen Thread setzen.
@@ -12377,6 +12381,68 @@ fn sys_load_uebergeben(
             s.block_for_load(core, frame)
         })
     })
+}
+
+/// **Einen `SYS_LOAD_IMAGE` an den Verifizierer übergeben** (LXPD-Laufzeit) — der
+/// `load_image`-Callback des Dispatch.
+///
+/// Spiegel von [`sys_load_uebergeben`]: derselbe Blockierpfad (`block_for_load`, mit
+/// `charged`-Abrechnung nach B-5.1), derselbe Verifizierer, dieselben drei Ausgänge. Der
+/// einzige Unterschied ist die Bildquelle: kein Archiv-Index, sondern `(bild_phys, bild_len,
+/// pid)` aus Aufrufer-RAM — die Geometrie (plain-RAM, READ-Recht, Länge gedeckt) hat der
+/// Dispatch bereits gegen die Aufrufer-Memory-Cap geprüft.
+fn sys_load_image_uebergeben(
+    bild_phys: u64,
+    bild_len: u64,
+    pid: u32,
+    caller_pd: usize,
+    endow: &[(usize, CapPtr)],
+    core: usize,
+    frame: usize,
+    cap_budget: u16,
+    dma_pages: u32,
+) -> crate::verifizierer::Uebergabe {
+    let caller = SCHEDS[core].lock().current_id(core);
+    crate::verifizierer::uebergeben_bild(
+        bild_phys,
+        bild_len,
+        pid,
+        caller_pd,
+        endow,
+        caller,
+        core,
+        cap_budget,
+        dma_pages,
+        || {
+            // Derselbe Pfad wie nebenan: wer blockiert, hat gerechnet (B-5.1).
+            charged(core, &mut SCHEDS[core].lock(), |s| {
+                s.block_for_load(core, frame)
+            })
+        },
+    )
+}
+
+/// **Staging-Puffer für `SYS_LOAD_IMAGE`** (LXPD-Laufzeit): Kernel-RAM für die EINMALIGE
+/// Kopie des Aufrufer-Bilds, aus der danach Hash, Parse und Laden lesen.
+///
+/// Reiner Kernel-Speicher über [`mem_alloc_anywhere`] (Zone `Anywhere` — bevorzugt oberhalb
+/// 4 GiB): der Puffer wird NIE in eine PD abgebildet und nie einem Gerät gezeigt, also darf
+/// er überall liegen. Kein BSS-Monster: bis zu 4 MiB (`LXPD_MAX_BILD`) stehen nicht im Image,
+/// sondern kommen aus `MEM`. Gibt `(Basis, Länge)` — die Länge ist die der Cap (aufgerundet
+/// möglich, s. [`staging_free`]); `None` heisst RAM erschöpft, und der Ladevorgang schlägt
+/// dann benannt fehl, statt ohne Kopie zu laden.
+pub(crate) fn staging_alloc(len: u64) -> Option<(u64, u64)> {
+    let cap = mem_alloc_anywhere(len, 8)?;
+    Some((cap.base(), cap.len()))
+}
+
+/// Einen Staging-Puffer aus [`staging_alloc`] an `MEM` zurückgeben.
+///
+/// Paarig: JEDER `SYS_LOAD_IMAGE`-Ladevorgang gibt hier zurück — erfolgreich wie abgebrochen —,
+/// sonst leckt pro Laufzeit-Treiber bis zu 4 MiB. `len` muss die von [`staging_alloc`]
+/// gelieferte Cap-Länge sein, nicht die Bildlänge (der Allokator rundet auf).
+pub(crate) fn staging_free(base: u64, len: u64) {
+    MEM.lock().free_region(PhysRegion::new(base, len));
 }
 
 /// Wartet dieser Thread auf den Verifizierer? (C8, nur Prüfung — die `verif`-Zeile braucht die

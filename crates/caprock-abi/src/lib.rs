@@ -452,6 +452,29 @@ pub mod sys {
     /// (kein Schreiben in fremde Frames).
     pub const CALL_TIMEOUT: u64 = 30;
 
+    /// **Geprueftes Treiber-Bild laden** (LXPD-Laufzeitpfad): wie [`LOAD`](Self::LOAD), aber
+    /// das Bild kommt NICHT aus dem Boot-Archiv, sondern aus einer Memory-Cap des Aufrufers.
+    ///
+    /// Register-Belegung wie `LOAD` (`MSG0` = Programm-ID aus dem Boot-Manifest, `MSG1` =
+    /// Delegationsliste, `MSG2` = Anzahl, `MSG3` = Ressourcenwunsch), dazu `TAG`: Low-Byte =
+    /// Slot der Memory-Cap mit dem geprueften Bild, Bits 8..40 = exakte Bildlaenge in Byte,
+    /// Bits 40..64 muessen `0` sein (sonst Absage — kein stilles Abschneiden). Die Laenge muss
+    /// exakt der geladenen Laenge entsprechen — kuerzer heisst abgebrochen, laenger heisst
+    /// Anhaengsel, beides wird abgewiesen. Manifest-Cap braucht es keine: Vertrauen kommt aus
+    /// dem Boot-Manifest (Hash-Gleichheit mit dem Eintrag dieser Programm-ID), nicht aus
+    /// mitgereichten Bytes — „niemals der PD glauben".
+    ///
+    /// Gatter wie `LOAD` (Loader-Cap + WRITE), Delegation wie `LOAD`, DMA-Schranke VOR jeder
+    /// Ableitung. Der Kernel kopiert die Bytes EINMAL in Staging und prueft danach nur noch
+    /// die Kopie (kein TOCTOU zwischen Hash und Laden). Schranke
+    /// [`LXPD_MAX_BILD`](Self::LXPD_MAX_BILD) gilt vor jeder Kopie.
+    pub const LOAD_IMAGE: u64 = 36;
+
+    /// **Obergrenze eines Laufzeit-Treiberbilds** (`LOAD_IMAGE`): 4 MiB. Wer mehr braucht,
+    /// bekommt eine benannte Absage statt einer stillen Teilkopie — Treiber-Images sind
+    /// klein, und eine Schranke hier ist billiger als ein halb geladener Treiber.
+    pub const LXPD_MAX_BILD: u64 = 4 * 1024 * 1024;
+
     /// **Speicher der Ziel-PD schreiben** (Debugger v2, `M`-Paket der gdbserver-PD).
     ///
     /// `MSG0` Cap-Slot (`DebugControl`) · `MSG1` Ziel-VA · `MSG2` Laenge ·
@@ -955,9 +978,9 @@ pub mod fork {
     /// wenige Segmente), klein genug, dass die Kopierschleife unter der
     /// Sperrhaltedauer-Marke bleibt (Aufrufer schleift, preemptibel).
     pub const SNAPSHOT_MAX_BYTES: u64 = 8 * 1024 * 1024;
-    /// Naechste freie Syscall-Nummer nach FORK/EXEC + Debugger-v2 (s. `super::sys`).
-    /// `36` ist frei; `4` bleibt historische Luecke, nie vergeben.
-    pub const NAECHSTE_FREIE_SYSCALL: u64 = 36;
+    /// Naechste freie Syscall-Nummer nach FORK/EXEC + Debugger-v2 + LOAD_IMAGE (s. `super::sys`).
+    /// `37` ist frei; `4` bleibt historische Luecke, nie vergeben.
+    pub const NAECHSTE_FREIE_SYSCALL: u64 = 37;
 }
 
 // --- Host-nahe Pruefung der Nummernvergabe (A2-Rest) ------------------------------------------
@@ -991,15 +1014,17 @@ mod nummern {
     }
 
     #[test]
-    fn fork_exec_belegen_die_luecke_36_bleibt_frei() {
-        // Prozessmodell: die Luecke `31`/`32` ist geschlossen, `36+` bleibt frei.
-        // `4` bleibt historische Luecke, nie vergeben. Kollision = Baufehler:
-        // faellt dieser Test, ist eine Nummer doppelt vergeben (s. naechsten Test).
+    fn fork_exec_belegen_die_luecke_37_bleibt_frei() {
+        // Prozessmodell: die Luecke `31`/`32` ist geschlossen, `36` ist LOAD_IMAGE,
+        // `37+` bleibt frei. `4` bleibt historische Luecke, nie vergeben.
+        // Kollision = Baufehler: faellt dieser Test, ist eine Nummer doppelt
+        // vergeben (s. naechsten Test).
         assert_eq!(sys::FORK_SNAPSHOT, 31);
         assert_eq!(sys::EXEC_REPLACE, 32);
-        assert_eq!(super::fork::NAECHSTE_FREIE_SYSCALL, 36);
+        assert_eq!(sys::LOAD_IMAGE, 36);
+        assert_eq!(super::fork::NAECHSTE_FREIE_SYSCALL, 37);
         assert_eq!(super::fork::SNAPSHOT_MAX_BYTES, 8 * 1024 * 1024);
-        // Kein bekannter Syscall liegt auf/ueber 36 — wuerde einer hinzukommen, ohne
+        // Kein bekannter Syscall liegt auf/ueber 37 — wuerde einer hinzukommen, ohne
         // diesen Test zu erweitern, schwiege die Einmaligkeitspruefung nicht, aber die
         // „naechste freie"-Aussage waere falsch. Deshalb steht die Aufzaehlung hier.
         for n in [
@@ -1038,8 +1063,9 @@ mod nummern {
             sys::CALL_TIMEOUT,
             sys::FORK_SNAPSHOT,
             sys::EXEC_REPLACE,
+            sys::LOAD_IMAGE,
         ] {
-            assert!(n < 36, "Syscall-Nummer {n} liegt auf/ueber der naechsten freien 36");
+            assert!(n < 37, "Syscall-Nummer {n} liegt auf/ueber der naechsten freien 37");
         }
     }
 
@@ -1081,6 +1107,7 @@ mod nummern {
             sys::CALL_TIMEOUT,
             sys::FORK_SNAPSHOT,
             sys::EXEC_REPLACE,
+            sys::LOAD_IMAGE,
         ];
         let mut sortiert = alle;
         sortiert.sort_unstable();
@@ -1117,7 +1144,8 @@ mod nummern {
         assert_ne!(result::ERR_HASCHILDREN, result::ERR_INUSE);
         // Geprueft am 2026-09-09: `30` ist seit A2-Rest als `CALL_TIMEOUT` vergeben
         // (`4` ist eine historische Luecke, nie vergeben). `31`/`32` sind seit
-        // Prozessmodell FORK/EXEC vergeben; naechste freie Nummer: `36`.
+        // Prozessmodell FORK/EXEC vergeben, `36` seit LXPD-Laufzeit LOAD_IMAGE;
+        // naechste freie Nummer: `37`.
         assert_eq!(sys::PARK_TIMEOUT, 29);
         assert_eq!(sys::CALL_TIMEOUT, 30);
         assert_eq!(sys::FORK_SNAPSHOT, 31);

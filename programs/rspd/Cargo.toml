@@ -1,0 +1,15 @@
+[package]
+name = "rspd"
+version = "0.0.0"
+edition = "2021"
+description = "RSP protocol side of the gdbserver PD (debugger v2, standalone demo, not a workspace member)"
+license = "MIT OR Apache-2.0"
+
+# Standalone: this empty section detaches the crate from the Caprock workspace
+# (root and programs/ manifests must NOT list it as a member). It stays
+# verifiable on its own via an isolated `cargo test` in a /tmp copy, the same
+# way tools/host-tests.sh tests dependency-carrying crates.
+[workspace]
+
+[lib]
+path = "src/lib.rs"

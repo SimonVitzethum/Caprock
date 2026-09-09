@@ -37,22 +37,23 @@
 //! ```text
 //! Kopf (80 B):
 //!   0  magic:u32              = 0x534C_4B4D ("SLKM")
-//!   4  format_version:u16     = 1
+//!   4  format_version:u16     = 2 (1 = Vorgaenger, s.u.)
 //!   6  signature_algorithm_id:u16   (Ed25519 = 1)
 //!   8  flags:u32
 //!  12  manifest_version:u32   (monoton; Anti-Downgrade)
 //!  16  entry_count:u32
-//!  20  entry_len:u32          = 96  (selbstbeschreibend -- aber NIE zum Teil-Lesen: ein Kernel
-//!                                    mit anderem Eintragsformat weist BENANNT ab, statt die
-//!                                    bekannten Felder zu lesen und den Rest zu ueberspringen.
-//!                                    Das waere hier besonders tueckisch, weil die Signatur ueber
-//!                                    die GANZE Nachricht laeuft: das Ergebnis waere echt und
-//!                                    missverstanden zugleich, mit verrutschtem `initial_caps`)
+//!  20  entry_len:u32          = 100 (v2) bzw. 96 (v1 — selbstbeschreibend, aber NIE zum
+//!                                    Teil-Lesen: ein Kernel mit anderem Eintragsformat weist
+//!                                    BENANNT ab, statt die bekannten Felder zu lesen und den Rest
+//!                                    zu ueberspringen. Das waere hier besonders tueckisch, weil
+//!                                    die Signatur ueber die GANZE Nachricht laeuft: das Ergebnis
+//!                                    waere echt und missverstanden zugleich, mit verrutschtem
+//!                                    `initial_caps`)
 //!  24  kernel_hash:[u8;32]    SHA-256 des Kernel-Codes -> bindet das Manifest an DIESEN Kernel
 //!  56  key_id:[u8;16]
 //!  72  reserved:[u8;8]        = 0
 //!
-//! Eintrag (96 B), entry_count mal:
+//! Eintrag v1 (96 B), entry_count mal — die Fassung, die `tools/sign_manifest.py` schreibt:
 //!   0  name:[u8;16]           (NUL-gepolstert)
 //!  16  program_id:u32         (stabile ID; ueberdauert Namensaenderungen)
 //!  20  domain:u32             (0=TrustedSAS 1=HardwareLand 2=UserLand)
@@ -69,9 +70,30 @@
 //!  88  dev_class:u32          (class<<16|subclass<<8|prog_if; 0xFFFF_FFFF = beliebig)
 //!  92  service_id:u32         (A-5.4: WELCHEN Dienst dieser Client meint; 0 = nicht benannt)
 //!
-//! msg_len = 80 + entry_count * 96
+//! Eintrag v2 (100 B) = v1 plus:
+//!  96  period_us:u32          (Z11c: die Periode zur `budget_us`-Reservierung; 0 = nichts gesagt)
+//!
+//! msg_len = 80 + entry_count * entry_len (96 oder 100, je Fassung)
 //! msg_len  signature:[..]     (nicht leer; Laenge/Algorithmus prueft der Kernel-Verifier)
 //! ```
+//!
+//! ## Warum v2 laenger ist statt breiter zu deuten (Z11c, 2026-09-09)
+//!
+//! Eine MCS-Reservierung braucht Budget **und** Periode; v1 hatte eine Zahl. Aus einer Zahl eine
+//! Reservierung zu machen hiesse, die Periode zu erfinden — sie stuende dann in keinem Dokument.
+//! Die reservierten Bytes sind weg (A-5.3 nahm 8, A-5.4 die letzten 4), also waechst der Eintrag
+//! um 4 auf 100 und die Formatversion auf 2. Ein v1-Lader weist v2 **benannt** ab
+//! ([`LoaderError::UnsupportedManifestFormat`] mit beiden Zahlen) statt 96 von 100 Byte zu
+//! lesen — s. die Regel im Kopfkommentar von [`SystemManifest::parse`].
+//!
+//! ## Warum `period_us = 0` KEINE priority-0-Falle ist
+//!
+//! `priority = 0` ist die niedrigste gueltige Prioritaet und damit von „nichts gesagt" nicht zu
+//! unterscheiden (Z11c, offen). Bei der Periode gibt es diese Falle nicht: eine Periode von
+//! 0 µs ist keine gueltige Reservierung, sondern bedeutungslos — `0` heisst also eindeutig
+//! „nichts gesagt", genau wie `budget_us = 0` „kein Budget" heisst. Entscheidend ist die
+//! **Kombination**: erst `budget_us != 0 && period_us != 0` ist eine Reservierung
+//! ([`Entry::hat_reservierung`]); jede der beiden Zahlen allein sagt nichts.
 //!
 //! ## Die Politikfelder gehören halb hierher (A-1.4)
 //!
@@ -88,15 +110,19 @@ use crate::LoaderError;
 
 /// Magic ("SLKM").
 pub const MANIFEST_MAGIC: u32 = 0x534C_4B4D;
-/// Unterstützte Formatversion.
-pub const MANIFEST_FORMAT_VERSION: u16 = 1;
+/// Neueste unterstützte Formatversion (Z11c: traegt `period_us`).
+pub const MANIFEST_FORMAT_VERSION: u16 = 2;
+/// Vorgaenger-Fassung: wird weiterhin gelesen (`period_us` = 0 = „nichts gesagt").
+pub const MANIFEST_FORMAT_VERSION_V1: u16 = 1;
 /// Signaturalgorithmus Ed25519 (identisch nummeriert wie in [`crate::cert`]).
 pub const SIG_ALG_ED25519: u16 = 1;
 
 /// Länge des festen Kopfteils.
 pub const HEADER_LEN: usize = 80;
-/// Länge eines Eintrags (Formatversion 1).
+/// Länge eines Eintrags der Fassung 1 (96 B — die Fassung, die `tools/sign_manifest.py` schreibt).
 pub const ENTRY_LEN: usize = 96;
+/// Länge eines Eintrags der Fassung 2 (96 B + `period_us`).
+pub const ENTRY_LEN_V2: usize = 100;
 
 /// Obergrenze der Eintragszahl. Bewusst klein: die Startmenge eines Knotens ist überschaubar, und
 /// eine harte Schranke hier ist billiger als eine Schleife über eine fremde `u32`.
@@ -231,6 +257,13 @@ pub struct Entry<'a> {
     pub priority: u32,
     /// CPU-Budget in Mikrosekunden (0 = keines).
     pub budget_us: u32,
+    /// CPU-Periode in Mikrosekunden (Z11c, nur Fassung 2; Fassung 1 liefert 0).
+    ///
+    /// `0` heisst „nichts gesagt" — und das ist hier **keine** priority-0-Falle: eine Periode
+    /// von 0 µs waere keine gueltige Reservierung, waehrend Prioritaet 0 die niedrigste
+    /// gueltige Prioritaet ist. Erst zusammen mit [`Entry::budget_us`] entsteht eine
+    /// Reservierung, s. [`Entry::hat_reservierung`].
+    pub period_us: u32,
     /// **Welches** Gerät diese Komponente bekommen soll (A-5.3). Siehe [`DeviceSelector`].
     pub device: DeviceSelector,
     /// **Welchen Dienst dieser Client meint** (A-5.4) — die `program_id` des Anbieters.
@@ -316,6 +349,15 @@ impl<'a> Entry<'a> {
     pub fn is_root_task(&self) -> bool {
         self.policy_flags & POLICY_ROOT_TASK != 0
     }
+    /// Traegt dieser Eintrag eine einhaltbare CPU-Reservierung? (Z11c)
+    ///
+    /// Erst Budget **und** Periode gemeinsam sind eine Reservierung. Jede der beiden Zahlen
+    /// allein sagt nichts: `budget_us` ohne `period_us` liesse die Periode erfinden, `period_us`
+    /// ohne `budget_us` den Anteil. Ein v1-Manifest (Periode immer 0) liefert hier also nie
+    /// `true` — der Kernel weist `budget_us != 0` ohne Periode ab, statt zu raten.
+    pub fn hat_reservierung(&self) -> bool {
+        self.budget_us != 0 && self.period_us != 0
+    }
     /// Verlangt dieser Eintrag Autorität, die dieser Kernel nicht kennt? Dann darf er **nicht**
     /// geladen werden: ein unbekanntes Bit bedeutet, dass das Manifest von einer Zuteilung
     /// ausgeht, die hier niemand vornimmt — stillschweigend weniger Autorität zu geben, wäre die
@@ -337,6 +379,8 @@ pub struct SystemManifest<'a> {
     pub manifest_version: u32,
     /// Zahl der Einträge (bereits gegen [`MAX_ENTRIES`] und die Datenlänge geprüft).
     pub entry_count: u32,
+    /// Breite eines Eintrags in Byte (96 = v1, 100 = v2) — die geparste Fassung.
+    pub entry_len: usize,
     /// SHA-256 des Kernel-Codes, an den dieses Manifest gebunden ist (A-1.3).
     pub kernel_hash: [u8; 32],
     /// Fingerprint des signierenden Schlüssels.
@@ -364,20 +408,29 @@ impl<'a> SystemManifest<'a> {
         // man kennt, und der Rest übersprungen: signiert ist die GANZE Nachricht, ein
         // teilgelesenes v2-Manifest wäre authentisch und unverstanden zugleich — mit verrutschtem
         // `initial_caps`/`policy_flags` und gültiger Signatur darüber. S. `LoaderError`.
+        //
+        // Z11c (2026-09-09): der Parser kennt ZWEI Fassungen — (1, 96) und (2, 100). Alles andere
+        // ist entweder neuer als dieser Kernel oder kaputt, und beides bekommt die benannte
+        // Absage mit beiden Zahlen. Insbesondere liest kein v2-Eintrag je als zwei v1-Einträge:
+        // die Breite steht im Kopf, die Schrittweite folgt ihr.
         let format_version = rd_u16(data, 4);
         let entry_len = rd_u32(data, 20);
-        if format_version != MANIFEST_FORMAT_VERSION || entry_len as usize != ENTRY_LEN {
+        let entry_len_ok = (format_version == MANIFEST_FORMAT_VERSION_V1
+            && entry_len as usize == ENTRY_LEN)
+            || (format_version == MANIFEST_FORMAT_VERSION && entry_len as usize == ENTRY_LEN_V2);
+        if !entry_len_ok {
             return Err(LoaderError::UnsupportedManifestFormat {
                 format_version,
                 entry_len,
             });
         }
+        let entry_len = entry_len as usize;
         let entry_count = rd_u32(data, 16);
         if entry_count as usize > MAX_ENTRIES {
             return Err(LoaderError::BadManifest);
         }
         // Overflow-sicher: entry_count <= MAX_ENTRIES, also passt das Produkt in usize.
-        let msg_len = HEADER_LEN + (entry_count as usize) * ENTRY_LEN;
+        let msg_len = HEADER_LEN + (entry_count as usize) * entry_len;
         if data.len() <= msg_len {
             return Err(LoaderError::BadManifest); // Signatur fehlt bzw. ist leer
         }
@@ -391,6 +444,7 @@ impl<'a> SystemManifest<'a> {
             flags: rd_u32(data, 8),
             manifest_version: rd_u32(data, 12),
             entry_count,
+            entry_len,
             kernel_hash,
             key_id,
             entries: &data[HEADER_LEN..msg_len],
@@ -443,8 +497,10 @@ impl<'a> Verified<'a> {
         if i >= self.count() {
             return None;
         }
-        // Bereits bei `parse` sichergestellt: `entries` ist genau `count * ENTRY_LEN` lang.
-        let e = self.0.entries.get(i * ENTRY_LEN..(i + 1) * ENTRY_LEN)?;
+        // Bereits bei `parse` sichergestellt: `entries` ist genau `count * entry_len` lang, und
+        // `entry_len` ist 96 (v1) oder 100 (v2) — die Schrittweite folgt der geparsten Fassung.
+        let w = self.0.entry_len;
+        let e = self.0.entries.get(i * w..(i + 1) * w)?;
         let mut sha256 = [0u8; 32];
         sha256.copy_from_slice(&e[32..64]);
         Some(Entry {
@@ -459,6 +515,10 @@ impl<'a> Verified<'a> {
             core_affinity: rd_u32(e, 72),
             priority: rd_u32(e, 76),
             budget_us: rd_u32(e, 80),
+            // Z11c: die Periode steht nur in Fassung 2 (Offset 96). Fassung 1 liefert 0 =
+            // „nichts gesagt" — alte Manifeste bleiben lesbar, und ein altes Manifest bekommt
+            // dadurch nie eine Reservierung angedichtet (`hat_reservierung` bleibt falsch).
+            period_us: if w >= ENTRY_LEN_V2 { rd_u32(e, 96) } else { 0 },
             // A-5.3 nimmt 8 der 12 reservierten Bytes. Das Format bleibt eingefroren: `ENTRY_LEN`
             // aendert sich nicht, und ein aelteres Manifest (Nullen im reservierten Bereich) ergibt
             // `vendor=0 device=0 class=0` -- was auf **kein** Geraet passt. Deshalb wird `0` hier
@@ -555,6 +615,9 @@ mod tests {
         device: Option<DeviceSelector>,
         /// A-5.4: die `program_id` des gemeinten Dienstes (`0` = nicht benannt).
         service_id: u32,
+        /// Z11c: die Periode zur Budget-Reservierung (`0` = nichts gesagt). Nur der v2-Bauer
+        /// schreibt sie; der v1-Bauer legt Nullen — genau wie ein vor Z11c erzeugtes Manifest.
+        period_us: u32,
     }
 
     fn e(name: &'static str, program_id: u32) -> E {
@@ -566,19 +629,31 @@ mod tests {
             policy_flags: 0,
             device: None,
             service_id: 0,
+            period_us: 0,
         }
     }
 
-    /// Ein strukturell gültiges Manifest bauen (Signatur ist Dummy — der Parser prüft keine Krypto).
+    /// Ein strukturell gültiges Manifest der NEUESTEN Fassung bauen (Signatur ist Dummy — der
+    /// Parser prüft keine Krypto).
     fn build(entries: &[E], siglen: usize) -> Vec<u8> {
-        let msg_len = HEADER_LEN + entries.len() * ENTRY_LEN;
+        build_mit(MANIFEST_FORMAT_VERSION, ENTRY_LEN_V2, entries, siglen)
+    }
+
+    /// Ein strukturell gültiges Manifest der Fassung 1 bauen — also genau das, was
+    /// `tools/sign_manifest.py` vor Z11c schrieb (96-B-Einträge, keine Periode).
+    fn build_v1(entries: &[E], siglen: usize) -> Vec<u8> {
+        build_mit(MANIFEST_FORMAT_VERSION_V1, ENTRY_LEN, entries, siglen)
+    }
+
+    fn build_mit(version: u16, breite: usize, entries: &[E], siglen: usize) -> Vec<u8> {
+        let msg_len = HEADER_LEN + entries.len() * breite;
         let mut v = vec![0u8; msg_len + siglen];
         v[0..4].copy_from_slice(&MANIFEST_MAGIC.to_le_bytes());
-        v[4..6].copy_from_slice(&MANIFEST_FORMAT_VERSION.to_le_bytes());
+        v[4..6].copy_from_slice(&version.to_le_bytes());
         v[6..8].copy_from_slice(&SIG_ALG_ED25519.to_le_bytes());
         v[12..16].copy_from_slice(&7u32.to_le_bytes()); // manifest_version
         v[16..20].copy_from_slice(&(entries.len() as u32).to_le_bytes());
-        v[20..24].copy_from_slice(&(ENTRY_LEN as u32).to_le_bytes());
+        v[20..24].copy_from_slice(&(breite as u32).to_le_bytes());
         for i in 24..56 {
             v[i] = i as u8; // kernel_hash
         }
@@ -586,7 +661,7 @@ mod tests {
             v[i] = (i + 1) as u8; // key_id
         }
         for (i, en) in entries.iter().enumerate() {
-            let b = HEADER_LEN + i * ENTRY_LEN;
+            let b = HEADER_LEN + i * breite;
             let nb = en.name.as_bytes();
             v[b..b + nb.len().min(16)].copy_from_slice(&nb[..nb.len().min(16)]);
             v[b + 16..b + 20].copy_from_slice(&en.program_id.to_le_bytes());
@@ -607,6 +682,9 @@ mod tests {
                 v[b + 88..b + 92].copy_from_slice(&d.class.to_le_bytes());
             }
             v[b + 92..b + 96].copy_from_slice(&en.service_id.to_le_bytes());
+            if breite >= ENTRY_LEN_V2 {
+                v[b + 96..b + 100].copy_from_slice(&en.period_us.to_le_bytes());
+            }
         }
         for i in 0..siglen {
             v[msg_len + i] = (i + 9) as u8;
@@ -623,6 +701,7 @@ mod tests {
             policy_flags: POLICY_ROOT_TASK,
             device: None,
             service_id: 0,
+            period_us: 0,
         }
     }
 
@@ -693,13 +772,14 @@ mod tests {
     }
 
     /// Der Selektor liegt in den **reservierten** Bytes und aendert die Eintragslaenge nicht --
-    /// sonst waere jedes bestehende signierte Manifest ungueltig geworden.
+    /// sonst waere jedes bestehende signierte Manifest ungueltig geworden. (Fassung 1; Fassung 2
+    /// waechst dafuer um genau die 4 Byte der Periode, s. `eintragsbreite_v2_ist_100`.)
     #[test]
     fn selektor_aendert_die_eintragslaenge_nicht() {
         assert_eq!(ENTRY_LEN, 96);
         let mut en = e("x", 1);
         en.device = Some(DeviceSelector { vendor: 1, device: 2, class: 3 });
-        let raw = build(&[en], 64);
+        let raw = build_v1(&[en], 64);
         assert_eq!(raw.len(), HEADER_LEN + ENTRY_LEN + 64);
         // Die letzten vier Bytes tragen seit A-5.4 die Dienst-Benennung; ungesetzt sind sie null.
         let b = HEADER_LEN;
@@ -710,17 +790,124 @@ mod tests {
         m.verify_with(|_, _| true).unwrap()
     }
 
+    // --- Z11c: `period_us` (Format v2) -----------------------------------------------------------
+
+    /// **Alte Manifeste bleiben lesbar.** Ein vor Z11c erzeugtes Manifest (Fassung 1, 96 B je
+    /// Eintrag — genau das, was `tools/sign_manifest.py` schreibt) parst unveraendert, und die
+    /// fehlende Periode heisst 0 = „nichts gesagt": kein Budget wird angedichtet, keine
+    /// Reservierung behauptet. Das ist die Gegenprobe zur priority-0-Falle — dort waere 0 ein
+    /// gueltiger Wert, hier ist 0 µs bedeutungslos.
+    #[test]
+    fn v1_bleibt_lesbar_periode_ist_nichts_gesagt() {
+        let raw = build_v1(&[root("init", 1), e("hello", 2)], 64);
+        assert_eq!(raw.len(), HEADER_LEN + 2 * ENTRY_LEN + 64);
+        let m = SystemManifest::parse(&raw).unwrap();
+        assert_eq!(m.format_version, MANIFEST_FORMAT_VERSION_V1);
+        assert_eq!(m.entry_len, ENTRY_LEN);
+        assert_eq!(m.message().len(), HEADER_LEN + 2 * ENTRY_LEN);
+        let v = accept(m);
+        let e0 = v.entry(0).unwrap();
+        assert_eq!(e0.budget_us, 1000); // das Budget steht auch in v1 schon da
+        assert_eq!(e0.period_us, 0); // die Periode stand in keinem Dokument: nichts gesagt
+        assert!(!e0.hat_reservierung()); // Budget ohne Periode ist KEINE Reservierung
+        assert_eq!(v.entry(1).unwrap().period_us, 0);
+    }
+
+    /// **Die neue Zahl kommt durch.** Fassung 2 traegt die Periode bei Offset 96, und sie wird
+    /// als Reservierung lesbar: Budget UND Periode gesetzt.
+    #[test]
+    fn v2_traegt_die_periode() {
+        let mut rt = root("init", 1);
+        rt.period_us = 20_000;
+        let raw = build(&[rt], 64);
+        assert_eq!(raw.len(), HEADER_LEN + ENTRY_LEN_V2 + 64);
+        let m = SystemManifest::parse(&raw).unwrap();
+        assert_eq!(m.format_version, MANIFEST_FORMAT_VERSION);
+        assert_eq!(m.entry_len, ENTRY_LEN_V2);
+        let v = accept(m);
+        let e0 = v.entry(0).unwrap();
+        assert_eq!(e0.budget_us, 1000);
+        assert_eq!(e0.period_us, 20_000);
+        assert!(e0.hat_reservierung());
+    }
+
+    /// **Die Reservierung braucht beide Zahlen.** Jede allein sagt nichts — genau die Aussage,
+    /// an der v1 scheiterte („eine Zahl, aus der eine Reservierung zu machen hiesse, die Periode
+    /// zu erfinden"). Alle vier Kombinationen, ausgeschrieben statt abgezaehlt.
+    #[test]
+    fn reservierung_braucht_budget_und_periode() {
+        let fall = |budget: u32, periode: u32| {
+            let mut en = e("x", 1);
+            en.period_us = periode;
+            let mut raw = build(&[en], 64);
+            // `build` schreibt immer budget 1000 — den Budget-Fall formen wir per Hand.
+            raw[HEADER_LEN + 80..HEADER_LEN + 84].copy_from_slice(&budget.to_le_bytes());
+            let v = accept(SystemManifest::parse(&raw).unwrap());
+            v.entry(0).unwrap().hat_reservierung()
+        };
+        assert!(!fall(0, 0), "nichts gesagt ist keine Reservierung");
+        assert!(!fall(1000, 0), "Budget ohne Periode ist keine Reservierung");
+        assert!(!fall(0, 20_000), "Periode ohne Budget ist keine Reservierung");
+        assert!(fall(1000, 20_000), "Budget mit Periode ist eine Reservierung");
+    }
+
+    /// **Fassung 2 ist genau 4 Byte laenger.** Kein Umbau, kein Deuten: `period_us` haengt an,
+    /// alles andere bleibt an seinem Offset — ein v2-Eintrag ist ein v1-Eintrag mit Anhang.
+    #[test]
+    fn eintragsbreite_v2_ist_100() {
+        assert_eq!(ENTRY_LEN, 96);
+        assert_eq!(ENTRY_LEN_V2, 100);
+        let mut en = e("x", 1);
+        en.period_us = 20_000;
+        let raw = build(&[en], 64);
+        assert_eq!(raw.len(), HEADER_LEN + ENTRY_LEN_V2 + 64);
+        // Die ersten 96 Byte liegen wie in v1: Name, IDs, Caps, Selektor, Dienst.
+        let raw_v1 = build_v1(&[e("x", 1)], 64);
+        assert_eq!(&raw[HEADER_LEN..HEADER_LEN + 96], &raw_v1[HEADER_LEN..HEADER_LEN + 96]);
+    }
+
+    /// **Jede fremde Kombination wird benannt abgewiesen, nicht gelesen.** (1, 100) ist kein v2,
+    /// (2, 96) kein v1, und (3, 96) ist neuer als dieser Kernel — alle drei enden in
+    /// `UnsupportedManifestFormat` mit den beiden Zahlen, nie in `BadManifest` und nie in einem
+    /// Eintrag.
+    #[test]
+    fn fremde_kombinationen_werden_benannt_abgewiesen() {
+        let kombination = |version: u16, breite: u32| {
+            let mut raw = build(&[root("init", 1)], 64);
+            raw[4..6].copy_from_slice(&version.to_le_bytes());
+            raw[20..24].copy_from_slice(&breite.to_le_bytes());
+            SystemManifest::parse(&raw).unwrap_err()
+        };
+        assert_eq!(
+            kombination(1, 100),
+            LoaderError::UnsupportedManifestFormat { format_version: 1, entry_len: 100 }
+        );
+        assert_eq!(
+            kombination(2, 96),
+            LoaderError::UnsupportedManifestFormat { format_version: 2, entry_len: 96 }
+        );
+        assert_eq!(
+            kombination(3, 96),
+            LoaderError::UnsupportedManifestFormat { format_version: 3, entry_len: 96 }
+        );
+        assert_eq!(
+            kombination(2, 104),
+            LoaderError::UnsupportedManifestFormat { format_version: 2, entry_len: 104 }
+        );
+    }
+
     #[test]
     fn parse_roundtrip() {
         let raw = build(&[root("init", 1), e("hello", 2)], 64);
         let m = SystemManifest::parse(&raw).unwrap();
         assert_eq!(m.format_version, MANIFEST_FORMAT_VERSION);
+        assert_eq!(m.entry_len, ENTRY_LEN_V2);
         assert_eq!(m.signature_algorithm_id, SIG_ALG_ED25519);
         assert_eq!(m.manifest_version, 7);
         assert_eq!(m.entry_count, 2);
         assert_eq!(m.kernel_hash[0], 24);
         assert_eq!(m.key_id[0], 57);
-        assert_eq!(m.message().len(), HEADER_LEN + 2 * ENTRY_LEN);
+        assert_eq!(m.message().len(), HEADER_LEN + 2 * ENTRY_LEN_V2);
         assert_eq!(m.signature().len(), 64);
         // message + signature partitionieren die Eingabe exakt.
         assert_eq!(m.message().len() + m.signature().len(), raw.len());
@@ -738,6 +925,8 @@ mod tests {
         assert_eq!(e0.core_affinity, ANY_CORE);
         assert_eq!(e0.priority, 5);
         assert_eq!(e0.budget_us, 1000);
+        assert_eq!(e0.period_us, 0); // der Bauer nannte keine Periode: nichts gesagt, s. Z11c
+        assert!(!e0.hat_reservierung()); // Budget ohne Periode ist keine Reservierung
         assert_eq!(e0.sha256[0], 1);
         let e1 = v.entry(1).unwrap();
         assert_eq!(e1.name(), "hello");
@@ -761,7 +950,7 @@ mod tests {
     fn verify_sees_exactly_message_and_signature() {
         let raw = build(&[root("init", 1)], 64);
         let m = SystemManifest::parse(&raw).unwrap();
-        let msg_len = HEADER_LEN + ENTRY_LEN;
+        let msg_len = HEADER_LEN + ENTRY_LEN_V2;
         m.verify_with(|msg, sig| {
             assert_eq!(msg, &raw[..msg_len]);
             assert_eq!(sig, &raw[msg_len..]);
@@ -790,7 +979,7 @@ mod tests {
             SystemManifest::parse(&raw).unwrap_err(),
             LoaderError::UnsupportedManifestFormat {
                 format_version: 0xEE,
-                entry_len: ENTRY_LEN as u32,
+                entry_len: ENTRY_LEN_V2 as u32,
             }
         );
     }
@@ -978,7 +1167,11 @@ mod kani_proofs {
         if let Ok(m) = SystemManifest::parse(&data[..len]) {
             assert!(m.message().len() + m.signature().len() == len);
             assert!(!m.signature().is_empty());
-            assert!(m.message().len() == HEADER_LEN + (m.entry_count as usize) * ENTRY_LEN);
+            // Z11c: zwei Fassungen — die Nachrichtenlaenge folgt der geparsten Breite.
+            assert!(
+                m.message().len() == HEADER_LEN + (m.entry_count as usize) * m.entry_len
+                    && (m.entry_len == ENTRY_LEN || m.entry_len == ENTRY_LEN_V2)
+            );
             if let Ok(v) = m.verify_with(|_, _| true) {
                 let n = v.count();
                 kani::assume(n <= 1);

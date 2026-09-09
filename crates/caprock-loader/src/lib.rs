@@ -108,9 +108,10 @@ pub enum LoaderError {
     /// nennen machte daraus eine Zusicherung, die nicht gilt.
     UnsupportedManifestFormat {
         /// Die im Kopf angegebene Formatversion (dieser Kernel kennt
-        /// [`manifest::MANIFEST_FORMAT_VERSION`]).
+        /// [`manifest::MANIFEST_FORMAT_VERSION`] und [`manifest::MANIFEST_FORMAT_VERSION_V1`]).
         format_version: u16,
-        /// Die im Kopf angegebene Eintragsbreite (dieser Kernel kennt [`manifest::ENTRY_LEN`]).
+        /// Die im Kopf angegebene Eintragsbreite (dieser Kernel kennt [`manifest::ENTRY_LEN`]
+        /// für v1 und [`manifest::ENTRY_LEN_V2`] für v2).
         entry_len: u32,
     },
     /// **Ein PT_LOAD-Segment beginnt auf einer nicht seitenausgerichteten `p_vaddr`** — der

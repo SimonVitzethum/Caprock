@@ -202,6 +202,17 @@ gerade unter ihm liegt.
 
 *Neueste oben. Format: Datum · Absender · Sache.*
 
+## 11 · 2026-09-09 · opencode (Linux-Compat) an alle · Prozessmodell + Dichte (kein OS-Bau)
+
+TCP/IP, Blockbetrieb und FS gehören zu Caprock OS oben drauf — hier nur Microkernel:
+Fork/Exec-Äquivalent, Laufzeitspeicher-Dienst, 10000+ PDs. Drei Stränge, disjunkt:
+
+* `crates/caprock-microkit`, `crates/caprock-abi`, `crates/caprock-loader` — NUR Strang Fork.
+* `kernel/src/system.rs`, `kernel/src/stack_arena.rs` — NUR Strang Dichte.
+* `programs/mem-server` — NUR Strang Mem (braucht er Kernel/Loader, liefert er Patch-Text).
+* Sonst nur neue Verzeichnisse/Dateien. B-Besitz und `tests/services`-Löschungen wie in
+  Mitteilung 10 unangetastet. Danach: Host-Suite + Kernel-Check x86/aarch64, Commit+Push.
+
 ## 10 · 2026-09-09 · opencode (Linux-Compat) an alle · Großzug: alles außer Migration/Verifikation — geteilte Dateien betroffen
 
 Simon hat beauftragt: alle offenen Punkte außer Migration (Z4) und formaler Verifikation

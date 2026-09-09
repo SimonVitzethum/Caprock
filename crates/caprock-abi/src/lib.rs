@@ -460,7 +460,57 @@ pub mod sys {
     /// benannte Kapazitaet (`debug::WRITE_MAX`) gedeckelt — dieselbe Latenzform,
     /// gespiegelt: der Aufrufer schleift, seine Schleife ist preemptibel.
     ///
-    /// Nummer `33`: `30` ist `CALL_TIMEOUT`, `31`/`32` bleiben bewusst frei.
+    /// **Adressraum-Schnappschuss in eine frische Kind-PD (FORK, Phase 1: volle Kopie).**
+    ///
+    /// `x1` = Quell-PD ist IMMER die eigene (der Aufrufer klont sich selbst; eine fremde PD
+    /// zu klonen waere ein `DEBUG_READ_MEM` ohne Debug-Cap) · `MSG0` = Ziel-Slot fuer die
+    /// Kind-`PdControl`-Cap im Aufrufer-Cspace (muss frei sein) · `MSG1` = maximale
+    /// Kopierlaenge in Bytes (`0` = ganze abgebildete User-Flaeche; gedeckelt gegen
+    /// `fork::SNAPSHOT_MAX_BYTES`) · `MSG2` = Ziel-Prio des Kind-Hauptthreads ·
+    /// `MSG3` = reserviert (`0`).
+    ///
+    /// Rueckgabe: `x0` = result, `MSG0` = Kind-PD-Id (bei OK). Das Kind startet PARKIERT
+    /// (D0: parken -- binden -- zulassen; erst `PDCTL/START` laesst es laufen).
+    ///
+    /// ## Volle Kopie, kein COW — und das steht hier, nicht im Kleingedruckten
+    ///
+    /// Phase 1 kopiert jede abgebildete User-Seite (s. `fork`-Modul in `caprock-loader`).
+    /// COW ist Phase 2 und braucht zwei Dinge, die heute fehlen: Dirty-Tracking
+    /// (kein Write-Protect-Bit wird je gesetzt, kein Fault meldet „schreibend") und einen
+    /// Seitenfehler-Pfad, der nachlaedt statt beendet (Faults beenden heute den Thread).
+    /// Wer COW ohne beides verspricht, teilt Seiten still statt kopiert.
+    ///
+    /// Nummer `31`: erste der beiden bewusst freigehaltenen Luecken nach `CALL_TIMEOUT`.
+    pub const FORK_SNAPSHOT: u64 = 31;
+
+    /// **Neues Image in die BESTEHENDE eigene PD laden (EXEC-Replace).**
+    ///
+    /// `x1` = Loader-Cap-Slot im eigenen Cspace (WRITE) · `MSG0` = Archiv-Programm-Index ·
+    /// `MSG1` = Teardown-Token (s. `exec`-Modul in `caprock-loader`: `token == 0` heisst
+    /// „kein Token" und wird abgewiesen, nicht als „egal" gelesen) · `MSG2` = neue
+    /// Eintragsadresse wird IGNORIERT (sie kommt aus dem Image; ein Aufrufer, der sie
+    /// waehlt, waehlt fremden Code) · `MSG3` = reserviert (`0`).
+    ///
+    /// ## Slots/Caps werden geordnet zurueckgezogen, nicht ueberschrieben
+    ///
+    /// Vor dem Laden zieht der Kernel alle Threads der PD ausser dem Aufrufer ab
+    /// (`KILL`-Ordnung), loescht alle Slots ausser Loader- + Aufrufer-Stack-Cap
+    /// (Teardown-Token-Form: wer das Token nicht nennt, bekommt `ERR_STALE_TOKEN`,
+    /// kein halb geraeumtes Kind), und erst dann laedt er. Ein Ueberrest (alter Thread,
+    /// alte Cap, altes Mapping) ist ein Baufehler, kein „wird schon ueberschrieben".
+    ///
+    /// Nummer `32`: zweite der beiden Luecken nach `CALL_TIMEOUT`.
+    pub const EXEC_REPLACE: u64 = 32;
+
+    /// **Speicher der Ziel-PD schreiben** (Debugger v2, `M`-Paket der gdbserver-PD).
+    ///
+    /// `MSG0` Cap-Slot (`DebugControl`) · `MSG1` Ziel-VA · `MSG2` Laenge ·
+    /// `MSG3` VA des eigenen Puffers im Aufrufer. Gibt uebertragene Bytes in
+    /// [`reg::MSG0`] zurueck. Wie [`DEBUG_READ_MEM`](Self::DEBUG_READ_MEM) gegen eine
+    /// benannte Kapazitaet (`debug::WRITE_MAX`) gedeckelt — dieselbe Latenzform,
+    /// gespiegelt: der Aufrufer schleift, seine Schleife ist preemptibel.
+    ///
+    /// Nummer `33`: `30` ist `CALL_TIMEOUT`, `31`/`32` sind seit Prozessmodell FORK/EXEC.
     pub const DEBUG_WRITE_MEM: u64 = 33;
 
     /// **Einen Thread genau einen Schritt tun lassen** (Debugger v2, `s`-Paket).
@@ -875,6 +925,39 @@ pub mod result {
     /// *„Geraet tot"* liest, waehrend die Antwort gerade zugestellt wurde, ein **Korruptionspfad**
     /// ist und kein Haenger. Diese Kante ist benannt und noch nicht gemessen (todo A2c).
     pub const ERR_TIMEOUT: u64 = 25;
+
+    /// **Das Teardown-Token passt nicht zur PD-Epoche** (EXEC-Replace, Prozessmodell).
+    ///
+    /// Eigener Code, und das ist die ganze Teardown-Token-Form: `0` heisst „kein Token"
+    /// und wird hier abgewiesen, nicht als „egal" gelesen. Wer `ERR_BADCAP` naehme,
+    /// sagte „dich gibt es nicht" ueber eine Lage, die „du hast den alten Stand"
+    /// heisst — und ein Aufrufer, der die beiden nicht unterscheiden kann, wiederholt
+    /// mit demselben alten Token fuer immer.
+    pub const ERR_STALE_TOKEN: u64 = 26;
+
+    /// **Der Schnappschuss passt nicht in die benannte Schranke** (FORK, Phase 1).
+    ///
+    /// Eigener Code nach D11: die Schranke ist `fork::SNAPSHOT_MAX_BYTES` (volle Kopie,
+    /// keine COW-Ankuendigung). Gekuerzt zu kopieren hiesse, dem Kind einen
+    /// halb adressierten Raum zu geben — still halbiert ist hier ein Korruptionspfad,
+    /// kein Komfort.
+    pub const ERR_SNAPSHOT_LIMIT: u64 = 27;
+}
+
+/// **Schranken und Kodierung des Prozessmodells (FORK/EXEC, Phase 1).**
+///
+/// Reine Konstanten, keine Logik — die Pruefung steht in `caprock-loader` (`fork`,
+/// `exec`) und im Kernel-Dispatch (Patch-Text, s. `caprock-microkit::proc`).
+pub mod fork {
+    /// Obergrenze der Kopierlaenge eines FORK-Schnappschusses in Bytes (Phase 1).
+    ///
+    /// 8 MiB: viermal die groesste heute gefahrene User-Flaeche (16-KiB-Stack +
+    /// wenige Segmente), klein genug, dass die Kopierschleife unter der
+    /// Sperrhaltedauer-Marke bleibt (Aufrufer schleift, preemptibel).
+    pub const SNAPSHOT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+    /// Naechste freie Syscall-Nummer nach FORK/EXEC + Debugger-v2 (s. `super::sys`).
+    /// `36` ist frei; `4` bleibt historische Luecke, nie vergeben.
+    pub const NAECHSTE_FREIE_SYSCALL: u64 = 36;
 }
 
 // --- Host-nahe Pruefung der Nummernvergabe (A2-Rest) ------------------------------------------
@@ -897,12 +980,67 @@ mod nummern {
 
     #[test]
     fn debugger_v2_syscalls_liegen_hinter_call_timeout() {
-        // `CALL_TIMEOUT = 30`; `31`/`32` bleiben bewusst frei; v2 liegt dahinter.
+        // `CALL_TIMEOUT = 30`; `31`/`32` sind seit Prozessmodell FORK/EXEC; v2 liegt dahinter.
         assert_eq!(sys::CALL_TIMEOUT, 30);
+        assert_eq!(sys::FORK_SNAPSHOT, 31);
+        assert_eq!(sys::EXEC_REPLACE, 32);
         assert_eq!(sys::DEBUG_WRITE_MEM, 33);
         assert_eq!(sys::DEBUG_SINGLE_STEP, 34);
         assert_eq!(sys::DEBUG_HWBREAK, 35);
         assert_eq!(super::debug::WRITE_MAX, super::debug::READ_MAX);
+    }
+
+    #[test]
+    fn fork_exec_belegen_die_luecke_36_bleibt_frei() {
+        // Prozessmodell: die Luecke `31`/`32` ist geschlossen, `36+` bleibt frei.
+        // `4` bleibt historische Luecke, nie vergeben. Kollision = Baufehler:
+        // faellt dieser Test, ist eine Nummer doppelt vergeben (s. naechsten Test).
+        assert_eq!(sys::FORK_SNAPSHOT, 31);
+        assert_eq!(sys::EXEC_REPLACE, 32);
+        assert_eq!(super::fork::NAECHSTE_FREIE_SYSCALL, 36);
+        assert_eq!(super::fork::SNAPSHOT_MAX_BYTES, 8 * 1024 * 1024);
+        // Kein bekannter Syscall liegt auf/ueber 36 — wuerde einer hinzukommen, ohne
+        // diesen Test zu erweitern, schwiege die Einmaligkeitspruefung nicht, aber die
+        // „naechste freie"-Aussage waere falsch. Deshalb steht die Aufzaehlung hier.
+        for n in [
+            sys::YIELD,
+            sys::CALL,
+            sys::RECV,
+            sys::REPLY,
+            sys::PARK,
+            sys::EXIT,
+            sys::KILL,
+            sys::SIGNAL,
+            sys::WAIT,
+            sys::MAP,
+            sys::UNMAP,
+            sys::PDCTL,
+            sys::LOAD,
+            sys::CDELETE,
+            sys::CCOPY,
+            sys::CMOVE,
+            sys::SETRECV,
+            sys::UNPARK,
+            sys::SETHANDLER,
+            sys::SPAWN,
+            sys::DEBUG_ATTACH,
+            sys::DEBUG_STOP,
+            sys::DEBUG_CONTINUE,
+            sys::DEBUG_READ_MEM,
+            sys::DEBUG_WRITE_REGS,
+            sys::DEBUG_WRITE_MEM,
+            sys::DEBUG_SINGLE_STEP,
+            sys::DEBUG_HWBREAK,
+            sys::BIND_IRQ,
+            sys::SETTLS,
+            sys::CLOCK,
+            sys::PARK_TIMEOUT,
+            sys::CALL_TIMEOUT,
+            sys::FORK_SNAPSHOT,
+            sys::EXEC_REPLACE,
+        ] {
+            assert!(n < 36, "Syscall-Nummer {n} liegt auf/ueber der naechsten freien 36");
+        }
     }
 
     #[test]
@@ -941,6 +1079,8 @@ mod nummern {
             sys::CLOCK,
             sys::PARK_TIMEOUT,
             sys::CALL_TIMEOUT,
+            sys::FORK_SNAPSHOT,
+            sys::EXEC_REPLACE,
         ];
         let mut sortiert = alle;
         sortiert.sort_unstable();
@@ -976,8 +1116,13 @@ mod nummern {
         assert_ne!(result::ERR_BADCAP, result::ERR_INUSE);
         assert_ne!(result::ERR_HASCHILDREN, result::ERR_INUSE);
         // Geprueft am 2026-09-09: `30` ist seit A2-Rest als `CALL_TIMEOUT` vergeben
-        // (`4` ist eine historische Luecke, nie vergeben). Naechste freie Nummern: `31`, `32`.
+        // (`4` ist eine historische Luecke, nie vergeben). `31`/`32` sind seit
+        // Prozessmodell FORK/EXEC vergeben; naechste freie Nummer: `36`.
         assert_eq!(sys::PARK_TIMEOUT, 29);
         assert_eq!(sys::CALL_TIMEOUT, 30);
+        assert_eq!(sys::FORK_SNAPSHOT, 31);
+        assert_eq!(sys::EXEC_REPLACE, 32);
+        assert_ne!(result::ERR_STALE_TOKEN, result::ERR_BADCAP);
+        assert_ne!(result::ERR_SNAPSHOT_LIMIT, result::ERR_NOSPACE);
     }
 }

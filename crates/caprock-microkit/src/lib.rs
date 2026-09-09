@@ -34,6 +34,13 @@ mod cspace;
 pub use cspace::{CspaceAbweisung, STANDARD_PLAETZE};
 use cspace::{CspaceAnker, Vergabe};
 
+/// Prozessmodell: FORK/EXEC-Dispatchhelfer (Phase 1, volle Kopie, kein COW).
+///
+/// Abhaengigkeitsfrei (`core` nur), als Datei pruefbar (`rustc --test .../proc.rs`).
+/// Die Entscheidung steht genau einmal dort; der FORK/EXEC-Zweig in
+/// `dispatch_nativ` ruft sie auf, statt sie nachzubauen.
+pub mod proc;
+
 /// Größe des PD-Pools. **Öffentlich seit A-3.4**: wie viele Cap-Slots das System vorhalten muss,
 /// folgt aus `NPDS * CAP_BUDGET_PER_PD` — diese Rechnung gehört an *eine* Stelle
 /// ([`CAP_SLOTS_FOR_ALL_PDS`]) und nicht als abgeschriebene Zahl in den Boot-Code.
@@ -3083,6 +3090,39 @@ fn dispatch_nativ(
                     }
                     deny(result::ERR_SERVER_GONE)
                 }
+            }
+        }
+        // Prozessmodell FORK/EXEC (31/32) — fail-closed bis zum Kernel-Patch.
+        //
+        // Die Nummern sind vergeben (`caprock-abi::sys::{FORK_SNAPSHOT, EXEC_REPLACE}`),
+        // der Pfad ist es nicht: der Kernel kennt noch keine Rueckrufe dafuer (der
+        // EXAKTE Patch-Text steht in der Moduldoku von `proc`). Was dieser Zweig tut,
+        // ist die Vorpruefung aus `proc` (reserviert == 0, Token != 0, Laenge
+        // gedeckelt) — ohne einen einzigen Seiteneffekt — und danach die ehrliche
+        // Absage: `ERR_BADSYS` heisst hier „Antrag ok, Pfad fehlt", nicht „unbekannte
+        // Nummer". Ein gueltiger Antrag wird also weder ausgefuehrt noch still
+        // geduldet. Der Patch ersetzt den `BADSYS`-Ausgang durch die Rueckrufe
+        // `fork(kind_slot, max_len, prio)` / `exec(loader_cap, prog_index, token)`.
+        sys::FORK_SNAPSHOT => {
+            let m0 = frame_reg(frame, reg::MSG0);
+            let m1 = frame_reg(frame, reg::MSG0 + 1);
+            let m2 = frame_reg(frame, reg::MSG0 + 2);
+            let m3 = frame_reg(frame, reg::MSG0 + 3);
+            match proc::dekodiere_fork(m0, m1, m2, m3) {
+                proc::ForkExecEntscheid::Abgewiesen(code) => deny(code),
+                // Vorpruefung ok, aber kein Rueckruf verdrahtet (s. Kommentar oben).
+                _ => deny(result::ERR_BADSYS),
+            }
+        }
+        sys::EXEC_REPLACE => {
+            let x1 = frame_reg(frame, reg::EP_BADGE);
+            let m0 = frame_reg(frame, reg::MSG0);
+            let m1 = frame_reg(frame, reg::MSG0 + 1);
+            let m2 = frame_reg(frame, reg::MSG0 + 2);
+            let m3 = frame_reg(frame, reg::MSG0 + 3);
+            match proc::dekodiere_exec(x1, m0, m1, m2, m3) {
+                proc::ForkExecEntscheid::Abgewiesen(code) => deny(code),
+                _ => deny(result::ERR_BADSYS),
             }
         }
         _ => deny(result::ERR_BADSYS),

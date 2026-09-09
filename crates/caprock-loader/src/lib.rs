@@ -16,8 +16,11 @@
 
 pub mod archive;
 pub mod cert;
+pub mod cost;
 pub mod elf;
+pub mod exec;
 pub mod manifest;
+pub mod snapshot;
 
 /// Zieldomäne eines Programms (Manifest/Quellen-Feld). Bewusst kernel-agnostisch (u32); der
 /// Kernel-Glue bildet das auf `microkit::Domain` ab.

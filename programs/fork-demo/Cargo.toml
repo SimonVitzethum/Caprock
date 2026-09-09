@@ -1,0 +1,19 @@
+[package]
+name = "fork-demo"
+version = "0.0.0"
+edition = "2021"
+description = "Prozessmodell-Demo (Microkernel, kein OS-Bau): FORK-Snapshot + EXEC-Replace als Host-Ablauf mit denselben reinen Pruefungen wie der Kernel-Pfad (standalone demo, not a workspace member)"
+license = "MIT OR Apache-2.0"
+
+# Standalone: diese leere Sektion loest die Crate vom Caprock-Workspace
+# (root- und programs-Manifeste listen sie NICHT als Member — wie mem-server).
+# Pruefbar auf dem Host via `cargo test` in einer /tmp-Kopie, derselbe Weg wie
+# tools/host-tests.sh Ziele mit Abhaengigkeiten.
+[workspace]
+
+[[bin]]
+name = "fork-demo"
+path = "src/main.rs"
+
+[dependencies]
+caprock-loader = { path = "../../crates/caprock-loader" }

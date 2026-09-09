@@ -1,10 +1,21 @@
-//! **Speicher-Server in Userspace (Z14 Stufe 1).**
+//! **Speicher-Server in Userspace (Z14 Stufe 1 + Stufe 2).**
 //!
 //! Eine PD hält eine große Memory-Cap (hier: eine Arena über einem [`DmaPool`]-Fenster) und gibt
 //! auf Anfrage abgeleitete Bereiche per IPC-REPLY heraus; der Client mappt sie mit `SYS_MAP`.
 //! Das ist `brk`/`mmap` — **ohne eine einzige neue Kernelzeile**, weil Cap-Ableitung (`CCOPY`)
 //! und Cap-Transfer beide schon stehen. Der Kern bleibt unberührt, die Politik („wer bekommt wie
 //! viel") wandert dorthin, wo sie hingehört: in eine PD.
+//!
+//! ## Stufen
+//!
+//! - **Stufe 1** (darunter, unverändert): Vergabe beim Laden — Startkapital, Freiliste,
+//!   benannte Absagen.
+//! - **Stufe 2** (hier neu): Vergabe zur **Laufzeit**. Die PD fordert Größe **plus Zweck** an
+//!   ([`Zweck`]), der Server antwortet mit einem übertragbaren Schein, der Client mappt per
+//!   `SYS_MAP` und meldet Abbilden/Ausblenden zurück ([`Self::abbilden_melden`],
+//!   [`Self::ausblenden_melden`]); die Rückgabe geht nur über den entgegengesetzten Weg.
+//!   Das Nachrichtenformat dafür (CALL/REPLY-Worte) und die Client-Zustandsmaschine stehen in
+//!   [`protokoll`].
 //!
 //! ## Was hier läuft und was gestellt ist
 //!
@@ -14,6 +25,28 @@
 //! der Test schreibt Bytes. Was damit belegt ist: Die Abnahme aus Z14 — eine PD, die beim Laden
 //! 4 KiB bekommt, fordert 1 MiB an, schreibt sie voll und gibt sie zurück, und eine zweite PD
 //! bekommt dieselbe Region **nicht** zu sehen.
+//!
+//! ## Was gestellt BLEIBT (Stufe 2, ehrlich benannt)
+//!
+//! - **Kein Cap-Transfer über PD-Grenzen ohne Kernel-Hilfe.** `CCOPY`/`mint` leiten *dasselbe*
+//!   Objekt ab (s. `caprock-cap/src/space.rs`: `copy` hängt einen Kind-Knoten auf dasselbe
+//!   Objekt) — einen *Teilbereich* als eigene Memory-Cap gibt es nicht. Wer den 1-MiB-Grant per
+//!   REPLY-Grant übergäbe, übergäbe die **ganze Arena**. Der Schein ist deshalb ein Versprechen,
+//!   keine Cap; was zum echten Transfer fehlt, steht als exakter Patch-Text in der Aufgabe
+//!   (vorgeschlagen: `CSUB`, s. [`protokoll`]-Doku).
+//! - **Keine Demand-Paging.** Der Client mappt explizit (`SYS_MAP`); ein Seitenfehler löst
+//!   nichts aus und holt nichts nach. Der Fault-Handler-Pfad (`FaultHandler`-Cap, Z26/A3)
+//!   stellt Fehler zu, mappt aber nicht — „beim Fehler nachmappen" wäre ein weiterer Server-
+//!   Pfad, kein vorhandener.
+//! - **Kein COW.** Geteilte lesbare Bereiche mit Kopie-beim-Schreiben gibt es nicht; wer teilt,
+//!   teilt sichtbar (und die Vergabe hier teilt grundsätzlich nicht: lebende Grants überlappen
+//!   nie).
+//! - **Freigabe entzieht die Abbildung nur kooperativ.** Der Server benennt den Entzug
+//!   ([`SpeicherFehler::Entzogen`], [`SpeicherFehler::NochAbgebildet`]), aber die Abbildung in
+//!   einer *lebenden* fremden PD entfernt nur deren eigenes `SYS_UNMAP` (oder ihr Tod: erst
+//!   `destroy_pd`/`vspace_teardown` räumt Mappings ab). Ein Client, der nach der Freigabe nicht
+//!   ausblendet, behält lesbaren Speicher — das ist kein Server-Fehler, sondern die benannte
+//!   Grenze dieses Protokolls (s. `offene_entzogene_abbildungen` im [`protokoll`]).
 //!
 //! ## Verwendete Schemen (Pfadabhängigkeiten, alle `no_std` + `forbid(unsafe_code)`)
 //!
@@ -48,6 +81,8 @@ use caprock_dma::DmaPool;
 use caprock_region::page::{MemMap, PAGE_SIZE};
 use caprock_wait::{Completion, LockError, Mutex, Park, Tid};
 
+pub mod protokoll;
+
 /// Die Arena des Servers: 2 MiB — Startkapital (4 KiB) + 1-MiB-Grant + Luft für die zweite PD.
 pub const ARENA_BYTES: u64 = 2 * 1024 * 1024;
 /// Was eine PD beim Laden hält (Z14-Abnahme: „beim Laden 4 KiB").
@@ -66,6 +101,59 @@ pub const ARENA_DEV_BASIS: u64 = 0x1000_0000;
 /// Loch: darüber gibt es [`SpeicherFehler::TabelleVoll`] (D11 — *wer eine Kapazität einführt,
 /// muss den Überlauf benennen*).
 pub const MAX_GRANTS: usize = 16;
+
+/// Wofür der Client den Speicher will (Stufe 2: Anfrage trägt Größe **plus Zweck**).
+/// Der Zweck ist Politik, keine Dekoration: Der Server führt je Zweck ein Kontingent und darf
+/// Zwecke verbieten — eine DMA-Engine mit 8 MiB Hunger bekommt eine benannte Absage, keinen
+/// stillen Anteil an fremdem Speicher.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Zweck {
+    /// Allgemeiner Heap-Ersatz (`brk`-nah).
+    Allgemein,
+    /// Gerätepuffer (IOMMU-Sicht aus [`GrantSicht::dev`]).
+    DmaPuffer,
+    /// Threads-Stapel einer PD.
+    Stapel,
+    /// Abbild eines Geräteregisters oder Objektfensters.
+    Abbildung,
+}
+
+impl Zweck {
+    /// Draht-Kennziffer (CALL-Wort `b` der Anfrage).
+    pub fn kennziffer(self) -> u64 {
+        match self {
+            Zweck::Allgemein => 0,
+            Zweck::DmaPuffer => 1,
+            Zweck::Stapel => 2,
+            Zweck::Abbildung => 3,
+        }
+    }
+
+    /// Draht-Kennziffer zurück — `None` heisst: diesen Zweck gibt es nicht.
+    pub fn aus_kennziffer(k: u64) -> Option<Self> {
+        match k {
+            0 => Some(Zweck::Allgemein),
+            1 => Some(Zweck::DmaPuffer),
+            2 => Some(Zweck::Stapel),
+            3 => Some(Zweck::Abbildung),
+            _ => None,
+        }
+    }
+
+    fn index(self) -> usize {
+        self.kennziffer() as usize
+    }
+}
+
+/// Wie viele Zwecke es gibt (Größe der Kontingent-Tabelle).
+pub const ZWECK_N: usize = 4;
+
+/// Die Rundungsregel des Clients: was er per `SYS_MAP` abbildet, ist seitausgerichtet.
+/// Öffentlich, damit der Client aus seiner Anfrage-Länge die Antwort-Länge vorhersagen kann
+/// (die Antwort trägt nur Handle + Sichten, keine Länge — s. [`protokoll`]).
+pub fn aufgerundet(len: u64) -> Option<u64> {
+    runde_auf_seite(len)
+}
 
 /// Warum eine Anfrage nicht bedient wurde. Jeder Ausgang hat einen eigenen Namen — „geht nicht"
 /// allein sagte nicht, ob der Aufrufer kleiner fragen, später fragen oder gar nicht fragen soll.
@@ -87,6 +175,28 @@ pub enum SpeicherFehler {
     FremderSchein,
     /// Dieser Schein ist bereits zurückgegeben — doppelte Freigabe, kein doppelter Bereich.
     BereitsZurueck,
+    /// Dieser Zweck ist unbekannt oder auf diesem Server verboten — keine Mengenaussage,
+    /// sondern Politik. Der Aufrufer fragt anders (kleiner hilft nicht, später hilft nicht).
+    ZweckAbgelehnt,
+    /// Das Kontingent **dieses Zwecks** ist aufgebraucht (nicht die Arena, nicht die Tabelle).
+    /// Wiederholbar, sobald ein Grant desselben Zwecks zurückgegeben wurde.
+    KontingentErschoepft,
+    /// Die Revoke-Form der Rückgabe: der Schein ist noch **abgebildet** (der Client hat sein
+    /// `SYS_UNMAP` nicht gemeldet), also wird nicht freigegeben. Erst ausblenden, dann
+    /// zurückgeben — sonst bekäme die nächste PD physisch denselben Speicher, während die alte
+    /// ihn noch liest. Das ist die Stelle, an der „Freigabe entzieht die Abbildung" **kooperativ**
+    /// ist: Der Server verweigert die Wiedervergabe, entfernen muss der Client sie selbst.
+    NochAbgebildet,
+    /// Ausblenden ohne Abbilden — kein Zustand, den der Server ändern müsste.
+    NichtAbgebildet,
+    /// Serverseitig entzogen (z. B. Aufräumpfad nach PD-Tod): der Schein löst nicht mehr auf,
+    /// die Region bleibt aber **reserviert**, bis sie zurückgegeben wird. Weder
+    /// [`SpeicherFehler::BereitsZurueck`] (sie ist nicht zurückgegeben) noch
+    /// [`SpeicherFehler::UnbekannterSchein`] (sie ist bekannt) — ein eigener Ausgang, weil
+    /// Verwechslung hier hieße, die Region für frei zu halten, während sie belegt ist.
+    Entzogen,
+    /// Unbekannte Nachrichtenart im [`protokoll`] — kein Grant, keine Absicht erkennbar.
+    UnbekannteArt,
     /// Der Server-Ausschluss selbst schlug fehl.
     Sperre(LockError),
 }
@@ -119,6 +229,12 @@ struct Grant {
     len: u64,
     cpu: u64,
     dev: u64,
+    zweck: Zweck,
+    /// Der Client hat die Abbildung (`SYS_MAP`) gemeldet und noch nicht zurückgenommen.
+    /// Solange gesetzt, wird nicht freigegeben ([`SpeicherFehler::NochAbgebildet`]).
+    abgebildet: bool,
+    /// Serverseitig entzogen: löst nicht mehr auf, bleibt aber reserviert.
+    entzogen: bool,
     live: bool,
 }
 
@@ -153,6 +269,12 @@ pub struct MemoryServer {
     naechste_gen: u32,
     bereit: Completion,
     sperre: Mutex,
+    /// Verbotene Zwecke als Bitmaske über [`Zweck::kennziffer`] (Stufe 2: Politik).
+    verbote: u64,
+    /// Kontingent je Zweck: Obergrenze in Byte …
+    grenze: [u64; ZWECK_N],
+    /// … und davon vergebene lebende Bytes.
+    benutzt: [u64; ZWECK_N],
 }
 
 const KEIN_GRANT: Option<Grant> = None;
@@ -179,6 +301,9 @@ impl MemoryServer {
             naechste_gen: 1,
             bereit: Completion::new(),
             sperre: Mutex::new(),
+            verbote: 0,
+            grenze: [u64::MAX; ZWECK_N],
+            benutzt: [0; ZWECK_N],
         };
         // Startkapital: Bump-frei, direkt aus der Arena geschnitten.
         let buf = stamm;
@@ -189,11 +314,35 @@ impl MemoryServer {
             len: START_KAPITAL,
             cpu: buf.cpu(),
             dev: buf.dev(),
+            zweck: Zweck::Allgemein,
+            abgebildet: false,
+            entzogen: false,
             live: true,
         });
         s.freie[0] = (START_KAPITAL, arena_len - START_KAPITAL);
         s.freie_n = 1;
+        s.benutzt[Zweck::Allgemein.index()] = START_KAPITAL;
         Some(s)
+    }
+
+    /// Einen Zweck verbieten oder wieder zulassen (Stufe-2-Politik). Verbote gelten für neue
+    /// Anfragen; lebende Grants bleiben unberührt (kein rückwirkender Entzug durch Politik).
+    pub fn zweck_verbieten(&mut self, zweck: Zweck, verboten: bool) {
+        if verboten {
+            self.verbote |= 1 << zweck.kennziffer();
+        } else {
+            self.verbote &= !(1 << zweck.kennziffer());
+        }
+    }
+
+    /// Das Kontingent eines Zwecks setzen (Obergrenze lebender Bytes). Vorgabe: unbegrenzt.
+    pub fn kontingent_setzen(&mut self, zweck: Zweck, grenze: u64) {
+        self.grenze[zweck.index()] = grenze;
+    }
+
+    /// Lebende Bytes dieses Zwecks.
+    pub fn zweck_benutzt(&self, zweck: Zweck) -> u64 {
+        self.benutzt[zweck.index()]
     }
 
     fn frisch_handle(&mut self, slot: usize) -> u64 {
@@ -277,17 +426,45 @@ impl MemoryServer {
         pd: u32,
         len: u64,
     ) -> Result<GrantSchein, SpeicherFehler> {
+        self.anfordern_mit_zweck(p, pd, len, Zweck::Allgemein)
+    }
+
+    /// Anfordern mit Zweck (Stufe 2: `mmap` mit Zweck, nicht nur `brk` mit Länge).
+    /// Reihenfolge der Absagen: Absicht (leer) → Politik (Zweck, Kontingent) → Last
+    /// (Tabelle, Arena). Eine volle Tabelle ist keine volle Arena, und ein verbotener Zweck
+    /// ist keine volle irgendwas — die Antwort unterscheidet sich, weil der Aufrufer sich
+    /// danach richtet (anders fragen, etwas zurückgeben, gar nicht fragen).
+    pub fn anfordern_mit_zweck(
+        &mut self,
+        p: &dyn Park,
+        pd: u32,
+        len: u64,
+        zweck: Zweck,
+    ) -> Result<GrantSchein, SpeicherFehler> {
         self.sperre.lock(p).map_err(SpeicherFehler::Sperre)?;
-        let ergebnis = self.anfordern_inner(pd, len);
+        let ergebnis = self.anfordern_inner(pd, len, zweck);
         self.sperre.unlock(p);
         ergebnis
     }
 
-    fn anfordern_inner(&mut self, pd: u32, len: u64) -> Result<GrantSchein, SpeicherFehler> {
+    fn anfordern_inner(
+        &mut self,
+        pd: u32,
+        len: u64,
+        zweck: Zweck,
+    ) -> Result<GrantSchein, SpeicherFehler> {
         if len == 0 {
             return Err(SpeicherFehler::LeereAnfrage);
         }
+        if self.verbote & (1 << zweck.kennziffer()) != 0 {
+            return Err(SpeicherFehler::ZweckAbgelehnt);
+        }
         let bedarf = runde_auf_seite(len).ok_or(SpeicherFehler::KeinPlatz)?;
+        let neu_benutzt =
+            self.benutzt[zweck.index()].checked_add(bedarf).ok_or(SpeicherFehler::KeinPlatz)?;
+        if neu_benutzt > self.grenze[zweck.index()] {
+            return Err(SpeicherFehler::KontingentErschoepft);
+        }
         // Erst der Tabellenplatz (D11 vor Last: eine volle Tabelle ist keine volle Arena, und
         // die Antwort unterscheidet sich). Ein zurückgegebenes Fach (`live == false`) ist wieder
         // ein freies Fach — sonst wäre die Tabelle nach 16 Grants für immer voll, egal wie oft
@@ -327,8 +504,12 @@ impl MemoryServer {
             len: bedarf,
             cpu: buf.cpu(),
             dev: buf.dev(),
+            zweck,
+            abgebildet: false,
+            entzogen: false,
             live: true,
         });
+        self.benutzt[zweck.index()] = neu_benutzt;
         Ok(GrantSchein { handle, offset: off, len: bedarf })
     }
 
@@ -356,8 +537,111 @@ impl MemoryServer {
         if g.pd != pd {
             return Err(SpeicherFehler::FremderSchein);
         }
+        if g.abgebildet {
+            return Err(SpeicherFehler::NochAbgebildet);
+        }
         self.grants[slot] = Some(Grant { live: false, ..g });
+        self.benutzt[g.zweck.index()] -= g.len;
         self.freien_bereich_ablegen(g.offset, g.len);
+        Ok(())
+    }
+
+    /// Abbilden melden: der Client hat den Grant per `SYS_MAP` in seine VSpace gelegt.
+    /// Erst ab hier gilt die Region als benutzt im starken Sinn — eine Rückgabe ohne vorheriges
+    /// [`Self::ausblenden_melden`] wird mit [`SpeicherFehler::NochAbgebildet`] abgewiesen, weil
+    /// die Wiedervergabe eines noch abgebildeten Bereichs zwei PDs auf denselben Speicher
+    /// legte (der Bruch der Isolation durch die Hintertür, s. [`SpeicherFehler::NochAbgebildet`]).
+    pub fn abbilden_melden(
+        &mut self,
+        p: &dyn Park,
+        pd: u32,
+        handle: u64,
+    ) -> Result<(), SpeicherFehler> {
+        self.sperre.lock(p).map_err(SpeicherFehler::Sperre)?;
+        let ergebnis = self.abbilden_inner(pd, handle);
+        self.sperre.unlock(p);
+        ergebnis
+    }
+
+    fn abbilden_inner(&mut self, pd: u32, handle: u64) -> Result<(), SpeicherFehler> {
+        let slot = self.slot_zu_handle(handle).ok_or(SpeicherFehler::UnbekannterSchein)?;
+        let g = self.grants[slot].expect("Slot eben belegt geprüft");
+        if !g.live {
+            return Err(SpeicherFehler::BereitsZurueck);
+        }
+        if g.pd != pd {
+            return Err(SpeicherFehler::FremderSchein);
+        }
+        if g.entzogen {
+            return Err(SpeicherFehler::Entzogen);
+        }
+        self.grants[slot] = Some(Grant { abgebildet: true, ..g });
+        Ok(())
+    }
+
+    /// Ausblenden melden: der Client hat den Grant per `SYS_UNMAP` aus seiner VSpace entfernt.
+    /// Erst danach ist die Rückgabe wieder offen. Idempotent ist hier nichts: wer ausblendet,
+    /// was nicht abgebildet ist, bekommt [`SpeicherFehler::NichtAbgebildet`] — dieselbe Strenge
+    /// wie `SYS_UNMAP` auf nicht Gemapptes (`ERR_BADCAP`), nur benannt statt kodiert.
+    pub fn ausblenden_melden(
+        &mut self,
+        p: &dyn Park,
+        pd: u32,
+        handle: u64,
+    ) -> Result<(), SpeicherFehler> {
+        self.sperre.lock(p).map_err(SpeicherFehler::Sperre)?;
+        let ergebnis = self.ausblenden_inner(pd, handle);
+        self.sperre.unlock(p);
+        ergebnis
+    }
+
+    fn ausblenden_inner(&mut self, pd: u32, handle: u64) -> Result<(), SpeicherFehler> {
+        let slot = self.slot_zu_handle(handle).ok_or(SpeicherFehler::UnbekannterSchein)?;
+        let g = self.grants[slot].expect("Slot eben belegt geprüft");
+        if !g.live {
+            return Err(SpeicherFehler::BereitsZurueck);
+        }
+        if g.pd != pd {
+            return Err(SpeicherFehler::FremderSchein);
+        }
+        if !g.abgebildet {
+            return Err(SpeicherFehler::NichtAbgebildet);
+        }
+        self.grants[slot] = Some(Grant { abgebildet: false, ..g });
+        Ok(())
+    }
+
+    /// Serverseitig entziehen (Revoke-Form, benannt): z. B. der Aufräumpfad, wenn eine PD stirbt
+    /// oder ihre Quote eingezogen wird. Der Schein löst danach nicht mehr auf
+    /// ([`SpeicherFehler::Entzogen`]), die Region bleibt aber reserviert, bis sie zurückgegeben
+    /// wird — Entzug ist kein Freigeben. Wer das verwechselte, vergäbe belegten Speicher neu.
+    ///
+    /// Ehrlich dazu: Was der Entzug NICHT tut, ist die Abbildung in einer lebenden fremden PD
+    /// entfernen — das kann nur deren eigenes `SYS_UNMAP` (oder ihr Tod über
+    /// `destroy_pd`/`vspace_teardown` im Kernel). Der entzogene, noch abgebildete Grant steht
+    /// dafür in der Bilanz weiter als vergeben.
+    pub fn entziehen(
+        &mut self,
+        p: &dyn Park,
+        pd: u32,
+        handle: u64,
+    ) -> Result<(), SpeicherFehler> {
+        self.sperre.lock(p).map_err(SpeicherFehler::Sperre)?;
+        let ergebnis = self.entziehen_inner(pd, handle);
+        self.sperre.unlock(p);
+        ergebnis
+    }
+
+    fn entziehen_inner(&mut self, pd: u32, handle: u64) -> Result<(), SpeicherFehler> {
+        let slot = self.slot_zu_handle(handle).ok_or(SpeicherFehler::UnbekannterSchein)?;
+        let g = self.grants[slot].expect("Slot eben belegt geprüft");
+        if !g.live {
+            return Err(SpeicherFehler::BereitsZurueck);
+        }
+        if g.pd != pd {
+            return Err(SpeicherFehler::FremderSchein);
+        }
+        self.grants[slot] = Some(Grant { entzogen: true, ..g });
         Ok(())
     }
 
@@ -384,6 +668,9 @@ impl MemoryServer {
         }
         if g.pd != pd {
             return Err(SpeicherFehler::FremderSchein);
+        }
+        if g.entzogen {
+            return Err(SpeicherFehler::Entzogen);
         }
         Ok(GrantSicht { offset: g.offset, len: g.len, cpu: g.cpu, dev: g.dev })
     }

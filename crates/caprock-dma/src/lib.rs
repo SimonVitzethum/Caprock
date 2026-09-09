@@ -37,6 +37,12 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+// Die Crate ist `no_std` (sie laeuft in einer Treiber-PD ohne Betriebssystem). Die
+// DMA-Arithmetik ist aber reine Rechnung und damit auf dem Host pruefbar — der Testharness
+// braucht dafuer `std`. Nur unter `cfg(test)`, der PD-Build sieht davon nichts.
+#[cfg(test)]
+extern crate std;
+
 /// **Grosse, zusammenhängende DMA** (Z26, Vorbedingung 2): die benannte Absage und die
 /// Achsenprüfung. Eigene Datei aus demselben Grund wie `irte.rs` in der HAL — reine
 /// Grössenarithmetik, mit Literalen auslösbar.
@@ -233,6 +239,266 @@ impl DmaPool {
     }
 }
 
+/// **Die Stromrichtung eines einzelnen DMA-Auftrags** (Gegenstück zu `enum dma_data_direction`).
+///
+/// Auf dieser Maschine ist die Richtung für die Abbildung **bedeutungslos**: der Pool ist
+/// kohärent abgebildet, CPU- und Gerätesicht zeigen auf denselben Speicher ohne Zwischencache.
+/// Die Richtung steht trotzdem im Typ, damit ein automatisch portierter Treiber seine
+/// `DMA_TO_DEVICE`/`DMA_FROM_DEVICE`/`DMA_BIDIRECTIONAL`-Stelle 1:1 wiederfindet, statt sie beim
+/// Portieren zu verlieren — und damit eine künftige nicht-kohärente Abbildung sie auswerten kann,
+/// ohne alle Aufrufer anzufassen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StromRichtung {
+    /// CPU schreibt, Gerät liest (`DMA_TO_DEVICE`).
+    NachGeraet,
+    /// Gerät schreibt, CPU liest (`DMA_FROM_DEVICE`).
+    VomGeraet,
+    /// Beide Richtungen (`DMA_BIDIRECTIONAL`).
+    Beide,
+}
+
+/// **Das Gegenstück zu `dma_map_single` je Anfrage — reine Arithmetik, null Syscalls.**
+///
+/// Ein Alias über [`DmaPool::map`]: die CPU-Adresse muss im Pool liegen, sonst `None` (s. dort).
+/// `dir` wird heute **nicht ausgewertet** (kohärent auf x86) und ist trotzdem Pflicht, damit der
+/// Aufruf beim Portieren seine Richtung behält.
+pub fn map_single(pool: &DmaPool, cpu: u64, len: u64, dir: StromRichtung) -> Option<DmaBuf> {
+    let _ = dir;
+    pool.map(cpu, len)
+}
+
+/// **Das Gegenstück zu `dma_unmap_single` — heute ein No-op mit Doku.**
+///
+/// Es gibt nichts rückgängig zu machen: [`map_single`] legt keine dauerhafte Buchhaltung an,
+/// und die Abbildung ist kohärent. Die Funktion existiert, damit portierter Code seinen
+/// `unmap`-Aufruf behält — fällt die Kohärenz je weg, ist dies die Stelle, die etwas tun muss,
+/// und alle Aufrufer stehen schon.
+pub fn unmap_single(_buf: DmaBuf, _dir: StromRichtung) {
+    // Absichtlich leer: kohärent auf x86, keine Buchhaltung in `map_single`.
+}
+
+/// **Das Gegenstück zu `dma_sync_single_for_cpu` — heute ein No-op mit Doku.**
+///
+/// Auf kohärent abgebildetem Speicher sieht die CPU ohne weitere Massnahme, was das Gerät
+/// geschrieben hat. Auf einer nicht-kohärenten Abbildung müsste hier ein Cache-Invalidieren
+/// stehen; der Aufruf ist deshalb bereits vorhanden und wird dann gefüllt, statt nachgetragen.
+pub fn sync_fuer_cpu(_buf: &DmaBuf, _dir: StromRichtung) {
+    // Absichtlich leer: kohärent auf x86.
+}
+
+/// **Das Gegenstück zu `dma_sync_single_for_device` — heute ein No-op mit Doku.**
+///
+/// Spiegel zu [`sync_fuer_cpu`]: vor dem Gerätestart müsste auf nicht-kohärenter Abbildung ein
+/// Cache-Writeback stehen. Hier kohärent, also nichts zu tun — aber der Aufruf bleibt, damit der
+/// Treiber an beiden Übergaben synchronisiert, nicht nur an einer.
+pub fn sync_fuer_geraet(_buf: &DmaBuf, _dir: StromRichtung) {
+    // Absichtlich leer: kohärent auf x86.
+}
+
+/// **Ein Streulisten-Eintrag in CPU-Sicht** (Gegenstück zu `struct scatterlist`, Adressteil).
+///
+/// Die Gerätesicht trägt das Ergebnis ([`DmaBuf`]); hier steht nur, was der Treiber anfragt.
+/// `len == 0` ist kein leeres Segment, sondern ein Formfehler — [`map_sg`] weist die ganze Liste
+/// dann ab (gibt 0), statt ein Null-Segment an das Gerät zu reichen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SgEintrag {
+    pub cpu: u64,
+    pub len: u64,
+}
+
+/// **Was das Gerät an einer Adresse verträgt** (Gegenstück zu DMA-Maske und Segmentgrenzen).
+///
+/// Alle drei Felder sind Zusagen des Geräts, nicht der Maschine: eine 32-Bit-Netzkarte auf einer
+/// 64-Bit-Maschine meldet `maske = 0xFFFF_FFFF`, und ein Gerät mit 64-KiB-Segmentgrenze meldet
+/// `grenze = 0xFFFF`. `0` heisst jeweils „keine Schranke" — ausser bei `maske`, wo `0` alles
+/// abweist (keine Gerätesicht unter Null ist ansprechbar).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GeraeteGrenzen {
+    /// Höchste ansprechbare Geräteadresse (`dma_mask`): es muss `dev + len - 1 <= maske` gelten.
+    pub maske: u64,
+    /// Segmentgrenzen-Maske: die Bits, die über ein Segment **gleich bleiben müssen**. Kreutzt
+    /// `[dev, dev+len)` eine Gerätegrenze, gilt `((dev ^ (dev+len-1)) & grenze) != 0`. Für
+    /// „kein Segment kreuzt eine 64-KiB-Grenze" steht hier `0xFFFF_0000` (Bits ab 16 konstant),
+    /// nicht `0xFFFF` — eine Low-Maske forderte gleiche Low-Bits und liesse nur Ein-Byte-Segmente
+    /// durch. `0` heisst „keine Grenze".
+    pub grenze: u64,
+    /// Grösstes einzelnes Segment (`max_seg_size`). `0` heisst „unbegrenzt".
+    pub max_seg: u64,
+}
+
+/// **Warum eine Geräteadresse das Gerät nicht erreichen darf.**
+///
+/// Reihenfolge der Prüfung in [`pruefe_grenzen`], und sie ist nicht beliebig: Form zuerst (Leer,
+/// Überlauf — Fehler des Aufrufers), dann die Reichweite (Maske), dann die Form des Segments
+/// (Grenze, Grösse). Wer die Grösse vor der Maske prüfte, meldete „zu gross" für eine Adresse,
+/// die das Gerät nie erreicht — eine Zahl, die in die falsche Richtung schickt.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GrenzenFehler {
+    /// Länge 0 — kein Segment, und ein Null-Segment am Gerät ist ein Deskriptor, den der Treiber
+    /// für gültig hielte.
+    Leer,
+    /// `dev + len` läuft in `u64` über — dann sind Masken- und Grenzprüfung darunter wertlos.
+    Ueberlauf,
+    /// `dev + len - 1 > maske`: das Gerät kann das Ende nicht adressieren.
+    MaskeVerletzt { dev: u64, len: u64, maske: u64 },
+    /// Das Segment kreuzt eine Gerätegrenze (`(dev ^ ende) & grenze != 0`).
+    GrenzeVerletzt { dev: u64, len: u64, grenze: u64 },
+    /// Das Segment ist länger als `max_seg` — der Aufrufer muss teilen, nicht das Gerät.
+    SegmentZuGross { len: u64, max_seg: u64 },
+}
+
+/// **Die Grenzprüfung einer einzelnen Geräteadresse.**
+///
+/// Prüft gegen [`GeraeteGrenzen`] in der Reihenfolge aus [`GrenzenFehler`]. Reine Arithmetik über
+/// der Gerätesicht — woher `dev` kommt (Pool, Bounce, Gross-DMA), ist dieser Funktion egal.
+pub fn pruefe_grenzen(g: &GeraeteGrenzen, dev: u64, len: u64) -> Result<(), GrenzenFehler> {
+    if len == 0 {
+        return Err(GrenzenFehler::Leer);
+    }
+    // `ende - 1` ist die letzte adressierte Byte-Adresse; `len > 0` oben macht das Abziehen sicher.
+    let ende = dev.checked_add(len).ok_or(GrenzenFehler::Ueberlauf)?;
+    let letzte = ende - 1;
+    if letzte > g.maske {
+        return Err(GrenzenFehler::MaskeVerletzt {
+            dev,
+            len,
+            maske: g.maske,
+        });
+    }
+    if g.grenze != 0 && ((dev ^ letzte) & g.grenze) != 0 {
+        return Err(GrenzenFehler::GrenzeVerletzt {
+            dev,
+            len,
+            grenze: g.grenze,
+        });
+    }
+    if g.max_seg != 0 && len > g.max_seg {
+        return Err(GrenzenFehler::SegmentZuGross {
+            len,
+            max_seg: g.max_seg,
+        });
+    }
+    Ok(())
+}
+
+/// **Wie viel von `[dev, dev+len)` liegt noch vor der nächsten Gerätegrenze?**
+///
+/// Antwort ist die Restlänge im **ersten** Segment: passt alles, kommt `len` zurück; kreuzt der
+/// Bereich eine Grenze, kommt die Länge bis zur Grenze zurück — der Aufrufer legt dort den
+/// Schnitt. `grenze == 0` heisst „keine Grenze" und gibt `len`. `None` nur bei Formfehlern
+/// (`len == 0`, Überlauf der Endadresse).
+///
+/// Die Maske nennt Bits, die konstant bleiben müssen (s. [`GeraeteGrenzen::grenze`]): das erste
+/// Segment endet am nächsten Kippen eines gesetzten Bits. Das ist das Minimum über alle
+/// gesetzten Bitstellen `k` von `2^k - (dev mod 2^k)` — höchstens 64 Schritte, typisch wenige.
+pub fn teile_an_grenze(dev: u64, len: u64, grenze: u64) -> Option<u64> {
+    if len == 0 {
+        return None;
+    }
+    dev.checked_add(len)?;
+    if grenze == 0 {
+        return Some(len);
+    }
+    // Abstand zum nächsten Kippen je gesetzter Bitstelle; das kleinste gewinnt.
+    let mut erste: u64 = len;
+    let mut m = grenze;
+    while m != 0 {
+        let k = m.trailing_zeros();
+        // `2^k` passt immer (`k < 64`), die Maske darunter auch.
+        let schritt = 1u64 << k;
+        let rest = dev & (schritt - 1);
+        // `rest < schritt`, also `schritt - rest >= 1`: das Segment hat dort noch Platz.
+        let abstand = schritt - rest;
+        if abstand < erste {
+            erste = abstand;
+        }
+        // Früh raus, wenn nichts Kleineres mehr kommen kann.
+        if erste == 1 {
+            break;
+        }
+        m &= m - 1; // niedrigstes gesetztes Bit löschen
+    }
+    Some(if erste < len { erste } else { len })
+}
+
+/// **Das Gegenstück zu `dma_map_sg` — Eintrag für Eintrag, nie verschmelzend.**
+///
+/// Für jeden Eintrag: [`DmaPool::map`] plus [`pruefe_grenzen`]. Benachbarte Einträge werden
+/// **nicht** zusammengefasst — ein Linux-`dma_map_sg` darf verschmelzen und meldet dann weniger
+/// Segmente zurück, als es bekam; wer die Rückgabe als „Eingabezahl" liest, programmiert den
+/// nächsten Deskriptor auf das falsche Segment. Hier gilt: **Eingabezahl bei Erfolg, sonst 0** —
+/// ein Zwischenergebnis gibt es nicht, `raus` steht bei Fehlschlag ganz auf `None`.
+///
+/// `raus` muss mindestens so lang sein wie `sg`; ist es kürzer, kommt `0` (der Aufrufer hätte
+/// sonst ein Teilergebnis, das wie ein Vollergebnis aussieht). Einträge hinter `sg.len()`
+/// werden auf `None` gestellt, damit kein alter Inhalt als Segment gelesen wird.
+pub fn map_sg(
+    pool: &DmaPool,
+    sg: &[SgEintrag],
+    raus: &mut [Option<DmaBuf>],
+    grenzen: &GeraeteGrenzen,
+) -> usize {
+    if raus.len() < sg.len() {
+        return 0;
+    }
+    for (i, e) in sg.iter().enumerate() {
+        let buf = match pool.map(e.cpu, e.len) {
+            Some(b) => b,
+            None => {
+                // Pool-fremd oder ausserhalb: kein Teilergebnis — alles auf `None`.
+                for r in raus.iter_mut().take(sg.len()) {
+                    *r = None;
+                }
+                return 0;
+            }
+        };
+        if pruefe_grenzen(grenzen, buf.dev(), buf.len()).is_err() {
+            for r in raus.iter_mut().take(sg.len()) {
+                *r = None;
+            }
+            return 0;
+        }
+        raus[i] = Some(buf);
+    }
+    for r in raus.iter_mut().skip(sg.len()) {
+        *r = None;
+    }
+    sg.len()
+}
+
+/// **Ein ausgelagerter Bounce-Puffer: das Stück plus die Marke, auf die es zurückgeht.**
+///
+/// Der Bounce-Puffer löst den Fall, für den [`DmaPool::map`] `None` gibt: ein Stapel- oder
+/// Heap-Puffer, der nicht im Pool liegt. Der Treiber lagert in den Pool ein (kopiert hin),
+/// lässt das Gerät auf dem Poolstück arbeiten und kopiert zurück — das Kopieren ist
+/// Treibersache, Vergeben und Freigeben stehen hier. Die Marke liegt **dabei**, damit Freigabe
+/// nicht mit einer fremden oder gestrigen Marke geschieht (s. `Mark` in [`DmaPool::release`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BounceSlot {
+    /// Das Poolstück, auf dem das Gerät arbeitet.
+    pub buf: DmaBuf,
+    /// Der Poolstand vor der Einlagerung — dorthin geht [`bounce_freigeben`] zurück.
+    pub marke: Mark,
+}
+
+/// **In den Pool einlagern: Marke merken, dann vergeben.**
+///
+/// Gibt `None`, wenn der Pool das Stück nicht hergibt (erschöpft, Länge 0, krumme Ausrichtung) —
+/// der Poolstand bleibt dann unverändert, es gibt nichts freizugeben.
+pub fn bounce_einlagern(pool: &mut DmaPool, bedarf: u64, align: u64) -> Option<BounceSlot> {
+    let marke = pool.mark();
+    let buf = pool.alloc(bedarf, align)?;
+    Some(BounceSlot { buf, marke })
+}
+
+/// **Den Bounce-Puffer freigeben: zurück auf die gespeicherte Marke.**
+///
+/// Gibt `false`, wenn die Marke in der Zukunft liegt (darf nicht geschehen — die Marke stammt
+/// aus [`bounce_einlagern`] am selben Pool); der Pool bleibt dann unverändert.
+pub fn bounce_freigeben(pool: &mut DmaPool, slot: BounceSlot) -> bool {
+    pool.release(slot.marke)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +624,216 @@ mod tests {
         assert!(p.release(m));
         assert_eq!(p.used(), 0);
         assert_eq!(p.hoechststand(), 4096); // die Zahl, mit der man die Poolgroesse begruendet
+    }
+}
+
+#[cfg(test)]
+mod strom_tests {
+    // Host-Tests fuer die DMA-Schemen: Richtung, Streuliste, Geraetegrenzen, Bounce.
+    // Reine Literale, keine Maschine — derselbe Grund wie beim Rest der Crate.
+    use super::*;
+
+    const CPU: u64 = 0x4000_0000;
+    const DEV: u64 = 0x1_0000_0000;
+    const LEN: u64 = 0x10000;
+
+    fn pool() -> DmaPool {
+        match DmaPool::new(CPU, DEV, LEN) {
+            Ok(p) => p,
+            Err(_) => panic!("Pool liess sich nicht anlegen"),
+        }
+    }
+
+    fn offene_grenzen() -> GeraeteGrenzen {
+        GeraeteGrenzen {
+            maske: u64::MAX,
+            grenze: 0,
+            max_seg: 0,
+        }
+    }
+
+    #[test]
+    fn richtung_ist_egal_aber_pflicht() {
+        // Kohaerent auf x86: alle drei Richtungen liefern dieselbe Abbildung.
+        let p = pool();
+        let a = map_single(&p, CPU, 64, StromRichtung::NachGeraet).unwrap();
+        let b = map_single(&p, CPU, 64, StromRichtung::VomGeraet).unwrap();
+        let c = map_single(&p, CPU, 64, StromRichtung::Beide).unwrap();
+        assert_eq!(a.dev(), b.dev());
+        assert_eq!(a.dev(), c.dev());
+        // Und pool-fremd bleibt pool-fremd, egal mit welcher Richtung gefragt wird.
+        assert!(map_single(&p, 0xDEAD_0000, 8, StromRichtung::Beide).is_none());
+    }
+
+    #[test]
+    fn sync_und_unmap_sind_noops() {
+        // Sie duerfen nichts tun — aber sie muessen aufrufbar sein, damit portierter Code
+        // seine Uebergaben behaelt.
+        let p = pool();
+        let b = map_single(&p, CPU, 128, StromRichtung::Beide).unwrap();
+        sync_fuer_cpu(&b, StromRichtung::VomGeraet);
+        sync_fuer_geraet(&b, StromRichtung::NachGeraet);
+        // Nach dem Synchronisieren liegt der Puffer noch da, wo er lag.
+        assert_eq!(b.dev(), DEV);
+        assert_eq!(b.len(), 128);
+        unmap_single(b, StromRichtung::Beide);
+    }
+
+    #[test]
+    fn maske_verletzt_wird_benannt() {
+        // Eine 32-Bit-Karte (maske 0xFFFF_FFFF) erreicht eine IOVA oberhalb 4 GiB nicht.
+        let g = GeraeteGrenzen {
+            maske: 0xFFFF_FFFF,
+            grenze: 0,
+            max_seg: 0,
+        };
+        let e = pruefe_grenzen(&g, 0x1_0000_0000, 4096).unwrap_err();
+        assert_eq!(
+            e,
+            GrenzenFehler::MaskeVerletzt {
+                dev: 0x1_0000_0000,
+                len: 4096,
+                maske: 0xFFFF_FFFF
+            }
+        );
+        // Die Gegenprobe: unterhalb der Maske geht es durch.
+        assert!(pruefe_grenzen(&g, 0xFFFF_E000, 4096).is_ok());
+    }
+
+    #[test]
+    fn maskenkante_zaehlt_das_letzte_byte() {
+        // `dev + len - 1 <= maske`: genau auf die Kante passt noch, eins darueber nicht.
+        let g = GeraeteGrenzen {
+            maske: 0xFFFF_FFFF,
+            grenze: 0,
+            max_seg: 0,
+        };
+        assert!(pruefe_grenzen(&g, 0xFFFF_F000, 4096).is_ok());
+        assert!(matches!(
+            pruefe_grenzen(&g, 0xFFFF_F001, 4096).unwrap_err(),
+            GrenzenFehler::MaskeVerletzt { .. }
+        ));
+    }
+
+    #[test]
+    fn boundary_split_teilt_am_richtigen_byte() {
+        // 64-KiB-Grenze (Bits ab 16 konstant): 0x1_FFF0 + 0x20 kreuzt sie, 16 passen davor.
+        let grenze = 0xFFFF_0000u64;
+        assert_eq!(teile_an_grenze(0x1_FFF0, 0x20, grenze), Some(16));
+        // Ohne Uebertritt kommt die volle Laenge zurueck.
+        assert_eq!(teile_an_grenze(0x1_0000, 0x20, grenze), Some(0x20));
+        // Ohne Grenze (`0`) passt immer alles.
+        assert_eq!(teile_an_grenze(0x1_FFF0, 0x20, 0), Some(0x20));
+        // Und die Pruefung weist den kreuzenden Bereich ab, statt ihn still zuzulassen.
+        let g = GeraeteGrenzen {
+            maske: u64::MAX,
+            grenze,
+            max_seg: 0,
+        };
+        assert!(matches!(
+            pruefe_grenzen(&g, 0x1_FFF0, 0x20).unwrap_err(),
+            GrenzenFehler::GrenzeVerletzt { .. }
+        ));
+        assert!(pruefe_grenzen(&g, 0x1_0000, 0x20).is_ok());
+    }
+
+    #[test]
+    fn max_seg_weist_zu_lang_ab() {
+        let g = GeraeteGrenzen {
+            maske: u64::MAX,
+            grenze: 0,
+            max_seg: 4096,
+        };
+        assert!(pruefe_grenzen(&g, 0x1_0000, 4096).is_ok());
+        assert_eq!(
+            pruefe_grenzen(&g, 0x1_0000, 4097).unwrap_err(),
+            GrenzenFehler::SegmentZuGross {
+                len: 4097,
+                max_seg: 4096
+            }
+        );
+    }
+
+    #[test]
+    fn sg_mit_pool_fremd_gibt_null_und_kein_teilergebnis() {
+        let p = pool();
+        let sg = [
+            SgEintrag { cpu: CPU, len: 64 },
+            SgEintrag {
+                cpu: 0xDEAD_0000,
+                len: 64,
+            }, // Stapelpuffer-Fall
+        ];
+        let mut raus = [None, None, None];
+        assert_eq!(map_sg(&p, &sg, &mut raus, &offene_grenzen()), 0);
+        // Kein Teilergebnis: auch der gueltige erste Eintrag steht auf `None`.
+        assert!(raus[0].is_none());
+        assert!(raus[1].is_none());
+    }
+
+    #[test]
+    fn sg_erfolg_zaehlt_eingaben_und_verschmilzt_nie() {
+        // Zwei benachbarte Eintraege blieben beim Verschmelzen EIN Segment — hier sind es zwei.
+        let p = pool();
+        let sg = [
+            SgEintrag { cpu: CPU, len: 64 },
+            SgEintrag {
+                cpu: CPU + 64,
+                len: 64,
+            },
+        ];
+        let mut raus = [None, None];
+        assert_eq!(map_sg(&p, &sg, &mut raus, &offene_grenzen()), 2);
+        let a = raus[0].unwrap();
+        let b = raus[1].unwrap();
+        assert_eq!(a.dev(), DEV);
+        assert_eq!(b.dev(), DEV + 64);
+        // Benachbart, aber zwei Stuecke: wer verschmoelze, meldete ein Segment statt zwei.
+        assert_eq!(a.dev() + a.len(), b.dev());
+        assert_eq!(a.len(), 64);
+        assert_eq!(b.len(), 64);
+    }
+
+    #[test]
+    fn sg_grenzverletzung_gibt_null() {
+        let p = pool();
+        let g = GeraeteGrenzen {
+            maske: u64::MAX,
+            grenze: 0xFFFF_0000,
+            max_seg: 0,
+        };
+        // `[DEV, DEV+0x20)` kreuzt keine 64-KiB-Grenze (DEV ist ausgerichtet) — also zuerst eine
+        // Adresse suchen, die es tut: CPU+0xFFF0 im Pool entspricht DEV+0xFFF0.
+        let sg = [SgEintrag {
+            cpu: CPU + 0xFFF0,
+            len: 0x20,
+        }];
+        let mut raus = [None];
+        assert_eq!(map_sg(&p, &sg, &mut raus, &g), 0);
+        assert!(raus[0].is_none());
+    }
+
+    #[test]
+    fn bounce_alloc_free_ist_wiederverwendbar() {
+        let mut p = pool();
+        let belegt = p.used();
+        let slot = bounce_einlagern(&mut p, 256, 64).unwrap();
+        assert_eq!(slot.buf.len(), 256);
+        assert_eq!(slot.buf.cpu() % 64, 0);
+        assert!(bounce_freigeben(&mut p, slot));
+        // Nach der Freigabe liegt derselbe Platz wieder an: Bounce ist kein Leck.
+        assert_eq!(p.used(), belegt);
+        let wieder = bounce_einlagern(&mut p, 256, 64).unwrap();
+        assert_eq!(wieder.buf.cpu(), slot.buf.cpu());
+        assert_eq!(wieder.buf.dev(), slot.buf.dev());
+        assert!(bounce_freigeben(&mut p, wieder));
+    }
+
+    #[test]
+    fn bounce_erschoepfung_laesst_den_stand_unveraendert() {
+        let mut p = pool();
+        let belegt = p.used();
+        assert!(bounce_einlagern(&mut p, LEN + 1, 1).is_none());
+        assert_eq!(p.used(), belegt);
     }
 }

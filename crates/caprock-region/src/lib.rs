@@ -22,6 +22,8 @@
 extern crate alloc;
 
 pub mod heap;
+pub mod kmalloc;
+pub mod page;
 pub mod state;
 
 use core::marker::PhantomData;

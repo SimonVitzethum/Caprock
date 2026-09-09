@@ -77,7 +77,7 @@ mit_deps() { # $1 = Name, $2 = Crate-Verzeichnis, $3.. = Abhaengigkeiten (Verzei
     rm -rf "$SA"
 }
 
-ZIELE="${*:-mem part fat cycles loader cap virtio dma wait irte irteneg grossdmaneg dmar dmarneg iohealth smt numa bootparams fbtext redirect redirectneg typestate ipctreue schedtreue}"
+ZIELE="${*:-mem part fat cycles loader cap virtio dma wait region irte irteneg grossdmaneg dmar dmarneg iohealth smt numa bootparams fbtext redirect redirectneg typestate ipctreue schedtreue}"
 for z in $ZIELE; do
     case "$z" in
         mem)  einzeln mem  "$ROOT/crates/caprock-mem/src/lib.rs" ;;
@@ -117,6 +117,10 @@ for z in $ZIELE; do
         # Logik gegen einen STELLVERTRETER pruefen -- die Fallen hier sind Reihenfolgen (verlorenes
         # Wecken, voller Warteraum), keine Hardware. Derselbe Weg wie bei `ipctreue`.
         wait) einzeln wait "$ROOT/crates/caprock-wait/src/lib.rs" ;;
+        # `caprock-region` (ext-25, Z22 Speicher): haengt an `caprock-mem`/`caprock-sync`
+        # (beide abhaengigkeitsfrei). Traegt `page` (struct-page-Schema) und `kmalloc`
+        # (GFP-Schema) fuer die Linux-Compat -- laeuft hier, nicht erst in QEMU.
+        region) mit_deps region caprock-region caprock-mem caprock-sync ;;
         # `caprock-hal` als Ganzes ist arch-Asm und baut auf dem Host nie. `dmar.rs` ist die
         # Ausnahme: **reine Funktion ueber eingespeiste Daten** (`forbid(unsafe_code)`, keine
         # `use`-Zeile ausser `super::*` im Testmodul), also als DATEI pruefbar -- derselbe Weg wie
@@ -227,7 +231,7 @@ for z in $ZIELE; do
             else
                 bash "$ROOT/tools/verus-modelltreue-sched.sh" || fail=1
             fi ;;
-        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio dma wait irte irteneg grossdmaneg dmar dmarneg iohealth smt numa bootparams fbtext redirect redirectneg typestate ipctreue schedtreue)"; fail=1 ;;
+        *)    echo "  FEHLER: unbekanntes Ziel '$z' (bekannt: mem part fat cycles loader cap virtio dma wait region irte irteneg grossdmaneg dmar dmarneg iohealth smt numa bootparams fbtext redirect redirectneg typestate ipctreue schedtreue)"; fail=1 ;;
     esac
 done
 

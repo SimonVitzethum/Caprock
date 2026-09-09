@@ -398,6 +398,27 @@ pub mod sys {
     /// **What this is NOT:** wall-clock time, an absolute epoch, or a deadline. Deadlines are A2
     /// and change the blocking invariants; this syscall changes nothing about them.
     pub const CLOCK: u64 = 28;
+
+    /// **Sich selbst mit Frist parken** (A2-Rest): wie [`PARK`], aber mit Rueckkehr.
+    ///
+    /// `MSG0` = Frist in Ticks derselben monotonen Uhr, die [`CLOCK`] liest (`0` = keine Frist,
+    /// dann verhaelt sich der Aufruf bitgleich zu [`PARK`]). Rueckgabe in `x0`: [`result::OK`]
+    /// (per [`UNPARK`] geweckt oder Weckmarke verbraucht) oder [`result::ERR_TIMEOUT`] (die Frist
+    /// lief ab, ohne dass geweckt wurde).
+    ///
+    /// **Die Weckmarken-Semantik von [`PARK`] bleibt erhalten:** liegt eine Marke vor, wird sie
+    /// verbraucht und SOFORT mit [`result::OK`] zurueckgekehrt — die Frist greift dann nicht.
+    /// Ohne Marke wird blockiert, und der Wecker ist ausschliesslich [`UNPARK`] (wie bei
+    /// [`PARK`], nicht wie bei [`WAIT`]: ein fremdes `reply` weckt hier niemanden).
+    ///
+    /// **Keine Cap**, dieselbe Klasse wie [`PARK`]: der Aufruf wirkt nur auf den Aufrufer. Er
+    /// steht deshalb im Dispatch vor der generischen Cap-Aufloesung — sie wuerde `x1` als
+    /// Cap-Slot lesen und mit [`result::ERR_BADCAP`] abweisen.
+    ///
+    /// Der Baustein, auf dem eine PD `wait_event_timeout`, `wait_for_completion_timeout`,
+    /// `msleep` und `delayed_work` baut, ohne je ein Kernelobjekt anzulegen (Z22, P4): die
+    /// Warteschlange bleibt eine Liste im Speicher der PD, die Frist liegt im Scheduler.
+    pub const PARK_TIMEOUT: u64 = 29;
 }
 
 /// Rights and frame-word names for the debug syscalls (Z6b).
@@ -786,4 +807,77 @@ pub mod result {
     /// *„Geraet tot"* liest, waehrend die Antwort gerade zugestellt wurde, ein **Korruptionspfad**
     /// ist und kein Haenger. Diese Kante ist benannt und noch nicht gemessen (todo A2c).
     pub const ERR_TIMEOUT: u64 = 25;
+}
+
+// --- Host-nahe Pruefung der Nummernvergabe (A2-Rest) ------------------------------------------
+//
+// `caprock-abi` ist abhaengigkeitsfrei und laeuft ueber `rustc --test` in Sekunden (derselbe Weg
+// wie `tools/host-tests.sh`, Ziel `einzeln`). Was hier steht, ist keine Logik, sondern die
+// einzige Stelle, an der eine Kollision zweier Syscall-Nummern auffiele, bevor sie ein
+// lauffaehiges Image baut: zwei gleiche Nummern waeren im Dispatch kein Fehler, sondern ein
+// toter Syscall.
+#[cfg(test)]
+mod nummern {
+    use super::*;
+
+    #[test]
+    fn park_timeout_ist_die_naechste_freie_nummer() {
+        // `CLOCK = 28` war die hoechste vergebene Nummer; `PARK_TIMEOUT` folgt direkt.
+        assert_eq!(sys::CLOCK, 28);
+        assert_eq!(sys::PARK_TIMEOUT, 29);
+    }
+
+    #[test]
+    fn jede_syscall_nummer_ist_einmalig() {
+        let alle = [
+            sys::YIELD,
+            sys::CALL,
+            sys::RECV,
+            sys::REPLY,
+            sys::PARK,
+            sys::EXIT,
+            sys::KILL,
+            sys::SIGNAL,
+            sys::WAIT,
+            sys::MAP,
+            sys::UNMAP,
+            sys::PDCTL,
+            sys::LOAD,
+            sys::CDELETE,
+            sys::CCOPY,
+            sys::CMOVE,
+            sys::SETRECV,
+            sys::UNPARK,
+            sys::SETHANDLER,
+            sys::SPAWN,
+            sys::DEBUG_ATTACH,
+            sys::DEBUG_STOP,
+            sys::DEBUG_CONTINUE,
+            sys::DEBUG_READ_MEM,
+            sys::DEBUG_WRITE_REGS,
+            sys::BIND_IRQ,
+            sys::SETTLS,
+            sys::CLOCK,
+            sys::PARK_TIMEOUT,
+        ];
+        let mut sortiert = alle;
+        sortiert.sort_unstable();
+        let mut i = 0;
+        while i + 1 < sortiert.len() {
+            assert_ne!(
+                sortiert[i],
+                sortiert[i + 1],
+                "Syscall-Nummer doppelt vergeben: {}",
+                sortiert[i]
+            );
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn frist_rueckgabe_ist_benannt() {
+        // `PARK_TIMEOUT` braucht genau diese beiden Ausgaenge, und beide muessen verschieden
+        // sein — sonst kann der Aufrufer „geweckt" von „abgelaufen" nicht unterscheiden.
+        assert_ne!(result::OK, result::ERR_TIMEOUT);
+    }
 }

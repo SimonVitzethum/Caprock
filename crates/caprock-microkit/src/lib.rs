@@ -1816,6 +1816,34 @@ fn dispatch_nativ(
             }
         };
     }
+    if nr == sys::PARK_TIMEOUT {
+        // Selbst-Park mit Frist (A2-Rest): wie `PARK`, aber mit Rueckkehr per `ERR_TIMEOUT`.
+        // `MSG0` = Frist in Ticks, `0` = keine (dann bitgleich zu `PARK`).
+        //
+        // Dispatch analog zur `WAIT`-Frist: **scharfgestellt VOR dem Blockieren**, sonst gaebe
+        // es ein Fenster, in dem der Thread schon wartet und seine Frist noch nicht steht.
+        //
+        // **Der bewachte Grund ist `PARK`, nicht `IPC`** -- und das ist kein Stil, sondern die
+        // Bedingung, unter der ueberhaupt geweckt wird: `unpark` entfernt genau `PARK`, `unblock`
+        // genau `IPC`. Mit `IPC` als Grund weckte ein fremdes `reply` den Parker, waehrend sein
+        // eigentliches `UNPARK` wirkungslos verpuffte (Marke gesetzt, Grund bleibt stehen).
+        //
+        // **Die Weckmarke bleibt erhalten** (`park_current` verbraucht sie zuerst): lag sie vor,
+        // kehrt der Aufruf sofort mit `OK` zurueck, und die eben scharfgestellte Frist trifft
+        // spaeter auf einen Thread ohne `PARK`-Grund -- sie wird still entwaffnet, ohne Bericht
+        // („das Signal gewinnt", dieselbe Aufloesung wie bei der `WAIT`-Frist).
+        let ticks = frame_reg(frame, reg::MSG0);
+        if ticks != 0 {
+            ops.frist_setzen(core, ticks, caprock_sched::BlockReasons::PARK);
+        }
+        return match ops.park_current(core, frame) {
+            Some(next) => next,
+            None => {
+                frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
+                frame
+            }
+        };
+    }
     if nr == sys::UNPARK {
         // Ziel muss in DERSELBEN PD liegen. Fail-closed in allen drei Richtungen: der Aufrufer
         // ohne PD, das Ziel ohne PD, oder verschiedene PDs -> abweisen. Siehe `sys::UNPARK`,

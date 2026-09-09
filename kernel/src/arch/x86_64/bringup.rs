@@ -6463,6 +6463,18 @@ pub fn run(multiboot_info: u64) -> ! {
     if nmods > 0 {
         crate::loader::set_archive_span(mods[0].start, mods[0].len());
     }
+    // Module 1.. sind LXPD-Treiber-Images (Mitteilung 12): Spannen melden, damit der
+    // Boot-Hook sie per Hash findet. Alle Module sind oben aus der Freiliste
+    // ausgeschnitten (s. subtract_holes) — lesbar, nie doppelt vergeben.
+    // `nmods > 1` zuerst: bei null Modulen waere `mods[1..0]` ein Panic im Boot-Pfad.
+    if nmods > 1 {
+        for (i, m) in mods[1..nmods].iter().enumerate() {
+            if m.len() == 0 {
+                continue;
+            }
+            crate::loader::set_lxpd_module_span(i, m.start, m.len());
+        }
+    }
     let free_base = hal::mmu::kernel_end().max(hal::mmu::USER_RAM_MIN);
     /*
      * **Die Struktur des Bootloaders liegt unter der Freiliste -- gemessen, nicht angenommen.**

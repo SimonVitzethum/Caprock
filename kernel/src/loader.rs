@@ -1288,11 +1288,617 @@ pub fn start_root_task_reported() -> bool {
                 "root    : ALL PASS (Startprogramm aus der Startmenge geladen: Thread {:?}, PD {pd}; Manifest-Hash geprueft, Wurzel-Caps endowt)",
                 tid.to_raw()
             );
+            // LXPD-Treiber-Boot (s. Abschnitt unten): nach dem Archiv-Root-Task die
+            // Manifest-Treiberliste abfahren. Der Bring-up ruft nichts weiter — der Aufruf
+            // steht hier, damit beide Hochlaufwege (x86, aarch64) ihn ohne Änderung fahren.
+            let _ = boot_lxpd_treiber(Some(pd));
             true
         }
         Err(e) => {
             println!("root    : FAILURES ({e:?}) -- kein Root-Task, der Kernel hat nichts auszufuehren");
+            // Auch ohne Root-Task wird geprüft und BENANNT abgewiesen (`WurzelFehlt`),
+            // statt still zu überspringen.
+            let _ = boot_lxpd_treiber(None);
             false
+        }
+    }
+}
+
+// ================================================================================================
+// LXPD-Treiber-Boot: Treiber-PDs aus Bootloader-Modulen (Strang Boot)
+// ================================================================================================
+//
+// Die Hüllenprüfung liegt in [`lxpd_boot`] (eigene Datei, s. dort); hier liegt der
+// **privilegierte** Teil: Treiber-Einträge des angenommenen Manifests auflösen und je
+// Eintrag eine Treiber-PD erzeugen — über die bestehenden Pfade, keine neuen Sonderrechte.
+//
+// Verdrahtung ohne `main.rs`: Diese Datei ist die einzige geänderte, `lxpd_boot.rs` die
+// einzige neue — der Dateibesitz dieses Strangs lässt nichts anderes zu. Deshalb hängt
+// das Modul hier per Pfad-Attribut statt per `mod`-Zeile in `main.rs`:
+//
+// ```ignore
+// #[path = "lxpd_boot.rs"] mod lxpd_boot;
+// ```
+//
+// ## Zuständigkeit — und warum Archiv-ELFs hier NICHT angefasst werden
+//
+// Ein Manifest-Eintrag der Domäne HardwareLand endet in genau einem von drei Zählern
+// (`gestartet`, `abgewiesen`, `an-init-verwiesen`); kein Eintrag wird still übersprungen.
+// Aber „abfahren" heisst nicht „alles selbst laden":
+//
+// * **Archiv-ELF → init-Pfad (`SYS_LOAD`).** Das heutige `virtio-blk`/`virtio-net` liegt als
+//   ELF im Archiv und wird von `init` über seine Loader-Cap geladen (A-5.1, A-5.3, A-5.4,
+//   `drv :`/`dmaiso :`). Würde der Boot dieselben Module zuerst in eigene Backend-PDs
+//   laden, schnappte er `init` die Geräte weg — die Zuteilung ist fail-closed, also fiele
+//   der echte Treiberpfad danach mit `NoDevice` aus. Deshalb: gezählt, als Zeile gemeldet,
+//   nicht angefasst.
+// * **LXPD-Hülle (beide Quellen) → prüfen + benennen.** Ein v1-Container ist Transportnachweis,
+//   kein ladbares Image — er wird vollständig validiert und mit `TransportNur` abgewiesen
+//   (die ladbare `bind_elf`-Form kommt über denselben Eintrag herein, sobald der
+//   Format-Strang sie liefert). Eine verletzte Hülle heisst `ContainerFehler`.
+// * **Bootloader-Spanne (Module 1..) + ELF → Boot-PD.** Diese Module sieht `init` nicht
+//   (`load_by_index` liest nur das Archiv) — hier entsteht keine Doppelbelegung, und nur
+//   hier erzeugt der Boot eine PD.
+//
+// ## Warum die Zeilen `ABGEWIESEN` sagen statt `FAILURES`
+//
+// Die Suiten führen einen Rotzeilen-Scanner: jede `... : ...FAILURES`-Zeile ausserhalb der
+// bekannten Liste färbt den Lauf. Eine LXPD-Absage ist aber kein Befund am Kernel, sondern
+// eine benannte Aufbau-/Formatlage (kein Modul, falscher Hash, Transport statt Image) —
+// sie trüge einen fremden Befund in jede Suite, die (noch) keine LXPD-Module mitgibt.
+// Deshalb das eigene Wort; die Zähler stehen in der Bilanz.
+
+/// LXPD-Boot-Transport (Hüllenprüfung + Modul-Spannen). Pfad-Attribut statt `main.rs`-
+/// Eintrag, s. Abschnitt oben.
+#[path = "lxpd_boot.rs"]
+mod lxpd_boot;
+
+/// Gemeldete Spannen zählen (Bericht). Re-Export für die Bring-up-Verdrahtung
+/// (Module 1.. aus `bringup.rs` melden) — die Statik lebt weiter in `lxpd_boot`.
+pub use lxpd_boot::set_lxpd_module_span;
+
+/// Warum ein Boot-Treiber nicht zustande kam. Bewusst **unterscheidbar** — dieselbe
+/// Begründung wie bei [`RootTaskError`]: „lädt nicht" ist als Diagnose wertlos, und der
+/// Unterschied zwischen „kein Modul" und „Hash passt nicht" ist der Unterschied zwischen
+/// einem Aufbaufehler und einem Integritätsbefund.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LxpdAbsage {
+    /// Der Eintrag ist unlesbar, obwohl der Zähler ihn verspricht (Manifest innerlich unstimmig).
+    EintragUnlesbar,
+    /// Als ROOT markiert, aber Domäne HardwareLand — ein Widerspruch im Manifest, keine PD.
+    WurzelWiderspruch,
+    /// Weder Archiv noch Bootloader-Modul tragen diesen Hash.
+    NichtGefunden,
+    /// Das Archivmodul weicht vom Manifest-Hash ab — der Fall, für den der Hash da ist.
+    HashAbweichung,
+    /// Weder LXPD- noch ELF-Magic — kein bekanntes Transportformat.
+    KeinContainer,
+    /// LXPD-Hülle verletzt — mit dem genauen Grund.
+    ContainerFehler(lxpd_boot::LxpdBootError),
+    /// Gültiger v1-Container, aber **kein ladbares Image**: Die Stubs sind der
+    /// Transportnachweis der lxport-Pipeline, kein Code. Der Boot braucht die
+    /// `bind_elf`-Form (reines ET_EXEC-ELF); sie kommt über denselben Eintrag herein,
+    /// sobald der Format-Strang sie liefert.
+    TransportNur,
+    /// Der Root-Task läuft nicht — ohne Partner keine Backend-PD (die Hülle wurde trotzdem geprüft).
+    WurzelFehlt,
+    /// Keine Backend-PD erzeugbar (Kernel-Ressourcen erschöpft).
+    KeinBackend,
+    /// Das Manifest verlangt Geräte-Autorität, und es gibt keine (s. [`RootTaskError::NoDevice`]).
+    KeineZuteilung,
+    /// Das Manifest verlangt Autorität, die dieser Kernel nicht erteilen kann.
+    PolitikAbgewiesen,
+    /// Anfangs-Caps ließen sich nicht erzeugen (Kernel-Ressourcen erschöpft).
+    KeineRessourcen,
+    /// Der Loader hat das Image abgelehnt — mit dem genauen Grund.
+    LoaderAbgewiesen(LoaderError),
+    /// Kein angenommenes Boot-Manifest — nur der Laufzeit-Pfad (`SYS_LOAD_IMAGE`): der
+    /// Boot-Hook meldet das vor der Schleife, hier ist es eine Absage je Auftrag.
+    KeinManifest,
+    /// Kein Manifest-Eintrag mit dieser `pid` — der Join-Schlüssel des Laufzeit-Pfads
+    /// verfehlt (Aufbaufehler, kein Integritätsbefund: geprüft wurde nichts, weil es nichts
+    /// zu prüfen gab).
+    PidUnbekannt,
+    /// Der Eintrag ist nicht HardwareLand — nur Treiber laden über diesen Pfad (der
+    /// Root-Task kommt aus dem Boot, Dienste/Clients über `SYS_LOAD`).
+    FalscheDomaene,
+    /// Derselbe Slot aus Manifest UND Aufrufer-Angebot — wie `collision` in `load_by_index`:
+    /// welches von beiden das Programm dann meinte, könnte niemand mehr sagen.
+    EndowKollision,
+    /// Mehr Caps als [`ENDOW_SLOTS`] fassen — fail-closed statt Überlauf in den festen
+    /// Puffer (die alte Inline-Fassung schrieb blind und war nur per Konstruktion sicher,
+    /// weil sie eine einzige Quelle hatte).
+    EndowZuViel,
+}
+
+/// Der Hook ist idempotent (der Bring-up darf ihn später direkt rufen, ohne eine zweite
+/// Fassung zu erzeugen): `1`, sobald er einmal fuhr.
+static LXPD_BOOT_GELAUFEN: AtomicU64 = AtomicU64::new(0);
+/// Gestartete Boot-Treiber-PDs (Bilanz, kein Ruhm — die Zahl gehört zur Zeile).
+static LXPD_GESTARTET: AtomicU64 = AtomicU64::new(0);
+/// Benannt abgewiesene Einträge.
+static LXPD_ABGEWIESEN: AtomicU64 = AtomicU64::new(0);
+/// An den init-Pfad verwiesene Archiv-ELFs (Zuständigkeit, keine Absage).
+static LXPD_AN_INIT: AtomicU64 = AtomicU64::new(0);
+
+/// Eine Absage melden + zählen — eine Stelle, damit kein Pfad das Zählen vergisst.
+fn lxpd_nein(pid: u32, name: &str, quelle: &str, grund: LxpdAbsage) {
+    LXPD_ABGEWIESEN.fetch_add(1, Ordering::Relaxed);
+    println!("lxpddrv : [{pid}]{name} ABGEWIESEN ({grund:?}, quelle={quelle}) -- keine Treiber-PD");
+}
+
+/// Einen Start melden + zählen.
+fn lxpd_ja(pid: u32, name: &str, quelle: &str, pd: usize, tid: ThreadId) {
+    LXPD_GESTARTET.fetch_add(1, Ordering::Relaxed);
+    println!(
+        "lxpddrv : [{pid}]{name} gestartet (quelle={quelle} PD={pd} Thread={:?}; Hash gebunden, Grants endowt)",
+        tid.to_raw()
+    );
+}
+
+/// Die Bilanz ziehen — **immer**, auch bei leerer Treiberliste: Die Zeile ist der Beleg,
+/// dass der Hook fuhr. Enthält bewusst kein `FAILURES` (s. Abschnitt oben).
+fn lxpd_bilanz() -> (usize, usize) {
+    let g = LXPD_GESTARTET.load(Ordering::Relaxed) as usize;
+    let a = LXPD_ABGEWIESEN.load(Ordering::Relaxed) as usize;
+    let v = LXPD_AN_INIT.load(Ordering::Relaxed) as usize;
+    let s = lxpd_boot::lxpd_module_gemeldet();
+    println!(
+        "lxpddrv : gestartet={g} abgewiesen={a} an-init-verwiesen={v} Spannen={s} (Treiber-PDs aus Bootloader-/Archiv-Modulen; Manifest-Signatur gegen MANIFEST_KEYS, Modul-Hash gegen Eintrag)"
+    );
+    (g, a)
+}
+
+/// **Einen hash-gebundenen LXPD-Treiber in eine Backend-PD laden** — die SHARED Fassung des
+/// Per-Treiber-Bodys („Bootloader-Spanne mit ELF-Form" in [`boot_lxpd_treiber`]).
+///
+/// EIN Body, zwei Aufrufer: der Boot-Hook (Partner = Root-Task-PD, Vorgabe-Pool, ohne
+/// Aufrufer-Angebot, Heimatkern = dieser Kern, Startmengen-Argument) und der Laufzeit-Pfad
+/// ([`load_verified_image`]: Partner = Aufrufer-PD, Budgets + Angebot des Aufrufers,
+/// Heimatkern des Aufrufers, `boot_arg(pid, 0)`). Was hier steht, gilt für beide — zwei
+/// Stellen, die dasselbe täten, altern auseinander (s. `sammle_endow` im Dispatch).
+///
+/// Voraussetzungen (prüft der AUFRUFER, nicht diese Funktion): das Bild ist ELF
+/// (`lxpd_boot::is_elf`) und `sha256(bild) == e.sha256` — Vertrauen aus dem BOOT-Manifest.
+/// Gibt `(Backend-PD, Endpoint, Notification, Thread)` zurück; die Dienst-Registrierung
+/// (`set_driver_service`, mit aufruferspezifischem `index`) bleibt beim Aufrufer, weil nur
+/// er weiss, woher das Bild kam (Archiv-Index vs. `u32::MAX` = kein Archivmodul).
+///
+/// `caller_endow` sind die vom Dispatch aus dem Aufrufer-Cspace delegierten Caps (L2:
+/// höchstens ein Cap, in Slot 0) — sie werden mit den Manifest-Caps KOMBINIERT, nicht daneben
+/// gelegt: Schranke [`ENDOW_SLOTS`], derselbe Slot zweimal ist fail-closed
+/// ([`LxpdAbsage::EndowKollision`]/[`LxpdAbsage::EndowZuViel`]). Die alte Inline-Fassung schrieb
+/// blind in `[first; ENDOW_SLOTS]` — mit nur einer Quelle per Konstruktion ungefährlich, mit
+/// zwei ein Panic-Pfad; die Schranke hier schliesst ihn.
+///
+/// `angebot` (die Bitmaske der Aufrufer-Slots für die Ladepolitik) folgt derselben Quelle:
+/// leerer Aufruf heisst `0`, wie `load_program_into_pd` ihn immer trug — der Boot-Fall ist
+/// damit bitgleich zur alten Fassung (`_auf(..., eigener_kern(), 0, 0)` IST
+/// `load_program_into_pd`, s. dort).
+#[allow(clippy::too_many_arguments)]
+fn lxpddrv_laden(
+    e: &ManifestEntry,
+    bild: &[u8],
+    partner: usize,
+    caller_endow: &[(usize, CapPtr)],
+    heimatkern: usize,
+    cap_budget: u16,
+    dma_pages: u32,
+    arg: usize,
+) -> Result<(usize, usize, usize, ThreadId), LxpdAbsage> {
+    let Some((hpd, ep, ntfn)) =
+        crate::system::create_hardware_backend(partner, (e.program_id & 0xffff) as u16)
+    else {
+        return Err(LxpdAbsage::KeinBackend);
+    };
+    // Vorgabe-Pool am Boot (`dma_pages = 0`), wie der Root-Task — die Grössenpolitik zur
+    // Ladezeit (C2) gehört dem Laufzeit-Pfad, nicht dem Boot.
+    let caps = match endow_from_manifest(e, Some(Kanal::Geraet(ep, ntfn)), dma_pages, Some(hpd)) {
+        Ok(c) => c,
+        Err(RootTaskError::NoDevice) => return Err(LxpdAbsage::KeineZuteilung),
+        Err(RootTaskError::UnsupportedAuthority) => return Err(LxpdAbsage::PolitikAbgewiesen),
+        Err(_) => return Err(LxpdAbsage::KeineRessourcen),
+    };
+    // Das synthetische `Program`: `Program::new` ist ausdrücklich quellen-agnostisch
+    // („Archiv, Dateisystem, …"). Version 1 ist ungebunden, aber harmlos —
+    // HardwareLand braucht kein Zertifikat (`verify_image` ignoriert alles ausser der
+    // Domäne), und die Schnittstellenversion trägt das Manifest (`iface_gate`).
+    let synth = Program::new(
+        e.program_id,
+        e.name().as_bytes(),
+        1,
+        DOMAIN_HARDWARE,
+        e.sha256,
+        bild,
+        &[],
+        &[],
+    );
+    // Kombinieren: erst Manifest, dann Angebot — mit Schranke UND Kollisionsprüfung (s. Doku).
+    // Eine Absage hier braucht Aufräumen: die Manifest-Caps sind frisch geprägt und nirgends
+    // installiert — ohne `cap_delete` blieben sie als verwaiste CDT-Kinder liegen (derselbe
+    // Fehler, den der Abweispfad im Dispatch schon einmal bezahlt hat, s. `sammle_endow`).
+    let mut alle: [Option<(usize, CapPtr)>; ENDOW_SLOTS] = [None; ENDOW_SLOTS];
+    let mut n = 0usize;
+    for &c in caps.iter().flatten().chain(caller_endow.iter()) {
+        if alle[..n].iter().flatten().any(|&(s, _)| s == c.0) {
+            for &(_, cap) in alle[..n].iter().flatten() {
+                let _ = crate::system::cap_delete(cap);
+            }
+            return Err(LxpdAbsage::EndowKollision);
+        }
+        if n == alle.len() {
+            for &(_, cap) in alle[..n].iter().flatten() {
+                let _ = crate::system::cap_delete(cap);
+            }
+            return Err(LxpdAbsage::EndowZuViel);
+        }
+        alle[n] = Some(c);
+        n += 1;
+    }
+    let angebot = caller_endow.iter().fold(0u16, |m, &(slot, _)| {
+        m | if slot < 16 { 1u16 << slot } else { 0 }
+    });
+    let geladen = match alle[..n].iter().flatten().next().copied() {
+        Some(first) => {
+            let mut endow = [first; ENDOW_SLOTS];
+            let mut k = 0usize;
+            for &c in alle[..n].iter().flatten() {
+                endow[k] = c;
+                k += 1;
+            }
+            // Heimatkern + Budgets nennt der Aufrufer: am Boot ist das dieser Kern mit
+            // Vorgaben (bitgleich zu `load_program_into_pd`), zur Laufzeit der Aufrufer-Kern
+            // mit seinen Wünschen.
+            load_program_into_pd_auf(
+                &synth,
+                hpd,
+                &endow[..k],
+                arg,
+                heimatkern,
+                angebot,
+                cap_budget,
+            )
+        }
+        None => load_program_into_pd_auf(&synth, hpd, &[], arg, heimatkern, angebot, cap_budget),
+    };
+    match geladen {
+        Ok(tid) => Ok((hpd, ep, ntfn, tid)),
+        Err(e) => {
+            // Die endowten Caps sind noch nirgends installiert (wie beim Root-Task);
+            // Backend-PD + Kanal bleiben bestehen wie in `load_by_index` — wiederverwendet,
+            // nicht neu erfunden.
+            for &(_, cap) in alle[..n].iter().flatten() {
+                let _ = crate::system::cap_delete(cap);
+            }
+            Err(LxpdAbsage::LoaderAbgewiesen(e))
+        }
+    }
+}
+
+/// **LXPD-Treiber-Boot**: nach dem Archiv-Root-Task die Manifest-Treiberliste abfahren.
+///
+/// Auflösung je Eintrag (Domäne HardwareLand, nicht ROOT):
+/// 1. **Welches Modul?** Archivmodul mit gleicher `program_id` (wie der Root-Task) oder —
+///    ohne `program_id`-Feld im Container — Bootloader-Spanne mit gleichem Hash.
+/// 2. **Hash womit?** `sha256(Modulbytes) == Eintrag.sha256`, vor jeder weiteren Prüfung.
+/// 3. **Signatur gegen welche Keys?** Es gibt nur angenommene Manifeste (`read_manifest`,
+///    gegen [`crate::manifest_keys::MANIFEST_KEYS`]) — ungeprüfte Einträge existieren hier nicht.
+///
+/// `partner` ist die Root-Task-PD (Partner-Bindung der Backend-PD, wie in `load_by_index`);
+/// `None` heisst „der Root-Task läuft nicht" — geprüft wird trotzdem, geladen nicht
+/// (`WurzelFehlt`). Gibt `(gestartet, abgewiesen)` zurück. Idempotent: der zweite Aufruf
+/// meldet den alten Stand und erzeugt keine zweite Fassung.
+pub fn boot_lxpd_treiber(partner: Option<usize>) -> (usize, usize) {
+    if LXPD_BOOT_GELAUFEN.swap(1, Ordering::Relaxed) != 0 {
+        let g = LXPD_GESTARTET.load(Ordering::Relaxed) as usize;
+        let a = LXPD_ABGEWIESEN.load(Ordering::Relaxed) as usize;
+        println!("lxpddrv : bereits gefahren (idempotent -- keine zweite Fassung; gestartet={g} abgewiesen={a})");
+        return (g, a);
+    }
+    let Some(man) = read_manifest() else {
+        println!("lxpddrv : ABGEWIESEN (KeinManifest -- ohne angenommenes Manifest gibt es keine Treiberliste; s. manifest_audit)");
+        return lxpd_bilanz();
+    };
+    let archiv = read_archive();
+    if archiv.is_none() {
+        // Benannt, einmal: Die Archivquelle entfällt — die Spannensuche läuft trotzdem.
+        println!("lxpddrv : kein Boot-Archiv (KeinArchiv) -- Archivquelle entfaellt, Bootloader-Spannen bleiben suchbar");
+    }
+    let n = man.count();
+    let mut treiber = 0usize;
+    for mi in 0..n {
+        let Some(e) = man.entry(mi) else {
+            lxpd_nein(0, "?", "unbekannt", LxpdAbsage::EintragUnlesbar);
+            continue;
+        };
+        if e.domain != DOMAIN_HARDWARE {
+            continue;
+        }
+        treiber += 1;
+        let pid = e.program_id;
+        let name = e.name();
+        if e.is_root_task() {
+            lxpd_nein(pid, name, "Manifest", LxpdAbsage::WurzelWiderspruch);
+            continue;
+        }
+        // --- Quelle suchen: Archiv zuerst (Join-Key `program_id`), dann Spannen (Join-Key Hash).
+        let mut bild: Option<&[u8]> = None;
+        let mut prog_aus_archiv: Option<Program<'_>> = None;
+        let mut archiv_index: Option<u32> = None;
+        let mut quelle = "unbekannt";
+        if let Some(a) = archiv.as_ref() {
+            if let Some(ai) =
+                (0..a.count()).find(|&i| a.program(i).map(|p| p.program_id) == Some(pid))
+            {
+                match a.program(ai) {
+                    Some(prog) if sha256(prog.elf) == e.sha256 => {
+                        bild = Some(prog.elf);
+                        prog_aus_archiv = Some(prog);
+                        archiv_index = Some(ai as u32);
+                        quelle = "Archiv";
+                    }
+                    _ => {
+                        lxpd_nein(pid, name, "Archiv", LxpdAbsage::HashAbweichung);
+                        continue;
+                    }
+                }
+            }
+        }
+        if bild.is_none() {
+            // Der Container trägt kein `program_id`-Feld — der Hash allein bindet ihn.
+            for si in 0..lxpd_boot::LXPD_MAX_MODULES {
+                let Some(bytes) = lxpd_boot::lxpd_module_bytes(si) else { continue };
+                if sha256(bytes) == e.sha256 {
+                    bild = Some(bytes);
+                    quelle = "Bootloader-Modul";
+                    break;
+                }
+            }
+        }
+        let Some(bild) = bild else {
+            lxpd_nein(pid, name, quelle, LxpdAbsage::NichtGefunden);
+            continue;
+        };
+        // --- Form unterscheiden: ELF lädt (Zuständigkeit beachten), LXPD wird geprüft.
+        if lxpd_boot::is_elf(bild) {
+            if prog_aus_archiv.is_some() {
+                // Zuständigkeit (s. Abschnitt oben): Archiv-ELFs lädt `init` über SYS_LOAD.
+                LXPD_AN_INIT.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            // Bootloader-Spanne mit ELF-Form: `init` sieht sie nicht — hier entsteht die PD.
+            // Läuft über die SHARED Fassung [`lxpddrv_laden`] (Vorgabe-Pool, ohne Angebot,
+            // Heimatkern = dieser Kern): bitgleich zur alten Inline-Fassung, ein Body für Boot
+            // UND Laufzeit statt zweier, die auseinanderaltern.
+            let Some(proot) = partner else {
+                lxpd_nein(pid, name, quelle, LxpdAbsage::WurzelFehlt);
+                continue;
+            };
+            // Die Startmenge ist das Manifest (D5): Index = Manifestposition, nicht Behälterlage.
+            let arg = boot_arg(mi, n);
+            match lxpddrv_laden(
+                &e,
+                bild,
+                proot,
+                &[],
+                crate::system::eigener_kern(),
+                0,
+                0,
+                arg,
+            ) {
+                Ok((hpd, ep, ntfn, tid)) => {
+                    // `u32::MAX` = kein Archivmodul: `reload_driver` findet darunter kein
+                    // Archivprogramm und meldet benannt `NotLoaded`, statt ein FALSCHES
+                    // Modul (fremder Spannenindex als Archivindex gelesen) zu laden.
+                    let index = archiv_index.unwrap_or(u32::MAX);
+                    set_driver_service(DriverService {
+                        ep,
+                        ntfn,
+                        pd: hpd,
+                        tid,
+                        index,
+                        program_id: pid,
+                    });
+                    lxpd_ja(pid, name, quelle, hpd, tid);
+                }
+                Err(g) => lxpd_nein(pid, name, quelle, g),
+            }
+        } else if lxpd_boot::is_lxpd(bild) {
+            match lxpd_boot::LxpdBild::parse(bild) {
+                Ok(img) => {
+                    println!(
+                        "lxpddrv : [{pid}]{name} Transportnachweis gueltig (quelle={quelle}: {} Stubs, {} umverdrahtet) -- aber kein ladbares Image",
+                        img.tramp_count(),
+                        img.rewired_count()
+                    );
+                    lxpd_nein(pid, name, quelle, LxpdAbsage::TransportNur);
+                }
+                Err(fe) => {
+                    lxpd_nein(pid, name, quelle, LxpdAbsage::ContainerFehler(fe));
+                }
+            }
+        } else {
+            lxpd_nein(pid, name, quelle, LxpdAbsage::KeinContainer);
+        }
+    }
+    if treiber == 0 {
+        println!("lxpddrv : keine Treiber-Eintraege im Manifest (Domaene HardwareLand) -- 0 gestartet, 0 abgewiesen");
+    } else {
+        let v = LXPD_AN_INIT.load(Ordering::Relaxed);
+        if v > 0 {
+            println!("lxpddrv : {v} Archiv-ELF(s) gehoeren dem init-Pfad (SYS_LOAD) -- hier nicht angefasst (Zustaendigkeit, keine Absage)");
+        }
+    }
+    lxpd_bilanz()
+}
+
+// ================================================================================================
+// Laufzeit-Treiber (`SYS_LOAD_IMAGE = 36`): Bild aus Aufrufer-RAM statt Boot-Archiv
+// ================================================================================================
+
+/// **Einen Laufzeit-Treiber aus Aufrufer-RAM laden** (`SYS_LOAD_IMAGE = 36`).
+///
+/// Der Dispatch hat Geometrie (plain-RAM, READ, Länge) und Delegation bereits geprüft; der
+/// Verifizierer hat das Bild EINMAL nach Staging kopiert (`verifizierer::laden_bild`) und
+/// reicht hier NUR die Kopie herein. Was ankommt, ist damit fixiert — was der Aufrufer
+/// seither in sein RAM schreibt, lädt nicht mehr mit (TOCTOU, s. dort).
+///
+/// Reihenfolge, und sie ist die des Boot-Hooks ([`boot_lxpd_treiber`]):
+/// 1. **Autorität aus dem BOOT-Manifest** — `read_manifest()` (Signatur, Kernel-Bindung,
+///    Anti-Downgrade), Join per `pid`. Kein Manifest, keine `pid`, falsche Domäne,
+///    Root-Task-Eintrag: benannte Absage, keine PD.
+/// 2. **Form: NUR ELF.** Ein LXPD-Container ist Transport, kein Code
+///    ([`LxpdAbsage::TransportNur`], wie am Boot) — wer ihn schickt, bekommt den Namen des
+///    Falls, nicht ein wortloses `ERR_BADCAP`.
+/// 3. **Bindung: `sha256(staged) == e.sha256`.** Das Vertrauen kommt aus dem BOOT-Manifest,
+///    nicht aus mitgereichten Bytes — das Staging trägt keinen Absender, nur Inhalt.
+/// 4. **Laden über die SHARED Fassung** ([`lxpddrv_laden`]): Backend mit `partner = caller_pd`
+///    (wer lädt, ist der Partner — wie `load_by_index`), Manifest-Caps + Aufrufer-Angebot
+///    kombiniert, synthetisches `Program`, Heimatkern/Budgets des Aufrufers.
+///    Dienst-Registrierung mit `index = u32::MAX` (kein Archivmodul — `reload_driver` meldet
+///    darunter benannt `NotLoaded`, statt ein falsches Modul zu laden).
+///    `arg = boot_arg(pid, 0)`: **keine Manifestposition** — der Laufzeit-Treiber gehört nicht
+///    zur Boot-Startmenge (D5); das Feld trägt die `pid`, die Zählung `0` markiert „keine
+///    Startmenge".
+///
+/// Gibt die Backend-PD. `None` heisst immer „benannt abgewiesen (Zeile oben), nichts angelegt":
+/// die delegierten Aufrufer-Caps werden zurückgenommen (wie `load_by_index`), Backend-PD +
+/// Kanal bleiben bestehen (wiederverwendet, nicht neu erfunden — wie dort).
+///
+/// Die Zeilen sagen `ABGEWIESEN`, nie `FAILURES` (s. Abschnitt oben): Eine Absage ist kein
+/// Befund am Kernel, und der Rotzeilen-Scanner der Suiten färbt jede `FAILURES`-Zeile.
+pub fn load_verified_image(
+    bild: &[u8],
+    pid: u32,
+    caller_pd: usize,
+    caller_endow: &[(usize, CapPtr)],
+    heimatkern: usize,
+    cap_budget: u16,
+    dma_pages: u32,
+) -> Option<usize> {
+    let pd = load_verified_image_inner(
+        bild,
+        pid,
+        caller_pd,
+        caller_endow,
+        heimatkern,
+        cap_budget,
+        dma_pages,
+    );
+    if pd.is_none() {
+        // Laden fehlgeschlagen → die delegierten Aufrufer-Cap-KOPIEN wurden NICHT installiert
+        // (installiert wird erst nach vollem Erfolg). Frische CDT-Blätter, das Original im
+        // Aufrufer-Cspace lebt → nur Refcount senken. Ohne dieses Cleanup lecken sie als
+        // verwaiste CDT-Kinder und blockieren sogar `delete` des Eltern-Caps (HasChildren) —
+        // derselbe Weg wie in `load_by_index`.
+        for &(_, cap) in caller_endow {
+            let _ = crate::system::cap_delete(cap);
+        }
+    }
+    pd
+}
+
+fn load_verified_image_inner(
+    bild: &[u8],
+    pid: u32,
+    caller_pd: usize,
+    caller_endow: &[(usize, CapPtr)],
+    heimatkern: usize,
+    cap_budget: u16,
+    dma_pages: u32,
+) -> Option<usize> {
+    let Some(man) = read_manifest() else {
+        let grund = LxpdAbsage::KeinManifest;
+        println!(
+            "lxpdimg : [{pid}]? ABGEWIESEN ({grund:?}, quelle=Laufzeit) -- ohne angenommenes Boot-Manifest gibt es keinen Join-Schluessel"
+        );
+        return None;
+    };
+    let Some(e) = (0..man.count())
+        .filter_map(|i| man.entry(i))
+        .find(|e| e.program_id == pid)
+    else {
+        let grund = LxpdAbsage::PidUnbekannt;
+        println!(
+            "lxpdimg : [{pid}]? ABGEWIESEN ({grund:?}, quelle=Laufzeit) -- kein Manifest-Eintrag mit dieser pid"
+        );
+        return None;
+    };
+    let name = e.name();
+    if e.domain != DOMAIN_HARDWARE {
+        let grund = LxpdAbsage::FalscheDomaene;
+        println!(
+            "lxpdimg : [{pid}]{name} ABGEWIESEN ({grund:?}, quelle=Laufzeit) -- nur Treiber laden ueber diesen Pfad"
+        );
+        return None;
+    }
+    if e.is_root_task() {
+        let grund = LxpdAbsage::WurzelWiderspruch;
+        println!(
+            "lxpdimg : [{pid}]{name} ABGEWIESEN ({grund:?}, quelle=Laufzeit) -- der Root-Task kommt aus dem Boot, nicht aus Aufrufer-RAM"
+        );
+        return None;
+    }
+    if !lxpd_boot::is_elf(bild) {
+        let grund = if lxpd_boot::is_lxpd(bild) {
+            match lxpd_boot::LxpdBild::parse(bild) {
+                Ok(img) => {
+                    println!(
+                        "lxpdimg : [{pid}]{name} Transportnachweis gueltig (quelle=Laufzeit: {} Stubs, {} umverdrahtet) -- aber kein ladbares Image",
+                        img.tramp_count(),
+                        img.rewired_count()
+                    );
+                    LxpdAbsage::TransportNur
+                }
+                Err(fe) => LxpdAbsage::ContainerFehler(fe),
+            }
+        } else {
+            LxpdAbsage::KeinContainer
+        };
+        println!(
+            "lxpdimg : [{pid}]{name} ABGEWIESEN ({grund:?}, quelle=Laufzeit) -- keine Treiber-PD"
+        );
+        return None;
+    }
+    // Bindung: Vertrauen aus dem BOOT-Manifest, nicht aus mitgereichten Bytes.
+    if sha256(bild) != e.sha256 {
+        let grund = LxpdAbsage::HashAbweichung;
+        println!(
+            "lxpdimg : [{pid}]{name} ABGEWIESEN ({grund:?}, quelle=Laufzeit) -- Staging weicht vom Manifest-Hash ab"
+        );
+        return None;
+    }
+    let arg = boot_arg(pid as usize, 0);
+    match lxpddrv_laden(
+        &e,
+        bild,
+        caller_pd,
+        caller_endow,
+        heimatkern,
+        cap_budget,
+        dma_pages,
+        arg,
+    ) {
+        Ok((hpd, ep, ntfn, tid)) => {
+            set_driver_service(DriverService {
+                ep,
+                ntfn,
+                pd: hpd,
+                tid,
+                index: u32::MAX,
+                program_id: pid,
+            });
+            println!(
+                "lxpdimg : [{pid}]{name} gestartet (quelle=Laufzeit PD={hpd} Thread={:?}; Hash gebunden, Grants endowt)",
+                tid.to_raw()
+            );
+            Some(hpd)
+        }
+        Err(g) => {
+            println!(
+                "lxpdimg : [{pid}]{name} ABGEWIESEN ({g:?}, quelle=Laufzeit) -- keine Treiber-PD"
+            );
+            None
         }
     }
 }

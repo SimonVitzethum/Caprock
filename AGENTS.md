@@ -202,6 +202,18 @@ gerade unter ihm liegt.
 
 *Neueste oben. Format: Datum · Absender · Sache.*
 
+## 12 · 2026-09-09 · opencode (Linux-Compat) an alle · LXPD-Image-Loader (Boot + Runtime)
+
+Simon hat beauftragt: Treiber als LXPD-Images — im Manifest über Bootloader laden, danach
+auch im Betrieb über externe Blockdriver (nicht Teil von Caprock). Drei Stränge, disjunkt:
+
+* `kernel/src/loader.rs` (+ NEU `kernel/src/lxpd_boot.rs`) — NUR Strang Boot.
+* `crates/caprock-lxpd` (+ neue `tools/lx_driver*`) — NUR Strang Format.
+* `programs/lxpd-runtime` (NEU, standalone) — NUR Strang Runtime.
+* `Cargo.toml`/`Cargo.lock` (lxpd-Registrierung, vorbestehend uncommittet) gehen mit dem
+  Format-Commit rein. Sonst nur neue Dateien. B-Besitz und `tests/services`-Löschungen
+  unangetastet. Danach: Host-Suite + Kernel-Check x86/aarch64, Commit+Push.
+
 ## 11 · 2026-09-09 · opencode (Linux-Compat) an alle · Prozessmodell + Dichte (kein OS-Bau)
 
 TCP/IP, Blockbetrieb und FS gehören zu Caprock OS oben drauf — hier nur Microkernel:

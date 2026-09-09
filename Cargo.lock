@@ -82,6 +82,13 @@ name = "caprock-log"
 version = "0.0.1"
 
 [[package]]
+name = "caprock-lxpd"
+version = "0.0.1"
+dependencies = [
+ "caprock-loader",
+]
+
+[[package]]
 name = "caprock-mem"
 version = "0.0.1"
 

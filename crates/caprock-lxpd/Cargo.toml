@@ -1,0 +1,18 @@
+# LXPD-Transportprüfung (lxport-Abnahme): validiert LXPD-v1-Container +
+# ET_EXEC-Images + JSON-Manifeste. Kein `unsafe`, kein `alloc`, nur `&[u8]`-Sichten —
+# daher per Host-Test vollständig verifizierbar. Der privilegierte Teil (mappen/spawnen)
+# lebt im Kernel-Glue.
+[package]
+name = "caprock-lxpd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+caprock-loader = { path = "../caprock-loader" }
+
+# **Eingeschlossenheit ist die Eintrittskarte** (Z28) — s. `crates/caprock-loader/Cargo.toml`:
+# die Marke steht IM MANIFEST, damit Verschieben oder Umbenennen sie nicht vom Code trennt.
+[package.metadata.caprock]
+einschluss = "streng"

@@ -27,6 +27,7 @@ members = [
     "crates/caprock-dma",
     "crates/caprock-wait",
     "crates/caprock-log",
+    "crates/caprock-lxpd",
 ]
 
 [workspace.package]

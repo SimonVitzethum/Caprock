@@ -1,0 +1,25 @@
+[package]
+name = "lxpd-runtime"
+version = "0.0.0"
+edition = "2021"
+description = "Loader-Dienst-PD fuer den BETRIEB: laedt Treiber-LXPD-Images von Platte ueber einen externen Blockdriver, verifiziert und stoesst Instanziierung an (standalone, kein Workspace-Mitglied)"
+license = "AGPL-3.0-or-later"
+# Gleiche Lizenz wie das Programm `virtio-blk` (ebenfalls eine PD): Diese Crate linkt
+# `caprock-lxpd`/`caprock-loader`, die unter der Workspace-Lizenz (AGPL) stehen. Eine
+# permissive Lizenz waere hier ein falsches Versprechen — s. BETRIEB.md („Lizenz-Hinweis").
+
+# Standalone: diese leere Sektion loest die Crate vom Caprock-Workspace
+# (weder die Wurzel noch programs/ duerfen sie als Mitglied fuehren). Nachweis ueber einen
+# isolierten `cargo test` in einer /tmp-Kopie mit umgeschriebenen Manifesten — derselbe Weg,
+# den tools/host-tests.sh (`mit_deps`) fuer abhaengigkeitstragende Crates nimmt.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+caprock-part = { path = "../../crates/caprock-part" }
+caprock-lxpd = { path = "../../crates/caprock-lxpd" }
+# Produktions-Anstoss: `KernelAnstoss` ruft `libcaprock::load_image` (`SYS_LOAD_IMAGE = 36`).
+# Permissiv (MIT/Apache) wie `caprock-part` — kein Lizenzwechsel dieser AGPL-Crate dadurch.
+libcaprock = { path = "../libcaprock" }

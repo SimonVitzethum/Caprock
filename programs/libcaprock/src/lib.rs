@@ -7,6 +7,11 @@
 
 #![no_std]
 
+// Der Testharness braucht `std` — test-only, der PD-Bau sieht es nie (dasselbe Muster wie
+// `programs/lxpd-runtime`: `no_std` + `forbid` gibt es dort, hier nur `no_std`).
+#[cfg(test)]
+extern crate std;
+
 use core::arch::asm;
 
 /// Syscall-Nummern (Spiegel von `caprock_abi::sys`).
@@ -24,6 +29,18 @@ pub mod sys {
     pub const UNMAP: u64 = 11;
     pub const PDCTL: u64 = 12;
     pub const LOAD: u64 = 13;
+    /// **Geprüftes Treiber-Bild laden** (LXPD-Laufzeitpfad) — Spiegel von
+    /// `caprock_abi::sys::LOAD_IMAGE` (die EINZIGE Wahrheit steht dort).
+    ///
+    /// Wie [`LOAD`](Self::LOAD), aber das Bild kommt NICHT aus dem Boot-Archiv, sondern aus
+    /// einer Memory-Cap des Aufrufers. Belegung: `x1` = Loader-Cap-Index (WRITE, wie `LOAD`),
+    /// `MSG0` = Programm-ID aus dem Boot-Manifest, `MSG1` = Delegationsliste, `MSG2` = Anzahl,
+    /// `MSG3` = Ressourcenwunsch (wie `LOAD`), dazu `TAG`: Low-Byte = Slot der Memory-Cap mit
+    /// dem geprüften Bild, Bits 8..40 = exakte Bildlänge in Byte, Bits 40..64 = `0` (sonst
+    /// Absage — kein stilles Abschneiden). Manifest-Cap braucht es keine: Vertrauen kommt aus
+    /// dem Boot-Manifest (Hash-Gleichheit mit dem Eintrag dieser Programm-ID), nicht aus
+    /// mitgereichten Bytes. S. [`super::load_image`] + [`super::pack_tag`].
+    pub const LOAD_IMAGE: u64 = 36;
     pub const CDELETE: u64 = 14;
     pub const CCOPY: u64 = 15;
     pub const CMOVE: u64 = 16;
@@ -385,6 +402,64 @@ pub fn load(
     let extras = ((dma_pages as u64) << 16) | (cap_budget as u64);
     invoke(sys::LOAD, cap, [index, liste, delegates.len() as u64, extras], 0).result
 }
+
+/// **Das `TAG`-Wort von [`sys::LOAD_IMAGE`] packen** — rein, ohne Syscall.
+///
+/// Layout (Spiegel von `caprock_abi::sys::LOAD_IMAGE`): Low-Byte = Slot der Memory-Cap mit
+/// dem geprüften Bild, Bits 8..40 = exakte Bildlänge in Byte, Bits 40..64 = `0`.
+///
+/// `None` heisst „kein Tag": der Slot passt nicht in ein Byte, die Länge nicht in 32 Bit
+/// oder sie ist `0` (ein leeres Bild verifiziert nie — der Kernel wiese es ab, also wird es
+/// hier gar nicht erst gebaut). **Lieber Absage als Abschneiden**: Wer `bild_len >> 32`
+/// maskierte statt prüfte, lüde ein Präfix und hielte es für das Bild — dieselbe Sorte
+/// wie die DMA-Kürzung, gegen die [`load`] mit [`result::ERR_DMA_TOO_LARGE`] steht.
+///
+/// Die Rückgabe ist `Option` statt `u64`, weil ein reines `u64` die Absage nicht ausdrücken
+/// könnte — und eine Absage, die man nicht ausdrücken kann, wird still umgangen.
+pub fn pack_tag(bild_slot: u64, bild_len: u64) -> Option<u64> {
+    if bild_slot > 0xff {
+        return None;
+    }
+    if bild_len == 0 || bild_len >> 32 != 0 {
+        return None;
+    }
+    Some(bild_slot | (bild_len << 8))
+}
+
+/// **Geprüftes Treiber-Bild laden** (LXPD-Laufzeitpfad) — wie [`load`], aber die Bytes kommen
+/// aus einer Memory-Cap des Aufrufers statt aus dem Boot-Archiv.
+///
+/// `loader_slot` = Loader-Cap-Index (WRITE, wie [`load`]), `bild_slot`/`bild_len` = Slot und
+/// exakte Länge der Memory-Cap mit dem geprüften Bild (ins [`TAG`](sys::LOAD_IMAGE) gepackt
+/// per [`pack_tag`]), `pid` = Programm-ID aus dem Boot-Manifest, `liste`/`anzahl` = gepackte
+/// Delegationsliste + Zahl der gültigen Paare (die Packung steckt in `liste`, wie bei
+/// [`load`]), `extras` = Ressourcenwunsch (die Belegung steckt in `load_extras`, wie bei
+/// [`load`]).
+///
+/// Client-seitig fail-closed wie [`load`]: passt der Slot/die Länge nicht ins Tag, ist die
+/// Länge `0` oder nennt `anzahl` mehr als [`LOAD_MAX_DELEGATES`] Paare, kommt
+/// [`result::ERR_BADCAP`] zurück, **ohne dass ein Syscall gebaut wird** — eine Absage, kein
+/// gekürzter Anstoss. Sonst das volle [`Ret`]: `result` ist der Ergebniscode, `badge` die
+/// neue PD-Id bei `OK` (der Kernel legt sie in `x1` ab, wie bei [`sys::LOAD`]).
+pub fn load_image(
+    loader_slot: u64,
+    bild_slot: u64,
+    bild_len: u64,
+    pid: u64,
+    liste: u64,
+    anzahl: u64,
+    extras: u64,
+) -> Ret {
+    let absage = Ret { result: result::ERR_BADCAP, badge: 0, msg: [0; 4], tag: 0 };
+    if anzahl > LOAD_MAX_DELEGATES as u64 {
+        return absage;
+    }
+    let tag = match pack_tag(bild_slot, bild_len) {
+        Some(t) => t,
+        None => return absage,
+    };
+    invoke(sys::LOAD_IMAGE, loader_slot, [pid, liste, anzahl, extras], tag)
+}
 /// **Obergrenze des DMA-Pools einer Geraetezuteilung, in Seiten** — Spiegel von
 /// `caprock_abi::DRIVER_DMA_MAX_PAGES`. 1024 Seiten = 4 MiB. Darueber weist [`load`] mit
 /// [`result::ERR_DMA_TOO_LARGE`] ab, statt zu kuerzen.
@@ -685,9 +760,70 @@ macro_rules! entry {
     };
 }
 
+// Nur auf freistehenden Zielen (PD-Bau, `programs/*-caprock-user.json` ohne `os`-Feld —
+// Default `none`): Dort gibt es kein `std` und damit keinen Panik-Handler. Auf dem Host
+// (Host-Tests, `target_os = linux`) linkt der Testharness `std` mit eigenem Handler — ein
+// zweiter hier wäre E0152, auch wenn diese Crate nur Dependenz ist (dann gilt `cfg(test)`
+// nämlich nicht für sie). Der Handler parkt; der Kernel beobachtet das Ausbleiben.
+#[cfg(target_os = "none")]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     // Kein Heap/Konsole im EL0-Programm verfügbar -> still parken; der Kernel beobachtet, dass
     // kein erwartetes Signal kam (bzw. ein Fault terminiert den Thread regulär).
     park()
+}
+
+// --- Host-Tests ---------------------------------------------------------------------------
+//
+// `asm!` kompiliert auf dem Host (x86_64-Host trifft den `int 0x80`-Zweig), läuft aber nie:
+// Diese Tests prüfen NUR die reine [`pack_tag`]-Funktion und den [`sys::LOAD_IMAGE`]-Spiegel,
+// nie den Syscall. Wer hier `invoke`/`load_image` riefe, führte auf dem Host `int 0x80` mit
+// Kernel-ABI-Registern aus — das ist kein Test, sondern ein Absturz mit Ansage.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_image_spiegel_hat_die_abi_nummer() {
+        // EINZIGE Wahrheit: `caprock_abi::sys::LOAD_IMAGE`. Läuft der Spiegel auseinander,
+        // stellte jeder Anstoss einen fremden Syscall — sichtbar erst im Kernel-Log.
+        assert_eq!(sys::LOAD_IMAGE, 36);
+    }
+
+    #[test]
+    fn pack_rundweg() {
+        // Slot ins Low-Byte, Länge in Bits 8..40, Bits 40..64 null — und zurück.
+        let tag = pack_tag(5, 96).expect("passt");
+        assert_eq!(tag, 5 | (96 << 8));
+        assert_eq!(tag & 0xff, 5, "Low-Byte = Bild-Slot");
+        assert_eq!((tag >> 8) & 0xffff_ffff, 96, "Bits 8..40 = exakte Bildlänge");
+        assert_eq!(tag >> 40, 0, "Bits 40..64 = 0");
+        // Ränder: Slot 0xFF und volle 32-Bit-Länge packen noch.
+        let voll = pack_tag(0xff, 0xffff_ffff).expect("Rand passt");
+        assert_eq!(voll & 0xff, 0xff);
+        assert_eq!((voll >> 8) & 0xffff_ffff, 0xffff_ffff);
+        assert_eq!(voll >> 40, 0);
+    }
+
+    #[test]
+    fn pack_slot_ueber_ein_byte_ist_absage() {
+        // Slot 256 bräuchte ein neuntes Bit — maskieren hieße Slot 0 laden statt Slot 256.
+        assert_eq!(pack_tag(0x100, 96), None);
+        assert_eq!(pack_tag(u64::MAX, 96), None);
+    }
+
+    #[test]
+    fn pack_high_bits_sind_absage_kein_abschnitt() {
+        // Bit 32+ fiele aus Bits 8..40 heraus — abschneiden lüde ein Präfix und hielte es
+        // für das Bild. Lieber Absage (`None`) als ein gekürzter Anstoss.
+        assert_eq!(pack_tag(5, 1 << 32), None);
+        assert_eq!(pack_tag(5, u64::MAX), None);
+    }
+
+    #[test]
+    fn pack_len_null_ist_absage() {
+        // Ein leeres Bild verifiziert nie — der Kernel wiese es ab, also wird das Tag gar
+        // nicht erst gebaut (fail-closed client-seitig, wie `load` bei zu vielen Delegaten).
+        assert_eq!(pack_tag(5, 0), None);
+    }
 }

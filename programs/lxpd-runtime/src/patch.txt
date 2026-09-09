@@ -1,0 +1,29 @@
+UMGESETZT am 2026-09-09: abi LOAD_IMAGE=36, Kernel-Glue im Parallelstrang
+==============================================================================
+Der Patch ist vergeben — was hier steht, ist kein Vorschlag mehr, sondern der Stand, gegen
+den der Vertrags-Test laeuft (`vertrag_load_image_36_und_tag_belegung`): EINZIGE Wahrheit
+ist `caprock_abi::sys::LOAD_IMAGE`; der Spiegel steht in `programs/libcaprock` (`sys::
+LOAD_IMAGE`, `load_image`, `pack_tag`); Dispatch (`caprock-microkit`) und Glue (`kernel/
+src/loader.rs`: `load_verified_image`) baut der Parallelstrang.
+
+Register-Tabelle `SYS_LOAD_IMAGE = 36` (wie `SYS_LOAD = 13`, aber das Bild aus einer
+Memory-Cap des Aufrufers statt aus dem Boot-Archiv):
+
+```text
+x1   = Loader-Cap-Index (WRITE, gegatet wie SYS_LOAD)
+TAG  = Low-Byte: Slot der Memory-Cap mit dem geprueften Bild
+       Bits 8..40: exakte Bildlaenge in Byte (gegen die geladene Laenge geprueft —
+       kuerzer heisst abgebrochen, laenger heisst Anhaengsel, beides abgewiesen)
+       Bits 40..64: muessen 0 sein (sonst Absage — kein stilles Abschneiden)
+MSG0 = Programm-ID aus dem Boot-Manifest (daran bindet das Vertrauen: Hash-Gleichheit
+       mit dem Eintrag dieser Programm-ID — kein Manifest-Cap noetig)
+MSG1 = Delegationsliste (gepackt wie bei SYS_LOAD)
+MSG2 = Anzahl der gueltigen Paare
+MSG3 = Ressourcenwunsch (load_extras-Belegung wie bei SYS_LOAD)
+Rueckgabe wie SYS_LOAD: x0 = result, x1 = neue PD-Id bei OK
+```
+
+Vertrauen: Die PD-Pruefung (Hash + Container + Signatur, s. BETRIEB.md) ist die erste, nicht
+die einzige — der Kernel rechnet NACH (niemals der PD glauben). Der Kernel kopiert die Bytes
+EINMAL in Staging und prueft danach nur noch die Kopie (kein TOCTOU zwischen Hash und Laden).
+Schranke `LXPD_MAX_BILD` (4 MiB) gilt vor jeder Kopie.

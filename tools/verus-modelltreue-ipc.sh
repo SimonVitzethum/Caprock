@@ -599,6 +599,7 @@ mod caprock_sched {
         fn switch_to(&mut self, core: usize, frame: usize, target: ThreadId) -> usize;
         fn unblock(&mut self, tid: ThreadId);
         fn end_donation(&mut self, core: usize);
+        fn wartet_auf_ipc(&mut self, tid: ThreadId) -> bool;
     }
 
     pub static HEIMATKERN: Mutex<Vec<(u64, usize)>> = Mutex::new(Vec::new());
@@ -722,6 +723,12 @@ mod treue {
             self.geweckt.push(tid.to_raw());
         }
         fn end_donation(&mut self, _core: usize) {}
+        /// A2-Rest, zweite Partei: „wartet noch" heisst hier „lebt noch" — die Welt kennt
+        /// keinen Frist-Timer, also kann kein Aufrufer per Frist verschwinden; wer tot ist,
+        /// wartet nicht mehr. Damit verhaelt sich der REPLY-Pfad wie vor der Aenderung.
+        fn wartet_auf_ipc(&mut self, tid: ThreadId) -> bool {
+            !self.tot.contains(&tid.to_raw())
+        }
     }
 
     impl Welt {
@@ -1979,10 +1986,19 @@ Wurzel aller vier Faelle"
                                  "if let Some(caller) = self.caller {", 1)'
     erwarte kracht "Code: REPLY konsumiert das Token nicht mehr (Doppel-Reply moeglich)"
 
-    mutieren code 's = s.replace("""            ops.unblock(caller);
-        }
-        frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);""", """        }
-        frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);""", 1)'
+    # Anker seit A2-Rest (CALL_TIMEOUT): das REPLY prueft vorher `wartet_auf_ipc` und
+    # weckt in ZWEI Armen (mit/ohne Frame) — die Mutation nimmt BEIDE Weckrufe heraus.
+    mutieren code 's = s.replace("""            } else if let Some(cframe) = ops.frame_of(caller) {
+                transfer(frame, cframe);
+                frame_set_reg(cframe, reg::SYSNO_RESULT, result::OK);
+                ops.unblock(caller);
+            } else {
+                ops.unblock(caller);
+            }""", """            } else if let Some(cframe) = ops.frame_of(caller) {
+                transfer(frame, cframe);
+                frame_set_reg(cframe, reg::SYSNO_RESULT, result::OK);
+            } else {
+            }""", 1)'
     erwarte kracht "Code: REPLY weckt den wartenden Aufrufer nicht mehr (Wirkung faellt weg)"
 
     mutieren code 's = s.replace("""            self.caller = Some(sender);

@@ -48,6 +48,12 @@
 mod cycles;
 pub use cycles::{CycleStats, Reject, Sample, Source, Stamp, MAX_PLAUSIBLE_SLICE};
 
+/// **Die Frist-Entscheidung als reine Funktion** (A2-Rest). Abhaengigkeitsfrei und als Datei
+/// host-geprueft -- dieselbe Begruendung wie bei [`cycles`]: die Fallen sind Entscheidungen
+/// (zu frueh, nie, Signal-gegen-Timer, siebzehnter Thread), mit Literalen ausloesbar, ohne
+/// Maschine. Die Schleife bleibt hier, die Entscheidung liegt dort.
+mod fristen;
+
 /// **Umgeleitete Syscalls** (Z26/A3). Abhängigkeitsfrei und **als Datei** host-getestet — dieselbe
 /// Begründung wie bei [`cycles`]: die Fallen sind Reihenfolgen und Zahlenbereiche, mit Literalen
 /// auslösbar, ohne Maschine.
@@ -683,6 +689,16 @@ pub struct Scheduler {
     /// Anzahl aktuell **erschöpfter** MCS-Konten. Ist sie 0, entfällt der Refill-Scan
     /// vollständig — der Normalfall (kein Budget) kostet damit nichts je Tick.
     depleted_count: usize,
+    /// **Wie viele faellige Fristen wegen voller Ausgabe auf den naechsten Tick verschoben
+    /// wurden** (A2-Rest, Stufe A).
+    ///
+    /// Der behobene `FRISTEN_JE_TICK`-Fehler war ein *verlorener* siebzehnter Thread; die
+    /// Behebung macht ihn zu einem *verzoegerten*. Ohne diese Zahl waere das ein Satz im
+    /// Kommentar -- mit ihr ist es eine Messgroesse: bleibt sie auf einem ruhigen System
+    /// dauerhaft Null, war der Deckel nie erreicht; waechst sie, wurde verzoegert, und zwar
+    /// genau so oft. Benannter Ueberlauf statt Stille, und die Stelle, an der die
+    /// Kernel-Telemetrie kuenftig abliest.
+    fristen_ueberlauf: u64,
     /// **Die frueheste bewaffnete Frist** (`u64::MAX` = keine).
     ///
     /// Nicht ein Zaehler, sondern ein **Minimum** -- und der Unterschied ist D10. Ein Zaehler
@@ -759,6 +775,7 @@ impl Scheduler {
             cyc_core: CycleStats::EMPTY,
             used: 0,
             depleted_count: 0,
+            fristen_ueberlauf: 0,
             naechste_frist: u64::MAX,
             budget_blocked_count: 0,
             migrations_out: 0,
@@ -1251,36 +1268,58 @@ impl Scheduler {
             if !self.tcbs[i].used || f == 0 {
                 continue;
             }
-            if f > self.now {
-                if f < naechste {
-                    naechste = f;
+            // **Die Entscheidung steht in `fristen::frist_befund`** (A2-Rest, host-geprueft als
+            // Datei): Zukunft vor Deckel vor Rennen. Die Wirkung bleibt HIER -- der
+            // Modell-Treue-Waechter sieht nur diese Datei, und die Gegenproben mutieren genau
+            // diese Zeilen. Eine Entscheidung, die man nicht anfassen kann, ohne dass ein
+            // Pruefer hinsieht, ist keine.
+            match fristen::frist_befund(
+                self.now,
+                f,
+                self.tcbs[i].reasons.enthaelt(self.tcbs[i].frist_grund),
+                n == out.len(),
+            ) {
+                fristen::FristBefund::Zukunft => {
+                    if f < naechste {
+                        naechste = f;
+                    }
+                    continue;
                 }
-                continue;
-            }
-            // **Der Deckel greift VOR der Wirkung, nicht danach.** Stand er hinter dem
-            // `remove`, waere der Grund entfernt, der Thread aber weder eingereiht noch
-            // berichtet -- er liefe nie wieder, und der Aufrufer schriebe ihm keinen Code.
-            // Das waere ein **verlorener** Thread und keine Verzoegerung; die Zusage lautet
-            // aber Verzoegerung. Hier bleibt `frist` stehen, `naechste` zieht den Wert mit,
-            // und der naechste Tick nimmt ihn erneut auf.
-            if n == out.len() {
-                if f < naechste {
-                    naechste = f;
+                // **Der Deckel greift VOR der Wirkung, nicht danach.** Stand er hinter dem
+                // `remove`, waere der Grund entfernt, der Thread aber weder eingereiht noch
+                // berichtet -- er liefe nie wieder, und der Aufrufer schriebe ihm keinen Code.
+                // Das waere ein **verlorener** Thread und keine Verzoegerung; die Zusage lautet
+                // aber Verzoegerung. Hier bleibt `frist` stehen, `naechste` zieht den Wert mit,
+                // und der naechste Tick nimmt ihn erneut auf -- und der Aufschub wird GEZAEHLT
+                // (`fristen_ueberlauf`), statt still zu geschehen.
+                fristen::FristBefund::Aufschieben => {
+                    if f < naechste {
+                        naechste = f;
+                    }
+                    self.fristen_ueberlauf += 1;
+                    continue;
                 }
-                continue;
+                // **Das Rennen, und seine Aufloesung steht hier ausgeschrieben: das SIGNAL gewinnt.**
+                //
+                // Ist der bewachte Grund schon weg, war der Thread bereits geweckt -- die Frist gehoert
+                // zu einem Warten, das vorbei ist. Sie wird entwaffnet und **nichts** geschrieben.
+                //
+                // Das ist die teure Haelfte der Entscheidung: ein Treiber, der `ERR_TIMEOUT` als
+                // „Geraet tot" liest und zuruecksetzt, waehrend die Antwort gerade zugestellt wurde,
+                // ist ein **Korruptionspfad** und kein Haenger. Deshalb bekommt nur ein Thread den
+                // Code, den die Frist WIRKLICH freigegeben hat.
+                fristen::FristBefund::SignalGewann => {
+                    self.tcbs[i].frist = 0;
+                    self.tcbs[i].frist_grund = 0;
+                    continue;
+                }
+                fristen::FristBefund::Freigeben => {}
             }
             let grund = self.tcbs[i].frist_grund;
             self.tcbs[i].frist = 0;
             self.tcbs[i].frist_grund = 0;
-            // **Das Rennen, und seine Aufloesung steht hier ausgeschrieben: das SIGNAL gewinnt.**
-            //
-            // Ist der bewachte Grund schon weg, war der Thread bereits geweckt -- die Frist gehoert
-            // zu einem Warten, das vorbei ist. Sie wird entwaffnet und **nichts** geschrieben.
-            //
-            // Das ist die teure Haelfte der Entscheidung: ein Treiber, der `ERR_TIMEOUT` als
-            // „Geraet tot" liest und zuruecksetzt, waehrend die Antwort gerade zugestellt wurde,
-            // ist ein **Korruptionspfad** und kein Haenger. Deshalb bekommt nur ein Thread den
-            // Code, den die Frist WIRKLICH freigegeben hat.
+            // Die Vorpruefung stand im Befund darueber; diese Zeile bleibt als die textuelle
+            // Renn-Aufloesung -- ein `remove` ohne sie waere ein Wecker ohne benannten Gewinner.
             if !self.tcbs[i].reasons.enthaelt(grund) {
                 continue;
             }
@@ -1313,6 +1352,28 @@ impl Scheduler {
     /// Steht ueberhaupt eine Frist? (Bericht/Sonde)
     pub fn frist_von(&self, tid: ThreadId) -> u64 {
         self.resolve(tid).map_or(0, |t| self.tcbs[t].frist)
+    }
+
+    /// **Wie viele faellige Fristen bisher auf einen spaeteren Tick verschoben wurden**
+    /// (A2-Rest, Stufe A).
+    ///
+    /// Kumulativ seit Anbeginn, kein Fenster: der Ueberlauf von `FRISTEN_JE_TICK` ist
+    /// Verzoegerung, und diese Zahl ist ihr Beleg. Auf einem ruhigen System bleibt sie Null --
+    /// und genau das ist dann eine Aussage, keine Annahme.
+    pub fn fristen_ueberlauf(&self) -> u64 {
+        self.fristen_ueberlauf
+    }
+
+    /// **Wartet dieser Thread noch aus dem IPC-Grund?** (A2-Rest, Stufe A2/CALL).
+    ///
+    /// Der Haken, an dem die Antwortpflicht eines `CALL` haengt: feuert die Frist des Aufrufers,
+    /// waehrend der Server antwortet, darf das spaetere `REPLY` nicht in einen Frame schreiben,
+    /// dessen Thread nicht mehr wartet. Der Wecker (`fristen_faellig`) entfernt den Grund, der
+    /// Dispatch meldet den Thread beim Objekt ab -- und wer ANTWORTET, prueft vorher hier, statt
+    /// zu raten. Reine Lesefrage, kein Eingriff: `false` heisst „nicht mehr dein Aufrufer".
+    pub fn wartet_auf_ipc(&self, tid: ThreadId) -> bool {
+        self.resolve(tid)
+            .is_some_and(|s| self.tcbs[s].reasons.has(BlockReasons::IPC))
     }
 
     pub fn park_current(&mut self, core: usize, frame: usize) -> Option<usize> {
@@ -2558,6 +2619,18 @@ pub trait SchedOps {
     /// Klasse, gegen die `iova_window_clear_of_msi` steht.
     /// **Eine Frist fuer den laufenden Thread scharfstellen** (A2) -- `ticks == 0` entwaffnet.
     fn frist_setzen(&mut self, core: usize, ticks: u64, grund: u16);
+    /// **Wartet dieser Thread noch aus dem IPC-Grund?** (A2-Rest, Stufe A2/CALL).
+    ///
+    /// Der Haken fuer die Antwortpflicht: ein `REPLY` an einen Aufrufer, dessen Frist bereits
+    /// gefeuert hat, darf nicht in dessen Frame schreiben. Die Vorgabe ist `true` („wartet") --
+    /// also das heutige Verhalten: der Kernel verdrahtet die echte Frage
+    /// ([`Scheduler::wartet_auf_ipc`]) erst mit dem `CALL_TIMEOUT`-Dispatch, und bis dahin
+    /// aendert sich kein Pfad. Eine Vorgabe `false` wuerde jede Antwort verwerfen -- die
+    /// fail-offene Richtung, und genau die falsche.
+    fn wartet_auf_ipc(&mut self, tid: ThreadId) -> bool {
+        let _ = tid;
+        true
+    }
     fn clock_hz(&mut self) -> u64;
     /// Der aktuelle Stand derselben Uhr.
     fn clock_now(&mut self) -> u64;

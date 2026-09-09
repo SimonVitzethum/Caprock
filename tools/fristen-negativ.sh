@@ -12,8 +12,18 @@
 # 2026-08-28 einen dritten Gang, in dem der Kernel den Wartenden **pausiert**, waehrend er wartet.
 #
 # **Nicht abgedeckt, und das steht hier, damit es niemand fuer abgedeckt haelt:** der Ueberlauf
-# von `FRISTEN_JE_TICK` (16). Ihn zu treffen braucht siebzehn Threads mit Fristen im selben Tick;
-# die Sonde hat einen. Der Fehler, den er hatte, ist gelesen und behoben, nicht gefahren.
+# von `FRISTEN_JE_TICK` (16) im LAUF -- ihn zu treffen braucht siebzehn Threads mit Fristen im
+# selben Tick; die Sonde hat einen. Der Fehler darin (Grund entfernt, Thread weder eingereiht
+# noch berichtet -- also *verloren* statt *verzoegert*) ist behoben; was ihn bewacht, ist (a) die
+# Regel als Host-Test (`crates/caprock-sched/src/fristen.rs`: der Siebzehnte wird aufgeschoben,
+# nicht verloren, und der Aufschub traegt die Frist weiter) und (b) der Zaehler
+# `Scheduler::fristen_ueberlauf` (benannter Ueberlauf statt Stille). Was FEHLT, ist der Lauf mit
+# siebzehn Threads -- M1/M2/M4 fahren die Schleife weiter mit einem.
+#
+# **A2-Rest/CALL, Stand:** `CALL_TIMEOUT` (ABI 30) ist gelandet (M5 unten zaehlt drei
+# Stellen). Noch offen: CALL-Faelle nach dem Muster von M3 (Frist auf 1 Tick kuerzen) --
+# mit der zweiten Partei als eigenem Konjunkt (kein Reply-Recht am nicht-mehr-wartenden
+# Thread).
 if [ -z "${BASH_VERSION:-}" ]; then echo "FEHLER: braucht bash, nicht sh/dash." >&2; exit 2; fi
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -21,7 +31,7 @@ ROOT="$(pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/fristneg.XXXXXX")"
 fail=0
 
-DATEIEN=( "crates/caprock-sched/src/lib.rs" "crates/caprock-microkit/src/lib.rs" )
+DATEIEN=( "crates/caprock-sched/src/lib.rs" "crates/caprock-sched/src/fristen.rs" "crates/caprock-microkit/src/lib.rs" )
 for f in "${DATEIEN[@]}"; do mkdir -p "$TMP/$(dirname "$f")"; cp "$f" "$TMP/$f"; done
 restore() { for f in "${DATEIEN[@]}"; do cp "$TMP/$f" "$ROOT/$f"; done; }
 trap 'restore; rm -rf "$TMP"' EXIT
@@ -107,9 +117,14 @@ restore
 # **Nicht isolierend, und das ist kausal, nicht schlampig:** wer nie geweckt wird, erreicht den
 # zweiten Gang nicht. Die Zeile darf hier also mehr als ein Konjunkt verlieren; gepruft wird, dass
 # die Nachbarn AUSSERHALB von A2 stehen bleiben -- sonst maesse die Mutation die halbe Sonde.
+#
+# **A2-Rest:** die Entscheidung steht seitdem in `crates/caprock-sched/src/fristen.rs` als reine
+# Funktion (`frist_befund`) -- dieselbe Mutation („nie faellig") dort, nicht mehr in der
+# Schleife. Was sie dort trifft, ist die Regel selbst; was die Schleife damit macht (Minimum,
+# Deckel, Melden), bleibt Sache von M1/M4.
 echo "-- M2: eine faellige Frist gilt als zukuenftig --"
-if mutiere crates/caprock-sched/src/lib.rs \
-   's|^            if f > self.now {$|            if true {|' M2 1; then
+if mutiere crates/caprock-sched/src/fristen.rs \
+   's|^    if frist > jetzt {$|    if true {|' M2 1; then
     lauf "$TMP/m2.log"
     rot   M2 "$TMP/m2.log" "frist-weckt"
     gruen M2 "$TMP/m2.log" "rate-plausibel"
@@ -164,6 +179,22 @@ else
     echo "  FAIL: M4 -- Mutation nicht anwendbar"; fail=1
 fi
 restore
+
+# --- M5 (statisch): CALL_TIMEOUT-Dispatch steht — CALL-Faelle als naechste Stufe --------
+#
+# `CALL_TIMEOUT` (ABI 30) ist gelandet: dritte `frist_setzen`-Stelle im Dispatch, dazu die
+# Reply-Invalidierung der zweiten Partei (`wartet_auf_ipc`). Was hier steht: die Stellen sind
+# benannt und gezaehlt. Faellt die Zahl unter 3, ist ein Frist-Arm verloren gegangen.
+# Noch offen (M3-Analogon): QEMU-Negativfaelle fuer CALL — Frist auf 1 Tick plus das eigene
+# Konjunkt der zweiten Partei (kein Reply-Recht am nicht-mehr-wartenden Thread).
+echo "-- M5 (statisch): drei Frist-Arme im Dispatch --"
+n_frist_dispatch="$(grep -c "ops\.frist_setzen(" crates/caprock-microkit/src/lib.rs)"
+if [ "$n_frist_dispatch" != "3" ]; then
+    echo "  FAIL: M5 -- $n_frist_dispatch frist_setzen-Stellen im Dispatch, erwartet 3 (WAIT, PARK_TIMEOUT, CALL_TIMEOUT)."
+    fail=1
+else
+    echo "  PASS: M5 -- 3 Stellen (WAIT, PARK_TIMEOUT, CALL_TIMEOUT)"
+fi
 
 echo
 if [ "$fail" = 0 ]; then

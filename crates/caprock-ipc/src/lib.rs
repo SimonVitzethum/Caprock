@@ -873,11 +873,18 @@ impl Endpoint {
         // REPLY findet `None` -> No-Op (kein Doppel-Reply).
         self.reply_owner = None;
         if let Some(caller) = self.caller.take() {
-            if let Some(cframe) = ops.frame_of(caller) {
+            // A2-Rest, zweite Partei: wartet der Aufrufer nicht mehr (Frist gefeuert, Timer
+            // hat ERR_TIMEOUT geschrieben bzw. schreibt es), wird NICHT in seinen Frame
+            // geschrieben und NICHT geweckt -- Form wie ERR_EP_FULL: benannter Ausgang ohne
+            // Zustandsaenderung. Sperrordnung EPS<SCHEDS erlaubt die Frage hier.
+            if !ops.wartet_auf_ipc(caller) {
+            } else if let Some(cframe) = ops.frame_of(caller) {
                 transfer(frame, cframe);
                 frame_set_reg(cframe, reg::SYSNO_RESULT, result::OK);
+                ops.unblock(caller);
+            } else {
+                ops.unblock(caller);
             }
-            ops.unblock(caller);
         }
         frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
         frame

@@ -533,6 +533,418 @@ impl ClientSeite {
     }
 }
 
+/// CSUB-Grant-Schicht: aus dem Schein wird eine Cap, wo es geht — Host-Modell.
+///
+/// Der Server hält seine Arena als Memory-Cap ([`ARENA_CAP_SLOT`]); pro Grant leitet er per
+/// `CSUB` einen Teilbereich ab (Syscall 37: `x1` = Quell-Slot, `MSG0` = Ziel-Slot,
+/// `MSG1` = Offset, `MSG2` = Länge). Das Handle bleibt der Schlüssel (Format aus `super`:
+/// `(Gen << 32) | Slot`), daneben führt [`CsubVerleiher`] pro Handle die Cap (Ziel-Slot,
+/// Fenster, Rechte-Schnitt). Auf dem Host läuft statt des Kernels ein [`CsubBackend`] (Tests:
+/// `FakeCsub`) mit derselben Absagen-Semantik wie `CapSpace::subregion`/`teilfenster_rechnen`
+/// (`caprock-cap`): Überlauf, Leerfenster und Ausschnitt-jenseits heissen `Subregion`, nie Stutzen.
+///
+/// Zahlen-Spiegel (mem-server ist standalone ohne ABI-Dep — EINZIGE Wahrheit:
+/// `caprock_abi::sys::CSUB` = 37, `result::ERR_BADCAP` = 1, `ERR_NOSPACE` = 7,
+/// `ERR_SUBREGION` = 21): die ABI-Kodes 1/7 kollidierten auf dem Server-Draht mit
+/// [`fehler_kode`] (1 = `LeereAnfrage`, 7 = `ZweckAbgelehnt`), deshalb trägt der Draht eigene
+/// Kodes ([`KODE_CSUB_BADCAP`] ff.) — die Abbildung steht bei [`csub_fehler_kode`].
+///
+/// Beschluss pro Pfad (je ein Satz):
+/// - ANFORDERN: CSUB greift — [`CsubVerleiher::ableiten_fuer_grant`] ruft `csub` mit Offset/Länge aus der Anfrage und dem Rechte-Schnitt auf.
+/// - AUFLOESEN: CSUB greift — [`CsubVerleiher::cap_zu_grant`] gibt echte Cap-Daten (Ziel-Slot plus Fenster) statt Schatten-Arithmetik.
+/// - ABBILDEN/AUSBLENDEN: Schein bleibt — beide melden nur das `abgebildet`-Flag, kein Kernel-Objekt ändert sich, also gibt es nichts abzuleiten oder einzuziehen.
+/// - FREIGEBEN: CSUB greift — [`CsubVerleiher::freigeben_mit_revoke`] zieht die Teil-Cap per `revoke` ein, erst danach ist die Region wiedervergebbar.
+/// - ENTZUG: CSUB greift — [`CsubVerleiher::entzug_mit_revoke`] zieht die Cap ein, ohne die Region freizugeben (reserviert bis zur Rückgabe).
+/// - Fehler: `UnbekannterSchein`/`FremderSchein` prüft der Server zuerst und bleiben; CSUB-Absagen werden als eigene Draht-Kodes durchgereicht.
+pub const ARENA_CAP_SLOT: u64 = 1;
+
+/// ABI-Spiegel: kein Cap / keine Memory-Cap / Ziel belegt (s. Schicht-Doku zur Kode-Lage).
+pub const CSUB_ABI_BADCAP: u64 = 1;
+/// ABI-Spiegel: Ziel belegt/ausserhalb, Budget, Tabelle.
+pub const CSUB_ABI_NOSPACE: u64 = 7;
+/// ABI-Spiegel: Fenster ausserhalb der Cap (Nr. 21, seit K1b).
+pub const CSUB_ABI_SUBREGION: u64 = 21;
+
+/// Draht-Kode für durchgereichte CSUB-`BADCAP` (kollisionsfrei zu [`fehler_kode`] 1–13).
+pub const KODE_CSUB_BADCAP: u64 = 20;
+/// Draht-Kode für durchgereichte CSUB-`NOSPACE`.
+pub const KODE_CSUB_NOSPACE: u64 = 21;
+/// Draht-Kode für durchgereichte CSUB-`SUBREGION`.
+pub const KODE_CSUB_SUBREGION: u64 = 22;
+
+/// Rechte-Maske der Ableitung (1 = R, 2 = W, 4 = X — wie `ccopy` in libcaprock).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CsubRechte(pub u64);
+
+impl CsubRechte {
+    /// Lesbar.
+    pub const R: CsubRechte = CsubRechte(1);
+    /// Schreibbar.
+    pub const W: CsubRechte = CsubRechte(2);
+    /// Ausführbar.
+    pub const X: CsubRechte = CsubRechte(4);
+    /// Lesbar + schreibbar.
+    pub const RW: CsubRechte = CsubRechte(3);
+    /// Voll.
+    pub const RWX: CsubRechte = CsubRechte(7);
+    /// Schnitt mit der Quelle — keine Eskalation, wie `CapSpace::subregion` (dort
+    /// `rights.intersect`, hier dieselbe UND-Rechnung über eingespeiste Werte).
+    pub fn schnitt(self, wunsch: CsubRechte) -> CsubRechte {
+        CsubRechte(self.0 & wunsch.0)
+    }
+    /// Enthält das Recht (Schnitt-Kontrolle im Test).
+    pub fn enthaelt(self, recht: CsubRechte) -> bool {
+        self.0 & recht.0 == recht.0
+    }
+}
+
+/// Was die Server-Arena an Rechten hergibt: lesbar + schreibbar, nie ausführbar — Speicher,
+/// kein Code, also gibt es kein X zu vererben, egal was der Client wünscht.
+pub const QUELLE_RECHTE: CsubRechte = CsubRechte::RW;
+
+/// Die CSUB-Absage — dieselben drei Ausgänge wie der Kernel-Zweig (s. Schicht-Doku).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CsubFehler {
+    /// Kein Cap / keine Memory-Cap / Null-Länge (Client-Gatter wie `libcaprock::csub`).
+    BadCap,
+    /// Ziel-Slot belegt/ausserhalb, Budget, Tabelle.
+    NoSpace,
+    /// Fenster ausserhalb der Cap (Überlauf, leer, jenseits — nie gestutzt).
+    Subregion,
+}
+
+/// CSUB-Absage auf den Draht (Durchreiche, s. Schicht-Doku zur Kode-Lage).
+pub fn csub_fehler_kode(f: CsubFehler) -> u64 {
+    match f {
+        CsubFehler::BadCap => KODE_CSUB_BADCAP,
+        CsubFehler::NoSpace => KODE_CSUB_NOSPACE,
+        CsubFehler::Subregion => KODE_CSUB_SUBREGION,
+    }
+}
+
+/// Kode zurück — `None` heisst: diesen Kode vergibt die CSUB-Schicht nie.
+pub fn csub_fehler_aus_kode(k: u64) -> Option<CsubFehler> {
+    match k {
+        KODE_CSUB_BADCAP => Some(CsubFehler::BadCap),
+        KODE_CSUB_NOSPACE => Some(CsubFehler::NoSpace),
+        KODE_CSUB_SUBREGION => Some(CsubFehler::Subregion),
+        _ => None,
+    }
+}
+
+/// Eine abgeleitete Teil-Cap: Ziel-Slot plus Fenster plus verengte Rechte.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CsubCap {
+    /// Ziel-Slot im Cspace der Server-PD (`MSG0` des `csub`-Aufrufs).
+    pub ziel_slot: u64,
+    /// Offset in der Arena (aus der Anfrage, seitausgerichtet).
+    pub offset: u64,
+    /// Länge in Byte (aus der Anfrage, seitausgerichtet).
+    pub len: u64,
+    /// Verengte Rechte (Schnitt aus Quelle und Wunsch).
+    pub rechte: CsubRechte,
+}
+
+/// Der Kernel-Anteil der Schicht als Trait: ableiten (`csub`), einziehen (`revoke`), leben
+/// (`cap_ist_live`). Der Gast ruft `libcaprock::csub`/`revoke`, der Host-Test `FakeCsub` —
+/// beide mit derselben Absagen-Semantik, sonst wäre der Test keiner.
+pub trait CsubBackend {
+    /// Teilbereich aus `quell_slot` nach `ziel_slot` ableiten (Offset/Länge aus der Anfrage).
+    fn ableiten(
+        &mut self,
+        quell_slot: u64,
+        ziel_slot: u64,
+        offset: u64,
+        len: u64,
+        rechte: CsubRechte,
+    ) -> Result<CsubCap, CsubFehler>;
+    /// Teil-Cap einziehen (`revoke` an der Quelle zieht das Teil ein).
+    fn einziehen(&mut self, ziel_slot: u64) -> Result<(), CsubFehler>;
+    /// Lebt die Teil-Cap noch (nicht eingezogen, nicht gelöscht)?
+    fn cap_ist_live(&self, ziel_slot: u64) -> bool;
+}
+
+/// Grant-Fehler über beide Schichten: erst der Server (Schein), dann CSUB (Cap).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GrantCapFehler {
+    /// Die Schein-Schicht hat abgesagt (u. a. `UnbekannterSchein`/`FremderSchein` bleiben).
+    Server(SpeicherFehler),
+    /// Die Cap-Schicht hat abgesagt (Durchreiche, s. [`csub_fehler_kode`]).
+    Csub(CsubFehler),
+}
+
+/// Grant-Fehler auf den Draht: Server-Kodes wie bisher, CSUB-Kodes daneben (20–22).
+pub fn grant_cap_kode(f: GrantCapFehler) -> u64 {
+    match f {
+        GrantCapFehler::Server(s) => fehler_kode(s),
+        GrantCapFehler::Csub(c) => csub_fehler_kode(c),
+    }
+}
+
+/// Kode zurück — `None` heisst: diesen Kode vergibt die Grant-Schicht nie.
+pub fn grant_cap_aus_kode(k: u64) -> Option<GrantCapFehler> {
+    if let Some(s) = fehler_aus_kode(k) {
+        return Some(GrantCapFehler::Server(s));
+    }
+    csub_fehler_aus_kode(k).map(GrantCapFehler::Csub)
+}
+
+/// Ein Grant mit abgeleiteter Cap: Handle (Schlüssel) plus Cap plus Einzugsstand.
+#[derive(Clone, Copy)]
+struct GrantCapEintrag {
+    handle: u64,
+    quelle_pd: u32,
+    cap: CsubCap,
+    eingezogen: bool,
+}
+
+/// Der Verleiher: führt pro Handle die per CSUB abgeleitete Cap und zieht sie per `revoke`
+/// wieder ein. Die Schein-Prüfung (`unbekannt`/`fremd`) bleibt beim Server und läuft ZUERST —
+/// eine fremde PD erreicht das Backend nie, nicht einmal mit einer Absage von dort.
+pub struct CsubVerleiher<B> {
+    backend: B,
+    eintraege: [Option<GrantCapEintrag>; super::MAX_GRANTS],
+}
+
+impl<B: CsubBackend> CsubVerleiher<B> {
+    /// Leerer Verleiher über einem Backend (Gast: Kernel, Host-Test: `FakeCsub`).
+    pub fn neu(backend: B) -> Self {
+        const LEER: Option<GrantCapEintrag> = None;
+        CsubVerleiher { backend, eintraege: [LEER; super::MAX_GRANTS] }
+    }
+
+    /// Backend lesen (Test- und Diagnosehilfe).
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    /// Backend erreichen (Slot-Belegung, Einzugsstand — die Transport-Kontrolle des Tests).
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
+    }
+
+    fn finden(&self, handle: u64) -> Option<usize> {
+        let mut i = 0;
+        while i < super::MAX_GRANTS {
+            if let Some(e) = self.eintraege[i] {
+                if e.handle == handle {
+                    return Some(i);
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn freien_platz(&self) -> Option<usize> {
+        let mut i = 0;
+        while i < super::MAX_GRANTS {
+            if self.eintraege[i].is_none() {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// ANFORDERN-Pfad: Schein auflösen, daraus per `csub` ableiten, Cap verbuchen. CSUB greift —
+    /// Offset/Länge kommen aus der Anfrage (via Schein), die Rechte aus dem Schnitt mit der Quelle.
+    pub fn ableiten_fuer_grant(
+        &mut self,
+        s: &mut MemoryServer,
+        p: &dyn Park,
+        pd: u32,
+        handle: u64,
+        quell_slot: u64,
+        ziel_slot: u64,
+        wunsch: CsubRechte,
+    ) -> Result<CsubCap, GrantCapFehler> {
+        // Erst der Server: unbekannt/fremd/entzogen bleiben seine Absagen, das Backend sieht
+        // davon nichts (kein Eintrag, kein Aufruf — die Isolation steckt in dieser Reihenfolge).
+        let sicht = s.aufloesen(p, pd, handle).map_err(GrantCapFehler::Server)?;
+        if let Some(i) = self.finden(handle) {
+            let e = self.eintraege[i].expect("eben gefunden");
+            if !e.eingezogen {
+                // Zweites Ableiten ohne Einzug: kein zweiter Aufruf, keine zweite Cap — der
+                // Ziel-Slot wäre belegt, also heisst es wie dort `NoSpace`.
+                return Err(GrantCapFehler::Csub(CsubFehler::NoSpace));
+            }
+            self.eintraege[i] = None;
+        }
+        let rechte = QUELLE_RECHTE.schnitt(wunsch);
+        let cap =
+            self.backend.ableiten(quell_slot, ziel_slot, sicht.offset, sicht.len, rechte).map_err(
+                GrantCapFehler::Csub,
+            )?;
+        let platz = self.freien_platz().ok_or(GrantCapFehler::Csub(CsubFehler::NoSpace))?;
+        self.eintraege[platz] =
+            Some(GrantCapEintrag { handle, quelle_pd: pd, cap, eingezogen: false });
+        Ok(cap)
+    }
+
+    /// AUFLOESEN-Pfad: echte Cap-Daten zu einem Handle — `None` heisst kein lebendes Teil
+    /// (nie abgeleitet oder bereits eingezogen). CSUB greift — Slot plus Fenster statt Schatten.
+    pub fn cap_zu_grant(&self, handle: u64) -> Option<CsubCap> {        let i = self.finden(handle)?;
+        let e = self.eintraege[i].expect("eben gefunden");
+        if e.eingezogen {
+            return None;
+        }
+        if !self.backend.cap_ist_live(e.cap.ziel_slot) {
+            return None;
+        }
+        Some(e.cap)
+    }
+
+    /// Wem gehört der Grant hinter diesem Handle (Test- und Diagnosehilfe: die Fremd-Prüfung
+    /// des Servers als lesbare Aussage, nicht nur als Absage-Kode).
+    pub fn eintrag_quelle_pd(&self, handle: u64) -> Option<u32> {
+        let i = self.finden(handle)?;
+        Some(self.eintraege[i].expect("eben gefunden").quelle_pd)
+    }
+
+    /// FREIGEBEN-Pfad: erst die Server-Freigabe (u. a. `NochAbgebildet` bleibt), dann `revoke` —
+    /// echt einziehbar: nach dem Einzug löst die Cap nichts mehr auf. CSUB greift. Ohne
+    /// abgeleitete Cap (Startkapital, reine Scheine) gibt es nichts einzuziehen — reine
+    /// Server-Freigabe, kein Fehler, kein Aufruf.
+    pub fn freigeben_mit_revoke(
+        &mut self,
+        s: &mut MemoryServer,
+        p: &dyn Park,
+        pd: u32,
+        handle: u64,
+    ) -> Result<(), GrantCapFehler> {
+        s.zurueckgeben(p, pd, handle).map_err(GrantCapFehler::Server)?;
+        let Some(i) = self.finden(handle) else { return Ok(()) };
+        let e = self.eintraege[i].expect("eben gefunden");
+        if e.eingezogen {
+            return Ok(());
+        }
+        // Die Revoke-Absage wird durchgereicht, der Eintrag bleibt live-markiert — eine
+        // eingezogene Region mit lebender Cap wäre die stille Überlappung von morgen.
+        self.backend.einziehen(e.cap.ziel_slot).map_err(GrantCapFehler::Csub)?;
+        self.eintraege[i] = Some(GrantCapEintrag { eingezogen: true, ..e });
+        Ok(())
+    }
+
+    /// ENTZUG-Pfad: Server-Entzug plus `revoke` — die Cap ist tot, die Region bleibt reserviert
+    /// bis zur Rückgabe. CSUB greift. Ohne abgeleitete Cap nur Server-Entzug (wie FREIGEBEN).
+    pub fn entzug_mit_revoke(
+        &mut self,
+        s: &mut MemoryServer,
+        p: &dyn Park,
+        pd: u32,
+        handle: u64,
+    ) -> Result<(), GrantCapFehler> {
+        s.entziehen(p, pd, handle).map_err(GrantCapFehler::Server)?;
+        let Some(i) = self.finden(handle) else { return Ok(()) };
+        let e = self.eintraege[i].expect("eben gefunden");
+        if !e.eingezogen {
+            self.backend.einziehen(e.cap.ziel_slot).map_err(GrantCapFehler::Csub)?;
+            self.eintraege[i] = Some(GrantCapEintrag { eingezogen: true, ..e });
+        }
+        Ok(())
+    }
+}
+
+/// Host-Stellvertreter des Kernels für die CSUB-Schicht: dieselbe Absagen-Semantik wie
+/// `CapSpace::subregion` (Quelle muss die Arena-Cap sein, Fensterrechnung wie
+/// `teilfenster_rechnen`, belegtes Ziel wie `install_cap`), nur über eingespeisten Werten —
+/// kein Syscall, kein Cspace, acht Slots statt Budget. Was hier `Subregion` heisst, heisst im
+/// Gast `ERR_SUBREGION` (21); was hier `live == false` heisst, heisst dort „die Cap löst nicht
+/// mehr auf".
+#[cfg(test)]
+pub struct FakeCsub {
+    arena_len: u64,
+    slots: [Option<FakeCsubSlot>; 8],
+}
+
+/// Ein belegter Fake-Slot: Fenster plus Rechte plus Einzugsstand.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct FakeCsubSlot {
+    offset: u64,
+    len: u64,
+    rechte: CsubRechte,
+    live: bool,
+}
+
+#[cfg(test)]
+impl FakeCsub {
+    /// Leerer Stellvertreter über einer Arena der Länge `arena_len`.
+    pub fn neu(arena_len: u64) -> Self {
+        const LEER: Option<FakeCsubSlot> = None;
+        FakeCsub { arena_len, slots: [LEER; 8] }
+    }
+
+    fn slot_index(ziel_slot: u64) -> Option<usize> {
+        let i = ziel_slot as usize;
+        if i < 8 {
+            Some(i)
+        } else {
+            None
+        }
+    }
+
+    /// Fenster plus Rechte eines belegten Slots (Testhilfe: das Backend spiegelt die Cap-Daten
+    /// des Grants — was hier steht, stünde im Gast im Cspace).
+    pub fn slot_fenster(&self, ziel_slot: u64) -> Option<(u64, u64, CsubRechte)> {
+        let i = Self::slot_index(ziel_slot)?;
+        self.slots[i].map(|s| (s.offset, s.len, s.rechte))
+    }
+}
+
+#[cfg(test)]
+impl CsubBackend for FakeCsub {
+    fn ableiten(
+        &mut self,
+        quell_slot: u64,
+        ziel_slot: u64,
+        offset: u64,
+        len: u64,
+        rechte: CsubRechte,
+    ) -> Result<CsubCap, CsubFehler> {
+        // Quelle muss die Arena-Cap sein — ein Teil aus etwas anderem wäre Geräte-Autorität
+        // im Zuschnitt (dieselbe Prüfung wie der Kernel-Zweig vor `subregion`).
+        if quell_slot != ARENA_CAP_SLOT {
+            return Err(CsubFehler::BadCap);
+        }
+        // Null-Länge ohne Syscall (Client-Gatter wie `libcaprock::csub`).
+        if len == 0 {
+            return Err(CsubFehler::BadCap);
+        }
+        // Fensterrechnung wie `teilfenster_rechnen`: Überlauf, Ende-jenseits — nie stutzen.
+        let ende = offset.checked_add(len).ok_or(CsubFehler::Subregion)?;
+        if ende > self.arena_len {
+            return Err(CsubFehler::Subregion);
+        }
+        let i = Self::slot_index(ziel_slot).ok_or(CsubFehler::NoSpace)?;
+        if matches!(self.slots[i], Some(s) if s.live) {
+            return Err(CsubFehler::NoSpace);
+        }
+        self.slots[i] = Some(FakeCsubSlot { offset, len, rechte, live: true });
+        Ok(CsubCap { ziel_slot, offset, len, rechte })
+    }
+
+    fn einziehen(&mut self, ziel_slot: u64) -> Result<(), CsubFehler> {
+        let i = Self::slot_index(ziel_slot).ok_or(CsubFehler::BadCap)?;
+        match self.slots[i] {
+            Some(s) if s.live => {
+                self.slots[i] = Some(FakeCsubSlot { live: false, ..s });
+                Ok(())
+            }
+            // Unbekannt oder bereits eingezogen: keine zweite Wirkung, benannte Absage.
+            _ => Err(CsubFehler::BadCap),
+        }
+    }
+
+    fn cap_ist_live(&self, ziel_slot: u64) -> bool {
+        match Self::slot_index(ziel_slot) {
+            Some(i) => matches!(self.slots[i], Some(s) if s.live),
+            None => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -1088,5 +1500,243 @@ mod tests {
         // Stufe-1-Aussage über den Draht eine andere PD.
         assert_eq!(PD_A, PD_BOOT);
         assert_eq!(PD_A, super::super::PD_BOOT);
+    }
+
+    fn verleiher() -> CsubVerleiher<FakeCsub> {
+        CsubVerleiher::neu(FakeCsub::neu(ARENA_BYTES))
+    }
+
+    /// ANFORDERN über Worte, Ableiten über die Schicht: ein Aufruf, eine Cap.
+    fn anfordern_und_ableiten(
+        s: &mut MemoryServer,
+        p: &FakePark,
+        c: &mut ClientSeite,
+        v: &mut CsubVerleiher<FakeCsub>,
+        pd: u32,
+        len: u64,
+        ziel_slot: u64,
+        wunsch: CsubRechte,
+    ) -> (u64, CsubCap) {
+        let aw = bedienen(s, p, pd, c.anfrage(len, Zweck::Allgemein).als_worte());
+        assert_eq!(aw[0], 0, "anfordern ok");
+        let h = c.antwort_anfordern(aw, len).expect("schein ok");
+        let cap =
+            v.ableiten_fuer_grant(s, p, pd, h, ARENA_CAP_SLOT, ziel_slot, wunsch).expect("csub ok");
+        (h, cap)
+    }
+
+    #[test]
+    fn csub_ableiten_ok() {
+        // Ableiten-ok: ANFORDERN läuft über Worte, die Schicht leitet daraus per CSUB ab —
+        // Handle trägt (Slot, Cap): Ziel-Slot plus echtes Fenster aus der Anfrage.
+        let park = FakePark::neu(TEST_TID);
+        let mut s = server();
+        let mut c = ClientSeite::neu();
+        let mut v = verleiher();
+        let (h, cap) =
+            anfordern_und_ableiten(&mut s, &park, &mut c, &mut v, PD_A, ABNAHME_GRANT, 4, CsubRechte::RWX);
+        assert_eq!(cap.ziel_slot, 4);
+        assert_eq!(cap.offset, START_KAPITAL);
+        assert_eq!(cap.len, ABNAHME_GRANT);
+        // AUFLOESEN gibt echte Cap-Daten: dieselbe Cap, kein Schatten-Nachrechnen.
+        assert_eq!(v.cap_zu_grant(h), Some(cap));
+        assert!(v.backend().cap_ist_live(4));
+        // Das Backend spiegelt Fenster und Rechte des Grants (Gast: Cspace-Eintrag).
+        assert_eq!(v.backend().slot_fenster(4), Some((START_KAPITAL, ABNAHME_GRANT, cap.rechte)));
+        assert_eq!(v.eintrag_quelle_pd(h), Some(PD_A));
+        // FREIGEBEN zieht per revoke ein: Server-Freigabe plus Einzug in einem Schritt, danach
+        // ist die Cap tot und der Client-Eintrag erlischt.
+        v.freigeben_mit_revoke(&mut s, &park, PD_A, h).expect("freigabe+revoke");
+        assert_eq!(v.cap_zu_grant(h), None, "eingezogene Cap loest nichts auf");
+        assert!(!v.backend().cap_ist_live(4));
+        c.antwort_freigeben(h, [0, 0, 0, 0]).expect("client erlischt");
+        assert_eq!(s.vergeben_bytes(), START_KAPITAL);
+    }
+
+    #[test]
+    fn csub_rechte_schnitt() {
+        // Schnitt: Wunsch RWX gegen Quelle RW ergibt RW — kein X aus dem Nichts, die
+        // Eskalationsprüfung von `CapSpace::subregion` als UND-Rechnung über dem Draht.
+        let park = FakePark::neu(TEST_TID);
+        let mut s = server();
+        let mut c = ClientSeite::neu();
+        let mut v = verleiher();
+        let (h, cap) =
+            anfordern_und_ableiten(&mut s, &park, &mut c, &mut v, PD_A, PAGE_SIZE, 4, CsubRechte::RWX);
+        assert_eq!(cap.rechte, CsubRechte::RW, "Schnitt, keine Eskalation");
+        assert!(!cap.rechte.enthaelt(CsubRechte::X));
+        assert!(cap.rechte.enthaelt(CsubRechte::R));
+        rueckweg_revoke(&mut s, &park, &mut c, &mut v, PD_A, h);
+        assert_eq!(s.vergeben_bytes(), START_KAPITAL);
+    }
+
+    #[test]
+    fn csub_ueberlauf_subregion() {
+        // Überlauf → SUBREGION: `Offset + Länge` läuft über, die Absage heisst wie im Kernel
+        // `ERR_SUBREGION` und geht als eigener Draht-Kode (22) durch, nicht als „kein Platz".
+        let mut v = verleiher();
+        let b = v.backend_mut();
+        assert_eq!(
+            b.ableiten(ARENA_CAP_SLOT, 4, u64::MAX - 100, 200, CsubRechte::RW),
+            Err(CsubFehler::Subregion)
+        );
+        assert_eq!(
+            b.ableiten(ARENA_CAP_SLOT, 4, ARENA_BYTES, PAGE_SIZE, CsubRechte::RW),
+            Err(CsubFehler::Subregion)
+        );
+        assert_eq!(csub_fehler_kode(CsubFehler::Subregion), KODE_CSUB_SUBREGION);
+        assert_eq!(csub_fehler_kode(CsubFehler::Subregion), 22);
+        assert_eq!(
+            grant_cap_kode(GrantCapFehler::Csub(CsubFehler::Subregion)),
+            KODE_CSUB_SUBREGION
+        );
+        assert_eq!(
+            grant_cap_aus_kode(KODE_CSUB_SUBREGION),
+            Some(GrantCapFehler::Csub(CsubFehler::Subregion))
+        );
+        // Die Absagen haben stattgefunden, ohne etwas zu belegen: Slot 4 ist noch frei.
+        assert!(!v.backend().cap_ist_live(4));
+        let cap =
+            v.backend_mut().ableiten(ARENA_CAP_SLOT, 4, 0, PAGE_SIZE, CsubRechte::RW).expect("frei");
+        assert_eq!((cap.offset, cap.len), (0, PAGE_SIZE));
+    }
+
+    #[test]
+    fn csub_revoke_zieht_ein() {
+        // Revoke-zieht-ein: nach FREIGEBEN+Revoke löst die Cap nichts mehr auf — die
+        // Abbildung wäre ohne Einzug weiter lesbar (kooperativer Entzug), mit Einzug ist die
+        // Cap tot, und die Region ist erst dann wiedervergebbar.
+        let park = FakePark::neu(TEST_TID);
+        let mut s = server();
+        let mut c = ClientSeite::neu();
+        let mut v = verleiher();
+        let (h, cap) =
+            anfordern_und_ableiten(&mut s, &park, &mut c, &mut v, PD_A, PAGE_SIZE, 4, CsubRechte::RW);
+        // Abgebildet blockiert erst die Server-Freigabe — die Revoke-Absage bleibt benannt,
+        // die Cap lebt weiter (kein halber Einzug).
+        let lw = bedienen(&mut s, &park, PD_A, c.aufloesen(h).expect("e").als_worte());
+        c.antwort_aufloesen(h, lw).expect("sicht");
+        let bw = bedienen(&mut s, &park, PD_A, c.abbilden(h).expect("e").als_worte());
+        c.antwort_abbilden(h, bw).expect("abbilden");
+        assert_eq!(
+            v.freigeben_mit_revoke(&mut s, &park, PD_A, h),
+            Err(GrantCapFehler::Server(SpeicherFehler::NochAbgebildet))
+        );
+        assert_eq!(v.cap_zu_grant(h), Some(cap), "kein halber Einzug");
+        // Ordnungsgemäß: ausblenden, freigeben+revoke — danach ist die Cap tot.
+        let uw = bedienen(&mut s, &park, PD_A, c.ausblenden(h).expect("e").als_worte());
+        c.antwort_ausblenden(h, uw).expect("ausblenden");
+        v.freigeben_mit_revoke(&mut s, &park, PD_A, h).expect("freigabe+revoke");
+        assert_eq!(v.cap_zu_grant(h), None, "eingezogene Cap loest nichts auf");
+        assert!(!v.backend().cap_ist_live(4));
+        assert_eq!(
+            v.backend_mut().einziehen(4),
+            Err(CsubFehler::BadCap),
+            "doppelter Einzug: benannt, keine zweite Wirkung"
+        );
+        let fw = [0, 0, 0, 0];
+        c.antwort_freigeben(h, fw).expect("client-seitig erloschen");
+        assert_eq!(s.vergeben_bytes(), START_KAPITAL);
+    }
+
+    #[test]
+    fn csub_doppelvergabe() {
+        // Doppelvergabe mit Cap: nach Freigabe+Revoke kommt derselbe Offset zurück (First-fit,
+        // neues Handle, neue Cap) — die alte Cap ist tot, die neue lebt im selben Fenster.
+        let park = FakePark::neu(TEST_TID);
+        let mut s = server();
+        let mut ca = ClientSeite::neu();
+        let mut cb = ClientSeite::neu();
+        let mut v = verleiher();
+        let (ha, capa) =
+            anfordern_und_ableiten(&mut s, &park, &mut ca, &mut v, PD_A, PAGE_SIZE, 4, CsubRechte::RW);
+        rueckweg_revoke(&mut s, &park, &mut ca, &mut v, PD_A, ha);
+        let (hb, capb) =
+            anfordern_und_ableiten(&mut s, &park, &mut cb, &mut v, PD_B, PAGE_SIZE, 5, CsubRechte::RW);
+        assert_ne!(hb, ha, "neuer Schein, neues Handle");
+        assert_eq!(capb.offset, capa.offset, "First-fit: dasselbe Fenster, neue Cap");
+        assert_eq!(v.cap_zu_grant(ha), None, "alte Cap tot");
+        assert_eq!(v.cap_zu_grant(hb), Some(capb), "neue Cap lebt");
+        // As alter Schein löst serverseitig nicht auf — über den Draht wie bisher.
+        let alt = bedienen(&mut s, &park, PD_A, Nachricht::aufloesen(ha).als_worte());
+        assert_eq!(alt[0], fehler_kode(SpeicherFehler::UnbekannterSchein));
+        rueckweg_revoke(&mut s, &park, &mut cb, &mut v, PD_B, hb);
+        assert_eq!(s.vergeben_bytes() + s.freie_bytes(), ARENA_BYTES);
+    }
+
+    #[test]
+    fn csub_fremder_schein() {
+        // Fremder-Schein: Bs Ableiten auf As Handle scheitert SERVER-seitig (FremderSchein) —
+        // das Backend sieht davon nichts: kein Eintrag, kein Aufruf, keine Cap für B.
+        let park = FakePark::neu(TEST_TID);
+        let mut s = server();
+        let mut ca = ClientSeite::neu();
+        let mut v = verleiher();
+        let (ha, capa) =
+            anfordern_und_ableiten(&mut s, &park, &mut ca, &mut v, PD_A, PAGE_SIZE, 4, CsubRechte::RW);
+        assert_eq!(
+            v.ableiten_fuer_grant(&mut s, &park, PD_B, ha, ARENA_CAP_SLOT, 5, CsubRechte::RW),
+            Err(GrantCapFehler::Server(SpeicherFehler::FremderSchein))
+        );
+        assert!(!v.backend().cap_ist_live(5), "keine Cap für den Fremden");
+        assert_eq!(v.eintrag_quelle_pd(ha), Some(PD_A), "kein zweiter Eintrag für B");
+        assert_eq!(
+            v.freigeben_mit_revoke(&mut s, &park, PD_B, ha),
+            Err(GrantCapFehler::Server(SpeicherFehler::FremderSchein))
+        );
+        assert_eq!(v.cap_zu_grant(ha), Some(capa), "As Cap unberührt");
+        rueckweg_revoke(&mut s, &park, &mut ca, &mut v, PD_A, ha);
+        assert_eq!(s.vergeben_bytes(), START_KAPITAL);
+    }
+
+    #[test]
+    fn csub_absagen_durchgereicht() {
+        // BADCAP/NOSPACE-Durchreiche plus Kode-Lage: Null-Länge und falsche Quelle heissen
+        // BADCAP (20), belegtes Ziel heisst NOSPACE (21) — eigene Kodes neben `fehler_kode`.
+        let mut v = verleiher();
+        assert_eq!(
+            v.backend_mut().ableiten(ARENA_CAP_SLOT, 4, 0, 0, CsubRechte::RW),
+            Err(CsubFehler::BadCap)
+        );
+        assert_eq!(
+            v.backend_mut().ableiten(99, 4, 0, PAGE_SIZE, CsubRechte::RW),
+            Err(CsubFehler::BadCap)
+        );
+        v.backend_mut().ableiten(ARENA_CAP_SLOT, 4, 0, PAGE_SIZE, CsubRechte::RW).expect("erst ok");
+        assert_eq!(
+            v.backend_mut().ableiten(ARENA_CAP_SLOT, 4, PAGE_SIZE, PAGE_SIZE, CsubRechte::RW),
+            Err(CsubFehler::NoSpace)
+        );
+        assert_eq!(csub_fehler_kode(CsubFehler::BadCap), 20);
+        assert_eq!(csub_fehler_kode(CsubFehler::NoSpace), 21);
+        assert_eq!(csub_fehler_aus_kode(20), Some(CsubFehler::BadCap));
+        assert_eq!(csub_fehler_aus_kode(21), Some(CsubFehler::NoSpace));
+        assert_eq!(csub_fehler_aus_kode(22), Some(CsubFehler::Subregion));
+        // Kollisionsfreiheit zur Schein-Schicht: 20–22 vergibt `fehler_kode` nie (dort 1–13).
+        assert_eq!(fehler_aus_kode(20), None);
+        assert_eq!(fehler_aus_kode(21), None);
+        assert_eq!(fehler_aus_kode(22), None);
+        // Unbekannter Grant über die Schicht: Server zuerst — UnbekannterSchein bleibt.
+        let park = FakePark::neu(TEST_TID);
+        let mut s = server();
+        assert_eq!(
+            v.ableiten_fuer_grant(&mut s, &park, PD_A, 0xDEAD_BEEF, ARENA_CAP_SLOT, 6, CsubRechte::RW),
+            Err(GrantCapFehler::Server(SpeicherFehler::UnbekannterSchein))
+        );
+    }
+
+    /// Rückweg mit Revoke: Server-Freigabe plus Einzug in einem Schritt, dann erlischt der
+    /// Client-Eintrag (die `[0, 0, 0, 0]`-Antwort ist der OK-Pfad von `antwort_freigeben` —
+    /// der Server hat bereits im selben Schritt bedient, ein zweites Wort wäre Doppel-Freigabe).
+    fn rueckweg_revoke(
+        s: &mut MemoryServer,
+        p: &FakePark,
+        c: &mut ClientSeite,
+        v: &mut CsubVerleiher<FakeCsub>,
+        pd: u32,
+        h: u64,
+    ) {
+        v.freigeben_mit_revoke(s, p, pd, h).expect("freigabe+revoke");
+        c.antwort_freigeben(h, [0, 0, 0, 0]).expect("client erlischt");
     }
 }

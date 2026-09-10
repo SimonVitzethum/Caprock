@@ -37,6 +37,36 @@ die Implementierungsstufe keinen Befehl an den falschen Gedanken haengt.
 - `Z1` braucht zusaetzlich Kontextwechsel-Disziplin (FP_OWNER-Klasse) — vier Register je
   Kern sind eine Kapazitaet, deren Ueberlauf benannt werden muss (`ERR_DEBUG_BUSY`-Form).
 
+## Stufe 2 (RSP-WIRE, 2026-09-10): verdrahtet was geht, benannt der Rest
+
+`bediene(nutzlast, backend, aus)` in `src/lib.rs` (`Backend`-Trait: `read_mem`,
+`write_mem`, `read_regs` — injizierbar, host-testbar; der PD-Eintritt implementiert es
+gegen die echten Syscalls). `beantworte` bleibt die kernellose Stufe-1-Antwort
+(immer `$#00`); Framing/Prüfsummen/Parser sind Byte-identisch.
+
+| RSP | Stufe 2 | Mechanik |
+|---|---|---|
+| `qSupported...` | beantwortet: `PacketSize=2048` | kein Syscall — nur was wirklich geht (kein `QStartNoAckMode+`, kein `multiprocess+`) |
+| `?` | beantwortet: `S05` (SIGTRAP) | kein Syscall — kanonischer Stoppgrund, keine erfundene Thread-Id |
+| `g` | bedient über `Backend::read_regs` | produktiv Sidecar read-only — bewusst KEIN Syscall 24 (ABI: "Frame reading has no syscall"); wer `g` an 24 hinge, läse Zielspeicher statt Registerframe |
+| `mADDR,LEN` | bedient über `Backend::read_mem` | Syscall 24 (`DEBUG_READ_MEM`), PD schleift in `READ_MAX` (512); Teillänge = Lücke (kurze Antwort), Absage = `E01` |
+| `MADDR,LEN:HEX` | bedient über `Backend::write_mem` | Syscall 33 (`DEBUG_WRITE_MEM`, `debug_write_mem`, `WRITE_MAX`-Deckel), Erfolg = `OK`; Längenwiderspruch → leer (kein Kürzen), Lücke → `E01` (kein Teil-`OK`) |
+| `c[ADDR]` | benannt unbedient (`$#00`) | `DEBUG_CONTINUE = 23` EXISTIERT, trägt `c` aber bewusst noch nicht: Weiterlaufen braucht die Halt-Disziplin des Ziels (gehalten? wessen Stopp?), die gehört dem PD-Eintritt, nicht dem Protokoll |
+| `s[ADDR]` | benannt unbedient (`$#00`) | fehlt: `DEBUG_SINGLE_STEP = 34` ist fail-closed (`ERR_BADSYS`) — kein `hal::debug` (x86: TF, aarch64: `MDSCR_EL1.SS`/`PSTATE.SS`, `#DB`-Pfad) |
+| `Z0...` | benannt unbedient (`$#00`) | nie per Design (Plan §10d, Route 1): `int3`-Patchen ist Schreiben nach Programmtext gegen W^X — der Debugger schreibt es selbst via `M`/Syscall 33 |
+| `Z1...`/`z1...` | benannt unbedient (`$#00`) | fehlt: `DEBUG_HWBREAK = 35` ist fail-closed (`ERR_BADSYS`) — kein `hal::debug`, kein pro-Thread-Sichern der Debugregister im Kontextwechsel |
+| `G...` | benannt unbedient (`$#00`) | `DEBUG_WRITE_REGS = 25` existiert, `G` wartet auf die v2-Maske (PC/SP/Flags, Plan §3b) |
+
+Korrektur zum Auftrag ("`g` an `DEBUG_READ_MEM`"): das verwechselt `g` und `m`.
+`m` (Speicher lesen) geht an 24 — verdrahtet. `g` (Register lesen) geht ans Sidecar —
+verdrahtet über `read_regs`. Die Form ist in beiden Fällen ein gedeckelter
+Blocktransfer; die Nummer 24 steht nur bei `m`.
+
+Mini-Wrapper statt `libcaprock`-Dep (Form wie `load`/`csub` gelesen, nicht importiert):
+`forbid(unsafe_code)` verträgt kein SVC-asm, die Standalone-Isolation (`/tmp`-Tests)
+verträgt keinen Workspace-Dep, und der echte SVC steht ohnehin erst im PD-Eintritt —
+hier Form (Nummern, Deckel) + Trait. Einzige Wahrheit der Nummern: `caprock_abi::sys`.
+
 ## Was diese Stufe beweist (und was nicht)
 
 - Bewiesen (host-testbar): Rahmung, Pruefsummen, Escapes, Neusynchronisation,

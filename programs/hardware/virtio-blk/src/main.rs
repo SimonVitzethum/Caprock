@@ -45,14 +45,21 @@
 //! der Aufrufer. Prüfte der Treiber den Inhalt selbst, wäre die einzige Quelle für „es hat
 //! geklappt" derselbe Code, der es behauptet.
 
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
 // **T5: eine echte thread-lokale Variable.** Nicht als Selbstzweck -- sie ist der Abnahmefall des
 // TLS-Strangs: *ein Treiber laeuft mit TLS*. Ohne `has-thread-local` im Ziel und `.tdata`/`.tbss`
 // im Linkerskript (T3) schlaegt schon diese Zeile im UEBERSETZER fehl, nicht erst im Lauf.
 #![feature(thread_local)]
 
+// Der Host-Testharness braucht `std`; der PD-Bau sieht davon nichts (Muster wie
+// `caprock-virtio`/`mem-server`: nur unter `cfg(test)`).
+#[cfg(test)]
+extern crate std;
+
+#[cfg(not(test))]
 use libcaprock::{exit, map_window, recv, reply, result, signal};
+#[cfg(not(test))]
 use caprock_virtio::blk::{Op, VirtioBlk, SECTOR};
 
 /// Slot der Kanal-Notification. Ihr Badge steckt in der **Cap** (der Kernel hat es beim Endowment
@@ -168,9 +175,11 @@ const TLS_WERT: u64 = 0xC0FFEE_4711;
 /// ein Block Ausrichtung plus aufgerundete Groesse. `tls_bedarf()` sagt die Zahl; hier steht
 /// grosszuegig das Doppelte, damit eine zusaetzliche thread-lokale Variable nicht sofort wieder
 /// eine stille Verschiebung ist.
+#[cfg(not(test))]
 static mut TLS_PUFFER: [u8; 8192] = [0; 8192];
 
 /// **Die thread-lokale Variable.** Der ganze Punkt von T5.
+#[cfg(not(test))]
 #[thread_local]
 static mut TLS_MARKE: u64 = 0;
 
@@ -179,6 +188,7 @@ static mut TLS_MARKE: u64 = 0;
 /// `false` heisst „der Warteweg ist unbrauchbar geworden"; die Crate bricht dann ab und pollt
 /// **nicht**. Ein `wait`, das ein fremdes Badge liefert, ist kein Fehler -- Notifications
 /// akkumulieren, und die Crate prueft danach ohnehin den used-Ring.
+#[cfg(not(test))]
 fn warte_auf_irq() -> bool {
     let b = libcaprock::wait(IRQ_NTFN);
     WECKRUFE.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
@@ -195,6 +205,7 @@ fn warte_auf_irq() -> bool {
 /// wird dagegen mit Frist: `wait_frist` kehrt mit `ERR_TIMEOUT` zurueck, und `wait_used`
 /// bricht dann ab, statt zu pollen. `false` heisst hier „nichts kam", nicht „das Geraet ist
 /// tot" -- `used.idx` hat der Kernel ohnehin unabhaengig im Blick.
+#[cfg(not(test))]
 fn warte_auf_irq_befristet() -> bool {
     let (rc, b) = libcaprock::wait_frist(IRQ_NTFN, B4_MESS_FRIST_TICKS);
     if rc != result::OK {
@@ -207,12 +218,15 @@ fn warte_auf_irq_befristet() -> bool {
 /// Das zuletzt in [`warte_auf_irq`] gesehene Badge. `static`, weil ein Funktionszeiger nichts
 /// einfangen kann -- und ein Funktionszeiger ist der Preis dafuer, dass die Crate keine
 /// Abhaengigkeit bekommt.
+#[cfg(not(test))]
 static LETZTES_BADGE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Wie oft ueberhaupt geweckt wurde, ueber alle Anfragen.
+#[cfg(not(test))]
 static WECKRUFE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 /// Hat IRGENDEINE Anfrage den Poll-Weg benutzt? Die Groesse, an der `poll-runden == 0` haengt --
 /// als „ueberhaupt" und nicht als Zahl: ein Treiber, der **einmal** pollt, hat die Zusage
 /// gebrochen, und eine kleine Zahl lade dazu ein, sie fuer „fast nicht" zu halten.
+#[cfg(not(test))]
 static GEPOLLT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 // --- Das Dienstprotokoll (A-6.1) --------------------------------------------------------------
 //
@@ -285,12 +299,12 @@ const MAX_POLL: u64 = 50_000_000;
 /// liegt nicht in der inner-shareable Domäne. Eine Barriere, die auf einer Architektur trägt und
 /// auf der anderen still schwächer ist, ist eine Falle mit Verfallsdatum — genau deshalb nimmt
 /// `caprock-virtio` sie als Parameter entgegen, statt sie selbst zu wählen.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(not(test), target_arch = "x86_64"))]
 fn device_fence() {
     // SAFETY: reine Barriere, kein Speicher-/Registereffekt.
     unsafe { core::arch::asm!("mfence", options(nostack, preserves_flags)) }
 }
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(not(test), target_arch = "aarch64"))]
 fn device_fence() {
     // SAFETY: wie oben.
     unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) }
@@ -308,6 +322,7 @@ fn device_fence() {
 ///
 /// # Safety-Hinweis
 /// wie [`bump_served`] -- eigene Region, feste Offsets ausserhalb von Queue, Kopf und Puffer.
+#[cfg(not(test))]
 fn melde(dma_cpu: u64, msix_ok: bool) {
     use core::sync::atomic::Ordering;
     // SAFETY: s. o.
@@ -332,6 +347,7 @@ fn melde(dma_cpu: u64, msix_ok: bool) {
     }
 }
 
+#[cfg(not(test))]
 fn bump_served(dma_cpu: u64) -> u64 {
     // SAFETY: s. o. -- eigene Region, fester Offset, ausschliesslich dieses Wort.
     unsafe {
@@ -343,6 +359,7 @@ fn bump_served(dma_cpu: u64) -> u64 {
 }
 
 /// Fehlergruende als Zahl -- damit der Aufrufer sie unterscheiden kann, ohne den Typ zu kennen.
+#[cfg(not(test))]
 fn fehlercode(e: caprock_part::PartError) -> u64 {
     use caprock_part::PartError as E;
     match e {
@@ -364,6 +381,7 @@ fn fehlercode(e: caprock_part::PartError) -> u64 {
 /// verglichen. Wer je Stueck prueft, prueft ein Stueck und glaubt an die Tabelle.
 ///
 /// Gibt `(Zahl belegter Eintraege, erste LBA der ersten Partition, deren Sektorzahl)`.
+#[cfg(not(test))]
 fn scan_partitions(
     blk: &VirtioBlk,
     dma_cpu: u64,
@@ -425,13 +443,169 @@ fn scan_partitions(
 ///
 /// # Safety-Hinweis
 /// `buf` muss auf den Datenbereich der eigenen DMA-Region zeigen und `len` innerhalb davon liegen.
+#[cfg(not(test))]
 fn sektor<'a>(buf: u64, len: usize) -> &'a [u8] {
     // SAFETY: s. o. -- eigene Region, Laenge durch `MAX_SECTORS * SECTOR` begrenzt, nur lesend.
     unsafe { core::slice::from_raw_parts(buf as *const u8, len) }
 }
 
+// --- Robustheit des Demo-Treibers (B4B-DRIVER) --------------------------------------------------
+//
+// Drei Haertungen, alle hinter dem bestehenden B4-Gatter (`B4_WARTEN=false` unveraendert,
+// Messmodus unangetastet), alle ohne Verhaltensänderung im Normalpfad:
+//
+//  1. **Frist statt Hang.** Das used-Warten endet nachweislich: die Schranke steht schon heute in
+//     `blk.request(..., MAX_POLL, ...)` (Pollweg) bzw. `MAX_WAKEUPS` (Warteweg, Crate) —
+//     [`warte_mit_frist`] ist die host-pruefbare Fassung derselben Regel: Frist abgelaufen heisst
+//     benannte Absage ([`AbsageGrund::FristAbgelaufen`]) plus Rueckzug, nie stiller Hang.
+//  2. **Benanntes Neuaufsetzen.** Genau EIN Wiederholungsversuch je Anfrage — nur wenn das Geraet
+//     NIE abgeschlossen hat (`!used_advanced`); dann ist die Wiederholung idempotent (derselbe
+//     Sektor, derselbe Inhalt) und `request` faehrt dabei Reset + Queue neu auf. Kein impliziter
+//     Neustart: der Schritt heisst [`Schritt::NeuAufsetzen`] und steht an der Aufrufstelle.
+//  3. **Malformed-Abwehr.** `used`-Eintrag und Statusbyte schreibt das GERAET; [`pruefe_abschluss`]
+//     deutet jede Form (kein Fortschritt, falscher Status, zu wenig, absurd viel) als benannte
+//     Absage. Folgefehler statt Absage gab es an genau einer Stelle: `written` (u32 aus dem
+//     used-Ring) war nur nach UNTEN begrenzt — ein absurd grosser Wert galt als gelungen. Die
+//     Antwortpfade gattern deshalb zusaetzlich auf [`Abschluss::Gelungen`].
+//
+// Alles hier ist reines `core` (kein MMIO, kein Syscall) und damit auf dem Host belegt;
+// der PD-Bau sieht denselben Code wie zuvor plus zwei benannte Gatter.
+
+/// Wie viele Neuaufsetzungen eine Anfrage hoechstens bekommt: genau eine.
+///
+/// Null hiesse „kein Neuaufsetzen" (der heutige Ein-Schuss), zwei oder mehr lade dazu ein, ein
+/// stummes Geraet durch Wiederholung wachzuklopfen. Eins ist die Mitte: ein verlorener Anstoss
+/// (Kick vor Queue-freigabe o. ae.) bekommt eine zweite Chance, ein totes Geraet genau eine
+/// benannte Absage danach.
+pub const MAX_NEU_AUFSETZEN: u32 = 1;
+
+/// Obergrenze geraetegemeldeter Bytes je Anfrage: 8 Sektoren à 512 Byte plus Statusbyte.
+///
+/// Dieselbe Zahl wie `MAX_SECTORS * SECTOR + 1` in `caprock-virtio` (hier als Literal, damit
+/// dieses Modul ohne die Crate auf dem Host baut — aendert sich die Crate-Zahl, muss diese
+/// mit; der Test `liefergrenze_passt_zum_layout` haelt beide aneinander).
+pub const MAX_LIEFER_BYTES: u32 = 8 * 512 + 1;
+
+/// Die Vorbelegung des Statusbytes: schreibt das Geraet nichts, steht sie noch da — und die
+/// Statuspruefung waere wertlos, stuende dort schon `S_OK` (s. `blk::request`).
+pub const STATUS_VORBELEGUNG: u8 = 0xff;
+
+/// Wie das used-Warten mit Frist ausgeht — benannt, nie still.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WarteAusgang {
+    /// Der used-Stand hat sich geaendert (nach `runden` Beobachtungen, >= 1).
+    Fertig { runden: u64 },
+    /// Die Frist ist abgelaufen, ohne dass sich etwas geaendert haette — Absage plus Rueckzug.
+    FristAbgelaufen { runden: u64 },
+}
+
+/// Auf `used != vorher` warten, hoechstens `frist_runden` Beobachtungen lang.
+///
+/// `beobachte` liefert den aktuellen used-Stand; `None` heisst „unlesbar" und zaehlt wie eine
+/// Beobachtung ohne Fortschritt (ein unlesbares Register ist kein Grund zu haengen und keiner,
+/// fertig zu melden). Frist 0 schaut gar nicht erst — sofortige benannte Absage.
+///
+/// Der Vergleich ist `!=`, nicht `>`: `used.idx` ist u16 und laeuft ueber; bei genau einer
+/// ausstehenden Anfrage ist JEDE Aenderung der Fortschritt dieser Anfrage.
+pub fn warte_mit_frist(
+    vorher: u16,
+    frist_runden: u64,
+    mut beobachte: impl FnMut() -> Option<u16>,
+) -> WarteAusgang {
+    let mut runden = 0u64;
+    while runden < frist_runden {
+        match beobachte() {
+            Some(stand) if stand != vorher => return WarteAusgang::Fertig { runden: runden + 1 },
+            _ => runden += 1,
+        }
+    }
+    WarteAusgang::FristAbgelaufen { runden }
+}
+
+/// Warum eine Anfrage ABGESAGT wurde — jede Lage hat ihren Namen, damit der Aufrufer sie
+/// unterscheiden kann, ohne den Treiber zu kennen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AbsageGrund {
+    /// Kein used-Fortschritt innert Frist: das Geraet hat nie abgeschlossen. Einziger Grund mit
+    /// Neuaufsetzen ([`Schritt::NeuAufsetzen`]) — alles andere HAT geantwortet.
+    FristAbgelaufen,
+    /// Das Statusbyte steht noch auf der Vorbelegung: used fortgeschritten, aber das Geraet hat
+    /// den Abschluss nie beschrieben (halbe Antwort).
+    StatusUnbeschrieben,
+    /// Das Geraet meldet einen Fehlerstatus.
+    StatusFehler(u8),
+    /// Das Geraet meldet weniger Bytes als die Richtung verlangt (lesen: Sektoren + Statusbyte,
+    /// schreiben/flushen: Statusbyte).
+    ZuWenig { erwartet: u32, geliefert: u32 },
+    /// Das Geraet meldet mehr Bytes, als eine Anfrage je tragen kann — Unsinn statt Antwort.
+    /// Genau die Lage, die `written >= erwartet` allein als gelungen durchliesse.
+    UnsinnigViel { geliefert: u32 },
+}
+
+/// Die gedeutete Antwort des Geraets: gelungen oder BENANNT abgesagt.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Abschluss {
+    Gelungen,
+    Abgesagt(AbsageGrund),
+}
+
+/// Eine Geraeteantwort deuten — Absage statt Folgefehler.
+///
+/// `erwartet` haengt an der Richtung (s. `BlkResult::expected_written`): lesen verlangt
+/// Sektoren + Statusbyte, schreiben/flushen nur das Statusbyte. Die Reihenfolge der Pruefungen
+/// ist der Inhalt: erst Fortschritt, dann Status, dann die Laenge nach BEIDEN Seiten.
+pub fn pruefe_abschluss(
+    used_fortschritt: bool,
+    status: u8,
+    geliefert: u32,
+    erwartet: u32,
+) -> Abschluss {
+    if !used_fortschritt {
+        return Abschluss::Abgesagt(AbsageGrund::FristAbgelaufen);
+    }
+    if status == STATUS_VORBELEGUNG {
+        return Abschluss::Abgesagt(AbsageGrund::StatusUnbeschrieben);
+    }
+    if status != 0 {
+        return Abschluss::Abgesagt(AbsageGrund::StatusFehler(status));
+    }
+    if geliefert > MAX_LIEFER_BYTES {
+        return Abschluss::Abgesagt(AbsageGrund::UnsinnigViel { geliefert });
+    }
+    if geliefert < erwartet {
+        return Abschluss::Abgesagt(AbsageGrund::ZuWenig { erwartet, geliefert });
+    }
+    Abschluss::Gelungen
+}
+
+/// Der naechste Schritt einer Anfrage — die Zustandsmaschine des Neuaufsetzens.
+///
+/// `versuch` zaehlt die Neuaufsetzungen (0 = Erstversuch laeuft bzw. lief). Regeln:
+/// gelungen antwortet; `FristAbgelaufen` setzt genau einmal neu auf; jede beantwortete Lage
+/// (Status, Laenge, Unsinn) gibt benannt auf — eine Wiederholung fragte nur erneut.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Schritt {
+    Antworten(Abschluss),
+    NeuAufsetzen { versuch: u32 },
+    Aufgeben(AbsageGrund),
+}
+
+pub fn naechster_schritt(ausgang: Abschluss, versuch: u32) -> Schritt {
+    match ausgang {
+        Abschluss::Gelungen => Schritt::Antworten(ausgang),
+        Abschluss::Abgesagt(grund) => match grund {
+            AbsageGrund::FristAbgelaufen if versuch < MAX_NEU_AUFSETZEN => {
+                Schritt::NeuAufsetzen { versuch: versuch + 1 }
+            }
+            _ => Schritt::Aufgeben(grund),
+        },
+    }
+}
+
+#[cfg(not(test))]
 libcaprock::entry!(run);
 
+#[cfg(not(test))]
 fn run(_arg: usize) -> ! {
     // 1. Die drei Fenster mappen. Jeder Fehlschlag beendet den Treiber **ohne** Bereit-Meldung:
     //    ein Treiber, der ohne sein Gerät in `recv` ginge, nähme Anfragen an, die er nicht
@@ -651,12 +825,38 @@ fn run(_arg: usize) -> ! {
                     }
                 }
                 // SAFETY: wie oben; `count` ist geprueft und passt in die Region.
-                let r = unsafe {
+                let mut r = unsafe {
                     blk.request(dma_cpu, dma_dev, o, sector, count as u32, MAX_POLL, irq)
                 };
+                // B4B-DRIVER/2: genau EIN benanntes Neuaufsetzen — nur wenn das Geraet NIE
+                // abgeschlossen hat (`!used_advanced`: kein used-Fortschritt, also keine
+                // Antwort, deren Wiederholung etwas doppelt ausfuehren wuerde). `request`
+                // faehrt dabei Reset + Queue neu auf: das IST die Reset-Sequenz, kein
+                // impliziter Neustart — sie steht hier mit ihrem Namen.
+                if !r.used_advanced {
+                    let deutung = pruefe_abschluss(
+                        r.used_advanced,
+                        r.status,
+                        r.written,
+                        r.expected_written,
+                    );
+                    if matches!(naechster_schritt(deutung, 0), Schritt::NeuAufsetzen { .. }) {
+                        // SAFETY: wie oben; dieselbe gepruefte Anfrage, idempotent.
+                        r = unsafe {
+                            blk.request(dma_cpu, dma_dev, o, sector, count as u32, MAX_POLL, irq)
+                        };
+                    }
+                }
+                // B4B-DRIVER/3: benannte Deutung zusaetzlich zur Crate-Aussage. Im Normalpfad
+                // (wohlgeformt) ist beides wahr und die Antwort unten byte-identisch; bei
+                // Unsinn (`UnsinnigViel`) sagt die Deutung nein, wo `completed` allein ja sagte.
+                let gelungen = matches!(
+                    pruefe_abschluss(r.used_advanced, r.status, r.written, r.expected_written),
+                    Abschluss::Gelungen
+                );
                 // Gelesene Sektoren in die geteilte Flaeche kopieren, damit der Client sie
                 // SEHEN kann. Beim Schreiben umgekehrt -- dort hat er sie vorher hineingelegt.
-                if r.completed() {
+                if r.completed() && gelungen {
                     let n = (r.sectors as u64 * SECTOR as u64)
                         .min(shared_len)
                         .min(daten.len()) as usize;
@@ -678,7 +878,7 @@ fn run(_arg: usize) -> ! {
                 reply(
                     EP,
                     [
-                        if r.completed() { ST_OK } else { ST_DEVICE },
+                        if r.completed() && gelungen { ST_OK } else { ST_DEVICE },
                         r.first_word,
                         r.sectors as u64,
                         served,
@@ -688,9 +888,20 @@ fn run(_arg: usize) -> ! {
             OP_FLUSH => {
                 // SAFETY: wie oben.
                 let r = unsafe { blk.request(dma_cpu, dma_dev, Op::Flush, 0, 0, MAX_POLL, irq) };
+                // B4B-DRIVER/3, ohne /2: Flush ist Hilfspfad (der Client wiederholt ihn selbst),
+                // aber die Malformed-Deutung gilt auch hier — Unsinn wird Absage, kein ST_OK.
+                let gelungen = matches!(
+                    pruefe_abschluss(r.used_advanced, r.status, r.written, r.expected_written),
+                    Abschluss::Gelungen
+                );
                 reply(
                     EP,
-                    [if r.completed() { ST_OK } else { ST_DEVICE }, 0, 0, bump_served(dma_cpu)],
+                    [
+                        if r.completed() && gelungen { ST_OK } else { ST_DEVICE },
+                        0,
+                        0,
+                        bump_served(dma_cpu)
+                    ],
                 );
             }
             OP_SCAN => {
@@ -707,4 +918,149 @@ fn run(_arg: usize) -> ! {
         }
     }
     exit();
+}
+
+// --- Host-Belege (B4B-DRIVER) ---------------------------------------------------------------
+//
+// Reines `core` oben, deshalb hier mit Literalen pruefbar: jede Frist endet benannt, jeder
+// Fehlschlag bekommt genau einen benannten naechsten Schritt, jede malforme Antwort wird
+// Absage. Laeuft auf dem Host (`rustc --test`), nicht erst in QEMU.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Beobachtungsfolge aus Literalen: der Stand „springt", wenn die Liste es sagt.
+    fn folge(beobachtungen: &[Option<u16>]) -> impl FnMut() -> Option<u16> + '_ {
+        let i = core::cell::Cell::new(0usize);
+        move || {
+            let k = i.get();
+            i.set(k + 1);
+            if k < beobachtungen.len() { beobachtungen[k] } else { None }
+        }
+    }
+
+    #[test]
+    fn frist_trifft_beim_ersten_hinschauen() {
+        let aus = warte_mit_frist(7, 100, folge(&[Some(8)]));
+        assert_eq!(aus, WarteAusgang::Fertig { runden: 1 });
+    }
+
+    #[test]
+    fn frist_laueft_ab_statt_zu_haengen() {
+        let zaehler = core::cell::Cell::new(0u64);
+        let aus = warte_mit_frist(7, 50, || {
+            zaehler.set(zaehler.get() + 1);
+            Some(7)
+        });
+        assert_eq!(aus, WarteAusgang::FristAbgelaufen { runden: 50 });
+        assert_eq!(zaehler.get(), 50);
+    }
+
+    #[test]
+    fn frist_null_schaut_gar_nicht_erst() {
+        let zaehler = core::cell::Cell::new(0u64);
+        let aus = warte_mit_frist(7, 0, || {
+            zaehler.set(zaehler.get() + 1);
+            Some(8)
+        });
+        assert_eq!(aus, WarteAusgang::FristAbgelaufen { runden: 0 });
+        assert_eq!(zaehler.get(), 0);
+    }
+
+    #[test]
+    fn unlesbares_register_haengt_nicht_und_meldet_nicht_fertig() {
+        let aus = warte_mit_frist(7, 10, folge(&[None, None, None]));
+        assert_eq!(aus, WarteAusgang::FristAbgelaufen { runden: 10 });
+    }
+
+    #[test]
+    fn used_ueberlauf_zaehlt_als_fortschritt() {
+        let aus = warte_mit_frist(0xffff, 10, folge(&[Some(0)]));
+        assert_eq!(aus, WarteAusgang::Fertig { runden: 1 });
+    }
+
+    #[test]
+    fn erster_fehlschlag_setzt_benannt_neu_auf() {
+        let schritt = naechster_schritt(Abschluss::Abgesagt(AbsageGrund::FristAbgelaufen), 0);
+        assert_eq!(schritt, Schritt::NeuAufsetzen { versuch: 1 });
+    }
+
+    #[test]
+    fn zweiter_fehlschlag_gibt_benannt_auf() {
+        let schritt = naechster_schritt(Abschluss::Abgesagt(AbsageGrund::FristAbgelaufen), 1);
+        assert_eq!(schritt, Schritt::Aufgeben(AbsageGrund::FristAbgelaufen));
+    }
+
+    #[test]
+    fn beantwortete_lage_bekommt_kein_neuaufsetzen() {
+        // Das Geraet HAT geantwortet (Fehlerstatus) — eine Wiederholung fragte nur erneut.
+        let schritt =
+            naechster_schritt(Abschluss::Abgesagt(AbsageGrund::StatusFehler(7)), 0);
+        assert_eq!(schritt, Schritt::Aufgeben(AbsageGrund::StatusFehler(7)));
+    }
+
+    #[test]
+    fn gelingen_antwortet_ohne_neuaufsetzen() {
+        let schritt = naechster_schritt(Abschluss::Gelungen, 0);
+        assert_eq!(schritt, Schritt::Antworten(Abschluss::Gelungen));
+    }
+
+    #[test]
+    fn kein_fortschritt_ist_fristabsage() {
+        assert_eq!(
+            pruefe_abschluss(false, 0, 0, 513),
+            Abschluss::Abgesagt(AbsageGrund::FristAbgelaufen)
+        );
+    }
+
+    #[test]
+    fn unbeschriebenes_statusbyte_ist_absage() {
+        assert_eq!(
+            pruefe_abschluss(true, STATUS_VORBELEGUNG, MAX_LIEFER_BYTES, MAX_LIEFER_BYTES),
+            Abschluss::Abgesagt(AbsageGrund::StatusUnbeschrieben)
+        );
+    }
+
+    #[test]
+    fn fehlerstatus_ist_absage() {
+        assert_eq!(
+            pruefe_abschluss(true, 5, 513, 513),
+            Abschluss::Abgesagt(AbsageGrund::StatusFehler(5))
+        );
+    }
+
+    #[test]
+    fn zu_wenig_ist_absage() {
+        assert_eq!(
+            pruefe_abschluss(true, 0, 100, 4097),
+            Abschluss::Abgesagt(AbsageGrund::ZuWenig { erwartet: 4097, geliefert: 100 })
+        );
+    }
+
+    #[test]
+    fn absurde_laenge_ist_absage_statt_gelungen() {
+        // `u32::MAX >= erwartet` — die alte Ein-Seiten-Pruefung liesse das durch.
+        assert_eq!(
+            pruefe_abschluss(true, 0, u32::MAX, 513),
+            Abschluss::Abgesagt(AbsageGrund::UnsinnigViel { geliefert: u32::MAX })
+        );
+    }
+
+    #[test]
+    fn wohlgeformt_gelingt_lesen_schreiben_flushen() {
+        assert_eq!(pruefe_abschluss(true, 0, 513, 513), Abschluss::Gelungen);
+        assert_eq!(pruefe_abschluss(true, 0, 4097, 4097), Abschluss::Gelungen);
+        assert_eq!(pruefe_abschluss(true, 0, 1, 1), Abschluss::Gelungen);
+    }
+
+    #[test]
+    fn liefergrenze_passt_zum_layout() {
+        // 8 Sektoren à 512 Byte plus Statusbyte — s. `MAX_SECTORS`/`SECTOR`/`S_OK` in der Crate.
+        assert_eq!(MAX_LIEFER_BYTES, 8 * 512 + 1);
+        assert_eq!(pruefe_abschluss(true, 0, MAX_LIEFER_BYTES, MAX_LIEFER_BYTES), Abschluss::Gelungen);
+        assert!(matches!(
+            pruefe_abschluss(true, 0, MAX_LIEFER_BYTES + 1, MAX_LIEFER_BYTES),
+            Abschluss::Abgesagt(AbsageGrund::UnsinnigViel { .. })
+        ));
+    }
 }

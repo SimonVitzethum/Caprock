@@ -1,0 +1,19 @@
+[package]
+name = "caprock-wasm"
+version = "0.0.0"
+edition = "2021"
+description = "WASM-2a engine scaffold: parse, validate, fuel, traps (standalone, not a workspace member)"
+license = "MIT OR Apache-2.0"
+
+# Standalone: this empty section detaches the crate from the Caprock workspace
+# (root and programs/ manifests must NOT list it as a member). It stays
+# verifiable on its own via `rustc --test` (dependency-free), the same way
+# tools/host-tests.sh tests dependency-free crates.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "wasm-demo"
+path = "src/main.rs"

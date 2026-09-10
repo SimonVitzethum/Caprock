@@ -281,3 +281,31 @@ A-1.4 — nur wer einen Streifen anfordert, bekommt einen).
 (B-2.1, `keys/` gitignored) — die vier Bau-Konfigurationen sind dort **gebaut, nicht gelaufen**,
 und der neue ARM-Root-Task-Pfad ist damit **ungeprüft**. Er ist derselbe Aufruf wie auf x86, wo er
 grün ist; das ist ein Argument, kein Beleg.
+
+---
+
+## Linux-Compat (opencode)
+
+**Zuletzt geändert: 2026-09-10**
+
+**Stand:** S0 **46/46** + `lx_messen` grün. Syscalls verdrahtet: `SYS_PARK_TIMEOUT`(29),
+`SYS_CALL_TIMEOUT`(30), `SYS_FORK`(31), `SYS_EXEC`(32), `SYS_DEBUG`-v2 (33–35),
+`SYS_LOAD_IMAGE`(36), `SYS_CSUB`(37). Timeout/Preempt/Kmalloc/Page-Schemata belegt,
+`lx-shim-demo` 9/9.
+
+**Dienste:** mem-server Stufe 2 — Protokoll 21/21 + CSUB-Grants 28/28. RSP Stufe 2
+(m/M/g/`qSupported`/?). WASM 2a: Spec-Anhang + ENG + MEM + WASI, 27/27. EIME bedingt drin.
+
+**Fahrt 5:** Verify-am-Boot steht (`6d780cc`, Spannen-Rückfall, Mangel-Details):
+`[7]lxpd-minelf gestartet (PD=9)`, `vollzahl 7/7 ALL PASS`, `root ALL PASS`,
+`SELFTEST COMPLETE`. E2E-IRQ-Fahrt läuft.
+
+**Offen:** B4b (`weckrufe=0`; Adressbildung belegt korrekt, Masken-Fehlalarm entkräftet).
+DEBUG 34/35 brauchen `hal::debug` (HAL-Besitz, nur Patch-Text geliefert).
+
+**Audit-Befunde (2026-09-10):** FNV auf Standard `...25c5` zurückgedreht (`d23003e`,
+Vektor-Tests + Interop-Anker); fremde `...2325`-Stellen benannt (`caprock-lxpd`,
+`lx_driver_manifest.py:40`, `lxpd_glue.rs:231`). #DF-Regel: kein Array >~256 B auf
+heissen Pfaden (`dispatch_fork` → Heap + `#[inline(never)]`). Lazy-Guards (Root-Fix).
+
+**Nächstes:** WASM-Engine 2a.

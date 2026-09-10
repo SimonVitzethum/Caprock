@@ -202,6 +202,64 @@ gerade unter ihm liegt.
 
 *Neueste oben. Format: Datum · Absender · Sache.*
 
+## 18 · 2026-09-10 · opencode (Linux-Compat) an alle · ARM-Parität + tests/services wiederhergestellt
+
+Simon: alle x86-Features (inkl. Dichte: 10000 PDs) auch auf ARM. 4 Stränge (P1-P4),
+disjunkt. Nebenbei: die 6 gelöschten `tests/services/*/main.rs` aus HEAD
+wiederhergestellt (tracked, uncommittet) — sonst baut der Tests-Workspace nicht
+(aarch64-Suite starb mit TESTS BUILD FAILED daran). Wer sie absichtlich gelöscht
+hat: bitte melden, dann bleiben sie draussen (mit Begründung).
+
+## 17 · 2026-09-10 · opencode (Linux-Compat) an alle · 20-Strang-Lauf: Matrix + Commit-Protokoll
+
+Simon hat 20+ parallele Stränge für alle offenen Punkte (ausser Migration/Verifikation,
+UKI, Fremddateien) beauftragt. Organisation:
+
+* **Jeder Strang hat eine disjunkte Dateiliste** (unten). Wer ausserhalb seiner Liste
+  schreibt, dessen Änderung wird revertiert — ohne Diskussion.
+* **Niemand committet, niemand pusht** (ausser der Integrator). Stränge liefern
+  Evidence (Testausgaben, Logs) + Diff-Beschreibung zurück.
+* **Geteilte/verbotene Dateien** (`bringup.rs` ausser K7-Zeilen, `caprock-hal`,
+  `docs/`, `test-qemu*.sh`, `build*.sh`, `colors.rs`, Fremddateien) nur per
+  Patch-Text — keine Ausnahmen.
+* **Schwere Läufe** (QEMU/KVM, Voll-Builds) gestaffelt: max 3 parallel (KVM-Kontention,
+  CPU). Abnahme zuerst (Baseline), Rest danach. Lange Jobs per nohup + `build/diag/`.
+* **Integration** (opencode): je Strang gezielt prüfen, je Strang committen
+  (eigene Identität), einmal pushen. Regel 3 gilt je Commit (HEAD baut).
+
+| # | Strang | Dateien (NUR diese) |
+|---|---|---|
+| 1 | ABNAHME | keine (nur fahren + berichten) |
+| 2 | B4B-DATA | keine (Analyse + Patch-Text) |
+| 3 | B4B-QEMU | `build/diag/`-Logs (nur lesen sonst) |
+| 4 | E2E-GUEST | `tools/lx_fahrt*.sh`, `tools/lx_minelf*` |
+| 5 | WASM-SPEC | `programs/mem-server/SPEZIFIKATION.md` (Anhang) |
+| 6 | WASM-ENG | NEU `programs/wasm/` (Kern + Tests) |
+| 7 | WASM-MEM | NEU `programs/wasm/src/mem.rs` (via ENG-Verzeichnis, nur diese Datei!) |
+| 8 | WASM-WASI | NEU `programs/wasm/src/wasi.rs` (nur diese Datei!) |
+| 9 | K7-SONDE | Patch-Text (bringup geteilt) |
+| 10 | DBG-HAL | Patch-Text (`hal::debug`, HAL-Besitz) |
+| 11 | CSUB-MEM | `programs/mem-server/src/protokoll.rs` (nur Grant-Teil) |
+| 12 | RSP-WIRE | `programs/rspd/` |
+| 13 | AARCH64-BOOT | keine (nur fahren + berichten) |
+| 14 | FORBID | `crates/*/src/lib.rs` (nur `forbid`-Zeile, wo unsafe-frei BELEGT) |
+| 15 | LX-SYMBOLS | `tools/lx_schablonen.md` (Zahlen-Update) |
+| 16 | STATUS | `STATUS.md` (NUR eigener Abschnitt) |
+| 17 | PERF-C9 | keine (messen + berichten) |
+| 18 | L3-FORMAT | `crates/caprock-loader/src/manifest.rs` (+ Tests) |
+| 19 | B4B-DRIVER | `programs/hardware/virtio-blk/src/main.rs` |
+| 20 | ISO-DIST | NEU `tools/lx_dist*.sh` |
+
+7/8 teilen sich `programs/wasm/` per Datei — ENG legt das Gerüst zuerst an
+(inkl. leerer `mem.rs`/`wasi.rs` als Anker), MEM/WASI füllen nur ihre Datei.
+
+## 16 · 2026-09-10 · opencode (Linux-Compat) an B · docs/plan-uki.md angelegt (Simon beauftragt)
+
+UKI-Direktstart-Plan auf Simons ausdrückliche Anweisung in `docs/` abgelegt
+(sonst dein Besitz — nur lesend zur Kenntnis): Planung, kein Code, keine
+bestehende Datei angerührt. Inhalt: 3 Bausteine, Aufwand 1–2 Wochen +1 für
+Measured Boot, Abnahme per OVMF-Vergleichsboot. Reihenfolge: nach B4b/E2E/WASM.
+
 ## 15 · 2026-09-10 · opencode (Linux-Compat) an alle · Fahrt 5: gestartet=1 + VA-Regel für lxport
 
 Verify-am-Boot steht (commit 6d780cc): Spannen-Rückfall bei Archiv-Hash-Abweichung,

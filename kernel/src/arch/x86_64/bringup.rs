@@ -2068,13 +2068,11 @@ const SWEEP_KMAX: [u32; SWEEP_PFADE] = [12, 12, 4, 6, 4, 6, 3, 24];
 //     Die letzte ist neu und ein Befund fuer sich: sie stand als „Ladepfad" gebucht und ist
 //     keiner -- sie ist der Weg, auf dem eine Treiber-PD ihr Geraetefenster bekommt, und der
 //     braucht kein Archiv. Ein Grund, der nie nachgeprueft wird, ueberlebt jede Umgebung.
-//  2. **PROVOZIERT, nur MIT Boot-Archiv** (5): 4288 Segmentspeicher · 4304 Seitentabelle eines
-//     Segments · 4350 User-Stack · 4366 Seitentabelle des Stacks · Heap-OOM der va_liste in
-//     `load_into_pd_mit_va` (drei `try_reserve`, eine Meldestelle). Das ist der Ladepfad, auf dem
+//  2. **PROVOZIERT, nur MIT Boot-Archiv** (4): 4288 Segmentspeicher · 4304 Seitentabelle eines
+//     Segments · 4350 User-Stack · 4366 Seitentabelle des Stacks. Das ist der Ladepfad, auf dem
 //     `NoResources` sechs Wochen stumm war; die Lade-Suite hat das Archiv, die Hauptsuite nicht.
-//     Die fuenfte Stelle meldet Heap-Erschoepfung statt Topf-Leere -- der Sweep leert Toepfe,
-//     keinen Heap, also provoziert er sie nicht; sie steht hier, damit der Nenner stimmt,
-//     nicht als behauptete Abdeckung.
+//     (Die Heap-OOM-Stelle der va_liste (Sept 2026) ist mit den statischen Scratch-Bereichen
+//     entfallen -- kein Heap im Kernel, also keine OOM-Meldestelle. Nenner 43.)
 //  3. **PLATZ-TOEPFE** (10): 2399/2453/3221/3386/3547/4438 Thread-Slot · 2572 ASID ·
 //     3293/4171 Farbstreifen · 4516 PD-Slot. Die Sperre sitzt im SPEICHER-Allokator; diese Toepfe
 //     vergeben keine Bytes. Sie zu leeren heisst tausende Threads/PDs anzulegen -- das ist die
@@ -2104,7 +2102,7 @@ const SWEEP_KMAX: [u32; SWEEP_PFADE] = [12, 12, 4, 6, 4, 6, 3, 24];
 #[cfg(feature = "selftest")]
 const SWEEP_K1_PROVOZIERT_OHNE_ARCHIV: usize = 12;
 #[cfg(feature = "selftest")]
-const SWEEP_K2_PROVOZIERT_MIT_ARCHIV: usize = 5;
+const SWEEP_K2_PROVOZIERT_MIT_ARCHIV: usize = 4;
 #[cfg(feature = "selftest")]
 const SWEEP_K3_PLATZ: usize = 10;
 #[cfg(feature = "selftest")]
@@ -5267,7 +5265,7 @@ fn report_and_off(watchdog: bool) -> ! {
              ist keiner: sie ist der Weg zum GERAETEFENSTER einer Treiber-PD und braucht kein \
              Archiv. **{} PROVOZIERT NUR MIT ARCHIV** (in diesem Lauf: {}): 4288 Segmentspeicher · \
              4304 Seitentabelle eines Segments · 4350 User-Stack · 4366 Seitentabelle des Stacks \
-             · Heap-OOM der va_liste (Topf-leer unprovoziert, s. Klasse 2) \
+             · Heap-OOM entfallen (kein Heap im Kernel, s. Klasse 2) \
              -- der echte load_into_pd_mit, dieselbe Funktion, die SYS_LOAD ruft. **{} PLATZ-\
              TOEPFE** (2399/2453/3221/3386/3547/4438 Thread-Slot, 2572 ASID, 3293/4171 \
              Farbstreifen, 4516 PD-Slot): die Sperre sitzt im SPEICHER-Allokator, diese Toepfe \

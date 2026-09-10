@@ -36,6 +36,17 @@
 //! (8-Bit-APIC-ID in Bits 47:40). Wer EIME einschaltet, muss hier mit ändern; [`irte_build`] weist
 //! eine APIC-ID über 255 deshalb **ab**, statt sie abzuschneiden.
 //!
+//! ## x2APIC branch (EIME set)
+//!
+//! [`irte_build_x2apic`] encodes the destination in the **x2APIC** format: the full 32-bit
+//! APIC ID in bits 63:32, with no `0xFF` cap. Which branch applies travels in
+//! [`Vektorwunsch::x2apic`] and must match `IRTA.EIME` as programmed by `vtd::ir_enable`
+//! (both read the same `x2apic_active()` state, so table and entries cannot drift apart).
+//! Bit positions per Linux `struct irte` (`dest_id : 32`, bits 63:32) combined with
+//! `IRTE_DEST(dest) = eim ? dest : dest << 8` (`drivers/iommu/intel/irq_remapping.c`,
+//! `include/linux/dmar.h`): without EIME the 8-bit ID lands shifted in 47:40, with EIME
+//! the 32-bit ID sits unshifted in 63:32.
+//!
 //! ## Die VERGABE (seit 2026-08-10) — und für WEN sie da ist
 //!
 //! Bis hierher war das eine reine Kodierung ohne Abnehmer: die Remapping-Tabelle stand seit B-3.2
@@ -115,6 +126,26 @@ pub fn irte_build(vector: u8, apic_id: u32, sid: u16) -> Option<Irte> {
     //  15:0  SID
     //  17:16 SQ
     //  19:18 SVT
+    let hi = (sid as u64) | (SQ_ALLE_16 << 16) | (SVT_SID << 18);
+    Some(Irte { lo, hi })
+}
+
+/// **Build an IRTE for x2APIC (EIME set): same entry, 32-bit destination.**
+///
+/// Identical to [`irte_build`] except for the destination field: the full 32-bit APIC ID
+/// goes unshifted into bits 63:32 (Linux `IRTE_DEST(dest) = dest` in EIM mode). There is
+/// no `0xFF` cap — every `u32` ID is encodable. Vectors below 32 are still refused (they
+/// are CPU exceptions, whatever the APIC mode).
+///
+/// Callers do not pick this directly: [`vergib`] selects it when [`Vektorwunsch::x2apic`]
+/// is set, which the HAL sets from the same state that programs `IRTA.EIME`.
+pub fn irte_build_x2apic(vector: u8, apic_id: u32, sid: u16) -> Option<Irte> {
+    if vector < 32 {
+        return None;
+    }
+    // lo: P/DM/RH/TM/DLM/Vector as in [`irte_build`]; Destination = full ID in 63:32.
+    let lo = 1 | (DLM_FIXED << 5) | ((vector as u64) << 16) | ((apic_id as u64) << 32);
+    // hi: SID/SQ/SVT unchanged — source validation does not depend on the APIC mode.
     let hi = (sid as u64) | (SQ_ALLE_16 << 16) | (SVT_SID << 18);
     Some(Irte { lo, hi })
 }
@@ -451,6 +482,14 @@ pub struct Vektorwunsch {
     pub basis_vektor: u8,
     /// Ziel-LAPIC (xAPIC-Format, ≤ 255 ohne `EIME`).
     pub apic_id: u32,
+    /// x2APIC destination format — must match `IRTA.EIME` as programmed.
+    ///
+    /// Set from `x2apic_active()` by the HAL grant path (`vtd::irte_vergib`). `true`
+    /// selects [`irte_build_x2apic`] (32-bit ID in 63:32, no `0xFF` cap); `false` keeps
+    /// the xAPIC branch of [`irte_build`] byte-identical, including the refusal above
+    /// 255. One flag from one boot state for both table and entries, so the two can
+    /// never disagree about the format.
+    pub x2apic: bool,
     /// Die **BDF des Geräts** — das ist die Sicherheitsaussage, s. Modul-Doku zu `SVT`/`SID`.
     pub sid: u16,
     pub form: Vektorform,
@@ -491,7 +530,10 @@ pub trait IrtZugriff {
 /// Zuteilung ist schlimmer als keine" steht bei `assign_driver_device` schon einmal, aus demselben
 /// Grund.
 fn pruefe_kodierbar(w: &Vektorwunsch) -> Result<(), VergabeFehler> {
-    if w.apic_id > 0xFF {
+    // x2APIC branch: any u32 ID is encodable (32-bit destination with EIME set), so the
+    // cap falls away ONLY here. The xAPIC branch below is untouched: it still refuses
+    // instead of truncating, because a truncated ID would name a different core.
+    if !w.x2apic && w.apic_id > 0xFF {
         return Err(VergabeFehler::ApicIdZuGross { apic_id: w.apic_id });
     }
     let letzter = (w.basis_vektor as usize)
@@ -563,7 +605,9 @@ pub fn vergib<Z: IrtZugriff>(
         let vektor = w.basis_vektor + i as u8;
         // `pruefe_kodierbar` hat den ganzen Block schon abgenommen; ein `None` hier wäre ein
         // Widerspruch zwischen beiden Stellen und darf nicht als „geht halt nicht" durchgehen.
-        let Some(e) = irte_build(vektor, w.apic_id, w.sid) else {
+        // The constructor follows `w.x2apic`, so the entry format always matches IRTA.EIME.
+        let encode = if w.x2apic { irte_build_x2apic } else { irte_build };
+        let Some(e) = encode(vektor, w.apic_id, w.sid) else {
             ruecknahme(z, a, handle, w.anzahl, i);
             return Err(VergabeFehler::VektorReserviert {
                 vektor: vektor as u32,
@@ -944,6 +988,7 @@ pub fn selbsttest<Z: IrtZugriff>(
         &Vektorwunsch {
             basis_vektor: vektor,
             apic_id: 0,
+            x2apic: false,
             sid: sid_a,
             form: Vektorform::MsiX,
             anzahl: 1,
@@ -973,6 +1018,7 @@ pub fn selbsttest<Z: IrtZugriff>(
         &Vektorwunsch {
             basis_vektor: vektor,
             apic_id: 0,
+            x2apic: false,
             sid: sid_b,
             form: Vektorform::MsiX,
             anzahl: 1,
@@ -1000,6 +1046,7 @@ pub fn selbsttest<Z: IrtZugriff>(
             &Vektorwunsch {
                 basis_vektor: 14,
                 apic_id: 0,
+                x2apic: false,
                 sid: sid_a,
                 form: Vektorform::MsiX,
                 anzahl: 1
@@ -1022,6 +1069,7 @@ pub fn selbsttest<Z: IrtZugriff>(
             &Vektorwunsch {
                 basis_vektor: vektor,
                 apic_id: 0,
+                x2apic: false,
                 sid: sid_a,
                 form: Vektorform::MsiX,
                 anzahl: 1
@@ -1103,6 +1151,56 @@ mod tests {
         // falschen Ort an, und das sieht aus wie Erfolg.
         assert!(irte_build(0x40, 0x100, 0).is_none());
         assert!(irte_build(0x40, 0xFF, 0).is_some());
+    }
+
+    #[test]
+    fn xapic_branch_is_bit_identical() {
+        // The x2APIC work must not move a single xAPIC bit: exact-word pin for the branch
+        // that stays. P=1, DLM=fixed, vector 0x42 at 23:16, 8-bit ID 3 at 47:40, SVT=01.
+        let e = irte_build(0x42, 3, 0).unwrap();
+        assert_eq!(e.lo, 1 | (0x42u64 << 16) | (3u64 << 40));
+        assert_eq!(e.hi, SVT_SID << 18);
+    }
+
+    #[test]
+    fn x2apic_destination_is_32bit_wide() {
+        // EIME set: the full ID sits unshifted in 63:32 (Linux IRTE_DEST = dest), so an ID
+        // above 255 survives instead of aliasing a different core.
+        let e = irte_build_x2apic(0x42, 0x12345, 0).unwrap();
+        assert_eq!(e.lo & 1, 1, "P must be set");
+        assert_eq!((e.lo >> 16) & 0xFF, 0x42, "vector stays at 23:16");
+        assert_eq!((e.lo >> 32) & 0xFFFF_FFFF, 0x12345, "32-bit destination at 63:32");
+        assert_eq!((e.hi >> 18) & 0b11, SVT_SID, "source validation is mode-independent");
+    }
+
+    #[test]
+    fn x2apic_accepts_ids_above_255() {
+        // The 0xFF cap falls away ONLY in this branch; the xAPIC assertions next to it
+        // pin the branch that keeps refusing.
+        assert!(irte_build_x2apic(0x40, 0x100, 0).is_some());
+        assert!(irte_build_x2apic(0x40, 0xFFFF, 0).is_some());
+        assert!(irte_build_x2apic(0x40, 0xFFFF_FFFF, 0).is_some());
+        assert!(irte_build(0x40, 0x100, 0).is_none());
+    }
+
+    #[test]
+    fn x2apic_still_refuses_cpu_exception_vectors() {
+        // Vectors below 32 are CPU exceptions in either APIC mode.
+        assert!(irte_build_x2apic(14, 0x1234, 0).is_none());
+        assert!(irte_build_x2apic(31, 0x1234, 0).is_none());
+        assert!(irte_build_x2apic(32, 0x1234, 0).is_some());
+    }
+
+    #[test]
+    fn x2apic_grant_path_encodes_large_ids() {
+        // End to end through `vergib`: a large ID is granted AND lands in 63:32.
+        let (mut z, mut a) = (Sicht::neu(), IrteAllocator::new());
+        let mut w = wunsch(1, Vektorform::MsiX);
+        w.x2apic = true;
+        w.apic_id = 0x1234;
+        let m = vergib(&mut z, &mut a, true, &w).unwrap();
+        let (lo, _) = z.lies(m.handle());
+        assert_eq!((lo >> 32) & 0xFFFF_FFFF, 0x1234);
     }
 
     #[test]
@@ -1275,6 +1373,7 @@ mod tests {
         Vektorwunsch {
             basis_vektor: 0x40,
             apic_id: 0,
+            x2apic: false,
             sid: sid_from_bdf(0, 4, 0).unwrap(),
             form,
             anzahl,

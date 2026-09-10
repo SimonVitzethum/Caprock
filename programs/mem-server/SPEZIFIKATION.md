@@ -63,3 +63,8 @@ Wort — der Linearspeicher ist ein Grant mit Zweck, weiter nichts.
 **Explizit nicht hier:** Engine-Auswahl und -Bau (Kandidaten nur benannt: Engine mit
 `no_std`-Pfad, z. B. wasmi-Klasse; Prüffrage ist der Speicherzugriff pro Lade/Speicher —
 Trap bei Zugriff über den Linearspeicher hinaus). Erst die Schnittstelle, dann die Engine.
+
+## Simon-Entscheidung 2026-09-10: WASM-Go
+
+Go für den WASM-Weg. Nächster Schritt ist Stufe 2a ohne `memory.grow` (statisch, eine
+Anfrage beim Start); 2b/2c hängen nicht daran und warten auf ihre Bedingung.

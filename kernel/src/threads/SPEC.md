@@ -117,3 +117,8 @@ Tenants; die Domäne ist deshalb ein neues, benanntes Konzept, kein umbenanntes 
   die ARM-Seite (s. Ergebnisbericht).
 - **Gemeinsam (`kernel/src/system.rs`):** `system::nohz_stand(core)`-Accessor +
   Tick-seitige Umprogrammierung in `reschedule` (s. Ergebnisbericht).
+
+## Simon-Entscheidung 2026-09-10: §12a-Bestätigung
+
+Option 2 bleibt gültig (Zusicherung auf Tenant-gegen-Tenant verengt). Tenant-gegen-Kernel
+(F1/F2) bleibt offen und gehört zu Stufe 3, nicht in diesen Schritt.

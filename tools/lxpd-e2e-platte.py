@@ -20,6 +20,13 @@ Dokumente (Werte wie in den Dienst-Tests, damit jede Pruefung greift):
 
 Aufruf:
   tools/lxpd-e2e-platte.py --disk build/lxpd-e2e.img --image <treiber.elf> [--lba 21000]
+  tools/lxpd-e2e-platte.py --selbsttest   (Trockenlauf ohne QEMU: Temp-Platte bauen,
+    EIN Bild schreiben, alles nachpruefen)
+
+D5-Hinweis: Die Platte traegt genau EIN Treiber-Bild und gehoert NICHT zur
+Boot-Startmenge (D5 verlangt nur Manifestposition = Archivposition, s. Kopf von
+`tools/lxpd-e2e.sh`). Verbraucher ist `suchen(index 0)` in `programs/lxpd-runtime`,
+der nur das erste LXIMG2-Verzeichnis liest — weitere Bilder haetten keinen Leser.
 
 Prueft nach dem Schreiben alles selbst nach (GPT-Signatur/Revision/CRCs beider Koepfe,
 Verzeichnis-Magic/Laengen, SHA-256 des Bildes gegen den Eintrag, Zeuge + Manifest-Signatur
@@ -49,7 +56,10 @@ FREI_HALTEN = {20001, 20002, 32710}
 # Manifest-Signatur im Dienst (der die Kanonik selbst wiederherstellt).
 CANON = b'{"api_version":"X1","arch":"x86-64","class_b_objects":[],"coverage_pct":100.0,"dma_window":{"base":0,"size":65536,"bits":64},"driver":"e1000e","gpl_affected":false,"grants_bar":[{"index":0,"base":4096,"size":8192,"flags":"RW"}],"irq_vector":7,"schema_version":1,"trampolines":["dma_map_single->caprock_dma_map","spin_lock->caprock_spin_lock"]}'
 
-FNV_OFFSET = 0xCBF29CE484222325
+# FNV-1a-64-Standard-Basis (NICHT ...2325 — dort stand ein Tippfehler; der
+# Dienst-Spiegel `programs/lxpd-runtime/src/lib.rs` rechnet mit dem Standard, und jede
+# andere Basis faellt im Gast als `BadSignature` auf, s. AGENTS.md-Mitteilung 14).
+FNV_OFFSET = 0xCBF29CE4842225C5
 FNV_PRIME = 0x100000001B3
 
 
@@ -224,9 +234,45 @@ def haupt(args) -> int:
     return 0
 
 
+def selbsttest() -> int:
+    """Trockenlauf ohne QEMU: Lade-Suite-Platte im Temp bauen, EIN Bild schreiben,
+    alles nachpruefen (dasselbe `haupt`, das der Echteinsatz faehrt)."""
+    import os
+    import subprocess
+    import tempfile
+    hier = os.path.dirname(os.path.abspath(__file__))
+    with tempfile.TemporaryDirectory(prefix="lxpd-platte-selbsttest-") as tmp:
+        platte = os.path.join(tmp, "platte.img")
+        bild = os.path.join(tmp, "treiber.bin")
+        with open(bild, "wb") as f:
+            f.write(b"LXPD-SELBSTTEST\x00" * 200)  # 3200 B: in 1..=8192
+        r = subprocess.run(
+            [sys.executable, os.path.join(hier, "mkgpt.py"), platte,
+             "--sectors", "32768",
+             "--part", "34:20000", "--part", "20001:32700", "--magic-at", "20001",
+             "--fat16", "34:20000", "--file", "HELLO.TXT=CAPROCKS-DATEIINHALT"],
+            capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"SELBSTTEST: mkgpt scheiterte: {r.stderr.strip()}", file=sys.stderr)
+            return 1
+        ns = argparse.Namespace(disk=platte, image=bild, lba=21000)
+        if haupt(ns) != 0:
+            print("SELBSTTEST: Schreiben/Pruefen meldete Fehler", file=sys.stderr)
+            return 1
+    print("LXPD-E2E-PLATTE-SELBSTTEST: ALL PASS")
+    return 0
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--disk", required=True)
-    ap.add_argument("--image", required=True)
+    ap.add_argument("--disk")
+    ap.add_argument("--image")
     ap.add_argument("--lba", type=int, default=21000)
+    ap.add_argument("--selbsttest", action="store_true",
+                    help="Trockenlauf ohne QEMU: Temp-Platte bauen, EIN Bild schreiben, nachpruefen.")
+    args = ap.parse_args()
+    if args.selbsttest:
+        sys.exit(selbsttest())
+    if not args.disk or not args.image:
+        ap.error("--disk und --image sind noetig (oder --selbsttest).")
     sys.exit(haupt(ap.parse_args()))

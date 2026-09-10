@@ -137,6 +137,13 @@ const GSTS_CFIS: u32 = 1 << 23;
 const IRT_ENTRIES: u64 = super::irte::IRT_EINTRAEGE as u64;
 const IRTA_SIZE_FIELD: u64 = super::irte::IRTA_GROESSENFELD;
 
+/// `IRTA.EIME` (bit 11): the table holds entries in x2APIC format (32-bit destination
+/// in IRTE 63:32). With EIME clear the unit reads the xAPIC format (8-bit ID in 47:40).
+/// Set exactly when the core runs x2APIC — without x2APIC it is a reserved bit.
+/// Evidence: Linux `IR_X2APIC_MODE(mode) ((mode) ? (1 << 11) : 0)` ORed into the IRTA
+/// value (`drivers/iommu/intel/irq_remapping.c`); table/entry formats, VT-d §5.1.3/§9.9.
+const IRTA_EIME: u64 = 1 << 11;
+
 /// Basisadresse der Interrupt-Remapping-Tabelle (0 = IR nicht aktiv).
 static IRT: [AtomicU64; super::dmar::MAX_UNITS] =
     [const { AtomicU64::new(0) }; super::dmar::MAX_UNITS];
@@ -973,10 +980,16 @@ fn ir_enable(alloc: &mut dyn FnMut() -> Option<u64>) -> bool {
         return false;
     }
     let Some(table) = alloc() else { return false };
-    // Groessenfeld in den unteren Bits, Adresse in 63:12. EIME (Bit 11) bleibt aus: es gilt nur
-    // im x2APIC-Modus, und den meldet diese Plattform nicht zwingend -- ein gesetztes EIME ohne
-    // x2APIC waere ein reserviertes Bit.
-    write64(REG_IRTA, (table & !0xfff) | IRTA_SIZE_FIELD);
+    // Size field in the low bits, address in 63:12, EIME (bit 11, see [`IRTA_EIME`]) exactly
+    // when this core runs x2APIC. A set EIME without x2APIC would be a reserved bit; a clear
+    // EIME with x2APIC-format entries (or vice versa) would be a new silent misformat, so
+    // the entry side (`irte_vergib`) reads the same `x2apic_active()` state. That state is
+    // settled by now: `intc::init_cpu` (which sets the mode) runs in bring-up before
+    // `vtd::init`, and the mode never changes afterwards. B4b rig (M1/M2, TCG): CPU on
+    // x2APIC (MSR path) against xAPIC-format IRTEs — programmed queue vector, used.idx=1,
+    // no faults, no IRQ.
+    let eime = if super::intc::x2apic_active() { IRTA_EIME } else { 0 };
+    write64(REG_IRTA, (table & !0xfff) | IRTA_SIZE_FIELD | eime);
     if !gcmd_issue(GCMD_SIRTP, GSTS_IRTPS, true) {
         return false;
     }
@@ -1176,9 +1189,14 @@ pub fn irte_vergib(
 ) -> Result<super::irte::MsiZiel, super::irte::VergabeFehler> {
     let tabelle = IRT[0].load(Ordering::Acquire);
     let aktiv = irte_vergabe_moeglich();
+    // The entry format follows the same mode that programmed IRTA.EIME in `ir_enable`
+    // (`x2apic_active()` is set once by `intc::init_cpu` before `vtd::init` and never
+    // changes), so table and entries always agree. `apic_id` comes from `lapic_id()`,
+    // which already yields the full 32-bit ID in x2APIC mode.
     let w = super::irte::Vektorwunsch {
         basis_vektor,
         apic_id,
+        x2apic: super::intc::x2apic_active(),
         sid: (rid & 0xFFFF) as u16,
         form,
         anzahl,

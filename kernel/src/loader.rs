@@ -1553,6 +1553,12 @@ pub enum LxpdAbsage {
     /// Transportnachweis der lxport-Pipeline, kein Code. Der Boot braucht die
     /// `bind_elf`-Form (reines ET_EXEC-ELF); sie kommt über denselben Eintrag herein,
     /// sobald der Format-Strang sie liefert.
+    ///
+    /// Das ist kein Platzhalter, sondern die dauerhaft korrekte Antwort fuer Container:
+    /// v1 ist Kopf + n x 32-B-Stubs (`LXTR` + ID + 2 x FNV32 + NOP-Padding) + `LXEND`
+    /// (Fahrt 4: 153 B, 4 Stubs) — kein ausfuehrbares Segment, kein Einsprungpunkt.
+    /// Starten ist damit strukturell unmoeglich, nicht bloss unverifiziert; auch nach
+    /// Verify-am-Boot endet ein Container hier, nur das ELF daneben startet.
     TransportNur,
     /// Der Root-Task läuft nicht — ohne Partner keine Backend-PD (die Hülle wurde trotzdem geprüft).
     WurzelFehlt,
@@ -1744,6 +1750,17 @@ fn lxpddrv_laden(
             for &(_, cap) in alle[..n].iter().flatten() {
                 let _ = crate::system::cap_delete(cap);
             }
+            // **Der Grund wird genannt** (wie in `do_load`): ein `NoResources` ohne
+            // Ressource ist die Pruefer-Krankheit. `lade_mangel()` steht hier noch auf
+            // dem Fehlschlag (nichts dazwischen setzt zurueck).
+            if e == LoaderError::NoResources {
+                let (code, bytes, frei) = crate::system::lade_mangel();
+                println!(
+                    "lxpddrv :   fehlende Ressource: {} (Code {code}); angefordert {bytes} Byte, \
+                     freier Rest {frei} Byte",
+                    crate::system::mangel_name(code)
+                );
+            }
             Err(LxpdAbsage::LoaderAbgewiesen(e))
         }
     }
@@ -1797,6 +1814,9 @@ fn lxpd_container_gate(pid: u32, tramp_count: usize) -> Result<(), LxpdAbsage> {
 /// Auflösung je Eintrag (Domäne HardwareLand, nicht ROOT):
 /// 1. **Welches Modul?** Archivmodul mit gleicher `program_id` (wie der Root-Task) oder —
 ///    ohne `program_id`-Feld im Container — Bootloader-Spanne mit gleichem Hash.
+///    Weicht die Archivkopie vom Manifest-Hash ab, wird ersatzweise die Spanne mit
+///    gleichem Hash genommen (HINWEIS-Zeile); traegt keine Spanne die geforderten
+///    Bytes, bleibt es `HashAbweichung`.
 /// 2. **Hash womit?** `sha256(Modulbytes) == Eintrag.sha256`, vor jeder weiteren Prüfung.
 /// 3. **Signatur gegen welche Keys?** Es gibt nur angenommene Manifeste (`read_manifest`,
 ///    gegen [`crate::manifest_keys::MANIFEST_KEYS`]) — ungeprüfte Einträge existieren hier nicht.
@@ -1839,10 +1859,20 @@ pub fn boot_lxpd_treiber(partner: Option<usize>) -> (usize, usize) {
             continue;
         }
         // --- Quelle suchen: Archiv zuerst (Join-Key `program_id`), dann Spannen (Join-Key Hash).
+        //
+        // Weicht die Archivkopie vom Manifest-Hash ab, faellt die Absage NICHT sofort:
+        // erst werden die Spannen gefragt. Der Manifest-Hash ist die einzige Autoritaet
+        // ueber das WAS — traegt eine Spanne genau die geforderten Bytes, erfuellt sie
+        // dieselbe Bindung, die die Archivkopie verfehlt. Belegt: Fahrt 2 fand die Spanne
+        // per Hash (`quelle=Bootloader-Modul`), Fahrt 4 nur das Archiv; ohne Rueckfall
+        // waere der Spannen-ELF-Pfad bei gueltiger Wurzel (D5 verlangt die ID im Archiv,
+        // das Archiv gewinnt immer) strukturell unerreichbar — gemessen nie gruen.
+        // Die Abweichung bleibt sichtbar (HINWEIS bei Spannenfund, `HashAbweichung` ohne).
         let mut bild: Option<&[u8]> = None;
         let mut prog_aus_archiv: Option<Program<'_>> = None;
         let mut archiv_index: Option<u32> = None;
         let mut quelle = "unbekannt";
+        let mut archiv_abweichung = false;
         if let Some(a) = archiv.as_ref() {
             if let Some(ai) =
                 (0..a.count()).find(|&i| a.program(i).map(|p| p.program_id) == Some(pid))
@@ -1855,8 +1885,7 @@ pub fn boot_lxpd_treiber(partner: Option<usize>) -> (usize, usize) {
                         quelle = "Archiv";
                     }
                     _ => {
-                        lxpd_nein(pid, name, "Archiv", LxpdAbsage::HashAbweichung);
-                        continue;
+                        archiv_abweichung = true;
                     }
                 }
             }
@@ -1868,12 +1897,26 @@ pub fn boot_lxpd_treiber(partner: Option<usize>) -> (usize, usize) {
                 if sha256(bytes) == e.sha256 {
                     bild = Some(bytes);
                     quelle = "Bootloader-Modul";
+                    if archiv_abweichung {
+                        println!(
+                            "lxpddrv : [{pid}]{name} HINWEIS Archivkopie weicht vom Manifest-Hash ab -- Spanne {si} traegt die geforderten Bytes und wird geladen (Bindung: sha256 == Eintrag)"
+                        );
+                    }
                     break;
                 }
             }
         }
         let Some(bild) = bild else {
-            lxpd_nein(pid, name, quelle, LxpdAbsage::NichtGefunden);
+            lxpd_nein(
+                pid,
+                name,
+                if archiv_abweichung { "Archiv" } else { quelle },
+                if archiv_abweichung {
+                    LxpdAbsage::HashAbweichung
+                } else {
+                    LxpdAbsage::NichtGefunden
+                },
+            );
             continue;
         };
         // --- Form unterscheiden: ELF lädt (Zuständigkeit beachten), LXPD wird geprüft.
@@ -1907,6 +1950,16 @@ pub fn boot_lxpd_treiber(partner: Option<usize>) -> (usize, usize) {
                     // `u32::MAX` = kein Archivmodul: `reload_driver` findet darunter kein
                     // Archivprogramm und meldet benannt `NotLoaded`, statt ein FALSCHES
                     // Modul (fremder Spannenindex als Archivindex gelesen) zu laden.
+                    //
+                    // VOLLZAEHLIGKEIT: kein zweiter Eintrag noetig — `lxpddrv_laden`
+                    // laeuft durch `load_program_into_pd_auf`, und dort traegt
+                    // `record_program_thread` (s. dort) den Thread unter `program_id`
+                    // ein, bevor dieser Zweig je erreicht wird. Ohne ihn luege
+                    // `vollzahl` dauerhaft (Fahrt 4: `6/7 FEHLEND pid 7`). Kein Doppel
+                    // mit dem init-Pfad: Spannen sieht `load_by_index` nicht (es liest
+                    // nur das Archiv), und Archiv-ELFs fasst dieser Hook nicht an
+                    // (`an-init-verwiesen`-Zweig oben) — jede PD wird genau einmal
+                    // unter ihrer ID eingetragen.
                     let index = archiv_index.unwrap_or(u32::MAX);
                     set_driver_service(DriverService {
                         ep,

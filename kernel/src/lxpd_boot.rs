@@ -429,6 +429,31 @@ mod tests {
     }
 
     #[test]
+    fn spannen_tabelle() {
+        // Die Spannen-Registrierung ist der Join des Spannen-ELF-Pfads im Boot-Hook
+        // (`boot_lxpd_treiber` sucht per Hash): was hier nicht gemeldet ist, findet er
+        // nicht — Fahrt 4 meldete `Spannen=0`. Eine Funktion, ein Test.
+        let vor = lxpd_module_gemeldet();
+        // Ausserhalb der Tabelle: Absage am Aufruf, kein stilles Verwerfen.
+        assert!(!set_lxpd_module_span(LXPD_MAX_MODULES, 0x1000, 64));
+        assert!(!set_lxpd_module_span(usize::MAX, 0x1000, 64));
+        assert!(lxpd_module_span(LXPD_MAX_MODULES).is_none());
+        // Melden, lesen, ueberschreiben — auf dem letzten freien Platz, damit kein
+        // anderer Test (keiner fasst die Tabelle an) und kein Zaehler stoert.
+        let idx = LXPD_MAX_MODULES - 1;
+        assert!(set_lxpd_module_span(idx, 0x1000, 64));
+        assert_eq!(lxpd_module_span(idx), Some((0x1000, 64)));
+        assert_eq!(lxpd_module_gemeldet(), vor + 1);
+        assert!(set_lxpd_module_span(idx, 0x2000, 128));
+        assert_eq!(lxpd_module_span(idx), Some((0x2000, 128)));
+        assert_eq!(lxpd_module_gemeldet(), vor + 1);
+        // `(0, 0)` meldet ab: der Platz zaehlt nicht mehr (Delta bleibt 0).
+        assert!(set_lxpd_module_span(idx, 0, 0));
+        assert!(lxpd_module_span(idx).is_none());
+        assert_eq!(lxpd_module_gemeldet(), vor);
+    }
+
+    #[test]
     fn fehlertexte_benannt() {
         // Jeder Fehler hat einen festen Text — eine Absage ohne Namen ist keine Diagnose.
         assert_eq!(LxpdBootError::TooSmall.as_str(), "lxpd-boot: image ends before the announced structure");

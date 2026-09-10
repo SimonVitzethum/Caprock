@@ -15,8 +15,6 @@
 //! nimmt zwei verschiedene `SCHEDS[*]` gleichzeitig. Vollständige Herleitung + alle belegten
 //! Schachtelungen: `docs/invariants.md` §1.
 
-extern crate alloc;
-
 use caprock_cap::{CapError, CapInfo, CapPtr, DmaCoherence, DmaDir, ObjectKind};
 use caprock_hal::{self as hal, exception::TrapFrame, fp::FpState, println};
 use caprock_cap::checkpoint::{Channel, Edge, EdgeRole, Scope};
@@ -309,26 +307,48 @@ fn kstack_arena_bestuecken(faeden: usize) -> u64 {
             return 0;
         }
     };
-    // Wachen legen (x86: echte Splits, aarch64: nur gezaehlt). Schlaegt eine Wache fehl,
-    // wird genau dieser Slot gesperrt statt die ganze Arena zu verwerfen — Dichte statt
-    // Alles-oder-Nichts; gesperrte Slots zaehlen als vergeben, nie als frei.
-    for i in 0..plaetze {
-        let wache_ok = match arena.wache_von_slot(i) {
-            Some(wache) => hal::mmu::guard_unmap(wache as u64),
-            None => false,
-        };
-        if !wache_ok {
-            arena.sperren(i);
-        }
-    }
+    // KEIN Vorab-Legen der Wachen (2026-09-10, Root-NoResources): eine Schleife ueber alle
+    // Plaetze rief `guard_unmap` je Slot -- bei ~4000 Plaetzen waren damit fast alle 4096
+    // Guard-Pages des HAL-Vorrats beim Bestuecken schon vergeben, und jeder weitere
+    // Streu-Stack (hello!) fiel mit MANGEL_GUARD_TABELLE. Wachen werden stattdessen LAZY
+    // bei der ersten Vergabe gelegt (s. `kstack_arena_vergeben`): was nie lebt, kostet
+    // keine Wache; belegte Bloecke + Pages folgen den lebenden Stacks, nicht der Planzahl.
     *KSTACK_ARENA.lock() = Some(arena);
     *ARENA_PLAN.lock() = (faeden, plaetze, grund, true);
     cap.len() + bcap.len()
 }
 
 /// C7c: Arena-Vergabe (nur ungefaerbter Pfad; `None` = Streupfad weiter).
+///
+/// Die Wache wird LAZY gelegt (s. `kstack_arena_bestuecken`): erst pruefen, ob sie schon
+/// steht (`ist_wache` -- wiederverwendete Slots behalten ihre), sonst legen; schlaegt das
+/// Legen fehl (Blockvorrat erschoepft), wird genau dieser Slot gesperrt und der naechste
+/// freie versucht (Retry-Schleife, begrenzt durch die Platzahl -- kein endloses Kreisen).
+/// aarch64 kennt keine echten Wachen (`guard_unterstuetzt() == false`): dort zaehlt das
+/// Legen nur, und jeder Slot gilt sofort.
 fn kstack_arena_vergeben() -> Option<usize> {
-    KSTACK_ARENA.lock().as_mut()?.vergeben().ok()
+    let mut arena_guard = KSTACK_ARENA.lock();
+    let arena = arena_guard.as_mut()?;
+    loop {
+        let base = arena.vergeben().ok()?;
+        let Some(slot) = arena.slot_von_stapelbasis(base) else {
+            continue;
+        };
+        if !hal::mmu::guard_unterstuetzt() {
+            return Some(base);
+        }
+        let Some(wache) = arena.wache_von_slot(slot) else {
+            arena.sperren(slot);
+            continue;
+        };
+        if hal::mmu::ist_wache(wache as u64) {
+            return Some(base);
+        }
+        if hal::mmu::guard_unmap(wache as u64) {
+            return Some(base);
+        }
+        arena.sperren(slot);
+    }
 }
 
 /// C7c: Arena-Freigabe — `true` heisst „war ein Arena-Slot, ist gebucht".
@@ -1237,10 +1257,12 @@ fn dispatch_delete_cap(cap: caprock_cap::CapPtr) -> Result<(), u64> {
         .map_err(|_| caprock_abi::result::ERR_HASCHILDREN)
 }
 
-/// **Die fuenf Debug-Syscalls, an einer Stelle** (Z6b).
+/// **Die acht Debug-Syscalls, an einer Stelle** (Z6b + Debugger-v2).
 ///
 /// Der Rueckruf des Dispatch. Er loest die Cap **selbst** auf und haelt `CAPS` ueber den ganzen
-/// Vorgang -- s. die Doku an [`debug_stop`] fuer den Grund.
+/// Vorgang -- s. die Doku an [`debug_stop`] fuer den Grund. 21-25 und 33 sind voll verdrahtet;
+/// 34-35 sind autorisiert geprueft und weisen den fehlenden CPU-Pfad (`hal::debug`) benannt ab --
+/// s. [`debug_single_step`] und [`debug_hwbreak`]. Nie ein Stub-Erfolg.
 fn dispatch_debug(
     nr: u64,
     pd: usize,
@@ -1255,6 +1277,9 @@ fn dispatch_debug(
         caprock_abi::sys::DEBUG_CONTINUE => debug_continue(pd, slot, a1),
         caprock_abi::sys::DEBUG_READ_MEM => debug_read_mem(pd, slot, a1, a2, a3),
         caprock_abi::sys::DEBUG_WRITE_REGS => debug_write_reg(pd, slot, a1, a2, a3),
+        caprock_abi::sys::DEBUG_WRITE_MEM => debug_write_mem(pd, slot, a1, a2, a3),
+        caprock_abi::sys::DEBUG_SINGLE_STEP => debug_single_step(pd, slot, a1),
+        caprock_abi::sys::DEBUG_HWBREAK => debug_hwbreak(pd, slot, a1, a2, a3),
         _ => Err(caprock_abi::result::ERR_BADSYS),
     }
 }
@@ -3992,6 +4017,63 @@ pub fn forkexec_bilanz() -> (u64, u64, u64, u64) {
     )
 }
 
+/// FORK-Kratzflaeche (BSS, ~5,7 KiB): die sechs Segmentlisten von `dispatch_fork`
+/// (`quelle`, `vas`, `plan`, `kind_segs`, `kind_vas`, `kind_perms`, je `MAX_IMG_SEGS`
+/// Eintraege).
+///
+/// Weder Heap noch Stack — beides ist hier kein Fix, sondern der Fehler: der Kernel hat
+/// KEINEN Heap (`main.rs`: `NoGlobalHeap`, jeder `alloc`-Versuch scheitert per Design —
+/// sechs `Vec`s mit `try_reserve` schlugen also IMMER fehl und der Root-Task startete
+/// nie), und ~6 KiB Arrays auf dem Stack sprengten per Inlining die 4-KiB-Kstacks heisser
+/// Pfade (#DF-Befund 2026-09-10). Die Kapazitaet folgt `MAX_IMG_SEGS` (keine zweite Zahl
+/// daneben); gelesen wird immer nur bis zum frisch geschriebenen Zaehler (`nq`/`nseg`/
+/// `nkind`), nie weiter — alte Inhalte sind damit unerreichbar, kein Rueckstand.
+///
+/// Sperr-Rang: Blattlock (`docs/invariants.md` §1) — IMMER als aeusserster Lock zuerst
+/// genommen (`dispatch_fork` nimmt ihn als erste Anweisung, ohne dass eine andere Sperre
+/// gehalten wird; CAPS/MEM/SCHEDS/... liegen alle darunter), nie verschachtelt genommen,
+/// waehrend eine von ihnen gehalten wird. Eigenes Lock statt eines gemeinsamen mit
+/// `LOAD_SCRATCH`: FORK laeuft auf dem Syscall-Kern, LOAD auf dem Verifizierer bzw. via
+/// EXEC nebenlaeufig — ein gemeinsames Lock serialisierte beide Pfade ohne Grund. Beide
+/// Kratzlocks werden nie gleichzeitig gehalten (`dispatch_exec` nimmt keines der beiden,
+/// `dispatch_fork` ruft nie den Ladepfad).
+struct ForkScratch {
+    quelle: [(u64, u64, u64, u8); MAX_IMG_SEGS],
+    vas: [(u64, u64); MAX_IMG_SEGS],
+    plan: [caprock_loader::snapshot::SnapSeg; MAX_IMG_SEGS],
+    kind_segs: [(u64, u64); MAX_IMG_SEGS],
+    kind_vas: [u64; MAX_IMG_SEGS],
+    kind_perms: [u8; MAX_IMG_SEGS],
+}
+static FORK_SCRATCH: SpinLock<ForkScratch> = SpinLock::new(ForkScratch {
+    quelle: [(0, 0, 0, 0); MAX_IMG_SEGS],
+    vas: [(0, 0); MAX_IMG_SEGS],
+    plan: [caprock_loader::snapshot::SnapSeg { va: 0, len: 0 }; MAX_IMG_SEGS],
+    kind_segs: [(0, 0); MAX_IMG_SEGS],
+    kind_vas: [0; MAX_IMG_SEGS],
+    kind_perms: [0; MAX_IMG_SEGS],
+});
+
+/// LOAD-Kratzflaeche (BSS, ~1,6 KiB): die drei Stuecklisten von `load_into_pd_mit_va`
+/// (`seglist`, `vvas`, `pperm`, je `MAX_IMG_SEGS` Eintraege).
+///
+/// Derselbe Grund wie bei `FORK_SCRATCH`: kein Heap (der Ladepfad wiese sonst ueber EXEC
+/// auf 4-KiB-Aufrufer-Stacks jede Ladung ab), kein Stack (1,6 KiB gehoeren nicht auf einen
+/// 4-KiB-Kstack). Gelesen wird nur bis `nrec`. Sperr-Rang: Blattlock
+/// (`docs/invariants.md` §1) — wie `FORK_SCRATCH` als aeusserster Lock zuerst genommen
+/// (erste Anweisung von `load_into_pd_mit_va`), nie verschachtelt mit CAPS/MEM/SCHEDS,
+/// nie gleichzeitig mit `FORK_SCRATCH` gehalten.
+struct LoadScratch {
+    seglist: [(u64, u64); MAX_IMG_SEGS],
+    vvas: [u64; MAX_IMG_SEGS],
+    pperm: [u8; MAX_IMG_SEGS],
+}
+static LOAD_SCRATCH: SpinLock<LoadScratch> = SpinLock::new(LoadScratch {
+    seglist: [(0, 0); MAX_IMG_SEGS],
+    vvas: [0; MAX_IMG_SEGS],
+    pperm: [0; MAX_IMG_SEGS],
+});
+
 /// `FORK_SNAPSHOT`: volle Kopie der registrierten Frames der Quell-PD in eine frische Kind-PD.
 ///
 /// Kein COW (s. `caprock-loader::snapshot`-Doku: Dirty-Tracking + nachladender Fault-Pfad
@@ -4010,13 +4092,16 @@ pub fn forkexec_bilanz() -> (u64, u64, u64, u64) {
 /// Streifen) — kein `ERR_NOSPACE`-statt-Aufraeumen: ein halb angelegtes Kind waere ein Leck
 /// mit gueltiger PD-Nummer.
 ///
-/// **Kein Stack-Speicher ueber ~256 Byte in dieser Funktion** (2026-09-10, #DF-Befund):
+/// **Weder Heap noch Stack-Speicher ueber ~256 Byte in dieser Funktion** (2026-09-10):
 /// die sechs Segmentlisten (`quelle`, `vas`, `plan`, `kind_*`, je 64 Eintraege, zusammen
 /// ~6 KiB) standen als Arrays auf dem Stack — und der Compiler zog sie per Inlining in
 /// `syscall()` hoch, wo sie auf JEDEM Syscall (nicht nur FORK) 4-KiB-Kstacks sprengten
-/// (RIP im Syscall-Prolog, RSP 264 B unter dem Stackboden). Sie liegen deshalb auf dem
-/// Heap (`Vec`, OOM = benanntes `ERR_NOSPACE`, nie Panic), und die Funktion traegt
-/// `#[inline(never)]`: selbst ein kuenftiges Inline duerfte die Listen nie wieder in einen
+/// (RIP im Syscall-Prolog, RSP 264 B unter dem Stackboden). Auf dem Heap standen sie
+/// danach (`Vec`): dort schlugen sie IMMER fehl — der Kernel hat KEINEN Heap (`main.rs`:
+/// `NoGlobalHeap`, `alloc` scheitert per Design; `try_reserve` → Err → benannte Absage),
+/// der Root-Task startete nie. Sie liegen deshalb in `FORK_SCRATCH` (BSS, Blattlock, als
+/// aeusserster Lock zuerst genommen — s. dort), und die Funktion traegt weiter
+/// `#[inline(never)]`: selbst ein kuenftiges Inline duerfte die Pfade nie wieder in einen
 /// heissen Rahmen legen.
 #[inline(never)]
 fn dispatch_fork(
@@ -4026,6 +4111,15 @@ fn dispatch_fork(
     prio: u8,
 ) -> Result<u64, u64> {
     use caprock_abi::result;
+    // Kratzflaeche ZUERST (Blattlock, s. `FORK_SCRATCH`): keine andere Sperre gehalten;
+    // alles Folgende (CAPS/MEM/SCHEDS/...) liegt darunter. Gueltig bis Funktionsende —
+    // die Slices unten laufen auf den statischen Feldern.
+    let mut kratz = FORK_SCRATCH.lock();
+    // EINMAL aufspalten: Borrows durch den `SpinLock`-Guard sind nicht feldgenau
+    // (`&kratz.quelle` neben `&mut kratz.kind_segs` lehnte der Borrowchecker ab, E0502) —
+    // ueber `&mut ForkScratch` sind sie es. Die Namen unten bleiben die statischen
+    // Felder, keine Kopien.
+    let kratz: &mut ForkScratch = &mut *kratz;
     // Aufrufer-Domaene + Budget erben; der Kind-Slot muss im Aufrufer-Cspace frei sein —
     // alles lesend, bevor irgendetwas angelegt ist.
     let g = CAPS.read();
@@ -4050,12 +4144,9 @@ fn dispatch_fork(
     if asid == 0 {
         return Err(result::ERR_NOPD);
     }
-    let mut quelle: alloc::vec::Vec<(u64, u64, u64, u8)> = alloc::vec::Vec::new();
-    if quelle.try_reserve_exact(MAX_IMG_SEGS).is_err() {
-        return Err(result::ERR_NOSPACE);
-    }
-    quelle.resize(MAX_IMG_SEGS, (0, 0, 0, 0));
-    let nq = loaded_snapshot(asid, &mut quelle);
+    // Quellmenge: registrierte Frames der eigenen ASID. Kratzfeld statt Heap/Stack
+    // (s. Funktionsdoku) — Kapazitaet statisch, kein Reserve-Fehler.
+    let nq = loaded_snapshot(asid, &mut kratz.quelle);
     if nq == 0 {
         return Err(result::ERR_NOPD);
     }
@@ -4075,13 +4166,8 @@ fn dispatch_fork(
     // Die Stack-Fenster fallen aus der Kopie: sie bekommen das Kind frisch (s. Doku oben).
     // Gefiltert wird ueber die VA — ein weiterer Grund, warum die Liste beim Mappen
     // gesammelt wird statt geraten.
-    let mut vas: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
-    if vas.try_reserve_exact(MAX_IMG_SEGS).is_err() {
-        return Err(result::ERR_NOSPACE);
-    }
-    vas.resize(MAX_IMG_SEGS, (0, 0));
     let mut nseg = 0usize;
-    for &(phys, va, len, _) in &quelle[..nq] {
+    for &(phys, va, len, _) in &kratz.quelle[..nq] {
         let _ = phys;
         if va >= LOADED_STACK_VA && va < LOADED_STACK_VA + LOADED_STACK_BYTES {
             continue;
@@ -4089,21 +4175,13 @@ fn dispatch_fork(
         if nseg >= MAX_IMG_SEGS {
             return Err(result::ERR_SNAPSHOT_LIMIT);
         }
-        vas[nseg] = (va, len);
+        kratz.vas[nseg] = (va, len);
         nseg += 1;
     }
     // Rein pruefen, bevor irgendetwas alloziert ist (kanonisch in `forkexec`).
-    // Heap statt Stack (s. Funktionsdoku): `SnapSeg` ist `Copy`, die Liste lebt im Heap.
-    let mut plan: alloc::vec::Vec<caprock_loader::snapshot::SnapSeg> =
-        alloc::vec::Vec::new();
-    if plan.try_reserve_exact(MAX_IMG_SEGS).is_err() {
-        return Err(result::ERR_NOSPACE);
-    }
-    plan.resize(
-        MAX_IMG_SEGS,
-        caprock_loader::snapshot::SnapSeg { va: 0, len: 0 },
-    );
-    let (_nstueck, summe) = match forkexec::fork_plan_pruefen(&vas[..nseg], max_len, &mut plan) {
+    // Kratzfeld statt Heap/Stack (s. Funktionsdoku): `SnapSeg` ist `Copy`.
+    let (_nstueck, summe) =
+        match forkexec::fork_plan_pruefen(&kratz.vas[..nseg], max_len, &mut kratz.plan) {
         Ok(v) => v,
         Err(f) => return Err(forkexec::fork_fehler_code(f)),
     };
@@ -4190,33 +4268,20 @@ fn dispatch_fork(
         return Err(result::ERR_NOSPACE);
     };
     // Stuecke kopieren: phys→phys (beide identity-gemappt), an DIESELBEN VAs mappen.
-    // Heap statt Stack (s. Funktionsdoku) -- drei Listen, ein Reserve-Fehler.
-    let mut kind_segs: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
-    let mut kind_vas: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-    let mut kind_perms: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    if kind_segs.try_reserve_exact(MAX_IMG_SEGS).is_err()
-        || kind_vas.try_reserve_exact(MAX_IMG_SEGS).is_err()
-        || kind_perms.try_reserve_exact(MAX_IMG_SEGS).is_err()
-    {
-        kind_aufraeumen(kind_pd, casid, &[], None, kbase, streifen);
-        return Err(result::ERR_NOSPACE);
-    }
-    kind_segs.resize(MAX_IMG_SEGS, (0, 0));
-    kind_vas.resize(MAX_IMG_SEGS, 0);
-    kind_perms.resize(MAX_IMG_SEGS, 0);
+    // Drei Kratzfelder (s. Funktionsdoku) — Kapazitaet statisch, kein Reserve-Fehler.
     let mut nkind = 0usize;
-    for &(sphys, va, len, pcode) in &quelle[..nq] {
+    for &(sphys, va, len, pcode) in &kratz.quelle[..nq] {
         if va >= LOADED_STACK_VA && va < LOADED_STACK_VA + LOADED_STACK_BYTES {
             continue;
         }
         let Some(p) = perm_von(pcode) else {
             println!("fork    : ABGEWIESEN -- unbekannter Perm-Code {pcode} an VA {va:#x}");
-            kind_aufraeumen(kind_pd, casid, &kind_segs[..nkind], None, kbase, None);
+            kind_aufraeumen(kind_pd, casid, &kratz.kind_segs[..nkind], None, kbase, None);
             return Err(result::ERR_BADSYS);
         };
         let Some(region) = mem_alloc_masked_anywhere_auf(len, 4096, kind_maske, knoten) else {
             mangel(MANGEL_SEGMENT_SPEICHER, len);
-            kind_aufraeumen(kind_pd, casid, &kind_segs[..nkind], None, kbase, None);
+            kind_aufraeumen(kind_pd, casid, &kratz.kind_segs[..nkind], None, kbase, None);
             return Err(result::ERR_NOSPACE);
         };
         let dpa = region.base();
@@ -4227,9 +4292,9 @@ fn dispatch_fork(
         unsafe {
             core::ptr::copy_nonoverlapping(sphys as *const u8, dpa as *mut u8, len as usize);
         }
-        kind_segs[nkind] = (dpa, len);
-        kind_vas[nkind] = va;
-        kind_perms[nkind] = pcode;
+        kratz.kind_segs[nkind] = (dpa, len);
+        kratz.kind_vas[nkind] = va;
+        kratz.kind_perms[nkind] = pcode;
         nkind += 1;
         let mut off = 0u64;
         while off < len {
@@ -4244,7 +4309,7 @@ fn dispatch_fork(
                 if lade_mangel().0 == MANGEL_KEINER {
                     mangel(MANGEL_MAPPING_ABGEWIESEN, 0);
                 }
-                kind_aufraeumen(kind_pd, casid, &kind_segs[..nkind], None, kbase, None);
+                kind_aufraeumen(kind_pd, casid, &kratz.kind_segs[..nkind], None, kbase, None);
                 return Err(result::ERR_NOSPACE);
             }
             off += 4096;
@@ -4258,16 +4323,16 @@ fn dispatch_fork(
         let n = LOADED_STACK_BYTES;
         let Some(region) = mem_alloc_masked_anywhere_auf(n, 4096, kind_maske, knoten) else {
             mangel(MANGEL_STACK_SPEICHER, n);
-            kind_aufraeumen(kind_pd, casid, &kind_segs[..nkind], None, kbase, None);
+            kind_aufraeumen(kind_pd, casid, &kratz.kind_segs[..nkind], None, kbase, None);
             return Err(result::ERR_NOSPACE);
         };
         let spa = region.base();
         if kind_maske.is_none() {
             kind_stack = Some((spa, n));
         } else {
-            kind_segs[nkind] = (spa, n);
-            kind_vas[nkind] = LOADED_STACK_VA;
-            kind_perms[nkind] = PERM_RW;
+            kratz.kind_segs[nkind] = (spa, n);
+            kratz.kind_vas[nkind] = LOADED_STACK_VA;
+            kratz.kind_perms[nkind] = PERM_RW;
             nkind += 1;
         }
         let mut off = 0u64;
@@ -4289,7 +4354,7 @@ fn dispatch_fork(
                 if lade_mangel().0 == MANGEL_KEINER {
                     mangel(MANGEL_MAPPING_ABGEWIESEN, 0);
                 }
-                kind_aufraeumen(kind_pd, casid, &kind_segs[..nkind], kind_stack, kbase, None);
+                kind_aufraeumen(kind_pd, casid, &kratz.kind_segs[..nkind], kind_stack, kbase, None);
                 return Err(result::ERR_NOSPACE);
             }
             off += 4096;
@@ -4326,16 +4391,16 @@ fn dispatch_fork(
     let Some(ctid) = ctid else {
         hal::cpu::local_irq_restore(daif);
         mangel(MANGEL_THREAD_SLOT, 0);
-        kind_aufraeumen(kind_pd, casid, &kind_segs[..nkind], kind_stack, kbase, None);
+        kind_aufraeumen(kind_pd, casid, &kratz.kind_segs[..nkind], kind_stack, kbase, None);
         return Err(result::ERR_NOSPACE);
     };
     if !loaded_register(
         casid,
         eintritt,
         startarg,
-        &kind_segs[..nkind],
-        &kind_vas[..nkind],
-        &kind_perms[..nkind],
+        &kratz.kind_segs[..nkind],
+        &kratz.kind_vas[..nkind],
+        &kratz.kind_perms[..nkind],
     ) {
         hal::cpu::local_irq_restore(daif);
         // `kill_remote` rechnet den Kstack selbst ab (`reclaim_user_kstack`) und der Reaper die
@@ -4347,7 +4412,7 @@ fn dispatch_fork(
                 "fork    : RUECKZUG Kind-Thread nicht beendbar -- PD {kind_pd} bleibt stehen (Leck statt UAF)"
             );
         }
-        kind_aufraeumen(kind_pd, casid, &kind_segs[..nkind], None, 0, None);
+        kind_aufraeumen(kind_pd, casid, &kratz.kind_segs[..nkind], None, 0, None);
         return Err(result::ERR_NOSPACE);
     }
     // KEIN `record_program_thread`: das Kind hat keine `program_id` aus dem Manifest, und die
@@ -6199,31 +6264,16 @@ fn loaded_eintritt(asid: u16) -> Option<(usize, usize)> {
 }
 
 /// Die registrierten RAM-Frames der `asid` an den Allokator zurückgeben + den Slot freigeben.
-/// Snapshot ziehen, `LOADED_IMAGES` freigegeben, DANN `MEM` (Rangordnung: nie beide gleichzeitig).
-///
-/// Heap statt 1-KiB-Stack-Array (Audit 2026-09-10, #DF-Klasse): Teardown laeuft auf
-/// moeglicherweise fast vollen Stacks (Fault-/Exit-Pfade). Semantik bitgleich zur
-/// Array-Fassung (alles auf einmal entnehmen + Slot loeschen, dann freigeben) -- ein
-/// scheibchenweises Freigeben oeffnete ein Fenster, in dem ein nebenlaeufiger Leser eine
-/// halb geraeumte Tabelle saehe. Einzige neue Kante: Heap-OOM -- dann bleibt der Slot
-/// belegt UND die Frames belegt (Leck statt UAF; Rueckgabe nur, was entnommen wurde).
-/// Eine 1-KiB-Reservierung scheitert nur bei erschoepftem Heap, also wenn das System
-/// ohnehin steht; ein Stack-Array scheiterte nie, kostete dafuer jeden Aufrufer 1 KiB.
-#[inline(never)] // s. `dispatch_fork`: dicke Raeum-Funktion aus heissen Rahmen heraushalten.
+/// Snapshot ziehen, `LOADED_IMAGES` freigeben, DANN `MEM` (Rangordnung: nie beide gleichzeitig).
 fn loaded_free(asid: u16) {
-    let mut snap: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    let mut snap = [(0u64, 0u64); MAX_IMG_SEGS];
     let mut n = 0;
     {
         let mut t = LOADED_IMAGES.lock();
         if let Some(slot) = t.iter().position(|i| i.asid == asid && i.asid != 0) {
             n = t[slot].nseg;
-            if snap.try_reserve_exact(n).is_ok() {
-                snap.resize(n, (0, 0));
-                snap[..n].copy_from_slice(&t[slot].segs[..n]);
-                t[slot] = LoadedImage::EMPTY;
-            } else {
-                n = 0;
-            }
+            snap[..n].copy_from_slice(&t[slot].segs[..n]);
+            t[slot] = LoadedImage::EMPTY;
         }
     }
     if n > 0 {
@@ -6772,6 +6822,12 @@ pub fn load_into_pd_mit_va(
     pol: LadePolitik,
     va_out: Option<&mut [(u64, u64)]>,
 ) -> Option<(ThreadId, usize)> {
+    // Kratzflaeche ZUERST (Blattlock, s. `LOAD_SCRATCH`): keine andere Sperre gehalten;
+    // alles Folgende (CAPS/MEM/SCHEDS/...) liegt darunter. Gueltig bis Funktionsende —
+    // die Slices unten laufen auf den statischen Feldern.
+    let mut kratz = LOAD_SCRATCH.lock();
+    // EINMAL aufspalten (s. `dispatch_fork`): Guard-Borrows sind nicht feldgenau (E0502).
+    let kratz: &mut LoadScratch = &mut *kratz;
     // **Das Endowment wird VERBUCHT, bevor irgendetwas alloziert ist** (2026-08-25).
     //
     // Bis heute lief die Installationsschleife weiter unten so: `if !install_pd_cap(..) {
@@ -6921,24 +6977,12 @@ pub fn load_into_pd_mit_va(
         mangel(MANGEL_SEGMENT_SPEICHER, 0);
         return cleanup(asid, kbase, &[], None);
     }
-    let mut seglist: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
     // Parallel zu `seglist`: die VA und der Perm-Code je Stueck — beim Mappen gesammelt
     // (s. `load_into_pd_mit_va`-Doku), an `loaded_register` und `va_out` gegeben.
-    // Heap statt Stack (s. `dispatch_fork`-Doku): der Ladepfad laeuft ueber EXEC auch auf
-    // 4-KiB-Aufrufer-Stacks, 1,6 KiB Listen gehoeren dort nicht hin. OOM = benannte
-    // Absage ueber den bestehenden `cleanup`-Pfad, nie Panic.
-    let mut vvas: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-    let mut pperm: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    if seglist.try_reserve_exact(MAX_IMG_SEGS).is_err()
-        || vvas.try_reserve_exact(MAX_IMG_SEGS).is_err()
-        || pperm.try_reserve_exact(MAX_IMG_SEGS).is_err()
-    {
-        mangel(MANGEL_SEGMENT_SPEICHER, 0);
-        return cleanup(asid, kbase, &[], None);
-    }
-    seglist.resize(MAX_IMG_SEGS, (0, 0));
-    vvas.resize(MAX_IMG_SEGS, 0);
-    pperm.resize(MAX_IMG_SEGS, 0);
+    // Kratzfelder statt Heap/Stack (s. `LOAD_SCRATCH`): der Ladepfad laeuft ueber EXEC
+    // auch auf 4-KiB-Aufrufer-Stacks, 1,6 KiB Listen gehoeren dort nicht hin, und einen
+    // Heap gibt es nicht (`NoGlobalHeap`). Kapazitaet statisch, kein Reserve-Fehler —
+    // die Absage bei Ueberlauf steht oben (`stuecke_noetig`) und unten (`loaded_register`).
     let mut nrec = 0usize;
     for seg in img.segments() {
         let total = (((seg.memsz as u64) + 4095) & !4095).max(4096) as usize;
@@ -6956,15 +7000,15 @@ pub fn load_into_pd_mit_va(
             let Some(region) = mem_alloc_masked_anywhere_auf(n as u64, 4096, mask, knoten)
             else {
                 mangel(MANGEL_SEGMENT_SPEICHER, n as u64);
-                return cleanup(asid, kbase, &seglist[..nrec], None);
+                return cleanup(asid, kbase, &kratz.seglist[..nrec], None);
             };
             let pa = region.base(); // MemoryCap-Drop = nur Deskriptor (kein Free); RAM bleibt belegt
             // VOR dem Mappen registrieren -> ein späterer Map-Fehler gibt diesen Frame mit frei.
             // Daneben SOFORT die VA und den Perm: spaeter ist die Zuordnung (welches Stueck lag
             // an welcher VA) nicht mehr herstellbar — kein inverser Index, kein Raten.
-            seglist[nrec] = (pa, n as u64);
-            vvas[nrec] = seg.vaddr + done as u64;
-            pperm[nrec] = perm_code(perm);
+            kratz.seglist[nrec] = (pa, n as u64);
+            kratz.vvas[nrec] = seg.vaddr + done as u64;
+            kratz.pperm[nrec] = perm_code(perm);
             nrec += 1;
             copy_segment_at(pa, img.segment_bytes(&seg), done, n);
             let mut off = 0u64;
@@ -6990,7 +7034,7 @@ pub fn load_into_pd_mit_va(
                     if lade_mangel().0 == MANGEL_KEINER {
                         mangel(MANGEL_MAPPING_ABGEWIESEN, 0);
                     }
-                    return cleanup(asid, kbase, &seglist[..nrec], None);
+                    return cleanup(asid, kbase, &kratz.seglist[..nrec], None);
                 }
                 off += 4096;
             }
@@ -7022,7 +7066,7 @@ pub fn load_into_pd_mit_va(
         let n = stack_sz.min(LOADED_STACK_BYTES as usize - sdone);
         let Some(region) = mem_alloc_masked_anywhere_auf(n as u64, 4096, mask, knoten) else {
             mangel(MANGEL_STACK_SPEICHER, n as u64);
-            return cleanup(asid, kbase, &seglist[..nrec], stack_reap);
+            return cleanup(asid, kbase, &kratz.seglist[..nrec], stack_reap);
         };
         let pa = region.base();
         if mask.is_none() {
@@ -7031,9 +7075,9 @@ pub fn load_into_pd_mit_va(
         } else {
             // Wie die Segmente oben: Phys, VA und Perm SOFORT nebeneinander — der Stack einer
             // gefaerbt geladenen PD gehoert der PD (Teardown), nicht dem Thread (Reap).
-            seglist[nrec] = (pa, n as u64);
-            vvas[nrec] = LOADED_STACK_VA + sdone as u64;
-            pperm[nrec] = PERM_RW;
+            kratz.seglist[nrec] = (pa, n as u64);
+            kratz.vvas[nrec] = LOADED_STACK_VA + sdone as u64;
+            kratz.pperm[nrec] = PERM_RW;
             nrec += 1;
         }
         let mut off = 0u64;
@@ -7057,7 +7101,7 @@ pub fn load_into_pd_mit_va(
                 if lade_mangel().0 == MANGEL_KEINER {
                     mangel(MANGEL_MAPPING_ABGEWIESEN, 0);
                 }
-                return cleanup(asid, kbase, &seglist[..nrec], stack_reap);
+                return cleanup(asid, kbase, &kratz.seglist[..nrec], stack_reap);
             }
             off += 4096;
         }
@@ -7119,7 +7163,7 @@ pub fn load_into_pd_mit_va(
         // Segmente + Stack mitfreigeben (loaded_register lief noch nicht). Gefaerbt stehen die
         // Stackstuecke bereits in `seglist`, `stack_reap` ist dann `None`.
         mangel(MANGEL_THREAD_SLOT, 0);
-        return cleanup(asid, kbase, &seglist[..nrec], stack_reap);
+        return cleanup(asid, kbase, &kratz.seglist[..nrec], stack_reap);
     };
     // **Der Rueckgabewert wird geprueft** (s. `loaded_register`): passt die Liste nicht mehr,
     // waeren die Stuecke beim Teardown verloren. Oben ist das bereits fail-closed abgefangen --
@@ -7150,12 +7194,12 @@ pub fn load_into_pd_mit_va(
         asid,
         img.entry() as usize,
         boot_arg,
-        &seglist[..nrec],
-        &vvas[..nrec],
-        &pperm[..nrec],
+        &kratz.seglist[..nrec],
+        &kratz.vvas[..nrec],
+        &kratz.pperm[..nrec],
     ) {
         hal::cpu::local_irq_restore(daif);
-        return cleanup(asid, kbase, &seglist[..nrec], stack_reap);
+        return cleanup(asid, kbase, &kratz.seglist[..nrec], stack_reap);
     }
     bind_pd(pd, tid);
     for &(slot, cap) in endow {
@@ -7189,7 +7233,7 @@ pub fn load_into_pd_mit_va(
     if let Some(out) = va_out {
         let n = nrec.min(out.len());
         for i in 0..n {
-            out[i] = (vvas[i], seglist[i].1);
+            out[i] = (kratz.vvas[i], kratz.seglist[i].1);
         }
     }
     Some((tid, nrec))
@@ -7354,17 +7398,16 @@ pub fn map_region_into_thread(tid: ThreadId, phys: u64, len: u64, kind: MappingK
 // läuft im Reschedule-Pfad (IRQs im Trap maskiert -> kein Reentrancy) und nimmt NTFNS<SCHEDS.
 /// Bindungsplätze der IRQ-Tabelle — **hergeleitet, nicht gewählt**.
 ///
-/// Eine Bindung je Gerätezuteilung (Stufe B gibt jedem Gerät genau einen Vektor, mehr ist
-/// ausdrückliches Nichtziel), plus **eine** für den in-Kernel-Binder: den aarch64-RTC-Test, der
-/// zu keiner Zuteilung gehört. Eine feste 4 daneben wäre ein zweites Gedächtnis, und die Relation
-/// `NIRQ_BIND >= MAX_DRIVER_ASSIGN` galt bis heute nur zufällig — genau die Form, die
-/// `STACK_CAP_SLOTS = 1024` gekostet hat: eine Zahl, die neben ihren Nachbarn steht statt gegen
-/// sie geprüft zu werden.
+/// Eine Bindung je Gerätevektor (Stufe B gibt jedem Gerät [`VEKTOREN_JE_ZUTEILUNG`] Vektoren),
+/// plus **eine** für den in-Kernel-Binder: den aarch64-RTC-Test, der zu keiner Zuteilung gehört.
+/// Eine feste Zahl daneben wäre ein zweites Gedächtnis, und die Relation `NIRQ_BIND >=
+/// MAX_DRIVER_ASSIGN` galt bis heute nur zufällig — genau die Form, die `STACK_CAP_SLOTS = 1024`
+/// gekostet hat: eine Zahl, die neben ihren Nachbarn steht statt gegen sie geprüft zu werden.
 ///
 /// **Die Folge ist die Aussage von `ERR_IRQ_FULL`** (E12): weil die Tabelle nie enger ist als die
 /// Menge der Zuteilungen, kann kein Treiber-PD einem anderen den Platz wegnehmen. Der Code meint
 /// damit etwas Lokales — *dieses Gerät hat keinen freien Vektor* — und nicht „das System ist voll".
-const NIRQ_BIND: usize = MAX_DRIVER_ASSIGN + 1;
+const NIRQ_BIND: usize = MAX_DRIVER_ASSIGN * VEKTOREN_JE_ZUTEILUNG + 1;
 #[allow(clippy::declare_interior_mutable_const)]
 static IRQ_INTID: [AtomicU32; NIRQ_BIND] = [const { AtomicU32::new(u32::MAX) }; NIRQ_BIND];
 #[allow(clippy::declare_interior_mutable_const)]
@@ -7373,12 +7416,33 @@ static IRQ_NTFN: [AtomicU32; NIRQ_BIND] = [const { AtomicU32::new(0) }; NIRQ_BIN
 static IRQ_BADGE: [AtomicU64; NIRQ_BIND] = [const { AtomicU64::new(0) }; NIRQ_BIND];
 #[allow(clippy::declare_interior_mutable_const)]
 static IRQ_PENDING: [AtomicBool; NIRQ_BIND] = [const { AtomicBool::new(false) }; NIRQ_BIND];
+/// **Der Vektor-Index je Bindungsplatz** — die Spalte, die aus „Interrupt `i` kam an" ein „Vektor
+/// `j` des Geräts kam an" macht.
+///
+/// Gesetzt beim Binden aus der Zuteilung ([`dispatch_bind_irq`] löst den CPU-Vektor über
+/// [`irq_vidx_fuer_vektor`] auf); `u32::MAX` heisst „kein Gerätevektor" (RTC-Test, Zustellprobe —
+/// beide binden roh über [`bind_irq`], ohne Zuteilung dahinter). Gelesen wird sie im Bericht, der
+/// sonst zwei Vektoren desselben Geräts nicht auseinanderhielte — dieselbe Unterscheidung wie
+/// `angeboten` gegen `vergeben`, nur auf der Zustellachse.
+#[allow(clippy::declare_interior_mutable_const)]
+static IRQ_VIDX: [AtomicU32; NIRQ_BIND] = [const { AtomicU32::new(u32::MAX) }; NIRQ_BIND];
 static IRQ_ANY_PENDING: AtomicBool = AtomicBool::new(false);
 static IRQ_DELIVERED: AtomicU64 = AtomicU64::new(0); // Telemetrie: zugestellte Geräte-IRQs
 /// **Wie oft `irq_hook` ueberhaupt gerufen wurde** — die ANKUNFT, unabhaengig von Bindung und Drain.
 static IRQ_HOOK_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Der zuletzt gesehene Vektor. „Es kam etwas" und „es kam MEINER" sind zwei Aussagen.
 static IRQ_HOOK_LAST: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// **Wie oft `irq_hook` eine Flanke zusammengefasst statt neu gemeldet hat** — die zweite Flanke
+/// desselben Vektors, während die erste noch undrained ist.
+///
+/// Das ist der **Re-Trigger-Schutz je Slot** (MSI ist flankengetriggert, es gibt keine Maske, die
+/// eine zweite Flanke aufhielte): die erste Flanke setzt das Pending-Bit ([`MeldeUrteil::Neu`]),
+/// jede weitere sieht es schon stehen und wird zusammengefasst statt doppelt zugestellt
+/// ([`MeldeUrteil::Zusammengefasst`] — die Entscheidung aus `hal::irte::ReTriggerSchutz`, hier als
+/// atomares Bit, weil der Hook **lock-frei** ist und kein `&mut` halten kann). Zusammenfassen ist
+/// kein Verlieren: der Drain arbeitet beim Lesen alle ausstehenden ab.
+static IRQ_ZUSAMMENGEFASST: AtomicU64 = AtomicU64::new(0);
 
 /// **Geräte-IRQ-Hook** (aus `exception.rs`, IRQ-Kontext, **LOCK-FREI**): ist `intid`
 /// registriert, vermerken (pending) + am Distributor maskieren (kein Re-Trigger), `true`.
@@ -7399,7 +7463,12 @@ fn irq_hook(intid: u32) -> bool {
     for i in 0..NIRQ_BIND {
         if IRQ_INTID[i].load(Ordering::Acquire) == intid {
             hal::intc::mask_intid(intid); // level-getriggerten Geräte-IRQ bis zum Drain sperren
-            IRQ_PENDING[i].store(true, Ordering::Release);
+            // **Schon ausstehend heisst: zusammengefasst, nicht verloren.** `swap(true)` ist kein
+            // „erneutes Melden" — der Drain liest das Bit einmal und stellt einmal zu, ganz gleich
+            // wie viele Flanken es gesetzt haben.
+            if IRQ_PENDING[i].swap(true, Ordering::AcqRel) {
+                IRQ_ZUSAMMENGEFASST.fetch_add(1, Ordering::Relaxed);
+            }
             IRQ_ANY_PENDING.store(true, Ordering::Release);
             return true;
         }
@@ -7464,7 +7533,16 @@ fn dispatch_bind_irq(intid: u32, ntfn: usize, badge: u64, core: usize) -> Result
             return Ok(());
         }
     }
-    if bind_irq(intid, ntfn, badge, core) {
+    // **Der Vektor-Index kommt aus der Zuteilung, nicht aus der Cap.** Die `Irq`-Cap trägt nur den
+    // CPU-Vektor (`intid`); welcher Index *dieses Geräts* das ist, weiss allein die Tabelle, die
+    // den Block vergeben hat. Gehört der Vektor zu keiner Zuteilung (Zustellprobe), läuft der
+    // Rohpfad — die Spalte bleibt auf „kein Gerätevektor" statt einer erfundenen 0, die hiesse
+    // „erster Vektor eines Geräts".
+    let ok = match irq_vidx_fuer_vektor(intid) {
+        Some(vidx) => bind_irq_vidx(intid, vidx, ntfn, badge, core),
+        None => bind_irq(intid, ntfn, badge, core),
+    };
+    if ok {
         Ok(())
     } else {
         Err(caprock_abi::result::ERR_IRQ_FULL)
@@ -7480,6 +7558,15 @@ fn dispatch_bind_irq(intid: u32, ntfn: usize, badge: u64, core: usize) -> Result
 ///
 /// Gibt `false`, wenn kein Bindungs-Slot frei ist.
 pub fn bind_irq(intid: u32, ntfn: usize, badge: u64, core: usize) -> bool {
+    // Roh heisst auch: ohne Zuteilung, also ohne Vektor-Index (`u32::MAX`).
+    bind_irq_vidx(intid, u32::MAX, ntfn, badge, core)
+}
+
+/// Wie [`bind_irq`], aber mit Vektor-Index `vidx` für die [`IRQ_VIDX`]-Spalte.
+///
+/// `u32::MAX` heisst „kein Gerätevektor" und ist der einzige Wert, den der Rohpfad je setzt —
+/// eine erfundene 0 würde den RTC-Test als „ersten Vektor eines Geräts" ausweisen.
+fn bind_irq_vidx(intid: u32, vidx: u32, ntfn: usize, badge: u64, core: usize) -> bool {
     for i in 0..NIRQ_BIND {
         if IRQ_INTID[i]
             .compare_exchange(u32::MAX, intid, Ordering::AcqRel, Ordering::Acquire)
@@ -7487,6 +7574,7 @@ pub fn bind_irq(intid: u32, ntfn: usize, badge: u64, core: usize) -> bool {
         {
             IRQ_NTFN[i].store(ntfn as u32, Ordering::Release);
             IRQ_BADGE[i].store(badge, Ordering::Release);
+            IRQ_VIDX[i].store(vidx, Ordering::Release);
             // SPI an den Ziel-Kern routen (GICD_ITARGETSR — fehlte bisher; lasttragend,
             // sensitivitaetsgeprueft: ohne dies erreicht der RTC-IRQ keinen Kern).
             hal::intc::route_spi(intid, core);
@@ -7495,6 +7583,26 @@ pub fn bind_irq(intid: u32, ntfn: usize, badge: u64, core: usize) -> bool {
         }
     }
     false
+}
+
+/// **Zu welchem Vektor-Index gehört dieser CPU-Vektor?** — die Auflösung für [`dispatch_bind_irq`].
+///
+/// Durchsucht die Zuteilungen nach dem Block, der `vektor` enthält; der Index ist der Abstand zur
+/// Blockbasis. `None` = keine Zuteilung führt diesen Vektor (Zustellprobe, RTC-Test) — dann gibt
+/// es auch keinen Index, statt eines geratenen.
+fn irq_vidx_fuer_vektor(vektor: u32) -> Option<u32> {
+    if vektor > 0xFF {
+        return None;
+    }
+    let g = DRIVER_ASSIGN.lock();
+    for a in g.iter().filter(|a| a.used && a.msi_da) {
+        let basis = a.msi_basis as u32;
+        let n = a.msi_anzahl as u32;
+        if vektor >= basis && vektor < basis + n {
+            return Some(vektor - basis);
+        }
+    }
+    None
 }
 
 /// Anzahl bisher zugestellter Geräte-IRQs (Telemetrie für den `irq`-Test).
@@ -7512,6 +7620,13 @@ pub fn irq_hook_stats() -> (u64, u32) {
         IRQ_HOOK_CALLS.load(Ordering::Acquire),
         IRQ_HOOK_LAST.load(Ordering::Acquire),
     )
+}
+
+/// **Wie oft der Re-Trigger-Schutz zusammengefasst hat** — zweite Flanke bei noch ausstehendem
+/// Slot (s. [`IRQ_ZUSAMMENGEFASST`]). Zusammenfassen ist kein Verlieren: der Drain stellt einmal
+/// zu, ganz gleich wie viele Flanken das Bit gesetzt haben.
+pub fn irq_zusammengefasst() -> u64 {
+    IRQ_ZUSAMMENGEFASST.load(Ordering::Acquire)
 }
 
 // --- DMA-Capabilities + DmaEnforcer-Abstraktion (ext-23) ---
@@ -9427,30 +9542,46 @@ const _: () = assert!(
 /// Höchstzahl gleichzeitiger Gerätezuteilungen (heute: eine, s. [`DRIVER_DEVICE`]).
 const MAX_DRIVER_ASSIGN: usize = 4;
 
+/// **Vektoren je Gerätezuteilung** (Stufe B, Mehrvektor-Entscheidung: 4).
+///
+/// Ein MSI-X-Gerät mit `n` Vektoren braucht `n` `Irq`-Caps und `n` Notifications — je Vektor ein
+/// Paar, weil `SYS_BIND_IRQ` genau ein Paar bindet. Vier deckt die Geräte dieser Stufe (virtio:
+/// Konfiguration + Warteschlangen); mehr ist kein neuer Mechanismus, sondern eine grössere Zahl
+/// hier und in den Tabellen, die daraus abgeleitet sind ([`MSI_VEKTOR_POOL`], [`NIRQ_BIND`]).
+/// Die Schranke ist *diese*, nicht `caprock_microkit::VEKTOREN_JE_GERAET_MAX` (64): jene begrenzt
+/// die Bindungsseite je Gerät, diese die Vergabe — gewährt wird das Minimum beider.
+pub const VEKTOREN_JE_ZUTEILUNG: usize = 4;
+
 // --- Stufe B: CPU-Vektoren fuer Geraete-MSI --------------------------------------------------
 //
-// **Ein Vektor je Zuteilung, und die Zahl ist hergeleitet, nicht gewaehlt:** Stufe B gibt jedem
-// Geraet genau einen Vektor (MSI-X mit mehreren Vektoren ist ausdruecklich Nichtziel), also braucht
-// es so viele wie es Zuteilungen gibt.
+// **Ein Block je Zuteilung, und die Zahl ist hergeleitet, nicht gewaehlt:** Stufe B gibt jedem
+// Geraet [`VEKTOREN_JE_ZUTEILUNG`] Vektoren (MSI-X mit genau dieser Breite), also braucht es so
+// viele wie es Zuteilungen mal Vektoren gibt.
 //
-// `0x60` ist frei: 0..31 sind CPU-Ausnahmen, 32 der Timer, 33 der Resched-IPI, 0x70 der
-// IRTE-Selbsttest, 0x80 der Syscall. Der `const assert` haelt die Wahl gegen die belegten Zahlen,
-// damit eine Verschiebung den Bau bricht statt still zu kollidieren.
+// `0x50` ist frei: 0..31 sind CPU-Ausnahmen, 32 der Timer, 33 der Resched-IPI, 0x70 der
+// IRTE-Selbsttest, 0x80 der Syscall. `0x60` ginge nicht mehr: der Block ist 16 Vektoren breit
+// (`0x60 + 16 = 0x70` laege auf der Zustellprobe, und `0x60 + 16 + 1` auf dem Selbsttest). Der
+// `const assert` haelt die Wahl gegen die belegten Zahlen, damit eine Verschiebung den Bau bricht
+// statt still zu kollidieren.
 //
 // **x86 only, by content and not merely by use:** every number in that list is an entry of the
 // x86 IDT. aarch64 delivers through GICv3/ITS and allocates no CPU vector at all (plan §5).
 #[cfg(target_arch = "x86_64")]
-const MSI_VEKTOR_BASIS: u8 = 0x60;
+const MSI_VEKTOR_BASIS: u8 = 0x50;
+/// **Der Pool: ein Bit je vergebbaren Vektor** — `MAX_DRIVER_ASSIGN` Zuteilungen mal
+/// [`VEKTOREN_JE_ZUTEILUNG`] Vektoren.
+#[cfg(target_arch = "x86_64")]
+const MSI_VEKTOR_POOL: usize = MAX_DRIVER_ASSIGN * VEKTOREN_JE_ZUTEILUNG;
 /// **Der Vektor der ZUSTELLPROBE** — direkt hinter dem Block der Zuteilungen.
 ///
 /// Er gehoert in denselben `const assert` wie die uebrigen: eine Probe, die sich mit einer echten
 /// Zuteilung ueberschneidet, misst deren Interrupt und meldet Erfolg.
 #[cfg(target_arch = "x86_64")]
-const MSI_TEST_VEKTOR: u8 = MSI_VEKTOR_BASIS + MAX_DRIVER_ASSIGN as u8;
+const MSI_TEST_VEKTOR: u8 = MSI_VEKTOR_BASIS + MSI_VEKTOR_POOL as u8;
 #[cfg(target_arch = "x86_64")]
 const _: () = assert!(
     MSI_VEKTOR_BASIS as usize > 33
-        && (MSI_VEKTOR_BASIS as usize) + MAX_DRIVER_ASSIGN + 1 <= 0x70,
+        && (MSI_VEKTOR_BASIS as usize) + MSI_VEKTOR_POOL + 1 <= 0x70,
     "MSI-Vektorblock (samt Zustellprobe) kollidiert mit Timer/IPI/IRTE-Selbsttest/Syscall"
 );
 
@@ -9596,43 +9727,87 @@ pub fn msi_zustellprobe() -> MsiZustellBefund {
     b
 }
 
-/// Belegte MSI-Vektoren, indiziert relativ zu [`MSI_VEKTOR_BASIS`].
+/// Belegte MSI-Vektoren, indiziert relativ zu [`MSI_VEKTOR_BASIS`] — ein Bit je
+/// vergebbaren Vektor ([`MSI_VEKTOR_POOL`] Stück).
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::declare_interior_mutable_const)]
-static MSI_VEKTOR_BELEGT: [AtomicBool; MAX_DRIVER_ASSIGN] =
-    [const { AtomicBool::new(false) }; MAX_DRIVER_ASSIGN];
+static MSI_VEKTOR_BELEGT: [AtomicBool; MSI_VEKTOR_POOL] =
+    [const { AtomicBool::new(false) }; MSI_VEKTOR_POOL];
 
-/// Einen CPU-Vektor fuer ein Geraet reservieren. `None` = alle vergeben.
+/// Einen **zusammenhängenden** CPU-Vektorblock der Länge `n` für ein Gerät reservieren.
+///
+/// Zusammenhängend, weil die IRTE-Vergabe (`irte_vergib` mit `anzahl = n`, Form `MsiX`) einen
+/// Block mit `basis_vektor + i` je Eintrag einträgt: gestreute Vektoren liessen sich dort nicht
+/// abbilden. `None` = kein zusammenhängender Block dieser Länge frei — gerätelokal, die anderen
+/// Geräte stört es nicht (E12: „dieses Gerät hat keinen freien Vektor").
 #[cfg(target_arch = "x86_64")]
-fn msi_vektor_reservieren() -> Option<u8> {
-    for i in 0..MAX_DRIVER_ASSIGN {
-        if MSI_VEKTOR_BELEGT[i]
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            return Some(MSI_VEKTOR_BASIS + i as u8);
+fn msi_block_reservieren(n: usize) -> Option<u8> {
+    if n == 0 || n > MSI_VEKTOR_POOL {
+        return None;
+    }
+    let mut start = 0usize;
+    while start + n <= MSI_VEKTOR_POOL {
+        // Erst schauen (alle frei?), dann nehmen — zwei Durchgänge statt einem, damit ein
+        // halb belegter Block nicht halb reserviert stehenbleibt.
+        let mut frei = true;
+        for i in 0..n {
+            if MSI_VEKTOR_BELEGT[start + i].load(Ordering::Acquire) {
+                frei = false;
+                break;
+            }
+        }
+        if frei {
+            let mut genommen = 0usize;
+            for i in 0..n {
+                if MSI_VEKTOR_BELEGT[start + i]
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    genommen += 1;
+                } else {
+                    break;
+                }
+            }
+            if genommen == n {
+                return Some(MSI_VEKTOR_BASIS + start as u8);
+            }
+            // Ein anderer hat dazwischen gegriffen: Zurückgeben, was wir genommen haben, und
+            // hinter der Lücke weitersuchen statt von vorn.
+            for i in 0..genommen {
+                MSI_VEKTOR_BELEGT[start + i].store(false, Ordering::Release);
+            }
+            start += 1;
+        } else {
+            start += 1;
         }
     }
     None
 }
 
-/// Einen Vektor zurueckgeben (Ruecknahme einer halben Zuteilung, Teardown).
+/// Einen Vektorblock zurückgeben (Rücknahme einer halben Zuteilung, Teardown).
 #[cfg(target_arch = "x86_64")]
-fn msi_vektor_freigeben(vektor: u8) {
-    let i = vektor.wrapping_sub(MSI_VEKTOR_BASIS) as usize;
-    if i < MAX_DRIVER_ASSIGN {
-        MSI_VEKTOR_BELEGT[i].store(false, Ordering::Release);
+fn msi_block_freigeben(basis: u8, n: usize) {
+    let start = basis.wrapping_sub(MSI_VEKTOR_BASIS) as usize;
+    for i in 0..n {
+        if start + i < MSI_VEKTOR_POOL {
+            MSI_VEKTOR_BELEGT[start + i].store(false, Ordering::Release);
+        }
     }
 }
 
-/// **What a granted device interrupt consists of.**
+/// **What a granted multi-vector device interrupt consists of.**
 ///
-/// Three pieces and not two: `ticket` is the `#[must_use]` receipt `irte_vergib` hands out, and it
-/// is the **only** thing `irte_zieh_ein` accepts. Keeping just the handle would leave a present
-/// IRTE that nobody can withdraw any more — precisely what that `#[must_use]` exists to prevent.
+/// Four pieces and not three: `ticket` is the `#[must_use]` receipt `irte_vergib` hands out for
+/// the whole block (`anzahl` entries), and it is the **only** thing `irte_zieh_ein` accepts.
+/// Keeping just the handle would leave present IRTEs that nobody can withdraw any more —
+/// precisely what that `#[must_use]` exists to prevent.
 #[derive(Clone, Copy)]
-struct MsiGrant {
-    vector: u8,
+struct MsiMehrGrant {
+    /// Erster CPU-Vektor des Blocks; Vektor `i` liegt auf `basis + i`.
+    basis: u8,
+    /// Vergebene Vektoren (`1..=VEKTOREN_JE_ZUTEILUNG`).
+    anzahl: usize,
+    /// Erster IRTE-Index; Eintrag `i` liegt auf `handle + i` (Blockvergabe, zusammenhängend).
     handle: u16,
     /// x86 only: on aarch64 there is no ticket, because there is no allocation (see
     /// [`msi_grant`]). A field that only exists where it means something beats an `Option` that
@@ -9641,38 +9816,42 @@ struct MsiGrant {
     ticket: hal::vtd::MsiZiel,
 }
 
-/// **Take an interrupt grant back — device first, translation second, vector last.**
+/// **Take a multi-vector interrupt grant back — device first, translation second, vectors last.**
 ///
-/// The order is the assurance, not the tidiness. Reversed — withdraw the IRTE, then mask, then
-/// free — there is a window in which the device is still armed and its entry is already gone: an
-/// MSI arriving there hits a **not present** IRTE. That is fail-closed as delivery, but it is a
-/// VT-d fault with no owner, counted against nothing, and it happens on a perfectly ordinary
+/// The order is the assurance, not the tidiness. Reversed — withdraw the IRTEs, then mask, then
+/// free — there is a window in which the device is still armed and its entries are already gone:
+/// an MSI arriving there hits a **not present** IRTE. That is fail-closed as delivery, but it is
+/// a VT-d fault with no owner, counted against nothing, and it happens on a perfectly ordinary
 /// abort path.
 ///
 /// This is the same order the DMA teardown already runs — **source before translation** — and it
 /// is one place on purpose: every abort path in [`assign_driver_device`] goes through here, so the
 /// paths before and after `msix_enable` cannot drift apart.
 #[cfg(target_arch = "x86_64")]
-fn msi_revoke(dev: &DriverDevice, g: &MsiGrant) {
+fn msi_revoke(dev: &DriverDevice, g: &MsiMehrGrant) {
     // 1. Still the device. Function Mask rather than `Enable = 0`, see `msix_quiesce_by_rid`.
     let _ = hal::pcie::msix_quiesce_by_rid(dev.rid, dev.msix_cap);
     if dev.msix_table != 0 {
         // SAFETY: `msix_table` is this device's identity-mapped table base (determined from BAR
-        // index + offset when the device was offered), row 0 < the reported row count, and the
-        // device belongs to nobody else until it is released.
-        unsafe { hal::pcie::msix_mask_entry(dev.msix_table, 0) };
+        // index + offset when the device was offered), each row `i < anzahl` below the reported
+        // row count (the grant capped `anzahl` at the offered entries), and the device belongs
+        // to nobody else until it is released.
+        for i in 0..g.anzahl {
+            unsafe { hal::pcie::msix_mask_entry(dev.msix_table, i as u16) };
+        }
     }
-    // 2. Only now the translation: nothing can be in flight towards it any more.
+    // 2. Only now the translation: nothing can be in flight towards it any more. One ticket for
+    // the whole block — `irte_zieh_ein` withdraws every row (`P = 0`, invalidate, free).
     let _ = hal::vtd::irte_zieh_ein(&g.ticket);
-    // 3. And only then the vector, which is what a later grant would hand out again.
-    msi_vektor_freigeben(g.vector);
+    // 3. And only then the vectors, which is what a later grant would hand out again.
+    msi_block_freigeben(g.basis, g.anzahl);
 }
 
 /// aarch64 has no MSI grant to take back — see [`msi_grant`].
 #[cfg(not(target_arch = "x86_64"))]
-fn msi_revoke(_dev: &DriverDevice, _g: &MsiGrant) {}
+fn msi_revoke(_dev: &DriverDevice, _g: &MsiMehrGrant) {}
 
-/// **Allocate an IRTE, write the device's MSI-X row, arm it** (Stufe B, B1).
+/// **Allocate an IRTE block, write the device's MSI-X rows, arm them** (Stufe B, B1).
 ///
 /// At the same place as the DMA attach and for the same reason: the assignment is the point at
 /// which a device is tied to a PD, and both authorities — *where may it write* and *where may it
@@ -9681,40 +9860,68 @@ fn msi_revoke(_dev: &DriverDevice, _g: &MsiGrant) {}
 /// channel A-5.4 closed on the DMA axis. Setting it afterwards would mean a window in which the
 /// entry exists and does not check.
 ///
+/// **Die gerätelokale Voll-Absage:** `wunsch` nennt, wie viele Vektoren dieses Gerät bekommen
+/// soll; was das Gerät nicht trägt oder was nicht frei ist, gibt es **gar keinen** statt ein paar
+/// (`None`, der Treiber pollt). Ein halber Satz wäre die halbe Zuteilung, die schlimmer ist als
+/// keine: der Treiber bände Vektoren, deren Zeilen nie geschrieben wurden, und die Bindung trüge
+/// eine Autorität ohne Übersetzung. Die Absage stört kein anderes Gerät (E12) — die Prüfung
+/// ([`geraet_vektoren`]) läuft VOR der ersten Reservierung, und jeder Fehlschlag danach zieht
+/// alles bereits Genommene über [`msi_revoke`] wieder ein.
+///
+/// **Kein Wunsch ist zu gross für diese Funktion, nur für dieses Gerät:** mehr als
+/// [`VEKTOREN_JE_ZUTEILUNG`] oder mehr als die angebotenen Zeilen wird abgewiesen, nicht gekürzt —
+/// gekürzt hiesse, der Aufrufer bekäme weniger, als er gebunden hat. Was das Gerät anbietet
+/// (`msix_eintraege`), deckelt den Wunsch von oben: ein Gerät mit zwei Zeilen bekommt zwei
+/// Vektoren, keines mit vier Zeilen Wunschdenken.
+///
 /// **No interrupt is not a failure.** A device without MSI-X (or a unit without live remapping)
-/// gets an assignment without a vector — the driver then polls as before. Refusing the device
+/// gets an assignment without vectors — the driver then polls as before. Refusing the device
 /// instead would make Stufe B a *precondition* of A-5.1 rather than its extension. What that
 /// costs is a distinction the report has to carry: see `driver_msi`.
 #[cfg(target_arch = "x86_64")]
-fn msi_grant(dev: &DriverDevice) -> Option<MsiGrant> {
+fn msi_grant(dev: &DriverDevice, wunsch: usize) -> Option<MsiMehrGrant> {
     if dev.msix_table == 0 || dev.msix_eintraege == 0 {
         return None;
     }
-    let vector = msi_vektor_reservieren()?;
+    // **VORHER, rein, ohne Hardware:** was dieses Gerät trägt, entscheidet die gerätelokale
+    // Funktion — `None` statt einer Zahl, die weder in die Tabelle noch in den Schutz passt.
+    // (Die Bindungsseite prüft den Satz mit `caprock_microkit::paare_pruefen` VOR der ersten
+    // Bindung; das ist der Zwilling dieser Zeile auf der anderen Seite des Syscalls.)
+    let anzahl = wunsch.min(dev.msix_eintraege as usize);
+    if anzahl == 0 || anzahl > VEKTOREN_JE_ZUTEILUNG {
+        return None;
+    }
+    match hal::vtd::geraet_vektoren(anzahl, dev.msix_eintraege as usize) {
+        hal::vtd::GeraeteVerdikt::Gewaehren(n) if n == anzahl => {}
+        // `GeraetVoll` und jede gekürzte Gewährung: Voll-Absage statt Teilsatz (s. oben).
+        _ => return None,
+    }
+    let basis = msi_block_reservieren(anzahl)?;
     let ticket = match hal::vtd::irte_vergib(
         dev.rid,
-        vector,
+        basis,
         hal::intc::lapic_id(),
         hal::vtd::Vektorform::MsiX,
-        1,
+        anzahl,
     ) {
         Ok(t) => t,
         Err(_) => {
-            // Nothing is present and nothing was written to the device: the reserved vector is
+            // Nothing is present and nothing was written to the device: the reserved block is
             // the only thing to give back, and `msi_revoke` has no ticket to take.
-            msi_vektor_freigeben(vector);
+            msi_block_freigeben(basis, anzahl);
             return None;
         }
     };
     let handle = ticket.handle();
-    let Some((addr, data, _)) = ticket.eintrag(0) else {
-        msi_revoke(dev, &MsiGrant { vector, handle, ticket });
-        return None;
-    };
-    // SAFETY: see `msi_revoke`.
-    unsafe { hal::pcie::msix_write_entry(dev.msix_table, 0, addr, data) };
+    let g = MsiMehrGrant { basis, anzahl, handle, ticket };
+    // **Je Zeile ihre eigene Adresse** — Zeile `i` trägt Handle `handle + i` (s. `MsixZeile`):
+    // erst Adresse und Datenwort, dann die Maske lösen, sonst ginge ein Interrupt in der
+    // Lücke an Vektor 0.
+    for z in g.ticket.msix_zeilen() {
+        // SAFETY: see `msi_revoke` (eigene Tabelle, Zeile < angebotene Zeilen, exklusives Gerät).
+        unsafe { hal::pcie::msix_write_entry(dev.msix_table, z.zeile, z.addr, z.data) };
+    }
     let ctrl = hal::pcie::msix_enable_by_rid(dev.rid, dev.msix_cap);
-    let g = MsiGrant { vector, handle, ticket };
     // A spoken-for check, not a convenience: a configuration space that does not answer returns
     // `0xffff`, and a write nobody reads back looks the same in both cases.
     if hal::pcie::all_ones16(ctrl) || ctrl & hal::pcie::MSIX_CTRL_ENABLE == 0 {
@@ -9737,7 +9944,7 @@ fn msi_grant(dev: &DriverDevice) -> Option<MsiGrant> {
 /// the aarch64 build (E0433 × 4, E0425 × 4) — third instance of *arch-neutral kernel code calls a
 /// HAL function that only x86 has*.
 #[cfg(not(target_arch = "x86_64"))]
-fn msi_grant(_dev: &DriverDevice) -> Option<MsiGrant> {
+fn msi_grant(_dev: &DriverDevice, _wunsch: usize) -> Option<MsiMehrGrant> {
     None
 }
 
@@ -9771,32 +9978,38 @@ struct DriverAssign {
     /// und dafuer braucht er beide Zahlen. Nur die gewaehrte zu fuehren hiesse, „gekuerzt" von
     /// „so angefordert" nicht unterscheiden zu koennen -- genau die Aussage, um die es hier geht.
     dma_gewuenscht: u32,
-    // --- Stufe B: Interrupt ----------------------------------------------------------------
+    // --- Stufe B: Interrupt (Mehrvektor) ---------------------------------------------------
     //
     // **Die Bindung haengt HIER und nicht an einer globalen Tabelle** (E12). Es gibt bereits eine
-    // natuerliche Obergrenze -- ein Vektor je Geraet --, also braucht es kein Konto: wer ein Geraet
-    // hat, hat genau dessen Bindungen, und kein Treiber-PD kann einem anderen die Ressource
-    // wegnehmen, weil die Zuteilung schon die Vergabestelle ist. `ERR_IRQ_FULL` meint damit etwas
-    // **Lokales**: dieses Geraet hat keinen freien Vektor.
+    // natuerliche Obergrenze -- [`VEKTOREN_JE_ZUTEILUNG`] Vektoren je Geraet --, also braucht es
+    // kein Konto: wer ein Geraet hat, hat genau dessen Bindungen, und kein Treiber-PD kann einem
+    // anderen die Ressource wegnehmen, weil die Zuteilung schon die Vergabestelle ist.
+    // `ERR_IRQ_FULL` meint damit etwas **Lokales**: dieses Geraet hat keinen freien Vektor.
     //
     // Dieselbe Zahl trug vorher `NIRQ_BIND = 4` global -- formgleich zu `CAP_BUDGET_PER_PD` vor
     // der Kontoumstellung, nur dass hier die Obergrenze schon existierte.
-    /// CPU-Vektor dieses Geraets (`0` = keiner vergeben, das Geraet hat kein MSI-X).
-    msi_vektor: u8,
-    /// Der IRTE-Index, den die MSI-X-Zeile traegt. Nur fuer den Einzug beim Teardown.
+    /// Erster CPU-Vektor des Blocks (`0` = keiner vergeben — zweideutig allein, s. `msi_da`).
+    msi_basis: u8,
+    /// Vergebene Vektoren (`0` = keine; Vektor `i` liegt auf `msi_basis + i`).
+    msi_anzahl: u8,
+    /// Der erste IRTE-Index, den die MSI-X-Zeilen tragen. Nur fuer den Einzug beim Teardown —
+    /// die Zeilen liegen als Block (`handle + i`), ein Ticket braucht es danach nicht mehr.
     msi_handle: u16,
-    /// Ist er vergeben? (`msi_vektor == 0` waere zweideutig -- 0 ist ein gueltiger Vektor.)
+    /// Ist er vergeben? (`msi_basis == 0` waere zweideutig -- 0 ist ein gueltiger Vektor.)
     msi_da: bool,
     /// Identity-Adresse der MSI-X-Tabelle (`0` = keine) — mitgefuehrt, damit der Bericht die Zeile
     /// **zurueklesen** kann, statt zu glauben, dass sie noch steht.
     msix_table: u64,
     /// Offset der MSI-X-Capability im Konfigurationsraum (`0` = keine).
     msix_cap: u16,
-    /// Die Notification, auf der der Treiber seinen Interrupt erwartet (B4). `u32::MAX` = keine.
+    /// Die Notifications, auf denen der Treiber seine Interrupts erwartet (B4, je Vektor eine).
+    /// `u32::MAX` = keine — nur `[..msi_anzahl]` ist belegt.
     ///
-    /// Die **Id**, nicht die Cap: der Bericht will wissen, ob DIESES Objekt signalisiert wurde,
+    /// Die **Ids**, nicht die Caps: der Bericht will wissen, ob DIESES Objekt signalisiert wurde,
     /// und eine Cap sagt darueber nichts (der Treiber haelt eine Kopie, der Kernel das Original).
-    msi_ntfn: u32,
+    /// Die Nachfolgefassung (Hot-Reload) bekommt frische Caps auf DIESELBEN Ids — ein frisches
+    /// Objekt hiesse, dass der Interrupt weiter an das Objekt der gestorbenen Fassung geht.
+    msi_ntfn: [u32; VEKTOREN_JE_ZUTEILUNG],
     /// **Bietet das GERAET ueberhaupt MSI-X an?** — der Wunsch neben der Gewaehrung, wie
     /// `dma_gewuenscht` neben `dma_len`.
     ///
@@ -9828,12 +10041,13 @@ impl DriverAssign {
         dma_phys: 0,
         dma_len: 0,
         dma_gewuenscht: 0,
-        msi_vektor: 0,
+        msi_basis: 0,
+        msi_anzahl: 0,
         msi_handle: 0,
         msi_da: false,
         msix_table: 0,
         msix_cap: 0,
-        msi_ntfn: u32::MAX,
+        msi_ntfn: [u32::MAX; VEKTOREN_JE_ZUTEILUNG],
         msi_angeboten: false,
         iova: 0,
         cfg_page: 0,
@@ -9935,7 +10149,27 @@ pub struct DriverGrant {
     /// dessen Slot 7 leer bleibt, pollt zulässig. Welcher der beiden Fälle vorliegt, sagt
     /// `driver_msi` über `angeboten` — hier wäre die Unterscheidung nicht unterzubringen, ohne aus
     /// einer Cap eine Statusmeldung zu machen.
+    ///
+    /// Das ist das **erste** Paar; die übrigen stehen in [`Self::irq_mehr`]. Getrennt, weil der
+    /// Lader (fremder Besitz) heute nur Slot 7/8 endowt: was er kennt, behält seinen Namen, was
+    /// neu ist, steht daneben statt darin.
     pub irq: Option<CapPtr>,
+    /// Vergebene Vektoren (`0` = keine — der Treiber pollt zulässig).
+    pub irq_anzahl: usize,
+    /// Die **`Irq`-Caps je Vektor** (B2×N): `[i]` gehört zu Vektor `i` des Blocks.
+    ///
+    /// **Nur `[..irq_anzahl]` ist belegt**; der Rest ist `None`. `[0]` ist dieselbe Cap wie
+    /// [`Self::irq`] — ein zweites Original daneben wäre zwei Wahrheiten über einen Vektor.
+    /// Der Verbraucher (Lader, fremder Besitz) endowt heute `[0]` nach Slot 7 und trägt die
+    /// übrigen nach, sobald es Slots dafür gibt — oder löscht sie ausdrücklich (`cap_delete`),
+    /// statt sie still fallenzulassen.
+    pub irq_mehr: [Option<CapPtr>; VEKTOREN_JE_ZUTEILUNG],
+    /// Die **Notification-Caps je Vektor** (B2×N) — `[i]` gehört zu `[i]` in [`Self::irq_mehr`].
+    /// `[0]` ist dieselbe Cap wie [`Self::irq_ntfn`], aus demselben Grund wie dort.
+    pub irq_ntfn_mehr: [Option<CapPtr>; VEKTOREN_JE_ZUTEILUNG],
+    /// Die **Ids** derselben Objekte — `[i]` gehört zum Paar `[i]`. Die Nachfolgefassung
+    /// (Hot-Reload) bekommt frische Caps auf DIESELBEN Ids (s. `DriverAssign::msi_ntfn`).
+    pub irq_ntfn_ids: [u32; VEKTOREN_JE_ZUTEILUNG],
 }
 
 /// Ein Gerät herausnehmen, das auf `sel` passt (A-5.3). Es ist danach **vergeben**.
@@ -10034,11 +10268,13 @@ pub fn assign_driver_device(
         give_back();
         return None;
     };
-    // --- Stufe B: IRTE allocation + MSI-X row (B1) ----------------------------------------
+    // --- Stufe B: IRTE-Block + MSI-X-Zeilen (B1) ------------------------------------------------
     //
     // At the same place as the DMA attach and for the same reason; the whole argument, and the
-    // arch seam it sits behind, is at `msi_grant`.
-    let msi = msi_grant(&dev);
+    // arch seam it sits behind, is at `msi_grant`. Der Wunsch ist die Entscheidung (4 Vektoren je
+    // Gerät); was das Gerät nicht trägt oder was nicht frei ist, gibt es gar keinen statt ein paar
+    // (Voll-Absage, s. `msi_grant`).
+    let msi = msi_grant(&dev, VEKTOREN_JE_ZUTEILUNG);
     let msi_zurueck = || {
         if let Some(g) = msi.as_ref() {
             msi_revoke(&dev, g);
@@ -10096,33 +10332,39 @@ pub fn assign_driver_device(
         give_back();
         return None;
     };
-    // --- B2: die `Irq`-Cap ---------------------------------------------------------------
+    // --- B2×N: je Vektor ein Paar ---------------------------------------------------------
     //
-    // **Zuletzt geprägt, und das ist Absicht:** sie ist der einzige Schritt, dessen Misserfolg
-    // nichts anderes rückgängig machen muss als sich selbst, also steht sie dort, wo genau ein
-    // Abweispfad hinter ihr liegt. Andersherum trüge jeder der sechs Pfade darüber eine weitere
+    // **Zuletzt geprägt, und das ist Absicht:** es ist der einzige Schritt, dessen Misserfolg
+    // nichts anderes rückgängig machen muss als sich selbst, also steht er dort, wo genau ein
+    // Abweispfad hinter ihm liegt. Andersherum trüge jeder der sechs Pfade darüber eine weitere
     // Aufräumzeile — und *ein neuer Abweispfad erbt die Aufräumpflicht des alten NICHT*.
     //
     // Die Cap trägt den **CPU-Vektor** als `intid`. Auf x86 ruft der Dispatch `irq_hook` mit dem
     // rohen Vektor, es gibt also keine zweite Nummer, die hier umgerechnet werden müsste — und
-    // damit auch keine, die auseinanderlaufen könnte.
+    // damit auch keine, die auseinanderlaufen könnte. Der Vektor-Index (`IRQ_VIDX`) wird erst beim
+    // Binden aus der Zuteilung aufgelöst (s. `dispatch_bind_irq`).
     //
     // Kein Vektor, keine Cap: `None` heisst „dieses Gerät unterbricht nicht", und der Treiber
     // pollt zulässig. Das Gerät deswegen abzuweisen machte Stufe B zur Vorbedingung von A-5.1.
-    let mut irq_ntfn_id = u32::MAX;
-    let irq_paar = match msi {
-        Some(ref g) => {
-            // **Beide oder keins.** Eine `Irq`-Cap ohne Notification ist eine Autoritaet ohne
-            // Ziel, eine Notification ohne Cap ein Objekt ohne Grund -- und der Treiber verlangt
-            // beim Binden beide. Ein halb ausgestattetes Geraet scheiterte erst im Treiber, an
-            // einer Stelle, die niemand mit der Zuteilung in Verbindung braechte.
+    //
+    // **Beide oder keins — je Paar, und alle Paare oder keins.** Eine `Irq`-Cap ohne Notification
+    // ist eine Autoritaet ohne Ziel, eine Notification ohne Cap ein Objekt ohne Grund — und der
+    // Treiber verlangt beim Binden beide. Ein halb ausgestattetes Geraet scheiterte erst im
+    // Treiber, an einer Stelle, die niemand mit der Zuteilung in Verbindung braechte. Gilt ein
+    // Paar nicht, fallen alle bereits geprägten mit (Schleife unten) plus der ganze Rest der
+    // Zuteilung — dieselbe Voll-Absage wie im Grant, eine Ebene höher.
+    let mut irq_ntfn_ids = [u32::MAX; VEKTOREN_JE_ZUTEILUNG];
+    let mut irq_mehr: [Option<CapPtr>; VEKTOREN_JE_ZUTEILUNG] = [None; VEKTOREN_JE_ZUTEILUNG];
+    let mut irq_ntfn_mehr: [Option<CapPtr>; VEKTOREN_JE_ZUTEILUNG] =
+        [None; VEKTOREN_JE_ZUTEILUNG];
+    let irq_anzahl = msi.map_or(0, |g| g.anzahl);
+    if let Some(g) = msi {
+        for i in 0..g.anzahl {
+            let vektor = g.basis + i as u8;
             let paar = create_notification().and_then(|nid| {
-                let ic = install_irq_cap(g.vector as u32, Rights::READ).ok()?;
+                let ic = install_irq_cap(vektor as u32, Rights::READ).ok()?;
                 match install_notification_cap(nid as u32, Rights::RWX) {
-                    Ok(nc) => {
-                        irq_ntfn_id = nid as u32;
-                        Some((ic, nc))
-                    }
+                    Ok(nc) => Some((nid as u32, ic, nc)),
                     Err(_) => {
                         let _ = cap_delete(ic);
                         None
@@ -10130,8 +10372,20 @@ pub fn assign_driver_device(
                 }
             });
             match paar {
-                Some(p) => Some(p),
+                Some((nid, ic, nc)) => {
+                    irq_ntfn_ids[i] = nid;
+                    irq_mehr[i] = Some(ic);
+                    irq_ntfn_mehr[i] = Some(nc);
+                }
                 None => {
+                    for j in 0..i {
+                        if let Some(c) = irq_mehr[j] {
+                            let _ = cap_delete(c);
+                        }
+                        if let Some(c) = irq_ntfn_mehr[j] {
+                            let _ = cap_delete(c);
+                        }
+                    }
                     let _ = cap_delete(shared);
                     let _ = cap_delete(bar);
                     let _ = cap_delete(cfg);
@@ -10143,20 +10397,23 @@ pub fn assign_driver_device(
                 }
             }
         }
-        None => None,
-    };
-    let irq = irq_paar.map(|(c, _)| c);
-    let irq_ntfn = irq_paar.map(|(_, n)| n);
-    let irq_ntfn_id = irq_ntfn_id; // Name fuer den Rueckgabewert festhalten
+    }
+    // Paar 0 behält seine alten Namen: der Lader (fremder Besitz) endowt heute Slot 7/8 und kennt
+    // nur sie — was er kennt, behält seinen Namen, was neu ist, steht in den Feldern daneben.
+    let irq = irq_mehr[0];
+    let irq_ntfn = irq_ntfn_mehr[0];
+    let irq_ntfn_id = irq_ntfn_ids[0];
     {
         let mut t = DRIVER_ASSIGN.lock();
         let Some(slot) = t.iter().position(|a| !a.used) else {
             drop(t);
-            if let Some(c) = irq {
-                let _ = cap_delete(c);
-            }
-            if let Some(c) = irq_ntfn {
-                let _ = cap_delete(c);
+            for j in 0..irq_anzahl {
+                if let Some(c) = irq_mehr[j] {
+                    let _ = cap_delete(c);
+                }
+                if let Some(c) = irq_ntfn_mehr[j] {
+                    let _ = cap_delete(c);
+                }
             }
             let _ = cap_delete(shared);
             let _ = cap_delete(bar);
@@ -10176,12 +10433,13 @@ pub fn assign_driver_device(
             dma_phys: region.base,
             dma_len: region.len,
             dma_gewuenscht: dma_pages,
-            msi_vektor: msi.map_or(0, |g| g.vector),
+            msi_basis: msi.map_or(0, |g| g.basis),
+            msi_anzahl: msi.map_or(0, |g| g.anzahl as u8),
             msi_handle: msi.map_or(0, |g| g.handle),
             msi_da: msi.is_some(),
             msix_table: dev.msix_table,
             msix_cap: dev.msix_cap,
-            msi_ntfn: irq_ntfn_id,
+            msi_ntfn: irq_ntfn_ids,
             // Read from the OFFER, not from the grant: `msix_cap != 0` means the device carries an
             // MSI-X capability, whatever became of it afterwards.
             msi_angeboten: dev.msix_cap != 0,
@@ -10193,7 +10451,19 @@ pub fn assign_driver_device(
             shared_phys,
         };
     }
-    Some(DriverGrant { cfg, bar, dma, shared, irq, irq_ntfn, irq_ntfn_id })
+    Some(DriverGrant {
+        cfg,
+        bar,
+        dma,
+        shared,
+        irq,
+        irq_ntfn,
+        irq_ntfn_id,
+        irq_anzahl,
+        irq_mehr,
+        irq_ntfn_mehr,
+        irq_ntfn_ids,
+    })
 }
 
 /// Eine **Kopie** der geteilten Uebertragungsflaeche fuer einen Client des Blockdienstes (A-6.3).
@@ -10253,7 +10523,12 @@ pub struct DriverMsi {
     pub program_id: u32,
     /// Die Requester-ID des Geräts — **die Größe, gegen die `SVT/SID` geprüft wird.**
     pub rid: u32,
+    /// Erster CPU-Vektor des Blocks — **Alias für `vektoren[0]`**, damit die bisherigen Leser
+    /// (Prüfzeile: `irte_pruefen(handle, vektor, rid)`, Slot-7-Vergleich) unverändert weiterlaufen.
+    /// Die volle Blockprüfung (`irte_block_pruefen` je Zeile) ist Folgelarbeit dort, wo sie
+    /// gelesen wird (Bring-up, fremder Besitz).
     pub vektor: u8,
+    /// Erster IRTE-Index — **Alias für den Blockbeginn** (die Zeilen liegen als `handle + i`).
     pub handle: u16,
     /// Basis der DMA-Region — dort legt der Treiber seine B4-Zahlen ab.
     pub dma_phys: u64,
@@ -10267,6 +10542,12 @@ pub struct DriverMsi {
     pub da: bool,
     /// **Bietet das Gerät überhaupt MSI-X an?** Der Wunsch neben der Gewährung.
     pub angeboten: bool,
+    /// Vergebene Vektoren (`0` = keine) — die Zahl, über die der Block gelesen wird.
+    pub anzahl: u8,
+    /// Alle Vektoren des Blocks — nur `[..anzahl]` ist belegt.
+    pub vektoren: [u8; VEKTOREN_JE_ZUTEILUNG],
+    /// Die Notification-Ids je Vektor — nur `[..anzahl]` ist belegt (`u32::MAX` = keine).
+    pub ntfn_ids: [u32; VEKTOREN_JE_ZUTEILUNG],
 }
 
 /// **Stufe B: der Interrupt-Zustand der Zuteilungen.**
@@ -10290,10 +10571,17 @@ pub fn driver_msi(out: &mut [DriverMsi]) -> usize {
         if n == out.len() {
             break;
         }
+        // `vektoren` aus der Blockbasis hergeleitet, nicht geraten: der Grant vergibt
+        // zusammenhängend (`basis + i`), und genau das steht hier — ein Array daneben wäre ein
+        // zweites Gedächtnis für dieselbe Wahrheit.
+        let mut vektoren = [0u8; VEKTOREN_JE_ZUTEILUNG];
+        for (i, v) in vektoren.iter_mut().enumerate().take(a.msi_anzahl as usize) {
+            *v = a.msi_basis + i as u8;
+        }
         out[n] = DriverMsi {
             program_id: a.program_id,
             rid: a.rid,
-            vektor: a.msi_vektor,
+            vektor: a.msi_basis,
             handle: a.msi_handle,
             dma_phys: a.dma_phys,
             msix_table: a.msix_table,
@@ -10301,6 +10589,9 @@ pub fn driver_msi(out: &mut [DriverMsi]) -> usize {
             cfg_page: a.cfg_page,
             da: a.msi_da,
             angeboten: a.msi_angeboten,
+            anzahl: a.msi_anzahl,
+            vektoren,
+            ntfn_ids: a.msi_ntfn,
         };
         n += 1;
     }
@@ -10388,22 +10679,29 @@ pub fn reassign_driver_device(program_id: u32) -> Option<DriverGrant> {
         let _ = cap_delete(dma);
         return None;
     };
-    // **B2 beim Hot-Reload: die Nachfolgefassung bekommt eine EIGENE Cap auf denselben Vektor.**
+    // **B2×N beim Hot-Reload: die Nachfolgefassung bekommt EIGENE Caps auf dieselben Vektoren.**
     //
-    // Nicht die alte weitergereicht — die gehört dem Cspace der sterbenden PD und geht mit ihr.
+    // Nicht die alten weitergereicht — die gehören dem Cspace der sterbenden PD und gehen mit ihr.
     // *Wer eine Fassung ersetzt, muss ihr ALLES geben, was die alte hatte*: fehlte Slot 7, bräche
     // die neue Fassung an derselben Stelle ab wie damals ohne Slot 6, und der Austausch meldete
     // `NotReady` — was nach einem Zeitproblem aussieht und ein fehlendes Cap ist.
     //
-    // Der IRTE und die MSI-X-Zeile bleiben unangetastet: das Gerät wechselt nicht, nur sein
+    // Die IRTEs und die MSI-X-Zeilen bleiben unangetastet: das Gerät wechselt nicht, nur sein
     // Bediener. Genau deshalb ist das hier eine Cap-Prägung und keine zweite Vergabe.
-    let (irq, irq_ntfn) = if a.msi_da {
-        // **Dieselbe Notification, eine neue Cap darauf** -- nicht ein neues Objekt. Die Bindung
-        // im Kernel zeigt auf die alte Id; ein frisches Objekt hiesse, dass der Interrupt weiter
-        // an das Objekt der gestorbenen Fassung zugestellt wird und die neue ewig wartet. Genau
-        // die Falle, die A-5.1 mit der DMA-Region schon einmal hatte.
-        let paar = install_irq_cap(a.msi_vektor as u32, Rights::READ).ok().and_then(|ic| {
-            match install_notification_cap(a.msi_ntfn, Rights::RWX) {
+    let mut irq_mehr: [Option<CapPtr>; VEKTOREN_JE_ZUTEILUNG] = [None; VEKTOREN_JE_ZUTEILUNG];
+    let mut irq_ntfn_mehr: [Option<CapPtr>; VEKTOREN_JE_ZUTEILUNG] =
+        [None; VEKTOREN_JE_ZUTEILUNG];
+    let irq_anzahl = if a.msi_da { a.msi_anzahl as usize } else { 0 };
+    // **Dieselben Notifications, neue Caps darauf** -- nicht neue Objekte. Die Bindung im Kernel
+    // zeigt auf die alte Id; ein frisches Objekt hiesse, dass der Interrupt weiter an das Objekt
+    // der gestorbenen Fassung zugestellt wird und die neue ewig wartet. Genau die Falle, die
+    // A-5.1 mit der DMA-Region schon einmal hatte. Gilt ein Paar nicht, fallen alle bereits
+    // geprägten mit — beide-oder-keins je Paar, alle Paare oder keins.
+    let mut reassign_ok = true;
+    for i in 0..irq_anzahl {
+        let vektor = a.msi_basis + i as u8;
+        let paar = install_irq_cap(vektor as u32, Rights::READ).ok().and_then(|ic| {
+            match install_notification_cap(a.msi_ntfn[i], Rights::RWX) {
                 Ok(nc) => Some((ic, nc)),
                 Err(_) => {
                     let _ = cap_delete(ic);
@@ -10412,19 +10710,49 @@ pub fn reassign_driver_device(program_id: u32) -> Option<DriverGrant> {
             }
         });
         match paar {
-            Some((ic, nc)) => (Some(ic), Some(nc)),
+            Some((ic, nc)) => {
+                irq_mehr[i] = Some(ic);
+                irq_ntfn_mehr[i] = Some(nc);
+            }
             None => {
-                let _ = cap_delete(shared);
-                let _ = cap_delete(bar);
-                let _ = cap_delete(cfg);
-                let _ = cap_delete(dma);
-                return None;
+                reassign_ok = false;
+                break;
             }
         }
+    }
+    if !reassign_ok {
+        for j in 0..irq_anzahl {
+            if let Some(c) = irq_mehr[j] {
+                let _ = cap_delete(c);
+            }
+            if let Some(c) = irq_ntfn_mehr[j] {
+                let _ = cap_delete(c);
+            }
+        }
+        let _ = cap_delete(shared);
+        let _ = cap_delete(bar);
+        let _ = cap_delete(cfg);
+        let _ = cap_delete(dma);
+        return None;
+    }
+    let (irq, irq_ntfn) = if a.msi_da {
+        (irq_mehr[0], irq_ntfn_mehr[0])
     } else {
         (None, None)
     };
-    Some(DriverGrant { cfg, bar, dma, shared, irq, irq_ntfn, irq_ntfn_id: a.msi_ntfn })
+    Some(DriverGrant {
+        cfg,
+        bar,
+        dma,
+        shared,
+        irq,
+        irq_ntfn,
+        irq_ntfn_id: a.msi_ntfn[0],
+        irq_anzahl,
+        irq_mehr,
+        irq_ntfn_mehr,
+        irq_ntfn_ids: a.msi_ntfn,
+    })
 }
 
 /// Eine **weitere** HardwareLand-Backend-PD an einem **bestehenden** Kanal anlegen (A-5.1).
@@ -12661,6 +12989,203 @@ pub fn debug_write_reg(
     } else {
         Err(result::ERR_BADCAP)
     }
+}
+
+/// **`SYS_DEBUG_WRITE_MEM` (33)** -- Speicher der Ziel-PD schreiben, aus dem Puffer des Aufrufers.
+///
+/// Das Spiegelbild von [`debug_read_mem`]: dieselbe benannte Kapazitaet
+/// ([`caprock_abi::debug::WRITE_MAX`] -- wertgleich mit `READ_MAX`, aber EINE Schranke je
+/// Richtung, nicht eine Zahl mit zwei Bedeutungen), dieselbe Latenzform (der Aufrufer schleift,
+/// seine Schleife ist preemptibel), dieselbe Luecken-Regel (eine Luecke im ZIEL beendet den Lauf
+/// mit der bisherigen Zahl -- ein Debugger soll eine Luecke SEHEN, nicht raten; ein fehlender
+/// Aufrufer-Puffer ist [`result::ERR_BADSTACK`]). Nur die Kopierrichtung ist gedreht; Reihenfolge
+/// und Vorrang der beiden Aufloesungen sind bitgleich zum Lesen.
+///
+/// ## Das Recht ist `DebugControl`, nicht `DebugRead`
+///
+/// Lesen beobachtet, Schreiben veraendert -- ein Leserecht ohne Steuerrecht kommt hier nicht
+/// hinein ([`result::ERR_RIGHTS`]). Dieselbe Trennung wie zwischen Sidecar-Lesen (gar kein
+/// Syscall) und `DEBUG_WRITE_REGS` (Steuerrecht plus Maske).
+pub fn debug_write_mem(
+    caller_pd: usize,
+    slot: usize,
+    va: u64,
+    len: u64,
+    src: u64,
+) -> Result<u64, u64> {
+    use caprock_abi::{debug as dbgr, result};
+    if len == 0 || len > dbgr::WRITE_MAX {
+        return Err(result::ERR_RIGHTS);
+    }
+    let g = CAPS.read();
+    let Some(cap) = g.pds.cap_ptr_at(caller_pd, slot) else {
+        return Err(result::ERR_BADCAP);
+    };
+    let Some((pd, _, control)) = debug_cap_kind(&g, cap) else {
+        return Err(result::ERR_BADCAP);
+    };
+    if !control {
+        // Ein Leserecht schreibt nicht -- sonst waere `RIGHT_READ` die ganze Autoritaet und die
+        // Aufteilung in zwei Rechte eine Behauptung ohne Gatter.
+        return Err(result::ERR_RIGHTS);
+    }
+    drop(g);
+
+    // Die Tabellen beider Seiten -- getrennt geholt und getrennt benannt, wie in
+    // `debug_read_mem` (ein Parameter mit zwei Bedeutungen war dort die `spawn_user`-Falle).
+    let (ziel_l1, ziel_l2) = pd_tables(pd as usize).ok_or(result::ERR_NOPD)?;
+    let (mein_l1, mein_l2) = pd_tables(caller_pd).ok_or(result::ERR_NOPD)?;
+
+    let mut n = 0u64;
+    while n < len {
+        let Some(dst_pa) = hal::mmu::vspace_resolve(ziel_l1, ziel_l2, va + n) else {
+            break; // Luecke im Ziel -- wie beim Lesen: bisherige Zahl gilt
+        };
+        let Some(src_pa) = hal::mmu::vspace_resolve(mein_l1, mein_l2, src + n) else {
+            return Err(result::ERR_BADSTACK); // der Aufrufer hat einen Puffer benannt, den er nicht hat
+        };
+        // SAFETY: beide Physadressen stammen aus einer Tabellenaufloesung dieses Kernels und
+        // liegen damit in gemapptem RAM; der Kernel erreicht sie ueber die Identitaetskarte.
+        // Byteweise, weil die beiden Seiten verschiedene Ausrichtungen haben koennen.
+        unsafe {
+            core::ptr::write_volatile(dst_pa as *mut u8, core::ptr::read_volatile(src_pa as *const u8));
+        }
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// **`SYS_DEBUG_SINGLE_STEP` (34)** -- einen angehaltenen Thread genau einen Befehl tun lassen.
+///
+/// ## Stand: autorisiert geprueft, CPU-Pfad fehlt -- benannte Absage statt Stub-Erfolg
+///
+/// Cap-Aufloesung, Steuerrecht (`DebugControl`), PD-Zugehoerigkeit und Halt-Zustand werden VOLL
+/// geprueft -- dieselben Codes wie [`debug_write_reg`]: `ERR_BADCAP` (fremde/leere Cap, falsche
+/// PD), `ERR_RIGHTS` (kein Steuerrecht), `ERR_DEBUG_BUSY` (das Ziel ist nicht gehalten; ein
+/// Schrittbefehl an einen laufenden Thread waere ein Zustand, den es nie gab). Danach faellt der
+/// Aufruf auf [`result::ERR_BADSYS`] -- „Antrag ok, Pfad fehlt" (dieselbe Form wie die 31/32-Arme
+/// im Microkit-Dispatch): es gibt kein `hal::debug` -- kein TF-Scharfstellen auf x86, kein
+/// `MDSCR_EL1.SS`/`PSTATE.SS` auf aarch64, keinen `#DB`-Pfad, der den Schritt meldet und die
+/// Scharfstellung zuruecknimmt.
+///
+/// Ein TF-Bit ohne Handler zu setzen waere geraten, nicht verdrahtet: der naechste Schritt
+/// lieferte `#DB` an einen Kernel ohne `#DB`-Pfad. Deshalb wird hier NICHTS an der CPU gestellt --
+/// fail-closed, nie `OK`.
+///
+/// ## Patch-Text fuer `hal::debug` (bauen, nicht raten)
+/// ```text
+/// // crates/caprock-hal/src/debug.rs (neu, je Arch ein Modul hinter einer Fassade):
+/// pub fn single_step_scharf(frame: *mut TrapFrame);
+/// //   x86: RFLAGS.TF (Bit 8) im GESPEICHERTEN Frame setzen (nicht live -- der Thread steht).
+/// //   aarch64: PSTATE.SS im SPSR des Frames plus MDSCR_EL1.SS (EL1-Zugriff einrichten).
+/// // Dazu ein #DB-/Debug-Exception-Pfad, der (a) den Schritt an den haltenden Debugger meldet,
+/// // (b) TF/SS zuruecknimmt (sonst ist es ein Modus, kein Schritt: JEDER Befehl trapt),
+/// // (c) ohne haltenden Debugger fail-closed bleibt.
+/// // Reihenfolge im Rueckruf: erst scharfstellen, DANN freigeben (die Freigabe ist heute
+/// // `debug_continue`-foermig) -- nie umgekehrt: freigegeben-aber-nicht-scharf liefe frei.
+/// ```
+pub fn debug_single_step(caller_pd: usize, slot: usize, tid_raw: u64) -> Result<u64, u64> {
+    use caprock_abi::result;
+    let tid = ThreadId::from_raw(tid_raw);
+    let g = CAPS.read();
+    let Some(cap) = g.pds.cap_ptr_at(caller_pd, slot) else {
+        return Err(result::ERR_BADCAP);
+    };
+    let Some((pd, _, control)) = debug_cap_kind(&g, cap) else {
+        return Err(result::ERR_BADCAP);
+    };
+    if !control {
+        return Err(result::ERR_RIGHTS);
+    }
+    if g.pds.pd_of_thread_pub(tid) != Some(pd as usize) {
+        return Err(result::ERR_BADCAP);
+    }
+    // **Nur an einem ANGEHALTENEN Thread** -- derselbe Grund wie in `debug_write_reg` und
+    // derselbe Code wie im ABI-Vertrag (`ERR_DEBUG_BUSY`, wenn nicht gehalten).
+    if !with_owner(tid, |s, _| s.is_debug_stopped(tid).then_some(())).is_some() {
+        return Err(result::ERR_DEBUG_BUSY);
+    }
+    drop(g);
+    // Kein `hal::debug` -- s. Doku oben. Benannt abgewiesen, nie `OK`.
+    Err(result::ERR_BADSYS)
+}
+
+/// **`SYS_DEBUG_HWBREAK` (35)** -- Hardware-Breakpoint setzen/loeschen.
+///
+/// ## Stand: autorisiert geprueft, CPU-Pfad fehlt -- benannte Absage statt Stub-Erfolg
+///
+/// Geprueft wird VOLL: Cap (`ERR_BADCAP`), Steuerrecht (`ERR_RIGHTS`), PD-Zugehoerigkeit des
+/// Zielthreads (`ERR_BADCAP`), Halt-Zustand (`ERR_DEBUG_BUSY` -- wie [`debug_write_reg`], in
+/// derselben Reihenfolge: wer einem laufenden Thread in die Register redet, erzeugt einen
+/// Zustand, den es nie gab), Art (`MSG3`: `1` = Hardware; `0` = Software ist die falsche Bitte an
+/// den Kernel -- Software-Breakpoints (`INT3`/`BRK`) schreibt der Debugger selbst via
+/// `DEBUG_WRITE_MEM`, dafuer braucht es keinen Syscall; alles andere ist keine Art -- beides
+/// `ERR_RIGHTS`, dieselbe Klasse wie die Laengen-Deckel in `debug_read_mem`/`debug_write_mem`).
+///
+/// Danach faellt `1` (Hardware) auf [`result::ERR_BADSYS`] -- „Antrag ok, Pfad fehlt": vier
+/// Register je Kern sind eine benannte Kapazitaet, und sie braucht das **pro-Thread-Sichern der
+/// Debugregister im Kontextwechsel** (`hal::debug`), das es nicht gibt. Ohne das Sichern wuerde
+/// ein Breakpoint des Threads A auf Kern 0 den Thread B treffen, der als naechstes dort laeuft --
+/// still geteilt statt benannt abgewiesen, genau die Form, die der ABI-Vertrag verbietet.
+///
+/// ## Was die Luecke ehrlich umfasst -- kein Kontextwechsel-Umbau ohne Not
+///
+/// - `hal::debug` fehlt GANZ (x86: kein DR0-DR3/DR7-Sichern, kein DR6-Lesen, kein `#DB`-Pfad;
+///   aarch64: kein DBGBVR/DBGBCR-Sichern, kein Debug-Exception-Pfad).
+/// - Der Kontextwechsel fasst Debugregister heute NICHT an -- absichtlich unangetastet: ein
+///   Sichern ohne Vergabe schuetzt nichts und kostet jedem Wechsel Zyklen.
+/// - Kapazitaet (4 je Kern), Vergabe-Tabelle, Erschoepfungs-Absage und Loesch-Pfad entstehen
+///   MIT `hal::debug`, nicht vorher. Die Loesch-Kodierung (z. B. `addr == 0`) wird mit der
+///   RSP-PD geklaert, nicht hier festgelegt -- eine erfundene Konvention waere ein zweiter
+///   Vertrag neben der ABI.
+///
+/// ## Patch-Text fuer `hal::debug` + Kontextwechsel (bauen, nicht raten)
+/// ```text
+/// // crates/caprock-hal/src/debug.rs:
+/// pub const HWBREAKS_JE_KERN: usize = 4; // benannte Kapazitaet aus dem ABI-Vertrag
+/// pub enum HwbreakAbweisung { Erschoepft, UngueltigeAdresse }
+/// pub fn hwbreak_setzen(fach: usize /* 0..4 */, addr: u64) -> Result<(), HwbreakAbweisung>;
+/// pub fn hwbreak_loeschen(fach: usize);
+/// // Kontextwechsel: DR0-DR3 + DR7 (x86) bzw. DBGBVR/DBGBCR + DBGBCR-Ermoeglichung (aarch64)
+/// // je THREAD sichern/wiederherstellen -- Ablage im TCB (4 Adressen + Kontrolle), NICHT global
+/// // je Kern. Vergabe-Tabelle im Kernel; Erschoepfung -> ERR_NOSPACE (benannt, nicht still
+/// // geteilt -- ABI-Vertrag); Loeschen gibt das Fach frei.
+/// ```
+pub fn debug_hwbreak(
+    caller_pd: usize,
+    slot: usize,
+    tid_raw: u64,
+    addr: u64,
+    art: u64,
+) -> Result<u64, u64> {
+    use caprock_abi::result;
+    let tid = ThreadId::from_raw(tid_raw);
+    let g = CAPS.read();
+    let Some(cap) = g.pds.cap_ptr_at(caller_pd, slot) else {
+        return Err(result::ERR_BADCAP);
+    };
+    let Some((pd, _, control)) = debug_cap_kind(&g, cap) else {
+        return Err(result::ERR_BADCAP);
+    };
+    if !control {
+        return Err(result::ERR_RIGHTS);
+    }
+    if g.pds.pd_of_thread_pub(tid) != Some(pd as usize) {
+        return Err(result::ERR_BADCAP);
+    }
+    // **Nur an einem ANGEHALTENEN Thread** -- wie `debug_write_reg`, vor der Art-Pruefung.
+    if !with_owner(tid, |s, _| s.is_debug_stopped(tid).then_some(())).is_some() {
+        return Err(result::ERR_DEBUG_BUSY);
+    }
+    // Die Art: nur `1` (Hardware) ist eine Bitte an den Kernel. `0` (Software) gehoert dem
+    // Debugger selbst (INT3/BRK via `DEBUG_WRITE_MEM`); alles andere ist keine Art.
+    if art != 1 {
+        return Err(result::ERR_RIGHTS);
+    }
+    let _ = addr; // Entgegengenommen, aber an keine CPU gestellt -- s. Doku oben.
+    drop(g);
+    // Kein `hal::debug`, kein pro-Thread-Sichern -- s. Doku oben. Benannt abgewiesen, nie `OK`.
+    Err(result::ERR_BADSYS)
 }
 
 // --- Z4a: der Haltepunkt ------------------------------------------------------------------------

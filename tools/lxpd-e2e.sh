@@ -8,14 +8,29 @@
 # laden ohne Pruefung) und stoesst die Instanziierung per `LOAD_IMAGE` an. Erfolg ist die
 # Kernel-Zeile `lxpdimg : [8]... gestartet` bei sonst gruener Suite.
 #
+# D5-INVARIANTE (Startmenge: Manifestposition = Archivposition — hier 7=7, kein Zaehler weniger):
+# Der Root-Task spricht die uebrige Startmenge ueber einen ARCHIVINDEX an (`SYS_LOAD`),
+# bekommt ihre Groesse aber aus dem MANIFEST. Beide Zahlen meinen nur dann dasselbe, wenn
+# die Manifest-Eintraege 1..7 genau auf den Archivpositionen 1..7 liegen (gleiche
+# `program_id` je Position). Der Kernel prueft das fail-closed (`StartSetNotPrefix`,
+# `kernel/src/loader.rs`): ein 7-Eintrag-Manifest mit nur 6 Archiv-Programmen bootet nicht
+# in den falschen Dienst, sondern meldet `root : FAILURES (StartSetNotPrefix)` — per Design,
+# s. `tests/lxpd-boot-qemu/BEFUND.md` B5. Deshalb baut `build_archive()` unten BEIDE Seiten
+# aus EINER Stelle (`tools/sign_manifest.py --entry …` + `tools/mkarchive.py …`,
+# Zertifikate fuer die TrustedSAS-Eintraege 1/init, 4/fs, 7/lxpdrv) — Muster aus
+# `test-qemu-x86-load.sh` (dort 6=6, hier 7=7: Eintraege 1..6 byte-identisch zur Lade-Suite,
+# dazu 7:lxpdrv mit Zertifikat, `shared` auf Dienst 3). Die Platte traegt genau EIN
+# Treiber-Bild (`hello.elf`, ausserhalb der Startmenge — D5 gilt nur fuer den Boot, der
+# Laufzeit-Treiber gehoert nicht dazu, s. `boot_arg`-Doku in `kernel/src/loader.rs`):
+# Verbraucher ist `suchen(index 0)` in `programs/lxpd-runtime`, der nur das erste
+# LXIMG2-Verzeichnis liest — sieben Platten-Bilder waeren sechs ohne Leser. Die Zahl steht
+# doppelt als Check im Skript (`archive : 7 Modul(e)`) und trocken ohne QEMU unter
+# `--selbsttest`.
+#
 # Aufbau (gegen `test-qemu-x86-load.sh` gelesen — LESEN, nicht geaendert):
 #   * Platte: DIESELBE `mkgpt.py`-Zeile wie die Lade-Suite (P1 FAT + HELLO.TXT, P2 roh mit
 #     Magie, Checkpoint-Sektor frei) — plus Typ-Patch von P2 auf die LXPD-GUID und LXIMG2
 #     in freien P2-Sektoren. SCAN zaehlt weiter 2, `part` bleibt scharf.
-#   * Manifest: Eintraege 1..6 byte-identisch zur Lade-Suite, dazu 7:lxpdrv (TrustedSAS mit
-#     Zertifikat, `shared` auf Dienst 3). Archiv: 7 Module (der Laufzeit-Treiber steht NICHT
-#     darin — er kommt von Platte; sein Boot-Eintrag waere pid 8 und ist in diesen beiden
-#     Laeufen ABSICHTLICH nicht enthalten, s. Modi).
 #   * QEMU-Flags: dieselbe Maschine, dieselben Geraete, ein Boot (keine Z4-Kette — sie ist
 #     nicht die Frage dieses Laufs).
 #
@@ -39,9 +54,44 @@ ROOT="$(pwd)"
 MODUS="${1:-}"
 RAM="${2:-512M}"
 SECONDS_RUN="${3:-180}"
+
+# Trockene D5-Zaehllung ohne QEMU: Manifest-Eintraege == Archiv-Programme == 7,
+# IDs beidseits 1..7, Platten-Aufruf (EIN Bild) vorhanden, Platten-Selbsttest gruen.
+selbsttest() {
+    echo "== LXPD-E2E-Selbsttest (trocken, ohne QEMU) =="
+    fail=0
+    # `--entry "[0-9]:` (mit Ziffer + Doppelpunkt) statt bloss `--entry "`: sonst
+    # zaehlt diese Funktion ihre eigenen grep-Muster mit (Selbstbeobachtung).
+    n_man="$(grep -c -- '--entry "[0-9]:' "$0" || true)"
+    n_arc="$(grep -cE '^[[:space:]]*"[0-9]+:[^"]*\$PROG/' "$0" || true)"
+    echo "  Manifest-Eintraege: $n_man, Archiv-Programme: $n_arc (erwartet 7=7, D5)"
+    [ "$n_man" = 7 ] || { echo "  FAIL: Manifest-Zaehllung"; fail=1; }
+    [ "$n_arc" = 7 ] || { echo "  FAIL: Archiv-Zaehllung"; fail=1; }
+    man_ids="$(grep -o -- '--entry "[0-9]:' "$0" | grep -o '[0-9]' | tr '\n' ' ')"
+    arc_ids="$(grep -oE '^[[:space:]]*"[0-9]+:' "$0" | grep -oE '[0-9]+' | tr '\n' ' ')"
+    echo "  Manifest-IDs: ${man_ids:-keine} / Archiv-IDs: ${arc_ids:-keine} (erwartet 1..7 beidseits)"
+    [ "$man_ids" = "1 2 3 4 5 6 7 " ] || { echo "  FAIL: Manifest-Folge"; fail=1; }
+    [ "$arc_ids" = "1 2 3 4 5 6 7 " ] || { echo "  FAIL: Archiv-Folge"; fail=1; }
+    if grep -q 'lxpd-e2e-platte.py --disk.*--image.*--lba' "$0"; then
+        echo "  PASS: Platten-Aufruf (EIN Bild, ausserhalb der Startmenge)"
+    else echo "  FAIL: Platten-Aufruf fehlt"; fail=1; fi
+    if grep -q 'archive : 7 Modul(e)' "$0"; then
+        echo "  PASS: Archiv-Check 7 Modul(e) im Skript"
+    else echo "  FAIL: Archiv-Check fehlt"; fail=1; fi
+    echo "== Platten-Selbsttest (Temp, ohne QEMU) =="
+    python3 tools/lxpd-e2e-platte.py --selbsttest || fail=1
+    if [ "$fail" -eq 0 ]; then echo "== LXPD-E2E-SELBSTTEST: ALL PASS ==";
+    else echo "== LXPD-E2E-SELBSTTEST: FAIL =="; fi
+    return "$fail"
+}
+
 case "$MODUS" in
   --mit-lader) CAPS="loader,ntfn,ep,shared"; E2E_NAME="mit-lader" ;;
   --ohne-lader) CAPS="ntfn,ep,shared"; E2E_NAME="ohne-lader" ;;
+  --help|-h) echo "Aufruf: $0 --mit-lader|--ohne-lader [RAM] [SEKUNDEN]";
+             echo "  --selbsttest: trockene D5-Zaehllung + Platten-Selbsttest, ohne QEMU.";
+             exit 0 ;;
+  --selbsttest) selbsttest; exit $? ;;
   *) echo "Aufruf: $0 --mit-lader|--ohne-lader [RAM] [SEKUNDEN]" >&2; exit 2 ;;
 esac
 

@@ -490,6 +490,7 @@ impl Caps {
     /// „DmaCap nur in HardwareLand" deckt bereits [`Caps::domain_audit`] (Code 1) ab, da
     /// `kind_is_hardware` nun `Dma` einschließt. Die hardware-erzwungene Durchsetzung (SMMU)
     /// liegt hinter dem kernel-internen `DmaEnforcer` und wird separat auditiert.
+    #[inline(never)] // Audit 2026-09-10 (#DF-Klasse): 512-B-Rahmen aus Crate-Aufrufern heraushalten.
     pub fn dma_bounds_audit(&self, floor: u64, ceil: u64) -> u32 {
         let mut regs: [(u64, u64); 32] = [(0, 0); 32];
         let mut n = 0usize;
@@ -2364,11 +2365,15 @@ fn dispatch_nativ(
         }
     }
 
-    // Z6b: die Debug-Syscalls. **Vor** der generischen Cap-Aufloesung, aus demselben Grund wie
-    // `SPAWN`: die Entscheidung faellt in EINER Kernelfunktion, nicht halb hier und halb dort.
-    // *Eine Pruefung, die an zwei Stellen halb passiert, ist zwei Pruefungen, und die zweite
-    // altert* (K1a).
-    if nr >= sys::DEBUG_ATTACH && nr <= sys::DEBUG_WRITE_REGS {
+    // Z6b + Debugger-v2: die Debug-Syscalls (21-25) plus 33-35. **Vor** der generischen
+    // Cap-Aufloesung, aus demselben Grund wie `SPAWN`: die Entscheidung faellt in EINER
+    // Kernelfunktion, nicht halb hier und halb dort. *Eine Pruefung, die an zwei Stellen halb
+    // passiert, ist zwei Pruefungen, und die zweite altert* (K1a). 33-35 reiten auf demselben
+    // Rueckruf (Cap-Aufloesung, Rechte, Slot-Weitergabe liegen in `dispatch_debug`); hier steht
+    // nur die Weiche, keine Pruefung. Die Luecke 26-32 (BIND_IRQ..EXEC_REPLACE) bleibt draussen.
+    if (nr >= sys::DEBUG_ATTACH && nr <= sys::DEBUG_WRITE_REGS)
+        || (nr >= sys::DEBUG_WRITE_MEM && nr <= sys::DEBUG_HWBREAK)
+    {
         let thread = ops.current_id(core);
         let slot = frame_reg(frame, reg::MSG0) as usize;
         let a1 = frame_reg(frame, reg::MSG0 + 1);

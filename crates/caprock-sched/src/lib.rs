@@ -59,6 +59,13 @@ mod fristen;
 /// auslösbar, ohne Maschine.
 pub mod redirect;
 
+/// **Die NOHZ-Entscheidung** (B-5.2/Z5): braucht dieser Kern seinen Tick noch? Die reine
+/// Entscheidung liegt abhaengigkeitsfrei in `nohz` (host-geprueft als Datei, wie `cycles`
+/// und `fristen`); die Messung dazu -- [`Scheduler::nohz_stand`] -- bleibt hier, weil sie
+/// Tabellen unter einem Lock liest.
+mod nohz;
+pub use nohz::{Nohz, nohz_plan};
+
 use core::sync::atomic::{AtomicU64, Ordering};
 use caprock_hal::exception::init_thread_frame;
 use caprock_slab::{AtomicTable, FreeList, Slab};
@@ -1352,6 +1359,58 @@ impl Scheduler {
     /// Steht ueberhaupt eine Frist? (Bericht/Sonde)
     pub fn frist_von(&self, tid: ThreadId) -> u64 {
         self.resolve(tid).map_or(0, |t| self.tcbs[t].frist)
+    }
+
+    /// **Der NOHZ-Stand dieses Kerns in einem Schnappschuss** (B-5.2/Z5).
+    ///
+    /// Gibt `(rivalen, weckruf, hat_schranke)` zurueck -- genau die drei Eingaben von
+    /// [`nohz_plan`], unter **einem** Lock gelesen statt in drei Anlaeufen. Drei Anlaeufe
+    /// haetten drei Zeitpunkte: eine Frist, die zwischen Anlauf 2 und 3 bewaffnet wird,
+    /// kaeme in keiner der beiden Ablesungen vor -- der Timer wuerde ueber sie hinweg
+    /// entwaffnet. Ein Schnappschuss kennt das Rennen nicht; was danach bewaffnet wird,
+    /// faellt unter die Maskierungsregel des Aufrufers (Abfrage, Armieren und `wfi` unter
+    /// maskierten IRQs -- s. `kernel/src/threads/nohz.rs`).
+    ///
+    /// * `rivalen`: bereite Threads **ohne** den laufenden (Summe der Queue-Zaehler; per
+    ///   Audit-Invariante -- Codes 2/9 -- ist jeder davon wirklich lauffaehig).
+    /// * `weckruf`: naechster benannter Weckruf als **Delta** in Ticks ab `now` (`None` =
+    ///   nichts bewaffnet). Das Minimum aus `naechste_frist` und allen `next_refill`-
+    ///   Zeitpunkten erschoepfter Budgets. Ein zu frueh stehender Wert (die dokumentierte
+    ///   `naechste_frist`-Schieflage) erzeugt hoechstens einen ueberfluessigen Tick -- die
+    ///   sichere Richtung; zu spaet darf er nie stehen, und das garantiert der Scheduler,
+    ///   nicht die Entscheidung.
+    /// * `hat_schranke`: der laufende Thread traegt ein begrenztes Budget (`budget > 0`).
+    ///   Seine Erschoepfung wird auf dem Tick erkannt -- ohne Tick keine Durchsetzung,
+    ///   also kein Schweigen (B-5.1 hat Abrechnung und Durchsetzung entkoppelt, und genau
+    ///   diese Haelfte braucht den Tick noch).
+    ///
+    /// Nur auf dem kalten Pfad zu rufen (Idle-Eintritt, Tick-Umprogrammierung): der
+    /// Refill-Minimum-Lauf ist O(Tabellengroesse), wie der Refill-Scan selbst -- und wie
+    /// der entfaellt er im Normalfall nicht, sondern wird nur selten bezahlt.
+    pub fn nohz_stand(&self) -> (usize, Option<u64>, bool) {
+        let mut rivalen = 0usize;
+        for q in self.queues.iter() {
+            rivalen += q.count as usize;
+        }
+        let mut weckruf: Option<u64> = None;
+        if self.naechste_frist != u64::MAX {
+            weckruf = Some(self.naechste_frist.saturating_sub(self.now));
+        }
+        for slot in 0..self.tcbs.len() {
+            let t = &self.tcbs[slot];
+            if t.used && t.budget > 0 && t.depleted {
+                let d = t.next_refill.saturating_sub(self.now);
+                weckruf = Some(match weckruf {
+                    Some(bisher) => bisher.min(d),
+                    None => d,
+                });
+            }
+        }
+        let hat_schranke = match self.current {
+            Some(cur) => self.tcbs[cur].budget > 0,
+            None => false,
+        };
+        (rivalen, weckruf, hat_schranke)
     }
 
     /// **Wie viele faellige Fristen bisher auf einen spaeteren Tick verschoben wurden**

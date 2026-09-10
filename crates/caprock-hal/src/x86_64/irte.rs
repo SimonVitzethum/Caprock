@@ -646,6 +646,210 @@ pub fn zieh_ein<Z: IrtZugriff>(
 }
 
 // ================================================================================================
+// Mehrere Vektoren je Gerät (MSI-X) — Vergabe je Vektor, Zeilen je Vektor, Schutz je Vektor
+// ================================================================================================
+//
+// Ein MSI-X-Gerät mit `n` Vektoren bekommt EINEN Block aus `vergib` (`anzahl = n`, Form
+// `MsiX`): `n` zusammenhängende Handles — der Allokator KANN Kontiguität (`reserviere`
+// vergibt immer geschlossen), also wird sie benutzt, statt je Vektor einzeln zu würfeln.
+// Was hier dazukommt, ist der Rest des Satzes: was je Zeile zu SCHREIBEN ist, was einen
+// Vektor vor erneutem Melden SCHÜTZT, und wann ein Gerät LOKAL voll ist.
+//
+// Die MMIO selbst (`pcie::msix_write_entry` je Zeile, `msix_enable_by_rid`) bleibt beim
+// Kernel (Patch-Text, DriverAssign-Vektorisierung, fremder Strang): diese Datei fasst keine
+// Hardware an, und genau deshalb läuft sie auf dem Host. Was der Kernel schreibt, steht
+// hier als Plan — lesbar, zählbar, testbar.
+
+/// Höchstzahl Vektoren je Gerät auf der Darstellungsseite: die Breite der Pending-Maske
+/// im [`ReTriggerSchutz`] (`u64`).
+///
+/// **Darstellung, keine Policy**: wer mehr will, bekommt keinen Schutz, also keine Vektoren
+/// ([`geraet_vektoren`] weist darüber mit [`GeraeteVerdikt::GeraetVoll`] ab). Die
+/// Policy-Schranke auf der Bindungsseite (`caprock_microkit::VEKTOREN_JE_GERAET_MAX`)
+/// spiegelt diese Zahl — die Beziehung steht an beiden Stellen, damit Drift auffällt.
+pub const VEKTOREN_JE_GERAET_MAX: usize = 64;
+
+/// Was in EINE MSI-X-Zeile zu schreiben ist — der Plan, nicht der Schreibzugriff.
+///
+/// Reihenfolge beim Schreiben (trägt `pcie::msix_write_entry` + der Kernel-Patch-Text):
+/// **erst Adresse und Datenwort, dann die Maske lösen**. Andersherum gäbe es ein Fenster,
+/// in dem die Zeile freigegeben ist und noch auf `0` zeigt — ein Interrupt darin ginge an
+/// Vektor 0. Die Zeilennummer ist der Vektor-Index: Zeile `i` trägt Handle `handle + i`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MsixZeile {
+    /// Die Tabellenzeile (`i`).
+    pub zeile: u16,
+    /// Die remappable MSI-Adresse dieses Vektors (`SHV = 0`, je Zeile eigene).
+    pub addr: u32,
+    /// Das Datenwort (`0` — Vektor und Ziel stehen in der IRTE, nicht in der Nachricht).
+    pub data: u32,
+    /// Der CPU-Vektor dieses Eintrags (`basis_vektor + i`).
+    pub vektor: u8,
+}
+
+/// Der Plan über alle Zeilen eines Tickets — `for z in ticket.msix_zeilen()`.
+pub struct MsixZeilen {
+    ziel: MsiZiel,
+    i: usize,
+}
+
+impl Iterator for MsixZeilen {
+    type Item = MsixZeile;
+
+    fn next(&mut self) -> Option<MsixZeile> {
+        let z = self.ziel.msix_zeile(self.i)?;
+        self.i += 1;
+        Some(z)
+    }
+}
+
+impl MsiZiel {
+    /// Die Schreibanweisung für Zeile `i`: nur für [`Vektorform::MsiX`].
+    ///
+    /// Klassisches MSI gibt `None`: es hat EIN Adress-/Datenpaar (`SHV = 1`), der Treiber
+    /// schreibt nur Zeile 0 der MSI-Capability, und das Gerät zählt die Subhandles selbst
+    /// hoch. Eine „Zeile 3" gäbe es dort nicht zu schreiben — was `eintrag(i)` für MSI
+    /// sagt, ist die Bus-Sicht danach, kein Schreibplan.
+    pub fn msix_zeile(&self, i: usize) -> Option<MsixZeile> {
+        if self.form != Vektorform::MsiX {
+            return None;
+        }
+        let (addr, data, vektor) = self.eintrag(i)?;
+        Some(MsixZeile { zeile: i as u16, addr, data, vektor })
+    }
+
+    /// Alle Zeilen-Schreibanweisungen, in Zeilenreihenfolge.
+    pub fn msix_zeilen(&self) -> MsixZeilen {
+        MsixZeilen { ziel: *self, i: 0 }
+    }
+}
+
+/// Der Re-Trigger-Schutz je Vektor: eine ausstehende Meldung wird zusammengefasst, nicht
+/// doppelt zugestellt.
+///
+/// MSI ist flankengetriggert — es gibt keine Maske, die eine zweite Flanke desselben Vektors
+/// aufhielte, während die erste noch undrained ist. Ohne Schutz meldete jede Flanke ein
+/// eigenes Signal, und die Notification sagte „zweimal" über etwas, das der Treiber einmal
+/// abarbeitet. Der Schutz vermerkt je Vektor genau ein Bit: die erste Flanke meldet
+/// ([`MeldeUrteil::Neu`]), jede weitere desselben Vektors wird zusammengefasst
+/// ([`MeldeUrteil::Zusammengefasst`]), bis der Drain den Vektor wieder scharfstellt.
+///
+/// Das ist ZUSAMMENFASSEN, kein Verlieren: der Treiber arbeitet beim Drain alle
+/// ausstehenden ab — wie ein level-getriggerter Eingang, der bis zum Lesen steht. Wer
+/// Flanken zählte statt Vektoren, zählte Rauschen.
+///
+/// Lock-frei ist das hier nicht — der Kernel hält seine eigene Tabelle (`IRQ_PENDING`);
+/// was hier steht, ist die Entscheidung je Gerät, host-testbar, ohne Einheit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ReTriggerSchutz {
+    gefuehrt: usize,
+    ausstehend: u64,
+}
+
+/// Was EINE Flanke auf Vektor `i` bedeutet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MeldeUrteil {
+    /// Erste Flanke seit dem letzten Drain — jetzt signalisieren.
+    Neu,
+    /// Bereits ausstehend — kein zweites Signal, der Drain arbeitet beide ab.
+    Zusammengefasst,
+    /// Kein geführter Vektor — fail-closed, kein Signal.
+    Ungueltig,
+}
+
+impl ReTriggerSchutz {
+    /// Einen Schutz für `n` Vektoren anlegen. `None` bei `n == 0` (nichts zu schützen ist
+    /// kein Schutz) und bei `n > VEKTOREN_JE_GERAET_MAX` (passt nicht in die Maske — der
+    /// Aufrufer gewährt dann gerätelokal weniger, s. [`geraet_vektoren`]).
+    pub const fn neu(n: usize) -> Option<Self> {
+        if n == 0 || n > VEKTOREN_JE_GERAET_MAX {
+            return None;
+        }
+        Some(ReTriggerSchutz { gefuehrt: n, ausstehend: 0 })
+    }
+
+    /// Wie viele Vektoren geführt werden.
+    pub const fn kapazitaet(&self) -> usize {
+        self.gefuehrt
+    }
+
+    /// Ist Vektor `i` gerade ausstehend (gemeldet, noch nicht gedrained)?
+    pub fn ist_ausstehend(&self, i: usize) -> bool {
+        i < self.gefuehrt && self.ausstehend & (1u64 << i) != 0
+    }
+
+    /// Wie viele Vektoren stehen aus — die Zahl, an der der Drain seine Runde bemisst.
+    pub fn offene(&self) -> u32 {
+        self.ausstehend.count_ones()
+    }
+
+    /// Eine Flanke auf Vektor `i` einordnen.
+    pub fn ankommen(&mut self, i: usize) -> MeldeUrteil {
+        if i >= self.gefuehrt {
+            return MeldeUrteil::Ungueltig;
+        }
+        let bit = 1u64 << i;
+        if self.ausstehend & bit != 0 {
+            MeldeUrteil::Zusammengefasst
+        } else {
+            self.ausstehend |= bit;
+            MeldeUrteil::Neu
+        }
+    }
+
+    /// Vektor `i` nach der Abarbeitung wieder scharfstellen. `false` = er stand nicht aus
+    /// (ein Drain, der nichts findet, ist kein Fehler, aber auch keine Arbeit).
+    pub fn drain(&mut self, i: usize) -> bool {
+        if i >= self.gefuehrt {
+            return false;
+        }
+        let bit = 1u64 << i;
+        let war = self.ausstehend & bit != 0;
+        self.ausstehend &= !bit;
+        war
+    }
+}
+
+/// Ob ein Gerät seine gewünschten Vektoren bekommt — die gerätelokale Entscheidung.
+///
+/// `msix_zeilen` ist, was das GERÄT anbietet (Zeilen seiner MSI-X-Tabelle); die zweite
+/// Schranke ist die Darstellung ([`VEKTOREN_JE_GERAET_MAX`]). Was darunter liegt, wird
+/// gewährt; was darüber liegt, wird mit [`GeraeteVerdikt::GeraetVoll`] abgewiesen — und
+/// der Dispatch meldet dafür `ERR_IRQ_FULL` („dieses Gerät hat keinen freien Vektor"),
+/// ohne ein anderes Gerät zu stören. Das ist die E12-Aussage je Gerät statt je System:
+/// die Tabelle mag noch Platz haben, DIESES Gerät hat keinen.
+///
+/// `verlangt == 0` heisst „kein Vektor" und wird gewährt (nichts zu schreiben, kein Ticket —
+/// der Treiber pollt). Eine Absage daraus zu machen hiesse, ein Gerät ohne MSI-X-Wunsch
+/// abzuweisen, statt es zulässig pollen zu lassen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GeraeteVerdikt {
+    /// So viele Vektoren gewähren (danach: `vergib` mit `anzahl`, dann je Zeile schreiben).
+    Gewaehren(usize),
+    /// Das Gerät trägt den Wunsch nicht — gerätelokal voll.
+    GeraetVoll {
+        /// Verlangte Vektor-Zahl.
+        verlangt: usize,
+        /// Was dieses Gerät höchstens trägt.
+        max: usize,
+    },
+}
+
+/// Die gerätelokale Vektor-Entscheidung — reine Funktion über eingespeisten Werten.
+pub const fn geraet_vektoren(verlangt: usize, msix_zeilen: usize) -> GeraeteVerdikt {
+    let max = if msix_zeilen < VEKTOREN_JE_GERAET_MAX {
+        msix_zeilen
+    } else {
+        VEKTOREN_JE_GERAET_MAX
+    };
+    if verlangt > max {
+        GeraeteVerdikt::GeraetVoll { verlangt, max }
+    } else {
+        GeraeteVerdikt::Gewaehren(verlangt)
+    }
+}
+
+// ================================================================================================
 // Der Selbsttest — hier, damit er auf dem HOST läuft
 // ================================================================================================
 //
@@ -1521,5 +1725,116 @@ mod tests {
         zieh_ein(&mut z, &mut a, &m).unwrap();
         assert_eq!(a.belegt_anzahl(), 0);
         assert_eq!(a.hoechststand(), 8);
+    }
+
+    // ============================================================================================
+    // Mehrere Vektoren je Gerät (MSI-X)
+    // ============================================================================================
+
+    #[test]
+    fn msix_zeilen_tragen_je_vektor_handle_und_vektor() {
+        // Vier Vektoren: vier Zeilen, vier Handles (aufeinanderfolgend — der Allokator kann
+        // Kontiguität, also wird sie benutzt), vier CPU-Vektoren, remappable Adressen.
+        let (mut z, mut a) = (Sicht::neu(), IrteAllocator::new());
+        let m = vergib(&mut z, &mut a, true, &wunsch(4, Vektorform::MsiX)).unwrap();
+        let mut zeilen = [m.msix_zeile(0).unwrap(); 4];
+        for (i, x) in zeilen.iter_mut().enumerate() {
+            *x = m.msix_zeile(i).unwrap();
+        }
+        for (i, x) in zeilen.iter().enumerate() {
+            assert_eq!(x.zeile, i as u16);
+            assert_eq!(x.addr, msi_addr(m.handle() + i as u16));
+            assert_eq!(x.data, 0);
+            assert_eq!(x.vektor, 0x40 + i as u8);
+            assert_ne!(x.addr & (1 << 3), 0, "Zeile {i}: remappable-Bit");
+        }
+        assert!(m.msix_zeile(4).is_none(), "ueber den Block hinaus gibt es nichts");
+        // Der Iterator sieht denselben Plan in derselben Reihenfolge.
+        let mut n = 0;
+        for x in m.msix_zeilen() {
+            assert_eq!(x, zeilen[n]);
+            n += 1;
+        }
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn msi_hat_keinen_zeilenplan() {
+        // Klassisches MSI schreibt EIN Paar; „Zeile 2" gäbe es nicht zu schreiben.
+        let (mut z, mut a) = (Sicht::neu(), IrteAllocator::new());
+        let m = vergib(&mut z, &mut a, true, &wunsch(4, Vektorform::Msi)).unwrap();
+        assert!(m.msix_zeile(0).is_none());
+        assert_eq!(m.msix_zeilen().count(), 0);
+    }
+
+    #[test]
+    fn retrigger_schutz_fasst_zusammen_statt_doppelt_zu_melden() {
+        let mut s = ReTriggerSchutz::neu(4).unwrap();
+        assert_eq!(s.ankommen(0), MeldeUrteil::Neu);
+        assert!(s.ist_ausstehend(0));
+        assert_eq!(s.offene(), 1);
+        // Die zweite Flanke desselben Vektors: kein zweites Signal.
+        assert_eq!(s.ankommen(0), MeldeUrteil::Zusammengefasst);
+        assert_eq!(s.offene(), 1, "zusammengefasst heisst nicht doppelt vermerkt");
+        // Ein anderer Vektor meldet unabhängig.
+        assert_eq!(s.ankommen(2), MeldeUrteil::Neu);
+        assert_eq!(s.offene(), 2);
+        // Drain stellt scharf — danach meldet die nächste Flanke wieder neu.
+        assert!(s.drain(0));
+        assert!(!s.ist_ausstehend(0));
+        assert_eq!(s.ankommen(0), MeldeUrteil::Neu);
+        // Drain ohne Ausstand ist keine Arbeit, aber auch kein Fehler.
+        assert!(!s.drain(1));
+        assert!(!s.drain(99), "ausserhalb ist kein Drain");
+    }
+
+    #[test]
+    fn retrigger_schutz_weist_ungefuehrte_vektoren_ab() {
+        let mut s = ReTriggerSchutz::neu(2).unwrap();
+        assert_eq!(s.ankommen(2), MeldeUrteil::Ungueltig);
+        assert_eq!(s.ankommen(63), MeldeUrteil::Ungueltig);
+        assert_eq!(s.offene(), 0, "Ungueltiges hinterlaesst nichts");
+    }
+
+    #[test]
+    fn retrigger_schutz_nimmt_nur_fuehrbare_groessen() {
+        assert!(ReTriggerSchutz::neu(0).is_none(), "nichts zu schuetzen ist kein Schutz");
+        assert!(ReTriggerSchutz::neu(64).is_some());
+        assert!(ReTriggerSchutz::neu(65).is_none(), "passt nicht in die Maske");
+        assert_eq!(ReTriggerSchutz::neu(4).unwrap().kapazitaet(), 4);
+    }
+
+    #[test]
+    fn geraet_voll_ist_lokal_benannt() {
+        // Das Gerät bietet 4 Zeilen, der Treiber will 8: benannt voll — DIESES Gerät,
+        // die Tabelle mag noch Platz haben.
+        assert_eq!(
+            geraet_vektoren(8, 4),
+            GeraeteVerdikt::GeraetVoll { verlangt: 8, max: 4 }
+        );
+        // Die Darstellung deckelt ebenfalls: 200 Zeilen heissen trotzdem 64.
+        assert_eq!(
+            geraet_vektoren(65, 200),
+            GeraeteVerdikt::GeraetVoll { verlangt: 65, max: 64 }
+        );
+        assert_eq!(geraet_vektoren(64, 200), GeraeteVerdikt::Gewaehren(64));
+        assert_eq!(geraet_vektoren(4, 4), GeraeteVerdikt::Gewaehren(4));
+        // Kein Wunsch, kein Ticket — der Treiber pollt zulässig.
+        assert_eq!(geraet_vektoren(0, 4), GeraeteVerdikt::Gewaehren(0));
+    }
+
+    #[test]
+    fn mehrvektor_block_zieht_geschlossen_ein() {
+        // Einzug über das Ticket nimmt den ganzen Block zurück — kein Vektor bleibt
+        // präsent stehen, kein Handle bleibt belegt.
+        let (mut z, mut a) = (Sicht::neu(), IrteAllocator::new());
+        let m = vergib(&mut z, &mut a, true, &wunsch(4, Vektorform::MsiX)).unwrap();
+        let h = m.handle();
+        assert_eq!(a.belegt_anzahl(), 4);
+        zieh_ein(&mut z, &mut a, &m).unwrap();
+        assert_eq!(a.belegt_anzahl(), 0);
+        for i in 0..4u16 {
+            assert_eq!(z.lo_von(h + i), Some(0), "Eintrag {} muss auf P=0 zurueck", h + i);
+        }
     }
 }

@@ -310,6 +310,168 @@ pub fn manifest_report() -> u32 {
 }
 
 // ================================================================================================
+// Z7-Messkette (SW-PCR, kein TPM): jedes ERFOLGREICH geladene Image verlaengert genau einmal
+// ================================================================================================
+//
+// Die Kette ist PCR-Philosophie ohne TPM-Hardware: `neu = SHA-256(prev || program_id ||
+// domain || image_hash)`. Der Anker (`prev` des ersten Eintrags) ist [`kernel_code_hash`]
+// — also genau die Spanne, an die das Manifest per `kernel_hash` gebunden ist
+// (`read_manifest` weist ein Manifest an einen anderen Kernel ab). Damit haengt die Kette am
+// Kernel-Image und ueber das Manifest an den Kernel-Keys — ohne eigene Key-DB.
+//
+// Was sie NICHT ist (ehrlich benannt): ohne TPM gibt es keinen Hardware-Anker. Ein
+// physischer Angreifer mit Schreibzugriff aufs RAM schreibt die Liste um; der signierte
+// Bericht (s. `programs/attest`, `tools/lx_attest_check.py`) ist Software-Evidenz, kein
+// Remote-Trust gegen physische Angreifer. Die TPM-Messkette (Firmware misst Bootloader,
+// Bootloader misst Kernel + Modul) kommt von aussen (s. `tools/lx_bootentscheidung.md` §2):
+// diese Liste beginnt erst beim Kernel und misst Programme.
+//
+// Blattstellen (genau einmal je Ladevorgang, beide Blaetter, kein Doppelzaehlen):
+// * `load_image_auf` (fremder Z7-Vorlauf: Aufruf dort, Definition hier — Aufruf unangetastet),
+// * `load_program_into_pd_auf` (Aufruf unten — der LXPD-Pfad `lxpddrv_laden` laeuft DARUEBER,
+//   `load_verified_image` ebenso; `lxpddrv_laden` selbst misst NICHT, sonst zaehlte der
+//   LXPD-Weg doppelt).
+//
+// Abruf: [`messkette_bericht`] (Berichtsform wie `manifest_report`). KEIN neuer Syscall:
+// ein lesender Zugriff waere eine Autoritaetsquelle neben dem Manifest; was die
+// Attestierungs-PD braucht, steht als PATCH-TEXT im Arbeitsergebnis, nicht im Kernel.
+
+/// Wie viele Messungen die Kette hoechstens haelt (wie `MAX_IFACE_TRACKED`: eine geladene
+/// PD je ID; darueber wird BENANNT verworfen statt still ueberschrieben).
+pub const MESSKETTE_MAX: usize = 64;
+
+/// Ein Kettenglied: was gemessen wurde und der PCR-Stand danach.
+#[derive(Clone, Copy)]
+pub struct MessEintrag {
+    /// Stabile Programm-ID aus dem Archiv/Manifest.
+    pub program_id: u32,
+    /// Zieldomaene (`DOMAIN_*` aus `caprock-loader`, u32 wie in `Program.domain`).
+    pub domain: u32,
+    /// `SHA-256(ELF-Bytes)` des geladenen Images.
+    pub image_hash: [u8; 32],
+    /// Kettenstand NACH diesem Eintrag (`SHA-256(prev || id || domain || hash)`).
+    pub pcr: [u8; 32],
+}
+
+struct Messkette {
+    glieder: [Option<MessEintrag>; MESSKETTE_MAX],
+    anzahl: usize,
+    verworfen: u64,
+}
+
+impl Messkette {
+    const fn neu() -> Self {
+        Messkette { glieder: [None; MESSKETTE_MAX], anzahl: 0, verworfen: 0 }
+    }
+}
+
+static MESSKETTE: SpinLock<Messkette> = SpinLock::new(Messkette::neu());
+
+/// Die Kette um ein erfolgreich geladenes Image verlaengern (Z7).
+///
+/// Signatur aus der Aufrufstelle abgeleitet: `messkette_verlaengern(prog.program_id,
+/// prog.domain, sha256(prog.elf))` — `program_id: u32`, `domain: u32` (wie
+/// `Program.domain`), `image_hash: [u8; 32]` (wie `sha256` ihn liefert).
+///
+/// Nur ERFOLG misst: beide Aufrufer stehen nach dem `Ok` ihres Ladepfads. Laeuft die Kette
+/// voll, wird BENANNT verworfen (`verworfen + 1`, der Bericht meldet `FAILURES`) statt
+/// still zu ueberschreiben — eine Messung, die unbemerkt aussetzt, saehe aus wie eine
+/// bestandene.
+pub fn messkette_verlaengern(program_id: u32, domain: u32, image_hash: [u8; 32]) {
+    let mut buf = [0u8; 72];
+    let prev = {
+        let g = MESSKETTE.lock();
+        if g.anzahl == 0 {
+            kernel_code_hash()
+        } else {
+            g.glieder[g.anzahl - 1].map(|e| e.pcr).unwrap_or_else(kernel_code_hash)
+        }
+    };
+    buf[..32].copy_from_slice(&prev);
+    buf[32..36].copy_from_slice(&program_id.to_le_bytes());
+    buf[36..40].copy_from_slice(&domain.to_le_bytes());
+    buf[40..72].copy_from_slice(&image_hash);
+    let pcr = sha256(&buf);
+    let mut g = MESSKETTE.lock();
+    if g.anzahl >= MESSKETTE_MAX {
+        g.verworfen += 1;
+        return;
+    }
+    let i = g.anzahl;
+    g.glieder[i] = Some(MessEintrag { program_id, domain, image_hash, pcr });
+    g.anzahl = i + 1;
+}
+
+/// Wie viele Images gemessen wurden (noch ohne Genesis — `0` heisst „nichts geladen").
+pub fn messkette_anzahl() -> usize {
+    MESSKETTE.lock().anzahl
+}
+
+/// Wie viele Messungen wegen voller Kette verworfen wurden (`0` = nichts verloren).
+pub fn messkette_verworfen() -> u64 {
+    MESSKETTE.lock().verworfen
+}
+
+/// Der aktuelle Kettenstand: `(pcr, anzahl)`. Ohne Ladung ist der Stand die Genesis
+/// ([`kernel_code_hash`], `0`) — ein Pruefer kennt den Anker auch im leeren Lauf.
+pub fn messkette_aktuell() -> ([u8; 32], usize) {
+    let g = MESSKETTE.lock();
+    if g.anzahl == 0 {
+        (kernel_code_hash(), 0)
+    } else {
+        (g.glieder[g.anzahl - 1].map(|e| e.pcr).unwrap_or([0u8; 32]), g.anzahl)
+    }
+}
+
+/// Das `i`-te Glied kopieren (`None` ausserhalb der belegten Spanne).
+pub fn messkette_eintrag(i: usize) -> Option<MessEintrag> {
+    MESSKETTE.lock().glieder.get(i).copied().flatten()
+}
+
+/// Die Kette melden (Berichtsform wie `manifest_report`): Genesis-Anker, je Glied
+/// `program_id`/`domain`/Hash-Praefix/PCR-Praefix, dann die Bilanz. Gibt die Anzahl
+/// zurueck. `FAILURES` faellt nur bei verworfenen Messungen — `0` Eintraege sind kein
+/// Befund am Kernel, sondern ein Lauf ohne Module (der Anker steht trotzdem).
+pub fn messkette_bericht() -> usize {
+    let (anzahl, verworfen) = {
+        let g = MESSKETTE.lock();
+        (g.anzahl, g.verworfen)
+    };
+    let genesis = kernel_code_hash();
+    println!(
+        "messkette: Anker Kernel-Code-Hash {:02x}{:02x}{:02x}{:02x}.., {} Eintrag/Eintraege, {} verworfen (SW-PCR ohne TPM-HW: neu = SHA-256(prev || program_id || domain || image_hash))",
+        genesis[0], genesis[1], genesis[2], genesis[3], anzahl, verworfen
+    );
+    // Unter der Sperre wird KOPIERT, gedruckt wird danach (wie `iface_record_or_check`:
+    // Drucken gehoert nicht in den kritischen Abschnitt).
+    let mut kopie: [Option<MessEintrag>; MESSKETTE_MAX] = [None; MESSKETTE_MAX];
+    {
+        let g = MESSKETTE.lock();
+        kopie.copy_from_slice(&g.glieder);
+    }
+    for e in kopie[..anzahl].iter().flatten() {
+        println!(
+            "messkette:   [{}] dom={} bild={:02x}{:02x}{:02x}{:02x}.. pcr={:02x}{:02x}{:02x}{:02x}..",
+            e.program_id,
+            e.domain,
+            e.image_hash[0],
+            e.image_hash[1],
+            e.image_hash[2],
+            e.image_hash[3],
+            e.pcr[0],
+            e.pcr[1],
+            e.pcr[2],
+            e.pcr[3]
+        );
+    }
+    println!(
+        "messkette: {} (jedes erfolgreich geladene Image genau einmal; verworfene Messungen brechen die Kette)",
+        if verworfen == 0 { "ALL PASS" } else { "FAILURES" }
+    );
+    anzahl
+}
+
+// ================================================================================================
 // Root-Task (A-2.1): das erste Programm, und ab da ist jede Fähigkeit ein Userland-Programm
 // ================================================================================================
 
@@ -1353,6 +1515,10 @@ pub fn start_root_task_reported() -> bool {
 #[path = "lxpd_boot.rs"]
 mod lxpd_boot;
 
+/// LXPD-Spawn-Entscheidung (nur `core`): Pfad-Attribut wie `lxpd_boot`, genutzt in [`boot_lxpd_treiber`].
+#[path = "lxpd_glue.rs"]
+mod lxpd_glue;
+
 /// Gemeldete Spannen zählen (Bericht). Re-Export für die Bring-up-Verdrahtung
 /// (Module 1.. aus `bringup.rs` melden) — die Statik lebt weiter in `lxpd_boot`.
 pub use lxpd_boot::set_lxpd_module_span;
@@ -1575,6 +1741,49 @@ fn lxpddrv_laden(
     }
 }
 
+/// **LXPD-Container durch das Glue-Gate** (`lxpd_glue::spawn_entscheidung`): Verifikation
+/// (Manifest angenommen, Hash gebunden, Hülle geparst) → Facts → Entscheidung → Mapping.
+///
+/// Die JSON-Seite fehlt am Boot (Stubnamen/Grants/Coverage kommen separat, s. `lxpd_boot`):
+/// ohne `verify_manifest`-Urteil kein `verified` (sonst belöge man den Gate, s. `lxpd_glue`) —
+/// der Gate endet heute in `Unverified` → `TransportNur`. Alle Varianten sind benannt auf
+/// bestehende Absagen abgebildet (kein Panic-Pfad); mit der JSON-Seite sprechen die
+/// hinteren Gate ohne Umbau des Mappings.
+fn lxpd_container_gate(pid: u32, tramp_count: usize) -> Result<(), LxpdAbsage> {
+    use lxpd_glue::{spawn_entscheidung, ExecAntrag, LxpdFacts, LxpdPolicy, LxpdSpawnError};
+    let facts = LxpdFacts {
+        verified: false, // kein verify_manifest-Urteil am Boot (s. oben)
+        signature_present: false, // keine LXPD-JSON-Signatur geprüft
+        schema_version: lxpd_glue::LXPD_SCHEMA_VERSION, // Hülle ist v1 per Konstruktion
+        trampoline_names: 0, // JSON-Namen unbekannt — Zähler allein bindet nichts
+        tramp_count,     // verifiziert: aus der geparsten Hülle
+        coverage_pct: 0.0, // JSON-Deckung unbekannt
+        bar_base: 0, bar_size: 0, dma_base: 0, dma_size: 0, // keine Grant-Daten am Boot
+        irq: 0, heap_pages: 0, // dito (Manifest nennt keinen Heap, s. lxpd_glue)
+    };
+    let policy = LxpdPolicy {
+        max_bar_bytes: u64::MAX,
+        max_dma_bytes: u64::MAX,
+        max_heap_pages: u64::MAX,
+        exec: ExecAntrag {
+            program_id: pid,
+            epoche: 0,
+            token: lxpd_glue::teardown_token_fuer(pid, 0),
+            eintrag: 1,
+            segmente: 1,
+        },
+    };
+    match spawn_entscheidung(&facts, &policy) {
+        Ok(_) => Ok(()),
+        Err(LxpdSpawnError::Unverified) => Err(LxpdAbsage::TransportNur),
+        Err(LxpdSpawnError::BadImage) => Err(LxpdAbsage::EintragUnlesbar),
+        Err(LxpdSpawnError::BadGrants) => Err(LxpdAbsage::KeineZuteilung),
+        Err(LxpdSpawnError::Ueberlappung) => Err(LxpdAbsage::EndowKollision),
+        Err(LxpdSpawnError::BudgetErschoepft) => Err(LxpdAbsage::PolitikAbgewiesen),
+        Err(LxpdSpawnError::ExecAbgelehnt) => Err(LxpdAbsage::TransportNur),
+    }
+}
+
 /// **LXPD-Treiber-Boot**: nach dem Archiv-Root-Task die Manifest-Treiberliste abfahren.
 ///
 /// Auflösung je Eintrag (Domäne HardwareLand, nicht ROOT):
@@ -1704,15 +1913,20 @@ pub fn boot_lxpd_treiber(partner: Option<usize>) -> (usize, usize) {
                 Err(g) => lxpd_nein(pid, name, quelle, g),
             }
         } else if lxpd_boot::is_lxpd(bild) {
+            // Glue-Gate STATT reiner Hüllenprüfung: Hülle → Facts → Entscheidung →
+            // Mapping (s. `lxpd_container_gate`); Ok endet wie bisher in `TransportNur`.
             match lxpd_boot::LxpdBild::parse(bild) {
-                Ok(img) => {
-                    println!(
-                        "lxpddrv : [{pid}]{name} Transportnachweis gueltig (quelle={quelle}: {} Stubs, {} umverdrahtet) -- aber kein ladbares Image",
-                        img.tramp_count(),
-                        img.rewired_count()
-                    );
-                    lxpd_nein(pid, name, quelle, LxpdAbsage::TransportNur);
-                }
+                Ok(img) => match lxpd_container_gate(pid, img.tramp_count()) {
+                    Ok(()) => {
+                        println!(
+                            "lxpddrv : [{pid}]{name} Transportnachweis gueltig (quelle={quelle}: {} Stubs, {} umverdrahtet) -- aber kein ladbares Image",
+                            img.tramp_count(),
+                            img.rewired_count()
+                        );
+                        lxpd_nein(pid, name, quelle, LxpdAbsage::TransportNur);
+                    }
+                    Err(g) => lxpd_nein(pid, name, quelle, g),
+                },
                 Err(fe) => {
                     lxpd_nein(pid, name, quelle, LxpdAbsage::ContainerFehler(fe));
                 }
@@ -2185,6 +2399,11 @@ fn ladepolitik_auf(
     };
     LadePolitik {
         farbig,
+        node: if numa != 0 {
+            caprock_hal::numa::Node::At(numa as u8)
+        } else {
+            caprock_hal::numa::Node::Unaffiliated
+        },
         angebotene_slots: angebot,
         cap_budget,
         // `priority = 0` heisst im Manifest "nichts gesagt" -- 0 ist im Scheduler eine gueltige
@@ -2466,6 +2685,9 @@ pub fn load_image_auf(
     )
     .ok_or(LoaderError::NoResources)?;
     record_program_thread(prog.program_id, r.0);
+    // Z7: jedes ERFOLGREICH geladene Image verlaengert die Messkette (Boot + Laufzeit --
+    // beide kommen ueber diese beiden Funktionen; der LXPD-Hook selbst bleibt unangetastet).
+    messkette_verlaengern(prog.program_id, prog.domain, sha256(prog.elf));
     Ok(r)
 }
 
@@ -2506,6 +2728,11 @@ pub fn load_program_into_pd_auf(
     )
     .ok_or(LoaderError::NoResources)?;
     record_program_thread(prog.program_id, tid);
+    // Z7: zweites Blatt der Messkette (das erste ist `load_image_auf` — fremder Vorlauf,
+    // dort unangetastet). `lxpddrv_laden` (Boot + `load_verified_image`) laeuft DURCH diese
+    // Funktion und misst damit genau einmal; ein Zaehlpunkt in `lxpddrv_laden` selbst zaehlte
+    // doppelt.
+    messkette_verlaengern(prog.program_id, prog.domain, sha256(prog.elf));
     debuggable_praegen(prog.program_id, pd);
     Ok(tid)
 }

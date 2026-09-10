@@ -5154,7 +5154,16 @@ const DONE_FLAGS_ARM: usize = 61;
 
 fn all_done(warum: Option<&mut [(&'static str, bool); DONE_FLAGS_ARM]>) -> bool {
     let workers = (0..NWORKERS).all(|i| WORKER_COUNTS[i].load(Ordering::Relaxed) >= THRESHOLD);
-    let cores = (0..system::num_cores()).all(|c| hal::timer::ticks(c) > 0);
+    // Z6 Stufe 1b: nur ONLINE-Kerne muessen ticken. Ein unterdruecktes SMT-Geschwister hat
+    // Tabellen (`num_cores()` zaehlt es), aber keinen Timer -- `ticks == 0` ist dort die
+    // Politik, kein Defekt. Wer ueber die konfigurierte Zahl ginge, verlangte von einem
+    // Kern, der absichtlich nie bootet, einen Herzschlag -- und triebe jeden SMT-Lauf in
+    // den Watchdog (`offen waren: cores`). Die Erwartung kommt aus `core_online()` (dem
+    // Bit hinter `cores_online()`), nicht aus der Konfiguration. Ohne SMT ist jedes
+    // konfigurierte Bit gesetzt und die Zeile buchstabengleich zur alten.
+    let cores = (0..system::num_cores())
+        .filter(|&c| caprock_sched::core_online(c))
+        .all(|c| hal::timer::ticks(c) > 0);
     let fp = FP_COLLECTOR_DONE.load(Ordering::Acquire) && system::fp_switch_count() > 0;
     let prio = (0..NPRIO_TEST).all(|i| PRIO_DONE[i].load(Ordering::Acquire));
     let life = KILLER_DONE.load(Ordering::Acquire) && REAPED.load(Ordering::Relaxed) >= 2;
@@ -5168,7 +5177,14 @@ fn all_done(warum: Option<&mut [(&'static str, bool); DONE_FLAGS_ARM]>) -> bool 
     let el0iso = system::el0_fault_count() >= 1;
     // SMP: alle Sekundärkerne haben ihren Worker abgearbeitet (parallele Einplanung)
     // und der Parker wurde kern-übergreifend per IPI geweckt.
+    // Z6 Stufe 1b: Fortschritt wird nur von ONLINE-Kernen erwartet -- ein unterdruecktes
+    // SMT-Geschwister laeuft nie und haette nie Fortschritt (derselbe Grund wie beim
+    // `cores`-Konjunkt oben). Der IPI-Wake (`woken`) bleibt unbedingt: Faellt er, ist der
+    // Cross-Core-Pfad wirklich kaputt -- oder der Parker liegt auf einem toten Kern
+    // (feste Platzierung auf Kern 1, s. Spawn-Seite), und dann nennt der Watchdog `smp`
+    // beim Namen statt `cores` danebenzuschuldigen.
     let smp = (1..system::num_cores())
+        .filter(|&c| caprock_sched::core_online(c))
         .all(|c| XCORE_PROGRESS[c].load(Ordering::Relaxed) >= SMP_WORK_TARGET)
         && XCORE_WOKEN.load(Ordering::Acquire);
     let xipc = XIPC_DONE.load(Ordering::Acquire);
@@ -5453,6 +5469,14 @@ fn report() {
     crate::uhr::messen();
     let mut sched_ok = true;
     for c in 0..system::num_cores() {
+        // Z6 Stufe 1b: ein unterdruecktes SMT-Geschwister meldet `suppressed`, nicht
+        // `ticks=0` -- dieselbe Unterscheidung wie im `cores`-Konjunkt oben: Abwesenheit
+        // mit Grund ist keine fehlende Messung. Ohne SMT ist jeder Kern online und die
+        // Ausgabe buchstabengleich zur alten (davon haengen die Suite-Greps ab).
+        if !caprock_sched::core_online(c) {
+            println!("sched   : core {c} suppressed (SMT-Stufe-1: nie gebootet, kein Tick erwartet)");
+            continue;
+        }
         let t = hal::timer::ticks(c);
         println!("sched   : core {c} ticks={t}");
         if t == 0 {
@@ -5673,6 +5697,13 @@ fn report() {
     // abgearbeitet; der Parker wurde kern-übergreifend per IPI geweckt.
     let mut smp_ok = true;
     for c in 1..system::num_cores() {
+        // Z6 Stufe 1b: wie in der `sched`-Zeile -- Abwesenheit mit Grund ist keine
+        // fehlende Messung. Ohne SMT ist jeder Kern online und die Ausgabe
+        // buchstabengleich zur alten.
+        if !caprock_sched::core_online(c) {
+            println!("smp     : core {c} suppressed (SMT-Stufe-1: nie gebootet, kein Fortschritt erwartet)");
+            continue;
+        }
         let p = XCORE_PROGRESS[c].load(Ordering::Relaxed);
         println!("smp     : core {c} Worker-Fortschritt={p}/{SMP_WORK_TARGET}");
         if p < SMP_WORK_TARGET {

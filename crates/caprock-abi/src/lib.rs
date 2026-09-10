@@ -553,6 +553,20 @@ pub mod sys {
     /// Erschoepfung wird abgewiesen, nicht still geteilt. Erfordert pro-Thread-Sichern
     /// der Debugregister im Kontextwechsel (`hal::debug`).
     pub const DEBUG_HWBREAK: u64 = 35;
+
+    /// **Einen Teilbereich einer Memory-Cap als eigene Cap ableiten** (CSUB,
+    /// Mem-Server-Transport): das Fenster steht am Slot, nicht am Objekt — Eltern und
+    /// Kind teilen das Objekt, `revoke` zieht das Teil ueber die Kindkette ein, die
+    /// Region wird genau einmal freigegeben (wenn die letzte Cap faellt).
+    ///
+    /// `x1` = Quell-Slot (Memory) · `MSG0` = freier Ziel-Slot · `MSG1` = Offset ·
+    /// `MSG2` = Laenge. Vier Worte, keine Rechte-Maske: die Schnitt-Eigenschaft traegt
+    /// das Primitiv (`CapSpace::subregion`), nicht der Aufruf. Ausgaenge: `OK` ·
+    /// `ERR_BADCAP` (kein Cap / keine Memory-Cap) · `ERR_NOSPACE` (Ziel belegt oder
+    /// ausserhalb, Budget, Tabelle) · `ERR_SUBREGION` (21) · `ERR_RIGHTS`.
+    ///
+    /// Nummer 37 = erste freie nach FORK/EXEC + Debugger-v2 + LOAD_IMAGE.
+    pub const CSUB: u64 = 37;
 }
 
 /// Rights and frame-word names for the debug syscalls (Z6b).
@@ -978,9 +992,9 @@ pub mod fork {
     /// wenige Segmente), klein genug, dass die Kopierschleife unter der
     /// Sperrhaltedauer-Marke bleibt (Aufrufer schleift, preemptibel).
     pub const SNAPSHOT_MAX_BYTES: u64 = 8 * 1024 * 1024;
-    /// Naechste freie Syscall-Nummer nach FORK/EXEC + Debugger-v2 + LOAD_IMAGE (s. `super::sys`).
-    /// `37` ist frei; `4` bleibt historische Luecke, nie vergeben.
-    pub const NAECHSTE_FREIE_SYSCALL: u64 = 37;
+    /// Naechste freie Syscall-Nummer nach FORK/EXEC + Debugger-v2 + LOAD_IMAGE + CSUB.
+    /// `38` ist frei; `4` bleibt historische Luecke, nie vergeben.
+    pub const NAECHSTE_FREIE_SYSCALL: u64 = 38;
 }
 
 // --- Host-nahe Pruefung der Nummernvergabe (A2-Rest) ------------------------------------------
@@ -1014,17 +1028,18 @@ mod nummern {
     }
 
     #[test]
-    fn fork_exec_belegen_die_luecke_37_bleibt_frei() {
+    fn fork_exec_belegen_die_luecke_38_bleibt_frei() {
         // Prozessmodell: die Luecke `31`/`32` ist geschlossen, `36` ist LOAD_IMAGE,
-        // `37+` bleibt frei. `4` bleibt historische Luecke, nie vergeben.
+        // `37` ist CSUB, `38+` bleibt frei. `4` bleibt historische Luecke, nie vergeben.
         // Kollision = Baufehler: faellt dieser Test, ist eine Nummer doppelt
         // vergeben (s. naechsten Test).
         assert_eq!(sys::FORK_SNAPSHOT, 31);
         assert_eq!(sys::EXEC_REPLACE, 32);
         assert_eq!(sys::LOAD_IMAGE, 36);
-        assert_eq!(super::fork::NAECHSTE_FREIE_SYSCALL, 37);
+        assert_eq!(sys::CSUB, 37);
+        assert_eq!(super::fork::NAECHSTE_FREIE_SYSCALL, 38);
         assert_eq!(super::fork::SNAPSHOT_MAX_BYTES, 8 * 1024 * 1024);
-        // Kein bekannter Syscall liegt auf/ueber 37 — wuerde einer hinzukommen, ohne
+        // Kein bekannter Syscall liegt auf/ueber 38 — wuerde einer hinzukommen, ohne
         // diesen Test zu erweitern, schwiege die Einmaligkeitspruefung nicht, aber die
         // „naechste freie"-Aussage waere falsch. Deshalb steht die Aufzaehlung hier.
         for n in [
@@ -1064,8 +1079,9 @@ mod nummern {
             sys::FORK_SNAPSHOT,
             sys::EXEC_REPLACE,
             sys::LOAD_IMAGE,
+            sys::CSUB,
         ] {
-            assert!(n < 37, "Syscall-Nummer {n} liegt auf/ueber der naechsten freien 37");
+            assert!(n < 38, "Syscall-Nummer {n} liegt auf/ueber der naechsten freien 38");
         }
     }
 
@@ -1108,6 +1124,7 @@ mod nummern {
             sys::FORK_SNAPSHOT,
             sys::EXEC_REPLACE,
             sys::LOAD_IMAGE,
+            sys::CSUB,
         ];
         let mut sortiert = alle;
         sortiert.sort_unstable();

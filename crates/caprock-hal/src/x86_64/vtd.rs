@@ -1245,6 +1245,54 @@ pub fn irte_pruefen(index: u16, erwarteter_vektor: u8, rid: u32) -> IrteBefund {
     }
 }
 
+/// **Einen vergebenen Mehrvektor-Block gegen die Erwartung prüfen** — gelesen, nicht
+/// nachgerechnet (s. [`irte_lesen`]).
+///
+/// Nach einem Mehrvektor-Grant (`anzahl > 1`) sagt ein einzelnes [`irte_pruefen`] nichts
+/// über die übrigen Zeilen: ein Block, dessen dritte Zeile ohne `SID` stünde, wäre auf
+/// diesem Vektor von jedem Gerät benutzbar — und ein Prüfer, der nur Zeile 0 liest, sähe
+/// das nie (dieselbe Form wie `jeder_eintrag_des_blocks_traegt_die_quellpruefung` auf der
+/// Host-Seite).
+///
+/// Geprüft wird jede Zeile des Tickets (`handle + i` gegen `basis_vektor + i`, dieselbe
+/// `rid`): `geprueft` zählt die gelesenen Zeilen, `ok` heisst „alle tragen Präsenz, Vektor
+/// und Quellprüfung", `erster_fehler` nennt die erste Zeile, die es nicht tut (`None` bei
+/// `ok`). Ein Block, dessen Vektorfolge nicht darstellbar wäre, ist kein Prüf-, sondern
+/// ein Vergabefehler (`vergib` weist ihn vorher ab) — läuft die Folge hier trotzdem über,
+/// zählt die Zeile als Fehler, statt umzulaufen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IrteBlockBefund {
+    /// Wie viele Zeilen gelesen wurden.
+    pub geprueft: usize,
+    /// Alle gelesenen Zeilen tragen Präsenz, Vektor und Quellprüfung.
+    pub ok: bool,
+    /// Erste fehlerhafte Zeile (`None` bei `ok`).
+    pub erster_fehler: Option<u16>,
+}
+
+pub fn irte_block_pruefen(ziel: &super::irte::MsiZiel, rid: u32) -> IrteBlockBefund {
+    let mut b = IrteBlockBefund { geprueft: 0, ok: true, erster_fehler: None };
+    for i in 0..ziel.anzahl() {
+        let index = ziel.handle().wrapping_add(i as u16);
+        let Some(vektor) = ziel.basis_vektor().checked_add(i as u8) else {
+            b.ok = false;
+            if b.erster_fehler.is_none() {
+                b.erster_fehler = Some(index);
+            }
+            continue;
+        };
+        let f = irte_pruefen(index, vektor, rid);
+        b.geprueft += 1;
+        if !(f.tabelle_da && f.praesent && f.vektor_passt && f.svt_gesetzt && f.sid_passt) {
+            b.ok = false;
+            if b.erster_fehler.is_none() {
+                b.erster_fehler = Some(index);
+            }
+        }
+    }
+    b
+}
+
 /// Einen vergebenen Block wieder einziehen (Teardown, Hot-Reload).
 pub fn irte_zieh_ein(ziel: &super::irte::MsiZiel) -> Result<(), super::irte::VergabeFehler> {
     let tabelle = IRT[0].load(Ordering::Acquire);
@@ -1285,6 +1333,17 @@ pub use super::irte::Vektorform;
 /// Handle zu behalten liesse den Eintrag praesent stehen, ohne dass ihn noch jemand einziehen
 /// kann -- genau das, wogegen das `#[must_use]` am Typ steht.
 pub use super::irte::MsiZiel;
+/// Der Mehrvektor-Satz (`irte.rs`, Abschnitt „Mehrere Vektoren je Gerät") — **aus demselben
+/// Grund hier weitergereicht wie [`MsiZiel`]**: der Kernel schreibt je Zeile
+/// (`MsixZeile`/`MsixZeilen`), schützt je Vektor (`ReTriggerSchutz`/`MeldeUrteil`) und
+/// entscheidet gerätelokal (`geraet_vektoren`/`GeraeteVerdikt` gegen
+/// `VEKTOREN_JE_GERAET_MAX`), und dazu muss er die Typen nennen können. `irte` selbst
+/// bleibt am Crate-Kopf unerreicht — die Fassade ist diese Datei, nicht das Kodierungsmodul.
+pub use super::irte::{
+    geraet_vektoren, GeraeteVerdikt, MeldeUrteil, MsixZeile, MsixZeilen, ReTriggerSchutz,
+    VEKTOREN_JE_GERAET_MAX,
+};
+/// Der Befund der Block-Rücklesung ([`irte_block_pruefen`]) — gelesen, nicht nachgerechnet.
 
 /// **Der Selbsttest der IRTE-Vergabe** — laeuft in [`init`], unmittelbar nachdem Interrupt
 /// Remapping aufgesetzt ist.

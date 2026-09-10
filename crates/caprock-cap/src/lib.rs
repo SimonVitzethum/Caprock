@@ -15,8 +15,8 @@
 //! * **Generations-Handles** ([`CapPtr`]): externe Verweise prüfen eine
 //!   Generationsnummer und erkennen so stale Pointer.
 //!
-//! Operationen: [`CapSpace::copy`], [`CapSpace::mint`], [`CapSpace::move_cap`],
-//! [`CapSpace::delete`], [`CapSpace::revoke`]. Rechte können bei der Ableitung
+//! Operationen: [`CapSpace::copy`], [`CapSpace::mint`], [`CapSpace::subregion`],
+//! [`CapSpace::move_cap`], [`CapSpace::delete`], [`CapSpace::revoke`]. Rechte können bei der Ableitung
 //! nur *eingeschränkt* werden (kein Privilege-Escalation).
 //!
 //! Alles ist sichere Rust-Datenstrukturlogik — **kein `unsafe`**, seit A-3.4 nicht mehr nur

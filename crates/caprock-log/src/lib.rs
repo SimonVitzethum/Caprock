@@ -207,6 +207,62 @@ impl LogRing {
     }
 }
 
+/// Die Linux-`KERN_*`-Nummern, soweit die Schablone sie braucht — benannt statt magisch,
+/// damit ein Shim ein `<3>`-Präfix oder einen rohen Code ohne Zahlenraten liest. Nur die drei
+/// Stufen, die die Schablone abbildet; der Rest läuft über [`kern_stufe`].
+pub const KERN_ERR: u8 = 3;
+/// `KERN_WARNING` — auffällig, aber weiter ([`Stufe::Warn`]).
+pub const KERN_WARNING: u8 = 4;
+/// `KERN_INFO` — Betrieb ([`Stufe::Info`]).
+pub const KERN_INFO: u8 = 6;
+
+/// Rohe Linux-Stufe (0–7) auf [`Stufe`] abbilden — die `printk`-Abbildung für Shims.
+///
+/// `0..=3 → Err`, `4..=5 → Warn`, `6..=7 → Info`; ausserhalb gibt es `None` (kein Raten auf
+/// unbekannten Codes — der Aufrufer benennt die Absage statt eine Stufe zu erfinden).
+/// Gröber als Linux mit Absicht: der Ring kennt drei Stufen, und eine vierte täuschte eine
+/// Unterscheidung vor, die kein Leser je sieht.
+pub fn kern_stufe(kern: u8) -> Option<Stufe> {
+    match kern {
+        0..=3 => Some(Stufe::Err),
+        4..=5 => Some(Stufe::Warn),
+        6..=7 => Some(Stufe::Info),
+        _ => None,
+    }
+}
+
+/// `printk`-Schablone für Shims: Stufe plus Text in den Ring.
+///
+/// Aufrufsignatur `(ring, stufe, nachricht)` — Subjekt zuerst, dann was, dann Inhalt (wie
+/// `push`, nur als freie Funktion, damit ein generierter Shim sie ohne Typ rufen kann).
+/// `no_std`, kehrt **immer sofort** zurück: blockiert nie, parkt nie — bei vollem Ring wird
+/// das Älteste verworfen und [`LogRing::verworfen`] zählt (s. [`LogRing::push`]). Der Aufrufer
+/// formatiert in einen stapellokalen Puffer und reicht die Scheibe herein; was über
+/// [`LOG_TEXT`] hinausgeht, wird begrenzt, nicht abgewiesen. Rückgabe: `true` = aufbewahrt,
+/// `false` = per Filter abgewiesen (zählt ebenfalls als verworfen).
+pub fn printk(ring: &mut LogRing, stufe: Stufe, nachricht: &[u8]) -> bool {
+    ring.push(stufe, nachricht)
+}
+
+/// `dev_err`-Schablone für Shims: `KERN_ERR` ohne Nummern und ohne `struct device`.
+///
+/// Das Linux-`dev_err(dev, fmt, ...)` trägt das Gerät im Präfix; hier steht der Text allein —
+/// welches Gerät spricht, weiss der Leser aus der PD, nicht aus der Zeile. Dünn über
+/// [`LogRing::push`]: dieselben Zusagen (nie blockierend, Ältestes fällt, Zähler zählt).
+pub fn dev_err(ring: &mut LogRing, nachricht: &[u8]) -> bool {
+    ring.push(Stufe::Err, nachricht)
+}
+
+/// `dev_warn`-Schablone (`KERN_WARNING`) — s. [`dev_err`].
+pub fn dev_warn(ring: &mut LogRing, nachricht: &[u8]) -> bool {
+    ring.push(Stufe::Warn, nachricht)
+}
+
+/// `dev_info`-Schablone (`KERN_INFO`) — s. [`dev_err`].
+pub fn dev_info(ring: &mut LogRing, nachricht: &[u8]) -> bool {
+    ring.push(Stufe::Info, nachricht)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +336,51 @@ mod tests {
         assert_eq!(ring.verworfen(), 0); // Geschichte bleibt
         assert!(ring.push(Stufe::Warn, b"drei")); // und danach geht es weiter
         assert_eq!(ring.eintrag(0).unwrap().text(), b"drei");
+    }
+
+    #[test]
+    fn kern_stufe_deckt_0_bis_7_ab_und_raet_nicht() {
+        // Die drei benannten Codes treffen ihre Stufe — und die Nachbarn gleich mit, weil die
+        // Abbildung Bereiche liest, keine Einzelwerte (0–3 ist alles „Fehler", nicht nur 3).
+        assert_eq!(kern_stufe(KERN_ERR), Some(Stufe::Err));
+        assert_eq!(kern_stufe(0), Some(Stufe::Err)); // EMERG ist auch ein Fehler
+        assert_eq!(kern_stufe(KERN_WARNING), Some(Stufe::Warn));
+        assert_eq!(kern_stufe(5), Some(Stufe::Warn)); // NOTICE ist auch auffällig
+        assert_eq!(kern_stufe(KERN_INFO), Some(Stufe::Info));
+        assert_eq!(kern_stufe(7), Some(Stufe::Info)); // DEBUG läuft als Betrieb
+        assert_eq!(kern_stufe(8), None); // unbekannt: benannte Absage statt erfundener Stufe
+        assert_eq!(kern_stufe(u8::MAX), None);
+        // Die Ordnung trägt den Filter: was der Ring vergleicht, bildet die Abbildung ab.
+        assert!(Stufe::Err > Stufe::Warn && Stufe::Warn > Stufe::Info);
+    }
+
+    #[test]
+    fn shim_signaturen_blockieren_nie_verwerfen_aeltestes() {
+        // Die Schablonen-Zusage: voller Ring + ein Satz mehr = Ältester weg, Zähler +1,
+        // Rückgabe trotzdem `true` (aufbewahrt — nur Filter-Abgewiesenes meldet `false`).
+        let mut ring = LogRing::new();
+        for i in 0..(LOG_PLAETZE as u8) {
+            assert!(printk(&mut ring, Stufe::Info, &[i]));
+        }
+        assert!(dev_err(&mut ring, b"irq: ueberlauf")); // parkt nicht, wartet nicht
+        assert!(dev_warn(&mut ring, b"auffaellig"));
+        assert!(dev_info(&mut ring, b"betrieb"));
+        assert_eq!(ring.len(), LOG_PLAETZE); // begrenzt, nicht gewachsen
+        assert_eq!(ring.verworfen(), 3); // genau die drei Verdrängten
+        assert_eq!(ring.eintrag(0).unwrap().text(), &[3u8]); // 0, 1, 2 sind weg
+        let letzter = ring.eintrag(LOG_PLAETZE - 1).unwrap();
+        assert_eq!(letzter.stufe(), Stufe::Info);
+        assert_eq!(letzter.text(), b"betrieb");
+    }
+
+    #[test]
+    fn shim_signaturen_achten_den_filter() {
+        let mut ring = LogRing::new();
+        ring.set_filter(Stufe::Warn);
+        assert!(!dev_info(&mut ring, b"leise")); // abgewiesen, nicht aufbewahrt
+        assert_eq!(ring.verworfen(), 1);
+        assert!(dev_warn(&mut ring, b"laut genug"));
+        assert!(printk(&mut ring, Stufe::Err, b"fehler"));
+        assert_eq!(ring.len(), 2);
     }
 }

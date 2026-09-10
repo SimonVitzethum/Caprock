@@ -437,6 +437,7 @@ fn idle() -> ! {
         // gibt deren Stacks an den Allokator zurück. So lecken auch Threads, die auf
         // einem Sekundärkern enden (z. B. lastbewusst platzierte), keinen Speicher.
         system::reap();
+        // NOHZ unverdrahtet (s. `system.rs` am Lastausgleich): plain `wfi`, wie bisher.
         hal::cpu::wfi();
     }
 }

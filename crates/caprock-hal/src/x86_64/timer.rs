@@ -13,9 +13,17 @@ const REG_TIMER_CURRCNT: usize = 0x390;
 const REG_TIMER_DIV: usize = 0x3E0;
 /// LVT-Bit 17: periodischer Modus.
 const LVT_PERIODIC: u32 = 1 << 17;
+/// LVT-Bit 16: Interrupt maskiert (NOHZ-`disarm`, B-5.2).
+const LVT_MASKED: u32 = 1 << 16;
 
 /// Gemessene Taktrate des LAPIC-Timers (Ticks/s), s. [`calibrate`].
 static LAPIC_HZ: AtomicU64 = AtomicU64::new(0);
+
+/// Die `hz` aus dem letzten [`init`]-Aufruf -- die periodische Rate, zu der
+/// [`rearm_periodic`] zurueckkehrt. `0` = noch nie armiert (dann ist Rearmieren ein No-Op:
+///
+/// ein Timer, der nie lief, wird nicht aus Versehen gestartet).
+static PERIOD_HZ: AtomicU64 = AtomicU64::new(0);
 
 /// Tick-Zähler je Kern (nur der jeweilige Kern schreibt seinen Eintrag).
 const MAX_CORES: usize = 256;
@@ -77,9 +85,78 @@ pub fn init(hz: u64) {
         }
         r => r,
     };
+    PERIOD_HZ.store(hz.max(1), Ordering::Relaxed);
     write(REG_TIMER_DIV, 0b1011); // Teiler 1
     write(REG_LVT_TIMER, TIMER_INTID | LVT_PERIODIC);
     write(REG_TIMER_INITCNT, (rate / hz.max(1)).max(1) as u32);
+}
+
+// --- NOHZ-Umprogrammierung (B-5.2/Z5) --------------------------------------------------------
+//
+// Der LAPIC-Timer kennt neben periodisch auch **einmalig**: ohne `LVT_PERIODIC` zaehlt
+// `INITCNT` einmal herunter, feuert genau einen Interrupt und bleibt stehen. Das ist der
+// Mechanismus hinter den NOHZ-Ausgaengen `OneShot`/`Disarmed` (die Entscheidung liegt in
+// `caprock-sched`, `nohz::nohz_plan` -- diese Crate kennt sie nicht, hier nur die Register).
+//
+// Alle drei Funktionen sind reine Registerprogrammierungen ohne Fehlerausgang: Was nicht
+// gelingen kann, kann nicht fehlschlagen -- und der Aufrufer braucht keinen Irrtumspfad.
+// Fail-closed liegt beim Aufrufer (Idle-/Tick-Pfad): Wer nicht umprogrammiert, tickt wie
+// bisher.
+
+/// Zaehler pro Tick bei der periodischen Rate (`INITCNT`-Einheiten je Tick).
+fn counts_pro_tick() -> u64 {
+    let rate = LAPIC_HZ.load(Ordering::Relaxed).max(1);
+    let hz = PERIOD_HZ.load(Ordering::Relaxed).max(1);
+    (rate / hz).max(1)
+}
+
+/// Groesstes als One-Shot armierbares Delta in Ticks (`INITCNT` ist 32-bittig).
+pub fn oneshot_max_ticks() -> u64 {
+    (u32::MAX as u64 / counts_pro_tick()).max(1)
+}
+
+/// Timer ganz entwaffnen: LVT-Eintrag maskieren (Bit 16) und Zaehler anhalten.
+///
+/// Geweckt wird der Kern danach durch alles, was kein Tick ist -- IPI, Geraete-IRQ.
+/// Nur zu rufen, wenn die NOHZ-Entscheidung `Disarmed` lautet; alles andere waere ein
+/// Kern, der schlaeft, waehrend Arbeit anliegt.
+pub fn disarm() {
+    write(REG_LVT_TIMER, TIMER_INTID | LVT_MASKED);
+    write(REG_TIMER_INITCNT, 0);
+}
+
+/// Genau einmal in `delta_ticks` Ticks feuern, danach Stille.
+///
+/// `0` wird auf `1` aufgerundet (sofort statt nie -- ein One-Shot, der nie feuert, ist
+/// ein verlorener Weckruf); groessere Werte werden auf [`oneshot_max_ticks`] gedeckelt
+/// (ein Ueberlauf wuerde frueh feuern -- die gefaehrliche Richtung, weil der Weckruf
+/// danach verbraucht waere). Der Aufrufer gibt nur Werte `>= 2` herein (s. `nohz_plan`);
+/// die Aufrundung ist das Netz, nicht der Weg.
+pub fn arm_oneshot(delta_ticks: u64) {
+    let counts = delta_ticks
+        .max(1)
+        .saturating_mul(counts_pro_tick())
+        .min(u32::MAX as u64)
+        .max(1) as u32;
+    // One-Shot: Vektor + unmaskiert, aber OHNE `LVT_PERIODIC` -- nach dem Feuern Stille.
+    write(REG_LVT_TIMER, TIMER_INTID);
+    write(REG_TIMER_INITCNT, counts);
+}
+
+/// Zurueck zur periodischen Rate aus dem letzten [`init`]. Nach jedem Aufwachen aus einem
+/// One-Shot/Disarmed zu rufen -- unbedingt, nicht bedingt: Im Zweifel tickt der Kern
+/// einmal zu viel statt einmal zu wenig (die sichere Richtung).
+pub fn rearm_periodic() {
+    let hz = PERIOD_HZ.load(Ordering::Relaxed);
+    if hz == 0 {
+        return; // nie armiert -- nichts wiederherzustellen, nichts zu starten
+    }
+    write(REG_TIMER_DIV, 0b1011); // Teiler 1
+    write(REG_LVT_TIMER, TIMER_INTID | LVT_PERIODIC);
+    write(
+        REG_TIMER_INITCNT,
+        (LAPIC_HZ.load(Ordering::Relaxed).max(1) / hz).max(1) as u32,
+    );
 }
 
 /// Vom Interrupt-Dispatch bei jedem Timer-Interrupt zu rufen (aarch64: Comparator neu setzen;

@@ -869,6 +869,7 @@ extern "C" fn ap_entry() -> ! {
     hal::cpu::local_irq_enable();
     loop {
         system::reap(); // jeder Kern sammelt seine eigenen Zombies ein
+        // NOHZ unverdrahtet (s. `system.rs` am Lastausgleich): plain `wfi`, wie bisher.
         hal::cpu::wfi();
     }
 }
@@ -2067,9 +2068,13 @@ const SWEEP_KMAX: [u32; SWEEP_PFADE] = [12, 12, 4, 6, 4, 6, 3, 24];
 //     Die letzte ist neu und ein Befund fuer sich: sie stand als „Ladepfad" gebucht und ist
 //     keiner -- sie ist der Weg, auf dem eine Treiber-PD ihr Geraetefenster bekommt, und der
 //     braucht kein Archiv. Ein Grund, der nie nachgeprueft wird, ueberlebt jede Umgebung.
-//  2. **PROVOZIERT, nur MIT Boot-Archiv** (4): 4288 Segmentspeicher · 4304 Seitentabelle eines
-//     Segments · 4350 User-Stack · 4366 Seitentabelle des Stacks. Das ist der Ladepfad, auf dem
+//  2. **PROVOZIERT, nur MIT Boot-Archiv** (5): 4288 Segmentspeicher · 4304 Seitentabelle eines
+//     Segments · 4350 User-Stack · 4366 Seitentabelle des Stacks · Heap-OOM der va_liste in
+//     `load_into_pd_mit_va` (drei `try_reserve`, eine Meldestelle). Das ist der Ladepfad, auf dem
 //     `NoResources` sechs Wochen stumm war; die Lade-Suite hat das Archiv, die Hauptsuite nicht.
+//     Die fuenfte Stelle meldet Heap-Erschoepfung statt Topf-Leere -- der Sweep leert Toepfe,
+//     keinen Heap, also provoziert er sie nicht; sie steht hier, damit der Nenner stimmt,
+//     nicht als behauptete Abdeckung.
 //  3. **PLATZ-TOEPFE** (10): 2399/2453/3221/3386/3547/4438 Thread-Slot · 2572 ASID ·
 //     3293/4171 Farbstreifen · 4516 PD-Slot. Die Sperre sitzt im SPEICHER-Allokator; diese Toepfe
 //     vergeben keine Bytes. Sie zu leeren heisst tausende Threads/PDs anzulegen -- das ist die
@@ -2090,10 +2095,16 @@ const SWEEP_KMAX: [u32; SWEEP_PFADE] = [12, 12, 4, 6, 4, 6, 3, 24];
 //     * 4269 `MANGEL_SEGMENT_SPEICHER` mit Menge 0 -- die Fail-closed-Schranke gegen mehr als
 //       `MAX_IMG_SEGS` (64) Frame-Stuecke. Sie braucht ein IMAGE mit mehr als 64 Stuecken, keinen
 //       leeren Topf; kein Programm des Testarchivs kommt in die Naehe.
+//  7. **FORK-PFAD** (10, Stand 2026-09-09): die zehn Meldestellen in `dispatch_fork`
+//     (`system.rs`: Kostenschaetzung, PD-Slot, L2-Tabelle, Segment-/Seitentabellen-/Stack-
+//     Speicher, Mapping-Abweisung, Thread-Slot). Sie brauchen kein Boot-Archiv (FORK kopiert
+//     eine laufende PD), aber der Sweep uebt sie NOCH NICHT -- er kennt nur den Lade-Pfad.
+//     Die Zahl steht hier, damit der Nenner stimmt; die Provozierung ist eigene Arbeit
+//     (FORK-Sonde mit leeren Toepfen, Muster `sweep`). B reviewt die Einordnung.
 #[cfg(feature = "selftest")]
 const SWEEP_K1_PROVOZIERT_OHNE_ARCHIV: usize = 12;
 #[cfg(feature = "selftest")]
-const SWEEP_K2_PROVOZIERT_MIT_ARCHIV: usize = 4;
+const SWEEP_K2_PROVOZIERT_MIT_ARCHIV: usize = 5;
 #[cfg(feature = "selftest")]
 const SWEEP_K3_PLATZ: usize = 10;
 #[cfg(feature = "selftest")]
@@ -2102,6 +2113,8 @@ const SWEEP_K4_NICHT_GEFRAGT: usize = 4;
 const SWEEP_K5_HAL_VORRAT: usize = 1;
 #[cfg(feature = "selftest")]
 const SWEEP_K6_UNAUSLOESBAR: usize = 2;
+#[cfg(feature = "selftest")]
+const SWEEP_K7_FORK_PFAD: usize = 10;
 
 /// **Die Summanden MUESSEN aufgehen** -- zur Bauzeit, nicht im Bericht.
 #[cfg(feature = "selftest")]
@@ -2112,10 +2125,11 @@ const _: () = assert!(
         + SWEEP_K4_NICHT_GEFRAGT
         + SWEEP_K5_HAL_VORRAT
         + SWEEP_K6_UNAUSLOESBAR
+        + SWEEP_K7_FORK_PFAD
         == system::MELDESTELLEN,
     "C7: die Summanden der Sweep-Abdeckung gehen nicht mehr gegen system::MELDESTELLEN auf. \
      Es ist eine Meldestelle dazugekommen (oder weggefallen), und sie ist nicht eingeordnet. \
-     Ordne sie in eine der sechs Klassen bei SWEEP_KMAX ein -- eine Abdeckung mit einem \
+     Ordne sie in eine der sieben Klassen bei SWEEP_KMAX ein -- eine Abdeckung mit einem \
      falschen Nenner ist eine Behauptung."
 );
 
@@ -4524,7 +4538,13 @@ fn all_done(
     warum: Option<&mut [(&'static str, crate::befund::Befund); DONE_FLAGS]>,
 ) -> bool {
     let workers = (0..NWORKERS).all(|i| WORKER_ROUNDS[i].load(Ordering::Relaxed) >= WORK_TARGET);
-    let cores = (0..system::num_cores()).all(|c| hal::timer::ticks(c) > 0);
+    // Z6 Stufe 1b: nur ONLINE-Kerne muessen ticken (Analogon threads/mod.rs ARM-Seite).
+    // Ein unterdruecktes SMT-Geschwister hat Tabellen, aber keinen Timer -- `ticks == 0`
+    // ist dort die Politik, kein Defekt. Ohne SMT ist jedes Bit gesetzt und die Bedingung
+    // buchstabengleich zur alten.
+    let cores = (0..system::num_cores())
+        .filter(|&c| caprock_sched::core_online(c))
+        .all(|c| hal::timer::ticks(c) > 0);
     let ring3 = USER_SYSCALLS.load(Ordering::Relaxed) > 0 && system::el0_fault_count() > 0;
     let iso = SAS_READ_OK.load(Ordering::Relaxed) == PROBE_MAGIC && system::iso_fault_count() > 0;
     let root = !archive || (root_chain_done() && cdelete_done());
@@ -5240,13 +5260,14 @@ fn report_and_off(watchdog: bool) -> ! {
             "sweep   : {} (C7-Abdeckung: {provoziert} von {} Meldestellen in DIESEM Lauf \
              provoziert; der Nenner kommt aus tools/mangel-zaehlen.py, die Summanden aus einer \
              Zusicherung zur Bauzeit -- eine Klassifikation, die man vergessen kann, ist keine. \
-             {}+{}+{}+{}+{}+{} = {}. **{} PROVOZIERT OHNE ARCHIV**: 125 Kernel-Stack · \
+             {}+{}+{}+{}+{}+{}+{} = {}. **{} PROVOZIERT OHNE ARCHIV**: 125 Kernel-Stack · \
              2379/2436 Kernel-Thread-Stack · 2473 User-Stack · 2590/2625 Seitentabelle in \
              create_vspace · 2989 Seitentabelle im Fenster · 3169/3322/3463/3464 Privatregion · \
              4608 map_region_into_thread -- die letzte stand bis heute als 'Ladepfad' gebucht und \
              ist keiner: sie ist der Weg zum GERAETEFENSTER einer Treiber-PD und braucht kein \
              Archiv. **{} PROVOZIERT NUR MIT ARCHIV** (in diesem Lauf: {}): 4288 Segmentspeicher · \
              4304 Seitentabelle eines Segments · 4350 User-Stack · 4366 Seitentabelle des Stacks \
+             · Heap-OOM der va_liste (Topf-leer unprovoziert, s. Klasse 2) \
              -- der echte load_into_pd_mit, dieselbe Funktion, die SYS_LOAD ruft. **{} PLATZ-\
              TOEPFE** (2399/2453/3221/3386/3547/4438 Thread-Slot, 2572 ASID, 3293/4171 \
              Farbstreifen, 4516 PD-Slot): die Sperre sitzt im SPEICHER-Allokator, diese Toepfe \
@@ -5257,7 +5278,8 @@ fn report_and_off(watchdog: bool) -> ! {
              Allokator. **{} STRUKTURELL NICHT AUSLOESBAR, und das ist ein Befund ueber die \
              Stellen**: 4207 (vspace_l2 gibt fuer eine soeben angelegte ASID immer Some -- toter \
              Zweig) und 4269 (fail-closed gegen mehr als 64 Frame-Stuecke -- das braucht ein \
-             IMAGE, keinen leeren Topf))",
+             IMAGE, keinen leeren Topf)) **{} FORK-PFAD (noch nicht provoziert -- eigene Sonde \
+             offen)**: die zehn Meldestellen in `dispatch_fork`",
             if sweep_messen() { "ALL PASS" } else { "FAILURES" },
             system::MELDESTELLEN,
             SWEEP_K1_PROVOZIERT_OHNE_ARCHIV,
@@ -5266,6 +5288,7 @@ fn report_and_off(watchdog: bool) -> ! {
             SWEEP_K4_NICHT_GEFRAGT,
             SWEEP_K5_HAL_VORRAT,
             SWEEP_K6_UNAUSLOESBAR,
+            SWEEP_K7_FORK_PFAD,
             system::MELDESTELLEN,
             SWEEP_K1_PROVOZIERT_OHNE_ARCHIV,
             SWEEP_K2_PROVOZIERT_MIT_ARCHIV,
@@ -5274,6 +5297,7 @@ fn report_and_off(watchdog: bool) -> ! {
             SWEEP_K4_NICHT_GEFRAGT,
             SWEEP_K5_HAL_VORRAT,
             SWEEP_K6_UNAUSLOESBAR,
+            SWEEP_K7_FORK_PFAD,
         );
     }
 
@@ -5626,6 +5650,11 @@ fn report_and_off(watchdog: bool) -> ! {
     let ticks = hal::timer::ticks(0);
     let mut all_tick = true;
     for c in 0..system::num_cores() {
+        // Z6 Stufe 1b: Abwesenheit mit Grund ist keine fehlende Messung (Analogon ARM-Seite).
+        if !caprock_sched::core_online(c) {
+            println!("sched   : core {c} suppressed (SMT-Stufe-1: nie gebootet, kein Tick erwartet)");
+            continue;
+        }
         let t = hal::timer::ticks(c);
         println!("sched   : core {c} ticks={t}");
         all_tick &= t > 0;

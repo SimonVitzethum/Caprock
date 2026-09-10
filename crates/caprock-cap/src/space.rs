@@ -1,7 +1,7 @@
 //! Capability-Space: Slot-Tabelle + Capability-Derivation-Tree (CDT).
 
 use crate::object::{DmaCoherence, DmaDir, Object, ObjectKind};
-use caprock_mem::{MemoryCap, PhysAllocator, Rights};
+use caprock_mem::{MemoryCap, PhysAllocator, PhysRegion, Rights};
 use caprock_slab::Slab;
 
 /// Sicheres Capability-Handle: Slot-Index + Generation (erkennt stale Pointer).
@@ -33,6 +33,16 @@ pub enum CapError {
     /// ausgerichtet" heisst „verschiebe sie", „zu klein" heisst „nimm mehr Speicher". Eine
     /// Absage, die zwei Ursachen unter einem Namen führt, macht die Behebung zum Raten.
     ZuKlein,
+    /// Das gewünschte **Teilfenster liegt nicht in der Quell-Region** (CSUB,
+    /// Mem-Server-Transport): Überlauf in `Basis + Offset` oder `Offset + Länge`, leeres
+    /// Fenster (`len == 0`) oder Ausschnitt jenseits der Cap.
+    ///
+    /// Eigener Name und nicht [`Self::Invalid`], weil die Behebung eine andere ist („kleiner
+    /// fragen", nicht „andere Cap nehmen") — und weil ein Fenster ausserhalb der Cap die Form
+    /// ist, die ein Angreifer produziert, nicht die eines Tippfehlers. Der Dispatch bildet ihn
+    /// auf ABI `ERR_SUBREGION` (21) ab — derselbe Code, den die Stapelprüfung (K1b) für ein
+    /// Fenster ausserhalb der Stack-Cap vergibt.
+    Subregion,
 }
 
 /// Ableitungs-Metadaten eines Slots (MDB-Knoten / CDT-Verkettung).
@@ -65,6 +75,17 @@ pub struct CapSlot {
     pub(crate) object: usize, // Index in die Objekt-Tabelle
     pub(crate) rights: Rights,
     pub(crate) badge: u64,
+    /// **Das Teilfenster dieser Cap** (CSUB): `Some(f)` heisst „diese Cap autorisiert nur
+    /// `f`", `None` heisst „die ganze Objekt-Region".
+    ///
+    /// Es steht am **Slot** und nicht am Objekt, und das ist der Punkt: alle Ableitungen
+    /// teilen sich **ein** Objekt (der CDT-Audit verlangt genau das — Eltern und Kind
+    /// zeigen auf dasselbe Objekt, Code 4 sonst), und die Freigabe der Region läuft einmal
+    /// über dessen Referenzzähler. Ein eigenes Objekt je Teilfenster gäbe die
+    /// Teilregion bei der Finalisierung an den Allokator zurück — mitten aus der noch
+    /// lebenden Eltern-Region heraus. `copy`/`mint`/`move_cap` übernehmen das Fenster;
+    /// `lookup`/`inspect`/`kind_of` melden die wirksame (verengte) Region.
+    pub(crate) subregion: Option<PhysRegion>,
     pub(crate) mdb: Mdb,
 }
 
@@ -75,6 +96,7 @@ impl CapSlot {
         object: 0,
         rights: Rights::NONE,
         badge: 0,
+        subregion: None,
         mdb: Mdb::EMPTY,
     };
 }
@@ -275,6 +297,55 @@ fn count_children(slots: &[CapSlot], parent: usize, limit: usize) -> Result<usiz
         cur = s.mdb.next_sibling;
     }
     Ok(n)
+}
+
+/// Das CSUB-Teilfenster ausrechnen — die reine Entscheidung von [`CapSpace::subregion`].
+///
+/// `whole` ist die **wirksame** Region der Quell-Cap (Objekt-Region oder deren Teilfenster),
+/// `offset`/`len` der gewünschte Ausschnitt. Alles `u64`, alles geprüft: ein Überlauf in
+/// `Basis + Offset` oder `Offset + Länge`, ein leeres Fenster und ein Ausschnitt jenseits von
+/// `whole` werden mit [`CapError::Subregion`] abgewiesen — **nicht abgeschnitten**. Ein
+/// abgeschnittenes Fenster gäbe dem Aufrufer weniger, als er abbildet, und der Fehler fiele
+/// erst beim Zugriff auf, nicht beim Ableiten.
+///
+/// Freie Funktion über eingespeisten Werten (Muster `descend_to_leaf`, `spawncheck`):
+/// [`CapSpace::subregion`] ruft sie auf, statt die Rechnung nachzubauen — eine Prüfung an
+/// zwei Stellen ist zwei Prüfungen, und die zweite altert.
+pub(crate) fn teilfenster_rechnen(
+    whole: PhysRegion,
+    offset: u64,
+    len: u64,
+) -> Result<PhysRegion, CapError> {
+    if len == 0 {
+        return Err(CapError::Subregion);
+    }
+    let base = whole.base.checked_add(offset).ok_or(CapError::Subregion)?;
+    let ende = base.checked_add(len).ok_or(CapError::Subregion)?;
+    let whole_ende = whole
+        .base
+        .checked_add(whole.len)
+        .ok_or(CapError::Subregion)?;
+    if ende > whole_ende {
+        return Err(CapError::Subregion);
+    }
+    Ok(PhysRegion::new(base, len))
+}
+
+/// `child` vorne in die Kinderliste von `parent` einhängen — die reine Verkettung von
+/// [`CapSpace::link_child`], als freie Funktion über einem Slice, damit sie ohne `CapSpace`
+/// (und damit ohne `Slab`, dessen Anbindung `unsafe` ist) geprüft werden kann.
+///
+/// Der Test unten belegt damit „Kind im CDT" auf dem Host: Wer das Fenster ableitet, hängt
+/// es als Kind ein — und `revoke` läuft über genau diese Kette.
+fn kind_einhaengen(slots: &mut [CapSlot], parent: usize, child: usize) {
+    let old_first = slots[parent].mdb.first_child;
+    slots[child].mdb.parent = Some(parent);
+    slots[child].mdb.prev_sibling = None;
+    slots[child].mdb.next_sibling = old_first;
+    if let Some(f) = old_first {
+        slots[f].mdb.prev_sibling = Some(child);
+    }
+    slots[parent].mdb.first_child = Some(child);
 }
 
 /// Lesbare Sicht auf einen Capability (für Diagnose/Tests).
@@ -591,14 +662,18 @@ impl CapSpace {
 
     /// Objektart, Rechte und Badge eines Caps auflösen (für cap-gesicherte
     /// Invokation; der Badge identifiziert z. B. die Signalquelle bei Notifications).
+    ///
+    /// Eine Memory-Cap mit Teilfenster meldet die **verengte** Region, nicht die des Objekts:
+    /// wer das Teil per `SYS_MAP` abbildet, bekommt das Teil — sonst wäre das Fenster eine
+    /// Auskunft, keine Autorität.
     pub fn lookup(&self, ptr: CapPtr) -> Option<(ObjectKind, Rights, u64)> {
         let slot = self.resolve(ptr).ok()?;
         let obj = self.slots[slot].object;
-        Some((
-            self.objects[obj].kind,
-            self.slots[slot].rights,
-            self.slots[slot].badge,
-        ))
+        let kind = match self.objects[obj].kind {
+            ObjectKind::Memory(r) => ObjectKind::Memory(self.slots[slot].subregion.unwrap_or(r)),
+            k => k,
+        };
+        Some((kind, self.slots[slot].rights, self.slots[slot].badge))
     }
 
     /// Über alle **DMA-Objekte** (objektgranular, distinct) iterieren: ruft `f(phys, len)`
@@ -620,12 +695,18 @@ impl CapSpace {
     /// Capability ableiten: neuer Kind-Cap auf dasselbe Objekt, Rechte
     /// eingeschränkt auf `src.rights ∩ rights` (keine Eskalation). Badge wird
     /// übernommen.
+    ///
+    /// Ein bestehendes Teilfenster ([`subregion`](Self::subregion)) wird **übernommen**, nicht
+    /// geweitet: eine Kopie darf nie mehr Region autorisieren als die Vorlage — dieselbe
+    /// Richtung wie bei den Rechten.
     pub fn copy(&mut self, src: CapPtr, rights: Rights) -> Result<CapPtr, CapError> {
         let s = self.resolve(src)?;
         let obj = self.slots[s].object;
         let new_rights = self.slots[s].rights.intersect(rights);
         let badge = self.slots[s].badge;
+        let fenster = self.slots[s].subregion;
         let dst = self.alloc_slot(obj, new_rights, badge)?;
+        self.slots[dst].subregion = fenster;
         self.objects[obj].refcount += 1;
         self.link_child(s, dst);
         Ok(self.ptr(dst))
@@ -636,6 +717,45 @@ impl CapSpace {
         let dst = self.copy(src, rights)?;
         self.slots[dst.slot].badge = badge;
         Ok(dst)
+    }
+
+    /// Einen **Teilbereich** einer Memory-Cap als eigene Cap ableiten (CSUB,
+    /// Mem-Server-Transport): `[Basis + Offset, Basis + Offset + Länge)` aus der **wirksamen**
+    /// Region der Quell-Cap (Objekt-Region oder deren Teilfenster — Ableitungen von
+    /// Ableitungen verengen weiter, sie weiten nie).
+    ///
+    /// * Die Quell-Cap **muss** eine Memory-Cap sein — sonst [`CapError::Invalid`]: ohne Region
+    ///   gibt es kein Fenster. Der Dispatch bildet das auf `ERR_BADCAP` ab.
+    /// * Das Fenster muss in der Region liegen — sonst [`CapError::Subregion`] (Dispatch:
+    ///   `ERR_SUBREGION`, Nr. 21). Die Rechnung steht in [`teilfenster_rechnen`].
+    /// * Die Rechte sind der **Schnitt** mit denen der Quelle (keine Eskalation, wie
+    ///   [`copy`](Self::copy)); das Badge wird übernommen.
+    /// * Das Kind zeigt auf **dasselbe Objekt** und hängt als Kind im CDT: `revoke` an der
+    ///   Quelle zieht das Teil ein, und die Region wird genau einmal freigegeben — wenn die
+    ///   letzte Cap (Quelle oder Teil) fällt. Ein eigenes Objekt je Teilfenster gäbe die
+    ///   Teilregion mitten aus der lebenden Eltern-Region an den Allokator zurück.
+    pub fn subregion(
+        &mut self,
+        src: CapPtr,
+        offset: u64,
+        len: u64,
+        rights: Rights,
+    ) -> Result<CapPtr, CapError> {
+        let s = self.resolve(src)?;
+        let obj = self.slots[s].object;
+        let whole = match self.objects[obj].kind {
+            ObjectKind::Memory(r) => r,
+            _ => return Err(CapError::Invalid),
+        };
+        let wirksam = self.slots[s].subregion.unwrap_or(whole);
+        let fenster = teilfenster_rechnen(wirksam, offset, len)?;
+        let new_rights = self.slots[s].rights.intersect(rights);
+        let badge = self.slots[s].badge;
+        let dst = self.alloc_slot(obj, new_rights, badge)?;
+        self.slots[dst].subregion = Some(fenster);
+        self.objects[obj].refcount += 1;
+        self.link_child(s, dst);
+        Ok(self.ptr(dst))
     }
 
     /// Cap in einen frischen Slot verschieben (Identität/Position im CDT bleibt).
@@ -1007,7 +1127,10 @@ impl CapSpace {
     /// sondern ein Latenzloch, das keine Pruefzeile ansieht — nur diesmal HAT eine hingesehen.
     pub fn kind_of(&self, ptr: CapPtr) -> Option<ObjectKind> {
         let slot = self.resolve(ptr).ok()?;
-        Some(self.objects[self.slots[slot].object].kind)
+        Some(match self.objects[self.slots[slot].object].kind {
+            ObjectKind::Memory(r) => ObjectKind::Memory(self.slots[slot].subregion.unwrap_or(r)),
+            k => k,
+        })
     }
 
     pub fn inspect(&self, ptr: CapPtr) -> Option<CapInfo> {
@@ -1017,8 +1140,12 @@ impl CapSpace {
         // erfundenen 0. Eine Sicht, die bei kaputter Verkettung „keine Kinder" meldet, wäre
         // genau die stille Falschaussage, gegen die die Schranke gebaut ist.
         let child_count = self.child_count(slot).ok()?;
+        let kind = match self.objects[obj].kind {
+            ObjectKind::Memory(r) => ObjectKind::Memory(self.slots[slot].subregion.unwrap_or(r)),
+            k => k,
+        };
         Some(CapInfo {
-            kind: self.objects[obj].kind,
+            kind,
             rights: self.slots[slot].rights,
             badge: self.slots[slot].badge,
             refcount: self.objects[obj].refcount,
@@ -1079,6 +1206,7 @@ impl CapSpace {
             object,
             rights,
             badge,
+            subregion: None,
             mdb: Mdb::EMPTY,
         };
         // Höchststand hier, im einzigen Belegungspfad: eine Stichprobe von aussen wuerde genau
@@ -1130,16 +1258,10 @@ impl CapSpace {
         count_children(self.slots.as_slice(), slot, self.cdt_step_limit())
     }
 
-    /// `child` vorne in die Kinderliste von `parent` einhängen.
+    /// `child` vorne in die Kinderliste von `parent` einhängen. Die Verkettung steht genau
+    /// einmal in [`kind_einhaengen`] und wird dort auch geprüft (als Slice, ohne Kernel).
     fn link_child(&mut self, parent: usize, child: usize) {
-        let old_first = self.slots[parent].mdb.first_child;
-        self.slots[child].mdb.parent = Some(parent);
-        self.slots[child].mdb.prev_sibling = None;
-        self.slots[child].mdb.next_sibling = old_first;
-        if let Some(f) = old_first {
-            self.slots[f].mdb.prev_sibling = Some(child);
-        }
-        self.slots[parent].mdb.first_child = Some(child);
+        kind_einhaengen(self.slots.as_mut_slice(), parent, child);
     }
 
     /// `slot` aus der Geschwister-/Kinderverkettung lösen.
@@ -1317,5 +1439,91 @@ mod tests {
         slots[0].used = true;
         slots[0].mdb.first_child = Some(42);
         assert_eq!(count_children(&slots, 0, 8), Err(()));
+    }
+
+    // ============================================================================================
+    // CSUB: das Teilfenster (reine Entscheidung) + die CDT-Einhängung
+    // ============================================================================================
+    //
+    // Was hier steht, braucht weder Slab-Speicher noch Allokator und läuft deshalb auf dem
+    // Host (`tools/host-tests.sh cap`): die Fensterreichnung über eingespeisten Werten und die
+    // Verkettung über einem Stapel-Array. Die volle Kette (Rechte-Schnitt am `CapSpace`,
+    // `revoke` zieht das Teil ein, Audit bleibt 0) braucht angebundenen Slab-Speicher
+    // (`Slab::attach` ist `unsafe`, diese Crate ist `forbid(unsafe_code)`) und steht als
+    // Integrationslauf ausserhalb der Crate.
+
+    fn region_ab(base: u64, len: u64) -> PhysRegion {
+        PhysRegion::new(base, len)
+    }
+
+    #[test]
+    fn teilfenster_genau_innen() {
+        // Mitte der Region, mit exakten Koordinaten.
+        let f = teilfenster_rechnen(region_ab(0x10_000, 0x8000), 0x1000, 0x2000).unwrap();
+        assert_eq!(f, region_ab(0x11_000, 0x2000));
+        // Offset 0 + volle Länge = die Region selbst (bitgleich zur Vorlage).
+        let f = teilfenster_rechnen(region_ab(0x10_000, 0x8000), 0, 0x8000).unwrap();
+        assert_eq!(f, region_ab(0x10_000, 0x8000));
+        // Das letzte Byte ist noch innen.
+        let f = teilfenster_rechnen(region_ab(0x10_000, 0x8000), 0x7FFF, 1).unwrap();
+        assert_eq!(f, region_ab(0x17_FFF, 1));
+    }
+
+    #[test]
+    fn teilfenster_lehnt_leer_und_aussen_ab() {
+        let w = region_ab(0x10_000, 0x8000);
+        // Leeres Fenster ist kein Fenster — auch nicht an Offset 0.
+        assert_eq!(teilfenster_rechnen(w, 0, 0), Err(CapError::Subregion));
+        assert_eq!(teilfenster_rechnen(w, 0x1000, 0), Err(CapError::Subregion));
+        // Ein Byte über das Ende hinaus ist draussen.
+        assert_eq!(teilfenster_rechnen(w, 0x7FFF, 2), Err(CapError::Subregion));
+        assert_eq!(teilfenster_rechnen(w, 0x8000, 1), Err(CapError::Subregion));
+        // Offset hinter der Region ist draussen, auch mit Länge 1.
+        assert_eq!(teilfenster_rechnen(w, 0x9000, 1), Err(CapError::Subregion));
+        // Die Absage heisst `Subregion`, nicht `Invalid`: „kleiner fragen", nicht
+        // „andere Cap nehmen" — der Dispatch bildet sie auf ERR_SUBREGION (21) ab.
+        assert_ne!(teilfenster_rechnen(w, 0, 0), Err(CapError::Invalid));
+    }
+
+    #[test]
+    fn teilfenster_lehnt_ueberlauf_ab() {
+        let w = region_ab(0x10_000, 0x8000);
+        // `Basis + Offset` läuft über.
+        assert_eq!(teilfenster_rechnen(w, u64::MAX, 1), Err(CapError::Subregion));
+        assert_eq!(
+            teilfenster_rechnen(w, u64::MAX - 0x10_000 + 1, 1),
+            Err(CapError::Subregion)
+        );
+        // `Offset + Länge` läuft über (Basis 0, damit nur die zweite Addition trägt).
+        let flach = region_ab(0, 0x1000);
+        assert_eq!(teilfenster_rechnen(flach, u64::MAX, u64::MAX), Err(CapError::Subregion));
+        assert_eq!(teilfenster_rechnen(flach, 1, u64::MAX), Err(CapError::Subregion));
+        // Eine Region, deren Ende nicht darstellbar ist, verleiht nichts: fail-closed statt
+        // umlaufender `end()`-Vergleich.
+        let kipp = region_ab(u64::MAX - 0xFFF, 0x2000);
+        assert_eq!(teilfenster_rechnen(kipp, 0, 1), Err(CapError::Subregion));
+    }
+
+    #[test]
+    fn einhaengen_baut_die_kindkette() {
+        // **„Kind im CDT" auf dem Host.** `subregion` hängt über `link_child` ein, und das
+        // steht genau einmal in `kind_einhaengen` — was hier über einem Stapel-Array gilt,
+        // gilt dort über dem Slab.
+        let mut slots = [CapSlot::EMPTY; 3];
+        for s in slots.iter_mut() {
+            s.used = true;
+        }
+        kind_einhaengen(&mut slots, 0, 1);
+        assert_eq!(slots[0].mdb.first_child, Some(1));
+        assert_eq!(slots[1].mdb.parent, Some(0));
+        assert_eq!(slots[1].mdb.prev_sibling, None);
+        assert_eq!(slots[1].mdb.next_sibling, None);
+        // Das zweite Kind hängt sich VORNE ein; die Geschwisterkette bleibt reziprok.
+        kind_einhaengen(&mut slots, 0, 2);
+        assert_eq!(slots[0].mdb.first_child, Some(2));
+        assert_eq!(slots[2].mdb.next_sibling, Some(1));
+        assert_eq!(slots[1].mdb.prev_sibling, Some(2));
+        assert_eq!(slots[2].mdb.parent, Some(0));
+        assert_eq!(count_children(&slots, 0, 8), Ok(2));
     }
 }

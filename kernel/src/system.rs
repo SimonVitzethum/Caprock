@@ -15,6 +15,8 @@
 //! nimmt zwei verschiedene `SCHEDS[*]` gleichzeitig. Vollständige Herleitung + alle belegten
 //! Schachtelungen: `docs/invariants.md` §1.
 
+extern crate alloc;
+
 use caprock_cap::{CapError, CapInfo, CapPtr, DmaCoherence, DmaDir, ObjectKind};
 use caprock_hal::{self as hal, exception::TrapFrame, fp::FpState, println};
 use caprock_cap::checkpoint::{Channel, Edge, EdgeRole, Scope};
@@ -30,6 +32,13 @@ use crate::addr::{DmaRegion, Iova, Pa};
 use caprock_sched::{SchedOps, Scheduler, ThreadId, MAX_CORES};
 use caprock_slab::{AtomicTable, Slab};
 use caprock_sync::{RwSpinLock, SpinLock};
+
+/// FORK/EXEC-Planlogik des Ladepfads (rein, host-testbar) — die Entscheidungen VOR der ersten
+/// Allokation. Der Vollzug (`dispatch_fork`/`dispatch_exec` weiter unten) ruft sie auf, statt
+/// sie nachzubauen. Als Pfad-Modul hier angehaengt statt in `main.rs`: die Datei ist neu, und
+/// `main.rs` gehoert niemandem allein (AGENTS.md) — ein `#[path]`-Modul braucht dort keine Zeile.
+#[path = "forkexec.rs"]
+mod forkexec;
 
 /// **Tatsächliche** Kernzahl (beim Boot gesetzt, s. [`configure`]). Alle per-Kern-Schleifen
 /// laufen hierüber; die Compile-Zeit-Konstante [`MAX_CORES`] dimensioniert nur die Arrays
@@ -359,15 +368,27 @@ pub fn kstack_arena_stats() -> (usize, usize, usize, usize, u64, u64, usize) {
 pub const USER_KSTACK_ALLOC: u64 = USER_KSTACK_SIZE as u64 + caprock_mem::PAGE;
 
 fn claim_user_kstack() -> Option<usize> {
-    claim_user_kstack_masked(None)
+    claim_user_kstack_masked(None, caprock_hal::numa::Node::Unaffiliated)
 }
-/// Wie [`claim_user_kstack`], aber optional aus einem Farbsatz (todo A1).
+/// Wie [`claim_user_kstack`], aber optional aus einem Farbsatz (todo A1) und mit
+/// Knotenwunsch (Z8/N3: `LadePolitik.node`, gesetzt aus `manifest.numa_node`).
 ///
 /// Der Kernel-Stack einer PD wird zwar vom Kernel benutzt, aber **im Namen dieses Subjekts** —
 /// seine Cache-Zeilen tragen also dessen Zugriffsmuster. Ihn ungefärbt zu lassen hieße, die
 /// Trennung an genau der Stelle aufzugeben, an der der Kernel für das Subjekt arbeitet.
 /// 16 KiB sind vier Seiten und passen damit in jeden Streifen (kleinster Streifen: 16 Seiten).
-fn claim_user_kstack_masked(mask: Option<caprock_mem::ColorMask>) -> Option<usize> {
+///
+/// **Die Regel, nach der Knoten und Farbe nachgeben (Z8/N3):** ein Knotenwunsch ist eine
+/// Platzierung, keine Zusicherung — was ihn nicht erfuellt, faellt BENANNT zurueck
+/// (`kstack : RUECKFALL`), nie auf einen Fehler. Der Boot hinge sonst an der Topologie der
+/// Maschine. Die Reihenfolge ist die der Leiter: erst gibt der Knoten nach (gefaerbt ohne
+/// Knoten), dann die Farbe (ungefaerbt/unaffiliated). Ohne Knotenwunsch laeuft keine dieser
+/// Stufen: die rein gefaerbte Anforderung bleibt fail-closed (A1), und der rein ungefragte
+/// Pfad ist bitgleich der alte.
+fn claim_user_kstack_masked(
+    mask: Option<caprock_mem::ColorMask>,
+    node: caprock_hal::numa::Node,
+) -> Option<usize> {
     let (sz, al) = (USER_KSTACK_SIZE as u64, USER_KSTACK_SIZE as u64);
     // **Der Topf benennt sich hier, nicht bei seinen fuenf Aufrufern.** Ein Aufrufer, der den
     // Mangel selbst hinschreibt, muss die Groesse ein zweites Mal nennen -- und eine zweite
@@ -405,12 +426,12 @@ fn claim_user_kstack_masked(mask: Option<caprock_mem::ColorMask>) -> Option<usiz
     // 16-KiB-ausgerichtet und damit der STACK bei `roh + PAGE` gerade NICHT streifenausgerichtet;
     // die Farbbedingung des gefaerbten Teils waere wieder unerfuellbar. Der Stack braucht die
     // 16-KiB-Ausrichtung nicht (die CPU verlangt fuer `rsp0` 16 Byte).
-    // C7c: Arena zuerst — ein zusammenhaengender Slot kostet keinen neuen Guard-Block
-    // (die Arena-Bloecke sind einmal aufgeteilt) und keinen MEM-Gang. Gefaerbte
-    // Anforderungen (`mask`) laufen weiter ueber den Streupfad: die Arena kennt keine
-    // Farben (Kopplung A-1.4/B-4). Arena voll oder nicht bestueckt: Streupfad unten
-    // (benennt den Mangel selbst).
-    if mask.is_none() {
+    // C7c: Arena zuerst — aber NUR ohne jede Politik. Die Arena kennt weder Farben noch
+    // Knoten (Kopplung A-1.4/B-4); ein knotenlokaler Stack aus dem Arena-Topf waere eine
+    // Platzierungszusage, die niemand einloest. Gefaerbte Anforderungen (`mask`) laufen weiter
+    // ueber den Streupfad: die Arena kennt keine Farben. Arena voll oder nicht bestueckt:
+    // Streupfad unten (benennt den Mangel selbst).
+    if mask.is_none() && matches!(node, caprock_hal::numa::Node::Unaffiliated) {
         if let Some(base) = kstack_arena_vergeben() {
             // SAFETY: exklusiv vergebener Slot, identity-gemappt — wie Streupfad unten.
             unsafe { crate::kstackmark::fuellen(crate::kstackmark::KL_EL0, base, sz as usize) };
@@ -418,11 +439,15 @@ fn claim_user_kstack_masked(mask: Option<caprock_mem::ColorMask>) -> Option<usiz
             return Some(base);
         }
     }
-    let roh = benannt_alloc(MANGEL_KERNEL_STACK, USER_KSTACK_ALLOC, |n| match mask {
+    let roh = benannt_alloc(MANGEL_KERNEL_STACK, USER_KSTACK_ALLOC, |n| match (mask, node) {
         // Ueber die Politik aus `mem_alloc`/`alloc_colored` (unten zuerst), nicht daran vorbei:
         // eine Vorgabe, an der eine einzige Stelle vorbeigreift, ist keine Vorgabe (E-Rest 3b).
-        Some(m) => alloc_colored_vorspann(1, n, caprock_mem::PAGE, m),
-        None => mem_alloc(n, al),
+        // Mit Knotenwunsch gilt zusaetzlich die Leiter (s. Funktionsdoku): der Knoten gibt
+        // zuerst nach, die Farbe zuletzt — beides benannt, nie ein Fehler aus Topologie.
+        (Some(m), caprock_hal::numa::Node::At(wunsch)) => kstack_gefaerbt_auf_knoten(n, m, wunsch),
+        (Some(m), _) => alloc_colored_vorspann(1, n, caprock_mem::PAGE, m),
+        (None, caprock_hal::numa::Node::At(wunsch)) => kstack_auf_knoten(n, al, wunsch),
+        (None, _) => mem_alloc(n, al),
     })?
     .base();
     let wache = roh; // die unterste Seite des Blocks
@@ -449,6 +474,85 @@ fn claim_user_kstack_masked(mask: Option<caprock_mem::ColorMask>) -> Option<usiz
     unsafe { crate::kstackmark::fuellen(crate::kstackmark::KL_EL0, base as usize, sz as usize) };
     KSTACKS.lock().live += 1;
     Some(base as usize)
+}
+/// Gefaerbt UND in einem Physfenster, mit Wachseiten-Vorspann (Z8/N3).
+///
+/// Die Fensterfassung von [`alloc_colored_vorspann`] fuer die knotenlokale Kstack-Vergabe:
+/// die erste Seite (`vorspann`) steht wie dort unter keiner Farbbedingung (sie traegt keine
+/// Daten und belegt kein Cache-Set), der Rest kommt aus `[lo, hi)`. Wie
+/// [`alloc_colored_in_window`] eine Bedingung, keine Vorliebe: `None` statt ausserhalb.
+fn alloc_colored_vorspann_in_fenster(
+    vorspann: u64,
+    size: u64,
+    align: u64,
+    mask: caprock_mem::ColorMask,
+    lo: u64,
+    hi: u64,
+) -> Option<MemoryCap> {
+    #[cfg(feature = "selftest")]
+    if sperre_greift(size) {
+        return None;
+    }
+    let cap = MEM.lock().alloc_colored_vorspann_in(
+        vorspann,
+        size,
+        align,
+        crate::colors::count(),
+        mask,
+        lo,
+        hi,
+    )?;
+    zero_phys(cap.base(), cap.len());
+    Some(cap)
+}
+
+/// Gefaerbter Kstack mit Knotenwunsch (Z8/N3) — die Leiter als Schleife.
+///
+/// Erst fensterweise auf dem Knoten (exakt), dann gefaerbt ohne Knoten (der Knoten gibt
+/// nach), dann ungefaerbt (die Farbe gibt zuletzt nach). Jede Stufe ist benannt: ein stiller
+/// Farbverzicht waere der `MASK_BITS`-Fehler noch einmal (gruen, obwohl nichts getrennt war).
+/// Echte Erschoepfung (auch ungefaerbt nichts frei) meldet der Aufrufer (`benannt_alloc`).
+fn kstack_gefaerbt_auf_knoten(
+    n: u64,
+    m: caprock_mem::ColorMask,
+    wunsch: u8,
+) -> Option<MemoryCap> {
+    let top = crate::numa::topology();
+    if top.trustworthy() {
+        let mut i = 0;
+        while let Some((lo, hi)) = top.window_of(wunsch, i) {
+            if let Some(c) = alloc_colored_vorspann_in_fenster(1, n, caprock_mem::PAGE, m, lo, hi) {
+                return Some(c);
+            }
+            i += 1;
+        }
+    }
+    println!(
+        "kstack  : RUECKFALL knotenlokal-gefaerbt unerfuellbar (Knoten {wunsch}) -- gefaerbt ohne Knoten"
+    );
+    if let Some(c) = alloc_colored_vorspann(1, n, caprock_mem::PAGE, m) {
+        return Some(c);
+    }
+    println!("kstack  : RUECKFALL gefaerbt erschoepft -- ungefärbt/unaffiliated (Farbe gibt zuletzt nach)");
+    mem_alloc(n, USER_KSTACK_SIZE as u64)
+}
+
+/// Ungefaerbter Kstack mit Knotenwunsch (Z8/N3).
+///
+/// `alloc_on_node` traegt die Leiter selbst (exakt, dann irgendwo — gezaehlt nach Wirkung);
+/// was hier noch fehlschlaegt, ist echte Erschoepfung auf dem Wunschpfad, und dann gilt die
+/// Regel: benannt zurueck auf ungefärbt/unaffiliated, nie ein Fehler aus Topologie.
+fn kstack_auf_knoten(n: u64, al: u64, wunsch: u8) -> Option<MemoryCap> {
+    let knoten = caprock_hal::numa::Node::At(wunsch);
+    match crate::numa::alloc_on_node(n, al, knoten) {
+        Some(c) => Some(c),
+        None => {
+            println!(
+                "kstack  : RUECKFALL Knoten {wunsch} ohne Speicher -- ungefärbt/unaffiliated"
+            );
+            mem_alloc(n, al)
+        }
+    }
 }
 /// Einen (noch keinem Thread zugeordneten) Kstack wieder an `MEM` freigeben (Fehlerpfad vor `record`).
 fn release_user_kstack(base: usize) {
@@ -1094,6 +1198,12 @@ fn reschedule(frame: *mut TrapFrame) -> *mut TrapFrame {
     }
     // Periodischer Lastausgleich (ext-30). Sicher an dieser Stelle: `balance_once` verschiebt
     // nie den **laufenden** Thread, der gerade gewählte `next`-Frame bleibt also gültig.
+    //
+    // KEIN Tick-Pfad fuer NOHZ (B-5.2, Stand 2026-09-10): ein armierter Tick-Pfad (Disarmed
+    // ohne garantiertes Rearm auf laufendem Thread) liess den Timer sterben -- der Gast stand
+    // danach still, ohne Watchdog, ohne Zeile (E2E-Befund). `nohz_stand`/`nohz_idle` bleiben
+    // als gepruefte, aber unverdrahtete Bausteine (s. dort): erst IPI-Kick-Sicherheit, dann
+    // Verdrahtung. Bis dahin tickt jeder Kern wie bisher.
     if BALANCING.load(Ordering::Relaxed) {
         let n = BALANCE_TICK[core].fetch_add(1, Ordering::Relaxed) + 1;
         if n % BALANCE_INTERVAL_TICKS == 0 {
@@ -1158,6 +1268,19 @@ fn syscall(frame: *mut TrapFrame) -> *mut TrapFrame {
     // Cap-Auflösung, dann per-Objekt-Lock; SchedOps je Op genau eine SCHEDS-Instanz).
     // Sperrordnung CAPS < EPS[i]/NTFNS[i] < SCHEDS -> deadlockfrei. IRQs im Trap
     // maskiert -> kein Preempt beim Lock-Halten.
+    //
+    // FORK/EXEC (31/32) laufen VOR dem Microkit-Dispatch (`forkexec_syscall`): die Crate ist
+    // nur gelesen, ihre 31/32-Arme bleiben fail-closed `ERR_BADSYS` („Antrag ok, Pfad fehlt").
+    // Der Hook haelt nichts — die Rueckrufe nehmen CAPS/MEM/SCHEDS selbst.
+    let nr = hal::exception::frame_reg(frame as usize, caprock_abi::reg::SYSNO_RESULT);
+    if nr == caprock_abi::sys::FORK_SNAPSHOT || nr == caprock_abi::sys::EXEC_REPLACE {
+        let next = forkexec_syscall(frame as usize, core, nr);
+        {
+            let sched = SCHEDS[core].lock();
+            sync_thread_state(core, &sched);
+        }
+        return next as *mut TrapFrame;
+    }
     let mut ops = KernelSched;
     let next = caprock_microkit::dispatch(
         frame as usize,
@@ -2293,7 +2416,7 @@ pub fn configure_caps() -> u64 {
         VSPACES.lock().attach(
             vspaces_mem as *mut VSpaceEnt,
             caprock_microkit::NPDS,
-            |_| VSpaceEnt { used: false, l1: 0, l2: 0, stripe: None },
+            |_| VSpaceEnt::FREI,
         )
     };
     let loaded_mem = table(
@@ -2587,13 +2710,15 @@ fn mem_alloc_below(size: u64, align: u64, limit: u64) -> Option<MemoryCap> {
 }
 
 /// [`mem_alloc`] oder [`alloc_colored`], je nachdem ob ein Farbsatz vorgegeben ist. Beide
-/// nullen; der Unterschied ist ausschliesslich die Farbbedingung.
+/// nullen; der Unterschied ist ausschliesslich die Farbbedingung. Mit Knotenwunsch laeuft
+/// die Anforderung durch [`mem_alloc_masked_auf`].
 fn mem_alloc_masked(
     size: u64,
     align: u64,
     mask: Option<caprock_mem::ColorMask>,
+    node: caprock_hal::numa::Node,
 ) -> Option<MemoryCap> {
-    mem_alloc_masked_auf(size, align, mask, caprock_hal::numa::Node::Unaffiliated)
+    mem_alloc_masked_auf(size, align, mask, node)
 }
 
 /// **Wie [`mem_alloc_masked`], aber mit KNOTENWUNSCH** (Z8/N2, 2026-08-20).
@@ -2698,19 +2823,42 @@ fn alloc_colored_anywhere(
     zoned_alloc_colored(0, size, align, mask, Zone::Anywhere)
 }
 
-/// [`mem_alloc_anywhere`] oder [`alloc_colored_anywhere`], je nachdem ob ein Farbsatz vorliegt.
-///
 /// Das Gegenstueck zu [`mem_alloc_masked`], nur ohne Identitaetsbindung -- fuer die Segmente und
-/// den Stack einer gefaerbt geladenen PD (A1/Z11c). **Ohne Maske ist es bitgleich der bisherige
-/// Pfad**: der ungefaerbte Ladeweg soll sich durch diese Aenderung nicht verschieben.
-fn mem_alloc_masked_anywhere(
+/// den Stack einer geladenen PD (A1/Z11c) sowie deren Seitentabellen im Ladepfad.
+/// **Ohne Maske und ohne Knoten ist es bitgleich der bisherige Pfad**: der ungefaerbte Ladeweg
+/// soll sich durch diese Aenderung nicht verschieben.
+///
+/// Mit Knotenwunsch (Z8/N3) gilt die Leiter aus `numa` (exakt, dann ausserhalb — gezaehlt nach
+/// Wirkung) plus dieselbe Rueckfallregel wie am Kstack: was die Leiter nicht erfuellt, faellt
+/// BENANNT zurueck (`lader : RUECKFALL`), nie auf einen Fehler aus Topologie. Die Reihenfolge
+/// ist auch hier: erst gibt der Knoten nach, dann die Farbe. Ohne Knotenwunsch bleibt die rein
+/// gefaerbte Anforderung fail-closed (A1) — die Farblogik ist unangetastet.
+/// Wie [`mem_alloc_masked`], aber mit KNOTENWUNSCH (Z8/N3).
+fn mem_alloc_masked_anywhere_auf(
     size: u64,
     align: u64,
     mask: Option<caprock_mem::ColorMask>,
+    node: caprock_hal::numa::Node,
 ) -> Option<MemoryCap> {
-    match mask {
-        Some(m) => alloc_colored_anywhere(size, align, m),
-        None => mem_alloc_anywhere(size, align),
+    match (mask, node) {
+        (Some(m), caprock_hal::numa::Node::At(_)) => {
+            if let Some(c) = crate::numa::alloc_on_node_colored(size, align, node, m) {
+                return Some(c);
+            }
+            println!(
+                "lader   : RUECKFALL knotenlokal-gefaerbt erschoepft -- gefaerbt ohne Knoten"
+            );
+            if let Some(c) = alloc_colored_anywhere(size, align, m) {
+                return Some(c);
+            }
+            println!(
+                "lader   : RUECKFALL gefaerbt erschoepft -- ungefärbt/unaffiliated (Farbe gibt zuletzt nach)"
+            );
+            mem_alloc_anywhere(size, align)
+        }
+        (Some(m), _) => alloc_colored_anywhere(size, align, m),
+        (None, caprock_hal::numa::Node::At(_)) => crate::numa::alloc_on_node(size, align, node),
+        (None, _) => mem_alloc_anywhere(size, align),
     }
 }
 
@@ -3799,6 +3947,710 @@ fn dispatch_spawn(
     Ok(tid.to_raw())
 }
 
+// ================================================================================================
+// FORK/EXEC-Dispatch (Prozessmodell, Phase 1) — die Kernel-Rueckrufe zu 31/32
+// ================================================================================================
+//
+// `caprock-microkit` (fremd, nur gelesen) dekodiert und prueft vor (`proc::dekodiere_fork/exec`,
+// fail-closed), ohne einen einzigen Seiteneffekt — was hier steht, ist der Vollzug. Verdrahtet
+// ist er VOR dem Microkit-Dispatch (`forkexec_syscall` in `fn syscall`): die 31/32-Arme dort
+// bleiben fail-closed `ERR_BADSYS` („Antrag ok, Pfad fehlt") als zweite Wahrheit daneben, und
+// genau deshalb liegt der Pfad hier und nicht dort — ein Rucckruf, den der Dispatch naehme,
+// braeuchte seine Signatur (fremde Datei).
+//
+// Sperrordnung ueberall: CAPS/MEM/SCHEDS werden nie verschachtelt gehalten, sondern je Schritt
+// kurz genommen (Muster `dispatch_spawn`). Der Aufrufer (`forkexec_syscall`) haelt nichts.
+
+/// Teardown-Epoche je PD fuer das EXEC-Token (monoton je PD, Start 0).
+///
+/// 10 000 Eintraege = 40 KiB BSS; die Laenge folgt `NPDS` aus microkit (nicht einer zweiten
+/// Zahl, die daneben altern wuerde). Wer mit dem Token von gestern kommt, bekommt keinen halb
+/// geraeumten Zustand, sondern `ERR_STALE_TOKEN` — ein Ueberrest (alter Thread, alte Cap,
+/// altes Mapping) ist ein Baufehler, keine Lage.
+static EXEC_EPOCHE: SpinLock<[u32; caprock_microkit::NPDS]> =
+    SpinLock::new([0; caprock_microkit::NPDS]);
+
+/// FORK/EXEC-Bilanz (nach Wirkung, nicht nach Aufruf): `(fork_gelungen, fork_abgewiesen,
+/// exec_gelungen, exec_abgewiesen)`. Gezaehlt wird in `forkexec_syscall`, einmal je Ausgang.
+static FORK_GELUNGEN: AtomicU64 = AtomicU64::new(0);
+static FORK_ABGEWIESEN: AtomicU64 = AtomicU64::new(0);
+static EXEC_GELUNGEN: AtomicU64 = AtomicU64::new(0);
+static EXEC_ABGEWIESEN: AtomicU64 = AtomicU64::new(0);
+
+/// Die FORK/EXEC-Bilanz fuer den Bericht: `(fork_gelungen, fork_abgewiesen, exec_gelungen,
+/// exec_abgewiesen)`. Vier Zahlen, weil „lief" und „lief nicht" zwei Aussagen sind — und weil
+/// ein Zaehler, der nie ueber 0 gehen kann, von einem, der nie ausloest, nicht zu unterscheiden
+/// ist (N2-Lehre).
+pub fn forkexec_bilanz() -> (u64, u64, u64, u64) {
+    (
+        FORK_GELUNGEN.load(Ordering::Relaxed),
+        FORK_ABGEWIESEN.load(Ordering::Relaxed),
+        EXEC_GELUNGEN.load(Ordering::Relaxed),
+        EXEC_ABGEWIESEN.load(Ordering::Relaxed),
+    )
+}
+
+/// `FORK_SNAPSHOT`: volle Kopie der registrierten Frames der Quell-PD in eine frische Kind-PD.
+///
+/// Kein COW (s. `caprock-loader::snapshot`-Doku: Dirty-Tracking + nachladender Fault-Pfad
+/// fehlen — geteilt ohne beides waere kein Snapshot, sondern ein Geschwister, das die Seite
+/// des anderen beschreibt). Das Kind startet am SELBEN Eintritt mit demselben Argument
+/// (Neustart vom Eintritt, kein Fortsetzen — beides steht in der Teardown-Buchhaltung, nicht
+/// in einer zweiten Tabelle) und wird SOFORT zugelassen: ein geparktes Kind, das niemand
+/// starten kann (kein PDCTL/START-Syscall existiert), waere ein Leck, kein Prozess.
+///
+/// Was kopiert wird, ist die Teardown-Buchhaltung (`loaded_snapshot`): was dort nicht steht,
+/// gehoert der PD nicht und wird nicht kopiert. Der Stack bekommt das Kind FRISCH (genullt,
+/// an derselben VA): sein Inhalt ist fluechtiger Aufrufzustand, kein Adressraum — ihn zu
+/// kopieren hiesse, die Ruecksprungadressen des Vaters im Kind fortzusetzen.
+///
+/// Jeder Fehlerausgang raeumt ab, was er angelegt hat (PD-Slot, VSpace, Frames, Kstack,
+/// Streifen) — kein `ERR_NOSPACE`-statt-Aufraeumen: ein halb angelegtes Kind waere ein Leck
+/// mit gueltiger PD-Nummer.
+///
+/// **Kein Stack-Speicher ueber ~256 Byte in dieser Funktion** (2026-09-10, #DF-Befund):
+/// die sechs Segmentlisten (`quelle`, `vas`, `plan`, `kind_*`, je 64 Eintraege, zusammen
+/// ~6 KiB) standen als Arrays auf dem Stack — und der Compiler zog sie per Inlining in
+/// `syscall()` hoch, wo sie auf JEDEM Syscall (nicht nur FORK) 4-KiB-Kstacks sprengten
+/// (RIP im Syscall-Prolog, RSP 264 B unter dem Stackboden). Sie liegen deshalb auf dem
+/// Heap (`Vec`, OOM = benanntes `ERR_NOSPACE`, nie Panic), und die Funktion traegt
+/// `#[inline(never)]`: selbst ein kuenftiges Inline duerfte die Listen nie wieder in einen
+/// heissen Rahmen legen.
+#[inline(never)]
+fn dispatch_fork(
+    pd: usize,
+    kind_slot: usize,
+    max_len: u64,
+    prio: u8,
+) -> Result<u64, u64> {
+    use caprock_abi::result;
+    // Aufrufer-Domaene + Budget erben; der Kind-Slot muss im Aufrufer-Cspace frei sein —
+    // alles lesend, bevor irgendetwas angelegt ist.
+    let g = CAPS.read();
+    let Some(domain) = g.pds.domain_of(pd) else {
+        return Err(result::ERR_NOPD);
+    };
+    let budget = g.pds.budget_of(pd);
+    let caps = g.pds.caps_of(pd);
+    let Some(kind_frei) = caps.get(kind_slot).map(|c| c.is_none()) else {
+        // Jenseits des Laufs: ein Slot, den es nicht gibt, ist kein freier Slot.
+        return Err(result::ERR_BADCAP);
+    };
+    if !kind_frei {
+        return Err(result::ERR_NOSPACE);
+    }
+    drop(g);
+    // Quellmenge: registrierte Frames der eigenen ASID. `asid == 0` (globale SAS-Map) heisst:
+    // dieser Aufrufer hat keinen eigenen Adressraum, den es zu kopieren gaebe.
+    let core = hal::cpu::core_id();
+    let afl = SCHEDS[core].lock().current_id(core);
+    let asid = (vspace_of(afl.slot()) >> 48) as u16;
+    if asid == 0 {
+        return Err(result::ERR_NOPD);
+    }
+    let mut quelle: alloc::vec::Vec<(u64, u64, u64, u8)> = alloc::vec::Vec::new();
+    if quelle.try_reserve_exact(MAX_IMG_SEGS).is_err() {
+        return Err(result::ERR_NOSPACE);
+    }
+    quelle.resize(MAX_IMG_SEGS, (0, 0, 0, 0));
+    let nq = loaded_snapshot(asid, &mut quelle);
+    if nq == 0 {
+        return Err(result::ERR_NOPD);
+    }
+    let (src_node, src_maske) = vspace_herkunft(asid);
+    let Some((eintritt, startarg)) = loaded_eintritt(asid) else {
+        // Registrierte Frames ohne Eintritt: die Buchhaltung widerspricht sich — benannt,
+        // nicht geraten (ein Kind ohne Eintritt liefe nach MUSTER).
+        println!("fork    : ABGEWIESEN -- asid {asid} hat Frames, aber keinen Eintritt");
+        return Err(result::ERR_BADSYS);
+    };
+    if eintritt == 0 {
+        // Gebucht, aber nie belegt (`EMPTY`-Eintritt): dieselbe Lage wie oben, nur eine Stufe
+        // frueher — ein Kind am Eintritt 0 faultete an seiner ersten Instruktion.
+        println!("fork    : ABGEWIESEN -- asid {asid} ohne gebuchten Eintritt");
+        return Err(result::ERR_BADSYS);
+    }
+    // Die Stack-Fenster fallen aus der Kopie: sie bekommen das Kind frisch (s. Doku oben).
+    // Gefiltert wird ueber die VA — ein weiterer Grund, warum die Liste beim Mappen
+    // gesammelt wird statt geraten.
+    let mut vas: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    if vas.try_reserve_exact(MAX_IMG_SEGS).is_err() {
+        return Err(result::ERR_NOSPACE);
+    }
+    vas.resize(MAX_IMG_SEGS, (0, 0));
+    let mut nseg = 0usize;
+    for &(phys, va, len, _) in &quelle[..nq] {
+        let _ = phys;
+        if va >= LOADED_STACK_VA && va < LOADED_STACK_VA + LOADED_STACK_BYTES {
+            continue;
+        }
+        if nseg >= MAX_IMG_SEGS {
+            return Err(result::ERR_SNAPSHOT_LIMIT);
+        }
+        vas[nseg] = (va, len);
+        nseg += 1;
+    }
+    // Rein pruefen, bevor irgendetwas alloziert ist (kanonisch in `forkexec`).
+    // Heap statt Stack (s. Funktionsdoku): `SnapSeg` ist `Copy`, die Liste lebt im Heap.
+    let mut plan: alloc::vec::Vec<caprock_loader::snapshot::SnapSeg> =
+        alloc::vec::Vec::new();
+    if plan.try_reserve_exact(MAX_IMG_SEGS).is_err() {
+        return Err(result::ERR_NOSPACE);
+    }
+    plan.resize(
+        MAX_IMG_SEGS,
+        caprock_loader::snapshot::SnapSeg { va: 0, len: 0 },
+    );
+    let (_nstueck, summe) = match forkexec::fork_plan_pruefen(&vas[..nseg], max_len, &mut plan) {
+        Ok(v) => v,
+        Err(f) => return Err(forkexec::fork_fehler_code(f)),
+    };
+    // Kostenabschaetzung VOR der Allokation: Daten + Tabellen (je ≤512 Seiten eine + eine).
+    // Reicht der freie Rest nicht einmal dafuer, faellt der Antrag hier — benannt, nicht erst
+    // nach dem dritten kopierten Stueck.
+    let (daten, tabellen) = caprock_loader::snapshot::snapshot_kosten(summe);
+    if MEM.lock().total_free() < (daten + tabellen) * 4096 {
+        mangel(MANGEL_SEGMENT_SPEICHER, summe);
+        return Err(result::ERR_NOSPACE);
+    }
+    // Das Kind: eigene PD (Budget geerbt), eigene VSpace, eigener Streifen wenn moeglich.
+    // Der Streifen zuerst (Isolation erhalten, wenn es geht), dann das Erbe der Mutter
+    // (benannt: das Kind teilt dann deren Farben), dann ungefärbt (die Farbe gibt zuletzt
+    // nach — benannt, nie ein Fehler aus Topologie).
+    let budget16 = budget.min(u16::MAX as usize) as u16;
+    let Some(kind_pd) = create_pd_mit_budget(domain, budget16) else {
+        mangel(MANGEL_PD_SLOT, 0);
+        return Err(result::ERR_NOSPACE);
+    };
+    let (streifen, kind_maske): (Option<(u32, caprock_mem::ColorMask)>, Option<caprock_mem::ColorMask>) =
+        match src_maske {
+            Some(_) => match crate::colors::claim_stripe() {
+                Some(st) => {
+                    let m = st.1;
+                    (Some(st), Some(m))
+                }
+                None => {
+                    println!(
+                        "fork    : RUECKFALL kein eigener Streifen frei -- Kind erbt Farbsatz der Mutter"
+                    );
+                    (None, src_maske)
+                }
+            },
+            None => (None, None),
+        };
+    let knoten = src_node;
+    // Ab hier raeumt jeder Fehlerausgang ab (`kind_aufraeumen`): PD-Slot, VSpace, Frames,
+    // Kstack und Streifen — in genau dieser Reihenfolge (erst Inhalt, dann Behaelter).
+    let kind_aufraeumen = |kind_pd: usize,
+                           casid: u16,
+                           segs: &[(u64, u64)],
+                           stack: Option<(u64, u64)>,
+                           kbase: usize,
+                           streifen: Option<(u32, caprock_mem::ColorMask)>| {
+        {
+            let mut mem = MEM.lock();
+            for &(b, l) in segs {
+                if l > 0 {
+                    mem.free_region(PhysRegion::new(b, l));
+                }
+            }
+            if let Some((b, l)) = stack {
+                mem.free_region(PhysRegion::new(b, l));
+            }
+        }
+        if casid != 0 {
+            vspace_teardown(casid);
+        }
+        if kbase != 0 {
+            release_user_kstack(kbase);
+        }
+        if let Some((i, _)) = streifen {
+            crate::colors::release_stripe(i);
+        }
+        CAPS.write().pds.free(kind_pd);
+    };
+    let kbase_opt = claim_user_kstack_masked(kind_maske, knoten);
+    let Some(kbase) = kbase_opt else {
+        kind_aufraeumen(kind_pd, 0, &[], None, 0, streifen);
+        return Err(result::ERR_NOSPACE);
+    };
+    let vspace_opt = create_vspace_masked(kind_maske, knoten);
+    let Some((casid, l1)) = vspace_opt else {
+        kind_aufraeumen(kind_pd, 0, &[], None, kbase, streifen);
+        return Err(result::ERR_NOSPACE);
+    };
+    if let Some((i, _)) = streifen {
+        vspace_bind_stripe(casid, i);
+    }
+    let Some(l2) = vspace_l2(casid) else {
+        mangel(MANGEL_L2_TABELLE, 0);
+        kind_aufraeumen(kind_pd, casid, &[], None, kbase, None);
+        return Err(result::ERR_NOSPACE);
+    };
+    // Stuecke kopieren: phys→phys (beide identity-gemappt), an DIESELBEN VAs mappen.
+    // Heap statt Stack (s. Funktionsdoku) -- drei Listen, ein Reserve-Fehler.
+    let mut kind_segs: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    let mut kind_vas: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    let mut kind_perms: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if kind_segs.try_reserve_exact(MAX_IMG_SEGS).is_err()
+        || kind_vas.try_reserve_exact(MAX_IMG_SEGS).is_err()
+        || kind_perms.try_reserve_exact(MAX_IMG_SEGS).is_err()
+    {
+        kind_aufraeumen(kind_pd, casid, &[], None, kbase, streifen);
+        return Err(result::ERR_NOSPACE);
+    }
+    kind_segs.resize(MAX_IMG_SEGS, (0, 0));
+    kind_vas.resize(MAX_IMG_SEGS, 0);
+    kind_perms.resize(MAX_IMG_SEGS, 0);
+    let mut nkind = 0usize;
+    for &(sphys, va, len, pcode) in &quelle[..nq] {
+        if va >= LOADED_STACK_VA && va < LOADED_STACK_VA + LOADED_STACK_BYTES {
+            continue;
+        }
+        let Some(p) = perm_von(pcode) else {
+            println!("fork    : ABGEWIESEN -- unbekannter Perm-Code {pcode} an VA {va:#x}");
+            kind_aufraeumen(kind_pd, casid, &kind_segs[..nkind], None, kbase, None);
+            return Err(result::ERR_BADSYS);
+        };
+        let Some(region) = mem_alloc_masked_anywhere_auf(len, 4096, kind_maske, knoten) else {
+            mangel(MANGEL_SEGMENT_SPEICHER, len);
+            kind_aufraeumen(kind_pd, casid, &kind_segs[..nkind], None, kbase, None);
+            return Err(result::ERR_NOSPACE);
+        };
+        let dpa = region.base();
+        // SAFETY: beide Frames frisch alloziert bzw. der Quell-Frame der eigenen, lebenden
+        // VSpace (der Aufrufer laeuft darauf — `loaded_snapshot` haelt kein Lock, aber die
+        // Frames gehoeren bis zum Teardown dieser ASID niemand anderem); beide
+        // identity-gemappt, exakt `len` Bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(sphys as *const u8, dpa as *mut u8, len as usize);
+        }
+        kind_segs[nkind] = (dpa, len);
+        kind_vas[nkind] = va;
+        kind_perms[nkind] = pcode;
+        nkind += 1;
+        let mut off = 0u64;
+        while off < len {
+            let mut a3 = || {
+                let r = pt_rahmen(mem_alloc_masked_anywhere_auf(4096, 4096, kind_maske, knoten));
+                if r.is_none() {
+                    mangel(MANGEL_SEITENTABELLE, 4096);
+                }
+                r
+            };
+            if !hal::mmu::vspace_map_page_at(l2, va + off, dpa + off, p, &mut a3) {
+                if lade_mangel().0 == MANGEL_KEINER {
+                    mangel(MANGEL_MAPPING_ABGEWIESEN, 0);
+                }
+                kind_aufraeumen(kind_pd, casid, &kind_segs[..nkind], None, kbase, None);
+                return Err(result::ERR_NOSPACE);
+            }
+            off += 4096;
+        }
+    }
+    // Frischer Stack an derselben VA (genullt aus dem Allokator — nichts geht ungenullt an
+    // ein Subjekt). Gefaerbt wandert er in `kind_segs` (Teardown wie die Segmente), ungefaerbt
+    // als Reap-Region an den Thread (wie im Ladepfad — derselbe benannte Unterschied).
+    let mut kind_stack: Option<(u64, u64)> = None;
+    {
+        let n = LOADED_STACK_BYTES;
+        let Some(region) = mem_alloc_masked_anywhere_auf(n, 4096, kind_maske, knoten) else {
+            mangel(MANGEL_STACK_SPEICHER, n);
+            kind_aufraeumen(kind_pd, casid, &kind_segs[..nkind], None, kbase, None);
+            return Err(result::ERR_NOSPACE);
+        };
+        let spa = region.base();
+        if kind_maske.is_none() {
+            kind_stack = Some((spa, n));
+        } else {
+            kind_segs[nkind] = (spa, n);
+            kind_vas[nkind] = LOADED_STACK_VA;
+            kind_perms[nkind] = PERM_RW;
+            nkind += 1;
+        }
+        let mut off = 0u64;
+        while off < n {
+            let mut a3 = || {
+                let r = pt_rahmen(mem_alloc_masked_anywhere_auf(4096, 4096, kind_maske, knoten));
+                if r.is_none() {
+                    mangel(MANGEL_SEITENTABELLE, 4096);
+                }
+                r
+            };
+            if !hal::mmu::vspace_map_page_at(
+                l2,
+                LOADED_STACK_VA + off,
+                spa + off,
+                hal::mmu::UserPerm::Rw,
+                &mut a3,
+            ) {
+                if lade_mangel().0 == MANGEL_KEINER {
+                    mangel(MANGEL_MAPPING_ABGEWIESEN, 0);
+                }
+                kind_aufraeumen(kind_pd, casid, &kind_segs[..nkind], kind_stack, kbase, None);
+                return Err(result::ERR_NOSPACE);
+            }
+            off += 4096;
+        }
+    }
+    hal::mmu::flush_asid(casid);
+    // Thread: geparkt erzeugen, buchen (noch unter SCHEDS — s. `record_user_kstack`), binden,
+    // Kind-Cap beim Aufrufer eintragen, DANN zulassen (D0: parken — binden — zulassen).
+    let daif = hal::cpu::local_irq_save();
+    let ctid = {
+        let mut sched = SCHEDS[core].lock();
+        let r = sched.spawn_user_at_parked(
+            core,
+            eintritt,
+            startarg,
+            kbase,
+            USER_KSTACK_SIZE,
+            (LOADED_STACK_VA + LOADED_STACK_BYTES) as usize,
+            kind_stack.map(|(b, _)| b as usize).unwrap_or(0),
+            kind_stack.map(|(_, l)| l as usize).unwrap_or(0),
+            prio,
+        );
+        if let Some(t) = r {
+            fp_reset_slot(t.slot());
+            record_user_kstack(t, kbase);
+            // Gefaerbt liegt der Stack in `kind_segs` (PD-Eigentum, kein Reap) — dann ist die
+            // Buchung hier `(0, 0)` und damit ein No-Op (s. `record_user_region`).
+            let (sb, sl) = kind_stack.unwrap_or((0, 0));
+            record_user_region(t.slot(), sb, sl);
+            set_vspace_of(t.slot(), ((casid as u64) << 48) | l1);
+        }
+        r
+    };
+    let Some(ctid) = ctid else {
+        hal::cpu::local_irq_restore(daif);
+        mangel(MANGEL_THREAD_SLOT, 0);
+        kind_aufraeumen(kind_pd, casid, &kind_segs[..nkind], kind_stack, kbase, None);
+        return Err(result::ERR_NOSPACE);
+    };
+    if !loaded_register(
+        casid,
+        eintritt,
+        startarg,
+        &kind_segs[..nkind],
+        &kind_vas[..nkind],
+        &kind_perms[..nkind],
+    ) {
+        hal::cpu::local_irq_restore(daif);
+        // `kill_remote` rechnet den Kstack selbst ab (`reclaim_user_kstack`) und der Reaper die
+        // Reap-Region — beides danach NICHT mehr anfassen (doppelte Freigabe bzw. fremder Stack).
+        // `0`/`None` heisst fuer `kind_aufraeumen „bereits abgerechnet"; was `kill` ablehnt,
+        // bleibt benannt stehen (Leck statt UAF).
+        if !kill_remote(ctid) {
+            println!(
+                "fork    : RUECKZUG Kind-Thread nicht beendbar -- PD {kind_pd} bleibt stehen (Leck statt UAF)"
+            );
+        }
+        kind_aufraeumen(kind_pd, casid, &kind_segs[..nkind], None, 0, None);
+        return Err(result::ERR_NOSPACE);
+    }
+    // KEIN `record_program_thread`: das Kind hat keine `program_id` aus dem Manifest, und die
+    // Tabelle beantwortet „steht fuer jeden Manifest-Eintrag ein Programm" (`vollzaehligkeit`).
+    // Ein Kind-Eintrag unter der PD-Nummer koennte einen fehlenden Manifest-Eintrag derselben
+    // Nummer als geladen ausweisen — ein stiller Vollzaehligkeits-Fund, schlimmer als keiner.
+    bind_pd(kind_pd, ctid);
+    // Die Kind-`PdControl`-Cap in den Ziel-Slot des Aufrufers (autorisiert: nur TrustedSas
+    // haelt `PdControl` — `install_pd_cap` prueft die Policy, und was sie abweist, wird
+    // geloescht statt geleckt).
+    let kind_cap = match install_pd_control_cap(kind_pd, Rights::WRITE) {
+        Ok(c) => c,
+        Err(_) => {
+            hal::cpu::local_irq_restore(daif);
+            // Kstack/Reap liegen beim `kill` (s. oben) — hier `0`/`None`; registrierte Frames
+            // raeumt der Teardown (`&[]` heisst: nichts Ungetracktes mehr frei).
+            if !kill_remote(ctid) {
+                println!(
+                    "fork    : RUECKZUG Kind-Thread nicht beendbar -- PD {kind_pd} bleibt stehen (Leck statt UAF)"
+                );
+            }
+            kind_aufraeumen(kind_pd, casid, &[], None, 0, None);
+            return Err(result::ERR_NOSPACE);
+        }
+    };
+    if !install_pd_cap(pd, kind_slot, kind_cap) {
+        let _ = cap_delete(kind_cap);
+        hal::cpu::local_irq_restore(daif);
+        if !kill_remote(ctid) {
+            println!(
+                "fork    : RUECKZUG Kind-Thread nicht beendbar -- PD {kind_pd} bleibt stehen (Leck statt UAF)"
+            );
+        }
+        kind_aufraeumen(kind_pd, casid, &[], None, 0, None);
+        return Err(result::ERR_BADCAP);
+    }
+    if !SCHEDS[core].lock().admit(ctid) {
+        hal::cpu::local_irq_restore(daif);
+        // Wie der Ladepfad (`load_into_pd_mit_va`): keine Zulassung ohne Aufloesung — best
+        // effort beenden, registrierte Frames ueber den Teardown, Kstack/Reap ueber Kill/Reaper.
+        println!("fork    : RUECKZUG Kind-Thread nicht zulassbar -- PD {kind_pd} wird abgebaut");
+        kill_remote(ctid);
+        kind_aufraeumen(kind_pd, casid, &[], None, 0, None);
+        return Err(result::ERR_NOSPACE);
+    }
+    hal::cpu::local_irq_restore(daif);
+    Ok(kind_pd as u64)
+}
+
+/// `EXEC_REPLACE`: neues Image in die BESTEHENDE PD laden (Teardown-Token-Form).
+///
+/// Geordneter Rueckzug statt `ERR_NOSPACE`-statt-Aufraeumen: fremde Threads abziehen, Slots
+/// loeschen (ausser dem der Loader-Cap), DANN laden — und erst nach erfolgreichem Laden den
+/// Aufrufer auf die neue VSpace binden, die alte Abbauen und die Epoche heben. Schlaegt das
+/// Laden fehl, lebt die alte Fassung weiter (Slots ausser Loader sind dann allerdings schon
+/// geraeumt — benannt, kein stiller Ueberrest) und das Token bleibt gueltig (die Epoche hebt
+/// sich erst bei Erfolg): ein Fehlschlag ist wiederholbar, kein Einbahnstrassen-Verlust.
+///
+/// Was die Reihenfolge gegenueber der `exec`-Doku (`erst 1-3, dann laden`) verschiebt: dort
+/// steht der Rueckbau vor dem Laden, hier laedt erst das Neue, dann geht das Alte. Der Grund
+/// ist atomar: mit zwei VSpaces (die PD lebt weiter, nur ihr Inhalt geht) ist „erst laden,
+/// dann umbinden und abbauen" der einzige Weg, auf dem ein Fehlschlag nichts halb
+/// Geraeumtes hinterlaesst. Die alte VSpace wird erst nach dem Umbinden abgebaut — nie zeigt
+/// ein lebender Thread auf freigegebene Tabellen.
+#[inline(never)] // s. `dispatch_fork`: heisse Rahmen bleiben schlank, auch per Inline.
+fn dispatch_exec(
+    pd: usize,
+    loader_cap: caprock_cap::CapPtr,
+    loader_slot: usize,
+    prog_index: u32,
+    token: u64,
+) -> Result<(), u64> {
+    use caprock_abi::result;
+    // 1. Loader-Autoritaet: Loader-Art + WRITE (dieselbe Pruefung wie SYS_LOAD).
+    {
+        let g = CAPS.read();
+        match g.cspace.lookup(loader_cap) {
+            Some((caprock_cap::ObjectKind::Loader { .. }, r, _))
+                if r.contains(caprock_mem::Rights::WRITE) => {}
+            _ => return Err(result::ERR_BADCAP),
+        }
+    }
+    // 2. Token gegen (program_id, Epoche): 0 ist kein „egal" (kanonisch in `forkexec`).
+    if token == 0 {
+        return Err(result::ERR_STALE_TOKEN);
+    }
+    let core = hal::cpu::core_id();
+    let me = SCHEDS[core].lock().current_id(core);
+    // Nur die EIGENE PD wird ersetzt — eine fremde waere ein Kill mit Extraschritten.
+    match CAPS.read().pds.pd_of_thread(me) {
+        Some(eigen) if eigen == pd => {}
+        _ => return Err(result::ERR_BADCAP),
+    }
+    let prog_id = crate::loader::program_of_thread(me).unwrap_or(u32::MAX);
+    let epoche = EXEC_EPOCHE.lock()[pd % caprock_microkit::NPDS];
+    // 3. Programm aufloesen (Archiv-Index -> Program; dieselbe Quelle wie `reload_driver`).
+    let arch = crate::loader::read_archive().ok_or(result::ERR_BADCAP)?;
+    let prog = arch.program(prog_index as usize).ok_or(result::ERR_BADCAP)?;
+    let img = match caprock_loader::elf::ElfImage::parse(prog.elf) {
+        Ok(i) => i,
+        Err(_) => {
+            println!("exec    : ABGEWIESEN -- Archiv-Index {prog_index} ist kein gueltiges ELF");
+            return Err(result::ERR_BADCAP);
+        }
+    };
+    let nseg = img.segments().count();
+    forkexec::exec_antrag_pruefen(prog_id, epoche, token, img.entry(), nseg)?;
+    // Herkunft der laufenden Fassung: Farbe und Knoten erbt die neue (der Aufrufer hat keine
+    // Manifestposition mehr — EXEC ist Laufzeit, kein Boot).
+    let alt_asid = (vspace_of(me.slot()) >> 48) as u16;
+    let (src_node, src_maske) = vspace_herkunft(alt_asid);
+    // 4a. Fremde Threads abziehen (KILL-Ordnung) — alle ausser dem Aufrufer, begrenzt durch
+    // die Threadzahl plus einen: was danach noch laeuft und fremd ist, ist benannt (der Kill
+    // hat es abgelehnt), nicht uebersehen.
+    let fremd_anzahl = CAPS.read().pds.thread_count(pd).saturating_add(1) as usize;
+    for _ in 0..fremd_anzahl {
+        let gef = core::cell::Cell::new(None);
+        {
+            let g = CAPS.read();
+            // `any_thread` nimmt `&dyn Fn` (kein `FnMut`) — deshalb die Zelle statt `&mut`.
+            g.pds.any_thread(pd, &|t| {
+                if t != me && gef.get().is_none() {
+                    gef.set(Some(t));
+                }
+                false
+            });
+        }
+        let Some(t) = gef.get() else { break };
+        if !kill_remote(t) {
+            println!("exec    : RUECKZUG unvollstaendig -- Thread {} blieb (PD {pd})", t.to_raw());
+            break;
+        }
+    }
+    // 4b. Alle Slots loeschen ausser dem der Loader-Cap. Was `cap_delete` ablehnt (Kinder),
+    // wird trotzdem aus der PD geraeumt (Autoritaet entzogen) und benannt — ein globales
+    // Leck ist besser als eine EXEC-PD mit fremder Autoritaet.
+    {
+        let caps = CAPS.read().pds.caps_of(pd);
+        for (slot, c) in caps.iter().enumerate() {
+            if slot == loader_slot {
+                continue;
+            }
+            if let Some(cap) = *c {
+                if cap_delete(cap).is_err() {
+                    println!("exec    : RUECKZUG Slot {slot} global nicht freigegeben -- aus PD {pd} geraeumt");
+                }
+                clear_pd_cap(pd, slot);
+            }
+        }
+    }
+    // 4c. Neu laden in DIESELBE PD (neue VSpace, neuer Thread — die PD lebt weiter, nur ihr
+    // Inhalt geht). Farbe und Knoten der alten Fassung reisen mit; die Prio ist die Vorgabe
+    // (EXEC umgeht das Manifest, und eine erfundene Prio waere eine Zusicherung, die niemand
+    // verlangt hat — dieselbe Form wie `budget_us` im `zahlenpolitik_gate`).
+    let pol = LadePolitik {
+        farbig: src_maske.is_some(),
+        node: src_node,
+        prio: LadePolitik::VORGABE.prio,
+        core: Some(core),
+        budget_us: 0,
+        angebotene_slots: 0,
+        cap_budget: 0,
+    };
+    let arg = crate::loader::boot_arg(prog_index as usize, arch.count());
+    let (neu, _) = match load_into_pd_mit_va(&img, pd, &[], arg, pol, None) {
+        Some(v) => v,
+        None => {
+            // Die alte Fassung lebt weiter (ihre VSpace wurde nicht angeruehrt); das Token
+            // bleibt gueltig (Epoche ungehubt) — wiederholbar statt verloren. Was fehlt
+            // (geraemte Slots, abgezogene Threads), steht oben benannt.
+            println!("exec    : ABGEBROCHEN -- alte Fassung laeuft weiter (PD {pd}), Token gueltig");
+            return Err(result::ERR_NOSPACE);
+        }
+    };
+    // 4d. Aufrufer auf die neue VSpace binden, DANN die alte abbauen (nie umgekehrt — sonst
+    // zeigte ein lebender Thread auf freigegebene Tabellen).
+    let neu_asid = (vspace_of(neu.slot()) >> 48) as u16;
+    match vspace_l1(neu_asid) {
+        Some(neu_l1) => set_vspace_of(me.slot(), ((neu_asid as u64) << 48) | neu_l1),
+        None => {
+            println!("exec    : WIDERSPRUCH -- neue ASID {neu_asid} ohne L1 (PD {pd})");
+            return Err(result::ERR_BADSYS);
+        }
+    }
+    if alt_asid != 0 && alt_asid != neu_asid {
+        vspace_teardown(alt_asid);
+    }
+    // 5. Epoche erst nach erfolgreichem Laden heben — sonst verlöre ein Fehlschlag das Token
+    // der noch laufenden alten Fassung.
+    EXEC_EPOCHE.lock()[pd % caprock_microkit::NPDS] = epoche.wrapping_add(1).max(1);
+    Ok(())
+}
+
+/// FORK/EXEC (31/32) VOR dem Microkit-Dispatch (s. Modul-Doku oben).
+///
+/// `caprock-microkit` ist nur gelesen: seine 31/32-Arme bleiben fail-closed `ERR_BADSYS`
+/// („Antrag ok, Pfad fehlt") fuer den Fall, dass dieser Hook je umgangen wird. Die
+/// Vorpruefung (`proc::dekodiere_fork/exec`: reserviert == 0, Token != 0, Laenge gedeckelt)
+/// laeuft hier — ohne einen einzigen Seiteneffekt — und danach der Rueckruf.
+#[inline(never)] // s. `dispatch_fork`: dieser Hook steht in `syscall()`, sein Rahmen muss
+// schlank bleiben -- die dicken Listen wohnen dahinter, nie darin.
+fn forkexec_syscall(frame: usize, core: usize, nr: u64) -> usize {
+    use caprock_abi::{reg, result, sys};
+    use caprock_microkit::proc::{dekodiere_exec, dekodiere_fork, ForkExecEntscheid};
+    let deny = |code: u64| -> usize {
+        hal::exception::frame_set_reg(frame, reg::SYSNO_RESULT, code);
+        frame
+    };
+    if nr == sys::FORK_SNAPSHOT {
+        let m0 = hal::exception::frame_reg(frame, reg::MSG0);
+        let m1 = hal::exception::frame_reg(frame, reg::MSG0 + 1);
+        let m2 = hal::exception::frame_reg(frame, reg::MSG0 + 2);
+        let m3 = hal::exception::frame_reg(frame, reg::MSG0 + 3);
+        match dekodiere_fork(m0, m1, m2, m3) {
+            ForkExecEntscheid::Abgewiesen(code) => {
+                FORK_ABGEWIESEN.fetch_add(1, Ordering::Relaxed);
+                deny(code)
+            }
+            ForkExecEntscheid::Fork(a) => {
+                let me = SCHEDS[core].lock().current_id(core);
+                let pd = { CAPS.read().pds.pd_of_thread(me) };
+                // CAPS freigegeben — `dispatch_fork` nimmt CAPS/MEM/SCHEDS selbst.
+                let Some(pd) = pd else {
+                    FORK_ABGEWIESEN.fetch_add(1, Ordering::Relaxed);
+                    return deny(result::ERR_NOPD);
+                };
+                match dispatch_fork(pd, a.kind_slot, a.max_len, a.prio) {
+                    Ok(kind_pd) => {
+                        FORK_GELUNGEN.fetch_add(1, Ordering::Relaxed);
+                        hal::exception::frame_set_reg(frame, reg::MSG0, kind_pd);
+                        hal::exception::frame_set_reg(frame, reg::SYSNO_RESULT, result::OK);
+                        frame
+                    }
+                    Err(code) => {
+                        FORK_ABGEWIESEN.fetch_add(1, Ordering::Relaxed);
+                        deny(code)
+                    }
+                }
+            }
+            ForkExecEntscheid::Exec(_) => {
+                FORK_ABGEWIESEN.fetch_add(1, Ordering::Relaxed);
+                deny(result::ERR_BADCAP)
+            }
+            ForkExecEntscheid::Unbekannt => {
+                FORK_ABGEWIESEN.fetch_add(1, Ordering::Relaxed);
+                deny(result::ERR_BADSYS)
+            }
+        }
+    } else {
+        let loader_slot = hal::exception::frame_reg(frame, reg::EP_BADGE);
+        let m0 = hal::exception::frame_reg(frame, reg::MSG0);
+        let m1 = hal::exception::frame_reg(frame, reg::MSG0 + 1);
+        let m2 = hal::exception::frame_reg(frame, reg::MSG0 + 2);
+        let m3 = hal::exception::frame_reg(frame, reg::MSG0 + 3);
+        match dekodiere_exec(loader_slot, m0, m1, m2, m3) {
+            ForkExecEntscheid::Abgewiesen(code) => {
+                EXEC_ABGEWIESEN.fetch_add(1, Ordering::Relaxed);
+                deny(code)
+            }
+            ForkExecEntscheid::Exec(a) => {
+                let me = SCHEDS[core].lock().current_id(core);
+                let (pd, cap) = {
+                    let g = CAPS.read();
+                    let Some(pd) = g.pds.pd_of_thread(me) else {
+                        EXEC_ABGEWIESEN.fetch_add(1, Ordering::Relaxed);
+                        return deny(result::ERR_NOPD);
+                    };
+                    let cap = g
+                        .pds
+                        .caps_of(pd)
+                        .get(a.loader_slot)
+                        .copied()
+                        .flatten();
+                    match cap {
+                        Some(c) => (pd, c),
+                        None => {
+                            EXEC_ABGEWIESEN.fetch_add(1, Ordering::Relaxed);
+                            return deny(result::ERR_BADCAP);
+                        }
+                    }
+                };
+                // CAPS freigegeben — `dispatch_exec` nimmt CAPS/MEM/SCHEDS selbst.
+                match dispatch_exec(pd, cap, a.loader_slot, a.prog_index, a.token) {
+                    Ok(()) => {
+                        EXEC_GELUNGEN.fetch_add(1, Ordering::Relaxed);
+                        deny(result::OK)
+                    }
+                    Err(code) => {
+                        EXEC_ABGEWIESEN.fetch_add(1, Ordering::Relaxed);
+                        deny(code)
+                    }
+                }
+            }
+            ForkExecEntscheid::Fork(_) => {
+                EXEC_ABGEWIESEN.fetch_add(1, Ordering::Relaxed);
+                deny(result::ERR_BADCAP)
+            }
+            ForkExecEntscheid::Unbekannt => {
+                EXEC_ABGEWIESEN.fetch_add(1, Ordering::Relaxed);
+                deny(result::ERR_BADSYS)
+            }
+        }
+    }
+}
+
 /// **`SYS_SPAWN`: a thread whose stack the CALLER brought** (K1a, 2026-08-17).
 ///
 /// The difference to [`spawn_user_parked`] is one line long and it is the whole point: that
@@ -3936,6 +4788,31 @@ struct VSpaceEnt {
     /// Thread aufgehängt würde er bei mehreren Threads je PD mehrfach freigegeben oder gar nicht;
     /// an der VSpace hat er genau einen Anfang und genau ein Ende (`vspace_teardown`).
     stripe: Option<u32>,
+    /// Der GEWUENSCHTE Knoten dieser VSpace (Z8/N3) — die Platzierung, keine Messung.
+    ///
+    /// Gesetzt aus `LadePolitik.node` beim Anlegen; was davon WIRKUNG wurde, zaehlt die Leiter
+    /// (`numa::stats`), nicht dieses Feld. Ein Wunsch ist von einem Treffer zu unterscheiden —
+    /// sonst liest sich „Knoten 0 gewuenscht, weil das Manifest schwieg" wie „Knoten 0 getroffen".
+    /// Spawn-Wege ohne Manifest tragen `Unaffiliated`.
+    node: caprock_hal::numa::Node,
+    /// Der Farbsatz, aus dem Tabellen und Stacks dieser VSpace stammen (Z8/N3, FORK-Erbe).
+    ///
+    /// `None` heisst ungefärbt. Zusammen mit `node` erbt der FORK-Pfad daraus die Platzierung
+    /// der Eltern-PD, ohne sie zu raten: was die Mutter trug, steht hier, nicht in einer zweiten
+    /// Tabelle, die daneben altern wuerde.
+    cmask: Option<caprock_mem::ColorMask>,
+}
+
+impl VSpaceEnt {
+    /// Freier Slot — keine Herkunft, keine Farbe, kein Knoten.
+    const FREI: VSpaceEnt = VSpaceEnt {
+        used: false,
+        l1: 0,
+        l2: 0,
+        stripe: None,
+        node: caprock_hal::numa::Node::Unaffiliated,
+        cmask: None,
+    };
 }
 static VSPACES: SpinLock<Slab<VSpaceEnt>> = SpinLock::new(Slab::empty());
 
@@ -3959,15 +4836,23 @@ pub fn vspace_capacity() -> (usize, usize) {
 /// (zuerst, freigegeben), trägt dann die Metadaten ein (`MEM` und `VSPACES` nie
 /// gleichzeitig gehalten -> keine Sperrordnungs-Inversion zu Teardown/map).
 fn create_vspace() -> Option<(u16, u64)> {
-    create_vspace_masked(None)
+    create_vspace_masked(None, caprock_hal::numa::Node::Unaffiliated)
 }
 
-/// Wie [`create_vspace`], aber die Seitentabellen kommen optional aus einem Farbsatz (todo A1).
+/// Wie [`create_vspace`], aber die Seitentabellen kommen optional aus einem Farbsatz (todo A1)
+/// und mit Knotenwunsch (Z8/N3).
 ///
 /// Tabellenzeilen werden vom **Seitenlaufwerk der MMU** geladen und liegen im selben LLC wie
 /// alles andere; ein Walk im Namen einer PD hinterlaesst also Spuren. Sie mitzufaerben kostet
 /// nichts (zwei bzw. drei 4-KiB-Seiten) und schliesst einen Kanal, den man sonst uebersieht.
-fn create_vspace_masked(mask: Option<caprock_mem::ColorMask>) -> Option<(u16, u64)> {
+///
+/// Der Knoten laeuft ueber [`mem_alloc_masked_auf`] (die Leiter: exakt, dann ausserhalb —
+/// benannt, nie ein Fehler aus Topologie). Die Herkunft (`node`, `cmask`) steht danach in der
+/// VSpace selbst (`vspace_herkunft`) — der FORK-Pfad erbt sie, ohne zu raten.
+fn create_vspace_masked(
+    mask: Option<caprock_mem::ColorMask>,
+    node: caprock_hal::numa::Node,
+) -> Option<(u16, u64)> {
     // ASID/VSpace-Slot aus der **Free-List** (VSPACES) belegen — wiederverwendbar
     // (kein monoton wachsender Zähler -> keine ASID-Leaks). Reservierung unter EINEM
     // Lock (Platzhalter), damit zwei Kerne nicht denselben Slot greifen.
@@ -3987,13 +4872,20 @@ fn create_vspace_masked(mask: Option<caprock_mem::ColorMask>) -> Option<(u16, u6
             mangel(MANGEL_VSPACE_ASID, 0);
             return None;
         };
-        t[i] = VSpaceEnt { used: true, l1: 0, l2: 0, stripe: None }; // reserviert
+        t[i] = VSpaceEnt {
+            used: true,
+            l1: 0,
+            l2: 0,
+            stripe: None,
+            node,
+            cmask: mask,
+        }; // reserviert
         (i + 1) as u16
     };
     // Ab hier zaehlt jeder Rahmen in den Seitentabellen-Topf (C7) -- und der Fehlerpfad bucht
     // ihn wieder aus, sonst waere der Fuellstand nach dem ersten Fehlschlag dauerhaft zu hoch.
-    let a = pt_rahmen(mem_alloc_masked(4096, 4096, mask));
-    let b = pt_rahmen(mem_alloc_masked(4096, 4096, mask));
+    let a = pt_rahmen(mem_alloc_masked(4096, 4096, mask, node));
+    let b = pt_rahmen(mem_alloc_masked(4096, 4096, mask, node));
     let (l1, l2) = match (a, b) {
         (Some(l1), Some(l2)) => (l1, l2),
         (a, b) => {
@@ -4029,8 +4921,9 @@ fn create_vspace_masked(mask: Option<caprock_mem::ColorMask>) -> Option<(u16, u6
         // gefaerbten PD ausserhalb ihres Farbsatzes, und der Farbtest sah es nicht, weil er nur
         // `l1`/`l2` zurueckliest. Ein Seitenlauf der MMU im Namen der PD hinterlaesst dort
         // dieselben Spuren wie in den beiden anderen. Schlaegt die gefaerbte Zuteilung fehl,
-        // scheitert das Anlegen der VSpace — kein stiller Rueckfall auf fremde Farben.
-        let f = pt_rahmen(mem_alloc_masked(4096, 4096, mask))?;
+        // scheitert das Anlegen der VSpace — kein stiller Rueckfall auf fremde Farben. Mit
+        // Knotenwunsch laeuft dieselbe Leiter wie bei L1/L2 (exakt, dann ausserhalb).
+        let f = pt_rahmen(mem_alloc_masked(4096, 4096, mask, node))?;
         extra = Some(f);
         Some(f)
     });
@@ -4056,10 +4949,31 @@ fn create_vspace_masked(mask: Option<caprock_mem::ColorMask>) -> Option<(u16, u6
         l1,
         l2,
         // Der Streifen wird nach dem Anlegen gesetzt (`vspace_bind_stripe`): hier ist noch nicht
-        // entschieden, ob diese VSpace eine gefärbte PD trägt.
+        // entschieden, ob diese VSpace eine gefärbte PD trägt. Knoten und Farbsatz dagegen stehen
+        // schon hier — sie sind die WUNSCH-Herkunft dieses Anlegens (s. `vspace_herkunft`).
         stripe: None,
+        node,
+        cmask: mask,
     };
     Some((asid, l1))
+}
+
+/// Die Herkunft einer VSpace: `(gewuenschter Knoten, Farbsatz)` (Z8/N3, FORK-Erbe).
+///
+/// `(Unaffiliated, None)` heisst „keine Politik" — das gilt fuer Spawn-Wege ohne Manifest,
+/// fuer freie/unbekannte ASIDs und fuer den globalen SAS-Fall (`asid == 0`). Der FORK-Pfad
+/// liest hier die Platzierung der Eltern-PD, statt sie zu raten; was er damit tut (eigener
+/// Streifen zuerst, dann Erbe, dann Rueckfall), steht in `dispatch_fork`.
+fn vspace_herkunft(asid: u16) -> (caprock_hal::numa::Node, Option<caprock_mem::ColorMask>) {
+    if asid == 0 || asid as usize > vspace_slots() {
+        return (caprock_hal::numa::Node::Unaffiliated, None);
+    }
+    let v = VSPACES.lock()[asid as usize - 1];
+    if v.used {
+        (v.node, v.cmask)
+    } else {
+        (caprock_hal::numa::Node::Unaffiliated, None)
+    }
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -4311,7 +5225,15 @@ fn vspace_map_masked(
         while p < base + len {
             let mapped =
                 hal::mmu::vspace_map_page(l2, p, perm, &mut || {
-                    pt_rahmen(mem_alloc_masked(4096, 4096, mask))
+                    // Abbildungszeitpunkt, kein Ladezeitpunkt: hier fliesst keine
+                    // `LadePolitik` (MAP-Syscall, Spawn-Wege ohne Manifest) — also
+                    // ungefragt unaffiliated; die Knotenpolitik lebt im Ladepfad.
+                    pt_rahmen(mem_alloc_masked(
+                        4096,
+                        4096,
+                        mask,
+                        caprock_hal::numa::Node::Unaffiliated,
+                    ))
                 });
             if !mapped {
                 all = false;
@@ -4399,7 +5321,13 @@ fn vspace_map_user_region(
     // Aufrufer, der hinterher nachrechnet, WARUM das Abbilden scheiterte, baut eine zweite
     // Wirklichkeit neben die erste (`iova_window_clear_of_msi`).
     let mut alloc = || {
-        let r = pt_rahmen(mem_alloc_masked(4096, 4096, mask));
+        // Wie oben: Abbildungszeitpunkt ohne Ladepolitik — unaffiliated.
+        let r = pt_rahmen(mem_alloc_masked(
+            4096,
+            4096,
+            mask,
+            caprock_hal::numa::Node::Unaffiliated,
+        ));
         if r.is_none() {
             mangel(MANGEL_SEITENTABELLE, 4096);
         }
@@ -4539,7 +5467,9 @@ fn vspace_teardown(asid: u16) {
         pt_zurueck(zurueck + 2);
     }
     // 3. Slot erst JETZT freigeben (nach Flush) -> keine Wiederverwendung mit veralteten Einträgen.
-    VSPACES.lock()[asid as usize - 1] = VSpaceEnt { used: false, l1: 0, l2: 0, stripe: None };
+    VSPACES.lock()[asid as usize - 1] = VSpaceEnt::FREI;
+    // Herkunft und Farbe fallen mit dem Slot: wer ihn neu vergibt, erbt keinen Knoten und
+    // keinen Farbsatz (ein geerbter Knoten waere eine Platzierungszusage, die niemand gab).
     // 4. Farbstreifen zuletzt (B-4.2). **Nach** dem Slot, nicht davor: gäbe man den Streifen frei,
     // solange diese VSpace noch steht, könnte eine neue PD ihn belegen und läge kurzzeitig auf
     // denselben Farben wie eine noch existierende — genau die Überschneidung, die B-4.2 verhindern
@@ -4736,7 +5666,10 @@ fn spawn_isolated_colored_inner(
     let _colors = crate::colors::count();
     let region_sz = crate::colors::region_bytes();
     // Region, Kernel-Stack UND Seitentabellen dieser PD kommen aus demselben Streifen.
-    let kbase = claim_user_kstack_masked(Some(mask))?;
+    // Spawn-Wege tragen keinen Manifest-Knoten (keine Ladepolitik) — unaffiliated; die
+    // Knotenpolitik lebt ausschliesslich im Ladepfad (`load_into_pd_mit_va`).
+    let kbase =
+        claim_user_kstack_masked(Some(mask), caprock_hal::numa::Node::Unaffiliated)?;
 
     // **Seit E-Rest 3d ohne Zonenbindung:** die Region wird nicht mehr identisch abgebildet,
     // sondern in das private User-Fenster dieser PD. Die Farbbedingung bleibt -- sie ist eine
@@ -4752,7 +5685,9 @@ fn spawn_isolated_colored_inner(
     };
     let (rbase, rlen) = (cap.base(), cap.len());
     zero_phys(rbase, rlen); // wie `mem_alloc`: nichts geht ungenullt an ein Subjekt
-    let Some((asid, l1)) = create_vspace_masked(Some(mask)) else {
+    let Some((asid, l1)) =
+        create_vspace_masked(Some(mask), caprock_hal::numa::Node::Unaffiliated)
+    else {
         MEM.lock().free_region(PhysRegion::new(rbase, rlen));
         release_user_kstack(kbase);
         return None;
@@ -4985,7 +5920,9 @@ pub fn spawn_isolated_native_parked(code: *const u8, code_len: usize, prio: u8) 
             // 2-MiB-Block (kein L3) am L2 -> vspace_teardown faende ihn nicht. Unter der ASID
             // registrieren, damit ein spaeteres destroy_isolated ihn via loaded_free freigibt
             // (sonst leckt der Code-Frame beim Abbau). Der Stack wird separat via Reap freigegeben.
-            let _ = loaded_register(asid, &[(cbase, clen)]);
+            // VA, Perm, Eintritt und Argument stehen hier im selben Sichtfeld — keine zweite
+            // Quelle, kein Raten (FORK-Erbe wie im Ladepfad).
+            let _ = loaded_register(asid, cva as usize, 0, &[(cbase, clen)], &[cva], &[PERM_RX]);
             Some(Parked(t))
         }
         None => {
@@ -5061,22 +5998,67 @@ fn copy_segment(dst_phys: u64, src: &[u8], total: usize) {
 // (x86 512 KiB, aarch64 16 KiB). Sie wird deshalb stueckweise alloziert, und jedes Stueck muss
 // einzeln zurueckgegeben werden koennen.
 const MAX_IMG_SEGS: usize = 64; // Frames je Programm (Segmentstuecke + Stackstuecke)
+// W^X bleibt pro Stueck pruefbar: der Perm-Code reist mit der Buchhaltung, nicht mit dem Pfad.
+const PERM_RX: u8 = 0;
+const PERM_RW: u8 = 1;
+const PERM_RO: u8 = 2;
+
+/// Einen Abbildungs-Perm in seinen Buchhaltungs-Code falten (FORK-Erbe).
+fn perm_code(p: hal::mmu::UserPerm) -> u8 {
+    match p {
+        hal::mmu::UserPerm::Rx => PERM_RX,
+        hal::mmu::UserPerm::Rw => PERM_RW,
+        hal::mmu::UserPerm::Ro => PERM_RO,
+    }
+}
+
+/// Den Code zurueck in einen Perm — `None` kennt der Ladepfad nicht (fail-closed, benannt).
+fn perm_von(c: u8) -> Option<hal::mmu::UserPerm> {
+    match c {
+        PERM_RX => Some(hal::mmu::UserPerm::Rx),
+        PERM_RW => Some(hal::mmu::UserPerm::Rw),
+        PERM_RO => Some(hal::mmu::UserPerm::Ro),
+        _ => None,
+    }
+}
 #[derive(Clone, Copy)]
 struct LoadedImage {
     asid: u16, // 0 = freier Slot
     nseg: usize,
     segs: [(u64, u64); MAX_IMG_SEGS], // (base, len)
+    /// Die VA je Stueck (FORK-Quellmenge) — `len` steht in `segs[i].1`.
+    ///
+    /// Beim Mappen gesammelt, nicht geraten: eine Rueckabbildung phys→VA existiert nicht
+    /// (kein inverser Index; `vspace_resolve` geht nur VA→PA). Wer den FORK-Loop ohne diese
+    /// Liste schriebe, kopierte an geratene VAs — das ist der Korruptionspfad, nicht die
+    /// Abkuerzung. Kosten: 512 B je Eintrag zusaetzlich (s. `configure_caps`).
+    vaddr: [u64; MAX_IMG_SEGS],
+    /// Der Perm-Code je Stueck (W^X bleibt im Kind pruefbar).
+    perm: [u8; MAX_IMG_SEGS],
+    /// Eintritt und Startargument des geladenen Images (FORK-Erbe: das Kind startet am
+    /// selben Eintritt mit demselben Argument — Neustart vom Eintritt, kein Fortsetzen).
+    eintritt: usize,
+    startarg: usize,
 }
 impl LoadedImage {
-    const EMPTY: LoadedImage = LoadedImage { asid: 0, nseg: 0, segs: [(0, 0); MAX_IMG_SEGS] };
+    const EMPTY: LoadedImage = LoadedImage {
+        asid: 0,
+        nseg: 0,
+        segs: [(0, 0); MAX_IMG_SEGS],
+        vaddr: [0; MAX_IMG_SEGS],
+        perm: [0; MAX_IMG_SEGS],
+        eintritt: 0,
+        startarg: 0,
+    };
 }
 /// Teardown-Buchhaltung geladener Programme aus Boot-RAM (Dichte): ein Eintrag je PD.
 ///
 /// Bis hierher eine statische Reserve von 16 Eintraegen (`[LoadedImage; 16]` im BSS): das 17.
 /// gleichzeitig geladene Programm bekam keinen Teardown-Eintrag, und der Ladevorgang schlug
 /// fehl — bei 10 000 PDs also an einer Zahl, die nie mitgewachsen ist. Dimensioniert auf
-/// `NPDS` (s. `configure_caps`), Kosten je Eintrag rund ein KiB aus Boot-RAM mit Abrechnung
-/// im Boot-Report. Ein vergessener Anhang faellt wie bei `VSPACES` auf: die Tabelle hat dann
+/// `NPDS` (s. `configure_caps`), Kosten je Eintrag rund eineinhalb KiB aus Boot-RAM
+/// (Frames + VA-Liste + Perms + Eintritt, s. `LoadedImage`) mit Abrechnung im Boot-Report.
+/// Ein vergessener Anhang faellt wie bei `VSPACES` auf: die Tabelle hat dann
 /// Laenge 0, und jede Registrierung meldet das Scheitern statt zu lecken.
 static LOADED_IMAGES: SpinLock<Slab<LoadedImage>> = SpinLock::new(Slab::empty());
 
@@ -5085,8 +6067,10 @@ pub fn loaded_capacity() -> usize {
     LOADED_IMAGES.lock().len()
 }
 
-/// Die RAM-Frames `segs` eines geladenen Programms unter `asid` registrieren (für den Teardown).
+/// Die RAM-Frames `segs` eines geladenen Programms unter `asid` registrieren (für den Teardown),
+/// dazu die VA-Liste, die Perms, Eintritt und Startargument (FORK-Erbe).
 ///
+/// `vas`/`perms` laufen parallel zu `segs` (ungleiche Laengen = Absage, kein Abschneiden).
 /// **Gibt `false` zurueck, wenn nicht ALLES registriert werden konnte** -- kein Slot frei, oder
 /// mehr Stuecke als [`MAX_IMG_SEGS`].
 ///
@@ -5096,8 +6080,15 @@ pub fn loaded_capacity() -> usize {
 /// Solange die Segmentzahl vorher gegen dieselbe Schranke geprueft wurde, war es unerreichbar;
 /// mit der stueckweisen Allokation der gefaerbten PDs ist es das nicht mehr.
 #[must_use = "ein nicht registriertes Stueck wird beim Teardown nie freigegeben -- ein Leck"]
-fn loaded_register(asid: u16, segs: &[(u64, u64)]) -> bool {
-    if segs.len() > MAX_IMG_SEGS {
+fn loaded_register(
+    asid: u16,
+    eintritt: usize,
+    startarg: usize,
+    segs: &[(u64, u64)],
+    vas: &[u64],
+    perms: &[u8],
+) -> bool {
+    if segs.len() > MAX_IMG_SEGS || segs.len() != vas.len() || segs.len() != perms.len() {
         return false;
     }
     let mut t = LOADED_IMAGES.lock();
@@ -5106,8 +6097,12 @@ fn loaded_register(asid: u16, segs: &[(u64, u64)]) -> bool {
     };
     let mut img = LoadedImage::EMPTY;
     img.asid = asid;
-    for &s in segs {
+    img.eintritt = eintritt;
+    img.startarg = startarg;
+    for (i, &s) in segs.iter().enumerate() {
         img.segs[img.nseg] = s;
+        img.vaddr[img.nseg] = vas[i];
+        img.perm[img.nseg] = perms[i];
         img.nseg += 1;
     }
     t[slot] = img;
@@ -5173,6 +6168,34 @@ pub fn loaded_frames_of(asid: u16, out: &mut [(u64, u64)]) -> usize {
     n
 }
 
+/// Die registrierten `(Phys, VA, Laenge, Perm-Code)` einer `asid` lesen — die Quellmenge des
+/// FORK (NICHT hinter `selftest`: der FORK-Pfad braucht sie im Produktivbau).
+///
+/// Spiegel von [`loaded_frames_of`], aber vollstaendig: was dort nicht steht (die VA), gehoert
+/// der PD nicht zur Kopie — der FORK kopiert an DIESELBEN VAs, und was er darueber hinaus
+/// gemappt hat, wird NICHT kopiert (Luecke sehen, nicht raten). Gibt die Zahl der
+/// geschriebenen Eintraege; `0` heisst „keine solche `asid`".
+fn loaded_snapshot(asid: u16, out: &mut [(u64, u64, u64, u8)]) -> usize {
+    let t = LOADED_IMAGES.lock();
+    let Some(slot) = t.iter().position(|i| i.asid == asid && i.asid != 0) else {
+        return 0;
+    };
+    let n = t[slot].nseg.min(out.len());
+    for i in 0..n {
+        out[i] = (t[slot].segs[i].0, t[slot].vaddr[i], t[slot].segs[i].1, t[slot].perm[i]);
+    }
+    n
+}
+
+/// Eintritt und Startargument des unter `asid` registrierten Images (FORK-Erbe).
+/// `None` = keine solche `asid` (keine Aussage, kein Ersatzwert).
+fn loaded_eintritt(asid: u16) -> Option<(usize, usize)> {
+    let t = LOADED_IMAGES.lock();
+    t.iter()
+        .find(|i| i.asid == asid && i.asid != 0)
+        .map(|i| (i.eintritt, i.startarg))
+}
+
 /// Die registrierten RAM-Frames der `asid` an den Allokator zurückgeben + den Slot freigeben.
 /// Snapshot ziehen, `LOADED_IMAGES` freigeben, DANN `MEM` (Rangordnung: nie beide gleichzeitig).
 fn loaded_free(asid: u16) {
@@ -5227,6 +6250,18 @@ pub fn load_into_pd(
 pub struct LadePolitik {
     /// Exklusiver Farbstreifen (`POLICY_EXCLUSIVE_STRIPE`).
     pub farbig: bool,
+    /// Gewuenschter NUMA-Knoten (Z8/N3, todo 3521-3529) — aus `manifest.numa_node`.
+    ///
+    /// `Unaffiliated` heisst „kein ausdruecklicher Wunsch" (das gilt auch fuer `numa_node = 0`:
+    /// das Format kann „nichts gesagt" nicht von „Knoten 0" unterscheiden, und aus einem
+    /// schweigenden Dokument einen Knotenwunsch zu erfinden waere die A1-Lehre andersherum).
+    /// Steht er, reist er bis zu den gefaerbten Allokationen des Ladepfads
+    /// (`mem_alloc_masked_auf`). Schweigt er, gewinnt der Ladepfad ihn aus dem geloesten Kern
+    /// zurueck (`node_of_core` in `load_into_pd_mit_va`): der Lader loest `numa_node` in einen
+    /// Kern DIESES Knotens auf, und der Kern traegt den Knoten noch. Vorher trug die Politik
+    /// `farbig` und `core`, aber keinen Knoten, und niemand rief die Leiter je mit einem echten
+    /// Knoten (Arithmetik ohne Anrufer).
+    pub node: caprock_hal::numa::Node,
     /// Prioritaet des Threads.
     pub prio: u8,
     /// Fester Kern, oder `None` fuer den aufrufenden.
@@ -5268,6 +6303,7 @@ impl LadePolitik {
     /// Was ohne Manifest-Angabe gilt -- **bitgleich das Verhalten vor Z11c**.
     pub const VORGABE: LadePolitik = LadePolitik {
         farbig: false,
+        node: caprock_hal::numa::Node::Unaffiliated,
         prio: IDLE_PRIO,
         core: None,
         budget_us: 0,
@@ -5697,6 +6733,28 @@ pub fn load_into_pd_mit(
     boot_arg: usize,
     pol: LadePolitik,
 ) -> Option<ThreadId> {
+    load_into_pd_mit_va(img, pd, endow, boot_arg, pol, None).map(|(t, _)| t)
+}
+
+/// Wie [`load_into_pd_mit`], sammelt zusaetzlich die VA-Liste: `(VA, Laenge)` je abgebildetem
+/// Stueck, in `va_out` (bis zu dessen Laenge), und gibt `(Thread, GESAMTE Stueckzahl)` zurueck
+/// (geschrieben wurde das Minimum aus Stueckzahl und Pufferlaenge — die Differenz benennt einen
+/// zu kleinen Puffer, statt still zu schneiden).
+///
+/// Die Liste wird BEIM MAPPEN gesammelt — aus dem einzigen Ort, der beide Seiten kennt (die
+/// Schleifen unten halten Physadresse UND Ziel-VA in der Hand). Eine Rueckabbildung phys→VA
+/// existiert nicht (kein inverser Index; `vspace_resolve` geht nur VA→PA), und wer sie aus den
+/// Tabellen raete, kopierte an geratene VAs. Dieselbe Sammlung traegt `loaded_register` in
+/// die Teardown-Buchhaltung (`vaddr`/`perm` je Stueck): EINE Wahrheit statt zwei — was der
+/// FORK kopiert, ist genau das, was der Teardown freigibt.
+pub fn load_into_pd_mit_va(
+    img: &ElfImage,
+    pd: usize,
+    endow: &[(usize, CapPtr)],
+    boot_arg: usize,
+    pol: LadePolitik,
+    va_out: Option<&mut [(u64, u64)]>,
+) -> Option<(ThreadId, usize)> {
     // **Das Endowment wird VERBUCHT, bevor irgendetwas alloziert ist** (2026-08-25).
     //
     // Bis heute lief die Installationsschleife weiter unten so: `if !install_pd_cap(..) {
@@ -5719,6 +6777,22 @@ pub fn load_into_pd_mit(
     // bekommt -- und `spawn_user_at_parked` prueft das per `debug_assert_eq!`. Eine Affinitaet, die
     // erst nach dem Anlegen wirkt, waere eine Migration und keine Zuteilung.
     let core = pol.core.unwrap_or_else(hal::cpu::core_id);
+    // **Der wirksame Knoten** (Z8/N3, todo 3521-3529) — die Bruecke, fuer die `loader.rs` NICHT
+    // angefasst wird (nur gelesen): `ladepolitik_auf` loest `manifest.numa_node` in einen Kern
+    // DIESES Knotens auf (`least_loaded_core_on`) und legt ihn in `pol.core`. Der Kern traegt
+    // den Knoten noch (`node_of_core`), also wird der Wunsch hier zurueckgewonnen, statt ihn
+    // im Lader in ein neues Feld zu schreiben. Ein AUSDRUECKLICHER `pol.node` sticht immer —
+    // sobald der Lader ihn setzt (Patch steht im Bericht), faellt diese Ableitung weg, ohne
+    // dass sich eine Allokationsstelle aendert. Ohne Topologie ist das Ergebnis
+    // `Unaffiliated` und damit bitgleich der alte Pfad; `None` (kein geloester Kern, reiner
+    // `VORGABE`-Lauf) bleibt es ebenfalls.
+    let knoten = match pol.node {
+        caprock_hal::numa::Node::At(_) => pol.node,
+        caprock_hal::numa::Node::Unaffiliated => match pol.core {
+            Some(c) => crate::numa::node_of_core(c),
+            None => caprock_hal::numa::Node::Unaffiliated,
+        },
+    };
     // Der Streifen zuerst: schlaegt er fehl, ist noch nichts alloziert, was zurueckmuesste.
     // Beim EINTRITT loeschen -- sonst stuende beim naechsten Fehlschlag der Grund des vorigen da,
     // und ein veralteter Grund ist schlimmer als keiner (er macht den Punkt unbehebbar).
@@ -5746,12 +6820,14 @@ pub fn load_into_pd_mit(
     // meldet den EL0-Kernel-Stack MIT der angeforderten Menge, `create_vspace_masked`
     // unterscheidet den ASID-Platz vom Seitentabellen-Speicher. Eine zweite, groebere Meldung
     // hier wuerde die feinere ueberschreiben -- und ein groeberer Grund ist keine Sicherheit,
-    // sondern eine falsche Faehrte.
-    let Some(kbase) = claim_user_kstack_masked(mask) else {
+    // sondern eine falsche Faehrte. Beide laufen mit dem wirksamen Knoten (s. oben): der
+    // Manifest-Knoten reist bis zu den gefaerbten Allokationen, mit benanntem Rueckfall statt
+    // Fehler.
+    let Some(kbase) = claim_user_kstack_masked(mask, knoten) else {
         streifen_zurueck(stripe);
         return None;
     };
-    let Some((asid, l1)) = create_vspace_masked(mask) else {
+    let Some((asid, l1)) = create_vspace_masked(mask, knoten) else {
         release_user_kstack(kbase);
         streifen_zurueck(stripe);
         return None;
@@ -5776,7 +6852,7 @@ pub fn load_into_pd_mit(
                    kbase: usize,
                    segs: &[(u64, u64)],
                    stack: Option<(u64, u64)>|
-     -> Option<ThreadId> {
+     -> Option<(ThreadId, usize)> {
         {
             let mut mem = MEM.lock();
             for &(b, l) in segs {
@@ -5828,7 +6904,24 @@ pub fn load_into_pd_mit(
         mangel(MANGEL_SEGMENT_SPEICHER, 0);
         return cleanup(asid, kbase, &[], None);
     }
-    let mut seglist = [(0u64, 0u64); MAX_IMG_SEGS];
+    let mut seglist: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    // Parallel zu `seglist`: die VA und der Perm-Code je Stueck — beim Mappen gesammelt
+    // (s. `load_into_pd_mit_va`-Doku), an `loaded_register` und `va_out` gegeben.
+    // Heap statt Stack (s. `dispatch_fork`-Doku): der Ladepfad laeuft ueber EXEC auch auf
+    // 4-KiB-Aufrufer-Stacks, 1,6 KiB Listen gehoeren dort nicht hin. OOM = benannte
+    // Absage ueber den bestehenden `cleanup`-Pfad, nie Panic.
+    let mut vvas: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    let mut pperm: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    if seglist.try_reserve_exact(MAX_IMG_SEGS).is_err()
+        || vvas.try_reserve_exact(MAX_IMG_SEGS).is_err()
+        || pperm.try_reserve_exact(MAX_IMG_SEGS).is_err()
+    {
+        mangel(MANGEL_SEGMENT_SPEICHER, 0);
+        return cleanup(asid, kbase, &[], None);
+    }
+    seglist.resize(MAX_IMG_SEGS, (0, 0));
+    vvas.resize(MAX_IMG_SEGS, 0);
+    pperm.resize(MAX_IMG_SEGS, 0);
     let mut nrec = 0usize;
     for seg in img.segments() {
         let total = (((seg.memsz as u64) + 4095) & !4095).max(4096) as usize;
@@ -5843,13 +6936,18 @@ pub fn load_into_pd_mit(
         let mut done = 0usize;
         while done < total {
             let n = sz.min(total - done);
-            let Some(region) = mem_alloc_masked_anywhere(n as u64, 4096, mask) else {
+            let Some(region) = mem_alloc_masked_anywhere_auf(n as u64, 4096, mask, knoten)
+            else {
                 mangel(MANGEL_SEGMENT_SPEICHER, n as u64);
                 return cleanup(asid, kbase, &seglist[..nrec], None);
             };
             let pa = region.base(); // MemoryCap-Drop = nur Deskriptor (kein Free); RAM bleibt belegt
             // VOR dem Mappen registrieren -> ein späterer Map-Fehler gibt diesen Frame mit frei.
+            // Daneben SOFORT die VA und den Perm: spaeter ist die Zuordnung (welches Stueck lag
+            // an welcher VA) nicht mehr herstellbar — kein inverser Index, kein Raten.
             seglist[nrec] = (pa, n as u64);
+            vvas[nrec] = seg.vaddr + done as u64;
+            pperm[nrec] = perm_code(perm);
             nrec += 1;
             copy_segment_at(pa, img.segment_bytes(&seg), done, n);
             let mut off = 0u64;
@@ -5858,7 +6956,7 @@ pub fn load_into_pd_mit(
                 // warum das Abbilden scheiterte. Zwei Nachrechnungen derselben Groesse waeren die
                 // `iova_window_clear_of_msi`-Falle: Zuteiler und Pruefer brauchen EINE Quelle.
                 let mut a3 = || {
-                    let r = pt_rahmen(mem_alloc_masked_anywhere(4096, 4096, mask));
+                    let r = pt_rahmen(mem_alloc_masked_anywhere_auf(4096, 4096, mask, knoten));
                     if r.is_none() {
                         mangel(MANGEL_SEITENTABELLE, 4096);
                     }
@@ -5905,7 +7003,7 @@ pub fn load_into_pd_mit(
     let mut sdone = 0usize;
     while sdone < LOADED_STACK_BYTES as usize {
         let n = stack_sz.min(LOADED_STACK_BYTES as usize - sdone);
-        let Some(region) = mem_alloc_masked_anywhere(n as u64, 4096, mask) else {
+        let Some(region) = mem_alloc_masked_anywhere_auf(n as u64, 4096, mask, knoten) else {
             mangel(MANGEL_STACK_SPEICHER, n as u64);
             return cleanup(asid, kbase, &seglist[..nrec], stack_reap);
         };
@@ -5914,13 +7012,17 @@ pub fn load_into_pd_mit(
             // Ein Stueck, und es gehoert dem Thread (Reap).
             stack_reap = Some((pa, n as u64));
         } else {
+            // Wie die Segmente oben: Phys, VA und Perm SOFORT nebeneinander — der Stack einer
+            // gefaerbt geladenen PD gehoert der PD (Teardown), nicht dem Thread (Reap).
             seglist[nrec] = (pa, n as u64);
+            vvas[nrec] = LOADED_STACK_VA + sdone as u64;
+            pperm[nrec] = PERM_RW;
             nrec += 1;
         }
         let mut off = 0u64;
         while (off as usize) < n {
             let mut a3 = || {
-                let r = pt_rahmen(mem_alloc_masked_anywhere(4096, 4096, mask));
+                let r = pt_rahmen(mem_alloc_masked_anywhere_auf(4096, 4096, mask, knoten));
                 if r.is_none() {
                     mangel(MANGEL_SEITENTABELLE, 4096);
                 }
@@ -6027,7 +7129,14 @@ pub fn load_into_pd_mit(
             None => *PDCOLOR_UNGEFAERBT.lock() = asid,
         }
     }
-    if !loaded_register(asid, &seglist[..nrec]) {
+    if !loaded_register(
+        asid,
+        img.entry() as usize,
+        boot_arg,
+        &seglist[..nrec],
+        &vvas[..nrec],
+        &pperm[..nrec],
+    ) {
         hal::cpu::local_irq_restore(daif);
         return cleanup(asid, kbase, &seglist[..nrec], stack_reap);
     }
@@ -6057,7 +7166,16 @@ pub fn load_into_pd_mit(
         return None;
     }
     hal::cpu::local_irq_restore(daif);
-    Some(tid)
+    // Die VA-Liste an den Aufrufer — was nicht hineinpasst, wird gezaehlt statt geschnitten:
+    // die Rueckgabe nennt die GESAMTE Stueckzahl, geschrieben wurde das Minimum. Ein Aufrufer,
+    // der weniger bekam als es gibt, sieht es an der Differenz (kein stiller Schnitt).
+    if let Some(out) = va_out {
+        let n = nrec.min(out.len());
+        for i in 0..n {
+            out[i] = (vvas[i], seglist[i].1);
+        }
+    }
+    Some((tid, nrec))
 }
 
 /// Wie [`load_into_pd`], aber **erzeugt** eine frische PD in `domain` (UserLand). Der bequeme Pfad
@@ -13195,6 +14313,64 @@ pub fn sched_audit_all() -> u32 {
         }
     }
     0
+}
+
+/// **NOHZ-Schnappschuss eines Kerns** (B-5.2/Z5): `(rivalen, weckruf, hat_schranke)` aus
+/// EINEM Lock statt drei Anlaeufen (s. `Scheduler::nohz_stand` -- eine Frist zwischen zwei
+/// Anlaeufen fiele durch jedes Gatter). Nur kalter Pfad (Idle-Eintritt + Tick-Nachfrage).
+pub fn nohz_stand(core: usize) -> (usize, Option<u64>, bool) {
+    SCHEDS[core].lock().nohz_stand()
+}
+
+/// **NOHZ-Idle-Eintritt** (B-5.2/Z5): schlafen statt ticken, wenn nichts zu verdraengen ist.
+///
+/// Der einzige Ort ausser dem Tick, an dem der Timer je entwaffnet wird: der laufende Thread
+/// ist der Idle-Thread, die Ready-Queues sind leer, und der naechste Weckruf ist benannt
+/// (Frist oder Budget-Refill) oder es gibt keinen. Die wartende Demo-Schleife lebt VOM Tick
+/// (Worker-Preemption) und darf hier nie landen.
+///
+/// ## Der Vertrag (drei Zeilen, alle drei noetig)
+///
+/// 1. Schnappschuss aus **einem** [`Scheduler::nohz_stand`](caprock_sched::Scheduler::nohz_stand)
+///    unter **maskierten** IRQs (`local_irq_save`). Das schliesst das klassische NOHZ-Rennen:
+///    Weckruf NACH dem Schnappschuss, aber VOR dem Armieren bewaffnet -- ohne Maskierung
+///    schliefe der Kern ueber ihn hinweg bis zum naechsten fremden IRQ.
+/// 2. Entscheidung in `caprock_sched::nohz_plan` (host-geprueft): `Periodic` aendert nichts,
+///    `OneShot` armiert einmalig (32-Bit-gedeckelt, `d <= 1` faellt auf Tick zurueck),
+///    `Disarmed` maskiert die LVT.
+/// 3. Nach dem Aufwachen steht der Timer **unbedingt** wieder periodisch da. Im Zweifel ein
+///    Tick zu viel statt Stille -- die sichere Richtung.
+///
+/// ## Fail-closed
+///
+/// Wer hier nicht durchkommt, tickt wie bisher. Mit Fristen/Zweit-Threads/Budgets liefert
+/// `nohz_plan` `Periodic`, und auch dann aendert sich gegenueber heute genau nichts (ein
+/// idempotentes Rearmieren plus `wfi`). Arch-neutral: beide Idle-Schleifen rufen hierher.
+pub fn nohz_idle(core: usize) {
+    let irq = hal::cpu::local_irq_save();
+    let (rivalen, weckruf, hat_schranke) = nohz_stand(core);
+    match caprock_sched::nohz_plan(rivalen, weckruf, hat_schranke) {
+        caprock_sched::Nohz::Periodic => {
+            hal::timer::rearm_periodic();
+            hal::cpu::wfi();
+        }
+        caprock_sched::Nohz::OneShot { ticks } => {
+            let d = ticks.min(hal::timer::oneshot_max_ticks());
+            if d <= 1 {
+                hal::timer::rearm_periodic();
+            } else {
+                hal::timer::arm_oneshot(d);
+            }
+            hal::cpu::wfi();
+            hal::timer::rearm_periodic();
+        }
+        caprock_sched::Nohz::Disarmed => {
+            hal::timer::disarm();
+            hal::cpu::wfi();
+            hal::timer::rearm_periodic();
+        }
+    }
+    hal::cpu::local_irq_restore(irq);
 }
 
 /// Einen blockierten Thread mit einem **Fehlercode** in `x0` (statt `OK`) entblocken —

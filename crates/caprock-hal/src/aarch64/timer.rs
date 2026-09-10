@@ -55,6 +55,78 @@ pub fn init(hz: u64) {
     set_ctl(CTL_ENABLE);
 }
 
+// --- NOHZ-Umprogrammierung (B-5.2/Z5) --------------------------------------------------------
+//
+// Der Generic Timer ist von Natur aus einmalig: `CNTP_TVAL_EL0` zaehlt herunter, feuert
+// genau einmal, und nur `on_irq` laedt ihn neu -- die Periodik ist Software, kein
+// Modus. Ein One-Shot ist also kein zweiter Mechanismus, sondern das Weglassen des
+// Nachladens: `arm_oneshot` schreibt einen anderen Wert, `disarm` schaltet ganz ab.
+// (Gegenstueck x86: dort ist einmalig ein eigener LVT-Modus ohne `LVT_PERIODIC`.)
+//
+// Alle drei Funktionen sind reine Registerprogrammierungen ohne Fehlerausgang --
+// Fail-closed liegt beim Aufrufer (Idle-/Tick-Pfad): Wer nicht umprogrammiert, tickt
+// wie bisher.
+
+/// Zaehler pro Tick bei der periodischen Rate (`TVAL`-Einheiten je Tick).
+fn counts_pro_tick() -> u64 {
+    INTERVAL.load(Ordering::Relaxed).max(1)
+}
+
+/// Groesstes als One-Shot armierbares Delta in Ticks (`TVAL` ist 32-bittig).
+pub fn oneshot_max_ticks() -> u64 {
+    (u32::MAX as u64 / counts_pro_tick()).max(1)
+}
+
+/// Timer ganz entwaffnen (`CNTP_CTL_EL0.ENABLE = 0`).
+///
+/// Geweckt wird der Kern danach durch alles, was kein Tick ist -- IPI, Geraete-IRQ.
+/// Nur zu rufen, wenn die NOHZ-Entscheidung `Disarmed` lautet; alles andere waere ein
+/// Kern, der schlaeft, waehrend Arbeit anliegt.
+pub fn disarm() {
+    set_ctl(0);
+}
+
+/// Genau einmal in `delta_ticks` Ticks feuern, danach Stille.
+///
+/// `0` wird auf `1` aufgerundet (sofort statt nie -- ein One-Shot, der nie feuert, ist
+/// ein verlorener Weckruf); groessere Werte werden auf [`oneshot_max_ticks`] gedeckelt
+/// (ein Ueberlauf wuerde frueh feuern -- die gefaehrliche Richtung, weil der Weckruf
+/// danach verbraucht waere). Der Aufrufer gibt nur Werte `>= 2` herein (s. `nohz_plan`
+/// in `caprock-sched`); die Aufrundung ist das Netz, nicht der Weg.
+///
+/// Schichtetiefe, festgehalten statt vorausgesetzt: Feuert der One-Shot, laeuft
+/// [`on_irq`] und laedt `INTERVAL` nach -- der Timer steht danach von selbst wieder
+/// periodisch da, auch wenn der Kernel das Rearmieren vergisst. Das ist die sichere
+/// Richtung (ein Tick zu viel statt Stille), aber NICHT die volle NOHZ-Semantik: Wer
+/// nach dem Weckruf weiter schweigen will, braucht die Tick-seitige Umprogrammierung
+/// in `system::reschedule` (s. Patch-Text im Arbeitsergebnis).
+pub fn arm_oneshot(delta_ticks: u64) {
+    let counts = delta_ticks
+        .max(1)
+        .saturating_mul(counts_pro_tick())
+        .min(u32::MAX as u64)
+        .max(1);
+    set_tval(counts);
+    set_ctl(CTL_ENABLE);
+}
+
+/// Zurueck zur periodischen Rate aus dem letzten [`init`]. Nach jedem Aufwachen aus einem
+/// One-Shot/Disarmed zu rufen -- unbedingt, nicht bedingt: Im Zweifel tickt der Kern
+/// einmal zu viel statt einmal zu wenig (die sichere Richtung).
+///
+/// Achtung: Wer aus einem One-Shot aufwacht, steht NICHT automatisch wieder periodisch
+/// da -- `on_irq` laedt das alte `INTERVAL` nach, das hier aber gerade ueberschrieben
+/// wurde. Deshalb stellt diese Funktion das Intervall aus `INTERVAL` wieder her, statt
+/// sich auf das Nachladen zu verlassen.
+pub fn rearm_periodic() {
+    let interval = INTERVAL.load(Ordering::Relaxed);
+    if interval == 0 {
+        return; // nie armiert -- nichts wiederherzustellen, nichts zu starten
+    }
+    set_tval(interval);
+    set_ctl(CTL_ENABLE);
+}
+
 /// Vom IRQ-Dispatch bei einem Timer-Interrupt aufgerufen: neu armieren + zählen.
 /// (Die eigentliche Reschedule-Entscheidung trifft der Hook in `exception`.)
 pub fn on_irq() {

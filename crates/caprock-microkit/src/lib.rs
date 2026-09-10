@@ -17,7 +17,7 @@
 //! Reine Orchestrierung — **kein eigenes `unsafe`**.
 
 use caprock_abi::{pdctl, reg, result, sys};
-use caprock_cap::{CapPtr, CapSpace, DmaCoherence, DmaDir, ObjectKind};
+use caprock_cap::{CapError, CapPtr, CapSpace, DmaCoherence, DmaDir, ObjectKind};
 use caprock_hal::cpu::array_index_nospec;
 use caprock_hal::exception::{frame_reg, frame_set_reg};
 use caprock_ipc::{Endpoint, Notification};
@@ -33,6 +33,17 @@ use caprock_sync::{RwSpinLock, SpinLock};
 mod cspace;
 pub use cspace::{CspaceAbweisung, STANDARD_PLAETZE};
 use cspace::{CspaceAnker, Vergabe};
+
+/// irq+NTFN je Vektor (Multi-Vektor-MSI-X): die reine Paar-Buchhaltung.
+///
+/// Abhaengigkeitsfrei (`core` nur) und per `rustc --test` als Datei pruefbar — die
+/// Entscheidung steht genau einmal dort, der Kernel (Patch-Text) ruft sie auf, statt sie
+/// nachzubauen (dieselbe Teilung wie `cspace.rs` und `proc.rs`).
+mod irqvec;
+pub use irqvec::{
+    paare_pruefen, plaetze_fuer_vektoren, CapRolle, SlotSicht, VektorAbweisung, VektorPaar,
+    VEKTOREN_JE_GERAET_MAX,
+};
 
 /// Prozessmodell: FORK/EXEC-Dispatchhelfer (Phase 1, volle Kopie, kein COW).
 ///
@@ -2102,6 +2113,26 @@ fn zustellen(
     next
 }
 
+/// **CSUB — einen Teilbereich einer Memory-Cap als eigene Cap ableiten** (Mem-Server-Transport).
+///
+/// `x1` = Quell-Slot (muss eine Memory-Cap halten) · `MSG0` = freier Ziel-Slot ·
+/// `MSG1` = Offset in Bytes · `MSG2` = Länge in Bytes. Die Ableitung trägt die verengte
+/// Region, Rechte aus dem Schnitt mit der Quelle, das Badge der Quelle und hängt als Kind
+/// im CDT (`revoke` an der Quelle zieht das Teil ein).
+///
+/// **Vier Worte und keine Rechte-Maske**: `SYS_MAP`/`SYS_SPAWN` brauchen neben Slots nur
+/// Offset+Länge, und eine Maske wäre der fünfte Parameter. Wer weniger Rechte will, leitet
+/// per `CCOPY` mit Maske ab und schneidet daraus — die Schnitt-Eigenschaft trägt das
+/// Primitiv (`CapSpace::subregion`), nicht dieser Zweig.
+///
+/// Ausgänge: `OK` · `ERR_BADCAP` (kein Cap / keine Memory-Cap) · `ERR_NOSPACE` (Ziel belegt
+/// oder ausserhalb, Budget, Tabelle) · `ERR_SUBREGION` (Fenster ausserhalb der Cap, Nr. 21 —
+/// existiert seit K1b für die Stapelprüfung) · `ERR_RIGHTS` (Domänen-Policy, wie `CCOPY`).
+///
+/// **Nummer 37 — Original, kein Spiegel mehr.** `caprock_abi::sys::CSUB`, erste freie Nummer
+/// nach FORK/EXEC + Debugger-v2 + LOAD_IMAGE (`4` bleibt historische Luecke).
+pub const CSUB: u64 = caprock_abi::sys::CSUB;
+
 /// Der Dispatch **ohne** Umleitung — der Rumpf, den es vor Z26/A3 gab.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_nativ(
@@ -2360,9 +2391,10 @@ fn dispatch_nativ(
         };
     }
 
-    // `CCOPY`/`CMOVE`/`SETRECV` (A-3.2) — wie `CDELETE` vor der generischen Auflösung: sie
-    // arbeiten auf **Slots** des eigenen Cspace, nicht auf einem Objekt hinter einer Cap.
-    if nr == sys::CCOPY || nr == sys::CMOVE || nr == sys::SETRECV {
+    // `CCOPY`/`CMOVE`/`SETRECV`/`CSUB` (A-3.2 + Mem-Server-Transport) — wie `CDELETE` vor der
+    // generischen Auflösung: sie arbeiten auf **Slots** des eigenen Cspace, nicht auf einem
+    // Objekt hinter einer Cap.
+    if nr == sys::CCOPY || nr == sys::CMOVE || nr == sys::SETRECV || nr == CSUB {
         let thread = ops.current_id(core);
         let src_slot = frame_reg(frame, reg::EP_BADGE) as usize;
         let dst_slot = frame_reg(frame, reg::MSG0) as usize;
@@ -2406,7 +2438,53 @@ fn dispatch_nativ(
                         result::OK
                     }
                 }
+                CSUB => {
+                    // **Teilbereichs-Ableitung** (Mem-Server-Transport): `x1` = Quell-Slot,
+                    // `MSG0` = Ziel-Slot, `MSG1` = Offset, `MSG2` = Länge. Slots wie `CCOPY`
+                    // (Ziel frei + im Lauf + Budget), die Quelle muss eine Memory-Cap sein.
+                    let offset = frame_reg(frame, reg::MSG0 + 1);
+                    let len = frame_reg(frame, reg::MSG0 + 2);
+                    let Some(src) = g.pds.cap_at(pd, src_slot) else {
+                        return deny(result::ERR_BADCAP);
+                    };
+                    // **Die Quell-Cap muss Memory sein — geprüft VOR jeder Ableitung.** Eine
+                    // Teil-MMIO- oder Teil-IRQ-Cap gäbe es nicht (Gerätefenster sind unteilbar),
+                    // und sie hier zuzulassen hiesse, Geräte-Autorität zuzuschneiden, die der
+                    // Kernel ungeschnitten vergeben hat.
+                    let ist_memory = matches!(
+                        g.cspace.lookup(src),
+                        Some((ObjectKind::Memory(_), _, _))
+                    );
+                    if !ist_memory {
+                        return deny(result::ERR_BADCAP);
+                    }
+                    if dst_slot >= g.pds.cspace_len_von(pd) || g.pds.cap_at(pd, dst_slot).is_some() {
+                        result::ERR_NOSPACE
+                    } else if !g.budget_allows(pd, dst_slot) {
+                        result::ERR_NOSPACE
+                    } else {
+                        // **Keine Rechte-Maske** (vier Worte, s. `CSUB`-Doku): der Schnitt mit der
+                        // Quelle ist die Identität — die Schnitt-Eigenschaft trägt das Primitiv
+                        // (`CapSpace::subregion`), nicht dieser Zweig.
+                        match g.cspace.subregion(src, offset, len, Rights::RWX) {
+                            Ok(new) => {
+                                if g.install_cap_checked(pd, dst_slot, new) {
+                                    result::OK
+                                } else {
+                                    orphan = Some(new);
+                                    result::ERR_RIGHTS
+                                }
+                            }
+                            // **Jeder Cap-Fehler hat seinen ABI-Namen**: ausserhalb heisst
+                            // `ERR_SUBREGION` (Nr. 21), nicht „bad cap" und nicht „kein Platz".
+                            Err(CapError::Subregion) => result::ERR_SUBREGION,
+                            Err(CapError::Invalid) => result::ERR_BADCAP,
+                            Err(_) => result::ERR_NOSPACE,
+                        }
+                    }
+                }
                 _ => {
+                    debug_assert!(nr == sys::CCOPY);
                     let Some(src) = g.pds.cap_at(pd, src_slot) else {
                         return deny(result::ERR_BADCAP);
                     };
@@ -2649,6 +2727,14 @@ fn dispatch_nativ(
         // Beide Caps liegen im Cspace des **Aufrufers**, und beide werden gebraucht: die `Irq`-Cap
         // sagt *welcher Interrupt*, die Notification sagt *wohin*. Ohne die zweite koennte eine PD
         // den Interrupt ihres Geraets an ein fremdes Objekt zustellen lassen.
+        //
+        // **Multi-Vektor-MSI-X: ein Aufruf je Paar, kein neuer Syscall.** Ein Gerät mit `n`
+        // Vektoren hält `n` `Irq`-Caps (je Vektor ein `intid`) und `n` Notifications; der
+        // Treiber bindet Paar für Paar über genau diesen Zweig. Der ganze Satz wird VOR der
+        // ersten Bindung geprüft (`irqvec::paare_pruefen` — injizierte Sicht auf den
+        // **variablen** Cspace-Lauf, Rechte `READ`/`WRITE` wie hier); was darüber liegt,
+        // meldet `ERR_IRQ_FULL` gerätelokal. Kernel-Seite: Patch-Text (DriverAssign-
+        // Vektorisierung, fremder Strang).
         sys::BIND_IRQ => {
             let ObjectKind::Irq { intid } = kind else {
                 return deny(result::ERR_BADCAP);

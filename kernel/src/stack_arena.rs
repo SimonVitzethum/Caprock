@@ -14,7 +14,10 @@
 //!
 //! Eine **einmal aufgeteilte zusammenhaengende Arena** ueber Boot-RAM: alle Stacks liegen dicht an
 //! dicht, jeder Slot traegt seine Wache bei sich, und die Zahl aufgeteilter Bloecke folgt der
-//! Arenameenge statt der Streuung. Dichte-Ziel: **~12x** (256 je Block statt gemessener ~20).
+//! Arenameenge statt der Streuung. Dichte-Ziel auf x86: **~12x** (256 je Block statt
+//! gemessener ~20). Auf aarch64 ist der Schritt 20 KiB (102 je Block) — gegen dieselbe
+//! Streuung **~5x**, ehrlich kleiner; die Ableitung (`arena_plaetze`, `slots_je_block`,
+//! `volle_pd_kosten`) rechnet je Architektur statt einer Zahl zu glauben.
 //!
 //! # Was hier steht — und was ausdruecklich nicht
 //!

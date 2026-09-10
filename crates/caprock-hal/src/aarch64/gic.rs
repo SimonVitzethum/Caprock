@@ -1,5 +1,10 @@
 //! GICv2-Interrupt-Controller (QEMU `virt`: `arm,cortex-a15-gic`).
 //!
+//! Bewusst **nur GICv2, kein GICv3/ITS**: MSI läuft hier über die ITS-Doorbell als
+//! gewöhnliche übersetzte Adresse (s. `iommu::interrupt_message_window` = `None`),
+//! ein ITS-Treiber ist Non-Goal. Wer GICv3/ITS braucht, baut ein neues Modul —
+//! kein `cfg` in dieser Datei.
+//!
 //! GICD (Distributor) @ 0x0800_0000, GICC (CPU-Interface) @ 0x0801_0000.
 //! Diese Region ist als Device-Memory gemappt (MMU, ADR 0002), daher sind die
 //! volatilen MMIO-Zugriffe wohldefiniert. MMIO-Registerzugriff ist eine erlaubte

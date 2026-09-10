@@ -135,9 +135,9 @@ pub fn on_irq() {
     TICKS[core].fetch_add(1, Ordering::Relaxed);
 }
 
-/// Tick-Zähler eines Kerns.
+/// Tick-Zähler eines Kerns (`0` jenseits der Tabelle — wie `x86_64::timer::ticks`).
 pub fn ticks(core: usize) -> u64 {
-    TICKS[core].load(Ordering::Relaxed)
+    TICKS.get(core).map(|t| t.load(Ordering::Relaxed)).unwrap_or(0)
 }
 
 

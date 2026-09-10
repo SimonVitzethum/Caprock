@@ -102,8 +102,12 @@ pub const IDLE_PRIO: u8 = 1;
 /// schon bezahlt (`MASK_BITS`, das auf x86 zufaellig richtig war und auf aarch64 falsch).
 #[cfg(target_arch = "x86_64")]
 pub(crate) const USER_KSTACK_SIZE: usize = 0x1000;
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
 pub(crate) const USER_KSTACK_SIZE: usize = 0x4000;
+// Kein stiller Fallback fuer eine dritte Architektur: wer sie anfaehrt, bekommt einen
+// Baufehler statt einer geratenen Stackgroesse (dieselbe Haltung wie D11 zur Laufzeit).
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("USER_KSTACK_SIZE ist nur fuer x86_64/aarch64 belegt -- Dichte-Zahlen ableiten, nicht raten");
 
 /// Besitzer-Abbildung der **dynamisch aus `MEM` allozierten** EL0-Kernel-Stacks: `base_of[slot]`
 /// = physische Basis des Kstacks des Threads `slot` (0 = keiner). Kstacks kommen NICHT mehr aus
@@ -324,8 +328,8 @@ fn kstack_arena_bestuecken(faeden: usize) -> u64 {
 /// steht (`ist_wache` -- wiederverwendete Slots behalten ihre), sonst legen; schlaegt das
 /// Legen fehl (Blockvorrat erschoepft), wird genau dieser Slot gesperrt und der naechste
 /// freie versucht (Retry-Schleife, begrenzt durch die Platzahl -- kein endloses Kreisen).
-/// aarch64 kennt keine echten Wachen (`guard_unterstuetzt() == false`): dort zaehlt das
-/// Legen nur, und jeder Slot gilt sofort.
+/// aarch64 kennt keine echten Wachen (`guard_unterstuetzt() == false`): dort zaehlt die
+/// Vergabe wie im Streupfad (`unbewachte_stacks`), und jeder Slot gilt sofort.
 fn kstack_arena_vergeben() -> Option<usize> {
     let mut arena_guard = KSTACK_ARENA.lock();
     let arena = arena_guard.as_mut()?;
@@ -335,6 +339,12 @@ fn kstack_arena_vergeben() -> Option<usize> {
             continue;
         };
         if !hal::mmu::guard_unterstuetzt() {
+            // Kein Fail-closed ohne Wachen (wie im Streupfad) -- aber auch kein Schweigen:
+            // `guard_unmap` zaehlt dort nur (`unbewachte_stacks`), und ohne diesen Aufruf
+            // waere jeder Arena-Slot ein unbewachter Stack, den keine Zahl nennt.
+            if let Some(wache) = arena.wache_von_slot(slot) {
+                let _ = hal::mmu::guard_unmap(wache as u64);
+            }
             return Some(base);
         }
         let Some(wache) = arena.wache_von_slot(slot) else {
@@ -377,7 +387,8 @@ pub fn kstack_arena_stats() -> (usize, usize, usize, usize, u64, u64, usize) {
     }
 }
 
-/// Einen EL0-Kernel-Stack (16 KiB, ausgerichtet) aus `MEM` allozieren. Gibt die **physische Basis**
+/// Einen EL0-Kernel-Stack (`USER_KSTACK_SIZE` -- 4 KiB auf x86, 16 KiB auf aarch64 --
+/// plus Wache) aus `MEM` allozieren. Gibt die **physische Basis**
 /// zurück (identity-gemappt = EL1-SP-Region), oder `None` bei RAM-Erschöpfung.
 /// **Was fuer EINEN EL0-Kernel-Stack wirklich angefordert wird**: der Stack plus seine Wache.
 ///
@@ -396,7 +407,8 @@ fn claim_user_kstack() -> Option<usize> {
 /// Der Kernel-Stack einer PD wird zwar vom Kernel benutzt, aber **im Namen dieses Subjekts** —
 /// seine Cache-Zeilen tragen also dessen Zugriffsmuster. Ihn ungefärbt zu lassen hieße, die
 /// Trennung an genau der Stelle aufzugeben, an der der Kernel für das Subjekt arbeitet.
-/// 16 KiB sind vier Seiten und passen damit in jeden Streifen (kleinster Streifen: 16 Seiten).
+/// Der Stack (4 KiB = 1 Seite auf x86, 16 KiB = 4 Seiten auf aarch64) passt damit in jeden
+/// Streifen (kleinster Streifen: 16 Seiten).
 ///
 /// **Die Regel, nach der Knoten und Farbe nachgeben (Z8/N3):** ein Knotenwunsch ist eine
 /// Platzierung, keine Zusicherung — was ihn nicht erfuellt, faellt BENANNT zurueck
@@ -490,7 +502,8 @@ fn claim_user_kstack_masked(
     // C4: Wasserstandsmarke. **Hier und nicht spaeter** — `init_thread_frame` legt gleich den
     // Startframe an den Stack-Top; wer danach fuellt, ueberschreibt ihn, und der Thread spraenge
     // nach `MUSTER`.
-    // SAFETY: frisch allozierte, exklusiv gehaltene, 16-KiB-ausgerichtete Region; identity-gemappt.
+    // SAFETY: frisch allozierte, exklusiv gehaltene, auf `USER_KSTACK_SIZE`
+    // ausgerichtete Region; identity-gemappt.
     unsafe { crate::kstackmark::fuellen(crate::kstackmark::KL_EL0, base as usize, sz as usize) };
     KSTACKS.lock().live += 1;
     Some(base as usize)

@@ -104,6 +104,31 @@ const IRQ_BADGE: u64 = 0x1;
 /// Liste von Konjunkten.
 const B4_WARTEN: bool = false;
 
+/// **Misst dieser Treiber den Warteweg, statt ihn zu fahren?** (B4b-Messstand)
+///
+/// `false` in der Vorgabe, und das ist Absicht: mit `true` programmiert der Treiber die
+/// Queue auf MSI-X-Zeile 0 und wartet **befristet** (`wait_frist`, Frist des MESSENDEN, nicht
+/// der ABI). Kommt kein Interrupt, bricht die Anfrage mit `ST_DEVICE` ab statt zu haengen --
+/// die Suite bleibt am Leben, und die Kernel-Berichtszeile traegt trotzdem die ganze Kette:
+/// `queue0-msix-vektor`, MSI-X-Zeile, `used.idx`, `msix-ok=1` gegen `weckrufe=0`.
+///
+/// Ohne diesen Schalter programming NICHTS die Queue (mit `B4_WARTEN=false` ist `irq=None`
+/// und `queue_msix` wird nie gerufen): die Queue steht auf `0xffff` (KEINE), und ein
+/// ausbleibender Interrupt belegt dann nichts -- das Geraet ist spec-konform stumm.
+/// Genau deshalb braucht der B4b-Messstand diesen Modus: die drei Umgebungslaufe
+/// (TCG / ohne intremap / eim=on) sprächen sonst alle über eine nie programmierte Queue.
+///
+/// **Kein Produktivpfad:** bei Fristablauf wird NICHT gepollt (kein dynamischer Rueckfall,
+/// Plan §4) und `B4_WARTEN` bleibt `false` -- `OFF_B4_AKTIV` meldet weiterhin den
+/// Produktweg, die B4-Konjukte bleiben vakant, und nur die Rohzeilen tragen die Messung.
+/// Wer misst, faehrt damit bewusst rote `drv`/`blkdev`-Zeilen: ein Messmodus misst,
+/// er dient nicht.
+const B4_MESSEN: bool = false;
+/// Frist des Messenden in Timer-Ticks (100 Hz): 200 = 2 s. Grosszuegig gegenueber einem
+/// emulierten Geraet, das unter TCG antwortet, bevor der Treiber ueberhaupt wartet; kurz
+/// genug, dass ein Lauf mit sechs Anfragen keine Minute verliert.
+const B4_MESS_FRIST_TICKS: u64 = 200;
+
 /// Offsets der B4-Zahlen in der DMA-Region — der Kernel liest sie dort.
 ///
 /// In der Region und nicht in Programmvariablen, aus demselben Grund wie [`OFF_SERVED`]: sie
@@ -164,6 +189,21 @@ fn warte_auf_irq() -> bool {
     true
 }
 
+/// **Der befristete Warteweg des Messstandes** -- s. [`B4_MESSEN`].
+///
+/// Programmiert wird die Queue wie im Produktweg (Zeile 0, vom Kernel geschrieben); gewartet
+/// wird dagegen mit Frist: `wait_frist` kehrt mit `ERR_TIMEOUT` zurueck, und `wait_used`
+/// bricht dann ab, statt zu pollen. `false` heisst hier „nichts kam", nicht „das Geraet ist
+/// tot" -- `used.idx` hat der Kernel ohnehin unabhaengig im Blick.
+fn warte_auf_irq_befristet() -> bool {
+    let (rc, b) = libcaprock::wait_frist(IRQ_NTFN, B4_MESS_FRIST_TICKS);
+    if rc != result::OK {
+        return false;
+    }
+    WECKRUFE.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    LETZTES_BADGE.store(b, core::sync::atomic::Ordering::Release);
+    true
+}
 /// Das zuletzt in [`warte_auf_irq`] gesehene Badge. `static`, weil ein Funktionszeiger nichts
 /// einfangen kann -- und ein Funktionszeiger ist der Preis dafuer, dass die Crate keine
 /// Abhaengigkeit bekommt.
@@ -518,15 +558,23 @@ fn run(_arg: usize) -> ! {
     //     Scheitert die Bindung, bleibt `irq` `None` und der Treiber pollt weiter. Das ist die
     //     zulaessige Lage „dieses Geraet unterbricht nicht" -- und sie ist von aussen an
     //     `angeboten-dann-da` und `msix-ok` zu unterscheiden, nicht an einer stillen Naht hier.
-    //     **Gebunden wird immer, gewartet nur mit [`B4_WARTEN`]** -- die Bindung ist B3 und
-    //     traegt; der Warteweg ist B4 und haengt an einem offenen Befund.
+    //     **Gebunden wird immer, gewartet nur mit [`B4_WARTEN`] oder [`B4_MESSEN`]**
+    //     -- die Bindung ist B3 und traegt; der Warteweg ist B4 und haengt an einem offenen
+    //     Befund, der Messweg ist dessen befristetes Instrument.
     let gebunden = libcaprock::bind_irq(IRQ, IRQ_NTFN, IRQ_BADGE) == result::OK;
-    let irq = if B4_WARTEN && gebunden {
+    // Produktweg (`B4_WARTEN`, unbefristet) vor Messweg (`B4_MESSEN`, befristet): beide
+    // programmieren die Queue auf Zeile 0, nur die Wartefunktion unterscheidet sich.
+    let warte: fn() -> bool = if B4_WARTEN {
+        warte_auf_irq
+    } else {
+        warte_auf_irq_befristet
+    };
+    let irq = if (B4_WARTEN || B4_MESSEN) && gebunden {
         Some(caprock_virtio::IrqWarten {
             // **Zeile 0**, und sie hat der KERNEL geschrieben (E11). Der Treiber waehlt hier nur,
             // welche Queue sie bedient -- die Adresse und das Datenwort darin hat er nie gesehen.
             msix_zeile: 0,
-            warte: warte_auf_irq,
+            warte,
         })
     } else {
         None

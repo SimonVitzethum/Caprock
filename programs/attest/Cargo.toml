@@ -1,0 +1,18 @@
+[package]
+name = "attest"
+version = "0.0.0"
+edition = "2021"
+description = "Attestierungs-PD-Skelett fuer Z7: Messkette lesen, Bericht + Nonce mit PD-eigenem Key signieren, Kette/Replay pruefen (standalone, kein Workspace-Mitglied)"
+license = "AGPL-3.0-or-later"
+# Dieselbe Lizenz wie `lxpd-runtime` (das Muster dieser Crate): Z7-Arbeit im selben
+# Vertrauensbereich, keine neue Lizenzfrage.
+
+# Standalone: diese leere Sektion loest die Crate vom Caprock-Workspace
+# (weder die Wurzel noch programs/ duerfen sie als Mitglied fuehren). Nachweis ueber
+# `rustc --test --edition 2021 -O programs/attest/src/lib.rs` — die Crate ist
+# abhaengigkeitsfrei, also braucht es kein Wegwerf-Cargo-Projekt (derselbe Weg, den
+# tools/host-tests.sh (`einzeln`) fuer abhaengigkeitsfreie Crates nimmt).
+[workspace]
+
+[lib]
+path = "src/lib.rs"

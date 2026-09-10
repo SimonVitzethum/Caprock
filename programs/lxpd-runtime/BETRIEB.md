@@ -163,27 +163,38 @@ falsches Versprechen — die Grenz-Crates (`caprock-part` u. a.) bleiben davon u
 ## 6. Nachweis
 
 Isolierter `cargo test` in einer `/tmp`-Kopie, Manifest-Umschreibung wie
-`tools/host-tests.sh` (`mit_deps`): Crate-Quellen + `caprock-part` + `caprock-lxpd` +
-`caprock-loader` (Dependenz von `caprock-lxpd`) + `libcaprock` (Produktions-Anstoss
-`KernelAnstoss` → `load_image`) werden kopiert (kein Pfad zurück in den Workspace — sonst
-zöge `.cargo/config.toml` das Custom-Target wieder herein), 24 Tests:
+`tools/host-tests.sh` (`mit_deps`): Crate-Quellen (einschliesslich `src/bin/lxpdrv.rs`) +
+`caprock-part` + `caprock-lxpd` + `caprock-loader` (Dependenz von `caprock-lxpd`) +
+`libcaprock` (Produktions-Anstoss `KernelAnstoss` → `load_image`) werden kopiert (kein Pfad
+zurück in den Workspace — sonst zöge `.cargo/config.toml` das Custom-Target wieder herein),
+25 Tests:
 
 ```sh
-rm -rf /tmp/lxpd-rt && mkdir -p /tmp/lxpd-rt/{rt/src,part/src,lxpd/src,loader/src,sdk/src}
+rm -rf /tmp/lxpd-rt && mkdir -p /tmp/lxpd-rt/{rt/src,rt/src/bin,part/src,lxpd/src,loader/src,sdk/src}
 cp programs/lxpd-runtime/src/* /tmp/lxpd-rt/rt/src/          # lib.rs, protokoll.rs, patch.txt
+cp programs/lxpd-runtime/src/bin/* /tmp/lxpd-rt/rt/src/bin/  # lxpdrv.rs (Gast-PD)
 cp crates/caprock-part/src/lib.rs /tmp/lxpd-rt/part/src/
 cp crates/caprock-lxpd/src/*.rs /tmp/lxpd-rt/lxpd/src/
 cp crates/caprock-loader/src/*.rs /tmp/lxpd-rt/loader/src/
 cp programs/libcaprock/src/lib.rs /tmp/lxpd-rt/sdk/src/
 # Manifeste neu schreiben (Namen + Pfad-Dependenzen, je mit leerem [workspace]):
-# rt → part + lxpd + sdk; lxpd → loader; part/loader/sdk ohne Dependenzen. Dann:
-cd /tmp/lxpd-rt/rt && cargo test --release
+# rt → part + lxpd + sdk (plus `[[bin]] lxpdrv`); lxpd → loader; part/loader/sdk ohne
+# Dependenzen. Dann AUS dem /tmp-Verzeichnis (sonst zöge die Repo-`.cargo/config.toml` das
+# Custom-Target herein):
+cd /tmp/lxpd-rt/rt && cargo test --release --lib
 ```
 
-Erwartung: alle 24 Tests grün — 18 Dienst-Tests in `lib.rs` (sechzehn alte Gatter-/Prüf-Pfade
+`--lib` mit Absicht: Die Gast-PD (`[[bin]] lxpdrv`, `#![no_main]`) baut für den Host, aber der
+Test-Harness brächte ein zweites `_start` (Linker-Fehler, kein Test-Fehler — dieselbe Form wie
+bei jeder anderen PD). Geprüft wird die Bin über den PD-Bau
+(`cd programs && cargo build --release --target x86_64-caprock-user.json --manifest-path
+lxpd-runtime/Cargo.toml`, s. `tools/lxpd-e2e.sh`), nicht über den Harness.
+
+Erwartung: alle 25 Tests grün — 19 Dienst-Tests in `lib.rs` (sechzehn alte Gatter-/Prüf-Pfade
 plus neu: `vertrag_load_image_36_und_tag_belegung` pinnt Nummer und TAG-Belegung gegen den
 `libcaprock`-Spiegel und den `UMGESETZT`-Stand von `patch.txt`; `slot_kontext_laueft_bis_zum_
-anstoss_durch` belegt, dass der Manifest-Kontext unverändert bis zum Anstoss läuft) plus 6
+anstoss_durch` belegt, dass der Manifest-Kontext unverändert bis zum Anstoss läuft;
+`geprueftes_bild_erst_nach_pruefen` belegt die Vorlage für die `LOAD_IMAGE`-Übergabe) plus 6
 Protokoll-Tests in `protokoll.rs`. Daneben laufen die 5 `pack_tag`-Tests von `libcaprock`
 selbst (eigene `/tmp`-Kopie, `cargo test --release`: Rundweg, Slot-/High-Bits-/Len-0-Absage,
 ABI-Nummer). Die exakte Zählung steht im Ergebnisbericht, nicht hier (eine Zahl, die hier

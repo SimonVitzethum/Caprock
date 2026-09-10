@@ -1,3 +1,20 @@
+UMGESETZT am 2026-09-10 (LOADPATH-Strang + Integration).
+
+Der untenstehende Patch-Text ist historisch: dispatch_fork/dispatch_exec,
+forkexec_syscall, va_liste (load_into_pd_mit_va), EXEC-Rueckzug und NUMA-node
+sind seitdem in kernel/src/system.rs (+ neu kernel/src/forkexec.rs) gelandet;
+die Microkit-Arme rufen die Rueckrufe statt ERR_BADSYS.
+
+Bekannte Folge-Maengel (nicht verschwiegen):
+- FORK-Scratch (~6 KiB Arrays) stand auf dem Stack und wurde per Inlining in
+  syscall() hochgezogen (4-KiB-Kstack-#DF, RIP Syscall-Prolog). Behoben:
+  Heap-Vecs + #[inline(never)] auf dispatch_fork/dispatch_exec/forkexec_syscall.
+  Regel: kein Stack-Array ueber ~256 B auf heissen Pfaden (s. Funktionsdoku).
+- Die VA-Rueckabbildung phys->VA existiert weiter nicht; die Liste wird beim
+  Mappen gesammelt (va_liste), nie geraten.
+
+Original-Patch-Text folgt zu Archivzwecken:
+=====================================================================
 PATCH: FORK_SNAPSHOT (31) + EXEC_REPLACE (32) im Kernel verdrahten
 =====================================================================
 Stand: HEAD am 2026-09-09, Zweig arch/x86_64. ABI (31/32, ERR_STALE_TOKEN=26,

@@ -17,6 +17,15 @@ license = "AGPL-3.0-or-later"
 [lib]
 path = "src/lib.rs"
 
+# Gast-PD `lxpdrv`: Loader-Dienst im Gast (LXPD-End-to-End, s. tools/lxpd-e2e.sh). Baut mit
+# demselben Ziel + Linkerskript wie die uebrigen PDs (`cd programs && cargo build --release
+# --target x86_64-caprock-user.json --manifest-path lxpd-runtime/Cargo.toml`). Die Bin
+# nutzt nur `libcaprock` (Allowlist) + die eigene Lib — das Unsafe-Audit fuer das
+# TrustedSAS-Zertifikat (`sign_trusted.py`) sieht deshalb dieselbe saubere Menge.
+[[bin]]
+name = "lxpdrv"
+path = "src/bin/lxpdrv.rs"
+
 [dependencies]
 caprock-part = { path = "../../crates/caprock-part" }
 caprock-lxpd = { path = "../../crates/caprock-lxpd" }

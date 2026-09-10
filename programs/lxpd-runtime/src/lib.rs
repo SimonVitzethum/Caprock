@@ -891,6 +891,21 @@ impl LadeDienst {
         Ok(summe)
     }
 
+    /// Geprüfte Bildbytes für die `LOAD_IMAGE`-Übergabe.
+    ///
+    /// Erst nach [`LadeDienst::pruefen`] vorhanden (`Some` genau in [`Phase::Geprueft`]),
+    /// sonst `None` — die PD kopiert sie in ihre Memory-Cap (das Shared-Fenster des
+    /// Blockdienstes) und stößt dann an. Der Kernel liest die Bytes aus der Cap, nicht
+    /// aus der PD: Was hier zurückkommt, ist die Vorlage für die Übergabe, nicht die
+    /// Übergabe selbst. Nach [`LadeDienst::zuruecksetzen`] ist wieder zu.
+    pub fn geprueftes_bild(&self) -> Option<&[u8]> {
+        let s = self.summe?;
+        if self.phase != Phase::Geprueft {
+            return None;
+        }
+        self.bild.get(..s.bild_len)
+    }
+
     /// Schritt 4: der Lade-Anstoss — gegatet (Loader-Cap) und nur aus [`Phase::Geprueft`].
     /// `ctx` sind die Slots aus dem Manifest der PD (s. [`AnstossKontext`): Der Dienst erfindet
     /// keine Übergabe, er reicht sie nur durch. Gibt die neue PD-Id zurueck.
@@ -962,7 +977,7 @@ pub(crate) mod tests {
     }
 
     fn fnv64(bytes: &[u8]) -> u64 {
-        let mut h: u64 = 0xcbf29ce4842225c5;
+        let mut h: u64 = 0xcbf29ce484222325;
         for &b in bytes {
             h ^= u64::from(b);
             h = h.wrapping_mul(0x100000001b3);
@@ -1816,6 +1831,37 @@ pub(crate) mod tests {
         );
         assert_eq!(ant2[0], lade_kode(LadeFehler::Container(LxpdError::BadSignature)));
         assert_eq!(a2.aufrufe, 0);
+    }
+
+    #[test]
+    fn geprueftes_bild_erst_nach_pruefen() {
+        // Die Vorlage fuer die LOAD_IMAGE-Uebergabe: vor dem Pruefen gibt es nichts
+        // (None — keine Bytes, die der Kernel lesen koennte), danach exakt die geprueften
+        // Bytes (Laenge + SHA-256 stimmen mit der Pruefsumme ueberein), nach dem
+        // Zuruecksetzen wieder nichts. Wer ohne Pruefung anstieesse, lade Ungeprueftes.
+        use caprock_lxpd::driver::sha256;
+        let (eintrag, bild, manifest) = gutes_paar();
+        let (mut q, _) = platte_bauen(&eintrag, &bild, &manifest, &[]);
+        let (mut d, mut a) = dienst_mit_cap();
+        assert_eq!(d.geprueftes_bild(), None, "leer: keine Vorlage");
+        d.suchen(&mut q, 0).expect("Suche ok");
+        assert_eq!(d.geprueftes_bild(), None, "Verzeichnis: noch ungeprueft");
+        d.bild_lesen(&mut q).expect("Lesen ok");
+        assert_eq!(d.geprueftes_bild(), None, "Bild: noch ungeprueft");
+        let summe = d.pruefen(b"deadbeef", &PUBKEY).expect("pruefen ok");
+        let vorlage_len = {
+            let vorlage = d.geprueftes_bild().expect("geprueft: Vorlage da");
+            assert_eq!(vorlage.len(), summe.bild_len, "exakt die gepruefte Laenge");
+            assert_eq!(vorlage, bild.as_slice(), "exakt die geprueften Bytes");
+            assert_eq!(sha256(vorlage), summe.bild_hash, "Hash traegt die Vorlage");
+            vorlage.len()
+        };
+        // Der Anstoss nimmt sie dahinter auch wirklich (Fake zaehlt die Laenge).
+        d.anstossen(&mut a, &test_kontext()).expect("anstossen");
+        assert_eq!(a.letzte_bildlen, vorlage_len);
+        d.zuruecksetzen();
+        assert_eq!(d.geprueftes_bild(), None, "zurueckgesetzt: wieder zu");
+        assert_eq!(d.anstossen(&mut a, &test_kontext()).err(), Some(LadeFehler::Ungeprueft));
     }
 
     #[test]

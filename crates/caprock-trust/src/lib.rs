@@ -9,6 +9,7 @@
 //! TrustedSAS-**Programm**-Trust-Basis (unsafe-frei) bleibt unberührt.
 
 #![cfg_attr(not(test), no_std)]
+#![forbid(unsafe_code)]
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};

@@ -1,4 +1,5 @@
 #![no_std]
+#![forbid(unsafe_code)]
 //! Synchrone IPC über Endpoints + asynchrone Notifications (ADR 0004).
 //!
 //! Ein **Endpoint** ist ein Rendezvous-Punkt: Sender (Aufrufer) und Empfänger

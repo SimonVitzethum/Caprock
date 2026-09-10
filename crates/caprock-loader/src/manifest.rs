@@ -37,13 +37,13 @@
 //! ```text
 //! Kopf (80 B):
 //!   0  magic:u32              = 0x534C_4B4D ("SLKM")
-//!   4  format_version:u16     = 2 (1 = Vorgaenger, s.u.)
+//!   4  format_version:u16     = 3 (2 = Vorgaenger mit Periode, 1 = Vorgaenger ohne Periode, s.u.)
 //!   6  signature_algorithm_id:u16   (Ed25519 = 1)
 //!   8  flags:u32
 //!  12  manifest_version:u32   (monoton; Anti-Downgrade)
 //!  16  entry_count:u32
-//!  20  entry_len:u32          = 100 (v2) bzw. 96 (v1 — selbstbeschreibend, aber NIE zum
-//!                                    Teil-Lesen: ein Kernel mit anderem Eintragsformat weist
+//!  20  entry_len:u32          = 116 (v3) bzw. 100 (v2) bzw. 96 (v1 — selbstbeschreibend, aber NIE
+//!                                    zum Teil-Lesen: ein Kernel mit anderem Eintragsformat weist
 //!                                    BENANNT ab, statt die bekannten Felder zu lesen und den Rest
 //!                                    zu ueberspringen. Das waere hier besonders tueckisch, weil
 //!                                    die Signatur ueber die GANZE Nachricht laeuft: das Ergebnis
@@ -73,7 +73,11 @@
 //! Eintrag v2 (100 B) = v1 plus:
 //!  96  period_us:u32          (Z11c: die Periode zur `budget_us`-Reservierung; 0 = nichts gesagt)
 //!
-//! msg_len = 80 + entry_count * entry_len (96 oder 100, je Fassung)
+//! Eintrag v3 (116 B) = v2 plus:
+//! 100  key_id:[u8;16]         (L3-Brücke: Treiber-Autor-Bindung, s. Abschnitt unten; 0 = kein
+//!                             Treiber-Zeuge — genau der Zustand jedes vor L3 erzeugten Manifests)
+//!
+//! msg_len = 80 + entry_count * entry_len (96, 100 oder 116, je Fassung)
 //! msg_len  signature:[..]     (nicht leer; Laenge/Algorithmus prueft der Kernel-Verifier)
 //! ```
 //!
@@ -85,6 +89,34 @@
 //! um 4 auf 100 und die Formatversion auf 2. Ein v1-Lader weist v2 **benannt** ab
 //! ([`LoaderError::UnsupportedManifestFormat`] mit beiden Zahlen) statt 96 von 100 Byte zu
 //! lesen — s. die Regel im Kopfkommentar von [`SystemManifest::parse`].
+//!
+//! ## Warum der Eintrag eine `key_id` traegt (L3-Bruecke, Format v3, 2026-09-10)
+//!
+//! Der Treiber-Eintrag (`DriverEntry` in `caprock-lxpd`) kennt drei Dinge: **woher** das Image
+//! kommt (`source`), **welches** Bild genau (`image_hash`, SHA-256) und **wem** geglaubt wird
+//! (`key_id` = `SHA-256(Pubkey)[..16]`, dazu ein FNV-Zeuge). Das System-Manifest kannte davon
+//! nur das zweite — als `sha256` je Eintrag — und band den Eintrag an **keinen** Autor. Es gab
+//! kein Werkzeug, das `DriverEntry → System-Manifest` ueberfuehrt (Befund L3): der sha256 musste
+//! per Hand als BLOB getragen werden, die Autor-Bindung fiel dabei still unter den Tisch.
+//!
+//! Die `key_id` schliesst die Format-Seite dieser Luecke: Sie bindet den Manifest-Eintrag an
+//! denselben Treiber-Autor wie den `DriverEntry` — **dasselbe** Format (16 B,
+//! `SHA-256(Pubkey)[..16]`), **derselbe** Null-Zustand (16 Null-Bytes = „kein Treiber-Zeuge",
+//! genau der Zustand jedes vor L3 erzeugten Manifests). Sobald die JSON-Seite (DriverEntry mit
+//! Zeuge) den Boot erreicht, kann der Boot die beiden Zeugen **vergleichen**, statt einen von
+//! Hand getragenen Hash zu glauben.
+//!
+//! Warum **v3 mit Anhang** statt Deutung oder v2-Umbau: Im Eintrag ist kein Platz mehr umzudeuten
+//! (A-5.3/A-5.4/Z11c haben die letzten freien Bytes genommen), und v2 um 16 Byte zu verbreitern
+//! wuerde jedes bestehende signierte v2-Manifest ungueltig machen — dieselbe Falle wie bei der
+//! Selektor-Einfuehrung. Also waechst der Eintrag um 16 auf 116, die Formatversion auf 3, und
+//! v1/v2 bleiben **lesbar** (fehlend = Null = kein Zeuge, s. [`Entry::hat_treiber_zeuge`]). Ein
+//! v2-Lader weist v3 **benannt** ab statt 100 von 116 Byte zu lesen — dieselbe Regel wie bei v2.
+//!
+//! Was hier **nicht** steht: der Zeuge selbst (die FNV-Signatur) und die Herkunft (`source`).
+//! Beides gehoert in den `DriverEntry`, nicht in den Boot-Pfad — das Manifest sagt *dieser Eintrag
+//! meint den Autor mit dieser ID*, ob der Zeuge stimmt, prueft der Verifizierer gegen den
+//! vorgelegten Pubkey.
 //!
 //! ## Warum `period_us = 0` KEINE priority-0-Falle ist
 //!
@@ -110,9 +142,12 @@ use crate::LoaderError;
 
 /// Magic ("SLKM").
 pub const MANIFEST_MAGIC: u32 = 0x534C_4B4D;
-/// Neueste unterstützte Formatversion (Z11c: traegt `period_us`).
-pub const MANIFEST_FORMAT_VERSION: u16 = 2;
-/// Vorgaenger-Fassung: wird weiterhin gelesen (`period_us` = 0 = „nichts gesagt").
+/// Neueste unterstützte Formatversion (L3: traegt `key_id` je Eintrag).
+pub const MANIFEST_FORMAT_VERSION: u16 = 3;
+/// Zwischen-Fassung: wird weiterhin gelesen (`period_us`, aber keine Eintrags-`key_id`).
+pub const MANIFEST_FORMAT_VERSION_V2: u16 = 2;
+/// Vorgaenger-Fassung: wird weiterhin gelesen (`period_us` = 0 = „nichts gesagt",
+/// Eintrags-`key_id` = Null = „kein Treiber-Zeuge").
 pub const MANIFEST_FORMAT_VERSION_V1: u16 = 1;
 /// Signaturalgorithmus Ed25519 (identisch nummeriert wie in [`crate::cert`]).
 pub const SIG_ALG_ED25519: u16 = 1;
@@ -123,6 +158,13 @@ pub const HEADER_LEN: usize = 80;
 pub const ENTRY_LEN: usize = 96;
 /// Länge eines Eintrags der Fassung 2 (96 B + `period_us`).
 pub const ENTRY_LEN_V2: usize = 100;
+/// Länge eines Eintrags der Fassung 3 (100 B + `key_id`, L3-Brücke).
+pub const ENTRY_LEN_V3: usize = 116;
+/// Offset der Eintrags-`key_id` in einem v3-Eintrag (Schreiber-Helfer: wer v3-Einträge baut,
+/// legt hier 16 B `SHA-256(Pubkey)[..16]` ab, Null = kein Treiber-Zeuge).
+pub const ENTRY_KEY_ID_OFF: usize = 100;
+/// „Kein Treiber-Zeuge": der Zustand jedes vor L3 erzeugten Manifests (v1/v2 liefern das).
+pub const KEY_ID_NONE: [u8; 16] = [0u8; 16];
 
 /// Obergrenze der Eintragszahl. Bewusst klein: die Startmenge eines Knotens ist überschaubar, und
 /// eine harte Schranke hier ist billiger als eine Schleife über eine fremde `u32`.
@@ -276,6 +318,15 @@ pub struct Entry<'a> {
     /// Deshalb: `0` bleibt zulässig und heißt „es gibt ohnehin nur einen"; gibt es mehrere, wird
     /// **abgewiesen** statt geraten.
     pub service_id: u32,
+    /// **An welchen Treiber-Autor dieser Eintrag gebunden ist** (L3-Brücke, nur Fassung 3).
+    ///
+    /// `SHA-256(Pubkey)[..16]` — exakt die `key_id` des `DriverEntry` in `caprock-lxpd`.
+    /// Null ([`KEY_ID_NONE`]) heisst „kein Treiber-Zeuge": der Zustand jedes vor L3 erzeugten
+    /// Manifests (v1/v2 liefern immer Null) und jedes Eintrags, der kein Treiber-Image meint.
+    /// Wie bei `period_us = 0` ist Null hier **keine** Falle: 16 Null-Bytes sind keine gueltige
+    /// Autor-Bindung (kein Pubkey hasht darauf — und wuerde er es tun, waere der Zeuge ohnehin
+    /// gegen den vorgelegten Pubkey zu pruefen), sondern eindeutig „nichts gesagt".
+    pub key_id: [u8; 16],
 }
 
 /// **Der Geräte-Selektor eines Manifest-Eintrags** (A-5.3).
@@ -358,6 +409,28 @@ impl<'a> Entry<'a> {
     pub fn hat_reservierung(&self) -> bool {
         self.budget_us != 0 && self.period_us != 0
     }
+    /// Bindet dieser Eintrag ein Treiber-Image an einen Autor? (L3-Brücke)
+    ///
+    /// `true` genau dann, wenn [`Entry::key_id`] gesetzt ist (nicht [`KEY_ID_NONE`]). Die
+    /// Lese-Seite von „setzen/lesen": v1/v2-Manifeste liefern immer Null und damit `false` —
+    /// ein altes Manifest bekommt dadurch nie einen Zeugen angedichtet. Ob der Zeuge **stimmt**,
+    /// sagt nur der Verifizierer gegen den vorgelegten Pubkey; hier steht nur, ob einer
+    /// **behauptet** wird.
+    pub fn hat_treiber_zeuge(&self) -> bool {
+        self.key_id != KEY_ID_NONE
+    }
+    /// Die behauptete Autor-Bindung — `None`, wenn kein Treiber-Zeuge gesetzt ist.
+    ///
+    /// Die ausfuehrliche Lese-Seite zu [`Entry::hat_treiber_zeuge`]: wer den Zeugen gegen einen
+    /// Pubkey pruefen will, bekommt hier die zu vergleichende ID (`SHA-256(Pubkey)[..16]`)
+    /// oder explizit keinen Wert statt einer ID, die man versehentlich vergleichen koennte.
+    pub fn treiber_key_id(&self) -> Option<[u8; 16]> {
+        if self.hat_treiber_zeuge() {
+            Some(self.key_id)
+        } else {
+            None
+        }
+    }
     /// Verlangt dieser Eintrag Autorität, die dieser Kernel nicht kennt? Dann darf er **nicht**
     /// geladen werden: ein unbekanntes Bit bedeutet, dass das Manifest von einer Zuteilung
     /// ausgeht, die hier niemand vornimmt — stillschweigend weniger Autorität zu geben, wäre die
@@ -379,7 +452,7 @@ pub struct SystemManifest<'a> {
     pub manifest_version: u32,
     /// Zahl der Einträge (bereits gegen [`MAX_ENTRIES`] und die Datenlänge geprüft).
     pub entry_count: u32,
-    /// Breite eines Eintrags in Byte (96 = v1, 100 = v2) — die geparste Fassung.
+    /// Breite eines Eintrags in Byte (96 = v1, 100 = v2, 116 = v3) — die geparste Fassung.
     pub entry_len: usize,
     /// SHA-256 des Kernel-Codes, an den dieses Manifest gebunden ist (A-1.3).
     pub kernel_hash: [u8; 32],
@@ -413,11 +486,18 @@ impl<'a> SystemManifest<'a> {
         // ist entweder neuer als dieser Kernel oder kaputt, und beides bekommt die benannte
         // Absage mit beiden Zahlen. Insbesondere liest kein v2-Eintrag je als zwei v1-Einträge:
         // die Breite steht im Kopf, die Schrittweite folgt ihr.
+        //
+        // L3 (2026-09-10): dritte Fassung — (3, 116) = v2 plus `key_id` bei Offset 100. v1/v2
+        // bleiben lesbar (fehlend = Null = kein Treiber-Zeuge); alles andere wird weiter benannt
+        // abgewiesen, nie teilgelesen.
         let format_version = rd_u16(data, 4);
         let entry_len = rd_u32(data, 20);
         let entry_len_ok = (format_version == MANIFEST_FORMAT_VERSION_V1
             && entry_len as usize == ENTRY_LEN)
-            || (format_version == MANIFEST_FORMAT_VERSION && entry_len as usize == ENTRY_LEN_V2);
+            || (format_version == MANIFEST_FORMAT_VERSION_V2
+                && entry_len as usize == ENTRY_LEN_V2)
+            || (format_version == MANIFEST_FORMAT_VERSION
+                && entry_len as usize == ENTRY_LEN_V3);
         if !entry_len_ok {
             return Err(LoaderError::UnsupportedManifestFormat {
                 format_version,
@@ -498,11 +578,19 @@ impl<'a> Verified<'a> {
             return None;
         }
         // Bereits bei `parse` sichergestellt: `entries` ist genau `count * entry_len` lang, und
-        // `entry_len` ist 96 (v1) oder 100 (v2) — die Schrittweite folgt der geparsten Fassung.
+        // `entry_len` ist 96 (v1), 100 (v2) oder 116 (v3) — die Schrittweite folgt der geparsten
+        // Fassung.
         let w = self.0.entry_len;
         let e = self.0.entries.get(i * w..(i + 1) * w)?;
         let mut sha256 = [0u8; 32];
         sha256.copy_from_slice(&e[32..64]);
+        // L3: die `key_id` steht nur in Fassung 3 (Offset 100). v1/v2 liefern Null = kein
+        // Treiber-Zeuge — alte Manifeste bleiben lesbar, und keinem alten Eintrag wird ein
+        // Zeuge angedichtet (`hat_treiber_zeuge` bleibt falsch).
+        let mut key_id = KEY_ID_NONE;
+        if w >= ENTRY_LEN_V3 {
+            key_id.copy_from_slice(&e[ENTRY_KEY_ID_OFF..ENTRY_KEY_ID_OFF + 16]);
+        }
         Some(Entry {
             name: &e[0..16],
             program_id: rd_u32(e, 16),
@@ -536,6 +624,7 @@ impl<'a> Verified<'a> {
                 }
             },
             service_id: rd_u32(e, 92),
+            key_id,
         })
     }
 
@@ -602,7 +691,7 @@ impl<'a> Verified<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DOMAIN_TRUSTED, DOMAIN_USERLAND};
+    use crate::{DOMAIN_HARDWARE, DOMAIN_TRUSTED, DOMAIN_USERLAND};
 
     struct E {
         name: &'static str,
@@ -615,9 +704,12 @@ mod tests {
         device: Option<DeviceSelector>,
         /// A-5.4: die `program_id` des gemeinten Dienstes (`0` = nicht benannt).
         service_id: u32,
-        /// Z11c: die Periode zur Budget-Reservierung (`0` = nichts gesagt). Nur der v2-Bauer
+        /// Z11c: die Periode zur Budget-Reservierung (`0` = nichts gesagt). Nur der v2/v3-Bauer
         /// schreibt sie; der v1-Bauer legt Nullen — genau wie ein vor Z11c erzeugtes Manifest.
         period_us: u32,
+        /// L3: die Autor-Bindung (`SHA-256(Pubkey)[..16]`). Nur der v3-Bauer schreibt sie;
+        /// v1/v2-Bauer legen nichts — genau wie ein vor L3 erzeugtes Manifest (Null = kein Zeuge).
+        key_id: [u8; 16],
     }
 
     fn e(name: &'static str, program_id: u32) -> E {
@@ -630,13 +722,20 @@ mod tests {
             device: None,
             service_id: 0,
             period_us: 0,
+            key_id: KEY_ID_NONE,
         }
     }
 
     /// Ein strukturell gültiges Manifest der NEUESTEN Fassung bauen (Signatur ist Dummy — der
     /// Parser prüft keine Krypto).
     fn build(entries: &[E], siglen: usize) -> Vec<u8> {
-        build_mit(MANIFEST_FORMAT_VERSION, ENTRY_LEN_V2, entries, siglen)
+        build_mit(MANIFEST_FORMAT_VERSION, ENTRY_LEN_V3, entries, siglen)
+    }
+
+    /// Ein strukturell gültiges Manifest der Fassung 2 bauen (100-B-Einträge: Periode, aber
+    /// keine Eintrags-`key_id`).
+    fn build_v2(entries: &[E], siglen: usize) -> Vec<u8> {
+        build_mit(MANIFEST_FORMAT_VERSION_V2, ENTRY_LEN_V2, entries, siglen)
     }
 
     /// Ein strukturell gültiges Manifest der Fassung 1 bauen — also genau das, was
@@ -685,6 +784,11 @@ mod tests {
             if breite >= ENTRY_LEN_V2 {
                 v[b + 96..b + 100].copy_from_slice(&en.period_us.to_le_bytes());
             }
+            if breite >= ENTRY_LEN_V3 {
+                // L3 Schreiber-Seite: `key_id` bei Offset 100 (s. `ENTRY_KEY_ID_OFF`).
+                v[b + ENTRY_KEY_ID_OFF..b + ENTRY_KEY_ID_OFF + 16]
+                    .copy_from_slice(&en.key_id);
+            }
         }
         for i in 0..siglen {
             v[msg_len + i] = (i + 9) as u8;
@@ -702,6 +806,7 @@ mod tests {
             device: None,
             service_id: 0,
             period_us: 0,
+            key_id: KEY_ID_NONE,
         }
     }
 
@@ -819,16 +924,19 @@ mod tests {
     fn v2_traegt_die_periode() {
         let mut rt = root("init", 1);
         rt.period_us = 20_000;
-        let raw = build(&[rt], 64);
+        let raw = build_v2(&[rt], 64);
         assert_eq!(raw.len(), HEADER_LEN + ENTRY_LEN_V2 + 64);
         let m = SystemManifest::parse(&raw).unwrap();
-        assert_eq!(m.format_version, MANIFEST_FORMAT_VERSION);
+        assert_eq!(m.format_version, MANIFEST_FORMAT_VERSION_V2);
         assert_eq!(m.entry_len, ENTRY_LEN_V2);
         let v = accept(m);
         let e0 = v.entry(0).unwrap();
         assert_eq!(e0.budget_us, 1000);
         assert_eq!(e0.period_us, 20_000);
         assert!(e0.hat_reservierung());
+        // v2 kennt noch keinen Treiber-Zeugen: Null, kein angedichteter Zeuge.
+        assert_eq!(e0.key_id, KEY_ID_NONE);
+        assert!(!e0.hat_treiber_zeuge());
     }
 
     /// **Die Reservierung braucht beide Zahlen.** Jede allein sagt nichts — genau die Aussage,
@@ -853,23 +961,190 @@ mod tests {
 
     /// **Fassung 2 ist genau 4 Byte laenger.** Kein Umbau, kein Deuten: `period_us` haengt an,
     /// alles andere bleibt an seinem Offset — ein v2-Eintrag ist ein v1-Eintrag mit Anhang.
+    /// (Dasselbe Muster traegt v3 um 16 weiter: s. `v3_haengt_key_id_an`.)
     #[test]
     fn eintragsbreite_v2_ist_100() {
         assert_eq!(ENTRY_LEN, 96);
         assert_eq!(ENTRY_LEN_V2, 100);
+        assert_eq!(ENTRY_LEN_V3, 116);
         let mut en = e("x", 1);
         en.period_us = 20_000;
-        let raw = build(&[en], 64);
+        let raw = build_v2(&[en], 64);
         assert_eq!(raw.len(), HEADER_LEN + ENTRY_LEN_V2 + 64);
         // Die ersten 96 Byte liegen wie in v1: Name, IDs, Caps, Selektor, Dienst.
         let raw_v1 = build_v1(&[e("x", 1)], 64);
         assert_eq!(&raw[HEADER_LEN..HEADER_LEN + 96], &raw_v1[HEADER_LEN..HEADER_LEN + 96]);
     }
 
+    // --- L3-Brücke: Eintrags-`key_id` (Format v3) ----------------------------------------------
+
+    /// **Fassung 3 haengt die `key_id` an, alles andere bleibt.** Ein v3-Eintrag ist ein
+    /// v2-Eintrag mit 16 Byte Autor-Bindung bei Offset 100 — dieselbe Form wie v2 gegen v1.
+    #[test]
+    fn v3_haengt_key_id_an() {
+        assert_eq!(ENTRY_LEN_V3, ENTRY_LEN_V2 + 16);
+        assert_eq!(ENTRY_KEY_ID_OFF, ENTRY_LEN_V2);
+        let mut en = e("x", 1);
+        en.period_us = 20_000;
+        en.key_id = [0xABu8; 16];
+        let raw = build(&[en], 64);
+        assert_eq!(raw.len(), HEADER_LEN + ENTRY_LEN_V3 + 64);
+        // Die ersten 100 Byte liegen wie in v2: Periode inklusive, Rest unberuehrt.
+        let mut v2en = e("x", 1);
+        v2en.period_us = 20_000;
+        let raw_v2 = build_v2(&[v2en], 64);
+        assert_eq!(&raw[HEADER_LEN..HEADER_LEN + 100], &raw_v2[HEADER_LEN..HEADER_LEN + 100]);
+        // Und die letzten 16 Byte sind genau die gesetzte ID am dokumentierten Offset.
+        let b = HEADER_LEN;
+        assert_eq!(&raw[b + ENTRY_KEY_ID_OFF..b + ENTRY_KEY_ID_OFF + 16], &[0xABu8; 16]);
+    }
+
+    /// **v3-Rundweg: gesetzte `key_id` kommt durch** — Fassung, Breite, Helfer, Vergleichswert.
+    #[test]
+    fn v3_rundweg_key_id() {
+        let mut drv = e("lxpd-test", 7);
+        drv.domain = DOMAIN_HARDWARE;
+        drv.key_id = [
+            0x20, 0x9d, 0x7d, 0x3a, 0xb9, 0x5a, 0xc8, 0xcb, 0xbe, 0x84, 0x0d, 0xd9, 0x8e, 0x60,
+            0x1f, 0x9f,
+        ];
+        let kid = drv.key_id;
+        let raw = build(&[root("init", 1), drv], 64);
+        let m = SystemManifest::parse(&raw).unwrap();
+        assert_eq!(m.format_version, MANIFEST_FORMAT_VERSION);
+        assert_eq!(m.entry_len, ENTRY_LEN_V3);
+        assert_eq!(m.message().len(), HEADER_LEN + 2 * ENTRY_LEN_V3);
+        let v = accept(m);
+        let got = v.entry(1).unwrap();
+        assert_eq!(got.name(), "lxpd-test");
+        assert_eq!(got.key_id, kid);
+        assert!(got.hat_treiber_zeuge());
+        assert_eq!(got.treiber_key_id(), Some(kid));
+        // Der Root-Eintrag daneben traegt keinen Zeugen — gesetzt bleibt gesetzt, Null bleibt Null.
+        let rt = v.entry(0).unwrap();
+        assert_eq!(rt.key_id, KEY_ID_NONE);
+        assert!(!rt.hat_treiber_zeuge());
+        assert_eq!(rt.treiber_key_id(), None);
+    }
+
+    /// **v1 bleibt lesbar, fehlende `key_id` heisst Null.** Genau das Manifest, das
+    /// `tools/sign_manifest.py` vor L3 schrieb — kein Zeuge angedichtet.
+    #[test]
+    fn v1_ohne_key_id_wird_null() {
+        let raw = build_v1(&[root("init", 1), e("hello", 2)], 64);
+        let m = SystemManifest::parse(&raw).unwrap();
+        assert_eq!(m.format_version, MANIFEST_FORMAT_VERSION_V1);
+        assert_eq!(m.entry_len, ENTRY_LEN);
+        let v = accept(m);
+        for en in v.iter() {
+            assert_eq!(en.key_id, KEY_ID_NONE, "v1 kennt keine Autor-Bindung");
+            assert!(!en.hat_treiber_zeuge());
+            assert_eq!(en.treiber_key_id(), None);
+        }
+    }
+
+    /// **v2 bleibt lesbar, fehlende `key_id` heisst Null.** Die Periode kommt durch, der Zeuge
+    /// bleibt aus — die beiden Anhaenge sind unabhaengig.
+    #[test]
+    fn v2_ohne_key_id_wird_null() {
+        let mut rt = root("init", 1);
+        rt.period_us = 20_000;
+        let raw = build_v2(&[rt], 64);
+        let m = SystemManifest::parse(&raw).unwrap();
+        assert_eq!(m.format_version, MANIFEST_FORMAT_VERSION_V2);
+        let v = accept(m);
+        let e0 = v.entry(0).unwrap();
+        assert_eq!(e0.period_us, 20_000, "die Periode steht in v2 schon da");
+        assert_eq!(e0.key_id, KEY_ID_NONE, "die Autor-Bindung steht erst in v3 da");
+        assert!(!e0.hat_treiber_zeuge());
+        assert_eq!(e0.treiber_key_id(), None);
+    }
+
+    /// **Gesetzt bleibt gesetzt: je Eintrag verschieden.** Zwei Treiber mit zwei Autoren —
+    /// die IDs duerfen sich nicht vermischen und Null daneben bleibt Null.
+    #[test]
+    fn key_id_gesetzt_bleibt_je_eintrag() {
+        let mut a = e("treiber-a", 7);
+        a.key_id = [0x11u8; 16];
+        let mut b = e("treiber-b", 8);
+        b.key_id = [0x22u8; 16];
+        let raw = build(&[root("init", 1), a, b], 64);
+        let v = accept(SystemManifest::parse(&raw).unwrap());
+        assert_eq!(v.entry(1).unwrap().key_id, [0x11u8; 16]);
+        assert_eq!(v.entry(2).unwrap().key_id, [0x22u8; 16]);
+        assert_ne!(v.entry(1).unwrap().key_id, v.entry(2).unwrap().key_id);
+        assert_eq!(v.entry(1).unwrap().treiber_key_id(), Some([0x11u8; 16]));
+        assert_eq!(v.entry(2).unwrap().treiber_key_id(), Some([0x22u8; 16]));
+        // Ein gekipptes Byte in der ID ist eine ANDERE ID — kein „ungefaehr gleich".
+        let mut raw2 = raw.clone();
+        raw2[HEADER_LEN + ENTRY_LEN_V3 + ENTRY_KEY_ID_OFF] ^= 0x01;
+        let v2 = accept(SystemManifest::parse(&raw2).unwrap());
+        assert_ne!(v2.entry(1).unwrap().key_id, [0x11u8; 16]);
+        assert!(v2.entry(1).unwrap().hat_treiber_zeuge(), "weiterhin ein Zeuge, nur ein anderer");
+    }
+
+    /// **Null heisst kein Zeuge — und das ist keine Falle.** Weder v3 mit Nullen noch v1/v2
+    /// behaupten eine Bindung; `treiber_key_id()` gibt dann explizit `None` statt einer ID,
+    /// die man versehentlich gegen einen Pubkey vergleichen koennte.
+    #[test]
+    fn null_heisst_kein_zeuge_keine_falle() {
+        assert_eq!(KEY_ID_NONE, [0u8; 16]);
+        let raw = build(&[root("init", 1)], 64);
+        let v = accept(SystemManifest::parse(&raw).unwrap());
+        let en = v.entry(0).unwrap();
+        assert!(!en.hat_treiber_zeuge());
+        assert_eq!(en.treiber_key_id(), None);
+    }
+
+    /// **Falsche Laenge zur Version 3 wird benannt abgewiesen.** (3, 96) liest kein v1-Eintrag,
+    /// (3, 100) kein v2-Eintrag — der Parser folgt der Breite im Kopf, nie der Version allein.
+    #[test]
+    fn v3_mit_falscher_breite_abgewiesen() {
+        for breite in [96u32, 100, 104, 115, 117, 132] {
+            let mut raw = build(&[root("init", 1)], 64);
+            raw[20..24].copy_from_slice(&breite.to_le_bytes());
+            assert_eq!(
+                SystemManifest::parse(&raw).unwrap_err(),
+                LoaderError::UnsupportedManifestFormat { format_version: 3, entry_len: breite },
+                "Breite {breite}"
+            );
+        }
+        // Gespiegelt: alte Versionen duerfen die neue Breite nicht lesen.
+        for version in [1u16, 2] {
+            let mut raw = build(&[root("init", 1)], 64);
+            raw[4..6].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(
+                SystemManifest::parse(&raw).unwrap_err(),
+                LoaderError::UnsupportedManifestFormat {
+                    format_version: version,
+                    entry_len: ENTRY_LEN_V3 as u32,
+                },
+                "Version {version} mit v3-Breite"
+            );
+        }
+    }
+
+    /// **Unbekannte Version abgewiesen — auch mit gueltig aussehender Breite.** Version 4 mit
+    /// v3-Breite ist „neuer als dieser Kernel", nicht „v3 mit Tippfehler".
+    #[test]
+    fn unbekannte_version_mit_v3_breite_abgewiesen() {
+        for version in [0u16, 4, 99, 0xEE] {
+            let mut raw = build(&[root("init", 1)], 64);
+            raw[4..6].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(
+                SystemManifest::parse(&raw).unwrap_err(),
+                LoaderError::UnsupportedManifestFormat {
+                    format_version: version,
+                    entry_len: ENTRY_LEN_V3 as u32,
+                },
+                "Version {version}"
+            );
+        }
+    }
     /// **Jede fremde Kombination wird benannt abgewiesen, nicht gelesen.** (1, 100) ist kein v2,
-    /// (2, 96) kein v1, und (3, 96) ist neuer als dieser Kernel — alle drei enden in
-    /// `UnsupportedManifestFormat` mit den beiden Zahlen, nie in `BadManifest` und nie in einem
-    /// Eintrag.
+    /// (2, 96) kein v1, (3, 100) kein v3, (2, 116) kein v2, und (4, 116) ist neuer als dieser
+    /// Kernel — alle enden in `UnsupportedManifestFormat` mit den beiden Zahlen, nie in
+    /// `BadManifest` und nie in einem Eintrag.
     #[test]
     fn fremde_kombinationen_werden_benannt_abgewiesen() {
         let kombination = |version: u16, breite: u32| {
@@ -891,6 +1166,22 @@ mod tests {
             LoaderError::UnsupportedManifestFormat { format_version: 3, entry_len: 96 }
         );
         assert_eq!(
+            kombination(3, 100),
+            LoaderError::UnsupportedManifestFormat { format_version: 3, entry_len: 100 }
+        );
+        assert_eq!(
+            kombination(2, 116),
+            LoaderError::UnsupportedManifestFormat { format_version: 2, entry_len: 116 }
+        );
+        assert_eq!(
+            kombination(1, 116),
+            LoaderError::UnsupportedManifestFormat { format_version: 1, entry_len: 116 }
+        );
+        assert_eq!(
+            kombination(4, 116),
+            LoaderError::UnsupportedManifestFormat { format_version: 4, entry_len: 116 }
+        );
+        assert_eq!(
             kombination(2, 104),
             LoaderError::UnsupportedManifestFormat { format_version: 2, entry_len: 104 }
         );
@@ -901,13 +1192,13 @@ mod tests {
         let raw = build(&[root("init", 1), e("hello", 2)], 64);
         let m = SystemManifest::parse(&raw).unwrap();
         assert_eq!(m.format_version, MANIFEST_FORMAT_VERSION);
-        assert_eq!(m.entry_len, ENTRY_LEN_V2);
+        assert_eq!(m.entry_len, ENTRY_LEN_V3);
         assert_eq!(m.signature_algorithm_id, SIG_ALG_ED25519);
         assert_eq!(m.manifest_version, 7);
         assert_eq!(m.entry_count, 2);
         assert_eq!(m.kernel_hash[0], 24);
         assert_eq!(m.key_id[0], 57);
-        assert_eq!(m.message().len(), HEADER_LEN + 2 * ENTRY_LEN_V2);
+        assert_eq!(m.message().len(), HEADER_LEN + 2 * ENTRY_LEN_V3);
         assert_eq!(m.signature().len(), 64);
         // message + signature partitionieren die Eingabe exakt.
         assert_eq!(m.message().len() + m.signature().len(), raw.len());
@@ -927,6 +1218,9 @@ mod tests {
         assert_eq!(e0.budget_us, 1000);
         assert_eq!(e0.period_us, 0); // der Bauer nannte keine Periode: nichts gesagt, s. Z11c
         assert!(!e0.hat_reservierung()); // Budget ohne Periode ist keine Reservierung
+        assert_eq!(e0.key_id, KEY_ID_NONE); // der Bauer nannte keine Autor-Bindung: kein Zeuge
+        assert!(!e0.hat_treiber_zeuge());
+        assert_eq!(e0.treiber_key_id(), None);
         assert_eq!(e0.sha256[0], 1);
         let e1 = v.entry(1).unwrap();
         assert_eq!(e1.name(), "hello");
@@ -950,7 +1244,7 @@ mod tests {
     fn verify_sees_exactly_message_and_signature() {
         let raw = build(&[root("init", 1)], 64);
         let m = SystemManifest::parse(&raw).unwrap();
-        let msg_len = HEADER_LEN + ENTRY_LEN_V2;
+        let msg_len = HEADER_LEN + ENTRY_LEN_V3;
         m.verify_with(|msg, sig| {
             assert_eq!(msg, &raw[..msg_len]);
             assert_eq!(sig, &raw[msg_len..]);
@@ -979,15 +1273,15 @@ mod tests {
             SystemManifest::parse(&raw).unwrap_err(),
             LoaderError::UnsupportedManifestFormat {
                 format_version: 0xEE,
-                entry_len: ENTRY_LEN_V2 as u32,
+                entry_len: ENTRY_LEN_V3 as u32,
             }
         );
     }
 
-    /// Eine fremde Eintragsbreite wird **erkannt**, nicht um acht Bytes verrutscht gelesen.
+    /// Eine fremde Eintragsbreite wird **erkannt**, nicht um sechzehn Bytes verrutscht gelesen.
     ///
-    /// Der Fall, den die Regel verbietet: signiert ist die GANZE Nachricht. Läse ein v1-Lader
-    /// 96 von 104 Byte je Eintrag, wäre das Ergebnis authentisch und unverstanden zugleich —
+    /// Der Fall, den die Regel verbietet: signiert ist die GANZE Nachricht. Läse ein v2-Lader
+    /// 100 von 116 Byte je Eintrag, wäre das Ergebnis authentisch und unverstanden zugleich —
     /// `initial_caps` und `policy_flags` lägen dann auf fremden Bytes, und die Signatur stimmte
     /// darüber trotzdem.
     #[test]
@@ -1168,9 +1462,12 @@ mod kani_proofs {
             assert!(m.message().len() + m.signature().len() == len);
             assert!(!m.signature().is_empty());
             // Z11c: zwei Fassungen — die Nachrichtenlaenge folgt der geparsten Breite.
+            // L3: drei Fassungen (v3 haengt `key_id` an).
             assert!(
                 m.message().len() == HEADER_LEN + (m.entry_count as usize) * m.entry_len
-                    && (m.entry_len == ENTRY_LEN || m.entry_len == ENTRY_LEN_V2)
+                    && (m.entry_len == ENTRY_LEN
+                        || m.entry_len == ENTRY_LEN_V2
+                        || m.entry_len == ENTRY_LEN_V3)
             );
             if let Ok(v) = m.verify_with(|_, _| true) {
                 let n = v.count();

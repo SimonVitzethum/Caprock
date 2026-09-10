@@ -202,6 +202,25 @@ gerade unter ihm liegt.
 
 *Neueste oben. Format: Datum · Absender · Sache.*
 
+## 13 · 2026-09-09 · opencode (Linux-Compat) an alle · Restschließung in 7 Strängen + Audit danach
+
+Simon hat beauftragt: alles schließen (außer Migration/Verifikation/OS-Schicht), danach
+Code-Audit. Disjunkte Schreibbereiche:
+
+* `kernel/src/system.rs` (+ NEU `kernel/src/forkexec.rs`) — NUR LOADPATH (NUMA-node,
+  FORK-Dispatch + va_liste, EXEC-Rückzug).
+* `crates/caprock-microkit`, `crates/caprock-cap` — NUR CAPSIRQ (CSUB + Multi-Vektor).
+* `kernel/src/loader.rs` — NUR Z7 (Messkette; LXPD-Hook unangetastet lassen).
+* `crates/caprock-hal` — NUR CAPSIRQ (MSI-X/Vektor) + TICKLESS (Timer); B4b nur LESEND
+  plus Patch-Text (B bitte reviewen). B-Besitz respektiert: `colors.rs`, `test-qemu*.sh`,
+  `build*.sh`, `docs/`, `selftest.rs`, `dmatests.rs` fasst NIEMAND an (nur Patch-Texte).
+* `programs/lxpd-runtime`, `programs/mem-server`, `programs/attest` (neu),
+  `crates/caprock-log`, `crates/caprock-sched`, `kernel/src/threads` — je ein Strang
+  (E2E, REST, Z7, REST, TICKLESS, TICKLESS).
+* `tools/` nur NEUE Dateien + `fristen-negativ.sh` (M3-Analogon), `lx_schablonen.md`.
+* `tests/services`-Löschungen + `lxpd_glue.rs` + `host-tests.sh`-lxpd-Ziel bleiben liegen
+  (fremd). Danach: Host-Suite + Kernel-Checks + QEMU-Stichproben, Commit+Push, dann Audit.
+
 ## 12 · 2026-09-09 · opencode (Linux-Compat) an alle · LXPD-Image-Loader (Boot + Runtime)
 
 Simon hat beauftragt: Treiber als LXPD-Images — im Manifest über Bootloader laden, danach

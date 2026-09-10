@@ -74,8 +74,8 @@ M1/M2 (Z. 622–641); Primitive geprüft gegen
 | request_threaded_irq | A | Threaded-IRQ-Modell (Completion + WAIT, Warteweg) | A-Zustand | vorhanden:formell benannt |
 | pci_enable_device | B | aus Linux-Quellen uebersetzt (drivers/base, PCI) | — | fehlt:bewusst |
 | pci_request_regions | B | aus Linux-Quellen uebersetzt | — | fehlt:bewusst |
-| dev_err | A | keines (Senke in Klassenschicht/Router offen) | A-Zustand | fehlt:Kernel |
-| printk | A | keines (Senke in Klassenschicht/Router offen) | A-Zustand | fehlt:Kernel |
+| dev_err | A | caprock-log dev_err/dev_warn/dev_info-Senke (LogRing: no_std, nie blockierend, voll verwirft Ältestes + Zähler) | A-Zustand | vorhanden:formell benannt |
+| printk | A | caprock-log printk-Senke + kern_stufe-Abbildung (KERN_ERR 0–3/WARNING 4–5/INFO 6–7 → Err/Warn/Info, Rest None) | A-Zustand | vorhanden:formell benannt |
 
 ## Ehrliche Lücken (Querschnitt, nicht je Symbol)
 
@@ -89,8 +89,9 @@ Zug vorhanden und host-getestet. Übrig bleibt:
 2. **Variabler Cspace:** `NCAPS = 16`, hart; für mehr Caps je PD braucht es
    einen variablen Cspace (TODO0 K1c). Trifft `request_irq` (Cap je Vektor)
    und jede Treiber-PD mit großem Cap-Bedarf.
-3. **Logging:** `dev_err`/`printk` brauchen eine Senke in Klassenschicht oder
-   Router; heute keine Schablone.
+3. **Logging-Senke steht, Anbindung offen:** `dev_err`/`printk` bilden auf
+   `caprock-log` ab (Ring, Filter, `kern_stufe`); was fehlt, ist die Leser-Seite in
+   Klassenschicht oder Router (wer den Ring leert und wohin), nicht mehr die Senke.
 4. **Blockierendes `flush_workqueue`:** `Workqueue::flush` belegt nur die Leere;
    ein Flush, der auf laufende Jobs wartet, ist mit Completion baubar, aber nicht
    als Form ausgeschrieben.

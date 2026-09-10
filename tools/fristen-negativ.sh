@@ -21,9 +21,9 @@
 # siebzehn Threads -- M1/M2/M4 fahren die Schleife weiter mit einem.
 #
 # **A2-Rest/CALL, Stand:** `CALL_TIMEOUT` (ABI 30) ist gelandet (M5 unten zaehlt drei
-# Stellen). Noch offen: CALL-Faelle nach dem Muster von M3 (Frist auf 1 Tick kuerzen) --
-# mit der zweiten Partei als eigenem Konjunkt (kein Reply-Recht am nicht-mehr-wartenden
-# Thread).
+# Stellen). Die CALL-Faelle nach dem Muster von M3 stehen als M6 unten: Anker + Mutationsprobe
+# laufen immer (ohne QEMU gruen), der QEMU-Block hinter `CALL_QEMU=1` — er braucht
+# kernelseitig das Konjunkt der zweiten Partei (`kein-reply-nach-frist`).
 if [ -z "${BASH_VERSION:-}" ]; then echo "FEHLER: braucht bash, nicht sh/dash." >&2; exit 2; fi
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -31,7 +31,7 @@ ROOT="$(pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/fristneg.XXXXXX")"
 fail=0
 
-DATEIEN=( "crates/caprock-sched/src/lib.rs" "crates/caprock-sched/src/fristen.rs" "crates/caprock-microkit/src/lib.rs" )
+DATEIEN=( "crates/caprock-sched/src/lib.rs" "crates/caprock-sched/src/fristen.rs" "crates/caprock-microkit/src/lib.rs" "crates/caprock-ipc/src/lib.rs" )
 for f in "${DATEIEN[@]}"; do mkdir -p "$TMP/$(dirname "$f")"; cp "$f" "$TMP/$f"; done
 restore() { for f in "${DATEIEN[@]}"; do cp "$TMP/$f" "$ROOT/$f"; done; }
 trap 'restore; rm -rf "$TMP"' EXIT
@@ -185,8 +185,7 @@ restore
 # `CALL_TIMEOUT` (ABI 30) ist gelandet: dritte `frist_setzen`-Stelle im Dispatch, dazu die
 # Reply-Invalidierung der zweiten Partei (`wartet_auf_ipc`). Was hier steht: die Stellen sind
 # benannt und gezaehlt. Faellt die Zahl unter 3, ist ein Frist-Arm verloren gegangen.
-# Noch offen (M3-Analogon): QEMU-Negativfaelle fuer CALL — Frist auf 1 Tick plus das eigene
-# Konjunkt der zweiten Partei (kein Reply-Recht am nicht-mehr-wartenden Thread).
+# Die QEMU-Faelle dazu stehen als M6 unten (M3-Analogon plus Zweit-Partei-Mutation).
 echo "-- M5 (statisch): drei Frist-Arme im Dispatch --"
 n_frist_dispatch="$(grep -c "ops\.frist_setzen(" crates/caprock-microkit/src/lib.rs)"
 if [ "$n_frist_dispatch" != "3" ]; then
@@ -194,6 +193,92 @@ if [ "$n_frist_dispatch" != "3" ]; then
     fail=1
 else
     echo "  PASS: M5 -- 3 Stellen (WAIT, PARK_TIMEOUT, CALL_TIMEOUT)"
+fi
+
+# --- M6: CALL_TIMEOUT-M3-Analogon + Zweit-Partei-Mutation --------------------------------------
+#
+# Die erste Mutation ist M3 woertlich nachgebaut, nur am anderen Arm: `frist` (CALL_TIMEOUT)
+# statt `ticks` (WAIT). Der Variablenname ist der Anker — stuende dort ebenfalls `ticks`,
+# traefe das M3-sed zwei Stellen und meldete „2 Treffer, erwartet 1" (s. die
+# Stelligkeitspruefung oben und den Kommentar am CALL_TIMEOUT-Arm im Dispatch).
+#
+# Die zweite Mutation bricht die Gegenstelle: `reply` fragt `wartet_auf_ipc` — ohne die Frage
+# schriebe ein spaetes Reply in den Frame eines Threads, der laengst `ERR_TIMEOUT` hat, und
+# weckte ihn (M4-Form: die Trennung `code-trotzdem`/`zweitgrund-haelt` als Vorbild).
+#
+# **Warum der QEMU-Block hinter `CALL_QEMU=1` steht, obwohl das Muster sonst
+# sed+Lauf+rot/gruen ist:** die `uhr`-Zeile uebt nur WAIT (drei Gaenge, kein CALL). Eine
+# 1-Tick-CALL-Frist liesse sie GRUEN — und ein gruener Negativfall belegt gar nichts
+# (dieselbe Folgenlosigkeit wie M1 ohne dritten Gang, s. Kopf). Der Lauf braucht kernelseitig
+# zwei eigene Konjunkte, deren Namen HIER feststehen, damit beide Seiten sich treffen:
+# `antwort-rechtzeitig` (Aufrufer mit N-Tick-Frist bekommt das Reply als OK vor Ablauf) und
+# `kein-reply-nach-frist` (ein Reply NACH Ablauf schreibt nichts und weckt nichts — die
+# `wartet_auf_ipc`-Frage in `crates/caprock-ipc/src/lib.rs`, Form wie ERR_EP_FULL: benannter
+# Ausgang ohne Zustandsaenderung). Kernelarbeit, fremder Strang — was OHNE Schalter laeuft,
+# ist alles, was ohne sie pruefbar ist: (a) beide Anker zaehlen genau 1 Stelle, (b) beide
+# seds treffen auf einer KOPIE genau 1 Stelle (lauffaehig, sobald die Konjunkte landen).
+# Wer den Block MIT Schalter ohne die Konjunkte faehrt, bekommt kein Gruen, sondern das
+# ehrliche „kommt im Protokoll gar nicht vor".
+echo "-- M6: CALL_TIMEOUT-Frist auf 1 Tick + Reply ohne Warte-Frage (Anker + Probe) --"
+n_frist_arm="$(grep -c 'ops\.frist_setzen(core, frist,' crates/caprock-microkit/src/lib.rs)"
+if [ "$n_frist_arm" != "1" ]; then
+    echo "  FAIL: M6a-Anker -- $n_frist_arm frist-Stellen im Dispatch, erwartet 1 (CALL_TIMEOUT)."; fail=1
+else
+    echo "  PASS: M6a-Anker -- 1 frist-Stelle (CALL_TIMEOUT, neben WAIT- und PARK-Arm)"
+fi
+n_wartefrage="$(grep -c 'if !ops\.wartet_auf_ipc(caller)' crates/caprock-ipc/src/lib.rs)"
+if [ "$n_wartefrage" != "1" ]; then
+    echo "  FAIL: M6b-Anker -- $n_wartefrage wartet_auf_ipc-Fragen im Reply, erwartet 1."; fail=1
+else
+    echo "  PASS: M6b-Anker -- 1 wartet_auf_ipc-Frage im Reply-Pfad"
+fi
+# Mutationsproben auf KOPIEN — die echten Dateien fasst nur der QEMU-Block an (und stellt sie
+# per restore zurueck, wie M1–M4).
+cp crates/caprock-microkit/src/lib.rs "$TMP/m6a-kopie.rs"
+m6a_vorher="$(md5sum "$TMP/m6a-kopie.rs" | cut -d' ' -f1)"
+m6a_treffer="$(sed -n 's|ops\.frist_setzen(core, frist, caprock_sched::BlockReasons::IPC);|ops.frist_setzen(core, 1, caprock_sched::BlockReasons::IPC);|p' "$TMP/m6a-kopie.rs" | wc -l)"
+sed -i 's|ops\.frist_setzen(core, frist, caprock_sched::BlockReasons::IPC);|ops.frist_setzen(core, 1, caprock_sched::BlockReasons::IPC);|' "$TMP/m6a-kopie.rs"
+if [ "$(md5sum "$TMP/m6a-kopie.rs" | cut -d' ' -f1)" = "$m6a_vorher" ]; then
+    echo "  FAIL: M6a-Probe -- das sed-Muster hat NICHTS getroffen"; fail=1
+elif [ "$m6a_treffer" != "1" ]; then
+    echo "  FAIL: M6a-Probe -- das Muster traf $m6a_treffer Stelle(n), erwartet 1"; fail=1
+else
+    echo "  PASS: M6a-Probe -- Mutations-sed trifft genau die CALL_TIMEOUT-Stelle (Kopie, Datei unberuehrt)"
+fi
+cp crates/caprock-ipc/src/lib.rs "$TMP/m6b-kopie.rs"
+m6b_vorher="$(md5sum "$TMP/m6b-kopie.rs" | cut -d' ' -f1)"
+m6b_treffer="$(sed -n 's|if !ops\.wartet_auf_ipc(caller) {|if false {|p' "$TMP/m6b-kopie.rs" | wc -l)"
+sed -i 's|if !ops\.wartet_auf_ipc(caller) {|if false {|' "$TMP/m6b-kopie.rs"
+if [ "$(md5sum "$TMP/m6b-kopie.rs" | cut -d' ' -f1)" = "$m6b_vorher" ]; then
+    echo "  FAIL: M6b-Probe -- das sed-Muster hat NICHTS getroffen"; fail=1
+elif [ "$m6b_treffer" != "1" ]; then
+    echo "  FAIL: M6b-Probe -- das Muster traf $m6b_treffer Stelle(n), erwartet 1"; fail=1
+else
+    echo "  PASS: M6b-Probe -- Mutations-sed trifft genau die Warte-Frage (Kopie, Datei unberuehrt)"
+fi
+if [ "${CALL_QEMU:-0}" != "1" ]; then
+    echo "  SKIP: M6-QEMU -- kein Lauf ohne CALL_QEMU=1 (braucht kernelseitig 'antwort-rechtzeitig' + 'kein-reply-nach-frist')"
+else
+    echo "-- M6a-QEMU: CALL_TIMEOUT stellt jede Frist auf 1 Tick --"
+    if mutiere crates/caprock-microkit/src/lib.rs \
+       's|ops\.frist_setzen(core, frist, caprock_sched::BlockReasons::IPC);|ops.frist_setzen(core, 1, caprock_sched::BlockReasons::IPC);|' M6a-QEMU 1; then
+        lauf "$TMP/m6a.log"
+        rot   M6a-QEMU "$TMP/m6a.log" "antwort-rechtzeitig"
+        gruen M6a-QEMU "$TMP/m6a.log" "kein-reply-nach-frist"
+        gruen M6a-QEMU "$TMP/m6a.log" "frist-weckt"
+    else
+        echo "  FAIL: M6a-QEMU -- Mutation nicht anwendbar"; fail=1
+    fi
+    restore
+    echo "-- M6b-QEMU: Reply ohne Warte-Frage --"
+    if mutiere crates/caprock-ipc/src/lib.rs \
+       's|if !ops\.wartet_auf_ipc(caller) {|if false {|' M6b-QEMU 1; then
+        lauf "$TMP/m6b.log"
+        rot   M6b-QEMU "$TMP/m6b.log" "kein-reply-nach-frist"
+    else
+        echo "  FAIL: M6b-QEMU -- Mutation nicht anwendbar"; fail=1
+    fi
+    restore
 fi
 
 echo

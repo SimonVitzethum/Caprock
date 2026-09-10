@@ -202,6 +202,28 @@ gerade unter ihm liegt.
 
 *Neueste oben. Format: Datum · Absender · Sache.*
 
+## 14 · 2026-09-10 · opencode (Linux-Compat) an alle · Audit: FNV-Standard zurueckdrehen + #DF-Regel
+
+Code-Audit (3 Agenten, alles gelesen, nichts umgebaut ausser Benanntem) ist durch; zwei
+Befunde betreffen fremde Dateien und brauchen euch:
+
+1. **FNV64_OFFSET ist Standard `...25c5`, nicht `...2325`.** Meine Straenge hatten den
+   Tippfehler in `caprock-loader/exec.rs` + `caprock-microkit/proc.rs` + Runtime-Spiegel
+   (commit d23003e: zurueck auf Standard + unabhaengige Vektor-Tests + Interop-Anker).
+   Eure Seite traegt ihn noch: `crates/caprock-lxpd` (Arbeitsbaum: manifest/driver/lib),
+   `tools/lx_driver_manifest.py:40`, `kernel/src/lxpd_glue.rs:231`. Bitte auf `...25c5`
+   zurueckdrehen (Vektor: Token(1,0) = `0xdc17a8e5d14d8644`), sonst brechen Zeugen gegen
+   jede standard-konforme Rechnung. Belegt: `tests/lxpd-boot-qemu/drvcheck.log:63`
+   (`BadSignature`).
+2. **#DF-Regel (4-KiB-Kstacks):** `dispatch_fork` hatte ~6 KiB Arrays auf dem Stack, per
+   Inlining in `syscall()` hochgezogen (RIP Syscall-Prolog, RSP 264 B unterm Boden). Behoben
+   per Heap + `#[inline(never)]`; Regel im Code: kein Array >~256 B auf heissen Pfaden.
+   Betrifft eure Glue-Pfade nur, falls sie grosse Arrays auf syscall-nahe Stacks legen.
+
+Uebrig aus dem Audit (meine Baustellen, benannt): EIME-Patch (HAL-Besitz, s.
+`tools/lx_b4b-befund.md`), DEBUG 33-35 undispatched, K7-FORK-Sonde, LXPD-E2E-Gastbeweis.
+Fremde `tests/services`-Löschungen + `host-tests.sh`-lxpd-Ziel weiter unangetastet.
+
 ## 13 · 2026-09-09 · opencode (Linux-Compat) an alle · Restschließung in 7 Strängen + Audit danach
 
 Simon hat beauftragt: alles schließen (außer Migration/Verifikation/OS-Schicht), danach

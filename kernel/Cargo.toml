@@ -52,8 +52,14 @@ default = []
 # Produktivkernel. Dieselbe Einordnung wie `kstackmark`.
 # Fehlt sie, meldet die `sperre`-Zeile „NICHT GEMESSEN" und faellt durch, statt „alles kurz" zu
 # behaupten.
-selftest = ["caprock-hal/selftest", "caprock-sync/sperrwacht"]
+selftest = ["caprock-hal/selftest", "caprock-sync/sperrwacht", "debug-log"]
 kernel-fuzz = []
+# `debug-log` — erzaehlende B-Print-Ausgabe (Bring-up-Details, Mess-Details, Diagnosezeilen),
+# gegattert von den Straengen G1/G2 (loader/system/bringup/arch/main) und GATE-FEAT (Rest).
+# Urteile (ALL PASS/FAILURES/SKIP), Suite-Gates, Panic-Pfade und fail-closed-Absagen gattern NIE.
+# In `selftest` enthalten: die Suiten fahren mit Pruefinfrastruktur UND Erzaehlung, der
+# schlanke Bau (F1, --no-default-features) schweigt. Allein stellbar fuer `.text`-Messung.
+debug-log = []
 # Continuous-Soak-Treiber (Burn-in #2): nach dem Selbsttest faehrt der Idle-Manager statt
 # `system_off` eine Endlos-Epochenschleife (Dauerbetrieb EINER Instanz). NUR Harness/Testcode; der
 # Kernel-Kern bleibt byte-identisch zum Release. Mit `soak,kernel-fuzz` kombinierbar.

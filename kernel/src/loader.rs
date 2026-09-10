@@ -230,10 +230,11 @@ pub fn manifest_report() -> u32 {
     let audit = manifest_audit();
     match read_manifest() {
         Some(v) => {
-            let h = v.header();
+            let _h = v.header();
+            #[cfg(feature = "debug-log")]
             println!(
                 "manifest: v{} vom Schluessel {:02x}{:02x}{:02x}{:02x}.., an dieses Kernel-Image gebunden, {} Eintrag/Eintraege",
-                h.manifest_version, h.key_id[0], h.key_id[1], h.key_id[2], h.key_id[3], v.count()
+                _h.manifest_version, _h.key_id[0], _h.key_id[1], _h.key_id[2], _h.key_id[3], v.count()
             );
             for e in v.iter() {
                 print!(
@@ -252,22 +253,26 @@ pub fn manifest_report() -> u32 {
         None => {
             // Bei Ablehnung ist die haeufigste echte Ursache "neuer Kernel, altes Manifest".
             // Deshalb steht hier, WORAN gebunden wurde -- sonst raet man.
-            let k = kernel_code_hash();
+            let _k = kernel_code_hash();
+            #[cfg(feature = "debug-log")]
             println!(
                 "manifest: kein angenommenes System-Manifest (Audit-Code {audit}; dieser Kernel-Code-Hash beginnt {:02x}{:02x}{:02x}{:02x})",
-                k[0], k[1], k[2], k[3]
+                _k[0], _k[1], _k[2], _k[3]
             );
             if let Some(a) = read_archive() {
                 let raw = a.system_manifest();
                 if !raw.is_empty() {
                     match SystemManifest::parse(raw) {
-                        Ok(m) => println!(
+                        Ok(_m) => {
+                            #[cfg(feature = "debug-log")]
+                            println!(
                             "manifest:   im Archiv: v{} alg={} key={:02x}{:02x}{:02x}{:02x}.. gebunden an {:02x}{:02x}{:02x}{:02x}.. ({} Eintraege, {} B Signatur)",
-                            m.manifest_version, m.signature_algorithm_id,
-                            m.key_id[0], m.key_id[1], m.key_id[2], m.key_id[3],
-                            m.kernel_hash[0], m.kernel_hash[1], m.kernel_hash[2], m.kernel_hash[3],
-                            m.entry_count, m.signature().len()
-                        ),
+                            _m.manifest_version, _m.signature_algorithm_id,
+                            _m.key_id[0], _m.key_id[1], _m.key_id[2], _m.key_id[3],
+                            _m.kernel_hash[0], _m.kernel_hash[1], _m.kernel_hash[2], _m.kernel_hash[3],
+                            _m.entry_count, _m.signature().len()
+                        );
+                        }
                         // **Der Versionsfall wird BENANNT.** Drei Zeilen weiter oben steht schon
                         // „die haeufigste echte Ursache ist *neuer Kernel, altes Manifest*, deshalb
                         // steht hier, WORAN gebunden wurde -- sonst raet man". Fuer den
@@ -291,7 +296,10 @@ pub fn manifest_report() -> u32 {
                             caprock_loader::manifest::MANIFEST_FORMAT_VERSION,
                             caprock_loader::manifest::ENTRY_LEN
                         ),
-                        Err(_) => println!("manifest:   im Archiv liegen {} B, die nicht parsen (Form, nicht Version -- die Formatversion haette einen eigenen Satz)", raw.len()),
+                        Err(_) => {
+                            #[cfg(feature = "debug-log")]
+                            println!("manifest:   im Archiv liegen {} B, die nicht parsen (Form, nicht Version -- die Formatversion haette einen eigenen Satz)", raw.len());
+                        }
                     }
                 }
             }
@@ -445,10 +453,11 @@ pub fn messkette_bericht() -> usize {
         let g = MESSKETTE.lock();
         (g.anzahl, g.verworfen)
     };
-    let genesis = kernel_code_hash();
+    let _genesis = kernel_code_hash();
+    #[cfg(feature = "debug-log")]
     println!(
         "messkette: Anker Kernel-Code-Hash {:02x}{:02x}{:02x}{:02x}.., {} Eintrag/Eintraege, {} verworfen (SW-PCR ohne TPM-HW: neu = SHA-256(prev || program_id || domain || image_hash))",
-        genesis[0], genesis[1], genesis[2], genesis[3], anzahl, verworfen
+        _genesis[0], _genesis[1], _genesis[2], _genesis[3], anzahl, verworfen
     );
     // Unter der Sperre wird KOPIERT, gedruckt wird danach (wie `iface_record_or_check`:
     // Drucken gehoert nicht in den kritischen Abschnitt).
@@ -457,19 +466,20 @@ pub fn messkette_bericht() -> usize {
         let g = MESSKETTE.lock();
         kopie.copy_from_slice(&g.glieder);
     }
-    for e in kopie[..anzahl].iter().flatten() {
+    for _e in kopie[..anzahl].iter().flatten() {
+        #[cfg(feature = "debug-log")]
         println!(
             "messkette:   [{}] dom={} bild={:02x}{:02x}{:02x}{:02x}.. pcr={:02x}{:02x}{:02x}{:02x}..",
-            e.program_id,
-            e.domain,
-            e.image_hash[0],
-            e.image_hash[1],
-            e.image_hash[2],
-            e.image_hash[3],
-            e.pcr[0],
-            e.pcr[1],
-            e.pcr[2],
-            e.pcr[3]
+            _e.program_id,
+            _e.domain,
+            _e.image_hash[0],
+            _e.image_hash[1],
+            _e.image_hash[2],
+            _e.image_hash[3],
+            _e.pcr[0],
+            _e.pcr[1],
+            _e.pcr[2],
+            _e.pcr[3]
         );
     }
     println!(
@@ -2083,9 +2093,10 @@ fn load_verified_image_inner(
     dma_pages: u32,
 ) -> Option<usize> {
     let Some(man) = read_manifest() else {
-        let grund = LxpdAbsage::KeinManifest;
+        let _grund = LxpdAbsage::KeinManifest;
+        #[cfg(feature = "debug-log")]
         println!(
-            "lxpdimg : [{pid}]? ABGEWIESEN ({grund:?}, quelle=Laufzeit) -- ohne angenommenes Boot-Manifest gibt es keinen Join-Schluessel"
+            "lxpdimg : [{pid}]? ABGEWIESEN ({_grund:?}, quelle=Laufzeit) -- ohne angenommenes Boot-Manifest gibt es keinen Join-Schluessel"
         );
         return None;
     };
@@ -2093,35 +2104,39 @@ fn load_verified_image_inner(
         .filter_map(|i| man.entry(i))
         .find(|e| e.program_id == pid)
     else {
-        let grund = LxpdAbsage::PidUnbekannt;
+        let _grund = LxpdAbsage::PidUnbekannt;
+        #[cfg(feature = "debug-log")]
         println!(
-            "lxpdimg : [{pid}]? ABGEWIESEN ({grund:?}, quelle=Laufzeit) -- kein Manifest-Eintrag mit dieser pid"
+            "lxpdimg : [{pid}]? ABGEWIESEN ({_grund:?}, quelle=Laufzeit) -- kein Manifest-Eintrag mit dieser pid"
         );
         return None;
     };
-    let name = e.name();
+    let _name = e.name();
     if e.domain != DOMAIN_HARDWARE {
-        let grund = LxpdAbsage::FalscheDomaene;
+        let _grund = LxpdAbsage::FalscheDomaene;
+        #[cfg(feature = "debug-log")]
         println!(
-            "lxpdimg : [{pid}]{name} ABGEWIESEN ({grund:?}, quelle=Laufzeit) -- nur Treiber laden ueber diesen Pfad"
+            "lxpdimg : [{pid}]{_name} ABGEWIESEN ({_grund:?}, quelle=Laufzeit) -- nur Treiber laden ueber diesen Pfad"
         );
         return None;
     }
     if e.is_root_task() {
-        let grund = LxpdAbsage::WurzelWiderspruch;
+        let _grund = LxpdAbsage::WurzelWiderspruch;
+        #[cfg(feature = "debug-log")]
         println!(
-            "lxpdimg : [{pid}]{name} ABGEWIESEN ({grund:?}, quelle=Laufzeit) -- der Root-Task kommt aus dem Boot, nicht aus Aufrufer-RAM"
+            "lxpdimg : [{pid}]{_name} ABGEWIESEN ({_grund:?}, quelle=Laufzeit) -- der Root-Task kommt aus dem Boot, nicht aus Aufrufer-RAM"
         );
         return None;
     }
     if !lxpd_boot::is_elf(bild) {
-        let grund = if lxpd_boot::is_lxpd(bild) {
+        let _grund = if lxpd_boot::is_lxpd(bild) {
             match lxpd_boot::LxpdBild::parse(bild) {
-                Ok(img) => {
+                Ok(_img) => {
+                    #[cfg(feature = "debug-log")]
                     println!(
-                        "lxpdimg : [{pid}]{name} Transportnachweis gueltig (quelle=Laufzeit: {} Stubs, {} umverdrahtet) -- aber kein ladbares Image",
-                        img.tramp_count(),
-                        img.rewired_count()
+                        "lxpdimg : [{pid}]{_name} Transportnachweis gueltig (quelle=Laufzeit: {} Stubs, {} umverdrahtet) -- aber kein ladbares Image",
+                        _img.tramp_count(),
+                        _img.rewired_count()
                     );
                     LxpdAbsage::TransportNur
                 }
@@ -2130,16 +2145,18 @@ fn load_verified_image_inner(
         } else {
             LxpdAbsage::KeinContainer
         };
+        #[cfg(feature = "debug-log")]
         println!(
-            "lxpdimg : [{pid}]{name} ABGEWIESEN ({grund:?}, quelle=Laufzeit) -- keine Treiber-PD"
+            "lxpdimg : [{pid}]{_name} ABGEWIESEN ({_grund:?}, quelle=Laufzeit) -- keine Treiber-PD"
         );
         return None;
     }
     // Bindung: Vertrauen aus dem BOOT-Manifest, nicht aus mitgereichten Bytes.
     if sha256(bild) != e.sha256 {
-        let grund = LxpdAbsage::HashAbweichung;
+        let _grund = LxpdAbsage::HashAbweichung;
+        #[cfg(feature = "debug-log")]
         println!(
-            "lxpdimg : [{pid}]{name} ABGEWIESEN ({grund:?}, quelle=Laufzeit) -- Staging weicht vom Manifest-Hash ab"
+            "lxpdimg : [{pid}]{_name} ABGEWIESEN ({_grund:?}, quelle=Laufzeit) -- Staging weicht vom Manifest-Hash ab"
         );
         return None;
     }
@@ -2163,15 +2180,17 @@ fn load_verified_image_inner(
                 index: u32::MAX,
                 program_id: pid,
             });
+            #[cfg(feature = "debug-log")]
             println!(
-                "lxpdimg : [{pid}]{name} gestartet (quelle=Laufzeit PD={hpd} Thread={:?}; Hash gebunden, Grants endowt)",
+                "lxpdimg : [{pid}]{_name} gestartet (quelle=Laufzeit PD={hpd} Thread={:?}; Hash gebunden, Grants endowt)",
                 tid.to_raw()
             );
             Some(hpd)
         }
-        Err(g) => {
+        Err(_g) => {
+            #[cfg(feature = "debug-log")]
             println!(
-                "lxpdimg : [{pid}]{name} ABGEWIESEN ({g:?}, quelle=Laufzeit) -- keine Treiber-PD"
+                "lxpdimg : [{pid}]{_name} ABGEWIESEN ({_g:?}, quelle=Laufzeit) -- keine Treiber-PD"
             );
             None
         }
@@ -2281,6 +2300,7 @@ fn policy_gate(program_id: u32) -> Result<(), LoaderError> {
     // einhalten kann, wird abgewiesen, nicht ignoriert.** Ein Politikfeld, das nur gedruckt wird,
     // ist schlechter als keins -- es sieht konfiguriert aus.
     if flags & m::POLICY_PINNED != 0 {
+        #[cfg(feature = "debug-log")]
         println!(
             "loader  : POLICY ABGEWIESEN -- program_id {program_id} verlangt PINNED. Der \
              Lastausgleich ist heute per Vorgabe AUS, aber \"aus\" ist keine Zusicherung: \
@@ -2335,6 +2355,7 @@ fn zahlenpolitik_gate(program_id: u32) -> Result<(), LoaderError> {
         // Die Behebung ist die Reihenfolge; diese Zeile ist das **Gatter dagegen, dass sie jemand
         // zurueckdreht**. Ohne sie waere die Behebung eine Gewohnheit.
         if !crate::numa::gelesen() {
+            #[cfg(feature = "debug-log")]
             println!(
                 "loader  : REIHENFOLGE-FEHLER -- program_id {program_id} verlangt numa_node={numa}, \
                  aber `numa::init()` ist noch nicht gelaufen. Das ist KEINE Aussage ueber die \
@@ -2355,6 +2376,7 @@ fn zahlenpolitik_gate(program_id: u32) -> Result<(), LoaderError> {
             return Err(LoaderError::UnsupportedPolicy);
         }
         if numa as usize >= topo.node_count() {
+            #[cfg(feature = "debug-log")]
             println!(
                 "loader  : POLICY ABGEWIESEN -- program_id {program_id} verlangt numa_node={numa}, \
                  die Maschine hat {} Knoten (0..{}).",
@@ -2368,6 +2390,7 @@ fn zahlenpolitik_gate(program_id: u32) -> Result<(), LoaderError> {
     // die Schranke: eine Kernnummer, die es nicht gibt, ist ein Fehler im Dokument.
     if affin != caprock_loader::manifest::ANY_CORE && (affin as usize) >= crate::system::num_cores()
     {
+        #[cfg(feature = "debug-log")]
         println!(
             "loader  : POLICY ABGEWIESEN -- program_id {program_id} verlangt core_affinity={affin}, \
              die Maschine hat {} Kerne.",
@@ -2378,6 +2401,7 @@ fn zahlenpolitik_gate(program_id: u32) -> Result<(), LoaderError> {
     // **Prioritaet**: der Scheduler kennt 0..NPRIO-1 (8). Eine Zahl darueber ist kein "so hoch wie
     // moeglich", sondern ein Fehler im Dokument.
     if prio as usize >= caprock_sched::NPRIO {
+        #[cfg(feature = "debug-log")]
         println!(
             "loader  : POLICY ABGEWIESEN -- program_id {program_id} verlangt priority={prio}, der \
              Scheduler kennt 0..{}.",
@@ -2400,6 +2424,7 @@ fn zahlenpolitik_gate(program_id: u32) -> Result<(), LoaderError> {
     // Das ist deshalb eine **Formatfrage**, keine Kernelfrage: solange das Manifest keine Periode
     // traegt, ist `budget_us` nicht einhaltbar. Steht als offener Punkt in `todo.md` Z11c.
     if budget != 0 {
+        #[cfg(feature = "debug-log")]
         println!(
             "loader  : POLICY ABGEWIESEN -- program_id {program_id} verlangt budget_us={budget}. \
              Eine MCS-Reservierung braucht Budget UND Periode; das Manifestformat hat nur eine \
@@ -2505,6 +2530,7 @@ fn hotreload_gate(program_id: u32, schon_geladen: bool) -> Result<(), LoaderErro
         return Ok(());
     };
     if flags & caprock_loader::manifest::POLICY_NO_HOTRELOAD != 0 {
+        #[cfg(feature = "debug-log")]
         println!(
             "loader  : A-4.5 ABGEWIESEN -- program_id {program_id} ist als NO_HOTRELOAD markiert \
              und wurde bereits geladen."
@@ -2580,15 +2606,17 @@ fn iface_record_or_check(program_id: u32, jetzt: u32) -> Result<(), LoaderError>
 
     match urteil {
         Urteil::Ok => Ok(()),
-        Urteil::Geaendert(zuerst) => {
+        Urteil::Geaendert(_zuerst) => {
+            #[cfg(feature = "debug-log")]
             println!(
                 "loader  : A-4.4 ABGEWIESEN -- program_id {program_id} wurde mit iface_version \
-                 {zuerst} geladen, das Archiv bietet {jetzt}. Ein Austausch ueber dieselbe \
+                 {_zuerst} geladen, das Archiv bietet {jetzt}. Ein Austausch ueber dieselbe \
                  Endpoint-Cap darf die Schnittstelle nicht aendern."
             );
             Err(LoaderError::IfaceVersionChanged)
         }
         Urteil::Voll => {
+            #[cfg(feature = "debug-log")]
             println!(
                 "loader  : A-4.4 ABGEWIESEN -- Versionsbuchhaltung voll ({MAX_IFACE_TRACKED} IDs). \
                  Lieber abweisen als ungeprueft laden."
@@ -2655,6 +2683,7 @@ pub fn run_ladepolitik() -> bool {
         Some(k) => kern_bekommen == Some(k),
     };
     let prio_ok = bekommen == Some(verlangt);
+    #[cfg(feature = "debug-log")]
     println!(
         "ladepol : Thread mit ABWEICHENDER Politik: Manifest verlangte prio={verlangt} \
          kern={kern:?}, Scheduler gab prio={bekommen:?} kern={kern_bekommen:?} (beim LADEN \
@@ -2686,6 +2715,7 @@ pub fn run_iface_gate() -> bool {
     let ohne_eintrag_durch = hotreload_gate(ID, true).is_ok();
     let unbekannt_durch = hotreload_gate(ID + 2, false).is_ok();
     let ok = erst && gleich && anders && fremd && ohne_eintrag_durch && unbekannt_durch;
+    #[cfg(feature = "debug-log")]
     println!(
         "iface   : erstes Laden {erst}; gleiche Version {gleich}; GEAENDERTE Version abgewiesen \
          {anders}; andere program_id unberuehrt {fremd}; ohne Manifest-Eintrag keine \
@@ -2824,6 +2854,7 @@ fn debuggable_praegen(program_id: u32, pd: usize) {
         .is_some_and(|(_, f)| f & caprock_loader::manifest::POLICY_DEBUGGABLE != 0);
     if !gewuenscht {
         DEBUGGABLE_NICHT_GEPRAEGT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "debug-log")]
         println!(
             "loader  : pd {pd} (program_id {program_id}) OHNE Debuggable -- kein Debugger kann sie              anfassen, auch keiner mit jeder anderen Cap des Systems"
         );
@@ -2832,13 +2863,17 @@ fn debuggable_praegen(program_id: u32, pd: usize) {
     match crate::system::mint_debuggable(pd) {
         Some(_) => {
             DEBUGGABLE_GEPRAEGT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            #[cfg(feature = "debug-log")]
             println!(
                 "loader  : AUDIT Debuggable GEPRAEGT fuer pd {pd} (program_id {program_id}) --                  diese PD ist ab jetzt debuggbar; das Fenster endet mit dem Revoke DIESER Cap,                  nicht mit dem Ablauf eines abgeleiteten Rechts"
             );
         }
-        None => println!(
+        None => {
+            #[cfg(feature = "debug-log")]
+            println!(
             "loader  : Debuggable fuer pd {pd} NICHT praegbar (kein Slot) -- die PD laeuft, ist              aber nicht debuggbar. Fail-closed: das ist die sichere Richtung"
-        ),
+        );
+        }
     }
 }
 
@@ -3159,16 +3194,18 @@ pub fn load_by_index(
                 // ist ein Pruefer, der „FAIL" sagt. Dazu die angeforderte Groesse UND der freie
                 // Rest -- ohne den sagt „n Byte angefordert" nicht, ob der Speicher knapp oder der
                 // Pool der falsche war.
-                let (code, bytes, frei) = crate::system::lade_mangel();
+                let (_code, _bytes, _frei) = crate::system::lade_mangel();
+                #[cfg(feature = "debug-log")]
                 println!(
                     "loader  : SYS_LOAD fehlgeschlagen -- Index {index}, program_id {}, Grund {:?}",
                     prog.program_id, e
                 );
                 if e == LoaderError::NoResources {
+                    #[cfg(feature = "debug-log")]
                     println!(
-                        "loader  :   fehlende Ressource: {} (Code {code}); angefordert {bytes} Byte, \
-                         freier Rest {frei} Byte",
-                        crate::system::mangel_name(code)
+                        "loader  :   fehlende Ressource: {} (Code {_code}); angefordert {_bytes} Byte, \
+                         freier Rest {_frei} Byte",
+                        crate::system::mangel_name(_code)
                     );
                 }
                 None

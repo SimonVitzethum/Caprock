@@ -4680,42 +4680,52 @@ fn all_done(
     // Client-PD kam derselbe Fehler eine Ebene hoeher zurueck: `wasmhost` ueberschrieb die Ablage
     // der Dateisystem-PD, der `drv`-Ablauf wartete auf ein Badge an einem fremden Objekt, und
     // `drv`/`blkdev`/`part` fielen aus, ohne dass am Treiber etwas kaputt war.
-    let (clients, ntfn_verloren) = crate::loader::client_notification_stats();
+    let (_clients, _ntfn_verloren) = crate::loader::client_notification_stats();
     {
         // **Die IDs, nicht nur die Zahl.** Eine Id-Kollision (Root und ein Client auf demselben
         // Objekt) erklaerte alles auf einmal: warum das Root-Badge einmal das CLIENT-Bit trug und
         // warum Badges „nicht ankommen". Ohne die Ids ist das nicht entscheidbar.
-        let mut ids = [(0u32, 0usize); 8];
-        let n = crate::loader::client_notification_ids(&mut ids);
+        let mut _ids = [(0u32, 0usize); 8];
+        let _n = crate::loader::client_notification_ids(&mut _ids);
+        #[cfg(feature = "debug-log")]
         print!("clientn : Objekt-Ids: root=");
+        #[cfg(feature = "debug-log")]
         match crate::loader::root_notification() {
             Some(r) => print!("#{r}"),
             None => print!("keine"),
         }
+        #[cfg(feature = "debug-log")]
         print!(" driver=");
+        #[cfg(feature = "debug-log")]
         match crate::loader::driver_notification() {
             Some(d) => print!("#{d}"),
             None => print!("keine"),
         }
-        for &(pid, id) in ids.iter().take(n) {
+        #[cfg(feature = "debug-log")]
+        for &(pid, id) in _ids.iter().take(_n) {
             print!(" · Programm {pid}=#{id}");
         }
+        #[cfg(feature = "debug-log")]
         println!(" (zwei gleiche Zahlen = EIN Objekt fuer zwei Rollen -- dann sind alle Badges an derselben Stelle)");
         // **Das Thread-Register als Ganzes.** Ohne es ist „Programm 6 hat keinen Thread" nicht von
         // „die Registrierung laeuft ueberhaupt nicht" zu unterscheiden -- eine leere Tabelle sieht
         // aus wie ein leerer Befund. Sprechprobe des Registers gegen sich selbst.
-        let (n_reg, verloren_reg) = crate::loader::program_thread_stats();
-        print!("clientn : Thread-Register: {n_reg} Eintrag/Eintraege, {verloren_reg} verloren ·");
+        let (_n_reg, _verloren_reg) = crate::loader::program_thread_stats();
+        #[cfg(feature = "debug-log")]
+        print!("clientn : Thread-Register: {_n_reg} Eintrag/Eintraege, {_verloren_reg} verloren ·");
         for pid in 1..=8u32 {
             if let Some(t) = crate::loader::thread_of_program(pid) {
-                let (ex, adm, g) = system::thread_lage(t);
-                print!(" P{pid}=tid{:#x}(da={ex} zul={adm} gr={g:#04b})", t.to_raw());
+                let (_ex, _adm, _g) = system::thread_lage(t);
+                #[cfg(feature = "debug-log")]
+                print!(" P{pid}=tid{:#x}(da={_ex} zul={_adm} gr={_g:#04b})", t.to_raw());
             }
         }
+        #[cfg(feature = "debug-log")]
         println!(" (leer BEI geladenen Programmen hiesse: die Registrierung selbst laeuft nicht)");
     }
+    #[cfg(feature = "debug-log")]
     println!(
-        "clientn : {clients} Client-PD(s) mit EIGENER Ablage, {ntfn_verloren} verloren (muss 0 \
+        "clientn : {_clients} Client-PD(s) mit EIGENER Ablage, {_ntfn_verloren} verloren (muss 0 \
          sein). Verschluesselt ist die Ablage mit der program_id, nicht mit der ROLLE -- „Client\" \
          ist eine Rolle, und die zweite Client-PD ueberschrieb bis 2026-08-10 die Ablage der \
          ersten. Die Schranke ist die Hoechstzahl der Manifest-Eintraege, also HERGELEITET: ein \
@@ -5159,14 +5169,15 @@ fn report_and_off(watchdog: bool) -> ! {
     // Gegenprobe genau EIN Konjunkt kippen kann und nicht die halbe Zeile.
     // ------------------------------------------------------------------------------------------
     {
-        let (a, b, c, d) = ptab_urteil();
-        let noetig = system::PT_RAHMEN_JE_VSPACE * pt_vspaces as u64;
+        let (_a, _b, _c, _d) = ptab_urteil();
+        let _noetig = system::PT_RAHMEN_JE_VSPACE * pt_vspaces as u64;
+        #[cfg(feature = "debug-log")]
         println!(
-            "ptab    : Seitentabellen-Topf -- allokationsseite-spricht={a} ({pt_raus} Rahmen \
-             geholt) · freigabeseite-spricht={b} ({pt_zurueck} Rahmen zurueck) · \
-             bilanz={c} (raus >= zurueck: es kann nichts zurueckkommen, was nie herausgegeben \
+            "ptab    : Seitentabellen-Topf -- allokationsseite-spricht={_a} ({pt_raus} Rahmen \
+             geholt) · freigabeseite-spricht={_b} ({pt_zurueck} Rahmen zurueck) · \
+             bilanz={_c} (raus >= zurueck: es kann nichts zurueckkommen, was nie herausgegeben \
              wurde -- faellt, sobald EINE Allokationsstelle nicht mehr bucht) · \
-             quervergleich={d} ({pt_gehalten} gehalten >= {noetig} = {} je VSpace x \
+             quervergleich={_d} ({pt_gehalten} gehalten >= {_noetig} = {} je VSpace x \
              {pt_vspaces} belegte; bei NULL belegten VSpaces sagt dieser Konjunkt nichts, und \
              das gehoert dazu). Gemessen AN DER QUELLE (was der Allokator fuer eine \
              Seitentabelle herausgibt), nicht als Differenz des freien RAM -- eine Differenz \
@@ -5185,13 +5196,14 @@ fn report_and_off(watchdog: bool) -> ! {
     // C7: die SPRECHPROBE des Mangel-Melders auf einem `spawn_*`-Pfad.
     // ------------------------------------------------------------------------------------------
     {
-        let (abgewiesen, code, bytes, farben) = *MANGEL_PROBE.lock();
+        let (_abgewiesen, _code, _bytes, _farben) = *MANGEL_PROBE.lock();
+        #[cfg(feature = "debug-log")]
         println!(
-            "mangel  : Sprechprobe auf spawn_isolated_colored (leere Farbmaske, {farben} Farben) \
-             -- abgewiesen={abgewiesen} · Code {code} = {} · gemeldet {bytes} Byte (angefordert \
+            "mangel  : Sprechprobe auf spawn_isolated_colored (leere Farbmaske, {_farben} Farben) \
+             -- abgewiesen={_abgewiesen} · Code {_code} = {} · gemeldet {_bytes} Byte (angefordert \
              {} Byte) · vergiftet war {} (kein Kernelpfad schreibt diesen Code -- steht er noch \
              da, hat der Pfad GESCHWIEGEN)",
-            system::mangel_name(code),
+            system::mangel_name(_code),
             system::USER_KSTACK_SIZE,
             system::MANGEL_VERGIFTET
         );
@@ -5446,15 +5458,17 @@ fn report_and_off(watchdog: bool) -> ! {
     // Mal baut -- und zwei Fassungen derselben Messung laufen auseinander. Gezaehlt wird der
     // ZUSTAND (Identitaet des Kstack-Eigentuemers, Freigabe des eigenen Stacks), nicht der Ausgang.
     {
-        let (spaet, fremd, fuesse, rec_ges, rec_stack) = crate::system::kstack_spaet_stats();
-        let (zomb_ges, zomb_fuss) = caprock_sched::zombie_fuss_stats();
+        let (_spaet, _fremd, _fuesse, _rec_ges, _rec_stack) = crate::system::kstack_spaet_stats();
+        let (_zomb_ges, _zomb_fuss) = caprock_sched::zombie_fuss_stats();
+        #[cfg(feature = "debug-log")]
         println!(
-            "kstackid: spaet-am-wiedervergebenen-Slot={spaet} fremder-Kstack-freigegeben={fremd} \
-             (von {rec_ges} Aufraeumungen, {rec_stack} mit Stack)"
+            "kstackid: spaet-am-wiedervergebenen-Slot={_spaet} fremder-Kstack-freigegeben={_fremd} \
+             (von {_rec_ges} Aufraeumungen, {_rec_stack} mit Stack)"
         );
+        #[cfg(feature = "debug-log")]
         println!(
-            "kstackid: EL0-Kstack unter den eigenen Fuessen freigegeben={fuesse}; \
-             Zombie-Region unter den eigenen Fuessen eingereiht={zomb_fuss} von {zomb_ges}"
+            "kstackid: EL0-Kstack unter den eigenen Fuessen freigegeben={_fuesse}; \
+             Zombie-Region unter den eigenen Fuessen eingereiht={_zomb_fuss} von {_zomb_ges}"
         );
     }
 
@@ -5473,23 +5487,24 @@ fn report_and_off(watchdog: bool) -> ! {
     // verbessern: es hebt den Hoechststand. Der Unterschied zwischen dem Gatter (das ohne den
     // Fegelauf entscheidet) und dieser Zeile faellt damit fail-closed aus.
     {
-        let (gefegt, tiefster) = system::userstack_marke_fegen();
+        let (_gefegt, _tiefster) = system::userstack_marke_fegen();
         let u = crate::userstackmark::marke();
-        let (s_gemessen, s_ok, s_tiefe) = crate::userstackmark::sonde_stand();
+        let (_s_gemessen, _s_ok, _s_tiefe) = crate::userstackmark::sonde_stand();
         // **Zwei Groessen, zwei Zahlen** -- und sie werden getrennt gedruckt, weil sie aus
         // verschiedenen Regionen stammen duerfen: der TIEFSTE Pfad in Bytes (er traegt die
         // Summenbedingung) und der hoechste FUELLGRAD (er sagt, wie knapp es irgendwo wurde). In
         // einer Klasse mit vier Regionsgroessen ist „45 %" ohne seine Region keine Aussage.
-        let tiefe_promille = if u.tiefste_groesse == 0 {
+        let _tiefe_promille = if u.tiefste_groesse == 0 {
             0
         } else {
             u.tiefe_max * 1000 / u.tiefste_groesse
         };
+        #[cfg(feature = "debug-log")]
         println!(
             "ustack  : Wasserstand EL0-USER-Stack -- Hoechststand {} von {} B ({}.{} % SEINER \
              Region; hoechster Fuellgrad ueberhaupt {}.{} %, moeglicherweise in einer anderen) · \
              {} registriert / {} gemessen ({} davon im \
-             Sterbepfad -- DIESE sieht das Gatter, {gefegt} am Schluss ueber LEBENDE Regionen \
+             Sterbepfad -- DIESE sieht das Gatter, {_gefegt} am Schluss ueber LEBENDE Regionen \
              gefegt) · Rekordhalter Thread-Slot {} · Regionsgroessen {}..{} B · Fuss nicht genullt: \
              {} (muss 0 sein -- das heisst 'aufgebraucht ODER nie genullt', beide sollen dasselbe \
              Urteil ausloesen) · nie benutzt: {} (Threads, die kein von Null verschiedenes Byte \
@@ -5497,8 +5512,8 @@ fn report_and_off(watchdog: bool) -> ! {
              lebender Slot {}",
             u.tiefe_max,
             u.tiefste_groesse,
-            tiefe_promille / 10,
-            tiefe_promille % 10,
+            _tiefe_promille / 10,
+            _tiefe_promille % 10,
             u.fuell_max_promille / 10,
             u.fuell_max_promille % 10,
             u.registriert,
@@ -5509,8 +5524,9 @@ fn report_and_off(watchdog: bool) -> ! {
             u.groesse_max,
             u.erschoepft,
             u.nie_benutzt,
-            if tiefster == usize::MAX { u64::MAX } else { tiefster as u64 },
+            if _tiefster == usize::MAX { u64::MAX } else { _tiefster as u64 },
         );
+        #[cfg(feature = "debug-log")]
         println!(
             "ustack  : Herkunft -- sterbende Threads {} B, lebende {} B. **Die Klasse fasst VIER \
              Groessen**: die private Region einer isolierten PD ({} B), die gefaerbte Region \
@@ -5525,9 +5541,10 @@ fn report_and_off(watchdog: bool) -> ! {
             hal::mmu::PRIV_REGION_SIZE,
             crate::colors::region_bytes(),
         );
+        #[cfg(feature = "debug-log")]
         println!(
-            "ustack  : Tiefensonde (Sprechprobe des GEMESSENEN PFADES) -- gemessen={s_gemessen} \
-             getroffen={s_ok} gemeldete Tiefe={s_tiefe} B gegen beruehrte {} B (+{} B Schlupf fuer \
+            "ustack  : Tiefensonde (Sprechprobe des GEMESSENEN PFADES) -- gemessen={_s_gemessen} \
+             getroffen={_s_ok} gemeldete Tiefe={_s_tiefe} B gegen beruehrte {} B (+{} B Schlupf fuer \
              ihren eigenen Rahmen). Sie prueft, was die Eichung strukturell NICHT kann: dass die \
              Buchfuehrung Thread-Slot -> Region auf die RICHTIGE Region zeigt. Ein Eintrag, der \
              auf irgendeine andere genullte Region zeigt, meldet 'viel Luft' und bestuende jede \
@@ -5535,10 +5552,11 @@ fn report_and_off(watchdog: bool) -> ! {
             crate::userstackmark::SONDE_TIEFE,
             crate::userstackmark::SONDE_SCHLUPF,
         );
-        let (s_pfad, s_zweit, s_res, s_gr) = crate::userstackmark::summe();
+        let (_s_pfad, _s_zweit, _s_res, _s_gr) = crate::userstackmark::summe();
+        #[cfg(feature = "debug-log")]
         println!(
-            "ustack  : SUMME (C7b, strukturell statt statistisch) -- tiefster Pfad {s_pfad} B + \
-             zweiter Summand {s_zweit} B + geforderte Reserve {s_res} B = {} B von {s_gr} B \
+            "ustack  : SUMME (C7b, strukturell statt statistisch) -- tiefster Pfad {_s_pfad} B + \
+             zweiter Summand {_s_zweit} B + geforderte Reserve {_s_res} B = {} B von {_s_gr} B \
              (kleinste Region). **Der zweite Summand ist auf EL0 NULL, und das ist eine Aussage \
              ueber die Architektur, keine Bequemlichkeit**: ein Interrupt oder eine Exception aus \
              Ring 3 wechselt IMMER den Stack (x86-64 laedt RSP0 aus der TSS, aarch64 laeuft auf \
@@ -5549,7 +5567,7 @@ fn report_and_off(watchdog: bool) -> ! {
              die Nullung, ein mit NULL beschriebenes Stackwort ist also unsichtbar -- die Zahl ist \
              eine UNTERGRENZE, und deshalb liegt die Regionsgroesse ein Vielfaches darueber und \
              nicht knapp daneben",
-            s_pfad + s_zweit + s_res
+            _s_pfad + _s_zweit + _s_res
         );
         println!(
             "ustack  : {} (C7b: geforderte Mindestreserve {} B = 1/{} der kleinsten Region, \
@@ -5700,13 +5718,15 @@ fn report_and_off(watchdog: bool) -> ! {
         let spaet = system::LATE_PD_BIND.load(Ordering::Relaxed);
         let unklar = system::LATE_PD_BIND_UNKLAR.load(Ordering::Relaxed);
         let gesamt = system::PD_BIND_GESAMT.load(Ordering::Relaxed);
-        let gesehen = system::SPAETBINDUNG_GESEHEN.load(Ordering::Relaxed);
+        let _gesehen = system::SPAETBINDUNG_GESEHEN.load(Ordering::Relaxed);
+        #[cfg(feature = "debug-log")]
         println!(
             "pdbind  : gebunden={gesamt} spaet-gebunden={spaet} unklar={unklar} \
-             erklaert-gefeuert={gesehen:#x} (D0: eine PD, die an einen bereits zugelassenen Thread \
+             erklaert-gefeuert={_gesehen:#x} (D0: eine PD, die an einen bereits zugelassenen Thread \
              geht, kommt zu spaet -- der Thread kann seinen ersten Syscall schon gemacht und \
              ERR_NOPD bekommen haben. Erklaerte Gruende zaehlen NICHT als spaet, stehen aber hier)"
         );
+        #[cfg(feature = "debug-log")]
         for g in system::ERLAUBTE_SPAETBINDUNGEN {
             println!("pdbind  :   erklaert zulaessig: {g}");
         }
@@ -6393,8 +6413,11 @@ fn report_and_off(watchdog: bool) -> ! {
 pub fn run(multiboot_info: u64) -> ! {
     // --- Hardware in der Reihenfolge hochziehen, in der sie voneinander abhängt ---
     hal::console::init();
+    #[cfg(feature = "debug-log")]
     println!("========================================");
+    #[cfg(feature = "debug-log")]
     println!(" Caprock — capability microkernel");
+    #[cfg(feature = "debug-log")]
     println!(" x86_64 (Multiboot -> Long Mode)");
     // **Die Konfiguration gehört an das Artefakt gebunden, nicht nur ins Bauprotokoll.**
     // Der Binärfingerabdruck der Suiten schliesst „veralteter Build" für einen *Suitenlauf* aus;
@@ -6404,11 +6427,13 @@ pub fn run(multiboot_info: u64) -> ! {
     // `kernel/build.rs`). Seither steht der Fingerabdruck der **effektiven** Flags im Abbild und
     // wird gedruckt: zwei Läufe mit verschiedener Bauumgebung sind damit unterscheidbar, ohne
     // dass jemand die Umgebung nachträglich rekonstruieren muss.
+    #[cfg(feature = "debug-log")]
     println!(
         " bauflags {} ({} Flags)",
         env!("CAPROCK_FLAGS_FP"),
         env!("CAPROCK_FLAGS_N")
     );
+    #[cfg(feature = "debug-log")]
     println!("========================================");
     hal::exception::init(); // IDT: Faults ab hier diagnostizierbar
     hal::gdt::init(); // GDT + per-Kern-TSS (Selektoren für Trap-/Ring-Wechsel, IST-Stacks)
@@ -6419,6 +6444,7 @@ pub fn run(multiboot_info: u64) -> ! {
     hal::mmu::init_primary(); // 4-Level-Paging, W^X, CR0.WP
     let (m, c, w) = hal::mmu::sctlr_flags();
     println!("mmu     : identity-map, paging={} caches={} CR0.WP={}", m as u8, c as u8, w as u8);
+    #[cfg(feature = "debug-log")]
     println!("arch    : x86_64 (CPL {} = Ring 0)", 1 - hal::cpu::current_el());
 
     hal::intc::init_dist(); // 8259-PIC stilllegen
@@ -6439,6 +6465,7 @@ pub fn run(multiboot_info: u64) -> ! {
         hal::timer::freq(),
         hal::timer::TIMER_INTID
     );
+    #[cfg(feature = "debug-log")]
     println!(
         "spec    : CSV2={} CSV3={} FEAT_SB={} · nospec-Indizes an",
         hal::cpu::csv2(),
@@ -7521,13 +7548,15 @@ pub fn run(multiboot_info: u64) -> ! {
                 super::ist::df_wache_ausloesen();
             }
             if sekunden > 60 || spins > 5_000_000_000 {
-                let mut w = [("", crate::befund::Befund::Bestanden); DONE_FLAGS];
-                let _ = all_done(archive, Some(&mut w));
+                let mut _w = [("", crate::befund::Befund::Bestanden); DONE_FLAGS];
+                let _ = all_done(archive, Some(&mut _w));
                 println!(
                     "bringup : WATCHDOG — nicht alle Aussagen belegt (nach {sekunden}s, {spins} Umdrehungen)"
                 );
+                #[cfg(feature = "debug-log")]
                 print!("bringup : offen waren:");
-                for (name, b) in w.iter() {
+                #[cfg(feature = "debug-log")]
+                for (name, b) in _w.iter() {
                     // **Nur das Offene nennen, und SKIP ist nicht offen.** Ein uebersprungener
                     // Punkt hat den Watchdog nicht verursacht -- ihn hier mitzudrucken schickte
                     // den naechsten Leser an die falsche Stelle.
@@ -7535,6 +7564,7 @@ pub fn run(multiboot_info: u64) -> ! {
                         print!(" {name}");
                     }
                 }
+                #[cfg(feature = "debug-log")]
                 println!();
                 report_and_off(true);
             }

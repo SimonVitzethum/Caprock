@@ -251,11 +251,14 @@ fn messen_inner() -> bool {
         "handler : {} abi-stimmt={abi_stimmt} zyklusverbot={zyklus_ok} slots={slots_ok}",
         if alles { "ALL PASS" } else { "FAILURES" }
     );
+    // B-Erzaehlung: die Einzelwerte dahinter (das Urteil steht in der Zeile darueber).
+    #[cfg(feature = "debug-log")]
     println!(
         "handler : laeuft-vorher={laeuft_vorher} markiert={markiert} steht={steht} \
          nach-unpark={nach_unpark} nach-resume={nach_resume} nach-pause-resume={nach_thaw} \
          laeuft-nach-reply={laeuft_nach_reply}"
     );
+    #[cfg(feature = "debug-log")]
     println!(
         "handler : Urteile{:?} gebunden={gebunden} restgrund={bits:#04x} \
          fault-umgeleitet={} runden={}",
@@ -263,6 +266,8 @@ fn messen_inner() -> bool {
         system::handler_fault_count(),
         SONDE_RUNDEN.load(Ordering::Acquire)
     );
+    #[cfg(not(feature = "debug-log"))]
+    let _ = (gebunden, bits);
     alles
 }
 
@@ -714,6 +719,8 @@ fn redirect_messen_inner() -> bool {
         laenge,
         result::OK
     );
+    // B-Erzaehlung zum Umlauf (das Urteil steht in der Zeile darueber).
+    #[cfg(feature = "debug-log")]
     println!(
         "redirect: der Gast setzte Syscall {GAST_SYSNO} ab -- eine Nummer, die der Caprock-Kernel \
          NICHT kennt (nativ waere das {} = ERR_BADCAP) -- und bekam x0={x0:#x} (erwartet {:#x} = \
@@ -723,6 +730,7 @@ fn redirect_messen_inner() -> bool {
         result::ERR_BADCAP,
         GAST_ARG.wrapping_add(1)
     );
+    #[cfg(feature = "debug-log")]
     println!(
         "redirect: fail-closed nach Stilllegung der Handler-PD: laeuft-vorher={laeuft_vorher} \
          stillgelegt={stillgelegt} handler-blockiert={blockiert} zaehler-steht={steht} \

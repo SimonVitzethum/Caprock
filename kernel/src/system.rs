@@ -560,12 +560,14 @@ fn kstack_gefaerbt_auf_knoten(
             i += 1;
         }
     }
+    #[cfg(feature = "debug-log")]
     println!(
         "kstack  : RUECKFALL knotenlokal-gefaerbt unerfuellbar (Knoten {wunsch}) -- gefaerbt ohne Knoten"
     );
     if let Some(c) = alloc_colored_vorspann(1, n, caprock_mem::PAGE, m) {
         return Some(c);
     }
+    #[cfg(feature = "debug-log")]
     println!("kstack  : RUECKFALL gefaerbt erschoepft -- ungefärbt/unaffiliated (Farbe gibt zuletzt nach)");
     mem_alloc(n, USER_KSTACK_SIZE as u64)
 }
@@ -580,6 +582,7 @@ fn kstack_auf_knoten(n: u64, al: u64, wunsch: u8) -> Option<MemoryCap> {
     match crate::numa::alloc_on_node(n, al, knoten) {
         Some(c) => Some(c),
         None => {
+            #[cfg(feature = "debug-log")]
             println!(
                 "kstack  : RUECKFALL Knoten {wunsch} ohne Speicher -- ungefärbt/unaffiliated"
             );
@@ -655,7 +658,7 @@ fn record_user_region(thread_slot: usize, base: u64, len: u64) {
     crate::userstackmark::registriert();
 }
 /// Beim Thread-Ende: den ggf. zugeordneten Kstack an `MEM` zurückgeben. No-Op für EL1-Threads.
-fn reclaim_user_kstack(tid: ThreadId, anlass: &'static str) {
+fn reclaim_user_kstack(tid: ThreadId, _anlass: &'static str) {
     let thread_slot = tid.slot();
     KSTACK_RECLAIM_GESAMT.fetch_add(1, Ordering::Relaxed);
     // **D15-Melder 1 (Gelegenheit).** Ist der Slot in diesem Moment schon wieder belegt, bezeichnet
@@ -663,8 +666,9 @@ fn reclaim_user_kstack(tid: ThreadId, anlass: &'static str) {
     // hat, trifft ab hier ihn. Gezaehlt wird das unabhaengig davon, ob es diesmal schadet.
     if caprock_sched::slot_in_use(thread_slot) {
         KSTACK_SPAET_SLOT.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "debug-log")]
         println!(
-            "kstackid: SPAET via {anlass} -- Slot {thread_slot} ist bereits wieder belegt \
+            "kstackid: SPAET via {_anlass} -- Slot {thread_slot} ist bereits wieder belegt \
              (aufgeraeumt wird fuer Generation {})",
             tid.gen()
         );
@@ -683,8 +687,9 @@ fn reclaim_user_kstack(tid: ThreadId, anlass: &'static str) {
             // **Laut, nicht nur gezaehlt.** Der Zaehler steht am Ende des Laufs; ein Lauf, der
             // vorher stirbt, verliert ihn -- und genau die sterben interessieren. Die Zeile nennt
             // Opfer und Region, damit ein spaeterer Sprung nach 0 zuzuordnen ist.
+            #[cfg(feature = "debug-log")]
             println!(
-                "kstackid: FREMD via {anlass} -- Slot {thread_slot} traegt Kstack {b:#x} der \
+                "kstackid: FREMD via {_anlass} -- Slot {thread_slot} traegt Kstack {b:#x} der \
                  Generation {}, aufgeraeumt wird aber fuer Generation {} \
                  (Leck statt UAF: nicht freigegeben)",
                 p.gen_of[thread_slot],
@@ -2883,12 +2888,14 @@ fn mem_alloc_masked_anywhere_auf(
             if let Some(c) = crate::numa::alloc_on_node_colored(size, align, node, m) {
                 return Some(c);
             }
+            #[cfg(feature = "debug-log")]
             println!(
                 "lader   : RUECKFALL knotenlokal-gefaerbt erschoepft -- gefaerbt ohne Knoten"
             );
             if let Some(c) = alloc_colored_anywhere(size, align, m) {
                 return Some(c);
             }
+            #[cfg(feature = "debug-log")]
             println!(
                 "lader   : RUECKFALL gefaerbt erschoepft -- ungefärbt/unaffiliated (Farbe gibt zuletzt nach)"
             );
@@ -4167,12 +4174,14 @@ fn dispatch_fork(
     let Some((eintritt, startarg)) = loaded_eintritt(asid) else {
         // Registrierte Frames ohne Eintritt: die Buchhaltung widerspricht sich — benannt,
         // nicht geraten (ein Kind ohne Eintritt liefe nach MUSTER).
+        #[cfg(feature = "debug-log")]
         println!("fork    : ABGEWIESEN -- asid {asid} hat Frames, aber keinen Eintritt");
         return Err(result::ERR_BADSYS);
     };
     if eintritt == 0 {
         // Gebucht, aber nie belegt (`EMPTY`-Eintritt): dieselbe Lage wie oben, nur eine Stufe
         // frueher — ein Kind am Eintritt 0 faultete an seiner ersten Instruktion.
+        #[cfg(feature = "debug-log")]
         println!("fork    : ABGEWIESEN -- asid {asid} ohne gebuchten Eintritt");
         return Err(result::ERR_BADSYS);
     }
@@ -4223,6 +4232,7 @@ fn dispatch_fork(
                     (Some(st), Some(m))
                 }
                 None => {
+                    #[cfg(feature = "debug-log")]
                     println!(
                         "fork    : RUECKFALL kein eigener Streifen frei -- Kind erbt Farbsatz der Mutter"
                     );
@@ -4288,6 +4298,7 @@ fn dispatch_fork(
             continue;
         }
         let Some(p) = perm_von(pcode) else {
+            #[cfg(feature = "debug-log")]
             println!("fork    : ABGEWIESEN -- unbekannter Perm-Code {pcode} an VA {va:#x}");
             kind_aufraeumen(kind_pd, casid, &kratz.kind_segs[..nkind], None, kbase, None);
             return Err(result::ERR_BADSYS);
@@ -4421,6 +4432,7 @@ fn dispatch_fork(
         // `0`/`None` heisst fuer `kind_aufraeumen „bereits abgerechnet"; was `kill` ablehnt,
         // bleibt benannt stehen (Leck statt UAF).
         if !kill_remote(ctid) {
+            #[cfg(feature = "debug-log")]
             println!(
                 "fork    : RUECKZUG Kind-Thread nicht beendbar -- PD {kind_pd} bleibt stehen (Leck statt UAF)"
             );
@@ -4455,6 +4467,7 @@ fn dispatch_fork(
         let _ = cap_delete(kind_cap);
         hal::cpu::local_irq_restore(daif);
         if !kill_remote(ctid) {
+            #[cfg(feature = "debug-log")]
             println!(
                 "fork    : RUECKZUG Kind-Thread nicht beendbar -- PD {kind_pd} bleibt stehen (Leck statt UAF)"
             );
@@ -4466,6 +4479,7 @@ fn dispatch_fork(
         hal::cpu::local_irq_restore(daif);
         // Wie der Ladepfad (`load_into_pd_mit_va`): keine Zulassung ohne Aufloesung — best
         // effort beenden, registrierte Frames ueber den Teardown, Kstack/Reap ueber Kill/Reaper.
+        #[cfg(feature = "debug-log")]
         println!("fork    : RUECKZUG Kind-Thread nicht zulassbar -- PD {kind_pd} wird abgebaut");
         kill_remote(ctid);
         kind_aufraeumen(kind_pd, casid, &[], None, 0, None);
@@ -4527,6 +4541,7 @@ fn dispatch_exec(
     let img = match caprock_loader::elf::ElfImage::parse(prog.elf) {
         Ok(i) => i,
         Err(_) => {
+            #[cfg(feature = "debug-log")]
             println!("exec    : ABGEWIESEN -- Archiv-Index {prog_index} ist kein gueltiges ELF");
             return Err(result::ERR_BADCAP);
         }
@@ -4555,6 +4570,7 @@ fn dispatch_exec(
         }
         let Some(t) = gef.get() else { break };
         if !kill_remote(t) {
+            #[cfg(feature = "debug-log")]
             println!("exec    : RUECKZUG unvollstaendig -- Thread {} blieb (PD {pd})", t.to_raw());
             break;
         }
@@ -4570,6 +4586,7 @@ fn dispatch_exec(
             }
             if let Some(cap) = *c {
                 if cap_delete(cap).is_err() {
+                    #[cfg(feature = "debug-log")]
                     println!("exec    : RUECKZUG Slot {slot} global nicht freigegeben -- aus PD {pd} geraeumt");
                 }
                 clear_pd_cap(pd, slot);
@@ -4596,6 +4613,7 @@ fn dispatch_exec(
             // Die alte Fassung lebt weiter (ihre VSpace wurde nicht angeruehrt); das Token
             // bleibt gueltig (Epoche ungehubt) — wiederholbar statt verloren. Was fehlt
             // (geraemte Slots, abgezogene Threads), steht oben benannt.
+            #[cfg(feature = "debug-log")]
             println!("exec    : ABGEBROCHEN -- alte Fassung laeuft weiter (PD {pd}), Token gueltig");
             return Err(result::ERR_NOSPACE);
         }
@@ -4606,6 +4624,7 @@ fn dispatch_exec(
     match vspace_l1(neu_asid) {
         Some(neu_l1) => set_vspace_of(me.slot(), ((neu_asid as u64) << 48) | neu_l1),
         None => {
+            #[cfg(feature = "debug-log")]
             println!("exec    : WIDERSPRUCH -- neue ASID {neu_asid} ohne L1 (PD {pd})");
             return Err(result::ERR_BADSYS);
         }
@@ -6983,6 +7002,7 @@ pub fn load_into_pd_mit_va(
         .sum::<usize>()
         + (LOADED_STACK_BYTES.div_ceil(stueck(LOADED_STACK_BYTES)) as usize);
     if stuecke_noetig > MAX_IMG_SEGS {
+        #[cfg(feature = "debug-log")]
         println!(
             "loader  : ABGEWIESEN -- das Image braucht {stuecke_noetig} Frame-Stuecke, die \
              Teardown-Buchhaltung fasst {MAX_IMG_SEGS}. Lieber gar nicht laden als ein Leck."
@@ -9369,7 +9389,7 @@ fn park_pending(region: DmaRegion) {
     if let Some(e) = p.iter_mut().find(|r| r.is_empty()) {
         *e = region;
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", feature = "debug-log"))]
     crate::println!(
         "dma: Region pa=0x{:x} len=0x{:x} bleibt dauerhaft pending -- Stilllegung nicht bestaetigt",
         region.pa.raw(),

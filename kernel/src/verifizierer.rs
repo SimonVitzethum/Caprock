@@ -58,6 +58,7 @@
 //! wertlos geworden. Die Umdefinition steht deshalb in der Berichtszeile selbst, nicht nur hier.
 
 use caprock_cap::CapPtr;
+#[cfg(feature = "debug-log")]
 use caprock_hal::println;
 use caprock_sched::ThreadId;
 use caprock_sync::SpinLock;
@@ -409,6 +410,9 @@ fn laden_bild(a: &Auftrag, b: Bildquelle) -> Option<usize> {
     // Verifizierer, die Schlange und ein Kernwechsel liegen, und eine Schranke, die nur an einer
     // Stelle steht, an jeder anderen umgehbar ist.
     if b.len == 0 || b.len > caprock_abi::sys::LXPD_MAX_BILD {
+        // Benannte Absage als Diagnosezeile (der Aufrufer bekommt ERR_BADCAP; die Absage
+        // selbst steht im Rueckgabewert, die Begruendung hier).
+        #[cfg(feature = "debug-log")]
         println!(
             "lxpdimg : Bild {len} B ausserhalb 1..=LXPD_MAX_BILD ({max}) -- ABGEWIESEN (BildZuGross) ohne Staging",
             len = b.len,
@@ -419,6 +423,7 @@ fn laden_bild(a: &Auftrag, b: Bildquelle) -> Option<usize> {
     // Staging aus MEM, kein BSS-Monster: bis zu 4 MiB stehen nicht im Image.
     let len = b.len as usize; // passt: durch die Schranke oben gedeckt (4 MiB)
     let Some((basis, slen)) = crate::system::staging_alloc(b.len) else {
+        #[cfg(feature = "debug-log")]
         println!(
             "lxpdimg : Staging {len} B erschoepft (MEM) -- ABGEWIESEN (KeineRessourcen) ohne Kopie"
         );
@@ -428,6 +433,7 @@ fn laden_bild(a: &Auftrag, b: Bildquelle) -> Option<usize> {
         // Der Allokator rundet auf, nie ab — traefe das doch zu, wäre die Kopie unten ein
         // Überlauf. Fail-closed statt rechnen.
         crate::system::staging_free(basis, slen);
+        #[cfg(feature = "debug-log")]
         println!(
             "lxpdimg : Staging {slen} B kleiner als Bild {len} B -- ABGEWIESEN (KeineRessourcen) ohne Kopie"
         );

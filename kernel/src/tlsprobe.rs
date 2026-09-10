@@ -453,6 +453,9 @@ fn urteilen(a_base: u64, param: u64) {
         let wechsel = kind(b, K_NACH_WECHSEL);
         let syscall = kind(b, K_NACH_SYSCALL);
         let runden = kind(b, K_RUNDEN);
+        // B-Erzaehlung je Kind (die Konjunkte darunter lesen dieselben Worte — das Urteil
+        // haengt nicht an dieser Zeile).
+        #[cfg(feature = "debug-log")]
         println!(
             "tls    : Kind {b:#x}: gesetzt={gesetzt:#x} sofort={sofort:#x} \
              nach-wechsel={wechsel:#x} nach-syscall={syscall:#x} runden={runden}"
@@ -516,12 +519,15 @@ fn urteilen(a_base: u64, param: u64) {
                 core::ptr::read_volatile((e.dma_phys + D_TLS_FS0_OFF) as *const u64),
             )
         };
+        #[cfg(feature = "debug-log")]
         println!(
             "tls    : Treiber {}: thread-lokale Variable gelesen={wert:#x} erwartet={D_TLS_WERT:#x} \
              | tp={tp:#x} roher-fs0={fs0:#x} (gleich = FS_BASE wirkt, dann liegt der Fehler in der \
              ADRESSIERUNG der Variablen; ungleich = das Register wirkt nicht)",
             e.program_id
         );
+        #[cfg(not(feature = "debug-log"))]
+        let _ = (tp, fs0);
         if wert != D_TLS_WERT {
             treiber_tls_stimmt = false;
         }

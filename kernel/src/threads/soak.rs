@@ -96,6 +96,8 @@ pub fn run() -> ! {
     // sie den stationären Zustand nach einmaligem Durchlauf aller Operationen).
     let _ = epoch();
     let base = snapshot();
+    // B-Erzaehlung (Startzeile + Heartbeat); `SOAK ANOMALY` ist der Befund und steht immer.
+    #[cfg(feature = "debug-log")]
     println!(
         "SOAK start free_bytes={} free_mib={} cap_obj={} cap_slots={} hb_ticks={}",
         base.free,
@@ -133,6 +135,7 @@ pub fn run() -> ! {
         let now = hal::timer::ticks(0);
         if now.wrapping_sub(last_hb) >= SOAK_HEARTBEAT_TICKS {
             last_hb = now;
+            #[cfg(feature = "debug-log")]
             println!(
                 "SOAK hb epoch={} uptime_ticks={} free_bytes={} free_mib={} cap_obj={} cap_slots={} loads={} dmas={} churns={} faults={} anomalies={} audit={}",
                 epochs, now, system::total_free(), system::total_free() / (1024 * 1024),

@@ -5410,7 +5410,10 @@ fn pdbind_bericht() {
              ERR_NOPD bekommen haben. Erklaerte Gruende zaehlen NICHT als spaet, stehen aber hier)"
         );
         for g in system::ERLAUBTE_SPAETBINDUNGEN {
+            #[cfg(feature = "debug-log")]
             println!("pdbind  :   erklaert zulaessig: {g}");
+            #[cfg(not(feature = "debug-log"))]
+            let _ = g;
         }
         // **Sprechprobe am gepruefte Pfad, nicht an einer Ausnahme darin.** `gebunden == 0` heisst:
         // dieser Lauf ist an `bind_pd` gar nicht vorbeigekommen -- dann sagt eine Null bei `spaet`
@@ -5836,14 +5839,18 @@ fn report() {
     // Melder, der nur beim Unglueck spricht, in 443 von 444 Laeufen stumm.
     let (spaet, fremd, fuesse, rec_ges, rec_stack) = system::kstack_spaet_stats();
     let (zomb_ges, zomb_fuss) = caprock_sched::zombie_fuss_stats();
+    #[cfg(feature = "debug-log")]
     println!(
         "kstackid: spaet-am-wiedervergebenen-Slot={spaet} fremder-Kstack-freigegeben={fremd} \
          (von {rec_ges} Aufraeumungen, {rec_stack} mit Stack)"
     );
+    #[cfg(feature = "debug-log")]
     println!(
         "kstackid: EL0-Kstack unter den eigenen Fuessen freigegeben={fuesse}; \
          Zombie-Region unter den eigenen Fuessen eingereiht={zomb_fuss} von {zomb_ges}"
     );
+    #[cfg(not(feature = "debug-log"))]
+    let _ = (spaet, fremd, fuesse, rec_ges, rec_stack, zomb_ges, zomb_fuss);
 
     // MCS Scheduling Contexts: budgetierter vs. unbeschränkter Thread auf MCS_CORE.
     let (depl, refl) = system::budget_stats(MCS_CORE);

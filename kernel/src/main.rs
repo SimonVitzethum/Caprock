@@ -215,11 +215,17 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
         let (m, c, i) = hal::mmu::sctlr_flags();
         println!("mmu     : identity-map, M={} C={} I={} (caches an)", m as u8, c as u8, i as u8);
     }
+    #[cfg(feature = "debug-log")]
     println!("========================================");
+    #[cfg(feature = "debug-log")]
     println!(" Caprock — capability microkernel");
+    #[cfg(feature = "debug-log")]
     println!(" phase 1: HAL bring-up");
+    #[cfg(feature = "debug-log")]
     println!("========================================");
+    #[cfg(feature = "debug-log")]
     println!("arch    : aarch64 (running at EL{})", hal::cpu::current_el());
+    #[cfg(feature = "debug-log")]
     println!("boot-x0 : {dtb_addr:#018x} (DTB-Zeiger; bei QEMU-ELF 0 -> DTB eingebettet)");
 
     // Distributor global + Init des Primärkerns (core 0).
@@ -233,6 +239,7 @@ pub extern "C" fn kernel_main(dtb_addr: u64) -> ! {
     // härtet unabhängig davon seine EL0-Indexpfade (`array_index_nospec`) und setzt beim
     // VSpace-Wechsel eine Spekulationsbarriere. NICHT abgedeckt bleiben Cache-/Timing-
     // Seitenkanäle zwischen PDs (keine Cache-Partitionierung) — s. docs/invariants.md.
+    #[cfg(feature = "debug-log")]
     println!(
         "spec    : CSV2={} CSV3={} FEAT_SB={} · nospec-Indizes an, Barriere beim VSpace-Wechsel",
         hal::cpu::csv2(),

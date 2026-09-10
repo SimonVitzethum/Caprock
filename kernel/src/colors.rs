@@ -18,7 +18,9 @@
 //! Abwesenheit als Erfüllung lesen. [`usable`] trennt das deshalb explizit: unter zwei Farben
 //! ist die Eigenschaft **nicht vorhanden**, nicht etwa trivial erfüllt.
 
-use caprock_hal::{self as hal, println};
+use caprock_hal::{self as hal};
+#[cfg(any(feature = "selftest", feature = "debug-log"))]
+use caprock_hal::println;
 use caprock_mem::{color_of, ColorMask};
 
 /// Seitengröße, gegen die Farben gerechnet werden.
@@ -486,21 +488,29 @@ pub fn report_color(c: &ColorTest) {
 pub fn report() {
     match hal::cache::llc() {
         Some(g) => {
-            let colors = count();
-            println!(
-                "cache   : LLC L{} {} KiB, {}-fach, {} B/Zeile, {} Sets -> {} Seitenfarbe(n){}",
-                g.level,
-                g.size_bytes / 1024,
-                g.ways,
-                g.line_bytes,
-                g.sets,
-                colors,
-                if colors >= 2 { "" } else { " (keine Partitionierung moeglich)" }
-            );
+            #[cfg(feature = "debug-log")]
+            {
+                let colors = count();
+                println!(
+                    "cache   : LLC L{} {} KiB, {}-fach, {} B/Zeile, {} Sets -> {} Seitenfarbe(n){}",
+                    g.level,
+                    g.size_bytes / 1024,
+                    g.ways,
+                    g.line_bytes,
+                    g.sets,
+                    colors,
+                    if colors >= 2 { "" } else { " (keine Partitionierung moeglich)" }
+                );
+            }
+            #[cfg(not(feature = "debug-log"))]
+            let _ = g;
         }
-        None => println!(
-            "cache   : keine Cache-Geometrie gemeldet -> 1 Seitenfarbe (keine Partitionierung moeglich)"
-        ),
+        None => {
+            #[cfg(feature = "debug-log")]
+            println!(
+                "cache   : keine Cache-Geometrie gemeldet -> 1 Seitenfarbe (keine Partitionierung moeglich)"
+            )
+        }
     }
 }
 

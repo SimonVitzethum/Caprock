@@ -10,10 +10,18 @@ use caprock_hal::println;
 use caprock_mem::{MemoryCap, Rights, PAGE};
 
 fn check(prefix: &str, cond: bool, name: &str, fail: &mut bool) {
+    // Einzelzusagen ohne Leerzeichen vor dem Doppelpunkt (`memtest: PASS ...`) — der
+    // B-1.2c-Waechter liest nur Zusammenfassungen (`name   : WORT`), diese Zeilen sind fuer ihn
+    // unsichtbar. Reine B-Erzaehlung hinter `debug-log`; das Urteil (`*fail`) steht IMMER.
+    #[cfg(feature = "debug-log")]
     if cond {
         println!("{prefix}: PASS  {name}");
     } else {
         println!("{prefix}: FAIL  {name}");
+    }
+    #[cfg(not(feature = "debug-log"))]
+    let _ = (prefix, name);
+    if !cond {
         *fail = true;
     }
 }
@@ -486,6 +494,7 @@ fn memtest() {
     let mut fail = false;
     let free0 = mm::total_free();
     let frags0 = mm::fragments();
+    #[cfg(feature = "debug-log")]
     println!("memtest : freies RAM = {} MiB ({frags0} Fragmente)", free0 >> 20);
 
     let a = mm::alloc(PAGE, PAGE).expect("alloc a");

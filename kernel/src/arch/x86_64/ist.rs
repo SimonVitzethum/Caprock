@@ -268,7 +268,9 @@ pub fn bericht() {
         hal::exception::idt_ist(18),
         hal::exception::idt_ist(14),
     );
+    #[cfg(feature = "debug-log")]
     print!("ist     : Wirkung je Kern (int 2 / int 18 landeten auf dem EIGENEN Stack):");
+    #[cfg(feature = "debug-log")]
     for c in 0..n.min(hal::gdt::MAX_TSS_CORES) {
         let e = ERGEBNIS[c].load(Ordering::Acquire);
         print!(
@@ -280,6 +282,7 @@ pub fn bericht() {
             u8::from(e & B_GELAUFEN != 0),
         );
     }
+    #[cfg(feature = "debug-log")]
     println!();
     // Der Wasserstand der IST-Stacks: in einem gesunden Lauf sind #DF und #MC unberuehrt, der
     // NMI-Stack traegt die Spur der Sonde. Genau daran ist ablesbar, dass hier ueberhaupt etwas
@@ -414,6 +417,7 @@ pub fn df_wache_ausloesen() -> ! {
     // Die heutige Fassung kann das nicht mehr: sie zielt auf eine nachweislich NICHT abgebildete
     // Seite, dort faultet der Zugriff, statt zu treffen.
     let Some(wache) = hal::mmu::erste_lebende_wache() else {
+        #[cfg(feature = "debug-log")]
         println!(
             "dfsonde : KEINE stehende Wache gefunden -- Sonde bricht ab. Das ist ein \
              Aufbaufehler und kein Messergebnis: ohne Wache kann diese Sonde nichts belegen."
@@ -421,6 +425,7 @@ pub fn df_wache_ausloesen() -> ! {
         crate::arch::x86_64::system_off();
     };
     let kb = wache + 4096; // der Stackfuss liegt eine Seite ueber seiner Wache
+    #[cfg(feature = "debug-log")]
     println!(
         "dfsonde : Ueberlauf ueber eine NACHWEISLICH stehende Wache bei {wache:#x} \
          (Stackfuss {kb:#x}). RSP auf den Stackfuss, zweimal ablegen -- das zweite trifft sie."

@@ -20,17 +20,22 @@
 //!
 //! ## Nummern-Anker (Drift = Baufehler)
 //!
-//! `31`/`32` spiegeln `caprock-abi::sys::{FORK_SNAPSHOT, EXEC_REPLACE}`, `36` die
+//! `31`/`32` spiegeln `caprock-abi::sys::{FORK_SNAPSHOT, EXEC_REPLACE}`, `38` die
 //! naechste freie Nummer, `26`/`27` die neuen Ergebnis-Codes. Die ABI-Crate traegt
-//! denselben Anker (`nummern`-Tests); driftet eine Seite, faellt ein Test —
-//! Kollision ist ein Baufehler, kein Laufzeitfehler.
+//! denselben Anker (`nummern`-Tests); zusaetzlich haelt `microkit` (das beide Seiten
+//! abhaengig hat) den Spiegel gegen das Original (`spiegel_gegen_abi`). Driftet eine
+//! Seite, faellt ein Test -- Kollision ist ein Baufehler, kein Laufzeitfehler.
 
 /// Syscall-Nummern (Spiegel von `caprock-abi::sys`).
 pub const SYS_FORK_SNAPSHOT: u64 = 31;
 /// Syscall-Nummern (Spiegel von `caprock-abi::sys`).
 pub const SYS_EXEC_REPLACE: u64 = 32;
 /// Naechste freie Nummer (Spiegel von `caprock-abi::fork::NAECHSTE_FREIE_SYSCALL`).
-pub const NAECHSTE_FREIE_SYSCALL: u64 = 36;
+/// Stand 2026-09-10: 38 (31/32 FORK/EXEC, 33-35 Debugger-v2, 36 LOAD_IMAGE, 37 CSUB).
+/// Die Uebereinstimmung prueft `microkit`-seitig ein Anker-Test (diese Datei ist
+/// absichtlich abhaengigkeitsfrei und kann es selbst nicht) -- ein Spiegel, den niemand
+/// gegen das Original haelt, driftet (geschehen 2026-09-09: hier stand noch 36).
+pub const NAECHSTE_FREIE_SYSCALL: u64 = 38;
 
 /// Ergebnis-Codes (Spiegel von `caprock-abi::result`).
 pub const ERR_OK: u64 = 0;
@@ -132,8 +137,9 @@ pub fn dekodiere_exec(
 /// Teardown-Token falten (Spiegel von `caprock-loader::exec::teardown_token_fuer`).
 /// Kanonisch ist der Loader; diese Kopie existiert nur, damit die Datei ohne
 /// Abhaengigkeit pruefbar bleibt. Beide tragen denselben Vektor-Test unten.
+/// Offset-Basis ist FNV-Standard (s. Doku dort) -- kein Eigenwert.
 pub fn teardown_token_fuer(program_id: u32, epoche: u32) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
+    let mut h: u64 = 0xcbf29ce4842225c5;
     let bytes = [
         (program_id & 0xff) as u8,
         ((program_id >> 8) & 0xff) as u8,
@@ -158,12 +164,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn nummern_anker_gegen_die_abi() {
+    fn nummern_selbstkonsistenz() {
+        // Ehrlicher Name: Diese Datei ist absichtlich abhaengigkeitsfrei und kann die
+        // ABI-Crate NICHT gegenlesen -- der echte Abgleich steht in `caprock-abi`
+        // (`nummern`-Tests, dort ebenfalls 38). Was hier steht, faellt, sobald jemand
+        // diese Spiegel anfasst, ohne die ABI zu meinen.
         assert_eq!(SYS_FORK_SNAPSHOT, 31);
         assert_eq!(SYS_EXEC_REPLACE, 32);
-        assert_eq!(NAECHSTE_FREIE_SYSCALL, 36);
+        assert_eq!(NAECHSTE_FREIE_SYSCALL, 38);
         assert_eq!(SNAPSHOT_MAX_BYTES, 8 * 1024 * 1024);
         assert_ne!(SYS_FORK_SNAPSHOT, SYS_EXEC_REPLACE);
+    }
+
+    #[test]
+    fn token_basis_ist_fnv_standard() {
+        // Wie drueben in `caprock-loader::exec`: unabhaengig nachgerechnet, kein Spiegel
+        // eines Spiegels (s. Doku an `teardown_token_fuer`).
+        assert_eq!(teardown_token_fuer(1, 0), 0xdc17a8e5d14d8644);
     }
 
     #[test]

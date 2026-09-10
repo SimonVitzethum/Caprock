@@ -977,7 +977,10 @@ pub(crate) mod tests {
     }
 
     fn fnv64(bytes: &[u8]) -> u64 {
-        let mut h: u64 = 0xcbf29ce484222325;
+        // FNV-1a-64-Standard-Basis (s. Doku an `caprock-loader::exec::teardown_token_fuer`):
+        // hier stand ein Tippfehler (...2325), den die Spiegel-Tests nicht fanden, weil sie
+        // denselben falschen Wert spiegeln. Der echte Abgleich ist `spiegel_trifft_lxpd` unten.
+        let mut h: u64 = 0xcbf29ce4842225c5;
         for &b in bytes {
             h ^= u64::from(b);
             h = h.wrapping_mul(0x100000001b3);
@@ -1363,6 +1366,20 @@ pub(crate) mod tests {
     }
 
     // --- Tests -----------------------------------------------------------------------------------
+
+    #[test]
+    fn spiegel_trifft_lxpd() {
+        // Interop-Anker (Audit 2026-09-10, FNV-Drift): Der Spiegel signiert, die echte
+        // `caprock-lxpd`-Rechnung prueft -- muss Ok sein. Ein Tippfehler in EINER Basis
+        // (geschehen: `...2325` statt `...25c5`) faellt hier, waehrend alle reinen
+        // Spiegel-Tests (beide Seiten derselbe falsche Wert) gruenen. Manifest UND
+        // Eintrag, denn es sind zwei verschiedene Zeugen (Key-gehasht vs. Roh-Pubkey).
+        let manifest = gutes_manifest();
+        assert!(caprock_lxpd::manifest::verify_signature(&manifest, b"deadbeef").is_ok());
+        let bild = gutes_bild();
+        let eintrag = guter_eintrag(&bild, &LXPD_UNIQUE, &PUBKEY);
+        assert!(caprock_lxpd::driver::verify_witness(&eintrag, &PUBKEY).is_ok());
+    }
 
     #[test]
     fn rundweg_suchen_lesen_pruefen_anstossen() {

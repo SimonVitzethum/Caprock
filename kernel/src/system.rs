@@ -3969,6 +3969,8 @@ fn dispatch_spawn(
 /// altes Mapping) ist ein Baufehler, keine Lage.
 static EXEC_EPOCHE: SpinLock<[u32; caprock_microkit::NPDS]> =
     SpinLock::new([0; caprock_microkit::NPDS]);
+// Sperr-Rang (Audit 2026-09-10, §1-Nachtrag): Blattlock -- alle Takes standalone
+// (lesen in `dispatch_exec`, heben nach Erfolg), nie verschachtelt gehalten.
 
 /// FORK/EXEC-Bilanz (nach Wirkung, nicht nach Aufruf): `(fork_gelungen, fork_abgewiesen,
 /// exec_gelungen, exec_abgewiesen)`. Gezaehlt wird in `forkexec_syscall`, einmal je Ausgang.
@@ -6197,16 +6199,31 @@ fn loaded_eintritt(asid: u16) -> Option<(usize, usize)> {
 }
 
 /// Die registrierten RAM-Frames der `asid` an den Allokator zurückgeben + den Slot freigeben.
-/// Snapshot ziehen, `LOADED_IMAGES` freigeben, DANN `MEM` (Rangordnung: nie beide gleichzeitig).
+/// Snapshot ziehen, `LOADED_IMAGES` freigegeben, DANN `MEM` (Rangordnung: nie beide gleichzeitig).
+///
+/// Heap statt 1-KiB-Stack-Array (Audit 2026-09-10, #DF-Klasse): Teardown laeuft auf
+/// moeglicherweise fast vollen Stacks (Fault-/Exit-Pfade). Semantik bitgleich zur
+/// Array-Fassung (alles auf einmal entnehmen + Slot loeschen, dann freigeben) -- ein
+/// scheibchenweises Freigeben oeffnete ein Fenster, in dem ein nebenlaeufiger Leser eine
+/// halb geraeumte Tabelle saehe. Einzige neue Kante: Heap-OOM -- dann bleibt der Slot
+/// belegt UND die Frames belegt (Leck statt UAF; Rueckgabe nur, was entnommen wurde).
+/// Eine 1-KiB-Reservierung scheitert nur bei erschoepftem Heap, also wenn das System
+/// ohnehin steht; ein Stack-Array scheiterte nie, kostete dafuer jeden Aufrufer 1 KiB.
+#[inline(never)] // s. `dispatch_fork`: dicke Raeum-Funktion aus heissen Rahmen heraushalten.
 fn loaded_free(asid: u16) {
-    let mut snap = [(0u64, 0u64); MAX_IMG_SEGS];
+    let mut snap: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
     let mut n = 0;
     {
         let mut t = LOADED_IMAGES.lock();
         if let Some(slot) = t.iter().position(|i| i.asid == asid && i.asid != 0) {
             n = t[slot].nseg;
-            snap[..n].copy_from_slice(&t[slot].segs[..n]);
-            t[slot] = LoadedImage::EMPTY;
+            if snap.try_reserve_exact(n).is_ok() {
+                snap.resize(n, (0, 0));
+                snap[..n].copy_from_slice(&t[slot].segs[..n]);
+                t[slot] = LoadedImage::EMPTY;
+            } else {
+                n = 0;
+            }
         }
     }
     if n > 0 {
@@ -10856,6 +10873,8 @@ pub fn revoke_dma(binding: &DmaBinding, tid: ThreadId) {
 /// - `2` = zwei DmaCap-Regionen überlappen einander.
 /// - `3` = der Enforcer meldet eine Durchsetzungs-Anomalie (`dma_enforcer().audit()`).
 /// Wird in [`ipc_audit`] als Code `40 + dma_audit()` aggregiert.
+#[inline(never)] // Audit 2026-09-10 (#DF-Klasse): dicke Pruef-Funktion aus heissen Rahmen
+// heraushalten -- der Aufrufer (`ipc_audit`) laeuft auch auf heissem Pfad.
 pub fn dma_audit() -> u32 {
     let floor = hal::mmu::kernel_end().max(hal::mmu::USER_RAM_MIN);
     let ceil = hal::mmu::GIB1_END;
@@ -14458,6 +14477,7 @@ pub fn ipc_audit() -> u32 {
 /// pruefen — Rangordnung: nie beide Locks gleichzeitig). Hoechstens `MAX_IMG_SEGS` Eintraege
 /// (1 KiB) liegen je auf dem Stapel: die vorige Fassung hielt alle Images als Ganzes, und das
 /// skaliert nicht auf zehntausend Images (zehn MiB Stapel).
+#[inline(never)] // s. `dma_audit`: Audit-Rahmen aus heissen Pfaden heraushalten.
 pub fn loader_audit() -> u32 {
     let n = LOADED_IMAGES.lock().len();
     let mut buf = [(0u64, 0u64); MAX_IMG_SEGS];

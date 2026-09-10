@@ -28,10 +28,11 @@
 //! ## Was zum echten Transfer fehlt (Kernel-Hilfe, exakter Patch-Text in der Aufgabe)
 //!
 //! `CCOPY` leitet *dasselbe* Objekt ab — einen *Teilbereich* als eigene Memory-Cap gibt es
-//! nicht. Der Vorschlag (`CSUB`, syscall 31 — neben 4 die einzige freie Nummer unter 32):
-//! `x1` = Quell-Slot (Memory-Cap), `x2` = freier Ziel-Slot, `x3` = Offset, `x4` = Länge →
-//! abgeleitete Memory-Cap mit verengter Region, Rechten aus dem Schnitt, Fehlern `ERR_BADCAP`
-//! / `ERR_NOSPACE` / `ERR_SUBREGION` (letzterer existiert bereits für die Stapelprüfung).
+//! nicht. Der Vorschlag ist seit 2026-09-10 gebaut (`CSUB`, syscall **37** — s.
+//! `caprock_abi::sys::CSUB`; Stand dieses Dokuments: 31, ueberholt):
+//! `x1` = Quell-Slot (Memory-Cap), `MSG0` = freier Ziel-Slot, `MSG1` = Offset,
+//! `MSG2` = Länge → abgeleitete Memory-Cap mit verengter Region, Rechten aus dem Schnitt,
+//! Fehlern `ERR_BADCAP` / `ERR_NOSPACE` / `ERR_SUBREGION` (21, existiert seit K1b).
 //! Erst damit wird aus dem Schein eine Cap, die der Client per `SYS_MAP` abbildet und der
 //! Server per `revoke` tatsächlich einzieht — inklusive der Abbildung (heute räumt erst
 //! `destroy_pd`/`vspace_teardown` Mappings ab; bei lebender PD bleibt der Entzug kooperativ,

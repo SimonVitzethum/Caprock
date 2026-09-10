@@ -366,6 +366,9 @@ impl Messkette {
 }
 
 static MESSKETTE: SpinLock<Messkette> = SpinLock::new(Messkette::neu());
+// Sperr-Rang (Audit 2026-09-10, §1-Nachtrag): Blattlock -- alle Takes standalone, nie
+// verschachtelt mit CAPS/MEM/SCHEDS gehalten (Leser: Bericht; Schreiber: je ein Lock ueber
+// Lesen+Haengen, s. `messkette_verlaengern`).
 
 /// Die Kette um ein erfolgreich geladenes Image verlaengern (Z7).
 ///
@@ -377,22 +380,27 @@ static MESSKETTE: SpinLock<Messkette> = SpinLock::new(Messkette::neu());
 /// voll, wird BENANNT verworfen (`verworfen + 1`, der Bericht meldet `FAILURES`) statt
 /// still zu ueberschreiben — eine Messung, die unbemerkt aussetzt, saehe aus wie eine
 /// bestandene.
+///
+/// EIN Lock ueber Lesen+Haengen (Audit 2026-09-10): der Hash (72 Byte, Mikrosekunden)
+/// laeuft UNTER der Sperre, obwohl Rechnen unter Lock sonst verpoent ist -- zwei
+/// nebenlaeufige Lader (Laufzeit-`LOAD_IMAGE` neben Boot) wuerden sonst denselben `prev`
+/// falten und die Kette gabeln (zweiter Eintrag verlaengert nicht den ersten).
+/// Ketten-Linearitaet schlaegt hier Haltezeit; geladen wird selten, nie heiss.
+/// Sperr-Rang: Blattlock (alle Takes standalone, nie verschachtelt -- s. §1-Nachtrag an
+/// der Statik unten).
 pub fn messkette_verlaengern(program_id: u32, domain: u32, image_hash: [u8; 32]) {
-    let mut buf = [0u8; 72];
-    let prev = {
-        let g = MESSKETTE.lock();
-        if g.anzahl == 0 {
-            kernel_code_hash()
-        } else {
-            g.glieder[g.anzahl - 1].map(|e| e.pcr).unwrap_or_else(kernel_code_hash)
-        }
+    let mut g = MESSKETTE.lock();
+    let prev = if g.anzahl == 0 {
+        kernel_code_hash()
+    } else {
+        g.glieder[g.anzahl - 1].map(|e| e.pcr).unwrap_or_else(kernel_code_hash)
     };
+    let mut buf = [0u8; 72];
     buf[..32].copy_from_slice(&prev);
     buf[32..36].copy_from_slice(&program_id.to_le_bytes());
     buf[36..40].copy_from_slice(&domain.to_le_bytes());
     buf[40..72].copy_from_slice(&image_hash);
     let pcr = sha256(&buf);
-    let mut g = MESSKETTE.lock();
     if g.anzahl >= MESSKETTE_MAX {
         g.verworfen += 1;
         return;

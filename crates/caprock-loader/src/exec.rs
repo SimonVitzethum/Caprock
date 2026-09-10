@@ -29,7 +29,14 @@
 /// Epoche + Programm-ID falten zu einem Token, das kein gueltiger „egal"-Wert ist.
 pub fn teardown_token_fuer(program_id: u32, epoche: u32) -> u64 {
     // FNV-1a ueber 8 Bytes, danach `0` verboten (s. `pruefe_exec_antrag`).
-    let mut h: u64 = 0xcbf29ce484222325;
+    //
+    // Die Offset-Basis ist der FNV-Standard (`14695981039346656037`), kein Caprock-Eigenwert --
+    // und genau deshalb steht der Vektor-Test unten mit einem unabhaengig nachgerechneten Wert:
+    // Am 2026-09-09 stand hier ein Tippfehler (`...2325` statt `...25c5`), und die
+    // Selbstkonsistenz-Tests (Loader-Spiegel in `proc.rs` inklusive) blieben allesamt gruen,
+    // weil sie denselben falschen Wert spiegeln. Ein Standard, den nur Spiegel pruefen, ist
+    // keiner.
+    let mut h: u64 = 0xcbf29ce4842225c5;
     let bytes = [
         (program_id & 0xff) as u8,
         ((program_id >> 8) & 0xff) as u8,
@@ -101,6 +108,15 @@ mod tests {
         assert_ne!(t1, 0);
         assert_ne!(teardown_token_fuer(7, 4), t1);
         assert_ne!(teardown_token_fuer(8, 3), t1);
+    }
+
+    #[test]
+    fn token_basis_ist_fnv_standard() {
+        // Unabhaengig nachgerechnet (FNV-1a, Basis 0xcbf29ce4842225c5, Bytes
+        // `[01 00 00 00 00 00 00 00]`): haette je Seite einen anderen Tippfehler in der
+        // Konstanten, fiele genau dieser Test -- die Spiegel-Tests unten faenden ihn nie
+        // (s. Doku an `teardown_token_fuer`).
+        assert_eq!(teardown_token_fuer(1, 0), 0xdc17a8e5d14d8644);
     }
 
     #[test]

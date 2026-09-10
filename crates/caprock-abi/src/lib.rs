@@ -1,4 +1,5 @@
 #![no_std]
+#![forbid(unsafe_code)] // Audit 2026-09-10: reine Zahlen/Typen-Deklaration, kein Grund fuer unsafe.
 //! Geteilte Kernel<->Thread-ABI (ADR 0004).
 //!
 //! Syscalls werden über `SVC #0` ausgelöst; Argumente und Rückgaben liegen in
@@ -552,6 +553,10 @@ pub mod sys {
     /// Register je Kern sind eine benannte Kapazitaet wie der Halt selbst (§8a):
     /// Erschoepfung wird abgewiesen, nicht still geteilt. Erfordert pro-Thread-Sichern
     /// der Debugregister im Kontextwechsel (`hal::debug`).
+    ///
+    /// Stand 2026-09-10 (Audit): Nummern 33-35 sind VERGEBEN, aber UNDISPATCHED -- der
+    /// Kernel deckt nur 21-25 ab, Aufrufe fallen auf `ERR_BADSYS` (kein Stub, der Erfolg
+    /// meldet). Verdrahtung zusammen mit `hal::debug` + RSP-PD (`programs/rspd`).
     pub const DEBUG_HWBREAK: u64 = 35;
 
     /// **Einen Teilbereich einer Memory-Cap als eigene Cap ableiten** (CSUB,
@@ -590,6 +595,9 @@ pub mod debug {
     /// The mirror of [`READ_MAX`]: the write walks the **target's** page tables under
     /// a lock, so the same latency hole applies in the other direction. Same value,
     /// same reason — one capacity per direction, not one number with two meanings.
+    ///
+    /// Stand 2026-09-10 (Audit): noch ohne Durchsetzung -- `DEBUG_WRITE_MEM` (33) ist
+    /// undispatched (s. dort), erst die Verdrahtung zieht diese Schranke nach.
     pub const WRITE_MAX: u64 = 512;
 }
 

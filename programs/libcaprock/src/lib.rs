@@ -43,6 +43,9 @@ pub mod sys {
     pub const LOAD_IMAGE: u64 = 36;
     pub const CDELETE: u64 = 14;
     pub const CCOPY: u64 = 15;
+    /// **Teilbereich einer Memory-Cap ableiten** (CSUB, Mem-Server-Transport) — Spiegel von
+    /// `caprock_abi::sys::CSUB` (die EINZIGE Wahrheit steht dort).
+    pub const CSUB: u64 = 37;
     pub const CMOVE: u64 = 16;
     pub const SETRECV: u64 = 17;
     /// **Einen zweiten Thread in der EIGENEN PD erzeugen** (K1a/K1b) — s. [`super::spawn`].
@@ -540,6 +543,18 @@ pub fn ccopy(src: u64, dst: u64, rights: u64, badge: u64) -> u64 {
 pub fn cmove(src: u64, dst: u64) -> u64 {
     invoke(sys::CMOVE, src, [dst, 0, 0, 0], 0).result
 }
+/// **Teilbereich einer Memory-Cap als eigene Cap ableiten** (CSUB): `src` muss eine
+/// Memory-Cap halten, `dst` muss frei sein, `[offset, offset+len)` muss in der Region
+/// liegen (sonst [`result::ERR_SUBREGION`]). Die Rechte sind der Schnitt mit der Quelle.
+/// Client-Gatter wie [`ccopy`]/[`load`]: unpassende Slots/Null-Laenge werden OHNE Syscall
+/// mit [`result::ERR_BADCAP`] beantwortet -- ein Aufruf, der die Antwort schon kennt,
+/// kostet keinen Fall in den Kernel.
+pub fn csub(src: u64, dst: u64, offset: u64, len: u64) -> u64 {
+    if len == 0 {
+        return result::ERR_BADCAP;
+    }
+    invoke(sys::CSUB, src, [dst, offset, len, 0], 0).result
+}
 /// **Empfangs-Slot festlegen** (A-3.2): wo per IPC übertragene Caps landen. Der Empfänger
 /// entscheidet das, nicht der Sender.
 pub fn setrecv(slot: u64) -> u64 {
@@ -788,6 +803,21 @@ mod tests {
         // EINZIGE Wahrheit: `caprock_abi::sys::LOAD_IMAGE`. Läuft der Spiegel auseinander,
         // stellte jeder Anstoss einen fremden Syscall — sichtbar erst im Kernel-Log.
         assert_eq!(sys::LOAD_IMAGE, 36);
+    }
+
+    #[test]
+    fn csub_spiegel_hat_die_abi_nummer() {
+        // Wie oben, fuer CSUB=37 (s. Doku am Spiegel).
+        assert_eq!(sys::CSUB, 37);
+    }
+
+    #[test]
+    fn csub_null_laenge_ohne_syscall() {
+        // Client-Gatter: Laenge 0 kehrt ohne `invoke` mit ERR_BADCAP zurueck -- wie
+        // dokumentiert wird der Syscall gar nicht erst gestellt (auf dem Host liesse
+        // er sich ohnehin nicht stellen, s. Moduldoku).
+        assert_eq!(csub(3, 4, 0, 0), result::ERR_BADCAP);
+        assert_eq!(csub(3, 4, 16, 0), result::ERR_BADCAP);
     }
 
     #[test]
